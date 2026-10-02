@@ -4,8 +4,6 @@
 
 mod counts;
 mod critical;
-#[cfg(all(windows, target_pointer_width = "64"))]
-mod live;
 mod prefix;
 mod queue;
 mod shape;
