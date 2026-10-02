@@ -209,7 +209,7 @@ mod tests {
             .expect("the snapshot lists this process");
         let exe = std::env::current_exe().expect("this test binary has a path");
         let stem = exe.file_stem().expect("the test binary has a file stem").to_string_lossy();
-        assert!(!me.name.is_empty());
+        assert_ne!(me.name, "");
         assert!(me.created.is_some());
         let command_line = me.command_line.expect("this process's command line can be read");
         assert!(command_line.contains(stem.as_ref()), "{command_line} names {stem}");
