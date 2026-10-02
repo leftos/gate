@@ -65,6 +65,13 @@ fn compare(machine: &Machine, case: &str) -> Value {
     let ours = serde_json::to_value(dashboard_state(&inputs, &Win32ProcessTable, &Win32MutexProbe, &Win32CwdReader)).expect("the state serialises");
     let (ours, theirs) = (normalise(ours), normalise(theirs));
     assert_eq!(ours, theirs, "the {case} state differs from gate-dashboard.ps1 -Once");
+    // `Value` equality ignores key order; the serialised text keeps it, as serde_json's `preserve_order` reads and
+    // writes keys in document order.
+    assert_eq!(
+        serde_json::to_string(&ours).expect("our state serialises"),
+        serde_json::to_string(&theirs).expect("their state serialises"),
+        "the {case} state's key order differs from gate-dashboard.ps1 -Once"
+    );
     ours
 }
 
@@ -74,7 +81,8 @@ const CLAIM_DATES: [&str; 2] = ["processStart", "started"];
 /// The value with `now` blanked, as each side reads the clock at its own moment, and every claim date in one canonical
 /// form. gate-dashboard.ps1 re-prints a claim's dates through `ConvertFrom-Json` and `ConvertTo-Json`, which drops the
 /// fraction's trailing zeros, while gate-state keeps the claim file's text on purpose; so the dates are compared as the
-/// instants they name. A date that does not parse is left as it is, and the comparison fails on it.
+/// instants they name. A date that does not parse is left as it is, and the comparison fails on it. Every value is
+/// replaced in place, so each key keeps its position.
 fn normalise(mut state: Value) -> Value {
     state["now"] = Value::Null;
     if let Some(holder) = state.pointer_mut("/critical/holder") {
