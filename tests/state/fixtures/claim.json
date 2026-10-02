@@ -1,0 +1,1 @@
+{"kind":"heavy","index":0,"pid":51000,"processStart":"2026-10-02T21:16:00.5711853Z","started":"2026-10-02T21:16:02.0157648Z","cwd":"C:\\work\\repo","command":"pwsh -NoProfile -Command Start-Sleep 20","log":"C:\\work\\repo\\.tmp\\o28-capture\\first.log","timeoutSeconds":120.0}
