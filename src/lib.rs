@@ -8,10 +8,14 @@ mod claims;
 mod counts;
 mod model;
 mod state;
+#[cfg(all(windows, target_pointer_width = "64"))]
+mod win32;
 
 pub use counts::{WriteError, apply_slot_count, read_slot_count_setting, slot_count_path, write_slot_counts};
 pub use model::{
-    CwdReader, DashboardState, MutexProbe, ParseError, PoolState, ProcessInfo, ProcessTable, SlotCount, SlotCounts, SlotKind, SlotRow, SlotState,
-    StateInputs, Waiting,
+    CriticalState, CwdReader, DashboardState, MutexProbe, ParseError, PoolState, ProcessInfo, ProcessTable, QueueTicket, SlotCount, SlotCounts,
+    SlotKind, SlotRow, SlotState, StateInputs, Waiting,
 };
 pub use state::dashboard_state;
+#[cfg(all(windows, target_pointer_width = "64"))]
+pub use win32::{LiveInputsError, Win32CwdReader, Win32MutexProbe, Win32ProcessTable, live_inputs, live_state};

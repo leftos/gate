@@ -175,6 +175,10 @@ pub struct StateInputs {
     pub local_app_data: PathBuf,
     /// The counts file to use in place of the per-user one (the gate's `GATE_TEST_SLOT_COUNTS`), for tests only.
     pub slot_counts_override: Option<PathBuf>,
+    /// The prefix the gate's self-test puts in front of the slot and critical mutex names, their claim files' names and
+    /// the `gate\waiting` folder's name (the gate's `GATE_TEST_SLOT_PREFIX`), for tests only; empty otherwise. With a
+    /// prefix set, only claims carrying it are read.
+    pub slot_prefix: String,
 }
 
 /// One process of a [`ProcessTable`] snapshot.
@@ -219,8 +223,44 @@ pub struct DashboardState {
     pub machine: String,
     /// The machine's logical processor count.
     pub processors: usize,
+    /// The critical request's row: the gate holding the critical mutex, and the critical gates waiting for it.
+    pub critical: CriticalState,
+    /// The arrival tickets of the live gates waiting for a slot or for the machine, oldest first.
+    pub queue: Vec<QueueTicket>,
     /// The heavy pool, then the light one.
     pub pools: Vec<PoolState>,
+}
+
+/// The critical request: who holds the machine and who waits to.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct CriticalState {
+    /// The critical mutex's row, index 0: busy once its gate holds every slot and has written its claim, held while that
+    /// gate waits for the earlier gates and the slots' holders, free when there is none. It has no `extra` key.
+    pub holder: SlotRow,
+    /// The gates run with `-Slot critical` that hold no live claim and have no child yet.
+    pub waiting: Vec<Waiting>,
+}
+
+/// A live gate's arrival ticket, which it writes as it starts and deletes once it holds its slot; a critical gate keeps
+/// its own to its end.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct QueueTicket {
+    /// The slot the gate asked for, as the ticket has it: `heavy`, `light` or `critical`.
+    pub kind: String,
+    /// True for a critical gate that holds the machine.
+    pub holds: bool,
+    /// The gate's process id.
+    pub pid: u32,
+    /// When the gate arrived, ISO 8601 UTC with seven fractional digits.
+    pub arrived: String,
+    /// Whole seconds from the arrival to the state's moment, halves rounded to even, serialised as a float like `5.0`.
+    #[serde(rename = "ageSeconds")]
+    pub age_seconds: f64,
+    /// The gate's working directory, when it could be read.
+    pub cwd: Option<String>,
+    /// The gate's command line, when it could be read.
+    #[serde(rename = "commandLine")]
+    pub command_line: Option<String>,
 }
 
 /// One pool of slots.
@@ -239,7 +279,8 @@ pub struct PoolState {
     pub problem: Option<String>,
     /// The slots `0..count`, plus any slot past the count that has a claim file.
     pub slots: Vec<SlotRow>,
-    /// The gates waiting for a slot of the kind, listed only when no slot within the count is free.
+    /// The gates waiting for a slot of the kind, listed only when no slot within the count is free or a live critical
+    /// ticket bars the pool.
     pub waiting: Vec<Waiting>,
 }
 
@@ -261,8 +302,12 @@ pub struct SlotRow {
     /// The last non-blank line of the holding gate's log.
     #[serde(rename = "lastLine")]
     pub last_line: Option<String>,
-    /// True for a slot past the pool's count, shown only because it has a claim file.
-    pub extra: bool,
+    /// True for a held slot of a pool while a gate holds or is taking the critical mutex: the critical gate holds it.
+    pub critical: bool,
+    /// For a pool's slot, true when it is past the pool's count and shown only because it has a claim file; `None`, and
+    /// no key, for the critical row.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extra: Option<bool>,
 }
 
 /// What holds a slot.

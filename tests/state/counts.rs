@@ -31,7 +31,7 @@ fn idle_defaults_with_16_processors() {
         for slot in &pool.slots {
             assert_eq!(slot.state, SlotState::Free, "{}", slot.name);
             assert_eq!(slot.name, format!("{}{}", kind.prefix(), slot.index));
-            assert!(!slot.extra, "{}", slot.name);
+            assert_eq!(slot.extra, Some(false), "{}", slot.name);
         }
     }
 }
@@ -45,7 +45,7 @@ fn counts_file_sets_count() {
     let heavy = pool(&state, SlotKind::Heavy);
     assert_eq!((heavy.count, heavy.default_count, heavy.set), (4, 3, Some(count(4))));
     assert_eq!(heavy.slots.len(), 4);
-    assert!(heavy.slots.iter().all(|slot| !slot.extra));
+    assert!(heavy.slots.iter().all(|slot| slot.extra == Some(false)));
     let light = pool(&state, SlotKind::Light);
     assert_eq!(
         (light.count, light.default_count, light.set, light.problem.as_deref()),

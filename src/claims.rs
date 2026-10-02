@@ -1,4 +1,5 @@
-//! The claim files gates write for the slots they hold, and the last line of a holding gate's log.
+//! The claim files gates write for the slots they hold, the arrival tickets they write as they start, and the last line
+//! of a holding gate's log.
 
 use std::collections::HashMap;
 use std::fs::{self, File};
@@ -7,6 +8,8 @@ use std::path::{Path, PathBuf};
 
 use jiff::Timestamp;
 use serde_json::{Map, Value};
+
+use crate::counts::powershell_text;
 
 /// How much of a log's end is read for its last line.
 const LOG_TAIL_BYTES: u64 = 4096;
@@ -42,16 +45,33 @@ pub(crate) struct ReadableClaim {
     pub log: Option<PathBuf>,
 }
 
-/// The claim files of real slots in `dir`, keyed by slot name in lower case. Self-test claims carry a prefix and are
-/// left out; a missing folder holds none.
-pub(crate) fn read_claims(dir: &Path) -> HashMap<String, Claim> {
+/// An arrival ticket's fields, as a gate writes them.
+#[derive(Clone, Debug)]
+pub(crate) struct Ticket {
+    /// The slot the gate asked for, as text.
+    pub kind: String,
+    /// True for a critical gate that holds the machine.
+    pub holds: bool,
+    /// The gate's process id.
+    pub pid: u32,
+    /// The gate's process start, in .NET ticks.
+    pub start_ticks: i64,
+    /// When the gate arrived, in .NET ticks.
+    pub arrived_ticks: i64,
+}
+
+/// The claim files of the slots and of the critical gate in `dir`, keyed by mutex name in lower case: the files named
+/// `<prefix>gate-slot-<n>`, `<prefix>gate-light-slot-<n>` or `<prefix>gate-critical` with a `.json` extension, in any
+/// letter case. A claim without the prefix is left out; a missing folder holds none.
+pub(crate) fn read_claims(dir: &Path, prefix: &str) -> HashMap<String, Claim> {
     let mut claims = HashMap::new();
     let Ok(entries) = fs::read_dir(dir) else {
         return claims;
     };
+    let prefix = prefix.to_ascii_lowercase();
     for entry in entries.flatten() {
         let path = entry.path();
-        let Some(name) = slot_name(&path) else {
+        let Some(name) = mutex_name(&path, &prefix) else {
             continue;
         };
         if path.is_file() {
@@ -61,21 +81,68 @@ pub(crate) fn read_claims(dir: &Path) -> HashMap<String, Claim> {
     claims
 }
 
-/// The slot name a claim file's name gives: `gate-slot-<n>` or `gate-light-slot-<n>` with a `.json` extension, in any
-/// letter case, lowered.
-fn slot_name(path: &Path) -> Option<String> {
+/// The mutex name a claim file's name gives, lowered, when it is a slot's or the critical gate's under the lowered
+/// prefix.
+fn mutex_name(path: &Path, prefix: &str) -> Option<String> {
+    let base = json_base_name(path)?;
+    let name = base.strip_prefix(prefix)?;
+    if name == "gate-critical" {
+        return Some(base);
+    }
+    let digits = name.strip_prefix("gate-light-slot-").or_else(|| name.strip_prefix("gate-slot-"))?;
+    (!digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())).then_some(base)
+}
+
+/// A file's name lowered, without its `.json` extension; `None` for another extension.
+fn json_base_name(path: &Path) -> Option<String> {
     let file = path.file_name()?.to_str()?.to_ascii_lowercase();
-    let base = file.strip_suffix(".json")?;
-    let digits = base.strip_prefix("gate-light-slot-").or_else(|| base.strip_prefix("gate-slot-"))?;
-    (!digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())).then(|| base.to_owned())
+    file.strip_suffix(".json").map(str::to_owned)
+}
+
+/// The arrival tickets in `dir`, the `.json` files that hold every field a gate writes. A ticket that cannot be read
+/// is left out: its gate took its slot and deleted it between the listing and the read, or no gate wrote it. A missing
+/// folder holds none.
+pub(crate) fn read_tickets(dir: &Path) -> Vec<Ticket> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut tickets = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if json_base_name(&path).is_some()
+            && path.is_file()
+            && let Some(ticket) = read_ticket(&path)
+        {
+            tickets.push(ticket);
+        }
+    }
+    tickets
+}
+
+fn read_ticket(path: &Path) -> Option<Ticket> {
+    let Ok(Value::Object(object)) = serde_json::from_str::<Value>(&read_text(path).ok()?) else {
+        return None;
+    };
+    Some(Ticket {
+        kind: powershell_text(object.get("kind")?),
+        holds: object.get("holds")?.as_bool()?,
+        pid: object.get("pid")?.as_u64().and_then(|pid| u32::try_from(pid).ok())?,
+        start_ticks: object.get("startTicks")?.as_i64()?,
+        arrived_ticks: object.get("arrived")?.as_i64()?,
+    })
+}
+
+/// A file's text, without a UTF-8 byte order mark.
+fn read_text(path: &Path) -> io::Result<String> {
+    let bytes = fs::read(path)?;
+    Ok(String::from_utf8_lossy(bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(&bytes)).into_owned())
 }
 
 fn read_claim(path: &Path) -> Claim {
-    let bytes = match fs::read(path) {
-        Ok(bytes) => bytes,
+    let text = match read_text(path) {
+        Ok(text) => text,
         Err(error) => return unreadable(&error.to_string()),
     };
-    let text = String::from_utf8_lossy(bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(&bytes));
     match serde_json::from_str::<Value>(&text) {
         Ok(Value::Object(object)) => parse_claim(object),
         Ok(_) => unreadable("the claim is not a JSON object"),

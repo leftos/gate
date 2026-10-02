@@ -3,6 +3,11 @@
 #![expect(clippy::expect_used, reason = "a test that cannot set up its files or find its pool must fail loudly")]
 
 mod counts;
+mod critical;
+#[cfg(all(windows, target_pointer_width = "64"))]
+mod live;
+mod prefix;
+mod queue;
 mod shape;
 mod slots;
 mod support;

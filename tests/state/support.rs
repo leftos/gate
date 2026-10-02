@@ -18,9 +18,18 @@ pub const START_CLOSE: &str = "2026-10-01T11:00:02Z";
 pub const START_FAR: &str = "2026-10-01T11:00:03.5Z";
 /// A waiting light gate's command line.
 pub const LIGHT_GATE: &str = r"pwsh -NoProfile -File C:\Users\me\.claude\tools\gate\gate.ps1 -Log x -Slot light -- cargo test";
+/// A critical gate's command line.
+pub const CRITICAL_GATE: &str = r"pwsh -NoProfile -File C:\Users\me\.claude\tools\gate\gate.ps1 -Log x -Slot critical -- cargo test";
+/// .NET ticks (100 ns since 0001-01-01) at the Unix epoch.
+const UNIX_EPOCH_TICKS: i128 = 621_355_968_000_000_000;
 
 pub fn ts(text: &str) -> Timestamp {
     text.parse().expect("a test timestamp parses")
+}
+
+/// A test timestamp as .NET ticks, the unit of a ticket's `arrived` and `startTicks`.
+pub fn ticks(text: &str) -> i64 {
+    i64::try_from(ts(text).as_nanosecond().div_euclid(100) + UNIX_EPOCH_TICKS).expect("a test moment fits in ticks")
 }
 
 pub struct Machine {
@@ -28,6 +37,8 @@ pub struct Machine {
     pub processes: Vec<ProcessInfo>,
     pub open: HashSet<String>,
     pub cwds: HashMap<u32, String>,
+    /// The gate's test prefix, empty unless a test sets it.
+    pub prefix: String,
 }
 
 impl Machine {
@@ -43,6 +54,7 @@ impl Machine {
             processes: Vec::new(),
             open: HashSet::new(),
             cwds: HashMap::new(),
+            prefix: String::new(),
         }
     }
 
@@ -53,6 +65,7 @@ impl Machine {
             processors: 16,
             local_app_data: self.dir.clone(),
             slot_counts_override: None,
+            slot_prefix: self.prefix.clone(),
         }
     }
 
@@ -70,6 +83,13 @@ impl Machine {
 
     pub fn write_claim(&self, file_name: &str, text: &str) {
         fs::write(self.dir.join("gate").join("slots").join(file_name), text).expect("a claim file can be written");
+    }
+
+    /// Writes an arrival ticket into `gate\<folder>`, such as `waiting`.
+    pub fn write_ticket(&self, folder: &str, file_name: &str, text: &str) {
+        let dir = self.dir.join("gate").join(folder);
+        fs::create_dir_all(&dir).expect("the ticket folder can be made");
+        fs::write(dir.join(file_name), text).expect("a ticket can be written");
     }
 
     pub fn add_process(&mut self, pid: u32, parent_pid: u32, name: &str, command_line: Option<&str>, created: Option<&str>) {
@@ -120,6 +140,17 @@ pub fn claim(pid: u32, log: Option<&str>, cwd: &str) -> Value {
         "command": "cargo test",
         "log": log,
         "timeoutSeconds": 600.0,
+    })
+}
+
+/// An arrival ticket as the gate writes it, with the gate's key order, for a process that started at [`START`].
+pub fn ticket(kind: &str, pid: u32, arrived: i64, holds: bool) -> Value {
+    json!({
+        "kind": kind,
+        "arrived": arrived,
+        "pid": pid,
+        "startTicks": ticks(START),
+        "holds": holds,
     })
 }
 

@@ -38,7 +38,7 @@ fn live_claim_is_busy_with_descendants_and_last_line() {
     assert_eq!(row.stale, None);
     assert_eq!(row.processes, 3);
     assert_eq!(row.last_line.as_deref(), Some("second line"));
-    assert!(!row.extra);
+    assert_eq!(row.extra, Some(false));
 }
 
 #[test]
@@ -82,8 +82,8 @@ fn claim_index_past_count_is_extra() {
 
     let heavy = pool(&state, SlotKind::Heavy);
     assert_eq!(heavy.count, 3);
-    let rows: Vec<(u32, bool)> = heavy.slots.iter().map(|slot| (slot.index, slot.extra)).collect();
-    assert_eq!(rows, [(0, false), (1, false), (2, false), (5, true)]);
+    let rows: Vec<(u32, Option<bool>)> = heavy.slots.iter().map(|slot| (slot.index, slot.extra)).collect();
+    assert_eq!(rows, [(0, Some(false)), (1, Some(false)), (2, Some(false)), (5, Some(true))]);
     let extra = heavy.slots.iter().find(|slot| slot.index == 5).expect("the extra row exists");
     assert_eq!(extra.name, "gate-slot-5");
     assert!(extra.stale.is_some());

@@ -3,11 +3,14 @@
 use gate_state::SlotKind;
 use serde_json::Value;
 
-use crate::support::{LIGHT_GATE, Machine, START, claim, keys};
+use crate::support::{CRITICAL_GATE, LIGHT_GATE, Machine, NOW, START, claim, keys, ticket, ticks};
 
-const TOP: [&str; 4] = ["now", "machine", "processors", "pools"];
+const TOP: [&str; 6] = ["now", "machine", "processors", "critical", "queue", "pools"];
 const POOL: [&str; 7] = ["kind", "count", "default", "set", "problem", "slots", "waiting"];
-const SLOT: [&str; 8] = ["index", "name", "state", "claim", "stale", "processes", "lastLine", "extra"];
+const SLOT: [&str; 9] = ["index", "name", "state", "claim", "stale", "processes", "lastLine", "critical", "extra"];
+const CRITICAL: [&str; 2] = ["holder", "waiting"];
+const HOLDER: [&str; 8] = ["index", "name", "state", "claim", "stale", "processes", "lastLine", "critical"];
+const QUEUE: [&str; 7] = ["kind", "holds", "pid", "arrived", "ageSeconds", "cwd", "commandLine"];
 const WAITING: [&str; 4] = ["pid", "since", "cwd", "commandLine"];
 const CLAIM: [&str; 9] = [
     "kind",
@@ -27,6 +30,15 @@ fn array(value: &Value, key: &str) -> Vec<Value> {
 
 fn assert_shape(value: &Value) {
     assert_eq!(keys(value), TOP);
+    let critical = value.get("critical").expect("the state has a critical row");
+    assert_eq!(keys(critical), CRITICAL);
+    assert_eq!(keys(critical.get("holder").expect("the critical row has a holder")), HOLDER);
+    for waiting in array(critical, "waiting") {
+        assert_eq!(keys(&waiting), WAITING);
+    }
+    for ticket in array(value, "queue") {
+        assert_eq!(keys(&ticket), QUEUE);
+    }
     for pool in array(value, "pools") {
         assert_eq!(keys(&pool), POOL);
         for slot in array(&pool, "slots") {
@@ -64,4 +76,26 @@ fn serialised_key_order_matches_script() {
     assert_eq!(keys(first.get("claim").expect("a busy slot has its claim")), CLAIM);
     let second = slots.get(1).expect("light slot 1 is listed");
     assert_eq!(second.get("state").and_then(Value::as_str), Some("held"));
+}
+
+#[test]
+fn state_keys_follow_dashboard_order() {
+    let machine = Machine::new("state_keys_follow_dashboard_order");
+    let idle = serde_json::to_value(machine.state()).expect("the idle state serialises");
+    assert_eq!(keys(&idle), TOP);
+}
+
+#[test]
+fn critical_and_queue_keys_follow_dashboard_order() {
+    let mut machine = Machine::new("critical_and_queue_keys_follow_dashboard_order");
+    machine.write_claim("gate-critical.json", &claim(700, None, "C:\\work").to_string());
+    machine.add_process(700, 1, "pwsh.exe", Some(CRITICAL_GATE), Some(START));
+    machine.add_process(701, 1, "pwsh.exe", Some(CRITICAL_GATE), Some(START));
+    machine.write_ticket("waiting", "701.json", &ticket("critical", 701, ticks(NOW), false).to_string());
+    let state = serde_json::to_value(machine.state()).expect("the state serialises");
+
+    assert_shape(&state);
+    let critical = state.get("critical").expect("the state has a critical row");
+    assert_eq!(array(critical, "waiting").len(), 1);
+    assert_eq!(array(&state, "queue").len(), 1);
 }

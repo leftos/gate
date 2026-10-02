@@ -55,7 +55,7 @@ fn waiting_ignores_extra_slots_when_deciding_full() {
 
     let light = pool(&state, SlotKind::Light);
     let extra = light.slots.iter().find(|slot| slot.index == 9).expect("the extra slot is listed");
-    assert!(extra.extra);
+    assert_eq!(extra.extra, Some(true));
     assert_eq!(extra.state, SlotState::Free);
     let waiting: Vec<u32> = light.waiting.iter().map(|waiting| waiting.pid).collect();
     assert_eq!(waiting, [300], "a free extra slot does not stop the pool being full");
