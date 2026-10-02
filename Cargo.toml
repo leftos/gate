@@ -1,0 +1,18 @@
+[package]
+name = "gate-state"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+doctest = false
+
+[lints]
+workspace = true
+
+[dependencies]
+jiff = "0.2.37"
+regex = "1.13.1"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.151", features = ["preserve_order"] }
+thiserror = "2.0.21"
