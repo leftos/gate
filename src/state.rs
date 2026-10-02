@@ -4,7 +4,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 use jiff::{SignedDuration, Timestamp};
-use proc_table::{ProcessInfo, ProcessTable};
+use proc_table::{ProcessInfo, ProcessTable, ProcessTree};
 use regex::Regex;
 
 use crate::claims::{Claim, ReadableClaim, Ticket, last_log_line, read_claims, read_tickets};
@@ -118,24 +118,24 @@ fn age_seconds(now: i128, arrived: i64) -> f64 {
 
 /// The process snapshot, indexed by pid and by parent.
 struct Table {
-    processes: Vec<ProcessInfo>,
-    by_pid: HashMap<u32, usize>,
+    tree: ProcessTree,
     children: HashMap<u32, Vec<u32>>,
 }
 
 impl Table {
     fn new(processes: Vec<ProcessInfo>) -> Self {
-        let mut by_pid = HashMap::new();
         let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
-        for (position, process) in processes.iter().enumerate() {
-            by_pid.insert(process.pid, position);
+        for process in &processes {
             children.entry(process.parent_pid).or_default().push(process.pid);
         }
-        Self { processes, by_pid, children }
+        Self {
+            tree: ProcessTree::new(processes),
+            children,
+        }
     }
 
     fn get(&self, pid: u32) -> Option<&ProcessInfo> {
-        self.by_pid.get(&pid).and_then(|position| self.processes.get(*position))
+        self.tree.get(pid)
     }
 
     /// The number of processes under `root`, the root excluded, guarding against pid reuse making a cycle.
@@ -179,10 +179,7 @@ impl Table {
     fn waiting(&self, kind: &str, holders: &HashSet<u32>, cwds: &dyn CwdReader) -> Vec<Waiting> {
         let pattern = waiting_pattern(kind);
         let mut waiting = Vec::new();
-        for (position, process) in self.processes.iter().enumerate() {
-            if self.by_pid.get(&process.pid) != Some(&position) {
-                continue;
-            }
+        for process in self.tree.iter() {
             let Some(command_line) = &process.command_line else {
                 continue;
             };
