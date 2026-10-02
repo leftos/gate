@@ -117,7 +117,7 @@ fn unreadable_claim_is_stale_unreadable() {
     let object = stale.as_object().expect("the stale claim is an object");
     assert_eq!(object.keys().collect::<Vec<_>>(), ["unreadable"]);
     let message = object.get("unreadable").and_then(Value::as_str).expect("the reason is text");
-    assert!(!message.is_empty());
+    assert_ne!(message, "");
 }
 
 #[test]

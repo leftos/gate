@@ -1,6 +1,6 @@
 //! The arrival tickets of the gates waiting for a slot or for the machine, and the pools a critical ticket bars.
 
-use gate_state::{DashboardState, SlotKind};
+use gate_state::{DashboardState, QueueTicket, SlotKind};
 use serde_json::{Value, json};
 
 use crate::support::{CRITICAL_GATE, LIGHT_GATE, Machine, NOW, START, START_CLOSE, START_FAR, ticket, ticks};
@@ -139,7 +139,7 @@ fn unbarred_pool_with_free_slot_lists_no_waiting() {
     let state = machine.state();
 
     assert_eq!(queue_pids(&state), [300]);
-    assert!(light_waiting(&state).is_empty());
+    assert_eq!(light_waiting(&state), Vec::<u32>::new());
 }
 
 #[test]
@@ -158,6 +158,6 @@ fn ended_critical_ticket_does_not_bar() {
     machine.write_ticket("waiting", "700.json", &ticket("critical", 700, ticks(NOW), false).to_string());
     let state = machine.state();
 
-    assert!(state.queue.is_empty());
-    assert!(light_waiting(&state).is_empty());
+    assert_eq!(state.queue, Vec::<QueueTicket>::new());
+    assert_eq!(light_waiting(&state), Vec::<u32>::new());
 }

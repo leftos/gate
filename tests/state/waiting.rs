@@ -1,6 +1,6 @@
 //! The gates listed as waiting for a full pool.
 
-use gate_state::{SlotKind, SlotState};
+use gate_state::{SlotKind, SlotState, Waiting};
 
 use crate::support::{LIGHT_GATE, Machine, START, claim, pool};
 
@@ -28,7 +28,7 @@ fn waiting_listed_only_when_pool_full() {
     assert_eq!(waiting.since.as_deref(), Some("2026-10-01T11:00:00.5000000Z"));
     assert_eq!(waiting.cwd.as_deref(), Some("C:\\work"));
     assert_eq!(waiting.command_line, LIGHT_GATE);
-    assert!(pool(&state, SlotKind::Heavy).waiting.is_empty());
+    assert_eq!(pool(&state, SlotKind::Heavy).waiting, Vec::<Waiting>::new());
 }
 
 #[test]

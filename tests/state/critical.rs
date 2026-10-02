@@ -1,6 +1,6 @@
 //! The critical request: its holder row, the slots it holds and the gates waiting for it.
 
-use gate_state::{DashboardState, SlotKind, SlotState};
+use gate_state::{DashboardState, SlotKind, SlotState, Waiting};
 
 use crate::support::{CRITICAL_GATE, LIGHT_GATE, Machine, START, claim, pool};
 
@@ -30,7 +30,7 @@ fn idle_slot_rows_are_not_critical() {
     assert_eq!((holder.index, holder.name.as_str(), holder.state), (0, "gate-critical", SlotState::Free));
     assert!(!holder.critical);
     assert_eq!(holder.extra, None, "the critical row has no extra key");
-    assert!(state.critical.waiting.is_empty());
+    assert_eq!(state.critical.waiting, Vec::<Waiting>::new());
 }
 
 #[test]
