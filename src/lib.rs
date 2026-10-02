@@ -69,6 +69,16 @@ impl ProcessTree {
         self.by_pid.get(&pid).and_then(|position| self.processes.get(*position))
     }
 
+    /// Every pid's process once, in snapshot order: when two processes share a pid, only the one [`ProcessTree::get`]
+    /// returns is yielded, at its own place in the snapshot.
+    pub fn iter(&self) -> impl Iterator<Item = &ProcessInfo> {
+        self.processes
+            .iter()
+            .enumerate()
+            .filter(|(position, process)| self.by_pid.get(&process.pid) == Some(position))
+            .map(|(_, process)| process)
+    }
+
     /// The process's parent, then the parent's parent, and so on; `pid` itself is never yielded. The walk stops at a
     /// parent pid the snapshot does not have, at a pid already visited (pid reuse can make a cycle), and at a parent
     /// that started after its child (the real parent exited and a newer process took its pid). A process whose start
@@ -187,6 +197,41 @@ mod tests {
         ]);
         assert_eq!(ancestor_pids(&tree, 3), Vec::<u32>::new());
         assert_eq!(ancestor_pids(&tree, 2), vec![1]);
+    }
+
+    fn iter_pids(tree: &ProcessTree) -> Vec<u32> {
+        tree.iter().map(|process| process.pid).collect()
+    }
+
+    #[test]
+    fn iter_yields_a_duplicate_pid_once_as_get_does() {
+        let tree = ProcessTree::new(vec![
+            process(7, 1, "2026-10-01T10:00:00Z"),
+            process(8, 1, "2026-10-01T10:00:01Z"),
+            process(7, 2, "2026-10-01T10:00:02Z"),
+        ]);
+        let sevens: Vec<&ProcessInfo> = tree.iter().filter(|process| process.pid == 7).collect();
+        assert_eq!(sevens.len(), 1);
+        assert_eq!(sevens.first().copied(), tree.get(7));
+        assert_eq!(sevens.first().map(|process| process.parent_pid), Some(2));
+    }
+
+    #[test]
+    fn iter_follows_snapshot_order() {
+        let tree = ProcessTree::new(vec![
+            process(30, 0, "2026-10-01T10:00:00Z"),
+            process(10, 0, "2026-10-01T10:00:00Z"),
+            process(20, 0, "2026-10-01T10:00:00Z"),
+            process(10, 5, "2026-10-01T10:00:01Z"),
+            process(40, 0, "2026-10-01T10:00:00Z"),
+        ]);
+        assert_eq!(iter_pids(&tree), vec![30, 20, 10, 40]);
+    }
+
+    #[test]
+    fn iter_of_empty_snapshot_yields_nothing() {
+        let tree = ProcessTree::new(Vec::new());
+        assert_eq!(iter_pids(&tree), Vec::<u32>::new());
     }
 
     #[test]
