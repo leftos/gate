@@ -181,27 +181,6 @@ pub struct StateInputs {
     pub slot_prefix: String,
 }
 
-/// One process of a [`ProcessTable`] snapshot.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ProcessInfo {
-    /// The process id.
-    pub pid: u32,
-    /// The id of the process that started it.
-    pub parent_pid: u32,
-    /// The executable's file name, such as `conhost.exe`.
-    pub name: String,
-    /// The command line, when it could be read.
-    pub command_line: Option<String>,
-    /// When the process started, when that could be read.
-    pub created: Option<Timestamp>,
-}
-
-/// The machine's processes, taken in one snapshot per state.
-pub trait ProcessTable {
-    /// Every process running now.
-    fn snapshot(&self) -> Vec<ProcessInfo>;
-}
-
 /// Whether a gate slot's mutex exists.
 pub trait MutexProbe {
     /// True when some process has the mutex `Local\<name>` open; asking must not take it.

@@ -4,13 +4,13 @@
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 use jiff::{SignedDuration, Timestamp};
+use proc_table::{ProcessInfo, ProcessTable};
 use regex::Regex;
 
 use crate::claims::{Claim, ReadableClaim, Ticket, last_log_line, read_claims, read_tickets};
 use crate::counts::{CountsFile, pool_count, read_counts_file, slot_count_path};
 use crate::model::{
-    CriticalState, CwdReader, DashboardState, MutexProbe, PoolState, ProcessInfo, ProcessTable, QueueTicket, SlotKind, SlotRow, SlotState,
-    StateInputs, Waiting,
+    CriticalState, CwdReader, DashboardState, MutexProbe, PoolState, QueueTicket, SlotKind, SlotRow, SlotState, StateInputs, Waiting,
 };
 
 /// How far a live process's start time may be from the one its claim records, in nanoseconds.

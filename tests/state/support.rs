@@ -4,8 +4,9 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use gate_state::{CwdReader, DashboardState, MutexProbe, PoolState, ProcessInfo, ProcessTable, SlotKind, StateInputs, dashboard_state};
+use gate_state::{CwdReader, DashboardState, MutexProbe, PoolState, SlotKind, StateInputs, dashboard_state};
 use jiff::Timestamp;
+use proc_table::{ProcessInfo, ProcessTable};
 use serde_json::{Value, json};
 
 /// The moment every state describes.
