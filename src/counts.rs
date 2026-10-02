@@ -229,7 +229,7 @@ pub(crate) fn format_count_value(value: &Value) -> String {
     format!("'{}'", powershell_text(value))
 }
 
-/// A JSON value as text the way the gate dashboard's PowerShell turns it into a string: null is empty, a boolean is
+/// A JSON value as text the way PowerShell turns it into a string: null is empty, a boolean is
 /// `True` or `False`, a whole number has no fraction, an array's items are joined by spaces, and an object is its JSON.
 pub(crate) fn powershell_text(value: &Value) -> String {
     match value {

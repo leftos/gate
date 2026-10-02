@@ -1,4 +1,4 @@
-//! The serialised state's shape: the gate dashboard's keys, in its order, at every level.
+//! The serialised state's shape: the keys `GET /api/gate/slots` serves, in their order, at every level.
 
 use gate_state::SlotKind;
 use serde_json::Value;

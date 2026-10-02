@@ -24,7 +24,7 @@ const MAX_TICKS: i64 = 3_155_378_975_999_999_999;
 /// The `-Slot` value of a gate that asks for the machine.
 const CRITICAL: &str = "critical";
 
-/// The state the gate dashboard page shows: the critical request, the queue of arrival tickets, and each pool's counts,
+/// The state the Gates tab shows: the critical request, the queue of arrival tickets, and each pool's counts,
 /// its slots and, when it is full or a critical request bars it, the gates waiting for it.
 #[must_use]
 pub fn dashboard_state(inputs: &StateInputs, processes: &dyn ProcessTable, mutexes: &dyn MutexProbe, cwds: &dyn CwdReader) -> DashboardState {
@@ -85,7 +85,7 @@ fn busy_pid(row: &SlotRow) -> Option<u32> {
     u32::try_from(pid).ok()
 }
 
-/// A timestamp as ISO 8601 UTC with seven fractional digits and `Z`, the gate dashboard's round-trip format.
+/// A timestamp as ISO 8601 UTC with seven fractional digits and `Z`, .NET's round-trip `DateTime` format (`o`).
 fn iso_utc(timestamp: Timestamp) -> String {
     jiff::fmt::strtime::format("%Y-%m-%dT%H:%M:%S.%7fZ", timestamp).unwrap_or_else(|_| timestamp.to_string())
 }
@@ -95,7 +95,7 @@ fn ticks_of(timestamp: Timestamp) -> i128 {
     timestamp.as_nanosecond().div_euclid(100) + UNIX_EPOCH_TICKS
 }
 
-/// .NET ticks as the gate dashboard's round-trip format, or `None` outside the range a `DateTime` holds.
+/// .NET ticks as text in .NET's round-trip `DateTime` format (`o`), or `None` outside the range a `DateTime` holds.
 fn format_ticks(ticks: i64) -> Option<String> {
     if !(0..=MAX_TICKS).contains(&ticks) {
         return None;
@@ -271,7 +271,7 @@ impl Machine<'_> {
         }
     }
 
-    /// The row of the mutex `name`; its claim is looked up in any letter case, as the gate dashboard's table does.
+    /// The row of the mutex `name`; its claim is looked up by the name in any letter case.
     fn slot_row(&self, name: String, index: u32) -> SlotRow {
         let claim = self.claims.get(&name.to_ascii_lowercase());
         let mut row = SlotRow {

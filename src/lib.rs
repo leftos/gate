@@ -1,4 +1,4 @@
-//! The gate slots' state as the gate dashboard shows it: each pool's counts, its slots, who holds them and who waits,
+//! The gate slots' state as the Gates tab shows it: each pool's counts, its slots, who holds them and who waits,
 //! read from the gates' claim files, the slot counts file, a process snapshot and the slot mutexes. The process table,
 //! the mutexes and process working directories come in through traits, so a daemon and the tests supply their own.
 //! The counts and claim files are read as strict JSON: PowerShell's `ConvertFrom-Json` is more lenient, so a hand-edited

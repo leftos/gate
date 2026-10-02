@@ -50,7 +50,7 @@ impl SlotKind {
     ///
     /// # Errors
     ///
-    /// [`ParseError::Kind`] for any other value, carrying the value as the gate dashboard quotes it.
+    /// [`ParseError::Kind`] for any other value, carrying the value as the refusal quotes it.
     pub fn from_request(value: &Value) -> Result<Self, ParseError> {
         let text = powershell_text(value);
         for kind in SlotKind::ALL {
@@ -103,7 +103,7 @@ impl SlotCount {
     ///
     /// # Errors
     ///
-    /// [`ParseError::Count`] for any other value, carrying the value as the gate dashboard quotes it.
+    /// [`ParseError::Count`] for any other value, carrying the value as the refusal quotes it.
     pub fn from_request(value: &Value) -> Result<Option<Self>, ParseError> {
         if value.is_null() {
             return Ok(None);
@@ -115,7 +115,7 @@ impl SlotCount {
     }
 }
 
-/// Why a slot-count request's `kind` or `count` was refused, in the gate dashboard's words.
+/// Why a slot-count request's `kind` or `count` was refused, in the words the slot-count POST's 400 carries.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ParseError {
     /// The kind was neither `heavy` nor `light`; the value is quoted as the message shows it.
@@ -193,7 +193,7 @@ pub trait CwdReader {
     fn current_dir(&self, pid: u32) -> Option<String>;
 }
 
-/// Everything the gate dashboard page shows, in the gate dashboard's JSON shape and key order.
+/// Everything the Gates tab shows, in the JSON shape and key order `GET /api/gate/slots` serves.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct DashboardState {
     /// The moment described, ISO 8601 UTC with seven fractional digits.

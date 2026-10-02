@@ -1,4 +1,4 @@
-//! The live machine behind the state's seams, read the way the gate dashboard reads it: the slot mutexes by name and a
+//! The live machine behind the state's seams: the slot mutexes by the names `gate.ps1` gives them and a
 //! process's working directory from its PEB, with proc-table's [`Win32ProcessTable`] for the process table.
 
 use std::path::PathBuf;
@@ -33,7 +33,7 @@ pub enum LiveInputsError {
     Processors(#[source] std::io::Error),
 }
 
-/// The inputs of the state of this machine now, read as the gate dashboard reads them.
+/// The inputs of the state of this machine now, read from its environment and its processor count.
 ///
 /// The machine's name comes from `COMPUTERNAME`, the processor count from the processors this process may run on (as
 /// .NET's `Environment.ProcessorCount` counts them), and the gate's folder from `LOCALAPPDATA`. The test-only
