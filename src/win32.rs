@@ -1,18 +1,23 @@
 //! The live machine behind the state's seams: the slot mutexes by the names `gate.ps1` gives them and a
 //! process's working directory from its PEB, with proc-table's [`Win32ProcessTable`] for the process table.
 
+use std::cell::OnceCell;
 use std::path::PathBuf;
 
 use jiff::Timestamp;
-use proc_table::Win32ProcessTable;
 use proc_table::win32::{OwnedHandle, open_process, read_parameters_string};
+use proc_table::{ProcessTable, ProcessTree, Win32ProcessTable};
 use windows_sys::Win32::System::Threading::{IsWow64Process, OpenMutexW, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ, SYNCHRONIZATION_SYNCHRONIZE};
 
+use crate::journal::{History, JournalCache};
 use crate::model::{CwdReader, DashboardState, MutexProbe, StateInputs};
 use crate::state::dashboard_state;
 
 /// The offset of the `CurrentDirectory` path's `UNICODE_STRING` in 64-bit `RTL_USER_PROCESS_PARAMETERS`.
 const PARAMS_CURRENT_DIRECTORY: usize = 0x38;
+/// How far a live process's start time may be from the `processStart` a journal line records, in nanoseconds: the
+/// tolerance a claim's start time gets.
+const PROCESS_START_TOLERANCE_NANOS: i128 = 2_000_000_000;
 
 /// The slot mutexes in the session's `Local\` namespace, opened only to see that they exist.
 #[derive(Clone, Copy, Debug)]
@@ -31,6 +36,23 @@ pub enum LiveInputsError {
     /// The processor count the pools' default counts follow could not be read.
     #[error("could not read the processor count: {0}")]
     Processors(#[source] std::io::Error),
+}
+
+/// Why the gate journal's history could not be read.
+#[derive(Debug, thiserror::Error)]
+pub enum LiveHistoryError {
+    /// The inputs naming the journal's folder and prefix could not be read.
+    #[error(transparent)]
+    Inputs(#[from] LiveInputsError),
+    /// A journal file exists but could not be read.
+    #[error("could not read the gate journal in {dir}: {source}")]
+    Journal {
+        /// The folder holding the journal.
+        dir: PathBuf,
+        /// What the read met.
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 /// The inputs of the state of this machine now, read from its environment and its processor count.
@@ -66,6 +88,33 @@ pub fn live_inputs() -> Result<StateInputs, LiveInputsError> {
 /// The [`LiveInputsError`] of [`live_inputs`].
 pub fn live_state() -> Result<DashboardState, LiveInputsError> {
     Ok(dashboard_state(&live_inputs()?, &Win32ProcessTable, &Win32MutexProbe, &Win32CwdReader))
+}
+
+/// The gate journal's history on this machine now, read through `cache` from `%LOCALAPPDATA%\gate` with the
+/// `GATE_TEST_SLOT_PREFIX` [`live_inputs`] reads. An open run's gate is live when its pid is running and started within
+/// 2 s of the `processStart` the journal records; the process table is read only when a run is open. It blocks on the
+/// file reads and the process snapshot, so an async caller runs it on a blocking thread.
+///
+/// # Errors
+///
+/// The [`LiveInputsError`] of [`live_inputs`], or [`LiveHistoryError::Journal`] when a journal file exists but cannot
+/// be read.
+pub fn live_history(cache: &mut JournalCache) -> Result<History, LiveHistoryError> {
+    let inputs = live_inputs()?;
+    let dir = inputs.local_app_data.join("gate");
+    let processes: OnceCell<ProcessTree> = OnceCell::new();
+    let is_live = |pid: u32, process_start: &str| {
+        let Ok(recorded) = process_start.parse::<Timestamp>() else {
+            return false;
+        };
+        let tree = processes.get_or_init(|| ProcessTree::new(Win32ProcessTable.snapshot()));
+        tree.get(pid)
+            .and_then(|process| process.created)
+            .is_some_and(|created| (created.as_nanosecond() - recorded.as_nanosecond()).abs() < PROCESS_START_TOLERANCE_NANOS)
+    };
+    cache
+        .read(&dir, &inputs.slot_prefix, inputs.now, is_live)
+        .map_err(|source| LiveHistoryError::Journal { dir, source })
 }
 
 fn required_variable(name: &'static str) -> Result<std::ffi::OsString, LiveInputsError> {

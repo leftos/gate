@@ -5,6 +5,7 @@
 mod counts;
 mod critical;
 mod fixtures;
+mod journal;
 mod prefix;
 mod queue;
 mod shape;
