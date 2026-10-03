@@ -10,8 +10,7 @@ use proc_table::{ProcessTable, ProcessTree, Win32ProcessTable};
 use windows_sys::Win32::System::Threading::{IsWow64Process, OpenMutexW, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ, SYNCHRONIZATION_SYNCHRONIZE};
 
 use crate::journal::{History, JournalCache};
-use crate::model::{CwdReader, DashboardState, MutexProbe, StateInputs};
-use crate::state::dashboard_state;
+use crate::model::{CwdReader, MutexProbe, StateInputs};
 
 /// The offset of the `CurrentDirectory` path's `UNICODE_STRING` in 64-bit `RTL_USER_PROCESS_PARAMETERS`.
 const PARAMS_CURRENT_DIRECTORY: usize = 0x38;
@@ -77,17 +76,6 @@ pub fn live_inputs() -> Result<StateInputs, LiveInputsError> {
         slot_counts_override: optional_variable("GATE_TEST_SLOT_COUNTS").map(PathBuf::from),
         slot_prefix: optional_variable("GATE_TEST_SLOT_PREFIX").map_or_else(String::new, |prefix| prefix.to_string_lossy().into_owned()),
     })
-}
-
-/// The state of this machine now: [`dashboard_state`] over [`live_inputs`] and the Win32 process table, mutexes and
-/// working directories. It blocks on the process snapshot and the file reads, so an async caller runs it on a blocking
-/// thread.
-///
-/// # Errors
-///
-/// The [`LiveInputsError`] of [`live_inputs`].
-pub fn live_state() -> Result<DashboardState, LiveInputsError> {
-    Ok(dashboard_state(&live_inputs()?, &Win32ProcessTable, &Win32MutexProbe, &Win32CwdReader))
 }
 
 /// The gate journal's history on this machine now, read through `cache` from `%LOCALAPPDATA%\gate` with the
