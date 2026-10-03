@@ -3,7 +3,7 @@
 use std::fs;
 use std::path::Path;
 
-use gate_state::{SlotCount, SlotKind, SlotState, dashboard_state};
+use gate_state::{CommandSummary, HistoryRun, JournalCache, RunState, SlotCount, SlotKind, SlotState, dashboard_state};
 use serde_json::Value;
 
 use crate::support::{Machine, pool, ts};
@@ -14,6 +14,8 @@ const CLAIM: &str = include_str!("fixtures/claim.json");
 const TICKET: &str = include_str!("fixtures/ticket.json");
 /// The counts file the capture ran under.
 const SLOT_COUNTS: &str = include_str!("fixtures/slot-counts.json");
+/// The journal of four light gates under one light slot, plus a hand-written abandoned one.
+const JOURNAL: &str = include_str!("fixtures/journal.jsonl");
 /// The self-test prefix the capture ran under, in front of the claim's name and the waiting folder's.
 const PREFIX: &str = "ops28-";
 /// The neutral working directory the fixtures name in place of the capture's, JSON-escaped as the files have it.
@@ -104,4 +106,86 @@ fn captured_slot_counts_set_both_pools() {
     assert_eq!((light.count, light.default_count, light.set), (2, 7, Some(count(2))));
     assert_eq!(light.problem, None);
     assert_eq!(light.slots.len(), 2);
+}
+
+#[test]
+fn captured_journal_is_read_into_runs() {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join("gate-state")
+        .join("captured_journal_is_read_into_runs");
+    if dir.exists() {
+        fs::remove_dir_all(&dir).expect("the test's old folder can be removed");
+    }
+    fs::create_dir_all(&dir).expect("the test's folder can be made");
+    fs::write(dir.join("ops72-events.jsonl"), JOURNAL).expect("the journal can be written");
+    let not_live = |_pid: u32, _process_start: &str| false;
+
+    let history = JournalCache::default()
+        .read(&dir, "ops72-", ts("2026-10-03T06:00:00Z"), not_live)
+        .expect("the journal can be read");
+
+    let states: Vec<(u32, RunState)> = history.runs.iter().map(|run| (run.slot.unwrap_or(u32::MAX), run.state)).collect();
+    assert_eq!(
+        states,
+        [
+            (u32::MAX, RunState::Abandoned),
+            (0, RunState::Ok),
+            (0, RunState::Ok),
+            (0, RunState::Failed),
+            (0, RunState::Ok),
+        ],
+        "newest first: the abandoned gate, the gate that waited, the sleep, exit 3, exit 0"
+    );
+    assert_eq!(
+        history.runs[4],
+        HistoryRun {
+            command: "cmd /c exit 0".to_owned(),
+            kind: "light".to_owned(),
+            slot: Some(0),
+            state: RunState::Ok,
+            queued: Some("2026-10-03T05:04:39.1209178Z".to_owned()),
+            started: Some("2026-10-03T05:04:39.1866333Z".to_owned()),
+            waited_seconds: Some(0.065),
+            held_seconds: Some(0.105),
+            status: Some(0),
+        }
+    );
+    assert_eq!(
+        history.runs[3],
+        HistoryRun {
+            command: "cmd /c exit 3".to_owned(),
+            kind: "light".to_owned(),
+            slot: Some(0),
+            state: RunState::Failed,
+            queued: Some("2026-10-03T05:04:39.6873680Z".to_owned()),
+            started: Some("2026-10-03T05:04:39.7589416Z".to_owned()),
+            waited_seconds: Some(0.071),
+            held_seconds: Some(0.096),
+            status: Some(3),
+        }
+    );
+    assert_eq!(
+        history.runs[1].waited_seconds,
+        Some(8.12),
+        "the gate that queued behind the sleep waited for it"
+    );
+    assert_eq!(
+        history.summary,
+        [
+            CommandSummary {
+                command: "cmd /c exit 0".to_owned(),
+                count: 2,
+                p50_seconds: 0.105,
+                p90_seconds: 0.132,
+                max_seconds: 0.132,
+            },
+            CommandSummary {
+                command: "pwsh -NoProfile -Command Start-Sleep 10".to_owned(),
+                count: 1,
+                p50_seconds: 10.308,
+                p90_seconds: 10.308,
+                max_seconds: 10.308,
+            },
+        ]
+    );
 }
