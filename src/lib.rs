@@ -33,6 +33,16 @@ pub trait ProcessTable {
     fn snapshot(&self) -> Vec<ProcessInfo>;
 }
 
+/// A process table that lists no processes: the table on a platform without a live one, and in tests that need none.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct EmptyTable;
+
+impl ProcessTable for EmptyTable {
+    fn snapshot(&self) -> Vec<ProcessInfo> {
+        Vec::new()
+    }
+}
+
 /// FILETIME ticks (100 ns since 1601-01-01 UTC) at the Unix epoch.
 const FILETIME_UNIX_EPOCH: i64 = 116_444_736_000_000_000;
 
@@ -109,7 +119,7 @@ fn started_after(parent: &ProcessInfo, child: &ProcessInfo) -> bool {
 mod tests {
     use jiff::Timestamp;
 
-    use super::{FILETIME_UNIX_EPOCH, ProcessInfo, ProcessTree, filetime_to_timestamp};
+    use super::{EmptyTable, FILETIME_UNIX_EPOCH, ProcessInfo, ProcessTable as _, ProcessTree, filetime_to_timestamp};
 
     fn ts(text: &str) -> Timestamp {
         text.parse().expect("a test timestamp parses")
@@ -232,6 +242,11 @@ mod tests {
     fn iter_of_empty_snapshot_yields_nothing() {
         let tree = ProcessTree::new(Vec::new());
         assert_eq!(iter_pids(&tree), Vec::<u32>::new());
+    }
+
+    #[test]
+    fn empty_table_lists_no_processes() {
+        assert_eq!(EmptyTable.snapshot(), Vec::<ProcessInfo>::new());
     }
 
     #[test]
