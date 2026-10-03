@@ -21,4 +21,4 @@ pub use model::{
 };
 pub use state::dashboard_state;
 #[cfg(all(windows, target_pointer_width = "64"))]
-pub use win32::{LiveHistoryError, LiveInputsError, Win32CwdReader, Win32MutexProbe, live_history, live_inputs, live_state};
+pub use win32::{LiveHistoryError, LiveInputsError, Win32CwdReader, Win32MutexProbe, live_history, live_inputs};
