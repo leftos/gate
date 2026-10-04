@@ -1,12 +1,11 @@
 //! The live machine behind the state's seams: the slot mutexes by the names `gate.ps1` gives them and a
-//! process's working directory from its PEB, with proc-table's [`Win32ProcessTable`] for the process table.
+//! process's working directory from its PEB; the process table comes from the caller.
 
-use std::cell::OnceCell;
 use std::path::PathBuf;
 
 use jiff::Timestamp;
+use proc_table::ProcessInfo;
 use proc_table::win32::{OwnedHandle, open_process, read_parameters_string};
-use proc_table::{ProcessTable, ProcessTree, Win32ProcessTable};
 use windows_sys::Win32::System::Threading::{IsWow64Process, OpenMutexW, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ, SYNCHRONIZATION_SYNCHRONIZE};
 
 use crate::journal::{History, JournalCache};
@@ -79,24 +78,24 @@ pub fn live_inputs() -> Result<StateInputs, LiveInputsError> {
 }
 
 /// The gate journal's history on this machine now, read through `cache` from `%LOCALAPPDATA%\gate` with the
-/// `GATE_TEST_SLOT_PREFIX` [`live_inputs`] reads. An open run's gate is live when its pid is running and started within
-/// 2 s of the `processStart` the journal records; the process table is read only when a run is open. It blocks on the
-/// file reads and the process snapshot, so an async caller runs it on a blocking thread.
+/// `GATE_TEST_SLOT_PREFIX` [`live_inputs`] reads. An open run's gate is live when its pid is in `processes`, the
+/// caller's process snapshot, and started within 2 s of the `processStart` the journal records. It blocks on the file
+/// reads, so an async caller runs it on a blocking thread.
 ///
 /// # Errors
 ///
 /// The [`LiveInputsError`] of [`live_inputs`], or [`LiveHistoryError::Journal`] when a journal file exists but cannot
 /// be read.
-pub fn live_history(cache: &mut JournalCache) -> Result<History, LiveHistoryError> {
+pub fn live_history(cache: &mut JournalCache, processes: &[ProcessInfo]) -> Result<History, LiveHistoryError> {
     let inputs = live_inputs()?;
     let dir = inputs.local_app_data.join("gate");
-    let processes: OnceCell<ProcessTree> = OnceCell::new();
     let is_live = |pid: u32, process_start: &str| {
         let Ok(recorded) = process_start.parse::<Timestamp>() else {
             return false;
         };
-        let tree = processes.get_or_init(|| ProcessTree::new(Win32ProcessTable.snapshot()));
-        tree.get(pid)
+        processes
+            .iter()
+            .rfind(|process| process.pid == pid)
             .and_then(|process| process.created)
             .is_some_and(|created| (created.as_nanosecond() - recorded.as_nanosecond()).abs() < PROCESS_START_TOLERANCE_NANOS)
     };
