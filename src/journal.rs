@@ -51,6 +51,8 @@ pub enum RunState {
 pub struct HistoryRun {
     /// The gated command, as [`normalize_command`] gives it.
     pub command: String,
+    /// The folder the gate ran in, as its first journal line read for the run wrote it; `None` when no line carried one.
+    pub cwd: Option<String>,
     /// The gate's `-Slot`: `heavy`, `light` or `critical`; a string because `critical` is not a `SlotKind`.
     pub kind: String,
     /// The index of the first slot the run took, or `None` when it took none.
@@ -144,6 +146,8 @@ enum End {
 #[derive(Clone, Debug)]
 struct Run {
     command: String,
+    /// The `cwd` of the first line read for the run; `None` when it was empty.
+    cwd: Option<String>,
     kind: String,
     /// The time of the first line read for the run, its queue line when that was read: what the runs are ordered by.
     first: Timestamp,
@@ -270,6 +274,7 @@ impl JournalCache {
         let stamp = Stamp { at, text: line.time };
         let run = self.runs.entry((line.pid, line.process_start)).or_insert_with(|| Run {
             command: normalize_command(&line.command),
+            cwd: Some(line.cwd).filter(|cwd| !cwd.is_empty()),
             kind: line.kind,
             first: at,
             queued: None,
@@ -338,6 +343,7 @@ impl Run {
     fn row(&self, state: RunState) -> HistoryRun {
         HistoryRun {
             command: self.command.clone(),
+            cwd: self.cwd.clone(),
             kind: self.kind.clone(),
             slot: self.slot,
             state,
