@@ -140,6 +140,7 @@ fn captured_journal_is_read_into_runs() {
         history.runs[4],
         HistoryRun {
             command: "cmd /c exit 0".to_owned(),
+            cwd: Some(r"C:\work\repo".to_owned()),
             kind: "light".to_owned(),
             slot: Some(0),
             state: RunState::Ok,
@@ -154,6 +155,7 @@ fn captured_journal_is_read_into_runs() {
         history.runs[3],
         HistoryRun {
             command: "cmd /c exit 3".to_owned(),
+            cwd: Some(r"C:\work\repo".to_owned()),
             kind: "light".to_owned(),
             slot: Some(0),
             state: RunState::Failed,

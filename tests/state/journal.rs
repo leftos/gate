@@ -188,6 +188,7 @@ fn runs_pair_queue_take_release_by_pid_and_process_start() {
         [
             HistoryRun {
                 command: "cargo test".to_owned(),
+                cwd: Some(r"C:\work\repo".to_owned()),
                 kind: "heavy".to_owned(),
                 slot: Some(1),
                 state: RunState::Failed,
@@ -199,6 +200,7 @@ fn runs_pair_queue_take_release_by_pid_and_process_start() {
             },
             HistoryRun {
                 command: "cargo build".to_owned(),
+                cwd: Some(r"C:\work\repo".to_owned()),
                 kind: "heavy".to_owned(),
                 slot: Some(1),
                 state: RunState::Ok,
@@ -209,6 +211,29 @@ fn runs_pair_queue_take_release_by_pid_and_process_start() {
                 status: Some(0),
             },
         ]
+    );
+}
+
+#[test]
+fn a_runs_cwd_is_its_first_lines() {
+    let mut first = Gate::new(100, START, COMMAND);
+    first.cwd = r"X:\dev\ops-tower.wt\ops-92";
+    let mut moved = Gate::new(100, START, COMMAND);
+    moved.cwd = r"X:\dev\elsewhere";
+    let mut blank = Gate::new(200, START, COMMAND);
+    blank.cwd = "";
+    let lines = [
+        first.queue(&ago(30)),
+        moved.take(&ago(29), 1.0),
+        moved.release(&ago(28), 60.0, json!(0)),
+        blank.queue(&ago(20)),
+    ];
+    let history = history_of("a_runs_cwd_is_its_first_lines", &lines);
+    let cwds: Vec<Option<&str>> = history.runs.iter().map(|run| run.cwd.as_deref()).collect();
+    assert_eq!(
+        cwds,
+        [None, Some(r"X:\dev\ops-tower.wt\ops-92")],
+        "an empty cwd is none, and a run keeps its first line's cwd"
     );
 }
 
