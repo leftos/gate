@@ -179,19 +179,19 @@ fn remote_journal_is_read_into_runs_and_a_split_summary() {
             (Some(0), false, None, None, RunState::Ok),
             (Some(1), false, None, Some("parity"), RunState::Failed),
             (Some(2), false, None, Some("rebooted"), RunState::Ok),
-            (Some(0), false, None, Some("busy"), RunState::Ok),
+            (Some(0), false, None, Some("full"), RunState::Ok),
             (Some(1), false, None, Some("unreachable"), RunState::Ok),
             (Some(0), true, Some("builder@build-box"), None, RunState::Ok),
         ],
         "newest first: the local run, then the runs that fell back, each on its final local slot, then the remote run"
     );
-    let busy = &history.runs[3];
+    let full = &history.runs[3];
     assert_eq!(
-        busy.queued.as_deref(),
+        full.queued.as_deref(),
         Some("2026-10-03T06:20:00.4000000Z"),
         "a second queue line keeps the first queued time"
     );
-    assert_eq!(busy.started.as_deref(), Some("2026-10-03T06:21:00.6000000Z"));
+    assert_eq!(full.started.as_deref(), Some("2026-10-03T06:21:00.6000000Z"));
     assert_eq!(
         history.runs[2].started.as_deref(),
         Some("2026-10-03T06:31:10.2000000Z"),

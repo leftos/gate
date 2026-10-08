@@ -1,5 +1,5 @@
-//! The gate's `remote.json`, read for the remote pool's size: its `slots`, a whole number 1 to 16. The file's routing
-//! keys are the gate's alone and are not read here.
+//! The gate's `remote.json`, read for the remote pool's size: its `slots`, a whole number 1 to 16, or 1 when the key
+//! is missing. The file's routing keys are the gate's alone and are not read here.
 
 use std::path::{Path, PathBuf};
 
@@ -11,7 +11,7 @@ const MAX_SLOTS: u32 = 16;
 
 /// The remote pool's size as `remote.json` gives it.
 pub(crate) struct RemoteCount {
-    /// The slots gates may take: `slots`, or 0 when the file is ignored.
+    /// The slots gates may take: `slots`, 1 when the key is missing, or 0 when the file is ignored.
     pub count: u32,
     /// Why the file was ignored, or `None`.
     pub problem: Option<String>,
@@ -22,9 +22,9 @@ pub(crate) fn remote_settings_path(inputs: &StateInputs) -> PathBuf {
     inputs.local_app_data.join("gate").join("remote.json")
 }
 
-/// The remote pool's size, or `None` when `remote.json` does not exist. A file that cannot be read, is not a JSON
-/// object, or whose `slots` (matched in any letter case) is missing or not a whole number 1 to 16 gives a count of 0
-/// and a problem line naming the file.
+/// The remote pool's size, or `None` when `remote.json` does not exist. A file with no `slots` key (matched in any
+/// letter case) means one remote slot. A file that cannot be read, is not a JSON object, or whose `slots` is not a
+/// whole number 1 to 16 gives a count of 0 and a problem line naming the file.
 pub(crate) fn read_remote_count(path: &Path) -> Option<RemoteCount> {
     let ignored = |reason: &str| RemoteCount {
         count: 0,
@@ -36,7 +36,7 @@ pub(crate) fn read_remote_count(path: &Path) -> Option<RemoteCount> {
         Err(reason) => return Some(ignored(&reason)),
     };
     let Some(value) = property(&settings, "slots") else {
-        return Some(ignored("it has no slots"));
+        return Some(RemoteCount { count: 1, problem: None });
     };
     match SlotCount::from_json(value).map(SlotCount::get).filter(|count| *count <= MAX_SLOTS) {
         Some(count) => Some(RemoteCount { count, problem: None }),

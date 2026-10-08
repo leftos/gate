@@ -263,6 +263,17 @@ fn remote_json_slots_is_read_in_any_letter_case_up_to_16() {
 }
 
 #[test]
+fn remote_json_without_slots_has_one_slot() {
+    let machine = Machine::new("remote_json_without_slots_has_one_slot");
+    for text in [r#"{"repos": {}}"#, "{}"] {
+        machine.write_remote(text);
+        let remote = remote_pool(&machine);
+        assert_eq!((remote.count, remote.problem.as_deref()), (1, None), "{text}");
+        assert_eq!(remote_rows(&remote), [(0, SlotState::Free, Some(false))], "{text}");
+    }
+}
+
+#[test]
 fn remote_json_that_cannot_be_used_is_a_problem() {
     let machine = Machine::new("remote_json_that_cannot_be_used_is_a_problem");
     let path = machine.dir.join("gate").join("remote.json");
@@ -273,7 +284,6 @@ fn remote_json_that_cannot_be_used_is_a_problem() {
         (r#"{"slots": "2"}"#, ignored("slots must be a whole number 1 to 16, got '2'")),
         (r#"{"slots": 2.5}"#, ignored("slots must be a whole number 1 to 16, got '2.5'")),
         (r#"{"slots": null}"#, ignored("slots must be a whole number 1 to 16, got null")),
-        (r#"{"repos": {}}"#, ignored("it has no slots")),
         ("[2]", ignored("it is not a JSON object")),
     ] {
         machine.write_remote(text);
