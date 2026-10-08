@@ -53,6 +53,9 @@ pub struct HistoryRun {
     pub command: String,
     /// The folder the gate ran in, as its first journal line read for the run wrote it; `None` when no line carried one.
     pub cwd: Option<String>,
+    /// The repository the run's folder belongs to, as the caller's repo function names it; `None` without a folder or
+    /// when the function names none.
+    pub repo: Option<String>,
     /// The gate's `-Slot`: `heavy`, `light` or `critical`; a string because `critical` is not a `SlotKind`.
     pub kind: String,
     /// The index of the first slot the run took, or `None` when it took none.
@@ -73,12 +76,14 @@ pub struct HistoryRun {
     pub status: Option<i64>,
 }
 
-/// How long the runs of one command that passed held their slot.
+/// How long the runs of one command in one repository that passed held their slot.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CommandSummary {
     /// The command, as [`normalize_command`] gives it.
     pub command: String,
+    /// The repository the runs' folders belong to, as [`HistoryRun::repo`] names it.
+    pub repo: Option<String>,
     /// The runs counted.
     pub count: usize,
     /// The median held time, by nearest rank.
@@ -94,7 +99,8 @@ pub struct CommandSummary {
 pub struct History {
     /// The 50 newest runs by the time they queued, newest first, in every state.
     pub runs: Vec<HistoryRun>,
-    /// One row per command over the runs taken in the last 7 days that passed, the most run first, then by command.
+    /// One row per repository and command over the runs taken in the last 7 days that passed, the most run first, then
+    /// by command, then by repository (none first).
     pub summary: Vec<CommandSummary>,
 }
 
@@ -183,24 +189,32 @@ struct Line {
 
 impl JournalCache {
     /// The history in `dir`'s `<prefix>events.jsonl` and `<prefix>events.1.jsonl` as of `now`, an open run being
-    /// [`RunState::Running`] when `is_live(pid, processStart)` says its gate still runs.
+    /// [`RunState::Running`] when `is_live(pid, processStart)` says its gate still runs, and a run's repository being
+    /// `repo_of(cwd)`, the caller's rule for naming the repository a folder belongs to.
     ///
     /// The first read, and a read after the journal was rolled (it is shorter than the bytes read so far, or its
-    /// creation time changed, or `events.1.jsonl` appeared, went or changed its length or write time) or after `dir` or `prefix` changed, reads `events.1.jsonl` and then the journal from its
-    /// start; any other read parses only the journal's complete lines appended since the last, a trailing fragment
+    /// creation time changed, or `events.1.jsonl` appeared, went or changed its length or write time) or after `dir` or
+    /// `prefix` changed, reads `events.1.jsonl` and then the journal from its start; any other read parses only the journal's complete lines appended since the last, a trailing fragment
     /// without its line feed being left for the next. Runs older than 7 days are then dropped unless they are among the
     /// 50 newest. A missing file reads as an empty one.
     ///
     /// # Errors
     ///
     /// Fails when a journal file exists but cannot be read; the cache then starts again at the next read.
-    pub fn read(&mut self, dir: &Path, prefix: &str, now: Timestamp, is_live: impl Fn(u32, &str) -> bool) -> io::Result<History> {
+    pub fn read(
+        &mut self,
+        dir: &Path,
+        prefix: &str,
+        now: Timestamp,
+        is_live: impl Fn(u32, &str) -> bool,
+        repo_of: impl Fn(&str) -> Option<String>,
+    ) -> io::Result<History> {
         if let Err(error) = self.refresh(dir, prefix) {
             *self = Self::default();
             return Err(error);
         }
         self.prune(now);
-        Ok(self.history(now, &is_live))
+        Ok(self.history(now, &is_live, &repo_of))
     }
 
     fn refresh(&mut self, dir: &Path, prefix: &str) -> io::Result<()> {
@@ -316,15 +330,15 @@ impl JournalCache {
             .retain(|key, run| run.started.as_ref().map_or(run.first, |started| started.at) >= cutoff || newest.contains(key));
     }
 
-    fn history(&self, now: Timestamp, is_live: &impl Fn(u32, &str) -> bool) -> History {
+    fn history(&self, now: Timestamp, is_live: &impl Fn(u32, &str) -> bool, repo_of: &impl Fn(&str) -> Option<String>) -> History {
         let runs = newest_first(&self.runs)
             .into_iter()
             .take(RECENT_RUNS)
-            .map(|(key, run)| run.row(run.state(key, is_live)))
+            .map(|(key, run)| run.row(run.state(key, is_live), run.repo(repo_of)))
             .collect();
         History {
             runs,
-            summary: summarize(self.runs.values(), now - SUMMARY_WINDOW),
+            summary: summarize(self.runs.values(), now - SUMMARY_WINDOW, repo_of),
         }
     }
 }
@@ -340,10 +354,16 @@ impl Run {
         }
     }
 
-    fn row(&self, state: RunState) -> HistoryRun {
+    /// The repository the run's folder belongs to, by `repo_of`; `None` without a folder.
+    fn repo(&self, repo_of: &impl Fn(&str) -> Option<String>) -> Option<String> {
+        self.cwd.as_deref().and_then(repo_of)
+    }
+
+    fn row(&self, state: RunState, repo: Option<String>) -> HistoryRun {
         HistoryRun {
             command: self.command.clone(),
             cwd: self.cwd.clone(),
+            repo,
             kind: self.kind.clone(),
             slot: self.slot,
             state,
@@ -370,20 +390,22 @@ fn newest_first(runs: &HashMap<RunKey, Run>) -> Vec<(&RunKey, &Run)> {
     ordered
 }
 
-/// One row per command over the runs that passed and took their slot at or after `cutoff`.
-fn summarize<'a>(runs: impl Iterator<Item = &'a Run>, cutoff: Timestamp) -> Vec<CommandSummary> {
-    let mut held: BTreeMap<&str, Vec<f64>> = BTreeMap::new();
+/// One row per repository and command over the runs that passed and took their slot at or after `cutoff`, a run's
+/// repository named by `repo_of` its folder: the most run first, then by command, then by repository (none first).
+fn summarize<'a>(runs: impl Iterator<Item = &'a Run>, cutoff: Timestamp, repo_of: &impl Fn(&str) -> Option<String>) -> Vec<CommandSummary> {
+    let mut held: BTreeMap<(Option<String>, &str), Vec<f64>> = BTreeMap::new();
     for run in runs {
         if let Some(seconds) = run.counted_held_seconds(cutoff) {
-            held.entry(run.command.as_str()).or_default().push(seconds);
+            held.entry((run.repo(repo_of), run.command.as_str())).or_default().push(seconds);
         }
     }
     let mut summary: Vec<CommandSummary> = held
         .into_iter()
-        .filter_map(|(command, mut seconds)| {
+        .filter_map(|((repo, command), mut seconds)| {
             seconds.sort_by(f64::total_cmp);
             Some(CommandSummary {
                 command: command.to_owned(),
+                repo,
                 count: seconds.len(),
                 p50_seconds: nearest_rank(&seconds, 50)?,
                 p90_seconds: nearest_rank(&seconds, 90)?,
@@ -391,7 +413,12 @@ fn summarize<'a>(runs: impl Iterator<Item = &'a Run>, cutoff: Timestamp) -> Vec<
             })
         })
         .collect();
-    summary.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.command.cmp(&b.command)));
+    summary.sort_by(|a, b| {
+        b.count
+            .cmp(&a.count)
+            .then_with(|| a.command.cmp(&b.command))
+            .then_with(|| a.repo.cmp(&b.repo))
+    });
     summary
 }
 

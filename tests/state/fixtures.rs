@@ -119,9 +119,10 @@ fn captured_journal_is_read_into_runs() {
     fs::create_dir_all(&dir).expect("the test's folder can be made");
     fs::write(dir.join("ops72-events.jsonl"), JOURNAL).expect("the journal can be written");
     let not_live = |_pid: u32, _process_start: &str| false;
+    let last_segment = |cwd: &str| cwd.rsplit(['\\', '/']).next().map(str::to_owned);
 
     let history = JournalCache::default()
-        .read(&dir, "ops72-", ts("2026-10-03T06:00:00Z"), not_live)
+        .read(&dir, "ops72-", ts("2026-10-03T06:00:00Z"), not_live, last_segment)
         .expect("the journal can be read");
 
     let states: Vec<(u32, RunState)> = history.runs.iter().map(|run| (run.slot.unwrap_or(u32::MAX), run.state)).collect();
@@ -141,6 +142,7 @@ fn captured_journal_is_read_into_runs() {
         HistoryRun {
             command: "cmd /c exit 0".to_owned(),
             cwd: Some(r"C:\work\repo".to_owned()),
+            repo: Some("repo".to_owned()),
             kind: "light".to_owned(),
             slot: Some(0),
             state: RunState::Ok,
@@ -156,6 +158,7 @@ fn captured_journal_is_read_into_runs() {
         HistoryRun {
             command: "cmd /c exit 3".to_owned(),
             cwd: Some(r"C:\work\repo".to_owned()),
+            repo: Some("repo".to_owned()),
             kind: "light".to_owned(),
             slot: Some(0),
             state: RunState::Failed,
@@ -176,6 +179,7 @@ fn captured_journal_is_read_into_runs() {
         [
             CommandSummary {
                 command: "cmd /c exit 0".to_owned(),
+                repo: Some("repo".to_owned()),
                 count: 2,
                 p50_seconds: 0.105,
                 p90_seconds: 0.132,
@@ -183,6 +187,7 @@ fn captured_journal_is_read_into_runs() {
             },
             CommandSummary {
                 command: "pwsh -NoProfile -Command Start-Sleep 10".to_owned(),
+                repo: Some("repo".to_owned()),
                 count: 1,
                 p50_seconds: 10.308,
                 p90_seconds: 10.308,
