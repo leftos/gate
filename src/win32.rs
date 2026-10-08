@@ -79,14 +79,18 @@ pub fn live_inputs() -> Result<StateInputs, LiveInputsError> {
 
 /// The gate journal's history on this machine now, read through `cache` from `%LOCALAPPDATA%\gate` with the
 /// `GATE_TEST_SLOT_PREFIX` [`live_inputs`] reads. An open run's gate is live when its pid is in `processes`, the
-/// caller's process snapshot, and started within 2 s of the `processStart` the journal records. It blocks on the file
-/// reads, so an async caller runs it on a blocking thread.
+/// caller's process snapshot, and started within 2 s of the `processStart` the journal records; a run's repository is
+/// `repo_of` its folder, the caller's rule. It blocks on the file reads, so an async caller runs it on a blocking thread.
 ///
 /// # Errors
 ///
 /// The [`LiveInputsError`] of [`live_inputs`], or [`LiveHistoryError::Journal`] when a journal file exists but cannot
 /// be read.
-pub fn live_history(cache: &mut JournalCache, processes: &[ProcessInfo]) -> Result<History, LiveHistoryError> {
+pub fn live_history(
+    cache: &mut JournalCache,
+    processes: &[ProcessInfo],
+    repo_of: impl Fn(&str) -> Option<String>,
+) -> Result<History, LiveHistoryError> {
     let inputs = live_inputs()?;
     let dir = inputs.local_app_data.join("gate");
     let is_live = |pid: u32, process_start: &str| {
@@ -100,7 +104,7 @@ pub fn live_history(cache: &mut JournalCache, processes: &[ProcessInfo]) -> Resu
             .is_some_and(|created| (created.as_nanosecond() - recorded.as_nanosecond()).abs() < PROCESS_START_TOLERANCE_NANOS)
     };
     cache
-        .read(&dir, &inputs.slot_prefix, inputs.now, is_live)
+        .read(&dir, &inputs.slot_prefix, inputs.now, is_live, repo_of)
         .map_err(|source| LiveHistoryError::Journal { dir, source })
 }
 

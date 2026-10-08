@@ -23,6 +23,11 @@ fn not_live(_pid: u32, _process_start: &str) -> bool {
     false
 }
 
+/// The repository a test folder names: its last segment, `None` for an empty one.
+fn last_segment(cwd: &str) -> Option<String> {
+    cwd.rsplit(['\\', '/']).next().filter(|segment| !segment.is_empty()).map(str::to_owned)
+}
+
 /// `minutes` before [`NOW`], as the journal writes a time.
 fn ago(minutes: i64) -> String {
     (ts(NOW) - SignedDuration::from_mins(minutes)).to_string()
@@ -115,7 +120,9 @@ fn append(path: &Path, text: &str) {
 
 /// The history of `dir`'s unprefixed journal as a fresh cache reads it, no gate live.
 fn read_fresh(dir: &Path) -> History {
-    JournalCache::default().read(dir, "", ts(NOW), not_live).expect("the journal can be read")
+    JournalCache::default()
+        .read(dir, "", ts(NOW), not_live, last_segment)
+        .expect("the journal can be read")
 }
 
 /// The history of a journal holding just `lines`.
@@ -189,6 +196,7 @@ fn runs_pair_queue_take_release_by_pid_and_process_start() {
             HistoryRun {
                 command: "cargo test".to_owned(),
                 cwd: Some(r"C:\work\repo".to_owned()),
+                repo: Some("repo".to_owned()),
                 kind: "heavy".to_owned(),
                 slot: Some(1),
                 state: RunState::Failed,
@@ -201,6 +209,7 @@ fn runs_pair_queue_take_release_by_pid_and_process_start() {
             HistoryRun {
                 command: "cargo build".to_owned(),
                 cwd: Some(r"C:\work\repo".to_owned()),
+                repo: Some("repo".to_owned()),
                 kind: "heavy".to_owned(),
                 slot: Some(1),
                 state: RunState::Ok,
@@ -265,6 +274,7 @@ fn failed_and_abandoned_runs_are_listed_but_not_counted() {
         history.summary,
         [CommandSummary {
             command: COMMAND.to_owned(),
+            repo: Some("repo".to_owned()),
             count: 1,
             p50_seconds: 10.0,
             p90_seconds: 10.0,
@@ -288,7 +298,9 @@ fn open_run_is_running_when_live_else_unrecorded() {
     let dir = journal_dir("open_run_is_running_when_live_else_unrecorded");
     fs::write(dir.join("events.jsonl"), text(&lines)).expect("the journal can be written");
     let is_live = |pid: u32, process_start: &str| (pid, process_start) == (1, START) || (pid, process_start) == (3, OTHER_START);
-    let history = JournalCache::default().read(&dir, "", ts(NOW), is_live).expect("the journal can be read");
+    let history = JournalCache::default()
+        .read(&dir, "", ts(NOW), is_live, last_segment)
+        .expect("the journal can be read");
 
     assert_eq!(states(&history), [RunState::Running, RunState::Unrecorded, RunState::Running]);
     assert_eq!(history.runs[0].started, None, "a run still queued has not started");
@@ -336,6 +348,7 @@ fn summary_counts_only_runs_taken_in_the_last_7_days() {
         history.summary,
         [CommandSummary {
             command: COMMAND.to_owned(),
+            repo: Some("repo".to_owned()),
             count: 1,
             p50_seconds: 30.0,
             p90_seconds: 30.0,
@@ -359,6 +372,7 @@ fn percentiles_use_nearest_rank() {
         [
             CommandSummary {
                 command: COMMAND.to_owned(),
+                repo: Some("repo".to_owned()),
                 count: 10,
                 p50_seconds: 5.0,
                 p90_seconds: 9.0,
@@ -366,12 +380,75 @@ fn percentiles_use_nearest_rank() {
             },
             CommandSummary {
                 command: "cargo build".to_owned(),
+                repo: Some("repo".to_owned()),
                 count: 1,
                 p50_seconds: 1.0,
                 p90_seconds: 1.0,
                 max_seconds: 1.0,
             },
         ]
+    );
+}
+
+#[test]
+fn run_repo_comes_from_its_folder_and_is_none_without_one() {
+    let mut nowhere = Gate::new(2, START, COMMAND);
+    nowhere.cwd = "";
+    let mut lines = Gate::new(1, START, COMMAND).run(30, 5.0, json!(0));
+    lines.extend(nowhere.run(20, 5.0, json!(0)));
+    let history = history_of("run_repo_comes_from_its_folder_and_is_none_without_one", &lines);
+    let repos: Vec<Option<&str>> = history.runs.iter().map(|run| run.repo.as_deref()).collect();
+    assert_eq!(
+        repos,
+        [None, Some("repo")],
+        "newest first: the run with no folder, then the one in C:\\work\\repo"
+    );
+    assert_eq!(history.runs[0].cwd, None);
+}
+
+#[test]
+fn summary_groups_by_repo_and_command_most_run_first_then_by_command_then_by_repo() {
+    let in_folder = |pid: u32, command: &'static str, cwd: &'static str| {
+        let mut gate = Gate::new(pid, START, command);
+        gate.cwd = cwd;
+        gate
+    };
+    let alpha = r"C:\work\alpha";
+    let beta = r"C:\work\beta";
+    let mut lines = in_folder(1, "zz check", alpha).run(60, 2.0, json!(0));
+    lines.extend(in_folder(2, "zz check", alpha).run(55, 4.0, json!(0)));
+    lines.extend(in_folder(3, "cargo build", beta).run(50, 1.0, json!(0)));
+    lines.extend(in_folder(4, COMMAND, beta).run(45, 1.0, json!(0)));
+    lines.extend(in_folder(5, COMMAND, "").run(40, 1.0, json!(0)));
+    lines.extend(in_folder(6, COMMAND, alpha).run(35, 1.0, json!(0)));
+    let history = history_of("summary_groups_by_repo_and_command_most_run_first_then_by_command_then_by_repo", &lines);
+
+    let rows: Vec<(&str, Option<&str>, usize)> = history
+        .summary
+        .iter()
+        .map(|row| (row.command.as_str(), row.repo.as_deref(), row.count))
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            ("zz check", Some("alpha"), 2),
+            ("cargo build", Some("beta"), 1),
+            (COMMAND, None, 1),
+            (COMMAND, Some("alpha"), 1),
+            (COMMAND, Some("beta"), 1),
+        ],
+        "one row per repository and command: the most run first, then by command, then by repository with none first"
+    );
+    assert_eq!(
+        history.summary[0],
+        CommandSummary {
+            command: "zz check".to_owned(),
+            repo: Some("alpha".to_owned()),
+            count: 2,
+            p50_seconds: 2.0,
+            p90_seconds: 4.0,
+            max_seconds: 4.0,
+        }
     );
 }
 
@@ -402,7 +479,7 @@ fn cache_parses_only_appended_lines() {
     let old = text(&Gate::new(1, START, "cargo build").run(30, 5.0, json!(0)));
     fs::write(&journal, &old).expect("the journal can be written");
     let mut cache = JournalCache::default();
-    let first = cache.read(&dir, "", ts(NOW), not_live).expect("the journal can be read");
+    let first = cache.read(&dir, "", ts(NOW), not_live, last_segment).expect("the journal can be read");
     assert_eq!(commands(&first), ["cargo build"]);
 
     // Overwrite the bytes already read in place with another valid run of the same length, keeping the file: a cache
@@ -424,7 +501,9 @@ fn cache_parses_only_appended_lines() {
     drop(file);
     append(&journal, &text(&Gate::new(2, START, COMMAND).run(10, 7.0, json!(0))));
 
-    let second = cache.read(&dir, "", ts(NOW), not_live).expect("the journal can be read again");
+    let second = cache
+        .read(&dir, "", ts(NOW), not_live, last_segment)
+        .expect("the journal can be read again");
     assert_eq!(commands(&second), [COMMAND, "cargo build"], "only the appended run is new");
     assert_eq!(states(&second), [RunState::Ok, RunState::Ok]);
 }
@@ -439,11 +518,13 @@ fn cache_waits_for_a_partial_last_line() {
     fs::write(&journal, format!("{}{head}", text(&[gate.queue(&ago(20)), gate.take(&ago(19), 1.0)]))).expect("the journal can be written");
     let mut cache = JournalCache::default();
 
-    let partial = cache.read(&dir, "", ts(NOW), not_live).expect("the journal can be read");
+    let partial = cache.read(&dir, "", ts(NOW), not_live, last_segment).expect("the journal can be read");
     assert_eq!(states(&partial), [RunState::Unrecorded], "the release is not read until its line ends");
 
     append(&journal, &format!("{tail}\n"));
-    let complete = cache.read(&dir, "", ts(NOW), not_live).expect("the journal can be read again");
+    let complete = cache
+        .read(&dir, "", ts(NOW), not_live, last_segment)
+        .expect("the journal can be read again");
     assert_eq!(states(&complete), [RunState::Ok]);
     assert_eq!(complete.runs[0].held_seconds, Some(5.0));
     assert_eq!(complete, read_fresh(&dir), "a cold read agrees");
@@ -457,13 +538,15 @@ fn cache_rereads_after_a_roll() {
     old.extend(Gate::new(2, START, "cargo clippy").run(50, 6.0, json!(0)));
     fs::write(&journal, text(&old)).expect("the journal can be written");
     let mut cache = JournalCache::default();
-    let before = cache.read(&dir, "", ts(NOW), not_live).expect("the journal can be read");
+    let before = cache.read(&dir, "", ts(NOW), not_live, last_segment).expect("the journal can be read");
     assert_eq!(commands(&before), ["cargo clippy", "cargo build"]);
 
     fs::rename(&journal, dir.join("events.1.jsonl")).expect("the journal can be rolled");
     fs::write(&journal, text(&Gate::new(3, START, COMMAND).run(10, 7.0, json!(0)))).expect("the new journal can be written");
 
-    let after = cache.read(&dir, "", ts(NOW), not_live).expect("the rolled journal can be read");
+    let after = cache
+        .read(&dir, "", ts(NOW), not_live, last_segment)
+        .expect("the rolled journal can be read");
     assert_eq!(commands(&after), [COMMAND, "cargo clippy", "cargo build"]);
     assert_eq!(after, read_fresh(&dir), "a cold read agrees");
 
@@ -476,7 +559,9 @@ fn cache_rereads_after_a_roll() {
     fs::write(&journal, text(&newer)).expect("the newer journal can be written");
     assert!(fs::metadata(&journal).expect("the journal is there").len() > offset);
 
-    let again = cache.read(&dir, "", ts(NOW), not_live).expect("the twice-rolled journal can be read");
+    let again = cache
+        .read(&dir, "", ts(NOW), not_live, last_segment)
+        .expect("the twice-rolled journal can be read");
     assert_eq!(commands(&again), ["cargo fmt", "cargo doc", COMMAND]);
     assert_eq!(again, read_fresh(&dir), "a cold read agrees");
 }
@@ -488,7 +573,7 @@ fn cache_rereads_when_the_rolled_file_changes_even_if_the_journal_grew_past_the_
     let old = text(&Gate::new(1, START, "cargo build").run(60, 5.0, json!(0)));
     fs::write(&journal, &old).expect("the journal can be written");
     let mut cache = JournalCache::default();
-    let before = cache.read(&dir, "", ts(NOW), not_live).expect("the journal can be read");
+    let before = cache.read(&dir, "", ts(NOW), not_live, last_segment).expect("the journal can be read");
     assert_eq!(commands(&before), ["cargo build"]);
 
     // The roll as a tunnelled creation time leaves it: the old content moves to the rolled file, and the journal is
@@ -500,7 +585,9 @@ fn cache_rereads_when_the_rolled_file_changes_even_if_the_journal_grew_past_the_
     assert!(new.len() > old.len(), "the length check alone would not see the roll");
     fs::write(&journal, &new).expect("the new journal can be written");
 
-    let after = cache.read(&dir, "", ts(NOW), not_live).expect("the rolled journal can be read");
+    let after = cache
+        .read(&dir, "", ts(NOW), not_live, last_segment)
+        .expect("the rolled journal can be read");
     assert_eq!(
         commands(&after),
         [COMMAND, "cargo doc", "cargo build"],
