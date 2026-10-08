@@ -218,7 +218,8 @@ pub struct DashboardState {
 /// only the gate writes.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct RemotePool {
-    /// The slots gates may take: `remote.json`'s `slots`, or 0 when it is absent or ignored.
+    /// The slots gates may take: `remote.json`'s `slots` (1 when the key is missing), or 0 when the file is absent or
+    /// ignored.
     pub count: u32,
     /// Why `remote.json` was ignored, or that it is absent while a remote claim file exists; `None` otherwise.
     pub problem: Option<String>,

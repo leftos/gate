@@ -68,8 +68,9 @@ pub struct HistoryRun {
     pub remote: bool,
     /// The build box a remote run waits for or runs on, its ssh destination; `None` for a local run.
     pub host: Option<String>,
-    /// Why the run, routed to the remote pool, was sent back to the local queue (`unreachable`, `busy`, `rebooted`,
-    /// `parity`, or `unknown` when the line names none); `None` when it was not.
+    /// Why the run, routed to the remote pool, was sent back to the local queue: `full` (the pool stayed full for
+    /// 60 s), `busy` (the box's work folder is locked by a leftover run), `unreachable`, `rebooted`, `parity`, or
+    /// `unknown` when the line names none; `None` when it was not.
     pub fallback: Option<String>,
     /// How the run stands.
     pub state: RunState,
