@@ -171,7 +171,8 @@ pub struct StateInputs {
     pub machine: String,
     /// The machine's logical processor count, from which each pool's default count follows.
     pub processors: usize,
-    /// The per-user local application data folder, under which `gate\slots` and `gate\slot-counts.json` live.
+    /// The per-user local application data folder, under which `gate\slots`, `gate\slot-counts.json` and
+    /// `gate\remote.json` live.
     pub local_app_data: PathBuf,
     /// The counts file to use in place of the per-user one (the gate's `GATE_TEST_SLOT_COUNTS`), for tests only.
     pub slot_counts_override: Option<PathBuf>,
@@ -208,6 +209,22 @@ pub struct DashboardState {
     pub queue: Vec<QueueTicket>,
     /// The heavy pool, then the light one.
     pub pools: Vec<PoolState>,
+    /// The remote pool, whose slots the gate runs on a build box; `None` while the gate's `remote.json` is absent and no
+    /// remote claim file exists.
+    pub remote: Option<RemotePool>,
+}
+
+/// The remote pool: heavy gates the gate routes to a build box over ssh. Its size is the gate's `remote.json`, which
+/// only the gate writes.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct RemotePool {
+    /// The slots gates may take: `remote.json`'s `slots`, or 0 when it is absent or ignored.
+    pub count: u32,
+    /// Why `remote.json` was ignored, or that it is absent while a remote claim file exists; `None` otherwise.
+    pub problem: Option<String>,
+    /// The slots `0..count`, plus any slot past the count that has a claim file. A gate waiting for one shows only as its
+    /// ticket in the queue.
+    pub slots: Vec<SlotRow>,
 }
 
 /// The critical request: who holds the machine and who waits to.
@@ -228,6 +245,9 @@ pub struct QueueTicket {
     pub kind: String,
     /// True for a critical gate that holds the machine.
     pub holds: bool,
+    /// True for a heavy gate routed to the remote pool and waiting for a remote slot; serialised only when true.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub remote: bool,
     /// The gate's process id.
     pub pid: u32,
     /// When the gate arrived, ISO 8601 UTC with seven fractional digits.

@@ -10,8 +10,9 @@ use regex::Regex;
 use crate::claims::{Claim, ReadableClaim, Ticket, last_log_line, read_claims, read_tickets};
 use crate::counts::{CountsFile, pool_count, read_counts_file, slot_count_path};
 use crate::model::{
-    CriticalState, CwdReader, DashboardState, MutexProbe, PoolState, QueueTicket, SlotKind, SlotRow, SlotState, StateInputs, Waiting,
+    CriticalState, CwdReader, DashboardState, MutexProbe, PoolState, QueueTicket, RemotePool, SlotKind, SlotRow, SlotState, StateInputs, Waiting,
 };
+use crate::remote::{RemoteCount, read_remote_count, remote_settings_path};
 
 /// How far a live process's start time may be from the one its claim records, in nanoseconds.
 const CLAIM_START_TOLERANCE_NANOS: i128 = 2_000_000_000;
@@ -24,8 +25,9 @@ const MAX_TICKS: i64 = 3_155_378_975_999_999_999;
 /// The `-Slot` value of a gate that asks for the machine.
 const CRITICAL: &str = "critical";
 
-/// The state the Gates tab shows: the critical request, the queue of arrival tickets, and each pool's counts,
-/// its slots and, when it is full or a critical request bars it, the gates waiting for it.
+/// The state the Gates tab shows: the critical request, the queue of arrival tickets, each pool's counts, its slots
+/// and, when it is full or a critical request bars it, the gates waiting for it; then the remote pool, when the gate's
+/// `remote.json` or a remote claim file exists. A gate routed to the remote pool shows only as its queue ticket.
 #[must_use]
 pub fn dashboard_state(inputs: &StateInputs, processes: &dyn ProcessTable, mutexes: &dyn MutexProbe, cwds: &dyn CwdReader) -> DashboardState {
     let table = Table::new(processes.snapshot());
@@ -50,6 +52,12 @@ pub fn dashboard_state(inputs: &StateInputs, processes: &dyn ProcessTable, mutex
         holders.extend(pool.slots.iter().filter_map(busy_pid));
         pools.push(pool);
     }
+    let remote = machine.remote_pool(inputs);
+    holders.extend(remote.iter().flat_map(|pool| pool.slots.iter().filter_map(busy_pid)));
+    // A gate routed to the remote pool keeps `-Slot heavy`: it shows only as its ticket in the queue, so it is held out
+    // of the pools' waiting gates.
+    let routed: HashSet<u32> = queue.iter().filter(|ticket| ticket.remote).map(|ticket| ticket.pid).collect();
+    let held_out: HashSet<u32> = holders.union(&routed).copied().collect();
     // A live critical ticket holds back the gates that arrive after it, so they wait with slots free.
     let barred = queue.iter().any(|ticket| ticket.kind.eq_ignore_ascii_case(CRITICAL));
     let critical_held = holder.state != SlotState::Free;
@@ -57,7 +65,7 @@ pub fn dashboard_state(inputs: &StateInputs, processes: &dyn ProcessTable, mutex
         // A gate takes a free slot within 2 s, so with one free no gate of the kind is waiting unless it is barred.
         let full = !pool.slots.iter().any(|slot| slot.state == SlotState::Free && slot.extra != Some(true));
         if full || barred {
-            pool.waiting = table.waiting(pool.kind.as_str(), &holders, cwds);
+            pool.waiting = table.waiting(pool.kind.as_str(), &held_out, cwds);
         }
         if critical_held {
             for slot in &mut pool.slots {
@@ -73,6 +81,7 @@ pub fn dashboard_state(inputs: &StateInputs, processes: &dyn ProcessTable, mutex
         critical: CriticalState { holder, waiting },
         queue,
         pools,
+        remote,
     }
 }
 
@@ -222,6 +231,7 @@ impl Table {
             command_line: process.command_line.clone(),
             kind: ticket.kind,
             holds: ticket.holds,
+            remote: ticket.remote,
             pid: ticket.pid,
         })
     }
@@ -247,28 +257,58 @@ impl Machine<'_> {
         let counts = pool_count(counts_file, counts_path, kind, inputs.processors);
         let count = counts.set.map_or(counts.default, crate::model::SlotCount::get);
         let prefix = format!("{}{}", inputs.slot_prefix, kind.prefix());
-        let lowered = prefix.to_ascii_lowercase();
-        let mut indexes: BTreeSet<u32> = (0..count).collect();
-        for name in self.claims.keys() {
-            if let Some(index) = name.strip_prefix(&lowered).and_then(|digits| digits.parse::<u32>().ok()) {
-                indexes.insert(index);
-            }
-        }
-        let mut slots = Vec::new();
-        for index in indexes {
-            let mut row = self.slot_row(format!("{prefix}{index}"), index);
-            row.extra = Some(index >= count);
-            slots.push(row);
-        }
         PoolState {
             kind,
             count,
             default_count: counts.default,
             set: counts.set,
             problem: counts.problem,
-            slots,
+            slots: self.slot_rows(&prefix, count, self.claimed_indexes(&prefix)),
             waiting: Vec::new(),
         }
+    }
+
+    /// The remote pool, sized by the gate's `remote.json`; `None` while that file is absent and no remote claim file
+    /// exists.
+    fn remote_pool(&self, inputs: &StateInputs) -> Option<RemotePool> {
+        let path = remote_settings_path(inputs);
+        let prefix = format!("{}gate-remote-slot-", inputs.slot_prefix);
+        let claimed = self.claimed_indexes(&prefix);
+        let setting = read_remote_count(&path);
+        if setting.is_none() && claimed.is_empty() {
+            return None;
+        }
+        let RemoteCount { count, problem } = setting.unwrap_or_else(|| RemoteCount {
+            count: 0,
+            problem: Some(format!("no remote.json at {}", path.display())),
+        });
+        Some(RemotePool {
+            count,
+            problem,
+            slots: self.slot_rows(&prefix, count, claimed),
+        })
+    }
+
+    /// The indexes of the claim files whose name is `prefix` and a number, the prefix matched in any letter case.
+    fn claimed_indexes(&self, prefix: &str) -> BTreeSet<u32> {
+        let lowered = prefix.to_ascii_lowercase();
+        self.claims
+            .keys()
+            .filter_map(|name| name.strip_prefix(&lowered).and_then(|digits| digits.parse::<u32>().ok()))
+            .collect()
+    }
+
+    /// The rows of the slots `0..count` and of the `claimed` slots past it, which are `extra`.
+    fn slot_rows(&self, prefix: &str, count: u32, claimed: BTreeSet<u32>) -> Vec<SlotRow> {
+        let mut indexes: BTreeSet<u32> = (0..count).collect();
+        indexes.extend(claimed);
+        let mut slots = Vec::new();
+        for index in indexes {
+            let mut row = self.slot_row(format!("{prefix}{index}"), index);
+            row.extra = Some(index >= count);
+            slots.push(row);
+        }
+        slots
     }
 
     /// The row of the mutex `name`; its claim is looked up by the name in any letter case.

@@ -199,6 +199,9 @@ fn runs_pair_queue_take_release_by_pid_and_process_start() {
                 repo: Some("repo".to_owned()),
                 kind: "heavy".to_owned(),
                 slot: Some(1),
+                remote: false,
+                host: None,
+                fallback: None,
                 state: RunState::Failed,
                 queued: Some(ago(29)),
                 started: Some(ago(27)),
@@ -212,6 +215,9 @@ fn runs_pair_queue_take_release_by_pid_and_process_start() {
                 repo: Some("repo".to_owned()),
                 kind: "heavy".to_owned(),
                 slot: Some(1),
+                remote: false,
+                host: None,
+                fallback: None,
                 state: RunState::Ok,
                 queued: Some(ago(30)),
                 started: Some(ago(28)),
@@ -275,6 +281,7 @@ fn failed_and_abandoned_runs_are_listed_but_not_counted() {
         [CommandSummary {
             command: COMMAND.to_owned(),
             repo: Some("repo".to_owned()),
+            remote: false,
             count: 1,
             p50_seconds: 10.0,
             p90_seconds: 10.0,
@@ -349,6 +356,7 @@ fn summary_counts_only_runs_taken_in_the_last_7_days() {
         [CommandSummary {
             command: COMMAND.to_owned(),
             repo: Some("repo".to_owned()),
+            remote: false,
             count: 1,
             p50_seconds: 30.0,
             p90_seconds: 30.0,
@@ -373,6 +381,7 @@ fn percentiles_use_nearest_rank() {
             CommandSummary {
                 command: COMMAND.to_owned(),
                 repo: Some("repo".to_owned()),
+                remote: false,
                 count: 10,
                 p50_seconds: 5.0,
                 p90_seconds: 9.0,
@@ -381,6 +390,7 @@ fn percentiles_use_nearest_rank() {
             CommandSummary {
                 command: "cargo build".to_owned(),
                 repo: Some("repo".to_owned()),
+                remote: false,
                 count: 1,
                 p50_seconds: 1.0,
                 p90_seconds: 1.0,
@@ -444,6 +454,7 @@ fn summary_groups_by_repo_and_command_most_run_first_then_by_command_then_by_rep
         CommandSummary {
             command: "zz check".to_owned(),
             repo: Some("alpha".to_owned()),
+            remote: false,
             count: 2,
             p50_seconds: 2.0,
             p90_seconds: 4.0,
@@ -594,4 +605,176 @@ fn cache_rereads_when_the_rolled_file_changes_even_if_the_journal_grew_past_the_
         "the new journal is read from its start"
     );
     assert_eq!(after, read_fresh(&dir), "a cold read agrees");
+}
+
+/// The ssh destination the remote lines name.
+const HOST: &str = "builder@build-box";
+
+impl Gate<'_> {
+    /// The queue line of a gate routed to the remote pool.
+    fn remote_queue(&self, time: &str) -> String {
+        self.line(
+            "queue",
+            time,
+            json!({"log": r"C:\work\repo\.tmp\run.log", "remote": true, "host": HOST, "key": "repo-1"}),
+        )
+    }
+
+    /// The take line of a gate that took remote slot `index`.
+    fn remote_take(&self, time: &str, index: u32) -> String {
+        let slot = format!(r"Local\gate-remote-slot-{index}");
+        self.line(
+            "take",
+            time,
+            json!({"slots": [slot], "waitedSeconds": 0.5, "remote": true, "host": HOST, "key": "repo-1"}),
+        )
+    }
+
+    /// The fallback line of a remote run sent back to the local queue, with `reason` when there is one.
+    fn fallback(&self, time: &str, reason: Option<&str>) -> String {
+        let mut fields = json!({"remote": true, "host": HOST, "key": "repo-1"});
+        if let Some(reason) = reason {
+            fields["reason"] = json!(reason);
+        }
+        self.line("fallback", time, fields)
+    }
+}
+
+#[test]
+fn remote_take_marks_the_run_remote_with_its_host() {
+    let gate = Gate::new(1, START, COMMAND);
+    let lines = [
+        gate.remote_queue(&ago(30)),
+        gate.remote_take(&ago(29), 1),
+        gate.release(&ago(28), 60.0, json!(0)),
+    ];
+    let history = history_of("remote_take_marks_the_run_remote_with_its_host", &lines);
+    let run = &history.runs[0];
+    assert_eq!(
+        (run.slot, run.remote, run.host.as_deref(), run.fallback.as_deref()),
+        (Some(1), true, Some(HOST), None)
+    );
+    assert_eq!(run.kind, "heavy", "a remote run's kind stays heavy");
+}
+
+#[test]
+fn queued_remote_run_is_remote_while_it_waits() {
+    let gate = Gate::new(1, START, COMMAND);
+    let history = history_of("queued_remote_run_is_remote_while_it_waits", &[gate.remote_queue(&ago(5))]);
+    let run = &history.runs[0];
+    assert_eq!((run.slot, run.remote, run.host.as_deref()), (None, true, Some(HOST)));
+}
+
+#[test]
+fn fallback_clears_remote_and_the_local_take_holds_the_slot() {
+    let gate = Gate::new(1, START, COMMAND);
+    let lines = [
+        gate.remote_queue(&ago(30)),
+        gate.remote_take(&ago(29), 0),
+        gate.fallback(&ago(28), Some("rebooted")),
+        gate.take(&ago(27), 0.2),
+        gate.release(&ago(26), 60.0, json!(0)),
+    ];
+    let history = history_of("fallback_clears_remote_and_the_local_take_holds_the_slot", &lines);
+    let run = &history.runs[0];
+    assert_eq!(history.runs.len(), 1, "a fallback is no run of its own");
+    assert_eq!(
+        (run.slot, run.remote, run.host.as_deref(), run.fallback.as_deref()),
+        (Some(1), false, None, Some("rebooted"))
+    );
+    assert_eq!(run.started.as_deref(), Some(ago(27).as_str()), "the local take is the run's start");
+    assert_eq!(run.state, RunState::Ok);
+}
+
+#[test]
+fn fallback_after_a_remote_take_holds_nothing_until_a_local_take() {
+    let gate = Gate::new(1, START, COMMAND);
+    let lines = [
+        gate.remote_queue(&ago(30)),
+        gate.remote_take(&ago(29), 1),
+        gate.fallback(&ago(28), Some("rebooted")),
+    ];
+    let history = history_of("fallback_after_a_remote_take_holds_nothing_until_a_local_take", &lines);
+    let run = &history.runs[0];
+    assert_eq!((run.slot, run.started.as_deref(), run.waited_seconds), (None, None, None));
+    assert_eq!((run.remote, run.fallback.as_deref()), (false, Some("rebooted")));
+}
+
+#[test]
+fn remote_take_after_a_fallback_is_a_plain_remote_run() {
+    let gate = Gate::new(1, START, COMMAND);
+    let lines = [
+        gate.remote_queue(&ago(30)),
+        gate.fallback(&ago(29), Some("busy")),
+        gate.remote_take(&ago(28), 0),
+    ];
+    let history = history_of("remote_take_after_a_fallback_is_a_plain_remote_run", &lines);
+    let run = &history.runs[0];
+    assert_eq!((run.slot, run.remote, run.fallback.as_deref()), (Some(0), true, None));
+}
+
+#[test]
+fn remote_release_marks_a_run_whose_take_rolled_out_remote() {
+    let gate = Gate::new(1, START, COMMAND);
+    let release = gate.line(
+        "release",
+        &ago(10),
+        json!({"slots": [r"Local\gate-remote-slot-0"], "heldSeconds": 30.0, "status": 0, "remote": true, "host": HOST}),
+    );
+    let history = history_of("remote_release_marks_a_run_whose_take_rolled_out_remote", &[release]);
+    let run = &history.runs[0];
+    assert_eq!((run.remote, run.host.as_deref()), (true, Some(HOST)));
+    assert_eq!(history.summary, Vec::<CommandSummary>::new(), "a run with no take is not counted");
+}
+
+#[test]
+fn unknown_fallback_reason_is_kept_and_a_missing_one_reads_unknown() {
+    let odd = Gate::new(1, START, COMMAND);
+    let bare = Gate::new(2, START, COMMAND);
+    let lines = [
+        odd.remote_queue(&ago(30)),
+        odd.fallback(&ago(29), Some("solar flare")),
+        bare.remote_queue(&ago(20)),
+        bare.fallback(&ago(19), None),
+    ];
+    let history = history_of("unknown_fallback_reason_is_kept_and_a_missing_one_reads_unknown", &lines);
+    let reasons: Vec<Option<&str>> = history.runs.iter().map(|run| run.fallback.as_deref()).collect();
+    assert_eq!(reasons, [Some("unknown"), Some("solar flare")]);
+}
+
+#[test]
+fn second_queue_line_keeps_the_first_queued_time() {
+    let gate = Gate::new(1, START, COMMAND);
+    let lines = [
+        gate.remote_queue(&ago(30)),
+        gate.fallback(&ago(29), Some("busy")),
+        gate.queue(&ago(29)),
+        gate.take(&ago(28), 60.0),
+    ];
+    let history = history_of("second_queue_line_keeps_the_first_queued_time", &lines);
+    let run = &history.runs[0];
+    assert_eq!(run.queued.as_deref(), Some(ago(30).as_str()));
+    assert!(!run.remote);
+}
+
+#[test]
+fn summary_splits_remote_runs_from_local_runs_of_one_command() {
+    let remote = Gate::new(1, START, COMMAND);
+    let mut lines = vec![
+        remote.remote_queue(&ago(60)),
+        remote.remote_take(&ago(59), 0),
+        remote.release(&ago(58), 90.0, json!(0)),
+    ];
+    lines.extend(Gate::new(2, START, COMMAND).run(50, 30.0, json!(0)));
+    let history = history_of("summary_splits_remote_runs_from_local_runs_of_one_command", &lines);
+    let rows: Vec<(&str, bool, usize, f64)> = history
+        .summary
+        .iter()
+        .map(|row| (row.command.as_str(), row.remote, row.count, row.max_seconds))
+        .collect();
+    assert_eq!(
+        rows,
+        [(COMMAND, false, 1, 30.0), (COMMAND, true, 1, 90.0)],
+        "one row each, the local row first when the counts tie"
+    );
 }

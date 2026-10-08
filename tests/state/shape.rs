@@ -3,10 +3,13 @@
 use gate_state::SlotKind;
 use serde_json::Value;
 
-use crate::support::{CRITICAL_GATE, LIGHT_GATE, Machine, NOW, START, claim, keys, ticket, ticks};
+use crate::support::{CRITICAL_GATE, HEAVY_GATE, LIGHT_GATE, Machine, NOW, START, claim, keys, remote_claim, remote_ticket, ticket, ticks};
 
-const TOP: [&str; 6] = ["now", "machine", "processors", "critical", "queue", "pools"];
+const TOP: [&str; 7] = ["now", "machine", "processors", "critical", "queue", "pools", "remote"];
 const POOL: [&str; 7] = ["kind", "count", "default", "set", "problem", "slots", "waiting"];
+const REMOTE: [&str; 3] = ["count", "problem", "slots"];
+/// A remote ticket's keys: a ticket's, with `remote` after `holds`.
+const QUEUE_REMOTE: [&str; 8] = ["kind", "holds", "remote", "pid", "arrived", "ageSeconds", "cwd", "commandLine"];
 const SLOT: [&str; 9] = ["index", "name", "state", "claim", "stale", "processes", "lastLine", "critical", "extra"];
 const CRITICAL: [&str; 2] = ["holder", "waiting"];
 const HOLDER: [&str; 8] = ["index", "name", "state", "claim", "stale", "processes", "lastLine", "critical"];
@@ -37,17 +40,53 @@ fn assert_shape(value: &Value) {
         assert_eq!(keys(&waiting), WAITING);
     }
     for ticket in array(value, "queue") {
-        assert_eq!(keys(&ticket), QUEUE);
+        let expected: &[&str] = if ticket.get("remote").is_some() { &QUEUE_REMOTE } else { &QUEUE };
+        assert_eq!(keys(&ticket), expected);
     }
     for pool in array(value, "pools") {
         assert_eq!(keys(&pool), POOL);
-        for slot in array(&pool, "slots") {
+        assert_rows(&pool);
+    }
+    let remote = value.get("remote").expect("the state has a remote key");
+    if !remote.is_null() {
+        assert_eq!(keys(remote), REMOTE);
+        for slot in array(remote, "slots") {
             assert_eq!(keys(&slot), SLOT);
         }
-        for waiting in array(&pool, "waiting") {
-            assert_eq!(keys(&waiting), WAITING);
-        }
     }
+}
+
+/// The keys of a pool's slots and waiting gates.
+fn assert_rows(pool: &Value) {
+    for slot in array(pool, "slots") {
+        assert_eq!(keys(&slot), SLOT);
+    }
+    for waiting in array(pool, "waiting") {
+        assert_eq!(keys(&waiting), WAITING);
+    }
+}
+
+#[test]
+fn remote_pool_and_ticket_keys_follow_dashboard_order() {
+    let mut machine = Machine::new("remote_pool_and_ticket_keys_follow_dashboard_order");
+    machine.write_remote(r#"{"slots": 2}"#);
+    machine.write_claim("gate-remote-slot-0.json", &remote_claim(800, 0).to_string());
+    machine.add_process(800, 1, "pwsh.exe", Some(HEAVY_GATE), Some(START));
+    machine.add_process(801, 1, "pwsh.exe", Some(HEAVY_GATE), Some(START));
+    machine.add_process(802, 1, "pwsh.exe", Some(LIGHT_GATE), Some(START));
+    machine.write_ticket("waiting", "801.json", &remote_ticket(801, ticks(NOW)).to_string());
+    machine.write_ticket("waiting", "802.json", &ticket("light", 802, ticks(NOW), false).to_string());
+    let state = serde_json::to_value(machine.state()).expect("the state serialises");
+
+    assert_shape(&state);
+    let remote = state.get("remote").expect("the state has a remote pool");
+
+    let slots = array(remote, "slots");
+    let busy = slots.first().expect("remote slot 0 is listed");
+    let mut claim_keys = CLAIM.to_vec();
+    claim_keys.extend(["remote", "host", "key"]);
+    assert_eq!(keys(busy.get("claim").expect("a busy slot has its claim")), claim_keys);
+    assert_eq!(array(&state, "queue").len(), 2);
 }
 
 #[test]

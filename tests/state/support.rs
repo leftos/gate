@@ -21,6 +21,10 @@ pub const START_FAR: &str = "2026-10-01T11:00:03.5Z";
 pub const LIGHT_GATE: &str = r"pwsh -NoProfile -File C:\Users\me\.claude\tools\gate\gate.ps1 -Log x -Slot light -- cargo test";
 /// A critical gate's command line.
 pub const CRITICAL_GATE: &str = r"pwsh -NoProfile -File C:\Users\me\.claude\tools\gate\gate.ps1 -Log x -Slot critical -- cargo test";
+/// A heavy gate's command line, which a gate routed to the remote pool keeps.
+pub const HEAVY_GATE: &str = r"pwsh -NoProfile -File C:\Users\me\.claude\tools\gate\gate.ps1 -Log x -Slot heavy -- cargo test";
+/// The ssh destination the remote claims name.
+pub const HOST: &str = "builder@build-box";
 /// .NET ticks (100 ns since 0001-01-01) at the Unix epoch.
 const UNIX_EPOCH_TICKS: i128 = 621_355_968_000_000_000;
 
@@ -80,6 +84,18 @@ impl Machine {
 
     pub fn write_counts(&self, text: &str) {
         fs::write(self.counts_path(), text).expect("the counts file can be written");
+    }
+
+    /// Writes the gate's `remote.json`, which sizes the remote pool.
+    pub fn write_remote(&self, text: &str) {
+        fs::write(self.dir.join("gate").join("remote.json"), text).expect("remote.json can be written");
+    }
+
+    /// Opens the mutex of every heavy slot within the default count of 3.
+    pub fn hold_heavy_slots(&mut self) {
+        for index in 0..3 {
+            self.open.insert(format!("gate-slot-{index}"));
+        }
     }
 
     pub fn write_claim(&self, file_name: &str, text: &str) {
@@ -142,6 +158,24 @@ pub fn claim(pid: u32, log: Option<&str>, cwd: &str) -> Value {
         "log": log,
         "timeoutSeconds": 600.0,
     })
+}
+
+/// A remote slot's claim as the gate writes it: a heavy claim's keys, then `remote`, `host` and `key`.
+pub fn remote_claim(pid: u32, index: u32) -> Value {
+    let mut claim = claim(pid, None, "C:\\work");
+    let object = claim.as_object_mut().expect("a claim is an object");
+    object.insert("index".to_owned(), json!(index));
+    object.insert("remote".to_owned(), json!(true));
+    object.insert("host".to_owned(), json!(HOST));
+    object.insert("key".to_owned(), json!("work-3f2a9c"));
+    claim
+}
+
+/// The arrival ticket of a gate routed to the remote pool.
+pub fn remote_ticket(pid: u32, arrived: i64) -> Value {
+    let mut ticket = ticket("heavy", pid, arrived, false);
+    ticket["remote"] = json!(true);
+    ticket
 }
 
 /// An arrival ticket as the gate writes it, with the gate's key order, for a process that started at [`START`].

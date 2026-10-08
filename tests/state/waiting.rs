@@ -1,8 +1,57 @@
 //! The gates listed as waiting for a full pool.
 
-use gate_state::{SlotKind, SlotState, Waiting};
+use gate_state::{DashboardState, SlotKind, SlotState, Waiting};
 
-use crate::support::{LIGHT_GATE, Machine, START, claim, pool};
+use crate::support::{CRITICAL_GATE, HEAVY_GATE, LIGHT_GATE, Machine, NOW, START, claim, pool, remote_claim, remote_ticket, ticket, ticks};
+
+fn heavy_waiting(state: &DashboardState) -> Vec<u32> {
+    pool(state, SlotKind::Heavy).waiting.iter().map(|waiting| waiting.pid).collect()
+}
+
+#[test]
+fn remote_holder_is_not_a_heavy_waiter() {
+    let mut machine = Machine::new("remote_holder_is_not_a_heavy_waiter");
+    machine.hold_heavy_slots();
+    machine.write_remote(r#"{"slots": 1}"#);
+    machine.write_claim("gate-remote-slot-0.json", &remote_claim(500, 0).to_string());
+    machine.add_process(500, 1, "pwsh.exe", Some(HEAVY_GATE), Some(START));
+    machine.add_process(501, 1, "pwsh.exe", Some(HEAVY_GATE), Some(START));
+    let state = machine.state();
+
+    assert_eq!(heavy_waiting(&state), [501], "the remote holder keeps -Slot heavy but holds a slot");
+}
+
+#[test]
+fn routed_waiter_is_held_out_of_the_full_heavy_pool() {
+    let mut machine = Machine::new("routed_waiter_is_held_out_of_the_full_heavy_pool");
+    machine.hold_heavy_slots();
+    machine.write_remote(r#"{"slots": 1}"#);
+    machine.open.insert("gate-remote-slot-0".to_owned());
+    machine.add_process(600, 1, "pwsh.exe", Some(HEAVY_GATE), Some(START));
+    machine.cwds.insert(600, "C:\\work".to_owned());
+    machine.write_ticket("waiting", "600.json", &remote_ticket(600, ticks(NOW)).to_string());
+    let state = machine.state();
+
+    assert_eq!(heavy_waiting(&state), Vec::<u32>::new(), "a routed gate shows only in the queue");
+}
+
+#[test]
+fn routed_waiter_is_held_out_of_a_barred_heavy_pool() {
+    let mut machine = Machine::new("routed_waiter_is_held_out_of_a_barred_heavy_pool");
+    machine.write_remote(r#"{"slots": 1}"#);
+    machine.add_process(600, 1, "pwsh.exe", Some(HEAVY_GATE), Some(START));
+    machine.add_process(601, 1, "pwsh.exe", Some(HEAVY_GATE), Some(START));
+    machine.add_process(700, 1, "pwsh.exe", Some(CRITICAL_GATE), Some(START));
+    machine.write_ticket("waiting", "600.json", &remote_ticket(600, ticks(NOW)).to_string());
+    machine.write_ticket("waiting", "700.json", &ticket("critical", 700, ticks(NOW), false).to_string());
+    let state = machine.state();
+
+    assert!(
+        pool(&state, SlotKind::Heavy).slots.iter().all(|slot| slot.state == SlotState::Free),
+        "the heavy pool has free slots"
+    );
+    assert_eq!(heavy_waiting(&state), [601], "the barred pool lists its local waiter, not the routed one");
+}
 
 fn light_waiting(machine: &Machine) -> Vec<u32> {
     let state = machine.state();

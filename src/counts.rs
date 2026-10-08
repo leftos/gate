@@ -122,7 +122,7 @@ pub(crate) fn pool_count(file: &CountsFile, path: &Path, kind: SlotKind, process
 }
 
 /// The value of an object's key, matched without regard to ASCII case as the gate's JSON reader does.
-fn property<'a>(object: &'a Map<String, Value>, key: &str) -> Option<&'a Value> {
+pub(crate) fn property<'a>(object: &'a Map<String, Value>, key: &str) -> Option<&'a Value> {
     for (name, value) in object {
         if name.eq_ignore_ascii_case(key) {
             return Some(value);

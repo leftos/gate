@@ -1,0 +1,1 @@
+{"kind":"heavy","index":1,"pid":52000,"processStart":"2026-10-02T21:16:00.5711853Z","started":"2026-10-02T21:16:02.0157648Z","cwd":"C:\\work\\repo","command":"dotnet test Delve.slnx -c Release","log":"C:\\work\\repo\\.tmp\\remote.log","timeoutSeconds":900.0,"remote":true,"host":"builder@build-box","key":"repo-3f2a9c"}
