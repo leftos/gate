@@ -3,7 +3,7 @@
 use gate_state::{DashboardState, QueueTicket, SlotKind};
 use serde_json::{Value, json};
 
-use crate::support::{CRITICAL_GATE, LIGHT_GATE, Machine, NOW, START, START_CLOSE, START_FAR, ticket, ticks};
+use crate::support::{CRITICAL_GATE, HEAVY_GATE, LIGHT_GATE, Machine, NOW, START, START_CLOSE, START_FAR, remote_ticket, ticket, ticks};
 
 const SECOND: i64 = 10_000_000;
 
@@ -46,6 +46,40 @@ fn queue_lists_waiting_tickets() {
         "commandLine": LIGHT_GATE,
     }]);
     assert_eq!(queue, expected);
+}
+
+#[test]
+fn queue_row_carries_the_ticket_remote_flag() {
+    let mut machine = Machine::new("queue_row_carries_the_ticket_remote_flag");
+    machine.add_process(300, 1, "pwsh.exe", Some(LIGHT_GATE), Some(START));
+    machine.add_process(301, 1, "pwsh.exe", Some(HEAVY_GATE), Some(START));
+    machine.write_ticket("waiting", "300.json", &ticket("light", 300, ticks(NOW) - 2 * SECOND, false).to_string());
+    machine.write_ticket("waiting", "301.json", &remote_ticket(301, ticks(NOW) - SECOND).to_string());
+    let state = machine.state();
+
+    let flags: Vec<(u32, bool)> = state.queue.iter().map(|ticket| (ticket.pid, ticket.remote)).collect();
+    assert_eq!(flags, [(300, false), (301, true)], "a ticket without remote is local");
+    let queue = serde_json::to_value(&state.queue).expect("the queue serialises");
+    let remote: Vec<Option<&Value>> = queue
+        .as_array()
+        .expect("the queue is an array")
+        .iter()
+        .map(|ticket| ticket.get("remote"))
+        .collect();
+    assert_eq!(remote, [None, Some(&json!(true))], "remote is written only when true");
+}
+
+#[test]
+fn queue_row_reads_a_remote_that_is_not_a_boolean_as_local() {
+    let mut machine = Machine::new("queue_row_reads_a_remote_that_is_not_a_boolean_as_local");
+    machine.add_process(301, 1, "pwsh.exe", Some(HEAVY_GATE), Some(START));
+    let mut text = remote_ticket(301, ticks(NOW));
+    text["remote"] = json!("true");
+    machine.write_ticket("waiting", "301.json", &text.to_string());
+    let state = machine.state();
+
+    let flags: Vec<(u32, bool)> = state.queue.iter().map(|ticket| (ticket.pid, ticket.remote)).collect();
+    assert_eq!(flags, [(301, false)]);
 }
 
 #[test]

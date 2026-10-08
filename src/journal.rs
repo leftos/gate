@@ -2,7 +2,9 @@
 //! read into runs, the newest runs and, per command, how long the runs that passed held their slot over the last week.
 //!
 //! A run is keyed by the gate's `pid` and `processStart`, since the journal carries no run id: its `queue` line, its
-//! `take` once it holds a slot, then `release` as it lets the slot go or `abandon` when it ended still waiting. `covered`
+//! `take` once it holds a slot, then `release` as it lets the slot go or `abandon` when it ended still waiting. A run
+//! routed to the remote pool carries `remote` and `host` on those lines, and a `fallback` line when it was sent back to
+//! the local queue, whose local `take` follows. `covered`
 //! and `parent` lines (a gate running on its parent's slot) and every line of the gate's own self-test (a `cwd` holding
 //! `gate-selftest`) are ignored, and a line that does not parse is skipped. The folder, the prefix, the clock and the
 //! process liveness check all come from the caller.
@@ -60,6 +62,15 @@ pub struct HistoryRun {
     pub kind: String,
     /// The index of the first slot the run took, or `None` when it took none.
     pub slot: Option<u32>,
+    /// True for a run routed to the remote pool: its latest queue, take or release line says `remote` and no `fallback`
+    /// line came after it. It stays true once the run has released its remote slot, and the summary counts the run's
+    /// held time on the command's remote row.
+    pub remote: bool,
+    /// The build box a remote run waits for or runs on, its ssh destination; `None` for a local run.
+    pub host: Option<String>,
+    /// Why the run, routed to the remote pool, was sent back to the local queue (`unreachable`, `busy`, `rebooted`,
+    /// `parity`, or `unknown` when the line names none); `None` when it was not.
+    pub fallback: Option<String>,
     /// How the run stands.
     pub state: RunState,
     /// When the gate queued, as the journal wrote it (ISO 8601 UTC, seven fractional digits); `None` when its queue
@@ -76,7 +87,8 @@ pub struct HistoryRun {
     pub status: Option<i64>,
 }
 
-/// How long the runs of one command in one repository that passed held their slot.
+/// How long the runs of one command in one repository that passed held their slot, the remote runs apart from the local
+/// ones.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CommandSummary {
@@ -84,6 +96,8 @@ pub struct CommandSummary {
     pub command: String,
     /// The repository the runs' folders belong to, as [`HistoryRun::repo`] names it.
     pub repo: Option<String>,
+    /// True for the runs that held a remote slot, as [`HistoryRun::remote`] has it.
+    pub remote: bool,
     /// The runs counted.
     pub count: usize,
     /// The median held time, by nearest rank.
@@ -99,8 +113,8 @@ pub struct CommandSummary {
 pub struct History {
     /// The 50 newest runs by the time they queued, newest first, in every state.
     pub runs: Vec<HistoryRun>,
-    /// One row per repository and command over the runs taken in the last 7 days that passed, the most run first, then
-    /// by command, then by repository (none first).
+    /// One row per repository, command and remote flag over the runs taken in the last 7 days that passed, the most run
+    /// first, then by command, then by repository (none first), then local before remote.
     pub summary: Vec<CommandSummary>,
 }
 
@@ -160,6 +174,9 @@ struct Run {
     queued: Option<Stamp>,
     started: Option<Stamp>,
     slot: Option<u32>,
+    remote: bool,
+    host: Option<String>,
+    fallback: Option<String>,
     waited_seconds: Option<f64>,
     held_seconds: Option<f64>,
     status: Option<i64>,
@@ -185,6 +202,12 @@ struct Line {
     held_seconds: Option<f64>,
     #[serde(default)]
     status: Option<i64>,
+    #[serde(default)]
+    remote: bool,
+    #[serde(default)]
+    host: Option<String>,
+    #[serde(default)]
+    reason: Option<String>,
 }
 
 impl JournalCache {
@@ -273,8 +296,10 @@ impl JournalCache {
         }
     }
 
-    /// Adds one journal line to its run; a line that does not parse, the self-test's, and every event but the four a
-    /// run is made of are skipped.
+    /// Adds one journal line to its run; a line that does not parse, the self-test's, and every event but the five a
+    /// run is made of are skipped. A run's first `queue` line sets its queued time; a later one (after a `fallback`)
+    /// does not. A `fallback` line sends a remote run back to the local queue: the run is no longer remote, and keeps the
+    /// reason.
     fn apply(&mut self, bytes: &[u8]) {
         let Ok(line) = serde_json::from_slice::<Line>(bytes.trim_ascii()) else {
             return;
@@ -282,7 +307,7 @@ impl JournalCache {
         let Ok(at) = line.time.parse::<Timestamp>() else {
             return;
         };
-        if line.cwd.contains(SELFTEST_MARKER) || !matches!(line.event.as_str(), "queue" | "take" | "release" | "abandon") {
+        if line.cwd.contains(SELFTEST_MARKER) || !matches!(line.event.as_str(), "queue" | "take" | "release" | "abandon" | "fallback") {
             return;
         }
         let stamp = Stamp { at, text: line.time };
@@ -294,22 +319,42 @@ impl JournalCache {
             queued: None,
             started: None,
             slot: None,
+            remote: false,
+            host: None,
+            fallback: None,
             waited_seconds: None,
             held_seconds: None,
             status: None,
             end: None,
         });
         match line.event.as_str() {
-            "queue" => run.queued = Some(stamp),
+            "queue" => {
+                run.queued.get_or_insert(stamp);
+                run.route(line.remote, line.host);
+            }
             "take" => {
                 run.started = Some(stamp);
                 run.slot = first_slot(&line.slots);
                 run.waited_seconds = line.waited_seconds;
+                run.route(line.remote, line.host);
             }
             "release" => {
                 run.held_seconds = line.held_seconds;
                 run.status = line.status;
                 run.end = Some(End::Released);
+                // A release line that says `remote` marks a run whose queue and take rolled out of the journal; one that
+                // does not leaves the run as its take left it.
+                if line.remote {
+                    run.route(true, line.host);
+                }
+            }
+            "fallback" => {
+                // The run holds nothing until a local take: a remote take's slot, start and wait no longer stand.
+                run.route(false, None);
+                run.slot = None;
+                run.started = None;
+                run.waited_seconds = None;
+                run.fallback = Some(line.reason.unwrap_or_else(|| "unknown".to_owned()));
             }
             _ => {
                 run.waited_seconds = line.waited_seconds;
@@ -344,6 +389,15 @@ impl JournalCache {
 }
 
 impl Run {
+    /// Marks the run remote on `host`, or local. A remote line after a `fallback` makes the run a plain remote one again.
+    fn route(&mut self, remote: bool, host: Option<String>) {
+        self.remote = remote;
+        self.host = host.filter(|_| remote);
+        if remote {
+            self.fallback = None;
+        }
+    }
+
     fn state(&self, (pid, process_start): &RunKey, is_live: &impl Fn(u32, &str) -> bool) -> RunState {
         match self.end {
             Some(End::Released) if self.status == Some(0) => RunState::Ok,
@@ -366,6 +420,9 @@ impl Run {
             repo,
             kind: self.kind.clone(),
             slot: self.slot,
+            remote: self.remote,
+            host: self.host.clone(),
+            fallback: self.fallback.clone(),
             state,
             queued: self.queued.as_ref().map(|stamp| stamp.text.clone()),
             started: self.started.as_ref().map(|stamp| stamp.text.clone()),
@@ -390,22 +447,26 @@ fn newest_first(runs: &HashMap<RunKey, Run>) -> Vec<(&RunKey, &Run)> {
     ordered
 }
 
-/// One row per repository and command over the runs that passed and took their slot at or after `cutoff`, a run's
-/// repository named by `repo_of` its folder: the most run first, then by command, then by repository (none first).
+/// One row per repository, command and remote flag over the runs that passed and took their slot at or after `cutoff`, a
+/// run's repository named by `repo_of` its folder: the most run first, then by command, then by repository (none
+/// first), then local before remote.
 fn summarize<'a>(runs: impl Iterator<Item = &'a Run>, cutoff: Timestamp, repo_of: &impl Fn(&str) -> Option<String>) -> Vec<CommandSummary> {
-    let mut held: BTreeMap<(Option<String>, &str), Vec<f64>> = BTreeMap::new();
+    let mut held: BTreeMap<(Option<String>, &str, bool), Vec<f64>> = BTreeMap::new();
     for run in runs {
         if let Some(seconds) = run.counted_held_seconds(cutoff) {
-            held.entry((run.repo(repo_of), run.command.as_str())).or_default().push(seconds);
+            held.entry((run.repo(repo_of), run.command.as_str(), run.remote))
+                .or_default()
+                .push(seconds);
         }
     }
     let mut summary: Vec<CommandSummary> = held
         .into_iter()
-        .filter_map(|((repo, command), mut seconds)| {
+        .filter_map(|((repo, command, remote), mut seconds)| {
             seconds.sort_by(f64::total_cmp);
             Some(CommandSummary {
                 command: command.to_owned(),
                 repo,
+                remote,
                 count: seconds.len(),
                 p50_seconds: nearest_rank(&seconds, 50)?,
                 p90_seconds: nearest_rank(&seconds, 90)?,
@@ -418,6 +479,7 @@ fn summarize<'a>(runs: impl Iterator<Item = &'a Run>, cutoff: Timestamp, repo_of
             .cmp(&a.count)
             .then_with(|| a.command.cmp(&b.command))
             .then_with(|| a.repo.cmp(&b.repo))
+            .then_with(|| a.remote.cmp(&b.remote))
     });
     summary
 }

@@ -2,10 +2,10 @@
 
 use std::fs;
 
-use gate_state::{SlotKind, SlotRow, SlotState};
+use gate_state::{RemotePool, SlotKind, SlotRow, SlotState};
 use serde_json::{Value, json};
 
-use crate::support::{Machine, START, START_CLOSE, START_FAR, claim, pool};
+use crate::support::{Machine, START, START_CLOSE, START_FAR, claim, pool, remote_claim};
 
 fn heavy_slot(machine: &Machine, index: u32) -> SlotRow {
     let state = machine.state();
@@ -170,6 +170,122 @@ fn last_line_reads_only_the_final_4096_bytes() {
         row.last_line.as_deref(),
         Some(tail),
         "the final 4096 bytes are the line's last 4095 and its newline"
+    );
+}
+
+fn remote_pool(machine: &Machine) -> RemotePool {
+    machine.state().remote.expect("the state has a remote pool")
+}
+
+/// Each remote slot's index, state and `extra`.
+fn remote_rows(pool: &RemotePool) -> Vec<(u32, SlotState, Option<bool>)> {
+    pool.slots.iter().map(|slot| (slot.index, slot.state, slot.extra)).collect()
+}
+
+#[test]
+fn remote_claim_is_busy_in_the_remote_pool_and_in_no_other() {
+    let mut machine = Machine::new("remote_claim_is_busy_in_the_remote_pool_and_in_no_other");
+    machine.write_remote(r#"{"slots": 2}"#);
+    let claim = remote_claim(100, 1);
+    machine.write_claim("gate-remote-slot-1.json", &claim.to_string());
+    machine.add_process(100, 1, "pwsh.exe", None, Some(START));
+    machine.add_process(101, 100, "ssh.exe", None, None);
+    machine.open.insert("gate-remote-slot-0".to_owned());
+    let state = machine.state();
+
+    let remote = state.remote.as_ref().expect("remote.json sizes a remote pool");
+    assert_eq!((remote.count, remote.problem.as_deref()), (2, None));
+    assert_eq!(
+        remote_rows(remote),
+        [(0, SlotState::Held, Some(false)), (1, SlotState::Busy, Some(false))]
+    );
+    let busy = remote.slots.get(1).expect("remote slot 1 is listed");
+    assert_eq!((busy.name.as_str(), busy.processes), ("gate-remote-slot-1", 1));
+    assert_eq!(busy.claim, Some(claim));
+    for kind in [SlotKind::Heavy, SlotKind::Light] {
+        assert!(
+            pool(&state, kind)
+                .slots
+                .iter()
+                .all(|slot| slot.state == SlotState::Free && !slot.name.contains("remote")),
+            "{kind:?} holds no remote slot"
+        );
+    }
+}
+
+#[test]
+fn remote_claim_past_the_count_is_extra() {
+    let machine = Machine::new("remote_claim_past_the_count_is_extra");
+    machine.write_remote(r#"{"slots": 1}"#);
+    machine.write_claim("gate-remote-slot-3.json", &remote_claim(100, 3).to_string());
+
+    let remote = remote_pool(&machine);
+
+    assert_eq!(
+        remote_rows(&remote),
+        [(0, SlotState::Free, Some(false)), (3, SlotState::Free, Some(true))]
+    );
+    assert!(
+        remote.slots.get(1).is_some_and(|slot| slot.stale.is_some()),
+        "the dead gate's claim is stale"
+    );
+}
+
+#[test]
+fn no_remote_json_and_no_remote_claim_is_no_remote_pool() {
+    let machine = Machine::new("no_remote_json_and_no_remote_claim_is_no_remote_pool");
+    let state = machine.state();
+    assert_eq!(state.remote, None);
+    let value = serde_json::to_value(&state).expect("the state serialises");
+    assert_eq!(value.get("remote"), Some(&Value::Null));
+}
+
+#[test]
+fn remote_claim_without_remote_json_is_an_extra_slot_with_a_problem() {
+    let machine = Machine::new("remote_claim_without_remote_json_is_an_extra_slot_with_a_problem");
+    machine.write_claim("gate-remote-slot-0.json", &remote_claim(100, 0).to_string());
+
+    let remote = remote_pool(&machine);
+
+    assert_eq!(remote.count, 0);
+    let path = machine.dir.join("gate").join("remote.json");
+    assert_eq!(remote.problem, Some(format!("no remote.json at {}", path.display())));
+    assert_eq!(remote_rows(&remote), [(0, SlotState::Free, Some(true))]);
+}
+
+#[test]
+fn remote_json_slots_is_read_in_any_letter_case_up_to_16() {
+    let machine = Machine::new("remote_json_slots_is_read_in_any_letter_case_up_to_16");
+    machine.write_remote(r#"{"SLOTS": 16.0, "repos": {"x": ["dotnet test *"]}}"#);
+    let remote = remote_pool(&machine);
+    assert_eq!((remote.count, remote.problem), (16, None));
+    assert_eq!(remote.slots.len(), 16);
+}
+
+#[test]
+fn remote_json_that_cannot_be_used_is_a_problem() {
+    let machine = Machine::new("remote_json_that_cannot_be_used_is_a_problem");
+    let path = machine.dir.join("gate").join("remote.json");
+    let ignored = |reason: &str| format!("gate: ignored {}: {reason}; using no remote slots", path.display());
+    for (text, reason) in [
+        (r#"{"slots": 0}"#, ignored("slots must be a whole number 1 to 16, got '0'")),
+        (r#"{"slots": 17}"#, ignored("slots must be a whole number 1 to 16, got '17'")),
+        (r#"{"slots": "2"}"#, ignored("slots must be a whole number 1 to 16, got '2'")),
+        (r#"{"slots": 2.5}"#, ignored("slots must be a whole number 1 to 16, got '2.5'")),
+        (r#"{"slots": null}"#, ignored("slots must be a whole number 1 to 16, got null")),
+        (r#"{"repos": {}}"#, ignored("it has no slots")),
+        ("[2]", ignored("it is not a JSON object")),
+    ] {
+        machine.write_remote(text);
+        let remote = remote_pool(&machine);
+        assert_eq!((remote.count, remote.problem.as_deref()), (0, Some(reason.as_str())), "{text}");
+        assert!(remote.slots.is_empty(), "{text}");
+    }
+    machine.write_remote("{slots: 2}");
+    let problem = remote_pool(&machine).problem.expect("malformed JSON is a problem");
+    assert!(
+        problem.starts_with(&format!("gate: ignored {}: it is not valid JSON: ", path.display())),
+        "{problem}"
     );
 }
 

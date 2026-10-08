@@ -58,11 +58,13 @@ pub(crate) struct Ticket {
     pub start_ticks: i64,
     /// When the gate arrived, in .NET ticks.
     pub arrived_ticks: i64,
+    /// True for a heavy gate routed to the remote pool; a ticket without the key is a local one.
+    pub remote: bool,
 }
 
 /// The claim files of the slots and of the critical gate in `dir`, keyed by mutex name in lower case: the files named
-/// `<prefix>gate-slot-<n>`, `<prefix>gate-light-slot-<n>` or `<prefix>gate-critical` with a `.json` extension, in any
-/// letter case. A claim without the prefix is left out; a missing folder holds none.
+/// `<prefix>gate-slot-<n>`, `<prefix>gate-light-slot-<n>`, `<prefix>gate-remote-slot-<n>` or `<prefix>gate-critical`
+/// with a `.json` extension, in any letter case. A claim without the prefix is left out; a missing folder holds none.
 pub(crate) fn read_claims(dir: &Path, prefix: &str) -> HashMap<String, Claim> {
     let mut claims = HashMap::new();
     let Ok(entries) = fs::read_dir(dir) else {
@@ -89,7 +91,10 @@ fn mutex_name(path: &Path, prefix: &str) -> Option<String> {
     if name == "gate-critical" {
         return Some(base);
     }
-    let digits = name.strip_prefix("gate-light-slot-").or_else(|| name.strip_prefix("gate-slot-"))?;
+    let digits = name
+        .strip_prefix("gate-light-slot-")
+        .or_else(|| name.strip_prefix("gate-remote-slot-"))
+        .or_else(|| name.strip_prefix("gate-slot-"))?;
     (!digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())).then_some(base)
 }
 
@@ -129,6 +134,7 @@ fn read_ticket(path: &Path) -> Option<Ticket> {
         pid: object.get("pid")?.as_u64().and_then(|pid| u32::try_from(pid).ok())?,
         start_ticks: object.get("startTicks")?.as_i64()?,
         arrived_ticks: object.get("arrived")?.as_i64()?,
+        remote: object.get("remote").and_then(Value::as_bool).unwrap_or(false),
     })
 }
 

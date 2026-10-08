@@ -3,7 +3,7 @@
 use std::fs;
 use std::path::Path;
 
-use gate_state::{CommandSummary, HistoryRun, JournalCache, RunState, SlotCount, SlotKind, SlotState, dashboard_state};
+use gate_state::{CommandSummary, HistoryRun, JournalCache, RunState, SlotCount, SlotKind, SlotState, Waiting, dashboard_state};
 use serde_json::Value;
 
 use crate::support::{Machine, pool, ts};
@@ -16,13 +16,29 @@ const TICKET: &str = include_str!("fixtures/ticket.json");
 const SLOT_COUNTS: &str = include_str!("fixtures/slot-counts.json");
 /// The journal of four light gates under one light slot, plus a hand-written abandoned one.
 const JOURNAL: &str = include_str!("fixtures/journal.jsonl");
+/// A remote slot's claim file, written by hand from the design.
+const REMOTE_CLAIM: &str = include_str!("fixtures/remote-claim.json");
+/// The arrival ticket of a gate routed to the remote pool, written by hand from the design.
+const REMOTE_TICKET: &str = include_str!("fixtures/remote-ticket.json");
+/// The gate's remote settings: two slots, plus routing keys the state ignores.
+const REMOTE_SETTINGS: &str = include_str!("fixtures/remote.json");
+/// The journal of a remote run, four runs that fell back, and a local one, written by hand from the design.
+const REMOTE_JOURNAL: &str = include_str!("fixtures/remote-journal.jsonl");
 /// The self-test prefix the capture ran under, in front of the claim's name and the waiting folder's.
 const PREFIX: &str = "ops28-";
+/// The self-test prefix the remote fixtures are read under.
+const REMOTE_PREFIX: &str = "ops225-";
+/// The routed gate's command line: a gate routed to the remote pool keeps `-Slot heavy`.
+const ROUTED_GATE: &str =
+    r"pwsh -NoProfile -File C:\Users\me\.claude\tools\gate\gate.ps1 -Log .tmp/r.log -TimeoutSeconds 900 -Slot heavy -- dotnet test";
 /// The neutral working directory the fixtures name in place of the capture's, JSON-escaped as the files have it.
 const NEUTRAL_CWD: &str = r"C:\\work\\repo";
 /// The waiting gate's command line.
 const WAITING_GATE: &str =
     r"pwsh -NoProfile -File C:\Users\me\.claude\tools\gate\gate.ps1 -Log .tmp/o28-capture/second.log -TimeoutSeconds 120 -Slot heavy -- pwsh";
+
+/// A run's slot, remote flag, host, fallback reason and state.
+type RunRow<'a> = (Option<u32>, bool, Option<&'a str>, Option<&'a str>, RunState);
 
 fn count(value: u32) -> SlotCount {
     SlotCount::new(value).expect("a test count is 1 to 64")
@@ -92,6 +108,108 @@ fn captured_ticket_is_read_into_the_queue() {
 }
 
 #[test]
+fn remote_claim_is_read_as_a_busy_remote_slot_with_its_host() {
+    let mut machine = Machine::new("remote_claim_is_read_as_a_busy_remote_slot_with_its_host");
+    machine.prefix = REMOTE_PREFIX.to_owned();
+    machine.write_remote(REMOTE_SETTINGS);
+    machine.write_claim("ops225-gate-remote-slot-1.json", REMOTE_CLAIM);
+    machine.add_process(52000, 1, "pwsh.exe", Some(ROUTED_GATE), Some("2026-10-02T21:16:00.5711853Z"));
+
+    let state = machine.state();
+
+    let remote = state.remote.as_ref().expect("remote.json sizes a remote pool");
+    assert_eq!((remote.count, remote.problem.as_deref()), (2, None), "the routing keys are ignored");
+    let names: Vec<&str> = remote.slots.iter().map(|slot| slot.name.as_str()).collect();
+    assert_eq!(names, ["ops225-gate-remote-slot-0", "ops225-gate-remote-slot-1"]);
+    let row = remote.slots.get(1).expect("remote slot 1 is listed");
+    assert_eq!(row.state, SlotState::Busy);
+    let claim = row.claim.as_ref().expect("a busy slot shows its claim");
+    assert_eq!(text(claim, "host"), "builder@build-box");
+    assert_eq!(text(claim, "key"), "repo-3f2a9c");
+    assert_eq!(claim.get("remote"), Some(&Value::Bool(true)));
+    assert!(
+        pool(&state, SlotKind::Heavy).slots.iter().all(|slot| slot.state == SlotState::Free),
+        "a remote claim is no heavy slot's"
+    );
+    assert_eq!(pool(&state, SlotKind::Heavy).waiting, Vec::<Waiting>::new());
+}
+
+#[test]
+fn remote_ticket_is_read_into_the_queue() {
+    let mut machine = Machine::new("remote_ticket_is_read_into_the_queue");
+    machine.prefix = REMOTE_PREFIX.to_owned();
+    machine.write_remote(REMOTE_SETTINGS);
+    machine.write_ticket("ops225-waiting", "60090-639265725620427420.json", REMOTE_TICKET);
+    machine.add_process(60090, 1, "pwsh.exe", Some(ROUTED_GATE), Some("2026-10-02T21:16:02.0427420Z"));
+    let mut inputs = machine.inputs();
+    inputs.now = ts("2026-10-02T21:16:07.4458960Z");
+
+    let state = dashboard_state(&inputs, &machine, &machine, &machine);
+
+    let ticket = state.queue.first().expect("the ticket's gate is live");
+    assert_eq!((ticket.kind.as_str(), ticket.pid, ticket.remote), ("heavy", 60090, true));
+    assert!(state.remote.is_some(), "remote.json sizes a remote pool");
+}
+
+#[test]
+fn remote_journal_is_read_into_runs_and_a_split_summary() {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join("gate-state")
+        .join("remote_journal_is_read_into_runs_and_a_split_summary");
+    if dir.exists() {
+        fs::remove_dir_all(&dir).expect("the test's old folder can be removed");
+    }
+    fs::create_dir_all(&dir).expect("the test's folder can be made");
+    fs::write(dir.join("ops225-events.jsonl"), REMOTE_JOURNAL).expect("the journal can be written");
+    let not_live = |_pid: u32, _process_start: &str| false;
+    let last_segment = |cwd: &str| cwd.rsplit(['\\', '/']).next().map(str::to_owned);
+
+    let history = JournalCache::default()
+        .read(&dir, REMOTE_PREFIX, ts("2026-10-03T08:00:00Z"), not_live, last_segment)
+        .expect("the journal can be read");
+
+    let rows: Vec<RunRow<'_>> = history
+        .runs
+        .iter()
+        .map(|run| (run.slot, run.remote, run.host.as_deref(), run.fallback.as_deref(), run.state))
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            (Some(0), false, None, None, RunState::Ok),
+            (Some(1), false, None, Some("parity"), RunState::Failed),
+            (Some(2), false, None, Some("rebooted"), RunState::Ok),
+            (Some(0), false, None, Some("busy"), RunState::Ok),
+            (Some(1), false, None, Some("unreachable"), RunState::Ok),
+            (Some(0), true, Some("builder@build-box"), None, RunState::Ok),
+        ],
+        "newest first: the local run, then the runs that fell back, each on its final local slot, then the remote run"
+    );
+    let busy = &history.runs[3];
+    assert_eq!(
+        busy.queued.as_deref(),
+        Some("2026-10-03T06:20:00.4000000Z"),
+        "a second queue line keeps the first queued time"
+    );
+    assert_eq!(busy.started.as_deref(), Some("2026-10-03T06:21:00.6000000Z"));
+    assert_eq!(
+        history.runs[2].started.as_deref(),
+        Some("2026-10-03T06:31:10.2000000Z"),
+        "the local take after a remote one"
+    );
+    let summary: Vec<(bool, usize, f64, f64, f64)> = history
+        .summary
+        .iter()
+        .map(|row| (row.remote, row.count, row.p50_seconds, row.p90_seconds, row.max_seconds))
+        .collect();
+    assert_eq!(
+        summary,
+        [(false, 4, 27.0, 28.0, 28.0), (true, 1, 64.2, 64.2, 64.2)],
+        "the remote runs of a command are a row of their own; the failed run is not counted"
+    );
+}
+
+#[test]
 fn captured_slot_counts_set_both_pools() {
     let machine = Machine::new("captured_slot_counts_set_both_pools");
     machine.write_counts(SLOT_COUNTS);
@@ -145,6 +263,9 @@ fn captured_journal_is_read_into_runs() {
             repo: Some("repo".to_owned()),
             kind: "light".to_owned(),
             slot: Some(0),
+            remote: false,
+            host: None,
+            fallback: None,
             state: RunState::Ok,
             queued: Some("2026-10-03T05:04:39.1209178Z".to_owned()),
             started: Some("2026-10-03T05:04:39.1866333Z".to_owned()),
@@ -161,6 +282,9 @@ fn captured_journal_is_read_into_runs() {
             repo: Some("repo".to_owned()),
             kind: "light".to_owned(),
             slot: Some(0),
+            remote: false,
+            host: None,
+            fallback: None,
             state: RunState::Failed,
             queued: Some("2026-10-03T05:04:39.6873680Z".to_owned()),
             started: Some("2026-10-03T05:04:39.7589416Z".to_owned()),
@@ -180,6 +304,7 @@ fn captured_journal_is_read_into_runs() {
             CommandSummary {
                 command: "cmd /c exit 0".to_owned(),
                 repo: Some("repo".to_owned()),
+                remote: false,
                 count: 2,
                 p50_seconds: 0.105,
                 p90_seconds: 0.132,
@@ -188,6 +313,7 @@ fn captured_journal_is_read_into_runs() {
             CommandSummary {
                 command: "pwsh -NoProfile -Command Start-Sleep 10".to_owned(),
                 repo: Some("repo".to_owned()),
+                remote: false,
                 count: 1,
                 p50_seconds: 10.308,
                 p90_seconds: 10.308,
