@@ -5,6 +5,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Abandoned slot**: a slot whose mutex the kernel reports as abandoned because the gate holding it died; the next gate takes it as its own and journals the takeover.
 - **Backfill guest**: a waiting gate admitted, during a critical drain, onto a slot the critical gate lends, because its expected run ends before the drain's shadow end; one still running when the drain completes is killed and re-queued.
 - **Backstop**: the watchdog's last limit, five times the ceiling in wall time (less time paused behind a critical request), whatever the load.
+- **Black-box suite**: the Rust integration suite (`crates/gate/tests/suite/`) that drives the built `gate.exe` through its CLI and reads only its exit code, output, log, journal, claims and tickets; it needs the `test-seams` feature to run.
 - **Box**: a builder; the word the gate's prose and its hidden `gate box` subcommand use.
 - **Bridge**: the stand-in, until the remote port, by which `gate.exe` runs a routed run's remote part through the PowerShell remote client, `remote.ps1`.
 - **Build client**: a process in the command's job that drives a build (`MSBuild.exe`, or `dotnet` without `--no-build`); only while one runs does a build server's CPU count as the command's progress.
@@ -54,6 +55,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Take**: a gate acquiring its slot, journalled as `take`; **release** is letting it go, journalled as `release` before the slot is freed.
 - **Test seam**: a hidden `--test-*` flag, compiled only with the `test-seams` cargo feature, by which the suite sets a timing knob or forces a failure.
 - **Ticket**: the JSON file `waiting\<pid>-<start>.json` a gate writes when it queues for a slot, holding its kind and `arrived` time; waiters of one kind take slots in ticket order.
+- **Usage error**: a command line the gate refuses (a missing, unknown, repeated or invalid input): each problem on its own `gate: ` line, then the usage, exit 2, before any slot is queued.
 - **Verdict**: the outcome a `release` line records: `passed`, `failed`, `log-failure`, `stalled`, `timed-out`, `backstop` or `unknown`.
 - **Wake event**: the auto-reset named event each waiter sleeps on, which a gate signals when it releases a slot or deletes a ticket.
 - **Watchdog**: the part of a running gate that samples the command and kills its job on a stall, the ceiling or the backstop.

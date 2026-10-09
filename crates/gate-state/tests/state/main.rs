@@ -8,6 +8,7 @@ mod fixtures;
 mod journal;
 mod prefix;
 mod queue;
+mod root;
 mod shape;
 mod slots;
 mod support;

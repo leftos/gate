@@ -1,0 +1,94 @@
+//! The request the gate resolves, seen through `--test-print-request`: the absolute log, the defaults, and the state
+//! root chosen from `--state-dir`, then `GATE_STATE_DIR`.
+
+use serde_json::{Value, json};
+
+use crate::support::{Case, finish, print_run, shown};
+
+fn assert_root_hash(request: &Value) {
+    let hash = request["rootHash"].as_str().expect("a non-default root has a hash");
+    assert_eq!(hash.len(), 8, "{hash}");
+    assert!(
+        hash.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')),
+        "{hash} is lower-case hex"
+    );
+}
+
+#[test]
+fn print_request_shows_the_new_cli_request() {
+    let case = Case::new("print_request_shows_the_new_cli_request");
+    let outcome = case.run(&print_run(&["cmd", "/c", "echo hi"]));
+    let request = outcome.request();
+
+    assert_root_hash(&request);
+    let expected = json!({
+        "mode": "run",
+        "slot": "heavy",
+        "timeout": 5,
+        "log": shown(&case.root().join("out.log")),
+        "stall": 120,
+        "tail": 20,
+        "noMarkers": false,
+        "local": false,
+        "stateDir": shown(&case.root()),
+        "defaultRoot": false,
+        "rootHash": request["rootHash"],
+        "command": ["cmd", "/c", "echo hi"],
+        "testSeams": {"sampleMs": null, "heartbeatMs": null, "pollMs": null, "stallMs": null},
+    });
+    assert_eq!(outcome.stdout, format!("{expected}\n"), "the keys come in the published order");
+
+    let stop = case.run(&["stop-tree", "--test-print-request", "123"]).request();
+    assert_eq!(
+        stop,
+        json!({
+            "mode": "stop-tree",
+            "pid": 123,
+            "stateDir": shown(&case.root()),
+            "defaultRoot": false,
+            "rootHash": request["rootHash"],
+        })
+    );
+}
+
+#[test]
+fn default_root_is_recognised_through_dots_and_doubled_separators() {
+    let case = Case::new("default_root_through_dots");
+    let mut command = case.gate_without_state_dir(&["stop-tree", "--test-print-request", "1"]);
+    let local_app_data = format!(r"{}\appdata\..\appdata\\local", case.root().display());
+    command.env("LOCALAPPDATA", &local_app_data);
+
+    let request = finish(command).request();
+
+    assert_eq!(
+        request["stateDir"],
+        shown(&case.root().join("appdata").join("local").join("gate").join("v1"))
+    );
+    assert_eq!(request["defaultRoot"], true, "LOCALAPPDATA {local_app_data}");
+    assert_eq!(request["rootHash"], Value::Null);
+}
+
+#[test]
+fn state_dir_flag_beats_env() {
+    let case = Case::new("state_dir_flag_beats_env");
+    let other = Case::new("state_dir_flag_beats_env_other");
+    let mut command = case.gate(&print_run(&["cmd"]));
+    command.env("GATE_STATE_DIR", other.root());
+
+    let request = finish(command).request();
+
+    assert_eq!(request["stateDir"], shown(&case.root()));
+}
+
+#[test]
+fn state_dir_env_used_without_flag() {
+    let case = Case::new("state_dir_env_used_without_flag");
+    let mut command = case.gate_without_state_dir(&print_run(&["cmd"]));
+    command.env("GATE_STATE_DIR", case.root());
+
+    let request = finish(command).request();
+
+    assert_eq!(request["stateDir"], shown(&case.root()));
+    assert_eq!(request["defaultRoot"], false);
+    assert_root_hash(&request);
+}
