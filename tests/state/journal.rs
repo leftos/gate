@@ -202,6 +202,7 @@ fn runs_pair_queue_take_release_by_pid_and_process_start() {
                 remote: false,
                 host: None,
                 fallback: None,
+                parent_pid: None,
                 state: RunState::Failed,
                 queued: Some(ago(29)),
                 started: Some(ago(27)),
@@ -218,6 +219,7 @@ fn runs_pair_queue_take_release_by_pid_and_process_start() {
                 remote: false,
                 host: None,
                 fallback: None,
+                parent_pid: None,
                 state: RunState::Ok,
                 queued: Some(ago(30)),
                 started: Some(ago(28)),
@@ -742,8 +744,9 @@ fn unknown_fallback_reason_is_kept_and_a_missing_one_reads_unknown() {
     assert_eq!(reasons, [Some("unknown"), Some("solar flare")]);
 }
 
+/// The gate writes one queue line per run; a second one, should a journal hold it, is tolerated.
 #[test]
-fn second_queue_line_keeps_the_first_queued_time() {
+fn a_tolerated_second_queue_line_keeps_the_first_queued_time() {
     let gate = Gate::new(1, START, COMMAND);
     let lines = [
         gate.remote_queue(&ago(30)),
@@ -751,10 +754,101 @@ fn second_queue_line_keeps_the_first_queued_time() {
         gate.queue(&ago(29)),
         gate.take(&ago(28), 60.0),
     ];
-    let history = history_of("second_queue_line_keeps_the_first_queued_time", &lines);
+    let history = history_of("a_tolerated_second_queue_line_keeps_the_first_queued_time", &lines);
     let run = &history.runs[0];
     assert_eq!(run.queued.as_deref(), Some(ago(30).as_str()));
     assert!(!run.remote);
+}
+
+#[test]
+fn a_remote_take_ended_by_a_fallback_reads_as_the_local_run() {
+    let gate = Gate::new(1, START, COMMAND);
+    let lines = [
+        gate.remote_queue(&ago(30)),
+        gate.remote_take(&ago(29), 0),
+        gate.fallback(&ago(28), Some("unreachable")),
+        gate.take(&ago(27), 60.0),
+        gate.release(&ago(26), 45.0, json!(0)),
+    ];
+    let history = history_of("a_remote_take_ended_by_a_fallback_reads_as_the_local_run", &lines);
+    let run = &history.runs[0];
+    assert_eq!(
+        (run.state, run.slot, run.remote, run.host.as_deref(), run.fallback.as_deref()),
+        (RunState::Ok, Some(1), false, None, Some("unreachable")),
+        "no release for the remote slot: the fallback ended its take, and the local slot is the run's"
+    );
+    assert_eq!(run.started.as_deref(), Some(ago(27).as_str()));
+    assert_eq!(run.waited_seconds, Some(60.0), "the local take's wait, counted from the fallback");
+    assert_eq!(run.held_seconds, Some(45.0));
+}
+
+/// A gate that fell back onto its parent's slot: remote queue, remote take, fallback (`busy`), then `parent` naming pid 9.
+fn on_parent_lines(child: &Gate<'_>) -> Vec<String> {
+    vec![
+        child.remote_queue(&ago(30)),
+        child.remote_take(&ago(29), 0),
+        child.fallback(&ago(28), Some("busy")),
+        child.line("parent", &ago(27), json!({"parentPid": 9})),
+    ]
+}
+
+#[test]
+fn a_parent_line_after_a_fallback_reads_on_parent() {
+    let child = Gate::new(1, START, COMMAND);
+    let parent = Gate::new(9, START, COMMAND);
+    let reused = Gate::new(9, OTHER_START, COMMAND);
+    let mut ended = vec![parent.queue(&ago(40)), parent.take(&ago(39), 0.5)];
+    ended.extend(on_parent_lines(&child));
+    ended.push(parent.release(&ago(20), 1140.0, json!(0)));
+    ended.extend(reused.run(12, 30.0, json!(1)));
+    let history = history_of("a_parent_line_after_a_fallback_reads_on_parent", &ended);
+    let run = history.runs.iter().find(|run| run.parent_pid.is_some()).expect("the child is a run");
+    assert_eq!(
+        (run.state, run.parent_pid, run.slot, run.started.as_deref(), run.fallback.as_deref()),
+        (RunState::Parent, Some(9), None, None, Some("busy"))
+    );
+    assert_eq!(
+        (run.status, run.held_seconds),
+        (Some(0), Some(1140.0)),
+        "the end of the parent's run whose take came before the parent line, not of a later run of the reused pid"
+    );
+    let counted: Vec<(usize, f64)> = history.summary.iter().map(|row| (row.count, row.max_seconds)).collect();
+    assert_eq!(counted, [(1, 1140.0)], "only the parent's run counts its time");
+
+    let mut open = vec![parent.queue(&ago(40)), parent.take(&ago(39), 0.5)];
+    open.extend(on_parent_lines(&child));
+    let dir = journal_dir("a_parent_line_after_a_fallback_reads_on_parent_open");
+    fs::write(dir.join("events.jsonl"), text(&open)).expect("the journal can be written");
+    for live in [false, true] {
+        let history = JournalCache::default()
+            .read(&dir, "", ts(NOW), |_pid: u32, _start: &str| live, last_segment)
+            .expect("the journal can be read");
+        let run = history.runs.iter().find(|run| run.parent_pid.is_some()).expect("the child is a run");
+        assert_eq!(
+            (run.state, run.status, run.held_seconds),
+            (RunState::Parent, None, None),
+            "with the parent's run not ended, the run stays on parent whether its gate is live ({live}) or gone"
+        );
+        assert!(history.summary.is_empty(), "nothing has passed: {:?}", history.summary);
+    }
+}
+
+#[test]
+fn the_parent_is_the_latest_run_of_its_pid_to_take_a_slot_before_the_parent_line() {
+    let child = Gate::new(1, START, COMMAND);
+    let earlier = Gate::new(9, OTHER_START, COMMAND);
+    let parent = Gate::new(9, START, COMMAND);
+    let mut lines = earlier.run(60, 30.0, json!(1));
+    lines.extend([parent.queue(&ago(40)), parent.take(&ago(39), 0.5)]);
+    lines.extend(on_parent_lines(&child));
+    lines.push(parent.release(&ago(20), 1140.0, json!(0)));
+    let history = history_of("the_parent_is_the_latest_run_of_its_pid_to_take_a_slot_before_the_parent_line", &lines);
+    let run = history.runs.iter().find(|run| run.parent_pid.is_some()).expect("the child is a run");
+    assert_eq!(
+        (run.state, run.status, run.held_seconds),
+        (RunState::Parent, Some(0), Some(1140.0)),
+        "the run of pid 9 that took its slot last before the parent line, not the earlier one released before it"
+    );
 }
 
 #[test]

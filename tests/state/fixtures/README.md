@@ -1,6 +1,6 @@
 # gate.ps1 fixtures
 
-Files captured from a real run of `~/.claude/tools/gate/gate.ps1`, not written by hand (except the four `remote*` files, below), so `fixtures.rs` proves `gate-state` reads what the gate writes. Each is kept as captured (UTF-8 without a byte order mark, one line), except that the worktree path the capture ran in is replaced by `C:\work\repo` in `cwd` and `log`, and the repo's `end-of-file-fixer` hook adds the trailing newline the gate does not write (the tests parse the JSON, so it does not matter).
+Files captured from a real run of `~/.claude/tools/gate/gate.ps1`, not written by hand (except three of the `remote*` files, below), so `fixtures.rs` proves `gate-state` reads what the gate writes. Each is kept as captured (UTF-8 without a byte order mark, one line), except that the worktree path the capture ran in is replaced by `C:\work\repo` in `cwd` and `log`, and the repo's `end-of-file-fixer` hook adds the trailing newline the gate does not write (the tests parse the JSON, so it does not matter).
 
 | File | What it is | Where the gate writes it |
 |---|---|---|
@@ -11,9 +11,9 @@ Files captured from a real run of `~/.claude/tools/gate/gate.ps1`, not written b
 | `remote-claim.json` | **Hand-written**: the claim file of a heavy gate holding remote slot 1, a heavy claim's keys plus `remote: true`, `host` (the ssh destination) and `key` (the remote work folder's key). | `%LOCALAPPDATA%\gate\slots\gate-remote-slot-<n>.json`, here `ops225-gate-remote-slot-1.json` |
 | `remote-ticket.json` | **Hand-written**: the arrival ticket of a heavy gate routed to the remote pool and waiting for a remote slot, a heavy ticket plus `remote: true`. | `%LOCALAPPDATA%\gate\<prefix>waiting\<pid>-<start ticks>.json`, here `ops225-waiting\60090-639265725620427420.json` |
 | `remote.json` | **Hand-written**: the gate's remote settings, two remote slots plus routing keys that `gate-state` ignores. | `%LOCALAPPDATA%\gate\remote.json` |
-| `remote-journal.jsonl` | **Hand-written**: the journal of six heavy gates running one command: a remote run (ok), four runs that fell back to the local queue, one for each of four `fallback` reasons (`unreachable`, `full` with a second local `queue` line, `rebooted` after a remote take, and `parity`, which then failed), and a local control run (ok). | `%LOCALAPPDATA%\gate\<prefix>events.jsonl`, here `ops225-events.jsonl` |
+| `remote-journal.jsonl` | The journal of the real gate's remote route, captured sandboxed by `capture-remote-journal.ps1`: a remote run that passed, runs that fell back to the local queue (`full`, then one for each reason `unreachable`, `busy`, `parity` with a failing command, `rebooted`, `tools`), a run that fell back onto its parent gate's slot (a `parent` line follows its `fallback`), and a local control run. | `%LOCALAPPDATA%\gate\<prefix>events.jsonl`, here `ops225-events.jsonl` |
 
-The four `remote*` files are written by hand from the gate's remote-slot design (`~/.claude/docs/plans/gate-remote-slot.md`, "Decisions"), since the gate does not write a remote claim, ticket or journal line yet; they are re-captured from a real gate once it does. The line sequence of a fallen-back run is assumed: the run keeps its `pid` and `processStart`, its `fallback` line follows its remote `queue` (or its remote `take`), and a local `take` without `remote` follows.
+The three other `remote*` files are written by hand from the gate's remote-slot design (`~/.claude/docs/plans/gate-remote-slot.md`, "Decisions"), since the gate does not write a remote claim or ticket a test can capture; they are re-captured from a real gate once it does. claude-config keeps a copy of `remote-journal.jsonl` (`tools/gate/fixtures/remote-journal.jsonl`).
 
 ## Re-capturing them
 
@@ -25,6 +25,10 @@ From the worktree root, in pwsh, with `LOCALAPPDATA` pointed at a scratch folder
 4. Start the second gate the same way with `-Log .tmp/o28-capture/second.log` and `Start-Sleep 1`; it queues, and once `$lad\gate\ops28-waiting\<its pid>-<ticks>.json` exists copy it as `ticket.json`.
 5. Copy `$lad\gate\slot-counts.json` as `slot-counts.json`.
 6. Replace the worktree path in `claim.json` (JSON-escaped, `X:\\...`) with `C:\\work\\repo`, and update the pid, times and ticket name `fixtures.rs` expects to the new capture's.
+
+## Re-capturing the remote journal
+
+From the repo root, in pwsh: `pwsh -NoProfile -File tools/gate.ps1 -Log .tmp/cap.log -TimeoutSeconds 600 -Slot light -- pwsh -NoProfile -File crates/gate-state/tests/state/fixtures/capture-remote-journal.ps1`, with an optional `-Scratch <folder>` (default `.tmp\cap-remote-journal\run-<stamp>`, left for you to delete). The script runs the real gate under a scratch `LOCALAPPDATA`, a self-test slot prefix and a stub remote, so no live journal, mutex or build box is touched, and writes `remote-journal.jsonl` with LF line ends, the scratch repo's path as `C:\work\repo`, renumbered pids and shifted times. Update the figures `fixtures.rs` expects if the sequence changes.
 
 ## Re-capturing the journal
 

@@ -4,10 +4,11 @@
 //! A run is keyed by the gate's `pid` and `processStart`, since the journal carries no run id: its `queue` line, its
 //! `take` once it holds a slot, then `release` as it lets the slot go or `abandon` when it ended still waiting. A run
 //! routed to the remote pool carries `remote` and `host` on those lines, and a `fallback` line when it was sent back to
-//! the local queue, whose local `take` follows. `covered`
-//! and `parent` lines (a gate running on its parent's slot) and every line of the gate's own self-test (a `cwd` holding
-//! `gate-selftest`) are ignored, and a line that does not parse is skipped. The folder, the prefix, the clock and the
-//! process liveness check all come from the caller.
+//! the local queue, which ends its remote take (no `release` follows for the remote slot): its local `take` follows, or
+//! a `parent` line when it ran on its parent gate's slot instead. `covered` lines and every other `parent` line (a gate
+//! running on its parent's slot) and every line of the gate's own self-test (a `cwd` holding `gate-selftest`) are ignored,
+//! and a line that does not parse is skipped. The folder, the prefix, the clock and the process liveness check all come
+//! from the caller.
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -45,6 +46,8 @@ pub enum RunState {
     Running,
     /// Not ended, and its gate is gone: it was killed, or its end was never written.
     Unrecorded,
+    /// Fell back onto its parent gate's slot: its command ran under the parent's run, which owns its time.
+    Parent,
 }
 
 /// One run of a gate, in the JSON shape `GET /api/gate/history` serves.
@@ -69,9 +72,14 @@ pub struct HistoryRun {
     /// The build box a remote run waits for or runs on, its ssh destination; `None` for a local run.
     pub host: Option<String>,
     /// Why the run, routed to the remote pool, was sent back to the local queue: `full` (the pool stayed full for
-    /// 60 s), `busy` (the box's work folder is locked by a leftover run), `unreachable`, `rebooted`, `parity`, or
-    /// `unknown` when the line names none; `None` when it was not.
+    /// 60 s), `busy` (the box's work folder is locked by another run), `unreachable`, `rebooted`, `parity`, `tools`
+    /// (the box could not restore the repo's dotnet local tools), or `unknown` when the line names none; `None` when it
+    /// was not.
     pub fallback: Option<String>,
+    /// The pid of the gate whose slot a [`RunState::Parent`] run ran on, from its `parent` line; `None` for any other
+    /// run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_pid: Option<u32>,
     /// How the run stands.
     pub state: RunState,
     /// When the gate queued, as the journal wrote it (ISO 8601 UTC, seven fractional digits); `None` when its queue
@@ -81,10 +89,13 @@ pub struct HistoryRun {
     pub started: Option<String>,
     /// How long the gate waited for its slot, from its take or its abandon.
     pub waited_seconds: Option<f64>,
-    /// How long the gate held its slot, from its release.
+    /// How long the gate held its slot, from its release; for a [`RunState::Parent`] run, how long its parent's run held
+    /// its slot, `None` until the journal holds that run's release, and only while the journal read still holds the
+    /// parent's run (the 50-run, 7-day prune can drop it).
     pub held_seconds: Option<f64>,
     /// The gate's exit status, from its release; `None` without a release or when the gate failed before its command
-    /// ran.
+    /// ran. For a [`RunState::Parent`] run, its parent's run's status, `None` until the journal holds that run's release,
+    /// and only while the journal read still holds the parent's run.
     pub status: Option<i64>,
 }
 
@@ -182,6 +193,8 @@ struct Run {
     held_seconds: Option<f64>,
     status: Option<i64>,
     end: Option<End>,
+    /// The parent gate's pid and the time of the run's `parent` line, once one followed its `fallback`.
+    parent: Option<(u32, Timestamp)>,
 }
 
 /// The fields of a journal line the history reads.
@@ -209,6 +222,8 @@ struct Line {
     host: Option<String>,
     #[serde(default)]
     reason: Option<String>,
+    #[serde(default)]
+    parent_pid: Option<u32>,
 }
 
 impl JournalCache {
@@ -298,9 +313,8 @@ impl JournalCache {
     }
 
     /// Adds one journal line to its run; a line that does not parse, the self-test's, and every event but the five a
-    /// run is made of are skipped. A run's first `queue` line sets its queued time; a later one (after a `fallback`)
-    /// does not. A `fallback` line sends a remote run back to the local queue: the run is no longer remote, and keeps the
-    /// reason.
+    /// run is made of and `parent` are skipped. A run's first `queue` line sets its queued time; a later one does not. A
+    /// `fallback` line sends a remote run back to the local queue: the run is no longer remote, and keeps the reason.
     fn apply(&mut self, bytes: &[u8]) {
         let Ok(line) = serde_json::from_slice::<Line>(bytes.trim_ascii()) else {
             return;
@@ -308,7 +322,14 @@ impl JournalCache {
         let Ok(at) = line.time.parse::<Timestamp>() else {
             return;
         };
-        if line.cwd.contains(SELFTEST_MARKER) || !matches!(line.event.as_str(), "queue" | "take" | "release" | "abandon" | "fallback") {
+        if line.cwd.contains(SELFTEST_MARKER) {
+            return;
+        }
+        if line.event == "parent" {
+            self.apply_parent(line, at);
+            return;
+        }
+        if !matches!(line.event.as_str(), "queue" | "take" | "release" | "abandon" | "fallback") {
             return;
         }
         let stamp = Stamp { at, text: line.time };
@@ -327,6 +348,7 @@ impl JournalCache {
             held_seconds: None,
             status: None,
             end: None,
+            parent: None,
         });
         match line.event.as_str() {
             "queue" => {
@@ -364,6 +386,30 @@ impl JournalCache {
         }
     }
 
+    /// Marks a run whose last route was a `fallback` as run on the slot of the parent gate its `parent` line names; a
+    /// `parent` line of any other run, or one naming no parent, is skipped.
+    fn apply_parent(&mut self, line: Line, at: Timestamp) {
+        let Some(parent_pid) = line.parent_pid else {
+            return;
+        };
+        if let Some(run) = self.runs.get_mut(&(line.pid, line.process_start))
+            && run.fallback.is_some()
+        {
+            run.parent = Some((parent_pid, at));
+        }
+    }
+
+    /// The run a gate that said `parent` at `at` ran under, once that run has released its slot: of the runs of gate
+    /// `pid` that took their slot at or before `at`, the latest.
+    fn released_parent(&self, (pid, at): (u32, Timestamp)) -> Option<&Run> {
+        self.runs
+            .iter()
+            .filter(|((run_pid, _), run)| *run_pid == pid && run.started.as_ref().is_some_and(|started| started.at <= at))
+            .max_by_key(|(_, run)| run.started.as_ref().map(|started| started.at))
+            .map(|(_, run)| run)
+            .filter(|run| run.end == Some(End::Released))
+    }
+
     /// Drops the runs that started more than 7 days before `now`, unless they are among the 50 newest.
     fn prune(&mut self, now: Timestamp) {
         let cutoff = now - SUMMARY_WINDOW;
@@ -380,7 +426,10 @@ impl JournalCache {
         let runs = newest_first(&self.runs)
             .into_iter()
             .take(RECENT_RUNS)
-            .map(|(key, run)| run.row(run.state(key, is_live), run.repo(repo_of)))
+            .map(|(key, run)| {
+                let parent = run.parent.and_then(|parent| self.released_parent(parent));
+                run.row(run.state(key, is_live), run.repo(repo_of), parent)
+            })
             .collect();
         History {
             runs,
@@ -400,6 +449,9 @@ impl Run {
     }
 
     fn state(&self, (pid, process_start): &RunKey, is_live: &impl Fn(u32, &str) -> bool) -> RunState {
+        if self.parent.is_some() {
+            return RunState::Parent;
+        }
         match self.end {
             Some(End::Released) if self.status == Some(0) => RunState::Ok,
             Some(End::Released) => RunState::Failed,
@@ -414,7 +466,9 @@ impl Run {
         self.cwd.as_deref().and_then(repo_of)
     }
 
-    fn row(&self, state: RunState, repo: Option<String>) -> HistoryRun {
+    /// The run's row; a run on its parent's slot takes its status and held time from `parent`, its parent's ended run.
+    fn row(&self, state: RunState, repo: Option<String>, parent: Option<&Self>) -> HistoryRun {
+        let end = if self.parent.is_some() { parent } else { Some(self) };
         HistoryRun {
             command: self.command.clone(),
             cwd: self.cwd.clone(),
@@ -424,18 +478,20 @@ impl Run {
             remote: self.remote,
             host: self.host.clone(),
             fallback: self.fallback.clone(),
+            parent_pid: self.parent.map(|(pid, _)| pid),
             state,
             queued: self.queued.as_ref().map(|stamp| stamp.text.clone()),
             started: self.started.as_ref().map(|stamp| stamp.text.clone()),
             waited_seconds: self.waited_seconds,
-            held_seconds: self.held_seconds,
-            status: self.status,
+            held_seconds: end.and_then(|end| end.held_seconds),
+            status: end.and_then(|end| end.status),
         }
     }
 
-    /// The held time of a run that passed and took its slot at or after `cutoff`.
+    /// The held time of a run that passed and took its slot at or after `cutoff`; never a run on its parent's slot,
+    /// whose parent's run counts the time.
     fn counted_held_seconds(&self, cutoff: Timestamp) -> Option<f64> {
-        let passed = self.end == Some(End::Released) && self.status == Some(0);
+        let passed = self.end == Some(End::Released) && self.status == Some(0) && self.parent.is_none();
         let recent = self.started.as_ref().is_some_and(|started| started.at >= cutoff);
         if passed && recent { self.held_seconds } else { None }
     }

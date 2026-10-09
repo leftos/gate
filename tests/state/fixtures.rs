@@ -22,7 +22,8 @@ const REMOTE_CLAIM: &str = include_str!("fixtures/remote-claim.json");
 const REMOTE_TICKET: &str = include_str!("fixtures/remote-ticket.json");
 /// The gate's remote settings: two slots, plus routing keys the state ignores.
 const REMOTE_SETTINGS: &str = include_str!("fixtures/remote.json");
-/// The journal of a remote run, four runs that fell back, and a local one, written by hand from the design.
+/// The journal of nine routed and local gates captured under a stub remote: a remote run, a run the full pool sent back,
+/// five runs refused after their remote take, one that fell back onto its parent's slot, and a local one.
 const REMOTE_JOURNAL: &str = include_str!("fixtures/remote-journal.jsonl");
 /// The self-test prefix the capture ran under, in front of the claim's name and the waiting folder's.
 const PREFIX: &str = "ops28-";
@@ -177,26 +178,43 @@ fn remote_journal_is_read_into_runs_and_a_split_summary() {
         rows,
         [
             (Some(0), false, None, None, RunState::Ok),
-            (Some(1), false, None, Some("parity"), RunState::Failed),
-            (Some(2), false, None, Some("rebooted"), RunState::Ok),
+            (None, false, None, Some("busy"), RunState::Parent),
+            (Some(0), false, None, Some("tools"), RunState::Ok),
+            (Some(0), false, None, Some("rebooted"), RunState::Ok),
+            (Some(0), false, None, Some("parity"), RunState::Failed),
+            (Some(0), false, None, Some("busy"), RunState::Ok),
+            (Some(0), false, None, Some("unreachable"), RunState::Ok),
             (Some(0), false, None, Some("full"), RunState::Ok),
-            (Some(1), false, None, Some("unreachable"), RunState::Ok),
             (Some(0), true, Some("builder@build-box"), None, RunState::Ok),
         ],
-        "newest first: the local run, then the runs that fell back, each on its final local slot, then the remote run"
+        "newest first: the local run, the run on its parent's slot, the runs that fell back on their local slot, the remote run"
     );
-    let full = &history.runs[3];
+    let parent = &history.runs[1];
+    assert_eq!(parent.parent_pid, Some(70000), "the run names the gate whose slot it ran on");
+    assert_eq!(
+        (parent.started.as_deref(), parent.status, parent.held_seconds),
+        (None, None, None),
+        "the parent's run is not in the journal, so there is no end to copy"
+    );
+    let full = &history.runs[7];
     assert_eq!(
         full.queued.as_deref(),
-        Some("2026-10-03T06:20:00.4000000Z"),
-        "a second queue line keeps the first queued time"
+        Some("2026-10-03T06:00:06.5919052Z"),
+        "a run the full pool sent back queues once"
     );
-    assert_eq!(full.started.as_deref(), Some("2026-10-03T06:21:00.6000000Z"));
     assert_eq!(
-        history.runs[2].started.as_deref(),
-        Some("2026-10-03T06:31:10.2000000Z"),
+        full.started.as_deref(),
+        Some("2026-10-03T06:00:10.4672274Z"),
+        "its local take is its start"
+    );
+    assert_eq!(full.waited_seconds, Some(3.875), "its wait counts from its queue");
+    let unreachable = &history.runs[6];
+    assert_eq!(
+        unreachable.started.as_deref(),
+        Some("2026-10-03T06:00:16.8420567Z"),
         "the local take after a remote one"
     );
+    assert_eq!(unreachable.waited_seconds, Some(0.065), "the local take's wait, as the gate wrote it");
     let summary: Vec<(bool, usize, f64, f64, f64)> = history
         .summary
         .iter()
@@ -204,8 +222,12 @@ fn remote_journal_is_read_into_runs_and_a_split_summary() {
         .collect();
     assert_eq!(
         summary,
-        [(false, 4, 27.0, 28.0, 28.0), (true, 1, 64.2, 64.2, 64.2)],
-        "the remote runs of a command are a row of their own; the failed run is not counted"
+        [
+            (false, 5, 1.622, 3.263, 3.263),
+            (false, 1, 2.299, 2.299, 2.299),
+            (true, 1, 12.558, 12.558, 12.558)
+        ],
+        "the remote runs of a command are a row of their own; the failed run and the run on its parent's slot are not counted"
     );
 }
 
@@ -266,6 +288,7 @@ fn captured_journal_is_read_into_runs() {
             remote: false,
             host: None,
             fallback: None,
+            parent_pid: None,
             state: RunState::Ok,
             queued: Some("2026-10-03T05:04:39.1209178Z".to_owned()),
             started: Some("2026-10-03T05:04:39.1866333Z".to_owned()),
@@ -285,6 +308,7 @@ fn captured_journal_is_read_into_runs() {
             remote: false,
             host: None,
             fallback: None,
+            parent_pid: None,
             state: RunState::Failed,
             queued: Some("2026-10-03T05:04:39.6873680Z".to_owned()),
             started: Some("2026-10-03T05:04:39.7589416Z".to_owned()),
