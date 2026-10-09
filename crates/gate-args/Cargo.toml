@@ -1,0 +1,15 @@
+[package]
+name = "gate-args"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+doctest = false
+
+[lints]
+workspace = true
+
+[features]
+# The hidden `--test-*` flags of the black-box suite; an installed gate is built without them.
+test-seams = []

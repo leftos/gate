@@ -25,7 +25,7 @@ Non-goals:
 
 ## CLI
 
-The CLI is subcommands with GNU-style flags: `--name value` or `--name=value`, and `--` ends the gate's options. The first word picks the parser: a subcommand name selects the CLI below, and a first word starting with `-` selects the [compatibility layer](#compatibility-layer).
+The CLI is subcommands with GNU-style flags: `--name value` or `--name=value`, and `--` ends the gate's options. The first word picks the parser. `--version`, `--help` and `help` are matched first; then a subcommand name selects the CLI below, and any other first word starting with `-` selects the [compatibility layer](#compatibility-layer). No arguments at all print the usage on stderr and exit 2.
 
 | Subcommand | Purpose |
 |---|---|
@@ -36,7 +36,19 @@ The CLI is subcommands with GNU-style flags: `--name value` or `--name=value`, a
 | `gate --version` | Print the version and exit 0. |
 | `gate --help`, `gate help` | Print the usage on stdout and exit 0. |
 
-An unknown subcommand, an unknown flag or a missing value prints what is wrong on its own `gate: ` line, then the usage, and exits 2 before any slot is queued (kept, C1).
+An unknown subcommand, an unknown flag or a missing value prints what is wrong on its own `gate: ` line, then the usage, and exits 2 before any slot is queued (kept, C1). Every problem found is printed, one per line: invalid values in the order the words came, then the missing inputs in the order slot, timeout, log, command. A state-root failure ([State root](#state-root)) exits 2 with its one line and no usage.
+
+Rules both parsers share:
+
+- An option given twice is a usage error.
+- A value option takes the next word unless that word is `--`; an empty value counts as missing.
+- A whole number is ASCII digits only: no sign, space or fraction. Timeout, stall, tail and the `--test-*-ms` values are at most 2147483647.
+- `--slot` values compare case-insensitively.
+- `--slot auto` and `--timeout auto` are refused as invalid values until GATE-8 and GATE-16 build them.
+- A gate option that is not valid Unicode is a usage error; the words after `--` are passed through as the caller gave them.
+- A word before `--` that is not an option is a usage error (`gate: unexpected argument <word>`).
+
+Until the launch slice (GATE-35), a valid `gate run` prints `gate: run is not built yet` and a valid `gate stop-tree` prints `gate: stop-tree is not built yet`, both on stderr with exit 70.
 
 ### `gate run`
 
@@ -81,8 +93,11 @@ Further modes arrive as subcommands of the same binary, each designed with its i
 
 `gate -Log <path> -TimeoutSeconds <n> -Slot heavy|light|critical [-StallSeconds <n>] [-Tail <n>] [-NoMarkers] [-Local] -- <command>` and `gate -StopTree <pid>`.
 
-- It accepts exactly the options `-Log`, `-TimeoutSeconds`, `-Slot`, `-StallSeconds`, `-Tail`, `-NoMarkers`, `-Local` and `-StopTree`, compared case-insensitively, and maps each to the flag in the table above (`-StopTree <pid>` to `gate stop-tree <pid>`). Any other option, or a new-CLI flag in the old form, is a usage error (exit 2).
-- The colon form `-Name:value` in one word is read as that option with that value (C2). A switch's colon form is read by its value: `-NoMarkers:true`, `-Local:$true` set it, `-Local:false`, `-Local:$false` clear it, and any other value is a usage error. This fixes the PowerShell gate's reading of every `-Switch:<value>` as true (C2, CC-194).
+- It accepts exactly the options `-Log`, `-TimeoutSeconds`, `-Slot`, `-StallSeconds`, `-Tail`, `-NoMarkers`, `-Local` and `-StopTree`, compared case-insensitively, and maps each to the flag in the table above (`-StopTree <pid>` to `gate stop-tree <pid>`). Any other option, or a new-CLI flag in the old form (`-StateDir`, `--state-dir`, `--slot`), is a usage error (exit 2). The one exception is the hidden `--test-print-request` of a `test-seams` build ([Black-box suite harness](#black-box-suite-harness)).
+- `--` is required before the command; the command never starts at the first word that is not an option.
+- `-StopTree <pid>` (or `-StopTree:<pid>`) must be the only option.
+- A value option never takes one of the eight option names as its value: `-Log -NoMarkers` is `-Log` with no value, then `-NoMarkers`.
+- The colon form `-Name:value` in one word is read as that option with that value (C2). A switch's colon form is read by its value, compared case-insensitively: `-NoMarkers:true`, `-Local:$true` set it, `-Local:false`, `-Local:$false` clear it, and any other value is a usage error. This fixes the PowerShell gate's reading of every `-Switch:<value>` as true (C2, CC-194).
 - Values are validated as in the new CLI; the messages may name either spelling.
 - The layer is removed once no caller uses it. Until then, every reader of command-line text (ops-tower's activity join, the hooks that inspect a gated command) matches both spellings.
 
@@ -96,6 +111,7 @@ Further modes arrive as subcommands of the same binary, each designed with its i
 | 2 | Usage: a missing, unknown or invalid input; a `.cmd` or `.bat` word the gate refuses (C5); a critical gate under a heavy or light slot marker (K7). Nothing is queued. |
 | 124 | The watchdog killed the command: STALLED, TIMED OUT or BACKSTOP (X2). |
 | 127 | The command could not be started (C7); the slot is released at once. |
+| 70 | Temporary: a valid `gate run` or `gate stop-tree`, which are not built yet. The launch slice (GATE-35) removes this code. |
 | 75 | A builder refused a routed run (`gate box`, or the bridged remote client): busy, unreachable, parity, rebooted, tools, version. The PC side reads the refusal and falls back to a local run, so a caller sees 75 only as a command's own status, or as a refusal that carried no reason (T5). |
 
 The codes are kept (V4), with 75 added for refusals. 124 is the status coreutils `timeout` uses, so no caller mistakes a kill for the command's own status; a command that itself exits 124 is told apart in the journal's `verdict`.
@@ -153,11 +169,13 @@ A slot is held while any handle to its name exists: a reader opens the name with
 
 ## State root
 
-One folder holds every file the gate writes: `%LOCALAPPDATA%\gate\v1\` by default, beside the install folder `%LOCALAPPDATA%\gate\bin\` and the PowerShell gate's own files in `%LOCALAPPDATA%\gate\`, so the two generations' files never mix. `--state-dir <path>` overrides it, else the `GATE_STATE_DIR` environment variable; the flag wins over the variable.
+One folder holds every file the gate writes: `%LOCALAPPDATA%\gate\v1\` by default, beside the install folder `%LOCALAPPDATA%\gate\bin\` and the PowerShell gate's own files in `%LOCALAPPDATA%\gate\`, so the two generations' files never mix. `--state-dir <path>` overrides it, else the `GATE_STATE_DIR` environment variable; the flag wins over the variable. An empty `GATE_STATE_DIR` or `LOCALAPPDATA` counts as unset. A relative root is made absolute against the working directory, and the root need not exist: nothing is created under it by the CLI alone.
+
+A root that cannot be resolved exits 2 with one line and no usage: `gate: LOCALAPPDATA is not set; give the state root with --state-dir or GATE_STATE_DIR`, `gate: cannot read the LOCALAPPDATA variable` (both only when neither the flag nor the variable gave a root), `gate: cannot read the state root <path>`, `gate: cannot make the state root <path> absolute: <error>`, or `gate: cannot make the default state root <path> absolute: <error>`. A `--log` that cannot be made absolute is `gate: cannot make the log path <path> absolute: <error>`.
 
 The root replaces the PowerShell gate's test variables `GATE_TEST_SLOT_PREFIX`, `GATE_TEST_SLOT_COUNTS`, `GATE_TEST_REMOTE_CONFIG` and `GATE_TEST_JOURNAL_BYTES`: a test gets its own counts file, routing file and journal by giving its gate its own root, and tests rollover by writing a journal near the rollover size into that root.
 
-A root is the default when its full path, lower-cased with `\` separators and no trailing separator, equals that of `%LOCALAPPDATA%\gate\v1`. The default root's kernel object names are the PowerShell gate's, so during the cutover drain both generations take turns on one set of slots ([Cutover](#cutover)). For any other root, every kernel object name carries `<h>`, the first 8 hex digits of the SHA-256 of that normalised path, so a test root never touches the machine's real slots. A gate running under a non-default root passes the root on to its command as `GATE_STATE_DIR`, so a gate nested in that command uses the same root.
+A root is the default when its full path, normalised (made absolute, a leading `\\?\UNC\` turned into `\\` and a leading `\\?\` removed, `/` turned into `\`, lower-cased, trailing `\` removed), equals that of `%LOCALAPPDATA%\gate\v1` normalised the same way. The default root's kernel object names are the PowerShell gate's, so during the cutover drain both generations take turns on one set of slots ([Cutover](#cutover)). For any other root, every kernel object name carries `<h>`, the first 8 lower-case hex digits of the SHA-256 of the UTF-8 bytes of that normalised path, so a test root never touches the machine's real slots. A gate running under a non-default root passes the root on to its command as `GATE_STATE_DIR`, so a gate nested in that command uses the same root.
 
 ### Files
 
@@ -390,12 +408,12 @@ Rules:
 A Rust integration suite drives the built `gate.exe` through its CLI and reads only what it writes: exit codes, stdout, stderr, the log, the journal, claims and tickets.
 
 - **Own state root per case.** Every case creates a fresh root under the target directory's temporary folder and passes it with `--state-dir`, so cases never touch the machine's real slots, journal or counts, or each other's. Cases run side by side.
-- **Test seams.** Hidden `--test-*` flags, compiled only with the `test-seams` cargo feature, set the timing knobs: `--test-sample-ms` (sample period), `--test-heartbeat-ms` (wait heartbeat), `--test-poll-ms` (fallback poll) and `--test-stall-ms` (stall window below a second). The same feature carries the failure seams `--test-sampler-fail` (W5) and `--test-diagnostics-fail` (X3), and `--test-remote-client <path>` (a stub in place of the remote client). An installed gate has none of them.
+- **Test seams.** Hidden `--test-*` flags, compiled only with the `test-seams` cargo feature, set the timing knobs: `--test-sample-ms` (sample period), `--test-heartbeat-ms` (wait heartbeat), `--test-poll-ms` (fallback poll) and `--test-stall-ms` (stall window below a second). Each takes whole milliseconds above 0 on `gate run`, and is parsed only until the wait loop and the watchdog exist. `--test-print-request`, on `run`, `stop-tree` and the compatibility form, prints the parsed request as one JSON line on stdout and exits 0, so the suite sees what a command line asked for; it is the one hidden switch the compatibility layer accepts. The same feature will carry the failure seams `--test-sampler-fail` (W5) and `--test-diagnostics-fail` (X3), and `--test-remote-client <path>` (a stub in place of the remote client), with their slices. An installed gate has none of them, and without the feature each is an unknown option.
 - **Ordering, never elapsed time.** A case asserts the order of events in the journal and the log (a waiter's `take` after the holder's `release`, a heartbeat line before the inner gate's take, a kill line before the exit), never a wall-clock bound a busy machine could cross. A case's own deadline only guards against a hang and is generous.
 - **Injected clock.** The watchdog arithmetic is unit-tested in `gate-watchdog` with an injected clock and scripted samples, not through the binary.
-- **Fake process trees.** A small helper executable built by the suite, copied under the names the gate classifies (`VBCSCompiler.exe`, `dotnet.exe`, `MSBuild.exe`), spawns children, burns CPU, prints its argv, writes output or sleeps on command, so build-server, orphan and kill-tree cases need no real toolchain.
+- **Fake process trees.** A small helper executable, `fake-tool` (built only with the `test-seams` feature; it runs its steps in order: `argv`, `out <text>`, `err <text>`, `sleep <ms>`, `exit <n>`), copied under the names the gate classifies (`VBCSCompiler.exe`, `dotnet.exe`, `MSBuild.exe`), spawns children, burns CPU, prints its argv, writes output or sleeps on command, so build-server, orphan and kill-tree cases need no real toolchain.
 - **No fixture from the checkout path.** No routing pattern, expected path or assertion is derived from where the repo is checked out; a case builds its own repository and routing file in its root.
-- **Running it.** The suite is a test target with `required-features = ["test-seams"]`, run through the gate with `cargo test --workspace --profile test-release --all-features`.
+- **Running it.** The suite is a test target with `required-features = ["test-seams"]`, run through the gate with `cargo test --workspace --profile test-release --all-features`. Without the feature (no `--all-features`) cargo skips the suite silently.
 
 ## Cores hint
 

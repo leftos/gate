@@ -4,7 +4,7 @@ gate is a Cargo workspace whose `gate` binary (`gate.exe`) queues heavy commands
 
 The rule that shapes it: every file and kernel object another process sees is defined once, in `gate-state`, and the pure crates hold no Windows types, so they build and test on Linux. The design is [design.md](design.md); terms used in a project sense are in the [glossary](GLOSSARY.md).
 
-Every crate below is planned: `gate-state` and `proc-table` move in from ops-tower with their history (GATE-4), the rest are written by the local port (GATE-5).
+`gate-state` and `proc-table` exist (moved in from ops-tower with their history, GATE-4), and so do `gate-args` and the `gate` binary's skeleton (GATE-32). `gate-win32`, `gate-watchdog` and `gate-router` are planned, written by the local port (GATE-5).
 
 ## Task Index
 
@@ -17,24 +17,26 @@ Every crate below is planned: `gate-state` and `proc-table` move in from ops-tow
 | Change how the journal is read | `crates/gate-state/src/journal.rs` → `crates/gate-state/tests/state/journal.rs` | [design.md, Journal](design.md#journal) |
 | Re-capture the gate's fixtures | `crates/gate-state/tests/state/fixtures/README.md` → `crates/gate-state/tests/state/fixtures/capture-remote-journal.ps1` | `fixtures/README.md` |
 | Move or change the process table | `crates/proc-table/src/lib.rs` → `crates/proc-table/src/win32.rs` → `crates/gate-state/src/state.rs` (its user here) | none |
-| Change the CLI (a subcommand, a flag, a usage message) | [design.md, CLI](design.md#cli) → `crates/gate-args/` (the parser and the compatibility layer) → `crates/gate/src/` (the subcommand) → the readers of command-line text in [the inventory, section 3](research/2026-10-09-powershell-gate-inventory.md#3-files-and-names-other-processes-see) | [design.md](design.md#cli) |
+| Change the CLI or the compatibility layer (a subcommand, a flag, a usage message, an exit code) | [design.md, CLI](design.md#cli), [Compatibility layer](design.md#compatibility-layer) and [Exit codes](design.md#exit-codes) → `crates/gate-args/src/` (`cli.rs`, `compat.rs`, `run.rs`, `usage.rs`) → `crates/gate/src/main.rs` and `report.rs` (the subcommand) → `crates/gate/tests/suite/` → the readers of command-line text in [the inventory, section 3](research/2026-10-09-powershell-gate-inventory.md#3-files-and-names-other-processes-see) | [design.md](design.md#cli) |
 | Change an output line callers parse | [design.md, Output lines](design.md#output-lines) → `crates/gate/src/` → the parsers in [the inventory, section 3](research/2026-10-09-powershell-gate-inventory.md#3-files-and-names-other-processes-see) ("Output lines and exit codes other tools parse") | [design.md](design.md#output-lines) |
 | Change how a command is quoted, resolved or refused | `crates/gate-args/` → [design.md, Command launching](design.md#command-launching) → `crates/gate/src/` and `gate box` (they share the rules) | [design.md](design.md#command-launching) |
 | Change stall, ceiling, backstop or cores-hint arithmetic | `crates/gate-watchdog/` → `crates/gate-win32/` (the samples) → [design.md, Watchdog](design.md#watchdog) | [design.md](design.md#watchdog) |
 | Change what routes to a builder | `crates/gate-router/` → `crates/gate/src/` (the bridge) → [design.md, Routing](design.md#routing-and-the-remoteps1-bridge) | [design/gate-remote-slot.md](design/gate-remote-slot.md) |
-| Add a test seam | [design.md, Black-box suite harness](design.md#black-box-suite-harness) → `crates/gate/Cargo.toml` (the `test-seams` feature) → `crates/gate/src/` | [design.md](design.md#black-box-suite-harness) |
+| Change the state root or a kernel object name | [design.md, State root](design.md#state-root) and [Kernel object names](design.md#kernel-object-names) → `crates/gate-state/src/root.rs` → `crates/gate-state/tests/state/root.rs` → `crates/gate/src/resolve.rs` | [design.md](design.md#state-root) |
+| Add a test seam | [design.md, Black-box suite harness](design.md#black-box-suite-harness) → `crates/gate-args/Cargo.toml` and `crates/gate/Cargo.toml` (the `test-seams` feature) → `crates/gate-args/src/run.rs` → `crates/gate/src/` | [design.md](design.md#black-box-suite-harness) |
+| Add or run a black-box suite case | [design.md, Black-box suite harness](design.md#black-box-suite-harness) → `crates/gate/tests/suite/support.rs` (the `Case` harness) → `crates/gate/tests/suite/` (the case modules) → `crates/gate/Cargo.toml` (the `suite` target; run with `--all-features`) | [design.md](design.md#black-box-suite-harness) |
 | Port a behaviour of the PowerShell gate | [the inventory](research/2026-10-09-powershell-gate-inventory.md), its item in section 1 → the design.md section that cites that item → the crate the Layers below give it | [design.md](design.md) |
 | Find every caller of the gate | [the inventory, section 4](research/2026-10-09-powershell-gate-inventory.md#4-consumers-outside-toolsgate) (its search patterns and per-repo table) | none |
 
 ## Layers
 
-- **`proc-table`** (`crates/proc-table/`, planned): owns the process snapshot model (`ProcessInfo`, `ProcessTable`, `ProcessTree`) and its Windows reader. References `windows-sys` in its `win32` module only. Never depends on any gate crate: ops-tower and its other crates use it too.
-- **`gate-state`** (`crates/gate-state/`, planned): owns every file format in the state root, their readers and writers, the path and object-name rules, journal history and the dashboard state ops-tower shows. References `proc-table`. Never depends on `gate-win32`, `gate-watchdog`, `gate-router` or the binary, and its API exposes no `windows` or `windows-sys` types.
+- **`proc-table`** (`crates/proc-table/`): owns the process snapshot model (`ProcessInfo`, `ProcessTable`, `ProcessTree`) and its Windows reader. References `windows-sys` in its `win32` module only. Never depends on any gate crate: ops-tower and its other crates use it too.
+- **`gate-state`** (`crates/gate-state/`): owns every file format in the state root, their readers and writers, the path and object-name rules, journal history and the dashboard state ops-tower shows. References `proc-table`. Never depends on `gate-win32`, `gate-watchdog`, `gate-router` or the binary, and its API exposes no `windows` or `windows-sys` types.
 - **`gate-watchdog`** (`crates/gate-watchdog/`, planned, pure): owns the stall, free-share, ceiling, backstop and cores-hint arithmetic over samples. References nothing of the gate's but plain data types. Never reads a clock, a process or a file itself: the clock and samples are injected.
-- **`gate-args`** (`crates/gate-args/`, planned, pure): owns the gate's own argv (the subcommand CLI and the compatibility layer), C-runtime and cmd.exe quoting, the `%VAR%` refusals and the PATHEXT resolution rules. Never depends on `gate-win32`; the environment and file lookups it needs are injected.
+- **`gate-args`** (`crates/gate-args/`, pure): owns the gate's own argv (the subcommand CLI and the compatibility layer), C-runtime and cmd.exe quoting, the `%VAR%` refusals and the PATHEXT resolution rules. Never depends on `gate-win32`; the environment and file lookups it needs are injected.
 - **`gate-router`** (`crates/gate-router/`, planned, pure): owns the routing rules, the in-worktree path rewrite and the `--no-build` drop, over strings. Never runs git, ssh or a process; its inputs are given.
 - **`gate-win32`** (`crates/gate-win32/`, planned, Windows only): owns job objects, process creation, named mutexes and events, priority, console handling and taking samples. References `proc-table` and `windows-sys`. Never holds policy: what to kill and when is `gate-watchdog`'s.
-- **`gate`** (`crates/gate/`, planned, Windows only): the binary. Owns the subcommands, the wait loop, the run, the journal writes, the `remote.ps1` bridge and `gate box`. References every crate above. Nothing depends on it.
+- **`gate`** (`crates/gate/`, Windows only): the binary. Owns the subcommands, the wait loop, the run, the journal writes, the `remote.ps1` bridge and `gate box`. References every crate above. Nothing depends on it.
 
 ## Integration Footguns
 

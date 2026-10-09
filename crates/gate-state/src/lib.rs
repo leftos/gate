@@ -11,6 +11,7 @@ mod counts;
 mod journal;
 mod model;
 mod remote;
+mod root;
 mod state;
 #[cfg(all(windows, target_pointer_width = "64"))]
 mod win32;
@@ -21,6 +22,7 @@ pub use model::{
     CriticalState, CwdReader, DashboardState, MutexProbe, ParseError, PoolState, QueueTicket, RemotePool, SlotCount, SlotCounts, SlotKind, SlotRow,
     SlotState, StateInputs, Waiting,
 };
+pub use root::{KernelObject, StateRoot, default_root, normalize_root, root_hash};
 pub use state::dashboard_state;
 #[cfg(all(windows, target_pointer_width = "64"))]
 pub use win32::{LiveHistoryError, LiveInputsError, Win32CwdReader, Win32MutexProbe, live_history, live_inputs};

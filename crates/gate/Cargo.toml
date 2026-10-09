@@ -1,0 +1,32 @@
+[package]
+name = "gate"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lints]
+workspace = true
+
+[features]
+# The hidden `--test-*` flags and the `fake-tool` helper the black-box suite needs; an installed gate is built without.
+test-seams = ["gate-args/test-seams"]
+
+[dependencies]
+gate-args = { path = "../gate-args" }
+gate-state = { path = "../gate-state" }
+serde_json = { version = "1.0.151", features = ["preserve_order"] }
+
+[[bin]]
+name = "gate"
+path = "src/main.rs"
+
+[[bin]]
+name = "fake-tool"
+path = "src/bin/fake-tool.rs"
+required-features = ["test-seams"]
+
+# Without the `test-seams` feature (`--all-features` or `--features test-seams`) cargo skips this suite silently.
+[[test]]
+name = "suite"
+path = "tests/suite/main.rs"
+required-features = ["test-seams"]
