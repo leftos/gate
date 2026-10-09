@@ -1,0 +1,62 @@
+# Glossary
+
+Terms the gate's docs use in a project sense, in alphabetical order.
+
+- **Abandoned slot**: a slot whose mutex the kernel reports as abandoned because the gate holding it died; the next gate takes it as its own and journals the takeover.
+- **Backfill guest**: a waiting gate admitted, during a critical drain, onto a slot the critical gate lends, because its expected run ends before the drain's shadow end; one still running when the drain completes is killed and re-queued.
+- **Backstop**: the watchdog's last limit, five times the ceiling in wall time (less time paused behind a critical request), whatever the load.
+- **Box**: a builder; the word the gate's prose and its hidden `gate box` subcommand use.
+- **Bridge**: the stand-in, until the remote port, by which `gate.exe` runs a routed run's remote part through the PowerShell remote client, `remote.ps1`.
+- **Build client**: a process in the command's job that drives a build (`MSBuild.exe`, or `dotnet` without `--no-build`); only while one runs does a build server's CPU count as the command's progress.
+- **Build server**: a long-lived compiler or MSBuild node process (`VBCSCompiler`, a `dotnet` running `VBCSCompiler.dll` or an MSBuild node) that builds share.
+- **Builder**: a remote Windows machine, named in a PC's own `remote.json`, that runs routed heavy commands with its own copy of `gate.exe`.
+- **Ceiling**: the `--timeout` limit, counted in load-adjusted seconds; passing it kills the command as TIMED OUT.
+- **Claim**: the JSON file `slots\<name>.json` a gate writes while it holds a slot, naming its pid, command, log and ceiling.
+- **Compatibility layer**: `gate.exe`'s acceptance of the PowerShell gate's argument form (`-Log`, `-TimeoutSeconds`, `-Slot` and the rest), kept until no caller uses it.
+- **Cores hint**: the end-of-run line saying how many cores the command kept busy and whether its slot kind fitted.
+- **Covered**: said of a nested gate whose parent's slot kind covers its own (heavy covers heavy and light, light covers light, critical covers all), so it takes no slot.
+- **Critical drain**: a critical gate's wait for the gates that arrived before it to free their slots, while it holds back the gates that arrive after it.
+- **Critical gate**: a gate run with `--slot critical`, which takes every heavy and unreserved light slot and runs its command at High priority.
+- **Cutover**: switching a machine's gates from the PowerShell gate to `gate.exe`; `gate cutover` runs the local one.
+- **Cutover sweep**: the later change of every calling repo from the PowerShell launcher to `gate` on PATH, after which the PowerShell gate is deleted.
+- **Drained cutover**: a cutover in which every gate of the old generation finishes before the switch completes, so the two generations never hold slots side by side.
+- **Fallback**: a routed run that runs locally instead, after its builder refused it or the remote pool stayed full; journalled as a `fallback` event with its reason.
+- **Fallback poll**: the short timeout on every slot wait, which re-reads counts and tickets so a dead waiter's ticket is cleared even when no wake event comes.
+- **Free share**: the fraction of the cores the command could use that other work left free in a sample, at least 5%; the load-adjusted clock advances by it.
+- **Heartbeat**: a line a waiting gate prints every 30 s so a gate around it does not read the wait as a stall.
+- **Heavy**: the slot kind for work that keeps several cores busy; its pool's thread budget is 4.
+- **Holds the machine**: said of a critical gate once it has taken every heavy and unreserved light slot.
+- **Journal**: the append-only `events.jsonl` in the state root, one JSON line per gate event (`queue`, `take`, `release` and others), with its rolled file and gzip archive.
+- **Lending**: a parent gate letting a nested gate its slot does not cover run on that slot while a critical request drains, instead of queueing behind it.
+- **Lent window**: the span during a critical drain in which the critical gate lends one slot to backfill guests, ending at the shadow end.
+- **Light**: the slot kind for work that keeps one or two cores busy; its pool's thread budget is 2.
+- **Load-adjusted time**: wall time scaled by the free share in each sample, the clock the ceiling runs on, so a command slowed by other work is not killed for it.
+- **Marker**: a failure marker, a log line the built-in regex reads as a failure (such as `Build FAILED.` or `error CS1234`), which turns a zero exit into status 1.
+- **Nesting**: a gate started inside another gate's command (a build hook under a gated `git commit`), which reads its parent from the slot marker.
+- **Pause marker**: an empty file a nested gate rewrites while it waits behind a critical request, which stops its parent's watchdog clocks for that time.
+- **Pool**: the set of slots of one kind (heavy, light, remote); pools never wait on each other.
+- **Probe by open**: reading whether a slot is held by opening its mutex's name: it is held while any handle to that name exists.
+- **Pure crate**: a crate with no Windows types in its API that builds and unit-tests on Linux as well (`gate-state`, `gate-watchdog`, `gate-args`, `gate-router`).
+- **Refusal**: a builder's exit 75 with a reason (`busy`, `unreachable`, `parity`, `rebooted`, `tools`, `version`), which makes the routed run fall back.
+- **Release**: see take.
+- **Reserved field**: an optional field readers accept before any gate writes it, such as `expected` or `avgCores`.
+- **Reserved light slot**: one of the up to two highest light slots a critical gate never takes, so light gates run beside it.
+- **Root hash**: the first 8 hex digits of the SHA-256 of a non-default state root's path, carried in every kernel object name and slot marker of that root.
+- **Routed run**: a heavy gate whose command `remote.json` sends to a builder.
+- **Shadow end**: the expected end of the slowest gate a critical drain waits on, which closes the lent window.
+- **Slot**: a named mutex in the session's `Local\` namespace that a gate holds for its command's whole run; the number of slots per pool caps how many commands run at once.
+- **Slot marker**: the environment variable `GATE_SLOT_HELD`, `<kind>:<pid>:<start>` (plus the root hash under a non-default root), which a gate sets for its command so a nested gate knows its parent.
+- **Snapshot**: either the parentless commit of a worktree as it stands, which a routed run sends to its builder; or the critical gate's record, at take, of the counts and the other gates' claims.
+- **Stable line**: one of the three published `gate:` line forms callers may parse (STALLED, TIMED OUT or BACKSTOP; `waiting for the machine (critical)`; `Full output:`); every other `gate:` line is prose.
+- **Stall**: a kill for no progress (no output, CPU, new process or build-server work) for the stall window, `--stall` seconds.
+- **State root**: the folder holding every file the gate writes, `%LOCALAPPDATA%\gate\v1\` by default, overridden by `--state-dir` or `GATE_STATE_DIR`.
+- **Sync-back**: applying the files a routed command changed on the builder to the PC's worktree, refused when the worktree changed during the run.
+- **Take**: a gate acquiring its slot, journalled as `take`; **release** is letting it go, journalled as `release` before the slot is freed.
+- **Test seam**: a hidden `--test-*` flag, compiled only with the `test-seams` cargo feature, by which the suite sets a timing knob or forces a failure.
+- **Ticket**: the JSON file `waiting\<pid>-<start>.json` a gate writes when it queues for a slot, holding its kind and `arrived` time; waiters of one kind take slots in ticket order.
+- **Verdict**: the outcome a `release` line records: `passed`, `failed`, `log-failure`, `stalled`, `timed-out`, `backstop` or `unknown`.
+- **Wake event**: the auto-reset named event each waiter sleeps on, which a gate signals when it releases a slot or deletes a ticket.
+- **Watchdog**: the part of a running gate that samples the command and kills its job on a stall, the ceiling or the backstop.
+- **Win32 layer**: the `gate-win32` crate, the only code that calls Windows for job objects, processes, mutexes, events and console handling.
+- **Work folder**: the builder's checkout of one PC worktree, reused across routed runs so builds stay incremental.
+- **Work-folder key**: the name of a work folder: the worktree folder's name plus 8 hex digits of the SHA-256 of its lower-cased path.

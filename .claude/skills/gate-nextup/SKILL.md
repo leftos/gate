@@ -29,7 +29,7 @@ Until the cutover, every command runs through the PowerShell gate: `pwsh -NoProf
 
 | The diff touches | Gate commands |
 |---|---|
-| any Rust | `-Slot light -- cargo fmt --all --check`, then `-Slot heavy -TimeoutSeconds 900 -- cargo clippy --workspace --all-targets --profile test-release -- -D warnings`, then `-Slot heavy -TimeoutSeconds 900 -- cargo test --workspace --profile test-release` |
+| any Rust | `-Slot light -- cargo fmt --all --check`, then `-Slot heavy -TimeoutSeconds 900 -- cargo clippy --workspace --all-targets --all-features --profile test-release -- -D warnings`, then `-Slot heavy -TimeoutSeconds 900 -- cargo test --workspace --all-features --profile test-release` (`--all-features` builds the black-box suite, which needs the `test-seams` feature) |
 
 A test that asserts on timing must hold on a busy machine: no wall-clock bound a loaded PC can cross (the PowerShell suite's CC-209 and CC-211 are what this avoids). A test that needs the machine alone runs on `-Slot critical`, and the profile names it here when it exists.
 
@@ -39,9 +39,12 @@ A commit goes through the gate: `-Slot heavy -TimeoutSeconds 300 -- git commit -
 
 | The diff touches | Owning doc |
 |---|---|
-| the CLI, an output line, a file or mutex other processes read | the gate's reference doc (named when the design lands) |
+| the CLI, an output line, a file or mutex other processes read | `docs/design.md` (and the public `README.md` when callers see it) |
 | a crate's layout or a task's file order | `docs/ARCHITECTURE.md` |
-| a new term | the glossary linked from `docs/README.md` |
+| a new term | `docs/GLOSSARY.md` |
+| a file format ops-tower reads | `docs/design.md` "Formats", the fixtures README under `crates/gate-state/tests/state/fixtures/`, and a repo inbox request to ops-tower |
+
+The repo is public: no build-box host, address, ssh user or key, provider name, or personal machine path goes into a commit or a GATE issue.
 
 There is no changelog.
 
