@@ -1,0 +1,1 @@
+{"slots":2,"host":"builder@build-box","repos":{"repo":["dotnet test *","dotnet build *"]}}
