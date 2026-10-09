@@ -13,7 +13,7 @@ Files captured from a real run of `~/.claude/tools/gate/gate.ps1`, not written b
 | `remote.json` | **Hand-written**: the gate's remote settings, two remote slots plus routing keys that `gate-state` ignores. | `%LOCALAPPDATA%\gate\remote.json` |
 | `remote-journal.jsonl` | The journal of the real gate's remote route, captured sandboxed by `capture-remote-journal.ps1`: a remote run that passed, runs that fell back to the local queue (`full`, then one for each reason `unreachable`, `busy`, `parity` with a failing command, `rebooted`, `tools`), a run that fell back onto its parent gate's slot (a `parent` line follows its `fallback`), and a local control run. | `%LOCALAPPDATA%\gate\<prefix>events.jsonl`, here `ops225-events.jsonl` |
 
-The three other `remote*` files are written by hand from the gate's remote-slot design (`~/.claude/docs/plans/gate-remote-slot.md`, "Decisions"), since the gate does not write a remote claim or ticket a test can capture; they are re-captured from a real gate once it does. claude-config keeps a copy of `remote-journal.jsonl` (`tools/gate/fixtures/remote-journal.jsonl`).
+The three other `remote*` files are written by hand from the gate's remote-slot design (`docs/design/gate-remote-slot.md`), since the gate does not write a remote claim or ticket a test can capture; they are re-captured from a real gate once it does. claude-config keeps a copy of `remote-journal.jsonl` (`tools/gate/fixtures/remote-journal.jsonl`).
 
 ## Re-capturing them
 
