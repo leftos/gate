@@ -441,7 +441,7 @@ The Linear read-only tools, team CC, projects "Gate and launchers", "Remote slot
 | CC-192 | Split `Invoke-Main` under the complexity limit | **Moot** (PowerShell function shape) |
 | CC-187 | Cache the box wrapper's compiled job type | **Moot**: no `Add-Type` in Rust; the 0.8 s per call disappears with a native wrapper |
 | CC-177 | `Test-RemoteBusy` fails intermittently on a snapshot ref collision | **Fixed by design**: two runs of one worktree pushed to the same `refs/gate/<key>`; use a per-run ref (or lock before push) and make the busy test deterministic. Note the issue text's `refs/gate/{key}-{8 hex}` is stale: the code pushes `refs/gate/<key>` (R:939) and the key already ends in 8 hex |
-| CC-132 | Home build box to replace the Hetzner rental (Blocked) | **Moot** for the port (infrastructure); the port must not hard-code the host |
+| CC-132 | Home build box to replace the rented one (Blocked) | **Moot** for the port (infrastructure); the port must not hard-code the host |
 | CC-12 | Every repo runs the agent-mail-guard hook through the tracked launcher (Blocked) | **Moot** for the gate; the same `sync-launchers.ps1` publishes both launchers, so the sweep must keep the guard launcher working |
 | CC-104 | Gate: remote heavy slot on the build box (umbrella, In Progress) | **Carried**: open items are step 8's yaat enable (waits on CC-161) and godot-mcp, and the sub-issues below |
 | CC-203 | Count lost connections apart from command failures; stop routing to a box that keeps dropping runs | **Carried** (new in Rust): a per-host loss counter, route nothing past a threshold until a preflight succeeds |
