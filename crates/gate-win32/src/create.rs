@@ -18,7 +18,7 @@ use windows_sys::Win32::System::Threading::{
     PROCESS_CREATION_FLAGS, PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW, UpdateProcThreadAttribute,
 };
 
-use crate::launch::{is_batch, refused, setup, struct_size, wide_os};
+use crate::launch::{end_unstarted, end_unstarted_by_id, is_batch, refused, setup, struct_size, wide_os};
 use crate::{EnvironmentBlock, LaunchError, Suspended, own_handle, win32_message};
 
 /// Held while this crate starts a process: across making the inheritable copies of a launch's handles, its
@@ -294,10 +294,24 @@ fn create_process(creation: &Creation<'_>, flags: PROCESS_CREATION_FLAGS, startu
             message: win32_message(code),
         });
     }
-    // SAFETY: a success returns a fresh process handle nothing else owns.
-    let process = unsafe { own_handle(created.hProcess) }.map_err(|error| setup(error, "own the command's process"))?;
+    // The suspended command is in no job yet: a failure below ends it, so it cannot hold its log or pipes open for good.
     // SAFETY: a success returns a fresh thread handle nothing else owns.
-    let thread = unsafe { own_handle(created.hThread) }.map_err(|error| setup(error, "own the command's thread"))?;
+    let thread = unsafe { own_handle(created.hThread) };
+    // SAFETY: a success returns a fresh process handle nothing else owns.
+    let process = match unsafe { own_handle(created.hProcess) } {
+        Ok(process) => process,
+        Err(error) => {
+            end_unstarted_by_id(created.dwProcessId);
+            return Err(setup(error, "own the command's process"));
+        }
+    };
+    let thread = match thread {
+        Ok(thread) => thread,
+        Err(error) => {
+            end_unstarted(&process);
+            return Err(setup(error, "own the command's thread"));
+        }
+    };
     Ok(Suspended {
         process: Some(process),
         thread,

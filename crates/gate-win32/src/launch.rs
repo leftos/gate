@@ -18,7 +18,8 @@ use windows_sys::Win32::Storage::FileSystem::{
     GetFileInformationByHandle, GetFileType, OPEN_EXISTING, SECURITY_ANONYMOUS, SECURITY_SQOS_PRESENT,
 };
 use windows_sys::Win32::System::Threading::{
-    BELOW_NORMAL_PRIORITY_CLASS, GetExitCodeProcess, HIGH_PRIORITY_CLASS, PROCESS_CREATION_FLAGS, ResumeThread, TerminateProcess, WaitForSingleObject,
+    BELOW_NORMAL_PRIORITY_CLASS, GetExitCodeProcess, HIGH_PRIORITY_CLASS, OpenProcess, PROCESS_CREATION_FLAGS, PROCESS_TERMINATE, ResumeThread,
+    TerminateProcess, WaitForSingleObject,
 };
 use windows_sys::Win32::System::WindowsProgramming::PROCESS_CREATION_DESKTOP_APP_BREAKAWAY_DISABLE_PROCESS_TREE;
 
@@ -354,14 +355,14 @@ impl Suspended {
             return Err(setup(io::Error::other("the process was already taken"), "resume the command"));
         };
         if let Err(error) = job.assign(&process) {
-            terminate(&process);
+            end_unstarted(&process);
             return Err(setup(error, &format!("put the command in the job {}", job.name())));
         }
         // SAFETY: the thread handle is open for the whole call, with the `THREAD_SUSPEND_RESUME` access a created
         // thread's handle has.
         if unsafe { ResumeThread(self.thread.raw()) } == u32::MAX {
             let error = io::Error::last_os_error();
-            terminate(&process);
+            end_unstarted(&process);
             return Err(setup(error, "resume the command"));
         }
         Ok(Running { process, pid: self.pid })
@@ -371,17 +372,26 @@ impl Suspended {
 impl Drop for Suspended {
     fn drop(&mut self) {
         if let Some(process) = &self.process {
-            terminate(process);
+            end_unstarted(process);
         }
     }
 }
 
 /// Ends a command that never ran with exit code 1. Its own failure is not reported: it runs on a path that is already
-/// failing or dropping, and a process that could not be terminated stays visible in its job.
-fn terminate(process: &OwnedHandle) {
+/// failing or dropping, which reports its own error; a command it could not end stays suspended, never having run.
+pub(crate) fn end_unstarted(process: &OwnedHandle) {
     // SAFETY: the process handle is open for the whole call, with the `PROCESS_TERMINATE` access a created process's
     // handle has.
     unsafe { TerminateProcess(process.raw(), 1) };
+}
+
+/// Ends the never-run command `pid` when the handle `CreateProcessW` returned for it could not be owned. The caller
+/// keeps the command's thread handle open meanwhile, so the pid cannot name another process.
+pub(crate) fn end_unstarted_by_id(pid: u32) {
+    // SAFETY: `OpenProcess` takes no pointers. A success is a fresh handle nothing else owns.
+    if let Ok(process) = unsafe { own_handle(OpenProcess(PROCESS_TERMINATE, 0, pid)) } {
+        end_unstarted(&process);
+    }
 }
 
 /// A command resumed in its job.
