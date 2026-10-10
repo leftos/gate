@@ -10,7 +10,7 @@ use crate::resolve::ResolvedRoot;
 
 pub(crate) fn run(request: &RunRequest, log: &Path, root: &ResolvedRoot) -> String {
     let command: Vec<String> = request.command.iter().map(|word| word.to_string_lossy().into_owned()).collect();
-    let seams = request.test_seams;
+    let seams = &request.test_seams;
     json!({
         "mode": "run",
         "slot": request.slot.as_str(),
@@ -28,8 +28,7 @@ pub(crate) fn run(request: &RunRequest, log: &Path, root: &ResolvedRoot) -> Stri
             "sampleMs": seams.sample_ms,
             "heartbeatMs": seams.heartbeat_ms,
             "pollMs": seams.poll_ms,
-            "stallMs": seams.stall_ms,
-        },
+            "stallMs": seams.stall_ms,        },
     })
     .to_string()
 }

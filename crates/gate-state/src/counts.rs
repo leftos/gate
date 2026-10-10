@@ -171,13 +171,27 @@ pub(crate) fn write_replacing(path: &Path, text: &str) -> io::Result<()> {
         fs::create_dir_all(folder)?;
     }
     let temp = temp_path(path);
-    fs::write(&temp, text)?;
+    if let Err(error) = fs::write(&temp, text) {
+        return Err(remove_partial(&temp, error));
+    }
     let moved = with_retry(|| fs::rename(&temp, path));
     if moved.is_err() {
         // The write has failed and says so; a file left beside the target is overwritten by this process's next write.
         let _ = fs::remove_file(&temp);
     }
     moved
+}
+
+/// Removes the partial file a failed write left at `temp` and returns `error`, the write's failure; a file that is not
+/// there is fine, and one that cannot be removed is added to the error.
+fn remove_partial(temp: &Path, error: io::Error) -> io::Error {
+    match fs::remove_file(temp) {
+        Err(removal) if removal.kind() != io::ErrorKind::NotFound => io::Error::new(
+            error.kind(),
+            format!("{error}; the partial file {} could not be removed: {removal}", temp.display()),
+        ),
+        _ => error,
+    }
 }
 
 /// Runs `operation` until it succeeds, up to [`WRITE_ATTEMPTS`] times, [`WRITE_RETRY_DELAY`] apart, returning the

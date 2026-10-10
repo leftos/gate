@@ -120,7 +120,7 @@ The codes are kept (V4), with 75 added for refusals. 124 is the status coreutils
 
 ## Output lines
 
-Every line the gate writes for itself starts `gate: ` and goes to stderr and to the end of the log (V1), except the passed line and the stop-tree summary, which go to stdout (V3, X6). Three forms are the published interface that callers may parse; they keep their wording, and a change to them is a breaking change:
+Every line the gate says is written and flushed as it is said, never held until exit, so a running or killed gate's lines are already visible. Every line the gate writes for itself starts `gate: ` and goes to stderr and to the end of the log (V1), except the passed line and the stop-tree summary, which go to stdout (V3, X6). Three forms are the published interface that callers may parse; they keep their wording, and a change to them is a breaking change:
 
 | Line | Where | Meaning |
 |---|---|---|
@@ -476,11 +476,16 @@ A Rust integration suite drives the built `gate.exe` through its CLI and reads o
 - **Own state root per case.** Every case creates a fresh root under the target directory's temporary folder and passes it with `--state-dir`, so cases never touch the machine's real slots, journal or counts, or each other's. Cases run side by side.
 - **Test seams.** Hidden `--test-*` flags, compiled only with the `test-seams` cargo feature, set the timing knobs: `--test-sample-ms` (sample period), `--test-heartbeat-ms` (wait heartbeat), `--test-poll-ms` (fallback poll) and `--test-stall-ms` (stall window below a second). Each takes whole milliseconds above 0 on `gate run`, and is parsed only until the wait loop and the watchdog exist.
 
-  `--test-journal-run <status>` (a whole number 0 to 255, on `gate run` in the new CLI only) writes the `queue`, `take` (`"slots":[]`, `waitedSeconds` 0) and `release` lines through the real writer and mutex without launching a command or taking a slot, then exits with `<status>`; it is refused with `gate: --test-journal-run must be a whole number 0 to 255, got '<v>'`, or `gate: --test-journal-run and --test-print-request cannot be combined`.
+  `--test-journal-run <status>` (a whole number 0 to 255, on `gate run` in the new CLI only) writes the `queue`, `take` (`"slots":[]`, `waitedSeconds` 0), an optional hold and `release` lines through the real writer and mutex without launching a command or taking a slot, then exits with `<status>`; it is refused with `gate: --test-journal-run must be a whole number 0 to 255, got '<v>'`, or `gate: --test-journal-run and --test-print-request cannot be combined`.
+
+  `--test-hold-until <path>` (or `=<path>`) makes `--test-journal-run` hold between the `take` and `release` lines, checking every 20 ms, until `<path>` exists, so the suite can observe or kill a gate that holds. The hold has no timeout of its own and counts in `heldSeconds` and `wallSeconds`. If the path cannot be checked, the gate says `gate: cannot check <path>: <error>` and ends the hold.
+
+  It is refused with `gate: --test-hold-until needs --test-journal-run` (when `--test-journal-run` is not given) or `gate: --test-hold-until needs a value` (an empty value). `--test-print-request` output has no `holdUntil` key, since a hold needs journal-run, which cannot be combined with it.
 
   `--test-print-request`, on `run`, `stop-tree` and the compatibility form, prints the parsed request as one JSON line on stdout and exits 0, so the suite sees what a command line asked for; it is the one hidden switch the compatibility layer accepts.
 
   The same feature will carry the failure seams `--test-sampler-fail` (W5) and `--test-diagnostics-fail` (X3), and `--test-remote-client <path>` (a stub in place of the remote client), with their slices. An installed gate has none of them, and without the feature each is an unknown option.
+- **Spawn and wait helpers.** The suite's `start` launches the gate and returns a `Running` that can wait for a stderr line, say whether the gate is still running, and finish; dropping a `Running` kills a gate still running. Output readers are joined with a deadline, so a grandchild holding the pipes cannot hang the suite.
 - **Ordering, never elapsed time.** A case asserts the order of events in the journal and the log (a waiter's `take` after the holder's `release`, a heartbeat line before the inner gate's take, a kill line before the exit), never a wall-clock bound a busy machine could cross. A case's own deadline only guards against a hang and is generous.
 - **Injected clock.** The watchdog arithmetic is unit-tested in `gate-watchdog` with an injected clock and scripted samples, not through the binary.
 - **Fake process trees.** A small helper executable, `fake-tool` (built only with the `test-seams` feature; it runs its steps in order: `argv`, `out <text>`, `err <text>`, `sleep <ms>`, `exit <n>`), copied under the names the gate classifies (`VBCSCompiler.exe`, `dotnet.exe`, `MSBuild.exe`), spawns children, burns CPU, prints its argv, writes output or sleeps on command, so build-server, orphan and kill-tree cases need no real toolchain.
