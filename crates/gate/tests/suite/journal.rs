@@ -13,7 +13,7 @@ use gate_state::{JOURNAL_CAP_BYTES, KernelObject, StateRoot};
 use gate_win32::NamedMutex;
 use serde_json::Value;
 
-use crate::support::{Case, Outcome, assert_in_order, finish, shown};
+use crate::support::{Case, Outcome, assert_in_order, finish, shown, wait_for_file, wait_for_journal_line};
 
 /// The words of a light run that journals itself and exits with `status`, the command after `--` last.
 fn journal_run(status: &'static str) -> Vec<&'static str> {
@@ -155,6 +155,59 @@ fn journal_run_writes_queue_take_release_in_order() {
     assert_eq!(lines[0]["log"], shown(&case.root().join("out.log")));
     assert!(lines[1]["waitedSeconds"].is_f64(), "the take says how long it waited: {}", lines[1]);
     assert!(lines[1].get("abandoned").is_none(), "a clean take names no abandoned slot: {}", lines[1]);
+}
+
+#[test]
+fn journal_command_is_quoted_like_format_command_text() {
+    // `Format-CommandText` of these words, as the PowerShell gate writes it.
+    const QUOTED: &str = r#"cmd /c echo "a b" "x\"y""#;
+    let case = Case::new("journal_command_is_quoted_like_format_command_text");
+    let go = case.root().join("go");
+    let go_word = shown(&go);
+    let words = [
+        "run",
+        "--slot",
+        "light",
+        "--timeout",
+        "5",
+        "--log",
+        "out.log",
+        "--test-journal-run",
+        "0",
+        "--test-hold-until",
+        &go_word,
+        "--",
+        "cmd",
+        "/c",
+        "echo",
+        "a b",
+        "x\"y",
+    ];
+
+    let running = case.start(&words);
+    // The take is journalled before the claim is written; the claim is complete once it exists (written by rename).
+    let claim_path = case.root().join("slots").join("gate-light-slot-0.json");
+    wait_for_journal_line(&case.root(), &format!(r#""event":"take","pid":{},"#, running.id()));
+    wait_for_file(&claim_path);
+    let claim = fs::read_to_string(&claim_path).expect("the held slot's claim can be read");
+    fs::write(&go, "").expect("the go file can be made");
+    let outcome = running.finish();
+
+    assert_quiet(&outcome, 0);
+    assert_eq!(parsed(&claim)["command"].as_str(), Some(QUOTED), "the claim: {claim}");
+    let lines = lines_of(&case.root().join("events.jsonl"));
+    let commands: Vec<(Value, Value)> = lines
+        .iter()
+        .map(|line| {
+            let line = parsed(line);
+            (line["event"].clone(), line["command"].clone())
+        })
+        .collect();
+    assert_eq!(
+        commands,
+        ["queue", "take", "release"].map(|event| (Value::from(event), Value::from(QUOTED))),
+        "every journal line carries the quoted command"
+    );
 }
 
 #[test]

@@ -49,8 +49,8 @@ pub struct TestSeams {
     pub heartbeat_ms: Option<u64>,
     pub poll_ms: Option<u64>,
     pub stall_ms: Option<u64>,
-    /// `--test-journal-run <status>`: journal a run's queue, take and release without launching its command or taking
-    /// a slot, then exit with this status.
+    /// `--test-journal-run <status>`: queue, take a real slot with its claim, and release it, journalling each, without
+    /// launching the command, then exit with this status.
     pub journal_run: Option<u8>,
     /// `--test-hold-until <path>`: with `--test-journal-run`, hold between the take and the release until `<path>`
     /// exists.

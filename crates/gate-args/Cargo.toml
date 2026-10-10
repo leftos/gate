@@ -10,6 +10,9 @@ doctest = false
 [lints]
 workspace = true
 
+[dev-dependencies]
+proptest = { version = "1.11.0", default-features = false, features = ["std"] }
+
 [features]
 # The hidden `--test-*` flags of the black-box suite; an installed gate is built without them.
 test-seams = []

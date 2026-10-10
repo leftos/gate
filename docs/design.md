@@ -257,7 +257,7 @@ The environment carries one more name: `GATE_SLOT_HELD`, the slot marker ([Criti
 | `processStart` | string | the gate's start time, ISO UTC |
 | `started` | string | when it took the slot, ISO UTC |
 | `cwd` | string | the gate's working directory |
-| `command` | string | the command's words joined by spaces; each word will be quoted as for CreateProcess (C4) once command launching is built |
+| `command` | string | the command's raw words (the program unresolved), each quoted as for CreateProcess (C4) even for a batch target and joined by spaces, as the PowerShell gate's `Format-CommandText` writes them, such as `cmd /c echo "a b" "x\"y"` |
 | `log` | string | the log's full path |
 | `timeoutSeconds` | number | the ceiling; the writer refuses a value JSON cannot carry (not finite) |
 | `remote`, `host`, `key` | bool, string, string | a remote slot's claim only (L1) |
@@ -298,7 +298,7 @@ A missing file, or a missing key, gives the default silently. A file unreadable 
 
 `events.jsonl` holds one JSON object per line, appended under the journal mutex (`Local\gate-journal`, [Kernel object names](#kernel-object-names)) with a 2 s wait (kept, J1). The events are `queue`, `take`, `release`, `abandon`, `covered`, `parent` and `fallback`.
 
-Every line starts with `v`, `time`, `event`, `pid`, `processStart`, `kind`, `cwd` and `command`, in that order, then the event's own fields, as the PowerShell gate writes them (J1); a routed run adds `remote`, `host` and `key` until its `fallback`.
+Every line starts with `v`, `time`, `event`, `pid`, `processStart`, `kind`, `cwd` and `command` (the same text as the claim's [`command`](#claim)), in that order, then the event's own fields, as the PowerShell gate writes them (J1); a routed run adds `remote`, `host` and `key` until its `fallback`.
 
 The journal keeps ISO 8601 UTC strings for `time` and `processStart` (7 fractional digits, ending in `Z`); it never held .NET ticks, so the move of claims, tickets and markers to epoch milliseconds does not touch it. `gate.exe` takes `processStart` from `GetProcessTimes`, in whole microseconds, so its 7th fractional digit is 0. Seconds fields (`heldSeconds`, `waitedSeconds`, `wallSeconds`, `adjustedSeconds`) are rounded to 3 decimals.
 
@@ -395,20 +395,30 @@ The arithmetic (stall progress, the free share, the clock, the backstop, the cor
 ## Command launching
 
 - **The argv arrives byte-exact.** `gate.exe` reads its own command line (`GetCommandLineW`), splits it by the Microsoft C runtime's rules, and takes every word after the first `--` as the command, unchanged (C3). The PowerShell binder workarounds (C3's rejoined colon words and flattened arrays) do not exist.
-- **C-runtime quoting.** The words are written into one CreateProcess command line so the C runtime reads each back as one argv entry: an empty word or one holding whitespace or a quote is wrapped, `"` becomes `\"`, and a backslash run before a quote or at the end is doubled (kept, C4). Splitting the written line gives back the words, for every word list; a property test holds that.
-- **`.cmd` and `.bat` targets** run as `"<ComSpec>" /d /v:off /s /c "<line>"`, each word quoted for cmd.exe (kept, C5).
+- **C-runtime quoting.** The words are written into one CreateProcess command line so the C runtime reads each back as one argv entry: an empty word or one holding whitespace or a quote is wrapped, `"` becomes `\"`, and a backslash run before a quote or at the end is doubled (kept, C4). Splitting the written line gives back the words, for every list of argument words; a property test holds that. A program word must not hold a quote or end in a backslash, because the C runtime reads argv[0] without backslash escapes (the PowerShell gate has the same limit).
+- **`.cmd` and `.bat` targets** run as `"<ComSpec>" /d /v:off /s /c "<line>"`, the ComSpec written C4-quoted and each word quoted for cmd.exe (kept, C5). A target is a program whose extension is `.cmd` or `.bat` in any case, after the trailing dots and spaces of its file name are dropped.
 
-  The gate refuses, with exit 2 before any slot is queued, a word that cmd.exe would split or expand, the batch file's own path included:
+  A word holding `"` is written `""` for a batch file, which programs on the old msvcrt.dll read differently from the C runtime's `\"`. This is a known limit shared with the PowerShell gate.
 
-  - a word holding a CR or LF;
-  - `%NAME%` of a variable set in the command's environment;
+  The gate refuses, with exit 2 before any slot is queued, a word that cmd.exe would split, cut or expand, the batch file's own path included:
+
+  - a word holding a CR, LF or U+0000;
+  - `%NAME%` of a variable set in the command's environment, names compared case-insensitively over all of Unicode and the lookup answering for the exact environment block the command gets;
+  - any `%=…%` name (`%=ExitCode%`, `%=C:%`), set or not, since cmd.exe's hidden variables appear in no environment listing;
   - a dynamic name cmd.exe expands though no variable is set: `%CD%`, `%DATE%`, `%TIME%`, `%RANDOM%`, `%ERRORLEVEL%`, `%CMDCMDLINE%`, `%CMDEXTVERSION%`, `%HIGHESTNUMANODENUMBER%`, `%__CD__%`, `%__APPDIR__%`;
-  - the substring and substitution forms `%NAME:~a,b%` and `%NAME:a=b%` of a set or dynamic name.
+  - the substring and substitution forms `%NAME:~a,b%` and `%NAME:a=b%` of a set or dynamic name, and a whole `%NAME:…%` name that is itself set.
 
   A lone `%` and an unset name pass. The gate and the box side share this one implementation.
-- **Program resolution.** A bare name resolves to the first file on PATH whose extension is in PATHEXT, skipping extensionless shims; a name with an extension or a directory is taken as written, a relative directory read against the working directory (kept, C6). A start failure prints `gate: could not start <word> (<resolved>): <message>` and exits 127, releasing the slot (C7).
+- **Program resolution.** The program must resolve to an absolute path (kept, C6):
 
-  Unlike the PowerShell gate, which lets CreateProcess search for the program (the current folder among others), the program must resolve to an absolute path, and a name found nowhere is a start failure. This is deliberate, for security: a repo cannot plant a `git.exe` at its root. The `gate-win32` layer passes the path as `lpApplicationName`, so CreateProcessW searches no folder (not the gate's, the current one, System32 or PATH).
+  - A name with a directory part is read against the working folder, `.` and `..` folded and separators written `\`; a drive-qualified or UNC name is kept as written.
+  - A name with an extension but no directory is looked for as written in each absolute PATH folder.
+  - A bare name is looked for in PATH × PATHEXT, the folders outer and the extensions inner, as `Get-Command` orders them.
+  - The current folder and relative PATH entries are never searched, and an extensionless shim is never found.
+
+  A name found nowhere is a start failure. Unlike the PowerShell gate, which lets CreateProcess search for the program (the current folder among others), the gate never passes an unfound name on. This is deliberate, for security: a repo cannot plant a `git.exe` at its root. The `gate-win32` layer passes the path as `lpApplicationName`, so CreateProcessW searches no folder (not the gate's, the current one, System32 or PATH).
+
+  A start failure prints `gate: could not start <word> (<resolved>): <message>` and exits 127, releasing the slot (C7).
 - **Process creation.** The `gate-win32` layer is the contract the run uses (`Launch` → `Suspended` → `Running`). The command is created suspended with an explicit environment block, assigned to the gate's job `Local\gate-job-<gate pid>`, then resumed (kept, X1, P1). Creation flags are `CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT` plus the priority class, with no new console and no new process group.
 
   The job has no limits: no breakaway, no kill-on-close. A job name already held is refused. If assigning to the job or resuming fails, the command is terminated with exit code 1 first, and a suspended command dropped without being resumed is terminated with exit code 1.

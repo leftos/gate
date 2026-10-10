@@ -1,8 +1,12 @@
-//! The gate's argv grammar: the subcommand CLI, the compatibility layer and the hidden test-seam flags.
+//! The gate's argv grammar: the subcommand CLI, the compatibility layer and the hidden test-seam flags; and the command's
+//! words: their quoting for the C runtime and cmd.exe, the words a batch target refuses, and program resolution.
 
 #![expect(clippy::expect_used, reason = "a test whose command line parses the wrong way must fail loudly")]
 
+mod batch;
 mod compat;
+mod program;
+mod quoting;
 mod run;
 mod seams;
 mod support;

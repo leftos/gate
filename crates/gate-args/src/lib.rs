@@ -2,10 +2,18 @@
 //! layer that reads the PowerShell gate's `-Log <path> -TimeoutSeconds <n> -Slot <kind> -- <command>` form. Parsing is
 //! pure: it reads the words it is given, opens no file and reads no environment, so it builds and tests everywhere.
 //! A usage error is a list of [`Problem`]s, each printed on its own `gate: ` line before the [`USAGE`].
+//!
+//! It also owns the rules for the command's words, as pure functions over injected inputs: their C-runtime quoting
+//! ([`command_line`]), their cmd.exe quoting for a `.cmd` or `.bat` target ([`is_batch_target`],
+//! [`batch_command_line`]) with the words such a target refuses ([`batch_refusal`]), and program resolution through
+//! `PATH` and `PATHEXT` ([`resolve_program`]).
 
+mod batch;
 mod cli;
+mod cmdline;
 mod compat;
 mod problem;
+mod program;
 mod request;
 mod run;
 mod usage;
@@ -13,7 +21,10 @@ mod values;
 
 use std::ffi::OsString;
 
+pub use batch::{BatchRefusal, batch_command_line, batch_refusal, is_batch_target, quote_batch_arg, quote_batch_arg_str};
+pub use cmdline::{command_line, command_text, quote_arg, quote_arg_str};
 pub use problem::{MAX_WHOLE_NUMBER, Problem, Required, Spelling};
+pub use program::{ProgramSearch, resolve_program};
 pub use request::{DEFAULT_STALL_SECONDS, DEFAULT_TAIL_LINES, Invocation, RunRequest, Slot, StopRequest, TestSeams};
 pub use usage::USAGE;
 

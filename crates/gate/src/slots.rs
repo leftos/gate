@@ -80,7 +80,7 @@ pub(crate) struct ThisGate {
     start_error: Option<String>,
     kind: &'static str,
     cwd: Result<String, String>,
-    /// The command's words joined by spaces.
+    /// The command's words as given, each quoted for the C runtime and joined by spaces ([`gate_args::command_text`]).
     command: String,
 }
 
@@ -94,7 +94,6 @@ impl ThisGate {
         let cwd = std::env::current_dir()
             .map(|cwd| cwd.to_string_lossy().into_owned())
             .map_err(|error| format!("cannot read the working directory: {error}"));
-        let command: Vec<String> = request.command.iter().map(|word| word.to_string_lossy().into_owned()).collect();
         ThisGate {
             pid: std::process::id(),
             start,
@@ -102,7 +101,7 @@ impl ThisGate {
             start_error,
             kind: request.slot.as_str(),
             cwd,
-            command: command.join(" "),
+            command: gate_args::command_text(&request.command),
         }
     }
 
@@ -352,5 +351,52 @@ pub(crate) fn delete(path: &Path) -> io::Result<()> {
     match fs::remove_file(path) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         removed => removed,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsString;
+
+    use gate_args::Invocation;
+    use gate_state::normalize_command;
+
+    use super::ThisGate;
+
+    /// What the PowerShell gate's `Format-CommandText` writes for the command below.
+    const POWERSHELL: &str = "cargo test --manifest-path X:/dev/ops.wt/ops-61/Cargo.toml -- --exact \"a b\" \"a\u{a0}b\" .tmp/out.txt";
+
+    /// The journal history keys one command's runs together whichever gate wrote them.
+    #[test]
+    fn this_gate_carries_the_command_as_the_powershell_gate_writes_it() {
+        let words = [
+            "run",
+            "--slot",
+            "light",
+            "--timeout",
+            "5",
+            "--log",
+            "out.log",
+            "--",
+            "cargo",
+            "test",
+            "--manifest-path",
+            "X:/dev/ops.wt/ops-61/Cargo.toml",
+            "--",
+            "--exact",
+            "a b",
+            "a\u{a0}b",
+            ".tmp/out.txt",
+        ];
+        let request = match gate_args::parse(words.into_iter().map(OsString::from).collect()) {
+            Ok(Invocation::Run(request)) => request,
+            other => unreachable!("the words are a run: {other:?}"),
+        };
+
+        let gate = ThisGate::read(&request);
+
+        assert_eq!(gate.command, POWERSHELL);
+        assert_eq!(normalize_command(&gate.command), normalize_command(POWERSHELL));
+        assert_eq!(normalize_command(&gate.command), "cargo test -- --exact \"a b\" \"a\u{a0}b\" \u{2026}");
     }
 }

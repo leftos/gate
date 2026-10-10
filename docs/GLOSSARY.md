@@ -22,6 +22,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Cutover**: switching a machine's gates from the PowerShell gate to `gate.exe`; `gate cutover` runs the local one.
 - **Cutover sweep**: the later change of every calling repo from the PowerShell launcher to `gate` on PATH, after which the PowerShell gate is deleted.
 - **Drained cutover**: a cutover in which every gate of the old generation finishes before the switch completes, so the two generations never hold slots side by side.
+- **Dynamic name**: one of cmd.exe's built-in variables (`%CD%`, `%RANDOM%`, `%ERRORLEVEL%` and the like) that it expands though the environment block holds no such variable; a batch target's words are refused when they hold one.
 - **Fallback**: a routed run that runs locally instead, after its builder refused it or the remote pool stayed full; journalled as a `fallback` event with its reason.
 - **Fallback poll**: the short timeout on every slot wait, which re-reads counts and tickets so a dead waiter's ticket is cleared even when no wake event comes.
 - **Free share**: the fraction of the cores the command could use that other work left free in a sample, at least 5%; the load-adjusted clock advances by it.
@@ -48,6 +49,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Root hash**: the first 8 hex digits of the SHA-256 of a non-default state root's path, carried in every kernel object name and slot marker of that root.
 - **Routed run**: a heavy gate whose command `remote.json` sends to a builder.
 - **Shadow end**: the expected end of the slowest gate a critical drain waits on, which closes the lent window.
+- **Shim**: an extensionless script on PATH, such as the bash shims a plugin puts ahead of `uv` and `python`; program resolution skips it, since Windows cannot start it.
 - **Slot**: a named mutex in the session's `Local\` namespace that a gate holds for its command's whole run; the number of slots per pool caps how many commands run at once.
 - **Slot marker**: the environment variable `GATE_SLOT_HELD`, `<kind>:<pid>:<start>` (plus the root hash under a non-default root), which a gate sets for its command so a nested gate knows its parent.
 - **Snapshot**: either the parentless commit of a worktree as it stands, which a routed run sends to its builder; or the critical gate's record, at take, of the counts and the other gates' claims.
