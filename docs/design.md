@@ -95,7 +95,7 @@ Hidden from the usage and from `--help`. It is the builder side of a routed run,
 
 ### Later subcommands
 
-Further modes arrive as subcommands of the same binary, each designed with its issue: `gate expect -- <command>` (the expected duration of a command, GATE-13), `gate status`, `gate install` and `gate drain`. New options, such as `--timeout auto` (GATE-16) and `--slot auto` (GATE-8), exist only in the new CLI, never in the compatibility layer.
+Further modes arrive as subcommands of the same binary, each designed with its issue: `gate expect -- <command>` (the expected duration of a command, GATE-13), `gate status` and `gate drain`. New options, such as `--timeout auto` (GATE-16) and `--slot auto` (GATE-8), exist only in the new CLI, never in the compatibility layer.
 
 ### Compatibility layer
 
@@ -503,7 +503,7 @@ Routing is off on a machine with no `remote.json` in its state root: nothing is 
 
 ## The box side
 
-A builder runs the same `gate.exe`, under the hidden `gate box` subcommand, from its own `%LOCALAPPDATA%\gate\bin`. The install script pushes the exe to every builder the local `remote.json` names, over ssh. A routed run first learns the builder's gate version; when it differs from its own, the run falls back to local, saying `gate: not routed: <host> runs gate <version>, this PC <version>`, and journals `fallback` with reason `version`.
+A builder runs the same `gate.exe`, under the hidden `gate box` subcommand, from its own `%LOCALAPPDATA%\gate\bin`. The exe is pushed to every builder the local `remote.json` names, over ssh, by the remote port (GATE-65), not by the local install script. A routed run first learns the builder's gate version; when it differs from its own, the run falls back to local, saying `gate: not routed: <host> runs gate <version>, this PC <version>`, and journals `fallback` with reason `version`.
 
 Builders are configured only in the local state root's `remote.json`. The repo, its docs and its tests name no builder; the suite's remote cases run against a stub.
 
@@ -521,10 +521,14 @@ Built verbs:
 
 ## Install
 
-- The install script builds a Release `gate.exe` (without the `test-seams` feature) and installs it to `%LOCALAPPDATA%\gate\bin\gate.exe`. Installed gates never run from `target/`, which build cleaners empty and a rebuild overwrites while gates hold it open.
-- A copy already there, running or not, is renamed aside before the new one is copied in, so live gates are never broken; aside copies that no process holds any more are deleted on a later install. The script prints the version it replaced and the version it installed.
-- It adds `%LOCALAPPDATA%\gate\bin` to the user's PATH when missing, so callers run `gate`.
-- It then pushes the same exe to each builder in `remote.json`, with the same rename-aside on the builder.
+- `pwsh tools/install.ps1` builds a Release `gate.exe` with `cargo build --release -p gate` (default features, so no `test-seams`) through the repo's `tools\gate.ps1` on a heavy slot, and installs it to `%LOCALAPPDATA%\gate\bin\gate.exe`. Installed gates never run from `target/`, which build cleaners empty and a rebuild overwrites while gates hold it open. It refuses an unset or empty `LOCALAPPDATA`.
+- When the built exe has the same SHA-256 as the installed one, the copy is skipped and the script prints `install: gate <version> already installed at <path>`.
+- Otherwise the new exe is first copied to a temporary name in the folder; then a copy already there, running or not, is moved aside to `gate.exe.<stamp>.<pid>.old` (which works while gates run it), and the temporary file is renamed into place, so `gate.exe` is missing only between two renames. A failed copy leaves the installed exe untouched; a failed final rename moves the old exe back, and the failure line says whether that worked. The script prints the version it replaced and the version it installed.
+- Aside copies that no process holds any more are deleted; one a running gate still holds stays until a later install.
+- It adds `%LOCALAPPDATA%\gate\bin` to the user's PATH when missing, so callers run `gate`: the raw registry value of the user environment is read and written, keeping its kind and its unexpanded `%NAME%` entries; the change is broadcast (`WM_SETTINGCHANGE`, as `setx` does) so programs started from then on see it, and the script says to open a new terminal. It never touches the state root's files.
+- `-WhatIf` lists every step without taking it. `-Exe` (install a prebuilt exe, skipping the build) and `-EnvironmentKey` (the registry key the PATH entry lives in) exist for the suite, which runs the script against a temporary `LOCALAPPDATA` and registry key.
+- The script installs locally only. Pushing the exe to each builder in `remote.json`, with the same rename-aside on the builder, belongs to the remote port (GATE-65).
+- Install is a script, not a `gate install` subcommand.
 
 ## Cutover
 
@@ -580,7 +584,7 @@ A Rust integration suite drives the built `gate.exe` through its CLI and reads o
   It is copied under the names the gate classifies (`VBCSCompiler.exe`, `dotnet.exe`, `MSBuild.exe`).
 
   It spawns children, burns CPU, prints its argv, writes output or sleeps on command, so build-server, orphan and kill-tree cases need no real toolchain.
-- **No fixture from the checkout path.** No routing pattern, expected path or assertion is derived from where the repo is checked out; a case builds its own repository and routing file in its root.
+- **No fixture from the checkout path.** No routing pattern, expected path or assertion is derived from where the repo is checked out; a case builds its own repository and routing file in its root. `checkout::repo_file` is the one route to a checked-in file (the install script), never for a path or pattern a case asserts on.
 - **Running it.** The suite is a test target with `required-features = ["test-seams"]`, run through the gate with `cargo test --workspace --profile test-release --all-features`. Without the feature (no `--all-features`) cargo skips the suite silently.
 
 ## Cores hint
@@ -603,5 +607,5 @@ What no ruling settles yet, with the issue that owns it:
 - **The duration estimate** (GATE-12): whether p50 comes from a short recent window, and whether cold and warm cache runs are summarised apart.
 - **A prediction a run has passed** (GATE-14): what a holder past its p90 reports in wait lines, and whether the critical gate re-prices its shadow end and closes or shrinks the lent window when a blocker overruns.
 - **The `--timeout auto` spelling** (GATE-16): how the caller's floor travels with `auto` in the new CLI.
-- **The surfaces of `gate status`, `gate install` and `gate drain`** (no issue yet), and whether the install script becomes `gate install`.
+- **The surfaces of `gate status` and `gate drain`** (no issue yet). Install stays a script (`tools/install.ps1`) until a reason for a `gate install` subcommand appears.
 - **The Windows facilities to spike before their slice** (GATE-5): reading the WSL VM's CPU (W6), other users' command lines (B1), the desktop-app breakaway policy (X1) and nested jobs, each of which changes kill behaviour if it silently fails.

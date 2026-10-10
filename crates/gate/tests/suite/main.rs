@@ -8,6 +8,7 @@ mod cli;
 mod compat;
 mod harness;
 mod hold;
+mod install;
 mod journal;
 mod launch;
 mod request;

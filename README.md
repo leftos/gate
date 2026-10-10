@@ -12,7 +12,7 @@ Pre-release. Nothing here is ready to use yet, and gate is not yet a replacement
 
 ## How it will work
 
-- **Install.** An install script builds a Release `gate.exe`, puts it in `%LOCALAPPDATA%\gate\bin` and adds that folder to your PATH. Reinstalling while gates are running is safe: the running copy is renamed aside, and the script prints the version it replaced.
+- **Install.** `pwsh tools/install.ps1` builds a Release `gate.exe`, puts it in `%LOCALAPPDATA%\gate\bin` and adds that folder to your user PATH; open a new terminal afterwards to use `gate`. Reinstalling while gates are running is safe: the running copy is renamed aside, and the script prints the version it replaced and the version it installed (or that the same build is already installed). It installs on this machine only.
 - **Call.** `gate run --slot heavy|light|critical --timeout <seconds> --log <path> -- <command>`. `heavy` is for work that fills several cores, `light` for one or two, and `critical` for a timing-sensitive run that needs the machine to itself. The command's output goes to the log; gate prints its tail and a one-line verdict, and exits with the command's status, or 124 when it killed the command.
 - **Slots.** The number of slots per kind comes from the machine's core count and can be changed in `%LOCALAPPDATA%\gate\v1\slot-counts.json`.
 - **Remote builders (optional).** A machine can send allowlisted heavy commands to other Windows machines it names in its own `%LOCALAPPDATA%\gate\v1\remote.json`. Builders are configured only there, on your machine; nothing about them lives in this repo. With no such file, gate runs everything locally.

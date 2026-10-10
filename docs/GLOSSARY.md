@@ -4,6 +4,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 
 - **Abandoned slot**: a slot taken from a gate that died holding it, seen as an abandoned mutex or, when the take is clean, a claim whose pid and start are no longer alive; the next gate takes it as its own and journals the takeover.
 - **Archive**: the gzipped `release` lines of a rolled journal, kept in `<state root>\archive\events-<stamp>.jsonl.gz` for 180 days; the gate whose append rolled the journal writes it before releasing the journal mutex.
+- **Aside copy**: the old `gate.exe` an install moves to `gate.exe.<stamp>.<pid>.old` beside the new one; a later install deletes it once no process holds it.
 - **Backfill guest**: a waiting gate admitted, during a critical drain, onto a slot the critical gate lends, because its expected run ends before the drain's shadow end; one still running when the drain completes is killed and re-queued.
 - **Backstop**: the watchdog's last limit, five times the ceiling in wall time (less time paused behind a critical request), whatever the load.
 - **Black-box suite**: the Rust integration suite (`crates/gate/tests/suite/`) that drives the built `gate.exe` through its CLI and reads only its exit code, output, log, journal, claims and tickets; it needs the `test-seams` feature to run.

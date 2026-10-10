@@ -36,6 +36,7 @@ The rule that shapes it: every file and kernel object another process sees is de
 | Change the state root or a kernel object name | [design.md, State root](design.md#state-root) and [Kernel object names](design.md#kernel-object-names) → `crates/gate-state/src/root.rs` → `crates/gate-state/tests/state/root.rs` → `crates/gate/src/resolve.rs` | [design.md](design.md#state-root) |
 | Add a test seam | [design.md, Black-box suite harness](design.md#black-box-suite-harness) → `crates/gate-args/Cargo.toml` and `crates/gate/Cargo.toml` (the `test-seams` feature) → `crates/gate-args/src/run.rs` → `crates/gate/src/` | [design.md](design.md#black-box-suite-harness) |
 | Add or run a black-box suite case | [design.md, Black-box suite harness](design.md#black-box-suite-harness) → `crates/gate/tests/suite/support.rs` (the `Case` harness) → `crates/gate/tests/suite/` (the case modules) → `crates/gate/Cargo.toml` (the `suite` target; run with `--all-features`) | [design.md](design.md#black-box-suite-harness) |
+| Change or run the install script (build, rename-aside, PATH) | [design.md, Install](design.md#install) → `tools/install.ps1` → `crates/gate/tests/suite/install.rs` → `crates/gate/tests/suite/checkout.rs` (`repo_file`) → `README.md` | [design.md](design.md#install) |
 | Port a behaviour of the PowerShell gate | [the inventory](research/2026-10-09-powershell-gate-inventory.md), its item in section 1 → the design.md section that cites that item → the crate the Layers below give it | [design.md](design.md) |
 | Find every caller of the gate | [the inventory, section 4](research/2026-10-09-powershell-gate-inventory.md#4-consumers-outside-toolsgate) (its search patterns and per-repo table) | none |
 
@@ -75,7 +76,7 @@ The rule that shapes it: every file and kernel object another process sees is de
 
 - `crates/gate-state/tests/state/`: every format against its fixtures, claims, counts, the critical and queue views, journal reading. Fixtures in `crates/gate-state/tests/state/fixtures/`.
 - Unit tests inside each pure crate (`gate-watchdog`, `gate-args`, `gate-router`, and `gate-state`'s pure parts): run on Windows and on Linux. Quoting round-trips and path rewrites are property tests.
-- `crates/gate/tests/`: the black-box suite, a test target with `required-features = ["test-seams"]`. A new behaviour of the binary gets a case here, with its own state root and ordering-only asserts.
+- `crates/gate/tests/`: the black-box suite, a test target with `required-features = ["test-seams"]`. A new behaviour of the binary gets a case here, with its own state root and ordering-only asserts. `suite/install.rs` runs `tools/install.ps1` against a temporary `LOCALAPPDATA` and registry key.
 - Run everything through the gate with `cargo test --workspace --profile test-release --all-features`; the pure crates alone on Linux with `cargo test` on those packages.
 
 ## Deep docs
