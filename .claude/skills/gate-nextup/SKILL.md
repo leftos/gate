@@ -17,6 +17,12 @@ linear: gate
 - A steer or a finding the item does not fix gets an **add**, in the project whose files it shares, else in `Backlog`. A change another repo needs (claude-config's launcher, docs or skills; ops-tower's use of `gate-state`) goes as a repo inbox request.
 - Tracker: **triage** as plan-operations says.
 
+## Decisions
+
+The owner wants this project worked as autonomously as possible and holds no strong views on technical choices. The decision round settles every technical decision itself: formats, APIs, crate layout, Win32 mechanics, seams and test shape. It picks the option with the best worst case, quotes the reasoning into the brief, and **settle**s it into the issue.
+
+The owner is asked only about what they know as a user and a developer: how they and the agents in the repos that use the gate experience it. That covers output a person or agent reads, waits and their feedback, failure messages, defaults that change how a caller's run behaves, and workflows in those repos. A feature branch counts as technical: the round decides it and says so.
+
 ## Agents
 
 - Explore: `Explore`. Behaviour questions about the PowerShell gate point the explorer at `~/.claude/tools/gate/` by path, and at the behaviour inventory, `docs/research/2026-10-09-powershell-gate-inventory.md`.
