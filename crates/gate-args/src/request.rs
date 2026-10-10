@@ -88,6 +88,8 @@ pub struct TestSeams {
     pub interrupt_queued: bool,
     /// Make every sample of the running command fail, so the watch goes by wall time alone.
     pub sampler_fail: bool,
+    /// Make the gathering of a kill's diagnostics fail, so the block is the heading and the failed line.
+    pub diagnostics_fail: bool,
 }
 
 /// A valid `gate run`.

@@ -23,6 +23,7 @@ fn seam_flags_parse_with_the_feature() {
             "3",
             "--test-interrupt-queued",
             "--test-sampler-fail",
+            "--test-diagnostics-fail",
             "--test-print-request",
             "--",
             "cmd",
@@ -39,6 +40,7 @@ fn seam_flags_parse_with_the_feature() {
             interrupt_after_samples: Some(3),
             interrupt_queued: true,
             sampler_fail: true,
+            diagnostics_fail: true,
         }
     );
     assert!(request.print_request);
@@ -102,6 +104,10 @@ fn seam_flags_are_unknown_without_the_feature() {
     assert_eq!(
         problems(&refs(&with(&RUN, &["--test-print-request", "--", "cmd"]))),
         ["gate: unknown option --test-print-request"]
+    );
+    assert_eq!(
+        problems(&refs(&with(&RUN, &["--test-diagnostics-fail", "--", "cmd"]))),
+        ["gate: unknown option --test-diagnostics-fail"]
     );
     assert_eq!(
         problems(&["stop-tree", "--test-print-request", "1"]),

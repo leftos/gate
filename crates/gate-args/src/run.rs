@@ -40,6 +40,8 @@ pub(crate) enum SwitchOption {
     InterruptQueued,
     #[cfg(feature = "test-seams")]
     SamplerFail,
+    #[cfg(feature = "test-seams")]
+    DiagnosticsFail,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -149,6 +151,8 @@ impl RunBuilder {
             SwitchOption::InterruptQueued => self.test_seams.interrupt_queued = on,
             #[cfg(feature = "test-seams")]
             SwitchOption::SamplerFail => self.test_seams.sampler_fail = on,
+            #[cfg(feature = "test-seams")]
+            SwitchOption::DiagnosticsFail => self.test_seams.diagnostics_fail = on,
         }
     }
 

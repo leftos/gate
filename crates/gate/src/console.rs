@@ -38,10 +38,6 @@ impl Console {
     }
 
     /// Gathers `line` as a note for the log without saying it on stdout or stderr.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "no caller outside tests until a routed run's refused attempt gathers its lines")
-    )]
     pub(crate) fn note(&mut self, line: &str) {
         self.notes.push(line.to_owned());
     }

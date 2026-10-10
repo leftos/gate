@@ -9,7 +9,9 @@ mod heartbeat;
 mod share;
 mod watch;
 
-pub use diagnostics::{ProcessFacts, Report, SampleFacts, SampleHistory, ServerFacts, WslVm, failed_line, lines};
+pub use diagnostics::{
+    JOB_LINES, OUTSIDE_LINES, ProcessFacts, Report, SampleFacts, SampleHistory, ServerFacts, WslVm, failed_block, failed_line, lines,
+};
 pub use heartbeat::{BeatClock, CpuSource, Pump, Ticker};
 pub use share::{Machine, SystemTimes, Ticks, free_share};
 pub use watch::{Config, Kill, Sample, Watch, sampler_failed_line};

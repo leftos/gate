@@ -6,11 +6,16 @@ use std::collections::VecDeque;
 
 use crate::share::Ticks;
 
-/// The job processes the block gives a line each; the rest are counted on one line.
-const JOB_LINES: usize = 40;
+/// The heading of the block, its first line.
+pub const HEADING: &str = "gate: diagnostics";
 
-/// The processes outside the job the block gives a line each; the rest are counted on one line.
-const OUTSIDE_LINES: usize = 20;
+/// The job processes the block gives a line each; the rest are counted on one line. A gatherer reads at most this many
+/// of them and counts the rest unread.
+pub const JOB_LINES: usize = 40;
+
+/// The processes outside the job the block gives a line each; the rest are counted on one line. A gatherer reads at
+/// most this many of them and counts the rest unread.
+pub const OUTSIDE_LINES: usize = 20;
 
 /// The samples the block lists and a [`SampleHistory`] keeps, the last ones.
 const SAMPLES: usize = 6;
@@ -145,7 +150,7 @@ impl SampleHistory {
 /// build servers, the last samples, and when the gathering was cut.
 #[must_use]
 pub fn lines(report: &Report) -> Vec<String> {
-    let mut lines = vec!["gate: diagnostics".to_owned()];
+    let mut lines = vec![HEADING.to_owned()];
     let mut job: Vec<&ProcessFacts> = report.job.iter().collect();
     job.sort_by_key(|process| process.pid);
     push_processes(&mut lines, "job", job.into_iter(), report.job_unread, JOB_LINES);
@@ -165,6 +170,12 @@ pub fn lines(report: &Report) -> Vec<String> {
 #[must_use]
 pub fn failed_line(message: &str) -> String {
     format!("gate: diagnostics failed: {}", one_line(message.trim_end_matches(['\r', '\n'])))
+}
+
+/// The whole block when the gathering failed: the heading, then [`failed_line`].
+#[must_use]
+pub fn failed_block(message: &str) -> Vec<String> {
+    vec![HEADING.to_owned(), failed_line(message)]
 }
 
 /// Up to `limit` lines for the processes `read` under `label`, then a line counting the rest, the `unread` ones with
@@ -580,6 +591,14 @@ mod tests {
         let mut report = empty();
         report.cut_at_ms = Some(0);
         assert_eq!(lines(&report).last().map(String::as_str), Some("gate:   ... diagnostics cut at 0 ms"));
+    }
+
+    #[test]
+    fn a_failed_block_is_the_heading_and_the_failed_line() {
+        assert_eq!(
+            failed_block("no snapshot"),
+            ["gate: diagnostics", "gate: diagnostics failed: no snapshot"]
+        );
     }
 
     #[test]

@@ -11,6 +11,7 @@ mod ceiling;
 mod checkout;
 mod cli;
 mod compat;
+mod diagnostics;
 mod harness;
 mod hold;
 mod install;

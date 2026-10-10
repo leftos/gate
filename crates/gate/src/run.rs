@@ -538,19 +538,27 @@ impl Run<'_> {
     }
 
     /// Ends the run as the watch ended it: a command that exited has its verdict; one killed as stalled, timed out or
-    /// past the backstop has its kill line said, its job terminated and the verdict of status 124; an interrupted one
-    /// is given 5 s to end before its job is stopped, and has the verdict of its own status, neither scanned for
-    /// markers.
+    /// past the backstop has its diagnostics written to the log, its kill line and the pointer to them said, its job
+    /// terminated and the verdict of status 124; an interrupted one is given 5 s to end before its job is stopped, and
+    /// has the verdict of its own status, neither scanned for markers.
     fn after_watch(&mut self, watched: Watched, timing: Timing, started: (&Job, &Running), console: &mut Console) -> Ended {
         let (job, running) = started;
         match watched {
             Watched::Exited(code) => {
                 let exited = i64::from(code.cast_signed());
-                self.ended(&Outcome { exited, timing, kill: None }, false, started, console)
+                self.ended(&Outcome { exited, timing, kill: None }, false, &[], started, console)
             }
-            Watched::Killed { line, processes } => {
+            Watched::Killed {
+                line,
+                processes,
+                diagnostics,
+            } => {
+                for note in &diagnostics {
+                    console.note(note);
+                }
                 console.err(&line);
                 kill(job, running, processes, console);
+                console.err(&format!("gate: diagnostics written to {}", self.log.path().display()));
                 let exited = i64::from(STOPPED);
                 self.ended(
                     &Outcome {
@@ -559,20 +567,22 @@ impl Run<'_> {
                         kill: Some(&line),
                     },
                     true,
+                    &diagnostics,
                     started,
                     console,
                 )
             }
             Watched::Interrupted => {
                 let exited = interrupted(job, running, console);
-                self.ended(&Outcome { exited, timing, kill: None }, true, started, console)
+                self.ended(&Outcome { exited, timing, kill: None }, true, &[], started, console)
             }
         }
     }
 
     /// Reaches the verdict of `outcome`, its markers not scanned when `unscanned`, and the facts its release carries.
-    fn ended(&mut self, outcome: &Outcome<'_>, unscanned: bool, started: (&Job, &Running), console: &mut Console) -> Ended {
-        match self.verdict(outcome.exited, Some(outcome.timing), unscanned, console) {
+    /// `diagnostics` is the block a kill wrote to the log, whose lines the verdict's tail leaves out.
+    fn ended(&mut self, outcome: &Outcome<'_>, unscanned: bool, diagnostics: &[String], started: (&Job, &Running), console: &mut Console) -> Ended {
+        match self.verdict(outcome.exited, Some(outcome.timing), unscanned, diagnostics, console) {
             Ok(status) => Ended {
                 status,
                 facts: Some(RunFacts {
@@ -592,7 +602,7 @@ impl Run<'_> {
             None => format!("gate: could not start {word}: {message}"),
         };
         console.err(&line);
-        match self.verdict(NOT_STARTED, None, false, console) {
+        match self.verdict(NOT_STARTED, None, false, &[], console) {
             Ok(status) => Ended { status, facts: None },
             Err(problem) => self.gate_failed(&problem, None, console),
         }
@@ -600,14 +610,22 @@ impl Run<'_> {
 
     /// Completes the log with the notes so far, and says the marker lines of a failure, the log's tail and the verdict
     /// line; the gate's status. `exited` is the command's status, and `timing` how long it ran, `None` when it never
-    /// started; a run the gate ended itself is `unscanned`, its markers not read.
-    fn verdict(&mut self, exited: i64, timing: Option<Timing>, unscanned: bool, console: &mut Console) -> Result<i64, String> {
+    /// started; a run the gate ended itself is `unscanned`, its markers not read. `diagnostics` is the block a kill
+    /// wrote to the log: the log keeps it, and the tail leaves exactly its lines out.
+    fn verdict(
+        &mut self,
+        exited: i64,
+        timing: Option<Timing>,
+        unscanned: bool,
+        diagnostics: &[String],
+        console: &mut Console,
+    ) -> Result<i64, String> {
         let shown = self.log.path().display().to_string();
         self.log
             .finish(console)
             .map_err(|error| format!("cannot complete the log {shown}: {error}"))?;
         let (found, tail) = self
-            .read_back(unscanned)
+            .read_back(unscanned, diagnostics)
             .map_err(|error| format!("cannot read the log {shown}: {error}"))?;
         let mut status = exited;
         if status == 0 && !found.is_empty() {
@@ -637,14 +655,17 @@ impl Run<'_> {
         Ok(status)
     }
 
-    /// The log's first marker lines, none when the run turned the scan off or is `unscanned`, and its tail.
-    fn read_back(&self, unscanned: bool) -> io::Result<(Vec<Marker>, Vec<String>)> {
+    /// The log's first marker lines, none when the run turned the scan off or is `unscanned`, and its tail: the last
+    /// [`RunRequest::tail`] lines of the log with the block `diagnostics` a kill wrote dropped by position, so the
+    /// command's own output and the kill's lines fill the tail whatever the block's size.
+    fn read_back(&self, unscanned: bool, diagnostics: &[String]) -> io::Result<(Vec<Marker>, Vec<String>)> {
         let found = if self.request.no_markers || unscanned {
             Vec::new()
         } else {
             self.log.markers()?
         };
-        Ok((found, self.log.tail(self.request.tail)?))
+        let wanted = self.request.tail.saturating_add(u64::try_from(diagnostics.len()).unwrap_or(u64::MAX));
+        Ok((found, tail_without_block(self.log.tail(wanted)?, diagnostics, self.request.tail)))
     }
 
     /// Says the gate's own failure, terminates the job of a command that started, and completes the log; status 1.
@@ -741,6 +762,26 @@ fn await_stopped(running: &Running, console: &mut Console) -> Option<u32> {
             None
         }
     }
+}
+
+/// The tail of `lines` for a kill that wrote `block`: the last contiguous run equal to `block` is dropped by position,
+/// and the last `count` lines of what is left are the tail. Nothing is dropped by content, so a command line equal to a
+/// block line is still shown.
+fn tail_without_block(mut lines: Vec<String>, block: &[String], count: u64) -> Vec<String> {
+    if let Some(at) = last_run(&lines, block) {
+        lines.drain(at..at + block.len());
+    }
+    let wanted = usize::try_from(count).unwrap_or(usize::MAX);
+    let extra = lines.len().saturating_sub(wanted);
+    lines.drain(..extra);
+    lines
+}
+
+/// The index the last run of `lines` equal to `block` starts at, or `None` when `block` occurs nowhere.
+fn last_run(lines: &[String], block: &[String]) -> Option<usize> {
+    (0..=lines.len().checked_sub(block.len())?)
+        .rev()
+        .find(|&at| &lines[at..at + block.len()] == block)
 }
 
 /// `seconds` in whole seconds, rounded half to even as the PowerShell gate's `[math]::Round` rounds.
