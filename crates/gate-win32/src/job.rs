@@ -28,6 +28,16 @@ pub struct Job {
     name: String,
 }
 
+// SAFETY: a job handle is a kernel object reference with no thread affinity: every call made through it
+// (`QueryInformationJobObject`, `AssignProcessToJobObject`, `TerminateJobObject`) may come from any thread, and the
+// kernel serialises them on the object. The handle is closed once, when the one `Job` owning it drops, so moving the
+// owner to another thread cannot close it twice.
+unsafe impl Send for Job {}
+
+// SAFETY: every method takes `&self` and only passes the handle to the thread-safe calls above, or reads the name,
+// which is never changed after creation; no `&Job` can close the handle, so sharing one between threads is sound.
+unsafe impl Sync for Job {}
+
 impl Job {
     /// Creates the job `name` (such as `Local\gate-job-<pid>`), with no limits and no kill-on-close.
     ///

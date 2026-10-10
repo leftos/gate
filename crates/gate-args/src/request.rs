@@ -29,11 +29,21 @@ pub enum Invocation {
     Box(BoxRequest),
 }
 
-/// A valid `gate box`: the verb, and the payload word as given, base64 of UTF-8 JSON that the binary decodes.
+/// A valid `gate box`: the verb, the payload word as given, base64 of UTF-8 JSON that the binary decodes, and the
+/// hidden seams given before the verb.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BoxRequest {
     pub verb: BoxVerb,
     pub payload: OsString,
+    pub seams: BoxSeams,
+}
+
+/// What the black-box suite sets on `gate box` through the hidden `--test-*` flags given before the verb; all `None` in
+/// a gate built without the `test-seams` feature.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BoxSeams {
+    /// The period of `gate box run`'s heartbeat, in milliseconds.
+    pub heartbeat_ms: Option<u64>,
 }
 
 /// What `gate box` was asked to do on the builder.

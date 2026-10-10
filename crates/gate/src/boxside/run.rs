@@ -15,12 +15,15 @@ use std::io;
 use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 use std::time::Duration;
 
+use gate_watchdog::Pump;
 use gate_win32::{Job, LaunchError, PipedLaunch, PipedSuspended, Running};
 
 use crate::answer::USAGE_STATUS;
 use crate::boxside::forward::{DRAIN, Forwarders, OutputLock};
+use crate::boxside::heartbeat;
 use crate::boxside::payload::{Payload, ordinal_upper};
 use crate::boxside::preflight::{Failed, GIT_REDIRECTS, Git, exit_code};
 use crate::boxside::stop::{STOPPED, still_holding, terminate_and_wait};
@@ -109,8 +112,9 @@ fn identity(payload: &Payload) -> Result<Vec<(String, String)>, String> {
 /// Runs the payload's command in its work folder and returns the status: the command's own whole 32-bit code, 127
 /// when it could not be started, 75 when another run holds the work folder, 2 for a payload or a word refused, a
 /// failing git step's status, 1 when the box failed or the tree of a passed command could not be committed back, or
-/// 255 when the client closed the connection and the box stopped the job.
-pub(crate) fn run(payload: &Payload, console: &mut Console) -> u32 {
+/// 255 when the client closed the connection and the box stopped the job. Once the subfolder is checked, a heartbeat
+/// goes to stderr every `period` until the run ends.
+pub(crate) fn run(payload: &Payload, period: Duration, console: &mut Console) -> u32 {
     let request = match Request::read(payload) {
         Ok(request) => request,
         Err(line) => {
@@ -131,14 +135,37 @@ pub(crate) fn run(payload: &Payload, console: &mut Console) -> u32 {
             return FAILED_STATUS;
         }
     };
-    match in_work_folder(&request, console) {
+    match in_work_folder(&request, period, console) {
         Ok(status) | Err(status) => status,
     }
 }
 
+/// What the run writes besides its console lines: the lock every line on the box's own output takes, and the
+/// heartbeat pump writing under it, `None` when it could not be started.
+struct Beat<'a> {
+    lock: &'a OutputLock,
+    pump: Option<&'a Pump>,
+}
+
+impl Beat<'_> {
+    /// Has the heartbeat count the CPU of `job` and the box's build servers from now on.
+    fn watch(&self, job: &Arc<Job>) {
+        if let Some(pump) = self.pump {
+            pump.watch(heartbeat::job_cpu(Arc::clone(job)));
+        }
+    }
+
+    /// Has the heartbeat write every period again.
+    fn unwatch(&self) {
+        if let Some(pump) = self.pump {
+            pump.unwatch();
+        }
+    }
+}
+
 /// The run once the lock is held: `Ok` with the status after the back commit, or `Err` with the status of a run that
-/// ended before it, its lines said.
-fn in_work_folder(request: &Request<'_>, console: &mut Console) -> Result<u32, u32> {
+/// ended before it, its lines said. The heartbeat starts once the subfolder is checked and stops on every way out.
+fn in_work_folder(request: &Request<'_>, period: Duration, console: &mut Console) -> Result<u32, u32> {
     let git = WorkGit::ready(request);
     // Refused before the checkout, so a payload naming a folder outside the work folder changes nothing there; the
     // earlier run's back ref goes, as the checkout's would, so the client finds none to fetch.
@@ -150,12 +177,34 @@ fn in_work_folder(request: &Request<'_>, console: &mut Console) -> Result<u32, u
         git.clear_back_ref(request).map_err(|failed| said(console, &failed))?;
         return Err(u32::from(USAGE_STATUS));
     };
+    let lock = OutputLock::default();
+    // A heartbeat that cannot start ends the heartbeats, never the run.
+    let pump = heartbeat::start(&lock, period)
+        .inspect_err(|error| console.err(&format!("gate: remote heartbeat stopped: cannot start the heartbeat: {error}")))
+        .ok();
+    let beat = Beat {
+        lock: &lock,
+        pump: pump.as_ref(),
+    };
+    let ran = checked_out(request, &git, &place, &beat, console);
+    if let Some(pump) = pump {
+        // Bounded, so a client that stopped reading cannot keep the work folder's lock held. Nothing is said for a
+        // pump left stuck or one that panicked: the stuck stream is the one it would be said on, and a panicking pump
+        // has already said so itself whenever it still could. The run's status stands either way.
+        let _ = pump.stop_within(DRAIN);
+    }
+    ran
+}
+
+/// The run once the heartbeat beats: the snapshot checked out, the command seen to its end in `place`, and the tree it
+/// left committed back; the status as [`in_work_folder`] gives it.
+fn checked_out(request: &Request<'_>, git: &WorkGit, place: &Path, beat: &Beat<'_>, console: &mut Console) -> Result<u32, u32> {
     git.checkout(request).map_err(|failed| said(console, &failed))?;
     if !place.is_dir() {
         console.err(&format!("gate: remote subfolder {} does not exist in the snapshot", request.subfolder));
         return Err(u32::from(USAGE_STATUS));
     }
-    let mut status = command(request, &place, console)?;
+    let mut status = command(request, place, beat, console)?;
     if let Err(message) = git.back_commit(request, console) {
         console.err(&format!("gate: remote sync-back failed: {message}"));
         if status == 0 {
@@ -226,8 +275,8 @@ fn full_path(path: &Path) -> Option<PathBuf> {
 
 /// Starts the command in `place` and sees it to its end: `Ok` with its status (127 when it could not be started), or
 /// `Err` with the status of a run that ends here, its line said: 2 for a batch word refused, 1 for the box's own
-/// failure, 255 for a client that closed the connection.
-fn command(request: &Request<'_>, place: &Path, console: &mut Console) -> Result<u32, u32> {
+/// failure, 255 for a client that closed the connection. The heartbeat watches the job while [`watch`] waits for it.
+fn command(request: &Request<'_>, place: &Path, beat: &Beat<'_>, console: &mut Console) -> Result<u32, u32> {
     let variables = Variables::from_process();
     let environment = variables
         .block()
@@ -261,7 +310,7 @@ fn command(request: &Request<'_>, place: &Path, console: &mut Console) -> Result
     };
     let running = suspended.assign_and_resume(&job).map_err(|error| failed(console, &error.to_string()))?;
     let mut stopper = Stopper { job: &job, armed: true };
-    let watched = watch(&job, &running, Pipes { stdout, stderr }, console);
+    let watched = watch(&job, &running, Pipes { stdout, stderr }, beat, console);
     stopper.armed = false;
     watched
 }
@@ -286,9 +335,10 @@ fn start_failed(console: &mut Console, word: &str, program: &Path, code: u32, me
 }
 
 /// Creates the run's job `name`; a name some job already has is refused, so a run never shares a job and a stop meant
-/// for an earlier run never reaches it. Else the status 1, its line said.
-fn create_job(name: &str, console: &mut Console) -> Result<Job, u32> {
-    Job::create(name).map_err(|error| {
+/// for an earlier run never reaches it; shared, so the heartbeat's thread can read its CPU. Else the status 1, its line
+/// said.
+fn create_job(name: &str, console: &mut Console) -> Result<Arc<Job>, u32> {
+    Job::create(name).map(Arc::new).map_err(|error| {
         if error.kind() == io::ErrorKind::AlreadyExists {
             console.err(&format!("gate: the job {name} already exists; a run's job name must be new"));
             FAILED_STATUS
@@ -324,10 +374,10 @@ struct Pipes {
 /// [`DRAIN`]; the command's exit code. A failed write to the box's own output means the client closed the connection,
 /// whenever it is noticed: the command's job is stopped then, before the readers drain or after them, and
 /// [`CLOSED_STATUS`] answered for it instead. Should the box fail first, the job is terminated, so the command does
-/// not outlive a run that no longer watches it.
-fn watch(job: &Job, running: &Running, pipes: Pipes, console: &mut Console) -> Result<u32, u32> {
-    let lock = OutputLock::default();
-    let forwarders = match Forwarders::start(pipes.stdout, pipes.stderr, &lock) {
+/// not outlive a run that no longer watches it. The heartbeat watches the job once the readers drain its pipes, so no
+/// CPU read runs while the command's output is left unread, and stops watching it once the wait ends, however it ends.
+fn watch(job: &Arc<Job>, running: &Running, pipes: Pipes, beat: &Beat<'_>, console: &mut Console) -> Result<u32, u32> {
+    let forwarders = match Forwarders::start(pipes.stdout, pipes.stderr, beat.lock) {
         Ok(forwarders) => forwarders,
         Err(error) => {
             let status = failed(console, &format!("cannot start reading the command's output: {error}"));
@@ -335,31 +385,52 @@ fn watch(job: &Job, running: &Running, pipes: Pipes, console: &mut Console) -> R
             return Err(status);
         }
     };
-    let code = loop {
-        match running.wait(WAIT_STEP) {
-            Ok(Some(code)) => break code,
-            Ok(None) => {
-                if forwarders.pipe_closed() {
-                    let ending = terminate_and_wait(job);
-                    forwarders.drain(DRAIN);
-                    return Err(closed_connection(job, ending, console));
-                }
-            }
-            Err(error) => {
-                let status = failed(console, &format!("cannot wait for the command: {error}"));
-                end_job(job, console);
-                return Err(status);
-            }
+    beat.watch(job);
+    let waited = wait_for_exit(job, running, &forwarders, console);
+    beat.unwatch();
+    let code = match waited {
+        WaitEnd::Exited(code) => code,
+        WaitEnd::ClientGone => {
+            let ending = terminate_and_wait(job.as_ref());
+            forwarders.drain(DRAIN);
+            return Err(closed_connection(job, ending, console));
         }
+        WaitEnd::Failed(status) => return Err(status),
     };
     let drained = forwarders.drain(DRAIN);
     if drained.pipe_closed {
-        return Err(closed_connection(job, terminate_and_wait(job), console));
+        return Err(closed_connection(job, terminate_and_wait(job.as_ref()), console));
     }
     if !drained.all_ended {
         console.err("gate: remote command's output is still held open by a leftover process; stopped reading");
     }
     Ok(code)
+}
+
+/// How the wait for the command's main process ended.
+enum WaitEnd {
+    /// It exited with this code.
+    Exited(u32),
+    /// A write to the box's own output failed first: the client closed the connection.
+    ClientGone,
+    /// The box could not wait for it: the status 1, its line said and its job terminated.
+    Failed(u32),
+}
+
+/// Waits for the command's main process to exit, looking every [`WAIT_STEP`] whether the client is still there.
+fn wait_for_exit(job: &Job, running: &Running, forwarders: &Forwarders, console: &mut Console) -> WaitEnd {
+    loop {
+        match running.wait(WAIT_STEP) {
+            Ok(Some(code)) => return WaitEnd::Exited(code),
+            Ok(None) if forwarders.pipe_closed() => return WaitEnd::ClientGone,
+            Ok(None) => {}
+            Err(error) => {
+                let status = failed(console, &format!("cannot wait for the command: {error}"));
+                end_job(job, console);
+                return WaitEnd::Failed(status);
+            }
+        }
+    }
 }
 
 /// The answer to a run whose client closed the connection, its job's `ending` already decided and its readers already

@@ -494,7 +494,7 @@ The arithmetic (stall progress, the free share, the clock, the three kills and t
 
 `<p>` is the free share averaged over the wall time the ceiling counted (paused seconds left out), a whole number rounded half to even, 100 while nothing is counted; the seconds are rounded the same way. After a sampler failure only the backstop is read.
 
-The box heartbeat (BW9) is the box wrapper's command-time heartbeat, not the wait heartbeat: a pump thread writes `gate-remote-heartbeat: <cpu ms>` every period, and while a command is watched only when the CPU used since the last beat is at least 1% of the time elapsed since it. A failed CPU read writes `gate: remote heartbeat stopped: <message>` and ends the heartbeats, never the run. Nothing in the `gate` binary calls the crate yet.
+The box heartbeat (BW9) is the box wrapper's command-time heartbeat, not the wait heartbeat: a pump thread writes `gate-remote-heartbeat: <cpu ms>` every period, and while a command is watched only when the CPU used since the last beat is at least 1% of the time elapsed since it. A failed CPU read writes `gate: remote heartbeat stopped: <message>` and ends the heartbeats, never the run. `gate box run` is the crate's caller ([The box side](#the-box-side)).
 
 ## Command launching
 
@@ -654,7 +654,9 @@ For `run` the payload also needs a `Snapshot` key: exactly 40 lowercase hex char
 
 The value is empty for a missing key or JSON null, the string as given with control characters escaped, and compact JSON for any other non-string. Two differences from the wrapper are deliberate: the echoed value has its control characters escaped, and the check is stricter than the wrapper's .NET `$`, which accepts a trailing newline.
 
-Every path comes from the payload and nothing is written under the gate's state root; `gate box` takes no `--state-dir`. Test seams are `test-seams`-gated flags, never environment variables, and sit before the verb (`gate box --test-... run <payload>`) in a `BoxSeams` struct on `BoxRequest`, apart from the `gate run` seams.
+Every path comes from the payload and nothing is written under the gate's state root; `gate box` takes no `--state-dir`. Test seams are `test-seams`-gated flags, never environment variables, and sit before the verb (`gate box --test-... run <payload>`) in a `BoxSeams` struct on `BoxRequest`, apart from the `gate run` seams, so `--test-print-request` is unchanged.
+
+The one box seam is `--test-heartbeat-ms <n>` (or `--test-heartbeat-ms=<n>`), the period of the command heartbeat. It is refused as the `gate run` seams are: no value, not a whole number above 0, above 2147483647, or given twice. Without the feature the word gets the box usage line.
 
 The box leaves build servers warm on purpose: it sets neither `MSBUILDDISABLENODEREUSE` (the local gate sets it to 1 for every command) nor a node handshake salt, so MSBuild nodes and compiler servers survive between runs and every work folder on the builder shares one node pool.
 
@@ -670,6 +672,18 @@ Built verbs:
 
   A folder or file that cannot be made prints `gate: remote could not create the folder <path>: <error>` or `gate: remote could not write <path>: <error>` and exits 1. An SDK list that cannot be read prints `gate: remote could not read the SDK list: <message>`, omits the sdks line and still exits 0.
 - **`run`** runs the payload's `Command` (a list of texts) in `Work`, and exits with the command's own whole 32-bit status after a successful run. Its stdout is the command's stdout, LF-terminated; its stderr is the command's stderr plus the box's own lines.
+
+  The heartbeat: `gate box run` writes `gate-remote-heartbeat: <cpu ms>` on stderr every 5 s, on `gate-watchdog`'s `BeatClock` and `Pump`. It writes unconditionally before the command starts (from just before the checkout) and after the command's wait ends. While the command runs it writes only when the CPU of the command's job, plus every build server on the box outside the job, since the last beat reaches 1% of the time since it.
+
+  Build servers are VBCSCompiler, and dotnet naming VBCSCompiler.dll or an MSBuild node, read by the gate's server reader. Every server counts as new, so warm MSBuild nodes count, as the PowerShell wrapper's BW9 does.
+
+  The `CpuSource` is a monotone running sum: a server new since the last read, or whose total fell (a reused id), adds its whole CPU, and an empty or failed process snapshot, or a server whose times could not be read, keeps the previous values. Another run's busy build on the box can keep a silent idle command alive until the wall-clock timeout, as in PowerShell.
+
+  A heartbeat line never splits a forwarded command line: the pump writes under the output lock the forwarders take (a git child's stderr does not take it yet, GATE-100).
+
+  A failed CPU read writes `gate: remote heartbeat stopped: cannot read the CPU of job <name>: <error>` (or `... cannot list the processes of job <name>: <error>`) and a thread that cannot start writes `gate: remote heartbeat stopped: cannot start the heartbeat: <error>`; the heartbeats end and the run does not.
+
+  Ending the heartbeat waits at most 2 s (`Pump::stop_within`), so a pump stuck on a client that stopped reading is left behind and the work folder's lock is released.
 
   Payload refusals exit 2, each on stderr. The command's own: `gate: box payload Command is not a list of texts`, `gate: box payload lacks Command`, `gate: box payload Subfolder is not a text`, `gate: box payload Identity is not an object of texts`, `gate: box payload Identity may set only GIT_AUTHOR_* and GIT_COMMITTER_* names: <name>` and `gate: box payload Identity <name> holds a NUL`.
 
@@ -710,9 +724,8 @@ Built verbs:
 
   Processes still alive 10 s after the termination print `gate: remote job <name> still has <n> process(es) 10 s after it was terminated` and exit 1, and a job that cannot be terminated prints `gate: remote could not stop job <name>: <error>` and exits 1.
 
-`outputs` prints `gate: box outputs is not built yet` and exits 70. The heartbeat and the console belong to later parts of the remote port (GATE-61) and are planned, not built:
+`outputs` prints `gate: box outputs is not built yet` and exits 70. The console belongs to a later part of the remote port (GATE-61) and is planned, not built:
 
-- **The heartbeat** runs on `gate-watchdog`'s `BeatClock` and `Pump`. It counts the job's CPU alone; whether it also counts the build servers the watchdog now reads is GATE-84's to settle. Its `CpuSource` returns a monotone running sum, since `Pump` takes deltas of a cumulative total. A failed heartbeat write does not stop the job.
 - **The console** is a UTF-8 console from the donor-console method, as the PowerShell wrapper does it.
 
   A restart into a replacement console keeps the same job: the job is never terminated for it, its processes are killed one by one through their process ids until none remain, and the command is relaunched into the same job, so there is no window without a job, a `stop` that arrives meanwhile still finds it, and the client needs no change. A run whose relaunch fails because a `stop` emptied the job exits 1 with `gate: the gate failed while running the command: <problem>`.
@@ -788,7 +801,7 @@ Rules:
 A Rust integration suite drives the built `gate.exe` through its CLI and reads only what it writes: exit codes, stdout, stderr, the log, the journal, claims and tickets.
 
 - **Own state root per case.** Every case creates a fresh folder under the target directory's temporary folder. The folder is the case's working folder, holding its logs and its `LOCALAPPDATA`, and its `state` subfolder is the `--state-dir`, so cases never touch the machine's real slots, journal or counts, or each other's. Cases run side by side.
-- **Test seams.** Hidden `--test-*` flags, compiled only with the `test-seams` cargo feature, set the timing knobs: `--test-sample-ms` (sample period), `--test-heartbeat-ms` (wait heartbeat), `--test-poll-ms` (fallback poll) and `--test-stall-ms` (stall window below a second). Each takes whole milliseconds above 0 on `gate run`. The sample and stall knobs drive the watchdog.
+- **Test seams.** Hidden `--test-*` flags, compiled only with the `test-seams` cargo feature, set the timing knobs: `--test-sample-ms` (sample period), `--test-heartbeat-ms` (wait heartbeat; on `gate box` the command heartbeat's period), `--test-poll-ms` (fallback poll) and `--test-stall-ms` (stall window below a second). Each takes whole milliseconds above 0 on `gate run`. The sample and stall knobs drive the watchdog.
 
   Two more seams make a run end by Ctrl+C without a console: `--test-interrupt-after-samples <n>` raises the interrupt after the n-th sample, and `--test-interrupt-queued` raises it when the waiting line is printed, so once no slot is free for the gate. `--test-print-request` shows them as `testSeams.interruptAfterSamples` and `testSeams.interruptQueued`.
 

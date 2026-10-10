@@ -27,7 +27,7 @@ pub use batch::{BatchRefusal, batch_command_line, batch_refusal, is_batch_target
 pub use cmdline::{command_line, command_text, quote_arg, quote_arg_str};
 pub use problem::{MAX_WHOLE_NUMBER, Problem, Required, Spelling};
 pub use program::{ProgramSearch, resolve_program};
-pub use request::{BoxRequest, BoxVerb, DEFAULT_STALL_SECONDS, DEFAULT_TAIL_LINES, Invocation, RunRequest, Slot, StopRequest, TestSeams};
+pub use request::{BoxRequest, BoxSeams, BoxVerb, DEFAULT_STALL_SECONDS, DEFAULT_TAIL_LINES, Invocation, RunRequest, Slot, StopRequest, TestSeams};
 pub use usage::USAGE;
 
 /// Reads the gate's arguments, without the program name.

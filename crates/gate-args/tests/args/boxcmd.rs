@@ -2,7 +2,7 @@
 
 use std::ffi::OsString;
 
-use gate_args::{BoxRequest, BoxVerb, Invocation, USAGE};
+use gate_args::{BoxRequest, BoxSeams, BoxVerb, Invocation, USAGE};
 
 use crate::support::{invocation, os, problems, problems_of, unreadable_word};
 
@@ -22,6 +22,7 @@ fn each_verb_parses_with_its_payload_word_unread() {
             Invocation::Box(BoxRequest {
                 verb,
                 payload: OsString::from("not even base64"),
+                seams: BoxSeams::default(),
             }),
             "{word}"
         );
@@ -57,6 +58,7 @@ fn a_payload_that_is_not_unicode_is_passed_on() {
         Invocation::Box(BoxRequest {
             verb: BoxVerb::Boot,
             payload: unreadable_word(),
+            seams: BoxSeams::default(),
         })
     );
 }

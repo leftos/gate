@@ -95,6 +95,8 @@ struct State {
     clock: BeatClock,
     notice: Option<String>,
     stopped: bool,
+    /// Set once the pump's thread has ended, however it ended.
+    finished: bool,
     panicked: Option<String>,
 }
 
@@ -119,6 +121,7 @@ impl Pump {
                 clock: BeatClock::new(),
                 notice: None,
                 stopped: false,
+                finished: false,
                 panicked: None,
             }),
             wake: Condvar::new(),
@@ -126,9 +129,10 @@ impl Pump {
         });
         let thread = {
             let shared = Arc::clone(&shared);
-            thread::Builder::new()
-                .name(THREAD_NAME.to_string())
-                .spawn(move || pump(writer, period, &shared))?
+            thread::Builder::new().name(THREAD_NAME.to_string()).spawn(move || {
+                let _finished = Finished(&shared);
+                pump(writer, period, &shared);
+            })?
         };
         Ok(Self {
             shared,
@@ -165,6 +169,40 @@ impl Pump {
     #[must_use = "the panic a pump hit is reported only by this Result"]
     pub fn stop(mut self) -> Result<(), String> {
         self.signal_stop();
+        self.joined()
+    }
+
+    /// Signals the pump to stop and waits at most `limit` for its thread to end; a thread still stuck in a write then
+    /// is left to end on its own, or with the process, so a reader that stopped reading cannot hold up the caller.
+    ///
+    /// # Errors
+    ///
+    /// What the pump's thread panicked with, as [`Pump::stop`] reports it, or that it did not end within `limit`.
+    #[must_use = "the panic a pump hit is reported only by this Result"]
+    pub fn stop_within(mut self, limit: Duration) -> Result<(), String> {
+        self.signal_stop();
+        let finished = {
+            let state = lock(&self.shared.state);
+            let (state, _) = self
+                .shared
+                .wake
+                .wait_timeout_while(state, limit, |state| !state.finished)
+                .unwrap_or_else(PoisonError::into_inner);
+            state.finished
+        };
+        if !finished {
+            // Dropping the handle detaches the thread, still blocked in its write.
+            drop(self.thread.take());
+            return Err(format!(
+                "the heartbeat pump did not stop within {} ms and was left to end on its own",
+                limit.as_millis()
+            ));
+        }
+        self.joined()
+    }
+
+    /// Joins the pump's thread, already told to stop, and reports what it panicked with.
+    fn joined(&mut self) -> Result<(), String> {
         let joined = match self.thread.take().map(JoinHandle::join) {
             Some(Err(payload)) => Some(panic_message(payload.as_ref())),
             _ => None,
@@ -187,6 +225,17 @@ impl Drop for Pump {
     fn drop(&mut self) {
         // The thread is detached, so a write a stuck pipe blocks cannot hold up the process ending.
         self.signal_stop();
+    }
+}
+
+/// Marks the pump's thread finished when dropped, on its way out whether it returned or unwound, and wakes a caller
+/// waiting for it.
+struct Finished<'a>(&'a Shared);
+
+impl Drop for Finished<'_> {
+    fn drop(&mut self) {
+        lock(&self.0.state).finished = true;
+        self.0.wake.notify_all();
     }
 }
 
@@ -827,6 +876,34 @@ mod tests {
             Err("the pipe blew up".to_string()),
             "a thread that died inside the panic line is still reported"
         );
+    }
+
+    #[test]
+    fn heartbeat_stop_within_returns_once_a_free_pump_ends() {
+        let (events, seen) = channel();
+        let pump = Pump::start(ReportingWriter { events }, Arc::new(ZeroTicker), PERIOD).expect("the pump starts");
+        assert_eq!(next_line(&seen), IDLE_LINE);
+        assert_eq!(pump.stop_within(GUARD), Ok(()), "a pump free to end ends, and reports nothing");
+    }
+
+    /// A writer blocked for good must not hold up a bounded stop: it returns saying so, and leaves the thread behind.
+    #[test]
+    fn heartbeat_stop_within_leaves_a_pump_stuck_in_its_writer() {
+        let (entered, entered_seen) = channel();
+        let (release, held) = channel::<()>();
+        let writer = StuckWriter {
+            entered,
+            held,
+            log: Arc::new(Mutex::new(Vec::new())),
+            blocked: false,
+        };
+        let pump = Pump::start(writer, Arc::new(ZeroTicker), PERIOD).expect("the pump starts");
+        assert!(entered_seen.recv_timeout(GUARD).is_ok(), "the pump reached its write");
+        assert_eq!(
+            pump.stop_within(Duration::from_millis(20)),
+            Err("the heartbeat pump did not stop within 20 ms and was left to end on its own".to_string())
+        );
+        let _ = release.send(());
     }
 
     /// A write that blocks must not hold up `watch` or `unwatch`. A regression here shows as a hang the gate's own

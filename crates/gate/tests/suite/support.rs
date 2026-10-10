@@ -263,6 +263,20 @@ impl Running {
         wait_for_text(&self.stderr, "stderr", needle);
     }
 
+    /// Returns stderr so far once `check` holds for it; fails saying `what` did not happen, with the stderr so far,
+    /// after the hang guard.
+    pub fn wait_for_stderr_where(&self, what: &str, check: impl Fn(&str) -> bool) -> String {
+        let deadline = Instant::now() + HANG_GUARD;
+        loop {
+            let text = text(&self.stderr);
+            if check(&text) {
+                return text;
+            }
+            assert!(Instant::now() < deadline, "{what} did not happen on stderr; stderr so far:\n{text}");
+            thread::sleep(POLL);
+        }
+    }
+
     /// Returns stdout so far once it contains `needle`; fails with the stdout so far after the hang guard.
     pub fn wait_for_stdout(&self, needle: &str) -> String {
         wait_for_text(&self.stdout, "stdout", needle)

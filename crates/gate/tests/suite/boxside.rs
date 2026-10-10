@@ -26,8 +26,20 @@ fn payload(json: &Value) -> String {
     STANDARD.encode(json.to_string())
 }
 
-/// The gate with `args` as they are, without the git variables the suite may have inherited.
+/// The heartbeat period every box call of the suite passes unless it says otherwise: long enough that no beat lands in
+/// a case's output however slow a loaded machine makes the run.
+const QUIET_HEARTBEAT_MS: &str = "2147483647";
+
+/// `gate box` with `args` after `box`, its heartbeat period [`QUIET_HEARTBEAT_MS`], without the git variables the
+/// suite may have inherited.
 fn box_command(case: &Case, args: &[&str]) -> Command {
+    let mut words = vec!["box", "--test-heartbeat-ms", QUIET_HEARTBEAT_MS];
+    words.extend_from_slice(args.strip_prefix(&["box"][..]).unwrap_or(args));
+    bare_box_command(case, &words)
+}
+
+/// The gate with `args` as they are, no seam added, without the git variables the suite may have inherited.
+fn bare_box_command(case: &Case, args: &[&str]) -> Command {
     let mut command = case.gate_without_state_dir(args);
     for name in GIT_REDIRECTS {
         command.env_remove(name);
@@ -355,25 +367,25 @@ fn box_usage_and_payload_errors_exit_2() {
     let case = Case::new("box_usage_and_payload_errors_exit_2");
     let folders = Folders::new(&case);
     for args in [&["box"][..], &["box", "launch", "e30="]] {
-        let outcome = finish(box_command(&case, args));
+        let outcome = finish(bare_box_command(&case, args));
 
         assert_eq!(outcome.code, Some(2), "{args:?}");
         assert_eq!(outcome.stdout, "", "{args:?}");
         assert_eq!(outcome.stderr, BOX_USAGE, "{args:?}: the box usage alone");
     }
 
-    let not_base64 = gate_box(&case, "preflight", "not-base64!", None);
+    let not_base64 = finish(bare_box_command(&case, &["box", "preflight", "not-base64!"]));
     assert_eq!(not_base64.code, Some(2));
     assert_eq!(not_base64.stdout, "");
     assert!(not_base64.stderr.starts_with("gate: box payload is not base64 JSON: "), "{not_base64:?}");
     assert_eq!(lines(&not_base64.stderr).len(), 1, "{not_base64:?}");
 
-    let not_an_object = gate_box(&case, "preflight", &payload(&json!(["Bare", "Work"])), None);
+    let not_an_object = finish(bare_box_command(&case, &["box", "preflight", &payload(&json!(["Bare", "Work"]))]));
     assert_eq!(not_an_object.code, Some(2));
     assert_eq!(not_an_object.stdout, "");
     assert_eq!(not_an_object.stderr, "gate: box payload is not base64 JSON: the JSON is not an object\n");
 
-    let lacking = gate_box(&case, "preflight", &payload(&json!({"Bare": folders.bare})), None);
+    let lacking = finish(bare_box_command(&case, &["box", "preflight", &payload(&json!({"Bare": folders.bare}))]));
     assert_eq!(lacking.code, Some(2));
     assert_eq!(lacking.stdout, "");
     assert_eq!(lacking.stderr, "gate: box payload lacks Work\n");
@@ -863,6 +875,40 @@ fn box_run_forwards_each_stream_line_by_line_ending_each_line_lf() {
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert_eq!(outcome.stdout, "a1\na2\nb\nc\nd\n", "CR LF and a lone CR each end a line");
     assert_eq!(outcome.stderr, "e1\ne2\n");
+}
+
+#[test]
+fn box_run_beats_while_a_busy_command_runs() {
+    let case = Case::new("box_run_beats");
+    let go = case.folder().join("go");
+    let go_word = shown(&go);
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "err", "started", "burn", &go_word, "exit", "7"]);
+    snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
+
+    let running = start(bare_box_command(
+        &case,
+        &["box", "--test-heartbeat-ms", "30", "run", &self::payload(&payload)],
+    ));
+    // Beats come before the command too, and one may slip in between its first line and the watch; of two after that
+    // line, the second came a period after the watch began, while the command burned.
+    let beats_after_started = |stderr: &str| {
+        stderr.split_once("started\n").map_or(0, |(_, after)| {
+            after.lines().filter(|line| line.starts_with("gate-remote-heartbeat: ")).count()
+        })
+    };
+    running.wait_for_stderr_where("two heartbeats after the command's first line", |stderr| beats_after_started(stderr) >= 2);
+    let_go(&go);
+    let outcome = running.finish();
+
+    assert_eq!(outcome.code, Some(7), "the command's own status: {outcome:?}");
+    assert_eq!(outcome.stdout, "burning\n", "no heartbeat on stdout: {outcome:?}");
+    let beat = Regex::new(r"^gate-remote-heartbeat: \d+$").expect("the pattern compiles");
+    let beats: Vec<&str> = outcome.stderr.lines().filter(|line| line.contains("gate-remote-heartbeat")).collect();
+    assert!(!beats.is_empty(), "{outcome:?}");
+    for line in beats {
+        assert!(beat.is_match(line), "a heartbeat is a whole line of its own: {line:?} in {outcome:?}");
+    }
+    wait_until_closed(Path::new(field(&payload, "Lock")));
 }
 
 #[test]

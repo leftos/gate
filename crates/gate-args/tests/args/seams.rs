@@ -221,6 +221,79 @@ fn the_servers_under_seam_needs_a_value_once() {
     );
 }
 
+/// The one line a malformed `gate box` prints.
+const BOX_USAGE: &str = "usage: gate box preflight|run|stop|boot|outputs <base64 JSON payload>";
+
+#[cfg(feature = "test-seams")]
+#[test]
+fn box_seam_heartbeat_ms_is_read_before_the_verb() {
+    use std::ffi::OsString;
+
+    use gate_args::{BoxRequest, BoxSeams, BoxVerb, Invocation};
+
+    use crate::support::invocation;
+
+    let beating = |heartbeat_ms| {
+        Invocation::Box(BoxRequest {
+            verb: BoxVerb::Run,
+            payload: OsString::from("e30="),
+            seams: BoxSeams { heartbeat_ms },
+        })
+    };
+    assert_eq!(invocation(&["box", "--test-heartbeat-ms", "30", "run", "e30="]), beating(Some(30)));
+    assert_eq!(invocation(&["box", "--test-heartbeat-ms=45", "run", "e30="]), beating(Some(45)));
+    assert_eq!(invocation(&["box", "run", "e30="]), beating(None), "no seam given, none set");
+    assert_eq!(
+        invocation(&["box", "--test-heartbeat-ms", "2147483647", "run", "e30="]),
+        beating(Some(2_147_483_647))
+    );
+}
+
+#[cfg(feature = "test-seams")]
+#[test]
+fn box_seam_heartbeat_ms_refuses_what_the_run_seams_refuse() {
+    let rows: [(&[&str], &[&str]); 10] = [
+        (
+            &["box", "--test-heartbeat-ms", "--test-heartbeat-ms=2", "run", "e30="],
+            &["gate: --test-heartbeat-ms needs a value", "gate: --test-heartbeat-ms is given twice"],
+        ),
+        (
+            &["box", "--test-heartbeat-ms=", "run", "e30="],
+            &["gate: --test-heartbeat-ms needs a value"],
+        ),
+        (
+            &["box", "--test-heartbeat-ms", "0", "run", "e30="],
+            &["gate: --test-heartbeat-ms must be a whole number above 0, got '0'"],
+        ),
+        (
+            &["box", "--test-heartbeat-ms", "fast", "run", "e30="],
+            &["gate: --test-heartbeat-ms must be a whole number above 0, got 'fast'"],
+        ),
+        (
+            &["box", "--test-heartbeat-ms", "2147483648", "run", "e30="],
+            &["gate: --test-heartbeat-ms must be at most 2147483647, got '2147483648'"],
+        ),
+        (
+            &["box", "--test-heartbeat-ms", "1", "--test-heartbeat-ms=2", "run", "e30="],
+            &["gate: --test-heartbeat-ms is given twice"],
+        ),
+        (&["box", "--test-heartbeat-ms"], &["gate: --test-heartbeat-ms needs a value", BOX_USAGE]),
+        (&["box", "run", "--test-heartbeat-ms", "30", "e30="], &[BOX_USAGE]),
+        (&["box", "--test-heartbeat-msx", "30", "run", "e30="], &[BOX_USAGE]),
+        (&["box", "--test-sample-ms", "30", "run", "e30="], &[BOX_USAGE]),
+    ];
+    for (words, want) in rows {
+        assert_eq!(problems(words), want, "{words:?}");
+    }
+}
+
+#[cfg(not(feature = "test-seams"))]
+#[test]
+fn box_seam_heartbeat_ms_is_an_unknown_word_without_the_feature() {
+    assert_eq!(problems(&["box", "--test-heartbeat-ms", "30", "run", "e30="]), [BOX_USAGE]);
+    assert_eq!(problems(&["box", "--test-heartbeat-ms=30", "run", "e30="]), [BOX_USAGE]);
+}
+
 #[cfg(not(feature = "test-seams"))]
 #[test]
 fn seam_flags_are_unknown_without_the_feature() {
