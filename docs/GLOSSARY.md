@@ -26,7 +26,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Fallback**: a routed run that runs locally instead, after its builder refused it or the remote pool stayed full; journalled as a `fallback` event with its reason.
 - **Fallback poll**: the short timeout on every slot wait, which re-reads counts and tickets so a dead waiter's ticket is cleared even when no wake event comes.
 - **Free share**: the fraction of the cores the command could use that other work left free in a sample, at least 5%; the load-adjusted clock advances by it.
-- **Heartbeat**: a line a waiting gate prints every 30 s so a gate around it does not read the wait as a stall.
+- **Heartbeat**: a line printed so a gate around the printer does not read quiet as a stall; the wait heartbeat is a waiting gate's `still waiting` line every 30 s, and the box heartbeat is the `gate-remote-heartbeat: <cpu ms>` line the box wrapper writes while its command's CPU use earns one.
 - **Heavy**: the slot kind for work that keeps several cores busy; its pool's thread budget is 4.
 - **History key**: a journal run's `command` after `gate_state::normalize_command`: split with the C runtime's argument rules, tree flags and their paths dropped, `.tmp` and worktree paths shortened, each word re-quoted; runs with the same key count together.
 - **Holds the machine**: said of a critical gate once it has taken every heavy and unreserved light slot.
@@ -44,6 +44,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Pool**: the set of slots of one kind (heavy, light, remote); pools never wait on each other.
 - **Preflight**: the box's first call of a routed run (`gate box preflight`): it creates the bare repo and the work folder and reports the gate version, the boot time and the SDKs.
 - **Probe by open**: reading whether a slot is held by opening its mutex's name: it is held while any handle to that name exists.
+- **Progress**: what resets the stall clock in a sample: the output size changed, the job's CPU reached 1% of one core over the stall window since the last progress, a new pid appeared, or a nested gate is paused.
 - **Pure crate**: a crate with no Windows types in its API that builds and unit-tests on Linux as well (`gate-state`, `gate-watchdog`, `gate-args`, `gate-router`).
 - **Refusal**: a builder's exit 75 with a reason (`busy`, `unreachable`, `parity`, `rebooted`, `tools`, `version`), which makes the routed run fall back.
 - **Release**: see take.
@@ -52,6 +53,8 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Rollover**: the move of `events.jsonl` over `events.1.jsonl` by the append that finds the journal at or above 5,242,880 bytes, followed by the archive of the rolled file.
 - **Root hash**: the first 8 hex digits of the SHA-256 of a non-default state root's path, carried in every kernel object name and slot marker of that root.
 - **Routed run**: a heavy gate whose command `remote.json` sends to a builder.
+- **Sample**: one reading of a running command taken every 5 s by the sampler: the system's CPU times, the job's CPU and pids, and the log's size; the watchdog's clocks advance only by samples.
+- **Sampler**: the Win32 side of the watchdog that takes the samples; if one fails, the watch goes by wall time alone.
 - **Shadow end**: the expected end of the slowest gate a critical drain waits on, which closes the lent window.
 - **Shim**: an extensionless script on PATH, such as the bash shims a plugin puts ahead of `uv` and `python`; program resolution skips it, since Windows cannot start it.
 - **Slot**: a named mutex in the session's `Local\` namespace that a gate holds for its command's whole run; the number of slots per pool caps how many commands run at once.

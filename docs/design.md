@@ -407,16 +407,24 @@ Changes from the PowerShell forms:
 All kept, with each knob's default unchanged:
 
 - The sampler (W1): every 5 s while the command runs, it reads the system times, one process snapshot, the job's accounting and process list, and the log and `.err` sizes; nothing goes through WMI.
-- Stall (W2): no output, no CPU (at least 1% of one core over the window), no new process in the job, no build-server progress, no WSL VM CPU and no nested gate paused behind a critical request, for `--stall` seconds: `gate: STALLED: ...`.
-- The load-adjusted clock and the ceiling (W3): each sample adds `interval * free` to the clock `--timeout` runs on, with the 5% floor; `gate: TIMED OUT after ...`.
+- Stall (W2): no output, no CPU (at least 1% of one core over the window), no new process in the job, no build-server progress, no WSL VM CPU and no nested gate paused behind a critical request, for `--stall` seconds: `gate: STALLED: ...`. Progress as the watchdog crate counts it resets the stall clock when the sum of the log and `.err` sizes changed (grew or shrank), the job's CPU since the last progress reached 1% of one core over the stall window, a pid appeared that the last sample did not have, or a nested gate is paused. Build-server progress and WSL VM CPU are not yet counted.
+- The load-adjusted clock and the ceiling (W3): each sample adds `interval * free` to the clock `--timeout` runs on; a sample taken while a nested gate is paused adds to the paused time instead; `gate: TIMED OUT after ...`. The free share is 1 for a High-priority command; otherwise `busy` is the share of the interval's system time that was not idle, the cores others held are `max(0, busy * cores - own cores)` with `own cores` the job's CPU gained over the interval, and `free = clamp((cores - others) / demand, 0.05, 1)`. `demand` is every core, or `min(cores, 2)` for a light gate.
 - The backstop (W4): wall time less paused time reaching 5 times the ceiling, whatever the load: `gate: BACKSTOP: ...`. One sample's precedence is STALLED, TIMED OUT, BACKSTOP.
-- Sampler failure (W5): one line, then the backstop alone watches.
+- Sampler failure (W5): `gate: sampler failed: <message>; watching by wall time only`, then the backstop alone watches.
 - WSL (W6): a `wsl` command's VM CPU counts as progress.
 - A command that exits on its own before the kill keeps its status (W7).
 - Build servers: classification (B1), their priority (B2), and `MSBUILDDISABLENODEREUSE=1` and `DOTNET_CLI_USE_MSBUILD_SERVER=0` so worker nodes run in the command's job (B3).
 - Kill: the diagnostics block (X3), then `TerminateJobObject(job, 124)`, `gate: terminated the job's <n> process(es)`, a 5 s wait for the command and exit 124 (X2). A failure inside the gate after the command started terminates the job first (X4); Ctrl+C terminates the job, so the command never outlives its gate (X5).
 
-The arithmetic (stall progress, the free share, the clock, the backstop, the cores hint) is a pure crate driven by samples and an injected clock; the Win32 layer takes the samples.
+The arithmetic (stall progress, the free share, the clock, the three kills and their lines, the box heartbeat) is a pure crate driven by samples and an injected clock; the Win32 layer takes the samples. The cores hint is not yet in it. The kill lines are:
+
+- `gate: STALLED: no output and no CPU for <quiet> s (machine free <p>% on average); killed <command> and its children`
+- `gate: TIMED OUT after <timeout> s of load-adjusted time (wall <wall> s, machine free <p>% on average); killed <command> and its children`
+- `gate: BACKSTOP: <wall> s of wall time (5 x <timeout> s ceiling, load-adjusted <adjusted> s, machine free <p>% on average); killed <command> and its children`, where the middle clause reads `machine load unknown: the sampler failed` after a sampler failure.
+
+`<p>` is the free share averaged over the wall time the ceiling counted (paused seconds left out), a whole number rounded half to even, 100 while nothing is counted; the seconds are rounded the same way. After a sampler failure only the backstop is read.
+
+The box heartbeat (BW9) is the box wrapper's command-time heartbeat, not the wait heartbeat: a pump thread writes `gate-remote-heartbeat: <cpu ms>` every period, and while a command is watched only when the CPU used since the last beat is at least 1% of the time elapsed since it. A failed CPU read writes `gate: remote heartbeat stopped: <message>` and ends the heartbeats, never the run. Nothing in the `gate` binary calls the crate yet.
 
 ## Command launching
 
@@ -540,7 +548,7 @@ A virtual Cargo workspace (`resolver = "3"`) with every crate under `crates/`, l
 | `gate-state` | Every file format in the state root (claim, ticket, counts, journal, archive, `remote.json`), their readers and writers, path and object-name rules, journal history and `normalize_command`, the dashboard state ops-tower shows. Moved from ops-tower with its history (GATE-4). | yes; a pure crate |
 | `proc-table` | The process snapshot model (`ProcessInfo`, `ProcessTable`, `ProcessTree`) and its Windows reader. Moved with `gate-state` (GATE-4). | yes; its `win32` module is Windows-only |
 | `gate-win32` | The Win32 layer: job objects, process creation, named mutexes and events, priority, console, the WSL VM counter, the samples the watchdog consumes. | no |
-| `gate-watchdog` | Stall, free-share, ceiling and backstop arithmetic over samples, and the cores-hint verdict, on an injected clock. | yes; a pure crate |
+| `gate-watchdog` | Free-share, load-adjusted clock, stall, ceiling and backstop arithmetic over samples with the kill lines, and the box heartbeat, on an injected clock; the cores-hint verdict is not yet built. | yes; a pure crate |
 | `gate-args` | The gate's own argv: the subcommand CLI, the compatibility layer, the C-runtime and cmd.exe quoting, the `%VAR%` refusals and the PATHEXT resolution rules over an injected environment and file lookup. | yes; a pure crate |
 | `gate-router` | The routing rules (T2-T4) over strings: what routes, the path rewrite, the `--no-build` drop. | yes; a pure crate |
 | `gate` | The `gate` binary: the subcommands, the wait loop, the run, the journal writes, the bridge and `gate box`. | no |

@@ -188,6 +188,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "gate-watchdog"
+version = "0.1.0"
+
+[[package]]
 name = "gate-win32"
 version = "0.1.0"
 dependencies = [

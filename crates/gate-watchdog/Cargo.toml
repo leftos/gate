@@ -1,0 +1,11 @@
+[package]
+name = "gate-watchdog"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+doctest = false
+
+[lints]
+workspace = true
