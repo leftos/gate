@@ -8,31 +8,26 @@
   - [ ] GATE-39 Local slice 8: router and the bridge to remote.ps1
     - [ ] GATE-68 Router part C: the remote.ps1 bridge through a repo shim
   - [ ] GATE-62 Watchdog: count build servers, WSL and paused child gates as progress
-    - [ ] GATE-90 Watchdog part C: the WSL VM's CPU for a wsl command
     - [ ] GATE-91 Watchdog part D: a paused child gate counts as progress
   - [ ] GATE-38 Local slice 7: critical drain and nesting
-    - [ ] GATE-93 Critical part A: nesting under GATE_SLOT_HELD
-    - [ ] GATE-94 Critical part B: the critical drain, barrier and reserved light slots
+    - [/] GATE-94 Critical part B: the critical drain, barrier and reserved light slots
     - [ ] GATE-95 Critical part C: pause markers, writer and reader
   - [!] GATE-41 Local slice 10: the PowerShell launcher execs gate.exe once the cutover flag is set
 - [ ] GATE-9 Local cutover: drain and switch to gate.exe, bridging routed runs to remote.ps1
 - [ ] GATE-77 Watchdog: lower build servers' priority during a critical run (B2)
-- [ ] GATE-97 Suite: install cases write the real user PATH, so parallel worktree runs collide
 
 ## Remote
 
 - [ ] GATE-10 Port the remote client and box wrapper, then the remote cutover
   - [ ] GATE-42 Remote slice 1: the box side as gate box (run, stop, preflight, boot)
     - [ ] GATE-61 Box part C: box heartbeat, UTF-8 console and the pipe-closed stop
-      - [ ] GATE-84 Box part C2: the box heartbeat on BeatClock and Pump
-      - [ ] GATE-85 Box part C3: the UTF-8 console and the same-job relaunch
+      - [/] GATE-85 Box part C3: the UTF-8 console and the same-job relaunch
     - [ ] GATE-96 Box run: escape the payload's Subfolder and command word where they are echoed
   - [ ] GATE-63 Box: restore a repo's dotnet tools before a routed run
-  - [ ] GATE-25 Box: stop a job whose PC has gone away so it frees the work folder
   - [ ] GATE-26 Box: measure MSBuild node sharing across work folders, salt per work folder
   - [ ] GATE-24 Routed .NET builds recompile everything because each snapshot is a new commit
   - [ ] GATE-70 Remote: measure per-verb ssh overhead, then choose per-call or gate box serve
-  - [ ] GATE-43 Remote slice 2: remote client (snapshot, push, run, sync-back)
+  - [/] GATE-43 Remote slice 2: remote client (snapshot, push, run, sync-back)
   - [ ] GATE-44 Remote slice 3: bring a routed run's outputs back
   - [ ] GATE-45 Remote slice 4: health refusals, fallback journalling and remote claims
   - [ ] GATE-19 Remote: send a repo's declared sibling worktrees with a routed run
@@ -58,3 +53,11 @@
   - [ ] GATE-16 Durations part 4: `--timeout auto` as a floor, and ceiling and hang hints
   - [ ] GATE-17 Durations part 5: backfill guests during a critical drain
 - [ ] GATE-8 `--slot auto` picks heavy or light from the command's history
+
+## Backlog
+
+- [ ] GATE-98 Decide process liveness by a wait, not exit code 259
+- [ ] GATE-99 Bind a slot marker to a real parent gate's job before covering
+- [ ] GATE-100 Forward the box's git stderr under the output lock
+- [ ] GATE-101 A covered gate outlives its parent's slot
+- [ ] GATE-102 Give no slot marker when a gate cannot read its own start
