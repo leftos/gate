@@ -221,6 +221,12 @@ impl Watch {
         self.adjusted
     }
 
+    /// The wall time counted as paused, while a gate under this one waited behind a critical request.
+    #[must_use]
+    pub fn paused_time(&self) -> Duration {
+        self.paused
+    }
+
     /// The share of the machine free on average over the wall time the ceiling counted, rounded to a whole number
     /// with halves to even: the paused seconds are left out, and 100 while nothing has been counted.
     #[must_use]

@@ -14,6 +14,7 @@ use gate_win32::mutex_exists;
 use jiff::Timestamp;
 
 use crate::console::Console;
+use crate::nesting::Parent;
 use crate::resolve::ResolvedRoot;
 use crate::slots::{self, Liveness, ThisGate};
 use crate::wait::UnderParent;
@@ -127,29 +128,64 @@ pub(crate) trait PauseFacts {
     /// Whether a critical request is pending, as [`slots::critical_pending`] reads it; `Err` as
     /// [`PauseFacts::names`] when the critical mutex cannot be probed.
     fn critical_pending(&mut self) -> Result<bool, String>;
+    /// Whether the process `pid` runs in this gate's job; `Err` as [`PauseFacts::names`] when the job's processes
+    /// cannot be listed.
+    fn in_job(&mut self, pid: u32) -> Result<bool, String>;
 }
 
-/// Whether a gate under this gate's slot waits behind a critical request now, read from the pause markers named after
-/// the gate `pid` started at `start_ms`; `Err` is the line to say once, and the caller says it
-/// ([`live_child_pause_with`]).
-#[expect(dead_code, reason = "the watchdog is the only reader of a gate's pause markers, and reads none")]
-pub(crate) fn live_child_pause(root: &ResolvedRoot, pid: u32, start_ms: u64, now_ms: u64) -> Result<bool, String> {
-    live_child_pause_with(
-        &mut Disk {
+/// The watchdog's reads of the pause markers of the gates under this one, and whether a read that failed has been said
+/// this watch, which it says once.
+pub(crate) struct PauseReader<'a> {
+    root: &'a ResolvedRoot,
+    /// This gate, as its ticket names it, which is never a child's.
+    own: (u32, u64),
+    /// The parent whose marker this gate hands its command, as its pid and start, when that parent's slot covers it
+    /// or is lent to it: a gate under that command names its markers after the parent.
+    hands_on: Option<(u32, u64)>,
+    said: bool,
+}
+
+impl<'a> PauseReader<'a> {
+    /// The reader of the markers under `root` of the gates under `gate`, which hands its command the marker of
+    /// `hands_on` when it runs on that parent's slot; it has said nothing yet.
+    pub(crate) fn new(root: &'a ResolvedRoot, gate: &ThisGate, hands_on: Option<&Parent>) -> Self {
+        PauseReader {
             root,
-            own: (pid, start_ms),
+            own: (gate.pid, gate.start_ms),
+            hands_on: hands_on.map(|parent| (parent.pid, parent.start_ms)),
+            said: false,
+        }
+    }
+
+    /// One sample's read at the wall clock `now_ms`, `members` listing the processes in this gate's job: whether a gate
+    /// under this one waits behind a critical request ([`live_child_pause_with`]), and the line to say when this is the
+    /// first read of the watch that failed. A read that fails counts as not paused, and the next sample reads again.
+    pub(crate) fn sample(&mut self, now_ms: u64, members: &dyn Fn() -> io::Result<Vec<u32>>) -> (bool, Option<String>) {
+        let mut disk = Disk {
+            root: self.root,
+            own: self.own,
             now_ms,
-        },
-        pid,
-        start_ms,
-    )
+            listed: None,
+            members,
+        };
+        match live_child_pause_with(&mut disk, self.own, self.hands_on) {
+            Ok(paused) => (paused, None),
+            Err(line) if !self.said => {
+                self.said = true;
+                (false, Some(line))
+            }
+            Err(_) => (false, None),
+        }
+    }
 }
 
-/// Whether a gate under the gate `own_pid` started at `own_start_ms` waits behind a critical request now, out of the
-/// markers the pause folder holds: the first marker naming a child gate that still runs with the start in its name,
-/// written within [`PAUSE_STALE`] and still holding its ticket. `Ok(false)` when none names such a child; `Err` the
-/// line to say once when the folder, the tickets or the critical mutex cannot be read.
-pub(crate) fn live_child_pause_with(facts: &mut impl PauseFacts, own_pid: u32, own_start_ms: u64) -> Result<bool, String> {
+/// Whether a gate under the gate `own` waits behind a critical request now, out of the markers the pause folder holds:
+/// the first marker named after `own`, or after the parent `hands_on` whose marker this gate hands its command, whose
+/// child gate waits ([`waits`]); each gate is its pid and start in Unix epoch milliseconds. A marker named after
+/// `hands_on` counts only for a child in this gate's job, since a sibling gate the parent started beside this one names
+/// it too. `Ok(false)` when none names such a child; `Err` the line to say once when the folder, the tickets, the job
+/// or the critical mutex cannot be read.
+pub(crate) fn live_child_pause_with(facts: &mut impl PauseFacts, own: (u32, u64), hands_on: Option<(u32, u64)>) -> Result<bool, String> {
     let Some(names) = facts.names()? else {
         return Ok(false);
     };
@@ -158,26 +194,34 @@ pub(crate) fn live_child_pause_with(facts: &mut impl PauseFacts, own_pid: u32, o
         let Some(marker) = v1::parse_pause_name(&name) else {
             continue;
         };
-        if marker.parent_pid != own_pid || marker.parent_start_ms != own_start_ms {
+        let parent = (marker.parent_pid, marker.parent_start_ms);
+        let handed = parent != own && Some(parent) == hands_on;
+        if parent != own && !handed {
             continue;
         }
-        if !facts.runs(marker.pid, marker.start_ms) {
-            continue;
+        if waits(facts, &name, (marker.pid, marker.start_ms), handed, now)? {
+            return facts.critical_pending();
         }
-        // A marker gone as its time is read is one whose gate stopped waiting, not a failed read: the next marker is
-        // asked.
-        let Some(written) = facts.written_ms(&name) else {
-            continue;
-        };
-        if now.saturating_sub(written) > PAUSE_STALE_MS {
-            continue;
-        }
-        if !facts.ticket_exists(marker.pid, marker.start_ms)? {
-            continue;
-        }
-        return facts.critical_pending();
     }
     Ok(false)
+}
+
+/// Whether the child gate `child`, its pid and start, of the marker `name` waits at `now`: it still runs with the
+/// start in the marker's name, the marker was written within [`PAUSE_STALE`], it still holds its ticket, and, for a
+/// marker named after the parent this gate hands its command (`handed`), it runs in this gate's job.
+fn waits(facts: &mut impl PauseFacts, name: &str, child: (u32, u64), handed: bool, now: u64) -> Result<bool, String> {
+    let (pid, start_ms) = child;
+    if !facts.runs(pid, start_ms) {
+        return Ok(false);
+    }
+    // A marker gone as its time is read is one whose gate stopped waiting, not a failed read: the next marker is asked.
+    let Some(written) = facts.written_ms(name) else {
+        return Ok(false);
+    };
+    if now.saturating_sub(written) > PAUSE_STALE_MS || !facts.ticket_exists(pid, start_ms)? {
+        return Ok(false);
+    }
+    Ok(!handed || facts.in_job(pid)?)
 }
 
 /// The pause facts as the machine has them: the pause folder, the waiting tickets and the critical mutex under `root`,
@@ -187,6 +231,11 @@ struct Disk<'a> {
     /// The gate the read answers for, whose own ticket is never the child's.
     own: (u32, u64),
     now_ms: u64,
+    /// The waiting tickets as this read listed them, once it has: one listing answers every ticket and the critical
+    /// request it asks about.
+    listed: Option<Vec<slots::Listed>>,
+    /// Lists the processes in this gate's job.
+    members: &'a dyn Fn() -> io::Result<Vec<u32>>,
 }
 
 impl PauseFacts for Disk<'_> {
@@ -208,14 +257,13 @@ impl PauseFacts for Disk<'_> {
     }
 
     fn ticket_exists(&mut self, pid: u32, start_ms: u64) -> Result<bool, String> {
-        let listed = self.reading_tickets()?;
         let names_it = |entry: &slots::Listed| entry.live().is_some_and(|ticket| (ticket.pid, ticket.start_ms) == (pid, start_ms));
-        Ok(listed.iter().any(names_it))
+        Ok(self.tickets()?.iter().any(names_it))
     }
 
     fn critical_pending(&mut self) -> Result<bool, String> {
         let root = self.root;
-        let live: Vec<Ticket> = self.reading_tickets()?.iter().filter_map(slots::Listed::live).cloned().collect();
+        let live: Vec<Ticket> = self.tickets()?.iter().filter_map(slots::Listed::live).cloned().collect();
         let name = root.root.object_name(KernelObject::Critical);
         // A probe that fails cannot be read as no critical request: the read ends, and the parent pauses nothing.
         let mut failed = None;
@@ -228,12 +276,25 @@ impl PauseFacts for Disk<'_> {
         });
         failed.map_or(Ok(pending), |error| Err(line("the critical mutex", name, &error)))
     }
+
+    fn in_job(&mut self, pid: u32) -> Result<bool, String> {
+        (self.members)()
+            .map(|members| members.contains(&pid))
+            .map_err(|error| format!("gate: could not read the processes in this gate's job ({error}); a gate under this one pauses nothing"))
+    }
 }
 
 impl Disk<'_> {
+    /// The waiting tickets under the state root, listed on this read's first ask ([`Disk::list`]) and kept for the
+    /// rest of it.
+    fn tickets(&mut self) -> Result<&[slots::Listed], String> {
+        let listed = self.listed.take().map_or_else(|| self.list(), Ok)?;
+        Ok(self.listed.insert(listed).as_slice())
+    }
+
     /// The waiting tickets under the state root ([`slots::listed_tickets`]), the waiting folder named in the line when
     /// it cannot be read.
-    fn reading_tickets(&mut self) -> Result<Vec<slots::Listed>, String> {
+    fn list(&self) -> Result<Vec<slots::Listed>, String> {
         let root = self.root;
         let folder = v1::tickets_dir(&root.path);
         slots::listed_tickets(&root.path, self.own).map_err(|error| line("the waiting tickets in", folder.display(), &error))
@@ -342,11 +403,15 @@ mod tests {
         fn critical_pending(&mut self) -> Result<bool, String> {
             self.pending.clone()
         }
+
+        fn in_job(&mut self, pid: u32) -> Result<bool, String> {
+            Ok(self.running.iter().any(|&(running, _)| running == pid))
+        }
     }
 
     /// What the reader answers for the gate [`OWN_PID`] under `facts`.
     fn read(facts: &mut Fake) -> Result<bool, String> {
-        live_child_pause_with(facts, OWN_PID, OWN_START)
+        live_child_pause_with(facts, (OWN_PID, OWN_START), None)
     }
 
     #[test]
@@ -518,7 +583,15 @@ mod tests {
             root,
             own: (OWN_PID, OWN_START),
             now_ms: NOW,
+            listed: None,
+            members: &no_members,
         }
+    }
+
+    /// A job that holds no process.
+    #[expect(clippy::unnecessary_wraps, reason = "it stands in for the job's lister, which returns a Result")]
+    fn no_members() -> std::io::Result<Vec<u32>> {
+        Ok(Vec::new())
     }
 
     /// Makes the file at `path` and sets its last write time to `ms` past the epoch, without sleeping.

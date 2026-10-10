@@ -20,8 +20,11 @@ use proc_table::{ProcessInfo, ProcessTable, ProcessTree, Win32ProcessTable, file
 
 use crate::console::Console;
 use crate::log::Log;
+use crate::nesting::Parent;
+use crate::pause::PauseReader;
+use crate::resolve::ResolvedRoot;
 use crate::servers::{Scope, Servers, counted};
-use crate::slots::Pool;
+use crate::slots::{Pool, ThisGate, epoch_ms};
 
 /// How long the watch waits for the command between two samples.
 const SAMPLE_PERIOD: Duration = Duration::from_secs(5);
@@ -82,6 +85,9 @@ pub(crate) struct Watcher<'a> {
     /// After how many samples the gate raises the interrupt itself (`--test-interrupt-after-samples`).
     interrupt_after: Option<u64>,
     vm: VmReader<VmRead>,
+    /// The pause markers of the gates under this one: a gate under it waiting behind a critical request is the run's
+    /// progress.
+    pause: PauseReader<'a>,
 }
 
 /// A read of the WSL VM's cumulative CPU in 100 ns ticks, `None` when no VM runs.
@@ -146,6 +152,13 @@ pub(crate) struct Watching<'a> {
     /// The slot kind the command runs as, whose machine the watch measures it on: critical under a critical parent's
     /// slot, else the gate's own.
     pub runs_as: Slot,
+    /// The state root whose pause markers name the gates waiting under this one.
+    pub root: &'a ResolvedRoot,
+    /// This gate, whose name the pause markers of the gates under it carry.
+    pub gate: &'a ThisGate,
+    /// The parent whose marker this gate hands its command, when that parent's slot covers it or is lent to it: the
+    /// gates under that command name their pause markers after the parent.
+    pub hands_on: Option<&'a Parent>,
 }
 
 impl<'a> Watcher<'a> {
@@ -184,6 +197,7 @@ impl<'a> Watcher<'a> {
             samples: 0,
             interrupt_after: request.test_seams.interrupt_after_samples,
             vm,
+            pause: PauseReader::new(run.root, run.gate, run.hands_on),
         })
     }
 
@@ -222,6 +236,11 @@ impl<'a> Watcher<'a> {
         self.sampler_works.then(|| self.watch.adjusted_seconds())
     }
 
+    /// The wall time the watch counted as paused, while a gate under this one waited behind a critical request.
+    pub(crate) fn paused_time(&self) -> Duration {
+        self.watch.paused_time()
+    }
+
     /// Waits at most `timeout` for the command's exit, or for the interrupt when it was installed.
     fn wait(&self, timeout: Duration) -> io::Result<Waited> {
         match self.interrupt {
@@ -233,15 +252,17 @@ impl<'a> Watcher<'a> {
     /// Takes one sample, or moves the clock by wall time once the sampler has failed.
     fn take_sample(&mut self, console: &mut Console) {
         let at = self.started.elapsed();
+        // A gate under this one waiting behind a critical request is progress, and the wall-only path counts it too.
+        let paused = self.paused(console);
         if !self.sampler_works {
-            self.watch.wall_only(at, false);
+            self.watch.wall_only(at, paused);
             return;
         }
         let (vm, line) = self.vm.sample();
         if let Some(line) = line {
             console.err(&line);
         }
-        match self.sample(at, vm.as_ref().ok().copied().flatten()) {
+        match self.sample(at, vm.as_ref().ok().copied().flatten(), paused) {
             Ok((sample, log_bytes, err_bytes)) => {
                 // Only a sample that came back whole becomes the one a kill's block lists the servers of; one that
                 // failed part way leaves the last good sample's servers in place.
@@ -252,6 +273,8 @@ impl<'a> Watcher<'a> {
             Err(error) => {
                 self.sampler_works = false;
                 console.err(&self.watch.sampler_failed(&error.to_string()));
+                // The pause read this pass answers for the stretch the failed sample would have measured.
+                self.watch.wall_only(at, paused);
             }
         }
     }
@@ -389,11 +412,22 @@ impl<'a> Watcher<'a> {
             .collect()
     }
 
+    /// Whether a gate under this one waits behind a critical request now ([`PauseReader::sample`]); a read that fails
+    /// counts as not paused, and the first of the watch is said, as the WSL VM's unreadable line is.
+    fn paused(&mut self, console: &mut Console) -> bool {
+        let job = self.job;
+        let (paused, line) = self.pause.sample(epoch_ms(Timestamp::now()), &|| job.process_ids());
+        if let Some(line) = line {
+            console.err(&line);
+        }
+        paused
+    }
+
     /// The facts of one sample at `at`: the system's and the job's CPU, the job's processes created since the command
     /// started, the build servers outside the job and the build client inside it, the WSL VM's CPU `vm_cpu` read for
-    /// it, and the size of the log and its `.err` file, the two kept apart for the diagnostics block. Under
-    /// `--test-sampler-fail` every sample fails.
-    fn sample(&mut self, at: Duration, vm_cpu: Option<u64>) -> io::Result<(Sample, u64, u64)> {
+    /// it, whether a gate under this one waits behind a critical request (`paused`), and the size of the log and its
+    /// `.err` file, the two kept apart for the diagnostics block. Under `--test-sampler-fail` every sample fails.
+    fn sample(&mut self, at: Duration, vm_cpu: Option<u64>, paused: bool) -> io::Result<(Sample, u64, u64)> {
         if self.sampler_fail {
             return Err(io::Error::other(SAMPLER_FAIL));
         }
@@ -415,7 +449,7 @@ impl<'a> Watcher<'a> {
             job_cpu: Ticks(self.job.accounting()?.cpu),
             output_size: log_bytes + err_bytes,
             pids,
-            paused: false,
+            paused,
             new_servers: found.new_servers,
             shared_servers: found.shared_servers,
             build_client: found.build_client,

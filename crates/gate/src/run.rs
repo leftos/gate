@@ -285,8 +285,9 @@ impl Plan {
     fn prepare(request: &RunRequest, words: &[OsString], at: &Where<'_>, console: &mut Console) -> Result<Plan, NotRun> {
         let Where { root, gate, log, nesting } = *at;
         let folder = std::env::current_dir().map_err(|error| NotRun::failed(format!("gate: cannot read the working directory: {error}")))?;
-        // A covered gate hands on the marker of the parent whose slot its command runs under.
-        let marker = match nesting.covering() {
+        // A covered gate hands on the marker of the parent whose slot its command runs under; one its parent lends its
+        // slot later is handed that marker then ([`Plan::handing_on`]).
+        let marker = match nesting.handed_on(false) {
             Some(parent) => parent.marker.clone(),
             None => environment::slot_marker(request.slot.as_str(), gate, &root.root),
         };
@@ -468,12 +469,13 @@ enum Pass<'h> {
     On(&'h str, Duration),
 }
 
-/// How long a command ran: by the wall clock, and in load-adjusted seconds, `None` once the sampler failed and they are
-/// unknown.
+/// How long a command ran: by the wall clock, in load-adjusted seconds, `None` once the sampler failed and they are
+/// unknown, and the part of its wall time paused while a gate under it waited behind a critical request.
 #[derive(Clone, Copy)]
 struct Timing {
     wall: Duration,
     adjusted: Option<f64>,
+    paused: Duration,
 }
 
 /// How a watched command ended, as its verdict reads it: its status, how long it ran, and the line of a kill.
@@ -994,10 +996,11 @@ impl Run<'_> {
     fn watched(&mut self, job: &Job, running: &Running, start: &Start, console: &mut Console) -> Ended {
         let mut stopper = Stopper { job, armed: true };
         let ended = match self.watch(job, running, start, console) {
-            Ok((watched, adjusted)) => {
+            Ok((watched, adjusted, paused)) => {
                 let timing = Timing {
                     wall: start.started.elapsed(),
                     adjusted,
+                    paused,
                 };
                 self.after_watch(watched, timing, (job, running), console)
             }
@@ -1007,20 +1010,24 @@ impl Run<'_> {
         ended
     }
 
-    /// Watches the command until it exits, is killed or the console is interrupted; how it ended and the load-adjusted
-    /// seconds it ran, `None` once the sampler failed, else the gate's problem.
-    fn watch(&self, job: &Job, running: &Running, start: &Start, console: &mut Console) -> Result<(Watched, Option<f64>), String> {
+    /// Watches the command until it exits, is killed or the console is interrupted; how it ended, the load-adjusted
+    /// seconds it ran, `None` once the sampler failed, and the wall time paused while a gate under it waited behind a
+    /// critical request, else the gate's problem.
+    fn watch(&self, job: &Job, running: &Running, start: &Start, console: &mut Console) -> Result<(Watched, Option<f64>, Duration), String> {
         let watching = Watching {
             job,
             running,
             log: &self.log,
             interrupt: self.host.interrupt,
             runs_as: self.nesting.runs_as(self.request.slot),
+            root: self.root,
+            gate: &self.gate,
+            hands_on: self.nesting.handed_on(self.lent),
         };
         let mut watcher = Watcher::begin(self.request, watching, start, self.host.processors)
             .map_err(|error| format!("cannot begin to watch the command: {error}"))?;
         let watched = watcher.until_end(console).map_err(|error| format!("cannot watch the command: {error}"))?;
-        Ok((watched, watcher.adjusted_seconds()))
+        Ok((watched, watcher.adjusted_seconds(), watcher.paused_time()))
     }
 
     /// Ends the run as the watch ended it: a command that exited has its verdict; one killed as stalled, timed out or
@@ -1072,7 +1079,7 @@ impl Run<'_> {
             Ok(status) => Ended {
                 status,
                 facts: Some(RunFacts {
-                    wall_seconds: outcome.timing.wall.as_secs_f64(),
+                    wall_seconds: outcome.timing.wall.saturating_sub(outcome.timing.paused).as_secs_f64(),
                     adjusted_seconds: outcome.timing.adjusted,
                     verdict: Verdict::of(outcome.kill, outcome.exited, status),
                 }),
