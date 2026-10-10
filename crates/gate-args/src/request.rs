@@ -98,6 +98,8 @@ pub struct TestSeams {
     pub remote_client: Option<PathBuf>,
     /// How long a routed run waits for a remote slot before it falls back with reason `full`.
     pub remote_wait_ms: Option<u64>,
+    /// How long each git call of the routing decision may take before git is killed and the run goes ahead here.
+    pub git_limit_ms: Option<u64>,
 }
 
 /// A valid `gate run`.

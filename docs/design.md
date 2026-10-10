@@ -555,7 +555,9 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
   Git is asked only then: a folder in no worktree (any non-zero `git rev-parse` exit), a repo the file does not list (the main checkout's folder name as a repo name, in any letter case) and words no pattern of the repo matches stay local silently, the first matching pattern winning. A fact that cannot be read stays local saying `gate: not routed: <reason>`. A machine with no `remote.json` costs no git call.
 
-  git is found along the gate's own `PATH` (absolute entries only) and run by its full path from the gate's folder, with the `GIT_*` variables that point it at another repository, index or config removed and `core.fsmonitor` off, so a gate in a hook that exports `GIT_DIR` still routes; each call gets 10 s, after which git is killed and the gate runs here saying `gate: not routed: git did not answer within 10 s`.
+  git is found along the gate's own `PATH` (absolute entries only) and run by its full path from the gate's folder, with the `GIT_*` variables that point it at another repository, index or config removed and `core.fsmonitor` off, so a gate in a hook that exports `GIT_DIR` still routes; each call gets 60 s, after which git is killed and the gate runs here saying `gate: not routed: git did not answer within 60 s` (in whole milliseconds, `1 ms`, when `--test-git-limit-ms` sets a limit that is not a whole number of seconds).
+
+  The limit is long because a loaded PC took git over 10 s in tiny repos, which kept heavy gates here exactly when the builder would help most; a git that truly hangs costs a heavy gate a minute.
 
   `gate run` answers those facts in `route.rs`, before it queues and before any command starts. The routing file is `%LOCALAPPDATA%\gate\remote.json` (no file when `LOCALAPPDATA` is unset or empty). The hook rule reads `GIT_INDEX_FILE`: set and non-empty means a git hook, which never routes.
 
@@ -768,6 +770,8 @@ A Rust integration suite drives the built `gate.exe` through its CLI and reads o
   `--test-diagnostics-fail` (a switch) makes the diagnostics gathering of a kill fail, so the log carries `gate: diagnostics failed: <message>` in place of the block; `--test-print-request` shows it as `testSeams.diagnosticsFail`, after `samplerFail`.
 
   `--test-remote-client <path>` replaces the remote client with a scripted one that runs in the gate's own process: the file's steps, one a line, are `out`, `err`, `record`, `wait`, `interrupt`, `killed`, `status`, `refuse` and `fail-start`. `--test-remote-wait-ms <n>` (whole milliseconds above 0) replaces the 60 s limit of the wait for a remote slot. `--test-print-request` shows them as `testSeams.remoteClient` and `testSeams.remoteWaitMs`.
+
+  `--test-git-limit-ms <n>` (whole milliseconds above 0, on `gate run` only) replaces the 60 s limit of each git call of the routing decision; `--test-print-request` shows it as `testSeams.gitLimitMs`, after `remoteWaitMs`.
 
   An installed gate has none of them, and without the feature each is an unknown option.
 - **Spawn and wait helpers.** The suite's `start` launches the gate and returns a `Running` that can wait for a stderr line, say whether the gate is still running, and finish; dropping a `Running` kills a gate still running. Output readers are joined with a deadline, so a grandchild holding the pipes cannot hang the suite. A run's `Outcome` carries `raw_stdout`, the bytes as the gate wrote them, beside the decoded text.

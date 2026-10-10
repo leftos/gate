@@ -24,7 +24,7 @@ const LOCAL_FLAG: &str = "--local";
 /// Why a command that would route runs here when one of its words is not valid Unicode.
 const NOT_UNICODE: &str = "a word of the command is not valid Unicode";
 /// How long one of the decision's git calls may take before git is killed and the run goes ahead here.
-const GIT_LIMIT: Duration = Duration::from_secs(10);
+const GIT_LIMIT: Duration = Duration::from_secs(60);
 /// How often a git call is looked at while it runs.
 const GIT_POLL: Duration = Duration::from_millis(5);
 /// The variables that would point git at another repository, index, object store, config or pathspec reading; git is
@@ -65,6 +65,7 @@ pub(crate) fn route(request: &RunRequest, environment: &Environment, console: &m
     let machine = Machine {
         folder: std::env::current_dir(),
         local_app_data: environment.local_app_data.as_deref(),
+        git_limit: request.test_seams.git_limit_ms.map_or(GIT_LIMIT, Duration::from_millis),
     };
     let route = match decide(&inputs, &machine) {
         Route::Routed(_) if !unicode => Route::Local {
@@ -101,11 +102,12 @@ fn slot(slot: Slot) -> gate_router::Slot {
     }
 }
 
-/// This machine's facts: the gate's working folder, or why it cannot be read, and the LOCALAPPDATA folder that holds
-/// the routing file.
+/// This machine's facts: the gate's working folder, or why it cannot be read, the LOCALAPPDATA folder that holds the
+/// routing file, and how long each of the decision's git calls may take.
 struct Machine<'a> {
     folder: io::Result<PathBuf>,
     local_app_data: Option<&'a OsStr>,
+    git_limit: Duration,
 }
 
 impl Facts for Machine<'_> {
@@ -138,7 +140,7 @@ impl Facts for Machine<'_> {
             "--path-format=absolute",
             "--git-common-dir",
         ];
-        let (status, mut output) = git(folder, &args)?;
+        let (status, mut output) = git(folder, &args, self.git_limit)?;
         if !status.success() {
             return Ok(None);
         }
@@ -164,7 +166,7 @@ impl Facts for Machine<'_> {
             "--",
             &place.prefix,
         ];
-        let (status, output) = git(root, &args)?;
+        let (status, output) = git(root, &args, self.git_limit)?;
         if !status.success() {
             let code = status.code().map_or_else(|| "unknown".to_owned(), |code| code.to_string());
             return Err(format!("git ls-files failed with status {code}"));
@@ -184,10 +186,10 @@ impl Facts for Machine<'_> {
 }
 
 /// Runs git, found along the gate's own `PATH` and started by its full path, in `folder` with `args`: no input, none
-/// of [`GIT_LOCATION`], no fsmonitor program, and killed after [`GIT_LIMIT`]. Its exit status and its stdout, held in
+/// of [`GIT_LOCATION`], no fsmonitor program, and killed after `limit`. Its exit status and its stdout, held in
 /// a temporary file read from its start, since a pipe nobody reads while git runs would stop a git that prints much.
 /// git runs before the command is started, while the gate holds no handle a child should not inherit.
-fn git(folder: &Path, args: &[&str]) -> Result<(ExitStatus, File), String> {
+fn git(folder: &Path, args: &[&str], limit: Duration) -> Result<(ExitStatus, File), String> {
     let program = find_program("git", &Variables::from_process(), folder).map_err(|why| format!("cannot run git: {why}"))?;
     let cannot_hold = |error: io::Error| format!("cannot make a file for git's output: {error}");
     let mut output = output_file().map_err(cannot_hold)?;
@@ -205,7 +207,7 @@ fn git(folder: &Path, args: &[&str]) -> Result<(ExitStatus, File), String> {
         .stdout(stdout)
         .stderr(Stdio::null());
     let mut child = gate_win32::spawn(&mut command).map_err(|error| format!("cannot run git: {error}"))?;
-    let status = wait_for(&mut child)?;
+    let status = wait_for(&mut child, limit)?;
     output
         .seek(SeekFrom::Start(0))
         .map_err(|error| format!("cannot read git's output: {error}"))?;
@@ -224,21 +226,30 @@ fn output_file() -> io::Result<File> {
         .open(path)
 }
 
-/// git's exit status once it ends; after [`GIT_LIMIT`] it is killed and the call fails.
-fn wait_for(child: &mut Child) -> Result<ExitStatus, String> {
-    let deadline = Instant::now() + GIT_LIMIT;
+/// git's exit status once it ends; after `limit` it is killed and the call fails.
+fn wait_for(child: &mut Child, limit: Duration) -> Result<ExitStatus, String> {
+    let deadline = Instant::now() + limit;
     loop {
         if let Some(status) = child.try_wait().map_err(|error| format!("cannot wait for git: {error}"))? {
             return Ok(status);
         }
         if Instant::now() >= deadline {
-            let late = format!("git did not answer within {} s", GIT_LIMIT.as_secs());
+            let late = late_git_line(limit);
             return match child.kill().and_then(|()| child.wait()) {
                 Ok(_) => Err(late),
                 Err(error) => Err(format!("{late}, and could not be stopped: {error}")),
             };
         }
         thread::sleep(GIT_POLL);
+    }
+}
+
+/// The line a git that outlived `limit` is killed under: the limit in whole seconds when it is a whole number of
+/// seconds, else in whole milliseconds.
+fn late_git_line(limit: Duration) -> String {
+    match limit.as_millis() % 1000 {
+        0 => format!("git did not answer within {} s", limit.as_secs()),
+        _ => format!("git did not answer within {} ms", limit.as_millis()),
     }
 }
 
@@ -281,10 +292,11 @@ fn holds_existing_path(listing: impl BufRead, root: &Path) -> io::Result<bool> {
 mod tests {
     use std::fs;
     use std::path::PathBuf;
+    use std::time::Duration;
 
     use gate_router::{LocalReason, Place, Route};
 
-    use super::{holds_existing_path, not_routed, parse_place};
+    use super::{GIT_LIMIT, holds_existing_path, late_git_line, not_routed, parse_place};
 
     fn place(root: &str, prefix: &str, checkout: &str) -> Place {
         Place {
@@ -339,5 +351,13 @@ mod tests {
         assert_eq!(not_routed(&flag).as_deref(), Some("--local"));
         assert_eq!(not_routed(&failed), None);
         assert_eq!(not_routed(&Route::Local { reason: None }), None);
+    }
+
+    #[test]
+    fn a_late_git_names_its_limit_in_seconds_or_milliseconds() {
+        assert_eq!(late_git_line(GIT_LIMIT), "git did not answer within 60 s", "the default limit");
+        assert_eq!(late_git_line(Duration::from_secs(60)), "git did not answer within 60 s");
+        assert_eq!(late_git_line(Duration::from_secs(10)), "git did not answer within 10 s");
+        assert_eq!(late_git_line(Duration::from_millis(1)), "git did not answer within 1 ms");
     }
 }

@@ -31,6 +31,8 @@ pub(crate) enum ValueOption {
     RemoteClient,
     #[cfg(feature = "test-seams")]
     RemoteWaitMs,
+    #[cfg(feature = "test-seams")]
+    GitLimitMs,
 }
 
 /// An option that is on or off.
@@ -141,6 +143,8 @@ impl RunBuilder {
             ValueOption::RemoteClient => self.test_seams.remote_client = Some(PathBuf::from(value)),
             #[cfg(feature = "test-seams")]
             ValueOption::RemoteWaitMs => self.test_seams.remote_wait_ms = Some(values::above_zero(spelled, value)?),
+            #[cfg(feature = "test-seams")]
+            ValueOption::GitLimitMs => self.test_seams.git_limit_ms = Some(values::above_zero(spelled, value)?),
         }
         Ok(())
     }

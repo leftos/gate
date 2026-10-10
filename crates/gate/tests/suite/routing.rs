@@ -34,9 +34,17 @@ fn stub(case: &Case, steps: &[&str]) -> PathBuf {
 }
 
 /// The words of a heavy run logging to `log` that calls the scripted client of the step file `stub`, `extra` before
-/// `--` and `command` after it.
+/// `--` and `command` after it, with a routing git limit no machine reaches.
 fn routed_words<'a>(log: &'a str, stub: &'a str, extra: &[&'a str], command: &[&'a str]) -> Vec<&'a str> {
-    let mut before = vec!["--test-remote-client", stub];
+    let mut before = vec!["--test-remote-client", stub, "--test-git-limit-ms", "3600000"];
+    before.extend(extra);
+    heavy_words(log, &before, command)
+}
+
+/// The words of a heavy run of this suite, with a routing git limit of an hour: a case holds however long git takes
+/// on a loaded machine, not only within the gate's default limit.
+fn heavy_words_with_limit<'a>(log: &'a str, extra: &[&'a str], command: &[&'a str]) -> Vec<&'a str> {
+    let mut before = vec!["--test-git-limit-ms", "3600000"];
     before.extend(extra);
     heavy_words(log, &before, command)
 }
@@ -180,7 +188,7 @@ fn stdout_lines(stdout: &str) -> Vec<&str> {
 #[test]
 fn with_no_test_client_a_routed_run_falls_back_with_reason_client() {
     let case = routed_case("routing-no-client");
-    let outcome = finish(case.gate(&heavy_words("out.log", &[], &[r".\tool.exe", "out", "ran here"])));
+    let outcome = finish(case.gate(&heavy_words_with_limit("out.log", &[], &[r".\tool.exe", "out", "ran here"])));
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert!(outcome.stderr.contains(CLIENT_LINE), "{outcome:?}");
@@ -193,7 +201,7 @@ fn with_no_test_client_a_routed_run_falls_back_with_reason_client() {
 #[test]
 fn local_runs_here_saying_why_and_journals_not_routed() {
     let case = routed_case("routing-local");
-    let heavy = finish(case.gate(&heavy_words("heavy.log", &["--local"], &[r".\tool.exe", "out", "hi"])));
+    let heavy = finish(case.gate(&heavy_words_with_limit("heavy.log", &["--local"], &[r".\tool.exe", "out", "hi"])));
     let light = finish(case.gate(&run_words("light.log", &["--local"], &[r".\tool.exe", "out", "hi"])));
 
     assert_eq!((heavy.code, light.code), (Some(0), Some(0)), "{heavy:?} {light:?}");
@@ -211,7 +219,7 @@ fn without_a_routing_file_nothing_is_said_and_nothing_is_written() {
     let case = Case::new("routing-no-file");
     git_init(&case);
     copy_tool(&case, "tool.exe");
-    let outcome = finish(case.gate(&heavy_words("out.log", &[], &[r".\tool.exe", "out", "hi"])));
+    let outcome = finish(case.gate(&heavy_words_with_limit("out.log", &[], &[r".\tool.exe", "out", "hi"])));
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert_eq!(outcome.stderr, "", "{outcome:?}");
@@ -222,7 +230,7 @@ fn without_a_routing_file_nothing_is_said_and_nothing_is_written() {
 #[test]
 fn inside_a_git_hook_a_heavy_gate_stays_here_silently() {
     let case = routed_case("routing-hook");
-    let mut command = case.gate(&heavy_words("out.log", &[], &[r".\tool.exe", "out", "hi"]));
+    let mut command = case.gate(&heavy_words_with_limit("out.log", &[], &[r".\tool.exe", "out", "hi"]));
     command.env("GIT_INDEX_FILE", "x");
     let outcome = finish(command);
 
@@ -235,7 +243,7 @@ fn inside_a_git_hook_a_heavy_gate_stays_here_silently() {
 fn an_unusable_routing_file_is_ignored_with_one_line() {
     let case = Case::new("routing-unusable");
     let path = write_remote_json(&case, "{ not json");
-    let heavy = finish(case.gate(&heavy_words("heavy.log", &[], &[FAKE_TOOL, "out", "hi"])));
+    let heavy = finish(case.gate(&heavy_words_with_limit("heavy.log", &[], &[FAKE_TOOL, "out", "hi"])));
     let light = finish(case.gate(&run_words("light.log", &[], &[FAKE_TOOL, "out", "hi"])));
 
     assert_eq!((heavy.code, light.code), (Some(0), Some(0)), "{heavy:?} {light:?}");
@@ -251,7 +259,7 @@ fn an_unusable_routing_file_is_ignored_with_one_line() {
 #[test]
 fn a_matched_command_outside_the_worktree_runs_here_saying_so() {
     let case = routed_case("routing-outside");
-    let outcome = finish(case.gate(&heavy_words("out.log", &[], &[FAKE_TOOL, "out", "ran here"])));
+    let outcome = finish(case.gate(&heavy_words_with_limit("out.log", &[], &[FAKE_TOOL, "out", "ran here"])));
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert!(
@@ -266,7 +274,7 @@ fn a_folder_that_holds_nothing_the_snapshot_sends_runs_here_saying_so() {
     let case = routed_case("routing-nothing-sent");
     sub_folder(&case, "sub", false);
     let log = log_path(&case, "out.log");
-    let outcome = finish(case.gate_in("sub", &heavy_words(&log, &[], &[r".\tool.exe", "out", "ran here"])));
+    let outcome = finish(case.gate_in("sub", &heavy_words_with_limit(&log, &[], &[r".\tool.exe", "out", "ran here"])));
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert!(outcome.stderr.contains(NOTHING_SENT_LINE), "{outcome:?}");
@@ -280,7 +288,7 @@ fn a_folder_named_with_spaces_and_brackets_holding_a_file_routes() {
     let empty = case.folder().join("empty.gitconfig");
     fs::write(&empty, "").expect("an empty git config can be written");
     let log = log_path(&case, "out.log");
-    let mut command = case.gate_in("my dir [1]", &heavy_words(&log, &[], &[r".\tool.exe", "out", "ran here"]));
+    let mut command = case.gate_in("my dir [1]", &heavy_words_with_limit(&log, &[], &[r".\tool.exe", "out", "ran here"]));
     command.env("GIT_CONFIG_GLOBAL", &empty).env("GIT_CONFIG_NOSYSTEM", "1");
     let outcome = finish(command);
 
@@ -293,9 +301,9 @@ fn a_folder_named_with_spaces_and_brackets_holding_a_file_routes() {
 fn with_git_dir_and_work_tree_inherited_a_gate_in_a_subfolder_still_routes() {
     let case = routed_case("routing-git-dir");
     sub_folder(&case, "sub", true);
-    let at_root = finish(case.gate(&heavy_words("root.log", &[], &[r".\tool.exe", "out", "hi"])));
+    let at_root = finish(case.gate(&heavy_words_with_limit("root.log", &[], &[r".\tool.exe", "out", "hi"])));
     let log = log_path(&case, "sub.log");
-    let mut command = case.gate_in("sub", &heavy_words(&log, &[], &[r".\tool.exe", "out", "hi"]));
+    let mut command = case.gate_in("sub", &heavy_words_with_limit(&log, &[], &[r".\tool.exe", "out", "hi"]));
     // As a hook run at the worktree's root exports them: relative, so they name the case's repo only from its root.
     command.env("GIT_DIR", ".git").env("GIT_WORK_TREE", ".");
     let in_sub = finish(command);
@@ -316,7 +324,7 @@ fn a_worktree_with_unstaged_deletes_does_not_count_a_deleted_folder_as_holding_f
     git(&case, &["commit", "--quiet", "-m", "a"]);
     fs::remove_file(case.folder().join("sub").join("a.txt")).expect("the tracked file can be deleted");
     let log = log_path(&case, "out.log");
-    let outcome = finish(case.gate_in("sub", &heavy_words(&log, &[], &[r".\tool.exe", "out", "ran here"])));
+    let outcome = finish(case.gate_in("sub", &heavy_words_with_limit(&log, &[], &[r".\tool.exe", "out", "ran here"])));
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert!(outcome.stderr.contains(NOTHING_SENT_LINE), "{outcome:?}");
@@ -327,7 +335,7 @@ fn a_worktree_with_unstaged_deletes_does_not_count_a_deleted_folder_as_holding_f
 fn a_path_argument_with_spaces_routes_with_the_word_intact() {
     let case = routed_case("routing-spaces");
     let word = r"dir with spaces\file.txt";
-    let outcome = finish(case.gate(&heavy_words("out.log", &[], &[r".\tool.exe", "argv", word])));
+    let outcome = finish(case.gate(&heavy_words_with_limit("out.log", &[], &[r".\tool.exe", "argv", word])));
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert!(outcome.stderr.contains(CLIENT_LINE), "{outcome:?}");
@@ -678,9 +686,9 @@ fn remote_and_local_waiters_do_not_queue_behind_each_other() {
     write_counts(&case.root(), r#"{"v":1,"heavy":1}"#);
     let local_go = case.folder().join("local-go");
     let local_go_word = shown(&local_go);
-    let local_holder = case.start(&heavy_words("lh.log", &["--local"], &[r".\tool.exe", "wait", &local_go_word]));
+    let local_holder = case.start(&heavy_words_with_limit("lh.log", &["--local"], &[r".\tool.exe", "wait", &local_go_word]));
     wait_for_journal_line(&case.root(), &format!(r#""event":"take","pid":{},"#, local_holder.id()));
-    let mut local_waiter = case.start(&heavy_words("lw.log", &["--local"], &[r".\tool.exe", "out", "hi"]));
+    let mut local_waiter = case.start(&heavy_words_with_limit("lw.log", &["--local"], &[r".\tool.exe", "out", "hi"]));
     local_waiter.wait_for_stderr("gate: waiting for a heavy slot");
     let free = shown(&stub(&case, &["status 0"]));
     let routed = finish(case.gate(&routed_words("routed.log", &free, &[], &[r".\tool.exe", "out", "hi"])));
@@ -698,7 +706,7 @@ fn remote_and_local_waiters_do_not_queue_behind_each_other() {
     let waits = ["--test-remote-wait-ms", "3600000", "--test-poll-ms", "50"];
     let mut remote_waiter = case.start(&routed_words("rw.log", &free, &waits, &[r".\tool.exe", "out", "hi"]));
     remote_waiter.wait_for_stderr(REMOTE_WAITING);
-    let local = finish(case.gate(&heavy_words("local.log", &["--local"], &[r".\tool.exe", "out", "hi"])));
+    let local = finish(case.gate(&heavy_words_with_limit("local.log", &["--local"], &[r".\tool.exe", "out", "hi"])));
     assert_eq!(
         local.code,
         Some(0),
@@ -774,7 +782,7 @@ fn a_ctrl_c_in_the_local_wait_after_a_fallback_abandons_without_the_remote_field
     write_counts(&case.root(), r#"{"v":1,"heavy":1}"#);
     let go = case.folder().join("go");
     let go_word = shown(&go);
-    let holder = case.start(&heavy_words("holder.log", &["--local"], &[r".\tool.exe", "wait", &go_word]));
+    let holder = case.start(&heavy_words_with_limit("holder.log", &["--local"], &[r".\tool.exe", "wait", &go_word]));
     wait_for_journal_line(&case.root(), &format!(r#""event":"take","pid":{},"#, holder.id()));
     let steps = shown(&stub(&case, &["refuse busy"]));
     let gate = case.start(&routed_words(
@@ -806,7 +814,7 @@ fn events_of_last(case: &Case) -> Vec<Value> {
 #[test]
 fn a_word_that_is_not_valid_unicode_runs_here_saying_so() {
     let case = routed_case("routing-not-unicode");
-    let mut command = case.gate(&heavy_words("out.log", &[], &[r".\tool.exe", "argv"]));
+    let mut command = case.gate(&heavy_words_with_limit("out.log", &[], &[r".\tool.exe", "argv"]));
     command.arg(OsString::from_wide(&[u16::from(b'x'), 0xD800]));
     let outcome = finish(command);
 
@@ -815,5 +823,20 @@ fn a_word_that_is_not_valid_unicode_runs_here_saying_so() {
         outcome.stderr.contains("gate: not routed: a word of the command is not valid Unicode\n"),
         "{outcome:?}"
     );
+    assert_local(&events(&case), None);
+}
+
+#[test]
+fn a_git_that_does_not_answer_within_the_limit_runs_here_saying_so() {
+    let case = routed_case("routing-git-late");
+    let words = heavy_words("out.log", &["--test-git-limit-ms", "1"], &[r".\tool.exe", "out", "ran here"]);
+    let outcome = finish(case.gate(&words));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(
+        outcome.stderr.contains("gate: not routed: git did not answer within 1 ms\n"),
+        "{outcome:?}"
+    );
+    assert!(outcome.stdout.contains("ran here"), "the command ran here: {outcome:?}");
     assert_local(&events(&case), None);
 }

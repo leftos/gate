@@ -35,6 +35,7 @@ pub(crate) fn run(request: &RunRequest, log: &Path, root: &ResolvedRoot) -> Stri
             "diagnosticsFail": seams.diagnostics_fail,
             "remoteClient": seams.remote_client.as_ref().map(|path| path.to_string_lossy()),
             "remoteWaitMs": seams.remote_wait_ms,
+            "gitLimitMs": seams.git_limit_ms,
         },
     })
     .to_string()

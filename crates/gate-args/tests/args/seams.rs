@@ -27,6 +27,8 @@ fn seam_flags_parse_with_the_feature() {
             "--test-remote-client",
             r"steps\client.txt",
             "--test-remote-wait-ms=90",
+            "--test-git-limit-ms",
+            "95",
             "--test-print-request",
             "--",
             "cmd",
@@ -46,6 +48,7 @@ fn seam_flags_parse_with_the_feature() {
             diagnostics_fail: true,
             remote_client: Some(std::path::PathBuf::from(r"steps\client.txt")),
             remote_wait_ms: Some(90),
+            git_limit_ms: Some(95),
         }
     );
     assert!(request.print_request);
@@ -84,6 +87,10 @@ fn seam_flags_parse_with_the_feature() {
     assert_eq!(
         problems(&["stop-tree", "--test-poll-ms", "5", "1"]),
         ["gate: unknown option --test-poll-ms", "gate: unexpected argument 1"]
+    );
+    assert_eq!(
+        problems(&["stop-tree", "--test-git-limit-ms", "5", "1"]),
+        ["gate: unknown option --test-git-limit-ms", "gate: unexpected argument 1"]
     );
 
     let compat = run_request(&["-Log", "x", "--test-print-request", "-TimeoutSeconds", "5", "-Slot", "heavy", "--", "cmd"]);
@@ -142,6 +149,33 @@ fn remote_seams_need_a_value_once() {
             "cmd"
         ]),
         ["gate: unknown option --test-remote-client", "gate: unexpected argument a"]
+    );
+    assert_eq!(
+        problems(&refs(&with(&RUN, &["--test-git-limit-ms=", "--", "cmd"]))),
+        ["gate: --test-git-limit-ms needs a value"]
+    );
+    assert_eq!(
+        problems(&refs(&with(&RUN, &["--test-git-limit-ms", "0", "--", "cmd"]))),
+        ["gate: --test-git-limit-ms must be a whole number above 0, got '0'"]
+    );
+    assert_eq!(
+        problems(&refs(&with(&RUN, &["--test-git-limit-ms", "1", "--test-git-limit-ms", "2", "--", "cmd"]))),
+        ["gate: --test-git-limit-ms is given twice"]
+    );
+    assert_eq!(
+        problems(&[
+            "-Log",
+            "x",
+            "-TimeoutSeconds",
+            "5",
+            "-Slot",
+            "heavy",
+            "--test-git-limit-ms",
+            "5",
+            "--",
+            "cmd"
+        ]),
+        ["gate: unknown option --test-git-limit-ms", "gate: unexpected argument 5"]
     );
 }
 
