@@ -75,6 +75,19 @@ impl Payload {
             .map(|(name, value)| value.as_str().map(|text| (name.clone(), text.to_owned())).ok_or_else(not_pairs))
             .collect()
     }
+
+    /// The run's `Snapshot`: the payload's commit, exactly 40 lowercase hex digits, as the client sends it; else the
+    /// line saying it is not one. A missing key and a JSON null are shown as the empty string, any other non-string
+    /// value as its compact JSON text, each with its control characters escaped, so a value cannot break or forge the
+    /// line.
+    pub(crate) fn snapshot(&self) -> Result<&str, String> {
+        match self.0.get("Snapshot") {
+            Some(Value::String(text)) if is_commit_sha(text) => Ok(text),
+            Some(Value::String(text)) => Err(not_a_snapshot(text)),
+            Some(Value::Null) | None => Err(not_a_snapshot("")),
+            Some(other) => Err(not_a_snapshot(&other.to_string())),
+        }
+    }
 }
 
 /// The client's work-folder checks: the key, the work folder named for it, and the run's job and files beside it.
@@ -142,6 +155,17 @@ const NONCE_DIGITS: usize = 12;
 
 fn not_a_key(key: &str) -> String {
     format!("gate: box payload Key is not a work-folder key: {}", escaped(key))
+}
+
+/// The line refusing a run whose payload named no 40-hex commit as its snapshot, showing `value` as it is.
+fn not_a_snapshot(value: &str) -> String {
+    format!("gate: remote run payload's Snapshot '{}' is not a 40-hex commit sha", escaped(value))
+}
+
+/// Whether `value` is exactly 40 lowercase hex digits: PowerShell's `-cmatch '^[0-9a-f]{40}$'`, but without .NET's
+/// allowance for a trailing newline, so 40 hex digits followed by a line end are not a snapshot.
+fn is_commit_sha(value: &str) -> bool {
+    value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
 /// `text` with each control character escaped, so a value cannot break or forge a line.
@@ -277,6 +301,66 @@ mod tests {
             text(r#"{"work":"w"}"#, "Work"),
             Err("gate: box payload lacks Work".to_owned()),
             "names are exact"
+        );
+    }
+
+    /// The run's snapshot of the JSON `json`: its text, or the line refusing it.
+    fn snapshot(json: &str) -> Result<String, String> {
+        decoded(json).and_then(|payload| payload.snapshot().map(str::to_owned))
+    }
+
+    /// The refusal line a snapshot value is shown in.
+    fn refusing(value: &str) -> String {
+        format!("gate: remote run payload's Snapshot '{value}' is not a 40-hex commit sha")
+    }
+
+    #[test]
+    fn a_snapshot_is_exactly_40_lowercase_hex_digits() {
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        assert_eq!(
+            snapshot(&format!(r#"{{"Snapshot":"{sha}"}}"#)),
+            Ok(sha.to_owned()),
+            "40 lowercase hex digits"
+        );
+        assert_eq!(
+            snapshot(&format!(r#"{{"Snapshot":"{sha}\n"}}"#)),
+            Err(refusing(&format!("{sha}\\n"))),
+            "a line end after the sha is not allowed"
+        );
+        assert_eq!(
+            snapshot(&format!(r#"{{"Snapshot":"{sha}0"}}"#)),
+            Err(refusing(&format!("{sha}0"))),
+            "41 of them"
+        );
+        let dashes = "-".repeat(40);
+        assert_eq!(snapshot(&format!(r#"{{"Snapshot":"{dashes}"}}"#)), Err(refusing(&dashes)), "40 non-hex");
+        let gees = "g".repeat(40);
+        assert_eq!(snapshot(&format!(r#"{{"Snapshot":"{gees}"}}"#)), Err(refusing(&gees)), "a non-hex letter");
+        assert_eq!(snapshot(r#"{"Snapshot":""}"#), Err(refusing("")), "the empty string");
+        assert_eq!(snapshot(r#"{"Snapshot":null}"#), Err(refusing("")), "null shows nothing");
+    }
+
+    #[test]
+    fn a_snapshot_that_is_not_a_string_is_shown_as_its_compact_json() {
+        assert_eq!(snapshot(r#"{"Snapshot":3}"#), Err(refusing("3")), "a number");
+        assert_eq!(snapshot(r#"{"Snapshot":true}"#), Err(refusing("true")), "a boolean");
+        assert_eq!(snapshot(r#"{"Snapshot":["x"]}"#), Err(refusing(r#"["x"]"#)), "an array");
+        assert_eq!(snapshot(r#"{"Snapshot":{"a":1}}"#), Err(refusing(r#"{"a":1}"#)), "an object");
+    }
+
+    #[test]
+    fn a_snapshot_line_escapes_every_control_character() {
+        // ESC, CR, LF, DEL and U+009B, in a string value and in a non-string one.
+        let controls = "\u{1b}\r\n\u{7f}\u{9b}";
+        assert_eq!(
+            snapshot(&json!({ "Snapshot": controls }).to_string()),
+            Err(refusing(r"\u{1b}\r\n\u{7f}\u{9b}")),
+            "a string value"
+        );
+        assert_eq!(
+            snapshot(&json!({ "Snapshot": ["\u{1b}[31m"] }).to_string()),
+            Err(refusing(r#"["\u001b[31m"]"#)),
+            "a non-string value is shown as its compact JSON text"
         );
     }
 }

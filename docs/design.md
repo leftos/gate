@@ -627,7 +627,9 @@ The box protocol keeps the PowerShell wrapper's wire format byte for byte, so th
 
 The payload is one base64 word (standard alphabet, padded) of UTF-8 JSON holding the wrapper's keys: `Key`, `Bare`, `Work`, `Lock`, `Index`, `OutputFolder` and `Job`, and for `run` also `Command`, `Subfolder`, `Identity`, `Outputs`, `Nonce` and `OutputsFull`. Unknown keys are ignored, and `Outputs`, `OutputsFull` and `OutputFolder`, which the outputs transport owns (GATE-44), are parsed tolerantly and ignored.
 
-For `run` the wrapper also requires a `Snapshot` key: a 40-hex commit sha, refused with `gate: remote run payload's Snapshot '<value>' is not a 40-hex commit sha` and exit 2, and the commit is what the run checks out. `gate box run` does not read it yet (GATE-86 builds it): it still fetches `refs/gate/<key>` and checks out `FETCH_HEAD`, so today's `remote.ps1` cannot drive it until then.
+For `run` the payload also needs a `Snapshot` key: exactly 40 lowercase hex characters, the commit the run checks out. Anything else is refused before the lock and the checkout with `gate: remote run payload's Snapshot '<value>' is not a 40-hex commit sha` and exit 2.
+
+The value is empty for a missing key or JSON null, the string as given with control characters escaped, and compact JSON for any other non-string. Two differences from the wrapper are deliberate: the echoed value has its control characters escaped, and the check is stricter than the wrapper's .NET `$`, which accepts a trailing newline.
 
 Every path comes from the payload and nothing is written under the gate's state root; `gate box` takes no `--state-dir`. Test seams are `test-seams`-gated flags, never environment variables, and sit before the verb (`gate box --test-... run <payload>`) in a `BoxSeams` struct on `BoxRequest`, apart from the `gate run` seams.
 
@@ -660,7 +662,11 @@ Built verbs:
 
   The payload is data, refused unless well formed; the command, and whatever it writes into `Work`, is the user's own code running as the user, and is trusted.
 
-  The steps are fetch, checkout, clean and the back ref reset, then the command, then the sync-back. A failing step prints `gate: remote <fetch|checkout|clean|back ref reset> failed (status <n>)` and exits `n`.
+  The steps are fetch, the commit probe, checkout, clean and the back ref reset, then the command, then the sync-back. A failing step prints `gate: remote <fetch|checkout|clean|back ref reset> failed (status <n>)` and exits `n`.
+
+  After the fetch of `refs/gate/<key>` from `Bare`, the probe runs `git cat-file -e <sha>^{commit}` in `Work`. A non-zero exit prints `gate: remote snapshot <sha> is not in the work folder's repository after the fetch` and exits 1, and a git that cannot start prints `gate: remote cat-file failed: <message>` and exits 1.
+
+  The checkout is `checkout -q --force --detach <sha>`, the payload's commit and not `FETCH_HEAD`, so a later push of the key changes nothing a running run runs. The box's git calls for preflight and the probe share one start path (`preflight::Git::code`).
 
   A `Subfolder` is compared against the snapshot with per-character simple uppercase (the wrapper's OrdinalIgnoreCase): one that is not a folder inside `Work` prints `gate: remote subfolder <sub> is not a folder inside the work folder`, deletes the back ref and exits 2, and one missing from the snapshot prints `gate: remote subfolder <sub> does not exist in the snapshot` and exits 2. The shared batch refusal (a `.cmd` or `.bat` word, [Command launching](#command-launching)) exits 2.
 

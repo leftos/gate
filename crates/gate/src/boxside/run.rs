@@ -58,6 +58,7 @@ const IDENTITY_NAMES: [&str; 6] = [
 /// What a run reads of its payload.
 struct Request<'a> {
     key: &'a str,
+    snapshot: &'a str,
     bare: &'a str,
     work: &'a str,
     lock: &'a str,
@@ -70,9 +71,12 @@ struct Request<'a> {
 
 impl Request<'_> {
     fn read(payload: &Payload) -> Result<Request<'_>, String> {
+        // The snapshot first, as the wrapper refuses a payload without one before the lock or the checkout.
+        let snapshot = payload.snapshot()?;
         let (key, work) = payload.work_folder()?;
         Ok(Request {
             key,
+            snapshot,
             bare: payload.path("Bare")?,
             work,
             lock: payload.beside_work("Lock", work, "lock")?,
@@ -396,6 +400,15 @@ fn not_started(console: &mut Console, word: &str, resolved: Option<&Path>, messa
     NOT_STARTED
 }
 
+/// The failure of a fetch that left the payload's snapshot out of the work folder's repository: the wrapper's line,
+/// its status 1.
+fn missing_snapshot(sha: &str) -> Failed {
+    Failed {
+        line: format!("gate: remote snapshot {sha} is not in the work folder's repository after the fetch"),
+        status: FAILED_STATUS,
+    }
+}
+
 /// git as the box runs it in the work folder: none of the variables that would point it elsewhere, no standard input,
 /// its hooks read from a folder that cannot exist, and no file-system monitor.
 struct WorkGit {
@@ -428,15 +441,36 @@ impl WorkGit {
         self.git.step(step, &self.args(&all))
     }
 
-    /// The snapshot at `refs/gate/<key>`, fetched from the bare repository, checked out over whatever the last run
-    /// left, untracked files removed and ignored ones (build output) kept, and no back commit of an earlier run left
-    /// behind.
+    /// The snapshot the payload names, fetched from the bare repository at `refs/gate/<key>` and checked out by that
+    /// commit over whatever the last run left, untracked files removed and ignored ones (build output) kept, and no
+    /// back commit of an earlier run left behind. The commit, never the ref's tip, is what is checked out, so a later
+    /// push of the key changes nothing this run runs. A commit the work folder's repository lacks after the fetch ends
+    /// the run with the box's own line.
     fn checkout(&self, request: &Request<'_>) -> Result<(), Failed> {
-        let snapshot = format!("refs/gate/{}", request.key);
-        self.step("fetch", request, &["fetch", "-q", request.bare, &snapshot])?;
-        self.step("checkout", request, &["checkout", "-q", "--force", "--detach", "FETCH_HEAD"])?;
+        let refname = format!("refs/gate/{}", request.key);
+        self.step("fetch", request, &["fetch", "-q", request.bare, &refname])?;
+        let commit = format!("{}^{{commit}}", request.snapshot);
+        match self.quiet(request, &["cat-file", "-e", &commit]) {
+            Ok(0) => {}
+            Ok(_) => return Err(missing_snapshot(request.snapshot)),
+            Err(message) => {
+                return Err(Failed {
+                    line: format!("gate: remote cat-file failed: {message}"),
+                    status: FAILED_STATUS,
+                });
+            }
+        }
+        self.step("checkout", request, &["checkout", "-q", "--force", "--detach", request.snapshot])?;
         self.step("clean", request, &["clean", "-fdq"])?;
         self.clear_back_ref(request)
+    }
+
+    /// git's exit code for `args` in the work folder, both of its streams discarded, as the wrapper discards
+    /// `cat-file`'s own; else why git could not be started.
+    fn quiet(&self, request: &Request<'_>, args: &[&str]) -> Result<i32, String> {
+        let mut all = vec!["-C", request.work];
+        all.extend_from_slice(args);
+        self.git.code(&self.args(&all), Stdio::null(), Stdio::null())
     }
 
     /// Deletes `refs/gate-back/<key>` in the bare repository, an earlier run's back commit, so the client finds none

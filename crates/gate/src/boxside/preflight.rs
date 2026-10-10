@@ -84,7 +84,7 @@ fn ready(bare: &str, work: &str, console: &mut Console) -> Result<(), Failed> {
     }
     // Checked apart from .git, so a preflight cut short between the two steps is finished by the next one. A git that
     // cannot be started here fails the next step, which names it.
-    if git.code(&["-C", work, "config", "--get", "remote.origin.url"], Stdio::null()) != Ok(0) {
+    if git.code(&["-C", work, "config", "--get", "remote.origin.url"], Stdio::null(), Stdio::inherit()) != Ok(0) {
         git.step("git remote add", &["-C", work, "remote", "add", "--", "origin", bare])?;
     }
     // The work folder's own config, so the checkout and the sync-back keep the snapshot's bytes whatever the builder's
@@ -122,23 +122,24 @@ impl Git {
     /// Runs git with `args`, its output passed through; a non-zero status, or a git that cannot be started, fails
     /// `step`, named as the wrapper names it.
     pub(crate) fn step(&self, step: &str, args: &[&str]) -> Result<(), Failed> {
-        match self.code(args, Stdio::inherit()) {
+        match self.code(args, Stdio::inherit(), Stdio::inherit()) {
             Ok(0) => Ok(()),
             Ok(code) => Err(git_failed(step, code)),
             Err(message) => Err(Failed::without_status(format!("gate: remote {step} failed: {message}"))),
         }
     }
 
-    /// git's exit code for `args`, its stdout sent to `stdout` and its stderr passed through; else why it could not be
-    /// started. git reads no standard input and none of the variables that would point it elsewhere.
-    fn code(&self, args: &[&str], stdout: Stdio) -> Result<i32, String> {
+    /// git's exit code for `args`, its stdout sent to `stdout` and its stderr to `stderr`; else why it could not be
+    /// started. git reads no standard input and none of the variables that would point it elsewhere. This is the one
+    /// place git is started, so the redirect clearing, the standard input and the spawn lock live here alone.
+    pub(crate) fn code(&self, args: &[&str], stdout: Stdio, stderr: Stdio) -> Result<i32, String> {
         let program = self.program.as_ref().map_err(Clone::clone)?;
         let mut command = Command::new(program);
         for name in GIT_REDIRECTS {
             command.env_remove(name);
         }
         // Started under the spawn lock, so it inherits no launch's handles.
-        let status = gate_win32::spawn(command.args(args).stdin(Stdio::null()).stdout(stdout))
+        let status = gate_win32::spawn(command.args(args).stdin(Stdio::null()).stdout(stdout).stderr(stderr))
             .and_then(|mut child| child.wait())
             .map_err(|error| error.to_string())?;
         Ok(exit_code(status))
