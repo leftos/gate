@@ -27,6 +27,8 @@ pub(crate) enum ValueOption {
     StallMs,
     #[cfg(feature = "test-seams")]
     JournalRun,
+    #[cfg(feature = "test-seams")]
+    HoldUntil,
 }
 
 /// An option that is on or off.
@@ -127,6 +129,8 @@ impl RunBuilder {
             ValueOption::StallMs => self.test_seams.stall_ms = Some(values::above_zero(spelled, value)?),
             #[cfg(feature = "test-seams")]
             ValueOption::JournalRun => self.test_seams.journal_run = Some(values::status(spelled, value)?),
+            #[cfg(feature = "test-seams")]
+            ValueOption::HoldUntil => self.test_seams.hold_until = Some(PathBuf::from(value)),
         }
         Ok(())
     }
@@ -145,10 +149,14 @@ impl RunBuilder {
     }
 
     /// The run request, or every problem: those found while reading, the journal seam given with
-    /// `--test-print-request`, then each missing input in the order slot, timeout, log, command.
+    /// `--test-print-request`, the hold seam given without the journal seam, then each missing input in the order slot,
+    /// timeout, log, command.
     pub(crate) fn finish_run(mut self, command: Vec<OsString>, spelling: Spelling) -> Result<RunRequest, Vec<Problem>> {
         if self.print_request && self.test_seams.journal_run.is_some() {
             self.problems.push(Problem::JournalRunWithPrintRequest);
+        }
+        if self.test_seams.hold_until.is_some() && !self.given.contains(&RunOption::Value(ValueOption::JournalRun)) {
+            self.problems.push(Problem::HoldUntilWithoutJournalRun);
         }
         for (option, required) in [
             (ValueOption::Slot, Required::Slot),
