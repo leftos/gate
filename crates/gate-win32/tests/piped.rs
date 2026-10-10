@@ -12,7 +12,7 @@ use std::sync::{Once, mpsc};
 use std::thread;
 use std::time::Duration;
 
-use gate_win32::{EnvironmentBlock, Job, OpenedJob, PipedLaunch, PipedSuspended, Running};
+use gate_win32::{EnvironmentBlock, Job, OpenedJob, PipedConsole, PipedLaunch, PipedSuspended, Running};
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_BREAKAWAY_OK, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
     JobObjectExtendedLimitInformation, SetInformationJobObject,
@@ -58,6 +58,7 @@ fn cmd(line: &str) -> PipedLaunch {
         command_line: format!("cmd /d /c {line}").encode_utf16().collect(),
         directory: system,
         environment: EnvironmentBlock::new(std::env::vars_os()).expect("the block is built"),
+        console: PipedConsole::Hidden,
     }
 }
 

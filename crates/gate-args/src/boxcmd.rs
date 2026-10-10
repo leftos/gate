@@ -1,7 +1,7 @@
 //! The hidden `gate box <verb> <payload>`: the builder side of a routed run. Only the words are read here; the payload
 //! word is passed on unread, since decoding it is the binary's. A `test-seams` build also reads the hidden
-//! `--test-heartbeat-ms <n>` (or `--test-heartbeat-ms=<n>`) before the verb; without the feature it is no verb, and so
-//! the box usage.
+//! `--test-heartbeat-ms <n>`, `--test-box-console fail-before` and `--test-box-park-launch <path>` (each also as
+//! `--<seam>=<value>`) before the verb; without the feature each is no verb, and so the box usage.
 
 use std::ffi::{OsStr, OsString};
 use std::iter::Peekable;
@@ -39,49 +39,90 @@ fn verb(text: &str) -> Option<BoxVerb> {
     }
 }
 
-/// The seam that sets the heartbeat's period.
+/// A seam `gate box` reads before the verb.
 #[cfg(feature = "test-seams")]
-const HEARTBEAT_MS: &str = "--test-heartbeat-ms";
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Seam {
+    /// `--test-heartbeat-ms <n>`: the heartbeat's period.
+    HeartbeatMs,
+    /// `--test-box-console fail-before`: the command's UTF-8 console fails before the command starts.
+    Console,
+    /// `--test-box-park-launch <path>`: the command's launch waits until the path exists.
+    ParkLaunch,
+}
 
-/// Reads the seams before the verb, each problem in `problems`: a value from the word itself after `=` or from the next
-/// word unless that word is another `--` option, whole milliseconds above 0, given once.
+#[cfg(feature = "test-seams")]
+impl Seam {
+    /// The seam `word` names, as `--<seam>` or `--<seam>=<value>`.
+    fn named(word: &OsStr) -> Option<Seam> {
+        let text = word.to_str()?;
+        match text.split_once('=').map_or(text, |(name, _)| name) {
+            "--test-heartbeat-ms" => Some(Seam::HeartbeatMs),
+            "--test-box-console" => Some(Seam::Console),
+            "--test-box-park-launch" => Some(Seam::ParkLaunch),
+            _ => None,
+        }
+    }
+
+    /// Its option word.
+    fn name(self) -> &'static str {
+        match self {
+            Seam::HeartbeatMs => "--test-heartbeat-ms",
+            Seam::Console => "--test-box-console",
+            Seam::ParkLaunch => "--test-box-park-launch",
+        }
+    }
+}
+
+/// Reads the seams before the verb, in any order, each problem in `problems`: a value from the word itself after `=`
+/// or from the next word unless that word is another `--` option, each seam given once.
 #[cfg(feature = "test-seams")]
 fn seams(words: &mut Peekable<impl Iterator<Item = OsString>>, problems: &mut Vec<Problem>) -> BoxSeams {
     let mut seams = BoxSeams::default();
-    let mut given = false;
-    while let Some(word) = words.next_if(|word| is_heartbeat_ms(word)) {
+    let mut given: Vec<Seam> = Vec::new();
+    // Each word is named once: peeked, and taken only when it names a seam.
+    while let Some((seam, word)) = words
+        .peek()
+        .and_then(|word| Seam::named(word))
+        .and_then(|seam| words.next().map(|word| (seam, word)))
+    {
         let value = match word.to_string_lossy().split_once('=') {
             Some((_, value)) => Ok(Some(value.to_owned())),
             None => crate::run::next_value(words, |next| next.starts_with("--")),
         };
-        if given {
-            problems.push(Problem::GivenTwice(HEARTBEAT_MS.to_owned()));
+        if given.contains(&seam) {
+            problems.push(Problem::GivenTwice(seam.name().to_owned()));
             continue;
         }
-        given = true;
-        match heartbeat_ms(value) {
-            Ok(ms) => seams.heartbeat_ms = Some(ms),
-            Err(problem) => problems.push(problem),
+        given.push(seam);
+        if let Err(problem) = set_seam(&mut seams, seam, value) {
+            problems.push(problem);
         }
     }
     seams
 }
 
-/// Whether `word` is `--test-heartbeat-ms` or `--test-heartbeat-ms=<value>`.
+/// Sets `seam` from `value`: whole milliseconds above 0 for the heartbeat, `fail-before` for the console, any path
+/// for the park. An empty or missing value is no value.
 #[cfg(feature = "test-seams")]
-fn is_heartbeat_ms(word: &OsStr) -> bool {
-    word.to_str()
-        .and_then(|text| text.strip_prefix(HEARTBEAT_MS))
-        .is_some_and(|rest| rest.is_empty() || rest.starts_with('='))
-}
-
-/// The heartbeat period read from `value`; an empty or missing value is no value.
-#[cfg(feature = "test-seams")]
-fn heartbeat_ms(value: Result<Option<String>, Problem>) -> Result<u64, Problem> {
-    match value? {
-        Some(value) if !value.is_empty() => crate::values::above_zero(HEARTBEAT_MS, &value),
-        _ => Err(Problem::NeedsValue(HEARTBEAT_MS.to_owned())),
+fn set_seam(seams: &mut BoxSeams, seam: Seam, value: Result<Option<String>, Problem>) -> Result<(), Problem> {
+    let name = seam.name();
+    let value = match value? {
+        Some(value) if !value.is_empty() => value,
+        _ => return Err(Problem::NeedsValue(name.to_owned())),
+    };
+    match seam {
+        Seam::HeartbeatMs => seams.heartbeat_ms = Some(crate::values::above_zero(name, &value)?),
+        Seam::Console if value == "fail-before" => seams.fail_console = true,
+        Seam::Console => {
+            return Err(Problem::BadConsoleFailure {
+                option: name.to_owned(),
+                value,
+            });
+        }
+        Seam::ParkLaunch => seams.park_launch = Some(std::path::PathBuf::from(value)),
     }
+    Ok(())
 }
 
 /// No seams without the `test-seams` feature: a `--test-*` word is read as the verb, and refused as one.

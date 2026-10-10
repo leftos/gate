@@ -48,6 +48,11 @@ pub enum Problem {
         option: String,
         value: String,
     },
+    /// A `--test-box-console` value other than `fail-before`.
+    BadConsoleFailure {
+        option: String,
+        value: String,
+    },
     NeedsValue(String),
     GivenTwice(String),
     UnknownOption(String),
@@ -72,6 +77,7 @@ impl fmt::Display for Problem {
             Problem::NotZeroOrAbove { option, value } => write!(f, "gate: {option} must be a whole number 0 or above, got '{value}'"),
             Problem::TooLarge { option, value } => write!(f, "gate: {option} must be at most {MAX_WHOLE_NUMBER}, got '{value}'"),
             Problem::NotTrueOrFalse { option, value } => write!(f, "gate: {option} takes true or false, got '{value}'"),
+            Problem::BadConsoleFailure { option, value } => write!(f, "gate: {option} must be fail-before, got '{value}'"),
             Problem::NeedsValue(option) => write!(f, "gate: {option} needs a value"),
             Problem::GivenTwice(option) => write!(f, "gate: {option} is given twice"),
             Problem::UnknownOption(word) => write!(f, "gate: unknown option {word}"),

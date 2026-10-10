@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
-use gate_win32::{EnvironmentBlock, Job, Launch};
+use gate_win32::{EnvironmentBlock, Job, Launch, OpenedJob};
 use jiff::{SignedDuration, Timestamp};
 use regex::Regex;
 use serde_json::{Value, json};
@@ -1046,6 +1046,127 @@ fn box_run_an_unknown_program_exits_127() {
         outcome.stderr,
         format!("gate: could not start gate-suite-no-such-program: {}\n", gate_win32::win32_message(2))
     );
+}
+
+/// Whether `line` is the box's line for a command it could not give a UTF-8 console, whatever the reason.
+fn is_console_fallback(line: &str) -> bool {
+    line.strip_prefix("gate: remote could not give the command a UTF-8 console (")
+        .and_then(|rest| rest.strip_suffix("); running it on the box's default code page"))
+        .is_some_and(|reason| !reason.is_empty())
+}
+
+/// The fake-tool `mark` file at `path`, empty when no run marked it.
+fn marks(path: &Path) -> String {
+    let text = fs::read_to_string(path);
+    if matches!(&text, Err(error) if error.kind() == std::io::ErrorKind::NotFound) {
+        return String::new();
+    }
+    text.expect("the mark file can be read")
+}
+
+#[test]
+fn box_run_gives_the_command_a_utf8_console() {
+    let case = Case::new("box_run_utf8_console");
+    let mut payload = box_payload(&case, "k", &["cmd", "/d", "/c", "chcp"]);
+    snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
+
+    let outcome = run_box(&case, &payload);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(outcome.stdout, "Active code page: 65001\n", "{outcome:?}");
+    assert_eq!(outcome.stderr, "", "no fallback: {outcome:?}");
+
+    let mut bytes = renamed(&payload, 1);
+    bytes["Command"] = json!([FAKE_TOOL, "bytes", "c3a9e282ac0a"]);
+    let outcome = run_box(&case, &bytes);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(outcome.raw_stdout, "é€\n".as_bytes(), "non-ASCII bytes arrive intact: {outcome:?}");
+    assert_eq!(outcome.stderr, "", "{outcome:?}");
+}
+
+#[test]
+fn box_run_falls_back_before_the_start_and_runs_the_command() {
+    let case = Case::new("box_run_console_fails_before");
+    let count = case.folder().join("count");
+    let count_word = shown(&count);
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "mark", &count_word, "out", "ran"]);
+    snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
+
+    let outcome = finish(box_command(
+        &case,
+        &["box", "--test-box-console", "fail-before", "run", &self::payload(&payload)],
+    ));
+
+    assert_eq!(outcome.code, Some(0), "the fallback never fails the run: {outcome:?}");
+    assert_eq!(outcome.stdout, "ran\n", "{outcome:?}");
+    let said: Vec<&str> = outcome.stderr.lines().collect();
+    assert!(matches!(said[..], [line] if is_console_fallback(line)), "one fallback line: {outcome:?}");
+    assert_eq!(marks(&count), "run\n", "the command ran once");
+}
+
+#[test]
+fn box_run_of_a_command_that_leaves_the_console_runs_once() {
+    let case = Case::new("box_run_leaves_console");
+    let count = case.folder().join("count");
+    let count_word = shown(&count);
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "free-console", "mark", &count_word]);
+    snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
+
+    let outcome = run_box(&case, &payload);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(marks(&count), "run\n", "the command ran once");
+    assert!(!outcome.stderr.lines().any(is_console_fallback), "no fallback: {outcome:?}");
+}
+
+#[test]
+fn box_stop_before_the_launch_stops_the_job() {
+    // The box parks with the console's donor already in the job.
+    stop_before_the_launch("box_stop_before_launch", &[]);
+}
+
+#[test]
+fn box_stop_before_the_launch_without_a_donor_stops_the_job() {
+    stop_before_the_launch("box_stop_before_launch_no_donor", &["--test-box-console", "fail-before"]);
+}
+
+/// A run given `seams` and parked just before its launch, stopped meanwhile, then let go: it fails with the stop line
+/// and no console fallback line, its command never ran, and its job holds no process.
+fn stop_before_the_launch(name: &str, seams: &[&str]) {
+    let case = Case::new(name);
+    let park = case.folder().join("park");
+    let parked = case.folder().join("park.parked");
+    let count = case.folder().join("count");
+    let (park_word, count_word) = (shown(&park), shown(&count));
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "mark", &count_word]);
+    snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
+    let job = field(&payload, "Job");
+    let payload_word = self::payload(&payload);
+    let mut args = vec!["box"];
+    args.extend_from_slice(seams);
+    args.extend_from_slice(&["--test-box-park-launch", &park_word, "run", &payload_word]);
+    let running = start(box_command(&case, &args));
+    wait_until("the box parked before the launch", || parked.exists());
+
+    let stopped = gate_box(&case, "stop", &payload_word, None);
+    let_go(&park);
+    let outcome = running.finish();
+
+    assert_eq!(stopped.code, Some(0), "{stopped:?}");
+    assert_eq!(outcome.code, Some(1), "a stop before the launch fails the run: {outcome:?}");
+    let said = format!("gate: the gate failed while running the command: the job {job} was stopped before the command started");
+    assert!(outcome.stderr.lines().any(|line| line == said), "{said:?} in {outcome:?}");
+    assert!(
+        !outcome.stderr.lines().any(is_console_fallback),
+        "no fallback line before the stop line: {outcome:?}"
+    );
+    if let Some(opened) = OpenedJob::open(job).expect("the job can be looked for") {
+        let left = opened.process_ids().expect("the job's processes can be listed");
+        assert!(left.is_empty(), "no process of the job remains: {left:?}");
+    }
+    assert!(!count.exists(), "the command never ran");
+    wait_until_closed(Path::new(field(&payload, "Lock")));
 }
 
 #[test]

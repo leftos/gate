@@ -25,7 +25,7 @@ const PERIOD: Duration = Duration::from_secs(5);
 const NANOS_PER_TICK: u128 = 100;
 
 /// The heartbeat's period: the seam's milliseconds when given, else [`PERIOD`].
-pub(crate) fn period(seams: BoxSeams) -> Duration {
+pub(crate) fn period(seams: &BoxSeams) -> Duration {
     seams.heartbeat_ms.map_or(PERIOD, Duration::from_millis)
 }
 

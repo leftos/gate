@@ -33,7 +33,7 @@ pub(crate) fn answer(request: &BoxRequest, console: &mut Console) -> u32 {
             boot::say(console);
             0
         }
-        BoxVerb::Run => run::run(&payload, heartbeat::period(request.seams), console),
+        BoxVerb::Run => run::run(&payload, &request.seams, console),
         BoxVerb::Stop => stop::stop(&payload, console),
         BoxVerb::Outputs => {
             console.err(&format!("gate: box {} is not built yet", request.verb.as_str()));

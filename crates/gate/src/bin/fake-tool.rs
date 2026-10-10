@@ -12,7 +12,10 @@
 //! exits with status n, any 32-bit code, negative ones as Windows reads them back;
 //! `env <name>` prints the variable's value, or `fake-tool: <name> is not set`, on its own line; `bytes <hex>` writes the
 //! bytes the hex digits spell to stdout as they are, with no line feed added; `lines <n> <text>` prints n lines on
-//! stdout, the i-th `<text><i>` counting from 1; `pid` prints `pid <its own pid>` on stdout;
+//! stdout, the i-th `<text><i>` counting from 1; `pid` prints `pid <its own pid>` on stdout; `mark <path>` adds the line
+//! `run` to the file at the path, creating it when missing, so a case can count how many times its command ran;
+//! `free-console` leaves this process's console, as a GUI program or one that detaches early does, its standard handles
+//! kept;
 //! `argv` prints every word after it, each on its own line, and ends, so it is always the last step.
 //! With no `exit` step it exits 0. For example `fake-tool out hi err oops exit 3`.
 
@@ -117,6 +120,8 @@ fn run(args: &[OsString]) -> Result<i32, String> {
                 stdout.flush().map_err(|error| write_failed(&error))?;
                 return text.parse().map_err(|_| format!("exit takes a 32-bit status, got '{text}'"));
             }
+            "mark" => mark(&operand(&mut steps, "mark")?)?,
+            "free-console" => free_console()?,
             "pid" => {
                 writeln!(stdout, "pid {}", std::process::id()).map_err(|error| write_failed(&error))?;
                 stdout.flush().map_err(|error| write_failed(&error))?;
@@ -209,6 +214,25 @@ fn spawn_orphan(path: &str) -> Result<(), String> {
     } else {
         Err(format!("the orphaning helper ended with {status}"))
     }
+}
+
+/// Adds the line `run` to the file at `path`, creating it when missing.
+fn mark(path: &str) -> Result<(), String> {
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .and_then(|mut file| file.write_all(b"run\n"))
+        .map_err(|error| format!("cannot mark {path}: {error}"))
+}
+
+/// Leaves this process's console; its standard handles, the pipes it was given, stay as they are.
+fn free_console() -> Result<(), String> {
+    // SAFETY: the call takes no pointers.
+    if unsafe { windows_sys::Win32::System::Console::FreeConsole() } == 0 {
+        return Err(format!("cannot leave the console: {}", io::Error::last_os_error()));
+    }
+    Ok(())
 }
 
 /// The value of the variable `name`, or the line saying it is not set.

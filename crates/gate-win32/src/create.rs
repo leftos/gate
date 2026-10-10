@@ -329,7 +329,7 @@ mod tests {
     use windows_sys::Win32::Foundation::{GetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT};
 
     use super::SPAWN_LOCK;
-    use crate::{EnvironmentBlock, Job, Launch, PipedLaunch};
+    use crate::{EnvironmentBlock, Job, Launch, PipedConsole, PipedLaunch};
 
     /// Keeps these tests from running at once, so that one's launch never holds the spawn lock while the other checks
     /// that it is free. Every unit test of this crate that starts a process takes it for its whole run, or that check
@@ -414,6 +414,7 @@ mod tests {
             command_line: "cmd /d /c exit 0".encode_utf16().collect(),
             directory: system,
             environment: environment(),
+            console: PipedConsole::Hidden,
         };
 
         // `CreateProcessW` refuses the command when this process's job refuses breakaway; the window comes before the

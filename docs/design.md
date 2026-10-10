@@ -271,6 +271,7 @@ For any other root, every kernel object name carries `<h>`, the first 8 lower-ca
 | waiter's wake event | `Local\gate-wake-<pid>-<start>` | `Local\gate-<h>-wake-<pid>-<start>` |
 | command's job | `Local\gate-job-<gate pid>` | `Local\gate-<h>-job-<gate pid>` |
 | box command's job | `Local\gate-remote-<key>-<nonce>` | the same; the name is not root-dependent |
+| box command's stop event | `Local\gate-remote-<key>-<nonce>-stopped` | the same; the name is not root-dependent |
 | log's mutex | `Local\gate-log-<l>` | `Local\gate-<h>-log-<l>` |
 
 The critical mutex is taken by a critical gate once no earlier live critical ticket exists, and held for its whole run. An abandoned one counts as taken ([Abandoned slots](#abandoned-slots)).
@@ -716,7 +717,9 @@ The value is empty for a missing key or JSON null, the string as given with cont
 
 Every path comes from the payload and nothing is written under the gate's state root; `gate box` takes no `--state-dir`. Test seams are `test-seams`-gated flags, never environment variables, and sit before the verb (`gate box --test-... run <payload>`) in a `BoxSeams` struct on `BoxRequest`, apart from the `gate run` seams, so `--test-print-request` is unchanged.
 
-The one box seam is `--test-heartbeat-ms <n>` (or `--test-heartbeat-ms=<n>`), the period of the command heartbeat. It is refused as the `gate run` seams are: no value, not a whole number above 0, above 2147483647, or given twice. Without the feature the word gets the box usage line.
+The box seams, in any order before the verb and each also as `--<seam>=<value>`, are `--test-heartbeat-ms <n>`, the period of the command heartbeat; `--test-box-console fail-before`, which makes the command's UTF-8 console fail before the command starts (the only accepted value, else `gate: --test-box-console must be fail-before, got '<value>'`); and `--test-box-park-launch <path>`, which parks the launch after the donor is in the job and before the output lock, writes the empty file `<path>.parked`, and goes on once `<path>` exists (at most 600 s).
+
+A seam is refused as the `gate run` seams are: no value, given twice, and for the heartbeat not a whole number above 0 or above 2147483647. Without the feature each word gets the box usage line.
 
 The box leaves build servers warm on purpose: it sets neither `MSBUILDDISABLENODEREUSE` (the local gate sets it to 1 for every command) nor a node handshake salt, so MSBuild nodes and compiler servers survive between runs and every work folder on the builder shares one node pool.
 
@@ -767,9 +770,13 @@ Built verbs:
 
   A `Subfolder` is compared against the snapshot with per-character simple uppercase (the wrapper's OrdinalIgnoreCase): one that is not a folder inside `Work` prints `gate: remote subfolder <sub> is not a folder inside the work folder`, deletes the back ref and exits 2, and one missing from the snapshot prints `gate: remote subfolder <sub> does not exist in the snapshot` and exits 2. The shared batch refusal (a `.cmd` or `.bat` word, [Command launching](#command-launching)) exits 2.
 
-  The command runs on a hidden console of its own (`CREATE_NO_WINDOW`) and outside the box's own job, created with `CREATE_BREAKAWAY_FROM_JOB` so it leaves the ssh session's job (the box's job refusing breakaway prints `gate: the box cannot start a command outside its own job: <message>` and exits 1).
+  The command runs outside the box's own job, created with `CREATE_BREAKAWAY_FROM_JOB` so it leaves the ssh session's job (the box's job refusing breakaway prints `gate: the box cannot start a command outside its own job: <message>` and exits 1). Its console is a donor's UTF-8 console (the console, below), else a hidden console of its own (`CREATE_NO_WINDOW`).
 
   It is assigned to the payload's named job, which has no limits and no kill-on-close, and inherits exactly NUL, the two pipe write ends and a query-only handle to its job, as copies made under the spawn lock ([Command launching](#command-launching)). The box's git and dotnet calls start through `gate_win32::spawn`, under the same lock.
+
+  The stop event `<job>-stopped` ([Kernel object names](#kernel-object-names)) is a manual-reset event the run creates, unset, right after it takes the work-folder lock, before the fetch and checkout; one that cannot be created prints `gate: the gate failed while running the command: cannot create the event <job>-stopped: <error>` and exits 1. `gate box stop` sets it whether or not the job exists yet (a missing event is silent), then terminates the job when there is one. The run looks at it once just before it creates the job (set: the stop line and exit 1, nothing started), and again after the command is assigned to the job and before it is resumed, on every launch.
+
+  Set means a `stop` came first: the command is ended unstarted, the job is terminated, and the run prints `gate: the gate failed while running the command: the job <name> was stopped before the command started` and exits 1. An event that cannot be read prints `gate: remote cannot read the stop signal of job <name>: <error>; starting the command`, and the command starts.
 
   A job name already held prints `gate: the job <name> already exists; a run's job name must be new` and exits 1. A command that cannot start prints `gate: could not start <word>[ (<resolved>)]: <message>` and exits 127; a failure of the gate after the start prints `gate: the gate failed while running the command: <problem>` and exits 1. If the box panics after the resume, the job is terminated with 124.
 
@@ -780,15 +787,19 @@ Built verbs:
   On stderr, best effort, it says `gate: remote the client closed the connection; stopped job <name>` once the job is empty. Otherwise it says `gate: remote the client closed the connection; stopping job <name>` followed by the could-not-stop line or the `still has <n> process(es)` line of `stop`. The stdin closing is not the signal. A command that itself exits 255 is indistinguishable from a lost connection, as with the PowerShell wrapper.
 
   After the command, the sync-back commits the tree when it changed: a copy of the index at `<Work>.index` is staged, and the commit (message `gate-remote back`, parent HEAD) is written to `refs/gate-back/<key>` in `Bare`. A sync-back that fails prints `gate: remote sync-back failed: <message>` and turns a 0 status into 1; an index copy that cannot be removed prints `gate: remote could not remove <index>: <error>` and changes no status.
-- **`stop`** terminates the payload's job, taking no lock. It polls the job's process ids every 100 ms for up to 10 s; its processes end with 124. A stopped job prints `gate: remote stopped job <name>` on stdout and exits 0; no such job exits 0 with no output.
+- **`stop`** sets the job's stop event, then terminates the payload's job, taking no lock. It terminates the job again on every 100 ms poll of the job's process ids, until the job is empty or 10 s pass, so a process that joins late is ended; its processes end with 124. A terminate after the first that fails is not a failure of the stop: it is said once, `gate: remote could not terminate job <name> again: <error>`, after the other lines. An event that cannot be set prints `gate: remote could not signal the stop of job <name>: <error>` on stderr, and the job is terminated all the same. A stopped job prints `gate: remote stopped job <name>` on stdout and exits 0; no such job exits 0 with no output.
 
   Processes still alive 10 s after the termination print `gate: remote job <name> still has <n> process(es) 10 s after it was terminated` and exit 1, and a job that cannot be terminated prints `gate: remote could not stop job <name>: <error>` and exits 1.
 
-`outputs` prints `gate: box outputs is not built yet` and exits 70. The console belongs to a later part of the remote port (GATE-61) and is planned, not built:
+`outputs` prints `gate: box outputs is not built yet` and exits 70.
 
-- **The console** is a UTF-8 console from the donor-console method, as the PowerShell wrapper does it.
+The console: `gate box run` gives the command a UTF-8 console through a donor console, as the PowerShell wrapper does. Right after it creates the run's job, the box starts a hidden donor, the system's `cmd.exe /d /q /k` (never one found on PATH), in the job. The donor holds a stdin pipe nobody writes so `cmd /k` does not exit, and lives for the whole run, until the wait for the command is over.
 
-  A restart into a replacement console keeps the same job: the job is never terminated for it, its processes are killed one by one through their process ids until none remain, and the command is relaunched into the same job, so there is no window without a job, a `stop` that arrives meanwhile still finds it, and the client needs no change. A run whose relaunch fails because a `stop` emptied the job exits 1 with `gate: the gate failed while running the command: <problem>`.
+To create the command the box starts a keeper `cmd.exe` on its own console, so that console stays alive, then takes the output lock, waiting at most 10 s. It leaves its console, attaches to the donor's and sets the input and output code pages to 65001. It creates the command suspended in the job, without `CREATE_NO_WINDOW`, so the command inherits the donor's console, then checks the stop event and resumes it. It then returns to its own console, the keeper's (`AttachConsole(ATTACH_PARENT_PROCESS)` as the last resort), ends the keeper, and puts back its standard handles that were not console handles.
+
+Before the command starts, a donor that cannot start, an attach or code page that fails, or an output lock not had in 10 s (reason `the box's output is blocked`) does not fail the run: the command runs on the plain hidden console and the box says `gate: remote could not give the command a UTF-8 console (<reason>); running it on the box's default code page`. The line comes after the launch, and only when the launch was not stopped.
+
+There is no fallback after the command has started and no relaunch: a command that never shows on the console (a GUI program, one that calls `FreeConsole`, a slow starter) runs once.
 
 The rest of the protocol, the transport of snapshots and outputs, is the remote port's design (GATE-10).
 
@@ -862,6 +873,8 @@ A Rust integration suite drives the built `gate.exe` through its CLI and reads o
 
 - **Own state root per case.** Every case creates a fresh folder under the target directory's temporary folder. The folder is the case's working folder, holding its logs and its `LOCALAPPDATA`, and its `state` subfolder is the `--state-dir`, so cases never touch the machine's real slots, journal or counts, or each other's. Cases run side by side.
 - **Test seams.** Hidden `--test-*` flags, compiled only with the `test-seams` cargo feature, set the timing knobs: `--test-sample-ms` (sample period), `--test-heartbeat-ms` (wait heartbeat; on `gate box` the command heartbeat's period), `--test-poll-ms` (fallback poll) and `--test-stall-ms` (stall window below a second). Each takes whole milliseconds above 0 on `gate run`. The sample and stall knobs drive the watchdog.
+
+  Two seams of `gate box` shape the command's console: `--test-box-console fail-before` makes the UTF-8 console fail before the command starts, and `--test-box-park-launch <path>` parks the launch until `<path>` exists ([The box side](#the-box-side)).
 
   Two more seams make a run end by Ctrl+C without a console: `--test-interrupt-after-samples <n>` raises the interrupt after the n-th sample, and `--test-interrupt-queued` raises it when the waiting line is printed, so once no slot is free for the gate. `--test-print-request` shows them as `testSeams.interruptAfterSamples` and `testSeams.interruptQueued`.
 

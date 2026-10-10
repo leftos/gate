@@ -262,7 +262,10 @@ fn box_seam_heartbeat_ms_is_read_before_the_verb() {
         Invocation::Box(BoxRequest {
             verb: BoxVerb::Run,
             payload: OsString::from("e30="),
-            seams: BoxSeams { heartbeat_ms },
+            seams: BoxSeams {
+                heartbeat_ms,
+                ..BoxSeams::default()
+            },
         })
     };
     assert_eq!(invocation(&["box", "--test-heartbeat-ms", "30", "run", "e30="]), beating(Some(30)));
@@ -317,6 +320,134 @@ fn box_seam_heartbeat_ms_refuses_what_the_run_seams_refuse() {
 fn box_seam_heartbeat_ms_is_an_unknown_word_without_the_feature() {
     assert_eq!(problems(&["box", "--test-heartbeat-ms", "30", "run", "e30="]), [BOX_USAGE]);
     assert_eq!(problems(&["box", "--test-heartbeat-ms=30", "run", "e30="]), [BOX_USAGE]);
+}
+
+#[cfg(feature = "test-seams")]
+#[test]
+fn box_seam_console_and_park_launch_are_read_before_the_verb() {
+    use std::ffi::OsString;
+    use std::path::PathBuf;
+
+    use gate_args::{BoxRequest, BoxSeams, BoxVerb, Invocation};
+
+    use crate::support::invocation;
+
+    let running = |seams| {
+        Invocation::Box(BoxRequest {
+            verb: BoxVerb::Run,
+            payload: OsString::from("e30="),
+            seams,
+        })
+    };
+    let failing = || BoxSeams {
+        fail_console: true,
+        ..BoxSeams::default()
+    };
+    let parked = || BoxSeams {
+        park_launch: Some(PathBuf::from(r"X:\case\park")),
+        ..BoxSeams::default()
+    };
+    assert_eq!(
+        invocation(&["box", "--test-box-console", "fail-before", "run", "e30="]),
+        running(failing())
+    );
+    assert_eq!(invocation(&["box", "--test-box-console=fail-before", "run", "e30="]), running(failing()));
+    assert_eq!(
+        invocation(&["box", "--test-box-park-launch", r"X:\case\park", "run", "e30="]),
+        running(parked())
+    );
+    assert_eq!(
+        invocation(&["box", "--test-box-park-launch=X:\\case\\park", "run", "e30="]),
+        running(parked())
+    );
+    assert_eq!(
+        invocation(&[
+            "box",
+            "--test-box-park-launch",
+            r"X:\case\park",
+            "--test-heartbeat-ms",
+            "30",
+            "--test-box-console",
+            "fail-before",
+            "stop",
+            "e30="
+        ]),
+        Invocation::Box(BoxRequest {
+            verb: BoxVerb::Stop,
+            payload: OsString::from("e30="),
+            seams: BoxSeams {
+                heartbeat_ms: Some(30),
+                fail_console: true,
+                park_launch: Some(PathBuf::from(r"X:\case\park")),
+            },
+        }),
+        "the seams come in any order before the verb"
+    );
+}
+
+#[cfg(feature = "test-seams")]
+#[test]
+fn box_seam_console_and_park_launch_refuse_a_bad_missing_or_repeated_value() {
+    let rows: [(&[&str], &[&str]); 12] = [
+        (
+            &["box", "--test-box-console", "fail-sideways", "run", "e30="],
+            &["gate: --test-box-console must be fail-before, got 'fail-sideways'"],
+        ),
+        (
+            &["box", "--test-box-console", "fail-after", "run", "e30="],
+            &["gate: --test-box-console must be fail-before, got 'fail-after'"],
+        ),
+        (
+            &["box", "--test-box-console", "FAIL-BEFORE", "run", "e30="],
+            &["gate: --test-box-console must be fail-before, got 'FAIL-BEFORE'"],
+        ),
+        (
+            &["box", "--test-box-console=", "run", "e30="],
+            &["gate: --test-box-console needs a value"],
+        ),
+        (
+            &["box", "--test-box-console", "--test-box-park-launch", "p", "run", "e30="],
+            &["gate: --test-box-console needs a value"],
+        ),
+        (
+            &[
+                "box",
+                "--test-box-console",
+                "fail-before",
+                "--test-box-console=fail-before",
+                "run",
+                "e30=",
+            ],
+            &["gate: --test-box-console is given twice"],
+        ),
+        (
+            &["box", "--test-box-park-launch=", "run", "e30="],
+            &["gate: --test-box-park-launch needs a value"],
+        ),
+        (
+            &["box", "--test-box-park-launch", "--test-heartbeat-ms", "30", "run", "e30="],
+            &["gate: --test-box-park-launch needs a value"],
+        ),
+        (
+            &["box", "--test-box-park-launch", "a", "--test-box-park-launch=b", "run", "e30="],
+            &["gate: --test-box-park-launch is given twice"],
+        ),
+        (&["box", "--test-box-park-restart", "p", "run", "e30="], &[BOX_USAGE]),
+        (&["box", "run", "--test-box-console", "fail-before", "e30="], &[BOX_USAGE]),
+        (&["box", "--test-box-consolex", "fail-before", "run", "e30="], &[BOX_USAGE]),
+    ];
+    for (words, want) in rows {
+        assert_eq!(problems(words), want, "{words:?}");
+    }
+}
+
+#[cfg(not(feature = "test-seams"))]
+#[test]
+fn box_seam_console_and_park_launch_are_unknown_words_without_the_feature() {
+    assert_eq!(problems(&["box", "--test-box-console", "fail-before", "run", "e30="]), [BOX_USAGE]);
+    assert_eq!(problems(&["box", "--test-box-console=fail-before", "run", "e30="]), [BOX_USAGE]);
+    assert_eq!(problems(&["box", "--test-box-park-launch", "park", "run", "e30="]), [BOX_USAGE]);
+    assert_eq!(problems(&["box", "--test-box-park-launch=park", "run", "e30="]), [BOX_USAGE]);
 }
 
 #[cfg(not(feature = "test-seams"))]

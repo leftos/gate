@@ -38,12 +38,18 @@ pub struct BoxRequest {
     pub seams: BoxSeams,
 }
 
-/// What the black-box suite sets on `gate box` through the hidden `--test-*` flags given before the verb; all `None` in
-/// a gate built without the `test-seams` feature.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// What the black-box suite sets on `gate box` through the hidden `--test-*` flags given before the verb; each field
+/// keeps its default, as its own line says, in a gate built without the `test-seams` feature.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct BoxSeams {
-    /// The period of `gate box run`'s heartbeat, in milliseconds.
+    /// The period of `gate box run`'s heartbeat, in milliseconds; `None` without the feature.
     pub heartbeat_ms: Option<u64>,
+    /// Make `gate box run` fail to give its command a UTF-8 console before the command starts, so it starts on the
+    /// plain hidden console; `false` without the feature.
+    pub fail_console: bool,
+    /// Make `gate box run` wait, just before it starts the command, until this path exists; `None` without the
+    /// feature.
+    pub park_launch: Option<PathBuf>,
 }
 
 /// What `gate box` was asked to do on the builder.

@@ -350,14 +350,33 @@ impl Suspended {
     ///
     /// [`LaunchError::Setup`] when the command cannot be put in the job or resumed; it is terminated with exit code 1
     /// first.
-    pub fn assign_and_resume(mut self, job: &Job) -> Result<Running, LaunchError> {
+    pub fn assign_and_resume(self, job: &Job) -> Result<Running, LaunchError> {
+        self.assign(job)?;
+        self.resume()
+    }
+
+    /// Puts the command in `job`, still suspended; [`Suspended::resume`] lets it run.
+    ///
+    /// # Errors
+    ///
+    /// [`LaunchError::Setup`] when the command cannot be put in the job; it is terminated with exit code 1 once dropped.
+    pub fn assign(&self, job: &Job) -> Result<(), LaunchError> {
+        let Some(process) = &self.process else {
+            return Err(setup(io::Error::other("the process was already taken"), "put the command in its job"));
+        };
+        job.assign(process)
+            .map_err(|error| setup(error, &format!("put the command in the job {}", job.name())))
+    }
+
+    /// Lets the command run, once [`Suspended::assign`] has put it in its job.
+    ///
+    /// # Errors
+    ///
+    /// [`LaunchError::Setup`] when the command cannot be resumed; it is terminated with exit code 1 first.
+    pub fn resume(mut self) -> Result<Running, LaunchError> {
         let Some(process) = self.process.take() else {
             return Err(setup(io::Error::other("the process was already taken"), "resume the command"));
         };
-        if let Err(error) = job.assign(&process) {
-            end_unstarted(&process);
-            return Err(setup(error, &format!("put the command in the job {}", job.name())));
-        }
         // SAFETY: the thread handle is open for the whole call, with the `THREAD_SUSPEND_RESUME` access a created
         // thread's handle has.
         if unsafe { ResumeThread(self.thread.raw()) } == u32::MAX {
@@ -396,8 +415,8 @@ pub(crate) fn end_unstarted_by_id(pid: u32) {
 
 /// A command resumed in its job.
 pub struct Running {
-    process: OwnedHandle,
-    pid: u32,
+    pub(crate) process: OwnedHandle,
+    pub(crate) pid: u32,
 }
 
 impl Running {

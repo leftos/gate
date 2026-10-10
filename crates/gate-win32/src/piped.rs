@@ -1,7 +1,7 @@
 //! Commands created suspended with their output piped back: stdin from `NUL`, stdout and stderr into two anonymous
-//! pipes whose read ends stay with the caller, outside the caller's own job and on a hidden console of their own, then
-//! put in a named job and resumed. The command also inherits a handle to that job, so the job's name lasts while the
-//! command runs even after the caller is gone.
+//! pipes whose read ends stay with the caller, outside the caller's own job and on a hidden console of their own or the
+//! caller's, then put in a named job and resumed. The command also inherits a handle to that job, so the job's name
+//! lasts while the command runs even after the caller is gone.
 
 use std::fs::File;
 use std::io;
@@ -34,6 +34,17 @@ pub struct PipedLaunch {
     pub directory: PathBuf,
     /// The command's whole environment.
     pub environment: EnvironmentBlock,
+    /// The console the command is created on.
+    pub console: PipedConsole,
+}
+
+/// The console a [`PipedLaunch`] creates its command on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PipedConsole {
+    /// A hidden console of its own (`CREATE_NO_WINDOW`), whose code pages are the system's OEM ones.
+    Hidden,
+    /// The console this process is attached to, which the command inherits, such as a [`crate::Utf8Console`].
+    Attached,
 }
 
 /// A command [`PipedLaunch::start_suspended`] created: the suspended process, and the read ends of its two pipes.
@@ -49,12 +60,12 @@ pub struct PipedSuspended {
 
 impl PipedLaunch {
     /// Creates the command suspended, in its working folder with its environment, outside this process's job
-    /// (`CREATE_BREAKAWAY_FROM_JOB`, which fails when that job refuses breakaway) and on a hidden console of its own
-    /// (`CREATE_NO_WINDOW`). Its stdin is `NUL` and its stdout and stderr the write ends of two new pipes; it inherits
-    /// exactly those three handles and one to `job`, opened by the job's name with query access only, so the name
-    /// lasts as long as the command runs. This process's copies of those four handles are closed before the call
-    /// returns; the read ends are never inheritable. The command is not yet in `job`: the caller puts it there with
-    /// [`Suspended::assign_and_resume`].
+    /// (`CREATE_BREAKAWAY_FROM_JOB`, which fails when that job refuses breakaway) and on the console
+    /// [`PipedLaunch::console`] names: a hidden one of its own (`CREATE_NO_WINDOW`), or this process's. Its stdin is
+    /// `NUL` and its stdout and stderr the write ends of two new pipes; it inherits exactly those three handles and one
+    /// to `job`, opened by the job's name with query access only, so the name lasts as long as the command runs.
+    /// This process's copies of those four handles are closed before the call returns; the read ends are never
+    /// inheritable. The command is not yet in `job`: the caller puts it there with [`Suspended::assign_and_resume`].
     ///
     /// This process's own handles to those four are never inheritable: the command inherits copies open only while the
     /// spawn lock is held, so no process started meanwhile through [`crate::spawn`] or another launch inherits them.
@@ -80,7 +91,11 @@ impl PipedLaunch {
             stdio: [&input, &output, &errors],
             others: &[(&job_handle, Some(JOB_OBJECT_QUERY))],
         };
-        let suspended = create_inheriting(&creation, CREATE_BREAKAWAY_FROM_JOB | CREATE_NO_WINDOW, &inherited, None)?;
+        let flags = match self.console {
+            PipedConsole::Hidden => CREATE_BREAKAWAY_FROM_JOB | CREATE_NO_WINDOW,
+            PipedConsole::Attached => CREATE_BREAKAWAY_FROM_JOB,
+        };
+        let suspended = create_inheriting(&creation, flags, &inherited, None)?;
         // The command holds its own copies now; with these closed, each read end ends when the command's copies do.
         drop((input, output, errors, job_handle));
         Ok(PipedSuspended { suspended, stdout, stderr })

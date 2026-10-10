@@ -2,7 +2,8 @@
 //! in the payload's job with its output forwarded, the tree it left committed back, and the command's status passed
 //! whole, as the PowerShell wrapper's `Invoke-Run` does. git starts through [`gate_win32::spawn`], under the spawn lock
 //! the command's own launch holds while its inheritable handle copies are open, so no git inherits a handle meant for
-//! the command.
+//! the command. The command runs on a console whose code pages are UTF-8 ([`Utf8Console`]), or, when it cannot have
+//! one, on the box's default code page, which the box says and never fails the run for.
 //!
 //! The payload is data: it is refused unless well formed, and runs nothing but its command and writes nothing but the
 //! work folder's own files. The command, and whatever it writes into the work folder, `.git` included, is the user's
@@ -15,18 +16,20 @@ use std::io;
 use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, TryLockError};
+use std::thread;
+use std::time::{Duration, Instant};
 
+use gate_args::BoxSeams;
 use gate_watchdog::Pump;
-use gate_win32::{Job, LaunchError, PipedLaunch, PipedSuspended, Running};
+use gate_win32::{Donor, Job, LaunchError, NamedEvent, PipedConsole, PipedLaunch, PipedSuspended, Running, Utf8Console};
 
 use crate::answer::USAGE_STATUS;
 use crate::boxside::forward::{DRAIN, Forwarders, OutputLock};
 use crate::boxside::heartbeat;
 use crate::boxside::payload::{Payload, ordinal_upper};
 use crate::boxside::preflight::{Failed, GIT_REDIRECTS, Git, exit_code};
-use crate::boxside::stop::{STOPPED, still_holding, terminate_and_wait};
+use crate::boxside::stop::{Ending, STOPPED, stop_event_name, terminate_and_wait};
 use crate::console::Console;
 use crate::environment::Variables;
 use crate::run::{Written, find_program, written};
@@ -41,6 +44,11 @@ const NOT_STARTED: u32 = 127;
 const CLOSED_STATUS: u32 = 255;
 /// How long one wait for the command's exit lasts before the box looks again whether the client is still there.
 const WAIT_STEP: Duration = Duration::from_millis(100);
+/// How often the park seam looks for its path, and how long it looks before the launch goes on.
+const PARK_STEP: Duration = Duration::from_millis(20);
+const PARK_LIMIT: Duration = Duration::from_secs(600);
+/// The reason the console seam gives for the failure it forces.
+const FORCED: &str = "the test seam --test-box-console forced the failure";
 /// The Win32 errors of an open refused because another process has the file open.
 const SHARING_VIOLATION: i32 = 32;
 const LOCK_VIOLATION: i32 = 33;
@@ -113,8 +121,9 @@ fn identity(payload: &Payload) -> Result<Vec<(String, String)>, String> {
 /// when it could not be started, 75 when another run holds the work folder, 2 for a payload or a word refused, a
 /// failing git step's status, 1 when the box failed or the tree of a passed command could not be committed back, or
 /// 255 when the client closed the connection and the box stopped the job. Once the subfolder is checked, a heartbeat
-/// goes to stderr every `period` until the run ends.
-pub(crate) fn run(payload: &Payload, period: Duration, console: &mut Console) -> u32 {
+/// goes to stderr every period, 5 s unless `seams` set it, until the run ends; `seams` may also make the command's
+/// console fail, or park its launch.
+pub(crate) fn run(payload: &Payload, seams: &BoxSeams, console: &mut Console) -> u32 {
     let request = match Request::read(payload) {
         Ok(request) => request,
         Err(line) => {
@@ -135,16 +144,25 @@ pub(crate) fn run(payload: &Payload, period: Duration, console: &mut Console) ->
             return FAILED_STATUS;
         }
     };
-    match in_work_folder(&request, period, console) {
+    // Made as soon as the lock is held and kept for the run, so a stop that comes before the job exists, during the
+    // checkout, is kept for the look just before the job is created.
+    let stop = match create_stop_event(request.job, console) {
+        Ok(stop) => stop,
+        Err(status) => return status,
+    };
+    match in_work_folder(&request, &stop, seams, console) {
         Ok(status) | Err(status) => status,
     }
 }
 
 /// What the run writes besides its console lines: the lock every line on the box's own output takes, and the
-/// heartbeat pump writing under it, `None` when it could not be started.
+/// heartbeat pump writing under it, `None` when it could not be started; the seams that may make the command's
+/// console fail; and the job's stop signal, made once the work folder's lock is held.
 struct Beat<'a> {
     lock: &'a OutputLock,
     pump: Option<&'a Pump>,
+    seams: &'a BoxSeams,
+    stop: &'a NamedEvent,
 }
 
 impl Beat<'_> {
@@ -165,7 +183,7 @@ impl Beat<'_> {
 
 /// The run once the lock is held: `Ok` with the status after the back commit, or `Err` with the status of a run that
 /// ended before it, its lines said. The heartbeat starts once the subfolder is checked and stops on every way out.
-fn in_work_folder(request: &Request<'_>, period: Duration, console: &mut Console) -> Result<u32, u32> {
+fn in_work_folder(request: &Request<'_>, stop: &NamedEvent, seams: &BoxSeams, console: &mut Console) -> Result<u32, u32> {
     let git = WorkGit::ready(request);
     // Refused before the checkout, so a payload naming a folder outside the work folder changes nothing there; the
     // earlier run's back ref goes, as the checkout's would, so the client finds none to fetch.
@@ -179,12 +197,14 @@ fn in_work_folder(request: &Request<'_>, period: Duration, console: &mut Console
     };
     let lock = OutputLock::default();
     // A heartbeat that cannot start ends the heartbeats, never the run.
-    let pump = heartbeat::start(&lock, period)
+    let pump = heartbeat::start(&lock, heartbeat::period(seams))
         .inspect_err(|error| console.err(&format!("gate: remote heartbeat stopped: cannot start the heartbeat: {error}")))
         .ok();
     let beat = Beat {
         lock: &lock,
         pump: pump.as_ref(),
+        seams,
+        stop,
     };
     let ran = checked_out(request, &git, &place, &beat, console);
     if let Some(pump) = pump {
@@ -275,7 +295,11 @@ fn full_path(path: &Path) -> Option<PathBuf> {
 
 /// Starts the command in `place` and sees it to its end: `Ok` with its status (127 when it could not be started), or
 /// `Err` with the status of a run that ends here, its line said: 2 for a batch word refused, 1 for the box's own
-/// failure, 255 for a client that closed the connection. The heartbeat watches the job while [`watch`] waits for it.
+/// failure or a stop that came first, 255 for a client that closed the connection. The job's stop signal is looked at
+/// just before the job is created ([`before_the_job`]), so a stop that came while the snapshot was checked out starts
+/// nothing. The command starts on a UTF-8 console when it can have one
+/// ([`start_command`]), whose donor lives until the wait for the command is over, however it ends. The heartbeat
+/// watches the job while [`watch`] waits for it.
 fn command(request: &Request<'_>, place: &Path, beat: &Beat<'_>, console: &mut Console) -> Result<u32, u32> {
     let variables = Variables::from_process();
     let environment = variables
@@ -300,19 +324,246 @@ fn command(request: &Request<'_>, place: &Path, beat: &Beat<'_>, console: &mut C
             command_line,
             directory: place.to_owned(),
             environment,
+            console: PipedConsole::Hidden,
         },
     };
+    before_the_job(|| beat.stop.is_set(), request.job, console)?;
     let job = create_job(request.job, console)?;
-    let PipedSuspended { suspended, stdout, stderr } = match launch.start_suspended(&job) {
-        Ok(piped) => piped,
-        Err(LaunchError::CreateProcess { code, message }) => return start_failed(console, word, &program, code, &message),
-        Err(error) => return Err(failed(console, &error.to_string())),
+    // Started right after the job and kept until the command's wait is over, so its console outlives the command.
+    let donor = console_donor(&job, beat.seams);
+    if let Some(park) = beat.seams.park_launch.as_deref() {
+        wait_for_path(park, console);
+    }
+    let mut start = Start {
+        launch,
+        job: &job,
+        stop: beat.stop,
+        word,
+        program: &program,
     };
-    let running = suspended.assign_and_resume(&job).map_err(|error| failed(console, &error.to_string()))?;
+    let launched = match start_command(&mut start, donor.as_ref().map_err(String::as_str), beat, console) {
+        Ok(launched) => launched,
+        Err(answer) => return answer,
+    };
     let mut stopper = Stopper { job: &job, armed: true };
-    let watched = watch(&job, &running, Pipes { stdout, stderr }, beat, console);
+    let watched = watch(&job, &launched.running, launched.pipes, beat, console);
     stopper.armed = false;
+    // Ended only now, so the command's console stays up for as long as the command may use it.
+    drop(donor);
     watched
+}
+
+/// The command to start: its launch, its job and the job's stop signal, and the word and program a start failure names.
+struct Start<'a> {
+    launch: PipedLaunch,
+    job: &'a Job,
+    stop: &'a NamedEvent,
+    word: &'a str,
+    program: &'a Path,
+}
+
+/// A command started in its job, and the read ends of its pipes.
+struct Launched {
+    running: Running,
+    pipes: Pipes,
+}
+
+/// The console's donor, put in `job`, or why there is none: the console seam forces that before any donor starts.
+fn console_donor(job: &Job, seams: &BoxSeams) -> Result<Donor, String> {
+    if seams.fail_console {
+        return Err(FORCED.to_owned());
+    }
+    Donor::start(job)
+}
+
+/// Starts the command on `donor`'s UTF-8 console, or, when the console cannot be had (`donor` may say why none
+/// started), on the plain hidden console, which is said and never fails the run. A stop signalled before the command
+/// is resumed keeps it from starting ([`launch`]), which stops the job and fails the run with status 1. What the launch
+/// has to say is said once it is over and the box is home ([`Ended::say`]). The command started, or the run's answer:
+/// `Ok(127)` for a command that could not be started, `Err` with the status of the box's own failure, its line said.
+fn start_command(start: &mut Start<'_>, donor: Result<&Donor, &str>, beat: &Beat<'_>, console: &mut Console) -> Result<Launched, Result<u32, u32>> {
+    let ended = match donor {
+        Ok(donor) => on_utf8_console(start, donor, beat, console),
+        Err(reason) => Ended {
+            fallback: Some(reason.to_owned()),
+            ..launch(start, PipedConsole::Hidden)
+        },
+    };
+    ended.say(console);
+    match ended.how {
+        LaunchEnd::Started(launched) => Ok(launched),
+        LaunchEnd::Refused(error) => Err(start_refused(console, start, error)),
+        LaunchEnd::Stopped => Err(Err(stopped_before_start(start.job, console))),
+    }
+}
+
+/// The launch on `donor`'s UTF-8 console, the box's own output held from just before the box leaves its console until
+/// it is home again, since its standard handles may point at the donor's console meanwhile; on the plain hidden
+/// console when the UTF-8 one cannot be had, as when the output's lock is not free within the console's wait. How the
+/// launch ended, with why the UTF-8 console could not be had, for the caller to say.
+fn on_utf8_console(start: &mut Start<'_>, donor: &Donor, beat: &Beat<'_>, console: &mut Console) -> Ended {
+    let lock = beat.lock;
+    let hold = || match lock.try_lock() {
+        Ok(guard) => Some(guard),
+        Err(TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
+        Err(TryLockError::WouldBlock) => None,
+    };
+    match Utf8Console::enter(donor, hold) {
+        Ok(utf8) => {
+            let ended = launch(start, PipedConsole::Attached);
+            if let Err(problem) = utf8.leave() {
+                console.err(&format!("gate: remote {problem}"));
+            }
+            ended
+        }
+        Err(reason) => Ended {
+            fallback: Some(reason),
+            ..launch(start, PipedConsole::Hidden)
+        },
+    }
+}
+
+/// How a launch ended, and what the box says of it once it is home: never while it is away on the donor's console,
+/// where the client does not hear it.
+struct Ended {
+    how: LaunchEnd,
+    /// Why the command could not have a UTF-8 console, when it was launched on the plain hidden one.
+    fallback: Option<String>,
+    /// The line saying the job's stop signal could not be read, when it could not.
+    unread: Option<String>,
+}
+
+impl Ended {
+    /// Says the fallback, unless the launch was stopped, so no fallback line comes before a stop line; then that the
+    /// stop signal could not be read.
+    fn say(&self, console: &mut Console) {
+        if let Some(reason) = self.fallback.as_deref().filter(|_| !matches!(self.how, LaunchEnd::Stopped)) {
+            say_fallback(console, reason);
+        }
+        if let Some(line) = &self.unread {
+            console.err(line);
+        }
+    }
+}
+
+/// How a launch ended.
+enum LaunchEnd {
+    /// The command runs in its job.
+    Started(Launched),
+    /// The command could not be created, put in its job or resumed.
+    Refused(LaunchError),
+    /// A stop was signalled before the command was resumed: the command never ran.
+    Stopped,
+}
+
+/// Creates the command suspended on the console `on`, puts it in its job, then, unless the job's stop signal says a
+/// stop came first ([`look`]), resumes it. A stop that comes after the look terminates the job, the command in it.
+/// Nothing is said here, as the box may be away on the donor's console: a signal that could not be read is in the
+/// [`Ended`], for the caller to say once the box is home.
+fn launch(start: &mut Start<'_>, on: PipedConsole) -> Ended {
+    start.launch.console = on;
+    let ended = |how, unread| Ended { how, fallback: None, unread };
+    let PipedSuspended { suspended, stdout, stderr } = match start.launch.start_suspended(start.job) {
+        Ok(created) => created,
+        Err(error) => return ended(LaunchEnd::Refused(error), None),
+    };
+    let assigned = suspended.assign(start.job);
+    // Whether the command went in the job or the stopped job refused it, it never runs: it is ended as it is dropped.
+    let unread = match look(|| start.stop.is_set(), start.job.name()) {
+        Look::Stopped => return ended(LaunchEnd::Stopped, None),
+        Look::Go(unread) => unread,
+    };
+    let how = match assigned.and_then(|()| suspended.resume()) {
+        Ok(running) => LaunchEnd::Started(Launched {
+            running,
+            pipes: Pipes { stdout, stderr },
+        }),
+        Err(error) => LaunchEnd::Refused(error),
+    };
+    ended(how, unread)
+}
+
+/// What a look at a job's stop signal found.
+#[derive(Debug, PartialEq, Eq)]
+enum Look {
+    /// It is set: a stop came.
+    Stopped,
+    /// It is unset, or it could not be read, with the line saying so: no stop came.
+    Go(Option<String>),
+}
+
+/// What `check` reads of the stop signal of the job `job`: set is a stop, unset none. A signal that cannot be read is
+/// no stop, and the command starts; the line saying so is returned, not said, for the caller to say where the client
+/// hears it.
+fn look(check: impl FnOnce() -> io::Result<bool>, job: &str) -> Look {
+    match check() {
+        Ok(true) => Look::Stopped,
+        Ok(false) => Look::Go(None),
+        Err(error) => Look::Go(Some(format!(
+            "gate: remote cannot read the stop signal of job {job}: {error}; starting the command"
+        ))),
+    }
+}
+
+/// Ends the run before its job `job` is created when a stop came already, as `check` reads the job's stop signal: the
+/// stop line said, status 1, and nothing started. A signal that cannot be read is said, and the run goes on.
+fn before_the_job(check: impl FnOnce() -> io::Result<bool>, job: &str, console: &mut Console) -> Result<(), u32> {
+    match look(check, job) {
+        Look::Stopped => Err(stopped_first(console, job)),
+        Look::Go(unread) => {
+            if let Some(line) = unread {
+                console.err(&line);
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Says the run failed for a stop that came before the command of the job `job` started; status 1.
+fn stopped_first(console: &mut Console, job: &str) -> u32 {
+    failed(console, &format!("the job {job} was stopped before the command started"))
+}
+
+/// Stops the job of a command a stop came before, then says the run failed for it; status 1. What the job still holds
+/// after the stop and a later terminate that failed ([`Ending::say`]), or why it could not be stopped, is said after.
+fn stopped_before_start(job: &Job, console: &mut Console) -> u32 {
+    let ending = terminate_and_wait(job);
+    let status = stopped_first(console, job.name());
+    match ending {
+        Ok(ending) => ending.say(job.name(), console),
+        Err(error) => console.err(&format!("gate: and could not terminate the command's job {}: {error}", job.name())),
+    }
+    status
+}
+
+/// Says why the command did not start: its start failure, or the box's own failure; the run's answer.
+fn start_refused(console: &mut Console, start: &Start<'_>, error: LaunchError) -> Result<u32, u32> {
+    match error {
+        LaunchError::CreateProcess { code, message } => start_failed(console, start.word, start.program, code, &message),
+        error @ LaunchError::Setup { .. } => Err(failed(console, &error.to_string())),
+    }
+}
+
+/// Says that the command runs on the box's default code page, for `reason`.
+fn say_fallback(console: &mut Console, reason: &str) {
+    console.err(&format!(
+        "gate: remote could not give the command a UTF-8 console ({reason}); running it on the box's default code page"
+    ));
+}
+
+/// The park seam's wait, before the box's output is locked: it creates the empty file `<path>.parked` as it starts, so
+/// a case sees the box parked, then waits until `path` exists, for at most [`PARK_LIMIT`], so a box no case lets go
+/// still ends.
+fn wait_for_path(path: &Path, console: &mut Console) {
+    let mut parked = path.as_os_str().to_owned();
+    parked.push(".parked");
+    if let Err(error) = File::create(&parked) {
+        console.err(&format!("gate: remote park seam cannot create {}: {error}", Path::new(&parked).display()));
+    }
+    let started = Instant::now();
+    while !path.exists() && started.elapsed() < PARK_LIMIT {
+        thread::sleep(PARK_STEP);
+    }
 }
 
 /// A `CreateProcessW` failure: the box's own when its job refuses breakaway (status 1), else the command's start
@@ -332,6 +583,13 @@ fn start_failed(console: &mut Console, word: &str, program: &Path, code: u32, me
             &format!("cannot tell whether the box's own job refused the start ({message}): {error}"),
         )),
     }
+}
+
+/// Creates the stop signal of the run's job `name` ([`stop_event_name`]), unset; a name some event already has is
+/// refused, so no earlier set reaches this run. Else the status 1, its line said, as for a job that cannot be created.
+fn create_stop_event(name: &str, console: &mut Console) -> Result<NamedEvent, u32> {
+    let event = stop_event_name(name);
+    NamedEvent::create_new_manual(&event).map_err(|error| failed(console, &format!("cannot create the event {event}: {error}")))
 }
 
 /// Creates the run's job `name`; a name some job already has is refused, so a run never shares a job and a stop meant
@@ -437,12 +695,15 @@ fn wait_for_exit(job: &Job, running: &Running, forwarders: &Forwarders, console:
 /// drained: says on stderr what became of the job — `stopped` with no process left, `stopping` before why it did not
 /// stop — best effort, since the stream that failed may be the one it is said on. [`CLOSED_STATUS`], which the box
 /// exits with.
-fn closed_connection(job: &Job, ending: io::Result<usize>, console: &mut Console) -> u32 {
-    let said = if matches!(&ending, Ok(0)) { "stopped" } else { "stopping" };
+fn closed_connection(job: &Job, ending: io::Result<Ending>, console: &mut Console) -> u32 {
+    let said = if matches!(&ending, Ok(Ending { left: 0, .. })) {
+        "stopped"
+    } else {
+        "stopping"
+    };
     console.err(&format!("gate: remote the client closed the connection; {said} job {}", job.name()));
     match ending {
-        Ok(0) => {}
-        Ok(left) => console.err(&still_holding(job.name(), left)),
+        Ok(ending) => ending.say(job.name(), console),
         Err(error) => console.err(&format!("gate: remote could not stop job {}: {error}", job.name())),
     }
     CLOSED_STATUS
@@ -633,5 +894,61 @@ impl BackGit<'_> {
                 .ok_or_else(|| format!("{step} printed nothing")),
             code => Err(format!("{step} failed (status {code})")),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+
+    use super::{Look, before_the_job, look};
+    use crate::console::Console;
+
+    const JOB: &str = r"Local\gate-job-k-0001";
+
+    /// The line for a stop signal of [`JOB`] whose wait failed with `the wait failed`.
+    fn unread() -> String {
+        format!("gate: remote cannot read the stop signal of job {JOB}: the wait failed; starting the command")
+    }
+
+    #[test]
+    fn launch_sees_a_set_stop_signal_as_a_stop() {
+        assert_eq!(look(|| Ok(true), JOB), Look::Stopped);
+    }
+
+    #[test]
+    fn launch_sees_an_unset_stop_signal_as_no_stop() {
+        assert_eq!(look(|| Ok(false), JOB), Look::Go(None));
+    }
+
+    #[test]
+    fn launch_that_cannot_read_the_stop_signal_starts_the_command_and_returns_the_line_unsaid() {
+        assert_eq!(look(|| Err(io::Error::other("the wait failed")), JOB), Look::Go(Some(unread())));
+    }
+
+    #[test]
+    fn run_stopped_before_its_job_exists_says_so_and_fails() {
+        let mut console = Console::new();
+        assert_eq!(before_the_job(|| Ok(true), JOB, &mut console), Err(1));
+        assert_eq!(
+            console.take_notes(),
+            [format!(
+                "gate: the gate failed while running the command: the job {JOB} was stopped before the command started"
+            )]
+        );
+    }
+
+    #[test]
+    fn run_not_stopped_before_its_job_exists_goes_on_and_says_nothing() {
+        let mut console = Console::new();
+        assert_eq!(before_the_job(|| Ok(false), JOB, &mut console), Ok(()));
+        assert!(console.take_notes().is_empty(), "nothing is said");
+    }
+
+    #[test]
+    fn run_that_cannot_read_the_stop_signal_before_its_job_exists_says_so_and_goes_on() {
+        let mut console = Console::new();
+        assert_eq!(before_the_job(|| Err(io::Error::other("the wait failed")), JOB, &mut console), Ok(()));
+        assert_eq!(console.take_notes(), [unread()]);
     }
 }

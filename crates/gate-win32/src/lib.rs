@@ -1,11 +1,13 @@
-//! The gate's Win32 layer: named mutexes and events, job objects and their accounting, commands created suspended, the
-//! start time of the gate process or of another, the system's, a process's and the WSL VM's CPU times, the console interrupt, the
+//! The gate's Win32 layer: named mutexes and events, job objects and their accounting, commands created suspended and
+//! the UTF-8 console a command can be created on, the start time of the gate process or of another, the system's, a
+//! process's and the WSL VM's CPU times, the console interrupt, the
 //! system's boot time, what a drive letter stands for, and the Windows message of an error code. It holds no policy:
 //! the names, the waits, the command's environment and priority, and what an abandoned mutex means to the gate are the
 //! caller's. Windows only; elsewhere the crate is empty.
 
 #![cfg(windows)]
 
+mod console;
 mod create;
 mod device;
 mod event;
@@ -18,6 +20,7 @@ mod piped;
 mod times;
 mod tree;
 
+pub use console::{Donor, Utf8Console};
 pub use create::spawn;
 pub use device::device_target;
 pub use event::{EventWait, NamedEvent};
@@ -26,7 +29,7 @@ pub use job::{Accounting, Job};
 pub use launch::{EnvironmentBlock, Launch, LaunchError, PriorityClass, Running, Suspended, Waited, same_variable_name};
 pub use memory::working_set;
 pub use mutex::{AcquireError, MutexGuard, NamedMutex, OwnedMutexGuard, mutex_exists};
-pub use piped::{PipedLaunch, PipedSuspended, breakaway_refused};
+pub use piped::{PipedConsole, PipedLaunch, PipedSuspended, breakaway_refused};
 pub use times::{ProcessTimes, SystemTimes, file_time_now, process_times, system_times, wsl_vm_cpu};
 
 /// Refuses an open file that is not a plain disk file: one that is not on a disk, is a reparse point (a link or a
