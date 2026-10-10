@@ -31,6 +31,22 @@ pub struct WriteError {
     pub source: io::Error,
 }
 
+/// Why one kind's count could not be applied to the counts file.
+#[derive(Debug, thiserror::Error)]
+pub enum ApplyError {
+    /// The file exists but could not be read, so the other kind's count is unknown and nothing was written.
+    #[error("could not read {} ({source})", .path.display())]
+    Read {
+        /// The counts file.
+        path: PathBuf,
+        /// The error the read met.
+        source: io::Error,
+    },
+    /// The file could not be written.
+    #[error(transparent)]
+    Write(#[from] WriteError),
+}
+
 /// The counts file the PowerShell gate reads: the override when the caller gives a non-empty one, else
 /// `<local app data>\gate\slot-counts.json`. `gate.exe` reads `<state root>\slot-counts.json` instead
 /// (`v1::counts_path`).
@@ -49,18 +65,36 @@ pub fn slot_count_path(inputs: &StateInputs) -> PathBuf {
 pub(crate) type CountsFile = Result<Option<Map<String, Value>>, String>;
 
 pub(crate) fn read_counts_file(path: &Path) -> CountsFile {
-    let bytes = match fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(format!("it could not be read: {}", prose(&error.to_string()))),
-    };
-    let text = String::from_utf8_lossy(bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(&bytes));
+    match read_counts_bytes(path) {
+        Ok(bytes) => counts_from_bytes(bytes),
+        Err(error) => Err(format!("it could not be read: {}", prose(&error.to_string()))),
+    }
+}
+
+/// The counts file a read gave: `bytes` parsed, or `Ok(None)` when there was no file.
+fn counts_from_bytes(bytes: Option<Vec<u8>>) -> CountsFile {
+    bytes.map(|bytes| parse_counts(&bytes)).transpose()
+}
+
+/// The counts file's bytes: `Ok(None)` when it does not exist, `Err` with the error when it exists but cannot be read.
+fn read_counts_bytes(path: &Path) -> io::Result<Option<Vec<u8>>> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// The counts file's bytes parsed: `Err` with the reason the gate gives when they are not valid JSON or not a JSON
+/// object.
+fn parse_counts(bytes: &[u8]) -> Result<Map<String, Value>, String> {
+    let text = String::from_utf8_lossy(bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes));
     // The gate's JSON reader gives no value at all for blank text, which it then refuses as not an object.
     if text.trim().is_empty() {
         return Err("it is not a JSON object".to_owned());
     }
     match serde_json::from_str::<Value>(&text) {
-        Ok(Value::Object(counts)) => Ok(Some(counts)),
+        Ok(Value::Object(counts)) => Ok(counts),
         Ok(_) => Err("it is not a JSON object".to_owned()),
         Err(error) => Err(format!("it is not valid JSON: {}", prose(&error.to_string()))),
     }
@@ -135,10 +169,14 @@ pub(crate) fn property<'a>(object: &'a Map<String, Value>, key: &str) -> Option<
 /// gate itself would ignore.
 #[must_use]
 pub fn read_slot_count_setting(path: &Path) -> SlotCounts {
-    let file = read_counts_file(path);
+    kept_counts(&read_counts_file(path), path)
+}
+
+/// The counts in `file`, read from `path`, that the gate would use.
+fn kept_counts(file: &CountsFile, path: &Path) -> SlotCounts {
     let mut counts = SlotCounts::default();
     for kind in SlotKind::ALL {
-        counts.set(kind, pool_count(&file, path, kind, 1).set);
+        counts.set(kind, pool_count(file, path, kind, 1).set);
     }
     counts
 }
@@ -215,15 +253,22 @@ fn with_retry(mut operation: impl FnMut() -> io::Result<()>) -> io::Result<()> {
     Err(failure)
 }
 
-/// Sets or unsets one kind's count in the counts file, keeping the other kind's valid value.
+/// Sets or unsets one kind's count in the counts file, keeping the other kind's valid value. A file that is not valid
+/// JSON or not a JSON object keeps nothing and is replaced.
 ///
 /// # Errors
 ///
-/// [`WriteError`] when the file cannot be written.
-pub fn apply_slot_count(path: &Path, kind: SlotKind, count: Option<SlotCount>) -> Result<(), WriteError> {
-    let mut counts = read_slot_count_setting(path);
+/// [`ApplyError::Read`] when the file exists but cannot be read; nothing is then written or deleted.
+/// [`ApplyError::Write`] when the file cannot be written.
+pub fn apply_slot_count(path: &Path, kind: SlotKind, count: Option<SlotCount>) -> Result<(), ApplyError> {
+    let bytes = read_counts_bytes(path).map_err(|source| ApplyError::Read {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let mut counts = kept_counts(&counts_from_bytes(bytes), path);
     counts.set(kind, count);
-    write_slot_counts(path, &counts)
+    write_slot_counts(path, &counts)?;
+    Ok(())
 }
 
 /// `<path>.<pid>.<n>.tmp`, `<n>` taken from [`TEMP_COUNTER`] so no two writes of this process share one.

@@ -22,7 +22,7 @@ mod verdict;
 mod win32;
 
 pub use archive::{ARCHIVE_DIR, archive_rolled_journal};
-pub use counts::{WriteError, apply_slot_count, read_slot_count_setting, slot_count_path, write_slot_counts};
+pub use counts::{ApplyError, WriteError, apply_slot_count, read_slot_count_setting, slot_count_path, write_slot_counts};
 pub use journal::{CommandSummary, History, HistoryRun, JournalCache, RunState, normalize_command};
 pub use journal_writer::{
     Appended, Held, JOURNAL_CAP_BYTES, JOURNAL_FILE, JOURNAL_WAIT, JournalEvent, JournalIdentity, JournalLock, JournalNote, LockError,

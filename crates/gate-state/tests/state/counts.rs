@@ -228,6 +228,66 @@ fn apply_slot_count_keeps_other_kind_and_drops_invalid_values() {
     assert!(!path.exists(), "a file with no count left is deleted");
 }
 
+/// Opens the counts file sharing only delete access, so a read of it fails while the handle lives but a rename over it
+/// or a delete of it still goes through: a write that ignores the failed read changes the file.
+#[cfg(windows)]
+fn hold_unshared(path: &std::path::Path) -> fs::File {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    const FILE_SHARE_DELETE: u32 = 0x4;
+    fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_DELETE)
+        .open(path)
+        .expect("the counts file can be held")
+}
+
+#[cfg(windows)]
+#[test]
+fn apply_slot_count_refuses_an_unreadable_file_and_leaves_it() {
+    let machine = Machine::new("apply_slot_count_refuses_an_unreadable_file_and_leaves_it");
+    let path = machine.counts_path();
+    machine.write_counts(r#"{"heavy":3,"light":4}"#);
+    let before = fs::read(&path).expect("the counts file exists");
+
+    let held = hold_unshared(&path);
+    let result = apply_slot_count(&path, SlotKind::Light, Some(count(2)));
+    assert!(matches!(result, Err(gate_state::ApplyError::Read { .. })), "{result:?}");
+    drop(held);
+
+    assert_eq!(fs::read(&path).expect("the counts file still exists"), before);
+}
+
+#[cfg(windows)]
+#[test]
+fn apply_slot_count_refuses_to_unset_on_an_unreadable_file() {
+    let machine = Machine::new("apply_slot_count_refuses_to_unset_on_an_unreadable_file");
+    let path = machine.counts_path();
+    machine.write_counts(r#"{"heavy":3,"light":4}"#);
+    let before = fs::read(&path).expect("the counts file exists");
+
+    let held = hold_unshared(&path);
+    let result = apply_slot_count(&path, SlotKind::Light, None);
+    assert!(matches!(result, Err(gate_state::ApplyError::Read { .. })), "{result:?}");
+    drop(held);
+
+    assert_eq!(fs::read(&path).expect("the counts file is not deleted"), before);
+}
+
+#[test]
+fn apply_slot_count_replaces_a_file_that_is_not_json() {
+    let machine = Machine::new("apply_slot_count_replaces_a_file_that_is_not_json");
+    let path = machine.counts_path();
+    machine.write_counts("not json");
+
+    apply_slot_count(&path, SlotKind::Light, Some(count(2))).expect("a file that is not JSON is replaced");
+
+    let expected = SlotCounts {
+        heavy: None,
+        light: Some(count(2)),
+    };
+    assert_eq!(read_slot_count_setting(&path), expected);
+}
+
 #[test]
 fn slot_count_parse_messages() {
     for (value, shown) in [(json!(0), "'0'"), (json!(65), "'65'"), (json!(2.5), "'2.5'"), (json!("x"), "'x'")] {
