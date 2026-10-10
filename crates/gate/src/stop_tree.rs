@@ -10,7 +10,7 @@ use gate_args::USAGE;
 use gate_state::{KernelObject, StateRoot};
 use gate_win32::{OpenedJob, StoppableProcess, win32_message};
 use jiff::Timestamp;
-use proc_table::{ProcessTable as _, ProcessTree, Win32ProcessTable};
+use proc_table::{ProcessTree, Win32ProcessTable};
 
 use crate::answer::USAGE_STATUS;
 use crate::console::Console;
@@ -100,7 +100,7 @@ fn find(pid: u32) -> Found {
     if matches!(state, RootState::Ended) {
         return Found::NotLive;
     }
-    found_in(pid, state, &ProcessTree::new(Win32ProcessTable.snapshot()))
+    found_in(pid, state, &ProcessTree::new(Win32ProcessTable.snapshot_without_command_lines()))
 }
 
 /// The tree under `pid` in `snapshot`, given what the root's own process said. A process that has ended but whose

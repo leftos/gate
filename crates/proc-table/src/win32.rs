@@ -1,6 +1,7 @@
 //! The process table on 64-bit Windows: a `ToolHelp` snapshot, each process's start time, and its command line read
-//! from its PEB. The handle guard, [`open_process`] and [`read_parameters_string`] are public for callers that read
-//! another PEB string, such as a process's working directory.
+//! from its PEB. [`Win32ProcessTable::snapshot_without_command_lines`] gives the same entries with no command line.
+//! The handle guard, [`open_process`] and [`read_parameters_string`] are public for callers that read another PEB
+//! string, such as a process's working directory.
 
 use std::ffi::c_void;
 use std::mem::size_of;
@@ -27,48 +28,73 @@ const PARAMS_COMMAND_LINE: usize = 0x70;
 const UNICODE_STRING_SIZE: usize = 16;
 
 /// The machine's processes, from a `ToolHelp` snapshot, with each one's start time and command line where its process
-/// can be opened.
+/// can be opened. [`Win32ProcessTable::snapshot_without_command_lines`] gives the same entries with no command line.
 #[derive(Clone, Copy, Debug)]
 pub struct Win32ProcessTable;
 
 impl ProcessTable for Win32ProcessTable {
     fn snapshot(&self) -> Vec<ProcessInfo> {
-        let mut processes = Vec::new();
-        let Ok(entry_size) = u32::try_from(size_of::<PROCESSENTRY32W>()) else {
-            return processes;
-        };
-        // SAFETY: CreateToolhelp32Snapshot takes no pointers; its result is checked by the guard before any use. It
-        // returns a fresh handle nothing else owns, so the guard alone closes it.
-        let Some(snapshot) = (unsafe { OwnedHandle::new(CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)) }) else {
-            return processes;
-        };
-        let mut entry = PROCESSENTRY32W {
-            dwSize: entry_size,
-            ..PROCESSENTRY32W::default()
-        };
-        // SAFETY: the snapshot handle is open, and `entry` is a writable PROCESSENTRY32W whose dwSize is set.
-        let mut more = unsafe { Process32FirstW(snapshot.0, &raw mut entry) } != 0;
-        while more {
-            processes.push(process_info(&entry));
-            // SAFETY: as for Process32FirstW above; the snapshot stays open until this loop ends.
-            more = unsafe { Process32NextW(snapshot.0, &raw mut entry) } != 0;
-        }
-        processes
+        walk(true)
     }
 }
 
-/// One snapshot entry with its start time and command line, each `None` when it cannot be read.
-fn process_info(entry: &PROCESSENTRY32W) -> ProcessInfo {
+impl Win32ProcessTable {
+    /// Every process running now, each with its pid, parent, executable name and start time: the same entries
+    /// [`ProcessTable::snapshot`] lists, but with every `command_line` `None`.
+    ///
+    /// No process is opened for its command line, so no `PROCESS_VM_READ` is asked for and nothing of a process's PEB
+    /// is read: a process this user may query but not read still contributes its start time. A caller that needs only
+    /// the process tree and start times takes this snapshot.
+    #[must_use]
+    pub fn snapshot_without_command_lines(&self) -> Vec<ProcessInfo> {
+        walk(false)
+    }
+}
+
+/// Every process of one `ToolHelp` snapshot, each turned into a [`ProcessInfo`] by [`process_info`]; an empty list when
+/// the snapshot itself cannot be taken. `command_lines` reads each process's command line as well as its start time.
+fn walk(command_lines: bool) -> Vec<ProcessInfo> {
+    let mut processes = Vec::new();
+    let Ok(entry_size) = u32::try_from(size_of::<PROCESSENTRY32W>()) else {
+        return processes;
+    };
+    // SAFETY: CreateToolhelp32Snapshot takes no pointers; its result is checked by the guard before any use. It returns
+    // a fresh handle nothing else owns, so the guard alone closes it.
+    let Some(snapshot) = (unsafe { OwnedHandle::new(CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)) }) else {
+        return processes;
+    };
+    let mut entry = PROCESSENTRY32W {
+        dwSize: entry_size,
+        ..PROCESSENTRY32W::default()
+    };
+    // SAFETY: the snapshot handle is open, and `entry` is a writable PROCESSENTRY32W whose dwSize is set.
+    let mut more = unsafe { Process32FirstW(snapshot.0, &raw mut entry) } != 0;
+    while more {
+        processes.push(process_info(&entry, command_lines));
+        // SAFETY: as for Process32FirstW above; the snapshot stays open until this loop ends.
+        more = unsafe { Process32NextW(snapshot.0, &raw mut entry) } != 0;
+    }
+    processes
+}
+
+/// One snapshot entry with its start time, and its command line only when `command_lines` is set, each `None` when it
+/// cannot be read.
+fn process_info(entry: &PROCESSENTRY32W, command_lines: bool) -> ProcessInfo {
     let pid = entry.th32ProcessID;
     let name_length = entry.szExeFile.iter().position(|unit| *unit == 0).unwrap_or(entry.szExeFile.len());
-    let (created, command_line) = if let Some(process) = open_process(pid, PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ) {
-        (creation_time(&process), read_parameters_string(&process, PARAMS_COMMAND_LINE))
+    let readable = if command_lines {
+        open_process(pid, PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ)
     } else {
-        // A process this user may query but not read still has a start time.
-        (
+        None
+    };
+    let (created, command_line) = match readable {
+        Some(process) => (creation_time(&process), read_parameters_string(&process, PARAMS_COMMAND_LINE)),
+        // A process this user may query but not read still has a start time; with no command line asked for, this is the
+        // only handle opened.
+        None => (
             open_process(pid, PROCESS_QUERY_LIMITED_INFORMATION).and_then(|process| creation_time(&process)),
             None,
-        )
+        ),
     };
     ProcessInfo {
         pid,
@@ -235,6 +261,25 @@ mod tests {
         assert!(me.created.is_some());
         let command_line = me.command_line.expect("this process's command line can be read");
         assert!(command_line.contains(stem.as_ref()), "{command_line} names {stem}");
+    }
+
+    #[test]
+    fn snapshot_without_command_lines_keeps_this_process_parent_and_start_time() {
+        let full = Win32ProcessTable.snapshot();
+        let brief = Win32ProcessTable.snapshot_without_command_lines();
+        assert!(
+            brief.iter().all(|process| process.command_line.is_none()),
+            "no entry of a command-line-free snapshot carries a command line"
+        );
+        let me = std::process::id();
+        let seen = full.iter().find(|process| process.pid == me).expect("the snapshot lists this process");
+        let mine = brief
+            .iter()
+            .find(|process| process.pid == me)
+            .expect("the command-line-free snapshot lists this process");
+        assert_eq!(mine.parent_pid, seen.parent_pid);
+        assert_eq!(mine.created, seen.created, "the same start time as the full snapshot gives");
+        assert!(mine.created.is_some(), "this process's start time can be read without its command line");
     }
 
     #[test]
