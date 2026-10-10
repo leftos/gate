@@ -3,6 +3,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use gate_state::v1::{Ticket, TicketKind, read_claim, ticket_path, write_ticket};
 use gate_state::{KernelObject, StateRoot};
@@ -214,6 +215,67 @@ fn a_holder_whose_ticket_was_not_deleted_does_not_block_the_queue() {
     assert!(slot.ends_with("light-slot-1"), "{take}");
     let_go(&go_h);
     assert_passed(holding);
+}
+
+#[test]
+fn a_waiter_deferring_to_a_gate_that_took_its_slot_does_not_say_it_waits() {
+    let case = Case::new("a_waiter_deferring_to_a_gate_that_took_its_slot");
+    write_counts(&case.root(), r#"{"v":1,"light":2}"#);
+    // A gate between its take of slot 0 and its ticket's deletion, held still; this test process stands in for it.
+    let mutex = NamedMutex::open(&light_slot(&case, 0)).expect("slot 0's mutex opens");
+    let held = mutex.acquire(Duration::from_secs(5)).expect("slot 0 is free");
+    let pid = std::process::id();
+    let began = gate_win32::process_start_of(pid)
+        .expect("this process can be queried")
+        .expect("this process runs");
+    let start_ms = u64::try_from(began.as_millisecond()).expect("this process started after the epoch");
+    let ticket = Ticket {
+        kind: TicketKind::Light,
+        arrived: 0,
+        pid,
+        start_ms,
+        holds: false,
+        remote: None,
+        expected: None,
+    };
+    let taker = ticket_path(&case.root(), pid, start_ms);
+    write_ticket(&taker, &ticket).expect("the taker's ticket can be written");
+    let waiter = start(&case, "out.log", None, &["--test-heartbeat-ms", "50", "--test-poll-ms", "50"]);
+    waiter.wait_for_stderr("gate: still waiting for a light slot");
+
+    fs::remove_file(&taker).expect("the taker's ticket can be deleted, as its take does next");
+
+    let outcome = waiter.finish();
+    drop(held);
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(
+        !outcome.stderr.contains("gate: waiting for a light slot ("),
+        "slot 1 was free for the waiter, and the only gate ahead of it held slot 0: {outcome:?}"
+    );
+}
+
+#[test]
+fn a_waiter_with_every_slot_held_says_it_waits_with_every_slot_busy() {
+    let case = Case::new("a_waiter_with_every_slot_held_says_it_waits");
+    write_counts(&case.root(), r#"{"v":1,"light":2}"#);
+    let mutexes: Vec<NamedMutex> = (0..2)
+        .map(|index| NamedMutex::open(&light_slot(&case, index)).expect("the slot's mutex opens"))
+        .collect();
+    let held: Vec<_> = mutexes
+        .iter()
+        .map(|mutex| mutex.acquire(Duration::from_secs(5)).expect("the slot is free"))
+        .collect();
+    let waiter = start(&case, "out.log", None, &["--test-heartbeat-ms", "50", "--test-poll-ms", "50"]);
+    waiter.wait_for_stderr("gate: still waiting for a light slot");
+
+    drop(held);
+
+    let outcome = waiter.finish();
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_in_order(
+        &outcome.stderr,
+        &["gate: waiting for a light slot (2 busy)", "gate: still waiting for a light slot ("],
+    );
 }
 
 #[test]

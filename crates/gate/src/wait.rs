@@ -1,5 +1,6 @@
 //! The wait for a slot: the gate's wake event and arrival ticket, the passes that re-read the counts and the tickets
-//! and try the pool when no live ticket of the gate's kind is ahead of it, and the lines a waiting gate says.
+//! and try the pool when fewer live tickets of the gate's kind are ahead of it than slots are free, and the lines a
+//! waiting gate says.
 
 use std::path::PathBuf;
 use std::thread;
@@ -19,6 +20,9 @@ use crate::slots::{self, Pool, Survey, Taken, ThisGate, epoch_ms};
 const POLL: Duration = Duration::from_secs(2);
 /// How often a waiter says it still waits.
 const HEARTBEAT: Duration = Duration::from_secs(30);
+
+/// A probe of a pool's slots: for each, whether some gate has it open, `None` for a slot that could not be probed.
+type Probe = Vec<Option<bool>>;
 
 /// A gate queued for a slot of its pool.
 pub(crate) struct Wait<'a> {
@@ -107,8 +111,8 @@ impl<'a> Wait<'a> {
         }
     }
 
-    /// Passes until the gate takes a slot: each pass reads the counts and the tickets, tries the pool when no live
-    /// ticket of the gate's kind is ahead of it, and otherwise sleeps on the wake event until the poll or the next
+    /// Passes until the gate takes a slot: each pass reads the counts and the tickets, tries the pool when fewer live
+    /// tickets of the gate's kind are ahead of it than slots are free, and otherwise sleeps on the wake event until the poll or the next
     /// still-waiting line. `None` once the console is interrupted, which ends the wait at once.
     pub(crate) fn until_taken(&mut self, survey: &mut Survey, console: &mut Console) -> Option<Taken> {
         loop {
@@ -116,18 +120,13 @@ impl<'a> Wait<'a> {
                 return None;
             }
             let count = self.count(console);
-            if self.may_try(count, survey, console)
-                && let Some(taken) = slots::try_pool(self.root, self.pool, count, survey, console)
-            {
+            let (may_try, probe) = self.may_try(count, survey, console);
+            if may_try && let Some(taken) = slots::try_pool(self.root, self.pool, count, survey, console) {
                 return Some(taken);
             }
             if !self.said_waiting {
-                self.said_waiting = true;
-                let busy = self.busy(count, survey, console);
-                console.err(&format!("gate: waiting for a {} slot ({busy} busy)", self.pool.name()));
-                if let Some(interrupt) = self.interrupt_when_waiting {
-                    interrupt.raise();
-                }
+                let probe = probe.unwrap_or_else(|| self.probe(count, survey, console));
+                self.say_waiting(&probe, console);
             }
             self.sleep(console);
             if self.interrupted() {
@@ -158,10 +157,31 @@ impl<'a> Wait<'a> {
     }
 
     /// Whether the gate may try the pool's slots `0..count`: when fewer live tickets of its kind are ahead of it than
-    /// the pool has free slots, so a try never takes the slot an earlier waiter would get.
-    fn may_try(&self, count: u32, survey: &mut Survey, console: &mut Console) -> bool {
+    /// the pool has free slots, so a try never takes the slot an earlier waiter would get. The probe that decided comes
+    /// with it, `None` when no ticket is ahead and none was needed.
+    fn may_try(&self, count: u32, survey: &mut Survey, console: &mut Console) -> (bool, Option<Probe>) {
         let ahead = self.ahead(survey, console);
-        ahead == 0 || ahead < self.probe(count, survey, console).iter().filter(|held| **held == Some(false)).count()
+        if ahead == 0 {
+            return (true, None);
+        }
+        let probe = self.probe(count, survey, console);
+        (ahead < slots_where(&probe, false), Some(probe))
+    }
+
+    /// Says the gate waits, once a wait, when `probe`, this pass's only probe, found none of the pool's slots free,
+    /// with the busy slots of that same probe. A gate that defers to the tickets ahead of it while a slot is free for
+    /// it says nothing; its still-waiting lines report a long wait. The probe may predate a try that failed in the same
+    /// pass, so a pass whose try lost the race for a slot it saw free says nothing until the next pass.
+    fn say_waiting(&mut self, probe: &[Option<bool>], console: &mut Console) {
+        if slots_where(probe, false) > 0 {
+            return;
+        }
+        self.said_waiting = true;
+        let busy = slots_where(probe, true);
+        console.err(&format!("gate: waiting for a {} slot ({busy} busy)", self.pool.name()));
+        if let Some(interrupt) = self.interrupt_when_waiting {
+            interrupt.raise();
+        }
     }
 
     /// How many live tickets of the gate's kind are ahead of it. A ticket whose gate a live claim names is not counted:
@@ -184,14 +204,9 @@ impl<'a> Wait<'a> {
         ahead.iter().filter(|ticket| !holders.contains(&(ticket.pid, ticket.start_ms))).count()
     }
 
-    /// How many of the pool's slots `0..count` some gate has open.
-    fn busy(&self, count: u32, survey: &mut Survey, console: &mut Console) -> usize {
-        self.probe(count, survey, console).iter().filter(|held| **held == Some(true)).count()
-    }
-
     /// Whether some gate has each of the pool's slots `0..count` open; `None` for a slot that cannot be probed, said
     /// once, which counts as neither free nor busy.
-    fn probe(&self, count: u32, survey: &mut Survey, console: &mut Console) -> Vec<Option<bool>> {
+    fn probe(&self, count: u32, survey: &mut Survey, console: &mut Console) -> Probe {
         (0..count)
             .map(|index| {
                 let name = self.root.root.object_name(self.pool.object(index));
@@ -239,6 +254,12 @@ impl<'a> Wait<'a> {
             self.next_heartbeat += self.heartbeat;
         }
     }
+}
+
+/// How many slots of `probe` some gate has open (`held`) or none has (not `held`); a slot that could not be probed is
+/// neither.
+fn slots_where(probe: &[Option<bool>], held: bool) -> usize {
+    probe.iter().filter(|slot| **slot == Some(held)).count()
 }
 
 /// The machine's logical processors, which the default counts and the watch's share are made from. A count that cannot
