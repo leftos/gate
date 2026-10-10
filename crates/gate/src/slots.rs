@@ -9,7 +9,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use gate_args::{RunRequest, Slot};
-use gate_state::v1::{self, Claim, ClaimKind, Counts, PoolSetting, Ticket, TicketKind};
+use gate_state::v1::{self, Claim, ClaimKind, Counts, FormatError, PoolSetting, Ticket, TicketKind};
 use gate_state::{JournalIdentity, KernelObject, SlotKind};
 use gate_win32::{NamedEvent, OwnedMutexGuard};
 use jiff::Timestamp;
@@ -206,6 +206,10 @@ impl Survey {
         for (path, read) in listed {
             let shown = path.display().to_string();
             match read {
+                // Windows refuses to open a file whose delete is pending, so a ticket its gate is deleting as this gate
+                // reads it comes back access denied: it is going away, not unreadable, and is passed over unsaid. A
+                // skipped ticket never counts as ahead, so one that stays denied cannot block the queue either.
+                Err(FormatError::Io(error)) if error.kind() == io::ErrorKind::PermissionDenied => {}
                 Err(reason) => self.say_once("ignored the ticket", &shown, reason, console),
                 Ok(ticket) if self.is_live(&path, ticket.pid, ticket.start_ms, console) => live.push(ticket),
                 Ok(_) => match delete(&path) {

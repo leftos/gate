@@ -142,6 +142,30 @@ fn a_gate_killed_while_waiting_leaves_no_ticket_after_the_poll() {
 }
 
 #[test]
+fn simultaneous_arrivals_with_free_slots_do_not_wait() {
+    let case = Case::new("simultaneous_arrivals_with_free_slots_do_not_wait");
+    write_counts(&case.root(), r#"{"v":1,"light":3}"#);
+    let gos: Vec<PathBuf> = (1..=3).map(|number| case.root().join(format!("go-{number}"))).collect();
+    let runs: Vec<Running> = gos.iter().map(|go| start(&case, Some(go), &[])).collect();
+
+    for running in &runs {
+        wait_for_journal_line(&case.root(), &take_needle(running.id()));
+    }
+
+    for go in &gos {
+        let_go(go);
+    }
+    for running in runs {
+        let outcome = running.finish();
+        assert_eq!(outcome.code, Some(0), "{outcome:?}");
+        assert!(
+            !outcome.stderr.contains("waiting for"),
+            "a gate with a free slot for it did not wait: {outcome:?}"
+        );
+    }
+}
+
+#[test]
 fn a_holder_whose_ticket_was_not_deleted_does_not_block_the_queue() {
     let case = Case::new("a_holder_whose_ticket_was_not_deleted_does_not_block_the_queue");
     write_counts(&case.root(), r#"{"v":1,"light":2}"#);
