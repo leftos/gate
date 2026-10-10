@@ -4,7 +4,8 @@
 //! `--test-remote-snapshot`, which stops once it has made the snapshot, and the Rust client of
 //! `--test-remote-transport`, which runs the command on a builder. [`git`] runs git for the routing decision and the
 //! client; [`snapshot`] makes the snapshot and bridge commits; `client` runs the Rust client's phases, `transport`
-//! reaches the builder, `payload` builds what `gate box` is sent, and `retry` holds the rule a call is retried on.
+//! reaches the builder, `payload` builds what `gate box` is sent, `retry` holds the rule a call is retried on, and
+//! `syncback` fetches and applies the changes the command left on the builder.
 
 use std::fs::OpenOptions;
 use std::io::{self, Write};
@@ -26,6 +27,8 @@ mod retry;
     expect(dead_code, reason = "a gate without the test seams has no client that makes a snapshot")
 )]
 mod snapshot;
+#[cfg(feature = "test-seams")]
+mod syncback;
 #[cfg(feature = "test-seams")]
 mod transport;
 

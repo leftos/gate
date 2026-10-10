@@ -27,8 +27,8 @@ const DATES: [&str; 2] = ["GIT_AUTHOR_DATE", "GIT_COMMITTER_DATE"];
 const SNAPSHOT_MESSAGE: &str = "gate-remote snapshot";
 const BRIDGE_MESSAGE: &str = "gate-remote bridge";
 /// Where the local refs of the snapshots live, one a key, beside the `-back` refs of changes kept from the builder.
-const REFS: &str = "refs/gate-remote/";
-const BACK: &str = "-back";
+pub(super) const REFS: &str = "refs/gate-remote/";
+pub(super) const BACK: &str = "-back";
 
 /// One worktree's snapshot commit and, when there was a previous snapshot, its bridge commit; both full shas.
 pub(crate) struct Snapshot {
@@ -56,6 +56,19 @@ pub(crate) fn save(root: &Path, key: &str, commit: &str, limit: Duration, interr
         ..git::Call::plain(root, &args, limit)
     })
     .map(drop)
+}
+
+/// The tree of the worktree at `root` as `git add -A` and `git write-tree` write it through a copy of its index: what
+/// the sync-back compares against the snapshot's tree, and no commit. git is ended after `limit` or by the console
+/// `interrupt`.
+pub(super) fn worktree(root: &Path, limit: Duration, interrupt: Option<Interrupt>) -> Result<String, GitError> {
+    let git = Git::find(root).map_err(GitError::Failed)?;
+    worktree_tree(&Calls {
+        git: &git,
+        root,
+        limit,
+        interrupt,
+    })
 }
 
 fn take_one(git: &Git, root: &Path, key: &str, limit: Duration, interrupt: Option<Interrupt>) -> Result<Snapshot, GitError> {
@@ -233,7 +246,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::slice;
 
-    use super::{DATES, IDENTITY, asked, copy_name, git_path, lock_of, previous, repository, save, take};
+    use super::{DATES, IDENTITY, asked, copy_name, git_path, lock_of, previous, repository, save, take, worktree};
     use crate::remote::git::{GIT_LIMIT, GitError};
 
     const OWN: &str = "app-1a2b3c4d";
@@ -315,6 +328,26 @@ mod tests {
         );
         let tree = |commit: &str| ask(&["rev-parse", &format!("{commit}^{{tree}}")]);
         assert_eq!(tree(bridge), tree(&second[0].commit), "the bridge carries the snapshot's tree");
+        fs::remove_dir_all(&root).expect("the repository can be removed");
+    }
+
+    #[test]
+    fn the_worktree_tree_is_the_snapshot_s_own_and_makes_no_commit() {
+        let root = repository("worktree-tree");
+        fs::write(root.join("b.txt"), "b\n").expect("a file can be written");
+        let roots = slice::from_ref(&root);
+        let made = take(roots, OWN, GIT_LIMIT, None).expect("the snapshot is made");
+
+        let tree = worktree(&root, GIT_LIMIT, None).expect("the worktree tree is written");
+
+        let snapshot = asked(&root, &["rev-parse", &format!("{}^{{tree}}", made[0].commit)]).expect("git answers");
+        assert_eq!(
+            tree,
+            snapshot.trim_end(),
+            "the tree the sync-back compares against, with no commit of its own"
+        );
+        fs::write(root.join("b.txt"), "c\n").expect("a file can be changed");
+        assert_ne!(worktree(&root, GIT_LIMIT, None).expect("the tree is written again"), tree, "read afresh");
         fs::remove_dir_all(&root).expect("the repository can be removed");
     }
 

@@ -24,8 +24,9 @@ pub(crate) const GIT_LIMIT: Duration = Duration::from_secs(60);
 const GIT_POLL: Duration = Duration::from_millis(5);
 /// The variables that would point git at another repository, index, object store, config or pathspec reading; git is
 /// asked about the gate's folder alone, so a gate inside a hook that exports them still routes. The indexed config
-/// variables are removed too, by their prefixes.
-const GIT_LOCATION: [&str; 16] = [
+/// variables are removed too, by their prefixes. So are the ssh variant and the external diff, which would change how
+/// git reaches the builder and what patch the sync-back applies.
+const GIT_LOCATION: [&str; 18] = [
     "GIT_DIR",
     "GIT_WORK_TREE",
     "GIT_COMMON_DIR",
@@ -42,6 +43,8 @@ const GIT_LOCATION: [&str; 16] = [
     "GIT_NOGLOB_PATHSPECS",
     "GIT_ICASE_PATHSPECS",
     "GIT_LITERAL_PATHSPECS",
+    "GIT_SSH_VARIANT",
+    "GIT_EXTERNAL_DIFF",
 ];
 /// The prefixes of the config variables `GIT_CONFIG_COUNT` indexes: `GIT_CONFIG_KEY_<n>` and `GIT_CONFIG_VALUE_<n>`.
 const GIT_CONFIG_INDEXED: [&str; 2] = ["GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"];

@@ -2,7 +2,8 @@
 //! pushed. The ssh transport runs OpenSSH, and git over it, as the PowerShell client does: every option a word of its
 //! own and `--` before the host. The local transport of the test seams has its builder root in a folder here, runs
 //! this gate's own `box` with the words the line carries after the builder's gate, or a stand-in for ssh with ssh's own
-//! words, and pushes to the bare repository's own path.
+//! words, and pushes to the bare repository's own path; its `local-ssh:` form pushes and fetches as the ssh transport
+//! does, to `<host>:<path>` with the stand-in as git's ssh.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -49,6 +50,9 @@ pub(crate) trait Transport {
     fn call(&self, host: &str, line: &str) -> Program;
     /// Where the snapshot of `repo` is pushed on the builder `host`.
     fn push_target(&self, host: &str, repo: &str) -> PushTarget;
+    /// The command git runs on the builder to serve the sync-back's fetch, the upload-pack counterpart of the push's
+    /// receive-pack; `None` for a bare repository on this machine, where the push names none either.
+    fn upload_pack(&self) -> Option<String>;
 }
 
 /// ssh's words for running `line` on `host`: the options, `--`, the host and the line, each a word of its own.
@@ -57,28 +61,42 @@ pub(crate) fn ssh_words(host: &str, line: &str) -> Vec<OsString> {
 }
 
 /// The local transport of `--test-remote-transport local:<folder>`: the builder's root `<folder>`, every call this
-/// gate's own exe, or the stand-in `stub` of `--test-remote-ssh` given ssh's words.
+/// gate's own exe, or the stand-in `stub` of `--test-remote-ssh` given ssh's words. Of `local-ssh:<folder>`, git's ssh
+/// command too, the stand-in's, which git runs for the push and the sync-back's calls.
 pub(crate) struct Local {
     root: String,
     gate: PathBuf,
     stub: Option<PathBuf>,
+    git_ssh: Option<String>,
 }
 
 impl Local {
-    /// The local transport `transport` names, `local:<folder>` with the folder read against the working directory, its
-    /// calls made through `stub` when one is given; else the line saying why it cannot be used.
+    /// The local transport `transport` names, `local:<folder>` or `local-ssh:<folder>` with the folder read against the
+    /// working directory, its calls made through `stub` when one is given, which `local-ssh:` needs; else the line
+    /// saying why it cannot be used.
     pub(crate) fn new(transport: &str, stub: Option<&Path>) -> Result<Local, String> {
         let cannot = |why: String| format!("gate: cannot use the remote transport '{transport}': {why}");
-        let folder = transport
-            .strip_prefix("local:")
-            .filter(|folder| !folder.is_empty())
-            .ok_or_else(|| cannot("it is not local:<folder>".to_owned()))?;
+        let (folder, over_ssh) = match transport.split_once(':') {
+            Some(("local", folder)) if !folder.is_empty() => (folder, false),
+            Some(("local-ssh", folder)) if !folder.is_empty() => (folder, true),
+            _ => return Err(cannot("it is not local:<folder>".to_owned())),
+        };
+        let git_ssh = match (over_ssh, stub) {
+            (false, _) => None,
+            (true, Some(stub)) => Some(ssh::git_ssh_command(stub)),
+            (true, None) => {
+                return Err(cannot(
+                    "local-ssh:<folder> runs git through --test-remote-ssh, which is not given".to_owned(),
+                ));
+            }
+        };
         let root = std::path::absolute(folder).map_err(|error| cannot(error.to_string()))?;
         let gate = std::env::current_exe().map_err(|error| cannot(format!("cannot find this gate's own exe: {error}")))?;
         Ok(Local {
             root: root.to_string_lossy().into_owned(),
             gate,
             stub: stub.map(Path::to_path_buf),
+            git_ssh,
         })
     }
 }
@@ -101,12 +119,24 @@ impl Transport for Local {
         }
     }
 
-    fn push_target(&self, _host: &str, repo: &str) -> PushTarget {
-        PushTarget {
-            url: payload::bare(&self.root, repo),
-            receive_pack: None,
-            ssh_command: None,
+    fn push_target(&self, host: &str, repo: &str) -> PushTarget {
+        let bare = payload::bare(&self.root, repo);
+        match &self.git_ssh {
+            Some(ssh_command) => PushTarget {
+                url: format!("{host}:{}", bare.replace('\\', "/")),
+                receive_pack: None,
+                ssh_command: Some(ssh_command.clone()),
+            },
+            None => PushTarget {
+                url: bare,
+                receive_pack: None,
+                ssh_command: None,
+            },
         }
+    }
+
+    fn upload_pack(&self) -> Option<String> {
+        None
     }
 }
 
@@ -131,6 +161,7 @@ mod ssh {
 
     const BUILDER_ROOT: &str = r"D:\gate-remote";
     const RECEIVE_PACK: &str = "pwsh -NoProfile -NonInteractive -Command git-receive-pack";
+    const UPLOAD_PACK: &str = "pwsh -NoProfile -NonInteractive -Command git-upload-pack";
 
     pub(crate) struct Ssh {
         pub(super) program: PathBuf,
@@ -165,6 +196,10 @@ mod ssh {
                 receive_pack: Some(RECEIVE_PACK.to_owned()),
                 ssh_command: Some(git_ssh_command(&self.program)),
             }
+        }
+
+        fn upload_pack(&self) -> Option<String> {
+            Some(UPLOAD_PACK.to_owned())
         }
     }
 
@@ -236,6 +271,11 @@ mod tests {
             }
         );
         assert_eq!(
+            ssh.upload_pack(),
+            Some("pwsh -NoProfile -NonInteractive -Command git-upload-pack".to_owned()),
+            "the fetch's pack command is the push's own with git's other verb"
+        );
+        assert_eq!(
             git_ssh_command(&ssh.program),
             concat!(
                 r"'C:/Program Files/Open'\''SSH/ssh.exe' -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15",
@@ -252,6 +292,7 @@ mod tests {
         assert_eq!(local.root(), r"C:\builder");
         assert_eq!(local.call("builder", line).args, words(&["box", "preflight", "e30="]));
         assert_eq!(local.push_target("builder", "app").url, r"C:\builder\app.git");
+        assert_eq!(local.upload_pack(), None, "a bare repository here names no pack command");
         let stubbed = Local::new(r"local:C:\builder", Some(PathBuf::from("fake-ssh.exe").as_path())).expect("a local transport");
         assert_eq!(
             stubbed.call("builder", line),
@@ -263,6 +304,33 @@ mod tests {
         assert_eq!(
             Local::new("remote:x", None).err(),
             Some("gate: cannot use the remote transport 'remote:x': it is not local:<folder>".to_owned())
+        );
+    }
+
+    #[test]
+    fn the_local_ssh_transport_pushes_and_fetches_through_the_stand_in_as_git_s_ssh() {
+        let stub = PathBuf::from(r"C:\suite\fake-ssh.exe");
+        let local = Local::new(r"local-ssh:C:\builder", Some(stub.as_path())).expect("a local-ssh transport");
+        assert_eq!(local.root(), r"C:\builder");
+        assert_eq!(
+            local.push_target("builder", "app"),
+            PushTarget {
+                url: "builder:C:/builder/app.git".to_owned(),
+                receive_pack: None,
+                ssh_command: Some(git_ssh_command(&stub)),
+            }
+        );
+        assert_eq!(local.upload_pack(), None, "git runs its own service names");
+        assert_eq!(
+            Local::new(r"local-ssh:C:\builder", None).err(),
+            Some(
+                r"gate: cannot use the remote transport 'local-ssh:C:\builder': local-ssh:<folder> runs git through --test-remote-ssh, which is not given"
+                    .to_owned()
+            )
+        );
+        assert_eq!(
+            Local::new("local:", None).err(),
+            Some("gate: cannot use the remote transport 'local:': it is not local:<folder>".to_owned())
         );
     }
 }

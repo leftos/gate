@@ -1,14 +1,18 @@
 //! The black-box suite's stand-in for ssh, which `gate run --test-remote-ssh` starts with ssh's own words: the options,
-//! `--`, the host and the line, whose last three words are `box <verb> <payload>`. It reads the steps file the variable
-//! `GATE_FAKE_SSH_STEPS` names, one step a line, appends the verb it was called with to `<steps file>.log`, and acts on
-//! the step of its call, counted by that log: the first call takes the first step.
+//! `--`, the host and the line, whose last three words are `box <verb> <payload>`. git's own ssh starts it too, through
+//! the `local-ssh:` transport, with the line `git-upload-pack '<path>'` or `git-receive-pack '<path>'`, whose verb is
+//! the service's name. It reads the steps file the variable `GATE_FAKE_SSH_STEPS` names, one step a line, appends the
+//! verb it was called with to `<steps file>.log`, and acts on the step of its call, counted by that log: the first call
+//! takes the first step. A line that holds neither, as git's `-G` probe of which ssh it runs, fails with no step taken.
 //!
-//! `ok` runs `<gate> box <verb> <payload>` with the gate the variable `GATE_FAKE_SSH_GATE` names, its standard streams
-//! this process's, and exits with its status; `hold <path>` waits until the path exists, then does as `ok`;
-//! `version <v>` does as `ok` with the gate's standard output read, its `gate: remote version` line said as
-//! `gate: remote version <v>`; `fail-banner` writes ssh's `Connection timed out during banner exchange` on standard
-//! error and exits 255; `fail-other` writes another first line there and exits 255; `out-then-drop` writes a line on
-//! standard output and exits 255; `exit <n>` runs nothing and exits `<n>`, as cmd's 9009 for a program it cannot find.
+//! `ok` runs `<gate> box <verb> <payload>` with the gate the variable `GATE_FAKE_SSH_GATE` names, or `git
+//! upload-pack <path>` or `git receive-pack <path>`, its standard streams this process's, and exits with its status;
+//! `hold <path>` waits until the path exists, then does as `ok`; `version <v>` does as `ok` with the gate's standard
+//! output read, its `gate: remote version` line said as `gate: remote version <v>`; `fail-banner` writes ssh's
+//! `Connection timed out during banner exchange` on standard error and exits 255; `fail-other` writes another first line
+//! there and exits 255; `out-then-drop` writes a line on standard output and exits 255; `exit <n>` runs nothing and
+//! exits `<n>`, as cmd's 9009 for a program it cannot find; `say-exit <n> <line>` runs nothing, writes the line on
+//! standard error and exits `<n>`, as the box says its own refusal.
 
 #![expect(clippy::disallowed_methods, reason = "a test helper standing in for ssh, which holds no launch's handles")]
 
@@ -25,6 +29,8 @@ const SSH_FAILED: i32 = 255;
 const HOLD_STEP: Duration = Duration::from_millis(20);
 const HOLD_LIMIT: Duration = Duration::from_secs(600);
 const VERSION: &str = "gate: remote version ";
+/// The git services git's own ssh runs, each with the repository's path in single quotes after its name.
+const GIT_SERVICES: [&str; 2] = ["git-upload-pack", "git-receive-pack"];
 
 fn main() {
     let status = match run() {
@@ -40,16 +46,9 @@ fn main() {
 
 fn run() -> Result<i32, String> {
     let line = std::env::args().next_back().ok_or("no line to run")?;
-    let words: Vec<&str> = line.split(' ').collect();
-    let [.., first, verb, payload] = words.as_slice() else {
-        return Err(format!("the line holds no box call: {line}"));
-    };
-    if *first != "box" {
-        return Err(format!("the line holds no box call: {line}"));
-    }
+    let call = BoxCall::of(&line)?;
     let steps = PathBuf::from(variable("GATE_FAKE_SSH_STEPS")?);
-    let step = next_step(&steps, verb)?;
-    let call = BoxCall { verb, payload };
+    let step = next_step(&steps, call.verb)?;
     match step.split_once(' ') {
         None => bare_step(&step, &call),
         Some(("hold", path)) => {
@@ -58,8 +57,17 @@ fn run() -> Result<i32, String> {
         }
         Some(("version", version)) => call.with_version(version),
         Some(("exit", status)) => status.parse().map_err(|_| format!("the step '{step}' names no status")),
+        Some(("say-exit", rest)) => say_exit(&step, rest),
         Some(_) => Err(format!("unknown step '{step}'")),
     }
+}
+
+/// `say-exit <n> <line>`, given as `rest` after the step's name: writes the line on standard error and gives `<n>`.
+fn say_exit(step: &str, rest: &str) -> Result<i32, String> {
+    let (status, line) = rest.split_once(' ').ok_or_else(|| format!("the step '{step}' names no line"))?;
+    let status = status.parse().map_err(|_| format!("the step '{step}' names no status"))?;
+    writeln!(io::stderr().lock(), "{line}").map_err(|error| format!("cannot write: {error}"))?;
+    Ok(status)
 }
 
 fn bare_step(step: &str, call: &BoxCall<'_>) -> Result<i32, String> {
@@ -113,14 +121,34 @@ fn hold(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// The `gate box` call the line carries.
+/// The call the line carries: `gate box`'s verb and payload, or a git service's name and the repository's path.
 struct BoxCall<'a> {
     verb: &'a str,
     payload: &'a str,
 }
 
-impl BoxCall<'_> {
+impl<'a> BoxCall<'a> {
+    /// The call `line` carries: a git service and its path, unquoted, or the last three words, `box <verb> <payload>`.
+    fn of(line: &'a str) -> Result<BoxCall<'a>, String> {
+        if let Some((verb, path)) = line.split_once(' ').filter(|(verb, _)| GIT_SERVICES.contains(verb)) {
+            return Ok(BoxCall {
+                verb,
+                payload: path.trim_matches('\''),
+            });
+        }
+        let words: Vec<&'a str> = line.split(' ').collect();
+        match words[..] {
+            [.., "box", verb, payload] => Ok(BoxCall { verb, payload }),
+            _ => Err(format!("the line holds no box call: {line}")),
+        }
+    }
+
     fn command(&self) -> Result<Command, String> {
+        if let Some(service) = self.verb.strip_prefix("git-") {
+            let mut command = Command::new("git");
+            command.args([service, self.payload]);
+            return Ok(command);
+        }
         let mut command = Command::new(variable("GATE_FAKE_SSH_GATE")?);
         command.args(["box", self.verb, self.payload]);
         Ok(command)

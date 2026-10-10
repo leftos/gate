@@ -5,7 +5,7 @@
 mod boot;
 mod forward;
 mod heartbeat;
-mod payload;
+pub(crate) mod payload;
 mod preflight;
 mod run;
 mod stop;

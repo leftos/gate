@@ -169,7 +169,7 @@ fn is_commit_sha(value: &str) -> bool {
 }
 
 /// `text` with each control character escaped, so a value cannot break or forge a line.
-fn escaped(text: &str) -> String {
+pub(crate) fn escaped(text: &str) -> String {
     text.chars()
         .map(|character| {
             if character.is_control() {

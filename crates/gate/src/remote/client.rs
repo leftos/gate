@@ -22,6 +22,7 @@ use super::git::{self, Git, GitError};
 use super::payload::{self, Location, RunCall};
 use super::retry::{self, Ended, GIT_SSH_FAILED, SSH_FAILED};
 use super::snapshot::{self, Snapshot};
+use super::syncback;
 use super::transport::{Local, Program, Transport};
 use super::{FAILED, FAILED_RUN, REFUSED, RemoteCall, RemoteClient, RemoteOutcome, busy_line};
 use crate::run::CONTROL_C_EXIT;
@@ -99,7 +100,7 @@ impl RemoteClient for RustClient {
 
 /// How the attempt ended.
 #[derive(Debug)]
-enum End {
+pub(super) enum End {
     /// The run call ended with this status, the command's own.
     Status(i64),
     /// The builder cannot take the run, for this reason: status 75, and the run falls back here.
@@ -112,23 +113,26 @@ enum End {
 
 /// Where a call's lines go besides the log.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Echo {
+pub(super) enum Echo {
     /// To the console stream each came on, as the command's output is.
     Console,
     /// Nowhere else: a preflight's lines.
     LogOnly,
     /// Nowhere else, each line as its carriage-return updates leave it: a push's progress.
     Progress,
+    /// Not even to the log: the lines are only kept for the call's failure line, as the sync-back's calls to the
+    /// builder keep theirs.
+    Unlogged,
 }
 
 /// One call's process as it ended: its exit status, whether it wrote on standard output, its first standard error
 /// line (a heartbeat included) and its last one (none), and every line it wrote but heartbeats.
-struct Called {
-    status: i32,
+pub(super) struct Called {
+    pub(super) status: i32,
     output_seen: bool,
     first_error: Option<String>,
     last_error: Option<String>,
-    lines: Vec<String>,
+    pub(super) lines: Vec<String>,
 }
 
 impl Called {
@@ -145,10 +149,10 @@ impl Called {
 
 /// One run of the client: the call, the way to the builder, the limits, every line the attempt wrote to the log, and
 /// the first line that could not be written.
-struct Attempt<'c, 'a> {
-    call: &'c RemoteCall<'a>,
-    transport: &'c dyn Transport,
-    limit: Duration,
+pub(super) struct Attempt<'c, 'a> {
+    pub(super) call: &'c RemoteCall<'a>,
+    pub(super) transport: &'c dyn Transport,
+    pub(super) limit: Duration,
     pause: Duration,
     lines: Vec<String>,
     problem: Option<String>,
@@ -169,11 +173,17 @@ impl Attempt<'_, '_> {
         let run_line = payload::capped("run", payload::line("run", &payload::run_word(&location, &run))).map_err(End::Failed)?;
         let created = self.preflight(&location)?;
         self.push(&snapshot, created)?;
-        self.run_call(&run_line)
+        let end = self.run_call(&run_line)?;
+        // The sync-back runs after a run call that ended with the command's own status; a refusal, an interrupt or a
+        // failed call ended the attempt before it, so a box refusal's 75 never syncs back.
+        match end {
+            End::Status(status) => syncback::sync_back(self, &snapshot, status),
+            end => Ok(end),
+        }
     }
 
     /// Goes on unless the console interrupt is raised, which ends the attempt as an interrupt.
-    fn go_on(&self) -> Result<(), End> {
+    pub(super) fn go_on(&self) -> Result<(), End> {
         if self.call.interrupt.is_some_and(Interrupt::is_raised) {
             return Err(End::Interrupted);
         }
@@ -239,7 +249,7 @@ impl Attempt<'_, '_> {
         let git = Git::find(root).map_err(End::Failed)?;
         let started = Instant::now();
         let ssh_command = target.ssh_command.as_deref();
-        let (mut called, _) = self.with_retry(GIT_SSH_FAILED, |attempt| attempt.git(&git, &args, ssh_command))?;
+        let (mut called, _) = self.with_retry(GIT_SSH_FAILED, |attempt| attempt.git(&git, &args, ssh_command, Echo::Progress))?;
         let size = push_size(&called.lines);
         self.lines.append(&mut called.lines);
         if called.status != 0 {
@@ -272,7 +282,7 @@ impl Attempt<'_, '_> {
     /// Makes a call with `make` and, when it failed before the banner, says so, pauses and makes it once more; a Ctrl+C
     /// before the retry or during its pause ends the attempt instead. The call that counts, its lines not yet kept, and
     /// whether the retry failed before the banner too.
-    fn with_retry(&mut self, fail_status: i32, mut make: impl FnMut(&mut Self) -> Result<Called, End>) -> Result<(Called, bool), End> {
+    pub(super) fn with_retry(&mut self, fail_status: i32, mut make: impl FnMut(&mut Self) -> Result<Called, End>) -> Result<(Called, bool), End> {
         let mut first = make(self)?;
         if !first.before_the_banner(fail_status) {
             return Ok((first, false));
@@ -295,14 +305,15 @@ impl Attempt<'_, '_> {
         self.started(command, echo)
     }
 
-    /// git with `args` in the worktree, given `ssh_command` as the ssh it runs when there is one.
-    fn git(&mut self, git: &Git, args: &[String], ssh_command: Option<&str>) -> Result<Called, End> {
+    /// git with `args` in the worktree, given `ssh_command` as the ssh it runs when there is one, its lines going where
+    /// `echo` says.
+    pub(super) fn git(&mut self, git: &Git, args: &[String], ssh_command: Option<&str>, echo: Echo) -> Result<Called, End> {
         let mut command = git.command(Path::new(self.call.root));
         command.args(args);
         if let Some(ssh) = ssh_command {
             command.env("GIT_SSH_COMMAND", ssh);
         }
-        self.started(command, Echo::Progress)
+        self.started(command, echo)
     }
 
     /// Starts `command` with no standard input, reads its two streams line by line into the log, and onto the console
@@ -343,7 +354,7 @@ impl Attempt<'_, '_> {
     }
 
     /// Appends the gate's own `line` to the log and says it on stderr; the first failure to is kept.
-    fn say(&mut self, line: String) {
+    pub(super) fn say(&mut self, line: String) {
         if let Err(why) = super::say(self.call.log, &[&line], io::stderr().lock()) {
             self.problem.get_or_insert(why);
         }
@@ -368,6 +379,21 @@ impl Attempt<'_, '_> {
             killed: false,
             lines: self.lines,
             detail: self.problem,
+        }
+    }
+}
+
+#[cfg(test)]
+impl<'c, 'a> Attempt<'c, 'a> {
+    /// An attempt of `call` through `transport` with no pause before a retry, as the sync-back's tests drive one.
+    pub(super) fn for_tests(call: &'c RemoteCall<'a>, transport: &'c dyn Transport) -> Attempt<'c, 'a> {
+        Attempt {
+            call,
+            transport,
+            limit: git::GIT_LIMIT,
+            pause: Duration::ZERO,
+            lines: Vec::new(),
+            problem: None,
         }
     }
 }
@@ -418,7 +444,8 @@ impl Heard {
     }
 
     /// Takes one `line` of standard error when `error`, else of standard output: a heartbeat only marks the first error
-    /// line; any other is written to the log, said on its stream when `echo` says so, and kept.
+    /// line; any other is written to the log unless `echo` keeps it out, said on its stream when `echo` says so, and
+    /// kept.
     fn take(&mut self, line: &str, error: bool, echo: Echo) {
         if error {
             self.first_error.get_or_insert_with(|| line.to_owned());
@@ -431,7 +458,9 @@ impl Heard {
         if error {
             self.last_error = Some(line.to_owned());
         }
-        if let Err(error) = writeln!(self.log, "{line}") {
+        if echo != Echo::Unlogged
+            && let Err(error) = writeln!(self.log, "{line}")
+        {
             self.problem.get_or_insert_with(|| format!("cannot write to the log: {error}"));
         }
         if echo == Echo::Console {
@@ -550,7 +579,10 @@ mod tests {
     use gate_state::{FallbackReason, StateRoot};
     use gate_win32::Interrupt;
 
-    use super::{Attempt, Called, End, SSH_FAILED, is_heartbeat, last_update, paused, push_size, refusal, seconds, their_version, version_refusal};
+    use super::{
+        Attempt, Called, End, GIT_SSH_FAILED, SSH_FAILED, is_heartbeat, last_update, paused, push_size, refusal, seconds, their_version,
+        version_refusal,
+    };
     use crate::remote::git::GIT_LIMIT;
     use crate::remote::payload::Location;
     use crate::remote::snapshot::Snapshot;
@@ -655,6 +687,45 @@ mod tests {
         assert!(outcome.lines.is_empty(), "an interrupt says no failure line: {outcome:?}");
         assert_eq!(outcome.fallback(), None, "an interrupt is no fallback");
         assert!(!log.exists(), "nothing is said");
+    }
+
+    #[test]
+    fn a_sync_back_git_call_dropped_before_the_banner_is_retried_once() {
+        // The local transport runs git against a bare repository path, never through the ssh stand-in, so the only way
+        // to reach the sync-back's retry is the decision itself, as a call that failed before the banner.
+        let log = std::env::temp_dir().join(format!("gate-client-sync-back-retry-{}.log", std::process::id()));
+        let mut given = call(&log);
+        given.interrupt = None;
+        let transport = Local::new(r"local:C:\builder", None).expect("a local transport");
+        let mut attempt = Attempt {
+            call: &given,
+            transport: &transport,
+            limit: GIT_LIMIT,
+            pause: Duration::ZERO,
+            lines: Vec::new(),
+            problem: None,
+        };
+        let mut made = 0;
+
+        let retried = attempt.with_retry(GIT_SSH_FAILED, |_| {
+            made += 1;
+            Ok(Called {
+                status: GIT_SSH_FAILED,
+                output_seen: false,
+                first_error: Some("kex_exchange_identification: Connection closed by remote host".to_owned()),
+                last_error: Some("kex_exchange_identification: Connection closed by remote host".to_owned()),
+                lines: vec!["kex_exchange_identification: Connection closed by remote host".to_owned()],
+            })
+        });
+
+        let (called, again) = retried.expect("a call that ends without an interrupt");
+        assert_eq!(made, 2, "the git call is made once more");
+        assert!(again, "the retry failed before the banner too");
+        assert_eq!(called.status, GIT_SSH_FAILED);
+        let said = std::fs::read_to_string(&log).expect("the retry line was written");
+        let retry_line = "gate: builder did not answer the ssh banner; trying once more";
+        assert_eq!(said.lines().filter(|line| *line == retry_line).count(), 1, "{said}");
+        std::fs::remove_file(&log).expect("the log can be removed");
     }
 
     #[test]

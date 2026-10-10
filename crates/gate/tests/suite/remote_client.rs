@@ -374,7 +374,13 @@ fn calls(steps: &Path) -> Vec<String> {
 /// The gate of a routed run logging to `log` through the Rust client: the builder root `builder` in the case folder,
 /// each ssh call made through the stand-in of the steps file `steps`, the retry pause 1 ms.
 fn client_gate(case: &Case, log: &str, steps: &Path, command: &[&str]) -> Command {
-    let transport = format!("local:{}", shown(&case.folder().join("builder")));
+    client_gate_through(case, "local", log, steps, command)
+}
+
+/// [`client_gate`] through the local transport of the form `kind`: `local`, or `local-ssh`, which pushes and fetches
+/// through the stand-in as git's own ssh, so each of git's calls to the builder is a call of the stand-in too.
+fn client_gate_through(case: &Case, kind: &str, log: &str, steps: &Path, command: &[&str]) -> Command {
+    let transport = format!("{kind}:{}", shown(&case.folder().join("builder")));
     let seams = [
         "--test-remote-transport",
         transport.as_str(),
@@ -409,11 +415,48 @@ fn key_of(events: &[Value]) -> String {
     events[0]["key"].as_str().expect("the queue line has a key").to_owned()
 }
 
+/// The builder's bare repository of the case's repo.
+fn bare_of(case: &Case) -> String {
+    let repo = repo_name(&case.folder().file_name().expect("the case folder has a name").to_string_lossy());
+    shown(&case.folder().join("builder").join(format!("{repo}.git")))
+}
+
 /// The commit `name` names in the case's builder's bare repository, empty when it names none.
 fn builder_ref(case: &Case, name: &str) -> String {
-    let repo = repo_name(&case.folder().file_name().expect("the case folder has a name").to_string_lossy());
-    let bare = shown(&case.folder().join("builder").join(format!("{repo}.git")));
-    git_out(case, &[], &["--git-dir", &bare, "for-each-ref", "--format=%(objectname)", name])
+    git_out(case, &[], &["--git-dir", &bare_of(case), "for-each-ref", "--format=%(objectname)", name])
+}
+
+/// The 8 hex digits of the snapshot the run logging to `log` pushed, from its `gate: pushed snapshot <8> in …` line.
+fn pushed_snapshot(case: &Case, log: &str) -> String {
+    let text = fs::read_to_string(case.folder().join(log)).expect("the log was written");
+    let line = text
+        .lines()
+        .find(|line| line.starts_with("gate: pushed snapshot "))
+        .expect("the run pushed a snapshot");
+    line["gate: pushed snapshot ".len()..].chars().take(8).collect()
+}
+
+/// The `gate-remote-*.patch` files the client left in the case's git folder.
+fn patch_files(case: &Case) -> Vec<String> {
+    fs::read_dir(case.folder().join(".git"))
+        .expect("the git folder can be listed")
+        .map(|entry| entry.expect("an entry can be read").file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("gate-remote-") && Path::new(name).extension().is_some_and(|kind| kind.to_str() == Some("patch")))
+        .collect()
+}
+
+/// The case worktree's git status, without the optional locks, so reading it refreshes no index.
+fn porcelain(case: &Case) -> String {
+    git_out(case, &[], &["--no-optional-locks", "status", "--porcelain=v2", "--untracked-files=all"])
+}
+
+/// Pushes an empty commit of the case's own, whose parent is the case's commit before it, into the builder's bare
+/// repository at `refs/gate-back/<key>`: the stale back commit a client must refuse to apply. Its sha.
+fn plant_back(case: &Case, key: &str) -> String {
+    git(case, &["commit", "--quiet", "--allow-empty", "-m", "stale"]);
+    let stale = git_out(case, &[], &["rev-parse", "HEAD"]);
+    git_out(case, &[], &["push", "--quiet", &bare_of(case), &format!("{stale}:refs/gate-back/{key}")]);
+    stale
 }
 
 /// Runs `gate` to its end, with its pid.
@@ -597,4 +640,286 @@ fn a_box_of_another_version_is_not_routed() {
     let events = events(&case);
     assert_eq!(fallbacks(&events), ["version"]);
     assert_eq!(builder_ref(&case, &format!("refs/gate/{}", key_of(&events))), "", "nothing was pushed");
+}
+
+#[test]
+fn a_file_the_command_changes_on_the_box_is_synced_back() {
+    let case = client_case("client-synced-back");
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "mark", "made-on-box.txt"]));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(
+        fs::read_to_string(case.folder().join("made-on-box.txt")).expect("the box's file is here"),
+        "run\n",
+        "the box's file, with the box's content: {outcome:?}"
+    );
+    assert!(outcome.stderr.contains("gate: synced back 1 file(s): made-on-box.txt"), "{outcome:?}");
+    let log = fs::read_to_string(case.folder().join("out.log")).expect("the log was written");
+    assert!(log.contains("gate: synced back 1 file(s): made-on-box.txt"), "{log}");
+    assert!(!log.contains("refs/gate-back/"), "the sync-back's git output stays out of the log: {log}");
+    assert_eq!(patch_files(&case), Vec::<String>::new(), "the patch is removed");
+    let key = key_of(&events(&case));
+    assert!(
+        is_sha(&builder_ref(&case, &format!("refs/gate-back/{key}"))),
+        "the box wrote the back commit"
+    );
+    assert_eq!(calls(&steps), ["preflight", "run"]);
+}
+
+#[test]
+fn a_command_that_changes_nothing_syncs_nothing_back() {
+    let case = client_case("client-nothing-back");
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "out", "ran there"]));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(!outcome.stderr.contains("gate: synced back "), "{outcome:?}");
+    let key = key_of(&events(&case));
+    assert_eq!(builder_ref(&case, &format!("refs/gate-back/{key}")), "", "the box wrote no back commit");
+    assert_eq!(calls(&steps), ["preflight", "run"]);
+}
+
+/// The box clears `refs/gate-back/<key>` as it checks the snapshot out, before the command runs, so a ref planted while
+/// the run call parks on a `hold` step is gone before the client looks for one. The stale ref is planted between two
+/// runs instead, and the second run's call runs nothing (`exit 0`), so nothing clears it before the client reads it.
+#[test]
+fn a_back_commit_not_made_from_this_snapshot_is_ignored() {
+    let case = client_case("client-stale-back");
+    write(&case, "a.txt", "a\n");
+    git(&case, &["add", "-A"]);
+    git(&case, &["commit", "--quiet", "-m", "start"]);
+    let first = ssh_steps(&case, "first", &["ok", "ok"]);
+    let pushed = finish(client_gate(&case, "first.log", &first, &[r".\tool.exe", "out", "ran there"]));
+    assert_eq!(pushed.code, Some(0), "{pushed:?}");
+    let key = key_of(&events(&case));
+    let stale = plant_back(&case, &key);
+    let before = porcelain(&case);
+
+    let second = ssh_steps(&case, "second", &["ok", "exit 0"]);
+    let outcome = finish(client_gate(&case, "second.log", &second, &[r".\tool.exe", "out", "ran there"]));
+
+    assert_eq!(outcome.code, Some(0), "the run's status stands: {outcome:?}");
+    let line = format!(
+        "gate: ignored stale remote changes {}: not made from snapshot {}",
+        &stale[..8],
+        pushed_snapshot(&case, "second.log")
+    );
+    assert!(outcome.stderr.contains(&line), "{outcome:?}");
+    assert_eq!(porcelain(&case), before, "the worktree is untouched: {outcome:?}");
+    let kept = git_out(
+        &case,
+        &[],
+        &["for-each-ref", "--format=%(objectname)", &format!("refs/gate-remote/{key}-back")],
+    );
+    assert_eq!(kept, "", "nothing was kept in the worktree");
+    assert_eq!(calls(&second), ["preflight", "run"]);
+}
+
+#[test]
+fn a_worktree_changed_during_the_run_keeps_the_changes_and_fails_a_passing_run() {
+    let case = client_case("client-worktree-changed");
+    write(&case, "a.txt", "before\n");
+    let go = case.folder().join("ssh").join("go");
+    let steps = ssh_steps(&case, "ssh", &["ok", &format!("hold {}", shown(&go))]);
+    let run = start(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "mark", "made-on-box.txt"]));
+    wait_until("the run call", || calls(&steps).len() == 2);
+    write(&case, "a.txt", "after\n");
+    fs::write(&go, "").expect("the go file can be made");
+
+    let outcome = run.finish();
+
+    assert_eq!(outcome.code, Some(1), "a passing run becomes 1: {outcome:?}");
+    let key = key_of(&events(&case));
+    let back = builder_ref(&case, &format!("refs/gate-back/{key}"));
+    assert!(is_sha(&back), "the box wrote the back commit: {back:?}");
+    let line = format!(
+        "gate: remote changes not applied: the worktree changed during the run; see git diff {} {}",
+        pushed_snapshot(&case, "out.log"),
+        &back[..8]
+    );
+    assert!(outcome.stderr.contains(&line), "{outcome:?}");
+    assert_eq!(
+        git_out(&case, &[], &["rev-parse", &format!("refs/gate-remote/{key}-back")]),
+        back,
+        "the changes are kept at the key's -back ref"
+    );
+    assert!(!case.folder().join("made-on-box.txt").exists(), "the box's change is not here");
+    assert_eq!(
+        fs::read_to_string(case.folder().join("a.txt")).expect("the file is there"),
+        "after\n",
+        "the worktree's own change stands"
+    );
+}
+
+#[test]
+fn a_failing_run_keeps_its_status_when_the_worktree_changed_during_it() {
+    let case = client_case("client-worktree-changed-failing");
+    write(&case, "a.txt", "before\n");
+    let go = case.folder().join("ssh").join("go");
+    let steps = ssh_steps(&case, "ssh", &["ok", &format!("hold {}", shown(&go))]);
+    let run = start(client_gate(
+        &case,
+        "out.log",
+        &steps,
+        &[r".\tool.exe", "mark", "made-on-box.txt", "exit", "3"],
+    ));
+    wait_until("the run call", || calls(&steps).len() == 2);
+    write(&case, "a.txt", "after\n");
+    fs::write(&go, "").expect("the go file can be made");
+
+    let outcome = run.finish();
+
+    assert_eq!(outcome.code, Some(3), "a failing run keeps its own status: {outcome:?}");
+    let key = key_of(&events(&case));
+    let back = builder_ref(&case, &format!("refs/gate-back/{key}"));
+    assert!(is_sha(&back), "the box wrote the back commit: {back:?}");
+    let line = format!(
+        "gate: remote changes not applied: the worktree changed during the run; see git diff {} {}",
+        pushed_snapshot(&case, "out.log"),
+        &back[..8]
+    );
+    assert!(outcome.stderr.contains(&line), "{outcome:?}");
+    assert!(!case.folder().join("made-on-box.txt").exists(), "the box's change is not here");
+}
+
+#[test]
+fn a_back_commit_that_touches_a_git_file_is_kept_and_fails_a_passing_run() {
+    let case = client_case("client-back-git-file");
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "mark", ".gitignore"]));
+
+    assert_eq!(outcome.code, Some(1), "a passing run becomes 1: {outcome:?}");
+    let key = key_of(&events(&case));
+    let back = builder_ref(&case, &format!("refs/gate-back/{key}"));
+    assert!(is_sha(&back), "the box wrote the back commit: {back:?}");
+    let line = format!(
+        "gate: remote changes not applied: they touch .gitignore, which a sync-back never writes; see git diff {} {}",
+        pushed_snapshot(&case, "out.log"),
+        &back[..8]
+    );
+    assert!(outcome.stderr.contains(&line), "{outcome:?}");
+    assert_eq!(
+        git_out(&case, &[], &["rev-parse", &format!("refs/gate-remote/{key}-back")]),
+        back,
+        "the changes are kept at the key's -back ref"
+    );
+    assert_eq!(
+        fs::read_to_string(case.folder().join(".gitignore")).expect("the .gitignore is there"),
+        CLIENT_IGNORED,
+        "the worktree's .gitignore is untouched"
+    );
+    assert!(!outcome.stderr.contains("gate: synced back "), "{outcome:?}");
+}
+
+/// The case plants a back commit between two runs, as the stale-back case does; the second run's call is the box's own
+/// busy refusal, so a sync-back after it would find the planted commit and say it ignored it.
+#[test]
+fn a_refused_run_call_syncs_nothing_back() {
+    let case = client_case("client-refused-back");
+    let first = ssh_steps(&case, "first", &["ok", "ok"]);
+    let pushed = finish(client_gate(&case, "first.log", &first, &[r".\tool.exe", "out", "ran there"]));
+    assert_eq!(pushed.code, Some(0), "{pushed:?}");
+    let key = key_of(&events(&case));
+    plant_back(&case, &key);
+    let busy = format!("say-exit 75 gate: remote work folder {key} is busy");
+    let second = ssh_steps(&case, "second", &["ok", &busy]);
+
+    let (pid, outcome) = finish_with_pid(client_gate(&case, "second.log", &second, &[r".\tool.exe", "out", "ran here"]));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(outcome.stderr.contains(BUSY_LINE), "{outcome:?}");
+    assert!(outcome.stdout.contains("ran here"), "it ran here: {outcome:?}");
+    assert!(
+        !outcome.stderr.contains("gate: ignored stale remote changes"),
+        "no sync-back: {outcome:?}"
+    );
+    assert_eq!(fallbacks(&own(&case, pid)), ["busy"]);
+    assert_eq!(calls(&second), ["preflight", "run"]);
+}
+
+/// The builder's bare repository is moved aside while the run call parks, so the sync-back's `ls-remote` finds none.
+#[test]
+fn a_git_failure_of_the_sync_back_fails_the_run_with_no_fallback() {
+    let case = client_case("client-back-git-failure");
+    let go = case.folder().join("ssh").join("go");
+    let steps = ssh_steps(&case, "ssh", &["ok", &format!("hold {}", shown(&go))]);
+    let run = start(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "out", "ran there"]));
+    wait_until("the run call", || calls(&steps).len() == 2);
+    let bare = PathBuf::from(bare_of(&case));
+    fs::rename(&bare, bare.with_extension("aside")).expect("the bare repository can be moved aside");
+    fs::write(&go, "").expect("the go file can be made");
+
+    let outcome = run.finish();
+
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert!(outcome.stderr.contains("gate: the remote run failed: git ls-remote"), "{outcome:?}");
+    assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new(), "no fallback");
+}
+
+/// The case's own exclude file leaves `made-on-box.txt` out of the snapshot, so the box's command makes it anew while
+/// the worktree holds a file of that name: the worktree still matches the snapshot, and the patch cannot apply.
+#[test]
+fn a_patch_that_does_not_apply_fails_the_run_and_is_removed() {
+    let case = client_case("client-apply-fails");
+    let exclude = case.folder().join(".git").join("info").join("exclude");
+    fs::create_dir_all(exclude.parent().expect("the exclude file has a folder")).expect("the info folder can be made");
+    let excluded = if exclude.exists() {
+        fs::read_to_string(&exclude).expect("the exclude file can be read")
+    } else {
+        String::new()
+    };
+    fs::write(&exclude, format!("{excluded}\nmade-on-box.txt\n")).expect("the exclude file can be written");
+    write(&case, "made-on-box.txt", "here\n");
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "mark", "made-on-box.txt"]));
+
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert!(outcome.stderr.contains("gate: the remote run failed: git apply "), "{outcome:?}");
+    assert_eq!(patch_files(&case), Vec::<String>::new(), "the patch is removed");
+    assert_eq!(
+        fs::read_to_string(case.folder().join("made-on-box.txt")).expect("the worktree's file is there"),
+        "here\n",
+        "the worktree's own file stands"
+    );
+    assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new(), "no fallback");
+}
+
+/// Through `local-ssh`, git's own ssh is the stand-in, so its `ls-remote` can be dropped before the banner: the
+/// preflight, the push's receive-pack and the run call, then the sync-back's ls-remote twice and its fetch.
+#[test]
+fn a_banner_drop_of_the_sync_back_s_ls_remote_is_retried_once() {
+    let case = client_case("client-back-retry");
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok", "ok", "fail-banner", "ok", "ok"]);
+
+    let outcome = finish(client_gate_through(
+        &case,
+        "local-ssh",
+        "out.log",
+        &steps,
+        &[r".\tool.exe", "mark", "made-on-box.txt"],
+    ));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(outcome.stderr.matches(RETRY_LINE).count(), 1, "{outcome:?}");
+    assert!(outcome.stderr.contains("gate: synced back 1 file(s): made-on-box.txt"), "{outcome:?}");
+    assert_eq!(
+        fs::read_to_string(case.folder().join("made-on-box.txt")).expect("the box's file is here"),
+        "run\n"
+    );
+    assert_eq!(
+        calls(&steps),
+        [
+            "preflight",
+            "git-receive-pack",
+            "run",
+            "git-upload-pack",
+            "git-upload-pack",
+            "git-upload-pack"
+        ]
+    );
 }
