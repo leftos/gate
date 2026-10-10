@@ -23,6 +23,7 @@ serde_json = { version = "1.0.151", features = ["preserve_order"] }
 
 [dev-dependencies]
 flate2 = "1.1.10"
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_JobObjects", "Win32_System_Threading"] }
 
 [[bin]]
 name = "gate"

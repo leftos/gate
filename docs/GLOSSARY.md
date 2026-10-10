@@ -9,6 +9,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Backstop**: the watchdog's last limit, five times the ceiling in wall time (less time paused behind a critical request), whatever the load.
 - **Black-box suite**: the Rust integration suite (`crates/gate/tests/suite/`) that drives the built `gate.exe` through its CLI and reads only its exit code, output, log, journal, claims and tickets; it needs the `test-seams` feature to run.
 - **Box**: a builder; the word the gate's prose and its hidden `gate box` subcommand use.
+- **Box job**: the named job `Local\gate-remote-<key>-<12 hex>` that a `gate box run` puts its command in, named by the payload and stopped by `gate box stop`; it has no limits and no kill-on-close.
 - **Bridge**: the stand-in, until the remote port, by which `gate.exe` runs a routed run's remote part through the PowerShell remote client, `remote.ps1`.
 - **Build client**: a process in the command's job that drives a build (`MSBuild.exe`, or `dotnet` without `--no-build`); only while one runs does a build server's CPU count as the command's progress.
 - **Build server**: a long-lived compiler or MSBuild node process (`VBCSCompiler`, a `dotnet` running `VBCSCompiler.dll` or an MSBuild node) that builds share.
@@ -78,3 +79,4 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Win32 layer**: the `gate-win32` crate, the only code that calls Windows for job objects, processes, mutexes, events and console handling.
 - **Work folder**: the builder's checkout of one PC worktree, reused across routed runs so builds stay incremental.
 - **Work-folder key**: the name of a work folder: the worktree folder's name plus 8 hex digits of the SHA-256 of its lower-cased path.
+- **Work-folder lock**: the file `<Work>.lock` that `gate box run` opens with no sharing and holds for the run's life, so one run at a time uses a work folder; a held lock is the `busy` refusal.

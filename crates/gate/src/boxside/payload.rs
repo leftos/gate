@@ -39,6 +39,136 @@ impl Payload {
             Err(format!("gate: box payload {key} is not an absolute path on a drive: {value:?}"))
         }
     }
+
+    /// The words of `key`, a list of texts; else the usage line saying the payload lacks it (absent or empty) or that
+    /// it is not a list of texts.
+    pub(crate) fn words(&self, key: &str) -> Result<Vec<String>, String> {
+        let not_words = || format!("gate: box payload {key} is not a list of texts");
+        let list = match self.0.get(key) {
+            None | Some(Value::Null) => return Err(format!("gate: box payload lacks {key}")),
+            Some(value) => value.as_array().ok_or_else(not_words)?,
+        };
+        if list.is_empty() {
+            return Err(format!("gate: box payload lacks {key}"));
+        }
+        list.iter().map(|word| word.as_str().map(str::to_owned).ok_or_else(not_words)).collect()
+    }
+
+    /// The text of `key`, empty when the key is absent or null; else the usage line saying it is not a text.
+    pub(crate) fn optional_text(&self, key: &str) -> Result<&str, String> {
+        match self.0.get(key) {
+            None | Some(Value::Null) => Ok(""),
+            Some(value) => value.as_str().ok_or_else(|| format!("gate: box payload {key} is not a text")),
+        }
+    }
+
+    /// The name and text of each entry of the object at `key`, none when the key is absent or null; else the usage
+    /// line saying it is not an object of texts.
+    pub(crate) fn pairs(&self, key: &str) -> Result<Vec<(String, String)>, String> {
+        let not_pairs = || format!("gate: box payload {key} is not an object of texts");
+        let object = match self.0.get(key) {
+            None | Some(Value::Null) => return Ok(Vec::new()),
+            Some(value) => value.as_object().ok_or_else(not_pairs)?,
+        };
+        object
+            .iter()
+            .map(|(name, value)| value.as_str().map(|text| (name.clone(), text.to_owned())).ok_or_else(not_pairs))
+            .collect()
+    }
+}
+
+/// The client's work-folder checks: the key, the work folder named for it, and the run's job and files beside it.
+impl Payload {
+    /// The work-folder key: ASCII letters, digits, `-` and `_`, as the client builds it from the repo's name; else the
+    /// usage line, the key shown with its control characters escaped.
+    pub(crate) fn key(&self) -> Result<&str, String> {
+        let key = self.text("Key")?;
+        if key
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+        {
+            Ok(key)
+        } else {
+            Err(not_a_key(key))
+        }
+    }
+
+    /// The key and the work folder: `Work` an absolute path on a drive, with no trailing separator, whose last name is
+    /// the key; else the usage line.
+    pub(crate) fn work_folder(&self) -> Result<(&str, &str), String> {
+        let work = self.path("Work")?;
+        if work.ends_with(['\\', '/']) {
+            return Err(format!("gate: box payload Work must not end with a separator: {}", escaped(work)));
+        }
+        let key = self.key()?;
+        let last = work.rsplit(['\\', '/']).next();
+        if last.is_some_and(|last| last.eq_ignore_ascii_case(key)) {
+            Ok((key, work))
+        } else {
+            Err(not_a_key(key))
+        }
+    }
+
+    /// The path of `key`, which must be `<work>.<extension>`, as the client builds the lock and the index; compared as
+    /// full paths without regard to case. Else the usage line.
+    pub(crate) fn beside_work(&self, key: &str, work: &str, extension: &str) -> Result<&str, String> {
+        let value = self.path(key)?;
+        let expected = format!("{work}.{extension}");
+        let full = |path: &str| std::path::absolute(path).map(|full| ordinal_upper(&full.to_string_lossy())).ok();
+        match (full(value), full(&expected)) {
+            (Some(value_full), Some(expected_full)) if value_full == expected_full => Ok(value),
+            _ => Err(format!("gate: box payload {key} must be {expected}")),
+        }
+    }
+
+    /// The run's job name, `Local\gate-remote-<key>-<nonce>` with the payload's own key and a nonce of 12 hex digits,
+    /// as the client names it; else the usage line. A stop can so reach no job but a run's of this work folder.
+    pub(crate) fn job(&self, key: &str) -> Result<&str, String> {
+        let job = self.text("Job")?;
+        let nonce = job
+            .strip_prefix(r"Local\gate-remote-")
+            .and_then(|rest| rest.strip_prefix(key))
+            .and_then(|rest| rest.strip_prefix('-'));
+        if nonce.is_some_and(|nonce| nonce.len() == NONCE_DIGITS && nonce.chars().all(|digit| digit.is_ascii_hexdigit())) {
+            Ok(job)
+        } else {
+            Err(format!("gate: box payload Job is not this work folder's job name: {}", escaped(job)))
+        }
+    }
+}
+
+/// The hex digits of a run's nonce, as the client draws it.
+const NONCE_DIGITS: usize = 12;
+
+fn not_a_key(key: &str) -> String {
+    format!("gate: box payload Key is not a work-folder key: {}", escaped(key))
+}
+
+/// `text` with each control character escaped, so a value cannot break or forge a line.
+fn escaped(text: &str) -> String {
+    text.chars()
+        .map(|character| {
+            if character.is_control() {
+                character.escape_debug().to_string()
+            } else {
+                character.to_string()
+            }
+        })
+        .collect()
+}
+
+/// `text` with each character mapped to its simple uppercase, as .NET's `OrdinalIgnoreCase` compares: a character
+/// whose uppercase is more than one character is kept.
+pub(crate) fn ordinal_upper(text: &str) -> String {
+    text.chars()
+        .map(|character| {
+            let mut upper = character.to_uppercase();
+            match (upper.next(), upper.next()) {
+                (Some(single), None) => single,
+                _ => character,
+            }
+        })
+        .collect()
 }
 
 fn is_drive_path(value: &str) -> bool {

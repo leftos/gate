@@ -192,7 +192,7 @@ struct Plan {
 }
 
 /// How a found program is started.
-enum Written {
+pub(crate) enum Written {
     /// The application and its command line.
     Line(PathBuf, Vec<u16>),
     /// A batch word cmd.exe would split or expand: the refusal's line.
@@ -275,7 +275,7 @@ pub(crate) fn find_program(word: &str, variables: &Variables, folder: &Path) -> 
 
 /// The application and command line of `program` with the words `rest`: a batch target runs through the system
 /// folder's cmd.exe, its words checked against what cmd.exe would split or expand.
-fn written(program: &Path, rest: &[OsString], variables: &Variables) -> Written {
+pub(crate) fn written(program: &Path, rest: &[OsString], variables: &Variables) -> Written {
     let mut words: Vec<Vec<u16>> = vec![program.as_os_str().encode_wide().collect()];
     words.extend(rest.iter().map(|word| word.encode_wide().collect()));
     if !is_batch_target(&program.to_string_lossy()) {

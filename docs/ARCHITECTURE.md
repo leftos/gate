@@ -4,7 +4,9 @@ gate is a Cargo workspace whose `gate` binary (`gate.exe`) queues heavy commands
 
 The rule that shapes it: every file and kernel object another process sees is defined once, in `gate-state`, and the pure crates hold no Windows types, so they build and test on Linux. The design is [design.md](design.md); terms used in a project sense are in the [glossary](GLOSSARY.md).
 
-`gate-state` and `proc-table` exist (moved in from ops-tower with their history, GATE-4), and so do `gate-args` and the `gate` binary's skeleton (GATE-32). `gate-win32` exists with the named mutexes and events (GATE-33), and the `gate` binary has the slot loop (GATE-34, GATE-30), `gate stop-tree` (GATE-57) and the box side's `boot` and `preflight` verbs (GATE-59). `gate-watchdog` exists as a pure crate (GATE-56), and nothing in the `gate` binary uses it yet.
+`gate-state` and `proc-table` exist (moved in from ops-tower with their history, GATE-4), and so do `gate-args` and the `gate` binary's skeleton (GATE-32).
+
+`gate-win32` exists with the named mutexes and events (GATE-33), and the `gate` binary has the slot loop (GATE-34, GATE-30), `gate stop-tree` (GATE-57) and the box side's `boot` and `preflight` verbs (GATE-59) and its `run` and `stop` verbs (GATE-60). `gate-watchdog` exists as a pure crate (GATE-56), and nothing in the `gate` binary uses it yet.
 
 `gate-router` exists as a pure crate (GATE-66): the routing decision, `remote.json` parsing, the `-like` matcher, the path rewrite and the work-folder key. Nothing in the `gate` binary uses it yet.
 
@@ -19,7 +21,7 @@ The rule that shapes it: every file and kernel object another process sees is de
 | Change journal rollover or the archive | [design.md, Journal](design.md#journal) and [Archive](design.md#archive) → `crates/gate-state/src/journal_writer.rs` and `archive.rs` → `crates/gate-state/tests/state/archive.rs` → `crates/gate/tests/suite/journal.rs` | [design.md](design.md#archive) |
 | Find the journal mutex or any kernel object name | [design.md, Kernel object names](design.md#kernel-object-names) → `crates/gate-state/src/root.rs` → `crates/gate-win32/src/mutex.rs` (mutexes and the probe by open) and `event.rs` (wake events) | [design.md](design.md#kernel-object-names) |
 | Change how a gate takes, waits for or releases a slot (a slot, a ticket, the wake event, the fallback poll, the count formula, an abandoned takeover) | [design.md, Slots](design.md#slots) and [Formats](design.md#formats) → `crates/gate-state/src/{root,model,counts,v1}.rs` → `crates/gate-win32/src/{mutex,event}.rs` → `crates/gate/src/{slots,wait,acquire}.rs` → `crates/gate/tests/suite/slots.rs` → items S1-S5, Q1-Q3 and L1-L2 in [the inventory](research/2026-10-09-powershell-gate-inventory.md) → a repo inbox request to ops-tower | [design.md, Slots](design.md#slots) |
-| Add or change a `gate box` verb (the builder side of a routed run) | [design.md, The box side](design.md#the-box-side) and [Command launching](design.md#command-launching) → the PowerShell reference `remote-wrapper.ps1` and items BW1-BW12 in [the inventory](research/2026-10-09-powershell-gate-inventory.md) → `crates/gate-args/src/{lib,request,problem,boxcmd}.rs` → `crates/gate/src/{answer,main}.rs` and `crates/gate/src/boxside/` → `crates/gate-win32/src/{job,launch}.rs` → `crates/gate/tests/suite/{boxside,support}.rs` | [design.md](design.md#the-box-side) |
+| Add or change a `gate box` verb (the builder side of a routed run) | [design.md, The box side](design.md#the-box-side) and [Command launching](design.md#command-launching) → the PowerShell reference `remote-wrapper.ps1` and items BW1-BW12 in [the inventory](research/2026-10-09-powershell-gate-inventory.md) → `crates/gate-args/src/{lib,request,problem,boxcmd}.rs` → `crates/gate/src/{answer,main}.rs` and `crates/gate/src/boxside/` (`run.rs`, `stop.rs` and `forward.rs` for `run` and `stop`) → `crates/gate-win32/src/{job,launch,piped}.rs` → `crates/gate/tests/suite/{boxside,support}.rs` | [design.md](design.md#the-box-side) |
 | Change how the gate reads slot state (claims, tickets, counts, mutexes) | `crates/gate-state/src/{model,state,counts,claims,remote,win32}.rs` → `crates/gate-state/tests/state/` and its fixtures | [design.md, Slots](design.md#slots) |
 | Change how the history key splits a command | `crates/gate-state/src/journal.rs` (`normalize_command`, `split_words`) → `crates/gate-args/src/cmdline.rs` (the quoting rules it mirrors) → `crates/gate-args/tests/args/support.rs` (`split_command_line`, the reference splitter) → `crates/gate-state/tests/state/journal.rs` → `docs/design/gate-durations.md` (keyVersion) | [design.md, Journal](design.md#journal) |
 | Change how the journal is read | `crates/gate-state/src/journal.rs` → `crates/gate-state/tests/state/journal.rs` | [design.md, Journal](design.md#journal) |
@@ -57,7 +59,11 @@ The rule that shapes it: every file and kernel object another process sees is de
   Reads no file, runs no git, ssh or process, and has no clock or environment: each fact comes through its `Facts` trait, asked only at the rule that needs it. Never depends on `gate-win32`, `windows-sys` or any other gate crate; its only dependencies are `serde_json` and `sha2`.
 - **`gate-win32`** (`crates/gate-win32/`, Windows only).
 
-  Built so far: named mutexes, events and process start times (the gate's own, and `process_start_of(pid)` for another process, `None` for a pid that is gone or exited). Also `system_directory` (the folder holding cmd.exe), `runs_below_normal` (the gate's own priority class), job objects (`Job`: create, terminate, process ids; `OpenedJob`: open by name, process ids, terminate), process stopping (`StoppableProcess`: open, created, wait, terminate; in `tree.rs`), suspended process creation (`Launch` → `Suspended` → `Running`, `EnvironmentBlock`, `same_variable_name`, `PriorityClass`), `win32_message`, and `boot_time` (when the machine booted).
+  Built so far: named mutexes, events and process start times (the gate's own, and `process_start_of(pid)` for another process, `None` for a pid that is gone or exited).
+
+  Also `system_directory` (the folder holding cmd.exe), `runs_below_normal` (the gate's own priority class), `win32_message`, `boot_time` (when the machine booted), and job objects (`Job`: create, terminate, process ids; `OpenedJob`: open by name, process ids, terminate). Process stopping is `StoppableProcess` (open, created, wait, terminate; in `tree.rs`).
+
+  Suspended process creation is `Launch` → `Suspended` → `Running`, with `EnvironmentBlock`, `same_variable_name` and `PriorityClass`. The box's piped launch is `PipedLaunch` → `PipedSuspended` (in `piped.rs`: a hidden console, breakaway from the caller's job, two pipes and a query-only job handle inherited), with `check_plain_file` and `breakaway_refused`.
 
   Owns job objects, process creation, named mutexes and events, priority, console handling and taking samples. References `proc-table` and `windows-sys`. Never holds policy: what to kill and when is `gate-watchdog`'s.
 - **`gate`** (`crates/gate/`, Windows only): the binary. Owns the subcommands, the wait loop, the run, the journal writes, the `remote.ps1` bridge and `gate box`. References every crate above. Nothing depends on it.
@@ -68,7 +74,7 @@ The rule that shapes it: every file and kernel object another process sees is de
 
   Also `run.rs` (the run lifecycle: program, batch refusal, queue, take, launch, wait, verdict, release), `log.rs` (the log, its tail and the failure markers) and `environment.rs` (the command's environment and slot marker).
 
-`boxside/` is `gate box`: `mod.rs` (the verbs and their exits), `payload.rs` (the base64 JSON payload), `preflight.rs` (the bare repo, the work folder and the report lines) and `boot.rs` (the boot-time line).
+`boxside/` is `gate box`: `mod.rs` (the verbs and their exits), `payload.rs` (the base64 JSON payload), `preflight.rs` (the bare repo, the work folder and the report lines), `boot.rs` (the boot-time line), `run.rs` (the lock, the git flags, the sync, the command and the back commit), `forward.rs` (the pipes forwarded to stdout and stderr) and `stop.rs` (terminating the job).
 
 ## Integration Footguns
 

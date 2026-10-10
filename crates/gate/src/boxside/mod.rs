@@ -3,8 +3,11 @@
 //! under one.
 
 mod boot;
+mod forward;
 mod payload;
 mod preflight;
+mod run;
+mod stop;
 
 use gate_args::{BoxRequest, BoxVerb};
 
@@ -14,8 +17,7 @@ use crate::console::Console;
 
 /// Decodes the payload, then answers the verb through `console` and returns the exit status. The payload is decoded
 /// before the verb is read, in the wrapper's order, so a payload that is not base64 JSON fails every verb; here it is
-/// a usage error (exit 2), where the wrapper, stopping on the error, exits 1. `run`, `stop` and `outputs` are not built
-/// yet.
+/// a usage error (exit 2), where the wrapper, stopping on the error, exits 1. `outputs` is not built yet.
 pub(crate) fn answer(request: &BoxRequest, console: &mut Console) -> u32 {
     let payload = match Payload::decode(&request.payload) {
         Ok(payload) => payload,
@@ -30,7 +32,9 @@ pub(crate) fn answer(request: &BoxRequest, console: &mut Console) -> u32 {
             boot::say(console);
             0
         }
-        BoxVerb::Run | BoxVerb::Stop | BoxVerb::Outputs => {
+        BoxVerb::Run => run::run(&payload, console),
+        BoxVerb::Stop => stop::stop(&payload, console),
+        BoxVerb::Outputs => {
             console.err(&format!("gate: box {} is not built yet", request.verb.as_str()));
             u32::from(NOT_BUILT_STATUS)
         }

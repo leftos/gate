@@ -16,7 +16,7 @@ use crate::run::{ERROR_FILE_NOT_FOUND, find_program};
 const FAILED_STATUS: u32 = 1;
 
 /// The git variables that would point git at another repository, index, object store or config than the work folder's.
-const GIT_REDIRECTS: [&str; 8] = [
+pub(crate) const GIT_REDIRECTS: [&str; 8] = [
     "GIT_DIR",
     "GIT_WORK_TREE",
     "GIT_INDEX_FILE",
@@ -28,9 +28,9 @@ const GIT_REDIRECTS: [&str; 8] = [
 ];
 
 /// A preflight step that failed: the line saying so, and the status the gate exits with.
-struct Failed {
-    line: String,
-    status: u32,
+pub(crate) struct Failed {
+    pub(crate) line: String,
+    pub(crate) status: u32,
 }
 
 impl Failed {
@@ -50,9 +50,9 @@ fn git_failed(step: &str, code: i32) -> Failed {
 
 /// Readies the folders the payload's `Bare` and `Work` name, then says the three trailing lines; returns the status.
 pub(crate) fn preflight(payload: &Payload, console: &mut Console) -> u32 {
-    let (bare, work) = match (payload.path("Bare"), payload.path("Work")) {
-        (Ok(bare), Ok(work)) => (bare, work),
-        (Err(line), _) | (_, Err(line)) => {
+    let (bare, work) = match payload.path("Bare").and_then(|bare| Ok((bare, payload.work_folder()?.1))) {
+        Ok(folders) => folders,
+        Err(line) => {
             console.err(&line);
             return u32::from(USAGE_STATUS);
         }
@@ -109,19 +109,19 @@ fn write_alternates(bare: &str, work: &str) -> Result<(), Failed> {
 }
 
 /// git, found once along the gate's own `PATH` and `PATHEXT`.
-struct Git {
-    program: Result<PathBuf, String>,
+pub(crate) struct Git {
+    pub(crate) program: Result<PathBuf, String>,
 }
 
 impl Git {
-    fn find() -> Git {
+    pub(crate) fn find() -> Git {
         let program = locate("git").and_then(|found| found.ok_or_else(|| gate_win32::win32_message(ERROR_FILE_NOT_FOUND)));
         Git { program }
     }
 
     /// Runs git with `args`, its output passed through; a non-zero status, or a git that cannot be started, fails
     /// `step`, named as the wrapper names it.
-    fn step(&self, step: &str, args: &[&str]) -> Result<(), Failed> {
+    pub(crate) fn step(&self, step: &str, args: &[&str]) -> Result<(), Failed> {
         match self.code(args, Stdio::inherit()) {
             Ok(0) => Ok(()),
             Ok(code) => Err(git_failed(step, code)),
@@ -149,7 +149,7 @@ impl Git {
 }
 
 /// The exit code of a process that ran to its end; on Windows every such process has one.
-fn exit_code(status: ExitStatus) -> i32 {
+pub(crate) fn exit_code(status: ExitStatus) -> i32 {
     status.code().unwrap_or(FAILED_STATUS.cast_signed())
 }
 

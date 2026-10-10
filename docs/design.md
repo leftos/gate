@@ -77,9 +77,13 @@ The words after `--` reach the command exactly as the caller passed them ([Comma
 
 `gate stop-tree <pid>` takes one process snapshot (pids, parents and start times, no command lines) and builds the tree: the pid plus its descendants, a child counting only when its creation time is readable and at or after its parent's, so a recycled pid adopts no one (a child whose creation time is unreadable is left out with its subtree).
 
-It terminates the job of every gate in the tree first, then the tree's processes deepest first, skipping itself and any process whose creation time changed since the snapshot (the pid was reused) (kept, X6). The members of a terminated gate job share a 2 s grace to exit on their own, and only the processes stop-tree had to terminate itself are counted. A job or process it stops ends with status 124. Gate jobs are found under the resolved [state root](#state-root), named as the job of each gate pid in the tree, so `--state-dir` and `GATE_STATE_DIR` are honoured.
+It terminates the job of every gate in the tree first, then the tree's processes deepest first, skipping itself and any process whose creation time changed since the snapshot (the pid was reused) (kept, X6). The members of a terminated gate job share a 2 s grace to exit on their own, and only the processes stop-tree had to terminate itself are counted.
 
-A failed terminate is a failure only if the process is still alive 1 s later. It prints `gate: stopped <n> gate job(s) and <m> process(es) under <pid>` on stdout and each failure as `gate: could not stop: <reason>` on stderr, and exits 0 when nothing failed and 1 when anything did. A reason reads `<Op>(<arg>) failed with Win32 error <n>: <message>`, where `<Op>` is `OpenJobObjectW`, `TerminateJobObject`, `OpenProcess` or `TerminateProcess`, or `listing the processes of <job name> failed: QueryInformationJobObject failed with Win32 error <n>: <message>`.
+A job or process it stops ends with status 124. Gate jobs are found under the resolved [state root](#state-root), named as the job of each gate pid in the tree, so `--state-dir` and `GATE_STATE_DIR` are honoured.
+
+A failed terminate is a failure only if the process is still alive 1 s later. It prints `gate: stopped <n> gate job(s) and <m> process(es) under <pid>` on stdout and each failure as `gate: could not stop: <reason>` on stderr, and exits 0 when nothing failed and 1 when anything did.
+
+A reason reads `<Op>(<arg>) failed with Win32 error <n>: <message>`, where `<Op>` is `OpenJobObjectW`, `TerminateJobObject`, `OpenProcess` or `TerminateProcess`, or `listing the processes of <job name> failed: QueryInformationJobObject failed with Win32 error <n>: <message>`.
 
 A pid with no live process prints `gate: stop-tree: no live process has the id <pid>` and the usage, and exits 2, as does a missing or invalid pid.
 
@@ -120,11 +124,11 @@ Further modes arrive as subcommands of the same binary, each designed with its i
 | 0 | The command exited 0 and its log holds no failure marker. |
 | `N` | The command's own non-zero status, passed through whole: the gate exits with the command's 32-bit exit code (300 stays 300; 0xFFFFFFFF reads as -1 where a caller reads it signed), and the FAILED line and the journal show it signed (a routed run whose connection was lost reports 255, RC7). |
 | 1 | The command exited 0 but its log holds a failure marker (never with `--no-markers`, V2); or the gate itself failed after the command started (X4); or it failed before queueing (the working directory, the command's environment, the log's folder or an earlier log that cannot be removed); or a routed run passed but its changes or outputs could not be brought back (RC9, D1). |
-| 2 | Usage: a missing, unknown or invalid input; a `.cmd` or `.bat` word the gate refuses (C5); a `--log` inside the state root; a critical gate under a heavy or light slot marker (K7). Nothing is queued. |
+| 2 | Usage: a missing, unknown or invalid input; a `.cmd` or `.bat` word the gate refuses (C5); a `--log` inside the state root; a critical gate under a heavy or light slot marker (K7). Nothing is queued. `gate box` also uses 2 for a refused payload and for a refused subfolder or batch word ([The box side](#the-box-side)). |
 | 124 | The watchdog killed the command: STALLED, TIMED OUT or BACKSTOP (X2). |
-| 127 | The command could not be started (C7); the slot is released at once. |
-| 70 | Temporary: a valid `gate box run`, `stop` or `outputs`, which are not built yet (`gate: box <verb> is not built yet`). Their slices remove this code. |
-| 75 | A builder refused a routed run (`gate box`, or the bridged remote client): busy, unreachable, parity, rebooted, tools, version. The PC side reads the refusal and falls back to a local run, so a caller sees 75 only as a command's own status, or as a refusal that carried no reason (T5). |
+| 127 | The command could not be started (C7); the slot is released at once. `gate box run` uses it for the same failure. |
+| 70 | Temporary: a valid `gate box outputs`, which is not built yet (`gate: box outputs is not built yet`). Its slice removes this code. |
+| 75 | A builder refused a routed run (`gate box`, or the bridged remote client): busy (`gate box run` finding its work folder's lock held), unreachable, parity, rebooted, tools, version. The PC side reads the refusal and falls back to a local run, so a caller sees 75 only as a command's own status, or as a refusal that carried no reason (T5). |
 
 The codes are kept (V4), with 75 added for refusals. 124 is the status coreutils `timeout` uses, so no caller mistakes a kill for the command's own status; a command that itself exits 124 is told apart in the journal's `verdict`.
 
@@ -178,7 +182,9 @@ A missing file or key means the default; an unreadable or invalid value is ignor
 ### Taking a slot
 
 1. A gate that needs a slot creates its wake event, then writes its arrival [ticket](#ticket), both before its first try, so no wake is lost. A gate a parent's slot covers or lends to takes no slot and writes no ticket (N1, N2).
-2. Waiters of one kind take slots in ticket `arrived` order, ties broken by pid. A gate tries a slot only when fewer live tickets of its kind are ahead of it than the pool has free slots (indices whose mutex no handle holds, a probe that fails counting as not free), not counting a ticket whose gate already holds a live claim (it holds a slot and only failed to delete its ticket), so a try never takes the slot an earlier waiter would get. It then tries indices 0 up to the count in order and takes the first free one. The critical barrier (Q3) and the reserved light slots (K2, K3) apply on top of the order.
+2. Waiters of one kind take slots in ticket `arrived` order, ties broken by pid. A gate tries a slot only when fewer live tickets of its kind are ahead of it than the pool has free slots (indices whose mutex no handle holds, a probe that fails counting as not free), not counting a ticket whose gate already holds a live claim (it holds a slot and only failed to delete its ticket), so a try never takes the slot an earlier waiter would get.
+
+   It then tries indices 0 up to the count in order and takes the first free one. The critical barrier (Q3) and the reserved light slots (K2, K3) apply on top of the order.
 3. A take deletes the gate's own ticket, journals `take`, writes the claim and wakes the waiters, so the next in line tries at once. A release deletes the claim, journals `release`, lets the mutex go and wakes the waiters. A run in the critical slot takes no slot of these pools and journals a `take` and `release` of `slots: []`.
 4. A waiter sleeps on its own wake event, `Local\gate-wake-<pid>-<start>` (auto-reset). A gate that takes or releases a slot, or deletes a dead gate's ticket, signals the wake event of every live ticket in its state root. An auto-reset event stays signalled until its waiter wakes, so no wakeup is lost between a waiter's check and its wait. A wake that cannot be opened or set is not said: the fallback poll covers it.
 5. Each wait has a fallback poll as its timeout (2 s, kept from S4's interval). The poll re-reads the counts and the tickets, which deletes a dead waiter's ticket so it cannot hold the queue (Q1), and picks up a count changed by hand.
@@ -250,7 +256,10 @@ For any other root, every kernel object name carries `<h>`, the first 8 lower-ca
 | journal mutex | `Local\gate-journal` | `Local\gate-<h>-journal` |
 | waiter's wake event | `Local\gate-wake-<pid>-<start>` | `Local\gate-<h>-wake-<pid>-<start>` |
 | command's job | `Local\gate-job-<gate pid>` | `Local\gate-<h>-job-<gate pid>` |
+| box command's job | `Local\gate-remote-<key>-<nonce>` | the same; the name is not root-dependent |
 | log's mutex | `Local\gate-log-<l>` | `Local\gate-<h>-log-<l>` |
+
+The box command's job name comes from the payload's `Job` (`<key>` is the payload's `Key`, `<nonce>` is 12 hex digits); `gate box` only checks its form and that it ends in the payload's key, and never derives it.
 
 `<l>` is the log hash: 16 lower-case hex digits, the first 8 bytes of the SHA-256 of the lower-cased, normalised absolute log path. Each run takes its log's mutex without waiting, before it readies the log, and holds it until after the slot release and the final append to the log, so two gates never write one log; a second gate fails at once ([Output lines](#output-lines)).
 
@@ -355,7 +364,11 @@ The verdict comes from the run's end: a kill line matching `^gate: (STALLED|TIME
 
 The history that ops-tower serves (`HistoryRun`, `GET /api/gate/history`) carries `verdict`, `wallSeconds` and `adjustedSeconds`, null when a line has none, and `abandoned`: every name any line of the run lists (`parent` and `covered` lines included), in line order without repeats, always present and empty when there are none.
 
-The history key is `gate_state::normalize_command` of a run's `command`, so the runs of one command in different worktrees count together. It splits the command as the Microsoft C runtime reads arguments (space and tab outside quotes separate words, `"` opens or closes a span, `""` inside a span is one literal quote, a backslash run before `"` is halved with the quote literal when the run is odd), the first word included. Each word's rules then run on its unquoted value: `--manifest-path`, `--directory`, `--dir` or `-C` with an absolute path after it is dropped with the path, a word starting `.tmp/` or `.tmp\` becomes `…`, and an absolute path with a `.wt` component and one more after it becomes what follows that component, with `/` separators, or `.` when nothing does. Each word is written back as `quote_arg_str` in `gate-args` writes it and the words are joined by single spaces, so a quoted spelling of a tree flag, scratch path or worktree path keys the same as the plain one.
+The history key is `gate_state::normalize_command` of a run's `command`, so the runs of one command in different worktrees count together. It splits the command as the Microsoft C runtime reads arguments (space and tab outside quotes separate words, `"` opens or closes a span, `""` inside a span is one literal quote, a backslash run before `"` is halved with the quote literal when the run is odd), the first word included.
+
+Each word's rules then run on its unquoted value: `--manifest-path`, `--directory`, `--dir` or `-C` with an absolute path after it is dropped with the path, a word starting `.tmp/` or `.tmp\` becomes `…`, and an absolute path with a `.wt` component and one more after it becomes what follows that component, with `/` separators, or `.` when nothing does.
+
+Each word is written back as `quote_arg_str` in `gate-args` writes it and the words are joined by single spaces, so a quoted spelling of a tree flag, scratch path or worktree path keys the same as the plain one.
 
 The journal writer says these prose lines, each prefixed `gate: `:
 
@@ -410,8 +423,12 @@ Changes from the PowerShell forms:
 All kept, with each knob's default unchanged:
 
 - The sampler (W1): every 5 s while the command runs, it reads the system times, one process snapshot, the job's accounting and process list, and the log and `.err` sizes; nothing goes through WMI.
-- Stall (W2): no output, no CPU (at least 1% of one core over the window), no new process in the job, no build-server progress, no WSL VM CPU and no nested gate paused behind a critical request, for `--stall` seconds: `gate: STALLED: ...`. Progress as the watchdog crate counts it resets the stall clock when the sum of the log and `.err` sizes changed (grew or shrank), the job's CPU since the last progress reached 1% of one core over the stall window, a pid appeared that the last sample did not have, or a nested gate is paused. Build-server progress and WSL VM CPU are not yet counted.
-- The load-adjusted clock and the ceiling (W3): each sample adds `interval * free` to the clock `--timeout` runs on; a sample taken while a nested gate is paused adds to the paused time instead; `gate: TIMED OUT after ...`. The free share is 1 for a High-priority command; otherwise `busy` is the share of the interval's system time that was not idle, the cores others held are `max(0, busy * cores - own cores)` with `own cores` the job's CPU gained over the interval, and `free = clamp((cores - others) / demand, 0.05, 1)`. `demand` is every core, or `min(cores, 2)` for a light gate.
+- Stall (W2): no output, no CPU (at least 1% of one core over the window), no new process in the job, no build-server progress, no WSL VM CPU and no nested gate paused behind a critical request, for `--stall` seconds: `gate: STALLED: ...`.
+
+  Progress as the watchdog crate counts it resets the stall clock when the sum of the log and `.err` sizes changed (grew or shrank), the job's CPU since the last progress reached 1% of one core over the stall window, a pid appeared that the last sample did not have, or a nested gate is paused. Build-server progress and WSL VM CPU are not yet counted.
+- The load-adjusted clock and the ceiling (W3): each sample adds `interval * free` to the clock `--timeout` runs on; a sample taken while a nested gate is paused adds to the paused time instead; `gate: TIMED OUT after ...`.
+
+  The free share is 1 for a High-priority command; otherwise `busy` is the share of the interval's system time that was not idle, the cores others held are `max(0, busy * cores - own cores)` with `own cores` the job's CPU gained over the interval, and `free = clamp((cores - others) / demand, 0.05, 1)`. `demand` is every core, or `min(cores, 2)` for a light gate.
 - The backstop (W4): wall time less paused time reaching 5 times the ceiling, whatever the load: `gate: BACKSTOP: ...`. One sample's precedence is STALLED, TIMED OUT, BACKSTOP.
 - Sampler failure (W5): `gate: sampler failed: <message>; watching by wall time only`, then the backstop alone watches.
 - WSL (W6): a `wsl` command's VM CPU counts as progress.
@@ -432,7 +449,9 @@ The box heartbeat (BW9) is the box wrapper's command-time heartbeat, not the wai
 ## Command launching
 
 - **The argv arrives byte-exact.** `gate.exe` reads its own command line (`GetCommandLineW`), splits it by the Microsoft C runtime's rules, and takes every word after the first `--` as the command, unchanged (C3). The PowerShell binder workarounds (C3's rejoined colon words and flattened arrays) do not exist.
-- **C-runtime quoting.** The words are written into one CreateProcess command line so the C runtime reads each back as one argv entry: an empty word or one holding whitespace or a quote is wrapped, `"` becomes `\"`, and a backslash run before a quote or at the end is doubled (kept, C4). Splitting the written line gives back the words, for every list of argument words; a property test holds that. A program word must not hold a quote or end in a backslash, because the C runtime reads argv[0] without backslash escapes (the PowerShell gate has the same limit).
+- **C-runtime quoting.** The words are written into one CreateProcess command line so the C runtime reads each back as one argv entry: an empty word or one holding whitespace or a quote is wrapped, `"` becomes `\"`, and a backslash run before a quote or at the end is doubled (kept, C4).
+
+  Splitting the written line gives back the words, for every list of argument words; a property test holds that. A program word must not hold a quote or end in a backslash, because the C runtime reads argv[0] without backslash escapes (the PowerShell gate has the same limit).
 - **`.cmd` and `.bat` targets** run as `"<system folder>\cmd.exe" /d /v:off /s /c "<line>"`, the path written C4-quoted and each word quoted for cmd.exe (C5). The system folder is `GetSystemDirectoryW`'s; `%ComSpec%` and `%SystemRoot%` are not read, a deliberate difference from the PowerShell gate. A target is a program whose extension is `.cmd` or `.bat` in any case, after the trailing dots and spaces of its file name are dropped.
 
   A word holding `"` is written `""` for a batch file, which programs on the old msvcrt.dll read differently from the C runtime's `\"`. This is a known limit shared with the PowerShell gate.
@@ -460,7 +479,7 @@ The box heartbeat (BW9) is the box wrapper's command-time heartbeat, not the wai
   A start failure prints `gate: could not start <word> (<resolved>): <message>` and exits 127, releasing the slot (C7); the lines are in [Output lines](#output-lines).
 - **Process creation.** The `gate-win32` layer is the contract the run uses (`Launch` → `Suspended` → `Running`). The command is created suspended with an explicit environment block, assigned to the gate's job `Local\gate-job-<gate pid>`, then resumed (kept, X1, P1). Creation flags are `CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT` plus the priority class, with no new console and no new process group.
 
-  The job has no limits: no breakaway, no kill-on-close. A job name already held is refused. If assigning to the job or resuming fails, the command is terminated with exit code 1 first, and a suspended command dropped without being resumed is terminated with exit code 1.
+  The job has no limits: no breakaway, no kill-on-close. (This is `gate run`; the box's command is created with `CREATE_BREAKAWAY_FROM_JOB`, [The box side](#the-box-side).) A job name already held is refused. If assigning to the job or resuming fails, the command is terminated with exit code 1 first, and a suspended command dropped without being resumed is terminated with exit code 1.
 
   The desktop-app policy `PROCESS_CREATION_DESKTOP_APP_BREAKAWAY_DISABLE_PROCESS_TREE` is set, as the PowerShell gate sets it. Per Microsoft's UpdateProcThreadAttribute remarks it matters only to Win32 apps packaged through the Desktop Bridge, whose children it keeps inside the desktop app runtime environment.
 
@@ -527,21 +546,59 @@ Builders are configured only in the local `%LOCALAPPDATA%\gate\remote.json`. The
 
 The box protocol keeps the PowerShell wrapper's wire format byte for byte, so the old `remote.ps1` can drive `gate box`. `gate box` ships dormant: builders run the PowerShell wrapper behind the bridge until the remote cutover (GATE-46).
 
-The payload is one base64 word (standard alphabet, padded) of UTF-8 JSON holding the wrapper's keys: `Key`, `Bare`, `Work`, `Lock`, `Index`, `OutputFolder` and `Job`, and for `run` also `Command`, `Subfolder`, `Identity`, `Outputs`, `Nonce` and `OutputsFull`. Unknown keys are ignored. Every path comes from the payload and nothing is written under the gate's state root. `git` and `dotnet` are found with the gate's own program resolution, which never searches the current folder. A payload that is not base64 JSON prints `gate: box payload is not base64 JSON: <reason>` on stderr and exits 2.
+The payload is one base64 word (standard alphabet, padded) of UTF-8 JSON holding the wrapper's keys: `Key`, `Bare`, `Work`, `Lock`, `Index`, `OutputFolder` and `Job`, and for `run` also `Command`, `Subfolder`, `Identity`, `Outputs`, `Nonce` and `OutputsFull`. Unknown keys are ignored.
+
+Every path comes from the payload and nothing is written under the gate's state root. `git` and `dotnet` are found with the gate's own program resolution, which never searches the current folder. A payload that is not base64 JSON prints `gate: box payload is not base64 JSON: <reason>` on stderr and exits 2.
 
 Built verbs:
 
 - **`boot`** prints `gate: remote boot <UTC time>` on stdout (ISO 8601, 7 fractional digits, `Z`; the system time less the tick count since boot) and exits 0. When the time cannot be read it prints `gate: remote could not read the boot time: <message>` on stderr and still exits 0.
-- **`preflight`** creates the bare repo at `Bare` when missing and the work folder at `Work` with `.git`, `origin` set to `Bare`, `core.autocrlf false` and `core.eol lf`, and writes `.git\objects\info\alternates` as `<Bare with />/objects` and a line feed, without a byte order mark, only when the file is missing or empty. It prints on stdout, in order: `gate: remote created <Bare>` (only when it created the bare repo), `gate: remote version <gate version>`, the boot line, and `gate: remote sdks <v1,v2|none>`; git's own output passes through. A payload without `Bare` or `Work` prints `gate: box payload lacks <key>` and exits 2.
-- A failing git step prints `gate: remote <step> failed (status <n>)` and exits with that status; a git that cannot start prints `gate: remote <step> failed: <OS message>` and exits 1. The steps are `git init --bare`, `git init`, `git remote add`, `git config core.autocrlf` and `git config core.eol`. A folder or file that cannot be made prints `gate: remote could not create the folder <path>: <error>` or `gate: remote could not write <path>: <error>` and exits 1. An SDK list that cannot be read prints `gate: remote could not read the SDK list: <message>`, omits the sdks line and still exits 0.
+- **`preflight`** creates the bare repo at `Bare` when missing and the work folder at `Work` with `.git`, `origin` set to `Bare`, `core.autocrlf false` and `core.eol lf`, and writes `.git\objects\info\alternates` as `<Bare with />/objects` and a line feed, without a byte order mark, only when the file is missing or empty.
 
-`run`, `stop` and `outputs` print `gate: box <verb> is not built yet` and exit 70. The replacement job, the pipe-closed stop (exit 255), the heartbeat and the console belong to later parts of the remote port (GATE-60, GATE-61) and are planned, not built. The rest of the protocol, the transport of snapshots and outputs, is the remote port's design (GATE-10).
+  It prints on stdout, in order: `gate: remote created <Bare>` (only when it created the bare repo), `gate: remote version <gate version>`, the boot line, and `gate: remote sdks <v1,v2|none>`; git's own output passes through. A payload without `Bare` or `Work` prints `gate: box payload lacks <key>` and exits 2.
+- A failing git step prints `gate: remote <step> failed (status <n>)` and exits with that status; a git that cannot start prints `gate: remote <step> failed: <OS message>` and exits 1. The steps are `git init --bare`, `git init`, `git remote add`, `git config core.autocrlf` and `git config core.eol`.
+
+  A folder or file that cannot be made prints `gate: remote could not create the folder <path>: <error>` or `gate: remote could not write <path>: <error>` and exits 1. An SDK list that cannot be read prints `gate: remote could not read the SDK list: <message>`, omits the sdks line and still exits 0.
+- **`run`** runs the payload's `Command` (a list of texts) in `Work`, and exits with the command's own whole 32-bit status after a successful run. Its stdout is the command's stdout, LF-terminated; its stderr is the command's stderr plus the box's own lines.
+
+  Payload refusals exit 2, each on stderr. The command's own: `gate: box payload Command is not a list of texts`, `gate: box payload lacks Command`, `gate: box payload Subfolder is not a text`, `gate: box payload Identity is not an object of texts`, `gate: box payload Identity may set only GIT_AUTHOR_* and GIT_COMMITTER_* names: <name>` and `gate: box payload Identity <name> holds a NUL`.
+
+  The work folder's: `gate: box payload Lock must be <Work>.lock`, `gate: box payload Index must be <Work>.index`, `gate: box payload Key is not a work-folder key: <key>` and `gate: box payload Job is not this work folder's job name: <job>`.
+
+  `Identity` may hold only `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL`, `GIT_AUTHOR_DATE`, `GIT_COMMITTER_NAME`, `GIT_COMMITTER_EMAIL` and `GIT_COMMITTER_DATE`.
+
+  `Key` is `[A-Za-z0-9_-]+` and is the last name of `Work`; `Job` is `Local\gate-remote-<Key>-<12 hex digits>`. `run`, `stop` and `preflight` check the key; `run` and `stop` check the job.
+
+  The lock `<Work>.lock` is opened with no sharing and without following links, must be a plain disk file, and is held for the run's life; a held lock prints `gate: remote work folder <key> is busy` and exits 75. A lock that cannot be opened prints `gate: remote could not open the work folder lock <path>: <error>` and exits 1.
+
+  `Work` must not end with a separator (`gate: box payload Work must not end with a separator: <work>`, exit 2). Every git call in `Work` passes `-c core.hooksPath=<Lock>\hooks -c core.fsmonitor=false`, a hooks path that cannot exist while the box holds the lock, so a repository's own hooks (one a build installed) never run in the box's git; fetch and push name `Bare` by its path, never `origin`.
+
+  The payload is data, refused unless well formed; the command, and whatever it writes into `Work`, is the user's own code running as the user, and is trusted.
+
+  The steps are fetch, checkout, clean and the back ref reset, then the command, then the sync-back. A failing step prints `gate: remote <fetch|checkout|clean|back ref reset> failed (status <n>)` and exits `n`.
+
+  A `Subfolder` is compared against the snapshot with per-character simple uppercase (the wrapper's OrdinalIgnoreCase): one that is not a folder inside `Work` prints `gate: remote subfolder <sub> is not a folder inside the work folder`, deletes the back ref and exits 2, and one missing from the snapshot prints `gate: remote subfolder <sub> does not exist in the snapshot` and exits 2. The shared batch refusal (a `.cmd` or `.bat` word, [Command launching](#command-launching)) exits 2.
+
+  The command runs on a hidden console of its own (`CREATE_NO_WINDOW`) and outside the box's own job, created with `CREATE_BREAKAWAY_FROM_JOB` so it leaves the ssh session's job (the box's job refusing breakaway prints `gate: the box cannot start a command outside its own job: <message>` and exits 1). It is assigned to the payload's named job, which has no limits and no kill-on-close, and inherits exactly NUL, the two pipe write ends and a query-only handle to its job.
+
+  A job name already held prints `gate: the job <name> already exists; a run's job name must be new` and exits 1. A command that cannot start prints `gate: could not start <word>[ (<resolved>)]: <message>` and exits 127; a failure of the gate after the start prints `gate: the gate failed while running the command: <problem>` and exits 1. If the box panics after the resume, the job is terminated with 124.
+
+  Output is forwarded from the pipes until both end. When a leftover process holds a pipe open after the command ended, the box stops reading after a 2 s drain and says `gate: remote command's output is still held open by a leftover process; stopped reading`. A pipe that cannot be read prints `gate: remote could not read the command's <stdout|stderr>: <error>`.
+
+  After the command, the sync-back commits the tree when it changed: a copy of the index at `<Work>.index` is staged, and the commit (message `gate-remote back`, parent HEAD) is written to `refs/gate-back/<key>` in `Bare`. A sync-back that fails prints `gate: remote sync-back failed: <message>` and turns a 0 status into 1; an index copy that cannot be removed prints `gate: remote could not remove <index>: <error>` and changes no status.
+- **`stop`** terminates the payload's job, taking no lock. It polls the job's process ids every 100 ms for up to 10 s; its processes end with 124. A stopped job prints `gate: remote stopped job <name>` on stdout and exits 0; no such job exits 0 with no output.
+
+  Processes still alive 10 s after the termination print `gate: remote job <name> still has <n> process(es) 10 s after it was terminated` and exit 1, and a job that cannot be terminated prints `gate: remote could not stop job <name>: <error>` and exits 1.
+
+`outputs` prints `gate: box outputs is not built yet` and exits 70. The pipe-closed stop (exit 255), the heartbeat and the console belong to later parts of the remote port (GATE-61) and are planned, not built. The rest of the protocol, the transport of snapshots and outputs, is the remote port's design (GATE-10).
 
 ## Install
 
 - `pwsh tools/install.ps1` builds a Release `gate.exe` with `cargo build --release -p gate` (default features, so no `test-seams`) through the repo's `tools\gate.ps1` on a heavy slot, and installs it to `%LOCALAPPDATA%\gate\bin\gate.exe`. Installed gates never run from `target/`, which build cleaners empty and a rebuild overwrites while gates hold it open. It refuses an unset or empty `LOCALAPPDATA`.
 - When the built exe has the same SHA-256 as the installed one, the copy is skipped and the script prints `install: gate <version> already installed at <path>`.
-- Otherwise the new exe is first copied to a temporary name in the folder; then a copy already there, running or not, is moved aside to `gate.exe.<stamp>.<pid>.old` (which works while gates run it), and the temporary file is renamed into place, so `gate.exe` is missing only between two renames. A failed copy leaves the installed exe untouched; a failed final rename moves the old exe back, and the failure line says whether that worked. The script prints the version it replaced and the version it installed.
+- Otherwise the new exe is first copied to a temporary name in the folder; then a copy already there, running or not, is moved aside to `gate.exe.<stamp>.<pid>.old` (which works while gates run it), and the temporary file is renamed into place, so `gate.exe` is missing only between two renames.
+
+  A failed copy leaves the installed exe untouched; a failed final rename moves the old exe back, and the failure line says whether that worked. The script prints the version it replaced and the version it installed.
 - Aside copies that no process holds any more are deleted; one a running gate still holds stays until a later install.
 - It adds `%LOCALAPPDATA%\gate\bin` to the user's PATH when missing, so callers run `gate`: the raw registry value of the user environment is read and written, keeping its kind and its unexpanded `%NAME%` entries; the change is broadcast (`WM_SETTINGCHANGE`, as `setx` does) so programs started from then on see it, and the script says to open a new terminal. It never touches the state root's files.
 - `-WhatIf` lists every step without taking it. `-Exe` (install a prebuilt exe, skipping the build) and `-EnvironmentKey` (the registry key the PATH entry lives in) exist for the suite, which runs the script against a temporary `LOCALAPPDATA` and registry key.
@@ -552,7 +609,9 @@ Built verbs:
 
 The PowerShell gate and `gate.exe` share slot mutexes and never share files. The default root's mutex names are the PowerShell gate's, so a PowerShell gate still running and a new `gate.exe` gate take turns on one set of slots and the machine is never over-subscribed; each generation writes its claims, tickets and journal in its own folder and format, and ops-tower reads only `gate.exe`'s once the drain is over. Moving a machine to `gate.exe` is a drained cutover:
 
-1. Before it runs, ops-tower's Gates tab must already write the default root's `slot-counts.json` (`%LOCALAPPDATA%\gate\v1\`), since `gate.exe` never reads the PowerShell gate's `%LOCALAPPDATA%\gate\slot-counts.json`. `gate cutover` copies the PowerShell gate's slot counts into the default root's `slot-counts.json`, so both generations count the same slots, then writes `%LOCALAPPDATA%\gate\cutover.flag`. The PowerShell launcher in each repo reads the flag, and from then on every new gate runs `gate.exe` through the compatibility layer.
+1. Before it runs, ops-tower's Gates tab must already write the default root's `slot-counts.json` (`%LOCALAPPDATA%\gate\v1\`), since `gate.exe` never reads the PowerShell gate's `%LOCALAPPDATA%\gate\slot-counts.json`.
+
+   `gate cutover` copies the PowerShell gate's slot counts into the default root's `slot-counts.json`, so both generations count the same slots, then writes `%LOCALAPPDATA%\gate\cutover.flag`. The PowerShell launcher in each repo reads the flag, and from then on every new gate runs `gate.exe` through the compatibility layer.
 2. It then waits until every PowerShell gate's claims and tickets in `%LOCALAPPDATA%\gate\` are gone or stale, naming on stderr what it still waits on, and exits 0 once none is left.
 
 During the drain a PowerShell gate neither reads `gate.exe`'s tickets nor signals its wake events: a PowerShell critical request can be overtaken by `gate.exe` gates that arrive after it (it still waits for every slot), and a `gate.exe` waiter learns of a PowerShell gate's release from its fallback poll.

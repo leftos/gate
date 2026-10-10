@@ -5,12 +5,12 @@ use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use std::{fs, process, thread};
 
-use serde_json::Value;
+use serde_json::{Value, json};
 
 /// The gate under test.
 pub const GATE: &str = env!("CARGO_BIN_EXE_gate");
@@ -48,6 +48,7 @@ static NEXT_CASE: AtomicU64 = AtomicU64::new(0);
 pub struct Case {
     folder: PathBuf,
     state: PathBuf,
+    number: u64,
 }
 
 impl Case {
@@ -59,7 +60,7 @@ impl Case {
         }
         let state = folder.join("state");
         fs::create_dir_all(&state).expect("the case folder and its state root can be made");
-        Case { folder, state }
+        Case { folder, state, number }
     }
 
     /// The case's state root, absolute as the gate reports it.
@@ -203,15 +204,12 @@ pub struct Running {
 impl Running {
     /// Returns once stderr contains `needle`; fails with the stderr so far after the hang guard.
     pub fn wait_for_stderr(&self, needle: &str) {
-        let deadline = Instant::now() + HANG_GUARD;
-        loop {
-            let stderr = text(&self.stderr);
-            if stderr.contains(needle) {
-                return;
-            }
-            assert!(Instant::now() < deadline, "{needle:?} did not appear on stderr; stderr so far:\n{stderr}");
-            thread::sleep(POLL);
-        }
+        wait_for_text(&self.stderr, "stderr", needle);
+    }
+
+    /// Returns stdout so far once it contains `needle`; fails with the stdout so far after the hang guard.
+    pub fn wait_for_stdout(&self, needle: &str) -> String {
+        wait_for_text(&self.stdout, "stdout", needle)
     }
 
     /// The program's pid.
@@ -309,6 +307,23 @@ fn gather(mut stream: impl Read + Send + 'static) -> (Buffer, JoinHandle<()>) {
     (buffer, reader)
 }
 
+/// Returns the text of `buffer`, the program's `stream`, once it contains `needle`; fails with the text so far after
+/// the hang guard.
+fn wait_for_text(buffer: &Buffer, stream: &str, needle: &str) -> String {
+    let deadline = Instant::now() + HANG_GUARD;
+    loop {
+        let text = text(buffer);
+        if text.contains(needle) {
+            return text;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{needle:?} did not appear on {stream}; {stream} so far:\n{text}"
+        );
+        thread::sleep(POLL);
+    }
+}
+
 fn text(buffer: &Buffer) -> String {
     String::from_utf8_lossy(&bytes(buffer)).into_owned()
 }
@@ -387,6 +402,63 @@ pub fn run_words<'a>(log: &'a str, extra: &[&'a str], command: &[&'a str]) -> Ve
 pub fn wait_until_closed(path: &Path) {
     wait_until(&format!("every handle on {} closing", path.display()), || {
         fs::OpenOptions::new().read(true).share_mode(0).open(path).is_ok()
+    });
+}
+
+/// The payload of a `gate box run` of `command` for the work folder `key`, as the remote client sends it: every path
+/// under the case folder's `remote` folder, and a job name unique to the case and the key, its 12-hex nonce ending in
+/// the run's number `0000`.
+pub fn box_payload(case: &Case, key: &str, command: &[&str]) -> Value {
+    let remote = case.folder().join("remote");
+    let path = |name: String| remote.join(name).to_str().expect("the case folder is Unicode").to_owned();
+    json!({
+        "Key": key,
+        "Bare": path(format!("{key}.git")),
+        "Work": path(key.to_owned()),
+        "Lock": path(format!("{key}.lock")),
+        "Index": path(format!("{key}.index")),
+        "OutputFolder": path(format!("{key}.outputs")),
+        "Job": format!(r"Local\gate-remote-{key}-{:04x}{:04x}0000", process::id() & 0xffff, case.number & 0xffff),
+        "Command": command,
+        "Subfolder": "",
+        "Identity": {
+            "GIT_AUTHOR_NAME": "gate suite",
+            "GIT_AUTHOR_EMAIL": "suite@example.invalid",
+            "GIT_COMMITTER_NAME": "gate suite",
+            "GIT_COMMITTER_EMAIL": "suite@example.invalid",
+        },
+        "Outputs": [],
+        "Nonce": "",
+        "OutputsFull": false,
+    })
+}
+
+/// Puts the suite's process in a fresh job that allows breakaway, nested in the job it already runs in, once. A box
+/// run creates its command with `CREATE_BREAKAWAY_FROM_JOB`, which fails while the immediate job refuses breakaway, and
+/// the gate's own job refuses it; from this inner job the command breaks away and stays in the gate's job, as the
+/// PowerShell wrapper's self-test arranges it. Every program the suite starts afterwards starts in this job too.
+pub fn allow_breakaway() {
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_BREAKAWAY_OK, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JobObjectExtendedLimitInformation, SetInformationJobObject,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    static ALLOWED: OnceLock<()> = OnceLock::new();
+    ALLOWED.get_or_init(|| {
+        // SAFETY: no security attributes and no name are allowed; a null handle is a failure.
+        let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        assert!(!job.is_null(), "the breakaway job is created: {}", io::Error::last_os_error());
+        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_BREAKAWAY_OK;
+        let size = u32::try_from(size_of_val(&limits)).expect("the limits fit a u32");
+        // SAFETY: the job is open and `limits` is a whole extended limit structure of `size` bytes.
+        let set = unsafe { SetInformationJobObject(job, JobObjectExtendedLimitInformation, (&raw const limits).cast(), size) };
+        assert_ne!(set, 0, "breakaway is allowed: {}", io::Error::last_os_error());
+        // SAFETY: the job is open and the pseudo-handle of this process is always open. The job's handle is never
+        // closed: the job lasts as long as this process, which it holds.
+        let assigned = unsafe { AssignProcessToJobObject(job, GetCurrentProcess()) };
+        assert_ne!(assigned, 0, "the suite enters the job: {}", io::Error::last_os_error());
     });
 }
 

@@ -161,6 +161,7 @@ dependencies = [
  "proc-table",
  "regex",
  "serde_json",
+ "windows-sys",
 ]
 
 [[package]]

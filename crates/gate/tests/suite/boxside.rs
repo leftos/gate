@@ -5,14 +5,16 @@ use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
+use gate_win32::{EnvironmentBlock, Job, Launch};
 use jiff::{SignedDuration, Timestamp};
 use regex::Regex;
 use serde_json::{Value, json};
 
-use crate::support::{Case, Outcome, finish};
+use crate::support::{Case, FAKE_TOOL, Outcome, Running, allow_breakaway, box_payload, finish, shown, start, wait_until, wait_until_closed};
 
 const BOX_USAGE: &str = "usage: gate box preflight|run|stop|boot|outputs <base64 JSON payload>\n";
 /// The git variables a caller's environment may hold that point git at another repository or config; no case's gate or
@@ -381,13 +383,601 @@ fn box_usage_and_payload_errors_exit_2() {
 }
 
 #[test]
-fn box_run_stop_and_outputs_are_not_built_yet() {
-    let case = Case::new("box_run_stop_and_outputs_are_not_built_yet");
-    for verb in ["run", "stop", "outputs"] {
-        let outcome = gate_box(&case, verb, &payload(&json!({"Key": "k"})), None);
+fn box_outputs_is_not_built_yet() {
+    let case = Case::new("box_outputs_is_not_built_yet");
 
-        assert_eq!(outcome.code, Some(70), "{verb}");
-        assert_eq!(outcome.stdout, "", "{verb}");
-        assert_eq!(outcome.stderr, format!("gate: box {verb} is not built yet\n"));
+    let outcome = gate_box(&case, "outputs", &payload(&json!({"Key": "k"})), None);
+
+    assert_eq!(outcome.code, Some(70));
+    assert_eq!(outcome.stdout, "");
+    assert_eq!(outcome.stderr, "gate: box outputs is not built yet\n");
+}
+
+/// The payload's text at `key`.
+fn field<'a>(payload: &'a Value, key: &str) -> &'a str {
+    payload[key].as_str().expect("the payload holds the key as text")
+}
+
+/// `payload` with the last four hex digits of its job's nonce set to `run`, for a later run in one case.
+fn renamed(payload: &Value, run: u16) -> Value {
+    let mut renamed = payload.clone();
+    let job = field(payload, "Job");
+    renamed["Job"] = json!(format!("{}{run:04x}", &job[..job.len() - 4]));
+    renamed
+}
+
+/// The names in the work folder of `payload`.
+fn work_entries(payload: &Value) -> Vec<String> {
+    fs::read_dir(field(payload, "Work"))
+        .expect("the work folder can be listed")
+        .map(|entry| entry.expect("an entry can be read").file_name().to_string_lossy().into_owned())
+        .collect()
+}
+
+/// Readies the payload's work folder with a preflight, then commits `files` in the case's source repository and pushes
+/// the commit to `refs/gate/<key>` in the bare repository, as the client sends a snapshot; the commit.
+fn snapshot(case: &Case, payload: &Value, files: &[(&str, &str)]) -> String {
+    allow_breakaway();
+    passed(&gate_box(case, "preflight", &self::payload(payload), None));
+    let source = case.folder().join("source");
+    let source_text = source.to_str().expect("the case folder is Unicode").to_owned();
+    if !source.exists() {
+        git(&["init", "-q", &source_text]);
+        git(&["-C", &source_text, "config", "core.autocrlf", "false"]);
     }
+    for (name, content) in files {
+        let file = source.join(name);
+        fs::create_dir_all(file.parent().expect("a file has a folder")).expect("the file's folder can be made");
+        fs::write(file, content).expect("a snapshot file can be written");
+    }
+    git(&["-C", &source_text, "add", "-A"]);
+    git(&[
+        "-C",
+        &source_text,
+        "-c",
+        "user.name=gate suite",
+        "-c",
+        "user.email=suite@example.invalid",
+        "commit",
+        "-q",
+        "--allow-empty",
+        "-m",
+        "snapshot",
+    ]);
+    let target = format!("HEAD:refs/gate/{}", field(payload, "Key"));
+    git(&["-C", &source_text, "push", "-q", "--force", field(payload, "Bare"), &target]);
+    git(&["-C", &source_text, "rev-parse", "HEAD"])
+}
+
+/// Whether the bare repository of `payload` has the ref `name`.
+fn has_ref(payload: &Value, name: &str) -> bool {
+    let mut command = Command::new("git");
+    for variable in GIT_REDIRECTS {
+        command.env_remove(variable);
+    }
+    let bare = format!("--git-dir={}", field(payload, "Bare"));
+    let output = command
+        .args([bare.as_str(), "rev-parse", "--verify", "-q", name])
+        .output()
+        .expect("git starts; the box cases need git on PATH");
+    output.status.success()
+}
+
+/// `gate box run` of `payload`, to its end.
+fn run_box(case: &Case, payload: &Value) -> Outcome {
+    gate_box(case, "run", &self::payload(payload), None)
+}
+
+/// `gate box run` of `payload`, started.
+fn start_box(case: &Case, payload: &Value) -> Running {
+    start(box_command(case, &["box", "run", &self::payload(payload)]))
+}
+
+fn let_go(go: &Path) {
+    fs::write(go, "").expect("the go file can be made");
+}
+
+/// The pid in the `spawned <pid>` line of `stdout`.
+fn spawned_pid(stdout: &str) -> u32 {
+    let line = stdout.lines().find_map(|line| line.strip_prefix("spawned ")).expect("a spawned line");
+    line.parse().expect("the spawned line holds a pid")
+}
+
+/// Waits until the process `pid` has ended.
+fn wait_until_gone(pid: u32) {
+    wait_until(&format!("process {pid} ending"), || {
+        gate_win32::process_start_of(pid).expect("the process can be looked for").is_none()
+    });
+}
+
+#[test]
+fn box_run_a_second_run_on_a_held_lock_is_busy() {
+    let case = Case::new("box_run_busy");
+    let go = case.folder().join("go");
+    let go_word = shown(&go);
+    let held = box_payload(&case, "k", &[FAKE_TOOL, "err", "started", "wait", &go_word]);
+    snapshot(&case, &held, &[("a.txt", "a\n")]);
+    let first = start_box(&case, &held);
+    first.wait_for_stderr("started");
+
+    let second = run_box(&case, &renamed(&held, 1));
+
+    assert_eq!(second.code, Some(75), "{second:?}");
+    assert_eq!(second.stdout, "");
+    assert_eq!(second.stderr, "gate: remote work folder k is busy\n");
+    let_go(&go);
+    let outcome = first.finish();
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    wait_until_closed(Path::new(field(&held, "Lock")));
+}
+
+#[test]
+fn box_run_refuses_a_subfolder_outside_the_work_folder_and_deletes_the_back_ref() {
+    let case = Case::new("box_run_subfolder_outside");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "out", "ran"]);
+    let commit = snapshot(&case, &payload, &[("a.txt", "a\n")]);
+    let kelvin = "..\\\u{212A}\\x";
+    let subs = [
+        r"C:\elsewhere",
+        "C:x",
+        r"\rooted",
+        r"\\server\share",
+        r"\\?\C:\x",
+        "/x",
+        r"..\k-sibling",
+        "sub/../../x",
+        kelvin,
+    ];
+    for sub in subs {
+        git(&[
+            &format!("--git-dir={}", field(&payload, "Bare")),
+            "update-ref",
+            "refs/gate-back/k",
+            &commit,
+        ]);
+        payload["Subfolder"] = json!(sub);
+
+        let outcome = run_box(&case, &payload);
+
+        assert_eq!(outcome.code, Some(2), "{sub}: {outcome:?}");
+        assert_eq!(outcome.stdout, "", "{sub}");
+        assert_eq!(
+            outcome.stderr,
+            format!("gate: remote subfolder {sub} is not a folder inside the work folder\n")
+        );
+        assert!(!has_ref(&payload, "refs/gate-back/k"), "{sub}: the back ref is deleted");
+        assert_eq!(work_entries(&payload), [".git"], "{sub}: nothing is checked out");
+    }
+}
+
+#[test]
+fn box_run_runs_the_command_in_its_subfolder() {
+    let case = Case::new("box_run_subfolder");
+    let mut payload = box_payload(&case, "k", &[r".\x.cmd"]);
+    payload["Subfolder"] = json!("sub");
+    snapshot(&case, &payload, &[("sub/x.cmd", "@cd\r\n@echo y>made.txt\r\n")]);
+
+    let outcome = run_box(&case, &payload);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let folder = Path::new(field(&payload, "Work")).join("sub");
+    assert!(
+        outcome.stdout.trim_end().eq_ignore_ascii_case(&folder.to_string_lossy()),
+        "the command runs in Work\\sub: {outcome:?}"
+    );
+    let bare = format!("--git-dir={}", field(&payload, "Bare"));
+    assert_eq!(git(&[&bare, "show", "refs/gate-back/k:sub/made.txt"]), "y");
+}
+
+#[test]
+fn box_run_refuses_an_identity_name_outside_the_git_identity() {
+    let case = Case::new("box_run_identity_refused");
+    let mut payload = box_payload(&case, "k", &[r".\write.cmd"]);
+    snapshot(&case, &payload, &[("write.cmd", "@echo x>new.txt\r\n")]);
+    payload["Identity"] = json!({
+        "GIT_AUTHOR_NAME": "a",
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": "core.fsmonitor",
+        "GIT_CONFIG_VALUE_0": "C:/x/evil.exe",
+    });
+
+    let outcome = run_box(&case, &payload);
+
+    assert_eq!(outcome.code, Some(2), "{outcome:?}");
+    assert_eq!(outcome.stdout, "");
+    assert_eq!(
+        outcome.stderr,
+        "gate: box payload Identity may set only GIT_AUTHOR_* and GIT_COMMITTER_* names: GIT_CONFIG_COUNT\n"
+    );
+    assert_eq!(work_entries(&payload), [".git"], "nothing is checked out or run");
+}
+
+#[test]
+fn box_run_git_runs_no_hook_the_command_wrote() {
+    let case = Case::new("box_run_hooks");
+    let marker = case.folder().join("marker");
+    let hook = format!("#!/bin/sh\necho ran > '{}'\n", shown(&marker).replace('\\', "/"));
+    let payload = box_payload(&case, "k", &[r".\hooks.cmd"]);
+    let script = "@copy /y hooks-src\\pre-push .git\\hooks\\pre-push >nul\r\n\
+                  @copy /y hooks-src\\post-checkout .git\\hooks\\post-checkout >nul\r\n\
+                  @echo x>new.txt\r\n";
+    snapshot(
+        &case,
+        &payload,
+        &[("hooks.cmd", script), ("hooks-src/pre-push", &hook), ("hooks-src/post-checkout", &hook)],
+    );
+
+    let first = run_box(&case, &payload);
+    assert_eq!(first.code, Some(0), "{first:?}");
+    assert!(has_ref(&payload, "refs/gate-back/k"), "the first run pushed its back commit");
+    let second = run_box(&case, &renamed(&payload, 1));
+
+    assert_eq!(second.code, Some(0), "{second:?}");
+    let hooks = Path::new(field(&payload, "Work")).join(".git").join("hooks");
+    assert!(
+        hooks.join("pre-push").exists() && hooks.join("post-checkout").exists(),
+        "the command wrote its hooks"
+    );
+    assert!(!marker.exists(), "no hook ran");
+}
+
+#[test]
+fn box_run_git_runs_no_hook_written_beside_the_work_folder() {
+    let case = Case::new("box_run_hooks_beside");
+    let marker = case.folder().join("marker");
+    let hook = format!("#!/bin/sh\necho ran > '{}'\n", shown(&marker).replace('\\', "/"));
+    let payload = box_payload(&case, "k", &[r".\hooks.cmd"]);
+    let script = "@mkdir ..\\k.hooks 2>nul\r\n\
+                  @copy /y hooks-src\\pre-push ..\\k.hooks\\pre-push >nul\r\n\
+                  @echo x>new.txt\r\n";
+    snapshot(&case, &payload, &[("hooks.cmd", script), ("hooks-src/pre-push", &hook)]);
+
+    let first = run_box(&case, &payload);
+    assert_eq!(first.code, Some(0), "{first:?}");
+    let second = run_box(&case, &renamed(&payload, 1));
+
+    assert_eq!(second.code, Some(0), "{second:?}");
+    assert!(
+        Path::new(&format!("{}.hooks", field(&payload, "Work"))).join("pre-push").exists(),
+        "the command wrote its hook"
+    );
+    assert!(has_ref(&payload, "refs/gate-back/k"), "the run pushed its back commit");
+    assert!(!marker.exists(), "no hook ran");
+}
+
+#[test]
+fn box_run_refuses_a_work_folder_ending_in_a_separator() {
+    let case = Case::new("box_run_work_separator");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "out", "ran"]);
+    snapshot(&case, &payload, &[("a.txt", "a\n")]);
+    let work = format!("{}\\", field(&payload, "Work"));
+    payload["Work"] = json!(work);
+
+    let outcome = run_box(&case, &payload);
+
+    assert_eq!(outcome.code, Some(2), "{outcome:?}");
+    assert_eq!(outcome.stdout, "");
+    assert_eq!(outcome.stderr, format!("gate: box payload Work must not end with a separator: {work}\n"));
+}
+
+#[test]
+fn box_run_refuses_an_index_or_lock_other_than_the_work_folders() {
+    let case = Case::new("box_run_index_lock_refused");
+    let payload = box_payload(&case, "k", &[FAKE_TOOL, "out", "ran"]);
+    snapshot(&case, &payload, &[("a.txt", "a\n")]);
+    let precious = case.folder().join("precious.txt");
+    fs::write(&precious, "keep").expect("the precious file can be written");
+    let mut index = payload.clone();
+    index["Index"] = json!(shown(&precious));
+
+    let outcome = run_box(&case, &index);
+
+    assert_eq!(outcome.code, Some(2), "{outcome:?}");
+    assert_eq!(outcome.stdout, "");
+    assert_eq!(
+        outcome.stderr,
+        format!("gate: box payload Index must be {}.index\n", field(&payload, "Work"))
+    );
+    assert_eq!(fs::read_to_string(&precious).expect("the precious file is read"), "keep");
+
+    let mut lock = payload.clone();
+    lock["Lock"] = json!(shown(&case.folder().join("NUL")));
+
+    let outcome = run_box(&case, &lock);
+
+    assert_eq!(outcome.code, Some(2), "{outcome:?}");
+    assert_eq!(outcome.stdout, "");
+    assert_eq!(
+        outcome.stderr,
+        format!("gate: box payload Lock must be {}.lock\n", field(&payload, "Work"))
+    );
+}
+
+#[test]
+fn box_run_a_failed_sync_back_turns_a_pass_into_status_1() {
+    let case = Case::new("box_run_sync_back_failed");
+    let payload = box_payload(&case, "k", &[FAKE_TOOL, "exit", "0"]);
+    snapshot(&case, &payload, &[("a.txt", "a\n")]);
+    fs::create_dir_all(field(&payload, "Index")).expect("a folder can block the index copy");
+
+    let outcome = run_box(&case, &payload);
+
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert!(
+        outcome.stderr.lines().any(|line| line.starts_with("gate: remote sync-back failed: ")),
+        "{outcome:?}"
+    );
+}
+
+#[test]
+fn box_run_a_failed_fetch_exits_with_gits_status() {
+    let case = Case::new("box_run_fetch_failed");
+    let payload = box_payload(&case, "k", &[FAKE_TOOL, "out", "ran"]);
+    passed(&gate_box(&case, "preflight", &self::payload(&payload), None));
+
+    let outcome = run_box(&case, &payload);
+
+    assert_eq!(outcome.code, Some(128), "{outcome:?}");
+    assert_eq!(outcome.stdout, "");
+    assert!(
+        outcome.stderr.lines().any(|line| line == "gate: remote fetch failed (status 128)"),
+        "{outcome:?}"
+    );
+}
+
+#[test]
+fn box_run_refuses_a_job_name_already_held() {
+    let case = Case::new("box_run_job_held");
+    let payload = box_payload(&case, "k", &[r".\write.cmd"]);
+    snapshot(&case, &payload, &[("write.cmd", "@echo x>new.txt\r\n")]);
+    let _held = Job::create(field(&payload, "Job")).expect("the job is created");
+
+    let outcome = run_box(&case, &payload);
+
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert_eq!(outcome.stdout, "");
+    assert_eq!(
+        outcome.stderr,
+        format!("gate: the job {} already exists; a run's job name must be new\n", field(&payload, "Job"))
+    );
+    assert!(!Path::new(field(&payload, "Work")).join("new.txt").exists(), "the command did not run");
+    assert!(!has_ref(&payload, "refs/gate-back/k"), "no back commit");
+}
+
+#[test]
+fn box_stop_refuses_a_job_name_not_of_its_work_folder() {
+    let case = Case::new("box_stop_foreign_job");
+    let go = case.folder().join("go");
+    let name = format!(r"Local\gate-job-suite-{}", std::process::id());
+    let job = Job::create(&name).expect("the job is created");
+    let launch = Launch {
+        application: PathBuf::from(FAKE_TOOL),
+        command_line: format!("\"{FAKE_TOOL}\" wait \"{}\"", shown(&go)).encode_utf16().collect(),
+        directory: case.folder(),
+        environment: EnvironmentBlock::new(std::env::vars_os()).expect("the block is built"),
+        log: case.folder().join("held.log"),
+        err_log: case.folder().join("held.log.err"),
+        priority: None,
+    };
+    let held = launch
+        .start_suspended()
+        .expect("the held command starts")
+        .assign_and_resume(&job)
+        .expect("it is assigned and resumed");
+    let mut payload = box_payload(&case, "k", &[]);
+    payload["Job"] = json!(name);
+
+    let outcome = gate_box(&case, "stop", &self::payload(&payload), None);
+
+    assert_eq!(outcome.code, Some(2), "{outcome:?}");
+    assert_eq!(outcome.stdout, "");
+    assert_eq!(
+        outcome.stderr,
+        format!("gate: box payload Job is not this work folder's job name: {name}\n")
+    );
+    assert_eq!(held.wait(Duration::ZERO).expect("the held command is looked at"), None, "it lives");
+    let_go(&go);
+    assert_eq!(held.wait(Duration::from_secs(60)).expect("the held command ends"), Some(0));
+}
+
+#[test]
+fn box_run_refuses_a_subfolder_the_snapshot_lacks() {
+    let case = Case::new("box_run_subfolder_missing");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "out", "ran"]);
+    snapshot(&case, &payload, &[("a.txt", "a\n")]);
+    payload["Subfolder"] = json!("nope");
+
+    let outcome = run_box(&case, &payload);
+
+    assert_eq!(outcome.code, Some(2), "{outcome:?}");
+    assert_eq!(outcome.stdout, "");
+    assert_eq!(outcome.stderr, "gate: remote subfolder nope does not exist in the snapshot\n");
+}
+
+#[test]
+fn box_run_checks_out_the_snapshot_keeping_ignored_files_and_removing_untracked_ones() {
+    let case = Case::new("box_run_checkout");
+    let payload = box_payload(&case, "k", &[FAKE_TOOL, "exit", "0"]);
+    let work = PathBuf::from(field(&payload, "Work"));
+    let first = snapshot(&case, &payload, &[("a.txt", "a\n"), (".gitignore", "ignored.txt\n")]);
+
+    let outcome = run_box(&case, &payload);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(git(&["-C", field(&payload, "Work"), "rev-parse", "HEAD"]), first);
+    assert_eq!(fs::read_to_string(work.join("a.txt")).expect("a.txt is checked out"), "a\n");
+    assert!(!has_ref(&payload, "refs/gate-back/k"), "an unchanged tree leaves no back ref");
+
+    fs::write(work.join("ignored.txt"), "build output").expect("an ignored file can be written");
+    fs::write(work.join("untracked.txt"), "stray").expect("an untracked file can be written");
+    let second = snapshot(&case, &payload, &[("a.txt", "b\n")]);
+
+    let outcome = run_box(&case, &renamed(&payload, 1));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(git(&["-C", field(&payload, "Work"), "rev-parse", "HEAD"]), second);
+    assert_eq!(fs::read_to_string(work.join("a.txt")).expect("a.txt is checked out"), "b\n");
+    assert!(work.join("ignored.txt").exists(), "an ignored file survives");
+    assert!(!work.join("untracked.txt").exists(), "an untracked file is removed");
+}
+
+#[test]
+fn box_run_passes_the_commands_whole_status() {
+    let case = Case::new("box_run_status");
+    let payload = box_payload(&case, "k", &[FAKE_TOOL, "exit", "300"]);
+    snapshot(&case, &payload, &[("a.txt", "a\n")]);
+
+    let outcome = run_box(&case, &payload);
+    assert_eq!(outcome.code, Some(300), "{outcome:?}");
+
+    let mut all_ones = renamed(&payload, 1);
+    all_ones["Command"] = json!([FAKE_TOOL, "exit", "-1"]);
+    let outcome = run_box(&case, &all_ones);
+    assert_eq!(outcome.code, Some(-1), "0xFFFFFFFF passes whole: {outcome:?}");
+}
+
+#[test]
+fn box_run_forwards_each_stream_line_by_line_ending_each_line_lf() {
+    let case = Case::new("box_run_forwarding");
+    let payload = box_payload(
+        &case,
+        "k",
+        &[FAKE_TOOL, "out", "a1", "err", "e1", "out", "a2", "bytes", "620d0a630d640a", "err", "e2"],
+    );
+    snapshot(&case, &payload, &[("a.txt", "a\n")]);
+
+    let outcome = run_box(&case, &payload);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(outcome.stdout, "a1\na2\nb\nc\nd\n", "CR LF and a lone CR each end a line");
+    assert_eq!(outcome.stderr, "e1\ne2\n");
+}
+
+#[test]
+fn box_run_stops_reading_output_a_leftover_process_holds_open() {
+    let case = Case::new("box_run_drain");
+    let never = case.folder().join("never");
+    let never_word = shown(&never);
+    let payload = box_payload(&case, "k", &[FAKE_TOOL, "spawn-wait", &never_word, "exit", "0"]);
+    snapshot(&case, &payload, &[("a.txt", "a\n")]);
+
+    let outcome = run_box(&case, &payload);
+
+    assert_eq!(outcome.code, Some(0), "the run still ends: {outcome:?}");
+    assert!(
+        outcome
+            .stderr
+            .lines()
+            .any(|line| line == "gate: remote command's output is still held open by a leftover process; stopped reading"),
+        "{outcome:?}"
+    );
+    let_go(&never);
+    wait_until_gone(spawned_pid(&outcome.stdout));
+}
+
+#[test]
+fn box_run_a_cmd_target_runs_through_cmd_and_what_it_wrote_is_committed_back() {
+    let case = Case::new("box_run_back_commit");
+    let payload = box_payload(&case, "k", &[r".\write.cmd"]);
+    let commit = snapshot(&case, &payload, &[("write.cmd", "@echo from-cmd\r\n@echo x>new.txt\r\n")]);
+
+    let outcome = run_box(&case, &payload);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(outcome.stdout, "from-cmd\n");
+    let bare = format!("--git-dir={}", field(&payload, "Bare"));
+    assert_eq!(
+        git(&[&bare, "rev-parse", "refs/gate-back/k^"]),
+        commit,
+        "the back commit's parent is HEAD"
+    );
+    assert_eq!(git(&[&bare, "show", "refs/gate-back/k:new.txt"]), "x");
+}
+
+#[test]
+fn box_run_refuses_a_batch_word_cmd_would_expand() {
+    let case = Case::new("box_run_batch_refusal");
+    let payload = box_payload(&case, "k", &[r".\write.cmd", "%PATH%"]);
+    snapshot(&case, &payload, &[("write.cmd", "@echo x>new.txt\r\n")]);
+
+    let outcome = run_box(&case, &payload);
+
+    assert_eq!(outcome.code, Some(2), "{outcome:?}");
+    assert_eq!(outcome.stdout, "");
+    assert_eq!(
+        outcome.stderr,
+        "gate: a .cmd or .bat command cannot take a word holding a line break or %NAME% of a set variable, which cmd.exe \
+         would split or expand: %PATH%\n"
+    );
+    assert!(!Path::new(field(&payload, "Work")).join("new.txt").exists(), "the command did not run");
+}
+
+#[test]
+fn box_run_an_unknown_program_exits_127() {
+    let case = Case::new("box_run_unknown_program");
+    let payload = box_payload(&case, "k", &["gate-suite-no-such-program"]);
+    snapshot(&case, &payload, &[("a.txt", "a\n")]);
+
+    let outcome = run_box(&case, &payload);
+
+    assert_eq!(outcome.code, Some(127), "{outcome:?}");
+    assert_eq!(outcome.stdout, "");
+    assert_eq!(
+        outcome.stderr,
+        format!("gate: could not start gate-suite-no-such-program: {}\n", gate_win32::win32_message(2))
+    );
+}
+
+#[test]
+fn box_stop_ends_a_held_run_and_says_so() {
+    let case = Case::new("box_stop_held_run");
+    let go = case.folder().join("go");
+    let go_word = shown(&go);
+    let payload = box_payload(&case, "k", &[FAKE_TOOL, "spawn-wait", &go_word, "wait", &go_word]);
+    snapshot(&case, &payload, &[("a.txt", "a\n")]);
+    let running = start_box(&case, &payload);
+    let helper = spawned_pid(&running.wait_for_stdout("\n"));
+
+    let stopped = gate_box(&case, "stop", &self::payload(&payload), None);
+
+    assert_eq!(stopped.code, Some(0), "{stopped:?}");
+    assert_eq!(stopped.stdout, format!("gate: remote stopped job {}\n", field(&payload, "Job")));
+    assert_eq!(stopped.stderr, "");
+    assert_eq!(gate_win32::process_start_of(helper).expect("the helper can be looked for"), None);
+    let outcome = running.finish();
+    assert_eq!(outcome.code, Some(124), "{outcome:?}");
+}
+
+#[test]
+fn box_stop_of_an_unknown_job_says_nothing() {
+    let case = Case::new("box_stop_unknown_job");
+    allow_breakaway();
+
+    let outcome = gate_box(&case, "stop", &payload(&box_payload(&case, "k", &[])), None);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(outcome.stdout, "");
+    assert_eq!(outcome.stderr, "");
+}
+
+#[test]
+fn box_stop_with_an_earlier_runs_job_spares_the_next_run() {
+    let case = Case::new("box_stop_spares_next_run");
+    let go = case.folder().join("go");
+    let go_word = shown(&go);
+    let earlier = box_payload(&case, "k", &[FAKE_TOOL, "exit", "0"]);
+    snapshot(&case, &earlier, &[("a.txt", "a\n")]);
+    assert_eq!(run_box(&case, &earlier).code, Some(0));
+    let mut next = renamed(&earlier, 1);
+    next["Command"] = json!([FAKE_TOOL, "err", "started", "wait", &go_word]);
+    let mut running = start_box(&case, &next);
+    running.wait_for_stderr("started");
+
+    let stopped = gate_box(&case, "stop", &payload(&earlier), None);
+
+    assert_eq!(stopped.code, Some(0), "{stopped:?}");
+    assert_eq!(stopped.stdout, "", "the earlier run's job is gone");
+    assert!(running.is_running(), "the next run goes on");
+    let_go(&go);
+    assert_eq!(running.finish().code, Some(0));
 }

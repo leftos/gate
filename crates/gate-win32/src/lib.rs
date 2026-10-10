@@ -9,12 +9,26 @@ mod event;
 mod job;
 mod launch;
 mod mutex;
+mod piped;
 mod tree;
 
 pub use event::{EventWait, NamedEvent};
 pub use job::Job;
 pub use launch::{EnvironmentBlock, Launch, LaunchError, PriorityClass, Running, Suspended, same_variable_name};
 pub use mutex::{AcquireError, MutexGuard, NamedMutex, OwnedMutexGuard, mutex_exists};
+pub use piped::{PipedLaunch, PipedSuspended, breakaway_refused};
+
+/// Refuses an open file that is not a plain disk file: one that is not on a disk, is a reparse point (a link or a
+/// junction, when opened with `FILE_FLAG_OPEN_REPARSE_POINT`), or has more than one name.
+///
+/// # Errors
+///
+/// An error saying which of those it is, or the system's error when the file cannot be inspected.
+pub fn check_plain_file(file: &std::fs::File) -> io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+
+    launch::check_plain_file(file.as_raw_handle())
+}
 pub use tree::{OpenedJob, StoppableProcess};
 
 use std::io;

@@ -30,7 +30,7 @@ use crate::{Job, own_handle, wait_millis, win32_message};
 
 /// A Unicode environment block, its entries sorted by name as `CreateProcessW` wants them.
 #[derive(Clone, Debug)]
-pub struct EnvironmentBlock(Vec<u16>);
+pub struct EnvironmentBlock(pub(crate) Vec<u16>);
 
 impl EnvironmentBlock {
     /// The block of `vars`, `(name, value)` pairs. Names are compared as Windows compares them, ordinally and without
@@ -194,7 +194,7 @@ fn os_message(error: &io::Error) -> String {
 }
 
 /// A [`LaunchError::Setup`] of `operation` with `error`.
-fn setup(error: io::Error, operation: &str) -> LaunchError {
+pub(crate) fn setup(error: io::Error, operation: &str) -> LaunchError {
     LaunchError::Setup {
         operation: operation.to_owned(),
         error,
@@ -202,7 +202,7 @@ fn setup(error: io::Error, operation: &str) -> LaunchError {
 }
 
 /// A launch refused before any call, for `problem`.
-fn refused(problem: String) -> LaunchError {
+pub(crate) fn refused(problem: String) -> LaunchError {
     setup(io::Error::new(io::ErrorKind::InvalidInput, problem), "check the launch")
 }
 
@@ -323,7 +323,7 @@ impl Launch {
 
 /// Whether `CreateProcessW` would run `path` through cmd.exe: its name, less the trailing dots and spaces Windows
 /// drops, ends in `.cmd` or `.bat`, in any case.
-fn is_batch(path: &Path) -> bool {
+pub(crate) fn is_batch(path: &Path) -> bool {
     let Some(name) = path.file_name() else {
         return false;
     };
@@ -335,17 +335,17 @@ fn is_batch(path: &Path) -> bool {
 
 /// The size of `T`, as a Win32 struct's size field holds it.
 #[expect(clippy::cast_possible_truncation, reason = "a Win32 struct is far smaller than 4 GiB")]
-fn struct_size<T>() -> u32 {
+pub(crate) fn struct_size<T>() -> u32 {
     size_of::<T>() as u32
 }
 
 /// The string as a NUL-terminated UTF-16 buffer.
-fn wide_os(text: &OsStr) -> Vec<u16> {
+pub(crate) fn wide_os(text: &OsStr) -> Vec<u16> {
     text.encode_wide().chain(Some(0)).collect()
 }
 
 /// A handle to `path` the command can inherit, open to every process for reading, writing and deleting.
-fn create_inheritable(
+pub(crate) fn create_inheritable(
     path: &Path,
     access: u32,
     disposition: FILE_CREATION_DISPOSITION,
@@ -390,20 +390,21 @@ fn create_output(path: &Path) -> Result<OwnedHandle, LaunchError> {
     }
     let flags = FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT | SECURITY_SQOS_PRESENT | SECURITY_ANONYMOUS;
     let handle = create_inheritable(path, GENERIC_WRITE, CREATE_NEW, flags)?;
-    check_plain_file(&handle).map_err(|error| setup(error, &format!("check {}", path.display())))?;
+    check_plain_file(handle.raw()).map_err(|error| setup(error, &format!("check {}", path.display())))?;
     Ok(handle)
 }
 
-/// Refuses a handle that is not to a disk file, is to a reparse point, or is to a file with more than one name.
-fn check_plain_file(handle: &OwnedHandle) -> io::Result<()> {
+/// Refuses a handle that is not to a disk file, is to a reparse point, or is to a file with more than one name. The
+/// caller keeps `handle` open for the whole call.
+pub(crate) fn check_plain_file(handle: HANDLE) -> io::Result<()> {
     // SAFETY: the handle is open for the whole call.
-    let kind = unsafe { GetFileType(handle.raw()) };
+    let kind = unsafe { GetFileType(handle) };
     if kind != FILE_TYPE_DISK {
         return Err(io::Error::other(format!("not a disk file (file type {kind})")));
     }
     let mut info = BY_HANDLE_FILE_INFORMATION::default();
     // SAFETY: the handle is open for the whole call and `info` is a writable `BY_HANDLE_FILE_INFORMATION`.
-    if unsafe { GetFileInformationByHandle(handle.raw(), &raw mut info) } == 0 {
+    if unsafe { GetFileInformationByHandle(handle, &raw mut info) } == 0 {
         return Err(io::Error::last_os_error());
     }
     if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
@@ -416,13 +417,13 @@ fn check_plain_file(handle: &OwnedHandle) -> io::Result<()> {
 }
 
 /// A process-and-thread attribute list, deleted when dropped.
-struct AttributeList {
+pub(crate) struct AttributeList {
     buffer: Vec<usize>,
 }
 
 impl AttributeList {
     /// A list with room for `count` attributes.
-    fn new(count: u32) -> Result<AttributeList, LaunchError> {
+    pub(crate) fn new(count: u32) -> Result<AttributeList, LaunchError> {
         let mut size = 0;
         // SAFETY: a null list asks only for the size a list of `count` attributes needs, written to `size`.
         unsafe { InitializeProcThreadAttributeList(std::ptr::null_mut(), count, 0, &raw mut size) };
@@ -440,7 +441,7 @@ impl AttributeList {
     }
 
     /// The list, as `STARTUPINFOEXW` points to it.
-    fn as_ptr(&mut self) -> LPPROC_THREAD_ATTRIBUTE_LIST {
+    pub(crate) fn as_ptr(&mut self) -> LPPROC_THREAD_ATTRIBUTE_LIST {
         self.buffer.as_mut_ptr().cast()
     }
 
@@ -450,7 +451,7 @@ impl AttributeList {
     ///
     /// `value` points to `size` readable bytes, as `attribute` wants them, that stay valid and unchanged for as long
     /// as the list lives: the list keeps the pointer, not a copy.
-    unsafe fn update(&mut self, attribute: u32, value: *const c_void, size: usize) -> Result<(), LaunchError> {
+    pub(crate) unsafe fn update(&mut self, attribute: u32, value: *const c_void, size: usize) -> Result<(), LaunchError> {
         // SAFETY: the list was initialized; the caller guarantees `value` and `size`.
         let updated = unsafe { UpdateProcThreadAttribute(self.as_ptr(), 0, attribute as usize, value, size, std::ptr::null_mut(), std::ptr::null()) };
         if updated == 0 {
@@ -472,9 +473,9 @@ impl Drop for AttributeList {
 /// without that, it is terminated with exit code 1, so a gate that fails before the resume leaves no suspended process.
 pub struct Suspended {
     /// The process, until [`Suspended::assign_and_resume`] takes it.
-    process: Option<OwnedHandle>,
-    thread: OwnedHandle,
-    pid: u32,
+    pub(crate) process: Option<OwnedHandle>,
+    pub(crate) thread: OwnedHandle,
+    pub(crate) pid: u32,
 }
 
 impl Suspended {
