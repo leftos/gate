@@ -22,9 +22,7 @@ use windows_sys::Win32::System::Threading::{
 
 /// The guard of a handle a Win32 call just returned, or the error the call left behind.
 ///
-/// A null handle is a call that failed, and its error is read here before the guard is made: [`OwnedHandle::new`]
-/// closes the null handle it refuses on the way out, which would otherwise overwrite the thread's last error with
-/// `ERROR_INVALID_HANDLE`.
+/// A null handle is a call that failed, and its error is read here before the guard is made.
 ///
 /// # Safety
 ///

@@ -91,7 +91,11 @@ impl OwnedHandle {
     /// closes it and no other guard is made from it.
     #[must_use]
     pub unsafe fn new(handle: HANDLE) -> Option<Self> {
-        (!handle.is_null() && handle != INVALID_HANDLE_VALUE).then_some(Self(handle))
+        if !handle.is_null() && handle != INVALID_HANDLE_VALUE {
+            Some(Self(handle))
+        } else {
+            None
+        }
     }
 
     /// The open handle, to pass to a Win32 call; the guard still owns it and closes it, so the caller never does.
@@ -197,8 +201,26 @@ fn read_memory(process: &OwnedHandle, address: usize, size: usize) -> Option<Vec
 #[cfg(test)]
 #[expect(clippy::expect_used, reason = "a test that cannot read this process must fail loudly")]
 mod tests {
-    use super::Win32ProcessTable;
+    use std::ptr;
+
+    use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, GetLastError, INVALID_HANDLE_VALUE, SetLastError};
+
+    use super::{OwnedHandle, Win32ProcessTable};
     use crate::ProcessTable;
+
+    #[test]
+    fn refused_handle_keeps_the_last_error() {
+        for handle in [ptr::null_mut(), INVALID_HANDLE_VALUE] {
+            // SAFETY: SetLastError only sets this thread's last-error code.
+            unsafe { SetLastError(ERROR_FILE_NOT_FOUND) };
+            // SAFETY: the handle is null or INVALID_HANDLE_VALUE, which the guard refuses.
+            let guard = unsafe { OwnedHandle::new(handle) };
+            // SAFETY: GetLastError only reads this thread's last-error code.
+            let error = unsafe { GetLastError() };
+            assert!(guard.is_none(), "{handle:?} is refused");
+            assert_eq!(error, ERROR_FILE_NOT_FOUND, "refusing {handle:?} keeps the thread's last error");
+        }
+    }
 
     #[test]
     fn process_table_lists_this_process() {
