@@ -5,15 +5,15 @@
 ## Local gate
 
 - [ ] GATE-5 Port the local gate, slice by slice
-  - [ ] GATE-37 Local slice 6: timeout ceiling and backstop
-    - [ ] GATE-76 Ceiling part C: gather and write the diagnostics on a kill
   - [ ] GATE-38 Local slice 7: critical drain and nesting
   - [ ] GATE-39 Local slice 8: router and the bridge to remote.ps1
-    - [ ] GATE-67 Router part B: route gate run through a remote client interface
-      - [ ] GATE-80 Router B2b: the remote pool and the client call
     - [ ] GATE-68 Router part C: the remote.ps1 bridge through a repo shim
-  - [ ] GATE-41 Local slice 10: the PowerShell launcher execs gate.exe once the cutover flag is set
+    - [ ] GATE-87 Routing: give git 60 s before running here, and let tests lift the limit
+  - [!] GATE-41 Local slice 10: the PowerShell launcher execs gate.exe once the cutover flag is set
   - [ ] GATE-62 Watchdog: count build servers, WSL and paused child gates as progress
+    - [ ] GATE-89 Watchdog part B: read build servers and the build client each sample
+    - [ ] GATE-90 Watchdog part C: the WSL VM's CPU for a wsl command
+    - [ ] GATE-91 Watchdog part D: a paused child gate counts as progress
 - [ ] GATE-9 Local cutover: drain and switch to gate.exe, bridging routed runs to remote.ps1
 - [ ] GATE-6 Say how many cores a run kept busy and whether its slot fitted
 - [ ] GATE-7 Learned command durations: summary, expected-time line, ETAs, auto ceiling, backfill
@@ -29,6 +29,9 @@
 - [ ] GATE-10 Port the remote client and box wrapper, then the remote cutover
   - [ ] GATE-42 Remote slice 1: the box side as gate box (run, stop, preflight, boot)
     - [ ] GATE-61 Box part C: box heartbeat, UTF-8 console and the pipe-closed stop
+      - [ ] GATE-84 Box part C2: the box heartbeat on BeatClock and Pump
+      - [ ] GATE-85 Box part C3: the UTF-8 console and the same-job relaunch
+    - [ ] GATE-86 Box run: check out the payload's Snapshot commit, as the live wrapper does
   - [ ] GATE-43 Remote slice 2: remote client (snapshot, push, run, sync-back)
   - [ ] GATE-44 Remote slice 3: bring a routed run's outputs back
   - [ ] GATE-45 Remote slice 4: health refusals, fallback journalling and remote claims
@@ -54,3 +57,4 @@
 ## Backlog
 
 - [ ] GATE-81 gate-win32: terminate a created process when owning its thread handle fails
+- [ ] GATE-92 Suite: raise the 60 s hang guard so cases hold on a busy machine
