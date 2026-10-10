@@ -3,14 +3,14 @@
 //! outside the job.
 
 use std::cmp::Ordering;
-use std::ffi::{OsStr, OsString, c_void};
+use std::ffi::{OsStr, OsString};
 use std::io;
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use proc_table::win32::OwnedHandle;
-use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT};
+use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows_sys::Win32::Globalization::{CSTR_EQUAL, CSTR_GREATER_THAN, CSTR_LESS_THAN, CompareStringOrdinal};
 use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 use windows_sys::Win32::Storage::FileSystem::{
@@ -19,13 +19,12 @@ use windows_sys::Win32::Storage::FileSystem::{
     GetFileInformationByHandle, GetFileType, OPEN_EXISTING, SECURITY_ANONYMOUS, SECURITY_SQOS_PRESENT,
 };
 use windows_sys::Win32::System::Threading::{
-    BELOW_NORMAL_PRIORITY_CLASS, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
-    EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, HIGH_PRIORITY_CLASS, InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
-    PROC_THREAD_ATTRIBUTE_DESKTOP_APP_POLICY, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_CREATION_FLAGS, PROCESS_INFORMATION, ResumeThread,
-    STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW, TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
+    BELOW_NORMAL_PRIORITY_CLASS, GetExitCodeProcess, HIGH_PRIORITY_CLASS, PROC_THREAD_ATTRIBUTE_DESKTOP_APP_POLICY, PROCESS_CREATION_FLAGS,
+    ResumeThread, TerminateProcess, WaitForSingleObject,
 };
 use windows_sys::Win32::System::WindowsProgramming::PROCESS_CREATION_DESKTOP_APP_BREAKAWAY_DISABLE_PROCESS_TREE;
 
+use crate::create::{AttributeList, Creation, check_launch, create_process, startup_info};
 use crate::interrupt::{Woken, wait_with};
 use crate::{Interrupt, Job, own_handle, wait_millis, win32_message};
 
@@ -127,7 +126,7 @@ fn compare_names(left: &[u16], right: &[u16]) -> Ordering {
 /// How to start a command: the caller decides every part of it.
 pub struct Launch {
     /// The program file, as an absolute path: `CreateProcessW` runs it as named and searches no folder for it. A
-    /// `.cmd` or `.bat` file is refused; the caller runs one through `ComSpec` itself.
+    /// `.cmd` or `.bat` file is refused; the caller runs one through cmd.exe itself.
     pub application: PathBuf,
     /// The command line, as the program reads it, without a terminating NUL.
     pub command_line: Vec<u16>,
@@ -224,101 +223,28 @@ impl Launch {
     /// (an application that is relative or a batch file, or a NUL in the application, command line, working folder,
     /// log or `.err` path) or a handle or the attribute list cannot be made.
     pub fn start_suspended(&self) -> Result<Suspended, LaunchError> {
-        self.check()?;
+        let paths = [
+            ("working folder", self.directory.as_path()),
+            ("log", self.log.as_path()),
+            ("err log", self.err_log.as_path()),
+        ];
+        check_launch(&self.command_line, &self.application, &paths)?;
         let input = create_inheritable(Path::new("NUL"), GENERIC_READ, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL)?;
         let output = create_output(&self.log)?;
         let errors = create_output(&self.err_log)?;
-        let handles = [input.raw(), output.raw(), errors.raw()];
         let policy: u32 = PROCESS_CREATION_DESKTOP_APP_BREAKAWAY_DISABLE_PROCESS_TREE;
-        let mut attributes = AttributeList::new(2)?;
-        // SAFETY: `handles` is declared before the list, so it outlives it, and is not changed while the list lives; it
-        // is an array of handles, as the attribute wants.
-        unsafe { attributes.update(PROC_THREAD_ATTRIBUTE_HANDLE_LIST, handles.as_ptr().cast(), size_of_val(&handles)) }?;
+        let mut attributes = AttributeList::new(1, [&input, &output, &errors], &[])?;
         // SAFETY: `policy` is declared before the list, so it outlives it, and is not changed while the list lives; it
         // is one DWORD, as the attribute wants.
         unsafe { attributes.update(PROC_THREAD_ATTRIBUTE_DESKTOP_APP_POLICY, (&raw const policy).cast(), size_of::<u32>()) }?;
-        let mut startup = STARTUPINFOEXW::default();
-        startup.StartupInfo.cb = struct_size::<STARTUPINFOEXW>();
-        startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
-        startup.StartupInfo.hStdInput = input.raw();
-        startup.StartupInfo.hStdOutput = output.raw();
-        startup.StartupInfo.hStdError = errors.raw();
-        startup.lpAttributeList = attributes.as_ptr();
-        self.create(&startup)
-    }
-
-    /// Refuses a launch `CreateProcessW` would read otherwise than as written: a NUL cuts a string short, a relative
-    /// application is searched for, and a batch file runs through cmd.exe without the caller's quoting.
-    fn check(&self) -> Result<(), LaunchError> {
-        if self.command_line.contains(&0) {
-            return Err(refused("the command line holds a NUL".to_owned()));
-        }
-        let paths = [
-            ("application", &self.application),
-            ("working folder", &self.directory),
-            ("log", &self.log),
-            ("err log", &self.err_log),
-        ];
-        for (field, path) in paths {
-            if path.as_os_str().encode_wide().any(|unit| unit == 0) {
-                return Err(refused(format!("the {field} {} holds a NUL", path.display())));
-            }
-        }
-        if !self.application.is_absolute() {
-            return Err(refused(format!("the application {} is not an absolute path", self.application.display())));
-        }
-        if is_batch(&self.application) {
-            return Err(refused(format!(
-                "the application {} is a batch file, which runs only through ComSpec",
-                self.application.display()
-            )));
-        }
-        Ok(())
-    }
-
-    /// Calls `CreateProcessW` with `startup`, whose handles stay open for the whole call.
-    fn create(&self, startup: &STARTUPINFOEXW) -> Result<Suspended, LaunchError> {
-        let application = wide_os(self.application.as_os_str());
-        let mut line: Vec<u16> = self.command_line.iter().copied().chain(Some(0)).collect();
-        let directory = wide_os(self.directory.as_os_str());
-        let priority = self.priority.map_or(0, PriorityClass::flag);
-        let flags = CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT | priority;
-        let mut created = PROCESS_INFORMATION::default();
-        // SAFETY: `application` and `directory` are NUL-terminated, `line` is a writable NUL-terminated buffer the call
-        // may change, the environment is a block `EnvironmentBlock` built (ended by two NULs) and
-        // `CREATE_UNICODE_ENVIRONMENT` says it is UTF-16; `startup` is a whole `STARTUPINFOEXW` whose `cb` says so and
-        // `EXTENDED_STARTUPINFO_PRESENT` says so too; every buffer outlives the call and `created` is writable.
-        let ok = unsafe {
-            CreateProcessW(
-                application.as_ptr(),
-                line.as_mut_ptr(),
-                std::ptr::null(),
-                std::ptr::null(),
-                1,
-                flags,
-                self.environment.0.as_ptr().cast(),
-                directory.as_ptr(),
-                std::ptr::from_ref(startup).cast::<STARTUPINFOW>(),
-                &raw mut created,
-            )
+        let startup = startup_info(&mut attributes);
+        let creation = Creation {
+            application: &self.application,
+            command_line: &self.command_line,
+            directory: &self.directory,
+            environment: &self.environment,
         };
-        if ok == 0 {
-            // SAFETY: `GetLastError` takes no pointers; it is read before anything else can set it.
-            let code = unsafe { GetLastError() };
-            return Err(LaunchError::CreateProcess {
-                code,
-                message: win32_message(code),
-            });
-        }
-        // SAFETY: a success returns a fresh process handle nothing else owns.
-        let process = unsafe { own_handle(created.hProcess) }.map_err(|error| setup(error, "own the command's process"))?;
-        // SAFETY: a success returns a fresh thread handle nothing else owns.
-        let thread = unsafe { own_handle(created.hThread) }.map_err(|error| setup(error, "own the command's thread"))?;
-        Ok(Suspended {
-            process: Some(process),
-            thread,
-            pid: created.dwProcessId,
-        })
+        create_process(&creation, self.priority.map_or(0, PriorityClass::flag), &startup)
     }
 }
 
@@ -415,59 +341,6 @@ pub(crate) fn check_plain_file(handle: HANDLE) -> io::Result<()> {
         return Err(io::Error::other(format!("a file with {} names, not one", info.nNumberOfLinks)));
     }
     Ok(())
-}
-
-/// A process-and-thread attribute list, deleted when dropped.
-pub(crate) struct AttributeList {
-    buffer: Vec<usize>,
-}
-
-impl AttributeList {
-    /// A list with room for `count` attributes.
-    pub(crate) fn new(count: u32) -> Result<AttributeList, LaunchError> {
-        let mut size = 0;
-        // SAFETY: a null list asks only for the size a list of `count` attributes needs, written to `size`.
-        unsafe { InitializeProcThreadAttributeList(std::ptr::null_mut(), count, 0, &raw mut size) };
-        if size == 0 {
-            let error = io::Error::last_os_error();
-            return Err(setup(error, "size the attribute list"));
-        }
-        let mut buffer = vec![0_usize; size.div_ceil(size_of::<usize>())];
-        // SAFETY: `buffer` holds at least `size` bytes, aligned for the pointers the list holds.
-        if unsafe { InitializeProcThreadAttributeList(buffer.as_mut_ptr().cast(), count, 0, &raw mut size) } == 0 {
-            let error = io::Error::last_os_error();
-            return Err(setup(error, "initialize the attribute list"));
-        }
-        Ok(AttributeList { buffer })
-    }
-
-    /// The list, as `STARTUPINFOEXW` points to it.
-    pub(crate) fn as_ptr(&mut self) -> LPPROC_THREAD_ATTRIBUTE_LIST {
-        self.buffer.as_mut_ptr().cast()
-    }
-
-    /// Sets `attribute` to the `size` bytes at `value`.
-    ///
-    /// # Safety
-    ///
-    /// `value` points to `size` readable bytes, as `attribute` wants them, that stay valid and unchanged for as long
-    /// as the list lives: the list keeps the pointer, not a copy.
-    pub(crate) unsafe fn update(&mut self, attribute: u32, value: *const c_void, size: usize) -> Result<(), LaunchError> {
-        // SAFETY: the list was initialized; the caller guarantees `value` and `size`.
-        let updated = unsafe { UpdateProcThreadAttribute(self.as_ptr(), 0, attribute as usize, value, size, std::ptr::null_mut(), std::ptr::null()) };
-        if updated == 0 {
-            let error = io::Error::last_os_error();
-            return Err(setup(error, &format!("set the process attribute 0x{attribute:x}")));
-        }
-        Ok(())
-    }
-}
-
-impl Drop for AttributeList {
-    fn drop(&mut self) {
-        // SAFETY: the list was initialized, and is deleted only here, once.
-        unsafe { DeleteProcThreadAttributeList(self.as_ptr()) };
-    }
 }
 
 /// A command created suspended: it has not run a single instruction until [`Suspended::assign_and_resume`]. Dropped

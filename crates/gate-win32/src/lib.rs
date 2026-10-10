@@ -6,6 +6,7 @@
 
 #![cfg(windows)]
 
+mod create;
 mod event;
 mod interrupt;
 mod job;
