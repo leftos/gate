@@ -28,6 +28,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Free share**: the fraction of the cores the command could use that other work left free in a sample, at least 5%; the load-adjusted clock advances by it.
 - **Heartbeat**: a line a waiting gate prints every 30 s so a gate around it does not read the wait as a stall.
 - **Heavy**: the slot kind for work that keeps several cores busy; its pool's thread budget is 4.
+- **History key**: a journal run's `command` after `gate_state::normalize_command`: split with the C runtime's argument rules, tree flags and their paths dropped, `.tmp` and worktree paths shortened, each word re-quoted; runs with the same key count together.
 - **Holds the machine**: said of a critical gate once it has taken every heavy and unreserved light slot.
 - **Journal**: the append-only `events.jsonl` in the state root, one JSON line per gate event (`queue`, `take`, `release` and others), with its rolled file and gzip archive.
 - **Journal mutex**: the named mutex `Local\gate-journal` (with the root hash under a non-default root) that every gate holds, waiting up to 2 s, while it appends to the journal, rolls it and archives.

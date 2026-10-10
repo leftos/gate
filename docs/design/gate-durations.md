@@ -36,6 +36,8 @@ Each part is a sub-issue of CC-178 and lands on `feat/gate-durations`. Part 1 co
   6. Filter values (`-Filter`, `--filter*`, `-t`) are kept in the **exact key**; the **family key** replaces them with `<filter>`.
   7. A key over 200 characters is cut to 200 plus 8 hex characters of its SHA-256.
 
+  The words are split, and written back, by the rules `gate_state::normalize_command` uses: the C runtime's argument rules for the split, the word rules on each unquoted word, and `quote_arg_str`'s quoting for the output.
+
   The map's 19-row table of real commands is the self-test's fixture for these rules. `keyVersion` in the summary names the rule set; a mismatch rebuilds the summary from the archive and the live journal.
 - **Estimate.** p90 and p99 of `wallSeconds` (and of `adjustedSeconds` for ceilings) over the last 30 passing runs or 14 days, whichever holds fewer runs. p50 is the median of the 5 most recent of those runs, so it follows a real change within three runs while one outlier cannot move it (Tsafrir et al. find recent runs predict better than a long history); p90 and p99 are raised to p50 when a slower recent stretch puts it above them. A key needs 5 passing runs.
 

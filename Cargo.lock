@@ -167,8 +167,10 @@ name = "gate-state"
 version = "0.1.0"
 dependencies = [
  "flate2",
+ "gate-args",
  "jiff",
  "proc-table",
+ "proptest",
  "regex",
  "serde",
  "serde_json",

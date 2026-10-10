@@ -10,11 +10,12 @@
 //! except that any line's `abandoned` names join a run the cache already knows, and a line that does not parse is
 //! skipped. The folder, the prefix, the clock and the process liveness check all come from the caller.
 
-use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Seek, SeekFrom};
+use std::iter::{Peekable, repeat_n};
 use std::path::{Path, PathBuf};
+use std::str::Chars;
 use std::time::SystemTime;
 
 use jiff::{SignedDuration, Timestamp};
@@ -265,7 +266,8 @@ impl JournalCache {
     ///
     /// The first read, and a read after the journal was rolled (it is shorter than the bytes read so far, or its
     /// creation time changed, or `events.1.jsonl` appeared, went or changed its length or write time) or after `dir` or
-    /// `prefix` changed, reads `events.1.jsonl` and then the journal from its start; any other read parses only the journal's complete lines appended since the last, a trailing fragment
+    /// `prefix` changed, reads `events.1.jsonl` and then the journal from its start; any other read parses only the
+    /// journal's complete lines appended since the last, a trailing fragment
     /// without its line feed being left for the next. Runs older than 7 days are then dropped unless they are among the
     /// 50 newest. A missing file reads as an empty one.
     ///
@@ -642,22 +644,29 @@ fn first_slot(slots: &Value) -> Option<u32> {
 }
 
 /// The gated command with what names one tree or one scratch file taken out, so the runs of one command in different
-/// worktrees count together. The command is split on whitespace, a double-quoted span staying one word, then:
+/// worktrees count together.
+///
+/// The command is split as the Microsoft C runtime reads a command line's arguments: space and tab outside quotes
+/// separate words, `"` opens or closes a quoted span, `""` inside a span is one literal quote and the span continues,
+/// and a backslash run before a `"` is halved with the quote literal when the run is odd (any other backslash is
+/// literal). Each word's rules run on its unquoted value:
 ///
 /// 1. `--manifest-path`, `--directory`, `--dir` or `-C` followed by an absolute path is dropped with that path;
 /// 2. a word starting `.tmp/` or `.tmp\` becomes `…`;
 /// 3. any other absolute path with a component ending `.wt` (in any case) and one more after it (the worktree's) becomes what follows
 ///    that component, with `/` separators, or `.` when nothing does;
-/// 4. the words are joined by single spaces.
+/// 4. each word is written back as `gate_args::cmdline::quote_arg_str` writes it (plain when non-empty with no
+///    whitespace and no `"`; otherwise quoted, `"` as `\"`, and a backslash run before a quote or at the end doubled),
+///    and the words are joined by single spaces.
 ///
 /// An absolute path starts with a drive letter and `:\` or `:/`, or with `/`, `\\` or `~`.
 #[must_use]
 pub fn normalize_command(command: &str) -> String {
     let words = split_words(command);
-    let mut kept: Vec<Cow<'_, str>> = Vec::with_capacity(words.len());
+    let mut kept: Vec<String> = Vec::with_capacity(words.len());
     let mut index = 0;
     while index < words.len() {
-        let word = words[index];
+        let word = words[index].as_str();
         if TREE_FLAGS.contains(&word) && words.get(index + 1).is_some_and(|next| is_absolute(next)) {
             index += 2;
             continue;
@@ -665,30 +674,71 @@ pub fn normalize_command(command: &str) -> String {
         kept.push(rewrite_word(word));
         index += 1;
     }
-    kept.join(" ")
+    kept.iter().map(String::as_str).map(quote_word).collect::<Vec<_>>().join(" ")
 }
 
-/// The command's words: runs of non-whitespace, whitespace inside double quotes not splitting one.
-fn split_words(command: &str) -> Vec<&str> {
+/// The command's words as the Microsoft C runtime reads a command line's arguments: space and tab outside quotes
+/// separate words, `"` opens or closes a quoted span, `""` inside a span is one literal quote and the span continues,
+/// and a backslash run before a `"` is halved with the quote literal when the run is odd (any other backslash is
+/// literal). A word that was `""` is empty and kept. The first word takes the same rule as the rest.
+fn split_words(command: &str) -> Vec<String> {
     let mut words = Vec::new();
-    let mut start = None;
+    let mut word = String::new();
+    let mut started = false;
     let mut quoted = false;
-    for (index, character) in command.char_indices() {
-        if character == '"' {
-            quoted = !quoted;
-            start.get_or_insert(index);
-        } else if character.is_whitespace() && !quoted {
-            if let Some(begin) = start.take() {
-                words.push(&command[begin..index]);
+    let mut chars = command.chars().peekable();
+    while let Some(character) = chars.next() {
+        if !quoted && matches!(character, ' ' | '\t') {
+            if started {
+                words.push(std::mem::take(&mut word));
+                started = false;
             }
         } else {
-            start.get_or_insert(index);
+            started = true;
+            read_word_char(character, &mut chars, &mut word, &mut quoted);
         }
     }
-    if let Some(begin) = start {
-        words.push(&command[begin..]);
+    if started {
+        words.push(word);
     }
     words
+}
+
+/// Reads one character of a word, `chars` following it, into `word`, opening or closing a quoted span as the C runtime
+/// does.
+fn read_word_char(character: char, chars: &mut Peekable<Chars<'_>>, word: &mut String, quoted: &mut bool) {
+    match character {
+        '\\' => read_backslashes(chars, word),
+        '"' if *quoted => {
+            if chars.peek().copied() == Some('"') {
+                word.push('"');
+                chars.next();
+            } else {
+                *quoted = false;
+            }
+        }
+        '"' => *quoted = true,
+        _ => word.push(character),
+    }
+}
+
+/// Reads the backslash run starting with the backslash just read, `chars` following it, into `word`: before a `"` the
+/// run is halved and the quote is literal when the run is odd, and any other backslash is literal.
+fn read_backslashes(chars: &mut Peekable<Chars<'_>>, word: &mut String) {
+    let mut count = 1;
+    while chars.peek().copied() == Some('\\') {
+        chars.next();
+        count += 1;
+    }
+    if chars.peek().copied() == Some('"') {
+        word.extend(repeat_n('\\', count / 2));
+        if count % 2 == 1 {
+            word.push('"');
+            chars.next();
+        }
+    } else {
+        word.extend(repeat_n('\\', count));
+    }
 }
 
 fn is_absolute(word: &str) -> bool {
@@ -697,13 +747,13 @@ fn is_absolute(word: &str) -> bool {
     drive || word.starts_with('/') || word.starts_with(r"\\") || word.starts_with('~')
 }
 
-/// A scratch file elided, or a worktree path shortened; any other word as it is.
-fn rewrite_word(word: &str) -> Cow<'_, str> {
+/// A scratch file elided, a worktree path shortened, or any other word as it is.
+fn rewrite_word(word: &str) -> String {
     if word.starts_with(".tmp/") || word.starts_with(r".tmp\") {
-        return Cow::Borrowed(ELIDED);
+        return ELIDED.to_owned();
     }
     if !is_absolute(word) {
-        return Cow::Borrowed(word);
+        return word.to_owned();
     }
     let components: Vec<&str> = word.split(['/', '\\']).collect();
     let is_worktrees = |component: &&str| {
@@ -712,11 +762,52 @@ fn rewrite_word(word: &str) -> Cow<'_, str> {
             .is_some_and(|extension| extension.eq_ignore_ascii_case("wt"))
     };
     let Some(worktrees) = components.iter().position(is_worktrees) else {
-        return Cow::Borrowed(word);
+        return word.to_owned();
     };
     if worktrees + 1 >= components.len() {
-        return Cow::Borrowed(word);
+        return word.to_owned();
     }
     let rest = components[worktrees + 2..].join("/");
-    if rest.is_empty() { Cow::Borrowed(".") } else { Cow::Owned(rest) }
+    if rest.is_empty() { ".".to_owned() } else { rest }
+}
+
+/// One word written back as the C runtime's quoting writes it: plain when it is non-empty and holds no whitespace
+/// (Unicode's, as .NET's `\s`) and no `"`; otherwise wrapped in quotes, `"` as `\"`, and a backslash run before a quote
+/// or at the end doubled.
+fn quote_word(word: &str) -> String {
+    if is_plain_word(word) {
+        return word.to_owned();
+    }
+    let mut out = String::with_capacity(word.len() + 2);
+    out.push('"');
+    write_escaped(word, &mut out);
+    out.push('"');
+    out
+}
+
+/// Whether a word is written plain: non-empty, holding no whitespace (Unicode's, as .NET's `\s`) and no `"`.
+fn is_plain_word(word: &str) -> bool {
+    !word.is_empty() && word.chars().all(|character| !character.is_whitespace() && character != '"')
+}
+
+/// Writes `word` into `out` with each `"` as `\"` and a backslash run before a quote or at the end doubled.
+fn write_escaped(word: &str, out: &mut String) {
+    let mut backslashes = 0;
+    for character in word.chars() {
+        match character {
+            '\\' => backslashes += 1,
+            '"' => {
+                out.extend(repeat_n('\\', backslashes * 2));
+                out.push('\\');
+                out.push('"');
+                backslashes = 0;
+            }
+            _ => {
+                out.extend(repeat_n('\\', backslashes));
+                out.push(character);
+                backslashes = 0;
+            }
+        }
+    }
+    out.extend(repeat_n('\\', backslashes * 2));
 }

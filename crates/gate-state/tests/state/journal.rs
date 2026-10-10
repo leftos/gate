@@ -1,11 +1,13 @@
 //! The gate journal read into runs and per-command held times, and the cache that reads only what was appended.
 
+use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use gate_state::{CommandSummary, History, HistoryRun, JournalCache, RunState, normalize_command};
 use jiff::SignedDuration;
+use proptest::prelude::*;
 use serde_json::{Value, json};
 
 use crate::support::ts;
@@ -312,7 +314,10 @@ fn normalize_command_examples() {
         ("uv run --directory X:/dev/rigcheck.wt/m4i-a-mcp-config ty check", "uv run ty check"),
         ("git commit -F .tmp/msg-sync-gate-launcher.txt", "git commit -F \u{2026}"),
         (
-            "pwsh -NoProfile -File C:/Users/someone/.claude.wt/cc32/tools/gate/gate.selftest.ps1 -Case Test-JournalRolloverBlocked,Test-JournalTornLine",
+            concat!(
+                "pwsh -NoProfile -File C:/Users/someone/.claude.wt/cc32/tools/gate/gate.selftest.ps1 ",
+                "-Case Test-JournalRolloverBlocked,Test-JournalTornLine",
+            ),
             "pwsh -NoProfile -File tools/gate/gate.selftest.ps1 -Case Test-JournalRolloverBlocked,Test-JournalTornLine",
         ),
     ];
@@ -331,6 +336,90 @@ fn normalize_command_non_examples() {
         "git push origin main",
     ] {
         assert_eq!(normalize_command(unchanged), unchanged);
+    }
+}
+
+/// A word quoted as the C runtime reads it back: the quotes and backslash escapes of `split_command_line`, the word
+/// rules on the unquoted word, and the re-quoting on output.
+#[test]
+fn normalize_command_quoted_words() {
+    let cases = [
+        (r#"cmd /c echo "x\"y" .tmp/out.txt"#, r#"cmd /c echo "x\"y" …"#),
+        (
+            r#"cargo test --manifest-path "X:/dev/my repo.wt/a/Cargo.toml" --release"#,
+            "cargo test --release",
+        ),
+        (r#"git commit -F ".tmp/my msg.txt""#, r"git commit -F …"),
+        (r#"echo "a\\\"b" .tmp/x"#, r#"echo "a\\\"b" …"#),
+        (r#"tool "" "X:/dev/r.wt/a/b""#, r#"tool "" b"#),
+        (r#"tool "C:\dir with space\\" .tmp/x"#, r#"tool "C:\dir with space\\" …"#),
+        (r#"cargo test "--manifest-path" X:/dev/r.wt/a/Cargo.toml"#, "cargo test"),
+        (r#"tool "X:/dev/my repo.wt/a/sub dir/f.txt""#, r#"tool "sub dir/f.txt""#),
+        (r#"tool "" .tmp/x"#, r#"tool "" …"#),
+        (
+            r#"uv run pytest tests/test_skill_injection_rules.py tests/test_permission_rules.py -k "not_allowed or permission""#,
+            r#"uv run pytest tests/test_skill_injection_rules.py tests/test_permission_rules.py -k "not_allowed or permission""#,
+        ),
+        (r#"tool "a""b""#, r#"tool "a\"b""#),
+        ("tool\ta", "tool a"),
+        ("  tool   a  ", "tool a"),
+        (r#"echo "abc"#, "echo abc"),
+        (r#"a"b c"d"#, r#""ab cd""#),
+    ];
+    for (input, normalized) in cases {
+        assert_eq!(normalize_command(input), normalized, "input {input}");
+    }
+}
+
+/// The flags whose next word names the tree a command runs in.
+const TREE_FLAGS: [&str; 4] = ["--manifest-path", "--directory", "--dir", "-C"];
+
+/// Whether a word rule rewrites `word` or drops it: an absolute path, a `.tmp/` or `.tmp\` path, or a tree flag.
+fn is_rewritten(word: &str) -> bool {
+    let bytes = word.as_bytes();
+    let drive = bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && matches!(bytes[2], b'\\' | b'/');
+    drive
+        || word.starts_with('/')
+        || word.starts_with(r"\\")
+        || word.starts_with('~')
+        || word.starts_with(".tmp/")
+        || word.starts_with(r".tmp\")
+        || TREE_FLAGS.contains(&word)
+}
+
+/// A word no rule rewrites: a string of separators, quotes, backslash runs, whitespace and path punctuation that is
+/// not absolute, not a `.tmp` path and not a tree flag.
+fn rewrite_free_word() -> impl Strategy<Value = String> {
+    let character = prop_oneof![
+        Just('x'),
+        Just('a'),
+        Just(' '),
+        Just('\t'),
+        Just('\n'),
+        Just('"'),
+        Just('\\'),
+        Just('\u{a0}'),
+        Just('\u{85}'),
+        Just('\u{3000}'),
+        Just('\u{200b}'),
+        Just('\u{feff}'),
+        Just('.'),
+        Just('/'),
+        Just('-'),
+    ];
+    prop::collection::vec(character, 0..6)
+        .prop_map(|characters| characters.into_iter().collect::<String>())
+        .prop_filter("no word rule rewrites it", |word| !is_rewritten(word))
+}
+
+proptest! {
+    // Splitting a written command text gives the words back: the identity holds for words no rule rewrites, so it
+    // round-trips through both the quoter and the splitter.
+    #[test]
+    fn normalize_split_round_trips(words in prop::collection::vec(rewrite_free_word(), 0..6)) {
+        let args: Vec<OsString> = words.into_iter().map(OsString::from).collect();
+        let text = gate_args::command_text(&args);
+        prop_assert_eq!(normalize_command(&text), text);
     }
 }
 
