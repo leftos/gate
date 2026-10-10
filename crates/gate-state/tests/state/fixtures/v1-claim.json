@@ -1,0 +1,1 @@
+{"v":1,"kind":"heavy","index":0,"pid":51000,"processStart":"2026-10-02T21:16:00.5711853Z","started":"2026-10-02T21:16:02.0157648Z","cwd":"C:\\work\\repo","command":"cargo test -p gate-state","log":"C:\\work\\repo\\.tmp\\state-test.log","timeoutSeconds":900.0}
