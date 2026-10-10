@@ -27,7 +27,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Diagnostics block**: the record of what was running that a kill writes to the log before it terminates the job: the job's processes, the descendants outside the job, the build servers and the last samples.
 - **Drained cutover**: a cutover in which every gate of the old generation finishes before the switch completes, so the two generations never hold slots side by side.
 - **Dynamic name**: one of cmd.exe's built-in variables (`%CD%`, `%RANDOM%`, `%ERRORLEVEL%` and the like) that it expands though the environment block holds no such variable; a batch target's words are refused when they hold one.
-- **Fallback**: a routed run that runs locally instead, after its builder refused it or the remote pool stayed full; journalled as a `fallback` event with its reason.
+- **Fallback**: a routed run that runs locally instead, after its builder refused it, the remote pool stayed full or the remote client could not start; journalled as a `fallback` event with its reason.
 - **Fallback poll**: the short timeout on every slot wait, which re-reads counts and tickets so a dead waiter's ticket is cleared even when no wake event comes.
 - **Free share**: the fraction of the cores the command could use that other work left free in a sample, at least 5%; the load-adjusted clock advances by it.
 - **Heartbeat**: a line printed so a gate around the printer does not read quiet as a stall; the wait heartbeat is a waiting gate's `still waiting` line every 30 s, and the box heartbeat is the `gate-remote-heartbeat: <cpu ms>` line the box wrapper writes while its command's CPU use earns one.

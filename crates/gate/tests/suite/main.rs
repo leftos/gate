@@ -18,6 +18,7 @@ mod interrupt;
 mod journal;
 mod launch;
 mod request;
+mod routing;
 mod slots;
 mod stall;
 mod stop_tree;

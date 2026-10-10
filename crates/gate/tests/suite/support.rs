@@ -34,6 +34,17 @@ run options:
 The PowerShell form (gate -Log <path> -TimeoutSeconds <n> -Slot <kind> [...] -- <command>) is also accepted.
 ";
 
+/// The git variables a caller's environment, such as a git hook around the suite, may hold that point git at another
+/// repository, index, object store or config; no case's gate or git gets them, and a gate with `GIT_INDEX_FILE` set
+/// never routes.
+pub const GIT_REDIRECTS: [&str; 6] = [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_COMMON_DIR",
+    "GIT_OBJECT_DIRECTORY",
+];
 /// The variables a real gate around the suite may have set, which no case's gate may inherit.
 const INHERITED: [&str; 2] = ["GATE_STATE_DIR", "GATE_SLOT_HELD"];
 /// Only guards against a stuck case; no case asserts how long anything took.
@@ -90,7 +101,7 @@ impl Case {
 
     /// As [`Case::prepare`], with `args` given as they are.
     pub fn prepare_without_state_dir(&self, command: &mut Command, args: &[&str]) {
-        for name in INHERITED {
+        for name in INHERITED.iter().chain(&GIT_REDIRECTS) {
             command.env_remove(name);
         }
         command.env("LOCALAPPDATA", self.local_app_data()).current_dir(&self.folder).args(args);
@@ -113,6 +124,13 @@ impl Case {
     pub fn gate_without_state_dir(&self, args: &[&str]) -> Command {
         let mut command = Command::new(GATE);
         self.prepare_without_state_dir(&mut command, args);
+        command
+    }
+
+    /// The gate with `args` as [`Case::gate`] readies it, its working directory the case folder's `sub` folder.
+    pub fn gate_in(&self, sub: &str, args: &[&str]) -> Command {
+        let mut command = self.gate(args);
+        command.current_dir(self.folder.join(sub));
         command
     }
 
@@ -381,6 +399,15 @@ pub fn assert_in_order(haystack: &str, needles: &[&str]) {
     }
 }
 
+/// The lines of `case`'s journal, in order.
+pub fn events(case: &Case) -> Vec<Value> {
+    fs::read_to_string(case.root().join("events.jsonl"))
+        .expect("the journal was written")
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("a journal line is JSON"))
+        .collect()
+}
+
 /// The `release` line of `case`'s journal.
 pub fn release(case: &Case) -> Value {
     fs::read_to_string(case.root().join("events.jsonl"))
@@ -412,6 +439,53 @@ pub fn run_words<'a>(log: &'a str, extra: &[&'a str], command: &[&'a str]) -> Ve
     words.push("--");
     words.extend(command);
     words
+}
+
+/// The words of a heavy run, as [`run_words`] gives those of a light one.
+pub fn heavy_words<'a>(log: &'a str, extra: &[&'a str], command: &[&'a str]) -> Vec<&'a str> {
+    let mut words = run_words(log, extra, command);
+    words[2] = "heavy";
+    words
+}
+
+/// Makes the case folder a git worktree of its own, so a gate there is at the root of a checkout named as the folder.
+pub fn git_init(case: &Case) {
+    git(case, &["init", "--quiet"]);
+}
+
+/// Runs git with `args` in the case folder, as a committer of the suite's own, with no hook and no signing; fails the
+/// case when git fails.
+pub fn git(case: &Case, args: &[&str]) {
+    let mut command = Command::new("git");
+    for name in GIT_REDIRECTS {
+        command.env_remove(name);
+    }
+    let identity = ["-c", "user.name=gate suite", "-c", "user.email=suite@example.invalid"];
+    let quiet = ["-c", "commit.gpgsign=false", "-c", "core.hooksPath=.no-hooks"];
+    let status = command
+        .args(identity)
+        .args(quiet)
+        .args(args)
+        .current_dir(case.folder())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .status()
+        .expect("git starts");
+    assert!(status.success(), "git {args:?} succeeds");
+}
+
+/// Writes `json` as the routing file the case's gates read, `<LOCALAPPDATA>\gate\remote.json`; its path.
+pub fn write_remote_json(case: &Case, json: &str) -> PathBuf {
+    let folder = case.local_app_data().join("gate");
+    fs::create_dir_all(&folder).expect("the routing file's folder can be made");
+    let path = folder.join("remote.json");
+    fs::write(&path, json).expect("the routing file can be written");
+    path
+}
+
+/// Copies fake-tool into the case folder as `name`, so a command can name it inside the case's worktree.
+pub fn copy_tool(case: &Case, name: &str) {
+    fs::copy(FAKE_TOOL, case.folder().join(name)).expect("fake-tool can be copied into the case folder");
 }
 
 /// Returns once every handle on `path` is closed: an open that shares nothing succeeds only then. A command a killed

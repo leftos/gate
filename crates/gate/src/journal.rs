@@ -4,7 +4,9 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use gate_state::{Held, JOURNAL_FILE, JournalEvent, JournalIdentity, JournalLock, JournalNote, KernelObject, LockError, append_line, journal_line};
+use gate_state::{
+    Held, JOURNAL_FILE, JournalEvent, JournalIdentity, JournalLock, JournalNote, KernelObject, LockError, RemoteTag, append_line, journal_line,
+};
 use gate_win32::{AcquireError, MutexGuard, NamedMutex};
 use jiff::Timestamp;
 
@@ -59,12 +61,13 @@ impl RunJournal {
         }
     }
 
-    /// Appends `event`'s line, saying on stderr a mutex taken abandoned and what the append had to say.
-    pub(crate) fn write(&mut self, event: &JournalEvent, console: &mut Console) {
+    /// Appends `event`'s line, with the `remote` tag of a routed run before its fallback, saying on stderr a mutex taken
+    /// abandoned and what the append had to say.
+    pub(crate) fn write(&mut self, event: &JournalEvent, remote: Option<&RemoteTag>, console: &mut Console) {
         let appended = match &self.writer {
             Ok((identity, mutex)) => {
                 let now = Timestamp::now();
-                append_line(&self.root, mutex, |abandoned| journal_line(identity, now, event, None, abandoned), now)
+                append_line(&self.root, mutex, |abandoned| journal_line(identity, now, event, remote, abandoned), now)
             }
             Err(reason) => {
                 let note = JournalNote::NotWritten {

@@ -155,6 +155,7 @@ dependencies = [
  "base64",
  "flate2",
  "gate-args",
+ "gate-router",
  "gate-state",
  "gate-watchdog",
  "gate-win32",

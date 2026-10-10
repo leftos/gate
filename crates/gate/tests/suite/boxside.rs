@@ -14,12 +14,11 @@ use jiff::{SignedDuration, Timestamp};
 use regex::Regex;
 use serde_json::{Value, json};
 
-use crate::support::{Case, FAKE_TOOL, Outcome, Running, allow_breakaway, box_payload, finish, shown, start, wait_until, wait_until_closed};
+use crate::support::{
+    Case, FAKE_TOOL, GIT_REDIRECTS, Outcome, Running, allow_breakaway, box_payload, finish, shown, start, wait_until, wait_until_closed,
+};
 
 const BOX_USAGE: &str = "usage: gate box preflight|run|stop|boot|outputs <base64 JSON payload>\n";
-/// The git variables a caller's environment may hold that point git at another repository or config; no case's gate or
-/// git gets them.
-const GIT_REDIRECTS: [&str; 4] = ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_CONFIG_PARAMETERS"];
 
 /// The payload word for `json`, as the remote client encodes it.
 fn payload(json: &Value) -> String {

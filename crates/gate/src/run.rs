@@ -11,7 +11,8 @@ use std::time::{Duration, Instant};
 use std::{fs, io};
 
 use gate_args::{ProgramSearch, RunRequest, Slot, batch_command_line, batch_refusal, command_line, is_batch_target, resolve_program};
-use gate_state::{JournalEvent, KernelObject, RunFacts, StateRoot, Verdict, log_hash};
+use gate_router::Route;
+use gate_state::{JournalEvent, KernelObject, RemoteTag, RunFacts, StateRoot, Verdict, log_hash};
 use gate_win32::{AcquireError, Interrupt, Job, Launch, LaunchError, NamedMutex, OwnedMutexGuard, PriorityClass, Running};
 
 use crate::acquire;
@@ -20,7 +21,8 @@ use crate::console::Console;
 use crate::environment::{self, Variables};
 use crate::journal::RunJournal;
 use crate::log::Log;
-use crate::resolve::ResolvedRoot;
+use crate::resolve::{Environment, ResolvedRoot};
+use crate::route;
 use crate::slots::{self, Pool, Survey, Taken, ThisGate};
 use crate::wait::{self, Arrival, Host, Wait};
 use crate::watch::{Start, Watched, Watcher, Watching};
@@ -39,13 +41,15 @@ const CONTROL_C_EXIT: u32 = 0xC000_013A;
 pub(crate) const ERROR_FILE_NOT_FOUND: u32 = 2;
 /// How long the gate waits for the command to end once it has terminated its job, or once a Ctrl+C came.
 const STOP_WAIT: Duration = Duration::from_secs(5);
+/// Why a routed run's remote client cannot start: none is built yet.
+const NO_CLIENT: &str = "the bridge to remote.ps1 is not built yet";
 
-/// Runs `request`'s command, logging to `log` (absolute) under `root`, saying each line as it goes; returns the gate's
-/// exit status: the command's own whole 32-bit code, 1 for a failure marker in its log or a failure of the gate after
-/// it started, 124 for a command killed as stalled, timed out or past the backstop, 127 when it could not be started,
+/// Runs `request`'s command, logging to `log` (absolute) under `root`, routing a heavy one by `environment`'s routing
+/// file and git hook, saying each line as it goes; returns the gate's exit status: the command's own whole 32-bit
+/// code, 1 for a failure marker in its log or a failure of the gate after it started, 124 for a command killed as stalled, timed out or past the backstop, 127 when it could not be started,
 /// 0xC000013A for a Ctrl+C in the queue, before the command started, or with the command still running 5 s after it,
 /// or 2 for a log inside the state root or a batch word refused before anything was queued.
-pub(crate) fn run(request: &RunRequest, log: &Path, root: &ResolvedRoot, console: &mut Console) -> u32 {
+pub(crate) fn run(request: &RunRequest, log: &Path, root: &ResolvedRoot, environment: &Environment, console: &mut Console) -> u32 {
     if log_in_state_root(log, &root.path) {
         console.err(&format!(
             "gate: the log {} is inside the gate's state folder {}",
@@ -95,11 +99,7 @@ pub(crate) fn run(request: &RunRequest, log: &Path, root: &ResolvedRoot, console
         log,
         host,
     };
-    let queue = JournalEvent::Queue {
-        log: run.log.path().to_string_lossy().into_owned(),
-        not_routed: None,
-    };
-    run.journal.write(&queue, console);
+    run.queue(environment, console);
     let mut taken = None;
     let mut took = Instant::now();
     let watched = panic::catch_unwind(AssertUnwindSafe(|| {
@@ -364,13 +364,42 @@ struct Ended {
 }
 
 impl Run<'_> {
+    /// Decides where the command runs, then journals the queue: with `notRouted` for a heavy gate its caller kept here
+    /// with `--local`, with the remote tag for a routed one, which then tries the builder.
+    fn queue(&mut self, environment: &Environment, console: &mut Console) {
+        let route = route::route(self.request, environment, console);
+        let tag = match &route {
+            Route::Routed(remote) => Some(RemoteTag {
+                host: remote.host.clone(),
+                key: remote.key.clone(),
+            }),
+            Route::Local { .. } => None,
+        };
+        let queue = JournalEvent::Queue {
+            log: self.log.path().to_string_lossy().into_owned(),
+            not_routed: route::not_routed(&route),
+        };
+        self.journal.write(&queue, tag.as_ref(), console);
+        if let Some(tag) = &tag {
+            self.try_remote(tag, console);
+        }
+    }
+
+    /// Tries the routed run on the builder. No remote client is built yet, so it cannot start: the run journals its
+    /// fallback, the last line with the remote tag, says so, and goes on as a heavy run here with the command as given.
+    fn try_remote(&mut self, tag: &RemoteTag, console: &mut Console) {
+        let fallback = JournalEvent::Fallback { reason: "client".to_owned() };
+        self.journal.write(&fallback, Some(tag), console);
+        console.err(&format!("gate: remote {} client could not start: {NO_CLIENT}; running here", tag.host));
+    }
+
     /// Waits its turn for a slot of the run's pool and takes it into `held` the moment it has it, then journals the
     /// take and writes the claim; a critical run takes no pool slot. When the slot was taken; `None` when a Ctrl+C
     /// ended the wait, which deletes the ticket at once, wakes the waiters and journals the abandon.
     fn take(&mut self, held: &mut Option<Taken>, console: &mut Console) -> Option<Instant> {
         let queued = Instant::now();
         let Some(pool) = Pool::of(self.request.slot) else {
-            self.journal.write(&take_event(Vec::new(), 0.0, Vec::new()), console);
+            self.journal.write(&take_event(Vec::new(), 0.0, Vec::new()), None, console);
             return Some(Instant::now());
         };
         let arrival = Arrival {
@@ -384,7 +413,7 @@ impl Run<'_> {
             slots::wake_waiters(self.root, &mut self.survey, console);
             console.err(&format!("gate: interrupted while waiting for a {} slot", pool.name()));
             let waited_seconds = queued.elapsed().as_secs_f64();
-            self.journal.write(&JournalEvent::Abandon { waited_seconds }, console);
+            self.journal.write(&JournalEvent::Abandon { waited_seconds }, None, console);
             return None;
         };
         let taken = held.insert(taken);
@@ -397,7 +426,7 @@ impl Run<'_> {
         }
         wait.end(console);
         let took = Instant::now();
-        self.journal.write(&take_event(vec![name], waited, abandoned), console);
+        self.journal.write(&take_event(vec![name], waited, abandoned), None, console);
         slots::write_claim(&taken.held, pool, &self.gate, self.request, self.log.path(), console);
         slots::wake_waiters(self.root, &mut self.survey, console);
         Some(took)
@@ -433,7 +462,7 @@ impl Run<'_> {
             status: ended.map(|ended| ended.status),
             facts: ended.and_then(|ended| ended.facts),
         };
-        self.journal.write(&release, console);
+        self.journal.write(&release, None, console);
         if let Some(taken) = taken {
             drop(taken);
             slots::wake_waiters(self.root, &mut self.survey, console);
@@ -732,6 +761,10 @@ fn take_event(slots: Vec<String>, waited_seconds: f64, abandoned: Vec<String>) -
 
 #[cfg(test)]
 #[expect(clippy::expect_used, reason = "a test that cannot make its folders must fail loudly")]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "a unit test starts cmd.exe directly, with no launch of its own open"
+)]
 mod tests {
     use std::fs;
     use std::process::Command;

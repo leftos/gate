@@ -7,10 +7,9 @@ use std::fs;
 use std::path::PathBuf;
 
 use gate_state::{KernelObject, StateRoot};
-use serde_json::Value;
 
 use crate::support::{
-    Case, FAKE_TOOL, assert_in_order, finish, run_words, shown, wait_for_journal_line, wait_until, wait_until_closed, write_counts,
+    Case, FAKE_TOOL, assert_in_order, events, finish, run_words, shown, wait_for_journal_line, wait_until, wait_until_closed, write_counts,
 };
 
 /// A light pool of one slot.
@@ -69,13 +68,6 @@ fn argv_output(words: &[&str]) -> Vec<u8> {
 }
 
 /// The journal's events, in order.
-fn events(case: &Case) -> Vec<Value> {
-    fs::read_to_string(case.root().join("events.jsonl"))
-        .expect("the journal was written")
-        .lines()
-        .map(|line| serde_json::from_str::<Value>(line).expect("a journal line is JSON"))
-        .collect()
-}
 
 #[test]
 fn a_run_launches_its_command_and_passes_its_status() {

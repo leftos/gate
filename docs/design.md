@@ -65,7 +65,7 @@ The watchdog samples the command and kills its job on a stall, at the ceiling an
 | `--slot heavy\|light\|critical` | `-Slot` | The slot kind ([Slots](#slots)). | ruling |
 | `--timeout <seconds>` | `-TimeoutSeconds` | The ceiling in load-adjusted seconds, a whole number above 0 (W3). | ruling |
 | `--log <path>` | `-Log` | The command's log; a relative path is read against the working directory once, at start (P5). | ruling |
-| `--stall <seconds>` | `-StallSeconds` | The stall window, default 120 (W2); a routed run raises a value under 15 to 15 (F2). | kept (C1, F2) |
+| `--stall <seconds>` | `-StallSeconds` | The stall window, default 120 (W2); the gate passes it as given, and the remote client raises a value under 15 to 15 on a routed run (F2). | kept (C1, F2) |
 | `--tail <lines>` | `-Tail` | Lines of the log printed at the end, default 20 (V3). | kept (C1, V3) |
 | `--no-markers` | `-NoMarkers` | The command's status is the verdict; the marker scan is off (V2). | ruling |
 | `--local` | `-Local` | Never route this run to a builder (F1). | kept (F1) |
@@ -142,7 +142,7 @@ Every line the gate says is written and flushed as it is said, never held until 
 | `gate: waiting for the machine (critical)` | stderr | A critical gate is queued and waiting for the machine (K5). |
 | `Full output: <path>` | the end of the verdict line: `gate: passed in ... Full output: <path>` on stdout, `gate: FAILED (status <n>). Full output: <path>` on stderr | Where the whole log is (V3). |
 
-Every other `gate: ` line is prose: it informs people and agents and may change in any release. That includes the passed and FAILED lines apart from their `Full output:` tail, the queue, take and wait lines, the heartbeat lines, the diagnostics block and the stop-tree summary.
+Every other `gate: ` line is prose: it informs people and agents and may change in any release. That includes the passed and FAILED lines apart from their `Full output:` tail, the wait lines, the heartbeat lines, the diagnostics block and the stop-tree summary.
 
 The lines of a run that starts its command:
 
@@ -155,7 +155,9 @@ The lines of a run that starts its command:
 - A log in use, exit 1, before queueing and with no journal line: `gate: the log <path> is in use by another gate`, when another gate holds the log's mutex ([Kernel object names](#kernel-object-names)). A mutex a killed gate left is taken silently. `gate: cannot take the mutex <name> of the log <path>: <error>`, exit 1, when the mutex cannot be opened or tried.
 - Routing, on stderr and in the log, with the command running here: `gate: ignored <path>: <reason>; running locally` when `remote.json` is there but unusable (not a file, unreadable or refused), and `gate: not routed: <reason>` when a heavy gate that would route stays local.
 
-  The second line is said for `--local`, a word outside the worktree, a folder that holds nothing the snapshot sends, or a fact that could not be read. A gate that is not heavy, has a covering parent, matches no pattern or has no `remote.json` says nothing.
+  The second line is said for `--local` (`gate: not routed: --local`), a word outside the worktree (`gate: not routed: <word> is outside the worktree`), a folder that holds nothing the snapshot sends (`gate: not routed: <sub> holds nothing the snapshot sends`), a word of the command that is not valid Unicode (`gate: not routed: a word of the command is not valid Unicode`), or a fact that could not be read (`gate: not routed: cannot run git: <error>`, or the working directory or git's output). A gate that is not heavy, has a covering parent, matches no pattern or has no `remote.json` says nothing.
+- A routed run, on stderr and in the log, after any `gate: dropped --no-build: the last build may have run on the other machine` and `gate: outputs: none brought back for a --no-build command` lines: `gate: remote <host> client could not start: the bridge to remote.ps1 is not built yet; running here`, then the run goes on here.
+- The gate prints no `queued for` or `took ... slot` line, for a local or a routed run: the queue and the take are in the journal, and a wait longer than 30 s says `gate: still waiting for a <kind> slot (<s> s)`.
 - Notes that never fail the gate: `gate: cannot remove <log>.err: <error>`, `gate: cannot append <log>.err to the log: <error>` and `gate: cannot read this gate's priority class, so the command runs below normal: <error>`.
 
 ## Slots
@@ -530,12 +532,18 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
 - **What routes** is kept (T2): a heavy gate, not `--local`, under no covering or lending parent, outside a git hook (`GIT_INDEX_FILE` set to a non-empty value), whose first word is not `git` or `prek`, in a git worktree of a repo `remote.json` lists, whose words with in-worktree paths rewritten (T3) match one of that repo's patterns.
 
-  A matched command still runs here, saying why, when a word names a path outside the worktree or the gate's folder holds nothing the snapshot sends. `--no-build` is dropped from a routed command and its fallback (T4).
+  A matched command still runs here, saying why, when a word names a path outside the worktree or the gate's folder holds nothing the snapshot sends. `--no-build` is dropped from the builder's words of a dotnet command, saying so (T4); the fallback here drops it only after the builder ran the command, so a fallback before that keeps the command as given.
 - **The decision is `gate-router`'s**, pure, over facts the caller gives it and the decision asks for lazily, in this order. A light or critical gate, or one under a covering or lending parent, stays local silently and reads nothing. `--local` stays local, saying `gate: not routed: --local`. Only then is `remote.json` read: no file stays local silently, and a file that is not a file, cannot be read or is refused stays local saying `gate: ignored <path>: <reason>; running locally`.
 
   After the file: a git hook, a command with no non-empty word, or a first word whose file name without extension is `git` or `prek` (`git.exe` and a full path included, in any letter case) stays local silently.
 
   Git is asked only then: a folder in no worktree (any non-zero `git rev-parse` exit), a repo the file does not list (the main checkout's folder name as a repo name, in any letter case) and words no pattern of the repo matches stay local silently, the first matching pattern winning. A fact that cannot be read stays local saying `gate: not routed: <reason>`. A machine with no `remote.json` costs no git call.
+
+  git is found along the gate's own `PATH` (absolute entries only) and run by its full path from the gate's folder, with the `GIT_*` variables that point it at another repository, index or config removed and `core.fsmonitor` off, so a gate in a hook that exports `GIT_DIR` still routes; each call gets 10 s, after which git is killed and the gate runs here saying `gate: not routed: git did not answer within 10 s`.
+
+  `gate run` answers those facts in `route.rs`, before it queues and before any command starts. The routing file is `%LOCALAPPDATA%\gate\remote.json` (no file when `LOCALAPPDATA` is unset or empty). The hook rule reads `GIT_INDEX_FILE`: set and non-empty means a git hook, which never routes. The worktree comes from one `git rev-parse` (root, prefix below the root and common git folder), and a folder below the root asks `git ls-files` whether the snapshot would send anything there (tracked or untracked and not ignored, and still on disk). A `subst` drive is followed through `gate_win32::device_target`. A word that is not valid Unicode keeps a command that would route here, saying so.
+
+  The queue line carries `notRouted` `--local` for a heavy `--local` gate and the remote tag for a routed one. Until the remote client lands, every routed decision falls back at once: the `fallback` line has reason `client`, the gate says `gate: remote <host> client could not start: ...; running here`, and the later `take` and `release` carry no remote fields.
 - **The routing file's text** is JSON with `//` and `/* */` comments and trailing commas allowed outside strings, and a leading byte order mark skipped, as the PowerShell gate's reader allows. Keys match in any letter case, and unknown keys are ignored.
 
   An object holding two keys that differ only in letter case anywhere in the file refuses the whole file, with the PowerShell reader's error text. Single-quoted strings are refused (`Conversion from JSON failed with error: ...`), a recorded deviation: the PowerShell reader accepts them.

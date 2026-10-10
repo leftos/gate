@@ -6,19 +6,10 @@ use std::fs;
 use gate_state::v1::ticket_path;
 use serde_json::Value;
 
-use crate::support::{Case, FAKE_TOOL, assert_in_order, release, run_words, said_pid, shown, wait_for_journal_line, write_counts};
+use crate::support::{Case, FAKE_TOOL, assert_in_order, events, release, run_words, said_pid, shown, wait_for_journal_line, write_counts};
 
 /// The status Windows reports for a process Ctrl+C ended, `STATUS_CONTROL_C_EXIT`, as a signed exit code.
 const CONTROL_C_EXIT: i32 = 0xC000_013A_u32.cast_signed();
-
-/// The journal's lines, in order.
-fn events(case: &Case) -> Vec<Value> {
-    fs::read_to_string(case.root().join("events.jsonl"))
-        .expect("the journal was written")
-        .lines()
-        .map(|line| serde_json::from_str::<Value>(line).expect("a journal line is JSON"))
-        .collect()
-}
 
 #[test]
 fn a_command_still_running_5_s_after_a_ctrl_c_has_its_job_terminated() {

@@ -54,7 +54,7 @@ fn run(request: &RunRequest, environment: &Environment, console: &mut Console) -
             console.out(&request_json::run(request, &log, &root));
             0
         }
-        Ok((log, root)) => crate::run::run(request, &log, &root, console),
+        Ok((log, root)) => crate::run::run(request, &log, &root, environment, console),
     }
 }
 

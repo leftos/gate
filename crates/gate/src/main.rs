@@ -1,16 +1,9 @@
 //! `gate.exe`: runs a heavy command under a machine-wide queue of CPU slots. This build reads its command line,
-//! resolves the state root and the log path, answers `--version` and `--help`, and runs a command under a slot in a
-//! job of its own, watched for a stall on a load-adjusted clock, saying each line as it goes, and stops a process tree
-//! with the gates in it. On a builder, the hidden `gate box` answers `boot`, `preflight`, `run` and `stop`. The
-//! watchdog's ceiling and backstop and the box's `outputs` are not built yet.
-
-#![cfg_attr(
-    test,
-    expect(
-        clippy::disallowed_methods,
-        reason = "a unit test starts its helper commands directly, with no launch of its own open"
-    )
-)]
+//! resolves the state root and the log path, answers `--version` and `--help`, decides whether a heavy command routes
+//! to a builder, and runs a command under a slot in a job of its own, watched for a stall, its ceiling and the
+//! backstop, saying each line as it goes, and stops a process tree with the gates in it. A routed command falls back to
+//! running here, as no remote client is built yet. On a builder, the hidden `gate box` answers `boot`, `preflight`,
+//! `run` and `stop`. The box's `outputs` are not built yet.
 
 mod acquire;
 mod answer;
@@ -21,6 +14,7 @@ mod journal;
 mod log;
 mod request_json;
 mod resolve;
+mod route;
 mod run;
 mod slots;
 mod stop_tree;

@@ -10,6 +10,8 @@ use gate_state::{StateRoot, default_root};
 pub(crate) struct Environment {
     pub state_dir: Option<OsString>,
     pub local_app_data: Option<OsString>,
+    /// `GIT_INDEX_FILE`, which git sets for a hook: a gate inside one never routes.
+    pub git_index_file: Option<OsString>,
 }
 
 impl Environment {
@@ -17,6 +19,7 @@ impl Environment {
         Environment {
             state_dir: std::env::var_os("GATE_STATE_DIR"),
             local_app_data: std::env::var_os("LOCALAPPDATA"),
+            git_index_file: std::env::var_os("GIT_INDEX_FILE"),
         }
     }
 }
@@ -91,10 +94,12 @@ mod tests {
         let no_root = Environment {
             state_dir: None,
             local_app_data: Some(unreadable()),
+            git_index_file: None,
         };
         let variable = Environment {
             state_dir: Some(given.clone().into_os_string()),
             local_app_data: Some(unreadable()),
+            git_index_file: None,
         };
 
         assert_eq!(root(None, &no_root).err().as_deref(), Some("gate: cannot read the LOCALAPPDATA variable"));

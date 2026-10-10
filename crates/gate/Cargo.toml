@@ -14,6 +14,7 @@ test-seams = ["gate-args/test-seams"]
 [dependencies]
 base64 = "0.23.1"
 gate-args = { path = "../gate-args" }
+gate-router = { path = "../gate-router" }
 gate-state = { path = "../gate-state" }
 gate-watchdog = { path = "../gate-watchdog" }
 gate-win32 = { path = "../gate-win32" }
