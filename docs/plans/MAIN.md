@@ -5,7 +5,6 @@
 ## Local gate
 
 - [ ] GATE-5 Port the local gate, slice by slice
-  - [ ] GATE-35 Local slice 4: launch the command (resolution, quoting, job object, log and markers)
   - [ ] GATE-36 Local slice 5: watchdog (CPU sampling, stall check, kill-tree, heartbeat)
   - [ ] GATE-37 Local slice 6: timeout ceiling and backstop
   - [ ] GATE-38 Local slice 7: critical drain and nesting
@@ -15,13 +14,13 @@
 - [ ] GATE-9 Local cutover: drain and switch to gate.exe, bridging routed runs to remote.ps1
 - [ ] GATE-6 Say how many cores a run kept busy and whether its slot fitted
 - [ ] GATE-7 Learned command durations: summary, expected-time line, ETAs, auto ceiling, backfill
-  - [ ] GATE-12 Durations: decide whether the estimate favours recent runs and separates cold and warm cache runs
   - [ ] GATE-13 Durations part 2: durations store, `gate expect`, and the expected-time line
-  - [ ] GATE-14 Durations: decide how a prediction is corrected once a run passes it (ETAs and the critical shadow end)
   - [ ] GATE-15 Durations part 3: ETAs in wait lines and an `expected` field in claims and tickets
   - [ ] GATE-16 Durations part 4: `--timeout auto` as a floor, and ceiling and hang hints
   - [ ] GATE-17 Durations part 5: backfill guests during a critical drain
 - [ ] GATE-8 `--slot auto` picks heavy or light from the command's history
+- [ ] GATE-54 Keep the command's log handles out of processes the gate starts on other threads
+- [ ] GATE-55 History keys: split journal commands with the C-runtime rules so quoted words are normalised
 
 ## Remote
 
@@ -45,8 +44,3 @@
 ## Cutover sweep
 
 - [ ] GATE-11 Caller sweep to gate on PATH; delete the PowerShell gate
-
-## Backlog
-
-- [ ] GATE-47 Two threads writing one state file share its temp file
-- [ ] GATE-49 proc-table's OwnedHandle::new closes the handle it refuses, overwriting the last error
