@@ -1,107 +1,50 @@
-//! The gate's Win32 layer: named mutexes and the gate process's own start time. It holds no policy: the names, the
-//! waits and what an abandoned mutex means to the gate are the caller's. Windows only; elsewhere the crate is empty.
+//! The gate's Win32 layer: named mutexes and events, and the gate process's own start time. It holds no policy: the
+//! names, the waits and what an abandoned mutex means to the gate are the caller's. Windows only; elsewhere the crate
+//! is empty.
 
 #![cfg(windows)]
+
+mod event;
+mod mutex;
+
+pub use event::{EventWait, NamedEvent};
+pub use mutex::{AcquireError, MutexGuard, NamedMutex, OwnedMutexGuard, mutex_exists};
 
 use std::io;
 use std::time::Duration;
 
 use jiff::Timestamp;
-use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, HANDLE, WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT};
-use windows_sys::Win32::System::Threading::{CreateMutexW, GetCurrentProcess, GetProcessTimes, INFINITE, ReleaseMutex, WaitForSingleObject};
+use proc_table::win32::OwnedHandle;
+use windows_sys::Win32::Foundation::{FILETIME, HANDLE};
+use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes, INFINITE};
 
-/// A handle to a named mutex, created unowned when no process has it open. A Windows mutex is owned by a thread, so
-/// neither the handle nor its guard leaves the thread that opened it.
-#[derive(Debug)]
-pub struct NamedMutex {
-    handle: HANDLE,
-    name: String,
+/// The guard of a handle a Win32 call just returned, or the error the call left behind.
+///
+/// A null handle is a call that failed, and its error is read here before the guard is made: [`OwnedHandle::new`]
+/// closes the null handle it refuses on the way out, which would otherwise overwrite the thread's last error with
+/// `ERROR_INVALID_HANDLE`.
+///
+/// # Safety
+///
+/// `handle` is open and this guard alone owns it from now on: nothing else closes it and no other guard is made
+/// from it.
+pub(crate) unsafe fn own_handle(handle: HANDLE) -> io::Result<OwnedHandle> {
+    if handle.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: the caller guarantees the handle is open and unowned, and it is not null.
+    unsafe { OwnedHandle::new(handle) }.ok_or_else(|| io::Error::other("the handle a Win32 call returned was refused"))
 }
 
-/// Why a mutex was not taken.
-#[derive(Debug, thiserror::Error)]
-pub enum AcquireError {
-    /// Another thread held it for the whole wait.
-    #[error("not free in time")]
-    Timeout,
-    /// The wait itself failed.
-    #[error("the wait failed: {0}")]
-    Failed(io::Error),
+/// A wait of `timeout` in milliseconds, saturating and capped below `INFINITE`, so that no wait of this crate can be
+/// asked for an endless one by accident.
+pub(crate) fn wait_millis(timeout: Duration) -> u32 {
+    u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX).min(INFINITE - 1)
 }
 
-/// An owned mutex, released when dropped.
-#[derive(Debug)]
-pub struct MutexGuard<'a> {
-    mutex: &'a NamedMutex,
-    abandoned: bool,
-}
-
-impl NamedMutex {
-    /// Opens the mutex `name` (such as `Local\gate-journal`), creating it unowned when it does not exist.
-    ///
-    /// # Errors
-    ///
-    /// The system's error when the mutex cannot be created or opened.
-    pub fn open(name: &str) -> io::Result<NamedMutex> {
-        let wide: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
-        // SAFETY: `wide` is NUL-terminated and outlives the call; null security attributes are allowed.
-        let handle = unsafe { CreateMutexW(std::ptr::null(), 0, wide.as_ptr()) };
-        if handle.is_null() {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(NamedMutex {
-            handle,
-            name: name.to_owned(),
-        })
-    }
-
-    /// The name it was opened by.
-    #[must_use]
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
-    /// Takes the mutex, waiting at most `timeout`. A mutex whose owner thread ended without releasing it comes back
-    /// owned, marked [`MutexGuard::abandoned`].
-    ///
-    /// # Errors
-    ///
-    /// [`AcquireError::Timeout`] when it was not free within `timeout`, [`AcquireError::Failed`] when the wait failed.
-    pub fn acquire(&self, timeout: Duration) -> Result<MutexGuard<'_>, AcquireError> {
-        let millis = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX).min(INFINITE - 1);
-        // SAFETY: the handle is open for as long as `self` lives.
-        let result = unsafe { WaitForSingleObject(self.handle, millis) };
-        let abandoned = match result {
-            WAIT_OBJECT_0 => false,
-            WAIT_ABANDONED => true,
-            WAIT_TIMEOUT => return Err(AcquireError::Timeout),
-            _ => return Err(AcquireError::Failed(io::Error::last_os_error())),
-        };
-        Ok(MutexGuard { mutex: self, abandoned })
-    }
-}
-
-impl Drop for NamedMutex {
-    fn drop(&mut self) {
-        // SAFETY: the handle is open and owned by `self` alone. A close that fails leaves nothing to do.
-        unsafe { CloseHandle(self.handle) };
-    }
-}
-
-impl MutexGuard<'_> {
-    /// True when the mutex was taken abandoned: its last owner's thread ended while it held it.
-    #[must_use]
-    pub fn abandoned(&self) -> bool {
-        self.abandoned
-    }
-}
-
-impl Drop for MutexGuard<'_> {
-    fn drop(&mut self) {
-        // SAFETY: this thread owns the mutex through the open handle. A release that fails leaves it to be abandoned
-        // when the thread ends, which the next taker handles.
-        unsafe { ReleaseMutex(self.mutex.handle) };
-    }
+/// The name as a NUL-terminated UTF-16 buffer, as a Win32 call that takes a name wants it.
+pub(crate) fn wide(name: &str) -> Vec<u16> {
+    name.encode_utf16().chain(Some(0)).collect()
 }
 
 /// This process's start time, as the process table gives start times (whole microseconds).
