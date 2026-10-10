@@ -1,4 +1,4 @@
-//! The first word, the usage, a valid run, and the skeleton's answer to a valid stop-tree.
+//! The first word, the usage and a valid run.
 
 use crate::support::{Case, FAKE_TOOL, USAGE, assert_in_order, shown};
 
@@ -92,16 +92,4 @@ fn valid_run_runs_its_command_and_exits_with_its_status() {
     assert!(case.folder().join("out.log").is_file(), "the log is in the working folder");
     let entries = case.root_entries();
     assert!(entries.iter().any(|entry| entry == "events.jsonl"), "events.jsonl in {entries:?}");
-}
-
-#[test]
-fn valid_stop_tree_says_not_built_and_exits_70() {
-    let case = Case::new("valid_stop_tree_says_not_built");
-    let outcome = case.run(&["stop-tree", "123"]);
-
-    assert_eq!(outcome.code, Some(70));
-    assert_eq!(outcome.stdout, "");
-    assert_eq!(outcome.stderr, "gate: stop-tree is not built yet\n");
-    assert_eq!(case.root_entries(), Vec::<String>::new(), "nothing is created under the root");
-    assert_eq!(case.folder_entries(), Vec::<String>::new(), "nothing is created in the working folder");
 }

@@ -5,7 +5,7 @@
 #[cfg(all(windows, target_pointer_width = "64"))]
 pub mod win32;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use jiff::Timestamp;
 
@@ -103,6 +103,34 @@ impl ProcessTree {
                 .filter(|parent| visited.insert(parent.pid) && !started_after(parent, current));
             child
         })
+    }
+
+    /// The processes under `pid`, breadth first, so no process comes before its parent: its children in snapshot
+    /// order, then theirs, and so on; `pid` itself is never yielded, and each process at most once. A process counts
+    /// as a child only when both its start time and its parent's are known and it started at or after its parent, so a
+    /// process that took over a dead parent's pid adopts none of that parent's children, and one whose start time is
+    /// unknown is left out with everything under it. Empty when the snapshot has no `pid` or its start time is unknown.
+    #[must_use]
+    pub fn descendants(&self, pid: u32) -> Vec<&ProcessInfo> {
+        let mut children: HashMap<u32, Vec<&ProcessInfo>> = HashMap::new();
+        for process in self.iter().filter(|process| process.pid != process.parent_pid) {
+            children.entry(process.parent_pid).or_default().push(process);
+        }
+        let mut visited = HashSet::from([pid]);
+        let mut found = Vec::new();
+        let mut queue: VecDeque<&ProcessInfo> = self.get(pid).into_iter().collect();
+        while let Some(parent) = queue.pop_front() {
+            let Some(parent_created) = parent.created else {
+                continue;
+            };
+            for &child in children.get(&parent.pid).into_iter().flatten() {
+                if child.created.is_some_and(|created| created >= parent_created) && visited.insert(child.pid) {
+                    found.push(child);
+                    queue.push_back(child);
+                }
+            }
+        }
+        found
     }
 }
 
@@ -247,6 +275,89 @@ mod tests {
     #[test]
     fn empty_table_lists_no_processes() {
         assert_eq!(EmptyTable.snapshot(), Vec::<ProcessInfo>::new());
+    }
+
+    fn descendant_pids(tree: &ProcessTree, pid: u32) -> Vec<u32> {
+        tree.descendants(pid).iter().map(|process| process.pid).collect()
+    }
+
+    fn unknown_start(pid: u32, parent_pid: u32) -> ProcessInfo {
+        ProcessInfo {
+            created: None,
+            ..process(pid, parent_pid, "2026-10-01T10:00:00Z")
+        }
+    }
+
+    #[test]
+    fn descendants_come_breadth_first_in_snapshot_order() {
+        let tree = ProcessTree::new(vec![
+            process(5, 3, "2026-10-01T10:00:05Z"),
+            process(1, 0, "2026-10-01T10:00:00Z"),
+            process(4, 2, "2026-10-01T10:00:04Z"),
+            process(3, 1, "2026-10-01T10:00:03Z"),
+            process(2, 1, "2026-10-01T10:00:02Z"),
+            process(9, 8, "2026-10-01T10:00:01Z"),
+        ]);
+        assert_eq!(descendant_pids(&tree, 1), vec![3, 2, 5, 4]);
+        assert_eq!(descendant_pids(&tree, 2), vec![4]);
+        assert_eq!(descendant_pids(&tree, 4), Vec::<u32>::new());
+    }
+
+    #[test]
+    fn descendants_count_a_child_started_at_or_after_its_parent() {
+        let tree = ProcessTree::new(vec![
+            process(1, 0, "2026-10-01T10:00:00Z"),
+            process(2, 1, "2026-10-01T10:00:00Z"),
+            process(3, 1, "2026-10-01T10:00:01Z"),
+        ]);
+        assert_eq!(descendant_pids(&tree, 1), vec![2, 3]);
+    }
+
+    #[test]
+    fn descendants_a_recycled_pid_adopts_no_one() {
+        // Pid 2 was taken by a process that started after 3 and 4, children of the earlier process that had it.
+        let tree = ProcessTree::new(vec![
+            process(1, 0, "2026-10-01T09:00:00Z"),
+            process(2, 1, "2026-10-01T11:00:00Z"),
+            process(3, 2, "2026-10-01T10:00:00Z"),
+            process(4, 3, "2026-10-01T10:30:00Z"),
+            process(5, 2, "2026-10-01T11:30:00Z"),
+        ]);
+        assert_eq!(descendant_pids(&tree, 2), vec![5]);
+        assert_eq!(descendant_pids(&tree, 1), vec![2, 5]);
+    }
+
+    #[test]
+    fn descendants_leave_out_an_unknown_start_with_everything_under_it() {
+        let tree = ProcessTree::new(vec![
+            process(1, 0, "2026-10-01T10:00:00Z"),
+            unknown_start(2, 1),
+            process(3, 2, "2026-10-01T10:00:03Z"),
+            process(4, 1, "2026-10-01T10:00:04Z"),
+        ]);
+        assert_eq!(descendant_pids(&tree, 1), vec![4]);
+        assert_eq!(
+            descendant_pids(&tree, 2),
+            Vec::<u32>::new(),
+            "a root with an unknown start has no known children"
+        );
+    }
+
+    #[test]
+    fn descendants_yield_each_process_once_on_a_cycle() {
+        let tree = ProcessTree::new(vec![
+            process(10, 20, "2026-10-01T10:00:00Z"),
+            process(20, 10, "2026-10-01T10:00:00Z"),
+            process(30, 30, "2026-10-01T10:00:00Z"),
+        ]);
+        assert_eq!(descendant_pids(&tree, 10), vec![20]);
+        assert_eq!(descendant_pids(&tree, 30), Vec::<u32>::new(), "a process is not its own child");
+    }
+
+    #[test]
+    fn descendants_of_unknown_pid_is_empty() {
+        let tree = ProcessTree::new(vec![process(1, 0, "2026-10-01T10:00:00Z")]);
+        assert_eq!(descendant_pids(&tree, 42), Vec::<u32>::new());
     }
 
     #[test]

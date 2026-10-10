@@ -48,7 +48,7 @@ Rules both parsers share:
 - A gate option that is not valid Unicode is a usage error; the words after `--` are passed through as the caller gave them.
 - A word before `--` that is not an option is a usage error (`gate: unexpected argument <word>`).
 
-A valid `gate stop-tree` prints `gate: stop-tree is not built yet` on stderr and exits 70 until its slice is built.
+A valid `gate stop-tree` stops the tree ([`gate stop-tree`](#gate-stop-tree)).
 
 A valid `gate run` starts the command: it refuses a batch word (exit 2), refuses a `--log` inside the state root (exit 2, `gate: the log <path> is inside the gate's state folder <root>`; the paths are compared canonical, through links and junctions, after canonicalising the nearest existing folder), takes the log's mutex, prepares the log, queues, takes a slot, starts the command in the job `Local\gate[-<h>]-job-<gate pid>`, waits for it, reaches the verdict and releases the slot.
 
@@ -75,9 +75,13 @@ The words after `--` reach the command exactly as the caller passed them ([Comma
 
 ### `gate stop-tree`
 
-`gate stop-tree <pid>` takes one process snapshot, builds the tree of descendants of the pid (a child counts only when created at or after its parent, so a recycled pid adopts no one), terminates the job of every gate in the tree, then terminates the tree's processes deepest first (kept, X6).
+`gate stop-tree <pid>` takes one process snapshot and builds the tree: the pid plus its descendants, a child counting only when its creation time is readable and at or after its parent's, so a recycled pid adopts no one (a child whose creation time is unreadable is left out with its subtree).
 
-It prints `gate: stopped <n> gate job(s) and <m> process(es) under <pid>` on stdout, each failure as `gate: could not stop: <reason>` on stderr with exit 1, and exits 2 with the usage for a missing or invalid pid. It honours `--state-dir`, since job names depend on the root.
+It terminates the job of every gate in the tree first, then the tree's processes deepest first, skipping itself and any process whose creation time changed since the snapshot (the pid was reused) (kept, X6). The members of a terminated gate job share a 2 s grace to exit on their own, and only the processes stop-tree had to terminate itself are counted. A job or process it stops ends with status 124. Gate jobs are found under the resolved [state root](#state-root), named as the job of each gate pid in the tree, so `--state-dir` and `GATE_STATE_DIR` are honoured.
+
+A failed terminate is a failure only if the process is still alive 1 s later. It prints `gate: stopped <n> gate job(s) and <m> process(es) under <pid>` on stdout and each failure as `gate: could not stop: <reason>` on stderr, and exits 0 when nothing failed and 1 when anything did. A reason reads `<Op>(<arg>) failed with Win32 error <n>: <message>`, where `<Op>` is `OpenJobObjectW`, `TerminateJobObject`, `OpenProcess` or `TerminateProcess`, or `listing the processes of <job name> failed: QueryInformationJobObject failed with Win32 error <n>: <message>`.
+
+A pid with no live process prints `gate: stop-tree: no live process has the id <pid>` and the usage, and exits 2, as does a missing or invalid pid.
 
 ### `gate cutover`
 
@@ -119,7 +123,7 @@ Further modes arrive as subcommands of the same binary, each designed with its i
 | 2 | Usage: a missing, unknown or invalid input; a `.cmd` or `.bat` word the gate refuses (C5); a `--log` inside the state root; a critical gate under a heavy or light slot marker (K7). Nothing is queued. |
 | 124 | The watchdog killed the command: STALLED, TIMED OUT or BACKSTOP (X2). |
 | 127 | The command could not be started (C7); the slot is released at once. |
-| 70 | Temporary: a valid `gate stop-tree`, or a valid `gate box run`, `stop` or `outputs`, which are not built yet (`gate: box <verb> is not built yet`). Their slices remove this code. |
+| 70 | Temporary: a valid `gate box run`, `stop` or `outputs`, which are not built yet (`gate: box <verb> is not built yet`). Their slices remove this code. |
 | 75 | A builder refused a routed run (`gate box`, or the bridged remote client): busy, unreachable, parity, rebooted, tools, version. The PC side reads the refusal and falls back to a local run, so a caller sees 75 only as a command's own status, or as a refusal that carried no reason (T5). |
 
 The codes are kept (V4), with 75 added for refusals. 124 is the status coreutils `timeout` uses, so no caller mistakes a kill for the command's own status; a command that itself exits 124 is told apart in the journal's `verdict`.
@@ -563,7 +567,7 @@ A Rust integration suite drives the built `gate.exe` through its CLI and reads o
 - **Injected clock.** The watchdog arithmetic is unit-tested in `gate-watchdog` with an injected clock and scripted samples, not through the binary.
 - **Fake process trees.** A small helper executable, `fake-tool`, is built only with the `test-seams` feature.
 
-  It runs its steps in order: `argv`, `out <text>`, `err <text>`, `sleep <ms>`, `wait <path>` (until the path exists, giving up after 120 s with exit 1), `spawn-wait <path>` (starts `fake-tool wait <path>` with the caller's handles, prints `spawned <pid>` and does not wait), `env <name>` (prints the variable's value), `bytes <hex>` (writes those bytes to stdout as they are), `lines <n> <text>` (prints `<text>1` to `<text><n>`), `exit <n>` (any 32-bit status).
+  It runs its steps in order: `argv`, `out <text>`, `err <text>`, `sleep <ms>`, `wait <path>` (until the path exists, giving up after 120 s with exit 1), `spawn-wait <path>` (starts `fake-tool wait <path>` with the caller's handles, prints `spawned <pid>` and does not wait), `spawn-orphan <path>` (runs `fake-tool spawn-wait <path>` as a child, waits for it to end, then continues with its next step, so the waiting helper is left without a parent and its `spawned <pid>` line is the up signal), `env <name>` (prints the variable's value), `bytes <hex>` (writes those bytes to stdout as they are), `lines <n> <text>` (prints `<text>1` to `<text><n>`), `exit <n>` (any 32-bit status).
 
   It is copied under the names the gate classifies (`VBCSCompiler.exe`, `dotnet.exe`, `MSBuild.exe`).
 

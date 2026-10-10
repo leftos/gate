@@ -10,7 +10,7 @@ use crate::resolve::{self, Environment};
 
 /// The status of a usage error: a missing, unknown or invalid input, or a word the command cannot take.
 pub(crate) const USAGE_STATUS: u8 = 2;
-/// The status of a valid request for a mode this build does not have yet: `stop-tree`.
+/// The status of a valid request for a mode this build does not have yet.
 pub(crate) const NOT_BUILT_STATUS: u8 = 70;
 
 /// Says the answer for `args`, the command line without the program name, through `console`, and returns the exit
@@ -68,9 +68,6 @@ fn stop_tree(request: &StopRequest, environment: &Environment, console: &mut Con
             console.out(&request_json::stop_tree(request, &root));
             0
         }
-        Ok(_) => {
-            console.err("gate: stop-tree is not built yet");
-            NOT_BUILT_STATUS
-        }
+        Ok(root) => crate::stop_tree::stop_tree(request.pid, &root.root, console),
     }
 }

@@ -9,11 +9,13 @@ mod event;
 mod job;
 mod launch;
 mod mutex;
+mod tree;
 
 pub use event::{EventWait, NamedEvent};
 pub use job::Job;
 pub use launch::{EnvironmentBlock, Launch, LaunchError, PriorityClass, Running, Suspended, same_variable_name};
 pub use mutex::{AcquireError, MutexGuard, NamedMutex, OwnedMutexGuard, mutex_exists};
+pub use tree::{OpenedJob, StoppableProcess};
 
 use std::io;
 use std::time::{Duration, SystemTime};

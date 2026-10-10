@@ -60,6 +60,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Stable line**: one of the three published `gate:` line forms callers may parse (STALLED, TIMED OUT or BACKSTOP; `waiting for the machine (critical)`; `Full output:`); every other `gate:` line is prose.
 - **Stall**: a kill for no progress (no output, CPU, new process or build-server work) for the stall window, `--stall` seconds.
 - **State root**: the folder holding every file the gate writes, `%LOCALAPPDATA%\gate\v1\` by default, overridden by `--state-dir` or `GATE_STATE_DIR`.
+- **Stop-tree**: `gate stop-tree <pid>`, which terminates the gate jobs and then the processes of a pid's tree, deepest first, so a kill reaches processes that no longer have a parent.
 - **Sync-back**: applying the files a routed command changed on the builder to the PC's worktree, refused when the worktree changed during the run.
 - **Take**: a gate acquiring its slot, journalled as `take`; **release** is letting it go, journalled as `release` before the slot is freed.
 - **Test seam**: a hidden `--test-*` flag, compiled only with the `test-seams` cargo feature, by which the suite sets a timing knob or prints the parsed request.

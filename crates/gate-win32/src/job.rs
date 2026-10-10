@@ -65,39 +65,7 @@ impl Job {
     ///
     /// The system's error when the job cannot be queried.
     pub fn process_ids(&self) -> io::Result<Vec<u32>> {
-        let first = std::mem::offset_of!(JOBOBJECT_BASIC_PROCESS_ID_LIST, ProcessIdList) / size_of::<usize>();
-        let mut capacity = 64;
-        loop {
-            let mut buffer = vec![0_usize; first + capacity];
-            let length = u32::try_from(size_of_val(buffer.as_slice())).map_err(io::Error::other)?;
-            // SAFETY: the handle is open for the whole call, with the `JOB_OBJECT_QUERY` access a created job has;
-            // `buffer` is writable for `length` bytes and aligned as the list is, and no returned length is asked for.
-            let read = unsafe {
-                QueryInformationJobObject(
-                    self.handle.raw(),
-                    JobObjectBasicProcessIdList,
-                    buffer.as_mut_ptr().cast(),
-                    length,
-                    std::ptr::null_mut(),
-                )
-            } != 0;
-            // SAFETY: `GetLastError` takes no pointers; it is read before anything else can set it.
-            let error = if read { 0 } else { unsafe { GetLastError() } };
-            if !read && error != ERROR_MORE_DATA {
-                return Err(io::Error::from_raw_os_error(error.cast_signed()));
-            }
-            // SAFETY: `buffer` is aligned as the list is and longer than it, and the call wrote its two counts.
-            let list = unsafe { &*buffer.as_ptr().cast::<JOBOBJECT_BASIC_PROCESS_ID_LIST>() };
-            let assigned = list.NumberOfAssignedProcesses as usize;
-            let listed = list.NumberOfProcessIdsInList as usize;
-            if read && listed >= assigned {
-                let ids = buffer
-                    .get(first..first + listed)
-                    .ok_or_else(|| io::Error::other("the job listed more process ids than its buffer holds"))?;
-                return ids.iter().map(|&id| u32::try_from(id).map_err(io::Error::other)).collect();
-            }
-            capacity = (capacity * 2).max(assigned + 16);
-        }
+        process_ids(&self.handle)
     }
 
     /// Ends every process in the job, and in the jobs nested inside it, with `exit_code`.
@@ -106,8 +74,54 @@ impl Job {
     ///
     /// The system's error when the job cannot be terminated.
     pub fn terminate(&self, exit_code: u32) -> io::Result<()> {
-        // SAFETY: the handle is open for the whole call, with the `JOB_OBJECT_TERMINATE` access a created job has.
-        let terminated = unsafe { TerminateJobObject(self.handle.raw(), exit_code) };
-        if terminated == 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
+        terminate(&self.handle, exit_code)
     }
+}
+
+/// The ids of every process in the job behind `job` now, those in the jobs nested inside it included. A handle
+/// without `JOB_OBJECT_QUERY` access gets the system's error.
+pub(crate) fn process_ids(job: &OwnedHandle) -> io::Result<Vec<u32>> {
+    let first = std::mem::offset_of!(JOBOBJECT_BASIC_PROCESS_ID_LIST, ProcessIdList) / size_of::<usize>();
+    let mut capacity = 64;
+    loop {
+        let mut buffer = vec![0_usize; first + capacity];
+        let length = u32::try_from(size_of_val(buffer.as_slice())).map_err(io::Error::other)?;
+        // SAFETY: the handle is open for the whole call, and one without the `JOB_OBJECT_QUERY` access the call asks
+        // for only makes it fail; `buffer` is writable for `length` bytes and aligned as the list is, and no returned
+        // length is asked for.
+        let read = unsafe {
+            QueryInformationJobObject(
+                job.raw(),
+                JobObjectBasicProcessIdList,
+                buffer.as_mut_ptr().cast(),
+                length,
+                std::ptr::null_mut(),
+            )
+        } != 0;
+        // SAFETY: `GetLastError` takes no pointers; it is read before anything else can set it.
+        let error = if read { 0 } else { unsafe { GetLastError() } };
+        if !read && error != ERROR_MORE_DATA {
+            return Err(io::Error::from_raw_os_error(error.cast_signed()));
+        }
+        // SAFETY: `buffer` is aligned as the list is and longer than it, and the call wrote its two counts.
+        let list = unsafe { &*buffer.as_ptr().cast::<JOBOBJECT_BASIC_PROCESS_ID_LIST>() };
+        let assigned = list.NumberOfAssignedProcesses as usize;
+        let listed = list.NumberOfProcessIdsInList as usize;
+        if read && listed >= assigned {
+            let ids = buffer
+                .get(first..first + listed)
+                .ok_or_else(|| io::Error::other("the job listed more process ids than its buffer holds"))?;
+            return ids.iter().map(|&id| u32::try_from(id).map_err(io::Error::other)).collect();
+        }
+        capacity = (capacity * 2).max(assigned + 16);
+    }
+}
+
+/// Ends every process in the job behind `job`, and in the jobs nested inside it, with `exit_code`. A handle without
+/// `JOB_OBJECT_TERMINATE` access gets the system's error.
+pub(crate) fn terminate(job: &OwnedHandle, exit_code: u32) -> io::Result<()> {
+    // SAFETY: the handle is open for the whole call, and one without the `JOB_OBJECT_TERMINATE` access the call asks
+    // for only makes it fail.
+    let terminated = unsafe { TerminateJobObject(job.raw(), exit_code) };
+    if terminated == 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
 }

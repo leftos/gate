@@ -2,7 +2,9 @@
 //! `out <text>` and `err <text>` print a line on stdout or stderr; `sleep <ms>` sleeps; `wait <path>` sleeps until the
 //! path exists, and exits 1 when it has not appeared after 120 s; `spawn-wait <path>` starts `fake-tool wait <path>`
 //! with this process's stdin, stdout and stderr, prints `spawned <its pid>` and goes on without waiting for it;
-//! `exit <n>` exits with status n, any 32-bit code, negative ones as Windows reads them back;
+//! `spawn-orphan <path>` runs `fake-tool spawn-wait <path>` with this process's handles and waits for it to end, so the
+//! helper that one starts is left with no parent and only the job this process runs in still reaches it; `exit <n>`
+//! exits with status n, any 32-bit code, negative ones as Windows reads them back;
 //! `env <name>` prints the variable's value, or `fake-tool: <name> is not set`, on its own line; `bytes <hex>` writes the
 //! bytes the hex digits spell to stdout as they are, with no line feed added; `lines <n> <text>` prints n lines on
 //! stdout, the i-th `<text><i>` counting from 1;
@@ -81,6 +83,10 @@ fn run(args: &[OsString]) -> Result<i32, String> {
                 let pid = spawn_wait(&operand(&mut steps, "spawn-wait")?)?;
                 writeln!(stdout, "spawned {pid}").map_err(|error| write_failed(&error))?;
             }
+            "spawn-orphan" => {
+                stdout.flush().map_err(|error| write_failed(&error))?;
+                spawn_orphan(&operand(&mut steps, "spawn-orphan")?)?;
+            }
             "exit" => {
                 let text = operand(&mut steps, "exit")?;
                 stdout.flush().map_err(|error| write_failed(&error))?;
@@ -123,6 +129,22 @@ fn spawn_wait(path: &str) -> Result<u32, String> {
         .spawn()
         .map(|helper| helper.id())
         .map_err(|error| format!("cannot start the waiting helper: {error}"))
+}
+
+/// Runs `fake-tool spawn-wait <path>` with this process's handles and waits for it to end, which it does as soon as
+/// its helper is started, so that helper outlives its parent.
+fn spawn_orphan(path: &str) -> Result<(), String> {
+    let me = std::env::current_exe().map_err(|error| format!("cannot find this program: {error}"))?;
+    let status = Command::new(me)
+        .arg("spawn-wait")
+        .arg(path)
+        .status()
+        .map_err(|error| format!("cannot start the orphaning helper: {error}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("the orphaning helper ended with {status}"))
+    }
 }
 
 /// The value of the variable `name`, or the line saying it is not set.

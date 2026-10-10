@@ -1,0 +1,178 @@
+//! `gate stop-tree`: a gate and its command's processes stopped, a process only the gate's job still reaches, a tree
+//! with no gate in it, and a pid no live process has.
+
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use jiff::Timestamp;
+use proc_table::{ProcessTable as _, ProcessTree, Win32ProcessTable};
+use regex::Regex;
+
+use crate::support::{Case, FAKE_TOOL, USAGE, run_words, shown, start, wait_until, wait_until_closed};
+
+/// Writes the go file when dropped, so a helper a failing case leaves behind ends without waiting out its limit. A
+/// case declares it after its [`Case`] and before its running programs, so it lets them go before the folder goes.
+struct LetGo(PathBuf);
+
+impl Drop for LetGo {
+    fn drop(&mut self) {
+        // The folder may already be gone; a helper that cannot see the file still ends at its own limit.
+        let _ = fs::write(&self.0, "");
+    }
+}
+
+/// The pid on the `spawned <pid>` line of `log`, once the log also has `after`.
+fn spawned_pid(log: &Path, after: &str) -> u32 {
+    let mut pid = None;
+    wait_until(&format!("{} naming its spawned helper after {after:?}", log.display()), || {
+        let text = fs::read(log)
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+            .unwrap_or_default();
+        pid = text
+            .lines()
+            .any(|line| line == after)
+            .then(|| text.lines().find_map(|line| line.strip_prefix("spawned ")?.parse().ok()))
+            .flatten();
+        pid.is_some()
+    });
+    pid.expect("checked by the wait")
+}
+
+/// A running process: its pid and its start, so that a later process given the same pid is not taken for it.
+struct Started {
+    pid: u32,
+    at: Timestamp,
+}
+
+/// The running process `pid`, with its start read now.
+fn started(pid: u32) -> Started {
+    let at = gate_win32::process_start_of(pid)
+        .expect("a process the case started can be queried")
+        .expect("the process runs");
+    Started { pid, at }
+}
+
+/// Returns once the process has ended: its pid no longer belongs to a running process with its start.
+fn wait_gone(process: &Started) {
+    wait_until(
+        &format!("process {} ending", process.pid),
+        || !matches!(gate_win32::process_start_of(process.pid), Ok(Some(at)) if at == process.at),
+    );
+}
+
+/// The pids of the running `fake-tool` processes whose parent is `pid`.
+fn fake_tool_children(pid: u32) -> Vec<u32> {
+    ProcessTree::new(Win32ProcessTable.snapshot())
+        .iter()
+        .filter(|process| process.parent_pid == pid && process.name.eq_ignore_ascii_case("fake-tool.exe"))
+        .map(|process| process.pid)
+        .collect()
+}
+
+/// Asserts that `stdout` is the one summary line of stop-tree under `pid`, with `jobs` gate jobs.
+fn assert_summary(stdout: &str, jobs: u32, pid: u32) {
+    let pattern = format!(r"^gate: stopped {jobs} gate job\(s\) and \d+ process\(es\) under {pid}\n$");
+    let summary = Regex::new(&pattern).expect("the summary pattern is valid");
+    assert!(summary.is_match(stdout), "{stdout:?} does not match {pattern}");
+}
+
+#[test]
+fn stop_tree_stops_a_gate_and_its_children() {
+    let case = Case::new("stop_tree_stops_a_gate_and_its_children");
+    let go = case.folder().join("go");
+    let _let_go = LetGo(go.clone());
+    let go = shown(&go);
+    let log = case.folder().join("out.log");
+    let gate = case.start(&run_words("out.log", &[], &[FAKE_TOOL, "out", "ready", "spawn-wait", &go, "wait", &go]));
+    let helper = spawned_pid(&log, "ready");
+    let command = ProcessTree::new(Win32ProcessTable.snapshot())
+        .get(helper)
+        .map(|process| process.parent_pid)
+        .expect("the helper is running under the command");
+    let gate_pid = gate.id();
+    let tree = [started(gate_pid), started(command), started(helper)];
+
+    let outcome = case.run(&["stop-tree", &gate_pid.to_string()]);
+    let stopped = gate.finish();
+
+    assert_eq!((outcome.code, outcome.stderr.as_str()), (Some(0), ""), "{outcome:?}");
+    assert_summary(&outcome.stdout, 1, gate_pid);
+    assert_eq!(stopped.code, Some(124), "the gate ends with the stop status: {stopped:?}");
+    for process in &tree {
+        wait_gone(process);
+    }
+    wait_until_closed(&log);
+}
+
+#[test]
+fn stop_tree_reaches_a_process_only_the_job_holds() {
+    let case = Case::new("stop_tree_reaches_a_process_only_the_job_holds");
+    let go = case.folder().join("go");
+    let _let_go = LetGo(go.clone());
+    let go = shown(&go);
+    let log = case.folder().join("out.log");
+    let gate = case.start(&run_words(
+        "out.log",
+        &[],
+        &[FAKE_TOOL, "spawn-orphan", &go, "out", "orphaned", "wait", &go],
+    ));
+    let orphan = started(spawned_pid(&log, "orphaned"));
+
+    let gate_pid = gate.id();
+    let outcome = case.run(&["stop-tree", &gate_pid.to_string()]);
+    let stopped = gate.finish();
+
+    assert_eq!((outcome.code, outcome.stderr.as_str()), (Some(0), ""), "{outcome:?}");
+    assert_summary(&outcome.stdout, 1, gate_pid);
+    assert_eq!(stopped.code, Some(124), "the gate ends with the stop status: {stopped:?}");
+    wait_gone(&orphan);
+    wait_until_closed(&log);
+}
+
+#[test]
+fn stop_tree_of_a_tree_without_a_gate() {
+    let case = Case::new("stop_tree_of_a_tree_without_a_gate");
+    let go = case.folder().join("go");
+    let _let_go = LetGo(go.clone());
+    let go = shown(&go);
+    let mut command = Command::new(FAKE_TOOL);
+    command.args(["spawn-wait", &go, "err", "up", "wait", &go]);
+    let tree = start(command);
+    tree.wait_for_stderr("up");
+    let root = tree.id();
+    let helpers = fake_tool_children(root);
+    assert_eq!(helpers.len(), 1, "the root runs one helper: {helpers:?}");
+    let started_tree: Vec<Started> = std::iter::once(root).chain(helpers.iter().copied()).map(started).collect();
+
+    let outcome = case.run(&["stop-tree", &root.to_string()]);
+    let ended = tree.finish();
+
+    assert_eq!((outcome.code, outcome.stderr.as_str()), (Some(0), ""), "{outcome:?}");
+    assert_summary(&outcome.stdout, 0, root);
+    assert_eq!(ended.code, Some(124), "the root ends with the stop status: {ended:?}");
+    assert!(
+        ended.stdout.contains(&format!("spawned {}\n", helpers[0])),
+        "the helper found is the one the root started: {ended:?}"
+    );
+    for process in &started_tree {
+        wait_gone(process);
+    }
+}
+
+#[test]
+fn stop_tree_of_a_dead_pid_is_a_usage_error() {
+    let case = Case::new("stop_tree_of_a_dead_pid_is_a_usage_error");
+    let mut command = Command::new(FAKE_TOOL);
+    command.args(["exit", "0"]);
+    // Kept, unwaited, until the case ends: its handle keeps the pid from going to another process meanwhile.
+    let mut exited = start(command);
+    wait_until("the process exiting", || !exited.is_running());
+    let pid = exited.id();
+
+    let outcome = case.run(&["stop-tree", &pid.to_string()]);
+
+    assert_eq!(outcome.code, Some(2), "{outcome:?}");
+    assert_eq!(outcome.stdout, "");
+    assert_eq!(outcome.stderr, format!("gate: stop-tree: no live process has the id {pid}\n{USAGE}"));
+}
