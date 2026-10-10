@@ -1326,3 +1326,81 @@ fn box_run_says_a_snapshot_missing_after_the_fetch() {
     assert!(work.join("untracked.txt").exists(), "the untracked file stands");
     assert!(has_ref(&payload, "refs/gate-back/k"), "the back ref stands");
 }
+
+#[test]
+fn box_run_echoes_a_subfolder_with_control_characters_escaped() {
+    let case = Case::new("box_run_subfolder_escaped");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "out", "ran"]);
+    snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
+    // One subfolder climbs out of the work folder and one is merely missing in the snapshot, so both refusal lines
+    // that show the subfolder are checked; each holds ESC and CR/LF.
+    let subs = [
+        ("..\\escape\u{1b}\r\n", r"..\escape\u{1b}\r\n", "is not a folder inside the work folder"),
+        ("missing\u{1b}\r\n", r"missing\u{1b}\r\n", "does not exist in the snapshot"),
+    ];
+    for (sub, shown, refusal) in subs {
+        payload["Subfolder"] = json!(sub);
+
+        let outcome = run_box(&case, &payload);
+
+        assert_eq!(outcome.code, Some(2), "{sub:?}: {outcome:?}");
+        assert_eq!(outcome.stdout, "", "{sub:?}");
+        assert_eq!(
+            outcome.stderr,
+            format!("gate: remote subfolder {shown} {refusal}\n"),
+            "{sub:?}: the refusal shows the subfolder with its control characters escaped"
+        );
+        assert!(
+            !outcome.stderr.contains(['\u{1b}', '\r']),
+            "{sub:?}: no raw control character of the subfolder reaches the client"
+        );
+    }
+}
+
+#[test]
+fn box_run_echoes_a_command_word_with_control_characters_escaped() {
+    let case = Case::new("box_run_command_word_escaped");
+    let mut payload = box_payload(&case, "k", &[]);
+    snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
+    let work = Path::new(field(&payload, "Work"));
+    // A bare word is looked for on PATH and found nowhere, so the refusal shows only the word; a relative word with a
+    // separator is taken as written and read against the work folder, so the refusal shows the resolved path too. Both
+    // hold ESC and CR/LF.
+    let resolved = work
+        .join("sub")
+        .join("no-such-\u{1b}\r\n.exe")
+        .to_string_lossy()
+        .replace('\u{1b}', r"\u{1b}")
+        .replace('\r', r"\r")
+        .replace('\n', r"\n");
+    let cases = [
+        (
+            "gate-suite-no-such-\u{1b}\r\n-program".to_owned(),
+            r"gate-suite-no-such-\u{1b}\r\n-program".to_owned(),
+            String::new(),
+        ),
+        (
+            "sub\\no-such-\u{1b}\r\n.exe".to_owned(),
+            r"sub\no-such-\u{1b}\r\n.exe".to_owned(),
+            format!(" ({resolved})"),
+        ),
+    ];
+    for (word, shown, shown_resolved) in cases {
+        payload["Command"] = json!([word]);
+
+        let outcome = run_box(&case, &payload);
+
+        assert_eq!(outcome.code, Some(127), "{word:?}: {outcome:?}");
+        assert_eq!(outcome.stdout, "", "{word:?}");
+        let line = outcome.stderr.strip_suffix('\n').expect("the refusal is one line");
+        let prefix = format!("gate: could not start {shown}{shown_resolved}: ");
+        assert!(
+            line.starts_with(&prefix),
+            "{word:?}: the refusal shows the word and the resolved path with their control characters escaped: {line:?}"
+        );
+        assert!(
+            !line.contains(['\u{1b}', '\r']),
+            "{word:?}: no raw control character of the word reaches the client"
+        );
+    }
+}

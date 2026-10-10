@@ -27,7 +27,7 @@ use gate_win32::{Donor, Job, LaunchError, NamedEvent, PipedConsole, PipedLaunch,
 use crate::answer::USAGE_STATUS;
 use crate::boxside::forward::{DRAIN, Forwarders, OutputLock};
 use crate::boxside::heartbeat;
-use crate::boxside::payload::{Payload, ordinal_upper};
+use crate::boxside::payload::{Payload, escaped, ordinal_upper};
 use crate::boxside::preflight::{Failed, GIT_REDIRECTS, Git, exit_code};
 use crate::boxside::stop::{Ending, STOPPED, stop_event_name, terminate_and_wait};
 use crate::console::Console;
@@ -190,7 +190,7 @@ fn in_work_folder(request: &Request<'_>, stop: &NamedEvent, seams: &BoxSeams, co
     let Some(place) = subfolder_path(request.work, request.subfolder) else {
         console.err(&format!(
             "gate: remote subfolder {} is not a folder inside the work folder",
-            request.subfolder
+            escaped(request.subfolder)
         ));
         git.clear_back_ref(request).map_err(|failed| said(console, &failed))?;
         return Err(u32::from(USAGE_STATUS));
@@ -221,7 +221,10 @@ fn in_work_folder(request: &Request<'_>, stop: &NamedEvent, seams: &BoxSeams, co
 fn checked_out(request: &Request<'_>, git: &WorkGit, place: &Path, beat: &Beat<'_>, console: &mut Console) -> Result<u32, u32> {
     git.checkout(request).map_err(|failed| said(console, &failed))?;
     if !place.is_dir() {
-        console.err(&format!("gate: remote subfolder {} does not exist in the snapshot", request.subfolder));
+        console.err(&format!(
+            "gate: remote subfolder {} does not exist in the snapshot",
+            escaped(request.subfolder)
+        ));
         return Err(u32::from(USAGE_STATUS));
     }
     let mut status = command(request, place, beat, console)?;
@@ -726,8 +729,8 @@ fn failed(console: &mut Console, problem: &str) -> u32 {
 fn not_started(console: &mut Console, word: &str, resolved: Option<&Path>, message: &str) -> u32 {
     let resolved = resolved.map(|path| path.to_string_lossy().into_owned());
     match resolved.filter(|resolved| resolved != word) {
-        Some(resolved) => console.err(&format!("gate: could not start {word} ({resolved}): {message}")),
-        None => console.err(&format!("gate: could not start {word}: {message}")),
+        Some(resolved) => console.err(&format!("gate: could not start {} ({}): {message}", escaped(word), escaped(&resolved))),
+        None => console.err(&format!("gate: could not start {}: {message}", escaped(word))),
     }
     NOT_STARTED
 }
