@@ -156,9 +156,15 @@ The lines of a run that starts its command:
 - Routing, on stderr and in the log, with the command running here: `gate: ignored <path>: <reason>; running locally` when `remote.json` is there but unusable (not a file, unreadable or refused), and `gate: not routed: <reason>` when a heavy gate that would route stays local.
 
   The second line is said for `--local` (`gate: not routed: --local`), a word outside the worktree (`gate: not routed: <word> is outside the worktree`), a folder that holds nothing the snapshot sends (`gate: not routed: <sub> holds nothing the snapshot sends`), a word of the command that is not valid Unicode (`gate: not routed: a word of the command is not valid Unicode`), or a fact that could not be read (`gate: not routed: cannot run git: <error>`, or the working directory or git's output). A gate that is not heavy, has a covering parent, matches no pattern or has no `remote.json` says nothing.
-- A routed run, on stderr and in the log, after any `gate: dropped --no-build: the last build may have run on the other machine` and `gate: outputs: none brought back for a --no-build command` lines: `gate: remote <host> client could not start: the bridge to remote.ps1 is not built yet; running here`, then the run goes on here.
+- A routed run, on stderr and in the log, after any `gate: dropped --no-build: the last build may have run on the other machine` and `gate: outputs: none brought back for a --no-build command` lines. While it waits for a remote slot: `gate: waiting for a remote slot on <host> (<n> busy)` and `gate: still waiting for a remote slot on <host> (<s> s)`, as a local wait says them.
+
+  A run the builder does not take says why and goes on here: `gate: remote <host> <reason>; running here`, with `<reason>` one of `full` (no remote slot within 60 s), `busy`, `unreachable`, `parity`, `rebooted`, `tools` or `version`, and `gate: remote <host> client could not start: <detail>; running here` when the remote client cannot start. A gate with no remote client built says the second line with `the bridge to remote.ps1 is not built yet`, before it takes a remote slot.
+
+  A Ctrl+C while waiting for the remote slot says `gate: interrupted while waiting for a remote slot`. One during the client's call, or raised before it, ends the gate with `gate: interrupted before the command started` and no fallback, even when the client refused the run; the remote slot is released.
+
+  A routed run that passed says `gate: passed in <w> s on <host> (wall clock, ceiling <n> s). Full output: <log>`, with no load-adjusted time. The client's status is the gate's own, passed through as `N`.
 - The gate prints no `queued for` or `took ... slot` line, for a local or a routed run: the queue and the take are in the journal, and a wait longer than 30 s says `gate: still waiting for a <kind> slot (<s> s)`.
-- Notes that never fail the gate: `gate: cannot remove <log>.err: <error>`, `gate: cannot append <log>.err to the log: <error>` and `gate: cannot read this gate's priority class, so the command runs below normal: <error>`.
+- Notes that never fail the gate: `gate: cannot remove <log>.err: <error>`, `gate: cannot remove the log <path> of the attempt: <error>` (a routed run that fell back could not delete the log the client wrote), `gate: cannot append <log>.err to the log: <error>` and `gate: cannot read this gate's priority class, so the command runs below normal: <error>`.
 
 ## Slots
 
@@ -353,7 +359,7 @@ The event's own fields:
 | `release` | `slots`, `heldSeconds`, `status` (null when the gate failed before its command had one), `wallSeconds`, `adjustedSeconds`, `verdict` |
 | `abandon` | `waitedSeconds`: the gate ended while still queued (Ctrl+C while waiting for a slot) |
 | `parent`, `covered` | `parentPid` |
-| `fallback` | `reason`, then `remote`, `host`, `key`: it ends the routed attempt, so a remote `take` that falls back gets no `release` |
+| `fallback` | `reason`, then `remote`, `host`, `key`: it ends the routed attempt, so a remote `take` that falls back gets no `release`; a `full` fallback, and a `client` fallback with no client built, follow no remote `take` |
 
 A release with no run facts writes `wallSeconds: null`, `adjustedSeconds: null` and `verdict: "unknown"`.
 
@@ -362,7 +368,8 @@ Fields beyond J1's:
 - any event: `abandoned`, the last field, a list of names present only when there were any ([Abandoned slots](#abandoned-slots); GATE-30). On a `take` it is the slots taken from a gate that died holding them, followed by the journal mutex's name when that came back abandoned; on any other event it is just the journal mutex's name.
 - `take`: a critical gate's `take` carries `counts`, `otherHeld` and `otherClaims` (or `snapshotError`), kept from K5 (GATE-38).
 - `release`: `wallSeconds` (the command's wall time less the seconds paused behind a critical request; a routed run's whole remote wall time), `adjustedSeconds` (load-adjusted seconds, 3 decimals, a number for every run that started; null for a routed run and for a run whose sampler failed) and `verdict`, one of `passed`, `failed`, `log-failure`, `stalled`, `timed-out`, `backstop`, `unknown` (kept, J5). A routed run is a kill only when the gate killed it; a command that exits 124 on its own is `failed`.
-- `fallback`: `reason`, one of `full`, `busy`, `unreachable`, `parity`, `rebooted`, `tools` (T5), `version` ([The box side](#the-box-side)) and `client` (the remote client could not start).
+- `fallback`: `reason`, one of `full` (no remote slot within the 60 s wait), `busy`, `unreachable`, `parity`, `rebooted`, `tools` (T5), `version` ([The box side](#the-box-side)) and `client` (the remote client could not start, or none is built). The `take` after it is the run's local one, untagged, its `waitedSeconds` counted from the `fallback`.
+- a routed run's `take`, `release` and `abandon` carry the tag; its `release` has `adjustedSeconds` null and a `wallSeconds` of the whole remote call.
 
 The verdict comes from the run's end: a kill line matching `^gate: (STALLED|TIMED OUT|BACKSTOP)\b` gives `stalled`, `timed-out` or `backstop`; otherwise a command status of 0 with a non-zero gate status is `log-failure`, a status of 0 is `passed`, anything else `failed`; `unknown` when there are no run facts.
 
@@ -548,7 +555,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
   `gate run` answers those facts in `route.rs`, before it queues and before any command starts. The routing file is `%LOCALAPPDATA%\gate\remote.json` (no file when `LOCALAPPDATA` is unset or empty). The hook rule reads `GIT_INDEX_FILE`: set and non-empty means a git hook, which never routes. The worktree comes from one `git rev-parse` (root, prefix below the root and common git folder), and a folder below the root asks `git ls-files` whether the snapshot would send anything there (tracked or untracked and not ignored, and still on disk). A `subst` drive is followed through `gate_win32::device_target`. A word that is not valid Unicode keeps a command that would route here, saying so.
 
-  The queue line carries `notRouted` `--local` for a heavy `--local` gate and the remote tag for a routed one. Until the remote client lands, every routed decision falls back at once: the `fallback` line has reason `client`, the gate says `gate: remote <host> client could not start: ...; running here`, and the later `take` and `release` carry no remote fields.
+  The queue line carries `notRouted` `--local` for a heavy `--local` gate and the remote tag for a routed one. With no remote client built, every routed decision falls back before it takes a remote slot: the `fallback` line has reason `client`, the gate says `gate: remote <host> client could not start: ...; running here`, and the later `take` and `release` carry no remote fields.
 - **The routing file's text** is JSON with `//` and `/* */` comments and trailing commas allowed outside strings, and a leading byte order mark skipped, as the PowerShell gate's reader allows. Keys match in any letter case, and unknown keys are ignored.
 
   An object holding two keys that differ only in letter case anywhere in the file refuses the whole file, with the PowerShell reader's error text. Single-quoted strings are refused (`Conversion from JSON failed with error: ...`), a recorded deviation: the PowerShell reader accepts them.
@@ -561,8 +568,12 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
   A path runs to the first of `, ; " ' ) | & < >`. In a word that holds one of those or a line break (a script word: a script's text or a list) white space ends a path too; in any other word, one argument, a path runs through its spaces. A drive other than the root's is followed through `subst` mappings.
 - **The work folder** on the builder is named `<repo name>-<key>`, the worktree root's last segment cut to letters, digits, `-` and `_` and 8 hex digits of the SHA-256 of the lower-cased root ([Glossary](GLOSSARY.md), work-folder key).
-- **The routed run's life** is kept (T5): its ticket carries `remote: true`; it waits up to 60 s for a remote slot; it takes one with a claim of its own; it runs remotely; on `full` or a refusal it journals `fallback` while still holding the remote slot, lets the slot go, rewrites its ticket with its first arrival and runs here.
-- **The bridge.** Until the remote port, `gate.exe` runs the remote part through the PowerShell gate's remote client, `remote.ps1`, as a child process speaking its current protocol, and every builder keeps its PowerShell wrapper.
+- **The routed run's life** is kept (T5) and built in `remote.rs` and `run.rs`: its ticket is heavy with `remote: true` and queues apart from the local waiters, which never count it ahead of them, nor it them; it waits up to 60 s for a remote slot (`--test-remote-wait-ms` in a test build); it takes one with a claim of kind `remote` of its own and calls the remote client with the route, the log and the limits (`--stall` as given, the interrupt).
+
+  A client that runs the command to its end hands back its status, which the gate passes through, and the run releases the slot with the remote tag. On `full` (no slot within the wait), a refusal (status 75 with a reason) or a client that cannot start, it journals `fallback` while still holding the remote slot (none was taken on `full`), deletes the claim, lets the slot go, and runs here, taking a heavy slot with its first arrival kept in the ticket.
+
+  The attempt's lines stay in the log once, as notes: the client's own bytes in the log are removed, and the local run writes its log afresh.
+- **The bridge.** Until the remote port, `gate.exe` is to run the remote part through the PowerShell gate's remote client, `remote.ps1`, as a child process speaking its current protocol, and every builder keeps its PowerShell wrapper.
 
   Everything inside the remote attempt (the snapshot, the push, the remote watchdog, heartbeats, sync-back and outputs) stays in `remote.ps1`, and its outputs pass through `gate.exe` untouched. `gate.exe` owns the routing decision, the remote pool, the claim, the ticket, the journal lines and the fallback. The remote port replaces both ends in one drain and deletes the bridge.
 
@@ -699,7 +710,9 @@ A Rust integration suite drives the built `gate.exe` through its CLI and reads o
 
   `--test-diagnostics-fail` (a switch) makes the diagnostics gathering of a kill fail, so the log carries `gate: diagnostics failed: <message>` in place of the block; `--test-print-request` shows it as `testSeams.diagnosticsFail`, after `samplerFail`.
 
-  The same feature will carry `--test-remote-client <path>` (a stub in place of the remote client), with their slices. An installed gate has none of them, and without the feature each is an unknown option.
+  `--test-remote-client <path>` replaces the remote client with a scripted one that runs in the gate's own process: the file's steps, one a line, are `out`, `err`, `record`, `wait`, `interrupt`, `killed`, `status`, `refuse` and `fail-start`. `--test-remote-wait-ms <n>` (whole milliseconds above 0) replaces the 60 s limit of the wait for a remote slot. `--test-print-request` shows them as `testSeams.remoteClient` and `testSeams.remoteWaitMs`.
+
+  An installed gate has none of them, and without the feature each is an unknown option.
 - **Spawn and wait helpers.** The suite's `start` launches the gate and returns a `Running` that can wait for a stderr line, say whether the gate is still running, and finish; dropping a `Running` kills a gate still running. Output readers are joined with a deadline, so a grandchild holding the pipes cannot hang the suite. A run's `Outcome` carries `raw_stdout`, the bytes as the gate wrote them, beside the decoded text.
 - **Holding and killing a gate.** A case holds a run with a real command, `fake-tool wait <go>`, and lets it go by creating `<go>`. A case that kills a gate lets its command go and waits until the command's log is closed (`support::wait_until_closed`), since the job has no kill-on-close. `support::run_words(log, extra, command)` builds the words of a light run.
 - **Ordering, never elapsed time.** A case asserts the order of events in the journal and the log (a waiter's `take` after the holder's `release`, a heartbeat line before the inner gate's take, a kill line before the exit), never a wall-clock bound a busy machine could cross. A case's own deadline only guards against a hang and is generous.

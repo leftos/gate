@@ -10,16 +10,17 @@ use gate_args::RunRequest;
 use gate_state::KernelObject;
 use gate_state::v1::{self, Ticket};
 use gate_win32::{Interrupt, NamedEvent, mutex_exists};
-use jiff::Timestamp;
 
 use crate::console::Console;
 use crate::resolve::ResolvedRoot;
-use crate::slots::{self, Pool, Survey, Taken, ThisGate, epoch_ms};
+use crate::slots::{self, Pool, Survey, Taken, ThisGate};
 
 /// The fallback poll: the longest a waiter sleeps before it reads the counts and the tickets again.
 const POLL: Duration = Duration::from_secs(2);
 /// How often a waiter says it still waits.
 const HEARTBEAT: Duration = Duration::from_secs(30);
+/// How long a routed run waits for a remote slot before it falls back here.
+const REMOTE_LIMIT: Duration = Duration::from_secs(60);
 
 /// A probe of a pool's slots: for each, whether some gate has it open, `None` for a slot that could not be probed.
 type Probe = Vec<Option<bool>>;
@@ -43,6 +44,10 @@ pub(crate) struct Wait<'a> {
     interrupt: Option<Interrupt>,
     /// The interrupt the gate raises itself once it has said it waits (`--test-interrupt-queued`), else `None`.
     interrupt_when_waiting: Option<Interrupt>,
+    /// How long the gate waits before it gives up, `None` for as long as it takes: a remote slot's wait has a limit.
+    limit: Option<Duration>,
+    /// What the wait lines say the gate waits for: `heavy slot`, or `remote slot on <host>`.
+    place: String,
     ticket: PathBuf,
     said_waiting: bool,
     said_ignored: bool,
@@ -57,20 +62,38 @@ pub(crate) struct Host {
     pub interrupt: Option<Interrupt>,
 }
 
-/// The gate that queues and what it asked: which gate it is, its request, and when it queued.
+/// The gate that queues and what it asked: which gate it is, its request, when it queued for this wait, its first
+/// arrival in Unix epoch milliseconds, which its ticket keeps across a fallback, and the builder of a remote wait.
 #[derive(Clone, Copy)]
 pub(crate) struct Arrival<'g> {
     pub gate: &'g ThisGate,
     pub request: &'g RunRequest,
     pub queued: Instant,
+    pub arrived: u64,
+    pub builder: Option<&'g str>,
+}
+
+/// How a wait ended.
+pub(crate) enum Waited {
+    Taken(Taken),
+    /// The console was interrupted.
+    Interrupted,
+    /// The wait's limit passed with no slot taken.
+    TimedOut,
 }
 
 impl<'a> Wait<'a> {
     /// Queues the arriving gate for a slot of `pool`: creates its wake event before it writes its ticket, so no wake
     /// is lost. Each that cannot be made is said, and the gate waits on without it. A raised interrupt of `host` ends
-    /// the wait.
+    /// the wait; so does the limit of a remote pool's wait, `--test-remote-wait-ms` else 60 s.
     pub(crate) fn queue(root: &'a ResolvedRoot, pool: Pool, arrival: Arrival<'_>, host: Host, console: &mut Console) -> Wait<'a> {
-        let Arrival { gate, request, queued } = arrival;
+        let Arrival {
+            gate,
+            request,
+            queued,
+            arrived,
+            builder,
+        } = arrival;
         let name = root.root.object_name(KernelObject::WakeEvent {
             pid: gate.pid,
             start_ms: gate.start_ms,
@@ -80,11 +103,11 @@ impl<'a> Wait<'a> {
             .ok();
         let ticket = Ticket {
             kind: pool.ticket_kind(),
-            arrived: epoch_ms(Timestamp::now()),
+            arrived,
             pid: gate.pid,
             start_ms: gate.start_ms,
             holds: false,
-            remote: None,
+            remote: pool.is_remote().then_some(true),
             expected: None,
         };
         let path = v1::ticket_path(&root.path, gate.pid, gate.start_ms);
@@ -104,6 +127,13 @@ impl<'a> Wait<'a> {
             event,
             interrupt: host.interrupt,
             interrupt_when_waiting: host.interrupt.filter(|_| request.test_seams.interrupt_queued),
+            limit: pool
+                .is_remote()
+                .then(|| request.test_seams.remote_wait_ms.map_or(REMOTE_LIMIT, Duration::from_millis)),
+            place: match builder.filter(|_| pool.is_remote()) {
+                Some(builder) => format!("remote slot on {builder}"),
+                None => format!("{} slot", pool.name()),
+            },
             ticket: path,
             said_waiting: false,
             said_ignored: false,
@@ -112,28 +142,41 @@ impl<'a> Wait<'a> {
     }
 
     /// Passes until the gate takes a slot: each pass reads the counts and the tickets, tries the pool when fewer live
-    /// tickets of the gate's kind are ahead of it than slots are free, and otherwise sleeps on the wake event until the poll or the next
-    /// still-waiting line. `None` once the console is interrupted, which ends the wait at once.
-    pub(crate) fn until_taken(&mut self, survey: &mut Survey, console: &mut Console) -> Option<Taken> {
+    /// tickets of the gate's kind are ahead of it than slots are free, and otherwise sleeps on the wake event until
+    /// the poll or the next still-waiting line. Interrupted once the console is, read again before the limit, which
+    /// ends the wait at once; timed out when a pass fails at or after the wait's limit.
+    pub(crate) fn until_taken(&mut self, survey: &mut Survey, console: &mut Console) -> Waited {
         loop {
             if self.interrupted() {
-                return None;
+                return Waited::Interrupted;
             }
             let count = self.count(console);
             let (may_try, probe) = self.may_try(count, survey, console);
             if may_try && let Some(taken) = slots::try_pool(self.root, self.pool, count, survey, console) {
-                return Some(taken);
+                return Waited::Taken(taken);
             }
             if !self.said_waiting {
                 let probe = probe.unwrap_or_else(|| self.probe(count, survey, console));
                 self.say_waiting(&probe, console);
             }
+            if let Some(ended) = self.pass_ended() {
+                return ended;
+            }
             self.sleep(console);
             if self.interrupted() {
-                return None;
+                return Waited::Interrupted;
             }
             self.say_heartbeat(console);
         }
+    }
+
+    /// Whether this pass ended the wait, and how. The console is read first, so a Ctrl+C raised by this pass's own
+    /// still-waiting line is the interrupt, and never a remote pool read as full at the wait's limit.
+    fn pass_ended(&self) -> Option<Waited> {
+        if self.interrupted() {
+            return Some(Waited::Interrupted);
+        }
+        self.limit.is_some_and(|limit| self.queued.elapsed() >= limit).then_some(Waited::TimedOut)
     }
 
     /// Deletes the gate's ticket, the first step of its take.
@@ -143,10 +186,15 @@ impl<'a> Wait<'a> {
         }
     }
 
-    /// The pool's count from the counts file as it stands, its ignored line said once a wait.
+    /// The pool's count: the remote pool's own size, or a local pool's from the counts file as it stands, its ignored
+    /// line said once a wait.
     fn count(&mut self, console: &mut Console) -> u32 {
+        let kind = match self.pool {
+            Pool::Remote(slots) => return slots,
+            Pool::Local(kind) => kind,
+        };
         let counts = v1::read_counts(&v1::counts_path(&self.root.path), self.processors);
-        let setting = self.pool.setting(&counts);
+        let setting = slots::setting(kind, &counts);
         if let Some(line) = &setting.ignored
             && !self.said_ignored
         {
@@ -178,13 +226,14 @@ impl<'a> Wait<'a> {
         }
         self.said_waiting = true;
         let busy = slots_where(probe, true);
-        console.err(&format!("gate: waiting for a {} slot ({busy} busy)", self.pool.name()));
+        console.err(&format!("gate: waiting for a {} ({busy} busy)", self.place));
         if let Some(interrupt) = self.interrupt_when_waiting {
             interrupt.raise();
         }
     }
 
-    /// How many live tickets of the gate's kind are ahead of it. A ticket whose gate a live claim names is not counted:
+    /// How many live tickets of the gate's kind and pool, local or remote, are ahead of it, so a local and a remote
+    /// waiter never count each other. A ticket whose gate a live claim names is not counted:
     /// that gate holds a slot already, and only failed to delete its ticket. A pass that deleted a dead gate's ticket
     /// wakes the other waiters, since the queue moved.
     fn ahead(&self, survey: &mut Survey, console: &mut Console) -> usize {
@@ -193,9 +242,10 @@ impl<'a> Wait<'a> {
             slots::signal(self.root, live.iter().filter(|ticket| ticket.pid != self.order.1));
         }
         let kind = self.pool.ticket_kind();
+        let remote = self.pool.is_remote();
         let ahead: Vec<&Ticket> = live
             .iter()
-            .filter(|ticket| ticket.kind == kind && ticket.queue_order() < self.order)
+            .filter(|ticket| ticket.kind == kind && (ticket.remote == Some(true)) == remote && ticket.queue_order() < self.order)
             .collect();
         if ahead.is_empty() {
             return 0;
@@ -225,7 +275,11 @@ impl<'a> Wait<'a> {
     /// Sleeps on the wake event until it is set, the console is interrupted, the poll runs out or the next
     /// still-waiting line is due. A wait that fails is said once and slept out instead.
     fn sleep(&mut self, console: &mut Console) {
-        let timeout = self.poll.min(self.next_heartbeat.saturating_sub(self.queued.elapsed()));
+        let elapsed = self.queued.elapsed();
+        let mut timeout = self.poll.min(self.next_heartbeat.saturating_sub(elapsed));
+        if let Some(limit) = self.limit {
+            timeout = timeout.min(limit.saturating_sub(elapsed));
+        }
         let Some(event) = &self.event else {
             thread::sleep(timeout);
             return;
@@ -249,7 +303,7 @@ impl<'a> Wait<'a> {
         if waited < self.next_heartbeat {
             return;
         }
-        console.err(&format!("gate: still waiting for a {} slot ({} s)", self.pool.name(), waited.as_secs()));
+        console.err(&format!("gate: still waiting for a {} ({} s)", self.place, waited.as_secs()));
         while self.next_heartbeat <= waited {
             self.next_heartbeat += self.heartbeat;
         }

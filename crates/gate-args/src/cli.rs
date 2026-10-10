@@ -103,6 +103,8 @@ fn seam_option(name: &str) -> Option<RunOption> {
         "test-interrupt-queued" => Some(RunOption::Switch(SwitchOption::InterruptQueued)),
         "test-sampler-fail" => Some(RunOption::Switch(SwitchOption::SamplerFail)),
         "test-diagnostics-fail" => Some(RunOption::Switch(SwitchOption::DiagnosticsFail)),
+        "test-remote-client" => Some(RunOption::Value(ValueOption::RemoteClient)),
+        "test-remote-wait-ms" => Some(RunOption::Value(ValueOption::RemoteWaitMs)),
         _ => None,
     }
 }

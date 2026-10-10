@@ -10,6 +10,10 @@ pub const DEFAULT_TAIL_LINES: u64 = 20;
 
 /// What the gate was asked to do.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "one invocation is read once a process and moved once; boxing the run request would save nothing"
+)]
 pub enum Invocation {
     /// `gate --version`.
     Version,
@@ -90,6 +94,10 @@ pub struct TestSeams {
     pub sampler_fail: bool,
     /// Make the gathering of a kill's diagnostics fail, so the block is the heading and the failed line.
     pub diagnostics_fail: bool,
+    /// The step file of the scripted remote client a routed run calls in place of the real one.
+    pub remote_client: Option<PathBuf>,
+    /// How long a routed run waits for a remote slot before it falls back with reason `full`.
+    pub remote_wait_ms: Option<u64>,
 }
 
 /// A valid `gate run`.

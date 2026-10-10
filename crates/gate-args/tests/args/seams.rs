@@ -24,6 +24,9 @@ fn seam_flags_parse_with_the_feature() {
             "--test-interrupt-queued",
             "--test-sampler-fail",
             "--test-diagnostics-fail",
+            "--test-remote-client",
+            r"steps\client.txt",
+            "--test-remote-wait-ms=90",
             "--test-print-request",
             "--",
             "cmd",
@@ -41,6 +44,8 @@ fn seam_flags_parse_with_the_feature() {
             interrupt_queued: true,
             sampler_fail: true,
             diagnostics_fail: true,
+            remote_client: Some(std::path::PathBuf::from(r"steps\client.txt")),
+            remote_wait_ms: Some(90),
         }
     );
     assert!(request.print_request);
@@ -91,6 +96,52 @@ fn seam_flags_parse_with_the_feature() {
     assert_eq!(
         problems(&["-Log", "x", "-TimeoutSeconds", "5", "-Slot", "heavy", "--test-poll-ms", "5", "--", "cmd"]),
         ["gate: unknown option --test-poll-ms", "gate: unexpected argument 5"]
+    );
+}
+
+#[cfg(feature = "test-seams")]
+#[test]
+fn remote_seams_need_a_value_once() {
+    assert_eq!(
+        problems(&refs(&with(&RUN, &["--test-remote-client", "--", "cmd"]))),
+        ["gate: --test-remote-client needs a value"]
+    );
+    assert_eq!(
+        problems(&refs(&with(&RUN, &["--test-remote-wait-ms=", "--", "cmd"]))),
+        ["gate: --test-remote-wait-ms needs a value"]
+    );
+    assert_eq!(
+        problems(&refs(&with(&RUN, &["--test-remote-wait-ms", "0", "--", "cmd"]))),
+        ["gate: --test-remote-wait-ms must be a whole number above 0, got '0'"]
+    );
+    assert_eq!(
+        problems(&refs(&with(
+            &RUN,
+            &["--test-remote-client", "a", "--test-remote-client", "b", "--", "cmd"]
+        ))),
+        ["gate: --test-remote-client is given twice"]
+    );
+    assert_eq!(
+        problems(&refs(&with(
+            &RUN,
+            &["--test-remote-wait-ms", "1", "--test-remote-wait-ms", "2", "--", "cmd"]
+        ))),
+        ["gate: --test-remote-wait-ms is given twice"]
+    );
+    assert_eq!(
+        problems(&[
+            "-Log",
+            "x",
+            "-TimeoutSeconds",
+            "5",
+            "-Slot",
+            "heavy",
+            "--test-remote-client",
+            "a",
+            "--",
+            "cmd"
+        ]),
+        ["gate: unknown option --test-remote-client", "gate: unexpected argument a"]
     );
 }
 

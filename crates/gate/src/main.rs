@@ -12,6 +12,7 @@ mod console;
 mod environment;
 mod journal;
 mod log;
+mod remote;
 mod request_json;
 mod resolve;
 mod route;

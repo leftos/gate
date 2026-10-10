@@ -107,6 +107,19 @@ impl Log {
         appended
     }
 
+    /// Removes the log, so a run that goes on from here starts from a log holding nothing: the bytes a remote client
+    /// wrote to it do not stand twice beside the notes that say them again. A log already gone is no failure.
+    ///
+    /// # Errors
+    ///
+    /// The system's error when the log cannot be removed.
+    pub(crate) fn discard(&self) -> io::Result<()> {
+        match fs::remove_file(&self.path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            removed => removed,
+        }
+    }
+
     /// Copies the `.err` file's bytes to the end of the log; whether there was one.
     fn copy_err(&self) -> io::Result<bool> {
         let mut errors = match File::open(&self.err_path) {
@@ -158,6 +171,25 @@ impl Log {
     /// The system's error when the log cannot be read.
     pub(crate) fn tail(&self, count: u64) -> io::Result<Vec<String>> {
         tail_in(&mut File::open(&self.path)?, count, TAIL_CHUNK, TAIL_BYTES)
+    }
+
+    /// The log's last line for which `wanted` holds, read line by line from the start and never whole, only the last
+    /// such line held; `None` when none holds. A line ends at CR LF, LF or a lone CR, so a line written after a
+    /// progress line's lone CR is a line of its own.
+    ///
+    /// # Errors
+    ///
+    /// The system's error when the log cannot be read.
+    pub(crate) fn last_line(&self, wanted: impl Fn(&str) -> bool) -> io::Result<Option<String>> {
+        let mut lines = LineReader::new(BufReader::new(File::open(&self.path)?), SCAN_LINE_BYTES);
+        let mut last = None;
+        while let Some(line) = lines.next_line()? {
+            let text = String::from_utf8_lossy(&line);
+            if wanted(&text) {
+                last = Some(text.into_owned());
+            }
+        }
+        Ok(last)
     }
 }
 

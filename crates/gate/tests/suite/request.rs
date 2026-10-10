@@ -43,9 +43,19 @@ fn print_request_shows_the_new_cli_request() {
             "interruptQueued": false,
             "samplerFail": false,
             "diagnosticsFail": false,
+            "remoteClient": null,
+            "remoteWaitMs": null,
         },
     });
     assert_eq!(outcome.stdout, format!("{expected}\n"), "the keys come in the published order");
+
+    let mut seams = print_run(&["cmd"]);
+    seams.splice(7..7, ["--test-remote-client", r"steps\client.txt", "--test-remote-wait-ms", "5"]);
+    let request = case.run(&seams).request();
+    assert_eq!(
+        (&request["testSeams"]["remoteClient"], &request["testSeams"]["remoteWaitMs"]),
+        (&json!(r"steps\client.txt"), &json!(5))
+    );
 
     let stop = case.run(&["stop-tree", "--test-print-request", "123"]).request();
     assert_eq!(

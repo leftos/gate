@@ -4,6 +4,7 @@
 //! log completed, the failure markers scanned, the tail and the verdict line said, and the slot released.
 
 use std::ffi::OsString;
+use std::fs::OpenOptions;
 use std::os::windows::ffi::OsStrExt;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Component, Path, PathBuf};
@@ -11,9 +12,10 @@ use std::time::{Duration, Instant};
 use std::{fs, io};
 
 use gate_args::{ProgramSearch, RunRequest, Slot, batch_command_line, batch_refusal, command_line, is_batch_target, resolve_program};
-use gate_router::Route;
-use gate_state::{JournalEvent, KernelObject, RemoteTag, RunFacts, StateRoot, Verdict, log_hash};
+use gate_router::{RemoteRun, Route};
+use gate_state::{FallbackReason, JournalEvent, KernelObject, RemoteTag, RunFacts, StateRoot, Verdict, log_hash};
 use gate_win32::{AcquireError, Interrupt, Job, Launch, LaunchError, NamedMutex, OwnedMutexGuard, PriorityClass, Running};
+use jiff::Timestamp;
 
 use crate::acquire;
 use crate::answer::USAGE_STATUS;
@@ -21,10 +23,11 @@ use crate::console::Console;
 use crate::environment::{self, Variables};
 use crate::journal::RunJournal;
 use crate::log::Log;
+use crate::remote::{self, NoClient, RemoteCall, RemoteClient, RemoteOutcome};
 use crate::resolve::{Environment, ResolvedRoot};
 use crate::route;
-use crate::slots::{self, Pool, Survey, Taken, ThisGate};
-use crate::wait::{self, Arrival, Host, Wait};
+use crate::slots::{self, ClaimOf, Pool, Survey, Taken, ThisGate, epoch_ms};
+use crate::wait::{self, Arrival, Host, Wait, Waited};
 use crate::watch::{Start, Watched, Watcher, Watching};
 
 /// The status of a run the gate itself failed.
@@ -36,17 +39,17 @@ const NOT_STARTED: i64 = 127;
 /// The exit code the job's processes are ended with when the gate stops the command.
 const STOPPED: u32 = 124;
 /// `STATUS_CONTROL_C_EXIT`: the status of a process Ctrl+C ended, which the gate exits with when interrupted.
-const CONTROL_C_EXIT: u32 = 0xC000_013A;
+pub(crate) const CONTROL_C_EXIT: u32 = 0xC000_013A;
 /// The Win32 error of a file not found, which a program found nowhere is reported as.
 pub(crate) const ERROR_FILE_NOT_FOUND: u32 = 2;
 /// How long the gate waits for the command to end once it has terminated its job, or once a Ctrl+C came.
 const STOP_WAIT: Duration = Duration::from_secs(5);
-/// Why a routed run's remote client cannot start: none is built yet.
-const NO_CLIENT: &str = "the bridge to remote.ps1 is not built yet";
 
 /// Runs `request`'s command, logging to `log` (absolute) under `root`, routing a heavy one by `environment`'s routing
-/// file and git hook, saying each line as it goes; returns the gate's exit status: the command's own whole 32-bit
-/// code, 1 for a failure marker in its log or a failure of the gate after it started, 124 for a command killed as stalled, timed out or past the backstop, 127 when it could not be started,
+/// file and git hook, saying each line as it goes; returns the gate's exit status.
+///
+/// The status is the command's own whole 32-bit code, 1 for a failure marker in its log or a failure of the gate after
+/// it started, 124 for a command killed as stalled, timed out or past the backstop, 127 when it could not be started,
 /// 0xC000013A for a Ctrl+C in the queue, before the command started, or with the command still running 5 s after it,
 /// or 2 for a log inside the state root or a batch word refused before anything was queued.
 pub(crate) fn run(request: &RunRequest, log: &Path, root: &ResolvedRoot, environment: &Environment, console: &mut Console) -> u32 {
@@ -60,8 +63,13 @@ pub(crate) fn run(request: &RunRequest, log: &Path, root: &ResolvedRoot, environ
     }
     let gate = ThisGate::read(request);
     let log = Log::new(log);
-    let plan = match Plan::prepare(request, root, &gate, &log, console) {
-        Ok(plan) => plan,
+    let at = Where {
+        root,
+        gate: &gate,
+        log: &log,
+    };
+    let (plan, client) = match ready(request, &at, console) {
+        Ok(ready) => ready,
         Err(NotRun { status, line }) => {
             console.err(&line);
             return status;
@@ -98,22 +106,24 @@ pub(crate) fn run(request: &RunRequest, log: &Path, root: &ResolvedRoot, environ
         gate,
         log,
         host,
+        client,
+        tag: None,
+        arrived: epoch_ms(Timestamp::now()),
     };
-    run.queue(environment, console);
-    let mut taken = None;
-    let mut took = Instant::now();
-    let watched = panic::catch_unwind(AssertUnwindSafe(|| {
-        took = run.take(&mut taken, console)?;
-        Some(run.command(plan, console))
-    }));
+    let route = run.queue(environment, console);
+    let mut hold = Hold {
+        taken: None,
+        took: Instant::now(),
+    };
+    let watched = panic::catch_unwind(AssertUnwindSafe(|| run.through(&route, plan, &mut hold, console)));
     let status = match watched {
         Ok(Some(ended)) => {
-            run.release(taken, took, Some(&ended), console);
+            run.release(hold.taken, hold.took, Some(&ended), console);
             exit_status(ended.status)
         }
         Ok(None) => CONTROL_C_EXIT,
         Err(payload) => {
-            run.after_panic(taken, took, console);
+            run.after_panic(hold.taken, hold.took, console);
             panic::resume_unwind(payload);
         }
     };
@@ -121,6 +131,14 @@ pub(crate) fn run(request: &RunRequest, log: &Path, root: &ResolvedRoot, environ
         console.err(&format!("gate: cannot write to {}: {error}", run.log.path().display()));
     }
     status
+}
+
+/// The run's plan and its remote client, or the failure that stops it before its log is taken: the command as given,
+/// and the client a routed run calls, if the gate has one.
+fn ready(request: &RunRequest, at: &Where<'_>, console: &mut Console) -> Result<(Plan, Option<Box<dyn RemoteClient>>), NotRun> {
+    let plan = Plan::prepare(request, &request.command, at, console)?;
+    let client = remote::chosen(request).map_err(NotRun::failed)?;
+    Ok((plan, client))
 }
 
 /// Takes the mutex of the log at `path` under `root` without waiting, so no two gates write one log at once; a mutex a
@@ -200,6 +218,13 @@ impl NotRun {
     }
 }
 
+/// Where a planned command logs, under which state root, and which gate runs it.
+struct Where<'a> {
+    root: &'a ResolvedRoot,
+    gate: &'a ThisGate,
+    log: &'a Log,
+}
+
 /// The command as it will be started, or the start failure found before any call.
 struct Plan {
     /// The command's first word, as given.
@@ -220,18 +245,20 @@ pub(crate) enum Written {
 }
 
 impl Plan {
-    /// Finds the program, writes the command line and builds the environment, in the caller's working folder.
+    /// Finds the program of `words`, writes the command line and builds the environment, in the caller's working
+    /// folder.
     ///
     /// # Errors
     ///
     /// A refused batch word (status 2), or a working folder or environment the gate cannot read or pass on (status 1).
-    fn prepare(request: &RunRequest, root: &ResolvedRoot, gate: &ThisGate, log: &Log, console: &mut Console) -> Result<Plan, NotRun> {
+    fn prepare(request: &RunRequest, words: &[OsString], at: &Where<'_>, console: &mut Console) -> Result<Plan, NotRun> {
+        let Where { root, gate, log } = *at;
         let folder = std::env::current_dir().map_err(|error| NotRun::failed(format!("gate: cannot read the working directory: {error}")))?;
         let variables = Variables::for_command(root, &environment::slot_marker(request.slot.as_str(), gate, &root.root));
         let environment = variables
             .block()
             .map_err(|error| NotRun::failed(format!("gate: cannot build the command's environment: {error}")))?;
-        let Some((first, rest)) = request.command.split_first() else {
+        let Some((first, rest)) = words.split_first() else {
             return Err(NotRun::failed("gate: the run has no command".to_owned()));
         };
         let word = first.to_string_lossy().into_owned();
@@ -340,6 +367,46 @@ struct Run<'a> {
     survey: Survey,
     /// The machine's processors and the console interrupt, read once for the run.
     host: Host,
+    /// The remote client a routed run calls, until it is called; `None` when there is none.
+    client: Option<Box<dyn RemoteClient>>,
+    /// The remote tag of a routed run, which its journal lines and remote claim carry until its fallback.
+    tag: Option<RemoteTag>,
+    /// The run's first arrival in Unix epoch milliseconds, which every ticket it writes keeps.
+    arrived: u64,
+}
+
+/// The slot a run holds, once it has taken one, and when it took it.
+struct Hold {
+    taken: Option<Taken>,
+    took: Instant,
+}
+
+/// How a wait for a slot ended.
+enum Taking {
+    /// The slot was taken at this moment.
+    Took(Instant),
+    /// A Ctrl+C ended the wait.
+    Interrupted,
+    /// The remote pool stayed full past the wait's limit.
+    Full,
+}
+
+/// How a routed run's remote attempt ended.
+enum Remotely {
+    /// The client ran the command to its end.
+    Ended(Ended),
+    /// A Ctrl+C ended the wait for a remote slot.
+    Interrupted,
+    /// The run falls back here, for this reason.
+    Here(FallbackReason),
+}
+
+/// What a passed line says of how long the command ran: here, by the wall clock and load-adjusted, or on a builder,
+/// by the wall clock.
+#[derive(Clone, Copy)]
+enum Pass<'h> {
+    Here(Timing),
+    On(&'h str, Duration),
 }
 
 /// How long a command ran: by the wall clock, and in load-adjusted seconds, `None` once the sampler failed and they are
@@ -365,10 +432,10 @@ struct Ended {
 
 impl Run<'_> {
     /// Decides where the command runs, then journals the queue: with `notRouted` for a heavy gate its caller kept here
-    /// with `--local`, with the remote tag for a routed one, which then tries the builder.
-    fn queue(&mut self, environment: &Environment, console: &mut Console) {
+    /// with `--local`, with the remote tag for a routed one. The route.
+    fn queue(&mut self, environment: &Environment, console: &mut Console) -> Route {
         let route = route::route(self.request, environment, console);
-        let tag = match &route {
+        self.tag = match &route {
             Route::Routed(remote) => Some(RemoteTag {
                 host: remote.host.clone(),
                 key: remote.key.clone(),
@@ -379,44 +446,204 @@ impl Run<'_> {
             log: self.log.path().to_string_lossy().into_owned(),
             not_routed: route::not_routed(&route),
         };
-        self.journal.write(&queue, tag.as_ref(), console);
-        if let Some(tag) = &tag {
-            self.try_remote(tag, console);
+        self.journal.write(&queue, self.tag.as_ref(), console);
+        route
+    }
+
+    /// Runs the command where `route` sends it: on the builder, and here after a fallback; or here. The slot it takes
+    /// goes into `hold`. How the run ended; `None` when a Ctrl+C ended a wait for a slot.
+    fn through(&mut self, route: &Route, plan: Plan, hold: &mut Hold, console: &mut Console) -> Option<Ended> {
+        let plan = match route {
+            Route::Local { .. } => plan,
+            Route::Routed(remote) => match self.routed(remote, hold, console) {
+                Remotely::Ended(ended) => return Some(ended),
+                Remotely::Interrupted => return None,
+                Remotely::Here(reason) => match self.plan_here(remote, reason, plan, console) {
+                    Ok(plan) => plan,
+                    Err(ended) => return Some(ended),
+                },
+            },
+        };
+        match self.take(Pool::of(self.request.slot), &mut hold.taken, console) {
+            Taking::Took(took) => {
+                hold.took = took;
+                Some(self.command(plan, console))
+            }
+            Taking::Interrupted => None,
+            // Only a remote pool has a wait limit, so a local take never times out.
+            Taking::Full => unreachable!("a local pool is never full past a limit"),
         }
     }
 
-    /// Tries the routed run on the builder. No remote client is built yet, so it cannot start: the run journals its
-    /// fallback, the last line with the remote tag, says so, and goes on as a heavy run here with the command as given.
-    fn try_remote(&mut self, tag: &RemoteTag, console: &mut Console) {
-        let fallback = JournalEvent::Fallback { reason: "client".to_owned() };
-        self.journal.write(&fallback, Some(tag), console);
-        console.err(&format!("gate: remote {} client could not start: {NO_CLIENT}; running here", tag.host));
+    /// Runs the routed command on the builder: takes a remote slot into `hold`, calls the client and ends the run as
+    /// the client ended it. A full remote pool, a refusal or a client that cannot start falls back here; with no client
+    /// at all the run falls back before it takes a remote slot. A Ctrl+C ends the run here, with the remote slot
+    /// released: one raised before the call, or during it over a refusal. A client that ended on its own keeps its
+    /// own status.
+    fn routed(&mut self, remote: &RemoteRun, hold: &mut Hold, console: &mut Console) -> Remotely {
+        let Some(mut client) = self.client.take() else {
+            let outcome = NoClient.run(&self.call(remote));
+            return self.fell_back(FallbackReason::Client, &outcome, None, console);
+        };
+        match self.take(Some(Pool::Remote(remote.slots)), &mut hold.taken, console) {
+            Taking::Took(took) => hold.took = took,
+            Taking::Interrupted => return Remotely::Interrupted,
+            Taking::Full => return self.fell_back(FallbackReason::Full, &RemoteOutcome::default(), None, console),
+        }
+        // A Ctrl+C that came once the remote slot was held, before the client was called, ends the run as an
+        // interrupt before a command starts does here; the caller releases the slot with the run's tag.
+        if self.host.interrupt.is_some_and(Interrupt::is_raised) {
+            return Remotely::Ended(self.interrupted_before_start(console));
+        }
+        let started = Instant::now();
+        let outcome = client.run(&self.call(remote));
+        let fallback = outcome.fallback();
+        // A Ctrl+C during the call wins over a refusal: the command never runs here.
+        if fallback.is_some() && self.host.interrupt.is_some_and(Interrupt::is_raised) {
+            return Remotely::Ended(self.interrupted_before_start(console));
+        }
+        match fallback {
+            Some(reason) => self.fell_back(reason, &outcome, hold.taken.take(), console),
+            None => Remotely::Ended(self.remote_ended(&remote.host, &outcome, started, console)),
+        }
     }
 
-    /// Waits its turn for a slot of the run's pool and takes it into `held` the moment it has it, then journals the
-    /// take and writes the claim; a critical run takes no pool slot. When the slot was taken; `None` when a Ctrl+C
-    /// ended the wait, which deletes the ticket at once, wakes the waiters and journals the abandon.
-    fn take(&mut self, held: &mut Option<Taken>, console: &mut Console) -> Option<Instant> {
+    /// The client's call for `remote`, with the run's log, limits and interrupt.
+    fn call<'r>(&'r self, remote: &'r RemoteRun) -> RemoteCall<'r> {
+        RemoteCall {
+            host: &remote.host,
+            key: &remote.key,
+            root: &remote.root,
+            repo: &remote.repo,
+            subfolder: &remote.subfolder,
+            words: &remote.words,
+            outputs: &remote.outputs,
+            log: self.log.path(),
+            timeout: self.request.timeout,
+            stall: self.request.stall,
+            tail: self.request.tail,
+            no_markers: self.request.no_markers,
+            interrupt: self.host.interrupt,
+        }
+    }
+
+    /// Gives up the remote attempt for `reason`: journals the fallback, the run's last line with the remote tag, while
+    /// the remote slot `held` is still held, then deletes its claim, lets it go and wakes the waiters, removes the log
+    /// so the client's own bytes do not stand beside the notes that say them, gathers the attempt's lines into the
+    /// log's notes unsaid, and says the run goes on here.
+    fn fell_back(&mut self, reason: FallbackReason, outcome: &RemoteOutcome, held: Option<Taken>, console: &mut Console) -> Remotely {
+        let tag = self.tag.take();
+        self.journal.write(&JournalEvent::Fallback { reason }, tag.as_ref(), console);
+        if let Some(taken) = held {
+            slots::delete_claim(&taken.held, console);
+            drop(taken);
+            slots::wake_waiters(self.root, &mut self.survey, console);
+        }
+        // A run here starts from a log holding none of what the client wrote: the notes below say its lines again.
+        if let Err(error) = self.log.discard() {
+            console.err(&format!(
+                "gate: cannot remove the log {} of the attempt: {error}",
+                self.log.path().display()
+            ));
+        }
+        for line in &outcome.lines {
+            console.note(line);
+        }
+        let host = tag.map_or_else(String::new, |tag| tag.host);
+        console.err(&fallback_line(&host, reason, outcome.detail.as_deref()));
+        Remotely::Here(reason)
+    }
+
+    /// The plan of the run here after a fallback for `reason`: the first plan, the command as given, unless the builder
+    /// rebooted after it ran the command, when it is the command with a dotnet `--no-build` dropped. Else how the run
+    /// ended when that command cannot be planned.
+    fn plan_here(&self, remote: &RemoteRun, reason: FallbackReason, plan: Plan, console: &mut Console) -> Result<Plan, Ended> {
+        if reason != FallbackReason::Rebooted {
+            return Ok(plan);
+        }
+        let words: Vec<OsString> = remote.ran_fallback.iter().map(OsString::from).collect();
+        let at = Where {
+            root: self.root,
+            gate: &self.gate,
+            log: &self.log,
+        };
+        Plan::prepare(self.request, &words, &at, console).map_err(|NotRun { status, line }| {
+            console.err(&line);
+            Ended {
+                status: i64::from(status),
+                facts: None,
+            }
+        })
+    }
+
+    /// Ends a run the client ran to its end: the verdict with the passed line on `host`, its markers not scanned when
+    /// the client killed the run or the console was interrupted, and the facts its release carries, with no adjusted
+    /// seconds. It is a kill only when the client killed it, by the kill line in the log.
+    fn remote_ended(&mut self, host: &str, outcome: &RemoteOutcome, started: Instant, console: &mut Console) -> Ended {
+        let interrupted = self.host.interrupt.is_some_and(Interrupt::is_raised);
+        let wall = started.elapsed();
+        // A client that wrote nothing left no log; the verdict reads one.
+        if let Err(error) = OpenOptions::new().append(true).create(true).open(self.log.path()) {
+            let problem = format!("cannot create the log {}: {error}", self.log.path().display());
+            return self.gate_failed(&problem, None, console);
+        }
+        match self.verdict(outcome.status, Some(Pass::On(host, wall)), outcome.killed || interrupted, &[], console) {
+            Ok(status) => {
+                let kill = if outcome.killed { self.kill_line(console) } else { None };
+                Ended {
+                    status,
+                    facts: Some(RunFacts {
+                        wall_seconds: wall.as_secs_f64(),
+                        adjusted_seconds: None,
+                        verdict: Verdict::of(kill.as_deref(), outcome.status, status),
+                    }),
+                }
+            }
+            Err(problem) => self.gate_failed(&problem, None, console),
+        }
+    }
+
+    /// The log's last kill line, as the client's watchdog wrote it; `None` when it holds none, or, said, when it cannot
+    /// be read.
+    fn kill_line(&self, console: &mut Console) -> Option<String> {
+        let is_kill = |line: &str| Verdict::of(Some(line), 0, 0) != Verdict::Passed;
+        self.log
+            .last_line(is_kill)
+            .inspect_err(|error| console.err(&format!("gate: cannot read the log {}: {error}", self.log.path().display())))
+            .ok()
+            .flatten()
+    }
+
+    /// Waits its turn for a slot of `pool` and takes it into `held` the moment it has it, then journals the take, with
+    /// the remote tag while the run has one, and writes the claim; a run with no pool, a critical one, takes no slot.
+    /// When the slot was taken; else a Ctrl+C ended the wait, which deletes the ticket at once, wakes the waiters and
+    /// journals the abandon, or a remote pool stayed full past the wait's limit, which deletes the ticket.
+    fn take(&mut self, pool: Option<Pool>, held: &mut Option<Taken>, console: &mut Console) -> Taking {
         let queued = Instant::now();
-        let Some(pool) = Pool::of(self.request.slot) else {
+        let Some(pool) = pool else {
             self.journal.write(&take_event(Vec::new(), 0.0, Vec::new()), None, console);
-            return Some(Instant::now());
+            return Taking::Took(Instant::now());
         };
         let arrival = Arrival {
             gate: &self.gate,
             request: self.request,
             queued,
+            arrived: self.arrived,
+            builder: self.tag.as_ref().map(|tag| tag.host.as_str()),
         };
         let mut wait = Wait::queue(self.root, pool, arrival, self.host, console);
-        let Some(taken) = wait.until_taken(&mut self.survey, console) else {
-            wait.end(console);
-            slots::wake_waiters(self.root, &mut self.survey, console);
-            console.err(&format!("gate: interrupted while waiting for a {} slot", pool.name()));
-            let waited_seconds = queued.elapsed().as_secs_f64();
-            self.journal.write(&JournalEvent::Abandon { waited_seconds }, None, console);
-            return None;
+        let taken = match wait.until_taken(&mut self.survey, console) {
+            Waited::Taken(taken) => held.insert(taken),
+            Waited::Interrupted => {
+                self.abandon(wait, pool, queued, console);
+                return Taking::Interrupted;
+            }
+            Waited::TimedOut => {
+                wait.end(console);
+                slots::wake_waiters(self.root, &mut self.survey, console);
+                return Taking::Full;
+            }
         };
-        let taken = held.insert(taken);
         let waited = queued.elapsed().as_secs_f64();
         let name = taken.held.name().to_owned();
         let mut abandoned = Vec::new();
@@ -426,10 +653,26 @@ impl Run<'_> {
         }
         wait.end(console);
         let took = Instant::now();
-        self.journal.write(&take_event(vec![name], waited, abandoned), None, console);
-        slots::write_claim(&taken.held, pool, &self.gate, self.request, self.log.path(), console);
+        self.journal.write(&take_event(vec![name], waited, abandoned), self.tag.as_ref(), console);
+        let of = ClaimOf {
+            gate: &self.gate,
+            request: self.request,
+            log: self.log.path(),
+            remote: self.tag.as_ref(),
+        };
+        slots::write_claim(&taken.held, pool, &of, console);
         slots::wake_waiters(self.root, &mut self.survey, console);
-        Some(took)
+        Taking::Took(took)
+    }
+
+    /// Leaves the queue of `pool` after a Ctrl+C: deletes the ticket, wakes the waiters, says so and journals the
+    /// abandon, with the remote tag while the run has one.
+    fn abandon(&mut self, wait: Wait<'_>, pool: Pool, queued: Instant, console: &mut Console) {
+        wait.end(console);
+        slots::wake_waiters(self.root, &mut self.survey, console);
+        console.err(&format!("gate: interrupted while waiting for a {} slot", pool.name()));
+        let waited_seconds = queued.elapsed().as_secs_f64();
+        self.journal.write(&JournalEvent::Abandon { waited_seconds }, self.tag.as_ref(), console);
     }
 
     /// After a panic from the moment the slot was taken: completes the log as far as it can, the `.err` file and the
@@ -462,7 +705,7 @@ impl Run<'_> {
             status: ended.map(|ended| ended.status),
             facts: ended.and_then(|ended| ended.facts),
         };
-        self.journal.write(&release, None, console);
+        self.journal.write(&release, self.tag.as_ref(), console);
         if let Some(taken) = taken {
             drop(taken);
             slots::wake_waiters(self.root, &mut self.survey, console);
@@ -582,7 +825,7 @@ impl Run<'_> {
     /// Reaches the verdict of `outcome`, its markers not scanned when `unscanned`, and the facts its release carries.
     /// `diagnostics` is the block a kill wrote to the log, whose lines the verdict's tail leaves out.
     fn ended(&mut self, outcome: &Outcome<'_>, unscanned: bool, diagnostics: &[String], started: (&Job, &Running), console: &mut Console) -> Ended {
-        match self.verdict(outcome.exited, Some(outcome.timing), unscanned, diagnostics, console) {
+        match self.verdict(outcome.exited, Some(Pass::Here(outcome.timing)), unscanned, diagnostics, console) {
             Ok(status) => Ended {
                 status,
                 facts: Some(RunFacts {
@@ -609,13 +852,13 @@ impl Run<'_> {
     }
 
     /// Completes the log with the notes so far, and says the marker lines of a failure, the log's tail and the verdict
-    /// line; the gate's status. `exited` is the command's status, and `timing` how long it ran, `None` when it never
-    /// started; a run the gate ended itself is `unscanned`, its markers not read. `diagnostics` is the block a kill
-    /// wrote to the log: the log keeps it, and the tail leaves exactly its lines out.
+    /// line; the gate's status. `exited` is the command's status, and `pass` how long it ran for the passed line, `None`
+    /// when it never started; a run the gate ended itself is `unscanned`, its markers not read. `diagnostics` is the
+    /// block a kill wrote to the log: the log keeps it, and the tail leaves exactly its lines out.
     fn verdict(
         &mut self,
         exited: i64,
-        timing: Option<Timing>,
+        pass: Option<Pass<'_>>,
         unscanned: bool,
         diagnostics: &[String],
         console: &mut Console,
@@ -640,19 +883,30 @@ impl Run<'_> {
         for line in &tail {
             console.out(line);
         }
-        match timing {
-            Some(timing) if status == 0 => console.note_out(&format!(
-                "gate: passed in {} s (load-adjusted {}, ceiling {} s). Full output: {shown}",
+        match pass {
+            Some(pass) if status == 0 => console.note_out(&self.passed_line(pass, &shown)),
+            _ => console.err(&format!("gate: FAILED (status {status}). Full output: {shown}")),
+        }
+        Ok(status)
+    }
+
+    /// The passed line of a run that ran as `pass` says, its log shown as `shown`.
+    fn passed_line(&self, pass: Pass<'_>, shown: &str) -> String {
+        let ceiling = self.request.timeout;
+        match pass {
+            Pass::Here(timing) => format!(
+                "gate: passed in {} s (load-adjusted {}, ceiling {ceiling} s). Full output: {shown}",
                 whole_seconds(timing.wall.as_secs_f64()),
                 timing.adjusted.map_or_else(
                     || "unknown: the sampler failed".to_owned(),
                     |adjusted| format!("{} s", whole_seconds(adjusted))
                 ),
-                self.request.timeout
-            )),
-            _ => console.err(&format!("gate: FAILED (status {status}). Full output: {shown}")),
+            ),
+            Pass::On(host, wall) => format!(
+                "gate: passed in {} s on {host} (wall clock, ceiling {ceiling} s). Full output: {shown}",
+                whole_seconds(wall.as_secs_f64())
+            ),
         }
-        Ok(status)
     }
 
     /// The log's first marker lines, none when the run turned the scan off or is `unscanned`, and its tail: the last
@@ -787,6 +1041,18 @@ fn last_run(lines: &[String], block: &[String]) -> Option<usize> {
 /// `seconds` in whole seconds, rounded half to even as the PowerShell gate's `[math]::Round` rounds.
 fn whole_seconds(seconds: f64) -> f64 {
     seconds.round_ties_even()
+}
+
+/// The line a routed run says as it falls back here for `reason` from the builder `host`; a client that could not
+/// start says why, `detail`.
+fn fallback_line(host: &str, reason: FallbackReason, detail: Option<&str>) -> String {
+    match reason {
+        FallbackReason::Client => format!(
+            "gate: remote {host} client could not start: {}; running here",
+            detail.unwrap_or("no reason given")
+        ),
+        _ => format!("gate: remote {host} {}; running here", reason.as_str()),
+    }
 }
 
 /// A line holding a failure marker: its number, counted from 1, and its text as printed.

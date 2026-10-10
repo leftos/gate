@@ -27,6 +27,10 @@ pub(crate) enum ValueOption {
     StallMs,
     #[cfg(feature = "test-seams")]
     InterruptAfterSamples,
+    #[cfg(feature = "test-seams")]
+    RemoteClient,
+    #[cfg(feature = "test-seams")]
+    RemoteWaitMs,
 }
 
 /// An option that is on or off.
@@ -133,6 +137,10 @@ impl RunBuilder {
             ValueOption::StallMs => self.test_seams.stall_ms = Some(values::above_zero(spelled, value)?),
             #[cfg(feature = "test-seams")]
             ValueOption::InterruptAfterSamples => self.test_seams.interrupt_after_samples = Some(values::above_zero(spelled, value)?),
+            #[cfg(feature = "test-seams")]
+            ValueOption::RemoteClient => self.test_seams.remote_client = Some(PathBuf::from(value)),
+            #[cfg(feature = "test-seams")]
+            ValueOption::RemoteWaitMs => self.test_seams.remote_wait_ms = Some(values::above_zero(spelled, value)?),
         }
         Ok(())
     }

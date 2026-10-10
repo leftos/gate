@@ -113,9 +113,48 @@ pub enum JournalEvent {
     },
     /// The gate gave up its remote attempt and runs the command on this machine.
     Fallback {
-        /// Why, such as `full`, `busy` or `unreachable`.
-        reason: String,
+        /// Why.
+        reason: FallbackReason,
     },
+}
+
+/// Why a routed run gave up its remote attempt: the remote pool stayed full, the builder refused the run, or the
+/// remote client could not start.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum FallbackReason {
+    /// No remote slot came free within the wait's limit.
+    Full,
+    /// The builder was busy.
+    Busy,
+    /// The builder could not be reached.
+    Unreachable,
+    /// The builder's snapshot did not match the caller's tree.
+    Parity,
+    /// The builder rebooted during the run.
+    Rebooted,
+    /// The builder lacks a tool the command needs.
+    Tools,
+    /// The builder's gate is of another version.
+    Version,
+    /// The remote client could not start.
+    Client,
+}
+
+impl FallbackReason {
+    /// The word the journal's `fallback` line and the fallback line give.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FallbackReason::Full => "full",
+            FallbackReason::Busy => "busy",
+            FallbackReason::Unreachable => "unreachable",
+            FallbackReason::Parity => "parity",
+            FallbackReason::Rebooted => "rebooted",
+            FallbackReason::Tools => "tools",
+            FallbackReason::Version => "version",
+            FallbackReason::Client => "client",
+        }
+    }
 }
 
 /// The remote fields of a routed run's lines up to its fallback: `remote: true`, `host` and `key`.

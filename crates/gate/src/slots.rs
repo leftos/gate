@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use gate_args::{RunRequest, Slot};
 use gate_state::v1::{self, Claim, ClaimKind, Counts, FormatError, PoolSetting, Ticket, TicketKind};
-use gate_state::{JournalIdentity, KernelObject, SlotKind};
+use gate_state::{JournalIdentity, KernelObject, RemoteTag, SlotKind};
 use gate_win32::{NamedEvent, OwnedMutexGuard};
 use jiff::Timestamp;
 
@@ -18,59 +18,77 @@ use crate::acquire;
 use crate::console::Console;
 use crate::resolve::ResolvedRoot;
 
-/// The pool of slots a gate of one kind takes from.
+/// The pool of slots a gate takes from: this machine's pool of one kind, or the builder's remote pool.
 #[derive(Clone, Copy)]
-pub(crate) struct Pool(SlotKind);
+pub(crate) enum Pool {
+    Local(SlotKind),
+    /// The remote pool, of this many slots, whose waiters' tickets are heavy and marked remote.
+    Remote(u32),
+}
 
 impl Pool {
     /// The pool a gate of `slot` takes from; `None` for a critical gate, which has no pool of its own.
     pub(crate) fn of(slot: Slot) -> Option<Pool> {
         match slot {
-            Slot::Heavy => Some(Pool(SlotKind::Heavy)),
-            Slot::Light => Some(Pool(SlotKind::Light)),
+            Slot::Heavy => Some(Pool::Local(SlotKind::Heavy)),
+            Slot::Light => Some(Pool::Local(SlotKind::Light)),
             Slot::Critical => None,
         }
     }
 
     /// The kernel object of the pool's slot `index`.
     pub(crate) fn object(self, index: u32) -> KernelObject {
-        match self.0 {
-            SlotKind::Heavy => KernelObject::HeavySlot(index),
-            SlotKind::Light => KernelObject::LightSlot(index),
+        match self {
+            Pool::Local(SlotKind::Heavy) => KernelObject::HeavySlot(index),
+            Pool::Local(SlotKind::Light) => KernelObject::LightSlot(index),
+            Pool::Remote(_) => KernelObject::RemoteSlot(index),
         }
     }
 
     /// The kind the tickets of the pool's waiters carry.
     pub(crate) fn ticket_kind(self) -> TicketKind {
-        match self.0 {
-            SlotKind::Heavy => TicketKind::Heavy,
-            SlotKind::Light => TicketKind::Light,
+        match self {
+            Pool::Local(SlotKind::Heavy) | Pool::Remote(_) => TicketKind::Heavy,
+            Pool::Local(SlotKind::Light) => TicketKind::Light,
         }
+    }
+
+    /// Whether the pool is the remote one.
+    pub(crate) fn is_remote(self) -> bool {
+        matches!(self, Pool::Remote(_))
     }
 
     fn claim_kind(self) -> ClaimKind {
-        match self.0 {
-            SlotKind::Heavy => ClaimKind::Heavy,
-            SlotKind::Light => ClaimKind::Light,
-        }
-    }
-
-    /// The pool's own setting in `counts`.
-    pub(crate) fn setting(self, counts: &Counts) -> &PoolSetting {
-        match self.0 {
-            SlotKind::Heavy => &counts.heavy,
-            SlotKind::Light => &counts.light,
+        match self {
+            Pool::Local(SlotKind::Heavy) => ClaimKind::Heavy,
+            Pool::Local(SlotKind::Light) => ClaimKind::Light,
+            Pool::Remote(_) => ClaimKind::Remote,
         }
     }
 
     /// The pool's kind as the wait lines name it.
     pub(crate) fn name(self) -> &'static str {
-        self.0.as_str()
+        match self {
+            Pool::Local(kind) => kind.as_str(),
+            Pool::Remote(_) => "remote",
+        }
     }
 
-    /// The threads one gate of the pool is taken to keep busy.
+    /// The threads one gate of the pool is taken to keep busy here; read of a local pool, where a light command is
+    /// measured against them.
     pub(crate) fn threads(self) -> usize {
-        self.0.threads()
+        match self {
+            Pool::Local(kind) => kind.threads(),
+            Pool::Remote(_) => unreachable!("nothing reads the threads of the remote pool"),
+        }
+    }
+}
+
+/// The setting of the local pool of `kind` in `counts`.
+pub(crate) fn setting(kind: SlotKind, counts: &Counts) -> &PoolSetting {
+    match kind {
+        SlotKind::Heavy => &counts.heavy,
+        SlotKind::Light => &counts.light,
     }
 }
 
@@ -287,18 +305,27 @@ pub(crate) fn try_pool(root: &ResolvedRoot, pool: Pool, count: u32, survey: &mut
     None
 }
 
+/// Whose claim a slot holds: the gate, its request and log, and the remote tag of a routed run's remote slot.
+pub(crate) struct ClaimOf<'a> {
+    pub gate: &'a ThisGate,
+    pub request: &'a RunRequest,
+    pub log: &'a Path,
+    pub remote: Option<&'a RemoteTag>,
+}
+
 /// Writes this gate's claim on `held`, saying so when it cannot be written; the run goes on either way.
-pub(crate) fn write_claim(held: &Held, pool: Pool, gate: &ThisGate, request: &RunRequest, log: &Path, console: &mut Console) {
+pub(crate) fn write_claim(held: &Held, pool: Pool, of: &ClaimOf<'_>, console: &mut Console) {
     let Some(path) = &held.claim else {
         return;
     };
-    let written = claim(held, pool, gate, request, log).and_then(|claim| v1::write_claim(path, &claim));
+    let written = claim(held, pool, of).and_then(|claim| v1::write_claim(path, &claim));
     if let Err(error) = written {
         console.err(&format!("gate: cannot write the claim {}: {error}", path.display()));
     }
 }
 
-fn claim(held: &Held, pool: Pool, gate: &ThisGate, request: &RunRequest, log: &Path) -> io::Result<Claim> {
+fn claim(held: &Held, pool: Pool, of: &ClaimOf<'_>) -> io::Result<Claim> {
+    let ClaimOf { gate, request, log, remote } = *of;
     Ok(Claim {
         kind: pool.claim_kind(),
         index: held.index,
@@ -309,9 +336,9 @@ fn claim(held: &Held, pool: Pool, gate: &ThisGate, request: &RunRequest, log: &P
         command: gate.command.clone(),
         log: log.to_string_lossy().into_owned(),
         timeout_seconds: seconds(request.timeout),
-        remote: None,
-        host: None,
-        key: None,
+        remote: remote.map(|_| true),
+        host: remote.map(|tag| tag.host.clone()),
+        key: remote.map(|tag| tag.key.clone()),
         expected: None,
     })
 }

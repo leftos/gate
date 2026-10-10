@@ -10,8 +10,8 @@ use std::time::Duration;
 
 use flate2::read::GzDecoder;
 use gate_state::{
-    Held, JOURNAL_CAP_BYTES, JournalEvent, JournalIdentity, JournalLock, JournalNote, LockError, RemoteTag, RunFacts, Verdict, append_line,
-    journal_line,
+    FallbackReason, Held, JOURNAL_CAP_BYTES, JournalEvent, JournalIdentity, JournalLock, JournalNote, LockError, RemoteTag, RunFacts, Verdict,
+    append_line, journal_line,
 };
 use serde_json::{Value, json};
 
@@ -306,7 +306,9 @@ fn a_routed_abandon_line_puts_the_remote_fields_after_waited_seconds() {
 
 #[test]
 fn a_fallback_line_is_the_one_the_fixture_holds() {
-    let fallback = JournalEvent::Fallback { reason: "full".to_owned() };
+    let fallback = JournalEvent::Fallback {
+        reason: FallbackReason::Full,
+    };
     let line = journal_line(&identity(), ts(NOW), &fallback, Some(&tag()), None);
 
     assert_eq!(parsed(&line)["event"], "fallback");
@@ -314,6 +316,24 @@ fn a_fallback_line_is_the_one_the_fixture_holds() {
     assert_eq!(own_fields(&line), own_fields(remote_fixture(4)));
     let under_abandoned_lock = journal_line(&identity(), ts(NOW), &fallback, Some(&tag()), Some(LOCK_NAME));
     assert_eq!(own_keys(&under_abandoned_lock), ["reason", "remote", "host", "key", "abandoned"]);
+}
+
+#[test]
+fn a_fallback_line_names_each_reason_by_its_word() {
+    let reasons = [
+        (FallbackReason::Full, "full"),
+        (FallbackReason::Busy, "busy"),
+        (FallbackReason::Unreachable, "unreachable"),
+        (FallbackReason::Parity, "parity"),
+        (FallbackReason::Rebooted, "rebooted"),
+        (FallbackReason::Tools, "tools"),
+        (FallbackReason::Version, "version"),
+        (FallbackReason::Client, "client"),
+    ];
+    for (reason, word) in reasons {
+        let line = journal_line(&identity(), ts(NOW), &JournalEvent::Fallback { reason }, Some(&tag()), None);
+        assert_eq!(parsed(&line)["reason"], word, "{line}");
+    }
 }
 
 #[test]
@@ -330,7 +350,9 @@ fn a_line_without_a_remote_tag_has_no_remote_field() {
         },
         release(None),
         JournalEvent::Abandon { waited_seconds: 1.7 },
-        JournalEvent::Fallback { reason: "busy".to_owned() },
+        JournalEvent::Fallback {
+            reason: FallbackReason::Busy,
+        },
     ];
     for event in &events {
         let line = journal_line(&identity(), ts(NOW), event, None, None);

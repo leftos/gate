@@ -55,7 +55,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Pure crate**: a crate with no Windows types in its API that builds and unit-tests on Linux as well (`gate-state`, `gate-watchdog`, `gate-args`, `gate-router`).
 - **Refusal**: a builder's or the remote client's answer that a routed run cannot run there, with a reason (`busy`, `unreachable`, `parity`, `rebooted`, `tools`, `version`, `client`); the gate then falls back to a local run.
 - **Release**: see take.
-- **Remote client**: what `gate run` calls to run a routed command on a builder: today the `remote.ps1` bridge.
+- **Remote client**: what `gate run` calls to run a routed command on a builder: `RemoteClient` in the gate binary; the `remote.ps1` bridge is to be its first client, and a gate with none built falls back with reason `client`.
 - **Reserved field**: an optional field readers accept before any gate writes it, such as `expected` or `avgCores`.
 - **Reserved light slot**: one of the up to two highest light slots a critical gate never takes, so light gates run beside it.
 - **Rollover**: the move of `events.jsonl` over `events.1.jsonl` by the append that finds the journal at or above 5,242,880 bytes, followed by the archive of the rolled file.
