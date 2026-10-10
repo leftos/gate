@@ -498,7 +498,11 @@ The box heartbeat (BW9) is the box wrapper's command-time heartbeat, not the wai
 
   Both are shared for read, write and delete, so a process the command left running does not block the next run on that log; a second gate on a live log is kept out by the log's mutex ([Kernel object names](#kernel-object-names)). An orphan's old, delete-pending file makes the create fail loudly rather than be shared. stdin is `NUL`, opened `OPEN_EXISTING`.
 
-  It inherits exactly three handles, through `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`: stdin from `NUL`, stdout to the log and stderr to `<log>.err`. It shares the gate's console, so Ctrl+C reaches it. A nested gate's job nests inside its parent's.
+  It inherits exactly three handles, through `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`: stdin from `NUL`, stdout to the log and stderr to `<log>.err`. The gate's own handles to them are not inheritable: the command inherits copies made under the spawn lock, which exist only while the lock is held, and a failed copy is a setup error, `copy a handle for the command to inherit: <message>`.
+
+  The spawn lock is process-wide and is held while the gate starts any process, so only the launched command inherits the copies. A process the gate starts itself goes through `gate_win32::spawn`, which holds the lock for the start alone; one started any other way could inherit the copies if it started while they are open.
+
+  The command shares the gate's console, so Ctrl+C reaches it. A nested gate's job nests inside its parent's.
 
   The start-failure message is the system message for the CreateProcessW error code, as `Win32Exception.Message` gives it, with no `(os error N)` suffix. That failure alone maps to status 127; every other start failure is the gate's own.
 - **Priority.** BelowNormal, or the gate's own class when that is already BelowNormal or Idle; High for a critical gate and any gate under a critical marker (kept, P2).
@@ -588,7 +592,7 @@ Built verbs:
 
   A `Subfolder` is compared against the snapshot with per-character simple uppercase (the wrapper's OrdinalIgnoreCase): one that is not a folder inside `Work` prints `gate: remote subfolder <sub> is not a folder inside the work folder`, deletes the back ref and exits 2, and one missing from the snapshot prints `gate: remote subfolder <sub> does not exist in the snapshot` and exits 2. The shared batch refusal (a `.cmd` or `.bat` word, [Command launching](#command-launching)) exits 2.
 
-  The command runs on a hidden console of its own (`CREATE_NO_WINDOW`) and outside the box's own job, created with `CREATE_BREAKAWAY_FROM_JOB` so it leaves the ssh session's job (the box's job refusing breakaway prints `gate: the box cannot start a command outside its own job: <message>` and exits 1). It is assigned to the payload's named job, which has no limits and no kill-on-close, and inherits exactly NUL, the two pipe write ends and a query-only handle to its job.
+  The command runs on a hidden console of its own (`CREATE_NO_WINDOW`) and outside the box's own job, created with `CREATE_BREAKAWAY_FROM_JOB` so it leaves the ssh session's job (the box's job refusing breakaway prints `gate: the box cannot start a command outside its own job: <message>` and exits 1). It is assigned to the payload's named job, which has no limits and no kill-on-close, and inherits exactly NUL, the two pipe write ends and a query-only handle to its job, as copies made under the spawn lock ([Command launching](#command-launching)). The box's git and dotnet calls start through `gate_win32::spawn`, under the same lock.
 
   A job name already held prints `gate: the job <name> already exists; a run's job name must be new` and exits 1. A command that cannot start prints `gate: could not start <word>[ (<resolved>)]: <message>` and exits 127; a failure of the gate after the start prints `gate: the gate failed while running the command: <problem>` and exits 1. If the box panics after the resume, the job is terminated with 124.
 

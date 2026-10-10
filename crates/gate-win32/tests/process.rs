@@ -2,6 +2,10 @@
 
 #![cfg(windows)]
 #![expect(clippy::expect_used, reason = "a test that cannot start or wait for its child must fail loudly")]
+#![expect(
+    clippy::disallowed_methods,
+    reason = "a test starts its child directly: what it checks is the child itself"
+)]
 
 use std::process::{Child, Command};
 

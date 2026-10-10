@@ -68,6 +68,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Slot**: a named mutex in the session's `Local\` namespace that a gate holds for its command's whole run; the number of slots per pool caps how many commands run at once.
 - **Slot marker**: the environment variable `GATE_SLOT_HELD`, `<kind>:<pid>:<start>` (plus the root hash under a non-default root), which a gate sets for its command so a nested gate knows its parent.
 - **Snapshot**: either the parentless commit of a worktree as it stands, which a routed run sends to its builder; or the critical gate's record, at take, of the counts and the other gates' claims.
+- **Spawn lock**: the `gate-win32` lock held while the gate starts any process, so only the launched command inherits the copies of its handles.
 - **Stable line**: one of the three published `gate:` line forms callers may parse (STALLED, TIMED OUT or BACKSTOP; `waiting for the machine (critical)`; `Full output:`); every other `gate:` line is prose.
 - **Stall**: a kill for no progress (no output, CPU, new process or build-server work) for the stall window, `--stall` seconds.
 - **State root**: the folder holding every file the gate writes, `%LOCALAPPDATA%\gate\v1\` by default, overridden by `--state-dir` or `GATE_STATE_DIR`.

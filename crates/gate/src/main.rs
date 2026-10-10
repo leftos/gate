@@ -4,6 +4,14 @@
 //! with the gates in it. On a builder, the hidden `gate box` answers `boot`, `preflight`, `run` and `stop`. The
 //! watchdog's ceiling and backstop and the box's `outputs` are not built yet.
 
+#![cfg_attr(
+    test,
+    expect(
+        clippy::disallowed_methods,
+        reason = "a unit test starts its helper commands directly, with no launch of its own open"
+    )
+)]
+
 mod acquire;
 mod answer;
 mod boxside;

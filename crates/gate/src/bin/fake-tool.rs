@@ -11,6 +11,11 @@
 //! `argv` prints every word after it, each on its own line, and ends, so it is always the last step.
 //! With no `exit` step it exits 0. For example `fake-tool out hi err oops exit 3`.
 
+#![expect(
+    clippy::disallowed_methods,
+    reason = "a test helper that starts copies of itself and holds no launch's handles"
+)]
+
 use std::ffi::OsString;
 use std::io::{self, Write};
 use std::path::Path;

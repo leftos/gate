@@ -1,0 +1,5 @@
+disallowed-methods = [
+    { path = "std::process::Command::spawn", reason = "start processes through gate_win32::spawn so they take the spawn lock" },
+    { path = "std::process::Command::output", reason = "start processes through gate_win32::spawn so they take the spawn lock" },
+    { path = "std::process::Command::status", reason = "start processes through gate_win32::spawn so they take the spawn lock" },
+]

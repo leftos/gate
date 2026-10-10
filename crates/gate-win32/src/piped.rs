@@ -9,8 +9,7 @@ use std::os::windows::io::FromRawHandle;
 use std::path::{Path, PathBuf};
 
 use proc_table::win32::OwnedHandle;
-use windows_sys::Win32::Foundation::{GENERIC_READ, HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation};
-use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+use windows_sys::Win32::Foundation::{GENERIC_READ, HANDLE};
 use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_NORMAL, OPEN_EXISTING};
 use windows_sys::Win32::System::JobObjects::{
     IsProcessInJob, JOB_OBJECT_LIMIT_BREAKAWAY_OK, JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
@@ -20,8 +19,8 @@ use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::SystemServices::JOB_OBJECT_QUERY;
 use windows_sys::Win32::System::Threading::{CREATE_BREAKAWAY_FROM_JOB, CREATE_NO_WINDOW, GetCurrentProcess};
 
-use crate::create::{AttributeList, Creation, check_launch, create_process, startup_info};
-use crate::launch::{create_inheritable, setup, struct_size};
+use crate::create::{Creation, Inherited, check_launch, create_inheriting};
+use crate::launch::{open_shared, setup, struct_size};
 use crate::{EnvironmentBlock, Job, LaunchError, Suspended, own_handle, wide};
 
 /// How to start a command whose output the caller reads: the caller decides every part of it.
@@ -57,8 +56,8 @@ impl PipedLaunch {
     /// returns; the read ends are never inheritable. The command is not yet in `job`: the caller puts it there with
     /// [`Suspended::assign_and_resume`].
     ///
-    /// The four handles are inheritable while this call runs, so no other thread of the caller may start a process
-    /// meanwhile, or that process would inherit them too.
+    /// This process's own handles to those four are never inheritable: the command inherits copies open only while the
+    /// spawn lock is held, so no process started meanwhile through [`crate::spawn`] or another launch inherits them.
     ///
     /// # Errors
     ///
@@ -67,21 +66,22 @@ impl PipedLaunch {
     /// or a handle, a pipe or the attribute list cannot be made.
     pub fn start_suspended(&self, job: &Job) -> Result<PipedSuspended, LaunchError> {
         check_launch(&self.command_line, &self.application, &[("working folder", self.directory.as_path())])?;
-        let job_handle = inheritable_job(job)?;
-        let input = create_inheritable(Path::new("NUL"), GENERIC_READ, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL)?;
+        let job_handle = open_job(job)?;
+        let input = open_shared(Path::new("NUL"), GENERIC_READ, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL)?;
         let (stdout, output) = pipe("stdout")?;
         let (stderr, errors) = pipe("stderr")?;
-        let mut attributes = AttributeList::new(0, [&input, &output, &errors], &[&job_handle])?;
-        let startup = startup_info(&mut attributes);
         let creation = Creation {
             application: &self.application,
             command_line: &self.command_line,
             directory: &self.directory,
             environment: &self.environment,
         };
-        let suspended = create_process(&creation, CREATE_BREAKAWAY_FROM_JOB | CREATE_NO_WINDOW, &startup)?;
+        let inherited = Inherited {
+            stdio: [&input, &output, &errors],
+            others: &[(&job_handle, Some(JOB_OBJECT_QUERY))],
+        };
+        let suspended = create_inheriting(&creation, CREATE_BREAKAWAY_FROM_JOB | CREATE_NO_WINDOW, &inherited, None)?;
         // The command holds its own copies now; with these closed, each read end ends when the command's copies do.
-        drop(attributes);
         drop((input, output, errors, job_handle));
         Ok(PipedSuspended { suspended, stdout, stderr })
     }
@@ -122,38 +122,29 @@ pub fn breakaway_refused() -> io::Result<bool> {
     Ok(limits.BasicLimitInformation.LimitFlags & allowed == 0)
 }
 
-/// A second, inheritable handle to `job`, opened by its name with query access only: the command's copy keeps the
-/// name alive and lets it do nothing else to the job.
-fn inheritable_job(job: &Job) -> Result<OwnedHandle, LaunchError> {
+/// A second handle to `job`, never inheritable, opened by its name with query access only: the command's copy keeps
+/// the name alive and lets it do nothing else to the job.
+fn open_job(job: &Job) -> Result<OwnedHandle, LaunchError> {
     let name = wide(job.name());
     // SAFETY: `name` is NUL-terminated and outlives the call. A success is a fresh handle nothing else owns.
-    unsafe { own_handle(OpenJobObjectW(JOB_OBJECT_QUERY, 1, name.as_ptr())) }
+    unsafe { own_handle(OpenJobObjectW(JOB_OBJECT_QUERY, 0, name.as_ptr())) }
         .map_err(|error| setup(error, &format!("open the job {} for the command to inherit", job.name())))
 }
 
-/// A new pipe for the command's `stream`: the read end, never inheritable, as a file this process reads, and the
-/// write end, inheritable, for the command.
+/// A new pipe for the command's `stream`, neither end inheritable: the read end, as a file this process reads, and
+/// the write end, for the command.
 fn pipe(stream: &str) -> Result<(File, OwnedHandle), LaunchError> {
     let operation = format!("create the {stream} pipe");
-    let attributes = SECURITY_ATTRIBUTES {
-        nLength: struct_size::<SECURITY_ATTRIBUTES>(),
-        lpSecurityDescriptor: std::ptr::null_mut(),
-        bInheritHandle: 0,
-    };
     let mut read: HANDLE = std::ptr::null_mut();
     let mut write: HANDLE = std::ptr::null_mut();
-    // SAFETY: both handle pointers are writable and `attributes` is a whole `SECURITY_ATTRIBUTES`; size 0 asks for the
-    // default buffer.
-    if unsafe { CreatePipe(&raw mut read, &raw mut write, &raw const attributes, 0) } == 0 {
+    // SAFETY: both handle pointers are writable; no security attributes are passed, so neither end is inheritable,
+    // and size 0 asks for the default buffer.
+    if unsafe { CreatePipe(&raw mut read, &raw mut write, std::ptr::null(), 0) } == 0 {
         return Err(setup(io::Error::last_os_error(), &operation));
     }
     // SAFETY: a success returns two fresh handles nothing else owns; each gets exactly one owner here.
     let reader = File::from(unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(read) });
     // SAFETY: as above, for the write end.
     let writer = unsafe { own_handle(write) }.map_err(|error| setup(error, &operation))?;
-    // SAFETY: the write end is open for the whole call.
-    if unsafe { SetHandleInformation(writer.raw(), HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) } == 0 {
-        return Err(setup(io::Error::last_os_error(), &format!("let the command inherit the {stream} pipe")));
-    }
     Ok((reader, writer))
 }

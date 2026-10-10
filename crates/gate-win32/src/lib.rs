@@ -16,6 +16,7 @@ mod piped;
 mod times;
 mod tree;
 
+pub use create::spawn;
 pub use event::{EventWait, NamedEvent};
 pub use interrupt::Interrupt;
 pub use job::{Accounting, Job};

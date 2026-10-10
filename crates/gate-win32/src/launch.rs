@@ -12,19 +12,17 @@ use std::time::Duration;
 use proc_table::win32::OwnedHandle;
 use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows_sys::Win32::Globalization::{CSTR_EQUAL, CSTR_GREATER_THAN, CSTR_LESS_THAN, CompareStringOrdinal};
-use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, CREATE_NEW, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_CREATION_DISPOSITION,
     FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TYPE_DISK,
     GetFileInformationByHandle, GetFileType, OPEN_EXISTING, SECURITY_ANONYMOUS, SECURITY_SQOS_PRESENT,
 };
 use windows_sys::Win32::System::Threading::{
-    BELOW_NORMAL_PRIORITY_CLASS, GetExitCodeProcess, HIGH_PRIORITY_CLASS, PROC_THREAD_ATTRIBUTE_DESKTOP_APP_POLICY, PROCESS_CREATION_FLAGS,
-    ResumeThread, TerminateProcess, WaitForSingleObject,
+    BELOW_NORMAL_PRIORITY_CLASS, GetExitCodeProcess, HIGH_PRIORITY_CLASS, PROCESS_CREATION_FLAGS, ResumeThread, TerminateProcess, WaitForSingleObject,
 };
 use windows_sys::Win32::System::WindowsProgramming::PROCESS_CREATION_DESKTOP_APP_BREAKAWAY_DISABLE_PROCESS_TREE;
 
-use crate::create::{AttributeList, Creation, check_launch, create_process, startup_info};
+use crate::create::{Creation, Inherited, check_launch, create_inheriting};
 use crate::interrupt::{Woken, wait_with};
 use crate::{Interrupt, Job, own_handle, wait_millis, win32_message};
 
@@ -212,7 +210,9 @@ impl Launch {
     /// each created afresh (an earlier file at the path is deleted first, and a link at it is never followed) and open
     /// to every process for reading, writing and deleting while the command writes them, so a process the command left
     /// running cannot keep the next run from replacing them; it inherits those three
-    /// handles and no other. It is created with the desktop-app policy
+    /// handles and no other. This process's own handles to them are never inheritable: the command inherits copies
+    /// open only while the spawn lock is held, so no process started meanwhile through [`crate::spawn`] or another
+    /// launch inherits them. It is created with the desktop-app policy
     /// `PROCESS_CREATION_DESKTOP_APP_BREAKAWAY_DISABLE_PROCESS_TREE`, as the PowerShell gate creates it: Microsoft's
     /// documentation says only that it matters to a Win32 app packaged through the Desktop Bridge, whose child
     /// processes it keeps inside the desktop app runtime environment, a policy its descendants inherit.
@@ -229,22 +229,21 @@ impl Launch {
             ("err log", self.err_log.as_path()),
         ];
         check_launch(&self.command_line, &self.application, &paths)?;
-        let input = create_inheritable(Path::new("NUL"), GENERIC_READ, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL)?;
+        let input = open_shared(Path::new("NUL"), GENERIC_READ, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL)?;
         let output = create_output(&self.log)?;
         let errors = create_output(&self.err_log)?;
-        let policy: u32 = PROCESS_CREATION_DESKTOP_APP_BREAKAWAY_DISABLE_PROCESS_TREE;
-        let mut attributes = AttributeList::new(1, [&input, &output, &errors], &[])?;
-        // SAFETY: `policy` is declared before the list, so it outlives it, and is not changed while the list lives; it
-        // is one DWORD, as the attribute wants.
-        unsafe { attributes.update(PROC_THREAD_ATTRIBUTE_DESKTOP_APP_POLICY, (&raw const policy).cast(), size_of::<u32>()) }?;
-        let startup = startup_info(&mut attributes);
         let creation = Creation {
             application: &self.application,
             command_line: &self.command_line,
             directory: &self.directory,
             environment: &self.environment,
         };
-        create_process(&creation, self.priority.map_or(0, PriorityClass::flag), &startup)
+        let inherited = Inherited {
+            stdio: [&input, &output, &errors],
+            others: &[],
+        };
+        let policy = PROCESS_CREATION_DESKTOP_APP_BREAKAWAY_DISABLE_PROCESS_TREE;
+        create_inheriting(&creation, self.priority.map_or(0, PriorityClass::flag), &inherited, Some(policy))
     }
 }
 
@@ -271,33 +270,18 @@ pub(crate) fn wide_os(text: &OsStr) -> Vec<u16> {
     text.encode_wide().chain(Some(0)).collect()
 }
 
-/// A handle to `path` the command can inherit, open to every process for reading, writing and deleting.
-pub(crate) fn create_inheritable(
+/// A handle to `path`, never inheritable, open to every process for reading, writing and deleting.
+pub(crate) fn open_shared(
     path: &Path,
     access: u32,
     disposition: FILE_CREATION_DISPOSITION,
     flags: FILE_FLAGS_AND_ATTRIBUTES,
 ) -> Result<OwnedHandle, LaunchError> {
     let name = wide_os(path.as_os_str());
-    let inheritable = SECURITY_ATTRIBUTES {
-        nLength: struct_size::<SECURITY_ATTRIBUTES>(),
-        lpSecurityDescriptor: std::ptr::null_mut(),
-        bInheritHandle: 1,
-    };
     let share = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
-    // SAFETY: `name` is NUL-terminated and `inheritable` a whole `SECURITY_ATTRIBUTES`, both outliving the call; no
-    // template file is passed.
-    let handle = unsafe {
-        CreateFileW(
-            name.as_ptr(),
-            access,
-            share,
-            &raw const inheritable,
-            disposition,
-            flags,
-            std::ptr::null_mut(),
-        )
-    };
+    // SAFETY: `name` is NUL-terminated and outlives the call; no security attributes are passed, so the handle is not
+    // inheritable, and no template file is passed.
+    let handle = unsafe { CreateFileW(name.as_ptr(), access, share, std::ptr::null(), disposition, flags, std::ptr::null_mut()) };
     if handle == INVALID_HANDLE_VALUE {
         let error = io::Error::last_os_error();
         return Err(setup(error, &format!("open {}", path.display())));
@@ -316,7 +300,7 @@ fn create_output(path: &Path) -> Result<OwnedHandle, LaunchError> {
         Err(error) => return Err(setup(error, &format!("delete the earlier {}", path.display()))),
     }
     let flags = FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT | SECURITY_SQOS_PRESENT | SECURITY_ANONYMOUS;
-    let handle = create_inheritable(path, GENERIC_WRITE, CREATE_NEW, flags)?;
+    let handle = open_shared(path, GENERIC_WRITE, CREATE_NEW, flags)?;
     check_plain_file(handle.raw()).map_err(|error| setup(error, &format!("check {}", path.display())))?;
     Ok(handle)
 }

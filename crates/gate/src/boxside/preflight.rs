@@ -137,12 +137,9 @@ impl Git {
         for name in GIT_REDIRECTS {
             command.env_remove(name);
         }
-        // Started with std's own spawn, which lets every inheritable handle through: `gate box preflight` holds none.
-        let status = command
-            .args(args)
-            .stdin(Stdio::null())
-            .stdout(stdout)
-            .status()
+        // Started under the spawn lock, so it inherits no launch's handles.
+        let status = gate_win32::spawn(command.args(args).stdin(Stdio::null()).stdout(stdout))
+            .and_then(|mut child| child.wait())
             .map_err(|error| error.to_string())?;
         Ok(exit_code(status))
     }
@@ -179,13 +176,16 @@ fn sdks() -> Result<String, String> {
     let Some(dotnet) = locate("dotnet")? else {
         return Ok(sdk_list(""));
     };
-    // Started with std's own spawn, which lets every inheritable handle through: `gate box preflight` holds none.
-    let output = Command::new(&dotnet)
-        .arg("--list-sdks")
-        .stdin(Stdio::null())
-        .stderr(Stdio::inherit())
-        .output()
-        .map_err(|error| format!("cannot start {}: {error}", dotnet.display()))?;
+    // Started under the spawn lock, so it inherits no launch's handles.
+    let output = gate_win32::spawn(
+        Command::new(&dotnet)
+            .arg("--list-sdks")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit()),
+    )
+    .and_then(std::process::Child::wait_with_output)
+    .map_err(|error| format!("cannot start {}: {error}", dotnet.display()))?;
     if !output.status.success() {
         return Err(format!("dotnet --list-sdks exited with status {}", exit_code(output.status)));
     }

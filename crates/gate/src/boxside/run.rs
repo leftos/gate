@@ -1,7 +1,8 @@
 //! `gate box run`: the work folder's lock taken, the subfolder checked, the snapshot checked out, the command started
 //! in the payload's job with its output forwarded, the tree it left committed back, and the command's status passed
-//! whole, as the PowerShell wrapper's `Invoke-Run` does. git runs only before the command starts and after the
-//! command's pipes are closed here, so no git inherits a handle meant for the command.
+//! whole, as the PowerShell wrapper's `Invoke-Run` does. git starts through [`gate_win32::spawn`], under the spawn lock
+//! the command's own launch holds while its inheritable handle copies are open, so no git inherits a handle meant for
+//! the command.
 //!
 //! The payload is data: it is refused unless well formed, and runs nothing but its command and writes nothing but the
 //! work folder's own files. The command, and whatever it writes into the work folder, `.git` included, is the user's
@@ -473,10 +474,9 @@ impl BackGit<'_> {
 
     /// Runs `step`, its output passed through; else why it failed.
     fn status(&self, step: &str, args: &[&str], copied_index: bool) -> Result<(), String> {
-        // Started with std's own spawn, which lets every inheritable handle through: the command's are closed by now.
-        let status = self
-            .command(args, copied_index)
-            .status()
+        // Started under the spawn lock, so it inherits no launch's handles.
+        let status = gate_win32::spawn(&mut self.command(args, copied_index))
+            .and_then(|mut child| child.wait())
             .map_err(|error| format!("{step} failed: {error}"))?;
         match exit_code(status) {
             0 => Ok(()),
@@ -486,11 +486,9 @@ impl BackGit<'_> {
 
     /// Runs `step` and returns the first line of its stdout, its stderr passed through; else why it failed.
     fn line(&self, step: &str, args: &[&str], copied_index: bool) -> Result<String, String> {
-        // Started with std's own spawn, which lets every inheritable handle through: the command's are closed by now.
-        let output = self
-            .command(args, copied_index)
-            .stderr(Stdio::inherit())
-            .output()
+        // Started under the spawn lock, so it inherits no launch's handles.
+        let output = gate_win32::spawn(self.command(args, copied_index).stdout(Stdio::piped()).stderr(Stdio::inherit()))
+            .and_then(std::process::Child::wait_with_output)
             .map_err(|error| format!("{step} failed: {error}"))?;
         match exit_code(output.status) {
             0 => String::from_utf8_lossy(&output.stdout)
