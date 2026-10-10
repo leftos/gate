@@ -6,16 +6,18 @@
 
 - [ ] GATE-5 Port the local gate, slice by slice
   - [ ] GATE-39 Local slice 8: router and the bridge to remote.ps1
-    - [/] GATE-87 Routing: give git 60 s before running here, and let tests lift the limit
     - [ ] GATE-68 Router part C: the remote.ps1 bridge through a repo shim
   - [ ] GATE-62 Watchdog: count build servers, WSL and paused child gates as progress
-    - [/] GATE-89 Watchdog part B: read build servers and the build client each sample
     - [ ] GATE-90 Watchdog part C: the WSL VM's CPU for a wsl command
     - [ ] GATE-91 Watchdog part D: a paused child gate counts as progress
   - [ ] GATE-38 Local slice 7: critical drain and nesting
+    - [ ] GATE-93 Critical part A: nesting under GATE_SLOT_HELD
+    - [ ] GATE-94 Critical part B: the critical drain, barrier and reserved light slots
+    - [ ] GATE-95 Critical part C: pause markers, writer and reader
   - [!] GATE-41 Local slice 10: the PowerShell launcher execs gate.exe once the cutover flag is set
 - [ ] GATE-9 Local cutover: drain and switch to gate.exe, bridging routed runs to remote.ps1
 - [ ] GATE-77 Watchdog: lower build servers' priority during a critical run (B2)
+- [ ] GATE-97 Suite: install cases write the real user PATH, so parallel worktree runs collide
 
 ## Remote
 
@@ -24,7 +26,7 @@
     - [ ] GATE-61 Box part C: box heartbeat, UTF-8 console and the pipe-closed stop
       - [ ] GATE-84 Box part C2: the box heartbeat on BeatClock and Pump
       - [ ] GATE-85 Box part C3: the UTF-8 console and the same-job relaunch
-    - [ ] GATE-86 Box run: check out the payload's Snapshot commit, as the live wrapper does
+    - [ ] GATE-96 Box run: escape the payload's Subfolder and command word where they are echoed
   - [ ] GATE-63 Box: restore a repo's dotnet tools before a routed run
   - [ ] GATE-25 Box: stop a job whose PC has gone away so it frees the work folder
   - [ ] GATE-26 Box: measure MSBuild node sharing across work folders, salt per work folder
@@ -56,7 +58,3 @@
   - [ ] GATE-16 Durations part 4: `--timeout auto` as a floor, and ceiling and hang hints
   - [ ] GATE-17 Durations part 5: backfill guests during a critical drain
 - [ ] GATE-8 `--slot auto` picks heavy or light from the command's history
-
-## Backlog
-
-- [ ] GATE-81 gate-win32: terminate a created process when owning its thread handle fails
