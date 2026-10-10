@@ -171,6 +171,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "gate-router"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "gate-state"
 version = "0.1.0"
 dependencies = [

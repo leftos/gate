@@ -54,8 +54,10 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Rollover**: the move of `events.jsonl` over `events.1.jsonl` by the append that finds the journal at or above 5,242,880 bytes, followed by the archive of the rolled file.
 - **Root hash**: the first 8 hex digits of the SHA-256 of a non-default state root's path, carried in every kernel object name and slot marker of that root.
 - **Routed run**: a heavy gate whose command `remote.json` sends to a builder.
+- **Routing file**: `remote.json` in `%LOCALAPPDATA%\gate\`, naming the builder's host, the remote pool's size and, per repo, the `-like` patterns of the commands that route and the globs of the files a routed run brings back.
 - **Sample**: one reading of a running command taken every 5 s by the sampler: the system's CPU times, the job's CPU and pids, and the log's size; the watchdog's clocks advance only by samples.
 - **Sampler**: the Win32 side of the watchdog that takes the samples; if one fails, the watch goes by wall time alone.
+- **Script word**: a command word holding a line break or one of `, ; " ' ) | & < >`, such as a script's text or a list; in it a path ends at white space, where in any other word a path runs through its spaces.
 - **Shadow end**: the expected end of the slowest gate a critical drain waits on, which closes the lent window.
 - **Shim**: an extensionless script on PATH, such as the bash shims a plugin puts ahead of `uv` and `python`; program resolution skips it, since Windows cannot start it.
 - **Slot**: a named mutex in the session's `Local\` namespace that a gate holds for its command's whole run; the number of slots per pool caps how many commands run at once.

@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/gate",
     "crates/gate-args",
+    "crates/gate-router",
     "crates/gate-state",
     "crates/gate-watchdog",
     "crates/gate-win32",
