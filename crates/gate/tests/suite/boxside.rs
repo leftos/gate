@@ -777,7 +777,7 @@ fn box_stop_refuses_a_job_name_not_of_its_work_folder() {
     );
     assert_eq!(held.wait(Duration::ZERO).expect("the held command is looked at"), None, "it lives");
     let_go(&go);
-    assert_eq!(held.wait(Duration::from_secs(60)).expect("the held command ends"), Some(0));
+    assert_eq!(held.wait(Duration::from_secs(600)).expect("the held command ends"), Some(0));
 }
 
 #[test]

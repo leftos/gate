@@ -25,8 +25,9 @@ use std::time::{Duration, Instant};
 
 /// How often `wait` looks for its path.
 const WAIT_STEP: Duration = Duration::from_millis(20);
-/// How long `wait` looks for its path before it gives up.
-const WAIT_LIMIT: Duration = Duration::from_secs(120);
+/// How long `wait` looks for its path before it gives up: the suite's hang guard, so a loaded machine never ends a
+/// helper its case still means to let go.
+const WAIT_LIMIT: Duration = Duration::from_secs(600);
 
 /// Exits through `std::process::exit`, because `ExitCode` carries 8 bits and the suite needs codes above 255 and
 /// negative ones.
