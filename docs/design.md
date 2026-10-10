@@ -407,11 +407,25 @@ The arithmetic (stall progress, the free share, the clock, the backstop, the cor
 
   A lone `%` and an unset name pass. The gate and the box side share this one implementation.
 - **Program resolution.** A bare name resolves to the first file on PATH whose extension is in PATHEXT, skipping extensionless shims; a name with an extension or a directory is taken as written, a relative directory read against the working directory (kept, C6). A start failure prints `gate: could not start <word> (<resolved>): <message>` and exits 127, releasing the slot (C7).
-- **Process creation.** The command is created suspended with an explicit environment block, assigned to the gate's job `Local\gate-job-<gate pid>` (no limits: no breakaway, no kill-on-close), with the desktop-app breakaway policy so a packaged app's children stay in the job, then resumed (kept, X1, P1).
 
-  It inherits exactly three handles: stdin from `NUL`, stdout to the log and stderr to `<log>.err`. It shares the gate's console, so Ctrl+C reaches it. A nested gate's job nests inside its parent's.
+  Unlike the PowerShell gate, which lets CreateProcess search for the program (the current folder among others), the program must resolve to an absolute path, and a name found nowhere is a start failure. This is deliberate, for security: a repo cannot plant a `git.exe` at its root. The `gate-win32` layer passes the path as `lpApplicationName`, so CreateProcessW searches no folder (not the gate's, the current one, System32 or PATH).
+- **Process creation.** The `gate-win32` layer is the contract the run uses (`Launch` → `Suspended` → `Running`). The command is created suspended with an explicit environment block, assigned to the gate's job `Local\gate-job-<gate pid>`, then resumed (kept, X1, P1). Creation flags are `CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT` plus the priority class, with no new console and no new process group.
+
+  The job has no limits: no breakaway, no kill-on-close. A job name already held is refused. If assigning to the job or resuming fails, the command is terminated with exit code 1 first, and a suspended command dropped without being resumed is terminated with exit code 1.
+
+  The desktop-app policy `PROCESS_CREATION_DESKTOP_APP_BREAKAWAY_DISABLE_PROCESS_TREE` is set, as the PowerShell gate sets it. Per Microsoft's UpdateProcThreadAttribute remarks it matters only to Win32 apps packaged through the Desktop Bridge, whose children it keeps inside the desktop app runtime environment.
+
+  The layer refuses a `.cmd` or `.bat` application (any case, trailing dots and spaces ignored): the caller wraps batch targets in `"<ComSpec>" /d /v:off /s /c "<line>"` itself. It refuses a NUL in the application, command line, working folder, log path or `.err` path before anything is opened.
+
+  The log and `<log>.err` are each opened fresh. Any file at the path is deleted first (a link itself, never its target), then created with `CREATE_NEW` and `FILE_FLAG_OPEN_REPARSE_POINT | SECURITY_SQOS_PRESENT | SECURITY_ANONYMOUS`; it must be a disk file, not a reparse point, with exactly one name. Both are shared for read, write and delete. An orphan's old, delete-pending file makes the create fail loudly rather than be shared. stdin is `NUL`, opened `OPEN_EXISTING`.
+
+  It inherits exactly three handles, through `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`: stdin from `NUL`, stdout to the log and stderr to `<log>.err`. It shares the gate's console, so Ctrl+C reaches it. A nested gate's job nests inside its parent's.
+
+  The start-failure message is the system message for the CreateProcessW error code, as `Win32Exception.Message` gives it, with no `(os error N)` suffix. That failure alone maps to status 127; every other start failure is the gate's own.
 - **Priority.** BelowNormal, or the gate's own class when that is already BelowNormal or Idle; High for a critical gate and any gate under a critical marker (kept, P2).
 - **Environment.** Every command gets the gate's environment with these set over it (names compared case-insensitively): `GATE_SLOT_HELD` (the held slot's marker, or the parent's for a covered gate), `MSBUILDDISABLENODEREUSE=1`, `DOTNET_CLI_USE_MSBUILD_SERVER=0` (kept, P3, B3), and `GATE_STATE_DIR` under a non-default root. The gate's own environment is never changed.
+
+  The block is built with names matched and sorted as Windows does (`CompareStringOrdinal`, case-insensitive over all of Unicode), and a later pair wins.
 - **Working directory.** The caller's (P5).
 
 ## Log and tail

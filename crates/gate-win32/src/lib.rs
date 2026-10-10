@@ -1,13 +1,18 @@
-//! The gate's Win32 layer: named mutexes and events, and the start time of the gate process or of another. It holds no policy: the
-//! names, the waits and what an abandoned mutex means to the gate are the caller's. Windows only; elsewhere the crate
-//! is empty.
+//! The gate's Win32 layer: named mutexes and events, job objects, commands created suspended, the start time of the
+//! gate process or of another, and the Windows message of an error code. It holds no policy: the names, the waits, the
+//! command's environment and priority, and what an abandoned mutex means to the gate are the caller's. Windows only;
+//! elsewhere the crate is empty.
 
 #![cfg(windows)]
 
 mod event;
+mod job;
+mod launch;
 mod mutex;
 
 pub use event::{EventWait, NamedEvent};
+pub use job::Job;
+pub use launch::{EnvironmentBlock, Launch, LaunchError, PriorityClass, Running, Suspended};
 pub use mutex::{AcquireError, MutexGuard, NamedMutex, OwnedMutexGuard, mutex_exists};
 
 use std::io;
@@ -15,7 +20,10 @@ use std::time::Duration;
 
 use jiff::Timestamp;
 use proc_table::win32::OwnedHandle;
-use windows_sys::Win32::Foundation::{ERROR_INVALID_PARAMETER, FILETIME, HANDLE, STILL_ACTIVE};
+use windows_sys::Win32::Foundation::{ERROR_INVALID_PARAMETER, FILETIME, HANDLE, LocalFree, STILL_ACTIVE};
+use windows_sys::Win32::System::Diagnostics::Debug::{
+    FORMAT_MESSAGE_ALLOCATE_BUFFER, FORMAT_MESSAGE_FROM_SYSTEM, FORMAT_MESSAGE_IGNORE_INSERTS, FormatMessageW,
+};
 use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, GetExitCodeProcess, GetProcessTimes, INFINITE, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
 };
@@ -45,6 +53,28 @@ pub(crate) fn wait_millis(timeout: Duration) -> u32 {
 /// The name as a NUL-terminated UTF-16 buffer, as a Win32 call that takes a name wants it.
 pub(crate) fn wide(name: &str) -> Vec<u16> {
     name.encode_utf16().chain(Some(0)).collect()
+}
+
+/// The system's message for the Win32 error `code`, as .NET's `Win32Exception.Message` gives it: inserts such as `%1`
+/// left as written, trailing whitespace and line breaks removed, the closing period kept, and `Unknown error (0x<code>)`
+/// for a code the system has no message for. It carries no `(os error N)` suffix, so a caller can print it in a line
+/// of its own.
+#[must_use]
+pub fn win32_message(code: u32) -> String {
+    let mut buffer: *mut u16 = std::ptr::null_mut();
+    let flags = FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS;
+    // SAFETY: with `FORMAT_MESSAGE_ALLOCATE_BUFFER` the buffer argument is the address of a pointer the system sets to a
+    // buffer it allocates; a null source and no arguments are what a system message with inserts ignored takes.
+    let length = unsafe { FormatMessageW(flags, std::ptr::null(), code, 0, (&raw mut buffer).cast(), 0, std::ptr::null()) };
+    if length == 0 || buffer.is_null() {
+        return format!("Unknown error (0x{code:x})");
+    }
+    // SAFETY: the system wrote `length` UTF-16 units into the buffer it allocated, which stays alive until freed below.
+    let text = unsafe { std::slice::from_raw_parts(buffer, length as usize) };
+    let message = String::from_utf16_lossy(text);
+    // SAFETY: the buffer was allocated by `FormatMessageW` with `LocalAlloc`, is no longer read, and is freed once.
+    unsafe { LocalFree(buffer.cast()) };
+    message.trim_end_matches(|c: char| c <= ' ').to_owned()
 }
 
 /// This process's start time, as the process table gives start times (whole microseconds).
