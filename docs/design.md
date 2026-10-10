@@ -635,6 +635,18 @@ The PowerShell gate and `gate.exe` share slot mutexes and never share files. The
    `gate cutover` copies the PowerShell gate's slot counts into the default root's `slot-counts.json`, so both generations count the same slots, then writes `%LOCALAPPDATA%\gate\cutover.flag`. The PowerShell launcher in each repo reads the flag, and from then on every new gate runs `gate.exe` through the compatibility layer.
 2. It then waits until every PowerShell gate's claims and tickets in `%LOCALAPPDATA%\gate\` are gone or stale, naming on stderr what it still waits on, and exits 0 once none is left.
 
+### The launcher's hand-over
+
+The launcher is claude-config's `tools/gate/gate-launcher.ps1`, which `sync-launchers.ps1` copies into each repo as `tools/gate.ps1`; the hand-over is built there, and this repo's black-box cases run the synced copy.
+
+- The flag is `%LOCALAPPDATA%\gate\cutover.flag`. Its existence is the switch; its content is not read. `--state-dir` and `GATE_STATE_DIR` do not move it.
+- With the flag present, the launcher runs `%LOCALAPPDATA%\gate\bin\gate.exe` with the caller's words, waits for it, and exits with its whole status. It says nothing of its own: gate.exe's lines are the whole output. A Ctrl+C reaches both; the launcher waits for gate.exe to end and exits with its status.
+- The words go through as the caller gave them, `-StopTree` included (the compatibility layer parses it). An in-session call whose `--` PowerShell's parser ate gets it put back before the first command word, which the launcher already finds (`Read-Argument`).
+- With the flag present and `gate.exe` missing, nothing runs: the launcher says `gate: the cutover flag is set but {exe} is missing; reinstall with tools/install.ps1` on stderr and exits 127.
+- With the flag absent, the launcher runs the PowerShell gate as before.
+
+Callers that start the PowerShell gate without the launcher (inventory section 4) are moved by the caller sweep.
+
 During the drain a PowerShell gate neither reads `gate.exe`'s tickets nor signals its wake events: a PowerShell critical request can be overtaken by `gate.exe` gates that arrive after it (it still waits for every slot), and a `gate.exe` waiter learns of a PowerShell gate's release from its fallback poll.
 
 ops-tower's Gates tab, `gate-state`, and the hooks and scripts that read gate command lines or output (inventory section 4) change in the same drain.

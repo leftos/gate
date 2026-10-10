@@ -23,6 +23,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Critical drain**: a critical gate's wait for the gates that arrived before it to free their slots, while it holds back the gates that arrive after it.
 - **Critical gate**: a gate run with `--slot critical`, which takes every heavy and unreserved light slot and runs its command at High priority.
 - **Cutover**: switching a machine's gates from the PowerShell gate to `gate.exe`; `gate cutover` runs the local one.
+- **Cutover flag**: the file `%LOCALAPPDATA%\gate\cutover.flag`, whose existence tells the PowerShell launcher to hand every call to `gate.exe`.
 - **Cutover sweep**: the later change of every calling repo from the PowerShell launcher to `gate` on PATH, after which the PowerShell gate is deleted.
 - **Diagnostics block**: the record of what was running that a kill writes to the log before it terminates the job: the job's processes, the descendants outside the job, the build servers and the last samples.
 - **Drained cutover**: a cutover in which every gate of the old generation finishes before the switch completes, so the two generations never hold slots side by side.
