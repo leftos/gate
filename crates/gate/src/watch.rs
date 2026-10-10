@@ -3,7 +3,7 @@
 //! kill gathers before it terminates the job, and the end of the wait: the command's exit, a kill as stalled, timed out
 //! or past the backstop, or a Ctrl+C.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 use std::io;
 use std::path::Path;
@@ -116,6 +116,7 @@ impl<'a> Watcher<'a> {
                 .test_seams
                 .stall_ms
                 .map_or(Duration::from_secs(request.stall), Duration::from_millis),
+            wsl: false,
         };
         let spoken: Vec<String> = request.command.iter().map(|word| word.to_string_lossy().into_owned()).collect();
         Ok(Watcher {
@@ -127,7 +128,7 @@ impl<'a> Watcher<'a> {
             period: request.test_seams.sample_ms.map_or(SAMPLE_PERIOD, Duration::from_millis),
             interrupt: run.interrupt,
             spoken: spoken.join(" "),
-            watch: Watch::new(config, machine(request.slot, processors), system, job_cpu),
+            watch: Watch::new(config, machine(request.slot, processors), system, job_cpu, None),
             history: SampleHistory::default(),
             sampler_works: true,
             sampler_fail: request.test_seams.sampler_fail,
@@ -328,6 +329,10 @@ impl<'a> Watcher<'a> {
             output_size: log_bytes + err_bytes,
             pids: self.pids()?,
             paused: false,
+            new_servers: BTreeMap::new(),
+            shared_servers: BTreeMap::new(),
+            build_client: false,
+            vm_cpu: None,
         };
         Ok((sample, log_bytes, err_bytes))
     }

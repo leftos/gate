@@ -1,7 +1,7 @@
 //! The state of one watched command: the load-adjusted clock the samples advance, and the share of the machine it
 //! counts at.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use crate::share::{Machine, SystemTimes, Ticks, free_share};
@@ -13,6 +13,10 @@ const MIN_INTERVAL: Duration = Duration::from_millis(1);
 /// so 10 000.
 const FLOOR_NANOS_PER_TICK: u128 = 10_000;
 
+/// The wall-time nanoseconds one tick of the WSL VM's floor stands for: the tenth of one core over the window that a
+/// 100 ns tick of the VM's CPU counts, so a thousand.
+const VM_FLOOR_NANOS_PER_TICK: u128 = 1_000;
+
 /// What kills a watched command, and when.
 #[derive(Clone, Copy, Debug)]
 pub struct Config {
@@ -21,6 +25,8 @@ pub struct Config {
     pub timeout: u64,
     /// The window without progress after which the command is killed as `STALLED`.
     pub stall: Duration,
+    /// Whether the command runs through WSL, so the VM's CPU counts toward its progress.
+    pub wsl: bool,
 }
 
 /// One sample of a watched command: the raw facts the Win32 side reads, with the time the watch had run.
@@ -38,6 +44,15 @@ pub struct Sample {
     pub pids: BTreeSet<u32>,
     /// Whether a gate under this one waits behind a critical request.
     pub paused: bool,
+    /// The build servers the command started, by pid, with the CPU time each has used in 100 ns ticks.
+    pub new_servers: BTreeMap<u32, u64>,
+    /// The compiler servers already running that the command's build client may be using, by pid, with the CPU time
+    /// each has used in 100 ns ticks.
+    pub shared_servers: BTreeMap<u32, u64>,
+    /// Whether the job holds a build client, one that may hand its compile to a build server.
+    pub build_client: bool,
+    /// The WSL VM's cumulative CPU time in 100 ns ticks, or `None` when it is not read, or could not be.
+    pub vm_cpu: Option<u64>,
 }
 
 /// The state of one watched command: the load-adjusted seconds it has accrued, the seconds it spent paused, where the
@@ -57,15 +72,21 @@ pub struct Watch {
     progress_cpu: Ticks,
     output_size: u64,
     pids: BTreeSet<u32>,
+    new_servers: BTreeMap<u32, u64>,
+    shared_servers: BTreeMap<u32, u64>,
+    vm_cpu: Option<u64>,
+    vm_busy: u64,
     sampled: bool,
     sampler_failed: bool,
 }
 
 impl Watch {
-    /// A watch beginning now, with `system` and `job_cpu` the facts at the start of the command: the clock starts at
-    /// zero, the progress clock with it, and nothing has been counted or read yet.
+    /// A watch beginning now, with `system` and `job_cpu` the facts at the start of the command and `vm_cpu` the WSL
+    /// VM's CPU read then, or `None` when it was not read: the clock starts at zero, the progress clock with it, and
+    /// nothing has been counted or read yet. A VM baseline lets the first sample count what the VM used since the
+    /// command started, as the PowerShell gate's own first reading does.
     #[must_use]
-    pub fn new(config: Config, machine: Machine, system: SystemTimes, job_cpu: Ticks) -> Self {
+    pub fn new(config: Config, machine: Machine, system: SystemTimes, job_cpu: Ticks, vm_cpu: Option<u64>) -> Self {
         Self {
             config,
             machine,
@@ -79,25 +100,35 @@ impl Watch {
             progress_cpu: job_cpu,
             output_size: 0,
             pids: BTreeSet::new(),
+            new_servers: BTreeMap::new(),
+            shared_servers: BTreeMap::new(),
+            vm_cpu,
+            vm_busy: 0,
             sampled: false,
             sampler_failed: false,
         }
     }
 
     /// Takes one sample: the interval since the last one advances the clock at the share of the machine the command
-    /// could have had, or counts as paused time while a gate under this one waits behind a critical request. The
-    /// sample is progress when the log's size changed either way, the job's CPU since the last progress reached 1% of
-    /// one core over the stall window, a pid appeared that the last sample did not have, or the run is paused.
+    /// could have had, or counts as paused time while a gate under this one waits behind a critical request. The sample
+    /// is progress when the log's size changed either way, the job's CPU since the last progress reached 1% of one core
+    /// over the stall window, a pid appeared that the last sample did not have, a build server the job's client is
+    /// using gained CPU, the WSL VM passed its floor, or the run is paused.
     pub fn sample(&mut self, sample: &Sample) {
         let interval = sample.at.saturating_sub(self.last_at).max(MIN_INTERVAL);
-        let own_gained = sample.job_cpu.saturating_sub(self.job_cpu);
-        let floor = self.config.stall.as_nanos() / FLOOR_NANOS_PER_TICK;
-        let grew = sample.output_size != self.output_size;
-        let working = u128::from(sample.job_cpu.saturating_sub(self.progress_cpu).0) >= floor;
-        let appeared = !sample.pids.is_subset(&self.pids);
-        if grew || working || appeared || sample.paused {
+        let new_servers = measure_cpu(&self.new_servers, &sample.new_servers);
+        let shared_servers = measure_cpu(&self.shared_servers, &sample.shared_servers);
+        let own_gained = own_gained(
+            sample.job_cpu.saturating_sub(self.job_cpu),
+            new_servers,
+            shared_servers,
+            sample.build_client,
+        );
+        let vm_working = self.vm_working(sample.vm_cpu);
+        if self.progressed(sample, new_servers, shared_servers, vm_working) {
             self.last_progress = sample.at;
             self.progress_cpu = sample.job_cpu;
+            self.vm_busy = 0;
         }
         let free = free_share(self.machine, self.system, sample.system, own_gained, interval.as_secs_f64());
         if sample.paused {
@@ -112,6 +143,42 @@ impl Watch {
         self.job_cpu = sample.job_cpu;
         self.output_size = sample.output_size;
         self.pids.clone_from(&sample.pids);
+        self.new_servers.clone_from(&sample.new_servers);
+        self.shared_servers.clone_from(&sample.shared_servers);
+    }
+
+    /// Whether `sample` is progress: the log changed either way, the job's CPU since the last progress reached 1% of
+    /// one core over the stall window, a pid appeared that the last sample did not have, a build server the job's
+    /// client is using rose, the WSL VM worked, or a gate under this one waits. A server counts only while the job
+    /// holds a build client, and a server that merely appeared is no progress.
+    fn progressed(&self, sample: &Sample, new_servers: CpuMove, shared_servers: CpuMove, vm_working: bool) -> bool {
+        let floor = self.config.stall.as_nanos() / FLOOR_NANOS_PER_TICK;
+        let grew = sample.output_size != self.output_size;
+        let working = u128::from(sample.job_cpu.saturating_sub(self.progress_cpu).0) >= floor;
+        let appeared = !sample.pids.is_subset(&self.pids);
+        let servers = sample.build_client && (new_servers.rose || shared_servers.rose);
+        grew || working || appeared || servers || sample.paused || vm_working
+    }
+
+    /// Adds the WSL VM's CPU since the last reading to the ticks accrued since the last progress, and says whether
+    /// they have reached the tenth of the stall window the floor is. Nothing is counted for a command that is not a WSL
+    /// one, and the first reading, and the first after one that could not be read, is only a baseline.
+    fn vm_working(&mut self, read: Option<u64>) -> bool {
+        if !self.config.wsl {
+            return false;
+        }
+        let floor = self.config.stall.as_nanos() / VM_FLOOR_NANOS_PER_TICK;
+        let Some(now) = read else {
+            self.vm_cpu = None;
+            return false;
+        };
+        let mut reached = false;
+        if let Some(before) = self.vm_cpu {
+            self.vm_busy = self.vm_busy.saturating_add(now.saturating_sub(before));
+            reached = u128::from(self.vm_busy) >= floor;
+        }
+        self.vm_cpu = Some(now);
+        reached
     }
 
     /// Records that a sample failed, and returns the line the gate says for it.
@@ -218,6 +285,54 @@ impl Watch {
     }
 }
 
+/// How far one set of processes moved between two samples: the CPU gained, the CPU of the processes the earlier sample
+/// had too, whether one of them gained any, and whether one appeared.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CpuMove {
+    /// Every process's CPU gained, an appearing process's whole CPU with it.
+    pub gained: u64,
+    /// The CPU gained by the processes the earlier sample had too.
+    pub continued: u64,
+    /// Whether a process the earlier sample had too gained any CPU.
+    pub rose: bool,
+    /// Whether a process appeared that the earlier sample did not have.
+    pub appeared: bool,
+}
+
+/// The CPU the processes of `after` gained on `before`, as the PowerShell gate's `Measure-Cpu` measures it: an appearing
+/// process adds its whole CPU to `gained` alone, and only a process seen before can rise, so a server that merely
+/// appeared is no progress.
+#[must_use]
+pub fn measure_cpu(before: &BTreeMap<u32, u64>, after: &BTreeMap<u32, u64>) -> CpuMove {
+    let mut moved = CpuMove::default();
+    for (&pid, &cpu) in after {
+        match before.get(&pid) {
+            None => {
+                moved.appeared = true;
+                moved.gained += cpu;
+            }
+            Some(&was) => {
+                let delta = cpu.saturating_sub(was);
+                if delta > 0 {
+                    moved.rose = true;
+                    moved.gained += delta;
+                    moved.continued += delta;
+                }
+            }
+        }
+    }
+    moved
+}
+
+/// The command's own CPU over the interval, in ticks: its job's gain, plus, while the job holds a build client, the
+/// build servers the command started and the shared compiler servers' continuing CPU.
+fn own_gained(job: Ticks, new_servers: CpuMove, shared_servers: CpuMove, client: bool) -> Ticks {
+    if !client {
+        return job;
+    }
+    Ticks(job.0 + new_servers.gained + shared_servers.continued)
+}
+
 /// Why a watched command was killed, with the figures its line says: the kill is decided at one sample and its line
 /// written whenever the caller is ready.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -296,6 +411,16 @@ pub fn sampler_failed_line(message: &str) -> String {
     format!("gate: sampler failed: {message}; watching by wall time only")
 }
 
+/// The line the gate says once the WSL VM's CPU cannot be read: every later sample tries again, and until one of them
+/// succeeds the command counts only its output and its job's CPU as progress.
+#[must_use]
+pub fn wsl_unavailable_line(message: &str) -> String {
+    format!(
+        "gate: WSL VM CPU unavailable ({message}); retrying each sample, and until a read succeeds this wsl command \
+         counts only output and job CPU as progress"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -310,18 +435,27 @@ mod tests {
         user: 800_000_000,
     };
 
-    /// The stall window and ceiling under test.
+    /// The stall window and ceiling under test, for a command that is not a WSL one.
     fn config(stall_ms: u64, timeout_s: u64) -> Config {
         Config {
             stall: Duration::from_millis(stall_ms),
             timeout: timeout_s,
+            wsl: false,
+        }
+    }
+
+    /// The stall window and ceiling under test, for a WSL command.
+    fn wsl_config(stall_ms: u64, timeout_s: u64) -> Config {
+        Config {
+            wsl: true,
+            ..config(stall_ms, timeout_s)
         }
     }
 
     /// A watch of a 16-core machine asking a command for every core of it: a sample that reads [`IDLE`] again sees a
     /// full share.
     fn watching(config: Config) -> Watch {
-        Watch::new(config, Machine::new(16, 16, false), IDLE, Ticks(0))
+        Watch::new(config, Machine::new(16, 16, false), IDLE, Ticks(0), None)
     }
 
     /// A sample at `ms` of an idle machine: `job_cpu` used by the job, `output` bytes in the log, `pids` in the job.
@@ -333,6 +467,10 @@ mod tests {
             output_size: output,
             pids: pids.iter().copied().collect(),
             paused,
+            new_servers: BTreeMap::new(),
+            shared_servers: BTreeMap::new(),
+            build_client: false,
+            vm_cpu: None,
         }
     }
 
@@ -345,6 +483,10 @@ mod tests {
             output_size: 0,
             pids: BTreeSet::new(),
             paused,
+            new_servers: BTreeMap::new(),
+            shared_servers: BTreeMap::new(),
+            build_client: false,
+            vm_cpu: None,
         }
     }
 
@@ -353,9 +495,50 @@ mod tests {
         sample(ms, HALF_BUSY, false)
     }
 
+    /// A sample at `ms` of an idle machine whose job holds `pids`, holding a build client when `client`, with the build
+    /// servers the sample found.
+    fn server_tick(ms: u64, pids: &[u32], new: &[(u32, u64)], shared: &[(u32, u64)], client: bool) -> Sample {
+        let mut ticked = tick(ms, 0, 0, pids, false);
+        ticked.new_servers = new.iter().copied().collect();
+        ticked.shared_servers = shared.iter().copied().collect();
+        ticked.build_client = client;
+        ticked
+    }
+
+    /// A sample at `ms` of a WSL command's watch, reading `vm_cpu` as the VM's cumulative CPU.
+    fn vm_sample(ms: u64, vm_cpu: Option<u64>) -> Sample {
+        let mut ticked = sample(ms, IDLE, false);
+        ticked.vm_cpu = vm_cpu;
+        ticked
+    }
+
+    /// The times a 16-core machine reads over one second with every core busy: no idle, all of it in kernel.
+    const FULLY_BUSY: SystemTimes = SystemTimes {
+        idle: 0,
+        kernel: 160_000_000,
+        user: 0,
+    };
+
+    /// The same machine one second later, so the second sample's interval is busy on every core too.
+    const FULLY_BUSY_SECOND: SystemTimes = SystemTimes {
+        idle: 0,
+        kernel: 320_000_000,
+        user: 0,
+    };
+
+    /// The free share the first sample of a 16-core machine busy on every core found, with `new` and `shared` servers
+    /// and a build client when `client`: 1.6 core-seconds of a server over the 1 s sample is a 10% share.
+    fn server_share(new: &[(u32, u64)], shared: &[(u32, u64)], client: bool) -> Option<u32> {
+        let mut watch = Watch::new(config(60_000, 5000), Machine::new(16, 16, false), IDLE, Ticks(0), None);
+        let mut first = server_tick(1000, &[], new, shared, client);
+        first.system = FULLY_BUSY;
+        watch.sample(&first);
+        watch.last_free_percent()
+    }
+
     #[test]
     fn free_percent_counts_nothing_as_100() {
-        let watch = Watch::new(config(5000, 5), Machine::new(4, 4, false), IDLE, Ticks(0));
+        let watch = Watch::new(config(5000, 5), Machine::new(4, 4, false), IDLE, Ticks(0), None);
         assert!((watch.free_percent() - 100.0).abs() < f64::EPSILON);
     }
 
@@ -376,7 +559,7 @@ mod tests {
             kernel: 5_000_000_000,
             user: 3_000_000_000,
         };
-        let mut watch = Watch::new(config(5000, 5), machine, before, Ticks(0));
+        let mut watch = Watch::new(config(5000, 5), machine, before, Ticks(0), None);
         watch.sample(&sample(1000, half, false));
         watch.sample(&sample(2000, quarter, false));
         assert!(
@@ -396,7 +579,7 @@ mod tests {
             kernel: 7_000_000_000,
             user: 1_000_000_000,
         };
-        let mut watch = Watch::new(config(5000, 5), machine, before, Ticks(0));
+        let mut watch = Watch::new(config(5000, 5), machine, before, Ticks(0), None);
         watch.sample(&sample(1000, eighth, false));
         watch.sample(&sample(2000, two_eighths, false));
         assert!(
@@ -410,7 +593,7 @@ mod tests {
     fn paused_seconds_are_left_out_of_the_free_percent() {
         // A second of a full share and a second paused: 1 s counted, not 2.
         let machine = Machine::new(4, 4, true);
-        let mut watch = Watch::new(config(5000, 5), machine, IDLE, Ticks(0));
+        let mut watch = Watch::new(config(5000, 5), machine, IDLE, Ticks(0), None);
         watch.sample(&sample(1000, IDLE, false));
         watch.sample(&sample(2000, IDLE, true));
         assert!((watch.adjusted_seconds() - 1.0).abs() < f64::EPSILON);
@@ -419,7 +602,7 @@ mod tests {
 
     #[test]
     fn last_free_percent_is_the_last_share_rounded_half_to_even() {
-        let mut watch = Watch::new(config(5000, 5), Machine::new(4, 4, false), IDLE, Ticks(0));
+        let mut watch = Watch::new(config(5000, 5), Machine::new(4, 4, false), IDLE, Ticks(0), None);
         assert_eq!(watch.last_free_percent(), None, "no sample has found a share yet");
         // 5 idle of 8 ticks on a 4-core machine asking for all four: a share of 0.625.
         let five_eighths = SystemTimes {
@@ -672,7 +855,7 @@ mod tests {
     #[test]
     fn final_partial_interval_added_at_last_share() {
         let machine = Machine::new(16, 16, false);
-        let mut watch = Watch::new(config(60_000, 5000), machine, IDLE, Ticks(0));
+        let mut watch = Watch::new(config(60_000, 5000), machine, IDLE, Ticks(0), None);
         watch.sample(&half_sample(2000));
         watch.exited(Duration::from_millis(3000));
         assert!(
@@ -681,7 +864,7 @@ mod tests {
             watch.adjusted_seconds()
         );
 
-        let mut watch = Watch::new(config(60_000, 5000), machine, IDLE, Ticks(0));
+        let mut watch = Watch::new(config(60_000, 5000), machine, IDLE, Ticks(0), None);
         watch.sample(&half_sample(2000));
         watch.sampler_failed("the job is gone");
         watch.exited(Duration::from_millis(3000));
@@ -742,6 +925,261 @@ mod tests {
         assert_eq!(
             sampler_failed_line("the job is gone"),
             "gate: sampler failed: the job is gone; watching by wall time only"
+        );
+        assert_eq!(
+            wsl_unavailable_line("the counter is missing"),
+            "gate: WSL VM CPU unavailable (the counter is missing); retrying each sample, and until a read succeeds \
+             this wsl command counts only output and job CPU as progress"
+        );
+    }
+
+    #[test]
+    fn measure_cpu_reads_the_moves_powershell_reads() {
+        let before = BTreeMap::from([(1, 100), (2, 50)]);
+        let after = BTreeMap::from([(1, 150), (2, 50), (3, 70)]);
+        assert_eq!(
+            measure_cpu(&before, &after),
+            CpuMove {
+                gained: 120,
+                continued: 50,
+                rose: true,
+                appeared: true,
+            },
+            "a continuing process adds its delta to both, an appearing one its whole CPU to gained alone"
+        );
+        assert_eq!(
+            measure_cpu(&before, &BTreeMap::from([(1, 100), (2, 50), (3, 70)])),
+            CpuMove {
+                gained: 70,
+                continued: 0,
+                rose: false,
+                appeared: true,
+            },
+            "no process that was there before gained anything, so nothing rose"
+        );
+        assert_eq!(
+            measure_cpu(&BTreeMap::from([(1, 500)]), &BTreeMap::from([(1, 400)])),
+            CpuMove::default(),
+            "a process whose CPU reads lower than before gains nothing and does not rise"
+        );
+        assert_eq!(
+            measure_cpu(&BTreeMap::from([(1, 500), (2, 60)]), &BTreeMap::from([(1, 500)])),
+            CpuMove::default(),
+            "a process that vanished is not in the sample at all, so it neither gains nor appears"
+        );
+    }
+
+    #[test]
+    fn a_build_server_that_only_appeared_is_not_progress() {
+        let mut watch = watching(config(1000, 5000));
+        watch.sample(&server_tick(1000, &[10], &[], &[], false));
+        watch.sample(&server_tick(2000, &[10], &[(99, 16_000_000)], &[], true));
+        assert!(
+            matches!(watch.kill_check(Duration::from_millis(2000)), Some(Kill::Stalled { .. })),
+            "a server appearing is not a server working"
+        );
+    }
+
+    #[test]
+    fn a_server_rising_counts_only_while_the_job_holds_a_build_client() {
+        // Test-SharedCompiler: the compiler server an earlier build left running works for the client in the job.
+        let mut watch = watching(config(1000, 5000));
+        watch.sample(&server_tick(1000, &[10], &[], &[(77, 1_000_000)], true));
+        watch.sample(&server_tick(2000, &[10], &[], &[(77, 9_000_000)], true));
+        assert!(
+            watch.kill_check(Duration::from_millis(2000)).is_none(),
+            "the shared compiler's CPU is the quiet job's progress"
+        );
+
+        // Test-OldServer: without a client in the job, no server's CPU counts.
+        let mut watch = watching(config(1000, 5000));
+        watch.sample(&server_tick(1000, &[10], &[], &[(77, 1_000_000)], false));
+        watch.sample(&server_tick(2000, &[10], &[], &[(77, 9_000_000)], false));
+        assert!(
+            matches!(watch.kill_check(Duration::from_millis(2000)), Some(Kill::Stalled { .. })),
+            "the same server with no client in the job is no progress"
+        );
+    }
+
+    #[test]
+    fn a_new_server_rising_counts_only_while_the_job_holds_a_build_client() {
+        // Test-UnrelatedServer: a build server another process starts while the gate runs is new to the job, not one
+        // it started; its CPU counts only while the job holds a build client.
+        let mut watch = watching(config(1000, 5000));
+        watch.sample(&server_tick(1000, &[10], &[(99, 1_000_000)], &[], true));
+        watch.sample(&server_tick(2000, &[10], &[(99, 9_000_000)], &[], true));
+        assert!(
+            watch.kill_check(Duration::from_millis(2000)).is_none(),
+            "the new server's CPU is the quiet job's progress"
+        );
+
+        let mut watch = watching(config(1000, 5000));
+        watch.sample(&server_tick(1000, &[10], &[(99, 1_000_000)], &[], false));
+        watch.sample(&server_tick(2000, &[10], &[(99, 9_000_000)], &[], false));
+        assert!(
+            matches!(watch.kill_check(Duration::from_millis(2000)), Some(Kill::Stalled { .. })),
+            "the same new server with no client in the job is no progress"
+        );
+    }
+
+    #[test]
+    fn own_cpu_counts_the_servers_only_for_a_build_client() {
+        // A server gaining 1.6 core-seconds over the 1 s sample counts as the command's own CPU with a client, so the
+        // share of a machine busy on every core is a tenth; without one it is the 5% floor.
+        assert_eq!(server_share(&[(99, 16_000_000)], &[], true), Some(10));
+        assert_eq!(server_share(&[(99, 16_000_000)], &[], false), Some(5));
+    }
+
+    #[test]
+    fn a_shared_server_counts_only_its_continuing_cpu_as_own() {
+        let mut watch = Watch::new(config(60_000, 5000), Machine::new(16, 16, false), IDLE, Ticks(0), None);
+        let mut first = server_tick(1000, &[], &[], &[(77, 5_000_000)], true);
+        first.system = FULLY_BUSY;
+        watch.sample(&first);
+        assert_eq!(
+            watch.last_free_percent(),
+            Some(5),
+            "a shared server first seen adds none of its lifetime CPU to the command's own"
+        );
+        let mut second = server_tick(2000, &[], &[], &[(77, 21_000_000)], true);
+        second.system = FULLY_BUSY_SECOND;
+        watch.sample(&second);
+        assert_eq!(
+            watch.last_free_percent(),
+            Some(10),
+            "the delta of a continuing shared server is the command's own CPU"
+        );
+    }
+
+    #[test]
+    fn the_cpu_of_a_child_that_exited_is_progress() {
+        // Test-ShortLivedChild: the command runs one busy child after another, so the job's accounting gains the
+        // floor's CPU while the pids the last sample held keep leaving it.
+        let mut watch = watching(config(1000, 5000));
+        watch.sample(&tick(1000, 100_000, 0, &[10, 11], false));
+        watch.sample(&tick(2000, 200_000, 0, &[10], false));
+        assert!(
+            watch.kill_check(Duration::from_millis(2000)).is_none(),
+            "the job gained the floor's CPU while a pid left"
+        );
+    }
+
+    #[test]
+    fn a_grandchild_whose_parent_exited_is_progress() {
+        // Test-OrphanProgress: the busy grandchild stays in the job after the child that started it exited, so only
+        // the job's CPU shows it working.
+        let mut watch = watching(config(1000, 5000));
+        watch.sample(&tick(1000, 0, 0, &[10, 11], false));
+        watch.sample(&tick(2000, 100_000, 0, &[10, 11], false));
+        assert!(
+            watch.kill_check(Duration::from_millis(2000)).is_none(),
+            "the orphaned grandchild's CPU is progress"
+        );
+    }
+
+    #[test]
+    fn the_vm_floor_is_exactly_a_tenth_of_the_stall_window() {
+        // The floor of a stall window is a tenth of it in core-seconds, 100 000 ticks each: it is reached by exactly
+        // that many ticks and not by one tick less.
+        let windows: [(u64, u64); 4] = [(3, 3_000_000), (5, 5_000_000), (6, 6_000_000), (7, 7_000_000)];
+        for (stall_s, floor) in windows {
+            let mut watch = watching(wsl_config(stall_s * 1000, 5000));
+            watch.sample(&vm_sample(1000, Some(1_000_000)));
+            watch.sample(&vm_sample(2000, Some(1_000_000 + floor - 1)));
+            assert!(
+                matches!(watch.kill_check(Duration::from_millis(1000 + stall_s * 1000)), Some(Kill::Stalled { .. })),
+                "a tick of the VM short of the {stall_s} s window's floor is not progress"
+            );
+
+            let mut watch = watching(wsl_config(stall_s * 1000, 5000));
+            watch.sample(&vm_sample(1000, Some(1_000_000)));
+            watch.sample(&vm_sample(2000, Some(1_000_000 + floor)));
+            assert!(
+                watch.kill_check(Duration::from_millis(1000 + stall_s * 1000)).is_none(),
+                "the {stall_s} s window's floor itself is progress"
+            );
+        }
+    }
+
+    #[test]
+    fn the_vm_cpu_is_never_the_commands_own_cpu() {
+        // 19.9 core-seconds of VM CPU over the second sample of a machine busy on every core: the VM's CPU is not the
+        // command's own, so the share stays at the floor.
+        let mut watch = Watch::new(wsl_config(60_000, 5000), Machine::new(16, 16, false), IDLE, Ticks(0), None);
+        let mut first = vm_sample(1000, Some(1_000_000));
+        first.system = FULLY_BUSY;
+        watch.sample(&first);
+        let mut second = vm_sample(2000, Some(200_000_000));
+        second.system = FULLY_BUSY_SECOND;
+        watch.sample(&second);
+        assert_eq!(watch.last_free_percent(), Some(5), "the VM's CPU is not counted as the command's own");
+    }
+
+    #[test]
+    fn the_vm_core_seconds_survive_a_failed_reading() {
+        // PowerShell drops the counter on a failed read but keeps VmBusy: the reading after the failure is a fresh
+        // baseline, and the ticks accrued before it still count.
+        let mut watch = watching(wsl_config(5000, 5000));
+        watch.sample(&vm_sample(1000, Some(1_000_000)));
+        watch.sample(&vm_sample(2000, Some(3_000_000)));
+        watch.sample(&vm_sample(3000, None));
+        watch.sample(&vm_sample(4000, Some(20_000_000)));
+        watch.sample(&vm_sample(5000, Some(23_000_000)));
+        assert!(
+            watch.kill_check(Duration::from_millis(5000)).is_none(),
+            "the 0.2 core-seconds before the failed read and the 0.3 after it reach the 0.5 floor"
+        );
+    }
+
+    #[test]
+    fn the_vm_accrual_resets_on_any_progress() {
+        // Two 0.4 core-second stretches, unbroken, would pass the 0.5 floor of a 5 s window.
+        let mut watch = watching(wsl_config(5000, 5000));
+        watch.sample(&vm_sample(1000, Some(1_000_000)));
+        let mut grew = vm_sample(2000, Some(5_000_000));
+        grew.output_size = 1;
+        watch.sample(&grew);
+        let mut quiet = vm_sample(3000, Some(9_000_000));
+        quiet.output_size = 1;
+        watch.sample(&quiet);
+        assert!(
+            matches!(watch.kill_check(Duration::from_millis(7000)), Some(Kill::Stalled { .. })),
+            "the log growing at 2 s reset the accrual, so 3 s adds only 0.4 core-seconds"
+        );
+    }
+
+    #[test]
+    fn the_first_reading_after_none_is_a_fresh_baseline() {
+        let mut watch = watching(wsl_config(5000, 5000));
+        watch.sample(&vm_sample(1000, Some(1_000_000)));
+        watch.sample(&vm_sample(2000, None));
+        watch.sample(&vm_sample(3000, Some(20_000_000)));
+        assert!(
+            matches!(watch.kill_check(Duration::from_millis(5000)), Some(Kill::Stalled { .. })),
+            "the reading after an unreadable one is a baseline, not 1.9 core-seconds of progress"
+        );
+    }
+
+    #[test]
+    fn the_vm_counts_only_for_a_wsl_command() {
+        let mut watch = watching(config(5000, 5000));
+        watch.sample(&vm_sample(1000, Some(1_000_000)));
+        watch.sample(&vm_sample(2000, Some(6_000_000)));
+        assert!(
+            matches!(watch.kill_check(Duration::from_millis(5000)), Some(Kill::Stalled { .. })),
+            "a command that is not a WSL one counts no VM CPU"
+        );
+    }
+
+    #[test]
+    fn a_vm_baseline_at_the_start_counts_the_first_sample() {
+        // PowerShell reads the VM once when it creates the watch, so its first sample counts what the VM used since the
+        // command started: a watch given 1 000 000 ticks then reads 6 000 000 and has its 5 s window's floor.
+        let mut watch = Watch::new(wsl_config(5000, 5000), Machine::new(16, 16, false), IDLE, Ticks(0), Some(1_000_000));
+        watch.sample(&vm_sample(1000, Some(6_000_000)));
+        assert!(
+            watch.kill_check(Duration::from_millis(5000)).is_none(),
+            "the first sample counts the 0.5 core-seconds the VM used since the watch began"
         );
     }
 }
