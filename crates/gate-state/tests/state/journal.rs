@@ -140,6 +140,163 @@ fn commands(history: &History) -> Vec<&str> {
     history.runs.iter().map(|run| run.command.as_str()).collect()
 }
 
+/// A run's command, state, verdict, wall seconds and adjusted seconds.
+type RunFacts<'a> = (&'a str, RunState, Option<&'a str>, Option<f64>, Option<f64>);
+
+/// `line` with `"v": v` put first, as the Rust gate writes it.
+fn versioned(line: &str, v: u64) -> String {
+    let fields: serde_json::Map<String, Value> = serde_json::from_str(line).expect("a test line is a JSON object");
+    let mut versioned = serde_json::Map::new();
+    versioned.insert("v".to_owned(), json!(v));
+    versioned.extend(fields);
+    Value::Object(versioned).to_string()
+}
+
+/// `line` with `fields` added after its own.
+fn with_fields(line: &str, fields: &Value) -> String {
+    let mut value: Value = serde_json::from_str(line).expect("a test line is JSON");
+    let extra = fields.as_object().expect("the fields are an object").clone();
+    value.as_object_mut().expect("a test line is an object").extend(extra);
+    value.to_string()
+}
+
+#[test]
+fn release_with_and_without_run_facts_parses() {
+    let facts = Gate::new(1, START, "cargo build");
+    let bare = Gate::new(2, START, "cargo test");
+    let early = Gate::new(3, START, "cargo check");
+    let lines = vec![
+        versioned(&facts.queue(&ago(30)), 1),
+        versioned(&facts.take(&ago(29), 0.5), 1),
+        versioned(
+            &with_fields(
+                &facts.release(&ago(28), 1.5, json!(0)),
+                &json!({"wallSeconds": 1.25, "adjustedSeconds": 1.125, "verdict": "passed"}),
+            ),
+            1,
+        ),
+        bare.queue(&ago(20)),
+        bare.take(&ago(19), 0.5),
+        bare.release(&ago(18), 2.0, json!(3)),
+        versioned(&early.queue(&ago(10)), 1),
+        versioned(&early.take(&ago(9), 0.5), 1),
+        versioned(
+            &with_fields(
+                &early.release(&ago(8), 0.25, Value::Null),
+                &json!({"wallSeconds": null, "adjustedSeconds": null, "verdict": "unknown"}),
+            ),
+            1,
+        ),
+    ];
+
+    let history = history_of("release_with_and_without_run_facts_parses", &lines);
+
+    let facts_of: Vec<RunFacts<'_>> = history
+        .runs
+        .iter()
+        .map(|run| {
+            (
+                run.command.as_str(),
+                run.state,
+                run.verdict.as_deref(),
+                run.wall_seconds,
+                run.adjusted_seconds,
+            )
+        })
+        .collect();
+    assert_eq!(
+        facts_of,
+        [
+            ("cargo check", RunState::Failed, Some("unknown"), None, None),
+            ("cargo test", RunState::Failed, None, None, None),
+            ("cargo build", RunState::Ok, Some("passed"), Some(1.25), Some(1.125)),
+        ]
+    );
+}
+
+#[test]
+fn reserved_release_fields_are_accepted() {
+    let gate = Gate::new(1, START, COMMAND);
+    let reserved = json!({
+        "wallSeconds": 3.5, "adjustedSeconds": 2.0, "verdict": "passed", "avgCores": 3.25, "peakCores": 8.0, "freeCores": 12.5,
+    });
+    let lines = vec![
+        versioned(&gate.queue(&ago(30)), 1),
+        versioned(&gate.take(&ago(29), 0.5), 1),
+        versioned(&with_fields(&gate.release(&ago(28), 4.0, json!(0)), &reserved), 1),
+    ];
+
+    let history = history_of("reserved_release_fields_are_accepted", &lines);
+
+    assert_eq!(states(&history), [RunState::Ok]);
+    assert_eq!((history.runs[0].held_seconds, history.runs[0].status), (Some(4.0), Some(0)));
+}
+
+#[test]
+fn reserved_take_fields_are_accepted() {
+    let gate = Gate::new(1, START, COMMAND);
+    let reserved = json!({
+        "abandoned": [r"Local\gate-slot-1"], "counts": {"heavy": 4, "light": 7}, "otherHeld": [r"Local\gate-light-slot-2"],
+        "otherClaims": [], "snapshotError": "the process snapshot failed",
+    });
+    let lines = vec![
+        versioned(&gate.queue(&ago(30)), 1),
+        versioned(&with_fields(&gate.take(&ago(29), 0.5), &reserved), 1),
+    ];
+
+    let history = history_of("reserved_take_fields_are_accepted", &lines);
+
+    assert_eq!(states(&history), [RunState::Unrecorded]);
+    let run = &history.runs[0];
+    assert_eq!(
+        (run.started.as_deref(), run.slot, run.waited_seconds),
+        (Some(ago(29).as_str()), Some(1), Some(0.5))
+    );
+}
+
+#[test]
+fn line_with_unknown_v_is_skipped() {
+    let future = Gate::new(1, START, "cargo build");
+    let current = Gate::new(2, START, COMMAND);
+    let mut lines: Vec<String> = future.run(30, 1.0, json!(0)).iter().map(|line| versioned(line, 2)).collect();
+    lines.extend(current.run(20, 1.0, json!(0)).iter().map(|line| versioned(line, 1)));
+
+    let history = history_of("line_with_unknown_v_is_skipped", &lines);
+
+    assert_eq!(commands(&history), [COMMAND], "a line of a format this reader does not know is skipped");
+}
+
+#[test]
+fn line_without_v_is_read_as_powershell_format() {
+    let gate = Gate::new(1, START, COMMAND);
+    let with_facts = Gate::new(2, START, "cargo build");
+    let mut lines = gate.run(30, 2.0, json!(0));
+    lines.extend([
+        with_facts.queue(&ago(20)),
+        with_facts.take(&ago(19), 0.5),
+        with_fields(
+            &with_facts.release(&ago(18), 3.25, json!(3)),
+            &json!({"wallSeconds": 3.2, "adjustedSeconds": 2.9, "verdict": "failed"}),
+        ),
+    ]);
+
+    let history = history_of("line_without_v_is_read_as_powershell_format", &lines);
+
+    assert_eq!(states(&history), [RunState::Failed, RunState::Ok]);
+    let facts = &history.runs[0];
+    assert_eq!(
+        (facts.held_seconds, facts.verdict.as_deref(), facts.wall_seconds, facts.adjusted_seconds),
+        (Some(3.25), Some("failed"), Some(3.2), Some(2.9)),
+        "a PowerShell release that carries the run's facts, wall seconds to one decimal"
+    );
+    let bare = &history.runs[1];
+    assert_eq!(
+        (bare.held_seconds, bare.verdict.as_deref(), bare.wall_seconds),
+        (Some(2.0), None, None),
+        "a release line without them"
+    );
+}
+
 #[test]
 fn normalize_command_examples() {
     let examples = [
@@ -209,6 +366,9 @@ fn runs_pair_queue_take_release_by_pid_and_process_start() {
                 waited_seconds: Some(1.0),
                 held_seconds: Some(60.0),
                 status: Some(4),
+                verdict: None,
+                wall_seconds: None,
+                adjusted_seconds: None,
             },
             HistoryRun {
                 command: "cargo build".to_owned(),
@@ -226,6 +386,9 @@ fn runs_pair_queue_take_release_by_pid_and_process_start() {
                 waited_seconds: Some(2.0),
                 held_seconds: Some(120.0),
                 status: Some(0),
+                verdict: None,
+                wall_seconds: None,
+                adjusted_seconds: None,
             },
         ]
     );

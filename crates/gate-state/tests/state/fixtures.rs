@@ -14,8 +14,14 @@ const CLAIM: &str = include_str!("fixtures/claim.json");
 const TICKET: &str = include_str!("fixtures/ticket.json");
 /// The counts file the capture ran under.
 const SLOT_COUNTS: &str = include_str!("fixtures/slot-counts.json");
-/// The journal of four light gates under one light slot, plus a hand-written abandoned one.
+/// The journal of three light gates captured through gate.exe's `--test-journal-run` seam (statuses 0, 3 and 0), plus a
+/// hand-written abandoned one.
 const JOURNAL: &str = include_str!("fixtures/journal.jsonl");
+/// The PowerShell gate's journal of four light gates under one light slot, captured before the v1 format (no `v`), plus
+/// a hand-written abandoned one.
+const POWERSHELL_JOURNAL: &str = include_str!("fixtures/journal-powershell.jsonl");
+/// The self-test prefix the PowerShell journal was captured under.
+const POWERSHELL_PREFIX: &str = "ops72-";
 /// A remote slot's claim file, written by hand from the design.
 const REMOTE_CLAIM: &str = include_str!("fixtures/remote-claim.json");
 /// The arrival ticket of a gate routed to the remote pool, written by hand from the design.
@@ -106,6 +112,34 @@ fn captured_ticket_is_read_into_the_queue() {
     assert_eq!(ticket.arrived, "2026-10-02T21:16:02.4458960Z");
     assert!((ticket.age_seconds - 5.0).abs() < f64::EPSILON, "age {}", ticket.age_seconds);
     assert_eq!(ticket.command_line.as_deref(), Some(WAITING_GATE));
+}
+
+/// `text`, a JSON object, with a reserved `expected` member added last.
+fn with_expected(text: &str) -> String {
+    let body = text.trim_end().strip_suffix('}').expect("the fixture is a JSON object");
+    format!(r#"{body},"expected":{{"p50":12.5,"p90":30.25,"n":8,"key":"cargo test"}}}}"#)
+}
+
+#[test]
+fn claim_and_ticket_accept_expected() {
+    let mut machine = Machine::new("claim_and_ticket_accept_expected");
+    machine.prefix = PREFIX.to_owned();
+    machine.write_claim("ops28-gate-slot-0.json", &with_expected(CLAIM));
+    machine.add_process(51000, 1, "pwsh.exe", None, Some("2026-10-02T21:16:00.5711853Z"));
+    machine.write_ticket("ops28-waiting", "60080-639265725620427420.json", &with_expected(TICKET));
+    machine.add_process(60080, 1, "pwsh.exe", Some(WAITING_GATE), Some("2026-10-02T21:16:02.0427420Z"));
+    let mut inputs = machine.inputs();
+    inputs.now = ts("2026-10-02T21:16:07.4458960Z");
+
+    let state = dashboard_state(&inputs, &machine, &machine, &machine);
+
+    let heavy = pool(&state, SlotKind::Heavy);
+    let row = heavy.slots.iter().find(|slot| slot.index == 0).expect("the heavy pool has slot 0");
+    assert_eq!(row.state, SlotState::Busy, "a claim carrying `expected` is read");
+    let expected = row.claim.as_ref().and_then(|claim| claim.get("expected"));
+    assert_eq!(expected.and_then(|expected| expected.get("n")).and_then(Value::as_u64), Some(8));
+    let pids: Vec<u32> = state.queue.iter().map(|ticket| ticket.pid).collect();
+    assert_eq!(pids, [60080], "a ticket carrying `expected` is read");
 }
 
 #[test]
@@ -257,12 +291,102 @@ fn captured_journal_is_read_into_runs() {
         fs::remove_dir_all(&dir).expect("the test's old folder can be removed");
     }
     fs::create_dir_all(&dir).expect("the test's folder can be made");
-    fs::write(dir.join("ops72-events.jsonl"), JOURNAL).expect("the journal can be written");
+    fs::write(dir.join("events.jsonl"), JOURNAL).expect("the journal can be written");
     let not_live = |_pid: u32, _process_start: &str| false;
     let last_segment = |cwd: &str| cwd.rsplit(['\\', '/']).next().map(str::to_owned);
 
     let history = JournalCache::default()
-        .read(&dir, "ops72-", ts("2026-10-03T06:00:00Z"), not_live, last_segment)
+        .read(&dir, "", ts("2026-10-10T06:00:00Z"), not_live, last_segment)
+        .expect("the journal can be read");
+
+    let states: Vec<(Option<&str>, RunState)> = history.runs.iter().map(|run| (run.verdict.as_deref(), run.state)).collect();
+    assert_eq!(
+        states,
+        [
+            (Some("passed"), RunState::Ok),
+            (Some("failed"), RunState::Failed),
+            (Some("passed"), RunState::Ok),
+            (None, RunState::Abandoned),
+        ],
+        "newest first: the second exit 0, exit 3, the first exit 0, then the hand-written abandoned gate"
+    );
+    assert_eq!(
+        history.runs[2],
+        HistoryRun {
+            command: "cmd /c exit 0".to_owned(),
+            cwd: Some(r"C:\work\repo".to_owned()),
+            repo: Some("repo".to_owned()),
+            kind: "light".to_owned(),
+            slot: None,
+            remote: false,
+            host: None,
+            fallback: None,
+            parent_pid: None,
+            state: RunState::Ok,
+            queued: Some("2026-10-10T00:12:31.4787619Z".to_owned()),
+            started: Some("2026-10-10T00:12:31.4792208Z".to_owned()),
+            waited_seconds: Some(0.0),
+            held_seconds: Some(0.0),
+            status: Some(0),
+            verdict: Some("passed".to_owned()),
+            wall_seconds: Some(0.0),
+            adjusted_seconds: None,
+        },
+        "the seam takes no slot"
+    );
+    assert_eq!(
+        history.runs[1],
+        HistoryRun {
+            command: "cmd /c exit 3".to_owned(),
+            cwd: Some(r"C:\work\repo".to_owned()),
+            repo: Some("repo".to_owned()),
+            kind: "light".to_owned(),
+            slot: None,
+            remote: false,
+            host: None,
+            fallback: None,
+            parent_pid: None,
+            state: RunState::Failed,
+            queued: Some("2026-10-10T00:12:31.4965943Z".to_owned()),
+            started: Some("2026-10-10T00:12:31.4968993Z".to_owned()),
+            waited_seconds: Some(0.0),
+            held_seconds: Some(0.0),
+            status: Some(3),
+            verdict: Some("failed".to_owned()),
+            wall_seconds: Some(0.0),
+            adjusted_seconds: None,
+        }
+    );
+    assert_eq!(history.runs[3].waited_seconds, Some(1.7), "the abandoned gate's wait");
+    assert_eq!(
+        history.summary,
+        [CommandSummary {
+            command: "cmd /c exit 0".to_owned(),
+            repo: Some("repo".to_owned()),
+            remote: false,
+            count: 2,
+            p50_seconds: 0.0,
+            p90_seconds: 0.0,
+            max_seconds: 0.0,
+        }]
+    );
+}
+
+#[test]
+fn powershell_journal_is_read_into_runs() {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join("gate-state")
+        .join("powershell_journal_is_read_into_runs");
+    if dir.exists() {
+        fs::remove_dir_all(&dir).expect("the test's old folder can be removed");
+    }
+    fs::create_dir_all(&dir).expect("the test's folder can be made");
+    fs::write(dir.join("ops72-events.jsonl"), POWERSHELL_JOURNAL).expect("the journal can be written");
+    let not_live = |_pid: u32, _process_start: &str| false;
+    let last_segment = |cwd: &str| cwd.rsplit(['\\', '/']).next().map(str::to_owned);
+
+    let history = JournalCache::default()
+        .read(&dir, POWERSHELL_PREFIX, ts("2026-10-03T06:00:00Z"), not_live, last_segment)
         .expect("the journal can be read");
 
     let states: Vec<(u32, RunState)> = history.runs.iter().map(|run| (run.slot.unwrap_or(u32::MAX), run.state)).collect();
@@ -275,7 +399,7 @@ fn captured_journal_is_read_into_runs() {
             (0, RunState::Failed),
             (0, RunState::Ok),
         ],
-        "newest first: the abandoned gate, the gate that waited, the sleep, exit 3, exit 0"
+        "newest first: the abandoned gate, the gate that waited, the sleep, exit 3, exit 0; ops72-gate-light-slot-0 is slot 0"
     );
     assert_eq!(
         history.runs[4],
@@ -295,6 +419,9 @@ fn captured_journal_is_read_into_runs() {
             waited_seconds: Some(0.065),
             held_seconds: Some(0.105),
             status: Some(0),
+            verdict: None,
+            wall_seconds: None,
+            adjusted_seconds: None,
         }
     );
     assert_eq!(
@@ -315,6 +442,9 @@ fn captured_journal_is_read_into_runs() {
             waited_seconds: Some(0.071),
             held_seconds: Some(0.096),
             status: Some(3),
+            verdict: None,
+            wall_seconds: None,
+            adjusted_seconds: None,
         }
     );
     assert_eq!(

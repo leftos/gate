@@ -32,6 +32,7 @@ fn seam_flags_parse_with_the_feature() {
             heartbeat_ms: Some(60),
             poll_ms: Some(70),
             stall_ms: Some(80),
+            journal_run: None,
         }
     );
     assert!(request.print_request);
@@ -78,6 +79,57 @@ fn seam_flags_parse_with_the_feature() {
     assert_eq!(
         problems(&["-Log", "x", "-TimeoutSeconds", "5", "-Slot", "heavy", "--test-poll-ms", "5", "--", "cmd"]),
         ["gate: unknown option --test-poll-ms", "gate: unexpected argument 5"]
+    );
+}
+
+#[cfg(feature = "test-seams")]
+#[test]
+fn test_journal_run_parses_with_the_feature() {
+    use crate::support::run_request;
+
+    for (value, status) in [("0", 0), ("3", 3), ("255", 255)] {
+        let request = run_request(&refs(&with(&RUN, &["--test-journal-run", value, "--", "cmd"])));
+        assert_eq!(request.test_seams.journal_run, Some(status), "{value}");
+        assert!(!request.print_request);
+    }
+    let inline = run_request(&refs(&with(&RUN, &["--test-journal-run=7", "--", "cmd"])));
+    assert_eq!(inline.test_seams.journal_run, Some(7));
+    assert_eq!(run_request(&refs(&with(&RUN, &["--", "cmd"]))).test_seams.journal_run, None);
+    assert_eq!(
+        problems(&[
+            "-Log",
+            "x",
+            "-TimeoutSeconds",
+            "5",
+            "-Slot",
+            "heavy",
+            "--test-journal-run",
+            "0",
+            "--",
+            "cmd"
+        ]),
+        ["gate: unknown option --test-journal-run", "gate: unexpected argument 0"],
+        "the compatibility layer does not read it"
+    );
+}
+
+#[cfg(feature = "test-seams")]
+#[test]
+fn test_journal_run_rejects_out_of_range() {
+    for value in ["256", "-1", "1.5", "x", "99999999999999999999"] {
+        assert_eq!(
+            problems(&refs(&with(&RUN, &["--test-journal-run", value, "--", "cmd"]))),
+            [format!("gate: --test-journal-run must be a whole number 0 to 255, got '{value}'")]
+        );
+    }
+}
+
+#[cfg(feature = "test-seams")]
+#[test]
+fn test_journal_run_and_print_request_cannot_be_combined() {
+    assert_eq!(
+        problems(&refs(&with(&RUN, &["--test-journal-run", "0", "--test-print-request", "--", "cmd"]))),
+        ["gate: --test-journal-run and --test-print-request cannot be combined"]
     );
 }
 

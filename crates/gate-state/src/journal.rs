@@ -97,6 +97,16 @@ pub struct HistoryRun {
     /// ran. For a [`RunState::Parent`] run, its parent's run's status, `None` until the journal holds that run's release,
     /// and only while the journal read still holds the parent's run.
     pub status: Option<i64>,
+    /// How the command ended, from its release's `verdict`, which both gates write; `None` without a release or when the
+    /// release line lacks the field, or holds null. For a [`RunState::Parent`] run, its parent's run's, as for `status`.
+    pub verdict: Option<String>,
+    /// The command's wall time, from its release's `wallSeconds` (the PowerShell gate rounds it to one decimal, the Rust
+    /// gate to three); `None` without a release or when the release line lacks the field, or holds null. For a
+    /// [`RunState::Parent`] run, its parent's run's.
+    pub wall_seconds: Option<f64>,
+    /// The command's load-adjusted seconds, from its release's `adjustedSeconds`; `None` without one. For a
+    /// [`RunState::Parent`] run, its parent's run's.
+    pub adjusted_seconds: Option<f64>,
 }
 
 /// How long the runs of one command in one repository that passed held their slot, the remote runs apart from the local
@@ -192,15 +202,23 @@ struct Run {
     waited_seconds: Option<f64>,
     held_seconds: Option<f64>,
     status: Option<i64>,
+    verdict: Option<String>,
+    wall_seconds: Option<f64>,
+    adjusted_seconds: Option<f64>,
     end: Option<End>,
     /// The parent gate's pid and the time of the run's `parent` line, once one followed its `fallback`.
     parent: Option<(u32, Timestamp)>,
 }
 
-/// The fields of a journal line the history reads.
+/// The fields of a journal line the history reads. The reserved fields (`avgCores`, `peakCores`, `freeCores` on a
+/// release; `abandoned`, `counts`, `otherHeld`, `otherClaims`, `snapshotError` on a take) are not read, and a line
+/// parses with or without them.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Line {
+    /// The format version: 1 for the Rust gate's lines, absent from the PowerShell gate's.
+    #[serde(default)]
+    v: Option<u64>,
     time: String,
     event: String,
     pid: u32,
@@ -216,6 +234,12 @@ struct Line {
     held_seconds: Option<f64>,
     #[serde(default)]
     status: Option<i64>,
+    #[serde(default)]
+    verdict: Option<String>,
+    #[serde(default)]
+    wall_seconds: Option<f64>,
+    #[serde(default)]
+    adjusted_seconds: Option<f64>,
     #[serde(default)]
     remote: bool,
     #[serde(default)]
@@ -312,13 +336,17 @@ impl JournalCache {
         }
     }
 
-    /// Adds one journal line to its run; a line that does not parse, the self-test's, and every event but the five a
-    /// run is made of and `parent` are skipped. A run's first `queue` line sets its queued time; a later one does not. A
-    /// `fallback` line sends a remote run back to the local queue: the run is no longer remote, and keeps the reason.
+    /// Adds one journal line to its run; a line that does not parse, a line whose `v` is not 1 (a line without `v` is the
+    /// PowerShell gate's), the self-test's, and every event but the five a run is made of and `parent` are skipped. A
+    /// run's first `queue` line sets its queued time; a later one does not. A `fallback` line sends a remote run back to
+    /// the local queue: the run is no longer remote, and keeps the reason.
     fn apply(&mut self, bytes: &[u8]) {
         let Ok(line) = serde_json::from_slice::<Line>(bytes.trim_ascii()) else {
             return;
         };
+        if line.v.is_some_and(|v| v != 1) {
+            return;
+        }
         let Ok(at) = line.time.parse::<Timestamp>() else {
             return;
         };
@@ -347,6 +375,9 @@ impl JournalCache {
             waited_seconds: None,
             held_seconds: None,
             status: None,
+            verdict: None,
+            wall_seconds: None,
+            adjusted_seconds: None,
             end: None,
             parent: None,
         });
@@ -364,6 +395,9 @@ impl JournalCache {
             "release" => {
                 run.held_seconds = line.held_seconds;
                 run.status = line.status;
+                run.verdict = line.verdict;
+                run.wall_seconds = line.wall_seconds;
+                run.adjusted_seconds = line.adjusted_seconds;
                 run.end = Some(End::Released);
                 // A release line that says `remote` marks a run whose queue and take rolled out of the journal; one that
                 // does not leaves the run as its take left it.
@@ -485,6 +519,9 @@ impl Run {
             waited_seconds: self.waited_seconds,
             held_seconds: end.and_then(|end| end.held_seconds),
             status: end.and_then(|end| end.status),
+            verdict: end.and_then(|end| end.verdict.clone()),
+            wall_seconds: end.and_then(|end| end.wall_seconds),
+            adjusted_seconds: end.and_then(|end| end.adjusted_seconds),
         }
     }
 

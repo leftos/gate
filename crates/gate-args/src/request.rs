@@ -41,14 +41,17 @@ impl Slot {
     }
 }
 
-/// The timing knobs the black-box suite sets through the hidden `--test-*` flags, in milliseconds; all `None` in a
-/// gate built without the `test-seams` feature.
+/// What the black-box suite sets through the hidden `--test-*` flags: the timing knobs, in milliseconds, and the
+/// journal seam; all `None` in a gate built without the `test-seams` feature.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TestSeams {
     pub sample_ms: Option<u64>,
     pub heartbeat_ms: Option<u64>,
     pub poll_ms: Option<u64>,
     pub stall_ms: Option<u64>,
+    /// `--test-journal-run <status>`: journal a run's queue, take and release without launching its command or taking
+    /// a slot, then exit with this status.
+    pub journal_run: Option<u8>,
 }
 
 /// A valid `gate run`.

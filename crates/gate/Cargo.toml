@@ -14,7 +14,12 @@ test-seams = ["gate-args/test-seams"]
 [dependencies]
 gate-args = { path = "../gate-args" }
 gate-state = { path = "../gate-state" }
+gate-win32 = { path = "../gate-win32" }
+jiff = "0.2.37"
 serde_json = { version = "1.0.151", features = ["preserve_order"] }
+
+[dev-dependencies]
+flate2 = "1.1.10"
 
 [[bin]]
 name = "gate"

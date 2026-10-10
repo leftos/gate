@@ -98,6 +98,7 @@ fn seam_option(name: &str) -> Option<RunOption> {
         "test-heartbeat-ms" => Some(RunOption::Value(ValueOption::HeartbeatMs)),
         "test-poll-ms" => Some(RunOption::Value(ValueOption::PollMs)),
         "test-stall-ms" => Some(RunOption::Value(ValueOption::StallMs)),
+        "test-journal-run" => Some(RunOption::Value(ValueOption::JournalRun)),
         "test-print-request" => Some(RunOption::Switch(SwitchOption::PrintRequest)),
         _ => None,
     }
