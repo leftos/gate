@@ -22,7 +22,6 @@
   - [ ] GATE-16 Durations part 4: `--timeout auto` as a floor, and ceiling and hang hints
   - [ ] GATE-17 Durations part 5: backfill guests during a critical drain
 - [ ] GATE-8 `--slot auto` picks heavy or light from the command's history
-- [ ] GATE-48 Merge feat/slots-and-tickets (#48)
 
 ## Remote
 
