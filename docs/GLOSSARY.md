@@ -66,6 +66,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Sampler**: the Win32 side of the watchdog that takes the samples; if one fails, the watch goes by wall time alone.
 - **Script word**: a command word holding a line break or one of `, ; " ' ) | & < >`, such as a script's text or a list; in it a path ends at white space, where in any other word a path runs through its spaces.
 - **Shadow end**: the expected end of the slowest gate a critical drain waits on, which closes the lent window.
+- **Shared compiler server**: a compiler server (`VBCSCompiler`) already running when the command started; its CPU counts as the command's progress only while the job holds a build client.
 - **Shim**: an extensionless script on PATH, such as the bash shims a plugin puts ahead of `uv` and `python`; program resolution skips it, since Windows cannot start it.
 - **Slot**: a named mutex in the session's `Local\` namespace that a gate holds for its command's whole run; the number of slots per pool caps how many commands run at once.
 - **Slot marker**: the environment variable `GATE_SLOT_HELD`, `<kind>:<pid>:<start>` (plus the root hash under a non-default root), which a gate sets for its command so a nested gate knows its parent.

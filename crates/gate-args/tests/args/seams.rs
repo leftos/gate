@@ -29,6 +29,8 @@ fn seam_flags_parse_with_the_feature() {
             "--test-remote-wait-ms=90",
             "--test-git-limit-ms",
             "95",
+            "--test-servers-under",
+            r"target\case",
             "--test-print-request",
             "--",
             "cmd",
@@ -49,6 +51,7 @@ fn seam_flags_parse_with_the_feature() {
             remote_client: Some(std::path::PathBuf::from(r"steps\client.txt")),
             remote_wait_ms: Some(90),
             git_limit_ms: Some(95),
+            servers_under: Some(std::path::PathBuf::from(r"target\case")),
         }
     );
     assert!(request.print_request);
@@ -176,6 +179,45 @@ fn remote_seams_need_a_value_once() {
             "cmd"
         ]),
         ["gate: unknown option --test-git-limit-ms", "gate: unexpected argument 5"]
+    );
+}
+
+#[cfg(feature = "test-seams")]
+#[test]
+fn the_servers_under_seam_needs_a_value_once() {
+    assert_eq!(
+        problems(&refs(&with(&RUN, &["--test-servers-under=", "--", "cmd"]))),
+        ["gate: --test-servers-under needs a value"]
+    );
+    assert_eq!(
+        problems(&refs(&with(&RUN, &["--test-servers-under", "--", "cmd"]))),
+        ["gate: --test-servers-under needs a value"]
+    );
+    assert_eq!(
+        problems(&refs(&with(
+            &RUN,
+            &["--test-servers-under", "a", "--test-servers-under", "b", "--", "cmd"]
+        ))),
+        ["gate: --test-servers-under is given twice"]
+    );
+    assert_eq!(
+        problems(&["stop-tree", "--test-servers-under", "5", "1"]),
+        ["gate: unknown option --test-servers-under", "gate: unexpected argument 1"]
+    );
+    assert_eq!(
+        problems(&[
+            "-Log",
+            "x",
+            "-TimeoutSeconds",
+            "5",
+            "-Slot",
+            "heavy",
+            "-TestServersUnder",
+            "5",
+            "--",
+            "cmd"
+        ]),
+        ["gate: unknown option -TestServersUnder", "gate: unexpected argument 5"]
     );
 }
 

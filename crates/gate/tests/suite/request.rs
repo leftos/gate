@@ -46,6 +46,7 @@ fn print_request_shows_the_new_cli_request() {
             "remoteClient": null,
             "remoteWaitMs": null,
             "gitLimitMs": null,
+            "serversUnder": null,
         },
     });
     assert_eq!(outcome.stdout, format!("{expected}\n"), "the keys come in the published order");
@@ -60,6 +61,8 @@ fn print_request_shows_the_new_cli_request() {
             "5",
             "--test-git-limit-ms",
             "7",
+            "--test-servers-under",
+            r"target\case",
         ],
     );
     let request = case.run(&seams).request();
@@ -68,8 +71,9 @@ fn print_request_shows_the_new_cli_request() {
             &request["testSeams"]["remoteClient"],
             &request["testSeams"]["remoteWaitMs"],
             &request["testSeams"]["gitLimitMs"],
+            &request["testSeams"]["serversUnder"],
         ),
-        (&json!(r"steps\client.txt"), &json!(5), &json!(7))
+        (&json!(r"steps\client.txt"), &json!(5), &json!(7), &json!(r"target\case"))
     );
 
     let stop = case.run(&["stop-tree", "--test-print-request", "123"]).request();

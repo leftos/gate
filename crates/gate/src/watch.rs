@@ -3,16 +3,16 @@
 //! kill gathers before it terminates the job, and the end of the wait: the command's exit, a kill as stalled, timed out
 //! or past the backstop, or a Ctrl+C.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashSet};
 use std::fs;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use gate_args::{RunRequest, Slot};
 use gate_watchdog::{
-    Config, JOB_LINES, Machine, OUTSIDE_LINES, ProcessFacts, Report, Sample, SampleFacts, SampleHistory, SystemTimes, Ticks, Watch, WslVm,
-    failed_block, lines,
+    Config, JOB_LINES, Machine, OUTSIDE_LINES, ProcessFacts, Report, Sample, SampleFacts, SampleHistory, ServerFacts, SystemTimes, Ticks, Watch,
+    WslVm, failed_block, lines,
 };
 use gate_win32::{Interrupt, Job, ProcessTimes, Running, Waited};
 use jiff::Timestamp;
@@ -20,6 +20,7 @@ use proc_table::{ProcessInfo, ProcessTable, ProcessTree, Win32ProcessTable, file
 
 use crate::console::Console;
 use crate::log::Log;
+use crate::servers::{Scope, Servers, counted};
 use crate::slots::Pool;
 
 /// How long the watch waits for the command between two samples.
@@ -64,6 +65,13 @@ pub(crate) struct Watcher<'a> {
     watch: Watch,
     /// The samples taken, as the diagnostics block lists them, oldest first.
     history: SampleHistory,
+    /// The build servers outside the job, and the command lines read for them so far.
+    servers: Servers,
+    /// The folder a build server's program must lie under, `None` when the scan is machine-wide
+    /// (`--test-servers-under`).
+    under: Option<PathBuf>,
+    /// The build servers the last sample counted, each with whether it started after the command.
+    counted: Vec<(u32, bool)>,
     sampler_works: bool,
     /// Whether every sample fails (`--test-sampler-fail`).
     sampler_fail: bool,
@@ -130,6 +138,9 @@ impl<'a> Watcher<'a> {
             spoken: spoken.join(" "),
             watch: Watch::new(config, machine(request.slot, processors), system, job_cpu, None),
             history: SampleHistory::default(),
+            servers: Servers::new(),
+            under: request.test_seams.servers_under.as_deref().map(absolute),
+            counted: Vec::new(),
             sampler_works: true,
             sampler_fail: request.test_seams.sampler_fail,
             diagnostics_fail: request.test_seams.diagnostics_fail,
@@ -190,6 +201,9 @@ impl<'a> Watcher<'a> {
         }
         match self.sample(at) {
             Ok((sample, log_bytes, err_bytes)) => {
+                // Only a sample that came back whole becomes the one a kill's block lists the servers of; one that
+                // failed part way leaves the last good sample's servers in place.
+                self.counted = counted(&sample.new_servers, &sample.shared_servers);
                 self.watch.sample(&sample);
                 self.record(&sample, log_bytes, err_bytes);
             }
@@ -200,8 +214,8 @@ impl<'a> Watcher<'a> {
         }
     }
 
-    /// Keeps one sample for the diagnostics block a kill writes. No build server, WSL VM or build client is watched
-    /// yet, so every sample says there were none.
+    /// Keeps one sample for the diagnostics block a kill writes: the sample's own figures, the CPU its build servers
+    /// have used and whether the job held a build client with them. No WSL VM is watched.
     fn record(&mut self, sample: &Sample, log_bytes: u64, err_bytes: u64) {
         self.history.push(SampleFacts {
             wall_seconds: sample.at.as_secs_f64(),
@@ -214,9 +228,9 @@ impl<'a> Watcher<'a> {
             job_cpu: sample.job_cpu,
             wsl_vm: WslVm::NotWatched,
             processes: u32::try_from(sample.pids.len()).unwrap_or(u32::MAX),
-            new_servers_cpu: Ticks(0),
-            shared_servers_cpu: Ticks(0),
-            build_client_in_job: false,
+            new_servers_cpu: Ticks(sample.new_servers.values().copied().sum()),
+            shared_servers_cpu: Ticks(sample.shared_servers.values().copied().sum()),
+            build_client_in_job: sample.build_client,
         });
     }
 
@@ -278,7 +292,7 @@ impl<'a> Watcher<'a> {
             job_unread,
             outside,
             outside_unread,
-            servers: if cut { None } else { Some(Vec::new()) },
+            servers: if cut { None } else { Some(self.server_facts(&tree)) },
             samples: self.history.to_vec(),
             cut_at_ms: if cut { Some(cut_at(started)) } else { None },
         })
@@ -313,25 +327,49 @@ impl<'a> Watcher<'a> {
         start_instant(self.since).is_some_and(|since| info.created.is_some_and(|created| created >= since))
     }
 
+    /// The build servers the last sample counted, read again now for the block: the name from the gathering's
+    /// snapshot, `(exited)` for one that no longer holds its pid, and its CPU time read again.
+    fn server_facts(&self, tree: &ProcessTree) -> Vec<ServerFacts> {
+        self.counted
+            .iter()
+            .map(|&(pid, after)| ServerFacts {
+                pid,
+                name: tree.get(pid).map_or_else(|| "(exited)".to_owned(), |info| info.name.clone()),
+                cpu: gate_win32::process_times(pid).ok().flatten().map(|times| Ticks(times.cpu)),
+                started_after_command: after,
+            })
+            .collect()
+    }
+
     /// The facts of one sample at `at`: the system's and the job's CPU, the job's processes created since the command
-    /// started, and the size of the log and its `.err` file, the two kept apart for the diagnostics block. Under
-    /// `--test-sampler-fail` every sample fails.
-    fn sample(&self, at: Duration) -> io::Result<(Sample, u64, u64)> {
+    /// started, the build servers outside the job and the build client inside it, and the size of the log and its
+    /// `.err` file, the two kept apart for the diagnostics block. Under `--test-sampler-fail` every sample fails.
+    fn sample(&mut self, at: Duration) -> io::Result<(Sample, u64, u64)> {
         if self.sampler_fail {
             return Err(io::Error::other(SAMPLER_FAIL));
         }
         let log_bytes = size(self.log.path())?;
         let err_bytes = size(self.log.err_path())?;
+        let pids = self.pids()?;
+        let processes = Win32ProcessTable.snapshot_without_command_lines();
+        let scope = Scope {
+            members: &pids,
+            since: self.since,
+            under: self.under.as_deref(),
+        };
+        let found = self
+            .servers
+            .read(&processes, &scope, gate_win32::process_times, proc_table::command_line_of);
         let sample = Sample {
             at,
             system: system_times()?,
             job_cpu: Ticks(self.job.accounting()?.cpu),
             output_size: log_bytes + err_bytes,
-            pids: self.pids()?,
+            pids,
             paused: false,
-            new_servers: BTreeMap::new(),
-            shared_servers: BTreeMap::new(),
-            build_client: false,
+            new_servers: found.new_servers,
+            shared_servers: found.shared_servers,
+            build_client: found.build_client,
             vm_cpu: None,
         };
         Ok((sample, log_bytes, err_bytes))
@@ -357,6 +395,12 @@ fn cut_at(started: Instant) -> u64 {
 /// The command's start as a process's start time reads it, or `None` when it is outside a [`Timestamp`]'s range.
 fn start_instant(since: u64) -> Option<Timestamp> {
     i64::try_from(since).ok().and_then(filetime_to_timestamp)
+}
+
+/// `path` made absolute against the gate's working directory, so a relative `--test-servers-under` still matches the
+/// program a command line names; a path that cannot be made absolute is left as it was given.
+fn absolute(path: &Path) -> PathBuf {
+    std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// The job's processes of `ids` read in pid order, and the number the cap or the budget left unread: only the ones the

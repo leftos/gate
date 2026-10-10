@@ -440,7 +440,7 @@ All kept, with each knob's default unchanged:
 - The sampler (W1): every 5 s while the command runs, it reads the system times, one process snapshot, the job's accounting and process list, and the log and `.err` sizes; nothing goes through WMI.
 - Stall (W2): no output, no CPU (at least 1% of one core over the window), no new process in the job, no build-server progress, no WSL VM CPU and no nested gate paused behind a critical request, for `--stall` seconds: `gate: STALLED: ...`.
 
-  Progress as the watchdog crate counts it resets the stall clock when the sum of the log and `.err` sizes changed (grew or shrank), the job's CPU since the last progress reached 1% of one core over the stall window, a pid appeared that the last sample did not have, or a nested gate is paused. Build-server progress and WSL VM CPU are not yet counted.
+  Progress as the watchdog crate counts it resets the stall clock when the sum of the log and `.err` sizes changed (grew or shrank), the job's CPU since the last progress reached 1% of one core over the stall window, a pid appeared that the last sample did not have, or a nested gate is paused, or a build server's CPU counts as progress (see Build servers below). The WSL VM's CPU (GATE-90) and the CPU of paused child gates (GATE-91) are not yet counted.
 - The load-adjusted clock and the ceiling (W3): each sample adds `interval * free` to the clock `--timeout` runs on; a sample taken while a nested gate is paused adds to the paused time instead; `gate: TIMED OUT after ...`.
 
   The free share is 1 for a High-priority command; otherwise `busy` is the share of the interval's system time that was not idle, the cores others held are `max(0, busy * cores - own cores)` with `own cores` the job's CPU gained over the interval, and `free = clamp((cores - others) / demand, 0.05, 1)`. `demand` is every core, or `min(cores, 2)` for a light gate.
@@ -449,10 +449,19 @@ All kept, with each knob's default unchanged:
 - WSL (W6): a `wsl` command's VM CPU counts as progress.
 - A command that exits on its own before the kill keeps its status (W7).
 - Build servers: classification (B1), their priority (B2), and `MSBUILDDISABLENODEREUSE=1` and `DOTNET_CLI_USE_MSBUILD_SERVER=0` so worker nodes run in the command's job (B3).
+
+  Every sample reads the build servers outside the command's job: `VBCSCompiler.exe`, `dotnet.exe` whose command line names `VBCSCompiler.dll`, and `MSBuild.dll` with `nodemode`. It takes one ToolHelp snapshot, which carries no command lines, and each process's times; a command line is read once per (pid, start) through `proc_table::command_line_of(pid)` (OpenProcess and ReadProcessMemory), never through a child process. A process the gate cannot read is skipped.
+
+  A server started at or after the command is new. One started before it counts only when it is a compiler server, and then it is shared. The job holds a build client when it has an `MSBuild.exe` or a `dotnet.exe` without `--no-build`.
+
+  With a build client in the job, a rising new or shared server is progress, and its CPU counts as the gate's own in the free share. A real gate therefore counts another session's compiler server as shared progress while its job holds a build client, as the PowerShell gate does.
+
+  The watch hands the pure crate raw facts: the per-pid cumulative CPU of the new and the shared servers, the build-client flag and the VM's CPU as an option (not watched until GATE-90). The classifiers are in `gate-watchdog`'s `servers.rs`; the reader is the binary's `servers.rs`.
 - Kill, on a STALLED, TIMED OUT or BACKSTOP alike: the diagnostics block (X3), then `TerminateJobObject(job, 124)`, `gate: terminated the job's <n> process(es)`, `gate: diagnostics written to <log>`, a 5 s wait for the command and exit 124 (X2). A failure inside the gate after the command started terminates the job first (X4).
 - The diagnostics block (X3) is gathered before the job is terminated and goes to the log only, between the command's output and the kill line. A command that exits during the gathering keeps its own status and writes no block. Its lines:
   - `gate: diagnostics`, then `gate:   job <pid> parent <ppid> <name>: cpu <s> s, working set <mb> MB: <command line>` for each process of the job (up to 40, then `gate:   ... and <n> more job processes`), and `gate:   outside job ...` lines for the descendants outside the job (up to 20).
-  - `gate:   build servers: none` when no build server was used, then up to six sample lines, `gate:   sample at <w> s (load-adjusted <a> s, free <p>%): log <n> B, err <n> B, job cpu <s> s, <n> processes, new servers cpu <s> s, shared servers cpu <s> s, build client in job: no`, or `gate:   samples: none` when no sample was taken.
+  - The build servers the last sample counted, one line each: `gate:   build server <pid> <name>: cpu <s> s (started after the command)` or `(already running; counts while the job holds a build client)`; a server gone by the time of the block shows `(exited)` in place of its name and `?` for its CPU. `gate:   build servers: none` when none was counted.
+  - Up to six sample lines, `gate:   sample at <w> s (load-adjusted <a> s, free <p>%): log <n> B, err <n> B, job cpu <s> s, <n> processes, new servers cpu <s> s, shared servers cpu <s> s, build client in job: yes|no`, or `gate:   samples: none` when no sample was taken.
   - `gate:   ... diagnostics cut at <n> ms` when the 2000 ms gather budget ran out. A gathering that failed writes `gate: diagnostics` then `gate: diagnostics failed: <message>` in its place.
   - The working set comes from `gate_win32::working_set` (`None` for a gone or exited process). stderr gets one line, `gate: diagnostics written to <log>` (also in the log), after the terminated line; the block's lines are not on stderr.
 - A command still running 5 s after its job was terminated is reported: `gate: the command was still running 5 s after its job was terminated`. A job that cannot be terminated says `gate: could not terminate the command's job: <error>`. A killed run is not scanned for markers, and its release verdict is `stalled`, `timed-out` or `backstop` by the kill line that ended it.
@@ -689,7 +698,7 @@ Built verbs:
 
 `outputs` prints `gate: box outputs is not built yet` and exits 70. The heartbeat and the console belong to later parts of the remote port (GATE-61) and are planned, not built:
 
-- **The heartbeat** runs on `gate-watchdog`'s `BeatClock` and `Pump`. It counts the job's CPU alone until the watchdog's build-server reader exists (GATE-62); its `CpuSource` returns a monotone running sum, since `Pump` takes deltas of a cumulative total. A failed heartbeat write does not stop the job.
+- **The heartbeat** runs on `gate-watchdog`'s `BeatClock` and `Pump`. It counts the job's CPU alone; whether it also counts the build servers the watchdog now reads is GATE-84's to settle. Its `CpuSource` returns a monotone running sum, since `Pump` takes deltas of a cumulative total. A failed heartbeat write does not stop the job.
 - **The console** is a UTF-8 console from the donor-console method, as the PowerShell wrapper does it.
 
   A restart into a replacement console keeps the same job: the job is never terminated for it, its processes are killed one by one through their process ids until none remain, and the command is relaunched into the same job, so there is no window without a job, a `stop` that arrives meanwhile still finds it, and the client needs no change. A run whose relaunch fails because a `stop` emptied the job exits 1 with `gate: the gate failed while running the command: <problem>`.
@@ -779,6 +788,8 @@ A Rust integration suite drives the built `gate.exe` through its CLI and reads o
 
   `--test-git-limit-ms <n>` (whole milliseconds above 0, on `gate run` only) replaces the 60 s limit of each git call of the routing decision; `--test-print-request` shows it as `testSeams.gitLimitMs`, after `remoteWaitMs`.
 
+  `--test-servers-under <folder>` (on `gate run` only; refused empty or given twice) makes a build server outside the job count only when its program path lies under the folder (whole path components, case-insensitive, the folder made absolute), so a case never counts the machine's real servers; `--test-print-request` shows it as `testSeams.serversUnder`, after `gitLimitMs`.
+
   An installed gate has none of them, and without the feature each is an unknown option.
 - **Spawn and wait helpers.** The suite's `start` launches the gate and returns a `Running` that can wait for a stderr line, say whether the gate is still running, and finish; dropping a `Running` kills a gate still running. Output readers are joined with a deadline, so a grandchild holding the pipes cannot hang the suite. A run's `Outcome` carries `raw_stdout`, the bytes as the gate wrote them, beside the decoded text.
 - **Holding and killing a gate.** A case holds a run with a real command, `fake-tool wait <go>`, and lets it go by creating `<go>`. A case that kills a gate lets its command go and waits until the command's log is closed (`support::wait_until_closed`), since the job has no kill-on-close. `support::run_words(log, extra, command)` builds the words of a light run.
@@ -791,6 +802,7 @@ A Rust integration suite drives the built `gate.exe` through its CLI and reads o
   - `argv`, `pid` (prints `pid <its own pid>`), `env <name>` (prints the variable's value) and `exit <n>` (any 32-bit status).
   - `out <text>`, `err <text>`, `bytes <hex>` (writes those bytes to stdout as they are) and `lines <n> <text>` (prints `<text>1` to `<text><n>`).
   - `sleep <ms>` and `wait <path>` (until the path exists, giving up after 120 s with exit 1).
+  - `burn <stop-path>` (prints `burning`, then spins on the CPU until the file exists) and `chatter <path>` (prints numbered lines `chatter 1`, `chatter 2`, ... about every 50 ms until the file exists).
   - `spawn-wait <path>` starts `fake-tool wait <path>` with the caller's handles, prints `spawned <pid>` and does not wait.
   - `spawn-orphan <path>` runs `fake-tool spawn-wait <path>` as a child, waits for it to end, then continues with its next step, so the waiting helper is left without a parent and its `spawned <pid>` line is the up signal.
 

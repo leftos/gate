@@ -200,6 +200,18 @@ pub fn read_parameters_string(process: &OwnedHandle, offset: usize) -> Option<St
     Some(String::from_utf16_lossy(&units))
 }
 
+/// The command line the process `pid` was started with, or `None` when it cannot be read: the process belongs to
+/// another user, has exited, or has no command line. The process is opened with the query and read rights the read
+/// needs, and the handle is closed before this returns.
+///
+/// The caller pays one `OpenProcess` and one PEB read per call, so a caller that reads the same process every sample
+/// caches the line against its pid and start time.
+#[must_use]
+pub fn command_line_of(pid: u32) -> Option<String> {
+    let process = open_process(pid, PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ)?;
+    read_parameters_string(&process, PARAMS_COMMAND_LINE)
+}
+
 /// The 64-bit pointer stored at `address` in the process.
 fn read_address(process: &OwnedHandle, address: usize) -> Option<usize> {
     let bytes = read_memory(process, address, 8)?;
@@ -231,7 +243,7 @@ mod tests {
 
     use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, GetLastError, INVALID_HANDLE_VALUE, SetLastError};
 
-    use super::{OwnedHandle, Win32ProcessTable};
+    use super::{OwnedHandle, Win32ProcessTable, command_line_of};
     use crate::ProcessTable;
 
     #[test]
@@ -261,6 +273,20 @@ mod tests {
         assert!(me.created.is_some());
         let command_line = me.command_line.expect("this process's command line can be read");
         assert!(command_line.contains(stem.as_ref()), "{command_line} names {stem}");
+    }
+
+    #[test]
+    fn command_line_of_reads_this_process_own_command_line() {
+        let command_line = command_line_of(std::process::id()).expect("this process's command line can be read");
+        let exe = std::env::current_exe().expect("this test binary has a path");
+        let stem = exe.file_stem().expect("the test binary has a file stem").to_string_lossy();
+        assert!(command_line.contains(stem.as_ref()), "{command_line} names {stem}");
+    }
+
+    #[test]
+    fn command_line_of_a_process_that_cannot_be_opened_is_none() {
+        // The idle process has no command line, and a read right over it is never granted.
+        assert_eq!(command_line_of(0), None);
     }
 
     #[test]

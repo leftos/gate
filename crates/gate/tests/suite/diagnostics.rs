@@ -56,7 +56,17 @@ fn assert_block(log: &str, kill: &str, lines: &[&str]) {
 #[test]
 fn a_kill_writes_its_diagnostics_to_the_log_before_the_kill_line() {
     let case = Case::new("a_kill_writes_its_diagnostics_to_the_log_before_the_kill_line");
-    let seams = ["--test-stall-ms", "1500", "--test-sample-ms", "100"];
+    // The server scan is confined to this case's own folder, which holds none, so a build server another case started
+    // can never take the `build servers: none` line this case pins.
+    let under = shown(&case.folder());
+    let seams = [
+        "--test-stall-ms",
+        "1500",
+        "--test-sample-ms",
+        "100",
+        "--test-servers-under",
+        under.as_str(),
+    ];
     let log_path = case.folder().join("out.log");
 
     let outcome = case.run(&run_words("out.log", &seams, &[FAKE_TOOL, "pid", "out", "hi", "sleep", "30000"]));

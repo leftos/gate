@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use jiff::Timestamp;
 
 #[cfg(all(windows, target_pointer_width = "64"))]
-pub use win32::Win32ProcessTable;
+pub use win32::{Win32ProcessTable, command_line_of};
 
 /// One process of a [`ProcessTable`] snapshot.
 #[derive(Clone, Debug, PartialEq, Eq)]

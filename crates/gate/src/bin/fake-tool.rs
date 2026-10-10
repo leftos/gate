@@ -1,6 +1,11 @@
 //! The black-box suite's helper program. It runs the steps on its command line in order:
 //! `out <text>` and `err <text>` print a line on stdout or stderr; `sleep <ms>` sleeps; `wait <path>` sleeps until the
-//! path exists, and exits 1 when it has not appeared after 120 s; `spawn-wait <path>` starts `fake-tool wait <path>`
+//! path exists, and exits 1 when it has not appeared after 120 s; `burn <stop-path>` prints `burning` on stdout and
+//! spins on the CPU until the file at `<stop-path>` exists, checking about every 10 ms, then goes on to its next step;
+//! `chatter <path>` prints `chatter <n>`, flushed, about every 50 ms until the file at `<path>` exists, then goes on,
+//! so a case can hold its command's log growing, and the watch's stall clock with it, until it is ready for the command
+//! to go quiet;
+//! `spawn-wait <path>` starts `fake-tool wait <path>`
 //! with this process's stdin, stdout and stderr, prints `spawned <its pid>` and goes on without waiting for it;
 //! `spawn-orphan <path>` runs `fake-tool spawn-wait <path>` with this process's handles and waits for it to end, so the
 //! helper that one starts is left with no parent and only the job this process runs in still reaches it; `exit <n>`
@@ -28,6 +33,10 @@ const WAIT_STEP: Duration = Duration::from_millis(20);
 /// How long `wait` looks for its path before it gives up: the suite's hang guard, so a loaded machine never ends a
 /// helper its case still means to let go.
 const WAIT_LIMIT: Duration = Duration::from_secs(600);
+/// How long `burn` spins between two looks for its stop file.
+const BURN_STEP: Duration = Duration::from_millis(10);
+/// How long `chatter` waits between two of its lines.
+const CHATTER_STEP: Duration = Duration::from_millis(50);
 
 /// Exits through `std::process::exit`, because `ExitCode` carries 8 bits and the suite needs codes above 255 and
 /// negative ones.
@@ -85,6 +94,16 @@ fn run(args: &[OsString]) -> Result<i32, String> {
                     return Ok(1);
                 }
             }
+            "burn" => {
+                let path = operand(&mut steps, "burn")?;
+                writeln!(stdout, "burning").map_err(|error| write_failed(&error))?;
+                stdout.flush().map_err(|error| write_failed(&error))?;
+                burn_until(&path)?;
+            }
+            "chatter" => {
+                let path = operand(&mut steps, "chatter")?;
+                chatter_until(&path, &mut stdout)?;
+            }
             "spawn-wait" => {
                 let pid = spawn_wait(&operand(&mut steps, "spawn-wait")?)?;
                 writeln!(stdout, "spawned {pid}").map_err(|error| write_failed(&error))?;
@@ -125,6 +144,41 @@ fn wait_for(path: &str) -> Result<bool, String> {
             Ok(true) => return Ok(true),
             Ok(false) if Instant::now() >= deadline => return Ok(false),
             Ok(false) => thread::sleep(WAIT_STEP),
+            Err(error) => return Err(format!("cannot check {path}: {error}")),
+        }
+    }
+}
+
+/// Spins on the CPU until the file at `path` exists, looking about every [`BURN_STEP`], so a case can stand a copy of
+/// this program in for a build server that is busy until its stop file appears. The arithmetic between two looks is
+/// kept by [`std::hint::black_box`], so an optimised build does not drop the burn.
+fn burn_until(path: &str) -> Result<(), String> {
+    let mut state: u64 = 1;
+    loop {
+        let until = Instant::now() + BURN_STEP;
+        while Instant::now() < until {
+            state = std::hint::black_box(state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407));
+        }
+        match Path::new(path).try_exists() {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            Err(error) => return Err(format!("cannot check {path}: {error}")),
+        }
+    }
+}
+
+/// Prints a numbered line about every [`CHATTER_STEP`], flushing each, until the file at `path` exists: the log a case's
+/// command keeps growing, so the watch it runs under sees progress and its stall clock cannot run.
+fn chatter_until(path: &str, stdout: &mut impl Write) -> Result<(), String> {
+    let mut line: u64 = 0;
+    loop {
+        line += 1;
+        writeln!(stdout, "chatter {line}").map_err(|error| write_failed(&error))?;
+        stdout.flush().map_err(|error| write_failed(&error))?;
+        thread::sleep(CHATTER_STEP);
+        match Path::new(path).try_exists() {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
             Err(error) => return Err(format!("cannot check {path}: {error}")),
         }
     }
