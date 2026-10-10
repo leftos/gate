@@ -194,6 +194,23 @@ impl Running {
         }
     }
 
+    /// The program's pid.
+    pub fn id(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// Kills the program, waits for it, and returns what it said before it died.
+    pub fn kill(mut self) -> Outcome {
+        self.child.kill().expect("the program can be killed");
+        let status = self.child.wait().expect("a killed program can be waited for");
+        self.let_readers_end();
+        Outcome {
+            code: status.code(),
+            stdout: text(&self.stdout),
+            stderr: text(&self.stderr),
+        }
+    }
+
     /// Whether the program has not exited yet.
     pub fn is_running(&mut self) -> bool {
         self.child.try_wait().expect("the program's status can be read").is_none()
@@ -290,6 +307,27 @@ pub fn wait_for_journal_line(root: &Path, needle: &str) {
         assert!(Instant::now() < deadline, "no line has {needle:?}; the journal so far:\n{lines}");
         thread::sleep(POLL);
     }
+}
+
+/// Returns once `check` holds; fails naming `what` after the hang guard.
+pub fn wait_until(what: &str, mut check: impl FnMut() -> bool) {
+    let deadline = Instant::now() + HANG_GUARD;
+    while !check() {
+        assert!(Instant::now() < deadline, "{what} did not happen within the hang guard");
+        thread::sleep(POLL);
+    }
+}
+
+/// Returns once `path` exists.
+pub fn wait_for_file(path: &Path) {
+    wait_until(&format!("{} appearing", path.display()), || path.exists());
+}
+
+/// Writes `json` as the counts file of `root`, through a file beside it moved over it, so a gate never reads it torn.
+pub fn write_counts(root: &Path, json: &str) {
+    let staged = root.join("slot-counts.json.staged");
+    fs::write(&staged, json).expect("the counts can be staged");
+    fs::rename(&staged, root.join("slot-counts.json")).expect("the counts can be moved into place");
 }
 
 /// Asserts that `needles` occur in `haystack` in this order, each after the end of the one before.

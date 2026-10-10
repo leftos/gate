@@ -6,7 +6,7 @@ use gate_args::{Invocation, Problem, RunRequest, StopRequest, USAGE, parse};
 
 use crate::console::Console;
 use crate::resolve::{self, Environment};
-use crate::{journal, request_json};
+use crate::{request_json, seam};
 
 /// The status of a usage error: a missing, unknown or invalid input.
 const USAGE_STATUS: u8 = 2;
@@ -55,7 +55,7 @@ fn run(request: &RunRequest, environment: &Environment, console: &mut Console) -
                 console.err("gate: run is not built yet");
                 return NOT_BUILT_STATUS;
             };
-            journal::seam_run(request, &log, &root, status, console)
+            seam::seam_run(request, &log, &root, status, console)
         }
     }
 }

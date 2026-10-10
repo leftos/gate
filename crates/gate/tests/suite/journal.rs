@@ -119,6 +119,8 @@ fn assert_quiet(outcome: &Outcome, code: i32) {
 #[test]
 fn journal_run_writes_queue_take_release_in_order() {
     let case = Case::new("journal_run_writes_queue_take_release_in_order");
+    let slot = StateRoot::new(&shown(&case.root()), None).object_name(KernelObject::LightSlot(0));
+    let slots = format!("\"slots\":[{}],", Value::from(slot.as_str()));
 
     let outcome = case.run(&journal_run("0"));
 
@@ -132,10 +134,11 @@ fn journal_run_writes_queue_take_release_in_order() {
             "\n",
             r#"{"v":1,"time":""#,
             r#""event":"take""#,
-            r#""slots":[],"waitedSeconds":0.0}"#,
+            &format!(r#"{slots}"waitedSeconds":"#),
             "\n",
             r#"{"v":1,"time":""#,
             r#""event":"release""#,
+            &slots,
             r#""status":0,"#,
             r#""adjustedSeconds":null,"verdict":"passed"}"#,
             "\n",
@@ -150,6 +153,8 @@ fn journal_run_writes_queue_take_release_in_order() {
         );
     }
     assert_eq!(lines[0]["log"], shown(&case.root().join("out.log")));
+    assert!(lines[1]["waitedSeconds"].is_f64(), "the take says how long it waited: {}", lines[1]);
+    assert!(lines[1].get("abandoned").is_none(), "a clean take names no abandoned slot: {}", lines[1]);
 }
 
 #[test]
@@ -197,6 +202,7 @@ fn rollover_while_another_gate_appends_loses_no_line() {
     const GATES: usize = 6;
     let case = Case::new("rollover_while_another_gate_appends_loses_no_line");
     let seed = seed_near_cap(&case);
+    fs::write(case.root().join("slot-counts.json"), format!(r#"{{"v":1,"light":{GATES}}}"#)).expect("the counts can be written");
     let seeded_releases = release_lines(&seed);
     assert!(
         (1..=10).contains(&seeded_releases.len()),

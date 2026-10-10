@@ -1,23 +1,17 @@
 //! This gate's journal: the identity every one of its lines carries, its state root's journal mutex, and the problem
-//! lines, a missing line and a failed rollover each said once a run. The `--test-journal-run` seam writes a run's
-//! queue, take and release through it without launching the command or taking a slot.
+//! lines, a missing line and a failed rollover each said once a run.
 
-use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::path::PathBuf;
+use std::time::Duration;
 
-use gate_args::RunRequest;
-use gate_state::{
-    Held, JOURNAL_FILE, JournalEvent, JournalIdentity, JournalLock, JournalNote, KernelObject, LockError, RunFacts, Verdict, append_line,
-    journal_line,
-};
+use gate_state::{Held, JOURNAL_FILE, JournalEvent, JournalIdentity, JournalLock, JournalNote, KernelObject, LockError, append_line, journal_line};
 use gate_win32::{AcquireError, MutexGuard, NamedMutex};
 use jiff::Timestamp;
 
+use crate::acquire;
 use crate::console::Console;
 use crate::resolve::ResolvedRoot;
-
-/// How often a held seam run looks for its file.
-const HOLD_STEP: Duration = Duration::from_millis(20);
+use crate::slots::ThisGate;
 
 /// A state root's journal mutex.
 struct JournalMutex(NamedMutex);
@@ -51,9 +45,9 @@ pub(crate) struct RunJournal {
 }
 
 impl RunJournal {
-    pub(crate) fn open(root: &ResolvedRoot, request: &RunRequest) -> RunJournal {
+    pub(crate) fn open(root: &ResolvedRoot, gate: &ThisGate) -> RunJournal {
         let name = root.root.object_name(KernelObject::Journal);
-        let writer = identity(request).and_then(|identity| match NamedMutex::open(&name) {
+        let writer = gate.journal_identity().and_then(|identity| match NamedMutex::open(&name) {
             Ok(mutex) => Ok((identity, JournalMutex(mutex))),
             Err(error) => Err(format!("could not open {name}: {error}")),
         });
@@ -84,7 +78,7 @@ impl RunJournal {
         if appended.abandoned
             && let Ok((_, mutex)) = &self.writer
         {
-            console.err(&format!("gate: took {}, which a killed gate had left held", mutex.name()));
+            acquire::say_taken_abandoned(console, mutex.name());
         }
         for note in &appended.notes {
             self.say(note, console);
@@ -104,76 +98,6 @@ impl RunJournal {
         if !*said {
             *said = true;
             console.err(&format!("gate: {note}"));
-        }
-    }
-}
-
-/// What every journal line of this gate carries.
-fn identity(request: &RunRequest) -> Result<JournalIdentity, String> {
-    let process_start = gate_win32::process_start().map_err(|error| format!("cannot read this gate's start time: {error}"))?;
-    let cwd = std::env::current_dir().map_err(|error| format!("cannot read the working directory: {error}"))?;
-    let command: Vec<String> = request.command.iter().map(|word| word.to_string_lossy().into_owned()).collect();
-    Ok(JournalIdentity {
-        pid: std::process::id(),
-        process_start,
-        kind: request.slot.as_str().to_owned(),
-        cwd: cwd.to_string_lossy().into_owned(),
-        command: command.join(" "),
-    })
-}
-
-/// `--test-journal-run <status>`: journals the run's queue, a take of no slot, and a release with `status`, then returns
-/// it as the exit status. The command is not launched. With `--test-hold-until`, it holds between the take and the
-/// release, and the hold counts as held time. Problem lines are said on stderr as they are found.
-pub(crate) fn seam_run(request: &RunRequest, log: &Path, root: &ResolvedRoot, status: u8, console: &mut Console) -> u8 {
-    let mut journal = RunJournal::open(root, request);
-    journal.write(
-        &JournalEvent::Queue {
-            log: log.to_string_lossy().into_owned(),
-        },
-        console,
-    );
-    let took = Instant::now();
-    journal.write(
-        &JournalEvent::Take {
-            slots: Vec::new(),
-            waited_seconds: 0.0,
-            abandoned: Vec::new(),
-        },
-        console,
-    );
-    if let Some(path) = &request.test_seams.hold_until {
-        hold_until(path, console);
-    }
-    let held = took.elapsed().as_secs_f64();
-    let code = i64::from(status);
-    journal.write(
-        &JournalEvent::Release {
-            slots: Vec::new(),
-            held_seconds: held,
-            status: Some(code),
-            facts: Some(RunFacts {
-                wall_seconds: held,
-                adjusted_seconds: None,
-                verdict: Verdict::of(None, code, code),
-            }),
-        },
-        console,
-    );
-    status
-}
-
-/// `--test-hold-until <path>`: sleeps until `path` exists. It has no timeout of its own; the suite's hang guard ends a
-/// gate that is never let go. A path that cannot be checked is said on stderr and ends the hold, so the run goes on.
-fn hold_until(path: &Path, console: &mut Console) {
-    loop {
-        match path.try_exists() {
-            Ok(true) => return,
-            Ok(false) => std::thread::sleep(HOLD_STEP),
-            Err(error) => {
-                console.err(&format!("gate: cannot check {}: {error}", path.display()));
-                return;
-            }
         }
     }
 }

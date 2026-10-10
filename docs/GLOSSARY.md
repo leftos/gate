@@ -60,7 +60,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Ticket**: the JSON file `waiting\<pid>-<start>.json` a gate writes when it queues for a slot, holding its kind and `arrived` time; waiters of one kind take slots in ticket order.
 - **Usage error**: a command line the gate refuses (a missing, unknown, repeated or invalid input): each problem on its own `gate: ` line, then the usage, exit 2, before any slot is queued.
 - **Verdict**: the outcome a `release` line records: `passed`, `failed`, `log-failure`, `stalled`, `timed-out`, `backstop` or `unknown` (no run facts).
-- **Wake event**: the auto-reset named event each waiter sleeps on, which a gate signals when it releases a slot or deletes a ticket.
+- **Wake event**: the auto-reset named event each waiter sleeps on, which a gate signals when it takes or releases a slot or deletes a dead gate's ticket.
 - **Watchdog**: the part of a running gate that samples the command and kills its job on a stall, the ceiling or the backstop.
 - **Win32 layer**: the `gate-win32` crate, the only code that calls Windows for job objects, processes, mutexes, events and console handling.
 - **Work folder**: the builder's checkout of one PC worktree, reused across routed runs so builds stay incremental.

@@ -82,16 +82,25 @@ fn a_gate_says_its_problem_lines_while_it_runs() {
     let words = held_run(&go, &["--state-dir".to_owned(), shown(&root)]);
     let mut running = start(case.gate_without_state_dir(&refs(&words)));
     let line = format!("gate: could not write the journal {} (", shown(&root.join("events.jsonl")));
+    let ticket = format!("gate: cannot write the ticket {}", shown(&root.join("waiting")));
+    let claim = format!(
+        "gate: cannot write the claim {}: ",
+        shown(&root.join("slots").join("gate-light-slot-0.json"))
+    );
 
-    running.wait_for_stderr(&line);
-    assert!(running.is_running(), "the line is said while the gate holds");
+    running.wait_for_stderr(&claim);
+    assert!(running.is_running(), "the lines are said while the gate holds");
 
     let_go(&go);
     let outcome = running.finish();
 
     assert_eq!((outcome.code, outcome.stdout.as_str()), (Some(0), ""), "{outcome:?}");
+    let lines: Vec<&str> = outcome.stderr.lines().collect();
+    assert_eq!(lines.len(), 3, "each problem is said once: {outcome:?}");
     assert!(
-        outcome.stderr.starts_with(&line) && outcome.stderr.ends_with(")\n") && outcome.stderr.lines().count() == 1,
-        "the root that cannot be made is said once for the run's three lines: {outcome:?}"
+        lines[0].starts_with(&line) && lines[0].ends_with(')'),
+        "the root that cannot be made is said once for the run's three journal lines: {outcome:?}"
     );
+    assert!(lines[1].starts_with(&ticket), "then the ticket that cannot be written: {outcome:?}");
+    assert!(lines[2].starts_with(&claim), "then the claim that cannot be written: {outcome:?}");
 }

@@ -134,7 +134,7 @@ Every other `gate: ` line is prose: it informs people and agents and may change 
 
 ### Pools and names
 
-A slot is a named mutex in the logon session's `Local\` namespace, held by the gate for the command's whole run (kept, S1, S3). An abandoned mutex is the crash recovery: a gate killed while holding a slot abandons it and the next gate takes it, where a semaphore's count would be lost for good.
+A slot is a named mutex in the logon session's `Local\` namespace, held by the gate for the command's whole run (kept, S1, S3). A gate killed while holding a slot is the crash recovery: the next gate takes the slot over, where a semaphore's count would be lost for good. It sees the takeover in either of two ways, the mutex coming back abandoned or the slot's claim naming a gate that is no longer alive ([Abandoned slots](#abandoned-slots)).
 
 | Pool | Mutex names (default root) | Who takes it |
 |---|---|---|
@@ -149,15 +149,19 @@ The pools never wait on each other, so a serial test run does not queue behind b
 
 The default count of a pool is `max(1, floor((logical processors - 1) / threads))`, with threads 4 for heavy and 2 for light (kept, S2). `slot-counts.json` in the state root overrides either count with a whole number from 1 to 64. It is re-read on every pass of the wait loop, so a count changed while gates wait applies to them, and a gate holding a slot the new count leaves out keeps it.
 
-A missing file or key means the default; an unreadable or invalid value is ignored for that pool with one line, `gate: ignored <path>: <reason>; using <n> <kind> slots`, said once per wait (S2). The remote pool's size comes from `remote.json` (T1).
+A missing file or key means the default; an unreadable or invalid value is ignored for that pool with one line, `gate: ignored <path>: <reason>; using <n> <kind> slots`, said once per wait and only for the waiting gate's own kind (S2). A processor count the system will not give is taken as 1, with `gate: cannot read the processor count: <error>; counting 1`, said once. The remote pool's size comes from `remote.json` (T1).
 
 ### Taking a slot
 
-1. A gate that needs a slot writes its arrival [ticket](#ticket) before its first try. A gate a parent's slot covers or lends to takes no slot and writes no ticket (N1, N2).
-2. Waiters of one kind take slots in ticket `arrived` order, ties broken by pid. A gate tries a slot only when no live ticket of its kind is ahead of it; it tries every index its pass may try, takes the first free one, deletes its ticket and wakes the waiters, so the next in line tries at once. The critical barrier (Q3) and the reserved light slots (K2, K3) apply on top of the order.
-3. A waiter sleeps on its own wake event, `Local\gate-wake-<pid>-<start>` (auto-reset). A gate that releases a slot or deletes a ticket signals the wake event of every live ticket in its state root. An auto-reset event stays signalled until its waiter wakes, so no wakeup is lost between a waiter's check and its wait.
-4. Each wait has a fallback poll as its timeout (2 s, kept from S4's interval). The poll re-reads the counts and the tickets, which deletes a dead waiter's ticket so it cannot hold the queue (Q1), and picks up a count changed by hand.
-5. A waiter prints `gate: waiting for a <kind> slot (<n> busy)` once and `gate: still waiting for a <kind> slot (<s> s)` every 30 s, on stderr and in the log, so a gate around it does not read the wait as a stall (kept, S4). Its watchdog starts only once it holds a slot.
+1. A gate that needs a slot creates its wake event, then writes its arrival [ticket](#ticket), both before its first try, so no wake is lost. A gate a parent's slot covers or lends to takes no slot and writes no ticket (N1, N2).
+2. Waiters of one kind take slots in ticket `arrived` order, ties broken by pid. A gate tries a slot only when no live ticket of its kind is ahead of it, not counting a ticket whose gate already holds a live claim (it holds a slot and only failed to delete its ticket). It then tries indices 0 up to the count in order and takes the first free one. The critical barrier (Q3) and the reserved light slots (K2, K3) apply on top of the order.
+3. A take deletes the gate's own ticket, journals `take`, writes the claim and wakes the waiters, so the next in line tries at once. A release deletes the claim, journals `release`, lets the mutex go and wakes the waiters. A run in the critical slot takes no slot of these pools and journals a `take` and `release` of `slots: []`.
+4. A waiter sleeps on its own wake event, `Local\gate-wake-<pid>-<start>` (auto-reset). A gate that takes or releases a slot, or deletes a dead gate's ticket, signals the wake event of every live ticket in its state root. An auto-reset event stays signalled until its waiter wakes, so no wakeup is lost between a waiter's check and its wait. A wake that cannot be opened or set is not said: the fallback poll covers it.
+5. Each wait has a fallback poll as its timeout (2 s, kept from S4's interval). The poll re-reads the counts and the tickets, which deletes a dead waiter's ticket so it cannot hold the queue (Q1), and picks up a count changed by hand.
+6. A waiter prints `gate: waiting for a <kind> slot (<n> busy)` once, where `<n>` is how many of the pool's slots the [probe by open](#probe-by-open) reports held, and `gate: still waiting for a <kind> slot (<s> s)` every 30 s from its queueing, on stderr and in the log, so a gate around it does not read the wait as a stall (kept, S4). Its watchdog starts only once it holds a slot. `waitedSeconds` in its `take` counts from its `queue` line.
+7. A problem a pass meets is said as a prose line, once per name or path per wait: `gate: could not take <name>: <error>`, `gate: cannot probe <name>: <error>`, `gate: cannot create the wake event <name>: <error>` (the gate then waits on the poll alone), `gate: cannot wait on the wake event <name>: <error>`, `gate: cannot write the ticket <path>: <error>`, `gate: cannot write the claim <path>: <error>`.
+
+   More: `gate: cannot read the tickets in <dir>: <error>`, `gate: cannot read the claims in <dir>: <error>`, `gate: ignored the ticket <path>: <reason>`, `gate: cannot check the gate of <path>: <error>` and `gate: cannot delete the ticket|the claim|the dead gate's ticket <path>: <error>`.
 
 Ordering by ticket replaces the PowerShell gate's free-for-all among waiters of one kind (Q2), and the wake events replace its 2 s polling as the way a waiter learns of a release.
 
@@ -167,11 +171,15 @@ A slot counts as taken from a gate that died holding it in either of two cases: 
 
 The gate says `gate: took <name>, which a killed gate had left held` on stderr and in the log, and its journal `take` line carries `abandoned`, the list of slot names it took that way, so the journal counts how often gates die holding a slot (GATE-30). An abandoned journal mutex counts as owned and is said the same way, and the line appended under it carries `abandoned` with the journal mutex's name, whatever its event.
 
-The second case exists because a killed gate leaves its claim and Windows frees a mutex with its last handle: the abandoned result is seen only when another handle to the name was open at the kill ([Probe by open](#probe-by-open)). The dead-claim check belongs to the slot loop.
+The second case exists because a killed gate leaves its claim and Windows frees a mutex with its last handle: the abandoned result is seen only when another handle to the name was open at the kill ([Probe by open](#probe-by-open)). The dead-claim check belongs to the slot loop, and runs on a clean take of a slot only.
+
+A claim that is missing or unreadable is no takeover: the gate overwrites it with its own. A claim is dead by the [liveness rule](#claim).
 
 ### Probe by open
 
-A slot is held while any handle to its name exists: a reader opens the name with `SYNCHRONIZE` access and closes it at once (kept, S5). ops-tower uses the probe to show a slot held with no claim, and the critical gate uses it to count light gates beside it (K3).
+A slot is held while any handle to its name exists: a reader opens the name with `SYNCHRONIZE` access and closes it at once (kept, S5). ops-tower uses the probe to show a slot held with no claim, the critical gate uses it to count light gates beside it (K3), and a waiter uses it for the busy count of its first wait line.
+
+A name the prober may not open (an elevated gate made it with an access list this process is refused) counts as held, since the refusal proves the name exists; any other failure is the prober's error.
 
 A gate that is trying a slot holds a handle for an instant, so a probe can read a transient "held"; only the head of each queue tries, which keeps such reads rare. The same rule bounds crash recovery: a mutex comes back abandoned only if another handle to its name was open when its owner was killed, so a take cannot rely on the abandoned result alone ([Abandoned slots](#abandoned-slots)).
 
@@ -197,7 +205,7 @@ For any other root, every kernel object name carries `<h>`, the first 8 lower-ca
 |---|---|---|---|
 | `slot-counts.json` | ops-tower's Gates tab, people | every waiting gate, ops-tower | [Counts](#counts). |
 | `remote.json` | people | the router, ops-tower (`slots`) | Builders and routing (T1); only in the local root. |
-| `slots\<name>.json` | the gate holding the slot | other gates, ops-tower | [Claim](#claim); `<name>` is the mutex name without `Local\` and the root hash, plus `gate-critical.json` for a critical gate. |
+| `slots\<name>.json` | the gate holding the slot, written after its `take` line | other gates, ops-tower | [Claim](#claim); `<name>` is the mutex name without `Local\` and the root hash, plus `gate-critical.json` for a critical gate. |
 | `waiting\<pid>-<start>.json` | the waiting gate | other gates, ops-tower | [Ticket](#ticket). |
 | `paused\<parent pid>-<parent start>-<pid>-<start>.pause` | a nested gate waiting behind a critical request | its parent's watchdog | Empty file rewritten every pass (kept, N3). |
 | `events.jsonl`, `events.1.jsonl` | every gate, under the journal mutex | ops-tower, the durations summary, people | [Journal](#journal). |
@@ -249,13 +257,17 @@ The environment carries one more name: `GATE_SLOT_HELD`, the slot marker ([Criti
 | `processStart` | string | the gate's start time, ISO UTC |
 | `started` | string | when it took the slot, ISO UTC |
 | `cwd` | string | the gate's working directory |
-| `command` | string | the command's words, each quoted as for CreateProcess (C4), joined by spaces |
+| `command` | string | the command's words joined by spaces; each word will be quoted as for CreateProcess (C4) once command launching is built |
 | `log` | string | the log's full path |
 | `timeoutSeconds` | number | the ceiling; the writer refuses a value JSON cannot carry (not finite) |
 | `remote`, `host`, `key` | bool, string, string | a remote slot's claim only (L1) |
 | `expected` | object | reserved, optional ([Reserved fields](#reserved-fields)); `null` reads as absent, any other non-object is unreadable |
 
-The file name `<name>` is `gate-slot-<i>`, `gate-light-slot-<i>`, `gate-remote-slot-<i>` or `gate-critical`, the same whatever the root: a non-default root's claims sit in that root's own `slots\` folder, so the file name carries no root hash. A claim is live while its `pid` runs with that `processStart` (L2). A killed gate leaves its file; the next holder overwrites it and readers treat it as stale. A gate that cannot write its claim says so once and runs on (L1).
+The file name `<name>` is `gate-slot-<i>`, `gate-light-slot-<i>`, `gate-remote-slot-<i>` or `gate-critical`, the same whatever the root: a non-default root's claims sit in that root's own `slots\` folder, so the file name carries no root hash.
+
+A claim is live while its `pid` runs with that `processStart` (L2), the start compared in whole milliseconds. A killed gate leaves its file; the next holder overwrites it and readers treat it as stale. A gate that cannot write its claim says so once and runs on (L1).
+
+The liveness rule is the same for claims and [tickets](#ticket). A pid with no running process, or one that has exited, is dead. A pid the checking gate may not query is dead too, since it is another user's process reusing a dead gate's pid. Any other failure to check counts as live, said once per path, since a gate deletes nothing it cannot judge. A gate never judges its own ticket or claim (same pid and start).
 
 ### Ticket
 
@@ -274,7 +286,7 @@ The file name `<name>` is `gate-slot-<i>`, `gate-light-slot-<i>`, `gate-remote-s
 
 Waiters of one kind queue by (`arrived`, `pid`). The ticket reader lists only `*.json` files in `waiting\` (a `*.tmp` file is skipped), and leaves out a ticket deleted between the listing and the read, since a gate that took its slot deletes it.
 
-A ticket whose pid is gone or started at another time is ignored and deleted by the first gate that finds it; the reader itself deletes nothing. An unreadable ticket is ignored but left in place. ops-tower learns that a gate is waiting from these tickets, read through `gate-state`; it does not scan process command lines.
+A ticket whose gate is dead by the [liveness rule](#claim) is ignored and deleted by the first gate that finds it, which then wakes the other waiters; the reader itself deletes nothing. An unreadable ticket is ignored but left in place, said once. ops-tower learns that a gate is waiting from these tickets, read through `gate-state`; it does not scan process command lines.
 
 ### Counts file
 
@@ -474,9 +486,11 @@ Rules:
 A Rust integration suite drives the built `gate.exe` through its CLI and reads only what it writes: exit codes, stdout, stderr, the log, the journal, claims and tickets.
 
 - **Own state root per case.** Every case creates a fresh root under the target directory's temporary folder and passes it with `--state-dir`, so cases never touch the machine's real slots, journal or counts, or each other's. Cases run side by side.
-- **Test seams.** Hidden `--test-*` flags, compiled only with the `test-seams` cargo feature, set the timing knobs: `--test-sample-ms` (sample period), `--test-heartbeat-ms` (wait heartbeat), `--test-poll-ms` (fallback poll) and `--test-stall-ms` (stall window below a second). Each takes whole milliseconds above 0 on `gate run`, and is parsed only until the wait loop and the watchdog exist.
+- **Test seams.** Hidden `--test-*` flags, compiled only with the `test-seams` cargo feature, set the timing knobs: `--test-sample-ms` (sample period), `--test-heartbeat-ms` (wait heartbeat), `--test-poll-ms` (fallback poll) and `--test-stall-ms` (stall window below a second). Each takes whole milliseconds above 0 on `gate run`. `--test-poll-ms` and `--test-heartbeat-ms` take effect in `--test-journal-run` runs; the sample and stall knobs are parsed only until the watchdog exists.
 
-  `--test-journal-run <status>` (a whole number 0 to 255, on `gate run` in the new CLI only) writes the `queue`, `take` (`"slots":[]`, `waitedSeconds` 0), an optional hold and `release` lines through the real writer and mutex without launching a command or taking a slot, then exits with `<status>`; it is refused with `gate: --test-journal-run must be a whole number 0 to 255, got '<v>'`, or `gate: --test-journal-run and --test-print-request cannot be combined`.
+  `--test-journal-run <status>` (a whole number 0 to 255, on `gate run` in the new CLI only) runs the slot lifecycle through the real writer, mutexes, tickets and claims without launching a command: `queue`, the wait for a slot, `take`, an optional hold, then `release`, and exits with `<status>`. A critical run takes no slot: its `take` and `release` carry `"slots":[]`.
+
+  The seam is refused with `gate: --test-journal-run must be a whole number 0 to 255, got '<v>'`, or `gate: --test-journal-run and --test-print-request cannot be combined`.
 
   `--test-hold-until <path>` (or `=<path>`) makes `--test-journal-run` hold between the `take` and `release` lines, checking every 20 ms, until `<path>` exists, so the suite can observe or kill a gate that holds. The hold has no timeout of its own and counts in `heldSeconds` and `wallSeconds`. If the path cannot be checked, the gate says `gate: cannot check <path>: <error>` and ends the hold.
 
