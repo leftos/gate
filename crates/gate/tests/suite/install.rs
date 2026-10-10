@@ -19,9 +19,10 @@ fn script() -> PathBuf {
 struct EnvironmentKey(String);
 
 impl EnvironmentKey {
-    /// The key named for `case`, under the suite's own registry folder.
+    /// The key named for `case` and this test process, under the suite's own registry folder, so two suite runs at
+    /// once (two worktrees) never share a case's key.
     fn new(case: &str) -> EnvironmentKey {
-        EnvironmentKey(format!(r"HKCU:\Software\gate-suite\{case}"))
+        EnvironmentKey(format!(r"HKCU:\Software\gate-suite\{case}-{}", std::process::id()))
     }
 }
 
