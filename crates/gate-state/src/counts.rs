@@ -6,6 +6,7 @@ use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -17,6 +18,8 @@ use crate::model::{SlotCount, SlotCounts, SlotKind, StateInputs};
 const WRITE_ATTEMPTS: u32 = 10;
 /// The pause between two of those tries.
 const WRITE_RETRY_DELAY: Duration = Duration::from_millis(100);
+/// The next `<n>` a temp file name takes, counted across every thread of this process.
+static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Why the counts file could not be written.
 #[derive(Debug, thiserror::Error)]
@@ -161,8 +164,9 @@ pub fn write_slot_counts(path: &Path, counts: &SlotCounts) -> Result<(), WriteEr
     write_replacing(path, &text).map_err(fail)
 }
 
-/// Writes `text` to `path` beside it first, as `<path>.<pid>.tmp`, then moves that over `path`, so a reader never sees
-/// a torn file; a missing parent folder is made. A reader holding the file blocks the move for that moment, so the move
+/// Writes `text` to `path` beside it first, as `<path>.<pid>.<n>.tmp`, then moves that over `path`, so a reader never
+/// sees a torn file; `<n>` is a per-process counter, so two threads writing one file never share a temp file. A missing
+/// parent folder is made. A reader holding the file blocks the move for that moment, so the move
 /// is tried up to ten times, 100 ms apart.
 pub(crate) fn write_replacing(path: &Path, text: &str) -> io::Result<()> {
     if let Some(folder) = path.parent()
@@ -176,7 +180,7 @@ pub(crate) fn write_replacing(path: &Path, text: &str) -> io::Result<()> {
     }
     let moved = with_retry(|| fs::rename(&temp, path));
     if moved.is_err() {
-        // The write has failed and says so; a file left beside the target is overwritten by this process's next write.
+        // The write has failed and says so; a temp file this cannot remove stays beside the target, since no later write uses its name.
         let _ = fs::remove_file(&temp);
     }
     moved
@@ -221,9 +225,11 @@ pub fn apply_slot_count(path: &Path, kind: SlotKind, count: Option<SlotCount>) -
     write_slot_counts(path, &counts)
 }
 
+/// `<path>.<pid>.<n>.tmp`, `<n>` taken from [`TEMP_COUNTER`] so no two writes of this process share one.
 fn temp_path(path: &Path) -> PathBuf {
+    let write = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     let mut name = OsString::from(path.as_os_str());
-    name.push(format!(".{}.tmp", std::process::id()));
+    name.push(format!(".{}.{write}.tmp", std::process::id()));
     PathBuf::from(name)
 }
 

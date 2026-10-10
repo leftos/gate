@@ -173,7 +173,7 @@ pub fn read_claim(path: &Path) -> Result<Claim, FormatError> {
     read_strict(path)
 }
 
-/// Writes `claim` at `path` through `<path>.<pid>.tmp` moved over it, making a missing folder.
+/// Writes `claim` at `path` through `<path>.<pid>.<n>.tmp` moved over it, making a missing folder.
 ///
 /// # Errors
 ///
@@ -195,7 +195,7 @@ pub fn read_ticket(path: &Path) -> Result<Ticket, FormatError> {
     read_strict(path)
 }
 
-/// Writes `ticket` at `path` through `<path>.<pid>.tmp` moved over it, making a missing folder.
+/// Writes `ticket` at `path` through `<path>.<pid>.<n>.tmp` moved over it, making a missing folder.
 ///
 /// # Errors
 ///

@@ -213,7 +213,7 @@ For any other root, every kernel object name carries `<h>`, the first 8 lower-ca
 | `durations.json`, `backfill\<pid>.json` and the backfill bar record | gates | gates | Reserved for learned durations (GATE-7; [design/gate-durations.md](design/gate-durations.md)). |
 | `remote\<key>.outputs-pending` | the bridged remote client | the bridged remote client | Written by `remote.ps1` while the bridge stands (D1). |
 
-`<start>` everywhere in a name is the process start time in Unix epoch milliseconds. Claims, tickets and counts are written to a temporary sibling (`<file>.<pid>.tmp`) and moved over the target, so a reader never sees a torn file (kept, L1, Q1).
+`<start>` everywhere in a name is the process start time in Unix epoch milliseconds. Claims, tickets and counts are written to a temporary sibling (`<file>.<pid>.<n>.tmp`, where `<n>` is a per-process counter so two threads of one process never share one) and moved over the target, so a reader never sees a torn file (kept, L1, Q1).
 
 ### Kernel object names
 

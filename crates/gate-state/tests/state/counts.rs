@@ -1,6 +1,7 @@
 //! Pool counts from the processor count and the counts file, writing the file, and refusing request values.
 
 use std::fs;
+use std::thread;
 
 use gate_state::{ParseError, SlotCount, SlotCounts, SlotKind, SlotState, apply_slot_count, read_slot_count_setting, write_slot_counts};
 use serde_json::{Value, json};
@@ -161,6 +162,49 @@ fn write_then_read_round_trips_and_empty_deletes() {
     assert!(!path.exists());
     write_slot_counts(&path, &SlotCounts::default()).expect("empty counts with no file are no error");
     assert_eq!(read_slot_count_setting(&path), SlotCounts::default());
+}
+
+#[test]
+fn concurrent_count_writes_all_succeed() {
+    const THREADS: u32 = 8;
+    const WRITES_PER_THREAD: usize = 50;
+    let machine = Machine::new("concurrent_count_writes_all_succeed");
+    let path = machine.counts_path();
+    let written: Vec<SlotCounts> = (1..=THREADS)
+        .map(|n| SlotCounts {
+            heavy: Some(count(n)),
+            light: Some(count(n + THREADS)),
+        })
+        .collect();
+
+    let target = path.as_path();
+    let results: Vec<_> = thread::scope(|scope| {
+        let writers: Vec<_> = written
+            .iter()
+            .map(|counts| scope.spawn(move || (0..WRITES_PER_THREAD).map(|_| write_slot_counts(target, counts)).collect::<Vec<_>>()))
+            .collect();
+        writers
+            .into_iter()
+            .flat_map(|writer| writer.join().expect("a writer thread does not panic"))
+            .collect()
+    });
+
+    assert_eq!(results.len(), written.len() * WRITES_PER_THREAD);
+    let failures: Vec<String> = results
+        .iter()
+        .filter_map(|result| result.as_ref().err())
+        .map(ToString::to_string)
+        .collect();
+    assert!(failures.is_empty(), "{} of {} writes failed: {failures:?}", failures.len(), results.len());
+    let last = read_slot_count_setting(&path);
+    assert!(written.contains(&last), "the file holds one thread's whole counts, got {last:?}");
+    let temps: Vec<_> = fs::read_dir(path.parent().expect("the path has a folder"))
+        .expect("the folder exists")
+        .flatten()
+        .map(|entry| entry.file_name())
+        .filter(|name| name.to_string_lossy().ends_with(".tmp"))
+        .collect();
+    assert!(temps.is_empty(), "no temp file is left beside the counts: {temps:?}");
 }
 
 #[test]
