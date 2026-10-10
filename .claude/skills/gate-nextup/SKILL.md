@@ -23,6 +23,8 @@ The owner wants this project worked as autonomously as possible and holds no str
 
 The owner is asked only about what they know as a user and a developer: how they and the agents in the repos that use the gate experience it. That covers output a person or agent reads, waits and their feedback, failure messages, defaults that change how a caller's run behaves, and workflows in those repos. A feature branch counts as technical: the round decides it and says so.
 
+Merging is the agents' call too. Once every item under a feature marker has landed and its gates are green, the session runs `ship` on the branch and merges the feature PR without asking.
+
 ## Agents
 
 - Explore: `Explore`. Behaviour questions about the PowerShell gate point the explorer at `~/.claude/tools/gate/` by path, and at the behaviour inventory, `docs/research/2026-10-09-powershell-gate-inventory.md`.
