@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use gate_args::{RunRequest, Slot};
 use gate_watchdog::{
     Config, JOB_LINES, Machine, OUTSIDE_LINES, ProcessFacts, Report, Sample, SampleFacts, SampleHistory, ServerFacts, SystemTimes, Ticks, Watch,
-    WslVm, failed_block, lines,
+    WslVm, failed_block, is_wsl_command, lines, wsl_unavailable_line,
 };
 use gate_win32::{Interrupt, Job, ProcessTimes, Running, Waited};
 use jiff::Timestamp;
@@ -81,6 +81,43 @@ pub(crate) struct Watcher<'a> {
     samples: u64,
     /// After how many samples the gate raises the interrupt itself (`--test-interrupt-after-samples`).
     interrupt_after: Option<u64>,
+    vm: VmReader<VmRead>,
+}
+
+/// A read of the WSL VM's cumulative CPU in 100 ns ticks, `None` when no VM runs.
+type VmRead = fn() -> io::Result<Option<u64>>;
+
+/// How the watch reads the WSL VM's CPU, and whether it has said that a read failed, which it says once a run.
+struct VmReader<R> {
+    read: R,
+    said: bool,
+}
+
+impl<R: FnMut() -> io::Result<Option<u64>>> VmReader<R> {
+    /// A reader that has said nothing yet.
+    fn new(read: R) -> Self {
+        VmReader { read, said: false }
+    }
+
+    /// The VM's CPU as the watch begins: a read that fails leaves no baseline and says nothing, since the first
+    /// sample whose own read fails says it.
+    fn baseline(&mut self) -> Option<u64> {
+        (self.read)().ok().flatten()
+    }
+
+    /// One sample's read, and the line to say when it is the first of the run that failed; a failure never fails the
+    /// sample, and the next sample reads again.
+    fn sample(&mut self) -> (io::Result<Option<u64>>, Option<String>) {
+        let read = (self.read)();
+        let line = match &read {
+            Err(error) if !self.said => {
+                self.said = true;
+                Some(wsl_unavailable_line(&error.to_string()))
+            }
+            _ => None,
+        };
+        (read, line)
+    }
 }
 
 /// The facts a watch begins from, read as the command starts: when it began, by both clocks.
@@ -113,7 +150,7 @@ pub(crate) struct Watching<'a> {
 
 impl<'a> Watcher<'a> {
     /// Begins the watch of `run`, which `request` started at `start` on a machine of `processors` logical processors,
-    /// from the system's and the job's CPU times read now.
+    /// from the system's and the job's CPU times read now, and the WSL VM's for a wsl command.
     ///
     /// # Errors
     ///
@@ -121,14 +158,11 @@ impl<'a> Watcher<'a> {
     pub(crate) fn begin(request: &RunRequest, run: Watching<'a>, start: &Start, processors: usize) -> io::Result<Watcher<'a>> {
         let system = system_times()?;
         let job_cpu = Ticks(run.job.accounting()?.cpu);
-        let config = Config {
-            timeout: request.timeout,
-            stall: request
-                .test_seams
-                .stall_ms
-                .map_or(Duration::from_secs(request.stall), Duration::from_millis),
-            wsl: false,
-        };
+        let config = config(request);
+        // A command that is not a wsl one reads nothing.
+        let read: VmRead = if config.wsl { gate_win32::wsl_vm_cpu } else { || Ok(None) };
+        let mut vm = VmReader::new(read);
+        let vm_cpu = vm.baseline();
         let spoken: Vec<String> = request.command.iter().map(|word| word.to_string_lossy().into_owned()).collect();
         Ok(Watcher {
             job: run.job,
@@ -139,7 +173,7 @@ impl<'a> Watcher<'a> {
             period: request.test_seams.sample_ms.map_or(SAMPLE_PERIOD, Duration::from_millis),
             interrupt: run.interrupt,
             spoken: spoken.join(" "),
-            watch: Watch::new(config, machine(run.runs_as, processors), system, job_cpu, None),
+            watch: Watch::new(config, machine(run.runs_as, processors), system, job_cpu, vm_cpu),
             history: SampleHistory::default(),
             servers: Servers::new(),
             under: request.test_seams.servers_under.as_deref().map(absolute),
@@ -149,6 +183,7 @@ impl<'a> Watcher<'a> {
             diagnostics_fail: request.test_seams.diagnostics_fail,
             samples: 0,
             interrupt_after: request.test_seams.interrupt_after_samples,
+            vm,
         })
     }
 
@@ -202,13 +237,17 @@ impl<'a> Watcher<'a> {
             self.watch.wall_only(at, false);
             return;
         }
-        match self.sample(at) {
+        let (vm, line) = self.vm.sample();
+        if let Some(line) = line {
+            console.err(&line);
+        }
+        match self.sample(at, vm.as_ref().ok().copied().flatten()) {
             Ok((sample, log_bytes, err_bytes)) => {
                 // Only a sample that came back whole becomes the one a kill's block lists the servers of; one that
                 // failed part way leaves the last good sample's servers in place.
                 self.counted = counted(&sample.new_servers, &sample.shared_servers);
                 self.watch.sample(&sample);
-                self.record(&sample, log_bytes, err_bytes);
+                self.record(&sample, log_bytes, err_bytes, vm.is_err());
             }
             Err(error) => {
                 self.sampler_works = false;
@@ -217,9 +256,15 @@ impl<'a> Watcher<'a> {
         }
     }
 
-    /// Keeps one sample for the diagnostics block a kill writes: the sample's own figures, the CPU its build servers
-    /// have used and whether the job held a build client with them. No WSL VM is watched.
-    fn record(&mut self, sample: &Sample, log_bytes: u64, err_bytes: u64) {
+    /// Keeps one sample for the diagnostics block a kill writes: the sample's own figures, the WSL VM's CPU the watch
+    /// found for a wsl command (`vm_failed` when this sample could not read it), the CPU its build servers have used
+    /// and whether the job held a build client with them.
+    fn record(&mut self, sample: &Sample, log_bytes: u64, err_bytes: u64, vm_failed: bool) {
+        let wsl_vm = match (self.watch.last_vm_percent(), vm_failed) {
+            (None, _) => WslVm::NotWatched,
+            (Some(_), true) => WslVm::Unavailable,
+            (Some(percent), false) => WslVm::Percent(percent),
+        };
         self.history.push(SampleFacts {
             wall_seconds: sample.at.as_secs_f64(),
             adjusted_seconds: self.watch.adjusted_seconds(),
@@ -229,7 +274,7 @@ impl<'a> Watcher<'a> {
             log_bytes,
             err_bytes,
             job_cpu: sample.job_cpu,
-            wsl_vm: WslVm::NotWatched,
+            wsl_vm,
             processes: u32::try_from(sample.pids.len()).unwrap_or(u32::MAX),
             new_servers_cpu: Ticks(sample.new_servers.values().copied().sum()),
             shared_servers_cpu: Ticks(sample.shared_servers.values().copied().sum()),
@@ -345,9 +390,10 @@ impl<'a> Watcher<'a> {
     }
 
     /// The facts of one sample at `at`: the system's and the job's CPU, the job's processes created since the command
-    /// started, the build servers outside the job and the build client inside it, and the size of the log and its
-    /// `.err` file, the two kept apart for the diagnostics block. Under `--test-sampler-fail` every sample fails.
-    fn sample(&mut self, at: Duration) -> io::Result<(Sample, u64, u64)> {
+    /// started, the build servers outside the job and the build client inside it, the WSL VM's CPU `vm_cpu` read for
+    /// it, and the size of the log and its `.err` file, the two kept apart for the diagnostics block. Under
+    /// `--test-sampler-fail` every sample fails.
+    fn sample(&mut self, at: Duration, vm_cpu: Option<u64>) -> io::Result<(Sample, u64, u64)> {
         if self.sampler_fail {
             return Err(io::Error::other(SAMPLER_FAIL));
         }
@@ -373,7 +419,7 @@ impl<'a> Watcher<'a> {
             new_servers: found.new_servers,
             shared_servers: found.shared_servers,
             build_client: found.build_client,
-            vm_cpu: None,
+            vm_cpu,
         };
         Ok((sample, log_bytes, err_bytes))
     }
@@ -382,6 +428,19 @@ impl<'a> Watcher<'a> {
     /// out.
     fn pids(&self) -> io::Result<BTreeSet<u32>> {
         members(self.job.process_ids()?, self.since, gate_win32::process_times)
+    }
+}
+
+/// What a run of `request` is watched for: its ceiling, its stall window, and whether it runs through WSL, as a command
+/// whose first word names `wsl` does.
+fn config(request: &RunRequest) -> Config {
+    Config {
+        timeout: request.timeout,
+        stall: request
+            .test_seams
+            .stall_ms
+            .map_or(Duration::from_secs(request.stall), Duration::from_millis),
+        wsl: request.command.first().is_some_and(|word| is_wsl_command(&word.to_string_lossy())),
     }
 }
 
@@ -487,12 +546,76 @@ fn size(path: &Path) -> io::Result<u64> {
 #[expect(clippy::expect_used, reason = "a sample that cannot be read must fail the test loudly")]
 mod tests {
     use std::collections::BTreeSet;
+    use std::ffi::OsString;
     use std::io;
+    use std::path::PathBuf;
 
-    use gate_args::Slot;
+    use gate_args::{RunRequest, Slot, Spelling, TestSeams};
+    use gate_watchdog::wsl_unavailable_line;
     use gate_win32::ProcessTimes;
 
-    use super::{ACCESS_DENIED, machine, members};
+    use super::{ACCESS_DENIED, VmReader, config, machine, members};
+
+    /// A heavy run of `command`.
+    fn request(command: &[&str]) -> RunRequest {
+        RunRequest {
+            slot: Slot::Heavy,
+            timeout: 60,
+            log: PathBuf::from("out.log"),
+            stall: 60,
+            tail: 0,
+            no_markers: false,
+            local: false,
+            state_dir: None,
+            command: command.iter().map(OsString::from).collect(),
+            test_seams: TestSeams::default(),
+            print_request: false,
+            spelling: Spelling::Cli,
+        }
+    }
+
+    #[test]
+    fn a_command_run_through_wsl_is_watched_as_a_wsl_one() {
+        assert!(config(&request(&["wsl", "-e", "true"])).wsl, "wsl by name");
+        assert!(config(&request(&["C:\\Windows\\System32\\wsl.exe", "-e", "true"])).wsl, "wsl.exe by path");
+        assert!(!config(&request(&["cargo", "test"])).wsl, "any other command is not a wsl one");
+    }
+
+    /// A VM reader that reads `reads` in turn, then no VM.
+    fn scripted(reads: Vec<io::Result<Option<u64>>>) -> VmReader<impl FnMut() -> io::Result<Option<u64>>> {
+        let mut reads = reads.into_iter();
+        VmReader::new(move || reads.next().unwrap_or(Ok(None)))
+    }
+
+    #[test]
+    fn the_vm_unavailable_line_is_said_once_at_the_first_failed_read() {
+        let mut vm = scripted(vec![
+            Err(io::Error::other("first")),
+            Err(io::Error::other("second")),
+            Ok(Some(5)),
+            Err(io::Error::other("third")),
+        ]);
+        let samples: Vec<(bool, Option<String>)> = (0..4)
+            .map(|_| {
+                let (read, line) = vm.sample();
+                (read.is_err(), line)
+            })
+            .collect();
+        assert_eq!(
+            samples,
+            vec![(true, Some(wsl_unavailable_line("first"))), (true, None), (false, None), (true, None)],
+            "every failure reads as one, and only the first is said"
+        );
+    }
+
+    #[test]
+    fn a_failed_baseline_followed_by_a_good_sample_says_nothing() {
+        let mut vm = scripted(vec![Err(io::Error::other("begin")), Ok(Some(5))]);
+        assert_eq!(vm.baseline(), None, "a failed read leaves no baseline");
+        let (read, line) = vm.sample();
+        assert_eq!(read.ok(), Some(Some(5)));
+        assert_eq!(line, None, "the begin read's failure is not said once a sample reads");
+    }
 
     #[test]
     fn a_light_command_asks_for_the_light_pool_s_threads_where_the_machine_has_them() {

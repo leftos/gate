@@ -76,6 +76,7 @@ pub struct Watch {
     shared_servers: BTreeMap<u32, u64>,
     vm_cpu: Option<u64>,
     vm_busy: u64,
+    vm_percent: f64,
     sampled: bool,
     sampler_failed: bool,
 }
@@ -104,6 +105,7 @@ impl Watch {
             shared_servers: BTreeMap::new(),
             vm_cpu,
             vm_busy: 0,
+            vm_percent: 0.0,
             sampled: false,
             sampler_failed: false,
         }
@@ -124,7 +126,7 @@ impl Watch {
             shared_servers,
             sample.build_client,
         );
-        let vm_working = self.vm_working(sample.vm_cpu);
+        let vm_working = self.vm_working(sample.vm_cpu, interval);
         if self.progressed(sample, new_servers, shared_servers, vm_working) {
             self.last_progress = sample.at;
             self.progress_cpu = sample.job_cpu;
@@ -161,24 +163,26 @@ impl Watch {
     }
 
     /// Adds the WSL VM's CPU since the last reading to the ticks accrued since the last progress, and says whether
-    /// they have reached the tenth of the stall window the floor is. Nothing is counted for a command that is not a WSL
-    /// one, and the first reading, and the first after one that could not be read, is only a baseline.
-    fn vm_working(&mut self, read: Option<u64>) -> bool {
+    /// they have reached the tenth of the stall window the floor is, and keeps that CPU over `interval` as the VM's
+    /// percent of one core. Nothing is counted for a command that is not a WSL one, and the first reading, and the
+    /// first after one that could not be read, is only a baseline, as is a reading lower than the last one (a VM that
+    /// restarted).
+    fn vm_working(&mut self, read: Option<u64>, interval: Duration) -> bool {
         if !self.config.wsl {
             return false;
         }
         let floor = self.config.stall.as_nanos() / VM_FLOOR_NANOS_PER_TICK;
-        let Some(now) = read else {
-            self.vm_cpu = None;
+        let before = self.vm_cpu;
+        self.vm_cpu = read;
+        let (Some(before), Some(now)) = (before, read) else {
+            self.vm_percent = 0.0;
             return false;
         };
-        let mut reached = false;
-        if let Some(before) = self.vm_cpu {
-            self.vm_busy = self.vm_busy.saturating_add(now.saturating_sub(before));
-            reached = u128::from(self.vm_busy) >= floor;
-        }
-        self.vm_cpu = Some(now);
-        reached
+        let gained = now.saturating_sub(before);
+        let gained_seconds = Duration::from_nanos(gained.saturating_mul(100)).as_secs_f64();
+        self.vm_percent = gained_seconds / interval.as_secs_f64() * 100.0;
+        self.vm_busy = self.vm_busy.saturating_add(gained);
+        u128::from(self.vm_busy) >= floor
     }
 
     /// Records that a sample failed, and returns the line the gate says for it.
@@ -242,6 +246,14 @@ impl Watch {
             return None;
         }
         Some((100.0 * self.last_free).round_ties_even() as u32)
+    }
+
+    /// The WSL VM's CPU over the last sample's interval, in percent of one core, so above 100 when it used more than
+    /// one: 0 before the first sample, when that sample's reading or the one before it is missing, and when the VM
+    /// restarted and reads lower than before. `None` for a command that is not a WSL one.
+    #[must_use]
+    pub fn last_vm_percent(&self) -> Option<f64> {
+        self.config.wsl.then_some(self.vm_percent)
     }
 
     /// Whether a sample has failed, so the watch goes by wall time alone.
@@ -1158,6 +1170,56 @@ mod tests {
             matches!(watch.kill_check(Duration::from_millis(5000)), Some(Kill::Stalled { .. })),
             "the reading after an unreadable one is a baseline, not 1.9 core-seconds of progress"
         );
+    }
+
+    #[test]
+    fn a_vm_total_that_falls_is_a_fresh_baseline() {
+        // A VM that restarted between samples reads a far lower total: that reading is only a baseline, so what the
+        // new VM uses after it must reach the 5 s window's floor on its own.
+        let floor = 5_000_000;
+        let mut watch = watching(wsl_config(5000, 5000));
+        watch.sample(&vm_sample(1000, Some(900_000_000)));
+        watch.sample(&vm_sample(2000, Some(1_000_000)));
+        watch.sample(&vm_sample(3000, Some(1_000_000 + floor - 1)));
+        assert!(
+            matches!(watch.kill_check(Duration::from_millis(6000)), Some(Kill::Stalled { .. })),
+            "a tick short of the floor after the fall is not progress"
+        );
+
+        let mut watch = watching(wsl_config(5000, 5000));
+        watch.sample(&vm_sample(1000, Some(900_000_000)));
+        watch.sample(&vm_sample(2000, Some(1_000_000)));
+        watch.sample(&vm_sample(3000, Some(1_000_000 + floor)));
+        assert!(
+            watch.kill_check(Duration::from_millis(6000)).is_none(),
+            "the floor reached after the fall is progress"
+        );
+    }
+
+    #[test]
+    fn the_first_sample_after_a_baseline_shows_the_vm_percent_since_it() {
+        // 2.5 core-seconds over the first 5 s since the baseline the watch began with is half a core.
+        let mut watch = Watch::new(wsl_config(60_000, 5000), Machine::new(16, 16, false), IDLE, Ticks(0), Some(1_000_000));
+        assert_eq!(watch.last_vm_percent(), Some(0.0), "no sample yet");
+        watch.sample(&vm_sample(5000, Some(26_000_000)));
+        let percent = watch.last_vm_percent().unwrap_or(f64::NAN);
+        assert!((percent - 50.0).abs() < 1e-9, "the first sample counts from the baseline, read {percent}");
+        watch.sample(&vm_sample(6000, Some(56_000_000)));
+        let percent = watch.last_vm_percent().unwrap_or(f64::NAN);
+        assert!((percent - 300.0).abs() < 1e-9, "three cores read above 100, read {percent}");
+        watch.sample(&vm_sample(7000, None));
+        assert_eq!(watch.last_vm_percent(), Some(0.0), "a missing reading");
+        watch.sample(&vm_sample(8000, Some(60_000_000)));
+        assert_eq!(watch.last_vm_percent(), Some(0.0), "the reading after a missing one is a baseline");
+        assert_eq!(watching(config(5000, 5000)).last_vm_percent(), None, "not a WSL command");
+    }
+
+    #[test]
+    fn a_vm_total_that_falls_shows_no_vm_percent() {
+        let mut watch = watching(wsl_config(60_000, 5000));
+        watch.sample(&vm_sample(1000, Some(900_000_000)));
+        watch.sample(&vm_sample(2000, Some(1_000_000)));
+        assert_eq!(watch.last_vm_percent(), Some(0.0), "a VM that restarted used nothing yet");
     }
 
     #[test]

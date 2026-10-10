@@ -17,6 +17,7 @@ thiserror = "2.0.21"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = [
+    "Wdk_System_SystemInformation",
     "Win32_Foundation",
     "Win32_Globalization",
     "Win32_Security",
