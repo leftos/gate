@@ -5,11 +5,12 @@
 ## Local gate
 
 - [ ] GATE-5 Port the local gate, slice by slice
-  - [ ] GATE-36 Local slice 5: watchdog (CPU sampling, stall check, kill-tree, heartbeat)
   - [ ] GATE-37 Local slice 6: timeout ceiling and backstop
+    - [ ] GATE-76 Ceiling part C: gather and write the diagnostics on a kill
   - [ ] GATE-38 Local slice 7: critical drain and nesting
   - [ ] GATE-39 Local slice 8: router and the bridge to remote.ps1
     - [ ] GATE-67 Router part B: route gate run through a remote client interface
+      - [ ] GATE-80 Router B2b: the remote pool and the client call
     - [ ] GATE-68 Router part C: the remote.ps1 bridge through a repo shim
   - [ ] GATE-41 Local slice 10: the PowerShell launcher execs gate.exe once the cutover flag is set
   - [ ] GATE-62 Watchdog: count build servers, WSL and paused child gates as progress
@@ -21,7 +22,7 @@
   - [ ] GATE-16 Durations part 4: `--timeout auto` as a floor, and ceiling and hang hints
   - [ ] GATE-17 Durations part 5: backfill guests during a critical drain
 - [ ] GATE-8 `--slot auto` picks heavy or light from the command's history
-- [ ] GATE-54 Keep the command's log handles out of processes the gate starts on other threads
+- [ ] GATE-77 Watchdog: lower build servers' priority during a critical run (B2)
 
 ## Remote
 
@@ -45,7 +46,6 @@
   - [ ] GATE-63 Box: restore a repo's dotnet tools before a routed run
   - [ ] GATE-65 Box: push the installed gate.exe to each builder
   - [ ] GATE-70 Remote: measure per-verb ssh overhead, then choose per-call or gate box serve
-- [ ] GATE-72 gate-win32: share one process-creation path between Launch and PipedLaunch
 
 ## Cutover sweep
 
@@ -53,4 +53,4 @@
 
 ## Backlog
 
-- [/] GATE-64 Suite: journal rollover case sometimes waits for a light slot under load
+- [ ] GATE-81 gate-win32: terminate a created process when owning its thread handle fails
