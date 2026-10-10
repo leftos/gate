@@ -41,6 +41,7 @@ fn print_request_shows_the_new_cli_request() {
             "stallMs": null,
             "interruptAfterSamples": null,
             "interruptQueued": false,
+            "samplerFail": false,
         },
     });
     assert_eq!(outcome.stdout, format!("{expected}\n"), "the keys come in the published order");

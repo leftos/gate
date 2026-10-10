@@ -22,6 +22,7 @@ fn seam_flags_parse_with_the_feature() {
             "--test-interrupt-after-samples",
             "3",
             "--test-interrupt-queued",
+            "--test-sampler-fail",
             "--test-print-request",
             "--",
             "cmd",
@@ -37,6 +38,7 @@ fn seam_flags_parse_with_the_feature() {
             stall_ms: Some(80),
             interrupt_after_samples: Some(3),
             interrupt_queued: true,
+            sampler_fail: true,
         }
     );
     assert!(request.print_request);

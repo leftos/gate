@@ -6,17 +6,7 @@ use std::fs;
 use regex::Regex;
 use serde_json::Value;
 
-use crate::support::{Case, FAKE_TOOL, assert_in_order, run_words};
-
-/// The journal's `release` line.
-fn release(case: &Case) -> Value {
-    fs::read_to_string(case.root().join("events.jsonl"))
-        .expect("the journal was written")
-        .lines()
-        .map(|line| serde_json::from_str::<Value>(line).expect("a journal line is JSON"))
-        .find(|event| event["event"] == "release")
-        .expect("the run journalled its release")
-}
+use crate::support::{Case, FAKE_TOOL, assert_in_order, release, run_words, said_pid, shown, wait_until_closed};
 
 #[test]
 fn a_silent_idle_command_is_killed_as_stalled() {
@@ -49,13 +39,38 @@ fn a_silent_idle_command_is_killed_as_stalled() {
         (&Value::from("stalled"), &Value::from(124)),
         "{release}"
     );
-    let pid: Option<u32> = log.lines().find_map(|text| text.strip_prefix("pid ")).and_then(|pid| pid.parse().ok());
-    assert!(pid.is_some(), "the command said its pid: {log}");
-    let pid = pid.expect("checked above");
+    let pid = said_pid(&log, "pid ");
     assert!(
         gate_win32::process_start_of(pid).is_ok_and(|start| start.is_none()),
         "the killed command {pid} is gone"
     );
+}
+
+#[test]
+fn a_stalled_command_is_killed_with_its_grandchild() {
+    let case = Case::new("a_stalled_command_is_killed_with_its_grandchild");
+    // Never created: the grandchild waits on it until the kill ends it.
+    let go = shown(&case.folder().join("go"));
+    // The command's own pid, its `pid` line, the grandchild's pid and its `spawned` line each restart the stall
+    // window, so the stall can only come once both processes are in the job and the command has gone quiet.
+    let seams = ["--test-stall-ms", "3000", "--test-sample-ms", "100"];
+
+    let outcome = case.run(&run_words("out.log", &seams, &[FAKE_TOOL, "pid", "spawn-wait", &go, "sleep", "30000"]));
+
+    assert_eq!(outcome.code, Some(124), "{outcome:?}");
+    let after = ["gate: terminated the job's 2 process(es)", "gate: FAILED (status 124)"];
+    assert_in_order(&outcome.stderr, &[&["gate: STALLED: "][..], &after[..]].concat());
+    assert_eq!(release(&case)["verdict"], "stalled");
+    let log_path = case.folder().join("out.log");
+    wait_until_closed(&log_path);
+    let log = fs::read_to_string(&log_path).expect("the log was written");
+    for prefix in ["pid ", "spawned "] {
+        let pid = said_pid(&log, prefix);
+        assert!(
+            gate_win32::process_start_of(pid).is_ok_and(|start| start.is_none()),
+            "the killed process {pid} ({prefix:?}) is gone"
+        );
+    }
 }
 
 #[test]

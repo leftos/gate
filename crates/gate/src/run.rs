@@ -42,9 +42,9 @@ const STOP_WAIT: Duration = Duration::from_secs(5);
 
 /// Runs `request`'s command, logging to `log` (absolute) under `root`, saying each line as it goes; returns the gate's
 /// exit status: the command's own whole 32-bit code, 1 for a failure marker in its log or a failure of the gate after
-/// it started, 124 for a command killed as stalled, 127 when it could not be started, 0xC000013A for a Ctrl+C in the
-/// queue, before the command started, or with the command still running 5 s after it, or 2 for a log inside the state
-/// root or a batch word refused before anything was queued.
+/// it started, 124 for a command killed as stalled, timed out or past the backstop, 127 when it could not be started,
+/// 0xC000013A for a Ctrl+C in the queue, before the command started, or with the command still running 5 s after it,
+/// or 2 for a log inside the state root or a batch word refused before anything was queued.
 pub(crate) fn run(request: &RunRequest, log: &Path, root: &ResolvedRoot, console: &mut Console) -> u32 {
     if log_in_state_root(log, &root.path) {
         console.err(&format!(
@@ -341,11 +341,12 @@ struct Run<'a> {
     host: Host,
 }
 
-/// How long a command ran: by the wall clock, and in load-adjusted seconds.
+/// How long a command ran: by the wall clock, and in load-adjusted seconds, `None` once the sampler failed and they are
+/// unknown.
 #[derive(Clone, Copy)]
 struct Timing {
     wall: Duration,
-    adjusted: f64,
+    adjusted: Option<f64>,
 }
 
 /// How a watched command ended, as its verdict reads it: its status, how long it ran, and the line of a kill.
@@ -473,7 +474,7 @@ impl Run<'_> {
         }
     }
 
-    /// Watches the started command to its exit, a stall kill or a Ctrl+C, then reaches the verdict. Should the gate fail
+    /// Watches the started command to its exit, a kill or a Ctrl+C, then reaches the verdict. Should the gate fail
     /// or panic first, the job is terminated, so the command does not outlive the run.
     fn watched(&mut self, job: &Job, running: &Running, start: &Start, console: &mut Console) -> Ended {
         let mut stopper = Stopper { job, armed: true };
@@ -491,9 +492,9 @@ impl Run<'_> {
         ended
     }
 
-    /// Watches the command until it exits, stalls or the console is interrupted; how it ended and the load-adjusted
-    /// seconds it ran, else the gate's problem.
-    fn watch(&self, job: &Job, running: &Running, start: &Start, console: &mut Console) -> Result<(Watched, f64), String> {
+    /// Watches the command until it exits, is killed or the console is interrupted; how it ended and the load-adjusted
+    /// seconds it ran, `None` once the sampler failed, else the gate's problem.
+    fn watch(&self, job: &Job, running: &Running, start: &Start, console: &mut Console) -> Result<(Watched, Option<f64>), String> {
         let watching = Watching {
             job,
             running,
@@ -506,9 +507,10 @@ impl Run<'_> {
         Ok((watched, watcher.adjusted_seconds()))
     }
 
-    /// Ends the run as the watch ended it: a command that exited has its verdict; a stalled one has its kill line said,
-    /// its job terminated and the verdict of status 124; an interrupted one is given 5 s to end before its job is stopped,
-    /// and has the verdict of its own status, neither scanned for markers.
+    /// Ends the run as the watch ended it: a command that exited has its verdict; one killed as stalled, timed out or
+    /// past the backstop has its kill line said, its job terminated and the verdict of status 124; an interrupted one
+    /// is given 5 s to end before its job is stopped, and has the verdict of its own status, neither scanned for
+    /// markers.
     fn after_watch(&mut self, watched: Watched, timing: Timing, started: (&Job, &Running), console: &mut Console) -> Ended {
         let (job, running) = started;
         match watched {
@@ -545,7 +547,7 @@ impl Run<'_> {
                 status,
                 facts: Some(RunFacts {
                     wall_seconds: outcome.timing.wall.as_secs_f64(),
-                    adjusted_seconds: Some(outcome.timing.adjusted),
+                    adjusted_seconds: outcome.timing.adjusted,
                     verdict: Verdict::of(outcome.kill, outcome.exited, status),
                 }),
             },
@@ -592,9 +594,12 @@ impl Run<'_> {
         }
         match timing {
             Some(timing) if status == 0 => console.note_out(&format!(
-                "gate: passed in {} s (load-adjusted {} s, ceiling {} s). Full output: {shown}",
+                "gate: passed in {} s (load-adjusted {}, ceiling {} s). Full output: {shown}",
                 whole_seconds(timing.wall.as_secs_f64()),
-                whole_seconds(timing.adjusted),
+                timing.adjusted.map_or_else(
+                    || "unknown: the sampler failed".to_owned(),
+                    |adjusted| format!("{} s", whole_seconds(adjusted))
+                ),
                 self.request.timeout
             )),
             _ => console.err(&format!("gate: FAILED (status {status}). Full output: {shown}")),
@@ -655,7 +660,7 @@ fn stop(job: &Job, running: &Running, console: &mut Console) {
     await_stopped(running, console);
 }
 
-/// Terminates the job of a stalled command, which held `processes` processes, and gives the command a moment to end.
+/// Terminates the job of a killed command, which held `processes` processes, and gives the command a moment to end.
 fn kill(job: &Job, running: &Running, processes: u32, console: &mut Console) {
     if let Err(error) = job.terminate(STOPPED) {
         console.err(&format!("gate: could not terminate the command's job: {error}"));

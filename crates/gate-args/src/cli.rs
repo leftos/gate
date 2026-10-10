@@ -101,6 +101,7 @@ fn seam_option(name: &str) -> Option<RunOption> {
         "test-interrupt-after-samples" => Some(RunOption::Value(ValueOption::InterruptAfterSamples)),
         "test-print-request" => Some(RunOption::Switch(SwitchOption::PrintRequest)),
         "test-interrupt-queued" => Some(RunOption::Switch(SwitchOption::InterruptQueued)),
+        "test-sampler-fail" => Some(RunOption::Switch(SwitchOption::SamplerFail)),
         _ => None,
     }
 }

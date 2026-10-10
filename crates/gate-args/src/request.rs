@@ -86,6 +86,8 @@ pub struct TestSeams {
     pub interrupt_after_samples: Option<u64>,
     /// Raise the console interrupt once the gate has said it is waiting for a slot.
     pub interrupt_queued: bool,
+    /// Make every sample of the running command fail, so the watch goes by wall time alone.
+    pub sampler_fail: bool,
 }
 
 /// A valid `gate run`.

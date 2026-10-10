@@ -1,6 +1,6 @@
 //! The watch of a running command: a sample of the system's and the job's CPU, the job's processes and the log's size
-//! every sample period, the load-adjusted clock and the stall they drive, and the end of the wait: the command's exit,
-//! a stall kill, or a Ctrl+C.
+//! every sample period, the load-adjusted clock, the stall, the ceiling and the backstop they drive, and the end of the
+//! wait: the command's exit, a kill as stalled, timed out or past the backstop, or a Ctrl+C.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use gate_args::{RunRequest, Slot};
-use gate_watchdog::{Config, Kill, Machine, Sample, SystemTimes, Ticks, Watch};
+use gate_watchdog::{Config, Machine, Sample, SystemTimes, Ticks, Watch};
 use gate_win32::{Interrupt, Job, ProcessTimes, Running, Waited};
 
 use crate::console::Console;
@@ -20,12 +20,15 @@ use crate::slots::Pool;
 const SAMPLE_PERIOD: Duration = Duration::from_secs(5);
 /// `ERROR_ACCESS_DENIED`, as a raw OS error.
 const ACCESS_DENIED: i32 = 5;
+/// The failure every sample has under `--test-sampler-fail`.
+const SAMPLER_FAIL: &str = "--test-sampler-fail makes every sample fail (test seam only)";
 
 /// How the wait for a watched command ended.
 pub(crate) enum Watched {
     /// The command exited with this code.
     Exited(u32),
-    /// The command stalled: the line that says so, and the processes its job held as it was found.
+    /// The command was killed as stalled, timed out or past the backstop: the line that says so, and the processes its
+    /// job held as the kill was found.
     Killed { line: String, processes: u32 },
     /// The console was interrupted while the command ran.
     Interrupted,
@@ -46,6 +49,8 @@ pub(crate) struct Watcher<'a> {
     spoken: String,
     watch: Watch,
     sampler_works: bool,
+    /// Whether every sample fails (`--test-sampler-fail`).
+    sampler_fail: bool,
     /// The samples taken so far, which `--test-interrupt-after-samples` counts.
     samples: u64,
     /// After how many samples the gate raises the interrupt itself (`--test-interrupt-after-samples`).
@@ -106,13 +111,14 @@ impl<'a> Watcher<'a> {
             spoken: spoken.join(" "),
             watch: Watch::new(config, machine(request.slot, processors), system, job_cpu),
             sampler_works: true,
+            sampler_fail: request.test_seams.sampler_fail,
             samples: 0,
             interrupt_after: request.test_seams.interrupt_after_samples,
         })
     }
 
-    /// Waits for the command to exit, sampling it every period, until it exits, stalls or the console is interrupted.
-    /// A sample that fails is said once, and the watch goes on by wall time alone.
+    /// Waits for the command to exit, sampling it every period, until it exits, is killed or the console is
+    /// interrupted. A sample that fails is said once, and the watch goes on by wall time alone.
     ///
     /// # Errors
     ///
@@ -141,9 +147,9 @@ impl<'a> Watcher<'a> {
         }
     }
 
-    /// The load-adjusted seconds the watch counted, unrounded.
-    pub(crate) fn adjusted_seconds(&self) -> f64 {
-        self.watch.adjusted_seconds()
+    /// The load-adjusted seconds the watch counted, unrounded; `None` once the sampler has failed, as they are unknown.
+    pub(crate) fn adjusted_seconds(&self) -> Option<f64> {
+        self.sampler_works.then(|| self.watch.adjusted_seconds())
     }
 
     /// Waits at most `timeout` for the command's exit, or for the interrupt when it was installed.
@@ -170,29 +176,30 @@ impl<'a> Watcher<'a> {
         }
     }
 
-    /// The stall kill when one is due now, or `None`; a command that exited as the kill was found keeps its own
-    /// status. The ceiling and the backstop are not acted on here.
+    /// The kill due now, as stalled, timed out or past the backstop, or `None`; a command that exited as the kill was
+    /// found keeps its own status.
     fn kill(&mut self) -> io::Result<Option<Watched>> {
         let now = self.started.elapsed();
-        match self.watch.kill_check(now) {
-            Some(kill @ Kill::Stalled { .. }) => {
-                if let Some(code) = self.running.wait(Duration::ZERO)? {
-                    self.watch.exited(self.started.elapsed());
-                    return Ok(Some(Watched::Exited(code)));
-                }
-                let processes = self.job.accounting()?.active_processes;
-                Ok(Some(Watched::Killed {
-                    line: kill.line(&self.spoken),
-                    processes,
-                }))
-            }
-            Some(Kill::TimedOut { .. } | Kill::Backstop { .. }) | None => Ok(None),
+        let Some(kill) = self.watch.kill_check(now) else {
+            return Ok(None);
+        };
+        if let Some(code) = self.running.wait(Duration::ZERO)? {
+            self.watch.exited(self.started.elapsed());
+            return Ok(Some(Watched::Exited(code)));
         }
+        let processes = self.job.accounting()?.active_processes;
+        Ok(Some(Watched::Killed {
+            line: kill.line(&self.spoken),
+            processes,
+        }))
     }
 
     /// The facts of one sample at `at`: the system's and the job's CPU, the job's processes created since the command
-    /// started, and the size of the log and its `.err` file.
+    /// started, and the size of the log and its `.err` file. Under `--test-sampler-fail` every sample fails.
     fn sample(&self, at: Duration) -> io::Result<Sample> {
+        if self.sampler_fail {
+            return Err(io::Error::other(SAMPLER_FAIL));
+        }
         Ok(Sample {
             at,
             system: system_times()?,

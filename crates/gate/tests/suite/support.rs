@@ -381,6 +381,23 @@ pub fn assert_in_order(haystack: &str, needles: &[&str]) {
     }
 }
 
+/// The `release` line of `case`'s journal.
+pub fn release(case: &Case) -> Value {
+    fs::read_to_string(case.root().join("events.jsonl"))
+        .expect("the journal was written")
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("a journal line is JSON"))
+        .find(|event| event["event"] == "release")
+        .expect("the run journalled its release")
+}
+
+/// The pid `log` says on its first line starting `prefix`, as fake-tool's `pid` and `spawn-wait` steps write it.
+pub fn said_pid(log: &str, prefix: &str) -> u32 {
+    let pid: Option<u32> = log.lines().find_map(|text| text.strip_prefix(prefix)).and_then(|pid| pid.parse().ok());
+    assert!(pid.is_some(), "no {prefix:?} line with a pid in the log:\n{log}");
+    pid.expect("checked above")
+}
+
 /// `path` as the gate prints it in the request.
 pub fn shown(path: &Path) -> String {
     path.to_string_lossy().into_owned()

@@ -3,6 +3,7 @@
 #![expect(clippy::expect_used, reason = "a case that cannot start its program or read its output must fail loudly")]
 
 mod boxside;
+mod ceiling;
 mod checkout;
 mod cli;
 mod compat;

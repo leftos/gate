@@ -6,7 +6,7 @@ use std::fs;
 use gate_state::v1::ticket_path;
 use serde_json::Value;
 
-use crate::support::{Case, FAKE_TOOL, assert_in_order, run_words, shown, wait_for_journal_line, write_counts};
+use crate::support::{Case, FAKE_TOOL, assert_in_order, release, run_words, said_pid, shown, wait_for_journal_line, write_counts};
 
 /// The status Windows reports for a process Ctrl+C ended, `STATUS_CONTROL_C_EXIT`, as a signed exit code.
 const CONTROL_C_EXIT: i32 = 0xC000_013A_u32.cast_signed();
@@ -33,19 +33,14 @@ fn a_command_still_running_5_s_after_a_ctrl_c_has_its_job_terminated() {
         &outcome.stderr,
         &["gate: interrupted; stopping the command", "gate: FAILED (status -1073741510)"],
     );
-    let release = events(&case)
-        .into_iter()
-        .find(|event| event["event"] == "release")
-        .expect("the run journalled its release");
+    let release = release(&case);
     assert_eq!(
         (&release["verdict"], &release["status"]),
         (&Value::from("failed"), &Value::from(CONTROL_C_EXIT)),
         "{release}"
     );
     let log = fs::read_to_string(case.folder().join("out.log")).expect("the log was written");
-    let pid: Option<u32> = log.lines().find_map(|text| text.strip_prefix("pid ")).and_then(|pid| pid.parse().ok());
-    assert!(pid.is_some(), "the command said its pid: {log}");
-    let pid = pid.expect("checked above");
+    let pid = said_pid(&log, "pid ");
     assert!(
         gate_win32::process_start_of(pid).is_ok_and(|start| start.is_none()),
         "the interrupted command {pid} is gone"
