@@ -24,6 +24,7 @@ use crate::console::Console;
 use crate::environment::{self, Variables};
 use crate::journal::RunJournal;
 use crate::log::Log;
+use crate::machine::{self, Machine, MachineWait, MachineWaited};
 use crate::nesting::Nesting;
 use crate::remote::{self, NoClient, RemoteCall, RemoteClient, RemoteOutcome};
 use crate::resolve::{Environment, ResolvedRoot};
@@ -114,17 +115,18 @@ pub(crate) fn run(request: &RunRequest, log: &Path, root: &ResolvedRoot, environ
     let route = run.queue(environment, console);
     let mut hold = Hold {
         taken: None,
+        machine: None,
         took: Instant::now(),
     };
     let watched = panic::catch_unwind(AssertUnwindSafe(|| run.through(&route, plan, &mut hold, console)));
     let status = match watched {
         Ok(Some(ended)) => {
-            run.release(hold.taken, hold.took, Some(&ended), console);
+            run.release(hold, Some(&ended), console);
             exit_status(ended.status)
         }
         Ok(None) => CONTROL_C_EXIT,
         Err(payload) => {
-            run.after_panic(hold.taken, hold.took, console);
+            run.after_panic(hold, console);
             panic::resume_unwind(payload);
         }
     };
@@ -410,9 +412,10 @@ struct Run<'a> {
     arrived: u64,
 }
 
-/// The slot a run holds, once it has taken one, and when it took it.
+/// The slot a run holds, or the machine a critical run holds, once it has taken it, and when it took it.
 struct Hold {
     taken: Option<Taken>,
+    machine: Option<Machine>,
     took: Instant,
 }
 
@@ -512,7 +515,11 @@ impl Run<'_> {
         if let Nesting::Under(parent) = self.nesting {
             console.err(&parent.uncovered_line(self.request.slot));
         }
-        match self.take(Pool::of(self.request.slot), &mut hold.taken, console) {
+        let taking = match Pool::of(self.request.slot) {
+            Some(pool) => self.take(pool, &mut hold.taken, console),
+            None => self.take_machine(&mut hold.machine, console),
+        };
+        match taking {
             Taking::Took(took) => {
                 hold.took = took;
                 Some(self.command(plan, console))
@@ -533,7 +540,7 @@ impl Run<'_> {
             let outcome = NoClient.run(&self.call(remote));
             return self.fell_back(FallbackReason::Client, &outcome, None, console);
         };
-        match self.take(Some(Pool::Remote(remote.slots)), &mut hold.taken, console) {
+        match self.take(Pool::Remote(remote.slots), &mut hold.taken, console) {
             Taking::Took(took) => hold.took = took,
             Taking::Interrupted => return Remotely::Interrupted,
             Taking::Full => return self.fell_back(FallbackReason::Full, &RemoteOutcome::default(), None, console),
@@ -664,15 +671,11 @@ impl Run<'_> {
     }
 
     /// Waits its turn for a slot of `pool` and takes it into `held` the moment it has it, then journals the take, with
-    /// the remote tag while the run has one, and writes the claim; a run with no pool, a critical one, takes no slot.
-    /// When the slot was taken; else a Ctrl+C ended the wait, which deletes the ticket at once, wakes the waiters and
-    /// journals the abandon, or a remote pool stayed full past the wait's limit, which deletes the ticket.
-    fn take(&mut self, pool: Option<Pool>, held: &mut Option<Taken>, console: &mut Console) -> Taking {
+    /// the remote tag while the run has one, and writes the claim. When the slot was taken; else a Ctrl+C ended the
+    /// wait, which deletes the ticket at once, wakes the waiters and journals the abandon, or a remote pool stayed full
+    /// past the wait's limit, which deletes the ticket.
+    fn take(&mut self, pool: Pool, held: &mut Option<Taken>, console: &mut Console) -> Taking {
         let queued = Instant::now();
-        let Some(pool) = pool else {
-            self.journal.write(&take_event(Vec::new(), 0.0, Vec::new()), None, console);
-            return Taking::Took(Instant::now());
-        };
         let arrival = Arrival {
             gate: &self.gate,
             request: self.request,
@@ -709,7 +712,53 @@ impl Run<'_> {
             log: self.log.path(),
             remote: self.tag.as_ref(),
         };
-        slots::write_claim(&taken.held, pool, &of, console);
+        slots::write_claim(&taken.held, pool.claim_kind(), &of, console);
+        slots::wake_waiters(self.root, &mut self.survey, console);
+        Taking::Took(took)
+    }
+
+    /// Waits for the machine as a critical gate and takes it into `held` once it holds every heavy and unreserved light
+    /// slot, then journals the take with what it found, says the holds line, writes the critical claim and wakes the
+    /// waiters. When the machine was taken; else a Ctrl+C ended the wait, which says so, journals the abandon, then
+    /// releases what it took so far, deletes the ticket and wakes the waiters.
+    fn take_machine(&mut self, held: &mut Option<Machine>, console: &mut Console) -> Taking {
+        let queued = Instant::now();
+        let arrival = Arrival {
+            gate: &self.gate,
+            request: self.request,
+            queued,
+            arrived: self.arrived,
+            builder: None,
+        };
+        let wait = MachineWait::queue(self.root, arrival, self.host, console);
+        let (machine, snapshot) = match wait.until_held(&mut self.survey, console) {
+            MachineWaited::Held(machine, snapshot) => (held.insert(machine), snapshot),
+            MachineWaited::Interrupted(machine) => {
+                console.err("gate: interrupted while waiting for the machine");
+                let waited_seconds = queued.elapsed().as_secs_f64();
+                self.journal.write(&JournalEvent::Abandon { waited_seconds }, None, console);
+                machine.release(self.root, &mut self.survey, console);
+                return Taking::Interrupted;
+            }
+        };
+        let waited = queued.elapsed().as_secs_f64();
+        let line = machine::holds_line(Timestamp::now(), waited, &snapshot);
+        let take = JournalEvent::Take {
+            slots: machine.names(),
+            waited_seconds: waited,
+            abandoned: machine.abandoned().to_vec(),
+            machine: Some(snapshot),
+        };
+        self.journal.write(&take, None, console);
+        console.err(&line);
+        let took = Instant::now();
+        let of = ClaimOf {
+            gate: &self.gate,
+            request: self.request,
+            log: self.log.path(),
+            remote: None,
+        };
+        machine.write_claim(&of, console);
         slots::wake_waiters(self.root, &mut self.survey, console);
         Taking::Took(took)
     }
@@ -727,24 +776,39 @@ impl Run<'_> {
     /// After a panic from the moment the slot was taken: completes the log as far as it can, the `.err` file and the
     /// notes so far, then releases the slot with the run's end unknown. The job of a started command was terminated
     /// as the panic left its watch.
-    fn after_panic(&mut self, taken: Option<Taken>, took: Instant, console: &mut Console) {
+    fn after_panic(&mut self, hold: Hold, console: &mut Console) {
         if let Err(error) = self.log.finish(console) {
             console.err(&format!(
                 "gate: could not write to {} after the failure: {error}",
                 self.log.path().display()
             ));
         }
-        self.release(taken, took, None, console);
+        self.release(hold, None, console);
     }
 
     /// Deletes the claim, journals the release with how the run `ended` (status and verdict unknown when it did not
-    /// end on its own path) and lets the slot go, then wakes the waiters. A gate a parent's slot covers took no slot and
-    /// journals no release.
-    fn release(&mut self, taken: Option<Taken>, took: Instant, ended: Option<&Ended>, console: &mut Console) {
+    /// end on its own path) and lets the slot go, then wakes the waiters. A critical gate journals the release of every
+    /// slot it held first, then lets the machine go ([`Machine::release`]). A gate a parent's slot covers took no slot
+    /// and journals no release.
+    fn release(&mut self, hold: Hold, ended: Option<&Ended>, console: &mut Console) {
         if self.nesting.covering().is_some() {
             return;
         }
+        let Hold { taken, machine, took } = hold;
         let held_seconds = took.elapsed().as_secs_f64();
+        let status = ended.map(|ended| ended.status);
+        let facts = ended.and_then(|ended| ended.facts);
+        if let Some(machine) = machine {
+            let release = JournalEvent::Release {
+                slots: machine.names(),
+                held_seconds,
+                status,
+                facts,
+            };
+            self.journal.write(&release, None, console);
+            machine.release(self.root, &mut self.survey, console);
+            return;
+        }
         let slots = match &taken {
             Some(taken) => {
                 slots::delete_claim(&taken.held, console);
@@ -755,8 +819,8 @@ impl Run<'_> {
         let release = JournalEvent::Release {
             slots,
             held_seconds,
-            status: ended.map(|ended| ended.status),
-            facts: ended.and_then(|ended| ended.facts),
+            status,
+            facts,
         };
         self.journal.write(&release, self.tag.as_ref(), console);
         if let Some(taken) = taken {
@@ -1117,6 +1181,7 @@ fn take_event(slots: Vec<String>, waited_seconds: f64, abandoned: Vec<String>) -
         slots,
         waited_seconds,
         abandoned,
+        machine: None,
     }
 }
 

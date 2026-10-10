@@ -11,7 +11,8 @@ use jiff::Timestamp;
 use serde_json::Value;
 
 use crate::support::{
-    Case, FAKE_TOOL, GATE, Outcome, Running, assert_in_order, events, finish, heavy_words, run_words, shown, start, wait_for_journal_line,
+    Case, FAKE_TOOL, GATE, Outcome, Running, assert_in_order, critical_words, events, finish, heavy_words, run_words, shown, start,
+    wait_for_journal_line,
 };
 
 /// A heavy pool of one slot.
@@ -44,13 +45,6 @@ pub(crate) fn marked(case: &Case, args: &[&str], marker: &str) -> Command {
     let mut command = case.gate(args);
     command.env("GATE_SLOT_HELD", marker);
     command
-}
-
-/// The words of a critical run, as [`run_words`] gives those of a light one.
-fn critical_words<'a>(log: &'a str, command: &[&'a str]) -> Vec<&'a str> {
-    let mut words = run_words(log, &[], command);
-    words[2] = "critical";
-    words
 }
 
 /// The journal's lines as their event and pid, in order.
@@ -194,7 +188,9 @@ fn refusal(flag: &str, held: &str) -> String {
 fn a_critical_gate_under_a_heavy_or_light_marker_is_refused() {
     for held in ["heavy", "light"] {
         let name = format!("a_critical_gate_under_a_heavy_or_light_marker_is_refused_{held}");
-        let (outcome, _case) = refused(&name, held, |case| case.gate(&critical_words("refused.log", &[FAKE_TOOL, "exit", "0"])));
+        let (outcome, _case) = refused(&name, held, |case| {
+            case.gate(&critical_words("refused.log", &[], &[FAKE_TOOL, "exit", "0"]))
+        });
         assert_eq!(outcome.stderr, refusal("--slot", held));
     }
 }
@@ -225,7 +221,7 @@ fn a_critical_gate_refused_through_the_powershell_form_names_its_flag_so() {
 #[test]
 fn a_critical_gate_under_a_critical_marker_is_covered() {
     let case = Case::new("a_critical_gate_under_a_critical_marker_is_covered");
-    let words = critical_words("out.log", &[FAKE_TOOL, "exit", "0"]);
+    let words = critical_words("out.log", &[], &[FAKE_TOOL, "exit", "0"]);
     let outcome = finish(marked(&case, &words, &test_marker(&case, "critical")));
     assert_passed(&outcome);
     assert!(

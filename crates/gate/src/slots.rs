@@ -27,7 +27,7 @@ pub(crate) enum Pool {
 }
 
 impl Pool {
-    /// The pool a gate of `slot` takes from; `None` for a critical gate, which has no pool of its own.
+    /// The pool a gate of `slot` takes from; `None` for a critical gate, which takes the machine ([`crate::machine`]).
     pub(crate) fn of(slot: Slot) -> Option<Pool> {
         match slot {
             Slot::Heavy => Some(Pool::Local(SlotKind::Heavy)),
@@ -58,7 +58,8 @@ impl Pool {
         matches!(self, Pool::Remote(_))
     }
 
-    fn claim_kind(self) -> ClaimKind {
+    /// The kind of the claim a gate holding a slot of the pool writes.
+    pub(crate) fn claim_kind(self) -> ClaimKind {
         match self {
             Pool::Local(SlotKind::Heavy) => ClaimKind::Heavy,
             Pool::Local(SlotKind::Light) => ClaimKind::Light,
@@ -269,6 +270,45 @@ impl Survey {
         (live, deleted)
     }
 
+    /// The live tickets under `root` of the other gates, this gate's own left out, and whether a dead one was deleted
+    /// on the way, as [`Survey::live_tickets`] reads them.
+    pub(crate) fn others(&mut self, root: &Path, console: &mut Console) -> (Vec<Ticket>, bool) {
+        let (live, deleted) = self.live_tickets(root, console);
+        (others(live, self.own), deleted)
+    }
+
+    /// The live claims under `root` of the other gates, each with its file name, sorted by it: only the files a claim
+    /// is named as ([`is_claim_file`]), this gate's own claims and a claim that cannot be read left out. An entry of
+    /// the folder that cannot be read is said once and passed over. Else why the claims folder cannot be listed; a
+    /// missing one holds none.
+    pub(crate) fn other_claims(&mut self, root: &Path, console: &mut Console) -> io::Result<Vec<(String, Claim)>> {
+        let dir = v1::slots_dir(root);
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error),
+        };
+        let mut claims = Vec::new();
+        for entry in entries {
+            let entry = match entry.and_then(|entry| entry.file_type().map(|kind| (entry, kind))) {
+                Ok((entry, kind)) if kind.is_file() && is_claim_file(&entry.file_name().to_string_lossy()) => entry,
+                Ok(_) => continue,
+                Err(error) => {
+                    self.say_once("cannot read the claims in", &dir.display().to_string(), error, console);
+                    continue;
+                }
+            };
+            let path = entry.path();
+            let Ok(claim) = v1::read_claim(&path) else { continue };
+            let start_ms = epoch_ms(claim.process_start);
+            if (claim.pid, start_ms) != self.own && self.is_live(&path, claim.pid, start_ms, console) {
+                claims.push((entry.file_name().to_string_lossy().into_owned(), claim));
+            }
+        }
+        claims.sort_by(|left, right| left.0.cmp(&right.0));
+        Ok(claims)
+    }
+
     /// The pid and start, in epoch milliseconds, of every gate a live claim under `root` names: the gates that hold a
     /// slot. An unreadable claim names none. A claims folder that cannot be read holds none, said once.
     pub(crate) fn holders(&mut self, root: &Path, console: &mut Console) -> HashSet<(u32, u64)> {
@@ -313,22 +353,40 @@ impl Survey {
 /// comes back abandoned, or when the slot's claim names a gate no longer alive. A slot that cannot be tried is said
 /// once and passed over.
 pub(crate) fn try_pool(root: &ResolvedRoot, pool: Pool, count: u32, survey: &mut Survey, console: &mut Console) -> Option<Taken> {
-    for index in 0..count {
-        let name = root.root.object_name(pool.object(index));
-        match acquire::try_slot(&name) {
-            Ok(Some(guard)) => {
-                let claim = v1::claim_path(&root.path, pool.object(index));
-                let abandoned = guard.abandoned() || claim.as_deref().is_some_and(|path| survey.left_by_a_dead_gate(path, console));
-                return Some(Taken {
-                    held: Held { guard, index, claim },
-                    abandoned,
-                });
-            }
-            Ok(None) => {}
-            Err(error) => survey.say_once("could not take", &name, error, console),
+    (0..count).find_map(|index| try_object(root, pool.object(index), index, survey, console))
+}
+
+/// Tries the mutex of `object`, the slot `index` of its pool or the critical mutex at index 0, once, and takes it when
+/// it is free. The take is a takeover when the mutex comes back abandoned, or when its claim names a gate no longer
+/// alive. A mutex that cannot be tried is said once and counts as not free.
+pub(crate) fn try_object(root: &ResolvedRoot, object: KernelObject, index: u32, survey: &mut Survey, console: &mut Console) -> Option<Taken> {
+    let name = root.root.object_name(object);
+    match acquire::try_slot(&name) {
+        Ok(Some(guard)) => {
+            let claim = v1::claim_path(&root.path, object);
+            let abandoned = guard.abandoned() || claim.as_deref().is_some_and(|path| survey.left_by_a_dead_gate(path, console));
+            Some(Taken {
+                held: Held { guard, index, claim },
+                abandoned,
+            })
+        }
+        Ok(None) => None,
+        Err(error) => {
+            survey.say_once("could not take", &name, error, console);
+            None
         }
     }
-    None
+}
+
+/// Whether a file of the claims folder named `name` is a claim of this root: `gate-<slot>.json`, as
+/// [`KernelObject::claim_file_name`] names them, so a claim's `*.tmp` file and another prefix's claim are not.
+fn is_claim_file(name: &str) -> bool {
+    name.starts_with("gate-") && Path::new(name).extension().is_some_and(|extension| extension == "json")
+}
+
+/// `tickets` less the one of the gate `own`, its pid and start in epoch milliseconds.
+pub(crate) fn others(tickets: Vec<Ticket>, own: (u32, u64)) -> Vec<Ticket> {
+    tickets.into_iter().filter(|ticket| (ticket.pid, ticket.start_ms) != own).collect()
 }
 
 /// Whose claim a slot holds: the gate, its request and log, and the remote tag of a routed run's remote slot.
@@ -339,21 +397,21 @@ pub(crate) struct ClaimOf<'a> {
     pub remote: Option<&'a RemoteTag>,
 }
 
-/// Writes this gate's claim on `held`, saying so when it cannot be written; the run goes on either way.
-pub(crate) fn write_claim(held: &Held, pool: Pool, of: &ClaimOf<'_>, console: &mut Console) {
+/// Writes this gate's claim of `kind` on `held`, saying so when it cannot be written; the run goes on either way.
+pub(crate) fn write_claim(held: &Held, kind: ClaimKind, of: &ClaimOf<'_>, console: &mut Console) {
     let Some(path) = &held.claim else {
         return;
     };
-    let written = claim(held, pool, of).and_then(|claim| v1::write_claim(path, &claim));
+    let written = claim(held, kind, of).and_then(|claim| v1::write_claim(path, &claim));
     if let Err(error) = written {
         console.err(&format!("gate: cannot write the claim {}: {error}", path.display()));
     }
 }
 
-fn claim(held: &Held, pool: Pool, of: &ClaimOf<'_>) -> io::Result<Claim> {
+fn claim(held: &Held, kind: ClaimKind, of: &ClaimOf<'_>) -> io::Result<Claim> {
     let ClaimOf { gate, request, log, remote } = *of;
     Ok(Claim {
-        kind: pool.claim_kind(),
+        kind,
         index: held.index,
         pid: gate.pid,
         process_start: gate.start,
@@ -422,7 +480,17 @@ mod tests {
     use gate_state::normalize_command;
     use jiff::Timestamp;
 
-    use super::{Liveness, ThisGate, liveness};
+    use super::{Liveness, ThisGate, is_claim_file, liveness};
+
+    #[test]
+    fn only_this_roots_claim_files_are_claims() {
+        assert!(is_claim_file("gate-slot-0.json"));
+        assert!(is_claim_file("gate-light-slot-1.json"));
+        assert!(is_claim_file("gate-critical.json"));
+        assert!(!is_claim_file("gate-light-slot-0.json.4242.1.tmp"), "a claim being written");
+        assert!(!is_claim_file("t1-gate-slot-0.json"), "another prefix's claim");
+        assert!(!is_claim_file("notes.json"));
+    }
 
     #[test]
     fn a_gate_is_live_only_while_its_pid_runs_since_its_start_and_unknown_when_its_start_cannot_be_read() {

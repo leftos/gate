@@ -86,6 +86,19 @@ pub enum ClaimKind {
     Remote,
 }
 
+impl ClaimKind {
+    /// The kind as a claim writes it: `heavy`, `light`, `critical` or `remote`.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ClaimKind::Heavy => "heavy",
+            ClaimKind::Light => "light",
+            ClaimKind::Critical => "critical",
+            ClaimKind::Remote => "remote",
+        }
+    }
+}
+
 /// The claim a gate holding a slot writes at `slots\<name>.json`. Its times are written to the 100 ns.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

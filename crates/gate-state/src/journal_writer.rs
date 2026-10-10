@@ -94,6 +94,8 @@ pub enum JournalEvent {
         waited_seconds: f64,
         /// The slot mutexes this gate took from a gate that died holding them; empty when it took none.
         abandoned: Vec<String>,
+        /// What a critical gate found as it took the machine; `None` for any other gate.
+        machine: Option<MachineSnapshot>,
     },
     /// The gate is letting its slot go.
     Release {
@@ -127,6 +129,42 @@ pub enum JournalEvent {
         /// The parent gate's process id.
         parent_pid: u32,
     },
+}
+
+/// What a critical gate found as it took the machine, which its `take` line carries after `waitedSeconds`: the counts
+/// of the pass that took it, the slots other gates hold within them, and the other gates' live claims or why they could
+/// not be read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MachineSnapshot {
+    /// The heavy and light counts, as `counts`.
+    pub counts: HeavyLight,
+    /// The heavy and light slots within the counts whose mutex another gate has open, as `otherHeld`.
+    pub other_held: HeavyLight,
+    /// The live claims of other gates, the remote pool's left out, as `otherClaims`; else the reason they could not be
+    /// read, as `snapshotError`.
+    pub other_claims: Result<Vec<OtherClaim>, String>,
+}
+
+/// A number for each local pool, written as `{"heavy": <n>, "light": <n>}`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HeavyLight {
+    pub heavy: u32,
+    pub light: u32,
+}
+
+/// Another gate's live claim as a critical gate's `take` lists it, written as `{pid, kind, index, command, file}`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OtherClaim {
+    /// The claiming gate's pid.
+    pub pid: u32,
+    /// The claim's kind: `heavy`, `light` or `critical`.
+    pub kind: String,
+    /// The slot's index.
+    pub index: u32,
+    /// The claiming gate's command.
+    pub command: String,
+    /// The claim's file name in the claims folder.
+    pub file: String,
 }
 
 /// Why a routed run gave up its remote attempt: the remote pool stayed full, the builder refused the run, or the
@@ -291,9 +329,17 @@ fn insert_own_fields(line: &mut Map<String, Value>, event: &JournalEvent) {
                 line.insert("notRouted".to_owned(), Value::from(not_routed.as_str()));
             }
         }
-        JournalEvent::Take { slots, waited_seconds, .. } => {
+        JournalEvent::Take {
+            slots,
+            waited_seconds,
+            machine,
+            ..
+        } => {
             line.insert("slots".to_owned(), Value::from(slots.clone()));
             line.insert("waitedSeconds".to_owned(), seconds(*waited_seconds));
+            if let Some(machine) = machine {
+                insert_machine(line, machine);
+            }
         }
         JournalEvent::Release {
             slots,
@@ -320,6 +366,38 @@ fn insert_own_fields(line: &mut Map<String, Value>, event: &JournalEvent) {
             line.insert("parentPid".to_owned(), Value::from(*parent_pid));
         }
     }
+}
+
+/// Inserts a critical take's snapshot: `counts`, `otherHeld`, then `otherClaims` or `snapshotError`.
+fn insert_machine(line: &mut Map<String, Value>, machine: &MachineSnapshot) {
+    line.insert("counts".to_owned(), heavy_light(machine.counts));
+    line.insert("otherHeld".to_owned(), heavy_light(machine.other_held));
+    match &machine.other_claims {
+        Ok(claims) => {
+            let claims = claims.iter().map(other_claim).collect();
+            line.insert("otherClaims".to_owned(), Value::Array(claims));
+        }
+        Err(reason) => {
+            line.insert("snapshotError".to_owned(), Value::from(reason.as_str()));
+        }
+    }
+}
+
+fn heavy_light(pair: HeavyLight) -> Value {
+    let mut object = Map::new();
+    object.insert("heavy".to_owned(), Value::from(pair.heavy));
+    object.insert("light".to_owned(), Value::from(pair.light));
+    Value::Object(object)
+}
+
+fn other_claim(claim: &OtherClaim) -> Value {
+    let mut object = Map::new();
+    object.insert("pid".to_owned(), Value::from(claim.pid));
+    object.insert("kind".to_owned(), Value::from(claim.kind.as_str()));
+    object.insert("index".to_owned(), Value::from(claim.index));
+    object.insert("command".to_owned(), Value::from(claim.command.as_str()));
+    object.insert("file".to_owned(), Value::from(claim.file.as_str()));
+    Value::Object(object)
 }
 
 fn event_name(event: &JournalEvent) -> &'static str {

@@ -500,6 +500,13 @@ pub fn heavy_words<'a>(log: &'a str, extra: &[&'a str], command: &[&'a str]) -> 
     words
 }
 
+/// The words of a critical run, as [`run_words`] gives those of a light one.
+pub fn critical_words<'a>(log: &'a str, extra: &[&'a str], command: &[&'a str]) -> Vec<&'a str> {
+    let mut words = run_words(log, extra, command);
+    words[2] = "critical";
+    words
+}
+
 /// Makes the case folder a git worktree of its own, so a gate there is at the root of a checkout named as the folder.
 pub fn git_init(case: &Case) {
     git(case, &["init", "--quiet"]);

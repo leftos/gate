@@ -10,8 +10,8 @@ use std::time::Duration;
 
 use flate2::read::GzDecoder;
 use gate_state::{
-    FallbackReason, Held, JOURNAL_CAP_BYTES, JournalEvent, JournalIdentity, JournalLock, JournalNote, LockError, RemoteTag, RunFacts, Verdict,
-    append_line, journal_line,
+    FallbackReason, HeavyLight, Held, JOURNAL_CAP_BYTES, JournalEvent, JournalIdentity, JournalLock, JournalNote, LockError, MachineSnapshot,
+    OtherClaim, RemoteTag, RunFacts, Verdict, append_line, journal_line,
 };
 use serde_json::{Value, json};
 
@@ -242,6 +242,7 @@ fn a_routed_take_line_puts_the_remote_fields_after_waited_seconds_and_before_aba
             slots: vec![REMOTE_SLOT.to_owned()],
             waited_seconds: 0.135,
             abandoned,
+            machine: None,
         };
         journal_line(&identity(), ts(NOW), &event, Some(&tag()), None)
     };
@@ -253,6 +254,52 @@ fn a_routed_take_line_puts_the_remote_fields_after_waited_seconds_and_before_aba
         own_keys(&take(vec![REMOTE_SLOT.to_owned()])),
         ["slots", "waitedSeconds", "remote", "host", "key", "abandoned"]
     );
+}
+
+#[test]
+fn a_critical_take_line_puts_its_snapshot_after_waited_seconds_and_before_abandoned() {
+    let snapshot = |other_claims: Result<Vec<OtherClaim>, String>| MachineSnapshot {
+        counts: HeavyLight { heavy: 2, light: 3 },
+        other_held: HeavyLight { heavy: 0, light: 1 },
+        other_claims,
+    };
+    let take = |machine: MachineSnapshot, abandoned: Vec<String>| {
+        let event = JournalEvent::Take {
+            slots: vec![r"Local\gate-slot-0".to_owned(), r"Local\gate-slot-1".to_owned()],
+            waited_seconds: 1.5,
+            abandoned,
+            machine: Some(machine),
+        };
+        journal_line(&identity(), ts(NOW), &event, None, None)
+    };
+    let claim = OtherClaim {
+        pid: 7,
+        kind: "light".to_owned(),
+        index: 2,
+        command: "cargo test".to_owned(),
+        file: "gate-light-slot-2.json".to_owned(),
+    };
+
+    let line = take(snapshot(Ok(vec![claim])), Vec::new());
+    assert_eq!(own_keys(&line), ["slots", "waitedSeconds", "counts", "otherHeld", "otherClaims"]);
+    assert!(
+        line.ends_with(concat!(
+            r#""waitedSeconds":1.5,"counts":{"heavy":2,"light":3},"otherHeld":{"heavy":0,"light":1},"#,
+            r#""otherClaims":[{"pid":7,"kind":"light","index":2,"command":"cargo test","file":"gate-light-slot-2.json"}]}"#
+        )),
+        "{line}"
+    );
+    assert_eq!(parsed(&take(snapshot(Ok(Vec::new())), Vec::new()))["otherClaims"], json!([]));
+
+    let failed = take(
+        snapshot(Err("cannot read the claims".to_owned())),
+        vec![r"Local\gate-critical".to_owned()],
+    );
+    assert_eq!(
+        own_keys(&failed),
+        ["slots", "waitedSeconds", "counts", "otherHeld", "snapshotError", "abandoned"]
+    );
+    assert_eq!(parsed(&failed)["snapshotError"], "cannot read the claims");
 }
 
 #[test]
@@ -367,6 +414,7 @@ fn a_line_without_a_remote_tag_has_no_remote_field() {
             slots: Vec::new(),
             waited_seconds: 0.5,
             abandoned: Vec::new(),
+            machine: None,
         },
         release(None),
         JournalEvent::Abandon { waited_seconds: 1.7 },
@@ -383,6 +431,7 @@ fn a_line_without_a_remote_tag_has_no_remote_field() {
         slots: vec![r"Local\ops253-gate-slot-0".to_owned()],
         waited_seconds: 3.875,
         abandoned: Vec::new(),
+        machine: None,
     };
     let line = journal_line(&identity(), ts(NOW), &local_take, None, None);
     assert_eq!(own_fields(&line), own_fields(remote_fixture(5)), "the local take after a fallback");
@@ -408,6 +457,7 @@ fn line_starts_with_v_then_the_common_keys_in_order() {
             slots: Vec::new(),
             waited_seconds: 0.0,
             abandoned: Vec::new(),
+            machine: None,
         },
         None,
         None,
@@ -525,6 +575,7 @@ fn seconds_round_to_three_decimals() {
             slots: Vec::new(),
             waited_seconds: 1.234_56,
             abandoned: Vec::new(),
+            machine: None,
         },
         None,
         None,
@@ -563,6 +614,7 @@ fn seconds_round_a_midpoint_to_even_as_dotnet_does() {
                 slots: Vec::new(),
                 waited_seconds: seconds,
                 abandoned: Vec::new(),
+                machine: None,
             },
             None,
             None,
@@ -714,6 +766,7 @@ fn a_take_with_abandoned_slots_lists_them_after_waited_seconds() {
             slots: vec![r"Local\gate-1a2b3c4d-slot-0".to_owned()],
             waited_seconds: 0.5,
             abandoned: vec![r"Local\gate-1a2b3c4d-slot-0".to_owned()],
+            machine: None,
         },
         None,
         None,
@@ -734,6 +787,7 @@ fn a_take_with_no_abandoned_slots_has_no_abandoned_key() {
             slots: Vec::new(),
             waited_seconds: 0.5,
             abandoned: Vec::new(),
+            machine: None,
         },
         None,
         None,
@@ -771,6 +825,7 @@ fn journal_line_puts_the_lock_after_the_slots_on_a_take() {
             slots: vec![r"Local\gate-1a2b3c4d-slot-0".to_owned()],
             waited_seconds: 0.5,
             abandoned: vec![r"Local\gate-1a2b3c4d-slot-0".to_owned()],
+            machine: None,
         },
         None,
         Some(r"Local\gate-test-journal"),
@@ -820,6 +875,7 @@ fn an_abandoned_lock_on_a_take_with_abandoned_slots_extends_its_list() {
                 slots: vec![r"Local\gate-1a2b3c4d-slot-0".to_owned()],
                 waited_seconds: 0.5,
                 abandoned: vec![r"Local\gate-1a2b3c4d-slot-0".to_owned()],
+                machine: None,
             },
             None,
             abandoned,

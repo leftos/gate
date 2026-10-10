@@ -25,8 +25,8 @@ pub use archive::{ARCHIVE_DIR, archive_rolled_journal};
 pub use counts::{ApplyError, WriteError, apply_slot_count, read_slot_count_setting, slot_count_path, write_slot_counts};
 pub use journal::{CommandSummary, History, HistoryRun, JournalCache, RunState, normalize_command};
 pub use journal_writer::{
-    Appended, FallbackReason, Held, JOURNAL_CAP_BYTES, JOURNAL_FILE, JOURNAL_WAIT, JournalEvent, JournalIdentity, JournalLock, JournalNote,
-    LockError, ROLLED_JOURNAL_FILE, RemoteTag, RunFacts, append_line, journal_line,
+    Appended, FallbackReason, HeavyLight, Held, JOURNAL_CAP_BYTES, JOURNAL_FILE, JOURNAL_WAIT, JournalEvent, JournalIdentity, JournalLock,
+    JournalNote, LockError, MachineSnapshot, OtherClaim, ROLLED_JOURNAL_FILE, RemoteTag, RunFacts, append_line, journal_line,
 };
 pub use model::{
     CRITICAL_LIGHT_RESERVE, CriticalState, CwdReader, DashboardState, MutexProbe, ParseError, PoolState, QueueTicket, RemotePool, SlotCount,

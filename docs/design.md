@@ -139,7 +139,7 @@ Every line the gate says is written and flushed as it is said, never held until 
 | Line | Where | Meaning |
 |---|---|---|
 | `gate: STALLED: ...`, `gate: TIMED OUT ...`, `gate: BACKSTOP: ...` | at line start in the log and on stderr | The watchdog killed the command; the exit is 124. Match `^gate: (STALLED\|TIMED OUT\|BACKSTOP)`. A gate wrapping a gate reports the inner kill through its own marker scan (V2). |
-| `gate: waiting for the machine (critical)` | stderr | A critical gate is queued and waiting for the machine (K5). |
+| `gate: waiting for the machine (critical)` | stderr | A critical gate is queued and waiting for the machine (K5); the stable part is the prefix, and the status after it is prose. A critical gate that takes the machine at once says nothing. |
 | `Full output: <path>` | the end of the verdict line: `gate: passed in ... Full output: <path>` on stdout, `gate: FAILED (status <n>). Full output: <path>` on stderr | Where the whole log is (V3). |
 
 Every other `gate: ` line is prose: it informs people and agents and may change in any release. That includes the passed and FAILED lines apart from their `Full output:` tail, the wait lines, the heartbeat lines, the diagnostics block and the stop-tree summary.
@@ -165,6 +165,7 @@ The lines of a run that starts its command:
   A Ctrl+C while waiting for the remote slot says `gate: interrupted while waiting for a remote slot`. One during the client's call, or raised before it, ends the gate with `gate: interrupted before the command started` and no fallback, even when the client refused the run; the remote slot is released.
 
   A routed run that passed says `gate: passed in <w> s on <host> (wall clock, ceiling <n> s). Full output: <log>`, with no load-adjusted time. The client's status is the gate's own, passed through as `N`.
+- A critical gate, on stderr and in the log: the `waiting for the machine (critical)`, `still waiting for the machine (critical)`, `holds the machine (critical)` and `interrupted while waiting for the machine` lines, in [Critical drain and nesting](#critical-drain-and-nesting).
 - Nesting, on stderr and in the log, from the slot marker in the gate's environment: the `running under`, `ignored GATE_SLOT_HELD` and `does not cover` lines, and the refusal of a critical gate, all in [Critical drain and nesting](#critical-drain-and-nesting).
 - The gate prints no `queued for` or `took ... slot` line, for a local or a routed run: the queue and the take are in the journal, and a wait longer than 30 s says `gate: still waiting for a <kind> slot (<s> s)`.
 - Notes that never fail the gate: `gate: cannot remove <log>.err: <error>`, `gate: cannot remove the log <path> of the attempt: <error>` (a routed run that fell back could not delete the log the client wrote), `gate: cannot append <log>.err to the log: <error>` and `gate: cannot read this gate's priority class, so the command runs below normal: <error>`.
@@ -195,8 +196,8 @@ A missing file or key means the default; an unreadable or invalid value is ignor
 1. A gate that needs a slot creates its wake event, then writes its arrival [ticket](#ticket), both before its first try, so no wake is lost. A gate a parent's slot covers or lends to takes no slot and writes no ticket (N1, N2).
 2. Waiters of one kind take slots in ticket `arrived` order, ties broken by pid. A gate tries a slot only when fewer live tickets of its kind are ahead of it than the pool has free slots (indices whose mutex no handle holds, a probe that fails counting as not free), not counting a ticket whose gate already holds a live claim (it holds a slot and only failed to delete its ticket), so a try never takes the slot an earlier waiter would get.
 
-   It then tries indices 0 up to the count in order and takes the first free one. The critical barrier (Q3) and the reserved light slots (K2, K3) apply on top of the order.
-3. A take deletes the gate's own ticket, journals `take`, writes the claim and wakes the waiters, so the next in line tries at once. A release deletes the claim, journals `release`, lets the mutex go and wakes the waiters. A run in the critical slot takes no slot of these pools and journals a `take` and `release` of `slots: []`.
+   It then tries indices 0 up to the count in order and takes the first free one. The critical barrier (Q3) and the reserved light slots (K2, K3) apply on top of the order once a slot gate honours a critical request; it does not yet (planned, [Critical drain and nesting](#critical-drain-and-nesting)).
+3. A take deletes the gate's own ticket, journals `take`, writes the claim and wakes the waiters, so the next in line tries at once. A release deletes the claim, journals `release`, lets the mutex go and wakes the waiters. A critical gate takes the machine instead ([Critical drain and nesting](#critical-drain-and-nesting)): its `take` and `release` list every slot it holds, and it writes one claim, `gate-critical.json`, and none for the slots.
 4. A waiter sleeps on its own wake event, `Local\gate-wake-<pid>-<start>` (auto-reset). A gate that takes or releases a slot, or deletes a dead gate's ticket, signals the wake event of every live ticket in its state root. An auto-reset event stays signalled until its waiter wakes, so no wakeup is lost between a waiter's check and its wait. A wake that cannot be opened or set is not said: the fallback poll covers it.
 5. Each wait has a fallback poll as its timeout (2 s, kept from S4's interval). The poll re-reads the counts and the tickets, which deletes a dead waiter's ticket so it cannot hold the queue (Q1), and picks up a count changed by hand.
 6. A waiter prints `gate: waiting for a <kind> slot (<n> busy)` once, on the first pass whose own [probe by open](#probe-by-open) finds none of the pool's slots free, where `<n>` is how many slots that same probe reports held. A gate that waits only behind earlier tickets while a slot is free for it does not print it.
@@ -248,7 +249,7 @@ For any other root, every kernel object name carries `<h>`, the first 8 lower-ca
 |---|---|---|---|
 | `slot-counts.json` | ops-tower's Gates tab, people | every waiting gate, ops-tower | [Counts](#counts). |
 | `remote.json` | people | the router, ops-tower (`slots`) | Builders and routing (T1); read from `%LOCALAPPDATA%\gate\remote.json`, beside the `v1\` folder, whatever the state root is. |
-| `slots\<name>.json` | the gate holding the slot, written after its `take` line | other gates, ops-tower | [Claim](#claim); `<name>` is the mutex name without `Local\` and the root hash, plus `gate-critical.json` for a critical gate. |
+| `slots\<name>.json` | the gate holding the slot, written after its `take` line | other gates, ops-tower | [Claim](#claim); `<name>` is the mutex name without `Local\` and the root hash, plus `gate-critical.json` for a critical gate, its one claim for the whole machine (kind `critical`, index 0), written after its `take` line; the heavy and light slots it holds get none. |
 | `waiting\<pid>-<start>.json` | the waiting gate | other gates, ops-tower | [Ticket](#ticket). |
 | `paused\<parent pid>-<parent start>-<pid>-<start>.pause` | a nested gate waiting behind a critical request | its parent's watchdog | Empty file rewritten every pass (kept, N3). |
 | `events.jsonl`, `events.1.jsonl` | every gate, under the journal mutex | ops-tower, the durations summary, people | [Journal](#journal). |
@@ -271,6 +272,8 @@ For any other root, every kernel object name carries `<h>`, the first 8 lower-ca
 | command's job | `Local\gate-job-<gate pid>` | `Local\gate-<h>-job-<gate pid>` |
 | box command's job | `Local\gate-remote-<key>-<nonce>` | the same; the name is not root-dependent |
 | log's mutex | `Local\gate-log-<l>` | `Local\gate-<h>-log-<l>` |
+
+The critical mutex is taken by a critical gate once no earlier live critical ticket exists, and held for its whole run. An abandoned one counts as taken ([Abandoned slots](#abandoned-slots)).
 
 The box command's job name comes from the payload's `Job` (`<key>` is the payload's `Key`, `<nonce>` is 12 hex digits); `gate box` only checks its form and that it ends in the payload's key, and never derives it.
 
@@ -329,7 +332,7 @@ The liveness rule is the same for claims and [tickets](#ticket). A pid with no r
 | `arrived` | number | first arrival, epoch ms; a routed run that falls back keeps its first arrival (K6) |
 | `pid` | number | the gate's pid |
 | `startTicks` | number | the gate's process start, epoch ms (the field keeps its name) |
-| `holds` | bool | true only for a critical gate that holds the machine |
+| `holds` | bool | true only for a critical gate that holds the machine: it rewrites its ticket with `true` once every slot is held and keeps the ticket until it ends |
 | `remote` | bool | present and true only while queued for the remote pool |
 | `expected` | object | reserved, optional; `null` reads as absent |
 
@@ -345,7 +348,7 @@ A missing file, or a missing key, gives the default silently. A file unreadable 
 
 ### Journal
 
-`events.jsonl` holds one JSON object per line, appended under the journal mutex (`Local\gate-journal`, [Kernel object names](#kernel-object-names)) with a 2 s wait (kept, J1). The events are `queue`, `take`, `release`, `abandon`, `covered`, `parent` and `fallback`. `gate.exe` writes `covered` for a gate running under its parent's slot; `parent` (a gate lent its parent's slot) is in the writer (`JournalEvent::Parent`) but `gate.exe` does not write it yet.
+`events.jsonl` holds one JSON object per line, appended under the journal mutex (`Local\gate-journal`, [Kernel object names](#kernel-object-names)) with a 2 s wait (kept, J1). The events are `queue`, `take`, `release`, `abandon`, `covered`, `parent` and `fallback`. `gate.exe` writes `covered` for a gate running under its parent's slot; `parent` (a gate lent its parent's slot) is in the writer (`JournalEvent::Parent`) but `gate.exe` does not write it yet (the lend is part B2 of GATE-94).
 
 Every line starts with `v`, `time`, `event`, `pid`, `processStart`, `kind`, `cwd` and `command` (the same text as the claim's [`command`](#claim)), in that order, then the event's own fields, as the PowerShell gate writes them (J1); a routed run adds `remote` (true), `host` (the ssh destination) and `key` (the remote work folder's key) after the event's own fields and before `abandoned`, on its `queue`, `take`, `release`, `abandon` and `fallback` lines, and on none after the `fallback`.
 
@@ -358,8 +361,8 @@ The event's own fields:
 | Event | Fields after the common ones |
 |---|---|
 | `queue` | `log` (the log's full path), `notRouted` (written right after `log`, only when a heavy gate's caller kept it local with `--local`, with the value `--local`; other reasons for a local run write none) |
-| `take` | `slots` (the slot names taken), `waitedSeconds` |
-| `release` | `slots`, `heldSeconds`, `status` (null when the gate failed before its command had one), `wallSeconds`, `adjustedSeconds`, `verdict` |
+| `take` | `slots` (the slot names taken; a critical gate lists every heavy and unreserved light slot it holds), `waitedSeconds`, and for a critical gate `counts`, `otherHeld`, then `otherClaims` or `snapshotError` |
+| `release` | `slots` (the same list), `heldSeconds`, `status` (null when the gate failed before its command had one), `wallSeconds`, `adjustedSeconds`, `verdict` |
 | `abandon` | `waitedSeconds`: the gate ended while still queued (Ctrl+C while waiting for a slot) |
 | `parent`, `covered` | `parentPid` |
 | `fallback` | `reason`, then `remote`, `host`, `key`: it ends the routed attempt, so a remote `take` that falls back gets no `release`; a `full` fallback, and a `client` fallback with no client built, follow no remote `take` |
@@ -369,7 +372,9 @@ A release with no run facts writes `wallSeconds: null`, `adjustedSeconds: null` 
 Fields beyond J1's:
 
 - any event: `abandoned`, the last field, a list of names present only when there were any ([Abandoned slots](#abandoned-slots); GATE-30). On a `take` it is the slots taken from a gate that died holding them, followed by the journal mutex's name when that came back abandoned; on any other event it is just the journal mutex's name.
-- `take`: a critical gate's `take` carries `counts`, `otherHeld` and `otherClaims` (or `snapshotError`), kept from K5 (GATE-38).
+- `take`: a critical gate's `take` carries, after `waitedSeconds` and in this order, `counts` (`{"heavy": <n>, "light": <n>}`, the counts of the pass that took the machine), `otherHeld` (the same shape: the slots within the counts that other gates hold), then `otherClaims` or `snapshotError`; `abandoned` stays last (K5, GATE-38).
+
+  `otherClaims` is a list of `{pid, kind, index, command, file}`, one per live claim of another gate in this root's `slots\` folder, sorted by file name: only the `gate-*.json` files, the remote pool's claims and this gate's own left out, `file` the claim's file name. `snapshotError` replaces it only when the claims folder cannot be listed, and holds the reason.
 - `release`: `wallSeconds` (the command's wall time less the seconds paused behind a critical request; a routed run's whole remote wall time), `adjustedSeconds` (load-adjusted seconds, 3 decimals, a number for every run that started; null for a routed run and for a run whose sampler failed) and `verdict`, one of `passed`, `failed`, `log-failure`, `stalled`, `timed-out`, `backstop`, `unknown` (kept, J5).
 
   A routed run is a kill only when the gate killed it; a command that exits 124 on its own is `failed`.
@@ -418,7 +423,6 @@ Readers accept these optional fields now; their issues write them:
 
 - `expected`: `{"p50": <s>, "p90": <s>, "n": <runs>, "key": "<key>"}` in claims and tickets, present when the gate has history for the command (GATE-15).
 - `avgCores`, `peakCores`, `freeCores` on `release`: the command's average and peak busy cores and the cores that were free ([Cores hint](#cores-hint), GATE-6).
-- `counts`, `otherHeld`, `otherClaims`, `snapshotError` on a critical gate's `take` (GATE-38): not written yet.
 
 ### remote.json
 
@@ -434,7 +438,9 @@ Changes from the PowerShell forms:
 - The pause folder lives in the state root, so a test root isolates it.
 - Light gates beside a critical gate and the critical gate's own waits use the wake events and the queue order of [Taking a slot](#taking-a-slot).
 
-What `gate.exe` does of it today is part A, nesting under the slot marker (N1, K7). Lending while a critical request drains (N2) with the drain's use of `parent` lines, and the pause markers (N3), are planned, not built: GATE-94 writes `parent`, and the pause markers are a later part.
+What `gate.exe` does of it today is part A, nesting under the slot marker (N1, K7), and part B1, the critical request's own drain and take (K1, K2, K5, below).
+
+Planned, not built: part B2 of GATE-94, the barrier (Q3) that holds a later heavy gate behind a critical request and keeps a later light gate to the reserved slots, and the lend of a light parent's slot to its heavy child while a request drains (N2), which writes `parent` lines and which the journal reader folds; and the pause markers (N3), a later part.
 
 - A gate reads `GATE_SLOT_HELD` once, before routing and before the log mutex (`nesting.rs`). A live parent whose slot covers the gate's kind (heavy covers heavy and light, light covers light, critical covers all three) gives `gate: running under the <held kind> slot of gate <pid>`: the gate takes no slot, writes no ticket or claim, and journals one `covered` line (identity fields, then `parentPid`; no `queue`, `take` or `release`).
 
@@ -446,6 +452,18 @@ What `gate.exe` does of it today is part A, nesting under the slot marker (N1, K
   A marker whose parent is gone says `gate: ignored GATE_SLOT_HELD='<marker>': gate <pid> is no longer running; taking a <kind> slot`. A marker hashed for another root, or unhashed under a non-default root, is ignored silently. Each of these gates then takes its own slot.
 - A critical gate under a heavy or light marker is refused (K7) on stderr only, exit 2, before the log mutex, with nothing queued or journalled: `gate: --slot critical cannot run under the <held kind> slot of gate <pid>: it would wait for that slot for good; run the critical command outside that gate` (`-Slot critical` through the PowerShell spelling).
 - A heavy gate under a light marker takes its own slot and says `gate: the <held kind> slot of gate <pid> does not cover a <kind> gate; taking a <kind> slot` just before its local take (after a Local route or a fallback, before its wait lines); a gate routed to the builder never says it.
+- **One request at a time.** A critical gate queues a ticket of kind `critical` and runs after every earlier live critical ticket, in arrival order, each through the critical mutex ([Kernel object names](#kernel-object-names)). An abandoned critical mutex counts as taken, with the `took <name>, which a killed gate had left held` line.
+- **The drain.** With the mutex held, the gate waits for every earlier live heavy ticket, and for every earlier light ticket when the light count less the reserved light slots is above 0. Remote tickets are ignored, and so is a ticket whose gate already holds a live claim and only failed to delete its ticket.
+- **The take.** It then takes every heavy slot and every unreserved light slot, re-reading the counts on each pass. The reserved light slots are the `min(2, light count)` of the highest indices, and a critical gate never takes them.
+
+  A slot a killed gate left is a takeover, journalled in `abandoned`, and the gate deletes that gate's claim, since it writes none for the slot.
+- **The hold.** Once every slot is held the gate rewrites its ticket with `holds: true`, keeps it until it ends, and writes the one claim `slots\gate-critical.json`. Its `take` and `release` list the slots held ([Journal](#journal)).
+- **Lines**, on stderr and in the log:
+  - `gate: waiting for the machine (critical): <h> heavy and <l> light slots held (<r> light slot|light slots reserved for light gates beside it), <n> earlier waiters`, the first time a pass falls short; a critical gate that takes the machine on its first pass says nothing.
+  - `gate: still waiting for the machine (critical): <status> (<s> s)`, with the same status, on each heartbeat.
+  - `gate: holds the machine (critical) at <yyyy-MM-ddTHH:mm:ss.fffffffZ> after <s.d> s: counts heavy <H>, light <L>; other gates hold <h> heavy and <l> light slots (<r> ... reserved for light gates beside it); other live claims: <pid> <kind> <index> <command>, ...`, the claims ending as `none` or `unknown (<reason>)` when they could not be listed.
+  - `gate: interrupted while waiting for the machine`, on Ctrl+C: the journal gets `abandon`, everything taken is released and the exit is 0xC000013A.
+  - `gate: cannot read the claims in <dir>: <error>`, said once, for an entry of the claims folder that cannot be read; the entry is skipped.
 
 ## Watchdog
 
@@ -495,7 +513,7 @@ All kept, with each knob's default unchanged:
 - Ctrl+C and Ctrl+Break (X5): the gate handles them itself and prints `gate: interrupted; stopping the command` during a run. The command got the same Ctrl+C through the shared console, so the gate waits up to 5 s for it to exit on its own and exits with its status, then terminates whatever is left in the job.
 - A command still running after those 5 s gets `gate: the command was still running 5 s after the interrupt; terminating its job`, the job is terminated with 0xC000013A and the gate exits 0xC000013A. Either way the verdict skips the marker scan and the release is journalled, with verdict `failed` when the status is 0xC000013A.
 - Ctrl+C between taking the slot and launching the command: `gate: interrupted before the command started`, no command runs, the exit is 0xC000013A and the release verdict is `unknown`.
-- Ctrl+C while queued: `gate: interrupted while waiting for a <kind> slot`, the ticket is deleted, the waiters are woken, an `abandon` line is journalled and the exit is 0xC000013A. No `still waiting` line follows it.
+- Ctrl+C while queued: `gate: interrupted while waiting for a <kind> slot`, the ticket is deleted, the waiters are woken, an `abandon` line is journalled and the exit is 0xC000013A. No `still waiting` line follows it. A critical gate says `gate: interrupted while waiting for the machine` and also lets go of everything it took so far.
 - A console close ends the gate at once, because Windows ends the process when the handler returns; the dead-gate cleanup reclaims its ticket and claim ([Abandoned slots](#abandoned-slots)). If the handler cannot be installed the gate says `gate: cannot install the Ctrl+C handler, so Ctrl+C ends the gate at once: <error>`.
 
 The arithmetic (stall progress, the free share, the clock, the three kills and their lines, the box heartbeat) is a pure crate driven by samples and an injected clock; the Win32 layer takes the samples. The cores hint is not yet in it. The kill lines are:
