@@ -89,6 +89,11 @@ Not measured; reasoning only.
 2. Run the same command on the box (allowlist + critical routing), per section 4.
 3. Narrow critical to the tight tests (run.rs, client.rs, http/gate.rs) with a second filter module name, leaving the 5 s-bound tests heavy.
 
+## Rulings
+
+- Routing a critical gate to the box is opt-in per repo: each repo's entry in `%LOCALAPPDATA%\gate\remote.json` says whether its critical gates may use the box's critical pool (and, by its allowlist patterns, which commands). A repo that does not opt in keeps every critical gate on the PC.
+- The repo that uses critical gates most first narrows its own critical runs to the timing tests that need the machine alone. The box critical pool (GATE-21) is re-judged on that repo's critical share measured after that split, and is built only if what remains still obstructs.
+
 ## DOC DRIFT
 
 - `X:/dev/ops-tower/CLAUDE.md:12` says gate slots are `heavy|light` and omits critical; `.claude/skills/ops-tower-nextup/SKILL.md:29` and `prek.toml:94` use critical. Which side is wrong: CLAUDE.md is incomplete. Owner: CLAUDE.md.

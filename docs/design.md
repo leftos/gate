@@ -155,7 +155,9 @@ The lines of a run that starts its command:
 - A log in use, exit 1, before queueing and with no journal line: `gate: the log <path> is in use by another gate`, when another gate holds the log's mutex ([Kernel object names](#kernel-object-names)). A mutex a killed gate left is taken silently. `gate: cannot take the mutex <name> of the log <path>: <error>`, exit 1, when the mutex cannot be opened or tried.
 - Routing, on stderr and in the log, with the command running here: `gate: ignored <path>: <reason>; running locally` when `remote.json` is there but unusable (not a file, unreadable or refused), and `gate: not routed: <reason>` when a heavy gate that would route stays local.
 
-  The second line is said for `--local` (`gate: not routed: --local`), a word outside the worktree (`gate: not routed: <word> is outside the worktree`), a folder that holds nothing the snapshot sends (`gate: not routed: <sub> holds nothing the snapshot sends`), a word of the command that is not valid Unicode (`gate: not routed: a word of the command is not valid Unicode`), or a fact that could not be read (`gate: not routed: cannot run git: <error>`, or the working directory or git's output). A gate that is not heavy, has a covering parent, matches no pattern or has no `remote.json` says nothing.
+  The second line is said for `--local` (`gate: not routed: --local`), a word outside the worktree (`gate: not routed: <word> is outside the worktree`), a folder that holds nothing the snapshot sends (`gate: not routed: <sub> holds nothing the snapshot sends`), a word of the command that is not valid Unicode (`gate: not routed: a word of the command is not valid Unicode`), or a fact that could not be read (`gate: not routed: cannot run git: <error>`, or the working directory or git's output).
+
+  A gate that is not heavy, has a covering parent, matches no pattern or has no `remote.json` says nothing.
 - A routed run, on stderr and in the log, after any `gate: dropped --no-build: the last build may have run on the other machine` and `gate: outputs: none brought back for a --no-build command` lines. While it waits for a remote slot: `gate: waiting for a remote slot on <host> (<n> busy)` and `gate: still waiting for a remote slot on <host> (<s> s)`, as a local wait says them.
 
   A run the builder does not take says why and goes on here: `gate: remote <host> <reason>; running here`, with `<reason>` one of `full` (no remote slot within 60 s), `busy`, `unreachable`, `parity`, `rebooted`, `tools` or `version`, and `gate: remote <host> client could not start: <detail>; running here` when the remote client cannot start. A gate with no remote client built says the second line with `the bridge to remote.ps1 is not built yet`, before it takes a remote slot.
@@ -367,7 +369,9 @@ Fields beyond J1's:
 
 - any event: `abandoned`, the last field, a list of names present only when there were any ([Abandoned slots](#abandoned-slots); GATE-30). On a `take` it is the slots taken from a gate that died holding them, followed by the journal mutex's name when that came back abandoned; on any other event it is just the journal mutex's name.
 - `take`: a critical gate's `take` carries `counts`, `otherHeld` and `otherClaims` (or `snapshotError`), kept from K5 (GATE-38).
-- `release`: `wallSeconds` (the command's wall time less the seconds paused behind a critical request; a routed run's whole remote wall time), `adjustedSeconds` (load-adjusted seconds, 3 decimals, a number for every run that started; null for a routed run and for a run whose sampler failed) and `verdict`, one of `passed`, `failed`, `log-failure`, `stalled`, `timed-out`, `backstop`, `unknown` (kept, J5). A routed run is a kill only when the gate killed it; a command that exits 124 on its own is `failed`.
+- `release`: `wallSeconds` (the command's wall time less the seconds paused behind a critical request; a routed run's whole remote wall time), `adjustedSeconds` (load-adjusted seconds, 3 decimals, a number for every run that started; null for a routed run and for a run whose sampler failed) and `verdict`, one of `passed`, `failed`, `log-failure`, `stalled`, `timed-out`, `backstop`, `unknown` (kept, J5).
+
+  A routed run is a kill only when the gate killed it; a command that exits 124 on its own is `failed`.
 - `fallback`: `reason`, one of `full` (no remote slot within the 60 s wait), `busy`, `unreachable`, `parity`, `rebooted`, `tools` (T5), `version` ([The box side](#the-box-side)) and `client` (the remote client could not start, or none is built). The `take` after it is the run's local one, untagged, its `waitedSeconds` counted from the `fallback`.
 - a routed run's `take`, `release` and `abandon` carry the tag; its `release` has `adjustedSeconds` null and a `wallSeconds` of the whole remote call.
 
@@ -553,29 +557,63 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
   git is found along the gate's own `PATH` (absolute entries only) and run by its full path from the gate's folder, with the `GIT_*` variables that point it at another repository, index or config removed and `core.fsmonitor` off, so a gate in a hook that exports `GIT_DIR` still routes; each call gets 10 s, after which git is killed and the gate runs here saying `gate: not routed: git did not answer within 10 s`.
 
-  `gate run` answers those facts in `route.rs`, before it queues and before any command starts. The routing file is `%LOCALAPPDATA%\gate\remote.json` (no file when `LOCALAPPDATA` is unset or empty). The hook rule reads `GIT_INDEX_FILE`: set and non-empty means a git hook, which never routes. The worktree comes from one `git rev-parse` (root, prefix below the root and common git folder), and a folder below the root asks `git ls-files` whether the snapshot would send anything there (tracked or untracked and not ignored, and still on disk). A `subst` drive is followed through `gate_win32::device_target`. A word that is not valid Unicode keeps a command that would route here, saying so.
+  `gate run` answers those facts in `route.rs`, before it queues and before any command starts. The routing file is `%LOCALAPPDATA%\gate\remote.json` (no file when `LOCALAPPDATA` is unset or empty). The hook rule reads `GIT_INDEX_FILE`: set and non-empty means a git hook, which never routes.
+
+  The worktree comes from one `git rev-parse` (root, prefix below the root and common git folder), and a folder below the root asks `git ls-files` whether the snapshot would send anything there (tracked or untracked and not ignored, and still on disk). A `subst` drive is followed through `gate_win32::device_target`. A word that is not valid Unicode keeps a command that would route here, saying so.
 
   The queue line carries `notRouted` `--local` for a heavy `--local` gate and the remote tag for a routed one. With no remote client built, every routed decision falls back before it takes a remote slot: the `fallback` line has reason `client`, the gate says `gate: remote <host> client could not start: ...; running here`, and the later `take` and `release` carry no remote fields.
 - **The routing file's text** is JSON with `//` and `/* */` comments and trailing commas allowed outside strings, and a leading byte order mark skipped, as the PowerShell gate's reader allows. Keys match in any letter case, and unknown keys are ignored.
 
   An object holding two keys that differ only in letter case anywhere in the file refuses the whole file, with the PowerShell reader's error text. Single-quoted strings are refused (`Conversion from JSON failed with error: ...`), a recorded deviation: the PowerShell reader accepts them.
 
-  `host` is an ssh alias or `user@host`, each part of ASCII letters, digits, `.`, `_` and `-` and not starting with `-`: the host reaches ssh's argument list, a git `host:path` URL and ssh_config `%h` expansion, and only that shape is safe in all three. Any other host refuses the file (`host must be an ssh alias or user@host of letters, digits, '.', '_' and '-', not starting with '-'`), a recorded deviation: the PowerShell reader accepts any non-empty string. An IPv6 literal or a `host:port` is written as an alias in `~/.ssh/config`.
+  `host` is an ssh alias or `user@host`, each part of ASCII letters, digits, `.`, `_` and `-` and not starting with `-`: the host reaches ssh's argument list, a git `host:path` URL and ssh_config `%h` expansion, and only that shape is safe in all three.
+
+  Any other host refuses the file (`host must be an ssh alias or user@host of letters, digits, '.', '_' and '-', not starting with '-'`), a recorded deviation: the PowerShell reader accepts any non-empty string. An IPv6 literal or a `host:port` is written as an alias in `~/.ssh/config`.
 
   `slots` is a whole number 1 to 16 (1 when missing), `repos` an object whose values are arrays of non-empty `-like` patterns, and `outputs` an optional object of the same shape whose globs may not hold `[` or `]`; a repo with no `outputs` entry brings back `**/bin/**` and `**/.godot/mono/temp/bin/**`.
 - **The `-like` matcher** is PowerShell's wildcard match, case-insensitive, over the words joined by single spaces. It folds case by simple case folding. Inside a `[...]` set, a non-ASCII member whose .NET case-insensitive equivalents differ (the Kelvin sign and `k`) can match in PowerShell and not here.
 - **The in-worktree path rewrite** (T3) finds a path wherever a drive letter, a colon and a separator start one inside a word (`--flag=X:\a`, `-p:Name=X:\a`, a script's text), each start judged on its own.
 
   A path runs to the first of `, ; " ' ) | & < >`. In a word that holds one of those or a line break (a script word: a script's text or a list) white space ends a path too; in any other word, one argument, a path runs through its spaces. A drive other than the root's is followed through `subst` mappings.
+
+  A bare first word (no separator, drive or `.`/`..`) becomes `./name` only when that file exists in the gate's folder; otherwise it stays bare, for the builder's `PATH`.
 - **The work folder** on the builder is named `<repo name>-<key>`, the worktree root's last segment cut to letters, digits, `-` and `_` and 8 hex digits of the SHA-256 of the lower-cased root ([Glossary](GLOSSARY.md), work-folder key).
 - **The routed run's life** is kept (T5) and built in `remote.rs` and `run.rs`: its ticket is heavy with `remote: true` and queues apart from the local waiters, which never count it ahead of them, nor it them; it waits up to 60 s for a remote slot (`--test-remote-wait-ms` in a test build); it takes one with a claim of kind `remote` of its own and calls the remote client with the route, the log and the limits (`--stall` as given, the interrupt).
 
   A client that runs the command to its end hands back its status, which the gate passes through, and the run releases the slot with the remote tag. On `full` (no slot within the wait), a refusal (status 75 with a reason) or a client that cannot start, it journals `fallback` while still holding the remote slot (none was taken on `full`), deletes the claim, lets the slot go, and runs here, taking a heavy slot with its first arrival kept in the ticket.
 
   The attempt's lines stay in the log once, as notes: the client's own bytes in the log are removed, and the local run writes its log afresh.
+- **The remote client's run** (GATE-43), planned, not built: each routed run pushes its snapshot to a ref of its own (or takes a lock before the push), so two routed runs from one worktree never collide on one ref; two routed runs at once give a deterministic `busy`, not a race.
+
+  A connection that drops before the box's banner is retried once, then the run falls back local. The index and the worktree are byte-identical before and after a snapshot.
+- **Sibling worktrees** (GATE-19), planned, not built: some repos' builds reach into a sibling repo by relative path, and a routed run that sends one worktree's snapshot would compile something different on the builder without any error.
+
+  `remote.json` declares each repo's siblings (`"siblings": {"app": ["app-server"]}`); a routed gate in a repo with siblings snapshots each sibling's worktree beside its own (`../{name}`, as the pair folder lays them out, or beside the main checkout), and the box lays the work folders out the same way, so relative paths between them resolve.
+
+  A word naming a path inside a declared sibling's worktree is rewritten as an in-worktree path is.
+
+  This lands before a repo with siblings is enabled in `remote.json`; a repo without siblings is enabled without it. What happens when a declared sibling is missing, whether the work-folder key is per pair or per repo, and how sync-back covers a sibling's changed files are open ([Open questions](#open-questions)).
+- **Inputs** (GATE-22), planned, not built: a routed command can need ignored files only the PC has, and the snapshot sends only tracked and untracked-not-ignored files. A repo's optional `inputs` list of ignored-file globs, beside `outputs` in the routing file, is packed with the outputs' transport and hash-diffed against the builder's work folder, so an unchanged input costs nothing.
+- **The per-host failure record** (GATE-27), planned, not built: a record in the state root holds a builder's failure reason and an expiry. A routed gate that finds an unexpired record says `gate: not routed: <host> <reason> <n> s ago`, runs here and journals `fallback` with the reason, rather than paying the snapshot, preflight and push again for the same reason.
+
+  The windows per reason: `unreachable` a short one (60 s, distcc's default backoff); `parity` and `tools` until the snapshot's `global.json` or tool manifests change; `busy` and `full` are load, not faults, and are never recorded.
+
+  The record also counts box-side losses (exit 255, `rebooted`, `unreachable` after the start, a `stop` that leaves processes behind) apart from command failures, which never count; past a threshold nothing routes to that builder until a preflight succeeds.
 - **The bridge.** Until the remote port, `gate.exe` is to run the remote part through the PowerShell gate's remote client, `remote.ps1`, as a child process speaking its current protocol, and every builder keeps its PowerShell wrapper.
 
   Everything inside the remote attempt (the snapshot, the push, the remote watchdog, heartbeats, sync-back and outputs) stays in `remote.ps1`, and its outputs pass through `gate.exe` untouched. `gate.exe` owns the routing decision, the remote pool, the claim, the ticket, the journal lines and the fallback. The remote port replaces both ends in one drain and deletes the bridge.
+
+  The bridge is not built yet (GATE-68); with no client, every routed decision falls back with reason `client`, as above.
+
+  The entry point is a small repo-owned shim script that dot-sources `remote.ps1` and calls `Invoke-RemoteCommand`, as `gate.ps1` does in-process, and hands the status and the refusal reason back on a side channel; `gate.exe` writes the verdict itself.
+
+  The stand-alone CLI of `remote.ps1` rewrites no words and writes its own verdict, so it is not the entry point. A routed run behaves as under the PowerShell gate: `--no-markers`, per-repo `outputs`, colon-form words, the passed line's host and a FAILED line before a fallback are kept.
+
+  `gate.exe` finds `pwsh` and the shim and starts the shim through a `gate-win32` spawn primitive built from `Launch` (explicit handle list, its own job, so stop-tree and Ctrl+C reach it). It maps the reasons, and falls back with reason `client` when the client cannot start.
+
+  The host reaches `remote.ps1` as one `-HostAlias` argument of `pwsh -File`, never through `pwsh -Command`, which would put it through a second round of PowerShell parsing. It is the host `gate.exe` already validated against the allowlist (the routing file's text, above); `remote.ps1` never re-reads `remote.json`, whose PowerShell reader lacks that check.
+
+  `gate-router` carries the host in the routed run as a `Host` newtype that only the routing file's reader builds, so no host string the reader did not check reaches a process. The Rust remote client starts ssh with each argument separate and `--` before the destination, and keeps the allowlist too, since a git `host:path` URL cannot carry `--`.
 
 ## The box side
 
@@ -585,9 +623,15 @@ Builders are configured only in the local `%LOCALAPPDATA%\gate\remote.json`. The
 
 The box protocol keeps the PowerShell wrapper's wire format byte for byte, so the old `remote.ps1` can drive `gate box`. `gate box` ships dormant: builders run the PowerShell wrapper behind the bridge until the remote cutover (GATE-46).
 
-The payload is one base64 word (standard alphabet, padded) of UTF-8 JSON holding the wrapper's keys: `Key`, `Bare`, `Work`, `Lock`, `Index`, `OutputFolder` and `Job`, and for `run` also `Command`, `Subfolder`, `Identity`, `Outputs`, `Nonce` and `OutputsFull`. Unknown keys are ignored.
+The payload is one base64 word (standard alphabet, padded) of UTF-8 JSON holding the wrapper's keys: `Key`, `Bare`, `Work`, `Lock`, `Index`, `OutputFolder` and `Job`, and for `run` also `Command`, `Subfolder`, `Identity`, `Outputs`, `Nonce` and `OutputsFull`. Unknown keys are ignored, and `Outputs`, `OutputsFull` and `OutputFolder`, which the outputs transport owns (GATE-44), are parsed tolerantly and ignored.
 
-Every path comes from the payload and nothing is written under the gate's state root. `git` and `dotnet` are found with the gate's own program resolution, which never searches the current folder. A payload that is not base64 JSON prints `gate: box payload is not base64 JSON: <reason>` on stderr and exits 2.
+For `run` the wrapper also requires a `Snapshot` key: a 40-hex commit sha, refused with `gate: remote run payload's Snapshot '<value>' is not a 40-hex commit sha` and exit 2, and the commit is what the run checks out. `gate box run` does not read it yet (GATE-86 builds it): it still fetches `refs/gate/<key>` and checks out `FETCH_HEAD`, so today's `remote.ps1` cannot drive it until then.
+
+Every path comes from the payload and nothing is written under the gate's state root; `gate box` takes no `--state-dir`. Test seams are `test-seams`-gated flags, never environment variables, and sit before the verb (`gate box --test-... run <payload>`) in a `BoxSeams` struct on `BoxRequest`, apart from the `gate run` seams.
+
+The box leaves build servers warm on purpose: it sets neither `MSBUILDDISABLENODEREUSE` (the local gate sets it to 1 for every command) nor a node handshake salt, so MSBuild nodes and compiler servers survive between runs and every work folder on the builder shares one node pool.
+
+Whether nodes are shared across work folders or pile up is to be measured (GATE-26); if they do, `gate box run` sets `MSBUILDNODEHANDSHAKESALT` to the work-folder key, which keeps warmth within a worktree and stops reuse across them. `git` and `dotnet` are found with the gate's own program resolution, which never searches the current folder. A payload that is not base64 JSON prints `gate: box payload is not base64 JSON: <reason>` on stderr and exits 2.
 
 Built verbs:
 
@@ -618,7 +662,9 @@ Built verbs:
 
   A `Subfolder` is compared against the snapshot with per-character simple uppercase (the wrapper's OrdinalIgnoreCase): one that is not a folder inside `Work` prints `gate: remote subfolder <sub> is not a folder inside the work folder`, deletes the back ref and exits 2, and one missing from the snapshot prints `gate: remote subfolder <sub> does not exist in the snapshot` and exits 2. The shared batch refusal (a `.cmd` or `.bat` word, [Command launching](#command-launching)) exits 2.
 
-  The command runs on a hidden console of its own (`CREATE_NO_WINDOW`) and outside the box's own job, created with `CREATE_BREAKAWAY_FROM_JOB` so it leaves the ssh session's job (the box's job refusing breakaway prints `gate: the box cannot start a command outside its own job: <message>` and exits 1). It is assigned to the payload's named job, which has no limits and no kill-on-close, and inherits exactly NUL, the two pipe write ends and a query-only handle to its job, as copies made under the spawn lock ([Command launching](#command-launching)). The box's git and dotnet calls start through `gate_win32::spawn`, under the same lock.
+  The command runs on a hidden console of its own (`CREATE_NO_WINDOW`) and outside the box's own job, created with `CREATE_BREAKAWAY_FROM_JOB` so it leaves the ssh session's job (the box's job refusing breakaway prints `gate: the box cannot start a command outside its own job: <message>` and exits 1).
+
+  It is assigned to the payload's named job, which has no limits and no kill-on-close, and inherits exactly NUL, the two pipe write ends and a query-only handle to its job, as copies made under the spawn lock ([Command launching](#command-launching)). The box's git and dotnet calls start through `gate_win32::spawn`, under the same lock.
 
   A job name already held prints `gate: the job <name> already exists; a run's job name must be new` and exits 1. A command that cannot start prints `gate: could not start <word>[ (<resolved>)]: <message>` and exits 127; a failure of the gate after the start prints `gate: the gate failed while running the command: <problem>` and exits 1. If the box panics after the resume, the job is terminated with 124.
 
@@ -633,7 +679,14 @@ Built verbs:
 
   Processes still alive 10 s after the termination print `gate: remote job <name> still has <n> process(es) 10 s after it was terminated` and exit 1, and a job that cannot be terminated prints `gate: remote could not stop job <name>: <error>` and exits 1.
 
-`outputs` prints `gate: box outputs is not built yet` and exits 70. The heartbeat and the console belong to later parts of the remote port (GATE-61) and are planned, not built. The rest of the protocol, the transport of snapshots and outputs, is the remote port's design (GATE-10).
+`outputs` prints `gate: box outputs is not built yet` and exits 70. The heartbeat and the console belong to later parts of the remote port (GATE-61) and are planned, not built:
+
+- **The heartbeat** runs on `gate-watchdog`'s `BeatClock` and `Pump`. It counts the job's CPU alone until the watchdog's build-server reader exists (GATE-62); its `CpuSource` returns a monotone running sum, since `Pump` takes deltas of a cumulative total. A failed heartbeat write does not stop the job.
+- **The console** is a UTF-8 console from the donor-console method, as the PowerShell wrapper does it.
+
+  A restart into a replacement console keeps the same job: the job is never terminated for it, its processes are killed one by one through their process ids until none remain, and the command is relaunched into the same job, so there is no window without a job, a `stop` that arrives meanwhile still finds it, and the client needs no change. A run whose relaunch fails because a `stop` emptied the job exits 1 with `gate: the gate failed while running the command: <problem>`.
+
+The rest of the protocol, the transport of snapshots and outputs, is the remote port's design (GATE-10).
 
 ## Install
 
@@ -657,6 +710,8 @@ The PowerShell gate and `gate.exe` share slot mutexes and never share files. The
    `gate cutover` copies the PowerShell gate's slot counts into the default root's `slot-counts.json`, so both generations count the same slots, then writes `%LOCALAPPDATA%\gate\cutover.flag`. The PowerShell launcher in each repo reads the flag, and from then on every new gate runs `gate.exe` through the compatibility layer.
 2. It then waits until every PowerShell gate's claims and tickets in `%LOCALAPPDATA%\gate\` are gone or stale, naming on stderr what it still waits on, and exits 0 once none is left.
 
+   Callers that start the PowerShell gate without the launcher keep starting PowerShell gates after the flag is set. The drain names on stderr each PowerShell gate whose claim or ticket appeared after the flag was written, with its command line, so a bypassing caller is visible rather than holding the drain open silently. The cutover is not run until claude-config lists the callers it moved.
+
 ### The launcher's hand-over
 
 The launcher is claude-config's `tools/gate/gate-launcher.ps1`, which `sync-launchers.ps1` copies into each repo as `tools/gate.ps1`; the hand-over is built there, and this repo's black-box cases run the synced copy.
@@ -674,6 +729,8 @@ During the drain a PowerShell gate neither reads `gate.exe`'s tickets nor signal
 ops-tower's Gates tab, `gate-state`, and the hooks and scripts that read gate command lines or output (inventory section 4) change in the same drain.
 
 After the caller sweep there is no fallback: callers run `gate ...` on PATH, a machine without it gets "command not found", and each repo's docs name the install script. Before the sweep, the PowerShell launcher's own fallback for a machine without the gate (H2) is the launcher's, not `gate.exe`'s.
+
+The compatibility layer is deleted once no caller uses `-Log`, `-TimeoutSeconds` or `-Slot`. The guard launcher stays: `sync-launchers.ps1` publishes both launchers.
 
 ## Crate layout
 
@@ -731,6 +788,7 @@ A Rust integration suite drives the built `gate.exe` through its CLI and reads o
 
   It spawns children, burns CPU, prints its argv, writes output or sleeps on command, so build-server, orphan and kill-tree cases need no real toolchain.
 - **No fixture from the checkout path.** No routing pattern, expected path or assertion is derived from where the repo is checked out; a case builds its own repository and routing file in its root. `checkout::repo_file` is the one route to a checked-in file (the install script), never for a path or pattern a case asserts on.
+- **Launcher cases** (GATE-41), planned, not written yet: they run the synced `tools/gate.ps1`. A case's `LOCALAPPDATA` is its `appdata` folder, whose `gate\v1` is the default root with the real slot names, so every such case also sets `GATE_STATE_DIR` to a non-default folder. The flag-unset case points the launcher at a stub canonical gate through `CLAUDE_CONFIG_DIR`. A new suite module that calls `repo_file` updates the callers pin in `checkout.rs`.
 - **Running it.** The suite is a test target with `required-features = ["test-seams"]`, run through the gate with `cargo test --workspace --profile test-release --all-features`. Without the feature (no `--all-features`) cargo skips the suite silently.
 
 ## Cores hint
@@ -747,7 +805,6 @@ At the end of every run the gate says how many cores the command kept busy and w
 What no ruling settles yet, with the issue that owns it:
 
 - **A `gate cutover` stopped part way** (GATE-9): whether rerunning it resumes the wait, and whether the flag can be taken back.
-- **The bridge call** (GATE-9): which `remote.ps1` entry point `gate.exe` runs (its stand-alone CLI rewrites no words and writes its own verdict) and how a refusal's reason reaches `gate.exe`.
 - **The box protocol and `remote.json`'s next format** (GATE-10): verbs, payload and transport between PC and builder, whether ssh keeps cmd.exe as the builder's shell, and the routing file's version and matcher. Sibling worktrees in a routed run leave three questions of their own (GATE-19).
 - **The remote lease** (GATE-25): how a builder notices that the PC side of a run is gone and stops the job, and after how long.
 - **The duration estimate** (GATE-12): whether p50 comes from a short recent window, and whether cold and warm cache runs are summarised apart.

@@ -1,6 +1,8 @@
 # gate.ps1 fixtures
 
-Files captured from a real run of the gate, not written by hand (except three of the `remote*` files and the two pid 58200 lines of `journal.jsonl` and `journal-powershell.jsonl`, below), so `fixtures.rs` proves `gate-state` reads what the gate writes. `journal.jsonl` comes from an early `gate.exe` that launched nothing and took no slot; the other captured files are still from `~/.claude/tools/gate/gate.ps1`. Each is kept as captured (UTF-8 without a byte order mark, one line), except that the worktree path the capture ran in is replaced by `C:\work\repo` in `cwd` and `log`, and the repo's `end-of-file-fixer` hook adds the trailing newline the gate does not write (the tests parse the JSON, so it does not matter).
+Files captured from a real run of the gate, not written by hand (except three of the `remote*` files and the two pid 58200 lines of `journal.jsonl` and `journal-powershell.jsonl`, below), so `fixtures.rs` proves `gate-state` reads what the gate writes. `journal.jsonl` comes from an early `gate.exe` that launched nothing and took no slot; the other captured files are still from `~/.claude/tools/gate/gate.ps1`.
+
+Each is kept as captured (UTF-8 without a byte order mark, one line), except that the worktree path the capture ran in is replaced by `C:\work\repo` in `cwd` and `log`, and the repo's `end-of-file-fixer` hook adds the trailing newline the gate does not write (the tests parse the JSON, so it does not matter).
 
 | File | What it is | Where the gate writes it |
 |---|---|---|
@@ -39,10 +41,14 @@ From the worktree root, in pwsh, with `LOCALAPPDATA` pointed at a scratch folder
 
 ## Re-capturing the remote journal
 
-From the repo root, in pwsh: `pwsh -NoProfile -File tools/gate.ps1 -Log .tmp/cap.log -TimeoutSeconds 600 -Slot light -- pwsh -NoProfile -File crates/gate-state/tests/state/fixtures/capture-remote-journal.ps1`, with an optional `-Scratch <folder>` (default `.tmp\cap-remote-journal\run-<stamp>`, left for you to delete). The script runs the real gate under a scratch `LOCALAPPDATA`, a self-test slot prefix and a stub remote, so no live journal, mutex or build box is touched, and writes `remote-journal.jsonl` with LF line ends, the scratch repo's path as `C:\work\repo`, renumbered pids and shifted times. Update the figures `fixtures.rs` expects if the sequence changes.
+From the repo root, in pwsh: `pwsh -NoProfile -File tools/gate.ps1 -Log .tmp/cap.log -TimeoutSeconds 600 -Slot light -- pwsh -NoProfile -File crates/gate-state/tests/state/fixtures/capture-remote-journal.ps1`, with an optional `-Scratch <folder>` (default `.tmp\cap-remote-journal\run-<stamp>`, left for you to delete).
+
+The script runs the real gate under a scratch `LOCALAPPDATA`, a self-test slot prefix and a stub remote, so no live journal, mutex or build box is touched, and writes `remote-journal.jsonl` with LF line ends, the scratch repo's path as `C:\work\repo`, renumbered pids and shifted times. Update the figures `fixtures.rs` expects if the sequence changes.
 
 ## Re-capturing the journal
 
 From the repo root, in pwsh: `pwsh -NoProfile -File tools/gate.ps1 -Log .tmp/cap-journal.log -TimeoutSeconds 600 -Slot light -- pwsh -NoProfile -File crates/gate-state/tests/state/fixtures/capture-journal.ps1`, with an optional `-Scratch <folder>` (default `.tmp\cap-journal\run-<stamp>`, left for you to delete).
 
-The script builds `gate.exe` without `test-seams` through the gate, runs three real `cmd /c exit <status>` commands (statuses 0, 3, 0) into a scratch state root, rewrites `cwd` and `log` to `C:\work\repo`, and writes `journal.jsonl` with LF line ends, the hand-written pid 58200 queue and abandon lines after the captured ones. A re-capture gives takes that name real slots and non-zero held and wall times, so the figures `fixtures.rs` expects would change with it. Update the pids, times and figures `fixtures.rs` expects if the sequence changes.
+The script builds `gate.exe` without `test-seams` through the gate, runs three real `cmd /c exit <status>` commands (statuses 0, 3, 0) into a scratch state root, rewrites `cwd` and `log` to `C:\work\repo`, and writes `journal.jsonl` with LF line ends, the hand-written pid 58200 queue and abandon lines after the captured ones.
+
+A re-capture gives takes that name real slots and non-zero held and wall times, so the figures `fixtures.rs` expects would change with it. Update the pids, times and figures `fixtures.rs` expects if the sequence changes.
