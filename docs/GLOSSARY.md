@@ -42,6 +42,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Notes**: the gate's own lines gathered while a run goes and appended to the end of its log.
 - **Pause marker**: an empty file a nested gate rewrites while it waits behind a critical request, which stops its parent's watchdog clocks for that time.
 - **Pool**: the set of slots of one kind (heavy, light, remote); pools never wait on each other.
+- **Preflight**: the box's first call of a routed run (`gate box preflight`): it creates the bare repo and the work folder and reports the gate version, the boot time and the SDKs.
 - **Probe by open**: reading whether a slot is held by opening its mutex's name: it is held while any handle to that name exists.
 - **Pure crate**: a crate with no Windows types in its API that builds and unit-tests on Linux as well (`gate-state`, `gate-watchdog`, `gate-args`, `gate-router`).
 - **Refusal**: a builder's exit 75 with a reason (`busy`, `unreachable`, `parity`, `rebooted`, `tools`, `version`), which makes the routed run fall back.

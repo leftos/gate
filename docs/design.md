@@ -85,7 +85,9 @@ See [Cutover](#cutover).
 
 ### `gate box`
 
-Hidden from the usage. It is the builder side of a routed run, run over ssh on the builder ([The box side](#the-box-side)).
+Hidden from the usage and from `--help`. It is the builder side of a routed run, run over ssh on the builder ([The box side](#the-box-side)).
+
+`gate box preflight|run|stop|boot|outputs <payload>` takes exactly one verb and one non-empty payload word, and no `--state-dir`: every path comes from the payload. Any other shape (no verb, no payload, an empty payload, an unknown verb, an extra word) prints `usage: gate box preflight|run|stop|boot|outputs <base64 JSON payload>` alone on stderr and exits 2.
 
 ### Later subcommands
 
@@ -117,7 +119,7 @@ Further modes arrive as subcommands of the same binary, each designed with its i
 | 2 | Usage: a missing, unknown or invalid input; a `.cmd` or `.bat` word the gate refuses (C5); a `--log` inside the state root; a critical gate under a heavy or light slot marker (K7). Nothing is queued. |
 | 124 | The watchdog killed the command: STALLED, TIMED OUT or BACKSTOP (X2). |
 | 127 | The command could not be started (C7); the slot is released at once. |
-| 70 | Temporary: a valid `gate stop-tree`, which is not built yet. Its slice removes this code. |
+| 70 | Temporary: a valid `gate stop-tree`, or a valid `gate box run`, `stop` or `outputs`, which are not built yet (`gate: box <verb> is not built yet`). Their slices remove this code. |
 | 75 | A builder refused a routed run (`gate box`, or the bridged remote client): busy, unreachable, parity, rebooted, tools, version. The PC side reads the refusal and falls back to a local run, so a caller sees 75 only as a command's own status, or as a refusal that carried no reason (T5). |
 
 The codes are kept (V4), with 75 added for refusals. 124 is the status coreutils `timeout` uses, so no caller mistakes a kill for the command's own status; a command that itself exits 124 is told apart in the journal's `verdict`.
@@ -493,7 +495,17 @@ A builder runs the same `gate.exe`, under the hidden `gate box` subcommand, from
 
 Builders are configured only in the local state root's `remote.json`. The repo, its docs and its tests name no builder; the suite's remote cases run against a stub.
 
-The box protocol (the verbs, the payload, the transport of snapshots and outputs) is the remote port's design (GATE-10); until it lands, builders run the PowerShell wrapper behind the bridge.
+The box protocol keeps the PowerShell wrapper's wire format byte for byte, so the old `remote.ps1` can drive `gate box`. `gate box` ships dormant: builders run the PowerShell wrapper behind the bridge until the remote cutover (GATE-46).
+
+The payload is one base64 word (standard alphabet, padded) of UTF-8 JSON holding the wrapper's keys: `Key`, `Bare`, `Work`, `Lock`, `Index`, `OutputFolder` and `Job`, and for `run` also `Command`, `Subfolder`, `Identity`, `Outputs`, `Nonce` and `OutputsFull`. Unknown keys are ignored. Every path comes from the payload and nothing is written under the gate's state root. `git` and `dotnet` are found with the gate's own program resolution, which never searches the current folder. A payload that is not base64 JSON prints `gate: box payload is not base64 JSON: <reason>` on stderr and exits 2.
+
+Built verbs:
+
+- **`boot`** prints `gate: remote boot <UTC time>` on stdout (ISO 8601, 7 fractional digits, `Z`; the system time less the tick count since boot) and exits 0. When the time cannot be read it prints `gate: remote could not read the boot time: <message>` on stderr and still exits 0.
+- **`preflight`** creates the bare repo at `Bare` when missing and the work folder at `Work` with `.git`, `origin` set to `Bare`, `core.autocrlf false` and `core.eol lf`, and writes `.git\objects\info\alternates` as `<Bare with />/objects` and a line feed, without a byte order mark, only when the file is missing or empty. It prints on stdout, in order: `gate: remote created <Bare>` (only when it created the bare repo), `gate: remote version <gate version>`, the boot line, and `gate: remote sdks <v1,v2|none>`; git's own output passes through. A payload without `Bare` or `Work` prints `gate: box payload lacks <key>` and exits 2.
+- A failing git step prints `gate: remote <step> failed (status <n>)` and exits with that status; a git that cannot start prints `gate: remote <step> failed: <OS message>` and exits 1. The steps are `git init --bare`, `git init`, `git remote add`, `git config core.autocrlf` and `git config core.eol`. A folder or file that cannot be made prints `gate: remote could not create the folder <path>: <error>` or `gate: remote could not write <path>: <error>` and exits 1. An SDK list that cannot be read prints `gate: remote could not read the SDK list: <message>`, omits the sdks line and still exits 0.
+
+`run`, `stop` and `outputs` print `gate: box <verb> is not built yet` and exit 70. The replacement job, the pipe-closed stop (exit 255), the heartbeat and the console belong to later parts of the remote port (GATE-60, GATE-61) and are planned, not built. The rest of the protocol, the transport of snapshots and outputs, is the remote port's design (GATE-10).
 
 ## Install
 

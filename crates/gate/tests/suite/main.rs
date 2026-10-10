@@ -2,6 +2,7 @@
 
 #![expect(clippy::expect_used, reason = "a case that cannot start its program or read its output must fail loudly")]
 
+mod boxside;
 mod checkout;
 mod cli;
 mod compat;

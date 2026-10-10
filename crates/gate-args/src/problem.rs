@@ -1,4 +1,4 @@
-//! The usage errors, each one `gate: ` line.
+//! The usage errors, each one `gate: ` line, except the hidden `gate box`'s own `usage: gate box ...` line.
 
 use std::fmt;
 
@@ -59,6 +59,8 @@ pub enum Problem {
     BadPid(String),
     /// A gate word that is not valid Unicode, shown lossily.
     Unreadable(String),
+    /// A `gate box` with no verb or payload, an unknown verb, or an extra word: the box's own usage line, said alone.
+    BoxUsage,
 }
 
 impl fmt::Display for Problem {
@@ -79,6 +81,7 @@ impl fmt::Display for Problem {
             Problem::MissingPid => f.write_str("gate: missing the process id"),
             Problem::BadPid(value) => write!(f, "gate: the process id must be a whole number above 0, got '{value}'"),
             Problem::Unreadable(lossy) => write!(f, "gate: cannot read the argument {lossy}"),
+            Problem::BoxUsage => f.write_str("usage: gate box preflight|run|stop|boot|outputs <base64 JSON payload>"),
         }
     }
 }

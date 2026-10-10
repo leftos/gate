@@ -22,6 +22,11 @@ impl Variables {
         Variables(applied(std::env::vars_os().collect(), overrides(root, marker)))
     }
 
+    /// The gate's own environment, unchanged: what a program the gate starts for itself sees.
+    pub(crate) fn from_process() -> Variables {
+        Variables(std::env::vars_os().collect())
+    }
+
     /// The value the command gets for `name`, names compared as Windows compares them.
     pub(crate) fn get(&self, name: &str) -> Option<&OsStr> {
         let name = OsStr::new(name);

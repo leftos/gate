@@ -33,7 +33,7 @@ const NOT_STARTED: i64 = 127;
 /// The exit code the job's processes are ended with when the gate stops the command.
 const STOPPED: u32 = 124;
 /// The Win32 error of a file not found, which a program found nowhere is reported as.
-const ERROR_FILE_NOT_FOUND: u32 = 2;
+pub(crate) const ERROR_FILE_NOT_FOUND: u32 = 2;
 /// How long one wait for the command's exit lasts before the gate waits again.
 const WAIT_STEP: Duration = Duration::from_secs(60);
 /// How long the gate waits for the command once it has terminated its job after a failure of its own.
@@ -254,7 +254,7 @@ impl Plan {
 
 /// The file `word` names, looked for along the command's `PATH` and `PATHEXT`, read against `folder` and made a full
 /// path as Windows reads it, `.` and `..` folded; else the start failure's message.
-fn find_program(word: &str, variables: &Variables, folder: &Path) -> Result<PathBuf, String> {
+pub(crate) fn find_program(word: &str, variables: &Variables, folder: &Path) -> Result<PathBuf, String> {
     // An unset PATH or PATHEXT has no folder or extension to try.
     let path = variables
         .get("PATH")

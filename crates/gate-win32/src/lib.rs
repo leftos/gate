@@ -1,7 +1,7 @@
 //! The gate's Win32 layer: named mutexes and events, job objects, commands created suspended, the start time of the
-//! gate process or of another, and the Windows message of an error code. It holds no policy: the names, the waits, the
-//! command's environment and priority, and what an abandoned mutex means to the gate are the caller's. Windows only;
-//! elsewhere the crate is empty.
+//! gate process or of another, the system's boot time, and the Windows message of an error code. It holds no policy:
+//! the names, the waits, the command's environment and priority, and what an abandoned mutex means to the gate are the
+//! caller's. Windows only; elsewhere the crate is empty.
 
 #![cfg(windows)]
 
@@ -16,7 +16,7 @@ pub use launch::{EnvironmentBlock, Launch, LaunchError, PriorityClass, Running, 
 pub use mutex::{AcquireError, MutexGuard, NamedMutex, OwnedMutexGuard, mutex_exists};
 
 use std::io;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use jiff::Timestamp;
 use proc_table::win32::OwnedHandle;
@@ -24,6 +24,7 @@ use windows_sys::Win32::Foundation::{ERROR_INVALID_PARAMETER, FILETIME, HANDLE, 
 use windows_sys::Win32::System::Diagnostics::Debug::{
     FORMAT_MESSAGE_ALLOCATE_BUFFER, FORMAT_MESSAGE_FROM_SYSTEM, FORMAT_MESSAGE_IGNORE_INSERTS, FormatMessageW,
 };
+use windows_sys::Win32::System::SystemInformation::GetTickCount64;
 use windows_sys::Win32::System::Threading::{
     BELOW_NORMAL_PRIORITY_CLASS, GetCurrentProcess, GetExitCodeProcess, GetPriorityClass, GetProcessTimes, IDLE_PRIORITY_CLASS, INFINITE,
     OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
@@ -127,6 +128,20 @@ pub fn system_directory() -> io::Result<std::path::PathBuf> {
         // Too small: `length` is the size the folder needs, its terminating NUL included.
         buffer.resize(length, 0);
     }
+}
+
+/// When the system last started: the time now less the milliseconds since the start (`GetTickCount64`, which counts
+/// time asleep and hibernated too). Two readings in one boot differ only by the drift between the two clocks.
+///
+/// # Errors
+///
+/// An error when that time is before the earliest time a [`SystemTime`] holds.
+pub fn boot_time() -> io::Result<SystemTime> {
+    // SAFETY: the call takes no argument and cannot fail.
+    let since_start = Duration::from_millis(unsafe { GetTickCount64() });
+    SystemTime::now()
+        .checked_sub(since_start)
+        .ok_or_else(|| io::Error::other("the boot time is before the earliest time the system clock holds"))
 }
 
 /// The start time of the running process `pid`, as [`process_start`] gives it; `None` when no process has that pid or

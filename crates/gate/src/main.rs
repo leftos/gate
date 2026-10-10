@@ -1,9 +1,11 @@
 //! `gate.exe`: runs a heavy command under a machine-wide queue of CPU slots. This build reads its command line,
 //! resolves the state root and the log path, answers `--version` and `--help`, and runs a command under a slot in a
-//! job of its own, saying each line as it goes; the watchdog and stopping a tree are not built yet.
+//! job of its own, saying each line as it goes. On a builder, the hidden `gate box` answers `boot` and `preflight`.
+//! The watchdog, stopping a tree and the box's `run`, `stop` and `outputs` are not built yet.
 
 mod acquire;
 mod answer;
+mod boxside;
 mod console;
 mod environment;
 mod journal;

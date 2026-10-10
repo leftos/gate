@@ -19,6 +19,39 @@ pub enum Invocation {
     Run(RunRequest),
     /// `gate stop-tree <pid>`, or the compatibility layer's `-StopTree <pid>`.
     StopTree(StopRequest),
+    /// The hidden `gate box <verb> <payload>`.
+    Box(BoxRequest),
+}
+
+/// A valid `gate box`: the verb, and the payload word as given, base64 of UTF-8 JSON that the binary decodes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BoxRequest {
+    pub verb: BoxVerb,
+    pub payload: OsString,
+}
+
+/// What `gate box` was asked to do on the builder.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BoxVerb {
+    Preflight,
+    Run,
+    Stop,
+    Boot,
+    Outputs,
+}
+
+impl BoxVerb {
+    /// The verb as the CLI spells it.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BoxVerb::Preflight => "preflight",
+            BoxVerb::Run => "run",
+            BoxVerb::Stop => "stop",
+            BoxVerb::Boot => "boot",
+            BoxVerb::Outputs => "outputs",
+        }
+    }
 }
 
 /// A slot kind a run asks for.

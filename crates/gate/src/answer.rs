@@ -11,7 +11,7 @@ use crate::resolve::{self, Environment};
 /// The status of a usage error: a missing, unknown or invalid input, or a word the command cannot take.
 pub(crate) const USAGE_STATUS: u8 = 2;
 /// The status of a valid request for a mode this build does not have yet: `stop-tree`.
-const NOT_BUILT_STATUS: u8 = 70;
+pub(crate) const NOT_BUILT_STATUS: u8 = 70;
 
 /// Says the answer for `args`, the command line without the program name, through `console`, and returns the exit
 /// status: a 32-bit code, since a run passes its command's whole exit code through.
@@ -27,6 +27,7 @@ pub(crate) fn answer(args: Vec<OsString>, environment: &Environment, console: &m
         }
         Ok(Invocation::Run(request)) => run(&request, environment, console),
         Ok(Invocation::StopTree(request)) => u32::from(stop_tree(&request, environment, console)),
+        Ok(Invocation::Box(request)) => crate::boxside::answer(&request, console),
         Err(problems) => u32::from(usage_error(&problems, console)),
     }
 }
@@ -35,7 +36,10 @@ fn usage_error(problems: &[Problem], console: &mut Console) -> u8 {
     for problem in problems {
         console.err(&problem.to_string());
     }
-    console.err(USAGE);
+    // `gate box` is hidden, so its own usage line is said alone, without the published usage.
+    if !matches!(problems, [Problem::BoxUsage]) {
+        console.err(USAGE);
+    }
     USAGE_STATUS
 }
 
