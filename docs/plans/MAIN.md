@@ -6,11 +6,15 @@
 
 - [ ] GATE-5 Port the local gate, slice by slice
   - [ ] GATE-36 Local slice 5: watchdog (CPU sampling, stall check, kill-tree, heartbeat)
+    - [ ] GATE-58 Watchdog part C: watch the run (sampler, stall kill, Ctrl+C)
   - [ ] GATE-37 Local slice 6: timeout ceiling and backstop
   - [ ] GATE-38 Local slice 7: critical drain and nesting
   - [ ] GATE-39 Local slice 8: router and the bridge to remote.ps1
-  - [ ] GATE-40 Local slice 9: install script
+    - [/] GATE-66 Router part A: the pure gate-router crate
+    - [ ] GATE-67 Router part B: route gate run through a remote client interface
+    - [ ] GATE-68 Router part C: the remote.ps1 bridge through a repo shim
   - [ ] GATE-41 Local slice 10: the PowerShell launcher execs gate.exe once the cutover flag is set
+  - [ ] GATE-62 Watchdog: count build servers, WSL and paused child gates as progress
 - [ ] GATE-9 Local cutover: drain and switch to gate.exe, bridging routed runs to remote.ps1
 - [ ] GATE-6 Say how many cores a run kept busy and whether its slot fitted
 - [ ] GATE-7 Learned command durations: summary, expected-time line, ETAs, auto ceiling, backfill
@@ -20,12 +24,13 @@
   - [ ] GATE-17 Durations part 5: backfill guests during a critical drain
 - [ ] GATE-8 `--slot auto` picks heavy or light from the command's history
 - [ ] GATE-54 Keep the command's log handles out of processes the gate starts on other threads
-- [ ] GATE-55 History keys: split journal commands with the C-runtime rules so quoted words are normalised
 
 ## Remote
 
 - [ ] GATE-10 Port the remote client and box wrapper, then the remote cutover
   - [ ] GATE-42 Remote slice 1: the box side as gate box (run, stop, preflight, boot)
+    - [ ] GATE-60 Box part B: gate box run and stop
+    - [ ] GATE-61 Box part C: box heartbeat, UTF-8 console and the pipe-closed stop
   - [ ] GATE-43 Remote slice 2: remote client (snapshot, push, run, sync-back)
   - [ ] GATE-44 Remote slice 3: bring a routed run's outputs back
   - [ ] GATE-45 Remote slice 4: health refusals, fallback journalling and remote claims
@@ -40,7 +45,14 @@
   - [ ] GATE-26 Box: measure MSBuild node sharing across work folders, salt per work folder
   - [ ] GATE-21 Remote: a critical pool on the builder for timing-sensitive gates (decide after measuring)
   - [ ] GATE-24 Routed .NET builds recompile everything because each snapshot is a new commit
+  - [ ] GATE-63 Box: restore a repo's dotnet tools before a routed run
+  - [ ] GATE-65 Box: push the installed gate.exe to each builder
 
 ## Cutover sweep
 
 - [ ] GATE-11 Caller sweep to gate on PATH; delete the PowerShell gate
+
+## Backlog
+
+- [ ] GATE-64 Suite: journal rollover case sometimes waits for a light slot under load
+- [ ] GATE-69 stop-tree: take a process snapshot without command lines
