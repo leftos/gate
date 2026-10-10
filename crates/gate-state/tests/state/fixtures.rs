@@ -14,8 +14,9 @@ const CLAIM: &str = include_str!("fixtures/claim.json");
 const TICKET: &str = include_str!("fixtures/ticket.json");
 /// The counts file the capture ran under.
 const SLOT_COUNTS: &str = include_str!("fixtures/slot-counts.json");
-/// The journal of three light gates captured through gate.exe's `--test-journal-run` seam (statuses 0, 3 and 0), plus a
-/// hand-written abandoned one.
+/// The journal of three light gates (statuses 0, 3 and 0) captured from an early gate.exe that launched no command and
+/// took no slot, plus a hand-written abandoned one. A re-capture with `capture-journal.ps1` gives takes naming real
+/// slots and non-zero held and wall times, so the figures `captured_journal_is_read_into_runs` expects change with it.
 const JOURNAL: &str = include_str!("fixtures/journal.jsonl");
 /// The PowerShell gate's journal of four light gates under one light slot, captured before the v1 format (no `v`), plus
 /// a hand-written abandoned one.
@@ -333,7 +334,7 @@ fn captured_journal_is_read_into_runs() {
             adjusted_seconds: None,
             abandoned: Vec::new(),
         },
-        "the seam takes no slot"
+        "the captured run took no slot"
     );
     assert_eq!(
         history.runs[1],

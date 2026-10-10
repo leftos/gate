@@ -48,15 +48,6 @@ pub enum Problem {
         option: String,
         value: String,
     },
-    /// A value that is not an exit status, a whole number 0 to 255.
-    NotAStatus {
-        option: String,
-        value: String,
-    },
-    /// The journal seam and the request printer, which both replace the run, given together.
-    JournalRunWithPrintRequest,
-    /// The hold seam, which holds the journal seam's run, given without it.
-    HoldUntilWithoutJournalRun,
     NeedsValue(String),
     GivenTwice(String),
     UnknownOption(String),
@@ -79,9 +70,6 @@ impl fmt::Display for Problem {
             Problem::NotZeroOrAbove { option, value } => write!(f, "gate: {option} must be a whole number 0 or above, got '{value}'"),
             Problem::TooLarge { option, value } => write!(f, "gate: {option} must be at most {MAX_WHOLE_NUMBER}, got '{value}'"),
             Problem::NotTrueOrFalse { option, value } => write!(f, "gate: {option} takes true or false, got '{value}'"),
-            Problem::NotAStatus { option, value } => write!(f, "gate: {option} must be a whole number 0 to 255, got '{value}'"),
-            Problem::JournalRunWithPrintRequest => f.write_str("gate: --test-journal-run and --test-print-request cannot be combined"),
-            Problem::HoldUntilWithoutJournalRun => f.write_str("gate: --test-hold-until needs --test-journal-run"),
             Problem::NeedsValue(option) => write!(f, "gate: {option} needs a value"),
             Problem::GivenTwice(option) => write!(f, "gate: {option} is given twice"),
             Problem::UnknownOption(word) => write!(f, "gate: unknown option {word}"),

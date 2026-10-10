@@ -1,6 +1,7 @@
 //! The harness: a [`Case`] with its own state root, the programs under test, and order-only assertions.
 
 use std::io::{self, Read, Write};
+use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -368,6 +369,25 @@ pub fn assert_in_order(haystack: &str, needles: &[&str]) {
 /// `path` as the gate prints it in the request.
 pub fn shown(path: &Path) -> String {
     path.to_string_lossy().into_owned()
+}
+
+/// The words of a light run logging to `log`, `extra` before `--` and `command` after it. Gates that run at once each
+/// need a log of their own, since a gate refuses a log another gate is writing.
+pub fn run_words<'a>(log: &'a str, extra: &[&'a str], command: &[&'a str]) -> Vec<&'a str> {
+    let mut words = vec!["run", "--slot", "light", "--timeout", "5", "--log", log];
+    words.extend(extra);
+    words.push("--");
+    words.extend(command);
+    words
+}
+
+/// Returns once every handle on `path` is closed: an open that shares nothing succeeds only then. A command a killed
+/// gate left running holds its log open until it ends, so this waits until no process of that command has the log
+/// open.
+pub fn wait_until_closed(path: &Path) {
+    wait_until(&format!("every handle on {} closing", path.display()), || {
+        fs::OpenOptions::new().read(true).share_mode(0).open(path).is_ok()
+    });
 }
 
 /// The words of a valid run that prints its request, the command after `--` last.

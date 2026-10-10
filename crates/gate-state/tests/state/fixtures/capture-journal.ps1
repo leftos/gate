@@ -1,10 +1,13 @@
 <#
 .SYNOPSIS
-Re-captures journal.jsonl from gate.exe's --test-journal-run seam.
+Re-captures journal.jsonl from three gate.exe runs.
 
 .DESCRIPTION
-Builds gate.exe with the test-seams feature through the repo's gate, then runs three light gates in a scratch state root
-(statuses 0, 3 and 0; the commands are not run), so no live journal or mutex is touched. Writes journal.jsonl beside
+Builds gate.exe through the repo's gate, then runs three light gates in a scratch state root, their commands
+`cmd /c exit 0`, `cmd /c exit 3` and `cmd /c exit 0`, so no live journal or mutex is touched. The journal.jsonl in the
+repo came from an early gate.exe that launched no command and took no slot; a re-capture with this script gives takes
+naming real slots and non-zero held and wall times, so the figures captured_journal_is_read_into_runs in fixtures.rs
+expects change with it. Writes journal.jsonl beside
 this script with LF line ends, the scratch folder's path as C:\work\repo, and the hand-written queue and abandon lines of
 pid 58200 after the captured ones.
 
@@ -22,7 +25,7 @@ if (-not $Scratch) {
 $null = New-Item -ItemType Directory -Force $Scratch
 $Scratch = (Resolve-Path $Scratch).Path
 
-& pwsh -NoProfile -WorkingDirectory $repo -File (Join-Path $repo 'tools\gate.ps1') -Log '.tmp/cap-journal-build.log' -TimeoutSeconds 900 -Slot heavy -- cargo build -p gate --features test-seams --profile test-release
+& pwsh -NoProfile -WorkingDirectory $repo -File (Join-Path $repo 'tools\gate.ps1') -Log '.tmp/cap-journal-build.log' -TimeoutSeconds 900 -Slot heavy -- cargo build -p gate --profile test-release
 if ($LASTEXITCODE -ne 0) { throw "the build failed (status $LASTEXITCODE); see $repo\.tmp\cap-journal-build.log" }
 
 $gate = Join-Path $repo 'target\test-release\gate.exe'
@@ -36,7 +39,7 @@ $env:GATE_SLOT_HELD = $null
 Push-Location $Scratch
 try {
     foreach ($run in $runs) {
-        & $gate run --slot light --timeout 60 --log $run.Log --state-dir $root --test-journal-run $run.Status -- cmd /c exit $run.Status
+        & $gate run --slot light --timeout 60 --log $run.Log --state-dir $root -- cmd /c exit $run.Status
         if ($LASTEXITCODE -ne $run.Status) { throw "the gate for status $($run.Status) exited $LASTEXITCODE" }
     }
 }

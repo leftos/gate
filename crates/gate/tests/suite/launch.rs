@@ -9,7 +9,9 @@ use std::path::PathBuf;
 use gate_state::{KernelObject, StateRoot};
 use serde_json::Value;
 
-use crate::support::{Case, FAKE_TOOL, assert_in_order, finish, shown, wait_for_file, wait_for_journal_line, wait_until, write_counts};
+use crate::support::{
+    Case, FAKE_TOOL, assert_in_order, finish, run_words, shown, wait_for_journal_line, wait_until, wait_until_closed, write_counts,
+};
 
 /// A light pool of one slot.
 const ONE_LIGHT: &str = r#"{"v":1,"light":1}"#;
@@ -33,15 +35,6 @@ const QUOTED_WORDS: [&str; 11] = [
     "a&b",
     "(x)",
 ];
-
-/// The words of a light run logging to `out.log`, `extra` before `--` and `command` after it.
-fn run_words<'a>(extra: &[&'a str], command: &[&'a str]) -> Vec<&'a str> {
-    let mut words = vec!["run", "--slot", "light", "--timeout", "5", "--log", "out.log"];
-    words.extend(extra);
-    words.push("--");
-    words.extend(command);
-    words
-}
 
 fn log_path(case: &Case) -> PathBuf {
     case.folder().join("out.log")
@@ -88,7 +81,7 @@ fn events(case: &Case) -> Vec<Value> {
 fn a_run_launches_its_command_and_passes_its_status() {
     let case = Case::new("a_run_launches_its_command_and_passes_its_status");
 
-    let outcome = case.run(&run_words(&[], &[FAKE_TOOL, "out", "hello", "err", "oops", "exit", "0"]));
+    let outcome = case.run(&run_words("out.log", &[], &[FAKE_TOOL, "out", "hello", "err", "oops", "exit", "0"]));
 
     let log = shown(&log_path(&case));
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
@@ -113,7 +106,7 @@ fn a_run_launches_its_command_and_passes_its_status() {
 fn exit_3_is_passed_through_with_the_failed_line() {
     let case = Case::new("exit_3_is_passed_through_with_the_failed_line");
 
-    let outcome = case.run(&run_words(&[], &[FAKE_TOOL, "out", "hi", "exit", "3"]));
+    let outcome = case.run(&run_words("out.log", &[], &[FAKE_TOOL, "out", "hi", "exit", "3"]));
 
     let failed = format!("gate: FAILED (status 3). Full output: {}\n", shown(&log_path(&case)));
     assert_eq!(outcome.code, Some(3), "{outcome:?}");
@@ -126,7 +119,7 @@ fn exit_3_is_passed_through_with_the_failed_line() {
 fn a_marker_with_exit_0_is_status_1() {
     let case = Case::new("a_marker_with_exit_0_is_status_1");
 
-    let outcome = case.run(&run_words(&[], &[FAKE_TOOL, "out", "Build FAILED.", "exit", "0"]));
+    let outcome = case.run(&run_words("out.log", &[], &[FAKE_TOOL, "out", "Build FAILED.", "exit", "0"]));
 
     let log = shown(&log_path(&case));
     assert_eq!(outcome.code, Some(1), "{outcome:?}");
@@ -141,7 +134,11 @@ fn a_marker_with_exit_0_is_status_1() {
 fn no_markers_keeps_status_0() {
     let case = Case::new("no_markers_keeps_status_0");
 
-    let outcome = case.run(&run_words(&["--no-markers"], &[FAKE_TOOL, "out", "Build FAILED.", "exit", "0"]));
+    let outcome = case.run(&run_words(
+        "out.log",
+        &["--no-markers"],
+        &[FAKE_TOOL, "out", "Build FAILED.", "exit", "0"],
+    ));
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert_eq!(outcome.stderr, "", "{outcome:?}");
@@ -153,7 +150,7 @@ fn a_missing_program_exits_127_and_releases_the_slot() {
     let case = Case::new("a_missing_program_exits_127_and_releases_the_slot");
     write_counts(&case.root(), ONE_LIGHT);
 
-    let outcome = case.run(&run_words(&[], &["gate-no-such-program", "x"]));
+    let outcome = case.run(&run_words("out.log", &[], &["gate-no-such-program", "x"]));
 
     let start = format!("gate: could not start gate-no-such-program: {}", gate_win32::win32_message(2));
     let failed = format!("gate: FAILED (status 127). Full output: {}", shown(&log_path(&case)));
@@ -166,7 +163,7 @@ fn a_missing_program_exits_127_and_releases_the_slot() {
     assert_eq!(names, ["queue", "take", "release"]);
     assert_eq!(journalled[2]["status"], 127);
 
-    let next = case.run(&run_words(&[], &[FAKE_TOOL, "exit", "0"]));
+    let next = case.run(&run_words("out.log", &[], &[FAKE_TOOL, "exit", "0"]));
 
     assert_eq!(next.code, Some(0), "{next:?}");
     assert_eq!(next.stderr, "", "the slot was released, not left held: {next:?}");
@@ -177,7 +174,7 @@ fn a_refused_batch_word_exits_2_before_queueing() {
     let case = Case::new("a_refused_batch_word_exits_2_before_queueing");
     let shim = write_shim(&case);
 
-    let outcome = case.run(&run_words(&[], &[&shim, "%PATH%"]));
+    let outcome = case.run(&run_words("out.log", &[], &[&shim, "%PATH%"]));
 
     assert_eq!(outcome.code, Some(2), "{outcome:?}");
     assert_eq!(outcome.stdout, "");
@@ -200,7 +197,7 @@ fn the_build_server_environment_reaches_the_command() {
         "env",
         "GATE_STATE_DIR",
     ];
-    let running = case.start(&run_words(&[], &command));
+    let running = case.start(&run_words("out.log", &[], &command));
     let pid = running.id();
 
     let outcome = running.finish();
@@ -224,7 +221,7 @@ fn percent_forms_reach_a_program_untouched_and_a_batch_file_refuses_them() {
     let shim = write_shim(&case);
     let mut command = vec![FAKE_TOOL, "argv"];
     command.extend(PERCENT_WORDS);
-    let mut gate = case.gate(&run_words(&[], &command));
+    let mut gate = case.gate(&run_words("out.log", &[], &command));
     gate.env("VAR", "abcdef");
 
     let outcome = finish(gate);
@@ -232,7 +229,7 @@ fn percent_forms_reach_a_program_untouched_and_a_batch_file_refuses_them() {
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert!(log_bytes(&case).starts_with(&argv_output(&PERCENT_WORDS)), "{}", log_text(&case));
     for word in PERCENT_WORDS {
-        let mut gate = case.gate(&run_words(&[], &[&shim, word]));
+        let mut gate = case.gate(&run_words("out.log", &[], &[&shim, word]));
         gate.env("VAR", "abcdef");
 
         let refused = finish(gate);
@@ -253,7 +250,7 @@ fn quoted_spaced_and_non_ascii_words_reach_the_command_byte_for_byte() {
     through_cmd.extend(QUOTED_WORDS);
 
     for command in [direct, through_cmd] {
-        let outcome = case.run(&run_words(&[], &command));
+        let outcome = case.run(&run_words("out.log", &[], &command));
 
         assert_eq!(outcome.code, Some(0), "{}: {outcome:?}", command[0]);
         let bytes = log_bytes(&case);
@@ -271,7 +268,7 @@ fn quoted_spaced_and_non_ascii_words_reach_the_command_byte_for_byte() {
 fn invalid_utf8_keeps_its_bytes_in_the_log_and_prints_as_replacement_characters() {
     let case = Case::new("invalid_utf8_keeps_its_bytes_in_the_log_and_prints_as_replacement_characters");
 
-    let outcome = case.run(&run_words(&[], &[FAKE_TOOL, "bytes", "6f6b20fffe206261640a"]));
+    let outcome = case.run(&run_words("out.log", &[], &[FAKE_TOOL, "bytes", "6f6b20fffe206261640a"]));
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert!(log_bytes(&case).starts_with(b"ok \xff\xfe bad\n"), "{:?}", log_bytes(&case));
@@ -287,28 +284,20 @@ fn a_takeover_line_follows_the_command_output_in_the_log() {
     let case = Case::new("a_takeover_line_follows_the_command_output_in_the_log");
     write_counts(&case.root(), ONE_LIGHT);
     let name = StateRoot::new(&shown(&case.root()), None).object_name(KernelObject::LightSlot(0));
-    let go = shown(&case.root().join("go"));
-    let held = [
-        "run",
-        "--slot",
-        "light",
-        "--timeout",
-        "5",
-        "--log",
-        "held.log",
-        "--test-journal-run",
-        "0",
-        "--test-hold-until",
-        &go,
-        "--",
-        FAKE_TOOL,
-    ];
-    let holder = case.start(&held);
+    let go = shown(&case.folder().join("go"));
+    let held_log = case.folder().join("held.log");
+    let holder = case.start(&run_words("held.log", &[], &[FAKE_TOOL, "out", "holding", "wait", &go]));
     wait_for_journal_line(&case.root(), &format!(r#""event":"take","pid":{},"#, holder.id()));
-    wait_for_file(&case.root().join("slots").join("gate-light-slot-0.json"));
+    wait_until("the holder's command writing its log", || {
+        fs::read(&held_log).is_ok_and(|bytes| bytes.starts_with(b"holding\n"))
+    });
     holder.kill();
 
-    let outcome = case.run(&run_words(&[], &[FAKE_TOOL, "out", "the command's output", "exit", "0"]));
+    let outcome = case.run(&run_words("out.log", &[], &[FAKE_TOOL, "out", "the command's output", "exit", "0"]));
+    // The killed gate's command is let go, and every handle on its log seen closed, before any assertion, so none is
+    // left waiting.
+    fs::write(&go, "").expect("the go file can be written");
+    wait_until_closed(&held_log);
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     let line = format!("gate: took {name}, which a killed gate had left held\n");
@@ -320,7 +309,7 @@ fn an_exit_code_above_255_and_a_negative_one_are_passed_through_whole() {
     let case = Case::new("an_exit_code_above_255_and_a_negative_one_are_passed_through_whole");
 
     for (status, code) in [("300", 300), ("-1", -1)] {
-        let outcome = case.run(&run_words(&[], &[FAKE_TOOL, "exit", status]));
+        let outcome = case.run(&run_words("out.log", &[], &[FAKE_TOOL, "exit", status]));
 
         assert_eq!(outcome.code, Some(code), "{outcome:?}");
         let failed = format!("gate: FAILED (status {code}). Full output: {}\n", shown(&log_path(&case)));
@@ -333,6 +322,7 @@ fn a_marker_after_a_lone_carriage_return_is_a_line_of_its_own() {
     let case = Case::new("a_marker_after_a_lone_carriage_return_is_a_line_of_its_own");
 
     let outcome = case.run(&run_words(
+        "out.log",
         &[],
         &[FAKE_TOOL, "bytes", "3530250d4275696c64204641494c45442e0a", "exit", "0"],
     ));
@@ -346,7 +336,7 @@ fn a_batch_file_named_through_a_dot_dot_is_still_a_batch_target() {
     let case = Case::new("a_batch_file_named_through_a_dot_dot_is_still_a_batch_target");
     let named = format!(r"{}\x\..", write_shim(&case));
 
-    let outcome = case.run(&run_words(&[], &[&named, "%CD%"]));
+    let outcome = case.run(&run_words("out.log", &[], &[&named, "%CD%"]));
 
     assert_eq!(outcome.code, Some(2), "{outcome:?}");
     assert_eq!(outcome.stderr, refusal("%CD%"));
@@ -410,8 +400,8 @@ fn a_log_held_by_a_leftover_process_does_not_block_the_next_run() {
     let case = Case::new("a_log_held_by_a_leftover_process_does_not_block_the_next_run");
     let go = shown(&case.folder().join("go"));
 
-    let first = case.run(&run_words(&[], &[FAKE_TOOL, "out", "first", "spawn-wait", &go]));
-    let second = case.run(&run_words(&[], &[FAKE_TOOL, "out", "second"]));
+    let first = case.run(&run_words("out.log", &[], &[FAKE_TOOL, "out", "first", "spawn-wait", &go]));
+    let second = case.run(&run_words("out.log", &[], &[FAKE_TOOL, "out", "second"]));
     // The leftover is let go, and seen to end, before any assertion and before the case folder goes, so no helper is
     // left waiting.
     fs::write(&go, "").expect("the go file can be written");
@@ -476,7 +466,7 @@ fn a_log_inside_the_state_root_is_refused_before_queueing() {
 fn tail_3_prints_the_last_3_lines_before_the_verdict() {
     let case = Case::new("tail_3_prints_the_last_3_lines_before_the_verdict");
 
-    let outcome = case.run(&run_words(&["--tail", "3"], &[FAKE_TOOL, "lines", "10", "line", "exit", "0"]));
+    let outcome = case.run(&run_words("out.log", &["--tail", "3"], &[FAKE_TOOL, "lines", "10", "line", "exit", "0"]));
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     let lines: Vec<&str> = outcome.stdout.lines().collect();
@@ -489,7 +479,7 @@ fn tail_3_prints_the_last_3_lines_before_the_verdict() {
 fn a_failed_run_prints_only_the_first_40_marker_lines() {
     let case = Case::new("a_failed_run_prints_only_the_first_40_marker_lines");
 
-    let outcome = case.run(&run_words(&[], &[FAKE_TOOL, "lines", "45", "error CS", "exit", "3"]));
+    let outcome = case.run(&run_words("out.log", &[], &[FAKE_TOOL, "lines", "45", "error CS", "exit", "3"]));
 
     assert_eq!(outcome.code, Some(3), "{outcome:?}");
     let mut expected: Vec<String> = (1..=40).map(|number| format!("{number}:error CS{number}")).collect();

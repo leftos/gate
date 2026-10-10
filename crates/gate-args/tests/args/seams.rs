@@ -32,8 +32,6 @@ fn seam_flags_parse_with_the_feature() {
             heartbeat_ms: Some(60),
             poll_ms: Some(70),
             stall_ms: Some(80),
-            journal_run: None,
-            hold_until: None,
         }
     );
     assert!(request.print_request);
@@ -81,113 +79,6 @@ fn seam_flags_parse_with_the_feature() {
         problems(&["-Log", "x", "-TimeoutSeconds", "5", "-Slot", "heavy", "--test-poll-ms", "5", "--", "cmd"]),
         ["gate: unknown option --test-poll-ms", "gate: unexpected argument 5"]
     );
-}
-
-#[cfg(feature = "test-seams")]
-#[test]
-fn test_journal_run_parses_with_the_feature() {
-    use crate::support::run_request;
-
-    for (value, status) in [("0", 0), ("3", 3), ("255", 255)] {
-        let request = run_request(&refs(&with(&RUN, &["--test-journal-run", value, "--", "cmd"])));
-        assert_eq!(request.test_seams.journal_run, Some(status), "{value}");
-        assert!(!request.print_request);
-    }
-    let inline = run_request(&refs(&with(&RUN, &["--test-journal-run=7", "--", "cmd"])));
-    assert_eq!(inline.test_seams.journal_run, Some(7));
-    assert_eq!(run_request(&refs(&with(&RUN, &["--", "cmd"]))).test_seams.journal_run, None);
-    assert_eq!(
-        problems(&[
-            "-Log",
-            "x",
-            "-TimeoutSeconds",
-            "5",
-            "-Slot",
-            "heavy",
-            "--test-journal-run",
-            "0",
-            "--",
-            "cmd"
-        ]),
-        ["gate: unknown option --test-journal-run", "gate: unexpected argument 0"],
-        "the compatibility layer does not read it"
-    );
-}
-
-#[cfg(feature = "test-seams")]
-#[test]
-fn test_journal_run_rejects_out_of_range() {
-    for value in ["256", "-1", "1.5", "x", "99999999999999999999"] {
-        assert_eq!(
-            problems(&refs(&with(&RUN, &["--test-journal-run", value, "--", "cmd"]))),
-            [format!("gate: --test-journal-run must be a whole number 0 to 255, got '{value}'")]
-        );
-    }
-}
-
-#[cfg(feature = "test-seams")]
-#[test]
-fn test_journal_run_and_print_request_cannot_be_combined() {
-    assert_eq!(
-        problems(&refs(&with(&RUN, &["--test-journal-run", "0", "--test-print-request", "--", "cmd"]))),
-        ["gate: --test-journal-run and --test-print-request cannot be combined"]
-    );
-}
-
-#[cfg(feature = "test-seams")]
-#[test]
-fn test_hold_until_parses_with_the_feature() {
-    use std::path::PathBuf;
-
-    use crate::support::run_request;
-
-    let spaced = run_request(&refs(&with(
-        &RUN,
-        &["--test-journal-run", "0", "--test-hold-until", r"x\go", "--", "cmd"],
-    )));
-    assert_eq!(spaced.test_seams.hold_until, Some(PathBuf::from(r"x\go")));
-    assert_eq!(spaced.test_seams.journal_run, Some(0));
-    let inline = run_request(&refs(&with(&RUN, &["--test-hold-until=go", "--test-journal-run=0", "--", "cmd"])));
-    assert_eq!(inline.test_seams.hold_until, Some(PathBuf::from("go")), "the value is taken as given");
-    assert_eq!(
-        run_request(&refs(&with(&RUN, &["--test-journal-run", "0", "--", "cmd"])))
-            .test_seams
-            .hold_until,
-        None
-    );
-}
-
-#[cfg(feature = "test-seams")]
-#[test]
-fn test_hold_until_needs_journal_run() {
-    assert_eq!(
-        problems(&refs(&with(&RUN, &["--test-hold-until", "go", "--", "cmd"]))),
-        ["gate: --test-hold-until needs --test-journal-run"]
-    );
-}
-
-#[cfg(feature = "test-seams")]
-#[test]
-fn test_hold_until_with_an_invalid_journal_run_says_only_the_value_problem() {
-    assert_eq!(
-        problems(&refs(&with(&RUN, &["--test-journal-run", "300", "--test-hold-until", "go", "--", "cmd"]))),
-        ["gate: --test-journal-run must be a whole number 0 to 255, got '300'"]
-    );
-}
-
-#[cfg(feature = "test-seams")]
-#[test]
-fn test_hold_until_rejects_an_empty_path() {
-    for words in [
-        ["--test-journal-run", "0", "--test-hold-until=", "--", "cmd"].as_slice(),
-        ["--test-journal-run", "0", "--test-hold-until", "--", "cmd"].as_slice(),
-    ] {
-        assert_eq!(
-            problems(&refs(&with(&RUN, words))),
-            ["gate: --test-hold-until needs a value"],
-            "{words:?}"
-        );
-    }
 }
 
 #[cfg(not(feature = "test-seams"))]

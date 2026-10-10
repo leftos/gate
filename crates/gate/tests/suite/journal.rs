@@ -1,7 +1,8 @@
-//! The journal a run writes through `--test-journal-run`: its v1 lines in order with their verdict, the state root's own
-//! journal mutex, and the rollover and archive while other gates append.
+//! The journal a run writes: its v1 lines in order with their verdict and quoted command, the state root's own journal
+//! mutex, and the rollover and archive while other gates append.
 
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::Path;
@@ -9,30 +10,21 @@ use std::thread;
 use std::time::Duration;
 
 use flate2::read::GzDecoder;
+use gate_args::command_text;
 use gate_state::{JOURNAL_CAP_BYTES, KernelObject, StateRoot};
 use gate_win32::NamedMutex;
 use serde_json::Value;
 
-use crate::support::{Case, Outcome, assert_in_order, finish, shown, wait_for_file, wait_for_journal_line};
+use crate::support::{Case, FAKE_TOOL, Outcome, assert_in_order, finish, run_words, shown, wait_for_file, wait_for_journal_line};
 
-/// The words of a light run that journals itself and exits with `status`, the command after `--` last.
-fn journal_run(status: &'static str) -> Vec<&'static str> {
-    vec![
-        "run",
-        "--slot",
-        "light",
-        "--timeout",
-        "5",
-        "--log",
-        "out.log",
-        "--test-journal-run",
-        status,
-        "--",
-        "cmd",
-        "/c",
-        "exit",
-        status,
-    ]
+/// The words of a light run logging to `log` whose command exits with `status`.
+fn exiting<'a>(log: &'a str, status: &'a str) -> Vec<&'a str> {
+    run_words(log, &[], &[FAKE_TOOL, "exit", status])
+}
+
+/// The journal's `command` text of `words`, each quoted as `Format-CommandText` quotes it.
+fn quoted(words: &[&str]) -> String {
+    command_text(&words.iter().map(OsString::from).collect::<Vec<_>>())
 }
 
 /// JSON lines of `total` bytes in all, each ending in a line feed, every thousandth a `release` and the rest `queue`: a
@@ -117,12 +109,13 @@ fn assert_quiet(outcome: &Outcome, code: i32) {
 }
 
 #[test]
-fn journal_run_writes_queue_take_release_in_order() {
-    let case = Case::new("journal_run_writes_queue_take_release_in_order");
+fn a_run_journals_queue_take_release_in_order() {
+    let case = Case::new("a_run_journals_queue_take_release_in_order");
     let slot = StateRoot::new(&shown(&case.root()), None).object_name(KernelObject::LightSlot(0));
     let slots = format!("\"slots\":[{}],", Value::from(slot.as_str()));
+    let command = quoted(&[FAKE_TOOL, "exit", "0"]);
 
-    let outcome = case.run(&journal_run("0"));
+    let outcome = case.run(&exiting("out.log", "0"));
 
     assert_quiet(&outcome, 0);
     let journal = fs::read_to_string(case.root().join("events.jsonl")).expect("the journal was written");
@@ -153,7 +146,7 @@ fn journal_run_writes_queue_take_release_in_order() {
                 &lines[0]["pid"],
                 Some("light"),
                 Some(shown(&case.folder()).as_str()),
-                Some("cmd /c exit 0")
+                Some(command.as_str())
             )
         );
     }
@@ -164,32 +157,14 @@ fn journal_run_writes_queue_take_release_in_order() {
 
 #[test]
 fn journal_command_is_quoted_like_format_command_text() {
-    // `Format-CommandText` of these words, as the PowerShell gate writes it.
-    const QUOTED: &str = r#"cmd /c echo "a b" "x\"y""#;
     let case = Case::new("journal_command_is_quoted_like_format_command_text");
-    let go = case.root().join("go");
+    let go = case.folder().join("go");
     let go_word = shown(&go);
-    let words = [
-        "run",
-        "--slot",
-        "light",
-        "--timeout",
-        "5",
-        "--log",
-        "out.log",
-        "--test-journal-run",
-        "0",
-        "--test-hold-until",
-        &go_word,
-        "--",
-        "cmd",
-        "/c",
-        "echo",
-        "a b",
-        "x\"y",
-    ];
+    // `Format-CommandText` of these words, as the PowerShell gate writes it: the fake tool's path and the go file's are
+    // quoted the same way, so only their spelling is built.
+    let expected = format!(r#"{} argv "a b" "x\"y""#, quoted(&[FAKE_TOOL, "wait", &go_word]));
 
-    let running = case.start(&words);
+    let running = case.start(&run_words("out.log", &[], &[FAKE_TOOL, "wait", &go_word, "argv", "a b", "x\"y"]));
     // The take is journalled before the claim is written; the claim is complete once it exists (written by rename).
     let claim_path = case.root().join("slots").join("gate-light-slot-0.json");
     wait_for_journal_line(&case.root(), &format!(r#""event":"take","pid":{},"#, running.id()));
@@ -199,7 +174,7 @@ fn journal_command_is_quoted_like_format_command_text() {
     let outcome = running.finish();
 
     assert_quiet(&outcome, 0);
-    assert_eq!(parsed(&claim)["command"].as_str(), Some(QUOTED), "the claim: {claim}");
+    assert_eq!(parsed(&claim)["command"].as_str(), Some(expected.as_str()), "the claim: {claim}");
     let lines = lines_of(&case.root().join("events.jsonl"));
     let commands: Vec<(Value, Value)> = lines
         .iter()
@@ -210,18 +185,22 @@ fn journal_command_is_quoted_like_format_command_text() {
         .collect();
     assert_eq!(
         commands,
-        ["queue", "take", "release"].map(|event| (Value::from(event), Value::from(QUOTED))),
+        ["queue", "take", "release"].map(|event| (Value::from(event), Value::from(expected.as_str()))),
         "every journal line carries the quoted command"
     );
 }
 
 #[test]
-fn journal_run_with_status_3_is_failed_and_exits_3() {
-    let case = Case::new("journal_run_with_status_3_is_failed_and_exits_3");
+fn a_run_with_status_3_is_journalled_failed_and_exits_3() {
+    let case = Case::new("a_run_with_status_3_is_journalled_failed_and_exits_3");
 
-    let outcome = case.run(&journal_run("3"));
+    let outcome = case.run(&exiting("out.log", "3"));
 
-    assert_quiet(&outcome, 3);
+    assert_eq!(outcome.code, Some(3), "{outcome:?}");
+    assert_eq!(
+        outcome.stderr,
+        format!("gate: FAILED (status 3). Full output: {}\n", shown(&case.folder().join("out.log")))
+    );
     let lines = lines_of(&case.root().join("events.jsonl"));
     let release = parsed(lines.last().expect("the journal has lines"));
     assert_eq!(
@@ -238,7 +217,7 @@ fn journal_lines_carry_the_case_root_mutex_not_the_machine_s() {
     let mutex = NamedMutex::open(&name).expect("the case root's journal mutex opens");
     let held = mutex.acquire(Duration::from_secs(5)).expect("the case root's journal mutex is free");
 
-    let blocked = case.run(&journal_run("0"));
+    let blocked = case.run(&exiting("out.log", "0"));
     drop(held);
 
     assert_eq!(blocked.code, Some(0), "the gate runs on without its journal: {blocked:?}");
@@ -251,7 +230,7 @@ fn journal_lines_carry_the_case_root_mutex_not_the_machine_s() {
         "the gate waits on the case root's mutex, and says so once for its three lines"
     );
     assert!(!case.root().join("events.jsonl").exists());
-    assert_quiet(&case.run(&journal_run("0")), 0);
+    assert_quiet(&case.run(&exiting("out.log", "0")), 0);
     assert_eq!(lines_of(&case.root().join("events.jsonl")).len(), 3);
 }
 
@@ -267,7 +246,9 @@ fn rollover_while_another_gate_appends_loses_no_line() {
         "a handful of seeded release lines: {}",
         seeded_releases.len()
     );
-    let commands: Vec<_> = (0..GATES).map(|_| case.gate(&journal_run("0"))).collect();
+    // Each gate logs to a file of its own, since a gate refuses a log another gate is writing.
+    let logs: Vec<String> = (0..GATES).map(|number| format!("out-{number}.log")).collect();
+    let commands: Vec<_> = logs.iter().map(|log| case.gate(&exiting(log, "0"))).collect();
 
     let runs: Vec<_> = commands.into_iter().map(|command| thread::spawn(move || finish(command))).collect();
     let outcomes: Vec<Outcome> = runs.into_iter().map(|run| run.join().expect("a gate's runner ends")).collect();
@@ -308,7 +289,7 @@ fn archive_is_written_on_roll() {
     let case = Case::new("archive_is_written_on_roll");
     let seed = seed_near_cap(&case);
 
-    let outcome = case.run(&journal_run("0"));
+    let outcome = case.run(&exiting("out.log", "0"));
 
     assert_quiet(&outcome, 0);
     let rolled = lines_of(&case.root().join("events.1.jsonl"));

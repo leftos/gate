@@ -1,4 +1,4 @@
-//! The slot a seam run takes: waiters of one kind in ticket order, a killed waiter's ticket cleared, the claim and the
+//! The slot a run takes: waiters of one kind in ticket order, a killed waiter's ticket cleared, the claim and the
 //! hashed names of a test root, a slot taken over from a killed holder (GATE-30), and the counts and wait lines.
 
 use std::fs;
@@ -9,38 +9,54 @@ use gate_state::{KernelObject, StateRoot};
 use gate_win32::{NamedMutex, mutex_exists};
 use serde_json::Value;
 
-use crate::support::{Case, Running, assert_in_order, shown, wait_for_file, wait_for_journal_line, wait_until, write_counts};
+use crate::support::{
+    Case, FAKE_TOOL, Outcome, Running, assert_in_order, run_words, shown, wait_for_file, wait_for_journal_line, wait_until, wait_until_closed,
+    write_counts,
+};
 
 /// A light pool of one slot.
 const ONE_LIGHT: &str = r#"{"v":1,"light":1}"#;
+/// What a held run's command writes to its log once it runs.
+const HOLDING: &str = "holding";
 
-/// The words of a light seam run that exits 0, holding until `go` exists when there is one, `extra` before `--`.
-fn seam_words(go: Option<&Path>, extra: &[&str]) -> Vec<String> {
-    let mut words: Vec<String> = ["run", "--slot", "light", "--timeout", "5", "--log", "out.log"].map(str::to_owned).into();
-    words.extend(extra.iter().map(|word| (*word).to_owned()));
-    words.extend(["--test-journal-run".to_owned(), "0".to_owned()]);
-    if let Some(go) = go {
-        words.extend(["--test-hold-until".to_owned(), shown(go)]);
+/// Starts a light run logging to `log`, `extra` before `--`, whose command says it is holding, waits for `go` when
+/// there is one, and exits 0.
+fn start(case: &Case, log: &str, go: Option<&Path>, extra: &[&str]) -> Running {
+    let go = go.map(shown);
+    let mut command = vec![FAKE_TOOL, "out", HOLDING];
+    if let Some(go) = &go {
+        command.extend(["wait", go.as_str()]);
     }
-    words.extend(["--", "cmd", "/c", "exit", "0"].map(str::to_owned));
-    words
+    case.start(&run_words(log, extra, &command))
 }
 
-fn start(case: &Case, go: Option<&Path>, extra: &[&str]) -> Running {
-    let words = seam_words(go, extra);
-    let refs: Vec<&str> = words.iter().map(String::as_str).collect();
-    case.start(&refs)
+/// Runs a light run logging to `out.log` whose command exits 0 at once.
+fn run_once(case: &Case) -> Outcome {
+    case.run(&run_words("out.log", &[], &[FAKE_TOOL, "exit", "0"]))
 }
 
-/// Starts a gate that takes the slot and holds it until `go` exists, and returns once it has taken it.
-fn holder(case: &Case, go: &Path) -> Running {
-    let running = start(case, Some(go), &[]);
+/// Starts a gate logging to `log` that takes the slot and holds it until `go` exists, and returns once it has taken it
+/// and its command runs.
+fn holder(case: &Case, log: &str, go: &Path) -> Running {
+    let running = start(case, log, Some(go), &[]);
     wait_for_journal_line(&case.root(), &take_needle(running.id()));
+    let path = case.folder().join(log);
+    let started = format!("{HOLDING}\n");
+    wait_until("the holder's command writing its log", || {
+        fs::read(&path).is_ok_and(|bytes| bytes.starts_with(started.as_bytes()))
+    });
     running
 }
 
 fn let_go(go: &Path) {
     fs::write(go, "").expect("the go file can be made");
+}
+
+/// Lets go the command a killed holder left running, which logs to `log`, and returns once every handle on that log is
+/// closed.
+fn end_orphan(case: &Case, go: &Path, log: &str) {
+    let_go(go);
+    wait_until_closed(&case.folder().join(log));
 }
 
 /// What a journal line of the take of the gate `pid` contains.
@@ -94,11 +110,11 @@ fn assert_passed(running: Running) {
 fn waiters_of_one_kind_take_a_freed_slot_in_ticket_order() {
     let case = Case::new("waiters_of_one_kind_take_a_freed_slot_in_ticket_order");
     write_counts(&case.root(), ONE_LIGHT);
-    let (go_h, go_1, go_2) = (case.root().join("go-h"), case.root().join("go-1"), case.root().join("go-2"));
-    let holding = holder(&case, &go_h);
-    let first = start(&case, Some(&go_1), &[]);
+    let (go_h, go_1, go_2) = (case.folder().join("go-h"), case.folder().join("go-1"), case.folder().join("go-2"));
+    let holding = holder(&case, "holder.log", &go_h);
+    let first = start(&case, "first.log", Some(&go_1), &[]);
     first.wait_for_stderr("gate: waiting for a light slot (1 busy)");
-    let mut second = start(&case, Some(&go_2), &[]);
+    let mut second = start(&case, "second.log", Some(&go_2), &[]);
     second.wait_for_stderr("gate: waiting for a light slot (");
 
     let_go(&go_h);
@@ -123,15 +139,15 @@ fn waiters_of_one_kind_take_a_freed_slot_in_ticket_order() {
 fn a_gate_killed_while_waiting_leaves_no_ticket_after_the_poll() {
     let case = Case::new("a_gate_killed_while_waiting_leaves_no_ticket_after_the_poll");
     write_counts(&case.root(), ONE_LIGHT);
-    let go_h = case.root().join("go-h");
-    let holding = holder(&case, &go_h);
-    let killed = start(&case, None, &[]);
+    let go_h = case.folder().join("go-h");
+    let holding = holder(&case, "holder.log", &go_h);
+    let killed = start(&case, "killed.log", None, &[]);
     killed.wait_for_stderr("gate: waiting for a light slot (");
     let pid = killed.id();
     assert!(has_ticket(&case, pid), "the waiter queued with a ticket");
     killed.kill();
 
-    let waiter = start(&case, None, &["--test-poll-ms", "50"]);
+    let waiter = start(&case, "waiter.log", None, &["--test-poll-ms", "50"]);
     wait_until("the killed waiter's ticket going", || !has_ticket(&case, pid));
     let_go(&go_h);
 
@@ -145,8 +161,9 @@ fn a_gate_killed_while_waiting_leaves_no_ticket_after_the_poll() {
 fn simultaneous_arrivals_with_free_slots_do_not_wait() {
     let case = Case::new("simultaneous_arrivals_with_free_slots_do_not_wait");
     write_counts(&case.root(), r#"{"v":1,"light":3}"#);
-    let gos: Vec<PathBuf> = (1..=3).map(|number| case.root().join(format!("go-{number}"))).collect();
-    let runs: Vec<Running> = gos.iter().map(|go| start(&case, Some(go), &[])).collect();
+    let gos: Vec<PathBuf> = (1..=3).map(|number| case.folder().join(format!("go-{number}"))).collect();
+    let logs: Vec<String> = (1..=3).map(|number| format!("out-{number}.log")).collect();
+    let runs: Vec<Running> = gos.iter().zip(&logs).map(|(go, log)| start(&case, log, Some(go), &[])).collect();
 
     for running in &runs {
         wait_for_journal_line(&case.root(), &take_needle(running.id()));
@@ -169,8 +186,8 @@ fn simultaneous_arrivals_with_free_slots_do_not_wait() {
 fn a_holder_whose_ticket_was_not_deleted_does_not_block_the_queue() {
     let case = Case::new("a_holder_whose_ticket_was_not_deleted_does_not_block_the_queue");
     write_counts(&case.root(), r#"{"v":1,"light":2}"#);
-    let go_h = case.root().join("go-h");
-    let holding = holder(&case, &go_h);
+    let go_h = case.folder().join("go-h");
+    let holding = holder(&case, "holder.log", &go_h);
     wait_for_file(&claim_path(&case));
     let claim = read_claim(&claim_path(&case)).expect("the holder's claim reads");
     let start_ms = u64::try_from(claim.process_start.as_millisecond()).expect("a gate starts after the epoch");
@@ -185,7 +202,7 @@ fn a_holder_whose_ticket_was_not_deleted_does_not_block_the_queue() {
     };
     write_ticket(&ticket_path(&case.root(), claim.pid, start_ms), &ticket).expect("the holder's ticket can be written back");
 
-    let outcome = case.run(&seam_words(None, &[]).iter().map(String::as_str).collect::<Vec<_>>());
+    let outcome = run_once(&case);
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert!(
@@ -207,8 +224,8 @@ fn a_test_root_names_its_slots_with_its_hash() {
     let hash = root.hash().expect("a case root is not the default root");
     let name = light_slot(&case, 0);
     assert!(name.starts_with(&format!(r"Local\gate-{hash}-")), "{name}");
-    let go = case.root().join("go");
-    let running = start(&case, Some(&go), &[]);
+    let go = case.folder().join("go");
+    let running = start(&case, "out.log", Some(&go), &[]);
     let claim = claim_path(&case);
 
     wait_for_file(&claim);
@@ -228,13 +245,19 @@ fn a_slot_left_by_a_killed_holder_is_journalled_abandoned() {
     let case = Case::new("a_slot_left_by_a_killed_holder_is_journalled_abandoned");
     write_counts(&case.root(), ONE_LIGHT);
     let name = light_slot(&case, 0);
-    let holding = holder(&case, &case.root().join("go"));
+    let go = case.folder().join("go");
+    let holding = holder(&case, "holder.log", &go);
     wait_for_file(&claim_path(&case));
     holding.kill();
-    assert!(claim_path(&case).exists(), "a killed holder leaves its claim");
+    // Read before the next run takes the slot over; asserted once the killed gate's command is gone.
+    let claim_left = claim_path(&case).exists();
 
-    let outcome = case.run(&seam_words(None, &[]).iter().map(String::as_str).collect::<Vec<_>>());
+    let outcome = run_once(&case);
+    // The killed gate's command is let go, and every handle on its log seen closed, before any assertion, so none is
+    // left waiting.
+    end_orphan(&case, &go, "holder.log");
 
+    assert!(claim_left, "a killed holder leaves its claim");
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     let take = takes(&case).pop().expect("the gate journalled its take");
     assert_eq!(take["abandoned"], Value::from(vec![name.as_str()]), "{take}");
@@ -247,13 +270,15 @@ fn an_abandoned_mutex_is_journalled_too() {
     let case = Case::new("an_abandoned_mutex_is_journalled_too");
     write_counts(&case.root(), ONE_LIGHT);
     let name = light_slot(&case, 0);
-    let holding = holder(&case, &case.root().join("go"));
+    let go = case.folder().join("go");
+    let holding = holder(&case, "holder.log", &go);
     wait_for_file(&claim_path(&case));
     let kept = NamedMutex::open(&name).expect("the slot's mutex opens beside its holder");
     holding.kill();
 
-    let outcome = case.run(&seam_words(None, &[]).iter().map(String::as_str).collect::<Vec<_>>());
+    let outcome = run_once(&case);
     drop(kept);
+    end_orphan(&case, &go, "holder.log");
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     let take = takes(&case).pop().expect("the gate journalled its take");
@@ -266,9 +291,9 @@ fn an_abandoned_mutex_is_journalled_too() {
 fn a_count_raised_while_waiting_applies_on_the_next_poll() {
     let case = Case::new("a_count_raised_while_waiting_applies_on_the_next_poll");
     write_counts(&case.root(), ONE_LIGHT);
-    let go_h = case.root().join("go-h");
-    let holding = holder(&case, &go_h);
-    let waiter = start(&case, None, &["--test-poll-ms", "50"]);
+    let go_h = case.folder().join("go-h");
+    let holding = holder(&case, "holder.log", &go_h);
+    let waiter = start(&case, "waiter.log", None, &["--test-poll-ms", "50"]);
     waiter.wait_for_stderr("gate: waiting for a light slot (");
 
     write_counts(&case.root(), r#"{"v":1,"light":2}"#);
@@ -289,9 +314,9 @@ fn a_count_raised_while_waiting_applies_on_the_next_poll() {
 fn a_waiter_says_it_still_waits() {
     let case = Case::new("a_waiter_says_it_still_waits");
     write_counts(&case.root(), ONE_LIGHT);
-    let go_h = case.root().join("go-h");
-    let holding = holder(&case, &go_h);
-    let waiter = start(&case, None, &["--test-heartbeat-ms", "100"]);
+    let go_h = case.folder().join("go-h");
+    let holding = holder(&case, "holder.log", &go_h);
+    let waiter = start(&case, "waiter.log", None, &["--test-heartbeat-ms", "100"]);
 
     waiter.wait_for_stderr("gate: still waiting for a light slot (");
 
@@ -305,7 +330,7 @@ fn a_counts_file_without_v_is_said_once() {
     let case = Case::new("a_counts_file_without_v_is_said_once");
     write_counts(&case.root(), r#"{"light":1}"#);
 
-    let outcome = case.run(&seam_words(None, &[]).iter().map(String::as_str).collect::<Vec<_>>());
+    let outcome = run_once(&case);
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     let line = format!(

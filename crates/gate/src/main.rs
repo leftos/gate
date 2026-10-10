@@ -1,8 +1,6 @@
 //! `gate.exe`: runs a heavy command under a machine-wide queue of CPU slots. This build reads its command line,
 //! resolves the state root and the log path, answers `--version` and `--help`, and runs a command under a slot in a
-//! job of its own, saying each line as it goes; the watchdog and stopping a tree are not built yet. A `test-seams`
-//! build also journals a run it does not launch, queueing for, taking and releasing a real slot
-//! (`--test-journal-run`).
+//! job of its own, saying each line as it goes; the watchdog and stopping a tree are not built yet.
 
 mod acquire;
 mod answer;
@@ -13,7 +11,6 @@ mod log;
 mod request_json;
 mod resolve;
 mod run;
-mod seam;
 mod slots;
 mod wait;
 

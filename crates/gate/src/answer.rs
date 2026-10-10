@@ -5,8 +5,8 @@ use std::ffi::OsString;
 use gate_args::{Invocation, Problem, RunRequest, StopRequest, USAGE, parse};
 
 use crate::console::Console;
+use crate::request_json;
 use crate::resolve::{self, Environment};
-use crate::{request_json, seam};
 
 /// The status of a usage error: a missing, unknown or invalid input, or a word the command cannot take.
 pub(crate) const USAGE_STATUS: u8 = 2;
@@ -50,10 +50,7 @@ fn run(request: &RunRequest, environment: &Environment, console: &mut Console) -
             console.out(&request_json::run(request, &log, &root));
             0
         }
-        Ok((log, root)) => match request.test_seams.journal_run {
-            Some(status) => u32::from(seam::seam_run(request, &log, &root, status, console)),
-            None => crate::run::run(request, &log, &root, console),
-        },
+        Ok((log, root)) => crate::run::run(request, &log, &root, console),
     }
 }
 

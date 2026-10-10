@@ -51,19 +51,6 @@ pub(crate) fn zero_or_above(option: &str, value: &str) -> Result<u64, Problem> {
     }
 }
 
-/// An exit status: a whole number from 0 to 255.
-#[cfg(feature = "test-seams")]
-pub(crate) fn status(option: &str, value: &str) -> Result<u8, Problem> {
-    match whole(value) {
-        Whole::Number(number) => u8::try_from(number).ok(),
-        Whole::TooLarge | Whole::Invalid => None,
-    }
-    .ok_or_else(|| Problem::NotAStatus {
-        option: option.to_owned(),
-        value: value.to_owned(),
-    })
-}
-
 pub(crate) fn slot(option: &str, value: &str) -> Result<Slot, Problem> {
     [Slot::Heavy, Slot::Light, Slot::Critical]
         .into_iter()
