@@ -101,6 +101,27 @@ fn two_roots_give_two_hashes() {
 }
 
 #[test]
+fn claim_files_drop_local_and_the_root_hash() {
+    let rows = [
+        (KernelObject::HeavySlot(2), "gate-slot-2.json"),
+        (KernelObject::LightSlot(0), "gate-light-slot-0.json"),
+        (KernelObject::RemoteSlot(1), "gate-remote-slot-1.json"),
+        (KernelObject::Critical, "gate-critical.json"),
+    ];
+    for (object, file_name) in rows {
+        assert_eq!(object.claim_file_name().as_deref(), Some(file_name), "{object:?}");
+    }
+
+    for object in [
+        KernelObject::Journal,
+        KernelObject::WakeEvent { pid: 4242, start_ms: 1 },
+        KernelObject::Job { gate_pid: 4242 },
+    ] {
+        assert_eq!(object.claim_file_name(), None, "{object:?} has no claim");
+    }
+}
+
+#[test]
 fn object_names_match_the_design_table() {
     let default = root(DEFAULT_ROOT);
     let other = root(r"C:\gate-test\root");

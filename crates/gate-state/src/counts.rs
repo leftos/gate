@@ -2,6 +2,7 @@
 //! writing it.
 
 use std::ffi::OsString;
+use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -71,23 +72,12 @@ pub(crate) struct PoolCount {
     pub problem: Option<String>,
 }
 
-/// The default count of a kind on a machine with `processors` logical processors: one slot per `threads` of all but
-/// one processor, and at least one.
-fn default_count(kind: SlotKind, processors: usize) -> u32 {
-    let slots = processors.saturating_sub(1) / kind.threads();
-    u32::try_from(slots).unwrap_or(u32::MAX).max(1)
-}
-
 pub(crate) fn pool_count(file: &CountsFile, path: &Path, kind: SlotKind, processors: usize) -> PoolCount {
-    let default = default_count(kind, processors);
+    let default = kind.default_count(processors);
     let ignored = |reason: &str| PoolCount {
         default,
         set: None,
-        problem: Some(format!(
-            "gate: ignored {}: {reason}; using {default} {} slots",
-            path.display(),
-            kind.as_str()
-        )),
+        problem: Some(ignored_line(path, &reason, default, kind)),
     };
     let counts = match file {
         Ok(Some(counts)) => counts,
@@ -119,6 +109,12 @@ pub(crate) fn pool_count(file: &CountsFile, path: &Path, kind: SlotKind, process
             format_count_value(value)
         )),
     }
+}
+
+/// The line the gate says when it ignores the counts file or one kind's value in it and uses `count` slots of `kind`:
+/// `gate: ignored <path>: <reason>; using <count> <kind> slots`.
+pub(crate) fn ignored_line(path: &Path, reason: &dyn fmt::Display, count: u32, kind: SlotKind) -> String {
+    format!("gate: ignored {}: {reason}; using {count} {} slots", path.display(), kind.as_str())
 }
 
 /// The value of an object's key, matched without regard to ASCII case as the gate's JSON reader does.
@@ -155,29 +151,41 @@ pub fn write_slot_counts(path: &Path, counts: &SlotCounts) -> Result<(), WriteEr
         path: path.to_path_buf(),
         source,
     };
-    let temp = if counts.is_empty() {
+    if counts.is_empty() {
         if !path.exists() {
             return Ok(());
         }
-        None
-    } else {
-        if let Some(folder) = path.parent()
-            && !folder.as_os_str().is_empty()
-        {
-            fs::create_dir_all(folder).map_err(fail)?;
-        }
-        let temp = temp_path(path);
-        let text = serde_json::to_string(counts).map_err(|error| fail(io::Error::other(error)))?;
-        fs::write(&temp, text).map_err(fail)?;
-        Some(temp)
-    };
+        return with_retry(|| remove_if_present(path)).map_err(fail);
+    }
+    let text = serde_json::to_string(counts).map_err(|error| fail(io::Error::other(error)))?;
+    write_replacing(path, &text).map_err(fail)
+}
+
+/// Writes `text` to `path` beside it first, as `<path>.<pid>.tmp`, then moves that over `path`, so a reader never sees
+/// a torn file; a missing parent folder is made. A reader holding the file blocks the move for that moment, so the move
+/// is tried up to ten times, 100 ms apart.
+pub(crate) fn write_replacing(path: &Path, text: &str) -> io::Result<()> {
+    if let Some(folder) = path.parent()
+        && !folder.as_os_str().is_empty()
+    {
+        fs::create_dir_all(folder)?;
+    }
+    let temp = temp_path(path);
+    fs::write(&temp, text)?;
+    let moved = with_retry(|| fs::rename(&temp, path));
+    if moved.is_err() {
+        // The write has failed and says so; a file left beside the target is overwritten by this process's next write.
+        let _ = fs::remove_file(&temp);
+    }
+    moved
+}
+
+/// Runs `operation` until it succeeds, up to [`WRITE_ATTEMPTS`] times, [`WRITE_RETRY_DELAY`] apart, returning the
+/// last error when every try fails.
+fn with_retry(mut operation: impl FnMut() -> io::Result<()>) -> io::Result<()> {
     let mut failure = io::Error::other("no attempt was made");
     for attempt in 1..=WRITE_ATTEMPTS {
-        let result = match &temp {
-            Some(temp) => fs::rename(temp, path),
-            None => remove_if_present(path),
-        };
-        match result {
+        match operation() {
             Ok(()) => return Ok(()),
             Err(error) => failure = error,
         }
@@ -185,11 +193,7 @@ pub fn write_slot_counts(path: &Path, counts: &SlotCounts) -> Result<(), WriteEr
             thread::sleep(WRITE_RETRY_DELAY);
         }
     }
-    if let Some(temp) = &temp {
-        // The write has failed and says so; a file left beside the counts is overwritten by this process's next write.
-        let _ = fs::remove_file(temp);
-    }
-    Err(fail(failure))
+    Err(failure)
 }
 
 /// Sets or unsets one kind's count in the counts file, keeping the other kind's valid value.

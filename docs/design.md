@@ -227,10 +227,13 @@ The environment carries one more name: `GATE_SLOT_HELD`, the slot marker ([Criti
 
 - The claim, ticket, counts and journal files are JSON with the PowerShell gate's field names (kept, L1, Q1, S2, J1), each object carrying `v`, the format version, as a whole number. Every format starts at `v: 1`.
 - Machine times are Unix epoch milliseconds as JSON numbers. Times people read (`time`, `started`, `processStart`) stay ISO 8601 UTC strings ending in `Z`.
-- Files are read as strict JSON (RFC 8259: no comments, no trailing commas, no unquoted keys) with case-sensitive keys. A file with a syntax error, a missing required key, a wrong type, a duplicate key or a `v` the reader does not know is unreadable, and the reader takes the path each format's section names for an unreadable file.
+- Files are read as strict JSON (RFC 8259: no comments, no trailing commas, no unquoted keys) with case-sensitive keys. A file with a syntax error, a byte order mark, bytes that are not UTF-8, a top level that is not an object, a missing required key, a wrong type, a duplicate key at any depth or a `v` that is missing or not the number 1 is unreadable.
 
-  The journal is the exception: its rule is per line ([Journal](#journal)). Unknown keys are ignored, so an optional field is added without a `v` change; a rename, removal, retyping or change of meaning raises `v`.
-- `gate-state` is the one implementation of every format; `gate.exe` and ops-tower both use it, and its fixtures (`crates/gate-state/tests/state/fixtures/`) are the reference examples.
+  The reader takes the path each format's section names for an unreadable file. The journal is the exception: its rule is per line ([Journal](#journal)). Unknown keys are ignored, so an optional field is added without a `v` change; a rename, removal, retyping or change of meaning raises `v`.
+- The reason a file is unreadable is one of `not JSON: <message>`, `not JSON: not UTF-8`, `duplicate key "<key>"`, `missing key "v"`, `unknown format v <value>`, `not a JSON object`, the message of the missing key or wrong type, or the io error. It is the `<reason>` of the gate's ignore line.
+- `gate-state` is the one implementation of every format; `gate.exe` and ops-tower both use it, and its fixtures (`crates/gate-state/tests/state/fixtures/`) are the reference examples. The strict rules above are the `gate_state::v1` module's, the formats `gate.exe` writes.
+
+  The crate's other readers (`claims.rs`, `state.rs` and the counts reader beside `v1`) read the PowerShell gate's files leniently, and ops-tower uses them until it moves to the `v1` root.
 - Text is UTF-8 with no BOM and LF line ends.
 
 ### Claim
@@ -248,11 +251,11 @@ The environment carries one more name: `GATE_SLOT_HELD`, the slot marker ([Criti
 | `cwd` | string | the gate's working directory |
 | `command` | string | the command's words, each quoted as for CreateProcess (C4), joined by spaces |
 | `log` | string | the log's full path |
-| `timeoutSeconds` | number | the ceiling |
+| `timeoutSeconds` | number | the ceiling; the writer refuses a value JSON cannot carry (not finite) |
 | `remote`, `host`, `key` | bool, string, string | a remote slot's claim only (L1) |
-| `expected` | object | reserved, optional ([Reserved fields](#reserved-fields)) |
+| `expected` | object | reserved, optional ([Reserved fields](#reserved-fields)); `null` reads as absent, any other non-object is unreadable |
 
-A claim is live while its `pid` runs with that `processStart` (L2). A killed gate leaves its file; the next holder overwrites it and readers treat it as stale. A gate that cannot write its claim says so once and runs on (L1).
+The file name `<name>` is `gate-slot-<i>`, `gate-light-slot-<i>`, `gate-remote-slot-<i>` or `gate-critical`, the same whatever the root: a non-default root's claims sit in that root's own `slots\` folder, so the file name carries no root hash. A claim is live while its `pid` runs with that `processStart` (L2). A killed gate leaves its file; the next holder overwrites it and readers treat it as stale. A gate that cannot write its claim says so once and runs on (L1).
 
 ### Ticket
 
@@ -267,13 +270,17 @@ A claim is live while its `pid` runs with that `processStart` (L2). A killed gat
 | `startTicks` | number | the gate's process start, epoch ms (the field keeps its name) |
 | `holds` | bool | true only for a critical gate that holds the machine |
 | `remote` | bool | present and true only while queued for the remote pool |
-| `expected` | object | reserved, optional |
+| `expected` | object | reserved, optional; `null` reads as absent |
 
-A ticket whose pid is gone or started at another time is ignored and deleted by the first reader. An unreadable ticket is ignored but left in place. ops-tower learns that a gate is waiting from these tickets, read through `gate-state`; it does not scan process command lines.
+Waiters of one kind queue by (`arrived`, `pid`). The ticket reader lists only `*.json` files in `waiting\` (a `*.tmp` file is skipped), and leaves out a ticket deleted between the listing and the read, since a gate that took its slot deletes it.
+
+A ticket whose pid is gone or started at another time is ignored and deleted by the first gate that finds it; the reader itself deletes nothing. An unreadable ticket is ignored but left in place. ops-tower learns that a gate is waiting from these tickets, read through `gate-state`; it does not scan process command lines.
 
 ### Counts file
 
-`slot-counts.json`: `{"v": 1, "heavy": <n>, "light": <n>}`, both keys optional, each a whole number from 1 to 64 (kept, S2). A file without `v` is unreadable, so the counts fall back to the defaults with the ignore line naming the missing key.
+`slot-counts.json`: `{"v": 1, "heavy": <n>, "light": <n>}`, both keys optional, each a whole number from 1 to 64 (kept, S2). People and ops-tower write it; `gate.exe` only reads it.
+
+A missing file, or a missing key, gives the default silently. A file unreadable as a whole (including one without `v`, reason `missing key "v"`) gives both pools their default, each with its own ignore line. A value that is not a whole number from 1 to 64 gives that pool alone its default, with the reason `"<kind>" must be a whole number from 1 to 64`. Every line is `gate: ignored <path>: <reason>; using <n> <kind> slots`, built in one place for the `v1` and the PowerShell-era readers.
 
 ### Journal
 

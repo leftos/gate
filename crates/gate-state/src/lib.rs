@@ -16,6 +16,7 @@ mod model;
 mod remote;
 mod root;
 mod state;
+pub mod v1;
 mod verdict;
 #[cfg(all(windows, target_pointer_width = "64"))]
 mod win32;
@@ -28,8 +29,8 @@ pub use journal_writer::{
     ROLLED_JOURNAL_FILE, RunFacts, append_line, journal_line,
 };
 pub use model::{
-    CriticalState, CwdReader, DashboardState, MutexProbe, ParseError, PoolState, QueueTicket, RemotePool, SlotCount, SlotCounts, SlotKind, SlotRow,
-    SlotState, StateInputs, Waiting,
+    CRITICAL_LIGHT_RESERVE, CriticalState, CwdReader, DashboardState, MutexProbe, ParseError, PoolState, QueueTicket, RemotePool, SlotCount,
+    SlotCounts, SlotKind, SlotRow, SlotState, StateInputs, Waiting, reserved_light,
 };
 pub use root::{KernelObject, StateRoot, default_root, normalize_root, root_hash};
 pub use state::dashboard_state;

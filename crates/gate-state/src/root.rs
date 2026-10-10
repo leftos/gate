@@ -71,6 +71,18 @@ impl KernelObject {
             KernelObject::Job { gate_pid } => format!("job-{gate_pid}"),
         }
     }
+
+    /// The file name of the claim a gate holding this object writes: the mutex name without `Local\` and without the
+    /// root hash, plus `.json`. `None` for an object no gate claims (the journal mutex, a wake event, a job).
+    #[must_use]
+    pub fn claim_file_name(self) -> Option<String> {
+        match self {
+            KernelObject::HeavySlot(_) | KernelObject::LightSlot(_) | KernelObject::RemoteSlot(_) | KernelObject::Critical => {
+                Some(format!("gate-{}.json", self.suffix()))
+            }
+            KernelObject::Journal | KernelObject::WakeEvent { .. } | KernelObject::Job { .. } => None,
+        }
+    }
 }
 
 /// A state root, identified by its normalised path.

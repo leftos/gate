@@ -8,6 +8,15 @@ use serde_json::Value;
 
 use crate::counts::{format_count_value, powershell_text};
 
+/// The most light slots a critical gate keeps free beside it.
+pub const CRITICAL_LIGHT_RESERVE: u32 = 2;
+
+/// The light slots a critical gate keeps free beside it, out of a light pool of `light_count` slots.
+#[must_use]
+pub fn reserved_light(light_count: u32) -> u32 {
+    light_count.min(CRITICAL_LIGHT_RESERVE)
+}
+
 /// The two slot pools, in the order the dashboard lists them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -39,11 +48,20 @@ impl SlotKind {
     }
 
     /// The threads one gate of the kind is taken to keep busy, which sets the kind's default count.
-    pub(crate) fn threads(self) -> usize {
+    #[must_use]
+    pub fn threads(self) -> usize {
         match self {
             SlotKind::Heavy => 4,
             SlotKind::Light => 2,
         }
+    }
+
+    /// The default count of the kind on a machine with `processors` logical processors: one slot per
+    /// [`threads`](SlotKind::threads) of all but one processor, and at least one.
+    #[must_use]
+    pub fn default_count(self, processors: usize) -> u32 {
+        let slots = processors.saturating_sub(1) / self.threads();
+        u32::try_from(slots).unwrap_or(u32::MAX).max(1)
     }
 
     /// The `kind` of a slot-count request: `heavy` or `light` in any letter case. A missing kind is passed as null.

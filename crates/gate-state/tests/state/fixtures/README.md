@@ -16,6 +16,16 @@ Files captured from a real run of the gate, not written by hand (except three of
 
 The three other `remote*` files are written by hand from the gate's remote-slot design (`docs/design/gate-remote-slot.md`), since the gate does not write a remote claim or ticket a test can capture; they are re-captured from a real gate once it does. claude-config keeps a copy of `remote-journal.jsonl` (`tools/gate/fixtures/remote-journal.jsonl`).
 
+## The v1 reference examples
+
+The `v1-*` files are the reference examples of the formats `gate.exe` writes under a state root, written by hand from the tables in `docs/design.md` "Formats" as `gate.exe` writes them (compact JSON, `v` first, epoch-millisecond machine times, ISO UTC times with seven fractional digits); `v1.rs` reads them. The files without the prefix are the PowerShell gate's captures and hand-written files described above, apart from `journal.jsonl`.
+
+| File | What it is | Where `gate.exe` writes it |
+|---|---|---|
+| `v1-claim.json` | The claim of a heavy gate holding slot 0, with every required field and none of the optional ones. | `<state root>\slots\gate-slot-0.json` |
+| `v1-ticket.json` | The arrival ticket of a light gate waiting in the local queue, `holds` false. | `<state root>\waiting\<pid>-<start>.json`, here `60080-1759439760571.json` |
+| `v1-slot-counts.json` | A counts file setting three heavy and six light slots. | `<state root>\slot-counts.json` |
+
 ## Re-capturing them
 
 From the worktree root, in pwsh, with `LOCALAPPDATA` pointed at a scratch folder and the self-test prefix set so no real gate is touched:
