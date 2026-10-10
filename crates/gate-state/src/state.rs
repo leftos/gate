@@ -95,7 +95,7 @@ fn busy_pid(row: &SlotRow) -> Option<u32> {
 }
 
 /// A timestamp as ISO 8601 UTC with seven fractional digits and `Z`, .NET's round-trip `DateTime` format (`o`).
-fn iso_utc(timestamp: Timestamp) -> String {
+pub(crate) fn iso_utc(timestamp: Timestamp) -> String {
     jiff::fmt::strtime::format("%Y-%m-%dT%H:%M:%S.%7fZ", timestamp).unwrap_or_else(|_| timestamp.to_string())
 }
 

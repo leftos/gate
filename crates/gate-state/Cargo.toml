@@ -11,6 +11,7 @@ doctest = false
 workspace = true
 
 [dependencies]
+flate2 = "1.1.10"
 jiff = "0.2.37"
 proc-table = { path = "../proc-table" }
 regex = "1.13.1"

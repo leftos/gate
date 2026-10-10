@@ -3,6 +3,7 @@
 Terms the gate's docs use in a project sense, in alphabetical order.
 
 - **Abandoned slot**: a slot whose mutex the kernel reports as abandoned because the gate holding it died; the next gate takes it as its own and journals the takeover.
+- **Archive**: the gzipped `release` lines of a rolled journal, kept in `<state root>\archive\events-<stamp>.jsonl.gz` for 180 days; the gate whose append rolled the journal writes it before releasing the journal mutex.
 - **Backfill guest**: a waiting gate admitted, during a critical drain, onto a slot the critical gate lends, because its expected run ends before the drain's shadow end; one still running when the drain completes is killed and re-queued.
 - **Backstop**: the watchdog's last limit, five times the ceiling in wall time (less time paused behind a critical request), whatever the load.
 - **Black-box suite**: the Rust integration suite (`crates/gate/tests/suite/`) that drives the built `gate.exe` through its CLI and reads only its exit code, output, log, journal, claims and tickets; it needs the `test-seams` feature to run.
@@ -28,6 +29,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Heavy**: the slot kind for work that keeps several cores busy; its pool's thread budget is 4.
 - **Holds the machine**: said of a critical gate once it has taken every heavy and unreserved light slot.
 - **Journal**: the append-only `events.jsonl` in the state root, one JSON line per gate event (`queue`, `take`, `release` and others), with its rolled file and gzip archive.
+- **Journal mutex**: the named mutex `Local\gate-journal` (with the root hash under a non-default root) that every gate holds, waiting up to 2 s, while it appends to the journal, rolls it and archives.
 - **Lending**: a parent gate letting a nested gate its slot does not cover run on that slot while a critical request drains, instead of queueing behind it.
 - **Lent window**: the span during a critical drain in which the critical gate lends one slot to backfill guests, ending at the shadow end.
 - **Light**: the slot kind for work that keeps one or two cores busy; its pool's thread budget is 2.
@@ -42,6 +44,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Release**: see take.
 - **Reserved field**: an optional field readers accept before any gate writes it, such as `expected` or `avgCores`.
 - **Reserved light slot**: one of the up to two highest light slots a critical gate never takes, so light gates run beside it.
+- **Rollover**: the move of `events.jsonl` over `events.1.jsonl` by the append that finds the journal at or above 5,242,880 bytes, followed by the archive of the rolled file.
 - **Root hash**: the first 8 hex digits of the SHA-256 of a non-default state root's path, carried in every kernel object name and slot marker of that root.
 - **Routed run**: a heavy gate whose command `remote.json` sends to a builder.
 - **Shadow end**: the expected end of the slowest gate a critical drain waits on, which closes the lent window.
@@ -56,7 +59,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Test seam**: a hidden `--test-*` flag, compiled only with the `test-seams` cargo feature, by which the suite sets a timing knob or forces a failure.
 - **Ticket**: the JSON file `waiting\<pid>-<start>.json` a gate writes when it queues for a slot, holding its kind and `arrived` time; waiters of one kind take slots in ticket order.
 - **Usage error**: a command line the gate refuses (a missing, unknown, repeated or invalid input): each problem on its own `gate: ` line, then the usage, exit 2, before any slot is queued.
-- **Verdict**: the outcome a `release` line records: `passed`, `failed`, `log-failure`, `stalled`, `timed-out`, `backstop` or `unknown`.
+- **Verdict**: the outcome a `release` line records: `passed`, `failed`, `log-failure`, `stalled`, `timed-out`, `backstop` or `unknown` (no run facts).
 - **Wake event**: the auto-reset named event each waiter sleeps on, which a gate signals when it releases a slot or deletes a ticket.
 - **Watchdog**: the part of a running gate that samples the command and kills its job on a stall, the ceiling or the backstop.
 - **Win32 layer**: the `gate-win32` crate, the only code that calls Windows for job objects, processes, mutexes, events and console handling.

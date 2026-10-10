@@ -16,9 +16,9 @@ Each part is a sub-issue of CC-178 and lands on `feat/gate-durations`. Part 1 co
 
 ### Part 1: journal facts and the archive
 
-- A `release` line gains `wallSeconds` (the command's own wall time, `Watch.Clock`), `adjustedSeconds` (its load-adjusted time) and `verdict` (`passed`, `failed`, `stalled`, `timed-out`, `backstop`, `log-failure`), passed from `Complete-Watched` / `Invoke-RemoteWatched` to `Write-EndEvent` on the gate's entry. `heldSeconds` stays as it is.
-- At each journal rollover, the release lines of the file being rolled are gzipped into `%LOCALAPPDATA%\gate\archive\events-<UTC stamp>.jsonl.gz`, under the journal mutex. Archives older than 180 days are deleted at the same moment. A failed archive write is said once on standard error, and the rollover goes on. `events.1.jsonl` is left exactly as today, since ops-tower detects the roll by its identity.
-- The self-test prefix (`GATE_TEST_SLOT_PREFIX`) applies to the archive folder as it does to the journal.
+- A `release` line gains `wallSeconds` (the command's own wall time, `Watch.Clock`), `adjustedSeconds` (its load-adjusted time) and `verdict` (`passed`, `failed`, `stalled`, `timed-out`, `backstop`, `log-failure`, or `unknown` with no run facts). `heldSeconds` stays as it is.
+- At each journal rollover, the gate whose append rolled the journal gzips the release lines of the rolled `events.1.jsonl` into `<state root>\archive\events-<UTC stamp>.jsonl.gz` and deletes archives older than 180 days, before it releases the journal mutex, in the same hold as the append. A failed archive write is said once on standard error, and the rollover goes on. `events.1.jsonl` is left as it is, since ops-tower detects the roll by its identity.
+- The archive folder lives in the state root, so a test root isolates it as it does the journal.
 
 ### Part 2: the durations summary, `-Expect` and the expected-time line
 
@@ -38,7 +38,7 @@ Each part is a sub-issue of CC-178 and lands on `feat/gate-durations`. Part 1 co
 
   The map's 19-row table of real commands is the self-test's fixture for these rules. `keyVersion` in the summary names the rule set; a mismatch rebuilds the summary from the archive and the live journal.
 - **Estimate.** p50, p90 and p99 of `wallSeconds` (and of `adjustedSeconds` for ceilings) over the last 30 passing runs or 14 days, whichever holds fewer runs. A key needs 5 passing runs. The exact key is used when it qualifies. Otherwise the family key is used for lines and hints, and for backfill only when its p90 is at most 2x its p50. Failures are counted, never timed.
-- **Store.** `%LOCALAPPDATA%\gate\durations.json`, updated in `Write-EndEvent` right after the `release` line, inside the journal mutex, written to a temp file and moved over the old one (the claim files' pattern). Hot-path readers take no lock. A torn or missing file reads as "no history" and is said once. Keys without enough history may live only in the archive, to keep the file small.
+- **Store.** `%LOCALAPPDATA%\gate\durations.json`, updated by the gate right after the `release` line, inside the journal mutex, written to a temp file and moved over the old one (the claim files' pattern). Hot-path readers take no lock. A torn or missing file reads as "no history" and is said once. Keys without enough history may live only in the archive, to keep the file small.
 - **Lines.** When the gate takes its slot: `gate: expected about <n> min (usual <p50>, p90 <p90>, <n> runs)`, or nothing for a command without history. `gate.ps1 -Expect -- <command>` prints the same figure for the current folder, or `no history`, and exits 0 without queueing.
 
 ### Part 3: ETAs in wait lines, claims and tickets

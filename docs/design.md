@@ -161,7 +161,7 @@ Ordering by ticket replaces the PowerShell gate's free-for-all among waiters of 
 
 ### Abandoned slots
 
-A slot whose mutex comes back abandoned counts as taken (S3). The gate says `gate: took <name>, which a killed gate had left held` on stderr and in the log, and its journal `take` line carries `abandoned`, the list of slot names it took that way, so the journal counts how often gates die holding a slot (GATE-30). An abandoned journal mutex counts as owned and is said the same way.
+A slot whose mutex comes back abandoned counts as taken (S3). The gate says `gate: took <name>, which a killed gate had left held` on stderr and in the log, and its journal `take` line will carry `abandoned`, the list of slot names it took that way, so the journal counts how often gates die holding a slot (GATE-30). An abandoned journal mutex counts as owned and is said the same way.
 
 ### Probe by open
 
@@ -213,7 +213,7 @@ The environment carries one more name: `GATE_SLOT_HELD`, the slot marker ([Criti
 
 - The claim, ticket, counts and journal files are JSON with the PowerShell gate's field names (kept, L1, Q1, S2, J1), each object carrying `v`, the format version, as a whole number. Every format starts at `v: 1`.
 - Machine times are Unix epoch milliseconds as JSON numbers. Times people read (`time`, `started`, `processStart`) stay ISO 8601 UTC strings ending in `Z`.
-- Files are read as strict JSON (RFC 8259: no comments, no trailing commas, no unquoted keys) with case-sensitive keys. A file with a syntax error, a missing required key, a wrong type, a duplicate key or a `v` the reader does not know is unreadable, and the reader takes the path each format's section names for an unreadable file. Unknown keys are ignored, so an optional field is added without a `v` change; a rename, removal, retyping or change of meaning raises `v`.
+- Files are read as strict JSON (RFC 8259: no comments, no trailing commas, no unquoted keys) with case-sensitive keys. A file with a syntax error, a missing required key, a wrong type, a duplicate key or a `v` the reader does not know is unreadable, and the reader takes the path each format's section names for an unreadable file. The journal is the exception: its rule is per line ([Journal](#journal)). Unknown keys are ignored, so an optional field is added without a `v` change; a rename, removal, retyping or change of meaning raises `v`.
 - `gate-state` is the one implementation of every format; `gate.exe` and ops-tower both use it, and its fixtures (`crates/gate-state/tests/state/fixtures/`) are the reference examples.
 - Text is UTF-8 with no BOM and LF line ends.
 
@@ -261,21 +261,56 @@ A ticket whose pid is gone or started at another time is ignored and deleted by 
 
 ### Journal
 
-`events.jsonl` holds one JSON object per line, appended under the journal mutex with a 2 s wait (kept, J1). The events are `queue`, `take`, `release`, `abandon`, `covered`, `parent` and `fallback`. Every line starts with `v`, `time`, `event`, `pid`, `processStart`, `kind`, `cwd` and `command`, then the event's own fields, as the PowerShell gate writes them (J1); a routed run adds `remote`, `host` and `key` until its `fallback`.
+`events.jsonl` holds one JSON object per line, appended under the journal mutex (`Local\gate-journal`, [Kernel object names](#kernel-object-names)) with a 2 s wait (kept, J1). The events are `queue`, `take`, `release`, `abandon`, `covered`, `parent` and `fallback`. Every line starts with `v`, `time`, `event`, `pid`, `processStart`, `kind`, `cwd` and `command`, in that order, then the event's own fields, as the PowerShell gate writes them (J1); a routed run adds `remote`, `host` and `key` until its `fallback`.
+
+The journal keeps ISO 8601 UTC strings for `time` and `processStart` (7 fractional digits, ending in `Z`); it never held .NET ticks, so the move of claims, tickets and markers to epoch milliseconds does not touch it. `gate.exe` takes `processStart` from `GetProcessTimes`, in whole microseconds, so its 7th fractional digit is 0. Seconds fields (`heldSeconds`, `waitedSeconds`, `wallSeconds`, `adjustedSeconds`) are rounded to 3 decimals.
+
+`v` is a line-level rule, unlike the other formats: the writer always writes `"v":1` first; a reader skips a line whose `v` is present and not 1, and reads a line with no `v` as the PowerShell gate's format until the cutover's drain (GATE-9) makes `v` required.
+
+The event's own fields:
+
+| Event | Fields after the common ones |
+|---|---|
+| `queue` | `log` (the log's full path), `notRouted` (why a gate its caller kept local was not routed) |
+| `take` | `slots` (the slot names taken), `waitedSeconds` |
+| `release` | `slots`, `heldSeconds`, `status` (null when the gate failed before its command had one), `wallSeconds`, `adjustedSeconds`, `verdict` |
+| `abandon` | `waitedSeconds`: the gate ended while still queued |
+| `parent`, `covered` | `parentPid` |
+| `fallback` | `reason` |
+
+A release with no run facts writes `wallSeconds: null`, `adjustedSeconds: null` and `verdict: "unknown"`.
 
 Fields beyond J1's:
 
-- `take`: `abandoned`, a list of slot names taken abandoned, present only when there were any ([Abandoned slots](#abandoned-slots)). A critical gate's `take` carries `counts`, `otherHeld` and `otherClaims` (or `snapshotError`), kept from K5.
+- `take`: `abandoned`, a list of slot names taken abandoned, present only when there were any ([Abandoned slots](#abandoned-slots); GATE-30). A critical gate's `take` carries `counts`, `otherHeld` and `otherClaims` (or `snapshotError`), kept from K5 (GATE-38).
 - `release`: `wallSeconds` (the command's wall time less the seconds paused behind a critical request; a routed run's whole remote wall time), `adjustedSeconds` (load-adjusted seconds; null for a routed run and after a sampler failure) and `verdict`, one of `passed`, `failed`, `log-failure`, `stalled`, `timed-out`, `backstop`, `unknown` (kept, J5). A routed run is a kill only when the gate killed it; a command that exits 124 on its own is `failed`.
 - `fallback`: `reason`, one of `full`, `busy`, `unreachable`, `parity`, `rebooted`, `tools` (T5) and `version` ([The box side](#the-box-side)).
 
+The verdict comes from the run's end: a kill line matching `^gate: (STALLED|TIMED OUT|BACKSTOP)\b` gives `stalled`, `timed-out` or `backstop`; otherwise a command status of 0 with a non-zero gate status is `log-failure`, a status of 0 is `passed`, anything else `failed`; `unknown` when there are no run facts. The history that ops-tower serves (`HistoryRun`, `GET /api/gate/history`) carries `verdict`, `wallSeconds` and `adjustedSeconds`, null when a line has none.
+
+The journal writer says these prose lines, each prefixed `gate: `:
+
+- `could not write the journal <path> (<reason>)`, once per run, whose reasons include `<name> was not free within 2 s`;
+- `could not move <events.jsonl> over <events.1.jsonl>: <reason>; appended to it as it is`, once per run;
+- `took <name>, which a killed gate had left held`, for an abandoned journal mutex ([Abandoned slots](#abandoned-slots));
+- the archive's lines ([Archive](#archive)).
+
 Ordering is part of the interface: `release` is written before the slots are let go, so no later `take` precedes it; `fallback` is written while the routed run still holds its remote slot; a `take` with no `release` or `fallback` after it is a gate killed outright (J1). Runs are keyed by (`pid`, `processStart`).
 
-Rollover, torn lines and failures are kept: a journal of 5 MB or more is moved over `events.1.jsonl` before an append, and a move a reader blocks leaves it in place and is said once (J2); a torn last line gets a line feed before the next (J3); a line that cannot be written is said once and skipped, and the gate runs on (J4).
+Rollover, torn lines and failures are kept: a journal of 5,242,880 bytes (5 MiB) or more is moved over `events.1.jsonl` before an append, so it rolls at or above the cap, and a move a reader blocks leaves it in place and is said once (J2); a torn last line gets a line feed before the next (J3); a line that cannot be written is said once and skipped, and the gate runs on (J4). The cap and the 2 s mutex wait are constants; a test writes a near-cap journal into its own root.
 
 ### Archive
 
-The gate whose append rolled the journal writes `events.1.jsonl`'s `release` lines, gzipped, to `archive\events-<yyyyMMddTHHmmssZ>.jsonl.gz` after releasing its slot, counting and skipping lines that do not parse, then deletes archives older than 180 days and stray temporary files older than a day (kept, J5).
+The gate whose append rolled the journal archives the rolled `events.1.jsonl`'s `release` lines, gzipped, to `<state root>\archive\events-<yyyyMMddTHHmmssZ>.jsonl.gz`, counting and skipping lines that do not parse, then deletes archives older than 180 days and stray temporary files older than a day. It does this before it releases the journal mutex, in the same hold as the append that rolled (J5), so a second roll can never replace the file before it is archived. The hold stays short: the archive parses only each line's `event` and does not flush to disk.
+
+A gate killed between the roll and the archive, or an archive write that fails, loses that roll's release lines from the archive: no later gate re-archives `events.1.jsonl`, and the next roll replaces it. They stay in `events.1.jsonl` until then.
+
+Two rolls within one second collide on the archive name: the second archive fails and the failure is said once. The writer says, as prose lines:
+
+- `archived the release lines of <path>; skipped <n> line(s) that do not parse`;
+- `could not archive the release lines of <path> in <dir>: <error>`;
+- `archived the release lines of <path> but could not delete <temp>: <error>`;
+- `could not delete old archive <name>: <error>`.
 
 ### Reserved fields
 
@@ -283,6 +318,7 @@ Readers accept these optional fields now; their issues write them:
 
 - `expected`: `{"p50": <s>, "p90": <s>, "n": <runs>, "key": "<key>"}` in claims and tickets, present when the gate has history for the command (GATE-15).
 - `avgCores`, `peakCores`, `freeCores` on `release`: the command's average and peak busy cores and the cores that were free ([Cores hint](#cores-hint), GATE-6).
+- `abandoned` on `take` (GATE-30), and `counts`, `otherHeld`, `otherClaims`, `snapshotError` on a critical gate's `take` (GATE-38): not written yet.
 
 ### remote.json
 
@@ -408,7 +444,7 @@ Rules:
 A Rust integration suite drives the built `gate.exe` through its CLI and reads only what it writes: exit codes, stdout, stderr, the log, the journal, claims and tickets.
 
 - **Own state root per case.** Every case creates a fresh root under the target directory's temporary folder and passes it with `--state-dir`, so cases never touch the machine's real slots, journal or counts, or each other's. Cases run side by side.
-- **Test seams.** Hidden `--test-*` flags, compiled only with the `test-seams` cargo feature, set the timing knobs: `--test-sample-ms` (sample period), `--test-heartbeat-ms` (wait heartbeat), `--test-poll-ms` (fallback poll) and `--test-stall-ms` (stall window below a second). Each takes whole milliseconds above 0 on `gate run`, and is parsed only until the wait loop and the watchdog exist. `--test-print-request`, on `run`, `stop-tree` and the compatibility form, prints the parsed request as one JSON line on stdout and exits 0, so the suite sees what a command line asked for; it is the one hidden switch the compatibility layer accepts. The same feature will carry the failure seams `--test-sampler-fail` (W5) and `--test-diagnostics-fail` (X3), and `--test-remote-client <path>` (a stub in place of the remote client), with their slices. An installed gate has none of them, and without the feature each is an unknown option.
+- **Test seams.** Hidden `--test-*` flags, compiled only with the `test-seams` cargo feature, set the timing knobs: `--test-sample-ms` (sample period), `--test-heartbeat-ms` (wait heartbeat), `--test-poll-ms` (fallback poll) and `--test-stall-ms` (stall window below a second). Each takes whole milliseconds above 0 on `gate run`, and is parsed only until the wait loop and the watchdog exist. `--test-journal-run <status>` (a whole number 0 to 255, on `gate run` in the new CLI only) writes the `queue`, `take` (`"slots":[]`, `waitedSeconds` 0) and `release` lines through the real writer and mutex without launching a command or taking a slot, then exits with `<status>`; it is refused with `gate: --test-journal-run must be a whole number 0 to 255, got '<v>'`, or `gate: --test-journal-run and --test-print-request cannot be combined`. `--test-print-request`, on `run`, `stop-tree` and the compatibility form, prints the parsed request as one JSON line on stdout and exits 0, so the suite sees what a command line asked for; it is the one hidden switch the compatibility layer accepts. The same feature will carry the failure seams `--test-sampler-fail` (W5) and `--test-diagnostics-fail` (X3), and `--test-remote-client <path>` (a stub in place of the remote client), with their slices. An installed gate has none of them, and without the feature each is an unknown option.
 - **Ordering, never elapsed time.** A case asserts the order of events in the journal and the log (a waiter's `take` after the holder's `release`, a heartbeat line before the inner gate's take, a kill line before the exit), never a wall-clock bound a busy machine could cross. A case's own deadline only guards against a hang and is generous.
 - **Injected clock.** The watchdog arithmetic is unit-tested in `gate-watchdog` with an injected clock and scripted samples, not through the binary.
 - **Fake process trees.** A small helper executable, `fake-tool` (built only with the `test-seams` feature; it runs its steps in order: `argv`, `out <text>`, `err <text>`, `sleep <ms>`, `exit <n>`), copied under the names the gate classifies (`VBCSCompiler.exe`, `dotnet.exe`, `MSBuild.exe`), spawns children, burns CPU, prints its argv, writes output or sleeps on command, so build-server, orphan and kill-tree cases need no real toolchain.

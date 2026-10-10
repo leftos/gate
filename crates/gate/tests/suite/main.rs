@@ -6,5 +6,6 @@ mod checkout;
 mod cli;
 mod compat;
 mod harness;
+mod journal;
 mod request;
 mod support;

@@ -4,8 +4,8 @@ use std::ffi::OsString;
 
 use gate_args::{Invocation, Problem, RunRequest, StopRequest, USAGE, parse};
 
-use crate::request_json;
 use crate::resolve::{self, Environment};
+use crate::{journal, request_json};
 
 /// The status of a usage error: a missing, unknown or invalid input.
 const USAGE_STATUS: u8 = 2;
@@ -63,7 +63,10 @@ fn run(request: &RunRequest, environment: &Environment) -> Report {
     match resolved {
         Err(line) => Report::stderr(USAGE_STATUS, line),
         Ok((log, root)) if request.print_request => Report::stdout(0, request_json::run(request, &log, &root)),
-        Ok(_) => Report::stderr(NOT_BUILT_STATUS, "gate: run is not built yet".to_owned()),
+        Ok((log, root)) => match request.test_seams.journal_run {
+            Some(status) => journal::seam_run(request, &log, &root, status),
+            None => Report::stderr(NOT_BUILT_STATUS, "gate: run is not built yet".to_owned()),
+        },
     }
 }
 
