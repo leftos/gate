@@ -5,8 +5,6 @@
 ## Local gate
 
 - [ ] GATE-5 Port the local gate, slice by slice
-  - [ ] GATE-32 Local slice 1: workspace, CLI skeleton, compatibility layer and suite harness
-  - [ ] GATE-33 Local slice 2: journal and gzip archive in the v1 format
   - [ ] GATE-34 Local slice 3: slots, counts, claims and FIFO tickets
     - [ ] GATE-30 Journal a slot taken over from a gate that died holding it (`abandoned` on the take line)
   - [ ] GATE-35 Local slice 4: launch the command (resolution, quoting, job object, log and markers)
