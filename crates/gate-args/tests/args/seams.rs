@@ -19,6 +19,9 @@ fn seam_flags_parse_with_the_feature() {
             "70",
             "--test-stall-ms",
             "80",
+            "--test-interrupt-after-samples",
+            "3",
+            "--test-interrupt-queued",
             "--test-print-request",
             "--",
             "cmd",
@@ -32,9 +35,15 @@ fn seam_flags_parse_with_the_feature() {
             heartbeat_ms: Some(60),
             poll_ms: Some(70),
             stall_ms: Some(80),
+            interrupt_after_samples: Some(3),
+            interrupt_queued: true,
         }
     );
     assert!(request.print_request);
+    assert_eq!(
+        problems(&refs(&with(&RUN, &["--test-interrupt-after-samples", "0", "--", "cmd"]))),
+        ["gate: --test-interrupt-after-samples must be a whole number above 0, got '0'"]
+    );
     assert!(stop_request(&["stop-tree", "--test-print-request", "1"]).print_request);
     assert_eq!(
         problems(&refs(&with(&RUN, &["--test-poll-ms", "0", "--", "cmd"]))),

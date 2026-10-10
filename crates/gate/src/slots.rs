@@ -67,6 +67,11 @@ impl Pool {
     pub(crate) fn name(self) -> &'static str {
         self.0.as_str()
     }
+
+    /// The threads one gate of the pool is taken to keep busy.
+    pub(crate) fn threads(self) -> usize {
+        self.0.threads()
+    }
 }
 
 /// This gate as its journal lines, its ticket, its claim and its wake event name it, read once a run.

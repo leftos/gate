@@ -90,8 +90,12 @@ fn a_run_launches_its_command_and_passes_its_status() {
         outcome.stdout.starts_with("hello\noops\ngate: passed in "),
         "the tail, then the verdict: {outcome:?}"
     );
+    let passed = format!(
+        r"\ngate: passed in \d+ s \(load-adjusted \d+ s, ceiling 3600 s\)\. Full output: {}\n\z",
+        regex::escape(&log)
+    );
     assert!(
-        outcome.stdout.ends_with(&format!(" s (ceiling 5 s). Full output: {log}\n")),
+        regex::Regex::new(&passed).expect("the pattern is valid").is_match(&outcome.stdout),
         "{outcome:?}"
     );
     let text = log_text(&case);

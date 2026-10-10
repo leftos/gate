@@ -74,14 +74,18 @@ impl Slot {
     }
 }
 
-/// What the black-box suite sets through the hidden `--test-*` flags: the timing knobs, in milliseconds; all `None` in
-/// a gate built without the `test-seams` feature.
+/// What the black-box suite sets through the hidden `--test-*` flags: the timing knobs, in milliseconds, and the
+/// interrupts the gate raises on itself; all `None` and off in a gate built without the `test-seams` feature.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TestSeams {
     pub sample_ms: Option<u64>,
     pub heartbeat_ms: Option<u64>,
     pub poll_ms: Option<u64>,
     pub stall_ms: Option<u64>,
+    /// Raise the console interrupt after this many samples of the running command.
+    pub interrupt_after_samples: Option<u64>,
+    /// Raise the console interrupt once the gate has said it is waiting for a slot.
+    pub interrupt_queued: bool,
 }
 
 /// A valid `gate run`.

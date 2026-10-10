@@ -220,6 +220,29 @@ fn line_starts_with_v_then_the_common_keys_in_order() {
 }
 
 #[test]
+fn abandon_line_is_the_one_the_reader_fixture_holds() {
+    let gate = JournalIdentity {
+        pid: 58200,
+        process_start: ts("2026-10-03T05:04:43.9Z"),
+        kind: "light".to_owned(),
+        cwd: r"C:\work\repo".to_owned(),
+        command: "cmd /c exit 0".to_owned(),
+    };
+    let line = journal_line(&gate, ts("2026-10-03T05:04:46Z"), &JournalEvent::Abandon { waited_seconds: 1.7 }, None);
+
+    assert_eq!(keys(&parsed(&line)), with_common(&["waitedSeconds"]));
+    assert_eq!(
+        line,
+        concat!(
+            r#"{"v":1,"time":"2026-10-03T05:04:46.0000000Z","event":"abandon","pid":58200,"#,
+            r#""processStart":"2026-10-03T05:04:43.9000000Z","kind":"light","cwd":"C:\\work\\repo","#,
+            r#""command":"cmd /c exit 0","waitedSeconds":1.7}"#
+        ),
+        "the abandon line of fixtures/journal.jsonl, which the reader takes as an abandoned run"
+    );
+}
+
+#[test]
 fn time_has_seven_fractional_digits_and_z() {
     let mut gate = identity();
     gate.process_start = ts("2026-10-03T05:04:38Z");

@@ -103,6 +103,11 @@ pub enum JournalEvent {
         /// The run's facts, or `None` when the gate ended before its command had a verdict.
         facts: Option<RunFacts>,
     },
+    /// The gate left the queue without taking a slot.
+    Abandon {
+        /// How long the gate waited, in seconds.
+        waited_seconds: f64,
+    },
 }
 
 /// What a `release` line says of the run.
@@ -207,6 +212,9 @@ pub fn journal_line(identity: &JournalIdentity, time: Timestamp, event: &Journal
             let verdict = facts.map_or(Verdict::Unknown, |facts| facts.verdict);
             line.insert("verdict".to_owned(), Value::from(verdict.as_str()));
         }
+        JournalEvent::Abandon { waited_seconds } => {
+            line.insert("waitedSeconds".to_owned(), seconds(*waited_seconds));
+        }
     }
     let mut abandoned: Vec<Value> = match event {
         JournalEvent::Take { abandoned, .. } => abandoned.iter().map(|name| Value::from(name.as_str())).collect(),
@@ -224,6 +232,7 @@ fn event_name(event: &JournalEvent) -> &'static str {
         JournalEvent::Queue { .. } => "queue",
         JournalEvent::Take { .. } => "take",
         JournalEvent::Release { .. } => "release",
+        JournalEvent::Abandon { .. } => "abandon",
     }
 }
 

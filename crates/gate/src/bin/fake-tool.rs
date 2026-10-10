@@ -7,7 +7,7 @@
 //! exits with status n, any 32-bit code, negative ones as Windows reads them back;
 //! `env <name>` prints the variable's value, or `fake-tool: <name> is not set`, on its own line; `bytes <hex>` writes the
 //! bytes the hex digits spell to stdout as they are, with no line feed added; `lines <n> <text>` prints n lines on
-//! stdout, the i-th `<text><i>` counting from 1;
+//! stdout, the i-th `<text><i>` counting from 1; `pid` prints `pid <its own pid>` on stdout;
 //! `argv` prints every word after it, each on its own line, and ends, so it is always the last step.
 //! With no `exit` step it exits 0. For example `fake-tool out hi err oops exit 3`.
 
@@ -91,6 +91,10 @@ fn run(args: &[OsString]) -> Result<i32, String> {
                 let text = operand(&mut steps, "exit")?;
                 stdout.flush().map_err(|error| write_failed(&error))?;
                 return text.parse().map_err(|_| format!("exit takes a 32-bit status, got '{text}'"));
+            }
+            "pid" => {
+                writeln!(stdout, "pid {}", std::process::id()).map_err(|error| write_failed(&error))?;
+                stdout.flush().map_err(|error| write_failed(&error))?;
             }
             other => return Err(format!("unknown step '{other}'")),
         }

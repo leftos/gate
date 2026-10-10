@@ -156,6 +156,7 @@ dependencies = [
  "flate2",
  "gate-args",
  "gate-state",
+ "gate-watchdog",
  "gate-win32",
  "jiff",
  "proc-table",

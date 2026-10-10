@@ -15,6 +15,7 @@ test-seams = ["gate-args/test-seams"]
 base64 = "0.23.1"
 gate-args = { path = "../gate-args" }
 gate-state = { path = "../gate-state" }
+gate-watchdog = { path = "../gate-watchdog" }
 gate-win32 = { path = "../gate-win32" }
 jiff = "0.2.37"
 proc-table = { path = "../proc-table" }

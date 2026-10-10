@@ -28,7 +28,10 @@ pub(crate) fn run(request: &RunRequest, log: &Path, root: &ResolvedRoot) -> Stri
             "sampleMs": seams.sample_ms,
             "heartbeatMs": seams.heartbeat_ms,
             "pollMs": seams.poll_ms,
-            "stallMs": seams.stall_ms,        },
+            "stallMs": seams.stall_ms,
+            "interruptAfterSamples": seams.interrupt_after_samples,
+            "interruptQueued": seams.interrupt_queued,
+        },
     })
     .to_string()
 }

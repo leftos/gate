@@ -387,9 +387,10 @@ pub fn shown(path: &Path) -> String {
 }
 
 /// The words of a light run logging to `log`, `extra` before `--` and `command` after it. Gates that run at once each
-/// need a log of their own, since a gate refuses a log another gate is writing.
+/// need a log of their own, since a gate refuses a log another gate is writing. The ceiling is far above the hang
+/// guard, so a run a case holds is never ended by it.
 pub fn run_words<'a>(log: &'a str, extra: &[&'a str], command: &[&'a str]) -> Vec<&'a str> {
-    let mut words = vec!["run", "--slot", "light", "--timeout", "5", "--log", log];
+    let mut words = vec!["run", "--slot", "light", "--timeout", "3600", "--log", log];
     words.extend(extra);
     words.push("--");
     words.extend(command);

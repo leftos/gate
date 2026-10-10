@@ -12,7 +12,7 @@ use std::{fs, io};
 
 use gate_args::{ProgramSearch, RunRequest, Slot, batch_command_line, batch_refusal, command_line, is_batch_target, resolve_program};
 use gate_state::{JournalEvent, KernelObject, RunFacts, StateRoot, Verdict, log_hash};
-use gate_win32::{AcquireError, Job, Launch, LaunchError, NamedMutex, OwnedMutexGuard, PriorityClass, Running};
+use gate_win32::{AcquireError, Interrupt, Job, Launch, LaunchError, NamedMutex, OwnedMutexGuard, PriorityClass, Running};
 
 use crate::acquire;
 use crate::answer::USAGE_STATUS;
@@ -22,7 +22,8 @@ use crate::journal::RunJournal;
 use crate::log::Log;
 use crate::resolve::ResolvedRoot;
 use crate::slots::{self, Pool, Survey, Taken, ThisGate};
-use crate::wait::Wait;
+use crate::wait::{self, Arrival, Host, Wait};
+use crate::watch::{Start, Watched, Watcher, Watching};
 
 /// The status of a run the gate itself failed.
 const GATE_FAILED: i64 = 1;
@@ -32,17 +33,18 @@ const LOG_FAILURE: i64 = 1;
 const NOT_STARTED: i64 = 127;
 /// The exit code the job's processes are ended with when the gate stops the command.
 const STOPPED: u32 = 124;
+/// `STATUS_CONTROL_C_EXIT`: the status of a process Ctrl+C ended, which the gate exits with when interrupted.
+const CONTROL_C_EXIT: u32 = 0xC000_013A;
 /// The Win32 error of a file not found, which a program found nowhere is reported as.
 pub(crate) const ERROR_FILE_NOT_FOUND: u32 = 2;
-/// How long one wait for the command's exit lasts before the gate waits again.
-const WAIT_STEP: Duration = Duration::from_secs(60);
-/// How long the gate waits for the command once it has terminated its job after a failure of its own.
+/// How long the gate waits for the command to end once it has terminated its job, or once a Ctrl+C came.
 const STOP_WAIT: Duration = Duration::from_secs(5);
 
 /// Runs `request`'s command, logging to `log` (absolute) under `root`, saying each line as it goes; returns the gate's
 /// exit status: the command's own whole 32-bit code, 1 for a failure marker in its log or a failure of the gate after
-/// it started, 127 when it could not be started, or 2 for a log inside the state root or a batch word refused before
-/// anything was queued.
+/// it started, 124 for a command killed as stalled, 127 when it could not be started, 0xC000013A for a Ctrl+C in the
+/// queue, before the command started, or with the command still running 5 s after it, or 2 for a log inside the state
+/// root or a batch word refused before anything was queued.
 pub(crate) fn run(request: &RunRequest, log: &Path, root: &ResolvedRoot, console: &mut Console) -> u32 {
     if log_in_state_root(log, &root.path) {
         console.err(&format!(
@@ -73,6 +75,17 @@ pub(crate) fn run(request: &RunRequest, log: &Path, root: &ResolvedRoot, console
         console.err(&format!("gate: {problem}"));
         return exit_status(GATE_FAILED);
     }
+    let interrupt = Interrupt::install()
+        .inspect_err(|error| {
+            console.err(&format!(
+                "gate: cannot install the Ctrl+C handler, so Ctrl+C ends the gate at once: {error}"
+            ));
+        })
+        .ok();
+    let host = Host {
+        processors: wait::processors(console),
+        interrupt,
+    };
     let mut run = Run {
         request,
         root,
@@ -80,6 +93,7 @@ pub(crate) fn run(request: &RunRequest, log: &Path, root: &ResolvedRoot, console
         journal: RunJournal::open(root, &gate),
         gate,
         log,
+        host,
     };
     let queue = JournalEvent::Queue {
         log: run.log.path().to_string_lossy().into_owned(),
@@ -88,21 +102,24 @@ pub(crate) fn run(request: &RunRequest, log: &Path, root: &ResolvedRoot, console
     let mut taken = None;
     let mut took = Instant::now();
     let watched = panic::catch_unwind(AssertUnwindSafe(|| {
-        took = run.take(&mut taken, console);
-        run.command(plan, console)
+        took = run.take(&mut taken, console)?;
+        Some(run.command(plan, console))
     }));
-    let ended = match watched {
-        Ok(ended) => ended,
+    let status = match watched {
+        Ok(Some(ended)) => {
+            run.release(taken, took, Some(&ended), console);
+            exit_status(ended.status)
+        }
+        Ok(None) => CONTROL_C_EXIT,
         Err(payload) => {
             run.after_panic(taken, took, console);
             panic::resume_unwind(payload);
         }
     };
-    run.release(taken, took, Some(&ended), console);
     if let Err(error) = run.log.append(&console.take_notes()) {
         console.err(&format!("gate: cannot write to {}: {error}", run.log.path().display()));
     }
-    exit_status(ended.status)
+    status
 }
 
 /// Takes the mutex of the log at `path` under `root` without waiting, so no two gates write one log at once; a mutex a
@@ -320,6 +337,22 @@ struct Run<'a> {
     log: Log,
     journal: RunJournal,
     survey: Survey,
+    /// The machine's processors and the console interrupt, read once for the run.
+    host: Host,
+}
+
+/// How long a command ran: by the wall clock, and in load-adjusted seconds.
+#[derive(Clone, Copy)]
+struct Timing {
+    wall: Duration,
+    adjusted: f64,
+}
+
+/// How a watched command ended, as its verdict reads it: its status, how long it ran, and the line of a kill.
+struct Outcome<'k> {
+    exited: i64,
+    timing: Timing,
+    kill: Option<&'k str>,
 }
 
 /// How the run ended: the gate's status, and the facts its release line carries when its verdict was reached.
@@ -330,15 +363,29 @@ struct Ended {
 
 impl Run<'_> {
     /// Waits its turn for a slot of the run's pool and takes it into `held` the moment it has it, then journals the
-    /// take and writes the claim; a critical run takes no pool slot. When the slot was taken.
-    fn take(&mut self, held: &mut Option<Taken>, console: &mut Console) -> Instant {
+    /// take and writes the claim; a critical run takes no pool slot. When the slot was taken; `None` when a Ctrl+C
+    /// ended the wait, which deletes the ticket at once, wakes the waiters and journals the abandon.
+    fn take(&mut self, held: &mut Option<Taken>, console: &mut Console) -> Option<Instant> {
         let queued = Instant::now();
         let Some(pool) = Pool::of(self.request.slot) else {
             self.journal.write(&take_event(Vec::new(), 0.0, Vec::new()), console);
-            return Instant::now();
+            return Some(Instant::now());
         };
-        let mut wait = Wait::queue(self.root, pool, &self.gate, self.request, queued, console);
-        let taken = held.insert(wait.until_taken(&mut self.survey, console));
+        let arrival = Arrival {
+            gate: &self.gate,
+            request: self.request,
+            queued,
+        };
+        let mut wait = Wait::queue(self.root, pool, arrival, self.host, console);
+        let Some(taken) = wait.until_taken(&mut self.survey, console) else {
+            wait.end(console);
+            slots::wake_waiters(self.root, &mut self.survey, console);
+            console.err(&format!("gate: interrupted while waiting for a {} slot", pool.name()));
+            let waited_seconds = queued.elapsed().as_secs_f64();
+            self.journal.write(&JournalEvent::Abandon { waited_seconds }, console);
+            return None;
+        };
+        let taken = held.insert(taken);
         let waited = queued.elapsed().as_secs_f64();
         let name = taken.held.name().to_owned();
         let mut abandoned = Vec::new();
@@ -351,7 +398,7 @@ impl Run<'_> {
         self.journal.write(&take_event(vec![name], waited, abandoned), console);
         slots::write_claim(&taken.held, pool, &self.gate, self.request, self.log.path(), console);
         slots::wake_waiters(self.root, &mut self.survey, console);
-        took
+        Some(took)
     }
 
     /// After a panic from the moment the slot was taken: completes the log as far as it can, the `.err` file and the
@@ -397,43 +444,113 @@ impl Run<'_> {
             Ok(launch) => launch,
             Err(message) => return self.not_started(&plan.word, plan.resolved.as_deref(), &message, console),
         };
+        if self.host.interrupt.is_some_and(Interrupt::is_raised) {
+            return self.interrupted_before_start(console);
+        }
         let name = self.root.root.object_name(KernelObject::Job { gate_pid: self.gate.pid });
         let job = match Job::create(&name) {
             Ok(job) => job,
             Err(error) => return self.gate_failed(&format!("cannot create the job {name}: {error}"), None, console),
         };
-        let started = Instant::now();
+        let start = Start::now();
         match launch.start_suspended().and_then(|suspended| suspended.assign_and_resume(&job)) {
-            Ok(running) => self.watched(&job, &running, started, console),
+            Ok(running) => self.watched(&job, &running, &start, console),
             Err(LaunchError::CreateProcess { message, .. }) => self.not_started(&plan.word, plan.resolved.as_deref(), &message, console),
             Err(error) => self.gate_failed(&error.to_string(), None, console),
         }
     }
 
-    /// Waits for the started command to exit, then reaches the verdict. Should the gate fail or panic first, the job is
-    /// terminated, so the command does not outlive the run.
-    fn watched(&mut self, job: &Job, running: &Running, started: Instant, console: &mut Console) -> Ended {
+    /// Says that a Ctrl+C came before the command started, which then never starts, and completes the log; the status
+    /// is `STATUS_CONTROL_C_EXIT`, with no verdict.
+    fn interrupted_before_start(&mut self, console: &mut Console) -> Ended {
+        console.err("gate: interrupted before the command started");
+        if let Err(error) = self.log.finish(console) {
+            console.err(&format!("gate: could not write to {}: {error}", self.log.path().display()));
+        }
+        Ended {
+            status: i64::from(CONTROL_C_EXIT.cast_signed()),
+            facts: None,
+        }
+    }
+
+    /// Watches the started command to its exit, a stall kill or a Ctrl+C, then reaches the verdict. Should the gate fail
+    /// or panic first, the job is terminated, so the command does not outlive the run.
+    fn watched(&mut self, job: &Job, running: &Running, start: &Start, console: &mut Console) -> Ended {
         let mut stopper = Stopper { job, armed: true };
-        let ended = match wait_for_exit(running) {
-            Ok(code) => {
-                let wall = started.elapsed();
-                let exited = i64::from(code.cast_signed());
-                match self.verdict(exited, Some(wall), console) {
-                    Ok(status) => Ended {
-                        status,
-                        facts: Some(RunFacts {
-                            wall_seconds: wall.as_secs_f64(),
-                            adjusted_seconds: None,
-                            verdict: Verdict::of(None, exited, status),
-                        }),
-                    },
-                    Err(problem) => self.gate_failed(&problem, Some((job, running)), console),
-                }
+        let ended = match self.watch(job, running, start, console) {
+            Ok((watched, adjusted)) => {
+                let timing = Timing {
+                    wall: start.started.elapsed(),
+                    adjusted,
+                };
+                self.after_watch(watched, timing, (job, running), console)
             }
-            Err(error) => self.gate_failed(&format!("cannot wait for the command: {error}"), Some((job, running)), console),
+            Err(problem) => self.gate_failed(&problem, Some((job, running)), console),
         };
         stopper.armed = false;
         ended
+    }
+
+    /// Watches the command until it exits, stalls or the console is interrupted; how it ended and the load-adjusted
+    /// seconds it ran, else the gate's problem.
+    fn watch(&self, job: &Job, running: &Running, start: &Start, console: &mut Console) -> Result<(Watched, f64), String> {
+        let watching = Watching {
+            job,
+            running,
+            log: &self.log,
+            interrupt: self.host.interrupt,
+        };
+        let mut watcher = Watcher::begin(self.request, watching, start, self.host.processors)
+            .map_err(|error| format!("cannot begin to watch the command: {error}"))?;
+        let watched = watcher.until_end(console).map_err(|error| format!("cannot watch the command: {error}"))?;
+        Ok((watched, watcher.adjusted_seconds()))
+    }
+
+    /// Ends the run as the watch ended it: a command that exited has its verdict; a stalled one has its kill line said,
+    /// its job terminated and the verdict of status 124; an interrupted one is given 5 s to end before its job is stopped,
+    /// and has the verdict of its own status, neither scanned for markers.
+    fn after_watch(&mut self, watched: Watched, timing: Timing, started: (&Job, &Running), console: &mut Console) -> Ended {
+        let (job, running) = started;
+        match watched {
+            Watched::Exited(code) => {
+                let exited = i64::from(code.cast_signed());
+                self.ended(&Outcome { exited, timing, kill: None }, false, started, console)
+            }
+            Watched::Killed { line, processes } => {
+                console.err(&line);
+                kill(job, running, processes, console);
+                let exited = i64::from(STOPPED);
+                self.ended(
+                    &Outcome {
+                        exited,
+                        timing,
+                        kill: Some(&line),
+                    },
+                    true,
+                    started,
+                    console,
+                )
+            }
+            Watched::Interrupted => {
+                let exited = interrupted(job, running, console);
+                self.ended(&Outcome { exited, timing, kill: None }, true, started, console)
+            }
+        }
+    }
+
+    /// Reaches the verdict of `outcome`, its markers not scanned when `unscanned`, and the facts its release carries.
+    fn ended(&mut self, outcome: &Outcome<'_>, unscanned: bool, started: (&Job, &Running), console: &mut Console) -> Ended {
+        match self.verdict(outcome.exited, Some(outcome.timing), unscanned, console) {
+            Ok(status) => Ended {
+                status,
+                facts: Some(RunFacts {
+                    wall_seconds: outcome.timing.wall.as_secs_f64(),
+                    adjusted_seconds: Some(outcome.timing.adjusted),
+                    verdict: Verdict::of(outcome.kill, outcome.exited, status),
+                }),
+            },
+            Err(problem) => self.gate_failed(&problem, Some(started), console),
+        }
     }
 
     /// Says the start failure of `word`, found as `resolved`, with the system's `message`, and ends with status 127.
@@ -443,21 +560,23 @@ impl Run<'_> {
             None => format!("gate: could not start {word}: {message}"),
         };
         console.err(&line);
-        match self.verdict(NOT_STARTED, None, console) {
+        match self.verdict(NOT_STARTED, None, false, console) {
             Ok(status) => Ended { status, facts: None },
             Err(problem) => self.gate_failed(&problem, None, console),
         }
     }
 
     /// Completes the log with the notes so far, and says the marker lines of a failure, the log's tail and the verdict
-    /// line; the gate's status. `exited` is the command's status, and `wall` how long it ran, `None` when it never
-    /// started.
-    fn verdict(&mut self, exited: i64, wall: Option<Duration>, console: &mut Console) -> Result<i64, String> {
+    /// line; the gate's status. `exited` is the command's status, and `timing` how long it ran, `None` when it never
+    /// started; a run the gate ended itself is `unscanned`, its markers not read.
+    fn verdict(&mut self, exited: i64, timing: Option<Timing>, unscanned: bool, console: &mut Console) -> Result<i64, String> {
         let shown = self.log.path().display().to_string();
         self.log
             .finish(console)
             .map_err(|error| format!("cannot complete the log {shown}: {error}"))?;
-        let (found, tail) = self.read_back().map_err(|error| format!("cannot read the log {shown}: {error}"))?;
+        let (found, tail) = self
+            .read_back(unscanned)
+            .map_err(|error| format!("cannot read the log {shown}: {error}"))?;
         let mut status = exited;
         if status == 0 && !found.is_empty() {
             console.err(&format!("gate: command exited 0 but its log reports a failure -> {shown}"));
@@ -471,10 +590,11 @@ impl Run<'_> {
         for line in &tail {
             console.out(line);
         }
-        match wall {
-            Some(wall) if status == 0 => console.note_out(&format!(
-                "gate: passed in {} s (ceiling {} s). Full output: {shown}",
-                whole_seconds(wall),
+        match timing {
+            Some(timing) if status == 0 => console.note_out(&format!(
+                "gate: passed in {} s (load-adjusted {} s, ceiling {} s). Full output: {shown}",
+                whole_seconds(timing.wall.as_secs_f64()),
+                whole_seconds(timing.adjusted),
                 self.request.timeout
             )),
             _ => console.err(&format!("gate: FAILED (status {status}). Full output: {shown}")),
@@ -482,9 +602,13 @@ impl Run<'_> {
         Ok(status)
     }
 
-    /// The log's first marker lines, none when the run turned the scan off, and its tail.
-    fn read_back(&self) -> io::Result<(Vec<Marker>, Vec<String>)> {
-        let found = if self.request.no_markers { Vec::new() } else { self.log.markers()? };
+    /// The log's first marker lines, none when the run turned the scan off or is `unscanned`, and its tail.
+    fn read_back(&self, unscanned: bool) -> io::Result<(Vec<Marker>, Vec<String>)> {
+        let found = if self.request.no_markers || unscanned {
+            Vec::new()
+        } else {
+            self.log.markers()?
+        };
         Ok((found, self.log.tail(self.request.tail)?))
     }
 
@@ -528,25 +652,65 @@ fn stop(job: &Job, running: &Running, console: &mut Console) {
         console.err(&format!("gate: and could not terminate the command's job: {error}"));
         return;
     }
-    match running.wait(STOP_WAIT) {
-        Ok(Some(_)) => {}
-        Ok(None) => console.err("gate: the command was still running 5 s after its job was terminated"),
-        Err(error) => console.err(&format!("gate: cannot wait for the command after terminating its job: {error}")),
-    }
+    await_stopped(running, console);
 }
 
-/// Waits for the command to exit; its exit code.
-fn wait_for_exit(running: &Running) -> io::Result<u32> {
-    loop {
-        if let Some(code) = running.wait(WAIT_STEP)? {
-            return Ok(code);
+/// Terminates the job of a stalled command, which held `processes` processes, and gives the command a moment to end.
+fn kill(job: &Job, running: &Running, processes: u32, console: &mut Console) {
+    if let Err(error) = job.terminate(STOPPED) {
+        console.err(&format!("gate: could not terminate the command's job: {error}"));
+        return;
+    }
+    console.err(&format!("gate: terminated the job's {processes} process(es)"));
+    await_stopped(running, console);
+}
+
+/// Waits up to [`STOP_WAIT`] for a command the console interrupted, which had the Ctrl+C too, to end on its own; its
+/// own status, with whatever it left in its job terminated. One still running then has its job terminated, and the
+/// status is `STATUS_CONTROL_C_EXIT`.
+fn interrupted(job: &Job, running: &Running, console: &mut Console) -> i64 {
+    console.err("gate: interrupted; stopping the command");
+    match running.wait(STOP_WAIT) {
+        Ok(Some(code)) => {
+            // What the command left running in its job does not outlive the gate after a Ctrl+C.
+            if let Err(error) = job.terminate(CONTROL_C_EXIT) {
+                console.err(&format!("gate: could not terminate the command's job: {error}"));
+            }
+            return i64::from(code.cast_signed());
+        }
+        Ok(None) => console.err("gate: the command was still running 5 s after the interrupt; terminating its job"),
+        Err(error) => console.err(&format!(
+            "gate: cannot wait for the command after the interrupt: {error}; terminating its job"
+        )),
+    }
+    match job.terminate(CONTROL_C_EXIT) {
+        Ok(()) => {
+            await_stopped(running, console);
+        }
+        Err(error) => console.err(&format!("gate: could not terminate the command's job: {error}")),
+    }
+    i64::from(CONTROL_C_EXIT.cast_signed())
+}
+
+/// Waits up to [`STOP_WAIT`] for the command whose job was terminated; its exit code, or `None`, said, when it did not
+/// end or could not be waited for.
+fn await_stopped(running: &Running, console: &mut Console) -> Option<u32> {
+    match running.wait(STOP_WAIT) {
+        Ok(Some(code)) => Some(code),
+        Ok(None) => {
+            console.err("gate: the command was still running 5 s after its job was terminated");
+            None
+        }
+        Err(error) => {
+            console.err(&format!("gate: cannot wait for the command after terminating its job: {error}"));
+            None
         }
     }
 }
 
-/// `wall` in whole seconds, rounded half to even as the PowerShell gate's `[math]::Round` rounds.
-fn whole_seconds(wall: Duration) -> f64 {
-    wall.as_secs_f64().round_ties_even()
+/// `seconds` in whole seconds, rounded half to even as the PowerShell gate's `[math]::Round` rounds.
+fn whole_seconds(seconds: f64) -> f64 {
+    seconds.round_ties_even()
 }
 
 /// A line holding a failure marker: its number, counted from 1, and its text as printed.

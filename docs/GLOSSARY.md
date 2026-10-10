@@ -2,6 +2,7 @@
 
 Terms the gate's docs use in a project sense, in alphabetical order.
 
+- **Abandon**: the journal event a gate writes when Ctrl+C ends it while still queued, with the seconds it waited.
 - **Abandoned slot**: a slot taken from a gate that died holding it, seen as an abandoned mutex or, when the take is clean, a claim whose pid and start are no longer alive; the next gate takes it as its own and journals the takeover.
 - **Archive**: the gzipped `release` lines of a rolled journal, kept in `<state root>\archive\events-<stamp>.jsonl.gz` for 180 days; the gate whose append rolled the journal writes it before releasing the journal mutex.
 - **Aside copy**: the old `gate.exe` an install moves to `gate.exe.<stamp>.<pid>.old` beside the new one; a later install deletes it once no process holds it.
@@ -32,6 +33,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Heavy**: the slot kind for work that keeps several cores busy; its pool's thread budget is 4.
 - **History key**: a journal run's `command` after `gate_state::normalize_command`: split with the C runtime's argument rules, tree flags and their paths dropped, `.tmp` and worktree paths shortened, each word re-quoted; runs with the same key count together.
 - **Holds the machine**: said of a critical gate once it has taken every heavy and unreserved light slot.
+- **Interrupt**: a Ctrl+C or Ctrl+Break at the gate's console, which stops a queued gate or a running command (exit 0xC000013A unless the command exits on its own first).
 - **Journal**: the append-only `events.jsonl` in the state root, one JSON line per gate event (`queue`, `take`, `release` and others), with its rolled file and gzip archive.
 - **Journal mutex**: the named mutex `Local\gate-journal` (with the root hash under a non-default root) that every gate holds, waiting up to 2 s, while it appends to the journal, rolls it and archives.
 - **Lending**: a parent gate letting a nested gate its slot does not cover run on that slot while a critical request drains, instead of queueing behind it.

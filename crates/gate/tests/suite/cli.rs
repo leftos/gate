@@ -85,8 +85,12 @@ fn valid_run_runs_its_command_and_exits_with_its_status() {
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert_eq!(outcome.stderr, "", "{outcome:?}");
     assert!(outcome.stdout.starts_with("gate: passed in "), "{outcome:?}");
+    let passed = format!(
+        r"\Agate: passed in \d+ s \(load-adjusted \d+ s, ceiling 5 s\)\. Full output: {}\n\z",
+        regex::escape(&log)
+    );
     assert!(
-        outcome.stdout.ends_with(&format!(" s (ceiling 5 s). Full output: {log}\n")),
+        regex::Regex::new(&passed).expect("the pattern is valid").is_match(&outcome.stdout),
         "{outcome:?}"
     );
     assert!(case.folder().join("out.log").is_file(), "the log is in the working folder");

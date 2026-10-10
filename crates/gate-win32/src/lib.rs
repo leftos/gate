@@ -1,22 +1,27 @@
-//! The gate's Win32 layer: named mutexes and events, job objects, commands created suspended, the start time of the
-//! gate process or of another, the system's boot time, and the Windows message of an error code. It holds no policy:
+//! The gate's Win32 layer: named mutexes and events, job objects and their accounting, commands created suspended, the
+//! start time of the gate process or of another, the system's and a process's CPU times, the console interrupt, the
+//! system's boot time, and the Windows message of an error code. It holds no policy:
 //! the names, the waits, the command's environment and priority, and what an abandoned mutex means to the gate are the
 //! caller's. Windows only; elsewhere the crate is empty.
 
 #![cfg(windows)]
 
 mod event;
+mod interrupt;
 mod job;
 mod launch;
 mod mutex;
 mod piped;
+mod times;
 mod tree;
 
 pub use event::{EventWait, NamedEvent};
-pub use job::Job;
-pub use launch::{EnvironmentBlock, Launch, LaunchError, PriorityClass, Running, Suspended, same_variable_name};
+pub use interrupt::Interrupt;
+pub use job::{Accounting, Job};
+pub use launch::{EnvironmentBlock, Launch, LaunchError, PriorityClass, Running, Suspended, Waited, same_variable_name};
 pub use mutex::{AcquireError, MutexGuard, NamedMutex, OwnedMutexGuard, mutex_exists};
 pub use piped::{PipedLaunch, PipedSuspended, breakaway_refused};
+pub use times::{ProcessTimes, SystemTimes, file_time_now, process_times, system_times};
 
 /// Refuses an open file that is not a plain disk file: one that is not on a disk, is a reparse point (a link or a
 /// junction, when opened with `FILE_FLAG_OPEN_REPARSE_POINT`), or has more than one name.

@@ -9,7 +9,8 @@ use windows_sys::Win32::System::Threading::{
     CreateEventW, EVENT_MODIFY_STATE, OpenEventW, SYNCHRONIZATION_SYNCHRONIZE, SetEvent, WaitForSingleObject,
 };
 
-use crate::{own_handle, wait_millis, wide};
+use crate::interrupt::{Woken, wait_with};
+use crate::{Interrupt, own_handle, wait_millis, wide};
 
 /// A handle to a named event, created or opened by name and closed when dropped.
 pub struct NamedEvent {
@@ -24,6 +25,8 @@ pub enum EventWait {
     Signaled,
     /// The event was still unset when the timeout ran out.
     TimedOut,
+    /// The interrupt was raised while the event was unset.
+    Interrupted,
 }
 
 impl NamedEvent {
@@ -99,5 +102,21 @@ impl NamedEvent {
             WAIT_TIMEOUT => Ok(EventWait::TimedOut),
             _ => Err(io::Error::last_os_error()),
         }
+    }
+
+    /// Waits at most `timeout` for the event to be set or `interrupt` to be raised; a set event is
+    /// [`EventWait::Signaled`] even when the interrupt was raised too.
+    ///
+    /// # Errors
+    ///
+    /// The system's error when the wait itself fails.
+    pub fn wait_or_interrupt(&self, timeout: Duration, interrupt: Interrupt) -> io::Result<EventWait> {
+        // SAFETY: the handle is open for as long as `self` lives, with the `SYNCHRONIZE` access a created or opened
+        // event's handle has.
+        Ok(match unsafe { wait_with(interrupt, self.handle.raw(), timeout) }? {
+            Woken::Signaled => EventWait::Signaled,
+            Woken::Interrupted => EventWait::Interrupted,
+            Woken::TimedOut => EventWait::TimedOut,
+        })
     }
 }

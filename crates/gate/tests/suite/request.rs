@@ -34,7 +34,14 @@ fn print_request_shows_the_new_cli_request() {
         "defaultRoot": false,
         "rootHash": request["rootHash"],
         "command": ["cmd", "/c", "echo hi"],
-        "testSeams": {"sampleMs": null, "heartbeatMs": null, "pollMs": null, "stallMs": null},
+        "testSeams": {
+            "sampleMs": null,
+            "heartbeatMs": null,
+            "pollMs": null,
+            "stallMs": null,
+            "interruptAfterSamples": null,
+            "interruptQueued": false,
+        },
     });
     assert_eq!(outcome.stdout, format!("{expected}\n"), "the keys come in the published order");
 

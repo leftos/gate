@@ -5,11 +5,21 @@ use std::io;
 use proc_table::win32::OwnedHandle;
 use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, ERROR_MORE_DATA, GetLastError, SetLastError};
 use windows_sys::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, JOBOBJECT_BASIC_PROCESS_ID_LIST, JobObjectBasicProcessIdList, QueryInformationJobObject,
-    TerminateJobObject,
+    AssignProcessToJobObject, CreateJobObjectW, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_BASIC_PROCESS_ID_LIST,
+    JobObjectBasicAccountingInformation, JobObjectBasicProcessIdList, QueryInformationJobObject, TerminateJobObject,
 };
 
 use crate::{own_handle, wide};
+
+/// What a job has used and holds: its CPU time and its live processes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Accounting {
+    /// The user and kernel time of every process that has ever been in the job, those that have exited and those in
+    /// the jobs nested inside it included, in 100 ns ticks.
+    pub cpu: u64,
+    /// The processes in the job now.
+    pub active_processes: u32,
+}
 
 /// A named job object with no limits: a process in it cannot break away, and nothing is killed when the job is
 /// dropped, which only closes this handle.
@@ -68,6 +78,15 @@ impl Job {
         process_ids(&self.handle)
     }
 
+    /// The CPU time the job has used, every process ever in it counted, and the processes it holds now.
+    ///
+    /// # Errors
+    ///
+    /// The system's error when the job cannot be queried.
+    pub fn accounting(&self) -> io::Result<Accounting> {
+        accounting(&self.handle)
+    }
+
     /// Ends every process in the job, and in the jobs nested inside it, with `exit_code`.
     ///
     /// # Errors
@@ -115,6 +134,33 @@ pub(crate) fn process_ids(job: &OwnedHandle) -> io::Result<Vec<u32>> {
         }
         capacity = (capacity * 2).max(assigned + 16);
     }
+}
+
+/// The accounting of the job behind `job`: the user and kernel time of every process ever in it, and the processes it
+/// holds now. A handle without `JOB_OBJECT_QUERY` access gets the system's error.
+pub(crate) fn accounting(job: &OwnedHandle) -> io::Result<Accounting> {
+    let mut information = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+    let length = u32::try_from(size_of_val(&information)).map_err(io::Error::other)?;
+    // SAFETY: the handle is open for the whole call, and one without the `JOB_OBJECT_QUERY` access the call asks for
+    // only makes it fail; `information` is writable for `length` bytes, and no returned length is asked for.
+    let read = unsafe {
+        QueryInformationJobObject(
+            job.raw(),
+            JobObjectBasicAccountingInformation,
+            (&raw mut information).cast(),
+            length,
+            std::ptr::null_mut(),
+        )
+    };
+    if read == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let user = u64::try_from(information.TotalUserTime).map_err(io::Error::other)?;
+    let kernel = u64::try_from(information.TotalKernelTime).map_err(io::Error::other)?;
+    Ok(Accounting {
+        cpu: user + kernel,
+        active_processes: information.ActiveProcesses,
+    })
 }
 
 /// Ends every process in the job behind `job`, and in the jobs nested inside it, with `exit_code`. A handle without

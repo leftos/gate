@@ -26,7 +26,8 @@ use windows_sys::Win32::System::Threading::{
 };
 use windows_sys::Win32::System::WindowsProgramming::PROCESS_CREATION_DESKTOP_APP_BREAKAWAY_DISABLE_PROCESS_TREE;
 
-use crate::{Job, own_handle, wait_millis, win32_message};
+use crate::interrupt::{Woken, wait_with};
+use crate::{Interrupt, Job, own_handle, wait_millis, win32_message};
 
 /// A Unicode environment block, its entries sorted by name as `CreateProcessW` wants them.
 #[derive(Clone, Debug)]
@@ -552,11 +553,44 @@ impl Running {
             WAIT_TIMEOUT => return Ok(None),
             _ => return Err(io::Error::last_os_error()),
         }
+        self.exit_code().map(Some)
+    }
+
+    /// Waits at most `timeout` for the command to exit or `interrupt` to be raised; a command that has exited is
+    /// [`Waited::Exited`] even when the interrupt was raised too.
+    ///
+    /// # Errors
+    ///
+    /// The system's error when the wait fails or the exit code cannot be read.
+    pub fn wait_or_interrupt(&self, timeout: Duration, interrupt: Interrupt) -> io::Result<Waited> {
+        // SAFETY: the handle is open for as long as `self` lives, with the `SYNCHRONIZE` access a created process's
+        // handle has.
+        match unsafe { wait_with(interrupt, self.process.raw(), timeout) }? {
+            Woken::Signaled => self.exit_code().map(Waited::Exited),
+            Woken::Interrupted => Ok(Waited::Interrupted),
+            Woken::TimedOut => Ok(Waited::Running),
+        }
+    }
+
+    /// The exit code of the command, which has exited.
+    fn exit_code(&self) -> io::Result<u32> {
+        let process: HANDLE = self.process.raw();
         let mut code = 0;
         // SAFETY: the handle is open for the whole call, with query access, and `code` is writable.
         if unsafe { GetExitCodeProcess(process, &raw mut code) } == 0 {
             return Err(io::Error::last_os_error());
         }
-        Ok(Some(code))
+        Ok(code)
     }
+}
+
+/// How a wait for a command that an interrupt may end ended.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Waited {
+    /// The command exited, with this code.
+    Exited(u32),
+    /// The interrupt was raised while the command still ran.
+    Interrupted,
+    /// The command still runs.
+    Running,
 }

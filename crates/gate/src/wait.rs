@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use gate_args::RunRequest;
 use gate_state::KernelObject;
 use gate_state::v1::{self, Ticket};
-use gate_win32::{NamedEvent, mutex_exists};
+use gate_win32::{Interrupt, NamedEvent, mutex_exists};
 use jiff::Timestamp;
 
 use crate::console::Console;
@@ -35,23 +35,38 @@ pub(crate) struct Wait<'a> {
     processors: usize,
     /// The gate's own wake event, or `None` when it could not be created and the poll alone wakes the gate.
     event: Option<NamedEvent>,
+    /// The console interrupt that ends the wait, or `None` when it could not be installed.
+    interrupt: Option<Interrupt>,
+    /// The interrupt the gate raises itself once it has said it waits (`--test-interrupt-queued`), else `None`.
+    interrupt_when_waiting: Option<Interrupt>,
     ticket: PathBuf,
     said_waiting: bool,
     said_ignored: bool,
     said_wait_failed: bool,
 }
 
+/// What a run reads of its host once: the machine's logical processors and the console interrupt, `None` when its
+/// handler could not be installed.
+#[derive(Clone, Copy)]
+pub(crate) struct Host {
+    pub processors: usize,
+    pub interrupt: Option<Interrupt>,
+}
+
+/// The gate that queues and what it asked: which gate it is, its request, and when it queued.
+#[derive(Clone, Copy)]
+pub(crate) struct Arrival<'g> {
+    pub gate: &'g ThisGate,
+    pub request: &'g RunRequest,
+    pub queued: Instant,
+}
+
 impl<'a> Wait<'a> {
-    /// Queues `gate` for a slot of `pool`, which it queued for at `queued`: creates its wake event before it writes its
-    /// ticket, so no wake is lost. Each that cannot be made is said, and the gate waits on without it.
-    pub(crate) fn queue(
-        root: &'a ResolvedRoot,
-        pool: Pool,
-        gate: &ThisGate,
-        request: &RunRequest,
-        queued: Instant,
-        console: &mut Console,
-    ) -> Wait<'a> {
+    /// Queues the arriving gate for a slot of `pool`: creates its wake event before it writes its ticket, so no wake
+    /// is lost. Each that cannot be made is said, and the gate waits on without it. A raised interrupt of `host` ends
+    /// the wait.
+    pub(crate) fn queue(root: &'a ResolvedRoot, pool: Pool, arrival: Arrival<'_>, host: Host, console: &mut Console) -> Wait<'a> {
+        let Arrival { gate, request, queued } = arrival;
         let name = root.root.object_name(KernelObject::WakeEvent {
             pid: gate.pid,
             start_ms: gate.start_ms,
@@ -81,8 +96,10 @@ impl<'a> Wait<'a> {
             poll: request.test_seams.poll_ms.map_or(POLL, Duration::from_millis),
             heartbeat,
             next_heartbeat: heartbeat,
-            processors: processors(console),
+            processors: host.processors,
             event,
+            interrupt: host.interrupt,
+            interrupt_when_waiting: host.interrupt.filter(|_| request.test_seams.interrupt_queued),
             ticket: path,
             said_waiting: false,
             said_ignored: false,
@@ -92,21 +109,30 @@ impl<'a> Wait<'a> {
 
     /// Passes until the gate takes a slot: each pass reads the counts and the tickets, tries the pool when no live
     /// ticket of the gate's kind is ahead of it, and otherwise sleeps on the wake event until the poll or the next
-    /// still-waiting line.
-    pub(crate) fn until_taken(&mut self, survey: &mut Survey, console: &mut Console) -> Taken {
+    /// still-waiting line. `None` once the console is interrupted, which ends the wait at once.
+    pub(crate) fn until_taken(&mut self, survey: &mut Survey, console: &mut Console) -> Option<Taken> {
         loop {
+            if self.interrupted() {
+                return None;
+            }
             let count = self.count(console);
             if self.may_try(count, survey, console)
                 && let Some(taken) = slots::try_pool(self.root, self.pool, count, survey, console)
             {
-                return taken;
+                return Some(taken);
             }
             if !self.said_waiting {
                 self.said_waiting = true;
                 let busy = self.busy(count, survey, console);
                 console.err(&format!("gate: waiting for a {} slot ({busy} busy)", self.pool.name()));
+                if let Some(interrupt) = self.interrupt_when_waiting {
+                    interrupt.raise();
+                }
             }
             self.sleep(console);
+            if self.interrupted() {
+                return None;
+            }
             self.say_heartbeat(console);
         }
     }
@@ -176,15 +202,24 @@ impl<'a> Wait<'a> {
             .collect()
     }
 
-    /// Sleeps on the wake event until it is set, the poll runs out or the next still-waiting line is due. A wait that
-    /// fails is said once and slept out instead.
+    /// Whether the console was interrupted.
+    fn interrupted(&self) -> bool {
+        self.interrupt.is_some_and(Interrupt::is_raised)
+    }
+
+    /// Sleeps on the wake event until it is set, the console is interrupted, the poll runs out or the next
+    /// still-waiting line is due. A wait that fails is said once and slept out instead.
     fn sleep(&mut self, console: &mut Console) {
         let timeout = self.poll.min(self.next_heartbeat.saturating_sub(self.queued.elapsed()));
         let Some(event) = &self.event else {
             thread::sleep(timeout);
             return;
         };
-        if let Err(error) = event.wait(timeout) {
+        let waited = match self.interrupt {
+            Some(interrupt) => event.wait_or_interrupt(timeout, interrupt),
+            None => event.wait(timeout),
+        };
+        if let Err(error) = waited {
             if !self.said_wait_failed {
                 self.said_wait_failed = true;
                 console.err(&format!("gate: cannot wait on the wake event {}: {error}", event.name()));
@@ -206,9 +241,9 @@ impl<'a> Wait<'a> {
     }
 }
 
-/// The machine's logical processors, which the default counts are made from. A count that cannot be read is said and
-/// taken as 1.
-fn processors(console: &mut Console) -> usize {
+/// The machine's logical processors, which the default counts and the watch's share are made from. A count that cannot
+/// be read is said and taken as 1.
+pub(crate) fn processors(console: &mut Console) -> usize {
     std::thread::available_parallelism().map_or_else(
         |error| {
             console.err(&format!("gate: cannot read the processor count: {error}; counting 1"));

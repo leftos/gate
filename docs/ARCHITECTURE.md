@@ -6,7 +6,7 @@ The rule that shapes it: every file and kernel object another process sees is de
 
 `gate-state` and `proc-table` exist (moved in from ops-tower with their history, GATE-4), and so do `gate-args` and the `gate` binary's skeleton (GATE-32).
 
-`gate-win32` exists with the named mutexes and events (GATE-33), and the `gate` binary has the slot loop (GATE-34, GATE-30), `gate stop-tree` (GATE-57) and the box side's `boot` and `preflight` verbs (GATE-59) and its `run` and `stop` verbs (GATE-60). `gate-watchdog` exists as a pure crate (GATE-56), and nothing in the `gate` binary uses it yet.
+`gate-win32` exists with the named mutexes and events (GATE-33), and the `gate` binary has the slot loop (GATE-34, GATE-30), `gate stop-tree` (GATE-57) and the box side's `boot` and `preflight` verbs (GATE-59) and its `run` and `stop` verbs (GATE-60). `gate-watchdog` exists as a pure crate (GATE-56), and the `gate` binary uses it through `watch.rs` (GATE-58).
 
 `gate-router` exists as a pure crate (GATE-66): the routing decision, `remote.json` parsing, the `-like` matcher, the path rewrite and the work-folder key. Nothing in the `gate` binary uses it yet.
 
@@ -34,7 +34,7 @@ The rule that shapes it: every file and kernel object another process sees is de
 | Change the log, the tail, the failure markers or the verdict line | [design.md, Log and tail](design.md#log-and-tail) and [Output lines](design.md#output-lines) → `crates/gate/src/{log,console,run}.rs` → `crates/gate-state/src/verdict.rs` → `crates/gate/tests/suite/launch.rs` | [design.md](design.md#log-and-tail) |
 | Change the command text the journal and claim carry | [design.md, Claim](design.md#claim) and [Journal](design.md#journal) → `crates/gate/src/slots.rs` (`ThisGate`) → `crates/gate-args/src/cmdline.rs` (`command_text`) → `crates/gate-state/src/journal.rs` (`normalize_command`) | [design.md](design.md#journal) |
 | Change `gate stop-tree` or how a kill reaches a tree | [design.md, CLI](design.md#gate-stop-tree) → `crates/gate/src/{answer,stop_tree}.rs` → `crates/gate-win32/src/{job,tree}.rs` → `crates/proc-table/src/lib.rs` (`descendants`) → `crates/gate/tests/suite/stop_tree.rs` → items X1, X2 and X5-X7 in [the inventory](research/2026-10-09-powershell-gate-inventory.md) | [design.md](design.md#gate-stop-tree) |
-| Change the watchdog's sampling, stall check, free share, load-adjusted clock, ceiling or backstop | [design.md, Watchdog](design.md#watchdog) → `crates/gate-watchdog/src/{share,watch}.rs` → `crates/gate-win32/src/{job,lib}.rs` (the samples, once taken) → `crates/gate/src/run.rs` → items W1-W7 in [the inventory](research/2026-10-09-powershell-gate-inventory.md) | [design.md](design.md#watchdog) |
+| Change the watchdog's sampling, stall check, free share, load-adjusted clock, ceiling or backstop | [design.md, Watchdog](design.md#watchdog) → `crates/gate-watchdog/src/{share,watch}.rs` → `crates/gate/src/watch.rs` (the sampler and the stall kill) → `crates/gate-win32/src/{times,interrupt,job}.rs` (the samples and the interrupt) → `crates/gate/src/run.rs` → items W1-W7 in [the inventory](research/2026-10-09-powershell-gate-inventory.md) | [design.md](design.md#watchdog) |
 | Change the box heartbeat | `crates/gate-watchdog/src/heartbeat.rs` → item BW9 in [the inventory](research/2026-10-09-powershell-gate-inventory.md) | [design/gate-remote-slot.md](design/gate-remote-slot.md) |
 | Change what routes to a builder | [design.md, Routing](design.md#routing-and-the-remoteps1-bridge) → `crates/gate-router/src/decide.rs` (the order of checks, `Facts`) → `config.rs` (`remote.json`), `like.rs` (the matcher), `rewrite.rs` (in-worktree paths), `key.rs` (the work-folder key) → `crates/gate-router/tests/router/` | [design/gate-remote-slot.md](design/gate-remote-slot.md) |
 | Change how a routed run reaches the builder (the bridge, its fallback and journal lines) | `crates/gate-router/` → `crates/gate/src/` (route, bridge, run, slots, wait, journal: the files the routing part adds or touches) → `crates/gate-state/src/journal_writer.rs` (+ `v1.rs`, `remote.rs`) → `crates/gate-win32/src/launch.rs` → `crates/gate/tests/suite/` routing cases → [design.md, Routing](design.md#routing-and-the-remoteps1-bridge) | [design/gate-remote-slot.md](design/gate-remote-slot.md) |
@@ -61,9 +61,12 @@ The rule that shapes it: every file and kernel object another process sees is de
 
   Built so far: named mutexes, events and process start times (the gate's own, and `process_start_of(pid)` for another process, `None` for a pid that is gone or exited).
 
-  Also `system_directory` (the folder holding cmd.exe), `runs_below_normal` (the gate's own priority class), `win32_message`, `boot_time` (when the machine booted), and job objects (`Job`: create, terminate, process ids; `OpenedJob`: open by name, process ids, terminate). Process stopping is `StoppableProcess` (open, created, wait, terminate; in `tree.rs`).
+  Also `system_directory` (the folder holding cmd.exe), `runs_below_normal` (the gate's own priority class), `win32_message`, `boot_time` (when the machine booted), and job objects (`Job`: create, terminate, process ids, `accounting`; `OpenedJob`: open by name, process ids, terminate). Process stopping is `StoppableProcess` (open, created, wait, terminate; in `tree.rs`).
 
   Suspended process creation is `Launch` → `Suspended` → `Running`, with `EnvironmentBlock`, `same_variable_name` and `PriorityClass`. The box's piped launch is `PipedLaunch` → `PipedSuspended` (in `piped.rs`: a hidden console, breakaway from the caller's job, two pipes and a query-only job handle inherited), with `check_plain_file` and `breakaway_refused`.
+
+  Also the samples in `times.rs` (`system_times`, `process_times`, `file_time_now`) and the Ctrl+C handler in `interrupt.rs` (`Interrupt`: install, is_raised, raise; `Running::wait_or_interrupt` and `NamedEvent::wait_or_interrupt` end a wait early).
+>>>>>>> theirs
 
   Owns job objects, process creation, named mutexes and events, priority, console handling and taking samples. References `proc-table` and `windows-sys`. Never holds policy: what to kill and when is `gate-watchdog`'s.
 - **`gate`** (`crates/gate/`, Windows only): the binary. Owns the subcommands, the wait loop, the run, the journal writes, the `remote.ps1` bridge and `gate box`. References every crate above. Nothing depends on it.
@@ -72,7 +75,7 @@ The rule that shapes it: every file and kernel object another process sees is de
 
   `stop_tree.rs` is `gate stop-tree`: the snapshot, the tree, the gate jobs and the deepest-first terminates.
 
-  Also `run.rs` (the run lifecycle: program, batch refusal, queue, take, launch, wait, verdict, release), `log.rs` (the log, its tail and the failure markers) and `environment.rs` (the command's environment and slot marker).
+  Also `run.rs` (the run lifecycle: program, batch refusal, queue, take, launch, wait, verdict, release), `log.rs` (the log, its tail and the failure markers), `environment.rs` (the command's environment and slot marker) and `watch.rs` (the watch of a running command: the sampler, the load-adjusted clock, the stall kill and the Ctrl+C stop).
 
 `boxside/` is `gate box`: `mod.rs` (the verbs and their exits), `payload.rs` (the base64 JSON payload), `preflight.rs` (the bare repo, the work folder and the report lines), `boot.rs` (the boot-time line), `run.rs` (the lock, the git flags, the sync, the command and the back commit), `forward.rs` (the pipes forwarded to stdout and stderr) and `stop.rs` (terminating the job).
 

@@ -25,6 +25,8 @@ pub(crate) enum ValueOption {
     PollMs,
     #[cfg(feature = "test-seams")]
     StallMs,
+    #[cfg(feature = "test-seams")]
+    InterruptAfterSamples,
 }
 
 /// An option that is on or off.
@@ -34,6 +36,8 @@ pub(crate) enum SwitchOption {
     Local,
     #[cfg(feature = "test-seams")]
     PrintRequest,
+    #[cfg(feature = "test-seams")]
+    InterruptQueued,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -123,6 +127,8 @@ impl RunBuilder {
             ValueOption::PollMs => self.test_seams.poll_ms = Some(values::above_zero(spelled, value)?),
             #[cfg(feature = "test-seams")]
             ValueOption::StallMs => self.test_seams.stall_ms = Some(values::above_zero(spelled, value)?),
+            #[cfg(feature = "test-seams")]
+            ValueOption::InterruptAfterSamples => self.test_seams.interrupt_after_samples = Some(values::above_zero(spelled, value)?),
         }
         Ok(())
     }
@@ -137,6 +143,8 @@ impl RunBuilder {
             SwitchOption::Local => self.local = on,
             #[cfg(feature = "test-seams")]
             SwitchOption::PrintRequest => self.print_request = on,
+            #[cfg(feature = "test-seams")]
+            SwitchOption::InterruptQueued => self.test_seams.interrupt_queued = on,
         }
     }
 
