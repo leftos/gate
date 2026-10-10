@@ -21,6 +21,7 @@ mod interrupt;
 mod journal;
 mod launch;
 mod nesting;
+mod pause;
 mod remote_client;
 mod request;
 mod routing;

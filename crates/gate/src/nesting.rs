@@ -17,11 +17,13 @@ const START_DIGITS: usize = 18;
 /// The most characters of a malformed marker its line shows.
 const MARKER_SHOWN: usize = 64;
 
-/// A live parent gate named by the marker: the slot kind it holds, its pid, and its marker as written.
+/// A live parent gate named by the marker: the slot kind it holds, its pid, the start it runs since in Unix epoch
+/// milliseconds, and its marker as written.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Parent {
     pub held: Slot,
     pub pid: u32,
+    pub start_ms: u64,
     pub marker: String,
 }
 
@@ -81,6 +83,7 @@ impl Nesting {
         let parent = Parent {
             held,
             pid,
+            start_ms: start,
             marker: text.into_owned(),
         };
         if covers(held, kind) {
@@ -255,6 +258,7 @@ mod tests {
         let parent = |held: Slot| Parent {
             held,
             pid: UNREADABLE,
+            start_ms: START,
             marker: marker(held.as_str()),
         };
         assert_eq!(decided(&marker("heavy"), Slot::Light), Nesting::Covered(parent(Slot::Heavy)));
@@ -286,6 +290,7 @@ mod tests {
         Parent {
             held,
             pid: PID,
+            start_ms: START,
             marker: marker(held),
         }
     }
@@ -341,6 +346,7 @@ mod tests {
             Some(&Parent {
                 held: Slot::Heavy,
                 pid: PID,
+                start_ms: START,
                 marker: hashless.clone()
             }),
             "no hash under the default root"

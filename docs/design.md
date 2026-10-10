@@ -251,7 +251,7 @@ For any other root, every kernel object name carries `<h>`, the first 8 lower-ca
 | `remote.json` | people | the router, ops-tower (`slots`) | Builders and routing (T1); read from `%LOCALAPPDATA%\gate\remote.json`, beside the `v1\` folder, whatever the state root is. |
 | `slots\<name>.json` | the gate holding the slot, written after its `take` line | other gates, ops-tower | [Claim](#claim); `<name>` is the mutex name without `Local\` and the root hash, plus `gate-critical.json` for a critical gate, its one claim for the whole machine (kind `critical`, index 0), written after its `take` line; the heavy and light slots it holds get none. |
 | `waiting\<pid>-<start>.json` | the waiting gate | other gates, ops-tower | [Ticket](#ticket). |
-| `paused\<parent pid>-<parent start>-<pid>-<start>.pause` | a nested gate waiting behind a critical request | its parent's watchdog | Empty file rewritten every pass (kept, N3). |
+| `paused\<parent pid>-<parent start>-<pid>-<start>.pause` | a gate waiting behind a critical request under a parent gate's slot | its parent gate's watchdog (not yet wired, GATE-91) | Empty file; [Critical drain and nesting](#critical-drain-and-nesting) (kept, N3). |
 | `events.jsonl`, `events.1.jsonl` | every gate, under the journal mutex | ops-tower, the durations summary, people | [Journal](#journal). |
 | `archive\events-<yyyyMMddTHHmmssZ>.jsonl.gz` | the gate whose append rolled the journal | the durations summary | [Archive](#archive). |
 | `durations.json`, `backfill\<pid>.json` and the backfill bar record | gates | gates | Reserved for learned durations (GATE-7; [design/gate-durations.md](design/gate-durations.md)). |
@@ -440,7 +440,7 @@ Changes from the PowerShell forms:
 - The pause folder lives in the state root, so a test root isolates it.
 - Light gates beside a critical gate and the critical gate's own waits use the wake events and the queue order of [Taking a slot](#taking-a-slot).
 
-What `gate.exe` does of it today is part A, nesting under the slot marker (N1, K7), part B1, the critical request's own drain and take (K1, K2, K5), and part B2, the barrier (Q3), the light gates beside a critical request (K3) and the lend (N2), all below. Not built: the pause markers (N3), a later part (GATE-95).
+What `gate.exe` does of it today is part A, nesting under the slot marker (N1, K7), part B1, the critical request's own drain and take (K1, K2, K5), the barrier (Q3), the light gates beside a critical request (K3), the lend (N2) and the pause markers' writer and reader (N3), all below. The watchdog does not read the markers yet (GATE-91).
 
 - A gate reads `GATE_SLOT_HELD` once, before routing and before the log mutex (`nesting.rs`). A live parent whose slot covers the gate's kind (heavy covers heavy and light, light covers light, critical covers all three) gives `gate: running under the <held kind> slot of gate <pid>`: the gate takes no slot, writes no ticket or claim, and journals one `covered` line (identity fields, then `parentPid`; no `queue`, `take` or `release`).
 
@@ -464,6 +464,12 @@ What `gate.exe` does of it today is part A, nesting under the slot marker (N1, K
 - **The lend (N2).** A heavy gate under a light parent (the one nesting case where the parent's slot does not cover the gate) is lent the parent's slot, takes no slot of its own and says the lend line, while a critical request is pending (a live critical ticket of another gate, or else the critical mutex open), no critical request holds the machine (no live critical ticket with `holds`), and the parent's light claim is not on a reserved light slot or past the light count (an unreadable or missing claim lends).
 
   The rule is checked before the gate queues, when the gate is lent without routing, queue line or ticket, and on every pass of its wait once it has queued, when it deletes its ticket and wakes the waiters. Its command gets the parent's marker. It journals `parent` with `parentPid` and no `take` or `release`; a gate lent as it waited has its `queue` before the `parent`. Once the critical gate holds the machine nothing is lent, and the child waits behind it like any gate.
+- **The pause marker (N3).** A gate waiting for a slot under a parent gate's marker that does not cover it keeps the empty file `paused\<parent pid>-<parent start>-<pid>-<start>.pause` in the state root. It writes the file on every pass of the wait while a live critical ticket that arrived before its own exists (the barrier), setting its last-write time explicitly each time, so the file's age shows the gate is alive.
+
+  It deletes the file when that stops and however the wait ends: take, lend, timeout, Ctrl+C or a panic. A write or delete that fails is said once per wait, each, and the wait goes on.
+- **Reading the pause markers.** `live_child_pause` (`pause.rs`) answers for a parent gate whether a gate under it waits behind a critical request. No `paused` folder means no pause. A marker counts when its name parses, names this gate as the parent, its child gate still runs with the start in the name (a start that cannot be read counts as not running), it was written at most 30 s ago (exactly 30 s is live) and the child's ticket exists. A marker gone while it is read is skipped. On the first marker that counts, the answer is whether a critical request is pending (a live critical ticket, else the critical mutex open).
+
+  A folder, the waiting tickets or the critical mutex that cannot be read is an error the caller says once, and the parent pauses nothing. The watchdog does not call the reader yet (GATE-91).
 - **Lines**, on stderr and in the log:
   - `gate: waiting for the machine (critical): <h> heavy and <l> light slots held (<r> light slot|light slots reserved for light gates beside it), <n> earlier waiters`, the first time a pass falls short; a critical gate that takes the machine on its first pass says nothing.
   - `gate: still waiting for the machine (critical): <status> (<s> s)`, with the same status, on each heartbeat.
@@ -473,6 +479,8 @@ What `gate.exe` does of it today is part A, nesting under the slot marker (N1, K
   - `gate: running under the <held kind> slot of gate <pid> while a critical request drains; taking no slot`, from a lent gate, said once its command's environment is built.
   - `gate: interrupted while waiting for the machine`, on Ctrl+C: the journal gets `abandon`, everything taken is released and the exit is 0xC000013A.
   - `gate: cannot read the claims in <dir>: <error>`, said once, for an entry of the claims folder that cannot be read; the entry is skipped.
+  - `gate: could not write the pause marker <path> (<reason>)` and `gate: could not delete the pause marker <path> (<reason>)`, each said once a wait.
+  - `gate: could not read the pause markers in <folder> (<reason>); a gate under this one pauses nothing`, and the same with `the waiting tickets in <folder>` or `the critical mutex <name>`, from the reader's caller.
 
 ## Watchdog
 

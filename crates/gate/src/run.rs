@@ -30,7 +30,7 @@ use crate::remote::{self, NoClient, RemoteCall, RemoteClient, RemoteOutcome};
 use crate::resolve::{Environment, ResolvedRoot};
 use crate::route;
 use crate::slots::{self, ClaimOf, Pool, Survey, Taken, ThisGate, epoch_ms};
-use crate::wait::{self, Arrival, Host, Wait, Waited};
+use crate::wait::{self, Arrival, Host, UnderParent, Wait, Waited};
 use crate::watch::{Start, Watched, Watcher, Watching};
 
 /// The status of a run the gate itself failed.
@@ -767,7 +767,10 @@ impl Run<'_> {
             arrived: self.arrived,
             builder: self.tag.as_ref().map(|tag| tag.host.as_str()),
             under: match self.nesting {
-                Nesting::Under(parent) => Some(parent.pid),
+                Nesting::Under(parent) => Some(UnderParent {
+                    pid: parent.pid,
+                    start_ms: parent.start_ms,
+                }),
                 _ => None,
             },
         };

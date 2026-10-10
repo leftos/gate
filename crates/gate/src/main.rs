@@ -14,6 +14,7 @@ mod journal;
 mod log;
 mod machine;
 mod nesting;
+mod pause;
 mod remote;
 mod request_json;
 mod resolve;

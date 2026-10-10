@@ -122,6 +122,39 @@ fn paths_sit_under_the_root_as_design_md_names_them() {
         ["waiting", "4242-1760000000123.json"]
     );
     assert_eq!(parts_under(root, &v1::counts_path(root)), ["slot-counts.json"]);
+    assert_eq!(parts_under(root, &v1::paused_dir(root)), ["paused"]);
+    assert_eq!(
+        parts_under(root, &v1::pause_path(root, 4242, 1_760_000_000_000, 5151, 1_760_000_001_000)),
+        ["paused", "4242-1760000000000-5151-1760000001000.pause"]
+    );
+}
+
+#[test]
+fn a_pause_marker_name_builds_and_parses_and_refuses_anything_else() {
+    let marker = v1::PauseMarker {
+        parent_pid: 4242,
+        parent_start_ms: 1_760_000_000_000,
+        pid: 5151,
+        start_ms: 1_760_000_001_000,
+    };
+    let name = v1::pause_name(marker.parent_pid, marker.parent_start_ms, marker.pid, marker.start_ms);
+
+    assert_eq!(name, "4242-1760000000000-5151-1760000001000.pause");
+    assert_eq!(v1::parse_pause_name(&name), Some(marker), "a built name parses back to what built it");
+    let refused = [
+        "4242-1760000000000-5151-176000001000-7.pause",
+        "4242-1760000000000-5151-176000001000",
+        "4242-1760000000000-5151-1760000001000.pause.bak",
+        "4242-1760000000000-5151.pause",
+        "4242-x-5151-1760000001000.pause",
+        "4242--5151-1760000001000.pause",
+        "-4242-1760000000000-5151-1760000001000.pause",
+        "4242-1760000000000-4294967296-176000001000.pause",
+        "4242-1760000000000-5151-123456789012345678901.pause",
+    ];
+    for text in refused {
+        assert_eq!(v1::parse_pause_name(text), None, "{text}");
+    }
 }
 
 #[test]

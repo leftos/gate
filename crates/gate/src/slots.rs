@@ -244,7 +244,7 @@ impl Survey {
     /// and left in place. A tickets folder that cannot be read holds none, said once.
     pub(crate) fn live_tickets(&mut self, root: &Path, console: &mut Console) -> (Vec<Ticket>, bool) {
         let dir = v1::tickets_dir(root);
-        let listed = match v1::read_tickets(&dir) {
+        let listed = match listed_tickets(root, self.own) {
             Ok(listed) => listed,
             Err(error) => {
                 self.say_once("cannot read the tickets in", &dir.display().to_string(), error, console);
@@ -253,18 +253,19 @@ impl Survey {
         };
         let mut live = Vec::new();
         let mut deleted = false;
-        for (path, read) in listed {
-            let shown = path.display().to_string();
-            match read {
-                // Windows refuses to open a file whose delete is pending, so a ticket its gate is deleting as this gate
-                // reads it comes back access denied: it is going away, not unreadable, and is passed over unsaid. A
-                // skipped ticket never counts as ahead, so one that stays denied cannot block the queue either.
-                Err(FormatError::Io(error)) if error.kind() == io::ErrorKind::PermissionDenied => {}
-                Err(reason) => self.say_once("ignored the ticket", &shown, reason, console),
-                Ok(ticket) if self.is_live(&path, ticket.pid, ticket.start_ms, console) => live.push(ticket),
-                Ok(_) => match delete(&path) {
+        for entry in listed {
+            match entry {
+                Listed::Live(ticket) => live.push(ticket),
+                Listed::Unknown(ticket, path, error) => {
+                    self.say_once("cannot check the gate of", &path.display().to_string(), error, console);
+                    live.push(ticket);
+                }
+                Listed::Unreadable(path, reason) => {
+                    self.say_once("ignored the ticket", &path.display().to_string(), reason, console);
+                }
+                Listed::Dead(path) => match delete(&path) {
                     Ok(()) => deleted = true,
-                    Err(error) => self.say_once("cannot delete the dead gate's ticket", &shown, error, console),
+                    Err(error) => self.say_once("cannot delete the dead gate's ticket", &path.display().to_string(), error, console),
                 },
             }
         }
@@ -444,6 +445,51 @@ fn is_claim_file(name: &str) -> bool {
 /// `tickets` less the one of the gate `own`, its pid and start in epoch milliseconds.
 pub(crate) fn others(tickets: Vec<Ticket>, own: (u32, u64)) -> Vec<Ticket> {
     tickets.into_iter().filter(|ticket| (ticket.pid, ticket.start_ms) != own).collect()
+}
+
+/// One waiting ticket under a state root, as [`listed_tickets`] reads it.
+pub(crate) enum Listed {
+    /// The ticket of a gate that still runs.
+    Live(Ticket),
+    /// The ticket of a gate that is gone, at this path, for the caller to delete.
+    Dead(PathBuf),
+    /// The ticket of a gate whose start cannot be read, which counts as live, at this path, with the reason to say.
+    Unknown(Ticket, PathBuf, io::Error),
+    /// A ticket that cannot be read, at this path, with the reason to say.
+    Unreadable(PathBuf, FormatError),
+}
+
+impl Listed {
+    /// The ticket of a gate that still runs, as [`Listed::Live`] and [`Listed::Unknown`] carry it.
+    pub(crate) fn live(&self) -> Option<&Ticket> {
+        match self {
+            Listed::Live(ticket) | Listed::Unknown(ticket, ..) => Some(ticket),
+            Listed::Dead(_) | Listed::Unreadable(..) => None,
+        }
+    }
+}
+
+/// Each ticket under `root` in file order, judged against this gate's own pid and start `own`, which is never judged: a
+/// ticket this gate is deleting as it is read comes back access denied and is passed over, since it is going away. A
+/// tickets folder that cannot be listed is the io error; a missing one holds none.
+pub(crate) fn listed_tickets(root: &Path, own: (u32, u64)) -> io::Result<Vec<Listed>> {
+    let mut listed = Vec::new();
+    for (path, read) in v1::read_tickets(&v1::tickets_dir(root))? {
+        match read {
+            // Windows refuses to open a file whose delete is pending, so a ticket its gate is deleting as this gate
+            // reads it comes back access denied: it is going away, not unreadable, and is passed over unsaid. A
+            // skipped ticket never counts as ahead, so one that stays denied cannot block the queue either.
+            Err(FormatError::Io(error)) if error.kind() == io::ErrorKind::PermissionDenied => {}
+            Err(reason) => listed.push(Listed::Unreadable(path, reason)),
+            Ok(ticket) if (ticket.pid, ticket.start_ms) == own => listed.push(Listed::Live(ticket)),
+            Ok(ticket) => match gate_liveness(ticket.pid, ticket.start_ms) {
+                Liveness::Live => listed.push(Listed::Live(ticket)),
+                Liveness::Gone => listed.push(Listed::Dead(path)),
+                Liveness::Unknown(error) => listed.push(Listed::Unknown(ticket, path, error)),
+            },
+        }
+    }
+    Ok(listed)
 }
 
 /// Whose claim a slot holds: the gate, its request and log, and the remote tag of a routed run's remote slot.

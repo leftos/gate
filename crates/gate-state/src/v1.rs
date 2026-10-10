@@ -76,6 +76,64 @@ pub fn counts_path(root: &Path) -> PathBuf {
     root.join("slot-counts.json")
 }
 
+/// The folder of the pause markers, `<root>\paused`.
+#[must_use]
+pub fn paused_dir(root: &Path) -> PathBuf {
+    root.join("paused")
+}
+
+/// The name of the pause marker of the gate `pid` started at `start_ms` (Unix epoch milliseconds) waiting under the
+/// parent gate `parent_pid` started at `parent_start_ms`: `<parent pid>-<parent start>-<pid>-<start>.pause`.
+#[must_use]
+pub fn pause_name(parent_pid: u32, parent_start_ms: u64, pid: u32, start_ms: u64) -> String {
+    format!("{parent_pid}-{parent_start_ms}-{pid}-{start_ms}.pause")
+}
+
+/// The pause marker of the gate `pid` started at `start_ms` waiting under the parent gate `parent_pid` started at
+/// `parent_start_ms`, `<root>\paused\<name>` ([`pause_name`]).
+#[must_use]
+pub fn pause_path(root: &Path, parent_pid: u32, parent_start_ms: u64, pid: u32, start_ms: u64) -> PathBuf {
+    paused_dir(root).join(pause_name(parent_pid, parent_start_ms, pid, start_ms))
+}
+
+/// A pause marker's name read: the gate waiting under a parent's slot, and the parent gate it runs under.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PauseMarker {
+    /// The parent gate, the one whose slot the marker's gate runs under.
+    pub parent_pid: u32,
+    /// The parent gate's start, Unix epoch milliseconds.
+    pub parent_start_ms: u64,
+    /// The gate waiting, which keeps the marker.
+    pub pid: u32,
+    /// The waiting gate's start, Unix epoch milliseconds.
+    pub start_ms: u64,
+}
+
+/// `name` read as a pause marker's name ([`pause_name`]): four whole numbers without a sign, the pids within `u32`;
+/// `None` for a name of any other shape.
+#[must_use]
+pub fn parse_pause_name(name: &str) -> Option<PauseMarker> {
+    let mut parts = name.strip_suffix(".pause")?.split('-');
+    let parent_pid = parts.next().and_then(whole)?;
+    let parent_start_ms = parts.next().and_then(whole)?;
+    let pid = parts.next().and_then(whole)?;
+    let start_ms = parts.next().and_then(whole)?;
+    let marker = PauseMarker {
+        parent_pid: u32::try_from(parent_pid).ok()?,
+        parent_start_ms,
+        pid: u32::try_from(pid).ok()?,
+        start_ms,
+    };
+    parts.next().is_none().then_some(marker)
+}
+
+/// `text` as a whole number of at least one ASCII digit and no sign.
+fn whole(text: &str) -> Option<u64> {
+    (!text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit()))
+        .then(|| text.parse().ok())
+        .flatten()
+}
+
 /// The kind of slot a claim holds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

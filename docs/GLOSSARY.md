@@ -51,7 +51,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Marker**: a failure marker, a log line the built-in regex reads as a failure (such as `Build FAILED.` or `error CS1234`), which turns a zero exit into status 1.
 - **Nesting**: a gate started inside another gate's command (a build hook under a gated `git commit`), which reads its parent from the slot marker.
 - **Notes**: the gate's own lines gathered while a run goes and appended to the end of its log.
-- **Pause marker**: an empty file a nested gate rewrites while it waits behind a critical request, which stops its parent's watchdog clocks for that time.
+- **Pause marker**: an empty file a gate under a parent gate's slot rewrites on every pass while it waits behind a critical request, which stops its parent's watchdog clocks for that time once the watchdog reads it; one older than 30 s is stale.
 - **Pipe-closed stop**: the box's stop of a job whose client's connection closed: `gate box run` terminates the job, waits for its processes and exits 255.
 - **Pool**: the set of slots of one kind (heavy, light, remote); pools never wait on each other.
 - **Preflight**: the box's first call of a routed run (`gate box preflight`): it creates the bare repo and the work folder and reports the gate version, the boot time and the SDKs.

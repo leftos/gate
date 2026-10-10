@@ -1,8 +1,8 @@
 //! The wait for a slot: the gate's wake event and arrival ticket, the passes that re-read the counts and the tickets
 //! and try the pool when fewer live tickets of the gate's kind are ahead of it than slots are free, the barrier of a
 //! critical request that arrived before the gate, the lend of a light parent's slot while a critical request drains,
-//! and the lines a waiting gate says. The waiter's core, which a critical gate's wait for the machine shares, is
-//! [`Waiter`].
+//! the pause marker a gate under a parent's slot keeps while a critical request holds it back, and the lines a waiting
+//! gate says. The waiter's core, which a critical gate's wait for the machine shares, is [`Waiter`].
 
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -15,6 +15,7 @@ use gate_state::{KernelObject, SlotKind, reserved_light};
 use gate_win32::{Interrupt, NamedEvent, mutex_exists};
 
 use crate::console::Console;
+use crate::pause::Pause;
 use crate::resolve::ResolvedRoot;
 use crate::slots::{self, Pool, Survey, Taken, ThisGate};
 
@@ -156,6 +157,15 @@ pub(crate) fn delete_ticket(path: &Path, console: &mut Console) {
     }
 }
 
+/// The parent gate whose slot a gate waits under: the gate's pid, and the start it runs since in Unix epoch
+/// milliseconds, which between them name the pause marker the waiting gate keeps while a critical request holds it
+/// back ([`crate::pause`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct UnderParent {
+    pub pid: u32,
+    pub start_ms: u64,
+}
+
 /// A gate queued for a slot of its pool.
 pub(crate) struct Wait<'a> {
     root: &'a ResolvedRoot,
@@ -167,11 +177,13 @@ pub(crate) struct Wait<'a> {
     limit: Option<Duration>,
     /// What the wait lines say the gate waits for: `heavy slot`, or `remote slot on <host>`.
     place: String,
-    /// The pid of the light parent gate that lends the gate its slot while a critical request drains; `None` for a
-    /// gate under no such parent, and for a remote wait.
-    under: Option<u32>,
+    /// The parent gate whose slot this gate runs under, which lends it while a critical request drains and whose pause
+    /// marker it keeps; `None` for a gate under no such parent, and for a remote wait.
+    under: Option<UnderParent>,
     /// The critical request that held the gate back on the last pass; `None` when none did.
     barrier: Option<Barrier>,
+    /// The pause marker this gate keeps while it waits behind a critical request; no marker for a gate under no parent.
+    pause: Pause,
     waiter: Waiter,
     said_waiting: bool,
     said_ignored: bool,
@@ -202,9 +214,9 @@ pub(crate) struct Arrival<'g> {
     pub queued: Instant,
     pub arrived: u64,
     pub builder: Option<&'g str>,
-    /// The pid of the light parent gate whose slot does not cover this gate, which lends it while a critical request
-    /// drains; `None` for any other gate.
-    pub under: Option<u32>,
+    /// The parent gate whose slot does not cover this gate, which lends it while a critical request drains; `None` for
+    /// any other gate.
+    pub under: Option<UnderParent>,
 }
 
 /// How a wait ended.
@@ -240,6 +252,8 @@ impl<'a> Wait<'a> {
             expected: None,
         };
         let waiter = Waiter::queue(root, arrival, &ticket, host, console);
+        let under = under.filter(|_| !pool.is_remote());
+        let pause = Pause::of(&root.path, under, gate);
         Wait {
             root,
             pool,
@@ -252,8 +266,9 @@ impl<'a> Wait<'a> {
                 Some(builder) => format!("remote slot on {builder}"),
                 None => format!("{} slot", pool.name()),
             },
-            under: under.filter(|_| !pool.is_remote()),
+            under,
             barrier: None,
+            pause,
             waiter,
             said_waiting: false,
             said_ignored: false,
@@ -276,6 +291,7 @@ impl<'a> Wait<'a> {
                 return Waited::Lent;
             }
             self.barrier = self.barrier_in(&others);
+            self.pause.refresh(self.barrier.is_some(), console);
             let (range, probe) = self.range(count, survey, console);
             let (may_try, probe) = self.may_try(&others, range.clone(), probe, survey, console);
             if may_try && let Some(taken) = slots::try_pool(self.root, self.pool, range.clone(), survey, console) {
@@ -306,8 +322,9 @@ impl<'a> Wait<'a> {
             .then_some(Waited::TimedOut)
     }
 
-    /// Deletes the gate's ticket, the first step of its take.
-    pub(crate) fn end(self, console: &mut Console) {
+    /// Deletes the gate's ticket, the first step of its take, and its pause marker, whichever way the wait ended.
+    pub(crate) fn end(mut self, console: &mut Console) {
+        self.pause.end(console);
         self.waiter.end(console);
     }
 
@@ -337,7 +354,7 @@ impl<'a> Wait<'a> {
         self.under.is_some_and(|parent| {
             let mut facts = Probed {
                 root,
-                parent,
+                parent: parent.pid,
                 survey,
                 console,
             };
