@@ -10,8 +10,6 @@
   - [ ] GATE-62 Watchdog: count build servers, WSL and paused child gates as progress
     - [ ] GATE-91 Watchdog part D: a paused child gate counts as progress
   - [ ] GATE-38 Local slice 7: critical drain and nesting
-    - [/] GATE-94 Critical part B: the critical drain, barrier and reserved light slots
-    - [ ] GATE-95 Critical part C: pause markers, writer and reader
   - [!] GATE-41 Local slice 10: the PowerShell launcher execs gate.exe once the cutover flag is set
 - [ ] GATE-9 Local cutover: drain and switch to gate.exe, bridging routed runs to remote.ps1
 - [ ] GATE-77 Watchdog: lower build servers' priority during a critical run (B2)
@@ -21,7 +19,6 @@
 - [ ] GATE-10 Port the remote client and box wrapper, then the remote cutover
   - [ ] GATE-42 Remote slice 1: the box side as gate box (run, stop, preflight, boot)
     - [ ] GATE-61 Box part C: box heartbeat, UTF-8 console and the pipe-closed stop
-      - [/] GATE-85 Box part C3: the UTF-8 console and the same-job relaunch
     - [ ] GATE-96 Box run: escape the payload's Subfolder and command word where they are echoed
   - [ ] GATE-63 Box: restore a repo's dotnet tools before a routed run
   - [ ] GATE-26 Box: measure MSBuild node sharing across work folders, salt per work folder
@@ -61,3 +58,4 @@
 - [ ] GATE-100 Forward the box's git stderr under the output lock
 - [ ] GATE-101 A covered gate outlives its parent's slot
 - [ ] GATE-102 Give no slot marker when a gate cannot read its own start
+- [ ] GATE-103 Replace a personal machine path in a journal test and a design doc with stand-ins
