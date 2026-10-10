@@ -9,6 +9,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Back ref**: a local `refs/gate-remote/<key>-back` ref, the result the builder sent back and the gate kept; the bridge commit's choice of parent skips it.
 - **Backfill guest**: a waiting gate admitted, during a critical drain, onto a slot the critical gate lends, because its expected run ends before the drain's shadow end; one still running when the drain completes is killed and re-queued.
 - **Backstop**: the watchdog's last limit, five times the ceiling in wall time (less time paused behind a critical request), whatever the load.
+- **Barrier**: the earliest live critical ticket that arrived before a gate's own, which holds the gate back: a heavy gate takes no slot behind it and a light gate only a reserved light slot.
 - **Black-box suite**: the Rust integration suite (`crates/gate/tests/suite/`) that drives the built `gate.exe` through its CLI and reads only its exit code, output, log, journal, claims and tickets; it needs the `test-seams` feature to run.
 - **Box**: a builder; the word the gate's prose and its hidden `gate box` subcommand use.
 - **Box job**: the named job `Local\gate-remote-<key>-<12 hex>` that a `gate box run` puts its command in, named by the payload and stopped by `gate box stop`; it has no limits and no kill-on-close.
@@ -42,7 +43,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Interrupt**: a Ctrl+C or Ctrl+Break at the gate's console, which stops a queued gate or a running command (exit 0xC000013A unless the command exits on its own first).
 - **Journal**: the append-only `events.jsonl` in the state root, one JSON line per gate event (`queue`, `take`, `release` and others), with its rolled file and gzip archive.
 - **Journal mutex**: the named mutex `Local\gate-journal` (with the root hash under a non-default root) that every gate holds, waiting up to 2 s, while it appends to the journal, rolls it and archives.
-- **Lending**: a parent gate letting a nested gate its slot does not cover run on that slot while a critical request drains, instead of queueing behind it.
+- **Lending**: a light parent gate letting a nested heavy gate, which its slot does not cover, run on that slot while a critical request drains and before one holds the machine, instead of queueing behind it; the gate is the lent gate. A parent on a reserved light slot lends nothing.
 - **Lent window**: the span during a critical drain in which the critical gate lends one slot to backfill guests, ending at the shadow end.
 - **Light**: the slot kind for work that keeps one or two cores busy; its pool's thread budget is 2.
 - **Load-adjusted time**: wall time scaled by the free share in each sample, the clock the ceiling runs on, so a command slowed by other work is not killed for it.

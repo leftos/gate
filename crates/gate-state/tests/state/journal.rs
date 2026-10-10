@@ -580,7 +580,7 @@ fn selftest_and_covered_lines_are_ignored() {
     let mut lines = selftest.run(30, 5.0, json!(0));
     lines.extend([
         covered.line("covered", &ago(20), json!({"parentPid": 9})),
-        parent.line("parent", &ago(10), json!({"parentPid": 9})),
+        parent.line("parent", &ago(10), json!({})),
     ]);
     let history = history_of("selftest_and_covered_lines_are_ignored", &lines);
     assert_eq!(history, History::default());
@@ -1103,6 +1103,52 @@ fn the_parent_is_the_latest_run_of_its_pid_to_take_a_slot_before_the_parent_line
         (RunState::Parent, Some(0), Some(1140.0)),
         "the run of pid 9 that took its slot last before the parent line, not the earlier one released before it"
     );
+}
+
+#[test]
+fn apply_parent_reads_a_lent_childs_parent_line_on_parent_with_or_without_a_fallback() {
+    let child = Gate::new(1, START, COMMAND);
+    let parent = Gate::new(9, START, COMMAND);
+    let queued = vec![child.queue(&ago(30)), child.line("parent", &ago(27), json!({"parentPid": 9}))];
+    for (name, lent) in [("queued", queued), ("fell_back", on_parent_lines(&child))] {
+        let mut lines = vec![parent.queue(&ago(40)), parent.take(&ago(39), 0.5)];
+        lines.extend(lent);
+        lines.push(parent.release(&ago(20), 1140.0, json!(0)));
+        let history = history_of(&format!("a_lent_childs_parent_line_reads_on_parent_{name}"), &lines);
+        let run = history.runs.iter().find(|run| run.parent_pid.is_some());
+        assert!(run.is_some(), "{name}: the child reads on its parent: {:?}", history.runs);
+        let run = run.expect("checked above");
+        assert_eq!(
+            (run.state, run.parent_pid, run.status, run.held_seconds),
+            (RunState::Parent, Some(9), Some(0), Some(1140.0)),
+            "{name}: the child ends as its parent's run ended"
+        );
+    }
+}
+
+#[test]
+fn a_gate_lent_before_it_queued_shows_as_a_parent_run() {
+    let child = Gate::new(1, START, COMMAND);
+    let parent = Gate::new(9, START, COMMAND);
+    let lines = vec![
+        parent.queue(&ago(40)),
+        parent.take(&ago(39), 0.5),
+        child.line("parent", &ago(27), json!({"parentPid": 9})),
+        parent.release(&ago(20), 1140.0, json!(0)),
+    ];
+
+    let history = history_of("a_gate_lent_before_it_queued_shows_as_a_parent_run", &lines);
+
+    let run = history.runs.iter().find(|run| run.parent_pid.is_some());
+    assert!(run.is_some(), "the lone parent line makes a run: {:?}", history.runs);
+    let run = run.expect("checked above");
+    assert_eq!(
+        (run.state, run.parent_pid, run.status, run.held_seconds),
+        (RunState::Parent, Some(9), Some(0), Some(1140.0)),
+        "the child ends as its parent's run ended"
+    );
+    assert_eq!((&run.queued, &run.started), (&None, &None), "the child neither queued nor took a slot");
+    assert_eq!(history.runs.len(), 2, "{:?}", history.runs);
 }
 
 #[test]

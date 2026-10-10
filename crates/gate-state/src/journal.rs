@@ -4,11 +4,13 @@
 //! A run is keyed by the gate's `pid` and `processStart`, since the journal carries no run id: its `queue` line, its
 //! `take` once it holds a slot, then `release` as it lets the slot go or `abandon` when it ended still waiting. A run
 //! routed to the remote pool carries `remote` and `host` on those lines, and a `fallback` line when it was sent back to
-//! the local queue, which ends its remote take (no `release` follows for the remote slot): its local `take` follows, or
-//! a `parent` line when it ran on its parent gate's slot instead. `covered` lines and every other `parent` line (a gate
-//! running on its parent's slot) and every line of the gate's own self-test (a `cwd` holding `gate-selftest`) are ignored,
-//! except that any line's `abandoned` names join a run the cache already knows, and a line that does not parse is
-//! skipped. The folder, the prefix, the clock and the process liveness check all come from the caller.
+//! the local queue, which ends its remote take (no `release` follows for the remote slot): its local `take` follows. A
+//! `parent` line that names a parent gate marks a run on that gate's slot, whether it fell back onto it or was lent it
+//! while a critical request drained; a gate lent the slot before it queued writes only that line, which starts its run.
+//! `covered` lines, a `parent` line naming no parent and every line of the gate's own self-test (a `cwd` holding
+//! `gate-selftest`) are ignored, except that any line's `abandoned` names join a run the cache already knows, and a line
+//! that does not parse is skipped. The folder, the prefix, the clock and the process liveness check all come from the
+//! caller.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File};
@@ -47,7 +49,8 @@ pub enum RunState {
     Running,
     /// Not ended, and its gate is gone: it was killed, or its end was never written.
     Unrecorded,
-    /// Fell back onto its parent gate's slot: its command ran under the parent's run, which owns its time.
+    /// Ran on its parent gate's slot, fallen back onto it or lent it while a critical request drained: its command ran
+    /// under the parent's run, which owns its time.
     Parent,
 }
 
@@ -210,7 +213,8 @@ struct Run {
     wall_seconds: Option<f64>,
     adjusted_seconds: Option<f64>,
     end: Option<End>,
-    /// The parent gate's pid and the time of the run's `parent` line, once one followed its `fallback`.
+    /// The parent gate's pid and the time of the run's `parent` line, once it read one naming a parent: after its
+    /// `fallback`, after its `queue` when it was lent the slot as it waited, or alone when it was lent it before it queued.
     parent: Option<(u32, Timestamp)>,
     /// Every name the run's lines listed in `abandoned`, in line order without repeats.
     abandoned: Vec<String>,
@@ -358,28 +362,27 @@ impl JournalCache {
         let Ok(at) = line.time.parse::<Timestamp>() else {
             return;
         };
-        self.fold(line, at);
+        self.fold(&line, at);
     }
 
-    /// Folds one parsed line into its run: only the five events a run is made of create one, and a `parent` line marks a
-    /// run on its parent gate's slot. Every line, `parent` and `covered` included, adds the names it lists in
-    /// `abandoned` to a run the cache already knows. A run's first `queue` line sets its queued time; a later one does
-    /// not. A `fallback` line sends a remote run back to the local queue: the run is no longer remote, and keeps the
-    /// reason.
-    fn fold(&mut self, line: Line, at: Timestamp) {
+    /// Folds one parsed line into its run: the five events a run is made of create one, as does a `parent` line naming a
+    /// parent gate, which marks a run on that gate's slot ([`Self::apply_parent`]). Every line, `parent` and `covered`
+    /// included, adds the names it lists in `abandoned` to a run the cache already knows. A run's first `queue` line sets
+    /// its queued time; a later one does not. A `fallback` line sends a remote run back to the local queue: the run is
+    /// no longer remote, and keeps the reason.
+    fn fold(&mut self, line: &Line, at: Timestamp) {
         let key = (line.pid, line.process_start.clone());
         if line.event == "parent" {
-            self.note_abandoned(&key, &line.abandoned);
-            self.apply_parent(line, at);
+            self.apply_parent(key, line, at);
             return;
         }
         if !matches!(line.event.as_str(), "queue" | "take" | "release" | "abandon" | "fallback") {
             self.note_abandoned(&key, &line.abandoned);
             return;
         }
-        let run = self.runs.entry(key).or_insert_with(|| Run::new(&line, at));
+        let run = self.runs.entry(key).or_insert_with(|| Run::new(line, at));
         run.note_abandoned(&line.abandoned);
-        run.note(&line, Stamp { at, text: line.time.clone() });
+        run.note(line, Stamp { at, text: line.time.clone() });
     }
 
     /// Adds `line`'s `abandoned` names to run `key` when the cache knows it; a line of an event that made no run adds
@@ -390,17 +393,18 @@ impl JournalCache {
         }
     }
 
-    /// Marks a run whose last route was a `fallback` as run on the slot of the parent gate its `parent` line names; a
-    /// `parent` line of any other run, or one naming no parent, is skipped.
-    fn apply_parent(&mut self, line: Line, at: Timestamp) {
+    /// Marks run `key` as run on the slot of the parent gate its `parent` line names, whether it fell back onto it or
+    /// was lent it while a critical request drained, as it waited or before it queued; a gate lent the slot before it
+    /// queued has no run yet, and the line starts one, with no queued or started time. A `parent` line naming no parent
+    /// only adds its `abandoned` names to a run the cache already knows.
+    fn apply_parent(&mut self, key: RunKey, line: &Line, at: Timestamp) {
         let Some(parent_pid) = line.parent_pid else {
+            self.note_abandoned(&key, &line.abandoned);
             return;
         };
-        if let Some(run) = self.runs.get_mut(&(line.pid, line.process_start))
-            && run.fallback.is_some()
-        {
-            run.parent = Some((parent_pid, at));
-        }
+        let run = self.runs.entry(key).or_insert_with(|| Run::new(line, at));
+        run.note_abandoned(&line.abandoned);
+        run.parent = Some((parent_pid, at));
     }
 
     /// The run a gate that said `parent` at `at` ran under, once that run has released its slot: of the runs of gate

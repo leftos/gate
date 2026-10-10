@@ -25,7 +25,7 @@ use crate::environment::{self, Variables};
 use crate::journal::RunJournal;
 use crate::log::Log;
 use crate::machine::{self, Machine, MachineWait, MachineWaited};
-use crate::nesting::Nesting;
+use crate::nesting::{Nesting, Parent};
 use crate::remote::{self, NoClient, RemoteCall, RemoteClient, RemoteOutcome};
 use crate::resolve::{Environment, ResolvedRoot};
 use crate::route;
@@ -111,6 +111,7 @@ pub(crate) fn run(request: &RunRequest, log: &Path, root: &ResolvedRoot, environ
         client,
         tag: None,
         arrived: epoch_ms(Timestamp::now()),
+        lent: false,
     };
     let route = run.queue(environment, console);
     let mut hold = Hold {
@@ -330,6 +331,21 @@ impl Plan {
             launch,
         })
     }
+
+    /// The plan with its command's environment handing on `marker`, the marker of the parent gate whose slot the
+    /// command runs on.
+    ///
+    /// # Errors
+    ///
+    /// An environment the gate cannot build (status 1).
+    fn handing_on(mut self, root: &ResolvedRoot, marker: &str) -> Result<Plan, NotRun> {
+        if let Ok(launch) = &mut self.launch {
+            launch.environment = Variables::for_command(root, marker)
+                .block()
+                .map_err(|error| NotRun::failed(format!("gate: cannot build the command's environment: {error}")))?;
+        }
+        Ok(self)
+    }
 }
 
 /// The file `word` names, looked for along the command's `PATH` and `PATHEXT`, read against `folder` and made a full
@@ -410,6 +426,9 @@ struct Run<'a> {
     tag: Option<RemoteTag>,
     /// The run's first arrival in Unix epoch milliseconds, which every ticket it writes keeps.
     arrived: u64,
+    /// Whether the run's light parent lent it its slot while a critical request drained, before it queued or once it
+    /// journalled `parent` as it waited, so it takes, journals and releases no slot.
+    lent: bool,
 }
 
 /// The slot a run holds, or the machine a critical run holds, once it has taken it, and when it took it.
@@ -423,6 +442,8 @@ struct Hold {
 enum Taking {
     /// The slot was taken at this moment.
     Took(Instant),
+    /// The run's light parent lent it its slot while a critical request drains; the run left the queue.
+    Lent,
     /// A Ctrl+C ended the wait.
     Interrupted,
     /// The remote pool stayed full past the wait's limit.
@@ -471,9 +492,18 @@ struct Ended {
 impl Run<'_> {
     /// Decides where the command runs, then journals the queue: with `notRouted` for a heavy gate its caller kept here
     /// with `--local`, with the remote tag for a routed one. A gate a parent's slot covers runs here, journalling
-    /// `covered` with the parent's pid in place of the queue. The route.
+    /// `covered` with the parent's pid in place of the queue. A gate whose light parent lends it its slot before it
+    /// queues, while a critical request drains, is not routed and journals nothing here ([`Run::on_parent`]). The
+    /// route.
     fn queue(&mut self, environment: &Environment, console: &mut Console) -> Route {
-        let covering = self.nesting.covering().map(|parent| parent.pid);
+        let nesting = self.nesting;
+        if let Nesting::Under(parent) = nesting
+            && wait::lent_before_queue(self.root, parent.pid, self.host.processors, &mut self.survey, console)
+        {
+            self.lent = true;
+            return Route::Local { reason: None };
+        }
+        let covering = nesting.covering().map(|parent| parent.pid);
         let route = route::route(self.request, environment, covering.is_some(), console);
         self.tag = match &route {
             Route::Routed(remote) => Some(RemoteTag {
@@ -493,10 +523,8 @@ impl Run<'_> {
         route
     }
 
-    /// Runs the command where `route` sends it: on the builder, and here after a fallback; or here. The slot it takes
-    /// goes into `hold`; a gate a parent's slot covers takes none, and one whose parent's slot does not cover it says so
-    /// as it goes on to take a local slot, before any wait line. How the run ended; `None` when a Ctrl+C ended a wait
-    /// for a slot.
+    /// Runs the command where `route` sends it: on the builder, and here after a fallback; or here ([`Run::here`]). How
+    /// the run ended; `None` when a Ctrl+C ended a wait for a slot.
     fn through(&mut self, route: &Route, plan: Plan, hold: &mut Hold, console: &mut Console) -> Option<Ended> {
         let plan = match route {
             Route::Local { .. } => plan,
@@ -509,25 +537,79 @@ impl Run<'_> {
                 },
             },
         };
-        if self.nesting.covering().is_some() {
+        self.here(plan, hold, console)
+    }
+
+    /// Runs the command here. A gate a parent's slot covers takes no slot; nor does one whose light parent lends it its
+    /// slot while a critical request drains, before it queued or as it waits ([`Run::on_parent`]). Any other gate takes
+    /// a slot into `hold`, one whose parent's slot does not cover it saying so first, before any wait line. How the run
+    /// ended; `None` when a Ctrl+C ended the wait for a slot.
+    fn here(&mut self, plan: Plan, hold: &mut Hold, console: &mut Console) -> Option<Ended> {
+        let nesting = self.nesting;
+        if nesting.covering().is_some() {
             return Some(self.command(plan, console));
         }
-        if let Nesting::Under(parent) = self.nesting {
+        if let Nesting::Under(parent) = nesting {
+            if self.lent {
+                return Some(self.on_parent(parent, plan, console));
+            }
             console.err(&parent.uncovered_line(self.request.slot));
         }
-        let taking = match Pool::of(self.request.slot) {
-            Some(pool) => self.take(pool, &mut hold.taken, console),
-            None => self.take_machine(&mut hold.machine, console),
-        };
-        match taking {
+        match self.take_own(hold, console) {
             Taking::Took(took) => {
                 hold.took = took;
                 Some(self.command(plan, console))
             }
+            Taking::Lent => Some(self.lent_as_it_waited(plan, hold, console)),
             Taking::Interrupted => None,
             // Only a remote pool has a wait limit, so a local take never times out.
             Taking::Full => unreachable!("a local pool is never full past a limit"),
         }
+    }
+
+    /// Waits for and takes the run's own slot of its pool into `hold`, or the machine for a critical run.
+    fn take_own(&mut self, hold: &mut Hold, console: &mut Console) -> Taking {
+        match Pool::of(self.request.slot) {
+            Some(pool) => self.take(pool, &mut hold.taken, console),
+            None => self.take_machine(&mut hold.machine, console),
+        }
+    }
+
+    /// Runs the command on the slot of the light parent that lent it as the gate waited ([`Run::on_parent`]); `hold`'s
+    /// time starts at the end of the wait, which a release journalled for a command that never ran counts from.
+    fn lent_as_it_waited(&mut self, plan: Plan, hold: &mut Hold, console: &mut Console) -> Ended {
+        let nesting = self.nesting;
+        let Nesting::Under(parent) = nesting else {
+            unreachable!("only a gate under a light parent is lent its parent's slot")
+        };
+        hold.took = Instant::now();
+        self.on_parent(parent, plan, console)
+    }
+
+    /// Runs the command on the slot of the light parent `parent`, which lends it while a critical request drains: hands
+    /// the command the parent's marker, then says so, journals `parent` with the parent's pid and runs it. The run
+    /// takes, claims and releases no slot. A command environment that cannot be built fails the gate (status 1) before
+    /// it says or journals the lend: a gate lent the slot before it queued then journals nothing, and one that queued
+    /// journals its release as any gate that fails before its command does.
+    fn on_parent(&mut self, parent: &Parent, plan: Plan, console: &mut Console) -> Ended {
+        let plan = match plan.handing_on(self.root, &parent.marker) {
+            Ok(plan) => plan,
+            Err(NotRun { status, line }) => {
+                console.err(&line);
+                return Ended {
+                    status: i64::from(status),
+                    facts: None,
+                };
+            }
+        };
+        self.lent = true;
+        console.err(&format!(
+            "gate: running under the {} slot of gate {} while a critical request drains; taking no slot",
+            parent.held.as_str(),
+            parent.pid
+        ));
+        self.journal.write(&JournalEvent::Parent { parent_pid: parent.pid }, None, console);
+        self.command(plan, console)
     }
 
     /// Runs the routed command on the builder: takes a remote slot into `hold`, calls the client and ends the run as
@@ -542,6 +624,7 @@ impl Run<'_> {
         };
         match self.take(Pool::Remote(remote.slots), &mut hold.taken, console) {
             Taking::Took(took) => hold.took = took,
+            Taking::Lent => unreachable!("only a local wait is lent a parent's slot"),
             Taking::Interrupted => return Remotely::Interrupted,
             Taking::Full => return self.fell_back(FallbackReason::Full, &RemoteOutcome::default(), None, console),
         }
@@ -673,7 +756,8 @@ impl Run<'_> {
     /// Waits its turn for a slot of `pool` and takes it into `held` the moment it has it, then journals the take, with
     /// the remote tag while the run has one, and writes the claim. When the slot was taken; else a Ctrl+C ended the
     /// wait, which deletes the ticket at once, wakes the waiters and journals the abandon, or a remote pool stayed full
-    /// past the wait's limit, which deletes the ticket.
+    /// past the wait's limit, which deletes the ticket, or a light parent lent the run its slot, which deletes the
+    /// ticket and wakes the waiters.
     fn take(&mut self, pool: Pool, held: &mut Option<Taken>, console: &mut Console) -> Taking {
         let queued = Instant::now();
         let arrival = Arrival {
@@ -682,10 +766,19 @@ impl Run<'_> {
             queued,
             arrived: self.arrived,
             builder: self.tag.as_ref().map(|tag| tag.host.as_str()),
+            under: match self.nesting {
+                Nesting::Under(parent) => Some(parent.pid),
+                _ => None,
+            },
         };
         let mut wait = Wait::queue(self.root, pool, arrival, self.host, console);
         let taken = match wait.until_taken(&mut self.survey, console) {
             Waited::Taken(taken) => held.insert(taken),
+            Waited::Lent => {
+                wait.end(console);
+                slots::wake_waiters(self.root, &mut self.survey, console);
+                return Taking::Lent;
+            }
             Waited::Interrupted => {
                 self.abandon(wait, pool, queued, console);
                 return Taking::Interrupted;
@@ -729,6 +822,7 @@ impl Run<'_> {
             queued,
             arrived: self.arrived,
             builder: None,
+            under: None,
         };
         let wait = MachineWait::queue(self.root, arrival, self.host, console);
         let (machine, snapshot) = match wait.until_held(&mut self.survey, console) {
@@ -788,10 +882,10 @@ impl Run<'_> {
 
     /// Deletes the claim, journals the release with how the run `ended` (status and verdict unknown when it did not
     /// end on its own path) and lets the slot go, then wakes the waiters. A critical gate journals the release of every
-    /// slot it held first, then lets the machine go ([`Machine::release`]). A gate a parent's slot covers took no slot
-    /// and journals no release.
+    /// slot it held first, then lets the machine go ([`Machine::release`]). A gate a parent's slot covers, or a light
+    /// parent lent its slot, took no slot and journals no release.
     fn release(&mut self, hold: Hold, ended: Option<&Ended>, console: &mut Console) {
-        if self.nesting.covering().is_some() {
+        if self.nesting.covering().is_some() || self.lent {
             return;
         }
         let Hold { taken, machine, took } = hold;

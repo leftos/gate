@@ -6,12 +6,13 @@ use std::collections::HashSet;
 use std::fmt::Display;
 use std::fs;
 use std::io;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use gate_args::{RunRequest, Slot};
 use gate_state::v1::{self, Claim, ClaimKind, Counts, FormatError, PoolSetting, Ticket, TicketKind};
-use gate_state::{JournalIdentity, KernelObject, RemoteTag, SlotKind};
-use gate_win32::{NamedEvent, OwnedMutexGuard};
+use gate_state::{JournalIdentity, KernelObject, RemoteTag, SlotKind, reserved_light};
+use gate_win32::{NamedEvent, OwnedMutexGuard, mutex_exists};
 use jiff::Timestamp;
 
 use crate::acquire;
@@ -309,6 +310,22 @@ impl Survey {
         Ok(claims)
     }
 
+    /// The pid and slot index of each other gate's live light claim under `root`, as [`Survey::other_claims`] reads
+    /// them. A claims folder that cannot be listed holds none, said once.
+    pub(crate) fn light_claims(&mut self, root: &Path, console: &mut Console) -> Vec<(u32, u32)> {
+        match self.other_claims(root, console) {
+            Ok(claims) => claims
+                .into_iter()
+                .filter(|(_, claim)| claim.kind == ClaimKind::Light)
+                .map(|(_, claim)| (claim.pid, claim.index))
+                .collect(),
+            Err(error) => {
+                self.say_once("cannot read the claims in", &v1::slots_dir(root).display().to_string(), error, console);
+                Vec::new()
+            }
+        }
+    }
+
     /// The pid and start, in epoch milliseconds, of every gate a live claim under `root` names: the gates that hold a
     /// slot. An unreadable claim names none. A claims folder that cannot be read holds none, said once.
     pub(crate) fn holders(&mut self, root: &Path, console: &mut Console) -> HashSet<(u32, u64)> {
@@ -349,11 +366,51 @@ impl Survey {
     }
 }
 
-/// Tries the pool's slots `0..count` in order and takes the first free one. The take is a takeover when the mutex
+/// Tries the pool's slots `indices` in order and takes the first free one. The take is a takeover when the mutex
 /// comes back abandoned, or when the slot's claim names a gate no longer alive. A slot that cannot be tried is said
 /// once and passed over.
-pub(crate) fn try_pool(root: &ResolvedRoot, pool: Pool, count: u32, survey: &mut Survey, console: &mut Console) -> Option<Taken> {
-    (0..count).find_map(|index| try_object(root, pool.object(index), index, survey, console))
+pub(crate) fn try_pool(root: &ResolvedRoot, pool: Pool, indices: Range<u32>, survey: &mut Survey, console: &mut Console) -> Option<Taken> {
+    indices
+        .into_iter()
+        .find_map(|index| try_object(root, pool.object(index), index, survey, console))
+}
+
+/// Whether a critical request is pending among the other gates' live tickets `others`: a critical ticket of theirs, or
+/// else the critical mutex open, which `critical_open` reads only when no such ticket settles it.
+pub(crate) fn critical_pending(others: &[Ticket], critical_open: impl FnOnce() -> bool) -> bool {
+    others.iter().any(|ticket| ticket.kind == TicketKind::Critical) || critical_open()
+}
+
+/// Whether a critical request among the other gates' live tickets `others` holds the machine, as its ticket says.
+pub(crate) fn critical_holding(others: &[Ticket]) -> bool {
+    others.iter().any(|ticket| ticket.kind == TicketKind::Critical && ticket.holds)
+}
+
+/// Whether some gate has the critical mutex under `root` open. A mutex that cannot be probed is said once and counts as
+/// not open.
+pub(crate) fn critical_open(root: &ResolvedRoot, survey: &mut Survey, console: &mut Console) -> bool {
+    let name = root.root.object_name(KernelObject::Critical);
+    mutex_exists(&name)
+        .inspect_err(|error| survey.say_once("cannot probe", &name, error, console))
+        .unwrap_or(false)
+}
+
+/// Whether the light slot `index` of a count of `light` is one no critical gate takes: one of the reserved slots, the
+/// highest `min(2, light)`, or one past the count.
+pub(crate) fn on_reserved_light(index: u32, light: u32) -> bool {
+    index >= light - reserved_light(light)
+}
+
+/// How many light gates run beside a critical request, out of `count` light slots. While it waits for the machine, the
+/// `reserved_open` reserved slots some gate has open: the light gates on the other slots are ones its drain waits for.
+/// Once it is `holding` the machine, those and every other gate's live light claim of `claims`, by slot index, below
+/// the reserved slots or past the count, where a count changed since they took it left them.
+pub(crate) fn light_beside(count: u32, holding: bool, reserved_open: usize, claims: &[u32]) -> usize {
+    if !holding {
+        return reserved_open;
+    }
+    let first = count - reserved_light(count);
+    reserved_open + claims.iter().filter(|index| **index < first || **index >= count).count()
 }
 
 /// Tries the mutex of `object`, the slot `index` of its pool or the critical mutex at index 0, once, and takes it when
@@ -480,7 +537,30 @@ mod tests {
     use gate_state::normalize_command;
     use jiff::Timestamp;
 
-    use super::{Liveness, ThisGate, is_claim_file, liveness};
+    use super::{Liveness, ThisGate, is_claim_file, light_beside, liveness, on_reserved_light};
+
+    #[test]
+    fn light_gates_beside_a_critical_request_are_its_open_reserved_slots_and_once_it_holds_every_light_claim_off_its_slots() {
+        let claims = [0, 1, 3, 7];
+        assert_eq!(light_beside(5, false, 1, &claims), 1, "while it waits, the open reserved slots alone");
+        assert_eq!(
+            light_beside(5, true, 1, &claims),
+            4,
+            "once it holds, the claims below the reserved slots and past the count too"
+        );
+        assert_eq!(light_beside(5, true, 0, &[]), 0);
+        assert_eq!(light_beside(1, true, 1, &[0]), 1, "a count of 1 reserves its one slot");
+    }
+
+    #[test]
+    fn a_light_slot_is_one_no_critical_gate_takes_when_it_is_reserved_or_past_the_count() {
+        assert!(!on_reserved_light(1, 4));
+        assert!(on_reserved_light(2, 4));
+        assert!(on_reserved_light(3, 4));
+        assert!(on_reserved_light(5, 4), "past the count");
+        assert!(on_reserved_light(0, 1), "a count of 1 reserves its one slot");
+        assert!(on_reserved_light(0, 2));
+    }
 
     #[test]
     fn only_this_roots_claim_files_are_claims() {
