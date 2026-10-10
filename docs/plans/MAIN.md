@@ -6,11 +6,9 @@
 
 - [ ] GATE-5 Port the local gate, slice by slice
   - [ ] GATE-36 Local slice 5: watchdog (CPU sampling, stall check, kill-tree, heartbeat)
-    - [ ] GATE-58 Watchdog part C: watch the run (sampler, stall kill, Ctrl+C)
   - [ ] GATE-37 Local slice 6: timeout ceiling and backstop
   - [ ] GATE-38 Local slice 7: critical drain and nesting
   - [ ] GATE-39 Local slice 8: router and the bridge to remote.ps1
-    - [/] GATE-66 Router part A: the pure gate-router crate
     - [ ] GATE-67 Router part B: route gate run through a remote client interface
     - [ ] GATE-68 Router part C: the remote.ps1 bridge through a repo shim
   - [ ] GATE-41 Local slice 10: the PowerShell launcher execs gate.exe once the cutover flag is set
@@ -29,7 +27,6 @@
 
 - [ ] GATE-10 Port the remote client and box wrapper, then the remote cutover
   - [ ] GATE-42 Remote slice 1: the box side as gate box (run, stop, preflight, boot)
-    - [ ] GATE-60 Box part B: gate box run and stop
     - [ ] GATE-61 Box part C: box heartbeat, UTF-8 console and the pipe-closed stop
   - [ ] GATE-43 Remote slice 2: remote client (snapshot, push, run, sync-back)
   - [ ] GATE-44 Remote slice 3: bring a routed run's outputs back
@@ -47,6 +44,8 @@
   - [ ] GATE-24 Routed .NET builds recompile everything because each snapshot is a new commit
   - [ ] GATE-63 Box: restore a repo's dotnet tools before a routed run
   - [ ] GATE-65 Box: push the installed gate.exe to each builder
+  - [ ] GATE-70 Remote: measure per-verb ssh overhead, then choose per-call or gate box serve
+- [ ] GATE-72 gate-win32: share one process-creation path between Launch and PipedLaunch
 
 ## Cutover sweep
 
@@ -54,5 +53,4 @@
 
 ## Backlog
 
-- [ ] GATE-64 Suite: journal rollover case sometimes waits for a light slot under load
-- [ ] GATE-69 stop-tree: take a process snapshot without command lines
+- [/] GATE-64 Suite: journal rollover case sometimes waits for a light slot under load
