@@ -7,8 +7,8 @@
 //! the local queue, which ends its remote take (no `release` follows for the remote slot): its local `take` follows, or
 //! a `parent` line when it ran on its parent gate's slot instead. `covered` lines and every other `parent` line (a gate
 //! running on its parent's slot) and every line of the gate's own self-test (a `cwd` holding `gate-selftest`) are ignored,
-//! and a line that does not parse is skipped. The folder, the prefix, the clock and the process liveness check all come
-//! from the caller.
+//! except that any line's `abandoned` names join a run the cache already knows, and a line that does not parse is
+//! skipped. The folder, the prefix, the clock and the process liveness check all come from the caller.
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -107,6 +107,9 @@ pub struct HistoryRun {
     /// The command's load-adjusted seconds, from its release's `adjustedSeconds`; `None` without one. For a
     /// [`RunState::Parent`] run, its parent's run's.
     pub adjusted_seconds: Option<f64>,
+    /// Every name a line of the run lists in `abandoned`: slots it took from a gate that died holding them and a journal
+    /// mutex it took abandoned, in line order without repeats; empty when none.
+    pub abandoned: Vec<String>,
 }
 
 /// How long the runs of one command in one repository that passed held their slot, the remote runs apart from the local
@@ -208,11 +211,13 @@ struct Run {
     end: Option<End>,
     /// The parent gate's pid and the time of the run's `parent` line, once one followed its `fallback`.
     parent: Option<(u32, Timestamp)>,
+    /// Every name the run's lines listed in `abandoned`, in line order without repeats.
+    abandoned: Vec<String>,
 }
 
 /// The fields of a journal line the history reads. The reserved fields (`avgCores`, `peakCores`, `freeCores` on a
-/// release; `abandoned`, `counts`, `otherHeld`, `otherClaims`, `snapshotError` on a take) are not read, and a line
-/// parses with or without them.
+/// release; `counts`, `otherHeld`, `otherClaims`, `snapshotError` on a take) are not read, and a line parses with or
+/// without them.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Line {
@@ -228,6 +233,9 @@ struct Line {
     command: String,
     #[serde(default)]
     slots: Value,
+    /// The names a line lists as taken abandoned: read from any event's line, whatever its type.
+    #[serde(default)]
+    abandoned: Value,
     #[serde(default)]
     waited_seconds: Option<f64>,
     #[serde(default)]
@@ -337,86 +345,46 @@ impl JournalCache {
     }
 
     /// Adds one journal line to its run; a line that does not parse, a line whose `v` is not 1 (a line without `v` is the
-    /// PowerShell gate's), the self-test's, and every event but the five a run is made of and `parent` are skipped. A
-    /// run's first `queue` line sets its queued time; a later one does not. A `fallback` line sends a remote run back to
-    /// the local queue: the run is no longer remote, and keeps the reason.
+    /// PowerShell gate's), and the self-test's are skipped.
     fn apply(&mut self, bytes: &[u8]) {
         let Ok(line) = serde_json::from_slice::<Line>(bytes.trim_ascii()) else {
             return;
         };
-        if line.v.is_some_and(|v| v != 1) {
+        if line.v.is_some_and(|v| v != 1) || line.cwd.contains(SELFTEST_MARKER) {
             return;
         }
         let Ok(at) = line.time.parse::<Timestamp>() else {
             return;
         };
-        if line.cwd.contains(SELFTEST_MARKER) {
-            return;
-        }
+        self.fold(line, at);
+    }
+
+    /// Folds one parsed line into its run: only the five events a run is made of create one, and a `parent` line marks a
+    /// run on its parent gate's slot. Every line, `parent` and `covered` included, adds the names it lists in
+    /// `abandoned` to a run the cache already knows. A run's first `queue` line sets its queued time; a later one does
+    /// not. A `fallback` line sends a remote run back to the local queue: the run is no longer remote, and keeps the
+    /// reason.
+    fn fold(&mut self, line: Line, at: Timestamp) {
+        let key = (line.pid, line.process_start.clone());
         if line.event == "parent" {
+            self.note_abandoned(&key, &line.abandoned);
             self.apply_parent(line, at);
             return;
         }
         if !matches!(line.event.as_str(), "queue" | "take" | "release" | "abandon" | "fallback") {
+            self.note_abandoned(&key, &line.abandoned);
             return;
         }
-        let stamp = Stamp { at, text: line.time };
-        let run = self.runs.entry((line.pid, line.process_start)).or_insert_with(|| Run {
-            command: normalize_command(&line.command),
-            cwd: Some(line.cwd).filter(|cwd| !cwd.is_empty()),
-            kind: line.kind,
-            first: at,
-            queued: None,
-            started: None,
-            slot: None,
-            remote: false,
-            host: None,
-            fallback: None,
-            waited_seconds: None,
-            held_seconds: None,
-            status: None,
-            verdict: None,
-            wall_seconds: None,
-            adjusted_seconds: None,
-            end: None,
-            parent: None,
-        });
-        match line.event.as_str() {
-            "queue" => {
-                run.queued.get_or_insert(stamp);
-                run.route(line.remote, line.host);
-            }
-            "take" => {
-                run.started = Some(stamp);
-                run.slot = first_slot(&line.slots);
-                run.waited_seconds = line.waited_seconds;
-                run.route(line.remote, line.host);
-            }
-            "release" => {
-                run.held_seconds = line.held_seconds;
-                run.status = line.status;
-                run.verdict = line.verdict;
-                run.wall_seconds = line.wall_seconds;
-                run.adjusted_seconds = line.adjusted_seconds;
-                run.end = Some(End::Released);
-                // A release line that says `remote` marks a run whose queue and take rolled out of the journal; one that
-                // does not leaves the run as its take left it.
-                if line.remote {
-                    run.route(true, line.host);
-                }
-            }
-            "fallback" => {
-                // The run holds nothing until a local take: a remote take's slot, start and wait no longer stand.
-                run.route(false, None);
-                run.slot = None;
-                run.started = None;
-                run.waited_seconds = None;
-                run.fallback = Some(line.reason.unwrap_or_else(|| "unknown".to_owned()));
-            }
-            _ => {
-                run.waited_seconds = line.waited_seconds;
-                run.end = Some(End::Abandoned);
-            }
+        let run = self.runs.entry(key).or_insert_with(|| Run::new(&line, at));
+        run.note_abandoned(&line.abandoned);
+        run.note(&line, Stamp { at, text: line.time.clone() });
+    }
+
+    /// Adds `line`'s `abandoned` names to run `key` when the cache knows it; a line of an event that made no run adds
+    /// nothing.
+    fn note_abandoned(&mut self, key: &RunKey, line: &Value) {
+        if let Some(run) = self.runs.get_mut(key) {
+            run.note_abandoned(line);
         }
     }
 
@@ -473,6 +441,81 @@ impl JournalCache {
 }
 
 impl Run {
+    /// A run from the first line read for it.
+    fn new(line: &Line, at: Timestamp) -> Self {
+        Run {
+            command: normalize_command(&line.command),
+            cwd: Some(line.cwd.clone()).filter(|cwd| !cwd.is_empty()),
+            kind: line.kind.clone(),
+            first: at,
+            queued: None,
+            started: None,
+            slot: None,
+            remote: false,
+            host: None,
+            fallback: None,
+            waited_seconds: None,
+            held_seconds: None,
+            status: None,
+            verdict: None,
+            wall_seconds: None,
+            adjusted_seconds: None,
+            end: None,
+            parent: None,
+            abandoned: Vec::new(),
+        }
+    }
+
+    /// Adds the names `line` lists in `abandoned` to the run's list, in line order without repeats.
+    fn note_abandoned(&mut self, line: &Value) {
+        for name in abandoned_names(line) {
+            if !self.abandoned.contains(&name) {
+                self.abandoned.push(name);
+            }
+        }
+    }
+
+    /// Folds one event's line into the run.
+    fn note(&mut self, line: &Line, stamp: Stamp) {
+        match line.event.as_str() {
+            "queue" => {
+                self.queued.get_or_insert(stamp);
+                self.route(line.remote, line.host.clone());
+            }
+            "take" => {
+                self.started = Some(stamp);
+                self.slot = first_slot(&line.slots);
+                self.waited_seconds = line.waited_seconds;
+                self.route(line.remote, line.host.clone());
+            }
+            "release" => {
+                self.held_seconds = line.held_seconds;
+                self.status = line.status;
+                self.verdict.clone_from(&line.verdict);
+                self.wall_seconds = line.wall_seconds;
+                self.adjusted_seconds = line.adjusted_seconds;
+                self.end = Some(End::Released);
+                // A release line that says `remote` marks a run whose queue and take rolled out of the journal; one that
+                // does not leaves the run as its take left it.
+                if line.remote {
+                    self.route(true, line.host.clone());
+                }
+            }
+            "fallback" => {
+                // The run holds nothing until a local take: a remote take's slot, start and wait no longer stand.
+                self.route(false, None);
+                self.slot = None;
+                self.started = None;
+                self.waited_seconds = None;
+                self.fallback = Some(line.reason.clone().unwrap_or_else(|| "unknown".to_owned()));
+            }
+            _ => {
+                self.waited_seconds = line.waited_seconds;
+                self.end = Some(End::Abandoned);
+            }
+        }
+    }
+
     /// Marks the run remote on `host`, or local. A remote line after a `fallback` makes the run a plain remote one again.
     fn route(&mut self, remote: bool, host: Option<String>) {
         self.remote = remote;
@@ -522,6 +565,7 @@ impl Run {
             verdict: end.and_then(|end| end.verdict.clone()),
             wall_seconds: end.and_then(|end| end.wall_seconds),
             adjusted_seconds: end.and_then(|end| end.adjusted_seconds),
+            abandoned: self.abandoned.clone(),
         }
     }
 
@@ -582,6 +626,12 @@ fn summarize<'a>(runs: impl Iterator<Item = &'a Run>, cutoff: Timestamp, repo_of
 fn nearest_rank(sorted: &[f64], percent: usize) -> Option<f64> {
     let rank = (percent * sorted.len()).div_ceil(100);
     sorted.get(rank.checked_sub(1)?).copied()
+}
+
+/// The names a line lists in `abandoned`: the strings of its array. A field that is not an array, or an element that is
+/// not a string, adds nothing.
+fn abandoned_names(value: &Value) -> impl Iterator<Item = String> + '_ {
+    value.as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_owned)
 }
 
 /// The number at the end of the first slot name, such as 0 for `Local\gate-light-slot-0`.
