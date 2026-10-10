@@ -154,7 +154,7 @@ A missing file or key means the default; an unreadable or invalid value is ignor
 ### Taking a slot
 
 1. A gate that needs a slot creates its wake event, then writes its arrival [ticket](#ticket), both before its first try, so no wake is lost. A gate a parent's slot covers or lends to takes no slot and writes no ticket (N1, N2).
-2. Waiters of one kind take slots in ticket `arrived` order, ties broken by pid. A gate tries a slot only when no live ticket of its kind is ahead of it, not counting a ticket whose gate already holds a live claim (it holds a slot and only failed to delete its ticket). It then tries indices 0 up to the count in order and takes the first free one. The critical barrier (Q3) and the reserved light slots (K2, K3) apply on top of the order.
+2. Waiters of one kind take slots in ticket `arrived` order, ties broken by pid. A gate tries a slot only when fewer live tickets of its kind are ahead of it than the pool has free slots (indices whose mutex no handle holds, a probe that fails counting as not free), not counting a ticket whose gate already holds a live claim (it holds a slot and only failed to delete its ticket), so a try never takes the slot an earlier waiter would get. It then tries indices 0 up to the count in order and takes the first free one. The critical barrier (Q3) and the reserved light slots (K2, K3) apply on top of the order.
 3. A take deletes the gate's own ticket, journals `take`, writes the claim and wakes the waiters, so the next in line tries at once. A release deletes the claim, journals `release`, lets the mutex go and wakes the waiters. A run in the critical slot takes no slot of these pools and journals a `take` and `release` of `slots: []`.
 4. A waiter sleeps on its own wake event, `Local\gate-wake-<pid>-<start>` (auto-reset). A gate that takes or releases a slot, or deletes a dead gate's ticket, signals the wake event of every live ticket in its state root. An auto-reset event stays signalled until its waiter wakes, so no wakeup is lost between a waiter's check and its wait. A wake that cannot be opened or set is not said: the fallback poll covers it.
 5. Each wait has a fallback poll as its timeout (2 s, kept from S4's interval). The poll re-reads the counts and the tickets, which deletes a dead waiter's ticket so it cannot hold the queue (Q1), and picks up a count changed by hand.
@@ -181,7 +181,7 @@ A slot is held while any handle to its name exists: a reader opens the name with
 
 A name the prober may not open (an elevated gate made it with an access list this process is refused) counts as held, since the refusal proves the name exists; any other failure is the prober's error.
 
-A gate that is trying a slot holds a handle for an instant, so a probe can read a transient "held"; only the head of each queue tries, which keeps such reads rare. The same rule bounds crash recovery: a mutex comes back abandoned only if another handle to its name was open when its owner was killed, so a take cannot rely on the abandoned result alone ([Abandoned slots](#abandoned-slots)).
+A gate that is trying a slot holds a handle for an instant, so a probe can read a transient "held"; only waiters with a free slot for them try ([Taking a slot](#taking-a-slot)), which keeps such reads rare. The same rule bounds crash recovery: a mutex comes back abandoned only if another handle to its name was open when its owner was killed, so a take cannot rely on the abandoned result alone ([Abandoned slots](#abandoned-slots)).
 
 ## State root
 

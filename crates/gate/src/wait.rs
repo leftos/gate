@@ -96,7 +96,7 @@ impl<'a> Wait<'a> {
     pub(crate) fn until_taken(&mut self, survey: &mut Survey, console: &mut Console) -> Taken {
         loop {
             let count = self.count(console);
-            if !self.is_behind(survey, console)
+            if self.may_try(count, survey, console)
                 && let Some(taken) = slots::try_pool(self.root, self.pool, count, survey, console)
             {
                 return taken;
@@ -131,10 +131,17 @@ impl<'a> Wait<'a> {
         setting.count
     }
 
-    /// Whether a live ticket of the gate's kind is ahead of it. A ticket whose gate a live claim names is not: that gate
-    /// holds a slot already, and only failed to delete its ticket. A pass that deleted a dead gate's ticket wakes the
-    /// other waiters, since the queue moved.
-    fn is_behind(&self, survey: &mut Survey, console: &mut Console) -> bool {
+    /// Whether the gate may try the pool's slots `0..count`: when fewer live tickets of its kind are ahead of it than
+    /// the pool has free slots, so a try never takes the slot an earlier waiter would get.
+    fn may_try(&self, count: u32, survey: &mut Survey, console: &mut Console) -> bool {
+        let ahead = self.ahead(survey, console);
+        ahead == 0 || ahead < self.probe(count, survey, console).iter().filter(|held| **held == Some(false)).count()
+    }
+
+    /// How many live tickets of the gate's kind are ahead of it. A ticket whose gate a live claim names is not counted:
+    /// that gate holds a slot already, and only failed to delete its ticket. A pass that deleted a dead gate's ticket
+    /// wakes the other waiters, since the queue moved.
+    fn ahead(&self, survey: &mut Survey, console: &mut Console) -> usize {
         let (live, deleted) = survey.live_tickets(&self.root.path, console);
         if deleted {
             slots::signal(self.root, live.iter().filter(|ticket| ticket.pid != self.order.1));
@@ -145,24 +152,28 @@ impl<'a> Wait<'a> {
             .filter(|ticket| ticket.kind == kind && ticket.queue_order() < self.order)
             .collect();
         if ahead.is_empty() {
-            return false;
+            return 0;
         }
         let holders = survey.holders(&self.root.path, console);
-        ahead.iter().any(|ticket| !holders.contains(&(ticket.pid, ticket.start_ms)))
+        ahead.iter().filter(|ticket| !holders.contains(&(ticket.pid, ticket.start_ms))).count()
     }
 
-    /// How many of the pool's slots `0..count` some gate has open. A slot that cannot be probed is said once and not
-    /// counted.
+    /// How many of the pool's slots `0..count` some gate has open.
     fn busy(&self, count: u32, survey: &mut Survey, console: &mut Console) -> usize {
+        self.probe(count, survey, console).iter().filter(|held| **held == Some(true)).count()
+    }
+
+    /// Whether some gate has each of the pool's slots `0..count` open; `None` for a slot that cannot be probed, said
+    /// once, which counts as neither free nor busy.
+    fn probe(&self, count: u32, survey: &mut Survey, console: &mut Console) -> Vec<Option<bool>> {
         (0..count)
-            .filter(|&index| {
+            .map(|index| {
                 let name = self.root.root.object_name(self.pool.object(index));
-                mutex_exists(&name).unwrap_or_else(|error| {
-                    survey.say_once("cannot probe", &name, error, console);
-                    false
-                })
+                mutex_exists(&name)
+                    .inspect_err(|error| survey.say_once("cannot probe", &name, error, console))
+                    .ok()
             })
-            .count()
+            .collect()
     }
 
     /// Sleeps on the wake event until it is set, the poll runs out or the next still-waiting line is due. A wait that
