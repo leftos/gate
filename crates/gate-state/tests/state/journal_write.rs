@@ -20,7 +20,7 @@ use crate::support::{keys, ts};
 /// The moment every append archives at.
 pub const NOW: &str = "2026-10-03T12:00:00Z";
 /// Only guards against a stuck test; nothing asserts how long an append took.
-const HANG_GUARD: Duration = Duration::from_secs(120);
+const HANG_GUARD: Duration = Duration::from_secs(600);
 /// The name the test locks answer with, the shape the binary's journal mutex name has.
 pub const LOCK_NAME: &str = r"Local\gate-test-journal";
 

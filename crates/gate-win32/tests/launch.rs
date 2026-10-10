@@ -20,7 +20,7 @@ use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
 use windows_sys::Win32::System::Threading::{GetExitCodeProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, WaitForSingleObject};
 
 /// The longest any command of these tests may take: a guard against a hang, never a timing bound.
-const HANG_GUARD: Duration = Duration::from_secs(60);
+const HANG_GUARD: Duration = Duration::from_secs(600);
 
 /// A job name no other test or process uses.
 fn unique_name(test: &str) -> String {

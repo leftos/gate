@@ -47,8 +47,12 @@ pub const GIT_REDIRECTS: [&str; 6] = [
 ];
 /// The variables a real gate around the suite may have set, which no case's gate may inherit.
 const INHERITED: [&str; 2] = ["GATE_STATE_DIR", "GATE_SLOT_HELD"];
-/// Only guards against a stuck case; no case asserts how long anything took.
-const HANG_GUARD: Duration = Duration::from_secs(60);
+/// Only guards against a stuck case; no case asserts how long anything took. Ten minutes, since a loaded machine
+/// (several heavy gates building at once) has kept a healthy case past a minute, and a real hang still ends.
+const HANG_GUARD: Duration = Duration::from_secs(600);
+/// How long the output readers get to end once the program has exited; a reader whose pipe a grandchild still holds
+/// would otherwise keep its case waiting the whole hang guard.
+const READER_GRACE: Duration = Duration::from_secs(60);
 /// How often a wait looks again.
 const POLL: Duration = Duration::from_millis(10);
 
@@ -287,10 +291,10 @@ impl Running {
         self.child.try_wait().expect("the program's status can be read").is_none()
     }
 
-    /// Joins the readers that end within the hang guard of the program's exit. A reader whose pipe a grandchild still
+    /// Joins the readers that end within [`READER_GRACE`] of the program's exit. A reader whose pipe a grandchild still
     /// holds is left running; its buffer is taken as it stands.
     fn let_readers_end(&mut self) {
-        let deadline = Instant::now() + HANG_GUARD;
+        let deadline = Instant::now() + READER_GRACE;
         while Instant::now() < deadline && !self.readers.iter().all(JoinHandle::is_finished) {
             thread::sleep(POLL);
         }

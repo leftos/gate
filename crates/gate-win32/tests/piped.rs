@@ -20,7 +20,7 @@ use windows_sys::Win32::System::JobObjects::{
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
 /// The longest any command of these tests may take: a guard against a hang, never a timing bound.
-const HANG_GUARD: Duration = Duration::from_secs(60);
+const HANG_GUARD: Duration = Duration::from_secs(600);
 
 static BREAKAWAY: Once = Once::new();
 

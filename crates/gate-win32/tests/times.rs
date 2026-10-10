@@ -16,7 +16,7 @@ use std::time::Duration;
 use gate_win32::{EnvironmentBlock, Job, Launch, file_time_now, process_times, system_times};
 
 /// The longest any command of these tests may take: a guard against a hang, never a timing bound.
-const HANG_GUARD: Duration = Duration::from_secs(60);
+const HANG_GUARD: Duration = Duration::from_secs(600);
 
 /// An empty folder of this test's own.
 fn case_dir(test: &str) -> PathBuf {
