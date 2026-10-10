@@ -189,8 +189,9 @@ pub struct StateInputs {
     pub machine: String,
     /// The machine's logical processor count, from which each pool's default count follows.
     pub processors: usize,
-    /// The per-user local application data folder, under which `gate\slots`, `gate\slot-counts.json` and
-    /// `gate\remote.json` live.
+    /// The per-user local application data folder, under which the PowerShell gate keeps `gate\slots` and
+    /// `gate\slot-counts.json`, and under which `gate\remote.json` lives for both generations. `gate.exe`'s own counts
+    /// are under its state root (`v1::counts_path`).
     pub local_app_data: PathBuf,
     /// The counts file to use in place of the per-user one (the gate's `GATE_TEST_SLOT_COUNTS`), for tests only.
     pub slot_counts_override: Option<PathBuf>,

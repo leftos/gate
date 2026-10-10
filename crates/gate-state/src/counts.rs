@@ -31,8 +31,9 @@ pub struct WriteError {
     pub source: io::Error,
 }
 
-/// The counts file the gate reads: the override when the caller gives a non-empty one, else
-/// `<local app data>\gate\slot-counts.json`.
+/// The counts file the PowerShell gate reads: the override when the caller gives a non-empty one, else
+/// `<local app data>\gate\slot-counts.json`. `gate.exe` reads `<state root>\slot-counts.json` instead
+/// (`v1::counts_path`).
 #[must_use]
 pub fn slot_count_path(inputs: &StateInputs) -> PathBuf {
     if let Some(path) = &inputs.slot_counts_override

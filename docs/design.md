@@ -217,7 +217,7 @@ A root that cannot be resolved exits 2 with one line and no usage: `gate: LOCALA
 
 A `--log` that cannot be made absolute is `gate: cannot make the log path <path> absolute: <error>`.
 
-The root replaces the PowerShell gate's test variables `GATE_TEST_SLOT_PREFIX`, `GATE_TEST_SLOT_COUNTS`, `GATE_TEST_REMOTE_CONFIG` and `GATE_TEST_JOURNAL_BYTES`: a test gets its own counts file, routing file and journal by giving its gate its own root, and tests rollover by writing a journal near the rollover size into that root.
+The root replaces the PowerShell gate's test variables `GATE_TEST_SLOT_PREFIX`, `GATE_TEST_SLOT_COUNTS`, `GATE_TEST_REMOTE_CONFIG` and `GATE_TEST_JOURNAL_BYTES`: a test gets its own counts file and journal by giving its gate its own root, and its own routing file by giving its gate its own `LOCALAPPDATA` (the routing file is `%LOCALAPPDATA%\gate\remote.json` whatever the root), and tests rollover by writing a journal near the rollover size into that root.
 
 A root is the default when its full path, normalised (made absolute, a leading `\\?\UNC\` turned into `\\` and a leading `\\?\` removed, `/` turned into `\`, lower-cased, trailing `\` removed), equals that of `%LOCALAPPDATA%\gate\v1` normalised the same way. The default root's kernel object names are the PowerShell gate's, so during the cutover drain both generations take turns on one set of slots ([Cutover](#cutover)).
 
@@ -552,7 +552,7 @@ Built verbs:
 
 The PowerShell gate and `gate.exe` share slot mutexes and never share files. The default root's mutex names are the PowerShell gate's, so a PowerShell gate still running and a new `gate.exe` gate take turns on one set of slots and the machine is never over-subscribed; each generation writes its claims, tickets and journal in its own folder and format, and ops-tower reads only `gate.exe`'s once the drain is over. Moving a machine to `gate.exe` is a drained cutover:
 
-1. `gate cutover` copies the PowerShell gate's slot counts into the default root's `slot-counts.json`, so both generations count the same slots, then writes `%LOCALAPPDATA%\gate\cutover.flag`. The PowerShell launcher in each repo reads the flag, and from then on every new gate runs `gate.exe` through the compatibility layer.
+1. Before it runs, ops-tower's Gates tab must already write the default root's `slot-counts.json` (`%LOCALAPPDATA%\gate\v1\`), since `gate.exe` never reads the PowerShell gate's `%LOCALAPPDATA%\gate\slot-counts.json`. `gate cutover` copies the PowerShell gate's slot counts into the default root's `slot-counts.json`, so both generations count the same slots, then writes `%LOCALAPPDATA%\gate\cutover.flag`. The PowerShell launcher in each repo reads the flag, and from then on every new gate runs `gate.exe` through the compatibility layer.
 2. It then waits until every PowerShell gate's claims and tickets in `%LOCALAPPDATA%\gate\` are gone or stale, naming on stderr what it still waits on, and exits 0 once none is left.
 
 During the drain a PowerShell gate neither reads `gate.exe`'s tickets nor signals its wake events: a PowerShell critical request can be overtaken by `gate.exe` gates that arrive after it (it still waits for every slot), and a `gate.exe` waiter learns of a PowerShell gate's release from its fallback poll.
