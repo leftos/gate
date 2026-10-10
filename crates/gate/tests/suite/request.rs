@@ -25,7 +25,7 @@ fn print_request_shows_the_new_cli_request() {
         "mode": "run",
         "slot": "heavy",
         "timeout": 5,
-        "log": shown(&case.root().join("out.log")),
+        "log": shown(&case.folder().join("out.log")),
         "stall": 120,
         "tail": 20,
         "noMarkers": false,

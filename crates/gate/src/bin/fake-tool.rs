@@ -1,27 +1,42 @@
 //! The black-box suite's helper program. It runs the steps on its command line in order:
-//! `out <text>` and `err <text>` print a line on stdout or stderr; `sleep <ms>` sleeps; `exit <n>` exits with status n;
+//! `out <text>` and `err <text>` print a line on stdout or stderr; `sleep <ms>` sleeps; `wait <path>` sleeps until the
+//! path exists, and exits 1 when it has not appeared after 120 s; `spawn-wait <path>` starts `fake-tool wait <path>`
+//! with this process's stdin, stdout and stderr, prints `spawned <its pid>` and goes on without waiting for it;
+//! `exit <n>` exits with status n, any 32-bit code, negative ones as Windows reads them back;
+//! `env <name>` prints the variable's value, or `fake-tool: <name> is not set`, on its own line; `bytes <hex>` writes the
+//! bytes the hex digits spell to stdout as they are, with no line feed added; `lines <n> <text>` prints n lines on
+//! stdout, the i-th `<text><i>` counting from 1;
 //! `argv` prints every word after it, each on its own line, and ends, so it is always the last step.
 //! With no `exit` step it exits 0. For example `fake-tool out hi err oops exit 3`.
 
 use std::ffi::OsString;
 use std::io::{self, Write};
-use std::process::ExitCode;
+use std::path::Path;
+use std::process::Command;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-fn main() -> ExitCode {
+/// How often `wait` looks for its path.
+const WAIT_STEP: Duration = Duration::from_millis(20);
+/// How long `wait` looks for its path before it gives up.
+const WAIT_LIMIT: Duration = Duration::from_secs(120);
+
+/// Exits through `std::process::exit`, because `ExitCode` carries 8 bits and the suite needs codes above 255 and
+/// negative ones.
+fn main() {
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
-    match run(&args) {
-        Ok(status) => ExitCode::from(status),
+    let status = match run(&args) {
+        Ok(status) => status,
         Err(message) => {
             // A helper that cannot write its own error has no other stream to say so on; its status still fails.
             let _ = writeln!(io::stderr().lock(), "fake-tool: {message}");
-            ExitCode::from(2)
+            2
         }
-    }
+    };
+    std::process::exit(status);
 }
 
-fn run(args: &[OsString]) -> Result<u8, String> {
+fn run(args: &[OsString]) -> Result<i32, String> {
     let mut stdout = io::stdout().lock();
     let mut steps = args.iter();
     while let Some(step) = steps.next() {
@@ -33,19 +48,43 @@ fn run(args: &[OsString]) -> Result<u8, String> {
                 break;
             }
             "out" => writeln!(stdout, "{}", operand(&mut steps, "out")?).map_err(|error| write_failed(&error))?,
+            "env" => writeln!(stdout, "{}", variable(&operand(&mut steps, "env")?)).map_err(|error| write_failed(&error))?,
+            "bytes" => stdout
+                .write_all(&decode_hex(&operand(&mut steps, "bytes")?)?)
+                .map_err(|error| write_failed(&error))?,
             "err" => {
                 stdout.flush().map_err(|error| write_failed(&error))?;
                 writeln!(io::stderr().lock(), "{}", operand(&mut steps, "err")?).map_err(|error| write_failed(&error))?;
+            }
+            "lines" => {
+                let text = operand(&mut steps, "lines")?;
+                let count: u32 = text.parse().map_err(|_| format!("lines takes a count, got '{text}'"))?;
+                let line = operand(&mut steps, "lines")?;
+                for number in 1..=count {
+                    writeln!(stdout, "{line}{number}").map_err(|error| write_failed(&error))?;
+                }
             }
             "sleep" => {
                 let text = operand(&mut steps, "sleep")?;
                 let ms: u64 = text.parse().map_err(|_| format!("sleep takes milliseconds, got '{text}'"))?;
                 thread::sleep(Duration::from_millis(ms));
             }
+            "wait" => {
+                let path = operand(&mut steps, "wait")?;
+                if !wait_for(&path)? {
+                    stdout.flush().map_err(|error| write_failed(&error))?;
+                    writeln!(io::stderr().lock(), "fake-tool: {path} did not appear within 120 s").map_err(|error| write_failed(&error))?;
+                    return Ok(1);
+                }
+            }
+            "spawn-wait" => {
+                let pid = spawn_wait(&operand(&mut steps, "spawn-wait")?)?;
+                writeln!(stdout, "spawned {pid}").map_err(|error| write_failed(&error))?;
+            }
             "exit" => {
                 let text = operand(&mut steps, "exit")?;
                 stdout.flush().map_err(|error| write_failed(&error))?;
-                return text.parse().map_err(|_| format!("exit takes a status from 0 to 255, got '{text}'"));
+                return text.parse().map_err(|_| format!("exit takes a 32-bit status, got '{text}'"));
             }
             other => return Err(format!("unknown step '{other}'")),
         }
@@ -59,6 +98,51 @@ fn operand<'a>(steps: &mut impl Iterator<Item = &'a OsString>, step: &str) -> Re
         .next()
         .map(|word| word.to_string_lossy().into_owned())
         .ok_or_else(|| format!("{step} needs a value"))
+}
+
+/// Sleeps until `path` exists, or gives up after [`WAIT_LIMIT`], so a helper no case lets go (one orphaned by a case
+/// that failed, which the case's own kill does not reach) never holds a case folder for ever. Whether the path came.
+fn wait_for(path: &str) -> Result<bool, String> {
+    let deadline = Instant::now() + WAIT_LIMIT;
+    loop {
+        match Path::new(path).try_exists() {
+            Ok(true) => return Ok(true),
+            Ok(false) if Instant::now() >= deadline => return Ok(false),
+            Ok(false) => thread::sleep(WAIT_STEP),
+            Err(error) => return Err(format!("cannot check {path}: {error}")),
+        }
+    }
+}
+
+/// Starts `fake-tool wait <path>` with this process's handles, and does not wait for it; its pid.
+fn spawn_wait(path: &str) -> Result<u32, String> {
+    let me = std::env::current_exe().map_err(|error| format!("cannot find this program: {error}"))?;
+    Command::new(me)
+        .arg("wait")
+        .arg(path)
+        .spawn()
+        .map(|helper| helper.id())
+        .map_err(|error| format!("cannot start the waiting helper: {error}"))
+}
+
+/// The value of the variable `name`, or the line saying it is not set.
+fn variable(name: &str) -> String {
+    std::env::var_os(name).map_or_else(|| format!("fake-tool: {name} is not set"), |value| value.to_string_lossy().into_owned())
+}
+
+/// The bytes two hex digits each spell.
+fn decode_hex(text: &str) -> Result<Vec<u8>, String> {
+    if !text.len().is_multiple_of(2) {
+        return Err(format!("bytes takes pairs of hex digits, got '{text}'"));
+    }
+    (0..text.len())
+        .step_by(2)
+        .map(|at| {
+            text.get(at..at + 2)
+                .and_then(|pair| u8::from_str_radix(pair, 16).ok())
+                .ok_or_else(|| format!("bytes takes pairs of hex digits, got '{text}'"))
+        })
+        .collect()
 }
 
 fn write_failed(error: &io::Error) -> String {

@@ -35,8 +35,10 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Lent window**: the span during a critical drain in which the critical gate lends one slot to backfill guests, ending at the shadow end.
 - **Light**: the slot kind for work that keeps one or two cores busy; its pool's thread budget is 2.
 - **Load-adjusted time**: wall time scaled by the free share in each sample, the clock the ceiling runs on, so a command slowed by other work is not killed for it.
+- **Log hash**: the first 16 hex digits of the SHA-256 of a lower-cased, normalised absolute log path, carried in the name of that log's mutex.
 - **Marker**: a failure marker, a log line the built-in regex reads as a failure (such as `Build FAILED.` or `error CS1234`), which turns a zero exit into status 1.
 - **Nesting**: a gate started inside another gate's command (a build hook under a gated `git commit`), which reads its parent from the slot marker.
+- **Notes**: the gate's own lines gathered while a run goes and appended to the end of its log.
 - **Pause marker**: an empty file a nested gate rewrites while it waits behind a critical request, which stops its parent's watchdog clocks for that time.
 - **Pool**: the set of slots of one kind (heavy, light, remote); pools never wait on each other.
 - **Probe by open**: reading whether a slot is held by opening its mutex's name: it is held while any handle to that name exists.

@@ -48,7 +48,11 @@ Rules both parsers share:
 - A gate option that is not valid Unicode is a usage error; the words after `--` are passed through as the caller gave them.
 - A word before `--` that is not an option is a usage error (`gate: unexpected argument <word>`).
 
-Until the launch slice (GATE-35), a valid `gate run` prints `gate: run is not built yet` and a valid `gate stop-tree` prints `gate: stop-tree is not built yet`, both on stderr with exit 70.
+A valid `gate stop-tree` prints `gate: stop-tree is not built yet` on stderr and exits 70 until its slice is built.
+
+A valid `gate run` starts the command: it refuses a batch word (exit 2), refuses a `--log` inside the state root (exit 2, `gate: the log <path> is inside the gate's state folder <root>`; the paths are compared canonical, through links and junctions, after canonicalising the nearest existing folder), takes the log's mutex, prepares the log, queues, takes a slot, starts the command in the job `Local\gate[-<h>]-job-<gate pid>`, waits for it, reaches the verdict and releases the slot.
+
+The watchdog is not built yet, so nothing ends a command that hangs.
 
 ### `gate run`
 
@@ -108,12 +112,12 @@ Further modes arrive as subcommands of the same binary, each designed with its i
 | Code | Meaning |
 |---|---|
 | 0 | The command exited 0 and its log holds no failure marker. |
-| `N` | The command's own non-zero status, passed through (a routed run whose connection was lost reports 255, RC7). |
-| 1 | The command exited 0 but its log holds a failure marker (never with `--no-markers`, V2); or the gate itself failed after the command started (X4); or a routed run passed but its changes or outputs could not be brought back (RC9, D1). |
-| 2 | Usage: a missing, unknown or invalid input; a `.cmd` or `.bat` word the gate refuses (C5); a critical gate under a heavy or light slot marker (K7). Nothing is queued. |
+| `N` | The command's own non-zero status, passed through whole: the gate exits with the command's 32-bit exit code (300 stays 300; 0xFFFFFFFF reads as -1 where a caller reads it signed), and the FAILED line and the journal show it signed (a routed run whose connection was lost reports 255, RC7). |
+| 1 | The command exited 0 but its log holds a failure marker (never with `--no-markers`, V2); or the gate itself failed after the command started (X4); or it failed before queueing (the working directory, the command's environment, the log's folder or an earlier log that cannot be removed); or a routed run passed but its changes or outputs could not be brought back (RC9, D1). |
+| 2 | Usage: a missing, unknown or invalid input; a `.cmd` or `.bat` word the gate refuses (C5); a `--log` inside the state root; a critical gate under a heavy or light slot marker (K7). Nothing is queued. |
 | 124 | The watchdog killed the command: STALLED, TIMED OUT or BACKSTOP (X2). |
 | 127 | The command could not be started (C7); the slot is released at once. |
-| 70 | Temporary: a valid `gate run` or `gate stop-tree`, which are not built yet. The launch slice (GATE-35) removes this code. |
+| 70 | Temporary: a valid `gate stop-tree`, which is not built yet. Its slice removes this code. |
 | 75 | A builder refused a routed run (`gate box`, or the bridged remote client): busy, unreachable, parity, rebooted, tools, version. The PC side reads the refusal and falls back to a local run, so a caller sees 75 only as a command's own status, or as a refusal that carried no reason (T5). |
 
 The codes are kept (V4), with 75 added for refusals. 124 is the status coreutils `timeout` uses, so no caller mistakes a kill for the command's own status; a command that itself exits 124 is told apart in the journal's `verdict`.
@@ -129,6 +133,17 @@ Every line the gate says is written and flushed as it is said, never held until 
 | `Full output: <path>` | the end of the verdict line: `gate: passed in ... Full output: <path>` on stdout, `gate: FAILED (status <n>). Full output: <path>` on stderr | Where the whole log is (V3). |
 
 Every other `gate: ` line is prose: it informs people and agents and may change in any release. That includes the passed and FAILED lines apart from their `Full output:` tail, the queue, take and wait lines, the heartbeat lines, the diagnostics block and the stop-tree summary.
+
+The lines of a run that starts its command:
+
+- Passed, on stdout: `gate: passed in <w> s (ceiling <n> s). Full output: <log>`, `<w>` in whole seconds rounded half to even. There is no load-adjusted figure until the watchdog (GATE-36).
+- Failed, on stderr: `gate: FAILED (status <n>). Full output: <log>`. A command that exited 0 with a marker in its log first says `gate: command exited 0 but its log reports a failure -> <log>` on stderr, and its status is 1.
+- On a non-zero status, up to 40 `<line number>:<line>` marker lines on stdout, before the tail.
+- A start failure, on stderr and in the log: `gate: could not start <word> (<resolved full path>): <system message>`, exit 127. The parenthesis is left out when the resolved path is the word itself, and a program found nowhere gets the message of error 2 with no parenthesis. `gate: cannot read the system folder, which holds cmd.exe: <error>` and `gate: cannot make <path> a full path: <error>` are start failures too.
+- A gate failure after the slot is taken: `gate: the gate failed while running the command: <message>`, exit 1. The job is terminated with 124, with its follow-up lines `gate: and could not terminate the command's job: <error>`, `gate: the command was still running 5 s after its job was terminated` or `gate: cannot wait for the command after terminating its job: <error>`.
+- Failures before queueing, exit 1: `gate: cannot read the working directory: <error>`, `gate: cannot build the command's environment: <error>`, `gate: cannot create the log's folder <dir>: <error>` and `gate: cannot remove the earlier <path>: <error>`.
+- A log in use, exit 1, before queueing and with no journal line: `gate: the log <path> is in use by another gate`, when another gate holds the log's mutex ([Kernel object names](#kernel-object-names)). A mutex a killed gate left is taken silently. `gate: cannot take the mutex <name> of the log <path>: <error>`, exit 1, when the mutex cannot be opened or tried.
+- Notes that never fail the gate: `gate: cannot remove <log>.err: <error>`, `gate: cannot append <log>.err to the log: <error>` and `gate: cannot read this gate's priority class, so the command runs below normal: <error>`.
 
 ## Slots
 
@@ -226,6 +241,9 @@ For any other root, every kernel object name carries `<h>`, the first 8 lower-ca
 | journal mutex | `Local\gate-journal` | `Local\gate-<h>-journal` |
 | waiter's wake event | `Local\gate-wake-<pid>-<start>` | `Local\gate-<h>-wake-<pid>-<start>` |
 | command's job | `Local\gate-job-<gate pid>` | `Local\gate-<h>-job-<gate pid>` |
+| log's mutex | `Local\gate-log-<l>` | `Local\gate-<h>-log-<l>` |
+
+`<l>` is the log hash: 16 lower-case hex digits, the first 8 bytes of the SHA-256 of the lower-cased, normalised absolute log path. Each run takes its log's mutex without waiting, before it readies the log, and holds it until after the slot release and the final append to the log, so two gates never write one log; a second gate fails at once ([Output lines](#output-lines)).
 
 The environment carries one more name: `GATE_SLOT_HELD`, the slot marker ([Critical drain and nesting](#critical-drain-and-nesting)).
 
@@ -396,7 +414,7 @@ The arithmetic (stall progress, the free share, the clock, the backstop, the cor
 
 - **The argv arrives byte-exact.** `gate.exe` reads its own command line (`GetCommandLineW`), splits it by the Microsoft C runtime's rules, and takes every word after the first `--` as the command, unchanged (C3). The PowerShell binder workarounds (C3's rejoined colon words and flattened arrays) do not exist.
 - **C-runtime quoting.** The words are written into one CreateProcess command line so the C runtime reads each back as one argv entry: an empty word or one holding whitespace or a quote is wrapped, `"` becomes `\"`, and a backslash run before a quote or at the end is doubled (kept, C4). Splitting the written line gives back the words, for every list of argument words; a property test holds that. A program word must not hold a quote or end in a backslash, because the C runtime reads argv[0] without backslash escapes (the PowerShell gate has the same limit).
-- **`.cmd` and `.bat` targets** run as `"<ComSpec>" /d /v:off /s /c "<line>"`, the ComSpec written C4-quoted and each word quoted for cmd.exe (kept, C5). A target is a program whose extension is `.cmd` or `.bat` in any case, after the trailing dots and spaces of its file name are dropped.
+- **`.cmd` and `.bat` targets** run as `"<system folder>\cmd.exe" /d /v:off /s /c "<line>"`, the path written C4-quoted and each word quoted for cmd.exe (C5). The system folder is `GetSystemDirectoryW`'s; `%ComSpec%` and `%SystemRoot%` are not read, a deliberate difference from the PowerShell gate. A target is a program whose extension is `.cmd` or `.bat` in any case, after the trailing dots and spaces of its file name are dropped.
 
   A word holding `"` is written `""` for a batch file, which programs on the old msvcrt.dll read differently from the C runtime's `\"`. This is a known limit shared with the PowerShell gate.
 
@@ -416,34 +434,44 @@ The arithmetic (stall progress, the free share, the clock, the backstop, the cor
   - A bare name is looked for in PATH × PATHEXT, the folders outer and the extensions inner, as `Get-Command` orders them.
   - The current folder and relative PATH entries are never searched, and an extensionless shim is never found.
 
+  The program's path is then made a full path (`.` and `..` folded) before the batch check, and that path is the application.
+
   A name found nowhere is a start failure. Unlike the PowerShell gate, which lets CreateProcess search for the program (the current folder among others), the gate never passes an unfound name on. This is deliberate, for security: a repo cannot plant a `git.exe` at its root. The `gate-win32` layer passes the path as `lpApplicationName`, so CreateProcessW searches no folder (not the gate's, the current one, System32 or PATH).
 
-  A start failure prints `gate: could not start <word> (<resolved>): <message>` and exits 127, releasing the slot (C7).
+  A start failure prints `gate: could not start <word> (<resolved>): <message>` and exits 127, releasing the slot (C7); the lines are in [Output lines](#output-lines).
 - **Process creation.** The `gate-win32` layer is the contract the run uses (`Launch` → `Suspended` → `Running`). The command is created suspended with an explicit environment block, assigned to the gate's job `Local\gate-job-<gate pid>`, then resumed (kept, X1, P1). Creation flags are `CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT` plus the priority class, with no new console and no new process group.
 
   The job has no limits: no breakaway, no kill-on-close. A job name already held is refused. If assigning to the job or resuming fails, the command is terminated with exit code 1 first, and a suspended command dropped without being resumed is terminated with exit code 1.
 
   The desktop-app policy `PROCESS_CREATION_DESKTOP_APP_BREAKAWAY_DISABLE_PROCESS_TREE` is set, as the PowerShell gate sets it. Per Microsoft's UpdateProcThreadAttribute remarks it matters only to Win32 apps packaged through the Desktop Bridge, whose children it keeps inside the desktop app runtime environment.
 
-  The layer refuses a `.cmd` or `.bat` application (any case, trailing dots and spaces ignored): the caller wraps batch targets in `"<ComSpec>" /d /v:off /s /c "<line>"` itself. It refuses a NUL in the application, command line, working folder, log path or `.err` path before anything is opened.
+  The layer refuses a `.cmd` or `.bat` application (any case, trailing dots and spaces ignored): the caller wraps batch targets in `"<system folder>\cmd.exe" /d /v:off /s /c "<line>"` itself. It refuses a NUL in the application, command line, working folder, log path or `.err` path before anything is opened.
 
-  The log and `<log>.err` are each opened fresh. Any file at the path is deleted first (a link itself, never its target), then created with `CREATE_NEW` and `FILE_FLAG_OPEN_REPARSE_POINT | SECURITY_SQOS_PRESENT | SECURITY_ANONYMOUS`; it must be a disk file, not a reparse point, with exactly one name. Both are shared for read, write and delete. An orphan's old, delete-pending file makes the create fail loudly rather than be shared. stdin is `NUL`, opened `OPEN_EXISTING`.
+  The log and `<log>.err` are each opened fresh. Any file at the path is deleted first (a link itself, never its target), then created with `CREATE_NEW` and `FILE_FLAG_OPEN_REPARSE_POINT | SECURITY_SQOS_PRESENT | SECURITY_ANONYMOUS`; it must be a disk file, not a reparse point, with exactly one name.
+
+  Both are shared for read, write and delete, so a process the command left running does not block the next run on that log; a second gate on a live log is kept out by the log's mutex ([Kernel object names](#kernel-object-names)). An orphan's old, delete-pending file makes the create fail loudly rather than be shared. stdin is `NUL`, opened `OPEN_EXISTING`.
 
   It inherits exactly three handles, through `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`: stdin from `NUL`, stdout to the log and stderr to `<log>.err`. It shares the gate's console, so Ctrl+C reaches it. A nested gate's job nests inside its parent's.
 
   The start-failure message is the system message for the CreateProcessW error code, as `Win32Exception.Message` gives it, with no `(os error N)` suffix. That failure alone maps to status 127; every other start failure is the gate's own.
 - **Priority.** BelowNormal, or the gate's own class when that is already BelowNormal or Idle; High for a critical gate and any gate under a critical marker (kept, P2).
-- **Environment.** Every command gets the gate's environment with these set over it (names compared case-insensitively): `GATE_SLOT_HELD` (the held slot's marker, or the parent's for a covered gate), `MSBUILDDISABLENODEREUSE=1`, `DOTNET_CLI_USE_MSBUILD_SERVER=0` (kept, P3, B3), and `GATE_STATE_DIR` under a non-default root. The gate's own environment is never changed.
+- **Environment.** Every command gets the gate's environment with these set over it (names compared case-insensitively): `GATE_SLOT_HELD=<kind>:<pid>:<start_ms>[:<h>]` (the held slot's marker, critical included, or the parent's for a covered gate), `MSBUILDDISABLENODEREUSE=1`, `DOTNET_CLI_USE_MSBUILD_SERVER=0` (kept, P3, B3), and `GATE_STATE_DIR=<root>` under a non-default root. Under the default root an inherited `GATE_STATE_DIR` is removed. The gate's own environment is never changed.
+
+  The batch refusal's `%NAME%` check answers for this exact block.
 
   The block is built with names matched and sorted as Windows does (`CompareStringOrdinal`, case-insensitive over all of Unicode), and a later pair wins.
 - **Working directory.** The caller's (P5).
 
 ## Log and tail
 
-- The log is kept as the command's exact bytes. The log's directory is created, an earlier log and `<log>.err` are removed at start, stdout goes to the log and stderr to `<log>.err`, and at the end `.err` is appended to the log and removed, followed by the gate's own lines, so one file holds the output, then the errors, then the gate's lines (kept, V1).
-- The printed tail and the marker scan decode the log as UTF-8 lossily: an invalid byte reads as U+FFFD. The gate writes the tail to stdout as UTF-8 (through the wide console API when stdout is a console).
-- The failure-marker regex is built in (kept, V2): `^Build FAILED\.|error CS\d+|: error |Test run summary: Failed!|^\s*failed: [1-9]|gate: (TIMED OUT|STALLED|BACKSTOP)`. A zero exit whose log matches becomes status 1 with `gate: command exited 0 but its log reports a failure -> <log>`; on any non-zero status up to 40 matching lines are printed to stdout as `<line number>:<line>`; a killed run is not scanned. `--no-markers` turns the scan off.
+- The log is kept as the command's exact bytes. The log's directory is created, an earlier log and `<log>.err` are removed at start, stdout goes to the log and stderr to `<log>.err`, and at the end the `.err` bytes are appended to the log byte for byte (once) and `.err` is deleted. The gate's own lines follow, starting on a line of their own: every line it said on stderr, and the passed line. So one file holds the output, then the errors, then the gate's lines (kept, V1).
+
+  The gate's lines are the run's notes, gathered while it goes and appended to the end of the log. The verdict lines are appended after the tail is printed, so the log ends with them and the printed tail does not hold them. A hard-killed gate's lines are only on stderr.
+- Lines end at CR LF, LF or a lone CR, as .NET's `ReadLine` ends them, for the marker scan and the tail. Both decode the log as UTF-8 lossily: an invalid byte reads as U+FFFD. The gate writes the tail to stdout as UTF-8 (through the wide console API when stdout is a console).
+- The failure-marker regex is built in (kept, V2): `^Build FAILED\.|error CS\d+|: error |Test run summary: Failed!|^\s*failed: [1-9]|gate: (TIMED OUT|STALLED|BACKSTOP)`. It is matched case-insensitively, per line. A zero exit whose log matches becomes status 1 with `gate: command exited 0 but its log reports a failure -> <log>`; on any non-zero status up to 40 matching lines are printed to stdout as `<line number>:<line>`; a killed run is not scanned. `--no-markers` turns the scan off.
+- The scan reads the log streaming and never whole: at most 64 KiB of any one line, and it stops after 40 matches. The tail is read backwards from the end of the log, at most 1 MiB of it; when the last line is longer than that window, the tail shows `… ` followed by its last 4096 characters, starting on a whole character. Each printed tail or marker line is cut at 4096 characters, ending ` …`.
 - At the end the last `--tail` lines go to stdout, then the verdict line ([Output lines](#output-lines)) (kept, V3).
+- A panic after the slot is taken terminates the job, appends the `.err` file and the gate's notes to the log (when completing the log fails, the notes are kept for the next write), deletes the claim and journals `release` with `status` null and `verdict` unknown.
 
 ## Routing and the remote.ps1 bridge
 
@@ -509,7 +537,7 @@ Rules:
 
 A Rust integration suite drives the built `gate.exe` through its CLI and reads only what it writes: exit codes, stdout, stderr, the log, the journal, claims and tickets.
 
-- **Own state root per case.** Every case creates a fresh root under the target directory's temporary folder and passes it with `--state-dir`, so cases never touch the machine's real slots, journal or counts, or each other's. Cases run side by side.
+- **Own state root per case.** Every case creates a fresh folder under the target directory's temporary folder. The folder is the case's working folder, holding its logs and its `LOCALAPPDATA`, and its `state` subfolder is the `--state-dir`, so cases never touch the machine's real slots, journal or counts, or each other's. Cases run side by side.
 - **Test seams.** Hidden `--test-*` flags, compiled only with the `test-seams` cargo feature, set the timing knobs: `--test-sample-ms` (sample period), `--test-heartbeat-ms` (wait heartbeat), `--test-poll-ms` (fallback poll) and `--test-stall-ms` (stall window below a second). Each takes whole milliseconds above 0 on `gate run`. `--test-poll-ms` and `--test-heartbeat-ms` take effect in `--test-journal-run` runs; the sample and stall knobs are parsed only until the watchdog exists.
 
   `--test-journal-run <status>` (a whole number 0 to 255, on `gate run` in the new CLI only) runs the slot lifecycle through the real writer, mutexes, tickets and claims without launching a command: `queue`, the wait for a slot, `take`, an optional hold, then `release`, and exits with `<status>`. A critical run takes no slot: its `take` and `release` carry `"slots":[]`.
@@ -523,10 +551,16 @@ A Rust integration suite drives the built `gate.exe` through its CLI and reads o
   `--test-print-request`, on `run`, `stop-tree` and the compatibility form, prints the parsed request as one JSON line on stdout and exits 0, so the suite sees what a command line asked for; it is the one hidden switch the compatibility layer accepts.
 
   The same feature will carry the failure seams `--test-sampler-fail` (W5) and `--test-diagnostics-fail` (X3), and `--test-remote-client <path>` (a stub in place of the remote client), with their slices. An installed gate has none of them, and without the feature each is an unknown option.
-- **Spawn and wait helpers.** The suite's `start` launches the gate and returns a `Running` that can wait for a stderr line, say whether the gate is still running, and finish; dropping a `Running` kills a gate still running. Output readers are joined with a deadline, so a grandchild holding the pipes cannot hang the suite.
+- **Spawn and wait helpers.** The suite's `start` launches the gate and returns a `Running` that can wait for a stderr line, say whether the gate is still running, and finish; dropping a `Running` kills a gate still running. Output readers are joined with a deadline, so a grandchild holding the pipes cannot hang the suite. A run's `Outcome` carries `raw_stdout`, the bytes as the gate wrote them, beside the decoded text.
 - **Ordering, never elapsed time.** A case asserts the order of events in the journal and the log (a waiter's `take` after the holder's `release`, a heartbeat line before the inner gate's take, a kill line before the exit), never a wall-clock bound a busy machine could cross. A case's own deadline only guards against a hang and is generous.
 - **Injected clock.** The watchdog arithmetic is unit-tested in `gate-watchdog` with an injected clock and scripted samples, not through the binary.
-- **Fake process trees.** A small helper executable, `fake-tool` (built only with the `test-seams` feature; it runs its steps in order: `argv`, `out <text>`, `err <text>`, `sleep <ms>`, `exit <n>`), copied under the names the gate classifies (`VBCSCompiler.exe`, `dotnet.exe`, `MSBuild.exe`), spawns children, burns CPU, prints its argv, writes output or sleeps on command, so build-server, orphan and kill-tree cases need no real toolchain.
+- **Fake process trees.** A small helper executable, `fake-tool`, is built only with the `test-seams` feature.
+
+  It runs its steps in order: `argv`, `out <text>`, `err <text>`, `sleep <ms>`, `wait <path>` (until the path exists, giving up after 120 s with exit 1), `spawn-wait <path>` (starts `fake-tool wait <path>` with the caller's handles, prints `spawned <pid>` and does not wait), `env <name>` (prints the variable's value), `bytes <hex>` (writes those bytes to stdout as they are), `lines <n> <text>` (prints `<text>1` to `<text><n>`), `exit <n>` (any 32-bit status).
+
+  It is copied under the names the gate classifies (`VBCSCompiler.exe`, `dotnet.exe`, `MSBuild.exe`).
+
+  It spawns children, burns CPU, prints its argv, writes output or sleeps on command, so build-server, orphan and kill-tree cases need no real toolchain.
 - **No fixture from the checkout path.** No routing pattern, expected path or assertion is derived from where the repo is checked out; a case builds its own repository and routing file in its root.
 - **Running it.** The suite is a test target with `required-features = ["test-seams"]`, run through the gate with `cargo test --workspace --profile test-release --all-features`. Without the feature (no `--all-features`) cargo skips the suite silently.
 

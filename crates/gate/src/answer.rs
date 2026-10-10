@@ -8,14 +8,14 @@ use crate::console::Console;
 use crate::resolve::{self, Environment};
 use crate::{request_json, seam};
 
-/// The status of a usage error: a missing, unknown or invalid input.
-const USAGE_STATUS: u8 = 2;
-/// The status of a valid request for a mode this build does not have yet.
+/// The status of a usage error: a missing, unknown or invalid input, or a word the command cannot take.
+pub(crate) const USAGE_STATUS: u8 = 2;
+/// The status of a valid request for a mode this build does not have yet: `stop-tree`.
 const NOT_BUILT_STATUS: u8 = 70;
 
 /// Says the answer for `args`, the command line without the program name, through `console`, and returns the exit
-/// status.
-pub(crate) fn answer(args: Vec<OsString>, environment: &Environment, console: &mut Console) -> u8 {
+/// status: a 32-bit code, since a run passes its command's whole exit code through.
+pub(crate) fn answer(args: Vec<OsString>, environment: &Environment, console: &mut Console) -> u32 {
     match parse(args) {
         Ok(Invocation::Version) => {
             console.out(&format!("gate {}", env!("CARGO_PKG_VERSION")));
@@ -26,8 +26,8 @@ pub(crate) fn answer(args: Vec<OsString>, environment: &Environment, console: &m
             0
         }
         Ok(Invocation::Run(request)) => run(&request, environment, console),
-        Ok(Invocation::StopTree(request)) => stop_tree(&request, environment, console),
-        Err(problems) => usage_error(&problems, console),
+        Ok(Invocation::StopTree(request)) => u32::from(stop_tree(&request, environment, console)),
+        Err(problems) => u32::from(usage_error(&problems, console)),
     }
 }
 
@@ -39,24 +39,21 @@ fn usage_error(problems: &[Problem], console: &mut Console) -> u8 {
     USAGE_STATUS
 }
 
-fn run(request: &RunRequest, environment: &Environment, console: &mut Console) -> u8 {
+fn run(request: &RunRequest, environment: &Environment, console: &mut Console) -> u32 {
     let resolved = resolve::root(request.state_dir.as_deref(), environment).and_then(|root| Ok((resolve::log(&request.log)?, root)));
     match resolved {
         Err(line) => {
             console.err(&line);
-            USAGE_STATUS
+            u32::from(USAGE_STATUS)
         }
         Ok((log, root)) if request.print_request => {
             console.out(&request_json::run(request, &log, &root));
             0
         }
-        Ok((log, root)) => {
-            let Some(status) = request.test_seams.journal_run else {
-                console.err("gate: run is not built yet");
-                return NOT_BUILT_STATUS;
-            };
-            seam::seam_run(request, &log, &root, status, console)
-        }
+        Ok((log, root)) => match request.test_seams.journal_run {
+            Some(status) => u32::from(seam::seam_run(request, &log, &root, status, console)),
+            None => crate::run::run(request, &log, &root, console),
+        },
     }
 }
 

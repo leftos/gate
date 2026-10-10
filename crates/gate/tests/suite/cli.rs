@@ -1,6 +1,6 @@
-//! The first word, the usage, and the skeleton's answer to a valid run or stop-tree.
+//! The first word, the usage, a valid run, and the skeleton's answer to a valid stop-tree.
 
-use crate::support::{Case, FAKE_TOOL, USAGE, assert_in_order};
+use crate::support::{Case, FAKE_TOOL, USAGE, assert_in_order, shown};
 
 #[test]
 fn version_exits_0() {
@@ -61,11 +61,12 @@ fn run_reports_missing_inputs_then_usage_exit_2() {
     assert_eq!(outcome.stderr.lines().filter(|line| line.starts_with("gate: ")).count(), 4);
     assert!(outcome.stderr.ends_with(USAGE), "the usage comes last");
     assert_eq!(case.root_entries(), Vec::<String>::new(), "a refused run writes nothing");
+    assert_eq!(case.folder_entries(), Vec::<String>::new(), "a refused run writes nothing");
 }
 
 #[test]
-fn valid_run_says_not_built_and_exits_70() {
-    let case = Case::new("valid_run_says_not_built");
+fn valid_run_runs_its_command_and_exits_with_its_status() {
+    let case = Case::new("valid_run_runs_its_command");
     let outcome = case.run(&[
         "run",
         "--slot",
@@ -80,14 +81,17 @@ fn valid_run_says_not_built_and_exits_70() {
         "0",
     ]);
 
-    assert_eq!(outcome.code, Some(70));
-    assert_eq!(outcome.stdout, "");
-    assert_eq!(outcome.stderr, "gate: run is not built yet\n");
-    assert_eq!(
-        case.root_entries(),
-        Vec::<String>::new(),
-        "nothing is created under the root, the log included"
+    let log = shown(&case.folder().join("out.log"));
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(outcome.stderr, "", "{outcome:?}");
+    assert!(outcome.stdout.starts_with("gate: passed in "), "{outcome:?}");
+    assert!(
+        outcome.stdout.ends_with(&format!(" s (ceiling 5 s). Full output: {log}\n")),
+        "{outcome:?}"
     );
+    assert!(case.folder().join("out.log").is_file(), "the log is in the working folder");
+    let entries = case.root_entries();
+    assert!(entries.iter().any(|entry| entry == "events.jsonl"), "events.jsonl in {entries:?}");
 }
 
 #[test]
@@ -99,4 +103,5 @@ fn valid_stop_tree_says_not_built_and_exits_70() {
     assert_eq!(outcome.stdout, "");
     assert_eq!(outcome.stderr, "gate: stop-tree is not built yet\n");
     assert_eq!(case.root_entries(), Vec::<String>::new(), "nothing is created under the root");
+    assert_eq!(case.folder_entries(), Vec::<String>::new(), "nothing is created in the working folder");
 }

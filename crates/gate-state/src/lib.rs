@@ -32,7 +32,7 @@ pub use model::{
     CRITICAL_LIGHT_RESERVE, CriticalState, CwdReader, DashboardState, MutexProbe, ParseError, PoolState, QueueTicket, RemotePool, SlotCount,
     SlotCounts, SlotKind, SlotRow, SlotState, StateInputs, Waiting, reserved_light,
 };
-pub use root::{KernelObject, StateRoot, default_root, normalize_root, root_hash};
+pub use root::{KernelObject, StateRoot, default_root, log_hash, normalize_root, root_hash};
 pub use state::dashboard_state;
 pub use verdict::Verdict;
 #[cfg(all(windows, target_pointer_width = "64"))]

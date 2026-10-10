@@ -1,0 +1,545 @@
+//! The command's log: readied before the command runs, completed after it with the `.err` file's bytes and the gate's
+//! own lines, and read back in pieces, never whole: the failure markers line by line from the start, the tail from the
+//! end. A line ends at CR LF, LF or a lone CR, as .NET's `ReadLine` reads it, and is read as UTF-8 lossily.
+
+use std::ffi::OsString;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
+
+use regex::Regex;
+
+use crate::console::Console;
+
+/// The failure markers (kept, V2), as the PowerShell gate and design.md write them.
+const MARKERS: &str = r"^Build FAILED\.|error CS\d+|: error |Test run summary: Failed!|^\s*failed: [1-9]|gate: (TIMED OUT|STALLED|BACKSTOP)";
+
+/// [`MARKERS`] matched without regard to case, as the PowerShell gate's `Select-String` matches them.
+#[expect(clippy::expect_used, reason = "the pattern is a constant, compiled by every unit test that scans a line")]
+static MARKER_SCAN: LazyLock<Regex> = LazyLock::new(|| Regex::new(&format!("(?i){MARKERS}")).expect("the marker pattern compiles"));
+
+/// The most marker lines a scan keeps, and a failed run prints.
+const MARKER_LINES: usize = 40;
+/// The bytes of one line the marker scan reads; the rest of a longer line is passed over.
+const SCAN_LINE_BYTES: usize = 64 * 1024;
+/// The most bytes read from the end of the log for its tail.
+const TAIL_BYTES: u64 = 1024 * 1024;
+/// The size of each piece the tail is read in, from the end back.
+const TAIL_CHUNK: u64 = 64 * 1024;
+/// The most characters a printed line shows.
+const SHOWN_CHARACTERS: usize = 4096;
+
+/// The log at an absolute path, the `.err` file beside it that the command's stderr goes to while it runs, and
+/// whether the `.err` file has been dealt with.
+pub(crate) struct Log {
+    path: PathBuf,
+    err_path: PathBuf,
+    err_done: bool,
+}
+
+impl Log {
+    /// The log at `path`, which is absolute.
+    pub(crate) fn new(path: &Path) -> Log {
+        let mut err_path = OsString::from(path.as_os_str());
+        err_path.push(".err");
+        Log {
+            path: path.to_owned(),
+            err_path: PathBuf::from(err_path),
+            err_done: false,
+        }
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub(crate) fn err_path(&self) -> &Path {
+        &self.err_path
+    }
+
+    /// Creates the log's folder and removes an earlier log and `.err` file, so a run that never starts its command
+    /// leaves only its own lines. A log a running command still writes cannot be removed.
+    ///
+    /// # Errors
+    ///
+    /// What could not be done, and why.
+    pub(crate) fn prepare(&self) -> Result<(), String> {
+        if let Some(folder) = self.path.parent() {
+            fs::create_dir_all(folder).map_err(|error| format!("cannot create the log's folder {}: {error}", folder.display()))?;
+        }
+        for path in [&self.path, &self.err_path] {
+            match fs::remove_file(path) {
+                Err(error) if error.kind() != io::ErrorKind::NotFound => {
+                    return Err(format!("cannot remove the earlier {}: {error}", path.display()));
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Appends the `.err` file's bytes to the log as they are and deletes it, once a run, then appends the notes
+    /// `console` gathered ([`Log::append`]). A `.err` file that cannot be copied or deleted is said as a note of its
+    /// own; the notes are appended either way, and kept in `console` for a later `finish` when they cannot be.
+    ///
+    /// # Errors
+    ///
+    /// The system's error when the notes cannot be appended.
+    pub(crate) fn finish(&mut self, console: &mut Console) -> io::Result<()> {
+        if !self.err_done {
+            self.err_done = true;
+            match self.copy_err() {
+                Ok(false) => {}
+                Ok(true) => {
+                    if let Err(error) = fs::remove_file(&self.err_path) {
+                        console.err(&format!("gate: cannot remove {}: {error}", self.err_path.display()));
+                    }
+                }
+                Err(error) => console.err(&format!("gate: cannot append {} to the log: {error}", self.err_path.display())),
+            }
+        }
+        let notes = console.take_notes();
+        let appended = self.append(&notes);
+        if appended.is_err() {
+            console.put_back_notes(notes);
+        }
+        appended
+    }
+
+    /// Copies the `.err` file's bytes to the end of the log; whether there was one.
+    fn copy_err(&self) -> io::Result<bool> {
+        let mut errors = match File::open(&self.err_path) {
+            Ok(errors) => errors,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        let mut log = OpenOptions::new().append(true).create(true).open(&self.path)?;
+        io::copy(&mut errors, &mut log)?;
+        Ok(true)
+    }
+
+    /// Appends `notes`, each as a line, starting on a line of its own when the log does not end in a line feed.
+    ///
+    /// # Errors
+    ///
+    /// The system's error when the log cannot be opened, read or written.
+    pub(crate) fn append(&self, notes: &[String]) -> io::Result<()> {
+        if notes.is_empty() {
+            return Ok(());
+        }
+        let mut log = OpenOptions::new().read(true).append(true).create(true).open(&self.path)?;
+        let mut text = Vec::new();
+        if !ends_a_line(&mut log)? {
+            text.push(b'\n');
+        }
+        for note in notes {
+            text.extend_from_slice(note.as_bytes());
+            text.push(b'\n');
+        }
+        log.write_all(&text)?;
+        log.flush()
+    }
+
+    /// The first lines holding a failure marker, at most 40, each with its line number counted from 1 and cut for
+    /// printing.
+    ///
+    /// # Errors
+    ///
+    /// The system's error when the log cannot be read.
+    pub(crate) fn markers(&self) -> io::Result<Vec<(usize, String)>> {
+        markers_in(BufReader::new(File::open(&self.path)?), MARKER_LINES)
+    }
+
+    /// The last `count` lines, read back from the end of the log, at most 1 MiB of it, each cut for printing.
+    ///
+    /// # Errors
+    ///
+    /// The system's error when the log cannot be read.
+    pub(crate) fn tail(&self, count: u64) -> io::Result<Vec<String>> {
+        tail_in(&mut File::open(&self.path)?, count, TAIL_CHUNK, TAIL_BYTES)
+    }
+}
+
+/// Whether `log` is empty or its last byte is a line feed.
+fn ends_a_line(log: &mut File) -> io::Result<bool> {
+    if log.metadata()?.len() == 0 {
+        return Ok(true);
+    }
+    let mut last = [0_u8];
+    log.seek(SeekFrom::End(-1))?;
+    log.read_exact(&mut last)?;
+    Ok(last[0] == b'\n')
+}
+
+/// Reads lines as .NET's `ReadLine` splits them, keeping at most `cap` bytes of each.
+struct LineReader<R> {
+    reader: R,
+    state: LineState,
+}
+
+/// Where the reader stands between bytes: the bytes a line keeps, and whether the last byte ended a line with a CR.
+struct LineState {
+    cap: usize,
+    after_cr: bool,
+}
+
+impl<R: BufRead> LineReader<R> {
+    fn new(reader: R, cap: usize) -> LineReader<R> {
+        LineReader {
+            reader,
+            state: LineState { cap, after_cr: false },
+        }
+    }
+
+    /// The next line's bytes, without its line end; `None` at the end, where no empty line follows a final line end.
+    fn next_line(&mut self) -> io::Result<Option<Vec<u8>>> {
+        let mut line = Vec::new();
+        let mut started = false;
+        loop {
+            let buffer = self.reader.fill_buf()?;
+            if buffer.is_empty() {
+                return Ok(started.then_some(line));
+            }
+            let (used, ended) = self.state.take(buffer, &mut line, &mut started);
+            self.reader.consume(used);
+            if ended {
+                return Ok(Some(line));
+            }
+        }
+    }
+}
+
+impl LineState {
+    /// Takes `buffer`'s bytes into `line` until a line ends; how many bytes were used, and whether the line ended.
+    fn take(&mut self, buffer: &[u8], line: &mut Vec<u8>, started: &mut bool) -> (usize, bool) {
+        for (index, &byte) in buffer.iter().enumerate() {
+            let after_cr = std::mem::replace(&mut self.after_cr, false);
+            match byte {
+                b'\n' if after_cr => {}
+                b'\n' => return (index + 1, true),
+                b'\r' => {
+                    self.after_cr = true;
+                    return (index + 1, true);
+                }
+                _ => {
+                    *started = true;
+                    if line.len() < self.cap {
+                        line.push(byte);
+                    }
+                }
+            }
+        }
+        (buffer.len(), false)
+    }
+}
+
+/// The first `limit` lines of `reader` holding a failure marker, numbered from 1 and cut for printing; the scan stops
+/// once it has them.
+fn markers_in(reader: impl BufRead, limit: usize) -> io::Result<Vec<(usize, String)>> {
+    let mut lines = LineReader::new(reader, SCAN_LINE_BYTES);
+    let mut found = Vec::new();
+    let mut number = 0;
+    while found.len() < limit
+        && let Some(line) = lines.next_line()?
+    {
+        number += 1;
+        let text = String::from_utf8_lossy(&line);
+        if MARKER_SCAN.is_match(&text) {
+            found.push((number, shown(&text)));
+        }
+    }
+    Ok(found)
+}
+
+/// The last `count` lines of `file`, read back from its end in pieces of `chunk` bytes until they hold the lines or
+/// `most` bytes were read, each cut for printing. A tail that needs more than `most` bytes shows the whole lines that
+/// fit, or, for a last line longer than that, its end ([`line_end`]).
+fn tail_in(file: &mut (impl Read + Seek), count: u64, chunk: u64, most: u64) -> io::Result<Vec<String>> {
+    let wanted = usize::try_from(count).unwrap_or(usize::MAX);
+    if wanted == 0 {
+        return Ok(Vec::new());
+    }
+    let end = file.seek(SeekFrom::End(0))?;
+    let mut start = end;
+    let mut buffer = Vec::new();
+    loop {
+        let step = chunk.min(start).min(most - (end - start));
+        start -= step;
+        let mut piece = vec![0; usize::try_from(step).map_err(io::Error::other)?];
+        file.seek(SeekFrom::Start(start))?;
+        file.read_exact(&mut piece)?;
+        piece.extend_from_slice(&buffer);
+        buffer = piece;
+        let lines = split(&buffer)?;
+        if start == 0 || end - start >= most || lines.len() > wanted {
+            return Ok(last_lines(lines, wanted, start == 0));
+        }
+    }
+}
+
+/// The last `wanted` of `lines`, cut for printing. Unless they start at the file's start, the first may have begun
+/// before the bytes read: it is dropped when another follows, and shown by its end ([`line_end`]) when it is the only
+/// one.
+fn last_lines(mut lines: Vec<Vec<u8>>, wanted: usize, at_start: bool) -> Vec<String> {
+    if !at_start {
+        match lines.as_slice() {
+            [only] => return vec![line_end(only)],
+            [_, _, ..] => {
+                lines.remove(0);
+            }
+            [] => {}
+        }
+    }
+    let skipped = lines.len().saturating_sub(wanted);
+    lines[skipped..].iter().map(|line| shown(&String::from_utf8_lossy(line))).collect()
+}
+
+/// The end of a line whose start was not read: `… ` and its last 4096 characters, from its first whole character (the
+/// bytes of a character begun before the line's read bytes are dropped).
+fn line_end(bytes: &[u8]) -> String {
+    let partial = bytes.iter().take(3).take_while(|&&byte| byte & 0xc0 == 0x80).count();
+    let text = String::from_utf8_lossy(&bytes[partial..]);
+    let characters = text.chars().count();
+    let from = text
+        .char_indices()
+        .nth(characters.saturating_sub(SHOWN_CHARACTERS))
+        .map_or(text.len(), |(at, _)| at);
+    format!("\u{2026} {}", &text[from..])
+}
+
+/// The lines of `bytes`.
+fn split(bytes: &[u8]) -> io::Result<Vec<Vec<u8>>> {
+    let mut reader = LineReader::new(bytes, usize::MAX);
+    let mut lines = Vec::new();
+    while let Some(line) = reader.next_line()? {
+        lines.push(line);
+    }
+    Ok(lines)
+}
+
+/// `text` as a printed line shows it: cut after 4096 characters, ending ` …` when cut.
+fn shown(text: &str) -> String {
+    match text.char_indices().nth(SHOWN_CHARACTERS) {
+        Some((cut, _)) => format!("{} \u{2026}", &text[..cut]),
+        None => text.to_owned(),
+    }
+}
+
+#[cfg(test)]
+#[expect(clippy::expect_used, reason = "a test that cannot write or read its files must fail loudly")]
+mod tests {
+    use std::fs::{self, OpenOptions};
+    use std::io::{BufReader, Cursor};
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::path::PathBuf;
+
+    use super::{Log, MARKER_LINES, markers_in, tail_in};
+    use crate::console::Console;
+
+    /// A fresh folder for one test, under the system's temporary folder.
+    fn folder(name: &str) -> PathBuf {
+        let folder = std::env::temp_dir().join(format!("gate-log-{name}-{}", std::process::id()));
+        if folder.exists() {
+            fs::remove_dir_all(&folder).expect("a folder left by an earlier run can be removed");
+        }
+        fs::create_dir_all(&folder).expect("the test folder can be made");
+        folder
+    }
+
+    fn markers(text: &str) -> Vec<(usize, String)> {
+        markers_in(text.as_bytes(), MARKER_LINES).expect("a string reads")
+    }
+
+    fn matched(line: &str) -> bool {
+        !markers(line).is_empty()
+    }
+
+    fn tail(text: &str, count: u64, chunk: u64, most: u64) -> Vec<String> {
+        tail_in(&mut Cursor::new(text.as_bytes()), count, chunk, most).expect("a string reads")
+    }
+
+    fn numbered(lines: &[(usize, &str)]) -> Vec<(usize, String)> {
+        lines.iter().map(|(number, line)| (*number, (*line).to_owned())).collect()
+    }
+
+    #[test]
+    fn each_marker_alternative_matches_a_line() {
+        let lines = [
+            "Build FAILED.",
+            "Program.cs(3,1): error CS1002: ; expected",
+            "src/main.rs: error : something",
+            "Test run summary: Failed!",
+            "failed: 1",
+            "gate: TIMED OUT after 900 s",
+            "gate: STALLED: no output",
+            "inner gate: BACKSTOP: 5 times the ceiling",
+        ];
+        for line in lines {
+            assert!(matched(line), "{line}");
+        }
+    }
+
+    #[test]
+    fn markers_anchor_per_line_ignore_case_and_need_a_failed_count_above_0() {
+        assert!(!matched("the Build FAILED. line"), "^ anchors at the line start");
+        assert_eq!(
+            markers("first line\nBuild FAILED.\n"),
+            numbered(&[(2, "Build FAILED.")]),
+            "^ anchors at each line"
+        );
+        assert!(matched("build failed."), "case is ignored");
+        assert!(matched("ERROR cs0103"), "case is ignored");
+        assert!(matched("GATE: stalled: x"), "case is ignored");
+        assert!(!matched("    failed: 0"));
+        assert!(matched("    failed: 3"), "leading spaces before failed");
+        assert!(!matched("Build FAILED"), "the period is part of the marker");
+    }
+
+    #[test]
+    fn lines_end_at_crlf_lf_or_a_lone_cr() {
+        assert_eq!(
+            markers("ok\r\nBuild FAILED.\r\nTest run summary: Failed!\r\n"),
+            numbered(&[(2, "Build FAILED."), (3, "Test run summary: Failed!")])
+        );
+        assert_eq!(
+            markers("50%\rBuild FAILED.\n"),
+            numbered(&[(2, "Build FAILED.")]),
+            "a progress line ends at CR"
+        );
+        assert_eq!(tail("a\r\nb\rc\n\nd", 4, 64, 1024), ["b", "c", "", "d"]);
+    }
+
+    #[test]
+    fn the_marker_scan_keeps_the_first_40() {
+        let text = (1..=45).map(|number| format!("error CS{number}")).collect::<Vec<_>>().join("\n");
+
+        let found = markers(&text);
+
+        assert_eq!(found.len(), 40);
+        assert_eq!(found[0], (1, "error CS1".to_owned()));
+        assert_eq!(found[39], (40, "error CS40".to_owned()));
+    }
+
+    #[test]
+    fn the_tail_is_read_back_across_pieces() {
+        let text = "one\r\ntwo\nthree\rfour\r\nfive\n";
+
+        for chunk in 1..=8 {
+            assert_eq!(tail(text, 3, chunk, 1024), ["three", "four", "five"], "pieces of {chunk}");
+            assert_eq!(tail(text, 9, chunk, 1024), ["one", "two", "three", "four", "five"], "pieces of {chunk}");
+        }
+        assert_eq!(tail(text, 0, 4, 1024), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_tail_past_its_byte_cap_shows_what_fits() {
+        assert_eq!(tail("a\nbb\nccc\n", 3, 2, 6), ["ccc"], "bb\\n is cut short, so only ccc is whole");
+        assert_eq!(tail("abcdefgh\n", 1, 2, 4), ["\u{2026} fgh"], "the end of a line longer than the cap");
+    }
+
+    #[test]
+    fn a_last_line_longer_than_the_cap_shows_its_last_4096_characters() {
+        let long = format!("{}END\n", "a".repeat(9000));
+        let split = format!("{}x\n", "\u{e9}".repeat(5000));
+
+        assert_eq!(tail(&long, 1, 1024, 8000), [format!("\u{2026} {}END", "a".repeat(4093))]);
+        assert_eq!(
+            tail(&split, 1, 1024, 4097),
+            [format!("\u{2026} {}x", "\u{e9}".repeat(2047))],
+            "the half of a character the window starts in is dropped"
+        );
+    }
+
+    #[test]
+    fn a_crlf_split_across_reads_ends_one_line() {
+        let text = "ok\r\nBuild FAILED.\r\nerror CS1\r\n";
+
+        let found = markers_in(BufReader::with_capacity(1, text.as_bytes()), MARKER_LINES).expect("a string reads");
+
+        assert_eq!(found, numbered(&[(2, "Build FAILED."), (3, "error CS1")]));
+    }
+
+    #[test]
+    fn a_printed_line_is_cut_after_4096_characters() {
+        let long = format!("{}\n", "\u{e9}".repeat(5000));
+
+        let lines = tail(&long, 1, 1024, 1 << 20);
+        let found = markers(&format!("error CS1 {long}"));
+
+        assert_eq!(lines, [format!("{} \u{2026}", "\u{e9}".repeat(4096))]);
+        assert!(found[0].1.ends_with(" \u{2026}"), "a marker line is cut too");
+        assert_eq!(found[0].1.chars().count(), 4096 + 2);
+    }
+
+    #[test]
+    fn the_tail_of_invalid_utf8_reads_as_replacement_characters() {
+        let folder = folder("tail");
+        let log = Log::new(&folder.join("out.log"));
+        fs::write(log.path(), b"first\nok \xff\xfe bad\nlast").expect("the log can be written");
+
+        assert_eq!(log.tail(2).expect("the log reads"), ["ok \u{fffd}\u{fffd} bad", "last"]);
+        assert_eq!(log.tail(20).expect("the log reads"), ["first", "ok \u{fffd}\u{fffd} bad", "last"]);
+        fs::remove_dir_all(&folder).expect("the test folder can be removed");
+    }
+
+    #[test]
+    fn finish_appends_the_err_bytes_exactly_then_the_notes_in_order() {
+        let folder = folder("finish");
+        let mut log = Log::new(&folder.join("logs").join("out.log"));
+        log.prepare().expect("the log's folder can be made");
+        fs::write(log.path(), b"out\n").expect("the log can be written");
+        fs::write(log.err_path(), b"\xffraw\r\nerr\n").expect("the err file can be written");
+        let mut console = Console::new();
+        console.err("gate: first");
+        console.err("gate: second");
+
+        log.finish(&mut console).expect("the log completes");
+
+        assert_eq!(
+            fs::read(log.path()).expect("the log reads"),
+            b"out\n\xffraw\r\nerr\ngate: first\ngate: second\n"
+        );
+        assert!(!log.err_path().exists(), "the err file is deleted");
+        fs::write(log.err_path(), b"again").expect("the err file can be written again");
+        console.err("gate: third");
+        log.finish(&mut console).expect("the log completes again");
+        let twice = fs::read(log.path()).expect("the log reads");
+        assert!(
+            twice.ends_with(b"gate: second\ngate: third\n"),
+            "a second finish copies no .err: {twice:?}"
+        );
+
+        let mut fresh = Log::new(&folder.join("fresh.log"));
+        fs::write(fresh.err_path(), b"no line feed").expect("the err file can be written");
+        console.err("gate: own line");
+        fresh.finish(&mut console).expect("the log completes");
+        assert_eq!(fs::read(fresh.path()).expect("the log reads"), b"no line feed\ngate: own line\n");
+        fs::remove_dir_all(&folder).expect("the test folder can be removed");
+    }
+
+    #[test]
+    fn finish_keeps_the_notes_when_the_err_file_cannot_be_removed() {
+        let folder = folder("undeletable");
+        let mut log = Log::new(&folder.join("out.log"));
+        fs::write(log.path(), b"").expect("the log can be written");
+        fs::write(log.err_path(), b"err\n").expect("the err file can be written");
+        // Read and write sharing only: the file cannot be deleted while this handle is open.
+        let held = OpenOptions::new()
+            .read(true)
+            .share_mode(1 | 2)
+            .open(log.err_path())
+            .expect("the err file opens");
+        let mut console = Console::new();
+        console.err("gate: note");
+
+        let finished = log.finish(&mut console);
+        drop(held);
+
+        finished.expect("finish keeps going past an err file it cannot remove");
+        let text = String::from_utf8(fs::read(log.path()).expect("the log reads")).expect("the log is UTF-8");
+        let cannot = format!("gate: cannot remove {}: ", log.err_path().display());
+        assert!(text.starts_with(&format!("err\ngate: note\n{cannot}")), "{text}");
+        fs::remove_dir_all(&folder).expect("the test folder can be removed");
+    }
+}

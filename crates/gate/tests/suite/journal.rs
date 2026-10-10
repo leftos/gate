@@ -149,10 +149,15 @@ fn journal_run_writes_queue_take_release_in_order() {
     for line in &lines {
         assert_eq!(
             (&line["pid"], line["kind"].as_str(), line["cwd"].as_str(), line["command"].as_str()),
-            (&lines[0]["pid"], Some("light"), Some(shown(&case.root()).as_str()), Some("cmd /c exit 0"))
+            (
+                &lines[0]["pid"],
+                Some("light"),
+                Some(shown(&case.folder()).as_str()),
+                Some("cmd /c exit 0")
+            )
         );
     }
-    assert_eq!(lines[0]["log"], shown(&case.root().join("out.log")));
+    assert_eq!(lines[0]["log"], shown(&case.folder().join("out.log")));
     assert!(lines[1]["waitedSeconds"].is_f64(), "the take says how long it waited: {}", lines[1]);
     assert!(lines[1].get("abandoned").is_none(), "a clean take names no abandoned slot: {}", lines[1]);
 }

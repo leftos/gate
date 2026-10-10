@@ -42,29 +42,37 @@ const POLL: Duration = Duration::from_millis(10);
 
 static NEXT_CASE: AtomicU64 = AtomicU64::new(0);
 
-/// One case: its own state root under the target directory, removed when the case ends.
+/// One case: its own folder under the target directory, removed when the case ends. The folder is the gate's working
+/// directory, where its logs go; the state root is the `state` folder inside it, so no log lands in the state root.
 pub struct Case {
-    root: PathBuf,
+    folder: PathBuf,
+    state: PathBuf,
 }
 
 impl Case {
     pub fn new(name: &str) -> Case {
         let number = NEXT_CASE.fetch_add(1, Ordering::Relaxed);
-        let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}-{}-{number}", process::id()));
-        if root.exists() {
-            fs::remove_dir_all(&root).expect("a case root left by an earlier run can be removed");
+        let folder = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}-{}-{number}", process::id()));
+        if folder.exists() {
+            fs::remove_dir_all(&folder).expect("a case folder left by an earlier run can be removed");
         }
-        fs::create_dir_all(&root).expect("the case root can be made");
-        Case { root }
+        let state = folder.join("state");
+        fs::create_dir_all(&state).expect("the case folder and its state root can be made");
+        Case { folder, state }
     }
 
     /// The case's state root, absolute as the gate reports it.
     pub fn root(&self) -> PathBuf {
-        std::path::absolute(&self.root).expect("the case root has an absolute path")
+        std::path::absolute(&self.state).expect("the state root has an absolute path")
     }
 
-    /// Readies `command` for this case: the inherited gate variables removed, LOCALAPPDATA under the case root
-    /// ([`Case::local_app_data`]), the working directory the case root,
+    /// The case's folder, absolute: the gate's working directory, holding the state root and the logs.
+    pub fn folder(&self) -> PathBuf {
+        std::path::absolute(&self.folder).expect("the case folder has an absolute path")
+    }
+
+    /// Readies `command` for this case: the inherited gate variables removed, LOCALAPPDATA under the case folder
+    /// ([`Case::local_app_data`]), the working directory the case folder,
     /// and `args` given with `--state-dir <root>` after a `run` or `stop-tree` subcommand.
     pub fn prepare(&self, command: &mut Command, args: &[&str]) {
         self.prepare_without_state_dir(command, &[]);
@@ -73,7 +81,7 @@ impl Case {
         };
         command.arg(first);
         if matches!(*first, "run" | "stop-tree") {
-            command.arg("--state-dir").arg(&self.root);
+            command.arg("--state-dir").arg(&self.state);
         }
         command.args(rest);
     }
@@ -83,13 +91,13 @@ impl Case {
         for name in INHERITED {
             command.env_remove(name);
         }
-        command.env("LOCALAPPDATA", self.local_app_data()).current_dir(&self.root).args(args);
+        command.env("LOCALAPPDATA", self.local_app_data()).current_dir(&self.folder).args(args);
     }
 
-    /// The LOCALAPPDATA every case's gate sees, under the case root, so no case reads the host's default root. The
+    /// The LOCALAPPDATA every case's gate sees, under the case folder, so no case reads the host's default root. The
     /// folder is not created.
     pub fn local_app_data(&self) -> PathBuf {
-        self.root().join("appdata")
+        self.folder().join("appdata")
     }
 
     /// The gate with `args`, `--state-dir` added where the form takes it.
@@ -115,30 +123,41 @@ impl Case {
         start(self.gate(args))
     }
 
-    /// The names of the entries the gate left in the root.
+    /// The names of the entries the gate left in the state root.
     pub fn root_entries(&self) -> Vec<String> {
-        fs::read_dir(&self.root)
-            .expect("the case root can be listed")
+        fs::read_dir(&self.state)
+            .expect("the state root can be listed")
             .map(|entry| entry.expect("a root entry can be read").file_name().to_string_lossy().into_owned())
+            .collect()
+    }
+
+    /// The names of the entries in the case folder, less the state root the harness made there.
+    pub fn folder_entries(&self) -> Vec<String> {
+        fs::read_dir(&self.folder)
+            .expect("the case folder can be listed")
+            .map(|entry| entry.expect("a folder entry can be read").file_name().to_string_lossy().into_owned())
+            .filter(|name| name != "state")
             .collect()
     }
 }
 
 impl Drop for Case {
     fn drop(&mut self) {
-        if let Err(error) = fs::remove_dir_all(&self.root) {
-            // A root left under the target directory harms no later case, and a panic in drop would abort the run.
-            let _ = writeln!(io::stderr(), "could not remove the case root {}: {error}", self.root.display());
+        if let Err(error) = fs::remove_dir_all(&self.folder) {
+            // A folder left under the target directory harms no later case, and a panic in drop would abort the run.
+            let _ = writeln!(io::stderr(), "could not remove the case folder {}: {error}", self.folder.display());
         }
     }
 }
 
-/// What a program did: its status code (`None` when killed by the hang guard) and its output.
+/// What a program did: its status code (`None` when killed by the hang guard) and its output, read as UTF-8 with
+/// U+FFFD for what is not, and stdout's own bytes.
 #[derive(Debug)]
 pub struct Outcome {
     pub code: Option<i32>,
     pub stdout: String,
     pub stderr: String,
+    pub raw_stdout: Vec<u8>,
 }
 
 impl Outcome {
@@ -208,6 +227,7 @@ impl Running {
             code: status.code(),
             stdout: text(&self.stdout),
             stderr: text(&self.stderr),
+            raw_stdout: bytes(&self.stdout),
         }
     }
 
@@ -249,6 +269,7 @@ impl Running {
             code: status.and_then(|status| status.code()),
             stdout: text(&self.stdout),
             stderr: text(&self.stderr),
+            raw_stdout: bytes(&self.stdout),
         }
     }
 }
@@ -288,7 +309,11 @@ fn gather(mut stream: impl Read + Send + 'static) -> (Buffer, JoinHandle<()>) {
 }
 
 fn text(buffer: &Buffer) -> String {
-    String::from_utf8_lossy(&buffer.lock().expect("no reader panicked holding the buffer")).into_owned()
+    String::from_utf8_lossy(&bytes(buffer)).into_owned()
+}
+
+fn bytes(buffer: &Buffer) -> Vec<u8> {
+    buffer.lock().expect("no reader panicked holding the buffer").clone()
 }
 
 /// Returns once a line of `root`'s journal contains `needle`, a missing journal read as no lines yet; fails with the

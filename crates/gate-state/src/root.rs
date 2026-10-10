@@ -34,6 +34,16 @@ pub fn root_hash(normalized: &str) -> String {
     hex
 }
 
+/// The log hash of an absolute log path: the first 16 hex digits of the SHA-256 of its normalised form
+/// ([`normalize_root`]), as a number, which [`KernelObject::Log`] names its mutex by.
+#[must_use]
+pub fn log_hash(absolute_log: &str) -> u64 {
+    let digest = Sha256::digest(normalize_root(absolute_log).as_bytes());
+    let mut first = [0_u8; 8];
+    first.copy_from_slice(&digest[..8]);
+    u64::from_be_bytes(first)
+}
+
 /// The default root for a `%LOCALAPPDATA%` value: `<LOCALAPPDATA>\gate\v1`.
 #[must_use]
 pub fn default_root(local_app_data: &str) -> String {
@@ -57,6 +67,8 @@ pub enum KernelObject {
     WakeEvent { pid: u32, start_ms: u64 },
     /// The job a gate runs its command in, by the gate's pid.
     Job { gate_pid: u32 },
+    /// The mutex a running gate holds for its log, by the log's [`log_hash`], so two gates never write one log.
+    Log { hash: u64 },
 }
 
 impl KernelObject {
@@ -69,18 +81,20 @@ impl KernelObject {
             KernelObject::Journal => "journal".to_owned(),
             KernelObject::WakeEvent { pid, start_ms } => format!("wake-{pid}-{start_ms}"),
             KernelObject::Job { gate_pid } => format!("job-{gate_pid}"),
+            KernelObject::Log { hash } => format!("log-{hash:016x}"),
         }
     }
 
     /// The file name of the claim a gate holding this object writes: the mutex name without `Local\` and without the
-    /// root hash, plus `.json`. `None` for an object no gate claims (the journal mutex, a wake event, a job).
+    /// root hash, plus `.json`. `None` for an object no gate claims (the journal mutex, a wake event, a job, a log's
+    /// mutex).
     #[must_use]
     pub fn claim_file_name(self) -> Option<String> {
         match self {
             KernelObject::HeavySlot(_) | KernelObject::LightSlot(_) | KernelObject::RemoteSlot(_) | KernelObject::Critical => {
                 Some(format!("gate-{}.json", self.suffix()))
             }
-            KernelObject::Journal | KernelObject::WakeEvent { .. } | KernelObject::Job { .. } => None,
+            KernelObject::Journal | KernelObject::WakeEvent { .. } | KernelObject::Job { .. } | KernelObject::Log { .. } => None,
         }
     }
 }

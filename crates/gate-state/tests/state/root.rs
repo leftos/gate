@@ -1,7 +1,7 @@
 //! The state root: which root is the machine's default, the hash a non-default root carries, and the kernel object names
 //! each root gives.
 
-use gate_state::{KernelObject, StateRoot, default_root, normalize_root, root_hash};
+use gate_state::{KernelObject, StateRoot, default_root, log_hash, normalize_root, root_hash};
 
 const LOCAL_APP_DATA: &str = r"C:\Users\someone\AppData\Local";
 const DEFAULT_ROOT: &str = r"C:\Users\someone\AppData\Local\gate\v1";
@@ -116,9 +116,25 @@ fn claim_files_drop_local_and_the_root_hash() {
         KernelObject::Journal,
         KernelObject::WakeEvent { pid: 4242, start_ms: 1 },
         KernelObject::Job { gate_pid: 4242 },
+        KernelObject::Log { hash: 1 },
     ] {
         assert_eq!(object.claim_file_name(), None, "{object:?} has no claim");
     }
+}
+
+#[test]
+fn a_log_mutex_is_named_by_16_hex_of_its_normalised_path() {
+    let hash = log_hash(r"C:\Work\Out.log");
+
+    assert_eq!(hash, log_hash(r"c:/work/out.log"), "case and separators do not matter");
+    assert_eq!(hash, log_hash(r"\\?\C:\WORK\OUT.LOG"), "nor does a verbatim prefix");
+    assert_ne!(hash, log_hash(r"C:\Work\Other.log"));
+    let name = root(r"C:\gate-test\root").object_name(KernelObject::Log { hash: 0xab });
+    assert_eq!(name, format!(r"Local\gate-{TEST_ROOT_HASH}-log-00000000000000ab"));
+    assert_eq!(
+        root(DEFAULT_ROOT).object_name(KernelObject::Log { hash }),
+        format!(r"Local\gate-log-{hash:016x}")
+    );
 }
 
 #[test]

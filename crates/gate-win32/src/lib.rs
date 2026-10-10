@@ -12,7 +12,7 @@ mod mutex;
 
 pub use event::{EventWait, NamedEvent};
 pub use job::Job;
-pub use launch::{EnvironmentBlock, Launch, LaunchError, PriorityClass, Running, Suspended};
+pub use launch::{EnvironmentBlock, Launch, LaunchError, PriorityClass, Running, Suspended, same_variable_name};
 pub use mutex::{AcquireError, MutexGuard, NamedMutex, OwnedMutexGuard, mutex_exists};
 
 use std::io;
@@ -25,7 +25,8 @@ use windows_sys::Win32::System::Diagnostics::Debug::{
     FORMAT_MESSAGE_ALLOCATE_BUFFER, FORMAT_MESSAGE_FROM_SYSTEM, FORMAT_MESSAGE_IGNORE_INSERTS, FormatMessageW,
 };
 use windows_sys::Win32::System::Threading::{
-    GetCurrentProcess, GetExitCodeProcess, GetProcessTimes, INFINITE, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    BELOW_NORMAL_PRIORITY_CLASS, GetCurrentProcess, GetExitCodeProcess, GetPriorityClass, GetProcessTimes, IDLE_PRIORITY_CLASS, INFINITE,
+    OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 
 /// The guard of a handle a Win32 call just returned, or the error the call left behind.
@@ -85,6 +86,47 @@ pub fn win32_message(code: u32) -> String {
 pub fn process_start() -> io::Result<Timestamp> {
     // SAFETY: the pseudo-handle of the current process is always open and needs no closing.
     unsafe { start_of(GetCurrentProcess()) }
+}
+
+/// Whether this process runs in the below-normal or the idle priority class.
+///
+/// # Errors
+///
+/// The system's error when the class cannot be read.
+pub fn runs_below_normal() -> io::Result<bool> {
+    // SAFETY: the pseudo-handle of the current process is always open, with the query access the call asks for.
+    let class = unsafe { GetPriorityClass(GetCurrentProcess()) };
+    if class == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(class == BELOW_NORMAL_PRIORITY_CLASS || class == IDLE_PRIORITY_CLASS)
+}
+
+/// The system folder (`System32`), as `GetSystemDirectoryW` gives it: where cmd.exe is, whatever the environment says.
+///
+/// # Errors
+///
+/// The system's error when the folder cannot be read.
+pub fn system_directory() -> io::Result<std::path::PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+
+    use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
+
+    let mut buffer = vec![0_u16; 260];
+    loop {
+        let size = u32::try_from(buffer.len()).map_err(io::Error::other)?;
+        // SAFETY: `buffer` is writable for `size` units, and the call writes at most that many.
+        let length = unsafe { GetSystemDirectoryW(buffer.as_mut_ptr(), size) } as usize;
+        if length == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if length < buffer.len() {
+            buffer.truncate(length);
+            return Ok(std::ffi::OsString::from_wide(&buffer).into());
+        }
+        // Too small: `length` is the size the folder needs, its terminating NUL included.
+        buffer.resize(length, 0);
+    }
 }
 
 /// The start time of the running process `pid`, as [`process_start`] gives it; `None` when no process has that pid or

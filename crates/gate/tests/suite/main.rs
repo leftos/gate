@@ -8,6 +8,7 @@ mod compat;
 mod harness;
 mod hold;
 mod journal;
+mod launch;
 mod request;
 mod slots;
 mod support;

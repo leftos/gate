@@ -96,9 +96,19 @@ fn check_entry(name: &[u16], value: &[u16]) -> io::Result<()> {
     }
 }
 
+/// Whether two environment variable names are one name to Windows, as [`EnvironmentBlock`] matches them: equal
+/// ordinally without regard to case over all of Unicode.
+#[must_use]
+pub fn same_variable_name(left: &OsStr, right: &OsStr) -> bool {
+    let left: Vec<u16> = left.encode_wide().collect();
+    let right: Vec<u16> = right.encode_wide().collect();
+    compare_names(&left, &right) == Ordering::Equal
+}
+
 /// The order of two names as Windows orders environment names: ordinal, without regard to case.
 fn compare_names(left: &[u16], right: &[u16]) -> Ordering {
-    // `check_entry` refused every name whose length does not fit an `i32`.
+    // `check_entry` refused every name whose length does not fit an `i32`; a longer name is compared by its first
+    // `i32::MAX` units, which stay within it.
     let left_len = i32::try_from(left.len()).unwrap_or(i32::MAX);
     let right_len = i32::try_from(right.len()).unwrap_or(i32::MAX);
     // SAFETY: each pointer is to as many readable units as its length says, both outliving the call.
@@ -200,7 +210,8 @@ impl Launch {
     /// Creates the command suspended, in its working folder with its environment and priority class, sharing this
     /// process's console and process group. Its stdin is `NUL`, its stdout the log and its stderr the `.err` file,
     /// each created afresh (an earlier file at the path is deleted first, and a link at it is never followed) and open
-    /// to every process for reading, writing and deleting while the command writes them; it inherits those three
+    /// to every process for reading, writing and deleting while the command writes them, so a process the command left
+    /// running cannot keep the next run from replacing them; it inherits those three
     /// handles and no other. It is created with the desktop-app policy
     /// `PROCESS_CREATION_DESKTOP_APP_BREAKAWAY_DISABLE_PROCESS_TREE`, as the PowerShell gate creates it: Microsoft's
     /// documentation says only that it matters to a Win32 app packaged through the Desktop Bridge, whose child

@@ -1,24 +1,34 @@
 //! `gate.exe`: runs a heavy command under a machine-wide queue of CPU slots. This build reads its command line,
-//! resolves the state root and the log path, and answers `--version` and `--help`, saying each line as it goes;
-//! running a command and stopping a tree are not built yet. A `test-seams` build journals a run it does not launch,
-//! queueing for, taking and releasing a real slot (`--test-journal-run`).
+//! resolves the state root and the log path, answers `--version` and `--help`, and runs a command under a slot in a
+//! job of its own, saying each line as it goes; the watchdog and stopping a tree are not built yet. A `test-seams`
+//! build also journals a run it does not launch, queueing for, taking and releasing a real slot
+//! (`--test-journal-run`).
 
 mod acquire;
 mod answer;
 mod console;
+mod environment;
 mod journal;
+mod log;
 mod request_json;
 mod resolve;
+mod run;
 mod seam;
 mod slots;
 mod wait;
 
-use std::process::ExitCode;
+use std::io::{self, Write};
 
 use crate::console::Console;
 use crate::resolve::Environment;
 
-fn main() -> ExitCode {
+/// Exits through `std::process::exit`, because `ExitCode` carries 8 bits and the gate exits with its command's whole
+/// 32-bit code.
+fn main() {
     let status = answer::answer(std::env::args_os().skip(1).collect(), &Environment::from_process(), &mut Console::new());
-    ExitCode::from(status)
+    // Every line was flushed as it was said; these only guard the exit against one that was not, with no stream left
+    // to report a failed flush on.
+    let _ = io::stdout().flush();
+    let _ = io::stderr().flush();
+    std::process::exit(status.cast_signed());
 }
