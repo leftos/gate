@@ -1,5 +1,6 @@
 //! The routing file. The reasons are the PowerShell gate's own (`remote.ps1`'s `Read-RemoteConfig`), each confirmed
-//! by feeding the same text to it in `pwsh -NoProfile`.
+//! by feeding the same text to it in `pwsh -NoProfile`, but for a host whose characters ssh or git would misread: that
+//! refusal is this gate's own and was not confirmed against `pwsh`.
 
 use std::path::Path;
 
@@ -152,11 +153,12 @@ fn a_trailing_comma_in_an_array_even_before_a_comment_is_accepted() {
 
 #[test]
 fn comment_and_comma_marks_inside_a_string_are_left_untouched() {
-    let config =
-        Config::parse("{\"host\": \"b\\\"//c\", \"repos\": {\"g\": [\"a,}\", \"x /* y */\", \"q,]\", \"e\\\\\"], // after an escaped backslash\n}}")
-            .expect("usable");
-    assert_eq!(config.host(), "b\"//c");
-    assert_eq!(pattern_texts(&config, "g"), ["a,}", "x /* y */", "q,]", "e\\"]);
+    let config = Config::parse(
+        "{\"host\": \"builder-1\", \"repos\": {\"g\": [\"a,}\", \"x /* y */\", \"q,]\", \"e\\\\\", \"b\\\"//c\"], // after an escaped backslash\n}}",
+    )
+    .expect("usable");
+    assert_eq!(config.host(), "builder-1");
+    assert_eq!(pattern_texts(&config, "g"), ["a,}", "x /* y */", "q,]", "e\\", "b\"//c"]);
 }
 
 #[test]
@@ -177,4 +179,53 @@ fn the_ignored_line_names_the_file_and_the_reason() {
         ignored_line(Path::new("remote.json"), "host is missing"),
         "gate: ignored remote.json: host is missing; running locally"
     );
+}
+
+/// A usable routing file but for its `host`, set to the JSON text `host_json`, which may hold escapes.
+fn host_file(host_json: &str) -> String {
+    format!(r#"{{"host": "{host_json}", "repos": {{}}}}"#)
+}
+
+#[test]
+fn a_host_that_is_not_an_ssh_alias_or_user_at_host_is_refused() {
+    let refused = Err::<(), String>("host must be an ssh alias or user@host of letters, digits, '.', '_' and '-', not starting with '-'".to_owned());
+    // A JSON string cannot hold a raw control character, so each form that is one is written as its JSON escape.
+    let forms = [
+        ("-oProxyCommand=x", "a leading dash"),
+        ("a b", "a space"),
+        (r"a\tb", "a tab"),
+        (r"a\nb", "a line break"),
+        (r"a\u0007b", "a control character"),
+        (r"a\u00a0b", "a no-break space"),
+        ("user@-x", "a host part starting with a dash"),
+        (r"a\u200bb", "a zero-width space"),
+        (r"a\u202eb", "a right-to-left override"),
+        (r"a\ufeffb", "a byte order mark"),
+        (r#"a\"b"#, "a quote"),
+        ("a%b", "a percent sign"),
+        ("a;b", "a semicolon"),
+        ("$(x)", "a command substitution"),
+        ("host:22", "a host and a port"),
+        ("a/b", "a slash"),
+        ("[::1]", "an IPv6 address"),
+        ("@host", "an empty user"),
+        ("user@", "an empty host"),
+        ("a@b@c", "two at signs"),
+    ];
+    let failures: Vec<String> = forms
+        .iter()
+        .filter_map(|(host, what)| {
+            let got = Config::parse(&host_file(host)).map(|_| ());
+            (got != refused).then(|| format!("{what} ({host}): expected {refused:?}, got {got:?}"))
+        })
+        .collect();
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+#[test]
+fn an_ssh_alias_or_user_at_host_of_allowed_characters_is_accepted() {
+    for host in ["builder", "build-box.lan", "user@build-box", "10.0.0.5", "b_1"] {
+        let config = Config::parse(&host_file(host)).expect("usable");
+        assert_eq!(config.host(), host);
+    }
 }

@@ -3,7 +3,8 @@
 //! the optional `outputs` (each repo name's globs for the files a routed run brings back). Keys match in any letter
 //! case and unknown keys are ignored. The text may hold `//` and `/* */` comments and trailing commas, as the
 //! PowerShell gate's JSON reader allows; single-quoted strings are refused. A file that breaks a rule is unusable as a
-//! whole, for the reason the PowerShell gate gives, which the caller says in [`ignored_line`].
+//! whole, for the reason the PowerShell gate gives (or, for a host ssh or git would misread, a reason of its own),
+//! which the caller says in [`ignored_line`].
 
 use std::path::{Path, PathBuf};
 
@@ -54,6 +55,9 @@ impl Config {
     /// object differing only in letter case, a value that is not a JSON object, a missing or empty `host`, a `slots`
     /// that is not a whole number 1 to 16, a missing `repos`, a `repos` or `outputs` that is not an object of arrays
     /// of non-empty valid patterns, or an output glob holding `[` or `]`.
+    ///
+    /// A `host` that is not an ssh alias or `user@host` of letters, digits, `.`, `_` and `-` is refused with a reason of
+    /// the gate's own, since the PowerShell gate accepts it.
     pub fn parse(text: &str) -> Result<Self, String> {
         let text = strict_json(text.strip_prefix('\u{feff}').unwrap_or(text));
         // PowerShell's JSON reader gives no value at all for blank text, which is then no JSON object.
@@ -209,12 +213,42 @@ fn property<'a>(object: &'a Map<String, Value>, key: &str) -> Option<&'a Value> 
     object.iter().find(|(name, _)| eq_ignoring_case(name, key)).map(|(_, value)| value)
 }
 
+/// The `host`: an ssh alias or `user@host`, both parts of letters, digits, `.`, `_` and `-`, neither starting with
+/// `-`. The host reaches ssh's argument list, a git `host:path` URL and `ssh_config` `%h` expansion, so only those
+/// characters are safe in all three.
 fn read_host(data: &Map<String, Value>) -> Result<String, String> {
     let value = property(data, "host").ok_or_else(|| "host is missing".to_owned())?;
     match value {
-        Value::String(host) if !host.is_empty() => Ok(host.clone()),
+        Value::String(host) if is_host(host) => Ok(host.clone()),
+        Value::String(host) if !host.is_empty() => Err(HOST_REFUSAL.to_owned()),
         _ => Err("host must be a non-empty string".to_owned()),
     }
+}
+
+/// The reason a host that is not an ssh alias or `user@host` of letters, digits, `.`, `_` and `-` is refused: a reason
+/// of the gate's own, since the PowerShell gate accepts such a host.
+const HOST_REFUSAL: &str = "host must be an ssh alias or user@host of letters, digits, '.', '_' and '-', not starting with '-'";
+
+/// Whether `host` is an ssh alias or `user@host`: at most one `@`, each part a [`host_part`].
+fn is_host(host: &str) -> bool {
+    match host.split_once('@') {
+        Some((user, name)) => host_part(user) && host_part(name),
+        None => host_part(host),
+    }
+}
+
+/// Whether `part` is a non-empty run of ASCII letters, digits, `.`, `_` and `-` that does not start with `-`.
+fn host_part(part: &str) -> bool {
+    let mut chars = part.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    first != '-' && host_part_char(first) && chars.all(host_part_char)
+}
+
+/// Whether `ch` may stand in a host part: an ASCII letter, a digit, `.`, `_` or `-`.
+fn host_part_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-')
 }
 
 /// `slots`, 1 when missing: any JSON number that is a whole number 1 to 16, so `2` and `2.0` are both 2.
