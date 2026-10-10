@@ -14,8 +14,8 @@ use gate_win32::Interrupt;
 
 use crate::remote::git::{self, Git, GitError};
 
-/// The author and committer of every commit the snapshot makes.
-const IDENTITY: [(&str, &str); 4] = [
+/// The author and committer of every commit the snapshot makes, and of the builder's back commit.
+pub(crate) const IDENTITY: [(&str, &str); 4] = [
     ("GIT_AUTHOR_NAME", "gate-remote"),
     ("GIT_AUTHOR_EMAIL", "gate-remote@localhost"),
     ("GIT_COMMITTER_NAME", "gate-remote"),
@@ -47,12 +47,15 @@ pub(crate) fn take(roots: &[PathBuf], key: &str, limit: Duration, interrupt: Opt
 }
 
 /// Points `refs/gate-remote/<key>` at `commit` in the repository of `root`, once the builder has the snapshot, so the
-/// next bridge commit builds on it.
-#[cfg_attr(not(test), expect(dead_code, reason = "no client pushes a snapshot, so none is saved"))]
-pub(crate) fn save(root: &Path, key: &str, commit: &str, limit: Duration) -> Result<(), GitError> {
+/// next bridge commit builds on it; git is ended after `limit` or by the console `interrupt`.
+pub(crate) fn save(root: &Path, key: &str, commit: &str, limit: Duration, interrupt: Option<Interrupt>) -> Result<(), GitError> {
     let git = Git::find(root).map_err(GitError::Failed)?;
-    git.output(&git::Call::plain(root, &["update-ref", &format!("{REFS}{key}"), commit], limit))
-        .map(drop)
+    let args = ["update-ref", &format!("{REFS}{key}"), commit];
+    git.output(&git::Call {
+        interrupt,
+        ..git::Call::plain(root, &args, limit)
+    })
+    .map(drop)
 }
 
 fn take_one(git: &Git, root: &Path, key: &str, limit: Duration, interrupt: Option<Interrupt>) -> Result<Snapshot, GitError> {
@@ -299,7 +302,7 @@ mod tests {
         let first = take(roots, OWN, GIT_LIMIT, None).expect("the first snapshot is made");
         assert_eq!(first.len(), 1, "one snapshot for one root");
         assert_eq!(first[0].bridge, None, "no snapshot before the first");
-        save(&root, OWN, &first[0].commit, GIT_LIMIT).expect("the ref is saved");
+        save(&root, OWN, &first[0].commit, GIT_LIMIT, None).expect("the ref is saved");
         fs::write(root.join("a.txt"), "b\n").expect("a file can be changed");
 
         let second = take(roots, OWN, GIT_LIMIT, None).expect("the second snapshot is made");

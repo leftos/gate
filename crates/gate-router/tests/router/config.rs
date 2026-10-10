@@ -73,27 +73,27 @@ fn each_unusable_file_gives_the_powershell_reason() {
         ("{}", "host is missing"),
         (r#"{"host": 1}"#, "host must be a non-empty string"),
         (r#"{"host": ""}"#, "host must be a non-empty string"),
-        (r#"{"host": "b"}"#, "repos is missing"),
-        (r#"{"host": "b", "repos": []}"#, "repos must be a JSON object"),
-        (r#"{"host": "b", "repos": {"g": "x"}}"#, "repos.g is not an array of strings"),
-        (r#"{"host": "b", "repos": {"g": null}}"#, "repos.g is not an array of strings"),
-        (r#"{"host": "b", "repos": {"g": {}}}"#, "repos.g is not an array of strings"),
-        (r#"{"host": "b", "repos": {"g": ["x", ""]}}"#, "repos.g[1] is not a non-empty string"),
-        (r#"{"host": "b", "repos": {"g": ["x", 3]}}"#, "repos.g[1] is not a non-empty string"),
-        (r#"{"host": "b", "repos": {"g": [["x"]]}}"#, "repos.g[0] is not a non-empty string"),
-        (r#"{"host": "b", "repos": {"g": ["[x"]}}"#, "repos.g[0] is not a valid wildcard pattern"),
-        (r#"{"host": "b", "repos": {"g": ["x"]}, "outputs": []}"#, "outputs must be a JSON object"),
+        (r#"{"host": "bx"}"#, "repos is missing"),
+        (r#"{"host": "bx", "repos": []}"#, "repos must be a JSON object"),
+        (r#"{"host": "bx", "repos": {"g": "x"}}"#, "repos.g is not an array of strings"),
+        (r#"{"host": "bx", "repos": {"g": null}}"#, "repos.g is not an array of strings"),
+        (r#"{"host": "bx", "repos": {"g": {}}}"#, "repos.g is not an array of strings"),
+        (r#"{"host": "bx", "repos": {"g": ["x", ""]}}"#, "repos.g[1] is not a non-empty string"),
+        (r#"{"host": "bx", "repos": {"g": ["x", 3]}}"#, "repos.g[1] is not a non-empty string"),
+        (r#"{"host": "bx", "repos": {"g": [["x"]]}}"#, "repos.g[0] is not a non-empty string"),
+        (r#"{"host": "bx", "repos": {"g": ["[x"]}}"#, "repos.g[0] is not a valid wildcard pattern"),
+        (r#"{"host": "bx", "repos": {"g": ["x"]}, "outputs": []}"#, "outputs must be a JSON object"),
         (
-            r#"{"host": "b", "repos": {"g": ["x"]}, "outputs": {"g": ["[x]"]}}"#,
+            r#"{"host": "bx", "repos": {"g": ["x"]}, "outputs": {"g": ["[x]"]}}"#,
             "outputs.g[0] is not a valid output glob: '[' and ']' are not allowed",
         ),
         (
-            r#"{"host": "b", "Host": "c", "repos": {}}"#,
+            r#"{"host": "bx", "Host": "c", "repos": {}}"#,
             "Cannot convert the JSON string because it contains keys with different casing. Please use the -AsHashTable \
              switch instead. The key that was attempted to be added to the existing key 'host' was 'Host'.",
         ),
         (
-            r#"{"host": "b", "repos": {"a": ["x"], "A": ["y"]}}"#,
+            r#"{"host": "bx", "repos": {"a": ["x"], "A": ["y"]}}"#,
             "Cannot convert the JSON string because it contains keys with different casing. Please use the -AsHashTable \
              switch instead. The key that was attempted to be added to the existing key 'a' was 'A'.",
         ),
@@ -110,7 +110,7 @@ fn each_unusable_file_gives_the_powershell_reason() {
 
 #[test]
 fn text_that_is_not_json_names_the_conversion_failure() {
-    for text in ["{", r#"{"host": "b", "repos": {}} x"#] {
+    for text in ["{", r#"{"host": "bx", "repos": {}} x"#] {
         assert!(reason(text).starts_with("Conversion from JSON failed with error: "), "{text}");
     }
 }
@@ -169,8 +169,8 @@ fn single_quoted_strings_are_refused() {
 
 #[test]
 fn a_repeated_key_in_one_letter_case_keeps_the_last_value() {
-    let config = Config::parse(r#"{"host": "b", "host": "c", "repos": {}}"#).expect("usable");
-    assert_eq!(config.host(), "c");
+    let config = Config::parse(r#"{"host": "bx", "host": "cx", "repos": {}}"#).expect("usable");
+    assert_eq!(config.host(), "cx");
 }
 
 #[test]
@@ -220,6 +220,18 @@ fn a_host_that_is_not_an_ssh_alias_or_user_at_host_is_refused() {
         })
         .collect();
     assert!(failures.is_empty(), "{failures:#?}");
+}
+
+#[test]
+fn the_host_allowlist_refuses_one_letter_which_git_would_read_as_a_drive() {
+    let refused = Err::<(), String>("host must not be a single letter, which a git host:path URL reads as a drive".to_owned());
+    for host in ["b", "Z"] {
+        assert_eq!(Config::parse(&host_file(host)).map(|_| ()), refused, "{host}");
+    }
+    for host in ["user@b", "b1", "7"] {
+        let config = Config::parse(&host_file(host)).expect("usable");
+        assert_eq!(config.host(), host, "{host} reads as no drive");
+    }
 }
 
 #[test]

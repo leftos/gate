@@ -48,6 +48,9 @@ fn print_request_shows_the_new_cli_request() {
             "gitLimitMs": null,
             "serversUnder": null,
             "remoteSnapshot": false,
+            "remoteTransport": null,
+            "remoteSsh": null,
+            "remoteRetryPauseMs": null,
         },
     });
     assert_eq!(outcome.stdout, format!("{expected}\n"), "the keys come in the published order");
@@ -77,6 +80,29 @@ fn print_request_shows_the_new_cli_request() {
             &request["testSeams"]["remoteSnapshot"],
         ),
         (&json!(r"steps\client.txt"), &json!(5), &json!(7), &json!(r"target\case"), &json!(true))
+    );
+    // The snapshot-only client and the Rust client's transport are refused together, so the transport's seams are
+    // printed by a run of their own.
+    let mut seams = print_run(&["cmd"]);
+    seams.splice(
+        7..7,
+        [
+            "--test-remote-transport",
+            r"local:target\builder",
+            "--test-remote-ssh",
+            "fake-ssh.exe",
+            "--test-remote-retry-pause-ms",
+            "9",
+        ],
+    );
+    let request = case.run(&seams).request();
+    assert_eq!(
+        (
+            &request["testSeams"]["remoteTransport"],
+            &request["testSeams"]["remoteSsh"],
+            &request["testSeams"]["remoteRetryPauseMs"],
+        ),
+        (&json!(r"local:target\builder"), &json!("fake-ssh.exe"), &json!(9))
     );
 
     let stop = case.run(&["stop-tree", "--test-print-request", "123"]).request();

@@ -612,22 +612,20 @@ impl Run<'_> {
         self.command(plan, console)
     }
 
-    /// Runs the routed command on the builder: takes a remote slot into `hold`, calls the client and ends the run as
-    /// the client ended it. A full remote pool, a refusal or a client that cannot start falls back here; with no client
-    /// at all the run falls back before it takes a remote slot. A Ctrl+C ends the run here, with the remote slot
-    /// released: one raised before the call, or during it over a refusal. A client that ended on its own keeps its
-    /// own status.
+    /// Runs the routed command on the builder: takes the client's work-folder key lock and a remote slot into `hold`,
+    /// calls the client and ends the run as the client ended it, the lock held until then. A key lock held elsewhere, a
+    /// full remote pool, a refusal or a client that cannot start falls back here; with no client at all the run falls
+    /// back before it takes a remote slot. A Ctrl+C ends the run here, with the remote slot released: one raised before
+    /// the call, or during it over a refusal. A client that ended on its own keeps its own status.
     fn routed(&mut self, remote: &RemoteRun, hold: &mut Hold, console: &mut Console) -> Remotely {
         let Some(mut client) = self.client.take() else {
             let outcome = NoClient.run(&self.call(remote));
             return self.fell_back(FallbackReason::Client, &outcome, None, console);
         };
-        match self.take(Pool::Remote(remote.slots), &mut hold.taken, console) {
-            Taking::Took(took) => hold.took = took,
-            Taking::Lent => unreachable!("only a local wait is lent a parent's slot"),
-            Taking::Interrupted => return Remotely::Interrupted,
-            Taking::Full => return self.fell_back(FallbackReason::Full, &RemoteOutcome::default(), None, console),
-        }
+        let _key = match self.hold_remote(client.as_ref(), remote, hold, console) {
+            Ok(key) => key,
+            Err(remotely) => return remotely,
+        };
         // A Ctrl+C that came once the remote slot was held, before the client was called, ends the run as an
         // interrupt before a command starts does here; the caller releases the slot with the run's tag.
         if self.host.interrupt.is_some_and(Interrupt::is_raised) {
@@ -646,6 +644,35 @@ impl Run<'_> {
         }
     }
 
+    /// Takes the work-folder key lock `client` takes, without waiting, then a remote slot into `hold`: the lock, held
+    /// until the remote attempt ends. Else how the run goes on: here, `busy`, when the lock is held elsewhere or cannot
+    /// be opened or taken, which says why; here, `full`, when the pool stayed full; or interrupted during the wait.
+    fn hold_remote(
+        &mut self,
+        client: &dyn RemoteClient,
+        remote: &RemoteRun,
+        hold: &mut Hold,
+        console: &mut Console,
+    ) -> Result<Option<OwnedMutexGuard>, Remotely> {
+        let held = client.hold_key(&self.call(remote));
+        let key = match held {
+            Ok(key) => key,
+            Err(why) => {
+                if let Some(line) = why {
+                    console.err(&line);
+                }
+                return Err(self.fell_back(FallbackReason::Busy, &RemoteOutcome::default(), None, console));
+            }
+        };
+        match self.take(Pool::Remote(remote.slots), &mut hold.taken, console) {
+            Taking::Took(took) => hold.took = took,
+            Taking::Lent => unreachable!("only a local wait is lent a parent's slot"),
+            Taking::Interrupted => return Err(Remotely::Interrupted),
+            Taking::Full => return Err(self.fell_back(FallbackReason::Full, &RemoteOutcome::default(), None, console)),
+        }
+        Ok(key)
+    }
+
     /// The client's call for `remote`, with the run's log, limits and interrupt.
     fn call<'r>(&'r self, remote: &'r RemoteRun) -> RemoteCall<'r> {
         RemoteCall {
@@ -662,6 +689,7 @@ impl Run<'_> {
             tail: self.request.tail,
             no_markers: self.request.no_markers,
             interrupt: self.host.interrupt,
+            state: &self.root.root,
         }
     }
 

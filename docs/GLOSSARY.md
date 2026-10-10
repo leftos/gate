@@ -56,6 +56,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Pause marker**: an empty file a gate under a parent gate's slot rewrites on every pass while it waits behind a critical request, which stops its parent's watchdog clocks for that time once the watchdog reads it; one older than 30 s is stale.
 - **Pipe-closed stop**: the box's stop of a job whose client's connection closed: `gate box run` terminates the job, waits for its processes and exits 255.
 - **Pool**: the set of slots of one kind (heavy, light, remote); pools never wait on each other.
+- **Pre-banner failure**: an ssh call, or a git call over ssh, that ended before the builder's sshd sent its banner (status 255, or 128 for git, with empty stdout and a first stderr line naming the banner exchange); the remote client retries it once after 2 s.
 - **Preflight**: the box's first call of a routed run (`gate box preflight`): it creates the bare repo and the work folder and reports the gate version, the boot time and the SDKs.
 - **Probe by open**: reading whether a slot is held by opening its mutex's name: it is held while any handle to that name exists.
 - **Progress**: what resets the stall clock in a sample: the output size changed, the job's CPU reached 1% of one core over the stall window since the last progress, a new pid appeared, or a nested gate is paused.
@@ -67,6 +68,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Reserved light slot**: one of the up to two highest light slots a critical gate never takes, so light gates run beside it.
 - **Rollover**: the move of `events.jsonl` over `events.1.jsonl` by the append that finds the journal at or above 5,242,880 bytes, followed by the archive of the rolled file.
 - **Root hash**: the first 8 hex digits of the SHA-256 of a non-default state root's path, carried in every kernel object name and slot marker of that root.
+- **Routed lock**: the mutex `Local\gate-[<root hash>-]routed-<16 hex>` (the hash of the lower-cased work-folder key) that a routed run takes without waiting, before its remote slot and until its remote attempt ends; a run that finds it taken runs here with reason `busy`.
 - **Routed run**: a heavy gate whose command `remote.json` sends to a builder.
 - **Routing file**: `remote.json` in `%LOCALAPPDATA%\gate\`, naming the builder's host, the remote pool's size and, per repo, the `-like` patterns of the commands that route and the globs of the files a routed run brings back.
 - **Sample**: one reading of a running command taken every 5 s by the sampler: the system's CPU times, the job's CPU and pids, and the log's size; the watchdog's clocks advance only by samples.

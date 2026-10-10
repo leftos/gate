@@ -219,6 +219,7 @@ fn property<'a>(object: &'a Map<String, Value>, key: &str) -> Option<&'a Value> 
 fn read_host(data: &Map<String, Value>) -> Result<String, String> {
     let value = property(data, "host").ok_or_else(|| "host is missing".to_owned())?;
     match value {
+        Value::String(host) if is_drive_letter(host) => Err(DRIVE_REFUSAL.to_owned()),
         Value::String(host) if is_host(host) => Ok(host.clone()),
         Value::String(host) if !host.is_empty() => Err(HOST_REFUSAL.to_owned()),
         _ => Err("host must be a non-empty string".to_owned()),
@@ -228,6 +229,14 @@ fn read_host(data: &Map<String, Value>) -> Result<String, String> {
 /// The reason a host that is not an ssh alias or `user@host` of letters, digits, `.`, `_` and `-` is refused: a reason
 /// of the gate's own, since the PowerShell gate accepts such a host.
 const HOST_REFUSAL: &str = "host must be an ssh alias or user@host of letters, digits, '.', '_' and '-', not starting with '-'";
+
+/// The reason a host of one letter is refused: git reads `b:path` as a path on drive `B:`, not as `path` on the host.
+const DRIVE_REFUSAL: &str = "host must not be a single letter, which a git host:path URL reads as a drive";
+
+/// Whether `host` is one ASCII letter, which a git `host:path` URL reads as a drive.
+fn is_drive_letter(host: &str) -> bool {
+    host.len() == 1 && host.bytes().all(|byte| byte.is_ascii_alphabetic())
+}
 
 /// Whether `host` is an ssh alias or `user@host`: at most one `@`, each part a [`host_part`].
 fn is_host(host: &str) -> bool {

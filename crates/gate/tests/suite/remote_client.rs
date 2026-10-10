@@ -1,5 +1,7 @@
-//! The remote client's snapshot, through `--test-remote-snapshot`: a routed run that stops once it has made the
-//! snapshot and bridge commits of its worktree, a real git repository in the case folder, and says them.
+//! The remote client: its snapshot, through `--test-remote-snapshot`, a routed run that stops once it has made the
+//! snapshot and bridge commits of its worktree, a real git repository in the case folder, and says them; and the whole
+//! client, through `--test-remote-transport local:<folder>`, whose builder is `gate box` run here on a builder root in
+//! the case folder, each ssh call made through the `fake-ssh` stand-in (`--test-remote-ssh`) that a steps file drives.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -9,10 +11,11 @@ use std::process::{Command, Stdio};
 use std::time::SystemTime;
 
 use gate_router::repo_name;
-use serde_json::json;
+use serde_json::{Value, json};
 
 use crate::support::{
-    Case, GIT_REDIRECTS, Outcome, copy_tool, events, finish, git, git_init, heavy_words, shown, wait_for_journal_line, write_remote_json,
+    Case, GATE, GIT_REDIRECTS, Outcome, allow_breakaway, copy_tool, events, finish, git, git_init, heavy_words, shown, start, wait_for_journal_line,
+    wait_until, write_remote_json,
 };
 
 const HOST: &str = "builder";
@@ -319,4 +322,279 @@ fn a_snapshot_ignores_commit_signing() {
     let (commit, _) = said(&case, &outcome, "out.log");
     let object = git_out(&case, &[], &["cat-file", "commit", &commit]);
     assert!(!object.contains("gpgsig"), "the commit carries no signature: {object}");
+}
+
+/// The suite's stand-in for ssh, which `--test-remote-ssh` names.
+const FAKE_SSH: &str = env!("CARGO_BIN_EXE_fake-ssh");
+/// The variable naming the stand-in's steps file; the stand-in logs each call's verb to `<steps>.log`.
+const STEPS_VARIABLE: &str = "GATE_FAKE_SSH_STEPS";
+/// The variable naming the gate the stand-in runs `box <verb> <payload>` with.
+const GATE_VARIABLE: &str = "GATE_FAKE_SSH_GATE";
+/// What a client case's snapshot leaves out: the gate's state root, LOCALAPPDATA and logs, the builder root and the
+/// stand-in's files. `tool.exe` is sent, so the builder runs it.
+const CLIENT_IGNORED: &str = "state/\nappdata/\n*.log\nbuilder/\nssh/\n";
+const RETRY_LINE: &str = "gate: builder did not answer the ssh banner; trying once more";
+const BUSY_LINE: &str = "gate: remote builder busy; running here";
+const UNREACHABLE_LINE: &str = "gate: remote builder unreachable; running here";
+
+/// A case folder made a checkout of its own holding fake-tool as `tool.exe`, which its snapshot sends, with a routing
+/// file that sends its `*tool*` commands to the builder and gives the remote pool two slots. The suite enters a job
+/// that allows breakaway first, as the box's command needs.
+fn client_case(name: &str) -> Case {
+    client_case_of(name, 2)
+}
+
+/// [`client_case`] with a remote pool of `slots` slots.
+fn client_case_of(name: &str, slots: u32) -> Case {
+    allow_breakaway();
+    let case = Case::new(name);
+    git_init(&case);
+    copy_tool(&case, "tool.exe");
+    write(&case, ".gitignore", CLIENT_IGNORED);
+    fs::create_dir_all(case.folder().join("ssh")).expect("the stand-in's folder can be made");
+    let repo = repo_name(&case.folder().file_name().expect("the case folder has a name").to_string_lossy());
+    write_remote_json(&case, &json!({ "host": HOST, "slots": slots, "repos": { repo: ["*tool*"] } }).to_string());
+    case
+}
+
+/// Writes `steps`, one a line, as the stand-in's steps file `name` in the case's `ssh` folder; its path.
+fn ssh_steps(case: &Case, name: &str, steps: &[&str]) -> PathBuf {
+    let path = case.folder().join("ssh").join(format!("{name}.steps"));
+    fs::write(&path, steps.join("\n")).expect("the steps file can be written");
+    path
+}
+
+/// The verbs the stand-in of the steps file `steps` was called with, in order; none before its first call.
+fn calls(steps: &Path) -> Vec<String> {
+    let mut log = steps.as_os_str().to_owned();
+    log.push(".log");
+    fs::read_to_string(PathBuf::from(log)).map_or_else(|_| Vec::new(), |text| text.lines().map(str::to_owned).collect())
+}
+
+/// The gate of a routed run logging to `log` through the Rust client: the builder root `builder` in the case folder,
+/// each ssh call made through the stand-in of the steps file `steps`, the retry pause 1 ms.
+fn client_gate(case: &Case, log: &str, steps: &Path, command: &[&str]) -> Command {
+    let transport = format!("local:{}", shown(&case.folder().join("builder")));
+    let seams = [
+        "--test-remote-transport",
+        transport.as_str(),
+        "--test-remote-ssh",
+        FAKE_SSH,
+        "--test-remote-retry-pause-ms",
+        "1",
+        "--test-git-limit-ms",
+        "3600000",
+    ];
+    let mut gate = case.gate(&heavy_words(log, &seams, command));
+    gate.env(STEPS_VARIABLE, steps).env(GATE_VARIABLE, GATE);
+    gate
+}
+
+/// The journal lines of the gate `pid`.
+fn own(case: &Case, pid: u32) -> Vec<Value> {
+    events(case).into_iter().filter(|event| event["pid"] == pid).collect()
+}
+
+/// The reasons of the `fallback` lines among `events`.
+fn fallbacks(events: &[Value]) -> Vec<&str> {
+    events
+        .iter()
+        .filter(|event| event["event"] == "fallback")
+        .map(|event| event["reason"].as_str().expect("a fallback names its reason"))
+        .collect()
+}
+
+/// The work-folder key the run's queue line names.
+fn key_of(events: &[Value]) -> String {
+    events[0]["key"].as_str().expect("the queue line has a key").to_owned()
+}
+
+/// The commit `name` names in the case's builder's bare repository, empty when it names none.
+fn builder_ref(case: &Case, name: &str) -> String {
+    let repo = repo_name(&case.folder().file_name().expect("the case folder has a name").to_string_lossy());
+    let bare = shown(&case.folder().join("builder").join(format!("{repo}.git")));
+    git_out(case, &[], &["--git-dir", &bare, "for-each-ref", "--format=%(objectname)", name])
+}
+
+/// Runs `gate` to its end, with its pid.
+fn finish_with_pid(gate: Command) -> (u32, Outcome) {
+    let running = start(gate);
+    let pid = running.id();
+    (pid, running.finish())
+}
+
+#[test]
+fn a_routed_run_runs_on_the_box_and_passes_its_output_and_status() {
+    let case = client_case("client-through");
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "out", "ran there", "exit", "3"]));
+
+    assert_eq!(outcome.code, Some(3), "the command's own status: {outcome:?}");
+    assert!(outcome.stdout.contains("ran there"), "{outcome:?}");
+    assert!(outcome.stderr.contains("gate: pushed snapshot "), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "run"]);
+    let log = fs::read_to_string(case.folder().join("out.log")).expect("the log was written");
+    assert!(log.contains("ran there") && log.contains("gate: pushed snapshot "), "{log}");
+    let events = events(&case);
+    assert_eq!(fallbacks(&events), Vec::<&str>::new(), "{events:#?}");
+    assert!(events.iter().all(|event| event["remote"] == true), "a remote run: {events:#?}");
+    let key = key_of(&events);
+    let snapshot = builder_ref(&case, &format!("refs/gate/{key}"));
+    assert!(is_sha(&snapshot), "the builder holds the snapshot: {snapshot:?}");
+    assert_eq!(git_out(&case, &[], &["rev-parse", &format!("refs/gate-remote/{key}")]), snapshot);
+    assert!(log.contains(&format!("gate: pushed snapshot {} in ", &snapshot[..8])), "{log}");
+}
+
+#[test]
+fn a_second_routed_run_of_one_worktree_falls_back_busy_at_once() {
+    // One slot, which the first run holds: the second finds the key's lock taken before it would wait for the slot.
+    let case = client_case_of("client-busy", 1);
+    let go = case.folder().join("ssh").join("go");
+    let first_steps = ssh_steps(&case, "first", &["ok", &format!("hold {}", shown(&go))]);
+    let first = start(client_gate(&case, "first.log", &first_steps, &[r".\tool.exe", "out", "ran there"]));
+    wait_until("the first run's run call", || calls(&first_steps).len() == 2);
+    let second_steps = ssh_steps(&case, "second", &["ok", "ok"]);
+
+    let (pid, second) = finish_with_pid(client_gate(&case, "second.log", &second_steps, &[r".\tool.exe", "out", "ran here"]));
+
+    assert_eq!(second.code, Some(0), "{second:?}");
+    assert!(second.stderr.contains(BUSY_LINE), "{second:?}");
+    assert!(second.stdout.contains("ran here"), "it ran here: {second:?}");
+    assert_eq!(calls(&second_steps), Vec::<String>::new(), "the second run made no ssh call");
+    assert_eq!(fallbacks(&own(&case, pid)), ["busy"]);
+    fs::write(&go, "").expect("the go file can be made");
+    let first = first.finish();
+    assert_eq!(first.code, Some(0), "{first:?}");
+    assert!(first.stdout.contains("ran there"), "{first:?}");
+    assert_eq!(calls(&first_steps), ["preflight", "run"]);
+}
+
+#[test]
+fn a_connection_dropped_before_the_banner_is_retried_once() {
+    let case = client_case("client-retry");
+    let steps = ssh_steps(&case, "ssh", &["fail-banner", "ok", "ok"]);
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "out", "ran there"]));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(outcome.stderr.matches(RETRY_LINE).count(), 1, "{outcome:?}");
+    assert!(outcome.stdout.contains("ran there"), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "preflight", "run"]);
+    assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new());
+}
+
+#[test]
+fn two_banner_drops_of_the_preflight_fall_back_unreachable() {
+    let case = client_case("client-preflight-drops");
+    let steps = ssh_steps(&case, "ssh", &["fail-banner", "fail-banner"]);
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "out", "ran here"]));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(outcome.stderr.matches(RETRY_LINE).count(), 1, "{outcome:?}");
+    assert!(outcome.stderr.contains(UNREACHABLE_LINE), "{outcome:?}");
+    assert!(outcome.stdout.contains("ran here"), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "preflight"]);
+    assert_eq!(fallbacks(&events(&case)), ["unreachable"]);
+}
+
+#[test]
+fn two_banner_drops_of_the_run_call_fall_back_unreachable() {
+    let case = client_case("client-run-drops");
+    let steps = ssh_steps(&case, "ssh", &["ok", "fail-banner", "fail-banner"]);
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "out", "ran here"]));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(outcome.stderr.matches(RETRY_LINE).count(), 1, "{outcome:?}");
+    assert!(outcome.stderr.contains(UNREACHABLE_LINE), "{outcome:?}");
+    let log = fs::read_to_string(case.folder().join("out.log")).expect("the log was written");
+    assert!(log.contains("ran here"), "it ran here: {log}");
+    assert_eq!(calls(&steps), ["preflight", "run", "run"]);
+    assert_eq!(fallbacks(&events(&case)), ["unreachable"]);
+}
+
+#[test]
+fn a_drop_after_output_is_not_retried() {
+    let case = client_case("client-drop-after-output");
+    let steps = ssh_steps(&case, "ssh", &["ok", "out-then-drop"]);
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "out", "ran there"]));
+
+    assert_eq!(outcome.code, Some(255), "{outcome:?}");
+    assert!(!outcome.stderr.contains(RETRY_LINE), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "run"]);
+    assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new());
+}
+
+#[test]
+fn a_drop_with_another_first_line_is_not_retried() {
+    let case = client_case("client-drop-other");
+    let steps = ssh_steps(&case, "ssh", &["fail-other"]);
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "out", "ran here"]));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(!outcome.stderr.contains(RETRY_LINE), "{outcome:?}");
+    assert!(outcome.stderr.contains(UNREACHABLE_LINE), "{outcome:?}");
+    assert!(outcome.stdout.contains("ran here"), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight"]);
+    assert_eq!(fallbacks(&events(&case)), ["unreachable"]);
+}
+
+#[test]
+fn a_run_call_longer_than_the_cap_fails_before_anything_is_sent() {
+    let case = client_case("client-cap");
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+    let long = "x".repeat(6200);
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "out", &long]));
+
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert!(outcome.stderr.contains("gate: the remote run failed: the run call is "), "{outcome:?}");
+    assert!(
+        outcome
+            .stderr
+            .contains(" characters, longer than the 8127 cmd takes (8191 less 64 for sshd's own cmd.exe /c); shorten the command"),
+        "{outcome:?}"
+    );
+    assert!(!outcome.stdout.contains(&long), "the command ran nowhere: {outcome:?}");
+    assert_eq!(calls(&steps), Vec::<String>::new(), "nothing was sent");
+    assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new());
+}
+
+#[test]
+fn a_builder_without_a_usable_gate_box_is_not_routed() {
+    let case = client_case("client-no-box");
+    let steps = ssh_steps(&case, "ssh", &["exit 9009"]);
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "out", "ran here"]));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let line = "gate: not routed: builder has no gate box that takes this run (preflight status 9009)";
+    assert!(outcome.stderr.contains(line), "{outcome:?}");
+    assert!(outcome.stderr.contains("gate: remote builder version; running here"), "{outcome:?}");
+    assert!(outcome.stdout.contains("ran here"), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight"]);
+    assert_eq!(fallbacks(&events(&case)), ["version"]);
+    assert!(!case.folder().join("builder").exists(), "nothing reached the builder");
+}
+
+#[test]
+fn a_box_of_another_version_is_not_routed() {
+    let case = client_case("client-version");
+    let steps = ssh_steps(&case, "ssh", &["version 0.0.0-other"]);
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "out", "ran here"]));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let line = format!("gate: not routed: builder runs gate 0.0.0-other, this PC {}", env!("CARGO_PKG_VERSION"));
+    assert!(outcome.stderr.contains(&line), "{outcome:?}");
+    assert!(outcome.stderr.contains("gate: remote builder version; running here"), "{outcome:?}");
+    assert!(outcome.stdout.contains("ran here"), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight"]);
+    let events = events(&case);
+    assert_eq!(fallbacks(&events), ["version"]);
+    assert_eq!(builder_ref(&case, &format!("refs/gate/{}", key_of(&events))), "", "nothing was pushed");
 }

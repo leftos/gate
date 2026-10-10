@@ -1,7 +1,7 @@
 //! The state root: which root is the machine's default, the hash a non-default root carries, and the kernel object names
 //! each root gives.
 
-use gate_state::{KernelObject, StateRoot, default_root, log_hash, normalize_root, root_hash};
+use gate_state::{KernelObject, StateRoot, default_root, key_hash, log_hash, normalize_root, root_hash};
 
 const LOCAL_APP_DATA: &str = r"C:\Users\someone\AppData\Local";
 const DEFAULT_ROOT: &str = r"C:\Users\someone\AppData\Local\gate\v1";
@@ -117,6 +117,7 @@ fn claim_files_drop_local_and_the_root_hash() {
         KernelObject::WakeEvent { pid: 4242, start_ms: 1 },
         KernelObject::Job { gate_pid: 4242 },
         KernelObject::Log { hash: 1 },
+        KernelObject::Routed { hash: 1 },
     ] {
         assert_eq!(object.claim_file_name(), None, "{object:?} has no claim");
     }
@@ -168,10 +169,32 @@ fn object_names_match_the_design_table() {
             r"Local\gate-job-4242",
             r"Local\gate-7ef6faae-job-4242",
         ),
+        (
+            KernelObject::Routed { hash: 0xab },
+            r"Local\gate-routed-00000000000000ab",
+            r"Local\gate-7ef6faae-routed-00000000000000ab",
+        ),
     ];
 
     for (object, default_name, other_name) in rows {
         assert_eq!(default.object_name(object), default_name, "{object:?} under the default root");
         assert_eq!(other.object_name(object), other_name, "{object:?} under a non-default root");
     }
+}
+
+/// The first 16 hex digits of the SHA-256 of the UTF-8 bytes of `app-1a2b3c4d`, computed with `sha256sum`, not with the
+/// crate under test.
+const KEY_HASH: u64 = 0x4fa4_4c98_cd5b_3bf3;
+
+#[test]
+fn a_routed_mutex_is_named_by_16_hex_of_its_lower_cased_key() {
+    assert_eq!(key_hash("app-1a2b3c4d"), KEY_HASH);
+    assert_eq!(key_hash("App-1A2B3C4D"), KEY_HASH, "the key's letter case does not matter");
+    assert_ne!(key_hash("app-1a2b3c4e"), KEY_HASH, "another key, another hash");
+    assert_eq!(
+        root(r"C:\gate-test\root").object_name(KernelObject::Routed {
+            hash: key_hash("APP-1a2b3c4d")
+        }),
+        format!(r"Local\gate-{TEST_ROOT_HASH}-routed-{KEY_HASH:016x}")
+    );
 }

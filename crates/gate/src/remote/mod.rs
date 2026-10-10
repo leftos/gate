@@ -1,31 +1,59 @@
 //! The remote client a routed run calls: the call it is given, the outcome it hands back, and the clients there are.
 //! With no client, a routed run falls back here with reason `client`. A gate built with the `test-seams` feature has
 //! the scripted client `--test-remote-client` names, which runs a step file in this process, and the client of
-//! `--test-remote-snapshot`, which stops once it has made the snapshot. [`git`] runs git for the routing decision and
-//! the client; [`snapshot`] makes the snapshot and bridge commits.
+//! `--test-remote-snapshot`, which stops once it has made the snapshot, and the Rust client of
+//! `--test-remote-transport`, which runs the command on a builder. [`git`] runs git for the routing decision and the
+//! client; [`snapshot`] makes the snapshot and bridge commits; `client` runs the Rust client's phases, `transport`
+//! reaches the builder, `payload` builds what `gate box` is sent, and `retry` holds the rule a call is retried on.
 
 use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::path::Path;
 
 use gate_args::RunRequest;
-use gate_state::FallbackReason;
-use gate_win32::Interrupt;
+use gate_state::{FallbackReason, StateRoot};
+use gate_win32::{Interrupt, OwnedMutexGuard};
 
+#[cfg(feature = "test-seams")]
+mod client;
 pub(crate) mod git;
+#[cfg(feature = "test-seams")]
+mod payload;
+#[cfg(feature = "test-seams")]
+mod retry;
 #[cfg_attr(
     not(any(test, feature = "test-seams")),
     expect(dead_code, reason = "a gate without the test seams has no client that makes a snapshot")
 )]
 mod snapshot;
+#[cfg(feature = "test-seams")]
+mod transport;
 
 /// The status a client hands back with a refusal's reason.
 pub(crate) const REFUSED: i64 = 75;
 /// Why a routed run's remote client cannot start: none is built yet.
 const NO_CLIENT: &str = "the bridge to remote.ps1 is not built yet";
+/// The status of a run whose client failed.
+#[cfg(feature = "test-seams")]
+const FAILED: i64 = 1;
+/// What a client failure says: `gate: the remote run failed: <why>`.
+#[cfg(feature = "test-seams")]
+const FAILED_RUN: &str = "gate: the remote run failed";
+
+/// The line the box says when another run holds the work folder `key`, which the client reads its refusal from.
+pub(crate) fn busy_line(key: &str) -> String {
+    format!("gate: remote work folder {key} is busy")
+}
 
 /// What runs a routed command on the builder.
 pub(crate) trait RemoteClient {
+    /// Takes the lock of the call's work-folder key, which the run holds from before it takes a remote slot until its
+    /// remote attempt ends: `Ok(None)` for a client that takes none. `Err` when the run falls back `busy`: `None` when
+    /// another routed run holds the lock, else the line saying why it could not be opened or taken.
+    fn hold_key(&self, _call: &RemoteCall<'_>) -> Result<Option<OwnedMutexGuard>, Option<String>> {
+        Ok(None)
+    }
+
     /// Runs the call to its end, or to its refusal, on the run's thread.
     fn run(&mut self, call: &RemoteCall<'_>) -> RemoteOutcome;
 }
@@ -55,6 +83,8 @@ pub(crate) struct RemoteCall<'a> {
     /// The console interrupt, which the client sees raised and stops what it started on; `None` when it could not be
     /// installed.
     pub interrupt: Option<Interrupt>,
+    /// The run's state root, whose hash names the work-folder key's lock.
+    pub state: &'a StateRoot,
 }
 
 /// What the client hands back: the status, a refusal's reason, whether it killed the run, the lines it wrote to the
@@ -113,13 +143,17 @@ fn say<S: AsRef<str>>(log: &Path, lines: &[S], mut stream: impl Write) -> Result
     stream.flush().map_err(|error| format!("cannot say a line: {error}"))
 }
 
-/// The client `request` names: the one of `--test-remote-snapshot`, else the scripted one of `--test-remote-client`,
-/// else none; or the line saying why its step file cannot be used.
+/// The client `request` names: the one of `--test-remote-snapshot`, else the Rust client of `--test-remote-transport`,
+/// else the scripted one of `--test-remote-client`, else none; or the line saying why its transport or its step file
+/// cannot be used.
 #[cfg(feature = "test-seams")]
 pub(crate) fn chosen(request: &RunRequest) -> Result<Option<Box<dyn RemoteClient>>, String> {
     if request.test_seams.remote_snapshot {
         let limit = git::limit(&request.test_seams);
         return Ok(Some(Box::new(snapshot_only::SnapshotOnly { limit })));
+    }
+    if let Some(transport) = &request.test_seams.remote_transport {
+        return client::RustClient::local(request, transport).map(|client| Some(Box::new(client) as Box<dyn RemoteClient>));
     }
     match &request.test_seams.remote_client {
         Some(path) => scripted::ScriptedClient::load(path).map(|client| Some(Box::new(client) as Box<dyn RemoteClient>)),
@@ -150,13 +184,8 @@ mod snapshot_only {
 
     use super::git::GitError;
     use super::snapshot::{self, Snapshot};
-    use super::{RemoteCall, RemoteClient, RemoteOutcome};
+    use super::{FAILED, FAILED_RUN, RemoteCall, RemoteClient, RemoteOutcome};
     use crate::run::CONTROL_C_EXIT;
-
-    /// The status of a run whose client failed.
-    const FAILED: i64 = 1;
-    /// What a snapshot that could not be made says: `gate: the remote run failed: <why>`.
-    const FAILED_RUN: &str = "gate: the remote run failed";
 
     pub(crate) struct SnapshotOnly {
         /// How long each git call may take.
@@ -199,7 +228,9 @@ mod snapshot_only {
     mod tests {
         use std::fs;
         use std::path::Path;
+        use std::sync::LazyLock;
 
+        use gate_state::StateRoot;
         use gate_win32::Interrupt;
 
         use super::SnapshotOnly;
@@ -207,6 +238,9 @@ mod snapshot_only {
         use crate::remote::snapshot;
         use crate::remote::{RemoteCall, RemoteClient};
         use crate::run::CONTROL_C_EXIT;
+
+        /// A state root no gate uses, which the snapshot-only client never reads.
+        static STATE: LazyLock<StateRoot> = LazyLock::new(|| StateRoot::new(r"C:\gate-snapshot-client-tests", None));
 
         /// The call the client is given; `root` is never reached by the test of an interrupt, which ends the first git
         /// call before it starts.
@@ -225,6 +259,7 @@ mod snapshot_only {
                 tail: 0,
                 no_markers: false,
                 interrupt,
+                state: &STATE,
             }
         }
 

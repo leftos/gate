@@ -136,7 +136,7 @@ pub(crate) fn run(payload: &Payload, seams: &BoxSeams, console: &mut Console) ->
     let _lock = match take_lock(request.lock) {
         Ok(Some(lock)) => lock,
         Ok(None) => {
-            console.err(&format!("gate: remote work folder {} is busy", request.key));
+            console.err(&crate::remote::busy_line(request.key));
             return BUSY_STATUS;
         }
         Err(line) => {

@@ -35,6 +35,12 @@ pub(crate) enum ValueOption {
     GitLimitMs,
     #[cfg(feature = "test-seams")]
     ServersUnder,
+    #[cfg(feature = "test-seams")]
+    RemoteTransport,
+    #[cfg(feature = "test-seams")]
+    RemoteSsh,
+    #[cfg(feature = "test-seams")]
+    RemoteRetryPauseMs,
 }
 
 /// An option that is on or off.
@@ -151,6 +157,12 @@ impl RunBuilder {
             ValueOption::GitLimitMs => self.test_seams.git_limit_ms = Some(values::above_zero(spelled, value)?),
             #[cfg(feature = "test-seams")]
             ValueOption::ServersUnder => self.test_seams.servers_under = Some(PathBuf::from(value)),
+            #[cfg(feature = "test-seams")]
+            ValueOption::RemoteTransport => self.test_seams.remote_transport = Some(value.to_owned()),
+            #[cfg(feature = "test-seams")]
+            ValueOption::RemoteSsh => self.test_seams.remote_ssh = Some(PathBuf::from(value)),
+            #[cfg(feature = "test-seams")]
+            ValueOption::RemoteRetryPauseMs => self.test_seams.remote_retry_pause_ms = Some(values::above_zero(spelled, value)?),
         }
         Ok(())
     }
@@ -176,9 +188,11 @@ impl RunBuilder {
         }
     }
 
-    /// The run request, or every problem: those found while reading, then each missing input in the order slot,
-    /// timeout, log, command.
+    /// The run request, or every problem: those found while reading, then the test seams that cannot work together,
+    /// then each missing input in the order slot, timeout, log, command.
     pub(crate) fn finish_run(mut self, command: Vec<OsString>, spelling: Spelling) -> Result<RunRequest, Vec<Problem>> {
+        #[cfg(feature = "test-seams")]
+        self.check_remote_seams();
         for (option, required) in [
             (ValueOption::Slot, Required::Slot),
             (ValueOption::Timeout, Required::Timeout),
@@ -207,6 +221,33 @@ impl RunBuilder {
                 spelling,
             }),
             _ => Err(self.problems),
+        }
+    }
+
+    /// Refuses the remote client's seams that cannot work together: `--test-remote-ssh` and
+    /// `--test-remote-retry-pause-ms` without `--test-remote-transport`, whose client alone reads them, and
+    /// `--test-remote-snapshot` with it, as each chooses the client.
+    #[cfg(feature = "test-seams")]
+    fn check_remote_seams(&mut self) {
+        const TRANSPORT: &str = "--test-remote-transport";
+        let transport = self.given.contains(&RunOption::Value(ValueOption::RemoteTransport));
+        // A seam whose value was refused is already a problem of its own.
+        for (read, spelled) in [
+            (self.test_seams.remote_ssh.is_some(), "--test-remote-ssh"),
+            (self.test_seams.remote_retry_pause_ms.is_some(), "--test-remote-retry-pause-ms"),
+        ] {
+            if read && !transport {
+                self.problems.push(Problem::SeamNeeds {
+                    option: spelled,
+                    needs: TRANSPORT,
+                });
+            }
+        }
+        if transport && self.test_seams.remote_snapshot {
+            self.problems.push(Problem::SeamsConflict {
+                option: "--test-remote-snapshot",
+                other: TRANSPORT,
+            });
         }
     }
 

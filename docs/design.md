@@ -273,12 +273,15 @@ For any other root, every kernel object name carries `<h>`, the first 8 lower-ca
 | box command's job | `Local\gate-remote-<key>-<nonce>` | the same; the name is not root-dependent |
 | box command's stop event | `Local\gate-remote-<key>-<nonce>-stopped` | the same; the name is not root-dependent |
 | log's mutex | `Local\gate-log-<l>` | `Local\gate-<h>-log-<l>` |
+| routed lock | `Local\gate-routed-<k>` | `Local\gate-<h>-routed-<k>` |
 
 The critical mutex is taken by a critical gate once no earlier live critical ticket exists, and held for its whole run. An abandoned one counts as taken ([Abandoned slots](#abandoned-slots)).
 
 The box command's job name comes from the payload's `Job` (`<key>` is the payload's `Key`, `<nonce>` is 12 hex digits); `gate box` only checks its form and that it ends in the payload's key, and never derives it.
 
 `<l>` is the log hash: 16 lower-case hex digits, the first 8 bytes of the SHA-256 of the lower-cased, normalised absolute log path. Each run takes its log's mutex without waiting, before it readies the log, and holds it until after the slot release and the final append to the log, so two gates never write one log; a second gate fails at once ([Output lines](#output-lines)).
+
+`<k>` is the key hash: 16 lower-case hex digits, the first 8 bytes of the SHA-256 of the lower-cased work-folder key. The Rust remote client takes the routed lock without waiting, before the remote slot, and holds it for the whole remote attempt ([Routing](#routing-and-the-remoteps1-bridge)).
 
 The environment carries one more name: `GATE_SLOT_HELD`, the slot marker ([Critical drain and nesting](#critical-drain-and-nesting)).
 
@@ -429,7 +432,7 @@ Readers accept these optional fields now; their issues write them:
 
 ### remote.json
 
-`remote.json` keeps the PowerShell gate's format (T1), read by `gate-router` as [Routing](#routing-and-the-remoteps1-bridge) describes: `host`, `slots`, `repos` and the optional per-repo `outputs`, read afresh by each routed gate and ignored as a whole with one line when unusable. It carries no `v` while the bridge stands; its format moves with the remote port (GATE-10).
+`remote.json` keeps the PowerShell gate's format (T1), read by `gate-router` as [Routing](#routing-and-the-remoteps1-bridge) describes: `host`, `slots`, `repos` and the optional per-repo `outputs`, read afresh by each routed gate and ignored as a whole with one line when unusable. A host of one letter is refused (`host must not be a single letter, which a git host:path URL reads as a drive`). It carries no `v` while the bridge stands; its format moves with the remote port (GATE-10).
 
 ## Critical drain and nesting
 
@@ -656,22 +659,32 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
   A client that runs the command to its end hands back its status, which the gate passes through, and the run releases the slot with the remote tag. On `full` (no slot within the wait), a refusal (status 75 with a reason) or a client that cannot start, it journals `fallback` while still holding the remote slot (none was taken on `full`), deletes the claim, lets the slot go, and runs here, taking a heavy slot with its first arrival kept in the ticket.
 
   The attempt's lines stay in the log once, as notes: the client's own bytes in the log are removed, and the local run writes its log afresh.
-- **The remote client** (GATE-43) is built in parts. The seam a routed run calls is `RemoteClient` in `crates/gate/src/remote/mod.rs` (the call, the outcome, the scripted client); part A, the snapshot, is built and dormant. The transport, the push, the run call, sync-back and the watchdog (parts B to D) are planned, not built.
+- **The remote client** (GATE-43) is built in parts. The seam a routed run calls is `RemoteClient` in `crates/gate/src/remote/mod.rs` (the call, the outcome, the scripted client); part A, the snapshot, and part B1, the transport, the routed lock, the preflight, the push and the run call, are built and dormant. Sync-back (part B2) and the watchdog, stop and lost connection (part C) are planned, not built.
 
   The snapshot copies the real index to `<git path>/gate-remote-<pid>.index` (a leftover copy and its `.index.lock` are removed first; the copy is empty when the repo has no index). With `GIT_INDEX_FILE` on the copy it runs `git add -A`, `git write-tree` and `git commit-tree --no-gpg-sign` with no parent, under the identity `gate-remote <gate-remote@localhost>` and with `GIT_AUTHOR_DATE` and `GIT_COMMITTER_DATE` removed.
 
   The copy is always removed, and the real index and the worktree are never touched, so both are byte-identical before and after a snapshot. The snapshot takes a list of roots, one entry today.
 
-  The bridge commit has the snapshot's tree and, as its parent, the newest local `refs/gate-remote/*` not ending `-back`; with none it has no parent. A function writes `refs/gate-remote/<key>` for the push (part B) to call once the builder has the snapshot; nothing calls it outside tests.
+  The bridge commit has the snapshot's tree and, as its parent, the newest local `refs/gate-remote/*` not ending `-back`; with none it has no parent. The push writes `refs/gate-remote/<key>` once the builder has the snapshot.
 
   Every git call of the client goes through `remote/git.rs`, which the routing decision's git calls share: it removes the `GIT_*` location variables, applies the routing decision's time limit (`--test-git-limit-ms`), spawns through `gate_win32::spawn`, sends stderr to null where it is not read and ends git on Ctrl+C.
 
-  Only `gate run --test-remote-snapshot` reaches the client. It makes the snapshot, says `gate: remote snapshot <sha> bridge <sha or none>` on stderr and in the log, and ends with status 0. A snapshot that fails says `gate: the remote run failed: git <args> failed in <root> (status <n>): <git's lines joined by ' | '>` and ends with status 1, with no fallback.
+  Only `gate run --test-remote-snapshot` and `--test-remote-transport` reach the client. The first makes the snapshot, says `gate: remote snapshot <sha> bridge <sha or none>` on stderr and in the log, and ends with status 0. A snapshot that fails says `gate: the remote run failed: git <args> failed in <root> (status <n>): <git's lines joined by ' | '>` and ends with status 1, with no fallback.
 
   Ctrl+C ends it with `STATUS_CONTROL_C_EXIT` and no line. A log that cannot be written gives status 1, with no fallback.
-- **The remote client's run** (GATE-43, parts B to D), planned, not built: each routed run pushes its snapshot to a ref of its own (or takes a lock before the push), so two routed runs from one worktree never collide on one ref; two routed runs at once give a deterministic `busy`, not a race.
+- **The remote client's run** (GATE-43, part B1) is built in `remote/{client,payload,retry,transport}.rs` and dormant: a production gate has no such client and still falls back `client`. Only a build with the `test-seams` feature has it, chosen by `gate run --test-remote-transport local:<folder>`, which stands in for the builder with a local folder.
 
-  A connection that drops before the box's banner is retried once, then the run falls back local.
+  The phases run in this order. Any `gate: the remote run failed` line ends the run with status 1 and no fallback; Ctrl+C at any point after the snapshot ends the run as an interrupt.
+  - **Lock.** The run takes the routed lock, `Local\gate-[<root hash>-]routed-<16 hex>` ([Kernel object names](#kernel-object-names)), before the remote slot, with a zero wait, and holds it for the whole remote attempt. A lock held elsewhere says `gate: remote <host> busy; running here` and falls back `busy` before any queueing, so two routed runs of one worktree give a deterministic `busy`, not a race. A lock that cannot be opened or taken says `gate: cannot open the mutex <name>: <error>` or `gate: cannot take the mutex <name>: <error>`, then the busy line.
+  - **Snapshot.** Part A's snapshot and bridge commit.
+  - **Run line.** The run call is one cmd line, `"%LOCALAPPDATA%\gate\bin\gate.exe" box run <base64 JSON>`, built before anything is sent. It may be at most 8127 characters, counting `%LOCALAPPDATA%` as 100 (8191, cmd's limit, less 64 for sshd's own `cmd.exe /c`). A longer one says `gate: the remote run failed: the run call is <n> characters, longer than the 8127 cmd takes (8191 less 64 for sshd's own cmd.exe /c); shorten the command` and sends nothing.
+  - **Preflight.** `gate box preflight` over ssh. Status 255 says `gate: remote <host> unreachable: <last stderr line>` and falls back `unreachable`. Status 9009 or 2 (no `gate box` verb there) says `gate: not routed: <host> has no gate box that takes this run (preflight status <n>)` and falls back `version`. Any other non-zero status says `gate: preparing <builder root> on <host> failed (status <n>)` and ends the run with that status. A reported version other than this PC's says `gate: not routed: <host> runs gate <theirs|unknown>, this PC <ours>` and falls back `version`.
+  - **Push.** `git push --no-verify --no-recurse-submodules --progress [--receive-pack=…] -- <host>:<builder root>/<repo>.git +<snapshot>:refs/gate/<key> [+<bridge>:refs/gate-bridge/<key>]`, with `GIT_SSH_COMMAND` carrying the ssh options. Success says `gate: pushed snapshot <8 hex> in <s> s (<size>|up to date)` and moves the local `refs/gate-remote/<key>`. Failure says `gate: pushing the snapshot to <url> failed (status <n>)` and falls back `unreachable`.
+  - **Run call.** The line goes over `ssh -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=4 -o ForwardAgent=no -o ClearAllForwardings=yes -- <host> <line>`, each argument separate. The box's output passes through to the log and the console. A status 75 is a refusal only when the box said its busy line (`gate: remote work folder <key> is busy`); otherwise it is the command's own status.
+
+  A pre-banner failure, which is exit 255 (128 for git) with empty stdout and a first stderr line starting `Connection timed out during banner exchange`, `kex_exchange_identification: ` or `banner exchange: `, says `gate: <host> did not answer the ssh banner; trying once more` and is retried once after a 2 s pause. Two pre-banner failures of the run call fall back `unreachable`.
+
+  The client's git calls also drop `GIT_CONFIG_COUNT`, `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM` and every `GIT_CONFIG_KEY_n` and `GIT_CONFIG_VALUE_n`, so the caller's git configuration never reaches the builder's repo.
 - **Sibling worktrees** (GATE-19), planned, not built: some repos' builds reach into a sibling repo by relative path, and a routed run that sends one worktree's snapshot would compile something different on the builder without any error.
 
   `remote.json` declares each repo's siblings (`"siblings": {"app": ["app-server"]}`); a routed gate in a repo with siblings snapshots each sibling's worktree beside its own (`../{name}`, as the pair folder lays them out, or beside the main checkout), and the box lays the work folders out the same way, so relative paths between them resolve.
@@ -892,6 +905,8 @@ A Rust integration suite drives the built `gate.exe` through its CLI and reads o
 
   `--test-remote-snapshot` (a switch, on `gate run` only) sends the run to the Rust remote client's snapshot alone ([The remote client](#routing-and-the-remoteps1-bridge)); `--test-print-request` shows it as `testSeams.remoteSnapshot`, after `serversUnder`.
 
+  `--test-remote-transport local:<folder>` (on `gate run` only) sends the run to the Rust remote client with a local folder standing in for the builder. `--test-remote-ssh <exe>` replaces ssh with a program (the test bin `fake-ssh`) and `--test-remote-retry-pause-ms <n>` (whole milliseconds above 0) replaces the 2 s pause before the pre-banner retry; both need the transport, and `--test-remote-snapshot` cannot be given with it. `--test-print-request` shows them as `testSeams.remoteTransport`, `testSeams.remoteSsh` and `testSeams.remoteRetryPauseMs`, after `remoteSnapshot`.
+
   An installed gate has none of them, and without the feature each is an unknown option.
 - **Spawn and wait helpers.** The suite's `start` launches the gate and returns a `Running` that can wait for a stderr line, say whether the gate is still running, and finish; dropping a `Running` kills a gate still running. Output readers are joined with a deadline, so a grandchild holding the pipes cannot hang the suite. A run's `Outcome` carries `raw_stdout`, the bytes as the gate wrote them, beside the decoded text.
 - **Holding and killing a gate.** A case holds a run with a real command, `fake-tool wait <go>`, and lets it go by creating `<go>`. A case that kills a gate lets its command go and waits until the command's log is closed (`support::wait_until_closed`), since the job has no kill-on-close. `support::run_words(log, extra, command)` builds the words of a light run.
@@ -909,6 +924,8 @@ A Rust integration suite drives the built `gate.exe` through its CLI and reads o
   - `spawn-orphan <path>` runs `fake-tool spawn-wait <path>` as a child, waits for it to end, then continues with its next step, so the waiting helper is left without a parent and its `spawned <pid>` line is the up signal.
 
   It is copied under the names the gate classifies (`VBCSCompiler.exe`, `dotnet.exe`, `MSBuild.exe`).
+
+  A second helper, `fake-ssh`, stands in for ssh in the remote client's cases (`--test-remote-ssh`). Its steps are `ok`, `hold`, `version`, `exit`, `fail-banner`, `fail-other` and `out-then-drop`.
 
   It spawns children, burns CPU, prints its argv, writes output or sleeps on command, so build-server, orphan and kill-tree cases need no real toolchain.
 - **No fixture from the checkout path.** No routing pattern, expected path or assertion is derived from where the repo is checked out; a case builds its own repository and routing file in its root. `checkout::repo_file` is the one route to a checked-in file (the install script), never for a path or pattern a case asserts on.

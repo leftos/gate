@@ -52,7 +52,7 @@ fn seam_flags_parse_with_the_feature() {
             remote_wait_ms: Some(90),
             git_limit_ms: Some(95),
             servers_under: Some(std::path::PathBuf::from(r"target\case")),
-            remote_snapshot: false,
+            ..TestSeams::default()
         }
     );
     assert!(request.print_request);
@@ -243,6 +243,102 @@ fn the_remote_snapshot_seam_is_a_switch_given_once() {
     assert_eq!(
         problems(&["stop-tree", "--test-remote-snapshot", "1"]),
         ["gate: unknown option --test-remote-snapshot"]
+    );
+}
+
+#[cfg(feature = "test-seams")]
+#[test]
+fn the_remote_client_seams_need_a_value_once() {
+    use crate::support::run_request;
+
+    let seams = run_request(&refs(&with(&RUN, &["--", "cmd"]))).test_seams;
+    assert_eq!(
+        (seams.remote_transport, seams.remote_ssh, seams.remote_retry_pause_ms),
+        (None, None, None),
+        "none unless given"
+    );
+    let given = [
+        "--test-remote-transport",
+        r"local:target\builder",
+        "--test-remote-ssh=fake-ssh.exe",
+        "--test-remote-retry-pause-ms",
+        "15",
+        "--",
+        "cmd",
+    ];
+    let seams = run_request(&refs(&with(&RUN, &given))).test_seams;
+    assert_eq!(
+        (seams.remote_transport, seams.remote_ssh, seams.remote_retry_pause_ms),
+        (
+            Some(r"local:target\builder".to_owned()),
+            Some(std::path::PathBuf::from("fake-ssh.exe")),
+            Some(15)
+        )
+    );
+    for flag in ["--test-remote-transport", "--test-remote-ssh", "--test-remote-retry-pause-ms"] {
+        assert_eq!(
+            problems(&refs(&with(&RUN, &[flag, "--", "cmd"]))),
+            [format!("gate: {flag} needs a value")],
+            "{flag} without its value"
+        );
+        assert_eq!(
+            problems(&refs(&with(&RUN, &[&format!("{flag}="), "--", "cmd"]))),
+            [format!("gate: {flag} needs a value")],
+            "{flag} with an empty value"
+        );
+        let transport: &[&str] = if flag == "--test-remote-transport" {
+            &[]
+        } else {
+            &["--test-remote-transport", "local:b"]
+        };
+        let twice: Vec<&str> = transport.iter().copied().chain([flag, "1", flag, "2", "--", "cmd"]).collect();
+        assert_eq!(
+            problems(&refs(&with(&RUN, &twice))),
+            [format!("gate: {flag} is given twice")],
+            "{flag} twice"
+        );
+        assert_eq!(
+            problems(&["stop-tree", flag, "5", "1"]),
+            [format!("gate: unknown option {flag}"), "gate: unexpected argument 1".to_owned()],
+            "{flag} on stop-tree"
+        );
+    }
+    assert_eq!(
+        problems(&refs(&with(&RUN, &["--test-remote-retry-pause-ms", "0", "--", "cmd"]))),
+        ["gate: --test-remote-retry-pause-ms must be a whole number above 0, got '0'"]
+    );
+}
+
+#[cfg(feature = "test-seams")]
+#[test]
+fn the_remote_client_seams_that_conflict_are_refused() {
+    for (words, problem) in [
+        (
+            &["--test-remote-ssh", "fake-ssh.exe"][..],
+            "gate: --test-remote-ssh needs --test-remote-transport",
+        ),
+        (
+            &["--test-remote-retry-pause-ms", "5"][..],
+            "gate: --test-remote-retry-pause-ms needs --test-remote-transport",
+        ),
+        (
+            &["--test-remote-snapshot", "--test-remote-transport", "local:b"][..],
+            "gate: --test-remote-snapshot cannot be given with --test-remote-transport",
+        ),
+    ] {
+        let given: Vec<&str> = words.iter().copied().chain(["--", "cmd"]).collect();
+        assert_eq!(problems(&refs(&with(&RUN, &given))), [problem], "{words:?}");
+    }
+    assert_eq!(
+        problems(&refs(&with(
+            &RUN,
+            &["--test-remote-ssh", "fake-ssh.exe", "--test-remote-retry-pause-ms", "5", "--", "cmd"]
+        ))),
+        [
+            "gate: --test-remote-ssh needs --test-remote-transport",
+            "gate: --test-remote-retry-pause-ms needs --test-remote-transport"
+        ],
+        "each seam that needs the transport is named"
     );
 }
 
@@ -469,6 +565,13 @@ fn seam_flags_are_unknown_without_the_feature() {
         problems(&refs(&with(&RUN, &["--test-remote-snapshot", "--", "cmd"]))),
         ["gate: unknown option --test-remote-snapshot"]
     );
+    for flag in ["--test-remote-transport", "--test-remote-ssh", "--test-remote-retry-pause-ms"] {
+        assert_eq!(
+            problems(&refs(&with(&RUN, &[flag, "5", "--", "cmd"]))),
+            [format!("gate: unknown option {flag}"), "gate: unexpected argument 5".to_owned()],
+            "{flag}"
+        );
+    }
     assert_eq!(
         problems(&["stop-tree", "--test-print-request", "1"]),
         ["gate: unknown option --test-print-request"]

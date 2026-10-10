@@ -38,6 +38,11 @@ name = "fake-tool"
 path = "src/bin/fake-tool.rs"
 required-features = ["test-seams"]
 
+[[bin]]
+name = "fake-ssh"
+path = "src/bin/fake-ssh.rs"
+required-features = ["test-seams"]
+
 # Without the `test-seams` feature (`--all-features` or `--features test-seams`) cargo skips this suite silently.
 [[test]]
 name = "suite"

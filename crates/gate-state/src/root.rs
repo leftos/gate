@@ -44,6 +44,16 @@ pub fn log_hash(absolute_log: &str) -> u64 {
     u64::from_be_bytes(first)
 }
 
+/// The key hash of a work-folder key: the first 16 hex digits of the SHA-256 of its lower-cased UTF-8 bytes, as a
+/// number, which [`KernelObject::Routed`] names its mutex by.
+#[must_use]
+pub fn key_hash(key: &str) -> u64 {
+    let digest = Sha256::digest(key.to_lowercase().as_bytes());
+    let mut first = [0_u8; 8];
+    first.copy_from_slice(&digest[..8]);
+    u64::from_be_bytes(first)
+}
+
 /// The default root for a `%LOCALAPPDATA%` value: `<LOCALAPPDATA>\gate\v1`.
 #[must_use]
 pub fn default_root(local_app_data: &str) -> String {
@@ -69,6 +79,9 @@ pub enum KernelObject {
     Job { gate_pid: u32 },
     /// The mutex a running gate holds for its log, by the log's [`log_hash`], so two gates never write one log.
     Log { hash: u64 },
+    /// The mutex a routed run holds from before its preflight to its end, by its work-folder key's [`key_hash`], so a
+    /// second routed run of one worktree finds it taken and runs here.
+    Routed { hash: u64 },
 }
 
 impl KernelObject {
@@ -82,6 +95,7 @@ impl KernelObject {
             KernelObject::WakeEvent { pid, start_ms } => format!("wake-{pid}-{start_ms}"),
             KernelObject::Job { gate_pid } => format!("job-{gate_pid}"),
             KernelObject::Log { hash } => format!("log-{hash:016x}"),
+            KernelObject::Routed { hash } => format!("routed-{hash:016x}"),
         }
     }
 
@@ -94,7 +108,11 @@ impl KernelObject {
             KernelObject::HeavySlot(_) | KernelObject::LightSlot(_) | KernelObject::RemoteSlot(_) | KernelObject::Critical => {
                 Some(format!("gate-{}.json", self.suffix()))
             }
-            KernelObject::Journal | KernelObject::WakeEvent { .. } | KernelObject::Job { .. } | KernelObject::Log { .. } => None,
+            KernelObject::Journal
+            | KernelObject::WakeEvent { .. }
+            | KernelObject::Job { .. }
+            | KernelObject::Log { .. }
+            | KernelObject::Routed { .. } => None,
         }
     }
 }

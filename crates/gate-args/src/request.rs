@@ -128,6 +128,13 @@ pub struct TestSeams {
     /// Make a routed run stop once its client has made the snapshot and bridge commits and said them, with status 0
     /// and nothing pushed.
     pub remote_snapshot: bool,
+    /// The transport of the Rust remote client a routed run calls, as given: `local:<folder>`, the builder's root a
+    /// folder here and every ssh call this gate's own `box`.
+    pub remote_transport: Option<String>,
+    /// The program each ssh call of the local transport starts with ssh's own words, in place of this gate's `box`.
+    pub remote_ssh: Option<PathBuf>,
+    /// The pause before the one retry of a call that failed before the ssh banner, in milliseconds.
+    pub remote_retry_pause_ms: Option<u64>,
 }
 
 /// A valid `gate run`.

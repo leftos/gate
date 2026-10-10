@@ -23,8 +23,9 @@ pub(crate) const GIT_LIMIT: Duration = Duration::from_secs(60);
 /// How often a git call is looked at while it runs.
 const GIT_POLL: Duration = Duration::from_millis(5);
 /// The variables that would point git at another repository, index, object store, config or pathspec reading; git is
-/// asked about the gate's folder alone, so a gate inside a hook that exports them still routes.
-const GIT_LOCATION: [&str; 13] = [
+/// asked about the gate's folder alone, so a gate inside a hook that exports them still routes. The indexed config
+/// variables are removed too, by their prefixes.
+const GIT_LOCATION: [&str; 16] = [
     "GIT_DIR",
     "GIT_WORK_TREE",
     "GIT_COMMON_DIR",
@@ -34,11 +35,16 @@ const GIT_LOCATION: [&str; 13] = [
     "GIT_NAMESPACE",
     "GIT_PREFIX",
     "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_SYSTEM",
     "GIT_GLOB_PATHSPECS",
     "GIT_NOGLOB_PATHSPECS",
     "GIT_ICASE_PATHSPECS",
     "GIT_LITERAL_PATHSPECS",
 ];
+/// The prefixes of the config variables `GIT_CONFIG_COUNT` indexes: `GIT_CONFIG_KEY_<n>` and `GIT_CONFIG_VALUE_<n>`.
+const GIT_CONFIG_INDEXED: [&str; 2] = ["GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"];
 /// `FILE_FLAG_DELETE_ON_CLOSE`: the file of git's output is gone once its last handle closes.
 const DELETE_ON_CLOSE: u32 = 0x0400_0000;
 
@@ -116,6 +122,23 @@ impl Git {
         String::from_utf8(output).map_err(|_| GitError::Failed("git's output is not valid UTF-8".to_owned()))
     }
 
+    /// git asked about `folder` alone, as every call starts it: the location and config variables removed, `-C
+    /// <folder>`, and no file-system monitor. Its arguments, streams and start are the caller's, through
+    /// [`gate_win32::spawn`].
+    pub(crate) fn command(&self, folder: &Path) -> Command {
+        let mut command = Command::new(&self.program);
+        for name in GIT_LOCATION {
+            command.env_remove(name);
+        }
+        for (name, _) in std::env::vars_os() {
+            if name.to_str().is_some_and(is_indexed_config) {
+                command.env_remove(name);
+            }
+        }
+        command.arg("-C").arg(folder).args(["-c", "core.fsmonitor=false"]);
+        command
+    }
+
     /// Runs git with `call`'s args and variables, its standard error going to the file `stderr` when one is given, else
     /// to null; its exit status and the file holding its standard output are returned, and both that file and `stderr`
     /// are left read from their start. A call made while the console interrupt is already raised starts no process.
@@ -125,18 +148,12 @@ impl Git {
         }
         let cannot_hold = |error: io::Error| GitError::Failed(format!("cannot make a file for git's output: {error}"));
         let mut stdout = output_file().map_err(cannot_hold)?;
-        let mut command = Command::new(&self.program);
-        for name in GIT_LOCATION {
-            command.env_remove(name);
-        }
+        let mut command = self.command(call.folder);
         for name in call.unset {
             command.env_remove(*name);
         }
         command
             .envs(call.set.iter().copied())
-            .arg("-C")
-            .arg(call.folder)
-            .args(["-c", "core.fsmonitor=false"])
             .args(call.args)
             .stdin(Stdio::null())
             .stdout(stdout.try_clone().map_err(cannot_hold)?);
@@ -191,6 +208,14 @@ impl<'a> Call<'a> {
 pub(crate) struct Ran {
     pub status: ExitStatus,
     pub stdout: File,
+}
+
+/// Whether `name` is one of the config variables `GIT_CONFIG_COUNT` indexes, its letter case aside as Windows reads a
+/// variable's name.
+fn is_indexed_config(name: &str) -> bool {
+    GIT_CONFIG_INDEXED
+        .iter()
+        .any(|prefix| name.get(..prefix.len()).is_some_and(|start| start.eq_ignore_ascii_case(prefix)) && name.len() > prefix.len())
 }
 
 /// git's exit status once it ends; after `limit` it is killed and the call fails, and a console interrupt raised while
@@ -271,7 +296,34 @@ mod tests {
     use std::path::Path;
     use std::time::Duration;
 
-    use super::{Call, GIT_LIMIT, failed_line, late_git_line};
+    use std::ffi::OsStr;
+    use std::path::PathBuf;
+
+    use super::{Call, GIT_LIMIT, Git, failed_line, is_indexed_config, late_git_line};
+
+    #[test]
+    fn git_is_given_none_of_the_config_variables() {
+        let command = Git {
+            program: PathBuf::from("git.exe"),
+        }
+        .command(Path::new(r"C:\work\app"));
+        let removed: Vec<&OsStr> = command.get_envs().filter(|(_, value)| value.is_none()).map(|(name, _)| name).collect();
+        for name in [
+            "GIT_CONFIG_COUNT",
+            "GIT_CONFIG_GLOBAL",
+            "GIT_CONFIG_SYSTEM",
+            "GIT_CONFIG_PARAMETERS",
+            "GIT_DIR",
+        ] {
+            assert!(removed.contains(&OsStr::new(name)), "{name} is removed: {removed:?}");
+        }
+        for name in ["GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0", "GIT_CONFIG_KEY_12", "git_config_value_3"] {
+            assert!(is_indexed_config(name), "{name}");
+        }
+        for name in ["GIT_CONFIG_KEYS", "GIT_CONFIG_NOSYSTEM", "GIT_CONFIG_KEY", "XGIT_CONFIG_KEY_0", "PATH"] {
+            assert!(!is_indexed_config(name), "{name}");
+        }
+    }
 
     #[test]
     fn a_late_git_names_its_limit_in_seconds_or_milliseconds() {

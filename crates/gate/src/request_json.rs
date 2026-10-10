@@ -38,6 +38,9 @@ pub(crate) fn run(request: &RunRequest, log: &Path, root: &ResolvedRoot) -> Stri
             "gitLimitMs": seams.git_limit_ms,
             "serversUnder": seams.servers_under.as_ref().map(|path| path.to_string_lossy()),
             "remoteSnapshot": seams.remote_snapshot,
+            "remoteTransport": seams.remote_transport,
+            "remoteSsh": seams.remote_ssh.as_ref().map(|path| path.to_string_lossy()),
+            "remoteRetryPauseMs": seams.remote_retry_pause_ms,
         },
     })
     .to_string()
