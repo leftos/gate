@@ -331,6 +331,7 @@ fn captured_journal_is_read_into_runs() {
             verdict: Some("passed".to_owned()),
             wall_seconds: Some(0.0),
             adjusted_seconds: None,
+            abandoned: Vec::new(),
         },
         "the seam takes no slot"
     );
@@ -355,6 +356,7 @@ fn captured_journal_is_read_into_runs() {
             verdict: Some("failed".to_owned()),
             wall_seconds: Some(0.0),
             adjusted_seconds: None,
+            abandoned: Vec::new(),
         }
     );
     assert_eq!(history.runs[3].waited_seconds, Some(1.7), "the abandoned gate's wait");
@@ -374,9 +376,8 @@ fn captured_journal_is_read_into_runs() {
 
 #[test]
 fn powershell_journal_is_read_into_runs() {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join("gate-state")
-        .join("powershell_journal_is_read_into_runs");
+    let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("gate-state");
+    let dir = root.join("powershell_journal_is_read_into_runs");
     if dir.exists() {
         fs::remove_dir_all(&dir).expect("the test's old folder can be removed");
     }
@@ -384,7 +385,6 @@ fn powershell_journal_is_read_into_runs() {
     fs::write(dir.join("ops72-events.jsonl"), POWERSHELL_JOURNAL).expect("the journal can be written");
     let not_live = |_pid: u32, _process_start: &str| false;
     let last_segment = |cwd: &str| cwd.rsplit(['\\', '/']).next().map(str::to_owned);
-
     let history = JournalCache::default()
         .read(&dir, POWERSHELL_PREFIX, ts("2026-10-03T06:00:00Z"), not_live, last_segment)
         .expect("the journal can be read");
@@ -422,6 +422,7 @@ fn powershell_journal_is_read_into_runs() {
             verdict: None,
             wall_seconds: None,
             adjusted_seconds: None,
+            abandoned: Vec::new(),
         }
     );
     assert_eq!(
@@ -445,6 +446,7 @@ fn powershell_journal_is_read_into_runs() {
             verdict: None,
             wall_seconds: None,
             adjusted_seconds: None,
+            abandoned: Vec::new(),
         }
     );
     assert_eq!(

@@ -20,6 +20,8 @@ use crate::support::{keys, ts};
 pub const NOW: &str = "2026-10-03T12:00:00Z";
 /// Only guards against a stuck test; nothing asserts how long an append took.
 const HANG_GUARD: Duration = Duration::from_secs(120);
+/// The name the test locks answer with, the shape the binary's journal mutex name has.
+pub const LOCK_NAME: &str = r"Local\gate-test-journal";
 
 /// A journal lock that answers at once.
 pub enum FakeLock {
@@ -31,11 +33,15 @@ pub enum FakeLock {
 impl JournalLock for FakeLock {
     type Guard<'a> = ();
 
+    fn name(&self) -> &str {
+        LOCK_NAME
+    }
+
     fn acquire(&self, _timeout: Duration) -> Result<Held<()>, LockError> {
         match self {
             FakeLock::Free => Ok(Held { guard: (), abandoned: false }),
             FakeLock::Abandoned => Ok(Held { guard: (), abandoned: true }),
-            FakeLock::Busy => Err(LockError(r"Local\gate-test-journal was not free within 2 s".to_owned())),
+            FakeLock::Busy => Err(LockError(format!("{LOCK_NAME} was not free within 2 s"))),
         }
     }
 }
@@ -46,6 +52,10 @@ struct ThreadLock(Mutex<()>);
 
 impl JournalLock for ThreadLock {
     type Guard<'a> = MutexGuard<'a, ()>;
+
+    fn name(&self) -> &str {
+        LOCK_NAME
+    }
 
     fn acquire(&self, _timeout: Duration) -> Result<Held<MutexGuard<'_, ()>>, LockError> {
         let guard = self.0.lock().map_err(|error| LockError(error.to_string()))?;
@@ -96,6 +106,11 @@ pub fn lines_of(path: &Path) -> Vec<String> {
         .lines()
         .map(str::to_owned)
         .collect()
+}
+
+/// A `append_line` builder that ignores the lock and returns `line`, for the raw-string tests.
+pub fn fixed(line: &str) -> impl FnOnce(Option<&str>) -> String + '_ {
+    move |_| line.to_owned()
 }
 
 /// The names in the root's `archive` folder, sorted.
@@ -164,6 +179,7 @@ fn line_starts_with_v_then_the_common_keys_in_order() {
         &JournalEvent::Queue {
             log: r"C:\work\repo\.tmp\f1.log".to_owned(),
         },
+        None,
     );
     let take = journal_line(
         &identity(),
@@ -171,14 +187,16 @@ fn line_starts_with_v_then_the_common_keys_in_order() {
         &JournalEvent::Take {
             slots: Vec::new(),
             waited_seconds: 0.0,
+            abandoned: Vec::new(),
         },
+        None,
     );
     let facts = RunFacts {
         wall_seconds: 0.1,
         adjusted_seconds: Some(0.2),
         verdict: Verdict::Passed,
     };
-    let released = journal_line(&identity(), time, &release(Some(facts)));
+    let released = journal_line(&identity(), time, &release(Some(facts)), None);
 
     assert!(queue.starts_with(r#"{"v":1,"time":"#), "{queue}");
     assert_eq!(keys(&parsed(&queue)), with_common(&["log"]));
@@ -205,7 +223,7 @@ fn line_starts_with_v_then_the_common_keys_in_order() {
 fn time_has_seven_fractional_digits_and_z() {
     let mut gate = identity();
     gate.process_start = ts("2026-10-03T05:04:38Z");
-    let line = journal_line(&gate, ts("2026-10-03T05:04:39.12Z"), &JournalEvent::Queue { log: "x".to_owned() });
+    let line = journal_line(&gate, ts("2026-10-03T05:04:39.12Z"), &JournalEvent::Queue { log: "x".to_owned() }, None);
     let value = parsed(&line);
 
     assert_eq!(value["time"], "2026-10-03T05:04:39.1200000Z");
@@ -215,6 +233,7 @@ fn time_has_seven_fractional_digits_and_z() {
         &identity(),
         ts("2026-10-03T05:04:39.1209178Z"),
         &JournalEvent::Queue { log: "x".to_owned() },
+        None,
     );
     assert_eq!(parsed(&exact)["time"], "2026-10-03T05:04:39.1209178Z");
     assert_eq!(parsed(&exact)["processStart"], "2026-10-03T05:04:38.7424554Z");
@@ -226,7 +245,7 @@ fn release_without_run_facts_writes_nulls_and_unknown() {
     if let JournalEvent::Release { status, .. } = &mut event {
         *status = None;
     }
-    let line = journal_line(&identity(), ts(NOW), &event);
+    let line = journal_line(&identity(), ts(NOW), &event, None);
 
     assert!(
         line.ends_with(r#""heldSeconds":0.105,"status":null,"wallSeconds":null,"adjustedSeconds":null,"verdict":"unknown"}"#),
@@ -242,7 +261,9 @@ fn seconds_round_to_three_decimals() {
         &JournalEvent::Take {
             slots: Vec::new(),
             waited_seconds: 1.234_56,
+            abandoned: Vec::new(),
         },
+        None,
     );
     let released = journal_line(
         &identity(),
@@ -257,6 +278,7 @@ fn seconds_round_to_three_decimals() {
                 verdict: Verdict::Failed,
             }),
         },
+        None,
     );
 
     assert!(take.ends_with(r#""waitedSeconds":1.235}"#), "{take}");
@@ -275,7 +297,9 @@ fn seconds_round_a_midpoint_to_even_as_dotnet_does() {
             &JournalEvent::Take {
                 slots: Vec::new(),
                 waited_seconds: seconds,
+                abandoned: Vec::new(),
             },
+            None,
         );
         parsed(&line)["waitedSeconds"].clone()
     };
@@ -290,7 +314,7 @@ fn append_ends_every_line_with_lf_and_writes_no_bom() {
     let root = fresh_dir("append_ends_every_line_with_lf_and_writes_no_bom");
 
     for line in [r#"{"v":1,"event":"queue","note":"é"}"#, r#"{"v":1,"event":"take"}"#] {
-        let appended = append_line(&root, &FakeLock::Free, line, ts(NOW));
+        let appended = append_line(&root, &FakeLock::Free, fixed(line), ts(NOW));
         assert!(appended.written && appended.notes.is_empty(), "{appended:?}");
     }
 
@@ -307,7 +331,7 @@ fn torn_last_line_gets_a_line_feed_first() {
     let root = fresh_dir("torn_last_line_gets_a_line_feed_first");
     fs::write(root.join("events.jsonl"), "{\"event\":\"queue\"}\n{\"event\":\"ta").expect("the journal can be seeded");
 
-    let appended = append_line(&root, &FakeLock::Free, r#"{"event":"release"}"#, ts(NOW));
+    let appended = append_line(&root, &FakeLock::Free, fixed(r#"{"event":"release"}"#), ts(NOW));
 
     assert!(appended.written, "{appended:?}");
     assert_eq!(
@@ -322,7 +346,7 @@ fn journal_below_the_cap_does_not_roll() {
     let seed = seed_lines(JOURNAL_CAP_BYTES - 1);
     fs::write(root.join("events.jsonl"), text(&seed)).expect("the journal can be seeded");
 
-    let appended = append_line(&root, &FakeLock::Free, r#"{"event":"take"}"#, ts(NOW));
+    let appended = append_line(&root, &FakeLock::Free, fixed(r#"{"event":"take"}"#), ts(NOW));
 
     assert!(appended.written && appended.notes.is_empty(), "{appended:?}");
     assert!(!root.join("events.1.jsonl").exists(), "a journal under the cap stays where it is");
@@ -336,7 +360,7 @@ fn journal_at_the_cap_rolls_before_the_append() {
     let seed = text(&seed_lines(JOURNAL_CAP_BYTES));
     fs::write(root.join("events.jsonl"), &seed).expect("the journal can be seeded");
 
-    let appended = append_line(&root, &FakeLock::Free, r#"{"event":"take"}"#, ts(NOW));
+    let appended = append_line(&root, &FakeLock::Free, fixed(r#"{"event":"take"}"#), ts(NOW));
 
     assert!(appended.written && appended.notes.is_empty(), "{appended:?}");
     assert_eq!(fs::read_to_string(root.join("events.1.jsonl")).expect("the journal was rolled"), seed);
@@ -353,7 +377,7 @@ fn roll_replaces_an_existing_events_1() {
     fs::write(root.join("events.jsonl"), &seed).expect("the journal can be seeded");
     fs::write(root.join("events.1.jsonl"), "{\"event\":\"older\"}\n").expect("an older roll can be seeded");
 
-    let appended = append_line(&root, &FakeLock::Free, r#"{"event":"take"}"#, ts(NOW));
+    let appended = append_line(&root, &FakeLock::Free, fixed(r#"{"event":"take"}"#), ts(NOW));
 
     assert!(appended.written && appended.notes.is_empty(), "{appended:?}");
     assert_eq!(fs::read_to_string(root.join("events.1.jsonl")).expect("the journal was rolled"), seed);
@@ -370,7 +394,7 @@ fn failed_roll_appends_in_place_and_says_so() {
     fs::create_dir_all(&rolled).expect("the blocking folder can be made");
     fs::write(rolled.join("keep"), "x").expect("the blocking folder can hold a file");
 
-    let appended = append_line(&root, &FakeLock::Free, r#"{"event":"take"}"#, ts(NOW));
+    let appended = append_line(&root, &FakeLock::Free, fixed(r#"{"event":"take"}"#), ts(NOW));
 
     assert!(appended.written, "{appended:?}");
     assert_eq!(
@@ -391,7 +415,7 @@ fn failed_roll_appends_in_place_and_says_so() {
 fn lock_timeout_skips_the_line_and_reports_it() {
     let root = fresh_dir("lock_timeout_skips_the_line_and_reports_it").join("root");
 
-    let appended = append_line(&root, &FakeLock::Busy, r#"{"event":"take"}"#, ts(NOW));
+    let appended = append_line(&root, &FakeLock::Busy, fixed(r#"{"event":"take"}"#), ts(NOW));
 
     assert!(!appended.written && !appended.abandoned, "{appended:?}");
     assert!(!root.exists(), "nothing is touched without the lock");
@@ -409,17 +433,129 @@ fn lock_timeout_skips_the_line_and_reports_it() {
 fn abandoned_lock_still_writes() {
     let root = fresh_dir("abandoned_lock_still_writes");
 
-    let appended = append_line(&root, &FakeLock::Abandoned, r#"{"event":"take"}"#, ts(NOW));
+    let appended = append_line(&root, &FakeLock::Abandoned, fixed(r#"{"event":"take"}"#), ts(NOW));
 
     assert!(appended.written && appended.abandoned && appended.notes.is_empty(), "{appended:?}");
     assert_eq!(lines_of(&root.join("events.jsonl")), [r#"{"event":"take"}"#]);
 }
 
 #[test]
+fn a_take_with_abandoned_slots_lists_them_after_waited_seconds() {
+    let take = journal_line(
+        &identity(),
+        ts(NOW),
+        &JournalEvent::Take {
+            slots: vec![r"Local\gate-1a2b3c4d-slot-0".to_owned()],
+            waited_seconds: 0.5,
+            abandoned: vec![r"Local\gate-1a2b3c4d-slot-0".to_owned()],
+        },
+        None,
+    );
+
+    assert!(
+        take.ends_with(r#""waitedSeconds":0.5,"abandoned":["Local\\gate-1a2b3c4d-slot-0"]}"#),
+        "{take}"
+    );
+}
+
+#[test]
+fn a_take_with_no_abandoned_slots_has_no_abandoned_key() {
+    let take = journal_line(
+        &identity(),
+        ts(NOW),
+        &JournalEvent::Take {
+            slots: Vec::new(),
+            waited_seconds: 0.5,
+            abandoned: Vec::new(),
+        },
+        None,
+    );
+
+    assert!(
+        !parsed(&take).as_object().expect("a line is an object").contains_key("abandoned"),
+        "{take}"
+    );
+    assert!(take.ends_with(r#""waitedSeconds":0.5}"#), "{take}");
+}
+
+#[test]
+fn journal_line_lists_the_lock_on_a_queue_line() {
+    let line = journal_line(
+        &identity(),
+        ts(NOW),
+        &JournalEvent::Queue { log: "x".to_owned() },
+        Some(r"Local\gate-test-journal"),
+    );
+
+    assert!(line.ends_with(r#""log":"x","abandoned":["Local\\gate-test-journal"]}"#), "{line}");
+}
+
+#[test]
+fn journal_line_puts_the_lock_after_the_slots_on_a_take() {
+    let line = journal_line(
+        &identity(),
+        ts(NOW),
+        &JournalEvent::Take {
+            slots: vec![r"Local\gate-1a2b3c4d-slot-0".to_owned()],
+            waited_seconds: 0.5,
+            abandoned: vec![r"Local\gate-1a2b3c4d-slot-0".to_owned()],
+        },
+        Some(r"Local\gate-test-journal"),
+    );
+
+    assert!(
+        line.ends_with(r#""waitedSeconds":0.5,"abandoned":["Local\\gate-1a2b3c4d-slot-0","Local\\gate-test-journal"]}"#),
+        "{line}"
+    );
+}
+
+#[test]
+fn a_line_appended_under_an_abandoned_journal_lock_lists_the_lock() {
+    let root = fresh_dir("a_line_appended_under_an_abandoned_journal_lock_lists_the_lock");
+
+    let appended = append_line(
+        &root,
+        &FakeLock::Abandoned,
+        |abandoned| journal_line(&identity(), ts(NOW), &JournalEvent::Queue { log: "x".to_owned() }, abandoned),
+        ts(NOW),
+    );
+
+    assert!(appended.written && appended.abandoned && appended.notes.is_empty(), "{appended:?}");
+    let written = &lines_of(&root.join("events.jsonl"))[0];
+    assert!(written.ends_with(r#""abandoned":["Local\\gate-test-journal"]}"#), "{written}");
+}
+
+#[test]
+fn an_abandoned_lock_on_a_take_with_abandoned_slots_extends_its_list() {
+    let root = fresh_dir("an_abandoned_lock_on_a_take_with_abandoned_slots_extends_its_list");
+    let take = |abandoned: Option<&str>| {
+        journal_line(
+            &identity(),
+            ts(NOW),
+            &JournalEvent::Take {
+                slots: vec![r"Local\gate-1a2b3c4d-slot-0".to_owned()],
+                waited_seconds: 0.5,
+                abandoned: vec![r"Local\gate-1a2b3c4d-slot-0".to_owned()],
+            },
+            abandoned,
+        )
+    };
+
+    let appended = append_line(&root, &FakeLock::Abandoned, take, ts(NOW));
+
+    assert!(appended.written && appended.abandoned, "{appended:?}");
+    let written = &lines_of(&root.join("events.jsonl"))[0];
+    assert!(
+        written.ends_with(r#""abandoned":["Local\\gate-1a2b3c4d-slot-0","Local\\gate-test-journal"]}"#),
+        "{written}"
+    );
+}
+
+#[test]
 fn missing_root_is_created() {
     let root = fresh_dir("missing_root_is_created").join("not").join("yet");
 
-    let appended = append_line(&root, &FakeLock::Free, r#"{"event":"queue"}"#, ts(NOW));
+    let appended = append_line(&root, &FakeLock::Free, fixed(r#"{"event":"queue"}"#), ts(NOW));
 
     assert!(appended.written && appended.notes.is_empty(), "{appended:?}");
     assert_eq!(lines_of(&root.join("events.jsonl")), [r#"{"event":"queue"}"#]);
@@ -441,7 +577,7 @@ fn rollover_while_others_append_loses_no_line() {
                 for number in 0..LINES {
                     let event = if number.is_multiple_of(2) { "release" } else { "queue" };
                     let line = json!({"v": 1, "event": event, "thread": thread, "number": number}).to_string();
-                    let appended = append_line(&root, &*lock, &line, ts(NOW));
+                    let appended = append_line(&root, &*lock, fixed(&line), ts(NOW));
                     assert!(appended.written && appended.notes.is_empty(), "{appended:?}");
                 }
                 done.send(()).expect("the test waits for every thread");

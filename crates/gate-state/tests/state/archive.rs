@@ -7,7 +7,7 @@ use std::time::{Duration, SystemTime};
 
 use gate_state::{Held, JOURNAL_CAP_BYTES, JournalLock, LockError, append_line, archive_rolled_journal};
 
-use crate::journal_write::{NOW, archive_names, fresh_dir, gunzip, lines_of, release_lines, seed_lines, text};
+use crate::journal_write::{LOCK_NAME, NOW, archive_names, fixed, fresh_dir, gunzip, lines_of, release_lines, seed_lines, text};
 use crate::support::ts;
 
 const RELEASE: &str = r#"{"v":1,"time":"2026-10-03T05:04:39.2910745Z","event":"release","pid":40268,"status":0}"#;
@@ -208,6 +208,10 @@ impl Drop for Recorder<'_> {
 impl JournalLock for RecordingLock {
     type Guard<'a> = Recorder<'a>;
 
+    fn name(&self) -> &str {
+        LOCK_NAME
+    }
+
     fn acquire(&self, _timeout: Duration) -> Result<Held<Recorder<'_>>, LockError> {
         self.record("acquire");
         Ok(Held {
@@ -227,7 +231,7 @@ fn roll_archives_under_the_same_lock_hold() {
         events: RefCell::new(Vec::new()),
     };
 
-    let appended = append_line(&root, &lock, RELEASE, ts(NOW));
+    let appended = append_line(&root, &lock, fixed(RELEASE), ts(NOW));
 
     assert!(appended.written && appended.notes.is_empty(), "{appended:?}");
     assert_eq!(

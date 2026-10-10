@@ -369,6 +369,7 @@ fn runs_pair_queue_take_release_by_pid_and_process_start() {
                 verdict: None,
                 wall_seconds: None,
                 adjusted_seconds: None,
+                abandoned: Vec::new(),
             },
             HistoryRun {
                 command: "cargo build".to_owned(),
@@ -389,6 +390,7 @@ fn runs_pair_queue_take_release_by_pid_and_process_start() {
                 verdict: None,
                 wall_seconds: None,
                 adjusted_seconds: None,
+                abandoned: Vec::new(),
             },
         ]
     );
@@ -1034,4 +1036,81 @@ fn summary_splits_remote_runs_from_local_runs_of_one_command() {
         [(COMMAND, false, 1, 30.0), (COMMAND, true, 1, 90.0)],
         "one row each, the local row first when the counts tie"
     );
+}
+
+#[test]
+fn a_run_lists_the_slots_its_take_took_abandoned() {
+    let gate = Gate::new(1, START, COMMAND);
+    let slot = r"Local\gate-slot-1";
+    let lines = vec![
+        versioned(&gate.queue(&ago(30)), 1),
+        versioned(&with_fields(&gate.take(&ago(29), 0.5), &json!({"abandoned": [slot]})), 1),
+        versioned(&gate.release(&ago(28), 2.0, json!(0)), 1),
+    ];
+
+    let history = history_of("a_run_lists_the_slots_its_take_took_abandoned", &lines);
+
+    assert_eq!(history.runs[0].abandoned, [slot]);
+}
+
+#[test]
+fn a_run_lists_an_abandoned_journal_mutex_from_any_of_its_lines_once() {
+    let gate = Gate::new(1, START, COMMAND);
+    let journal = r"Local\gate-1a2b3c4d-journal";
+    let slot = r"Local\gate-slot-1";
+    let lines = vec![
+        versioned(&with_fields(&gate.queue(&ago(30)), &json!({"abandoned": [journal]})), 1),
+        versioned(&with_fields(&gate.take(&ago(29), 0.5), &json!({"abandoned": [journal, slot]})), 1),
+        versioned(&gate.release(&ago(28), 2.0, json!(0)), 1),
+    ];
+
+    let history = history_of("a_run_lists_an_abandoned_journal_mutex_from_any_of_its_lines_once", &lines);
+
+    assert_eq!(
+        history.runs[0].abandoned,
+        [journal, slot],
+        "the journal mutex the queue and take lines both name is listed once, then the slot"
+    );
+}
+
+#[test]
+fn a_run_without_abandoned_lines_has_an_empty_list() {
+    let gate = Gate::new(1, START, COMMAND);
+
+    let history = history_of("a_run_without_abandoned_lines_has_an_empty_list", &gate.run(30, 2.0, json!(0)));
+
+    let run = &history.runs[0];
+    assert!(run.abandoned.is_empty(), "{run:?}");
+    let serialized = serde_json::to_string(run).expect("a run serializes");
+    assert!(serialized.contains(r#""abandoned":[]"#), "{serialized}");
+}
+
+#[test]
+fn a_run_lists_an_abandoned_journal_mutex_from_its_parent_line() {
+    let gate = Gate::new(1, START, COMMAND);
+    let journal = r"Local\gate-1a2b3c4d-journal";
+    let lines = vec![
+        gate.queue(&ago(30)),
+        gate.take(&ago(29), 0.5),
+        gate.line("parent", &ago(28), json!({"parentPid": 9, "abandoned": [journal]})),
+    ];
+
+    let history = history_of("a_run_lists_an_abandoned_journal_mutex_from_its_parent_line", &lines);
+
+    assert_eq!(history.runs[0].abandoned, [journal], "the run's parent line names the abandoned mutex");
+}
+
+#[test]
+fn a_run_lists_an_abandoned_journal_mutex_from_its_covered_line() {
+    let gate = Gate::new(1, START, COMMAND);
+    let journal = r"Local\gate-1a2b3c4d-journal";
+    let lines = vec![
+        gate.queue(&ago(30)),
+        gate.take(&ago(29), 0.5),
+        gate.line("covered", &ago(28), json!({"parentPid": 9, "abandoned": [journal]})),
+    ];
+
+    let history = history_of("a_run_lists_an_abandoned_journal_mutex_from_its_covered_line", &lines);
+
+    assert_eq!(history.runs[0].abandoned, [journal], "the run's covered line names the abandoned mutex");
 }

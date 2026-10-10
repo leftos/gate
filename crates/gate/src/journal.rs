@@ -22,6 +22,10 @@ struct JournalMutex(NamedMutex);
 impl JournalLock for JournalMutex {
     type Guard<'a> = MutexGuard<'a>;
 
+    fn name(&self) -> &str {
+        self.0.name()
+    }
+
     fn acquire(&self, timeout: Duration) -> Result<Held<MutexGuard<'_>>, LockError> {
         match self.0.acquire(timeout) {
             Ok(guard) => {
@@ -63,11 +67,10 @@ impl RunJournal {
 
     /// Appends `event`'s line, saying a mutex taken abandoned and what the append had to say.
     pub(crate) fn write(&mut self, event: &JournalEvent) {
-        let (appended, name) = match &self.writer {
+        let appended = match &self.writer {
             Ok((identity, mutex)) => {
                 let now = Timestamp::now();
-                let appended = append_line(&self.root, mutex, &journal_line(identity, now, event), now);
-                (appended, mutex.0.name().to_owned())
+                append_line(&self.root, mutex, |abandoned| journal_line(identity, now, event, abandoned), now)
             }
             Err(reason) => {
                 let note = JournalNote::NotWritten {
@@ -78,8 +81,10 @@ impl RunJournal {
                 return;
             }
         };
-        if appended.abandoned {
-            self.lines.push(format!("gate: took {name}, which a killed gate had left held"));
+        if appended.abandoned
+            && let Ok((_, mutex)) = &self.writer
+        {
+            self.lines.push(format!("gate: took {}, which a killed gate had left held", mutex.name()));
         }
         for note in &appended.notes {
             self.say(note);
@@ -128,6 +133,7 @@ pub(crate) fn seam_run(request: &RunRequest, log: &Path, root: &ResolvedRoot, st
     journal.write(&JournalEvent::Take {
         slots: Vec::new(),
         waited_seconds: 0.0,
+        abandoned: Vec::new(),
     });
     let held = took.elapsed().as_secs_f64();
     let code = i64::from(status);

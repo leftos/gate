@@ -35,6 +35,9 @@ pub trait JournalLock {
     where
         Self: 'a;
 
+    /// The lock's kernel object name, which a line appended under an abandoned acquisition lists in `abandoned`.
+    fn name(&self) -> &str;
+
     /// Takes the lock, waiting at most `timeout`.
     ///
     /// # Errors
@@ -86,6 +89,8 @@ pub enum JournalEvent {
         slots: Vec<String>,
         /// How long the gate waited, in seconds.
         waited_seconds: f64,
+        /// The slot mutexes this gate took from a gate that died holding them; empty when it took none.
+        abandoned: Vec<String>,
     },
     /// The gate is letting its slot go.
     Release {
@@ -164,8 +169,12 @@ impl fmt::Display for JournalNote {
 /// `processStart`, `kind`, `cwd` and `command`, then the event's own fields, times as ISO 8601 UTC with seven
 /// fractional digits and seconds rounded to three decimals. A `release` without facts writes null times and the verdict
 /// `unknown`.
+///
+/// `lock_abandoned` is the journal lock's name when it was taken abandoned. When it is `Some`, the line carries
+/// `abandoned` as its last field: a `take`'s own names followed by the lock's, any other event's just the lock's.
+/// Without it, only a `take` that took a slot abandoned writes the field.
 #[must_use]
-pub fn journal_line(identity: &JournalIdentity, time: Timestamp, event: &JournalEvent) -> String {
+pub fn journal_line(identity: &JournalIdentity, time: Timestamp, event: &JournalEvent, lock_abandoned: Option<&str>) -> String {
     let mut line = Map::new();
     line.insert("v".to_owned(), Value::from(VERSION));
     line.insert("time".to_owned(), Value::from(iso_utc(time)));
@@ -179,7 +188,7 @@ pub fn journal_line(identity: &JournalIdentity, time: Timestamp, event: &Journal
         JournalEvent::Queue { log } => {
             line.insert("log".to_owned(), Value::from(log.as_str()));
         }
-        JournalEvent::Take { slots, waited_seconds } => {
+        JournalEvent::Take { slots, waited_seconds, .. } => {
             line.insert("slots".to_owned(), Value::from(slots.clone()));
             line.insert("waitedSeconds".to_owned(), seconds(*waited_seconds));
         }
@@ -199,6 +208,14 @@ pub fn journal_line(identity: &JournalIdentity, time: Timestamp, event: &Journal
             line.insert("verdict".to_owned(), Value::from(verdict.as_str()));
         }
     }
+    let mut abandoned: Vec<Value> = match event {
+        JournalEvent::Take { abandoned, .. } => abandoned.iter().map(|name| Value::from(name.as_str())).collect(),
+        _ => Vec::new(),
+    };
+    abandoned.extend(lock_abandoned.map(Value::from));
+    if !abandoned.is_empty() {
+        line.insert("abandoned".to_owned(), Value::Array(abandoned));
+    }
     Value::Object(line).to_string()
 }
 
@@ -215,12 +232,15 @@ fn seconds(value: f64) -> Value {
     Value::from((value * 1000.0).round_ties_even() / 1000.0)
 }
 
-/// Appends `line` and a line feed to `root`'s journal while holding `lock`, waiting [`JOURNAL_WAIT`] for it. Under the
-/// one hold it creates the root when it is missing, moves a journal at or above the cap over `events.1.jsonl` and
-/// archives the moved file's release lines at `now` ([`archive_rolled_journal`]), then appends, a line feed first when
-/// the journal's last byte is not one. A move that fails leaves the journal where it is and appends to it. A lock that
-/// is not taken, or a write that fails, leaves the line unwritten and says why.
-pub fn append_line<L: JournalLock>(root: &Path, lock: &L, line: &str, now: Timestamp) -> Appended {
+/// Appends the line `build` returns and a line feed to `root`'s journal while holding `lock`, waiting [`JOURNAL_WAIT`]
+/// for it. Under the one hold it creates the root when it is missing, moves a journal at or above the cap over
+/// `events.1.jsonl` and archives the moved file's release lines at `now` ([`archive_rolled_journal`]), then appends, a
+/// line feed first when the journal's last byte is not one. A move that fails leaves the journal where it is and appends
+/// to it. A lock that is not taken, or a write that fails, leaves the line unwritten and says why.
+///
+/// `build` is called once, with the lock's name when the lock was taken abandoned and `None` otherwise, so the line it
+/// returns carries `abandoned`; [`Appended::abandoned`] reports the abandoned acquisition either way.
+pub fn append_line<L: JournalLock>(root: &Path, lock: &L, build: impl FnOnce(Option<&str>) -> String, now: Timestamp) -> Appended {
     let journal = root.join(JOURNAL_FILE);
     let held = match lock.acquire(JOURNAL_WAIT) {
         Ok(held) => held,
@@ -246,7 +266,8 @@ pub fn append_line<L: JournalLock>(root: &Path, lock: &L, line: &str, now: Times
         return appended;
     }
     roll(root, &journal, now, &mut appended.notes);
-    match write_line(&journal, line) {
+    let line = build(held.abandoned.then(|| lock.name()));
+    match write_line(&journal, &line) {
         Ok(()) => appended.written = true,
         Err(error) => appended.notes.push(JournalNote::NotWritten {
             journal,
