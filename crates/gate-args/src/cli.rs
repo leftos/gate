@@ -107,6 +107,7 @@ fn seam_option(name: &str) -> Option<RunOption> {
         "test-remote-wait-ms" => Some(RunOption::Value(ValueOption::RemoteWaitMs)),
         "test-git-limit-ms" => Some(RunOption::Value(ValueOption::GitLimitMs)),
         "test-servers-under" => Some(RunOption::Value(ValueOption::ServersUnder)),
+        "test-remote-snapshot" => Some(RunOption::Switch(SwitchOption::RemoteSnapshot)),
         _ => None,
     }
 }

@@ -52,6 +52,7 @@ fn seam_flags_parse_with_the_feature() {
             remote_wait_ms: Some(90),
             git_limit_ms: Some(95),
             servers_under: Some(std::path::PathBuf::from(r"target\case")),
+            remote_snapshot: false,
         }
     );
     assert!(request.print_request);
@@ -221,6 +222,30 @@ fn the_servers_under_seam_needs_a_value_once() {
     );
 }
 
+#[cfg(feature = "test-seams")]
+#[test]
+fn the_remote_snapshot_seam_is_a_switch_given_once() {
+    use crate::support::run_request;
+
+    assert!(
+        run_request(&refs(&with(&RUN, &["--test-remote-snapshot", "--", "cmd"])))
+            .test_seams
+            .remote_snapshot
+    );
+    assert!(
+        !run_request(&refs(&with(&RUN, &["--", "cmd"]))).test_seams.remote_snapshot,
+        "off unless given"
+    );
+    assert_eq!(
+        problems(&refs(&with(&RUN, &["--test-remote-snapshot", "--test-remote-snapshot", "--", "cmd"]))),
+        ["gate: --test-remote-snapshot is given twice"]
+    );
+    assert_eq!(
+        problems(&["stop-tree", "--test-remote-snapshot", "1"]),
+        ["gate: unknown option --test-remote-snapshot"]
+    );
+}
+
 /// The one line a malformed `gate box` prints.
 const BOX_USAGE: &str = "usage: gate box preflight|run|stop|boot|outputs <base64 JSON payload>";
 
@@ -308,6 +333,10 @@ fn seam_flags_are_unknown_without_the_feature() {
     assert_eq!(
         problems(&refs(&with(&RUN, &["--test-diagnostics-fail", "--", "cmd"]))),
         ["gate: unknown option --test-diagnostics-fail"]
+    );
+    assert_eq!(
+        problems(&refs(&with(&RUN, &["--test-remote-snapshot", "--", "cmd"]))),
+        ["gate: unknown option --test-remote-snapshot"]
     );
     assert_eq!(
         problems(&["stop-tree", "--test-print-request", "1"]),

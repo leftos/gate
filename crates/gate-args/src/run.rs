@@ -50,6 +50,8 @@ pub(crate) enum SwitchOption {
     SamplerFail,
     #[cfg(feature = "test-seams")]
     DiagnosticsFail,
+    #[cfg(feature = "test-seams")]
+    RemoteSnapshot,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -169,6 +171,8 @@ impl RunBuilder {
             SwitchOption::SamplerFail => self.test_seams.sampler_fail = on,
             #[cfg(feature = "test-seams")]
             SwitchOption::DiagnosticsFail => self.test_seams.diagnostics_fail = on,
+            #[cfg(feature = "test-seams")]
+            SwitchOption::RemoteSnapshot => self.test_seams.remote_snapshot = on,
         }
     }
 

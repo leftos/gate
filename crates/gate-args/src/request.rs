@@ -93,6 +93,10 @@ impl Slot {
 /// What the black-box suite sets through the hidden `--test-*` flags: the timing knobs, in milliseconds, and the
 /// interrupts the gate raises on itself; all `None` and off in a gate built without the `test-seams` feature.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each bool is a hidden flag of its own, set or not independently of the others"
+)]
 pub struct TestSeams {
     pub sample_ms: Option<u64>,
     pub heartbeat_ms: Option<u64>,
@@ -115,6 +119,9 @@ pub struct TestSeams {
     /// The folder the watched command's build servers must live under, `None` for every process on the machine: in a
     /// suite whose cases run at once, it keeps one case's build server out of another's watch.
     pub servers_under: Option<PathBuf>,
+    /// Make a routed run stop once its client has made the snapshot and bridge commits and said them, with status 0
+    /// and nothing pushed.
+    pub remote_snapshot: bool,
 }
 
 /// A valid `gate run`.

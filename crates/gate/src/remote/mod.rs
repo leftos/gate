@@ -1,12 +1,23 @@
 //! The remote client a routed run calls: the call it is given, the outcome it hands back, and the clients there are.
 //! With no client, a routed run falls back here with reason `client`. A gate built with the `test-seams` feature has
-//! the scripted client `--test-remote-client` names, which runs a step file in this process.
+//! the scripted client `--test-remote-client` names, which runs a step file in this process, and the client of
+//! `--test-remote-snapshot`, which stops once it has made the snapshot. [`git`] runs git for the routing decision and
+//! the client; [`snapshot`] makes the snapshot and bridge commits.
 
+use std::fs::OpenOptions;
+use std::io::{self, Write};
 use std::path::Path;
 
 use gate_args::RunRequest;
 use gate_state::FallbackReason;
 use gate_win32::Interrupt;
+
+pub(crate) mod git;
+#[cfg_attr(
+    not(any(test, feature = "test-seams")),
+    expect(dead_code, reason = "a gate without the test seams has no client that makes a snapshot")
+)]
+mod snapshot;
 
 /// The status a client hands back with a refusal's reason.
 pub(crate) const REFUSED: i64 = 75;
@@ -54,6 +65,7 @@ pub(crate) struct RemoteOutcome {
     pub reason: Option<FallbackReason>,
     pub killed: bool,
     pub lines: Vec<String>,
+    /// Why the client could not start its run, or could not say its lines.
     pub detail: Option<String>,
 }
 
@@ -88,10 +100,27 @@ impl RemoteClient for NoClient {
     }
 }
 
-/// The client `request` names: the scripted one of `--test-remote-client`, else none; or the line saying why its step
-/// file cannot be used.
+/// Appends each of `lines` to `log` and says them on `stream`: the one log-and-console writer the clients say their
+/// lines with.
+#[cfg_attr(not(feature = "test-seams"), expect(dead_code, reason = "only the clients the test seams name say lines"))]
+fn say<S: AsRef<str>>(log: &Path, lines: &[S], mut stream: impl Write) -> Result<(), String> {
+    let cannot = |error: io::Error| format!("cannot write to {}: {error}", log.display());
+    let mut file = OpenOptions::new().append(true).create(true).open(log).map_err(cannot)?;
+    for line in lines {
+        writeln!(file, "{}", line.as_ref()).map_err(cannot)?;
+        writeln!(stream, "{}", line.as_ref()).map_err(|error| format!("cannot say a line: {error}"))?;
+    }
+    stream.flush().map_err(|error| format!("cannot say a line: {error}"))
+}
+
+/// The client `request` names: the one of `--test-remote-snapshot`, else the scripted one of `--test-remote-client`,
+/// else none; or the line saying why its step file cannot be used.
 #[cfg(feature = "test-seams")]
 pub(crate) fn chosen(request: &RunRequest) -> Result<Option<Box<dyn RemoteClient>>, String> {
+    if request.test_seams.remote_snapshot {
+        let limit = git::limit(&request.test_seams);
+        return Ok(Some(Box::new(snapshot_only::SnapshotOnly { limit })));
+    }
     match &request.test_seams.remote_client {
         Some(path) => scripted::ScriptedClient::load(path).map(|client| Some(Box::new(client) as Box<dyn RemoteClient>)),
         None => Ok(None),
@@ -108,6 +137,153 @@ pub(crate) fn chosen(_request: &RunRequest) -> Result<Option<Box<dyn RemoteClien
     Ok(None)
 }
 
+/// The client of `--test-remote-snapshot`: makes the snapshot and bridge commits of the call's worktree and says each
+/// as `gate: remote snapshot <commit> bridge <commit or none>`, on stderr and in the log; the run ends with status 0,
+/// nothing pushed. A git failure ends it with status 1 and `gate: the remote run failed: <why>`, with no fallback; a
+/// Ctrl+C ends it as an interrupt, as the scripted client's `wait` does; and a run whose lines cannot be said ends with
+/// status 1, since its commits are already made.
+#[cfg(feature = "test-seams")]
+mod snapshot_only {
+    use std::io;
+    use std::path::PathBuf;
+    use std::time::Duration;
+
+    use super::git::GitError;
+    use super::snapshot::{self, Snapshot};
+    use super::{RemoteCall, RemoteClient, RemoteOutcome};
+    use crate::run::CONTROL_C_EXIT;
+
+    /// The status of a run whose client failed.
+    const FAILED: i64 = 1;
+    /// What a snapshot that could not be made says: `gate: the remote run failed: <why>`.
+    const FAILED_RUN: &str = "gate: the remote run failed";
+
+    pub(crate) struct SnapshotOnly {
+        /// How long each git call may take.
+        pub(crate) limit: Duration,
+    }
+
+    impl RemoteClient for SnapshotOnly {
+        fn run(&mut self, call: &RemoteCall<'_>) -> RemoteOutcome {
+            let roots = vec![PathBuf::from(call.root)];
+            let (status, lines) = match snapshot::take(&roots, call.key, self.limit, call.interrupt) {
+                Ok(snapshots) => (0, snapshots.iter().map(said).collect()),
+                // An interrupt is no failure, so it says no line: the run is the interrupt, as the client's `wait`.
+                Err(GitError::Interrupted) => (i64::from(CONTROL_C_EXIT.cast_signed()), Vec::new()),
+                Err(GitError::Failed(why)) => (FAILED, vec![format!("{FAILED_RUN}: {why}")]),
+            };
+            if let Err(why) = super::say(call.log, &lines, io::stderr().lock()) {
+                // The snapshot is made and cannot be unmade, so a run that cannot say its lines fails where it is.
+                return RemoteOutcome {
+                    status: FAILED,
+                    lines,
+                    detail: Some(why),
+                    ..RemoteOutcome::default()
+                };
+            }
+            RemoteOutcome {
+                status,
+                lines,
+                ..RemoteOutcome::default()
+            }
+        }
+    }
+
+    fn said(snapshot: &Snapshot) -> String {
+        let bridge = snapshot.bridge.as_deref().unwrap_or("none");
+        format!("gate: remote snapshot {} bridge {bridge}", snapshot.commit)
+    }
+
+    #[cfg(test)]
+    #[expect(clippy::expect_used, reason = "a test that cannot make its repository or its log must fail loudly")]
+    mod tests {
+        use std::fs;
+        use std::path::Path;
+
+        use gate_win32::Interrupt;
+
+        use super::SnapshotOnly;
+        use crate::remote::git::GIT_LIMIT;
+        use crate::remote::snapshot;
+        use crate::remote::{RemoteCall, RemoteClient};
+        use crate::run::CONTROL_C_EXIT;
+
+        /// The call the client is given; `root` is never reached by the test of an interrupt, which ends the first git
+        /// call before it starts.
+        fn call<'a>(root: &'a str, log: &'a Path, interrupt: Option<Interrupt>) -> RemoteCall<'a> {
+            RemoteCall {
+                host: "builder",
+                key: "app-1a2b3c4d",
+                root,
+                repo: "app",
+                subfolder: "",
+                words: &[],
+                outputs: &[],
+                log,
+                timeout: 3600,
+                stall: 0,
+                tail: 0,
+                no_markers: false,
+                interrupt,
+            }
+        }
+
+        #[test]
+        fn an_interrupted_snapshot_ends_the_run_as_an_interrupt() {
+            let interrupt = Interrupt::install().expect("the console handler is installed");
+            interrupt.raise();
+            let log = std::env::temp_dir().join(format!("gate-snapshot-interrupt-{}.log", std::process::id()));
+
+            let outcome = SnapshotOnly { limit: GIT_LIMIT }.run(&call(r"C:\no-such-worktree", &log, Some(interrupt)));
+
+            assert_eq!(outcome.status, i64::from(CONTROL_C_EXIT.cast_signed()), "{outcome:?}");
+            assert!(outcome.lines.is_empty(), "an interrupt says no failure line: {:?}", outcome.lines);
+            assert_eq!(outcome.fallback(), None, "an interrupt is no fallback");
+            assert_eq!(fs::read_to_string(&log).expect("the log was made"), "", "nothing is said");
+            assert!(fs::remove_file(&log).is_ok(), "the log can be removed");
+        }
+
+        #[test]
+        fn a_snapshot_that_cannot_say_its_lines_ends_the_run_with_status_1() {
+            let root = snapshot::repository("client-write");
+            let shown = root.to_string_lossy().into_owned();
+            let log = root.join("no-such-folder").join("out.log");
+
+            let outcome = SnapshotOnly { limit: GIT_LIMIT }.run(&call(&shown, &log, None));
+
+            assert_eq!(outcome.status, 1, "{outcome:?}");
+            assert_eq!(outcome.fallback(), None, "the snapshot's commits are already made");
+            assert!(
+                outcome.lines[0].starts_with("gate: remote snapshot "),
+                "the snapshot is made: {:?}",
+                outcome.lines
+            );
+            fs::remove_dir_all(&root).expect("the repository can be removed");
+        }
+
+        #[test]
+        fn a_failed_snapshot_says_the_run_failed_with_one_gate_prefix() {
+            let root = std::env::temp_dir().join(format!("gate-snapshot-client-{}-not-a-repo", std::process::id()));
+            if root.exists() {
+                fs::remove_dir_all(&root).expect("a folder left by an earlier run can be removed");
+            }
+            fs::create_dir_all(&root).expect("a folder that is no repository can be made");
+            let shown = root.to_string_lossy().into_owned();
+            let log = root.join("out.log");
+
+            let outcome = SnapshotOnly { limit: GIT_LIMIT }.run(&call(&shown, &log, None));
+
+            assert_eq!(outcome.status, 1, "{outcome:?}");
+            assert_eq!(outcome.fallback(), None, "a snapshot that cannot be made falls back nowhere");
+            let line = &outcome.lines[0];
+            assert!(line.starts_with("gate: the remote run failed: git "), "{line}");
+            let why = &line["gate: the remote run failed: ".len()..];
+            assert!(!why.starts_with("gate: "), "the reason carries no prefix of its own: {line}");
+            fs::remove_dir_all(&root).expect("the folder can be removed");
+        }
+    }
+}
+
 /// The scripted client: a step file run in order, one step a line. `out <text>` and `err <text>` append the text to
 /// the log and say it on stdout or stderr; `record <path>` writes the call as one JSON object; `wait <path>` returns
 /// when the path exists or the interrupt is raised, the latter ending the run with `STATUS_CONTROL_C_EXIT`;
@@ -115,7 +291,7 @@ pub(crate) fn chosen(_request: &RunRequest) -> Result<Option<Box<dyn RemoteClien
 /// <reason>` refuses with status 75; `fail-start <why>` ends the run as a client that could not start.
 #[cfg(feature = "test-seams")]
 mod scripted {
-    use std::fs::{self, OpenOptions};
+    use std::fs;
     use std::io::{self, Write};
     use std::path::{Path, PathBuf};
     use std::thread;
@@ -229,8 +405,8 @@ mod scripted {
     /// Performs `step` of `call` into `outcome`; whether the run goes on to the next step, or why the client failed.
     fn perform(step: &Step, call: &RemoteCall<'_>, outcome: &mut RemoteOutcome) -> Result<bool, String> {
         match step {
-            Step::Out(text) => say(call.log, text, io::stdout().lock(), outcome),
-            Step::Err(text) => say(call.log, text, io::stderr().lock(), outcome),
+            Step::Out(text) => out(call.log, text, io::stdout().lock(), outcome),
+            Step::Err(text) => out(call.log, text, io::stderr().lock(), outcome),
             Step::Record(path) => record(call, path),
             Step::Wait(path) => {
                 let came = wait(path, call.interrupt)?;
@@ -263,16 +439,8 @@ mod scripted {
     }
 
     /// Appends `text` to the log, says it on `stream` and keeps it in the outcome's lines.
-    fn say(log: &Path, text: &str, mut stream: impl Write, outcome: &mut RemoteOutcome) -> Result<bool, String> {
-        let mut file = OpenOptions::new()
-            .append(true)
-            .create(true)
-            .open(log)
-            .map_err(|error| format!("cannot open {}: {error}", log.display()))?;
-        writeln!(file, "{text}").map_err(|error| format!("cannot write to {}: {error}", log.display()))?;
-        writeln!(stream, "{text}")
-            .and_then(|()| stream.flush())
-            .map_err(|error| format!("cannot say a line: {error}"))?;
+    fn out(log: &Path, text: &str, stream: impl Write, outcome: &mut RemoteOutcome) -> Result<bool, String> {
+        super::say(log, &[text], stream)?;
         outcome.lines.push(text.to_owned());
         Ok(true)
     }
