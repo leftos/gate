@@ -1,8 +1,9 @@
 //! The command's output forwarded: one thread per pipe reads it line by line (CR LF, LF and a lone CR each end a line,
 //! the bytes read as UTF-8 with U+FFFD for what is not) and writes each line, LF-terminated, to the box's own stdout
 //! or stderr under one lock every such line takes, so no line lands inside another. A write that fails ends that
-//! stream's writing, and its reader goes on draining the pipe, so the command never blocks on a full one. Once the
-//! readers are stopped they drop every later line. The threads start no process.
+//! stream's writing and sets the flag both readers share, the run's signal that the client closed the connection; its
+//! reader goes on draining the pipe, so the command never blocks on a full one. Once the readers are stopped they drop
+//! every later line. The threads start no process.
 
 use std::fs::File;
 use std::io::{self, Read, Write};
@@ -37,6 +38,8 @@ impl Stream {
 /// The two readers of a command's output.
 pub(crate) struct Forwarders {
     stopped: Arc<AtomicBool>,
+    /// Set by a reader whose write to the box's own output failed: the client's connection is gone.
+    pipe_closed: Arc<AtomicBool>,
     ended: Receiver<()>,
     started: usize,
 }
@@ -49,12 +52,14 @@ impl Forwarders {
     /// The system's error when a thread cannot be started; a reader started before it goes on.
     pub(crate) fn start(stdout: File, stderr: File, lock: &OutputLock) -> io::Result<Forwarders> {
         let stopped = Arc::new(AtomicBool::new(false));
+        let pipe_closed = Arc::new(AtomicBool::new(false));
         let (sender, ended) = mpsc::channel();
         let mut started = 0;
         for (pipe, stream) in [(stdout, Stream::Out), (stderr, Stream::Err)] {
             let forwarder = Forwarder {
                 lock: Arc::clone(lock),
                 stopped: Arc::clone(&stopped),
+                pipe_closed: Arc::clone(&pipe_closed),
                 stream,
                 write_failed: false,
             };
@@ -66,12 +71,24 @@ impl Forwarders {
             })?;
             started += 1;
         }
-        Ok(Forwarders { stopped, ended, started })
+        Ok(Forwarders {
+            stopped,
+            pipe_closed,
+            ended,
+            started,
+        })
+    }
+
+    /// Whether a reader's write to the box's own output has failed: the client's connection is gone, and the run stops
+    /// the command's job for it.
+    pub(crate) fn pipe_closed(&self) -> bool {
+        self.pipe_closed.load(Ordering::SeqCst)
     }
 
     /// Waits at most `limit` for both readers to reach the end of the output, then stops them, so they drop every
-    /// later line; whether both reached it, which they do not while a process the command left running holds a pipe.
-    pub(crate) fn drain(self, limit: Duration) -> bool {
+    /// later line; what they reached, and whether a write to the box's own output failed meanwhile, the last moment a
+    /// reader can still write.
+    pub(crate) fn drain(self, limit: Duration) -> Drained {
         let deadline = Instant::now() + limit;
         let mut ended = 0;
         while ended < self.started {
@@ -81,16 +98,30 @@ impl Forwarders {
             ended += 1;
         }
         self.stopped.store(true, Ordering::SeqCst);
-        ended == self.started
+        Drained {
+            all_ended: ended == self.started,
+            pipe_closed: self.pipe_closed.load(Ordering::SeqCst),
+        }
     }
+}
+
+/// What one [`Forwarders::drain`] found.
+pub(crate) struct Drained {
+    /// Whether both readers reached the end of the output within the limit, which they do not while a process the
+    /// command left running holds a pipe.
+    pub(crate) all_ended: bool,
+    /// Whether a reader's write to the box's own output failed meanwhile: the client's connection is gone.
+    pub(crate) pipe_closed: bool,
 }
 
 /// One pipe's reader: where its lines go, and whether its writing has ended.
 struct Forwarder {
     lock: OutputLock,
     stopped: Arc<AtomicBool>,
+    /// Shared with the run: set when a write to the box's own output fails.
+    pipe_closed: Arc<AtomicBool>,
     stream: Stream,
-    /// Set by the first write to the box's stream that fails; no later line is written.
+    /// Set by the first write to the box's stream that fails; no later line is written by this reader.
     write_failed: bool,
 }
 
@@ -126,7 +157,10 @@ impl Forwarder {
             Stream::Out => write_flushed(&mut io::stdout().lock(), text.as_bytes()),
             Stream::Err => write_flushed(&mut io::stderr().lock(), text.as_bytes()),
         };
-        self.write_failed = written.is_err();
+        if written.is_err() {
+            self.write_failed = true;
+            self.pipe_closed.store(true, Ordering::SeqCst);
+        }
     }
 
     /// Says on stderr that the pipe could not be read; when stderr cannot take it either, nothing is left to say it on.

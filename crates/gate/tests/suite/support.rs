@@ -208,6 +208,40 @@ pub fn start(mut command: Command) -> Running {
     }
 }
 
+/// Which of a program's output streams a caller stops reading at once.
+#[derive(Clone, Copy)]
+pub enum Closed {
+    Stdout,
+    Stderr,
+}
+
+/// Starts `command` with stdin null and both output streams piped, dropping this process's read end of `closed` at
+/// once, so the program's next write to that stream fails; the other stream is gathered as [`start`] gathers it.
+pub fn start_with_closed(closed: Closed, mut command: Command) -> Running {
+    command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command.spawn().expect("the program starts");
+    let out_pipe = child.stdout.take().expect("stdout is piped");
+    let err_pipe = child.stderr.take().expect("stderr is piped");
+    let (stdout, stderr, reader) = match closed {
+        Closed::Stdout => {
+            drop(out_pipe);
+            let (stderr, reader) = gather(err_pipe);
+            (Buffer::default(), stderr, reader)
+        }
+        Closed::Stderr => {
+            drop(err_pipe);
+            let (stdout, reader) = gather(out_pipe);
+            (stdout, Buffer::default(), reader)
+        }
+    };
+    Running {
+        child,
+        stdout,
+        stderr,
+        readers: vec![reader],
+    }
+}
+
 /// A stream's bytes so far, shared with the thread that reads it.
 type Buffer = Arc<Mutex<Vec<u8>>>;
 

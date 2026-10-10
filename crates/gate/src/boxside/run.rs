@@ -23,7 +23,7 @@ use crate::answer::USAGE_STATUS;
 use crate::boxside::forward::{DRAIN, Forwarders, OutputLock};
 use crate::boxside::payload::{Payload, ordinal_upper};
 use crate::boxside::preflight::{Failed, GIT_REDIRECTS, Git, exit_code};
-use crate::boxside::stop::STOPPED;
+use crate::boxside::stop::{STOPPED, still_holding, terminate_and_wait};
 use crate::console::Console;
 use crate::environment::Variables;
 use crate::run::{Written, find_program, written};
@@ -34,8 +34,10 @@ const BUSY_STATUS: u32 = 75;
 const FAILED_STATUS: u32 = 1;
 /// The status of a command that could not be started.
 const NOT_STARTED: u32 = 127;
-/// How long one wait for the command's exit lasts before the box waits again.
-const WAIT_STEP: Duration = Duration::from_secs(60);
+/// The status of a run whose client closed the connection: the box stopped the job and exits as a lost connection does.
+const CLOSED_STATUS: u32 = 255;
+/// How long one wait for the command's exit lasts before the box looks again whether the client is still there.
+const WAIT_STEP: Duration = Duration::from_millis(100);
 /// The Win32 errors of an open refused because another process has the file open.
 const SHARING_VIOLATION: i32 = 32;
 const LOCK_VIOLATION: i32 = 33;
@@ -102,7 +104,8 @@ fn identity(payload: &Payload) -> Result<Vec<(String, String)>, String> {
 
 /// Runs the payload's command in its work folder and returns the status: the command's own whole 32-bit code, 127
 /// when it could not be started, 75 when another run holds the work folder, 2 for a payload or a word refused, a
-/// failing git step's status, or 1 when the box failed or the tree of a passed command could not be committed back.
+/// failing git step's status, 1 when the box failed or the tree of a passed command could not be committed back, or
+/// 255 when the client closed the connection and the box stopped the job.
 pub(crate) fn run(payload: &Payload, console: &mut Console) -> u32 {
     let request = match Request::read(payload) {
         Ok(request) => request,
@@ -219,7 +222,7 @@ fn full_path(path: &Path) -> Option<PathBuf> {
 
 /// Starts the command in `place` and sees it to its end: `Ok` with its status (127 when it could not be started), or
 /// `Err` with the status of a run that ends here, its line said: 2 for a batch word refused, 1 for the box's own
-/// failure.
+/// failure, 255 for a client that closed the connection.
 fn command(request: &Request<'_>, place: &Path, console: &mut Console) -> Result<u32, u32> {
     let variables = Variables::from_process();
     let environment = variables
@@ -314,8 +317,10 @@ struct Pipes {
 }
 
 /// Forwards the running command's output, waits for its main process to exit, then lets the readers drain for at most
-/// [`DRAIN`]; the command's exit code. Should the box fail first, the job is terminated, so the command does not
-/// outlive a run that no longer watches it.
+/// [`DRAIN`]; the command's exit code. A failed write to the box's own output means the client closed the connection,
+/// whenever it is noticed: the command's job is stopped then, before the readers drain or after them, and
+/// [`CLOSED_STATUS`] answered for it instead. Should the box fail first, the job is terminated, so the command does
+/// not outlive a run that no longer watches it.
 fn watch(job: &Job, running: &Running, pipes: Pipes, console: &mut Console) -> Result<u32, u32> {
     let lock = OutputLock::default();
     let forwarders = match Forwarders::start(pipes.stdout, pipes.stderr, &lock) {
@@ -329,7 +334,13 @@ fn watch(job: &Job, running: &Running, pipes: Pipes, console: &mut Console) -> R
     let code = loop {
         match running.wait(WAIT_STEP) {
             Ok(Some(code)) => break code,
-            Ok(None) => {}
+            Ok(None) => {
+                if forwarders.pipe_closed() {
+                    let ending = terminate_and_wait(job);
+                    forwarders.drain(DRAIN);
+                    return Err(closed_connection(job, ending, console));
+                }
+            }
             Err(error) => {
                 let status = failed(console, &format!("cannot wait for the command: {error}"));
                 end_job(job, console);
@@ -337,10 +348,29 @@ fn watch(job: &Job, running: &Running, pipes: Pipes, console: &mut Console) -> R
             }
         }
     };
-    if !forwarders.drain(DRAIN) {
+    let drained = forwarders.drain(DRAIN);
+    if drained.pipe_closed {
+        return Err(closed_connection(job, terminate_and_wait(job), console));
+    }
+    if !drained.all_ended {
         console.err("gate: remote command's output is still held open by a leftover process; stopped reading");
     }
     Ok(code)
+}
+
+/// The answer to a run whose client closed the connection, its job's `ending` already decided and its readers already
+/// drained: says on stderr what became of the job — `stopped` with no process left, `stopping` before why it did not
+/// stop — best effort, since the stream that failed may be the one it is said on. [`CLOSED_STATUS`], which the box
+/// exits with.
+fn closed_connection(job: &Job, ending: io::Result<usize>, console: &mut Console) -> u32 {
+    let said = if matches!(&ending, Ok(0)) { "stopped" } else { "stopping" };
+    console.err(&format!("gate: remote the client closed the connection; {said} job {}", job.name()));
+    match ending {
+        Ok(0) => {}
+        Ok(left) => console.err(&still_holding(job.name(), left)),
+        Err(error) => console.err(&format!("gate: remote could not stop job {}: {error}", job.name())),
+    }
+    CLOSED_STATUS
 }
 
 /// Terminates the job of a command the box no longer watches.

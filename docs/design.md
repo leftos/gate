@@ -613,12 +613,16 @@ Built verbs:
 
   Output is forwarded from the pipes until both end. When a leftover process holds a pipe open after the command ended, the box stops reading after a 2 s drain and says `gate: remote command's output is still held open by a leftover process; stopped reading`. A pipe that cannot be read prints `gate: remote could not read the command's <stdout|stderr>: <error>`.
 
+  A failed write by a forwarder to the box's stdout or stderr means the PC's ssh connection closed, and a closed connection always stops the job, whether it is noticed while the command runs or during the final drain. The box terminates the job with 124 and polls its processes every 100 ms for up to 10 s. It then drains the readers, skips the sync-back, releases the work-folder lock and exits 255.
+
+  On stderr, best effort, it says `gate: remote the client closed the connection; stopped job <name>` once the job is empty. Otherwise it says `gate: remote the client closed the connection; stopping job <name>` followed by the could-not-stop line or the `still has <n> process(es)` line of `stop`. The stdin closing is not the signal. A command that itself exits 255 is indistinguishable from a lost connection, as with the PowerShell wrapper.
+
   After the command, the sync-back commits the tree when it changed: a copy of the index at `<Work>.index` is staged, and the commit (message `gate-remote back`, parent HEAD) is written to `refs/gate-back/<key>` in `Bare`. A sync-back that fails prints `gate: remote sync-back failed: <message>` and turns a 0 status into 1; an index copy that cannot be removed prints `gate: remote could not remove <index>: <error>` and changes no status.
 - **`stop`** terminates the payload's job, taking no lock. It polls the job's process ids every 100 ms for up to 10 s; its processes end with 124. A stopped job prints `gate: remote stopped job <name>` on stdout and exits 0; no such job exits 0 with no output.
 
   Processes still alive 10 s after the termination print `gate: remote job <name> still has <n> process(es) 10 s after it was terminated` and exit 1, and a job that cannot be terminated prints `gate: remote could not stop job <name>: <error>` and exits 1.
 
-`outputs` prints `gate: box outputs is not built yet` and exits 70. The pipe-closed stop (exit 255), the heartbeat and the console belong to later parts of the remote port (GATE-61) and are planned, not built. The rest of the protocol, the transport of snapshots and outputs, is the remote port's design (GATE-10).
+`outputs` prints `gate: box outputs is not built yet` and exits 70. The heartbeat and the console belong to later parts of the remote port (GATE-61) and are planned, not built. The rest of the protocol, the transport of snapshots and outputs, is the remote port's design (GATE-10).
 
 ## Install
 

@@ -15,7 +15,8 @@ use regex::Regex;
 use serde_json::{Value, json};
 
 use crate::support::{
-    Case, FAKE_TOOL, GIT_REDIRECTS, Outcome, Running, allow_breakaway, box_payload, finish, shown, start, wait_until, wait_until_closed,
+    Case, Closed, FAKE_TOOL, GIT_REDIRECTS, Outcome, Running, allow_breakaway, box_payload, finish, shown, start, start_with_closed, wait_until,
+    wait_until_closed,
 };
 
 const BOX_USAGE: &str = "usage: gate box preflight|run|stop|boot|outputs <base64 JSON payload>\n";
@@ -872,6 +873,68 @@ fn box_run_stops_reading_output_a_leftover_process_holds_open() {
     );
     let_go(&never);
     wait_until_gone(spawned_pid(&outcome.stdout));
+}
+
+#[test]
+fn box_run_a_closed_stdout_pipe_stops_the_job_and_exits_255() {
+    let case = Case::new("box_run_closed_stdout");
+    let go = case.folder().join("go");
+    let never = case.folder().join("never");
+    let go_word = shown(&go);
+    let never_word = shown(&never);
+    let script = format!("@echo x>new.txt\r\n@\"{FAKE_TOOL}\" err started wait \"{go_word}\" out x wait \"{never_word}\"\r\n");
+    let payload = box_payload(&case, "k", &[r".\run.cmd"]);
+    snapshot(&case, &payload, &[("a.txt", "a\n"), ("run.cmd", &script)]);
+
+    let running = start_with_closed(Closed::Stdout, box_command(&case, &["box", "run", &self::payload(&payload)]));
+    running.wait_for_stderr("started");
+    let_go(&go);
+
+    let outcome = running.finish();
+
+    assert_eq!(outcome.code, Some(255), "a closed connection exits 255: {outcome:?}");
+    assert!(
+        outcome.stderr.contains("gate: remote the client closed the connection; stopped job "),
+        "{outcome:?}"
+    );
+    let stopped = gate_box(&case, "stop", &self::payload(&payload), None);
+    assert_eq!(stopped.code, Some(0), "the command's job is gone: {stopped:?}");
+    assert_eq!(stopped.stdout, "", "nothing is left to stop: {stopped:?}");
+    assert!(
+        Path::new(field(&payload, "Work")).join("new.txt").exists(),
+        "the command changed the tree"
+    );
+    assert!(!has_ref(&payload, "refs/gate-back/k"), "a lost client gets no back commit");
+    wait_until_closed(Path::new(field(&payload, "Lock")));
+}
+
+#[test]
+fn box_run_a_closed_stderr_pipe_stops_the_job_and_exits_255() {
+    let case = Case::new("box_run_closed_stderr");
+    let go = case.folder().join("go");
+    let never = case.folder().join("never");
+    let go_word = shown(&go);
+    let never_word = shown(&never);
+    let script = format!("@echo x>new.txt\r\n@\"{FAKE_TOOL}\" out started wait \"{go_word}\" err x wait \"{never_word}\"\r\n");
+    let payload = box_payload(&case, "k", &[r".\run.cmd"]);
+    snapshot(&case, &payload, &[("a.txt", "a\n"), ("run.cmd", &script)]);
+
+    let running = start_with_closed(Closed::Stderr, box_command(&case, &["box", "run", &self::payload(&payload)]));
+    running.wait_for_stdout("started");
+    let_go(&go);
+
+    let outcome = running.finish();
+
+    assert_eq!(outcome.code, Some(255), "a closed connection exits 255: {outcome:?}");
+    let stopped = gate_box(&case, "stop", &self::payload(&payload), None);
+    assert_eq!(stopped.code, Some(0), "the command's job is gone: {stopped:?}");
+    assert_eq!(stopped.stdout, "", "nothing is left to stop: {stopped:?}");
+    assert!(
+        Path::new(field(&payload, "Work")).join("new.txt").exists(),
+        "the command changed the tree"
+    );
+    assert!(!has_ref(&payload, "refs/gate-back/k"), "a lost client gets no back commit");
+    wait_until_closed(Path::new(field(&payload, "Lock")));
 }
 
 #[test]
