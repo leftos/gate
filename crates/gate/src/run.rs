@@ -97,6 +97,7 @@ pub(crate) fn run(request: &RunRequest, log: &Path, root: &ResolvedRoot, console
     };
     let queue = JournalEvent::Queue {
         log: run.log.path().to_string_lossy().into_owned(),
+        not_routed: None,
     };
     run.journal.write(&queue, console);
     let mut taken = None;

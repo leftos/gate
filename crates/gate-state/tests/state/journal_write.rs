@@ -10,7 +10,8 @@ use std::time::Duration;
 
 use flate2::read::GzDecoder;
 use gate_state::{
-    Held, JOURNAL_CAP_BYTES, JournalEvent, JournalIdentity, JournalLock, JournalNote, LockError, RunFacts, Verdict, append_line, journal_line,
+    Held, JOURNAL_CAP_BYTES, JournalEvent, JournalIdentity, JournalLock, JournalNote, LockError, RemoteTag, RunFacts, Verdict, append_line,
+    journal_line,
 };
 use serde_json::{Value, json};
 
@@ -170,6 +171,181 @@ fn with_common(own: &[&'static str]) -> Vec<&'static str> {
     COMMON.iter().chain(own).copied().collect()
 }
 
+/// The PowerShell gate's journal of routed runs: refused, fallen back and local.
+const REMOTE_FIXTURE: &str = include_str!("fixtures/remote-journal.jsonl");
+const REMOTE_HOST: &str = "builder@build-box";
+const REMOTE_KEY: &str = "repo-ba4a1013";
+const REMOTE_SLOT: &str = r"Local\ops253-gate-remote-slot-0";
+const REMOTE_KEYS: [&str; 3] = ["remote", "host", "key"];
+/// The `release` fields the Rust gate writes and the PowerShell lines of the fixture do not.
+const RUN_FACT_KEYS: [&str; 3] = ["wallSeconds", "adjustedSeconds", "verdict"];
+
+fn tag() -> RemoteTag {
+    RemoteTag {
+        host: REMOTE_HOST.to_owned(),
+        key: REMOTE_KEY.to_owned(),
+    }
+}
+
+/// The fixture's line `number`, counted from 1 as an editor counts.
+fn remote_fixture(number: usize) -> &'static str {
+    REMOTE_FIXTURE.lines().nth(number - 1).expect("the fixture has the line")
+}
+
+/// A journal line's fields after the identity's last, `command`, in the order the line has them.
+fn own_fields(line: &str) -> Vec<(String, Value)> {
+    parsed(line)
+        .as_object()
+        .expect("a journal line is an object")
+        .iter()
+        .skip_while(|(key, _)| *key != "command")
+        .skip(1)
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
+}
+
+fn own_keys(line: &str) -> Vec<String> {
+    own_fields(line).into_iter().map(|(key, _)| key).collect()
+}
+
+#[test]
+fn a_routed_queue_line_ends_with_the_remote_fields_as_the_fixture_does() {
+    let queue = JournalEvent::Queue {
+        log: r"C:\work\repo\.tmp\remote-ok.log".to_owned(),
+        not_routed: None,
+    };
+    let line = journal_line(&identity(), ts(NOW), &queue, Some(&tag()), None);
+
+    assert_eq!(own_keys(&line), ["log", "remote", "host", "key"]);
+    assert_eq!(own_fields(&line), own_fields(remote_fixture(1)));
+}
+
+#[test]
+fn a_queue_kept_local_writes_not_routed_after_the_log() {
+    let queue = JournalEvent::Queue {
+        log: r"C:\work\repo\.tmp\local.log".to_owned(),
+        not_routed: Some("--local".to_owned()),
+    };
+    let line = journal_line(&identity(), ts(NOW), &queue, None, None);
+
+    assert_eq!(own_keys(&line), ["log", "notRouted"]);
+    assert_eq!(parsed(&line)["notRouted"], "--local");
+    let mut fields = own_fields(&line);
+    fields.retain(|(key, _)| key != "notRouted");
+    assert_eq!(fields, own_fields(remote_fixture(37)), "otherwise the fixture's local queue line");
+}
+
+#[test]
+fn a_routed_take_line_puts_the_remote_fields_after_waited_seconds_and_before_abandoned() {
+    let take = |abandoned: Vec<String>| {
+        let event = JournalEvent::Take {
+            slots: vec![REMOTE_SLOT.to_owned()],
+            waited_seconds: 0.135,
+            abandoned,
+        };
+        journal_line(&identity(), ts(NOW), &event, Some(&tag()), None)
+    };
+
+    let line = take(Vec::new());
+    assert_eq!(own_keys(&line), ["slots", "waitedSeconds", "remote", "host", "key"]);
+    assert_eq!(own_fields(&line), own_fields(remote_fixture(2)));
+    assert_eq!(
+        own_keys(&take(vec![REMOTE_SLOT.to_owned()])),
+        ["slots", "waitedSeconds", "remote", "host", "key", "abandoned"]
+    );
+}
+
+#[test]
+fn a_routed_release_line_puts_the_remote_fields_after_the_verdict() {
+    let release = JournalEvent::Release {
+        slots: vec![REMOTE_SLOT.to_owned()],
+        held_seconds: 12.558,
+        status: Some(0),
+        facts: Some(RunFacts {
+            wall_seconds: 12.4,
+            adjusted_seconds: None,
+            verdict: Verdict::Passed,
+        }),
+    };
+    let line = journal_line(&identity(), ts(NOW), &release, Some(&tag()), None);
+
+    assert_eq!(
+        own_keys(&line),
+        [
+            "slots",
+            "heldSeconds",
+            "status",
+            "wallSeconds",
+            "adjustedSeconds",
+            "verdict",
+            "remote",
+            "host",
+            "key"
+        ]
+    );
+    let mut fields = own_fields(&line);
+    fields.retain(|(key, _)| !RUN_FACT_KEYS.contains(&key.as_str()));
+    assert_eq!(
+        fields,
+        own_fields(remote_fixture(7)),
+        "the fixture's line has no run facts; the rest is the same"
+    );
+}
+
+#[test]
+fn a_routed_abandon_line_puts_the_remote_fields_after_waited_seconds() {
+    let line = journal_line(&identity(), ts(NOW), &JournalEvent::Abandon { waited_seconds: 1.7 }, Some(&tag()), None);
+
+    assert_eq!(own_keys(&line), ["waitedSeconds", "remote", "host", "key"]);
+    let value = parsed(&line);
+    assert_eq!(
+        (&value["waitedSeconds"], &value["remote"], &value["host"], &value["key"]),
+        (&json!(1.7), &json!(true), &json!(REMOTE_HOST), &json!(REMOTE_KEY))
+    );
+}
+
+#[test]
+fn a_fallback_line_is_the_one_the_fixture_holds() {
+    let fallback = JournalEvent::Fallback { reason: "full".to_owned() };
+    let line = journal_line(&identity(), ts(NOW), &fallback, Some(&tag()), None);
+
+    assert_eq!(parsed(&line)["event"], "fallback");
+    assert_eq!(own_keys(&line), ["reason", "remote", "host", "key"]);
+    assert_eq!(own_fields(&line), own_fields(remote_fixture(4)));
+    let under_abandoned_lock = journal_line(&identity(), ts(NOW), &fallback, Some(&tag()), Some(LOCK_NAME));
+    assert_eq!(own_keys(&under_abandoned_lock), ["reason", "remote", "host", "key", "abandoned"]);
+}
+
+#[test]
+fn a_line_without_a_remote_tag_has_no_remote_field() {
+    let events = [
+        JournalEvent::Queue {
+            log: "x".to_owned(),
+            not_routed: None,
+        },
+        JournalEvent::Take {
+            slots: Vec::new(),
+            waited_seconds: 0.5,
+            abandoned: Vec::new(),
+        },
+        release(None),
+        JournalEvent::Abandon { waited_seconds: 1.7 },
+        JournalEvent::Fallback { reason: "busy".to_owned() },
+    ];
+    for event in &events {
+        let line = journal_line(&identity(), ts(NOW), event, None, None);
+        assert!(own_keys(&line).iter().all(|key| !REMOTE_KEYS.contains(&key.as_str())), "{line}");
+    }
+
+    let local_take = JournalEvent::Take {
+        slots: vec![r"Local\ops253-gate-slot-0".to_owned()],
+        waited_seconds: 3.875,
+        abandoned: Vec::new(),
+    };
+    let line = journal_line(&identity(), ts(NOW), &local_take, None, None);
+    assert_eq!(own_fields(&line), own_fields(remote_fixture(5)), "the local take after a fallback");
+}
+
 #[test]
 fn line_starts_with_v_then_the_common_keys_in_order() {
     let time = ts("2026-10-03T05:04:39.1209178Z");
@@ -178,7 +354,9 @@ fn line_starts_with_v_then_the_common_keys_in_order() {
         time,
         &JournalEvent::Queue {
             log: r"C:\work\repo\.tmp\f1.log".to_owned(),
+            not_routed: None,
         },
+        None,
         None,
     );
     let take = journal_line(
@@ -190,13 +368,14 @@ fn line_starts_with_v_then_the_common_keys_in_order() {
             abandoned: Vec::new(),
         },
         None,
+        None,
     );
     let facts = RunFacts {
         wall_seconds: 0.1,
         adjusted_seconds: Some(0.2),
         verdict: Verdict::Passed,
     };
-    let released = journal_line(&identity(), time, &release(Some(facts)), None);
+    let released = journal_line(&identity(), time, &release(Some(facts)), None, None);
 
     assert!(queue.starts_with(r#"{"v":1,"time":"#), "{queue}");
     assert_eq!(keys(&parsed(&queue)), with_common(&["log"]));
@@ -228,7 +407,13 @@ fn abandon_line_is_the_one_the_reader_fixture_holds() {
         cwd: r"C:\work\repo".to_owned(),
         command: "cmd /c exit 0".to_owned(),
     };
-    let line = journal_line(&gate, ts("2026-10-03T05:04:46Z"), &JournalEvent::Abandon { waited_seconds: 1.7 }, None);
+    let line = journal_line(
+        &gate,
+        ts("2026-10-03T05:04:46Z"),
+        &JournalEvent::Abandon { waited_seconds: 1.7 },
+        None,
+        None,
+    );
 
     assert_eq!(keys(&parsed(&line)), with_common(&["waitedSeconds"]));
     assert_eq!(
@@ -246,7 +431,16 @@ fn abandon_line_is_the_one_the_reader_fixture_holds() {
 fn time_has_seven_fractional_digits_and_z() {
     let mut gate = identity();
     gate.process_start = ts("2026-10-03T05:04:38Z");
-    let line = journal_line(&gate, ts("2026-10-03T05:04:39.12Z"), &JournalEvent::Queue { log: "x".to_owned() }, None);
+    let line = journal_line(
+        &gate,
+        ts("2026-10-03T05:04:39.12Z"),
+        &JournalEvent::Queue {
+            log: "x".to_owned(),
+            not_routed: None,
+        },
+        None,
+        None,
+    );
     let value = parsed(&line);
 
     assert_eq!(value["time"], "2026-10-03T05:04:39.1200000Z");
@@ -255,7 +449,11 @@ fn time_has_seven_fractional_digits_and_z() {
     let exact = journal_line(
         &identity(),
         ts("2026-10-03T05:04:39.1209178Z"),
-        &JournalEvent::Queue { log: "x".to_owned() },
+        &JournalEvent::Queue {
+            log: "x".to_owned(),
+            not_routed: None,
+        },
+        None,
         None,
     );
     assert_eq!(parsed(&exact)["time"], "2026-10-03T05:04:39.1209178Z");
@@ -268,7 +466,7 @@ fn release_without_run_facts_writes_nulls_and_unknown() {
     if let JournalEvent::Release { status, .. } = &mut event {
         *status = None;
     }
-    let line = journal_line(&identity(), ts(NOW), &event, None);
+    let line = journal_line(&identity(), ts(NOW), &event, None, None);
 
     assert!(
         line.ends_with(r#""heldSeconds":0.105,"status":null,"wallSeconds":null,"adjustedSeconds":null,"verdict":"unknown"}"#),
@@ -287,6 +485,7 @@ fn seconds_round_to_three_decimals() {
             abandoned: Vec::new(),
         },
         None,
+        None,
     );
     let released = journal_line(
         &identity(),
@@ -301,6 +500,7 @@ fn seconds_round_to_three_decimals() {
                 verdict: Verdict::Failed,
             }),
         },
+        None,
         None,
     );
 
@@ -322,6 +522,7 @@ fn seconds_round_a_midpoint_to_even_as_dotnet_does() {
                 waited_seconds: seconds,
                 abandoned: Vec::new(),
             },
+            None,
             None,
         );
         parsed(&line)["waitedSeconds"].clone()
@@ -473,6 +674,7 @@ fn a_take_with_abandoned_slots_lists_them_after_waited_seconds() {
             abandoned: vec![r"Local\gate-1a2b3c4d-slot-0".to_owned()],
         },
         None,
+        None,
     );
 
     assert!(
@@ -492,6 +694,7 @@ fn a_take_with_no_abandoned_slots_has_no_abandoned_key() {
             abandoned: Vec::new(),
         },
         None,
+        None,
     );
 
     assert!(
@@ -506,7 +709,11 @@ fn journal_line_lists_the_lock_on_a_queue_line() {
     let line = journal_line(
         &identity(),
         ts(NOW),
-        &JournalEvent::Queue { log: "x".to_owned() },
+        &JournalEvent::Queue {
+            log: "x".to_owned(),
+            not_routed: None,
+        },
+        None,
         Some(r"Local\gate-test-journal"),
     );
 
@@ -523,6 +730,7 @@ fn journal_line_puts_the_lock_after_the_slots_on_a_take() {
             waited_seconds: 0.5,
             abandoned: vec![r"Local\gate-1a2b3c4d-slot-0".to_owned()],
         },
+        None,
         Some(r"Local\gate-test-journal"),
     );
 
@@ -539,7 +747,18 @@ fn a_line_appended_under_an_abandoned_journal_lock_lists_the_lock() {
     let appended = append_line(
         &root,
         &FakeLock::Abandoned,
-        |abandoned| journal_line(&identity(), ts(NOW), &JournalEvent::Queue { log: "x".to_owned() }, abandoned),
+        |abandoned| {
+            journal_line(
+                &identity(),
+                ts(NOW),
+                &JournalEvent::Queue {
+                    log: "x".to_owned(),
+                    not_routed: None,
+                },
+                None,
+                abandoned,
+            )
+        },
         ts(NOW),
     );
 
@@ -560,6 +779,7 @@ fn an_abandoned_lock_on_a_take_with_abandoned_slots_extends_its_list() {
                 waited_seconds: 0.5,
                 abandoned: vec![r"Local\gate-1a2b3c4d-slot-0".to_owned()],
             },
+            None,
             abandoned,
         )
     };

@@ -37,6 +37,15 @@ impl Console {
         self.notes.push(line.to_owned());
     }
 
+    /// Gathers `line` as a note for the log without saying it on stdout or stderr.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "no caller outside tests until a routed run's refused attempt gathers its lines")
+    )]
+    pub(crate) fn note(&mut self, line: &str) {
+        self.notes.push(line.to_owned());
+    }
+
     /// The notes gathered since the last take, in the order they were said.
     pub(crate) fn take_notes(&mut self) -> Vec<String> {
         std::mem::take(&mut self.notes)
@@ -52,4 +61,20 @@ impl Console {
 fn write_line(stream: &mut impl Write, line: &str) {
     // A write that fails leaves no stream to say so on; the status still carries the gate's answer.
     let _ = writeln!(stream, "{line}").and_then(|()| stream.flush());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Console;
+
+    #[test]
+    fn a_note_is_gathered_in_order_with_the_lines_said() {
+        let mut console = Console::new();
+        console.err("gate: said first");
+        console.note("gate: noted, not said");
+        console.err("gate: said last");
+
+        assert_eq!(console.take_notes(), ["gate: said first", "gate: noted, not said", "gate: said last"]);
+        assert!(console.take_notes().is_empty(), "a take empties the notes");
+    }
 }

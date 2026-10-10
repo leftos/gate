@@ -26,7 +26,7 @@ pub use counts::{ApplyError, WriteError, apply_slot_count, read_slot_count_setti
 pub use journal::{CommandSummary, History, HistoryRun, JournalCache, RunState, normalize_command};
 pub use journal_writer::{
     Appended, Held, JOURNAL_CAP_BYTES, JOURNAL_FILE, JOURNAL_WAIT, JournalEvent, JournalIdentity, JournalLock, JournalNote, LockError,
-    ROLLED_JOURNAL_FILE, RunFacts, append_line, journal_line,
+    ROLLED_JOURNAL_FILE, RemoteTag, RunFacts, append_line, journal_line,
 };
 pub use model::{
     CRITICAL_LIGHT_RESERVE, CriticalState, CwdReader, DashboardState, MutexProbe, ParseError, PoolState, QueueTicket, RemotePool, SlotCount,

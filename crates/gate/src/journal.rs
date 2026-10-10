@@ -64,7 +64,7 @@ impl RunJournal {
         let appended = match &self.writer {
             Ok((identity, mutex)) => {
                 let now = Timestamp::now();
-                append_line(&self.root, mutex, |abandoned| journal_line(identity, now, event, abandoned), now)
+                append_line(&self.root, mutex, |abandoned| journal_line(identity, now, event, None, abandoned), now)
             }
             Err(reason) => {
                 let note = JournalNote::NotWritten {

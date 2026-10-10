@@ -82,6 +82,9 @@ pub enum JournalEvent {
     Queue {
         /// The log's full path.
         log: String,
+        /// Why a gate that could have been routed was kept on this machine, such as `--local`; `None` writes no
+        /// `notRouted` field.
+        not_routed: Option<String>,
     },
     /// The gate took its slot.
     Take {
@@ -108,6 +111,20 @@ pub enum JournalEvent {
         /// How long the gate waited, in seconds.
         waited_seconds: f64,
     },
+    /// The gate gave up its remote attempt and runs the command on this machine.
+    Fallback {
+        /// Why, such as `full`, `busy` or `unreachable`.
+        reason: String,
+    },
+}
+
+/// The remote fields of a routed run's lines up to its fallback: `remote: true`, `host` and `key`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemoteTag {
+    /// The build box the run was routed to, as `user@host`.
+    pub host: String,
+    /// The run's key on the build box.
+    pub key: String,
 }
 
 /// What a `release` line says of the run.
@@ -175,11 +192,20 @@ impl fmt::Display for JournalNote {
 /// fractional digits and seconds rounded to three decimals. A `release` without facts writes null times and the verdict
 /// `unknown`.
 ///
+/// `remote` is the tag of a routed run up to its fallback: when it is `Some`, the event's own fields are followed by
+/// `remote: true`, `host` and `key`; when it is `None`, the line has none of the three.
+///
 /// `lock_abandoned` is the journal lock's name when it was taken abandoned. When it is `Some`, the line carries
 /// `abandoned` as its last field: a `take`'s own names followed by the lock's, any other event's just the lock's.
 /// Without it, only a `take` that took a slot abandoned writes the field.
 #[must_use]
-pub fn journal_line(identity: &JournalIdentity, time: Timestamp, event: &JournalEvent, lock_abandoned: Option<&str>) -> String {
+pub fn journal_line(
+    identity: &JournalIdentity,
+    time: Timestamp,
+    event: &JournalEvent,
+    remote: Option<&RemoteTag>,
+    lock_abandoned: Option<&str>,
+) -> String {
     let mut line = Map::new();
     line.insert("v".to_owned(), Value::from(VERSION));
     line.insert("time".to_owned(), Value::from(iso_utc(time)));
@@ -189,9 +215,31 @@ pub fn journal_line(identity: &JournalIdentity, time: Timestamp, event: &Journal
     line.insert("kind".to_owned(), Value::from(identity.kind.as_str()));
     line.insert("cwd".to_owned(), Value::from(identity.cwd.as_str()));
     line.insert("command".to_owned(), Value::from(identity.command.as_str()));
+    insert_own_fields(&mut line, event);
+    if let Some(tag) = remote {
+        line.insert("remote".to_owned(), Value::Bool(true));
+        line.insert("host".to_owned(), Value::from(tag.host.as_str()));
+        line.insert("key".to_owned(), Value::from(tag.key.as_str()));
+    }
+    let mut abandoned: Vec<Value> = match event {
+        JournalEvent::Take { abandoned, .. } => abandoned.iter().map(|name| Value::from(name.as_str())).collect(),
+        _ => Vec::new(),
+    };
+    abandoned.extend(lock_abandoned.map(Value::from));
+    if !abandoned.is_empty() {
+        line.insert("abandoned".to_owned(), Value::Array(abandoned));
+    }
+    Value::Object(line).to_string()
+}
+
+/// Inserts `event`'s own fields after the identity's.
+fn insert_own_fields(line: &mut Map<String, Value>, event: &JournalEvent) {
     match event {
-        JournalEvent::Queue { log } => {
+        JournalEvent::Queue { log, not_routed } => {
             line.insert("log".to_owned(), Value::from(log.as_str()));
+            if let Some(not_routed) = not_routed {
+                line.insert("notRouted".to_owned(), Value::from(not_routed.as_str()));
+            }
         }
         JournalEvent::Take { slots, waited_seconds, .. } => {
             line.insert("slots".to_owned(), Value::from(slots.clone()));
@@ -215,16 +263,10 @@ pub fn journal_line(identity: &JournalIdentity, time: Timestamp, event: &Journal
         JournalEvent::Abandon { waited_seconds } => {
             line.insert("waitedSeconds".to_owned(), seconds(*waited_seconds));
         }
+        JournalEvent::Fallback { reason } => {
+            line.insert("reason".to_owned(), Value::from(reason.as_str()));
+        }
     }
-    let mut abandoned: Vec<Value> = match event {
-        JournalEvent::Take { abandoned, .. } => abandoned.iter().map(|name| Value::from(name.as_str())).collect(),
-        _ => Vec::new(),
-    };
-    abandoned.extend(lock_abandoned.map(Value::from));
-    if !abandoned.is_empty() {
-        line.insert("abandoned".to_owned(), Value::Array(abandoned));
-    }
-    Value::Object(line).to_string()
 }
 
 fn event_name(event: &JournalEvent) -> &'static str {
@@ -233,6 +275,7 @@ fn event_name(event: &JournalEvent) -> &'static str {
         JournalEvent::Take { .. } => "take",
         JournalEvent::Release { .. } => "release",
         JournalEvent::Abandon { .. } => "abandon",
+        JournalEvent::Fallback { .. } => "fallback",
     }
 }
 
