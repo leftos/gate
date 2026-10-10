@@ -9,4 +9,5 @@ mod harness;
 mod hold;
 mod journal;
 mod request;
+mod slots;
 mod support;
