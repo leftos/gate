@@ -116,6 +116,17 @@ pub enum JournalEvent {
         /// Why.
         reason: FallbackReason,
     },
+    /// The gate runs under the slot of a parent gate that covers it, taking no slot of its own.
+    Covered {
+        /// The parent gate's process id.
+        parent_pid: u32,
+    },
+    /// The gate runs on the slot of a parent gate that lends it while a critical request drains, taking no slot of its
+    /// own.
+    Parent {
+        /// The parent gate's process id.
+        parent_pid: u32,
+    },
 }
 
 /// Why a routed run gave up its remote attempt: the remote pool stayed full, the builder refused the run, or the
@@ -305,6 +316,9 @@ fn insert_own_fields(line: &mut Map<String, Value>, event: &JournalEvent) {
         JournalEvent::Fallback { reason } => {
             line.insert("reason".to_owned(), Value::from(reason.as_str()));
         }
+        JournalEvent::Covered { parent_pid } | JournalEvent::Parent { parent_pid } => {
+            line.insert("parentPid".to_owned(), Value::from(*parent_pid));
+        }
     }
 }
 
@@ -315,6 +329,8 @@ fn event_name(event: &JournalEvent) -> &'static str {
         JournalEvent::Release { .. } => "release",
         JournalEvent::Abandon { .. } => "abandon",
         JournalEvent::Fallback { .. } => "fallback",
+        JournalEvent::Covered { .. } => "covered",
+        JournalEvent::Parent { .. } => "parent",
     }
 }
 

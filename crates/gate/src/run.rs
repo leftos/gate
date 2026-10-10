@@ -1,7 +1,8 @@
-//! `gate run`: a log inside the state root refused, the program found and the words written into its command line, a
-//! batch word refused, the log's mutex taken so no other gate writes the same log, the log readied,
-//! a slot queued for and taken, the command started in its job with its environment and priority and waited for, the
-//! log completed, the failure markers scanned, the tail and the verdict line said, and the slot released.
+//! `gate run`: a log inside the state root refused, the parent gate's slot marker read and a critical gate under a heavy
+//! or light one refused, the program found and the words written into its command line, a batch word refused, the log's
+//! mutex taken so no other gate writes the same log, the log readied, a slot queued for and taken unless a parent's slot
+//! covers the gate, the command started in its job with its environment and priority and waited for, the log completed,
+//! the failure markers scanned, the tail and the verdict line said, and the slot released.
 
 use std::ffi::OsString;
 use std::fs::OpenOptions;
@@ -23,6 +24,7 @@ use crate::console::Console;
 use crate::environment::{self, Variables};
 use crate::journal::RunJournal;
 use crate::log::Log;
+use crate::nesting::Nesting;
 use crate::remote::{self, NoClient, RemoteCall, RemoteClient, RemoteOutcome};
 use crate::resolve::{Environment, ResolvedRoot};
 use crate::route;
@@ -51,22 +53,20 @@ const STOP_WAIT: Duration = Duration::from_secs(5);
 /// The status is the command's own whole 32-bit code, 1 for a failure marker in its log or a failure of the gate after
 /// it started, 124 for a command killed as stalled, timed out or past the backstop, 127 when it could not be started,
 /// 0xC000013A for a Ctrl+C in the queue, before the command started, or with the command still running 5 s after it,
-/// or 2 for a log inside the state root or a batch word refused before anything was queued.
+/// or 2 for a log inside the state root, a critical gate under a heavy or light parent's slot or a batch word refused
+/// before anything was queued.
 pub(crate) fn run(request: &RunRequest, log: &Path, root: &ResolvedRoot, environment: &Environment, console: &mut Console) -> u32 {
-    if log_in_state_root(log, &root.path) {
-        console.err(&format!(
-            "gate: the log {} is inside the gate's state folder {}",
-            log.display(),
-            root.path.display()
-        ));
-        return u32::from(USAGE_STATUS);
-    }
+    let nesting = match admitted(request, log, root, environment, console) {
+        Ok(nesting) => nesting,
+        Err(status) => return status,
+    };
     let gate = ThisGate::read(request);
     let log = Log::new(log);
     let at = Where {
         root,
         gate: &gate,
         log: &log,
+        nesting: &nesting,
     };
     let (plan, client) = match ready(request, &at, console) {
         Ok(ready) => ready,
@@ -101,6 +101,7 @@ pub(crate) fn run(request: &RunRequest, log: &Path, root: &ResolvedRoot, environ
     let mut run = Run {
         request,
         root,
+        nesting: &nesting,
         survey: Survey::new(&gate),
         journal: RunJournal::open(root, &gate),
         gate,
@@ -131,6 +132,32 @@ pub(crate) fn run(request: &RunRequest, log: &Path, root: &ResolvedRoot, environ
         console.err(&format!("gate: cannot write to {}: {error}", run.log.path().display()));
     }
     status
+}
+
+/// The nesting `request` runs under, its line said, or the status of a run refused before anything is taken or
+/// written: a log inside the state root, or a critical gate under a heavy or light parent's slot, which leaves an
+/// earlier log in place. A gate a parent's slot does not cover says so only as it goes on to take a local slot.
+fn admitted(request: &RunRequest, log: &Path, root: &ResolvedRoot, environment: &Environment, console: &mut Console) -> Result<Nesting, u32> {
+    if log_in_state_root(log, &root.path) {
+        console.err(&format!(
+            "gate: the log {} is inside the gate's state folder {}",
+            log.display(),
+            root.path.display()
+        ));
+        return Err(u32::from(USAGE_STATUS));
+    }
+    let nesting = Nesting::read(environment, request.slot, &root.root);
+    let said = match &nesting {
+        Nesting::Own | Nesting::Under(_) => None,
+        Nesting::Malformed(_) | Nesting::Ended { .. } | Nesting::Covered(_) | Nesting::Refused(_) => nesting.line(request.slot, request.spelling),
+    };
+    if let Some(line) = said {
+        console.err(&line);
+    }
+    if matches!(nesting, Nesting::Refused(_)) {
+        return Err(u32::from(USAGE_STATUS));
+    }
+    Ok(nesting)
 }
 
 /// The run's plan and its remote client, or the failure that stops it before its log is taken: the command as given,
@@ -218,11 +245,12 @@ impl NotRun {
     }
 }
 
-/// Where a planned command logs, under which state root, and which gate runs it.
+/// Where a planned command logs, under which state root, which gate runs it, and under which parent's slot.
 struct Where<'a> {
     root: &'a ResolvedRoot,
     gate: &'a ThisGate,
     log: &'a Log,
+    nesting: &'a Nesting,
 }
 
 /// The command as it will be started, or the start failure found before any call.
@@ -252,9 +280,14 @@ impl Plan {
     ///
     /// A refused batch word (status 2), or a working folder or environment the gate cannot read or pass on (status 1).
     fn prepare(request: &RunRequest, words: &[OsString], at: &Where<'_>, console: &mut Console) -> Result<Plan, NotRun> {
-        let Where { root, gate, log } = *at;
+        let Where { root, gate, log, nesting } = *at;
         let folder = std::env::current_dir().map_err(|error| NotRun::failed(format!("gate: cannot read the working directory: {error}")))?;
-        let variables = Variables::for_command(root, &environment::slot_marker(request.slot.as_str(), gate, &root.root));
+        // A covered gate hands on the marker of the parent whose slot its command runs under.
+        let marker = match nesting.covering() {
+            Some(parent) => parent.marker.clone(),
+            None => environment::slot_marker(request.slot.as_str(), gate, &root.root),
+        };
+        let variables = Variables::for_command(root, &marker);
         let environment = variables
             .block()
             .map_err(|error| NotRun::failed(format!("gate: cannot build the command's environment: {error}")))?;
@@ -286,7 +319,7 @@ impl Plan {
                 environment,
                 log: log.path().to_owned(),
                 err_log: log.err_path().to_owned(),
-                priority: priority(request.slot, console),
+                priority: priority(nesting.runs_as(request.slot), console),
             }),
         };
         Ok(Plan {
@@ -339,8 +372,8 @@ pub(crate) fn written(program: &Path, rest: &[OsString], variables: &Variables) 
     }
 }
 
-/// The command's priority class: high for a critical gate; otherwise below normal, unless the gate's own class is
-/// already below normal or idle, which the command then inherits.
+/// The priority class of a command run as `slot`: high for a critical gate and a gate under a critical parent's slot;
+/// otherwise below normal, unless the gate's own class is already below normal or idle, which the command then inherits.
 fn priority(slot: Slot, console: &mut Console) -> Option<PriorityClass> {
     if slot == Slot::Critical {
         return Some(PriorityClass::High);
@@ -361,6 +394,8 @@ fn priority(slot: Slot, console: &mut Console) -> Option<PriorityClass> {
 struct Run<'a> {
     request: &'a RunRequest,
     root: &'a ResolvedRoot,
+    /// The parent gate's slot the run is under, read once before it started.
+    nesting: &'a Nesting,
     gate: ThisGate,
     log: Log,
     journal: RunJournal,
@@ -432,9 +467,11 @@ struct Ended {
 
 impl Run<'_> {
     /// Decides where the command runs, then journals the queue: with `notRouted` for a heavy gate its caller kept here
-    /// with `--local`, with the remote tag for a routed one. The route.
+    /// with `--local`, with the remote tag for a routed one. A gate a parent's slot covers runs here, journalling
+    /// `covered` with the parent's pid in place of the queue. The route.
     fn queue(&mut self, environment: &Environment, console: &mut Console) -> Route {
-        let route = route::route(self.request, environment, console);
+        let covering = self.nesting.covering().map(|parent| parent.pid);
+        let route = route::route(self.request, environment, covering.is_some(), console);
         self.tag = match &route {
             Route::Routed(remote) => Some(RemoteTag {
                 host: remote.host.clone(),
@@ -442,16 +479,21 @@ impl Run<'_> {
             }),
             Route::Local { .. } => None,
         };
-        let queue = JournalEvent::Queue {
-            log: self.log.path().to_string_lossy().into_owned(),
-            not_routed: route::not_routed(&route),
+        let event = match covering {
+            Some(parent_pid) => JournalEvent::Covered { parent_pid },
+            None => JournalEvent::Queue {
+                log: self.log.path().to_string_lossy().into_owned(),
+                not_routed: route::not_routed(&route),
+            },
         };
-        self.journal.write(&queue, self.tag.as_ref(), console);
+        self.journal.write(&event, self.tag.as_ref(), console);
         route
     }
 
     /// Runs the command where `route` sends it: on the builder, and here after a fallback; or here. The slot it takes
-    /// goes into `hold`. How the run ended; `None` when a Ctrl+C ended a wait for a slot.
+    /// goes into `hold`; a gate a parent's slot covers takes none, and one whose parent's slot does not cover it says so
+    /// as it goes on to take a local slot, before any wait line. How the run ended; `None` when a Ctrl+C ended a wait
+    /// for a slot.
     fn through(&mut self, route: &Route, plan: Plan, hold: &mut Hold, console: &mut Console) -> Option<Ended> {
         let plan = match route {
             Route::Local { .. } => plan,
@@ -464,6 +506,12 @@ impl Run<'_> {
                 },
             },
         };
+        if self.nesting.covering().is_some() {
+            return Some(self.command(plan, console));
+        }
+        if let Nesting::Under(parent) = self.nesting {
+            console.err(&parent.uncovered_line(self.request.slot));
+        }
         match self.take(Pool::of(self.request.slot), &mut hold.taken, console) {
             Taking::Took(took) => {
                 hold.took = took;
@@ -566,6 +614,7 @@ impl Run<'_> {
             root: self.root,
             gate: &self.gate,
             log: &self.log,
+            nesting: self.nesting,
         };
         Plan::prepare(self.request, &words, &at, console).map_err(|NotRun { status, line }| {
             console.err(&line);
@@ -689,8 +738,12 @@ impl Run<'_> {
     }
 
     /// Deletes the claim, journals the release with how the run `ended` (status and verdict unknown when it did not
-    /// end on its own path) and lets the slot go, then wakes the waiters.
+    /// end on its own path) and lets the slot go, then wakes the waiters. A gate a parent's slot covers took no slot and
+    /// journals no release.
     fn release(&mut self, taken: Option<Taken>, took: Instant, ended: Option<&Ended>, console: &mut Console) {
+        if self.nesting.covering().is_some() {
+            return;
+        }
         let held_seconds = took.elapsed().as_secs_f64();
         let slots = match &taken {
             Some(taken) => {
@@ -773,6 +826,7 @@ impl Run<'_> {
             running,
             log: &self.log,
             interrupt: self.host.interrupt,
+            runs_as: self.nesting.runs_as(self.request.slot),
         };
         let mut watcher = Watcher::begin(self.request, watching, start, self.host.processors)
             .map_err(|error| format!("cannot begin to watch the command: {error}"))?;

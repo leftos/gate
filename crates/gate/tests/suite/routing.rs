@@ -11,6 +11,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use gate_router::{DROPPED_NO_BUILD_LINE, NO_OUTPUTS_LINE, repo_name};
 use serde_json::{Value, json};
 
+use crate::nesting::{marked, test_marker};
+
 use crate::support::{
     Case, FAKE_TOOL, Running, assert_in_order, copy_tool, events, finish, git, git_init, heavy_words, release, run_words, shown,
     wait_for_journal_line, wait_until, write_counts, write_remote_json,
@@ -439,6 +441,23 @@ fn a_routed_run_goes_to_the_client_and_passes_its_output_and_status_through() {
     assert!(slot.ends_with("remote-slot-0"), "{slot}");
     assert_eq!((&events[2]["verdict"], &events[2]["adjustedSeconds"]), (&json!("passed"), &Value::Null));
     assert!(!remote_claim(&case).exists(), "the remote claim is gone after the release");
+}
+
+#[test]
+fn a_heavy_gate_routed_from_under_a_light_parent_does_not_say_the_parent_does_not_cover_it() {
+    let case = routed_case("routing-under-light");
+    let steps = shown(&stub(&case, &["status 0"]));
+    let words = routed_words("out.log", &steps, &[], &[r".\tool.exe", "exit", "0"]);
+    let outcome = finish(marked(&case, &words, &test_marker(&case, "light")));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(
+        !outcome.stderr.contains("does not cover"),
+        "a routed gate takes no local slot: {outcome:?}"
+    );
+    let events = events(&case);
+    assert_eq!(names(&events), ["queue", "take", "release"], "{events:#?}");
+    assert!(events.iter().all(has_remote_tag), "{events:#?}");
 }
 
 #[test]

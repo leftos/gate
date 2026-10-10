@@ -168,6 +168,35 @@ pub(crate) struct Taken {
     pub abandoned: bool,
 }
 
+/// Whether a gate a ticket, a claim or a slot marker names still runs, as its pid's start tells.
+#[derive(Debug)]
+pub(crate) enum Liveness {
+    /// A process of the pid runs, started when the gate did.
+    Live,
+    /// No process of the pid runs since the gate's start, or the pid is another user's process.
+    Gone,
+    /// The pid's start cannot be read, for this reason.
+    Unknown(io::Error),
+}
+
+/// The liveness of the gate `pid` started at `start_ms` in Unix epoch milliseconds, its pid's start read on this machine.
+pub(crate) fn gate_liveness(pid: u32, start_ms: u64) -> Liveness {
+    liveness(pid, start_ms, gate_win32::process_start_of)
+}
+
+/// The liveness of the gate `pid` started at `start_ms`, its pid's start read through `start_of`, which gives `None` for
+/// a pid no process runs as.
+fn liveness(pid: u32, start_ms: u64, start_of: impl FnOnce(u32) -> io::Result<Option<Timestamp>>) -> Liveness {
+    match start_of(pid) {
+        Ok(Some(start)) if epoch_ms(start) == start_ms => Liveness::Live,
+        Ok(_) => Liveness::Gone,
+        // A gate of this user, elevated or not, opens with limited query rights. A pid that does not is another
+        // user's process, such as a service that reused a dead gate's pid, so the gate it names is gone.
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => Liveness::Gone,
+        Err(error) => Liveness::Unknown(error),
+    }
+}
+
 /// What this gate reads of the other gates under its state root: their tickets and claims, judged live or dead, with
 /// each problem in reading them said once a wait for each name or path.
 pub(crate) struct Survey {
@@ -199,13 +228,10 @@ impl Survey {
         if (pid, start_ms) == self.own {
             return true;
         }
-        match gate_win32::process_start_of(pid) {
-            Ok(Some(start)) => epoch_ms(start) == start_ms,
-            Ok(None) => false,
-            // A gate of this user, elevated or not, opens with limited query rights. A pid that does not is another
-            // user's process, such as a service that reused a dead gate's pid, so the gate it names is gone.
-            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => false,
-            Err(error) => {
+        match gate_liveness(pid, start_ms) {
+            Liveness::Live => true,
+            Liveness::Gone => false,
+            Liveness::Unknown(error) => {
                 self.say_once("cannot check the gate of", &path.display().to_string(), error, console);
                 true
             }
@@ -387,13 +413,35 @@ pub(crate) fn delete(path: &Path) -> io::Result<()> {
 }
 
 #[cfg(test)]
+#[expect(clippy::expect_used, reason = "a test whose fixed times cannot be built must fail loudly")]
 mod tests {
     use std::ffi::OsString;
+    use std::io;
 
     use gate_args::Invocation;
     use gate_state::normalize_command;
+    use jiff::Timestamp;
 
-    use super::ThisGate;
+    use super::{Liveness, ThisGate, liveness};
+
+    #[test]
+    fn a_gate_is_live_only_while_its_pid_runs_since_its_start_and_unknown_when_its_start_cannot_be_read() {
+        let start = Timestamp::from_millisecond(1_759_439_760_571).expect("a time after the epoch");
+        let start_ms = 1_759_439_760_571;
+        let of = |answer: io::Result<Option<Timestamp>>| liveness(7, start_ms, move |_| answer);
+
+        assert!(matches!(of(Ok(Some(start))), Liveness::Live), "running since its start");
+        let later = Timestamp::from_millisecond(1_759_439_760_572).expect("a time after the epoch");
+        assert!(matches!(of(Ok(Some(later))), Liveness::Gone), "its pid reused by a later process");
+        assert!(matches!(of(Ok(None)), Liveness::Gone), "no process of its pid");
+        let denied = io::Error::from(io::ErrorKind::PermissionDenied);
+        assert!(matches!(of(Err(denied)), Liveness::Gone), "another user's process on its pid");
+        let failed = of(Err(io::Error::other("the system failed")));
+        assert!(
+            matches!(&failed, Liveness::Unknown(error) if error.to_string() == "the system failed"),
+            "{failed:?}"
+        );
+    }
 
     /// What the PowerShell gate's `Format-CommandText` writes for the command below.
     const POWERSHELL: &str = "cargo test --manifest-path X:/dev/ops.wt/ops-61/Cargo.toml -- --exact \"a b\" \"a\u{a0}b\" .tmp/out.txt";

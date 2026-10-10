@@ -51,13 +51,13 @@ static NEXT_OUTPUT: AtomicU32 = AtomicU32::new(0);
 
 /// Decides where `request`'s command runs and says the decision's lines, on stderr and in the log: why a command runs
 /// here when there is a reason to say, or the lines of a routed run. A command that would route but has a word that is
-/// not valid Unicode runs here, saying so.
-pub(crate) fn route(request: &RunRequest, environment: &Environment, console: &mut Console) -> Route {
+/// not valid Unicode runs here, saying so. A gate under a `covering_parent`'s slot runs here, saying nothing.
+pub(crate) fn route(request: &RunRequest, environment: &Environment, covering_parent: bool, console: &mut Console) -> Route {
     let words: Vec<String> = request.command.iter().map(|word| word.to_string_lossy().into_owned()).collect();
     let unicode = request.command.iter().all(|word| word.to_str().is_some());
     let inputs = Inputs {
         slot: slot(request.slot),
-        covering_parent: false,
+        covering_parent,
         local: request.local,
         git_hook: environment.git_index_file.as_deref().is_some_and(|value| !value.is_empty()),
         words: &words,

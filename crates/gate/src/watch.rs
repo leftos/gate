@@ -106,6 +106,9 @@ pub(crate) struct Watching<'a> {
     pub running: &'a Running,
     pub log: &'a Log,
     pub interrupt: Option<Interrupt>,
+    /// The slot kind the command runs as, whose machine the watch measures it on: critical under a critical parent's
+    /// slot, else the gate's own.
+    pub runs_as: Slot,
 }
 
 impl<'a> Watcher<'a> {
@@ -136,7 +139,7 @@ impl<'a> Watcher<'a> {
             period: request.test_seams.sample_ms.map_or(SAMPLE_PERIOD, Duration::from_millis),
             interrupt: run.interrupt,
             spoken: spoken.join(" "),
-            watch: Watch::new(config, machine(request.slot, processors), system, job_cpu, None),
+            watch: Watch::new(config, machine(run.runs_as, processors), system, job_cpu, None),
             history: SampleHistory::default(),
             servers: Servers::new(),
             under: request.test_seams.servers_under.as_deref().map(absolute),

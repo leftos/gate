@@ -1,6 +1,6 @@
 //! The compatibility layer: the PowerShell gate's argument form.
 
-use gate_args::{Invocation, StopRequest, parse};
+use gate_args::{Invocation, RunRequest, Spelling, StopRequest, parse};
 
 use crate::support::{RUN, invocation, os, problems, refs, run_request, stop_request, with};
 
@@ -11,15 +11,23 @@ fn compat(extra: &[&str]) -> Vec<String> {
     with(&COMPAT, extra)
 }
 
+/// The request the CLI words `new` give, as the compatibility layer's form gives it: the same, in its own spelling.
+fn as_compat(new: &[String]) -> RunRequest {
+    RunRequest {
+        spelling: Spelling::Compat,
+        ..run_request(&refs(new))
+    }
+}
+
 #[test]
 fn compat_accepts_the_powershell_form() {
     let old = compat(&COMMAND);
     let new = with(&RUN, &COMMAND);
-    assert_eq!(run_request(&refs(&old)), run_request(&refs(&new)));
+    assert_eq!(run_request(&refs(&old)), as_compat(&new));
 
     let old = compat(&["-StallSeconds", "30", "-Tail", "5", "-NoMarkers", "-Local", "--", "cmd"]);
     let new = with(&RUN, &["--stall", "30", "--tail", "5", "--no-markers", "--local", "--", "cmd"]);
-    assert_eq!(run_request(&refs(&old)), run_request(&refs(&new)));
+    assert_eq!(run_request(&refs(&old)), as_compat(&new));
 }
 
 #[test]
@@ -41,7 +49,7 @@ fn compat_options_are_case_insensitive() {
         "cmd",
     ];
     let new = with(&RUN, &["--stall", "30", "--tail", "5", "--no-markers", "--local", "--", "cmd"]);
-    assert_eq!(run_request(&old), run_request(&refs(&new)));
+    assert_eq!(run_request(&old), as_compat(&new));
 }
 
 #[test]
@@ -56,7 +64,7 @@ fn compat_reads_colon_forms() {
         "cmd",
     ];
     let new = with(&RUN, &["--stall", "30", "--tail", "5", "--", "cmd"]);
-    assert_eq!(run_request(&old), run_request(&refs(&new)));
+    assert_eq!(run_request(&old), as_compat(&new));
 }
 
 #[test]

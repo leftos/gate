@@ -3,6 +3,8 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 
+use crate::problem::Spelling;
+
 /// The stall window when `--stall` is not given.
 pub const DEFAULT_STALL_SECONDS: u64 = 120;
 /// The log lines printed at the end when `--tail` is not given.
@@ -123,6 +125,8 @@ pub struct RunRequest {
     pub test_seams: TestSeams,
     /// The hidden `--test-print-request` switch.
     pub print_request: bool,
+    /// The form the command line was given in, so a line names a flag as the caller spelled it.
+    pub spelling: Spelling,
 }
 
 /// A valid `gate stop-tree`.

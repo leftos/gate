@@ -19,6 +19,7 @@ mod install;
 mod interrupt;
 mod journal;
 mod launch;
+mod nesting;
 mod request;
 mod routing;
 mod slots;

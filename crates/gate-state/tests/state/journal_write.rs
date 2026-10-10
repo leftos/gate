@@ -337,6 +337,26 @@ fn a_fallback_line_names_each_reason_by_its_word() {
 }
 
 #[test]
+fn a_parent_line_is_the_one_the_fixture_holds() {
+    let line = journal_line(&identity(), ts(NOW), &JournalEvent::Parent { parent_pid: 70000 }, None, None);
+
+    assert_eq!(parsed(&line)["event"], "parent");
+    assert_eq!(keys(&parsed(&line)), with_common(&["parentPid"]));
+    assert_eq!(own_fields(&line), own_fields(remote_fixture(36)));
+}
+
+#[test]
+fn a_covered_line_carries_the_parent_pid_after_the_identity() {
+    let line = journal_line(&identity(), ts(NOW), &JournalEvent::Covered { parent_pid: 70000 }, None, None);
+
+    assert_eq!(parsed(&line)["event"], "covered");
+    assert_eq!(keys(&parsed(&line)), with_common(&["parentPid"]));
+    assert_eq!(parsed(&line)["parentPid"], json!(70000));
+    let under_abandoned_lock = journal_line(&identity(), ts(NOW), &JournalEvent::Covered { parent_pid: 70000 }, None, Some(LOCK_NAME));
+    assert_eq!(own_keys(&under_abandoned_lock), ["parentPid", "abandoned"]);
+}
+
+#[test]
 fn a_line_without_a_remote_tag_has_no_remote_field() {
     let events = [
         JournalEvent::Queue {

@@ -3,7 +3,7 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 
-use gate_args::{DEFAULT_STALL_SECONDS, DEFAULT_TAIL_LINES, RunRequest, Slot, TestSeams};
+use gate_args::{DEFAULT_STALL_SECONDS, DEFAULT_TAIL_LINES, RunRequest, Slot, Spelling, TestSeams};
 
 use crate::support::{RUN, os, problems, problems_of, refs, run_of, run_request, unreadable_word, with};
 
@@ -31,6 +31,7 @@ fn run_reads_every_option_and_the_defaults() {
             command: os(&["cmd", "/c", "echo hi"]),
             test_seams: TestSeams::default(),
             print_request: false,
+            spelling: Spelling::Cli,
         }
     );
     let request = run_with(&[

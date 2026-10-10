@@ -200,6 +200,7 @@ impl RunBuilder {
                 command,
                 test_seams: self.test_seams,
                 print_request: self.print_request,
+                spelling,
             }),
             _ => Err(self.problems),
         }
