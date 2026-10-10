@@ -5,8 +5,6 @@
 ## Local gate
 
 - [ ] GATE-5 Port the local gate, slice by slice
-  - [ ] GATE-34 Local slice 3: slots, counts, claims and FIFO tickets
-    - [ ] GATE-30 Journal a slot taken over from a gate that died holding it (`abandoned` on the take line)
   - [ ] GATE-35 Local slice 4: launch the command (resolution, quoting, job object, log and markers)
   - [ ] GATE-36 Local slice 5: watchdog (CPU sampling, stall check, kill-tree, heartbeat)
   - [ ] GATE-37 Local slice 6: timeout ceiling and backstop
@@ -24,6 +22,7 @@
   - [ ] GATE-16 Durations part 4: `--timeout auto` as a floor, and ceiling and hang hints
   - [ ] GATE-17 Durations part 5: backfill guests during a critical drain
 - [ ] GATE-8 `--slot auto` picks heavy or light from the command's history
+- [ ] GATE-48 Merge feat/slots-and-tickets (#48)
 
 ## Remote
 
@@ -47,3 +46,8 @@
 ## Cutover sweep
 
 - [ ] GATE-11 Caller sweep to gate on PATH; delete the PowerShell gate
+
+## Backlog
+
+- [ ] GATE-47 Two threads writing one state file share its temp file
+- [ ] GATE-49 proc-table's OwnedHandle::new closes the handle it refuses, overwriting the last error
