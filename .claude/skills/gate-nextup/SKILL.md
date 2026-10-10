@@ -37,7 +37,7 @@ Until the cutover, every command runs through the PowerShell gate: `pwsh -NoProf
 
 | The diff touches | Gate commands |
 |---|---|
-| any Rust | `-Slot light -- cargo fmt --all --check`, then `-Slot heavy -TimeoutSeconds 900 -- cargo clippy --workspace --all-targets --all-features --profile test-release -- -D warnings`, then `-Slot heavy -TimeoutSeconds 900 -- cargo test --workspace --all-features --profile test-release` (`--all-features` builds the black-box suite, which needs the `test-seams` feature) |
+| any Rust | `-Slot light -- cargo fmt --all --check`, then `-Slot heavy -TimeoutSeconds 900 -- cargo clippy --workspace --all-targets --all-features --profile test-release -- -D warnings`, then the same clippy without `--all-features` (the build `gate.exe` ships; code that names a `test-seams` item outside its `cfg` compiles only with the feature), then `-Slot heavy -TimeoutSeconds 900 -- cargo test --workspace --all-features --profile test-release` (`--all-features` builds the black-box suite, which needs the `test-seams` feature) |
 
 A test that asserts on timing must hold on a busy machine: no wall-clock bound a loaded PC can cross (the PowerShell suite's CC-209 and CC-211 are what this avoids). A test that needs the machine alone runs on `-Slot critical`, and the profile names it here when it exists.
 

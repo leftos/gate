@@ -155,6 +155,7 @@ impl RunBuilder {
         if self.print_request && self.test_seams.journal_run.is_some() {
             self.problems.push(Problem::JournalRunWithPrintRequest);
         }
+        #[cfg(feature = "test-seams")]
         if self.test_seams.hold_until.is_some() && !self.given.contains(&RunOption::Value(ValueOption::JournalRun)) {
             self.problems.push(Problem::HoldUntilWithoutJournalRun);
         }
