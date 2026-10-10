@@ -57,6 +57,7 @@ pub struct Watch {
     progress_cpu: Ticks,
     output_size: u64,
     pids: BTreeSet<u32>,
+    sampled: bool,
     sampler_failed: bool,
 }
 
@@ -78,6 +79,7 @@ impl Watch {
             progress_cpu: job_cpu,
             output_size: 0,
             pids: BTreeSet::new(),
+            sampled: false,
             sampler_failed: false,
         }
     }
@@ -104,6 +106,7 @@ impl Watch {
             self.adjusted += interval.as_secs_f64() * free;
         }
         self.last_free = free;
+        self.sampled = true;
         self.last_at = sample.at;
         self.system = sample.system;
         self.job_cpu = sample.job_cpu;
@@ -156,6 +159,28 @@ impl Watch {
             return 100.0;
         }
         (100.0 * self.adjusted / counted.as_secs_f64()).round_ties_even()
+    }
+
+    /// The share of the machine the last sample found free, as a whole percent with halves to even: `None` before the
+    /// first sample and once the sampler has failed.
+    #[must_use]
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "with a demand of at least 1 the share is clamped to [0.05, 1], so its whole percent is 5 to 100; a demand \
+                  of 0 can make it NaN, which the cast turns into 0"
+    )]
+    pub fn last_free_percent(&self) -> Option<u32> {
+        if !self.sampled || self.sampler_failed {
+            return None;
+        }
+        Some((100.0 * self.last_free).round_ties_even() as u32)
+    }
+
+    /// Whether a sample has failed, so the watch goes by wall time alone.
+    #[must_use]
+    pub fn sampler_has_failed(&self) -> bool {
+        self.sampler_failed
     }
 
     /// The kill for the first of the three reasons that holds at `now`, or `None` while none does: the stall, then the
@@ -390,6 +415,32 @@ mod tests {
         watch.sample(&sample(2000, IDLE, true));
         assert!((watch.adjusted_seconds() - 1.0).abs() < f64::EPSILON);
         assert!((watch.free_percent() - 100.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn last_free_percent_is_the_last_share_rounded_half_to_even() {
+        let mut watch = Watch::new(config(5000, 5), Machine::new(4, 4, false), IDLE, Ticks(0));
+        assert_eq!(watch.last_free_percent(), None, "no sample has found a share yet");
+        // 5 idle of 8 ticks on a 4-core machine asking for all four: a share of 0.625.
+        let five_eighths = SystemTimes {
+            idle: 5_000,
+            kernel: 5_000,
+            user: 3_000,
+        };
+        watch.sample(&sample(1000, five_eighths, false));
+        assert_eq!(watch.last_free_percent(), Some(62), "62.5 rounds to the even 62");
+        watch.sample(&half_sample(2000));
+        assert_eq!(watch.last_free_percent(), Some(50), "the last sample's share, not the average");
+    }
+
+    #[test]
+    fn a_failed_sampler_leaves_no_last_free_percent() {
+        let mut watch = watching(config(5000, 5));
+        watch.sample(&half_sample(1000));
+        assert!(!watch.sampler_has_failed());
+        watch.sampler_failed("the job is gone");
+        assert!(watch.sampler_has_failed());
+        assert_eq!(watch.last_free_percent(), None, "a failed sampler has no share to report");
     }
 
     #[test]

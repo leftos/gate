@@ -24,6 +24,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Critical gate**: a gate run with `--slot critical`, which takes every heavy and unreserved light slot and runs its command at High priority.
 - **Cutover**: switching a machine's gates from the PowerShell gate to `gate.exe`; `gate cutover` runs the local one.
 - **Cutover sweep**: the later change of every calling repo from the PowerShell launcher to `gate` on PATH, after which the PowerShell gate is deleted.
+- **Diagnostics block**: the record of what was running that a kill writes to the log before it terminates the job: the job's processes, the descendants outside the job, the build servers and the last samples.
 - **Drained cutover**: a cutover in which every gate of the old generation finishes before the switch completes, so the two generations never hold slots side by side.
 - **Dynamic name**: one of cmd.exe's built-in variables (`%CD%`, `%RANDOM%`, `%ERRORLEVEL%` and the like) that it expands though the environment block holds no such variable; a batch target's words are refused when they hold one.
 - **Fallback**: a routed run that runs locally instead, after its builder refused it or the remote pool stayed full; journalled as a `fallback` event with its reason.
