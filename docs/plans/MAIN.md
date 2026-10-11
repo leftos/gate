@@ -4,7 +4,7 @@
 
 ## Local gate
 
-- [/] GATE-122 gate-state: cap the run history at the 50 newest runs that are not covered
+- [ ] GATE-124 gate-state: keep a listed covered run's parent through the 7-day prune
 
 ## Remote
 
@@ -13,18 +13,18 @@
   - [ ] GATE-45 Remote slice 4: health refusals, fallback journalling and remote claims
   - [ ] GATE-109 Remote: carry every verb of a routed run over one ssh connection (gate box serve)
   - [ ] GATE-115 Remote client: never retry or refuse on the command's own output
-  - [/] GATE-111 Remote client: bound kept lines and sync-back git reads, and put local git calls in jobs
   - [ ] GATE-19 Remote: send a repo's declared sibling worktrees with a routed run
   - [ ] GATE-22 Remote: send a routed command's ignored inputs to the builder, compressed
   - [ ] GATE-23 Outputs: measure the manifest time, cache hashes by (path, size, mtime) if slow
   - [ ] GATE-29 Sync-back: narrow the 'worktree changed during the run' refusal to changes that could matter
   - [ ] GATE-27 Remote: remember a builder's failures per host (short backoff, loss counter)
-  - [/] GATE-65 Box: push the installed gate.exe to each builder
   - [ ] GATE-46 Remote slice 5: drained remote cutover and deleting the remote.ps1 bridge
   - [ ] GATE-21 Remote: a critical pool on the builder for timing-sensitive gates (decide after measuring)
   - [ ] GATE-18 Remote preflight: refuse with `parity` when the builder lacks a .NET workload the repo needs
 - [ ] GATE-105 Decide whether the box caps its dotnet tool restore
 - [ ] GATE-121 Remote client: bound the size of the sync-back's fetched pack
+- [ ] GATE-123 Box: cap the outputs folder's total size
+- [ ] GATE-126 Remote client: turn off git's auto-maintenance in the sync-back fetch
 
 ## Cutover sweep
 
@@ -32,7 +32,6 @@
 
 ## After cutover
 
-- [ ] GATE-6 Say how many cores a run kept busy and whether its slot fitted
 - [ ] GATE-7 Learned command durations: summary, expected-time line, ETAs, auto ceiling, backfill
   - [ ] GATE-13 Durations part 2: durations store, `gate expect`, and the expected-time line
   - [ ] GATE-15 Durations part 3: ETAs in wait lines and an `expected` field in claims and tickets
@@ -42,9 +41,7 @@
 
 ## Backlog
 
-- [ ] GATE-98 Decide process liveness by a wait, not exit code 259
 - [ ] GATE-99 Bind a slot marker to a real parent gate's job before covering
-- [ ] GATE-100 Forward the box's git stderr under the output lock
 - [ ] GATE-101 A covered gate outlives its parent's slot
-- [ ] GATE-106 Take the 5 s ceiling out of the suite's held-log launch case
 - [ ] GATE-107 Make the sync-back git-failure case independent of a held bare repository
+- [ ] GATE-125 Find how far a packaged app escapes the gate's kill-on-close jobs
