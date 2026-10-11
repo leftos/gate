@@ -11,8 +11,8 @@ use gate_win32::{NamedMutex, mutex_exists};
 use serde_json::Value;
 
 use crate::support::{
-    Case, FAKE_TOOL, Outcome, Running, assert_in_order, run_words, shown, wait_for_file, wait_for_journal_line, wait_until, wait_until_closed,
-    write_counts,
+    Case, FAKE_TOOL, Outcome, Running, assert_in_order, heavy_words, run_words, shown, wait_for_file, wait_for_journal_line, wait_until,
+    wait_until_closed, write_counts,
 };
 
 /// A light pool of one slot.
@@ -105,6 +105,24 @@ fn has_ticket(case: &Case, pid: u32) -> bool {
 fn assert_passed(running: Running) {
     let outcome = running.finish();
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
+}
+
+#[test]
+fn a_gate_that_cannot_read_its_own_start_refuses_and_writes_nothing() {
+    let case = Case::new("a_gate_that_cannot_read_its_own_start_refuses_and_writes_nothing");
+    let ran = shown(&case.folder().join("ran"));
+    let outcome = case.run(&heavy_words("out.log", &["--test-own-start-fails"], &[FAKE_TOOL, "mark", ran.as_str()]));
+
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert!(outcome.stderr.contains("gate: cannot read this gate's own start: "), "{outcome:?}");
+    assert!(
+        outcome
+            .stderr
+            .contains("--test-own-start-fails makes the start unreadable (test seam only); not running "),
+        "{outcome:?}"
+    );
+    assert!(case.root_entries().is_empty(), "the state root holds {:?}", case.root_entries());
+    assert!(case.folder_entries().is_empty(), "the case folder holds {:?}", case.folder_entries());
 }
 
 #[test]

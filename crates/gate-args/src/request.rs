@@ -156,6 +156,8 @@ pub struct TestSeams {
     pub remote_script: Option<PathBuf>,
     /// The program the remote.ps1 bridge starts in place of the pwsh found on `PATH`.
     pub bridge_pwsh: Option<PathBuf>,
+    /// Make this gate's own start unreadable both ways, so the run refuses before it writes anything.
+    pub own_start_fails: bool,
 }
 
 /// A valid `gate run`.

@@ -62,7 +62,13 @@ pub(crate) fn run(request: &RunRequest, log: &Path, root: &ResolvedRoot, environ
         Ok(nesting) => nesting,
         Err(status) => return status,
     };
-    let gate = ThisGate::read(request);
+    let gate = match ThisGate::read(request) {
+        Ok(gate) => gate,
+        Err(line) => {
+            console.err(&line);
+            return exit_status(GATE_FAILED);
+        }
+    };
     let log = Log::new(log);
     let at = Where {
         root,

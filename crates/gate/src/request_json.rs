@@ -48,6 +48,7 @@ pub(crate) fn run(request: &RunRequest, log: &Path, root: &ResolvedRoot) -> Stri
             "remoteTimeoutMs": seams.remote_timeout_ms,
             "remoteScript": seams.remote_script.as_ref().map(|path| path.to_string_lossy()),
             "bridgePwsh": seams.bridge_pwsh.as_ref().map(|path| path.to_string_lossy()),
+            "ownStartFails": seams.own_start_fails,
         },
     })
     .to_string()

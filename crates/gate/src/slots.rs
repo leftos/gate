@@ -97,12 +97,10 @@ pub(crate) fn setting(kind: SlotKind, counts: &Counts) -> &PoolSetting {
 /// This gate as its journal lines, its ticket, its claim and its wake event name it, read once a run.
 pub(crate) struct ThisGate {
     pub pid: u32,
-    /// The gate's start, or the time it was read at when the start could not be.
+    /// The gate's start, read the second way when the first fails, so it is always the gate's real start.
     pub start: Timestamp,
     /// `start` in Unix epoch milliseconds.
     pub start_ms: u64,
-    /// Why the start could not be read, which keeps the journal from being written.
-    start_error: Option<String>,
     kind: &'static str,
     cwd: Result<String, String>,
     /// The command's words as given, each quoted for the C runtime and joined by spaces ([`gate_args::command_text`]).
@@ -110,31 +108,25 @@ pub(crate) struct ThisGate {
 }
 
 impl ThisGate {
-    /// This gate, running `request`.
-    pub(crate) fn read(request: &RunRequest) -> ThisGate {
-        let (start, start_error) = match gate_win32::process_start() {
-            Ok(start) => (start, None),
-            Err(error) => (Timestamp::now(), Some(format!("cannot read this gate's start time: {error}"))),
-        };
+    /// This gate, running `request`, or the line to say when its own start cannot be read either way.
+    pub(crate) fn read(request: &RunRequest) -> Result<ThisGate, String> {
+        let command = gate_args::command_text(&request.command);
+        let start = read_start(request).map_err(|error| format!("gate: cannot read this gate's own start: {error}; not running {command}"))?;
         let cwd = std::env::current_dir()
             .map(|cwd| cwd.to_string_lossy().into_owned())
             .map_err(|error| format!("cannot read the working directory: {error}"));
-        ThisGate {
+        Ok(ThisGate {
             pid: std::process::id(),
             start,
             start_ms: epoch_ms(start),
-            start_error,
             kind: request.slot.as_str(),
             cwd,
-            command: gate_args::command_text(&request.command),
-        }
+            command,
+        })
     }
 
     /// What every journal line of this gate carries, or why the journal cannot be written.
     pub(crate) fn journal_identity(&self) -> Result<JournalIdentity, String> {
-        if let Some(error) = &self.start_error {
-            return Err(error.clone());
-        }
         Ok(JournalIdentity {
             pid: self.pid,
             process_start: self.start,
@@ -143,6 +135,45 @@ impl ThisGate {
             command: self.command.clone(),
         })
     }
+}
+
+/// This gate's own start: [`gate_win32::process_start`] first, then [`gate_win32::process_start_of`] of this process,
+/// the source the sweepers read, so a gate that reads its start this way is judged live by construction. The
+/// `--test-own-start-fails` seam makes both reads fail.
+fn read_start(request: &RunRequest) -> io::Result<Timestamp> {
+    read_start_with(
+        request.test_seams.own_start_fails,
+        gate_win32::process_start,
+        gate_win32::process_start_of,
+        std::process::id(),
+    )
+}
+
+/// [`read_start`] over the reads `first` and `second`, with the `--test-own-start-fails` seam `seam`: a failed second
+/// read's error is the one the caller sees, and `Ok(None)`, a pid no process runs as, is no start either, said with the
+/// first read's error.
+fn read_start_with(
+    seam: bool,
+    first: impl FnOnce() -> io::Result<Timestamp>,
+    second: impl FnOnce(u32) -> io::Result<Option<Timestamp>>,
+    pid: u32,
+) -> io::Result<Timestamp> {
+    if seam {
+        return Err(seam_unreadable());
+    }
+    match first() {
+        Ok(start) => Ok(start),
+        Err(first) => match second(pid) {
+            Ok(Some(start)) => Ok(start),
+            Ok(None) => Err(io::Error::other(format!("{first}; then the process has no start"))),
+            Err(second) => Err(second),
+        },
+    }
+}
+
+/// The error the `--test-own-start-fails` seam makes both reads of this gate's start fail with.
+fn seam_unreadable() -> io::Error {
+    io::Error::other("--test-own-start-fails makes the start unreadable (test seam only)")
 }
 
 /// `time` in whole Unix epoch milliseconds. A gate's times are all after the epoch, where truncation is the floor.
@@ -611,7 +642,7 @@ mod tests {
     use gate_state::normalize_command;
     use jiff::Timestamp;
 
-    use super::{Liveness, ThisGate, is_claim_file, light_beside, liveness, on_reserved_light};
+    use super::{Liveness, ThisGate, is_claim_file, light_beside, liveness, on_reserved_light, read_start_with};
 
     #[test]
     fn light_gates_beside_a_critical_request_are_its_open_reserved_slots_and_once_it_holds_every_light_claim_off_its_slots() {
@@ -695,10 +726,51 @@ mod tests {
             other => unreachable!("the words are a run: {other:?}"),
         };
 
-        let gate = ThisGate::read(&request);
+        let gate = ThisGate::read(&request).expect("this gate's start reads");
 
         assert_eq!(gate.command, POWERSHELL);
         assert_eq!(normalize_command(&gate.command), normalize_command(POWERSHELL));
         assert_eq!(normalize_command(&gate.command), "cargo test -- --exact \"a b\" \"a\u{a0}b\" \u{2026}");
+    }
+
+    #[test]
+    fn a_gate_reads_its_start_the_second_way_when_the_first_read_fails() {
+        let start = Timestamp::from_millisecond(1_759_439_760_571).expect("a time after the epoch");
+        let read = read_start_with(false, || Err(io::Error::other("the first way failed")), |_| Ok(Some(start)), 7);
+
+        assert_eq!(read.expect("the second read gives the start"), start);
+    }
+
+    #[test]
+    fn a_gate_whose_start_cannot_be_read_either_way_fails_with_the_second_reads_error() {
+        let read = read_start_with(
+            false,
+            || Err(io::Error::other("the first way failed")),
+            |_| Err(io::Error::other("the second way failed")),
+            7,
+        );
+
+        assert_eq!(read.expect_err("no start is an error").to_string(), "the second way failed");
+    }
+
+    #[test]
+    fn a_gate_whose_pid_runs_as_no_process_fails_with_the_first_reads_error_and_no_start() {
+        let read = read_start_with(false, || Err(io::Error::other("the first way failed")), |_| Ok(None), 7);
+
+        assert_eq!(
+            read.expect_err("no start is an error").to_string(),
+            "the first way failed; then the process has no start"
+        );
+    }
+
+    #[test]
+    fn the_own_start_seam_makes_both_reads_fail() {
+        let start = Timestamp::from_millisecond(1_759_439_760_571).expect("a time after the epoch");
+        let read = read_start_with(true, || Ok(start), |_| Ok(Some(start)), 7);
+
+        assert_eq!(
+            read.expect_err("the seam makes both reads fail").to_string(),
+            "--test-own-start-fails makes the start unreadable (test seam only)"
+        );
     }
 }

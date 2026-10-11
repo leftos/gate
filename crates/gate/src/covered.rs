@@ -27,10 +27,9 @@ impl Covered {
     }
 
     /// Writes the marker of the gate `identity` names running under the slot of the gate `parent_pid`, under the state
-    /// root `root`. A gate whose identity could not be read (`Err`, its start or its working directory unreadable)
-    /// writes no marker, as it writes no `covered` line, and says nothing more: a marker named after a start that is not
-    /// the gate's would be judged dead, and its journal says why it wrote nothing. A marker that cannot be written is
-    /// said, and the run goes on without one.
+    /// root `root`. A gate whose identity could not be read (`Err`, its working directory unreadable) writes no marker,
+    /// as it writes no `covered` line, and says nothing more: the marker's `cwd` field cannot be filled, and its journal
+    /// says why it wrote nothing. A marker that cannot be written is said, and the run goes on without one.
     fn write_as(root: &Path, identity: Result<&JournalIdentity, &String>, parent_pid: u32, console: &mut Console) -> Covered {
         let Ok(identity) = identity else {
             return Covered { path: None };
@@ -99,10 +98,10 @@ mod tests {
     }
 
     #[test]
-    fn a_gate_whose_start_cannot_be_read_writes_no_marker_and_says_nothing() {
-        let root = scratch("unread-start");
+    fn a_gate_whose_working_directory_cannot_be_read_writes_no_marker_and_says_nothing() {
+        let root = scratch("unread-cwd");
         let mut console = Console::new();
-        let reason = "cannot read this gate's start time: denied".to_owned();
+        let reason = "cannot read the working directory: denied".to_owned();
 
         let mut covered = Covered::write_as(&root, Err(&reason), 52000, &mut console);
         covered.end(&mut console);

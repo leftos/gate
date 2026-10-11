@@ -295,6 +295,30 @@ fn the_remote_snapshot_seam_is_a_switch_given_once() {
 
 #[cfg(feature = "test-seams")]
 #[test]
+fn the_own_start_seam_is_a_switch_given_once() {
+    use crate::support::run_request;
+
+    assert!(
+        run_request(&refs(&with(&RUN, &["--test-own-start-fails", "--", "cmd"])))
+            .test_seams
+            .own_start_fails
+    );
+    assert!(
+        !run_request(&refs(&with(&RUN, &["--", "cmd"]))).test_seams.own_start_fails,
+        "off unless given"
+    );
+    assert_eq!(
+        problems(&refs(&with(&RUN, &["--test-own-start-fails", "--test-own-start-fails", "--", "cmd"]))),
+        ["gate: --test-own-start-fails is given twice"]
+    );
+    assert_eq!(
+        problems(&["stop-tree", "--test-own-start-fails", "1"]),
+        ["gate: unknown option --test-own-start-fails"]
+    );
+}
+
+#[cfg(feature = "test-seams")]
+#[test]
 fn the_remote_client_seams_need_a_value_once() {
     use crate::support::run_request;
 
@@ -744,6 +768,10 @@ fn seam_flags_are_unknown_without_the_feature() {
     assert_eq!(
         problems(&refs(&with(&RUN, &["--test-diagnostics-fail", "--", "cmd"]))),
         ["gate: unknown option --test-diagnostics-fail"]
+    );
+    assert_eq!(
+        problems(&refs(&with(&RUN, &["--test-own-start-fails", "--", "cmd"]))),
+        ["gate: unknown option --test-own-start-fails"]
     );
     assert_eq!(
         problems(&refs(&with(&RUN, &["--test-remote-snapshot", "--", "cmd"]))),

@@ -175,6 +175,9 @@ The lines of a run that starts its command:
 - A start failure, on stderr and in the log: `gate: could not start <word> (<resolved full path>): <system message>`, exit 127. The parenthesis is left out when the resolved path is the word itself, and a program found nowhere gets the message of error 2 with no parenthesis. `gate: cannot read the system folder, which holds cmd.exe: <error>` and `gate: cannot make <path> a full path: <error>` are start failures too.
 - A gate failure after the slot is taken: `gate: the gate failed while running the command: <message>`, exit 1. The job is terminated with 124, with its follow-up lines `gate: and could not terminate the command's job: <error>`, `gate: the command was still running 5 s after its job was terminated` or `gate: cannot wait for the command after terminating its job: <error>`.
 - Failures before queueing, exit 1: `gate: cannot read the working directory: <error>`, `gate: cannot build the command's environment: <error>`, `gate: cannot create the log's folder <dir>: <error>` and `gate: cannot remove the earlier <path>: <error>`.
+- A gate that cannot read its own start, exit 1, before it writes any ticket, claim, slot marker, pause marker, wake event, covered marker or journal line: `gate: cannot read this gate's own start: <error>; not running <command>`.
+
+  The gate reads its start a second way (`process_start_of` of its own pid, the source the sweepers judge liveness by) when the first read fails, and `<error>` is the second read's error, or `<first error>; then the process has no start` when that read finds no process start. A gate therefore always holds its real start.
 - A log in use, exit 1, before queueing and with no journal line: `gate: the log <path> is in use by another gate`, when another gate holds the log's mutex ([Kernel object names](#kernel-object-names)). A mutex a killed gate left is taken silently. `gate: cannot take the mutex <name> of the log <path>: <error>`, exit 1, when the mutex cannot be opened or tried.
 - Routing, on stderr and in the log, with the command running here: `gate: ignored <path>: <reason>; running locally` when `remote.json` is there but unusable (not a file, unreadable or refused), and `gate: not routed: <reason>` when a heavy gate that would route stays local.
 
@@ -395,7 +398,7 @@ A ticket whose gate is dead by the [liveness rule](#claim) is ignored and delete
 | `cwd` | string | the gate's working directory |
 | `since` | number | when the marker was written, epoch ms |
 
-The gate deletes the marker when it releases, after a panic and on drop. It writes none when it cannot read its own start or working folder, the condition that also leaves out the `covered` journal line.
+The gate deletes the marker when it releases, after a panic and on drop. It writes none when it cannot read its working folder, the condition that also leaves out the `covered` journal line. A gate whose own start cannot be read never gets this far: it refuses to run (see Output lines).
 
 A marker whose gate is dead by the [liveness rule](#claim) is deleted by the next gate's survey, the pass that deletes dead tickets; the reader itself deletes nothing. The reader (`gate_state::v1::read_covered`) returns the good markers in `covered\`, in file-name order, whose name `<pid>-<start>.json` matches the pid and start in the body; a file that is unreadable, misnamed or gone between the listing and the read is skipped without a word, and a missing folder is empty.
 
@@ -1125,6 +1128,8 @@ A Rust integration suite drives the built `gate.exe` through its CLI and reads o
   A value outside a seam's calls says `gate: --test-remote-watch-call must be preflight, push, run, ls-remote or fetch, got '<v>'`, and `--test-remote-interrupt-at` likewise names `preflight or run`. The four need the transport; `--test-print-request` shows them as `testSeams.remoteBoundMs`, `remoteInterruptAt`, `remoteWatchCall` and `remoteTimeoutMs`, after `remoteRetryPauseMs`.
 
   `--test-remote-script <path>` and `--test-bridge-pwsh <path>` (on `gate run` only) replace the bridge's `remote.ps1` and `pwsh`; `--test-print-request` shows them as `testSeams.remoteScript` and `testSeams.bridgePwsh`, after `remoteTimeoutMs`.
+
+  `--test-own-start-fails` (a switch, on `gate run` only) makes both reads of the gate's own start fail, so the run ends with the refusal line of [Output lines](#output-lines); `--test-print-request` shows it as `testSeams.ownStartFails`, after `bridgePwsh`.
 
   An installed gate has none of them, and without the feature each is an unknown option.
 - **Spawn and wait helpers.** The suite's `start` launches the gate and returns a `Running` that can wait for a stderr line, say whether the gate is still running, and finish; dropping a `Running` kills a gate still running. Output readers are joined with a deadline, so a grandchild holding the pipes cannot hang the suite. A run's `Outcome` carries `raw_stdout`, the bytes as the gate wrote them, beside the decoded text.
