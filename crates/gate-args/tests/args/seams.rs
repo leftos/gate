@@ -342,6 +342,53 @@ fn the_remote_client_seams_that_conflict_are_refused() {
     );
 }
 
+#[cfg(feature = "test-seams")]
+#[test]
+fn the_bridge_seams_need_a_value_once() {
+    use crate::support::run_request;
+
+    let seams = run_request(&refs(&with(&RUN, &["--", "cmd"]))).test_seams;
+    assert_eq!((seams.remote_script, seams.bridge_pwsh), (None, None), "none unless given");
+    let given = ["--test-remote-script", r"case\remote.ps1", "--test-bridge-pwsh=no-pwsh.exe", "--", "cmd"];
+    let seams = run_request(&refs(&with(&RUN, &given))).test_seams;
+    assert_eq!(
+        (seams.remote_script, seams.bridge_pwsh),
+        (
+            Some(std::path::PathBuf::from(r"case\remote.ps1")),
+            Some(std::path::PathBuf::from("no-pwsh.exe"))
+        )
+    );
+    for flag in ["--test-remote-script", "--test-bridge-pwsh"] {
+        assert_eq!(
+            problems(&refs(&with(&RUN, &[flag, "--", "cmd"]))),
+            [format!("gate: {flag} needs a value")],
+            "{flag} without its value"
+        );
+        assert_eq!(
+            problems(&refs(&with(&RUN, &[flag, "a", flag, "b", "--", "cmd"]))),
+            [format!("gate: {flag} is given twice")],
+            "{flag} twice"
+        );
+        assert_eq!(
+            problems(&["stop-tree", flag, "5", "1"]),
+            [format!("gate: unknown option {flag}"), "gate: unexpected argument 1".to_owned()],
+            "{flag} on stop-tree"
+        );
+    }
+}
+
+#[cfg(not(feature = "test-seams"))]
+#[test]
+fn the_bridge_seams_are_unknown_without_the_feature() {
+    for flag in ["--test-remote-script", "--test-bridge-pwsh"] {
+        assert_eq!(
+            problems(&refs(&with(&RUN, &[flag, "5", "--", "cmd"]))),
+            [format!("gate: unknown option {flag}"), "gate: unexpected argument 5".to_owned()],
+            "{flag}"
+        );
+    }
+}
+
 /// The one line a malformed `gate box` prints.
 const BOX_USAGE: &str = "usage: gate box preflight|run|stop|boot|outputs <base64 JSON payload>";
 

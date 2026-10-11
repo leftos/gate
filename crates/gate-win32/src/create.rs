@@ -316,6 +316,7 @@ fn create_process(creation: &Creation<'_>, flags: PROCESS_CREATION_FLAGS, startu
         process: Some(process),
         thread,
         pid: created.dwProcessId,
+        pipes: None,
     })
 }
 
@@ -329,7 +330,7 @@ mod tests {
     use windows_sys::Win32::Foundation::{GetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT};
 
     use super::SPAWN_LOCK;
-    use crate::{EnvironmentBlock, Job, Launch, PipedConsole, PipedLaunch};
+    use crate::{EnvironmentBlock, Job, Launch, LaunchOutput, PipedConsole, PipedLaunch};
 
     /// Keeps these tests from running at once, so that one's launch never holds the spawn lock while the other checks
     /// that it is free. Every unit test of this crate that starts a process takes it for its whole run, or that check
@@ -391,8 +392,10 @@ mod tests {
             command_line: "cmd /d /c exit 0".encode_utf16().collect(),
             directory: system,
             environment: environment(),
-            log: dir.join("out.log"),
-            err_log: dir.join("out.log.err"),
+            output: LaunchOutput::Files {
+                log: dir.join("out.log"),
+                err_log: dir.join("out.log.err"),
+            },
             priority: None,
         };
 

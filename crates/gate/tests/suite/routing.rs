@@ -18,13 +18,12 @@ use crate::support::{
     wait_for_journal_line, wait_until, write_counts, write_remote_json,
 };
 
-const HOST: &str = "builder";
-const CLIENT_LINE: &str = "gate: remote builder client could not start: the bridge to remote.ps1 is not built yet; running here";
-const BUSY_LINE: &str = "gate: remote builder busy; running here";
+pub(crate) const HOST: &str = "builder";
+pub(crate) const BUSY_LINE: &str = "gate: remote builder busy; running here";
 const NOTHING_SENT_LINE: &str = "gate: not routed: sub holds nothing the snapshot sends";
 const REMOTE_WAITING: &str = "gate: waiting for a remote slot on builder (1 busy)";
 /// The status Windows reports for a process Ctrl+C ended, `STATUS_CONTROL_C_EXIT`, as a signed exit code.
-const CONTROL_C_EXIT: i32 = 0xC000_013A_u32.cast_signed();
+pub(crate) const CONTROL_C_EXIT: i32 = 0xC000_013A_u32.cast_signed();
 
 static NEXT_STUB: AtomicU64 = AtomicU64::new(0);
 
@@ -45,10 +44,21 @@ fn routed_words<'a>(log: &'a str, stub: &'a str, extra: &[&'a str], command: &[&
 
 /// The words of a heavy run of this suite, with a routing git limit of an hour: a case holds however long git takes
 /// on a loaded machine, not only within the gate's default limit.
-fn heavy_words_with_limit<'a>(log: &'a str, extra: &[&'a str], command: &[&'a str]) -> Vec<&'a str> {
+pub(crate) fn heavy_words_with_limit<'a>(log: &'a str, extra: &[&'a str], command: &[&'a str]) -> Vec<&'a str> {
     let mut before = vec!["--test-git-limit-ms", "3600000"];
     before.extend(extra);
     heavy_words(log, &before, command)
+}
+
+/// The remote.ps1 a routed run of the case that selects no test client is given, `--test-remote-script`'s value: a
+/// file the case folder never holds, so the run never reads the real remote.ps1.
+fn missing_script(case: &Case) -> String {
+    word(case, "no-remote.ps1")
+}
+
+/// The line a routed run given the remote.ps1 `script`, which is missing, says as it falls back.
+fn client_line(script: &str) -> String {
+    format!("gate: remote builder client could not start: cannot find remote.ps1 at {script}; running here")
 }
 
 /// The path of a file `name` in the case folder, as a step's or a command's word.
@@ -89,7 +99,7 @@ fn has_ticket(case: &Case, pid: u32) -> bool {
     })
 }
 
-fn remote_claim(case: &Case) -> PathBuf {
+pub(crate) fn remote_claim(case: &Case) -> PathBuf {
     case.root().join("slots").join("gate-remote-slot-0.json")
 }
 
@@ -108,7 +118,7 @@ fn let_go(go: &Path) {
 
 /// Asserts one gate's journal lines of a routed run that took a remote slot and fell back for `reason`: `queue`,
 /// `take` and `fallback` with the remote tag, then a `take` and a `release` with none.
-fn assert_refused(events: &[Value], reason: &str) {
+pub(crate) fn assert_refused(events: &[Value], reason: &str) {
     assert_eq!(names(events), ["queue", "take", "fallback", "take", "release"], "{events:#?}");
     assert!(events[..3].iter().all(has_remote_tag), "{events:#?}");
     assert_eq!(events[2]["reason"], reason, "{events:#?}");
@@ -117,7 +127,7 @@ fn assert_refused(events: &[Value], reason: &str) {
 
 /// A case folder made a checkout of its own, holding fake-tool as `tool.exe`, with a routing file that sends its
 /// `*tool*` and `*dotnet.exe*` commands to the builder.
-fn routed_case(name: &str) -> Case {
+pub(crate) fn routed_case(name: &str) -> Case {
     let case = Case::new(name);
     git_init(&case);
     copy_tool(&case, "tool.exe");
@@ -127,7 +137,7 @@ fn routed_case(name: &str) -> Case {
 }
 
 /// The repo name of the case folder's checkout.
-fn repo(case: &Case) -> String {
+pub(crate) fn repo(case: &Case) -> String {
     repo_name(&case.folder().file_name().expect("the case folder has a name").to_string_lossy())
 }
 
@@ -147,7 +157,7 @@ fn log_path(case: &Case, name: &str) -> String {
     case.folder().join(name).to_str().expect("the case folder is Unicode").to_owned()
 }
 
-fn names(events: &[Value]) -> Vec<&str> {
+pub(crate) fn names(events: &[Value]) -> Vec<&str> {
     events
         .iter()
         .map(|event| event["event"].as_str().expect("a line names its event"))
@@ -160,7 +170,7 @@ fn has_no_remote_fields(event: &Value) -> bool {
 
 /// Asserts one gate's journal lines of a routed run that fell back at once: `queue` and `fallback` (reason `client`)
 /// with one remote tag, then a `take` and a `release` with none.
-fn assert_fell_back(case: &Case, events: &[Value]) {
+pub(crate) fn assert_fell_back(case: &Case, events: &[Value]) {
     assert_eq!(names(events), ["queue", "fallback", "take", "release"], "{events:#?}");
     let (queue, fallback) = (&events[0], &events[1]);
     let key = queue["key"].as_str().expect("the queue line has a key");
@@ -190,14 +200,17 @@ fn stdout_lines(stdout: &str) -> Vec<&str> {
 #[test]
 fn with_no_test_client_a_routed_run_falls_back_with_reason_client() {
     let case = routed_case("routing-no-client");
-    let outcome = finish(case.gate(&heavy_words_with_limit("out.log", &[], &[r".\tool.exe", "out", "ran here"])));
+    let script = missing_script(&case);
+    let seam = ["--test-remote-script", script.as_str()];
+    let outcome = finish(case.gate(&heavy_words_with_limit("out.log", &seam, &[r".\tool.exe", "out", "ran here"])));
 
+    let client_line = client_line(&script);
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
-    assert!(outcome.stderr.contains(CLIENT_LINE), "{outcome:?}");
+    assert!(outcome.stderr.contains(&client_line), "{outcome:?}");
     assert!(outcome.stdout.contains("ran here"), "{outcome:?}");
     assert_fell_back(&case, &events(&case));
     let log = fs::read_to_string(case.folder().join("out.log")).expect("the log was written");
-    assert_in_order(&log, &["ran here", CLIENT_LINE]);
+    assert_in_order(&log, &["ran here", &client_line]);
 }
 
 #[test]
@@ -290,12 +303,17 @@ fn a_folder_named_with_spaces_and_brackets_holding_a_file_routes() {
     let empty = case.folder().join("empty.gitconfig");
     fs::write(&empty, "").expect("an empty git config can be written");
     let log = log_path(&case, "out.log");
-    let mut command = case.gate_in("my dir [1]", &heavy_words_with_limit(&log, &[], &[r".\tool.exe", "out", "ran here"]));
+    let script = missing_script(&case);
+    let seam = ["--test-remote-script", script.as_str()];
+    let mut command = case.gate_in("my dir [1]", &heavy_words_with_limit(&log, &seam, &[r".\tool.exe", "out", "ran here"]));
     command.env("GIT_CONFIG_GLOBAL", &empty).env("GIT_CONFIG_NOSYSTEM", "1");
     let outcome = finish(command);
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
-    assert!(outcome.stderr.contains(CLIENT_LINE), "the folder's name is a literal path: {outcome:?}");
+    assert!(
+        outcome.stderr.contains(&client_line(&script)),
+        "the folder's name is a literal path: {outcome:?}"
+    );
     assert_fell_back(&case, &events(&case));
 }
 
@@ -303,15 +321,17 @@ fn a_folder_named_with_spaces_and_brackets_holding_a_file_routes() {
 fn with_git_dir_and_work_tree_inherited_a_gate_in_a_subfolder_still_routes() {
     let case = routed_case("routing-git-dir");
     sub_folder(&case, "sub", true);
-    let at_root = finish(case.gate(&heavy_words_with_limit("root.log", &[], &[r".\tool.exe", "out", "hi"])));
+    let script = missing_script(&case);
+    let seam = ["--test-remote-script", script.as_str()];
+    let at_root = finish(case.gate(&heavy_words_with_limit("root.log", &seam, &[r".\tool.exe", "out", "hi"])));
     let log = log_path(&case, "sub.log");
-    let mut command = case.gate_in("sub", &heavy_words_with_limit(&log, &[], &[r".\tool.exe", "out", "hi"]));
+    let mut command = case.gate_in("sub", &heavy_words_with_limit(&log, &seam, &[r".\tool.exe", "out", "hi"]));
     // As a hook run at the worktree's root exports them: relative, so they name the case's repo only from its root.
     command.env("GIT_DIR", ".git").env("GIT_WORK_TREE", ".");
     let in_sub = finish(command);
 
     assert_eq!((at_root.code, in_sub.code), (Some(0), Some(0)), "{at_root:?} {in_sub:?}");
-    assert!(in_sub.stderr.contains(CLIENT_LINE), "{in_sub:?}");
+    assert!(in_sub.stderr.contains(&client_line(&script)), "{in_sub:?}");
     let events = events(&case);
     assert_fell_back(&case, &events[..4]);
     assert_fell_back(&case, &events[4..]);
@@ -337,10 +357,12 @@ fn a_worktree_with_unstaged_deletes_does_not_count_a_deleted_folder_as_holding_f
 fn a_path_argument_with_spaces_routes_with_the_word_intact() {
     let case = routed_case("routing-spaces");
     let word = r"dir with spaces\file.txt";
-    let outcome = finish(case.gate(&heavy_words_with_limit("out.log", &[], &[r".\tool.exe", "argv", word])));
+    let script = missing_script(&case);
+    let seam = ["--test-remote-script", script.as_str()];
+    let outcome = finish(case.gate(&heavy_words_with_limit("out.log", &seam, &[r".\tool.exe", "argv", word])));
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
-    assert!(outcome.stderr.contains(CLIENT_LINE), "{outcome:?}");
+    assert!(outcome.stderr.contains(&client_line(&script)), "{outcome:?}");
     assert!(stdout_lines(&outcome.stdout).contains(&word), "{outcome:?}");
     assert_fell_back(&case, &events(&case));
 }

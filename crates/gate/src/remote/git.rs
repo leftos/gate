@@ -213,6 +213,13 @@ pub(crate) struct Ran {
     pub stdout: File,
 }
 
+/// Whether `name` is a variable git is never given: one of [`GIT_LOCATION`] or an indexed config variable, its letter
+/// case aside as Windows reads a variable's name.
+pub(crate) fn is_location_variable(name: &OsStr) -> bool {
+    name.to_str()
+        .is_some_and(|name| GIT_LOCATION.iter().any(|location| location.eq_ignore_ascii_case(name)) || is_indexed_config(name))
+}
+
 /// Whether `name` is one of the config variables `GIT_CONFIG_COUNT` indexes, its letter case aside as Windows reads a
 /// variable's name.
 fn is_indexed_config(name: &str) -> bool {

@@ -26,10 +26,10 @@ pub use device::device_target;
 pub use event::{EventWait, NamedEvent};
 pub use interrupt::Interrupt;
 pub use job::{Accounting, Job};
-pub use launch::{EnvironmentBlock, Launch, LaunchError, PriorityClass, Running, Suspended, Waited, same_variable_name};
+pub use launch::{EnvironmentBlock, Launch, LaunchError, LaunchOutput, PriorityClass, Running, StdioPipes, Suspended, Waited, same_variable_name};
 pub use memory::working_set;
 pub use mutex::{AcquireError, MutexGuard, NamedMutex, OwnedMutexGuard, mutex_exists};
-pub use piped::{PipedConsole, PipedLaunch, PipedSuspended, breakaway_refused};
+pub use piped::{PipedConsole, PipedLaunch, PipedSuspended, breakaway_refused, cancel_pending_io, cancelled};
 pub use times::{ProcessTimes, SystemTimes, file_time_now, process_times, system_times, wsl_vm_cpu};
 
 /// Refuses an open file that is not a plain disk file: one that is not on a disk, is a reparse point (a link or a

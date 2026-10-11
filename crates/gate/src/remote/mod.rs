@@ -1,6 +1,6 @@
 //! The remote client a routed run calls: the call it is given, the outcome it hands back, and the clients there are.
-//! With no client, a routed run falls back here with reason `client`. A gate built with the `test-seams` feature has
-//! the scripted client `--test-remote-client` names, which runs a step file in this process, and the client of
+//! Every gate has the [`bridge`] to remote.ps1. A gate built with the `test-seams` feature has the scripted client
+//! `--test-remote-client` names, which runs a step file in this process, and the client of
 //! `--test-remote-snapshot`, which stops once it has made the snapshot, and the Rust client of
 //! `--test-remote-transport`, which runs the command on a builder. [`git`] runs git for the routing decision and the
 //! client; [`snapshot`] makes the snapshot and bridge commits; `client` runs the Rust client's phases, `transport`
@@ -15,6 +15,7 @@ use gate_args::RunRequest;
 use gate_state::{FallbackReason, StateRoot};
 use gate_win32::{Interrupt, OwnedMutexGuard};
 
+mod bridge;
 #[cfg(feature = "test-seams")]
 mod client;
 pub(crate) mod git;
@@ -34,8 +35,6 @@ mod transport;
 
 /// The status a client hands back with a refusal's reason.
 pub(crate) const REFUSED: i64 = 75;
-/// Why a routed run's remote client cannot start: none is built yet.
-const NO_CLIENT: &str = "the bridge to remote.ps1 is not built yet";
 /// The status of a run whose client failed.
 #[cfg(feature = "test-seams")]
 const FAILED: i64 = 1;
@@ -57,6 +56,12 @@ pub(crate) trait RemoteClient {
         Ok(None)
     }
 
+    /// Whether the client has every part it starts, checked before the run takes a key lock or a remote slot: `Err`
+    /// with why one is missing, when the run falls back `client` at once.
+    fn ready(&self) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Runs the call to its end, or to its refusal, on the run's thread.
     fn run(&mut self, call: &RemoteCall<'_>) -> RemoteOutcome;
 }
@@ -65,7 +70,10 @@ pub(crate) trait RemoteClient {
 /// stops it.
 #[cfg_attr(
     not(feature = "test-seams"),
-    expect(dead_code, reason = "a gate without the test seams has only `NoClient`, which reads none of the call")
+    expect(
+        dead_code,
+        reason = "the bridge leaves the markers to the gate's verdict, and only the scripted client records them"
+    )
 )]
 pub(crate) struct RemoteCall<'a> {
     pub host: &'a str,
@@ -114,22 +122,13 @@ impl RemoteOutcome {
     }
 
     /// A client that could not start, for `why`.
-    fn not_started(why: String) -> RemoteOutcome {
+    pub(crate) fn not_started(why: String) -> RemoteOutcome {
         RemoteOutcome {
             status: REFUSED,
             reason: Some(FallbackReason::Client),
             detail: Some(why),
             ..RemoteOutcome::default()
         }
-    }
-}
-
-/// No client: every call is one that could not start.
-pub(crate) struct NoClient;
-
-impl RemoteClient for NoClient {
-    fn run(&mut self, _call: &RemoteCall<'_>) -> RemoteOutcome {
-        RemoteOutcome::not_started(NO_CLIENT.to_owned())
     }
 }
 
@@ -147,31 +146,33 @@ fn say<S: AsRef<str>>(log: &Path, lines: &[S], mut stream: impl Write) -> Result
 }
 
 /// The client `request` names: the one of `--test-remote-snapshot`, else the Rust client of `--test-remote-transport`,
-/// else the scripted one of `--test-remote-client`, else none; or the line saying why its transport or its step file
-/// cannot be used.
+/// else the scripted one of `--test-remote-client`, else the bridge, with the remote.ps1 of `--test-remote-script` and
+/// the pwsh of `--test-bridge-pwsh` when given; or the line saying why its transport or its step file cannot be used.
 #[cfg(feature = "test-seams")]
-pub(crate) fn chosen(request: &RunRequest) -> Result<Option<Box<dyn RemoteClient>>, String> {
+pub(crate) fn chosen(request: &RunRequest) -> Result<Box<dyn RemoteClient>, String> {
     if request.test_seams.remote_snapshot {
         let limit = git::limit(&request.test_seams);
-        return Ok(Some(Box::new(snapshot_only::SnapshotOnly { limit })));
+        return Ok(Box::new(snapshot_only::SnapshotOnly { limit }));
     }
     if let Some(transport) = &request.test_seams.remote_transport {
-        return client::RustClient::local(request, transport).map(|client| Some(Box::new(client) as Box<dyn RemoteClient>));
+        return client::RustClient::local(request, transport).map(|client| Box::new(client) as Box<dyn RemoteClient>);
     }
-    match &request.test_seams.remote_client {
-        Some(path) => scripted::ScriptedClient::load(path).map(|client| Some(Box::new(client) as Box<dyn RemoteClient>)),
-        None => Ok(None),
+    let seams = &request.test_seams;
+    if let Some(path) = &seams.remote_client {
+        return scripted::ScriptedClient::load(path).map(|client| Box::new(client) as Box<dyn RemoteClient>);
     }
+    let bridge = bridge::Bridge::new(seams.remote_script.clone(), seams.bridge_pwsh.clone());
+    Ok(Box::new(bridge))
 }
 
-/// The client `request` names: none in a gate built without the test seams.
+/// The client `request` names: the bridge, in a gate built without the test seams.
 #[cfg(not(feature = "test-seams"))]
 #[expect(
     clippy::unnecessary_wraps,
     reason = "the signature of the test-seams build, whose step file can fail to load"
 )]
-pub(crate) fn chosen(_request: &RunRequest) -> Result<Option<Box<dyn RemoteClient>>, String> {
-    Ok(None)
+pub(crate) fn chosen(_request: &RunRequest) -> Result<Box<dyn RemoteClient>, String> {
+    Ok(Box::new(bridge::Bridge::new(None, None)))
 }
 
 /// The client of `--test-remote-snapshot`: makes the snapshot and bridge commits of the call's worktree and says each

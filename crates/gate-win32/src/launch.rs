@@ -1,30 +1,35 @@
 //! Commands created suspended, with an explicit environment and exactly three inherited handles (stdin from `NUL`,
-//! stdout to the log, stderr to the log's `.err` file), then put in a job and resumed, so nothing they start runs
-//! outside the job.
+//! stdout to the log and stderr to the log's `.err` file; or stdin and stdout each a pipe this process holds the other
+//! end of, and stderr this process's own), then put in a job and resumed, so nothing they start runs outside the job.
 
 use std::cmp::Ordering;
 use std::ffi::{OsStr, OsString};
+use std::fs::File;
 use std::io;
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use proc_table::win32::OwnedHandle;
-use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT};
+use windows_sys::Win32::Foundation::{
+    DUPLICATE_SAME_ACCESS, DuplicateHandle, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT,
+};
 use windows_sys::Win32::Globalization::{CSTR_EQUAL, CSTR_GREATER_THAN, CSTR_LESS_THAN, CompareStringOrdinal};
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, CREATE_NEW, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_CREATION_DISPOSITION,
     FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TYPE_DISK,
     GetFileInformationByHandle, GetFileType, OPEN_EXISTING, SECURITY_ANONYMOUS, SECURITY_SQOS_PRESENT,
 };
+use windows_sys::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE};
 use windows_sys::Win32::System::Threading::{
-    BELOW_NORMAL_PRIORITY_CLASS, GetExitCodeProcess, HIGH_PRIORITY_CLASS, OpenProcess, PROCESS_CREATION_FLAGS, PROCESS_TERMINATE, ResumeThread,
-    TerminateProcess, WaitForSingleObject,
+    BELOW_NORMAL_PRIORITY_CLASS, GetCurrentProcess, GetExitCodeProcess, HIGH_PRIORITY_CLASS, OpenProcess, PROCESS_CREATION_FLAGS, PROCESS_TERMINATE,
+    ResumeThread, TerminateProcess, WaitForSingleObject,
 };
 use windows_sys::Win32::System::WindowsProgramming::PROCESS_CREATION_DESKTOP_APP_BREAKAWAY_DISABLE_PROCESS_TREE;
 
 use crate::create::{Creation, Inherited, check_launch, create_inheriting};
-use crate::interrupt::{Woken, wait_with};
+use crate::interrupt::{Woken, wait_again_with, wait_with};
+use crate::piped::{pipe_from_child, pipe_to_child};
 use crate::{Interrupt, Job, own_handle, wait_millis, win32_message};
 
 /// A Unicode environment block, its entries sorted by name as `CreateProcessW` wants them.
@@ -133,13 +138,37 @@ pub struct Launch {
     pub directory: PathBuf,
     /// The command's whole environment.
     pub environment: EnvironmentBlock,
-    /// The file the command's stdout goes to, created afresh.
-    pub log: PathBuf,
-    /// The file the command's stderr goes to, created afresh: the log's `.err` file.
-    pub err_log: PathBuf,
+    /// Where the command's stdin comes from and its stdout and stderr go.
+    pub output: LaunchOutput,
     /// The priority class to create the command in; with `None` it gets `NORMAL`, or this process's class when that is
     /// below normal or idle, as `CreateProcessW` gives a command no class is asked for.
     pub priority: Option<PriorityClass>,
+}
+
+/// Where a command's stdin comes from and its stdout and stderr go.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LaunchOutput {
+    /// stdin from `NUL`, and stdout and stderr each to a file created afresh.
+    Files {
+        /// The file the command's stdout goes to.
+        log: PathBuf,
+        /// The file the command's stderr goes to: the log's `.err` file.
+        err_log: PathBuf,
+    },
+    /// stdin and stdout each a new pipe whose other end this process keeps ([`Suspended::take_pipes`]), and stderr
+    /// this process's own stderr as it stands when the command is created, or `NUL` when this process has none: the
+    /// command's stderr lines reach whatever this process's own lines reach.
+    Piped,
+}
+
+/// This process's ends of the pipes of a command launched with [`LaunchOutput::Piped`]; neither is inheritable.
+#[derive(Debug)]
+pub struct StdioPipes {
+    /// The write end of the command's stdin: the command reads to its end once this is dropped.
+    pub stdin: File,
+    /// The read end of the command's stdout, which reaches its end once every process holding the write end has closed
+    /// it or exited.
+    pub stdout: File,
 }
 
 /// A priority class a command can be created in.
@@ -207,11 +236,14 @@ pub(crate) fn refused(problem: String) -> LaunchError {
 
 impl Launch {
     /// Creates the command suspended, in its working folder with its environment and priority class, sharing this
-    /// process's console and process group. Its stdin is `NUL`, its stdout the log and its stderr the `.err` file,
-    /// each created afresh (an earlier file at the path is deleted first, and a link at it is never followed) and open
+    /// process's console and process group, so a console Ctrl+C reaches it as it reaches this process. With
+    /// [`LaunchOutput::Piped`] its stdin and stdout are the command's ends of two new pipes, whose other ends the
+    /// returned [`Suspended`] holds until [`Suspended::take_pipes`] takes them, and its stderr a copy of this process's
+    /// own. With [`LaunchOutput::Files`] its stdin is `NUL`, its stdout the log and its stderr the `.err` file, each
+    /// file created afresh (an earlier file at the path is deleted first, and a link at it is never followed) and open
     /// to every process for reading, writing and deleting while the command writes them, so a process the command left
-    /// running cannot keep the next run from replacing them; it inherits those three
-    /// handles and no other. This process's own handles to them are never inheritable: the command inherits copies
+    /// running cannot keep the next run from replacing them. Either way it inherits those three handles and no other.
+    /// This process's own handles to them are never inheritable: the command inherits copies
     /// open only while the spawn lock is held, so no process started meanwhile through [`crate::spawn`] or another
     /// launch inherits them. It is created with the desktop-app policy
     /// `PROCESS_CREATION_DESKTOP_APP_BREAKAWAY_DISABLE_PROCESS_TREE`, as the PowerShell gate creates it: Microsoft's
@@ -224,15 +256,24 @@ impl Launch {
     /// (an application that is relative or a batch file, or a NUL in the application, command line, working folder,
     /// log or `.err` path) or a handle or the attribute list cannot be made.
     pub fn start_suspended(&self) -> Result<Suspended, LaunchError> {
-        let paths = [
-            ("working folder", self.directory.as_path()),
-            ("log", self.log.as_path()),
-            ("err log", self.err_log.as_path()),
-        ];
+        let mut paths = vec![("working folder", self.directory.as_path())];
+        if let LaunchOutput::Files { log, err_log } = &self.output {
+            paths.extend([("log", log.as_path()), ("err log", err_log.as_path())]);
+        }
         check_launch(&self.command_line, &self.application, &paths)?;
-        let input = open_shared(Path::new("NUL"), GENERIC_READ, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL)?;
-        let output = create_output(&self.log)?;
-        let errors = create_output(&self.err_log)?;
+        let mut pipes = None;
+        let (input, output, errors) = match &self.output {
+            LaunchOutput::Files { log, err_log } => {
+                let input = open_shared(Path::new("NUL"), GENERIC_READ, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL)?;
+                (input, create_output(log)?, create_output(err_log)?)
+            }
+            LaunchOutput::Piped => {
+                let (input, stdin) = pipe_to_child("stdin")?;
+                let (stdout, output) = pipe_from_child("stdout")?;
+                pipes = Some(StdioPipes { stdin, stdout });
+                (input, output, own_stderr()?)
+            }
+        };
         let creation = Creation {
             application: &self.application,
             command_line: &self.command_line,
@@ -244,8 +285,41 @@ impl Launch {
             others: &[],
         };
         let policy = PROCESS_CREATION_DESKTOP_APP_BREAKAWAY_DISABLE_PROCESS_TREE;
-        create_inheriting(&creation, self.priority.map_or(0, PriorityClass::flag), &inherited, Some(policy))
+        let mut suspended = create_inheriting(&creation, self.priority.map_or(0, PriorityClass::flag), &inherited, Some(policy))?;
+        // The command holds its own copies of its ends now; with these closed, each pipe ends when the command's does.
+        drop((input, output, errors));
+        suspended.pipes = pipes;
+        Ok(suspended)
     }
+}
+
+/// A copy of this process's stderr handle, never inheritable, or a handle to `NUL` when this process has no stderr.
+fn own_stderr() -> Result<OwnedHandle, LaunchError> {
+    let operation = "copy this process's stderr for the command";
+    // SAFETY: `GetStdHandle` takes no pointers.
+    let stderr = unsafe { GetStdHandle(STD_ERROR_HANDLE) };
+    if stderr.is_null() || stderr == INVALID_HANDLE_VALUE {
+        return open_shared(Path::new("NUL"), GENERIC_WRITE, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL);
+    }
+    let mut copy: HANDLE = std::ptr::null_mut();
+    // SAFETY: both process handles are this process's pseudo-handle, which is always open; the std handle stays open
+    // for the whole call, as nothing in this crate closes it, and `copy` is writable. The copy is not inheritable.
+    let copied = unsafe {
+        DuplicateHandle(
+            GetCurrentProcess(),
+            stderr,
+            GetCurrentProcess(),
+            &raw mut copy,
+            0,
+            0,
+            DUPLICATE_SAME_ACCESS,
+        )
+    };
+    if copied == 0 {
+        return Err(setup(io::Error::last_os_error(), operation));
+    }
+    // SAFETY: a success is a fresh handle nothing else owns.
+    unsafe { own_handle(copy) }.map_err(|error| setup(error, operation))
 }
 
 /// Whether `CreateProcessW` would run `path` through cmd.exe: its name, less the trailing dots and spaces Windows
@@ -335,6 +409,8 @@ pub struct Suspended {
     pub(crate) process: Option<OwnedHandle>,
     pub(crate) thread: OwnedHandle,
     pub(crate) pid: u32,
+    /// This process's ends of the command's pipes, for a [`LaunchOutput::Piped`] launch, until taken.
+    pub(crate) pipes: Option<StdioPipes>,
 }
 
 impl Suspended {
@@ -342,6 +418,12 @@ impl Suspended {
     #[must_use]
     pub fn pid(&self) -> u32 {
         self.pid
+    }
+
+    /// This process's ends of the command's stdin and stdout: `Some` once for a [`LaunchOutput::Piped`] launch, else
+    /// `None`. Ends not taken close when the command is resumed or dropped.
+    pub fn take_pipes(&mut self) -> Option<StdioPipes> {
+        self.pipes.take()
     }
 
     /// Puts the command in `job`, then lets it run, so nothing it starts can run outside the job.
@@ -452,6 +534,23 @@ impl Running {
         // SAFETY: the handle is open for as long as `self` lives, with the `SYNCHRONIZE` access a created process's
         // handle has.
         match unsafe { wait_with(interrupt, self.process.raw(), timeout) }? {
+            Woken::Signaled => self.exit_code().map(Waited::Exited),
+            Woken::Interrupted => Ok(Waited::Interrupted),
+            Woken::TimedOut => Ok(Waited::Running),
+        }
+    }
+
+    /// Waits at most `timeout` for the command to exit or `interrupt` to be raised a second time, as
+    /// [`Running::wait_or_interrupt`] does for the first: a caller that let the first press through waits here for
+    /// another. A second press that came before the call ends it at once.
+    ///
+    /// # Errors
+    ///
+    /// The system's error when the wait fails or the exit code cannot be read.
+    pub fn wait_or_interrupt_again(&self, timeout: Duration, interrupt: Interrupt) -> io::Result<Waited> {
+        // SAFETY: the handle is open for as long as `self` lives, with the `SYNCHRONIZE` access a created process's
+        // handle has.
+        match unsafe { wait_again_with(interrupt, self.process.raw(), timeout) }? {
             Woken::Signaled => self.exit_code().map(Waited::Exited),
             Woken::Interrupted => Ok(Waited::Interrupted),
             Woken::TimedOut => Ok(Waited::Running),

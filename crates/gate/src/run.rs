@@ -15,7 +15,7 @@ use std::{fs, io};
 use gate_args::{ProgramSearch, RunRequest, Slot, batch_command_line, batch_refusal, command_line, is_batch_target, resolve_program};
 use gate_router::{RemoteRun, Route};
 use gate_state::{FallbackReason, JournalEvent, KernelObject, RemoteTag, RunFacts, StateRoot, Verdict, log_hash};
-use gate_win32::{AcquireError, Interrupt, Job, Launch, LaunchError, NamedMutex, OwnedMutexGuard, PriorityClass, Running};
+use gate_win32::{AcquireError, Interrupt, Job, Launch, LaunchError, LaunchOutput, NamedMutex, OwnedMutexGuard, PriorityClass, Running};
 use jiff::Timestamp;
 
 use crate::acquire;
@@ -26,7 +26,7 @@ use crate::journal::RunJournal;
 use crate::log::Log;
 use crate::machine::{self, Machine, MachineWait, MachineWaited};
 use crate::nesting::{Nesting, Parent};
-use crate::remote::{self, NoClient, RemoteCall, RemoteClient, RemoteOutcome};
+use crate::remote::{self, RemoteCall, RemoteClient, RemoteOutcome};
 use crate::resolve::{Environment, ResolvedRoot};
 use crate::route;
 use crate::slots::{self, ClaimOf, Pool, Survey, Taken, ThisGate, epoch_ms};
@@ -164,8 +164,8 @@ fn admitted(request: &RunRequest, log: &Path, root: &ResolvedRoot, environment: 
 }
 
 /// The run's plan and its remote client, or the failure that stops it before its log is taken: the command as given,
-/// and the client a routed run calls, if the gate has one.
-fn ready(request: &RunRequest, at: &Where<'_>, console: &mut Console) -> Result<(Plan, Option<Box<dyn RemoteClient>>), NotRun> {
+/// and the client a routed run calls.
+fn ready(request: &RunRequest, at: &Where<'_>, console: &mut Console) -> Result<(Plan, Box<dyn RemoteClient>), NotRun> {
     let plan = Plan::prepare(request, &request.command, at, console)?;
     let client = remote::chosen(request).map_err(NotRun::failed)?;
     Ok((plan, client))
@@ -321,8 +321,10 @@ impl Plan {
                 command_line,
                 directory: folder,
                 environment,
-                log: log.path().to_owned(),
-                err_log: log.err_path().to_owned(),
+                output: LaunchOutput::Files {
+                    log: log.path().to_owned(),
+                    err_log: log.err_path().to_owned(),
+                },
                 priority: priority(nesting.runs_as(request.slot), console),
             }),
         };
@@ -421,8 +423,8 @@ struct Run<'a> {
     survey: Survey,
     /// The machine's processors and the console interrupt, read once for the run.
     host: Host,
-    /// The remote client a routed run calls, until it is called; `None` when there is none.
-    client: Option<Box<dyn RemoteClient>>,
+    /// The remote client a routed run calls.
+    client: Box<dyn RemoteClient>,
     /// The remote tag of a routed run, which its journal lines and remote claim carry until its fallback.
     tag: Option<RemoteTag>,
     /// The run's first arrival in Unix epoch milliseconds, which every ticket it writes keeps.
@@ -430,6 +432,27 @@ struct Run<'a> {
     /// Whether the run's light parent lent it its slot while a critical request drained, before it queued or once it
     /// journalled `parent` as it waited, so it takes, journals and releases no slot.
     lent: bool,
+}
+
+/// The client's call for `remote`, with the run's log, limits and interrupt, made of the run's parts so the run's
+/// client can be borrowed apart from them.
+fn call_of<'r>(request: &'r RunRequest, log: &'r Log, host: &Host, root: &'r ResolvedRoot, remote: &'r RemoteRun) -> RemoteCall<'r> {
+    RemoteCall {
+        host: &remote.host,
+        key: &remote.key,
+        root: &remote.root,
+        repo: &remote.repo,
+        subfolder: &remote.subfolder,
+        words: &remote.words,
+        outputs: &remote.outputs,
+        log: log.path(),
+        timeout: request.timeout,
+        stall: request.stall,
+        tail: request.tail,
+        no_markers: request.no_markers,
+        interrupt: host.interrupt,
+        state: &root.root,
+    }
 }
 
 /// The slot a run holds, or the machine a critical run holds, once it has taken it, and when it took it.
@@ -616,15 +639,14 @@ impl Run<'_> {
 
     /// Runs the routed command on the builder: takes the client's work-folder key lock and a remote slot into `hold`,
     /// calls the client and ends the run as the client ended it, the lock held until then. A key lock held elsewhere, a
-    /// full remote pool, a refusal or a client that cannot start falls back here; with no client at all the run falls
-    /// back before it takes a remote slot. A Ctrl+C ends the run here, with the remote slot released: one raised before
-    /// the call, or during it over a refusal. A client that ended on its own keeps its own status.
+    /// full remote pool, a refusal or a client that cannot start falls back here; with a client missing a part, the run
+    /// falls back before it takes a remote slot. A Ctrl+C ends the run here, with the remote slot released: one raised
+    /// before the call, or during it over a refusal. A client that ended on its own keeps its own status.
     fn routed(&mut self, remote: &RemoteRun, hold: &mut Hold, console: &mut Console) -> Remotely {
-        let Some(mut client) = self.client.take() else {
-            let outcome = NoClient.run(&self.call(remote));
-            return self.fell_back(FallbackReason::Client, &outcome, None, console);
-        };
-        let _key = match self.hold_remote(client.as_ref(), remote, hold, console) {
+        if let Err(why) = self.client.ready() {
+            return self.fell_back(FallbackReason::Client, &RemoteOutcome::not_started(why), None, console);
+        }
+        let _key = match self.hold_remote(remote, hold, console) {
             Ok(key) => key,
             Err(remotely) => return remotely,
         };
@@ -634,7 +656,8 @@ impl Run<'_> {
             return Remotely::Ended(self.interrupted_before_start(console));
         }
         let started = Instant::now();
-        let outcome = client.run(&self.call(remote));
+        let call = call_of(self.request, &self.log, &self.host, self.root, remote);
+        let outcome = self.client.run(&call);
         let fallback = outcome.fallback();
         // A Ctrl+C during the call wins over a refusal: the command never runs here.
         if fallback.is_some() && self.host.interrupt.is_some_and(Interrupt::is_raised) {
@@ -646,17 +669,12 @@ impl Run<'_> {
         }
     }
 
-    /// Takes the work-folder key lock `client` takes, without waiting, then a remote slot into `hold`: the lock, held
-    /// until the remote attempt ends. Else how the run goes on: here, `busy`, when the lock is held elsewhere or cannot
-    /// be opened or taken, which says why; here, `full`, when the pool stayed full; or interrupted during the wait.
-    fn hold_remote(
-        &mut self,
-        client: &dyn RemoteClient,
-        remote: &RemoteRun,
-        hold: &mut Hold,
-        console: &mut Console,
-    ) -> Result<Option<OwnedMutexGuard>, Remotely> {
-        let held = client.hold_key(&self.call(remote));
+    /// Takes the work-folder key lock the run's client takes, without waiting, then a remote slot into `hold`: the
+    /// lock, held until the remote attempt ends. Else how the run goes on: here, `busy`, when the lock is held
+    /// elsewhere or cannot be opened or taken, which says why; here, `full`, when the pool stayed full; or interrupted
+    /// during the wait.
+    fn hold_remote(&mut self, remote: &RemoteRun, hold: &mut Hold, console: &mut Console) -> Result<Option<OwnedMutexGuard>, Remotely> {
+        let held = self.client.hold_key(&self.call(remote));
         let key = match held {
             Ok(key) => key,
             Err(why) => {
@@ -677,22 +695,7 @@ impl Run<'_> {
 
     /// The client's call for `remote`, with the run's log, limits and interrupt.
     fn call<'r>(&'r self, remote: &'r RemoteRun) -> RemoteCall<'r> {
-        RemoteCall {
-            host: &remote.host,
-            key: &remote.key,
-            root: &remote.root,
-            repo: &remote.repo,
-            subfolder: &remote.subfolder,
-            words: &remote.words,
-            outputs: &remote.outputs,
-            log: self.log.path(),
-            timeout: self.request.timeout,
-            stall: self.request.stall,
-            tail: self.request.tail,
-            no_markers: self.request.no_markers,
-            interrupt: self.host.interrupt,
-            state: &self.root.root,
-        }
+        call_of(self.request, &self.log, &self.host, self.root, remote)
     }
 
     /// Gives up the remote attempt for `reason`: journals the fallback, the run's last line with the remote tag, while

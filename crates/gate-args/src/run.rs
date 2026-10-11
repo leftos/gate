@@ -41,6 +41,10 @@ pub(crate) enum ValueOption {
     RemoteSsh,
     #[cfg(feature = "test-seams")]
     RemoteRetryPauseMs,
+    #[cfg(feature = "test-seams")]
+    RemoteScript,
+    #[cfg(feature = "test-seams")]
+    BridgePwsh,
 }
 
 /// An option that is on or off.
@@ -163,6 +167,10 @@ impl RunBuilder {
             ValueOption::RemoteSsh => self.test_seams.remote_ssh = Some(PathBuf::from(value)),
             #[cfg(feature = "test-seams")]
             ValueOption::RemoteRetryPauseMs => self.test_seams.remote_retry_pause_ms = Some(values::above_zero(spelled, value)?),
+            #[cfg(feature = "test-seams")]
+            ValueOption::RemoteScript => self.test_seams.remote_script = Some(PathBuf::from(value)),
+            #[cfg(feature = "test-seams")]
+            ValueOption::BridgePwsh => self.test_seams.bridge_pwsh = Some(PathBuf::from(value)),
         }
         Ok(())
     }

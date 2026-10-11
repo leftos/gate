@@ -9,7 +9,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use gate_win32::{EnvironmentBlock, EventWait, Interrupt, Job, Launch, NamedEvent, Waited};
+use gate_win32::{EnvironmentBlock, EventWait, Interrupt, Job, Launch, LaunchOutput, NamedEvent, Waited};
 
 /// The longest any wait of this test may take: a guard against a hang, never a timing bound.
 const HANG_GUARD: Duration = Duration::from_secs(600);
@@ -32,8 +32,10 @@ fn launch(dir: &Path, line: &str) -> Launch {
         command_line: line.encode_utf16().collect(),
         directory: dir.to_path_buf(),
         environment: EnvironmentBlock::new(std::env::vars_os()).expect("the block is built"),
-        log: dir.join("out.log"),
-        err_log: dir.join("out.log.err"),
+        output: LaunchOutput::Files {
+            log: dir.join("out.log"),
+            err_log: dir.join("out.log.err"),
+        },
         priority: None,
     }
 }

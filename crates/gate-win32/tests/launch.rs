@@ -2,18 +2,21 @@
 //! resumed: nothing runs before the resume, the exit code and the output bytes come back, and a start failure carries
 //! the Windows message. The job holds what the command starts, a process whose parent has exited included, and ends
 //! them all at once; a job name already held is refused. A launch that names its program loosely, a batch file, or a
-//! NUL is refused; the log is created afresh, never through a link; a suspended command that is dropped is ended.
+//! NUL is refused; the log is created afresh, never through a link; a suspended command that is dropped is ended. A
+//! piped command reads what is written to its stdin pipe, writes its stdout to its pipe and its stderr to this
+//! process's own, its job holds it and its environment is the block given.
 
 #![cfg(windows)]
 #![expect(clippy::expect_used, reason = "a test that cannot start or wait for its command must fail loudly")]
 
 use std::ffi::OsString;
 use std::fs;
-use std::io;
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use gate_win32::{EnvironmentBlock, Job, Launch, LaunchError, PriorityClass, Running, win32_message};
+use gate_win32::{EnvironmentBlock, Job, Launch, LaunchError, LaunchOutput, PriorityClass, Running, win32_message};
 use proc_table::ProcessTable;
 use proc_table::win32::{OwnedHandle, Win32ProcessTable, open_process};
 use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
@@ -56,11 +59,44 @@ fn launch(dir: &Path, application: &Path, line: &str, extra: &[(&str, &str)]) ->
         command_line: line.encode_utf16().collect(),
         directory: dir.to_path_buf(),
         environment: EnvironmentBlock::new(std::env::vars_os().chain(overrides)).expect("the block is built"),
-        log: dir.join("out.log"),
-        err_log: dir.join("out.log.err"),
+        output: LaunchOutput::Files {
+            log: dir.join("out.log"),
+            err_log: dir.join("out.log.err"),
+        },
         priority: None,
     }
 }
+
+/// The command `line` of `application` to run in `dir` with `environment`, its stdin and stdout piped and its stderr
+/// this process's own.
+fn piped(dir: &Path, application: PathBuf, line: &str, environment: EnvironmentBlock) -> Launch {
+    Launch {
+        application,
+        command_line: line.encode_utf16().collect(),
+        directory: dir.to_path_buf(),
+        environment,
+        output: LaunchOutput::Piped,
+        priority: None,
+    }
+}
+
+/// Starts `launch`, puts it in a fresh job named for `test`, writes `input` to its stdin and closes it, and lets it
+/// run to its exit code: that, and what it wrote to its stdout.
+fn run_piped(test: &str, launch: &Launch, input: &[u8]) -> (u32, String) {
+    let job = Job::create(&unique_name(test)).expect("the job is created");
+    let mut suspended = launch.start_suspended().expect("the command starts");
+    let mut pipes = suspended.take_pipes().expect("a piped launch has pipes");
+    assert!(suspended.take_pipes().is_none(), "the pipes are taken once");
+    let running = suspended.assign_and_resume(&job).expect("the command is assigned and resumed");
+    pipes.stdin.write_all(input).expect("the command's stdin is written");
+    drop(pipes.stdin);
+    let mut output = String::new();
+    pipes.stdout.read_to_string(&mut output).expect("the command's stdout is read to its end");
+    (exit_code(&running), output)
+}
+
+/// The variable naming the folder the helper case runs its piped command in; unset, the helper does nothing.
+const HELPER: &str = "GATE_WIN32_TEST_PIPED_HELPER";
 
 /// The exit code of the process behind `process`, once it has exited.
 fn exit_code_of(process: &OwnedHandle) -> u32 {
@@ -290,6 +326,98 @@ fn a_job_holds_a_grandchild_whose_parent_has_exited_and_terminate_ends_it() {
     job.terminate(124).expect("the job is terminated");
 
     assert_eq!(exit_code_of(&process), 124, "terminating the job ended ping");
+}
+
+/// Run by [`a_piped_command_writes_stdout_to_its_pipe_and_stderr_to_this_process_s`] in a process of its own, whose
+/// stderr and stdout that case reads: a piped command writes a line to each of its own, and the helper asserts the
+/// stdout line came through the pipe.
+#[test]
+fn piped_helper() {
+    let Some(dir) = std::env::var_os(HELPER) else {
+        return;
+    };
+    let environment = EnvironmentBlock::new(std::env::vars_os()).expect("the block is built");
+    let launch = piped(Path::new(&dir), cmd(), "cmd /d /c echo child-stdout&1>&2 echo child-stderr", environment);
+
+    let (code, output) = run_piped("helper", &launch, b"");
+
+    assert_eq!((code, output.as_str()), (0, "child-stdout\r\n"));
+}
+
+#[test]
+fn a_piped_command_writes_stdout_to_its_pipe_and_stderr_to_this_process_s() {
+    let dir = case_dir("piped");
+    let mut command = Command::new(std::env::current_exe().expect("the test binary is known"));
+    command
+        .args(["piped_helper", "--exact", "--nocapture", "--test-threads", "1"])
+        .env(HELPER, &dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = gate_win32::spawn(&mut command)
+        .expect("the helper starts")
+        .wait_with_output()
+        .expect("the helper ends");
+
+    let (stdout, stderr) = (String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    assert!(output.status.success(), "{stdout}\n{stderr}");
+    assert!(stderr.contains("child-stderr"), "the command's stderr is the helper's: {stderr}");
+    assert!(
+        !stdout.contains("child-stdout") && !stderr.contains("child-stdout"),
+        "the command's stdout goes to its pipe alone: {stdout}\n{stderr}"
+    );
+}
+
+#[test]
+fn a_piped_command_reads_what_is_written_to_its_stdin() {
+    let dir = case_dir("piped-stdin");
+    let environment = EnvironmentBlock::new(std::env::vars_os()).expect("the block is built");
+    let launch = piped(&dir, system_program(r"System32\sort.exe"), "sort", environment);
+
+    let (code, output) = run_piped("piped-stdin", &launch, b"second\r\nfirst\r\n");
+
+    assert_eq!((code, output.as_str()), (0, "first\r\nsecond\r\n"));
+}
+
+#[test]
+fn a_piped_command_is_in_its_job_and_ends_with_it() {
+    let dir = case_dir("piped-job");
+    let job = Job::create(&unique_name("piped-job")).expect("the job is created");
+    let environment = EnvironmentBlock::new(std::env::vars_os()).expect("the block is built");
+    let running = piped(&dir, cmd(), "cmd /d /c ping -n 120 127.0.0.1 >nul", environment)
+        .start_suspended()
+        .expect("the command starts")
+        .assign_and_resume(&job)
+        .expect("the command is assigned and resumed");
+
+    assert!(
+        job.process_ids().expect("the job lists its processes").contains(&running.pid()),
+        "the command is in the job"
+    );
+    job.terminate(124).expect("the job is terminated");
+    assert_eq!(exit_code(&running), 124, "terminating the job ended the command");
+}
+
+#[test]
+fn a_piped_command_gets_exactly_the_environment_given() {
+    let dir = case_dir("piped-env");
+    let system_root = std::env::var_os("SystemRoot").expect("SystemRoot is set");
+    let given = [
+        (OsString::from("SystemRoot"), system_root),
+        (OsString::from("GATE_WIN32_ONLY"), OsString::from("given")),
+    ];
+    let environment = EnvironmentBlock::new(given).expect("the block is built");
+
+    let (code, text) = run_piped("piped-env", &piped(&dir, cmd(), "cmd /d /c set", environment), b"");
+
+    assert_eq!(code, 0, "{text}");
+    // cmd.exe defines COMSPEC, PATHEXT and PROMPT itself when the block it is given lacks them.
+    let names: Vec<&str> = text
+        .lines()
+        .filter_map(|line| line.split_once('=').map(|(name, _)| name))
+        .filter(|name| !["COMSPEC", "PATHEXT", "PROMPT"].contains(name))
+        .collect();
+    assert_eq!(names, ["GATE_WIN32_ONLY", "SystemRoot"], "{text}");
 }
 
 #[test]

@@ -5,12 +5,13 @@
 
 use std::fs::File;
 use std::io;
-use std::os::windows::io::FromRawHandle;
+use std::os::windows::io::{AsRawHandle, FromRawHandle};
 use std::path::{Path, PathBuf};
 
 use proc_table::win32::OwnedHandle;
-use windows_sys::Win32::Foundation::{GENERIC_READ, HANDLE};
+use windows_sys::Win32::Foundation::{ERROR_NOT_FOUND, ERROR_OPERATION_ABORTED, GENERIC_READ, HANDLE};
 use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_NORMAL, OPEN_EXISTING};
+use windows_sys::Win32::System::IO::CancelIoEx;
 use windows_sys::Win32::System::JobObjects::{
     IsProcessInJob, JOB_OBJECT_LIMIT_BREAKAWAY_OK, JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
     JobObjectExtendedLimitInformation, OpenJobObjectW, QueryInformationJobObject,
@@ -79,8 +80,8 @@ impl PipedLaunch {
         check_launch(&self.command_line, &self.application, &[("working folder", self.directory.as_path())])?;
         let job_handle = open_job(job)?;
         let input = open_shared(Path::new("NUL"), GENERIC_READ, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL)?;
-        let (stdout, output) = pipe("stdout")?;
-        let (stderr, errors) = pipe("stderr")?;
+        let (stdout, output) = pipe_from_child("stdout")?;
+        let (stderr, errors) = pipe_from_child("stderr")?;
         let creation = Creation {
             application: &self.application,
             command_line: &self.command_line,
@@ -146,20 +147,100 @@ fn open_job(job: &Job) -> Result<OwnedHandle, LaunchError> {
         .map_err(|error| setup(error, &format!("open the job {} for the command to inherit", job.name())))
 }
 
-/// A new pipe for the command's `stream`, neither end inheritable: the read end, as a file this process reads, and
-/// the write end, for the command.
-fn pipe(stream: &str) -> Result<(File, OwnedHandle), LaunchError> {
+/// A new pipe the command writes its `stream` to, neither end inheritable: the read end, as a file this process reads,
+/// and the write end, for the command.
+pub(crate) fn pipe_from_child(stream: &str) -> Result<(File, OwnedHandle), LaunchError> {
     let operation = format!("create the {stream} pipe");
-    let mut read: HANDLE = std::ptr::null_mut();
-    let mut write: HANDLE = std::ptr::null_mut();
-    // SAFETY: both handle pointers are writable; no security attributes are passed, so neither end is inheritable,
-    // and size 0 asks for the default buffer.
-    if unsafe { CreatePipe(&raw mut read, &raw mut write, std::ptr::null(), 0) } == 0 {
-        return Err(setup(io::Error::last_os_error(), &operation));
-    }
+    let (read, write) = new_pipe(&operation)?;
     // SAFETY: a success returns two fresh handles nothing else owns; each gets exactly one owner here.
     let reader = File::from(unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(read) });
     // SAFETY: as above, for the write end.
     let writer = unsafe { own_handle(write) }.map_err(|error| setup(error, &operation))?;
     Ok((reader, writer))
+}
+
+/// A new pipe the command reads its `stream` from, neither end inheritable: the read end, for the command, and the
+/// write end, as a file this process writes.
+pub(crate) fn pipe_to_child(stream: &str) -> Result<(OwnedHandle, File), LaunchError> {
+    let operation = format!("create the {stream} pipe");
+    let (read, write) = new_pipe(&operation)?;
+    // SAFETY: a success returns two fresh handles nothing else owns; each gets exactly one owner here.
+    let writer = File::from(unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(write) });
+    // SAFETY: as above, for the read end.
+    let reader = unsafe { own_handle(read) }.map_err(|error| setup(error, &operation))?;
+    Ok((reader, writer))
+}
+
+/// The read and write ends of a new anonymous pipe, neither inheritable, for the caller to own; `operation` names the
+/// failure.
+fn new_pipe(operation: &str) -> Result<(HANDLE, HANDLE), LaunchError> {
+    let mut read: HANDLE = std::ptr::null_mut();
+    let mut write: HANDLE = std::ptr::null_mut();
+    // SAFETY: both handle pointers are writable; no security attributes are passed, so neither end is inheritable,
+    // and size 0 asks for the default buffer.
+    if unsafe { CreatePipe(&raw mut read, &raw mut write, std::ptr::null(), 0) } == 0 {
+        return Err(setup(io::Error::last_os_error(), operation));
+    }
+    Ok((read, write))
+}
+
+/// Cancels every read and write this process has pending on the open file `file` is a handle to, whichever thread
+/// issued it and through whichever handle to that file: each ends with an error [`cancelled`] knows. `false` when
+/// none was pending.
+///
+/// # Errors
+///
+/// The system's error when the requests cannot be cancelled.
+pub fn cancel_pending_io(file: &File) -> io::Result<bool> {
+    // SAFETY: the handle is open for the borrow's length; with no OVERLAPPED every request on it is cancelled.
+    if unsafe { CancelIoEx(file.as_raw_handle(), std::ptr::null()) } != 0 {
+        return Ok(true);
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(ERROR_NOT_FOUND.cast_signed()) {
+        return Ok(false);
+    }
+    Err(error)
+}
+
+/// Whether `error` ended a read or write [`cancel_pending_io`] cancelled.
+#[must_use]
+pub fn cancelled(error: &io::Error) -> bool {
+    error.raw_os_error() == Some(ERROR_OPERATION_ABORTED.cast_signed())
+}
+
+#[cfg(test)]
+#[expect(clippy::expect_used, reason = "a test that cannot make or use its pipe must fail loudly")]
+mod tests {
+    use std::fs::File;
+    use std::io::Read;
+    use std::os::windows::io::FromRawHandle;
+    use std::thread;
+    use std::time::Duration;
+
+    use super::{cancel_pending_io, cancelled, new_pipe};
+
+    /// A new anonymous pipe's read and write ends.
+    fn pipe() -> (File, File) {
+        let (read, write) = new_pipe("create the test pipe").expect("a pipe can be made");
+        // SAFETY: a success returns two fresh handles nothing else owns; each gets exactly one owner here.
+        unsafe { (File::from_raw_handle(read), File::from_raw_handle(write)) }
+    }
+
+    #[test]
+    fn cancelling_a_copy_ends_a_read_another_thread_waits_in() {
+        let (mut reader, _writer) = pipe();
+        let copy = reader.try_clone().expect("the read end can be copied");
+        assert!(!cancel_pending_io(&copy).expect("an idle pipe can be cancelled"), "nothing was pending");
+
+        let blocked = thread::spawn(move || reader.read(&mut [0_u8; 16]));
+        // The read waits on an empty pipe whose write end stays open; cancel until it has begun and been cut short.
+        while !blocked.is_finished() {
+            cancel_pending_io(&copy).expect("the read can be cancelled");
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        let error = blocked.join().expect("the reader returns").expect_err("a cancelled read fails");
+        assert!(cancelled(&error), "{error:?}");
+    }
 }

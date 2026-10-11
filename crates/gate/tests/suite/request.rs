@@ -15,6 +15,20 @@ fn assert_root_hash(request: &Value) {
 }
 
 #[test]
+fn print_request_shows_the_bridge_seams() {
+    let case = Case::new("print_request_shows_the_bridge_seams");
+    let mut seams = print_run(&["cmd"]);
+    seams.splice(7..7, ["--test-remote-script", r"case\remote.ps1", "--test-bridge-pwsh", "no-pwsh.exe"]);
+
+    let request = case.run(&seams).request();
+
+    assert_eq!(
+        (&request["testSeams"]["remoteScript"], &request["testSeams"]["bridgePwsh"]),
+        (&json!(r"case\remote.ps1"), &json!("no-pwsh.exe"))
+    );
+}
+
+#[test]
 fn print_request_shows_the_new_cli_request() {
     let case = Case::new("print_request_shows_the_new_cli_request");
     let outcome = case.run(&print_run(&["cmd", "/c", "echo hi"]));
@@ -51,6 +65,8 @@ fn print_request_shows_the_new_cli_request() {
             "remoteTransport": null,
             "remoteSsh": null,
             "remoteRetryPauseMs": null,
+            "remoteScript": null,
+            "bridgePwsh": null,
         },
     });
     assert_eq!(outcome.stdout, format!("{expected}\n"), "the keys come in the published order");

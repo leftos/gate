@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
-use gate_win32::{EnvironmentBlock, Job, Launch, OpenedJob};
+use gate_win32::{EnvironmentBlock, Job, Launch, LaunchOutput, OpenedJob};
 use jiff::{SignedDuration, Timestamp};
 use regex::Regex;
 use serde_json::{Value, json};
@@ -779,8 +779,10 @@ fn box_stop_refuses_a_job_name_not_of_its_work_folder() {
         command_line: format!("\"{FAKE_TOOL}\" wait \"{}\"", shown(&go)).encode_utf16().collect(),
         directory: case.folder(),
         environment: EnvironmentBlock::new(std::env::vars_os()).expect("the block is built"),
-        log: case.folder().join("held.log"),
-        err_log: case.folder().join("held.log.err"),
+        output: LaunchOutput::Files {
+            log: case.folder().join("held.log"),
+            err_log: case.folder().join("held.log.err"),
+        },
         priority: None,
     };
     let held = launch

@@ -8,10 +8,15 @@ use std::process::{Command, Stdio};
 
 use crate::support::{Case, FAKE_TOOL, Outcome, finish, shown, start, wait_for_journal_line, wait_until_closed};
 
-/// `tools/install.ps1`, the script under test: a checked-in file a case runs, found through the suite's one
-/// sanctioned route to the checkout.
+/// `tools/install.ps1`, the script under test: a checked-in file a case runs.
 fn script() -> PathBuf {
-    crate::checkout::repo_file("tools/install.ps1")
+    checked_in("install.ps1")
+}
+
+/// The checked-in file `name` of the repo's `tools` folder: the suite's one way to name a checked-in file, and the
+/// only caller of the checkout route, so a case that needs another file comes here rather than to the route itself.
+pub(crate) fn checked_in(name: &str) -> PathBuf {
+    crate::checkout::repo_file(&format!("tools/{name}"))
 }
 
 /// The user environment registry key a case's install reads and writes, removed when the guard goes, so no case
@@ -248,6 +253,22 @@ fn install_copies_the_exe_and_adds_the_path() {
         path_value(&key),
         Some(("ExpandString".to_owned(), dir)),
         "the folder is added once, as an expand-string"
+    );
+}
+
+#[test]
+fn install_puts_the_bridge_script_beside_the_exe() {
+    let case = Case::new("install_puts_the_bridge_script_beside_the_exe");
+    let key = EnvironmentKey::new("install_puts_the_bridge_script_beside_the_exe");
+    let exe = copy_gate(&case, "gate-a.exe");
+
+    let outcome = install(&case, &key, &["-Exe", &shown(&exe)]);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(
+        fs::read(install_dir(&case).join("remote-bridge.ps1")).expect("the bridge script is installed"),
+        fs::read(checked_in("remote-bridge.ps1")).expect("the checked-in bridge script can be read"),
+        "the installed bridge script is the checked-in one"
     );
 }
 

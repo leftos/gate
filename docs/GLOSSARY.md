@@ -13,7 +13,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Black-box suite**: the Rust integration suite (`crates/gate/tests/suite/`) that drives the built `gate.exe` through its CLI and reads only its exit code, output, log, journal, claims and tickets; it needs the `test-seams` feature to run.
 - **Box**: a builder; the word the gate's prose and its hidden `gate box` subcommand use.
 - **Box job**: the named job `Local\gate-remote-<key>-<12 hex>` that a `gate box run` puts its command in, named by the payload and stopped by `gate box stop`; it has no limits and no kill-on-close.
-- **Bridge**: the stand-in, until the remote port, by which `gate.exe` runs a routed run's remote part through the PowerShell remote client, `remote.ps1`.
+- **Bridge**: the stand-in, until the remote port, by which `gate.exe` runs a routed run's remote part through the PowerShell remote client, `remote.ps1`, through a **Shim**, with the request on pwsh's stdin and the answer as **Control lines**.
 - **Bridge commit**: a commit with a snapshot's tree whose parent is the previous snapshot, which the Rust remote client builds so a push can send only what changed; none when there is no previous snapshot. Not the **Bridge** to `remote.ps1`.
 - **Build client**: a process in the command's job that drives a build (`MSBuild.exe`, or `dotnet` without `--no-build`); only while one runs does a build server's CPU count as the command's progress.
 - **Build server**: a long-lived compiler or MSBuild node process (`VBCSCompiler`, a `dotnet` running `VBCSCompiler.dll` or an MSBuild node) that builds share.
@@ -22,6 +22,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Claim**: the JSON file `slots\<name>.json` a gate writes while it holds a slot, naming its pid, command, log and ceiling.
 - **Compatibility layer**: `gate.exe`'s acceptance of the PowerShell gate's argument form (`-Log`, `-TimeoutSeconds`, `-Slot` and the rest), kept until no caller uses it.
 - **Console donor**: the hidden system `cmd.exe /d /q /k` that `gate box run` puts in the command's job, whose console the box sets to UTF-8 and the command inherits; it lives until the wait for the command is over.
+- **Control line**: one JSON line, carrying the call's nonce, that the **Shim** writes on pwsh's stdout to answer the gate: `started`, the result (status, killed, reason) or an error; the request goes the other way on pwsh's stdin.
 - **Cores hint**: the end-of-run line saying how many cores the command kept busy and whether its slot kind fitted.
 - **Covered**: said of a nested gate whose parent's slot kind covers its own (heavy covers heavy and light, light covers light, critical covers all), so it takes no slot.
 - **Critical drain**: a critical gate's wait for the gates that arrived before it to free their slots, while it holds back the gates that arrive after it.
@@ -63,7 +64,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Pure crate**: a crate with no Windows types in its API that builds and unit-tests on Linux as well (`gate-state`, `gate-watchdog`, `gate-args`, `gate-router`).
 - **Refusal**: a builder's or the remote client's answer that a routed run cannot run there, with a reason (`busy`, `unreachable`, `parity`, `rebooted`, `tools`, `version`, `client`); the gate then falls back to a local run.
 - **Release**: see take.
-- **Remote client**: what `gate run` calls to run a routed command on a builder: `RemoteClient` in the gate binary; the `remote.ps1` bridge is to be its first client, and a gate with none built falls back with reason `client`.
+- **Remote client**: what `gate run` calls to run a routed command on a builder: `RemoteClient` in the gate binary; the `remote.ps1` bridge is the client of a production gate, and a client that cannot start makes the run fall back with reason `client`.
 - **Reserved field**: an optional field readers accept before any gate writes it, such as `expected` or `avgCores`.
 - **Reserved light slot**: one of the up to two highest light slots a critical gate never takes, so light gates run beside it.
 - **Rollover**: the move of `events.jsonl` over `events.1.jsonl` by the append that finds the journal at or above 5,242,880 bytes, followed by the archive of the rolled file.
@@ -76,7 +77,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Script word**: a command word holding a line break or one of `, ; " ' ) | & < >`, such as a script's text or a list; in it a path ends at white space, where in any other word a path runs through its spaces.
 - **Shadow end**: the expected end of the slowest gate a critical drain waits on, which closes the lent window.
 - **Shared compiler server**: a compiler server (`VBCSCompiler`) already running when the command started; its CPU counts as the command's progress only while the job holds a build client.
-- **Shim**: an extensionless script on PATH, such as the bash shims a plugin puts ahead of `uv` and `python`; program resolution skips it, since Windows cannot start it.
+- **Shim**: either an extensionless script on PATH, such as the bash shims a plugin puts ahead of `uv` and `python`, which program resolution skips since Windows cannot start it; or the repo-owned PowerShell script (`remote-bridge.ps1`) the **Bridge** runs, which dot-sources `remote.ps1` and calls its `Invoke-RemoteCommand`.
 - **Slot**: a named mutex in the session's `Local\` namespace that a gate holds for its command's whole run; the number of slots per pool caps how many commands run at once.
 - **Slot marker**: the environment variable `GATE_SLOT_HELD`, `<kind>:<pid>:<start>` (plus the root hash under a non-default root), which a gate sets for its command so a nested gate knows its parent.
 - **Snapshot**: either the parentless commit of a worktree as it stands, which a routed run sends to its builder; or the critical gate's record, at take, of the counts and the other gates' claims.

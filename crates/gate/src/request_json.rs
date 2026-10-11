@@ -41,6 +41,8 @@ pub(crate) fn run(request: &RunRequest, log: &Path, root: &ResolvedRoot) -> Stri
             "remoteTransport": seams.remote_transport,
             "remoteSsh": seams.remote_ssh.as_ref().map(|path| path.to_string_lossy()),
             "remoteRetryPauseMs": seams.remote_retry_pause_ms,
+            "remoteScript": seams.remote_script.as_ref().map(|path| path.to_string_lossy()),
+            "bridgePwsh": seams.bridge_pwsh.as_ref().map(|path| path.to_string_lossy()),
         },
     })
     .to_string()

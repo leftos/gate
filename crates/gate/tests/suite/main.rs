@@ -7,6 +7,7 @@
 )]
 
 mod boxside;
+mod bridge;
 mod build_servers;
 mod ceiling;
 mod checkout;

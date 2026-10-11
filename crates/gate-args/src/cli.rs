@@ -111,6 +111,8 @@ fn seam_option(name: &str) -> Option<RunOption> {
         "test-remote-transport" => Some(RunOption::Value(ValueOption::RemoteTransport)),
         "test-remote-ssh" => Some(RunOption::Value(ValueOption::RemoteSsh)),
         "test-remote-retry-pause-ms" => Some(RunOption::Value(ValueOption::RemoteRetryPauseMs)),
+        "test-remote-script" => Some(RunOption::Value(ValueOption::RemoteScript)),
+        "test-bridge-pwsh" => Some(RunOption::Value(ValueOption::BridgePwsh)),
         _ => None,
     }
 }

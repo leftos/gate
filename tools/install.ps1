@@ -123,8 +123,6 @@ function Remove-AsideCopy {
 }
 
 # Tells the running windows that the user's environment changed, as `setx` does, so a terminal started from Start or
-# Explorer after this install reads the new PATH. A broadcast that fails or times out is not an error.
-# Tells the running windows that the user's environment changed, as `setx` does, so a terminal started from Start or
 # Explorer after this install reads the new PATH. The interop is added inside the guard too, so a broadcast that fails
 # or times out, and even the type failing to load, is not an error.
 function Send-EnvironmentChange {
@@ -297,6 +295,23 @@ elseif ($PSCmdlet.ShouldProcess($dest, 'Install')) {
 
     if ($null -ne $oldVersion) { Write-Output "install: replaced gate $oldVersion" }
     Write-Output "install: installed gate $newVersion at $dest"
+}
+
+# The script gate.exe starts a routed run's remote.ps1 through, which gate.exe finds beside itself. It is copied beside
+# the installed one first and moved into place, so a gate never reads it half written.
+$bridge = Join-Path $PSScriptRoot 'remote-bridge.ps1'
+$bridgeDest = Join-Path $installDir 'remote-bridge.ps1'
+if ((Test-Path -LiteralPath $installDir) -and $PSCmdlet.ShouldProcess($bridgeDest, 'Install')) {
+    $bridgeTemp = $bridgeDest + '.' + $PID + '.tmp'
+    try {
+        Copy-Item -LiteralPath $bridge -Destination $bridgeTemp -Force -ErrorAction Stop
+        Move-Item -LiteralPath $bridgeTemp -Destination $bridgeDest -Force -ErrorAction Stop
+    }
+    catch {
+        Remove-Item -LiteralPath $bridgeTemp -Force -ErrorAction SilentlyContinue
+        Write-InstallError "install: could not install ${bridgeDest}: $($_.Exception.Message)"
+        exit 1
+    }
 }
 
 Add-UserPath -Folder $installDir -Key $EnvironmentKey -WhatIf:$WhatIfPreference
