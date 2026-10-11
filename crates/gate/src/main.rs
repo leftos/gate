@@ -17,6 +17,11 @@ mod journal;
 mod log;
 mod machine;
 mod nesting;
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "neither the box's run nor the remote client packs or fetches outputs yet")
+)]
+mod outputs;
 mod pause;
 mod priority;
 mod remote;

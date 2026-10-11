@@ -512,7 +512,9 @@ Changes from the PowerShell forms:
 
 What `gate.exe` does of it today is part A, nesting under the slot marker (N1, K7), part B1, the critical request's own drain and take (K1, K2, K5), the barrier (Q3), the light gates beside a critical request (K3), the lend (N2) and the pause markers' writer and reader (N3), all below. The watchdog reads the markers on every sample.
 
-- A gate reads `GATE_SLOT_HELD` once, before routing and before the log mutex (`nesting.rs`). A live parent whose slot covers the gate's kind (heavy covers heavy and light, light covers light, critical covers all three) gives `gate: running under the <held kind> slot of gate <pid>`: the gate takes no slot, writes no ticket or claim, and journals one `covered` line (identity fields, then `parentPid`; no `queue`, `take` or `release`). It then keeps a [covered marker](#covered-marker) until it releases, so ops-tower sees it run.
+- A gate reads `GATE_SLOT_HELD` once, before routing and before the log mutex (`nesting.rs`). A live parent whose slot covers the gate's kind (heavy covers heavy and light, light covers light, critical covers all three) gives `gate: running under the <held kind> slot of gate <pid>`: the gate takes no slot, writes no ticket or claim, and journals one `covered` line (identity fields, then `parentPid`; no `queue`, `take` or `release`).
+
+  It then keeps a [covered marker](#covered-marker) until it releases, so ops-tower sees it run.
 
   Its command gets the parent's marker verbatim, and a heavy gate covered by any parent is never routed.
 - Under a critical parent the command runs at High priority and the watchdog measures it as a critical gate's.
@@ -567,7 +569,9 @@ All kept, with each knob's default unchanged:
   Each sample carries two stamps: `began`, taken before its reads, and `at`, taken after them, next to the system times and the job's accounting. The `interval`, the load-adjusted clock, the paused time, the free share and the exit use `at`; the PowerShell gate stamps once, before its reads.
 - Stall (W2): no output, no CPU (at least 1% of one core over the window), no new process in the job, no build-server progress, no WSL VM CPU and no nested gate paused behind a critical request, for `--stall` seconds: `gate: STALLED: ...`.
 
-  The quiet time runs from the last progress sample's `at` to the latest sample's `began`, not to the moment the watcher checks: a watcher starved of CPU wakes late, and the time it spends in its reads, and after them up to the check, is not the command's quiet time, so the next sample decides. A quiet command is therefore killed up to one sample period after its window, plus the read time of the last progress sample and of the latest sample, never before; the PowerShell gate measures to the check and can kill earlier. The ceiling and the backstop read the check's own time.
+  The quiet time runs from the last progress sample's `at` to the latest sample's `began`, not to the moment the watcher checks: a watcher starved of CPU wakes late, and the time it spends in its reads, and after them up to the check, is not the command's quiet time, so the next sample decides.
+
+  A quiet command is therefore killed up to one sample period after its window, plus the read time of the last progress sample and of the latest sample, never before; the PowerShell gate measures to the check and can kill earlier. The ceiling and the backstop read the check's own time.
 
   Progress as the watchdog crate counts it resets the stall clock when the sum of the log and `.err` sizes changed (grew or shrank), the job's CPU since the last progress reached 1% of one core over the stall window, a pid appeared that the last sample did not have, or a nested gate is paused, or a build server's CPU counts as progress (see Build servers below), or, for a `wsl` command, the WSL VM's CPU counts as progress (see WSL below).
 - The load-adjusted clock and the ceiling (W3): each sample adds `interval * free`, the interval running between the samples' `at` stamps, to the clock `--timeout` runs on; a sample taken while a nested gate is paused adds to the paused time instead; `gate: TIMED OUT after ...`.
@@ -905,7 +909,7 @@ Each verb is one ssh call today, and the call's cost is its connection, not its 
 
 A routed run therefore moves to one long-lived connection carrying every verb, `gate box serve`, and the per-call client stays until that lands (GATE-70 holds the measurement, and GATE-109 the work).
 
-The payload is one base64 word (standard alphabet, padded) of UTF-8 JSON holding the wrapper's keys: `Key`, `Bare`, `Work`, `Lock`, `Index`, `OutputFolder` and `Job`, and for `run` also `Command`, `Subfolder`, `Identity`, `Outputs`, `Nonce` and `OutputsFull`. Unknown keys are ignored, and `Outputs`, `OutputsFull` and `OutputFolder`, which the outputs transport owns (GATE-44), are parsed tolerantly and ignored.
+The payload is one base64 word (standard alphabet, padded) of UTF-8 JSON holding the wrapper's keys: `Key`, `Bare`, `Work`, `Lock`, `Index`, `OutputFolder` and `Job`, and for `run` also `Command`, `Subfolder`, `Identity`, `Outputs`, `Nonce` and `OutputsFull`. Unknown keys are ignored, and `Outputs`, `OutputsFull` and `OutputFolder`, which the outputs transport owns (GATE-44), are ignored by the box's verbs; `payload.rs` holds their accessors, which nothing calls until the box packs outputs.
 
 For `run` the payload also needs a `Snapshot` key: exactly 40 lowercase hex characters, the commit the run checks out. Anything else is refused before the lock and the checkout with `gate: remote run payload's Snapshot '<value>' is not a 40-hex commit sha` and exit 2.
 
@@ -925,7 +929,9 @@ Measured without the salt, one pool of worker nodes served routed builds from ev
 
 Built verbs:
 
-- **`boot`** prints `gate: remote boot <UTC time>` on stdout (ISO 8601, 7 fractional digits, `Z`; the system time less the tick count since boot) and exits 0. When the time cannot be read it prints `gate: remote could not read the boot time: <message>` on stderr and exits 1, so the client's boot query after a lost connection says the call failed rather than taking a status 0 with no time. The preflight says the same line and goes on: an unreadable boot time fails no preflight, and the client then makes no boot query.
+- **`boot`** prints `gate: remote boot <UTC time>` on stdout (ISO 8601, 7 fractional digits, `Z`; the system time less the tick count since boot) and exits 0.
+
+  When the time cannot be read it prints `gate: remote could not read the boot time: <message>` on stderr and exits 1, so the client's boot query after a lost connection says the call failed rather than taking a status 0 with no time. The preflight says the same line and goes on: an unreadable boot time fails no preflight, and the client then makes no boot query.
 - **`preflight`** creates the bare repo at `Bare` when missing and the work folder at `Work` with `.git`, `origin` set to `Bare`, `core.autocrlf false` and `core.eol lf`, and writes `.git\objects\info\alternates` as `<Bare with />/objects` and a line feed, without a byte order mark, only when the file is missing or empty.
 
   It prints on stdout, in order: `gate: remote created <Bare>` (only when it created the bare repo), `gate: remote version <gate version>`, the boot line, and `gate: remote sdks <v1,v2|none>`; git's own output passes through. A payload without `Bare` or `Work` prints `gate: box payload lacks <key>` and exits 2.
@@ -1019,6 +1025,29 @@ Built verbs:
 
 `outputs` prints `gate: box outputs is not built yet` and exits 70.
 
+**The outputs module** (GATE-44) is built and tested but dormant: nothing calls it until the box's run packs outputs and the PC fetches and installs them. Both ends are this exe and share `crates/gate/src/outputs/`.
+
+- Globs: each is relative to the work folder's root and `/`-separated, matched without regard to case: `**/` is any number of folders (none included), `**` anything, `*` any run of characters within one name, `?` one character within one name. Never brought back, whatever the globs: anything under a `.git`, `.tmp` or `TestResults` folder at any depth, and a `.env` file (`.env`, `.env.<name>`, `<name>.env`).
+- Walk: lists the files below a folder that the globs match, ordered by relative path, and does not enter an excluded folder. A link or a junction, to a file or to a folder, is neither followed nor listed. A folder or name that cannot be read, or is not Unicode, fails the walk.
+- Manifest: the PC's list of its matching files, sent as one line of JSON and a newline, `{"files":{"<path>":{"size":<bytes>,"modified":<file time>,"sha256":"<hex>"}}}`, paths relative to the worktree root and found without regard to case.
+
+  The box's pack takes each file the manifest lacks, and each it holds that the run created or changed (the box's stat listing from just before the command lacks it or holds another size or last write) whose SHA-256 differs from the manifest's, skipping the paths of the run's back commit. Under `OutputsFull` there is no listing, so every file counts as changed and each that differs from the PC's comes back.
+- Archive: a tar stream compressed with zstd (level 3), named `<key>-<nonce>.tar.zst`, each file read once and hashed as it is packed. The last member, `.gate-outputs.json`, lists what was packed (path, size, SHA-256), and the reader checks the members against it after extraction. Both ends stream; memory does not grow with a file's size.
+- Payload: `Nonce` is 32 lower-case hex digits, `OutputFolder` is `<root>\outputs` for the work folder `<root>\work\<key>`, `Outputs` a list of non-empty globs holding no `[` or `]`, `OutputsFull` true or false, and `Name` an archive name of the payload's own key and nonce, so that the outputs verb, when built, reaches no file in `OutputFolder` but an archive of this work folder. A refusal is a `gate: box payload ...` line.
+
+`unpack` creates its destination, which must not exist, and refuses an archive for any of these, a member before anything of it is written:
+
+- A member name that is not a plain relative path inside the destination: `.git` in any case, an 8.3 short name (`~` before a digit), a part ending in `.` or a space, any of `<>"|?*:` or `\`, a control or bidirectional character, a device name (`CON`, `PRN`, `AUX`, `NUL`, `CONIN$`, `CONOUT$`, `COM0` to `COM9`, `LPT0` to `LPT9`, also with an extension), or more than 64 parts.
+- A GNU long name over 4096 bytes, and any pax, `g`, `K` or `S` entry.
+- More than 50,000 files or folders.
+- A member over the bytes left of the caller's limit (and over 16 GiB).
+- Input as sent past the limit plus limit/64 plus 1 MiB, zstd's worst case for the limit.
+- A last write in base-256 form, before 1970 or more than a day ahead of the machine's clock.
+- A member that would be written through a link or a junction, or a member that is itself not a plain file.
+- A member that differs from the list in size or SHA-256, one the list lacks, or a listed file the archive lacks.
+
+`pack` fails on a link or a junction, a file last written before 1970, and a file whose size or last write changes while it is packed. On any refusal `unpack` removes the folder it made and all it extracted there; when that removal fails too, the refusal says so.
+
 The console: `gate box run` gives the command a UTF-8 console through a donor console, as the PowerShell wrapper does. Right after it creates the run's job, the box starts a hidden donor, the system's `cmd.exe /d /q /k` (never one found on PATH), in the job. The donor holds a stdin pipe nobody writes so `cmd /k` does not exit, and lives for the whole run, until the wait for the command is over.
 
 To create the command the box starts a keeper `cmd.exe` on its own console, so that console stays alive, then takes the output lock, waiting at most 10 s. It leaves its console, attaches to the donor's and sets the input and output code pages to 65001.
@@ -1056,7 +1085,9 @@ The PowerShell gate and `gate.exe` share slot mutexes and never share files. The
 
    It ends only when every scan across a 5 s confirmation window finds no gate, because the PowerShell gate deletes its ticket when it takes a slot and writes its claim up to about 2 s later, and a single empty scan could fall in that gap. The lines are in [`gate cutover`](#gate-cutover).
 
-   It ends by printing the flag's path and saying that deleting it goes back to the PowerShell gate: that is the take-back, by hand, so it works even when `gate.exe` is what is broken. A `gate cutover` stopped part way is run again: the rerun rewrites the flag and goes back to waiting, and it copies the slot counts only when the default root's `slot-counts.json` is absent, so a Gates-tab edit made since is kept. The copy never replaces: the file is written beside the target and hard-linked into place, so one that appears meanwhile wins, and a target that exists but cannot be read is kept too.
+   It ends by printing the flag's path and saying that deleting it goes back to the PowerShell gate: that is the take-back, by hand, so it works even when `gate.exe` is what is broken. A `gate cutover` stopped part way is run again: the rerun rewrites the flag and goes back to waiting, and it copies the slot counts only when the default root's `slot-counts.json` is absent, so a Gates-tab edit made since is kept.
+
+   The copy never replaces: the file is written beside the target and hard-linked into place, so one that appears meanwhile wins, and a target that exists but cannot be read is kept too.
 
    Callers that start the PowerShell gate without the launcher keep starting PowerShell gates after the flag is set. The drain names on stderr each PowerShell gate whose earliest claim or ticket `since` is later than the flag's write time (a late arrival), with its command line, so a bypassing caller is visible rather than holding the drain open silently; each pid is named once. The cutover is not run until claude-config lists the callers it moved.
 
@@ -1105,7 +1136,9 @@ Rules:
 A Rust integration suite drives the built `gate.exe` through its CLI and reads only what it writes: exit codes, stdout, stderr, the log, the journal, claims and tickets.
 
 - **Own state root per case.** Every case creates a fresh folder under the target directory's temporary folder. The folder is the case's working folder, holding its logs and its `LOCALAPPDATA`, and its `state` subfolder is the `--state-dir`, so cases never touch the machine's real slots, journal or counts, or each other's. Cases run side by side.
-- **Load.** Watchdog-timing cases depend on the scheduler. The gate under test runs at Normal priority, and its command and the build servers it watches run at BelowNormal. Under an all-core load, the gate was measured runnable but not running for up to 13.7 s, and a BelowNormal command for up to 31.8 s with no CPU. So a case never races a fixed sleep against the watcher: its command sleeps past the 600 s hang guard, and only the behaviour under test ends it. A stall window a case relies on is far past those gaps, or the case is ignored and run with `--ignored` on a critical slot (the repo's nextup profile lists them).
+- **Load.** Watchdog-timing cases depend on the scheduler. The gate under test runs at Normal priority, and its command and the build servers it watches run at BelowNormal. Under an all-core load, the gate was measured runnable but not running for up to 13.7 s, and a BelowNormal command for up to 31.8 s with no CPU.
+
+  So a case never races a fixed sleep against the watcher: its command sleeps past the 600 s hang guard, and only the behaviour under test ends it. A stall window a case relies on is far past those gaps, or the case is ignored and run with `--ignored` on a critical slot (the repo's nextup profile lists them).
 - **Test seams.** Hidden `--test-*` flags, compiled only with the `test-seams` cargo feature, set the timing knobs: `--test-sample-ms` (sample period), `--test-heartbeat-ms` (wait heartbeat; on `gate box` the command heartbeat's period), `--test-poll-ms` (fallback poll) and `--test-stall-ms` (stall window below a second). Each takes whole milliseconds above 0 on `gate run`. The sample and stall knobs drive the watchdog.
 
   Two seams of `gate box` shape the command's console: `--test-box-console fail-before` makes the UTF-8 console fail before the command starts, and `--test-box-park-launch <path>` parks the launch until `<path>` exists ([The box side](#the-box-side)).
@@ -1171,7 +1204,9 @@ A Rust integration suite drives the built `gate.exe` through its CLI and reads o
 - **Launcher cases** (GATE-41): `crates/gate/tests/suite/launcher.rs` has 8 cases. They run the synced `tools/gate.ps1`. A case's `LOCALAPPDATA` is its `appdata` folder, whose `gate\v1` is the default root with the real slot names, so every such case also sets `GATE_STATE_DIR` to a non-default folder. The flag-unset case points the launcher at a stub canonical gate through `CLAUDE_CONFIG_DIR`. A new suite module that calls `repo_file` updates the callers pin in `checkout.rs`.
 - **Cutover cases** (GATE-9): `crates/gate/tests/suite/cutover.rs` has 15 cases: the counts copy, the flag, the refused words and the printed request, and six over the drain. A live PowerShell gate is a `fake-tool wait` child whose claim or ticket, written by `support::write_powershell_claim` or `write_powershell_ticket` under `support::powershell_folder`, carries the child's real pid and start time; a stale one names a pid that has ended or a start that differs from the running process's.
 
-  The six cases wait on a live claim and name it, wait on a live ticket and name its command line, ignore stale claims and tickets, name a late arrival, resume after an interrupt, and run the launcher's hand-over after a finished cutover. They use the launcher cases' helpers (`stub_claude`, `install_gate`, `run_launcher`, `run_direct`). Their waits are ordering-only: `Running::wait_for_stderr_while_running` returns the stderr once the line is there and the gate has not exited, and no case asserts how long anything took.
+  The six cases wait on a live claim and name it, wait on a live ticket and name its command line, ignore stale claims and tickets, name a late arrival, resume after an interrupt, and run the launcher's hand-over after a finished cutover.
+
+  They use the launcher cases' helpers (`stub_claude`, `install_gate`, `run_launcher`, `run_direct`). Their waits are ordering-only: `Running::wait_for_stderr_while_running` returns the stderr once the line is there and the gate has not exited, and no case asserts how long anything took.
 - **Running it.** The suite is a test target with `required-features = ["test-seams"]`, run through the gate with `cargo test --workspace --profile test-release --all-features`. Without the feature (no `--all-features`) cargo skips the suite silently.
 
 ## Cores hint

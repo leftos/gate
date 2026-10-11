@@ -7,6 +7,9 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use serde_json::{Map, Value};
 
+use crate::outputs::archive::SUFFIX;
+use crate::outputs::hash::is_lower_hex;
+
 /// The decoded JSON object.
 pub(crate) struct Payload(Map<String, Value>);
 
@@ -76,13 +79,55 @@ impl Payload {
             .collect()
     }
 
+    /// The run's output globs, `Outputs`: a list of non-empty texts holding no `[` or `]`, as the routing file allows
+    /// them; none when the key is absent or null. Else the usage line, a glob shown with its control characters escaped.
+    #[cfg_attr(not(test), expect(dead_code, reason = "the box's run does not pack outputs yet"))]
+    pub(crate) fn output_globs(&self) -> Result<Vec<String>, String> {
+        let not_globs = || "gate: box payload Outputs is not a list of texts".to_owned();
+        let list = match self.0.get("Outputs") {
+            None | Some(Value::Null) => return Ok(Vec::new()),
+            Some(value) => value.as_array().ok_or_else(not_globs)?,
+        };
+        list.iter()
+            .map(|glob| match glob.as_str() {
+                None => Err(not_globs()),
+                Some("") => Err("gate: box payload Outputs holds an empty glob".to_owned()),
+                Some(glob) if glob.contains(['[', ']']) => Err(format!("gate: box payload Outputs glob '{}' holds '[' or ']'", escaped(glob))),
+                Some(glob) => Ok(glob.to_owned()),
+            })
+            .collect()
+    }
+
+    /// Whether `OutputsFull` is set, as the client sets it when the PC's last outputs step did not complete; false when
+    /// the key is absent or null. Else the usage line saying it is not true or false.
+    #[cfg_attr(not(test), expect(dead_code, reason = "the box's run does not pack outputs yet"))]
+    pub(crate) fn outputs_full(&self) -> Result<bool, String> {
+        match self.0.get("OutputsFull") {
+            None | Some(Value::Null) => Ok(false),
+            Some(Value::Bool(full)) => Ok(*full),
+            Some(_) => Err("gate: box payload OutputsFull is not true or false".to_owned()),
+        }
+    }
+
+    /// The run's outputs `Nonce`: 32 lower-case hex digits, as the client draws it; else the usage line, the value
+    /// shown with its control characters escaped.
+    #[cfg_attr(not(test), expect(dead_code, reason = "the box's run does not pack outputs yet"))]
+    pub(crate) fn nonce(&self) -> Result<&str, String> {
+        let nonce = self.text("Nonce")?;
+        if is_lower_hex(nonce, OUTPUTS_NONCE_DIGITS) {
+            Ok(nonce)
+        } else {
+            Err(format!("gate: box payload Nonce is not 32 lower-case hex digits: {}", escaped(nonce)))
+        }
+    }
+
     /// The run's `Snapshot`: the payload's commit, exactly 40 lowercase hex digits, as the client sends it; else the
-    /// line saying it is not one. A missing key and a JSON null are shown as the empty string, any other non-string
-    /// value as its compact JSON text, each with its control characters escaped, so a value cannot break or forge the
-    /// line.
+    /// line saying it is not one. This is PowerShell's `-cmatch '^[0-9a-f]{40}$'` without .NET's allowance for a
+    /// trailing newline. A missing key and a JSON null are shown as the empty string, any other non-string value as its
+    /// compact JSON text, each with its control characters escaped, so a value cannot break or forge the line.
     pub(crate) fn snapshot(&self) -> Result<&str, String> {
         match self.0.get("Snapshot") {
-            Some(Value::String(text)) if is_commit_sha(text) => Ok(text),
+            Some(Value::String(text)) if is_lower_hex(text, COMMIT_SHA_DIGITS) => Ok(text),
             Some(Value::String(text)) => Err(not_a_snapshot(text)),
             Some(Value::Null) | None => Err(not_a_snapshot("")),
             Some(other) => Err(not_a_snapshot(&other.to_string())),
@@ -127,10 +172,50 @@ impl Payload {
     pub(crate) fn beside_work(&self, key: &str, work: &str, extension: &str) -> Result<&str, String> {
         let value = self.path(key)?;
         let expected = format!("{work}.{extension}");
-        let full = |path: &str| std::path::absolute(path).map(|full| ordinal_upper(&full.to_string_lossy())).ok();
-        match (full(value), full(&expected)) {
-            (Some(value_full), Some(expected_full)) if value_full == expected_full => Ok(value),
-            _ => Err(format!("gate: box payload {key} must be {expected}")),
+        if same_path(value, &expected) {
+            Ok(value)
+        } else {
+            Err(format!("gate: box payload {key} must be {expected}"))
+        }
+    }
+
+    /// The `OutputFolder`, which must be `<root>\outputs` for the work folder `work`, `<root>\work\<key>`, as the client
+    /// builds it; compared as full paths without regard to case. Else the usage line.
+    #[cfg_attr(not(test), expect(dead_code, reason = "the box's run does not pack outputs yet"))]
+    pub(crate) fn output_folder(&self, work: &str) -> Result<&str, String> {
+        let value = self.path("OutputFolder")?;
+        let Some(root) = grandparent(work) else {
+            return Err(format!(
+                r"gate: box payload Work must be <root>\work\<key> to place OutputFolder: {}",
+                escaped(work)
+            ));
+        };
+        let expected = format!(r"{root}\outputs");
+        if same_path(value, &expected) {
+            Ok(value)
+        } else {
+            Err(format!("gate: box payload OutputFolder must be {expected}"))
+        }
+    }
+
+    /// The outputs archive's `Name`: `<key>-<nonce>.tar.zst` with the payload's own key and an outputs nonce, as the box
+    /// names a run's archive; else the usage line, the name shown with its control characters escaped. The outputs verb
+    /// can so reach no file in `OutputFolder` but an archive of this work folder.
+    #[cfg_attr(not(test), expect(dead_code, reason = "the box has no outputs verb yet"))]
+    pub(crate) fn archive_name(&self) -> Result<&str, String> {
+        let key = self.key()?;
+        let name = self.text("Name")?;
+        let nonce = name
+            .strip_prefix(key)
+            .and_then(|rest| rest.strip_prefix('-'))
+            .and_then(|rest| rest.strip_suffix(SUFFIX));
+        if nonce.is_some_and(|nonce| is_lower_hex(nonce, OUTPUTS_NONCE_DIGITS)) {
+            Ok(name)
+        } else {
+            Err(format!(
+                "gate: box payload Name is not an outputs archive of this work folder: {}",
+                escaped(name)
+            ))
         }
     }
 
@@ -152,6 +237,32 @@ impl Payload {
 
 /// The hex digits of a run's nonce, as the client draws it.
 const NONCE_DIGITS: usize = 12;
+/// The hex digits of a run's outputs nonce, as the client draws it.
+#[cfg_attr(not(test), expect(dead_code, reason = "the box's run does not pack outputs yet"))]
+const OUTPUTS_NONCE_DIGITS: usize = 32;
+/// The hex digits of a commit's sha.
+const COMMIT_SHA_DIGITS: usize = 40;
+
+/// The `<root>` of the work folder `path`, `<root>\work\<key>` with `work` in any case, without a trailing separator;
+/// `None` when `path` is not one.
+#[cfg_attr(not(test), expect(dead_code, reason = "the box's run does not pack outputs yet"))]
+fn grandparent(path: &str) -> Option<&str> {
+    let parent = &path[..path.rfind(['\\', '/'])?];
+    let split = parent.rfind(['\\', '/'])?;
+    let (root, middle) = (&parent[..split], &parent[split + 1..]);
+    (!root.is_empty() && middle.eq_ignore_ascii_case("work")).then_some(root)
+}
+
+/// Whether `first` and `second` are the same path once made full, without regard to case. Never when a part of
+/// `first` other than `.` or `..` ends in `.` or a space, which making the path full would drop, so the path that
+/// passes is the one opened.
+fn same_path(first: &str, second: &str) -> bool {
+    let renamed = first
+        .split(['\\', '/'])
+        .any(|part| !matches!(part, "." | "..") && part.ends_with(['.', ' ']));
+    let full = |path: &str| std::path::absolute(path).map(|full| ordinal_upper(&full.to_string_lossy())).ok();
+    !renamed && matches!((full(first), full(second)), (Some(first_full), Some(second_full)) if first_full == second_full)
+}
 
 fn not_a_key(key: &str) -> String {
     format!("gate: box payload Key is not a work-folder key: {}", escaped(key))
@@ -160,12 +271,6 @@ fn not_a_key(key: &str) -> String {
 /// The line refusing a run whose payload named no 40-hex commit as its snapshot, showing `value` as it is.
 fn not_a_snapshot(value: &str) -> String {
     format!("gate: remote run payload's Snapshot '{}' is not a 40-hex commit sha", escaped(value))
-}
-
-/// Whether `value` is exactly 40 lowercase hex digits: PowerShell's `-cmatch '^[0-9a-f]{40}$'`, but without .NET's
-/// allowance for a trailing newline, so 40 hex digits followed by a line end are not a snapshot.
-fn is_commit_sha(value: &str) -> bool {
-    value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
 /// `text` with each control character escaped, and each mark that reorders text or separates lines, so a value cannot
@@ -186,7 +291,7 @@ pub(crate) fn escaped(text: &str) -> String {
 
 /// Whether `character` is a bidirectional mark, embedding, override or isolate, or the line or paragraph separator:
 /// U+061C, U+200E, U+200F, U+202A to U+202E, U+2066 to U+2069, U+2028 and U+2029.
-fn is_reordering_mark(character: char) -> bool {
+pub(crate) fn is_reordering_mark(character: char) -> bool {
     matches!(
         character,
         '\u{61c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{2028}' | '\u{2029}'
@@ -393,5 +498,186 @@ mod tests {
             Err(refusing(r#"["\u001b[31m"]"#)),
             "a non-string value is shown as its compact JSON text"
         );
+    }
+
+    fn output_globs(json: &serde_json::Value) -> Result<Vec<String>, String> {
+        decoded(&json.to_string()).and_then(|payload| payload.output_globs())
+    }
+
+    #[test]
+    fn output_globs_are_a_list_of_texts_none_when_absent() {
+        assert_eq!(output_globs(&json!({})), Ok(vec![]), "absent");
+        assert_eq!(output_globs(&json!({ "Outputs": null })), Ok(vec![]), "null");
+        assert_eq!(output_globs(&json!({ "Outputs": [] })), Ok(vec![]), "an empty list");
+        assert_eq!(
+            output_globs(&json!({ "Outputs": ["**/bin/**", "*.dll"] })),
+            Ok(vec!["**/bin/**".to_owned(), "*.dll".to_owned()])
+        );
+        let not_a_list = Err("gate: box payload Outputs is not a list of texts".to_owned());
+        assert_eq!(output_globs(&json!({ "Outputs": "**/bin/**" })), not_a_list, "a text");
+        assert_eq!(output_globs(&json!({ "Outputs": ["a", 1] })), not_a_list, "a number in the list");
+        assert_eq!(
+            output_globs(&json!({ "Outputs": ["a", ""] })),
+            Err("gate: box payload Outputs holds an empty glob".to_owned())
+        );
+        assert_eq!(
+            output_globs(&json!({ "Outputs": ["bin/[ab].dll"] })),
+            Err("gate: box payload Outputs glob 'bin/[ab].dll' holds '[' or ']'".to_owned())
+        );
+        assert_eq!(
+            output_globs(&json!({ "Outputs": ["\u{1b}]"] })),
+            Err(r"gate: box payload Outputs glob '\u{1b}]' holds '[' or ']'".to_owned()),
+            "a glob shown with its control characters escaped"
+        );
+    }
+
+    #[test]
+    fn outputs_full_is_true_or_false_and_false_when_absent() {
+        let full = |json: serde_json::Value| decoded(&json.to_string()).and_then(|payload| payload.outputs_full());
+        assert_eq!(full(json!({})), Ok(false), "absent");
+        assert_eq!(full(json!({ "OutputsFull": null })), Ok(false), "null");
+        assert_eq!(full(json!({ "OutputsFull": true })), Ok(true));
+        assert_eq!(full(json!({ "OutputsFull": false })), Ok(false));
+        for bad in [json!("true"), json!(1), json!([true])] {
+            assert_eq!(
+                full(json!({ "OutputsFull": bad })),
+                Err("gate: box payload OutputsFull is not true or false".to_owned()),
+                "{bad}"
+            );
+        }
+    }
+
+    const NONCE: &str = "0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn an_outputs_nonce_is_32_lower_case_hex_digits() {
+        let nonce = |json: serde_json::Value| decoded(&json.to_string()).and_then(|payload| payload.nonce().map(str::to_owned));
+        assert_eq!(nonce(json!({ "Nonce": NONCE })), Ok(NONCE.to_owned()));
+        assert_eq!(nonce(json!({})), Err("gate: box payload lacks Nonce".to_owned()));
+        for bad in [
+            NONCE.to_uppercase(),
+            NONCE[1..].to_owned(),
+            format!("{NONCE}0"),
+            format!("{NONCE}\n"),
+            "n1".to_owned(),
+        ] {
+            assert_eq!(
+                nonce(json!({ "Nonce": bad })),
+                Err(format!("gate: box payload Nonce is not 32 lower-case hex digits: {}", escaped(&bad))),
+                "{bad:?}"
+            );
+        }
+    }
+
+    const WORK: &str = r"D:\gate-remote\work\app-1a2b3c4d";
+
+    fn output_folder(work: &str, folder: &str) -> Result<String, String> {
+        decoded(&json!({ "OutputFolder": folder }).to_string()).and_then(|payload| payload.output_folder(work).map(str::to_owned))
+    }
+
+    #[test]
+    fn the_output_folder_is_outputs_beside_the_work_folders_parent() {
+        for good in [r"D:\gate-remote\outputs", "d:/GATE-REMOTE/outputs", r"D:\gate-remote\work\..\outputs"] {
+            assert_eq!(output_folder(WORK, good), Ok(good.to_owned()), "{good}");
+        }
+        assert_eq!(
+            output_folder(r"C:\work\k", r"C:\outputs"),
+            Ok(r"C:\outputs".to_owned()),
+            "a root on the drive"
+        );
+        let refused = Err(r"gate: box payload OutputFolder must be D:\gate-remote\outputs".to_owned());
+        for bad in [
+            r"D:\gate-remote\work\outputs",
+            r"D:\other\outputs",
+            r"D:\gate-remote\outputs\x",
+            r"D:\gate-remote",
+        ] {
+            assert_eq!(output_folder(WORK, bad), refused, "{bad}");
+        }
+        assert_eq!(
+            output_folder(WORK, "outputs"),
+            Err("gate: box payload OutputFolder is not an absolute path on a drive: \"outputs\"".to_owned())
+        );
+        assert_eq!(output_folder(WORK, ""), Err("gate: box payload lacks OutputFolder".to_owned()));
+        assert_eq!(
+            output_folder(r"D:\app-1a2b3c4d", r"D:\outputs"),
+            Err(r"gate: box payload Work must be <root>\work\<key> to place OutputFolder: D:\app-1a2b3c4d".to_owned())
+        );
+    }
+
+    fn archive_name(name: &str) -> Result<String, String> {
+        decoded(&json!({ "Key": "app-1a2b3c4d", "Name": name }).to_string()).and_then(|payload| payload.archive_name().map(str::to_owned))
+    }
+
+    #[test]
+    fn grandparent_needs_a_work_folder() {
+        let outputs = r"D:\gate-remote\outputs";
+        assert_eq!(
+            output_folder(r"D:\gate-remote\WORK\app-1a2b3c4d", outputs),
+            Ok(outputs.to_owned()),
+            "work in any case"
+        );
+        for work in [
+            r"D:\gate-remote\other\app-1a2b3c4d",
+            r"D:\gate-remote\works\app-1a2b3c4d",
+            r"D:\gate-remote\work.\app-1a2b3c4d",
+        ] {
+            assert_eq!(
+                output_folder(work, outputs),
+                Err(format!(r"gate: box payload Work must be <root>\work\<key> to place OutputFolder: {work}")),
+                "{work}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_path_with_a_part_ending_in_a_dot_or_space_is_not_the_one_expected() {
+        let refused = Err(r"gate: box payload OutputFolder must be D:\gate-remote\outputs".to_owned());
+        for bad in [
+            r"D:\gate-remote\outputs.",
+            r"D:\gate-remote\outputs ",
+            r"D:\gate-remote.\outputs",
+            r"D:\gate-remote \outputs",
+            "D:/gate-remote/outputs..",
+        ] {
+            assert_eq!(output_folder(WORK, bad), refused, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn an_archive_name_needs_a_work_folder_key() {
+        let name = format!("app-1a2b3c4d-{NONCE}.tar.zst");
+        let named = |json: serde_json::Value| decoded(&json.to_string()).and_then(|payload| payload.archive_name().map(str::to_owned));
+        assert_eq!(named(json!({ "Name": name })), Err("gate: box payload lacks Key".to_owned()));
+        assert_eq!(
+            named(json!({ "Key": "app 1", "Name": name })),
+            Err("gate: box payload Key is not a work-folder key: app 1".to_owned())
+        );
+    }
+
+    #[test]
+    fn an_archive_name_is_the_work_folders_key_and_an_outputs_nonce() {
+        let good = format!("app-1a2b3c4d-{NONCE}.tar.zst");
+        assert_eq!(archive_name(&good), Ok(good.clone()));
+        for bad in [
+            format!("app-1a2b3c4d-{NONCE}.tar.xz"),
+            format!("other-{NONCE}.tar.zst"),
+            format!("APP-1A2B3C4D-{NONCE}.tar.zst"),
+            format!("app-1a2b3c4d-{}.tar.zst", NONCE.to_uppercase()),
+            format!("app-1a2b3c4d-{}.tar.zst", &NONCE[1..]),
+            format!(r"..\app-1a2b3c4d-{NONCE}.tar.zst"),
+            format!("app-1a2b3c4d-{NONCE}.tar.zst\n"),
+            format!("app-1a2b3c4d{NONCE}.tar.zst"),
+        ] {
+            assert_eq!(
+                archive_name(&bad),
+                Err(format!(
+                    "gate: box payload Name is not an outputs archive of this work folder: {}",
+                    escaped(&bad)
+                )),
+                "{bad:?}"
+            );
+        }
+        assert_eq!(archive_name(""), Err("gate: box payload lacks Name".to_owned()));
     }
 }

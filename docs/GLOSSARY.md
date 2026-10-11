@@ -57,10 +57,12 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Load-adjusted time**: wall time scaled by the free share in each sample, the clock the ceiling runs on, so a command slowed by other work is not killed for it.
 - **Log hash**: the first 16 hex digits of the SHA-256 of a lower-cased, normalised absolute log path, carried in the name of that log's mutex.
 - **Lost connection**: a remote run call that ended with ssh's status 255 after the banner (or whose command itself exited 255); nothing is synced back, the client sends the stop, and a boot-time check tells a restarted builder from a dropped link.
+- **Manifest**: the PC's list of its files under a routed run's output globs (path, size, last write, SHA-256), sent to the box so it packs only the files the PC lacks or that differ.
 - **Marker**: a failure marker, a log line the built-in regex reads as a failure (such as `Build FAILED.` or `error CS1234`), which turns a zero exit into status 1.
 - **Nesting**: a gate started inside another gate's command (a build hook under a gated `git commit`), which reads its parent from the slot marker.
 - **Notes**: the gate's own lines gathered while a run goes and appended to the end of its log.
 - **Output cap**: the remote client's limit of 64 KiB on one line of a call's output (a `\r` resets the line, so git's progress counts per update), which kills a capped call that sends a longer one.
+- **Outputs archive**: the `<key>-<nonce>.tar.zst` a routed run's changed output files travel in, its last member `.gate-outputs.json` listing the files before it.
 - **Pause marker**: an empty file a gate under a parent gate's slot rewrites on every pass while it waits behind a critical request, which stops its parent's watchdog clocks for that time, the watchdog reading it on each sample; one older than 30 s is stale.
 - **Pipe-closed stop**: the box's stop of a job whose client's connection closed: `gate box run` terminates the job, waits for its processes and exits 255.
 - **Pool**: the set of slots of one kind (heavy, light, remote); pools never wait on each other.

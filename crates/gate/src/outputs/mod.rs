@@ -1,0 +1,11 @@
+//! A routed run's outputs: the files under its output globs that the box packs after a passing run and the PC installs.
+//! Both ends are this exe and share this module. [`glob`] matches a path against the globs and the exclusions, [`walk`]
+//! lists the matching files below a folder, [`hash`] hashes a stream with SHA-256 over a fixed buffer, [`manifest`]
+//! holds the PC's list of its matching files and the rule choosing what the box packs, and [`archive`] writes and reads
+//! the `.tar.zst` archive the files travel in.
+
+pub(crate) mod archive;
+pub(crate) mod glob;
+pub(crate) mod hash;
+pub(crate) mod manifest;
+pub(crate) mod walk;

@@ -9,7 +9,7 @@ workspace = true
 
 [features]
 # The hidden `--test-*` flags and the `fake-tool` helper the black-box suite needs; an installed gate is built without.
-test-seams = ["gate-args/test-seams", "dep:windows-sys"]
+test-seams = ["gate-args/test-seams"]
 
 [dependencies]
 base64 = "0.23.1"
@@ -23,8 +23,10 @@ proc-table = { path = "../proc-table" }
 regex = "1.13.1"
 serde_json = { version = "1.0.151", features = ["preserve_order"] }
 sha2 = "0.11.0"
-# For `fake-tool` only, which a gate built without `test-seams` does not have.
-windows-sys = { version = "0.61.2", features = ["Win32_System_Console"], optional = true }
+tar = "0.4.46"
+# `Win32_Storage_FileSystem` for the outputs walk and pack; `Win32_System_Console` for `fake-tool`, a `test-seams` bin.
+windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem", "Win32_System_Console"] }
+zstd = "0.14.2"
 
 [dev-dependencies]
 flate2 = "1.1.10"
