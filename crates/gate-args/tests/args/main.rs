@@ -6,6 +6,7 @@
 mod batch;
 mod boxcmd;
 mod compat;
+mod cutover;
 mod program;
 mod quoting;
 mod run;

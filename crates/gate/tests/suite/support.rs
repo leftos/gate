@@ -21,6 +21,7 @@ pub const FAKE_TOOL: &str = env!("CARGO_BIN_EXE_fake-tool");
 pub const USAGE: &str = "\
 usage: gate run --slot heavy|light|critical --timeout <seconds> --log <path> [options] -- <command> [args...]
        gate stop-tree <pid>
+       gate cutover
        gate --version | --help
 
 run options:

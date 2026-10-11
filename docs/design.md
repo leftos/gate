@@ -89,7 +89,30 @@ A pid with no live process prints `gate: stop-tree: no live process has the id <
 
 ### `gate cutover`
 
-See [Cutover](#cutover).
+`gate cutover` takes no words; its usage line is `       gate cutover`, after `gate stop-tree <pid>`. It reads `%LOCALAPPDATA%` only: `GATE_STATE_DIR` is ignored, an extra word prints `gate: unexpected argument <word>` and any option, `--state-dir` included, prints `gate: unknown option <opt>`, each followed by the usage, exit 2.
+
+A missing or empty `LOCALAPPDATA` prints `gate: cutover needs LOCALAPPDATA` and exits 2. What it does and why is [Cutover](#cutover); this is what it says. Every line goes to stderr.
+
+1. Copy the counts. A failure prints `gate: cutover: cannot copy the slot counts: <error>` and exits 1 with no flag written. A PowerShell counts file that is rejected prints `gate: cutover: ignored <path>: <reason>; gates use the default counts` and the cutover goes on.
+2. Write the flag. A failure prints `gate: cutover: cannot write the cutover flag: <error>` and exits 1. Success prints `gate: cutover: flag written; new gates now start gate.exe`.
+3. Drain, below.
+4. Print `gate: cutover: done; every gate now runs gate.exe`, then `gate: cutover: to go back to the PowerShell gate, delete <LOCALAPPDATA>\gate\cutover.flag`, and exit 0.
+
+The drain polls every 2 s. Its first list is `gate: cutover: waiting for 1 PowerShell gate to finish:` (or `... <n> PowerShell gates to finish:`), then one line per gate in `since` order, `gate:   pid <pid>  <what>  <command>`.
+
+- `<what>` joins with `, ` any of `heavy slot <i>`, `light slot <i>`, `remote slot <i>`, `critical claim`, `waiting (<kind>)` and `holds the machine (critical)`. A critical gate's claim and its holding ticket are one gate.
+- `<command>` is the claim's command, else the process's command line, else `(command line unreadable)`.
+
+After the list, each scan says, in this order:
+
+- `gate: cutover: pid <pid> finished (<n> left)` for each pid that left;
+- for each new pid, `gate: cutover: late PowerShell gate pid <pid> started after the flag: <command>` when its earliest `since` is later than the flag time, else `gate: cutover: also waiting for pid <pid>  <what>  <command>`; each pid is named once;
+- `gate: cutover: cannot read <n> claim or ticket file(s) under <LOCALAPPDATA>\gate; they are not waited on`, said once;
+- `gate: cutover: still waiting for <n> PowerShell gate(s) (<s> s)` every 30 s from the start of the drain, while gates remain.
+
+The drain ends only when every scan across a 5 s confirmation window finds no gate; a scan that finds one resets the window. Ctrl+C prints `gate: cutover: interrupted; the flag stays set, and running gate cutover again resumes the wait` and exits 0xC000013A. A rerun resumes; the take-back is deleting the flag by hand.
+
+Test-seams builds accept hidden options on `cutover`: `--test-poll-ms`, `--test-heartbeat-ms`, `--test-confirm-ms` and the switch `--test-cutover-interrupt-after-list` (raises the interrupt once the first list is printed). `--test-print-request` prints `{"mode":"cutover","localAppData":...,"testSeams":{"pollMs","heartbeatMs","confirmMs","interruptAfterList"}}`.
 
 ### `gate box`
 
@@ -1009,11 +1032,13 @@ The PowerShell gate and `gate.exe` share slot mutexes and never share files. The
 1. Before it runs, ops-tower's Gates tab already writes the default root's `slot-counts.json` (`%LOCALAPPDATA%\gate\v1\`) on every edit, through `gate-state`'s writer, since `gate.exe` never reads the PowerShell gate's `%LOCALAPPDATA%\gate\slot-counts.json` ([Counts file](#counts-file)).
 
    `gate cutover` copies the PowerShell gate's slot counts into the default root's `slot-counts.json`, so both generations count the same slots, then writes `%LOCALAPPDATA%\gate\cutover.flag`, holding its write time in RFC 3339 UTC (the launcher never reads it). The PowerShell launcher in each repo reads the flag, and from then on every new gate runs `gate.exe` through the compatibility layer.
-2. It then waits until every PowerShell gate's claims and tickets in `%LOCALAPPDATA%\gate\` are gone or stale, naming on stderr what it still waits on, and exits 0 once none is left.
+2. It then waits until every PowerShell gate's claims and tickets in `%LOCALAPPDATA%\gate\` are gone or stale, naming on stderr what it still waits on, and exits 0 once none is left. The drain reads claims and tickets only and probes no mutex.
+
+   It ends only when every scan across a 5 s confirmation window finds no gate, because the PowerShell gate deletes its ticket when it takes a slot and writes its claim up to about 2 s later, and a single empty scan could fall in that gap. The lines are in [`gate cutover`](#gate-cutover).
 
    It ends by printing the flag's path and saying that deleting it goes back to the PowerShell gate: that is the take-back, by hand, so it works even when `gate.exe` is what is broken. A `gate cutover` stopped part way is run again: the rerun rewrites the flag and goes back to waiting, and it copies the slot counts only when the default root's `slot-counts.json` is absent, so a Gates-tab edit made since is kept. The copy never replaces: the file is written beside the target and hard-linked into place, so one that appears meanwhile wins, and a target that exists but cannot be read is kept too.
 
-   Callers that start the PowerShell gate without the launcher keep starting PowerShell gates after the flag is set. The drain names on stderr each PowerShell gate whose claim or ticket appeared after the flag was written, with its command line, so a bypassing caller is visible rather than holding the drain open silently. The cutover is not run until claude-config lists the callers it moved.
+   Callers that start the PowerShell gate without the launcher keep starting PowerShell gates after the flag is set. The drain names on stderr each PowerShell gate whose earliest claim or ticket `since` is later than the flag's write time (a late arrival), with its command line, so a bypassing caller is visible rather than holding the drain open silently; each pid is named once. The cutover is not run until claude-config lists the callers it moved.
 
 ### The launcher's hand-over
 
@@ -1066,7 +1091,9 @@ A Rust integration suite drives the built `gate.exe` through its CLI and reads o
 
   Two more seams make a run end by Ctrl+C without a console: `--test-interrupt-after-samples <n>` raises the interrupt after the n-th sample, and `--test-interrupt-queued` raises it when the waiting line is printed, so once no slot is free for the gate. `--test-print-request` shows them as `testSeams.interruptAfterSamples` and `testSeams.interruptQueued`.
 
-  `--test-print-request`, on `run`, `stop-tree` and the compatibility form, prints the parsed request as one JSON line on stdout and exits 0, so the suite sees what a command line asked for; it is the one hidden switch the compatibility layer accepts.
+  On `cutover` the seams are `--test-poll-ms`, `--test-heartbeat-ms`, `--test-confirm-ms` (the confirmation window) and the switch `--test-cutover-interrupt-after-list`; `--test-print-request` shows them as `testSeams.pollMs`, `heartbeatMs`, `confirmMs` and `interruptAfterList` ([`gate cutover`](#gate-cutover)).
+
+  `--test-print-request`, on `run`, `stop-tree`, `cutover` and the compatibility form, prints the parsed request as one JSON line on stdout and exits 0, so the suite sees what a command line asked for; it is the one hidden switch the compatibility layer accepts.
 
   `--test-sampler-fail` (a switch) makes every sample fail with `--test-sampler-fail makes every sample fail (test seam only)`, so the run says `gate: sampler failed: ...; watching by wall time only` and only the backstop watches; `--test-print-request` shows it as `testSeams.samplerFail`, after `interruptQueued`.
 

@@ -10,9 +10,9 @@ gate run --slot heavy --timeout 900 --log .tmp/test.log -- cargo test --workspac
 
 Pre-release. Nothing here is ready to use yet, and gate is not yet a replacement for anything. The design is written ([docs/design.md](docs/design.md)); the code is being built slice by slice.
 
-So far `gate` reads its command line (`--version`, `--help`, and the argument checks for `run` and `stop-tree`), and `gate run` starts a command under a slot, logs its output, prints the tail and a verdict line, and exits with the command's status.
+So far `gate` reads its command line (`--version`, `--help`, and the argument checks for `run`, `stop-tree` and `cutover`), and `gate run` starts a command under a slot, logs its output, prints the tail and a verdict line, and exits with the command's status.
 
-The watchdog kills a stalled command, one past its ceiling and one past the backstop, and Ctrl+C stops a run; routing is not built yet. `gate stop-tree <pid>` stops a process tree and the gate jobs inside it. It succeeds a PowerShell gate its author runs today, which stays in use until gate can take its place.
+The watchdog kills a stalled command, one past its ceiling and one past the backstop, and Ctrl+C stops a run; routing is not built yet. `gate stop-tree <pid>` stops a process tree and the gate jobs inside it. `gate cutover` copies the PowerShell gate's slot counts, writes the cutover flag so new gates start `gate.exe`, and waits for the PowerShell gates still running; deleting the flag by hand goes back. It succeeds a PowerShell gate its author runs today, which stays in use until gate can take its place.
 
 ## How it will work
 

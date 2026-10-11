@@ -1,5 +1,5 @@
-//! The gate's own argv: the subcommand CLI (`gate run`, `gate stop-tree`, the hidden `gate box`, `--version`,
-//! `--help`) and the compatibility layer that reads the PowerShell gate's `-Log <path> -TimeoutSeconds <n> -Slot
+//! The gate's own argv: the subcommand CLI (`gate run`, `gate stop-tree`, `gate cutover`, the hidden `gate box`,
+//! `--version`, `--help`) and the compatibility layer that reads the PowerShell gate's `-Log <path> -TimeoutSeconds <n> -Slot
 //! <kind> -- <command>` form. Parsing is pure: it reads the words it is given, opens no file and reads no environment,
 //! so it builds and tests everywhere. A usage error is a list of [`Problem`]s, each printed on its own `gate: ` line
 //! before the [`USAGE`]; a malformed `gate box` is the one [`Problem::BoxUsage`], its own `usage: ` line said alone.
@@ -27,13 +27,17 @@ pub use batch::{BatchRefusal, batch_command_line, batch_refusal, is_batch_target
 pub use cmdline::{command_line, command_text, quote_arg, quote_arg_str};
 pub use problem::{MAX_WHOLE_NUMBER, Problem, Required, Spelling};
 pub use program::{ProgramSearch, resolve_program};
-pub use request::{BoxRequest, BoxSeams, BoxVerb, DEFAULT_STALL_SECONDS, DEFAULT_TAIL_LINES, Invocation, RunRequest, Slot, StopRequest, TestSeams};
+pub use request::{
+    BoxRequest, BoxSeams, BoxVerb, CutoverRequest, CutoverSeams, DEFAULT_STALL_SECONDS, DEFAULT_TAIL_LINES, Invocation, RunRequest, Slot,
+    StopRequest, TestSeams,
+};
 pub use usage::USAGE;
 
 /// Reads the gate's arguments, without the program name.
 ///
 /// The first word picks the parser: `--version`, `--help` and `help` first, then a subcommand name (`run`,
-/// `stop-tree`, the hidden `box`) selects the CLI and a first word starting with `-` selects the compatibility layer.
+/// `stop-tree`, `cutover`, the hidden `box`) selects the CLI and a first word starting with `-` selects the
+/// compatibility layer.
 ///
 /// # Errors
 ///
@@ -53,6 +57,7 @@ pub fn parse(args: Vec<OsString>) -> Result<Invocation, Vec<Problem>> {
         "--help" | "help" => alone(words, Invocation::Help),
         "run" => cli::parse_run(words).map(Invocation::Run),
         "stop-tree" => cli::parse_stop_tree(words).map(Invocation::StopTree),
+        "cutover" => cli::parse_cutover(words).map(Invocation::Cutover),
         "box" => boxcmd::parse(words).map(Invocation::Box),
         _ if text.starts_with('-') => compat::parse(std::iter::once(first).chain(words)),
         _ => Err(vec![Problem::UnknownSubcommand(text.to_owned())]),

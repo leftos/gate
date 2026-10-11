@@ -5,7 +5,7 @@ use std::iter::Peekable;
 use std::path::PathBuf;
 
 use crate::problem::{Problem, Required, Spelling};
-use crate::request::{DEFAULT_STALL_SECONDS, DEFAULT_TAIL_LINES, RunRequest, Slot, StopRequest, TestSeams};
+use crate::request::{CutoverRequest, CutoverSeams, DEFAULT_STALL_SECONDS, DEFAULT_TAIL_LINES, RunRequest, Slot, StopRequest, TestSeams};
 use crate::values;
 
 /// An option that takes a value.
@@ -55,6 +55,8 @@ pub(crate) enum ValueOption {
     RemoteScript,
     #[cfg(feature = "test-seams")]
     BridgePwsh,
+    #[cfg(feature = "test-seams")]
+    ConfirmMs,
 }
 
 /// An option that is on or off.
@@ -72,6 +74,8 @@ pub(crate) enum SwitchOption {
     DiagnosticsFail,
     #[cfg(feature = "test-seams")]
     RemoteSnapshot,
+    #[cfg(feature = "test-seams")]
+    CutoverInterruptAfterList,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -93,6 +97,9 @@ pub(crate) struct RunBuilder {
     local: bool,
     print_request: bool,
     test_seams: TestSeams,
+    /// `gate cutover`'s own seams, `--test-confirm-ms` and `--test-cutover-interrupt-after-list`; its poll and
+    /// still-waiting period are read into `test_seams`, as a run's are.
+    cutover_seams: CutoverSeams,
     given: Vec<RunOption>,
     pub(crate) problems: Vec<Problem>,
 }
@@ -195,6 +202,8 @@ impl RunBuilder {
             ValueOption::RemoteScript => self.test_seams.remote_script = Some(PathBuf::from(value)),
             #[cfg(feature = "test-seams")]
             ValueOption::BridgePwsh => self.test_seams.bridge_pwsh = Some(PathBuf::from(value)),
+            #[cfg(feature = "test-seams")]
+            ValueOption::ConfirmMs => self.cutover_seams.confirm_ms = Some(values::above_zero(spelled, value)?),
         }
         Ok(())
     }
@@ -217,6 +226,8 @@ impl RunBuilder {
             SwitchOption::DiagnosticsFail => self.test_seams.diagnostics_fail = on,
             #[cfg(feature = "test-seams")]
             SwitchOption::RemoteSnapshot => self.test_seams.remote_snapshot = on,
+            #[cfg(feature = "test-seams")]
+            SwitchOption::CutoverInterruptAfterList => self.cutover_seams.interrupt_after_list = on,
         }
     }
 
@@ -317,6 +328,23 @@ impl RunBuilder {
                 Err(self.problems)
             }
         }
+    }
+
+    /// The cutover request, its seams taken from the poll, the still-waiting period, the confirmation window and the
+    /// interrupt switch read, or every problem found.
+    pub(crate) fn finish_cutover(self) -> Result<CutoverRequest, Vec<Problem>> {
+        if !self.problems.is_empty() {
+            return Err(self.problems);
+        }
+        Ok(CutoverRequest {
+            print_request: self.print_request,
+            seams: CutoverSeams {
+                poll_ms: self.test_seams.poll_ms,
+                heartbeat_ms: self.test_seams.heartbeat_ms,
+                confirm_ms: self.cutover_seams.confirm_ms,
+                interrupt_after_list: self.cutover_seams.interrupt_after_list,
+            },
+        })
     }
 }
 

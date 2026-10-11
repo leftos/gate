@@ -21,6 +21,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Ceiling**: the `--timeout` limit, counted in load-adjusted seconds; passing it kills the command as TIMED OUT.
 - **Claim**: the JSON file `slots\<name>.json` a gate writes while it holds a slot, naming its pid, command, log and ceiling.
 - **Compatibility layer**: `gate.exe`'s acceptance of the PowerShell gate's argument form (`-Log`, `-TimeoutSeconds`, `-Slot` and the rest), kept until no caller uses it.
+- **Confirmation window**: the 5 s across which every scan of the cutover's drain must find no PowerShell gate before it ends, because the PowerShell gate deletes its ticket when it takes a slot and writes its claim up to about 2 s later; a scan that finds a gate resets it.
 - **Console donor**: the hidden system `cmd.exe /d /q /k` that `gate box run` puts in the command's job, whose console the box sets to UTF-8 and the command inherits; it lives until the wait for the command is over.
 - **Control line**: one JSON line, carrying the call's nonce, that the **Shim** writes on pwsh's stdout to answer the gate: `started`, the result (status, killed, reason) or an error; the request goes the other way on pwsh's stdin.
 - **Cores hint**: the end-of-run line saying how many cores the command kept busy and whether its slot kind fitted.
@@ -48,7 +49,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Journal**: the append-only `events.jsonl` in the state root, one JSON line per gate event (`queue`, `take`, `release` and others), with its rolled file and gzip archive.
 - **Journal mutex**: the named mutex `Local\gate-journal` (with the root hash under a non-default root) that every gate holds, waiting up to 2 s, while it appends to the journal, rolls it and archives.
 - **Keeper**: the `cmd.exe` `gate box run` starts on its own console while it is away on the donor's console, so its own console stays alive for it to return to.
-- **Late arrival**: a PowerShell gate whose claim or ticket appeared after the cutover flag was written, because its caller bypassed the launcher; the cutover's drain names it.
+- **Late arrival**: a PowerShell gate whose earliest claim or ticket `since` is later than the cutover flag's write time, because its caller bypassed the launcher; the cutover's drain names it.
 - **Lending**: a light parent gate letting a nested heavy gate, which its slot does not cover, run on that slot while a critical request drains and before one holds the machine, instead of queueing behind it; the gate is the lent gate. A parent on a reserved light slot lends nothing.
 - **Lent window**: the span during a critical drain in which the critical gate lends one slot to backfill guests, ending at the shadow end.
 - **Light**: the slot kind for work that keeps one or two cores busy; its pool's thread budget is 2.

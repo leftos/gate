@@ -3,7 +3,7 @@
 
 use std::path::Path;
 
-use gate_args::{RunRequest, StopRequest};
+use gate_args::{CutoverRequest, RunRequest, StopRequest};
 use serde_json::json;
 
 use crate::resolve::ResolvedRoot;
@@ -48,6 +48,21 @@ pub(crate) fn run(request: &RunRequest, log: &Path, root: &ResolvedRoot) -> Stri
             "remoteTimeoutMs": seams.remote_timeout_ms,
             "remoteScript": seams.remote_script.as_ref().map(|path| path.to_string_lossy()),
             "bridgePwsh": seams.bridge_pwsh.as_ref().map(|path| path.to_string_lossy()),
+        },
+    })
+    .to_string()
+}
+
+pub(crate) fn cutover(request: &CutoverRequest, local_app_data: &Path) -> String {
+    let seams = &request.seams;
+    json!({
+        "mode": "cutover",
+        "localAppData": local_app_data.to_string_lossy(),
+        "testSeams": {
+            "pollMs": seams.poll_ms,
+            "heartbeatMs": seams.heartbeat_ms,
+            "confirmMs": seams.confirm_ms,
+            "interruptAfterList": seams.interrupt_after_list,
         },
     })
     .to_string()

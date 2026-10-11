@@ -25,6 +25,8 @@ pub enum Invocation {
     Run(RunRequest),
     /// `gate stop-tree <pid>`, or the compatibility layer's `-StopTree <pid>`.
     StopTree(StopRequest),
+    /// `gate cutover`.
+    Cutover(CutoverRequest),
     /// The hidden `gate box <verb> <payload>`.
     Box(BoxRequest),
 }
@@ -186,4 +188,28 @@ pub struct StopRequest {
     pub state_dir: Option<PathBuf>,
     /// The hidden `--test-print-request` switch.
     pub print_request: bool,
+}
+
+/// A valid `gate cutover`, which takes no words: only the hidden switches the black-box suite gives it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CutoverRequest {
+    /// The hidden `--test-print-request` switch.
+    pub print_request: bool,
+    /// The hidden `--test-*` flags that set the drain's timing and interrupt.
+    pub seams: CutoverSeams,
+}
+
+/// What the black-box suite sets on `gate cutover` through its hidden `--test-*` flags; each field keeps its default,
+/// `None` or off, in a gate built without the `test-seams` feature.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CutoverSeams {
+    /// The drain's poll, in milliseconds (`--test-poll-ms`).
+    pub poll_ms: Option<u64>,
+    /// The period of the drain's still-waiting line, in milliseconds (`--test-heartbeat-ms`).
+    pub heartbeat_ms: Option<u64>,
+    /// How long every scan must find no PowerShell gate before the drain ends, in milliseconds (`--test-confirm-ms`).
+    pub confirm_ms: Option<u64>,
+    /// Raise the console interrupt right after the first list of the gates waited on is said
+    /// (`--test-cutover-interrupt-after-list`).
+    pub interrupt_after_list: bool,
 }

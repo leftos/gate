@@ -14,6 +14,7 @@ mod checkout;
 mod cli;
 mod compat;
 mod critical;
+mod cutover;
 mod diagnostics;
 mod harness;
 mod hold;
