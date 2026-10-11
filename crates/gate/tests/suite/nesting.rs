@@ -1,17 +1,19 @@
 //! Nesting under a parent gate's slot marker, `GATE_SLOT_HELD`: a gate a live parent's slot covers takes no slot and
 //! journals `covered`, a critical gate under a heavy or light marker is refused, a heavy gate under a light marker takes
-//! a heavy slot, and a marker that is malformed, names a gate no longer running or belongs to another root is ignored.
+//! a heavy slot, and a marker that is malformed, names a gate no longer running or belongs to another root is ignored. A
+//! covered gate keeps its covered marker while its command runs, and a gate that queues deletes a dead gate's.
 
 use std::fs;
 use std::path::Path;
 use std::process::{self, Command};
 
 use gate_state::StateRoot;
+use gate_state::v1::{self, CoveredMarker};
 use jiff::Timestamp;
 use serde_json::Value;
 
 use crate::support::{
-    Case, FAKE_TOOL, GATE, Outcome, Running, assert_in_order, critical_words, events, finish, heavy_words, run_words, shown, start,
+    Case, FAKE_TOOL, GATE, Outcome, Running, assert_in_order, critical_words, events, finish, heavy_words, run_words, shown, start, wait_for_file,
     wait_for_journal_line,
 };
 
@@ -131,6 +133,88 @@ fn a_gate_under_a_covering_parent_takes_no_slot() {
     assert_in_order(
         &inner_log,
         &[&format!("{marker}\n"), &format!("gate: running under the heavy slot of gate {outer_pid}")],
+    );
+}
+
+/// The names of the files in the case root's covered folder, none when it is missing.
+fn covered_files(case: &Case) -> Vec<String> {
+    match fs::read_dir(v1::covered_dir(&case.root())) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        listed => listed
+            .expect("the covered folder can be listed")
+            .map(|entry| entry.expect("the entry lists").file_name().to_string_lossy().into_owned())
+            .collect(),
+    }
+}
+
+/// The covered markers in the case root, as gate-state reads them.
+fn covered_markers(case: &Case) -> Vec<CoveredMarker> {
+    v1::read_covered(&v1::covered_dir(&case.root()))
+        .expect("the covered folder can be listed")
+        .into_iter()
+        .map(|(_, marker)| marker)
+        .collect()
+}
+
+#[test]
+fn a_covered_gate_keeps_its_marker_while_its_command_runs() {
+    let case = Case::new("a_covered_gate_keeps_its_marker_while_its_command_runs");
+    let started = shown(&case.folder().join("started"));
+    let go = case.folder().join("go");
+    let go_text = shown(&go);
+    let words = run_words("inner.log", &[], &[FAKE_TOOL, "mark", &started, "wait", &go_text]);
+    let inner = start(marked(&case, &words, &test_marker(&case, "heavy")));
+    // The command starts only after the marker is written, so its mark is the moment to look.
+    wait_for_file(Path::new(&started));
+
+    let pid = inner.id();
+    let markers: Vec<(u32, u64, u32)> = covered_markers(&case)
+        .iter()
+        .map(|marker| (marker.pid, marker.process_start, marker.parent_pid))
+        .collect();
+    let child_start = u64::try_from(start_ms(pid)).expect("a start is after the epoch");
+    assert_eq!(
+        markers,
+        [(pid, child_start, process::id())],
+        "the covered gate's marker names it and its parent"
+    );
+    assert_eq!(covered_files(&case), [format!("{pid}-{child_start}.json")]);
+
+    let_go(&go);
+    assert_passed(&inner.finish());
+    assert_eq!(covered_files(&case), Vec::<String>::new(), "the marker is gone once the run ends");
+    assert_eq!(events_besides(&case, 0), ["covered"], "the marker changes nothing in the journal");
+}
+
+#[test]
+fn a_dead_gates_covered_marker_is_deleted_by_the_next_gate_that_queues() {
+    let case = Case::new("a_dead_gates_covered_marker_is_deleted_by_the_next_gate_that_queues");
+    let root = case.root();
+    // A pid no process runs as: Windows gives out multiples of 4 far below this one.
+    let dead = CoveredMarker {
+        pid: u32::MAX - 3,
+        process_start: 1_790_852_400_500,
+        parent_pid: 52000,
+        command: "cargo fmt --check".to_owned(),
+        cwd: shown(&case.folder()),
+        since: 1_790_852_402_000,
+    };
+    v1::write_covered(&v1::covered_path(&root, dead.pid, dead.process_start), &dead).expect("the dead marker can be written");
+    let own = process::id();
+    let own_start = u64::try_from(start_ms(own)).expect("a start is after the epoch");
+    let live = CoveredMarker {
+        pid: own,
+        process_start: own_start,
+        ..dead.clone()
+    };
+    v1::write_covered(&v1::covered_path(&root, own, own_start), &live).expect("the live marker can be written");
+
+    assert_passed(&case.run(&run_words("out.log", &[], &[FAKE_TOOL, "exit", "0"])));
+
+    assert_eq!(
+        covered_markers(&case),
+        [live],
+        "the dead gate's marker is deleted; the live gate's is kept"
     );
 }
 

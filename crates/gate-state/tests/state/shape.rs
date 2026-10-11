@@ -1,11 +1,12 @@
 //! The serialised state's shape: the keys `GET /api/gate/slots` serves, in their order, at every level.
 
-use gate_state::SlotKind;
+use gate_state::{SlotKind, v1};
 use serde_json::Value;
 
-use crate::support::{CRITICAL_GATE, HEAVY_GATE, LIGHT_GATE, Machine, NOW, START, claim, keys, remote_claim, remote_ticket, ticket, ticks};
+use crate::support::{CRITICAL_GATE, HEAVY_GATE, LIGHT_GATE, Machine, NOW, START, claim, keys, ms, remote_claim, remote_ticket, ticket, ticks};
 
-const TOP: [&str; 7] = ["now", "machine", "processors", "critical", "queue", "pools", "remote"];
+const TOP: [&str; 8] = ["now", "machine", "processors", "critical", "queue", "pools", "remote", "covered"];
+const COVERED: [&str; 6] = ["pid", "start", "parentPid", "command", "cwd", "since"];
 const POOL: [&str; 7] = ["kind", "count", "default", "set", "problem", "slots", "waiting"];
 const REMOTE: [&str; 3] = ["count", "problem", "slots"];
 /// A remote ticket's keys: a ticket's, with `remote` after `holds`.
@@ -53,6 +54,9 @@ fn assert_shape(value: &Value) {
         for slot in array(remote, "slots") {
             assert_eq!(keys(&slot), SLOT);
         }
+    }
+    for covered in array(value, "covered") {
+        assert_eq!(keys(&covered), COVERED);
     }
 }
 
@@ -122,6 +126,25 @@ fn state_keys_follow_dashboard_order() {
     let machine = Machine::new("state_keys_follow_dashboard_order");
     let idle = serde_json::to_value(machine.state()).expect("the idle state serialises");
     assert_eq!(keys(&idle), TOP);
+}
+
+#[test]
+fn covered_keys_follow_dashboard_order() {
+    let mut machine = Machine::v1("covered_keys_follow_dashboard_order");
+    machine.add_process(54000, 1, "gate.exe", None, Some(START));
+    let marker = v1::CoveredMarker {
+        pid: 54000,
+        process_start: ms(START),
+        parent_pid: 52000,
+        command: "cargo fmt --check".to_owned(),
+        cwd: r"C:\work\repo".to_owned(),
+        since: ms(NOW),
+    };
+    v1::write_covered(&v1::covered_path(&machine.v1_root(), 54000, ms(START)), &marker).expect("the marker can be written");
+    let state = serde_json::to_value(machine.state()).expect("the state serialises");
+
+    assert_shape(&state);
+    assert_eq!(array(&state, "covered").len(), 1);
 }
 
 #[test]

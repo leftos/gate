@@ -450,8 +450,11 @@ fn runs_pair_queue_take_release_by_pid_and_process_start() {
                 remote: false,
                 host: None,
                 fallback: None,
+                pid: 200,
+                process_start: START.to_owned(),
                 parent_pid: None,
                 state: RunState::Failed,
+                running: false,
                 queued: Some(ago(29)),
                 started: Some(ago(27)),
                 waited_seconds: Some(1.0),
@@ -473,8 +476,11 @@ fn runs_pair_queue_take_release_by_pid_and_process_start() {
                 remote: false,
                 host: None,
                 fallback: None,
+                pid: 100,
+                process_start: START.to_owned(),
                 parent_pid: None,
                 state: RunState::Ok,
+                running: false,
                 queued: Some(ago(30)),
                 started: Some(ago(28)),
                 waited_seconds: Some(2.0),
@@ -1391,6 +1397,38 @@ fn a_covered_line_is_a_covered_run_with_its_parent_pid() {
         ["cargo fmt --all", "cargo test --workspace"],
         "only the parents' runs count their time"
     );
+}
+
+#[test]
+fn a_covered_run_carries_its_gates_pid_start_and_liveness() {
+    let dir = journal_dir("a_covered_run_carries_its_gates_pid_start_and_liveness");
+    fs::write(dir.join("events.jsonl"), V1_JOURNAL).expect("the journal can be written");
+    let covered_start = "2026-10-03T11:01:59.8000000Z";
+
+    for live in [false, true] {
+        let is_live = |pid: u32, process_start: &str| live && (pid, process_start) == (54000, covered_start);
+        let history = JournalCache::default()
+            .read(&dir, "", ts(NOW), is_live, last_segment)
+            .expect("the journal can be read");
+        let covered = history
+            .runs
+            .iter()
+            .find(|run| run.state == RunState::Covered)
+            .expect("the covered line is a run");
+
+        assert_eq!(
+            (covered.pid, covered.process_start.as_str(), covered.running),
+            (54000, covered_start, live),
+            "a covered run stays covered, live or not"
+        );
+        let shape = serde_json::to_value(covered).expect("a run serializes");
+        assert_eq!(
+            (&shape["pid"], &shape["processStart"], &shape["running"], &shape["state"]),
+            (&json!(54000), &json!(covered_start), &json!(live), &json!("covered"))
+        );
+        let others: Vec<bool> = history.runs.iter().filter(|run| run.pid != 54000).map(|run| run.running).collect();
+        assert!(others.iter().all(|running| !running), "no other gate is live: {others:?}");
+    }
 }
 
 #[test]

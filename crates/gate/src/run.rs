@@ -21,6 +21,7 @@ use jiff::Timestamp;
 use crate::acquire;
 use crate::answer::USAGE_STATUS;
 use crate::console::Console;
+use crate::covered::Covered;
 use crate::environment::{self, Variables};
 use crate::journal::RunJournal;
 use crate::log::Log;
@@ -112,6 +113,7 @@ pub(crate) fn run(request: &RunRequest, log: &Path, root: &ResolvedRoot, environ
         tag: None,
         arrived: epoch_ms(Timestamp::now()),
         lent: false,
+        covered: None,
     };
     let route = run.queue(environment, console);
     let mut hold = Hold {
@@ -432,6 +434,8 @@ struct Run<'a> {
     /// Whether the run's light parent lent it its slot while a critical request drained, before it queued or once it
     /// journalled `parent` as it waited, so it takes, journals and releases no slot.
     lent: bool,
+    /// The covered marker of a run a parent's slot covers, from its `covered` line to its release.
+    covered: Option<Covered>,
 }
 
 /// The client's call for `remote`, with the run's log, limits and interrupt, made of the run's parts so the run's
@@ -517,8 +521,9 @@ struct Ended {
 impl Run<'_> {
     /// Decides where the command runs, then journals the queue: with `notRouted` for a heavy gate its caller kept here
     /// with `--local`, with the remote tag for a routed one. A gate a parent's slot covers runs here, journalling
-    /// `covered` with the parent's pid in place of the queue. A gate whose light parent lends it its slot before it
-    /// queues, while a critical request drains, is not routed and journals nothing here ([`Run::on_parent`]). The
+    /// `covered` with the parent's pid in place of the queue, then writing its covered marker ([`Covered`]). A gate
+    /// whose light parent lends it its slot before it queues, while a critical request drains, is not routed and
+    /// journals nothing here ([`Run::on_parent`]). The
     /// route.
     fn queue(&mut self, environment: &Environment, console: &mut Console) -> Route {
         let nesting = self.nesting;
@@ -545,6 +550,9 @@ impl Run<'_> {
             },
         };
         self.journal.write(&event, self.tag.as_ref(), console);
+        if let Some(parent_pid) = covering {
+            self.covered = Some(Covered::write(&self.root.path, &self.gate, parent_pid, console));
+        }
         route
     }
 
@@ -918,9 +926,12 @@ impl Run<'_> {
 
     /// Deletes the claim, journals the release with how the run `ended` (status and verdict unknown when it did not
     /// end on its own path) and lets the slot go, then wakes the waiters. A critical gate journals the release of every
-    /// slot it held first, then lets the machine go ([`Machine::release`]). A gate a parent's slot covers, or a light
-    /// parent lent its slot, took no slot and journals no release.
+    /// slot it held first, then lets the machine go ([`Machine::release`]). A gate a parent's slot covers deletes its
+    /// covered marker; it, and a gate a light parent lent its slot, took no slot and journals no release.
     fn release(&mut self, hold: Hold, ended: Option<&Ended>, console: &mut Console) {
+        if let Some(mut covered) = self.covered.take() {
+            covered.end(console);
+        }
         if self.nesting.covering().is_some() || self.lent {
             return;
         }

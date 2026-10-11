@@ -25,6 +25,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Control line**: one JSON line, carrying the call's nonce, that the **Shim** writes on pwsh's stdout to answer the gate: `started`, the result (status, killed, reason) or an error; the request goes the other way on pwsh's stdin.
 - **Cores hint**: the end-of-run line saying how many cores the command kept busy and whether its slot kind fitted.
 - **Covered**: said of a nested gate whose parent's slot kind covers its own (heavy covers heavy and light, light covers light, critical covers all), so it takes no slot.
+- **Covered marker**: the file `covered\<pid>-<start>.json` a covered gate keeps while it runs, so ops-tower sees a gate that writes no claim or ticket.
 - **Critical drain**: a critical gate's wait for the gates that arrived before it to free their slots, while it holds back the gates that arrive after it.
 - **Critical gate**: a gate run with `--slot critical`, which takes every heavy and unreserved light slot and runs its command at High priority.
 - **Critical request**: a critical gate's queued ticket and run, from its arrival until it releases the machine; critical requests run one at a time in arrival order.

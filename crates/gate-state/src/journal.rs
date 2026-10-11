@@ -93,12 +93,20 @@ pub struct HistoryRun {
     /// (the box could not restore the repo's dotnet local tools), or `unknown` when the line names none; `None` when it
     /// was not.
     pub fallback: Option<String>,
+    /// The run's own gate's pid, from its run key.
+    pub pid: u32,
+    /// The run's own gate's process start, as the journal wrote it (ISO 8601 UTC, seven fractional digits); with
+    /// [`HistoryRun::pid`] the run's key.
+    pub process_start: String,
     /// The pid of the gate whose slot a [`RunState::Parent`] or [`RunState::Covered`] run ran on, from its `parent` or
     /// `covered` line; `None` for any other run.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_pid: Option<u32>,
     /// How the run stands.
     pub state: RunState,
+    /// True while the run's own gate is live by the read's liveness check, whatever its state: a
+    /// [`RunState::Covered`] or [`RunState::Parent`] run stays in that state while its gate runs.
+    pub running: bool,
     /// When the gate queued, as the journal wrote it (ISO 8601 UTC, seven fractional digits); `None` when its queue
     /// line is in neither journal file.
     pub queued: Option<String>,
@@ -486,7 +494,7 @@ impl JournalCache {
             .take(RECENT_RUNS)
             .map(|(key, run)| {
                 let parent = run.parent.and_then(|parent| self.released_parent(parent));
-                run.row(run.state(key, is_live), run.repo(repo_of), parent)
+                run.row(key, is_live, run.repo(repo_of), parent)
             })
             .collect();
         History {
@@ -606,9 +614,11 @@ impl Run {
         self.cwd.as_deref().and_then(repo_of)
     }
 
-    /// The run's row; a run on its parent's slot takes its status and held time from `parent`, its parent's ended run.
-    fn row(&self, state: RunState, repo: Option<String>, parent: Option<&Self>) -> HistoryRun {
+    /// The row of the run keyed `key`, its state and whether its gate runs judged by `is_live`; a run on its parent's
+    /// slot takes its status and held time from `parent`, its parent's ended run.
+    fn row(&self, key: &RunKey, is_live: &impl Fn(u32, &str) -> bool, repo: Option<String>, parent: Option<&Self>) -> HistoryRun {
         let end = if self.parent.is_some() { parent } else { Some(self) };
+        let (pid, process_start) = key;
         HistoryRun {
             command: self.command.clone(),
             cwd: self.cwd.clone(),
@@ -620,8 +630,11 @@ impl Run {
             remote: self.remote,
             host: self.host.clone(),
             fallback: self.fallback.clone(),
+            pid: *pid,
+            process_start: process_start.clone(),
             parent_pid: self.parent.map(|(pid, _)| pid),
-            state,
+            state: self.state(key, is_live),
+            running: is_live(*pid, process_start),
             queued: self.queued.as_ref().map(|stamp| stamp.text.clone()),
             started: self.started.as_ref().map(|stamp| stamp.text.clone()),
             waited_seconds: self.waited_seconds,

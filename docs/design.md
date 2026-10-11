@@ -209,6 +209,8 @@ A missing file or key means the default; an unreadable or invalid value is ignor
 
    More: `gate: cannot read the tickets in <dir>: <error>`, `gate: cannot read the claims in <dir>: <error>`, `gate: ignored the ticket <path>: <reason>`, `gate: cannot check the gate of <path>: <error>` and `gate: cannot delete the ticket|the claim|the dead gate's ticket <path>: <error>`.
 
+   A gate under a parent's slot says `gate: cannot write the covered marker <path>: <error>` and `gate: cannot delete the covered marker <path>: <error>`, and the survey says `gate: cannot read the covered markers in <dir>: <error>` and `gate: cannot delete the dead gate's covered marker <path>: <error>`, each of the last two once; the run goes on after each.
+
 Ordering by ticket replaces the PowerShell gate's free-for-all among waiters of one kind (Q2), and the wake events replace its 2 s polling as the way a waiter learns of a release.
 
 ### Abandoned slots
@@ -253,6 +255,7 @@ For any other root, every kernel object name carries `<h>`, the first 8 lower-ca
 | `remote.json` | people | the router, ops-tower (`slots`) | Builders and routing (T1); read from `%LOCALAPPDATA%\gate\remote.json`, beside the `v1\` folder, whatever the state root is. |
 | `slots\<name>.json` | the gate holding the slot, written after its `take` line | other gates, ops-tower | [Claim](#claim); `<name>` is the mutex name without `Local\` and the root hash, plus `gate-critical.json` for a critical gate, its one claim for the whole machine (kind `critical`, index 0), written after its `take` line; the heavy and light slots it holds get none. |
 | `waiting\<pid>-<start>.json` | the waiting gate | other gates, ops-tower | [Ticket](#ticket). |
+| `covered\<pid>-<start>.json` | a gate running under a parent gate's slot | other gates (the survey), ops-tower | [Covered marker](#covered-marker). |
 | `paused\<parent pid>-<parent start>-<pid>-<start>.pause` | a gate waiting behind a critical request under a parent gate's slot | its parent gate's watchdog | Empty file; [Critical drain and nesting](#critical-drain-and-nesting) (kept, N3). |
 | `events.jsonl`, `events.1.jsonl` | every gate, under the journal mutex | ops-tower, the durations summary, people | [Journal](#journal). |
 | `archive\events-<yyyyMMddTHHmmssZ>.jsonl.gz` | the gate whose append rolled the journal | the durations summary | [Archive](#archive). |
@@ -306,6 +309,8 @@ The environment carries one more name: `GATE_SLOT_HELD`, the slot marker ([Criti
 
   The waiters in `queue[]`, `pools[].waiting` and `critical.waiting` come from the tickets, not from process command lines: `queue[]` is ordered by (`arrived`, `pid`) with `arrived` as ISO text of 7 fractional digits and a lower-case `kind`; a waiter's `since` is its gate's start and its `commandLine` is the gate's command line from the process table; `pools[].problem` is worded for `gate.exe`'s files.
 
+  `DashboardState.covered`, its last key, lists the gates running under a parent gate's slot, from the [covered markers](#covered-marker): `{pid, start, parentPid, command, cwd, since}`, with `start` and `since` as ISO text of 7 fractional digits, sorted by (`since`, `pid`). It holds live markers only, judged by the tickets' pid-and-start check, and is always empty for the `PowerShell` generation.
+
   A `V1` read of the counts takes `v1\slot-counts.json` beside the PowerShell counts path (with `GATE_TEST_SLOT_COUNTS`, `<that file's folder>\v1\slot-counts.json`) and reads it strictly ([Counts file](#counts-file)).
 - Text is UTF-8 with no BOM and LF line ends.
 
@@ -352,6 +357,24 @@ The liveness rule is the same for claims and [tickets](#ticket). A pid with no r
 Waiters of one kind queue by (`arrived`, `pid`). The ticket reader lists only `*.json` files in `waiting\` (a `*.tmp` file is skipped), and leaves out a ticket deleted between the listing and the read, since a gate that took its slot deletes it.
 
 A ticket whose gate is dead by the [liveness rule](#claim) is ignored and deleted by the first gate that finds it, which then wakes the other waiters; the reader itself deletes nothing. An unreadable ticket is ignored but left in place, said once. ops-tower learns that a gate is waiting from these tickets, read through `gate-state`; it does not scan process command lines.
+
+### Covered marker
+
+`covered\<pid>-<start>.json`, written by a gate running under a parent gate's slot ([Critical drain and nesting](#critical-drain-and-nesting)) right after its `covered` journal line, so ops-tower sees a gate that takes no slot and writes no ticket or claim.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `v` | number | 1 |
+| `pid` | number | the covered gate's pid |
+| `processStart` | number | the covered gate's process start, epoch ms |
+| `parentPid` | number | the pid of the parent gate whose slot covers it |
+| `command` | string | the command text, as the claim's [`command`](#claim) |
+| `cwd` | string | the gate's working directory |
+| `since` | number | when the marker was written, epoch ms |
+
+The gate deletes the marker when it releases, after a panic and on drop. It writes none when it cannot read its own start or working folder, the condition that also leaves out the `covered` journal line.
+
+A marker whose gate is dead by the [liveness rule](#claim) is deleted by the next gate's survey, the pass that deletes dead tickets; the reader itself deletes nothing. The reader (`gate_state::v1::read_covered`) returns the good markers in `covered\`, in file-name order, whose name `<pid>-<start>.json` matches the pid and start in the body; a file that is unreadable, misnamed or gone between the listing and the read is skipped without a word, and a missing folder is empty.
 
 ### Counts file
 
@@ -403,6 +426,8 @@ The reader starts a run from a lone `parent` line that names a parent: state `pa
 A lone `covered` line is its own state, `covered` (`RunState::Covered`), distinct from a run that lent its slot: the run has `parentPid`, no queued or started time, the kind and first time of the `covered` line, and the status and verdict of the parent's released run. A covered run is never counted in the summary.
 
 The history that ops-tower serves (`HistoryRun`, `GET /api/gate/history`) carries `verdict`, `wallSeconds` and `adjustedSeconds`, null when a line has none, and `abandoned`: every name any line of the run lists (`parent` and `covered` lines included), in line order without repeats, always present and empty when there are none.
+
+It also carries `pid` (a number), `processStart` (the ISO string from the journal) and `running` (a bool, true while the run's gate is live by the same pid-and-start check as the tickets', for every run): a covered run's `state` stays `covered` while it runs.
 
 It also carries, after `slot`, `slots` (the slot names the run took, such as `["Local\\gate-slot-0"]`, `[]` when none) and `machine` (null, or for a critical gate's `take` `{counts, otherHeld, otherClaims}` or `{counts, otherHeld, snapshotError}`). A `fallback` line clears `slot`, `slots` and `machine`. ops-tower reads the journal of the generation the cutover flag selects ([Common rules](#common-rules)).
 
@@ -461,7 +486,7 @@ Changes from the PowerShell forms:
 
 What `gate.exe` does of it today is part A, nesting under the slot marker (N1, K7), part B1, the critical request's own drain and take (K1, K2, K5), the barrier (Q3), the light gates beside a critical request (K3), the lend (N2) and the pause markers' writer and reader (N3), all below. The watchdog reads the markers on every sample.
 
-- A gate reads `GATE_SLOT_HELD` once, before routing and before the log mutex (`nesting.rs`). A live parent whose slot covers the gate's kind (heavy covers heavy and light, light covers light, critical covers all three) gives `gate: running under the <held kind> slot of gate <pid>`: the gate takes no slot, writes no ticket or claim, and journals one `covered` line (identity fields, then `parentPid`; no `queue`, `take` or `release`).
+- A gate reads `GATE_SLOT_HELD` once, before routing and before the log mutex (`nesting.rs`). A live parent whose slot covers the gate's kind (heavy covers heavy and light, light covers light, critical covers all three) gives `gate: running under the <held kind> slot of gate <pid>`: the gate takes no slot, writes no ticket or claim, and journals one `covered` line (identity fields, then `parentPid`; no `queue`, `take` or `release`). It then keeps a [covered marker](#covered-marker) until it releases, so ops-tower sees it run.
 
   Its command gets the parent's marker verbatim, and a heavy gate covered by any parent is never routed.
 - Under a critical parent the command runs at High priority and the watchdog measures it as a critical gate's.

@@ -292,6 +292,28 @@ pub struct DashboardState {
     /// The remote pool, whose slots the gate runs on a build box; `None` while the gate's `remote.json` is absent and no
     /// remote claim file exists.
     pub remote: Option<RemotePool>,
+    /// The live gates running under a parent gate's slot, from the covered markers they keep, oldest marker first;
+    /// always empty for [`Generation::PowerShell`], whose gate writes none.
+    pub covered: Vec<CoveredRun>,
+}
+
+/// A live gate a parent gate's slot covers, from the covered marker it keeps while its command runs: it takes no slot
+/// and writes no ticket or claim.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CoveredRun {
+    /// The covered gate's pid.
+    pub pid: u32,
+    /// The covered gate's process start, ISO 8601 UTC with seven fractional digits.
+    pub start: String,
+    /// The pid of the parent gate whose slot covers it.
+    pub parent_pid: u32,
+    /// The gated command, as the gate's claim would write it.
+    pub command: String,
+    /// The covered gate's working directory.
+    pub cwd: String,
+    /// When the covered gate wrote its marker, ISO 8601 UTC with seven fractional digits.
+    pub since: String,
 }
 
 /// The remote pool: heavy gates the gate routes to a build box over ssh. Its size is the gate's `remote.json`, which

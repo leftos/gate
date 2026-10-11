@@ -241,8 +241,10 @@ impl Survey {
     }
 
     /// The live tickets under `root`, and whether a dead one was deleted on the way. An unreadable ticket is said once
-    /// and left in place. A tickets folder that cannot be read holds none, said once.
+    /// and left in place. A tickets folder that cannot be read holds none, said once. The dead gates' covered markers
+    /// are deleted first ([`Survey::sweep_covered`]).
     pub(crate) fn live_tickets(&mut self, root: &Path, console: &mut Console) -> (Vec<Ticket>, bool) {
+        self.sweep_covered(root, console);
         let dir = v1::tickets_dir(root);
         let listed = match listed_tickets(root, self.own) {
             Ok(listed) => listed,
@@ -270,6 +272,32 @@ impl Survey {
             }
         }
         (live, deleted)
+    }
+
+    /// Deletes the covered markers under `root` whose gates are gone, judged as tickets are ([`Survey::is_live`]). A
+    /// marker that cannot be read is left in place unsaid, as the reader skips it; a covered folder that cannot be listed
+    /// or a marker that cannot be deleted is said once.
+    fn sweep_covered(&mut self, root: &Path, console: &mut Console) {
+        let dir = v1::covered_dir(root);
+        let markers = match v1::read_covered(&dir) {
+            Ok(markers) => markers,
+            Err(error) => {
+                self.say_once("cannot read the covered markers in", &dir.display().to_string(), error, console);
+                return;
+            }
+        };
+        for (path, marker) in markers {
+            if !self.is_live(&path, marker.pid, marker.process_start, console)
+                && let Err(error) = delete(&path)
+            {
+                self.say_once(
+                    "cannot delete the dead gate's covered marker",
+                    &path.display().to_string(),
+                    error,
+                    console,
+                );
+            }
+        }
     }
 
     /// The live tickets under `root` of the other gates, this gate's own left out, and whether a dead one was deleted

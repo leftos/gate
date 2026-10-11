@@ -11,8 +11,8 @@ use regex::Regex;
 use crate::claims::{Claim, ReadableClaim, Ticket, last_log_line, read_claims, read_tickets};
 use crate::counts::{PoolCount, pool_count, read_counts_file, state_counts_path};
 use crate::model::{
-    CriticalState, CwdReader, DashboardState, Generation, MutexProbe, PoolState, QueueTicket, RemotePool, SlotKind, SlotRow, SlotState, StateInputs,
-    Waiting,
+    CoveredRun, CriticalState, CwdReader, DashboardState, Generation, MutexProbe, PoolState, QueueTicket, RemotePool, SlotKind, SlotRow, SlotState,
+    StateInputs, Waiting,
 };
 use crate::remote::{RemoteCount, read_remote_count, remote_settings_path};
 use crate::v1;
@@ -36,7 +36,8 @@ const CRITICAL: &str = "critical";
 ///
 /// The claims, tickets and counts file are the PowerShell gate's under `gate\` or, for [`Generation::V1`], only
 /// `gate.exe`'s under `gate\v1\`, where a missing folder is an empty state. `gate.exe`'s waiting gates are its live
-/// tickets' gates; the PowerShell gate's are found by their command lines.
+/// tickets' gates; the PowerShell gate's are found by their command lines. `gate.exe`'s gates running under a parent
+/// gate's slot are its live covered markers' gates; the PowerShell gate writes no marker.
 #[must_use]
 pub fn dashboard_state(inputs: &StateInputs, processes: &dyn ProcessTable, mutexes: &dyn MutexProbe, cwds: &dyn CwdReader) -> DashboardState {
     let table = Table::new(processes.snapshot());
@@ -49,6 +50,7 @@ pub fn dashboard_state(inputs: &StateInputs, processes: &dyn ProcessTable, mutex
     };
     let tickets = read_queue(inputs.generation, &state_dir.join(format!("{}waiting", inputs.slot_prefix)));
     let queue = table.queue(&tickets, inputs.now, cwds);
+    let covered = table.covered(inputs.generation, &state_dir.join(format!("{}covered", inputs.slot_prefix)));
     let waiters = Waiters {
         generation: inputs.generation,
         table: &table,
@@ -95,6 +97,7 @@ pub fn dashboard_state(inputs: &StateInputs, processes: &dyn ProcessTable, mutex
         queue,
         pools,
         remote,
+        covered,
     }
 }
 
@@ -143,6 +146,24 @@ fn ticket_from_v1(ticket: &v1::Ticket) -> Option<Ticket> {
         arrived_ticks: ticks_of_ms(ticket.arrived)?,
         remote: ticket.remote == Some(true),
         exact_start_ms: Some(ticket.start_ms),
+    })
+}
+
+/// Whether a process created at `created` is the `gate.exe` gate started at `start_ms`, Unix epoch milliseconds: the
+/// two agree to the millisecond.
+fn started_at_ms(created: Timestamp, start_ms: u64) -> bool {
+    created.as_millisecond().unsigned_abs() == start_ms
+}
+
+/// A covered marker's row, its times as ISO text, or `None` when one is no moment a `DateTime` holds.
+fn covered_row(marker: &v1::CoveredMarker) -> Option<CoveredRun> {
+    Some(CoveredRun {
+        pid: marker.pid,
+        start: format_ticks(ticks_of_ms(marker.process_start)?)?,
+        parent_pid: marker.parent_pid,
+        command: marker.command.clone(),
+        cwd: marker.cwd.clone(),
+        since: format_ticks(ticks_of_ms(marker.since)?)?,
     })
 }
 
@@ -320,10 +341,34 @@ impl Table {
         let process = self.get(ticket.pid)?;
         let created = process.created?;
         let live = match ticket.exact_start_ms {
-            Some(start_ms) => created.as_millisecond().unsigned_abs() == start_ms,
+            Some(start_ms) => started_at_ms(created, start_ms),
             None => (ticks_of(created) - i128::from(ticket.start_ticks)).abs() < i128::from(2 * TICKS_PER_SECOND),
         };
         live.then_some(process)
+    }
+
+    /// The live covered gates of `gate.exe`'s markers in `dir`, oldest marker first, then by pid: each marker whose pid
+    /// runs as a process created at the marker's start, to the millisecond, as a `gate.exe` ticket's is judged. None for
+    /// [`Generation::PowerShell`], and none when the folder is missing or cannot be listed. The reader deletes nothing.
+    fn covered(&self, generation: Generation, dir: &Path) -> Vec<CoveredRun> {
+        match generation {
+            Generation::PowerShell => Vec::new(),
+            Generation::V1 => {
+                let Ok(read) = v1::read_covered(dir) else {
+                    return Vec::new();
+                };
+                let mut live: Vec<v1::CoveredMarker> = read
+                    .into_iter()
+                    .map(|(_, marker)| marker)
+                    .filter(|marker| {
+                        let created = self.get(marker.pid).and_then(|process| process.created);
+                        created.is_some_and(|created| started_at_ms(created, marker.process_start))
+                    })
+                    .collect();
+                live.sort_by_key(|marker| (marker.since, marker.pid));
+                live.iter().filter_map(covered_row).collect()
+            }
+        }
     }
 
     /// The ticket's row, or `None` when its gate has ended or its arrival is no moment a `DateTime` holds.

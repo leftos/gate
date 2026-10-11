@@ -4,10 +4,12 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::process;
 
-use gate_state::v1::{self, Ticket, TicketKind};
+use gate_state::v1::{self, CoveredMarker, Ticket, TicketKind};
 use gate_state::{
-    CountsCopy, Generation, SlotCount, SlotCounts, SlotKind, SlotState, Waiting, copy_slot_counts_to_v1, link_no_replace, write_cutover_flag,
+    CountsCopy, CoveredRun, Generation, SlotCount, SlotCounts, SlotKind, SlotState, Waiting, copy_slot_counts_to_v1, link_no_replace,
+    write_cutover_flag,
 };
 use jiff::Timestamp;
 use serde_json::json;
@@ -19,6 +21,7 @@ const V1_CRITICAL_TICKET: &str = include_str!("fixtures/v1-critical-ticket.json"
 const V1_REMOTE_CLAIM: &str = include_str!("fixtures/v1-remote-claim.json");
 const V1_REMOTE_TICKET: &str = include_str!("fixtures/v1-remote-ticket.json");
 const V1_SLOT_COUNTS: &str = include_str!("fixtures/v1-slot-counts.json");
+const V1_COVERED: &str = include_str!("fixtures/v1-covered.json");
 /// The file names gate.exe gives the two fixture tickets: `<pid>-<start ms>.json`.
 const V1_CRITICAL_TICKET_NAME: &str = "52000-1790852400500.json";
 const V1_REMOTE_TICKET_NAME: &str = "53100-1790852400500.json";
@@ -199,6 +202,102 @@ fn a_v1_ticket_queue_is_ordered_by_epoch_ms() {
          (700) is not a v1 ticket"
     );
     assert_eq!(state.queue[0].command_line.as_deref(), Some(GATE_EXE));
+}
+
+/// A covered marker of gate `pid` started at `start`, under the slot of gate 52000, written at `since`.
+fn covered_marker(pid: u32, start: &str, since: &str) -> CoveredMarker {
+    CoveredMarker {
+        pid,
+        process_start: ms(start),
+        parent_pid: 52000,
+        command: "cargo fmt --check".to_owned(),
+        cwd: r"C:\work\repo".to_owned(),
+        since: ms(since),
+    }
+}
+
+/// Writes `marker` where gate.exe keeps it, in `covered` under the v1 root and its prefix.
+fn write_covered(machine: &Machine, marker: &CoveredMarker) {
+    let path = machine
+        .v1_root()
+        .join(format!("{}covered", machine.prefix))
+        .join(format!("{}-{}.json", marker.pid, marker.process_start));
+    v1::write_covered(&path, marker).expect("a covered marker can be written");
+}
+
+#[test]
+fn v1_covered_gates_come_from_live_markers() {
+    let mut machine = Machine::v1("v1_covered_gates_come_from_live_markers");
+    let own = process::id();
+    machine.add_process(own, 1, "gate.exe", Some(GATE_EXE), Some(START));
+    machine.add_process(54100, 1, "gate.exe", Some(GATE_EXE), Some(START_CLOSE));
+    write_covered(&machine, &covered_marker(own, START, "2026-10-01T11:00:02Z"));
+    write_covered(&machine, &covered_marker(54100, START, "2026-10-01T11:00:01Z"));
+    write_covered(&machine, &covered_marker(54200, START, "2026-10-01T11:00:01Z"));
+
+    let state = machine.state();
+
+    assert_eq!(
+        state.covered,
+        [CoveredRun {
+            pid: own,
+            start: "2026-10-01T11:00:00.5000000Z".to_owned(),
+            parent_pid: 52000,
+            command: "cargo fmt --check".to_owned(),
+            cwd: r"C:\work\repo".to_owned(),
+            since: "2026-10-01T11:00:02.0000000Z".to_owned(),
+        }],
+        "the live marker; not one whose pid runs since another start (54100, 1.5 s off) or runs no process (54200)"
+    );
+    let folder = v1::covered_dir(&machine.v1_root());
+    assert_eq!(
+        fs::read_dir(&folder).expect("the covered folder lists").count(),
+        3,
+        "the reader deletes nothing"
+    );
+}
+
+#[test]
+fn v1_covered_markers_are_read_under_the_prefix_oldest_first() {
+    let mut machine = Machine::v1("v1_covered_markers_are_read_under_the_prefix_oldest_first");
+    machine.prefix = "T1-".to_owned();
+    for pid in [9000, 54000, 54001] {
+        machine.add_process(pid, 1, "gate.exe", Some(GATE_EXE), Some(START));
+    }
+    // 54001's file name sorts before 9000's, so only the pid tiebreak puts 9000 first among the two of one since.
+    write_covered(&machine, &covered_marker(54000, START, "2026-10-01T11:00:03Z"));
+    write_covered(&machine, &covered_marker(54001, START, "2026-10-01T11:00:02Z"));
+    write_covered(&machine, &covered_marker(9000, START, "2026-10-01T11:00:02Z"));
+    let unprefixed = covered_marker(54000, START, "2026-10-01T11:00:01Z");
+    v1::write_covered(&v1::covered_path(&machine.v1_root(), 54000, ms(START)), &unprefixed).expect("a marker can be written");
+
+    let state = machine.state();
+
+    let rows: Vec<(u32, &str)> = state.covered.iter().map(|row| (row.pid, row.since.as_str())).collect();
+    assert_eq!(
+        rows,
+        [
+            (9000, "2026-10-01T11:00:02.0000000Z"),
+            (54001, "2026-10-01T11:00:02.0000000Z"),
+            (54000, "2026-10-01T11:00:03.0000000Z"),
+        ],
+        "by since, then by pid in numeric order, not the file names'; the marker outside the prefixed folder is not read"
+    );
+}
+
+#[test]
+fn the_powershell_generation_has_no_covered_gates() {
+    let mut machine = Machine::new("the_powershell_generation_has_no_covered_gates");
+    machine.add_process(54000, 1, "gate.exe", Some(GATE_EXE), Some(START));
+    write_covered(&machine, &covered_marker(54000, START, "2026-10-01T11:00:02Z"));
+    let powershell_covered = machine.dir.join("gate").join("covered");
+    fs::create_dir_all(&powershell_covered).expect("the PowerShell root's covered folder can be made");
+    fs::write(powershell_covered.join("54000-1790852400500.json"), V1_COVERED).expect("a marker can be written");
+
+    let state = machine.state();
+
+    assert_eq!(machine.inputs().generation, Generation::PowerShell);
+    assert_eq!(state.covered, [], "neither root's markers are read before the cutover");
 }
 
 #[test]

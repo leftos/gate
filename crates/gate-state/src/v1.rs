@@ -1,5 +1,6 @@
 //! The formats `gate.exe` writes under a state root (design.md "Formats"): the claim a gate holding a slot writes, the
-//! arrival ticket a waiting gate writes, and the slot counts file people and ops-tower write, plus the paths they sit at.
+//! arrival ticket a waiting gate writes, the covered marker a gate running under a parent gate's slot writes, and the slot
+//! counts file people and ops-tower write, plus the paths they sit at.
 //!
 //! Each file is read as strict JSON with case-sensitive keys: a syntax error, a byte order mark, a duplicate key
 //! anywhere, a missing or unknown `v`, a missing required key or a wrong type makes it unreadable, while an unknown key
@@ -68,6 +69,19 @@ pub fn tickets_dir(root: &Path) -> PathBuf {
 #[must_use]
 pub fn ticket_path(root: &Path, pid: u32, start_ms: u64) -> PathBuf {
     tickets_dir(root).join(format!("{pid}-{start_ms}.json"))
+}
+
+/// The folder of the covered markers, `<root>\covered`.
+#[must_use]
+pub fn covered_dir(root: &Path) -> PathBuf {
+    root.join("covered")
+}
+
+/// The covered marker of the gate with `pid` started at `start_ms` (Unix epoch milliseconds),
+/// `<root>\covered\<pid>-<start_ms>.json`.
+#[must_use]
+pub fn covered_path(root: &Path, pid: u32, start_ms: u64) -> PathBuf {
+    covered_dir(root).join(format!("{pid}-{start_ms}.json"))
 }
 
 /// The slot counts file, `<root>\slot-counts.json`.
@@ -245,6 +259,72 @@ impl Ticket {
     pub fn queue_order(&self) -> (u64, u32) {
         (self.arrived, self.pid)
     }
+}
+
+/// The covered marker a gate running under a parent gate's slot keeps at `covered\<pid>-<start>.json` while its command
+/// runs. Its machine times, `processStart` and `since`, are Unix epoch milliseconds, as a ticket's are.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CoveredMarker {
+    /// The covered gate's pid.
+    pub pid: u32,
+    /// The covered gate's process start, Unix epoch milliseconds.
+    pub process_start: u64,
+    /// The pid of the parent gate whose slot covers it.
+    pub parent_pid: u32,
+    /// The command's words, each quoted as for `CreateProcess`, joined by spaces, as a claim's `command`.
+    pub command: String,
+    /// The covered gate's working directory.
+    pub cwd: String,
+    /// When the covered gate wrote the marker, Unix epoch milliseconds.
+    pub since: u64,
+}
+
+/// Writes `marker` at `path` through `<path>.<pid>.<n>.tmp` moved over it, making a missing folder.
+///
+/// # Errors
+///
+/// The io error when the folder or the file beside the target cannot be written, or the move fails every try.
+pub fn write_covered(path: &Path, marker: &CoveredMarker) -> io::Result<()> {
+    write_versioned(path, marker)
+}
+
+/// Reads every covered marker in `dir`, sorted by file name, each with its path; a missing folder holds none. Only a
+/// `*.json` file named `<pid>-<start>.json` after the pid and `processStart` it holds counts: a file that cannot be read,
+/// is unreadable as a v1 marker or is named after another gate is skipped, as is a temporary `*.tmp` file. Whether a
+/// marker's gate is still alive, and deleting the marker of one that is not, is the caller's job.
+///
+/// # Errors
+///
+/// The io error when the folder exists but cannot be listed.
+pub fn read_covered(dir: &Path) -> io::Result<Vec<(PathBuf, CoveredMarker)>> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let mut paths = Vec::new();
+    for entry in entries.flatten() {
+        if entry.file_type().is_ok_and(|file_type| file_type.is_file()) {
+            paths.push(entry.path());
+        }
+    }
+    paths.sort();
+    Ok(paths
+        .into_iter()
+        .filter_map(|path| {
+            let named = path.file_name().and_then(|name| name.to_str()).and_then(parse_covered_name)?;
+            let marker: CoveredMarker = read_strict(&path).ok()?;
+            (named == (marker.pid, marker.process_start)).then_some((path, marker))
+        })
+        .collect())
+}
+
+/// `name` read as a covered marker's name, `<pid>-<start>.json`: the pid within `u32` and the start, both whole numbers
+/// without a sign; `None` for a name of any other shape.
+fn parse_covered_name(name: &str) -> Option<(u32, u64)> {
+    let (pid, start_ms) = name.strip_suffix(".json")?.split_once('-')?;
+    Some((u32::try_from(whole(pid)?).ok()?, whole(start_ms)?))
 }
 
 /// Reads the claim at `path`.

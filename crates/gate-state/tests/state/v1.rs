@@ -5,7 +5,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use gate_state::v1::{self, Claim, ClaimKind, Counts, FormatError, PoolSetting, Ticket, TicketKind};
+use gate_state::v1::{self, Claim, ClaimKind, Counts, CoveredMarker, FormatError, PoolSetting, Ticket, TicketKind};
 use gate_state::{KernelObject, SlotKind, reserved_light};
 use serde_json::json;
 
@@ -13,6 +13,9 @@ use crate::support::{Machine, ts};
 
 const CLAIM_TEXT: &str = include_str!("fixtures/v1-claim.json");
 const TICKET_TEXT: &str = include_str!("fixtures/v1-ticket.json");
+const COVERED_TEXT: &str = include_str!("fixtures/v1-covered.json");
+/// The name gate.exe gives the fixture marker: `<pid>-<start ms>.json`.
+const COVERED_NAME: &str = "54000-1790852400500.json";
 
 fn fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -57,6 +60,30 @@ fn ticket(pid: u32, arrived: u64) -> Ticket {
         remote: None,
         expected: None,
     }
+}
+
+/// The covered marker `v1-covered.json` holds.
+fn covered() -> CoveredMarker {
+    CoveredMarker {
+        pid: 54000,
+        process_start: 1_790_852_400_500,
+        parent_pid: 52000,
+        command: "cargo fmt --check".to_owned(),
+        cwd: r"C:\work\repo".to_owned(),
+        since: 1_790_852_402_000,
+    }
+}
+
+/// The markers [`v1::read_covered`] reads from the covered folder under `root`, by file name.
+fn covered_names(root: &Path) -> Vec<(String, CoveredMarker)> {
+    v1::read_covered(&v1::covered_dir(root))
+        .expect("the covered folder lists")
+        .into_iter()
+        .map(|(path, marker)| {
+            let name = path.file_name().expect("a marker has a name").to_string_lossy().into_owned();
+            (name, marker)
+        })
+        .collect()
 }
 
 /// `text` written as a claim file in a fresh folder, then read.
@@ -120,6 +147,11 @@ fn paths_sit_under_the_root_as_design_md_names_them() {
     assert_eq!(
         parts_under(root, &v1::ticket_path(root, 4242, 1_760_000_000_123)),
         ["waiting", "4242-1760000000123.json"]
+    );
+    assert_eq!(parts_under(root, &v1::covered_dir(root)), ["covered"]);
+    assert_eq!(
+        parts_under(root, &v1::covered_path(root, 4242, 1_760_000_000_123)),
+        ["covered", "4242-1760000000123.json"]
     );
     assert_eq!(parts_under(root, &v1::counts_path(root)), ["slot-counts.json"]);
     assert_eq!(parts_under(root, &v1::paused_dir(root)), ["paused"]);
@@ -482,6 +514,71 @@ fn read_tickets_reports_unreadable_files_and_skips_tmp() {
     assert_eq!(read[0].1.as_ref().expect("the second ticket reads"), &second);
     assert_eq!(read[1].1.as_ref().expect("the first ticket reads"), &first);
     assert!(matches!(read[2].1, Err(FormatError::Syntax(_))), "{:?}", read[2].1);
+}
+
+#[test]
+fn a_written_covered_marker_reads_back_equal_and_is_the_fixture() {
+    let dir = scratch("written-covered");
+    let marker = covered();
+    let path = v1::covered_path(&dir, marker.pid, marker.process_start);
+
+    v1::write_covered(&path, &marker).expect("the marker is written into a folder the write makes");
+    let text = fs::read_to_string(&path).expect("the marker is there");
+
+    assert_eq!(text, COVERED_TEXT.trim_end(), "the fixture is what the writer writes");
+    assert_eq!(covered_names(&dir), [(COVERED_NAME.to_owned(), marker)]);
+    let names: Vec<String> = fs::read_dir(v1::covered_dir(&dir))
+        .expect("the covered folder exists")
+        .map(|entry| entry.expect("the entry lists").file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, [COVERED_NAME], "no temporary file is left beside the marker");
+}
+
+#[test]
+fn the_v1_covered_fixture_reads_under_its_name() {
+    let dir = scratch("covered-fixture");
+    let folder = v1::covered_dir(&dir);
+    fs::create_dir_all(&folder).expect("the covered folder can be made");
+    fs::copy(fixture("v1-covered.json"), folder.join(COVERED_NAME)).expect("the fixture can be copied");
+
+    assert_eq!(covered_names(&dir), [(COVERED_NAME.to_owned(), covered())]);
+}
+
+#[test]
+fn a_covered_marker_that_is_unreadable_or_misnamed_is_skipped() {
+    let missing_field = COVERED_TEXT.replacen(r#""cwd":"C:\\work\\repo","#, "", 1);
+    let wrong_v = COVERED_TEXT.replacen(r#""v":1"#, r#""v":2"#, 1);
+    assert_ne!(missing_field, COVERED_TEXT, "the fixture holds cwd");
+    assert_ne!(wrong_v, COVERED_TEXT, "the fixture holds v");
+    let files = [
+        ("missing-field", COVERED_NAME, missing_field.as_str()),
+        ("wrong-v", COVERED_NAME, wrong_v.as_str()),
+        ("another-pid", "54001-1790852400500.json", COVERED_TEXT),
+        ("another-start", "54000-1790852400501.json", COVERED_TEXT),
+        ("extra-part", "54000-1790852400500-1.json", COVERED_TEXT),
+        ("no-numbers", "not-a-marker.json", COVERED_TEXT),
+        ("signed", "+54000-1790852400500.json", COVERED_TEXT),
+        ("tmp", "54000-1790852400500.json.77.tmp", COVERED_TEXT),
+        ("txt", "54000-1790852400500.txt", COVERED_TEXT),
+    ];
+    for (case, name, text) in files {
+        let dir = scratch(&format!("covered-skipped-{case}"));
+        let folder = v1::covered_dir(&dir);
+        fs::create_dir_all(&folder).expect("the covered folder can be made");
+        fs::write(folder.join(name), text).expect("the file can be written");
+
+        assert_eq!(covered_names(&dir), [], "{case}: {name} is no marker");
+        assert!(folder.join(name).exists(), "{case}: the reader deletes nothing");
+    }
+}
+
+#[test]
+fn an_empty_or_missing_covered_folder_holds_no_markers() {
+    let dir = scratch("covered-empty");
+
+    assert_eq!(covered_names(&dir), [], "a missing folder holds none");
+    fs::create_dir_all(v1::covered_dir(&dir)).expect("the covered folder can be made");
+    assert_eq!(covered_names(&dir), [], "an empty folder holds none");
 }
 
 #[test]

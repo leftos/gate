@@ -9,6 +9,7 @@ mod acquire;
 mod answer;
 mod boxside;
 mod console;
+mod covered;
 mod environment;
 mod journal;
 mod log;
