@@ -2,9 +2,14 @@
 //! until then.
 
 use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
 
 use gate_state::v1::{self, Ticket, TicketKind};
-use gate_state::{Generation, SlotCount, SlotKind, SlotState, Waiting};
+use gate_state::{
+    CountsCopy, Generation, SlotCount, SlotCounts, SlotKind, SlotState, Waiting, copy_slot_counts_to_v1, link_no_replace, write_cutover_flag,
+};
+use jiff::Timestamp;
 use serde_json::json;
 
 use crate::support::{HEAVY_GATE, LIGHT_GATE, Machine, START, START_CLOSE, START_FAR, claim, ms, pool, ticket, ticks};
@@ -230,4 +235,173 @@ fn a_v1_counts_file_without_v_is_not_used() {
             "{kind:?}: a value the file sets is set, even the default"
         );
     }
+}
+
+/// An empty folder named after the test, standing for `%LOCALAPPDATA%` before any gate ran.
+fn empty_local_app_data(test: &str) -> PathBuf {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("gate-state").join(test);
+    if dir.exists() {
+        fs::remove_dir_all(&dir).expect("the test's old folder can be removed");
+    }
+    fs::create_dir_all(&dir).expect("the test's folder can be made");
+    dir
+}
+
+/// The names of the files in `dir`, sorted.
+fn file_names(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(dir)
+        .expect("the folder can be listed")
+        .map(|entry| entry.expect("the folder's entry can be read").file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+#[test]
+fn the_flag_writer_makes_the_gate_folder_and_hands_the_state_to_v1() {
+    let dir = empty_local_app_data("the_flag_writer_makes_the_gate_folder_and_hands_the_state_to_v1");
+
+    let path = write_cutover_flag(&dir).expect("the flag can be written");
+
+    assert_eq!(path, Generation::cutover_flag(&dir));
+    assert_eq!(Generation::detect(&dir).expect("the flag can be looked for"), Generation::V1);
+    let text = fs::read_to_string(&path).expect("the flag can be read");
+    assert!(text.ends_with('Z'), "the write time is in UTC: {text}");
+    text.parse::<Timestamp>().expect("the flag holds an ISO 8601 timestamp");
+    assert_eq!(file_names(&dir.join("gate")), ["cutover.flag"], "no temp file is left");
+}
+
+#[test]
+fn a_second_flag_write_replaces_the_first() {
+    let dir = empty_local_app_data("a_second_flag_write_replaces_the_first");
+    let path = Generation::cutover_flag(&dir);
+    fs::create_dir_all(dir.join("gate")).expect("the gate folder can be made");
+    fs::write(&path, "an earlier flag").expect("an earlier flag can be written");
+
+    write_cutover_flag(&dir).expect("the flag can be rewritten");
+
+    let text = fs::read_to_string(&path).expect("the flag can be read");
+    text.parse::<Timestamp>().expect("the rewritten flag holds the new write time");
+    assert_eq!(file_names(&dir.join("gate")), ["cutover.flag"], "no temp file is left");
+}
+
+#[test]
+fn the_flag_writer_fails_when_the_gate_folder_cannot_be_made() {
+    let dir = empty_local_app_data("the_flag_writer_fails_when_the_gate_folder_cannot_be_made");
+    fs::write(dir.join("gate"), "a file where the gate folder goes").expect("the blocking file can be written");
+
+    let error = write_cutover_flag(&dir).expect_err("no flag can be written under a file");
+
+    assert_eq!(error.path, Generation::cutover_flag(&dir), "{error}");
+    assert!(dir.join("gate").is_file(), "the blocking file is left as it was");
+}
+
+fn read(path: &Path) -> String {
+    fs::read_to_string(path).expect("the file can be read")
+}
+
+/// Writes gate.exe's counts file, making the v1 folder.
+fn write_v1_counts(machine: &Machine, text: &str) {
+    fs::create_dir_all(machine.v1_root()).expect("the v1 folder can be made");
+    fs::write(machine.v1_counts_path(), text).expect("the v1 counts file can be written");
+}
+
+/// The race with a writer that puts the v1 file in place between the look and the link is covered by
+/// `linking_into_place_never_replaces_a_file_there`.
+#[test]
+fn the_counts_copy_writes_the_powershell_counts_as_v1_text() {
+    let machine = Machine::new("the_counts_copy_writes_the_powershell_counts_as_v1_text");
+    machine.write_counts(r#"{"heavy":3,"light":5}"#);
+
+    let copy = copy_slot_counts_to_v1(&machine.dir).expect("the counts can be copied");
+
+    let counts = SlotCounts {
+        heavy: SlotCount::new(3),
+        light: SlotCount::new(5),
+    };
+    assert_eq!(copy, CountsCopy::Copied(counts));
+    assert_eq!(read(&machine.v1_counts_path()), r#"{"v":1,"heavy":3,"light":5}"#);
+    assert_eq!(
+        read(&machine.counts_path()),
+        r#"{"heavy":3,"light":5}"#,
+        "the PowerShell file is untouched"
+    );
+    assert_eq!(file_names(&machine.v1_root()), ["slot-counts.json"], "no temp file is left");
+}
+
+#[test]
+fn the_counts_copy_keeps_a_v1_counts_file_already_there() {
+    let machine = Machine::new("the_counts_copy_keeps_a_v1_counts_file_already_there");
+    machine.write_counts(r#"{"heavy":3,"light":5}"#);
+    for v1_text in [r#"{"v":1,"heavy":7}"#, "not json"] {
+        write_v1_counts(&machine, v1_text);
+
+        let copy = copy_slot_counts_to_v1(&machine.dir).expect("the copy can look for the v1 file");
+
+        assert_eq!(copy, CountsCopy::Kept, "{v1_text}");
+        assert_eq!(read(&machine.v1_counts_path()), v1_text, "the v1 file is kept, readable or not");
+        assert_eq!(file_names(&machine.v1_root()), ["slot-counts.json"], "no temp file is left");
+    }
+}
+
+#[test]
+fn the_counts_copy_writes_nothing_without_powershell_counts() {
+    let machine = Machine::new("the_counts_copy_writes_nothing_without_powershell_counts");
+
+    let copy = copy_slot_counts_to_v1(&machine.dir).expect("the copy can look for the files");
+
+    assert_eq!(copy, CountsCopy::NoPowerShellCounts);
+    assert!(!machine.v1_counts_path().exists(), "no v1 counts file is written");
+}
+
+#[test]
+fn the_counts_copy_writes_nothing_when_no_value_survives() {
+    let machine = Machine::new("the_counts_copy_writes_nothing_when_no_value_survives");
+    for text in ["{}", r#"{"heavy":0}"#] {
+        machine.write_counts(text);
+
+        let copy = copy_slot_counts_to_v1(&machine.dir).expect("the copy can look for the files");
+
+        assert_eq!(copy, CountsCopy::Copied(SlotCounts::default()), "{text}");
+        assert!(
+            !machine.v1_counts_path().exists(),
+            "{text}: empty counts write no v1 file, as a machine at its defaults holds none"
+        );
+    }
+}
+
+#[test]
+fn the_counts_copy_ignores_a_powershell_file_gate_state_rejects() {
+    let machine = Machine::new("the_counts_copy_ignores_a_powershell_file_gate_state_rejects");
+    for text in ["{heavy: 4}", "not json"] {
+        machine.write_counts(text);
+
+        let copy = copy_slot_counts_to_v1(&machine.dir).expect("the copy can look for the files");
+
+        let reason = match &copy {
+            CountsCopy::Ignored { path, reason } if *path == machine.counts_path() => reason.as_str(),
+            _ => "",
+        };
+        assert!(
+            reason.starts_with("it is not valid JSON: "),
+            "{text}: the PowerShell file is ignored with the reason, got {copy:?}"
+        );
+        assert!(!machine.v1_counts_path().exists(), "{text}: no v1 counts file is written");
+        assert_eq!(read(&machine.counts_path()), text, "the PowerShell file is untouched");
+    }
+}
+
+#[test]
+fn linking_into_place_never_replaces_a_file_there() {
+    let machine = Machine::new("linking_into_place_never_replaces_a_file_there");
+    let temp = machine.dir.join("new.tmp");
+    let target = machine.dir.join("target.json");
+    fs::write(&temp, "the new text").expect("the temp file can be written");
+    fs::write(&target, "a file another writer put there first").expect("the target can be written");
+
+    let error = link_no_replace(&temp, &target).expect_err("an existing target is not replaced");
+
+    assert_eq!(error.kind(), io::ErrorKind::AlreadyExists, "{error}");
+    assert_eq!(read(&temp), "the new text", "the temp file is left as it was");
+    assert_eq!(read(&target), "a file another writer put there first", "the target is left as it was");
 }

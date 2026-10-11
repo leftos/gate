@@ -102,7 +102,7 @@ fn mutex_name(path: &Path, prefix: &str) -> Option<String> {
 }
 
 /// A file's name lowered, without its `.json` extension; `None` for another extension.
-fn json_base_name(path: &Path) -> Option<String> {
+pub(crate) fn json_base_name(path: &Path) -> Option<String> {
     let file = path.file_name()?.to_str()?.to_ascii_lowercase();
     file.strip_suffix(".json").map(str::to_owned)
 }
@@ -127,7 +127,8 @@ pub(crate) fn read_tickets(dir: &Path) -> Vec<Ticket> {
     tickets
 }
 
-fn read_ticket(path: &Path) -> Option<Ticket> {
+/// The ticket at `path`; `None` when it cannot be read, is not JSON or lacks a field a gate writes.
+pub(crate) fn read_ticket(path: &Path) -> Option<Ticket> {
     let Ok(Value::Object(object)) = serde_json::from_str::<Value>(&read_text(path).ok()?) else {
         return None;
     };

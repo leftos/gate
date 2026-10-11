@@ -33,7 +33,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Cutover sweep**: the later change of every calling repo from the PowerShell launcher to `gate` on PATH, after which the PowerShell gate is deleted.
 - **Diagnostics block**: the record of what was running that a kill writes to the log before it terminates the job: the job's processes, the descendants outside the job, the build servers and the last samples.
 - **Drain**: see critical drain.
-- **Drained cutover**: a cutover in which every gate of the old generation finishes before the switch completes, so the two generations never hold slots side by side.
+- **Drained cutover**: a cutover in which every gate of the old generation finishes before the switch completes, while the two generations share the slot mutexes and take turns on them.
 - **Dynamic name**: one of cmd.exe's built-in variables (`%CD%`, `%RANDOM%`, `%ERRORLEVEL%` and the like) that it expands though the environment block holds no such variable; a batch target's words are refused when they hold one.
 - **Fallback**: a routed run that runs locally instead, after its builder refused it, the remote pool stayed full or the remote client could not start; journalled as a `fallback` event with its reason.
 - **Fallback poll**: the short timeout on every slot wait, which re-reads counts and tickets so a dead waiter's ticket is cleared even when no wake event comes.
@@ -47,6 +47,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Journal**: the append-only `events.jsonl` in the state root, one JSON line per gate event (`queue`, `take`, `release` and others), with its rolled file and gzip archive.
 - **Journal mutex**: the named mutex `Local\gate-journal` (with the root hash under a non-default root) that every gate holds, waiting up to 2 s, while it appends to the journal, rolls it and archives.
 - **Keeper**: the `cmd.exe` `gate box run` starts on its own console while it is away on the donor's console, so its own console stays alive for it to return to.
+- **Late arrival**: a PowerShell gate whose claim or ticket appeared after the cutover flag was written, because its caller bypassed the launcher; the cutover's drain names it.
 - **Lending**: a light parent gate letting a nested heavy gate, which its slot does not cover, run on that slot while a critical request drains and before one holds the machine, instead of queueing behind it; the gate is the lent gate. A parent on a reserved light slot lends nothing.
 - **Lent window**: the span during a critical drain in which the critical gate lends one slot to backfill guests, ending at the shadow end.
 - **Light**: the slot kind for work that keeps one or two cores busy; its pool's thread budget is 2.
@@ -90,6 +91,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Stop-tree**: `gate stop-tree <pid>`, which terminates the gate jobs and then the processes of a pid's tree, deepest first, so a kill reaches processes that no longer have a parent.
 - **Sync-back**: applying the files a routed command changed on the builder to the PC's worktree, refused when the worktree changed during the run.
 - **Take**: a gate acquiring its slot, journalled as `take`; **release** is letting it go, journalled as `release` before the slot is freed.
+- **Take-back**: returning a machine to the PowerShell gate by deleting the cutover flag by hand, which works even when `gate.exe` is what is broken.
 - **Test seam**: a hidden `--test-*` flag, compiled only with the `test-seams` cargo feature, by which the suite sets a timing knob or prints the parsed request.
 - **Ticket**: the JSON file `waiting\<pid>-<start>.json` a gate writes when it queues for a slot, holding its kind and `arrived` time; waiters of one kind take slots in ticket order.
 - **Usage error**: a command line the gate refuses (a missing, unknown, repeated or invalid input): each problem on its own `gate: ` line, then the usage, exit 2, before any slot is queued.

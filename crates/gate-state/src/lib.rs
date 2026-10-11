@@ -10,6 +10,8 @@
 mod archive;
 mod claims;
 mod counts;
+mod cutover;
+mod drain;
 mod journal;
 mod journal_writer;
 mod model;
@@ -23,6 +25,10 @@ mod win32;
 
 pub use archive::{ARCHIVE_DIR, archive_rolled_journal};
 pub use counts::{ApplyError, WriteError, apply_slot_count, read_slot_count_setting, slot_count_path, write_slot_counts};
+#[doc(hidden)]
+pub use cutover::link_no_replace;
+pub use cutover::{CountsCopy, copy_slot_counts_to_v1, write_cutover_flag};
+pub use drain::{PowerShellGate, PowerShellGates, PowerShellHold, PowerShellSlot, powershell_gates};
 pub use journal::{CommandSummary, History, HistoryRun, JournalCache, RunState, normalize_command};
 pub use journal_writer::{
     Appended, FallbackReason, HeavyLight, Held, JOURNAL_CAP_BYTES, JOURNAL_FILE, JOURNAL_WAIT, JournalEvent, JournalIdentity, JournalLock,

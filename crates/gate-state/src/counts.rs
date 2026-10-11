@@ -212,7 +212,7 @@ fn counts_folder(path: &Path) -> PathBuf {
 }
 
 /// The counts in `file`, read from `path`, that the gate would use.
-fn kept_counts(file: &CountsFile, path: &Path) -> SlotCounts {
+pub(crate) fn kept_counts(file: &CountsFile, path: &Path) -> SlotCounts {
     let mut counts = SlotCounts::default();
     for kind in SlotKind::ALL {
         counts.set(kind, pool_count(file, path, kind, 1).set);
@@ -302,7 +302,7 @@ pub(crate) fn write_replacing(path: &Path, text: &str) -> io::Result<()> {
 
 /// Removes the partial file a failed write left at `temp` and returns `error`, the write's failure; a file that is not
 /// there is fine, and one that cannot be removed is added to the error.
-fn remove_partial(temp: &Path, error: io::Error) -> io::Error {
+pub(crate) fn remove_partial(temp: &Path, error: io::Error) -> io::Error {
     match fs::remove_file(temp) {
         Err(removal) if removal.kind() != io::ErrorKind::NotFound => io::Error::new(
             error.kind(),
@@ -367,7 +367,7 @@ pub fn apply_slot_count(path: &Path, kind: SlotKind, count: Option<SlotCount>) -
 }
 
 /// `<path>.<pid>.<n>.tmp`, `<n>` taken from [`TEMP_COUNTER`] so no two writes of this process share one.
-fn temp_path(path: &Path) -> PathBuf {
+pub(crate) fn temp_path(path: &Path) -> PathBuf {
     let write = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     let mut name = OsString::from(path.as_os_str());
     name.push(format!(".{}.{write}.tmp", std::process::id()));
