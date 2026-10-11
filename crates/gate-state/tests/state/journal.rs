@@ -1269,10 +1269,10 @@ fn v1_history(test: &str) -> History {
     read_fresh(&dir)
 }
 
-/// The slots a critical take lists: every heavy slot and the light slots past the two it keeps free.
+/// The slots a critical take lists: every heavy slot and the light slots below the two it keeps free.
 fn critical_slots() -> Vec<String> {
     let heavy = (0..3).map(|index| format!(r"Local\gate-slot-{index}"));
-    heavy.chain((2..7).map(|index| format!(r"Local\gate-light-slot-{index}"))).collect()
+    heavy.chain((0..5).map(|index| format!(r"Local\gate-light-slot-{index}"))).collect()
 }
 
 #[test]
@@ -1291,9 +1291,9 @@ fn a_critical_take_carries_its_slots_and_machine() {
             other_claims: Ok(vec![OtherClaim {
                 pid: 57000,
                 kind: "light".to_owned(),
-                index: 0,
+                index: 5,
                 command: "cargo check".to_owned(),
-                file: "gate-light-slot-0.json".to_owned(),
+                file: "gate-light-slot-5.json".to_owned(),
             }]),
         })
     );
@@ -1313,7 +1313,7 @@ fn a_critical_take_carries_its_slots_and_machine() {
         json!({
             "counts": {"heavy": 3, "light": 7},
             "otherHeld": {"heavy": 0, "light": 1},
-            "otherClaims": [{"pid": 57000, "kind": "light", "index": 0, "command": "cargo check", "file": "gate-light-slot-0.json"}],
+            "otherClaims": [{"pid": 57000, "kind": "light", "index": 5, "command": "cargo check", "file": "gate-light-slot-5.json"}],
         })
     );
     assert_eq!(
