@@ -1,22 +1,19 @@
 //! The build servers outside the job and the build client inside it: the process table read once per sample, the
 //! command line of each process that matters read once per pid and start and kept while it is alive, and the classifier
-//! calls that fill a sample's server maps and its client flag. A process the gate cannot read is skipped, so no one
-//! else's process can fail a sample.
+//! calls that fill a sample's server maps, its client flag and the classified servers whose priority the watch moves.
+//! A process the gate cannot read is skipped, so no one else's process can fail a sample.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io;
 use std::path::Path;
 
-use gate_watchdog::{is_build_client, is_build_server, is_compiler_server};
+use gate_watchdog::{is_build_client, is_build_server, is_compiler_image, is_compiler_server};
 use gate_win32::ProcessTimes;
 use proc_table::ProcessInfo;
 
 /// The `dotnet` host an `MSBuild` node or a `VBCSCompiler.dll` runs under, and the one image whose command line a
 /// build client's name alone does not settle.
 const DOTNET: &str = "dotnet.exe";
-/// The images a build server runs under: the compiler server's own and the `dotnet` host. Any other image is no server,
-/// and no command line is read for it.
-const SERVER_IMAGES: [&str; 2] = ["VBCSCompiler.exe", DOTNET];
 
 /// What one sample found outside the job and inside it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -28,6 +25,23 @@ pub(crate) struct Found {
     pub(crate) shared_servers: BTreeMap<u32, u64>,
     /// Whether the job holds a build client.
     pub(crate) build_client: bool,
+    /// Every build server the sample classified, in this gate's job or outside it, whose priority class the watch's
+    /// pass moves ([`crate::priority`]).
+    pub(crate) servers: Vec<Classified>,
+}
+
+/// One build server a sample classified, whichever job it runs in: what the watchdog's `server_target` raises or
+/// lowers, and the pid and start that name it to the failure line.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Classified {
+    /// Its process id.
+    pub(crate) pid: u32,
+    /// The image it runs as, as a failure line names it.
+    pub(crate) name: String,
+    /// Its start as a `FILETIME`, the key that tells a pid another process has taken since.
+    pub(crate) created: u64,
+    /// Whether it runs in this gate's own job.
+    pub(crate) inside: bool,
 }
 
 /// The servers of a sample, each with whether it started after the command: the new ones first, then the shared ones,
@@ -53,11 +67,16 @@ pub(crate) struct Scope<'a> {
     pub(crate) under: Option<&'a Path>,
 }
 
-/// One build server a sample counted: whether it started after the command, and its CPU in 100 ns ticks.
-#[derive(Clone, Copy, Debug)]
+/// One build server a sample classified outside the job: what the sample counts it as, if anything, and the server
+/// itself, which a watch moves whether or not anything counts it.
+#[derive(Clone, Debug)]
 struct Server {
-    new: bool,
-    cpu: u64,
+    /// Whether the sample counts it, and as what: `true` for a server started after the command and `false` for a
+    /// compiler server already running, each with its CPU in 100 ns ticks; `None` for a server nothing counts, as an
+    /// `MSBuild` node already running is.
+    counted: Option<(bool, u64)>,
+    /// The server, as the priority pass reads it.
+    classified: Classified,
 }
 
 /// The build servers of a watch and the command lines it has read: one line per process id and start time, kept while
@@ -67,20 +86,30 @@ pub(crate) struct Servers {
     /// The command line of each process read so far, keyed by its pid and the start time its own times give it in
     /// 100 ns ticks, `None` when the line could not be read.
     command_lines: HashMap<(u32, u64), Option<String>>,
+    /// One more image file name read as a compiler server's (`--test-server-image`), `None` outside the suite.
+    test_image: Option<String>,
 }
 
 impl Servers {
-    /// A reader that has read nothing yet.
-    pub(crate) fn new() -> Self {
-        Self::default()
+    /// A reader that has read nothing yet, reading `test_image` as a compiler server's image too.
+    pub(crate) fn new(test_image: Option<String>) -> Self {
+        Servers {
+            command_lines: HashMap::new(),
+            test_image,
+        }
     }
 
-    /// The build servers and the build client of one sample: `processes` is the snapshot without command lines, and
-    /// `scope` what the sample is confined to, the job's members, the command's start and the folder a server must
-    /// live under. `times` reads a process's own times — its start, not the snapshot's, decides whether it is new —
-    /// and `command_line` reads a process's command line, each called only for the processes that matter; a process
-    /// either call cannot read for is skipped rather than failing the sample, as the PowerShell gate's
-    /// `Get-BuildServer` skips one it cannot open.
+    /// Whether `name` is a compiler server's image by its name alone, so no command line is read for it.
+    fn is_compiler_image(&self, name: &str) -> bool {
+        is_compiler_image(name, self.test_image.as_deref())
+    }
+
+    /// The build servers, the build client and the classified servers of one sample: `processes` is the snapshot
+    /// without command lines, and `scope` what the sample is confined to, the job's members, the command's start and
+    /// the folder a server must live under. `times` reads a process's own times — its start, not the snapshot's,
+    /// decides whether it is new — and `command_line` reads a process's command line, each called only for the
+    /// processes that matter; a process either call cannot read for is skipped rather than failing the sample, as the
+    /// PowerShell gate's `Get-BuildServer` skips one it cannot open.
     pub(crate) fn read(
         &mut self,
         processes: &[ProcessInfo],
@@ -92,43 +121,61 @@ impl Servers {
         let mut found = Found::default();
         for process in processes {
             if scope.members.contains(&process.pid) {
-                found.build_client |= self.member_is_client(process, &times, &command_line, &mut alive);
+                self.member(process, &times, &command_line, &mut alive, &mut found);
             } else if let Some(server) = self.server_of(process, scope, &times, &command_line, &mut alive) {
-                let servers = if server.new { &mut found.new_servers } else { &mut found.shared_servers };
-                servers.insert(process.pid, server.cpu);
+                if let Some((new, cpu)) = server.counted {
+                    let servers = if new { &mut found.new_servers } else { &mut found.shared_servers };
+                    servers.insert(process.pid, cpu);
+                }
+                found.servers.push(server.classified);
             }
         }
         self.command_lines.retain(|key, _| alive.contains(key));
         found
     }
 
-    /// Whether the job's process `process` is a build client: `MSBuild.exe` is one by its name alone, so no line is
-    /// read for it, while a `dotnet.exe` is one unless its command line names `--no-build`. Any other member is no
-    /// client, and a `dotnet.exe` whose times cannot be read has no key, so no line is read for it either.
-    fn member_is_client(
+    /// Reads a job member: whether it is a build client, and, when it runs as a build server's image, the server the
+    /// priority pass moves. `MSBuild.exe` is a client by its name alone, so no line is read for it, and so is a
+    /// `VBCSCompiler.exe` a build server by its name alone; a `dotnet.exe` is a client unless its command line names
+    /// `--no-build`. A hosted member whose times cannot be read has no key, so it is neither client nor server.
+    fn member(
         &mut self,
         process: &ProcessInfo,
         times: &impl Fn(u32) -> io::Result<Option<ProcessTimes>>,
         read: &impl Fn(u32) -> Option<String>,
         alive: &mut HashSet<(u32, u64)>,
-    ) -> bool {
-        let line = if process.name.eq_ignore_ascii_case(DOTNET) {
+        found: &mut Found,
+    ) {
+        let compiler = self.is_compiler_image(&process.name);
+        let (line, created) = if compiler || process.name.eq_ignore_ascii_case(DOTNET) {
             let Ok(Some(times)) = times(process.pid) else {
-                return false;
+                return;
             };
             let key = (process.pid, times.created);
             alive.insert(key);
-            self.line(key, process.pid, read)
+            let line = if compiler { String::new() } else { self.line(key, process.pid, read) };
+            (line, Some(times.created))
         } else {
             // The empty line is what the classifier takes for a name it reads no line for, as for an unreadable one.
-            String::new()
+            (String::new(), None)
         };
-        is_build_client(&process.name, &line)
+        found.build_client |= is_build_client(&process.name, &line);
+        if let Some(created) = created
+            && is_build_server(&process.name, &line, self.test_image.as_deref())
+        {
+            found.servers.push(Classified {
+                pid: process.pid,
+                name: process.name.clone(),
+                created,
+                inside: true,
+            });
+        }
     }
 
-    /// The build server `process` is, if the sample counts it: `None` for a process that is no server, one whose times
-    /// cannot be read, one whose program lies outside the scoped folder, and an `MSBuild` node already running, which
-    /// is no compiler server. Its command line's key is kept alive once a line was read for it.
+    /// The build server `process` is outside the job, if the sample classifies it: `None` for a process that is no
+    /// server, one whose times cannot be read, and one whose program lies outside the scoped folder. An `MSBuild` node
+    /// already running is a build server nothing counts, so it comes back with `counted` unset. Its command line's key
+    /// is kept alive once a line was read for it.
     fn server_of(
         &mut self,
         process: &ProcessInfo,
@@ -137,7 +184,8 @@ impl Servers {
         read: &impl Fn(u32) -> Option<String>,
         alive: &mut HashSet<(u32, u64)>,
     ) -> Option<Server> {
-        if !is_named(&process.name, &SERVER_IMAGES) {
+        // Any image but a compiler server's and the `dotnet` host is no server, and no command line is read for it.
+        if !self.is_compiler_image(&process.name) && !process.name.eq_ignore_ascii_case(DOTNET) {
             return None;
         }
         let Ok(Some(times)) = times(process.pid) else {
@@ -146,13 +194,24 @@ impl Servers {
         let key = (process.pid, times.created);
         alive.insert(key);
         let line = self.line(key, process.pid, read);
-        if !is_build_server(&process.name, &line) || scope.under.is_some_and(|under| !under_folder(&line, under)) {
+        let test_image = self.test_image.as_deref();
+        if !is_build_server(&process.name, &line, test_image) || scope.under.is_some_and(|under| !under_folder(&line, under)) {
             return None;
         }
-        if times.created >= scope.since {
-            return Some(Server { new: true, cpu: times.cpu });
-        }
-        is_compiler_server(&process.name, &line).then_some(Server { new: false, cpu: times.cpu })
+        let counted = if times.created >= scope.since {
+            Some((true, times.cpu))
+        } else {
+            is_compiler_server(&process.name, &line, test_image).then_some((false, times.cpu))
+        };
+        Some(Server {
+            counted,
+            classified: Classified {
+                pid: process.pid,
+                name: process.name.clone(),
+                created: times.created,
+                inside: false,
+            },
+        })
     }
 
     /// The command line of the process behind `key`, read now and kept for later samples unless it was read before; an
@@ -160,11 +219,6 @@ impl Servers {
     fn line(&mut self, key: (u32, u64), pid: u32, read: &impl Fn(u32) -> Option<String>) -> String {
         self.command_lines.entry(key).or_insert_with(|| read(pid)).clone().unwrap_or_default()
     }
-}
-
-/// Whether `name` is one of `images`, ignoring case.
-fn is_named(name: &str, images: &[&str]) -> bool {
-    images.iter().any(|image| name.eq_ignore_ascii_case(image))
 }
 
 /// Whether the program a command line starts with lies in `folder`: the first word with its surrounding quotes
@@ -256,7 +310,7 @@ mod tests {
 
     #[test]
     fn build_servers_are_split_into_the_new_and_the_shared_by_their_start_time() {
-        let mut servers = Servers::new();
+        let mut servers = Servers::new(None);
         let processes = [
             process(1, "VBCSCompiler.exe"),
             process(2, "VBCSCompiler.exe"),
@@ -287,7 +341,7 @@ mod tests {
 
     #[test]
     fn an_old_msbuild_node_is_left_out_while_a_new_one_counts() {
-        let mut servers = Servers::new();
+        let mut servers = Servers::new(None);
         let processes = [process(1, "dotnet.exe"), process(2, "dotnet.exe")];
         let lines = |_pid: u32| Some("dotnet MSBuild.dll /nodemode:1 /nodeReuse:false".to_owned());
         let times = |pid: u32| Ok(Some(times_at(if pid == 1 { 5 } else { 20 }, u64::from(pid) * 10)));
@@ -303,7 +357,7 @@ mod tests {
 
     #[test]
     fn a_server_whose_times_cannot_be_read_is_skipped_rather_than_failing_the_sample() {
-        let mut servers = Servers::new();
+        let mut servers = Servers::new(None);
         let processes = [process(1, "VBCSCompiler.exe"), process(2, "VBCSCompiler.exe")];
         let lines = |_pid: u32| None;
         let times = |pid: u32| match pid {
@@ -323,7 +377,7 @@ mod tests {
 
     #[test]
     fn a_process_whose_start_cannot_be_read_is_skipped() {
-        let mut servers = Servers::new();
+        let mut servers = Servers::new(None);
         let reads = Cell::new(0);
         let lines = |_pid: u32| {
             reads.set(reads.get() + 1);
@@ -339,7 +393,7 @@ mod tests {
 
     #[test]
     fn a_server_that_started_exactly_when_the_command_did_is_new() {
-        let mut servers = Servers::new();
+        let mut servers = Servers::new(None);
         let lines = |_pid: u32| None;
         let times = |_pid: u32| Ok(Some(times_at(10, 15)));
 
@@ -351,7 +405,7 @@ mod tests {
 
     #[test]
     fn a_command_line_is_read_once_per_pid_and_start_time_across_samples() {
-        let mut servers = Servers::new();
+        let mut servers = Servers::new(None);
         let reads = Cell::new(0);
         let lines = |_pid: u32| {
             reads.set(reads.get() + 1);
@@ -367,7 +421,7 @@ mod tests {
 
     #[test]
     fn a_pid_that_reappears_with_a_later_start_reads_its_command_line_again() {
-        let mut servers = Servers::new();
+        let mut servers = Servers::new(None);
         let reads = Cell::new(0);
         let lines = |_pid: u32| {
             reads.set(reads.get() + 1);
@@ -384,7 +438,7 @@ mod tests {
 
     #[test]
     fn a_command_line_no_live_process_holds_is_pruned() {
-        let mut servers = Servers::new();
+        let mut servers = Servers::new(None);
         let lines = |_pid: u32| Some("dotnet VBCSCompiler.dll".to_owned());
 
         servers.read(&[process(7, "dotnet.exe")], &scope(&BTreeSet::new(), None), times, lines);
@@ -395,7 +449,7 @@ mod tests {
 
     #[test]
     fn a_build_client_is_msbuild_or_a_dotnet_host_without_no_build() {
-        let mut servers = Servers::new();
+        let mut servers = Servers::new(None);
         let processes = [process(1, "MSBuild.exe"), process(2, "dotnet.exe"), process(3, "dotnet.exe")];
         let lines = |pid: u32| match pid {
             1 => Some("MSBuild.exe My.sln".to_owned()),
@@ -411,7 +465,7 @@ mod tests {
 
     #[test]
     fn a_member_that_is_no_dotnet_host_has_no_command_line_read() {
-        let mut servers = Servers::new();
+        let mut servers = Servers::new(None);
         let reads = Cell::new(0);
         let lines = |_pid: u32| {
             reads.set(reads.get() + 1);
@@ -428,7 +482,7 @@ mod tests {
 
     #[test]
     fn only_a_server_whose_program_lies_under_the_scoped_folder_counts() {
-        let mut servers = Servers::new();
+        let mut servers = Servers::new(None);
         let folder = Path::new(r"C:\work\case");
         let processes = [
             process(1, "VBCSCompiler.exe"),
@@ -452,7 +506,7 @@ mod tests {
 
     #[test]
     fn a_job_member_is_a_client_wherever_its_program_lives() {
-        let mut servers = Servers::new();
+        let mut servers = Servers::new(None);
         let processes = [process(3, "dotnet.exe")];
         let lines = |_pid: u32| Some(r"dotnet C:\work\elsewhere\My.sln".to_owned());
         let members = BTreeSet::from([3]);

@@ -13,8 +13,10 @@ use crate::support::{Case, FAKE_TOOL, assert_in_order, release, run_words, shown
 const SAMPLER_FAILED: &str = "gate: sampler failed: --test-sampler-fail makes every sample fail (test seam only); watching by wall time only";
 
 /// The words of a run in `slot` with a 1 s ceiling, logging to `out.log`, `seams` before `--` and `command` after it.
+/// The server scan is confined to the case's folder, as the run words' own is, so the run moves no build server of the
+/// machine it did not start itself.
 fn ceiling_words<'a>(slot: &'a str, seams: &[&'a str], command: &[&'a str]) -> Vec<&'a str> {
-    let mut words = vec!["run", "--slot", slot, "--timeout", "1", "--log", "out.log"];
+    let mut words = vec!["run", "--slot", slot, "--timeout", "1", "--log", "out.log", "--test-servers-under", "."];
     words.extend(seams);
     words.push("--");
     words.extend(command);

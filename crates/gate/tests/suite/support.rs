@@ -484,9 +484,11 @@ pub fn shown(path: &Path) -> String {
 
 /// The words of a light run logging to `log`, `extra` before `--` and `command` after it. Gates that run at once each
 /// need a log of their own, since a gate refuses a log another gate is writing. The ceiling is far above the hang
-/// guard, so a run a case holds is never ended by it.
+/// guard, so a run a case holds is never ended by it. The server scan is confined to the case's folder, the gate's
+/// working directory, so no case moves a build server of the machine it did not start itself. A case cannot pass a
+/// `--test-servers-under` of its own beside these words: the gate refuses a flag given twice.
 pub fn run_words<'a>(log: &'a str, extra: &[&'a str], command: &[&'a str]) -> Vec<&'a str> {
-    let mut words = vec!["run", "--slot", "light", "--timeout", "3600", "--log", log];
+    let mut words = vec!["run", "--slot", "light", "--timeout", "3600", "--log", log, "--test-servers-under", "."];
     words.extend(extra);
     words.push("--");
     words.extend(command);

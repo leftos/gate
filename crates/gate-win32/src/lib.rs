@@ -17,6 +17,7 @@ mod launch;
 mod memory;
 mod mutex;
 mod piped;
+mod priority;
 mod times;
 mod tree;
 
@@ -44,6 +45,8 @@ pub fn check_plain_file(file: &std::fs::File) -> io::Result<()> {
     launch::check_plain_file(file.as_raw_handle())
 }
 pub use tree::{OpenedJob, StoppableProcess};
+
+pub use priority::{Priority, priority_of, set_priority};
 
 use std::io;
 use std::time::{Duration, SystemTime};

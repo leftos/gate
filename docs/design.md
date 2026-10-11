@@ -519,6 +519,18 @@ All kept, with each knob's default unchanged:
   With a build client in the job, a rising new or shared server is progress, and its CPU counts as the gate's own in the free share. A real gate therefore counts another session's compiler server as shared progress while its job holds a build client, as the PowerShell gate does.
 
   The watch hands the pure crate raw facts: the per-pid cumulative CPU of the new and the shared servers, the build-client flag and the VM's CPU as an option (`None` for a command that is not a `wsl` one, or with no VM). The classifiers are in `gate-watchdog`'s `servers.rs`; the reader is the binary's `servers.rs`.
+
+  Priority (B2): after every sample, the watch moves the priority class of the build servers that sample classified, with the same classification as above. An ordinary gate lowers each classified server outside its job from Normal, AboveNormal, High or RealTime to BelowNormal; there is no restore after the run. Every classified server outside the job is lowered, not only those that count as progress, so a warm `MSBuild` node already running is lowered too.
+
+  A High gate (a critical gate, or one under a critical parent) instead raises the servers outside other live gates' jobs, and the servers of its own job, to High. An ordinary gate leaves its own job's servers as they started. A High gate's guard does not count the critical claim (`gate-critical.json`) or the remote-slot claims as other gates, so a gate covered by a critical parent raises its own job's build servers to High.
+
+  A server whose priority class cannot be read (the gate opens it with `PROCESS_QUERY_INFORMATION`, as .NET does) is an unknown class: an ordinary gate leaves it alone silently, and a High gate still tries the raise.
+
+  An ordinary gate also leaves alone a server in the job of a live critical gate whose ticket holds, and any server already at High while a critical ticket holds, since that gate's watch raised it. The rule is `gate-watchdog`'s `server_target` and `server_left` over `PriorityClass`; the calls are `gate_win32::priority_of` and `set_priority`; the per-watch pass is the binary's `priority.rs`.
+
+  The guard (the tickets, the claims and the other gates' jobs, opened by name) is read at most once a pass, and only when a server the gate would move asks; a pass with no server to move reads no state files. Tickets are read without deleting dead ones. A priority failure never fails a sample, and its two lines go to stderr and the log:
+  - `gate: could not lower|raise <name> <pid>: <message>`, once per (pid, start), which is never tried again; it comes only from a failed set, with the plain Windows message; a server that has exited since the sample is passed over silently.
+  - `gate: could not list the job of gate <id> (<message>); its build servers may be lowered|raised`, once per watch and gate, and that job is left out of the guard.
 - Kill, on a STALLED, TIMED OUT or BACKSTOP alike: the diagnostics block (X3), then `TerminateJobObject(job, 124)`, `gate: terminated the job's <n> process(es)`, `gate: diagnostics written to <log>`, a 5 s wait for the command and exit 124 (X2). A failure inside the gate after the command started terminates the job first (X4).
 - The diagnostics block (X3) is gathered before the job is terminated and goes to the log only, between the command's output and the kill line. A command that exits during the gathering keeps its own status and writes no block. Its lines:
   - `gate: diagnostics`, then `gate:   job <pid> parent <ppid> <name>: cpu <s> s, working set <mb> MB: <command line>` for each process of the job (up to 40, then `gate:   ... and <n> more job processes`), and `gate:   outside job ...` lines for the descendants outside the job (up to 20).
@@ -596,7 +608,7 @@ The box heartbeat (BW9) is the box wrapper's command-time heartbeat, not the wai
   The command shares the gate's console, so Ctrl+C reaches it. A nested gate's job nests inside its parent's.
 
   The start-failure message is the system message for the CreateProcessW error code, as `Win32Exception.Message` gives it, with no `(os error N)` suffix. That failure alone maps to status 127; every other start failure is the gate's own.
-- **Priority.** BelowNormal, or the gate's own class when that is already BelowNormal or Idle; High for a critical gate and any gate under a critical marker (kept, P2).
+- **Priority.** BelowNormal, or the gate's own class when that is already BelowNormal or Idle; High for a critical gate and any gate under a critical marker (kept, P2). The classes of the build servers outside the job are moved while the command runs ([Watchdog](#watchdog), B2).
 - **Environment.** Every command gets the gate's environment with these set over it (names compared case-insensitively): `GATE_SLOT_HELD=<kind>:<pid>:<start_ms>[:<h>]` (the held slot's marker, critical included, or the parent's for a covered gate), `MSBUILDDISABLENODEREUSE=1`, `DOTNET_CLI_USE_MSBUILD_SERVER=0` (kept, P3, B3), and `GATE_STATE_DIR=<root>` under a non-default root. Under the default root an inherited `GATE_STATE_DIR` is removed. The gate's own environment is never changed.
 
   The batch refusal's `%NAME%` check answers for this exact block.
@@ -928,7 +940,9 @@ A Rust integration suite drives the built `gate.exe` through its CLI and reads o
 
   `--test-servers-under <folder>` (on `gate run` only; refused empty or given twice) makes a build server outside the job count only when its program path lies under the folder (whole path components, case-insensitive, the folder made absolute), so a case never counts the machine's real servers; `--test-print-request` shows it as `testSeams.serversUnder`, after `gitLimitMs`.
 
-  `--test-remote-snapshot` (a switch, on `gate run` only) sends the run to the Rust remote client's snapshot alone ([The remote client](#routing-and-the-remoteps1-bridge)); `--test-print-request` shows it as `testSeams.remoteSnapshot`, after `serversUnder`.
+  `--test-server-image <file name>` (on `gate run` only; needs `--test-servers-under`, else `gate: --test-server-image needs --test-servers-under`; refused empty or given twice) makes the watch treat processes with that exact image name (case-insensitive) as a compiler server, like `VBCSCompiler.exe`; `--test-print-request` shows it as `testSeams.serverImage`, after `serversUnder`. The suite's priority cases use fake-tool copies named `gate-test-server.exe` with it, so another gate on the machine, which lowers every `VBCSCompiler.exe` outside its own job, cannot disturb them.
+
+  `--test-remote-snapshot` (a switch, on `gate run` only) sends the run to the Rust remote client's snapshot alone ([The remote client](#routing-and-the-remoteps1-bridge)); `--test-print-request` shows it as `testSeams.remoteSnapshot`, after `serverImage`.
 
   `--test-remote-transport local:<folder>` (on `gate run` only) sends the run to the Rust remote client with a local folder standing in for the builder; `local-ssh:<folder>` does the same but pushes and fetches to `<host>:<folder>/<repo>.git` with the `--test-remote-ssh` program as git's ssh (which it needs), so git's own ssh calls reach the stand-in. `--test-remote-ssh <exe>` replaces ssh with a program (the test bin `fake-ssh`) and `--test-remote-retry-pause-ms <n>` (whole milliseconds above 0) replaces the 2 s pause before the pre-banner retry; both need the transport, and `--test-remote-snapshot` cannot be given with it. `--test-print-request` shows them as `testSeams.remoteTransport`, `testSeams.remoteSsh` and `testSeams.remoteRetryPauseMs`, after `remoteSnapshot`.
 

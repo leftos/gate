@@ -61,6 +61,7 @@ fn print_request_shows_the_new_cli_request() {
             "remoteWaitMs": null,
             "gitLimitMs": null,
             "serversUnder": null,
+            "serverImage": null,
             "remoteSnapshot": false,
             "remoteTransport": null,
             "remoteSsh": null,
@@ -83,6 +84,8 @@ fn print_request_shows_the_new_cli_request() {
             "7",
             "--test-servers-under",
             r"target\case",
+            "--test-server-image",
+            "gate-test-server.exe",
             "--test-remote-snapshot",
         ],
     );
@@ -97,6 +100,7 @@ fn print_request_shows_the_new_cli_request() {
         ),
         (&json!(r"steps\client.txt"), &json!(5), &json!(7), &json!(r"target\case"), &json!(true))
     );
+    assert_eq!(request["testSeams"]["serverImage"], json!("gate-test-server.exe"));
     // The snapshot-only client and the Rust client's transport are refused together, so the transport's seams are
     // printed by a run of their own.
     let mut seams = print_run(&["cmd"]);
@@ -120,8 +124,14 @@ fn print_request_shows_the_new_cli_request() {
         ),
         (&json!(r"local:target\builder"), &json!("fake-ssh.exe"), &json!(9))
     );
+}
 
+#[test]
+fn print_request_shows_the_stop_tree_request() {
+    let case = Case::new("print_request_shows_the_stop_tree_request");
     let stop = case.run(&["stop-tree", "--test-print-request", "123"]).request();
+
+    assert_root_hash(&stop);
     assert_eq!(
         stop,
         json!({
@@ -129,7 +139,7 @@ fn print_request_shows_the_new_cli_request() {
             "pid": 123,
             "stateDir": shown(&case.root()),
             "defaultRoot": false,
-            "rootHash": request["rootHash"],
+            "rootHash": stop["rootHash"],
         })
     );
 }

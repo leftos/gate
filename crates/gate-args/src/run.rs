@@ -36,6 +36,8 @@ pub(crate) enum ValueOption {
     #[cfg(feature = "test-seams")]
     ServersUnder,
     #[cfg(feature = "test-seams")]
+    ServerImage,
+    #[cfg(feature = "test-seams")]
     RemoteTransport,
     #[cfg(feature = "test-seams")]
     RemoteSsh,
@@ -162,6 +164,8 @@ impl RunBuilder {
             #[cfg(feature = "test-seams")]
             ValueOption::ServersUnder => self.test_seams.servers_under = Some(PathBuf::from(value)),
             #[cfg(feature = "test-seams")]
+            ValueOption::ServerImage => self.test_seams.server_image = Some(value.to_owned()),
+            #[cfg(feature = "test-seams")]
             ValueOption::RemoteTransport => self.test_seams.remote_transport = Some(value.to_owned()),
             #[cfg(feature = "test-seams")]
             ValueOption::RemoteSsh => self.test_seams.remote_ssh = Some(PathBuf::from(value)),
@@ -201,6 +205,8 @@ impl RunBuilder {
     pub(crate) fn finish_run(mut self, command: Vec<OsString>, spelling: Spelling) -> Result<RunRequest, Vec<Problem>> {
         #[cfg(feature = "test-seams")]
         self.check_remote_seams();
+        #[cfg(feature = "test-seams")]
+        self.check_server_seams();
         for (option, required) in [
             (ValueOption::Slot, Required::Slot),
             (ValueOption::Timeout, Required::Timeout),
@@ -229,6 +235,19 @@ impl RunBuilder {
                 spelling,
             }),
             _ => Err(self.problems),
+        }
+    }
+
+    /// Refuses `--test-server-image` without `--test-servers-under`: an image the watch reads as a server's is only
+    /// safe in a scan confined to the case's folder.
+    #[cfg(feature = "test-seams")]
+    fn check_server_seams(&mut self) {
+        // A seam whose value was refused is already a problem of its own.
+        if self.test_seams.server_image.is_some() && !self.given.contains(&RunOption::Value(ValueOption::ServersUnder)) {
+            self.problems.push(Problem::SeamNeeds {
+                option: "--test-server-image",
+                needs: "--test-servers-under",
+            });
         }
     }
 

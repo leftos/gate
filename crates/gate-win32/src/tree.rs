@@ -14,8 +14,8 @@ use windows_sys::Win32::System::Threading::{
 
 use crate::{job, own_handle, start_of, wait_millis, wide};
 
-/// A job another process created, opened by its name with the access to list its processes and to end them. Dropping
-/// it only closes this handle.
+/// A job another process created, opened by its name with the access to list its processes, and to end them when it
+/// was opened to be stopped. Dropping it only closes this handle.
 pub struct OpenedJob {
     handle: OwnedHandle,
     name: String,
@@ -23,15 +23,30 @@ pub struct OpenedJob {
 
 impl OpenedJob {
     /// Opens the job `name` (such as `Local\gate-job-<pid>`) with `JOB_OBJECT_QUERY` and `JOB_OBJECT_TERMINATE`
-    /// access; `None` when no job has that name.
+    /// access, to list and end its processes; `None` when no job has that name.
     ///
     /// # Errors
     ///
     /// The system's error when the job exists but cannot be opened.
     pub fn open(name: &str) -> io::Result<Option<OpenedJob>> {
+        Self::open_with(name, JOB_OBJECT_QUERY | JOB_OBJECT_TERMINATE)
+    }
+
+    /// Opens the job `name` with `JOB_OBJECT_QUERY` access alone, to list its processes: [`OpenedJob::terminate`]
+    /// fails on it. `None` when no job has that name.
+    ///
+    /// # Errors
+    ///
+    /// The system's error when the job exists but cannot be opened.
+    pub fn open_to_list(name: &str) -> io::Result<Option<OpenedJob>> {
+        Self::open_with(name, JOB_OBJECT_QUERY)
+    }
+
+    /// Opens the job `name` with `access`; `None` when no job has that name.
+    fn open_with(name: &str, access: u32) -> io::Result<Option<OpenedJob>> {
         let wide_name = wide(name);
         // SAFETY: `wide_name` is NUL-terminated and outlives the call. A success is a fresh handle nothing else owns.
-        match unsafe { own_handle(OpenJobObjectW(JOB_OBJECT_QUERY | JOB_OBJECT_TERMINATE, 0, wide_name.as_ptr())) } {
+        match unsafe { own_handle(OpenJobObjectW(access, 0, wide_name.as_ptr())) } {
             Ok(handle) => Ok(Some(OpenedJob {
                 handle,
                 name: name.to_owned(),

@@ -37,6 +37,7 @@ pub(crate) fn run(request: &RunRequest, log: &Path, root: &ResolvedRoot) -> Stri
             "remoteWaitMs": seams.remote_wait_ms,
             "gitLimitMs": seams.git_limit_ms,
             "serversUnder": seams.servers_under.as_ref().map(|path| path.to_string_lossy()),
+            "serverImage": seams.server_image,
             "remoteSnapshot": seams.remote_snapshot,
             "remoteTransport": seams.remote_transport,
             "remoteSsh": seams.remote_ssh.as_ref().map(|path| path.to_string_lossy()),

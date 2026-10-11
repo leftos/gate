@@ -1016,7 +1016,7 @@ impl Run<'_> {
     /// Watches the command until it exits, is killed or the console is interrupted; how it ended, the load-adjusted
     /// seconds it ran, `None` once the sampler failed, and the wall time paused while a gate under it waited behind a
     /// critical request, else the gate's problem.
-    fn watch(&self, job: &Job, running: &Running, start: &Start, console: &mut Console) -> Result<(Watched, Option<f64>, Duration), String> {
+    fn watch(&mut self, job: &Job, running: &Running, start: &Start, console: &mut Console) -> Result<(Watched, Option<f64>, Duration), String> {
         let watching = Watching {
             job,
             running,
@@ -1026,6 +1026,7 @@ impl Run<'_> {
             root: self.root,
             gate: &self.gate,
             hands_on: self.nesting.handed_on(self.lent),
+            survey: &mut self.survey,
         };
         let mut watcher = Watcher::begin(self.request, watching, start, self.host.processors)
             .map_err(|error| format!("cannot begin to watch the command: {error}"))?;

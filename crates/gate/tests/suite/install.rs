@@ -207,8 +207,9 @@ fn delete_path_value(key: &EnvironmentKey) {
 }
 
 /// The words of a run a case holds: its ceiling is far above the suite's hang guard, so the gate does not end it
-/// while the case is still asserting.
-fn held_run(go: &str) -> [&str; 13] {
+/// while the case is still asserting. Its server scan is confined to its working directory, so it moves no build server
+/// of the machine.
+fn held_run(go: &str) -> [&str; 15] {
     [
         "run",
         "--slot",
@@ -217,6 +218,8 @@ fn held_run(go: &str) -> [&str; 13] {
         "900",
         "--log",
         "out.log",
+        "--test-servers-under",
+        ".",
         "--",
         FAKE_TOOL,
         "wait",

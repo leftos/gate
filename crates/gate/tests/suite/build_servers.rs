@@ -13,28 +13,26 @@ const CONTROL_C_EXIT: i32 = 0xC000_013A_u32.cast_signed();
 
 /// Copies fake-tool into the case folder as `name` and returns its absolute path, so a command or a burner names it
 /// inside the case's working directory.
-fn tool(case: &Case, name: &str) -> String {
+pub(crate) fn tool(case: &Case, name: &str) -> String {
     copy_tool(case, name);
     shown(&case.folder().join(name))
 }
 
-/// The words a case's gate runs with: a 100 ms sample, a 2 s stall window, the interrupt at 60 samples, well past it,
-/// and the server scan confined to the case's own folder, so a build server another case — or another session on this
-/// machine — started is never counted. "Not stalled" is shown by the sample count, and no case waits on a clock.
-fn seams(case: &Case) -> Vec<String> {
-    let mut words = [
+/// The words a case's gate runs with: a 100 ms sample, a 2 s stall window, and the interrupt at 60 samples, well past
+/// it. "Not stalled" is shown by the sample count, and no case waits on a clock. The server scan is the run words' own,
+/// confined to the case's folder, so a build server another case — or another session on this machine — started is
+/// never counted.
+fn seams() -> Vec<String> {
+    [
         "--test-sample-ms",
         "100",
         "--test-stall-ms",
         "2000",
         "--test-interrupt-after-samples",
         "60",
-        "--test-servers-under",
     ]
     .map(str::to_owned)
-    .to_vec();
-    words.push(shown(&case.folder()));
-    words
+    .to_vec()
 }
 
 /// The words a burner runs: each of `identity` printed by its own `out` step, so it stands in the burner's command
@@ -48,9 +46,9 @@ fn burn_words(identity: &[&str], stop: &str) -> Vec<String> {
 
 /// A build server a case started outside the job, burning until its stop file exists. The file is created when the
 /// burner drops, so a case that fails before its last line still stops it.
-struct Burner {
+pub(crate) struct Burner {
     /// The burner's process id, as the diagnostics block names it.
-    pid: u32,
+    pub(crate) pid: u32,
     /// The file whose existence ends the burn.
     stop: PathBuf,
     /// The copy itself, killed when the burner drops, so a case never leaves one behind.
@@ -60,7 +58,7 @@ struct Burner {
 impl Burner {
     /// Starts the case folder's copy at `exe` with `identity` as the words of its command line, burning until the
     /// case's `stop` file exists, and returns it once it has said `burning`.
-    fn spawn(case: &Case, exe: &str, identity: &[&str], stop: &str) -> Burner {
+    pub(crate) fn spawn(case: &Case, exe: &str, identity: &[&str], stop: &str) -> Burner {
         let stop = case.folder().join(stop);
         let words = burn_words(identity, &shown(&stop));
         let borrowed: Vec<&str> = words.iter().map(String::as_str).collect();
@@ -76,7 +74,7 @@ impl Burner {
     }
 
     /// Ends the burn by creating its stop file.
-    fn stop(&self) {
+    pub(crate) fn stop(&self) {
         fs::write(&self.stop, "").expect("the burner's stop file can be written");
     }
 }
@@ -110,7 +108,7 @@ fn a_quiet_build_waiting_on_a_busy_shared_compiler_is_not_stalled() {
     let case = Case::new("a_quiet_build_waiting_on_a_busy_shared_compiler_is_not_stalled");
     let msbuild = tool(&case, "MSBuild.exe");
     let compiler = tool(&case, "VBCSCompiler.exe");
-    let seams = seams(&case);
+    let seams = seams();
     let seams: Vec<&str> = seams.iter().map(String::as_str).collect();
     // The server is created before the gate's command, so it counts as shared; it burns for the whole run.
     let server = Burner::spawn(&case, &compiler, &[], "stop-compiler");
@@ -131,7 +129,7 @@ fn a_quiet_command_is_stalled_once_the_shared_compiler_goes_quiet() {
     let case = Case::new("a_quiet_command_is_stalled_once_the_shared_compiler_goes_quiet");
     let msbuild = tool(&case, "MSBuild.exe");
     let compiler = tool(&case, "VBCSCompiler.exe");
-    let seams = seams(&case);
+    let seams = seams();
     let seams: Vec<&str> = seams.iter().map(String::as_str).collect();
     let log = case.folder().join("out.log");
     let server = Burner::spawn(&case, &compiler, &[], "stop-compiler");
@@ -151,7 +149,7 @@ fn a_server_started_after_the_command_counts_while_the_job_holds_a_client() {
     let case = Case::new("a_server_started_after_the_command_counts_while_the_job_holds_a_client");
     let msbuild = tool(&case, "MSBuild.exe");
     let compiler = tool(&case, "VBCSCompiler.exe");
-    let seams = seams(&case);
+    let seams = seams();
     let seams: Vec<&str> = seams.iter().map(String::as_str).collect();
     let log = case.folder().join("out.log");
     let chatter = shown(&chatter_path(&case));
@@ -182,7 +180,7 @@ fn a_dotnet_server_is_told_by_its_command_line() {
     let case = Case::new("a_dotnet_server_is_told_by_its_command_line");
     let msbuild = tool(&case, "MSBuild.exe");
     let dotnet = tool(&case, "dotnet.exe");
-    let seams = seams(&case);
+    let seams = seams();
     let seams: Vec<&str> = seams.iter().map(String::as_str).collect();
 
     // The copy's command line names VBCSCompiler.dll, so the classifier reads a server out of it.
@@ -206,7 +204,7 @@ fn a_build_with_no_build_is_not_a_client() {
     let case = Case::new("a_build_with_no_build_is_not_a_client");
     let dotnet = tool(&case, "dotnet.exe");
     let compiler = tool(&case, "VBCSCompiler.exe");
-    let seams = seams(&case);
+    let seams = seams();
     let seams: Vec<&str> = seams.iter().map(String::as_str).collect();
     let server = Burner::spawn(&case, &compiler, &[], "stop-compiler");
 
@@ -224,7 +222,7 @@ fn an_old_msbuild_node_never_counts() {
     let case = Case::new("an_old_msbuild_node_never_counts");
     let msbuild = tool(&case, "MSBuild.exe");
     let dotnet = tool(&case, "dotnet.exe");
-    let seams = seams(&case);
+    let seams = seams();
     let seams: Vec<&str> = seams.iter().map(String::as_str).collect();
     // An MSBuild node started before the command burns outside the job. It is a build server, but no compiler server,
     // so nothing counts it and the quiet build with a client of its own stalls.
@@ -242,7 +240,7 @@ fn a_stall_kill_lists_the_build_server_its_last_sample_counted() {
     let case = Case::new("a_stall_kill_lists_the_build_server_its_last_sample_counted");
     let msbuild = tool(&case, "MSBuild.exe");
     let compiler = tool(&case, "VBCSCompiler.exe");
-    let seams = seams(&case);
+    let seams = seams();
     let seams: Vec<&str> = seams.iter().map(String::as_str).collect();
     let log = case.folder().join("out.log");
     let chatter = shown(&chatter_path(&case));

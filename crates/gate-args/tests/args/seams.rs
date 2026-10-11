@@ -224,6 +224,53 @@ fn the_servers_under_seam_needs_a_value_once() {
 
 #[cfg(feature = "test-seams")]
 #[test]
+fn the_server_image_seam_needs_the_servers_under_seam_and_a_value_once() {
+    use crate::support::run_request;
+
+    let given = ["--test-servers-under", ".", "--test-server-image", "gate-test-server.exe", "--", "cmd"];
+    assert_eq!(
+        run_request(&refs(&with(&RUN, &given))).test_seams.server_image,
+        Some("gate-test-server.exe".to_owned())
+    );
+    assert_eq!(
+        run_request(&refs(&with(&RUN, &["--test-servers-under", ".", "--", "cmd"])))
+            .test_seams
+            .server_image,
+        None,
+        "none unless given"
+    );
+    assert_eq!(
+        problems(&refs(&with(&RUN, &["--test-server-image", "gate-test-server.exe", "--", "cmd"]))),
+        ["gate: --test-server-image needs --test-servers-under"]
+    );
+    assert_eq!(
+        problems(&refs(&with(
+            &RUN,
+            &[
+                "--test-servers-under",
+                ".",
+                "--test-server-image",
+                "a.exe",
+                "--test-server-image",
+                "b.exe",
+                "--",
+                "cmd"
+            ]
+        ))),
+        ["gate: --test-server-image is given twice"]
+    );
+    assert_eq!(
+        problems(&refs(&with(&RUN, &["--test-servers-under", ".", "--test-server-image=", "--", "cmd"]))),
+        ["gate: --test-server-image needs a value"]
+    );
+    assert_eq!(
+        problems(&["stop-tree", "--test-server-image", "5", "1"]),
+        ["gate: unknown option --test-server-image", "gate: unexpected argument 1"]
+    );
+}
+
+#[cfg(feature = "test-seams")]
+#[test]
 fn the_remote_snapshot_seam_is_a_switch_given_once() {
     use crate::support::run_request;
 
@@ -612,7 +659,12 @@ fn seam_flags_are_unknown_without_the_feature() {
         problems(&refs(&with(&RUN, &["--test-remote-snapshot", "--", "cmd"]))),
         ["gate: unknown option --test-remote-snapshot"]
     );
-    for flag in ["--test-remote-transport", "--test-remote-ssh", "--test-remote-retry-pause-ms"] {
+    for flag in [
+        "--test-remote-transport",
+        "--test-remote-ssh",
+        "--test-remote-retry-pause-ms",
+        "--test-server-image",
+    ] {
         assert_eq!(
             problems(&refs(&with(&RUN, &[flag, "5", "--", "cmd"]))),
             [format!("gate: unknown option {flag}"), "gate: unexpected argument 5".to_owned()],

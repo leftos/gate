@@ -23,6 +23,7 @@ mod journal;
 mod launch;
 mod nesting;
 mod pause;
+mod priority;
 mod remote_client;
 mod request;
 mod routing;

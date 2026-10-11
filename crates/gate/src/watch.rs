@@ -22,9 +22,10 @@ use crate::console::Console;
 use crate::log::Log;
 use crate::nesting::Parent;
 use crate::pause::PauseReader;
+use crate::priority::{OtherGates, Prioritizer};
 use crate::resolve::ResolvedRoot;
-use crate::servers::{Scope, Servers, counted};
-use crate::slots::{Pool, ThisGate, epoch_ms};
+use crate::servers::{Classified, Found, Scope, Servers, counted};
+use crate::slots::{Pool, Survey, ThisGate, epoch_ms};
 
 /// How long the watch waits for the command between two samples.
 const SAMPLE_PERIOD: Duration = Duration::from_secs(5);
@@ -88,6 +89,12 @@ pub(crate) struct Watcher<'a> {
     /// The pause markers of the gates under this one: a gate under it waiting behind a critical request is the run's
     /// progress.
     pause: PauseReader<'a>,
+    /// The build servers the last sample classified, whose priority classes the pass below moves.
+    classified: Vec<Classified>,
+    /// The other gates' facts the build servers' guard reads, at most once a pass and only when a server the pass would move asks.
+    others: OtherGates<'a>,
+    /// The classes this watch moves the sample's build servers to.
+    priority: Prioritizer<'a>,
 }
 
 /// A read of the WSL VM's cumulative CPU in 100 ns ticks, `None` when no VM runs.
@@ -143,7 +150,6 @@ impl Start {
 }
 
 /// The command's run, as the watch is told it: what it watches and how.
-#[derive(Clone, Copy)]
 pub(crate) struct Watching<'a> {
     pub job: &'a Job,
     pub running: &'a Running,
@@ -159,6 +165,8 @@ pub(crate) struct Watching<'a> {
     /// The parent whose marker this gate hands its command, when that parent's slot covers it or is lent to it: the
     /// gates under that command name their pause markers after the parent.
     pub hands_on: Option<&'a Parent>,
+    /// The state root's tickets, claims and jobs, as the build servers' guard reads them.
+    pub survey: &'a mut Survey,
 }
 
 impl<'a> Watcher<'a> {
@@ -169,26 +177,38 @@ impl<'a> Watcher<'a> {
     ///
     /// The system's error when those times cannot be read.
     pub(crate) fn begin(request: &RunRequest, run: Watching<'a>, start: &Start, processors: usize) -> io::Result<Watcher<'a>> {
+        let Watching {
+            job,
+            running,
+            log,
+            interrupt,
+            runs_as,
+            root,
+            gate,
+            hands_on,
+            survey,
+        } = run;
         let system = system_times()?;
-        let job_cpu = Ticks(run.job.accounting()?.cpu);
+        let job_cpu = Ticks(job.accounting()?.cpu);
         let config = config(request);
         // A command that is not a wsl one reads nothing.
         let read: VmRead = if config.wsl { gate_win32::wsl_vm_cpu } else { || Ok(None) };
         let mut vm = VmReader::new(read);
         let vm_cpu = vm.baseline();
         let spoken: Vec<String> = request.command.iter().map(|word| word.to_string_lossy().into_owned()).collect();
+        let high = runs_as == Slot::Critical;
         Ok(Watcher {
-            job: run.job,
-            running: run.running,
-            log: run.log,
+            job,
+            running,
+            log,
             since: start.since,
             started: start.started,
             period: request.test_seams.sample_ms.map_or(SAMPLE_PERIOD, Duration::from_millis),
-            interrupt: run.interrupt,
+            interrupt,
             spoken: spoken.join(" "),
-            watch: Watch::new(config, machine(run.runs_as, processors), system, job_cpu, vm_cpu),
+            watch: Watch::new(config, machine(runs_as, processors), system, job_cpu, vm_cpu),
             history: SampleHistory::default(),
-            servers: Servers::new(),
+            servers: Servers::new(request.test_seams.server_image.clone()),
             under: request.test_seams.servers_under.as_deref().map(absolute),
             counted: Vec::new(),
             sampler_works: true,
@@ -197,7 +217,10 @@ impl<'a> Watcher<'a> {
             samples: 0,
             interrupt_after: request.test_seams.interrupt_after_samples,
             vm,
-            pause: PauseReader::new(run.root, run.gate, run.hands_on),
+            pause: PauseReader::new(root, gate, hands_on),
+            classified: Vec::new(),
+            others: OtherGates::new(high, gate, root, survey),
+            priority: Prioritizer::new(high),
         })
     }
 
@@ -269,6 +292,7 @@ impl<'a> Watcher<'a> {
                 self.counted = counted(&sample.new_servers, &sample.shared_servers);
                 self.watch.sample(&sample);
                 self.record(&sample, log_bytes, err_bytes, vm.is_err());
+                self.prioritize(console);
             }
             Err(error) => {
                 self.sampler_works = false;
@@ -303,6 +327,13 @@ impl<'a> Watcher<'a> {
             shared_servers_cpu: Ticks(sample.shared_servers.values().copied().sum()),
             build_client_in_job: sample.build_client,
         });
+    }
+
+    /// Moves the build servers this sample classified ([`Prioritizer`]): the other gates' guard is read at most once,
+    /// and only when a server the pass would move asks.
+    fn prioritize(&mut self, console: &mut Console) {
+        let servers = std::mem::take(&mut self.classified);
+        self.priority.run(&servers, &mut self.others, console);
     }
 
     /// The kill due now, as stalled, timed out or past the backstop, or `None`; a command that exited as the kill was
@@ -443,6 +474,13 @@ impl<'a> Watcher<'a> {
         let found = self
             .servers
             .read(&processes, &scope, gate_win32::process_times, proc_table::command_line_of);
+        let Found {
+            servers,
+            new_servers,
+            shared_servers,
+            build_client,
+        } = found;
+        self.classified = servers;
         let sample = Sample {
             at,
             system: system_times()?,
@@ -450,9 +488,9 @@ impl<'a> Watcher<'a> {
             output_size: log_bytes + err_bytes,
             pids,
             paused,
-            new_servers: found.new_servers,
-            shared_servers: found.shared_servers,
-            build_client: found.build_client,
+            new_servers,
+            shared_servers,
+            build_client,
             vm_cpu,
         };
         Ok((sample, log_bytes, err_bytes))

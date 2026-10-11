@@ -12,8 +12,10 @@ use crate::support::{Case, FAKE_TOOL, assert_in_order, release, run_words, said_
 const DIAGNOSTICS_FAIL: &str = "--test-diagnostics-fail makes the diagnostics fail (test seam only)";
 
 /// The words of a run in `slot` with a 1 s ceiling, logging to `out.log`, `seams` before `--` and `command` after it.
+/// The server scan is confined to the case's folder, as the run words' own is, so the run moves no build server of the
+/// machine it did not start itself.
 fn ceiling_words<'a>(slot: &'a str, seams: &[&'a str], command: &[&'a str]) -> Vec<&'a str> {
-    let mut words = vec!["run", "--slot", slot, "--timeout", "1", "--log", "out.log"];
+    let mut words = vec!["run", "--slot", slot, "--timeout", "1", "--log", "out.log", "--test-servers-under", "."];
     words.extend(seams);
     words.push("--");
     words.extend(command);
@@ -56,17 +58,9 @@ fn assert_block(log: &str, kill: &str, lines: &[&str]) {
 #[test]
 fn a_kill_writes_its_diagnostics_to_the_log_before_the_kill_line() {
     let case = Case::new("a_kill_writes_its_diagnostics_to_the_log_before_the_kill_line");
-    // The server scan is confined to this case's own folder, which holds none, so a build server another case started
-    // can never take the `build servers: none` line this case pins.
-    let under = shown(&case.folder());
-    let seams = [
-        "--test-stall-ms",
-        "1500",
-        "--test-sample-ms",
-        "100",
-        "--test-servers-under",
-        under.as_str(),
-    ];
+    // The server scan is the run words' own, confined to this case's folder, which holds none, so a build server
+    // another case started can never take the `build servers: none` line this case pins.
+    let seams = ["--test-stall-ms", "1500", "--test-sample-ms", "100"];
     let log_path = case.folder().join("out.log");
 
     let outcome = case.run(&run_words("out.log", &seams, &[FAKE_TOOL, "pid", "out", "hi", "sleep", "30000"]));

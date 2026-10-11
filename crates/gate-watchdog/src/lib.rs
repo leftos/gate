@@ -15,6 +15,8 @@ pub use diagnostics::{
     JOB_LINES, OUTSIDE_LINES, ProcessFacts, Report, SampleFacts, SampleHistory, ServerFacts, WslVm, failed_block, failed_line, lines,
 };
 pub use heartbeat::{BeatClock, CpuSource, Pump, Ticker};
-pub use servers::{is_build_client, is_build_server, is_compiler_server, is_wsl_command};
+pub use servers::{
+    PriorityClass, is_build_client, is_build_server, is_compiler_image, is_compiler_server, is_wsl_command, server_left, server_target,
+};
 pub use share::{Machine, SystemTimes, Ticks, free_share};
 pub use watch::{Config, CpuMove, Kill, Sample, Watch, measure_cpu, sampler_failed_line, wsl_unavailable_line};
