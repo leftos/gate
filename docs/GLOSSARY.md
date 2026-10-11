@@ -11,6 +11,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Backstop**: the watchdog's last limit, five times the ceiling in wall time (less time paused behind a critical request), whatever the load.
 - **Barrier**: the earliest live critical ticket that arrived before a gate's own, which holds the gate back: a heavy gate takes no slot behind it and a light gate only a reserved light slot.
 - **Black-box suite**: the Rust integration suite (`crates/gate/tests/suite/`) that drives the built `gate.exe` through its CLI and reads only its exit code, output, log, journal, claims and tickets; it needs the `test-seams` feature to run.
+- **Bounded call**: a call of the Rust remote client to the builder's `gate box` that is not the run itself (the `stop` and the `boot` after a lost connection), ended after 30 s and retried once after a pre-banner failure while 5 s of the bound would be left.
 - **Box**: a builder; the word the gate's prose and its hidden `gate box` subcommand use.
 - **Box job**: the named job `Local\gate-remote-<key>-<12 hex>` that a `gate box run` puts its command in, named by the payload and stopped by `gate box stop`; it has no limits and no kill-on-close.
 - **Bridge**: the stand-in, until the remote port, by which `gate.exe` runs a routed run's remote part through the PowerShell remote client, `remote.ps1`, through a **Shim**, with the request on pwsh's stdin and the answer as **Control lines**.

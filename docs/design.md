@@ -770,6 +770,8 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
   Ctrl+C ends it with `STATUS_CONTROL_C_EXIT` and no line. A log that cannot be written gives status 1, with no fallback.
 - **The remote client's run** (GATE-43, parts B1, B2, C1 and C2) is built in `remote/{client,payload,retry,syncback,transport,watchdog}.rs` and dormant: a production gate runs the bridge instead. Only a build with the `test-seams` feature has it, chosen by `gate run --test-remote-transport local:<folder>`, which stands in for the builder with a local folder.
 
+  The real ssh transport (`Ssh` in `remote/transport.rs`) is built and unit-tested but selected by nothing: the remote cutover (GATE-46) selects it for routed runs, and `gate push` (GATE-65) reuses it.
+
   The phases run in this order. Any `gate: the remote run failed` line ends the run with status 1 and no fallback; Ctrl+C at any point after the snapshot ends the run as an interrupt.
   - **Lock.** The run takes the routed lock, `Local\gate-[<root hash>-]routed-<16 hex>` ([Kernel object names](#kernel-object-names)), before the remote slot, with a zero wait, and holds it for the whole remote attempt.
 
@@ -1160,7 +1162,7 @@ A Rust integration suite drives the built `gate.exe` through its CLI and reads o
 
   It is copied under the names the gate classifies (`VBCSCompiler.exe`, `dotnet.exe`, `MSBuild.exe`).
 
-  A second helper, `fake-ssh`, stands in for ssh in the remote client's cases (`--test-remote-ssh`). Its steps are `ok`, `hold`, `version`, `boot <time>` (as `version`, for the box's boot line), `no-boot` (drops the box's boot line), `drop` (exits 255 at once, writing nothing), `exit`, `fail-banner`, `fail-other`, `out-then-drop`, `flood <n>`, `say-hold <word> <path>` and `progress-ok <n>`.
+  A second helper, `fake-ssh`, stands in for ssh in the remote client's cases (`--test-remote-ssh`). Its steps are `ok`, `hold`, `version`, `boot <time>` (as `version`, for the box's boot line), `no-boot` (drops the box's boot line), `drop` (exits 255 at once, writing nothing), `exit`, `fail-banner`, `fail-other`, `out-then-drop`, `say-exit <n> <line>` (writes the line on stderr and exits `<n>`, as the box says its own refusal), `flood <n>`, `say-hold <word> <path>` and `progress-ok <n>`.
 
   It spawns children, burns CPU, prints its argv, writes output or sleeps on command, so build-server, orphan and kill-tree cases need no real toolchain.
 - **No fixture from the checkout path.** No routing pattern, expected path or assertion is derived from where the repo is checked out; a case builds its own repository and routing file in its root. `checkout::repo_file` is the one route to a checked-in file (the install script), never for a path or pattern a case asserts on.
