@@ -33,3 +33,13 @@ fn an_exited_child_whose_handle_is_held_has_no_working_set() {
     // The child is gone, and `Child` still holds its handle, so it is open but no longer running.
     assert_eq!(working_set(child.id()).expect("an exited child is no error"), None);
 }
+
+#[test]
+fn the_working_set_of_an_exited_259_process_is_none() {
+    let mut child = Command::new("cmd").args(["/c", "exit 259"]).spawn().expect("cmd starts");
+    let status = child.wait().expect("the child can be waited for");
+    assert_eq!(status.code(), Some(259), "{status}");
+
+    // The child is gone, and `Child` still holds its handle, so its exit code, `STILL_ACTIVE`, stays readable.
+    assert_eq!(working_set(child.id()).expect("an exited child is no error"), None);
+}

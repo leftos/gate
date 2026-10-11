@@ -6,12 +6,12 @@ use std::mem::offset_of;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use windows_sys::Wdk::System::SystemInformation::{NtQuerySystemInformation, SystemProcessInformation};
-use windows_sys::Win32::Foundation::{ERROR_INVALID_PARAMETER, FILETIME, STATUS_INFO_LENGTH_MISMATCH, STILL_ACTIVE, UNICODE_STRING};
+use windows_sys::Win32::Foundation::{FILETIME, STATUS_INFO_LENGTH_MISMATCH, UNICODE_STRING};
 use windows_sys::Win32::System::SystemInformation::GetSystemTimeAsFileTime;
-use windows_sys::Win32::System::Threading::{GetExitCodeProcess, GetProcessTimes, GetSystemTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+use windows_sys::Win32::System::Threading::{GetProcessTimes, GetSystemTimes};
 use windows_sys::Win32::System::WindowsProgramming::SYSTEM_PROCESS_INFORMATION;
 
-use crate::own_handle;
+use crate::open_running;
 
 /// The image name of the process whose CPU is the WSL VM's: Ubuntu and docker-desktop share it.
 const VM_IMAGE: &str = "vmmemWSL";
@@ -110,21 +110,9 @@ pub fn file_time_now() -> u64 {
 ///
 /// The system's error when the process exists but cannot be opened or its times read.
 pub fn process_times(pid: u32) -> io::Result<Option<ProcessTimes>> {
-    // SAFETY: `OpenProcess` takes no pointers. A success is a fresh handle nothing else owns.
-    let process = match unsafe { own_handle(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid)) } {
-        Ok(process) => process,
-        // `OpenProcess` reports a pid no process has as `ERROR_INVALID_PARAMETER`.
-        Err(error) if error.raw_os_error() == i32::try_from(ERROR_INVALID_PARAMETER).ok() => return Ok(None),
-        Err(error) => return Err(error),
-    };
-    let mut code = 0;
-    // SAFETY: the handle is open for the whole call, with the query access the call asks for, and `code` is writable.
-    if unsafe { GetExitCodeProcess(process.raw(), &raw mut code) } == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    if code != STILL_ACTIVE.cast_unsigned() {
+    let Some(process) = open_running(pid)? else {
         return Ok(None);
-    }
+    };
     let mut created = FILETIME::default();
     let mut exited = FILETIME::default();
     let mut kernel = FILETIME::default();

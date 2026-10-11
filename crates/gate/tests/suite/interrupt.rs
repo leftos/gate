@@ -6,7 +6,9 @@ use std::fs;
 use gate_state::v1::ticket_path;
 use serde_json::Value;
 
-use crate::support::{Case, FAKE_TOOL, assert_in_order, events, release, run_words, said_pid, shown, wait_for_journal_line, write_counts};
+use crate::support::{
+    Case, FAKE_TOOL, assert_in_order, events, release, run_words, said_pid, shown, wait_for_journal_line, wait_until, write_counts,
+};
 
 /// The status Windows reports for a process Ctrl+C ended, `STATUS_CONTROL_C_EXIT`, as a signed exit code.
 const CONTROL_C_EXIT: i32 = 0xC000_013A_u32.cast_signed();
@@ -32,10 +34,10 @@ fn a_command_still_running_5_s_after_a_ctrl_c_has_its_job_terminated() {
     );
     let log = fs::read_to_string(case.folder().join("out.log")).expect("the log was written");
     let pid = said_pid(&log, "pid ");
-    assert!(
-        gate_win32::process_start_of(pid).is_ok_and(|start| start.is_none()),
-        "the interrupted command {pid} is gone"
-    );
+    // A terminated process leaves its job before its object is signalled, so its end is waited for, not read once.
+    wait_until(&format!("the interrupted command {pid} ending"), || {
+        gate_win32::process_start_of(pid).is_ok_and(|start| start.is_none())
+    });
 }
 
 #[test]

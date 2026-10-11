@@ -60,7 +60,7 @@ use windows_sys::Win32::System::Diagnostics::Debug::{
 use windows_sys::Win32::System::SystemInformation::GetTickCount64;
 use windows_sys::Win32::System::Threading::{
     BELOW_NORMAL_PRIORITY_CLASS, GetCurrentProcess, GetExitCodeProcess, GetPriorityClass, GetProcessTimes, IDLE_PRIORITY_CLASS, INFINITE,
-    OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
 };
 
 /// The guard of a handle a Win32 call just returned, or the error the call left behind.
@@ -185,23 +185,82 @@ pub fn boot_time() -> io::Result<SystemTime> {
 /// An error of kind [`io::ErrorKind::PermissionDenied`] when this process may not query that one, else the system's
 /// error when the process cannot be opened or its times read, or when the time is outside a [`Timestamp`]'s range.
 pub fn process_start_of(pid: u32) -> io::Result<Option<Timestamp>> {
-    // SAFETY: a success is a fresh handle nothing else owns.
-    let process = match unsafe { own_handle(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid)) } {
-        Ok(process) => process,
-        // `OpenProcess` reports a pid no process has as `ERROR_INVALID_PARAMETER`.
-        Err(error) if error.raw_os_error() == i32::try_from(ERROR_INVALID_PARAMETER).ok() => return Ok(None),
-        Err(error) => return Err(error),
+    let Some(process) = open_running(pid)? else {
+        return Ok(None);
     };
+    // SAFETY: the handle is open for the whole call, with the query access `GetProcessTimes` asks for.
+    unsafe { start_of(process.raw()) }.map(Some)
+}
+
+/// How a process opened by [`open_running`] is judged to have exited.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Judge {
+    /// A wait of no time on the handle, which has `PROCESS_SYNCHRONIZE` access. The exit code cannot say it: a process
+    /// that exited with code 259 (`STILL_ACTIVE`) reads as running to `GetExitCodeProcess` for as long as any handle
+    /// keeps its process object.
+    Wait,
+    /// The exit code, on a handle that has query access alone.
+    ExitCode,
+}
+
+/// The running process `pid`, opened with `PROCESS_QUERY_LIMITED_INFORMATION` access; `None` when no process has that
+/// pid or the process has exited.
+///
+/// # Errors
+///
+/// An error of kind [`io::ErrorKind::PermissionDenied`] when this process may not query that one, else the system's
+/// error when the process cannot be opened or whether it has exited cannot be read.
+pub(crate) fn open_running(pid: u32) -> io::Result<Option<OwnedHandle>> {
+    let open = |access| {
+        // SAFETY: `OpenProcess` takes no pointers. A success is a fresh handle nothing else owns.
+        unsafe { own_handle(OpenProcess(access, 0, pid)) }
+    };
+    let opened = choose_handle(open(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE), || {
+        open(PROCESS_QUERY_LIMITED_INFORMATION)
+    })?;
+    let Some((process, judge)) = opened else {
+        return Ok(None);
+    };
+    let exited = match judge {
+        Judge::Wait => event::signalled(&process)?,
+        Judge::ExitCode => exit_code_says_exited(&process)?,
+    };
+    Ok((!exited).then_some(process))
+}
+
+/// The handle to judge a process by, and how: the `waitable` open (query and `PROCESS_SYNCHRONIZE` access) when it
+/// succeeded, else the `query_only` open when the waitable one was refused; `None` when either open finds no process.
+///
+/// The waitable open can be refused where query access alone is granted, as to a process of another integrity level
+/// or a protected one. Such a process is still judged, by its exit code, so it is never taken for gone while it runs;
+/// only one that exited with code 259 (`STILL_ACTIVE`) then reads as running.
+fn choose_handle<H>(waitable: io::Result<H>, query_only: impl FnOnce() -> io::Result<H>) -> io::Result<Option<(H, Judge)>> {
+    match waitable {
+        Ok(handle) => Ok(Some((handle, Judge::Wait))),
+        // `OpenProcess` reports a pid no process has as `ERROR_INVALID_PARAMETER`.
+        Err(error) if tree::is_error(&error, ERROR_INVALID_PARAMETER) => Ok(None),
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => match query_only() {
+            Ok(handle) => Ok(Some((handle, Judge::ExitCode))),
+            Err(error) if tree::is_error(&error, ERROR_INVALID_PARAMETER) => Ok(None),
+            Err(error) => Err(error),
+        },
+        Err(error) => Err(error),
+    }
+}
+
+/// Whether the process behind `process` has exited, as its exit code says: any code but 259 (`STILL_ACTIVE`). A
+/// process that exited with 259 reads as running, so this is used only where a wait is refused.
+///
+/// # Errors
+///
+/// The system's error when the exit code cannot be read.
+fn exit_code_says_exited(process: &OwnedHandle) -> io::Result<bool> {
     let mut code = 0;
-    // SAFETY: the handle is open for the whole call, with the query access the call asks for, and `code` is writable.
+    // SAFETY: the guard keeps the handle open for the whole call, with query access, and `code` is writable.
     if unsafe { GetExitCodeProcess(process.raw(), &raw mut code) } == 0 {
         return Err(io::Error::last_os_error());
     }
-    if code != STILL_ACTIVE.cast_unsigned() {
-        return Ok(None);
-    }
-    // SAFETY: the handle is open for the whole call, with the query access `GetProcessTimes` asks for.
-    unsafe { start_of(process.raw()) }.map(Some)
+    Ok(code != STILL_ACTIVE.cast_unsigned())
 }
 
 /// The creation time of the process behind `process`.
@@ -224,4 +283,80 @@ unsafe fn start_of(process: HANDLE) -> io::Result<Timestamp> {
         .ok()
         .and_then(proc_table::filetime_to_timestamp)
         .ok_or_else(|| io::Error::other("the process start time is out of range"))
+}
+
+#[cfg(test)]
+#[expect(clippy::expect_used, reason = "a test whose open result is not the one it gave must fail loudly")]
+mod tests {
+    use std::cell::Cell;
+    use std::io;
+
+    use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, ERROR_NOT_ENOUGH_MEMORY};
+
+    use super::{Judge, choose_handle};
+
+    /// The error an `OpenProcess` refused with `code` leaves.
+    fn refused(code: u32) -> io::Error {
+        io::Error::from_raw_os_error(i32::try_from(code).expect("a Win32 error code fits an i32"))
+    }
+
+    /// A query-only open that succeeds and marks `tried` when it is made.
+    fn query_only(tried: &Cell<bool>) -> impl FnOnce() -> io::Result<&'static str> + '_ {
+        || {
+            tried.set(true);
+            Ok("query only")
+        }
+    }
+
+    #[test]
+    fn a_waitable_handle_is_judged_by_a_wait() {
+        let tried = Cell::new(false);
+        let chosen = choose_handle(Ok("waitable"), query_only(&tried)).expect("an open that succeeded is no error");
+
+        assert_eq!(chosen, Some(("waitable", Judge::Wait)));
+        assert!(!tried.get(), "no second open is made");
+    }
+
+    #[test]
+    fn a_pid_no_process_has_is_none_without_a_second_open() {
+        let tried = Cell::new(false);
+        let chosen = choose_handle(Err(refused(ERROR_INVALID_PARAMETER)), query_only(&tried)).expect("a pid no process has is no error");
+
+        assert_eq!(chosen, None);
+        assert!(!tried.get(), "no second open is made");
+    }
+
+    #[test]
+    fn a_refused_wait_falls_back_to_the_exit_code_on_a_query_only_handle() {
+        let tried = Cell::new(false);
+        let chosen = choose_handle(Err(refused(ERROR_ACCESS_DENIED)), query_only(&tried)).expect("the query-only open succeeded");
+
+        assert_eq!(chosen, Some(("query only", Judge::ExitCode)));
+        assert!(tried.get(), "the query-only open is made");
+    }
+
+    #[test]
+    fn a_process_gone_between_the_two_opens_is_none() {
+        let chosen = choose_handle::<&str>(Err(refused(ERROR_ACCESS_DENIED)), || Err(refused(ERROR_INVALID_PARAMETER)))
+            .expect("a pid no process has is no error");
+
+        assert_eq!(chosen, None);
+    }
+
+    #[test]
+    fn a_process_that_refuses_both_opens_is_permission_denied() {
+        let error =
+            choose_handle::<&str>(Err(refused(ERROR_ACCESS_DENIED)), || Err(refused(ERROR_ACCESS_DENIED))).expect_err("both opens were refused");
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error}");
+    }
+
+    #[test]
+    fn another_open_error_is_returned_without_a_second_open() {
+        let tried = Cell::new(false);
+        let error = choose_handle(Err(refused(ERROR_NOT_ENOUGH_MEMORY)), query_only(&tried)).expect_err("the open failed");
+
+        assert_eq!(error.raw_os_error(), refused(ERROR_NOT_ENOUGH_MEMORY).raw_os_error(), "{error}");
+        assert!(!tried.get(), "no second open is made");
+    }
 }

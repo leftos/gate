@@ -144,6 +144,6 @@ impl StoppableProcess {
 }
 
 /// Whether `error` is the Win32 error `code`.
-fn is_error(error: &io::Error, code: u32) -> bool {
+pub(crate) fn is_error(error: &io::Error, code: u32) -> bool {
     error.raw_os_error() == i32::try_from(code).ok()
 }

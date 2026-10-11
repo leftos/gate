@@ -6,7 +6,7 @@ use std::fs;
 use regex::Regex;
 use serde_json::Value;
 
-use crate::support::{Case, FAKE_TOOL, assert_in_order, release, run_words, said_pid, shown, wait_until_closed};
+use crate::support::{Case, FAKE_TOOL, assert_in_order, release, run_words, said_pid, shown, wait_until, wait_until_closed};
 
 #[test]
 fn a_silent_idle_command_is_killed_as_stalled() {
@@ -40,10 +40,10 @@ fn a_silent_idle_command_is_killed_as_stalled() {
         "{release}"
     );
     let pid = said_pid(&log, "pid ");
-    assert!(
-        gate_win32::process_start_of(pid).is_ok_and(|start| start.is_none()),
-        "the killed command {pid} is gone"
-    );
+    // A terminated process leaves its job before its object is signalled, so its end is waited for, not read once.
+    wait_until(&format!("the killed command {pid} ending"), || {
+        gate_win32::process_start_of(pid).is_ok_and(|start| start.is_none())
+    });
 }
 
 #[test]
@@ -66,10 +66,10 @@ fn a_stalled_command_is_killed_with_its_grandchild() {
     let log = fs::read_to_string(&log_path).expect("the log was written");
     for prefix in ["pid ", "spawned "] {
         let pid = said_pid(&log, prefix);
-        assert!(
-            gate_win32::process_start_of(pid).is_ok_and(|start| start.is_none()),
-            "the killed process {pid} ({prefix:?}) is gone"
-        );
+        // A terminated process leaves its job before its object is signalled, so its end is waited for, not read once.
+        wait_until(&format!("the killed process {pid} ({prefix:?}) ending"), || {
+            gate_win32::process_start_of(pid).is_ok_and(|start| start.is_none())
+        });
     }
 }
 

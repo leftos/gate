@@ -94,6 +94,16 @@ fn an_exited_child_has_no_times() {
 }
 
 #[test]
+fn the_times_of_an_exited_259_process_are_none() {
+    let mut child = Command::new("cmd").args(["/c", "exit 259"]).spawn().expect("cmd starts");
+    let status = child.wait().expect("the child can be waited for");
+    assert_eq!(status.code(), Some(259), "{status}");
+
+    // The child is gone, and `Child` still holds its handle, so its exit code, `STILL_ACTIVE`, stays readable.
+    assert_eq!(process_times(child.id()).expect("an exited child is no error"), None);
+}
+
+#[test]
 fn a_child_started_after_now_was_created_at_or_after_it() {
     let since = file_time_now();
     let mut child = Command::new("cmd").args(["/c", "ping -n 30 127.0.0.1 >nul"]).spawn().expect("cmd starts");

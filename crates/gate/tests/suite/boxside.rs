@@ -1304,7 +1304,8 @@ fn box_stop_ends_a_held_run_and_says_so() {
     assert_eq!(stopped.code, Some(0), "{stopped:?}");
     assert_eq!(stopped.stdout, format!("gate: remote stopped job {}\n", field(&payload, "Job")));
     assert_eq!(stopped.stderr, "");
-    assert_eq!(gate_win32::process_start_of(helper).expect("the helper can be looked for"), None);
+    // A terminated process leaves the job's count, which the stop waits for, before its object is signalled.
+    wait_until_gone(helper);
     let outcome = running.finish();
     assert_eq!(outcome.code, Some(124), "{outcome:?}");
 }

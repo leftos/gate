@@ -397,7 +397,7 @@ The file name `<name>` is `gate-slot-<i>`, `gate-light-slot-<i>`, `gate-remote-s
 
 A claim is live while its `pid` runs with that `processStart` (L2), the start compared in whole milliseconds. A killed gate leaves its file; the next holder overwrites it and readers treat it as stale. A gate that cannot write its claim says so once and runs on (L1).
 
-The liveness rule is the same for claims and [tickets](#ticket). A pid with no running process, or one that has exited, is dead. A pid the checking gate may not query is dead too, since it is another user's process reusing a dead gate's pid. Any other failure to check counts as live, said once per path, since a gate deletes nothing it cannot judge. A gate never judges its own ticket or claim (same pid and start).
+The liveness rule is the same for claims and [tickets](#ticket). A pid with no running process, or one that has exited, is dead; exited is judged by a zero-time wait on the process, never by its exit code, since a gate whose command exited 259 (`STILL_ACTIVE`) passes that code through. Only a process that refuses the wait's `SYNCHRONIZE` right while granting the query right is judged by its exit code (none does on a standard machine, elevated gates included). A pid the checking gate may not query is dead too, since it is another user's process reusing a dead gate's pid. Any other failure to check counts as live, said once per path, since a gate deletes nothing it cannot judge. A gate never judges its own ticket or claim (same pid and start).
 
 ### Ticket
 
