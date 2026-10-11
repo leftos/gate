@@ -4,13 +4,14 @@
 
 ## Local gate
 
-- [/] GATE-9 Local cutover: drain and switch to gate.exe, bridging routed runs to remote.ps1
+- [!] GATE-9 Local cutover: drain and switch to gate.exe, bridging routed runs to remote.ps1
+- [/] GATE-119 Watchdog: a late sample's interval is shorter than the system times it reads
 
 ## Remote
 
 - [ ] GATE-10 Port the remote client and box wrapper, then the remote cutover
   - [/] GATE-43 Remote slice 2: remote client (snapshot, push, run, sync-back)
-  - [ ] GATE-44 Remote slice 3: bring a routed run's outputs back
+  - [/] GATE-44 Remote slice 3: bring a routed run's outputs back
   - [ ] GATE-45 Remote slice 4: health refusals, fallback journalling and remote claims
   - [ ] GATE-109 Remote: carry every verb of a routed run over one ssh connection (gate box serve)
   - [ ] GATE-115 Remote client: never retry or refuse on the command's own output
@@ -46,11 +47,5 @@
 - [ ] GATE-99 Bind a slot marker to a real parent gate's job before covering
 - [ ] GATE-100 Forward the box's git stderr under the output lock
 - [ ] GATE-101 A covered gate outlives its parent's slot
-- [ ] GATE-102 Give no slot marker when a gate cannot read its own start
 - [ ] GATE-106 Take the 5 s ceiling out of the suite's held-log launch case
 - [ ] GATE-107 Make the sync-back git-failure case independent of a held bare repository
-
-## No project
-
-- [ ] GATE-117 A gate that cannot read its own start writes a ticket other gates sweep as dead
-- [ ] GATE-118 Watchdog: a descheduled watcher counts its own delay as the command's quiet time
