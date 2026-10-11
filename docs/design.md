@@ -755,7 +755,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
   A client that runs the command to its end hands back its status, which the gate passes through, and the run releases the slot with the remote tag. On `full` (no slot within the wait), a refusal (status 75 with a reason) or a client that cannot start, it journals `fallback` while still holding the remote slot (none was taken on `full`), deletes the claim, lets the slot go, and runs here, taking a heavy slot with its first arrival kept in the ticket.
 
   The attempt's lines stay in the log once, as notes: the client's own bytes in the log are removed, and the local run writes its log afresh.
-- **The remote client** (GATE-43) is built in parts. The seam a routed run calls is `RemoteClient` in `crates/gate/src/remote/mod.rs` (the call, the outcome, the scripted client); part A, the snapshot, and part B1, the transport, the routed lock, the preflight, the push and the run call, and part B2, the sync-back, and part C1, the watchdog, the stop, Ctrl+C, the sync-back's deadlines and the output cap, are built and dormant. The rest of part C is planned, not built.
+- **The remote client** (GATE-43) is built in parts. The seam a routed run calls is `RemoteClient` in `crates/gate/src/remote/mod.rs` (the call, the outcome, the scripted client); part A, the snapshot, and part B1, the transport, the routed lock, the preflight, the push and the run call, and part B2, the sync-back, part C1, the watchdog, the stop, Ctrl+C, the sync-back's deadlines and the output cap, and part C2, the lost connection and the reboot, are built and dormant.
 
   The snapshot copies the real index to `<git path>/gate-remote-<pid>.index` (a leftover copy and its `.index.lock` are removed first; the copy is empty when the repo has no index). With `GIT_INDEX_FILE` on the copy it runs `git add -A`, `git write-tree` and `git commit-tree --no-gpg-sign` with no parent, under the identity `gate-remote <gate-remote@localhost>` and with `GIT_AUTHOR_DATE` and `GIT_COMMITTER_DATE` removed.
 
@@ -768,7 +768,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
   Only `gate run --test-remote-snapshot` and `--test-remote-transport` reach the client. The first makes the snapshot, says `gate: remote snapshot <sha> bridge <sha or none>` on stderr and in the log, and ends with status 0. A snapshot that fails says `gate: the remote run failed: git <args> failed in <root> (status <n>): <git's lines joined by ' | '>` and ends with status 1, with no fallback.
 
   Ctrl+C ends it with `STATUS_CONTROL_C_EXIT` and no line. A log that cannot be written gives status 1, with no fallback.
-- **The remote client's run** (GATE-43, parts B1, B2 and C1) is built in `remote/{client,payload,retry,syncback,transport,watchdog}.rs` and dormant: a production gate runs the bridge instead. Only a build with the `test-seams` feature has it, chosen by `gate run --test-remote-transport local:<folder>`, which stands in for the builder with a local folder.
+- **The remote client's run** (GATE-43, parts B1, B2, C1 and C2) is built in `remote/{client,payload,retry,syncback,transport,watchdog}.rs` and dormant: a production gate runs the bridge instead. Only a build with the `test-seams` feature has it, chosen by `gate run --test-remote-transport local:<folder>`, which stands in for the builder with a local folder.
 
   The phases run in this order. Any `gate: the remote run failed` line ends the run with status 1 and no fallback; Ctrl+C at any point after the snapshot ends the run as an interrupt.
   - **Lock.** The run takes the routed lock, `Local\gate-[<root hash>-]routed-<16 hex>` ([Kernel object names](#kernel-object-names)), before the remote slot, with a zero wait, and holds it for the whole remote attempt.
@@ -809,6 +809,17 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
   **The stop** is a `stop` call to the builder's `gate box`, made after a kill and after a Ctrl+C that ended a call that may have started the command. It is bounded to 30 s, is retried once after a pre-banner failure while 5 s of the bound would be left, and runs on a hidden console of its own (`CREATE_NO_WINDOW`), so a second Ctrl+C cannot end it.
 
   The stop says `gate: stopping the command on <host> did not finish in <n> s` or `gate: stopping the command on <host> failed (status <n>)`; the run ends the same either way.
+
+  **A lost connection** is any exit 255 of the run call that is not a pre-banner failure (`End::Lost`); a command that itself exits 255 is treated the same, as the PowerShell wrapper does. Nothing is synced back. The client always sends the `stop` first, and a Ctrl+C by the end of the stop says the lost line below and ends with the Ctrl+C status, with no boot call.
+
+  Then, only when the preflight gave a boot time (`gate: remote boot <time>`), it makes a bounded `boot` call (`gate box boot`): the same 30 s bound and pre-banner retry rule as the stop. The outcome:
+  - Both boot values parse as timestamps and the new one is more than 30 s later: `gate: <host> restarted during the run (booted <time>); the run did not finish there`, and the run falls back `rebooted`.
+  - The boot call gives no value, or either value is no timestamp: `gate: <host> unreachable after the connection was lost; the run did not finish there`, and the run falls back `unreachable`.
+  - Otherwise (the same boot, an earlier boot, exactly 30 s later, or no boot time at the preflight): `gate: lost the connection to <host>` and the run ends with status 255.
+
+  A boot call that fails says `gate: asking <host> for its boot time did not finish in <n> s`, `gate: asking <host> for its boot time failed (status <n>)` or `gate: asking <host> for its boot time failed: <why>`, and counts as giving no value.
+
+  On a fallback after a loss, the run call's output lines are dropped from what the local rerun's marker scan reads. Unlike the PowerShell wrapper, the stop always comes first (it skips the stop on a restart), and a restart needs a later, parseable boot time (it compares unparsable values as strings and takes any difference over 30 s).
 
   **Ctrl+C** ends the call it interrupts and the run as an interrupt. A Ctrl+C whose kill of the call fails stays an interrupt and still sends the stop.
 
@@ -1121,7 +1132,7 @@ A Rust integration suite drives the built `gate.exe` through its CLI and reads o
 
   `--test-remote-ssh <exe>` replaces ssh with a program (the test bin `fake-ssh`) and `--test-remote-retry-pause-ms <n>` (whole milliseconds above 0) replaces the 2 s pause before the pre-banner retry; both need the transport, and `--test-remote-snapshot` cannot be given with it. `--test-print-request` shows them as `testSeams.remoteTransport`, `testSeams.remoteSsh` and `testSeams.remoteRetryPauseMs`, after `remoteSnapshot`.
 
-  `--test-remote-bound-ms <n>` (whole milliseconds above 0) replaces the 30 s bound of the client's `stop` call. `--test-remote-interrupt-at <preflight|run>` makes the client raise the console interrupt itself after that call's first output byte. `--test-remote-timeout-ms <n>` (whole milliseconds above 0) replaces the run's ceiling for the client.
+  `--test-remote-bound-ms <n>` (whole milliseconds above 0) replaces the 30 s bound of the client's `stop` and `boot` calls. `--test-remote-interrupt-at <preflight|run>` makes the client raise the console interrupt itself after that call's first output byte. `--test-remote-timeout-ms <n>` (whole milliseconds above 0) replaces the run's ceiling for the client.
 
   `--test-remote-watch-call <preflight|push|run|ls-remote|fetch>` makes `--test-stall-ms` and `--test-remote-timeout-ms` apply to that one call alone, its ceiling counted from the call's own start, every other call keeping the run's own window and ceiling. With `ls-remote`, `--test-remote-timeout-ms` is that call's deadline and `--test-stall-ms` alone leaves it on the git limit. With `fetch`, the stall and ceiling seams apply to the fetch alone.
 
@@ -1149,7 +1160,7 @@ A Rust integration suite drives the built `gate.exe` through its CLI and reads o
 
   It is copied under the names the gate classifies (`VBCSCompiler.exe`, `dotnet.exe`, `MSBuild.exe`).
 
-  A second helper, `fake-ssh`, stands in for ssh in the remote client's cases (`--test-remote-ssh`). Its steps are `ok`, `hold`, `version`, `exit`, `fail-banner`, `fail-other`, `out-then-drop`, `flood <n>`, `say-hold <word> <path>` and `progress-ok <n>`.
+  A second helper, `fake-ssh`, stands in for ssh in the remote client's cases (`--test-remote-ssh`). Its steps are `ok`, `hold`, `version`, `boot <time>` (as `version`, for the box's boot line), `no-boot` (drops the box's boot line), `drop` (exits 255 at once, writing nothing), `exit`, `fail-banner`, `fail-other`, `out-then-drop`, `flood <n>`, `say-hold <word> <path>` and `progress-ok <n>`.
 
   It spawns children, burns CPU, prints its argv, writes output or sleeps on command, so build-server, orphan and kill-tree cases need no real toolchain.
 - **No fixture from the checkout path.** No routing pattern, expected path or assertion is derived from where the repo is checked out; a case builds its own repository and routing file in its root. `checkout::repo_file` is the one route to a checked-in file (the install script), never for a path or pattern a case asserts on.

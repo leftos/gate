@@ -8,7 +8,9 @@
 //! `ok` runs `<gate> box <verb> <payload>` with the gate the variable `GATE_FAKE_SSH_GATE` names, or `git
 //! upload-pack <path>` or `git receive-pack <path>`, its standard streams this process's, and exits with its status;
 //! `hold <path>` waits until the path exists, then does as `ok`; `version <v>` does as `ok` with the gate's standard
-//! output read, its `gate: remote version` line said as `gate: remote version <v>`; `fail-banner` writes ssh's
+//! output read, its `gate: remote version` line said as `gate: remote version <v>`; `boot <time>` does the same with
+//! its `gate: remote boot` line, said as `gate: remote boot <time>`, and `no-boot` with that line dropped;
+//! `drop` exits 255 with nothing written, as a connection lost after the banner; `fail-banner` writes ssh's
 //! `Connection timed out during banner exchange` on standard error and exits 255; `fail-other` writes another first line
 //! there and exits 255; `out-then-drop` writes a line on standard output and exits 255; `exit <n>` runs nothing and
 //! exits `<n>`, as cmd's 9009 for a program it cannot find; `say-exit <n> <line>` runs nothing, writes the line on
@@ -32,6 +34,7 @@ const SSH_FAILED: i32 = 255;
 const HOLD_STEP: Duration = Duration::from_millis(20);
 const HOLD_LIMIT: Duration = Duration::from_secs(600);
 const VERSION: &str = "gate: remote version ";
+const BOOT: &str = "gate: remote boot ";
 /// The git services git's own ssh runs, each with the repository's path in single quotes after its name.
 const GIT_SERVICES: [&str; 2] = ["git-upload-pack", "git-receive-pack"];
 
@@ -58,7 +61,8 @@ fn run() -> Result<i32, String> {
             hold(Path::new(path))?;
             call.ok()
         }
-        Some(("version", version)) => call.with_version(version),
+        Some(("version", version)) => call.rewritten(VERSION, Some(version)),
+        Some(("boot", time)) => call.rewritten(BOOT, Some(time)),
         Some(("exit", status)) => status.parse().map_err(|_| format!("the step '{step}' names no status")),
         Some(("say-exit", rest)) => say_exit(&step, rest),
         Some(("flood", bytes)) => flood(&step, bytes),
@@ -120,6 +124,8 @@ fn say_exit(step: &str, rest: &str) -> Result<i32, String> {
 fn bare_step(step: &str, call: &BoxCall<'_>) -> Result<i32, String> {
     match step {
         "ok" => call.ok(),
+        "no-boot" => call.rewritten(BOOT, None),
+        "drop" => Ok(SSH_FAILED),
         "fail-banner" => said(&mut io::stderr().lock(), "Connection timed out during banner exchange"),
         "fail-other" => said(&mut io::stderr().lock(), "ssh: connect to host builder port 22: Connection refused"),
         "out-then-drop" => said(&mut io::stdout().lock(), "fake-ssh: a line before the connection dropped"),
@@ -207,8 +213,10 @@ impl<'a> BoxCall<'a> {
         status.code().ok_or_else(|| "the gate ended with no status".to_owned())
     }
 
-    /// Runs the call with its standard output read, its version line said with `version`; its status.
-    fn with_version(&self, version: &str) -> Result<i32, String> {
+    /// Runs the call with its standard output read, each line that starts with `prefix` said as `prefix` and `value`,
+    /// or dropped when there is no value; with a value and no such line, `prefix` and `value` are said once at the end,
+    /// so a step does not depend on this machine's own reading of what the line says. Its status.
+    fn rewritten(&self, prefix: &str, value: Option<&str>) -> Result<i32, String> {
         let mut child = self
             .command()?
             .stdout(Stdio::piped())
@@ -216,14 +224,21 @@ impl<'a> BoxCall<'a> {
             .map_err(|error| format!("cannot run the gate: {error}"))?;
         let stdout = child.stdout.take().ok_or("the gate has no output pipe")?;
         let mut out = io::stdout().lock();
+        let mut seen = false;
         for line in BufReader::new(stdout).lines() {
             let line = line.map_err(|error| format!("cannot read the gate: {error}"))?;
-            let said = if line.starts_with(VERSION) {
-                format!("{VERSION}{version}")
-            } else {
-                line
+            let said = match value {
+                _ if !line.starts_with(prefix) => line,
+                Some(value) => {
+                    seen = true;
+                    format!("{prefix}{value}")
+                }
+                None => continue,
             };
             writeln!(out, "{said}").map_err(|error| format!("cannot write: {error}"))?;
+        }
+        if let Some(value) = value.filter(|_| !seen) {
+            writeln!(out, "{prefix}{value}").map_err(|error| format!("cannot write: {error}"))?;
         }
         let status = child.wait().map_err(|error| format!("cannot wait for the gate: {error}"))?;
         status.code().ok_or_else(|| "the gate ended with no status".to_owned())

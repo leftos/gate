@@ -7,13 +7,18 @@
 //! let run. The preflight, the push and the run call run under the run's watchdog, whose clock starts with the
 //! attempt: a call that sends nothing for the stall window, or outlives the run's ceiling, is killed. A kill before the
 //! run call falls back `unreachable`, as the command never started; a kill of the run call stops the command and ends
-//! the run 124. No call holds more than 64 KiB of a line in memory: a longer one ends any call but the run call, whose
-//! output is passed on whole. The run takes the work-folder key's lock, [`hold_key`], before its remote slot, so a
-//! second routed run of one worktree falls back `busy` at once.
+//! the run 124. A run call that exits 255 other than a failure before the banner lost its connection: nothing is synced
+//! back and the command is stopped; then, when the preflight said the builder's boot time, the builder is asked for it
+//! again. One that booted more than 30 s later restarted, and the run falls back `rebooted`; one that gives no boot
+//! time, or when either value is no timestamp, falls back `unreachable`; else the run ends 255. No call holds more than
+//! 64 KiB of a line in memory: a longer one ends any call but the run call, whose output is passed on whole. The run
+//! takes the work-folder key's lock, [`hold_key`], before its remote slot, so a second routed run of one worktree falls
+//! back `busy` at once.
 
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
+use std::ops::Range;
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -29,6 +34,7 @@ use gate_win32::{
     AcquireError, EnvironmentBlock, Interrupt, Job, NamedMutex, OwnedMutexGuard, PipedConsole, PipedLaunch, PipedSuspended, Running,
     same_variable_name,
 };
+use jiff::{SignedDuration, Timestamp};
 use regex::Regex;
 
 use super::git::{self, Git, GitError, last_update};
@@ -53,6 +59,10 @@ const HEARTBEAT: &str = "gate-remote-heartbeat: ";
 /// The preflight's lines the client reads.
 const VERSION: &str = "gate: remote version ";
 const CREATED: &str = "gate: remote created ";
+/// The builder's boot time, which the preflight and the `boot` call say.
+const BOOT: &str = "gate: remote boot ";
+/// How far apart two boot times of one builder may be and still be one boot.
+const BOOT_SLACK: SignedDuration = SignedDuration::from_secs(30);
 /// This gate's version, which the builder's must be.
 const OURS: &str = env!("CARGO_PKG_VERSION");
 /// The status of a call the client killed, and of a run whose run call the watchdog killed.
@@ -72,7 +82,7 @@ pub(crate) struct RustClient {
     limit: Duration,
     /// The pause before a retry.
     pause: Duration,
-    /// How long the `stop` call may take.
+    /// How long a bounded call, the `stop` or the `boot`, may take.
     bound: Duration,
     /// `--test-stall-ms`: the stall window, given as it is, with no floor.
     stall_ms: Option<u64>,
@@ -173,10 +183,21 @@ pub(super) enum End {
     Interrupted,
     /// The watchdog killed the run call, and the command was stopped: status 124.
     Killed,
+    /// The run call's connection was lost: it exited 255, ssh's own failure status, other than before the banner. The
+    /// run call returns it before anything is stopped, with where the run call's own lines are among the attempt's, so
+    /// a fallback can leave them out. Nothing is synced back: status 255.
+    Lost(Range<usize>),
+}
+
+/// What the preflight found: whether it created the bare repository just now, and the builder's boot time, `None`
+/// when it said none.
+struct Prepared {
+    created: bool,
+    boot: Option<String>,
 }
 
 /// The run's clock, which starts with the attempt, and the limits the client's calls are watched by: the stall window,
-/// the ceiling, and the bound of the `stop` call.
+/// the ceiling, and the bound of the bounded calls, the `stop` and the `boot`.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Limits {
     started: Instant,
@@ -205,7 +226,8 @@ pub(super) enum Watch {
     Fetch(Limits),
     /// Killed once it ran for this long.
     Deadline(Duration),
-    /// As [`Watch::Deadline`], but a Ctrl+C does not end it: the `stop` made after one.
+    /// As [`Watch::Deadline`], but a Ctrl+C does not end it: the bounded calls, the `stop`, made after one, and the
+    /// `boot`.
     Bounded(Duration),
 }
 
@@ -235,7 +257,7 @@ impl Watch {
         }
     }
 
-    /// Whether a Ctrl+C ends the call: every call's but the bounded `stop`'s.
+    /// Whether a Ctrl+C ends the call: every call's but a bounded one's.
     fn interruptible(self) -> bool {
         !matches!(self, Watch::Bounded(_))
     }
@@ -309,13 +331,14 @@ impl Attempt<'_, '_> {
             snapshot: &snapshot.commit,
         };
         let run_line = payload::capped("run", payload::line("run", &payload::run_word(&location, &run))).map_err(End::Failed)?;
-        let created = self.preflight(&location)?;
-        self.push(&snapshot, created)?;
+        let prepared = self.preflight(&location)?;
+        self.push(&snapshot, prepared.created)?;
         let end = self.run_call(&run_line, &location)?;
         // The sync-back runs after a run call that ended with the command's own status; a refusal, an interrupt, a
-        // kill or a failed call ended the attempt before it, so a box refusal's 75 never syncs back.
+        // kill, a lost connection or a failed call ended the attempt before it, so a box refusal's 75 never syncs back.
         match end {
             End::Status(status) => syncback::sync_back(self, &snapshot, status),
+            End::Lost(output) => Ok(self.connection_lost(&location, prepared.boot.as_deref(), output)),
             end => Ok(end),
         }
     }
@@ -338,9 +361,9 @@ impl Attempt<'_, '_> {
     }
 
     /// The preflight: readies the work folder, and checks the builder runs this gate's version. Whether it created the
-    /// bare repository just now. A builder with no `gate box` that takes the run is not routed, as one of another
-    /// version is not.
-    fn preflight(&mut self, location: &Location) -> Result<bool, End> {
+    /// bare repository just now, and the builder's boot time. A builder with no `gate box` that takes the run is not
+    /// routed, as one of another version is not.
+    fn preflight(&mut self, location: &Location) -> Result<Prepared, End> {
         self.go_on()?;
         let line = payload::capped("preflight", payload::line("preflight", &payload::location_word(location))).map_err(End::Failed)?;
         let watch = Watch::Run(self.limits_for("preflight"));
@@ -348,6 +371,7 @@ impl Attempt<'_, '_> {
         let (mut called, _) = self.with_retry(SSH_FAILED, |attempt| attempt.ssh(&line, Echo::LogOnly, watch, raise))?;
         let theirs = their_version(&called.lines).map(str::to_owned);
         let created = called.lines.iter().any(|line| line.starts_with(CREATED));
+        let boot = boot_time(&called.lines).map(str::to_owned);
         self.lines.append(&mut called.lines);
         self.not_started_if_killed("the preflight", &called)?;
         let host = self.call.host;
@@ -373,7 +397,7 @@ impl Attempt<'_, '_> {
             self.say(line);
             return Err(End::Refused(FallbackReason::Version));
         }
-        Ok(created)
+        Ok(Prepared { created, boot })
     }
 
     /// Pushes the snapshot, and its bridge unless the bare repository was `created` just now, with no hooks and no
@@ -453,8 +477,9 @@ impl Attempt<'_, '_> {
     }
 
     /// The run call to the builder at `location`: the command's own status; `unreachable` when it failed before the
-    /// banner twice, as the command never started; a refusal when its 75 comes with the box's own refusal line. A
-    /// watchdog kill says its line, stops the command and ends the run killed; a Ctrl+C stops the command too.
+    /// banner twice, as the command never started; a refusal when its 75 comes with the box's own refusal line; a lost
+    /// connection when it exited 255 otherwise. A watchdog kill says its line, stops the command and ends the run
+    /// killed; a Ctrl+C stops the command too.
     fn run_call(&mut self, line: &str, location: &Location) -> Result<End, End> {
         self.go_on()?;
         let limits = self.limits_for("run");
@@ -482,7 +507,9 @@ impl Attempt<'_, '_> {
             Err(end) => return Err(end),
         };
         let reason = refusal(self.call.key, &called.lines);
+        let kept = self.lines.len();
         self.lines.append(&mut called.lines);
+        let output = kept..self.lines.len();
         if let Some(Cut::Watchdog(kill)) = called.cut {
             self.say(watchdog::kill_line(kill, limits.stall, limits.ceiling));
             self.noted(&called);
@@ -495,6 +522,9 @@ impl Attempt<'_, '_> {
         if self.go_on().is_err() {
             self.stop(location);
             return Err(End::Interrupted);
+        }
+        if called.status == SSH_FAILED {
+            return Ok(End::Lost(output));
         }
         let status = i64::from(called.status);
         match reason {
@@ -521,16 +551,72 @@ impl Attempt<'_, '_> {
         Ok((second, again))
     }
 
-    /// Stops the command the run call started on the builder at `location`, with the `stop` call, which the bound
-    /// limits and a Ctrl+C does not end; it is made once more after a failure before the banner while 5 s of the bound
-    /// would be left. Says when it did not finish or failed; the run's end is the caller's either way.
-    fn stop(&mut self, location: &Location) {
+    /// After the run call's connection to the builder at `location` was lost: stops the command, then, when the
+    /// preflight said the builder's boot time, `before`, asks for it again, as [`after_loss`] reads the two. A restart
+    /// falls back `rebooted`, and no boot time to compare by `unreachable`; either leaves the run call's own lines,
+    /// `output` among the attempt's, out of the run that falls back. Else the connection was lost, and a Ctrl+C that
+    /// came meanwhile ends the run as an interrupt; one that came by the end of the stop ends it there, with no boot
+    /// call.
+    fn connection_lost(&mut self, location: &Location, before: Option<&str>, output: Range<usize>) -> End {
         let host = self.call.host;
-        let line = match payload::capped("stop", payload::line("stop", &payload::location_word(location))) {
+        self.stop(location);
+        if self.go_on().is_err() {
+            self.say(format!("gate: lost the connection to {host}"));
+            return End::Interrupted;
+        }
+        let now = before.and_then(|_| self.boot_now(location));
+        match after_loss(before, now.as_deref()) {
+            Loss::Lost => {
+                self.say(format!("gate: lost the connection to {host}"));
+                if self.go_on().is_err() { End::Interrupted } else { End::Lost(output) }
+            }
+            Loss::Restarted(booted) => {
+                let shown = escaped(first_bytes(booted, git::FAILURE_BYTES));
+                let line = format!("gate: {host} restarted during the run (booted {shown}); the run did not finish there");
+                self.falls_back_after_loss(output, line, FallbackReason::Rebooted)
+            }
+            Loss::Unreachable => {
+                let line = format!("gate: {host} unreachable after the connection was lost; the run did not finish there");
+                self.falls_back_after_loss(output, line, FallbackReason::Unreachable)
+            }
+        }
+    }
+
+    /// Falls back for `reason` after a lost connection, saying `line`: the run call's own lines, `output` among the
+    /// attempt's, are left out, so the run that falls back reads none of the builder's output as its own.
+    fn falls_back_after_loss(&mut self, output: Range<usize>, line: String, reason: FallbackReason) -> End {
+        self.lines.drain(output);
+        self.say(line);
+        End::Refused(reason)
+    }
+
+    /// The builder's boot time now, from the `boot` call to `location`, a bounded call; `None` when the call failed,
+    /// did not finish or said none.
+    fn boot_now(&mut self, location: &Location) -> Option<String> {
+        let what = format!("asking {} for its boot time", self.call.host);
+        let called = self.bounded("boot", location, &what)?;
+        (called.status == 0 && called.cut.is_none())
+            .then(|| boot_time(&called.lines).map(str::to_owned))
+            .flatten()
+    }
+
+    /// Stops the command the run call started on the builder at `location`, with the `stop` call, a bounded call; the
+    /// run's end is the caller's however it went.
+    fn stop(&mut self, location: &Location) {
+        let what = format!("stopping the command on {}", self.call.host);
+        self.bounded("stop", location, &what);
+    }
+
+    /// The bounded call `verb` to the builder at `location`, which the bound limits and a Ctrl+C does not end; it is
+    /// made once more after a failure before the banner while 5 s of the bound would be left. Keeps the lines of the
+    /// call that counts, says when it did not finish or failed, `what` it does named, and gives it back; `None` when it
+    /// could not be made.
+    fn bounded(&mut self, verb: &str, location: &Location, what: &str) -> Option<Called> {
+        let line = match payload::capped(verb, payload::line(verb, &payload::location_word(location))) {
             Ok(line) => line,
             Err(why) => {
-                self.say(format!("gate: stopping the command on {host} failed: {why}"));
-                return;
+                self.say(format!("gate: {what} failed: {why}"));
+                return None;
             }
         };
         let bound = self.limits.bound;
@@ -541,20 +627,27 @@ impl Attempt<'_, '_> {
             if let Ok(first) = &mut made {
                 self.lines.append(&mut first.lines);
             }
-            self.say(retry::retry_line(host));
+            self.say(retry::retry_line(self.call.host));
             thread::sleep(self.pause);
             made = self.ssh(&line, Echo::LogOnly, Watch::Bounded(bound.saturating_sub(begun.elapsed())), false);
         }
         match made {
-            Ok(mut called) => {
-                self.lines.append(&mut called.lines);
-                if let Some(said) = stop_line(host, &called, bound) {
+            Ok(called) => {
+                self.lines.extend_from_slice(&called.lines);
+                if let Some(said) = bounded_line(what, &called, bound) {
                     self.say(said);
                 }
                 self.noted(&called);
+                Some(called)
             }
-            Err(End::Failed(why)) => self.say(format!("gate: stopping the command on {host} failed: {why}")),
-            Err(end) => self.say(format!("gate: stopping the command on {host} failed: {end:?}")),
+            Err(End::Failed(why)) => {
+                self.say(format!("gate: {what} failed: {why}"));
+                None
+            }
+            Err(end) => {
+                self.say(format!("gate: {what} failed: {end:?}"));
+                None
+            }
         }
     }
 
@@ -666,6 +759,7 @@ impl Attempt<'_, '_> {
             End::Refused(reason) => (REFUSED, Some(reason)),
             End::Interrupted => (i64::from(CONTROL_C_EXIT.cast_signed()), None),
             End::Killed => (i64::from(KILLED), None),
+            End::Lost(_) => (i64::from(SSH_FAILED), None),
             End::Failed(why) => {
                 self.say(format!("{FAILED_RUN}: {why}"));
                 (FAILED, None)
@@ -706,7 +800,7 @@ impl<'c, 'a> Attempt<'c, 'a> {
 
 #[cfg(test)]
 impl Limits {
-    /// Limits no test reaches, the stop's bound aside: an hour for the stall window and the ceiling.
+    /// Limits no test reaches, the bounded calls' bound aside: an hour for the stall window and the ceiling.
     fn for_tests() -> Limits {
         Limits {
             started: Instant::now(),
@@ -870,8 +964,8 @@ fn call_job(breakaway: bool) -> io::Result<Job> {
 }
 
 /// The console a call watched as `watch` is created on: this process's, whose Ctrl+C reaches it too, for every call a
-/// Ctrl+C ends; a hidden one of its own for the bounded `stop`, so that a second Ctrl+C cannot end it. ssh in batch
-/// mode reads nothing from a console.
+/// Ctrl+C ends; a hidden one of its own for a bounded call, the `stop` or the `boot`, so that a second Ctrl+C cannot
+/// end it. ssh in batch mode reads nothing from a console.
 fn console_of(watch: Watch) -> PipedConsole {
     if watch.interruptible() {
         PipedConsole::Attached
@@ -911,16 +1005,13 @@ fn environment_of(command: &Command) -> Vec<(OsString, OsString)> {
     variables
 }
 
-/// What a `stop` call to `host` that ended as `called`, limited by `bound`, says: nothing when it stopped the command.
-fn stop_line(host: &str, called: &Called, bound: Duration) -> Option<String> {
+/// What a bounded call, `what` it does, that ended as `called`, limited by `bound`, says: nothing when it exited 0.
+fn bounded_line(what: &str, called: &Called, bound: Duration) -> Option<String> {
     match (called.cut, called.status) {
-        (Some(Cut::Late(_)), _) => Some(format!(
-            "gate: stopping the command on {host} did not finish in {} s",
-            watchdog::whole_seconds(bound)
-        )),
-        (Some(cut), _) => Some(format!("gate: stopping the command on {host} failed: {}", cut.reason("it"))),
+        (Some(Cut::Late(_)), _) => Some(format!("gate: {what} did not finish in {} s", watchdog::whole_seconds(bound))),
+        (Some(cut), _) => Some(format!("gate: {what} failed: {}", cut.reason("it"))),
         (None, 0) => None,
-        (None, status) => Some(format!("gate: stopping the command on {host} failed (status {status})")),
+        (None, status) => Some(format!("gate: {what} failed (status {status})")),
     }
 }
 
@@ -1273,6 +1364,44 @@ fn their_version(lines: &[String]) -> Option<&str> {
     lines.iter().rev().find_map(|line| line.strip_prefix(VERSION)).map(str::trim)
 }
 
+/// The builder's boot time, from the last `gate: remote boot <time>` line of a preflight or a `boot` call; `None` when
+/// it said none, or one with no time. A time that is no timestamp is kept as it is, for [`after_loss`] to refuse.
+fn boot_time(lines: &[String]) -> Option<&str> {
+    lines
+        .iter()
+        .rev()
+        .find_map(|line| line.strip_prefix(BOOT))
+        .map(str::trim)
+        .filter(|time| !time.is_empty())
+}
+
+/// What a lost connection turned out to be.
+#[derive(Debug, PartialEq, Eq)]
+enum Loss<'n> {
+    /// The builder runs the same boot, or its boot time is unknown: only the connection was lost.
+    Lost,
+    /// The builder booted again, at this time.
+    Restarted(&'n str),
+    /// The builder gave no boot time to compare by.
+    Unreachable,
+}
+
+/// What a lost connection was, from the builder's boot time its preflight said, `before`, and the one it gave after
+/// the loss, `now`: a restart when both are timestamps and `now` is more than 30 s later, the slack the box's reading
+/// of its boot time needs; no answer when it gave none, or either is no timestamp; else, and with no time `before`, a
+/// lost connection. An earlier boot is no restart: a clock that stepped back is not one.
+fn after_loss<'n>(before: Option<&str>, now: Option<&'n str>) -> Loss<'n> {
+    match (before, now) {
+        (None, _) => Loss::Lost,
+        (Some(_), None) => Loss::Unreachable,
+        (Some(before), Some(now)) => match (before.parse::<Timestamp>(), now.parse::<Timestamp>()) {
+            (Ok(was), Ok(is)) if is.duration_since(was) > BOOT_SLACK => Loss::Restarted(now),
+            (Ok(_), Ok(_)) => Loss::Lost,
+            _ => Loss::Unreachable,
+        },
+    }
+}
+
 /// The line refusing a builder `host` whose version, `theirs`, is not `ours`; `None` when they are the same. A
 /// builder that said no version runs one unknown; one that did is shown by its first 4 KiB, escaped.
 fn version_refusal(host: &str, theirs: Option<&str>, ours: &str) -> Option<String> {
@@ -1344,8 +1473,9 @@ mod tests {
     use gate_win32::{Interrupt, PipedConsole};
 
     use super::{
-        Attempt, CallEnd, Called, Cut, Echo, End, GIT_SSH_FAILED, Heard, LINE_CAP, Limits, Reader, Reading, SSH_FAILED, Shared, Unfinished, Watch,
-        called_of, console_of, held, is_heartbeat, last_update, paused, push_size, refusal, relay, seconds, their_version, version_refusal,
+        Attempt, CallEnd, Called, Cut, Echo, End, GIT_SSH_FAILED, Heard, LINE_CAP, Limits, Loss, Reader, Reading, SSH_FAILED, Shared, Unfinished,
+        Watch, after_loss, boot_time, called_of, console_of, held, is_heartbeat, last_update, paused, push_size, refusal, relay, seconds,
+        their_version, version_refusal,
     };
     use crate::remote::git::GIT_LIMIT;
     use crate::remote::payload::Location;
@@ -1769,6 +1899,142 @@ mod tests {
         assert_eq!(
             version_refusal("builder", None, "0.1.0"),
             Some("gate: not routed: builder runs gate unknown, this PC 0.1.0".to_owned())
+        );
+    }
+
+    #[test]
+    fn the_boot_time_is_the_preflight_s_last_boot_line() {
+        let preflight = lines(&["gate: remote version 0.1.0", "gate: remote boot 2026-10-10T08:00:00.0000000Z"]);
+        assert_eq!(boot_time(&preflight), Some("2026-10-10T08:00:00.0000000Z"));
+        assert_eq!(boot_time(&lines(&["gate: remote version 0.1.0"])), None, "no boot line");
+        assert_eq!(
+            boot_time(&lines(&["gate: remote could not read the boot time: access denied"])),
+            None,
+            "the box could not read it"
+        );
+        assert_eq!(boot_time(&lines(&["gate: remote boot "])), None, "a boot line with no time");
+        assert_eq!(boot_time(&lines(&["gate: remote boot  \t"])), None, "a boot line with only spaces");
+        assert_eq!(
+            boot_time(&lines(&["gate: remote boot last tuesday"])),
+            Some("last tuesday"),
+            "a time that is no timestamp is kept, to be compared as text"
+        );
+    }
+
+    const BOOTED: &str = "2026-10-10T08:00:00.0000000Z";
+
+    #[test]
+    fn only_a_boot_more_than_30_s_later_is_a_restart() {
+        let first = Some(BOOTED);
+        let later = "2026-10-10T08:00:31.0000000Z";
+        assert_eq!(after_loss(first, Some(later)), Loss::Restarted(later), "31 s later is another boot");
+        assert_eq!(after_loss(first, Some(BOOTED)), Loss::Lost, "the same time");
+        assert_eq!(
+            after_loss(first, Some("2026-10-10T08:00:30.0000000Z")),
+            Loss::Lost,
+            "exactly 30 s later is the same boot"
+        );
+        assert_eq!(
+            after_loss(first, Some("2026-10-10T07:59:00.0000000Z")),
+            Loss::Lost,
+            "a minute earlier is a clock stepped back, not a restart"
+        );
+    }
+
+    #[test]
+    fn a_boot_time_that_is_no_timestamp_or_none_is_no_answer() {
+        assert_eq!(after_loss(Some(BOOTED), None), Loss::Unreachable, "no boot time now");
+        assert_eq!(
+            after_loss(Some("last tuesday"), Some("last tuesday")),
+            Loss::Unreachable,
+            "neither a timestamp"
+        );
+        assert_eq!(
+            after_loss(Some(BOOTED), Some("2026-10-10T09:00:00.0000000")),
+            Loss::Unreachable,
+            "now is no timestamp"
+        );
+        assert_eq!(
+            after_loss(Some("last tuesday"), Some(BOOTED)),
+            Loss::Unreachable,
+            "before is no timestamp"
+        );
+    }
+
+    #[test]
+    fn with_no_boot_time_at_the_preflight_only_the_connection_was_lost() {
+        assert_eq!(after_loss(None, None), Loss::Lost);
+        assert_eq!(after_loss(None, Some(BOOTED)), Loss::Lost);
+    }
+
+    #[test]
+    fn a_ctrl_c_by_the_end_of_a_lost_connection_s_stop_is_an_interrupt() {
+        let log = unwritten_log();
+        let call = call(&log);
+        let transport = nowhere();
+        let mut attempt = attempt(&call, &transport);
+
+        let ended = attempt.connection_lost(&location(), None, 0..0);
+
+        assert!(matches!(ended, End::Interrupted), "{ended:?}");
+        assert!(stopped(&attempt), "the stop is made first: {:?}", attempt.lines);
+        assert!(
+            attempt.lines.iter().any(|line| line == "gate: lost the connection to builder"),
+            "{:?}",
+            attempt.lines
+        );
+    }
+
+    #[test]
+    fn a_ctrl_c_by_the_end_of_a_lost_connection_s_stop_makes_no_boot_call() {
+        let log = unwritten_log();
+        let call = call(&log);
+        let transport = nowhere();
+        let mut attempt = attempt(&call, &transport);
+
+        let ended = attempt.connection_lost(&location(), Some(BOOTED), 0..0);
+
+        assert!(matches!(ended, End::Interrupted), "an interrupt, not a fallback: {ended:?}");
+        assert!(stopped(&attempt), "the stop is made first: {:?}", attempt.lines);
+        assert!(
+            !attempt.lines.iter().any(|line| line.contains("for its boot time")),
+            "no boot call: {:?}",
+            attempt.lines
+        );
+        assert_eq!(attempt.lines.last().map(String::as_str), Some("gate: lost the connection to builder"));
+    }
+
+    #[test]
+    fn a_fallback_after_a_lost_connection_leaves_the_run_call_s_lines_out() {
+        let log = unwritten_log();
+        // No Ctrl+C: one by the end of the stop would end the run there, with no fallback.
+        let call = RemoteCall {
+            interrupt: None,
+            ..call(&log)
+        };
+        let transport = nowhere();
+        let mut attempt = attempt(&call, &transport);
+        attempt.lines = lines(&[
+            "gate: pushed snapshot 0123abcd in 0.1 s (up to date)",
+            "error CS1002: ; expected",
+            "the command's line",
+        ]);
+
+        let ended = attempt.connection_lost(&location(), Some(BOOTED), 1..3);
+
+        assert!(matches!(ended, End::Refused(FallbackReason::Unreachable)), "{ended:?}");
+        assert_eq!(
+            attempt.lines.first().map(String::as_str),
+            Some("gate: pushed snapshot 0123abcd in 0.1 s (up to date)")
+        );
+        assert!(
+            !attempt.lines.iter().any(|line| line.contains("CS1002") || line == "the command's line"),
+            "{:?}",
+            attempt.lines
+        );
+        assert_eq!(
+            attempt.lines.last().map(String::as_str),
+            Some("gate: builder unreachable after the connection was lost; the run did not finish there")
         );
     }
 

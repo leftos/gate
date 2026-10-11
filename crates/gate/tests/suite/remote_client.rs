@@ -336,6 +336,10 @@ const CLIENT_IGNORED: &str = "state/\nappdata/\n*.log\nbuilder/\nssh/\n";
 const RETRY_LINE: &str = "gate: builder did not answer the ssh banner; trying once more";
 const BUSY_LINE: &str = "gate: remote builder busy; running here";
 const UNREACHABLE_LINE: &str = "gate: remote builder unreachable; running here";
+/// The line of a run call whose connection was lost on a builder that did not restart.
+const LOST_LINE: &str = "gate: lost the connection to builder";
+/// The boot time a case's preflight says the builder booted at.
+const BOOTED: &str = "2026-10-10T08:00:00.0000000Z";
 
 /// A case folder made a checkout of its own holding fake-tool as `tool.exe`, which its snapshot sends, with a routing
 /// file that sends its `*tool*` commands to the builder and gives the remote pool two slots. The suite enters a job
@@ -589,13 +593,16 @@ fn two_banner_drops_of_the_run_call_fall_back_unreachable() {
 #[test]
 fn a_drop_after_output_is_not_retried() {
     let case = client_case("client-drop-after-output");
-    let steps = ssh_steps(&case, "ssh", &["ok", "out-then-drop"]);
+    let booted = format!("boot {BOOTED}");
+    let steps = ssh_steps(&case, "ssh", &[&booted, "out-then-drop", "ok", &booted]);
 
-    let outcome = finish(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "out", "ran there"]));
+    let outcome = finish(lost_gate(&case, "local", &steps, &[r".\tool.exe", "out", "ran there"]));
 
     assert_eq!(outcome.code, Some(255), "{outcome:?}");
     assert!(!outcome.stderr.contains(RETRY_LINE), "{outcome:?}");
-    assert_eq!(calls(&steps), ["preflight", "run"]);
+    assert!(outcome.stderr.contains(LOST_LINE), "a lost connection: {outcome:?}");
+    assert!(!outcome.stderr.contains("gate: synced back"), "nothing is synced back: {outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "run", "stop", "boot"], "the stop, then the boot query");
     assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new());
 }
 
@@ -1312,4 +1319,182 @@ fn a_sync_back_call_that_sends_a_line_longer_than_64_kib_fails_the_run() {
             .contains("gate: the remote run failed: git ls-remote sent a line longer than 64 KiB"),
         "{outcome:?}"
     );
+}
+
+/// The bound of the `stop` and `boot` calls in a lost-connection case: 600 s, a hang guard, in place of their 30 s,
+/// which a starved run could pass.
+const HANG_GUARD_BOUND: [&str; 2] = ["--test-remote-bound-ms", "600000"];
+/// A boot time a minute after [`BOOTED`]: a builder that restarted.
+const REBOOTED: &str = "2026-10-10T08:01:00.0000000Z";
+
+/// The gate of a lost-connection case logging to `out.log`: [`client_gate_tuned`] through the transport form `kind`,
+/// its bounded calls bound by [`HANG_GUARD_BOUND`].
+fn lost_gate(case: &Case, kind: &str, steps: &Path, command: &[&str]) -> Command {
+    let tuned = Tuned {
+        kind,
+        extra: &HANG_GUARD_BOUND,
+        ..Tuned::default()
+    };
+    client_gate_tuned(case, "out.log", steps, &tuned, command)
+}
+
+/// Through `local-ssh`, so a sync-back would show as a call of the stand-in.
+#[test]
+fn a_connection_lost_mid_run_is_stopped_and_syncs_nothing_back() {
+    let case = client_case("client-lost");
+    let booted = format!("boot {BOOTED}");
+    let steps = ssh_steps(&case, "ssh", &[&booted, "ok", "drop", "ok", &booted]);
+
+    let outcome = finish(lost_gate(&case, "local-ssh", &steps, &[r".\tool.exe", "out", "ran there"]));
+
+    assert_eq!(outcome.code, Some(255), "{outcome:?}");
+    assert!(outcome.stderr.contains(LOST_LINE), "{outcome:?}");
+    assert!(!outcome.stderr.contains("gate: synced back"), "{outcome:?}");
+    assert_eq!(
+        calls(&steps),
+        ["preflight", "git-receive-pack", "run", "stop", "boot"],
+        "a stop and a boot query, and no sync-back"
+    );
+    assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new());
+}
+
+#[test]
+fn a_builder_that_restarted_is_a_rebooted_fallback() {
+    let case = client_case("client-rebooted");
+    let steps = ssh_steps(&case, "ssh", &[&format!("boot {BOOTED}"), "drop", "ok", &format!("boot {REBOOTED}")]);
+
+    let outcome = finish(lost_gate(&case, "local", &steps, &[r".\tool.exe", "out", "ran here"]));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let line = format!("gate: builder restarted during the run (booted {REBOOTED}); the run did not finish there");
+    assert!(outcome.stderr.contains(&line), "{outcome:?}");
+    assert!(!outcome.stderr.contains(LOST_LINE), "{outcome:?}");
+    assert!(outcome.stdout.contains("ran here"), "it ran here: {outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "run", "stop", "boot"], "the command is stopped first");
+    assert_eq!(fallbacks(&events(&case)), ["rebooted"]);
+}
+
+#[test]
+fn a_boot_time_within_the_slack_is_the_same_boot() {
+    let case = client_case("client-same-boot");
+    let steps = ssh_steps(
+        &case,
+        "ssh",
+        &[&format!("boot {BOOTED}"), "drop", "ok", "boot 2026-10-10T08:00:05.0000000Z"],
+    );
+
+    let outcome = finish(lost_gate(&case, "local", &steps, &[r".\tool.exe", "out", "ran there"]));
+
+    assert_eq!(outcome.code, Some(255), "{outcome:?}");
+    assert!(outcome.stderr.contains(LOST_LINE), "{outcome:?}");
+    assert!(!outcome.stderr.contains("restarted during the run"), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "run", "stop", "boot"]);
+    assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new());
+}
+
+/// The run call writes a line before its connection is lost, and the boot query fails after the banner, so it is not
+/// made again.
+#[test]
+fn a_builder_unreachable_after_the_loss_falls_back_unreachable() {
+    let case = client_case("client-lost-unreachable");
+    let steps = ssh_steps(&case, "ssh", &[&format!("boot {BOOTED}"), "out-then-drop", "ok", "fail-other"]);
+
+    let outcome = finish(lost_gate(&case, "local", &steps, &[r".\tool.exe", "out", "ran here"]));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(
+        outcome.stderr.contains("gate: asking builder for its boot time failed (status 255)"),
+        "{outcome:?}"
+    );
+    let line = "gate: builder unreachable after the connection was lost; the run did not finish there";
+    assert!(outcome.stderr.contains(line), "{outcome:?}");
+    assert!(!outcome.stderr.contains(LOST_LINE), "{outcome:?}");
+    assert!(outcome.stdout.contains("ran here"), "it ran here: {outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "run", "stop", "boot"]);
+    assert_eq!(fallbacks(&events(&case)), ["unreachable"]);
+}
+
+#[test]
+fn a_lost_connection_with_no_boot_at_preflight_is_stopped() {
+    let case = client_case("client-lost-no-boot");
+    let steps = ssh_steps(&case, "ssh", &["no-boot", "drop", "ok"]);
+
+    let outcome = finish(lost_gate(&case, "local", &steps, &[r".\tool.exe", "out", "ran there"]));
+
+    assert_eq!(outcome.code, Some(255), "{outcome:?}");
+    assert!(outcome.stderr.contains(LOST_LINE), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "run", "stop"], "no boot query with no boot time to compare");
+    assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new());
+}
+
+/// The run call writes a failure marker before its connection is lost; the run that falls back here passes.
+#[test]
+fn a_run_that_falls_back_after_a_loss_reads_none_of_the_builder_s_output() {
+    let case = client_case("client-lost-marker");
+    let steps = ssh_steps(
+        &case,
+        "ssh",
+        &[
+            &format!("boot {BOOTED}"),
+            "say-exit 255 Program.cs(1,1): error CS1002: ; expected",
+            "ok",
+            &format!("boot {REBOOTED}"),
+        ],
+    );
+
+    let outcome = finish(lost_gate(&case, "local", &steps, &[r".\tool.exe", "out", "ran here"]));
+
+    assert_eq!(outcome.code, Some(0), "the run here passed: {outcome:?}");
+    assert!(outcome.stdout.contains("ran here"), "it ran here: {outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "run", "stop", "boot"]);
+    assert_eq!(fallbacks(&events(&case)), ["rebooted"]);
+}
+
+/// The `stop` and the `boot` call each hold until the 200 ms bound kills them; either may be killed before the
+/// stand-in has logged it, and the next call then takes its step, which holds too.
+#[test]
+fn a_boot_call_that_does_not_finish_falls_back_unreachable() {
+    let case = client_case("client-boot-hangs");
+    let hold = format!("hold {}", never(&case));
+    let steps = ssh_steps(&case, "ssh", &[&format!("boot {BOOTED}"), "drop", &hold, &hold]);
+    let tuned = Tuned {
+        extra: &["--test-remote-bound-ms", "200"],
+        ..Tuned::default()
+    };
+
+    let outcome = finish(client_gate_tuned(&case, "out.log", &steps, &tuned, &[r".\tool.exe", "out", "ran here"]));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(
+        outcome.stderr.contains("gate: asking builder for its boot time did not finish in 1 s"),
+        "{outcome:?}"
+    );
+    let line = "gate: builder unreachable after the connection was lost; the run did not finish there";
+    assert!(outcome.stderr.contains(line), "{outcome:?}");
+    assert!(outcome.stdout.contains("ran here"), "it ran here: {outcome:?}");
+    let made = calls(&steps);
+    let logged: Vec<&str> = ["preflight", "run", "stop", "boot"]
+        .into_iter()
+        .filter(|verb| made.iter().any(|call| call == verb))
+        .collect();
+    assert!(
+        made.starts_with(&["preflight".to_owned(), "run".to_owned()]) && made == logged.as_slice(),
+        "{made:?}"
+    );
+    assert_eq!(fallbacks(&events(&case)), ["unreachable"]);
+}
+
+#[test]
+fn a_boot_call_dropped_before_the_banner_is_retried_once() {
+    let case = client_case("client-boot-retry");
+    let booted = format!("boot {BOOTED}");
+    let steps = ssh_steps(&case, "ssh", &[&booted, "drop", "ok", "fail-banner", &booted]);
+
+    let outcome = finish(lost_gate(&case, "local", &steps, &[r".\tool.exe", "out", "ran there"]));
+
+    assert_eq!(outcome.code, Some(255), "{outcome:?}");
+    assert_eq!(outcome.stderr.matches(RETRY_LINE).count(), 1, "{outcome:?}");
+    assert!(outcome.stderr.contains(LOST_LINE), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "run", "stop", "boot", "boot"]);
+    assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new());
 }

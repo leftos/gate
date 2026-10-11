@@ -12,7 +12,7 @@ pub(crate) const GIT_SSH_FAILED: i32 = 128;
 const PAUSE: Duration = Duration::from_secs(2);
 /// The least of a bounded call's bound that must be left after the pause for its retry to be made.
 const FLOOR: Duration = Duration::from_secs(5);
-/// The bound of the `stop` call, when `--test-remote-bound-ms` gives none.
+/// The bound of a bounded call, the `stop` or the `boot`, when `--test-remote-bound-ms` gives none.
 const BOUND: Duration = Duration::from_secs(30);
 /// ssh's own words, at the start of its first standard error line, that it reached the builder but no session began:
 /// the banner did not come within the connect timeout, or the builder closed the connection before it.
@@ -51,7 +51,7 @@ pub(crate) fn pause(seams: &TestSeams) -> Duration {
     seams.remote_retry_pause_ms.map_or(PAUSE, Duration::from_millis)
 }
 
-/// The bound of a bounded call, the `stop`: `--test-remote-bound-ms` when given, else 30 s.
+/// The bound of a bounded call, the `stop` or the `boot`: `--test-remote-bound-ms` when given, else 30 s.
 pub(crate) fn bound(seams: &TestSeams) -> Duration {
     seams.remote_bound_ms.map_or(BOUND, Duration::from_millis)
 }
