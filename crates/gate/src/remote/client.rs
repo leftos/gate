@@ -16,11 +16,9 @@
 //! takes the work-folder key's lock, [`hold_key`], before its remote slot, so a second routed run of one worktree falls
 //! back `busy` at once.
 
-use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::ops::Range;
-use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -31,14 +29,12 @@ use std::time::{Duration, Instant};
 
 use gate_args::RunRequest;
 use gate_state::{FallbackReason, KernelObject, key_hash};
-use gate_win32::{
-    AcquireError, EnvironmentBlock, Interrupt, Job, NamedMutex, OwnedMutexGuard, PipedConsole, PipedLaunch, PipedSuspended, Running,
-    same_variable_name,
-};
+use gate_win32::{AcquireError, Interrupt, Job, NamedMutex, OwnedMutexGuard, PipedConsole, PipedSuspended, Running};
 use jiff::{SignedDuration, Timestamp};
 use regex::Regex;
 
 use super::git::{self, Git, GitError, last_update};
+use super::launch::{DRAIN, KILL_WAIT, KILLED, call_job, piped_launch};
 use super::payload::{self, Location, RunCall};
 use super::retry::{self, Ended, GIT_SSH_FAILED, SSH_FAILED};
 use super::snapshot::{self, Snapshot};
@@ -67,12 +63,6 @@ const BOOT: &str = "gate: remote boot ";
 const BOOT_SLACK: SignedDuration = SignedDuration::from_secs(30);
 /// This gate's version, which the builder's must be.
 const OURS: &str = env!("CARGO_PKG_VERSION");
-/// The status of a call the client killed, and of a run whose run call the watchdog killed.
-const KILLED: i32 = 124;
-/// How long the client waits for a killed call's output to end before it stops waiting on it.
-const DRAIN: Duration = Duration::from_secs(2);
-/// How long the client waits for a call it killed to exit.
-const KILL_WAIT: Duration = Duration::from_secs(30);
 /// The line said when `--test-remote-interrupt-at` is given but the console handler that would carry the interrupt
 /// could not be installed.
 const NO_HANDLER: &str = "gate: --test-remote-interrupt-at needs the console handler; it could not be installed";
@@ -393,7 +383,7 @@ impl Attempt<'_, '_> {
         match called.status {
             0 => {}
             SSH_FAILED => {
-                let last = escaped(&git::failure_text(&[called.last_error.as_deref().unwrap_or_default()]));
+                let last = git::failure_text(&[called.last_error.as_deref().unwrap_or_default()]);
                 self.say(format!("gate: remote {host} unreachable: {last}"));
                 return Err(End::Refused(FallbackReason::Unreachable));
             }
@@ -438,7 +428,7 @@ impl Attempt<'_, '_> {
             self.say(format!("gate: pushing the snapshot to {} failed (status {})", target.url, called.status));
             return Err(End::Refused(FallbackReason::Unreachable));
         }
-        snapshot::save(root, key, &snapshot.commit, self.limit, self.call.interrupt).map_err(git_end)?;
+        snapshot::save(root, key, &snapshot.commit, self.limit).map_err(git_end)?;
         let short = snapshot.commit.get(..8).unwrap_or(&snapshot.commit);
         self.say(format!("gate: pushed snapshot {short} in {} s ({size})", seconds(started.elapsed())));
         Ok(())
@@ -966,18 +956,6 @@ struct Starts {
     raise: bool,
 }
 
-/// An anonymous job of its own for a call, which ends every process in it when it is terminated or dropped, and which
-/// no other process can open by a name. With `breakaway`, a process in it may start one outside it, as a box run on
-/// this machine starts its command; without, it refuses that, so no ssh or git started in it can leave it and outlive
-/// a kill.
-fn call_job(breakaway: bool) -> io::Result<Job> {
-    if breakaway {
-        Job::anonymous_kill_on_close_breakaway()
-    } else {
-        Job::anonymous_kill_on_close()
-    }
-}
-
 /// The console a call watched as `watch` is created on: this process's, whose Ctrl+C reaches it too, for every call a
 /// Ctrl+C ends; a hidden one of its own for a bounded call, the `stop` or the `boot`, so that a second Ctrl+C cannot
 /// end it. ssh in batch mode reads nothing from a console.
@@ -987,37 +965,6 @@ fn console_of(watch: Watch) -> PipedConsole {
     } else {
         PipedConsole::Hidden
     }
-}
-
-/// The launch of `command`, created suspended on `console`: its program, words and working folder, and this process's
-/// environment with the command's own changes.
-fn piped_launch(command: &Command, console: PipedConsole) -> io::Result<PipedLaunch> {
-    let words: Vec<Vec<u16>> = std::iter::once(command.get_program())
-        .chain(command.get_args())
-        .map(|word| word.encode_wide().collect())
-        .collect();
-    let directory = match command.get_current_dir() {
-        Some(folder) => folder.to_path_buf(),
-        None => std::env::current_dir()?,
-    };
-    Ok(PipedLaunch {
-        application: PathBuf::from(command.get_program()),
-        command_line: gate_args::command_line(&words),
-        directory,
-        environment: EnvironmentBlock::new(environment_of(command))?,
-        console,
-    })
-}
-
-/// This process's environment with `command`'s changes: each variable it sets replaces the one of its name, and each
-/// it removes is gone, names compared as Windows compares them.
-fn environment_of(command: &Command) -> Vec<(OsString, OsString)> {
-    let mut variables: Vec<(OsString, OsString)> = std::env::vars_os().collect();
-    for (name, value) in command.get_envs() {
-        variables.retain(|(kept, _)| !same_variable_name(kept, name));
-        variables.extend(value.map(|value| (name.to_owned(), value.to_owned())));
-    }
-    variables
 }
 
 /// What a bounded call, `what` it does, that ended as `called`, limited by `bound`, says: nothing when it exited 0.

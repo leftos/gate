@@ -19,6 +19,7 @@ mod bridge;
 #[cfg(feature = "test-seams")]
 mod client;
 pub(crate) mod git;
+mod launch;
 #[cfg(feature = "test-seams")]
 mod payload;
 #[cfg(feature = "test-seams")]

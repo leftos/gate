@@ -901,6 +901,94 @@ fn a_back_commit_that_touches_a_git_file_is_kept_and_fails_a_passing_run() {
     assert!(!outcome.stderr.contains("gate: synced back "), "{outcome:?}");
 }
 
+/// The box makes `made-on-box.txt`, which this worktree holds already but excludes in its own `.git/info/exclude`: the
+/// snapshot leaves it out, so the worktree still matches it, and `git apply` refuses to make a file that is there.
+#[test]
+fn a_back_commit_that_cannot_be_applied_is_kept_and_fails_the_run() {
+    let case = client_case("client-back-apply-fails");
+    fs::write(case.folder().join(".git").join("info").join("exclude"), "made-on-box.txt\n").expect("the exclude file can be written");
+    write(&case, "made-on-box.txt", "here\n");
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "mark", "made-on-box.txt"]));
+
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    let failed = outcome
+        .stderr
+        .lines()
+        .find(|line| line.starts_with("gate: the remote run failed: git -c core.protectNTFS=true apply "))
+        .unwrap_or_default();
+    let key = key_of(&events(&case));
+    let back = builder_ref(&case, &format!("refs/gate-back/{key}"));
+    assert!(is_sha(&back), "the box wrote the back commit: {back:?}");
+    let ending = format!(
+        "made-on-box.txt: already exists in working directory; the changes are kept: see git diff {} {}",
+        pushed_snapshot(&case, "out.log"),
+        &back[..8]
+    );
+    assert!(
+        failed.ends_with(&ending),
+        "the run failed in git apply, its line ending with apply's reason and where the changes are: {outcome:?}"
+    );
+    assert_eq!(
+        git_out(&case, &[], &["rev-parse", &format!("refs/gate-remote/{key}-back")]),
+        back,
+        "the changes are kept at the key's -back ref"
+    );
+    assert_eq!(
+        fs::read_to_string(case.folder().join("made-on-box.txt")).expect("the worktree's file is there"),
+        "here\n",
+        "the worktree's own file stands"
+    );
+    assert_eq!(patch_files(&case), Vec::<String>::new(), "the patch is removed");
+}
+
+/// The worktree's `held.slow` runs through a required clean filter that passes while the case's `broken` file is
+/// absent and fails once it is there; the case writes it while the run call parks, so the snapshot's `git add -A`
+/// passes and the sync-back's check of the worktree, before any apply, fails.
+#[test]
+fn a_back_commit_whose_worktree_check_fails_is_kept_and_fails_the_run() {
+    let case = client_case("client-back-check-fails");
+    let broken = case.folder().join("ssh").join("broken");
+    git(&case, &["config", "filter.slow.clean", &format!("test ! -e '{}' && cat", shown(&broken))]);
+    git(&case, &["config", "filter.slow.required", "true"]);
+    write(&case, ".gitattributes", "*.slow filter=slow\n");
+    write(&case, "held.slow", "held\n");
+    let go = case.folder().join("ssh").join("go");
+    let steps = ssh_steps(&case, "ssh", &["ok", &format!("hold {}", shown(&go))]);
+    let run = start(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "mark", "made-on-box.txt"]));
+    wait_until("the run call", || calls(&steps).len() == 2);
+    fs::write(&broken, "").expect("the broken file can be made");
+    fs::write(&go, "").expect("the go file can be made");
+
+    let outcome = run.finish();
+
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    let key = key_of(&events(&case));
+    let back = builder_ref(&case, &format!("refs/gate-back/{key}"));
+    assert!(is_sha(&back), "the box wrote the back commit: {back:?}");
+    let failed = outcome
+        .stderr
+        .lines()
+        .find(|line| line.starts_with("gate: the remote run failed: git ") && line.contains(" add -A "))
+        .unwrap_or_default();
+    let ending = format!(
+        "; the changes are kept: see git diff {} {}",
+        pushed_snapshot(&case, "out.log"),
+        &back[..8]
+    );
+    assert!(
+        failed.contains("held.slow: clean filter 'slow' failed") && failed.ends_with(&ending),
+        "the worktree check failed, its line ending with where the changes are: {outcome:?}"
+    );
+    assert_eq!(
+        git_out(&case, &[], &["rev-parse", &format!("refs/gate-remote/{key}-back")]),
+        back,
+        "the changes are kept at the key's -back ref"
+    );
+    assert!(!case.folder().join("made-on-box.txt").exists(), "nothing was applied");
+}
+
 /// The case plants a back commit between two runs, as the stale-back case does; the second run's call is the box's own
 /// busy refusal, so a sync-back after it would find the planted commit and say it ignored it.
 #[test]

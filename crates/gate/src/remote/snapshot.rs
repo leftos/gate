@@ -47,15 +47,12 @@ pub(crate) fn take(roots: &[PathBuf], key: &str, limit: Duration, interrupt: Opt
 }
 
 /// Points `refs/gate-remote/<key>` at `commit` in the repository of `root`, once the builder has the snapshot, so the
-/// next bridge commit builds on it; git is ended after `limit` or by the console `interrupt`.
-pub(crate) fn save(root: &Path, key: &str, commit: &str, limit: Duration, interrupt: Option<Interrupt>) -> Result<(), GitError> {
+/// next bridge commit builds on it. git holds the ref's lock while it runs, so it is a [`git::Call::locked`] call,
+/// which no Ctrl+C ends: it ends on its own or after `limit`.
+pub(crate) fn save(root: &Path, key: &str, commit: &str, limit: Duration) -> Result<(), GitError> {
     let git = Git::find(root).map_err(GitError::Failed)?;
     let args = ["update-ref", &format!("{REFS}{key}"), commit];
-    git.output(&git::Call {
-        interrupt,
-        ..git::Call::plain(root, &args, limit)
-    })
-    .map(drop)
+    git.output(&git::Call::locked(root, &args, limit)).map(drop)
 }
 
 /// The tree of the worktree at `root` as `git add -A` and `git write-tree` write it through a copy of its index: what
@@ -128,12 +125,10 @@ impl Calls<'_> {
     /// One of this worktree's calls.
     fn call<'c>(&'c self, args: &'c [&'c str], set: &'c [(&'c str, &'c OsStr)], unset: &'c [&'c str]) -> git::Call<'c> {
         git::Call {
-            folder: self.root,
-            args,
             set,
             unset,
-            limit: self.limit,
             interrupt: self.interrupt,
+            ..git::Call::plain(self.root, args, self.limit)
         }
     }
 }
@@ -315,7 +310,7 @@ mod tests {
         let first = take(roots, OWN, GIT_LIMIT, None).expect("the first snapshot is made");
         assert_eq!(first.len(), 1, "one snapshot for one root");
         assert_eq!(first[0].bridge, None, "no snapshot before the first");
-        save(&root, OWN, &first[0].commit, GIT_LIMIT, None).expect("the ref is saved");
+        save(&root, OWN, &first[0].commit, GIT_LIMIT).expect("the ref is saved");
         fs::write(root.join("a.txt"), "b\n").expect("a file can be changed");
 
         let second = take(roots, OWN, GIT_LIMIT, None).expect("the second snapshot is made");

@@ -811,7 +811,20 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
   The bridge commit has the snapshot's tree and, as its parent, the newest local `refs/gate-remote/*` not ending `-back`; with none it has no parent. The push writes `refs/gate-remote/<key>` once the builder has the snapshot.
 
-  Every git call of the client goes through `remote/git.rs`, which the routing decision's git calls share: it removes the `GIT_*` location variables, applies the routing decision's time limit (`--test-git-limit-ms`), spawns through `gate_win32::spawn`, sends stderr to null where it is not read and ends git on Ctrl+C.
+  Every git call of the client goes through `remote/git.rs`, which the routing decision's git calls share: it removes the `GIT_*` location variables, applies the routing decision's time limit (`--test-git-limit-ms`), starts git through `remote/launch.rs` (suspended, assigned to an anonymous kill-on-close job of its own and resumed, with its output on pipes read by a thread per stream), reads and drops stderr where nothing reads it and ends git's whole job on Ctrl+C.
+
+  The calls the client reads (`Git::output`: the sync-back's and the snapshot's) read git's output up to 16 MiB and keep the last 64 KiB of its stderr; a call past the cap is ended and fails with `git <args> failed in <folder>: its output passed 16 MiB`. The routing decision's calls are not capped. A Ctrl+C that ends git is an interrupt.
+
+  The sync-back's `update-ref` and `apply` and the snapshot's `update-ref` run on a hidden console and answer to no interrupt, so a Ctrl+C cannot end git while it holds a ref lock in the git folder.
+
+  Once the fetched back commit is confirmed as this snapshot's, every step up to a successful `apply` (the changed-file listing, the worktree check, the patch and the `apply` itself) that fails or is interrupted first keeps the back commit at `refs/gate-remote/<key>-back` and says so:
+  - a failure: `gate: the remote run failed: <reason>; the changes are kept: see git diff <snapshot 8 hex> <back 8 hex>`;
+  - an interrupt: `gate: the run was interrupted; the changes are kept: see git diff <snapshot 8 hex> <back 8 hex>`, with the interrupt's own status;
+  - a keep that fails too: `gate: the remote run failed: <reason>; the changes could not be kept either: <why>`, or after an interrupt `gate: the remote run failed: the run was interrupted, and the changes could not be kept: <why>` (status 1).
+
+  A patch that applied but cannot be removed fails the run (`gate: the remote run failed: cannot remove <patch>: <error>`) and keeps nothing: the changes are already in the worktree.
+
+  Once git has exited, its readers get 2 s to reach their pipes' ends, else the call fails with `cannot read git's output: it did not end within 2 s of git's exit`. A failure line carries the last 10 of git's lines joined by ` | `, escaped and cut to the last 4 KiB at a whole escape.
 
   Only `gate run --test-remote-snapshot` and `--test-remote-transport` reach the client. The first makes the snapshot, says `gate: remote snapshot <sha> bridge <sha or none>` on stderr and in the log, and ends with status 0. A snapshot that fails says `gate: the remote run failed: git <args> failed in <root> (status <n>): <git's lines joined by ' | '>` and ends with status 1, with no fallback.
 
@@ -873,7 +886,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
   **Ctrl+C** ends the call it interrupts and the run as an interrupt. A Ctrl+C whose kill of the call fails stays an interrupt and still sends the stop.
 
-  **Jobs.** Every remote call (ssh or git) runs in an anonymous kill-on-close job, created suspended and assigned before it runs, so a kill ends its whole tree. Breakaway from the job is allowed only for the local test transport, whose stand-in box starts under the gate's own job.
+  **Jobs.** Every remote call (ssh or git) runs in an anonymous kill-on-close job, created suspended and assigned before it runs, so a kill ends its whole tree; the routing decision's local git calls start the same way (`remote/launch.rs`). Breakaway from the job is allowed only for the local test transport, whose stand-in box starts under the gate's own job.
 
   **The output cap.** Every call's line is capped at 64 KiB, and a call keeps only its last 1000 lines and at most 1 MiB of them, dropping the oldest first; the newest line is always kept. A `\r` resets the current line, as git's progress does (the Progress and Unlogged readers only). A progress update over 64 KiB, however the pipe splits it, ends a capped call with `... sent a line longer than 64 KiB`. The run call is not capped: its longer lines pass on in pieces.
 

@@ -2,7 +2,9 @@
 //! the builder are fetched from `refs/gate-back/<key>` and applied to the worktree when it still matches the snapshot.
 //! The builder is trusted less than this PC. A fetched commit that is not the one the builder advertised, or that was
 //! not made from this snapshot, is ignored. One that touches a `.git*` path or makes a link or a submodule, or one the
-//! worktree changed under during the run, is kept at `refs/gate-remote/<key>-back` and fails a run that had passed.
+//! worktree changed under during the run, is kept at `refs/gate-remote/<key>-back` and fails a run that had passed;
+//! one that a step before its apply could not take further, as it failed or was interrupted, is kept there too, and
+//! the line that ends the run says where to see its changes.
 //! The two git calls that reach the builder take the pre-banner retry and keep their lines out of the log; any other
 //! git failure is the run's, status 1 and `gate: the remote run failed: ...`, with no fallback. Every name and git line
 //! said here has its control characters escaped.
@@ -114,22 +116,69 @@ fn made_from(attempt: &Attempt<'_, '_>, git: &Git, back: &str, snapshot: &str) -
 }
 
 /// Applies the back commit `back`, or keeps it when it touches what a sync-back never writes or the worktree no longer
-/// matches the snapshot.
+/// matches the snapshot. A step that fails or is interrupted before the patch applied keeps it as well, so its changes
+/// are not lost; a patch that applied but cannot be removed then fails the run with nothing kept.
 fn receive(attempt: &mut Attempt<'_, '_>, git: &Git, snapshot: &Snapshot, back: &str, status: i64) -> Result<End, End> {
-    let listing = git_call(attempt, git, &["diff-tree", "-r", "-z", "--raw", &snapshot.commit, back])?;
-    let refusal = match forbidden(&listing) {
-        Some(path) => Some(touched_line(&path, &snapshot.commit, back)),
-        None if changed(attempt, git, snapshot)? => Some(not_applied_line(&snapshot.commit, back)),
-        None => None,
-    };
-    if let Some(said) = refusal {
-        keep(attempt, git, back)?;
+    let commit = snapshot.commit.as_str();
+    let refused = refusal(attempt, git, snapshot, back).map_err(|failed| kept_after(attempt, git, commit, back, failed))?;
+    if let Some(said) = refused {
+        keep(attempt, git, back).map_err(End::Failed)?;
         attempt.say(said);
         return Ok(End::Status(if status == 0 { 1 } else { status }));
     }
-    let names = apply(attempt, git, snapshot, back)?;
+    let (names, patch) = apply(attempt, git, snapshot, back).map_err(|failed| kept_after(attempt, git, commit, back, failed))?;
+    remove(&patch)?;
     attempt.say(synced_line(&names));
     Ok(End::Status(status))
+}
+
+/// Why `back` is kept rather than applied: the line said for a back commit that touches what a sync-back never writes,
+/// or for one the worktree changed under during the run; `None` when it may be applied.
+fn refusal(attempt: &Attempt<'_, '_>, git: &Git, snapshot: &Snapshot, back: &str) -> Result<Option<String>, End> {
+    let listing = git_call(attempt, git, &["diff-tree", "-r", "-z", "--raw", &snapshot.commit, back])?;
+    Ok(match forbidden(&listing) {
+        Some(path) => Some(touched_line(&path, &snapshot.commit, back)),
+        None if changed(attempt, git, snapshot)? => Some(not_applied_line(&snapshot.commit, back)),
+        None => None,
+    })
+}
+
+/// How the run ends once `back`, which a step before its apply could not take past `failed`, is kept; what
+/// [`after_keep`] decides, and its line said.
+fn kept_after(attempt: &mut Attempt<'_, '_>, git: &Git, snapshot: &str, back: &str, failed: End) -> End {
+    let kept = keep(attempt, git, back);
+    let (end, said) = after_keep(failed, kept, &see_diff(snapshot, back));
+    if let Some(line) = said {
+        attempt.say(line);
+    }
+    end
+}
+
+/// How a run that a step before the apply ended at `failed` ends once the back commit's keep came out as `kept`, and
+/// the line it says then: a failure's reason says the changes are kept and where to `see` them, or that they could not
+/// be kept and why; an interrupt whose changes are kept stays an interrupt and says so, and one whose changes could
+/// not be kept is a failure, since they are lost. No reason is dropped: any other end stands, and a keep that failed
+/// beside it is said.
+fn after_keep(failed: End, kept: Result<(), String>, see: &str) -> (End, Option<String>) {
+    match (failed, kept) {
+        (End::Failed(why), Ok(())) => (End::Failed(format!("{why}; the changes are kept: {see}")), None),
+        (End::Failed(why), Err(not_kept)) => (End::Failed(format!("{why}; the changes could not be kept either: {not_kept}")), None),
+        (End::Interrupted, Ok(())) => (
+            End::Interrupted,
+            Some(format!("gate: the run was interrupted; the changes are kept: {see}")),
+        ),
+        (End::Interrupted, Err(not_kept)) => (
+            End::Failed(format!("the run was interrupted, and the changes could not be kept: {not_kept}")),
+            None,
+        ),
+        (other, Ok(())) => (other, None),
+        (other, Err(not_kept)) => (other, Some(format!("gate: the changes could not be kept: {not_kept}"))),
+    }
+}
+
+/// `see git diff <snapshot> <back>`, the two commits' short shas: where every line that keeps a back commit points.
+fn see_diff(snapshot: &str, back: &str) -> String {
+    format!("see git diff {} {}", short(snapshot), short(back))
 }
 
 /// Whether the worktree no longer matches the snapshot: the tree `git add -A` would write for it now is not the
@@ -140,15 +189,19 @@ fn changed(attempt: &Attempt<'_, '_>, git: &Git, snapshot: &Snapshot) -> Result<
     Ok(now != then)
 }
 
-/// Keeps `back` at the worktree's `refs/gate-remote/<key>-back`, for the changes a run could not apply.
-fn keep(attempt: &Attempt<'_, '_>, git: &Git, back: &str) -> Result<(), End> {
+/// Keeps `back` at the worktree's `refs/gate-remote/<key>-back`, for the changes a run could not apply; else why not,
+/// escaped.
+fn keep(attempt: &Attempt<'_, '_>, git: &Git, back: &str) -> Result<(), String> {
     let name = format!("{REFS}{}{BACK}", attempt.call.key);
-    git_call(attempt, git, &["update-ref", &name, back]).map(drop)
+    let args = ["update-ref", name.as_str(), back];
+    let call = git::Call::locked(Path::new(attempt.call.root), &args, attempt.limit);
+    git.output(&call).map(drop).map_err(|error| escaped(&String::from(error)))
 }
 
-/// Writes the back commit's changes as a patch into the git folder and applies it to the worktree, removing the patch
-/// whether or not it applied; the names of the files it changed.
-fn apply(attempt: &Attempt<'_, '_>, git: &Git, snapshot: &Snapshot, back: &str) -> Result<Vec<String>, End> {
+/// Writes the back commit's changes as a patch into the git folder and applies it to the worktree; the names of the
+/// files it changed, and the patch, which the caller removes. A patch that did not apply is removed here, and the
+/// apply's failure is the one the run ends with.
+fn apply(attempt: &Attempt<'_, '_>, git: &Git, snapshot: &Snapshot, back: &str) -> Result<(Vec<String>, PathBuf), End> {
     let names = names(attempt, git, snapshot, back)?;
     let patch = patch_file(attempt, git)?;
     let shown = patch.display().to_string();
@@ -158,11 +211,14 @@ fn apply(attempt: &Attempt<'_, '_>, git: &Git, snapshot: &Snapshot, back: &str) 
     // NTFS protection refuses a path that names `.git` by its 8.3 short name or an alternate stream, whatever the
     // repository's own setting.
     let apply = ["-c", "core.protectNTFS=true", "apply", "--whitespace=nowarn", "--", &shown];
-    let applied = made.and_then(|_| git_call(attempt, git, &apply));
-    let removed = remove(&patch);
-    applied?;
-    removed?;
-    Ok(names)
+    match made.and_then(|_| locked_call(attempt, git, &apply)) {
+        Ok(_) => Ok((names, patch)),
+        Err(failed) => {
+            // The apply's failure is the run's; a patch that cannot be removed after it is the lesser problem.
+            drop(remove(&patch));
+            Err(failed)
+        }
+    }
 }
 
 /// The names of the files the back commit `back` changes, against the snapshot, as git's plumbing lists them.
@@ -199,6 +255,13 @@ fn git_call(attempt: &Attempt<'_, '_>, git: &Git, args: &[&str]) -> Result<Strin
         interrupt: attempt.call.interrupt,
         ..git::Call::plain(Path::new(attempt.call.root), args, attempt.limit)
     };
+    git.output(&call).map_err(escaped_end)
+}
+
+/// Runs git with `args` in the worktree as [`git_call`] does, but as a [`git::Call::locked`] call, which no Ctrl+C
+/// ends while it holds a lock in the git folder.
+fn locked_call(attempt: &Attempt<'_, '_>, git: &Git, args: &[&str]) -> Result<String, End> {
+    let call = git::Call::locked(Path::new(attempt.call.root), args, attempt.limit);
     git.output(&call).map_err(escaped_end)
 }
 
@@ -288,19 +351,17 @@ pub(super) fn ignored_line(back: &str, snapshot: &str) -> String {
 /// The line said for a back commit the worktree changed under, named so the changes can be read with `git diff`.
 pub(super) fn not_applied_line(snapshot: &str, back: &str) -> String {
     format!(
-        "gate: remote changes not applied: the worktree changed during the run; see git diff {} {}",
-        short(snapshot),
-        short(back)
+        "gate: remote changes not applied: the worktree changed during the run; {}",
+        see_diff(snapshot, back)
     )
 }
 
 /// The line said for a back commit that touches `path`, which a sync-back never writes.
 fn touched_line(path: &str, snapshot: &str, back: &str) -> String {
     format!(
-        "gate: remote changes not applied: they touch {}, which a sync-back never writes; see git diff {} {}",
+        "gate: remote changes not applied: they touch {}, which a sync-back never writes; {}",
         escaped(path),
-        short(snapshot),
-        short(back)
+        see_diff(snapshot, back)
     )
 }
 
@@ -343,7 +404,10 @@ mod tests {
     use gate_state::StateRoot;
     use gate_win32::Interrupt;
 
-    use super::{Remote, advertised, fetch, forbidden, from_snapshot, has_back, ignored_line, not_applied_line, synced_line, touched_line};
+    use super::{
+        Remote, advertised, after_keep, fetch, forbidden, from_snapshot, has_back, ignored_line, not_applied_line, see_diff, synced_line,
+        touched_line,
+    };
     use crate::remote::RemoteCall;
     use crate::remote::client::{Attempt, End};
     use crate::remote::git::Git;
@@ -351,6 +415,59 @@ mod tests {
 
     const BACK: &str = "8e8777a0e71c530018dc15bdebd7288f4f432aa4";
     const SNAPSHOT: &str = "b8a4812193314ab4b2404479b93f2338078c69eb";
+    /// Where the lines of a kept back commit point, for [`SNAPSHOT`] and [`BACK`].
+    const SEE: &str = "see git diff b8a48121 8e8777a0";
+
+    #[test]
+    fn a_failure_whose_changes_are_kept_says_where_to_see_them() {
+        assert_eq!(see_diff(SNAPSHOT, BACK), SEE);
+        let (end, said) = after_keep(End::Failed("git apply failed".to_owned()), Ok(()), SEE);
+        assert!(
+            matches!(&end, End::Failed(why) if why == "git apply failed; the changes are kept: see git diff b8a48121 8e8777a0"),
+            "{end:?}"
+        );
+        assert_eq!(said, None, "the failure's own line says it");
+    }
+
+    #[test]
+    fn a_failure_whose_changes_could_not_be_kept_says_both_reasons() {
+        let (end, said) = after_keep(End::Failed("git apply failed".to_owned()), Err("git update-ref failed".to_owned()), SEE);
+        assert!(
+            matches!(&end, End::Failed(why) if why == "git apply failed; the changes could not be kept either: git update-ref failed"),
+            "{end:?}"
+        );
+        assert_eq!(said, None);
+    }
+
+    #[test]
+    fn an_interrupt_whose_changes_are_kept_stays_an_interrupt_and_says_where_they_are() {
+        let (end, said) = after_keep(End::Interrupted, Ok(()), SEE);
+        assert!(matches!(end, End::Interrupted), "{end:?}");
+        assert_eq!(
+            said.as_deref(),
+            Some("gate: the run was interrupted; the changes are kept: see git diff b8a48121 8e8777a0")
+        );
+    }
+
+    #[test]
+    fn an_interrupt_whose_changes_could_not_be_kept_fails_with_both() {
+        let (end, said) = after_keep(End::Interrupted, Err("git update-ref failed".to_owned()), SEE);
+        assert!(
+            matches!(&end, End::Failed(why) if why == "the run was interrupted, and the changes could not be kept: git update-ref failed"),
+            "{end:?}"
+        );
+        assert_eq!(said, None);
+    }
+
+    #[test]
+    fn any_other_end_stands_and_a_failed_keep_beside_it_is_said() {
+        let (end, said) = after_keep(End::Status(3), Err("git update-ref failed".to_owned()), SEE);
+        assert!(matches!(end, End::Status(3)), "{end:?}");
+        assert_eq!(said.as_deref(), Some("gate: the changes could not be kept: git update-ref failed"));
+        let (end, said) = after_keep(End::Status(3), Ok(()), SEE);
+        assert!(matches!(end, End::Status(3)), "{end:?}");
+        assert_eq!(said, None);
+    }
 
     /// git's call to the builder fails while the console interrupt is raised, as a Ctrl+C ends the git it reaches: the
     /// run is an interrupt, not the client's failure.
