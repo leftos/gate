@@ -23,24 +23,23 @@ pub(crate) fn tool(case: &Case, name: &str) -> String {
 /// confined to the case's folder, so a build server another case — or another session on this machine — started is
 /// never counted.
 fn seams() -> Vec<String> {
-    [
-        "--test-sample-ms",
-        "100",
-        "--test-stall-ms",
-        "2000",
-        "--test-interrupt-after-samples",
-        "60",
-    ]
-    .map(str::to_owned)
-    .to_vec()
+    let mut words = seams_with_stall("2000");
+    words.extend(["--test-interrupt-after-samples", "60"].map(str::to_owned));
+    words
+}
+
+/// The words of a gate that only a stall ends: a 100 ms sample and a stall window of `stall_ms` milliseconds, with no
+/// interrupt.
+fn seams_with_stall(stall_ms: &str) -> Vec<String> {
+    ["--test-sample-ms", "100", "--test-stall-ms", stall_ms].map(str::to_owned).to_vec()
 }
 
 /// The words a burner runs: each of `identity` printed by its own `out` step, so it stands in the burner's command
-/// line, then `burn <stop>` until the case's stop file exists, then a long sleep that keeps the process alive and quiet
-/// for the rest of the case.
+/// line, then `burn <stop>` until the case's stop file exists, then a sleep longer than any case, under the suite's
+/// hang guard, that keeps the process alive and quiet for the rest of the case; the burner's drop kills it.
 fn burn_words(identity: &[&str], stop: &str) -> Vec<String> {
     let mut words: Vec<String> = identity.iter().flat_map(|word| ["out", *word]).map(str::to_owned).collect();
-    words.extend(["burn", stop, "sleep", "30000"].map(str::to_owned));
+    words.extend(["burn", stop, "sleep", "590000"].map(str::to_owned));
     words
 }
 
@@ -85,11 +84,24 @@ impl Drop for Burner {
     }
 }
 
-/// Returns once the log at `path` holds `needle`.
-fn wait_for_log(path: &Path, needle: &str) {
-    wait_until(&format!("{needle:?} in {}", path.display()), || {
-        fs::read_to_string(path).is_ok_and(|text| text.contains(needle))
+/// Returns the gate under test, `running`, once the log at `path` holds `needle`; fails with the gate's status and
+/// stderr as soon as the gate has ended without the log holding it, rather than after the hang guard.
+#[expect(clippy::panic, reason = "a gate that ended before its log held the line fails the case with what it said")]
+fn wait_for_log(mut running: Running, path: &Path, needle: &str) -> Running {
+    let holds = || fs::read_to_string(path).is_ok_and(|text| text.contains(needle));
+    wait_until(&format!("{needle:?} in {}, or the gate ending", path.display()), || {
+        holds() || !running.is_running()
     });
+    if holds() {
+        return running;
+    }
+    let outcome = running.finish();
+    panic!(
+        "the gate ended before {needle:?} was in {}: status {:?}, stderr:\n{}",
+        path.display(),
+        outcome.code,
+        outcome.stderr
+    );
 }
 
 /// The file whose existence ends a case's `chatter` step: while it is missing, the command's log keeps growing, so the
@@ -104,6 +116,7 @@ fn stop_chatter(case: &Case) {
 }
 
 #[test]
+#[ignore = "needs the machine alone: run with -Slot critical and --ignored"]
 fn a_quiet_build_waiting_on_a_busy_shared_compiler_is_not_stalled() {
     let case = Case::new("a_quiet_build_waiting_on_a_busy_shared_compiler_is_not_stalled");
     let msbuild = tool(&case, "MSBuild.exe");
@@ -135,7 +148,7 @@ fn a_quiet_command_is_stalled_once_the_shared_compiler_goes_quiet() {
     let server = Burner::spawn(&case, &compiler, &[], "stop-compiler");
 
     let running = case.start(&run_words("out.log", &seams, &[msbuild.as_str(), "out", "building", "sleep", "30000"]));
-    wait_for_log(&log, "building");
+    let running = wait_for_log(running, &log, "building");
     server.stop();
     let outcome = running.finish();
 
@@ -145,6 +158,7 @@ fn a_quiet_command_is_stalled_once_the_shared_compiler_goes_quiet() {
 }
 
 #[test]
+#[ignore = "needs the machine alone: run with -Slot critical and --ignored"]
 fn a_server_started_after_the_command_counts_while_the_job_holds_a_client() {
     let case = Case::new("a_server_started_after_the_command_counts_while_the_job_holds_a_client");
     let msbuild = tool(&case, "MSBuild.exe");
@@ -162,7 +176,7 @@ fn a_server_started_after_the_command_counts_while_the_job_holds_a_client() {
         &seams,
         &[msbuild.as_str(), "chatter", chatter.as_str(), "sleep", "30000"],
     ));
-    wait_for_log(&log, "chatter 1");
+    let running = wait_for_log(running, &log, "chatter 1");
     let server = Burner::spawn(&case, &compiler, &[], "stop-compiler");
     stop_chatter(&case);
     let outcome = running.finish();
@@ -176,6 +190,7 @@ fn a_server_started_after_the_command_counts_while_the_job_holds_a_client() {
 }
 
 #[test]
+#[ignore = "needs the machine alone: run with -Slot critical and --ignored"]
 fn a_dotnet_server_is_told_by_its_command_line() {
     let case = Case::new("a_dotnet_server_is_told_by_its_command_line");
     let msbuild = tool(&case, "MSBuild.exe");
@@ -189,8 +204,17 @@ fn a_dotnet_server_is_told_by_its_command_line() {
     named.stop();
     assert_eq!(outcome.code, Some(CONTROL_C_EXIT), "the dotnet server counts:\n{outcome:?}");
     assert!(!outcome.stderr.contains("STALLED"), "{outcome:?}");
+}
 
-    // The same copy without that word is no server, so nothing keeps the quiet build alive.
+#[test]
+fn a_dotnet_host_without_a_server_on_its_command_line_is_no_server() {
+    let case = Case::new("a_dotnet_host_without_a_server_on_its_command_line_is_no_server");
+    let msbuild = tool(&case, "MSBuild.exe");
+    let dotnet = tool(&case, "dotnet.exe");
+    let seams = seams();
+    let seams: Vec<&str> = seams.iter().map(String::as_str).collect();
+
+    // A burning dotnet copy whose command line names no server is no server, so nothing keeps the quiet build alive.
     let plain = Burner::spawn(&case, &dotnet, &[], "stop-plain");
     let outcome = case.run(&run_words("plain.log", &seams, &[msbuild.as_str(), "out", "building", "sleep", "30000"]));
     plain.stop();
@@ -240,7 +264,10 @@ fn a_stall_kill_lists_the_build_server_its_last_sample_counted() {
     let case = Case::new("a_stall_kill_lists_the_build_server_its_last_sample_counted");
     let msbuild = tool(&case, "MSBuild.exe");
     let compiler = tool(&case, "VBCSCompiler.exe");
-    let seams = seams();
+    // A 60 s stall window and no interrupt: the block lists the server the last sample classified, whether or not its
+    // CPU rose, so a window that long keeps the case's meaning while a loaded machine starves the command and the
+    // server. The command sleeps past any case, so only the stall ends it.
+    let seams = seams_with_stall("60000");
     let seams: Vec<&str> = seams.iter().map(String::as_str).collect();
     let log = case.folder().join("out.log");
     let chatter = shown(&chatter_path(&case));
@@ -251,9 +278,9 @@ fn a_stall_kill_lists_the_build_server_its_last_sample_counted() {
     let running = case.start(&run_words(
         "out.log",
         &seams,
-        &[msbuild.as_str(), "chatter", chatter.as_str(), "sleep", "30000"],
+        &[msbuild.as_str(), "chatter", chatter.as_str(), "sleep", "590000"],
     ));
-    wait_for_log(&log, "chatter 1");
+    let running = wait_for_log(running, &log, "chatter 1");
     let server = Burner::spawn(&case, &compiler, &[], "stop-compiler");
     server.stop();
     stop_chatter(&case);

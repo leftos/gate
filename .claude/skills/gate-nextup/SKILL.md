@@ -41,7 +41,11 @@ Until the cutover, every command runs through the PowerShell gate: `pwsh -NoProf
 |---|---|
 | any Rust | `-Slot light -- cargo fmt --all --check`, then `-Slot heavy -TimeoutSeconds 900 -- cargo clippy --workspace --all-targets --all-features --profile test-release -- -D warnings`, then the same clippy without `--all-features` (the build `gate.exe` ships; code that names a `test-seams` item outside its `cfg` compiles only with the feature), then `-Slot heavy -TimeoutSeconds 900 -- cargo test --workspace --all-features --profile test-release` (`--all-features` builds the black-box suite, which needs the `test-seams` feature) |
 
-A test that asserts on timing must hold on a busy machine: no wall-clock bound a loaded PC can cross (the PowerShell suite's CC-209 and CC-211 are what this avoids). A test that needs the machine alone runs on `-Slot critical`, and the profile names it here when it exists.
+A test that asserts on timing must hold on a busy machine: no wall-clock bound a loaded PC can cross (the PowerShell suite's CC-209 and CC-211 are what this avoids). A test that needs the machine alone is marked `#[ignore = "needs the machine alone: run with -Slot critical and --ignored"]` and named here.
+
+The machine-alone cases are `build_servers::a_quiet_build_waiting_on_a_busy_shared_compiler_is_not_stalled`, `build_servers::a_dotnet_server_is_told_by_its_command_line` and `build_servers::a_server_started_after_the_command_counts_while_the_job_holds_a_client`. Each proves "not stalled" inside a short window, held off by a build server the gate lowers to BelowNormal. When the diff touches the watchdog, the build-server classification or the priority code, also run `-Slot critical -TimeoutSeconds 600 -- cargo test -p gate --all-features --profile test-release --test suite -- --ignored`.
+
+To check a timing case holds under load, run it inside `~/.claude/tools/load-burn/load-burn.ps1`, which burns every core only while it holds the machine on a critical slot.
 
 A commit goes through the gate: `-Slot heavy -TimeoutSeconds 300 -- git commit -F .tmp/msg-<slug>.txt`.
 

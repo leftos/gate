@@ -1,10 +1,11 @@
 //! The pause markers: the file a gate waits behind while it waits for a slot under a parent gate whose slot does not
 //! cover it, rewritten on every pass of that wait and gone once the wait ends.
 
-use std::fs;
+use std::fs::{self, File};
 use std::path::{Path, PathBuf};
-use std::process;
-use std::time::SystemTime;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, SystemTime};
+use std::{process, thread};
 
 use gate_state::v1::{self, Ticket, TicketKind};
 use regex::Regex;
@@ -15,6 +16,12 @@ use crate::support::{
 
 /// The seam that keeps a wait's passes and its still-waiting lines close together.
 const POLL: [&str; 2] = ["--test-poll-ms", "20"];
+/// As [`POLL`], with an hour's stall window, so a gate holding a slot through a case never stalls however long the case
+/// lasts on a loaded machine.
+const HOLDER: [&str; 4] = ["--test-poll-ms", "20", "--stall", "3600"];
+/// How often a case rewrites a pause marker it stands in for a waiting gate with, well inside the 30 s after which a
+/// watchdog reads a marker as stale.
+const MARKER_REWRITE: Duration = Duration::from_secs(1);
 /// As [`POLL`], with a still-waiting line every 200 ms, so a case can count several passes without a clock of its own.
 const HEARTBEATS: [&str; 4] = ["--test-poll-ms", "20", "--test-heartbeat-ms", "200"];
 /// The status Windows reports for a process Ctrl+C ended, `STATUS_CONTROL_C_EXIT`, as a signed exit code.
@@ -47,7 +54,7 @@ const PASSED: &str = r"gate: passed in (\d+) s \(load-adjusted (\d+) s";
 fn holding_critical(case: &Case) -> (PathBuf, Running) {
     let go = case.folder().join("go");
     let go_word = shown(&go);
-    let critical = case.start(&critical_words("critical.log", &POLL, &[FAKE_TOOL, "wait", &go_word, "exit", "0"]));
+    let critical = case.start(&critical_words("critical.log", &HOLDER, &[FAKE_TOOL, "wait", &go_word, "exit", "0"]));
     critical.wait_for_stderr(HOLDS);
     (go, critical)
 }
@@ -90,6 +97,14 @@ fn marker_of(case: &Case, parent: u32, parent_start: u64) -> Option<v1::PauseMar
         .first()
         .and_then(|name| v1::parse_pause_name(name))
         .filter(|marker| marker.parent_pid == parent && marker.parent_start_ms == parent_start)
+}
+
+/// Creates the file at `path`, or empties it, and sets its last write to now, as a waiting gate writes its pause marker.
+fn touch(path: &Path) {
+    File::create(path)
+        .expect("the marker can be written")
+        .set_modified(SystemTime::now())
+        .expect("the marker's last write can be set");
 }
 
 /// When the file at `path` was last written; `None` when it is gone.
@@ -293,7 +308,7 @@ fn a_pause_marker_is_deleted_when_the_child_is_lent_its_parents_slot() {
     let go = case.folder().join("go");
     let go_word = shown(&go);
     // A heavy holder keeps the critical request waiting, so the child has a barrier to write its marker behind.
-    let holder = case.start(&heavy_words("holder.log", &POLL, &[FAKE_TOOL, "wait", &go_word, "exit", "0"]));
+    let holder = case.start(&heavy_words("holder.log", &HOLDER, &[FAKE_TOOL, "wait", &go_word, "exit", "0"]));
     wait_for_journal_line(&case.root(), &format!(r#""event":"take","pid":{},"#, holder.id()));
     let critical = case.start(&critical_words("critical.log", &POLL, &[FAKE_TOOL, "exit", "0"]));
     critical.wait_for_stderr("gate: waiting for the machine (critical)");
@@ -461,10 +476,18 @@ fn a_covered_gate_is_not_paused_by_a_sibling_waiting_under_its_parent() {
     write_counts(&case.root(), r#"{"v":1,"heavy":1,"light":1}"#);
     let (go, critical) = holding_critical(&case);
 
-    // The covered gate's command hangs without output or CPU for 8 s, over five of its 1.5 s stall windows.
+    // The covered gate's command chatters until the case has written the sibling's marker, so its stall clock cannot
+    // run before the marker is there to be read; then it hangs without output or CPU for longer than any case, so only
+    // the stall ends it.
+    let chatter = case.folder().join("chatter");
+    let chatter_word = shown(&chatter);
     let mut covered = vec![GATE];
-    covered.extend(run_words("covered.log", &HUNG_WATCH, &[FAKE_TOOL, "sleep", "8000"]));
-    let parent = case.start(&parent_words("parent.log", &covered));
+    covered.extend(run_words(
+        "covered.log",
+        &HUNG_WATCH,
+        &[FAKE_TOOL, "chatter", &chatter_word, "sleep", "590000"],
+    ));
+    let parent = case.start(&run_words("parent.log", &POLL, &covered));
     let parent_pid = parent.id();
     wait_for_child_stderr(&case, "parent.log", &format!("gate: running under the light slot of gate {parent_pid}"));
     let parent_start = started(parent_pid).expect("the parent gate runs");
@@ -487,9 +510,24 @@ fn a_covered_gate_is_not_paused_by_a_sibling_waiting_under_its_parent() {
     v1::write_ticket(&v1::ticket_path(&case.root(), sibling.0, sibling.1), &ticket).expect("the ticket can be written");
     let paused = v1::paused_dir(&case.root());
     fs::create_dir_all(&paused).expect("the pause folder can be made");
-    fs::write(paused.join(v1::pause_name(parent_pid, parent_start, sibling.0, sibling.1)), "").expect("the marker can be written");
+    let marker = paused.join(v1::pause_name(parent_pid, parent_start, sibling.0, sibling.1));
+    touch(&marker);
 
-    let outcome = parent.finish();
+    // The sibling keeps its marker fresh, as a waiting gate rewrites its own on every pass, until the parent ends: a
+    // covered gate that counted it would stay paused and never stall.
+    let finished = AtomicBool::new(false);
+    let outcome = thread::scope(|scope| {
+        scope.spawn(|| {
+            while !finished.load(Ordering::Relaxed) {
+                touch(&marker);
+                thread::sleep(MARKER_REWRITE);
+            }
+        });
+        fs::write(&chatter, "").expect("the chatter file can be written");
+        let outcome = parent.finish();
+        finished.store(true, Ordering::Relaxed);
+        outcome
+    });
     let_go(&go);
     let covered_log = fs::read_to_string(case.folder().join("covered.log")).expect("the covered gate wrote its log");
     assert_eq!(outcome.code, Some(124), "the covered gate's hung command fails its parent: {outcome:?}");

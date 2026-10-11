@@ -1085,6 +1085,7 @@ Rules:
 A Rust integration suite drives the built `gate.exe` through its CLI and reads only what it writes: exit codes, stdout, stderr, the log, the journal, claims and tickets.
 
 - **Own state root per case.** Every case creates a fresh folder under the target directory's temporary folder. The folder is the case's working folder, holding its logs and its `LOCALAPPDATA`, and its `state` subfolder is the `--state-dir`, so cases never touch the machine's real slots, journal or counts, or each other's. Cases run side by side.
+- **Load.** Watchdog-timing cases depend on the scheduler. The gate under test runs at Normal priority, and its command and the build servers it watches run at BelowNormal. Under an all-core load, the gate was measured runnable but not running for up to 13.7 s, and a BelowNormal command for up to 31.8 s with no CPU. So a case never races a fixed sleep against the watcher: its command sleeps past the 600 s hang guard, and only the behaviour under test ends it. A stall window a case relies on is far past those gaps, or the case is ignored and run with `--ignored` on a critical slot (the repo's nextup profile lists them).
 - **Test seams.** Hidden `--test-*` flags, compiled only with the `test-seams` cargo feature, set the timing knobs: `--test-sample-ms` (sample period), `--test-heartbeat-ms` (wait heartbeat; on `gate box` the command heartbeat's period), `--test-poll-ms` (fallback poll) and `--test-stall-ms` (stall window below a second). Each takes whole milliseconds above 0 on `gate run`. The sample and stall knobs drive the watchdog.
 
   Two seams of `gate box` shape the command's console: `--test-box-console fail-before` makes the UTF-8 console fail before the command starts, and `--test-box-park-launch <path>` parks the launch until `<path>` exists ([The box side](#the-box-side)).
@@ -1134,7 +1135,7 @@ A Rust integration suite drives the built `gate.exe` through its CLI and reads o
 
   - `argv`, `pid` (prints `pid <its own pid>`), `env <name>` (prints the variable's value) and `exit <n>` (any 32-bit status).
   - `out <text>`, `err <text>`, `bytes <hex>` (writes those bytes to stdout as they are) and `lines <n> <text>` (prints `<text>1` to `<text><n>`).
-  - `sleep <ms>` and `wait <path>` (until the path exists, giving up after 120 s with exit 1).
+  - `sleep <ms>` and `wait <path>` (until the path exists, giving up after 600 s with exit 1).
   - `burn <stop-path>` (prints `burning`, then spins on the CPU until the file exists) and `chatter <path>` (prints numbered lines `chatter 1`, `chatter 2`, ... about every 50 ms until the file exists).
   - `spawn-wait <path>` starts `fake-tool wait <path>` with the caller's handles, prints `spawned <pid>` and does not wait.
   - `spawn-orphan <path>` runs `fake-tool spawn-wait <path>` as a child, waits for it to end, then continues with its next step, so the waiting helper is left without a parent and its `spawned <pid>` line is the up signal.

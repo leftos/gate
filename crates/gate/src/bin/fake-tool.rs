@@ -1,6 +1,6 @@
 //! The black-box suite's helper program. It runs the steps on its command line in order:
 //! `out <text>` and `err <text>` print a line on stdout or stderr; `sleep <ms>` sleeps; `wait <path>` sleeps until the
-//! path exists, and exits 1 when it has not appeared after 120 s; `burn <stop-path>` prints `burning` on stdout and
+//! path exists, and exits 1 when it has not appeared after 600 s; `burn <stop-path>` prints `burning` on stdout and
 //! spins on the CPU until the file at `<stop-path>` exists, checking about every 10 ms, then goes on to its next step;
 //! `chatter <path>` prints `chatter <n>`, flushed, about every 50 ms until the file at `<path>` exists, then goes on,
 //! so a case can hold its command's log growing, and the watch's stall clock with it, until it is ready for the command
@@ -93,7 +93,8 @@ fn run(args: &[OsString]) -> Result<i32, String> {
                 let path = operand(&mut steps, "wait")?;
                 if !wait_for(&path)? {
                     stdout.flush().map_err(|error| write_failed(&error))?;
-                    writeln!(io::stderr().lock(), "fake-tool: {path} did not appear within 120 s").map_err(|error| write_failed(&error))?;
+                    writeln!(io::stderr().lock(), "fake-tool: {path} did not appear within {} s", WAIT_LIMIT.as_secs())
+                        .map_err(|error| write_failed(&error))?;
                     return Ok(1);
                 }
             }
