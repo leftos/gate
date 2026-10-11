@@ -5,6 +5,7 @@ pub const USAGE: &str = "\
 usage: gate run --slot heavy|light|critical --timeout <seconds> --log <path> [options] -- <command> [args...]
        gate stop-tree <pid>
        gate cutover
+       gate push
        gate --version | --help
 
 run options:

@@ -1,4 +1,5 @@
-//! The routing file, `remote.json`, read from its text: the builder's `host`, the remote pool's `slots` (a whole
+//! The routing file, `remote.json`, read from its text: the builder's `host`, the optional `hosts` (further builders,
+//! which `gate push` reaches and routing neither reads nor refuses), the remote pool's `slots` (a whole
 //! number 1 to 16, 1 when missing), `repos` (each repo name's list of `-like` patterns for the commands that route) and
 //! the optional `outputs` (each repo name's globs for the files a routed run brings back). Keys match in any letter
 //! case and unknown keys are ignored. The text may hold `//` and `/* */` comments and trailing commas, as the
@@ -21,7 +22,10 @@ const MAX_SLOTS: u32 = 16;
 /// A usable routing file.
 #[derive(Debug, Clone)]
 pub struct Config {
-    host: String,
+    /// `host`, then each `hosts` entry; never empty.
+    builders: Vec<String>,
+    /// Why `hosts` cannot be used, which routing ignores.
+    hosts_problem: Option<String>,
     slots: u32,
     repos: Vec<(String, Vec<Pattern>)>,
     outputs: Vec<(String, Vec<Pattern>)>,
@@ -57,7 +61,8 @@ impl Config {
     /// of non-empty valid patterns, or an output glob holding `[` or `]`.
     ///
     /// A `host` that is not an ssh alias or `user@host` of letters, digits, `.`, `_` and `-` is refused with a reason of
-    /// the gate's own, since the PowerShell gate accepts it.
+    /// the gate's own, since the PowerShell gate accepts it. A bad `hosts` leaves the file usable for routing, and
+    /// [`Config::builders`] gives its reason.
     pub fn parse(text: &str) -> Result<Self, String> {
         let text = strict_json(text.strip_prefix('\u{feff}').unwrap_or(text));
         // PowerShell's JSON reader gives no value at all for blank text, which is then no JSON object.
@@ -73,13 +78,37 @@ impl Config {
         let slots = read_slots(&data)?;
         let repos = read_table(&data, "repos", true)?;
         let outputs = read_table(&data, "outputs", false)?;
-        Ok(Self { host, slots, repos, outputs })
+        let (builders, hosts_problem) = match read_builders(&data, &host) {
+            Ok(builders) => (builders, None),
+            Err(problem) => (vec![host], Some(problem)),
+        };
+        Ok(Self {
+            builders,
+            hosts_problem,
+            slots,
+            repos,
+            outputs,
+        })
     }
 
-    /// The builder's host alias.
+    /// The builder's host alias, the one a routed run goes to.
     #[must_use]
     pub fn host(&self) -> &str {
-        &self.host
+        &self.builders[0]
+    }
+
+    /// Every builder: `host`, then each `hosts` entry in file order, an entry equal to an earlier one in any letter case
+    /// skipped.
+    ///
+    /// # Errors
+    ///
+    /// Why `hosts` cannot be used: not an array of strings, or an entry `host` would refuse. Routing reads the file
+    /// whatever `hosts` holds.
+    pub fn builders(&self) -> Result<&[String], &str> {
+        match &self.hosts_problem {
+            Some(problem) => Err(problem),
+            None => Ok(&self.builders),
+        }
     }
 
     /// The remote pool's size.
@@ -218,20 +247,63 @@ fn property<'a>(object: &'a Map<String, Value>, key: &str) -> Option<&'a Value> 
 /// characters are safe in all three.
 fn read_host(data: &Map<String, Value>) -> Result<String, String> {
     let value = property(data, "host").ok_or_else(|| "host is missing".to_owned())?;
-    match value {
-        Value::String(host) if is_drive_letter(host) => Err(DRIVE_REFUSAL.to_owned()),
-        Value::String(host) if is_host(host) => Ok(host.clone()),
-        Value::String(host) if !host.is_empty() => Err(HOST_REFUSAL.to_owned()),
-        _ => Err("host must be a non-empty string".to_owned()),
-    }
+    checked_host(value, &HOST_REFUSALS)
 }
 
-/// The reason a host that is not an ssh alias or `user@host` of letters, digits, `.`, `_` and `-` is refused: a reason
-/// of the gate's own, since the PowerShell gate accepts such a host.
-const HOST_REFUSAL: &str = "host must be an ssh alias or user@host of letters, digits, '.', '_' and '-', not starting with '-'";
+/// The builders: `host`, then each entry of the optional `hosts`, an array of strings each checked as `host` is, in
+/// file order, an entry equal to an earlier builder in any letter case skipped.
+fn read_builders(data: &Map<String, Value>, host: &str) -> Result<Vec<String>, String> {
+    let mut builders = vec![host.to_owned()];
+    let Some(value) = property(data, "hosts") else {
+        return Ok(builders);
+    };
+    let Value::Array(entries) = value else {
+        return Err("hosts must be an array of strings".to_owned());
+    };
+    for entry in entries {
+        let entry = checked_host(entry, &HOSTS_REFUSALS)?;
+        if !builders.iter().any(|earlier| eq_ignoring_case(earlier, &entry)) {
+            builders.push(entry);
+        }
+    }
+    Ok(builders)
+}
 
-/// The reason a host of one letter is refused: git reads `b:path` as a path on drive `B:`, not as `path` on the host.
-const DRIVE_REFUSAL: &str = "host must not be a single letter, which a git host:path URL reads as a drive";
+/// The reasons a key holding a host gives for each kind of host it refuses.
+struct HostRefusals {
+    /// Not a string, or an empty one.
+    empty: &'static str,
+    /// One letter, which git reads as a drive.
+    drive: &'static str,
+    /// Not an ssh alias or `user@host` of letters, digits, `.`, `_` and `-`.
+    characters: &'static str,
+}
+
+/// The reasons of `host`. A host that is not an ssh alias or `user@host` of letters, digits, `.`, `_` and `-` is
+/// refused for a reason of the gate's own, since the PowerShell gate accepts such a host; one of one letter because
+/// git reads `b:path` as a path on drive `B:`, not as `path` on the host.
+const HOST_REFUSALS: HostRefusals = HostRefusals {
+    empty: "host must be a non-empty string",
+    drive: "host must not be a single letter, which a git host:path URL reads as a drive",
+    characters: "host must be an ssh alias or user@host of letters, digits, '.', '_' and '-', not starting with '-'",
+};
+
+/// The reasons of a `hosts` entry, worded as those of `host`.
+const HOSTS_REFUSALS: HostRefusals = HostRefusals {
+    empty: "hosts entries must each be a non-empty string",
+    drive: "hosts entries must not be a single letter, which a git host:path URL reads as a drive",
+    characters: "hosts entries must each be an ssh alias or user@host of letters, digits, '.', '_' and '-', not starting with '-'",
+};
+
+/// `value` as a host, or the reason from `refusals` it is refused for.
+fn checked_host(value: &Value, refusals: &HostRefusals) -> Result<String, String> {
+    match value {
+        Value::String(host) if is_drive_letter(host) => Err(refusals.drive.to_owned()),
+        Value::String(host) if is_host(host) => Ok(host.clone()),
+        Value::String(host) if !host.is_empty() => Err(refusals.characters.to_owned()),
+        _ => Err(refusals.empty.to_owned()),
+    }
+}
 
 /// Whether `host` is one ASCII letter, which a git `host:path` URL reads as a drive.
 fn is_drive_letter(host: &str) -> bool {

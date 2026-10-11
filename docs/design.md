@@ -32,6 +32,7 @@ The CLI is subcommands with GNU-style flags: `--name value` or `--name=value`, a
 | `gate run` | Run one command under a slot and the watchdog. |
 | `gate stop-tree` | Stop a process tree, reaching the gate jobs inside it. |
 | `gate cutover` | Switch this machine from the PowerShell gate to `gate.exe`, draining it first. |
+| `gate push` | Copy the installed `gate.exe` to every builder `remote.json` names. |
 | `gate box` | Hidden: the builder side of a routed run. |
 | `gate --version` | Print the version and exit 0. |
 | `gate --help`, `gate help` | Print the usage on stdout and exit 0. |
@@ -113,6 +114,40 @@ After the list, each scan says, in this order:
 The drain ends only when every scan across a 5 s confirmation window finds no gate; a scan that finds one resets the window. Ctrl+C prints `gate: cutover: interrupted; the flag stays set, and running gate cutover again resumes the wait` and exits 0xC000013A. A rerun resumes; the take-back is deleting the flag by hand.
 
 Test-seams builds accept hidden options on `cutover`: `--test-poll-ms`, `--test-heartbeat-ms`, `--test-confirm-ms` and the switch `--test-cutover-interrupt-after-list` (raises the interrupt once the first list is printed). `--test-print-request` prints `{"mode":"cutover","localAppData":...,"testSeams":{"pollMs","heartbeatMs","confirmMs","interruptAfterList"}}`.
+
+### `gate push`
+
+`gate push` takes no words; its usage line is `       gate push`, after `gate cutover`. A word prints `gate: unexpected argument <word>` and any option, `--state-dir` included, prints `gate: unknown option <opt>`, each followed by the usage, exit 2. It reads `%LOCALAPPDATA%` only; `GATE_STATE_DIR` is ignored. What it does is [Install](#install); this is what it says.
+
+It copies the installed `%LOCALAPPDATA%\gate\bin\gate.exe` to each builder, one after another, in the order `host` then `hosts` of `remote.json` ([remote.json](#remotejson)). The routing file must be one routing accepts, so `repos` and the other keys are checked as routing checks them. Every builder is tried, whatever happened to an earlier one. The exit is 1 if any builder failed or nothing could be pushed, else 0.
+
+With nothing to push or nowhere to push it, `gate push` tries no builder, prints one line on stderr and exits 1:
+
+- `push: no remote.json at <path>`;
+- `push: ignored <path>: <reason>`, the router's reason text for an unusable file, or for a bad `hosts` ([remote.json](#remotejson));
+- `push: no installed gate at <path>; run tools/install.ps1`;
+- `push: no remote.json: LOCALAPPDATA is not an absolute folder`, for an unset, empty or relative `LOCALAPPDATA`;
+- `push: could not read the version of <path>`, when the installed exe's `--version` gives no `gate <version>` line or takes over 30 s;
+- `push: cannot read <path>: <error>`, when the installed exe cannot be read.
+
+`<v>`, `<old>` and `<new>` are the text after `gate ` in `gate.exe --version`, as `tools/install.ps1` reads it; the local one is read once, before the first builder. Per builder, on stdout:
+
+1. `push: <host>: sending gate <v>`, before the transfer.
+2. Then one of `push: <host>: gate <v> already installed` (an identical SHA-256: nothing was replaced), or `push: <host>: replaced gate <old>` followed by `push: <host>: installed gate <new>` (`replaced` only when a gate was there before), or on stderr `push: <host> failed: <reason>`.
+
+`push: <host>: could not delete <path>: <message>` on stderr names an aside or stale temporary copy the builder could not delete; it never fails the push.
+
+A failure reason is one of: `timed out after <n> s`, `no answer`, ssh's last stderr line, `cannot feed the call: <error>`, the builder script's own (`the copy arrived damaged`; `the installed copy does not match` with `; the previous gate.exe is back in place` or `; the previous gate.exe is at <aside>`; `<dir> is a link`; the failing step's message). Builder text is escaped as the remote client escapes it and cut to 4096 bytes.
+
+Each builder is one ssh call, run in a kill-on-close job with stdin piped and bounded at 300 s.
+
+A timeout stops only the local ssh, so the builder's install may still finish. The call is `pwsh -NoProfile -NonInteractive -OutputFormat Text -EncodedCommand <script>` through the transport's ssh words ([Routing](#routing-and-the-remoteps1-bridge)), and the exe goes on stdin as base64 text. The builder needs pwsh 7.1 or later. The script carries this PC's SHA-256 of the exe and refuses bytes that differ, reports on `gate-push: ` lines that this side maps to the `push:` lines, and exits 1 after a failure. Concurrent pushes to one builder are not locked.
+
+On the builder the script installs as `tools/install.ps1` does ([Install](#install)), in its own `%LOCALAPPDATA%\gate\bin`, which it creates when missing and refuses when it is a link: it deletes the aside copies (`gate.exe.*.old`) and the stale `gate.exe.<pid>.tmp` copies no process holds; says the same version when `gate.exe` already has the same SHA-256; else writes the exe to `gate.exe.<pid>.tmp` (created new), moves the old one aside to `gate.exe.<stamp>.<pid>.old`, moves the temporary file into place, checks the SHA-256 of the installed copy and moves the aside copy back when anything failed.
+
+Each version read on the builder is bounded at 30 s.
+
+Test-seams builds accept hidden options on `push`: `--test-push-ssh <path>` (the program each builder's call runs in place of the ssh found along `PATH`) and `--test-push-bound-ms <n>` (the 300 s bound, in milliseconds above 0). `gate push` has no `--test-print-request`.
 
 ### `gate box`
 
@@ -498,7 +533,13 @@ Readers accept these optional fields now; their issues write them:
 
 ### remote.json
 
-`remote.json` keeps the PowerShell gate's format (T1), read by `gate-router` as [Routing](#routing-and-the-remoteps1-bridge) describes: `host`, `slots`, `repos` and the optional per-repo `outputs`, read afresh by each routed gate and ignored as a whole with one line when unusable. A host of one letter is refused (`host must not be a single letter, which a git host:path URL reads as a drive`). It carries no `v` while the bridge stands; its format moves with the remote port (GATE-10).
+`remote.json` keeps the PowerShell gate's format (T1), read by `gate-router` as [Routing](#routing-and-the-remoteps1-bridge) describes: `host`, `slots`, `repos` and the optional per-repo `outputs`, read afresh by each routed gate and ignored as a whole with one line when unusable. A host of one letter is refused (`host must not be a single letter, which a git host:path URL reads as a drive`).
+
+The optional `hosts` is an array of strings naming further builders, which only `gate push` reaches; a routed run goes to `host` alone. Each entry passes the checks `host` does, with the same reasons worded `hosts entries ...`. The push order is `host`, then `hosts` in file order, an entry equal to an earlier one in any letter case skipped. A `hosts` that is not an array of strings, or holds a bad entry, never affects routing: `gate push` alone refuses the file with `push: ignored <path>: <reason>`.
+
+ops-tower reads only `slots`.
+
+ It carries no `v` while the bridge stands; its format moves with the remote port (GATE-10).
 
 ## Critical drain and nesting
 
@@ -776,7 +817,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
   Ctrl+C ends it with `STATUS_CONTROL_C_EXIT` and no line. A log that cannot be written gives status 1, with no fallback.
 - **The remote client's run** (GATE-43, parts B1, B2, C1 and C2) is built in `remote/{client,payload,retry,syncback,transport,watchdog}.rs` and dormant: a production gate runs the bridge instead. Only a build with the `test-seams` feature has it, chosen by `gate run --test-remote-transport local:<folder>`, which stands in for the builder with a local folder.
 
-  The real ssh transport (`Ssh` in `remote/transport.rs`) is built and unit-tested but selected by nothing: the remote cutover (GATE-46) selects it for routed runs, and `gate push` (GATE-65) reuses it.
+  The real ssh transport (`Ssh` in `remote/transport.rs`) is built and unit-tested and used by `gate push` ([`gate push`](#gate-push)) in every build; the rest of the client stays dormant, and the remote cutover (GATE-46) selects the client for routed runs. `transport.rs`'s ssh words and `Ssh::find` build without `test-seams` for the push.
 
   The phases run in this order. Any `gate: the remote run failed` line ends the run with status 1 and no fallback; Ctrl+C at any point after the snapshot ends the run as an interrupt.
   - **Lock.** The run takes the routed lock, `Local\gate-[<root hash>-]routed-<16 hex>` ([Kernel object names](#kernel-object-names)), before the remote slot, with a zero wait, and holds it for the whole remote attempt.
@@ -899,7 +940,9 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
 ## The box side
 
-A builder runs the same `gate.exe`, under the hidden `gate box` subcommand, from its own `%LOCALAPPDATA%\gate\bin`. The exe is pushed to every builder the local `remote.json` names, over ssh, by the remote port (GATE-65), not by the local install script. A routed run first learns the builder's gate version; when it differs from its own, the run falls back to local, saying `gate: not routed: <host> runs gate <version>, this PC <version>`, and journals `fallback` with reason `version`.
+A builder runs the same `gate.exe`, under the hidden `gate box` subcommand, from its own `%LOCALAPPDATA%\gate\bin`. The exe is pushed to every builder the local `remote.json` names, over ssh, by `gate push` ([`gate push`](#gate-push)), not by the local install script.
+
+A routed run first learns the builder's gate version; when it differs from its own, the run falls back to local, saying `gate: not routed: <host> runs gate <version>, this PC <version>`, and journals `fallback` with reason `version`.
 
 Builders are configured only in the local `%LOCALAPPDATA%\gate\remote.json`. The repo, its docs and its tests name no builder; the suite's remote cases run against a stub.
 
@@ -1071,7 +1114,7 @@ The rest of the protocol, the transport of snapshots and outputs, is the remote 
 - It adds `%LOCALAPPDATA%\gate\bin` to the user's PATH when missing, so callers run `gate`: the raw registry value of the user environment is read and written, keeping its kind and its unexpanded `%NAME%` entries; the change is broadcast (`WM_SETTINGCHANGE`, as `setx` does) so programs started from then on see it, and the script says to open a new terminal. It never touches the state root's files.
 - `-WhatIf` lists every step without taking it. `-Exe` (install a prebuilt exe, skipping the build) and `-EnvironmentKey` (the registry key the PATH entry lives in) exist for the suite, which runs the script against a temporary `LOCALAPPDATA` and registry key.
 - Every install also copies `tools/remote-bridge.ps1` to `%LOCALAPPDATA%\gate\bin\remote-bridge.ps1`, where the bridge looks for it. The copy goes to `remote-bridge.ps1.<pid>.tmp` beside it and is moved into place with `Move-Item -Force`.
-- The script installs locally only. Pushing the exe to each builder in `remote.json`, with the same rename-aside on the builder, belongs to the remote port (GATE-65).
+- The script installs locally only. `gate push` copies the installed exe to each builder in `remote.json` (`host`, then `hosts`), with the same rename-aside on the builder, so a machine with builders runs `pwsh tools/install.ps1` and then `gate push` ([`gate push`](#gate-push)). It pushes the installed exe, never one from `target/`, and never installs here.
 - Install is a script, not a `gate install` subcommand.
 
 ## Cutover
@@ -1146,6 +1189,8 @@ A Rust integration suite drives the built `gate.exe` through its CLI and reads o
   Two more seams make a run end by Ctrl+C without a console: `--test-interrupt-after-samples <n>` raises the interrupt after the n-th sample, and `--test-interrupt-queued` raises it when the waiting line is printed, so once no slot is free for the gate. `--test-print-request` shows them as `testSeams.interruptAfterSamples` and `testSeams.interruptQueued`.
 
   On `cutover` the seams are `--test-poll-ms`, `--test-heartbeat-ms`, `--test-confirm-ms` (the confirmation window) and the switch `--test-cutover-interrupt-after-list`; `--test-print-request` shows them as `testSeams.pollMs`, `heartbeatMs`, `confirmMs` and `interruptAfterList` ([`gate cutover`](#gate-cutover)).
+
+  On `push` the seams are `--test-push-ssh <path>` (the ssh program to run instead of the one found along `PATH`, the suite's `fake-ssh`) and `--test-push-bound-ms <n>` (each builder's bound); `push` has no `--test-print-request` ([`gate push`](#gate-push)).
 
   `--test-print-request`, on `run`, `stop-tree`, `cutover` and the compatibility form, prints the parsed request as one JSON line on stdout and exits 0, so the suite sees what a command line asked for; it is the one hidden switch the compatibility layer accepts.
 

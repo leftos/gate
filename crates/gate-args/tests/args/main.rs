@@ -8,6 +8,7 @@ mod boxcmd;
 mod compat;
 mod cutover;
 mod program;
+mod push;
 mod quoting;
 mod run;
 mod seams;

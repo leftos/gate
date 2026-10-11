@@ -7,13 +7,13 @@
 #![expect(clippy::expect_used, reason = "a test that cannot start or wait for its command must fail loudly")]
 
 use std::fs::File;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::{Once, mpsc};
 use std::thread;
 use std::time::Duration;
 
-use gate_win32::{EnvironmentBlock, Job, OpenedJob, PipedConsole, PipedLaunch, PipedSuspended, Running};
+use gate_win32::{EnvironmentBlock, Job, OpenedJob, PipedConsole, PipedFed, PipedLaunch, PipedSuspended, Running};
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_BREAKAWAY_OK, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
     JobObjectExtendedLimitInformation, SetInformationJobObject,
@@ -157,6 +157,24 @@ fn an_anonymous_kill_on_close_job_holds_its_command_and_ends_it_when_dropped() {
         running.wait(HANG_GUARD).expect("the wait answers").is_some(),
         "closing the anonymous job's only handle ended the command"
     );
+}
+
+#[test]
+fn a_fed_launch_gives_the_child_its_stdin() {
+    let job = Job::anonymous_kill_on_close().expect("the job is created");
+    let PipedFed {
+        suspended,
+        mut stdin,
+        stdout,
+        stderr,
+    } = cmd("sort&1>&2 echo err").start_suspended_within_fed(&job).expect("the command starts");
+    let running = suspended.assign_and_resume(&job).expect("the command is assigned and resumed");
+    stdin.write_all(b"b\r\na\r\n").expect("the command's stdin takes the lines");
+    drop(stdin);
+
+    assert_eq!(read_all(stdout), "a\r\nb\r\n", "sort read the fed lines to their end");
+    assert_eq!(read_all(stderr), "err\r\n");
+    assert_eq!(running.wait(HANG_GUARD).expect("the wait answers"), Some(0));
 }
 
 #[test]

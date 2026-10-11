@@ -4,10 +4,15 @@
 //! this gate's own `box` with the words the line carries after the builder's gate, or a stand-in for ssh with ssh's own
 //! words, and pushes to the bare repository's own path; its `local-ssh:` form pushes and fetches as the ssh transport
 //! does, to `<host>:<path>` with the stand-in as git's ssh.
+//!
+//! A gate built without the `test-seams` feature has only what `gate push` needs of it: the ssh options, ssh's words
+//! and ssh itself.
 
 use std::ffi::OsString;
+#[cfg(feature = "test-seams")]
 use std::path::{Path, PathBuf};
 
+#[cfg(feature = "test-seams")]
 use crate::remote::payload::{self, BOX_EXE};
 
 /// The options of every ssh call, git's own included: no prompt, the timeouts, and nothing forwarded to the builder.
@@ -27,6 +32,7 @@ pub(crate) const SSH_OPTIONS: [&str; 12] = [
 ];
 
 /// A program and the words it is started with.
+#[cfg(feature = "test-seams")]
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Program {
     pub program: PathBuf,
@@ -35,6 +41,7 @@ pub(crate) struct Program {
 
 /// Where a snapshot is pushed: the URL, the receive-pack the builder runs, and the ssh command git runs; the latter two
 /// `None` for a bare repository on this machine.
+#[cfg(feature = "test-seams")]
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct PushTarget {
     pub url: String,
@@ -43,6 +50,7 @@ pub(crate) struct PushTarget {
 }
 
 /// The way to the builder.
+#[cfg(feature = "test-seams")]
 pub(crate) trait Transport {
     /// The builder's root, which every work folder and bare repository lives under.
     fn root(&self) -> &str;
@@ -66,6 +74,7 @@ pub(crate) fn ssh_words(host: &str, line: &str) -> Vec<OsString> {
 /// The local transport of `--test-remote-transport local:<folder>`: the builder's root `<folder>`, every call this
 /// gate's own exe, or the stand-in `stub` of `--test-remote-ssh` given ssh's words. Of `local-ssh:<folder>`, git's ssh
 /// command too, the stand-in's, which git runs for the push and the sync-back's calls.
+#[cfg(feature = "test-seams")]
 pub(crate) struct Local {
     root: String,
     gate: PathBuf,
@@ -73,6 +82,7 @@ pub(crate) struct Local {
     git_ssh: Option<String>,
 }
 
+#[cfg(feature = "test-seams")]
 impl Local {
     /// The local transport `transport` names, `local:<folder>` or `local-ssh:<folder>` with the folder read against the
     /// working directory, its calls made through `stub` when one is given, which `local-ssh:` needs; else the line
@@ -104,6 +114,7 @@ impl Local {
     }
 }
 
+#[cfg(feature = "test-seams")]
 impl Transport for Local {
     fn root(&self) -> &str {
         &self.root
@@ -148,6 +159,7 @@ impl Transport for Local {
 }
 
 /// The words `line` carries after the builder's gate: `box`, the verb and the payload word.
+#[cfg(feature = "test-seams")]
 fn box_words(line: &str) -> Vec<OsString> {
     line.strip_prefix(BOX_EXE)
         .unwrap_or(line)
@@ -158,25 +170,30 @@ fn box_words(line: &str) -> Vec<OsString> {
 
 /// The ssh transport: OpenSSH found along the gate's own `PATH`, the builder's root `D:\gate-remote`, and git pushing
 /// over ssh to a receive-pack started through pwsh, which reads the single-quoted path git sends through cmd.
-#[cfg_attr(not(test), expect(dead_code, reason = "no seam selects the ssh transport; only its tests build it"))]
-mod ssh {
-    use std::path::{Path, PathBuf};
+/// `gate push` runs its calls with ssh's own path; no seam selects the ssh transport for a routed run.
+pub(crate) mod ssh {
+    #[cfg(feature = "test-seams")]
+    use std::path::Path;
+    use std::path::PathBuf;
 
+    #[cfg(feature = "test-seams")]
     use super::{Program, PushTarget, SSH_OPTIONS, Transport, ssh_words};
     use crate::environment::Variables;
     use crate::run::find_program;
 
+    #[cfg(feature = "test-seams")]
     const BUILDER_ROOT: &str = r"D:\gate-remote";
+    #[cfg(feature = "test-seams")]
     const RECEIVE_PACK: &str = "pwsh -NoProfile -NonInteractive -Command git-receive-pack";
+    #[cfg(feature = "test-seams")]
     const UPLOAD_PACK: &str = "pwsh -NoProfile -NonInteractive -Command git-upload-pack";
 
     pub(crate) struct Ssh {
-        pub(super) program: PathBuf,
+        pub(crate) program: PathBuf,
     }
 
     impl Ssh {
         /// ssh found along the gate's own `PATH`, read against the working directory; else why it cannot be found.
-        #[expect(dead_code, reason = "no seam selects the ssh transport, and its tests give ssh's path themselves")]
         pub(crate) fn find() -> Result<Ssh, String> {
             let folder = std::env::current_dir().map_err(|error| format!("cannot read the working directory: {error}"))?;
             find_program("ssh", &Variables::from_process(), &folder)
@@ -185,6 +202,7 @@ mod ssh {
         }
     }
 
+    #[cfg(feature = "test-seams")]
     impl Transport for Ssh {
         fn root(&self) -> &str {
             BUILDER_ROOT
@@ -216,6 +234,7 @@ mod ssh {
 
     /// The ssh command git runs: ssh's path with `/` separators, single-quoted for the shell git starts it through, and
     /// the options.
+    #[cfg(feature = "test-seams")]
     pub(super) fn git_ssh_command(ssh: &Path) -> String {
         let path = ssh.to_string_lossy().replace('\\', "/");
         let quoted = format!("'{}'", path.replace('\'', r"'\''"));
@@ -223,7 +242,7 @@ mod ssh {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-seams"))]
 #[expect(clippy::expect_used, reason = "a test whose transport cannot be made must fail loudly")]
 mod tests {
     use std::ffi::OsString;

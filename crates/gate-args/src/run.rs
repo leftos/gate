@@ -5,7 +5,9 @@ use std::iter::Peekable;
 use std::path::PathBuf;
 
 use crate::problem::{Problem, Required, Spelling};
-use crate::request::{CutoverRequest, CutoverSeams, DEFAULT_STALL_SECONDS, DEFAULT_TAIL_LINES, RunRequest, Slot, StopRequest, TestSeams};
+use crate::request::{
+    CutoverRequest, CutoverSeams, DEFAULT_STALL_SECONDS, DEFAULT_TAIL_LINES, PushRequest, PushSeams, RunRequest, Slot, StopRequest, TestSeams,
+};
 use crate::values;
 
 /// An option that takes a value.
@@ -57,6 +59,10 @@ pub(crate) enum ValueOption {
     BridgePwsh,
     #[cfg(feature = "test-seams")]
     ConfirmMs,
+    #[cfg(feature = "test-seams")]
+    PushSsh,
+    #[cfg(feature = "test-seams")]
+    PushBoundMs,
 }
 
 /// An option that is on or off.
@@ -102,6 +108,8 @@ pub(crate) struct RunBuilder {
     /// `gate cutover`'s own seams, `--test-confirm-ms` and `--test-cutover-interrupt-after-list`; its poll and
     /// still-waiting period are read into `test_seams`, as a run's are.
     cutover_seams: CutoverSeams,
+    /// `gate push`'s own seams, `--test-push-ssh` and `--test-push-bound-ms`.
+    push_seams: PushSeams,
     given: Vec<RunOption>,
     pub(crate) problems: Vec<Problem>,
 }
@@ -206,6 +214,10 @@ impl RunBuilder {
             ValueOption::BridgePwsh => self.test_seams.bridge_pwsh = Some(PathBuf::from(value)),
             #[cfg(feature = "test-seams")]
             ValueOption::ConfirmMs => self.cutover_seams.confirm_ms = Some(values::above_zero(spelled, value)?),
+            #[cfg(feature = "test-seams")]
+            ValueOption::PushSsh => self.push_seams.ssh = Some(PathBuf::from(value)),
+            #[cfg(feature = "test-seams")]
+            ValueOption::PushBoundMs => self.push_seams.bound_ms = Some(values::above_zero(spelled, value)?),
         }
         Ok(())
     }
@@ -349,6 +361,14 @@ impl RunBuilder {
                 interrupt_after_list: self.cutover_seams.interrupt_after_list,
             },
         })
+    }
+
+    /// The push request, its seams the ssh and bound read, or every problem found.
+    pub(crate) fn finish_push(self) -> Result<PushRequest, Vec<Problem>> {
+        if !self.problems.is_empty() {
+            return Err(self.problems);
+        }
+        Ok(PushRequest { seams: self.push_seams })
     }
 }
 

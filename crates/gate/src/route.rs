@@ -72,6 +72,23 @@ fn slot(slot: Slot) -> gate_router::Slot {
     }
 }
 
+/// The routing file at `path`: `None` when there is none; else why it cannot be used: not a file, unreadable, or
+/// refused by [`Config::parse`]. Routing and `gate push` read it through this.
+pub(crate) fn read_remote_json(path: &Path) -> Result<Option<Config>, ConfigProblem> {
+    let problem = |reason: String| ConfigProblem {
+        path: path.to_path_buf(),
+        reason,
+    };
+    match fs::metadata(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(problem(error.to_string())),
+        Ok(metadata) if !metadata.is_file() => return Err(problem("not a file".to_owned())),
+        Ok(_) => {}
+    }
+    let bytes = fs::read(path).map_err(|error| problem(error.to_string()))?;
+    Config::parse(&String::from_utf8_lossy(&bytes)).map(Some).map_err(problem)
+}
+
 /// This machine's facts: the gate's working folder, or why it cannot be read, the LOCALAPPDATA folder that holds the
 /// routing file, and how long each of the decision's git calls may take.
 struct Machine<'a> {
@@ -86,16 +103,7 @@ impl Facts for Machine<'_> {
         let Some(folder) = self.local_app_data.map(Path::new).filter(|folder| folder.is_absolute()) else {
             return Ok(None);
         };
-        let path = folder.join("gate").join("remote.json");
-        let problem = |reason: String| ConfigProblem { path: path.clone(), reason };
-        match fs::metadata(&path) {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(problem(error.to_string())),
-            Ok(metadata) if !metadata.is_file() => return Err(problem("not a file".to_owned())),
-            Ok(_) => {}
-        }
-        let bytes = fs::read(&path).map_err(|error| problem(error.to_string()))?;
-        Config::parse(&String::from_utf8_lossy(&bytes)).map(Some).map_err(problem)
+        read_remote_json(&folder.join("gate").join("remote.json"))
     }
 
     fn place(&self) -> Result<Option<Place>, String> {

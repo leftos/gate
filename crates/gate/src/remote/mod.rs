@@ -30,8 +30,7 @@ mod retry;
 mod snapshot;
 #[cfg(feature = "test-seams")]
 mod syncback;
-#[cfg(feature = "test-seams")]
-mod transport;
+pub(crate) mod transport;
 #[cfg(feature = "test-seams")]
 mod watchdog;
 

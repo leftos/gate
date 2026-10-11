@@ -27,6 +27,8 @@ pub enum Invocation {
     StopTree(StopRequest),
     /// `gate cutover`.
     Cutover(CutoverRequest),
+    /// `gate push`.
+    Push(PushRequest),
     /// The hidden `gate box <verb> <payload>`.
     Box(BoxRequest),
 }
@@ -214,4 +216,21 @@ pub struct CutoverSeams {
     /// Raise the console interrupt right after the first list of the gates waited on is said
     /// (`--test-cutover-interrupt-after-list`).
     pub interrupt_after_list: bool,
+}
+
+/// A valid `gate push`, which takes no words: only the hidden seams the black-box suite gives it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PushRequest {
+    /// The hidden `--test-*` flags that set the push's ssh and bound.
+    pub seams: PushSeams,
+}
+
+/// What the black-box suite sets on `gate push` through its hidden `--test-*` flags; each field keeps its default,
+/// `None`, in a gate built without the `test-seams` feature.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PushSeams {
+    /// The program each builder's call runs in place of the ssh found along `PATH` (`--test-push-ssh`).
+    pub ssh: Option<PathBuf>,
+    /// How long each builder's call may take before it is killed, in milliseconds (`--test-push-bound-ms`).
+    pub bound_ms: Option<u64>,
 }

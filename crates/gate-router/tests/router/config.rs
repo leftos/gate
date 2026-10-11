@@ -235,6 +235,87 @@ fn the_host_allowlist_refuses_one_letter_which_git_would_read_as_a_drive() {
 }
 
 #[test]
+fn hosts_adds_builders_after_host() {
+    let config = Config::parse(r#"{"host": "builder-1", "Hosts": ["builder-2", "user@build-box.lan"], "repos": {}}"#).expect("usable");
+    assert_eq!(config.host(), "builder-1", "routing keeps the one host");
+    assert_eq!(
+        config.builders(),
+        Ok(["builder-1", "builder-2", "user@build-box.lan"].map(String::from).as_slice())
+    );
+}
+
+#[test]
+fn a_hosts_entry_equal_to_host_is_skipped() {
+    let config = Config::parse(r#"{"host": "builder-1", "hosts": ["BUILDER-1", "b2", "B2", "b3"], "repos": {}}"#).expect("usable");
+    assert_eq!(
+        config.builders(),
+        Ok(["builder-1", "b2", "b3"].map(String::from).as_slice()),
+        "an entry equal to an earlier one in any letter case is skipped"
+    );
+}
+
+#[test]
+fn a_bad_hosts_entry_ignores_the_file() {
+    let cases = [
+        (
+            r#"["b2", "z"]"#,
+            "hosts entries must not be a single letter, which a git host:path URL reads as a drive",
+        ),
+        (
+            r#"["a b"]"#,
+            "hosts entries must each be an ssh alias or user@host of letters, digits, '.', '_' and '-', not starting with '-'",
+        ),
+        (
+            r#"["-oProxyCommand=x"]"#,
+            "hosts entries must each be an ssh alias or user@host of letters, digits, '.', '_' and '-', not starting with '-'",
+        ),
+        (r#"["b2", ""]"#, "hosts entries must each be a non-empty string"),
+        ("[3]", "hosts entries must each be a non-empty string"),
+    ];
+    let failures: Vec<String> = cases
+        .iter()
+        .filter_map(|(hosts, expected)| {
+            let config = Config::parse(&format!(r#"{{"host": "builder-1", "hosts": {hosts}, "repos": {{}}}}"#)).expect("usable for routing");
+            let got = config.builders().map(<[String]>::to_vec);
+            (got != Err(*expected)).then(|| format!("{hosts}: expected {expected:?}, got {got:?}"))
+        })
+        .collect();
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+#[test]
+fn hosts_that_is_not_an_array_ignores_the_file() {
+    for hosts in [r#""builder-2""#, "{}", "null", "2"] {
+        let config = Config::parse(&format!(r#"{{"host": "builder-1", "hosts": {hosts}, "repos": {{}}}}"#)).expect("usable for routing");
+        assert_eq!(config.builders(), Err("hosts must be an array of strings"), "{hosts}");
+    }
+}
+
+#[test]
+fn a_bad_hosts_value_leaves_routing_alone() {
+    for hosts in [r#"["z"]"#, r#"["a b"]"#, "[3]", "null", r#""b2""#] {
+        let config = Config::parse(&format!(
+            r#"{{"host": "builder-1", "hosts": {hosts}, "slots": 2, "repos": {{"g": ["x"]}}}}"#
+        ))
+        .expect("routing reads the file whatever hosts holds");
+        assert_eq!(config.host(), "builder-1", "{hosts}");
+        assert_eq!(config.slots(), 2, "{hosts}");
+        assert_eq!(pattern_texts(&config, "g"), ["x"], "{hosts}");
+        assert!(config.builders().is_err(), "the push still refuses {hosts}");
+    }
+}
+
+#[test]
+fn no_hosts_means_host_alone() {
+    let host = ["builder-1".to_owned()];
+    let alone = Ok(host.as_slice());
+    let config = Config::parse(&host_file("builder-1")).expect("usable");
+    assert_eq!(config.builders(), alone);
+    let config = Config::parse(r#"{"host": "builder-1", "hosts": [], "repos": {}}"#).expect("usable");
+    assert_eq!(config.builders(), alone, "an empty hosts adds none");
+}
+
+#[test]
 fn an_ssh_alias_or_user_at_host_of_allowed_characters_is_accepted() {
     for host in ["builder", "build-box.lan", "user@build-box", "10.0.0.5", "b_1"] {
         let config = Config::parse(&host_file(host)).expect("usable");

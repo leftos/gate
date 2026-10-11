@@ -10,13 +10,17 @@ gate run --slot heavy --timeout 900 --log .tmp/test.log -- cargo test --workspac
 
 Pre-release. Nothing here is ready to use yet, and gate is not yet a replacement for anything. The design is written ([docs/design.md](docs/design.md)); the code is being built slice by slice.
 
-So far `gate` reads its command line (`--version`, `--help`, and the argument checks for `run`, `stop-tree` and `cutover`), and `gate run` starts a command under a slot, logs its output, prints the tail and a verdict line, and exits with the command's status.
+So far `gate` reads its command line (`--version`, `--help`, and the argument checks for `run`, `stop-tree`, `cutover` and `push`), and `gate run` starts a command under a slot, logs its output, prints the tail and a verdict line, and exits with the command's status.
 
-The watchdog kills a stalled command, one past its ceiling and one past the backstop, and Ctrl+C stops a run; routing is not built yet. `gate stop-tree <pid>` stops a process tree and the gate jobs inside it. `gate cutover` copies the PowerShell gate's slot counts, writes the cutover flag so new gates start `gate.exe`, and waits for the PowerShell gates still running; deleting the flag by hand goes back. It succeeds a PowerShell gate its author runs today, which stays in use until gate can take its place.
+The watchdog kills a stalled command, one past its ceiling and one past the backstop, and Ctrl+C stops a run; routing is not built yet. `gate stop-tree <pid>` stops a process tree and the gate jobs inside it. `gate push` copies the installed `gate.exe` to the builders.
+
+`gate cutover` copies the PowerShell gate's slot counts, writes the cutover flag so new gates start `gate.exe`, and waits for the PowerShell gates still running; deleting the flag by hand goes back. It succeeds a PowerShell gate its author runs today, which stays in use until gate can take its place.
 
 ## How it will work
 
 - **Install.** `pwsh tools/install.ps1` builds a Release `gate.exe`, puts it in `%LOCALAPPDATA%\gate\bin` and adds that folder to your user PATH; open a new terminal afterwards to use `gate`. Reinstalling while gates are running is safe: the running copy is renamed aside, and the script prints the version it replaced and the version it installed (or that the same build is already installed). It installs on this machine only.
+
+  An owner with builders then runs `gate push`, which copies the installed `gate.exe` to each builder their `remote.json` names (`host`, then the optional `hosts`) the same way and prints a line per builder.
 - **Call.** `gate run --slot heavy|light|critical --timeout <seconds> --log <path> -- <command>`. `heavy` is for work that fills several cores, `light` for one or two, and `critical` for a timing-sensitive run that needs the machine to itself. The command's output goes to the log; gate prints its tail and a one-line verdict, and exits with the command's status, or 124 when it killed the command.
 - **Slots.** The number of slots per kind comes from the machine's core count and can be changed in `%LOCALAPPDATA%\gate\v1\slot-counts.json`.
 - **Remote builders (optional).** A machine can send allowlisted heavy commands to other Windows machines it names in its own `%LOCALAPPDATA%\gate\v1\remote.json`. Builders are configured only there, on your machine; nothing about them lives in this repo. With no such file, gate runs everything locally.

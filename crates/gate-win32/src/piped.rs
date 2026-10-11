@@ -1,4 +1,4 @@
-//! Commands created suspended with their output piped back: stdin from `NUL`, stdout and stderr into two anonymous
+//! Commands created suspended with their output piped back: stdin from `NUL`, or fed through a third pipe, stdout and stderr into two anonymous
 //! pipes whose read ends stay with the caller, outside the caller's own job or within it, and on a hidden console of their own or the
 //! caller's, then put in a job, named or anonymous, and resumed. The command also inherits a handle to that job, so the job's name
 //! lasts while the command runs even after the caller is gone; unless the job kills on close, which a command holding a
@@ -80,7 +80,7 @@ impl PipedLaunch {
     /// (an application that is relative or a batch file, or a NUL in the application, command line or working folder)
     /// or a handle, a pipe or the attribute list cannot be made.
     pub fn start_suspended(&self, job: &Job) -> Result<PipedSuspended, LaunchError> {
-        self.created(job, CREATE_BREAKAWAY_FROM_JOB)
+        self.created(job, CREATE_BREAKAWAY_FROM_JOB, nul()?)
     }
 
     /// Creates the command suspended as [`PipedLaunch::start_suspended`] does, but inside this process's job rather
@@ -91,15 +91,33 @@ impl PipedLaunch {
     ///
     /// As [`PipedLaunch::start_suspended`].
     pub fn start_suspended_within(&self, job: &Job) -> Result<PipedSuspended, LaunchError> {
-        self.created(job, 0)
+        self.created(job, 0, nul()?)
     }
 
-    /// Creates the command suspended with the creation flag `breakaway`, `CREATE_BREAKAWAY_FROM_JOB` or none.
-    fn created(&self, job: &Job, breakaway: PROCESS_CREATION_FLAGS) -> Result<PipedSuspended, LaunchError> {
+    /// Creates the command suspended as [`PipedLaunch::start_suspended_within`] does, but with its stdin the read end
+    /// of a third new pipe, whose write end the returned [`PipedFed`] holds: the command reads what is written there,
+    /// and reaches the end of its input once that end is dropped.
+    ///
+    /// # Errors
+    ///
+    /// As [`PipedLaunch::start_suspended`].
+    pub fn start_suspended_within_fed(&self, job: &Job) -> Result<PipedFed, LaunchError> {
+        let (input, stdin) = pipe_to_child("stdin")?;
+        let PipedSuspended { suspended, stdout, stderr } = self.created(job, 0, input)?;
+        Ok(PipedFed {
+            suspended,
+            stdin,
+            stdout,
+            stderr,
+        })
+    }
+
+    /// Creates the command suspended with the creation flag `breakaway`, `CREATE_BREAKAWAY_FROM_JOB` or none, its stdin
+    /// `input`, a handle the caller made, which is closed here once the command holds its own copy.
+    fn created(&self, job: &Job, breakaway: PROCESS_CREATION_FLAGS, input: OwnedHandle) -> Result<PipedSuspended, LaunchError> {
         check_launch(&self.command_line, &self.application, &[("working folder", self.directory.as_path())])?;
         let job_handle = if job.kills_on_close() { None } else { Some(open_job(job)?) };
         let others: Vec<(&OwnedHandle, Option<u32>)> = job_handle.iter().map(|handle| (handle, Some(JOB_OBJECT_QUERY))).collect();
-        let input = open_shared(Path::new("NUL"), GENERIC_READ, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL)?;
         let (stdout, output) = pipe_from_child("stdout")?;
         let (stderr, errors) = pipe_from_child("stderr")?;
         let creation = Creation {
@@ -121,6 +139,24 @@ impl PipedLaunch {
         drop((input, output, errors, job_handle));
         Ok(PipedSuspended { suspended, stdout, stderr })
     }
+}
+
+/// A handle to `NUL` for a command's stdin.
+fn nul() -> Result<OwnedHandle, LaunchError> {
+    open_shared(Path::new("NUL"), GENERIC_READ, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL)
+}
+
+/// A command [`PipedLaunch::start_suspended_within_fed`] created: the suspended process, the write end of its stdin
+/// and the read ends of its stdout and stderr.
+pub struct PipedFed {
+    /// The command, not yet in its job and not yet run.
+    pub suspended: Suspended,
+    /// The write end of the command's stdin: the command reads to its end once this is dropped.
+    pub stdin: File,
+    /// The read end of the command's stdout.
+    pub stdout: File,
+    /// The read end of the command's stderr.
+    pub stderr: File,
 }
 
 /// Whether this process's own job refuses breakaway, so that [`PipedLaunch::start_suspended`] cannot create a command

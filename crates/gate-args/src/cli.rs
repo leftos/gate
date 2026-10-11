@@ -4,7 +4,7 @@ use std::ffi::OsString;
 use std::iter::Peekable;
 
 use crate::problem::{Problem, Spelling};
-use crate::request::{CutoverRequest, RunRequest, StopRequest};
+use crate::request::{CutoverRequest, PushRequest, RunRequest, StopRequest};
 use crate::run::{RunBuilder, RunOption, SwitchOption, ValueOption, next_text};
 use crate::values;
 
@@ -61,6 +61,21 @@ pub(crate) fn parse_cutover(words: impl Iterator<Item = OsString>) -> Result<Cut
         }
     }
     builder.finish_cutover()
+}
+
+/// Reads the words after `gate push`, which takes none: every word is a problem, `--` included, save the hidden seams
+/// of a build with the `test-seams` feature.
+pub(crate) fn parse_push(words: impl Iterator<Item = OsString>) -> Result<PushRequest, Vec<Problem>> {
+    let mut words = words.peekable();
+    let mut builder = RunBuilder::default();
+    while let Some(text) = next_text(&mut words, &mut builder.problems) {
+        if text.starts_with('-') && text != "--" {
+            read_option(&mut builder, &mut words, &text, push_option);
+        } else {
+            builder.problems.push(Problem::UnexpectedArgument(text));
+        }
+    }
+    builder.finish_push()
 }
 
 /// Reads one option word, `--name` or `--name=value`, taking its value from the next word when it needs one.
@@ -120,6 +135,20 @@ fn cutover_option(name: &str) -> Option<RunOption> {
 
 #[cfg(not(feature = "test-seams"))]
 fn cutover_option(_name: &str) -> Option<RunOption> {
+    None
+}
+
+#[cfg(feature = "test-seams")]
+fn push_option(name: &str) -> Option<RunOption> {
+    match name {
+        "test-push-ssh" => Some(RunOption::Value(ValueOption::PushSsh)),
+        "test-push-bound-ms" => Some(RunOption::Value(ValueOption::PushBoundMs)),
+        _ => None,
+    }
+}
+
+#[cfg(not(feature = "test-seams"))]
+fn push_option(_name: &str) -> Option<RunOption> {
     None
 }
 

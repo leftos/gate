@@ -19,6 +19,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Build client**: a process in the command's job that drives a build (`MSBuild.exe`, or `dotnet` without `--no-build`); only while one runs does a build server's CPU count as the command's progress.
 - **Build server**: a long-lived compiler or MSBuild node process (`VBCSCompiler`, a `dotnet` running `VBCSCompiler.dll` or an MSBuild node) that builds share.
 - **Builder**: a remote Windows machine, named in a PC's own `remote.json`, that runs routed heavy commands with its own copy of `gate.exe`.
+- **Builders list**: the builders `gate push` reaches: `host` of `remote.json`, then each entry of its optional `hosts` in file order, an entry equal to an earlier one in any letter case skipped. Routing uses `host` alone.
 - **Ceiling**: the `--timeout` limit, counted in load-adjusted seconds; passing it kills the command as TIMED OUT.
 - **Claim**: the JSON file `slots\<name>.json` a gate writes while it holds a slot, naming its pid, command, log and ceiling.
 - **Compatibility layer**: `gate.exe`'s acceptance of the PowerShell gate's argument form (`-Log`, `-TimeoutSeconds`, `-Slot` and the rest), kept until no caller uses it.
@@ -71,6 +72,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Probe by open**: reading whether a slot is held by opening its mutex's name: it is held while any handle to that name exists.
 - **Progress**: what resets the stall clock in a sample: the output size changed, the job's CPU reached 1% of one core over the stall window since the last progress, a new pid appeared, or a nested gate is paused.
 - **Pure crate**: a crate with no Windows types in its API that builds and unit-tests on Linux as well (`gate-state`, `gate-watchdog`, `gate-args`, `gate-router`).
+- **Push**: `gate push`, which copies the installed `gate.exe` to every builder on the builders list over ssh and installs it there with the old exe set aside. Not the remote client's push of a snapshot to the builder's git repo.
 - **Refusal**: a builder's or the remote client's answer that a routed run cannot run there, with a reason (`busy`, `unreachable`, `parity`, `rebooted`, `tools`, `version`, `client`); the gate then falls back to a local run.
 - **Release**: see take.
 - **Remote client**: what `gate run` calls to run a routed command on a builder: `RemoteClient` in the gate binary; the `remote.ps1` bridge is the client of a production gate, and a client that cannot start makes the run fall back with reason `client`.
@@ -80,7 +82,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Root hash**: the first 8 hex digits of the SHA-256 of a non-default state root's path, carried in every kernel object name and slot marker of that root.
 - **Routed lock**: the mutex `Local\gate-[<root hash>-]routed-<16 hex>` (the hash of the lower-cased work-folder key) that a routed run takes without waiting, before its remote slot and until its remote attempt ends; a run that finds it taken runs here with reason `busy`.
 - **Routed run**: a heavy gate whose command `remote.json` sends to a builder.
-- **Routing file**: `remote.json` in `%LOCALAPPDATA%\gate\`, naming the builder's host, the remote pool's size and, per repo, the `-like` patterns of the commands that route and the globs of the files a routed run brings back.
+- **Routing file**: `remote.json` in `%LOCALAPPDATA%\gate\`, naming the builder's host (and, for `gate push`, further `hosts`), the remote pool's size and, per repo, the `-like` patterns of the commands that route and the globs of the files a routed run brings back.
 - **Sample**: one reading of a running command taken every 5 s by the sampler: the system's CPU times, the job's CPU and pids, and the log's size, stamped `began` before its reads and `at` after them; the watchdog's clocks advance only by samples.
 - **Sampler**: the Win32 side of the watchdog that takes the samples; if one fails, the watch goes by wall time alone.
 - **Script word**: a command word holding a line break or one of `, ; " ' ) | & < >`, such as a script's text or a list; in it a path ends at white space, where in any other word a path runs through its spaces.
