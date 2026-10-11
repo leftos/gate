@@ -849,7 +849,7 @@ Built verbs:
 
   The tool restore (`boxside/tools.rs`) runs `dotnet tool restore` in `{Work}\{Subfolder}` on a hidden console, in a job of its own named `{job}-tools`, created kill-on-close and never handed to dotnet, so the box's own handle keeps it: a box that dies or is killed takes the restore and everything it started with it, and a process the restore leaves running is terminated before the command starts.
 
-  Its stdout and stderr are forwarded into the run's output line by line under the box's output lock, as the command's are, so they never split a heartbeat line. It has no time limit.
+  Its stdout and stderr are forwarded into the run's output line by line under the box's output lock, as the command's are, so they never split a heartbeat line. It has no time limit: a hung restore holds the work-folder lock, so every routed run of that worktree falls back `busy` meanwhile, and the run's stall watch does not see it, since the box heartbeat goes on outside the command (whether to cap it is GATE-105).
 
   A stop already set when the restore would start runs none: status 1, `gate: the gate failed while running the command: the job {job} was stopped before the command started`. A stop during the restore ends its job (dotnet and anything it started) and gives the same line naming `{job}-tools`.
 
@@ -1052,7 +1052,6 @@ What no ruling settles yet, with the issue that owns it:
 
 - **A `gate cutover` stopped part way** (GATE-9): whether rerunning it resumes the wait, and whether the flag can be taken back.
 - **The box protocol and `remote.json`'s next format** (GATE-10): verbs, payload and transport between PC and builder, whether ssh keeps cmd.exe as the builder's shell, and the routing file's version and matcher. Sibling worktrees in a routed run leave three questions of their own (GATE-19).
-- **The remote lease** (GATE-25): how a builder notices that the PC side of a run is gone and stops the job, and after how long.
 - **The duration estimate** (GATE-12): whether p50 comes from a short recent window, and whether cold and warm cache runs are summarised apart.
 - **A prediction a run has passed** (GATE-14): what a holder past its p90 reports in wait lines, and whether the critical gate re-prices its shadow end and closes or shrinks the lent window when a blocker overruns.
 - **The `--timeout auto` spelling** (GATE-16): how the caller's floor travels with `auto` in the new CLI.
