@@ -935,6 +935,8 @@ The PowerShell gate and `gate.exe` share slot mutexes and never share files. The
    `gate cutover` copies the PowerShell gate's slot counts into the default root's `slot-counts.json`, so both generations count the same slots, then writes `%LOCALAPPDATA%\gate\cutover.flag`. The PowerShell launcher in each repo reads the flag, and from then on every new gate runs `gate.exe` through the compatibility layer.
 2. It then waits until every PowerShell gate's claims and tickets in `%LOCALAPPDATA%\gate\` are gone or stale, naming on stderr what it still waits on, and exits 0 once none is left.
 
+   It ends by printing the flag's path and saying that deleting it goes back to the PowerShell gate: that is the take-back, by hand, so it works even when `gate.exe` is what is broken. A `gate cutover` stopped part way is run again: the rerun rewrites the flag and goes back to waiting, and it copies the slot counts only when the default root's `slot-counts.json` is absent, so a Gates-tab edit made since is kept.
+
    Callers that start the PowerShell gate without the launcher keep starting PowerShell gates after the flag is set. The drain names on stderr each PowerShell gate whose claim or ticket appeared after the flag was written, with its command line, so a bypassing caller is visible rather than holding the drain open silently. The cutover is not run until claude-config lists the callers it moved.
 
 ### The launcher's hand-over
@@ -1050,7 +1052,6 @@ At the end of every run the gate says how many cores the command kept busy and w
 
 What no ruling settles yet, with the issue that owns it:
 
-- **A `gate cutover` stopped part way** (GATE-9): whether rerunning it resumes the wait, and whether the flag can be taken back.
 - **The box protocol and `remote.json`'s next format** (GATE-10): verbs, payload and transport between PC and builder, whether ssh keeps cmd.exe as the builder's shell, and the routing file's version and matcher. Sibling worktrees in a routed run leave three questions of their own (GATE-19).
 - **The duration estimate** (GATE-12): whether p50 comes from a short recent window, and whether cold and warm cache runs are summarised apart.
 - **A prediction a run has passed** (GATE-14): what a holder past its p90 reports in wait lines, and whether the critical gate re-prices its shadow end and closes or shrinks the lent window when a blocker overruns.
