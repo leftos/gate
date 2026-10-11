@@ -11,8 +11,10 @@ const STALL_FLOOR: u64 = 15;
 /// The longest and the shortest time between two looks of the watchdog.
 const LONGEST_TICK: Duration = Duration::from_millis(1000);
 const SHORTEST_TICK: Duration = Duration::from_millis(10);
-/// The most bytes of one line the client keeps, and the most lines of one call it keeps: the last ones.
+/// The most bytes of one line the client keeps, the most lines of one call it keeps, and the most bytes those whole
+/// lines may total: the last ones.
 pub(super) const LINE_CAP: usize = 64 * 1024;
+const BYTES_KEPT: usize = 1024 * 1024;
 const LINES_KEPT: usize = 1000;
 
 /// Why the watchdog killed a call.
@@ -141,19 +143,28 @@ pub(super) fn truncated(line: &str) -> &str {
     &line[..end]
 }
 
-/// The lines of one call the client keeps in memory: the last [`LINES_KEPT`], each cut to [`LINE_CAP`] bytes.
+/// The lines of one call the client keeps in memory: the last [`LINES_KEPT`], each cut to [`LINE_CAP`] bytes, and those
+/// whole lines totalling at most [`BYTES_KEPT`] bytes.
 #[derive(Default)]
 pub(super) struct Kept {
     lines: VecDeque<String>,
+    /// The bytes `lines` holds.
+    bytes: usize,
 }
 
 impl Kept {
-    /// Keeps `line`, cut, dropping the oldest line kept when there are as many as are kept.
+    /// Keeps `line`, cut, dropping the oldest line kept while the call keeps more lines than are kept, or its whole
+    /// lines total more bytes than are kept. One line is at most [`LINE_CAP`] bytes, so the one just pushed always stays.
     pub(super) fn push(&mut self, line: &str) {
-        if self.lines.len() == LINES_KEPT {
-            self.lines.pop_front();
+        let line = truncated(line);
+        self.lines.push_back(line.to_owned());
+        self.bytes += line.len();
+        while self.lines.len() > LINES_KEPT || self.bytes > BYTES_KEPT {
+            let Some(oldest) = self.lines.pop_front() else {
+                break;
+            };
+            self.bytes -= oldest.len();
         }
-        self.lines.push_back(truncated(line).to_owned());
     }
 
     /// The lines kept, oldest first.
@@ -166,7 +177,9 @@ impl Kept {
 mod tests {
     use std::time::Duration;
 
-    use super::{Cut, Kept, Kill, LINE_CAP, LINES_KEPT, complete, kill, kill_line, stall_window, tick, too_long, truncated, whole_seconds};
+    use super::{
+        BYTES_KEPT, Cut, Kept, Kill, LINE_CAP, LINES_KEPT, complete, kill, kill_line, stall_window, tick, too_long, truncated, whole_seconds,
+    };
 
     const SECOND: Duration = Duration::from_secs(1);
 
@@ -293,5 +306,53 @@ mod tests {
         assert_eq!(lines.len(), LINES_KEPT);
         assert_eq!(lines.first().map(String::as_str), Some("5"), "the oldest are dropped");
         assert_eq!(lines.last().map(String::as_str), Some("1004"));
+    }
+
+    /// `n` lines of [`LINE_CAP`] bytes each, the first three bytes of each naming it, so a kept line is recognisable.
+    fn lines_of_the_cap(n: usize) -> Vec<String> {
+        (0..n).map(|number| format!("{number:0>3}{}", "x".repeat(LINE_CAP - 3))).collect()
+    }
+
+    #[test]
+    fn a_calls_kept_lines_stay_within_1_mib_dropping_the_oldest() {
+        let mut kept = Kept::default();
+        for line in lines_of_the_cap(100) {
+            kept.push(&line);
+        }
+        let lines = kept.into_lines();
+        let bytes: usize = lines.iter().map(String::len).sum();
+        assert!(bytes <= BYTES_KEPT, "the bytes kept: {bytes}");
+        assert!(lines.last().is_some_and(|line| line.starts_with("099")), "the newest line is kept");
+        assert!(!lines.iter().any(|line| line.starts_with("000")), "the oldest line is dropped");
+    }
+
+    #[test]
+    fn one_line_over_the_budget_is_still_kept() {
+        let mut kept = Kept::default();
+        for line in lines_of_the_cap(16) {
+            kept.push(&line);
+        }
+        let last = format!("999{}", "x".repeat(LINE_CAP - 3));
+        kept.push(&last);
+        let lines = kept.into_lines();
+        let bytes: usize = lines.iter().map(String::len).sum();
+        assert!(bytes <= BYTES_KEPT, "the bytes kept: {bytes}");
+        assert_eq!(lines.last().map(String::as_str), Some(last.as_str()), "the newest line is kept");
+    }
+
+    #[test]
+    fn the_line_limit_and_the_byte_budget_drop_together() {
+        let mut kept = Kept::default();
+        for number in 0..LINES_KEPT {
+            kept.push(&number.to_string());
+        }
+        let big = lines_of_the_cap(16);
+        for line in &big {
+            kept.push(line);
+        }
+        let lines = kept.into_lines();
+        let bytes: usize = lines.iter().map(String::len).sum();
+        assert!(bytes <= BYTES_KEPT, "the bytes kept: {bytes}");
+        assert_eq!(lines, big, "the short lines are all dropped, and every line of the cap is kept");
     }
 }

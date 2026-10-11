@@ -833,7 +833,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
   **Jobs.** Every remote call (ssh or git) runs in an anonymous kill-on-close job, created suspended and assigned before it runs, so a kill ends its whole tree. Breakaway from the job is allowed only for the local test transport, whose stand-in box starts under the gate's own job.
 
-  **The output cap.** Every call's line is capped at 64 KiB and only the last 1000 lines are kept. A `\r` resets the current line, as git's progress does (the Progress and Unlogged readers only). A progress update over 64 KiB, however the pipe splits it, ends a capped call with `... sent a line longer than 64 KiB`. The run call is not capped: its longer lines pass on in pieces.
+  **The output cap.** Every call's line is capped at 64 KiB, and a call keeps only its last 1000 lines and at most 1 MiB of them, dropping the oldest first; the newest line is always kept. A `\r` resets the current line, as git's progress does (the Progress and Unlogged readers only). A progress update over 64 KiB, however the pipe splits it, ends a capped call with `... sent a line longer than 64 KiB`. The run call is not capped: its longer lines pass on in pieces.
 
   **Escaping.** Every text a builder supplies that a `gate:` line quotes is escaped: control characters, U+061C, U+200E, U+200F, U+202A-U+202E, U+2066-U+2069, U+2028 and U+2029 are written `\u{..}`. That covers the preflight's last line, the builder's version in the version refusal, and every `git ... failed` line of the snapshot, the saved ref and the sync-back. A failed git line lists git's stdout first and its stderr last, keeping the last 10 lines and 4 KiB so git's `fatal:` line survives.
 
@@ -1167,7 +1167,9 @@ A Rust integration suite drives the built `gate.exe` through its CLI and reads o
 
   `--test-remote-transport local:<folder>` (on `gate run` only) sends the run to the Rust remote client with a local folder standing in for the builder; `local-ssh:<folder>` does the same but pushes and fetches to `<host>:<folder>/<repo>.git` with the `--test-remote-ssh` program as git's ssh (which it needs), so git's own ssh calls reach the stand-in.
 
-  `--test-remote-ssh <exe>` replaces ssh with a program (the test bin `fake-ssh`) and `--test-remote-retry-pause-ms <n>` (whole milliseconds above 0) replaces the 2 s pause before the pre-banner retry; both need the transport, and `--test-remote-snapshot` cannot be given with it. `--test-print-request` shows them as `testSeams.remoteTransport`, `testSeams.remoteSsh` and `testSeams.remoteRetryPauseMs`, after `remoteSnapshot`.
+  `--test-remote-ssh <exe>` replaces ssh with a program (the test bin `fake-ssh`), found as the gate finds its own programs ([Command launching](#command-launching)): a name with a folder part against the working folder, a bare name along PATH only. One it cannot find ends the run before any call with `gate: cannot use the remote transport '<transport>': cannot find --test-remote-ssh <word>: <why>` and status 1, after the transport's own form is checked.
+
+  `--test-remote-retry-pause-ms <n>` (whole milliseconds above 0) replaces the 2 s pause before the pre-banner retry; it and `--test-remote-ssh` need the transport, and `--test-remote-snapshot` cannot be given with it. `--test-print-request` shows them as `testSeams.remoteTransport`, `testSeams.remoteSsh` and `testSeams.remoteRetryPauseMs`, after `remoteSnapshot`.
 
   `--test-remote-bound-ms <n>` (whole milliseconds above 0) replaces the 30 s bound of the client's `stop` and `boot` calls. `--test-remote-interrupt-at <preflight|run>` makes the client raise the console interrupt itself after that call's first output byte. `--test-remote-timeout-ms <n>` (whole milliseconds above 0) replaces the run's ceiling for the client.
 

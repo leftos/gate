@@ -394,6 +394,8 @@ struct Tuned<'a> {
     kind: &'a str,
     timeout: &'a str,
     extra: &'a [&'a str],
+    /// The stand-in `--test-remote-ssh` names, [`FAKE_SSH`] when none.
+    ssh: Option<&'a str>,
 }
 
 impl Default for Tuned<'_> {
@@ -402,6 +404,7 @@ impl Default for Tuned<'_> {
             kind: "local",
             timeout: "3600",
             extra: &[],
+            ssh: None,
         }
     }
 }
@@ -409,11 +412,12 @@ impl Default for Tuned<'_> {
 /// [`client_gate`] with the words `tuned` changes.
 fn client_gate_tuned(case: &Case, log: &str, steps: &Path, tuned: &Tuned<'_>, command: &[&str]) -> Command {
     let transport = format!("{}:{}", tuned.kind, shown(&case.folder().join("builder")));
+    let ssh = tuned.ssh.unwrap_or(FAKE_SSH);
     let mut seams = vec![
         "--test-remote-transport",
         transport.as_str(),
         "--test-remote-ssh",
-        FAKE_SSH,
+        ssh,
         "--test-remote-retry-pause-ms",
         "1",
         "--test-git-limit-ms",
@@ -1497,4 +1501,76 @@ fn a_boot_call_dropped_before_the_banner_is_retried_once() {
     assert!(outcome.stderr.contains(LOST_LINE), "{outcome:?}");
     assert_eq!(calls(&steps), ["preflight", "run", "stop", "boot", "boot"]);
     assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new());
+}
+
+/// The stand-in copied into the case folder under `name`, so a relative `--test-remote-ssh` names it there.
+fn copy_ssh(case: &Case, name: &str) {
+    fs::copy(FAKE_SSH, case.folder().join(name)).expect("fake-ssh can be copied into the case folder");
+}
+
+/// `--test-remote-ssh .\fake-ssh.exe`, a name with a folder part, is read against the working folder as the gate reads
+/// its own programs, so the stand-in copied into the case folder runs and the run reaches the builder.
+#[test]
+fn a_relative_ssh_stand_in_is_found_the_way_the_gate_finds_a_program() {
+    let case = client_case("client-relative-ssh");
+    copy_ssh(&case, "fake-ssh.exe");
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+    let tuned = Tuned {
+        ssh: Some(r".\fake-ssh.exe"),
+        ..Tuned::default()
+    };
+
+    let outcome = finish(client_gate_tuned(&case, "out.log", &steps, &tuned, &[r".\tool.exe", "out", "ran there"]));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(outcome.stdout.contains("ran there"), "{outcome:?}");
+    assert!(outcome.stderr.contains("gate: pushed snapshot "), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "run"]);
+}
+
+/// A bare `--test-remote-ssh` name is searched along `PATH` alone, never the working folder: a copy under a name no
+/// `PATH` folder holds — the suite's own `PATH` holds the built `fake-ssh.exe` — is not found, and the run is refused
+/// with a clear line before its first ssh call.
+#[test]
+fn a_bare_ssh_stand_in_name_is_not_searched_in_the_working_folder() {
+    let case = client_case("client-bare-ssh");
+    copy_ssh(&case, "stand-in-ssh.exe");
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+    let tuned = Tuned {
+        ssh: Some("stand-in-ssh.exe"),
+        ..Tuned::default()
+    };
+
+    let outcome = finish(client_gate_tuned(&case, "out.log", &steps, &tuned, &[r".\tool.exe", "out", "ran there"]));
+
+    let transport = format!("local:{}", shown(&case.folder().join("builder")));
+    // The win32 error `ERROR_FILE_NOT_FOUND`, as `find_program` reports a word it does not find.
+    let line = format!(
+        "gate: cannot use the remote transport '{transport}': cannot find --test-remote-ssh stand-in-ssh.exe: {}",
+        gate_win32::win32_message(2)
+    );
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert!(outcome.stderr.contains(&line), "{outcome:?}");
+    assert_eq!(calls(&steps), Vec::<String>::new(), "no ssh call is made");
+}
+
+/// The transport's form is refused before the stand-in is looked for: `remote:x`, no local transport at all, with a
+/// stand-in the gate cannot find reports the form, not the stand-in.
+#[test]
+fn a_transport_s_form_is_refused_before_the_stand_in_is_looked_for() {
+    let case = client_case("client-form-first");
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+    let tuned = Tuned {
+        kind: "remote",
+        ssh: Some("stand-in-ssh.exe"),
+        ..Tuned::default()
+    };
+
+    let outcome = finish(client_gate_tuned(&case, "out.log", &steps, &tuned, &[r".\tool.exe", "out", "ran there"]));
+
+    let transport = format!("remote:{}", shown(&case.folder().join("builder")));
+    let line = format!("gate: cannot use the remote transport '{transport}': it is not local:<folder>");
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert!(outcome.stderr.contains(&line), "{outcome:?}");
+    assert_eq!(calls(&steps), Vec::<String>::new(), "no ssh call is made");
 }

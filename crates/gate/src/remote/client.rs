@@ -11,7 +11,8 @@
 //! back and the command is stopped; then, when the preflight said the builder's boot time, the builder is asked for it
 //! again. One that booted more than 30 s later restarted, and the run falls back `rebooted`; one that gives no boot
 //! time, or when either value is no timestamp, falls back `unreachable`; else the run ends 255. No call holds more than
-//! 64 KiB of a line in memory: a longer one ends any call but the run call, whose output is passed on whole. The run
+//! 64 KiB of a line in memory, nor keeps more than a call's last 1,000 lines, totalling at most 1 MiB: a longer line
+//! ends any call but the run call, whose output is passed on whole. The run
 //! takes the work-folder key's lock, [`hold_key`], before its remote slot, so a second routed run of one worktree falls
 //! back `busy` at once.
 
@@ -46,7 +47,8 @@ use super::transport::{Local, Program, Transport};
 use super::watchdog::{self, Cut, Kept, LINE_CAP};
 use super::{FAILED, FAILED_RUN, REFUSED, RemoteCall, RemoteClient, RemoteOutcome, busy_line};
 use crate::boxside::payload::escaped;
-use crate::run::CONTROL_C_EXIT;
+use crate::environment::Variables;
+use crate::run::{CONTROL_C_EXIT, find_program};
 
 /// The statuses of a preflight whose builder has no `gate box` that takes the run: cmd's for a program it cannot find,
 /// and a gate's usage error for a payload it does not read.
@@ -96,10 +98,14 @@ pub(crate) struct RustClient {
 
 impl RustClient {
     /// The client of the local transport `transport` names, with the request's seams; else the line saying why the
-    /// transport cannot be used.
+    /// transport cannot be used, or why the stand-in `--test-remote-ssh` names cannot be found.
     pub(crate) fn local(request: &RunRequest, transport: &str) -> Result<RustClient, String> {
         let seams = &request.test_seams;
-        let local = Local::new(transport, seams.remote_ssh.as_deref())?;
+        // The transport's form is refused first, so `--test-remote-transport remote:x` reports the form and not a
+        // stand-in it cannot find; the stand-in is then looked for, and the transport built with it.
+        Local::new(transport, seams.remote_ssh.as_deref())?;
+        let stub = seams.remote_ssh.as_deref().map(|word| stand_in(transport, word)).transpose()?;
+        let local = Local::new(transport, stub.as_deref())?;
         Ok(RustClient {
             transport: Box::new(local),
             limit: git::limit(seams),
@@ -111,6 +117,15 @@ impl RustClient {
             interrupt_at: seams.remote_interrupt_at.clone(),
         })
     }
+}
+
+/// The stand-in `--test-remote-ssh` names, resolved as the gate resolves its own programs: a name with a folder part
+/// against the gate's working folder, a bare name along its `PATH` alone; else the line saying why it cannot be found.
+fn stand_in(transport: &str, word: &Path) -> Result<PathBuf, String> {
+    let cannot = |why: String| format!("gate: cannot use the remote transport '{transport}': {why}");
+    let folder = std::env::current_dir().map_err(|error| cannot(format!("cannot read the working directory: {error}")))?;
+    let word = word.to_string_lossy();
+    find_program(&word, &Variables::from_process(), &folder).map_err(|why| cannot(format!("cannot find --test-remote-ssh {word}: {why}")))
 }
 
 /// The lock of `call`'s work-folder key: a root-hashed kernel mutex taken without waiting, which a routed run holds from
