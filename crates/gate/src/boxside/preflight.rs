@@ -3,10 +3,12 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
+use std::sync::PoisonError;
 
 use crate::answer::USAGE_STATUS;
 use crate::boxside::boot;
+use crate::boxside::forward::{ChildPipes, DRAIN, Drained, OutputLock};
 use crate::boxside::payload::Payload;
 use crate::console::Console;
 use crate::environment::Variables;
@@ -34,14 +36,14 @@ pub(crate) struct Failed {
 }
 
 impl Failed {
-    fn without_status(line: String) -> Failed {
+    pub(crate) fn without_status(line: String) -> Failed {
         Failed { line, status: FAILED_STATUS }
     }
 }
 
 /// The failure of git `step` that exited with `code`: the line shows the code signed, as `gate run` and the wrapper's
 /// `$LASTEXITCODE` show it, and the gate exits with its whole 32 bits.
-fn git_failed(step: &str, code: i32) -> Failed {
+pub(crate) fn git_failed(step: &str, code: i32) -> Failed {
     Failed {
         line: format!("gate: remote {step} failed (status {code})"),
         status: code.cast_unsigned(),
@@ -130,20 +132,68 @@ impl Git {
     }
 
     /// git's exit code for `args`, its stdout sent to `stdout` and its stderr to `stderr`; else why it could not be
-    /// started. git reads no standard input and none of the variables that would point it elsewhere. This is the one
-    /// place git is started, so the redirect clearing, the standard input and the spawn lock live here alone.
+    /// started.
     pub(crate) fn code(&self, args: &[&str], stdout: Stdio, stderr: Stdio) -> Result<i32, String> {
+        let mut command = self.command(args)?;
+        // Started under the spawn lock, so it inherits no launch's handles.
+        let status = gate_win32::spawn(command.stdout(stdout).stderr(stderr))
+            .and_then(|mut child| child.wait())
+            .map_err(|error| error.to_string())?;
+        Ok(exit_code(status))
+    }
+
+    /// git with `args`, reading no standard input and none of the variables that would point it elsewhere; else why
+    /// it cannot be started.
+    pub(crate) fn command(&self, args: &[&str]) -> Result<Command, String> {
         let program = self.program.as_ref().map_err(Clone::clone)?;
         let mut command = Command::new(program);
         for name in GIT_REDIRECTS {
             command.env_remove(name);
         }
-        // Started under the spawn lock, so it inherits no launch's handles.
-        let status = gate_win32::spawn(command.args(args).stdin(Stdio::null()).stdout(stdout).stderr(stderr))
-            .and_then(|mut child| child.wait())
-            .map_err(|error| error.to_string())?;
-        Ok(exit_code(status))
+        command.args(args).stdin(Stdio::null());
+        Ok(command)
     }
+
+    /// Starts the git `command` under the spawn lock, its stderr, and its stdout unless `read_stdout`, forwarded line by
+    /// line under `lock` ([`ChildPipes`]), so no heartbeat lands inside a line of git's, and waits for it to end. A
+    /// process still holding git's output once the readers have drained for [`DRAIN`] is said under `lock`, and the
+    /// run goes on. git's output, its stdout empty unless read; else why it could not be started or waited for, or that
+    /// a line of git's could not be written to the box's own output: the client closed the connection.
+    pub(crate) fn forwarded(command: Command, read_stdout: bool, lock: &OutputLock, console: &mut Console) -> Result<Output, GitFailure> {
+        let (output, drained) = run_forwarded(command, read_stdout, lock).map_err(GitFailure::Failed)?;
+        if drained.pipe_closed {
+            return Err(GitFailure::ClientGone);
+        }
+        if !drained.all_ended {
+            let _held = lock.lock().unwrap_or_else(PoisonError::into_inner);
+            console.err(GIT_LEFTOVER);
+        }
+        Ok(output)
+    }
+}
+
+/// The line said when a leftover process still holds git's output open once git exited.
+const GIT_LEFTOVER: &str = "gate: remote git's output is still held open by a leftover process; stopped reading";
+
+/// Why a git whose output the box forwards gave no output.
+pub(crate) enum GitFailure {
+    /// It could not be started or waited for, for this reason.
+    Failed(String),
+    /// A line of its could not be written to the box's own output: the client closed the connection.
+    ClientGone,
+}
+
+/// [`Git::forwarded`] up to the drain: git's output, and what the readers' drain found; else why it could not be
+/// started or waited for. `command` is dropped once git is started, so the readers see the end of its pipes once git
+/// and whatever it started have closed them.
+fn run_forwarded(mut command: Command, read_stdout: bool, lock: &OutputLock) -> Result<(Output, Drained), String> {
+    let ChildPipes { stdout, stderr, forwarders } = ChildPipes::open("git's", !read_stdout, lock).map_err(|error| error.to_string())?;
+    // Started under the spawn lock, so it inherits no launch's handles.
+    let started = gate_win32::spawn(command.stdout(stdout).stderr(stderr));
+    drop(command);
+    let output = started.and_then(Child::wait_with_output);
+    let drained = forwarders.drain(DRAIN);
+    Ok((output.map_err(|error| error.to_string())?, drained))
 }
 
 /// The exit code of a process that ran to its end; on Windows every such process has one.
@@ -205,7 +255,33 @@ fn sdk_list(listing: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{git_failed, sdk_list};
+    use std::sync::PoisonError;
+
+    use super::{Git, git_failed, run_forwarded, sdk_list};
+    use crate::boxside::forward::OutputLock;
+
+    #[test]
+    #[expect(clippy::expect_used, reason = "a test whose git cannot start must fail loudly")]
+    fn git_writes_its_stderr_through_the_output_lock() {
+        let output = OutputLock::default();
+        let missing = std::env::temp_dir().join(format!("gate-preflight-no-such-repository-{}", std::process::id()));
+        let git_dir = format!("--git-dir={}", missing.display());
+        let command = Git::find()
+            .command(&[&git_dir, "rev-parse", "HEAD"])
+            .expect("git is on PATH; the unit tests need it");
+        let held = output.lock().unwrap_or_else(PoisonError::into_inner);
+
+        // git says on stderr that the repository does not exist, then exits.
+        let ran = run_forwarded(command, false, &output);
+        drop(held);
+
+        let (ran, drained) = ran.expect("git starts");
+        assert_eq!(ran.status.code(), Some(128), "git's own status");
+        assert!(
+            !drained.all_ended,
+            "the reader of git's stderr waits for the held output lock, so it cannot end within the drain"
+        );
+    }
 
     #[test]
     fn a_git_status_is_said_signed_and_exited_with_whole() {

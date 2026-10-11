@@ -1005,7 +1005,9 @@ Built verbs:
 
   The `CpuSource` is a monotone running sum: a server new since the last read, or whose total fell (a reused id), adds its whole CPU, and an empty or failed process snapshot, or a server whose times could not be read, keeps the previous values. Another run's busy build on the box can keep a silent idle command alive until the wall-clock timeout, as in PowerShell.
 
-  A heartbeat line never splits a forwarded command line: the pump writes under the output lock the forwarders take (a git child's stderr does not take it yet, GATE-100).
+  A heartbeat line never splits a forwarded line: the pump writes under the output lock the forwarders take. The run's git children (fetch, checkout, clean, the back ref reset, the back commit's add, write-tree, rev-parse, commit-tree and push, and diff-tree) have their output forwarded the same way, line by line; the box's own lines are written whole under std's stream lock, which the pump's writes take too. A line still waiting for the lock when the readers stop is dropped.
+
+  After git exits, the box waits at most 2 s for its pipes to close. A pipe a leftover process still holds says `gate: remote git's output is still held open by a leftover process; stopped reading` and the run goes on. A client that closed the connection while git's output was forwarded ends the run with 255 and `gate: remote the client closed the connection during git <step>`. A pipe that cannot be read says `gate: remote could not read git's stderr: <error>` (or `stdout`).
 
   A failed CPU read writes `gate: remote heartbeat stopped: cannot read the CPU of job <name>: <error>` (or `... cannot list the processes of job <name>: <error>`) and a thread that cannot start writes `gate: remote heartbeat stopped: cannot start the heartbeat: <error>`; the heartbeats end and the run does not.
 

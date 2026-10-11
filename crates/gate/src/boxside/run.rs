@@ -2,9 +2,11 @@
 //! restored, the command started in the payload's job with its output forwarded, the tree it left committed back, the
 //! outputs of a passed command packed ([`crate::boxside::outputs`]), and the command's status passed whole, as the
 //! PowerShell wrapper's `Invoke-Run` does. git starts through [`gate_win32::spawn`], under the spawn lock the command's
-//! own launch holds while its inheritable handle copies are open, so no git inherits a handle meant for the command. The
-//! command runs on a console whose code pages are UTF-8 ([`Utf8Console`]), or, when it cannot have one, on the box's
-//! default code page, which the box says and never fails the run for.
+//! own launch holds while its inheritable handle copies are open, so no git inherits a handle meant for the command; what
+//! git writes is forwarded line by line under the box's output lock, as the command's output is, so no heartbeat lands
+//! inside a line of git's ([`Git::forwarded`]). The command runs on a console whose code pages are UTF-8
+//! ([`Utf8Console`]), or, when it cannot have one, on the box's default code page, which the box says and never fails
+//! the run for.
 //!
 //! The payload is data: it is refused unless well formed, and runs nothing but its command and writes nothing but the
 //! work folder's own files. The command, and whatever it writes into the work folder, `.git` included, is the user's
@@ -17,7 +19,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
 use std::sync::{Arc, PoisonError, TryLockError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
@@ -31,7 +33,7 @@ use crate::boxside::forward::{DRAIN, Forwarders, OutputLock};
 use crate::boxside::heartbeat;
 use crate::boxside::outputs::{self, Asked};
 use crate::boxside::payload::{Payload, escaped, ordinal_upper};
-use crate::boxside::preflight::{Failed, GIT_REDIRECTS, Git, exit_code};
+use crate::boxside::preflight::{Failed, GIT_REDIRECTS, Git, GitFailure, exit_code, git_failed};
 use crate::boxside::stop::{Ending, STOPPED, stop_event_name, terminate_and_wait};
 use crate::boxside::tools;
 use crate::console::Console;
@@ -306,7 +308,8 @@ impl<'a> RunOutputs<'a> {
 /// The run once the lock is held: `Ok` with the status after the back commit, or `Err` with the status of a run that
 /// ended before it, its lines said. The heartbeat starts once the subfolder is checked and stops on every way out.
 fn in_work_folder(request: &Request<'_>, stop: &NamedEvent, seams: &BoxSeams, console: &mut Console) -> Result<u32, u32> {
-    let git = WorkGit::ready(request);
+    let lock = OutputLock::default();
+    let git = WorkGit::ready(request, &lock);
     // Refused before the checkout, so a payload naming a folder outside the work folder changes nothing there; the
     // earlier run's back ref goes, as the checkout's would, so the client finds none to fetch.
     let Some((work, place)) = work_and_place(request.work, request.subfolder) else {
@@ -314,10 +317,9 @@ fn in_work_folder(request: &Request<'_>, stop: &NamedEvent, seams: &BoxSeams, co
             "gate: remote subfolder {} is not a folder inside the work folder",
             escaped(request.subfolder)
         ));
-        git.clear_back_ref(request).map_err(|failed| said(console, &failed))?;
+        git.clear_back_ref(request, console).map_err(|failed| said(console, &failed))?;
         return Err(u32::from(USAGE_STATUS));
     };
-    let lock = OutputLock::default();
     // A heartbeat that cannot start ends the heartbeats, never the run.
     let pump = heartbeat::start(&lock, heartbeat::period(seams))
         .inspect_err(|error| console.err(&format!("gate: remote heartbeat stopped: cannot start the heartbeat: {error}")))
@@ -352,7 +354,7 @@ fn checked_out(
     mut outputs: Option<&mut RunOutputs<'_>>,
     console: &mut Console,
 ) -> Result<u32, u32> {
-    git.checkout(request).map_err(|failed| said(console, &failed))?;
+    git.checkout(request, console).map_err(|failed| said(console, &failed))?;
     if !folders.place.is_dir() {
         console.err(&format!(
             "gate: remote subfolder {} does not exist in the snapshot",
@@ -367,7 +369,8 @@ fn checked_out(
     let status = command(request, folders.place, beat, console)?;
     let commit = match git.back_commit(request, console) {
         Ok(commit) => commit,
-        Err(message) => {
+        Err(failed) => {
+            let message = failed.or_end(console)?;
             console.err(&format!("gate: remote sync-back failed: {message}"));
             return Ok(if status == 0 { FAILED_STATUS } else { status });
         }
@@ -375,10 +378,22 @@ fn checked_out(
     match outputs {
         Some(outputs) if status == 0 => {
             // Read after the push and only for outputs, so failing to read them fails the outputs, never the sync-back.
-            let skip = commit.map_or_else(|| Ok(Vec::new()), |commit| git.back_paths(request, &commit));
+            let skip = back_skip(request, git, commit.as_deref(), console)?;
             Ok(outputs.bring_back(folders.work, skip, beat, console))
         }
         _ => Ok(status),
+    }
+}
+
+/// The paths the back commit `commit` changes, which the outputs leave out, none without a commit, or why they could
+/// not be read; `Err` with the status the run ends on when the client closed the connection meanwhile, its line said.
+fn back_skip(request: &Request<'_>, git: &WorkGit, commit: Option<&str>, console: &mut Console) -> Result<Result<Vec<String>, String>, u32> {
+    let Some(commit) = commit else {
+        return Ok(Ok(Vec::new()));
+    };
+    match git.back_paths(request, commit, console) {
+        Ok(paths) => Ok(Ok(paths)),
+        Err(failed) => failed.or_end(console).map(Err),
     }
 }
 
@@ -969,21 +984,71 @@ fn missing_snapshot(sha: &str) -> Failed {
     }
 }
 
+/// The failure of git `step` whose forwarded output found the client gone: the run ends as it ends when the command's
+/// forwarded output finds it gone, with [`CLOSED_STATUS`], git having already ended.
+fn client_gone(step: &str) -> Failed {
+    Failed {
+        line: format!("gate: remote the client closed the connection during git {step}"),
+        status: CLOSED_STATUS,
+    }
+}
+
+/// Why the back commit, or the reading of its paths, failed.
+enum BackFailed {
+    /// A step failed, for this reason, which the run says as its sync-back failure.
+    Step(String),
+    /// The client closed the connection while a step's output was forwarded: the run ends here ([`client_gone`]).
+    ClientGone(Failed),
+}
+
+impl BackFailed {
+    /// Why a step failed, or, for a client gone, `Err` with the status the run ends on, its line said.
+    fn or_end(self, console: &mut Console) -> Result<String, u32> {
+        match self {
+            BackFailed::Step(message) => Ok(message),
+            BackFailed::ClientGone(failed) => Err(said(console, &failed)),
+        }
+    }
+}
+
 /// git as the box runs it in the work folder: none of the variables that would point it elsewhere, no standard input,
-/// its hooks read from a folder that cannot exist, and no file-system monitor.
+/// its hooks read from a folder that cannot exist, no file-system monitor, and its output forwarded under the box's
+/// output lock.
 struct WorkGit {
     git: Git,
     /// `core.hooksPath=<lock>\hooks`: a folder inside the lock file, which cannot exist while the run holds the lock
     /// open sharing nothing, since a file has no children and cannot be deleted, renamed or replaced meanwhile.
     hooks: String,
+    /// The box's output lock, which every line git writes is forwarded under.
+    output: OutputLock,
 }
 
 impl WorkGit {
-    /// Finds git; called only once the run holds the lock.
-    fn ready(request: &Request<'_>) -> WorkGit {
+    /// Finds git, its output to be forwarded under `output`; called only once the run holds the lock.
+    fn ready(request: &Request<'_>, output: &OutputLock) -> WorkGit {
         WorkGit {
             git: Git::find(),
             hooks: format!(r"core.hooksPath={}\hooks", request.lock),
+            output: Arc::clone(output),
+        }
+    }
+
+    /// Runs git with the safety options and `args`, both of its streams forwarded ([`Git::forwarded`]); a non-zero
+    /// status, or a git that cannot be started, fails `step`, said as [`Git::step`] says it, and a client gone ends the
+    /// run ([`client_gone`]).
+    fn git_step(&self, step: &str, args: &[&str], console: &mut Console) -> Result<(), Failed> {
+        let ran = self
+            .git
+            .command(&self.args(args))
+            .map_err(GitFailure::Failed)
+            .and_then(|command| Git::forwarded(command, false, &self.output, console));
+        match ran {
+            Ok(output) => match exit_code(output.status) {
+                0 => Ok(()),
+                code => Err(git_failed(step, code)),
+            },
+            Err(GitFailure::Failed(message)) => Err(Failed::without_status(format!("gate: remote {step} failed: {message}"))),
+            Err(GitFailure::ClientGone) => Err(client_gone(step)),
         }
     }
 
@@ -994,11 +1059,11 @@ impl WorkGit {
         all
     }
 
-    /// Runs `step` in the work folder with `args`, its output passed through.
-    fn step(&self, step: &str, request: &Request<'_>, args: &[&str]) -> Result<(), Failed> {
+    /// Runs `step` in the work folder with `args`, its output forwarded.
+    fn step(&self, step: &str, request: &Request<'_>, args: &[&str], console: &mut Console) -> Result<(), Failed> {
         let mut all = vec!["-C", request.work];
         all.extend_from_slice(args);
-        self.git.step(step, &self.args(&all))
+        self.git_step(step, &all, console)
     }
 
     /// The snapshot the payload names, fetched from the bare repository at `refs/gate/<key>` and checked out by that
@@ -1006,9 +1071,9 @@ impl WorkGit {
     /// back commit of an earlier run left behind. The commit, never the ref's tip, is what is checked out, so a later
     /// push of the key changes nothing this run runs. A commit the work folder's repository lacks after the fetch ends
     /// the run with the box's own line.
-    fn checkout(&self, request: &Request<'_>) -> Result<(), Failed> {
+    fn checkout(&self, request: &Request<'_>, console: &mut Console) -> Result<(), Failed> {
         let refname = format!("refs/gate/{}", request.key);
-        self.step("fetch", request, &["fetch", "-q", request.bare, &refname])?;
+        self.step("fetch", request, &["fetch", "-q", request.bare, &refname], console)?;
         let commit = format!("{}^{{commit}}", request.snapshot);
         match self.quiet(request, &["cat-file", "-e", &commit]) {
             Ok(0) => {}
@@ -1020,9 +1085,9 @@ impl WorkGit {
                 });
             }
         }
-        self.step("checkout", request, &["checkout", "-q", "--force", "--detach", request.snapshot])?;
-        self.step("clean", request, &["clean", "-fdq"])?;
-        self.clear_back_ref(request)
+        self.step("checkout", request, &["checkout", "-q", "--force", "--detach", request.snapshot], console)?;
+        self.step("clean", request, &["clean", "-fdq"], console)?;
+        self.clear_back_ref(request, console)
     }
 
     /// git's exit code for `args` in the work folder, both of its streams discarded, as the wrapper discards
@@ -1035,28 +1100,33 @@ impl WorkGit {
 
     /// Deletes `refs/gate-back/<key>` in the bare repository, an earlier run's back commit, so the client finds none
     /// to fetch after a run that makes none.
-    fn clear_back_ref(&self, request: &Request<'_>) -> Result<(), Failed> {
+    fn clear_back_ref(&self, request: &Request<'_>, console: &mut Console) -> Result<(), Failed> {
         let bare = format!("--git-dir={}", request.bare);
         let back = format!("refs/gate-back/{}", request.key);
-        self.git.step("back ref reset", &self.args(&[&bare, "update-ref", "-d", &back]))
+        self.git_step("back ref reset", &[&bare, "update-ref", "-d", &back], console)
     }
 
     /// The tree the command left, committed on `HEAD` and pushed to `refs/gate-back/<key>` in the bare repository;
     /// nothing when the tree is unchanged. It starts from a copy of the work folder's index, which the checkout just
     /// refreshed, so `add -A` skips every unchanged file; a copy that cannot be removed afterwards is said and fails
     /// nothing. The commit pushed, `None` when the tree is unchanged; else why it failed.
-    fn back_commit(&self, request: &Request<'_>, console: &mut Console) -> Result<Option<String>, String> {
-        let program = self.git.program.as_ref().map_err(|message| format!("git cannot be started: {message}"))?;
+    fn back_commit(&self, request: &Request<'_>, console: &mut Console) -> Result<Option<String>, BackFailed> {
+        let program = self
+            .git
+            .program
+            .as_ref()
+            .map_err(|message| BackFailed::Step(format!("git cannot be started: {message}")))?;
         let back = BackGit {
             program,
             request,
             work: self,
         };
         let index = Path::new(request.work).join(".git").join("index");
-        fs::copy(&index, request.index).map_err(|error| format!("cannot copy {} to {}: {error}", index.display(), request.index))?;
+        fs::copy(&index, request.index)
+            .map_err(|error| BackFailed::Step(format!("cannot copy {} to {}: {error}", index.display(), request.index)))?;
         let tree = back
-            .status("add", &["add", "-A"], true)
-            .and_then(|()| back.line("write-tree", &["write-tree"], true));
+            .status("add", &["add", "-A"], true, console)
+            .and_then(|()| back.line("write-tree", &["write-tree"], true, console));
         match fs::remove_file(request.index) {
             Err(error) if error.kind() != io::ErrorKind::NotFound => {
                 console.err(&format!("gate: remote could not remove {}: {error}", request.index));
@@ -1064,24 +1134,33 @@ impl WorkGit {
             _ => {}
         }
         let tree = tree?;
-        if tree == back.line("rev-parse", &["rev-parse", "HEAD^{tree}"], false)? {
+        if tree == back.line("rev-parse", &["rev-parse", "HEAD^{tree}"], false, console)? {
             return Ok(None);
         }
-        let commit = back.line("commit-tree", &["commit-tree", &tree, "-p", "HEAD", "-m", "gate-remote back"], false)?;
+        let commit = back.line(
+            "commit-tree",
+            &["commit-tree", &tree, "-p", "HEAD", "-m", "gate-remote back"],
+            false,
+            console,
+        )?;
         let target = format!("{commit}:refs/gate-back/{}", request.key);
-        back.status("push", &["push", "-q", request.bare, &target], false)?;
+        back.status("push", &["push", "-q", request.bare, &target], false, console)?;
         Ok(Some(commit))
     }
 
     /// The `/`-separated paths the back commit `commit` changes against `HEAD`; else why they could not be read.
-    fn back_paths(&self, request: &Request<'_>, commit: &str) -> Result<Vec<String>, String> {
-        let program = self.git.program.as_ref().map_err(|message| format!("git cannot be started: {message}"))?;
+    fn back_paths(&self, request: &Request<'_>, commit: &str, console: &mut Console) -> Result<Vec<String>, BackFailed> {
+        let program = self
+            .git
+            .program
+            .as_ref()
+            .map_err(|message| BackFailed::Step(format!("git cannot be started: {message}")))?;
         BackGit {
             program,
             request,
             work: self,
         }
-        .changed(commit)
+        .changed(commit, console)
     }
 }
 
@@ -1108,47 +1187,50 @@ impl BackGit<'_> {
         command
     }
 
-    /// Runs `step`, its output passed through; else why it failed.
-    fn status(&self, step: &str, args: &[&str], copied_index: bool) -> Result<(), String> {
-        // Started under the spawn lock, so it inherits no launch's handles.
-        let status = gate_win32::spawn(&mut self.command(args, copied_index))
-            .and_then(|mut child| child.wait())
-            .map_err(|error| format!("{step} failed: {error}"))?;
-        match exit_code(status) {
+    /// Runs `step` to its end, its stderr, and its stdout unless `read_stdout`, forwarded ([`Git::forwarded`]); its
+    /// output, else why it could not run or that the client is gone.
+    fn run(&self, step: &str, args: &[&str], copied_index: bool, read_stdout: bool, console: &mut Console) -> Result<Output, BackFailed> {
+        Git::forwarded(self.command(args, copied_index), read_stdout, &self.work.output, console).map_err(|failure| match failure {
+            GitFailure::Failed(error) => BackFailed::Step(format!("{step} failed: {error}")),
+            GitFailure::ClientGone => BackFailed::ClientGone(client_gone(step)),
+        })
+    }
+
+    /// Runs `step`, its output forwarded; else why it failed.
+    fn status(&self, step: &str, args: &[&str], copied_index: bool, console: &mut Console) -> Result<(), BackFailed> {
+        let output = self.run(step, args, copied_index, false, console)?;
+        match exit_code(output.status) {
             0 => Ok(()),
-            code => Err(format!("{step} failed (status {code})")),
+            code => Err(BackFailed::Step(format!("{step} failed (status {code})"))),
         }
     }
 
-    /// Runs `step` and returns its stdout, its stderr passed through; else why it failed.
-    fn stdout(&self, step: &str, args: &[&str], copied_index: bool) -> Result<Vec<u8>, String> {
-        // Started under the spawn lock, so it inherits no launch's handles.
-        let output = gate_win32::spawn(self.command(args, copied_index).stdout(Stdio::piped()).stderr(Stdio::inherit()))
-            .and_then(std::process::Child::wait_with_output)
-            .map_err(|error| format!("{step} failed: {error}"))?;
+    /// Runs `step` and returns its stdout, its stderr forwarded; else why it failed.
+    fn stdout(&self, step: &str, args: &[&str], copied_index: bool, console: &mut Console) -> Result<Vec<u8>, BackFailed> {
+        let output = self.run(step, args, copied_index, true, console)?;
         match exit_code(output.status) {
             0 => Ok(output.stdout),
-            code => Err(format!("{step} failed (status {code})")),
+            code => Err(BackFailed::Step(format!("{step} failed (status {code})"))),
         }
     }
 
-    /// Runs `step` and returns the first line of its stdout, its stderr passed through; else why it failed.
-    fn line(&self, step: &str, args: &[&str], copied_index: bool) -> Result<String, String> {
-        let stdout = self.stdout(step, args, copied_index)?;
+    /// Runs `step` and returns the first line of its stdout, its stderr forwarded; else why it failed.
+    fn line(&self, step: &str, args: &[&str], copied_index: bool, console: &mut Console) -> Result<String, BackFailed> {
+        let stdout = self.stdout(step, args, copied_index, console)?;
         String::from_utf8_lossy(&stdout)
             .lines()
             .next()
             .map(str::to_owned)
-            .ok_or_else(|| format!("{step} printed nothing"))
+            .ok_or_else(|| BackFailed::Step(format!("{step} printed nothing")))
     }
 
     /// The `/`-separated paths `commit` changes against `HEAD`; else why they could not be read.
-    fn changed(&self, commit: &str) -> Result<Vec<String>, String> {
-        let stdout = self.stdout("diff-tree", &["diff-tree", "--name-only", "-r", "-z", "HEAD", commit], false)?;
+    fn changed(&self, commit: &str, console: &mut Console) -> Result<Vec<String>, BackFailed> {
+        let stdout = self.stdout("diff-tree", &["diff-tree", "--name-only", "-r", "-z", "HEAD", commit], false, console)?;
         stdout
             .split(|byte| *byte == 0)
             .filter(|path| !path.is_empty())
-            .map(|path| String::from_utf8(path.to_vec()).map_err(|_| "diff-tree printed a path that is not UTF-8".to_owned()))
+            .map(|path| String::from_utf8(path.to_vec()).map_err(|_| BackFailed::Step("diff-tree printed a path that is not UTF-8".to_owned())))
             .collect()
     }
 }

@@ -1031,6 +1031,32 @@ fn box_run_beats_while_a_busy_command_runs() {
     wait_until_closed(Path::new(field(&payload, "Lock")));
 }
 
+/// How many files the warning case's command writes, each of which makes the back commit's `add -A` warn once.
+const WARNED_FILES: usize = 200;
+
+#[test]
+fn a_git_warning_is_never_split_by_a_heartbeat() {
+    let case = Case::new("box_run_git_warning_whole");
+    let mut payload = box_payload(&case, "k", &[r".\write.cmd"]);
+    let write = format!("@for /L %%i in (1,1,{WARNED_FILES}) do @echo line>w%%i.txt\r\n");
+    snapshot(&case, &mut payload, &[(".gitattributes", "*.txt text eol=lf\n"), ("write.cmd", &write)]);
+
+    let outcome = finish(bare_box_command(
+        &case,
+        &["box", "--test-heartbeat-ms", "1", "run", &self::payload(&payload)],
+    ));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let beat = Regex::new(r"^gate-remote-heartbeat: \d+$").expect("the pattern compiles");
+    for line in outcome.stderr.lines().filter(|line| line.contains("gate-remote-heartbeat")) {
+        assert!(beat.is_match(line), "a heartbeat is a whole line of its own: {line:?} in {outcome:?}");
+    }
+    let warning = Regex::new(r"^warning: in the working copy of 'w\d+\.txt', CRLF will be replaced by LF the next time Git touches it$")
+        .expect("the pattern compiles");
+    let warned = outcome.stderr.lines().filter(|line| warning.is_match(line)).count();
+    assert_eq!(warned, WARNED_FILES, "each of git's warnings arrives whole: {outcome:?}");
+}
+
 #[test]
 fn box_run_stops_reading_output_a_leftover_process_holds_open() {
     let case = Case::new("box_run_drain");
