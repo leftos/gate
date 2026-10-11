@@ -514,25 +514,25 @@ pub fn git_init(case: &Case) {
     git(case, &["init", "--quiet"]);
 }
 
-/// Runs git with `args` in the case folder, as a committer of the suite's own, with no hook and no signing; fails the
-/// case when git fails.
-pub fn git(case: &Case, args: &[&str]) {
+/// Runs git with `args` in the case folder, as a committer of the suite's own, with no hook and no signing, and
+/// returns what it printed on stdout, its trailing line end cut; fails the case when git fails.
+pub fn git(case: &Case, args: &[&str]) -> String {
     let mut command = Command::new("git");
     for name in GIT_REDIRECTS {
         command.env_remove(name);
     }
     let identity = ["-c", "user.name=gate suite", "-c", "user.email=suite@example.invalid"];
     let quiet = ["-c", "commit.gpgsign=false", "-c", "core.hooksPath=.no-hooks"];
-    let status = command
+    let output = command
         .args(identity)
         .args(quiet)
         .args(args)
         .current_dir(case.folder())
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .status()
+        .output()
         .expect("git starts");
-    assert!(status.success(), "git {args:?} succeeds");
+    assert!(output.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&output.stderr));
+    String::from_utf8(output.stdout).expect("git's stdout is UTF-8").trim_end().to_owned()
 }
 
 /// Writes `json` as the routing file the case's gates read, `<LOCALAPPDATA>\gate\remote.json`; its path.

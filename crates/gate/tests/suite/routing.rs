@@ -660,6 +660,27 @@ fn every_refusal_reason_names_itself_in_the_line_and_the_journal() {
 }
 
 #[test]
+fn a_routed_dotnet_build_carries_the_worktree_head_as_its_source_revision() {
+    let case = routed_case("routing-dotnet-build");
+    copy_tool(&case, "dotnet.exe");
+    git(&case, &["commit", "--quiet", "--allow-empty", "-m", "a"]);
+    let head = git(&case, &["rev-parse", "HEAD"]);
+    let call = case.folder().join("dotnet.json");
+    let steps = shown(&stub(&case, &[&format!("record {}", shown(&call)), "status 0"]));
+    let outcome = finish(case.gate(&routed_words("dotnet.log", &steps, &[], &[r".\dotnet.exe", "build"])));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let stamp = format!("-p:SourceRevisionId={head}");
+    let call = recorded(&call);
+    assert_eq!(
+        recorded_words(&call)[1..],
+        ["build", stamp.as_str()],
+        "a routed dotnet build is pinned to the worktree HEAD: {call}"
+    );
+    assert_eq!(names(&events(&case)), ["queue", "take", "release"]);
+}
+
+#[test]
 fn no_build_is_dropped_for_the_box_and_the_fallback() {
     let case = routed_case("routing-no-build");
     copy_tool(&case, "dotnet.exe");

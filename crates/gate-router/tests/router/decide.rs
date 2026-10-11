@@ -8,7 +8,7 @@ use gate_router::{
     Config, ConfigProblem, DROPPED_NO_BUILD_LINE, Inputs, LocalReason, NO_OUTPUTS_LINE, Place, RemoteRun, Route, Slot, decide, work_folder_key,
 };
 
-use crate::support::{FakeFacts, ROOT, heavy, words};
+use crate::support::{FakeFacts, HEAD, ROOT, heavy, words};
 
 const SILENT: Route = Route::Local { reason: None };
 
@@ -39,6 +39,23 @@ fn routing_all() -> Config {
     Config::parse(r#"{"host": "builder-1", "repos": {"yaat": ["*"]}}"#).expect("usable")
 }
 
+/// The source-revision word a routed build carries: the fixture worktree's [`HEAD`].
+fn stamp() -> String {
+    format!("-p:SourceRevisionId={HEAD}")
+}
+
+/// A command's words as the builder gets them: `list` with the source-revision word after the last one.
+fn stamped(list: &[&str]) -> Vec<String> {
+    let mut words = words(list);
+    words.push(stamp());
+    words
+}
+
+/// Whether the decision asked for the worktree's HEAD, which only a command that gets the word does.
+fn asked_head(facts: &FakeFacts) -> bool {
+    facts.asked().iter().any(|question| question.as_str() == "head_sha")
+}
+
 #[test]
 fn the_control_command_routes_from_the_root() {
     let command = words(&["dotnet", "test", "X:/dev/yaat.wt/a/tests/T.csproj"]);
@@ -54,7 +71,7 @@ fn the_control_command_routes_from_the_root() {
             key: work_folder_key(ROOT),
             subfolder: String::new(),
             pattern: "dotnet *".to_owned(),
-            words: words(&["dotnet", "test", "tests/T.csproj"]),
+            words: stamped(&["dotnet", "test", "tests/T.csproj"]),
             fallback: command.clone(),
             outputs: words(&["**/bin/**", "**/.godot/mono/temp/bin/**"]),
             dropped_no_build: false,
@@ -62,7 +79,7 @@ fn the_control_command_routes_from_the_root() {
         }
     );
     assert_eq!(run.lines(), Vec::<&str>::new());
-    assert_eq!(facts.asked(), ["config", "place", "file_in_folder dotnet"]);
+    assert_eq!(facts.asked(), ["config", "place", "file_in_folder dotnet", "head_sha"]);
 }
 
 #[test]
@@ -364,7 +381,11 @@ fn no_build_is_dropped_from_a_dotnet_command_for_the_builder_and_the_fallback() 
     let command = words(&["DotNet.EXE", "test", "--no-build", "--no-build=x", "--NO-BUILD", "--x"]);
     let run = routed(decide(&heavy(&command), &FakeFacts::at_root()));
     assert_eq!(run.pattern, "* --x");
-    assert_eq!(run.words, ["DotNet.EXE", "test", "--no-build=x", "--NO-BUILD", "--x"]);
+    assert_eq!(
+        run.words,
+        ["DotNet.EXE", "test", "--no-build=x", "--NO-BUILD", "--x", stamp().as_str()],
+        "there is no --, so the sha stands after the last word"
+    );
     assert_eq!(run.fallback, ["DotNet.EXE", "test", "--no-build=x", "--NO-BUILD", "--x"]);
     assert!(run.dropped_no_build);
     assert_eq!(run.lines()[0], DROPPED_NO_BUILD_LINE);
@@ -389,6 +410,16 @@ fn no_build_stays_on_any_other_command() {
 fn a_dotnet_no_build_command_brings_no_outputs_back() {
     let command = words(&["dotnet", "test", "--no-build"]);
     let run = routed(decide(&heavy(&command), &FakeFacts::at_root()));
+    assert_eq!(
+        run.words,
+        ["dotnet", "test", stamp().as_str()],
+        "the builder's words build, pinned to the HEAD"
+    );
+    assert_eq!(
+        run.fallback,
+        ["dotnet", "test"],
+        "the fallback builds without --no-build and without the word"
+    );
     assert_eq!(run.outputs, Vec::<String>::new());
     assert!(run.outputs_withheld);
     assert_eq!(run.lines(), [DROPPED_NO_BUILD_LINE, NO_OUTPUTS_LINE]);
@@ -406,7 +437,7 @@ fn a_repo_with_its_own_outputs_gets_them() {
 fn a_path_with_spaces_routes_rewritten() {
     let command = words(&["dotnet", "test", r"X:\dev\yaat.wt\a\my tests\T.csproj"]);
     let run = routed(decide(&heavy(&command), &FakeFacts::at("src/")));
-    assert_eq!(run.words, ["dotnet", "test", r"..\my tests\T.csproj"]);
+    assert_eq!(run.words, ["dotnet", "test", r"..\my tests\T.csproj", stamp().as_str()]);
 }
 
 #[test]
@@ -489,7 +520,10 @@ fn subst_a_device_that_is_no_subst_drive_adds_no_spelling() {
         devices: vec![('D', r"\??\X:\dev".to_owned())],
         ..FakeFacts::at_root()
     };
-    assert_eq!(routed(decide(&heavy(&command), &subst)).words, ["dotnet", "test", r"tests\T"]);
+    assert_eq!(
+        routed(decide(&heavy(&command), &subst)).words,
+        ["dotnet", "test", r"tests\T", stamp().as_str()]
+    );
 }
 
 #[test]
@@ -498,4 +532,152 @@ fn subst_each_letter_is_asked_once_and_the_roots_own_never() {
     let facts = FakeFacts::at_root();
     let _route = decide(&heavy(&command), &facts);
     assert_eq!(facts.asked(), ["config", "place", "subst_target D", "subst_target Q"]);
+}
+
+#[test]
+fn a_dotnet_build_carries_the_worktree_head_as_its_source_revision() {
+    let command = words(&["dotnet", "build"]);
+    let facts = FakeFacts::at_root();
+    let run = routed(decide(&heavy(&command), &facts));
+    assert_eq!(run.words, ["dotnet", "build", stamp().as_str()]);
+    assert_eq!(run.fallback, ["dotnet", "build"], "the fallback carries no word of the builder's");
+    assert_eq!(run.lines(), Vec::<&str>::new(), "the word is said by no line");
+    assert_eq!(
+        facts.asked(),
+        ["config", "place", "file_in_folder dotnet", "head_sha"],
+        "the HEAD fact is asked for a command that gets the word"
+    );
+}
+
+#[test]
+fn the_source_revision_word_stands_before_the_first_double_dash() {
+    let run = routed(decide(
+        &heavy(&words(&["dotnet", "test", "proj.csproj", "--", "NUnit.Where=x"])),
+        &FakeFacts::at_root(),
+    ));
+    assert_eq!(run.words, ["dotnet", "test", "proj.csproj", stamp().as_str(), "--", "NUnit.Where=x"]);
+    let run = routed(decide(&heavy(&words(&["dotnet", "run", "--", "-p:x"])), &FakeFacts::at_root()));
+    assert_eq!(run.words, ["dotnet", "run", stamp().as_str(), "--", "-p:x"]);
+}
+
+#[test]
+fn every_dotnet_verb_that_builds_is_stamped_in_any_case() {
+    let facts = FakeFacts::with_config(routing_all());
+    for verb in ["build", "test", "publish", "pack", "run", "msbuild"] {
+        let command = words(&["DotNet.EXE", verb]);
+        let run = routed(decide(&heavy(&command), &facts));
+        assert_eq!(run.words, ["DotNet.EXE", verb, stamp().as_str()], "{verb}");
+    }
+    let run = routed(decide(&heavy(&words(&["dotnet", "PUBLISH"])), &facts));
+    assert_eq!(run.words, ["dotnet", "PUBLISH", stamp().as_str()], "the verb's case is ignored");
+    let run = routed(decide(&heavy(&words(&["DotNet.EXE", "publish", "-c", "Release"])), &facts));
+    assert_eq!(run.words, ["DotNet.EXE", "publish", "-c", "Release", stamp().as_str()]);
+    let run = routed(decide(&heavy(&words(&["dotnet", "msbuild", "-t:Pack"])), &facts));
+    assert_eq!(run.words, ["dotnet", "msbuild", "-t:Pack", stamp().as_str()]);
+}
+
+#[test]
+fn a_dotnet_command_that_does_not_build_is_left_alone() {
+    let commands: [&[&str]; 10] = [
+        &["dotnet", "tool", "restore"],
+        &["dotnet", "--version"],
+        &["dotnet", "--roll-forward", "x", "build"],
+        &["dotnet", "restore"],
+        &["dotnet", "clean"],
+        &["dotnet", "format", "--include", "src/**/*.cs"],
+        &["dotnet", "app.dll"],
+        &["dotnet", "new", "console"],
+        &["dotnet-ef", "migrations", "add", "x"],
+        &["cmd", "/c", "dotnet", "build"],
+    ];
+    for command in commands {
+        let facts = FakeFacts::with_config(routing_all());
+        let run = routed(decide(&heavy(&words(command)), &facts));
+        assert_eq!(run.words, words(command), "{command:?}");
+        assert!(!asked_head(&facts), "HEAD is asked for {command:?}");
+    }
+    let facts = FakeFacts::with_config(routing_all());
+    let run = routed(decide(&heavy(&words(&["cargo", "build"])), &facts));
+    assert_eq!(run.words, ["cargo", "build"], "another build tool's command is left alone");
+    assert!(!asked_head(&facts), "HEAD is asked for cargo build");
+}
+
+#[test]
+fn a_command_that_already_sets_the_source_revision_is_left_alone() {
+    let commands: [&[&str]; 7] = [
+        &["dotnet", "build", "-p:SourceRevisionId=abc"],
+        &["dotnet", "build", "/p:SourceRevisionId=abc"],
+        &["dotnet", "build", "--property:sourcerevisionid=abc"],
+        &["dotnet", "build", "-property:A=1;SourceRevisionId=abc"],
+        &["dotnet", "build", "-p:Configuration=Release,SourceRevisionId=abc"],
+        &["dotnet", "build", "-P:SourceRevisionId=1"],
+        &["dotnet", "build", "/PROPERTY:sourcerevisionid=1"],
+    ];
+    for command in commands {
+        let facts = FakeFacts::with_config(routing_all());
+        let run = routed(decide(&heavy(&words(command)), &facts));
+        assert_eq!(run.words, words(command), "{command:?}");
+        assert!(!asked_head(&facts), "HEAD is asked for {command:?}");
+    }
+}
+
+#[test]
+fn a_word_that_merely_holds_the_target_name_is_no_source_revision() {
+    let commands: [&[&str]; 4] = [
+        &["dotnet", "build", "-p:A=1;B=SourceRevisionId"],
+        &["dotnet", "build", "-p:SourceRevisionIdX=1"],
+        &["dotnet", "build", "-pp:SourceRevisionId=1"],
+        &["dotnet", "build", "-p:Tag=SourceRevisionId"],
+    ];
+    for command in commands {
+        let facts = FakeFacts::with_config(routing_all());
+        let run = routed(decide(&heavy(&words(command)), &facts));
+        let mut expected = words(command);
+        expected.push(stamp());
+        assert_eq!(run.words, expected, "{command:?}");
+        assert!(asked_head(&facts), "HEAD is asked for {command:?}");
+    }
+}
+
+#[test]
+fn a_source_revision_after_the_double_dash_does_not_count() {
+    let run = routed(decide(
+        &heavy(&words(&["dotnet", "run", "--", "-p:SourceRevisionId=abc"])),
+        &FakeFacts::at_root(),
+    ));
+    assert_eq!(run.words, ["dotnet", "run", stamp().as_str(), "--", "-p:SourceRevisionId=abc"]);
+}
+
+#[test]
+fn a_head_that_cannot_be_read_leaves_the_build_alone() {
+    let heads: [Result<Option<String>, String>; 2] = [Ok(None), Err("git could not be started".to_owned())];
+    for head in heads {
+        let command = words(&["dotnet", "build"]);
+        let facts = FakeFacts {
+            head,
+            ..FakeFacts::at_root()
+        };
+        let run = routed(decide(&heavy(&command), &facts));
+        assert_eq!(run.words, ["dotnet", "build"], "{:?}", facts.head);
+        assert_eq!(run.fallback, ["dotnet", "build"], "{:?}", facts.head);
+    }
+}
+
+#[test]
+fn a_dotnet_program_named_by_an_in_worktree_path_still_builds_stamped() {
+    let command = words(&[r"X:\dev\yaat.wt\a\dotnet.exe", "pack"]);
+    let run = routed(decide(&heavy(&command), &FakeFacts::with_config(routing_all())));
+    assert_eq!(run.words, ["dotnet.exe", "pack", stamp().as_str()]);
+}
+
+#[test]
+fn a_dotnet_program_outside_the_worktree_runs_here_with_no_word() {
+    let command = words(&[r"C:\Program Files\dotnet\dotnet.exe", "pack"]);
+    let facts = FakeFacts::with_config(routing_all());
+    let route = decide(&heavy(&command), &facts);
+    assert_eq!(
+        local_line(&route).as_deref(),
+        Some(r"gate: not routed: C:\Program Files\dotnet\dotnet.exe is outside the worktree")
+    );
+    assert!(!asked_head(&facts), "no word is made for a command that runs here");
 }

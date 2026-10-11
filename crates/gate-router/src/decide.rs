@@ -17,6 +17,16 @@ pub const NO_OUTPUTS_LINE: &str = "gate: outputs: none brought back for a --no-b
 
 const NO_BUILD: &str = "--no-build";
 
+/// The word that ends a dotnet command's own arguments: what follows it goes to the program the command runs.
+const SEPARATOR: &str = "--";
+/// The `MSBuild` property a routed build pins the worktree's `HEAD` sha to, so the builder does not throw away a
+/// build whose revision changed.
+const SOURCE_REVISION: &str = "SourceRevisionId";
+/// The switches that set an `MSBuild` property; their case and the property name's are ignored.
+const PROPERTY_SWITCHES: [&str; 5] = ["-p:", "/p:", "-property:", "/property:", "--property:"];
+/// The dotnet verbs that build: the ones a command-line property reaches `MSBuild` through.
+const BUILD_VERBS: [&str; 6] = ["build", "test", "publish", "pack", "run", "msbuild"];
+
 /// The slot kind a gate asks for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Slot {
@@ -77,6 +87,16 @@ pub trait Facts {
     ///
     /// Why it could not be told; the gate then runs here, saying so.
     fn folder_has_files(&self, place: &Place) -> Result<bool, String>;
+
+    /// The sha of the worktree root's `HEAD`, `Ok(None)` when it has none: a `git rev-parse --verify -q HEAD` that
+    /// fails (an unborn branch among them) or writes anything but one sha is no sha. Asked only of a command that gets
+    /// the source-revision word.
+    ///
+    /// # Errors
+    ///
+    /// Only when git cannot be started, outlives its limit, or its output cannot be read; the run then routes without
+    /// the word, as it does for `Ok(None)`.
+    fn head_sha(&self, place: &Place) -> Result<Option<String>, String>;
 
     /// Whether a file of exactly this name is in the gate's folder.
     fn file_in_folder(&self, name: &str) -> bool;
@@ -141,8 +161,9 @@ pub struct RemoteRun {
     pub subfolder: String,
     /// The pattern that matched.
     pub pattern: String,
-    /// The words the builder runs: paths rewritten, `--no-build` dropped from a dotnet command, and a bare first word
-    /// naming a file of the gate's folder written `./name`.
+    /// The words the builder runs: paths rewritten, `--no-build` dropped from a dotnet command, the worktree's `HEAD`
+    /// sha pinned onto a dotnet command that builds as `SourceRevisionId`, and a bare first word naming a file of the
+    /// gate's folder written `./name`.
     pub words: Vec<String>,
     /// The words every fallback here runs: the command as given, each exact `--no-build` word dropped from a dotnet
     /// command.
@@ -305,6 +326,7 @@ fn remote_run(matched: Matched<'_>, subfolder: String, given: &[String], facts: 
         outputs.clear();
     }
     mark_bare_first_word(&mut words, facts);
+    stamp_source_revision(&mut words, dotnet, &matched.place, facts);
     RemoteRun {
         host: matched.config.host().to_owned(),
         slots: matched.config.slots(),
@@ -339,6 +361,55 @@ fn mark_bare_first_word(words: &mut [String], facts: &dyn Facts) {
     if bare && facts.file_in_folder(word) {
         words[index] = format!("./{word}");
     }
+}
+
+/// Writes `-p:SourceRevisionId=<the worktree's HEAD sha>` into the builder's words of a dotnet command that builds,
+/// before the first word that is exactly `--` (or after the last word when it has none), so the builder's build is
+/// pinned to the revision the snapshot came from. The words of a command that is no such dotnet command, that already
+/// sets `SourceRevisionId` before its `--`, or whose HEAD cannot be read are left as they are.
+fn stamp_source_revision(words: &mut Vec<String>, dotnet: bool, place: &Place, facts: &dyn Facts) {
+    let Some(at) = stamp_at(words, dotnet) else {
+        return;
+    };
+    if let Ok(Some(sha)) = facts.head_sha(place) {
+        words.insert(at, format!("-p:{SOURCE_REVISION}={sha}"));
+    }
+}
+
+/// Where the source-revision word goes in the builder's words, or `None` when the command gets none: not a dotnet
+/// command, no verb that builds, or a word before the `--` that already sets `SourceRevisionId`.
+fn stamp_at(words: &[String], dotnet: bool) -> Option<usize> {
+    if !dotnet || !builds(words) {
+        return None;
+    }
+    let before = words.iter().position(|word| word == SEPARATOR).unwrap_or(words.len());
+    (!words[..before].iter().any(|word| sets_property(word, SOURCE_REVISION))).then_some(before)
+}
+
+/// Whether a dotnet command's words build: the next non-empty word after the dotnet word is one of [`BUILD_VERBS`],
+/// compared ignoring letter case.
+fn builds(words: &[String]) -> bool {
+    first_word(words).is_some_and(|(index, _)| {
+        words[index + 1..]
+            .iter()
+            .find(|word| !word.is_empty())
+            .is_some_and(|verb| BUILD_VERBS.iter().any(|building| eq_ignoring_case(verb, building)))
+    })
+}
+
+/// Whether a word sets the `MSBuild` property `name`: one of [`PROPERTY_SWITCHES`] and a `;`- or `,`-separated list in
+/// which one setting's name (the text before its `=`, the whole setting when it has none) is `name`, the case ignored.
+fn sets_property(word: &str, name: &str) -> bool {
+    let Some(switch) = PROPERTY_SWITCHES
+        .iter()
+        .copied()
+        .find(|switch| word.get(..switch.len()).is_some_and(|start| eq_ignoring_case(start, switch)))
+    else {
+        return false;
+    };
+    word[switch.len()..]
+        .split([',', ';'])
+        .any(|setting| eq_ignoring_case(setting.split_once('=').map_or(setting, |(setting, _)| setting), name))
 }
 
 /// A fact's failure as the reason said, its line breaks and the white space around them folded into one space.

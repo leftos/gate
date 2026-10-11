@@ -653,7 +653,19 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
 - **What routes** is kept (T2): a heavy gate, not `--local`, under no covering or lending parent, outside a git hook (`GIT_INDEX_FILE` set to a non-empty value), whose first word is not `git` or `prek`, in a git worktree of a repo `remote.json` lists, whose words with in-worktree paths rewritten (T3) match one of that repo's patterns.
 
-  A matched command still runs here, saying why, when a word names a path outside the worktree or the gate's folder holds nothing the snapshot sends. `--no-build` is dropped from the builder's words of a dotnet command, saying so (T4); the fallback here drops each exact `--no-build` word of a dotnet command after every refusal, rebuilding locally as the builder would have, because an earlier routed step (a repo's test-all build) may have built only on the builder, so a later `dotnet test --no-build` that falls back here would find no build output. A step that really did build here pays a second local build on a refusal, a cost accepted. A fallback that drops no word reuses the first plan.
+  A matched command still runs here, saying why, when a word names a path outside the worktree or the gate's folder holds nothing the snapshot sends.
+
+  `--no-build` is dropped from the builder's words of a dotnet command, saying so (T4); the fallback here drops each exact `--no-build` word of a dotnet command after every refusal, rebuilding locally as the builder would have, because an earlier routed step (a repo's test-all build) may have built only on the builder, so a later `dotnet test --no-build` that falls back here would find no build output.
+
+  A step that really did build here pays a second local build on a refusal, a cost accepted. A fallback that drops no word reuses the first plan.
+
+  Each routed run pushes a new snapshot commit, and the .NET SDK stamps the source revision into every assembly's informational version, so without a pinned revision a routed build recompiled every project on every run.
+
+  A routed dotnet command whose verb (the next non-empty word after `dotnet`, in any letter case) is `build`, `test`, `publish`, `pack`, `run` or `msbuild` therefore gets `-p:SourceRevisionId=<the worktree's HEAD sha>` on the builder's words only: before the first standalone `--`, else at the end.
+
+  The word is not added when a word before the `--` already sets `SourceRevisionId` (`-p:`, `/p:`, `-property:`, `/property:` or `--property:`, in any letter case, alone or in a list separated by `;` or `,`). The sha comes from `git rev-parse --verify -q HEAD` in the worktree root, asked only of a command that would get the word; when that fails or the branch is unborn the run routes without it.
+
+  The SDK keeps an explicit value (its git targets fill `SourceRevisionId` only when it is empty) and a `-p:` global property overrides a repo's own `<SourceRevisionId>`, so the builder's DLLs read `1.0.0+<HEAD sha>` as a local build's do, and a no-change routed build compiles nothing. The fallback here, the journal and the claim keep the command as given, and no output line says the word was added.
 - **The decision is `gate-router`'s**, pure, over facts the caller gives it and the decision asks for lazily, in this order. A light or critical gate, or one under a covering or lending parent, stays local silently and reads nothing. `--local` stays local, saying `gate: not routed: --local`. Only then is `remote.json` read: no file stays local silently, and a file that is not a file, cannot be read or is refused stays local saying `gate: ignored <path>: <reason>; running locally`.
 
   After the file: a git hook, a command with no non-empty word, or a first word whose file name without extension is `git` or `prek` (`git.exe` and a full path included, in any letter case) stays local silently.
@@ -802,7 +814,9 @@ Builders are configured only in the local `%LOCALAPPDATA%\gate\remote.json`. The
 
 The box protocol keeps the PowerShell wrapper's wire format byte for byte, so the old `remote.ps1` can drive `gate box`. `gate box` ships dormant: builders run the PowerShell wrapper behind the bridge until the remote cutover (GATE-46).
 
-Each verb is one ssh call today, and the call's cost is its connection, not its work. Measured warm, setup takes about 2.1 s (TCP about 0.2 s, key exchange and auth 1.5 s, the session 0.4 s) against 0.2 to 1.0 s of verb work, so a routed run's three verb calls spend about 6.4 s, 30 to 37% of a 17 to 26 s routed build, before its git transfers pay the same again. A routed run therefore moves to one long-lived connection carrying every verb, `gate box serve`, and the per-call client stays until that lands (GATE-70 holds the measurement, and GATE-109 the work).
+Each verb is one ssh call today, and the call's cost is its connection, not its work. Measured warm, setup takes about 2.1 s (TCP about 0.2 s, key exchange and auth 1.5 s, the session 0.4 s) against 0.2 to 1.0 s of verb work, so a routed run's three verb calls spend about 6.4 s, 30 to 37% of a 17 to 26 s routed build, before its git transfers pay the same again.
+
+A routed run therefore moves to one long-lived connection carrying every verb, `gate box serve`, and the per-call client stays until that lands (GATE-70 holds the measurement, and GATE-109 the work).
 
 The payload is one base64 word (standard alphabet, padded) of UTF-8 JSON holding the wrapper's keys: `Key`, `Bare`, `Work`, `Lock`, `Index`, `OutputFolder` and `Job`, and for `run` also `Command`, `Subfolder`, `Identity`, `Outputs`, `Nonce` and `OutputsFull`. Unknown keys are ignored, and `Outputs`, `OutputsFull` and `OutputFolder`, which the outputs transport owns (GATE-44), are parsed tolerantly and ignored.
 

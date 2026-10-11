@@ -144,6 +144,23 @@ impl Facts for Machine<'_> {
         holds_existing_path(BufReader::new(ran.stdout), root).map_err(|error| format!("cannot read git ls-files' output: {error}"))
     }
 
+    /// The root's `HEAD` sha, `Ok(None)` when the worktree has none: a `git rev-parse --verify -q HEAD` that fails (an
+    /// unborn branch among them) or writes anything but one sha is no sha.
+    fn head_sha(&self, place: &Place) -> Result<Option<String>, String> {
+        let root = Path::new(&place.root);
+        let args = ["rev-parse", "--verify", "-q", "HEAD"];
+        let mut ran = git::Git::find(root)?.run(&git::Call::plain(root, &args, self.git_limit))?;
+        if !ran.status.success() {
+            return Ok(None);
+        }
+        let mut bytes = Vec::new();
+        ran.stdout
+            .read_to_end(&mut bytes)
+            .map_err(|error| format!("cannot read git rev-parse's output: {error}"))?;
+        let text = String::from_utf8(bytes).map_err(|_| "git rev-parse's output is not valid UTF-8".to_owned())?;
+        Ok(parse_head(&text))
+    }
+
     fn file_in_folder(&self, name: &str) -> bool {
         self.folder.as_ref().is_ok_and(|folder| folder.join(name).is_file())
     }
@@ -177,6 +194,12 @@ fn parse_place(text: &str) -> Result<Place, String> {
     })
 }
 
+/// The one sha `git rev-parse HEAD` wrote: 40 lower-case hex digits on a line of their own, nothing else.
+fn parse_head(text: &str) -> Option<String> {
+    let sha = text.trim();
+    (sha.len() == 40 && sha.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))).then(|| sha.to_owned())
+}
+
 /// Whether a NUL-separated `git ls-files -z` listing, its paths relative to `root`, names a path still on disk; it
 /// reads no further than the first that does.
 fn holds_existing_path(listing: impl BufRead, root: &Path) -> io::Result<bool> {
@@ -197,7 +220,7 @@ mod tests {
 
     use gate_router::{LocalReason, Place, Route};
 
-    use super::{holds_existing_path, not_routed, parse_place};
+    use super::{holds_existing_path, not_routed, parse_head, parse_place};
 
     fn place(root: &str, prefix: &str, checkout: &str) -> Place {
         Place {
@@ -225,6 +248,18 @@ mod tests {
             "a git too old for --path-format prints a fourth line"
         );
         assert!(parse_place("C:/work/app\n\n/\n").is_err(), "a common folder with no parent");
+    }
+
+    #[test]
+    fn a_head_is_one_line_of_forty_lower_case_hex_digits() {
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        assert_eq!(parse_head(&format!("{sha}\n")), Some(sha.to_owned()), "an LF ending");
+        assert_eq!(parse_head(&format!("{sha}\r\n")), Some(sha.to_owned()), "a CRLF ending");
+        assert_eq!(parse_head(&sha.to_uppercase()), None, "upper case");
+        assert_eq!(parse_head(&format!("{sha}abcdef0123456789abcdef")), None, "a sha-256's 64 digits");
+        assert_eq!(parse_head(&format!("{sha}\n{sha}\n")), None, "two lines");
+        assert_eq!(parse_head(""), None, "nothing");
+        assert_eq!(parse_head("fatal: not a git repository (or any parent)\n"), None, "junk");
     }
 
     #[test]
