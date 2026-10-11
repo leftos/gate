@@ -66,12 +66,20 @@ fn print_request_shows_the_new_cli_request() {
             "remoteTransport": null,
             "remoteSsh": null,
             "remoteRetryPauseMs": null,
+            "remoteBoundMs": null,
+            "remoteInterruptAt": null,
+            "remoteWatchCall": null,
+            "remoteTimeoutMs": null,
             "remoteScript": null,
             "bridgePwsh": null,
         },
     });
     assert_eq!(outcome.stdout, format!("{expected}\n"), "the keys come in the published order");
+    the_seams_given_are_printed(&case);
+}
 
+/// The seams the case's runs give are printed as given.
+fn the_seams_given_are_printed(case: &Case) {
     let mut seams = print_run(&["cmd"]);
     seams.splice(
         7..7,
@@ -113,6 +121,14 @@ fn print_request_shows_the_new_cli_request() {
             "fake-ssh.exe",
             "--test-remote-retry-pause-ms",
             "9",
+            "--test-remote-bound-ms",
+            "11",
+            "--test-remote-interrupt-at",
+            "run",
+            "--test-remote-watch-call",
+            "push",
+            "--test-remote-timeout-ms",
+            "13",
         ],
     );
     let request = case.run(&seams).request();
@@ -121,8 +137,20 @@ fn print_request_shows_the_new_cli_request() {
             &request["testSeams"]["remoteTransport"],
             &request["testSeams"]["remoteSsh"],
             &request["testSeams"]["remoteRetryPauseMs"],
+            &request["testSeams"]["remoteBoundMs"],
+            &request["testSeams"]["remoteInterruptAt"],
         ),
-        (&json!(r"local:target\builder"), &json!("fake-ssh.exe"), &json!(9))
+        (
+            &json!(r"local:target\builder"),
+            &json!("fake-ssh.exe"),
+            &json!(9),
+            &json!(11),
+            &json!("run")
+        )
+    );
+    assert_eq!(
+        (&request["testSeams"]["remoteWatchCall"], &request["testSeams"]["remoteTimeoutMs"]),
+        (&json!("push"), &json!(13))
     );
 }
 

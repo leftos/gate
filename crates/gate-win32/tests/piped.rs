@@ -131,6 +131,34 @@ fn the_command_runs_in_the_job_whose_name_outlives_the_starters_handle() {
     assert_eq!(running.wait(HANG_GUARD).expect("the wait answers"), Some(124));
 }
 
+/// Created within this process's job, which may refuse breakaway, so no breakaway job is needed. Whether the command
+/// also stays in this process's job is not looked at: the test would pass as well for one that broke away from it.
+#[test]
+fn an_anonymous_kill_on_close_job_holds_its_command_and_ends_it_when_dropped() {
+    let job = Job::anonymous_kill_on_close().expect("the job is created");
+    assert_eq!(job.name(), "", "an anonymous job has no name");
+    // About 1000 s of pings: longer than the hang guard, so only the job's end can end it within the wait below.
+    let PipedSuspended {
+        suspended,
+        stdout: _stdout,
+        stderr: _stderr,
+    } = cmd("ping -n 1000 127.0.0.1 >NUL")
+        .start_suspended_within(&job)
+        .expect("the command starts");
+    let running = suspended.assign_and_resume(&job).expect("the command is assigned and resumed");
+    assert!(
+        job.process_ids().expect("the job lists its processes").contains(&running.pid()),
+        "the command is in the job"
+    );
+
+    drop(job);
+
+    assert!(
+        running.wait(HANG_GUARD).expect("the wait answers").is_some(),
+        "closing the anonymous job's only handle ended the command"
+    );
+}
+
 #[test]
 fn a_kill_on_close_jobs_command_ends_when_the_last_job_handle_is_dropped() {
     let name = unique_name("kill-on-close");

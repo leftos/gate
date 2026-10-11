@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 use gate_args::TestSeams;
 use gate_win32::Interrupt;
 
+use crate::boxside::payload::escaped;
 use crate::environment::Variables;
 use crate::run::find_program;
 
@@ -268,7 +269,8 @@ fn late_git_line(limit: Duration) -> String {
 }
 
 /// Why a git call with `call`'s arguments failed, in the words the PowerShell client uses: the folder git was asked
-/// about, its status, and every line it wrote, standard error's first, joined by ` | `.
+/// about, its status, and what [`failure_text`] keeps of the lines it wrote, standard output's first and standard
+/// error's last, so that its last error lines are the ones kept; escaped, as what git read may be the builder's.
 #[cfg_attr(
     not(any(test, feature = "test-seams")),
     expect(
@@ -280,13 +282,37 @@ fn failed_line(call: &Call<'_>, status: Option<i32>, errors: &[u8], output: &[u8
     let status = status.map_or_else(|| "unknown".to_owned(), |code| code.to_string());
     let errors = String::from_utf8_lossy(errors);
     let output = String::from_utf8_lossy(output);
-    let lines: Vec<&str> = errors.lines().chain(output.lines()).collect();
-    format!(
+    let lines: Vec<&str> = output.lines().chain(errors.lines()).collect();
+    escaped(&format!(
         "git {} failed in {} (status {status}): {}",
         call.args.join(" "),
         call.folder.display(),
-        lines.join(" | ")
-    )
+        failure_text(&lines)
+    ))
+}
+
+/// The most lines, the last, and the most bytes of them that a failure line carries of a call's lines.
+const FAILURE_LINES: usize = 10;
+pub(crate) const FAILURE_BYTES: usize = 4096;
+
+/// The last [`FAILURE_LINES`] of a failed call's `lines`, each as its last carriage-return update leaves it, joined by
+/// ` | ` and cut to their last [`FAILURE_BYTES`] at a character's boundary: what a failure line carries of them.
+pub(crate) fn failure_text<S: AsRef<str>>(lines: &[S]) -> String {
+    let last = lines.get(lines.len().saturating_sub(FAILURE_LINES)..).unwrap_or_default();
+    let shown: Vec<&str> = last.iter().map(|line| last_update(line.as_ref())).collect();
+    let joined = shown.join(" | ");
+    let mut start = joined.len().saturating_sub(FAILURE_BYTES);
+    while !joined.is_char_boundary(start) {
+        start += 1;
+    }
+    joined.get(start..).unwrap_or_default().to_owned()
+}
+
+/// What a progress line shows once its carriage-return updates are done: the text after its last carriage return.
+/// Preflight and failure text are read this way on purpose, each line keeping its last update and dropping what came
+/// before it.
+pub(crate) fn last_update(line: &str) -> &str {
+    line.rsplit('\r').next().unwrap_or(line)
 }
 
 /// A new file in the temporary folder for one git call's output, deleted once its last handle closes.
@@ -309,7 +335,55 @@ mod tests {
     use std::ffi::OsStr;
     use std::path::PathBuf;
 
-    use super::{Call, GIT_LIMIT, Git, failed_line, is_indexed_config, late_git_line};
+    use super::{Call, FAILURE_BYTES, GIT_LIMIT, Git, failed_line, failure_text, is_indexed_config, late_git_line};
+
+    #[test]
+    fn a_failure_line_shows_each_kept_line_s_last_progress_update() {
+        let lines = [
+            "Receiving objects:  1% (1/90)\rReceiving objects: 50% (45/90)",
+            "fatal: the remote end hung up unexpectedly",
+        ];
+        assert_eq!(
+            failure_text(&lines),
+            "Receiving objects: 50% (45/90) | fatal: the remote end hung up unexpectedly"
+        );
+    }
+
+    #[test]
+    fn a_failure_line_carries_the_last_10_lines_and_4_kib_of_them_at_most() {
+        let lines: Vec<String> = (1..=12).map(|number| format!("line {number}")).collect();
+        assert_eq!(
+            failure_text(&lines),
+            "line 3 | line 4 | line 5 | line 6 | line 7 | line 8 | line 9 | line 10 | line 11 | line 12"
+        );
+        let wide = ["\u{e9}".repeat(3000)];
+        let text = failure_text(&wide);
+        assert_eq!(text.len(), FAILURE_BYTES, "the last 4 KiB, which start at a character's boundary here");
+        let cut = [format!("{}x", "\u{e9}".repeat(3000))];
+        let text = failure_text(&cut);
+        assert_eq!(text.len(), FAILURE_BYTES - 1, "a character the cut would split is left out");
+        assert!(text.starts_with('\u{e9}') && text.ends_with('x'), "{text}");
+        assert_eq!(failure_text::<&str>(&[]), "");
+    }
+
+    #[test]
+    fn a_failed_git_s_standard_error_comes_last_so_its_fatal_line_is_kept() {
+        let call = Call::plain(Path::new(r"C:\work\app"), &["fetch"], GIT_LIMIT);
+        let output = (1..=12).fold(String::new(), |text, number| text + "out " + &number.to_string() + "\n");
+        assert_eq!(
+            failed_line(&call, Some(128), b"fatal: the remote end hung up\n", output.as_bytes()),
+            r"git fetch failed in C:\work\app (status 128): out 4 | out 5 | out 6 | out 7 | out 8 | out 9 | out 10 | out 11 | out 12 | fatal: the remote end hung up"
+        );
+    }
+
+    #[test]
+    fn a_failed_git_line_escapes_what_git_wrote() {
+        let call = Call::plain(Path::new(r"C:\work\app"), &["write-tree"], GIT_LIMIT);
+        assert_eq!(
+            failed_line(&call, Some(128), b"fatal: \x1b[31mred\x1b]8;;http://x\x07link\n", b""),
+            r"git write-tree failed in C:\work\app (status 128): fatal: \u{1b}[31mred\u{1b}]8;;http://x\u{7}link"
+        );
+    }
 
     #[test]
     fn git_is_given_none_of_the_config_variables() {
@@ -348,7 +422,7 @@ mod tests {
         let call = Call::plain(Path::new(r"C:\work\app"), &["write-tree"], GIT_LIMIT);
         assert_eq!(
             failed_line(&call, Some(128), b"warning: first\r\nfatal: last\n", b"then out\n"),
-            r"git write-tree failed in C:\work\app (status 128): warning: first | fatal: last | then out"
+            r"git write-tree failed in C:\work\app (status 128): then out | warning: first | fatal: last"
         );
         assert_eq!(
             failed_line(&call, Some(1), b"", b""),

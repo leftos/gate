@@ -44,6 +44,14 @@ pub(crate) enum ValueOption {
     #[cfg(feature = "test-seams")]
     RemoteRetryPauseMs,
     #[cfg(feature = "test-seams")]
+    RemoteBoundMs,
+    #[cfg(feature = "test-seams")]
+    RemoteInterruptAt,
+    #[cfg(feature = "test-seams")]
+    RemoteWatchCall,
+    #[cfg(feature = "test-seams")]
+    RemoteTimeoutMs,
+    #[cfg(feature = "test-seams")]
     RemoteScript,
     #[cfg(feature = "test-seams")]
     BridgePwsh,
@@ -172,6 +180,18 @@ impl RunBuilder {
             #[cfg(feature = "test-seams")]
             ValueOption::RemoteRetryPauseMs => self.test_seams.remote_retry_pause_ms = Some(values::above_zero(spelled, value)?),
             #[cfg(feature = "test-seams")]
+            ValueOption::RemoteBoundMs => self.test_seams.remote_bound_ms = Some(values::above_zero(spelled, value)?),
+            #[cfg(feature = "test-seams")]
+            ValueOption::RemoteInterruptAt => {
+                self.test_seams.remote_interrupt_at = Some(values::remote_call(spelled, value, values::INTERRUPTED_CALLS)?);
+            }
+            #[cfg(feature = "test-seams")]
+            ValueOption::RemoteWatchCall => {
+                self.test_seams.remote_watch_call = Some(values::remote_call(spelled, value, values::WATCHED_CALLS)?);
+            }
+            #[cfg(feature = "test-seams")]
+            ValueOption::RemoteTimeoutMs => self.test_seams.remote_timeout_ms = Some(values::above_zero(spelled, value)?),
+            #[cfg(feature = "test-seams")]
             ValueOption::RemoteScript => self.test_seams.remote_script = Some(PathBuf::from(value)),
             #[cfg(feature = "test-seams")]
             ValueOption::BridgePwsh => self.test_seams.bridge_pwsh = Some(PathBuf::from(value)),
@@ -251,9 +271,10 @@ impl RunBuilder {
         }
     }
 
-    /// Refuses the remote client's seams that cannot work together: `--test-remote-ssh` and
-    /// `--test-remote-retry-pause-ms` without `--test-remote-transport`, whose client alone reads them, and
-    /// `--test-remote-snapshot` with it, as each chooses the client.
+    /// Refuses the remote client's seams that cannot work together: `--test-remote-ssh`,
+    /// `--test-remote-retry-pause-ms`, `--test-remote-bound-ms`, `--test-remote-interrupt-at`,
+    /// `--test-remote-watch-call` and `--test-remote-timeout-ms` without `--test-remote-transport`, whose client alone
+    /// reads them, and `--test-remote-snapshot` with it, as each chooses the client.
     #[cfg(feature = "test-seams")]
     fn check_remote_seams(&mut self) {
         const TRANSPORT: &str = "--test-remote-transport";
@@ -262,6 +283,10 @@ impl RunBuilder {
         for (read, spelled) in [
             (self.test_seams.remote_ssh.is_some(), "--test-remote-ssh"),
             (self.test_seams.remote_retry_pause_ms.is_some(), "--test-remote-retry-pause-ms"),
+            (self.test_seams.remote_bound_ms.is_some(), "--test-remote-bound-ms"),
+            (self.test_seams.remote_interrupt_at.is_some(), "--test-remote-interrupt-at"),
+            (self.test_seams.remote_watch_call.is_some(), "--test-remote-watch-call"),
+            (self.test_seams.remote_timeout_ms.is_some(), "--test-remote-timeout-ms"),
         ] {
             if read && !transport {
                 self.problems.push(Problem::SeamNeeds {

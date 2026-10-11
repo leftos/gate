@@ -57,6 +57,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Marker**: a failure marker, a log line the built-in regex reads as a failure (such as `Build FAILED.` or `error CS1234`), which turns a zero exit into status 1.
 - **Nesting**: a gate started inside another gate's command (a build hook under a gated `git commit`), which reads its parent from the slot marker.
 - **Notes**: the gate's own lines gathered while a run goes and appended to the end of its log.
+- **Output cap**: the remote client's limit of 64 KiB on one line of a call's output (a `\r` resets the line, so git's progress counts per update), which kills a capped call that sends a longer one.
 - **Pause marker**: an empty file a gate under a parent gate's slot rewrites on every pass while it waits behind a critical request, which stops its parent's watchdog clocks for that time, the watchdog reading it on each sample; one older than 30 s is stale.
 - **Pipe-closed stop**: the box's stop of a job whose client's connection closed: `gate box run` terminates the job, waits for its processes and exits 255.
 - **Pool**: the set of slots of one kind (heavy, light, remote); pools never wait on each other.
@@ -98,6 +99,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Usage error**: a command line the gate refuses (a missing, unknown, repeated or invalid input): each problem on its own `gate: ` line, then the usage, exit 2, before any slot is queued.
 - **Verdict**: the outcome a `release` line records: `passed`, `failed`, `log-failure`, `stalled`, `timed-out`, `backstop` or `unknown` (no run facts).
 - **Wake event**: the auto-reset named event each waiter sleeps on, which a gate signals when it takes or releases a slot or deletes a dead gate's ticket.
+- **Watch call**: the one remote-client call (`preflight`, `push`, `run`, `ls-remote` or `fetch`) that `--test-remote-watch-call` points the stall and ceiling seams at.
 - **Watchdog**: the part of a running gate that samples the command and kills its job on a stall, the ceiling or the backstop.
 - **Win32 layer**: the `gate-win32` crate, the only code that calls Windows for job objects, processes, mutexes, events and console handling.
 - **Work folder**: the builder's checkout of one PC worktree, reused across routed runs so builds stay incremental.

@@ -1,6 +1,6 @@
 //! Commands created suspended with their output piped back: stdin from `NUL`, stdout and stderr into two anonymous
-//! pipes whose read ends stay with the caller, outside the caller's own job and on a hidden console of their own or the
-//! caller's, then put in a named job and resumed. The command also inherits a handle to that job, so the job's name
+//! pipes whose read ends stay with the caller, outside the caller's own job or within it, and on a hidden console of their own or the
+//! caller's, then put in a job, named or anonymous, and resumed. The command also inherits a handle to that job, so the job's name
 //! lasts while the command runs even after the caller is gone; unless the job kills on close, which a command holding a
 //! handle to it would keep open.
 
@@ -19,7 +19,7 @@ use windows_sys::Win32::System::JobObjects::{
 };
 use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::SystemServices::JOB_OBJECT_QUERY;
-use windows_sys::Win32::System::Threading::{CREATE_BREAKAWAY_FROM_JOB, CREATE_NO_WINDOW, GetCurrentProcess};
+use windows_sys::Win32::System::Threading::{CREATE_BREAKAWAY_FROM_JOB, CREATE_NO_WINDOW, GetCurrentProcess, PROCESS_CREATION_FLAGS};
 
 use crate::create::{Creation, Inherited, check_launch, create_inheriting};
 use crate::launch::{open_shared, setup, struct_size};
@@ -80,6 +80,22 @@ impl PipedLaunch {
     /// (an application that is relative or a batch file, or a NUL in the application, command line or working folder)
     /// or a handle, a pipe or the attribute list cannot be made.
     pub fn start_suspended(&self, job: &Job) -> Result<PipedSuspended, LaunchError> {
+        self.created(job, CREATE_BREAKAWAY_FROM_JOB)
+    }
+
+    /// Creates the command suspended as [`PipedLaunch::start_suspended`] does, but inside this process's job rather
+    /// than outside it: once [`Suspended::assign_and_resume`] puts it in `job` too, it runs in `job` nested in this
+    /// process's job, so a job that ends this process's tree ends it too, and a job that refuses breakaway takes it.
+    ///
+    /// # Errors
+    ///
+    /// As [`PipedLaunch::start_suspended`].
+    pub fn start_suspended_within(&self, job: &Job) -> Result<PipedSuspended, LaunchError> {
+        self.created(job, 0)
+    }
+
+    /// Creates the command suspended with the creation flag `breakaway`, `CREATE_BREAKAWAY_FROM_JOB` or none.
+    fn created(&self, job: &Job, breakaway: PROCESS_CREATION_FLAGS) -> Result<PipedSuspended, LaunchError> {
         check_launch(&self.command_line, &self.application, &[("working folder", self.directory.as_path())])?;
         let job_handle = if job.kills_on_close() { None } else { Some(open_job(job)?) };
         let others: Vec<(&OwnedHandle, Option<u32>)> = job_handle.iter().map(|handle| (handle, Some(JOB_OBJECT_QUERY))).collect();
@@ -97,8 +113,8 @@ impl PipedLaunch {
             others: &others,
         };
         let flags = match self.console {
-            PipedConsole::Hidden => CREATE_BREAKAWAY_FROM_JOB | CREATE_NO_WINDOW,
-            PipedConsole::Attached => CREATE_BREAKAWAY_FROM_JOB,
+            PipedConsole::Hidden => breakaway | CREATE_NO_WINDOW,
+            PipedConsole::Attached => breakaway,
         };
         let suspended = create_inheriting(&creation, flags, &inherited, None)?;
         // The command holds its own copies now; with these closed, each read end ends when the command's copies do.

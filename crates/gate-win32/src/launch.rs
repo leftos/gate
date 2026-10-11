@@ -446,8 +446,11 @@ impl Suspended {
         let Some(process) = &self.process else {
             return Err(setup(io::Error::other("the process was already taken"), "put the command in its job"));
         };
-        job.assign(process)
-            .map_err(|error| setup(error, &format!("put the command in the job {}", job.name())))
+        let named = match job.name() {
+            "" => "the job".to_owned(),
+            name => format!("the job {name}"),
+        };
+        job.assign(process).map_err(|error| setup(error, &format!("put the command in {named}")))
     }
 
     /// Lets the command run, once [`Suspended::assign`] has put it in its job.

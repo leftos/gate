@@ -300,8 +300,13 @@ fn the_remote_client_seams_need_a_value_once() {
 
     let seams = run_request(&refs(&with(&RUN, &["--", "cmd"]))).test_seams;
     assert_eq!(
-        (seams.remote_transport, seams.remote_ssh, seams.remote_retry_pause_ms),
-        (None, None, None),
+        (
+            seams.remote_transport,
+            seams.remote_ssh,
+            seams.remote_retry_pause_ms,
+            seams.remote_bound_ms
+        ),
+        (None, None, None, None),
         "none unless given"
     );
     let given = [
@@ -310,19 +315,32 @@ fn the_remote_client_seams_need_a_value_once() {
         "--test-remote-ssh=fake-ssh.exe",
         "--test-remote-retry-pause-ms",
         "15",
+        "--test-remote-bound-ms",
+        "200",
         "--",
         "cmd",
     ];
     let seams = run_request(&refs(&with(&RUN, &given))).test_seams;
     assert_eq!(
-        (seams.remote_transport, seams.remote_ssh, seams.remote_retry_pause_ms),
+        (
+            seams.remote_transport,
+            seams.remote_ssh,
+            seams.remote_retry_pause_ms,
+            seams.remote_bound_ms
+        ),
         (
             Some(r"local:target\builder".to_owned()),
             Some(std::path::PathBuf::from("fake-ssh.exe")),
-            Some(15)
+            Some(15),
+            Some(200)
         )
     );
-    for flag in ["--test-remote-transport", "--test-remote-ssh", "--test-remote-retry-pause-ms"] {
+    for flag in [
+        "--test-remote-transport",
+        "--test-remote-ssh",
+        "--test-remote-retry-pause-ms",
+        "--test-remote-bound-ms",
+    ] {
         assert_eq!(
             problems(&refs(&with(&RUN, &[flag, "--", "cmd"]))),
             [format!("gate: {flag} needs a value")],
@@ -354,6 +372,62 @@ fn the_remote_client_seams_need_a_value_once() {
         problems(&refs(&with(&RUN, &["--test-remote-retry-pause-ms", "0", "--", "cmd"]))),
         ["gate: --test-remote-retry-pause-ms must be a whole number above 0, got '0'"]
     );
+    assert_eq!(
+        problems(&refs(&with(
+            &RUN,
+            &["--test-remote-transport", "local:b", "--test-remote-bound-ms", "0", "--", "cmd"]
+        ))),
+        ["gate: --test-remote-bound-ms must be a whole number above 0, got '0'"]
+    );
+    for call in ["preflight", "run"] {
+        let words = with(
+            &RUN,
+            &["--test-remote-transport", "local:b", "--test-remote-interrupt-at", call, "--", "cmd"],
+        );
+        assert_eq!(run_request(&refs(&words)).test_seams.remote_interrupt_at.as_deref(), Some(call));
+    }
+    assert_eq!(
+        problems(&refs(&with(
+            &RUN,
+            &["--test-remote-transport", "local:b", "--test-remote-interrupt-at", "push", "--", "cmd"]
+        ))),
+        ["gate: --test-remote-interrupt-at must be preflight or run, got 'push'"]
+    );
+}
+
+#[cfg(feature = "test-seams")]
+#[test]
+fn the_remote_watch_seams_name_one_call_and_a_ceiling() {
+    use crate::support::run_request;
+
+    for call in ["preflight", "push", "run", "ls-remote", "fetch"] {
+        let words = with(
+            &RUN,
+            &["--test-remote-transport", "local:b", "--test-remote-watch-call", call, "--", "cmd"],
+        );
+        assert_eq!(run_request(&refs(&words)).test_seams.remote_watch_call.as_deref(), Some(call));
+    }
+    assert_eq!(
+        problems(&refs(&with(
+            &RUN,
+            &["--test-remote-transport", "local:b", "--test-remote-watch-call", "stop", "--", "cmd"]
+        ))),
+        ["gate: --test-remote-watch-call must be preflight, push, run, ls-remote or fetch, got 'stop'"]
+    );
+    let words = with(
+        &RUN,
+        &["--test-remote-transport", "local:b", "--test-remote-timeout-ms", "300", "--", "cmd"],
+    );
+    assert_eq!(run_request(&refs(&words)).test_seams.remote_timeout_ms, Some(300));
+    assert_eq!(
+        problems(&refs(&with(
+            &RUN,
+            &["--test-remote-transport", "local:b", "--test-remote-timeout-ms", "0", "--", "cmd"]
+        ))),
+        ["gate: --test-remote-timeout-ms must be a whole number above 0, got '0'"]
+    );
+    let none = run_request(&refs(&with(&RUN, &["--", "cmd"]))).test_seams;
+    assert_eq!((none.remote_watch_call, none.remote_timeout_ms), (None, None), "none unless given");
 }
 
 #[cfg(feature = "test-seams")]
@@ -367,6 +441,22 @@ fn the_remote_client_seams_that_conflict_are_refused() {
         (
             &["--test-remote-retry-pause-ms", "5"][..],
             "gate: --test-remote-retry-pause-ms needs --test-remote-transport",
+        ),
+        (
+            &["--test-remote-bound-ms", "5"][..],
+            "gate: --test-remote-bound-ms needs --test-remote-transport",
+        ),
+        (
+            &["--test-remote-interrupt-at", "run"][..],
+            "gate: --test-remote-interrupt-at needs --test-remote-transport",
+        ),
+        (
+            &["--test-remote-watch-call", "run"][..],
+            "gate: --test-remote-watch-call needs --test-remote-transport",
+        ),
+        (
+            &["--test-remote-timeout-ms", "300"][..],
+            "gate: --test-remote-timeout-ms needs --test-remote-transport",
         ),
         (
             &["--test-remote-snapshot", "--test-remote-transport", "local:b"][..],
@@ -663,6 +753,10 @@ fn seam_flags_are_unknown_without_the_feature() {
         "--test-remote-transport",
         "--test-remote-ssh",
         "--test-remote-retry-pause-ms",
+        "--test-remote-bound-ms",
+        "--test-remote-interrupt-at",
+        "--test-remote-watch-call",
+        "--test-remote-timeout-ms",
         "--test-server-image",
     ] {
         assert_eq!(

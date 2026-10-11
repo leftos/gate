@@ -14,8 +14,8 @@ use gate_router::repo_name;
 use serde_json::{Value, json};
 
 use crate::support::{
-    Case, GATE, GIT_REDIRECTS, Outcome, allow_breakaway, copy_tool, events, finish, git, git_init, heavy_words, shown, start, wait_for_journal_line,
-    wait_until, write_remote_json,
+    Case, GATE, GIT_REDIRECTS, Outcome, allow_breakaway, copy_tool, events, finish, git, git_init, heavy_words, release, shown, start,
+    wait_for_journal_line, wait_until, write_remote_json,
 };
 
 const HOST: &str = "builder";
@@ -380,8 +380,32 @@ fn client_gate(case: &Case, log: &str, steps: &Path, command: &[&str]) -> Comman
 /// [`client_gate`] through the local transport of the form `kind`: `local`, or `local-ssh`, which pushes and fetches
 /// through the stand-in as git's own ssh, so each of git's calls to the builder is a call of the stand-in too.
 fn client_gate_through(case: &Case, kind: &str, log: &str, steps: &Path, command: &[&str]) -> Command {
-    let transport = format!("{kind}:{}", shown(&case.folder().join("builder")));
-    let seams = [
+    let tuned = Tuned { kind, ..Tuned::default() };
+    client_gate_tuned(case, log, steps, &tuned, command)
+}
+
+/// What a case changes in the words of a client run: the transport's form, the ceiling, and more options before the
+/// command.
+struct Tuned<'a> {
+    kind: &'a str,
+    timeout: &'a str,
+    extra: &'a [&'a str],
+}
+
+impl Default for Tuned<'_> {
+    fn default() -> Self {
+        Tuned {
+            kind: "local",
+            timeout: "3600",
+            extra: &[],
+        }
+    }
+}
+
+/// [`client_gate`] with the words `tuned` changes.
+fn client_gate_tuned(case: &Case, log: &str, steps: &Path, tuned: &Tuned<'_>, command: &[&str]) -> Command {
+    let transport = format!("{}:{}", tuned.kind, shown(&case.folder().join("builder")));
+    let mut seams = vec![
         "--test-remote-transport",
         transport.as_str(),
         "--test-remote-ssh",
@@ -391,7 +415,11 @@ fn client_gate_through(case: &Case, kind: &str, log: &str, steps: &Path, command
         "--test-git-limit-ms",
         "3600000",
     ];
-    let mut gate = case.gate(&heavy_words(log, &seams, command));
+    seams.extend(tuned.extra);
+    let mut words = heavy_words(log, &seams, command);
+    assert_eq!(words[3], "--timeout", "the ceiling's value follows it");
+    words[4] = tuned.timeout;
+    let mut gate = case.gate(&words);
     gate.env(STEPS_VARIABLE, steps).env(GATE_VARIABLE, GATE);
     gate
 }
@@ -643,6 +671,53 @@ fn a_box_of_another_version_is_not_routed() {
 }
 
 #[test]
+fn a_builder_version_holding_escapes_is_refused_in_an_escaped_line() {
+    let case = client_case("client-version-escaped");
+    let steps = ssh_steps(&case, "ssh", &["version 9.9.9\u{1b}[2J\u{202e}"]);
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "out", "ran here"]));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let line = format!(
+        r"gate: not routed: builder runs gate 9.9.9\u{{1b}}[2J\u{{202e}}, this PC {}",
+        env!("CARGO_PKG_VERSION")
+    );
+    assert!(outcome.stderr.contains(&line), "{outcome:?}");
+    assert!(!outcome.stderr.contains(['\u{1b}', '\u{202e}']), "no raw escape: {outcome:?}");
+    assert_eq!(fallbacks(&events(&case)), ["version"]);
+}
+
+/// A preflight that fails as ssh does, with status 255 and a line that is no failure before the banner, so it is not
+/// made again; the line holds ESC, BEL and a carriage return.
+#[test]
+fn a_preflight_s_failure_line_is_shown_escaped_as_its_last_update() {
+    let case = client_case("client-preflight-escaped");
+    let steps = ssh_steps(
+        &case,
+        "ssh",
+        &["say-exit 255 \u{1b}[31mearlier-update\rlater \u{1b}]8;;http://x\u{7}link"],
+    );
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "out", "ran here"]));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(
+        outcome
+            .stderr
+            .contains(r"gate: remote builder unreachable: later \u{1b}]8;;http://x\u{7}link"),
+        "{outcome:?}"
+    );
+    assert!(!outcome.stderr.contains('\u{1b}'), "no raw ESC: {outcome:?}");
+    assert!(
+        !outcome.stderr.contains("earlier-update"),
+        "only the line's last update is shown: {outcome:?}"
+    );
+    assert!(outcome.stdout.contains("ran here"), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight"]);
+    assert_eq!(fallbacks(&events(&case)), ["unreachable"]);
+}
+
+#[test]
 fn a_file_the_command_changes_on_the_box_is_synced_back() {
     let case = client_case("client-synced-back");
     let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
@@ -879,7 +954,12 @@ fn a_patch_that_does_not_apply_fails_the_run_and_is_removed() {
     let outcome = finish(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "mark", "made-on-box.txt"]));
 
     assert_eq!(outcome.code, Some(1), "{outcome:?}");
-    assert!(outcome.stderr.contains("gate: the remote run failed: git apply "), "{outcome:?}");
+    assert!(
+        outcome
+            .stderr
+            .contains("gate: the remote run failed: git -c core.protectNTFS=true apply "),
+        "{outcome:?}"
+    );
     assert_eq!(patch_files(&case), Vec::<String>::new(), "the patch is removed");
     assert_eq!(
         fs::read_to_string(case.folder().join("made-on-box.txt")).expect("the worktree's file is there"),
@@ -921,5 +1001,315 @@ fn a_banner_drop_of_the_sync_back_s_ls_remote_is_retried_once() {
             "git-upload-pack",
             "git-upload-pack"
         ]
+    );
+}
+
+/// The stall window or ceiling a watchdog case gives the one call `--test-remote-watch-call` names, which sends nothing:
+/// every other call keeps the run's own windows, which no case reaches.
+const WATCHED_MS: &str = "300";
+/// The line of a run call the watchdog killed for a stall of [`WATCHED_MS`], in whole seconds rounded up.
+const STALLED_LINE: &str = "gate: STALLED: no output or remote CPU for 1 s";
+
+/// Whether the stand-in's calls `made` are `expected`, or `expected` without the call `watched`: a call killed
+/// [`WATCHED_MS`] after its start may be killed on a busy machine before the stand-in has logged it, and the next call
+/// then takes its step.
+fn made_but_maybe(made: &[String], expected: &[&str], watched: &str) -> bool {
+    let without: Vec<&str> = expected.iter().copied().filter(|verb| *verb != watched).collect();
+    made == expected || made == without.as_slice()
+}
+
+/// A path no case creates: a `hold` on it parks the stand-in until the client kills it.
+fn never(case: &Case) -> String {
+    shown(&case.folder().join("ssh").join("never"))
+}
+
+/// The verdict the run's release journalled.
+fn verdict(case: &Case) -> String {
+    release(case)["verdict"].as_str().expect("the release names its verdict").to_owned()
+}
+
+/// Through `local-ssh`, so a sync-back would show as a call of the stand-in.
+#[test]
+fn a_stalled_run_call_is_killed_and_the_command_stopped() {
+    let case = client_case("client-stalled");
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok", &format!("hold {}", never(&case)), "ok"]);
+    let tuned = Tuned {
+        kind: "local-ssh",
+        extra: &["--test-remote-watch-call", "run", "--test-stall-ms", WATCHED_MS],
+        ..Tuned::default()
+    };
+
+    let outcome = finish(client_gate_tuned(&case, "out.log", &steps, &tuned, &[r".\tool.exe", "out", "ran there"]));
+
+    assert_eq!(outcome.code, Some(124), "{outcome:?}");
+    assert!(outcome.stderr.contains(STALLED_LINE), "{outcome:?}");
+    let log = fs::read_to_string(case.folder().join("out.log")).expect("the log was written");
+    assert!(log.contains(STALLED_LINE), "the kill line is in the log: {log}");
+    assert_eq!(verdict(&case), "stalled");
+    let made = calls(&steps);
+    assert!(
+        made_but_maybe(&made, &["preflight", "git-receive-pack", "run", "stop"], "run"),
+        "a stop, and no sync-back: {made:?}"
+    );
+    assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new());
+}
+
+#[test]
+fn a_run_past_its_ceiling_is_killed_with_a_timed_out_line() {
+    let case = client_case("client-timed-out");
+    let steps = ssh_steps(&case, "ssh", &["ok", &format!("hold {}", never(&case)), "ok"]);
+    let tuned = Tuned {
+        extra: &["--test-remote-watch-call", "run", "--test-remote-timeout-ms", WATCHED_MS],
+        ..Tuned::default()
+    };
+
+    let outcome = finish(client_gate_tuned(&case, "out.log", &steps, &tuned, &[r".\tool.exe", "out", "ran there"]));
+
+    assert_eq!(outcome.code, Some(124), "{outcome:?}");
+    assert!(outcome.stderr.contains("gate: TIMED OUT after 1 s"), "{outcome:?}");
+    assert_eq!(verdict(&case), "timed-out");
+    let made = calls(&steps);
+    assert!(made_but_maybe(&made, &["preflight", "run", "stop"], "run"), "{made:?}");
+}
+
+#[test]
+fn a_stalled_preflight_falls_back_unreachable_and_runs_here() {
+    let case = client_case("client-stalled-preflight");
+    let steps = ssh_steps(&case, "ssh", &[&format!("hold {}", never(&case))]);
+    let tuned = Tuned {
+        extra: &["--test-remote-watch-call", "preflight", "--test-stall-ms", WATCHED_MS],
+        ..Tuned::default()
+    };
+
+    let outcome = finish(client_gate_tuned(&case, "out.log", &steps, &tuned, &[r".\tool.exe", "out", "ran here"]));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(
+        outcome.stderr.contains("gate: remote builder unreachable: the preflight stalled"),
+        "{outcome:?}"
+    );
+    assert!(outcome.stderr.contains(UNREACHABLE_LINE), "{outcome:?}");
+    assert!(outcome.stdout.contains("ran here"), "{outcome:?}");
+    let made = calls(&steps);
+    assert!(
+        made_but_maybe(&made, &["preflight"], "preflight"),
+        "no stop: the command never started: {made:?}"
+    );
+    assert_eq!(fallbacks(&events(&case)), ["unreachable"]);
+}
+
+/// Through `local-ssh`, the stand-in is git's ssh for the push, whose standard error git passes on as its own.
+#[test]
+fn a_push_whose_progress_updates_pass_64_kib_together_is_not_cut() {
+    let case = client_case("client-push-progress");
+    let steps = ssh_steps(&case, "ssh", &["ok", "progress-ok 70000", "ok", "ok"]);
+
+    let outcome = finish(client_gate_through(
+        &case,
+        "local-ssh",
+        "out.log",
+        &steps,
+        &[r".\tool.exe", "out", "ran there"],
+    ));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(!outcome.stderr.contains("longer than 64 KiB"), "{outcome:?}");
+    assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new(), "routed, not fallen back");
+    let made = calls(&steps);
+    assert_eq!(
+        made.get(..3),
+        Some(&["preflight".to_owned(), "git-receive-pack".to_owned(), "run".to_owned()][..]),
+        "{made:?}"
+    );
+}
+
+#[test]
+fn a_preflight_line_longer_than_64_kib_falls_back_unreachable_and_runs_here() {
+    let case = client_case("client-preflight-flood");
+    let steps = ssh_steps(&case, "ssh", &["flood 70000"]);
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "out", "ran here"]));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(
+        outcome
+            .stderr
+            .contains("gate: remote builder unreachable: the preflight sent a line longer than 64 KiB"),
+        "{outcome:?}"
+    );
+    assert!(outcome.stdout.contains("ran here"), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight"], "no stop: the command never started");
+    assert_eq!(fallbacks(&events(&case)), ["unreachable"]);
+}
+
+#[test]
+fn a_stall_window_under_15_s_is_raised_to_15() {
+    let case = client_case("client-stall-floor");
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+    let tuned = Tuned {
+        extra: &["--stall", "3"],
+        ..Tuned::default()
+    };
+
+    let outcome = finish(client_gate_tuned(&case, "out.log", &steps, &tuned, &[r".\tool.exe", "out", "ran there"]));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let raised = "gate: --stall 3 raised to 15 for a remote run (heartbeats come every 5 s)";
+    assert_eq!(outcome.stderr.matches(raised).count(), 1, "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "run"]);
+}
+
+#[test]
+fn a_stop_that_does_not_finish_is_given_up() {
+    let case = client_case("client-stop-hangs");
+    let hold = format!("hold {}", never(&case));
+    let steps = ssh_steps(&case, "ssh", &["ok", &hold, &hold]);
+    let tuned = Tuned {
+        extra: &[
+            "--test-remote-watch-call",
+            "run",
+            "--test-stall-ms",
+            WATCHED_MS,
+            "--test-remote-bound-ms",
+            "200",
+        ],
+        ..Tuned::default()
+    };
+
+    let outcome = finish(client_gate_tuned(&case, "out.log", &steps, &tuned, &[r".\tool.exe", "out", "ran there"]));
+
+    assert_eq!(outcome.code, Some(124), "{outcome:?}");
+    assert!(
+        outcome.stderr.contains("gate: stopping the command on builder did not finish in 1 s"),
+        "{outcome:?}"
+    );
+    // The run call and the stop are each killed 300 or 200 ms after they start, either maybe before the stand-in logs it.
+    let made = calls(&steps);
+    let logged: Vec<&str> = ["preflight", "run", "stop"]
+        .into_iter()
+        .filter(|verb| made.iter().any(|call| call == verb))
+        .collect();
+    assert!(
+        made.first().is_some_and(|call| call == "preflight") && made == logged.as_slice(),
+        "{made:?}"
+    );
+}
+
+/// The status Windows reports for a process Ctrl+C ended, `STATUS_CONTROL_C_EXIT`, as a signed exit code.
+const CONTROL_C_EXIT: i32 = 0xC000_013A_u32.cast_signed();
+
+#[test]
+fn a_ctrl_c_during_the_run_call_stops_the_command() {
+    let case = client_case("client-ctrl-c-run");
+    let steps = ssh_steps(&case, "ssh", &["ok", &format!("say-hold started {}", never(&case)), "ok"]);
+    let tuned = Tuned {
+        extra: &["--test-remote-interrupt-at", "run"],
+        ..Tuned::default()
+    };
+
+    let outcome = finish(client_gate_tuned(&case, "out.log", &steps, &tuned, &[r".\tool.exe", "out", "ran there"]));
+
+    assert_eq!(outcome.code, Some(CONTROL_C_EXIT), "{outcome:?}");
+    // The interrupt comes once the run call wrote its first byte, by when the stand-in has logged its call.
+    assert_eq!(calls(&steps), ["preflight", "run", "stop"], "the command is stopped");
+    assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new());
+}
+
+#[test]
+fn a_ctrl_c_during_the_preflight_stops_nothing() {
+    let case = client_case("client-ctrl-c-preflight");
+    let steps = ssh_steps(&case, "ssh", &[&format!("say-hold started {}", never(&case))]);
+    let tuned = Tuned {
+        extra: &["--test-remote-interrupt-at", "preflight"],
+        ..Tuned::default()
+    };
+
+    let outcome = finish(client_gate_tuned(&case, "out.log", &steps, &tuned, &[r".\tool.exe", "out", "ran here"]));
+
+    assert_eq!(outcome.code, Some(CONTROL_C_EXIT), "{outcome:?}");
+    // The interrupt comes once the preflight wrote its first byte, by when the stand-in has logged its call.
+    assert_eq!(calls(&steps), ["preflight"], "no stop: the command never started");
+    assert!(!outcome.stdout.contains("ran here"), "nothing ran here: {outcome:?}");
+}
+
+/// The preflight, the push's receive-pack and the run call through `local-ssh`, then the sync-back's `ls-remote` and,
+/// as `last` says, its fetch: a run whose command made a file on the builder, ended by a sync-back call. A last call
+/// that `--test-remote-watch-call` names may be killed before the stand-in has logged it.
+fn a_failed_sync_back(name: &str, last: fn(&Case) -> Vec<String>, tuned: &Tuned<'_>) -> Outcome {
+    let case = client_case(name);
+    let mut all = vec!["ok".to_owned(), "ok".to_owned(), "ok".to_owned()];
+    all.extend(last(&case));
+    let all: Vec<&str> = all.iter().map(String::as_str).collect();
+    let steps = ssh_steps(&case, "ssh", &all);
+    let tuned = Tuned { kind: "local-ssh", ..*tuned };
+
+    let outcome = finish(client_gate_tuned(
+        &case,
+        "out.log",
+        &steps,
+        &tuned,
+        &[r".\tool.exe", "mark", "made-on-box.txt"],
+    ));
+
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert!(!case.folder().join("made-on-box.txt").exists(), "nothing was applied: {outcome:?}");
+    assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new(), "no fallback");
+    // Both sync-back calls, the `ls-remote` and the fetch, reach the stand-in as `git-upload-pack`.
+    let mut expected = vec!["preflight", "git-receive-pack", "run"];
+    expected.resize(all.len(), "git-upload-pack");
+    let held = &expected[..expected.len() - 1];
+    let made = calls(&steps);
+    let watched = tuned.extra.contains(&"--test-remote-watch-call");
+    assert!(made == expected || (watched && made == held), "{made:?}");
+    outcome
+}
+
+#[test]
+fn a_sync_back_fetch_that_sends_nothing_for_the_stall_window_fails_the_run() {
+    let tuned = Tuned {
+        extra: &["--test-remote-watch-call", "fetch", "--test-stall-ms", WATCHED_MS],
+        ..Tuned::default()
+    };
+
+    let outcome = a_failed_sync_back(
+        "client-fetch-stalls",
+        |case| vec!["ok".to_owned(), format!("hold {}", never(case))],
+        &tuned,
+    );
+
+    assert!(
+        outcome
+            .stderr
+            .contains("gate: the remote run failed: git fetch did not answer for 300 ms"),
+        "{outcome:?}"
+    );
+}
+
+#[test]
+fn a_sync_back_ls_remote_past_its_deadline_fails_the_run() {
+    let tuned = Tuned {
+        extra: &["--test-remote-watch-call", "ls-remote", "--test-remote-timeout-ms", WATCHED_MS],
+        ..Tuned::default()
+    };
+
+    let outcome = a_failed_sync_back("client-ls-remote-late", |case| vec![format!("hold {}", never(case))], &tuned);
+
+    assert!(
+        outcome
+            .stderr
+            .contains("gate: the remote run failed: git ls-remote did not answer within 300 ms"),
+        "{outcome:?}"
+    );
+}
+
+#[test]
+fn a_sync_back_call_that_sends_a_line_longer_than_64_kib_fails_the_run() {
+    let outcome = a_failed_sync_back("client-ls-remote-flood", |_| vec!["flood 70000".to_owned()], &Tuned::default());
+
+    assert!(
+        outcome
+            .stderr
+            .contains("gate: the remote run failed: git ls-remote sent a line longer than 64 KiB"),
+        "{outcome:?}"
     );
 }

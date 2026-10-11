@@ -10,6 +10,10 @@ pub(crate) const SSH_FAILED: i32 = 255;
 pub(crate) const GIT_SSH_FAILED: i32 = 128;
 /// The pause before the retry, when `--test-remote-retry-pause-ms` gives none.
 const PAUSE: Duration = Duration::from_secs(2);
+/// The least of a bounded call's bound that must be left after the pause for its retry to be made.
+const FLOOR: Duration = Duration::from_secs(5);
+/// The bound of the `stop` call, when `--test-remote-bound-ms` gives none.
+const BOUND: Duration = Duration::from_secs(30);
 /// ssh's own words, at the start of its first standard error line, that it reached the builder but no session began:
 /// the banner did not come within the connect timeout, or the builder closed the connection before it.
 const PRE_BANNER: [&str; 3] = [
@@ -47,9 +51,35 @@ pub(crate) fn pause(seams: &TestSeams) -> Duration {
     seams.remote_retry_pause_ms.map_or(PAUSE, Duration::from_millis)
 }
 
+/// The bound of a bounded call, the `stop`: `--test-remote-bound-ms` when given, else 30 s.
+pub(crate) fn bound(seams: &TestSeams) -> Duration {
+    seams.remote_bound_ms.map_or(BOUND, Duration::from_millis)
+}
+
+/// Whether a bounded call that failed before the banner `elapsed` after it started is made once more after `pause`:
+/// only when at least 5 s of its `bound` is left after the pause, as the two attempts share it.
+pub(crate) fn retry_allowed(bound: Duration, elapsed: Duration, pause: Duration) -> bool {
+    bound.saturating_sub(elapsed).saturating_sub(pause) >= FLOOR
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Ended, GIT_SSH_FAILED, SSH_FAILED, before_the_banner, retry_line};
+    use std::time::Duration;
+
+    use super::{Ended, GIT_SSH_FAILED, SSH_FAILED, before_the_banner, retry_allowed, retry_line};
+
+    #[test]
+    fn a_bounded_call_is_retried_only_with_5_s_of_its_bound_left_after_the_pause() {
+        let (bound, pause) = (Duration::from_secs(30), Duration::from_secs(2));
+        assert!(retry_allowed(bound, Duration::from_secs(1), pause), "plenty left");
+        assert!(retry_allowed(bound, Duration::from_secs(23), pause), "exactly 5 s left");
+        assert!(!retry_allowed(bound, Duration::from_millis(23_001), pause), "just under 5 s left");
+        assert!(!retry_allowed(bound, Duration::from_secs(40), pause), "past the bound");
+        assert!(
+            !retry_allowed(Duration::from_millis(200), Duration::ZERO, pause),
+            "a bound under the floor"
+        );
+    }
 
     fn ssh(status: i32, output_seen: bool, first_error: Option<&str>) -> bool {
         before_the_banner(&Ended {

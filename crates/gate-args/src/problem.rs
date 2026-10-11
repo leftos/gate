@@ -31,6 +31,12 @@ pub enum Problem {
         option: String,
         value: String,
     },
+    #[cfg(feature = "test-seams")]
+    BadRemoteCall {
+        option: String,
+        value: String,
+        calls: &'static [&'static str],
+    },
     NotAboveZero {
         option: String,
         value: String,
@@ -83,6 +89,8 @@ impl fmt::Display for Problem {
         match self {
             Problem::Missing(required, spelling) => write!(f, "gate: missing {}", missing_text(*required, *spelling)),
             Problem::BadSlot { option, value } => write!(f, "gate: {option} must be heavy, light or critical, got '{value}'"),
+            #[cfg(feature = "test-seams")]
+            Problem::BadRemoteCall { option, value, calls } => write!(f, "gate: {option} must be {}, got '{value}'", one_of(calls)),
             Problem::NotAboveZero { option, value } => write!(f, "gate: {option} must be a whole number above 0, got '{value}'"),
             Problem::NotZeroOrAbove { option, value } => write!(f, "gate: {option} must be a whole number 0 or above, got '{value}'"),
             Problem::TooLarge { option, value } => write!(f, "gate: {option} must be at most {MAX_WHOLE_NUMBER}, got '{value}'"),
@@ -101,6 +109,16 @@ impl fmt::Display for Problem {
             Problem::SeamNeeds { option, needs } => write!(f, "gate: {option} needs {needs}"),
             Problem::SeamsConflict { option, other } => write!(f, "gate: {option} cannot be given with {other}"),
         }
+    }
+}
+
+/// The calls a seam may name, as a choice: `a or b`, `a, b or c`.
+#[cfg(feature = "test-seams")]
+fn one_of(calls: &[&str]) -> String {
+    match calls.split_last() {
+        Some((last, [])) => (*last).to_owned(),
+        Some((last, rest)) => format!("{} or {last}", rest.join(", ")),
+        None => String::new(),
     }
 }
 

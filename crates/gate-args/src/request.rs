@@ -138,6 +138,18 @@ pub struct TestSeams {
     pub remote_ssh: Option<PathBuf>,
     /// The pause before the one retry of a call that failed before the ssh banner, in milliseconds.
     pub remote_retry_pause_ms: Option<u64>,
+    /// How long the remote client's `stop` call may take before its ssh is killed, in milliseconds.
+    pub remote_bound_ms: Option<u64>,
+    /// The call of the remote client, `preflight` or `run`, after whose first output byte the client raises the console
+    /// interrupt itself.
+    pub remote_interrupt_at: Option<String>,
+    /// The one call of the remote client, `preflight`, `push`, `run`, `ls-remote` or `fetch`, that `--test-stall-ms`
+    /// and `--test-remote-timeout-ms` apply to; every other call keeps the run's own stall window and ceiling, and
+    /// `ls-remote` its git limit unless named with a ceiling, which is then its deadline.
+    pub remote_watch_call: Option<String>,
+    /// The remote client's ceiling in milliseconds, counted from the start of the call `--test-remote-watch-call`
+    /// names, or of the run when it names none.
+    pub remote_timeout_ms: Option<u64>,
     /// The script the remote.ps1 bridge dot-sources in place of `%USERPROFILE%\.claude\tools\gate\remote.ps1`.
     pub remote_script: Option<PathBuf>,
     /// The program the remote.ps1 bridge starts in place of the pwsh found on `PATH`.

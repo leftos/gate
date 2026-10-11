@@ -51,6 +51,26 @@ pub(crate) fn zero_or_above(option: &str, value: &str) -> Result<u64, Problem> {
     }
 }
 
+/// The calls `--test-remote-interrupt-at` may name.
+#[cfg(feature = "test-seams")]
+pub(crate) const INTERRUPTED_CALLS: &[&str] = &["preflight", "run"];
+/// The calls `--test-remote-watch-call` may name.
+#[cfg(feature = "test-seams")]
+pub(crate) const WATCHED_CALLS: &[&str] = &["preflight", "push", "run", "ls-remote", "fetch"];
+
+/// A call of the remote client a seam names, one of `calls`, as written.
+#[cfg(feature = "test-seams")]
+pub(crate) fn remote_call(option: &str, value: &str, calls: &'static [&'static str]) -> Result<String, Problem> {
+    if calls.contains(&value) {
+        return Ok(value.to_owned());
+    }
+    Err(Problem::BadRemoteCall {
+        option: option.to_owned(),
+        value: value.to_owned(),
+        calls,
+    })
+}
+
 pub(crate) fn slot(option: &str, value: &str) -> Result<Slot, Problem> {
     [Slot::Heavy, Slot::Light, Slot::Critical]
         .into_iter()

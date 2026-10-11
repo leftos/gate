@@ -11,7 +11,7 @@ use std::fs::OpenOptions;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use super::client::{Attempt, Called, Echo, End};
+use super::client::{Attempt, Called, Echo, End, Watch};
 use super::git::{self, Git, GitError};
 use super::payload;
 use super::retry::GIT_SSH_FAILED;
@@ -55,20 +55,51 @@ pub(super) fn sync_back(attempt: &mut Attempt<'_, '_>, snapshot: &Snapshot, stat
 
 /// The back commit the builder advertises for this run, from `ls-remote` of its ref; `None` when it holds none.
 fn has_back(attempt: &mut Attempt<'_, '_>, git: &Git, remote: &Remote<'_>) -> Result<Option<String>, End> {
-    let called = to_the_builder(attempt, git, remote, &remote.args(&["ls-remote"]))?;
+    let ls_remote = Network {
+        verb: "ls-remote",
+        watch: Watch::Deadline(attempt.deadline_for("ls-remote", attempt.limit)),
+    };
+    let called = to_the_builder(attempt, git, remote, &ls_remote, &remote.args(&["ls-remote"]))?;
     Ok(advertised(&called.lines, remote.reference))
 }
 
 /// Fetches the back ref the builder holds into `FETCH_HEAD`, every object it sends checked, and no tag or submodule.
+/// It says its progress, which a live fetch keeps sending on standard error, so only a fetch that went quiet stalls.
 fn fetch(attempt: &mut Attempt<'_, '_>, git: &Git, remote: &Remote<'_>) -> Result<(), End> {
-    let words = ["-c", "fetch.fsckObjects=true", "fetch", "-q", "--no-recurse-submodules", "--no-tags"];
-    to_the_builder(attempt, git, remote, &remote.args(&words)).map(drop)
+    let words = [
+        "-c",
+        "fetch.fsckObjects=true",
+        "fetch",
+        "--progress",
+        "--no-recurse-submodules",
+        "--no-tags",
+    ];
+    let fetch = Network {
+        verb: "fetch",
+        watch: Watch::Fetch(attempt.limits_for("fetch")),
+    };
+    to_the_builder(attempt, git, remote, &fetch, &remote.args(&words)).map(drop)
 }
 
-/// git with `args`, a call that reaches the builder: retried once when it failed before the banner, its lines kept
-/// out of the log. A failure is the run's, or its interrupt when the console interrupt was raised during the call.
-fn to_the_builder(attempt: &mut Attempt<'_, '_>, git: &Git, remote: &Remote<'_>, args: &[String]) -> Result<Called, End> {
-    let (called, _) = attempt.with_retry(GIT_SSH_FAILED, |attempt| attempt.git(git, args, remote.ssh, Echo::Unlogged))?;
+/// One git call of the sync-back that reaches the builder: its verb, and how it is watched. `ls-remote` gets the git
+/// limit; `fetch`, which may take long, ends once nothing came from it for the run's stall window, or at the run's
+/// ceiling.
+struct Network {
+    verb: &'static str,
+    watch: Watch,
+}
+
+/// git with `args`, the call `network` that reaches the builder: retried once when it failed before the banner, its
+/// lines kept out of the log, and killed as its watch says or at a line longer than the cap. A failure is the run's,
+/// or its interrupt when the console interrupt was raised during the call.
+fn to_the_builder(attempt: &mut Attempt<'_, '_>, git: &Git, remote: &Remote<'_>, network: &Network, args: &[String]) -> Result<Called, End> {
+    let (called, _) = attempt.with_retry(GIT_SSH_FAILED, |attempt| {
+        attempt.git(git, args, remote.ssh, Echo::Unlogged, network.watch)
+    })?;
+    if let Some(cut) = called.cut {
+        attempt.noted(&called);
+        return Err(End::Failed(escaped(&cut.reason(&format!("git {}", network.verb)))));
+    }
     if called.status != 0 {
         attempt.go_on()?;
         return Err(git_failure(attempt.call.root, args, &called));
@@ -124,7 +155,10 @@ fn apply(attempt: &Attempt<'_, '_>, git: &Git, snapshot: &Snapshot, back: &str) 
     let output = format!("--output={shown}");
     let diff = ["diff-tree", "-p", "--binary", "--full-index", "-r", &output, &snapshot.commit, back];
     let made = git_call(attempt, git, &diff);
-    let applied = made.and_then(|_| git_call(attempt, git, &["apply", "--whitespace=nowarn", "--", &shown]));
+    // NTFS protection refuses a path that names `.git` by its 8.3 short name or an alternate stream, whatever the
+    // repository's own setting.
+    let apply = ["-c", "core.protectNTFS=true", "apply", "--whitespace=nowarn", "--", &shown];
+    let applied = made.and_then(|_| git_call(attempt, git, &apply));
     let removed = remove(&patch);
     applied?;
     removed?;
@@ -187,11 +221,11 @@ fn line(attempt: &Attempt<'_, '_>, git: &Git, args: &[&str]) -> Result<String, E
 
 /// The git call of the sync-back that failed, as the attempt's own failure: no fallback, the run's status 1.
 fn git_failure(root: &str, args: &[String], called: &Called) -> End {
-    let lines = called.lines.join(" | ");
     End::Failed(escaped(&format!(
-        "git {} failed in {root} (status {}): {lines}",
+        "git {} failed in {root} (status {}): {}",
         args.join(" "),
-        called.status
+        called.status,
+        git::failure_text(&called.lines)
     )))
 }
 

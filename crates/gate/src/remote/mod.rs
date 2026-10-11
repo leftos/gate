@@ -32,6 +32,8 @@ mod snapshot;
 mod syncback;
 #[cfg(feature = "test-seams")]
 mod transport;
+#[cfg(feature = "test-seams")]
+mod watchdog;
 
 /// The status a client hands back with a refusal's reason.
 pub(crate) const REFUSED: i64 = 75;

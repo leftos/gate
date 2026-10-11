@@ -5,9 +5,10 @@ use std::io;
 use proc_table::win32::OwnedHandle;
 use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, ERROR_MORE_DATA, GetLastError, SetLastError};
 use windows_sys::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
-    JOBOBJECT_BASIC_PROCESS_ID_LIST, JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectBasicAccountingInformation, JobObjectBasicProcessIdList,
-    JobObjectExtendedLimitInformation, QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
+    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_BREAKAWAY_OK, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_BASIC_PROCESS_ID_LIST, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    JobObjectBasicAccountingInformation, JobObjectBasicProcessIdList, JobObjectExtendedLimitInformation, QueryInformationJobObject,
+    SetInformationJobObject, TerminateJobObject,
 };
 
 use crate::launch::struct_size;
@@ -23,9 +24,10 @@ pub struct Accounting {
     pub active_processes: u32,
 }
 
-/// A named job object: a process in it cannot break away. One made by [`Job::create`] has no limits, and nothing is
-/// killed when it is dropped, which only closes this handle; one made by [`Job::create_kill_on_close`] ends every
-/// process in it when its last handle is closed.
+/// A job object, named or anonymous. One made by [`Job::create`] has no limits, and nothing is killed when it is
+/// dropped, which only closes this handle; one made by [`Job::create_kill_on_close`] or
+/// [`Job::anonymous_kill_on_close`] ends every process in it when its last handle is closed. A process in a job cannot
+/// break away from it, unless the job was made by [`Job::anonymous_kill_on_close_breakaway`].
 pub struct Job {
     handle: OwnedHandle,
     name: String,
@@ -50,16 +52,24 @@ impl Job {
     /// An error of kind [`io::ErrorKind::AlreadyExists`] when a job of that name exists already, whose handle is
     /// closed again at once; the system's error when the job cannot be created.
     pub fn create(name: &str) -> io::Result<Job> {
-        let wide_name = wide(name);
+        Job::created(Some(name))
+    }
+
+    /// Creates the job `name`, or an anonymous one, which no other process can open by a name, for `None`.
+    fn created(name: Option<&str>) -> io::Result<Job> {
+        let wide_name = name.map(wide);
+        let name_pointer = wide_name.as_ref().map_or(std::ptr::null(), Vec::as_ptr);
         // SAFETY: `SetLastError` takes no pointers. It clears the last error so that a stale `ERROR_ALREADY_EXISTS`
         // cannot pass for this call's.
         unsafe { SetLastError(0) };
-        // SAFETY: `wide_name` is NUL-terminated and outlives the call; null security attributes are allowed.
-        let created = unsafe { CreateJobObjectW(std::ptr::null(), wide_name.as_ptr()) };
+        // SAFETY: `name_pointer` is null or points to `wide_name`, which is NUL-terminated and outlives the call; null
+        // security attributes are allowed.
+        let created = unsafe { CreateJobObjectW(std::ptr::null(), name_pointer) };
         // SAFETY: `GetLastError` takes no pointers; it is read before anything else can set it.
         let error = unsafe { GetLastError() };
         // SAFETY: a success is a fresh handle nothing else owns, to a new job or to the one the name already held.
         let handle = unsafe { own_handle(created) }?;
+        let name = name.unwrap_or_default();
         if error == ERROR_ALREADY_EXISTS {
             return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("a job named {name} exists already")));
         }
@@ -79,9 +89,36 @@ impl Job {
     ///
     /// As [`Job::create`]; and the system's error when the limit cannot be set, the job's handle closed again.
     pub fn create_kill_on_close(name: &str) -> io::Result<Job> {
-        let mut job = Job::create(name)?;
+        Job::create_closing(Some(name), JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE)
+    }
+
+    /// Creates an anonymous job that ends every process in it when its last handle is closed, as
+    /// [`Job::create_kill_on_close`] does: having no name, no other process can open it, or take its name first.
+    ///
+    /// # Errors
+    ///
+    /// The system's error when the job cannot be created, or its limit cannot be set.
+    pub fn anonymous_kill_on_close() -> io::Result<Job> {
+        Job::create_closing(None, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE)
+    }
+
+    /// Creates an anonymous job as [`Job::anonymous_kill_on_close`] does, and lets a process in it create one outside
+    /// it (`JOB_OBJECT_LIMIT_BREAKAWAY_OK`), as a [`crate::PipedLaunch`] started from inside it needs: the process it
+    /// creates is not ended with the job.
+    ///
+    /// # Errors
+    ///
+    /// As [`Job::anonymous_kill_on_close`].
+    pub fn anonymous_kill_on_close_breakaway() -> io::Result<Job> {
+        Job::create_closing(None, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK)
+    }
+
+    /// Creates the job `name`, or an anonymous one for `None`, with the limits `flags`, which hold
+    /// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`.
+    fn create_closing(name: Option<&str>, flags: u32) -> io::Result<Job> {
+        let mut job = Job::created(name)?;
         let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        limits.BasicLimitInformation.LimitFlags = flags;
         // SAFETY: the handle is open for the whole call, with the `JOB_OBJECT_SET_ATTRIBUTES` access a new job's
         // handle has; `limits` is a whole extended limit structure of the size passed, read only.
         let set = unsafe {
@@ -104,7 +141,7 @@ impl Job {
         self.kill_on_close
     }
 
-    /// The name it was created by.
+    /// The name it was created by; empty for an anonymous job.
     #[must_use]
     pub fn name(&self) -> &str {
         &self.name

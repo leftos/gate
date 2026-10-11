@@ -12,7 +12,10 @@
 //! `Connection timed out during banner exchange` on standard error and exits 255; `fail-other` writes another first line
 //! there and exits 255; `out-then-drop` writes a line on standard output and exits 255; `exit <n>` runs nothing and
 //! exits `<n>`, as cmd's 9009 for a program it cannot find; `say-exit <n> <line>` runs nothing, writes the line on
-//! standard error and exits `<n>`, as the box says its own refusal.
+//! standard error and exits `<n>`, as the box says its own refusal; `flood <n>` runs nothing, writes `<n>` bytes of `x`
+//! and no line end on standard error, which git passes through as its own, and exits 0; `say-hold <word> <path>` writes
+//! the word as a line on standard output, then does as `hold <path>`; `progress-ok <n>` writes at least `<n>` bytes of
+//! short progress updates, each ended by a carriage return, and a line end on standard error, then does as `ok`.
 
 #![expect(clippy::disallowed_methods, reason = "a test helper standing in for ssh, which holds no launch's handles")]
 
@@ -58,8 +61,52 @@ fn run() -> Result<i32, String> {
         Some(("version", version)) => call.with_version(version),
         Some(("exit", status)) => status.parse().map_err(|_| format!("the step '{step}' names no status")),
         Some(("say-exit", rest)) => say_exit(&step, rest),
+        Some(("flood", bytes)) => flood(&step, bytes),
+        Some(("progress-ok", bytes)) => {
+            progress(&step, bytes)?;
+            call.ok()
+        }
+        Some(("say-hold", rest)) => {
+            let (word, path) = rest.split_once(' ').ok_or_else(|| format!("the step '{step}' names no path"))?;
+            let mut stdout = io::stdout().lock();
+            writeln!(stdout, "{word}")
+                .and_then(|()| stdout.flush())
+                .map_err(|error| format!("cannot write: {error}"))?;
+            hold(Path::new(path))?;
+            call.ok()
+        }
         Some(_) => Err(format!("unknown step '{step}'")),
     }
+}
+
+/// `flood <n>`, given as `bytes` after the step's name: writes that many bytes of `x` and no line end on standard error,
+/// and gives 0.
+fn flood(step: &str, bytes: &str) -> Result<i32, String> {
+    let count: usize = bytes.parse().map_err(|_| format!("the step '{step}' names no byte count"))?;
+    let mut stderr = io::stderr().lock();
+    stderr
+        .write_all(&vec![b'x'; count])
+        .and_then(|()| stderr.flush())
+        .map_err(|error| format!("cannot write: {error}"))?;
+    Ok(0)
+}
+
+/// `progress-ok <n>`, given as `bytes` after the step's name: writes short progress updates, each ended by a carriage
+/// return, until they hold at least that many bytes, then a line end, all on standard error.
+fn progress(step: &str, bytes: &str) -> Result<(), String> {
+    let count: usize = bytes.parse().map_err(|_| format!("the step '{step}' names no byte count"))?;
+    let mut updates = String::new();
+    let mut number = 0;
+    while updates.len() < count {
+        updates = updates + "Writing objects: " + &(number % 100).to_string() + "%\r";
+        number += 1;
+    }
+    updates.push_str("Writing objects: 100%, done.\n");
+    let mut stderr = io::stderr().lock();
+    stderr
+        .write_all(updates.as_bytes())
+        .and_then(|()| stderr.flush())
+        .map_err(|error| format!("cannot write: {error}"))
 }
 
 /// `say-exit <n> <line>`, given as `rest` after the step's name: writes the line on standard error and gives `<n>`.

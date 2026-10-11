@@ -53,6 +53,9 @@ pub(crate) trait Transport {
     /// The command git runs on the builder to serve the sync-back's fetch, the upload-pack counterpart of the push's
     /// receive-pack; `None` for a bare repository on this machine, where the push names none either.
     fn upload_pack(&self) -> Option<String>;
+    /// Whether `gate box` runs on this machine, as a call's child: then a call's job must let the box start its
+    /// command outside it, and else it lets nothing leave.
+    fn box_runs_here(&self) -> bool;
 }
 
 /// ssh's words for running `line` on `host`: the options, `--`, the host and the line, each a word of its own.
@@ -138,6 +141,10 @@ impl Transport for Local {
     fn upload_pack(&self) -> Option<String> {
         None
     }
+
+    fn box_runs_here(&self) -> bool {
+        true
+    }
 }
 
 /// The words `line` carries after the builder's gate: `box`, the verb and the payload word.
@@ -201,6 +208,10 @@ mod ssh {
         fn upload_pack(&self) -> Option<String> {
             Some(UPLOAD_PACK.to_owned())
         }
+
+        fn box_runs_here(&self) -> bool {
+            false
+        }
     }
 
     /// The ssh command git runs: ssh's path with `/` separators, single-quoted for the shell git starts it through, and
@@ -255,6 +266,12 @@ mod tests {
             program: PathBuf::from(r"C:\Program Files\Open'SSH\ssh.exe"),
         };
         assert_eq!(ssh.root(), r"D:\gate-remote");
+        assert!(!ssh.box_runs_here(), "the builder's box runs there, so a call's job lets nothing leave");
+        let local = Local::new(r"local:C:\builder", None).expect("a local transport");
+        assert!(
+            local.box_runs_here(),
+            "the local box runs here, and starts its command outside the call's job"
+        );
         assert_eq!(
             ssh.call("builder", "line"),
             Program {
