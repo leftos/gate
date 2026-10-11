@@ -19,6 +19,8 @@ use crate::support::{
     wait_until_closed,
 };
 
+mod outputs;
+
 const BOX_USAGE: &str = "usage: gate box preflight|run|stop|boot|outputs <base64 JSON payload>\n";
 
 /// The payload word for `json`, as the remote client encodes it.
@@ -412,27 +414,19 @@ fn box_usage_and_payload_errors_exit_2() {
     assert!(!case.run(&["--help"]).stdout.contains("box"), "gate box is hidden from the usage");
 }
 
-#[test]
-fn box_outputs_is_not_built_yet() {
-    let case = Case::new("box_outputs_is_not_built_yet");
-
-    let outcome = gate_box(&case, "outputs", &payload(&json!({"Key": "k"})), None);
-
-    assert_eq!(outcome.code, Some(70));
-    assert_eq!(outcome.stdout, "");
-    assert_eq!(outcome.stderr, "gate: box outputs is not built yet\n");
-}
-
 /// The payload's text at `key`.
 fn field<'a>(payload: &'a Value, key: &str) -> &'a str {
     payload[key].as_str().expect("the payload holds the key as text")
 }
 
-/// `payload` with the last four hex digits of its job's nonce set to `run`, for a later run in one case.
+/// `payload` with the last four hex digits of its job's nonce and of its outputs nonce set to `run`, for a later run
+/// in one case.
 fn renamed(payload: &Value, run: u16) -> Value {
     let mut renamed = payload.clone();
-    let job = field(payload, "Job");
-    renamed["Job"] = json!(format!("{}{run:04x}", &job[..job.len() - 4]));
+    for key in ["Job", "Nonce"] {
+        let nonce = field(payload, key);
+        renamed[key] = json!(format!("{}{run:04x}", &nonce[..nonce.len() - 4]));
+    }
     renamed
 }
 

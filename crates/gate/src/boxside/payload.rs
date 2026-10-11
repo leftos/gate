@@ -81,7 +81,6 @@ impl Payload {
 
     /// The run's output globs, `Outputs`: a list of non-empty texts holding no `[` or `]`, as the routing file allows
     /// them; none when the key is absent or null. Else the usage line, a glob shown with its control characters escaped.
-    #[cfg_attr(not(test), expect(dead_code, reason = "the box's run does not pack outputs yet"))]
     pub(crate) fn output_globs(&self) -> Result<Vec<String>, String> {
         let not_globs = || "gate: box payload Outputs is not a list of texts".to_owned();
         let list = match self.0.get("Outputs") {
@@ -100,7 +99,6 @@ impl Payload {
 
     /// Whether `OutputsFull` is set, as the client sets it when the PC's last outputs step did not complete; false when
     /// the key is absent or null. Else the usage line saying it is not true or false.
-    #[cfg_attr(not(test), expect(dead_code, reason = "the box's run does not pack outputs yet"))]
     pub(crate) fn outputs_full(&self) -> Result<bool, String> {
         match self.0.get("OutputsFull") {
             None | Some(Value::Null) => Ok(false),
@@ -111,7 +109,6 @@ impl Payload {
 
     /// The run's outputs `Nonce`: 32 lower-case hex digits, as the client draws it; else the usage line, the value
     /// shown with its control characters escaped.
-    #[cfg_attr(not(test), expect(dead_code, reason = "the box's run does not pack outputs yet"))]
     pub(crate) fn nonce(&self) -> Result<&str, String> {
         let nonce = self.text("Nonce")?;
         if is_lower_hex(nonce, OUTPUTS_NONCE_DIGITS) {
@@ -141,14 +138,7 @@ impl Payload {
     /// usage line, the key shown with its control characters escaped.
     pub(crate) fn key(&self) -> Result<&str, String> {
         let key = self.text("Key")?;
-        if key
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
-        {
-            Ok(key)
-        } else {
-            Err(not_a_key(key))
-        }
+        if is_key(key) { Ok(key) } else { Err(not_a_key(key)) }
     }
 
     /// The key and the work folder: `Work` an absolute path on a drive, with no trailing separator, whose last name is
@@ -181,7 +171,6 @@ impl Payload {
 
     /// The `OutputFolder`, which must be `<root>\outputs` for the work folder `work`, `<root>\work\<key>`, as the client
     /// builds it; compared as full paths without regard to case. Else the usage line.
-    #[cfg_attr(not(test), expect(dead_code, reason = "the box's run does not pack outputs yet"))]
     pub(crate) fn output_folder(&self, work: &str) -> Result<&str, String> {
         let value = self.path("OutputFolder")?;
         let Some(root) = grandparent(work) else {
@@ -199,21 +188,17 @@ impl Payload {
     }
 
     /// The outputs archive's `Name`: `<key>-<nonce>.tar.zst` with the payload's own key and an outputs nonce, as the box
-    /// names a run's archive; else the usage line, the name shown with its control characters escaped. The outputs verb
-    /// can so reach no file in `OutputFolder` but an archive of this work folder.
-    #[cfg_attr(not(test), expect(dead_code, reason = "the box has no outputs verb yet"))]
+    /// names a run's archive; else the line refusing it, the name shown with its control characters escaped, or the
+    /// usage line saying the payload lacks it. The outputs verb can so reach no file in `OutputFolder` but an archive of
+    /// this work folder.
     pub(crate) fn archive_name(&self) -> Result<&str, String> {
         let key = self.key()?;
         let name = self.text("Name")?;
-        let nonce = name
-            .strip_prefix(key)
-            .and_then(|rest| rest.strip_prefix('-'))
-            .and_then(|rest| rest.strip_suffix(SUFFIX));
-        if nonce.is_some_and(|nonce| is_lower_hex(nonce, OUTPUTS_NONCE_DIGITS)) {
+        if archive_key(name) == Some(key) {
             Ok(name)
         } else {
             Err(format!(
-                "gate: box payload Name is not an outputs archive of this work folder: {}",
+                "gate: remote outputs archive name '{}' is not an outputs archive of this work folder",
                 escaped(name)
             ))
         }
@@ -238,14 +223,36 @@ impl Payload {
 /// The hex digits of a run's nonce, as the client draws it.
 const NONCE_DIGITS: usize = 12;
 /// The hex digits of a run's outputs nonce, as the client draws it.
-#[cfg_attr(not(test), expect(dead_code, reason = "the box's run does not pack outputs yet"))]
 const OUTPUTS_NONCE_DIGITS: usize = 32;
 /// The hex digits of a commit's sha.
 const COMMIT_SHA_DIGITS: usize = 40;
 
+/// Whether `text` is a work-folder key: one or more ASCII letters, digits, `-` and `_`.
+fn is_key(text: &str) -> bool {
+    !text.is_empty()
+        && text
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+}
+
+/// The name of the outputs archive of the work folder `key` for the outputs nonce `nonce`: `<key>-<nonce>.tar.zst`.
+/// [`archive_key`] reads it back.
+pub(crate) fn archive_file_name(key: &str, nonce: &str) -> String {
+    format!("{key}-{nonce}{SUFFIX}")
+}
+
+/// The work-folder key of `name` when it is an outputs archive's name as [`archive_file_name`] makes it, with a
+/// work-folder key and an outputs nonce of 32 lower-case hex digits; else `None`.
+pub(crate) fn archive_key(name: &str) -> Option<&str> {
+    let stem = name.strip_suffix(SUFFIX)?;
+    let split = stem.len().checked_sub(OUTPUTS_NONCE_DIGITS + 1)?;
+    let key = stem.get(..split)?;
+    let nonce = stem.get(split..)?.strip_prefix('-')?;
+    (is_key(key) && is_lower_hex(nonce, OUTPUTS_NONCE_DIGITS)).then_some(key)
+}
+
 /// The `<root>` of the work folder `path`, `<root>\work\<key>` with `work` in any case, without a trailing separator;
 /// `None` when `path` is not one.
-#[cfg_attr(not(test), expect(dead_code, reason = "the box's run does not pack outputs yet"))]
 fn grandparent(path: &str) -> Option<&str> {
     let parent = &path[..path.rfind(['\\', '/'])?];
     let split = parent.rfind(['\\', '/'])?;
@@ -672,7 +679,7 @@ mod tests {
             assert_eq!(
                 archive_name(&bad),
                 Err(format!(
-                    "gate: box payload Name is not an outputs archive of this work folder: {}",
+                    "gate: remote outputs archive name '{}' is not an outputs archive of this work folder",
                     escaped(&bad)
                 )),
                 "{bad:?}"

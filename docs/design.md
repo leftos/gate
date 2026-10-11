@@ -185,7 +185,6 @@ Further modes arrive as subcommands of the same binary, each designed with its i
 | 2 | Usage: a missing, unknown or invalid input; a `.cmd` or `.bat` word the gate refuses (C5); a `--log` inside the state root; a critical gate under a heavy or light slot marker (K7). Nothing is queued. `gate box` also uses 2 for a refused payload and for a refused subfolder or batch word ([The box side](#the-box-side)). |
 | 124 | The watchdog killed the command: STALLED, TIMED OUT or BACKSTOP (X2). |
 | 127 | The command could not be started (C7); the slot is released at once. `gate box run` uses it for the same failure. |
-| 70 | Temporary: a valid `gate box outputs`, which is not built yet (`gate: box outputs is not built yet`). Its slice removes this code. |
 | 75 | A builder refused a routed run (`gate box`, or the bridged remote client): busy (`gate box run` finding its work folder's lock held), unreachable, parity, rebooted, tools, version. The PC side reads the refusal and falls back to a local run, so a caller sees 75 only as a command's own status, or as a refusal that carried no reason (T5). |
 
 The codes are kept (V4), with 75 added for refusals. 124 is the status coreutils `timeout` uses, so no caller mistakes a kill for the command's own status; a command that itself exits 124 is told apart in the journal's `verdict`.
@@ -954,7 +953,7 @@ Each verb is one ssh call today, and the call's cost is its connection, not its 
 
 A routed run therefore moves to one long-lived connection carrying every verb, `gate box serve`, and the per-call client stays until that lands (GATE-70 holds the measurement, and GATE-109 the work).
 
-The payload is one base64 word (standard alphabet, padded) of UTF-8 JSON holding the wrapper's keys: `Key`, `Bare`, `Work`, `Lock`, `Index`, `OutputFolder` and `Job`, and for `run` also `Command`, `Subfolder`, `Identity`, `Outputs`, `Nonce` and `OutputsFull`. Unknown keys are ignored, and `Outputs`, `OutputsFull` and `OutputFolder`, which the outputs transport owns (GATE-44), are ignored by the box's verbs; `payload.rs` holds their accessors, which nothing calls until the box packs outputs.
+The payload is one base64 word (standard alphabet, padded) of UTF-8 JSON holding the wrapper's keys: `Key`, `Bare`, `Work`, `Lock`, `Index`, `OutputFolder` and `Job`, and for `run` also `Command`, `Subfolder`, `Identity`, `Outputs`, `Nonce` and `OutputsFull`, and for `outputs` also `Name`. Unknown keys are ignored, and `Outputs`, `OutputsFull` and `OutputFolder`, which the outputs transport owns (GATE-44), are read only by `run` (the outputs) and `outputs` (`Name`, `OutputFolder`); `preflight`, `stop` and `boot` ignore them.
 
 For `run` the payload also needs a `Snapshot` key: exactly 40 lowercase hex characters, the commit the run checks out. Anything else is refused before the lock and the checkout with `gate: remote run payload's Snapshot '<value>' is not a 40-hex commit sha` and exit 2.
 
@@ -1060,6 +1059,13 @@ Built verbs:
   On stderr, best effort, it says `gate: remote the client closed the connection; stopped job <name>` once the job is empty. Otherwise it says `gate: remote the client closed the connection; stopping job <name>` followed by the could-not-stop line or the `still has <n> process(es)` line of `stop`. The stdin closing is not the signal. A command that itself exits 255 is indistinguishable from a lost connection, as with the PowerShell wrapper.
 
   After the command, the sync-back commits the tree when it changed: a copy of the index at `<Work>.index` is staged, and the commit (message `gate-remote back`, parent HEAD) is written to `refs/gate-back/<key>` in `Bare`. A sync-back that fails prints `gate: remote sync-back failed: <message>` and turns a 0 status into 1; an index copy that cannot be removed prints `gate: remote could not remove <index>: <error>` and changes no status.
+
+  A payload with `Outputs` globs adds these steps (GATE-44):
+
+  - Once the heartbeat beats and before the checkout, `run` reads the PC's manifest from stdin up to its first newline (at most 64 MiB; a manifest that cannot be read is said only once the command has passed), then removes the old archives from `OutputFolder`: each file named `<key>-<32 lower-case hex digits>.tar.zst`, whatever the key, last written more than a day ago, and no other file. An archive already gone counts as removed; one that cannot be removed, or a folder that cannot be listed, is said (`gate: remote could not remove the old outputs archive <path>`, `gate: remote could not list the old outputs archives in <folder>`) and fails nothing.
+  - Just before the command, unless `OutputsFull`, it lists the files under the globs (size and last write); a listing that fails is said (`gate: remote could not list the outputs before the command: <error>`) and leaves every file counting as changed.
+  - After a command that exited 0 and its back commit, with the commit pushed, it reads the commit's paths (`git diff-tree`) and packs the files to bring back into `<OutputFolder>\<key>-<nonce>.tar.zst`, created new. It says `gate-remote-outputs: <n> <archive name>` on stderr, or `gate-remote-outputs: 0` with no archive when nothing is to come back. The paths are read only after the push, so failing to read them fails the outputs and never the sync-back.
+  - A pack that fails removes its half-written archive, says `gate: remote outputs not brought back: <reason>` and turns the passed 0 into 1. A command that did not exit 0, or a failed sync-back, packs nothing.
 - **`stop`** sets the job's stop event, then terminates the payload's job, taking no lock. It terminates the job again on every 100 ms poll of the job's process ids, until the job is empty or 10 s pass, so a process that joins late is ended; its processes end with 124.
 
   A terminate after the first that fails is not a failure of the stop: it is said once, `gate: remote could not terminate job <name> again: <error>`, after the other lines. An event that cannot be set prints `gate: remote could not signal the stop of job <name>: <error>` on stderr, and the job is terminated all the same. A stopped job prints `gate: remote stopped job <name>` on stdout and exits 0; no such job exits 0 with no output.
@@ -1068,9 +1074,13 @@ Built verbs:
 
   Processes still alive 10 s after the termination print `gate: remote job <name> still has <n> process(es) 10 s after it was terminated` and exit 1, and a job that cannot be terminated prints `gate: remote could not stop job <name>: <error>` and exits 1.
 
-`outputs` prints `gate: box outputs is not built yet` and exits 70.
+- **`outputs`** sends the archive the payload's `Name` names in its `OutputFolder` raw on stdout, then removes it. It takes no work-folder lock, so it never waits on a run.
 
-**The outputs module** (GATE-44) is built and tested but dormant: nothing calls it until the box's run packs outputs and the PC fetches and installs them. Both ends are this exe and share `crates/gate/src/outputs/`.
+  A payload without `Name`, `Work` or `OutputFolder`, or with a `Work` or `OutputFolder` that is not the work folder's own, exits 2. A `Name` that is not `<Key>-<32 lower-case hex digits>.tar.zst` for the payload's own key (`gate: remote outputs archive name '<name>' is not an outputs archive of this work folder`), an archive that does not exist (`gate: remote outputs archive <name> does not exist`) or one that cannot be read or sent exits 1. The file is opened without following a link, and only a plain file is sent.
+
+  A sent archive that cannot be removed prints `gate: remote could not remove the outputs archive <name>: <error>` and still exits 0; a later run's prune takes it.
+
+**The outputs module** (GATE-44) is shared by both ends, this exe, in `crates/gate/src/outputs/`. The box's `run` packs with it and the box's `outputs` verb sends the archive; the PC's fetch and install are not built yet.
 
 - Globs: each is relative to the work folder's root and `/`-separated, matched without regard to case: `**/` is any number of folders (none included), `**` anything, `*` any run of characters within one name, `?` one character within one name. Never brought back, whatever the globs: anything under a `.git`, `.tmp` or `TestResults` folder at any depth, and a `.env` file (`.env`, `.env.<name>`, `<name>.env`).
 - Walk: lists the files below a folder that the globs match, ordered by relative path, and does not enter an excluded folder. A link or a junction, to a file or to a folder, is neither followed nor listed. A folder or name that cannot be read, or is not Unicode, fails the walk.
@@ -1078,7 +1088,7 @@ Built verbs:
 
   The box's pack takes each file the manifest lacks, and each it holds that the run created or changed (the box's stat listing from just before the command lacks it or holds another size or last write) whose SHA-256 differs from the manifest's, skipping the paths of the run's back commit. Under `OutputsFull` there is no listing, so every file counts as changed and each that differs from the PC's comes back.
 - Archive: a tar stream compressed with zstd (level 3), named `<key>-<nonce>.tar.zst`, each file read once and hashed as it is packed. The last member, `.gate-outputs.json`, lists what was packed (path, size, SHA-256), and the reader checks the members against it after extraction. Both ends stream; memory does not grow with a file's size.
-- Payload: `Nonce` is 32 lower-case hex digits, `OutputFolder` is `<root>\outputs` for the work folder `<root>\work\<key>`, `Outputs` a list of non-empty globs holding no `[` or `]`, `OutputsFull` true or false, and `Name` an archive name of the payload's own key and nonce, so that the outputs verb, when built, reaches no file in `OutputFolder` but an archive of this work folder. A refusal is a `gate: box payload ...` line.
+- Payload: `Nonce` is 32 lower-case hex digits, `OutputFolder` is `<root>\outputs` for the work folder `<root>\work\<key>`, `Outputs` a list of non-empty globs holding no `[` or `]`, `OutputsFull` true or false, and `Name` an archive name of the payload's own key and nonce, so that the outputs verb reaches no file in `OutputFolder` but an archive of this work folder. A refusal is a `gate: box payload ...` line.
 
 `unpack` creates its destination, which must not exist, and refuses an archive for any of these, a member before anything of it is written:
 

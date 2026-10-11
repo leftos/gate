@@ -15,7 +15,9 @@
 //! stdout, the i-th `<text><i>` counting from 1; `pid` prints `pid <its own pid>` on stdout; `mark <path>` adds the line
 //! `run` to the file at the path, creating it when missing, so a case can count how many times its command ran;
 //! `free-console` leaves this process's console, as a GUI program or one that detaches early does, its standard handles
-//! kept;
+//! kept; `write <path> <text>` writes the text to the file at the path, replacing it, its folders made when missing;
+//! `fill <path> <bytes>` writes a file of that many `x` bytes at the path, its folders made when missing, through a
+//! fixed buffer, so its size never sits in memory;
 //! `argv` prints every word after it, each on its own line, and ends, so it is always the last step.
 //! With no `exit` step it exits 0. For example `fake-tool out hi err oops exit 3`.
 
@@ -25,7 +27,7 @@
 )]
 
 use std::ffi::OsString;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::Path;
 use std::process::Command;
 use std::thread;
@@ -122,6 +124,16 @@ fn run(args: &[OsString]) -> Result<i32, String> {
                 return text.parse().map_err(|_| format!("exit takes a 32-bit status, got '{text}'"));
             }
             "mark" => mark(&operand(&mut steps, "mark")?)?,
+            "write" => {
+                let path = operand(&mut steps, "write")?;
+                write_file(&path, &operand(&mut steps, "write")?)?;
+            }
+            "fill" => {
+                let path = operand(&mut steps, "fill")?;
+                let text = operand(&mut steps, "fill")?;
+                let size: u64 = text.parse().map_err(|_| format!("fill takes a byte count, got '{text}'"))?;
+                fill(&path, size)?;
+            }
             "free-console" => free_console()?,
             "pid" => {
                 writeln!(stdout, "pid {}", std::process::id()).map_err(|error| write_failed(&error))?;
@@ -225,6 +237,36 @@ fn mark(path: &str) -> Result<(), String> {
         .open(path)
         .and_then(|mut file| file.write_all(b"run\n"))
         .map_err(|error| format!("cannot mark {path}: {error}"))
+}
+
+/// Makes the folders above the file at `path` that are missing.
+fn make_folders(path: &str) -> Result<(), String> {
+    match Path::new(path).parent() {
+        Some(folder) if !folder.as_os_str().is_empty() => {
+            std::fs::create_dir_all(folder).map_err(|error| format!("cannot make the folders of {path}: {error}"))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Writes `text` to the file at `path`, replacing it, its folders made when missing.
+fn write_file(path: &str, text: &str) -> Result<(), String> {
+    make_folders(path)?;
+    std::fs::write(path, text).map_err(|error| format!("cannot write {path}: {error}"))
+}
+
+/// Writes a file of `size` bytes, each `x`, at `path`, its folders made when missing, copied through a fixed buffer so
+/// the file's size never sits in memory.
+fn fill(path: &str, size: u64) -> Result<(), String> {
+    make_folders(path)?;
+    let failed = |error: io::Error| format!("cannot fill {path}: {error}");
+    let mut file = std::fs::File::create(path).map_err(failed)?;
+    let copied = io::copy(&mut io::repeat(b'x').take(size), &mut file).map_err(failed)?;
+    if copied == size {
+        Ok(())
+    } else {
+        Err(format!("cannot fill {path}: {copied} of {size} bytes were written"))
+    }
 }
 
 /// Leaves this process's console; its standard handles, the pipes it was given, stay as they are.

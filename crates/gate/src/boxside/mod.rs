@@ -5,6 +5,7 @@
 mod boot;
 mod forward;
 mod heartbeat;
+mod outputs;
 pub(crate) mod payload;
 mod preflight;
 mod run;
@@ -13,13 +14,13 @@ mod tools;
 
 use gate_args::{BoxRequest, BoxVerb};
 
-use crate::answer::{FAILED_STATUS, NOT_BUILT_STATUS, USAGE_STATUS};
+use crate::answer::{FAILED_STATUS, USAGE_STATUS};
 use crate::boxside::payload::Payload;
 use crate::console::Console;
 
 /// Decodes the payload, then answers the verb through `console` and returns the exit status. The payload is decoded
 /// before the verb is read, in the wrapper's order, so a payload that is not base64 JSON fails every verb; here it is
-/// a usage error (exit 2), where the wrapper, stopping on the error, exits 1. `outputs` is not built yet.
+/// a usage error (exit 2), where the wrapper, stopping on the error, exits 1.
 pub(crate) fn answer(request: &BoxRequest, console: &mut Console) -> u32 {
     let payload = match Payload::decode(&request.payload) {
         Ok(payload) => payload,
@@ -33,10 +34,7 @@ pub(crate) fn answer(request: &BoxRequest, console: &mut Console) -> u32 {
         BoxVerb::Boot => boot_status(boot::say(console)),
         BoxVerb::Run => run::run(&payload, &request.seams, console),
         BoxVerb::Stop => stop::stop(&payload, console),
-        BoxVerb::Outputs => {
-            console.err(&format!("gate: box {} is not built yet", request.verb.as_str()));
-            u32::from(NOT_BUILT_STATUS)
-        }
+        BoxVerb::Outputs => outputs::outputs(&payload, console),
     }
 }
 

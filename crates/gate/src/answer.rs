@@ -12,8 +12,6 @@ use crate::resolve::{self, Environment};
 pub(crate) const FAILED_STATUS: u8 = 1;
 /// The status of a usage error: a missing, unknown or invalid input, or a word the command cannot take.
 pub(crate) const USAGE_STATUS: u8 = 2;
-/// The status of a valid request for a mode this build does not have yet.
-pub(crate) const NOT_BUILT_STATUS: u8 = 70;
 
 /// Says the answer for `args`, the command line without the program name, through `console`, and returns the exit
 /// status: a 32-bit code, since a run passes its command's whole exit code through.

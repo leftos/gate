@@ -3,8 +3,8 @@
 //! to a builder, and runs a command under a slot in a job of its own, watched for a stall, its ceiling and the
 //! backstop, saying each line as it goes. It stops a process tree with the gates in it, and moves the machine from the
 //! PowerShell gate to itself (`gate cutover`), and copies the installed exe to the builders (`gate push`). A routed
-//! command falls back to running here, as no remote client is built yet. On a builder, the hidden `gate box` answers `boot`, `preflight`, `run` and `stop`. The box's `outputs`
-//! are not built yet.
+//! command falls back to running here, as no remote client is built yet. On a builder, the hidden `gate box` answers
+//! `boot`, `preflight`, `run`, `stop` and `outputs`.
 
 mod acquire;
 mod answer;
@@ -19,7 +19,7 @@ mod machine;
 mod nesting;
 #[cfg_attr(
     not(test),
-    expect(dead_code, reason = "neither the box's run nor the remote client packs or fetches outputs yet")
+    expect(dead_code, reason = "the manifest writer and the unpack serve the remote client, which no code calls")
 )]
 mod outputs;
 mod pause;

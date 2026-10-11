@@ -3,7 +3,7 @@
 use std::io::{self, Read, Write};
 use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
@@ -205,7 +205,22 @@ pub fn finish(command: Command) -> Outcome {
 
 /// Starts `command` with stdin null and its output gathered as it arrives.
 pub fn start(mut command: Command) -> Running {
-    command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    command.stdin(Stdio::null());
+    gathered(command)
+}
+
+/// Starts `command` with its output gathered as [`start`] gathers it and its stdin a pipe, whose write end it returns:
+/// the program reads what the case writes there, and the end of its input once the case drops it.
+pub fn start_with_stdin(mut command: Command) -> (Running, ChildStdin) {
+    command.stdin(Stdio::piped());
+    let mut running = gathered(command);
+    let stdin = running.child.stdin.take().expect("stdin is piped");
+    (running, stdin)
+}
+
+/// Starts `command`, its stdin as the caller set it, both output streams piped and gathered as they arrive.
+fn gathered(mut command: Command) -> Running {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = command.spawn().expect("the program starts");
     let (stdout, stdout_reader) = gather(child.stdout.take().expect("stdout is piped"));
     let (stderr, stderr_reader) = gather(child.stderr.take().expect("stderr is piped"));
@@ -644,20 +659,24 @@ pub fn wait_until_closed(path: &Path) {
     });
 }
 
-/// The payload of a `gate box run` of `command` for the work folder `key`, as the remote client sends it: every path
-/// under the case folder's `remote` folder, and a job name unique to the case and the key, its 12-hex nonce ending in
-/// the run's number `0000`.
+/// The payload of a `gate box run` of `command` for the work folder `key`, as the remote client sends it, laid out as
+/// the client lays out a builder's root: under the case folder's `remote` folder, the bare repository `<key>.git`, the
+/// work folder `work\<key>` with its lock and index beside it, and the `outputs` folder. A job name unique to the case
+/// and the key, its 12-hex nonce ending in the run's number `0000`, and a 32-hex outputs nonce, unique the same way and
+/// ending in the same `0000`.
 pub fn box_payload(case: &Case, key: &str, command: &[&str]) -> Value {
     let remote = case.folder().join("remote");
     let path = |name: String| remote.join(name).to_str().expect("the case folder is Unicode").to_owned();
+    let work = path(format!(r"work\{key}"));
+    let unique = format!("{:04x}{:04x}", process::id() & 0xffff, case.number & 0xffff);
     json!({
         "Key": key,
         "Bare": path(format!("{key}.git")),
-        "Work": path(key.to_owned()),
-        "Lock": path(format!("{key}.lock")),
-        "Index": path(format!("{key}.index")),
-        "OutputFolder": path(format!("{key}.outputs")),
-        "Job": format!(r"Local\gate-remote-{key}-{:04x}{:04x}0000", process::id() & 0xffff, case.number & 0xffff),
+        "Lock": format!("{work}.lock"),
+        "Index": format!("{work}.index"),
+        "Work": work,
+        "OutputFolder": path("outputs".to_owned()),
+        "Job": format!(r"Local\gate-remote-{key}-{unique}0000"),
         "Command": command,
         "Subfolder": "",
         "Identity": {
@@ -667,7 +686,7 @@ pub fn box_payload(case: &Case, key: &str, command: &[&str]) -> Value {
             "GIT_COMMITTER_EMAIL": "suite@example.invalid",
         },
         "Outputs": [],
-        "Nonce": "",
+        "Nonce": format!("{unique}{}0000", "0".repeat(20)),
         "OutputsFull": false,
     })
 }

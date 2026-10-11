@@ -1,9 +1,10 @@
 //! `gate box run`: the work folder's lock taken, the subfolder checked, the snapshot checked out, the repo's dotnet tools
-//! restored, the command started in the payload's job with its output forwarded, the tree it left committed back, and the
-//! command's status passed whole, as the PowerShell wrapper's `Invoke-Run` does. git starts through [`gate_win32::spawn`],
-//! under the spawn lock the command's own launch holds while its inheritable handle copies are open, so no git inherits a
-//! handle meant for the command. The command runs on a console whose code pages are UTF-8 ([`Utf8Console`]), or, when it
-//! cannot have one, on the box's default code page, which the box says and never fails the run for.
+//! restored, the command started in the payload's job with its output forwarded, the tree it left committed back, the
+//! outputs of a passed command packed ([`crate::boxside::outputs`]), and the command's status passed whole, as the
+//! PowerShell wrapper's `Invoke-Run` does. git starts through [`gate_win32::spawn`], under the spawn lock the command's
+//! own launch holds while its inheritable handle copies are open, so no git inherits a handle meant for the command. The
+//! command runs on a console whose code pages are UTF-8 ([`Utf8Console`]), or, when it cannot have one, on the box's
+//! default code page, which the box says and never fails the run for.
 //!
 //! The payload is data: it is refused unless well formed, and runs nothing but its command and writes nothing but the
 //! work folder's own files. The command, and whatever it writes into the work folder, `.git` included, is the user's
@@ -17,9 +18,9 @@ use std::io;
 use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Arc, TryLockError};
+use std::sync::{Arc, PoisonError, TryLockError};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use gate_args::BoxSeams;
 use gate_watchdog::Pump;
@@ -28,12 +29,14 @@ use gate_win32::{Donor, Job, LaunchError, NamedEvent, PipedConsole, PipedLaunch,
 use crate::answer::USAGE_STATUS;
 use crate::boxside::forward::{DRAIN, Forwarders, OutputLock};
 use crate::boxside::heartbeat;
+use crate::boxside::outputs::{self, Asked};
 use crate::boxside::payload::{Payload, escaped, ordinal_upper};
 use crate::boxside::preflight::{Failed, GIT_REDIRECTS, Git, exit_code};
 use crate::boxside::stop::{Ending, STOPPED, stop_event_name, terminate_and_wait};
 use crate::boxside::tools;
 use crate::console::Console;
 use crate::environment::Variables;
+use crate::outputs::manifest::{Listing, Manifest};
 use crate::run::{Written, find_program, written};
 
 /// The status of a run refused: another run holds the work folder, or the work folder's dotnet tools could not be
@@ -84,6 +87,8 @@ pub(super) struct Request<'a> {
     command: Vec<String>,
     subfolder: &'a str,
     identity: Vec<(String, String)>,
+    /// The outputs the run brings back, `None` when it has no output globs.
+    outputs: Option<Asked<'a>>,
 }
 
 impl Request<'_> {
@@ -91,7 +96,15 @@ impl Request<'_> {
         // The snapshot first, as the wrapper refuses a payload without one before the lock or the checkout.
         let snapshot = payload.snapshot()?;
         let (key, work) = payload.work_folder()?;
+        let outputs = Asked::new(
+            &payload.output_globs()?,
+            payload.outputs_full()?,
+            key,
+            payload.nonce()?,
+            payload.output_folder(work)?,
+        )?;
         Ok(Request {
+            outputs,
             key,
             snapshot,
             bare: payload.path("Bare")?,
@@ -125,8 +138,9 @@ fn identity(payload: &Payload) -> Result<Vec<(String, String)>, String> {
 
 /// Runs the payload's command in its work folder and returns the status: the command's own whole 32-bit code, 127
 /// when it could not be started, 75 when another run holds the work folder or its dotnet tools could not be restored,
-/// 2 for a payload or a word refused, a failing git step's status, 1 when the box failed or the tree of a passed
-/// command could not be committed back, or 255 when the client closed the connection and the box stopped the job.
+/// 2 for a payload or a word refused, a failing git step's status, 1 when the box failed, the tree of a passed command
+/// could not be committed back or a passed command's outputs are not brought back, or 255 when the client closed the
+/// connection and the box stopped the job.
 /// Once the subfolder is checked, a heartbeat goes to stderr every period, 5 s unless `seams` set it, until the run
 /// ends; `seams` may also make the command's console fail, or park its launch.
 pub(crate) fn run(payload: &Payload, seams: &BoxSeams, console: &mut Console) -> u32 {
@@ -226,6 +240,67 @@ impl Beat<'_> {
             pump.unwatch();
         }
     }
+
+    /// Says `line` on stderr holding the box's output lock, so it never lands inside a heartbeat or a forwarded line.
+    fn say(&self, console: &mut Console, line: &str) {
+        let _held = self.lock.lock().unwrap_or_else(PoisonError::into_inner);
+        console.err(line);
+    }
+}
+
+/// The work folder and the folder below it the command runs in, both full paths.
+struct Folders<'a> {
+    work: &'a Path,
+    place: &'a Path,
+}
+
+/// A run's outputs step as it goes: what the run asks for, the PC's manifest or why it could not be read, and the
+/// listing taken before the command, `None` until then and under `OutputsFull`.
+struct RunOutputs<'a> {
+    asked: &'a Asked<'a>,
+    manifest: Result<Manifest, String>,
+    listing: Option<Listing>,
+}
+
+impl<'a> RunOutputs<'a> {
+    /// Reads the PC's manifest from stdin, up to its first newline, then removes the output folder's old archives,
+    /// saying each that could not be removed.
+    fn read(asked: &'a Asked<'a>, beat: &Beat<'_>, console: &mut Console) -> RunOutputs<'a> {
+        let manifest = outputs::read_manifest(io::stdin().lock());
+        for line in outputs::prune(asked, SystemTime::now()) {
+            beat.say(console, &line);
+        }
+        RunOutputs {
+            asked,
+            manifest,
+            listing: None,
+        }
+    }
+
+    /// Takes the listing of the files under the globs in `work` before the command, saying it could not be taken.
+    fn list(&mut self, work: &Path, beat: &Beat<'_>, console: &mut Console) {
+        let (listing, line) = outputs::listing(self.asked, work);
+        if let Some(line) = line {
+            beat.say(console, &line);
+        }
+        self.listing = listing;
+    }
+
+    /// Packs the outputs of a passed command run in `work`, leaving out `skip`, the back commit's paths or why they
+    /// could not be read, and says how it went: 0, or 1 when the outputs are not brought back.
+    fn bring_back(&self, work: &Path, skip: Result<Vec<String>, String>, beat: &Beat<'_>, console: &mut Console) -> u32 {
+        let brought = skip.and_then(|skip| outputs::bring_back(self.asked, &self.manifest, self.listing.as_ref(), work, &skip));
+        match brought {
+            Ok(line) => {
+                beat.say(console, &line);
+                0
+            }
+            Err(reason) => {
+                beat.say(console, &outputs::not_brought_back(&reason));
+                FAILED_STATUS
+            }
+        }
+    }
 }
 
 /// The run once the lock is held: `Ok` with the status after the back commit, or `Err` with the status of a run that
@@ -253,7 +328,10 @@ fn in_work_folder(request: &Request<'_>, stop: &NamedEvent, seams: &BoxSeams, co
         seams,
         stop: StopSignal::new(stop, request.job),
     };
-    let ran = checked_out(request, &git, &work, &place, &beat, console);
+    // Read while the heartbeat beats and before the checkout, so the client can take its time hashing the PC's files.
+    let mut outputs = request.outputs.as_ref().map(|asked| RunOutputs::read(asked, &beat, console));
+    let folders = Folders { work: &work, place: &place };
+    let ran = checked_out(request, &git, &folders, &beat, outputs.as_mut(), console);
     if let Some(pump) = pump {
         // Bounded, so a client that stopped reading cannot keep the work folder's lock held. Nothing is said for a
         // pump left stuck or one that panicked: the stuck stream is the one it would be said on, and a panicking pump
@@ -263,26 +341,45 @@ fn in_work_folder(request: &Request<'_>, stop: &NamedEvent, seams: &BoxSeams, co
     ran
 }
 
-/// The run once the heartbeat beats: the snapshot checked out, the repo's dotnet tools restored, the command seen to
-/// its end in `place`, and the tree it left committed back; the status as [`in_work_folder`] gives it.
-fn checked_out(request: &Request<'_>, git: &WorkGit, work: &Path, place: &Path, beat: &Beat<'_>, console: &mut Console) -> Result<u32, u32> {
+/// The run once the heartbeat beats: the snapshot checked out, the repo's dotnet tools restored, the outputs listed,
+/// the command seen to its end in the place, the tree it left committed back, and, after a passed command, its outputs
+/// packed; the status as [`in_work_folder`] gives it, 1 for a passed command whose outputs are not brought back.
+fn checked_out(
+    request: &Request<'_>,
+    git: &WorkGit,
+    folders: &Folders<'_>,
+    beat: &Beat<'_>,
+    mut outputs: Option<&mut RunOutputs<'_>>,
+    console: &mut Console,
+) -> Result<u32, u32> {
     git.checkout(request).map_err(|failed| said(console, &failed))?;
-    if !place.is_dir() {
+    if !folders.place.is_dir() {
         console.err(&format!(
             "gate: remote subfolder {} does not exist in the snapshot",
             escaped(request.subfolder)
         ));
         return Err(u32::from(USAGE_STATUS));
     }
-    tools::update(request, work, place, beat, console)?;
-    let mut status = command(request, place, beat, console)?;
-    if let Err(message) = git.back_commit(request, console) {
-        console.err(&format!("gate: remote sync-back failed: {message}"));
-        if status == 0 {
-            status = FAILED_STATUS;
-        }
+    tools::update(request, folders.work, folders.place, beat, console)?;
+    if let Some(outputs) = outputs.as_deref_mut() {
+        outputs.list(folders.work, beat, console);
     }
-    Ok(status)
+    let status = command(request, folders.place, beat, console)?;
+    let commit = match git.back_commit(request, console) {
+        Ok(commit) => commit,
+        Err(message) => {
+            console.err(&format!("gate: remote sync-back failed: {message}"));
+            return Ok(if status == 0 { FAILED_STATUS } else { status });
+        }
+    };
+    match outputs {
+        Some(outputs) if status == 0 => {
+            // Read after the push and only for outputs, so failing to read them fails the outputs, never the sync-back.
+            let skip = commit.map_or_else(|| Ok(Vec::new()), |commit| git.back_paths(request, &commit));
+            Ok(outputs.bring_back(folders.work, skip, beat, console))
+        }
+        _ => Ok(status),
+    }
 }
 
 /// Says the failed step's line; its status.
@@ -947,8 +1044,8 @@ impl WorkGit {
     /// The tree the command left, committed on `HEAD` and pushed to `refs/gate-back/<key>` in the bare repository;
     /// nothing when the tree is unchanged. It starts from a copy of the work folder's index, which the checkout just
     /// refreshed, so `add -A` skips every unchanged file; a copy that cannot be removed afterwards is said and fails
-    /// nothing. Else why it failed.
-    fn back_commit(&self, request: &Request<'_>, console: &mut Console) -> Result<(), String> {
+    /// nothing. The commit pushed, `None` when the tree is unchanged; else why it failed.
+    fn back_commit(&self, request: &Request<'_>, console: &mut Console) -> Result<Option<String>, String> {
         let program = self.git.program.as_ref().map_err(|message| format!("git cannot be started: {message}"))?;
         let back = BackGit {
             program,
@@ -968,11 +1065,23 @@ impl WorkGit {
         }
         let tree = tree?;
         if tree == back.line("rev-parse", &["rev-parse", "HEAD^{tree}"], false)? {
-            return Ok(());
+            return Ok(None);
         }
         let commit = back.line("commit-tree", &["commit-tree", &tree, "-p", "HEAD", "-m", "gate-remote back"], false)?;
         let target = format!("{commit}:refs/gate-back/{}", request.key);
-        back.status("push", &["push", "-q", request.bare, &target], false)
+        back.status("push", &["push", "-q", request.bare, &target], false)?;
+        Ok(Some(commit))
+    }
+
+    /// The `/`-separated paths the back commit `commit` changes against `HEAD`; else why they could not be read.
+    fn back_paths(&self, request: &Request<'_>, commit: &str) -> Result<Vec<String>, String> {
+        let program = self.git.program.as_ref().map_err(|message| format!("git cannot be started: {message}"))?;
+        BackGit {
+            program,
+            request,
+            work: self,
+        }
+        .changed(commit)
     }
 }
 
@@ -1011,20 +1120,36 @@ impl BackGit<'_> {
         }
     }
 
-    /// Runs `step` and returns the first line of its stdout, its stderr passed through; else why it failed.
-    fn line(&self, step: &str, args: &[&str], copied_index: bool) -> Result<String, String> {
+    /// Runs `step` and returns its stdout, its stderr passed through; else why it failed.
+    fn stdout(&self, step: &str, args: &[&str], copied_index: bool) -> Result<Vec<u8>, String> {
         // Started under the spawn lock, so it inherits no launch's handles.
         let output = gate_win32::spawn(self.command(args, copied_index).stdout(Stdio::piped()).stderr(Stdio::inherit()))
             .and_then(std::process::Child::wait_with_output)
             .map_err(|error| format!("{step} failed: {error}"))?;
         match exit_code(output.status) {
-            0 => String::from_utf8_lossy(&output.stdout)
-                .lines()
-                .next()
-                .map(str::to_owned)
-                .ok_or_else(|| format!("{step} printed nothing")),
+            0 => Ok(output.stdout),
             code => Err(format!("{step} failed (status {code})")),
         }
+    }
+
+    /// Runs `step` and returns the first line of its stdout, its stderr passed through; else why it failed.
+    fn line(&self, step: &str, args: &[&str], copied_index: bool) -> Result<String, String> {
+        let stdout = self.stdout(step, args, copied_index)?;
+        String::from_utf8_lossy(&stdout)
+            .lines()
+            .next()
+            .map(str::to_owned)
+            .ok_or_else(|| format!("{step} printed nothing"))
+    }
+
+    /// The `/`-separated paths `commit` changes against `HEAD`; else why they could not be read.
+    fn changed(&self, commit: &str) -> Result<Vec<String>, String> {
+        let stdout = self.stdout("diff-tree", &["diff-tree", "--name-only", "-r", "-z", "HEAD", commit], false)?;
+        stdout
+            .split(|byte| *byte == 0)
+            .filter(|path| !path.is_empty())
+            .map(|path| String::from_utf8(path.to_vec()).map_err(|_| "diff-tree printed a path that is not UTF-8".to_owned()))
+            .collect()
     }
 }
 

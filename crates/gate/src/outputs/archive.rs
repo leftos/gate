@@ -5,16 +5,21 @@
 //! not grow with a file's size.
 
 use std::cell::Cell;
+use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
+use std::os::windows::ffi::OsStringExt;
 use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 use tar::{EntryType, Header};
-use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT};
+use windows_sys::Win32::Storage::FileSystem::{
+    FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_NAME_NORMALIZED, GetFinalPathNameByHandleW, VOLUME_NAME_DOS,
+};
 
 use crate::boxside::payload::{escaped, is_reordering_mark};
 use crate::outputs::hash::{Hashing, SHA256_DIGITS, is_lower_hex};
@@ -62,14 +67,56 @@ pub(crate) struct Packed {
 /// Packs `files` into `sink` as a `.tar.zst` stream, in their order, each read once: hashed as it is packed, its header
 /// holding the size and last write it had when it was opened. Returns the entries and the compressed size; else why
 /// the pack failed, the file's path named. A link or a junction, a file last written before 1970, and a file whose
-/// size or last write changes while it is packed fail the pack.
-pub(crate) fn pack(sink: impl Write, files: &[&Found]) -> io::Result<Packed> {
+/// size or last write changes while it is packed fail the pack, and so does a file found below `root` whose final path,
+/// as the system resolves the open file, is not inside `root`'s: one reached through a folder swapped for a junction
+/// after the walk.
+pub(crate) fn pack(sink: impl Write, root: &Path, files: &[&Found]) -> io::Result<Packed> {
+    // Resolved once, as each file's final path is: `canonicalize` is `GetFinalPathNameByHandleW` on the opened folder.
+    let root = fs::canonicalize(root).map_err(|error| in_context(root, &error))?;
     let mut packer = Packer::new(sink)?;
     for file in files {
         let opened = open_plain(&file.full).map_err(|error| in_context(&file.full, &error))?;
+        check_inside(&opened, &root, file).map_err(|error| in_context(&file.full, &error))?;
         pack_file(&mut packer, file, &opened, &opened).map_err(|error| in_context(&file.full, &error))?;
     }
     packer.finish()
+}
+
+/// Refuses the open file `opened`, found as `file`, when its final path is not inside the final path `root`.
+fn check_inside(opened: &File, root: &Path, file: &Found) -> io::Result<()> {
+    if final_path(opened)?.starts_with(root) {
+        Ok(())
+    } else {
+        Err(refused(format!("{} resolves outside the work folder", file.path)))
+    }
+}
+
+/// The final path of the open file `opened`, as `GetFinalPathNameByHandleW` gives it: `\\?\`-prefixed, normalized, its
+/// links and junctions resolved as the open went through them.
+fn final_path(opened: &File) -> io::Result<PathBuf> {
+    let mut buffer = vec![0_u16; 512];
+    loop {
+        let capacity = u32::try_from(buffer.len()).map_err(io::Error::other)?;
+        // SAFETY: the handle is open while `opened` lives, and `buffer` has room for `capacity` UTF-16 units.
+        let length = unsafe {
+            GetFinalPathNameByHandleW(
+                opened.as_raw_handle(),
+                buffer.as_mut_ptr(),
+                capacity,
+                FILE_NAME_NORMALIZED | VOLUME_NAME_DOS,
+            )
+        };
+        let length = usize::try_from(length).map_err(io::Error::other)?;
+        if length == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if length < buffer.len() {
+            buffer.truncate(length);
+            return Ok(PathBuf::from(OsString::from_wide(&buffer)));
+        }
+        // Too small: `length` is the room the path needs, its terminating NUL included.
+        buffer.resize(length, 0);
+    }
 }
 
 /// The file at `path` opened for reading: the file itself, never a link's target; else why not, a link or a junction
@@ -693,7 +740,7 @@ mod tests {
         let found = walk(&source, &Globs::new(&["**".to_owned()]).expect("a glob")).expect("the walk");
         let chosen: Vec<_> = found.iter().collect();
         let mut archive = Vec::new();
-        let packed = pack(&mut archive, &chosen).expect("the files pack");
+        let packed = pack(&mut archive, &source, &chosen).expect("the files pack");
         assert_eq!(packed.compressed, archive.len() as u64);
         let mut expected: Vec<Entry> = files.iter().map(|(path, data)| entry(path, data)).collect();
         expected.sort_by(|first, second| first.path.cmp(&second.path));
@@ -1196,7 +1243,8 @@ mod tests {
             .open(&found.full)
             .and_then(|file| file.set_modified(UNIX_EPOCH - Duration::from_hours(24)))
             .expect("the last write can be set");
-        let error = pack(io::sink(), &[&found]).expect_err("a file from before 1970 is refused");
+        let root = found.full.parent().expect("the file has a folder");
+        let error = pack(io::sink(), root, &[&found]).expect_err("a file from before 1970 is refused");
         assert!(error.to_string().ends_with("a.dll was last written before 1970"), "{error}");
     }
 
@@ -1206,8 +1254,27 @@ mod tests {
         let link = found.full.with_file_name("a.dll");
         std::os::windows::fs::symlink_file(&found.full, &link).expect("this machine lets a test make a symbolic link");
         found.full = link;
-        let error = pack(io::sink(), &[&found]).expect_err("a link is refused");
+        let root = found.full.parent().expect("the link has a folder").to_owned();
+        let error = pack(io::sink(), &root, &[&found]).expect_err("a link is refused");
         assert!(error.to_string().ends_with("is a link or a junction, not a file"), "{error}");
+    }
+
+    #[test]
+    fn pack_refuses_a_file_reached_through_a_junction_swapped_in_after_the_walk() {
+        let root = scratch("swapped");
+        let outside = scratch("swapped-outside");
+        fs::create_dir_all(root.join("bin")).expect("the folder can be made");
+        fs::create_dir_all(&outside).expect("the outside folder can be made");
+        fs::write(root.join("bin").join("a.dll"), b"inside").expect("the file can be written");
+        fs::write(outside.join("a.dll"), b"outside").expect("the outside file can be written");
+        let found = walk(&root, &Globs::new(&["**".to_owned()]).expect("a glob")).expect("the walk");
+        fs::rename(root.join("bin"), root.join("moved")).expect("the walked folder can be moved away");
+        junction(&root.join("bin"), &outside);
+
+        let chosen: Vec<_> = found.iter().collect();
+        let error = pack(io::sink(), &root, &chosen).expect_err("a file outside the work folder is refused");
+
+        assert!(error.to_string().ends_with("bin/a.dll resolves outside the work folder"), "{error}");
     }
 
     /// Pseudo-random bytes, so zstd cannot shrink them, `left` more of them, counting each one given in `given`.
