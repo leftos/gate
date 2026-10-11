@@ -802,9 +802,9 @@ The box seams, in any order before the verb and each also as `--<seam>=<value>`,
 
 A seam is refused as the `gate run` seams are: no value, given twice, and for the heartbeat not a whole number above 0 or above 2147483647. Without the feature each word gets the box usage line.
 
-The box leaves build servers warm on purpose: it sets neither `MSBUILDDISABLENODEREUSE` (the local gate sets it to 1 for every command) nor a node handshake salt, so MSBuild nodes and compiler servers survive between runs and every work folder on the builder shares one node pool.
+The box leaves build servers warm on purpose: it does not set `MSBUILDDISABLENODEREUSE` (the local gate sets it to 1 for every command), so MSBuild nodes and compiler servers survive between runs. It sets `MSBUILDNODEHANDSHAKESALT` in the command's environment to the work-folder key, replacing any inherited value, so the nodes stay warm within a worktree and are never reused across them; the box's own git calls and tool restore do not get it.
 
-Whether nodes are shared across work folders or pile up is to be measured (GATE-26); if they do, `gate box run` sets `MSBUILDNODEHANDSHAKESALT` to the work-folder key, which keeps warmth within a worktree and stops reuse across them. `git` and `dotnet` are found with the gate's own program resolution, which never searches the current folder. A payload that is not base64 JSON prints `gate: box payload is not base64 JSON: <reason>` on stderr and exits 2.
+Measured without the salt, one pool of worker nodes served routed builds from every work folder on the builder (sequential runs added no nodes, concurrent ones two per extra build, reclaimed after idling). A run in another work folder therefore inherited nodes started for a different one, which the salt stops, at the cost of each worktree's first routed build starting its own nodes. `git` and `dotnet` are found with the gate's own program resolution, which never searches the current folder. A payload that is not base64 JSON prints `gate: box payload is not base64 JSON: <reason>` on stderr and exits 2.
 
 Built verbs:
 

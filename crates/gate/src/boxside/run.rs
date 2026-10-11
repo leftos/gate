@@ -352,9 +352,11 @@ pub(super) fn full_path(path: &Path) -> Option<PathBuf> {
 /// nothing; the restore looks at it the same way before it runs, so such a stop runs no restore either
 /// ([`crate::boxside::tools`]). The command starts on a UTF-8 console when it can have one ([`start_command`]), whose
 /// donor lives until the wait for the command is over, however it ends. The heartbeat watches the job while [`watch`]
-/// waits for it.
+/// waits for it. The command's environment is the box's own with `MSBUILDNODEHANDSHAKESALT` set to the work folder's
+/// key, replacing any value the box inherited, so `MSBuild`'s worker nodes stay warm within one work folder and are
+/// never reused across work folders ([`Variables::with`]).
 fn command(request: &Request<'_>, place: &Path, beat: &Beat<'_>, console: &mut Console) -> Result<u32, u32> {
-    let variables = Variables::from_process();
+    let variables = Variables::from_process().with("MSBUILDNODEHANDSHAKESALT", request.key);
     let environment = variables
         .block()
         .map_err(|error| failed(console, &format!("cannot build the command's environment: {error}")))?;

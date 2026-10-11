@@ -27,6 +27,12 @@ impl Variables {
         Variables(std::env::vars_os().collect())
     }
 
+    /// This environment with `name` set to `value`, replacing every value it holds for that name, names compared as
+    /// Windows compares them, so a name set under another letter case is replaced rather than joined.
+    pub(crate) fn with(self, name: &str, value: &str) -> Variables {
+        Variables(applied(self.0, vec![(OsString::from(name), Some(OsString::from(value)))]))
+    }
+
     /// The value the command gets for `name`, names compared as Windows compares them.
     pub(crate) fn get(&self, name: &str) -> Option<&OsStr> {
         let name = OsStr::new(name);
@@ -95,7 +101,7 @@ mod tests {
     use gate_state::StateRoot;
     use gate_win32::same_variable_name;
 
-    use super::{applied, overrides};
+    use super::{Variables, applied, overrides};
     use crate::resolve::ResolvedRoot;
 
     const DEFAULT: &str = r"C:\Users\someone\AppData\Local\gate\v1";
@@ -127,5 +133,18 @@ mod tests {
         assert_eq!(state_dirs(&under_other), [&OsString::from(r"D:\test-root")]);
         assert!(under_default.contains(&path), "other variables pass through");
         assert!(under_default.contains(&(OsString::from("GATE_SLOT_HELD"), OsString::from("heavy:1:2"))));
+    }
+
+    #[test]
+    fn with_replaces_a_set_variable_whatever_its_letter_case_and_adds_an_unset_one() {
+        let path = (OsString::from("Path"), OsString::from(r"C:\bin"));
+        let inherited = vec![(OsString::from("msbuildnodehandshakesalt"), OsString::from("other")), path.clone()];
+        let set = (OsString::from("MSBUILDNODEHANDSHAKESALT"), OsString::from("k"));
+
+        let replaced = Variables(inherited).with("MSBUILDNODEHANDSHAKESALT", "k");
+        let added = Variables(vec![path.clone()]).with("MSBUILDNODEHANDSHAKESALT", "k");
+
+        assert_eq!(replaced.0, [path.clone(), set.clone()], "the value set under another letter case is gone");
+        assert_eq!(added.0, [path, set], "an unset name is added");
     }
 }

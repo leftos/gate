@@ -508,6 +508,14 @@ fn run_box(case: &Case, payload: &Value) -> Outcome {
     gate_box(case, "run", &self::payload(payload), None)
 }
 
+/// `gate box run` of `payload` with `name` set to `value` in the box's own environment, as a case about a variable the
+/// box inherits needs it.
+fn run_box_with_env(case: &Case, payload: &Value, name: &str, value: &str) -> Outcome {
+    let mut command = box_command(case, &["box", "run", &self::payload(payload)]);
+    command.env(name, value);
+    finish(command)
+}
+
 /// `gate box run` of `payload` with `PATH` set to `path` when given, as a case about dotnet runs it.
 fn run_box_with_path(case: &Case, payload: &Value, path: Option<&OsString>) -> Outcome {
     gate_box(case, "run", &self::payload(payload), path)
@@ -681,6 +689,30 @@ fn box_run_runs_the_command_in_its_subfolder() {
     );
     let bare = format!("--git-dir={}", field(&payload, "Bare"));
     assert_eq!(git(&[&bare, "show", "refs/gate-back/k:sub/made.txt"]), "y");
+}
+
+#[test]
+fn box_run_salts_msbuild_nodes_with_the_work_folder_key() {
+    let case = Case::new("box_run_msbuild_salt");
+    let mut payload = box_payload(&case, "k", &[r".\salt.cmd"]);
+    snapshot(&case, &mut payload, &[("salt.cmd", "@echo %MSBUILDNODEHANDSHAKESALT%\r\n")]);
+
+    let outcome = run_box(&case, &payload);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(outcome.stdout, "k\n", "the command reads the work folder's key: {outcome:?}");
+}
+
+#[test]
+fn box_run_replaces_an_inherited_handshake_salt() {
+    let case = Case::new("box_run_msbuild_salt_inherited");
+    let mut payload = box_payload(&case, "k", &[r".\salt.cmd"]);
+    snapshot(&case, &mut payload, &[("salt.cmd", "@echo %MSBUILDNODEHANDSHAKESALT%\r\n")]);
+
+    let outcome = run_box_with_env(&case, &payload, "MSBUILDNODEHANDSHAKESALT", "other");
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(outcome.stdout, "k\n", "the key replaces the box's inherited value: {outcome:?}");
 }
 
 #[test]
