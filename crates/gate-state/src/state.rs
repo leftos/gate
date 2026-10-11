@@ -8,7 +8,10 @@ use jiff::{SignedDuration, Timestamp};
 use proc_table::{ProcessInfo, ProcessTable, ProcessTree};
 use regex::Regex;
 
-use crate::claims::{Claim, ReadableClaim, Ticket, last_log_line, read_claims, read_tickets};
+use crate::claims::{
+    Claim, ReadableClaim, TICKS_PER_SECOND, Ticket, UNIX_EPOCH_TICKS, claim_started_by, last_log_line, read_claims, read_tickets, ticket_started_by,
+    ticks_in_range, ticks_of,
+};
 use crate::counts::{PoolCount, pool_count, read_counts_file, state_counts_path};
 use crate::model::{
     CoveredRun, CriticalState, CwdReader, DashboardState, Generation, MutexProbe, PoolState, QueueTicket, RemotePool, SlotKind, SlotRow, SlotState,
@@ -17,16 +20,8 @@ use crate::model::{
 use crate::remote::{RemoteCount, read_remote_count, remote_settings_path};
 use crate::v1;
 
-/// How far a live process's start time may be from the one its claim records, in nanoseconds.
-const CLAIM_START_TOLERANCE_NANOS: i128 = 2_000_000_000;
-/// .NET ticks (100 ns) in a second.
-const TICKS_PER_SECOND: i64 = 10_000_000;
 /// .NET ticks in a millisecond, the unit of `gate.exe`'s ticket times.
 const TICKS_PER_MILLISECOND: i128 = 10_000;
-/// .NET ticks from 0001-01-01 to the Unix epoch.
-const UNIX_EPOCH_TICKS: i128 = 621_355_968_000_000_000;
-/// The last .NET tick a `DateTime` can hold, 9999-12-31T23:59:59.9999999.
-const MAX_TICKS: i64 = 3_155_378_975_999_999_999;
 /// The `-Slot` value of a gate that asks for the machine.
 const CRITICAL: &str = "critical";
 
@@ -204,14 +199,9 @@ pub(crate) fn iso_utc(timestamp: Timestamp) -> String {
     jiff::fmt::strtime::format("%Y-%m-%dT%H:%M:%S.%7fZ", timestamp).unwrap_or_else(|_| timestamp.to_string())
 }
 
-/// A timestamp as .NET ticks, truncated to the tick.
-fn ticks_of(timestamp: Timestamp) -> i128 {
-    timestamp.as_nanosecond().div_euclid(100) + UNIX_EPOCH_TICKS
-}
-
 /// .NET ticks as text in .NET's round-trip `DateTime` format (`o`), or `None` outside the range a `DateTime` holds.
 fn format_ticks(ticks: i64) -> Option<String> {
-    if !(0..=MAX_TICKS).contains(&ticks) {
+    if !ticks_in_range(ticks) {
         return None;
     }
     let nanos = i32::try_from((ticks % TICKS_PER_SECOND) * 100).ok()?;
@@ -271,10 +261,9 @@ impl Table {
 
     /// True when the claim's pid is alive and is the process that wrote it: its start time is within 2 s of the claim's.
     fn claim_live(&self, claim: &ReadableClaim) -> bool {
-        let Some(created) = self.get(claim.pid).and_then(|process| process.created) else {
-            return false;
-        };
-        (created.as_nanosecond() - claim.process_start.as_nanosecond()).abs() < CLAIM_START_TOLERANCE_NANOS
+        self.get(claim.pid)
+            .and_then(|process| process.created)
+            .is_some_and(|created| claim_started_by(claim.process_start, created))
     }
 
     /// True when the process has a child other than a console host, which a waiting gate does not have yet.
@@ -342,7 +331,7 @@ impl Table {
         let created = process.created?;
         let live = match ticket.exact_start_ms {
             Some(start_ms) => started_at_ms(created, start_ms),
-            None => (ticks_of(created) - i128::from(ticket.start_ticks)).abs() < i128::from(2 * TICKS_PER_SECOND),
+            None => ticket_started_by(ticket.start_ticks, created),
         };
         live.then_some(process)
     }

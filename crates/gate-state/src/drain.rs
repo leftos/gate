@@ -8,15 +8,10 @@ use jiff::Timestamp;
 use proc_table::{ProcessTable, ProcessTree};
 use serde_json::Value;
 
-use crate::claims::{Claim, ReadableClaim, Ticket, json_base_name, read_claims, read_ticket};
+use crate::claims::{
+    Claim, ReadableClaim, Ticket, claim_started_by, json_base_name, read_claims, read_ticket, ticket_started_by, ticks_in_range, timestamp_of_ticks,
+};
 use crate::model::Generation;
-
-/// How far a live process's start may be from the one its claim records, in nanoseconds, as the dashboard allows.
-const CLAIM_START_TOLERANCE_NANOS: i128 = 2_000_000_000;
-/// How far a live process's start may be from its PowerShell ticket's, in .NET ticks (2 s), as the dashboard allows.
-const TICKET_START_TOLERANCE_TICKS: i128 = 20_000_000;
-/// .NET ticks from 0001-01-01 to the Unix epoch.
-const UNIX_EPOCH_TICKS: i128 = 621_355_968_000_000_000;
 
 /// The slot a PowerShell claim holds, from its file's name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -122,9 +117,10 @@ impl PowerShellGates {
         });
     }
 
-    /// Adds the ticket when its gate is live, or counts it when it could not be read or its arrival is no moment.
+    /// Adds the ticket when its gate is live, or counts it when it could not be read or its start or arrival is outside
+    /// the ticks a `DateTime` holds.
     fn add_ticket(&mut self, ticket: Option<&Ticket>, table: &ProcessTree) {
-        let Some((ticket, arrived)) = ticket.and_then(|ticket| Some((ticket, timestamp_of_ticks(ticket.arrived_ticks)?))) else {
+        let Some((ticket, arrived)) = ticket.and_then(|ticket| Some((ticket, ticket_arrival(ticket)?))) else {
             self.unreadable += 1;
             return;
         };
@@ -184,22 +180,24 @@ fn still_there(path: &Path) -> bool {
 
 /// True when the claim's pid is a process that started within 2 s of the claim's `processStart`.
 fn claim_live(claim: &ReadableClaim, table: &ProcessTree) -> bool {
-    let Some(created) = table.get(claim.pid).and_then(|process| process.created) else {
-        return false;
-    };
-    (created.as_nanosecond() - claim.process_start.as_nanosecond()).abs() < CLAIM_START_TOLERANCE_NANOS
+    table
+        .get(claim.pid)
+        .and_then(|process| process.created)
+        .is_some_and(|created| claim_started_by(claim.process_start, created))
+}
+
+/// When the ticket's gate arrived, or `None` when its `startTicks` or `arrived` is outside the ticks a `DateTime` holds.
+fn ticket_arrival(ticket: &Ticket) -> Option<Timestamp> {
+    if !ticks_in_range(ticket.start_ticks) {
+        return None;
+    }
+    timestamp_of_ticks(ticket.arrived_ticks)
 }
 
 /// True when the ticket's pid is a process that started within 2 s of the ticket's `startTicks`.
 fn ticket_live(ticket: &Ticket, table: &ProcessTree) -> bool {
-    let Some(created) = table.get(ticket.pid).and_then(|process| process.created) else {
-        return false;
-    };
-    let created_ticks = created.as_nanosecond().div_euclid(100) + UNIX_EPOCH_TICKS;
-    (created_ticks - i128::from(ticket.start_ticks)).abs() < TICKET_START_TOLERANCE_TICKS
-}
-
-/// The moment .NET `ticks` name, or `None` outside the range a [`Timestamp`] holds.
-fn timestamp_of_ticks(ticks: i64) -> Option<Timestamp> {
-    Timestamp::from_nanosecond((i128::from(ticks) - UNIX_EPOCH_TICKS) * 100).ok()
+    table
+        .get(ticket.pid)
+        .and_then(|process| process.created)
+        .is_some_and(|created| ticket_started_by(ticket.start_ticks, created))
 }

@@ -8,14 +8,12 @@ use proc_table::ProcessInfo;
 use proc_table::win32::{OwnedHandle, open_process, read_parameters_string};
 use windows_sys::Win32::System::Threading::{IsWow64Process, OpenMutexW, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ, SYNCHRONIZATION_SYNCHRONIZE};
 
+use crate::claims::claim_started_by;
 use crate::journal::{History, JournalCache};
 use crate::model::{CwdReader, Generation, MutexProbe, StateInputs};
 
 /// The offset of the `CurrentDirectory` path's `UNICODE_STRING` in 64-bit `RTL_USER_PROCESS_PARAMETERS`.
 const PARAMS_CURRENT_DIRECTORY: usize = 0x38;
-/// How far a live process's start time may be from the `processStart` a journal line records, in nanoseconds: the
-/// tolerance a claim's start time gets.
-const PROCESS_START_TOLERANCE_NANOS: i128 = 2_000_000_000;
 
 /// The slot mutexes in the session's `Local\` namespace, opened only to see that they exist.
 #[derive(Clone, Copy, Debug)]
@@ -119,7 +117,7 @@ pub fn live_history(
             .iter()
             .rfind(|process| process.pid == pid)
             .and_then(|process| process.created)
-            .is_some_and(|created| (created.as_nanosecond() - recorded.as_nanosecond()).abs() < PROCESS_START_TOLERANCE_NANOS)
+            .is_some_and(|created| claim_started_by(recorded, created))
     };
     cache
         .read(&dir, &inputs.slot_prefix, inputs.now, is_live, repo_of)

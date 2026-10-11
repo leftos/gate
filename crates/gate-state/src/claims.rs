@@ -1,5 +1,5 @@
-//! The claim files gates write for the slots they hold, the arrival tickets they write as they start, and the last line
-//! of a holding gate's log.
+//! The claim files gates write for the slots they hold, the arrival tickets they write as they start, the last line of
+//! a holding gate's log, and the rule that tells whether a process is the PowerShell gate that wrote a claim or ticket.
 
 use std::collections::HashMap;
 use std::fs::{self, File};
@@ -13,6 +13,16 @@ use crate::counts::powershell_text;
 
 /// How much of a log's end is read for its last line.
 const LOG_TAIL_BYTES: u64 = 4096;
+/// How far a live process's start may be from the one its PowerShell claim records, in nanoseconds (2 s).
+const CLAIM_START_TOLERANCE_NANOS: i128 = 2_000_000_000;
+/// How far a live process's start may be from its PowerShell ticket's `startTicks`, in .NET ticks (2 s).
+const TICKET_START_TOLERANCE_TICKS: i128 = 20_000_000;
+/// .NET ticks (100 ns) in a second.
+pub(crate) const TICKS_PER_SECOND: i64 = 10_000_000;
+/// .NET ticks from 0001-01-01 to the Unix epoch.
+pub(crate) const UNIX_EPOCH_TICKS: i128 = 621_355_968_000_000_000;
+/// The last .NET tick a `DateTime` can hold, 9999-12-31T23:59:59.9999999.
+const MAX_TICKS: i64 = 3_155_378_975_999_999_999;
 
 /// A slot's claim file.
 #[derive(Clone, Debug)]
@@ -149,6 +159,36 @@ fn read_text(path: &Path) -> io::Result<String> {
     Ok(String::from_utf8_lossy(bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(&bytes)).into_owned())
 }
 
+/// True when a process created at `created` is the PowerShell gate whose claim records `claim_process_start`: the two
+/// are less than 2 s apart.
+pub(crate) fn claim_started_by(claim_process_start: Timestamp, created: Timestamp) -> bool {
+    (created.as_nanosecond() - claim_process_start.as_nanosecond()).abs() < CLAIM_START_TOLERANCE_NANOS
+}
+
+/// True when a process created at `created` is the PowerShell gate whose ticket records `start_ticks`: the two are less
+/// than 2 s apart.
+pub(crate) fn ticket_started_by(start_ticks: i64, created: Timestamp) -> bool {
+    (ticks_of(created) - i128::from(start_ticks)).abs() < TICKET_START_TOLERANCE_TICKS
+}
+
+/// A timestamp as .NET ticks, truncated to the tick.
+pub(crate) fn ticks_of(timestamp: Timestamp) -> i128 {
+    timestamp.as_nanosecond().div_euclid(100) + UNIX_EPOCH_TICKS
+}
+
+/// True when `ticks` is in the range a .NET `DateTime` holds, 0001-01-01 to 9999-12-31T23:59:59.9999999.
+pub(crate) fn ticks_in_range(ticks: i64) -> bool {
+    (0..=MAX_TICKS).contains(&ticks)
+}
+
+/// The moment .NET `ticks` name, or `None` outside the range a `DateTime` holds or a [`Timestamp`] holds.
+pub(crate) fn timestamp_of_ticks(ticks: i64) -> Option<Timestamp> {
+    if !ticks_in_range(ticks) {
+        return None;
+    }
+    Timestamp::from_nanosecond((i128::from(ticks) - UNIX_EPOCH_TICKS) * 100).ok()
+}
+
 fn read_claim(path: &Path) -> Claim {
     let text = match read_text(path) {
         Ok(text) => text,
@@ -244,4 +284,66 @@ fn open_shared(path: &Path) -> io::Result<File> {
 #[cfg(not(windows))]
 fn open_shared(path: &Path) -> io::Result<File> {
     File::open(path)
+}
+
+#[cfg(test)]
+#[expect(clippy::expect_used, reason = "a test whose own moments do not parse must fail loudly")]
+mod tests {
+    use jiff::{SignedDuration, Timestamp};
+
+    use super::{MAX_TICKS, UNIX_EPOCH_TICKS, claim_started_by, ticket_started_by, ticks_of, timestamp_of_ticks};
+
+    const START: &str = "2026-10-01T11:00:00.5Z";
+
+    fn start() -> Timestamp {
+        START.parse().expect("the test's start is a timestamp")
+    }
+
+    fn start_ticks() -> i64 {
+        i64::try_from(ticks_of(start())).expect("the test's start fits in ticks")
+    }
+
+    fn after(nanos: i64) -> Timestamp {
+        start()
+            .checked_add(SignedDuration::from_nanos(nanos))
+            .expect("the test's moment is a timestamp")
+    }
+
+    #[test]
+    fn a_claim_is_started_by_a_process_created_less_than_2_s_from_it() {
+        assert!(claim_started_by(start(), after(1_999_999_999)), "just under 2 s later");
+        assert!(claim_started_by(start(), after(-1_999_999_999)), "just under 2 s earlier");
+        assert!(!claim_started_by(start(), after(2_000_000_000)), "exactly 2 s later");
+        assert!(!claim_started_by(start(), after(-2_000_000_000)), "exactly 2 s earlier");
+    }
+
+    #[test]
+    fn a_ticket_is_started_by_a_process_created_less_than_2_s_from_it() {
+        assert!(ticket_started_by(start_ticks(), after(1_999_999_900)), "one tick under 2 s later");
+        assert!(ticket_started_by(start_ticks(), after(-1_999_999_900)), "one tick under 2 s earlier");
+        assert!(!ticket_started_by(start_ticks(), after(2_000_000_000)), "exactly 2 s later");
+        assert!(!ticket_started_by(start_ticks(), after(-2_000_000_000)), "exactly 2 s earlier");
+    }
+
+    #[test]
+    fn ticks_of_counts_100_ns_from_year_one() {
+        assert_eq!(ticks_of(Timestamp::UNIX_EPOCH), UNIX_EPOCH_TICKS);
+        assert_eq!(ticks_of(after(99)), ticks_of(start()), "truncated to the tick");
+        assert_eq!(
+            timestamp_of_ticks(start_ticks()),
+            Some(start()),
+            "the ticks name the moment they came from"
+        );
+    }
+
+    #[test]
+    fn ticks_outside_what_a_date_time_holds_are_no_moment() {
+        assert_eq!(timestamp_of_ticks(-1), None, "before 0001-01-01");
+        assert_eq!(timestamp_of_ticks(MAX_TICKS + 1), None, "after 9999-12-31T23:59:59.9999999");
+        assert_eq!(
+            timestamp_of_ticks(0),
+            Some("0001-01-01T00:00:00Z".parse().expect("year one is a timestamp")),
+            "the first tick"
+        );
+    }
 }

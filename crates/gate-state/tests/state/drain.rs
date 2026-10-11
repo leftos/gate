@@ -20,6 +20,8 @@ const TICKET_START_TICKS: i64 = 639_265_725_620_427_420;
 const TICKET_ARRIVED_TICKS: i64 = 639_265_725_624_458_960;
 /// .NET ticks (100 ns since 0001-01-01) at the Unix epoch.
 const UNIX_EPOCH_TICKS: i128 = 621_355_968_000_000_000;
+/// One tick past the last a .NET `DateTime` holds, 9999-12-31T23:59:59.9999999.
+const PAST_MAX_TICKS: i64 = 3_155_378_976_000_000_000;
 
 fn at_ticks(ticks: i64) -> Timestamp {
     Timestamp::from_nanosecond((i128::from(ticks) - UNIX_EPOCH_TICKS) * 100).expect("the test's ticks are a moment")
@@ -128,6 +130,24 @@ fn stale_and_unreadable_files_are_left_out() {
         "not a gate whose pid is gone (100, 200) or was reused (101, 201, 3 s off); a start 1.5 s off is the same process"
     );
     assert_eq!(found.unreadable, 2, "the claim and the ticket that are not JSON are counted");
+}
+
+#[test]
+fn a_ticket_whose_start_is_past_what_ticks_hold_is_unreadable() {
+    let mut machine = Machine::new("a_ticket_whose_start_is_past_what_ticks_hold_is_unreadable");
+    let mut past = ticket("heavy", 400, ticks(START), false);
+    past["startTicks"] = json!(PAST_MAX_TICKS);
+    machine.write_ticket("waiting", "400-1.json", &past.to_string());
+    machine.add_process(400, 1, "pwsh.exe", None, Some(START));
+
+    assert_eq!(
+        gates(&machine),
+        PowerShellGates {
+            gates: Vec::new(),
+            unreadable: 1,
+        },
+        "a ticket whose startTicks no DateTime holds is counted, not listed"
+    );
 }
 
 #[test]
