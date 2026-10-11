@@ -4,23 +4,22 @@
 
 ## Local gate
 
-- [ ] GATE-9 Local cutover: drain and switch to gate.exe, bridging routed runs to remote.ps1
+- [/] GATE-9 Local cutover: drain and switch to gate.exe, bridging routed runs to remote.ps1
 
 ## Remote
 
 - [ ] GATE-10 Port the remote client and box wrapper, then the remote cutover
-  - [/] GATE-24 Routed .NET builds recompile everything because each snapshot is a new commit
   - [/] GATE-43 Remote slice 2: remote client (snapshot, push, run, sync-back)
   - [ ] GATE-44 Remote slice 3: bring a routed run's outputs back
   - [ ] GATE-45 Remote slice 4: health refusals, fallback journalling and remote claims
   - [ ] GATE-109 Remote: carry every verb of a routed run over one ssh connection (gate box serve)
-  - [ ] GATE-110 Escape the builder's ssh stderr where the remote client quotes it in a gate: line
+  - [ ] GATE-115 Remote client: never retry or refuse on the command's own output
   - [ ] GATE-111 Remote client: bound kept lines and sync-back git reads, and put local git calls in jobs
   - [ ] GATE-19 Remote: send a repo's declared sibling worktrees with a routed run
   - [ ] GATE-22 Remote: send a routed command's ignored inputs to the builder, compressed
   - [ ] GATE-23 Outputs: measure the manifest time, cache hashes by (path, size, mtime) if slow
-  - [ ] GATE-27 Remote: remember a builder's failures per host (short backoff, loss counter)
   - [ ] GATE-29 Sync-back: narrow the 'worktree changed during the run' refusal to changes that could matter
+  - [ ] GATE-27 Remote: remember a builder's failures per host (short backoff, loss counter)
   - [ ] GATE-65 Box: push the installed gate.exe to each builder
   - [ ] GATE-46 Remote slice 5: drained remote cutover and deleting the remote.ps1 bridge
   - [ ] GATE-21 Remote: a critical pool on the builder for timing-sensitive gates (decide after measuring)
@@ -50,3 +49,8 @@
 - [ ] GATE-102 Give no slot marker when a gate cannot read its own start
 - [ ] GATE-106 Take the 5 s ceiling out of the suite's held-log launch case
 - [ ] GATE-107 Make the sync-back git-failure case independent of a held bare repository
+
+## No project
+
+- [ ] GATE-117 A gate that cannot read its own start writes a ticket other gates sweep as dead
+- [ ] GATE-118 Watchdog: a descheduled watcher counts its own delay as the command's quiet time
