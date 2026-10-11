@@ -50,7 +50,7 @@ impl Drop for EnvironmentKey {
 }
 
 /// `text` with Windows line ends turned into `\n`, so a case asserts the lines a PowerShell script said.
-fn unix(text: &str) -> String {
+pub(crate) fn unix(text: &str) -> String {
     text.replace("\r\n", "\n")
 }
 
@@ -103,7 +103,7 @@ fn installed_gate(case: &Case) -> PathBuf {
 }
 
 /// A copy of the built gate in the case folder, under `name`.
-fn copy_gate(case: &Case, name: &str) -> PathBuf {
+pub(crate) fn copy_gate(case: &Case, name: &str) -> PathBuf {
     let copy = case.folder().join(name);
     fs::copy(env!("CARGO_BIN_EXE_gate"), &copy).expect("the gate can be copied");
     copy

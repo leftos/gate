@@ -21,6 +21,7 @@ mod install;
 mod interrupt;
 mod journal;
 mod launch;
+mod launcher;
 mod nesting;
 mod pause;
 mod priority;
