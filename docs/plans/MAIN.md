@@ -4,20 +4,18 @@
 
 ## Local gate
 
-- [ ] GATE-5 Port the local gate, slice by slice
-  - [ ] GATE-39 Local slice 8: router and the bridge to remote.ps1
-    - [ ] GATE-104 Drop --no-build from a routed dotnet command's fallback after every refusal
 - [ ] GATE-9 Local cutover: drain and switch to gate.exe, bridging routed runs to remote.ps1
 
 ## Remote
 
 - [ ] GATE-10 Port the remote client and box wrapper, then the remote cutover
-  - [ ] GATE-26 Box: measure MSBuild node sharing across work folders, salt per work folder
-  - [ ] GATE-24 Routed .NET builds recompile everything because each snapshot is a new commit
-  - [ ] GATE-70 Remote: measure per-verb ssh overhead, then choose per-call or gate box serve
+  - [/] GATE-24 Routed .NET builds recompile everything because each snapshot is a new commit
   - [/] GATE-43 Remote slice 2: remote client (snapshot, push, run, sync-back)
   - [ ] GATE-44 Remote slice 3: bring a routed run's outputs back
   - [ ] GATE-45 Remote slice 4: health refusals, fallback journalling and remote claims
+  - [ ] GATE-109 Remote: carry every verb of a routed run over one ssh connection (gate box serve)
+  - [ ] GATE-110 Escape the builder's ssh stderr where the remote client quotes it in a gate: line
+  - [ ] GATE-111 Remote client: bound kept lines and sync-back git reads, and put local git calls in jobs
   - [ ] GATE-19 Remote: send a repo's declared sibling worktrees with a routed run
   - [ ] GATE-22 Remote: send a routed command's ignored inputs to the builder, compressed
   - [ ] GATE-23 Outputs: measure the manifest time, cache hashes by (path, size, mtime) if slow
