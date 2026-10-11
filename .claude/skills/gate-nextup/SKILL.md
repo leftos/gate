@@ -62,8 +62,14 @@ The repo is public: no build-box host, address, ssh user or key, provider name, 
 
 There is no changelog.
 
+## Reinstall
+
+This PC is cut over: every gate on it runs the installed `gate.exe`. After each landing whose diff changes code the local gate runs (the run, watchdog, slots, waiting, launch, the CLI and its subcommands, the journal, gate-state's writers), run `pwsh -NoProfile -File tools/install.ps1` from the main checkout on `main`, and name the installed version in the landing's report. A landing that changes only dormant code (the Rust remote client under `test-seams`, the box side builders run, the outputs module before it is wired) waits for the checkpoint, where one install covers them.
+
+The install is safe while gates run (rename-aside). A bad build is taken back by reinstalling the previous commit, or by deleting `%LOCALAPPDATA%\gate\cutover.flag`.
+
 ## Repo traps
 
 - An installed `gate.exe` runs from `%LOCALAPPDATA%\gate\bin`, never from `target/`: `~/.claude/tools/clean-builds.ps1` empties build folders daily, and a rebuild overwrites an exe live gates hold open.
-- Until a cutover, the PowerShell gate owns the machine's slots. A test of `gate.exe` takes slots under its own test prefix, never the real names, or it fights every session's gates.
+- The machine's real slots belong to every session's gates. A test of `gate.exe` takes slots under its own test prefix, never the real names, or it fights every session's gates.
 - Commits carry `Refs: GATE-<n>` trailers.
