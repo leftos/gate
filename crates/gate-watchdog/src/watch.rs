@@ -269,8 +269,9 @@ impl Watch {
     }
 
     /// The kill for the first of the three reasons that holds at `now`, or `None` while none does: the stall, then the
-    /// ceiling, then the backstop. Once the sampler has failed only the backstop is read, since the stall and the
-    /// load-adjusted clock no longer move.
+    /// ceiling, then the backstop. The stall is judged at the last sample's own time, so the delay a starved watcher
+    /// spent before calling is not the command's quiet time; the ceiling and the backstop read `now`. Once the sampler
+    /// has failed only the backstop is read, since the stall and the load-adjusted clock no longer move.
     #[must_use]
     #[expect(
         clippy::cast_precision_loss,
@@ -279,7 +280,10 @@ impl Watch {
     pub fn kill_check(&self, now: Duration) -> Option<Kill> {
         let free_percent = self.free_percent();
         if !self.sampler_failed {
-            let quiet = now.saturating_sub(self.last_progress);
+            // The stall is judged at the last sample's own time: a watcher starved of CPU wakes late, and the delay it
+            // spent descheduled is not the command's quiet time.
+            let judged_at = if self.sampled { self.last_at.min(now) } else { now };
+            let quiet = judged_at.saturating_sub(self.last_progress);
             if quiet >= self.config.stall {
                 return Some(Kill::Stalled { quiet, free_percent });
             }
@@ -658,6 +662,51 @@ mod tests {
     }
 
     #[test]
+    fn a_late_watcher_does_not_count_its_own_delay_as_quiet() {
+        // The watcher wakes 26.4 s after the sample it stamped: a baseline build server at 600 ms, then a kill check
+        // read at 27 s, once the starved sample's reads had finished.
+        let mut watch = watching(config(1000, 5000));
+        watch.sample(&server_tick(600, &[], &[(7, 55)], &[], true));
+        assert!(
+            watch.kill_check(Duration::from_secs(27)).is_none(),
+            "the delay between the sample's stamp and the kill check is not the command's quiet time"
+        );
+        // The next sample, stamped 5 s in, finds the same server further along: that CPU is progress.
+        watch.sample(&server_tick(5600, &[], &[(7, 26_440_000)], &[], true));
+        assert!(
+            watch.kill_check(Duration::from_millis(5600)).is_none(),
+            "the server CPU that rose between the samples is progress"
+        );
+    }
+
+    #[test]
+    fn a_late_sample_with_no_progress_is_still_a_stall() {
+        // A sample stamped 27 s in with the same server CPU as its baseline: the command really was quiet.
+        let mut watch = watching(config(1000, 5000));
+        watch.sample(&server_tick(600, &[], &[(7, 55)], &[], true));
+        watch.sample(&server_tick(27_000, &[], &[(7, 55)], &[], true));
+        assert!(
+            matches!(
+                watch.kill_check(Duration::from_secs(27)),
+                Some(Kill::Stalled { quiet, .. }) if quiet == Duration::from_secs(27)
+            ),
+            "a sample that saw no progress is a stall, quiet measured from the last progress"
+        );
+    }
+
+    #[test]
+    fn a_late_sample_with_job_cpu_is_progress() {
+        // The job used 3 s of CPU over the window, over the floor of 100 000 ticks a second: progress whatever the
+        // late stamp.
+        let mut watch = watching(config(1000, 5000));
+        watch.sample(&tick(27_000, 3_000_000, 0, &[], false));
+        assert!(
+            watch.kill_check(Duration::from_secs(27)).is_none(),
+            "the job's CPU over the floor is progress even at a late stamp"
+        );
+    }
+
+    #[test]
     fn cpu_trickle_below_one_percent_is_still_a_stall() {
         // The floor is 1% of one core over the window: 100_000 ticks over 1 s.
         let mut watch = watching(config(1000, 5000));
@@ -776,9 +825,9 @@ mod tests {
 
     #[test]
     fn stalled_outranks_backstop() {
-        // A paused run: the stall window and the backstop's unpaused wall both pass; the ceiling does not.
+        // An unpaused run with no progress: the stall window and the backstop's wall both pass; the ceiling does not.
         let mut watch = watching(config(1000, 1));
-        watch.sample(&tick(10_000, 0, 0, &[], true));
+        watch.sample(&tick(10_000, 0, 0, &[], false));
         assert!(
             matches!(watch.kill_check(Duration::from_secs(15)), Some(Kill::Stalled { .. })),
             "the stall outranks the backstop"
@@ -1103,7 +1152,7 @@ mod tests {
         for (stall_s, floor) in windows {
             let mut watch = watching(wsl_config(stall_s * 1000, 5000));
             watch.sample(&vm_sample(1000, Some(1_000_000)));
-            watch.sample(&vm_sample(2000, Some(1_000_000 + floor - 1)));
+            watch.sample(&vm_sample(stall_s * 1000, Some(1_000_000 + floor - 1)));
             assert!(
                 matches!(watch.kill_check(Duration::from_millis(1000 + stall_s * 1000)), Some(Kill::Stalled { .. })),
                 "a tick of the VM short of the {stall_s} s window's floor is not progress"
@@ -1111,7 +1160,7 @@ mod tests {
 
             let mut watch = watching(wsl_config(stall_s * 1000, 5000));
             watch.sample(&vm_sample(1000, Some(1_000_000)));
-            watch.sample(&vm_sample(2000, Some(1_000_000 + floor)));
+            watch.sample(&vm_sample(stall_s * 1000, Some(1_000_000 + floor)));
             assert!(
                 watch.kill_check(Duration::from_millis(1000 + stall_s * 1000)).is_none(),
                 "the {stall_s} s window's floor itself is progress"
@@ -1157,12 +1206,12 @@ mod tests {
         let mut grew = vm_sample(2000, Some(5_000_000));
         grew.output_size = 1;
         watch.sample(&grew);
-        let mut quiet = vm_sample(3000, Some(9_000_000));
+        let mut quiet = vm_sample(7000, Some(9_000_000));
         quiet.output_size = 1;
         watch.sample(&quiet);
         assert!(
             matches!(watch.kill_check(Duration::from_millis(7000)), Some(Kill::Stalled { .. })),
-            "the log growing at 2 s reset the accrual, so 3 s adds only 0.4 core-seconds"
+            "the log growing at 2 s reset the accrual, so the sample at 7 s adds only 0.4 core-seconds"
         );
     }
 
@@ -1171,7 +1220,7 @@ mod tests {
         let mut watch = watching(wsl_config(5000, 5000));
         watch.sample(&vm_sample(1000, Some(1_000_000)));
         watch.sample(&vm_sample(2000, None));
-        watch.sample(&vm_sample(3000, Some(20_000_000)));
+        watch.sample(&vm_sample(5000, Some(20_000_000)));
         assert!(
             matches!(watch.kill_check(Duration::from_millis(5000)), Some(Kill::Stalled { .. })),
             "the reading after an unreadable one is a baseline, not 1.9 core-seconds of progress"
@@ -1186,7 +1235,7 @@ mod tests {
         let mut watch = watching(wsl_config(5000, 5000));
         watch.sample(&vm_sample(1000, Some(900_000_000)));
         watch.sample(&vm_sample(2000, Some(1_000_000)));
-        watch.sample(&vm_sample(3000, Some(1_000_000 + floor - 1)));
+        watch.sample(&vm_sample(6000, Some(1_000_000 + floor - 1)));
         assert!(
             matches!(watch.kill_check(Duration::from_millis(6000)), Some(Kill::Stalled { .. })),
             "a tick short of the floor after the fall is not progress"
@@ -1195,7 +1244,7 @@ mod tests {
         let mut watch = watching(wsl_config(5000, 5000));
         watch.sample(&vm_sample(1000, Some(900_000_000)));
         watch.sample(&vm_sample(2000, Some(1_000_000)));
-        watch.sample(&vm_sample(3000, Some(1_000_000 + floor)));
+        watch.sample(&vm_sample(6000, Some(1_000_000 + floor)));
         assert!(
             watch.kill_check(Duration::from_millis(6000)).is_none(),
             "the floor reached after the fall is progress"
@@ -1232,7 +1281,7 @@ mod tests {
     fn the_vm_counts_only_for_a_wsl_command() {
         let mut watch = watching(config(5000, 5000));
         watch.sample(&vm_sample(1000, Some(1_000_000)));
-        watch.sample(&vm_sample(2000, Some(6_000_000)));
+        watch.sample(&vm_sample(5000, Some(6_000_000)));
         assert!(
             matches!(watch.kill_check(Duration::from_millis(5000)), Some(Kill::Stalled { .. })),
             "a command that is not a WSL one counts no VM CPU"

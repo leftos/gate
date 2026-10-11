@@ -562,6 +562,8 @@ All kept, with each knob's default unchanged:
 - The sampler (W1): every 5 s while the command runs, it reads the system times, one process snapshot, the job's accounting and process list, and the log and `.err` sizes; nothing goes through WMI.
 - Stall (W2): no output, no CPU (at least 1% of one core over the window), no new process in the job, no build-server progress, no WSL VM CPU and no nested gate paused behind a critical request, for `--stall` seconds: `gate: STALLED: ...`.
 
+  The quiet time is measured to the last sample's own time, not to the moment the watcher checks: a watcher starved of CPU wakes late, and the delay it spent descheduled is not the command's quiet time, so the next sample decides. A quiet command is therefore killed up to one sample period after its window, never before; the PowerShell gate measures to the check and can kill earlier. The ceiling and the backstop read the check's own time.
+
   Progress as the watchdog crate counts it resets the stall clock when the sum of the log and `.err` sizes changed (grew or shrank), the job's CPU since the last progress reached 1% of one core over the stall window, a pid appeared that the last sample did not have, or a nested gate is paused, or a build server's CPU counts as progress (see Build servers below), or, for a `wsl` command, the WSL VM's CPU counts as progress (see WSL below).
 - The load-adjusted clock and the ceiling (W3): each sample adds `interval * free` to the clock `--timeout` runs on; a sample taken while a nested gate is paused adds to the paused time instead; `gate: TIMED OUT after ...`.
 
