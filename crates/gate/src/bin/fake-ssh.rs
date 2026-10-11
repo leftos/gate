@@ -1,12 +1,17 @@
 //! The black-box suite's stand-in for ssh, which `gate run --test-remote-ssh` starts with ssh's own words: the options,
 //! `--`, the host and the line, whose last three words are `box <verb> <payload>`. git's own ssh starts it too, through
 //! the `local-ssh:` transport, with the line `git-upload-pack '<path>'` or `git-receive-pack '<path>'`, whose verb is
-//! the service's name. It reads the steps file the variable `GATE_FAKE_SSH_STEPS` names, one step a line, appends the
-//! verb it was called with to `<steps file>.log`, and acts on the step of its call, counted by that log: the first call
-//! takes the first step. A line that holds neither, as git's `-G` probe of which ssh it runs, fails with no step taken.
+//! the service's name. `gate push` starts it with a line that starts with `pwsh ` and holds `-EncodedCommand <script>`,
+//! a push call, whose verb is `push`. It reads the steps file the variable `GATE_FAKE_SSH_STEPS` names, one step a line,
+//! appends the verb it was called with to `<steps file>.log`, and acts on the step of its call, counted by that log: the
+//! first call takes the first step. A line that holds none of these, as git's `-G` probe of which ssh it runs, fails
+//! with no step taken. Started with `--version` alone, as a push case starts a copy of it standing in for a builder's
+//! old gate, it says `gate 0.0.0-old` and exits 0.
 //!
 //! `ok` runs `<gate> box <verb> <payload>` with the gate the variable `GATE_FAKE_SSH_GATE` names, or `git
-//! upload-pack <path>` or `git receive-pack <path>`, its standard streams this process's, and exits with its status;
+//! upload-pack <path>` or `git receive-pack <path>`, or a push call's words with this PC's `pwsh`, its `LOCALAPPDATA`
+//! the folder named as the host, the word before the line, in the folder the variable `GATE_FAKE_SSH_BUILDERS` names,
+//! made when missing; its standard streams are this process's, and it exits with its status;
 //! `hold <path>` waits until the path exists, then does as `ok`; `version <v>` does as `ok` with the gate's standard
 //! output read, its `gate: remote version` line said as `gate: remote version <v>`; `boot <time>` does the same with
 //! its `gate: remote boot` line, said as `gate: remote boot <time>`, and `no-boot` with that line dropped;
@@ -37,6 +42,15 @@ const VERSION: &str = "gate: remote version ";
 const BOOT: &str = "gate: remote boot ";
 /// The git services git's own ssh runs, each with the repository's path in single quotes after its name.
 const GIT_SERVICES: [&str; 2] = ["git-upload-pack", "git-receive-pack"];
+/// The verb of a push call, which `gate push` makes.
+const PUSH: &str = "push";
+/// The version this program says to `--version`, standing in for a builder's old gate.
+const OLD_VERSION: &str = "0.0.0-old";
+
+/// Why `command` could not be started, naming its program.
+fn cannot_run(command: &Command, error: &io::Error) -> String {
+    format!("cannot run {}: {error}", command.get_program().to_string_lossy())
+}
 
 fn main() {
     let status = match run() {
@@ -51,8 +65,17 @@ fn main() {
 }
 
 fn run() -> Result<i32, String> {
-    let line = std::env::args().next_back().ok_or("no line to run")?;
-    let call = BoxCall::of(&line)?;
+    let words: Vec<String> = std::env::args().skip(1).collect();
+    if words == ["--version"] {
+        writeln!(io::stdout().lock(), "gate {OLD_VERSION}").map_err(|error| format!("cannot write: {error}"))?;
+        return Ok(0);
+    }
+    let (host, line) = match &words[..] {
+        [] => return Err("no line to run".to_owned()),
+        [line] => ("", line.as_str()),
+        [.., host, line] => (host.as_str(), line.as_str()),
+    };
+    let call = BoxCall::of(line, host)?;
     let steps = PathBuf::from(variable("GATE_FAKE_SSH_STEPS")?);
     let step = next_step(&steps, call.verb)?;
     match step.split_once(' ') {
@@ -174,29 +197,44 @@ fn hold(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// The call the line carries: `gate box`'s verb and payload, or a git service's name and the repository's path.
+/// The call the line carries: `gate box`'s verb and payload, a git service's name and the repository's path, or
+/// [`PUSH`] and the push call's whole line; and the host it was made to.
 struct BoxCall<'a> {
     verb: &'a str,
     payload: &'a str,
+    host: &'a str,
 }
 
 impl<'a> BoxCall<'a> {
-    /// The call `line` carries: a git service and its path, unquoted, or the last three words, `box <verb> <payload>`.
-    fn of(line: &'a str) -> Result<BoxCall<'a>, String> {
+    /// The call `line`, made to `host`, carries: a git service and its path, unquoted, a push call, or the last three
+    /// words, `box <verb> <payload>`.
+    fn of(line: &'a str, host: &'a str) -> Result<BoxCall<'a>, String> {
         if let Some((verb, path)) = line.split_once(' ').filter(|(verb, _)| GIT_SERVICES.contains(verb)) {
             return Ok(BoxCall {
                 verb,
                 payload: path.trim_matches('\''),
+                host,
             });
         }
         let words: Vec<&'a str> = line.split(' ').collect();
+        let script = words.iter().skip_while(|word| **word != "-EncodedCommand").nth(1);
+        if words.first() == Some(&"pwsh") && script.is_some_and(|script| !script.is_empty()) {
+            return Ok(BoxCall {
+                verb: PUSH,
+                payload: line,
+                host,
+            });
+        }
         match words[..] {
-            [.., "box", verb, payload] => Ok(BoxCall { verb, payload }),
+            [.., "box", verb, payload] => Ok(BoxCall { verb, payload, host }),
             _ => Err(format!("the line holds no box call: {line}")),
         }
     }
 
     fn command(&self) -> Result<Command, String> {
+        if self.verb == PUSH {
+            return self.push_command();
+        }
         if let Some(service) = self.verb.strip_prefix("git-") {
             let mut command = Command::new("git");
             command.args([service, self.payload]);
@@ -207,9 +245,23 @@ impl<'a> BoxCall<'a> {
         Ok(command)
     }
 
+    /// This PC's `pwsh` with the push call's words after `pwsh`, its `LOCALAPPDATA` the host's folder in the folder
+    /// `GATE_FAKE_SSH_BUILDERS` names, made when missing.
+    fn push_command(&self) -> Result<Command, String> {
+        if self.host.is_empty() {
+            return Err("the push call names no host".to_owned());
+        }
+        let folder = PathBuf::from(variable("GATE_FAKE_SSH_BUILDERS")?).join(self.host);
+        fs::create_dir_all(&folder).map_err(|error| format!("cannot make {}: {error}", folder.display()))?;
+        let mut command = Command::new("pwsh");
+        command.args(self.payload.split(' ').skip(1)).env("LOCALAPPDATA", folder);
+        Ok(command)
+    }
+
     /// Runs the call with this process's streams; its status.
     fn ok(&self) -> Result<i32, String> {
-        let status = self.command()?.status().map_err(|error| format!("cannot run the gate: {error}"))?;
+        let mut command = self.command()?;
+        let status = command.status().map_err(|error| cannot_run(&command, &error))?;
         status.code().ok_or_else(|| "the gate ended with no status".to_owned())
     }
 
@@ -217,11 +269,8 @@ impl<'a> BoxCall<'a> {
     /// or dropped when there is no value; with a value and no such line, `prefix` and `value` are said once at the end,
     /// so a step does not depend on this machine's own reading of what the line says. Its status.
     fn rewritten(&self, prefix: &str, value: Option<&str>) -> Result<i32, String> {
-        let mut child = self
-            .command()?
-            .stdout(Stdio::piped())
-            .spawn()
-            .map_err(|error| format!("cannot run the gate: {error}"))?;
+        let mut command = self.command()?;
+        let mut child = command.stdout(Stdio::piped()).spawn().map_err(|error| cannot_run(&command, &error))?;
         let stdout = child.stdout.take().ok_or("the gate has no output pipe")?;
         let mut out = io::stdout().lock();
         let mut seen = false;
