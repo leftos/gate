@@ -32,7 +32,9 @@ pub struct Config {
 /// One sample of a watched command: the raw facts the Win32 side reads, with the time the watch had run.
 #[derive(Clone, Debug)]
 pub struct Sample {
-    /// How long the watch had run at this sample.
+    /// How long the watch had run when this sample's reads began.
+    pub began: Duration,
+    /// How long the watch had run at this sample, read with the system times and the job's accounting.
     pub at: Duration,
     /// The system's CPU times.
     pub system: SystemTimes,
@@ -63,6 +65,7 @@ pub struct Watch {
     config: Config,
     machine: Machine,
     last_at: Duration,
+    last_began: Duration,
     last_progress: Duration,
     adjusted: f64,
     paused: Duration,
@@ -92,6 +95,7 @@ impl Watch {
             config,
             machine,
             last_at: Duration::ZERO,
+            last_began: Duration::ZERO,
             last_progress: Duration::ZERO,
             adjusted: 0.0,
             paused: Duration::ZERO,
@@ -112,10 +116,14 @@ impl Watch {
     }
 
     /// Takes one sample: the interval since the last one advances the clock at the share of the machine the command
-    /// could have had, or counts as paused time while a gate under this one waits behind a critical request. The sample
-    /// is progress when the log's size changed either way, the job's CPU since the last progress reached 1% of one core
-    /// over the stall window, a pid appeared that the last sample did not have, a build server the job's client is
-    /// using gained CPU, the WSL VM passed its floor, or the run is paused.
+    /// could have had, or counts as paused time while a gate under this one waits behind a critical request. The
+    /// interval runs between the samples' end stamps, the moment their system times and job accounting were read, and
+    /// a progress sample marks its own end stamp as the last progress, since the CPU and the job's figures that show
+    /// it were read next to that stamp; the stall is judged at the latest sample's begin stamp, so a watcher starved
+    /// between its two stamps does not count its own read time as the command's quiet time. The sample is progress
+    /// when the log's size changed either way, the job's CPU since the last progress reached 1% of one core over the
+    /// stall window, a pid appeared that the last sample did not have, a build server the job's client is using gained
+    /// CPU, the WSL VM passed its floor, or the run is paused.
     pub fn sample(&mut self, sample: &Sample) {
         let interval = sample.at.saturating_sub(self.last_at).max(MIN_INTERVAL);
         let new_servers = measure_cpu(&self.new_servers, &sample.new_servers);
@@ -141,6 +149,7 @@ impl Watch {
         self.last_free = free;
         self.sampled = true;
         self.last_at = sample.at;
+        self.last_began = sample.began;
         self.system = sample.system;
         self.job_cpu = sample.job_cpu;
         self.output_size = sample.output_size;
@@ -196,23 +205,27 @@ impl Watch {
     }
 
     /// One pass while the sampler is failed, at `now`: the wall time since the last pass counts as paused time while
-    /// `paused` and is left out of the backstop, and either way the clock is brought up to `now`.
+    /// `paused` and is left out of the backstop, and either way the clock is brought up to `now`. A pass reads nothing,
+    /// so its two stamps fall together.
     pub fn wall_only(&mut self, now: Duration, paused: bool) {
         let stretch = now.saturating_sub(self.last_at);
         if paused {
             self.paused += stretch;
         }
         self.last_at = now;
+        self.last_began = now;
     }
 
     /// The command exited at `now`: the stretch since the last sample is counted at the share the last sample found.
-    /// A sampler that failed leaves no share to count it at, so nothing is added after one has.
+    /// A sampler that failed leaves no share to count it at, so nothing is added after one has. An exit reads nothing,
+    /// so its two stamps fall together.
     pub fn exited(&mut self, now: Duration) {
         if self.sampler_failed {
             return;
         }
         self.adjusted += now.saturating_sub(self.last_at).as_secs_f64() * self.last_free;
         self.last_at = now;
+        self.last_began = now;
     }
 
     /// The load-adjusted seconds the clock has counted, unrounded.
@@ -269,9 +282,10 @@ impl Watch {
     }
 
     /// The kill for the first of the three reasons that holds at `now`, or `None` while none does: the stall, then the
-    /// ceiling, then the backstop. The stall is judged at the last sample's own time, so the delay a starved watcher
-    /// spent before calling is not the command's quiet time; the ceiling and the backstop read `now`. Once the sampler
-    /// has failed only the backstop is read, since the stall and the load-adjusted clock no longer move.
+    /// ceiling, then the backstop. The stall is judged at the last sample's begin stamp, so the time a starved watcher
+    /// spent in its reads, and between them and the check, is not the command's quiet time; the ceiling and the
+    /// backstop read `now`. Once the sampler has failed only the backstop is read, since the stall and the load-adjusted
+    /// clock no longer move.
     #[must_use]
     #[expect(
         clippy::cast_precision_loss,
@@ -280,9 +294,9 @@ impl Watch {
     pub fn kill_check(&self, now: Duration) -> Option<Kill> {
         let free_percent = self.free_percent();
         if !self.sampler_failed {
-            // The stall is judged at the last sample's own time: a watcher starved of CPU wakes late, and the delay it
-            // spent descheduled is not the command's quiet time.
-            let judged_at = if self.sampled { self.last_at.min(now) } else { now };
+            // The stall is judged at the last sample's begin stamp: a watcher starved of CPU wakes late, and the delay
+            // it spent descheduled between its two stamps is not the command's quiet time.
+            let judged_at = if self.sampled { self.last_began.min(now) } else { now };
             let quiet = judged_at.saturating_sub(self.last_progress);
             if quiet >= self.config.stall {
                 return Some(Kill::Stalled { quiet, free_percent });
@@ -457,6 +471,13 @@ mod tests {
         user: 800_000_000,
     };
 
+    /// The times a 16-core machine reads over 30 s when half of it is busy elsewhere: three times [`HALF_BUSY`].
+    const HALF_BUSY_30S: SystemTimes = SystemTimes {
+        idle: 2_400_000_000,
+        kernel: 2_400_000_000,
+        user: 2_400_000_000,
+    };
+
     /// The stall window and ceiling under test, for a command that is not a WSL one.
     fn config(stall_ms: u64, timeout_s: u64) -> Config {
         Config {
@@ -480,9 +501,11 @@ mod tests {
         Watch::new(config, Machine::new(16, 16, false), IDLE, Ticks(0), None)
     }
 
-    /// A sample at `ms` of an idle machine: `job_cpu` used by the job, `output` bytes in the log, `pids` in the job.
+    /// A sample at `ms`, stamping its begin and its end both there: `job_cpu` used by the job, `output` bytes in the
+    /// log, `pids` in the job.
     fn tick(ms: u64, job_cpu: u64, output: u64, pids: &[u32], paused: bool) -> Sample {
         Sample {
+            began: Duration::from_millis(ms),
             at: Duration::from_millis(ms),
             system: IDLE,
             job_cpu: Ticks(job_cpu),
@@ -496,9 +519,11 @@ mod tests {
         }
     }
 
-    /// A sample at `ms` reading `system` as the machine's times since the watch began.
+    /// A sample at `ms`, stamping its begin and its end both there, reading `system` as the machine's times since the
+    /// watch began.
     fn sample(ms: u64, system: SystemTimes, paused: bool) -> Sample {
         Sample {
+            began: Duration::from_millis(ms),
             at: Duration::from_millis(ms),
             system,
             job_cpu: Ticks(0),
@@ -691,6 +716,55 @@ mod tests {
                 Some(Kill::Stalled { quiet, .. }) if quiet == Duration::from_secs(27)
             ),
             "a sample that saw no progress is a stall, quiet measured from the last progress"
+        );
+    }
+
+    #[test]
+    fn a_late_sample_counts_its_delay_at_the_share_it_read() {
+        // A watcher starved of CPU: its second sample began 6 s in and its reads finished at 31 s, so the interval it
+        // counts is the 30 s of system time the sample read, at the half share those times show.
+        let mut watch = watching(config(60_000, 15));
+        watch.sample(&sample(1000, IDLE, false));
+        let mut late = sample(31_000, HALF_BUSY_30S, false);
+        late.began = Duration::from_millis(6000);
+        watch.sample(&late);
+        assert!(
+            (watch.adjusted_seconds() - (1.0 + 30.0 * 0.5)).abs() < 1e-9,
+            "an idle second and 30 s at half a share, got {}",
+            watch.adjusted_seconds()
+        );
+        assert!(
+            matches!(watch.kill_check(Duration::from_secs(31)), Some(Kill::TimedOut { .. })),
+            "16 s of load-adjusted time is past a ceiling of 15"
+        );
+    }
+
+    #[test]
+    fn a_late_sample_does_not_count_its_own_duration_as_quiet() {
+        // One sample began 6 s in and finished its reads at 31 s with no progress: the stall is judged at the sample's
+        // began stamp, so its own 25 s of reads are not the command's quiet time.
+        let mut watch = watching(config(10_000, 5000));
+        let mut late = sample(31_000, IDLE, false);
+        late.began = Duration::from_millis(6000);
+        watch.sample(&late);
+        assert!(
+            watch.kill_check(Duration::from_secs(31)).is_none(),
+            "6 s of quiet is under the 10 s window; only the sample's own 25 s of reads would pass it"
+        );
+    }
+
+    #[test]
+    fn a_late_samples_progress_counts_to_its_end_stamp() {
+        // A late sample that saw the log grow: the progress it found was read next to its end stamp, so the quiet the
+        // next sample judges starts there. Its begin stamp would instead count the 25 s between them as quiet.
+        let mut watch = watching(config(10_000, 5000));
+        let mut late = tick(31_000, 0, 1, &[], false);
+        late.began = Duration::from_millis(6000);
+        watch.sample(&late);
+        watch.sample(&tick(32_000, 0, 1, &[], false));
+        assert!(
+            watch.kill_check(Duration::from_secs(32)).is_none(),
+            "quiet runs from the late sample's end stamp, 1 s back, under the 10 s window; from its begin it would be 26 s"
         );
     }
 

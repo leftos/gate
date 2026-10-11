@@ -169,6 +169,15 @@ pub(crate) struct Watching<'a> {
     pub survey: &'a mut Survey,
 }
 
+/// One sample pass's gathered facts: the sample itself, the sizes of the log and its `.err` file, the two kept apart
+/// for the diagnostics block, and whether the pass's WSL VM read failed, which that block reports.
+struct Gathered {
+    sample: Sample,
+    log_bytes: u64,
+    err_bytes: u64,
+    vm_failed: bool,
+}
+
 impl<'a> Watcher<'a> {
     /// Begins the watch of `run`, which `request` started at `start` on a machine of `processors` logical processors,
     /// from the system's and the job's CPU times read now, and the WSL VM's for a wsl command.
@@ -272,33 +281,38 @@ impl<'a> Watcher<'a> {
         }
     }
 
-    /// Takes one sample, or moves the clock by wall time once the sampler has failed.
+    /// Takes one sample, or moves the clock by wall time once the sampler has failed. The sample is stamped twice:
+    /// `began` before any of its reads, so the stall does not count the time its own reads took as the command's quiet
+    /// time, and `at` with the system times and the job's accounting, so the interval covers the stretch those two
+    /// measure.
     fn take_sample(&mut self, console: &mut Console) {
-        let at = self.started.elapsed();
+        let began = self.started.elapsed();
         // A gate under this one waiting behind a critical request is progress, and the wall-only path counts it too.
         let paused = self.paused(console);
         if !self.sampler_works {
-            self.watch.wall_only(at, paused);
+            // A failed pass reads nothing: the stretch it answers for is stamped once, at its own end.
+            self.watch.wall_only(self.started.elapsed(), paused);
             return;
         }
-        let (vm, line) = self.vm.sample();
-        if let Some(line) = line {
-            console.err(&line);
-        }
-        match self.sample(at, vm.as_ref().ok().copied().flatten(), paused) {
-            Ok((sample, log_bytes, err_bytes)) => {
+        match self.sample(console, began, paused) {
+            Ok(Gathered {
+                sample,
+                log_bytes,
+                err_bytes,
+                vm_failed,
+            }) => {
                 // Only a sample that came back whole becomes the one a kill's block lists the servers of; one that
                 // failed part way leaves the last good sample's servers in place.
                 self.counted = counted(&sample.new_servers, &sample.shared_servers);
                 self.watch.sample(&sample);
-                self.record(&sample, log_bytes, err_bytes, vm.is_err());
+                self.record(&sample, log_bytes, err_bytes, vm_failed);
                 self.prioritize(console);
             }
             Err(error) => {
                 self.sampler_works = false;
                 console.err(&self.watch.sampler_failed(&error.to_string()));
                 // The pause read this pass answers for the stretch the failed sample would have measured.
-                self.watch.wall_only(at, paused);
+                self.watch.wall_only(self.started.elapsed(), paused);
             }
         }
     }
@@ -454,11 +468,13 @@ impl<'a> Watcher<'a> {
         paused
     }
 
-    /// The facts of one sample at `at`: the system's and the job's CPU, the job's processes created since the command
-    /// started, the build servers outside the job and the build client inside it, the WSL VM's CPU `vm_cpu` read for
-    /// it, whether a gate under this one waits behind a critical request (`paused`), and the size of the log and its
-    /// `.err` file, the two kept apart for the diagnostics block. Under `--test-sampler-fail` every sample fails.
-    fn sample(&mut self, at: Duration, vm_cpu: Option<u64>, paused: bool) -> io::Result<(Sample, u64, u64)> {
+    /// The facts of one sample that began at `began`: the size of the log and its `.err` file, the two kept apart for
+    /// the diagnostics block, the job's processes created since the command started, the build servers outside the job
+    /// and the build client inside it, the WSL VM's CPU for a wsl command (its unreadable line said once, when it first
+    /// fails), and last the system's times and the job's accounting, stamped with the watch's end time: the interval
+    /// the watch counts them over is exactly the stretch the end stamp closes. Under `--test-sampler-fail` every
+    /// sample fails.
+    fn sample(&mut self, console: &mut Console, began: Duration, paused: bool) -> io::Result<Gathered> {
         if self.sampler_fail {
             return Err(io::Error::other(SAMPLER_FAIL));
         }
@@ -481,19 +497,32 @@ impl<'a> Watcher<'a> {
             build_client,
         } = found;
         self.classified = servers;
+        let (vm, line) = self.vm.sample();
+        if let Some(line) = line {
+            console.err(&line);
+        }
+        let system = system_times()?;
+        let job_cpu = Ticks(self.job.accounting()?.cpu);
+        let at = self.started.elapsed();
         let sample = Sample {
+            began,
             at,
-            system: system_times()?,
-            job_cpu: Ticks(self.job.accounting()?.cpu),
+            system,
+            job_cpu,
             output_size: log_bytes + err_bytes,
             pids,
             paused,
             new_servers,
             shared_servers,
             build_client,
-            vm_cpu,
+            vm_cpu: vm.as_ref().ok().copied().flatten(),
         };
-        Ok((sample, log_bytes, err_bytes))
+        Ok(Gathered {
+            sample,
+            log_bytes,
+            err_bytes,
+            vm_failed: vm.is_err(),
+        })
     }
 
     /// The job's processes created at or after the command's start; one that exited since the job listed it is left
