@@ -480,8 +480,8 @@ enum Remotely {
     Ended(Ended),
     /// A Ctrl+C ended the wait for a remote slot.
     Interrupted,
-    /// The run falls back here, for this reason.
-    Here(FallbackReason),
+    /// The run falls back here.
+    Here,
 }
 
 /// What a passed line says of how long the command ran: here, by the wall clock and load-adjusted, or on a builder,
@@ -556,7 +556,7 @@ impl Run<'_> {
             Route::Routed(remote) => match self.routed(remote, hold, console) {
                 Remotely::Ended(ended) => return Some(ended),
                 Remotely::Interrupted => return None,
-                Remotely::Here(reason) => match self.plan_here(remote, reason, plan, console) {
+                Remotely::Here => match self.plan_here(remote, plan, console) {
                     Ok(plan) => plan,
                     Err(ended) => return Some(ended),
                 },
@@ -722,17 +722,17 @@ impl Run<'_> {
         }
         let host = tag.map_or_else(String::new, |tag| tag.host);
         console.err(&fallback_line(&host, reason, outcome.detail.as_deref()));
-        Remotely::Here(reason)
+        Remotely::Here
     }
 
-    /// The plan of the run here after a fallback for `reason`: the first plan, the command as given, unless the builder
-    /// rebooted after it ran the command, when it is the command with a dotnet `--no-build` dropped. Else how the run
-    /// ended when that command cannot be planned.
-    fn plan_here(&self, remote: &RemoteRun, reason: FallbackReason, plan: Plan, console: &mut Console) -> Result<Plan, Ended> {
-        if reason != FallbackReason::Rebooted {
+    /// The plan of the run here after a fallback of any reason: the first plan unchanged when the fallback drops no
+    /// word, which is the command as given, else a plan of the fallback's words, the command with a dotnet `--no-build`
+    /// dropped. Else how the run ended when that command cannot be planned.
+    fn plan_here(&self, remote: &RemoteRun, plan: Plan, console: &mut Console) -> Result<Plan, Ended> {
+        let words: Vec<OsString> = remote.fallback.iter().map(OsString::from).collect();
+        if words == self.request.command {
             return Ok(plan);
         }
-        let words: Vec<OsString> = remote.ran_fallback.iter().map(OsString::from).collect();
         let at = Where {
             root: self.root,
             gate: &self.gate,

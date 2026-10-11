@@ -20,6 +20,8 @@ use crate::support::{
 
 pub(crate) const HOST: &str = "builder";
 pub(crate) const BUSY_LINE: &str = "gate: remote builder busy; running here";
+/// The line a routed run says as it falls back here from a full remote pool.
+const FULL_LINE: &str = "gate: remote builder full; running here";
 const NOTHING_SENT_LINE: &str = "gate: not routed: sub holds nothing the snapshot sends";
 const REMOTE_WAITING: &str = "gate: waiting for a remote slot on builder (1 busy)";
 /// The status Windows reports for a process Ctrl+C ended, `STATUS_CONTROL_C_EXIT`, as a signed exit code.
@@ -409,12 +411,46 @@ fn no_build_and_other_flags_that_are_not_paths_are_left_alone() {
     assert!(stdout_lines(&other.stdout).windows(3).any(|words| words == flags), "{other:?}");
     assert_in_order(&dotnet.stderr, &[DROPPED_NO_BUILD_LINE, NO_OUTPUTS_LINE, BUSY_LINE]);
     assert!(
-        stdout_lines(&dotnet.stdout).contains(&"--no-build"),
-        "a fallback before the builder ran keeps --no-build: {dotnet:?}"
+        !stdout_lines(&dotnet.stdout).contains(&"--no-build"),
+        "a fallback after any refusal drops --no-build: {dotnet:?}"
     );
     let events = events(&case);
     assert_refused(&events[..5], "busy");
     assert_refused(&events[5..], "busy");
+}
+
+#[test]
+fn a_dotnet_no_build_command_on_a_full_pool_runs_here_without_it() {
+    let case = routed_case("routing-no-build-full");
+    copy_tool(&case, "dotnet.exe");
+    let go = case.folder().join("go");
+    let holder = remote_holder(&case, "holder.log", &go);
+    let call = case.folder().join("dotnet.json");
+    let steps = shown(&stub(&case, &[&format!("record {}", shown(&call)), "status 0"]));
+    let waiter = case.start(&routed_words(
+        "dotnet.log",
+        &steps,
+        &["--test-remote-wait-ms", "1"],
+        &[r".\dotnet.exe", "argv", "test", "--no-build"],
+    ));
+    let pid = waiter.id();
+    let outcome = waiter.finish();
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_in_order(&outcome.stderr, &[DROPPED_NO_BUILD_LINE, FULL_LINE]);
+    let words = stdout_lines(&outcome.stdout);
+    assert!(
+        words.contains(&"test") && !words.contains(&"--no-build"),
+        "the fallback runs here as `argv test`, without --no-build: {outcome:?}"
+    );
+    assert!(!call.exists(), "the waiter's client never ran");
+    let own = own(&case, pid);
+    assert_eq!(names(&own), ["queue", "fallback", "take", "release"], "{own:#?}");
+    assert!(own[..2].iter().all(has_remote_tag), "{own:#?}");
+    assert_eq!(own[1]["reason"], "full");
+    assert!(own[2..].iter().all(has_no_remote_fields), "{own:#?}");
+    let_go(&go);
+    assert_eq!(holder.finish().code, Some(0));
 }
 
 #[test]
@@ -624,7 +660,7 @@ fn every_refusal_reason_names_itself_in_the_line_and_the_journal() {
 }
 
 #[test]
-fn no_build_is_dropped_for_the_box_and_kept_for_a_fallback_unless_the_box_ran_it() {
+fn no_build_is_dropped_for_the_box_and_the_fallback() {
     let case = routed_case("routing-no-build");
     copy_tool(&case, "dotnet.exe");
     let (busy_call, tool_call) = (case.folder().join("busy.json"), case.folder().join("tool.json"));
@@ -641,7 +677,10 @@ fn no_build_is_dropped_for_the_box_and_kept_for_a_fallback_unless_the_box_ran_it
     assert!(!recorded_words(&call).contains(&"--no-build"), "{call}");
     assert_eq!(call["outputs"], json!([]), "{call}");
     assert_in_order(&before.stderr, &[DROPPED_NO_BUILD_LINE, NO_OUTPUTS_LINE, BUSY_LINE]);
-    assert!(stdout_lines(&before.stdout).contains(&"--no-build"), "{before:?}");
+    assert!(
+        !stdout_lines(&before.stdout).contains(&"--no-build"),
+        "a fallback after any refusal drops --no-build: {before:?}"
+    );
     let after_lines = stdout_lines(&after.stdout);
     assert!(after_lines.contains(&"build") && !after_lines.contains(&"--no-build"), "{after:?}");
     assert!(
@@ -683,7 +722,7 @@ fn a_full_remote_pool_falls_back_with_reason_full() {
     let outcome = waiter.finish();
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
-    assert_in_order(&outcome.stderr, &[REMOTE_WAITING, "gate: remote builder full; running here"]);
+    assert_in_order(&outcome.stderr, &[REMOTE_WAITING, FULL_LINE]);
     let own = own(&case, pid);
     assert_eq!(names(&own), ["queue", "fallback", "take", "release"], "{own:#?}");
     assert!(own[..2].iter().all(has_remote_tag), "{own:#?}");

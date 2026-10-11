@@ -56,7 +56,6 @@ fn the_control_command_routes_from_the_root() {
             pattern: "dotnet *".to_owned(),
             words: words(&["dotnet", "test", "tests/T.csproj"]),
             fallback: command.clone(),
-            ran_fallback: command.clone(),
             outputs: words(&["**/bin/**", "**/.godot/mono/temp/bin/**"]),
             dropped_no_build: false,
             outputs_withheld: false,
@@ -361,13 +360,12 @@ fn a_fact_that_fails_says_not_routed_on_one_line() {
 }
 
 #[test]
-fn no_build_is_dropped_from_a_dotnet_command_for_the_builder_and_after_a_run() {
+fn no_build_is_dropped_from_a_dotnet_command_for_the_builder_and_the_fallback() {
     let command = words(&["DotNet.EXE", "test", "--no-build", "--no-build=x", "--NO-BUILD", "--x"]);
     let run = routed(decide(&heavy(&command), &FakeFacts::at_root()));
     assert_eq!(run.pattern, "* --x");
     assert_eq!(run.words, ["DotNet.EXE", "test", "--no-build=x", "--NO-BUILD", "--x"]);
-    assert_eq!(run.ran_fallback, ["DotNet.EXE", "test", "--no-build=x", "--NO-BUILD", "--x"]);
-    assert_eq!(run.fallback, command);
+    assert_eq!(run.fallback, ["DotNet.EXE", "test", "--no-build=x", "--NO-BUILD", "--x"]);
     assert!(run.dropped_no_build);
     assert_eq!(run.lines()[0], DROPPED_NO_BUILD_LINE);
     assert_eq!(
@@ -381,7 +379,7 @@ fn no_build_stays_on_any_other_command() {
     let command = words(&["cargo", "test", "--no-build"]);
     let run = routed(decide(&heavy(&command), &FakeFacts::at_root()));
     assert_eq!(run.words, command);
-    assert_eq!(run.ran_fallback, command);
+    assert_eq!(run.fallback, command);
     assert!(!run.dropped_no_build);
     assert!(!run.outputs_withheld);
     assert_eq!(run.lines(), Vec::<&str>::new());

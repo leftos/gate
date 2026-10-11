@@ -639,7 +639,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
 - **What routes** is kept (T2): a heavy gate, not `--local`, under no covering or lending parent, outside a git hook (`GIT_INDEX_FILE` set to a non-empty value), whose first word is not `git` or `prek`, in a git worktree of a repo `remote.json` lists, whose words with in-worktree paths rewritten (T3) match one of that repo's patterns.
 
-  A matched command still runs here, saying why, when a word names a path outside the worktree or the gate's folder holds nothing the snapshot sends. `--no-build` is dropped from the builder's words of a dotnet command, saying so (T4); the fallback here drops it only after the builder ran the command, so a fallback before that keeps the command as given.
+  A matched command still runs here, saying why, when a word names a path outside the worktree or the gate's folder holds nothing the snapshot sends. `--no-build` is dropped from the builder's words of a dotnet command, saying so (T4); the fallback here drops each exact `--no-build` word of a dotnet command after every refusal, rebuilding locally as the builder would have, because an earlier routed step (a repo's test-all build) may have built only on the builder, so a later `dotnet test --no-build` that falls back here would find no build output. A step that really did build here pays a second local build on a refusal, a cost accepted. A fallback that drops no word reuses the first plan.
 - **The decision is `gate-router`'s**, pure, over facts the caller gives it and the decision asks for lazily, in this order. A light or critical gate, or one under a covering or lending parent, stays local silently and reads nothing. `--local` stays local, saying `gate: not routed: --local`. Only then is `remote.json` read: no file stays local silently, and a file that is not a file, cannot be read or is refused stays local saying `gate: ignored <path>: <reason>; running locally`.
 
   After the file: a git hook, a command with no non-empty word, or a first word whose file name without extension is `git` or `prek` (`git.exe` and a full path included, in any letter case) stays local silently.
@@ -1053,7 +1053,6 @@ At the end of every run the gate says how many cores the command kept busy and w
 What no ruling settles yet, with the issue that owns it:
 
 - **The box protocol and `remote.json`'s next format** (GATE-10): verbs, payload and transport between PC and builder, whether ssh keeps cmd.exe as the builder's shell, and the routing file's version and matcher. Sibling worktrees in a routed run leave three questions of their own (GATE-19).
-- **The duration estimate** (GATE-12): whether p50 comes from a short recent window, and whether cold and warm cache runs are summarised apart.
 - **A prediction a run has passed** (GATE-14): what a holder past its p90 reports in wait lines, and whether the critical gate re-prices its shadow end and closes or shrinks the lent window when a blocker overruns.
 - **The `--timeout auto` spelling** (GATE-16): how the caller's floor travels with `auto` in the new CLI.
 - **The surfaces of `gate status` and `gate drain`** (no issue yet). Install stays a script (`tools/install.ps1`) until a reason for a `gate install` subcommand appears.

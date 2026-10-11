@@ -144,11 +144,9 @@ pub struct RemoteRun {
     /// The words the builder runs: paths rewritten, `--no-build` dropped from a dotnet command, and a bare first word
     /// naming a file of the gate's folder written `./name`.
     pub words: Vec<String>,
-    /// The words a fallback here runs after a refusal before the run: the command as given.
-    pub fallback: Vec<String>,
-    /// The words a fallback here runs after the builder ran the command: as given, `--no-build` dropped from a dotnet
+    /// The words every fallback here runs: the command as given, each exact `--no-build` word dropped from a dotnet
     /// command.
-    pub ran_fallback: Vec<String>,
+    pub fallback: Vec<String>,
     /// The output globs the run brings back; none for a dotnet `--no-build` command.
     pub outputs: Vec<String>,
     /// Whether `--no-build` was dropped from the builder's words.
@@ -300,9 +298,9 @@ fn remote_run(matched: Matched<'_>, subfolder: String, given: &[String], facts: 
     let sent_count = matched.words.len();
     let mut words = without_no_build(matched.words, dotnet);
     let dropped_no_build = words.len() != sent_count;
-    let ran_fallback = without_no_build(given.to_vec(), dotnet);
+    let fallback = without_no_build(given.to_vec(), dotnet);
     let mut outputs = matched.config.outputs(&matched.repo);
-    let outputs_withheld = ran_fallback.len() != given.len() && !outputs.is_empty();
+    let outputs_withheld = fallback.len() != given.len() && !outputs.is_empty();
     if outputs_withheld {
         outputs.clear();
     }
@@ -316,8 +314,7 @@ fn remote_run(matched: Matched<'_>, subfolder: String, given: &[String], facts: 
         subfolder,
         pattern: matched.pattern,
         words,
-        fallback: given.to_vec(),
-        ran_fallback,
+        fallback,
         outputs,
         dropped_no_build,
         outputs_withheld,
