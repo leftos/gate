@@ -298,7 +298,15 @@ The environment carries one more name: `GATE_SLOT_HELD`, the slot marker ([Criti
 - The reason a file is unreadable is one of `not JSON: <message>`, `not JSON: not UTF-8`, `duplicate key "<key>"`, `missing key "v"`, `unknown format v <value>`, `not a JSON object`, the message of the missing key or wrong type, or the io error. It is the `<reason>` of the gate's ignore line.
 - `gate-state` is the one implementation of every format; `gate.exe` and ops-tower both use it, and its fixtures (`crates/gate-state/tests/state/fixtures/`) are the reference examples. The strict rules above are the `gate_state::v1` module's, the formats `gate.exe` writes.
 
-  The crate's other readers (`claims.rs`, `state.rs` and the counts reader beside `v1`) read the PowerShell gate's files leniently, and ops-tower uses them until it moves to the `v1` root.
+  The crate's other readers (`claims.rs`, `state.rs` and the counts reader beside `v1`) read the PowerShell gate's files leniently, and ops-tower uses them while the cutover flag does not exist. ops-tower follows the flag: its `StateInputs.generation` (`Generation::PowerShell` or `Generation::V1`) is looked up on every `live_inputs()` call from `%LOCALAPPDATA%\gate\cutover.flag`, the switch the launcher uses ([Cutover](#cutover)).
+
+  In the `PowerShell` generation the state and the history read `%LOCALAPPDATA%\gate\`; in `V1` they read only `%LOCALAPPDATA%\gate\v1\`, and a missing `v1\` folder is an empty state.
+
+  In `V1` the readers take `gate.exe`'s formats: the claims (their `SlotRow.claim` carries `"v":1`), the tickets and the counts file are read as the strict `v1` formats, and the journal is the one `gate.exe` writes.
+
+  The waiters in `queue[]`, `pools[].waiting` and `critical.waiting` come from the tickets, not from process command lines: `queue[]` is ordered by (`arrived`, `pid`) with `arrived` as ISO text of 7 fractional digits and a lower-case `kind`; a waiter's `since` is its gate's start and its `commandLine` is the gate's command line from the process table; `pools[].problem` is worded for `gate.exe`'s files.
+
+  A `V1` read of the counts takes `v1\slot-counts.json` beside the PowerShell counts path (with `GATE_TEST_SLOT_COUNTS`, `<that file's folder>\v1\slot-counts.json`) and reads it strictly ([Counts file](#counts-file)).
 - Text is UTF-8 with no BOM and LF line ends.
 
 ### Claim
@@ -349,6 +357,8 @@ A ticket whose gate is dead by the [liveness rule](#claim) is ignored and delete
 
 `slot-counts.json`: `{"v": 1, "heavy": <n>, "light": <n>}`, both keys optional, each a whole number from 1 to 64 (kept, S2). People and ops-tower write it; `gate.exe` only reads it.
 
+ops-tower's Gates tab writes through `gate-state` (`write_slot_counts`, `apply_slot_count`) on every edit: the PowerShell gate's `%LOCALAPPDATA%\gate\slot-counts.json` first, then `gate.exe`'s `%LOCALAPPDATA%\gate\v1\slot-counts.json` as `{"v":1,"heavy":<n>,"light":<n>}`, creating `v1\`, whether or not the cutover flag exists. A failure on the first file leaves the second as it was. Counts that are empty delete both files.
+
 A missing file, or a missing key, gives the default silently. A file unreadable as a whole (including one without `v`, reason `missing key "v"`) gives both pools their default, each with its own ignore line. A value that is not a whole number from 1 to 64 gives that pool alone its default, with the reason `"<kind>" must be a whole number from 1 to 64`. Every line is `gate: ignored <path>: <reason>; using <n> <kind> slots`, built in one place for the `v1` and the PowerShell-era readers.
 
 ### Journal
@@ -390,7 +400,11 @@ The verdict comes from the run's end: a kill line matching `^gate: (STALLED|TIME
 
 The reader starts a run from a lone `parent` line that names a parent: state `parent` and `parentPid`, no queued or started time, and the status and held time of the parent's run. A `parent` line naming no parent is skipped. A lent gate whose command's environment cannot be built writes no `parent` line: one that had queued writes a `release` with `"slots":[]` and `"status":1`, and one lent before it queued writes nothing.
 
+A lone `covered` line is its own state, `covered` (`RunState::Covered`), distinct from a run that lent its slot: the run has `parentPid`, no queued or started time, the kind and first time of the `covered` line, and the status and verdict of the parent's released run. A covered run is never counted in the summary.
+
 The history that ops-tower serves (`HistoryRun`, `GET /api/gate/history`) carries `verdict`, `wallSeconds` and `adjustedSeconds`, null when a line has none, and `abandoned`: every name any line of the run lists (`parent` and `covered` lines included), in line order without repeats, always present and empty when there are none.
+
+It also carries, after `slot`, `slots` (the slot names the run took, such as `["Local\\gate-slot-0"]`, `[]` when none) and `machine` (null, or for a critical gate's `take` `{counts, otherHeld, otherClaims}` or `{counts, otherHeld, snapshotError}`). A `fallback` line clears `slot`, `slots` and `machine`. ops-tower reads the journal of the generation the cutover flag selects ([Common rules](#common-rules)).
 
 The history key is `gate_state::normalize_command` of a run's `command`, so the runs of one command in different worktrees count together. It splits the command as the Microsoft C runtime reads arguments (space and tab outside quotes separate words, `"` opens or closes a span, `""` inside a span is one literal quote, a backslash run before `"` is halved with the quote literal when the run is odd), the first word included.
 
@@ -932,7 +946,7 @@ The rest of the protocol, the transport of snapshots and outputs, is the remote 
 
 The PowerShell gate and `gate.exe` share slot mutexes and never share files. The default root's mutex names are the PowerShell gate's, so a PowerShell gate still running and a new `gate.exe` gate take turns on one set of slots and the machine is never over-subscribed; each generation writes its claims, tickets and journal in its own folder and format, and ops-tower reads only `gate.exe`'s once the drain is over. Moving a machine to `gate.exe` is a drained cutover:
 
-1. Before it runs, ops-tower's Gates tab must already write the default root's `slot-counts.json` (`%LOCALAPPDATA%\gate\v1\`), since `gate.exe` never reads the PowerShell gate's `%LOCALAPPDATA%\gate\slot-counts.json`.
+1. Before it runs, ops-tower's Gates tab already writes the default root's `slot-counts.json` (`%LOCALAPPDATA%\gate\v1\`) on every edit, through `gate-state`'s writer, since `gate.exe` never reads the PowerShell gate's `%LOCALAPPDATA%\gate\slot-counts.json` ([Counts file](#counts-file)).
 
    `gate cutover` copies the PowerShell gate's slot counts into the default root's `slot-counts.json`, so both generations count the same slots, then writes `%LOCALAPPDATA%\gate\cutover.flag`. The PowerShell launcher in each repo reads the flag, and from then on every new gate runs `gate.exe` through the compatibility layer.
 2. It then waits until every PowerShell gate's claims and tickets in `%LOCALAPPDATA%\gate\` are gone or stale, naming on stderr what it still waits on, and exits 0 once none is left.
@@ -955,7 +969,7 @@ Callers that start the PowerShell gate without the launcher (inventory section 4
 
 During the drain a PowerShell gate neither reads `gate.exe`'s tickets nor signals its wake events: a PowerShell critical request can be overtaken by `gate.exe` gates that arrive after it (it still waits for every slot), and a `gate.exe` waiter learns of a PowerShell gate's release from its fallback poll.
 
-ops-tower's Gates tab, `gate-state`, and the hooks and scripts that read gate command lines or output (inventory section 4) change in the same drain.
+ops-tower follows the flag: it reads the PowerShell gate's files until the flag exists and then only `v1\`, and its waiters come from `gate.exe`'s tickets ([Common rules](#common-rules)). The hooks and scripts that read gate command lines or output (inventory section 4) change in the same drain.
 
 After the caller sweep there is no fallback: callers run `gate ...` on PATH, a machine without it gets "command not found", and each repo's docs name the install script. Before the sweep, the PowerShell launcher's own fallback for a machine without the gate (H2) is the launcher's, not `gate.exe`'s.
 

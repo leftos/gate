@@ -12,7 +12,8 @@ use std::time::Duration;
 
 use serde_json::{Map, Value};
 
-use crate::model::{SlotCount, SlotCounts, SlotKind, StateInputs};
+use crate::model::{Generation, SlotCount, SlotCounts, SlotKind, StateInputs};
+use crate::v1;
 
 /// How many times a write tries to move its file into place, or to delete the file, before it fails.
 const WRITE_ATTEMPTS: u32 = 10;
@@ -48,8 +49,8 @@ pub enum ApplyError {
 }
 
 /// The counts file the PowerShell gate reads: the override when the caller gives a non-empty one, else
-/// `<local app data>\gate\slot-counts.json`. `gate.exe` reads `<state root>\slot-counts.json` instead
-/// (`v1::counts_path`).
+/// `<local app data>\gate\slot-counts.json`. It is the path [`apply_slot_count`] and [`write_slot_counts`] take, whatever
+/// the generation: they write `gate.exe`'s `v1\slot-counts.json` beside it too.
 #[must_use]
 pub fn slot_count_path(inputs: &StateInputs) -> PathBuf {
     if let Some(path) = &inputs.slot_counts_override
@@ -58,6 +59,22 @@ pub fn slot_count_path(inputs: &StateInputs) -> PathBuf {
         return path.clone();
     }
     inputs.local_app_data.join("gate").join("slot-counts.json")
+}
+
+/// `gate.exe`'s counts file beside the PowerShell gate's `path`: `<path's folder>\v1\slot-counts.json`, which for the
+/// per-user file is the default state root's (`v1::counts_path`).
+fn v1_counts_beside(path: &Path) -> PathBuf {
+    v1::counts_path(&counts_folder(path).join("v1"))
+}
+
+/// The counts file the state reads for `inputs`' generation: [`slot_count_path`], or for [`Generation::V1`] the v1 file
+/// beside it.
+pub(crate) fn state_counts_path(inputs: &StateInputs) -> PathBuf {
+    let path = slot_count_path(inputs);
+    match inputs.generation {
+        Generation::PowerShell => path,
+        Generation::V1 => v1_counts_beside(&path),
+    }
 }
 
 /// The counts file parsed: `Ok(None)` when it does not exist, `Err` with the reason the gate gives when it cannot be
@@ -165,11 +182,33 @@ pub(crate) fn property<'a>(object: &'a Map<String, Value>, key: &str) -> Option<
     None
 }
 
-/// The counts the file sets that the gate would use, so a write keeps the other kind's value and drops any value the
-/// gate itself would ignore.
+/// The counts the active generation's file sets that its gate would use, so a write keeps the other kind's value and
+/// drops any value the gate itself would ignore: the PowerShell gate's file at `path` read leniently, or, once the
+/// cutover flag beside it exists (`<path's folder>\cutover.flag`), `gate.exe`'s `v1\slot-counts.json` beside it read
+/// strictly. A flag that cannot be looked for reads as absent.
 #[must_use]
 pub fn read_slot_count_setting(path: &Path) -> SlotCounts {
-    kept_counts(&read_counts_file(path), path)
+    match Generation::detect_in(&counts_folder(path)).unwrap_or(Generation::PowerShell) {
+        Generation::PowerShell => kept_counts(&read_counts_file(path), path),
+        Generation::V1 => {
+            let v1_path = v1_counts_beside(path);
+            v1_kept_counts(&v1::read_counts_file(&v1_path), &v1_path)
+        }
+    }
+}
+
+/// The counts in `gate.exe`'s counts file `file`, read from `path`, that it would use.
+fn v1_kept_counts(file: &v1::CountsFile, path: &Path) -> SlotCounts {
+    let [heavy, light] = v1::pool_counts_of(file, path, 1);
+    SlotCounts {
+        heavy: heavy.set,
+        light: light.set,
+    }
+}
+
+/// The folder of the counts file at `path`, which holds the cutover flag and the `v1` folder.
+fn counts_folder(path: &Path) -> PathBuf {
+    path.parent().map_or_else(PathBuf::new, Path::to_path_buf)
 }
 
 /// The counts in `file`, read from `path`, that the gate would use.
@@ -181,14 +220,50 @@ fn kept_counts(file: &CountsFile, path: &Path) -> SlotCounts {
     counts
 }
 
-/// Writes the counts where the gate reads them, as compact JSON without a byte order mark: beside the file first, then
-/// moved over it. Empty counts delete the file, so a machine back at its defaults holds none. A gate reading the file
-/// blocks the move and the delete for that moment, so each is tried up to ten times, 100 ms apart.
+/// Writes the counts where both gates read them, as compact JSON without a byte order mark: the PowerShell gate's file
+/// at `path` (`{"heavy":4}`) and `gate.exe`'s `v1\slot-counts.json` beside it with `v` first (`{"v":1,"heavy":4}`),
+/// making the `v1` folder when it is missing, whether or not the cutover flag exists. The active generation's file is
+/// written first: `gate.exe`'s once the cutover flag beside `path` (`<path's folder>\cutover.flag`) exists, else the
+/// PowerShell gate's. Each is written beside the file first, then moved over it. Empty counts delete both files, so a
+/// machine back at its defaults holds none. A gate reading a file blocks the move and the delete for that moment, so
+/// each is tried up to ten times, 100 ms apart.
 ///
 /// # Errors
 ///
-/// [`WriteError`] when the folder or the file beside it cannot be written, or the move or delete fails every try.
+/// [`WriteError`] naming the cutover flag when whether it exists cannot be told, and nothing is written; else naming
+/// the file when a folder or the file beside it cannot be written, or the move or delete fails every try. A failure on
+/// the first file leaves the second as it was.
 pub fn write_slot_counts(path: &Path, counts: &SlotCounts) -> Result<(), WriteError> {
+    let folder = counts_folder(path);
+    let generation = Generation::detect_in(&folder).map_err(|source| WriteError {
+        path: Generation::flag_in(&folder),
+        source,
+    })?;
+    write_both(path, *counts, generation)
+}
+
+/// Writes `counts` to the PowerShell gate's file at `path` and to `gate.exe`'s beside it, `generation`'s first.
+fn write_both(path: &Path, counts: SlotCounts, generation: Generation) -> Result<(), WriteError> {
+    let v1_path = v1_counts_beside(path);
+    match generation {
+        Generation::PowerShell => {
+            write_counts_file(path, counts, powershell_counts_text)?;
+            write_counts_file(&v1_path, counts, v1::counts_text)
+        }
+        Generation::V1 => {
+            write_counts_file(&v1_path, counts, v1::counts_text)?;
+            write_counts_file(path, counts, powershell_counts_text)
+        }
+    }
+}
+
+/// The PowerShell gate's counts file text, such as `{"heavy":4}`.
+fn powershell_counts_text(counts: SlotCounts) -> serde_json::Result<String> {
+    serde_json::to_string(&counts)
+}
+
+/// Writes `counts` at `path` as `text` gives it, or deletes the file when they are empty.
+fn write_counts_file(path: &Path, counts: SlotCounts, text: fn(SlotCounts) -> serde_json::Result<String>) -> Result<(), WriteError> {
     let fail = |source: io::Error| WriteError {
         path: path.to_path_buf(),
         source,
@@ -199,7 +274,7 @@ pub fn write_slot_counts(path: &Path, counts: &SlotCounts) -> Result<(), WriteEr
         }
         return with_retry(|| remove_if_present(path)).map_err(fail);
     }
-    let text = serde_json::to_string(counts).map_err(|error| fail(io::Error::other(error)))?;
+    let text = text(counts).map_err(|error| fail(io::Error::other(error)))?;
     write_replacing(path, &text).map_err(fail)
 }
 
@@ -253,21 +328,41 @@ fn with_retry(mut operation: impl FnMut() -> io::Result<()>) -> io::Result<()> {
     Err(failure)
 }
 
-/// Sets or unsets one kind's count in the counts file, keeping the other kind's valid value. A file that is not valid
-/// JSON or not a JSON object keeps nothing and is replaced.
+/// Sets or unsets one kind's count, keeping the other kind's valid value in the active generation's file, and writes the
+/// counts to both gates' files, the active one's first ([`write_slot_counts`]). The active file is the PowerShell gate's
+/// at `path`, or once the cutover flag beside it exists, `gate.exe`'s `v1\slot-counts.json` beside it, read strictly;
+/// the other file is only written. A file that is not valid JSON, not a JSON object, or (for `gate.exe`'s) not a v1
+/// counts file keeps nothing and is replaced.
 ///
 /// # Errors
 ///
-/// [`ApplyError::Read`] when the file exists but cannot be read; nothing is then written or deleted.
-/// [`ApplyError::Write`] when the file cannot be written.
+/// [`ApplyError::Read`] when whether the cutover flag exists cannot be told, or the active file exists but cannot be
+/// read; nothing is then written or deleted. [`ApplyError::Write`] when a file cannot be written.
 pub fn apply_slot_count(path: &Path, kind: SlotKind, count: Option<SlotCount>) -> Result<(), ApplyError> {
-    let bytes = read_counts_bytes(path).map_err(|source| ApplyError::Read {
-        path: path.to_path_buf(),
+    let folder = counts_folder(path);
+    let generation = Generation::detect_in(&folder).map_err(|source| ApplyError::Read {
+        path: Generation::flag_in(&folder),
         source,
     })?;
-    let mut counts = kept_counts(&counts_from_bytes(bytes), path);
+    let mut counts = match generation {
+        Generation::PowerShell => {
+            let bytes = read_counts_bytes(path).map_err(|source| ApplyError::Read {
+                path: path.to_path_buf(),
+                source,
+            })?;
+            kept_counts(&counts_from_bytes(bytes), path)
+        }
+        Generation::V1 => {
+            let v1_path = v1_counts_beside(path);
+            let file = match v1::read_counts_file(&v1_path) {
+                Err(v1::FormatError::Io(source)) => return Err(ApplyError::Read { path: v1_path, source }),
+                file => file,
+            };
+            v1_kept_counts(&file, &v1_path)
+        }
+    };
     counts.set(kind, count);
-    write_slot_counts(path, &counts)?;
+    write_both(path, counts, generation)?;
     Ok(())
 }
 

@@ -1,23 +1,28 @@
 //! The dashboard state assembled from the claim files, the arrival tickets, the counts file, the process table and the
-//! slot mutexes.
+//! slot mutexes, of the PowerShell gate or of `gate.exe` as the inputs' [`Generation`] says.
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::path::Path;
 
 use jiff::{SignedDuration, Timestamp};
 use proc_table::{ProcessInfo, ProcessTable, ProcessTree};
 use regex::Regex;
 
 use crate::claims::{Claim, ReadableClaim, Ticket, last_log_line, read_claims, read_tickets};
-use crate::counts::{CountsFile, pool_count, read_counts_file, slot_count_path};
+use crate::counts::{PoolCount, pool_count, read_counts_file, state_counts_path};
 use crate::model::{
-    CriticalState, CwdReader, DashboardState, MutexProbe, PoolState, QueueTicket, RemotePool, SlotKind, SlotRow, SlotState, StateInputs, Waiting,
+    CriticalState, CwdReader, DashboardState, Generation, MutexProbe, PoolState, QueueTicket, RemotePool, SlotKind, SlotRow, SlotState, StateInputs,
+    Waiting,
 };
 use crate::remote::{RemoteCount, read_remote_count, remote_settings_path};
+use crate::v1;
 
 /// How far a live process's start time may be from the one its claim records, in nanoseconds.
 const CLAIM_START_TOLERANCE_NANOS: i128 = 2_000_000_000;
 /// .NET ticks (100 ns) in a second.
 const TICKS_PER_SECOND: i64 = 10_000_000;
+/// .NET ticks in a millisecond, the unit of `gate.exe`'s ticket times.
+const TICKS_PER_MILLISECOND: i128 = 10_000;
 /// .NET ticks from 0001-01-01 to the Unix epoch.
 const UNIX_EPOCH_TICKS: i128 = 621_355_968_000_000_000;
 /// The last .NET tick a `DateTime` can hold, 9999-12-31T23:59:59.9999999.
@@ -28,27 +33,35 @@ const CRITICAL: &str = "critical";
 /// The state the Gates tab shows: the critical request, the queue of arrival tickets, each pool's counts, its slots
 /// and, when it is full or a critical request bars it, the gates waiting for it; then the remote pool, when the gate's
 /// `remote.json` or a remote claim file exists. A gate routed to the remote pool shows only as its queue ticket.
+///
+/// The claims, tickets and counts file are the PowerShell gate's under `gate\` or, for [`Generation::V1`], only
+/// `gate.exe`'s under `gate\v1\`, where a missing folder is an empty state. `gate.exe`'s waiting gates are its live
+/// tickets' gates; the PowerShell gate's are found by their command lines.
 #[must_use]
 pub fn dashboard_state(inputs: &StateInputs, processes: &dyn ProcessTable, mutexes: &dyn MutexProbe, cwds: &dyn CwdReader) -> DashboardState {
     let table = Table::new(processes.snapshot());
-    let gate_dir = inputs.local_app_data.join("gate");
-    let claims = read_claims(&gate_dir.join("slots"), &inputs.slot_prefix);
-    let counts_path = slot_count_path(inputs);
-    let counts_file = read_counts_file(&counts_path);
+    let state_dir = inputs.generation.state_dir(&inputs.local_app_data);
+    let claims = read_claims(&state_dir.join("slots"), &inputs.slot_prefix);
     let machine = Machine {
         table: &table,
         claims: &claims,
         mutexes,
     };
-    let tickets = read_tickets(&gate_dir.join(format!("{}waiting", inputs.slot_prefix)));
-    let queue = table.queue(tickets, inputs.now, cwds);
+    let tickets = read_queue(inputs.generation, &state_dir.join(format!("{}waiting", inputs.slot_prefix)));
+    let queue = table.queue(&tickets, inputs.now, cwds);
+    let waiters = Waiters {
+        generation: inputs.generation,
+        table: &table,
+        tickets: &tickets,
+        cwds,
+    };
     let mut holder = machine.slot_row(format!("{}gate-critical", inputs.slot_prefix), 0);
     holder.extra = None;
     let mut holders = HashSet::new();
     holders.extend(busy_pid(&holder));
     let mut pools = Vec::new();
-    for kind in SlotKind::ALL {
-        let pool = machine.pool_state(kind, inputs, &counts_file, &counts_path);
+    for (kind, counts) in SlotKind::ALL.into_iter().zip(pool_counts(inputs)) {
+        let pool = machine.pool_state(kind, inputs, counts);
         holders.extend(pool.slots.iter().filter_map(busy_pid));
         pools.push(pool);
     }
@@ -65,7 +78,7 @@ pub fn dashboard_state(inputs: &StateInputs, processes: &dyn ProcessTable, mutex
         // A gate takes a free slot within 2 s, so with one free no gate of the kind is waiting unless it is barred.
         let full = !pool.slots.iter().any(|slot| slot.state == SlotState::Free && slot.extra != Some(true));
         if full || barred {
-            pool.waiting = table.waiting(pool.kind.as_str(), &held_out, cwds);
+            pool.waiting = waiters.of(pool.kind.as_str(), &held_out);
         }
         if critical_held {
             for slot in &mut pool.slots {
@@ -73,7 +86,7 @@ pub fn dashboard_state(inputs: &StateInputs, processes: &dyn ProcessTable, mutex
             }
         }
     }
-    let waiting = table.waiting(CRITICAL, &holders, cwds);
+    let waiting = waiters.of(CRITICAL, &holders);
     DashboardState {
         now: iso_utc(inputs.now),
         machine: inputs.machine.clone(),
@@ -82,6 +95,77 @@ pub fn dashboard_state(inputs: &StateInputs, processes: &dyn ProcessTable, mutex
         queue,
         pools,
         remote,
+    }
+}
+
+/// Each pool's counts, heavy then light, from the generation's counts file: the PowerShell gate's read leniently, or
+/// `gate.exe`'s read strictly, so a file without `"v":1` is ignored as `gate.exe` ignores it.
+fn pool_counts(inputs: &StateInputs) -> [PoolCount; 2] {
+    let path = state_counts_path(inputs);
+    match inputs.generation {
+        Generation::PowerShell => {
+            let file = read_counts_file(&path);
+            SlotKind::ALL.map(|kind| pool_count(&file, &path, kind, inputs.processors))
+        }
+        Generation::V1 => v1::read_pool_counts(&path, inputs.processors),
+    }
+}
+
+/// The arrival tickets in `dir`, in queue order: the PowerShell gate's by arrival, those that arrived together in the
+/// folder's order; `gate.exe`'s by arrival in epoch milliseconds, then by pid ([`v1::Ticket::queue_order`]), their times
+/// turned into ticks. A ticket that cannot be read, or is not of the generation's format, is left out, and a folder that
+/// is missing or cannot be listed holds none.
+fn read_queue(generation: Generation, dir: &Path) -> Vec<Ticket> {
+    match generation {
+        Generation::PowerShell => {
+            let mut tickets = read_tickets(dir);
+            tickets.sort_by_key(|ticket| ticket.arrived_ticks);
+            tickets
+        }
+        Generation::V1 => {
+            let Ok(read) = v1::read_tickets(dir) else {
+                return Vec::new();
+            };
+            let mut tickets: Vec<v1::Ticket> = read.into_iter().filter_map(|(_, ticket)| ticket.ok()).collect();
+            tickets.sort_by_key(v1::Ticket::queue_order);
+            tickets.iter().filter_map(ticket_from_v1).collect()
+        }
+    }
+}
+
+/// A `gate.exe` ticket with its times in ticks, or `None` when one is past what ticks hold.
+fn ticket_from_v1(ticket: &v1::Ticket) -> Option<Ticket> {
+    Some(Ticket {
+        kind: ticket.kind.as_str().to_owned(),
+        holds: ticket.holds,
+        pid: ticket.pid,
+        start_ticks: ticks_of_ms(ticket.start_ms)?,
+        arrived_ticks: ticks_of_ms(ticket.arrived)?,
+        remote: ticket.remote == Some(true),
+        exact_start_ms: Some(ticket.start_ms),
+    })
+}
+
+/// Unix epoch milliseconds as .NET ticks, or `None` past what an `i64` holds.
+fn ticks_of_ms(ms: u64) -> Option<i64> {
+    i64::try_from(i128::from(ms) * TICKS_PER_MILLISECOND + UNIX_EPOCH_TICKS).ok()
+}
+
+/// Where the gates waiting for a slot come from: the PowerShell gate's command lines, or `gate.exe`'s tickets.
+struct Waiters<'a> {
+    generation: Generation,
+    table: &'a Table,
+    tickets: &'a [Ticket],
+    cwds: &'a dyn CwdReader,
+}
+
+impl Waiters<'_> {
+    /// The gates waiting for a slot of the kind (`heavy`, `light` or `critical`), leaving out the pids `held_out`.
+    fn of(&self, kind: &str, held_out: &HashSet<u32>) -> Vec<Waiting> {
+        match self.generation {
+            Generation::PowerShell => self.table.waiting(kind, held_out, self.cwds),
+            Generation::V1 => self.table.ticket_waiting(self.tickets, kind, held_out, self.cwds),
+        }
     }
 }
 
@@ -205,31 +289,52 @@ impl Table {
         waiting
     }
 
-    /// The live gates' tickets, oldest first; tickets that arrived together keep the folder's order.
-    fn queue(&self, tickets: Vec<Ticket>, now: Timestamp, cwds: &dyn CwdReader) -> Vec<QueueTicket> {
-        let now = ticks_of(now);
-        let mut live: Vec<(i64, QueueTicket)> = tickets
-            .into_iter()
-            .filter_map(|ticket| Some((ticket.arrived_ticks, self.queue_row(ticket, now, cwds)?)))
-            .collect();
-        live.sort_by_key(|(arrived, _)| *arrived);
-        live.into_iter().map(|(_, row)| row).collect()
+    /// The gates waiting for a slot of the kind, from `gate.exe`'s tickets: each live ticket of the kind that is local,
+    /// does not hold the machine and is not `held_out`, its gate's start as `since` and its command line as the process
+    /// table has it (empty when it could not be read).
+    fn ticket_waiting(&self, tickets: &[Ticket], kind: &str, held_out: &HashSet<u32>, cwds: &dyn CwdReader) -> Vec<Waiting> {
+        tickets
+            .iter()
+            .filter(|ticket| ticket.kind == kind && !ticket.holds && !ticket.remote && !held_out.contains(&ticket.pid))
+            .filter_map(|ticket| {
+                let process = self.ticket_process(ticket)?;
+                Some(Waiting {
+                    pid: ticket.pid,
+                    since: format_ticks(ticket.start_ticks),
+                    cwd: cwds.current_dir(ticket.pid),
+                    command_line: process.command_line.clone().unwrap_or_default(),
+                })
+            })
+            .collect()
     }
 
-    /// The ticket's row, or `None` when its gate has ended (no process with its pid started within 2 s of its start
-    /// ticks) or its arrival is no moment a `DateTime` holds.
-    fn queue_row(&self, ticket: Ticket, now: i128, cwds: &dyn CwdReader) -> Option<QueueTicket> {
+    /// The live gates' tickets, in the order given.
+    fn queue(&self, tickets: &[Ticket], now: Timestamp, cwds: &dyn CwdReader) -> Vec<QueueTicket> {
+        let now = ticks_of(now);
+        tickets.iter().filter_map(|ticket| self.queue_row(ticket, now, cwds)).collect()
+    }
+
+    /// The process of the ticket's gate, or `None` when it has ended: no process with its pid started at the ticket's
+    /// start, to the millisecond for a `gate.exe` ticket, within 2 s for a PowerShell one.
+    fn ticket_process(&self, ticket: &Ticket) -> Option<&ProcessInfo> {
         let process = self.get(ticket.pid)?;
-        let created = ticks_of(process.created?);
-        if (created - i128::from(ticket.start_ticks)).abs() >= i128::from(2 * TICKS_PER_SECOND) {
-            return None;
-        }
+        let created = process.created?;
+        let live = match ticket.exact_start_ms {
+            Some(start_ms) => created.as_millisecond().unsigned_abs() == start_ms,
+            None => (ticks_of(created) - i128::from(ticket.start_ticks)).abs() < i128::from(2 * TICKS_PER_SECOND),
+        };
+        live.then_some(process)
+    }
+
+    /// The ticket's row, or `None` when its gate has ended or its arrival is no moment a `DateTime` holds.
+    fn queue_row(&self, ticket: &Ticket, now: i128, cwds: &dyn CwdReader) -> Option<QueueTicket> {
+        let process = self.ticket_process(ticket)?;
         Some(QueueTicket {
             arrived: format_ticks(ticket.arrived_ticks)?,
             age_seconds: age_seconds(now, ticket.arrived_ticks),
             cwd: cwds.current_dir(ticket.pid),
             command_line: process.command_line.clone(),
-            kind: ticket.kind,
+            kind: ticket.kind.clone(),
             holds: ticket.holds,
             remote: ticket.remote,
             pid: ticket.pid,
@@ -253,8 +358,7 @@ struct Machine<'a> {
 }
 
 impl Machine<'_> {
-    fn pool_state(&self, kind: SlotKind, inputs: &StateInputs, counts_file: &CountsFile, counts_path: &std::path::Path) -> PoolState {
-        let counts = pool_count(counts_file, counts_path, kind, inputs.processors);
+    fn pool_state(&self, kind: SlotKind, inputs: &StateInputs, counts: PoolCount) -> PoolState {
         let count = counts.set.map_or(counts.default, crate::model::SlotCount::get);
         let prefix = format!("{}{}", inputs.slot_prefix, kind.prefix());
         PoolState {

@@ -5,6 +5,7 @@
 mod archive;
 mod counts;
 mod critical;
+mod cutover;
 mod fixtures;
 mod journal;
 mod journal_write;

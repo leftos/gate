@@ -16,8 +16,8 @@ use serde::de::{self, DeserializeOwned, DeserializeSeed, MapAccess, SeqAccess, V
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
 
-use crate::counts::{ignored_line, write_replacing};
-use crate::model::{SlotCount, SlotKind};
+use crate::counts::{PoolCount, ignored_line, write_replacing};
+use crate::model::{SlotCount, SlotCounts, SlotKind};
 use crate::root::KernelObject;
 
 /// The only format version this module reads and the one it writes, as `v`.
@@ -204,6 +204,18 @@ pub enum TicketKind {
     Critical,
 }
 
+impl TicketKind {
+    /// The kind as a ticket writes it: `heavy`, `light` or `critical`.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TicketKind::Heavy => "heavy",
+            TicketKind::Light => "light",
+            TicketKind::Critical => "critical",
+        }
+    }
+}
+
 /// The arrival ticket a waiting gate writes at `waiting\<pid>-<start>.json`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -276,8 +288,9 @@ pub fn write_ticket(path: &Path, ticket: &Ticket) -> io::Result<()> {
 }
 
 /// Reads every `*.json` ticket in `dir`, sorted by file name, each with its path and what reading it gave; a missing
-/// folder holds none. A temporary `*.tmp` file is skipped. Whether a ticket's gate is still alive, and deleting the
-/// ticket of one that is not, is the gate's job, not this reader's.
+/// folder holds none. A temporary `*.tmp` file is skipped, as is an entry the listing could not read or tell the type
+/// of. Whether a ticket's gate is still alive, and deleting the ticket of one that is not, is the gate's job, not this
+/// reader's.
 ///
 /// # Errors
 ///
@@ -289,10 +302,10 @@ pub fn read_tickets(dir: &Path) -> io::Result<Vec<(PathBuf, Result<Ticket, Forma
         Err(error) => return Err(error),
     };
     let mut paths = Vec::new();
-    for entry in entries {
-        let entry = entry?;
+    for entry in entries.flatten() {
         let path = entry.path();
-        if entry.file_type()?.is_file() && path.extension().is_some_and(|extension| extension == "json") {
+        let is_file = entry.file_type().is_ok_and(|file_type| file_type.is_file());
+        if is_file && path.extension().is_some_and(|extension| extension == "json") {
             paths.push(path);
         }
     }
@@ -333,22 +346,51 @@ pub struct Counts {
 /// not a whole number from 1 to 64 gives that pool alone its default and a line.
 #[must_use]
 pub fn read_counts(path: &Path, processors: usize) -> Counts {
-    let file = match read_text(path) {
-        Err(FormatError::Io(error)) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error),
-        Ok(text) => parse_strict::<Map<String, Value>>(&text).map(Some),
-    };
+    let [heavy, light] = read_pool_counts(path, processors);
     Counts {
-        heavy: pool_setting(&file, path, SlotKind::Heavy, processors),
-        light: pool_setting(&file, path, SlotKind::Light, processors),
+        heavy: pool_setting(heavy),
+        light: pool_setting(light),
     }
 }
 
-fn pool_setting(file: &Result<Option<Map<String, Value>>, FormatError>, path: &Path, kind: SlotKind, processors: usize) -> PoolSetting {
+/// The counts file at `path` read as [`read_counts`] reads it, heavy then light, keeping whether the file set each value
+/// (the Gates tab shows a set value even when it equals the default).
+pub(crate) fn read_pool_counts(path: &Path, processors: usize) -> [PoolCount; 2] {
+    pool_counts_of(&read_counts_file(path), path, processors)
+}
+
+/// A counts file read strictly: `Ok(None)` when it does not exist, `Err` when it cannot be read or is not a v1 counts
+/// file.
+pub(crate) type CountsFile = Result<Option<Map<String, Value>>, FormatError>;
+
+/// The counts file at `path`, read strictly.
+pub(crate) fn read_counts_file(path: &Path) -> CountsFile {
+    match read_text(path) {
+        Err(FormatError::Io(error)) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+        Ok(text) => parse_strict::<Map<String, Value>>(&text).map(Some),
+    }
+}
+
+/// Each pool's counts, heavy then light, in the counts `file` read from `path`.
+pub(crate) fn pool_counts_of(file: &CountsFile, path: &Path, processors: usize) -> [PoolCount; 2] {
+    SlotKind::ALL.map(|kind| pool_count(file, path, kind, processors))
+}
+
+/// The count a pool's read gives the gate: the file's value, else the default.
+fn pool_setting(pool: PoolCount) -> PoolSetting {
+    PoolSetting {
+        count: pool.set.map_or(pool.default, SlotCount::get),
+        ignored: pool.problem,
+    }
+}
+
+fn pool_count(file: &CountsFile, path: &Path, kind: SlotKind, processors: usize) -> PoolCount {
     let default = kind.default_count(processors);
-    let ignored = |reason: &dyn fmt::Display| PoolSetting {
-        count: default,
-        ignored: Some(ignored_line(path, reason, default, kind)),
+    let ignored = |reason: &dyn fmt::Display| PoolCount {
+        default,
+        set: None,
+        problem: Some(ignored_line(path, reason, default, kind)),
     };
     let value = match file {
         Ok(Some(counts)) => counts.get(kind.as_str()),
@@ -356,16 +398,18 @@ fn pool_setting(file: &Result<Option<Map<String, Value>>, FormatError>, path: &P
         Err(error) => return ignored(error),
     };
     let Some(value) = value else {
-        return PoolSetting {
-            count: default,
-            ignored: None,
+        return PoolCount {
+            default,
+            set: None,
+            problem: None,
         };
     };
     let count = value.as_u64().and_then(|count| u32::try_from(count).ok()).and_then(SlotCount::new);
     match count {
-        Some(count) => PoolSetting {
-            count: count.get(),
-            ignored: None,
+        Some(count) => PoolCount {
+            default,
+            set: Some(count),
+            problem: None,
         },
         None => ignored(&format!(
             "\"{}\" must be a whole number from {} to {}",
@@ -396,6 +440,15 @@ struct Versioned<'a, T> {
 fn write_versioned<T: Serialize>(path: &Path, body: &T) -> io::Result<()> {
     let text = serde_json::to_string(&Versioned { v: FORMAT_VERSION, body }).map_err(io::Error::other)?;
     write_replacing(path, &text)
+}
+
+/// The counts file's text as `gate.exe` reads it: compact JSON, `v` first, then the set counts heavy then light, such as
+/// `{"v":1,"heavy":4}`.
+pub(crate) fn counts_text(counts: SlotCounts) -> serde_json::Result<String> {
+    serde_json::to_string(&Versioned {
+        v: FORMAT_VERSION,
+        body: &counts,
+    })
 }
 
 /// Parses `text` strictly: JSON with no duplicate key at any depth, an object whose `v` is the number 1, then the

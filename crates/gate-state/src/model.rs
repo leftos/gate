@@ -1,6 +1,7 @@
 //! The dashboard's state as the page reads it, the slot kinds and counts, and the seams a caller supplies.
 
-use std::path::PathBuf;
+use std::io;
+use std::path::{Path, PathBuf};
 
 use jiff::Timestamp;
 use serde::Serialize;
@@ -180,6 +181,63 @@ impl SlotCounts {
     }
 }
 
+/// The name of the cutover flag, a file in `%LOCALAPPDATA%\gate` whose presence, whatever it holds, hands the machine
+/// from the PowerShell gate to `gate.exe`.
+const CUTOVER_FLAG: &str = "cutover.flag";
+
+/// Which gate's files the state and the journal are read from: the PowerShell gate's until the cutover flag exists,
+/// then only `gate.exe`'s.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Generation {
+    /// The PowerShell gate's files under `<local app data>\gate`, read leniently, its tickets in .NET ticks.
+    PowerShell,
+    /// `gate.exe`'s files under its default state root `<local app data>\gate\v1`: the counts file and tickets read
+    /// strictly as v1 formats, the tickets in Unix epoch milliseconds, and the waiting gates taken from the tickets.
+    V1,
+}
+
+impl Generation {
+    /// The cutover flag, `<local app data>\gate\cutover.flag`.
+    #[must_use]
+    pub fn cutover_flag(local_app_data: &Path) -> PathBuf {
+        Self::flag_in(&local_app_data.join("gate"))
+    }
+
+    /// [`Generation::V1`] when the cutover flag exists, else [`Generation::PowerShell`].
+    ///
+    /// # Errors
+    ///
+    /// The io error when whether the flag exists cannot be told, such as access to its folder being denied.
+    pub fn detect(local_app_data: &Path) -> io::Result<Self> {
+        Self::detect_in(&local_app_data.join("gate"))
+    }
+
+    /// The cutover flag in `folder`, the one holding the PowerShell gate's counts file: `<folder>\cutover.flag`.
+    pub(crate) fn flag_in(folder: &Path) -> PathBuf {
+        folder.join(CUTOVER_FLAG)
+    }
+
+    /// [`Generation::V1`] when the cutover flag in `folder` exists, else [`Generation::PowerShell`].
+    pub(crate) fn detect_in(folder: &Path) -> io::Result<Self> {
+        if Self::flag_in(folder).try_exists()? {
+            Ok(Self::V1)
+        } else {
+            Ok(Self::PowerShell)
+        }
+    }
+
+    /// The folder holding the generation's `slots`, `waiting` folder, counts file and journal: `<local app data>\gate`
+    /// for the PowerShell gate, `<local app data>\gate\v1` for `gate.exe`. A missing folder reads as an empty one.
+    #[must_use]
+    pub fn state_dir(self, local_app_data: &Path) -> PathBuf {
+        let gate = local_app_data.join("gate");
+        match self {
+            Generation::PowerShell => gate,
+            Generation::V1 => gate.join("v1"),
+        }
+    }
+}
+
 /// What the state assembly takes from its caller rather than reading for itself.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StateInputs {
@@ -189,16 +247,19 @@ pub struct StateInputs {
     pub machine: String,
     /// The machine's logical processor count, from which each pool's default count follows.
     pub processors: usize,
-    /// The per-user local application data folder, under which the PowerShell gate keeps `gate\slots` and
-    /// `gate\slot-counts.json`, and under which `gate\remote.json` lives for both generations. `gate.exe`'s own counts
-    /// are under its state root (`v1::counts_path`).
+    /// The per-user local application data folder, under which each generation's state folder sits
+    /// ([`Generation::state_dir`]), the cutover flag is, and `gate\remote.json` lives for both generations.
     pub local_app_data: PathBuf,
-    /// The counts file to use in place of the per-user one (the gate's `GATE_TEST_SLOT_COUNTS`), for tests only.
+    /// The PowerShell gate's counts file to use in place of the per-user one (the gate's `GATE_TEST_SLOT_COUNTS`), for
+    /// tests only; for [`Generation::V1`] the counts file read is `v1\slot-counts.json` beside it, which a counts edit
+    /// writes too.
     pub slot_counts_override: Option<PathBuf>,
-    /// The prefix the gate's self-test puts in front of the slot and critical mutex names, their claim files' names and
-    /// the `gate\waiting` folder's name (the gate's `GATE_TEST_SLOT_PREFIX`), for tests only; empty otherwise. With a
-    /// prefix set, only claims carrying it are read.
+    /// The prefix the gate's self-test puts in front of the slot and critical mutex names, their claim files' names, the
+    /// `waiting` folder's name and the journal's (the gate's `GATE_TEST_SLOT_PREFIX`), for tests only; empty otherwise.
+    /// With a prefix set, only claims carrying it are read. It applies in the state folder of either generation.
     pub slot_prefix: String,
+    /// Whose files are read: [`Generation::detect`] gives it from the cutover flag.
+    pub generation: Generation,
 }
 
 /// Whether a gate slot's mutex exists.

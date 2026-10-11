@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use jiff::Timestamp;
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use serde_json::{Map, Value};
 
 use crate::archive::archive_rolled_journal;
@@ -134,6 +135,9 @@ pub enum JournalEvent {
 /// What a critical gate found as it took the machine, which its `take` line carries after `waitedSeconds`: the counts
 /// of the pass that took it, the slots other gates hold within them, and the other gates' live claims or why they could
 /// not be read.
+///
+/// It serializes as the line has it, `{"counts", "otherHeld", "otherClaims"}` or `{"counts", "otherHeld",
+/// "snapshotError"}`, and reads back only from an object holding exactly one of the last two.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MachineSnapshot {
     /// The heavy and light counts, as `counts`.
@@ -145,15 +149,60 @@ pub struct MachineSnapshot {
     pub other_claims: Result<Vec<OtherClaim>, String>,
 }
 
+/// A [`MachineSnapshot`]'s JSON fields: `otherClaims` and `snapshotError` both optional, so reading one checks that
+/// exactly one is there.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SnapshotFields {
+    counts: HeavyLight,
+    other_held: HeavyLight,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    other_claims: Option<Vec<OtherClaim>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    snapshot_error: Option<String>,
+}
+
+impl Serialize for MachineSnapshot {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let (other_claims, snapshot_error) = match &self.other_claims {
+            Ok(claims) => (Some(claims.clone()), None),
+            Err(reason) => (None, Some(reason.clone())),
+        };
+        SnapshotFields {
+            counts: self.counts,
+            other_held: self.other_held,
+            other_claims,
+            snapshot_error,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for MachineSnapshot {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let fields = SnapshotFields::deserialize(deserializer)?;
+        let other_claims = match (fields.other_claims, fields.snapshot_error) {
+            (Some(claims), None) => Ok(claims),
+            (None, Some(reason)) => Err(reason),
+            _ => return Err(de::Error::custom("a machine snapshot has exactly one of otherClaims and snapshotError")),
+        };
+        Ok(Self {
+            counts: fields.counts,
+            other_held: fields.other_held,
+            other_claims,
+        })
+    }
+}
+
 /// A number for each local pool, written as `{"heavy": <n>, "light": <n>}`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HeavyLight {
     pub heavy: u32,
     pub light: u32,
 }
 
 /// Another gate's live claim as a critical gate's `take` lists it, written as `{pid, kind, index, command, file}`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OtherClaim {
     /// The claiming gate's pid.
     pub pid: u32,
@@ -370,34 +419,10 @@ fn insert_own_fields(line: &mut Map<String, Value>, event: &JournalEvent) {
 
 /// Inserts a critical take's snapshot: `counts`, `otherHeld`, then `otherClaims` or `snapshotError`.
 fn insert_machine(line: &mut Map<String, Value>, machine: &MachineSnapshot) {
-    line.insert("counts".to_owned(), heavy_light(machine.counts));
-    line.insert("otherHeld".to_owned(), heavy_light(machine.other_held));
-    match &machine.other_claims {
-        Ok(claims) => {
-            let claims = claims.iter().map(other_claim).collect();
-            line.insert("otherClaims".to_owned(), Value::Array(claims));
-        }
-        Err(reason) => {
-            line.insert("snapshotError".to_owned(), Value::from(reason.as_str()));
-        }
+    // The snapshot is numbers, strings and arrays of objects with string keys, which always serialize to an object.
+    if let Ok(Value::Object(fields)) = serde_json::to_value(machine) {
+        line.extend(fields);
     }
-}
-
-fn heavy_light(pair: HeavyLight) -> Value {
-    let mut object = Map::new();
-    object.insert("heavy".to_owned(), Value::from(pair.heavy));
-    object.insert("light".to_owned(), Value::from(pair.light));
-    Value::Object(object)
-}
-
-fn other_claim(claim: &OtherClaim) -> Value {
-    let mut object = Map::new();
-    object.insert("pid".to_owned(), Value::from(claim.pid));
-    object.insert("kind".to_owned(), Value::from(claim.kind.as_str()));
-    object.insert("index".to_owned(), Value::from(claim.index));
-    object.insert("command".to_owned(), Value::from(claim.command.as_str()));
-    object.insert("file".to_owned(), Value::from(claim.file.as_str()));
-    Value::Object(object)
 }
 
 fn event_name(event: &JournalEvent) -> &'static str {

@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use gate_state::{CwdReader, DashboardState, MutexProbe, PoolState, SlotKind, StateInputs, dashboard_state};
+use gate_state::{CwdReader, DashboardState, Generation, MutexProbe, PoolState, SlotKind, StateInputs, dashboard_state};
 use jiff::Timestamp;
 use proc_table::{ProcessInfo, ProcessTable};
 use serde_json::{Value, json};
@@ -37,6 +37,11 @@ pub fn ticks(text: &str) -> i64 {
     i64::try_from(ts(text).as_nanosecond().div_euclid(100) + UNIX_EPOCH_TICKS).expect("a test moment fits in ticks")
 }
 
+/// A test timestamp as Unix epoch milliseconds, the unit of a v1 ticket's `arrived` and `startTicks`.
+pub fn ms(text: &str) -> u64 {
+    u64::try_from(ts(text).as_millisecond()).expect("a test moment is after the epoch")
+}
+
 pub struct Machine {
     pub dir: PathBuf,
     pub processes: Vec<ProcessInfo>,
@@ -63,6 +68,17 @@ impl Machine {
         }
     }
 
+    /// A machine past the cutover: `gate\cutover.flag` set, and empty `gate\v1\slots` and `gate\v1\waiting` folders.
+    pub fn v1(test: &str) -> Self {
+        let machine = Self::new(test);
+        for folder in ["slots", "waiting"] {
+            fs::create_dir_all(machine.v1_root().join(folder)).expect("the test's v1 folders can be made");
+        }
+        machine.set_flag();
+        machine
+    }
+
+    /// The inputs `live_inputs` would give on this machine: the generation follows the cutover flag.
     pub fn inputs(&self) -> StateInputs {
         StateInputs {
             now: ts(NOW),
@@ -71,7 +87,37 @@ impl Machine {
             local_app_data: self.dir.clone(),
             slot_counts_override: None,
             slot_prefix: self.prefix.clone(),
+            generation: Generation::detect(&self.dir).expect("the cutover flag can be looked for"),
         }
+    }
+
+    /// gate.exe's default state root, `gate\v1`.
+    pub fn v1_root(&self) -> PathBuf {
+        self.dir.join("gate").join("v1")
+    }
+
+    /// Sets the cutover flag, `gate\cutover.flag`.
+    pub fn set_flag(&self) {
+        fs::write(self.dir.join("gate").join("cutover.flag"), "").expect("the cutover flag can be written");
+    }
+
+    /// gate.exe's counts file, `gate\v1\slot-counts.json`.
+    pub fn v1_counts_path(&self) -> PathBuf {
+        self.v1_root().join("slot-counts.json")
+    }
+
+    /// Writes a claim into `gate\v1\slots`.
+    pub fn write_v1_claim(&self, file_name: &str, text: &str) {
+        let dir = self.v1_root().join("slots");
+        fs::create_dir_all(&dir).expect("the v1 slots folder can be made");
+        fs::write(dir.join(file_name), text).expect("a v1 claim can be written");
+    }
+
+    /// Writes an arrival ticket into `gate\v1\waiting`.
+    pub fn write_v1_ticket(&self, file_name: &str, text: &str) {
+        let dir = self.v1_root().join("waiting");
+        fs::create_dir_all(&dir).expect("the v1 ticket folder can be made");
+        fs::write(dir.join(file_name), text).expect("a v1 ticket can be written");
     }
 
     pub fn state(&self) -> DashboardState {

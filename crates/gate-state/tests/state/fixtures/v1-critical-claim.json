@@ -1,0 +1,1 @@
+{"v":1,"kind":"critical","index":0,"pid":52000,"processStart":"2026-10-01T11:00:00.5000000Z","started":"2026-10-01T11:00:05.0000000Z","cwd":"C:\\work\\repo","command":"cargo test --workspace","log":"C:\\work\\repo\\.tmp\\critical.log","timeoutSeconds":1800.0}

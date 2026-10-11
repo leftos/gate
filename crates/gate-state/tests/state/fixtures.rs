@@ -319,6 +319,8 @@ fn captured_journal_is_read_into_runs() {
             repo: Some("repo".to_owned()),
             kind: "light".to_owned(),
             slot: None,
+            slots: Vec::new(),
+            machine: None,
             remote: false,
             host: None,
             fallback: None,
@@ -344,6 +346,8 @@ fn captured_journal_is_read_into_runs() {
             repo: Some("repo".to_owned()),
             kind: "light".to_owned(),
             slot: None,
+            slots: Vec::new(),
+            machine: None,
             remote: false,
             host: None,
             fallback: None,
@@ -402,53 +406,43 @@ fn powershell_journal_is_read_into_runs() {
         ],
         "newest first: the abandoned gate, the gate that waited, the sleep, exit 3, exit 0; ops72-gate-light-slot-0 is slot 0"
     );
-    assert_eq!(
-        history.runs[4],
-        HistoryRun {
-            command: "cmd /c exit 0".to_owned(),
-            cwd: Some(r"C:\work\repo".to_owned()),
-            repo: Some("repo".to_owned()),
-            kind: "light".to_owned(),
-            slot: Some(0),
-            remote: false,
-            host: None,
-            fallback: None,
-            parent_pid: None,
-            state: RunState::Ok,
-            queued: Some("2026-10-03T05:04:39.1209178Z".to_owned()),
-            started: Some("2026-10-03T05:04:39.1866333Z".to_owned()),
-            waited_seconds: Some(0.065),
-            held_seconds: Some(0.105),
-            status: Some(0),
-            verdict: None,
-            wall_seconds: None,
-            adjusted_seconds: None,
-            abandoned: Vec::new(),
-        }
-    );
+    let exit_0 = HistoryRun {
+        command: "cmd /c exit 0".to_owned(),
+        cwd: Some(r"C:\work\repo".to_owned()),
+        repo: Some("repo".to_owned()),
+        kind: "light".to_owned(),
+        slot: Some(0),
+        slots: vec![r"Local\ops72-gate-light-slot-0".to_owned()],
+        machine: None,
+        remote: false,
+        host: None,
+        fallback: None,
+        parent_pid: None,
+        state: RunState::Ok,
+        queued: Some("2026-10-03T05:04:39.1209178Z".to_owned()),
+        started: Some("2026-10-03T05:04:39.1866333Z".to_owned()),
+        waited_seconds: Some(0.065),
+        held_seconds: Some(0.105),
+        status: Some(0),
+        verdict: None,
+        wall_seconds: None,
+        adjusted_seconds: None,
+        abandoned: Vec::new(),
+    };
+    assert_eq!(history.runs[4], exit_0);
     assert_eq!(
         history.runs[3],
         HistoryRun {
             command: "cmd /c exit 3".to_owned(),
-            cwd: Some(r"C:\work\repo".to_owned()),
-            repo: Some("repo".to_owned()),
-            kind: "light".to_owned(),
-            slot: Some(0),
-            remote: false,
-            host: None,
-            fallback: None,
-            parent_pid: None,
             state: RunState::Failed,
             queued: Some("2026-10-03T05:04:39.6873680Z".to_owned()),
             started: Some("2026-10-03T05:04:39.7589416Z".to_owned()),
             waited_seconds: Some(0.071),
             held_seconds: Some(0.096),
             status: Some(3),
-            verdict: None,
-            wall_seconds: None,
-            adjusted_seconds: None,
-            abandoned: Vec::new(),
-        }
+            ..exit_0
+        },
+        "on the same slot as exit 0"
     );
     assert_eq!(
         history.runs[1].waited_seconds,

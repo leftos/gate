@@ -20,13 +20,22 @@ The three other `remote*` files are written by hand from the gate's remote-slot 
 
 ## The v1 reference examples
 
-The `v1-*` files are the reference examples of the formats `gate.exe` writes under a state root, written by hand from the tables in `docs/design.md` "Formats" as `gate.exe` writes them (compact JSON, `v` first, epoch-millisecond machine times, ISO UTC times with seven fractional digits); `v1.rs` reads them. The files without the prefix are the PowerShell gate's captures and hand-written files described above, apart from `journal.jsonl`.
+The `v1-*` files are the reference examples of the formats `gate.exe` writes under a state root, written by hand from the tables in `docs/design.md` "Formats" as `gate.exe` writes them (compact JSON, `v` first, epoch-millisecond machine times, ISO UTC times with seven fractional digits); `v1.rs` reads them, and `cutover.rs` and `journal.rs` read them as the state and the history read `gate.exe`'s default state root `%LOCALAPPDATA%\gate\v1` once `%LOCALAPPDATA%\gate\cutover.flag` exists.
+
+The files without the prefix are the PowerShell gate's captures and hand-written files described above, apart from `journal.jsonl`.
+
+The claims and tickets other than `v1-claim.json` and `v1-ticket.json` name processes started at `2026-10-01T11:00:00.5Z` (epoch ms `1790852400500`), the start the state tests give their fake processes.
 
 | File | What it is | Where `gate.exe` writes it |
 |---|---|---|
 | `v1-claim.json` | The claim of a heavy gate holding slot 0, with every required field and none of the optional ones. | `<state root>\slots\gate-slot-0.json` |
 | `v1-ticket.json` | The arrival ticket of a light gate waiting in the local queue, `holds` false. | `<state root>\waiting\<pid>-<start>.json`, here `60080-1759439760571.json` |
 | `v1-slot-counts.json` | A counts file setting three heavy and six light slots. | `<state root>\slot-counts.json` |
+| `v1-critical-claim.json` | The claim of critical gate 52000 holding the machine, `kind` `critical` and `index` 0. | `<state root>\slots\gate-critical.json` |
+| `v1-critical-ticket.json` | The ticket critical gate 52000 keeps to its end, `holds` true. | `<state root>\waiting\52000-1790852400500.json` |
+| `v1-remote-claim.json` | The claim of heavy gate 53000 holding remote slot 1: `kind` `remote`, then `remote`, `host` and `key`. | `<state root>\slots\gate-remote-slot-1.json` |
+| `v1-remote-ticket.json` | The ticket of heavy gate 53100 queued for the remote pool, `remote` true. | `<state root>\waiting\53100-1790852400500.json` |
+| `v1-journal.jsonl` | A journal of five gates: light gate 56000 runs on `gate-light-slot-0` and lends it to 55000 (a lone `parent` line) before releasing it; critical gate 52000 takes eight slots with its machine snapshot (`counts`, `otherHeld`, `otherClaims`) and covers light gate 54000 (a lone `covered` line); critical gate 52100's take carries `snapshotError` and it fails. | `<state root>\events.jsonl` |
 
 ## Re-capturing them
 

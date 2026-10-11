@@ -29,7 +29,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Critical gate**: a gate run with `--slot critical`, which takes every heavy and unreserved light slot and runs its command at High priority.
 - **Critical request**: a critical gate's queued ticket and run, from its arrival until it releases the machine; critical requests run one at a time in arrival order.
 - **Cutover**: switching a machine's gates from the PowerShell gate to `gate.exe`; `gate cutover` runs the local one.
-- **Cutover flag**: the file `%LOCALAPPDATA%\gate\cutover.flag`, whose existence tells the PowerShell launcher to hand every call to `gate.exe`.
+- **Cutover flag**: the file `%LOCALAPPDATA%\gate\cutover.flag`, whose existence tells the PowerShell launcher to hand every call to `gate.exe`, and ops-tower's state to read `gate.exe`'s files.
 - **Cutover sweep**: the later change of every calling repo from the PowerShell launcher to `gate` on PATH, after which the PowerShell gate is deleted.
 - **Diagnostics block**: the record of what was running that a kill writes to the log before it terminates the job: the job's processes, the descendants outside the job, the build servers and the last samples.
 - **Drain**: see critical drain.
@@ -38,6 +38,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Fallback**: a routed run that runs locally instead, after its builder refused it, the remote pool stayed full or the remote client could not start; journalled as a `fallback` event with its reason.
 - **Fallback poll**: the short timeout on every slot wait, which re-reads counts and tickets so a dead waiter's ticket is cleared even when no wake event comes.
 - **Free share**: the fraction of the cores the command could use that other work left free in a sample, at least 5%; the load-adjusted clock advances by it.
+- **Generation**: the PowerShell gate or `gate.exe`, as `gate-state` tells them apart (`Generation`): ops-tower reads the PowerShell gate's files until the cutover flag exists and then only `gate.exe`'s.
 - **Heartbeat**: a line printed so a gate around the printer does not read quiet as a stall; the wait heartbeat is a waiting gate's `still waiting` line every 30 s, and the box heartbeat is the `gate-remote-heartbeat: <cpu ms>` line the box wrapper writes while its command's CPU use earns one.
 - **Heavy**: the slot kind for work that keeps several cores busy; its pool's thread budget is 4.
 - **History key**: a journal run's `command` after `gate_state::normalize_command`: split with the C runtime's argument rules, tree flags and their paths dropped, `.tmp` and worktree paths shortened, each word re-quoted; runs with the same key count together.

@@ -3,6 +3,7 @@
 use std::fs;
 use std::thread;
 
+use gate_state::v1::{self, Counts, PoolSetting};
 use gate_state::{ParseError, SlotCount, SlotCounts, SlotKind, SlotState, apply_slot_count, read_slot_count_setting, write_slot_counts};
 use serde_json::{Value, json};
 
@@ -151,15 +152,27 @@ fn write_then_read_round_trips_and_empty_deletes() {
     let bytes = fs::read(&path).expect("the counts file exists");
     assert_eq!(bytes, br#"{"heavy":4,"light":2}"#);
     assert_eq!(read_slot_count_setting(&path), counts);
-    let leftovers: Vec<_> = fs::read_dir(path.parent().expect("the path has a folder"))
-        .expect("the folder exists")
-        .flatten()
-        .map(|entry| entry.file_name())
-        .collect();
-    assert_eq!(leftovers, ["slot-counts.json"], "no temp file is left beside the counts");
+    let folder = path.parent().expect("the path has a folder");
+    let names = |dir: &std::path::Path| -> Vec<_> {
+        fs::read_dir(dir)
+            .expect("the folder exists")
+            .flatten()
+            .map(|entry| entry.file_name())
+            .collect()
+    };
+    assert_eq!(names(folder), ["slot-counts.json", "v1"], "no temp file is left beside the counts");
+    assert_eq!(
+        names(&folder.join("v1")),
+        ["slot-counts.json"],
+        "no temp file is left beside the v1 counts"
+    );
 
     write_slot_counts(&path, &SlotCounts::default()).expect("empty counts delete the file");
     assert!(!path.exists());
+    assert!(
+        !folder.join("v1").join("slot-counts.json").exists(),
+        "empty counts delete the v1 file too"
+    );
     write_slot_counts(&path, &SlotCounts::default()).expect("empty counts with no file are no error");
     assert_eq!(read_slot_count_setting(&path), SlotCounts::default());
 }
@@ -205,6 +218,129 @@ fn concurrent_count_writes_all_succeed() {
         .filter(|name| name.to_string_lossy().ends_with(".tmp"))
         .collect();
     assert!(temps.is_empty(), "no temp file is left beside the counts: {temps:?}");
+}
+
+#[test]
+fn a_counts_edit_writes_both_files() {
+    let machine = Machine::new("a_counts_edit_writes_both_files");
+    let path = machine.counts_path();
+    let v1_path = machine.v1_counts_path();
+    assert!(!machine.v1_root().exists(), "the edit makes the v1 folder");
+
+    apply_slot_count(&path, SlotKind::Heavy, Some(count(4))).expect("a heavy count can be set");
+    apply_slot_count(&path, SlotKind::Light, Some(count(6))).expect("a light count can be set");
+
+    assert_eq!(fs::read_to_string(&path).expect("the counts file exists"), r#"{"heavy":4,"light":6}"#);
+    assert_eq!(
+        fs::read_to_string(&v1_path).expect("the v1 counts file exists"),
+        r#"{"v":1,"heavy":4,"light":6}"#
+    );
+    let setting = |count| PoolSetting { count, ignored: None };
+    assert_eq!(
+        v1::read_counts(&v1_path, 16),
+        Counts {
+            heavy: setting(4),
+            light: setting(6),
+        },
+        "gate.exe reads the v1 file"
+    );
+    machine.set_flag();
+    assert_eq!(
+        pool(&machine.state(), SlotKind::Heavy).set,
+        Some(count(4)),
+        "past the cutover the state reads the v1 file the edit wrote"
+    );
+
+    apply_slot_count(&path, SlotKind::Heavy, None).expect("the heavy count can be unset");
+    assert_eq!(fs::read_to_string(&v1_path).expect("the v1 counts file exists"), r#"{"v":1,"light":6}"#);
+    apply_slot_count(&path, SlotKind::Light, None).expect("the last count can be unset");
+    assert!(!path.exists() && !v1_path.exists(), "counts back at their defaults delete both files");
+}
+
+#[test]
+fn a_v1_counts_edit_keeps_the_v1_values_the_powershell_file_lacks() {
+    let machine = Machine::v1("a_v1_counts_edit_keeps_the_v1_values_the_powershell_file_lacks");
+    let path = machine.counts_path();
+    fs::write(machine.v1_counts_path(), r#"{"v":1,"heavy":5,"light":3}"#).expect("the v1 counts file can be written");
+
+    apply_slot_count(&path, SlotKind::Light, None).expect("the light count can be unset");
+
+    assert_eq!(
+        fs::read_to_string(machine.v1_counts_path()).expect("the v1 counts file is kept"),
+        r#"{"v":1,"heavy":5}"#,
+        "past the cutover the edit starts from the v1 file"
+    );
+    assert_eq!(fs::read_to_string(&path).expect("the PowerShell file is written"), r#"{"heavy":5}"#);
+}
+
+#[cfg(windows)]
+#[test]
+fn a_v1_counts_edit_ignores_an_unreadable_powershell_file() {
+    let machine = Machine::v1("a_v1_counts_edit_ignores_an_unreadable_powershell_file");
+    let path = machine.counts_path();
+    machine.write_counts(r#"{"heavy":3}"#);
+    fs::write(machine.v1_counts_path(), r#"{"v":1,"heavy":5}"#).expect("the v1 counts file can be written");
+
+    let held = hold_unshared(&path);
+    let result = apply_slot_count(&path, SlotKind::Light, Some(count(2)));
+    drop(held);
+
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(
+        fs::read_to_string(machine.v1_counts_path()).expect("the v1 counts file exists"),
+        r#"{"v":1,"heavy":5,"light":2}"#
+    );
+    assert_eq!(fs::read_to_string(&path).expect("the PowerShell file exists"), r#"{"heavy":5,"light":2}"#);
+}
+
+#[test]
+fn a_counts_edit_writes_the_active_generation_first() {
+    for flag in [false, true] {
+        let machine = Machine::new(&format!("a_counts_edit_writes_the_active_generation_first_{flag}"));
+        let path = machine.counts_path();
+        if flag {
+            machine.set_flag();
+        }
+        let (first, second) = if flag {
+            (machine.v1_counts_path(), path.clone())
+        } else {
+            (path.clone(), machine.v1_counts_path())
+        };
+        // A folder where the second file goes: the write's move over it fails every try.
+        fs::create_dir_all(&second).expect("a folder can stand in the second file's place");
+
+        let result = apply_slot_count(&path, SlotKind::Heavy, Some(count(4)));
+
+        let failed = match &result {
+            Err(gate_state::ApplyError::Write(error)) => Some(error.path.clone()),
+            _ => None,
+        };
+        assert_eq!(failed, Some(second.clone()), "flag {flag}: the error names the second file: {result:?}");
+        let text = fs::read_to_string(&first).expect("the first file was written");
+        assert!(text.contains(r#""heavy":4"#), "flag {flag}: {text}");
+    }
+}
+
+#[test]
+fn read_slot_count_setting_reads_the_v1_file_after_the_cutover() {
+    let machine = Machine::v1("read_slot_count_setting_reads_the_v1_file_after_the_cutover");
+    machine.write_counts(r#"{"heavy":4}"#);
+    fs::write(machine.v1_counts_path(), r#"{"v":1,"heavy":5}"#).expect("the v1 counts file can be written");
+
+    assert_eq!(
+        read_slot_count_setting(&machine.counts_path()),
+        SlotCounts {
+            heavy: Some(count(5)),
+            light: None,
+        }
+    );
+
+    fs::write(machine.v1_counts_path(), r#"{"heavy":5}"#).expect("the v1 counts file can be written");
+    assert_eq!(
+        read_slot_count_setting(&machine.counts_path()),
+        SlotCounts::default(),
+        "a v1 file without v sets nothing, as gate.exe reads it"
+    );
 }
 
 #[test]

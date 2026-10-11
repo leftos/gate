@@ -60,6 +60,9 @@ pub(crate) struct Ticket {
     pub arrived_ticks: i64,
     /// True for a heavy gate routed to the remote pool; a ticket without the key is a local one.
     pub remote: bool,
+    /// For a `gate.exe` ticket, the gate's start in Unix epoch milliseconds, which its process's start must match to the
+    /// millisecond as `gate.exe` checks it; `None` for a PowerShell ticket, whose start may be 2 s off.
+    pub exact_start_ms: Option<u64>,
 }
 
 /// The claim files of the slots and of the critical gate in `dir`, keyed by mutex name in lower case: the files named
@@ -135,6 +138,7 @@ fn read_ticket(path: &Path) -> Option<Ticket> {
         start_ticks: object.get("startTicks")?.as_i64()?,
         arrived_ticks: object.get("arrived")?.as_i64()?,
         remote: object.get("remote").and_then(Value::as_bool).unwrap_or(false),
+        exact_start_ms: None,
     })
 }
 

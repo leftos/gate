@@ -9,7 +9,7 @@ use proc_table::win32::{OwnedHandle, open_process, read_parameters_string};
 use windows_sys::Win32::System::Threading::{IsWow64Process, OpenMutexW, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ, SYNCHRONIZATION_SYNCHRONIZE};
 
 use crate::journal::{History, JournalCache};
-use crate::model::{CwdReader, MutexProbe, StateInputs};
+use crate::model::{CwdReader, Generation, MutexProbe, StateInputs};
 
 /// The offset of the `CurrentDirectory` path's `UNICODE_STRING` in 64-bit `RTL_USER_PROCESS_PARAMETERS`.
 const PARAMS_CURRENT_DIRECTORY: usize = 0x38;
@@ -34,6 +34,15 @@ pub enum LiveInputsError {
     /// The processor count the pools' default counts follow could not be read.
     #[error("could not read the processor count: {0}")]
     Processors(#[source] std::io::Error),
+    /// Whether the cutover flag exists, which decides whose files are read, could not be told.
+    #[error("could not tell whether the cutover flag {} exists: {source}", .path.display())]
+    CutoverFlag {
+        /// The cutover flag's path.
+        path: PathBuf,
+        /// What looking for it met.
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 /// Why the gate journal's history could not be read.
@@ -56,17 +65,24 @@ pub enum LiveHistoryError {
 /// The inputs of the state of this machine now, read from its environment and its processor count.
 ///
 /// The machine's name comes from `COMPUTERNAME`, the processor count from the processors this process may run on (as
-/// .NET's `Environment.ProcessorCount` counts them), and the gate's folder from `LOCALAPPDATA`. The test-only
-/// `GATE_TEST_SLOT_COUNTS` and `GATE_TEST_SLOT_PREFIX` are honoured when set and not empty.
+/// .NET's `Environment.ProcessorCount` counts them), the gate's folder from `LOCALAPPDATA`, and the generation whose
+/// files are read from whether `%LOCALAPPDATA%\gate\cutover.flag` exists ([`Generation::detect`]), looked for on every
+/// call. The test-only `GATE_TEST_SLOT_COUNTS` and `GATE_TEST_SLOT_PREFIX` are honoured when set and not empty, in
+/// either generation.
 ///
 /// # Errors
 ///
-/// [`LiveInputsError::MissingVariable`] when `COMPUTERNAME` or `LOCALAPPDATA` is unset or empty, and
-/// [`LiveInputsError::Processors`] when the processor count cannot be read.
+/// [`LiveInputsError::MissingVariable`] when `COMPUTERNAME` or `LOCALAPPDATA` is unset or empty,
+/// [`LiveInputsError::Processors`] when the processor count cannot be read, and [`LiveInputsError::CutoverFlag`] when
+/// whether the flag exists cannot be told.
 pub fn live_inputs() -> Result<StateInputs, LiveInputsError> {
     let machine = required_variable("COMPUTERNAME")?.to_string_lossy().into_owned();
     let local_app_data = PathBuf::from(required_variable("LOCALAPPDATA")?);
     let processors = std::thread::available_parallelism().map_err(LiveInputsError::Processors)?.get();
+    let generation = Generation::detect(&local_app_data).map_err(|source| LiveInputsError::CutoverFlag {
+        path: Generation::cutover_flag(&local_app_data),
+        source,
+    })?;
     Ok(StateInputs {
         now: Timestamp::now(),
         machine,
@@ -74,11 +90,13 @@ pub fn live_inputs() -> Result<StateInputs, LiveInputsError> {
         local_app_data,
         slot_counts_override: optional_variable("GATE_TEST_SLOT_COUNTS").map(PathBuf::from),
         slot_prefix: optional_variable("GATE_TEST_SLOT_PREFIX").map_or_else(String::new, |prefix| prefix.to_string_lossy().into_owned()),
+        generation,
     })
 }
 
-/// The gate journal's history on this machine now, read through `cache` from `%LOCALAPPDATA%\gate` with the
-/// `GATE_TEST_SLOT_PREFIX` [`live_inputs`] reads. An open run's gate is live when its pid is in `processes`, the
+/// The gate journal's history on this machine now, read through `cache` from the state folder of the generation
+/// [`live_inputs`] gives (`%LOCALAPPDATA%\gate`, or `%LOCALAPPDATA%\gate\v1` once the cutover flag exists), with the
+/// `GATE_TEST_SLOT_PREFIX` it reads. An open run's gate is live when its pid is in `processes`, the
 /// caller's process snapshot, and started within 2 s of the `processStart` the journal records; a run's repository is
 /// `repo_of` its folder, the caller's rule. It blocks on the file reads, so an async caller runs it on a blocking thread.
 ///
@@ -92,7 +110,7 @@ pub fn live_history(
     repo_of: impl Fn(&str) -> Option<String>,
 ) -> Result<History, LiveHistoryError> {
     let inputs = live_inputs()?;
-    let dir = inputs.local_app_data.join("gate");
+    let dir = inputs.generation.state_dir(&inputs.local_app_data);
     let is_live = |pid: u32, process_start: &str| {
         let Ok(recorded) = process_start.parse::<Timestamp>() else {
             return false;

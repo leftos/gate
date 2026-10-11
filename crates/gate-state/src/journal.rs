@@ -7,10 +7,12 @@
 //! the local queue, which ends its remote take (no `release` follows for the remote slot): its local `take` follows. A
 //! `parent` line that names a parent gate marks a run on that gate's slot, whether it fell back onto it or was lent it
 //! while a critical request drained; a gate lent the slot before it queued writes only that line, which starts its run.
-//! `covered` lines, a `parent` line naming no parent and every line of the gate's own self-test (a `cwd` holding
-//! `gate-selftest`) are ignored, except that any line's `abandoned` names join a run the cache already knows, and a line
-//! that does not parse is skipped. The folder, the prefix, the clock and the process liveness check all come from the
-//! caller.
+//! A `covered` line, which `gate.exe` writes alone for a gate running under its parent's slot, is a run of its own, on
+//! its parent's slot. A critical gate's `take` carries every slot it took and what it found of the machine. A `parent`
+//! or `covered` line naming no parent and every line of the gate's own self-test (a `cwd` holding `gate-selftest`) are
+//! ignored, except that any line's `abandoned` names join a run the cache already knows, and a line that does not parse
+//! is skipped. The folder (the PowerShell gate's or `gate.exe`'s state root), the prefix, the clock and the process
+//! liveness check all come from the caller.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File};
@@ -22,7 +24,9 @@ use std::time::SystemTime;
 
 use jiff::{SignedDuration, Timestamp};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
+
+use crate::journal_writer::MachineSnapshot;
 
 /// How many of the newest runs the history lists.
 const RECENT_RUNS: usize = 50;
@@ -52,6 +56,9 @@ pub enum RunState {
     /// Ran on its parent gate's slot, fallen back onto it or lent it while a critical request drained: its command ran
     /// under the parent's run, which owns its time.
     Parent,
+    /// Ran under a parent gate whose held slot covers its kind, from a `covered` line: it took no slot and wrote no
+    /// ticket, and its command ran under the parent's run, which owns its time.
+    Covered,
 }
 
 /// One run of a gate, in the JSON shape `GET /api/gate/history` serves.
@@ -69,6 +76,12 @@ pub struct HistoryRun {
     pub kind: String,
     /// The index of the first slot the run took, or `None` when it took none.
     pub slot: Option<u32>,
+    /// Every slot the run's take took, by mutex name as the line writes it (`Local\gate-slot-0`), in line order; a
+    /// critical gate's lists every heavy slot and the light slots it does not keep free. Empty when it took none.
+    pub slots: Vec<String>,
+    /// What a critical gate's take found of the machine: `counts`, `otherHeld`, then `otherClaims` or `snapshotError`;
+    /// `None`, serialized as null, for any other take, a run that took no slot, or a snapshot that does not read as one.
+    pub machine: Option<MachineSnapshot>,
     /// True for a run routed to the remote pool: its latest queue, take or release line says `remote` and no `fallback`
     /// line came after it. It stays true once the run has released its remote slot, and the summary counts the run's
     /// held time on the command's remote row.
@@ -80,8 +93,8 @@ pub struct HistoryRun {
     /// (the box could not restore the repo's dotnet local tools), or `unknown` when the line names none; `None` when it
     /// was not.
     pub fallback: Option<String>,
-    /// The pid of the gate whose slot a [`RunState::Parent`] run ran on, from its `parent` line; `None` for any other
-    /// run.
+    /// The pid of the gate whose slot a [`RunState::Parent`] or [`RunState::Covered`] run ran on, from its `parent` or
+    /// `covered` line; `None` for any other run.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_pid: Option<u32>,
     /// How the run stands.
@@ -93,23 +106,24 @@ pub struct HistoryRun {
     pub started: Option<String>,
     /// How long the gate waited for its slot, from its take or its abandon.
     pub waited_seconds: Option<f64>,
-    /// How long the gate held its slot, from its release; for a [`RunState::Parent`] run, how long its parent's run held
-    /// its slot, `None` until the journal holds that run's release, and only while the journal read still holds the
-    /// parent's run (the 50-run, 7-day prune can drop it).
+    /// How long the gate held its slot, from its release; for a [`RunState::Parent`] or [`RunState::Covered`] run, how
+    /// long its parent's run held its slot, `None` until the journal holds that run's release, and only while the journal
+    /// read still holds the parent's run (the 50-run, 7-day prune can drop it). The status, verdict, wall and adjusted
+    /// seconds below follow the same rule.
     pub held_seconds: Option<f64>,
     /// The gate's exit status, from its release; `None` without a release or when the gate failed before its command
-    /// ran. For a [`RunState::Parent`] run, its parent's run's status, `None` until the journal holds that run's release,
+    /// ran. For a [`RunState::Parent`] or [`RunState::Covered`] run, its parent's run's status, `None` until the journal holds that run's release,
     /// and only while the journal read still holds the parent's run.
     pub status: Option<i64>,
     /// How the command ended, from its release's `verdict`, which both gates write; `None` without a release or when the
-    /// release line lacks the field, or holds null. For a [`RunState::Parent`] run, its parent's run's, as for `status`.
+    /// release line lacks the field, or holds null. For a [`RunState::Parent`] or [`RunState::Covered`] run, its parent's run's, as for `status`.
     pub verdict: Option<String>,
     /// The command's wall time, from its release's `wallSeconds` (the PowerShell gate rounds it to one decimal, the Rust
     /// gate to three); `None` without a release or when the release line lacks the field, or holds null. For a
-    /// [`RunState::Parent`] run, its parent's run's.
+    /// [`RunState::Parent`] or [`RunState::Covered`] run, its parent's run's.
     pub wall_seconds: Option<f64>,
     /// The command's load-adjusted seconds, from its release's `adjustedSeconds`; `None` without one. For a
-    /// [`RunState::Parent`] run, its parent's run's.
+    /// [`RunState::Parent`] or [`RunState::Covered`] run, its parent's run's.
     pub adjusted_seconds: Option<f64>,
     /// Every name a line of the run lists in `abandoned`: slots it took from a gate that died holding them and a journal
     /// mutex it took abandoned, in line order without repeats; empty when none.
@@ -203,6 +217,10 @@ struct Run {
     queued: Option<Stamp>,
     started: Option<Stamp>,
     slot: Option<u32>,
+    /// The slot names of the run's take.
+    slots: Vec<String>,
+    /// The snapshot of the run's critical take.
+    machine: Option<MachineSnapshot>,
     remote: bool,
     host: Option<String>,
     fallback: Option<String>,
@@ -213,16 +231,19 @@ struct Run {
     wall_seconds: Option<f64>,
     adjusted_seconds: Option<f64>,
     end: Option<End>,
-    /// The parent gate's pid and the time of the run's `parent` line, once it read one naming a parent: after its
-    /// `fallback`, after its `queue` when it was lent the slot as it waited, or alone when it was lent it before it queued.
+    /// The parent gate's pid and the time of the run's `parent` or `covered` line, once it read one naming a parent:
+    /// after its `fallback`, after its `queue` when it was lent the slot as it waited, or alone when it was lent it before
+    /// it queued or ran covered.
     parent: Option<(u32, Timestamp)>,
+    /// True when the line that named the parent was a `covered` line.
+    covered: bool,
     /// Every name the run's lines listed in `abandoned`, in line order without repeats.
     abandoned: Vec<String>,
 }
 
 /// The fields of a journal line the history reads. The reserved fields (`avgCores`, `peakCores`, `freeCores` on a
-/// release; `counts`, `otherHeld`, `otherClaims`, `snapshotError` on a take) are not read, and a line parses with or
-/// without them.
+/// release) are not read, and a line parses with or without them. A critical take's snapshot fields are read as they
+/// are, so a snapshot that does not read as one leaves the run without it rather than dropping the line.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Line {
@@ -261,6 +282,34 @@ struct Line {
     reason: Option<String>,
     #[serde(default)]
     parent_pid: Option<u32>,
+    #[serde(default)]
+    counts: Option<Value>,
+    #[serde(default)]
+    other_held: Option<Value>,
+    #[serde(default)]
+    other_claims: Option<Value>,
+    #[serde(default)]
+    snapshot_error: Option<Value>,
+}
+
+impl Line {
+    /// The line's machine snapshot, `counts`, `otherHeld`, then `otherClaims` or `snapshotError`; `None` when it has no
+    /// `counts`, or the fields do not read as a snapshot.
+    fn machine(&self) -> Option<MachineSnapshot> {
+        let mut fields = Map::new();
+        fields.insert("counts".to_owned(), self.counts.clone()?);
+        let rest = [
+            ("otherHeld", &self.other_held),
+            ("otherClaims", &self.other_claims),
+            ("snapshotError", &self.snapshot_error),
+        ];
+        for (key, value) in rest {
+            if let Some(value) = value {
+                fields.insert(key.to_owned(), value.clone());
+            }
+        }
+        serde_json::from_value(Value::Object(fields)).ok()
+    }
 }
 
 impl JournalCache {
@@ -365,14 +414,14 @@ impl JournalCache {
         self.fold(&line, at);
     }
 
-    /// Folds one parsed line into its run: the five events a run is made of create one, as does a `parent` line naming a
-    /// parent gate, which marks a run on that gate's slot ([`Self::apply_parent`]). Every line, `parent` and `covered`
-    /// included, adds the names it lists in `abandoned` to a run the cache already knows. A run's first `queue` line sets
-    /// its queued time; a later one does not. A `fallback` line sends a remote run back to the local queue: the run is
-    /// no longer remote, and keeps the reason.
+    /// Folds one parsed line into its run: the five events a run is made of create one, as does a `parent` or `covered`
+    /// line naming a parent gate, which marks a run on that gate's slot ([`Self::apply_parent`]). Every line, `parent`
+    /// and `covered` included, adds the names it lists in `abandoned` to a run the cache already knows. A run's first
+    /// `queue` line sets its queued time; a later one does not. A `fallback` line sends a remote run back to the local
+    /// queue: the run is no longer remote, and keeps the reason.
     fn fold(&mut self, line: &Line, at: Timestamp) {
         let key = (line.pid, line.process_start.clone());
-        if line.event == "parent" {
+        if matches!(line.event.as_str(), "parent" | "covered") {
             self.apply_parent(key, line, at);
             return;
         }
@@ -393,10 +442,10 @@ impl JournalCache {
         }
     }
 
-    /// Marks run `key` as run on the slot of the parent gate its `parent` line names, whether it fell back onto it or
-    /// was lent it while a critical request drained, as it waited or before it queued; a gate lent the slot before it
-    /// queued has no run yet, and the line starts one, with no queued or started time. A `parent` line naming no parent
-    /// only adds its `abandoned` names to a run the cache already knows.
+    /// Marks run `key` as run on the slot of the parent gate its `parent` or `covered` line names: fallen back onto it or
+    /// lent it while a critical request drained, as it waited or before it queued, or covered by it. A gate lent the slot
+    /// before it queued, or covered, has no run yet, and the line starts one, with no queued or started time and the
+    /// line's own time and kind. A line naming no parent only adds its `abandoned` names to a run the cache already knows.
     fn apply_parent(&mut self, key: RunKey, line: &Line, at: Timestamp) {
         let Some(parent_pid) = line.parent_pid else {
             self.note_abandoned(&key, &line.abandoned);
@@ -405,6 +454,7 @@ impl JournalCache {
         let run = self.runs.entry(key).or_insert_with(|| Run::new(line, at));
         run.note_abandoned(&line.abandoned);
         run.parent = Some((parent_pid, at));
+        run.covered = line.event == "covered";
     }
 
     /// The run a gate that said `parent` at `at` ran under, once that run has released its slot: of the runs of gate
@@ -457,6 +507,8 @@ impl Run {
             queued: None,
             started: None,
             slot: None,
+            slots: Vec::new(),
+            machine: None,
             remote: false,
             host: None,
             fallback: None,
@@ -468,13 +520,14 @@ impl Run {
             adjusted_seconds: None,
             end: None,
             parent: None,
+            covered: false,
             abandoned: Vec::new(),
         }
     }
 
     /// Adds the names `line` lists in `abandoned` to the run's list, in line order without repeats.
     fn note_abandoned(&mut self, line: &Value) {
-        for name in abandoned_names(line) {
+        for name in names(line) {
             if !self.abandoned.contains(&name) {
                 self.abandoned.push(name);
             }
@@ -491,6 +544,8 @@ impl Run {
             "take" => {
                 self.started = Some(stamp);
                 self.slot = first_slot(&line.slots);
+                self.slots = names(&line.slots).collect();
+                self.machine = line.machine();
                 self.waited_seconds = line.waited_seconds;
                 self.route(line.remote, line.host.clone());
             }
@@ -508,9 +563,11 @@ impl Run {
                 }
             }
             "fallback" => {
-                // The run holds nothing until a local take: a remote take's slot, start and wait no longer stand.
+                // The run holds nothing until a local take: a remote take's slots, snapshot, start and wait no longer stand.
                 self.route(false, None);
                 self.slot = None;
+                self.slots.clear();
+                self.machine = None;
                 self.started = None;
                 self.waited_seconds = None;
                 self.fallback = Some(line.reason.clone().unwrap_or_else(|| "unknown".to_owned()));
@@ -533,7 +590,7 @@ impl Run {
 
     fn state(&self, (pid, process_start): &RunKey, is_live: &impl Fn(u32, &str) -> bool) -> RunState {
         if self.parent.is_some() {
-            return RunState::Parent;
+            return if self.covered { RunState::Covered } else { RunState::Parent };
         }
         match self.end {
             Some(End::Released) if self.status == Some(0) => RunState::Ok,
@@ -558,6 +615,8 @@ impl Run {
             repo,
             kind: self.kind.clone(),
             slot: self.slot,
+            slots: self.slots.clone(),
+            machine: self.machine.clone(),
             remote: self.remote,
             host: self.host.clone(),
             fallback: self.fallback.clone(),
@@ -634,9 +693,9 @@ fn nearest_rank(sorted: &[f64], percent: usize) -> Option<f64> {
     sorted.get(rank.checked_sub(1)?).copied()
 }
 
-/// The names a line lists in `abandoned`: the strings of its array. A field that is not an array, or an element that is
-/// not a string, adds nothing.
-fn abandoned_names(value: &Value) -> impl Iterator<Item = String> + '_ {
+/// The names a line lists in `abandoned` or `slots`: the strings of its array. A field that is not an array, or an
+/// element that is not a string, adds nothing.
+fn names(value: &Value) -> impl Iterator<Item = String> + '_ {
     value.as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_owned)
 }
 

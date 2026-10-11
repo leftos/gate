@@ -1,0 +1,1 @@
+{"v":1,"kind":"remote","index":1,"pid":53000,"processStart":"2026-10-01T11:00:00.5000000Z","started":"2026-10-01T11:00:03.0000000Z","cwd":"C:\\work\\repo","command":"cargo build --release","log":"C:\\work\\repo\\.tmp\\remote.log","timeoutSeconds":900.0,"remote":true,"host":"builder@build-box","key":"work-3f2a9c"}

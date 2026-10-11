@@ -5,7 +5,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use gate_state::{CommandSummary, History, HistoryRun, JournalCache, RunState, normalize_command};
+use gate_state::{CommandSummary, HeavyLight, History, HistoryRun, JournalCache, MachineSnapshot, OtherClaim, RunState, normalize_command};
 use jiff::SignedDuration;
 use proptest::prelude::*;
 use serde_json::{Value, json};
@@ -445,6 +445,8 @@ fn runs_pair_queue_take_release_by_pid_and_process_start() {
                 repo: Some("repo".to_owned()),
                 kind: "heavy".to_owned(),
                 slot: Some(1),
+                slots: vec![r"Local\gate-slot-1".to_owned()],
+                machine: None,
                 remote: false,
                 host: None,
                 fallback: None,
@@ -466,6 +468,8 @@ fn runs_pair_queue_take_release_by_pid_and_process_start() {
                 repo: Some("repo".to_owned()),
                 kind: "heavy".to_owned(),
                 slot: Some(1),
+                slots: vec![r"Local\gate-slot-1".to_owned()],
+                machine: None,
                 remote: false,
                 host: None,
                 fallback: None,
@@ -572,7 +576,7 @@ fn open_run_is_running_when_live_else_unrecorded() {
 }
 
 #[test]
-fn selftest_and_covered_lines_are_ignored() {
+fn selftest_lines_and_a_parent_line_naming_no_parent_are_ignored() {
     let mut selftest = Gate::new(1, START, COMMAND);
     selftest.cwd = r"C:\Users\me\AppData\Local\Temp\gate-selftest-12\work";
     let covered = Gate::new(2, START, COMMAND);
@@ -582,8 +586,10 @@ fn selftest_and_covered_lines_are_ignored() {
         covered.line("covered", &ago(20), json!({"parentPid": 9})),
         parent.line("parent", &ago(10), json!({})),
     ]);
-    let history = history_of("selftest_and_covered_lines_are_ignored", &lines);
-    assert_eq!(history, History::default());
+    let history = history_of("selftest_lines_and_a_parent_line_naming_no_parent_are_ignored", &lines);
+    let runs: Vec<(RunState, Option<u32>)> = history.runs.iter().map(|run| (run.state, run.parent_pid)).collect();
+    assert_eq!(runs, [(RunState::Covered, Some(9))], "only the covered line makes a run");
+    assert!(history.summary.is_empty(), "{:?}", history.summary);
 }
 
 #[test]
@@ -1248,4 +1254,164 @@ fn a_run_lists_an_abandoned_journal_mutex_from_its_covered_line() {
     let history = history_of("a_run_lists_an_abandoned_journal_mutex_from_its_covered_line", &lines);
 
     assert_eq!(history.runs[0].abandoned, [journal], "the run's covered line names the abandoned mutex");
+}
+
+/// A hand-written v1 journal: a light gate (56000) whose slot is lent to 55000 before it queued, a critical gate (52000)
+/// whose take carries its snapshot and under which 54000 runs covered, and a critical gate (52100) whose snapshot failed.
+const V1_JOURNAL: &str = include_str!("fixtures/v1-journal.jsonl");
+/// Why 52100's take could not read the other gates' claims.
+const SNAPSHOT_ERROR: &str = r"cannot read the claims in C:\Users\me\AppData\Local\gate\v1\slots: Access is denied. (os error 5)";
+
+/// The history of `v1-journal.jsonl`.
+fn v1_history(test: &str) -> History {
+    let dir = journal_dir(test);
+    fs::write(dir.join("events.jsonl"), V1_JOURNAL).expect("the journal can be written");
+    read_fresh(&dir)
+}
+
+/// The slots a critical take lists: every heavy slot and the light slots past the two it keeps free.
+fn critical_slots() -> Vec<String> {
+    let heavy = (0..3).map(|index| format!(r"Local\gate-slot-{index}"));
+    heavy.chain((2..7).map(|index| format!(r"Local\gate-light-slot-{index}"))).collect()
+}
+
+#[test]
+fn a_critical_take_carries_its_slots_and_machine() {
+    let history = v1_history("a_critical_take_carries_its_slots_and_machine");
+
+    let critical: Vec<&HistoryRun> = history.runs.iter().filter(|run| run.kind == "critical").collect();
+    assert_eq!(critical.len(), 2, "two critical runs, newest first: {critical:?}");
+    let (failed, passed) = (critical[0], critical[1]);
+    assert_eq!((passed.state, passed.slot, &passed.slots), (RunState::Ok, Some(0), &critical_slots()));
+    assert_eq!(
+        passed.machine,
+        Some(MachineSnapshot {
+            counts: HeavyLight { heavy: 3, light: 7 },
+            other_held: HeavyLight { heavy: 0, light: 1 },
+            other_claims: Ok(vec![OtherClaim {
+                pid: 57000,
+                kind: "light".to_owned(),
+                index: 0,
+                command: "cargo check".to_owned(),
+                file: "gate-light-slot-0.json".to_owned(),
+            }]),
+        })
+    );
+    assert_eq!((failed.state, &failed.slots), (RunState::Failed, &critical_slots()));
+    assert_eq!(
+        failed.machine,
+        Some(MachineSnapshot {
+            counts: HeavyLight { heavy: 3, light: 7 },
+            other_held: HeavyLight { heavy: 0, light: 0 },
+            other_claims: Err(SNAPSHOT_ERROR.to_owned()),
+        })
+    );
+    let shape = |run: &HistoryRun| serde_json::to_value(run).expect("a run serializes");
+    assert_eq!(shape(passed)["slots"], json!(critical_slots()));
+    assert_eq!(
+        shape(passed)["machine"],
+        json!({
+            "counts": {"heavy": 3, "light": 7},
+            "otherHeld": {"heavy": 0, "light": 1},
+            "otherClaims": [{"pid": 57000, "kind": "light", "index": 0, "command": "cargo check", "file": "gate-light-slot-0.json"}],
+        })
+    );
+    assert_eq!(
+        shape(failed)["machine"],
+        json!({"counts": {"heavy": 3, "light": 7}, "otherHeld": {"heavy": 0, "light": 0}, "snapshotError": SNAPSHOT_ERROR})
+    );
+    let light = history
+        .runs
+        .iter()
+        .find(|run| run.command == "cargo fmt --all")
+        .expect("the light gate is a run");
+    assert_eq!(
+        (light.slot, &light.slots, &light.machine),
+        (Some(0), &vec![r"Local\gate-light-slot-0".to_owned()], &None),
+        "a take without a snapshot has no machine"
+    );
+    assert_eq!(shape(light)["machine"], Value::Null);
+}
+
+#[test]
+fn a_fallback_clears_slots_and_machine() {
+    let gate = Gate::new(1, START, COMMAND);
+    let snapshot = json!({"counts": {"heavy": 3, "light": 7}, "otherHeld": {"heavy": 0, "light": 0}, "otherClaims": []});
+    let mut lines = vec![gate.remote_queue(&ago(30)), with_fields(&gate.remote_take(&ago(29), 1), &snapshot)];
+    let taken = history_of("a_fallback_clears_slots_and_machine_taken", &lines);
+    let run = &taken.runs[0];
+    assert_eq!(
+        (&run.slots, run.machine.is_some()),
+        (&vec![r"Local\gate-remote-slot-1".to_owned()], true),
+        "{run:?}"
+    );
+
+    lines.push(gate.fallback(&ago(28), Some("busy")));
+    let fell_back = history_of("a_fallback_clears_slots_and_machine_fell_back", &lines);
+
+    let run = &fell_back.runs[0];
+    assert_eq!((run.slot, run.slots.is_empty(), &run.machine), (None, true, &None), "{run:?}");
+}
+
+#[test]
+fn a_covered_line_is_a_covered_run_with_its_parent_pid() {
+    let history = v1_history("a_covered_line_is_a_covered_run_with_its_parent_pid");
+
+    let covered = history
+        .runs
+        .iter()
+        .find(|run| run.state == RunState::Covered)
+        .expect("the covered line is a run");
+    assert_eq!(
+        (
+            covered.command.as_str(),
+            covered.parent_pid,
+            covered.status,
+            covered.held_seconds,
+            covered.verdict.as_deref()
+        ),
+        ("cargo fmt --check", Some(52000), Some(0), Some(300.0), Some("passed")),
+        "a covered run ends as the run of its parent's slot ended"
+    );
+    let shape = serde_json::to_value(covered).expect("a run serializes");
+    assert_eq!((&shape["state"], &shape["parentPid"]), (&json!("covered"), &json!(52000)));
+    let lent = history
+        .runs
+        .iter()
+        .find(|run| run.state == RunState::Parent)
+        .expect("the parent line is a run");
+    assert_eq!(
+        (lent.command.as_str(), lent.parent_pid, lent.held_seconds),
+        ("cargo clippy", Some(56000), Some(659.8)),
+        "a gate lent its parent's slot stays a parent run"
+    );
+    let counted: Vec<&str> = history.summary.iter().map(|row| row.command.as_str()).collect();
+    assert_eq!(
+        counted,
+        ["cargo fmt --all", "cargo test --workspace"],
+        "only the parents' runs count their time"
+    );
+}
+
+#[test]
+fn a_covered_line_alone_takes_its_time_and_kind_from_itself() {
+    let history = v1_history("a_covered_line_alone_takes_its_time_and_kind_from_itself");
+
+    assert_eq!(
+        commands(&history),
+        [
+            "cargo test --workspace",
+            "cargo fmt --check",
+            "cargo clippy",
+            "cargo test --workspace",
+            "cargo fmt --all",
+        ],
+        "newest first by each run's first line: the covered run at its covered line's time"
+    );
+    let covered = &history.runs[1];
+    assert_eq!(
+        (covered.state, covered.kind.as_str(), &covered.queued, &covered.started, covered.slot),
+        (RunState::Covered, "light", &None, &None, None),
+        "the covered gate neither queued nor took a slot"
+    );
 }
