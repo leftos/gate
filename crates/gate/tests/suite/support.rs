@@ -10,6 +10,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use std::{fs, process, thread};
 
+use jiff::Timestamp;
 use serde_json::{Value, json};
 
 /// The gate under test.
@@ -56,6 +57,8 @@ const HANG_GUARD: Duration = Duration::from_secs(600);
 const READER_GRACE: Duration = Duration::from_secs(60);
 /// How often a wait looks again.
 const POLL: Duration = Duration::from_millis(10);
+/// .NET ticks (100 ns since 0001-01-01) at the Unix epoch.
+const UNIX_EPOCH_TICKS: i128 = 621_355_968_000_000_000;
 
 static NEXT_CASE: AtomicU64 = AtomicU64::new(0);
 
@@ -267,15 +270,17 @@ impl Running {
     /// Returns stderr so far once `check` holds for it; fails saying `what` did not happen, with the stderr so far,
     /// after the hang guard.
     pub fn wait_for_stderr_where(&self, what: &str, check: impl Fn(&str) -> bool) -> String {
-        let deadline = Instant::now() + HANG_GUARD;
-        loop {
-            let text = text(&self.stderr);
-            if check(&text) {
-                return text;
-            }
-            assert!(Instant::now() < deadline, "{what} did not happen on stderr; stderr so far:\n{text}");
-            thread::sleep(POLL);
-        }
+        wait_for_stderr_check(&self.stderr, what, check, || true)
+    }
+
+    /// Returns stderr so far once `check` holds for it and the program is seen running after that stderr was read, so
+    /// it had not exited when it said what `check` looks for. Fails at once, saying `what` did not happen, when the
+    /// program has exited, and after the hang guard.
+    pub fn wait_for_stderr_while_running(&mut self, what: &str, check: impl Fn(&str) -> bool) -> String {
+        let Running { child, stderr, .. } = self;
+        wait_for_stderr_check(stderr, what, check, || {
+            child.try_wait().expect("the program's status can be read").is_none()
+        })
     }
 
     /// Returns stdout so far once it contains `needle`; fails with the stdout so far after the hang guard.
@@ -378,6 +383,23 @@ fn gather(mut stream: impl Read + Send + 'static) -> (Buffer, JoinHandle<()>) {
     (buffer, reader)
 }
 
+/// Returns the text of `stderr`, a program's, once `check` holds for it and `running` then says the program has not
+/// exited; fails saying `what` did not happen, with the text so far, at once when `running` says it has exited, and
+/// after the hang guard.
+fn wait_for_stderr_check(stderr: &Buffer, what: &str, check: impl Fn(&str) -> bool, mut running: impl FnMut() -> bool) -> String {
+    let deadline = Instant::now() + HANG_GUARD;
+    loop {
+        let text = text(stderr);
+        let alive = running();
+        if alive && check(&text) {
+            return text;
+        }
+        assert!(alive, "{what} did not happen on stderr before the program exited; stderr so far:\n{text}");
+        assert!(Instant::now() < deadline, "{what} did not happen on stderr; stderr so far:\n{text}");
+        thread::sleep(POLL);
+    }
+}
+
 /// Returns the text of `buffer`, the program's `stream`, once it contains `needle`; fails with the text so far after
 /// the hang guard.
 fn wait_for_text(buffer: &Buffer, stream: &str, needle: &str) -> String {
@@ -437,9 +459,7 @@ pub fn wait_for_file(path: &Path) {
 
 /// Writes `json` as the counts file of `root`, through a file beside it moved over it, so a gate never reads it torn.
 pub fn write_counts(root: &Path, json: &str) {
-    let staged = root.join("slot-counts.json.staged");
-    fs::write(&staged, json).expect("the counts can be staged");
-    fs::rename(&staged, root.join("slot-counts.json")).expect("the counts can be moved into place");
+    write_whole(&root.join("slot-counts.json"), json);
 }
 
 /// Asserts that `needles` occur in `haystack` in this order, each after the end of the one before.
@@ -542,6 +562,70 @@ pub fn write_remote_json(case: &Case, json: &str) -> PathBuf {
     fs::create_dir_all(&folder).expect("the routing file's folder can be made");
     let path = folder.join("remote.json");
     fs::write(&path, json).expect("the routing file can be written");
+    path
+}
+
+/// The PowerShell gate's folder under `case`'s LOCALAPPDATA, `%LOCALAPPDATA%\gate`.
+pub fn powershell_folder(case: &Case) -> PathBuf {
+    case.local_app_data().join("gate")
+}
+
+/// `at` in .NET ticks, as the PowerShell gate writes a ticket's times.
+fn dotnet_ticks(at: Timestamp) -> i64 {
+    i64::try_from(at.as_nanosecond().div_euclid(100) + UNIX_EPOCH_TICKS).expect("a test moment fits .NET ticks")
+}
+
+/// Writes `text` at `path`, a `.json` file in a folder that exists, through a file beside it moved over it, so a gate
+/// never reads it torn.
+fn write_whole(path: &Path, text: &str) {
+    let staged = path.with_extension("json.staged");
+    fs::write(&staged, text).expect("the file can be staged");
+    fs::rename(&staged, path).expect("the file can be moved into place");
+}
+
+/// Writes the claim a PowerShell gate holding the heavy or light slot `name` (`gate-slot-<i>` or `gate-light-slot-<i>`)
+/// writes, `%LOCALAPPDATA%\gate\slots\<name>.json` under `case`, and returns its path: the gate `pid` whose process
+/// started at `start`, running `command`, took the slot at `started`.
+pub fn write_powershell_claim(case: &Case, name: &str, (pid, start): (u32, Timestamp), command: &str, started: Timestamp) -> PathBuf {
+    let (kind, index) = name
+        .strip_prefix("gate-light-slot-")
+        .map(|index| ("light", index))
+        .or_else(|| name.strip_prefix("gate-slot-").map(|index| ("heavy", index)))
+        .expect("a heavy or light slot's claim");
+    let index: u32 = index.parse().expect("the slot's index is a number");
+    let claim = json!({
+        "kind": kind,
+        "index": index,
+        "pid": pid,
+        "processStart": start.to_string(),
+        "started": started.to_string(),
+        "cwd": shown(&case.folder()),
+        "command": command,
+        "log": "out.log",
+        "timeoutSeconds": 3600.0,
+    });
+    let folder = powershell_folder(case).join("slots");
+    fs::create_dir_all(&folder).expect("the claims folder can be made");
+    let path = folder.join(format!("{name}.json"));
+    write_whole(&path, &claim.to_string());
+    path
+}
+
+/// Writes the arrival ticket a PowerShell gate waiting for a `kind` slot writes, `%LOCALAPPDATA%\gate\waiting\<pid>-<start
+/// ticks>.json` under `case`, and returns its path: the gate `pid` whose process started at `start` arrived at `arrived`.
+pub fn write_powershell_ticket(case: &Case, (pid, start): (u32, Timestamp), kind: &str, arrived: Timestamp) -> PathBuf {
+    let start_ticks = dotnet_ticks(start);
+    let ticket = json!({
+        "kind": kind,
+        "arrived": dotnet_ticks(arrived),
+        "pid": pid,
+        "startTicks": start_ticks,
+        "holds": false,
+    });
+    let folder = powershell_folder(case).join("waiting");
+    fs::create_dir_all(&folder).expect("the tickets folder can be made");
+    let path = folder.join(format!("{pid}-{start_ticks}.json"));
+    write_whole(&path, &ticket.to_string());
     path
 }
 

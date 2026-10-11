@@ -11,7 +11,7 @@ use crate::install::{checked_in, copy_gate, unix};
 use crate::support::{Case, Outcome, USAGE, finish, shown};
 
 /// The words of today's form whose slot gate.exe refuses before anything runs.
-fn refused_words() -> Vec<&'static str> {
+pub(crate) fn refused_words() -> Vec<&'static str> {
     vec!["-Log", "out.log", "-TimeoutSeconds", "5", "-Slot", "auto", "--", "cmd"]
 }
 
@@ -61,7 +61,7 @@ fn launcher() -> PathBuf {
 /// The case folder the canonical gate is looked for in: a stub at the path the launcher builds,
 /// `CLAUDE_CONFIG_DIR\tools\gate\gate.ps1`, which writes its words, one per line, to `words` and exits 9. A launcher a
 /// flag does not switch therefore says which side it took and runs nothing that matters.
-fn stub_claude(case: &Case, words: &Path) -> PathBuf {
+pub(crate) fn stub_claude(case: &Case, words: &Path) -> PathBuf {
     let folder = case.folder().join("claude");
     let script = folder.join("tools").join("gate").join("gate.ps1");
     fs::create_dir_all(script.parent().expect("the stub's folder")).expect("the stub's folder can be made");
@@ -71,7 +71,7 @@ fn stub_claude(case: &Case, words: &Path) -> PathBuf {
 }
 
 /// The file the case's stub canonical gate writes its words to, under the case folder and never the state root.
-fn stub_words(case: &Case) -> PathBuf {
+pub(crate) fn stub_words(case: &Case) -> PathBuf {
     case.folder().join("stub-words.txt")
 }
 
@@ -85,14 +85,14 @@ fn set_flag(case: &Case, content: &str) {
 
 /// Installs a copy of the built gate as the case's `%LOCALAPPDATA%\gate\bin\gate.exe`, never through the install
 /// script, which writes the registry, and returns its path.
-fn install_gate(case: &Case) -> PathBuf {
+pub(crate) fn install_gate(case: &Case) -> PathBuf {
     fs::create_dir_all(case.local_app_data().join("gate").join("bin")).expect("the install folder can be made");
     copy_gate(case, r"appdata\gate\bin\gate.exe")
 }
 
 /// The launcher run as a caller runs it, `pwsh -NoProfile -File <tools/gate.ps1> <words>`, with the case's LOCALAPPDATA
 /// and working folder, its state root through `GATE_STATE_DIR` and `config` as `CLAUDE_CONFIG_DIR`.
-fn run_launcher(case: &Case, config: &Path, words: &[&str]) -> Outcome {
+pub(crate) fn run_launcher(case: &Case, config: &Path, words: &[&str]) -> Outcome {
     let mut command = Command::new("pwsh");
     let all: Vec<String> = ["-NoProfile", "-File"]
         .into_iter()
@@ -110,7 +110,7 @@ fn run_launcher(case: &Case, config: &Path, words: &[&str]) -> Outcome {
 /// The installed gate.exe run directly with `words`, its environment the launcher's child's: the case's LOCALAPPDATA
 /// and working folder, its state root through `GATE_STATE_DIR` and `config` as `CLAUDE_CONFIG_DIR`. A case compares the
 /// hand-over with this, so nothing it asserts is a literal that could drift from gate.exe's own.
-fn run_direct(exe: &Path, case: &Case, config: &Path, words: &[&str]) -> Outcome {
+pub(crate) fn run_direct(exe: &Path, case: &Case, config: &Path, words: &[&str]) -> Outcome {
     let mut command = Command::new(exe);
     case.prepare_without_state_dir(&mut command, words);
     command.env("GATE_STATE_DIR", case.root());
@@ -132,7 +132,7 @@ fn run_launcher_in_session(case: &Case, config: &Path, words: &[&str]) -> Outcom
 
 /// `text` as the process that carried it wrote it: Windows line ends read as `\n`, and a trailing line end dropped, so
 /// a launcher's output compares with a direct run's whatever the PowerShell host did to the child's bytes.
-fn lines(text: &str) -> String {
+pub(crate) fn lines(text: &str) -> String {
     unix(text).trim_end_matches('\n').to_owned()
 }
 
