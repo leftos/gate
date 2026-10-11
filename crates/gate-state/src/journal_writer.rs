@@ -97,6 +97,9 @@ pub enum JournalEvent {
         abandoned: Vec<String>,
         /// What a critical gate found as it took the machine; `None` for any other gate.
         machine: Option<MachineSnapshot>,
+        /// The pid of the parent gate whose slot did not cover this one, so it took its own; `None` for a gate under no
+        /// parent.
+        parent_pid: Option<u32>,
     },
     /// The gate is letting its slot go.
     Release {
@@ -271,6 +274,12 @@ pub struct RunFacts {
     pub wall_seconds: f64,
     /// The load-adjusted seconds, or `None` when there are none.
     pub adjusted_seconds: Option<f64>,
+    /// The command's average busy cores, or `None` when no sample measured them.
+    pub avg_cores: Option<f64>,
+    /// The command's peak busy cores over one sampler interval, or `None` when no sample measured them.
+    pub peak_cores: Option<f64>,
+    /// The cores other processes left free on average, or `None` when no sample measured them.
+    pub free_cores: Option<f64>,
     /// How the command ended.
     pub verdict: Verdict,
 }
@@ -382,12 +391,16 @@ fn insert_own_fields(line: &mut Map<String, Value>, event: &JournalEvent) {
             slots,
             waited_seconds,
             machine,
+            parent_pid,
             ..
         } => {
             line.insert("slots".to_owned(), Value::from(slots.clone()));
             line.insert("waitedSeconds".to_owned(), seconds(*waited_seconds));
             if let Some(machine) = machine {
                 insert_machine(line, machine);
+            }
+            if let Some(parent_pid) = parent_pid {
+                line.insert("parentPid".to_owned(), Value::from(*parent_pid));
             }
         }
         JournalEvent::Release {
@@ -402,6 +415,18 @@ fn insert_own_fields(line: &mut Map<String, Value>, event: &JournalEvent) {
             line.insert("wallSeconds".to_owned(), facts.map_or(Value::Null, |facts| seconds(facts.wall_seconds)));
             let adjusted = facts.and_then(|facts| facts.adjusted_seconds).map_or(Value::Null, seconds);
             line.insert("adjustedSeconds".to_owned(), adjusted);
+            if let Some(facts) = facts {
+                let cores = [
+                    ("avgCores", facts.avg_cores),
+                    ("peakCores", facts.peak_cores),
+                    ("freeCores", facts.free_cores),
+                ];
+                for (key, value) in cores {
+                    if let Some(value) = value {
+                        line.insert(key.to_owned(), tenths(value));
+                    }
+                }
+            }
             let verdict = facts.map_or(Verdict::Unknown, |facts| facts.verdict);
             line.insert("verdict".to_owned(), Value::from(verdict.as_str()));
         }
@@ -440,6 +465,11 @@ fn event_name(event: &JournalEvent) -> &'static str {
 /// Seconds rounded to three decimals, a midpoint to the even digit, as .NET's `[math]::Round(x, 3)` gives them.
 fn seconds(value: f64) -> Value {
     Value::from((value * 1000.0).round_ties_even() / 1000.0)
+}
+
+/// Cores rounded to one decimal, a midpoint to the even digit.
+fn tenths(value: f64) -> Value {
+    Value::from((value * 10.0).round_ties_even() / 10.0)
 }
 
 /// Appends the line `build` returns and a line feed to `root`'s journal while holding `lock`, waiting [`JOURNAL_WAIT`]

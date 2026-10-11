@@ -13,6 +13,7 @@ mod ceiling;
 mod checkout;
 mod cli;
 mod compat;
+mod cores;
 mod critical;
 mod cutover;
 mod diagnostics;

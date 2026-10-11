@@ -3,7 +3,7 @@
 //! kill gathers before it terminates the job, and the end of the wait: the command's exit, a kill as stalled, timed out
 //! or past the backstop, or a Ctrl+C.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 
 use gate_args::{RunRequest, Slot};
 use gate_watchdog::{
-    Config, JOB_LINES, Machine, OUTSIDE_LINES, ProcessFacts, Report, Sample, SampleFacts, SampleHistory, ServerFacts, SystemTimes, Ticks, Watch,
-    WslVm, failed_block, is_wsl_command, lines, wsl_unavailable_line,
+    Config, Cores, JOB_LINES, Machine, OUTSIDE_LINES, ProcessFacts, Report, Sample, SampleFacts, SampleHistory, ServerFacts, SystemTimes, Ticks,
+    Watch, WslVm, failed_block, is_wsl_command, lines, wsl_unavailable_line,
 };
 use gate_win32::{Interrupt, Job, ProcessTimes, Running, Waited};
 use jiff::Timestamp;
@@ -96,6 +96,9 @@ pub(crate) struct Watcher<'a> {
     /// The classes this watch moves the sample's build servers to.
     priority: Prioritizer<'a>,
 }
+
+/// Build servers' CPU time in 100 ns ticks, by pid, as a sample carries them.
+type ServerCpu = BTreeMap<u32, u64>;
 
 /// A read of the WSL VM's cumulative CPU in 100 ns ticks, `None` when no VM runs.
 type VmRead = fn() -> io::Result<Option<u64>>;
@@ -243,11 +246,11 @@ impl<'a> Watcher<'a> {
         loop {
             match self.wait(self.period)? {
                 Waited::Exited(code) => {
-                    self.watch.exited(self.started.elapsed());
+                    self.end(console);
                     return Ok(Watched::Exited(code));
                 }
                 Waited::Interrupted => {
-                    self.watch.exited(self.started.elapsed());
+                    self.end(console);
                     return Ok(Watched::Interrupted);
                 }
                 Waited::Running => {}
@@ -257,7 +260,7 @@ impl<'a> Watcher<'a> {
             if let Some(interrupt) = self.interrupt.filter(|_| self.interrupt_after == Some(self.samples)) {
                 interrupt.raise();
             }
-            if let Some(watched) = self.kill()? {
+            if let Some(watched) = self.kill(console)? {
                 return Ok(watched);
             }
         }
@@ -271,6 +274,37 @@ impl<'a> Watcher<'a> {
     /// The wall time the watch counted as paused, while a gate under this one waited behind a critical request.
     pub(crate) fn paused_time(&self) -> Duration {
         self.watch.paused_time()
+    }
+
+    /// The command's average, peak and free cores ([`Watch::cores`]); `None` before an unpaused sample, once the
+    /// sampler has failed, and when its CPU could not be read at its end.
+    pub(crate) fn cores(&self) -> Option<Cores> {
+        self.watch.cores()
+    }
+
+    /// Brings the watch to the command's end: the job's accounting and the CPU of the build servers the last sample
+    /// counted are read once more, so the CPU since the last sample counts toward the cores, and the stretch since that
+    /// sample is counted at the share it found. A job accounting read that fails leaves the cores unknown and is noted
+    /// in the log only, since the run's verdict does not depend on it.
+    fn end(&mut self, console: &mut Console) {
+        if self.sampler_works {
+            match self.final_read() {
+                Ok((job_cpu, new_servers, shared_servers)) => self.watch.final_cpu(job_cpu, &new_servers, &shared_servers),
+                Err(error) => {
+                    self.watch.cores_unread();
+                    console.note(&format!("gate: cannot read the command's CPU at its end: {error}; its cores are unknown"));
+                }
+            }
+        }
+        self.watch.exited(self.started.elapsed());
+    }
+
+    /// The job's total CPU now, and the CPU of the build servers the last sample counted that can still be read
+    /// ([`server_cpu`]); only the job's accounting failing fails the read.
+    fn final_read(&self) -> io::Result<(Ticks, ServerCpu, ServerCpu)> {
+        let job_cpu = Ticks(self.job.accounting()?.cpu);
+        let (new_servers, shared_servers) = server_cpu(&self.counted, gate_win32::process_times);
+        Ok((job_cpu, new_servers, shared_servers))
     }
 
     /// Waits at most `timeout` for the command's exit, or for the interrupt when it was installed.
@@ -352,16 +386,16 @@ impl<'a> Watcher<'a> {
 
     /// The kill due now, as stalled, timed out or past the backstop, or `None`; a command that exited as the kill was
     /// found keeps its own status, checked again once the diagnostics are gathered.
-    fn kill(&mut self) -> io::Result<Option<Watched>> {
+    fn kill(&mut self, console: &mut Console) -> io::Result<Option<Watched>> {
         let now = self.started.elapsed();
         let Some(kill) = self.watch.kill_check(now) else {
             return Ok(None);
         };
-        if let Some(exited) = self.exit_if_ended()? {
+        if let Some(exited) = self.exit_if_ended(console)? {
             return Ok(Some(exited));
         }
         let diagnostics = self.diagnostics();
-        if let Some(exited) = self.exit_if_ended()? {
+        if let Some(exited) = self.exit_if_ended(console)? {
             return Ok(Some(exited));
         }
         let processes = self.job.accounting()?.active_processes;
@@ -373,10 +407,10 @@ impl<'a> Watcher<'a> {
     }
 
     /// The command's own status once it has exited, or `None` while it still runs; the watch is brought to its end.
-    fn exit_if_ended(&mut self) -> io::Result<Option<Watched>> {
+    fn exit_if_ended(&mut self, console: &mut Console) -> io::Result<Option<Watched>> {
         match self.running.wait(Duration::ZERO)? {
             Some(code) => {
-                self.watch.exited(self.started.elapsed());
+                self.end(console);
                 Ok(Some(Watched::Exited(code)))
             }
             None => Ok(None),
@@ -532,6 +566,22 @@ impl<'a> Watcher<'a> {
     }
 }
 
+/// The CPU `times` reads now for each of the `counted` build servers, by pid, the ones the command started (`true`)
+/// apart from the shared ones. A server that exited, or whose times cannot be read, is skipped, as a sample skips one
+/// it cannot open ([`Servers::read`]).
+fn server_cpu(counted: &[(u32, bool)], times: impl Fn(u32) -> io::Result<Option<ProcessTimes>>) -> (ServerCpu, ServerCpu) {
+    let mut new_servers = BTreeMap::new();
+    let mut shared_servers = BTreeMap::new();
+    for &(pid, started_after) in counted {
+        let Ok(Some(read)) = times(pid) else {
+            continue;
+        };
+        let servers = if started_after { &mut new_servers } else { &mut shared_servers };
+        servers.insert(pid, read.cpu);
+    }
+    (new_servers, shared_servers)
+}
+
 /// What a run of `request` is watched for: its ceiling, its stall window, and whether it runs through WSL, as a command
 /// whose first word names `wsl` does.
 fn config(request: &RunRequest) -> Config {
@@ -655,7 +705,26 @@ mod tests {
     use gate_watchdog::wsl_unavailable_line;
     use gate_win32::ProcessTimes;
 
-    use super::{ACCESS_DENIED, VmReader, config, machine, members};
+    use super::{ACCESS_DENIED, VmReader, config, machine, members, server_cpu};
+
+    #[test]
+    fn an_end_read_skips_a_server_that_exited_or_cannot_be_read() {
+        // 10 and 20 the command started, 30 and 40 shared: 20 has exited and 40 cannot be opened.
+        let counted = [(10, true), (20, true), (30, false), (40, false)];
+        let times = |pid: u32| match pid {
+            20 => Ok(None),
+            40 => Err(io::Error::from_raw_os_error(ACCESS_DENIED)),
+            _ => Ok(Some(ProcessTimes {
+                created: 0,
+                cpu: u64::from(pid) * 100,
+            })),
+        };
+
+        let (new_servers, shared_servers) = server_cpu(&counted, times);
+
+        assert_eq!(new_servers.into_iter().collect::<Vec<_>>(), [(10, 1000)]);
+        assert_eq!(shared_servers.into_iter().collect::<Vec<_>>(), [(30, 3000)]);
+    }
 
     /// A heavy run of `command`.
     fn request(command: &[&str]) -> RunRequest {

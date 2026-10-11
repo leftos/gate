@@ -26,7 +26,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Confirmation window**: the 5 s across which every scan of the cutover's drain must find no PowerShell gate before it ends, because the PowerShell gate deletes its ticket when it takes a slot and writes its claim up to about 2 s later; a scan that finds a gate resets it.
 - **Console donor**: the hidden system `cmd.exe /d /q /k` that `gate box run` puts in the command's job, whose console the box sets to UTF-8 and the command inherits; it lives until the wait for the command is over.
 - **Control line**: one JSON line, carrying the call's nonce, that the **Shim** writes on pwsh's stdout to answer the gate: `started`, the result (status, killed, reason) or an error; the request goes the other way on pwsh's stdin.
-- **Cores hint**: the end-of-run line saying how many cores the command kept busy and whether its slot kind fitted.
+- **Cores hint**: the line before the passed line saying how many cores a command kept busy when its slot kind did not fit: a light run over 2 cores, or a heavy run under 1.5 with cores to spare.
 - **Covered**: said of a nested gate whose parent's slot kind covers its own (heavy covers heavy and light, light covers light, critical covers all), so it takes no slot.
 - **Covered marker**: the file `covered\<pid>-<start>.json` a covered gate keeps while it runs, so ops-tower sees a gate that writes no claim or ticket.
 - **Critical drain**: a critical gate's wait for the gates that arrived before it to free their slots, while it holds back the gates that arrive after it.
@@ -76,7 +76,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Refusal**: a builder's or the remote client's answer that a routed run cannot run there, with a reason (`busy`, `unreachable`, `parity`, `rebooted`, `tools`, `version`, `client`); the gate then falls back to a local run.
 - **Release**: see take.
 - **Remote client**: what `gate run` calls to run a routed command on a builder: `RemoteClient` in the gate binary; the `remote.ps1` bridge is the client of a production gate, and a client that cannot start makes the run fall back with reason `client`.
-- **Reserved field**: an optional field readers accept before any gate writes it, such as `expected` or `avgCores`.
+- **Reserved field**: an optional field readers accept before any gate writes it, such as `expected`.
 - **Reserved light slot**: one of the up to two highest light slots a critical gate never takes, so light gates run beside it.
 - **Rollover**: the move of `events.jsonl` over `events.1.jsonl` by the append that finds the journal at or above 5,242,880 bytes, followed by the archive of the rolled file.
 - **Root hash**: the first 8 hex digits of the SHA-256 of a non-default state root's path, carried in every kernel object name and slot marker of that root.

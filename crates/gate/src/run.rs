@@ -15,6 +15,7 @@ use std::{fs, io};
 use gate_args::{ProgramSearch, RunRequest, Slot, batch_command_line, batch_refusal, command_line, is_batch_target, resolve_program};
 use gate_router::{RemoteRun, Route};
 use gate_state::{FallbackReason, JournalEvent, KernelObject, RemoteTag, RunFacts, StateRoot, Verdict, log_hash};
+use gate_watchdog::{Cores, Hint, SlotKind, hint};
 use gate_win32::{AcquireError, Interrupt, Job, Launch, LaunchError, LaunchOutput, NamedMutex, OwnedMutexGuard, PriorityClass, Running};
 use jiff::Timestamp;
 
@@ -23,7 +24,7 @@ use crate::answer::USAGE_STATUS;
 use crate::console::Console;
 use crate::covered::Covered;
 use crate::environment::{self, Variables};
-use crate::journal::RunJournal;
+use crate::journal::{self, RunJournal};
 use crate::log::Log;
 use crate::machine::{self, Machine, MachineWait, MachineWaited};
 use crate::nesting::{Nesting, Parent};
@@ -48,6 +49,8 @@ pub(crate) const CONTROL_C_EXIT: u32 = 0xC000_013A;
 pub(crate) const ERROR_FILE_NOT_FOUND: u32 = 2;
 /// How long the gate waits for the command to end once it has terminated its job, or once a Ctrl+C came.
 const STOP_WAIT: Duration = Duration::from_secs(5);
+/// The wall time under which a passed run is too short to judge its slot by, so it gets no cores line.
+const HINT_MIN_WALL: Duration = Duration::from_secs(10);
 
 /// Runs `request`'s command, logging to `log` (absolute) under `root`, routing a heavy one by `environment`'s routing
 /// file and git hook, saying each line as it goes; returns the gate's exit status.
@@ -503,12 +506,16 @@ enum Pass<'h> {
 }
 
 /// How long a command ran: by the wall clock, in load-adjusted seconds, `None` once the sampler failed and they are
-/// unknown, and the part of its wall time paused while a gate under it waited behind a critical request.
+/// unknown, and the part of its wall time paused while a gate under it waited behind a critical request; and the cores
+/// it kept busy and found free, `None` when no unpaused sample measured them, the sampler failed, its CPU could not be
+/// read at its end, or a gate under it took a slot of its own, which `nested_took_slot` says.
 #[derive(Clone, Copy)]
 struct Timing {
     wall: Duration,
     adjusted: Option<f64>,
     paused: Duration,
+    cores: Option<Cores>,
+    nested_took_slot: bool,
 }
 
 /// How a watched command ended, as its verdict reads it: its status, how long it ran, and the line of a kill.
@@ -781,6 +788,9 @@ impl Run<'_> {
                     facts: Some(RunFacts {
                         wall_seconds: wall.as_secs_f64(),
                         adjusted_seconds: None,
+                        avg_cores: None,
+                        peak_cores: None,
+                        free_cores: None,
                         verdict: Verdict::of(kill.as_deref(), outcome.status, status),
                     }),
                 }
@@ -848,7 +858,14 @@ impl Run<'_> {
         }
         wait.end(console);
         let took = Instant::now();
-        self.journal.write(&take_event(vec![name], waited, abandoned), self.tag.as_ref(), console);
+        // A gate under a parent whose slot does not cover it names that parent, so the parent knows a gate under it
+        // took a slot of its own and does not judge its own slot by the CPU both used.
+        let parent_pid = match self.nesting {
+            Nesting::Under(parent) => Some(parent.pid),
+            _ => None,
+        };
+        self.journal
+            .write(&take_event(vec![name], waited, abandoned, parent_pid), self.tag.as_ref(), console);
         let of = ClaimOf {
             gate: &self.gate,
             request: self.request,
@@ -892,6 +909,8 @@ impl Run<'_> {
             waited_seconds: waited,
             abandoned: machine.abandoned().to_vec(),
             machine: Some(snapshot),
+            // A critical gate is never under a parent whose slot does not cover it: such a gate is refused.
+            parent_pid: None,
         };
         self.journal.write(&take, None, console);
         console.err(&line);
@@ -1016,24 +1035,16 @@ impl Run<'_> {
     fn watched(&mut self, job: &Job, running: &Running, start: &Start, console: &mut Console) -> Ended {
         let mut stopper = Stopper { job, armed: true };
         let ended = match self.watch(job, running, start, console) {
-            Ok((watched, adjusted, paused)) => {
-                let timing = Timing {
-                    wall: start.started.elapsed(),
-                    adjusted,
-                    paused,
-                };
-                self.after_watch(watched, timing, (job, running), console)
-            }
+            Ok((watched, timing)) => self.after_watch(watched, timing, (job, running), console),
             Err(problem) => self.gate_failed(&problem, Some((job, running)), console),
         };
         stopper.armed = false;
         ended
     }
 
-    /// Watches the command until it exits, is killed or the console is interrupted; how it ended, the load-adjusted
-    /// seconds it ran, `None` once the sampler failed, and the wall time paused while a gate under it waited behind a
-    /// critical request, else the gate's problem.
-    fn watch(&mut self, job: &Job, running: &Running, start: &Start, console: &mut Console) -> Result<(Watched, Option<f64>, Duration), String> {
+    /// Watches the command until it exits, is killed or the console is interrupted; how it ended and how long it ran,
+    /// with the cores it kept busy, else the gate's problem.
+    fn watch(&mut self, job: &Job, running: &Running, start: &Start, console: &mut Console) -> Result<(Watched, Timing), String> {
         let watching = Watching {
             job,
             running,
@@ -1048,7 +1059,14 @@ impl Run<'_> {
         let mut watcher = Watcher::begin(self.request, watching, start, self.host.processors)
             .map_err(|error| format!("cannot begin to watch the command: {error}"))?;
         let watched = watcher.until_end(console).map_err(|error| format!("cannot watch the command: {error}"))?;
-        Ok((watched, watcher.adjusted_seconds(), watcher.paused_time()))
+        let timing = Timing {
+            wall: start.started.elapsed(),
+            adjusted: watcher.adjusted_seconds(),
+            paused: watcher.paused_time(),
+            cores: watcher.cores(),
+            nested_took_slot: false,
+        };
+        Ok((watched, timing))
     }
 
     /// Ends the run as the watch ended it: a command that exited has its verdict; one killed as stalled, timed out or
@@ -1096,17 +1114,44 @@ impl Run<'_> {
     /// Reaches the verdict of `outcome`, its markers not scanned when `unscanned`, and the facts its release carries.
     /// `diagnostics` is the block a kill wrote to the log, whose lines the verdict's tail leaves out.
     fn ended(&mut self, outcome: &Outcome<'_>, unscanned: bool, diagnostics: &[String], started: (&Job, &Running), console: &mut Console) -> Ended {
-        match self.verdict(outcome.exited, Some(Pass::Here(outcome.timing)), unscanned, diagnostics, console) {
+        let timing = self.without_nested_cores(outcome.timing, console);
+        match self.verdict(outcome.exited, Some(Pass::Here(timing)), unscanned, diagnostics, console) {
             Ok(status) => Ended {
                 status,
                 facts: Some(RunFacts {
-                    wall_seconds: outcome.timing.wall.saturating_sub(outcome.timing.paused).as_secs_f64(),
-                    adjusted_seconds: outcome.timing.adjusted,
+                    wall_seconds: timing.wall.saturating_sub(timing.paused).as_secs_f64(),
+                    adjusted_seconds: timing.adjusted,
+                    avg_cores: timing.cores.map(|cores| cores.avg),
+                    peak_cores: timing.cores.map(|cores| cores.peak),
+                    free_cores: timing.cores.map(|cores| cores.free),
                     verdict: Verdict::of(outcome.kill, outcome.exited, status),
                 }),
             },
             Err(problem) => self.gate_failed(&problem, Some(started), console),
         }
+    }
+
+    /// `timing` with its cores dropped when a gate under this run took a slot of its own during it, whose CPU the job
+    /// counted as this run's ([`journal::nested_took_slot`]), or when the journal that tells cannot be read, which is
+    /// noted in the log. A run whose cores are unknown reads nothing.
+    fn without_nested_cores(&self, mut timing: Timing, console: &mut Console) -> Timing {
+        if timing.cores.is_none() {
+            return timing;
+        }
+        match journal::nested_took_slot(&self.root.path, self.gate.pid, self.gate.start) {
+            Ok(false) => {}
+            Ok(true) => {
+                timing.nested_took_slot = true;
+                timing.cores = None;
+            }
+            Err(error) => {
+                console.note(&format!(
+                    "gate: cannot tell whether a gate under this one took a slot of its own: {error}; its cores are unknown"
+                ));
+                timing.cores = None;
+            }
+        }
+        timing
     }
 
     /// Says the start failure of `word`, found as `resolved`, with the system's `message`, and ends with status 127.
@@ -1155,10 +1200,28 @@ impl Run<'_> {
             console.out(line);
         }
         match pass {
-            Some(pass) if status == 0 => console.note_out(&self.passed_line(pass, &shown)),
+            Some(pass) if status == 0 => {
+                if let Some(line) = self.cores_hint(pass) {
+                    console.note_out(&line);
+                }
+                console.note_out(&self.passed_line(pass, &shown));
+            }
             _ => console.err(&format!("gate: FAILED (status {status}). Full output: {shown}")),
         }
         Ok(status)
+    }
+
+    /// The cores line of a passed run that ran as `pass` says, when its slot did not fit ([`cores_hint_for`]).
+    fn cores_hint(&self, pass: Pass<'_>) -> Option<String> {
+        cores_hint_for(Judged {
+            passed: true,
+            own_slot: takes_own_slot(self.nesting, self.lent),
+            slot: self.request.slot,
+            timing: match pass {
+                Pass::Here(timing) => Some(timing),
+                Pass::On(..) => None,
+            },
+        })
     }
 
     /// The passed line of a run that ran as `pass` says, its log shown as `shown`.
@@ -1314,6 +1377,54 @@ fn whole_seconds(seconds: f64) -> f64 {
     seconds.round_ties_even()
 }
 
+/// What the cores line of a run is decided from: whether it passed, whether it took its own slot (not covered by a
+/// parent's, nor lent one), the slot kind it asked for, and how long it ran here, `None` for a run on a builder.
+#[derive(Clone, Copy)]
+struct Judged {
+    passed: bool,
+    own_slot: bool,
+    slot: Slot,
+    timing: Option<Timing>,
+}
+
+/// Whether a run under `nesting` took a slot of its own: not when a parent's slot covers it, nor when a light parent
+/// lent it its slot (`lent`). A run here after a fallback from a builder takes its own local slot like any other.
+fn takes_own_slot(nesting: &Nesting, lent: bool) -> bool {
+    nesting.covering().is_none() && !lent
+}
+
+/// The cores line of `judged`, when its slot did not fit: only a passed run that ran here on its own light or heavy
+/// slot for at least [`HINT_MIN_WALL`] of unpaused wall time, with no gate under it that took a slot of its own, is
+/// judged, and only when its cores are known.
+fn cores_hint_for(judged: Judged) -> Option<String> {
+    let timing = judged.timing.filter(|_| judged.passed && judged.own_slot)?;
+    if timing.nested_took_slot || timing.wall.saturating_sub(timing.paused) < HINT_MIN_WALL {
+        return None;
+    }
+    let slot = match judged.slot {
+        Slot::Light => SlotKind::Light,
+        Slot::Heavy => SlotKind::Heavy,
+        Slot::Critical => SlotKind::Critical,
+    };
+    let cores = timing.cores?;
+    hint(cores, slot).map(|misfit| cores_line(cores, misfit))
+}
+
+/// The line that tells a run its slot did not fit, `misfit` as `cores` show it: the average and free cores to one
+/// decimal, the peak to a whole number, halves to even.
+fn cores_line(cores: Cores, misfit: Hint) -> String {
+    let (slot, advice) = match misfit {
+        Hint::Hot => ("light", "work that keeps more than 2 busy belongs on heavy"),
+        Hint::Cold => ("heavy", "work that keeps under 1.5 busy fits on light"),
+    };
+    format!(
+        "gate: used {:.1} cores on average (peak {}, {:.1} free) on a {slot} slot; {advice}",
+        cores.avg,
+        cores.peak.round_ties_even(),
+        cores.free
+    )
+}
+
 /// The line a routed run says as it falls back here for `reason` from the builder `host`; a client that could not
 /// start says why, `detail`.
 fn fallback_line(host: &str, reason: FallbackReason, detail: Option<&str>) -> String {
@@ -1329,12 +1440,14 @@ fn fallback_line(host: &str, reason: FallbackReason, detail: Option<&str>) -> St
 /// A line holding a failure marker: its number, counted from 1, and its text as printed.
 type Marker = (usize, String);
 
-fn take_event(slots: Vec<String>, waited_seconds: f64, abandoned: Vec<String>) -> JournalEvent {
+/// The `take` of a slot of a pool, naming `parent_pid` when the gate runs under a parent whose slot did not cover it.
+fn take_event(slots: Vec<String>, waited_seconds: f64, abandoned: Vec<String>, parent_pid: Option<u32>) -> JournalEvent {
     JournalEvent::Take {
         slots,
         waited_seconds,
         abandoned,
         machine: None,
+        parent_pid,
     }
 }
 
@@ -1348,7 +1461,112 @@ mod tests {
     use std::fs;
     use std::process::Command;
 
-    use super::log_in_state_root;
+    use std::time::Duration;
+
+    use gate_args::Slot;
+    use gate_watchdog::{Cores, Hint};
+
+    use super::{Judged, Timing, cores_hint_for, cores_line, log_in_state_root, takes_own_slot};
+    use crate::nesting::{Nesting, Parent};
+
+    #[test]
+    fn only_a_run_neither_covered_nor_lent_takes_its_own_slot() {
+        let parent = Parent {
+            held: Slot::Light,
+            pid: 4242,
+            start_ms: 1,
+            marker: "light:4242:1".to_owned(),
+        };
+        let rows: [(&str, Nesting, bool, bool); 5] = [
+            ("covered by its parent's slot", Nesting::Covered(parent.clone()), false, false),
+            ("lent its light parent's slot", Nesting::Under(parent.clone()), true, false),
+            ("under a parent whose slot does not cover it", Nesting::Under(parent), false, true),
+            ("under no parent, here after a fallback or from the start", Nesting::Own, false, true),
+            ("with an ignored marker", Nesting::Malformed("x".to_owned()), false, true),
+        ];
+        for (name, nesting, lent, want) in rows {
+            assert_eq!(takes_own_slot(&nesting, lent), want, "{name}");
+        }
+    }
+
+    const HOT: Cores = Cores {
+        avg: 3.0,
+        peak: 4.0,
+        free: 12.0,
+    };
+    const COLD: Cores = Cores {
+        avg: 0.5,
+        peak: 1.0,
+        free: 12.0,
+    };
+
+    /// A passed run here on its own `slot` slot for `wall_s` seconds, `paused_s` of them paused, with `cores`.
+    fn judged(slot: Slot, wall_s: u64, paused_s: u64, cores: Cores) -> Judged {
+        Judged {
+            passed: true,
+            own_slot: true,
+            slot,
+            timing: Some(Timing {
+                wall: Duration::from_secs(wall_s),
+                adjusted: Some(1.0),
+                paused: Duration::from_secs(paused_s),
+                cores: Some(cores),
+                nested_took_slot: false,
+            }),
+        }
+    }
+
+    #[test]
+    fn the_cores_line_is_said_only_for_a_misfit_of_a_judged_run() {
+        let hot = judged(Slot::Light, 12, 0, HOT);
+        let nested = Judged {
+            timing: hot.timing.map(|timing| Timing {
+                nested_took_slot: true,
+                ..timing
+            }),
+            ..hot
+        };
+        let rows: [(&str, Judged, Option<&str>); 9] = [
+            ("failed", Judged { passed: false, ..hot }, None),
+            ("routed", Judged { timing: None, ..hot }, None),
+            ("not on its own slot", Judged { own_slot: false, ..hot }, None),
+            ("critical", judged(Slot::Critical, 12, 0, HOT), None),
+            ("under 10 s unpaused", judged(Slot::Light, 12, 3, HOT), None),
+            ("a gate under it took a slot", nested, None),
+            ("hot", hot, Some("on a light slot")),
+            ("cold", judged(Slot::Heavy, 10, 0, COLD), Some("on a heavy slot")),
+            ("fitted", judged(Slot::Heavy, 12, 0, HOT), None),
+        ];
+        for (name, judged, want) in rows {
+            let line = cores_hint_for(judged);
+            match want {
+                Some(part) => assert!(line.as_deref().is_some_and(|line| line.contains(part)), "{name}: {line:?}"),
+                None => assert_eq!(line, None, "{name}"),
+            }
+        }
+    }
+
+    #[test]
+    fn the_cores_line_says_each_misfit_with_its_rounding() {
+        let hot = Cores {
+            avg: 7.44,
+            peak: 14.6,
+            free: 9.26,
+        };
+        assert_eq!(
+            cores_line(hot, Hint::Hot),
+            "gate: used 7.4 cores on average (peak 15, 9.3 free) on a light slot; work that keeps more than 2 busy belongs on heavy"
+        );
+        let cold = Cores {
+            avg: 0.04,
+            peak: 0.5,
+            free: 12.0,
+        };
+        assert_eq!(
+            cores_line(cold, Hint::Cold),
+            "gate: used 0.0 cores on average (peak 0, 12.0 free) on a heavy slot; work that keeps under 1.5 busy fits on light"
+        );
+    }
 
     #[test]
     fn a_log_reached_through_a_junction_into_the_state_root_is_inside_it() {

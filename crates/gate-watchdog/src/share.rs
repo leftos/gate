@@ -40,33 +40,39 @@ impl Machine {
     /// The machine `cores` logical processors offer a command that may use `demand` of them.
     ///
     /// The demand is the caller's, as `New-Watch` computes it: `min(cores, the light pool's threads)` for a light gate
-    /// and `cores` for every other. `free_share` clamps nothing itself, so the caller that knows the pool clamps.
+    /// and `cores` for every other. `share_of` clamps no demand itself, so the caller that knows the pool clamps.
     #[must_use]
     pub fn new(cores: u32, demand: u32, high: bool) -> Self {
         Self { cores, demand, high }
     }
 }
 
-/// The share of its demand the command could have had over the interval from `before` to `after`: a High-priority
-/// command always has all of it. Otherwise the machine's busy cores, `busy * cores`, less the `own_gained` cores the
-/// command used itself, are the cores others held; what is left of the demand is the share.
-///
-/// The demand is taken as given, as `Get-FreeShare` takes it; what is clamped here is the share, to `[0.05, 1]`.
+/// The share of its demand a command could have had when others left `free_cores` of the machine free ([`free_cores`]):
+/// all of it for a High-priority command, else the free cores over the demand, clamped to `[0.05, 1]`. The demand is
+/// taken as given, as `Get-FreeShare` takes it; what is clamped here is the share.
+#[must_use]
+pub(crate) fn share_of(machine: Machine, free_cores: f64) -> f64 {
+    if machine.high {
+        return 1.0;
+    }
+    (free_cores / f64::from(machine.demand)).clamp(0.05, 1.0)
+}
+
+/// The cores other processes left free over the interval from `before` to `after`, unclamped: the machine's busy cores,
+/// `busy * cores`, less the `own_gained` cores the command used itself, are the cores others held, and the rest of the
+/// machine's cores are free. A High-priority command is measured the same way.
 #[must_use]
 #[expect(
     clippy::cast_precision_loss,
     reason = "the PowerShell gate divides these tick counts as doubles, so the same loss keeps the share equal"
 )]
-pub fn free_share(machine: Machine, before: SystemTimes, after: SystemTimes, own_gained: Ticks, interval_s: f64) -> f64 {
-    if machine.high {
-        return 1.0;
-    }
+pub(crate) fn free_cores(machine: Machine, before: SystemTimes, after: SystemTimes, own_gained: Ticks, interval_s: f64) -> f64 {
     let idle = after.idle.saturating_sub(before.idle);
     let total = after.kernel.saturating_sub(before.kernel) + after.user.saturating_sub(before.user);
     let busy = if total > 0 { 1.0 - (idle as f64 / total as f64) } else { 0.0 };
     let own_cores = (own_gained.0 as f64 / 1e7) / interval_s;
     let others = (busy * f64::from(machine.cores) - own_cores).max(0.0);
-    ((f64::from(machine.cores) - others) / f64::from(machine.demand)).clamp(0.05, 1.0)
+    f64::from(machine.cores) - others
 }
 
 #[cfg(test)]
@@ -83,7 +89,7 @@ mod tests {
         let machine = Machine::new(16, demand, high);
         let before = SystemTimes { idle: 0, kernel: 0, user: 0 };
         let after = SystemTimes { idle, kernel: idle, user };
-        free_share(machine, before, after, Ticks(own_cores * TICKS_PER_CORE), 10.0)
+        share_of(machine, free_cores(machine, before, after, Ticks(own_cores * TICKS_PER_CORE), 10.0))
     }
 
     /// The rows of `Test-FreeShare` (`gate.selftest.ps1`), in its order: a light gate's demand is its pool's two

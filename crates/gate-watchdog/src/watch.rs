@@ -4,7 +4,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
-use crate::share::{Machine, SystemTimes, Ticks, free_share};
+use crate::cores::{Cores, tenths};
+use crate::share::{Machine, SystemTimes, Ticks, free_cores, share_of};
 
 /// The shortest interval a sample may measure, so two samples at the same instant still count a millisecond.
 const MIN_INTERVAL: Duration = Duration::from_millis(1);
@@ -82,6 +83,25 @@ pub struct Watch {
     vm_percent: f64,
     sampled: bool,
     sampler_failed: bool,
+    /// Whether the last sample's job held a build client, so the stretch after it counts the build servers' CPU.
+    build_client: bool,
+    tally: Tally,
+}
+
+/// The command's busy and free cores counted so far, which [`Watch::cores`] reads.
+#[derive(Clone, Debug, Default)]
+struct Tally {
+    /// The command's own CPU in 100 ns ticks: every unpaused sample's, and the stretch after the last sample, which
+    /// the exit's last read measures.
+    own_ticks: u64,
+    /// The highest own CPU over one unpaused sample's interval, in cores.
+    peak_cores: f64,
+    /// The free cores of every unpaused sample, summed.
+    free_cores_sum: f64,
+    /// The unpaused samples counted in `free_cores_sum`.
+    unpaused_samples: u32,
+    /// Whether the command's CPU could not be read at its end, so its cores are unknown.
+    unread: bool,
 }
 
 impl Watch {
@@ -112,6 +132,8 @@ impl Watch {
             vm_percent: 0.0,
             sampled: false,
             sampler_failed: false,
+            build_client: false,
+            tally: Tally::default(),
         }
     }
 
@@ -140,13 +162,16 @@ impl Watch {
             self.progress_cpu = sample.job_cpu;
             self.vm_busy = 0;
         }
-        let free = free_share(self.machine, self.system, sample.system, own_gained, interval.as_secs_f64());
+        let free_cores = free_cores(self.machine, self.system, sample.system, own_gained, interval.as_secs_f64());
+        let free = share_of(self.machine, free_cores);
         if sample.paused {
             self.paused += interval;
         } else {
             self.adjusted += interval.as_secs_f64() * free;
+            self.count_cores(own_gained, interval, free_cores);
         }
         self.last_free = free;
+        self.build_client = sample.build_client;
         self.sampled = true;
         self.last_at = sample.at;
         self.last_began = sample.began;
@@ -192,6 +217,61 @@ impl Watch {
         self.vm_percent = gained_seconds / interval.as_secs_f64() * 100.0;
         self.vm_busy = self.vm_busy.saturating_add(gained);
         u128::from(self.vm_busy) >= floor
+    }
+
+    /// Counts one unpaused sample's own CPU, `own_gained` over `interval`, toward the average and the peak, and the
+    /// `free_cores` it found toward their mean.
+    fn count_cores(&mut self, own_gained: Ticks, interval: Duration, free_cores: f64) {
+        let tally = &mut self.tally;
+        tally.own_ticks = tally.own_ticks.saturating_add(own_gained.0);
+        let own_cores = ticks_seconds(own_gained) / interval.as_secs_f64();
+        tally.peak_cores = tally.peak_cores.max(own_cores);
+        tally.free_cores_sum += free_cores;
+        tally.unpaused_samples += 1;
+    }
+
+    /// The command's CPU read once more as it exited: the job's total CPU `job_cpu`, and the CPU of the build servers
+    /// the last sample counted that still run, by pid, `new_servers` and `shared_servers` as a sample carries them.
+    /// The stretch since the last sample counts toward the average on the same basis as a sample's: the servers count
+    /// only when the last sample's job held a build client. Nothing is counted once the sampler has failed.
+    pub fn final_cpu(&mut self, job_cpu: Ticks, new_servers: &BTreeMap<u32, u64>, shared_servers: &BTreeMap<u32, u64>) {
+        if self.sampler_failed {
+            return;
+        }
+        let gained = own_gained(
+            job_cpu.saturating_sub(self.job_cpu),
+            measure_cpu(&self.new_servers, new_servers),
+            measure_cpu(&self.shared_servers, shared_servers),
+            self.build_client,
+        );
+        self.tally.own_ticks = self.tally.own_ticks.saturating_add(gained.0);
+        self.job_cpu = job_cpu;
+        self.new_servers.clone_from(new_servers);
+        self.shared_servers.clone_from(shared_servers);
+    }
+
+    /// Records that the command's CPU could not be read at its end, so its cores are unknown; the load-adjusted clock
+    /// is unaffected.
+    pub fn cores_unread(&mut self) {
+        self.tally.unread = true;
+    }
+
+    /// The command's average, peak and free cores: the own CPU counted over the wall time the watch counted, the
+    /// paused stretches left out of both, and the mean of the free cores the unpaused samples found, each kept to one
+    /// decimal; and the busiest unpaused sample interval, unrounded. `None` before an unpaused sample, once the sampler
+    /// has failed, and when the CPU could not be read at the command's end.
+    #[must_use]
+    pub fn cores(&self) -> Option<Cores> {
+        let counted = self.last_at.saturating_sub(self.paused);
+        let tally = &self.tally;
+        if tally.unpaused_samples == 0 || self.sampler_failed || tally.unread || counted.is_zero() {
+            return None;
+        }
+        Some(Cores {
+            avg: tenths(ticks_seconds(Ticks(tally.own_ticks)) / counted.as_secs_f64()),
+            peak: tally.peak_cores,
+            free: tenths(tally.free_cores_sum / f64::from(tally.unpaused_samples)),
+        })
     }
 
     /// Records that a sample failed, and returns the line the gate says for it.
@@ -358,6 +438,11 @@ pub fn measure_cpu(before: &BTreeMap<u32, u64>, after: &BTreeMap<u32, u64>) -> C
         }
     }
     moved
+}
+
+/// `ticks` of CPU in seconds.
+fn ticks_seconds(ticks: Ticks) -> f64 {
+    Duration::from_nanos(ticks.0.saturating_mul(100)).as_secs_f64()
 }
 
 /// The command's own CPU over the interval, in ticks: its job's gain, plus, while the job holds a build client, the
@@ -1360,6 +1445,129 @@ mod tests {
             matches!(watch.kill_check(Duration::from_millis(5000)), Some(Kill::Stalled { .. })),
             "a command that is not a WSL one counts no VM CPU"
         );
+    }
+
+    /// 100 ns ticks in one core-second.
+    const CORE_SECOND: u64 = 10_000_000;
+
+    /// The average, peak and free cores `watch` found, which must be known.
+    #[expect(clippy::expect_used, reason = "a case whose cores are unknown must fail loudly")]
+    fn known_cores(watch: &Watch) -> Cores {
+        watch.cores().expect("a watch with an unpaused sample knows its cores")
+    }
+
+    fn assert_near(got: f64, want: f64, what: &str) {
+        assert!((got - want).abs() < 1e-9, "{what}: got {got}, expected {want}");
+    }
+
+    #[test]
+    fn cores_average_the_own_cpu_over_the_wall_time_with_the_final_stretch() {
+        let mut watch = watching(config(60_000, 5000));
+        // 20 core-seconds over the first 5 s, 10 over the next 5, then 4 over the last 2 s that only the exit's read sees.
+        watch.sample(&tick(5000, 20 * CORE_SECOND, 0, &[], false));
+        watch.sample(&tick(10_000, 30 * CORE_SECOND, 0, &[], false));
+        watch.final_cpu(Ticks(34 * CORE_SECOND), &BTreeMap::new(), &BTreeMap::new());
+        watch.exited(Duration::from_secs(12));
+        let cores = known_cores(&watch);
+        assert_near(cores.avg, 2.8, "34 core-seconds over 12 s is 2.83, kept to one decimal");
+        assert_near(cores.peak, 4.0, "the busiest interval kept 4 cores busy");
+        assert_near(cores.free, 16.0, "an idle 16-core machine leaves every core free");
+    }
+
+    #[test]
+    fn the_final_stretch_counts_toward_the_average_only_through_the_exit_read() {
+        let mut watch = watching(config(60_000, 5000));
+        watch.sample(&tick(5000, 0, 0, &[], false));
+        watch.exited(Duration::from_millis(10_000));
+        assert_near(known_cores(&watch).avg, 0.0, "without the exit's read the last 5 s count nothing");
+
+        let mut watch = watching(config(60_000, 5000));
+        watch.sample(&tick(5000, 0, 0, &[], false));
+        watch.final_cpu(Ticks(10 * CORE_SECOND), &BTreeMap::new(), &BTreeMap::new());
+        watch.exited(Duration::from_millis(10_000));
+        assert_near(known_cores(&watch).avg, 1.0, "10 core-seconds over 10 s");
+        assert_near(known_cores(&watch).peak, 0.0, "the final stretch is no sampler interval");
+    }
+
+    #[test]
+    fn the_final_stretch_counts_the_build_servers_only_when_the_last_sample_held_a_client() {
+        // A server the command started and a shared compiler server, each with 1 core-second at the last sample; by the
+        // exit they have 6 and 3, so the last 5 s add 5 + 2 core-seconds when the job held a client.
+        let new = [(70, CORE_SECOND)];
+        let shared = [(80, CORE_SECOND)];
+        let ended_new: BTreeMap<u32, u64> = [(70, 6 * CORE_SECOND)].into_iter().collect();
+        let ended_shared: BTreeMap<u32, u64> = [(80, 3 * CORE_SECOND)].into_iter().collect();
+        for (client, want) in [(true, 0.7), (false, 0.0)] {
+            let mut watch = watching(config(60_000, 5000));
+            watch.sample(&server_tick(5000, &[], &new, &shared, client));
+            let sampled = ticks_seconds(Ticks(watch.tally.own_ticks));
+            watch.final_cpu(Ticks(0), &ended_new, &ended_shared);
+            watch.exited(Duration::from_millis(10_000));
+            let last_stretch = ticks_seconds(Ticks(watch.tally.own_ticks)) - sampled;
+            assert_near(
+                last_stretch / 10.0,
+                want,
+                &format!("client {client}: the last stretch's servers over 10 s"),
+            );
+        }
+    }
+
+    #[test]
+    fn cores_are_unknown_when_the_end_could_not_be_read() {
+        let mut watch = watching(config(60_000, 5000));
+        watch.sample(&tick(5000, CORE_SECOND, 0, &[], false));
+        watch.cores_unread();
+        watch.exited(Duration::from_millis(6000));
+        assert_eq!(watch.cores(), None, "the end's read failed");
+        assert!(
+            (watch.adjusted_seconds() - 6.0).abs() < 1e-9,
+            "the load-adjusted clock still counts the last stretch, got {}",
+            watch.adjusted_seconds()
+        );
+    }
+
+    #[test]
+    fn paused_samples_leave_the_average_peak_free_and_wall_alone() {
+        let mut watch = watching(config(60_000, 5000));
+        // 25 core-seconds while paused, then 1 over the next 5 s on a half-busy machine.
+        watch.sample(&tick(5000, 25 * CORE_SECOND, 0, &[], true));
+        let mut busy = tick(10_000, 26 * CORE_SECOND, 0, &[], false);
+        busy.system = HALF_BUSY;
+        watch.sample(&busy);
+        watch.exited(Duration::from_millis(10_000));
+        let cores = known_cores(&watch);
+        assert_near(cores.peak, 0.2, "the paused interval's 5 cores are not the peak");
+        assert_near(cores.avg, 0.2, "the 1 core-second of the 5 s that were not paused");
+        // Of 16 cores, 8 are busy and 0.2 of those are the command's own: 7.8 held by others, 8.2 free.
+        assert_near(cores.free, 8.2, "only the unpaused sample's free cores");
+    }
+
+    #[test]
+    fn free_cores_are_the_mean_over_the_samples() {
+        let mut watch = watching(config(60_000, 5000));
+        watch.sample(&tick(10_000, 0, 0, &[], false));
+        watch.sample(&sample(20_000, HALF_BUSY_30S, false));
+        // An idle machine leaves 16 free, the half-busy one 8: the mean is 12, whatever the intervals' lengths.
+        assert_near(known_cores(&watch).free, 12.0, "the mean of 16 and 8");
+    }
+
+    #[test]
+    fn cores_are_unknown_without_an_unpaused_sample_or_once_the_sampler_failed() {
+        let mut watch = watching(config(60_000, 5000));
+        watch.final_cpu(Ticks(10 * CORE_SECOND), &BTreeMap::new(), &BTreeMap::new());
+        watch.exited(Duration::from_millis(3000));
+        assert_eq!(watch.cores(), None, "no sample");
+
+        let mut watch = watching(config(60_000, 5000));
+        watch.sample(&tick(5000, 0, 0, &[], true));
+        watch.exited(Duration::from_millis(6000));
+        assert_eq!(watch.cores(), None, "only a paused sample");
+
+        let mut watch = watching(config(60_000, 5000));
+        watch.sample(&tick(5000, 0, 0, &[], false));
+        watch.sampler_failed("the job is gone");
+        watch.exited(Duration::from_millis(6000));
+        assert_eq!(watch.cores(), None, "the sampler failed");
     }
 
     #[test]

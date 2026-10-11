@@ -18,6 +18,7 @@
 //! kept; `write <path> <text>` writes the text to the file at the path, replacing it, its folders made when missing;
 //! `fill <path> <bytes>` writes a file of that many `x` bytes at the path, its folders made when missing, through a
 //! fixed buffer, so its size never sits in memory;
+//! `burn-threads <n> <ms>` spins on the CPU on n threads for ms of wall time, then goes on to its next step;
 //! `argv` prints every word after it, each on its own line, and ends, so it is always the last step.
 //! With no `exit` step it exits 0. For example `fake-tool out hi err oops exit 3`.
 
@@ -139,6 +140,15 @@ fn run(args: &[OsString]) -> Result<i32, String> {
                 writeln!(stdout, "pid {}", std::process::id()).map_err(|error| write_failed(&error))?;
                 stdout.flush().map_err(|error| write_failed(&error))?;
             }
+            "burn-threads" => {
+                let threads = operand(&mut steps, "burn-threads")?;
+                let threads: usize = threads
+                    .parse()
+                    .map_err(|_| format!("burn-threads takes a thread count, got '{threads}'"))?;
+                let ms = operand(&mut steps, "burn-threads")?;
+                let ms: u64 = ms.parse().map_err(|_| format!("burn-threads takes milliseconds, got '{ms}'"))?;
+                burn_threads(threads, Duration::from_millis(ms))?;
+            }
             other => return Err(format!("unknown step '{other}'")),
         }
     }
@@ -183,6 +193,26 @@ fn burn_until(path: &str) -> Result<(), String> {
             Err(error) => return Err(format!("cannot check {path}: {error}")),
         }
     }
+}
+
+/// Spins on the CPU on `threads` threads until `wall` has passed, so the command keeps that many cores busy for as long
+/// as the machine gives them.
+fn burn_threads(threads: usize, wall: Duration) -> Result<(), String> {
+    let until = Instant::now() + wall;
+    let burners: Vec<_> = (0..threads)
+        .map(|_| {
+            thread::spawn(move || {
+                let mut state: u64 = 1;
+                while Instant::now() < until {
+                    state = std::hint::black_box(state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407));
+                }
+            })
+        })
+        .collect();
+    for burner in burners {
+        burner.join().map_err(|_| "a burning thread panicked".to_owned())?;
+    }
+    Ok(())
 }
 
 /// Prints a numbered line about every [`CHATTER_STEP`], flushing each, until the file at `path` exists: the log a case's

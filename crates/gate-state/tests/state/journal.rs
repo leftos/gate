@@ -257,6 +257,25 @@ fn reserved_take_fields_are_accepted() {
 }
 
 #[test]
+fn a_take_naming_its_parent_is_accepted_and_runs_on_its_own_slot() {
+    let gate = Gate::new(1, START, COMMAND);
+    let lines = vec![
+        versioned(&gate.queue(&ago(30)), 1),
+        versioned(&with_fields(&gate.take(&ago(29), 0.5), &json!({"parentPid": 4242})), 1),
+    ];
+
+    let history = history_of("a_take_naming_its_parent_is_accepted_and_runs_on_its_own_slot", &lines);
+
+    assert_eq!(states(&history), [RunState::Unrecorded]);
+    let run = &history.runs[0];
+    assert_eq!(
+        (run.started.as_deref(), run.slot, run.parent_pid),
+        (Some(ago(29).as_str()), Some(1), None),
+        "a take's parentPid does not put the run on that parent's slot"
+    );
+}
+
+#[test]
 fn line_with_unknown_v_is_skipped() {
     let future = Gate::new(1, START, "cargo build");
     let current = Gate::new(2, START, COMMAND);

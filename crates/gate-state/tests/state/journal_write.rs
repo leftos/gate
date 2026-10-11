@@ -243,6 +243,7 @@ fn a_routed_take_line_puts_the_remote_fields_after_waited_seconds_and_before_aba
             waited_seconds: 0.135,
             abandoned,
             machine: None,
+            parent_pid: None,
         };
         journal_line(&identity(), ts(NOW), &event, Some(&tag()), None)
     };
@@ -269,6 +270,7 @@ fn a_critical_take_line_puts_its_snapshot_after_waited_seconds_and_before_abando
             waited_seconds: 1.5,
             abandoned,
             machine: Some(machine),
+            parent_pid: None,
         };
         journal_line(&identity(), ts(NOW), &event, None, None)
     };
@@ -311,6 +313,9 @@ fn a_routed_release_line_puts_the_remote_fields_after_the_verdict() {
         facts: Some(RunFacts {
             wall_seconds: 12.4,
             adjusted_seconds: None,
+            avg_cores: None,
+            peak_cores: None,
+            free_cores: None,
             verdict: Verdict::Passed,
         }),
     };
@@ -415,6 +420,7 @@ fn a_line_without_a_remote_tag_has_no_remote_field() {
             waited_seconds: 0.5,
             abandoned: Vec::new(),
             machine: None,
+            parent_pid: None,
         },
         release(None),
         JournalEvent::Abandon { waited_seconds: 1.7 },
@@ -432,6 +438,7 @@ fn a_line_without_a_remote_tag_has_no_remote_field() {
         waited_seconds: 3.875,
         abandoned: Vec::new(),
         machine: None,
+        parent_pid: None,
     };
     let line = journal_line(&identity(), ts(NOW), &local_take, None, None);
     assert_eq!(own_fields(&line), own_fields(remote_fixture(5)), "the local take after a fallback");
@@ -458,6 +465,7 @@ fn line_starts_with_v_then_the_common_keys_in_order() {
             waited_seconds: 0.0,
             abandoned: Vec::new(),
             machine: None,
+            parent_pid: None,
         },
         None,
         None,
@@ -465,6 +473,9 @@ fn line_starts_with_v_then_the_common_keys_in_order() {
     let facts = RunFacts {
         wall_seconds: 0.1,
         adjusted_seconds: Some(0.2),
+        avg_cores: None,
+        peak_cores: None,
+        free_cores: None,
         verdict: Verdict::Passed,
     };
     let released = journal_line(&identity(), time, &release(Some(facts)), None, None);
@@ -576,6 +587,7 @@ fn seconds_round_to_three_decimals() {
             waited_seconds: 1.234_56,
             abandoned: Vec::new(),
             machine: None,
+            parent_pid: None,
         },
         None,
         None,
@@ -590,6 +602,9 @@ fn seconds_round_to_three_decimals() {
             facts: Some(RunFacts {
                 wall_seconds: 10.308_49,
                 adjusted_seconds: Some(2.999_9),
+                avg_cores: None,
+                peak_cores: None,
+                free_cores: None,
                 verdict: Verdict::Failed,
             }),
         },
@@ -605,6 +620,78 @@ fn seconds_round_to_three_decimals() {
 }
 
 #[test]
+fn a_take_under_a_parent_names_it_after_waited_seconds() {
+    let take = |parent_pid: Option<u32>| {
+        let event = JournalEvent::Take {
+            slots: vec![r"Local\gate-slot-0".to_owned()],
+            waited_seconds: 0.25,
+            abandoned: Vec::new(),
+            machine: None,
+            parent_pid,
+        };
+        journal_line(&identity(), ts(NOW), &event, None, None)
+    };
+
+    let under = take(Some(4242));
+    assert_eq!(own_keys(&under), ["slots", "waitedSeconds", "parentPid"]);
+    assert_eq!(parsed(&under)["parentPid"], 4242);
+    assert_eq!(own_keys(&take(None)), ["slots", "waitedSeconds"], "a gate under no parent names none");
+}
+
+#[test]
+fn release_with_cores_writes_them_after_adjusted_seconds_to_one_decimal() {
+    let facts = RunFacts {
+        wall_seconds: 12.0,
+        adjusted_seconds: Some(11.0),
+        avg_cores: Some(7.44),
+        peak_cores: Some(14.56),
+        free_cores: Some(0.25),
+        verdict: Verdict::Passed,
+    };
+    let released = journal_line(&identity(), ts(NOW), &release(Some(facts)), None, None);
+
+    assert_eq!(
+        own_keys(&released),
+        [
+            "slots",
+            "heldSeconds",
+            "status",
+            "wallSeconds",
+            "adjustedSeconds",
+            "avgCores",
+            "peakCores",
+            "freeCores",
+            "verdict"
+        ]
+    );
+    assert!(
+        released.ends_with(r#""adjustedSeconds":11.0,"avgCores":7.4,"peakCores":14.6,"freeCores":0.2,"verdict":"passed"}"#),
+        "{released}"
+    );
+}
+
+#[test]
+fn release_without_cores_omits_them() {
+    let facts = RunFacts {
+        wall_seconds: 12.0,
+        adjusted_seconds: Some(11.0),
+        avg_cores: None,
+        peak_cores: None,
+        free_cores: None,
+        verdict: Verdict::Passed,
+    };
+    let measured = journal_line(&identity(), ts(NOW), &release(Some(facts)), None, None);
+    let unknown = journal_line(&identity(), ts(NOW), &release(None), None, None);
+
+    for line in [measured, unknown] {
+        assert!(
+            ["avgCores", "peakCores", "freeCores"].iter().all(|key| parsed(&line).get(key).is_none()),
+            "{line}"
+        );
+    }
+}
+
+#[test]
 fn seconds_round_a_midpoint_to_even_as_dotnet_does() {
     let waited = |seconds: f64| {
         let line = journal_line(
@@ -615,6 +702,7 @@ fn seconds_round_a_midpoint_to_even_as_dotnet_does() {
                 waited_seconds: seconds,
                 abandoned: Vec::new(),
                 machine: None,
+                parent_pid: None,
             },
             None,
             None,
@@ -767,6 +855,7 @@ fn a_take_with_abandoned_slots_lists_them_after_waited_seconds() {
             waited_seconds: 0.5,
             abandoned: vec![r"Local\gate-1a2b3c4d-slot-0".to_owned()],
             machine: None,
+            parent_pid: None,
         },
         None,
         None,
@@ -788,6 +877,7 @@ fn a_take_with_no_abandoned_slots_has_no_abandoned_key() {
             waited_seconds: 0.5,
             abandoned: Vec::new(),
             machine: None,
+            parent_pid: None,
         },
         None,
         None,
@@ -826,6 +916,7 @@ fn journal_line_puts_the_lock_after_the_slots_on_a_take() {
             waited_seconds: 0.5,
             abandoned: vec![r"Local\gate-1a2b3c4d-slot-0".to_owned()],
             machine: None,
+            parent_pid: None,
         },
         None,
         Some(r"Local\gate-test-journal"),
@@ -876,6 +967,7 @@ fn an_abandoned_lock_on_a_take_with_abandoned_slots_extends_its_list() {
                 waited_seconds: 0.5,
                 abandoned: vec![r"Local\gate-1a2b3c4d-slot-0".to_owned()],
                 machine: None,
+                parent_pid: None,
             },
             None,
             abandoned,

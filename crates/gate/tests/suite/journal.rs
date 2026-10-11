@@ -138,9 +138,11 @@ fn a_run_journals_queue_take_release_in_order() {
         ],
     );
     assert!(
-        regex::Regex::new(r#""event":"release".*"adjustedSeconds":\d+(\.\d+)?,"verdict":"passed"\}\n"#)
-            .expect("the pattern is valid")
-            .is_match(&journal),
+        regex::Regex::new(
+            r#""event":"release".*"adjustedSeconds":\d+(\.\d+)?(,"avgCores":[\d.]+,"peakCores":[\d.]+,"freeCores":[\d.]+)?,"verdict":"passed"\}\n"#
+        )
+        .expect("the pattern is valid")
+        .is_match(&journal),
         "the release's load-adjusted seconds are a number, then the verdict: {journal}"
     );
     let lines: Vec<Value> = journal.lines().map(parsed).collect();
