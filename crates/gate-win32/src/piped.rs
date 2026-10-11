@@ -1,7 +1,8 @@
 //! Commands created suspended with their output piped back: stdin from `NUL`, stdout and stderr into two anonymous
 //! pipes whose read ends stay with the caller, outside the caller's own job and on a hidden console of their own or the
 //! caller's, then put in a named job and resumed. The command also inherits a handle to that job, so the job's name
-//! lasts while the command runs even after the caller is gone.
+//! lasts while the command runs even after the caller is gone; unless the job kills on close, which a command holding a
+//! handle to it would keep open.
 
 use std::fs::File;
 use std::io;
@@ -64,8 +65,10 @@ impl PipedLaunch {
     /// (`CREATE_BREAKAWAY_FROM_JOB`, which fails when that job refuses breakaway) and on the console
     /// [`PipedLaunch::console`] names: a hidden one of its own (`CREATE_NO_WINDOW`), or this process's. Its stdin is
     /// `NUL` and its stdout and stderr the write ends of two new pipes; it inherits exactly those three handles and one
-    /// to `job`, opened by the job's name with query access only, so the name lasts as long as the command runs.
-    /// This process's copies of those four handles are closed before the call returns; the read ends are never
+    /// to `job`, opened by the job's name with query access only, so the name lasts as long as the command runs. A job
+    /// made by [`Job::create_kill_on_close`] is the exception: the command inherits no handle to it, as one would keep
+    /// the job open, and the command alive, after this process's last handle to it is closed.
+    /// This process's copies of those handles are closed before the call returns; the read ends are never
     /// inheritable. The command is not yet in `job`: the caller puts it there with [`Suspended::assign_and_resume`].
     ///
     /// This process's own handles to those four are never inheritable: the command inherits copies open only while the
@@ -78,7 +81,8 @@ impl PipedLaunch {
     /// or a handle, a pipe or the attribute list cannot be made.
     pub fn start_suspended(&self, job: &Job) -> Result<PipedSuspended, LaunchError> {
         check_launch(&self.command_line, &self.application, &[("working folder", self.directory.as_path())])?;
-        let job_handle = open_job(job)?;
+        let job_handle = if job.kills_on_close() { None } else { Some(open_job(job)?) };
+        let others: Vec<(&OwnedHandle, Option<u32>)> = job_handle.iter().map(|handle| (handle, Some(JOB_OBJECT_QUERY))).collect();
         let input = open_shared(Path::new("NUL"), GENERIC_READ, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL)?;
         let (stdout, output) = pipe_from_child("stdout")?;
         let (stderr, errors) = pipe_from_child("stderr")?;
@@ -90,7 +94,7 @@ impl PipedLaunch {
         };
         let inherited = Inherited {
             stdio: [&input, &output, &errors],
-            others: &[(&job_handle, Some(JOB_OBJECT_QUERY))],
+            others: &others,
         };
         let flags = match self.console {
             PipedConsole::Hidden => CREATE_BREAKAWAY_FROM_JOB | CREATE_NO_WINDOW,

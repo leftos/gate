@@ -154,7 +154,7 @@ pub(crate) fn exit_code(status: ExitStatus) -> i32 {
 /// The file `word` names, found as `gate run` finds a command's program: along the gate's own `PATH` and `PATHEXT`,
 /// never in the working folder unless `PATH` names it. `None` when it is not found; else why it could not be looked
 /// for.
-fn locate(word: &str) -> Result<Option<PathBuf>, String> {
+pub(crate) fn locate(word: &str) -> Result<Option<PathBuf>, String> {
     let folder = std::env::current_dir().map_err(|error| format!("cannot read the working directory: {error}"))?;
     match find_program(word, &Variables::from_process(), &folder) {
         Ok(program) => Ok(Some(program)),

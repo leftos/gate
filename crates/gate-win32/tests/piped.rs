@@ -1,6 +1,7 @@
 //! Commands started with their output piped back: stdout and stderr arrive on the two read ends, which end once the
 //! command exits; the command runs in the named job; and the job's name still opens while the command runs after the
-//! starter has closed its own handle to the job, through the handle the command inherited.
+//! starter has closed its own handle to the job, through the handle the command inherited, unless the job kills on
+//! close, when the starter's last handle ends the command.
 
 #![cfg(windows)]
 #![expect(clippy::expect_used, reason = "a test that cannot start or wait for its command must fail loudly")]
@@ -128,4 +129,28 @@ fn the_command_runs_in_the_job_whose_name_outlives_the_starters_handle() {
     assert!(opened.process_ids().expect("the job lists its processes").contains(&running.pid()));
     opened.terminate(124).expect("the job is terminated");
     assert_eq!(running.wait(HANG_GUARD).expect("the wait answers"), Some(124));
+}
+
+#[test]
+fn a_kill_on_close_jobs_command_ends_when_the_last_job_handle_is_dropped() {
+    let name = unique_name("kill-on-close");
+    let _end = EndJob(name.clone());
+    let job = Job::create_kill_on_close(&name).expect("the job is created");
+    // About 1000 s of pings: longer than the hang guard, so only the job's end can end it within the wait below.
+    let (running, _stdout, _stderr) = start(&cmd("ping -n 1000 127.0.0.1 >NUL"), &job);
+    assert!(
+        job.process_ids().expect("the job lists its processes").contains(&running.pid()),
+        "the command is in the job"
+    );
+
+    drop(job);
+
+    assert!(
+        running.wait(HANG_GUARD).expect("the wait answers").is_some(),
+        "closing the job's last handle ended the command"
+    );
+    assert!(
+        OpenedJob::open(&name).expect("the job can be looked for").is_none(),
+        "the command held no handle to its job, so the job is gone with the starter's"
+    );
 }

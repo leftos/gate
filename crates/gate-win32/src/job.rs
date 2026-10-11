@@ -5,10 +5,12 @@ use std::io;
 use proc_table::win32::OwnedHandle;
 use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, ERROR_MORE_DATA, GetLastError, SetLastError};
 use windows_sys::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_BASIC_PROCESS_ID_LIST,
-    JobObjectBasicAccountingInformation, JobObjectBasicProcessIdList, QueryInformationJobObject, TerminateJobObject,
+    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
+    JOBOBJECT_BASIC_PROCESS_ID_LIST, JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectBasicAccountingInformation, JobObjectBasicProcessIdList,
+    JobObjectExtendedLimitInformation, QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
 };
 
+use crate::launch::struct_size;
 use crate::{own_handle, wide};
 
 /// What a job has used and holds: its CPU time and its live processes.
@@ -21,11 +23,13 @@ pub struct Accounting {
     pub active_processes: u32,
 }
 
-/// A named job object with no limits: a process in it cannot break away, and nothing is killed when the job is
-/// dropped, which only closes this handle.
+/// A named job object: a process in it cannot break away. One made by [`Job::create`] has no limits, and nothing is
+/// killed when it is dropped, which only closes this handle; one made by [`Job::create_kill_on_close`] ends every
+/// process in it when its last handle is closed.
 pub struct Job {
     handle: OwnedHandle,
     name: String,
+    kill_on_close: bool,
 }
 
 // SAFETY: a job handle is a kernel object reference with no thread affinity: every call made through it
@@ -62,7 +66,42 @@ impl Job {
         Ok(Job {
             handle,
             name: name.to_owned(),
+            kill_on_close: false,
         })
+    }
+
+    /// Creates the job `name` as [`Job::create`] does, then has it end every process in it when its last handle is
+    /// closed (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`): once this handle is dropped, or the process holding it ends, no
+    /// process in the job outlives it unless another handle to the job is open. A [`crate::PipedLaunch`] started in
+    /// it gives the command no handle to it, so the command cannot keep its own job open.
+    ///
+    /// # Errors
+    ///
+    /// As [`Job::create`]; and the system's error when the limit cannot be set, the job's handle closed again.
+    pub fn create_kill_on_close(name: &str) -> io::Result<Job> {
+        let mut job = Job::create(name)?;
+        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        // SAFETY: the handle is open for the whole call, with the `JOB_OBJECT_SET_ATTRIBUTES` access a new job's
+        // handle has; `limits` is a whole extended limit structure of the size passed, read only.
+        let set = unsafe {
+            SetInformationJobObject(
+                job.handle.raw(),
+                JobObjectExtendedLimitInformation,
+                (&raw const limits).cast(),
+                struct_size::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>(),
+            )
+        };
+        if set == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        job.kill_on_close = true;
+        Ok(job)
+    }
+
+    /// Whether it ends every process in it when its last handle is closed ([`Job::create_kill_on_close`]).
+    pub(crate) fn kills_on_close(&self) -> bool {
+        self.kill_on_close
     }
 
     /// The name it was created by.

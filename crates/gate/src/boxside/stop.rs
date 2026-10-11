@@ -1,7 +1,7 @@
 //! `gate box stop`: ends every process of the run whose job the payload names, as the PowerShell wrapper's
 //! `Invoke-Stop` does. It sets the run's stop signal first, so a run whose job does not exist yet never starts its
-//! command. The job name carries the run's nonce, so a stop that arrives late finds no job, and never another run's.
-//! It takes no lock.
+//! command, then ends the run's job and the job its dotnet tool restore runs in ([`restore_job_name`]). The job name
+//! carries the run's nonce, so a stop that arrives late finds no job, and never another run's. It takes no lock.
 
 use std::io;
 use std::thread;
@@ -22,9 +22,11 @@ const POLL: Duration = Duration::from_millis(100);
 /// The status of a stop that left processes behind or failed.
 const FAILED_STATUS: u32 = 1;
 
-/// Terminates the payload's job and waits for its processes to be gone; returns the status: 0 when the job is gone or
-/// there was none, 1 when processes are left or the job could not be stopped, 2 for a payload without a work-folder
-/// key or a job name of that work folder.
+/// Terminates the payload's job and its restore's job, and waits for their processes to be gone; returns the status: 0
+/// when both jobs are gone or there were none, 1 when processes are left or a job could not be stopped, 2 for a
+/// payload without a work-folder key or a job name of that work folder. The restore's job is opened before the run's
+/// stop signal is set, so a run that ends its restore on seeing the signal cannot close that job before the stop
+/// finds it; it is terminated only after the signal is set, so the run reads its end as the stop's.
 pub(crate) fn stop(payload: &Payload, console: &mut Console) -> u32 {
     let name = match payload.key().and_then(|key| payload.job(key)) {
         Ok(name) => name,
@@ -33,7 +35,18 @@ pub(crate) fn stop(payload: &Payload, console: &mut Console) -> u32 {
             return u32::from(USAGE_STATUS);
         }
     };
-    match stopped(name, console) {
+    let restore_name = restore_job_name(name);
+    let restore = OpenedJob::open(&restore_name);
+    let command = said(name, stopped(name, console), console);
+    let restore = restore.and_then(|job| job.map(|job| ended(&job, &restore_name, console)).transpose());
+    command.max(said(&restore_name, restore, console))
+}
+
+/// Says how stopping the job `name` went, from how many processes it still held (`None` when there was no such
+/// job): `stopped` on stdout when none, else why on stderr; the status, 0 when the job is gone or there was none, 1
+/// when processes are left or it could not be stopped.
+fn said(name: &str, stopped: io::Result<Option<usize>>, console: &mut Console) -> u32 {
+    match stopped {
         Ok(None) => 0,
         Ok(Some(0)) => {
             console.out(&format!("gate: remote stopped job {name}"));
@@ -95,6 +108,12 @@ pub(crate) fn stop_event_name(job: &str) -> String {
     format!("{job}-stopped")
 }
 
+/// The name of the job the dotnet tool restore of the run whose job is `job` runs in, which a stop ends beside the
+/// run's own.
+pub(crate) fn restore_job_name(job: &str) -> String {
+    format!("{job}-tools")
+}
+
 /// How [`terminate_and_wait`] ended.
 pub(crate) struct Ending {
     /// How many processes the job still held.
@@ -151,9 +170,15 @@ fn stopped(name: &str, console: &mut Console) -> io::Result<Option<usize>> {
     let Some(job) = OpenedJob::open(name)? else {
         return Ok(None);
     };
-    let ending = terminate_and_wait(&job)?;
+    ended(&job, name, console).map(Some)
+}
+
+/// Terminates `job`, named `name`, and waits for its processes to be gone; how many it still held. A terminate after
+/// the first that failed is said.
+fn ended(job: &OpenedJob, name: &str, console: &mut Console) -> io::Result<usize> {
+    let ending = terminate_and_wait(job)?;
     ending.say_late(name, console);
-    Ok(Some(ending.left))
+    Ok(ending.left)
 }
 
 /// Sets the stop signal of the job `name`. A missing signal is no error, as a run that has not reached its lock or

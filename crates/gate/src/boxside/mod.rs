@@ -9,6 +9,7 @@ pub(crate) mod payload;
 mod preflight;
 mod run;
 mod stop;
+mod tools;
 
 use gate_args::{BoxRequest, BoxVerb};
 

@@ -22,6 +22,7 @@ jiff = "0.2.37"
 proc-table = { path = "../proc-table" }
 regex = "1.13.1"
 serde_json = { version = "1.0.151", features = ["preserve_order"] }
+sha2 = "0.11.0"
 # For `fake-tool` only, which a gate built without `test-seams` does not have.
 windows-sys = { version = "0.61.2", features = ["Win32_System_Console"], optional = true }
 

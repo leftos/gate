@@ -114,6 +114,24 @@ fn path_with_git(folders: &[PathBuf]) -> OsString {
     std::env::join_paths(folders.iter().cloned().chain([git_folder()])).expect("the folders join into a PATH")
 }
 
+/// A PATH of `folders` first, then the suite's own PATH less every folder holding a `dotnet`: the box finds the stub's
+/// dotnet and no real one behind it, and git keeps everything its helpers need. A PATH of git's folder alone is not
+/// enough for a run: git's local transport spawns a helper that needs the folder holding its runtime on PATH, so
+/// `git fetch` fails with an access violation without it, though the steps a preflight runs do not.
+fn path_for_run(folders: &[PathBuf]) -> OsString {
+    let own = std::env::var_os("PATH").expect("PATH is set");
+    let without_dotnet = std::env::split_paths(&own).filter(|folder| !holds_dotnet(folder));
+    std::env::join_paths(folders.iter().cloned().chain(without_dotnet)).expect("the folders join into a PATH")
+}
+
+/// Whether `folder` holds a `dotnet` named with any of the four extensions a `PATHEXT` search tries, `.exe`, `.cmd`,
+/// `.bat` and `.com`, so [`path_for_run`] drops it.
+fn holds_dotnet(folder: &Path) -> bool {
+    ["exe", "cmd", "bat", "com"]
+        .iter()
+        .any(|extension| folder.join(format!("dotnet.{extension}")).is_file())
+}
+
 fn lines(text: &str) -> Vec<&str> {
     text.lines().collect()
 }
@@ -488,6 +506,80 @@ fn has_ref(payload: &Value, name: &str) -> bool {
 /// `gate box run` of `payload`, to its end.
 fn run_box(case: &Case, payload: &Value) -> Outcome {
     gate_box(case, "run", &self::payload(payload), None)
+}
+
+/// `gate box run` of `payload` with `PATH` set to `path` when given, as a case about dotnet runs it.
+fn run_box_with_path(case: &Case, payload: &Value, path: Option<&OsString>) -> Outcome {
+    gate_box(case, "run", &self::payload(payload), path)
+}
+
+/// `gate box run` of `payload` with `PATH` set to `path`, started, as a case that stops it mid-run needs it.
+fn start_box_with_path(case: &Case, payload: &Value, path: Option<&OsString>) -> Running {
+    let mut command = box_command(case, &["box", "run", &self::payload(payload)]);
+    if let Some(path) = path {
+        command.env("PATH", path);
+    }
+    start(command)
+}
+
+/// The tool manifest a restore case's snapshot holds; its bytes are what the work folder's record hashes.
+const TOOLS_MANIFEST: &str = "{\n  \"version\": 1\n}\n";
+/// The manifest's path in the snapshot, at the work folder's root under `.config`.
+const TOOLS_MANIFEST_PATH: &str = ".config/dotnet-tools.json";
+/// The SHA-256 the record holds for [`TOOLS_MANIFEST`] at `.config\dotnet-tools.json`: its path relative to the work
+/// folder, a NUL byte, its bytes, a NUL byte, as lower-case hex. Pinned, so a change to the layout fails a case.
+const TOOLS_MANIFEST_HASH: &str = "d834b15f0e1d448cb8a03922e089bdf22783185fc8884f500830639c97a22083";
+
+/// The file a stub dotnet appends its working folder to, one line per restore.
+fn counter(case: &Case) -> PathBuf {
+    case.folder().join("counter.txt")
+}
+
+/// The lines of the case's counter file, none when no stub ran.
+fn counter_lines(case: &Case) -> Vec<String> {
+    fs::read_to_string(counter(case)).unwrap_or_default().lines().map(str::to_owned).collect()
+}
+
+/// A folder on the case's `PATH` holding a `dotnet.cmd` that handles `tool restore`: it prints `restore: out` on
+/// stdout and `restore: note` on stderr, appends its working folder to the case's counter file, and exits with
+/// `exit`. A case passes it through [`path_for_run`], so its `PATH` holds this dotnet and no other. The folder is also
+/// where a case puts any other stub it needs on `PATH` (see [`stub_git`]).
+fn stub_dotnet(case: &Case, exit: i32) -> PathBuf {
+    stub_dotnet_running(case, exit, "")
+}
+
+/// [`stub_dotnet`] with the batch script `before` run first, before the stub says anything, so a case can hold the
+/// restore open and has whatever that script prints as the restore's own first output.
+fn stub_dotnet_running(case: &Case, exit: i32, before: &str) -> PathBuf {
+    let stub = case.folder().join(format!("stub-dotnet-{exit}"));
+    fs::create_dir_all(&stub).expect("the stub folder can be made");
+    fs::write(
+        stub.join("dotnet.cmd"),
+        format!(
+            "@echo off\r\n{before}echo restore: out\r\necho restore: note 1>&2\r\necho %CD%>>\"{}\"\r\nexit /b {exit}\r\n",
+            shown(&counter(case))
+        ),
+    )
+    .expect("the dotnet stub can be written");
+    stub
+}
+
+/// Puts a `git.cmd` in the stub folder `stub` that parks the box on its first git step — the fetch, before the
+/// restore — making `parked` and waiting for `go`, then running the real git with the same words. A case can so order
+/// a stop between the work folder's lock and the restore: it waits for `parked`, stops the run, and makes `go` to let
+/// the run go on to the restore's first look at the stop signal. Without it no step before the restore can be held.
+fn stub_git(stub: &Path, parked: &Path, go: &Path) {
+    let real = git_folder().join("git.exe");
+    fs::write(
+        stub.join("git.cmd"),
+        format!(
+            "@echo off\r\nif exist \"{go}\" goto real\r\necho parked>\"{parked}\"\r\n:wait\r\nif exist \"{go}\" goto real\r\nping -n 2 127.0.0.1 >nul\r\ngoto wait\r\n:real\r\n\"{real}\" %*\r\n",
+            go = shown(go),
+            parked = shown(parked),
+            real = shown(&real),
+        ),
+    )
+    .expect("the git stub can be written");
 }
 
 /// `gate box run` of `payload`, started.
@@ -1157,7 +1249,7 @@ fn stop_before_the_launch(name: &str, seams: &[&str]) {
 
     assert_eq!(stopped.code, Some(0), "{stopped:?}");
     assert_eq!(outcome.code, Some(1), "a stop before the launch fails the run: {outcome:?}");
-    let said = format!("gate: the gate failed while running the command: the job {job} was stopped before the command started");
+    let said = stopped_line_for(job);
     assert!(outcome.stderr.lines().any(|line| line == said), "{said:?} in {outcome:?}");
     assert!(
         !outcome.stderr.lines().any(is_console_fallback),
@@ -1405,4 +1497,482 @@ fn box_run_echoes_a_command_word_with_control_characters_escaped() {
             "{word:?}: no raw control character of the word reaches the client"
         );
     }
+}
+
+#[test]
+fn box_run_restores_the_tools_once_for_a_manifest_and_records_its_hash() {
+    let case = Case::new("box_run_tools_restore");
+    let marker = case.folder().join("marker");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "mark", &shown(&marker)]);
+    snapshot(&case, &mut payload, &[(TOOLS_MANIFEST_PATH, TOOLS_MANIFEST)]);
+    let stub = stub_dotnet(&case, 0);
+
+    let outcome = run_box_with_path(&case, &payload, Some(&path_for_run(&[stub])));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(
+        outcome.stdout.contains("restore: out"),
+        "the restore's stdout passes through: {outcome:?}"
+    );
+    assert!(
+        outcome.stderr.contains("restore: note"),
+        "the restore's stderr passes through: {outcome:?}"
+    );
+    assert!(marker.exists(), "the command ran after the restore: {outcome:?}");
+    let work = field(&payload, "Work");
+    let said = counter_lines(&case);
+    assert_eq!(said.len(), 1, "the restore ran once: {outcome:?}");
+    assert!(
+        said[0].eq_ignore_ascii_case(work),
+        "the restore ran in the place folder {work}: {outcome:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(format!("{work}.tools")).expect("the record is written"),
+        TOOLS_MANIFEST_HASH,
+        "the record holds the walk's hash"
+    );
+}
+
+#[test]
+fn box_run_does_not_restore_again_for_an_unchanged_manifest() {
+    let case = Case::new("box_run_tools_unchanged");
+    let marker = case.folder().join("marker");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "mark", &shown(&marker)]);
+    snapshot(&case, &mut payload, &[(TOOLS_MANIFEST_PATH, TOOLS_MANIFEST)]);
+    let stub = stub_dotnet(&case, 0);
+    let first = run_box_with_path(&case, &payload, Some(&path_for_run(std::slice::from_ref(&stub))));
+    assert_eq!(first.code, Some(0), "{first:?}");
+    assert_eq!(counter_lines(&case).len(), 1, "{first:?}");
+
+    let second = run_box_with_path(&case, &renamed(&payload, 1), Some(&path_for_run(&[stub])));
+
+    assert_eq!(second.code, Some(0), "{second:?}");
+    assert!(
+        !second.stdout.contains("restore: out"),
+        "the unchanged manifest restores nothing: {second:?}"
+    );
+    assert_eq!(counter_lines(&case).len(), 1, "the stub ran once, in the first run");
+    assert_eq!(
+        fs::read_to_string(&marker).expect("the marker is read").lines().count(),
+        2,
+        "the command ran in both runs"
+    );
+}
+
+#[test]
+fn box_run_restores_again_when_a_manifest_changes() {
+    let case = Case::new("box_run_tools_changed");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "exit", "0"]);
+    snapshot(&case, &mut payload, &[(TOOLS_MANIFEST_PATH, TOOLS_MANIFEST)]);
+    let stub = stub_dotnet(&case, 0);
+    assert_eq!(
+        run_box_with_path(&case, &payload, Some(&path_for_run(std::slice::from_ref(&stub)))).code,
+        Some(0)
+    );
+
+    let changed = push_snapshot(&case, &payload, &[(TOOLS_MANIFEST_PATH, "{\n  \"version\": 2\n}\n")]);
+    payload["Snapshot"] = json!(changed);
+    let second = run_box_with_path(&case, &renamed(&payload, 1), Some(&path_for_run(&[stub])));
+
+    assert_eq!(second.code, Some(0), "{second:?}");
+    assert!(second.stdout.contains("restore: out"), "the changed manifest restores again: {second:?}");
+    assert_eq!(counter_lines(&case).len(), 2, "the stub ran in both runs");
+}
+
+#[test]
+fn box_run_a_failed_restore_refuses_with_75_and_runs_no_command() {
+    let case = Case::new("box_run_tools_failed_restore");
+    let marker = case.folder().join("marker");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "mark", &shown(&marker)]);
+    snapshot(&case, &mut payload, &[(TOOLS_MANIFEST_PATH, TOOLS_MANIFEST)]);
+    let passing = stub_dotnet(&case, 0);
+    let first = run_box_with_path(&case, &payload, Some(&path_for_run(&[passing])));
+    assert_eq!(first.code, Some(0), "{first:?}");
+    let record = format!("{}.tools", field(&payload, "Work"));
+    let written = fs::read(&record).expect("the record is written");
+
+    let changed = push_snapshot(&case, &payload, &[(TOOLS_MANIFEST_PATH, "{\n  \"version\": 2\n}\n")]);
+    payload["Snapshot"] = json!(changed);
+    let failing = stub_dotnet(&case, 1);
+    let outcome = run_box_with_path(&case, &renamed(&payload, 1), Some(&path_for_run(&[failing])));
+
+    assert_eq!(outcome.code, Some(75), "{outcome:?}");
+    let said = lines(&outcome.stderr);
+    let failed = said.iter().position(|line| *line == "gate: remote tool restore failed (status 1)");
+    let refused = said
+        .iter()
+        .position(|line| *line == "gate: remote work folder k could not restore its dotnet tools");
+    assert!(
+        matches!((failed, refused), (Some(failed), Some(refused)) if failed < refused),
+        "the status line comes before the refusal: {outcome:?}"
+    );
+    assert_eq!(counter_lines(&case).len(), 2, "the failing stub ran: {outcome:?}");
+    assert_eq!(
+        fs::read_to_string(&marker).expect("the marker is read").lines().count(),
+        1,
+        "only the first run's command ran"
+    );
+    assert_eq!(fs::read(&record).expect("the record is read"), written, "the record stands as it was");
+    assert!(!has_ref(&payload, "refs/gate-back/k"), "the refused run made no back commit");
+    wait_until_closed(Path::new(field(&payload, "Lock")));
+}
+
+#[test]
+fn box_run_a_failed_restore_reports_the_stub_s_status() {
+    let case = Case::new("box_run_tools_failed_status");
+    let marker = case.folder().join("marker");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "mark", &shown(&marker)]);
+    snapshot(&case, &mut payload, &[(TOOLS_MANIFEST_PATH, TOOLS_MANIFEST)]);
+    let stub = stub_dotnet(&case, 7);
+
+    let outcome = run_box_with_path(&case, &payload, Some(&path_for_run(&[stub])));
+
+    assert_eq!(outcome.code, Some(75), "{outcome:?}");
+    assert!(
+        lines(&outcome.stderr).contains(&"gate: remote tool restore failed (status 7)"),
+        "the status the restore failed with is the stub's own: {outcome:?}"
+    );
+    assert!(!marker.exists(), "the command never ran");
+    assert!(!Path::new(&format!("{}.tools", field(&payload, "Work"))).exists(), "no record is written");
+}
+
+#[test]
+fn box_run_a_work_folder_with_no_manifest_runs_no_restore() {
+    let case = Case::new("box_run_tools_no_manifest");
+    let marker = case.folder().join("marker");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "mark", &shown(&marker)]);
+    snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
+    let stub = stub_dotnet(&case, 0);
+
+    let outcome = run_box_with_path(&case, &payload, Some(&path_for_run(&[stub])));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(
+        !counter(&case).exists(),
+        "a work folder with no manifest never looks for dotnet: {outcome:?}"
+    );
+    assert!(marker.exists(), "the command still ran: {outcome:?}");
+    assert!(!Path::new(&format!("{}.tools", field(&payload, "Work"))).exists(), "no record is written");
+}
+
+#[test]
+fn box_run_finds_a_root_dotnet_tools_json_with_no_config_folder() {
+    let case = Case::new("box_run_tools_root_manifest");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "exit", "0"]);
+    snapshot(&case, &mut payload, &[("dotnet-tools.json", TOOLS_MANIFEST)]);
+    let stub = stub_dotnet(&case, 0);
+
+    let outcome = run_box_with_path(&case, &payload, Some(&path_for_run(&[stub])));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(counter_lines(&case).len(), 1, "{outcome:?}");
+    assert!(outcome.stdout.contains("restore: out"), "{outcome:?}");
+}
+
+#[test]
+fn box_run_prefers_config_dotnet_tools_json_over_the_folders_other_manifest() {
+    let case = Case::new("box_run_tools_config_preferred");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "exit", "0"]);
+    snapshot(
+        &case,
+        &mut payload,
+        &[(TOOLS_MANIFEST_PATH, TOOLS_MANIFEST), ("dotnet-tools.json", "{\"loser\": 1}\n")],
+    );
+    let stub = stub_dotnet(&case, 0);
+    let first = run_box_with_path(&case, &payload, Some(&path_for_run(std::slice::from_ref(&stub))));
+    assert_eq!(first.code, Some(0), "{first:?}");
+    assert_eq!(counter_lines(&case).len(), 1, "{first:?}");
+
+    let changed = push_snapshot(&case, &payload, &[("dotnet-tools.json", "{\"loser\": 2}\n")]);
+    payload["Snapshot"] = json!(changed);
+    let second = run_box_with_path(&case, &renamed(&payload, 1), Some(&path_for_run(&[stub])));
+
+    assert_eq!(second.code, Some(0), "{second:?}");
+    assert!(
+        !second.stdout.contains("restore: out"),
+        "the folder's other manifest is not hashed: {second:?}"
+    );
+    assert_eq!(counter_lines(&case).len(), 1, "the stub ran once");
+}
+
+#[test]
+fn box_run_restores_from_a_manifest_above_the_place_folder() {
+    let case = Case::new("box_run_tools_walk");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "exit", "0"]);
+    payload["Subfolder"] = json!(r"src\app");
+    snapshot(
+        &case,
+        &mut payload,
+        &[("src/.config/dotnet-tools.json", TOOLS_MANIFEST), ("src/app/a.txt", "a\n")],
+    );
+    let stub = stub_dotnet(&case, 0);
+
+    let outcome = run_box_with_path(&case, &payload, Some(&path_for_run(&[stub])));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let said = counter_lines(&case);
+    assert_eq!(said.len(), 1, "{outcome:?}");
+    let place = Path::new(field(&payload, "Work")).join("src").join("app");
+    assert!(
+        said[0].eq_ignore_ascii_case(&place.to_string_lossy()),
+        "the restore ran in the place folder {place:?}: {outcome:?}"
+    );
+}
+
+#[test]
+fn box_run_of_a_place_with_no_manifest_above_it_restores_nothing() {
+    let case = Case::new("box_run_tools_walk_empty_place");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "exit", "0"]);
+    snapshot(&case, &mut payload, &[("src/.config/dotnet-tools.json", TOOLS_MANIFEST)]);
+    let stub = stub_dotnet(&case, 0);
+
+    let outcome = run_box_with_path(&case, &payload, Some(&path_for_run(&[stub])));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(
+        !counter(&case).exists(),
+        "the walk starts at the work folder, above the manifest: {outcome:?}"
+    );
+}
+
+#[test]
+fn box_run_restores_again_when_a_manifest_moves() {
+    let case = Case::new("box_run_tools_manifest_moved");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "exit", "0"]);
+    payload["Subfolder"] = json!("src");
+    snapshot(
+        &case,
+        &mut payload,
+        &[(".config/dotnet-tools.json", TOOLS_MANIFEST), ("src/a.txt", "a\n")],
+    );
+    let stub = stub_dotnet(&case, 0);
+    let first = run_box_with_path(&case, &payload, Some(&path_for_run(std::slice::from_ref(&stub))));
+    assert_eq!(first.code, Some(0), "{first:?}");
+    assert_eq!(counter_lines(&case).len(), 1, "{first:?}");
+
+    // The same bytes at another path: the manifest's path is part of the hash.
+    let changed = push_snapshot(&case, &payload, &[("src/dotnet-tools.json", TOOLS_MANIFEST)]);
+    payload["Snapshot"] = json!(changed);
+    let second = run_box_with_path(&case, &renamed(&payload, 1), Some(&path_for_run(&[stub])));
+
+    assert_eq!(second.code, Some(0), "{second:?}");
+    assert!(second.stdout.contains("restore: out"), "a moved manifest restores again: {second:?}");
+    assert_eq!(counter_lines(&case).len(), 2, "the stub ran in both runs");
+}
+
+#[test]
+fn box_run_never_reads_a_manifest_above_the_work_folder() {
+    let case = Case::new("box_run_tools_above_work");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "exit", "0"]);
+    snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
+    let beside = Path::new(field(&payload, "Work"))
+        .parent()
+        .expect("the work folder has a parent")
+        .join("dotnet-tools.json");
+    fs::write(&beside, TOOLS_MANIFEST).expect("the manifest beside the work folder can be written");
+    let stub = stub_dotnet(&case, 0);
+
+    let outcome = run_box_with_path(&case, &payload, Some(&path_for_run(&[stub])));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(!counter(&case).exists(), "the walk stops at the work folder: {outcome:?}");
+}
+
+#[test]
+fn box_run_without_dotnet_refuses_the_run_with_75() {
+    let case = Case::new("box_run_tools_no_dotnet");
+    let marker = case.folder().join("marker");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "mark", &shown(&marker)]);
+    snapshot(&case, &mut payload, &[(TOOLS_MANIFEST_PATH, TOOLS_MANIFEST)]);
+
+    let outcome = run_box_with_path(&case, &payload, Some(&path_for_run(&[])));
+
+    assert_eq!(outcome.code, Some(75), "{outcome:?}");
+    // The win32 error `ERROR_FILE_NOT_FOUND`, as `locate` reports a word it does not find.
+    let cannot_start = format!("gate: remote could not start the dotnet tool restore: {}", gate_win32::win32_message(2));
+    assert_eq!(
+        lines(&outcome.stderr),
+        [
+            cannot_start.as_str(),
+            "gate: remote tool restore failed (status 1)",
+            "gate: remote work folder k could not restore its dotnet tools",
+        ],
+        "{outcome:?}"
+    );
+    assert!(!marker.exists(), "the command never ran");
+}
+
+/// The line the box says for a stop that came before the command of the job `name` started.
+fn stopped_line_for(name: &str) -> String {
+    format!("gate: the gate failed while running the command: the job {name} was stopped before the command started")
+}
+
+/// The script a stub dotnet runs to hold the restore: a helper that waits for `never` is started and announced
+/// (`spawned <pid>`), then the stub waits for `never` too, so the restore runs until something ends it.
+fn held_restore(never: &Path) -> String {
+    let never_word = shown(never);
+    format!("@\"{FAKE_TOOL}\" spawn-wait \"{never_word}\"\r\n@\"{FAKE_TOOL}\" wait \"{never_word}\"\r\n")
+}
+
+#[test]
+fn box_run_a_stop_during_the_restore_ends_it_and_runs_no_command() {
+    let case = Case::new("box_run_tools_stop_during_restore");
+    let marker = case.folder().join("marker");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "mark", &shown(&marker)]);
+    snapshot(&case, &mut payload, &[(TOOLS_MANIFEST_PATH, TOOLS_MANIFEST)]);
+    let stub = stub_dotnet_running(&case, 0, &held_restore(&case.folder().join("never")));
+    let running = start_box_with_path(&case, &payload, Some(&path_for_run(std::slice::from_ref(&stub))));
+    let helper = spawned_pid(&running.wait_for_stdout("\n"));
+
+    let stopped = gate_box(&case, "stop", &self::payload(&payload), None);
+    let outcome = running.finish();
+
+    assert_eq!(stopped.code, Some(0), "{stopped:?}");
+    // The stop opens the restore's job before it sets the run's signal, so the box, seeing the signal, cannot close the
+    // job before the stop finds it: the stop ends the restore itself and says so.
+    assert_eq!(
+        stopped.stdout,
+        format!("gate: remote stopped job {}-tools\n", field(&payload, "Job")),
+        "{stopped:?}"
+    );
+    assert_eq!(stopped.stderr, "", "{stopped:?}");
+    assert_eq!(outcome.code, Some(1), "a stop during the restore fails the run: {outcome:?}");
+    // The line names the job that was stopped: the restore's own, named after the run's.
+    let said = stopped_line_for(&format!("{}-tools", field(&payload, "Job")));
+    assert!(outcome.stderr.lines().any(|line| line == said), "{said:?} in {outcome:?}");
+    assert!(!marker.exists(), "the command never ran");
+    assert!(!Path::new(&format!("{}.tools", field(&payload, "Work"))).exists(), "no record is written");
+    wait_until_gone(helper);
+    wait_until_closed(Path::new(field(&payload, "Lock")));
+}
+
+#[test]
+fn box_run_a_killed_box_takes_its_restore_with_it() {
+    let case = Case::new("box_run_tools_killed_box");
+    let marker = case.folder().join("marker");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "mark", &shown(&marker)]);
+    snapshot(&case, &mut payload, &[(TOOLS_MANIFEST_PATH, TOOLS_MANIFEST)]);
+    let stub = stub_dotnet_running(&case, 0, &held_restore(&case.folder().join("never")));
+    let running = start_box_with_path(&case, &payload, Some(&path_for_run(&[stub])));
+    let helper = spawned_pid(&running.wait_for_stdout("\n"));
+    let restore_job = format!("{}-tools", field(&payload, "Job"));
+    // Listed through a handle closed again at once, so the box's is once more the job's only one.
+    let restore = OpenedJob::open(&restore_job)
+        .expect("the restore's job can be looked for")
+        .expect("the restore runs in its job")
+        .process_ids()
+        .expect("the restore's processes can be listed");
+    assert!(restore.contains(&helper), "the helper is in the restore's job: {restore:?}");
+
+    // As a lost connection's cut kills the box before any stop reaches it.
+    let killed = running.kill();
+
+    // The box held the restore's job's last handle, so its death ended every process in that job.
+    for pid in restore {
+        wait_until_gone(pid);
+    }
+    assert!(!marker.exists(), "the command never ran: {killed:?}");
+    wait_until_closed(Path::new(field(&payload, "Lock")));
+}
+
+#[test]
+fn box_run_ends_a_process_the_restore_left_running() {
+    let case = Case::new("box_run_tools_restore_leftover");
+    let marker = case.folder().join("marker");
+    let spawned = case.folder().join("spawned.txt");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "mark", &shown(&marker)]);
+    snapshot(&case, &mut payload, &[(TOOLS_MANIFEST_PATH, TOOLS_MANIFEST)]);
+    // The stub starts a helper that waits for a file no one makes, its standard output a file of the case's and its
+    // standard error NUL, not the restore's pipes, and exits 0 without waiting for it.
+    let script = format!(
+        "@\"{FAKE_TOOL}\" spawn-wait \"{}\" >\"{}\" 2>nul\r\n",
+        shown(&case.folder().join("never")),
+        shown(&spawned)
+    );
+    let stub = stub_dotnet_running(&case, 0, &script);
+
+    let outcome = run_box_with_path(&case, &payload, Some(&path_for_run(&[stub])));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(marker.exists(), "the command ran after the restore: {outcome:?}");
+    let helper = spawned_pid(&fs::read_to_string(&spawned).expect("the helper's pid is written"));
+    wait_until_gone(helper);
+}
+
+#[test]
+fn box_run_never_truncates_a_file_hard_linked_as_the_record() {
+    let case = Case::new("box_run_tools_record_hard_link");
+    let marker = case.folder().join("marker");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "mark", &shown(&marker)]);
+    snapshot(&case, &mut payload, &[(TOOLS_MANIFEST_PATH, TOOLS_MANIFEST)]);
+    let stub = stub_dotnet(&case, 0);
+    let record = format!("{}.tools", field(&payload, "Work"));
+    let other = case.folder().join("other.txt");
+    fs::write(&other, "keep these bytes\n").expect("the other file can be written");
+    fs::hard_link(&other, &record).expect("the record can be made a second name of the other file");
+
+    let outcome = run_box_with_path(&case, &payload, Some(&path_for_run(&[stub])));
+
+    assert_eq!(outcome.code, Some(1), "a record that cannot be written fails the box: {outcome:?}");
+    let refused = format!("gate: remote could not write {record}: ");
+    assert!(
+        outcome.stderr.lines().any(|line| line.starts_with(&refused)),
+        "{refused:?} in {outcome:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(&other).expect("the other file is read"),
+        "keep these bytes\n",
+        "the file the record names too keeps its bytes"
+    );
+    assert!(!marker.exists(), "the command never ran");
+    wait_until_closed(Path::new(field(&payload, "Lock")));
+}
+
+#[test]
+fn box_run_a_stop_before_the_restore_runs_no_restore() {
+    let case = Case::new("box_run_tools_stop_before_restore");
+    let marker = case.folder().join("marker");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "mark", &shown(&marker)]);
+    snapshot(&case, &mut payload, &[(TOOLS_MANIFEST_PATH, TOOLS_MANIFEST)]);
+    let stub = stub_dotnet(&case, 0);
+    let parked = case.folder().join("parked");
+    let go = case.folder().join("go");
+    stub_git(&stub, &parked, &go);
+    let running = start_box_with_path(&case, &payload, Some(&path_for_run(std::slice::from_ref(&stub))));
+    wait_until("the box parked in its first git step, before the restore", || parked.exists());
+
+    let stopped = gate_box(&case, "stop", &self::payload(&payload), None);
+    let_go(&go);
+    let outcome = running.finish();
+
+    assert_eq!(stopped.code, Some(0), "{stopped:?}");
+    assert_eq!(outcome.code, Some(1), "a stop before the restore fails the run: {outcome:?}");
+    let said = stopped_line_for(field(&payload, "Job"));
+    assert!(outcome.stderr.lines().any(|line| line == said), "{said:?} in {outcome:?}");
+    assert!(!counter(&case).exists(), "the restore never ran: {outcome:?}");
+    assert!(!marker.exists(), "the command never ran");
+    wait_until_closed(Path::new(field(&payload, "Lock")));
+}
+
+#[test]
+fn box_run_a_record_that_is_a_folder_fails_with_status_1() {
+    let case = Case::new("box_run_tools_record_folder");
+    let marker = case.folder().join("marker");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "mark", &shown(&marker)]);
+    snapshot(&case, &mut payload, &[(TOOLS_MANIFEST_PATH, TOOLS_MANIFEST)]);
+    let stub = stub_dotnet(&case, 0);
+    let record = format!("{}.tools", field(&payload, "Work"));
+    fs::create_dir_all(&record).expect("a folder can be put where the record goes");
+
+    let outcome = run_box_with_path(&case, &payload, Some(&path_for_run(std::slice::from_ref(&stub))));
+
+    assert_eq!(outcome.code, Some(1), "a record that cannot be written fails the box: {outcome:?}");
+    let refused = format!("gate: remote could not write {record}: ");
+    assert!(
+        outcome.stderr.lines().any(|line| line.starts_with(&refused)),
+        "{refused:?} in {outcome:?}"
+    );
+    assert!(outcome.stdout.contains("restore: out"), "the restore ran before the write: {outcome:?}");
+    assert!(!marker.exists(), "the command never ran");
+    wait_until_closed(Path::new(field(&payload, "Lock")));
 }

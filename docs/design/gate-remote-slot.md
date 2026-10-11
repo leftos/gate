@@ -13,6 +13,6 @@ Open work for CC-104 (gate: remote heavy slot on the build box). The landed desi
 ## Open steps
 
 8. **Enable, remaining.** The yaat entry in `%LOCALAPPDATA%\gate\remote.json`, after step 10. The godot-mcp entry, after godot-mcp's own session-0 fix (CC-164).
-10. **Siblings** (CC-161, GATE-19). Send a repo's declared sibling worktrees with a routed run, then enable yaat. It edits `remote-wrapper.ps1`'s `Invoke-Run` and `Update-WorkFolder` (the checkout layout), `Initialize-WorkFolder`, and `remote.ps1`'s snapshot, publish, payload, sync-back and config-reader functions; CC-162 (the tools restore, GATE-63) shares `Invoke-Run`, so order them.
+10. **Siblings** (CC-161, GATE-19). Send a repo's declared sibling worktrees with a routed run, then enable yaat. It edits `remote-wrapper.ps1`'s `Invoke-Run` and `Update-WorkFolder` (the checkout layout), `Initialize-WorkFolder`, and `remote.ps1`'s snapshot, publish, payload, sync-back and config-reader functions.
 
-Also open under CC-104: workload parity in the health refusals (CC-160, GATE-18), the tools restore (CC-162, GATE-63), and ops-tower's confirmation that it reads the `gate-remote-slot-N` claim family.
+Also open under CC-104: workload parity in the health refusals (CC-160, GATE-18), and ops-tower's confirmation that it reads the `gate-remote-slot-N` claim family.

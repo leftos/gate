@@ -163,6 +163,7 @@ dependencies = [
  "proc-table",
  "regex",
  "serde_json",
+ "sha2",
  "windows-sys",
 ]
 
