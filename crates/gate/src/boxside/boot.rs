@@ -6,12 +6,35 @@ use jiff::tz::TimeZone;
 
 use crate::console::Console;
 
-/// Says the boot line on stdout; a boot time that cannot be read is said on stderr instead, and fails nothing.
-pub(crate) fn say(console: &mut Console) {
-    match read() {
-        Ok(time) => console.out(&format!("gate: remote boot {}", round_trip(time))),
-        Err(message) => console.err(&format!("gate: remote could not read the boot time: {message}")),
+/// Says the boot line on stdout through `console` and returns whether the boot time was read; a boot time that cannot be
+/// read is said on stderr instead. Only the `Boot` verb turns the failure into a status; the preflight fails nothing.
+pub(crate) fn say(console: &mut Console) -> bool {
+    say_with(read, console)
+}
+
+/// Says what `reader` gave: the round-trip line on stdout when it read the time, else the failure on stderr. Returns
+/// whether the boot time was read.
+pub(crate) fn say_with(reader: impl FnOnce() -> Result<Timestamp, String>, console: &mut Console) -> bool {
+    match reader() {
+        Ok(time) => {
+            console.out(&boot_line(time));
+            true
+        }
+        Err(message) => {
+            console.err(&boot_failure(&message));
+            false
+        }
     }
+}
+
+/// The `gate: remote boot <time>` line for `time`.
+fn boot_line(time: Timestamp) -> String {
+    format!("gate: remote boot {}", round_trip(time))
+}
+
+/// The `gate: remote could not read the boot time: <message>` line for `message`.
+fn boot_failure(message: &str) -> String {
+    format!("gate: remote could not read the boot time: {message}")
 }
 
 fn read() -> Result<Timestamp, String> {
@@ -35,10 +58,13 @@ fn round_trip(time: Timestamp) -> String {
 }
 
 #[cfg(test)]
+#[expect(clippy::expect_used, reason = "a test whose fixed boot time does not parse must fail loudly")]
 mod tests {
     use jiff::Timestamp;
 
-    use super::round_trip;
+    use crate::console::Console;
+
+    use super::{boot_line, round_trip, say_with};
 
     fn formatted(text: &str) -> Option<String> {
         text.parse::<Timestamp>().ok().map(round_trip)
@@ -53,5 +79,25 @@ mod tests {
             Some("2026-10-09T21:59:59.1234567Z"),
             "UTC, the ticks truncated"
         );
+    }
+
+    #[test]
+    fn a_read_boot_time_is_said_as_the_round_trip_line_and_reports_success() {
+        let time = "2026-10-09T21:09:31.121Z".parse::<Timestamp>().expect("the boot time parses");
+        assert_eq!(boot_line(time), "gate: remote boot 2026-10-09T21:09:31.1210000Z");
+
+        let mut console = Console::new();
+        assert!(say_with(|| Ok(time), &mut console), "a read boot time is a success");
+        assert!(console.take_notes().is_empty(), "the boot line is said on stdout, not gathered as a note");
+    }
+
+    #[test]
+    fn a_boot_time_that_cannot_be_read_is_said_on_stderr_and_reports_failure() {
+        let mut console = Console::new();
+        assert!(
+            !say_with(|| Err("the boot fell over".to_owned()), &mut console),
+            "an unread boot time is a failure"
+        );
+        assert_eq!(console.take_notes(), ["gate: remote could not read the boot time: the boot fell over"]);
     }
 }

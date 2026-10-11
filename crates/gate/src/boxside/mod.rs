@@ -13,7 +13,7 @@ mod tools;
 
 use gate_args::{BoxRequest, BoxVerb};
 
-use crate::answer::{NOT_BUILT_STATUS, USAGE_STATUS};
+use crate::answer::{FAILED_STATUS, NOT_BUILT_STATUS, USAGE_STATUS};
 use crate::boxside::payload::Payload;
 use crate::console::Console;
 
@@ -30,15 +30,35 @@ pub(crate) fn answer(request: &BoxRequest, console: &mut Console) -> u32 {
     };
     match request.verb {
         BoxVerb::Preflight => preflight::preflight(&payload, console),
-        BoxVerb::Boot => {
-            boot::say(console);
-            0
-        }
+        BoxVerb::Boot => boot_status(boot::say(console)),
         BoxVerb::Run => run::run(&payload, &request.seams, console),
         BoxVerb::Stop => stop::stop(&payload, console),
         BoxVerb::Outputs => {
             console.err(&format!("gate: box {} is not built yet", request.verb.as_str()));
             u32::from(NOT_BUILT_STATUS)
         }
+    }
+}
+
+/// The status of `gate box boot`: 0 when the boot time was read, `FAILED_STATUS` when it was not, so a boot query the
+/// client makes after a lost connection carries the failure rather than a status 0 with no time.
+fn boot_status(read: bool) -> u32 {
+    if read { 0 } else { u32::from(FAILED_STATUS) }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::answer::FAILED_STATUS;
+
+    use super::boot_status;
+
+    #[test]
+    fn a_boot_time_that_cannot_be_read_is_status_1() {
+        assert_eq!(boot_status(true), 0, "a read boot time is the boot line's own success");
+        assert_eq!(
+            boot_status(false),
+            u32::from(FAILED_STATUS),
+            "an unread boot time is the client's failure to report"
+        );
     }
 }

@@ -8,6 +8,8 @@ use crate::console::Console;
 use crate::request_json;
 use crate::resolve::{self, Environment};
 
+/// The status of a step that failed with no status of its own.
+pub(crate) const FAILED_STATUS: u8 = 1;
 /// The status of a usage error: a missing, unknown or invalid input, or a word the command cannot take.
 pub(crate) const USAGE_STATUS: u8 = 2;
 /// The status of a valid request for a mode this build does not have yet.
