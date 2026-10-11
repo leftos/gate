@@ -14,7 +14,7 @@
 //! is skipped. The folder (the PowerShell gate's or `gate.exe`'s state root), the prefix, the clock and the process
 //! liveness check all come from the caller.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Seek, SeekFrom};
 use std::iter::{Peekable, repeat_n};
@@ -28,8 +28,11 @@ use serde_json::{Map, Value};
 
 use crate::journal_writer::MachineSnapshot;
 
-/// How many of the newest runs the history lists.
+/// How many runs that are not covered the history lists: the newest ones.
 const RECENT_RUNS: usize = 50;
+/// How many covered runs the history lists at most: the newest of those newer than the oldest run it lists that is not
+/// covered.
+const RECENT_COVERED_RUNS: usize = 50;
 /// How far back a run's take may be for the summary to count it.
 const SUMMARY_WINDOW: SignedDuration = SignedDuration::from_hours(7 * 24);
 /// What every working directory of the gate's self-test holds.
@@ -116,8 +119,8 @@ pub struct HistoryRun {
     pub waited_seconds: Option<f64>,
     /// How long the gate held its slot, from its release; for a [`RunState::Parent`] or [`RunState::Covered`] run, how
     /// long its parent's run held its slot, `None` until the journal holds that run's release, and only while the journal
-    /// read still holds the parent's run (the 50-run, 7-day prune can drop it). The status, verdict, wall and adjusted
-    /// seconds below follow the same rule.
+    /// read still holds the parent's run (the 7-day prune can drop it once it is not among the runs the history lists).
+    /// The status, verdict, wall and adjusted seconds below follow the same rule.
     pub held_seconds: Option<f64>,
     /// The gate's exit status, from its release; `None` without a release or when the gate failed before its command
     /// ran. For a [`RunState::Parent`] or [`RunState::Covered`] run, its parent's run's status, `None` until the journal holds that run's release,
@@ -162,7 +165,11 @@ pub struct CommandSummary {
 /// The journal as the Gates tab shows it.
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct History {
-    /// The 50 newest runs by the time they queued, newest first, in every state.
+    /// The 50 newest runs that are not covered and the 50 newest covered runs newer than the oldest of them, in every
+    /// state: at most 100 runs. When fewer than 50 runs are not covered, every one of them is listed with the 50 newest
+    /// covered runs. Newest first by the time of the first journal line read for each run (its queue line unless that
+    /// rolled out of the journal; the `parent` or `covered` line of a gate that never queued, as a covered gate never
+    /// does), then by pid and process start.
     pub runs: Vec<HistoryRun>,
     /// One row per repository, command and remote flag over the runs taken in the last 7 days that passed, the most run
     /// first, then by command, then by repository (none first), then local before remote.
@@ -330,7 +337,7 @@ impl JournalCache {
     /// `prefix` changed, reads `events.1.jsonl` and then the journal from its start; any other read parses only the
     /// journal's complete lines appended since the last, a trailing fragment
     /// without its line feed being left for the next. Runs older than 7 days are then dropped unless they are among the
-    /// 50 newest. A missing file reads as an empty one.
+    /// runs the history lists ([`History::runs`]). A missing file reads as an empty one.
     ///
     /// # Errors
     ///
@@ -347,8 +354,9 @@ impl JournalCache {
             *self = Self::default();
             return Err(error);
         }
-        self.prune(now);
-        Ok(self.history(now, &is_live, &repo_of))
+        let listed = listed(&self.runs);
+        self.prune(now, &listed);
+        Ok(self.history(now, &listed, &is_live, &repo_of))
     }
 
     fn refresh(&mut self, dir: &Path, prefix: &str) -> io::Result<()> {
@@ -476,22 +484,20 @@ impl JournalCache {
             .filter(|run| run.end == Some(End::Released))
     }
 
-    /// Drops the runs that started more than 7 days before `now`, unless they are among the 50 newest.
-    fn prune(&mut self, now: Timestamp) {
+    /// Drops the runs that started more than 7 days before `now`, unless `listed`, the keys [`listed`] gives of the runs
+    /// the history lists, names them.
+    fn prune(&mut self, now: Timestamp, listed: &[RunKey]) {
         let cutoff = now - SUMMARY_WINDOW;
-        let newest: HashSet<RunKey> = newest_first(&self.runs)
-            .into_iter()
-            .take(RECENT_RUNS)
-            .map(|(key, _)| key.clone())
-            .collect();
         self.runs
-            .retain(|key, run| run.started.as_ref().map_or(run.first, |started| started.at) >= cutoff || newest.contains(key));
+            .retain(|key, run| run.started.as_ref().map_or(run.first, |started| started.at) >= cutoff || listed.contains(key));
     }
 
-    fn history(&self, now: Timestamp, is_live: &impl Fn(u32, &str) -> bool, repo_of: &impl Fn(&str) -> Option<String>) -> History {
-        let runs = newest_first(&self.runs)
-            .into_iter()
-            .take(RECENT_RUNS)
+    /// The history of the `listed` runs, in their order, and the summary of every run; `listed` runs [`Self::prune`]
+    /// kept, so each is still in the cache.
+    fn history(&self, now: Timestamp, listed: &[RunKey], is_live: &impl Fn(u32, &str) -> bool, repo_of: &impl Fn(&str) -> Option<String>) -> History {
+        let runs = listed
+            .iter()
+            .filter_map(|key| self.runs.get(key).map(|run| (key, run)))
             .map(|(key, run)| {
                 let parent = run.parent.and_then(|parent| self.released_parent(parent));
                 run.row(key, is_live, run.repo(repo_of), parent)
@@ -661,6 +667,29 @@ fn newest_first(runs: &HashMap<RunKey, Run>) -> Vec<(&RunKey, &Run)> {
     let mut ordered: Vec<(&RunKey, &Run)> = runs.iter().collect();
     ordered.sort_by(|(a_key, a_run), (b_key, b_run)| b_run.first.cmp(&a_run.first).then_with(|| b_key.cmp(a_key)));
     ordered
+}
+
+/// The keys of the runs the history lists, newest first as [`newest_first`] orders them: the [`RECENT_RUNS`] newest
+/// runs that are not covered, and the [`RECENT_COVERED_RUNS`] newest covered runs newer than the oldest of them; every
+/// run that is not covered when fewer are.
+fn listed(runs: &HashMap<RunKey, Run>) -> Vec<RunKey> {
+    let mut listed = Vec::new();
+    let (mut counted, mut covered) = (0, 0);
+    for (key, run) in newest_first(runs) {
+        if counted == RECENT_RUNS {
+            break;
+        }
+        if run.covered {
+            if covered == RECENT_COVERED_RUNS {
+                continue;
+            }
+            covered += 1;
+        } else {
+            counted += 1;
+        }
+        listed.push(key.clone());
+    }
+    listed
 }
 
 /// One row per repository, command and remote flag over the runs that passed and took their slot at or after `cutoff`, a

@@ -751,6 +751,181 @@ fn recent_runs_cap_at_50_newest_first() {
     );
 }
 
+/// The pids of the history's runs, newest first: the covered runs' when `covered`, else every other run's.
+fn pids_where_covered(history: &History, covered: bool) -> Vec<u32> {
+    history
+        .runs
+        .iter()
+        .filter(|run| (run.state == RunState::Covered) == covered)
+        .map(|run| run.pid)
+        .collect()
+}
+
+/// `count` covered lines from pids `first_pid` on, under parent gate `parent_pid`, the first `minutes` before [`NOW`] and
+/// each next one a minute later.
+fn covered_flood(first_pid: u32, count: u32, parent_pid: u32, minutes: i64) -> Vec<String> {
+    (0..count)
+        .map(|index| {
+            Gate::new(first_pid + index, START, "cargo fmt --check").line(
+                "covered",
+                &ago(minutes - i64::from(index)),
+                json!({"parentPid": parent_pid}),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn covered_runs_do_not_crowd_the_history() {
+    let mut lines = Vec::new();
+    for pid in 1..=49_u32 {
+        lines.extend(Gate::new(pid, START, COMMAND).run(1000 - 3 * i64::from(pid), 1.0, json!(0)));
+    }
+    let parent = Gate::new(100, START, "git commit -F .tmp/msg.txt");
+    lines.extend([parent.queue(&ago(500)), parent.take(&ago(499), 0.5)]);
+    lines.extend(covered_flood(200, 40, 100, 400));
+    lines.push(parent.release(&ago(300), 99.0, json!(0)));
+
+    let history = history_of("covered_runs_do_not_crowd_the_history", &lines);
+
+    let counted: Vec<u32> = [100].into_iter().chain((1..=49).rev()).collect();
+    assert_eq!(
+        pids_where_covered(&history, false),
+        counted,
+        "the parent and the 49 older plain runs are the 50 runs that are not covered"
+    );
+    assert_eq!(
+        pids_where_covered(&history, true),
+        (200..240).rev().collect::<Vec<u32>>(),
+        "every covered run newer than the 50th counted run is listed"
+    );
+    assert_eq!(history.runs.len(), 90);
+}
+
+#[test]
+fn covered_rows_are_capped_at_50() {
+    let mut lines = Vec::new();
+    for pid in 1..=49_u32 {
+        lines.extend(Gate::new(pid, START, COMMAND).run(1000 - 3 * i64::from(pid), 1.0, json!(0)));
+    }
+    let parent = Gate::new(100, START, "git commit -F .tmp/msg.txt");
+    lines.extend([parent.queue(&ago(500)), parent.take(&ago(499), 0.5)]);
+    lines.extend(covered_flood(200, 120, 100, 400));
+    lines.push(parent.release(&ago(250), 99.0, json!(0)));
+
+    let history = history_of("covered_rows_are_capped_at_50", &lines);
+
+    let counted: Vec<u32> = [100].into_iter().chain((1..=49).rev()).collect();
+    assert_eq!(pids_where_covered(&history, false), counted, "the 50 runs that are not covered");
+    assert_eq!(
+        pids_where_covered(&history, true),
+        (270..320).rev().collect::<Vec<u32>>(),
+        "the 50 newest covered runs are listed, the 70 older ones are not"
+    );
+    assert_eq!(history.runs.len(), 100);
+}
+
+#[test]
+fn a_parent_run_counts_toward_the_cap() {
+    let mut lines = Vec::new();
+    for pid in 1..=5_u32 {
+        lines.extend(Gate::new(pid, START, COMMAND).run(1000 - 3 * i64::from(pid), 1.0, json!(0)));
+    }
+    let mut counted = Vec::new();
+    for index in 0..50_u32 {
+        let minutes = 900 - 10 * i64::from(index);
+        if index % 5 == 0 {
+            let lent = Gate::new(300 + index, START, COMMAND);
+            lines.extend([lent.queue(&ago(minutes)), lent.line("parent", &ago(minutes - 1), json!({"parentPid": 9}))]);
+            counted.push(300 + index);
+        } else {
+            lines.extend(Gate::new(100 + index, START, COMMAND).run(minutes, 1.0, json!(0)));
+            counted.push(100 + index);
+        }
+        if index % 2 == 1 {
+            lines.extend(covered_flood(500 + index, 1, 9, minutes + 5));
+        }
+    }
+    counted.reverse();
+
+    let history = history_of("a_parent_run_counts_toward_the_cap", &lines);
+
+    assert_eq!(
+        pids_where_covered(&history, false),
+        counted,
+        "the 10 runs on their parent's slot count among the 50, so the 5 oldest plain runs are not listed"
+    );
+    assert_eq!(history.runs.iter().filter(|run| run.state == RunState::Parent).count(), 10);
+    assert_eq!(pids_where_covered(&history, true).len(), 25);
+}
+
+#[test]
+fn covered_runs_between_counted_runs_are_listed() {
+    let mut lines = covered_flood(1000, 1, 9, 50);
+    for pid in 1..=51_u32 {
+        let minutes = 100 + 10 * i64::from(pid);
+        lines.extend(Gate::new(pid, START, COMMAND).run(minutes, 1.0, json!(0)));
+        if pid <= 10 {
+            lines.extend(covered_flood(1100 + pid, 1, 9, minutes + 5));
+        }
+    }
+    lines.extend(covered_flood(1001, 1, 9, 595));
+    lines.extend(covered_flood(1002, 1, 9, 605));
+
+    let history = history_of("covered_runs_between_counted_runs_are_listed", &lines);
+
+    let mut expected = vec![1000];
+    for pid in 1..=49_u32 {
+        expected.push(pid);
+        if pid <= 10 {
+            expected.push(1100 + pid);
+        }
+    }
+    expected.extend([1001, 50]);
+    let listed: Vec<u32> = history.runs.iter().map(|run| run.pid).collect();
+    assert_eq!(
+        listed, expected,
+        "the covered runs newer than the 50th counted run, pid 50, are listed in their place; the one just older than it and \
+         pid 51 are not"
+    );
+}
+
+#[test]
+fn a_covered_flood_older_than_the_cap_is_dropped() {
+    let mut lines = covered_flood(200, 10, 9, 900);
+    for pid in 1..=50_u32 {
+        lines.extend(Gate::new(pid, START, COMMAND).run(800 - 3 * i64::from(pid), 1.0, json!(0)));
+    }
+
+    let history = history_of("a_covered_flood_older_than_the_cap_is_dropped", &lines);
+
+    assert_eq!(
+        pids_where_covered(&history, true),
+        Vec::<u32>::new(),
+        "covered runs older than the 50th are not listed"
+    );
+    assert_eq!(history.runs.len(), 50);
+}
+
+#[test]
+fn prune_keeps_the_runs_a_covered_flood_would_push_out() {
+    let week = 7 * 24 * 60;
+    let mut lines = Vec::new();
+    for pid in 1..=50_u32 {
+        lines.extend(Gate::new(pid, START, COMMAND).run(week + 200 - 3 * i64::from(pid), 1.0, json!(0)));
+    }
+    lines.extend(covered_flood(200, 40, 9, 100));
+
+    let history = history_of("prune_keeps_the_runs_a_covered_flood_would_push_out", &lines);
+
+    assert_eq!(
+        pids_where_covered(&history, false),
+        (1..=50).rev().collect::<Vec<u32>>(),
+        "runs older than 7 days stay while they are among the 50 newest that are not covered"
+    );
+    assert_eq!(history.runs.len(), 90);
+}
+
 #[test]
 fn cache_parses_only_appended_lines() {
     let dir = journal_dir("cache_parses_only_appended_lines");

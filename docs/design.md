@@ -488,6 +488,8 @@ A lone `covered` line is its own state, `covered` (`RunState::Covered`), distinc
 
 The history that ops-tower serves (`HistoryRun`, `GET /api/gate/history`) carries `verdict`, `wallSeconds` and `adjustedSeconds`, null when a line has none, and `abandoned`: every name any line of the run lists (`parent` and `covered` lines included), in line order without repeats, always present and empty when there are none.
 
+The history lists the 50 newest runs that are not covered, and at most the 50 newest covered runs newer than the oldest of them: at most 100 runs, newest first by the time of each run's first journal line (its queue line, or the `parent` or `covered` line of a gate that never queued), then by pid and process start. A run fallen back onto or lent its parent's slot counts toward the 50; a covered run does not, so a parent with many nested covered gates never crowds other runs out. The 7-day prune keeps every run the history lists.
+
 It also carries `pid` (a number), `processStart` (the ISO string from the journal) and `running` (a bool, true while the run's gate is live by the same pid-and-start check as the tickets', for every run): a covered run's `state` stays `covered` while it runs.
 
 It also carries, after `slot`, `slots` (the slot names the run took, such as `["Local\\gate-slot-0"]`, `[]` when none) and `machine` (null, or for a critical gate's `take` `{counts, otherHeld, otherClaims}` or `{counts, otherHeld, snapshotError}`). A `fallback` line clears `slot`, `slots` and `machine`. ops-tower reads the journal of the generation the cutover flag selects ([Common rules](#common-rules)).
