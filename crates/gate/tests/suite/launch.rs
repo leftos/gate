@@ -344,12 +344,13 @@ fn a_second_gate_cannot_remove_a_log_a_running_command_holds() {
     write_counts(&case.root(), TWO_LIGHT);
     let log = case.folder().join("same.log");
     let go = shown(&case.folder().join("go"));
+    // Its go file ends it, so its ceiling sits past the suite's hang guard: a short one could end it before the second gate looks.
     let held = [
         "run",
         "--slot",
         "light",
         "--timeout",
-        "5",
+        "900",
         "--log",
         "same.log",
         "--test-servers-under",
@@ -441,12 +442,13 @@ fn a_log_inside_the_state_root_is_refused_before_queueing() {
         assert_eq!(case.root_entries(), Vec::<String>::new(), "{given}: nothing was journalled or logged");
     }
 
+    // It runs a command that must pass, so its ceiling sits past the suite's hang guard: a short one could end it on a busy PC.
     let beside = case.run(&[
         "run",
         "--slot",
         "light",
         "--timeout",
-        "5",
+        "900",
         "--log",
         "stateful.log",
         "--test-servers-under",
