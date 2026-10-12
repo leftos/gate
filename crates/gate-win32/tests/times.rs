@@ -11,12 +11,16 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
+use std::thread;
+use std::time::{Duration, Instant};
 
-use gate_win32::{EnvironmentBlock, Job, Launch, LaunchOutput, file_time_now, process_times, system_times};
+use gate_win32::{Accounting, EnvironmentBlock, Job, Launch, LaunchOutput, file_time_now, process_times, system_times};
 
 /// The longest any command of these tests may take: a guard against a hang, never a timing bound.
 const HANG_GUARD: Duration = Duration::from_secs(600);
+
+/// How often a poll looks again.
+const LOOK_AGAIN: Duration = Duration::from_millis(10);
 
 /// An empty folder of this test's own.
 fn case_dir(test: &str) -> PathBuf {
@@ -44,6 +48,24 @@ fn launch(dir: &Path, line: &str) -> Launch {
     }
 }
 
+/// The job's accounting once no process is in it. A member's wait returns as soon as it is signalled, before the
+/// job's accounting has dropped it from the active count, so the count is read until it has, and the last accounting
+/// read is the failure's message when the hang guard passes without it.
+fn accounting_without_members(job: &Job) -> Accounting {
+    let deadline = Instant::now() + HANG_GUARD;
+    loop {
+        let accounting = job.accounting().expect("the accounting is read after the exit");
+        if accounting.active_processes == 0 {
+            return accounting;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the member left the job's active count within the hang guard, the last accounting read being {accounting:?}"
+        );
+        thread::sleep(LOOK_AGAIN);
+    }
+}
+
 #[test]
 fn accounting_keeps_the_cpu_of_a_member_that_exited() {
     let dir = case_dir("accounting");
@@ -65,8 +87,7 @@ fn accounting_keeps_the_cpu_of_a_member_that_exited() {
     let code = running.wait(HANG_GUARD).expect("the wait answers").expect("the command exits");
     assert_eq!(code, 0);
 
-    let after = job.accounting().expect("the accounting is read after the exit");
-    assert_eq!(after.active_processes, 0, "the member has left");
+    let after = accounting_without_members(&job);
     assert!(after.cpu > 0, "the CPU of the member that exited still counts: {after:?}");
 }
 
