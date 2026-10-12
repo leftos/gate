@@ -1,4 +1,4 @@
-//! The cores hint's verdict: whether a passed run's busy cores fitted the slot kind it ran on.
+//! The cores hint's verdict: whether a passed run's busy cores fitted the slot kind it ran on, or its running on no slot.
 
 /// The average busy cores above which a light run is told heavy would fit: the light slot's thread budget.
 const LIGHT_BUDGET: f64 = 2.0;
@@ -6,6 +6,8 @@ const LIGHT_BUDGET: f64 = 2.0;
 const HEAVY_FLOOR: f64 = 1.5;
 /// The free cores a heavy run must have had on average before it is told light would fit.
 const COLD_FREE: f64 = 4.0;
+/// The average busy cores from which a run on no slot is told light or heavy would fit.
+const NO_SLOT_CEILING: f64 = 1.5;
 
 /// How many cores a command kept busy and how many the rest of the machine left it.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -28,6 +30,8 @@ pub enum SlotKind {
     Heavy,
     /// The whole machine, which is never judged.
     Critical,
+    /// No slot.
+    None,
 }
 
 /// A run that did not fit its slot kind.
@@ -37,16 +41,19 @@ pub enum Hint {
     Hot,
     /// A heavy run kept under 1.5 cores busy while at least 4 were free: light would fit.
     Cold,
+    /// A run on no slot kept 1.5 cores or more busy: light or heavy would fit.
+    Busy,
 }
 
 /// Whether `cores` fitted `slot`: a light run averaging over 2 cores ran hot whatever was free, a heavy run averaging
-/// under 1.5 ran cold when at least 4 cores were free on average, and a critical run is never judged. The peak does not
-/// change the verdict.
+/// under 1.5 ran cold when at least 4 cores were free on average, a run on no slot averaging 1.5 or more was busy
+/// whatever was free, and a critical run is never judged. The peak does not change the verdict.
 #[must_use]
 pub fn hint(cores: Cores, slot: SlotKind) -> Option<Hint> {
     match slot {
         SlotKind::Light if cores.avg > LIGHT_BUDGET => Some(Hint::Hot),
         SlotKind::Heavy if cores.avg < HEAVY_FLOOR && cores.free >= COLD_FREE => Some(Hint::Cold),
+        SlotKind::None if cores.avg >= NO_SLOT_CEILING => Some(Hint::Busy),
         _ => None,
     }
 }
@@ -67,7 +74,7 @@ mod tests {
 
     #[test]
     fn cores_verdict_table() {
-        let rows: [(&str, Cores, SlotKind, Option<Hint>); 9] = [
+        let rows: [(&str, Cores, SlotKind, Option<Hint>); 13] = [
             ("light at its budget", cores(2.0, 16.0), SlotKind::Light, None),
             ("light past its budget", cores(2.1, 16.0), SlotKind::Light, Some(Hint::Hot)),
             (
@@ -82,6 +89,10 @@ mod tests {
             ("heavy idle on a free machine", cores(0.0, 16.0), SlotKind::Heavy, Some(Hint::Cold)),
             ("critical idle", cores(0.0, 16.0), SlotKind::Critical, None),
             ("critical busy", cores(12.0, 16.0), SlotKind::Critical, None),
+            ("no slot under 1.5", cores(1.4, 16.0), SlotKind::None, None),
+            ("no slot at 1.5", cores(1.5, 16.0), SlotKind::None, Some(Hint::Busy)),
+            ("no slot idle", cores(0.0, 16.0), SlotKind::None, None),
+            ("no slot busy on a full machine", cores(3.0, 0.0), SlotKind::None, Some(Hint::Busy)),
         ];
         for (name, cores, slot, want) in rows {
             assert_eq!(hint(cores, slot), want, "{name}");

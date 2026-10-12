@@ -15,7 +15,7 @@ use gate_state::{JOURNAL_CAP_BYTES, KernelObject, StateRoot};
 use gate_win32::NamedMutex;
 use serde_json::Value;
 
-use crate::support::{Case, FAKE_TOOL, Outcome, assert_in_order, finish, run_words, shown, wait_for_file, wait_for_journal_line};
+use crate::support::{Case, FAKE_TOOL, Outcome, assert_in_order, finish, none_words, run_words, shown, wait_for_file, wait_for_journal_line};
 
 /// The words of a light run logging to `log` whose command exits with `status`.
 fn exiting<'a>(log: &'a str, status: &'a str) -> Vec<&'a str> {
@@ -161,6 +161,33 @@ fn a_run_journals_queue_take_release_in_order() {
     assert_eq!(lines[0]["log"], shown(&case.folder().join("out.log")));
     assert!(lines[1]["waitedSeconds"].is_f64(), "the take says how long it waited: {}", lines[1]);
     assert!(lines[1].get("abandoned").is_none(), "a clean take names no abandoned slot: {}", lines[1]);
+}
+
+#[test]
+fn a_no_slot_run_is_journalled_with_kind_none_and_no_slots() {
+    let case = Case::new("a_no_slot_run_is_journalled_with_kind_none_and_no_slots");
+
+    let outcome = case.run(&none_words("out.log", &[], &[FAKE_TOOL, "exit", "0"]));
+
+    assert_quiet(&outcome, 0);
+    let lines: Vec<Value> = lines_of(&case.root().join("events.jsonl")).iter().map(|line| parsed(line)).collect();
+    let events: Vec<&str> = lines.iter().map(|line| line["event"].as_str().expect("a line names its event")).collect();
+    assert_eq!(events, ["queue", "take", "release"]);
+    for line in &lines {
+        assert_eq!((&line["pid"], line["kind"].as_str()), (&lines[0]["pid"], Some("none")), "{line}");
+    }
+    let (take, release) = (&lines[1], &lines[2]);
+    assert_eq!(
+        (&take["slots"], &take["waitedSeconds"]),
+        (&serde_json::json!([]), &serde_json::json!(0.0))
+    );
+    for absent in ["abandoned", "counts", "otherHeld", "otherClaims", "parentPid"] {
+        assert!(take.get(absent).is_none(), "a no-slot take has no {absent}: {take}");
+    }
+    assert_eq!(
+        (&release["slots"], &release["status"], &release["verdict"]),
+        (&serde_json::json!([]), &serde_json::json!(0), &serde_json::json!("passed"))
+    );
 }
 
 #[test]

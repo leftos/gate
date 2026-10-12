@@ -83,9 +83,9 @@ fn the_control_command_routes_from_the_root() {
 }
 
 #[test]
-fn only_a_heavy_gate_routes_and_light_or_critical_ask_nothing_not_even_the_routing_file() {
+fn only_a_heavy_gate_routes_and_light_critical_or_none_ask_nothing_not_even_the_routing_file() {
     let command = words(&["dotnet", "test"]);
-    for slot in [Slot::Light, Slot::Critical] {
+    for slot in [Slot::Light, Slot::Critical, Slot::None] {
         let facts = FakeFacts::at_root();
         let inputs = Inputs { slot, ..heavy(&command) };
         assert_eq!(decide(&inputs, &facts), SILENT, "{slot:?}");

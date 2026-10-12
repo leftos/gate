@@ -11,8 +11,8 @@ use gate_win32::{NamedMutex, mutex_exists};
 use serde_json::Value;
 
 use crate::support::{
-    Case, FAKE_TOOL, Outcome, Running, assert_in_order, heavy_words, run_words, shown, wait_for_file, wait_for_journal_line, wait_until,
-    wait_until_closed, write_counts,
+    Case, FAKE_TOOL, Outcome, Running, assert_in_order, events_of, heavy_words, none_words, run_words, shown, wait_for_file, wait_for_journal_line,
+    wait_until, wait_until_closed, write_counts,
 };
 
 /// A light pool of one slot.
@@ -105,6 +105,60 @@ fn has_ticket(case: &Case, pid: u32) -> bool {
 fn assert_passed(running: Running) {
     let outcome = running.finish();
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
+}
+
+/// The names in the case root's `folder`; none when there is no such folder.
+fn names_in(case: &Case, folder: &str) -> Vec<String> {
+    match fs::read_dir(case.root().join(folder)) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        listed => listed
+            .expect("the folder can be listed")
+            .map(|entry| entry.expect("an entry can be read").file_name().to_string_lossy().into_owned())
+            .collect(),
+    }
+}
+
+#[test]
+fn a_no_slot_run_starts_while_every_heavy_and_light_slot_is_held() {
+    let case = Case::new("a_no_slot_run_starts_while_every_heavy_and_light_slot_is_held");
+    write_counts(&case.root(), r#"{"v":1,"heavy":1,"light":1}"#);
+    let go = case.folder().join("go");
+    let go_word = shown(&go);
+    let heavy = case.start(&heavy_words("heavy.log", &[], &[FAKE_TOOL, "wait", &go_word, "exit", "0"]));
+    wait_for_journal_line(&case.root(), &take_needle(heavy.id()));
+    let light = holder(&case, "light.log", &go);
+
+    let none = case.start(&none_words("none.log", &[], &[FAKE_TOOL, "exit", "0"]));
+    let none_pid = none.id();
+    wait_for_journal_line(&case.root(), &format!(r#""event":"release","pid":{none_pid},"#));
+    let outcome = none.finish();
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(!outcome.stderr.contains("waiting for"), "{outcome:?}");
+    assert_eq!(events_of(&case, none_pid), ["queue", "take", "release"]);
+    assert!(!has_ticket(&case, none_pid), "a no-slot run leaves no ticket");
+    let_go(&go);
+    assert_passed(heavy);
+    assert_passed(light);
+}
+
+#[test]
+fn a_no_slot_run_writes_no_claim_or_ticket() {
+    let case = Case::new("a_no_slot_run_writes_no_claim_or_ticket");
+    let go = case.folder().join("go");
+    let go_word = shown(&go);
+    let running = case.start(&none_words("none.log", &[], &[FAKE_TOOL, "wait", &go_word, "exit", "0"]));
+    wait_for_journal_line(&case.root(), &take_needle(running.id()));
+
+    for folder in ["slots", "waiting", "covered"] {
+        assert_eq!(
+            names_in(&case, folder),
+            Vec::<String>::new(),
+            "the running no-slot gate wrote in {folder}"
+        );
+    }
+    let_go(&go);
+    assert_passed(running);
 }
 
 #[test]

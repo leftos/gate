@@ -64,6 +64,15 @@ fn compat_refuses_slot_auto_exit_2() {
     assert_eq!(outcome.stdout, "");
     assert_eq!(
         outcome.stderr,
-        format!("gate: -Slot must be heavy, light or critical, got 'auto'\n{USAGE}")
+        format!("gate: -Slot must be heavy, light, critical or none, got 'auto'\n{USAGE}")
     );
+}
+
+#[test]
+fn compat_slot_none_prints_in_the_request() {
+    let case = Case::new("compat_slot_none_prints_in_the_request");
+    let mut words = compat_run(&[]);
+    words[5] = "none";
+
+    assert_eq!(finish(with_env_root(&case, &words)).request()["slot"], "none");
 }

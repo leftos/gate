@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use gate_args::{RunRequest, Slot};
+use gate_state::SlotKind;
 use gate_watchdog::{
     Config, Cores, JOB_LINES, Machine, OUTSIDE_LINES, ProcessFacts, Report, Sample, SampleFacts, SampleHistory, ServerFacts, SystemTimes, Ticks,
     Watch, WslVm, failed_block, is_wsl_command, lines, wsl_unavailable_line,
@@ -25,7 +26,7 @@ use crate::pause::PauseReader;
 use crate::priority::{OtherGates, Prioritizer};
 use crate::resolve::ResolvedRoot;
 use crate::servers::{Classified, Found, Scope, Servers, counted};
-use crate::slots::{Pool, Survey, ThisGate, epoch_ms};
+use crate::slots::{Pool, Survey, Takes, ThisGate, epoch_ms};
 
 /// How long the watch waits for the command between two samples.
 const SAMPLE_PERIOD: Duration = Duration::from_secs(5);
@@ -669,13 +670,14 @@ fn members(ids: impl IntoIterator<Item = u32>, since: u64, times: impl Fn(u32) -
     Ok(pids)
 }
 
-/// The machine a command of `slot` runs on: a critical command is High priority, and a light one is measured against
-/// the light pool's threads where the machine has them.
+/// The machine a command of `slot` runs on: a critical command is High priority, a light one is measured against the
+/// light pool's threads where the machine has them, and a no-slot one against a single core.
 fn machine(slot: Slot, processors: usize) -> Machine {
     let cores = u32::try_from(processors).unwrap_or(u32::MAX);
-    let demand = match Pool::of(slot) {
-        Some(pool) if slot == Slot::Light => processors.min(pool.threads()),
-        _ => processors,
+    let demand = match Takes::of(slot) {
+        Takes::Pool(pool @ Pool::Local(SlotKind::Light)) => processors.min(pool.threads()),
+        Takes::Nothing => 1,
+        Takes::Pool(_) | Takes::Machine => processors,
     };
     Machine::new(cores, u32::try_from(demand).unwrap_or(u32::MAX), slot == Slot::Critical)
 }
@@ -805,6 +807,12 @@ mod tests {
         assert_eq!((heavy.cores, heavy.demand, heavy.high), (16, 16, false));
         let critical = machine(Slot::Critical, 16);
         assert_eq!((critical.cores, critical.demand, critical.high), (16, 16, true));
+    }
+
+    #[test]
+    fn a_no_slot_command_asks_for_one_core() {
+        let none = machine(Slot::None, 16);
+        assert_eq!((none.cores, none.demand, none.high), (16, 1, false));
     }
 
     #[test]

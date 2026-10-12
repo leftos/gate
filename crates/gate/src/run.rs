@@ -31,7 +31,7 @@ use crate::nesting::{Nesting, Parent};
 use crate::remote::{self, RemoteCall, RemoteClient, RemoteOutcome};
 use crate::resolve::{Environment, ResolvedRoot};
 use crate::route;
-use crate::slots::{self, ClaimOf, Pool, Survey, Taken, ThisGate, epoch_ms};
+use crate::slots::{self, ClaimOf, Pool, Survey, Taken, Takes, ThisGate, epoch_ms};
 use crate::wait::{self, Arrival, Host, UnderParent, Wait, Waited};
 use crate::watch::{Start, Watched, Watcher, Watching};
 
@@ -162,7 +162,7 @@ fn admitted(request: &RunRequest, log: &Path, root: &ResolvedRoot, environment: 
     }
     let nesting = Nesting::read(environment, request.slot, &root.root);
     let said = match &nesting {
-        Nesting::Own | Nesting::Under(_) => None,
+        Nesting::Own | Nesting::Under(_) | Nesting::Beside(_) => None,
         Nesting::Malformed(_) | Nesting::Ended { .. } | Nesting::Covered(_) | Nesting::Refused(_) => nesting.line(request.slot, request.spelling),
     };
     if let Some(line) = said {
@@ -614,12 +614,24 @@ impl Run<'_> {
         }
     }
 
-    /// Waits for and takes the run's own slot of its pool into `hold`, or the machine for a critical run.
+    /// Waits for and takes the run's own slot of its pool into `hold`, or the machine for a critical run; a no-slot run
+    /// takes nothing and waits for nothing ([`Run::take_nothing`]).
     fn take_own(&mut self, hold: &mut Hold, console: &mut Console) -> Taking {
-        match Pool::of(self.request.slot) {
-            Some(pool) => self.take(pool, &mut hold.taken, console),
-            None => self.take_machine(&mut hold.machine, console),
+        match Takes::of(self.request.slot) {
+            Takes::Pool(pool) => self.take(pool, &mut hold.taken, console),
+            Takes::Machine => self.take_machine(&mut hold.machine, console),
+            Takes::Nothing => self.take_nothing(console),
         }
+    }
+
+    /// Starts a no-slot run at once: no ticket, claim or mutex, and no waiter woken. It journals a `take` of no slot,
+    /// waited for nothing, naming the parent gate it runs under when there is one.
+    fn take_nothing(&mut self, console: &mut Console) -> Taking {
+        let took = Instant::now();
+        let parent_pid = self.nesting.uncovering().map(|parent| parent.pid);
+        self.journal
+            .write(&take_event(Vec::new(), 0.0, Vec::new(), parent_pid), self.tag.as_ref(), console);
+        Taking::Took(took)
     }
 
     /// Runs the command on the slot of the light parent that lent it as the gate waited ([`Run::on_parent`]); `hold`'s
@@ -828,6 +840,13 @@ impl Run<'_> {
                 Nesting::Under(parent) => Some(UnderParent {
                     pid: parent.pid,
                     start_ms: parent.start_ms,
+                    lends: true,
+                }),
+                // A parent that holds no slot has none to lend: it names only the pause marker the gate keeps.
+                Nesting::Beside(parent) => Some(UnderParent {
+                    pid: parent.pid,
+                    start_ms: parent.start_ms,
+                    lends: false,
                 }),
                 _ => None,
             },
@@ -859,12 +878,7 @@ impl Run<'_> {
         }
         wait.end(console);
         let took = Instant::now();
-        // A gate under a parent whose slot does not cover it names that parent, so the parent knows a gate under it
-        // took a slot of its own and does not judge its own slot by the CPU both used.
-        let parent_pid = match self.nesting {
-            Nesting::Under(parent) => Some(parent.pid),
-            _ => None,
-        };
+        let parent_pid = self.nesting.uncovering().map(|parent| parent.pid);
         self.journal
             .write(&take_event(vec![name], waited, abandoned, parent_pid), self.tag.as_ref(), console);
         let of = ClaimOf {
@@ -910,8 +924,9 @@ impl Run<'_> {
             waited_seconds: waited,
             abandoned: machine.abandoned().to_vec(),
             machine: Some(snapshot),
-            // A critical gate is never under a parent whose slot does not cover it: such a gate is refused.
-            parent_pid: None,
+            // A critical gate under a parent whose slot does not cover it is refused, so only a parent that holds no
+            // slot is named here.
+            parent_pid: self.nesting.uncovering().map(|parent| parent.pid),
         };
         self.journal.write(&take, None, console);
         console.err(&line);
@@ -1395,8 +1410,8 @@ fn takes_own_slot(nesting: &Nesting, lent: bool) -> bool {
 }
 
 /// The cores line of `judged`, when its slot did not fit: only a passed run that ran here on its own light or heavy
-/// slot for at least [`HINT_MIN_WALL`] of unpaused wall time, with no gate under it that took a slot of its own, is
-/// judged, and only when its cores are known.
+/// slot, or on no slot, for at least [`HINT_MIN_WALL`] of unpaused wall time, with no gate under it that took a slot of
+/// its own, is judged, and only when its cores are known.
 fn cores_hint_for(judged: Judged) -> Option<String> {
     let timing = judged.timing.filter(|_| judged.passed && judged.own_slot)?;
     if timing.nested_took_slot || timing.wall.saturating_sub(timing.paused) < HINT_MIN_WALL {
@@ -1406,24 +1421,22 @@ fn cores_hint_for(judged: Judged) -> Option<String> {
         Slot::Light => SlotKind::Light,
         Slot::Heavy => SlotKind::Heavy,
         Slot::Critical => SlotKind::Critical,
+        Slot::None => SlotKind::None,
     };
     let cores = timing.cores?;
     hint(cores, slot).map(|misfit| cores_line(cores, misfit))
 }
 
 /// The line that tells a run its slot did not fit, `misfit` as `cores` show it: the average and free cores to one
-/// decimal, the peak to a whole number, halves to even.
+/// decimal, the peak to a whole number, halves to even. A run on no slot is told without the free cores.
 fn cores_line(cores: Cores, misfit: Hint) -> String {
-    let (slot, advice) = match misfit {
-        Hint::Hot => ("light", "work that keeps more than 2 busy belongs on heavy"),
-        Hint::Cold => ("heavy", "work that keeps under 1.5 busy fits on light"),
-    };
-    format!(
-        "gate: used {:.1} cores on average (peak {}, {:.1} free) on a {slot} slot; {advice}",
-        cores.avg,
-        cores.peak.round_ties_even(),
-        cores.free
-    )
+    let used = format!("gate: used {:.1} cores on average (peak {}", cores.avg, cores.peak.round_ties_even());
+    let free = cores.free;
+    match misfit {
+        Hint::Hot => format!("{used}, {free:.1} free) on a light slot; work that keeps more than 2 busy belongs on heavy"),
+        Hint::Cold => format!("{used}, {free:.1} free) on a heavy slot; work that keeps under 1.5 busy fits on light"),
+        Hint::Busy => format!("{used}) on no slot; work that keeps 1.5 or more busy belongs on light or heavy"),
+    }
 }
 
 /// The line a routed run says as it falls back here for `reason` from the builder `host`; a client that could not
@@ -1527,7 +1540,7 @@ mod tests {
             }),
             ..hot
         };
-        let rows: [(&str, Judged, Option<&str>); 9] = [
+        let rows: [(&str, Judged, Option<&str>); 11] = [
             ("failed", Judged { passed: false, ..hot }, None),
             ("routed", Judged { timing: None, ..hot }, None),
             ("not on its own slot", Judged { own_slot: false, ..hot }, None),
@@ -1537,6 +1550,8 @@ mod tests {
             ("hot", hot, Some("on a light slot")),
             ("cold", judged(Slot::Heavy, 10, 0, COLD), Some("on a heavy slot")),
             ("fitted", judged(Slot::Heavy, 12, 0, HOT), None),
+            ("no slot, busy", judged(Slot::None, 12, 0, HOT), Some("on no slot")),
+            ("no slot, quiet", judged(Slot::None, 12, 0, COLD), None),
         ];
         for (name, judged, want) in rows {
             let line = cores_hint_for(judged);
@@ -1566,6 +1581,15 @@ mod tests {
         assert_eq!(
             cores_line(cold, Hint::Cold),
             "gate: used 0.0 cores on average (peak 0, 12.0 free) on a heavy slot; work that keeps under 1.5 busy fits on light"
+        );
+        let busy = Cores {
+            avg: 1.54,
+            peak: 2.5,
+            free: 3.0,
+        };
+        assert_eq!(
+            cores_line(busy, Hint::Busy),
+            "gate: used 1.5 cores on average (peak 2) on no slot; work that keeps 1.5 or more busy belongs on light or heavy"
         );
     }
 

@@ -1,6 +1,7 @@
 //! Nesting under a parent gate's slot: the marker `GATE_SLOT_HELD=<kind>:<pid>:<start>[:<h>]` a gate hands its command,
 //! read once a run, and what a gate started under it does: runs under the parent's slot when that slot covers its kind,
-//! is refused when it is critical and the slot does not cover it, and otherwise takes a slot of its own.
+//! is refused when it is critical and the slot does not cover it, and otherwise takes a slot of its own, as it does
+//! under a parent that holds no slot.
 
 use std::ffi::OsStr;
 
@@ -42,6 +43,9 @@ pub(crate) enum Nesting {
     Refused(Parent),
     /// A parent whose slot does not cover this gate's kind: the gate takes its own slot.
     Under(Parent),
+    /// A parent that holds no slot: the gate takes its own slot as a gate under no parent would, and says nothing of it;
+    /// a critical gate takes the machine. The parent lends it nothing.
+    Beside(Parent),
 }
 
 /// A marker as read: the kind of slot its gate holds, the gate's pid and start, and the root hash after them.
@@ -86,7 +90,9 @@ impl Nesting {
             start_ms: start,
             marker: text.into_owned(),
         };
-        if covers(held, kind) {
+        if held == Slot::None {
+            Nesting::Beside(parent)
+        } else if covers(held, kind) {
             Nesting::Covered(parent)
         } else if kind == Slot::Critical {
             Nesting::Refused(parent)
@@ -99,6 +105,16 @@ impl Nesting {
     pub(crate) fn covering(&self) -> Option<&Parent> {
         match self {
             Nesting::Covered(parent) => Some(parent),
+            _ => None,
+        }
+    }
+
+    /// The parent this gate takes a slot of its own under: one whose slot does not cover it, or one that holds no slot.
+    /// The gate's `take` names it; a take of a slot or of the machine tells the parent not to judge its own slot by the
+    /// CPU both used, while a no-slot gate's take, of nothing, leaves the parent's judgement as it is.
+    pub(crate) fn uncovering(&self) -> Option<&Parent> {
+        match self {
+            Nesting::Under(parent) | Nesting::Beside(parent) => Some(parent),
             _ => None,
         }
     }
@@ -122,17 +138,21 @@ impl Nesting {
         }
     }
 
-    /// The line a gate of `kind`, asked for in `spelling`, says of this nesting; none for [`Nesting::Own`].
+    /// The line a gate of `kind`, asked for in `spelling`, says of this nesting; none for [`Nesting::Own`] and
+    /// [`Nesting::Beside`].
     pub(crate) fn line(&self, kind: Slot, spelling: Spelling) -> Option<String> {
-        let name = kind.as_str();
+        let going_on = match kind {
+            Slot::None => "running on no slot".to_owned(),
+            _ => format!("taking a {} slot", kind.as_str()),
+        };
         let line = match self {
-            Nesting::Own => return None,
+            Nesting::Own | Nesting::Beside(_) => return None,
             Nesting::Malformed(marker) => format!(
-                "gate: ignored GATE_SLOT_HELD='{}', which is not <kind>:<pid>:<start>; taking a {name} slot",
+                "gate: ignored GATE_SLOT_HELD='{}', which is not <kind>:<pid>:<start>; {going_on}",
                 shown_marker(marker)
             ),
             Nesting::Ended { marker, pid } => {
-                format!("gate: ignored GATE_SLOT_HELD='{marker}': gate {pid} is no longer running; taking a {name} slot")
+                format!("gate: ignored GATE_SLOT_HELD='{marker}': gate {pid} is no longer running; {going_on}")
             }
             Nesting::Covered(parent) => format!("gate: running under the {} slot of gate {}", parent.held.as_str(), parent.pid),
             Nesting::Refused(parent) => format!(
@@ -180,13 +200,14 @@ fn shown_marker(marker: &str) -> String {
     shown
 }
 
-/// Whether a parent holding a `held` slot covers a gate of `kind`: heavy covers heavy and light, light covers light, and
-/// critical covers all three.
+/// Whether a parent holding a `held` slot covers a gate of `kind`: heavy covers heavy, light and no slot, light covers
+/// light and no slot, critical covers every kind, and a parent holding no slot covers none.
 fn covers(held: Slot, kind: Slot) -> bool {
     match held {
         Slot::Heavy => kind != Slot::Critical,
-        Slot::Light => kind == Slot::Light,
+        Slot::Light => matches!(kind, Slot::Light | Slot::None),
         Slot::Critical => true,
+        Slot::None => false,
     }
 }
 
@@ -206,6 +227,7 @@ fn parse(text: &str) -> Option<Marker<'_>> {
         "heavy" => Slot::Heavy,
         "light" => Slot::Light,
         "critical" => Slot::Critical,
+        "none" => Slot::None,
         _ => return None,
     };
     let pid = digits(parts.next()?, PID_DIGITS)?;
@@ -344,6 +366,31 @@ mod tests {
     }
 
     #[test]
+    fn a_no_slot_marker_is_a_parent_beside_which_every_kind_takes_its_own_slot_silently() {
+        for kind in [Slot::Heavy, Slot::Light, Slot::Critical, Slot::None] {
+            let nesting = decided(&marker(Slot::None), kind);
+            assert_eq!(nesting, Nesting::Beside(parent(Slot::None)), "a {kind:?} gate");
+            assert_eq!(
+                (
+                    nesting.line(kind, Spelling::Cli),
+                    nesting.covering(),
+                    nesting.handed_on(true),
+                    nesting.runs_as(kind)
+                ),
+                (None, None, None, kind),
+                "a {kind:?} gate"
+            );
+        }
+    }
+
+    #[test]
+    fn a_no_slot_gate_is_covered_by_a_heavy_light_or_critical_parent() {
+        for held in [Slot::Heavy, Slot::Light, Slot::Critical] {
+            assert_eq!(decided(&marker(held), Slot::None), Nesting::Covered(parent(held)), "{held:?}");
+        }
+    }
+
+    #[test]
     fn a_marker_of_another_state_root_is_ignored_silently() {
         let other = format!("heavy:{PID}:{START}:ffffffff");
         let hashless = format!("heavy:{PID}:{START}");
@@ -425,6 +472,21 @@ mod tests {
                 Slot::Heavy,
                 Spelling::Cli,
                 Some("gate: ignored GATE_SLOT_HELD='light:7:8': gate 7 is no longer running; taking a heavy slot"),
+            ),
+            (
+                Nesting::Malformed("x:y".to_owned()),
+                Slot::None,
+                Spelling::Cli,
+                Some("gate: ignored GATE_SLOT_HELD='x:y', which is not <kind>:<pid>:<start>; running on no slot"),
+            ),
+            (
+                Nesting::Ended {
+                    marker: "light:7:8".to_owned(),
+                    pid: 7,
+                },
+                Slot::None,
+                Spelling::Cli,
+                Some("gate: ignored GATE_SLOT_HELD='light:7:8': gate 7 is no longer running; running on no slot"),
             ),
             (
                 Nesting::Covered(parent(Slot::Critical)),

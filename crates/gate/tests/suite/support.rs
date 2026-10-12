@@ -20,7 +20,7 @@ pub const FAKE_TOOL: &str = env!("CARGO_BIN_EXE_fake-tool");
 
 /// The published usage text, copied here so a change to it fails a case.
 pub const USAGE: &str = "\
-usage: gate run --slot heavy|light|critical --timeout <seconds> --log <path> [options] -- <command> [args...]
+usage: gate run --slot heavy|light|critical|none --timeout <seconds> --log <path> [options] -- <command> [args...]
        gate stop-tree <pid>
        gate cutover
        gate push
@@ -58,7 +58,9 @@ const HANG_GUARD: Duration = Duration::from_secs(600);
 /// would otherwise keep its case waiting the whole hang guard.
 const READER_GRACE: Duration = Duration::from_secs(60);
 /// How often a wait looks again.
-const POLL: Duration = Duration::from_millis(10);
+const LOOK_AGAIN: Duration = Duration::from_millis(10);
+/// The fallback poll of every gate a case starts, so a wake missed costs a case 20 ms, not 2 s.
+pub const POLL: [&str; 2] = ["--test-poll-ms", "20"];
 /// .NET ticks (100 ns since 0001-01-01) at the Unix epoch.
 const UNIX_EPOCH_TICKS: i128 = 621_355_968_000_000_000;
 
@@ -333,7 +335,7 @@ impl Running {
     fn let_readers_end(&mut self) {
         let deadline = Instant::now() + READER_GRACE;
         while Instant::now() < deadline && !self.readers.iter().all(JoinHandle::is_finished) {
-            thread::sleep(POLL);
+            thread::sleep(LOOK_AGAIN);
         }
         for reader in self.readers.drain(..) {
             if reader.is_finished() {
@@ -354,7 +356,7 @@ impl Running {
                 self.child.wait().expect("a killed program can be waited for");
                 break None;
             }
-            thread::sleep(POLL);
+            thread::sleep(LOOK_AGAIN);
         };
         self.let_readers_end();
         Outcome {
@@ -413,7 +415,7 @@ fn wait_for_stderr_check(stderr: &Buffer, what: &str, check: impl Fn(&str) -> bo
         }
         assert!(alive, "{what} did not happen on stderr before the program exited; stderr so far:\n{text}");
         assert!(Instant::now() < deadline, "{what} did not happen on stderr; stderr so far:\n{text}");
-        thread::sleep(POLL);
+        thread::sleep(LOOK_AGAIN);
     }
 }
 
@@ -430,7 +432,7 @@ fn wait_for_text(buffer: &Buffer, stream: &str, needle: &str) -> String {
             Instant::now() < deadline,
             "{needle:?} did not appear on {stream}; {stream} so far:\n{text}"
         );
-        thread::sleep(POLL);
+        thread::sleep(LOOK_AGAIN);
     }
 }
 
@@ -456,7 +458,7 @@ pub fn wait_for_journal_line(root: &Path, needle: &str) {
             return;
         }
         assert!(Instant::now() < deadline, "no line has {needle:?}; the journal so far:\n{lines}");
-        thread::sleep(POLL);
+        thread::sleep(LOOK_AGAIN);
     }
 }
 
@@ -465,7 +467,7 @@ pub fn wait_until(what: &str, mut check: impl FnMut() -> bool) {
     let deadline = Instant::now() + HANG_GUARD;
     while !check() {
         assert!(Instant::now() < deadline, "{what} did not happen within the hang guard");
-        thread::sleep(POLL);
+        thread::sleep(LOOK_AGAIN);
     }
 }
 
@@ -496,6 +498,23 @@ pub fn events(case: &Case) -> Vec<Value> {
         .lines()
         .map(|line| serde_json::from_str::<Value>(line).expect("a journal line is JSON"))
         .collect()
+}
+
+/// The journal's events of the gate `pid`, in order.
+pub fn events_of(case: &Case, pid: u32) -> Vec<String> {
+    events(case)
+        .into_iter()
+        .filter(|event| event["pid"] == pid)
+        .map(|event| event["event"].as_str().expect("a line names its event").to_owned())
+        .collect()
+}
+
+/// The `take` line of the gate `pid`.
+pub fn take_of(case: &Case, pid: u32) -> Value {
+    events(case)
+        .into_iter()
+        .find(|event| event["event"] == "take" && event["pid"] == pid)
+        .expect("the gate journalled its take")
 }
 
 /// The `release` line of `case`'s journal.
@@ -544,6 +563,13 @@ pub fn heavy_words<'a>(log: &'a str, extra: &[&'a str], command: &[&'a str]) -> 
 pub fn critical_words<'a>(log: &'a str, extra: &[&'a str], command: &[&'a str]) -> Vec<&'a str> {
     let mut words = run_words(log, extra, command);
     words[2] = "critical";
+    words
+}
+
+/// The words of a run that takes no slot, as [`run_words`] gives those of a light one.
+pub fn none_words<'a>(log: &'a str, extra: &[&'a str], command: &[&'a str]) -> Vec<&'a str> {
+    let mut words = run_words(log, extra, command);
+    words[2] = "none";
     words
 }
 

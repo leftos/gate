@@ -13,8 +13,8 @@ use jiff::Timestamp;
 use serde_json::Value;
 
 use crate::support::{
-    Case, FAKE_TOOL, GATE, Outcome, Running, assert_in_order, critical_words, events, finish, heavy_words, run_words, shown, start, wait_for_file,
-    wait_for_journal_line,
+    Case, FAKE_TOOL, GATE, Outcome, POLL, Running, assert_in_order, critical_words, events, events_of, finish, heavy_words, none_words, run_words,
+    shown, start, take_of, wait_for_file, wait_for_journal_line, write_counts,
 };
 
 /// A heavy pool of one slot.
@@ -34,6 +34,16 @@ fn root_hash(case: &Case) -> String {
         .hash()
         .expect("a case root is not the default root")
         .to_owned()
+}
+
+/// The marker a gate of `kind` that wrote the case's journal line `line` hands its command.
+fn marker_of(case: &Case, kind: &str, line: &Value) -> String {
+    let start: Timestamp = line["processStart"]
+        .as_str()
+        .expect("a line has its gate's start")
+        .parse()
+        .expect("the start is a time");
+    format!("{kind}:{}:{}:{}", line["pid"], start.as_millisecond(), root_hash(case))
 }
 
 /// A marker of a `held` slot naming this test process, which runs as a gate would, under the case's root.
@@ -221,7 +231,7 @@ fn a_dead_gates_covered_marker_is_deleted_by_the_next_gate_that_queues() {
 #[test]
 fn a_nested_gate_under_a_critical_parent_runs_without_waiting_for_the_machine() {
     let case = Case::new("a_nested_gate_under_a_critical_parent_runs_without_waiting_for_the_machine");
-    crate::support::write_counts(&case.root(), ONE_HEAVY);
+    write_counts(&case.root(), ONE_HEAVY);
     let go = case.folder().join("go");
     let holder = heavy_holder(&case, &go);
     let holder_pid = holder.id();
@@ -378,9 +388,109 @@ fn a_marker_of_another_state_root_is_not_honoured() {
 }
 
 #[test]
+fn a_gate_under_a_no_slot_run_takes_its_own_slot_and_says_nothing() {
+    let case = Case::new("a_gate_under_a_no_slot_run_takes_its_own_slot_and_says_nothing");
+    let mut inner = vec![GATE];
+    inner.extend(heavy_words("inner.log", &[], &[FAKE_TOOL, "env", "GATE_SLOT_HELD"]));
+    let outer = case.start(&none_words("outer.log", &[], &inner));
+    let outer_pid = outer.id();
+    assert_passed(&outer.finish());
+
+    let take = events(&case)
+        .into_iter()
+        .find(|event| event["event"] == "take" && event["kind"] == "heavy")
+        .expect("the inner gate took a heavy slot");
+    let slot = StateRoot::new(&shown(&case.root()), None).object_name(gate_state::KernelObject::HeavySlot(0));
+    assert_eq!((&take["slots"], &take["parentPid"]), (&Value::from(vec![slot]), &Value::from(outer_pid)));
+    let inner_log = fs::read_to_string(case.folder().join("inner.log")).expect("the inner gate wrote its log");
+    assert!(inner_log.starts_with(&format!("{}\n", marker_of(&case, "heavy", &take))), "{inner_log}");
+    let outer_log = fs::read_to_string(case.folder().join("outer.log")).expect("the outer gate wrote its log");
+    assert!(
+        !outer_log.contains("GATE_SLOT_HELD") && !outer_log.contains("slot of gate"),
+        "the inner gate said nothing of its parent: {outer_log}"
+    );
+}
+
+#[test]
+fn a_critical_gate_under_a_no_slot_run_takes_the_machine() {
+    let case = Case::new("a_critical_gate_under_a_no_slot_run_takes_the_machine");
+    let words = critical_words("out.log", &[], &[FAKE_TOOL, "exit", "0"]);
+    let outcome = finish(marked(&case, &words, &test_marker(&case, "none")));
+
+    assert_passed(&outcome);
+    assert!(
+        !outcome.stderr.contains("GATE_SLOT_HELD") && !outcome.stderr.contains("cannot run under"),
+        "{outcome:?}"
+    );
+    assert!(outcome.stderr.contains("gate: holds the machine (critical) at "), "{outcome:?}");
+    assert_eq!(events_besides(&case, 0), ["queue", "take", "release"]);
+    let take = &events(&case)[1];
+    assert!(!take["slots"].as_array().expect("slots is a list").is_empty(), "{take}");
+    assert_eq!(take["parentPid"], Value::from(process::id()));
+}
+
+#[test]
+fn a_no_slot_run_marks_its_command_with_kind_none() {
+    let case = Case::new("a_no_slot_run_marks_its_command_with_kind_none");
+    let outcome = case.run(&none_words("out.log", &[], &[FAKE_TOOL, "env", "GATE_SLOT_HELD"]));
+    assert_passed(&outcome);
+
+    let log = fs::read_to_string(case.folder().join("out.log")).expect("the gate wrote its log");
+    let marker = marker_of(&case, "none", &events(&case)[0]);
+    assert!(log.starts_with(&format!("{marker}\n")), "{log}");
+}
+
+#[test]
+fn a_no_slot_gate_under_a_heavy_gate_is_covered_and_hands_the_marker_on() {
+    let case = Case::new("a_no_slot_gate_under_a_heavy_gate_is_covered_and_hands_the_marker_on");
+    let mut inner = vec![GATE];
+    inner.extend(none_words("inner.log", &[], &[FAKE_TOOL, "env", "GATE_SLOT_HELD"]));
+    let outer = case.start(&heavy_words("outer.log", &[], &inner));
+    let outer_pid = outer.id();
+    assert_passed(&outer.finish());
+
+    let line = covered(&case);
+    assert_eq!((&line["parentPid"], &line["kind"]), (&Value::from(outer_pid), &Value::from("none")));
+    let marker = marker_of(&case, "heavy", &events(&case)[0]);
+    let inner_log = fs::read_to_string(case.folder().join("inner.log")).expect("the inner gate wrote its log");
+    assert_in_order(
+        &inner_log,
+        &[&format!("{marker}\n"), &format!("gate: running under the heavy slot of gate {outer_pid}")],
+    );
+}
+
+#[test]
+fn a_gate_under_a_no_slot_run_is_not_lent_a_slot_during_a_critical_request() {
+    let case = Case::new("a_gate_under_a_no_slot_run_is_not_lent_a_slot_during_a_critical_request");
+    write_counts(&case.root(), r#"{"v":1,"heavy":1,"light":4}"#);
+    let go = case.folder().join("go");
+    let holder = heavy_holder(&case, &go);
+    let critical = case.start(&critical_words("critical.log", &POLL, &[FAKE_TOOL, "exit", "0"]));
+    let critical_pid = critical.id();
+    critical.wait_for_stderr("gate: waiting for the machine (critical)");
+
+    let words = heavy_words("child.log", &POLL, &[FAKE_TOOL, "exit", "0"]);
+    let child = start(marked(&case, &words, &test_marker(&case, "none")));
+    let child_pid = child.id();
+    child.wait_for_stderr(&format!(
+        "gate: waiting for a heavy slot behind the critical request of gate {critical_pid}\n"
+    ));
+    assert_eq!(events_of(&case, child_pid), ["queue"], "the child waits for a slot of its own");
+
+    let_go(&go);
+    assert_passed(&holder.finish());
+    assert_passed(&critical.finish());
+    let outcome = child.finish();
+    assert_passed(&outcome);
+    assert!(!outcome.stderr.contains("taking no slot"), "{outcome:?}");
+    assert_eq!(events_of(&case, child_pid), ["queue", "take", "release"]);
+    assert_eq!(take_of(&case, child_pid)["parentPid"], Value::from(process::id()));
+}
+
+#[test]
 fn a_heavy_gate_under_a_light_parent_takes_a_heavy_slot() {
     let case = Case::new("a_heavy_gate_under_a_light_parent_takes_a_heavy_slot");
-    crate::support::write_counts(&case.root(), ONE_HEAVY);
+    write_counts(&case.root(), ONE_HEAVY);
     let go = case.folder().join("go");
     let holder = heavy_holder(&case, &go);
     let holder_pid = holder.id();

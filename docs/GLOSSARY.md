@@ -10,6 +10,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Backfill guest**: a waiting gate admitted, during a critical drain, onto a slot the critical gate lends, because its expected run ends before the drain's shadow end; one still running when the drain completes is killed and re-queued.
 - **Backstop**: the watchdog's last limit, five times the ceiling in wall time (less time paused behind a critical request), whatever the load.
 - **Barrier**: the earliest live critical ticket that arrived before a gate's own, which holds the gate back: a heavy gate takes no slot behind it and a light gate only a reserved light slot.
+- **Beside**: the nesting case of a gate started under a no-slot parent's marker (`Nesting::Beside`): the parent holds nothing to cover or lend, so the gate takes its own slot as a top-level gate would, a critical child included.
 - **Black-box suite**: the Rust integration suite (`crates/gate/tests/suite/`) that drives the built `gate.exe` through its CLI and reads only its exit code, output, log, journal, claims and tickets; it needs the `test-seams` feature to run.
 - **Bounded call**: a call of the Rust remote client to the builder's `gate box` that is not the run itself (the `stop` and the `boot` after a lost connection), ended after 30 s and retried once after a pre-banner failure while 5 s of the bound would be left.
 - **Box**: a builder; the word the gate's prose and its hidden `gate box` subcommand use.
@@ -27,8 +28,8 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Confirmation window**: the 5 s across which every scan of the cutover's drain must find no PowerShell gate before it ends, because the PowerShell gate deletes its ticket when it takes a slot and writes its claim up to about 2 s later; a scan that finds a gate resets it.
 - **Console donor**: the hidden system `cmd.exe /d /q /k` that `gate box run` puts in the command's job, whose console the box sets to UTF-8 and the command inherits; it lives until the wait for the command is over.
 - **Control line**: one JSON line, carrying the call's nonce, that the **Shim** writes on pwsh's stdout to answer the gate: `started`, the result (status, killed, reason) or an error; the request goes the other way on pwsh's stdin.
-- **Cores hint**: the line before the passed line saying how many cores a command kept busy when its slot kind did not fit: a light run over 2 cores, or a heavy run under 1.5 with cores to spare.
-- **Covered**: said of a nested gate whose parent's slot kind covers its own (heavy covers heavy and light, light covers light, critical covers all), so it takes no slot.
+- **Cores hint**: the line before the passed line saying how many cores a command kept busy when its slot kind did not fit: a light run over 2 cores, a heavy run under 1.5 with cores to spare, or a no-slot run at 1.5 or more.
+- **Covered**: said of a nested gate whose parent's slot kind covers its own (heavy covers heavy, light and none, light covers light and none, critical covers all), so it takes no slot.
 - **Covered marker**: the file `covered\<pid>-<start>.json` a covered gate keeps while it runs, so ops-tower sees a gate that writes no claim or ticket.
 - **Critical drain**: a critical gate's wait for the gates that arrived before it to free their slots, while it holds back the gates that arrive after it.
 - **Critical gate**: a gate run with `--slot critical`, which takes every heavy and unreserved light slot and runs its command at High priority.
@@ -63,6 +64,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Manifest**: the PC's list of its files under a routed run's output globs (path, size, last write, SHA-256), sent to the box so it packs only the files the PC lacks or that differ.
 - **Marker**: a failure marker, a log line the built-in regex reads as a failure (such as `Build FAILED.` or `error CS1234`), which turns a zero exit into status 1.
 - **Nesting**: a gate started inside another gate's command (a build hook under a gated `git commit`), which reads its parent from the slot marker.
+- **No slot**: the slot kind `none` (`--slot none`), for a command that only dispatches or watches remote work: it takes no slot, mutex, ticket or claim, never waits, and still has its job, log, ceiling and watchdog.
 - **Notes**: the gate's own lines gathered while a run goes and appended to the end of its log.
 - **Output cap**: the remote client's limit of 64 KiB on one line of a call's output (a `\r` resets the line, so git's progress counts per update), which kills a capped call that sends a longer one.
 - **Outputs archive**: the `<key>-<nonce>.tar.zst` a routed run's changed output files travel in, its last member `.gate-outputs.json` listing the files before it.

@@ -257,6 +257,33 @@ fn reserved_take_fields_are_accepted() {
 }
 
 #[test]
+fn a_no_slot_run_folds_to_a_finished_run_with_no_slot() {
+    let gate = Gate::new(1, START, COMMAND);
+    let none = json!({"kind": "none"});
+    let none_slots = json!({"kind": "none", "slots": []});
+    let lines = vec![
+        versioned(&with_fields(&gate.queue(&ago(30)), &none), 1),
+        versioned(&with_fields(&gate.take(&ago(29), 0.0), &none_slots), 1),
+        versioned(
+            &with_fields(
+                &gate.release(&ago(28), 1.0, json!(0)),
+                &json!({"kind": "none", "slots": [], "verdict": "passed"}),
+            ),
+            1,
+        ),
+    ];
+
+    let history = history_of("a_no_slot_run_folds_to_a_finished_run_with_no_slot", &lines);
+
+    assert_eq!(states(&history), [RunState::Ok]);
+    let run = &history.runs[0];
+    assert_eq!(
+        (run.kind.as_str(), run.started.as_deref(), run.slot, run.slots.len()),
+        ("none", Some(ago(29).as_str()), None, 0)
+    );
+}
+
+#[test]
 fn a_take_naming_its_parent_is_accepted_and_runs_on_its_own_slot() {
     let gate = Gate::new(1, START, COMMAND);
     let lines = vec![

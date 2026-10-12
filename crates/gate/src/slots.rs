@@ -27,16 +27,30 @@ pub(crate) enum Pool {
     Remote(u32),
 }
 
-impl Pool {
-    /// The pool a gate of `slot` takes from; `None` for a critical gate, which takes the machine ([`crate::machine`]).
-    pub(crate) fn of(slot: Slot) -> Option<Pool> {
+/// What a gate of a slot kind takes here: a slot of a pool, the whole machine, or nothing.
+#[derive(Clone, Copy)]
+pub(crate) enum Takes {
+    /// A slot of this machine's pool of the gate's kind.
+    Pool(Pool),
+    /// The machine, as a critical gate takes it ([`crate::machine`]).
+    Machine,
+    /// Nothing: a no-slot gate takes no slot and waits for none.
+    Nothing,
+}
+
+impl Takes {
+    /// What a gate of `slot` takes.
+    pub(crate) fn of(slot: Slot) -> Takes {
         match slot {
-            Slot::Heavy => Some(Pool::Local(SlotKind::Heavy)),
-            Slot::Light => Some(Pool::Local(SlotKind::Light)),
-            Slot::Critical => None,
+            Slot::Heavy => Takes::Pool(Pool::Local(SlotKind::Heavy)),
+            Slot::Light => Takes::Pool(Pool::Local(SlotKind::Light)),
+            Slot::Critical => Takes::Machine,
+            Slot::None => Takes::Nothing,
         }
     }
+}
 
+impl Pool {
     /// The kernel object of the pool's slot `index`.
     pub(crate) fn object(self, index: u32) -> KernelObject {
         match self {

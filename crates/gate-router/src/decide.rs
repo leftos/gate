@@ -33,6 +33,8 @@ pub enum Slot {
     Heavy,
     Light,
     Critical,
+    /// No slot: a run that takes nothing, never routed.
+    None,
 }
 
 /// What the caller knows before the decision asks anything.

@@ -13,12 +13,10 @@ use serde_json::{Value, json};
 
 use crate::nesting::{marked, test_marker};
 use crate::support::{
-    Case, FAKE_TOOL, GATE, Running, assert_in_order, critical_words, events, finish, heavy_words, run_words, shown, start, wait_for_journal_line,
-    wait_until, write_counts,
+    Case, FAKE_TOOL, GATE, POLL, Running, assert_in_order, critical_words, events, events_of, finish, heavy_words, none_words, run_words, shown,
+    start, take_of, wait_for_journal_line, wait_until, write_counts,
 };
 
-/// The fallback poll of every gate a case starts, so a wake missed costs a case 20 ms, not 2 s.
-const POLL: [&str; 2] = ["--test-poll-ms", "20"];
 /// The status Windows reports for a process Ctrl+C ended, `STATUS_CONTROL_C_EXIT`, as a signed exit code.
 const CONTROL_C_EXIT: i32 = 0xC000_013A_u32.cast_signed();
 /// The prefix of a critical gate's waiting line.
@@ -49,19 +47,6 @@ fn at(case: &Case, event: &str, pid: u32) -> usize {
     let found = sequence.iter().position(|(name, of)| name == event && *of == pid);
     assert!(found.is_some(), "no {event} line of gate {pid} in {sequence:?}");
     found.expect("checked above")
-}
-
-/// The journal's events of the gate `pid`, in order.
-fn events_of(case: &Case, pid: u32) -> Vec<String> {
-    sequence(case).into_iter().filter(|(_, of)| *of == pid).map(|(name, _)| name).collect()
-}
-
-/// The `take` line of the gate `pid`.
-fn take_of(case: &Case, pid: u32) -> Value {
-    events(case)
-        .into_iter()
-        .find(|event| event["event"] == "take" && event["pid"] == pid)
-        .expect("the gate journalled its take")
 }
 
 /// The names of a `slots` list, sorted: a critical gate lists its slots in the order it took them.
@@ -305,6 +290,56 @@ fn light_gates_keep_working_beside_a_holding_critical_gate() {
     assert_eq!(events_of(&case, critical_pid), ["queue", "take"], "the critical gate holds on");
     let_go(&go);
     assert_passed(&critical.finish());
+}
+
+/// What a journal line of the release of the gate `pid` contains.
+fn release_needle(pid: u32) -> String {
+    format!(r#""event":"release","pid":{pid},"#)
+}
+
+#[test]
+fn a_no_slot_run_starts_while_a_critical_gate_holds_the_machine() {
+    let case = Case::new("a_no_slot_run_starts_while_a_critical_gate_holds_the_machine");
+    write_counts(&case.root(), r#"{"v":1,"heavy":1,"light":3}"#);
+    let go = case.folder().join("go");
+    let go_word = shown(&go);
+    let critical = holder(&case, &critical_words("critical.log", &POLL, &[FAKE_TOOL, "wait", &go_word, "exit", "0"]));
+    let critical_pid = critical.id();
+
+    let none = case.start(&none_words("none.log", &POLL, &[FAKE_TOOL, "exit", "0"]));
+    let none_pid = none.id();
+    wait_for_journal_line(&case.root(), &release_needle(none_pid));
+    let outcome = none.finish();
+
+    assert_passed(&outcome);
+    assert!(!outcome.stderr.contains("waiting for"), "{outcome:?}");
+    assert_eq!(events_of(&case, none_pid), ["queue", "take", "release"]);
+    assert_eq!(take_of(&case, none_pid)["slots"], json!([]), "the no-slot run took no slot");
+    assert_eq!(events_of(&case, critical_pid), ["queue", "take"], "the critical gate holds on");
+    let_go(&go);
+    assert_passed(&critical.finish());
+}
+
+#[test]
+fn a_critical_gate_does_not_wait_for_a_running_no_slot_run() {
+    let case = Case::new("a_critical_gate_does_not_wait_for_a_running_no_slot_run");
+    write_counts(&case.root(), r#"{"v":1,"heavy":1,"light":1}"#);
+    let go = case.folder().join("go");
+    let go_word = shown(&go);
+    let none = holder(&case, &none_words("none.log", &POLL, &[FAKE_TOOL, "wait", &go_word, "exit", "0"]));
+    let none_pid = none.id();
+
+    let critical = case.start(&critical_words("critical.log", &POLL, &[FAKE_TOOL, "exit", "0"]));
+    let critical_pid = critical.id();
+    wait_for_journal_line(&case.root(), &release_needle(critical_pid));
+    let outcome = critical.finish();
+
+    assert_passed(&outcome);
+    assert!(!outcome.stderr.contains(WAITING), "{outcome:?}");
+    assert_eq!(events_of(&case, none_pid), ["queue", "take"], "the no-slot run still runs");
+    assert_eq!(take_of(&case, critical_pid)["otherClaims"], json!([]));
+    let_go(&go);
+    assert_passed(&none.finish());
 }
 
 #[test]

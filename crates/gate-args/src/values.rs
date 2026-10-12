@@ -100,7 +100,7 @@ pub(crate) fn remote_call(option: &str, value: &str, calls: &'static [&'static s
 }
 
 pub(crate) fn slot(option: &str, value: &str) -> Result<Slot, Problem> {
-    [Slot::Heavy, Slot::Light, Slot::Critical]
+    [Slot::Heavy, Slot::Light, Slot::Critical, Slot::None]
         .into_iter()
         .find(|slot| slot.as_str().eq_ignore_ascii_case(value))
         .ok_or_else(|| Problem::BadSlot {

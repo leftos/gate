@@ -159,11 +159,13 @@ pub(crate) fn delete_ticket(path: &Path, console: &mut Console) {
 
 /// The parent gate whose slot a gate waits under: the gate's pid, and the start it runs since in Unix epoch
 /// milliseconds, which between them name the pause marker the waiting gate keeps while a critical request holds it
-/// back ([`crate::pause`]).
+/// back ([`crate::pause`]), and whether the parent may lend the gate its slot: a light parent whose slot does not cover
+/// the gate may, a parent that holds no slot may not.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct UnderParent {
     pub pid: u32,
     pub start_ms: u64,
+    pub lends: bool,
 }
 
 /// A gate queued for a slot of its pool.
@@ -214,8 +216,8 @@ pub(crate) struct Arrival<'g> {
     pub queued: Instant,
     pub arrived: u64,
     pub builder: Option<&'g str>,
-    /// The parent gate whose slot does not cover this gate, which lends it while a critical request drains; `None` for
-    /// any other gate.
+    /// The parent gate whose slot does not cover this gate, which lends it while a critical request drains, or the parent
+    /// that holds no slot, which lends nothing; `None` for any other gate.
     pub under: Option<UnderParent>,
 }
 
@@ -348,10 +350,11 @@ impl<'a> Wait<'a> {
     }
 
     /// Whether the gate's light parent lends it its slot on a pass that read the other gates' live tickets `others`
-    /// and a light count of `light` ([`lends`]); never for a gate under no such parent.
+    /// and a light count of `light` ([`lends`]); never for a gate under no such parent, nor under a parent that holds no
+    /// slot.
     fn lent(&self, others: &[Ticket], light: u32, survey: &mut Survey, console: &mut Console) -> bool {
         let root = self.root;
-        self.under.is_some_and(|parent| {
+        self.under.filter(|parent| parent.lends).is_some_and(|parent| {
             let mut facts = Probed {
                 root,
                 parent: parent.pid,

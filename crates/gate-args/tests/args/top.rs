@@ -16,7 +16,7 @@ fn version_and_help_are_matched_before_the_compat_layer() {
             problems(&[word]),
             [
                 format!("gate: unknown option {word}"),
-                "gate: missing -Slot heavy|light|critical".to_owned(),
+                "gate: missing -Slot heavy|light|critical|none".to_owned(),
                 "gate: missing -TimeoutSeconds <seconds>".to_owned(),
                 "gate: missing -Log <path>".to_owned(),
                 "gate: missing the command after --".to_owned(),

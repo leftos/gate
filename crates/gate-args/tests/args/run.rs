@@ -56,7 +56,7 @@ fn run_reads_every_option_and_the_defaults() {
 fn new_cli_refuses_slot_auto_and_timeout_auto() {
     assert_eq!(
         problems(&["run", "--slot", "auto", "--timeout", "5", "--log", "out.log", "--", "cmd"]),
-        ["gate: --slot must be heavy, light or critical, got 'auto'"]
+        ["gate: --slot must be heavy, light, critical or none, got 'auto'"]
     );
     assert_eq!(
         problems(&["run", "--slot", "heavy", "--timeout", "auto", "--log", "out.log", "--", "cmd"]),
@@ -69,7 +69,7 @@ fn run_reports_every_missing_input_on_its_own_line() {
     assert_eq!(
         problems(&["run"]),
         [
-            "gate: missing --slot heavy|light|critical",
+            "gate: missing --slot heavy|light|critical|none",
             "gate: missing --timeout <seconds>",
             "gate: missing --log <path>",
             "gate: missing the command after --"
@@ -78,7 +78,7 @@ fn run_reports_every_missing_input_on_its_own_line() {
     assert_eq!(
         problems(&["-Local"]),
         [
-            "gate: missing -Slot heavy|light|critical",
+            "gate: missing -Slot heavy|light|critical|none",
             "gate: missing -TimeoutSeconds <seconds>",
             "gate: missing -Log <path>",
             "gate: missing the command after --"
@@ -152,9 +152,15 @@ fn run_caps_whole_numbers_at_i32_max() {
 fn run_rejects_bad_slot() {
     assert_eq!(
         problems(&["run", "--slot", "medium", "--timeout", "5", "--log", "out.log", "--", "cmd"]),
-        ["gate: --slot must be heavy, light or critical, got 'medium'"]
+        ["gate: --slot must be heavy, light, critical or none, got 'medium'"]
     );
-    for (value, slot) in [("Light", Slot::Light), ("CRITICAL", Slot::Critical), ("heavy", Slot::Heavy)] {
+    for (value, slot) in [
+        ("Light", Slot::Light),
+        ("CRITICAL", Slot::Critical),
+        ("heavy", Slot::Heavy),
+        ("none", Slot::None),
+        ("None", Slot::None),
+    ] {
         let request = run_request(&["run", "--slot", value, "--timeout", "5", "--log", "out.log", "--", "cmd"]);
         assert_eq!(request.slot, slot, "--slot {value}");
     }

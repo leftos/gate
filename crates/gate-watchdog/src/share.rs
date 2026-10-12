@@ -30,7 +30,7 @@ pub struct Machine {
     /// The logical processors the machine offers.
     pub cores: u32,
     /// The processors the command's share is measured against, given by the caller: the light pool's thread count for
-    /// a light gate, every core for any other.
+    /// a light gate, one core for a gate on no slot, every core for any other.
     pub demand: u32,
     /// Whether the command is High priority, which no load of others slows.
     pub high: bool,
@@ -39,8 +39,9 @@ pub struct Machine {
 impl Machine {
     /// The machine `cores` logical processors offer a command that may use `demand` of them.
     ///
-    /// The demand is the caller's, as `New-Watch` computes it: `min(cores, the light pool's threads)` for a light gate
-    /// and `cores` for every other. `share_of` clamps no demand itself, so the caller that knows the pool clamps.
+    /// The demand is the caller's: `min(cores, the light pool's threads)` for a light gate, as `New-Watch` computes it,
+    /// 1 for a gate on no slot, and `cores` for every other. `share_of` clamps no demand itself, so the caller that
+    /// knows the pool clamps.
     #[must_use]
     pub fn new(cores: u32, demand: u32, high: bool) -> Self {
         Self { cores, demand, high }
@@ -109,6 +110,14 @@ mod tests {
         for (name, busy, own, demand, high, want) in rows {
             let got = share(busy, own, demand, high);
             assert!((got - want).abs() <= 1e-9, "{name}: got {got}, expected {want}");
+        }
+    }
+
+    #[test]
+    fn a_demand_of_one_core_has_its_whole_share_while_one_core_is_free() {
+        let machine = Machine::new(16, 1, false);
+        for free in [1.0, 1.5, 16.0] {
+            assert!((share_of(machine, free) - 1.0).abs() <= 1e-9, "{free} free cores");
         }
     }
 }

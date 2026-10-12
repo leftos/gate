@@ -91,6 +91,8 @@ pub enum Slot {
     Heavy,
     Light,
     Critical,
+    /// No slot: the run takes nothing from any pool and never waits.
+    None,
 }
 
 impl Slot {
@@ -101,6 +103,7 @@ impl Slot {
             Slot::Heavy => "heavy",
             Slot::Light => "light",
             Slot::Critical => "critical",
+            Slot::None => "none",
         }
     }
 }

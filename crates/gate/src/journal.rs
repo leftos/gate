@@ -109,8 +109,8 @@ impl RunJournal {
     }
 }
 
-/// Whether a gate under the gate `pid` took a slot of its own at or after `since`: a `take` line naming `pid` as its
-/// `parentPid` in the journal of the state root at `root`, or in the journal it rolled over to when the current one
+/// Whether a gate under the gate `pid` took a slot of its own at or after `since`: a `take` line of a slot or of the
+/// machine naming `pid` as its `parentPid` in the journal of the state root at `root`, or in the journal it rolled over to when the current one
 /// begins after `since`. A gate's marker names its parent by pid and start, and only a live parent is honoured, so
 /// such a line is normally from a gate under this one. A nested gate orphaned by an earlier gate of the same pid could
 /// still name it; that can only drop this run's cores, never add a hint.
@@ -139,14 +139,17 @@ fn read_if_present(path: &Path) -> io::Result<String> {
     }
 }
 
-/// Whether one of the journal lines in `text` is a `take` naming `pid` as its `parentPid` at or after `since`. A line
-/// that does not parse, as a torn last line may not, names no one.
+/// Whether one of the journal lines in `text` is a `take` of a slot or of the machine naming `pid` as its `parentPid` at
+/// or after `since`: a take that lists a slot, or a critical gate's, which carries what it found of the machine. A
+/// no-slot gate's take lists none and counts for nothing. A line that does not parse, as a torn last line may not,
+/// names no one.
 fn names_nested_take(text: &str, pid: u32, since: Timestamp) -> bool {
     text.lines()
         .filter(|line| line.contains(r#""event":"take""#) && line.contains(r#""parentPid":"#))
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
         .any(|line| {
-            line["parentPid"].as_u64() == Some(u64::from(pid))
+            let took = line["slots"].as_array().is_some_and(|slots| !slots.is_empty()) || line.get("counts").is_some();
+            took && line["parentPid"].as_u64() == Some(u64::from(pid))
                 && line["time"]
                     .as_str()
                     .and_then(|time| time.parse::<Timestamp>().ok())
@@ -171,7 +174,22 @@ mod tests {
     }
 
     fn take(time: &str, parent: &str) -> String {
-        format!(r#"{{"v":1,"time":"{time}","event":"take","pid":9,"slots":[],"waitedSeconds":0.0{parent}}}"#)
+        format!(r#"{{"v":1,"time":"{time}","event":"take","pid":9,"slots":["Local\\gate-slot-0"],"waitedSeconds":0.0{parent}}}"#)
+    }
+
+    #[test]
+    fn only_a_nested_take_of_a_slot_or_the_machine_counts() {
+        let since = at("2026-10-11T10:00:00Z");
+        let of_no_slot =
+            |extra: &str| format!(r#"{{"v":1,"time":"2026-10-11T10:00:01.0000000Z","event":"take","pid":9,"slots":[]{extra},"parentPid":42}}"#);
+        let machine = r#","counts":{"heavy":0,"light":0},"otherHeld":{"heavy":0,"light":0},"otherClaims":[]"#;
+        let rows = [
+            ("a take of no slot", of_no_slot(r#","waitedSeconds":0.0"#), false),
+            ("a take of the machine that listed no slot", of_no_slot(machine), true),
+        ];
+        for (name, line, want) in rows {
+            assert_eq!(names_nested_take(&format!("{line}\n"), 42, since), want, "{name}");
+        }
     }
 
     #[test]

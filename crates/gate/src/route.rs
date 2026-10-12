@@ -69,6 +69,7 @@ fn slot(slot: Slot) -> gate_router::Slot {
         Slot::Heavy => gate_router::Slot::Heavy,
         Slot::Light => gate_router::Slot::Light,
         Slot::Critical => gate_router::Slot::Critical,
+        Slot::None => gate_router::Slot::None,
     }
 }
 

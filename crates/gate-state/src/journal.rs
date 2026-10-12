@@ -75,7 +75,8 @@ pub struct HistoryRun {
     /// The repository the run's folder belongs to, as the caller's repo function names it; `None` without a folder or
     /// when the function names none.
     pub repo: Option<String>,
-    /// The gate's `-Slot`: `heavy`, `light` or `critical`; a string because `critical` is not a `SlotKind`.
+    /// The gate's `-Slot`: `heavy`, `light`, `critical` or `none`; a string because `critical` and `none` are not a
+    /// `SlotKind`.
     pub kind: String,
     /// The index of the first slot the run took, or `None` when it took none.
     pub slot: Option<u32>,
@@ -113,7 +114,8 @@ pub struct HistoryRun {
     /// When the gate queued, as the journal wrote it (ISO 8601 UTC, seven fractional digits); `None` when its queue
     /// line is in neither journal file.
     pub queued: Option<String>,
-    /// When the gate took its slot, as the journal wrote it, or `None` when it took none.
+    /// When the gate took its slot, as the journal wrote it; for a run that took no slot (`kind` `none`), when it
+    /// journalled its take, which is when it started. `None` when it journalled no take.
     pub started: Option<String>,
     /// How long the gate waited for its slot, from its take or its abandon.
     pub waited_seconds: Option<f64>,

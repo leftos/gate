@@ -1,6 +1,6 @@
 //! The compatibility layer: the PowerShell gate's argument form.
 
-use gate_args::{Invocation, RunRequest, Spelling, StopRequest, parse};
+use gate_args::{Invocation, RunRequest, Slot, Spelling, StopRequest, parse};
 
 use crate::support::{RUN, invocation, os, problems, refs, run_request, stop_request, with};
 
@@ -117,7 +117,17 @@ fn compat_switch_colon_other_value_is_usage_error() {
 #[test]
 fn compat_refuses_slot_auto() {
     let words = ["-Log", "out.log", "-TimeoutSeconds", "5", "-Slot", "auto", "--", "cmd"];
-    assert_eq!(problems(&words), ["gate: -Slot must be heavy, light or critical, got 'auto'"]);
+    assert_eq!(problems(&words), ["gate: -Slot must be heavy, light, critical or none, got 'auto'"]);
+}
+
+#[test]
+fn compat_accepts_slot_none_in_any_case() {
+    for words in [
+        ["-Log", "out.log", "-TimeoutSeconds", "5", "-Slot", "none", "--", "cmd"].as_slice(),
+        ["-Log", "out.log", "-TimeoutSeconds", "5", "-slot:NONE", "--", "cmd"].as_slice(),
+    ] {
+        assert_eq!(run_request(words).slot, Slot::None, "{words:?}");
+    }
 }
 
 #[test]
@@ -131,7 +141,7 @@ fn compat_refuses_new_cli_flags_in_old_form() {
         [
             "gate: unknown option --slot",
             "gate: unexpected argument heavy",
-            "gate: missing -Slot heavy|light|critical"
+            "gate: missing -Slot heavy|light|critical|none"
         ]
     );
     assert_eq!(problems(&refs(&compat(&["-Expect", "--", "cmd"]))), ["gate: unknown option -Expect"]);

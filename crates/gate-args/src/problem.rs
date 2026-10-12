@@ -97,7 +97,7 @@ impl fmt::Display for Problem {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Problem::Missing(required, spelling) => write!(f, "gate: missing {}", missing_text(*required, *spelling)),
-            Problem::BadSlot { option, value } => write!(f, "gate: {option} must be heavy, light or critical, got '{value}'"),
+            Problem::BadSlot { option, value } => write!(f, "gate: {option} must be heavy, light, critical or none, got '{value}'"),
             #[cfg(feature = "test-seams")]
             Problem::BadRemoteCall { option, value, calls } => write!(f, "gate: {option} must be {}, got '{value}'", one_of(calls)),
             Problem::NotAboveZero { option, value } => write!(f, "gate: {option} must be a whole number above 0, got '{value}'"),
@@ -136,8 +136,8 @@ fn one_of(calls: &[&str]) -> String {
 
 fn missing_text(required: Required, spelling: Spelling) -> &'static str {
     match (required, spelling) {
-        (Required::Slot, Spelling::Cli) => "--slot heavy|light|critical",
-        (Required::Slot, Spelling::Compat) => "-Slot heavy|light|critical",
+        (Required::Slot, Spelling::Cli) => "--slot heavy|light|critical|none",
+        (Required::Slot, Spelling::Compat) => "-Slot heavy|light|critical|none",
         (Required::Timeout, Spelling::Cli) => "--timeout <seconds>",
         (Required::Timeout, Spelling::Compat) => "-TimeoutSeconds <seconds>",
         (Required::Log, Spelling::Cli) => "--log <path>",

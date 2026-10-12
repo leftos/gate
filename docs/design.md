@@ -46,7 +46,7 @@ Rules both parsers share:
 - A value option takes the next word unless that word is `--`; an empty value counts as missing.
 - A whole number is ASCII digits only: no sign, space or fraction. Timeout, stall, tail and the `--test-*-ms` values are at most 2147483647.
 - `--slot` values compare case-insensitively.
-- `--slot auto` and `--timeout auto` are refused as invalid values until GATE-8 and GATE-16 build them.
+- `--slot auto` and `--timeout auto` are refused as invalid values until GATE-8 and GATE-16 build them. `--slot none` is accepted.
 - A gate option that is not valid Unicode is a usage error; the words after `--` are passed through as the caller gave them.
 - A word before `--` that is not an option is a usage error (`gate: unexpected argument <word>`).
 
@@ -54,17 +54,19 @@ A valid `gate stop-tree` stops the tree ([`gate stop-tree`](#gate-stop-tree)).
 
 A valid `gate run` starts the command: it refuses a batch word (exit 2), refuses a `--log` inside the state root (exit 2, `gate: the log <path> is inside the gate's state folder <root>`; the paths are compared canonical, through links and junctions, after canonicalising the nearest existing folder), takes the log's mutex, prepares the log, queues, takes a slot, starts the command in the job `Local\gate[-<h>]-job-<gate pid>`, waits for it, reaches the verdict and releases the slot.
 
+A `none` run takes no slot and starts at once ([Slots](#pools-and-names)).
+
 The watchdog samples the command and kills its job on a stall, at the ceiling and at the backstop.
 
 ### `gate run`
 
-`gate run --slot heavy|light|critical --timeout <seconds> --log <path> [options] -- <command> [args...]`
+`gate run --slot heavy|light|critical|none --timeout <seconds> --log <path> [options] -- <command> [args...]`
 
 `--slot`, `--timeout`, `--log` and the command are required and have no default, because a gate with no ceiling holds its caller for as long as the command hangs (kept, C1). Each missing or unreadable input is named on its own line before the usage.
 
 | Flag | PowerShell option | Meaning | Source |
 |---|---|---|---|
-| `--slot heavy\|light\|critical` | `-Slot` | The slot kind ([Slots](#slots)). | ruling |
+| `--slot heavy\|light\|critical\|none` | `-Slot` | The slot kind ([Slots](#slots)); `none` takes no slot and is for a command that only dispatches or watches remote work. | ruling |
 | `--timeout <seconds>` | `-TimeoutSeconds` | The ceiling in load-adjusted seconds, a whole number above 0 (W3). | ruling |
 | `--log <path>` | `-Log` | The command's log; a relative path is read against the working directory once, at start (P5). | ruling |
 | `--stall <seconds>` | `-StallSeconds` | The stall window, default 120 (W2); the gate passes it as given, and the remote client raises a value under 15 to 15 on a routed run (F2). | kept (C1, F2) |
@@ -178,7 +180,7 @@ Further modes arrive as subcommands of the same binary, each designed with its i
 
 `gate.exe` also accepts the PowerShell gate's argument form, so the cutover breaks no caller:
 
-`gate -Log <path> -TimeoutSeconds <n> -Slot heavy|light|critical [-StallSeconds <n>] [-Tail <n>] [-NoMarkers] [-Local] -- <command>` and `gate -StopTree <pid>`.
+`gate -Log <path> -TimeoutSeconds <n> -Slot heavy|light|critical|none [-StallSeconds <n>] [-Tail <n>] [-NoMarkers] [-Local] -- <command>` and `gate -StopTree <pid>`.
 
 - It accepts exactly the options `-Log`, `-TimeoutSeconds`, `-Slot`, `-StallSeconds`, `-Tail`, `-NoMarkers`, `-Local` and `-StopTree`, compared case-insensitively, and maps each to the flag in the table above (`-StopTree <pid>` to `gate stop-tree <pid>`).
 
@@ -187,7 +189,7 @@ Further modes arrive as subcommands of the same binary, each designed with its i
 - `-StopTree <pid>` (or `-StopTree:<pid>`) must be the only option.
 - A value option never takes one of the eight option names as its value: `-Log -NoMarkers` is `-Log` with no value, then `-NoMarkers`.
 - The colon form `-Name:value` in one word is read as that option with that value (C2). A switch's colon form is read by its value, compared case-insensitively: `-NoMarkers:true`, `-Local:$true` set it, `-Local:false`, `-Local:$false` clear it, and any other value is a usage error. This fixes the PowerShell gate's reading of every `-Switch:<value>` as true (C2, CC-194).
-- Values are validated as in the new CLI; the messages may name either spelling.
+- Values are validated as in the new CLI; the messages may name either spelling. The missing-slot line reads `gate: missing --slot heavy|light|critical|none` or `gate: missing -Slot heavy|light|critical|none`, and a bad slot says `gate: <option> must be heavy, light, critical or none, got '<value>'`.
 - The layer is removed once no caller uses it. Until then, every reader of command-line text (ops-tower's activity join, the hooks that inspect a gated command) matches both spellings.
 
 ## Exit codes
@@ -222,6 +224,7 @@ The lines of a run that starts its command:
 - The cores hint, on stdout just before the passed line, when its conditions hold ([Cores hint](#cores-hint)): `gate: used <avg> cores on average (peak <peak>, <free> free) on a light slot; work that keeps more than 2 busy belongs on heavy` or `... on a heavy slot; work that keeps under 1.5 busy fits on light`.
 
   Two notes go to the log only, and the hint is left out: `gate: cannot read the command's CPU at its end: <error>; its cores are unknown` and `gate: cannot tell whether a gate under this one took a slot of its own: <error>; its cores are unknown`.
+- The cores hint of a run on no slot, in the same place and under the same conditions, has no free cores: `gate: used <avg> cores on average (peak <peak>) on no slot; work that keeps 1.5 or more busy belongs on light or heavy`.
 - Failed, on stderr: `gate: FAILED (status <n>). Full output: <log>`. A command that exited 0 with a marker in its log first says `gate: command exited 0 but its log reports a failure -> <log>` on stderr, and its status is 1.
 - On a non-zero status, up to 40 `<line number>:<line>` marker lines on stdout, before the tail.
 - A start failure, on stderr and in the log: `gate: could not start <word> (<resolved full path>): <system message>`, exit 127. The parenthesis is left out when the resolved path is the word itself, and a program found nowhere gets the message of error 2 with no parenthesis. `gate: cannot read the system folder, which holds cmd.exe: <error>` and `gate: cannot make <path> a full path: <error>` are start failures too.
@@ -246,8 +249,8 @@ The lines of a run that starts its command:
 
   A routed run that passed says `gate: passed in <w> s on <host> (wall clock, ceiling <n> s). Full output: <log>`, with no load-adjusted time. The client's status is the gate's own, passed through as `N`.
 - A critical gate, on stderr and in the log: the `waiting for the machine (critical)`, `still waiting for the machine (critical)`, `holds the machine (critical)` and `interrupted while waiting for the machine` lines, in [Critical drain and nesting](#critical-drain-and-nesting).
-- Nesting, on stderr and in the log, from the slot marker in the gate's environment: the `running under` (including the lend's `while a critical request drains`), `ignored GATE_SLOT_HELD` and `does not cover` lines, the barrier's `waiting for a heavy slot behind the critical request` and `waiting for a light slot beside the critical request` lines, and the refusal of a critical gate, all in [Critical drain and nesting](#critical-drain-and-nesting).
-- The gate prints no `queued for` or `took ... slot` line, for a local or a routed run: the queue and the take are in the journal, and a wait longer than 30 s says `gate: still waiting for a <kind> slot (<s> s)`.
+- Nesting, on stderr and in the log, from the slot marker in the gate's environment: the `running under` (including the lend's `while a critical request drains`), `ignored GATE_SLOT_HELD` (`running on no slot` for a no-slot gate) and `does not cover` lines, the barrier's `waiting for a heavy slot behind the critical request` and `waiting for a light slot beside the critical request` lines, and the refusal of a critical gate, all in [Critical drain and nesting](#critical-drain-and-nesting).
+- The gate prints no `queued for` or `took ... slot` line, for a local, a routed or a no-slot run: the queue and the take are in the journal, and a wait longer than 30 s says `gate: still waiting for a <kind> slot (<s> s)`. A no-slot run never waits.
 - Notes that never fail the gate: `gate: cannot remove <log>.err: <error>`, `gate: cannot remove the log <path> of the attempt: <error>` (a routed run that fell back could not delete the log the client wrote), `gate: cannot append <log>.err to the log: <error>` and `gate: cannot read this gate's priority class, so the command runs below normal: <error>`.
 
 ## Slots
@@ -264,6 +267,12 @@ A slot is a named mutex in the logon session's `Local\` namespace, held by the g
 | critical | `Local\gate-critical` | a critical gate, for its whole run, so two critical requests run one at a time in arrival order (K1). |
 
 The pools never wait on each other, so a serial test run does not queue behind builds (S1). A gate takes and releases its mutexes on one OS thread, since Windows mutex ownership is per thread.
+
+A `none` run is in no pool: it takes no slot, mutex, ticket, claim or covered marker, never waits, wakes no waiters and starts at once, even while a critical gate holds the machine. It is for a command that only dispatches or watches remote work (`gh run watch`, a deploy script polling a server, a remote image build).
+
+It still has its job, so `gate stop-tree` reaches it, and it runs at BelowNormal. A critical drain does not wait for it, it is not in the take's `otherClaims`, and the barrier never holds it.
+
+A critical gate moves a `none` run's build servers as it moves an ungated build's, since the run holds no claim: a build belongs under a nested gate with a slot, whose claim protects its servers.
 
 ### Counts
 
@@ -405,7 +414,7 @@ The environment carries one more name: `GATE_SLOT_HELD`, the slot marker ([Criti
 | Field | Type | Meaning |
 |---|---|---|
 | `v` | number | 1 |
-| `kind` | string | `heavy`, `light`, `critical` or `remote` |
+| `kind` | string | `heavy`, `light`, `critical` or `remote`; a `none` run writes no claim |
 | `index` | number | slot index; 0 for `gate-critical.json` |
 | `pid` | number | the gate's pid |
 | `processStart` | string | the gate's start time, ISO UTC |
@@ -432,7 +441,7 @@ A pid the checking gate may not query is dead too, since it is another user's pr
 | Field | Type | Meaning |
 |---|---|---|
 | `v` | number | 1 |
-| `kind` | string | `heavy`, `light`, `critical` |
+| `kind` | string | `heavy`, `light`, `critical`; a `none` run writes no ticket |
 | `arrived` | number | first arrival, epoch ms; a routed run that falls back keeps its first arrival (K6) |
 | `pid` | number | the gate's pid |
 | `startTicks` | number | the gate's process start, epoch ms (the field keeps its name) |
@@ -446,7 +455,7 @@ A ticket whose gate is dead by the [liveness rule](#claim) is ignored and delete
 
 ### Covered marker
 
-`covered\<pid>-<start>.json`, written by a gate running under a parent gate's slot ([Critical drain and nesting](#critical-drain-and-nesting)) right after its `covered` journal line, so ops-tower sees a gate that takes no slot and writes no ticket or claim.
+`covered\<pid>-<start>.json`, written by a gate running under a parent gate's slot ([Critical drain and nesting](#critical-drain-and-nesting)) right after its `covered` journal line, so ops-tower sees a gate that takes no slot and writes no ticket or claim. A `none` run under no covering parent writes no marker: ops-tower's live Gates view, built from claims, tickets and covered markers, shows it only through the journal.
 
 | Field | Type | Meaning |
 |---|---|---|
@@ -472,7 +481,9 @@ A missing file, or a missing key, gives the default silently. A file unreadable 
 
 ### Journal
 
-`events.jsonl` holds one JSON object per line, appended under the journal mutex (`Local\gate-journal`, [Kernel object names](#kernel-object-names)) with a 2 s wait (kept, J1). The events are `queue`, `take`, `release`, `abandon`, `covered`, `parent` and `fallback`. `gate.exe` writes `covered` for a gate running under its parent's slot; `gate.exe` writes `parent` for a gate lent its light parent's slot while a critical request drains, once the command's environment is built.
+`events.jsonl` holds one JSON object per line, appended under the journal mutex (`Local\gate-journal`, [Kernel object names](#kernel-object-names)) with a 2 s wait (kept, J1). The events are `queue`, `take`, `release`, `abandon`, `covered`, `parent` and `fallback`. `kind` is `heavy`, `light`, `critical` or `none`.
+
+`gate.exe` writes `covered` for a gate running under its parent's slot; `gate.exe` writes `parent` for a gate lent its light parent's slot while a critical request drains, once the command's environment is built.
 
 Every line starts with `v`, `time`, `event`, `pid`, `processStart`, `kind`, `cwd` and `command` (the same text as the claim's [`command`](#claim)), in that order, then the event's own fields, as the PowerShell gate writes them (J1); a routed run adds `remote` (true), `host` (the ssh destination) and `key` (the remote work folder's key) after the event's own fields and before `abandoned`, on its `queue`, `take`, `release`, `abandon` and `fallback` lines, and on none after the `fallback`.
 
@@ -485,7 +496,7 @@ The event's own fields:
 | Event | Fields after the common ones |
 |---|---|
 | `queue` | `log` (the log's full path), `notRouted` (written right after `log`, only when a heavy gate's caller kept it local with `--local`, with the value `--local`; other reasons for a local run write none) |
-| `take` | `slots` (the slot names taken; a critical gate lists every heavy and unreserved light slot it holds), `waitedSeconds`, optionally `parentPid`, and for a critical gate `counts`, `otherHeld`, then `otherClaims` or `snapshotError` |
+| `take` | `slots` (the slot names taken; a critical gate lists every heavy and unreserved light slot it holds; a `none` run lists none, `[]`, with `waitedSeconds` 0.0), `waitedSeconds`, optionally `parentPid`, and for a critical gate `counts`, `otherHeld`, then `otherClaims` or `snapshotError` |
 | `release` | `slots` (the same list), `heldSeconds`, `status` (null when the gate failed before its command had one), `wallSeconds`, `adjustedSeconds`, optionally `avgCores`, `peakCores`, `freeCores`, `verdict` |
 | `abandon` | `waitedSeconds`: the gate ended while still queued (Ctrl+C while waiting for a slot) |
 | `parent`, `covered` | `parentPid`; a lent gate writes `parent` after its `queue` when it was lent the slot as it waited, and alone, with no `queue`, when it was lent it before it queued |
@@ -499,8 +510,9 @@ Fields beyond J1's:
 - `take`: a critical gate's `take` carries, after `waitedSeconds` and in this order, `counts` (`{"heavy": <n>, "light": <n>}`, the counts of the pass that took the machine), `otherHeld` (the same shape: the slots within the counts that other gates hold), then `otherClaims` or `snapshotError`; `abandoned` stays last (K5, GATE-38).
 
   `otherClaims` is a list of `{pid, kind, index, command, file}`, one per live claim of another gate in this root's `slots\` folder, sorted by file name: only the `gate-*.json` files, the remote pool's claims and this gate's own left out, `file` the claim's file name. `snapshotError` replaces it only when the claims folder cannot be listed, and holds the reason.
-- `take`: `parentPid`, an integer after `waitedSeconds` (and a critical take's snapshot fields) and before the remote fields and `abandoned`, written by a gate under a parent whose slot did not cover it ([Cores hint](#cores-hint)). `gate-state`'s reader accepts it and does not treat the run as on the parent's slot.
-- `release`: `avgCores`, `peakCores`, `freeCores`, optional numbers of one decimal after `adjustedSeconds` and before `verdict` ([Cores hint](#cores-hint)). They are omitted when there is no unpaused sample, the sampler failed, the read of the command's CPU at its end failed, a gate under the run took a slot of its own, the journal could not be read to tell, or the run was routed. Covered and lent runs write no `release`.
+- `take`: `parentPid`, an integer after `waitedSeconds` (and a critical take's snapshot fields) and before the remote fields and `abandoned`, written by a gate under a parent whose slot did not cover it ([Cores hint](#cores-hint)), or under a no-slot parent. `gate-state`'s reader accepts it and does not treat the run as on the parent's slot.
+- `take` of a `none` run: `"kind":"none"` on its `queue`, `take` and `release`, and a `take` with `"slots":[]` and `"waitedSeconds":0.0`, no `abandoned`, no machine fields, and `parentPid` only under a live no-slot parent. Its `release` has `"slots":[]` and is written like any run's, unlike a covered or lent run's. `v` stays 1. The history reader gives the run `kind` `none`, no `slot`, and `started` from the `take`.
+- `release`: `avgCores`, `peakCores`, `freeCores`, optional numbers of one decimal after `adjustedSeconds` and before `verdict` ([Cores hint](#cores-hint)). They are omitted when there is no unpaused sample, the sampler failed, the read of the command's CPU at its end failed, a gate under the run took a slot of its own (or the machine), the journal could not be read to tell, or the run was routed. Covered and lent runs write no `release`.
 - `release`: `wallSeconds` (the command's wall time less the seconds paused behind a critical request; a routed run's whole remote wall time), `adjustedSeconds` (load-adjusted seconds, 3 decimals, a number for every run that started; null for a routed run and for a run whose sampler failed) and `verdict`, one of `passed`, `failed`, `log-failure`, `stalled`, `timed-out`, `backstop`, `unknown` (kept, J5).
 
   A routed run is a kill only when the gate killed it; a command that exits 124 on its own is `failed`.
@@ -579,13 +591,13 @@ All kept: what a critical gate asks for and the order of its drain (K1), the res
 
 Changes from the PowerShell forms:
 
-- The slot marker is `GATE_SLOT_HELD=<kind>:<pid>:<start>` with `<start>` in epoch ms. Under a non-default root it gains the root hash, `<kind>:<pid>:<start>:<h>`, and a gate honours a marker only when its hash matches its own root (no hash for the default root). A test gate running under a real gate's marker therefore takes its own slots.
+- The slot marker is `GATE_SLOT_HELD=<kind>:<pid>:<start>` with `<start>` in epoch ms, `<kind>` one of `heavy`, `light`, `critical` and `none`. Under a non-default root it gains the root hash, `<kind>:<pid>:<start>:<h>`, and a gate honours a marker only when its hash matches its own root (no hash for the default root). A test gate running under a real gate's marker therefore takes its own slots.
 - The pause folder lives in the state root, so a test root isolates it.
 - Light gates beside a critical gate and the critical gate's own waits use the wake events and the queue order of [Taking a slot](#taking-a-slot).
 
 What `gate.exe` does of it today is part A, nesting under the slot marker (N1, K7), part B1, the critical request's own drain and take (K1, K2, K5), the barrier (Q3), the light gates beside a critical request (K3), the lend (N2) and the pause markers' writer and reader (N3), all below. The watchdog reads the markers on every sample.
 
-- A gate reads `GATE_SLOT_HELD` once, before routing and before the log mutex (`nesting.rs`). A live parent whose slot covers the gate's kind (heavy covers heavy and light, light covers light, critical covers all three) gives `gate: running under the <held kind> slot of gate <pid>`: the gate takes no slot, writes no ticket or claim, and journals one `covered` line (identity fields, then `parentPid`; no `queue`, `take` or `release`).
+- A gate reads `GATE_SLOT_HELD` once, before routing and before the log mutex (`nesting.rs`). A live parent whose slot covers the gate's kind (heavy covers heavy, light and none, light covers light and none, critical covers all four) gives `gate: running under the <held kind> slot of gate <pid>`: the gate takes no slot, writes no ticket or claim, and journals one `covered` line (identity fields, then `parentPid`; no `queue`, `take` or `release`).
 
   It then keeps a [covered marker](#covered-marker) until it releases, so ops-tower sees it run.
 
@@ -594,9 +606,14 @@ What `gate.exe` does of it today is part A, nesting under the slot marker (N1, K
 - A parent is live by the three-way liveness dead-gate cleanup uses (`slots::Liveness`): gone means no such process, a start mismatch or access denied; any other error reading its start counts as running, with no extra line.
 - A malformed marker says `gate: ignored GATE_SLOT_HELD='<text>', which is not <kind>:<pid>:<start>; taking a <kind> slot`, with every character outside `[A-Za-z0-9:]` in `<text>` shown as `?` and at most 64 characters, then `...`.
 
-  A marker whose parent is gone says `gate: ignored GATE_SLOT_HELD='<marker>': gate <pid> is no longer running; taking a <kind> slot`. A marker hashed for another root, or unhashed under a non-default root, is ignored silently. Each of these gates then takes its own slot.
+  A marker whose parent is gone says `gate: ignored GATE_SLOT_HELD='<marker>': gate <pid> is no longer running; taking a <kind> slot`. A marker hashed for another root, or unhashed under a non-default root, is ignored silently. Each of these gates then takes its own slot; a no-slot gate says `...; running on no slot` in place of `taking a <kind> slot`.
 - A critical gate under a heavy or light marker is refused (K7) on stderr only, exit 2, before the log mutex, with nothing queued or journalled: `gate: --slot critical cannot run under the <held kind> slot of gate <pid>: it would wait for that slot for good; run the critical command outside that gate` (`-Slot critical` through the PowerShell spelling).
 - A heavy gate under a light marker takes its own slot and says `gate: the <held kind> slot of gate <pid> does not cover a <kind> gate; taking a <kind> slot` just before its local take (after a Local route or a fallback, before its wait lines); a gate routed to the builder never says it.
+- **No slot.** A `none` run takes nothing and is never held by the drain or the barrier. Its marker is `GATE_SLOT_HELD=none:<pid>:<start>[:<h>]`. A gate under a `none` marker (the case `Nesting::Beside`) takes its own slot as a top-level gate would: a critical child takes the machine and is never refused (K7 applies to heavy and light markers only).
+
+  Such a gate prints no nesting line and is never lent a slot, and it keeps the pause marker for its no-slot parent's stall window. Its `take` names `parentPid`.
+
+  A `none` gate under a heavy, light or critical parent is covered: it journals `covered` with kind `none`, prints `gate: running under the <held kind> slot of gate <pid>` and hands the parent's marker on.
 - **One request at a time.** A critical gate queues a ticket of kind `critical` and runs after every earlier live critical ticket, in arrival order, each through the critical mutex ([Kernel object names](#kernel-object-names)). An abandoned critical mutex counts as taken, with the `took <name>, which a killed gate had left held` line.
 - **The drain.** With the mutex held, the gate waits for every earlier live heavy ticket, and for every earlier light ticket when the light count less the reserved light slots is above 0. Remote tickets are ignored, and so is a ticket whose gate already holds a live claim and only failed to delete its ticket.
 - **The take.** It then takes every heavy slot and every unreserved light slot, re-reading the counts on each pass. The reserved light slots are the `min(2, light count)` of the highest indices, and a critical gate never takes them.
@@ -649,7 +666,7 @@ All kept, with each knob's default unchanged:
   Progress as the watchdog crate counts it resets the stall clock when the sum of the log and `.err` sizes changed (grew or shrank), the job's CPU since the last progress reached 1% of one core over the stall window, a pid appeared that the last sample did not have, or a nested gate is paused, or a build server's CPU counts as progress (see Build servers below), or, for a `wsl` command, the WSL VM's CPU counts as progress (see WSL below).
 - The load-adjusted clock and the ceiling (W3): each sample adds `interval * free`, the interval running between the samples' `at` stamps, to the clock `--timeout` runs on; a sample taken while a nested gate is paused adds to the paused time instead; `gate: TIMED OUT after ...`.
 
-  The free share is 1 for a High-priority command; otherwise `busy` is the share of the interval's system time that was not idle, the cores others held are `max(0, busy * cores - own cores)` with `own cores` the job's CPU gained over the interval, and `free = clamp((cores - others) / demand, 0.05, 1)`. `demand` is every core, or `min(cores, 2)` for a light gate.
+  The free share is 1 for a High-priority command; otherwise `busy` is the share of the interval's system time that was not idle, the cores others held are `max(0, busy * cores - own cores)` with `own cores` the job's CPU gained over the interval, and `free = clamp((cores - others) / demand, 0.05, 1)`. `demand` is every core, `min(cores, 2)` for a light gate, or 1 for a gate on no slot, so its ceiling stays near wall time on a loaded PC.
 - The backstop (W4): wall time less paused time reaching 5 times the ceiling, whatever the load: `gate: BACKSTOP: ...`. One sample's precedence is STALLED, TIMED OUT, BACKSTOP.
 - Sampler failure (W5): `gate: sampler failed: <message>; watching by wall time only`, then the backstop alone watches. The pause markers are still read, and a paused stretch, that of the failing sample included and running to the failure's own fresh stamp, is left out of the backstop's wall time.
 - WSL (W6): for a command whose first word is `wsl` or `wsl.exe` (a path allowed, case-insensitive), the VM's CPU since the last progress reaching a tenth of one core over the stall window counts as progress. The VM's CPU is not added to the command's own CPU, since WSL's relay processes escape the job and the VM is the only signal.
@@ -761,7 +778,7 @@ The box heartbeat (BW9) is the box wrapper's command-time heartbeat, not the wai
 
   The start-failure message is the system message for the CreateProcessW error code, as `Win32Exception.Message` gives it, with no `(os error N)` suffix. That failure alone maps to status 127; every other start failure is the gate's own.
 - **Priority.** BelowNormal, or the gate's own class when that is already BelowNormal or Idle; High for a critical gate and any gate under a critical marker (kept, P2). The classes of the build servers outside the job are moved while the command runs ([Watchdog](#watchdog), B2).
-- **Environment.** Every command gets the gate's environment with these set over it (names compared case-insensitively): `GATE_SLOT_HELD=<kind>:<pid>:<start_ms>[:<h>]` (the held slot's marker, critical included, or the parent's for a covered gate), `MSBUILDDISABLENODEREUSE=1`, `DOTNET_CLI_USE_MSBUILD_SERVER=0` (kept, P3, B3), and `GATE_STATE_DIR=<root>` under a non-default root. Under the default root an inherited `GATE_STATE_DIR` is removed. The gate's own environment is never changed.
+- **Environment.** Every command gets the gate's environment with these set over it (names compared case-insensitively): `GATE_SLOT_HELD=<kind>:<pid>:<start_ms>[:<h>]` (the held slot's marker, `none` too, or the parent's for a covered gate), `MSBUILDDISABLENODEREUSE=1`, `DOTNET_CLI_USE_MSBUILD_SERVER=0` (kept, P3, B3), and `GATE_STATE_DIR=<root>` under a non-default root. Under the default root an inherited `GATE_STATE_DIR` is removed. The gate's own environment is never changed.
 
   The batch refusal's `%NAME%` check answers for this exact block.
 
@@ -1398,13 +1415,15 @@ A Rust integration suite drives the built `gate.exe` through its CLI and reads o
 
 When a run that passed did not fit its slot, the gate says how many cores the command kept busy, so the caller learns whether heavy or light was right (GATE-6). For example: `gate: used 7.4 cores on average (peak 15, 0.6 free) on a light slot; work that keeps more than 2 busy belongs on heavy`.
 
-- The line is said on stdout, just before the passed line, only for a passed run that took its own light or heavy slot, ran 10 s or more of unpaused wall time, and had no gate under it take a slot of its own. A critical run is never judged, and a covered or lent run takes no slot.
+- The line is said on stdout, just before the passed line, only for a passed run that took its own light or heavy slot or ran on no slot, ran 10 s or more of unpaused wall time, and had no gate under it take a slot of its own. A critical run is never judged, and a covered or lent run takes no slot.
 - `avg` is the job's CPU (user plus kernel time of every process ever in the job, exited ones included, with a final read at exit) plus the CPU of the build servers the watchdog counts while the job holds a build client (the final stretch counted with the last sample's servers), over the run's unpaused wall time; the CPU of paused samples is left out.
 
   `peak` is the highest own CPU over one sampler interval, paused samples skipped. `free` is the mean over the unpaused samples of the cores others left free. `avg` and `free` show one decimal; `peak` is rounded to a whole number, ties to even.
 - A light run averaging over 2 cores is told heavy would fit. A heavy run averaging under 1.5 cores with at least 4.0 free on average is told light would fit. The peak is reported but does not change the verdict.
-- Whether a gate under the run took a slot of its own is read from the journal (`nested_took_slot`): a gate under `Nesting::Under` writes `parentPid` on its `take`. When the CPU at the end or the journal cannot be read, the hint is left out with a log-only note ([Output lines](#output-lines)).
-- The journal's `release` line records `avgCores`, `peakCores` and `freeCores` ([Journal](#journal)), the history `--slot auto` will read (GATE-8). `--slot auto` runs a command with too little history on heavy and says it guessed; it never chooses critical.
+- A run on no slot averaging 1.5 cores or more is told `gate: used <avg> cores on average (peak <peak>) on no slot; work that keeps 1.5 or more busy belongs on light or heavy`, whatever was free; the line has no free cores. The conditions above are otherwise unchanged.
+- Whether a gate under the run took a slot of its own is read from the journal (`nested_took_slot`): a gate under `Nesting::Under` or `Nesting::Beside` writes `parentPid` on its `take`, and the parent drops its hint and cores only when that `take` lists a slot or took the machine (a critical `take`).
+- A nested no-slot gate takes nothing, so it leaves its parent's hint and cores. When the CPU at the end or the journal cannot be read, the hint is left out with a log-only note ([Output lines](#output-lines)).
+- The journal's `release` line records `avgCores`, `peakCores` and `freeCores` ([Journal](#journal)), the history `--slot auto` will read (GATE-8). `--slot auto` runs a command with too little history on heavy and says it guessed; it never chooses critical or none.
 - Learned durations and `--slot auto` are built after the local cutover; the v1 formats reserve their optional fields ([Reserved fields](#reserved-fields)).
 
 ## Open questions

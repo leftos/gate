@@ -156,7 +156,7 @@ fn flag_set_hands_over_the_whole_status_and_output() {
     );
     assert_eq!(
         lines(&handed.stderr),
-        format!("gate: -Slot must be heavy, light or critical, got 'auto'\n{USAGE}").trim_end_matches('\n')
+        format!("gate: -Slot must be heavy, light, critical or none, got 'auto'\n{USAGE}").trim_end_matches('\n')
     );
     assert!(!words.exists(), "the canonical gate ran: the launcher did not hand over");
 }

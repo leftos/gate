@@ -51,7 +51,7 @@ fn run_reports_missing_inputs_then_usage_exit_2() {
     assert_in_order(
         &outcome.stderr,
         &[
-            "gate: missing --slot heavy|light|critical\n",
+            "gate: missing --slot heavy|light|critical|none\n",
             "gate: missing --timeout <seconds>\n",
             "gate: missing --log <path>\n",
             "gate: missing the command after --\n",

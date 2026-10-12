@@ -79,6 +79,15 @@ fn print_request_shows_the_new_cli_request() {
     the_seams_given_are_printed(&case);
 }
 
+#[test]
+fn print_request_shows_slot_none() {
+    let case = Case::new("print_request_shows_slot_none");
+    let mut words = print_run(&["cmd"]);
+    words[2] = "none";
+
+    assert_eq!(case.run(&words).request()["slot"], "none");
+}
+
 /// The seams the case's runs give are printed as given.
 fn the_seams_given_are_printed(case: &Case) {
     let mut seams = print_run(&["cmd"]);

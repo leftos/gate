@@ -68,7 +68,7 @@ pub struct JournalIdentity {
     pub pid: u32,
     /// The gate process's start time.
     pub process_start: Timestamp,
-    /// The slot kind the gate asked for: `heavy`, `light` or `critical`.
+    /// The slot kind the gate asked for: `heavy`, `light`, `critical` or `none`.
     pub kind: String,
     /// The gate's working directory.
     pub cwd: String,

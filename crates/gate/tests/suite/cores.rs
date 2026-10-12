@@ -7,7 +7,7 @@
 
 use serde_json::Value;
 
-use crate::support::{Case, FAKE_TOOL, GATE, Outcome, events, heavy_words, run_words};
+use crate::support::{Case, FAKE_TOOL, GATE, Outcome, events, heavy_words, none_words, run_words};
 
 /// The fields the release line carries the cores in.
 const CORES_FIELDS: [&str; 3] = ["avgCores", "peakCores", "freeCores"];
@@ -38,16 +38,29 @@ fn journalled_cores(release: &Value) -> Option<(f64, f64, f64)> {
 /// is rounded from the unrounded figure, so it is only checked to lie within a rounding of the journal's tenths.
 fn assert_said_before_passed(outcome: &Outcome, cores: (f64, f64, f64), slot: &str, advice: &str) {
     let (avg, peak, free) = cores;
-    let lines: Vec<&str> = outcome.stdout.lines().collect();
-    assert!(lines.len() >= 2, "{outcome:?}");
-    assert!(lines[lines.len() - 1].starts_with("gate: passed in "), "{outcome:?}");
     let pattern = format!(
         r"\Agate: used {avg:.1} cores on average \(peak (\d+), {free:.1} free\) on a {slot} slot; {}\z",
         regex::escape(advice)
     );
-    let said = regex::Regex::new(&pattern)
-        .expect("the pattern is valid")
-        .captures(lines[lines.len() - 2]);
+    assert_matched_before_passed(outcome, &pattern, peak);
+}
+
+/// Asserts that `outcome` passed with the no-slot cores line of `cores` just before the passed line, as
+/// [`assert_said_before_passed`] asserts a slot's.
+fn assert_no_slot_line_before_passed(outcome: &Outcome, cores: (f64, f64, f64)) {
+    let (avg, peak, _) = cores;
+    let pattern =
+        format!(r"\Agate: used {avg:.1} cores on average \(peak (\d+)\) on no slot; work that keeps 1\.5 or more busy belongs on light or heavy\z");
+    assert_matched_before_passed(outcome, &pattern, peak);
+}
+
+/// Asserts that `outcome` passed with a line matching `pattern` just before the passed line, which stays last, its
+/// captured peak within a rounding of the journalled `peak`.
+fn assert_matched_before_passed(outcome: &Outcome, pattern: &str, peak: f64) {
+    let lines: Vec<&str> = outcome.stdout.lines().collect();
+    assert!(lines.len() >= 2, "{outcome:?}");
+    assert!(lines[lines.len() - 1].starts_with("gate: passed in "), "{outcome:?}");
+    let said = regex::Regex::new(pattern).expect("the pattern is valid").captures(lines[lines.len() - 2]);
     assert!(said.is_some(), "the line before the passed one is {pattern}: {outcome:?}");
     let said_peak: f64 = said.expect("checked above")[1].parse().expect("the peak is a whole number");
     assert!(
@@ -134,6 +147,96 @@ fn a_light_parent_whose_nested_gate_took_a_heavy_slot_is_not_judged() {
     nested.extend(heavy_words("nested.log", &[], &[FAKE_TOOL, "burn-threads", "4", "12000"]));
 
     let running = case.start(&run_words("out.log", &["--test-sample-ms", "1000"], &nested));
+    let pid = running.id();
+    let outcome = running.finish();
+
+    assert_eq!((outcome.code, outcome.stderr.as_str()), (Some(0), ""), "{outcome:?}");
+    let lines = events(&case);
+    let named = lines
+        .iter()
+        .find(|line| line["event"] == "take" && line["pid"] != pid)
+        .map(|take| take["parentPid"].clone());
+    assert_eq!(named, Some(Value::from(pid)), "the nested gate's take names its parent: {lines:?}");
+    let release = release_of(&case, pid);
+    assert!(
+        CORES_FIELDS.iter().all(|field| release.get(field).is_none()),
+        "the parent journals no cores: {release}"
+    );
+    assert_no_cores_line(&outcome);
+}
+
+#[test]
+fn a_busy_no_slot_run_says_it_belongs_on_light_or_heavy() {
+    let case = Case::new("a_busy_no_slot_run_says_it_belongs_on_light_or_heavy");
+    let command = [FAKE_TOOL, "burn-threads", "4", "12000"];
+
+    let running = case.start(&none_words("out.log", &["--test-sample-ms", "1000"], &command));
+    let pid = running.id();
+    let outcome = running.finish();
+
+    assert_eq!((outcome.code, outcome.stderr.as_str()), (Some(0), ""), "{outcome:?}");
+    match journalled_cores(&release_of(&case, pid)) {
+        Some(cores) if cores.0 >= 1.5 => assert_no_slot_line_before_passed(&outcome, cores),
+        _ => assert_no_cores_line(&outcome),
+    }
+}
+
+#[test]
+fn a_quiet_no_slot_run_prints_no_hint() {
+    let case = Case::new("a_quiet_no_slot_run_prints_no_hint");
+    let command = [FAKE_TOOL, "sleep", "11000"];
+
+    let running = case.start(&none_words("out.log", &["--test-sample-ms", "1000"], &command));
+    let pid = running.id();
+    let outcome = running.finish();
+
+    assert_eq!((outcome.code, outcome.stderr.as_str()), (Some(0), ""), "{outcome:?}");
+    if let Some(cores) = journalled_cores(&release_of(&case, pid)) {
+        assert!(cores.0 < 1.5, "a sleeping command keeps no core busy: {cores:?}");
+    }
+    assert_no_cores_line(&outcome);
+}
+
+#[test]
+fn a_no_slot_run_whose_nested_gate_took_no_slot_keeps_its_hint() {
+    let case = Case::new("a_no_slot_run_whose_nested_gate_took_no_slot_keeps_its_hint");
+    // The nested no-slot gate burns four threads for 12 s inside the no-slot parent's job and takes no slot, so the
+    // parent's CPU is its own to judge.
+    let mut nested = vec![GATE];
+    nested.extend(none_words("nested.log", &[], &[FAKE_TOOL, "burn-threads", "4", "12000"]));
+
+    let running = case.start(&none_words("out.log", &["--test-sample-ms", "1000"], &nested));
+    let pid = running.id();
+    let outcome = running.finish();
+
+    assert_eq!((outcome.code, outcome.stderr.as_str()), (Some(0), ""), "{outcome:?}");
+    let lines = events(&case);
+    let named = lines
+        .iter()
+        .find(|line| line["event"] == "take" && line["pid"] != pid)
+        .map(|take| (take["parentPid"].clone(), take["slots"].clone()));
+    assert_eq!(
+        named,
+        Some((Value::from(pid), Value::Array(Vec::new()))),
+        "the nested gate's take names its parent and no slot: {lines:?}"
+    );
+    let release = release_of(&case, pid);
+    let cores = journalled_cores(&release);
+    assert!(cores.is_some(), "the parent journals its cores, as no nested gate took a slot: {release}");
+    match cores {
+        Some(cores) if cores.0 >= 1.5 => assert_no_slot_line_before_passed(&outcome, cores),
+        _ => assert_no_cores_line(&outcome),
+    }
+}
+
+#[test]
+fn a_no_slot_run_whose_nested_gate_took_a_slot_prints_no_hint() {
+    let case = Case::new("a_no_slot_run_whose_nested_gate_took_a_slot_prints_no_hint");
+    // The nested heavy gate burns four threads for 12 s inside the no-slot parent's job: alone it would read busy.
+    let mut nested = vec![GATE];
+    nested.extend(heavy_words("nested.log", &[], &[FAKE_TOOL, "burn-threads", "4", "12000"]));
+
+    let running = case.start(&none_words("out.log", &["--test-sample-ms", "1000"], &nested));
     let pid = running.id();
     let outcome = running.finish();
 
