@@ -8,7 +8,7 @@ use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::fs;
 use std::hash::{DefaultHasher, Hasher};
-use std::io::ErrorKind;
+use std::io::{self, ErrorKind, Write as _};
 use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -400,6 +400,28 @@ fn calls(steps: &Path) -> Vec<String> {
     fs::read_to_string(PathBuf::from(log)).map_or_else(|_| Vec::new(), |text| text.lines().map(str::to_owned).collect())
 }
 
+/// The go file of a case that parks a call in `hold <go>`: writing it when it drops releases the stand-in even when the
+/// case panics before its own write, and writing one the case already made is harmless. A write that fails is said
+/// unless the file is there after all.
+struct Go(PathBuf);
+
+impl Go {
+    /// The path of the go file the case writes and its parked stand-in waits for.
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for Go {
+    fn drop(&mut self) {
+        if let Err(error) = fs::write(&self.0, "")
+            && !self.0.exists()
+        {
+            let _ = writeln!(io::stderr(), "the go file {} cannot be made: {error}", self.0.display());
+        }
+    }
+}
+
 /// The gate of a routed run logging to `log` through the Rust client: the builder root `builder` in the case folder,
 /// each ssh call made through the stand-in of the steps file `steps`, the retry pause 1 ms.
 fn client_gate(case: &Case, log: &str, steps: &Path, command: &[&str]) -> Command {
@@ -554,8 +576,8 @@ fn a_routed_run_runs_on_the_box_and_passes_its_output_and_status() {
 fn a_second_routed_run_of_one_worktree_falls_back_busy_at_once() {
     // One slot, which the first run holds: the second finds the key's lock taken before it would wait for the slot.
     let case = client_case_of("client-busy", 1);
-    let go = case.folder().join("ssh").join("go");
-    let first_steps = ssh_steps(&case, "first", &["ok", &format!("hold {}", shown(&go))]);
+    let go = Go(case.folder().join("ssh").join("go"));
+    let first_steps = ssh_steps(&case, "first", &["ok", &format!("hold {}", shown(go.path()))]);
     let first = start(client_gate(&case, "first.log", &first_steps, &[r".\tool.exe", "out", "ran there"]));
     wait_until("the first run's run call", || calls(&first_steps).len() == 2);
     let second_steps = ssh_steps(&case, "second", &["ok", "ok"]);
@@ -567,7 +589,7 @@ fn a_second_routed_run_of_one_worktree_falls_back_busy_at_once() {
     assert!(second.stdout.contains("ran here"), "it ran here: {second:?}");
     assert_eq!(calls(&second_steps), Vec::<String>::new(), "the second run made no ssh call");
     assert_eq!(fallbacks(&own(&case, pid)), ["busy"]);
-    fs::write(&go, "").expect("the go file can be made");
+    fs::write(go.path(), "").expect("the go file can be made");
     let first = first.finish();
     assert_eq!(first.code, Some(0), "{first:?}");
     assert!(first.stdout.contains("ran there"), "{first:?}");
@@ -1215,12 +1237,12 @@ fn a_back_commit_not_made_from_this_snapshot_is_ignored() {
 fn a_worktree_changed_during_the_run_keeps_the_changes_and_fails_a_passing_run() {
     let case = client_case("client-worktree-changed");
     write(&case, "a.txt", "before\n");
-    let go = case.folder().join("ssh").join("go");
-    let steps = ssh_steps(&case, "ssh", &["ok", &format!("hold {}", shown(&go))]);
+    let go = Go(case.folder().join("ssh").join("go"));
+    let steps = ssh_steps(&case, "ssh", &["ok", &format!("hold {}", shown(go.path()))]);
     let run = start(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "mark", "made-on-box.txt"]));
     wait_until("the run call", || calls(&steps).len() == 2);
     write(&case, "a.txt", "after\n");
-    fs::write(&go, "").expect("the go file can be made");
+    fs::write(go.path(), "").expect("the go file can be made");
 
     let outcome = run.finish();
 
@@ -1251,8 +1273,8 @@ fn a_worktree_changed_during_the_run_keeps_the_changes_and_fails_a_passing_run()
 fn a_failing_run_keeps_its_status_when_the_worktree_changed_during_it() {
     let case = client_case("client-worktree-changed-failing");
     write(&case, "a.txt", "before\n");
-    let go = case.folder().join("ssh").join("go");
-    let steps = ssh_steps(&case, "ssh", &["ok", &format!("hold {}", shown(&go))]);
+    let go = Go(case.folder().join("ssh").join("go"));
+    let steps = ssh_steps(&case, "ssh", &["ok", &format!("hold {}", shown(go.path()))]);
     let run = start(client_gate(
         &case,
         "out.log",
@@ -1261,7 +1283,7 @@ fn a_failing_run_keeps_its_status_when_the_worktree_changed_during_it() {
     ));
     wait_until("the run call", || calls(&steps).len() == 2);
     write(&case, "a.txt", "after\n");
-    fs::write(&go, "").expect("the go file can be made");
+    fs::write(go.path(), "").expect("the go file can be made");
 
     let outcome = run.finish();
 
@@ -1361,12 +1383,12 @@ fn a_back_commit_whose_worktree_check_fails_is_kept_and_fails_the_run() {
     git(&case, &["config", "filter.slow.required", "true"]);
     write(&case, ".gitattributes", "*.slow filter=slow\n");
     write(&case, "held.slow", "held\n");
-    let go = case.folder().join("ssh").join("go");
-    let steps = ssh_steps(&case, "ssh", &["ok", &format!("hold {}", shown(&go))]);
+    let go = Go(case.folder().join("ssh").join("go"));
+    let steps = ssh_steps(&case, "ssh", &["ok", &format!("hold {}", shown(go.path()))]);
     let run = start(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "mark", "made-on-box.txt"]));
     wait_until("the run call", || calls(&steps).len() == 2);
     fs::write(&broken, "").expect("the broken file can be made");
-    fs::write(&go, "").expect("the go file can be made");
+    fs::write(go.path(), "").expect("the go file can be made");
 
     let outcome = run.finish();
 
@@ -1425,23 +1447,25 @@ fn a_refused_run_call_syncs_nothing_back() {
     assert_eq!(calls(&second), ["preflight", "run"]);
 }
 
-/// The builder's bare repository is moved aside while the run call parks, so the sync-back's `ls-remote` finds none.
+/// Through `local-ssh`, the box's run succeeds, then the sync-back's `ls-remote` is refused by ssh: the run fails
+/// with no fallback, and nothing after that call runs.
 #[test]
 fn a_git_failure_of_the_sync_back_fails_the_run_with_no_fallback() {
     let case = client_case("client-back-git-failure");
-    let go = case.folder().join("ssh").join("go");
-    let steps = ssh_steps(&case, "ssh", &["ok", &format!("hold {}", shown(&go))]);
-    let run = start(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "out", "ran there"]));
-    wait_until("the run call", || calls(&steps).len() == 2);
-    let bare = PathBuf::from(bare_of(&case));
-    fs::rename(&bare, bare.with_extension("aside")).expect("the bare repository can be moved aside");
-    fs::write(&go, "").expect("the go file can be made");
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok", "ok", "fail-other"]);
 
-    let outcome = run.finish();
+    let outcome = finish(client_gate_through(
+        &case,
+        "local-ssh",
+        "out.log",
+        &steps,
+        &[r".\tool.exe", "mark", "made-on-box.txt"],
+    ));
 
     assert_eq!(outcome.code, Some(1), "{outcome:?}");
     assert!(outcome.stderr.contains("gate: the remote run failed: git ls-remote"), "{outcome:?}");
     assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new(), "no fallback");
+    assert_eq!(calls(&steps), ["preflight", "git-receive-pack", "run", "git-upload-pack"]);
 }
 
 /// The case's own exclude file leaves `made-on-box.txt` out of the snapshot, so the box's command makes it anew while
@@ -2096,13 +2120,13 @@ fn a_routed_run_sends_its_outputs_manifest() {
 #[test]
 fn outputs_zero_clears_the_pending_marker() {
     let case = outputs_case("client-outputs-zero", &BIN);
-    let go = case.folder().join("ssh").join("go");
-    let steps = ssh_steps(&case, "ssh", &["ok", &format!("hold {}", shown(&go))]);
+    let go = Go(case.folder().join("ssh").join("go"));
+    let steps = ssh_steps(&case, "ssh", &["ok", &format!("hold {}", shown(go.path()))]);
     let run = start(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "out", "ran there"]));
     wait_until("the run call", || calls(&steps).len() == 2);
     let marker = pending_marker(&case);
     assert!(marker.exists(), "the marker is written before the run call");
-    fs::write(&go, "").expect("the go file can be made");
+    fs::write(go.path(), "").expect("the go file can be made");
 
     let outcome = run.finish();
 
@@ -2230,12 +2254,12 @@ fn a_refused_killed_or_lost_run_leaves_the_marker() {
 fn a_run_whose_worktree_changed_says_outputs_were_not_brought_back() {
     let case = outputs_case("client-outputs-worktree-changed", &BIN);
     write(&case, "a.txt", "before\n");
-    let go = case.folder().join("ssh").join("go");
-    let steps = ssh_steps(&case, "ssh", &["ok", &format!("hold {}", shown(&go))]);
+    let go = Go(case.folder().join("ssh").join("go"));
+    let steps = ssh_steps(&case, "ssh", &["ok", &format!("hold {}", shown(go.path()))]);
     let run = start(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "mark", "made-on-box.txt"]));
     wait_until("the run call", || calls(&steps).len() == 2);
     write(&case, "a.txt", "after\n");
-    fs::write(&go, "").expect("the go file can be made");
+    fs::write(go.path(), "").expect("the go file can be made");
 
     let outcome = run.finish();
 
