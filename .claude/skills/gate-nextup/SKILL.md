@@ -35,9 +35,9 @@ Merging is the agents' call too. Once every item under a feature marker has land
 
 ## Gates
 
-test mode: mvp
+test mode: full
 
-The MVP is the remote cutover and the caller sweep: the open issues of the projects `Remote` up to GATE-46 and `Cutover sweep`.
+gate stays in `full`: `gate.exe` is the live gate every session's builds and tests run through, so a regression stalls every repo, and the slow suite drives the one built exe from nearly every package.
 
 Every command runs through the launcher: `pwsh -NoProfile -File tools/gate.ps1 -Log .tmp/<name>.log -TimeoutSeconds <n> -Slot heavy|light|critical -- <command>`. Tests run with cargo-nextest; its `--profile` picks a nextest config profile, so the cargo build profile is `--cargo-profile test-release`. The workspace has no doctests.
 
@@ -47,8 +47,8 @@ Every command runs through the launcher: `pwsh -NoProfile -File tools/gate.ps1 -
 
 The tests, by test mode:
 
-- **mvp** (now): each item runs the tests its change reaches, from [docs/test-map.md](../../../docs/test-map.md): `-Slot heavy -TimeoutSeconds 900 -- cargo nextest run --workspace --all-features --cargo-profile test-release -E '<the union of the filtersets of every row the diff touches>'`. A diff that touches a central file, or a file the map does not list, runs the full suite. The full suite runs once at each checkpoint, before the push, and before a cutover, a release or a feature-branch merge: `-Slot heavy -TimeoutSeconds 1800 -- cargo nextest run --workspace --all-features --cargo-profile test-release --no-fail-fast` (`--all-features` builds the black-box suite, which needs the `test-seams` feature). A red checkpoint run holds the push and becomes the next item.
-- **full**: each item runs the full suite as its last gate.
+- **full** (now): each item runs the full suite as its last gate: `-Slot heavy -TimeoutSeconds 1800 -- cargo nextest run --workspace --all-features --cargo-profile test-release --no-fail-fast` (`--all-features` builds the black-box suite, which needs the `test-seams` feature). While a step's loop iterates, its proving command runs only the tests the step reaches, from [docs/test-map.md](../../../docs/test-map.md) (`-E '<the union of the filtersets of every row the diff touches>'`).
+- **mvp**: each item's last gate runs the tests its change reaches, from the test map; a diff that touches a central file, or a file the map does not list, runs the full suite. The full suite runs once at each checkpoint, before the push, and before a cutover, a release or a feature-branch merge; a red checkpoint run holds the push and becomes the next item.
 
 The map is kept true by the docs sweep: an item that adds a suite module, a seam flag or a source area adds its row.
 

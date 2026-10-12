@@ -1,6 +1,6 @@
 # Test map
 
-Which tests a change reaches, so an item in `test mode: mvp` (the `gate-nextup` profile, "Gates") runs only those, with cargo-nextest filtersets, and the full suite runs at the checkpoint. Reach is read from the code (which source handles which subcommand, seam flag and output line, and which suite modules drive them), not measured by coverage. A file not listed here, or a change that spans several rows' "central" files, runs the full suite.
+Which tests a change reaches, so a step's proving loop, and in `test mode: mvp` an item's last gate (the `gate-nextup` profile, "Gates"), runs only those, with cargo-nextest filtersets. Reach is read from the code (which source handles which subcommand, seam flag and output line, and which suite modules drive them), not measured by coverage. A file not listed here, or a change that spans several rows' "central" files, runs the full suite.
 
 Suite = `crates/gate/tests/suite/` (binary `suite`, needs `--all-features`; test ids are `<module>::<case>`, `boxside::outputs::<case>` for the sub-module). Unit tests of the `gate` bin are inline `mod tests` (ids like `run::tests::...`, binary `gate`).
 
