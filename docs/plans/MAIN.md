@@ -23,6 +23,9 @@
   - [ ] GATE-21 Remote: a critical pool on the builder for timing-sensitive gates (decide after measuring)
   - [ ] GATE-29 Sync-back: narrow the 'worktree changed during the run' refusal to changes that could matter
   - [ ] GATE-105 Decide whether the box caps its dotnet tool restore
+  - [ ] GATE-135 Remote client: bound the PC's dotnet --list-sdks and find dotnet on PATH only
+  - [ ] GATE-136 Parity: check whether dotnet honours a global.json with trailing text
+  - [ ] GATE-137 Remote client: cap the bytes the outputs fetch writes
 - [ ] GATE-107 Make the sync-back git-failure case independent of a held bare repository
 
 ## Cutover sweep
@@ -41,8 +44,6 @@
 
 ## Backlog
 
-- [ ] GATE-128 Make the stall-kill build-server suite case hold under full-suite load
-- [ ] GATE-132 Dead-ticket sweep: stay quiet when another gate is deleting the same ticket
 - [ ] GATE-99 Bind a slot marker to a real parent gate's job before covering
 - [ ] GATE-101 A covered gate outlives its parent's slot
 - [ ] GATE-125 Find how far a packaged app escapes the gate's kill-on-close jobs
