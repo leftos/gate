@@ -4,9 +4,8 @@
 
 ## Do first
 
-- [/] GATE-45 Remote slice 4: health refusals, fallback journalling and remote claims — Urgent · Remote
-- [/] GATE-44 Remote slice 3: bring a routed run's outputs back — Urgent · Remote
 - [ ] GATE-46 Remote slice 5: drained remote cutover and deleting the remote.ps1 bridge — Urgent · Remote
+- [/] GATE-146 A local --no-build run after a routed build that brought nothing back finds no build — High · Remote
 
 ## Remote
 
@@ -19,11 +18,14 @@
   - [ ] GATE-27 Remote: remember a builder's failures per host (short backoff, loss counter)
   - [ ] GATE-21 Remote: a critical pool on the builder for timing-sensitive gates (decide after measuring)
   - [ ] GATE-29 Sync-back: narrow the 'worktree changed during the run' refusal to changes that could matter
-  - [ ] GATE-105 Decide whether the box caps its dotnet tool restore
   - [ ] GATE-135 Remote client: bound the PC's dotnet --list-sdks and find dotnet on PATH only
   - [ ] GATE-137 Remote client: cap the bytes the outputs fetch writes
-  - [ ] GATE-138 Sync-back: fetch into a quarantine object folder
-- [ ] GATE-145 Sync-back: bound what checkout conversions write (LFS smudge, ident, encoding, CRLF) and refuse .lfsconfig
+- [ ] GATE-148 Outputs install: decide whether to refuse a member git tracks
+- [/] GATE-150 A passed routed run fails when an output it brings back is in use
+- [ ] GATE-155 Outputs install: never write .git* paths or .lfsconfig
+- [ ] GATE-156 A full fallback's take reports only the local wait, not the wait since its queue line
+- [ ] GATE-157 History: keep a fallen-back remote take's start and wait for ops-tower
+- [ ] GATE-159 Box: choose the dotnet tool restore cap from its logged times
 
 ## Cutover sweep
 
@@ -41,7 +43,9 @@
 ## Backlog
 
 - [ ] GATE-140 End an escaped tree at the box, remote client, bridge and push kill sites
-- [/] GATE-139 Count a packaged app's escaped tree in the cores, clock and stall check
 - [ ] GATE-101 A covered gate outlives its parent's slot
 - [ ] GATE-143 Measure which other shared daemons leave a gate's job, and spare them from the escaped-tree kill
 - [ ] GATE-144 Harden the slot marker against a same-user forger: job DACL, parent claim check, job-name squatting
+- [/] GATE-152 Reach the escapee of a launcher that exits before the first sample (job member memory)
+- [/] GATE-153 Suite: a box-run case waited 600 s for its first line on a loaded machine
+- [/] GATE-158 Suite: four stall and backstop cases pass instead of being killed on a loaded machine
