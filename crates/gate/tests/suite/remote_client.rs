@@ -2002,7 +2002,7 @@ fn a_routed_run_sends_its_outputs_manifest() {
     let case = outputs_case("client-outputs-manifest", &BIN);
     write(&case, r"bin\same.txt", "same");
     write(&case, r"bin\differs.txt", "pc");
-    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok", "ok"]);
     let command = [r".\tool.exe", "write", r"bin\same.txt", "same", "write", r"bin\differs.txt", "box"];
 
     let outcome = finish(client_gate(&case, "out.log", &steps, &command));
@@ -2011,7 +2011,7 @@ fn a_routed_run_sends_its_outputs_manifest() {
     assert!(outcome.stderr.contains("gate-remote-outputs: 1 "), "one file comes back: {outcome:?}");
     let log = fs::read_to_string(case.folder().join("out.log")).expect("the log was written");
     assert!(log.contains("gate-remote-outputs: 1 "), "the box's line is in the log: {log}");
-    assert_eq!(calls(&steps), ["preflight", "run"]);
+    assert_eq!(calls(&steps), ["preflight", "run", "outputs"]);
     assert!(pending_marker(&case).exists(), "an archive waits, so the marker stays: {outcome:?}");
 }
 
@@ -2049,7 +2049,7 @@ fn a_failing_run_leaves_the_marker_and_the_next_run_sends_outputs_full() {
     assert_eq!(failed.code, Some(3), "{failed:?}");
     assert!(!failed.stderr.contains("gate-remote-outputs:"), "a failing run packs nothing: {failed:?}");
     assert!(pending_marker(&case).exists(), "a failing run leaves the marker: {failed:?}");
-    let second = ssh_steps(&case, "second", &["ok", "ok"]);
+    let second = ssh_steps(&case, "second", &["ok", "ok", "ok"]);
 
     let outcome = finish(client_gate(&case, "second.log", &second, &[r".\tool.exe", "out", "ran there"]));
 
@@ -2155,7 +2155,7 @@ fn a_manifest_that_cannot_be_built_still_runs_and_fails_a_pass() {
 #[test]
 fn a_forged_outputs_line_from_the_command_is_not_accepted() {
     let case = outputs_case("client-outputs-forged", &BIN);
-    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok", "ok"]);
     let forged = "gate-remote-outputs: 0";
     let command = [r".\tool.exe", "err", forged, "out", forged, "write", r"bin\new.txt", "built"];
 
@@ -2171,7 +2171,7 @@ fn a_forged_outputs_line_from_the_command_is_not_accepted() {
 #[test]
 fn an_outputs_line_on_stdout_after_the_box_is_ignored() {
     let case = outputs_case("client-outputs-stdout", &BIN);
-    let steps = ssh_steps(&case, "ssh", &["ok", "ok-then-out gate-remote-outputs: 0"]);
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok-then-out gate-remote-outputs: 0", "ok"]);
 
     let outcome = finish(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "write", r"bin\new.txt", "built"]));
 
@@ -2226,7 +2226,7 @@ fn a_pre_banner_retry_feeds_the_manifest_again() {
     let case = outputs_case("client-outputs-retry", &BIN);
     write(&case, r"bin\same.txt", "same");
     write(&case, r"bin\differs.txt", "pc");
-    let steps = ssh_steps(&case, "ssh", &["ok", "fail-banner", "ok"]);
+    let steps = ssh_steps(&case, "ssh", &["ok", "fail-banner", "ok", "ok"]);
     let command = [r".\tool.exe", "write", r"bin\same.txt", "same", "write", r"bin\differs.txt", "box"];
 
     let outcome = finish(client_gate(&case, "out.log", &steps, &command));
@@ -2234,5 +2234,200 @@ fn a_pre_banner_retry_feeds_the_manifest_again() {
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert_eq!(outcome.stderr.matches(RETRY_LINE).count(), 1, "{outcome:?}");
     assert!(outcome.stderr.contains("gate-remote-outputs: 1 "), "one file comes back: {outcome:?}");
-    assert_eq!(calls(&steps), ["preflight", "run", "run"]);
+    assert_eq!(calls(&steps), ["preflight", "run", "run", "outputs"]);
+}
+
+/// The outputs archives the client fetched into the case's `.tmp` folder: files named for the case's work-folder key,
+/// which its first run's queue line names, `<key>-<nonce>.tar.zst`.
+fn fetched_archives(case: &Case) -> Vec<PathBuf> {
+    let key = key_of(&events(case));
+    let Ok(entries) = fs::read_dir(case.folder().join(".tmp")) else {
+        return Vec::new();
+    };
+    entries
+        .map(|entry| entry.expect("an entry of .tmp can be read").path())
+        .filter(|path| {
+            let name = path.file_name().expect("an entry has a name").to_string_lossy();
+            name.starts_with(&format!("{key}-")) && name.ends_with(".tar.zst")
+        })
+        .collect()
+}
+
+/// The archive the box's own `gate-remote-outputs: <n> <archive>` line names in `stderr`.
+fn named_archive(stderr: &str) -> String {
+    let line = stderr
+        .lines()
+        .rev()
+        .find(|line| line.starts_with("gate-remote-outputs: "))
+        .expect("the box said its outputs line");
+    line.rsplit(' ').next().expect("the line names its archive").to_owned()
+}
+
+/// The magic number every zstd frame starts with.
+const ZSTD_MAGIC: [u8; 4] = [0x28, 0xb5, 0x2f, 0xfd];
+/// The line of a fetch the watchdog stopped.
+const FETCH_STOPPED_LINE: &str = "gate: remote outputs not brought back: the fetch was stopped by the watchdog";
+
+#[test]
+fn a_passing_run_fetches_its_outputs_archive_to_tmp() {
+    let case = outputs_case("client-outputs-fetch", &BIN);
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok", "ok"]);
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "write", r"bin\new.txt", "built"]));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "run", "outputs"]);
+    let archive = case.folder().join(".tmp").join(named_archive(&outcome.stderr));
+    assert_eq!(fetched_archives(&case), std::slice::from_ref(&archive), "{outcome:?}");
+    let bytes = fs::read(&archive).expect("the fetched archive can be read");
+    assert!(bytes.starts_with(&ZSTD_MAGIC), "a zstd archive, {} bytes", bytes.len());
+    assert!(pending_marker(&case).exists(), "the archive waits to be installed: {outcome:?}");
+    assert!(!outcome.stderr.contains("not brought back"), "{outcome:?}");
+}
+
+#[test]
+fn a_failing_run_makes_no_outputs_call() {
+    let case = outputs_case("client-outputs-failing", &BIN);
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+    let command = [r".\tool.exe", "write", r"bin\built.txt", "box", "exit", "3"];
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &command));
+
+    assert_eq!(outcome.code, Some(3), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "run"]);
+    assert_eq!(fetched_archives(&case), Vec::<PathBuf>::new());
+    assert!(pending_marker(&case).exists(), "{outcome:?}");
+}
+
+/// The outputs call sends a few bytes, then nothing: the watchdog of `--test-remote-watch-call outputs` stops it.
+#[test]
+fn a_fetch_the_watchdog_stops_keeps_124_and_says_so() {
+    let case = outputs_case("client-outputs-fetch-stalled", &BIN);
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok", &format!("bytes-hold 100 {}", never(&case))]);
+    let tuned = Tuned {
+        extra: &["--test-remote-watch-call", "outputs", "--test-stall-ms", WATCHED_MS],
+        ..Tuned::default()
+    };
+    let command = [r".\tool.exe", "write", r"bin\new.txt", "built"];
+
+    let outcome = finish(client_gate_tuned(&case, "out.log", &steps, &tuned, &command));
+
+    assert_eq!(outcome.code, Some(124), "{outcome:?}");
+    let stalled = outcome.stderr.find(STALLED_LINE).expect("the STALLED line");
+    let stopped = outcome.stderr.find(FETCH_STOPPED_LINE).expect("the outputs line");
+    assert!(stalled < stopped, "the kill line comes first: {outcome:?}");
+    let made = calls(&steps);
+    assert!(made_but_maybe(&made, &["preflight", "run", "outputs"], "outputs"), "no stop: {made:?}");
+    assert_eq!(fetched_archives(&case), Vec::<PathBuf>::new(), "the partial archive is removed");
+    assert!(pending_marker(&case).exists(), "{outcome:?}");
+}
+
+#[test]
+fn ctrl_c_during_the_fetch_ends_as_an_interrupt() {
+    let case = outputs_case("client-outputs-fetch-ctrl-c", &BIN);
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok", &format!("bytes-hold 100 {}", never(&case))]);
+    let tuned = Tuned {
+        extra: &["--test-remote-interrupt-at", "outputs"],
+        ..Tuned::default()
+    };
+    let command = [r".\tool.exe", "write", r"bin\new.txt", "built"];
+
+    let outcome = finish(client_gate_tuned(&case, "out.log", &steps, &tuned, &command));
+
+    assert_eq!(outcome.code, Some(CONTROL_C_EXIT), "{outcome:?}");
+    // The interrupt comes once the outputs call wrote its first byte, by when the stand-in has logged its call.
+    assert_eq!(calls(&steps), ["preflight", "run", "outputs"], "no stop: the command had ended");
+    assert_eq!(fetched_archives(&case), Vec::<PathBuf>::new(), "the partial archive is removed");
+    assert!(pending_marker(&case).exists(), "{outcome:?}");
+}
+
+#[test]
+fn a_fetch_dropped_before_any_byte_is_retried_once() {
+    let case = outputs_case("client-outputs-fetch-banner", &BIN);
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok", "fail-banner", "fail-banner"]);
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "write", r"bin\new.txt", "built"]));
+
+    assert_eq!(outcome.code, Some(1), "a passing run becomes 1: {outcome:?}");
+    assert_eq!(outcome.stderr.matches(RETRY_LINE).count(), 1, "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "run", "outputs", "outputs"]);
+    let line = "gate: remote outputs not brought back: Connection timed out during banner exchange";
+    assert!(outcome.stderr.contains(line), "{outcome:?}");
+    assert_eq!(fetched_archives(&case), Vec::<PathBuf>::new(), "nothing is left of either attempt");
+    assert!(pending_marker(&case).exists(), "{outcome:?}");
+}
+
+/// The stand-in passes the archive's first 8 bytes, then says ssh's pre-banner line and exits 255: only the bytes it
+/// sent tell the drop from one before the banner.
+#[test]
+fn a_fetch_dropped_after_bytes_is_not_retried() {
+    let case = outputs_case("client-outputs-fetch-truncated", &BIN);
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok", "truncate 8", "ok"]);
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "write", r"bin\new.txt", "built"]));
+
+    assert_eq!(outcome.code, Some(1), "a passing run becomes 1: {outcome:?}");
+    assert!(!outcome.stderr.contains(RETRY_LINE), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "run", "outputs"]);
+    let line = "gate: remote outputs not brought back: Connection timed out during banner exchange";
+    assert!(outcome.stderr.contains(line), "{outcome:?}");
+    assert_eq!(fetched_archives(&case), Vec::<PathBuf>::new(), "the partial archive is removed");
+    assert!(pending_marker(&case).exists(), "{outcome:?}");
+}
+
+/// The outputs call sends a few bytes, then nothing, past the ceiling `--test-remote-watch-call outputs` gives it alone.
+#[test]
+fn a_fetch_past_its_ceiling_keeps_124_and_says_so() {
+    let case = outputs_case("client-outputs-fetch-ceiling", &BIN);
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok", &format!("bytes-hold 100 {}", never(&case))]);
+    let tuned = Tuned {
+        extra: &["--test-remote-watch-call", "outputs", "--test-remote-timeout-ms", WATCHED_MS],
+        ..Tuned::default()
+    };
+    let command = [r".\tool.exe", "write", r"bin\new.txt", "built"];
+
+    let outcome = finish(client_gate_tuned(&case, "out.log", &steps, &tuned, &command));
+
+    assert_eq!(outcome.code, Some(124), "{outcome:?}");
+    let timed_out = outcome.stderr.find("gate: TIMED OUT after 1 s").expect("the TIMED OUT line");
+    let stopped = outcome.stderr.find(FETCH_STOPPED_LINE).expect("the outputs line");
+    assert!(timed_out < stopped, "the kill line comes first: {outcome:?}");
+    let made = calls(&steps);
+    assert!(made_but_maybe(&made, &["preflight", "run", "outputs"], "outputs"), "no stop: {made:?}");
+    assert_eq!(fetched_archives(&case), Vec::<PathBuf>::new(), "the partial archive is removed");
+    assert!(pending_marker(&case).exists(), "{outcome:?}");
+}
+
+/// The outputs call writes a standard error line past 64 KiB: a cut, but not the watchdog's.
+#[test]
+fn an_outputs_call_with_a_line_past_the_cap_fails_a_pass() {
+    let case = outputs_case("client-outputs-fetch-long-line", &BIN);
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok", "flood 70000"]);
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "write", r"bin\new.txt", "built"]));
+
+    assert_eq!(outcome.code, Some(1), "a passing run becomes 1: {outcome:?}");
+    let line = "gate: remote outputs not brought back: the outputs call sent a line longer than 64 KiB";
+    assert!(outcome.stderr.contains(line), "{outcome:?}");
+    assert!(
+        !outcome.stderr.contains("TIMED OUT") && !outcome.stderr.contains("STALLED"),
+        "{outcome:?}"
+    );
+    assert_eq!(fetched_archives(&case), Vec::<PathBuf>::new(), "the empty archive file is removed");
+    assert!(pending_marker(&case).exists(), "{outcome:?}");
+}
+
+/// What the fetch wrote is no archive at all; telling so is the install's, so this fetch keeps it as it came.
+#[test]
+fn a_garbage_fetch_that_ends_0_keeps_its_file() {
+    let case = outputs_case("client-outputs-fetch-garbage", &BIN);
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok", "garbage 64"]);
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "write", r"bin\new.txt", "built"]));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let archive = case.folder().join(".tmp").join(named_archive(&outcome.stderr));
+    assert_eq!(fetched_archives(&case), std::slice::from_ref(&archive), "{outcome:?}");
+    assert_eq!(fs::read(&archive).expect("the file can be read"), vec![b'x'; 64]);
+    assert!(pending_marker(&case).exists(), "{outcome:?}");
 }

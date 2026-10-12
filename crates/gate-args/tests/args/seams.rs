@@ -421,7 +421,7 @@ fn the_remote_client_seams_need_a_value_once() {
         ))),
         ["gate: --test-remote-bound-ms must be a whole number above 0, got '0'"]
     );
-    for call in ["preflight", "run"] {
+    for call in ["preflight", "run", "outputs"] {
         let words = with(
             &RUN,
             &["--test-remote-transport", "local:b", "--test-remote-interrupt-at", call, "--", "cmd"],
@@ -433,7 +433,7 @@ fn the_remote_client_seams_need_a_value_once() {
             &RUN,
             &["--test-remote-transport", "local:b", "--test-remote-interrupt-at", "push", "--", "cmd"]
         ))),
-        ["gate: --test-remote-interrupt-at must be preflight or run, got 'push'"]
+        ["gate: --test-remote-interrupt-at must be preflight, run or outputs, got 'push'"]
     );
 }
 
@@ -442,7 +442,7 @@ fn the_remote_client_seams_need_a_value_once() {
 fn the_remote_watch_seams_name_one_call_and_a_ceiling() {
     use crate::support::run_request;
 
-    for call in ["preflight", "push", "run", "ls-remote", "fetch"] {
+    for call in ["preflight", "push", "run", "ls-remote", "fetch", "outputs"] {
         let words = with(
             &RUN,
             &["--test-remote-transport", "local:b", "--test-remote-watch-call", call, "--", "cmd"],
@@ -454,7 +454,7 @@ fn the_remote_watch_seams_name_one_call_and_a_ceiling() {
             &RUN,
             &["--test-remote-transport", "local:b", "--test-remote-watch-call", "stop", "--", "cmd"]
         ))),
-        ["gate: --test-remote-watch-call must be preflight, push, run, ls-remote or fetch, got 'stop'"]
+        ["gate: --test-remote-watch-call must be preflight, push, run, ls-remote, fetch or outputs, got 'stop'"]
     );
     let words = with(
         &RUN,

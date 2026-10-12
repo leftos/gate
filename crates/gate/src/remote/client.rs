@@ -44,7 +44,7 @@ use super::retry::{self, Ended, GIT_SSH_FAILED, SSH_FAILED};
 use super::snapshot::{self, Snapshot};
 use super::syncback;
 use super::transport::{Local, Program, Transport};
-use super::watchdog::{self, Cut, Kept, LINE_CAP};
+use super::watchdog::{self, Cut, Kept, Kill, LINE_CAP};
 use super::{FAILED, FAILED_RUN, REFUSED, Refusal, RemoteCall, RemoteClient, RemoteOutcome, refused_line, started_line};
 use crate::boxside::payload::escaped;
 use crate::environment::Variables;
@@ -72,6 +72,8 @@ const OURS: &str = env!("CARGO_PKG_VERSION");
 /// The line said when `--test-remote-interrupt-at` is given but the console handler that would carry the interrupt
 /// could not be installed.
 const NO_HANDLER: &str = "gate: --test-remote-interrupt-at needs the console handler; it could not be installed";
+/// The most of a call's standard output one read of a raw copy takes.
+const RAW_CHUNK: usize = 64 * 1024;
 
 /// The client of `--test-remote-transport`.
 pub(crate) struct RustClient {
@@ -196,7 +198,7 @@ pub(super) enum End {
     Failed(String),
     /// The console interrupt ended it.
     Interrupted,
-    /// The watchdog killed the run call, and the command was stopped: status 124.
+    /// The watchdog killed the run call, and the command was stopped, or it killed the outputs call: status 124.
     Killed,
     /// The run call's connection was lost: it exited 255, ssh's own failure status, other than before the banner. The
     /// run call returns it before anything is stopped, with where the run call's own lines are among the attempt's, so
@@ -304,7 +306,7 @@ pub(super) struct Called {
     pub(super) problem: Option<String>,
     output_seen: bool,
     first_error: Option<String>,
-    last_error: Option<String>,
+    pub(super) last_error: Option<String>,
     pub(super) lines: Vec<String>,
     /// Its last standard error line that is the box's outputs line, however many lines came after it.
     outputs_line: Option<String>,
@@ -380,7 +382,12 @@ impl Attempt<'_, '_> {
             End::Status(status) => {
                 let synced = syncback::sync_back(self, &snapshot, status)?;
                 let brought = outputs::accepted(heard.as_deref(), self.call.key, &nonce);
-                Ok(outputs::ended(self, &sent, status, synced, brought.as_ref()))
+                let ran = outputs::Ran {
+                    location: &location,
+                    nonce: &nonce,
+                    status,
+                };
+                Ok(outputs::ended(self, &sent, &ran, synced, brought.as_ref()))
             }
             End::Lost(output) => Ok(self.connection_lost(&location, prepared.boot.as_deref(), output)),
             end => Ok(end),
@@ -412,7 +419,7 @@ impl Attempt<'_, '_> {
         let line = payload::capped("preflight", payload::line("preflight", &payload::location_word(location))).map_err(End::Failed)?;
         let watch = Watch::Run(self.limits_for("preflight"));
         let raise = self.raises_at("preflight");
-        let (mut called, _) = self.with_retry(SSH_FAILED, |attempt| attempt.ssh(&line, Echo::LogOnly, watch, raise, RunOnly::default()))?;
+        let (mut called, _) = self.with_retry(SSH_FAILED, |attempt| attempt.ssh(&line, Echo::LogOnly, watch, raise, CallOnly::default()))?;
         let theirs = their_version(&called.lines).map(str::to_owned);
         let created = called.lines.iter().any(|line| line.starts_with(CREATED));
         let boot = boot_time(&called.lines).map(str::to_owned);
@@ -608,9 +615,10 @@ impl Attempt<'_, '_> {
         let nonce: Arc<str> = Arc::from(nonce);
         let mut heard = None;
         let end = self.run_call_made(location, limits, |attempt| {
-            let run = RunOnly {
+            let run = CallOnly {
                 input: input.cloned(),
                 nonce: Some(Arc::clone(&nonce)),
+                sink: None,
             };
             let called = attempt.ssh(line, Echo::Console, Watch::Run(limits), raise, run)?;
             heard.clone_from(&called.outputs_line);
@@ -753,7 +761,7 @@ impl Attempt<'_, '_> {
         };
         let bound = self.limits.bound;
         let begun = Instant::now();
-        let mut made = self.ssh(&line, Echo::LogOnly, Watch::Bounded(bound), false, RunOnly::default());
+        let mut made = self.ssh(&line, Echo::LogOnly, Watch::Bounded(bound), false, CallOnly::default());
         let again = matches!(&made, Ok(first) if first.before_the_banner(SSH_FAILED)) && retry::retry_allowed(bound, begun.elapsed(), self.pause);
         if again {
             if let Ok(first) = &mut made {
@@ -766,7 +774,7 @@ impl Attempt<'_, '_> {
                 Echo::LogOnly,
                 Watch::Bounded(bound.saturating_sub(begun.elapsed())),
                 false,
-                RunOnly::default(),
+                CallOnly::default(),
             );
         }
         match made {
@@ -803,18 +811,39 @@ impl Attempt<'_, '_> {
     }
 
     /// One call of `gate box` on the builder carrying `line`, watched as `watch` says; the console interrupt raised
-    /// after its first output byte when `raise`; what only the run call gives it, `run`.
-    fn ssh(&mut self, line: &str, echo: Echo, watch: Watch, raise: bool, run: RunOnly) -> Result<Called, End> {
+    /// after its first output byte when `raise`; what only this call gives it, `only`.
+    fn ssh(&mut self, line: &str, echo: Echo, watch: Watch, raise: bool, only: CallOnly) -> Result<Called, End> {
         let Program { program, args } = self.transport.call(self.call.host, line);
         let mut command = Command::new(program);
         command.args(args);
         let starts = Starts {
             breakaway: self.transport.box_runs_here(),
             raise,
-            input: run.input,
-            nonce: run.nonce,
+            input: only.input,
+            nonce: only.nonce,
+            sink: only.sink,
         };
         self.started(&command, echo, watch, starts)
+    }
+
+    /// The outputs call to the builder at `location` for the archive `name`: `gate box outputs`, made once more when
+    /// it failed before the banner, watched as a fetch by `limits`, and the console interrupt raised after its first
+    /// output byte with `--test-remote-interrupt-at outputs`. Each attempt writes its standard output raw to the file
+    /// `archive` makes new for it; its standard error lines go to the log. The call that counts, its lines kept; else
+    /// why the file or the call could not be made, or the interrupt.
+    pub(super) fn outputs_call(&mut self, location: &Location, name: &str, archive: &mut outputs::Archive, limits: Limits) -> Result<Called, End> {
+        self.go_on()?;
+        let line = payload::capped("outputs", payload::line("outputs", &payload::outputs_word(location, name))).map_err(End::Failed)?;
+        let raise = self.raises_at("outputs");
+        let (mut called, _) = self.with_retry(SSH_FAILED, |attempt| {
+            let only = CallOnly {
+                sink: Some(archive.create().map_err(End::Failed)?),
+                ..CallOnly::default()
+            };
+            attempt.ssh(&line, Echo::LogOnly, Watch::Fetch(limits), raise, only)
+        })?;
+        self.lines.append(&mut called.lines);
+        Ok(called)
     }
 
     /// git with `args` in the worktree, given `ssh_command` as the ssh it runs when there is one, its lines going where
@@ -830,16 +859,18 @@ impl Attempt<'_, '_> {
             raise: false,
             input: None,
             nonce: None,
+            sink: None,
         };
         self.started(&command, echo, watch, starts)
     }
 
     /// Starts `command` with no standard input, or one fed what `starts` gives on a thread of its own and then closed,
     /// created suspended and put in an anonymous job of its own before it runs, and reads its two streams line by line
-    /// into the log, and onto the console as `echo` says, until both end and it has exited, watched as `watch` says
-    /// meanwhile. Every call's line is capped at 64 KiB but the run call's,
-    /// whose longer lines are passed on in pieces. A call the watch cuts has its whole job ended, and its readers are
-    /// given [`DRAIN`] to end; a Ctrl+C ends a call a bound does not limit the same way, as the attempt's interrupt.
+    /// into the log, and onto the console as `echo` says, its standard output instead copied raw into the sink
+    /// `starts` gives when it gives one, until both end and it has exited, watched as `watch` says meanwhile. Every
+    /// call's line is capped at 64 KiB but the run call's, whose longer lines are passed on in pieces. A call the watch
+    /// cuts has its whole job ended, and its readers are given [`DRAIN`] to end; a Ctrl+C ends a call a bound does not
+    /// limit the same way, as the attempt's interrupt.
     fn started(&mut self, command: &Command, echo: Echo, watch: Watch, starts: Starts) -> Result<Called, End> {
         let shown = Path::new(command.get_program()).display().to_string();
         let shown_log = self.call.log.display();
@@ -869,7 +900,10 @@ impl Attempt<'_, '_> {
             capped: echo != Echo::Console,
             lines: starts.nonce.as_deref().map(|nonce| Arc::new(ProtocolLines::new(nonce))),
         };
-        relayed(stdout, Reader::new(false, reading.clone(), out_log), &shared, done.clone());
+        match starts.sink {
+            Some(sink) => relayed_raw(stdout, sink.file, sink.shown, &shared, done.clone()),
+            None => relayed(stdout, Reader::new(false, reading.clone(), out_log), &shared, done.clone()),
+        }
         relayed(stderr, Reader::new(true, reading, err_log), &shared, done);
         let watched = Watched {
             running: &running,
@@ -1100,20 +1134,30 @@ fn cannot_wait(shown: &str, error: &io::Error) -> End {
 /// How a call starts: whether its job lets a process in it start one outside it, which only the ssh of a transport
 /// whose `gate box` runs on this machine needs; and whether the console interrupt is raised after its first output
 /// byte; and what is fed on its standard input, `None` for none; and the run's nonce its readers match the box's start
-/// marker and refusal tags by, `None` for every call but the run call.
+/// marker and refusal tags by, `None` for every call but the run call; and the sink its standard output is copied to
+/// raw, `None` for every call but the outputs call.
 struct Starts {
     breakaway: bool,
     raise: bool,
     input: Option<Arc<str>>,
     nonce: Option<Arc<str>>,
+    sink: Option<RawSink>,
 }
 
-/// What only the run call gives a call of `gate box`: what is fed on its standard input, and the run's nonce; neither
-/// for any other call.
+/// What one call of `gate box` alone gives it: the run call what is fed on its standard input and the run's nonce, the
+/// outputs call the sink its standard output is copied to raw; none of them for any other call.
 #[derive(Default)]
-struct RunOnly {
+struct CallOnly {
     input: Option<Arc<str>>,
     nonce: Option<Arc<str>>,
+    sink: Option<RawSink>,
+}
+
+/// Where a call's standard output is copied raw, byte for byte, rather than read as lines: the outputs call's archive
+/// file, and its path as the line saying it cannot be written shows it.
+pub(super) struct RawSink {
+    pub(super) file: File,
+    pub(super) shown: String,
 }
 
 /// `launch` created suspended within `job`: the process, the read ends of its stdout and stderr, and the write end of
@@ -1495,6 +1539,43 @@ fn relayed(stream: impl Read + Send + 'static, reader: Reader, shared: &Arc<Shar
     });
 }
 
+/// Copies `stream` into `sink`, shown as `shown`, on a thread of its own as [`relay_raw`] does, then says so on `done`.
+fn relayed_raw(stream: impl Read + Send + 'static, mut sink: impl Write + Send + 'static, shown: String, shared: &Arc<Shared>, done: Sender<()>) {
+    let shared = Arc::clone(shared);
+    thread::spawn(move || {
+        relay_raw(stream, &mut sink, &shown, &shared);
+        // Closed before the end is said: a retry removes the file and makes it anew, which an open handle would refuse.
+        drop(sink);
+        // A killed call's watcher stops listening once its drain is over: a reader that ends later has no one to tell.
+        done.send(()).ok();
+    });
+}
+
+/// Copies `stream` into `sink`, shown as `shown`, byte for byte until it ends, in chunks of at most [`RAW_CHUNK`]: no
+/// line is read, so no length cuts it. Each chunk marks the call's progress, and marks that the call wrote on standard
+/// output, so a call that sent a byte is past the banner. A read or a write that fails is the call's problem, and ends
+/// the copy. No write is made under the lock the watcher could take.
+fn relay_raw(mut stream: impl Read, sink: &mut impl Write, shown: &str, shared: &Shared) {
+    let mut buffer = vec![0_u8; RAW_CHUNK];
+    loop {
+        let read = match stream.read(&mut buffer) {
+            Ok(0) => return,
+            Ok(read) => read,
+            Err(failure) if failure.kind() == io::ErrorKind::Interrupted => continue,
+            Err(failure) => {
+                held(&shared.heard).failed(format!("cannot read a call's output: {failure}"));
+                return;
+            }
+        };
+        shared.progress.mark();
+        held(&shared.heard).output_seen = true;
+        if let Err(error) = sink.write_all(buffer.get(..read).unwrap_or_default()) {
+            held(&shared.heard).failed(format!("cannot write {shown}: {error}"));
+            return;
+        }
+    }
+}
+
 /// Reads `stream` line by line through `reader` until it ends, or a capped reading meets a line past the cap, each
 /// byte that comes marking the call's progress; each line without its line end, read as UTF-8 with U+FFFD for what is
 /// not. Neither a write nor a wait for one is made under the lock the watcher could take.
@@ -1631,8 +1712,19 @@ fn version_refusal(host: &str, theirs: Option<&str>, ours: &str) -> Option<Strin
     })
 }
 
+/// The watchdog's line for a call watched as a fetch by `limits` and cut for `cut`: STALLED for one that sent nothing
+/// for the stall window, TIMED OUT for one still running at the ceiling; `None` for any other cut.
+pub(super) fn watchdog_line(cut: Cut, limits: Limits) -> Option<String> {
+    let kill = match cut {
+        Cut::Silent(_) => Kill::Stalled,
+        Cut::Ceiling => Kill::TimedOut,
+        Cut::Watchdog(_) | Cut::Late(_) | Cut::TooLong => return None,
+    };
+    Some(watchdog::kill_line(kill, limits.stall, limits.ceiling))
+}
+
 /// `text` cut to its first `most` bytes, at a character's boundary.
-fn first_bytes(text: &str, most: usize) -> &str {
+pub(super) fn first_bytes(text: &str, most: usize) -> &str {
     let mut end = text.len().min(most);
     while !text.is_char_boundary(end) {
         end -= 1;
@@ -1710,8 +1802,12 @@ fn seconds(elapsed: Duration) -> String {
 #[cfg(test)]
 #[expect(clippy::expect_used, reason = "a test whose interrupt or transport cannot be made must fail loudly")]
 mod tests {
-    use std::path::Path;
-    use std::sync::LazyLock;
+    use std::collections::VecDeque;
+    use std::io::{self, Cursor, Read, Write};
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, LazyLock, mpsc};
+    use std::thread;
     use std::time::{Duration, Instant};
 
     use gate_state::{FallbackReason, StateRoot};
@@ -1719,10 +1815,11 @@ mod tests {
 
     use super::{
         Attempt, CallEnd, Called, Cut, Echo, End, GIT_SSH_FAILED, Heard, LINE_CAP, Limits, Loss, ProtocolLines, Reader, Reading, SSH_FAILED, Shared,
-        Unfinished, Watch, after_loss, boot_time, called_of, console_of, held, is_heartbeat, last_update, paused, push_size, relay, sdks_of, seconds,
-        their_version, version_refusal,
+        Unfinished, Watch, after_loss, boot_time, called_of, console_of, held, is_heartbeat, last_update, paused, push_size, relay, relay_raw,
+        relayed_raw, sdks_of, seconds, their_version, version_refusal,
     };
     use crate::remote::git::GIT_LIMIT;
+    use crate::remote::outputs;
     use crate::remote::payload::Location;
     use crate::remote::snapshot::Snapshot;
     use crate::remote::transport::Local;
@@ -1805,9 +1902,156 @@ mod tests {
         }
     }
 
+    /// What a call's progress holds as its last byte's time once a test unmarked it: no mark leaves it so.
+    const UNMARKED: u64 = u64::MAX;
+
+    /// A stream that gives the chunks `left`, one a read, then its end; before each read it notes whether the call's progress was
+    /// marked since the read before and whether the call counts as having written on standard output, then unmarks it.
+    struct Chunks<'s> {
+        left: VecDeque<Vec<u8>>,
+        shared: &'s Shared,
+        seen: Vec<(bool, bool)>,
+    }
+
+    impl Read for Chunks<'_> {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            let marked = self.shared.progress.last_byte.load(Ordering::Relaxed) != UNMARKED;
+            self.seen.push((marked, held(&self.shared.heard).output_seen));
+            self.shared.progress.last_byte.store(UNMARKED, Ordering::Relaxed);
+            let Some(chunk) = self.left.pop_front() else {
+                return Ok(0);
+            };
+            buffer.get_mut(..chunk.len()).expect("one chunk fits one read").copy_from_slice(&chunk);
+            Ok(chunk.len())
+        }
+    }
+
+    #[test]
+    fn a_raw_copy_passes_binary_whole_and_marks_progress_and_output_per_chunk() {
+        // No line end, and bytes no UTF-8 reading would keep: the zstd magic, NUL, a carriage return, 0x80 and 0xff.
+        let pattern = [0x28_u8, 0xb5, 0x2f, 0xfd, 0, b'\r', 0x80, 0xff];
+        let binary = |length: usize| -> Vec<u8> { pattern.iter().copied().cycle().take(length).collect() };
+        let chunks = [binary(64 * 1024), binary(40_000), binary(1_234)];
+        let whole = chunks.concat();
+        assert!(whole.len() > 64 * 1024 && !whole.contains(&b'\n'), "past a line's cap, with no line end");
+        let shared = Shared::new();
+        shared.progress.last_byte.store(UNMARKED, Ordering::Relaxed);
+        let mut stream = Chunks {
+            left: chunks.into_iter().collect(),
+            shared: &shared,
+            seen: Vec::new(),
+        };
+        let mut sink = Vec::new();
+
+        relay_raw(&mut stream, &mut sink, "the archive", &shared);
+
+        assert_eq!(sink, whole, "every byte, in order, none cut");
+        let before_any_byte = (false, false);
+        let after_a_chunk = (true, true);
+        assert_eq!(stream.seen, [before_any_byte, after_a_chunk, after_a_chunk, after_a_chunk]);
+        assert!(!shared.progress.too_long(), "no line is read, so no cap cuts it");
+        assert_eq!(held(&shared.heard).problem, None);
+    }
+
     /// Whether the attempt said it stopped, or tried to stop, the command.
     fn stopped(attempt: &Attempt<'_, '_>) -> bool {
         attempt.lines.iter().any(|line| line.starts_with("gate: stopping the command on builder"))
+    }
+
+    /// A sink that, once dropped, waits a while before it marks itself closed: an end said before the drop is seen
+    /// before the mark.
+    struct SlowToClose(Arc<AtomicBool>);
+
+    impl Write for SlowToClose {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Drop for SlowToClose {
+        fn drop(&mut self) {
+            thread::sleep(Duration::from_millis(200));
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// A sink that takes `room` bytes, then fails every write.
+    struct Full {
+        room: usize,
+    }
+
+    impl Write for Full {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if self.room == 0 {
+                return Err(io::Error::other("the disk is full"));
+            }
+            let taken = bytes.len().min(self.room);
+            self.room -= taken;
+            Ok(taken)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A retry's make removes the file the first attempt wrote: a handle still open would leave its name pending
+    /// deletion, and the new file could not be made.
+    #[test]
+    fn a_raw_copy_closes_its_sink_before_it_says_it_ended() {
+        let closed = Arc::new(AtomicBool::new(false));
+        let shared = Arc::new(Shared::new());
+        let (done, ended) = mpsc::channel();
+
+        relayed_raw(
+            &b"archive bytes"[..],
+            SlowToClose(Arc::clone(&closed)),
+            "the archive".to_owned(),
+            &shared,
+            done,
+        );
+
+        ended.recv().expect("the copy says it ended");
+        assert!(closed.load(Ordering::SeqCst), "the sink was closed first");
+    }
+
+    #[test]
+    fn a_raw_copy_whose_sink_fails_says_why_and_ends() {
+        let shared = Arc::new(Shared::new());
+        let (done, ended) = mpsc::channel();
+
+        relayed_raw(
+            Cursor::new(vec![0x28_u8; 200_000]),
+            Full { room: 70_000 },
+            "the archive".to_owned(),
+            &shared,
+            done,
+        );
+
+        ended.recv().expect("the copy says it ended");
+        let problem = held(&shared.heard).problem.clone();
+        assert_eq!(problem.as_deref(), Some("cannot write the archive: the disk is full"));
+    }
+
+    /// The outputs call failed, but the console interrupt was raised by its end: the interrupt is the run's end, and
+    /// nothing is said, as after a run call.
+    #[test]
+    fn a_ctrl_c_by_the_end_of_a_failed_outputs_call_is_an_interrupt() {
+        let log = unwritten_log();
+        let call = call(&log);
+        let transport = nowhere();
+        let mut attempt = attempt(&call, &transport);
+        let archive = outputs::Archive::new(PathBuf::from(r"C:\gate-client-tests-no-such-folder\app.tar.zst"));
+        let failed = ended_with(SSH_FAILED, "Connection reset by peer");
+
+        let end = outputs::judged(&mut attempt, &archive, &failed, Limits::for_tests(), End::Status(0));
+
+        assert!(matches!(end, End::Interrupted), "{end:?}");
+        assert_eq!(attempt.lines, Vec::<String>::new());
     }
 
     #[test]

@@ -1,11 +1,11 @@
 //! A routed run's outputs on the PC, up to its run call's end: the manifest of the files the PC holds under the run's
 //! output globs, hashed before the run call and sent on its standard input; the pending marker, written before the run
 //! call and removed once the outputs step completes, whose presence makes the next routed run of the worktree ask for
-//! every output that differs from the PC's (`OutputsFull`); and the box's `gate-remote-outputs:` line the client takes
-//! from the run call.
+//! every output that differs from the PC's (`OutputsFull`); the box's `gate-remote-outputs:` line the client takes
+//! from the run call; and the outputs call that fetches the archive it names into the worktree's `.tmp` folder.
 
 use std::cell::Cell;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -13,23 +13,84 @@ use std::sync::Arc;
 use gate_state::v1;
 
 use super::RemoteCall;
-use super::client::{Attempt, End};
+use super::client::{self, Attempt, Called, End, Limits, RawSink};
+use super::git::FAILURE_BYTES;
+use super::payload::Location;
 use crate::boxside::payload::{archive_file_name, escaped};
 use crate::outputs::archive::final_path;
 use crate::outputs::glob::Globs;
 use crate::outputs::hash::sha256_of;
-use crate::outputs::manifest::Manifest;
+use crate::outputs::manifest::{MANIFEST_LIMIT, Manifest};
 use crate::outputs::walk::{in_context, walk};
 
-/// The longest manifest line the box reads, its newline included: 64 MiB, the box's own limit.
-const MANIFEST_CAP: usize = 64 * 1024 * 1024;
-/// Why a manifest line longer than [`MANIFEST_CAP`] is not sent.
+/// Why a manifest line longer than [`MANIFEST_LIMIT`] is not sent.
 const PAST_THE_CAP: &str = "it is larger than the box takes (64 MiB)";
 /// The start of the box's line saying what it packed: `gate-remote-outputs: 0`, or `gate-remote-outputs: <n> <archive>`.
 const OUTPUTS: &str = "gate-remote-outputs: ";
 /// Why a passing run whose box said no outputs line the client accepts brings nothing back, as the PowerShell client
 /// says it.
 const NO_OUTPUTS_LINE: &str = "the box printed no 'gate-remote-outputs: <n> <archive>' line";
+/// The worktree's folder the fetched archive is kept in, made when missing.
+const TMP: &str = ".tmp";
+/// Why a fetch the watchdog stopped brings nothing back, as the PowerShell client says it.
+const STOPPED: &str = "the fetch was stopped by the watchdog";
+
+/// How a run's run call ended, for its outputs step: the work folder's place on the builder, the outputs nonce the run
+/// sent, and the call's status, the command's own.
+pub(super) struct Ran<'r> {
+    pub(super) location: &'r Location,
+    pub(super) nonce: &'r str,
+    pub(super) status: i64,
+}
+
+/// The file in the worktree a fetched archive is written to, and whether an attempt of this run made it.
+pub(super) struct Archive {
+    path: PathBuf,
+    made: bool,
+}
+
+impl Archive {
+    /// The file at `path`, which no attempt made yet.
+    pub(super) fn new(path: PathBuf) -> Archive {
+        Archive { path, made: false }
+    }
+
+    /// The file an outputs call's attempt writes its standard output to raw: made new, its folder made when missing,
+    /// once the file an earlier attempt of this run made is removed; a file of the name this run did not make is never
+    /// removed, and fails the make. Else why it cannot be written.
+    pub(super) fn create(&mut self) -> Result<RawSink, String> {
+        let cannot = |error: io::Error| format!("cannot write {}: {error}", self.path.display());
+        if self.made {
+            match fs::remove_file(&self.path) {
+                Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(cannot(error)),
+                _ => self.made = false,
+            }
+        }
+        if let Some(folder) = self.path.parent() {
+            fs::create_dir_all(folder).map_err(cannot)?;
+        }
+        let file = OpenOptions::new().write(true).create_new(true).open(&self.path).map_err(cannot)?;
+        self.made = true;
+        Ok(RawSink {
+            file,
+            shown: self.path.display().to_string(),
+        })
+    }
+
+    /// Removes the file an attempt of this run made, when one did; one already gone counts as removed. Else why it
+    /// could not be removed.
+    fn remove(&self) -> Result<(), String> {
+        if !self.made {
+            return Ok(());
+        }
+        match fs::remove_file(&self.path) {
+            Err(error) if error.kind() != io::ErrorKind::NotFound => {
+                Err(format!("cannot remove the partial outputs archive {}: {error}", self.path.display()))
+            }
+            _ => Ok(()),
+        }
+    }
+}
 
 /// Why the manifest was not built: the console interrupt was raised while it was, or a reason it could not be.
 #[derive(Debug, PartialEq, Eq)]
@@ -77,7 +138,7 @@ pub(super) fn sent<'a>(attempt: &mut Attempt<'_, 'a>) -> Result<Sent<'a>, End> {
     }
     let marker = v1::outputs_pending_path(call.state_dir, call.key);
     let full = pending(&marker);
-    match manifest_line(Path::new(call.root), call.outputs, MANIFEST_CAP, || attempt.go_on().is_ok()) {
+    match manifest_line(Path::new(call.root), call.outputs, MANIFEST_LIMIT, || attempt.go_on().is_ok()) {
         Ok(line) => {
             sent.globs = call.outputs;
             sent.full = full;
@@ -91,17 +152,18 @@ pub(super) fn sent<'a>(attempt: &mut Attempt<'_, 'a>) -> Result<Sent<'a>, End> {
     Ok(sent)
 }
 
-/// The end of `attempt`'s run once its sync-back ended it `synced`, its run call having ended with `status`, and the
+/// The end of `attempt`'s run once its sync-back ended it `synced`, its run call having ended as `ran` says, and the
 /// box having said it `brought` its outputs or not, for a run that carried `sent`: the outputs step of a run with
-/// output globs, which says at most one line. A run whose passing status the sync-back turned to 1 says its outputs
-/// were not brought back, the worktree having changed. A passing run whose manifest was not built, or whose box said
-/// no outputs line the client accepts, says why and ends 1. A passing run whose box packed nothing removes the
-/// pending marker, which every other end leaves; one that cannot be removed is said, and the run's status stands.
-pub(super) fn ended(attempt: &mut Attempt<'_, '_>, sent: &Sent<'_>, status: i64, synced: End, brought: Option<&Brought>) -> End {
+/// output globs. A run whose passing status the sync-back turned to 1 says its outputs were not brought back, the
+/// worktree having changed. A passing run whose manifest was not built, or whose box said no outputs line the client
+/// accepts, says why and ends 1. A passing run whose box packed an archive fetches it, as [`fetched`] says. A passing
+/// run whose box packed nothing removes the pending marker, which every other end leaves; one that cannot be removed
+/// is said, and the run's status stands.
+pub(super) fn ended(attempt: &mut Attempt<'_, '_>, sent: &Sent<'_>, ran: &Ran<'_>, synced: End, brought: Option<&Brought>) -> End {
     let (Some(marker), End::Status(now)) = (&sent.marker, &synced) else {
         return synced;
     };
-    if status == 0 && *now == 1 {
+    if ran.status == 0 && *now == 1 {
         attempt.say(not_brought_back("the worktree changed during the run"));
         return synced;
     }
@@ -111,7 +173,7 @@ pub(super) fn ended(attempt: &mut Attempt<'_, '_>, sent: &Sent<'_>, status: i64,
     let reason = match (&sent.unbuilt, brought) {
         (Some(reason), _) => format!("the manifest could not be built: {reason}"),
         (None, None) => NO_OUTPUTS_LINE.to_owned(),
-        (None, Some(Brought::Archive { .. })) => return synced,
+        (None, Some(Brought::Archive { .. })) => return fetched(attempt, ran, synced),
         (None, Some(Brought::Nothing)) => {
             if let Err(why) = clear_pending(marker) {
                 attempt.say(format!("gate: {why}"));
@@ -121,6 +183,67 @@ pub(super) fn ended(attempt: &mut Attempt<'_, '_>, sent: &Sent<'_>, status: i64,
     };
     attempt.say(not_brought_back(&reason));
     End::Status(1)
+}
+
+/// The outputs call of a passing run whose box packed an archive, `synced` its end so far: the archive the run's own
+/// key and nonce name, never the box's line, is fetched raw into the worktree's `.tmp` folder. One fetched whole is
+/// kept with the pending marker, and the run's end stands. A fetch the watchdog stops says the watchdog's line and
+/// ends the run killed; a Ctrl+C ends it as an interrupt, with no `stop` call; any other failure says why, the box's
+/// last standard error line when it said one, and fails the run. Each of these removes what was fetched, and says so
+/// when it cannot; each says the outputs were not brought back but the interrupt.
+fn fetched(attempt: &mut Attempt<'_, '_>, ran: &Ran<'_>, synced: End) -> End {
+    let name = archive_file_name(attempt.call.key, ran.nonce);
+    let mut archive = Archive::new(Path::new(attempt.call.root).join(TMP).join(&name));
+    let limits = attempt.limits_for("outputs");
+    match attempt.outputs_call(ran.location, &name, &mut archive, limits) {
+        Ok(called) => judged(attempt, &archive, &called, limits, synced),
+        Err(End::Failed(reason)) => unfetched(attempt, &archive, &reason, End::Status(1)),
+        Err(end) => {
+            removed(attempt, &archive);
+            end
+        }
+    }
+}
+
+/// The end of the outputs step once its outputs call, watched by `limits`, ended as `called`, having written to
+/// `archive`, the run's end so far `synced`: as [`fetched`] says.
+pub(super) fn judged(attempt: &mut Attempt<'_, '_>, archive: &Archive, called: &Called, limits: Limits, synced: End) -> End {
+    // A Ctrl+C raised by the call's end is the run's end, however the call ended, as after the run call.
+    if attempt.go_on().is_err() {
+        removed(attempt, archive);
+        return End::Interrupted;
+    }
+    if let Some(cut) = called.cut {
+        if let Some(line) = client::watchdog_line(cut, limits) {
+            attempt.say(line);
+            attempt.noted(called);
+            return unfetched(attempt, archive, STOPPED, End::Killed);
+        }
+        attempt.noted(called);
+        return unfetched(attempt, archive, &cut.reason("the outputs call"), End::Status(1));
+    }
+    if called.status != 0 {
+        let reason = match &called.last_error {
+            Some(line) => client::first_bytes(line, FAILURE_BYTES).to_owned(),
+            None => format!("the outputs call failed (status {})", called.status),
+        };
+        return unfetched(attempt, archive, &reason, End::Status(1));
+    }
+    synced
+}
+
+/// Says the run's outputs were not brought back, for `reason`, and removes what `archive` holds of them; `end`.
+fn unfetched(attempt: &mut Attempt<'_, '_>, archive: &Archive, reason: &str, end: End) -> End {
+    attempt.say(not_brought_back(reason));
+    removed(attempt, archive);
+    end
+}
+
+/// Removes what `archive` holds of a fetch that did not complete; a removal that fails is said, and changes no end.
+fn removed(attempt: &mut Attempt<'_, '_>, archive: &Archive) {
+    if let Err(why) = archive.remove() {
+        attempt.say(format!("gate: {why}"));
+    }
 }
 
 /// The manifest line, newline included, of the files under `globs` in the worktree `root`, each hashed as a stream
@@ -246,10 +369,11 @@ pub(super) fn accepted(line: Option<&str>, key: &str, nonce: &str) -> Option<Bro
 mod tests {
     use std::cell::Cell;
     use std::fs;
+    use std::io::Write;
     use std::path::{Path, PathBuf};
     use std::process::Command;
 
-    use super::{Brought, MANIFEST_CAP, Unbuilt, accepted, hashed, keep_outputs_line, manifest_line, pending, within_cap};
+    use super::{Archive, Brought, MANIFEST_LIMIT, Unbuilt, accepted, hashed, keep_outputs_line, manifest_line, pending, within_cap};
 
     const KEY: &str = "app-1a2b3c4d";
     const NONCE: &str = "0123456789abcdef0123456789abcdef";
@@ -364,10 +488,10 @@ mod tests {
 
     #[test]
     fn a_manifest_over_64_mib_is_refused() {
-        assert_eq!(MANIFEST_CAP, 64 * 1024 * 1024);
-        assert_eq!(within_cap(MANIFEST_CAP, MANIFEST_CAP), Ok(()), "64 MiB, its newline included, fits");
+        assert_eq!(MANIFEST_LIMIT, 64 * 1024 * 1024);
+        assert_eq!(within_cap(MANIFEST_LIMIT, MANIFEST_LIMIT), Ok(()), "64 MiB, its newline included, fits");
         assert_eq!(
-            within_cap(MANIFEST_CAP + 1, MANIFEST_CAP),
+            within_cap(MANIFEST_LIMIT + 1, MANIFEST_LIMIT),
             Err("it is larger than the box takes (64 MiB)".to_owned())
         );
     }
@@ -380,13 +504,13 @@ mod tests {
         fs::create_dir_all(root.join("bin")).expect("the folder can be made");
         fs::write(root.join("bin").join("a.dll"), "abc").expect("the file can be written");
         let globs = ["**".to_owned()];
-        let line = manifest_line(&root, &globs, MANIFEST_CAP, || true).expect("the manifest is built");
+        let line = manifest_line(&root, &globs, MANIFEST_LIMIT, || true).expect("the manifest is built");
 
         assert_eq!(manifest_line(&root, &globs, line.len(), || true), Ok(line.clone()));
         let refused = Err(Unbuilt::Failed("it is larger than the box takes (64 MiB)".to_owned()));
         assert_eq!(manifest_line(&root, &globs, line.len() - 1, || true), refused, "the whole line");
         assert_eq!(manifest_line(&root, &globs, 10, || true), refused, "the entries, before any hash");
-        assert_eq!(manifest_line(&root, &globs, MANIFEST_CAP, || false), Err(Unbuilt::Interrupted));
+        assert_eq!(manifest_line(&root, &globs, MANIFEST_LIMIT, || false), Err(Unbuilt::Interrupted));
     }
 
     #[test]
@@ -408,6 +532,37 @@ mod tests {
         assert!(own.is_ok(), "{own:?}");
         let refused = outside.expect_err("a file reached through a junction is refused").to_string();
         assert_eq!(refused, format!("{} resolves outside the worktree", through.display()));
+    }
+
+    #[test]
+    fn an_archive_file_is_made_anew_for_each_attempt_and_removed_only_when_made() {
+        let path = scratch("archive").join(".tmp").join("app.tar.zst");
+        let mut archive = Archive::new(path.clone());
+        assert_eq!(archive.remove(), Ok(()), "nothing made, nothing removed");
+
+        let mut first = archive.create().expect("the first attempt's file is made, its folder too");
+        first.file.write_all(b"partial").expect("the file can be written");
+        drop(first);
+        drop(archive.create().expect("a retry removes the first attempt's file and makes it anew"));
+        assert_eq!(
+            fs::read(&path).expect("the file can be read"),
+            Vec::<u8>::new(),
+            "the retry's file starts empty"
+        );
+        assert_eq!(archive.remove(), Ok(()));
+        assert!(!path.exists(), "a file this run made is removed");
+
+        fs::write(&path, "another run's").expect("the file can be written");
+        let mut fresh = Archive::new(path.clone());
+        let refused = fresh.create().map(drop);
+        let cannot = format!("cannot write {}: ", path.display());
+        assert!(refused.as_ref().is_err_and(|why| why.starts_with(&cannot)), "{refused:?}");
+        assert_eq!(fresh.remove(), Ok(()));
+        assert_eq!(
+            fs::read_to_string(&path).expect("the file is there"),
+            "another run's",
+            "a file this run did not make stays"
+        );
     }
 
     #[test]

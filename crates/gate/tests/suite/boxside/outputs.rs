@@ -212,6 +212,37 @@ fn box_run_beats_before_it_reads_the_outputs_manifest() {
     assert_eq!(archive_files(&archive_path(&payload)), expected(&[("bin/a.txt", "a")]));
 }
 
+/// The command writes on standard error before and after it builds its output, a forged outputs line among them: the
+/// box's own line, naming its archive, still comes last of every line but a heartbeat, so the client, which takes the
+/// last outputs line on standard error, can be told no other.
+#[test]
+fn a_passing_runs_last_stderr_line_is_its_outputs_line() {
+    let case = Case::new("box_outputs_last_line");
+    let command = [
+        FAKE_TOOL,
+        "err",
+        "gate-remote-outputs: 0",
+        "write",
+        r"bin\a.txt",
+        "a",
+        "err",
+        "after the build",
+    ];
+    let mut payload = outputs_payload(&case, &command, &["bin/**"]);
+    snapshot(&case, &mut payload, &[IGNORE_BIN]);
+
+    let outcome = run_with_manifest(&case, &payload, &manifest(&[]));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let last = outcome
+        .stderr
+        .lines()
+        .rev()
+        .find(|line| !line.starts_with("gate-remote-heartbeat: "))
+        .expect("the run said a line on standard error");
+    assert_eq!(last, packed_line(&payload, 1), "{outcome:?}");
+}
+
 #[test]
 fn box_run_without_output_globs_never_reads_stdin() {
     let case = Case::new("box_outputs_no_globs");

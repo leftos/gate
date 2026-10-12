@@ -23,12 +23,17 @@
 //! and no line end on standard error, which git passes through as its own, and exits 0; `say-hold <word> <path>` writes
 //! the word as a line on standard output, then does as `hold <path>`; `progress-ok <n>` writes at least `<n>` bytes of
 //! short progress updates, each ended by a carriage return, and a line end on standard error, then does as `ok`;
-//! `ok-then-out <line>` does as `ok`, then writes the line on standard output, after all the call wrote.
+//! `ok-then-out <line>` does as `ok`, then writes the line on standard output, after all the call wrote;
+//! `truncate <n>` does as `ok` with the call's standard output read, only its first `<n>` bytes passed on raw and the
+//! rest read and dropped, then writes ssh's `Connection timed out during banner exchange` on standard error and exits
+//! 255, so only the bytes it sent tell the drop from one before the banner; `garbage <n>` runs nothing, writes `<n>`
+//! bytes of `x`, no outputs archive, raw on standard output and exits 0; `bytes-hold <n> <path>` writes `<n>` bytes of
+//! `x` raw on standard output, then does as `hold <path>`.
 
 #![expect(clippy::disallowed_methods, reason = "a test helper standing in for ssh, which holds no launch's handles")]
 
 use std::fs::{self, OpenOptions};
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -36,6 +41,8 @@ use std::time::{Duration, Instant};
 
 /// The status ssh exits with when it fails itself.
 const SSH_FAILED: i32 = 255;
+/// ssh's line for a connection that ended before the banner, which the client retries on.
+const PRE_BANNER: &str = "Connection timed out during banner exchange";
 /// How often `hold` looks for its path, and how long before it gives up: the suite's hang guard.
 const HOLD_STEP: Duration = Duration::from_millis(20);
 const HOLD_LIMIT: Duration = Duration::from_secs(600);
@@ -99,6 +106,17 @@ fn run() -> Result<i32, String> {
             writeln!(io::stdout().lock(), "{line}").map_err(|error| format!("cannot write: {error}"))?;
             Ok(status)
         }
+        Some(("truncate", bytes)) => call.truncated(byte_count(&step, bytes)?),
+        Some(("garbage", bytes)) => {
+            filler(byte_count(&step, bytes)?)?;
+            Ok(0)
+        }
+        Some(("bytes-hold", rest)) => {
+            let (bytes, path) = rest.split_once(' ').ok_or_else(|| format!("the step '{step}' names no path"))?;
+            filler(byte_count(&step, bytes)?)?;
+            hold(Path::new(path))?;
+            call.ok()
+        }
         Some(("say-hold", rest)) => {
             let (word, path) = rest.split_once(' ').ok_or_else(|| format!("the step '{step}' names no path"))?;
             let mut stdout = io::stdout().lock();
@@ -122,6 +140,20 @@ fn flood(step: &str, bytes: &str) -> Result<i32, String> {
         .and_then(|()| stderr.flush())
         .map_err(|error| format!("cannot write: {error}"))?;
     Ok(0)
+}
+
+/// The byte count `bytes` the step `step` names after its name.
+fn byte_count(step: &str, bytes: &str) -> Result<usize, String> {
+    bytes.parse().map_err(|_| format!("the step '{step}' names no byte count"))
+}
+
+/// Writes `count` bytes of `x` raw on standard output, and flushes it.
+fn filler(count: usize) -> Result<(), String> {
+    let mut stdout = io::stdout().lock();
+    stdout
+        .write_all(&vec![b'x'; count])
+        .and_then(|()| stdout.flush())
+        .map_err(|error| format!("cannot write: {error}"))
 }
 
 /// `progress-ok <n>`, given as `bytes` after the step's name: writes short progress updates, each ended by a carriage
@@ -155,7 +187,7 @@ fn bare_step(step: &str, call: &BoxCall<'_>) -> Result<i32, String> {
         "ok" => call.ok(),
         "no-boot" => call.rewritten(BOOT, None),
         "drop" => Ok(SSH_FAILED),
-        "fail-banner" => said(&mut io::stderr().lock(), "Connection timed out during banner exchange"),
+        "fail-banner" => said(&mut io::stderr().lock(), PRE_BANNER),
         "fail-other" => said(&mut io::stderr().lock(), "ssh: connect to host builder port 22: Connection refused"),
         "out-then-drop" => said(&mut io::stdout().lock(), "fake-ssh: a line before the connection dropped"),
         other => Err(format!("unknown step '{other}'")),
@@ -269,6 +301,23 @@ impl<'a> BoxCall<'a> {
         let mut command = self.command()?;
         let status = command.status().map_err(|error| cannot_run(&command, &error))?;
         status.code().ok_or_else(|| "the gate ended with no status".to_owned())
+    }
+
+    /// Runs the call with its standard output read, only its first `count` bytes passed on raw and the rest read and
+    /// dropped, so the call is never stopped by a full pipe, then writes ssh's pre-banner line on standard error; ssh's
+    /// own failure status, whatever the call's.
+    fn truncated(&self, count: usize) -> Result<i32, String> {
+        let mut command = self.command()?;
+        let mut child = command.stdout(Stdio::piped()).spawn().map_err(|error| cannot_run(&command, &error))?;
+        let mut stdout = child.stdout.take().ok_or("the gate has no output pipe")?;
+        let limit = u64::try_from(count).map_err(|error| format!("cannot count {count} bytes: {error}"))?;
+        let mut out = io::stdout().lock();
+        io::copy(&mut (&mut stdout).take(limit), &mut out)
+            .and_then(|_| out.flush())
+            .map_err(|error| format!("cannot pass the gate's output on: {error}"))?;
+        io::copy(&mut stdout, &mut io::sink()).map_err(|error| format!("cannot read the gate: {error}"))?;
+        child.wait().map_err(|error| format!("cannot wait for the gate: {error}"))?;
+        said(&mut io::stderr().lock(), PRE_BANNER)
     }
 
     /// Runs the call with its standard output read, each line that starts with `prefix` said as `prefix` and `value`,

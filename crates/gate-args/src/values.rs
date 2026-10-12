@@ -81,10 +81,10 @@ pub(crate) fn above_zero_u32(option: &str, value: &str) -> Result<u32, Problem> 
 
 /// The calls `--test-remote-interrupt-at` may name.
 #[cfg(feature = "test-seams")]
-pub(crate) const INTERRUPTED_CALLS: &[&str] = &["preflight", "run"];
+pub(crate) const INTERRUPTED_CALLS: &[&str] = &["preflight", "run", "outputs"];
 /// The calls `--test-remote-watch-call` may name.
 #[cfg(feature = "test-seams")]
-pub(crate) const WATCHED_CALLS: &[&str] = &["preflight", "push", "run", "ls-remote", "fetch"];
+pub(crate) const WATCHED_CALLS: &[&str] = &["preflight", "push", "run", "ls-remote", "fetch", "outputs"];
 
 /// A call of the remote client a seam names, one of `calls`, as written.
 #[cfg(feature = "test-seams")]

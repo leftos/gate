@@ -98,6 +98,13 @@ pub(crate) fn location_word(location: &Location) -> String {
     word(&location.object())
 }
 
+/// The payload word of the outputs call: the location and the outputs archive's `Name`, `name`.
+pub(crate) fn outputs_word(location: &Location, name: &str) -> String {
+    let mut object = location.object();
+    object.insert("Name".to_owned(), Value::String(name.to_owned()));
+    word(&object)
+}
+
 /// The payload word of the run call.
 pub(crate) fn run_word(location: &Location, run: &RunCall<'_>) -> String {
     let mut object = location.object();

@@ -10,6 +10,9 @@ use crate::boxside::payload::{escaped, ordinal_upper};
 use crate::outputs::hash::{SHA256_DIGITS, file_sha256, is_lower_hex};
 use crate::outputs::walk::{Found, Stamp};
 
+/// The most a manifest line may hold, its newline included: 64 MiB, what the box reads and the client sends at most.
+pub(crate) const MANIFEST_LIMIT: usize = 64 * 1024 * 1024;
+
 /// One file of the PC's manifest: its stamp and its SHA-256.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Held {

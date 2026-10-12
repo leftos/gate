@@ -28,8 +28,8 @@ use crate::outputs::walk::{in_context, walk};
 /// How long an outputs archive is kept in the output folder before a run with output globs removes it, as the wrapper's
 /// `$OutputArchiveHours` keeps it.
 const ARCHIVE_AGE: Duration = Duration::from_hours(24);
-/// The most the PC's manifest line may hold, its newline included.
-const MANIFEST_LIMIT: u64 = 64 * 1024 * 1024;
+/// The most the PC's manifest line may hold, its newline included: the shared limit, as the reads count it.
+const MANIFEST_LIMIT: u64 = crate::outputs::manifest::MANIFEST_LIMIT as u64;
 /// The bytes in one gibibyte, as [`OUTPUTS_BUDGET`] and an over-large archive's size in the line saying so are counted.
 const GIB: u64 = 1024 * 1024 * 1024;
 /// The most of the output folder's outputs archives the box keeps, in bytes: 50 GiB. A pack that pushes the folder past

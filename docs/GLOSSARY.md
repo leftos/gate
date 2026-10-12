@@ -116,7 +116,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Usage error**: a command line the gate refuses (a missing, unknown, repeated or invalid input): each problem on its own `gate: ` line, then the usage, exit 2, before any slot is queued.
 - **Verdict**: the outcome a `release` line records: `passed`, `failed`, `log-failure`, `stalled`, `timed-out`, `backstop` or `unknown` (no run facts).
 - **Wake event**: the auto-reset named event each waiter sleeps on, which a gate signals when it takes or releases a slot or deletes a dead gate's ticket.
-- **Watch call**: the one remote-client call (`preflight`, `push`, `run`, `ls-remote` or `fetch`) that `--test-remote-watch-call` points the stall and ceiling seams at.
+- **Watch call**: the one remote-client call (`preflight`, `push`, `run`, `ls-remote`, `fetch` or `outputs`) that `--test-remote-watch-call` points the stall and ceiling seams at.
 - **Watchdog**: the part of a running gate that samples the command and kills its job on a stall, the ceiling or the backstop.
 - **Win32 layer**: the `gate-win32` crate, the only code that calls Windows for job objects, processes, mutexes, events and console handling.
 - **Work folder**: the builder's checkout of one PC worktree, reused across routed runs so builds stay incremental.
