@@ -5,8 +5,7 @@
 ## Do first
 
 - [/] GATE-44 Remote slice 3: bring a routed run's outputs back — Urgent · Remote
-- [ ] GATE-45 Remote slice 4: health refusals, fallback journalling and remote claims — Urgent · Remote
-- [ ] GATE-115 Remote client: never retry or refuse on the command's own output — Urgent · Remote
+- [/] GATE-45 Remote slice 4: health refusals, fallback journalling and remote claims — Urgent · Remote
 - [ ] GATE-46 Remote slice 5: drained remote cutover and deleting the remote.ps1 bridge — Urgent · Remote
 
 ## Remote
@@ -22,12 +21,12 @@
   - [ ] GATE-18 Remote preflight: refuse with `parity` when the builder lacks a .NET workload the repo needs
 - [ ] GATE-105 Decide whether the box caps its dotnet tool restore
 - [ ] GATE-121 Remote client: bound the size of the sync-back's fetched pack
-- [ ] GATE-126 Remote client: turn off git's auto-maintenance in the sync-back fetch
+- [ ] GATE-131 Sync-back: bound what a back commit writes into the worktree
+- [ ] GATE-133 Remote client: write the outputs-pending marker after the push
 
 ## Cutover sweep
 
 - [ ] GATE-11 Caller sweep to gate on PATH; delete the PowerShell gate
-- [ ] GATE-129 gate-state: show a slot a pre-cutover PowerShell gate holds as busy with its claim
 
 ## After cutover
 
@@ -45,3 +44,4 @@
 - [ ] GATE-107 Make the sync-back git-failure case independent of a held bare repository
 - [ ] GATE-125 Find how far a packaged app escapes the gate's kill-on-close jobs
 - [ ] GATE-128 Make the stall-kill build-server suite case hold under full-suite load
+- [ ] GATE-132 Dead-ticket sweep: stay quiet when another gate is deleting the same ticket
