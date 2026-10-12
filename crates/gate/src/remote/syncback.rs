@@ -65,22 +65,31 @@ fn has_back(attempt: &mut Attempt<'_, '_>, git: &Git, remote: &Remote<'_>) -> Re
     Ok(advertised(&called.lines, remote.reference))
 }
 
+/// The words of the sync-back's fetch: every object it sends is checked, and the automatic housekeeping git would
+/// otherwise start inside the fetch's own job — a `maintenance run --auto` or a `gc --auto`, whose lock a Ctrl+C
+/// during the fetch can leave in the user's repository — is off. Only the fetch, which runs with the console
+/// interrupt, needs this: the calls that hold a lock already run without it.
+const FETCH_WORDS: [&str; 10] = [
+    "-c",
+    "fetch.fsckObjects=true",
+    "-c",
+    "maintenance.auto=false",
+    "-c",
+    "gc.auto=0",
+    "fetch",
+    "--progress",
+    "--no-recurse-submodules",
+    "--no-tags",
+];
+
 /// Fetches the back ref the builder holds into `FETCH_HEAD`, every object it sends checked, and no tag or submodule.
 /// It says its progress, which a live fetch keeps sending on standard error, so only a fetch that went quiet stalls.
 fn fetch(attempt: &mut Attempt<'_, '_>, git: &Git, remote: &Remote<'_>) -> Result<(), End> {
-    let words = [
-        "-c",
-        "fetch.fsckObjects=true",
-        "fetch",
-        "--progress",
-        "--no-recurse-submodules",
-        "--no-tags",
-    ];
     let fetch = Network {
         verb: "fetch",
         watch: Watch::Fetch(attempt.limits_for("fetch")),
     };
-    to_the_builder(attempt, git, remote, &fetch, &remote.args(&words)).map(drop)
+    to_the_builder(attempt, git, remote, &fetch, &remote.args(&FETCH_WORDS)).map(drop)
 }
 
 /// One git call of the sync-back that reaches the builder: its verb, and how it is watched. `ls-remote` gets the git
@@ -405,8 +414,8 @@ mod tests {
     use gate_win32::Interrupt;
 
     use super::{
-        Remote, advertised, after_keep, fetch, forbidden, from_snapshot, has_back, ignored_line, not_applied_line, see_diff, synced_line,
-        touched_line,
+        FETCH_WORDS, Remote, advertised, after_keep, fetch, forbidden, from_snapshot, has_back, ignored_line, not_applied_line, see_diff,
+        synced_line, touched_line,
     };
     use crate::remote::RemoteCall;
     use crate::remote::client::{Attempt, End};
@@ -661,5 +670,22 @@ mod tests {
                 "refs/gate-back/app-1a2b3c4d"
             ]
         );
+    }
+
+    /// The fetch turns off git's automatic housekeeping, whose lock a Ctrl+C during the fetch can leave behind: the
+    /// two config overrides it carries before the verb, as the `fetch.fsckObjects` one does.
+    #[test]
+    fn the_fetch_turns_off_auto_maintenance() {
+        let remote = Remote {
+            url: "builder:D:/gate-remote/app.git",
+            pack: None,
+            ssh: None,
+            reference: "refs/gate-back/app-1a2b3c4d",
+        };
+        let args = remote.args(&FETCH_WORDS);
+        let verb = args.iter().position(|word| word == "fetch").expect("the fetch verb is in the words");
+        let pairs: Vec<(&str, &str)> = args[..verb].windows(2).map(|pair| (pair[0].as_str(), pair[1].as_str())).collect();
+        assert!(pairs.contains(&("-c", "maintenance.auto=false")), "{args:?}");
+        assert!(pairs.contains(&("-c", "gc.auto=0")), "{args:?}");
     }
 }
