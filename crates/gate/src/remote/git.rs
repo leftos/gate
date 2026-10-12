@@ -38,9 +38,11 @@ const ERRORS_KEPT: usize = 64 * 1024;
 const CHUNK: usize = 8 * 1024;
 /// The variables that would point git at another repository, index, object store, config or pathspec reading; git is
 /// asked about the gate's folder alone, so a gate inside a hook that exports them still routes. The indexed config
-/// variables are removed too, by their prefixes. So are the ssh variant and the external diff, which would change how
-/// git reaches the builder and what patch the sync-back applies.
-const GIT_LOCATION: [&str; 18] = [
+/// variables are removed too, by their prefixes. So are the ones that would change what git reports of the history it
+/// is asked about (a graft file, a replace ref base, no-replace, a shallow file), the quarantine a receive hook sets,
+/// which makes ref updates fail, and how git reaches the builder or what patch the sync-back applies (the ssh command
+/// and proxy and their variant, and the external diff).
+const GIT_LOCATION: [&str; 26] = [
     "GIT_DIR",
     "GIT_WORK_TREE",
     "GIT_COMMON_DIR",
@@ -59,6 +61,14 @@ const GIT_LOCATION: [&str; 18] = [
     "GIT_LITERAL_PATHSPECS",
     "GIT_SSH_VARIANT",
     "GIT_EXTERNAL_DIFF",
+    "GIT_GRAFT_FILE",
+    "GIT_REPLACE_REF_BASE",
+    "GIT_NO_REPLACE_OBJECTS",
+    "GIT_SHALLOW_FILE",
+    "GIT_QUARANTINE_PATH",
+    "GIT_SSH_COMMAND",
+    "GIT_SSH",
+    "GIT_PROXY_COMMAND",
 ];
 /// The prefixes of the config variables `GIT_CONFIG_COUNT` indexes: `GIT_CONFIG_KEY_<n>` and `GIT_CONFIG_VALUE_<n>`.
 const GIT_CONFIG_INDEXED: [&str; 2] = ["GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"];
@@ -933,10 +943,10 @@ mod tests {
 
     #[test]
     fn git_is_given_none_of_the_config_variables() {
-        let command = Git {
+        let git = Git {
             program: PathBuf::from("git.exe"),
-        }
-        .command(Path::new(r"C:\work\app"));
+        };
+        let command = git.command(Path::new(r"C:\work\app"));
         let removed: Vec<&OsStr> = command.get_envs().filter(|(_, value)| value.is_none()).map(|(name, _)| name).collect();
         for name in [
             "GIT_CONFIG_COUNT",
@@ -944,6 +954,14 @@ mod tests {
             "GIT_CONFIG_SYSTEM",
             "GIT_CONFIG_PARAMETERS",
             "GIT_DIR",
+            "GIT_GRAFT_FILE",
+            "GIT_REPLACE_REF_BASE",
+            "GIT_NO_REPLACE_OBJECTS",
+            "GIT_SHALLOW_FILE",
+            "GIT_QUARANTINE_PATH",
+            "GIT_SSH_COMMAND",
+            "GIT_SSH",
+            "GIT_PROXY_COMMAND",
         ] {
             assert!(removed.contains(&OsStr::new(name)), "{name} is removed: {removed:?}");
         }
@@ -953,6 +971,24 @@ mod tests {
         for name in ["GIT_CONFIG_KEYS", "GIT_CONFIG_NOSYSTEM", "GIT_CONFIG_KEY", "XGIT_CONFIG_KEY_0", "PATH"] {
             assert!(!is_indexed_config(name), "{name}");
         }
+        // A call's own variables are given to git after the removal, as `Git::spawned` does it: the gate's own ssh
+        // command reaches git although every call strips the one it inherited.
+        let call = Call {
+            set: &[("GIT_SSH_COMMAND", OsStr::new("ssh -o BatchMode=yes"))],
+            ..Call::plain(Path::new(r"C:\work\app"), &["ls-remote"], GIT_LIMIT)
+        };
+        let mut command = git.command(call.folder);
+        for name in call.unset {
+            command.env_remove(*name);
+        }
+        command.envs(call.set.iter().copied()).args(call.args);
+        let ssh: Vec<Option<&OsStr>> = command
+            .get_envs()
+            .filter(|(name, _)| *name == OsStr::new("GIT_SSH_COMMAND"))
+            .map(|(_, value)| value)
+            .collect();
+
+        assert_eq!(ssh, [Some(OsStr::new("ssh -o BatchMode=yes"))], "a call's own ssh command reaches git");
     }
 
     #[test]
