@@ -5,6 +5,7 @@
 
 mod batch;
 mod boxcmd;
+mod burn;
 mod compat;
 mod cutover;
 mod program;

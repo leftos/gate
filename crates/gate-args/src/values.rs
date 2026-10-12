@@ -29,6 +29,9 @@ fn too_large(option: &str, value: &str) -> Problem {
     }
 }
 
+/// The longest `gate burn` may run: the owner's 120 s burn cap plus 60 s of margin.
+pub(crate) const MAX_BURN_SECONDS: u32 = 180;
+
 pub(crate) fn above_zero(option: &str, value: &str) -> Result<u64, Problem> {
     match whole(value) {
         Whole::Number(number) if number > 0 => Ok(number),
@@ -49,6 +52,31 @@ pub(crate) fn zero_or_above(option: &str, value: &str) -> Result<u64, Problem> {
             value: value.to_owned(),
         }),
     }
+}
+
+/// A whole number from `low` to `high`, for an option bounded at both ends such as `gate burn`'s `--seconds`. Every
+/// value outside the range takes the one line, one above the whole-number ceiling included.
+pub(crate) fn in_range(option: &str, value: &str, low: u32, high: u32) -> Result<u32, Problem> {
+    let out_of_range = || Problem::NotInRange {
+        option: option.to_owned(),
+        value: value.to_owned(),
+        low,
+        high,
+    };
+    match whole(value) {
+        Whole::Number(number) if u64::from(low) <= number && number <= u64::from(high) => u32::try_from(number).map_err(|_| out_of_range()),
+        Whole::Number(_) | Whole::TooLarge | Whole::Invalid => Err(out_of_range()),
+    }
+}
+
+/// A whole number above 0 as a `u32`, [`above_zero`] for a count no option may set as high as a `u32` holds.
+pub(crate) fn above_zero_u32(option: &str, value: &str) -> Result<u32, Problem> {
+    let number = above_zero(option, value)?;
+    // `above_zero` refuses anything above `MAX_WHOLE_NUMBER`, which is below `u32::MAX`.
+    u32::try_from(number).map_err(|_| Problem::NotAboveZero {
+        option: option.to_owned(),
+        value: value.to_owned(),
+    })
 }
 
 /// The calls `--test-remote-interrupt-at` may name.

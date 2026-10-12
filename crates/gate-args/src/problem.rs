@@ -21,6 +21,8 @@ pub enum Required {
     Timeout,
     Log,
     Command,
+    /// `gate burn`'s `--seconds`, which it cannot do without.
+    Seconds,
 }
 
 /// One thing wrong with the command line. `option` is the option as the caller spelled it, without its value.
@@ -49,6 +51,13 @@ pub enum Problem {
     TooLarge {
         option: String,
         value: String,
+    },
+    /// A whole number outside the range an option takes, such as `--seconds` outside 1 to 180.
+    NotInRange {
+        option: String,
+        value: String,
+        low: u32,
+        high: u32,
     },
     NotTrueOrFalse {
         option: String,
@@ -94,6 +103,9 @@ impl fmt::Display for Problem {
             Problem::NotAboveZero { option, value } => write!(f, "gate: {option} must be a whole number above 0, got '{value}'"),
             Problem::NotZeroOrAbove { option, value } => write!(f, "gate: {option} must be a whole number 0 or above, got '{value}'"),
             Problem::TooLarge { option, value } => write!(f, "gate: {option} must be at most {MAX_WHOLE_NUMBER}, got '{value}'"),
+            Problem::NotInRange { option, value, low, high } => {
+                write!(f, "gate: {option} must be a whole number from {low} to {high}, got '{value}'")
+            }
             Problem::NotTrueOrFalse { option, value } => write!(f, "gate: {option} takes true or false, got '{value}'"),
             Problem::BadConsoleFailure { option, value } => write!(f, "gate: {option} must be fail-before, got '{value}'"),
             Problem::NeedsValue(option) => write!(f, "gate: {option} needs a value"),
@@ -131,5 +143,6 @@ fn missing_text(required: Required, spelling: Spelling) -> &'static str {
         (Required::Log, Spelling::Cli) => "--log <path>",
         (Required::Log, Spelling::Compat) => "-Log <path>",
         (Required::Command, _) => "the command after --",
+        (Required::Seconds, _) => "--seconds <seconds>",
     }
 }

@@ -6,7 +6,8 @@ use std::path::PathBuf;
 
 use crate::problem::{Problem, Required, Spelling};
 use crate::request::{
-    CutoverRequest, CutoverSeams, DEFAULT_STALL_SECONDS, DEFAULT_TAIL_LINES, PushRequest, PushSeams, RunRequest, Slot, StopRequest, TestSeams,
+    BurnRequest, CutoverRequest, CutoverSeams, DEFAULT_STALL_SECONDS, DEFAULT_TAIL_LINES, PushRequest, PushSeams, RunRequest, Slot, StopRequest,
+    TestSeams,
 };
 use crate::values;
 
@@ -19,6 +20,8 @@ pub(crate) enum ValueOption {
     Stall,
     Tail,
     StateDir,
+    Cores,
+    Seconds,
     #[cfg(feature = "test-seams")]
     SampleMs,
     #[cfg(feature = "test-seams")]
@@ -101,6 +104,8 @@ pub(crate) struct RunBuilder {
     stall: Option<u64>,
     tail: Option<u64>,
     state_dir: Option<PathBuf>,
+    cores: Option<u32>,
+    seconds: Option<u32>,
     no_markers: bool,
     local: bool,
     print_request: bool,
@@ -170,6 +175,8 @@ impl RunBuilder {
             ValueOption::Stall => self.stall = Some(values::above_zero(spelled, value)?),
             ValueOption::Tail => self.tail = Some(values::zero_or_above(spelled, value)?),
             ValueOption::StateDir => self.state_dir = Some(PathBuf::from(value)),
+            ValueOption::Cores => self.cores = Some(values::above_zero_u32(spelled, value)?),
+            ValueOption::Seconds => self.seconds = Some(values::in_range(spelled, value, 1, values::MAX_BURN_SECONDS)?),
             #[cfg(feature = "test-seams")]
             ValueOption::SampleMs => self.test_seams.sample_ms = Some(values::above_zero(spelled, value)?),
             #[cfg(feature = "test-seams")]
@@ -369,6 +376,18 @@ impl RunBuilder {
             return Err(self.problems);
         }
         Ok(PushRequest { seams: self.push_seams })
+    }
+
+    /// The burn request, its cores and seconds, or every problem: those found while reading, then a missing
+    /// `--seconds`.
+    pub(crate) fn finish_burn(mut self) -> Result<BurnRequest, Vec<Problem>> {
+        if !self.given.contains(&RunOption::Value(ValueOption::Seconds)) {
+            self.problems.push(Problem::Missing(Required::Seconds, Spelling::Cli));
+        }
+        match self.seconds {
+            Some(seconds) if self.problems.is_empty() => Ok(BurnRequest { cores: self.cores, seconds }),
+            _ => Err(self.problems),
+        }
     }
 }
 

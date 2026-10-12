@@ -9,6 +9,7 @@
 mod acquire;
 mod answer;
 mod boxside;
+mod burn;
 mod console;
 mod covered;
 mod cutover;

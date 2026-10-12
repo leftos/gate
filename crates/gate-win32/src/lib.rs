@@ -44,7 +44,7 @@ pub fn check_plain_file(file: &std::fs::File) -> io::Result<()> {
 
     launch::check_plain_file(file.as_raw_handle())
 }
-pub use tree::{OpenedJob, StoppableProcess};
+pub use tree::{OpenedJob, StoppableProcess, WaitableProcess};
 
 pub use priority::{Priority, priority_of, set_priority};
 

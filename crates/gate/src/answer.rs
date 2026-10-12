@@ -29,6 +29,7 @@ pub(crate) fn answer(args: Vec<OsString>, environment: &Environment, console: &m
         Ok(Invocation::StopTree(request)) => u32::from(stop_tree(&request, environment, console)),
         Ok(Invocation::Cutover(request)) => crate::cutover::cutover(&request, environment, console),
         Ok(Invocation::Push(request)) => crate::push::push(&request, environment, console),
+        Ok(Invocation::Burn(request)) => crate::burn::burn(&request, console),
         Ok(Invocation::Box(request)) => crate::boxside::answer(&request, console),
         Err(problems) => u32::from(usage_error(&problems, console)),
     }

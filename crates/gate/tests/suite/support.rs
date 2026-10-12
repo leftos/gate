@@ -24,6 +24,7 @@ usage: gate run --slot heavy|light|critical --timeout <seconds> --log <path> [op
        gate stop-tree <pid>
        gate cutover
        gate push
+       gate burn [--cores <n>] --seconds <s>
        gate --version | --help
 
 run options:

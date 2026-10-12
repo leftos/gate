@@ -29,6 +29,8 @@ pub enum Invocation {
     Cutover(CutoverRequest),
     /// `gate push`.
     Push(PushRequest),
+    /// `gate burn`.
+    Burn(BurnRequest),
     /// The hidden `gate box <verb> <payload>`.
     Box(BoxRequest),
 }
@@ -226,6 +228,14 @@ pub struct CutoverSeams {
 pub struct PushRequest {
     /// The hidden `--test-*` flags that set the push's ssh and bound.
     pub seams: PushSeams,
+}
+
+/// A valid `gate burn`: the threads to spin, `None` for the machine's logical processors, and how many seconds to spin
+/// them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BurnRequest {
+    pub cores: Option<u32>,
+    pub seconds: u32,
 }
 
 /// What the black-box suite sets on `gate push` through its hidden `--test-*` flags; each field keeps its default,

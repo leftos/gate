@@ -4,7 +4,7 @@ use std::ffi::OsString;
 use std::iter::Peekable;
 
 use crate::problem::{Problem, Spelling};
-use crate::request::{CutoverRequest, PushRequest, RunRequest, StopRequest};
+use crate::request::{BurnRequest, CutoverRequest, PushRequest, RunRequest, StopRequest};
 use crate::run::{RunBuilder, RunOption, SwitchOption, ValueOption, next_text};
 use crate::values;
 
@@ -78,6 +78,20 @@ pub(crate) fn parse_push(words: impl Iterator<Item = OsString>) -> Result<PushRe
     builder.finish_push()
 }
 
+/// Reads the words after `gate burn`: the optional `--cores <n>` and the required `--seconds <s>`.
+pub(crate) fn parse_burn(words: impl Iterator<Item = OsString>) -> Result<BurnRequest, Vec<Problem>> {
+    let mut words = words.peekable();
+    let mut builder = RunBuilder::default();
+    while let Some(text) = next_text(&mut words, &mut builder.problems) {
+        if text.starts_with('-') && text != "--" {
+            read_option(&mut builder, &mut words, &text, burn_option);
+        } else {
+            builder.problems.push(Problem::UnexpectedArgument(text));
+        }
+    }
+    builder.finish_burn()
+}
+
 /// Reads one option word, `--name` or `--name=value`, taking its value from the next word when it needs one.
 fn read_option(builder: &mut RunBuilder, words: &mut Peekable<impl Iterator<Item = OsString>>, word: &str, lookup: fn(&str) -> Option<RunOption>) {
     let Some(rest) = word.strip_prefix("--") else {
@@ -110,6 +124,14 @@ fn run_option(name: &str) -> Option<RunOption> {
         _ => return seam_option(name),
     };
     Some(option)
+}
+
+fn burn_option(name: &str) -> Option<RunOption> {
+    match name {
+        "cores" => Some(RunOption::Value(ValueOption::Cores)),
+        "seconds" => Some(RunOption::Value(ValueOption::Seconds)),
+        _ => None,
+    }
 }
 
 fn stop_tree_option(name: &str) -> Option<RunOption> {

@@ -8,7 +8,10 @@
 //! `spawn-wait <path>` starts `fake-tool wait <path>`
 //! with this process's stdin, stdout and stderr, prints `spawned <its pid>` and goes on without waiting for it;
 //! `spawn-orphan <path>` runs `fake-tool spawn-wait <path>` with this process's handles and waits for it to end, so the
-//! helper that one starts is left with no parent and only the job this process runs in still reaches it; `exit <n>`
+//! helper that one starts is left with no parent and only the job this process runs in still reaches it;
+//! `spawn-pid <path> <release> <program> [words]` starts the program with those words and this process's handles,
+//! writes its pid to the file at the path, prints `spawned <its pid>`, and goes on holding the program's handle until
+//! the file at the release path comes, so the program's parent outlives the case's own opening of it; `exit <n>`
 //! exits with status n, any 32-bit code, negative ones as Windows reads them back;
 //! `env <name>` prints the variable's value, or `fake-tool: <name> is not set`, on its own line; `bytes <hex>` writes the
 //! bytes the hex digits spell to stdout as they are, with no line feed added; `lines <n> <text>` prints n lines on
@@ -118,6 +121,10 @@ fn run(args: &[OsString]) -> Result<i32, String> {
             "spawn-orphan" => {
                 stdout.flush().map_err(|error| write_failed(&error))?;
                 spawn_orphan(&operand(&mut steps, "spawn-orphan")?)?;
+            }
+            "spawn-pid" => {
+                spawn_pid(&mut steps, &mut stdout)?;
+                break;
             }
             "exit" => {
                 let text = operand(&mut steps, "exit")?;
@@ -241,6 +248,28 @@ fn spawn_wait(path: &str) -> Result<u32, String> {
         .spawn()
         .map(|helper| helper.id())
         .map_err(|error| format!("cannot start the waiting helper: {error}"))
+}
+
+/// The `spawn-pid` step: starts the program it names with the words after it and this process's handles, writes its pid
+/// to the file it names, prints `spawned <its pid>`, then holds the program's handle until the release file comes. The
+/// program's parent is this process until then, so its pid cannot be taken by another process before a case opens it.
+fn spawn_pid<'a>(steps: &mut impl Iterator<Item = &'a OsString>, stdout: &mut impl Write) -> Result<(), String> {
+    let pid_path = operand(steps, "spawn-pid")?;
+    let release = operand(steps, "spawn-pid")?;
+    let program = operand(steps, "spawn-pid")?;
+    let words: Vec<OsString> = steps.by_ref().cloned().collect();
+    let child = Command::new(program.as_str())
+        .args(&words)
+        .spawn()
+        .map_err(|error| format!("cannot start {program}: {error}"))?;
+    let pid = child.id();
+    write_file(&pid_path, &pid.to_string())?;
+    writeln!(stdout, "spawned {pid}").map_err(|error| write_failed(&error))?;
+    stdout.flush().map_err(|error| write_failed(&error))?;
+    if !wait_for(&release)? {
+        return Err(format!("the release file {release} did not appear within {} s", WAIT_LIMIT.as_secs()));
+    }
+    Ok(())
 }
 
 /// Runs `fake-tool spawn-wait <path>` with this process's handles and waits for it to end, which it does as soon as

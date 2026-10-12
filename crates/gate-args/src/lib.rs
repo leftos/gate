@@ -1,4 +1,4 @@
-//! The gate's own argv: the subcommand CLI (`gate run`, `gate stop-tree`, `gate cutover`, `gate push`, the hidden `gate box`,
+//! The gate's own argv: the subcommand CLI (`gate run`, `gate burn`, `gate stop-tree`, `gate cutover`, `gate push`, the hidden `gate box`,
 //! `--version`, `--help`) and the compatibility layer that reads the PowerShell gate's `-Log <path> -TimeoutSeconds <n> -Slot
 //! <kind> -- <command>` form. Parsing is pure: it reads the words it is given, opens no file and reads no environment,
 //! so it builds and tests everywhere. A usage error is a list of [`Problem`]s, each printed on its own `gate: ` line
@@ -28,14 +28,14 @@ pub use cmdline::{command_line, command_text, quote_arg, quote_arg_str};
 pub use problem::{MAX_WHOLE_NUMBER, Problem, Required, Spelling};
 pub use program::{ProgramSearch, resolve_program};
 pub use request::{
-    BoxRequest, BoxSeams, BoxVerb, CutoverRequest, CutoverSeams, DEFAULT_STALL_SECONDS, DEFAULT_TAIL_LINES, Invocation, PushRequest, PushSeams,
-    RunRequest, Slot, StopRequest, TestSeams,
+    BoxRequest, BoxSeams, BoxVerb, BurnRequest, CutoverRequest, CutoverSeams, DEFAULT_STALL_SECONDS, DEFAULT_TAIL_LINES, Invocation, PushRequest,
+    PushSeams, RunRequest, Slot, StopRequest, TestSeams,
 };
 pub use usage::USAGE;
 
 /// Reads the gate's arguments, without the program name.
 ///
-/// The first word picks the parser: `--version`, `--help` and `help` first, then a subcommand name (`run`,
+/// The first word picks the parser: `--version`, `--help` and `help` first, then a subcommand name (`run`, `burn`,
 /// `stop-tree`, `cutover`, `push`, the hidden `box`) selects the CLI and a first word starting with `-` selects the
 /// compatibility layer.
 ///
@@ -59,6 +59,7 @@ pub fn parse(args: Vec<OsString>) -> Result<Invocation, Vec<Problem>> {
         "stop-tree" => cli::parse_stop_tree(words).map(Invocation::StopTree),
         "cutover" => cli::parse_cutover(words).map(Invocation::Cutover),
         "push" => cli::parse_push(words).map(Invocation::Push),
+        "burn" => cli::parse_burn(words).map(Invocation::Burn),
         "box" => boxcmd::parse(words).map(Invocation::Box),
         _ if text.starts_with('-') => compat::parse(std::iter::once(first).chain(words)),
         _ => Err(vec![Problem::UnknownSubcommand(text.to_owned())]),

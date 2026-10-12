@@ -33,6 +33,7 @@ The CLI is subcommands with GNU-style flags: `--name value` or `--name=value`, a
 | `gate stop-tree` | Stop a process tree, reaching the gate jobs inside it. |
 | `gate cutover` | Switch this machine from the PowerShell gate to `gate.exe`, draining it first. |
 | `gate push` | Copy the installed `gate.exe` to every builder `remote.json` names. |
+| `gate burn` | Spin the CPU for a set time, for the load-burn tool. |
 | `gate box` | Hidden: the builder side of a routed run. |
 | `gate --version` | Print the version and exit 0. |
 | `gate --help`, `gate help` | Print the usage on stdout and exit 0. |
@@ -149,6 +150,18 @@ Each version read on the builder is bounded at 30 s.
 
 Test-seams builds accept hidden options on `push`: `--test-push-ssh <path>` (the program each builder's call runs in place of the ssh found along `PATH`) and `--test-push-bound-ms <n>` (the 300 s bound, in milliseconds above 0). `gate push` has no `--test-print-request`.
 
+### `gate burn`
+
+`gate burn [--cores <n>] --seconds <s>` is the CPU burn of `~/.claude/tools/load-burn/load-burn.ps1`, which runs it inside a critical gate. One process spins `n` threads on a busy loop at the priority it inherited, for `s` seconds. It takes no slot and writes no claim, journal line or log; `GATE_STATE_DIR` and `--state-dir` do not apply.
+
+- `--seconds` is required and a whole number from 1 to 180 (the owner's 120 s burn cap plus 60 s of margin); a larger value, a huge one included, is refused.
+- `--cores` is a whole number above 0, at most this machine's logical processors, and defaults to all of them.
+- Usage errors, each on its own `gate: ` line before the usage, exit 2: `gate: missing --seconds <seconds>`, `gate: --seconds must be a whole number from 1 to 180, got '<v>'`, a `--cores` that is not a whole number above 0, `gate: --cores must be at most this machine's <n> logical processors, got <m>`, an unknown option, a word that is not an option, and an option given twice.
+
+It says `gate: burn: <n> thread(s) for <s> s` on stdout once, when the threads are running, and exits 0 at its deadline.
+
+It also ends when the process that started it ends: `gate: burn: the parent process <pid> ended` on stderr, exit 1. A parent it cannot watch is exit 1 on stderr: `gate: burn: the parent process <pid> is not running` (also when the pid was reused by a process that started after the burn did), `gate: burn: cannot open the parent process <pid>: <why>`, `gate: burn: cannot wait for the parent process <pid>: <why>`, or `gate: burn: this process is not in the process table, so its parent is unknown`.
+
 ### `gate box`
 
 Hidden from the usage and from `--help`. It is the builder side of a routed run, run over ssh on the builder ([The box side](#the-box-side)).
@@ -191,7 +204,7 @@ The codes are kept (V4), with 75 added for refusals. 124 is the status coreutils
 
 ## Output lines
 
-Every line the gate says is written and flushed as it is said, never held until exit, so a running or killed gate's lines are already visible. Every line the gate writes for itself starts `gate: ` and goes to stderr and to the end of the log (V1), except the passed line and the stop-tree summary, which go to stdout (V3, X6). Three forms are the published interface that callers may parse; they keep their wording, and a change to them is a breaking change:
+Every line the gate says is written and flushed as it is said, never held until exit, so a running or killed gate's lines are already visible. Every line the gate writes for itself starts `gate: ` and goes to stderr and to the end of the log (V1), except the passed line, the stop-tree summary and the `gate burn` start line, which go to stdout (V3, X6). Three forms are the published interface that callers may parse; they keep their wording, and a change to them is a breaking change:
 
 | Line | Where | Meaning |
 |---|---|---|
@@ -1283,6 +1296,7 @@ A Rust integration suite drives the built `gate.exe` through its CLI and reads o
   - `burn <stop-path>` (prints `burning`, then spins on the CPU until the file exists), `burn-threads <n> <ms>` (spins on `n` threads for `ms` of wall time, then goes on) and `chatter <path>` (prints numbered lines `chatter 1`, `chatter 2`, ... about every 50 ms until the file exists).
   - `spawn-wait <path>` starts `fake-tool wait <path>` with the caller's handles, prints `spawned <pid>` and does not wait.
   - `spawn-orphan <path>` runs `fake-tool spawn-wait <path>` as a child, waits for it to end, then continues with its next step, so the waiting helper is left without a parent and its `spawned <pid>` line is the up signal.
+  - `spawn-pid <pidfile> <release-path> <program> [words]` starts the program with those words and the caller's handles, writes its pid to the pidfile, prints `spawned <pid>` and holds the program's handle until the release path exists, so the pid cannot be reused while a case opens it as the parent of a `gate burn`. It ends the steps: nothing after it runs.
 
   It is copied under the names the gate classifies (`VBCSCompiler.exe`, `dotnet.exe`, `MSBuild.exe`).
 

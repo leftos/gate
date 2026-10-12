@@ -1,4 +1,5 @@
-//! What stopping a process tree needs: another gate's job opened by its name, and a process opened to be stopped.
+//! What stopping a process tree or waiting for one process needs: another gate's job opened by its name, a process
+//! opened to be stopped, and one opened to wait for its end.
 
 use std::io;
 use std::time::Duration;
@@ -9,7 +10,8 @@ use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_INVALID_PARAMET
 use windows_sys::Win32::System::JobObjects::OpenJobObjectW;
 use windows_sys::Win32::System::SystemServices::{JOB_OBJECT_QUERY, JOB_OBJECT_TERMINATE};
 use windows_sys::Win32::System::Threading::{
-    OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, TerminateProcess, WaitForSingleObject,
+    GetExitCodeProcess, OpenProcess, PROCESS_ACCESS_RIGHTS, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+    TerminateProcess, WaitForSingleObject,
 };
 
 use crate::{job, own_handle, start_of, wait_millis, wide};
@@ -82,7 +84,8 @@ impl OpenedJob {
     }
 }
 
-/// A process opened to be stopped: with the access to read its creation time, to wait for it and to terminate it.
+/// A process opened to be stopped: with the access to read its creation time and its exit code, to wait for it and to
+/// terminate it.
 pub struct StoppableProcess {
     handle: OwnedHandle,
 }
@@ -97,13 +100,7 @@ impl StoppableProcess {
     /// The system's error when the process exists but cannot be opened, such as one this process may not terminate.
     pub fn open(pid: u32) -> io::Result<Option<StoppableProcess>> {
         let access = PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE;
-        // SAFETY: `OpenProcess` takes no pointers. A success is a fresh handle nothing else owns.
-        match unsafe { own_handle(OpenProcess(access, 0, pid)) } {
-            Ok(handle) => Ok(Some(StoppableProcess { handle })),
-            // `OpenProcess` reports a pid no process has as `ERROR_INVALID_PARAMETER`.
-            Err(error) if is_error(&error, ERROR_INVALID_PARAMETER) => Ok(None),
-            Err(error) => Err(error),
-        }
+        Ok(open_process(pid, access)?.map(|handle| StoppableProcess { handle }))
     }
 
     /// Its creation time, as the process table gives start times (whole microseconds), so the two compare equal for
@@ -123,12 +120,23 @@ impl StoppableProcess {
     ///
     /// The system's error when the wait fails.
     pub fn wait(&self, timeout: Duration) -> io::Result<bool> {
-        // SAFETY: the handle is open for the whole call, with the `SYNCHRONIZE` access a wait asks for.
-        match unsafe { WaitForSingleObject(self.handle.raw(), wait_millis(timeout)) } {
-            WAIT_OBJECT_0 => Ok(true),
-            WAIT_TIMEOUT => Ok(false),
-            _ => Err(io::Error::last_os_error()),
+        wait_handle(&self.handle, timeout)
+    }
+
+    /// The code the process ended with, meaningful once [`StoppableProcess::wait`] has found it ended: a process that
+    /// still runs reports `STILL_ACTIVE` (259) for as long as a handle keeps its process object.
+    ///
+    /// # Errors
+    ///
+    /// The system's error when the code cannot be read.
+    pub fn exit_code(&self) -> io::Result<u32> {
+        // SAFETY: the handle is open for the whole call, with the `PROCESS_QUERY_LIMITED_INFORMATION` access the call
+        // asks for, and `code` is writable.
+        let mut code = 0;
+        if unsafe { GetExitCodeProcess(self.handle.raw(), &raw mut code) } == 0 {
+            return Err(io::Error::last_os_error());
         }
+        Ok(code)
     }
 
     /// Ends the process with `exit_code`.
@@ -140,6 +148,66 @@ impl StoppableProcess {
         // SAFETY: the handle is open for the whole call, with the `PROCESS_TERMINATE` access the call asks for.
         let terminated = unsafe { TerminateProcess(self.handle.raw(), exit_code) };
         if terminated == 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
+    }
+}
+
+/// A process opened to wait for its end, with the access a wait needs and no more: the process that started this one.
+pub struct WaitableProcess {
+    handle: OwnedHandle,
+}
+
+impl WaitableProcess {
+    /// Opens the process `pid` with `PROCESS_QUERY_LIMITED_INFORMATION` and `SYNCHRONIZE`; `None` when no process has
+    /// that pid.
+    ///
+    /// # Errors
+    ///
+    /// The system's error when the process exists but cannot be opened, such as one this process may not query.
+    pub fn open(pid: u32) -> io::Result<Option<WaitableProcess>> {
+        let access = PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE;
+        Ok(open_process(pid, access)?.map(|handle| WaitableProcess { handle }))
+    }
+
+    /// Its creation time, as the process table gives start times (whole microseconds), so a process that started after
+    /// the one that opened it is told apart from it.
+    ///
+    /// # Errors
+    ///
+    /// The system's error when its times cannot be read, or when the time is outside a [`Timestamp`]'s range.
+    pub fn created(&self) -> io::Result<Timestamp> {
+        // SAFETY: the handle is open for as long as `self` lives, with `PROCESS_QUERY_LIMITED_INFORMATION` access.
+        unsafe { start_of(self.handle.raw()) }
+    }
+
+    /// Waits at most `timeout` for the process to end: true when it has ended, false when it still runs.
+    ///
+    /// # Errors
+    ///
+    /// The system's error when the wait fails.
+    pub fn wait(&self, timeout: Duration) -> io::Result<bool> {
+        wait_handle(&self.handle, timeout)
+    }
+}
+
+/// The process `pid` opened with `access`; `None` when no process has that pid.
+fn open_process(pid: u32, access: PROCESS_ACCESS_RIGHTS) -> io::Result<Option<OwnedHandle>> {
+    // SAFETY: `OpenProcess` takes no pointers. A success is a fresh handle nothing else owns.
+    match unsafe { own_handle(OpenProcess(access, 0, pid)) } {
+        Ok(handle) => Ok(Some(handle)),
+        // `OpenProcess` reports a pid no process has as `ERROR_INVALID_PARAMETER`.
+        Err(error) if is_error(&error, ERROR_INVALID_PARAMETER) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// Waits at most `timeout` for `handle` to be signalled, as a process's is once it has ended: true when it was, false
+/// when the timeout ran out first.
+fn wait_handle(handle: &OwnedHandle, timeout: Duration) -> io::Result<bool> {
+    // SAFETY: the handle is open for the whole call, with the `SYNCHRONIZE` access a wait asks for.
+    match unsafe { WaitForSingleObject(handle.raw(), wait_millis(timeout)) } {
+        WAIT_OBJECT_0 => Ok(true),
+        WAIT_TIMEOUT => Ok(false),
+        _ => Err(io::Error::last_os_error()),
     }
 }
 
