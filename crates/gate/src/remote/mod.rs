@@ -24,6 +24,8 @@ mod launch;
 #[cfg(feature = "test-seams")]
 mod outputs;
 #[cfg(feature = "test-seams")]
+mod parity;
+#[cfg(feature = "test-seams")]
 mod payload;
 #[cfg(feature = "test-seams")]
 mod retry;
@@ -248,7 +250,7 @@ mod snapshot_only {
                 Ok(snapshots) => (0, snapshots.iter().map(said).collect()),
                 // An interrupt is no failure, so it says no line: the run is the interrupt, as the client's `wait`.
                 Err(GitError::Interrupted) => (i64::from(CONTROL_C_EXIT.cast_signed()), Vec::new()),
-                Err(GitError::Failed(why)) => (FAILED, vec![format!("{FAILED_RUN}: {why}")]),
+                Err(GitError::Failed(why) | GitError::OverCap(why)) => (FAILED, vec![format!("{FAILED_RUN}: {why}")]),
             };
             if let Err(why) = super::say(call.log, &lines, io::stderr().lock()) {
                 // The snapshot is made and cannot be unmade, so a run that cannot say its lines fails where it is.

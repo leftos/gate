@@ -159,6 +159,9 @@ pub struct TestSeams {
     /// The remote client's ceiling in milliseconds, counted from the start of the call `--test-remote-watch-call`
     /// names, or of the run when it names none.
     pub remote_timeout_ms: Option<u64>,
+    /// This PC's SDK list as the remote client's parity check reads it, in place of `dotnet --list-sdks`: versions
+    /// separated by commas, or `none`.
+    pub local_sdks: Option<String>,
     /// The script the remote.ps1 bridge dot-sources in place of `%USERPROFILE%\.claude\tools\gate\remote.ps1`.
     pub remote_script: Option<PathBuf>,
     /// The program the remote.ps1 bridge starts in place of the pwsh found on `PATH`.

@@ -20,7 +20,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError};
@@ -38,6 +38,7 @@ use regex::Regex;
 use super::git::{self, Git, GitError, last_update};
 use super::launch::{DRAIN, KILL_WAIT, KILLED, call_job, piped_launch};
 use super::outputs;
+use super::parity;
 use super::payload::{self, Location, RunCall};
 use super::retry::{self, Ended, GIT_SSH_FAILED, SSH_FAILED};
 use super::snapshot::{self, Snapshot};
@@ -47,7 +48,7 @@ use super::watchdog::{self, Cut, Kept, LINE_CAP};
 use super::{FAILED, FAILED_RUN, REFUSED, Refusal, RemoteCall, RemoteClient, RemoteOutcome, refused_line, started_line};
 use crate::boxside::payload::escaped;
 use crate::environment::Variables;
-use crate::run::{CONTROL_C_EXIT, find_program};
+use crate::run::{CONTROL_C_EXIT, ERROR_FILE_NOT_FOUND, find_program};
 
 /// The statuses of a preflight whose builder has no `gate box` that takes the run: cmd's for a program it cannot find,
 /// and a gate's usage error for a payload it does not read.
@@ -62,6 +63,8 @@ const VERSION: &str = "gate: remote version ";
 const CREATED: &str = "gate: remote created ";
 /// The builder's boot time, which the preflight and the `boot` call say.
 const BOOT: &str = "gate: remote boot ";
+/// The builder's SDK list, which the preflight says: `gate: remote sdks <v1,v2|none>`.
+const SDKS: &str = "gate: remote sdks ";
 /// How far apart two boot times of one builder may be and still be one boot.
 const BOOT_SLACK: SignedDuration = SignedDuration::from_secs(30);
 /// This gate's version, which the builder's must be.
@@ -87,6 +90,8 @@ pub(crate) struct RustClient {
     watch_call: Option<String>,
     /// `--test-remote-interrupt-at`: the call after whose first output byte the client raises the console interrupt.
     interrupt_at: Option<String>,
+    /// `--test-local-sdks`: this PC's SDK list, read in place of `dotnet --list-sdks`.
+    local_sdks: Option<String>,
 }
 
 impl RustClient {
@@ -108,6 +113,7 @@ impl RustClient {
             timeout_ms: seams.remote_timeout_ms,
             watch_call: seams.remote_watch_call.clone(),
             interrupt_at: seams.remote_interrupt_at.clone(),
+            local_sdks: seams.local_sdks.clone(),
         })
     }
 }
@@ -162,6 +168,7 @@ impl RemoteClient for RustClient {
                 ceiling: self.timeout_ms.map(Duration::from_millis),
             }),
             interrupt_at: self.interrupt_at.as_deref(),
+            local_sdks: self.local_sdks.as_deref(),
             lines: Vec::new(),
             problem: None,
         };
@@ -197,11 +204,12 @@ pub(super) enum End {
     Lost(Range<usize>),
 }
 
-/// What the preflight found: whether it created the bare repository just now, and the builder's boot time, `None`
-/// when it said none.
+/// What the preflight found: whether it created the bare repository just now, the builder's boot time, `None` when it
+/// said none, and the SDKs it lists, `None` when it said no SDK line.
 struct Prepared {
     created: bool,
     boot: Option<String>,
+    sdks: Option<Vec<String>>,
 }
 
 /// The run's clock, which starts with the attempt, and the limits the client's calls are watched by: the stall window,
@@ -339,6 +347,8 @@ pub(super) struct Attempt<'c, 'a> {
     one_call: Option<OneCall<'c>>,
     /// The call, `preflight` or `run`, after whose first output byte the console interrupt is raised, as a Ctrl+C would.
     interrupt_at: Option<&'c str>,
+    /// `--test-local-sdks`: this PC's SDK list, read in place of `dotnet --list-sdks`.
+    local_sdks: Option<&'c str>,
     lines: Vec<String>,
     problem: Option<String>,
 }
@@ -360,6 +370,7 @@ impl Attempt<'_, '_> {
         };
         let run_line = payload::capped("run", payload::line("run", &payload::run_word(&location, &run))).map_err(End::Failed)?;
         let prepared = self.preflight(&location)?;
+        self.parity(&snapshot, prepared.sdks.as_deref())?;
         self.push(&snapshot, prepared.created)?;
         let (end, heard) = self.run_call(&run_line, &location, sent.manifest.as_ref(), &nonce)?;
         // The sync-back runs after a run call that ended with the command's own status; a refusal, an interrupt, a
@@ -405,6 +416,7 @@ impl Attempt<'_, '_> {
         let theirs = their_version(&called.lines).map(str::to_owned);
         let created = called.lines.iter().any(|line| line.starts_with(CREATED));
         let boot = boot_time(&called.lines).map(str::to_owned);
+        let sdks = sdks_of(&called.lines);
         self.lines.append(&mut called.lines);
         self.not_started_if_killed("the preflight", &called)?;
         let host = self.call.host;
@@ -430,7 +442,81 @@ impl Attempt<'_, '_> {
             self.say(line);
             return Err(End::Refused(FallbackReason::Version));
         }
-        Ok(Prepared { created, boot })
+        Ok(Prepared { created, boot, sdks })
+    }
+
+    /// The toolchain parity check, made after the preflight and before the push, so a refusal costs no transfer: a
+    /// builder whose preflight listed the SDKs `sdks` must have what the snapshot needs, as [`parity::need`] reads it
+    /// from the snapshot's root `global.json`, whatever the letter case of its name, and, with no pin, this PC's newest
+    /// SDK major. One that lacks it is refused `parity`, with the mismatch line. A builder that listed no SDK line, a
+    /// snapshot that is no .NET tree, or one whose listing or `global.json` cannot be read whole is not checked, the
+    /// listing with a line.
+    fn parity(&mut self, snapshot: &Snapshot, sdks: Option<&[String]>) -> Result<(), End> {
+        let Some(sdks) = sdks else {
+            return Ok(());
+        };
+        self.go_on()?;
+        let git = Git::find(Path::new(self.call.root)).map_err(End::Failed)?;
+        let listing = match self.git_bytes(&git, &["ls-tree", "-r", "-z", "--name-only", &snapshot.commit]) {
+            Ok(listing) => listing,
+            Err(GitError::OverCap(why)) => {
+                self.say(format!("gate: cannot list the snapshot's files: {why}; skipping the toolchain check"));
+                return Ok(());
+            }
+            Err(error) => return Err(git_end(error)),
+        };
+        let Ok(listing) = String::from_utf8(listing) else {
+            self.say("gate: cannot list the snapshot's files: a path is not valid UTF-8; skipping the toolchain check".to_owned());
+            return Ok(());
+        };
+        let names: Vec<&str> = listing.split('\0').filter(|name| !name.is_empty()).collect();
+        if !parity::is_dotnet_tree(names.iter().copied()) {
+            return Ok(());
+        }
+        // dotnet reads a root `global.json` whatever the letter case of its name, as Windows opens it.
+        let global_json = names.iter().find(|name| name.eq_ignore_ascii_case("global.json")).copied();
+        let pin = match global_json {
+            Some(name) => match self.git_bytes(&git, &["show", &format!("{}:{name}", snapshot.commit)]) {
+                Ok(bytes) => parity::pin_of(Some(&String::from_utf8_lossy(&bytes))),
+                // A `global.json` past the cap could not be read whole, so it holds no readable pin.
+                Err(GitError::OverCap(_)) => parity::Pin::unreadable(),
+                Err(error) => return Err(git_end(error)),
+            },
+            None => parity::pin_of(None),
+        };
+        if pin.found && pin.version.is_none() {
+            self.say(parity::NO_READABLE_PIN.to_owned());
+        }
+        let Some(need) = parity::need(&pin, sdks, || self.local_major()) else {
+            return Ok(());
+        };
+        self.say(parity::mismatch_line(self.call.repo, &need, self.call.host, sdks));
+        Err(End::Refused(FallbackReason::Parity))
+    }
+
+    /// What git writes on standard output for `args` in the worktree, as the bytes it wrote, a call the console
+    /// interrupt ends; a failure is the run's to tell apart.
+    fn git_bytes(&self, git: &Git, args: &[&str]) -> Result<Vec<u8>, GitError> {
+        let call = git::Call {
+            interrupt: self.call.interrupt,
+            ..git::Call::plain(Path::new(self.call.root), args, self.limit)
+        };
+        git.output_bytes(&call)
+    }
+
+    /// This PC's newest .NET SDK major, from `--test-local-sdks` when given, else from `dotnet --list-sdks`; 0 when no
+    /// dotnet is found or it lists no SDK. A list that cannot be read is said, and checks no major.
+    fn local_major(&mut self) -> u64 {
+        if let Some(listing) = self.local_sdks {
+            return parity::newest_major(parity::listed(listing).iter().map(String::as_str));
+        }
+        match local_sdk_listing(Path::new(self.call.root)) {
+            Ok(listing) => parity::newest_major(listing.lines().filter_map(|line| line.split_whitespace().next())),
+            Err(why) => {
+                self.say(format!("gate: cannot read this PC's SDK list: {why}; checking no SDK major"));
+                0
+            }
+        }
     }
 
     /// Pushes the snapshot, and its bridge unless the bare repository was `created` just now, with no hooks and no
@@ -857,6 +943,7 @@ impl<'c, 'a> Attempt<'c, 'a> {
             limits: Limits::for_tests(),
             one_call: None,
             interrupt_at: None,
+            local_sdks: None,
             lines: Vec::new(),
             problem: None,
         }
@@ -1100,7 +1187,7 @@ fn paused(pause: Duration, interrupt: Option<Interrupt>) -> Result<(), End> {
 fn git_end(error: GitError) -> End {
     match error {
         GitError::Interrupted => End::Interrupted,
-        GitError::Failed(why) => End::Failed(why),
+        GitError::Failed(why) | GitError::OverCap(why) => End::Failed(why),
     }
 }
 
@@ -1459,6 +1546,44 @@ fn their_version(lines: &[String]) -> Option<&str> {
     lines.iter().rev().find_map(|line| line.strip_prefix(VERSION)).map(str::trim)
 }
 
+/// The SDKs the builder lists, from the last `gate: remote sdks <v1,v2|none>` line of its preflight, without `none`;
+/// `None` when it said no such line, or one with no list, which skips the parity check.
+fn sdks_of(lines: &[String]) -> Option<Vec<String>> {
+    lines
+        .iter()
+        .rev()
+        .find_map(|line| line.strip_prefix(SDKS))
+        .map(str::trim)
+        .filter(|listing| !listing.is_empty())
+        .map(parity::listed)
+}
+
+/// What `dotnet --list-sdks` lists on this PC, empty when no dotnet is found along the gate's own `PATH`, read against
+/// `folder`; else why it could not be read.
+fn local_sdk_listing(folder: &Path) -> Result<String, String> {
+    let dotnet = match find_program("dotnet", &Variables::from_process(), folder) {
+        Ok(dotnet) => dotnet,
+        // `find_program` says a word it does not find with this message, and every other failure with another.
+        Err(message) if message == gate_win32::win32_message(ERROR_FILE_NOT_FOUND) => return Ok(String::new()),
+        Err(message) => return Err(message),
+    };
+    // Started under the spawn lock, so it inherits no launch's handles.
+    let output = gate_win32::spawn(
+        Command::new(&dotnet)
+            .arg("--list-sdks")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null()),
+    )
+    .and_then(Child::wait_with_output)
+    .map_err(|error| format!("cannot start {}: {error}", dotnet.display()))?;
+    if !output.status.success() {
+        let status = output.status.code().map_or_else(|| "unknown".to_owned(), |code| code.to_string());
+        return Err(format!("dotnet --list-sdks exited with status {status}"));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
 /// The builder's boot time, from the last `gate: remote boot <time>` line of a preflight or a `boot` call; `None` when
 /// it said none, or one with no time. A time that is no timestamp is kept as it is, for [`after_loss`] to refuse.
 fn boot_time(lines: &[String]) -> Option<&str> {
@@ -1594,7 +1719,7 @@ mod tests {
 
     use super::{
         Attempt, CallEnd, Called, Cut, Echo, End, GIT_SSH_FAILED, Heard, LINE_CAP, Limits, Loss, ProtocolLines, Reader, Reading, SSH_FAILED, Shared,
-        Unfinished, Watch, after_loss, boot_time, called_of, console_of, held, is_heartbeat, last_update, paused, push_size, relay, seconds,
+        Unfinished, Watch, after_loss, boot_time, called_of, console_of, held, is_heartbeat, last_update, paused, push_size, relay, sdks_of, seconds,
         their_version, version_refusal,
     };
     use crate::remote::git::GIT_LIMIT;
@@ -1647,6 +1772,7 @@ mod tests {
             limits: Limits::for_tests(),
             one_call: None,
             interrupt_at: None,
+            local_sdks: None,
             lines: Vec::new(),
             problem: None,
         }
@@ -2122,6 +2248,33 @@ mod tests {
             version_refusal("builder", None, "0.1.0"),
             Some("gate: not routed: builder runs gate unknown, this PC 0.1.0".to_owned())
         );
+    }
+
+    #[test]
+    fn the_builder_s_sdks_are_its_preflight_s_last_sdks_line() {
+        let preflight = lines(&[
+            "gate: remote version 0.1.0",
+            "gate: remote sdks 8.0.100",
+            "gate: remote sdks 8.0.425, 10.0.100",
+            "gate: remote boot 2026-10-10T08:00:00.0000000Z",
+        ]);
+        assert_eq!(sdks_of(&preflight), Some(vec!["8.0.425".to_owned(), "10.0.100".to_owned()]));
+        assert_eq!(
+            sdks_of(&lines(&["gate: remote sdks 9.0.300,10.0.100"])),
+            Some(vec!["9.0.300".to_owned(), "10.0.100".to_owned()])
+        );
+        assert_eq!(
+            sdks_of(&lines(&["gate: remote sdks none"])),
+            Some(Vec::new()),
+            "a builder with no dotnet lists none"
+        );
+        assert_eq!(sdks_of(&lines(&["gate: remote version 0.1.0"])), None, "no SDK line skips the check");
+        assert_eq!(
+            sdks_of(&lines(&["gate: remote could not read the SDK list: access denied"])),
+            None,
+            "the box could not read it"
+        );
+        assert_eq!(sdks_of(&lines(&["gate: remote sdks  "])), None, "an SDK line with no list");
     }
 
     #[test]

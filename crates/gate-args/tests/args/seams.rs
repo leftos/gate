@@ -364,6 +364,7 @@ fn the_remote_client_seams_need_a_value_once() {
         "--test-remote-ssh",
         "--test-remote-retry-pause-ms",
         "--test-remote-bound-ms",
+        "--test-local-sdks",
     ] {
         assert_eq!(
             problems(&refs(&with(&RUN, &[flag, "--", "cmd"]))),
@@ -443,6 +444,11 @@ fn the_remote_watch_seams_name_one_call_and_a_ceiling() {
         &["--test-remote-transport", "local:b", "--test-remote-timeout-ms", "300", "--", "cmd"],
     );
     assert_eq!(run_request(&refs(&words)).test_seams.remote_timeout_ms, Some(300));
+    let words = with(
+        &RUN,
+        &["--test-local-sdks", "999.0.100", "--test-remote-transport", "local:b", "--", "cmd"],
+    );
+    assert_eq!(run_request(&refs(&words)).test_seams.local_sdks.as_deref(), Some("999.0.100"));
     assert_eq!(
         problems(&refs(&with(
             &RUN,
@@ -481,6 +487,10 @@ fn the_remote_client_seams_that_conflict_are_refused() {
         (
             &["--test-remote-timeout-ms", "300"][..],
             "gate: --test-remote-timeout-ms needs --test-remote-transport",
+        ),
+        (
+            &["--test-local-sdks", "999.0.100"][..],
+            "gate: --test-local-sdks needs --test-remote-transport",
         ),
         (
             &["--test-remote-snapshot", "--test-remote-transport", "local:b"][..],
@@ -868,6 +878,7 @@ fn seam_flags_are_unknown_without_the_feature() {
         "--test-remote-interrupt-at",
         "--test-remote-watch-call",
         "--test-remote-timeout-ms",
+        "--test-local-sdks",
         "--test-server-image",
     ] {
         assert_eq!(

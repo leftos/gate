@@ -81,6 +81,9 @@ pub(crate) enum GitError {
     /// The call failed: what could not be done, or, for a git that ran and refused, `git <args> failed in <root>
     /// (status <n>): <the lines git wrote>`.
     Failed(String),
+    /// The call wrote more than its reader's cap on standard output and was ended as soon as the reader saw it: its
+    /// line names the call, its folder and the cap, as a failure does.
+    OverCap(String),
 }
 
 /// A failed call's reason; an interrupt, which has no line of its own, says the run was interrupted.
@@ -88,7 +91,7 @@ impl From<GitError> for String {
     fn from(error: GitError) -> String {
         match error {
             GitError::Interrupted => "the run was interrupted".to_owned(),
-            GitError::Failed(why) => why,
+            GitError::Failed(why) | GitError::OverCap(why) => why,
         }
     }
 }
@@ -131,12 +134,26 @@ impl Git {
         )
     )]
     pub(crate) fn output(&self, call: &Call<'_>) -> Result<String, GitError> {
+        let output = self.output_bytes(call)?;
+        String::from_utf8(output).map_err(|_| GitError::Failed("git's output is not valid UTF-8".to_owned()))
+    }
+
+    /// [`Git::output`] with the bytes git wrote and no check that they are UTF-8: a caller that reads a tree's own
+    /// bytes, a path that need not be text or a file of any encoding, asks this way.
+    #[cfg_attr(
+        not(any(test, feature = "test-seams")),
+        expect(
+            dead_code,
+            reason = "only the remote client asks git this way, and a gate without the test seams has none"
+        )
+    )]
+    pub(crate) fn output_bytes(&self, call: &Call<'_>) -> Result<Vec<u8>, GitError> {
         self.output_within(call, OUTPUT_CAP, ERRORS_KEPT)
     }
 
-    /// [`Git::output`] with standard output read up to `cap` bytes and the last `kept` bytes of standard error kept: a
-    /// call that writes more than `cap` is ended as soon as its reader sees it, and fails.
-    fn output_within(&self, call: &Call<'_>, cap: usize, kept: usize) -> Result<String, GitError> {
+    /// [`Git::output_bytes`] with standard output read up to `cap` bytes and the last `kept` bytes of standard error
+    /// kept: a call that writes more than `cap` is ended as soon as its reader sees it, and is an over-cap call.
+    fn output_within(&self, call: &Call<'_>, cap: usize, kept: usize) -> Result<Vec<u8>, GitError> {
         let over = Over {
             seen: Arc::new(AtomicBool::new(false)),
             line: over_line(call, cap),
@@ -151,12 +168,12 @@ impl Git {
         };
         let (status, output, errors) = self.spawned(call, read_capped, move |pipe: File| tail(pipe, kept), Some(&over))?;
         let Some(output) = output else {
-            return Err(GitError::Failed(over.line));
+            return Err(GitError::OverCap(over.line));
         };
         if !status.success() {
             return Err(GitError::Failed(failed_line(call, status.code(), &errors, &output)));
         }
-        String::from_utf8(output).map_err(|_| GitError::Failed("git's output is not valid UTF-8".to_owned()))
+        Ok(output)
     }
 
     /// git asked about `folder` alone, as every call starts it: the location and config variables removed, `-C
@@ -395,8 +412,9 @@ fn is_indexed_config(name: &str) -> bool {
 }
 
 /// git's exit code once it ends, or [`GitError::Interrupted`] when that is a Ctrl+C's with the console interrupt
-/// raised. Past `deadline` its job is ended and the call fails, as it does once its reader saw more of its output than
-/// `over` allows; a console interrupt raised while it runs ends its job as [`GitError::Interrupted`].
+/// raised. Past `deadline` its job is ended and the call fails; once its reader saw more of its output than `over`
+/// allows, its job is ended and the call is an over-cap call, whether git had ended of it or not; a console interrupt
+/// raised while it runs ends its job as [`GitError::Interrupted`].
 fn waited(running: &Running, job: &Job, call: &Call<'_>, over: Option<&Over>, deadline: Instant) -> Result<u32, GitError> {
     loop {
         if call.interrupt.is_some_and(Interrupt::is_raised) {
@@ -406,7 +424,7 @@ fn waited(running: &Running, job: &Job, call: &Call<'_>, over: Option<&Over>, de
             });
         }
         if let Some(over) = over.filter(|over| over.seen.load(Ordering::Acquire)) {
-            return Err(stopped(over.line.clone(), running, job));
+            return Err(stopped(over.line.clone(), GitError::OverCap, running, job));
         }
         if let Some(code) = running
             .wait(GIT_POLL)
@@ -415,7 +433,7 @@ fn waited(running: &Running, job: &Job, call: &Call<'_>, over: Option<&Over>, de
             return exited(code, call);
         }
         if Instant::now() >= deadline {
-            return Err(stopped(late_git_line(call.limit), running, job));
+            return Err(stopped(late_git_line(call.limit), GitError::Failed, running, job));
         }
     }
 }
@@ -439,10 +457,12 @@ fn with_job_ended(error: GitError, job: &Job) -> GitError {
     }
 }
 
-/// The failure `why` of a call whose job is ended now, with why it could not be when it could not.
-fn stopped(why: String, running: &Running, job: &Job) -> GitError {
+/// The end `why` of a call whose job is ended now, built by `end`: [`GitError::OverCap`] for a call whose reader saw
+/// it pass its cap, [`GitError::Failed`] for one that outlived its limit. A job that cannot be ended says so beside
+/// `why`, whatever `end` is.
+fn stopped(why: String, end: fn(String) -> GitError, running: &Running, job: &Job) -> GitError {
     match ended(running, job) {
-        Ok(()) => GitError::Failed(why),
+        Ok(()) => end(why),
         Err(error) => GitError::Failed(format!("{why}, and could not be stopped: {error}")),
     }
 }
@@ -728,13 +748,40 @@ mod tests {
         assert!(text.starts_with(&escaped("\u{1b}")), "the cut starts at a whole escape: {start}");
     }
 
+    /// The over branch of the wait, the one that is not git's own exit, ends a call as over-cap too: here git writes
+    /// past a 1-byte cap, then blocks in a clean filter waiting for its go file, so the wait ends the call while git is
+    /// still running. `GIT_FLUSH` is what makes git write those lines before it blocks.
     #[test]
-    fn output_over_the_cap_fails_instead_of_reading_it_whole() {
+    fn an_over_cap_call_that_keeps_running_is_over_cap() {
+        let (root, pid_file, go) = slow_repository("git-over-cap");
+        let _removed = Removed(root.clone());
+        let _let_go = LetGo(&go);
+        let clean = waiting_filter(&pid_file, &go);
+        let args = ["-c", clean.as_str(), "add", "-A", "-v"];
+        let git = Git::find(&root).expect("git is found along PATH");
+        let call = Call {
+            set: &[("GIT_FLUSH", OsStr::new("1"))],
+            ..Call::plain(&root, &args, HANG_GUARD)
+        };
+
+        match git.output_within(&call, 1, ERRORS_KEPT) {
+            Err(GitError::OverCap(why)) => assert!(why.ends_with(": its output passed 1 bytes"), "{why}"),
+            other => panic!("a call whose reader saw it pass its cap is an over-cap call, whether or not git had ended: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn output_over_the_cap_is_over_cap_instead_of_reading_it_whole() {
         let (here, git) = this_checkout();
         let call = Call::plain(here, &["ls-files"], GIT_LIMIT);
         assert_eq!(
+            git.output_bytes(&call).expect("git lists its files"),
+            git.output(&call).expect("git lists its files, as text").into_bytes(),
+            "the bytes are what the text reads"
+        );
+        assert_eq!(
             git.output_within(&call, 64, ERRORS_KEPT),
-            Err(GitError::Failed(format!(
+            Err(GitError::OverCap(format!(
                 "git ls-files failed in {}: its output passed 64 bytes",
                 here.display()
             )))

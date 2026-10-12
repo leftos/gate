@@ -278,7 +278,7 @@ fn locked_call(attempt: &Attempt<'_, '_>, git: &Git, args: &[&str]) -> Result<St
 fn escaped_end(error: GitError) -> End {
     match error {
         GitError::Interrupted => End::Interrupted,
-        GitError::Failed(why) => End::Failed(escaped(&why)),
+        GitError::Failed(why) | GitError::OverCap(why) => End::Failed(escaped(&why)),
     }
 }
 

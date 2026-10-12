@@ -68,6 +68,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Outputs archive**: the `<key>-<nonce>.tar.zst` a routed run's changed output files travel in, its last member `.gate-outputs.json` listing the files before it.
 - **Outputs manifest**: the Manifest of the PC's files under a routed run's output globs, as the Rust client builds it before the run call and writes it as one line on that call's stdin, for the box to read.
 - **Outputs-pending marker**: the empty file `remote\<key>.outputs-pending` in the state root, written before a routed run's run call and removed only after an accepted `gate-remote-outputs: 0`; while it stands, the next run sends `OutputsFull`.
+- **Parity refusal**: the `parity` refusal of a routed run whose builder lacks the .NET SDK the snapshot needs (its `global.json` pin under the rollForward policy, or, with no pin, an SDK of this PC's newest major); the run goes local.
 - **Pause marker**: an empty file a gate under a parent gate's slot rewrites on every pass while it waits behind a critical request, which stops its parent's watchdog clocks for that time, the watchdog reading it on each sample; one older than 30 s is stale.
 - **Pipe-closed stop**: the box's stop of a job whose client's connection closed: `gate box run` terminates the job, waits for its processes and exits 255.
 - **Pool**: the set of slots of one kind (heavy, light, remote); pools never wait on each other.
@@ -91,6 +92,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Sample**: one reading of a running command taken every 5 s by the sampler: the system's CPU times, the job's CPU and pids, and the log's size, stamped `began` before its reads and `at` after them; the watchdog's clocks advance only by samples.
 - **Sampler**: the Win32 side of the watchdog that takes the samples; if one fails, the watch goes by wall time alone.
 - **Script word**: a command word holding a line break or one of `, ; " ' ) | & < >`, such as a script's text or a list; in it a path ends at white space, where in any other word a path runs through its spaces.
+- **SDK pin**: the `sdk` member of a snapshot's `global.json` (version, `rollForward` policy, `allowPrerelease`) that the parity check resolves against the builder's SDKs; one that cannot be read leaves only the SDK major to check.
 - **Shadow end**: the expected end of the slowest gate a critical drain waits on, which closes the lent window.
 - **Shared compiler server**: a compiler server (`VBCSCompiler`) already running when the command started; its CPU counts as the command's progress only while the job holds a build client.
 - **Shim**: either an extensionless script on PATH, such as the bash shims a plugin puts ahead of `uv` and `python`, which program resolution skips since Windows cannot start it; or the repo-owned PowerShell script (`remote-bridge.ps1`) the **Bridge** runs, which dot-sources `remote.ps1` and calls its `Invoke-RemoteCommand`.

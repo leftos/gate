@@ -4,6 +4,8 @@
 //! the case folder, each ssh call made through the `fake-ssh` stand-in (`--test-remote-ssh`) that a steps file drives.
 
 use std::collections::BTreeMap;
+use std::ffi::OsString;
+use std::fmt::Write as _;
 use std::fs;
 use std::hash::{DefaultHasher, Hasher};
 use std::io::ErrorKind;
@@ -813,6 +815,199 @@ fn a_box_of_another_version_is_not_routed() {
     let events = events(&case);
     assert_eq!(fallbacks(&events), ["version"]);
     assert_eq!(builder_ref(&case, &format!("refs/gate/{}", key_of(&events))), "", "nothing was pushed");
+}
+
+/// The line a run the builder lacks the toolchain for falls back under.
+const PARITY_LINE: &str = "gate: remote builder parity; running here";
+/// This PC's SDK list a parity case gives the client: a major no machine has.
+const LOCAL_SDKS: [&str; 2] = ["--test-local-sdks", "999.0.100"];
+
+/// A folder holding a `dotnet.cmd` that lists `versions` for `--list-sdks`, one to a line as dotnet does, and this
+/// PC's own `PATH` with it first and every folder holding a real `dotnet` dropped, so the builder's `dotnet` is this
+/// stub and no other: what a case that fixes the SDKs the builder serves passes to its run.
+fn box_path_with_dotnet(case: &Case, versions: &[&str]) -> OsString {
+    let stub = case.folder().join("ssh").join("stub-dotnet");
+    fs::create_dir_all(&stub).expect("the stub's folder can be made");
+    let mut listed = String::new();
+    for version in versions {
+        write!(listed, "echo {version} [C:\\stub]\r\n").expect("a String writes");
+    }
+    fs::write(stub.join("dotnet.cmd"), format!("@echo off\r\n{listed}")).expect("the stub dotnet can be written");
+    let own = std::env::var_os("PATH").expect("PATH is set");
+    let without_dotnet = std::env::split_paths(&own).filter(|folder| !holds_dotnet(folder));
+    std::env::join_paths(std::iter::once(stub).chain(without_dotnet)).expect("the folders join into a PATH")
+}
+
+/// Whether `folder` holds a `dotnet` under any of the extensions a `PATHEXT` search tries, so [`box_path_with_dotnet`]
+/// drops it.
+fn holds_dotnet(folder: &Path) -> bool {
+    ["exe", "cmd", "bat", "com"]
+        .iter()
+        .any(|extension| folder.join(format!("dotnet.{extension}")).is_file())
+}
+
+/// A routed run of a case whose tree the builder lacks the toolchain for, the client given `extra`: it falls back
+/// `parity` after the preflight alone, so nothing is pushed, says `need` in the mismatch line on the console and in the
+/// log, and runs the command here once.
+fn a_parity_refusal(case: &Case, extra: &[&str], need: &str, box_path: Option<&OsString>) -> Outcome {
+    let steps = ssh_steps(case, "ssh", &["ok", "ok"]);
+    let tuned = Tuned { extra, ..Tuned::default() };
+    let command = [r".\tool.exe", "mark", RAN, "out", "ran"];
+
+    let mut gate = client_gate_tuned(case, "out.log", &steps, &tuned, &command);
+    if let Some(path) = box_path {
+        gate.env("PATH", path);
+    }
+    let (pid, outcome) = finish_with_pid(gate);
+
+    assert_eq!(outcome.code, Some(0), "the run here passed: {outcome:?}");
+    let events = own(case, pid);
+    assert_eq!(fallbacks(&events), ["parity"], "{outcome:?}");
+    let repo = repo_name(&case.folder().file_name().expect("the case folder has a name").to_string_lossy());
+    let mismatch = format!("gate: remote toolchain mismatch: {repo} needs {need}; builder has ");
+    assert!(outcome.stderr.contains(&mismatch), "{mismatch}: {outcome:?}");
+    assert!(outcome.stderr.contains(PARITY_LINE), "{outcome:?}");
+    let log = fs::read_to_string(case.folder().join("out.log")).expect("the log was written");
+    assert!(log.contains(&mismatch), "{mismatch}: {log}");
+    assert_eq!(calls(&steps), ["preflight"], "the preflight alone reached the builder");
+    assert_eq!(builder_ref(case, &format!("refs/gate/{}", key_of(&events))), "", "nothing was pushed");
+    assert_eq!(runs(case), (1, 0), "the command ran once, here: {outcome:?}");
+    outcome
+}
+
+/// A root `global.json` named in another letter case is the file dotnet reads, as Windows opens it: its pin is read,
+/// so the mismatch line names the pin and not the major.
+#[test]
+fn a_global_json_named_in_another_case_is_read() {
+    let case = client_case("client-parity-global-case");
+    write(&case, "Global.json", r#"{"sdk": {"version": "999.0.0"}}"#);
+    write(&case, "src/App/App.csproj", "<Project />\n");
+
+    let outcome = a_parity_refusal(&case, &[], ".NET SDK 999.0.0 (rollForward patch)", None);
+
+    assert!(!outcome.stderr.contains("gate: global.json has no readable sdk pin"), "{outcome:?}");
+}
+
+#[test]
+fn a_pin_no_builder_sdk_serves_falls_back_parity_before_the_push() {
+    let case = client_case("client-parity-pin");
+    write(&case, "global.json", r#"{"sdk": {"version": "999.0.0"}}"#);
+    let box_path = box_path_with_dotnet(&case, &["8.0.404"]);
+
+    let outcome = a_parity_refusal(&case, &[], ".NET SDK 999.0.0 (rollForward patch)", Some(&box_path));
+
+    let repo = repo_name(&case.folder().file_name().expect("the case folder has a name").to_string_lossy());
+    let line = format!("gate: remote toolchain mismatch: {repo} needs .NET SDK 999.0.0 (rollForward patch); builder has 8.0.404");
+    assert!(outcome.stderr.lines().any(|said| said == line), "{line}: {outcome:?}");
+    assert!(!outcome.stderr.contains("gate: global.json has no readable sdk pin"), "{outcome:?}");
+}
+
+/// The builder serves the pin the worktree names: its own stub `dotnet` lists it, so the parity check passes and the
+/// run goes remote. A second run of the worktree whose builder lists another SDK is refused, which only a check that
+/// read the builder's SDK line shows.
+#[test]
+fn a_pin_the_builder_serves_goes_remote() {
+    let case = client_case("client-parity-served");
+    write(&case, "global.json", r#"{"sdk": {"version": "999.0.100"}}"#);
+    write(&case, "src/App/App.csproj", "<Project />\n");
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+    let mut gate = client_gate(&case, "out.log", &steps, &[r".\tool.exe", "mark", RAN, "out", "ran there"]);
+    gate.env("PATH", box_path_with_dotnet(&case, &["999.0.100"]));
+
+    let (pid, outcome) = finish_with_pid(gate);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(outcome.stdout.contains("ran there"), "{outcome:?}");
+    assert!(!outcome.stderr.contains("gate: remote toolchain mismatch: "), "{outcome:?}");
+    assert!(!outcome.stderr.contains(PARITY_LINE), "{outcome:?}");
+    let events = own(&case, pid);
+    assert_eq!(fallbacks(&events), Vec::<&str>::new(), "{events:#?}");
+    assert_eq!(calls(&steps), ["preflight", "run"]);
+    assert!(
+        is_sha(&builder_ref(&case, &format!("refs/gate/{}", key_of(&events)))),
+        "the snapshot was pushed"
+    );
+    assert_eq!(runs(&case), (0, 1), "the command ran once, on the builder: {outcome:?}");
+
+    let other = ssh_steps(&case, "other", &["ok", "ok"]);
+    let mut other_gate = client_gate(&case, "other.log", &other, &[r".\tool.exe", "out", "ran here"]);
+    other_gate.env("PATH", box_path_with_dotnet(&case, &["8.0.404"]));
+    let (other_pid, refused) = finish_with_pid(other_gate);
+
+    assert_eq!(refused.code, Some(0), "{refused:?}");
+    assert_eq!(fallbacks(&own(&case, other_pid)), ["parity"], "{refused:?}");
+    assert!(refused.stderr.contains(PARITY_LINE), "{refused:?}");
+    let repo = repo_name(&case.folder().file_name().expect("the case folder has a name").to_string_lossy());
+    let line = format!("gate: remote toolchain mismatch: {repo} needs .NET SDK 999.0.100 (rollForward patch); builder has 8.0.404");
+    assert!(refused.stderr.lines().any(|said| said == line), "{line}: {refused:?}");
+    assert_eq!(calls(&other), ["preflight"], "the preflight alone reached the builder");
+}
+
+#[test]
+fn a_dotnet_tree_without_a_pin_needs_the_pcs_newest_major() {
+    let case = client_case("client-parity-major");
+    write(&case, "src/App/App.csproj", "<Project />\n");
+
+    let outcome = a_parity_refusal(&case, &LOCAL_SDKS, "a .NET 999 SDK", None);
+
+    assert!(
+        !outcome.stderr.contains("gate: global.json has no readable sdk pin"),
+        "no global.json: {outcome:?}"
+    );
+}
+
+#[test]
+fn a_global_json_without_a_readable_pin_checks_the_major_only() {
+    let case = client_case("client-parity-no-pin");
+    write(&case, "global.json", r#"{"test": {"runner": "Microsoft.Testing.Platform"}}"#);
+
+    let outcome = a_parity_refusal(&case, &LOCAL_SDKS, "a .NET 999 SDK", None);
+
+    let no_pin = "gate: global.json has no readable sdk pin; checking the SDK major only";
+    let (said, mismatch) = (outcome.stderr.find(no_pin), outcome.stderr.find("gate: remote toolchain mismatch: "));
+    assert!(said.is_some() && said < mismatch, "the no-pin line, then the mismatch: {outcome:?}");
+}
+
+/// A `global.json` that is not UTF-8 is read lossily, and the byte that could not be read is no readable pin: the
+/// no-pin line, then the major rule.
+#[test]
+fn a_global_json_that_is_not_utf8_checks_the_major_only() {
+    let case = client_case("client-parity-not-utf8");
+    write(&case, "src/App/App.csproj", "<Project />\n");
+    let mut global_json = b"{\"sdk\":{\"version\":\"9".to_vec();
+    global_json.push(0xff);
+    global_json.extend_from_slice(b"\"}}");
+    fs::write(case.folder().join("global.json"), global_json).expect("the global.json can be written");
+
+    let outcome = a_parity_refusal(&case, &LOCAL_SDKS, "a .NET 999 SDK", None);
+
+    let no_pin = "gate: global.json has no readable sdk pin; checking the SDK major only";
+    let (said, mismatch) = (outcome.stderr.find(no_pin), outcome.stderr.find("gate: remote toolchain mismatch: "));
+    assert!(said.is_some() && said < mismatch, "the no-pin line, then the mismatch: {outcome:?}");
+}
+
+#[test]
+fn a_tree_that_is_not_dotnet_skips_the_parity_check() {
+    let case = client_case("client-parity-not-dotnet");
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+    let tuned = Tuned {
+        extra: &LOCAL_SDKS,
+        ..Tuned::default()
+    };
+
+    let (pid, outcome) = finish_with_pid(client_gate_tuned(
+        &case,
+        "out.log",
+        &steps,
+        &tuned,
+        &[r".\tool.exe", "mark", RAN, "out", "ran"],
+    ));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(!outcome.stderr.contains("gate: remote toolchain mismatch: "), "{outcome:?}");
+    assert_eq!(fallbacks(&own(&case, pid)), Vec::<&str>::new(), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "run"]);
+    assert_eq!(runs(&case), (0, 1), "the command ran once, on the builder: {outcome:?}");
 }
 
 #[test]
