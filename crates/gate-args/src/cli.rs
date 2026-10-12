@@ -204,6 +204,7 @@ fn seam_option(name: &str) -> Option<RunOption> {
         "test-remote-timeout-ms" => Some(RunOption::Value(ValueOption::RemoteTimeoutMs)),
         "test-local-sdks" => Some(RunOption::Value(ValueOption::LocalSdks)),
         "test-remote-fetch-cap-bytes" => Some(RunOption::Value(ValueOption::RemoteFetchCapBytes)),
+        "test-remote-apply-cap-bytes" => Some(RunOption::Value(ValueOption::RemoteApplyCapBytes)),
         "test-remote-script" => Some(RunOption::Value(ValueOption::RemoteScript)),
         "test-bridge-pwsh" => Some(RunOption::Value(ValueOption::BridgePwsh)),
         _ => None,

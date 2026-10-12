@@ -2,13 +2,14 @@
 //! kill-on-close job of its own, and ended with that job; and how long a killed call and its readers are waited for.
 
 use std::ffi::OsString;
+use std::fs::File;
 use std::io;
 use std::os::windows::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 
-use gate_win32::{EnvironmentBlock, Job, PipedConsole, PipedLaunch, same_variable_name};
+use gate_win32::{EnvironmentBlock, Job, LaunchError, PipedConsole, PipedFed, PipedLaunch, PipedSuspended, Suspended, same_variable_name};
 
 /// The status of a call the client killed, and of a run whose run call the watchdog killed; the exit code a killed
 /// call's job ends its processes with.
@@ -48,6 +49,22 @@ pub(super) fn piped_launch(command: &Command, console: PipedConsole) -> io::Resu
         environment: EnvironmentBlock::new(environment_of(command))?,
         console,
     })
+}
+
+/// `launch` created suspended within `job`: the process, the read ends of its stdout and stderr, and the write end of
+/// its stdin when `fed`, else `None` and its stdin `NUL`.
+pub(super) fn launched(launch: &PipedLaunch, job: &Job, fed: bool) -> Result<(Suspended, File, File, Option<File>), LaunchError> {
+    if fed {
+        let PipedFed {
+            suspended,
+            stdin,
+            stdout,
+            stderr,
+        } = launch.start_suspended_within_fed(job)?;
+        return Ok((suspended, stdout, stderr, Some(stdin)));
+    }
+    let PipedSuspended { suspended, stdout, stderr } = launch.start_suspended_within(job)?;
+    Ok((suspended, stdout, stderr, None))
 }
 
 /// This process's environment with `command`'s changes: each variable it sets replaces the one of its name, and each

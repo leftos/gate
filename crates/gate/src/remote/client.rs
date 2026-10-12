@@ -29,14 +29,12 @@ use std::time::{Duration, Instant};
 
 use gate_args::RunRequest;
 use gate_state::{FallbackReason, KernelObject, key_hash};
-use gate_win32::{
-    AcquireError, Interrupt, Job, LaunchError, NamedMutex, OwnedMutexGuard, PipedConsole, PipedFed, PipedLaunch, PipedSuspended, Running, Suspended,
-};
+use gate_win32::{AcquireError, Interrupt, Job, NamedMutex, OwnedMutexGuard, PipedConsole, Running};
 use jiff::{SignedDuration, Timestamp};
 use regex::Regex;
 
 use super::git::{self, Git, GitError, last_update};
-use super::launch::{DRAIN, KILL_WAIT, KILLED, call_job, piped_launch};
+use super::launch::{DRAIN, KILL_WAIT, KILLED, call_job, launched, piped_launch};
 use super::outputs;
 use super::parity;
 use super::payload::{self, Location, RunCall};
@@ -99,6 +97,9 @@ pub(crate) struct RustClient {
     local_sdks: Option<String>,
     /// The most bytes the job of the sync-back's fetch may write: `--test-remote-fetch-cap-bytes`, else 4 GiB.
     fetch_cap: u64,
+    /// The most bytes the files a back commit writes into the worktree may total: `--test-remote-apply-cap-bytes`,
+    /// else 4 GiB.
+    apply_cap: u64,
 }
 
 impl RustClient {
@@ -122,6 +123,7 @@ impl RustClient {
             interrupt_at: seams.remote_interrupt_at.clone(),
             local_sdks: seams.local_sdks.clone(),
             fetch_cap: seams.remote_fetch_cap_bytes.unwrap_or(watchdog::FETCH_CAP),
+            apply_cap: seams.remote_apply_cap_bytes.unwrap_or(watchdog::APPLY_CAP),
         })
     }
 }
@@ -178,6 +180,7 @@ impl RemoteClient for RustClient {
             interrupt_at: self.interrupt_at.as_deref(),
             local_sdks: self.local_sdks.as_deref(),
             fetch_cap: self.fetch_cap,
+            apply_cap: self.apply_cap,
             lines: Vec::new(),
             problem: None,
         };
@@ -391,6 +394,8 @@ pub(super) struct Attempt<'c, 'a> {
     local_sdks: Option<&'c str>,
     /// The most bytes the job of the sync-back's fetch may write.
     pub(super) fetch_cap: u64,
+    /// The most bytes the files a back commit writes into the worktree may total.
+    pub(super) apply_cap: u64,
     lines: Vec<String>,
     problem: Option<String>,
 }
@@ -1063,6 +1068,7 @@ impl<'c, 'a> Attempt<'c, 'a> {
             interrupt_at: None,
             local_sdks: None,
             fetch_cap: watchdog::FETCH_CAP,
+            apply_cap: watchdog::APPLY_CAP,
             lines: Vec::new(),
             problem: None,
         }
@@ -1287,22 +1293,6 @@ struct CallOnly {
 pub(super) struct RawSink {
     pub(super) file: File,
     pub(super) shown: String,
-}
-
-/// `launch` created suspended within `job`: the process, the read ends of its stdout and stderr, and the write end of
-/// its stdin when `fed`, else `None` and its stdin `NUL`.
-fn launched(launch: &PipedLaunch, job: &Job, fed: bool) -> Result<(Suspended, File, File, Option<File>), LaunchError> {
-    if fed {
-        let PipedFed {
-            suspended,
-            stdin,
-            stdout,
-            stderr,
-        } = launch.start_suspended_within_fed(job)?;
-        return Ok((suspended, stdout, stderr, Some(stdin)));
-    }
-    let PipedSuspended { suspended, stdout, stderr } = launch.start_suspended_within(job)?;
-    Ok((suspended, stdout, stderr, None))
 }
 
 /// Writes `input` to a call's `stdin` on a thread of its own, then closes it. A write that fails, as one to a call that
@@ -2000,6 +1990,7 @@ mod tests {
             interrupt_at: None,
             local_sdks: None,
             fetch_cap: watchdog::FETCH_CAP,
+            apply_cap: watchdog::APPLY_CAP,
             lines: Vec::new(),
             problem: None,
         }

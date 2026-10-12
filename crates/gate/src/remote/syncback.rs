@@ -1,11 +1,12 @@
 //! The client's sync-back: after a run call that ended with the command's own status, the changes the command left on
 //! the builder are fetched from `refs/gate-back/<key>` and applied to the worktree when it still matches the snapshot.
 //! The builder is trusted less than this PC. A fetched commit that is not the one the builder advertised, or that was
-//! not made from this snapshot, is ignored. One that touches a `.git*` path or makes a link or a submodule, or one the
-//! worktree changed under during the run, is kept at `refs/gate-remote/<key>-back` and fails a run that had passed;
-//! one that a step before its apply could not take further, as it failed or was interrupted, is kept there too, and
-//! the line that ends the run says where to see its changes. A fetch whose job writes more than the fetch cap is
-//! stopped and fails a run that had passed, the changes left on the builder and nothing applied.
+//! not made from this snapshot, is ignored. One that touches a `.git*` path or makes a link or a submodule, one whose
+//! files would write more than the apply cap into the worktree, or one the worktree changed under during the run, is
+//! kept at `refs/gate-remote/<key>-back` and fails a run that had passed; one that a step before its apply could not
+//! take further, as it failed or was interrupted, is kept there too, and the line that ends the run says where to see
+//! its changes. A fetch whose job writes more than the fetch cap is stopped and fails a run that had passed, the
+//! changes left on the builder and nothing applied.
 //! The two git calls that reach the builder take the pre-banner retry and keep their lines out of the log; any other
 //! git failure is the run's, status 1 and `gate: the remote run failed: ...`, with no fallback. Every name and git line
 //! said here has its control characters escaped.
@@ -32,6 +33,8 @@ const PATCH: &str = "gate-remote-";
 const PATCH_SUFFIX: &str = ".patch";
 /// The modes of a symbolic link and of a submodule, which no entry of a back commit may take.
 const LINK_MODES: [&str; 2] = ["120000", "160000"];
+/// What the mode of a regular or executable file starts with.
+const REGULAR_MODE: &str = "100";
 /// What the name of a path's component starts with, its letter case aside, when git reads the file itself.
 const GIT_NAME: &str = ".git";
 
@@ -254,9 +257,10 @@ fn made_from(attempt: &Attempt<'_, '_>, git: &Git, back: &str, snapshot: &str) -
     Ok(from_snapshot(&parents, snapshot))
 }
 
-/// Applies the back commit `back`, or keeps it when it touches what a sync-back never writes or the worktree no longer
-/// matches the snapshot. A step that fails or is interrupted before the patch applied keeps it as well, so its changes
-/// are not lost; a patch that applied but cannot be removed then fails the run with nothing kept.
+/// Applies the back commit `back`, or keeps it when it touches what a sync-back never writes, its files would write
+/// more than the apply cap into the worktree, or the worktree no longer matches the snapshot. A step that fails or is
+/// interrupted before the patch applied keeps it as well, so its changes are not lost; a patch that applied but cannot
+/// be removed then fails the run with nothing kept.
 fn receive(attempt: &mut Attempt<'_, '_>, git: &Git, snapshot: &Snapshot, back: &str, status: i64) -> Result<End, End> {
     let commit = snapshot.commit.as_str();
     let refused = refusal(attempt, git, snapshot, back).map_err(|failed| kept_after(attempt, git, commit, back, failed))?;
@@ -272,13 +276,108 @@ fn receive(attempt: &mut Attempt<'_, '_>, git: &Git, snapshot: &Snapshot, back: 
 }
 
 /// Why `back` is kept rather than applied: the line said for a back commit that touches what a sync-back never writes,
-/// or for one the worktree changed under during the run; `None` when it may be applied.
+/// for one whose files would write more than the apply cap into the worktree, or for one the worktree changed under
+/// during the run; `None` when it may be applied.
 fn refusal(attempt: &Attempt<'_, '_>, git: &Git, snapshot: &Snapshot, back: &str) -> Result<Option<String>, End> {
     let listing = git_call(attempt, git, &["diff-tree", "-r", "-z", "--raw", &snapshot.commit, back])?;
-    Ok(match forbidden(&listing) {
-        Some(path) => Some(touched_line(&path, &snapshot.commit, back)),
-        None if changed(attempt, git, snapshot)? => Some(not_applied_line(&snapshot.commit, back)),
-        None => None,
+    if let Some(path) = forbidden(&listing) {
+        return Ok(Some(touched_line(&path, &snapshot.commit, back)));
+    }
+    let size = written_size(attempt, git, &listing)?;
+    if let Some(line) = written_line(size, attempt.apply_cap, &snapshot.commit, back) {
+        return Ok(Some(line));
+    }
+    Ok(changed(attempt, git, snapshot)?.then(|| not_applied_line(&snapshot.commit, back)))
+}
+
+/// The bytes the files the back commit's `diff-tree -r -z --raw` `listing` writes total, each path counted: the sizes
+/// of their blobs, asked of one `git cat-file --batch-check=%(objectsize)` fed their ids. An answer that is not a size
+/// for each of them is the run's failure.
+fn written_size(attempt: &Attempt<'_, '_>, git: &Git, listing: &str) -> Result<u64, End> {
+    let blobs = written_blobs(listing);
+    if blobs.is_empty() {
+        return Ok(0);
+    }
+    let ids: String = blobs.iter().flat_map(|id| [*id, "\n"]).collect();
+    let args = ["cat-file", "--batch-check=%(objectsize)"];
+    let call = git::Call {
+        interrupt: attempt.call.interrupt,
+        stdin: Some(ids.as_bytes()),
+        ..git::Call::plain(Path::new(attempt.call.root), &args, attempt.limit)
+    };
+    let answer = git.output(&call).map_err(escaped_end)?;
+    total(&answer, &blobs).map_err(|why| escaped_end(GitError::Failed(format!("git {} failed in {}: {why}", args.join(" "), attempt.call.root))))
+}
+
+/// The blob ids of the files a back commit's `diff-tree -r -z --raw` `listing` writes, one per path in the listing's
+/// order: each path it adds or changes to a regular or executable file, so a blob two paths share is written, and
+/// counted, twice. A deletion, whose new id is all zeros, writes nothing.
+fn written_blobs(listing: &str) -> Vec<&str> {
+    entries(listing)
+        .into_iter()
+        .filter(|entry| entry.new_mode.starts_with(REGULAR_MODE) && !entry.new_id.bytes().all(|digit| digit == b'0'))
+        .map(|entry| entry.new_id)
+        .collect()
+}
+
+/// One entry of a `diff-tree -r -z --raw` listing: the mode and the blob id it gives its path, each empty when its
+/// header lacks them, and the path it names, or a rename's or a copy's source and destination.
+struct Entry<'a> {
+    new_mode: &'a str,
+    new_id: &'a str,
+    paths: Vec<&'a str>,
+}
+
+/// The entries of a `diff-tree -r -z --raw` `listing`, in its order: each header field, `:` and its words, is followed
+/// by as many path fields as its change names, which are read as paths whatever they start with.
+fn entries(listing: &str) -> Vec<Entry<'_>> {
+    let mut entries = Vec::new();
+    let mut fields = listing.split('\0');
+    while let Some(field) = fields.next() {
+        let Some(meta) = field.strip_prefix(':') else {
+            continue;
+        };
+        let words: Vec<&str> = meta.split(' ').collect();
+        // A rename or a copy names its source and its destination; a plain change names one path.
+        let count = if words.get(4).is_some_and(|change| change.starts_with(['R', 'C'])) {
+            2
+        } else {
+            1
+        };
+        entries.push(Entry {
+            new_mode: words.get(1).copied().unwrap_or_default(),
+            new_id: words.get(3).copied().unwrap_or_default(),
+            paths: fields.by_ref().take(count).collect(),
+        });
+    }
+    entries
+}
+
+/// The bytes the blobs `blobs` total, from `cat-file --batch-check=%(objectsize)`'s `answer`, one line for each in
+/// their order, summed up to `u64::MAX` at most; else why the answer cannot be read: a line that is not a size, as
+/// `<id> missing` is not, or a line count other than the blobs'.
+fn total(answer: &str, blobs: &[&str]) -> Result<u64, String> {
+    let lines: Vec<&str> = answer.lines().collect();
+    if lines.len() != blobs.len() {
+        return Err(format!("it answered {} line(s) for {} object(s)", lines.len(), blobs.len()));
+    }
+    lines.iter().zip(blobs).try_fold(0_u64, |sum, (line, id)| {
+        line.parse::<u64>()
+            .map(|size| sum.saturating_add(size))
+            .map_err(|_| format!("it answered '{line}' for {id}"))
+    })
+}
+
+/// The line said for a back commit whose files would write `size` bytes into the worktree, more than the `cap` a
+/// sync-back writes; `None` when they write no more than it.
+fn written_line(size: u64, cap: u64, snapshot: &str, back: &str) -> Option<String> {
+    (size > cap).then(|| {
+        format!(
+            "gate: remote changes not applied: they would write {} into the worktree, more than {}; {}",
+            watchdog::size(size),
+            watchdog::size(cap),
+            see_diff(snapshot, back)
+        )
     })
 }
 
@@ -443,24 +542,10 @@ fn advertised(lines: &[String], reference: &str) -> Option<String> {
 /// component whose name starts with `.git`, its letter case aside, or one the back commit makes a symbolic link or a
 /// submodule. `None` when every path may be written.
 fn forbidden(listing: &str) -> Option<String> {
-    let mut fields = listing.split('\0');
-    while let Some(field) = fields.next() {
-        let Some(meta) = field.strip_prefix(':') else {
-            continue;
-        };
-        let words: Vec<&str> = meta.split(' ').collect();
-        let link = words.get(1).is_some_and(|mode| LINK_MODES.contains(mode));
-        // A rename or a copy names its source and its destination; a plain change names one path.
-        let paths = if words.get(4).is_some_and(|change| change.starts_with(['R', 'C'])) {
-            2
-        } else {
-            1
-        };
-        if let Some(path) = fields.by_ref().take(paths).find(|path| link || is_git_s(path)) {
-            return Some(path.to_owned());
-        }
-    }
-    None
+    entries(listing).into_iter().find_map(|entry| {
+        let link = LINK_MODES.contains(&entry.new_mode);
+        entry.paths.into_iter().find(|path| link || is_git_s(path)).map(str::to_owned)
+    })
 }
 
 /// Whether `path` has a component whose name starts with `.git`, its letter case aside.
@@ -548,8 +633,8 @@ mod tests {
     use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
 
     use super::{
-        FETCH_WORDS, Remote, advertised, after_keep, fetch, forbidden, from_snapshot, has_back, ignored_line, not_applied_line, remove_new_tmp_packs,
-        see_diff, synced_line, tmp_packs, touched_line,
+        FETCH_WORDS, Remote, advertised, after_keep, entries, fetch, forbidden, from_snapshot, has_back, ignored_line, not_applied_line,
+        remove_new_tmp_packs, see_diff, synced_line, tmp_packs, total, touched_line, written_blobs, written_line,
     };
     use crate::boxside::payload::escaped;
     use crate::remote::RemoteCall;
@@ -826,6 +911,86 @@ mod tests {
             entry("000000", "100644", "A", &[".gitignore"])
         );
         assert_eq!(forbidden(&first), Some("one".to_owned()), "the first path it names");
+    }
+
+    /// One entry of `diff-tree -r -z --raw` whose new blob is `new_id`: its modes, its change and its paths.
+    fn written_entry(old: &str, new: &str, new_id: &str, change: &str, paths: &[&str]) -> String {
+        let mut text = format!(":{old} {new} {SNAPSHOT} {new_id} {change}\0");
+        for path in paths {
+            text.push_str(path);
+            text.push('\0');
+        }
+        text
+    }
+
+    #[test]
+    fn a_back_commit_counts_each_path_it_writes_and_nothing_it_deletes() {
+        let shared = "1111111111111111111111111111111111111111";
+        let other = "2222222222222222222222222222222222222222";
+        let zeros = "0000000000000000000000000000000000000000";
+        let listing = [
+            written_entry("000000", "100644", shared, "A", &["a.bin"]),
+            written_entry("000000", "100755", shared, "A", &["run.sh"]),
+            written_entry("100644", "100644", other, "M", &["c.txt"]),
+            written_entry("100644", "000000", zeros, "D", &["gone.txt"]),
+            written_entry("100644", "100644", other, "R100", &[":100644 100644 x y A", "renamed.txt"]),
+        ]
+        .concat();
+
+        let blobs = written_blobs(&listing);
+
+        assert_eq!(blobs, [shared, shared, other, other], "per path, the deletion left out");
+        assert_eq!(total("5\n5\n7\n7\n", &blobs), Ok(24), "a blob two paths share counts twice");
+        assert_eq!(written_blobs(""), Vec::<&str>::new(), "no change writes nothing");
+        assert_eq!(total("", &[]), Ok(0));
+        assert_eq!(
+            total("18446744073709551615\n1\n", &[shared, other]),
+            Ok(u64::MAX),
+            "the sum stops at the most a u64 holds"
+        );
+    }
+
+    /// A path field is read by its entry's count, so a name that starts with `:` and looks like a header is a path: the
+    /// first entry writes that name, and the next real entry's link is still seen.
+    #[test]
+    fn a_path_that_looks_like_a_header_is_read_as_a_path() {
+        let zeros = "0000000000000000000000000000000000000000";
+        let first = "1111111111111111111111111111111111111111";
+        let second = "2222222222222222222222222222222222222222";
+        let crafted = ":000000 120000 aaaa bbbb A";
+        let listing = format!(":000000 100644 {zeros} {first} A\0{crafted}\0:000000 120000 {zeros} {second} A\0evil\0");
+
+        let read = entries(&listing);
+
+        let paths: Vec<&[&str]> = read.iter().map(|entry| entry.paths.as_slice()).collect();
+        assert_eq!(paths, [&[crafted][..], &["evil"][..]]);
+        assert_eq!(forbidden(&listing), Some("evil".to_owned()), "the link the second entry makes");
+        assert_eq!(written_blobs(&listing), [first], "the crafted name is a file the first entry writes");
+    }
+
+    #[test]
+    fn an_answer_that_is_not_a_size_for_each_blob_is_never_a_size() {
+        let id = "1111111111111111111111111111111111111111";
+        assert_eq!(
+            total(&format!("{id} missing\n"), &[id]),
+            Err(format!("it answered '{id} missing' for {id}"))
+        );
+        assert_eq!(total("5\n", &[id, id]), Err("it answered 1 line(s) for 2 object(s)".to_owned()));
+        assert_eq!(total("5\n5\n", &[id]), Err("it answered 2 line(s) for 1 object(s)".to_owned()));
+        assert_eq!(total("-1\n", &[id]), Err(format!("it answered '-1' for {id}")));
+    }
+
+    #[test]
+    fn a_back_commit_that_writes_one_byte_past_the_cap_is_refused() {
+        assert_eq!(written_line(1_048_576, 1_048_576, SNAPSHOT, BACK), None, "the cap itself passes");
+        assert_eq!(
+            written_line(1_048_577, 1_048_576, SNAPSHOT, BACK).as_deref(),
+            Some("gate: remote changes not applied: they would write 1.0 MiB into the worktree, more than 1.0 MiB; see git diff b8a48121 8e8777a0")
+        );
+        assert_eq!(
+            written_line(8_388_608, 1_048_576, SNAPSHOT, BACK).as_deref(),
+            Some("gate: remote changes not applied: they would write 8.0 MiB into the worktree, more than 1.0 MiB; see git diff b8a48121 8e8777a0")
+        );
     }
 
     #[test]

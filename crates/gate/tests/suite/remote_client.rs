@@ -1183,6 +1183,78 @@ fn a_back_commit_under_the_fetch_cap_syncs_back() {
     assert_eq!(calls(&steps), ["preflight", "run"]);
 }
 
+/// The bytes of the file an apply-cap case's command writes on the box, all one byte, so its pack is a few KiB: 8 MiB.
+const FILL_BYTES: &str = "8388608";
+
+/// The box's command writes 8 MiB that pack to a few KiB, well under the fetch cap, and the sync-back may write 1 MiB
+/// into the worktree: the back commit is kept at the key's -back ref, no patch is made and nothing is written, and the
+/// passing run fails with the line saying how much the changes would write.
+#[test]
+fn a_back_commit_that_would_write_more_than_the_apply_cap_is_kept_and_fails_a_passing_run() {
+    let case = client_case("client-apply-over-cap");
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+    let before = porcelain(&case);
+    let tuned = Tuned {
+        extra: &["--test-remote-apply-cap-bytes", "1048576"],
+        ..Tuned::default()
+    };
+
+    let outcome = finish(client_gate_tuned(
+        &case,
+        "out.log",
+        &steps,
+        &tuned,
+        &[r".\tool.exe", "fill", "big.bin", FILL_BYTES],
+    ));
+
+    assert_eq!(outcome.code, Some(1), "a passing run becomes 1: {outcome:?}");
+    let events = events(&case);
+    let key = key_of(&events);
+    let back = builder_ref(&case, &format!("refs/gate-back/{key}"));
+    assert!(is_sha(&back), "the box wrote the back commit: {back:?}");
+    let line = format!(
+        "gate: remote changes not applied: they would write 8.0 MiB into the worktree, more than 1.0 MiB; see git diff {} {}",
+        pushed_snapshot(&case, "out.log"),
+        &back[..8]
+    );
+    assert!(outcome.stderr.lines().any(|said| said == line), "{outcome:?}");
+    assert_eq!(
+        git_out(&case, &[], &["rev-parse", &format!("refs/gate-remote/{key}-back")]),
+        back,
+        "the changes are kept at the key's -back ref"
+    );
+    assert!(!case.folder().join("big.bin").exists(), "the box's file is not here: {outcome:?}");
+    assert_eq!(porcelain(&case), before, "the worktree has no new file: {outcome:?}");
+    assert_eq!(patch_files(&case), Vec::<String>::new(), "no patch was made");
+    assert_eq!(fallbacks(&events), Vec::<&str>::new(), "the refusal is no fallback");
+    assert_eq!(calls(&steps), ["preflight", "run"]);
+}
+
+/// 1 KiB of the same byte under the same 1 MiB cap syncs back.
+#[test]
+fn a_back_commit_under_the_apply_cap_syncs_back() {
+    let case = client_case("client-apply-under-cap");
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+    let tuned = Tuned {
+        extra: &["--test-remote-apply-cap-bytes", "1048576"],
+        ..Tuned::default()
+    };
+
+    let outcome = finish(client_gate_tuned(
+        &case,
+        "out.log",
+        &steps,
+        &tuned,
+        &[r".\tool.exe", "fill", "small.bin", "1024"],
+    ));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(outcome.stderr.contains("gate: synced back 1 file(s): small.bin"), "{outcome:?}");
+    let synced = fs::metadata(case.folder().join("small.bin")).expect("the box's file is here").len();
+    assert_eq!(synced, 1024, "the whole file came back");
+    assert_eq!(calls(&steps), ["preflight", "run"]);
+}
+
 #[test]
 fn a_command_that_changes_nothing_syncs_nothing_back() {
     let case = client_case("client-nothing-back");

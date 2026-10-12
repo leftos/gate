@@ -18,6 +18,8 @@ const BYTES_KEPT: usize = 1024 * 1024;
 const LINES_KEPT: usize = 1000;
 /// The most bytes the job of the sync-back's fetch may write: 4 GiB.
 pub(super) const FETCH_CAP: u64 = 4 << 30;
+/// The most bytes the files a back commit writes into the worktree may total, each path counted: 4 GiB.
+pub(super) const APPLY_CAP: u64 = 4 << 30;
 
 /// Why the watchdog killed a call.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

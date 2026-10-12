@@ -5,7 +5,7 @@
 
 use std::ffi::OsStr;
 use std::fs::{File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
@@ -17,9 +17,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use gate_args::TestSeams;
-use gate_win32::{Interrupt, Job, PipedConsole, PipedSuspended, Running};
+use gate_win32::{Interrupt, Job, PipedConsole, Running};
 
-use super::launch::{DRAIN, KILL_WAIT, KILLED, call_job, piped_launch};
+use super::launch::{DRAIN, KILL_WAIT, KILLED, call_job, launched, piped_launch};
 use crate::boxside::payload::escaped;
 use crate::environment::Variables;
 use crate::run::{CONTROL_C_EXIT, find_program};
@@ -192,13 +192,13 @@ impl Git {
         command
     }
 
-    /// Runs git with `call`'s args and variables, created suspended with no standard input on the console `call`
-    /// names, and put in an anonymous kill-on-close job of its own before it runs; a thread per stream reads its
-    /// standard output with `stdout` and its standard error with `stderr`, and what they read is returned with its
-    /// exit status once it has exited. Whatever git left running then is ended with its job. A call made while the
-    /// console interrupt is already raised starts no process; one whose wait ends otherwise than in git's exit (it
-    /// outlived its limit, was interrupted, wrote more than `over` allows, or could not be waited for) has its whole
-    /// job ended.
+    /// Runs git with `call`'s args and variables, created suspended on the console `call` names with no standard input,
+    /// or with `call`'s input fed by a thread of its own and then closed, and put in an anonymous kill-on-close job of
+    /// its own before it runs; a thread per stream reads its standard output with `stdout` and its standard error with
+    /// `stderr`, and what they read is returned with its exit status once it has exited. Whatever git left running then
+    /// is ended with its job. A call made while the console interrupt is already raised starts no process; one whose
+    /// wait ends otherwise than in git's exit (it outlived its limit, was interrupted, wrote more than `over` allows, or
+    /// could not be waited for) has its whole job ended.
     fn spawned<O, E>(
         &self,
         call: &Call<'_>,
@@ -222,14 +222,16 @@ impl Git {
         let cannot_run = |error: &dyn std::fmt::Display| GitError::Failed(format!("cannot run git: {error}"));
         let job = call_job(false).map_err(|error| cannot_run(&error))?;
         let launch = piped_launch(&command, call.console).map_err(|error| cannot_run(&error))?;
-        let PipedSuspended {
-            suspended,
-            stdout: out_pipe,
-            stderr: err_pipe,
-        } = launch.start_suspended_within(&job).map_err(|error| cannot_run(&error))?;
+        let (suspended, out_pipe, err_pipe, in_pipe) = launched(&launch, &job, call.stdin.is_some()).map_err(|error| cannot_run(&error))?;
         let running = suspended.assign_and_resume(&job).map_err(|error| cannot_run(&error))?;
         let output = reading(out_pipe, stdout);
         let errors = reading(err_pipe, stderr);
+        // The feed writes on a thread of its own so this thread keeps watching the limit, the interrupt and the output
+        // cap: a git that stops reading its input would block the write forever, and its limit would never fire.
+        let fed = in_pipe.zip(call.stdin).map(|(pipe, bytes)| {
+            let bytes = bytes.to_vec();
+            reading(pipe, move |mut pipe: File| pipe.write_all(&bytes))
+        });
         let code = match waited(&running, &job, call, over, deadline) {
             Ok(code) => code,
             Err(error) => {
@@ -254,7 +256,26 @@ impl Git {
         let output = received(&output, until).ok_or_else(unread)?;
         let errors = received(&errors, until).ok_or_else(unread)?;
         let cannot_read = |error: io::Error| GitError::Failed(format!("cannot read git's output: {error}"));
-        Ok((ExitStatus::from_raw(code), output.map_err(cannot_read)?, errors.map_err(cannot_read)?))
+        let status = ExitStatus::from_raw(code);
+        fed_whole(fed.as_ref(), status, until)?;
+        Ok((status, output.map_err(cannot_read)?, errors.map_err(cannot_read)?))
+    }
+}
+
+/// Whether git, which exited with `status`, was fed its whole input by `fed`, waited for until `until`: a git that
+/// failed says why in its own lines, so a feed it cut short by exiting is no failure of its own, and a call with no
+/// input has nothing to check. A git that succeeded while its feed failed, or whose feed did not end, fails the call.
+fn fed_whole(fed: Option<&Receiver<io::Result<()>>>, status: ExitStatus, until: Instant) -> Result<(), GitError> {
+    let Some(fed) = fed.filter(|_| status.success()) else {
+        return Ok(());
+    };
+    match received(fed, until) {
+        Some(Ok(())) => Ok(()),
+        Some(Err(error)) => Err(GitError::Failed(format!("cannot feed git its input: {error}"))),
+        None => Err(GitError::Failed(format!(
+            "cannot feed git its input: it did not end within {} s of git's exit",
+            DRAIN.as_secs()
+        ))),
     }
 }
 
@@ -362,6 +383,9 @@ pub(crate) struct Call<'a> {
     /// The console git is created on: this process's, so a Ctrl+C reaches git as it reaches the gate, or a hidden one
     /// of its own, which no Ctrl+C reaches.
     pub console: PipedConsole,
+    /// What git reads on its standard input, written whole and then closed so git reaches its end; with none, its
+    /// standard input is `NUL`.
+    pub stdin: Option<&'a [u8]>,
 }
 
 impl<'a> Call<'a> {
@@ -376,6 +400,7 @@ impl<'a> Call<'a> {
             limit,
             interrupt: None,
             console: PipedConsole::Attached,
+            stdin: None,
         }
     }
 
@@ -768,6 +793,31 @@ mod tests {
             Err(GitError::OverCap(why)) => assert!(why.ends_with(": its output passed 1 bytes"), "{why}"),
             other => panic!("a call whose reader saw it pass its cap is an over-cap call, whether or not git had ended: {other:?}"),
         }
+    }
+
+    /// git reads what a call feeds it to its end: one object written from a short input and one from an input larger
+    /// than a pipe holds, then both sizes asked in one `cat-file` fed their two ids, one per line.
+    #[test]
+    fn a_call_fed_its_standard_input_reads_it_to_its_end() {
+        let root = repository("git-fed");
+        let _removed = Removed(root.clone());
+        let git = Git::find(&root).expect("git is found along PATH");
+        let written = |content: &[u8]| {
+            let call = Call {
+                stdin: Some(content),
+                ..Call::plain(&root, &["hash-object", "-w", "--stdin"], GIT_LIMIT)
+            };
+            git.output(&call).expect("git writes the object it is fed").trim_end().to_owned()
+        };
+        let short = written(b"one\n");
+        let long = written(&vec![b'x'; 100_000]);
+        let ids = format!("{short}\n{long}\n");
+        let call = Call {
+            stdin: Some(ids.as_bytes()),
+            ..Call::plain(&root, &["cat-file", "--batch-check=%(objectsize)"], GIT_LIMIT)
+        };
+
+        assert_eq!(git.output(&call).expect("git reads both ids"), "4\n100000\n");
     }
 
     #[test]
