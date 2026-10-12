@@ -3,13 +3,15 @@
 //! calls that fill a sample's server maps, its client flag and the classified servers whose priority the watch moves.
 //! A process the gate cannot read is skipped, so no one else's process can fail a sample.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io;
 use std::path::Path;
 
 use gate_watchdog::{is_build_client, is_build_server, is_compiler_image, is_compiler_server};
 use gate_win32::ProcessTimes;
-use proc_table::ProcessInfo;
+use proc_table::{ProcessInfo, filetime_to_timestamp};
+
+use crate::escaped;
 
 /// The `dotnet` host an `MSBuild` node or a `VBCSCompiler.dll` runs under, and the one image whose command line a
 /// build client's name alone does not settle.
@@ -93,8 +95,8 @@ struct Server {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Servers {
     /// The command line of each process read so far, keyed by its pid and the start time its own times give it in
-    /// 100 ns ticks, `None` when the line could not be read.
-    command_lines: HashMap<(u32, u64), Option<String>>,
+    /// 100 ns ticks, `None` when the line could not be read; the walk for the processes outside the job reads it too.
+    command_lines: BTreeMap<(u32, u64), Option<String>>,
     /// One more image file name read as a compiler server's (`--test-server-image`), `None` outside the suite.
     test_image: Option<String>,
 }
@@ -103,7 +105,7 @@ impl Servers {
     /// A reader that has read nothing yet, reading `test_image` as a compiler server's image too.
     pub(crate) fn new(test_image: Option<String>) -> Self {
         Servers {
-            command_lines: HashMap::new(),
+            command_lines: BTreeMap::new(),
             test_image,
         }
     }
@@ -220,6 +222,23 @@ impl Servers {
                 created: times.created,
                 inside: false,
             },
+        })
+    }
+
+    /// Whether the walk for the processes outside the job leaves `process` running with everything under it, as the
+    /// kill's [`escaped::spared`] judges it, on the command line a sample of this watch read for its pid and start, so
+    /// one judgement holds for the process's life and its PEB is not read again; `read` reads the line of a process no
+    /// sample read one for.
+    pub(crate) fn spares(&self, process: &ProcessInfo, read: impl FnOnce(u32) -> Option<String>) -> bool {
+        // The snapshot gives the start in whole microseconds, the key in 100 ns ticks.
+        let known = process.created.and_then(|started| {
+            self.command_lines
+                .range((process.pid, 0)..=(process.pid, u64::MAX))
+                .find(|((_, created), _)| i64::try_from(*created).ok().and_then(filetime_to_timestamp) == Some(started))
+        });
+        escaped::spared(process, self.test_image.as_deref(), |pid| match known {
+            Some((_, line)) => line.clone(),
+            None => read(pid),
         })
     }
 

@@ -968,6 +968,22 @@ fn box_seam_console_and_park_launch_are_unknown_words_without_the_feature() {
     assert_eq!(problems(&["box", "--test-box-park-launch=park", "run", "e30="]), [BOX_USAGE]);
 }
 
+#[cfg(feature = "test-seams")]
+#[test]
+fn the_job_breakaway_seam_parses_with_the_feature() {
+    use crate::support::run_request;
+
+    assert!(
+        run_request(&refs(&with(&RUN, &["--test-job-breakaway", "--", "cmd"])))
+            .test_seams
+            .job_breakaway
+    );
+    assert!(
+        !run_request(&refs(&with(&RUN, &["--", "cmd"]))).test_seams.job_breakaway,
+        "the job refuses breakaway unless the seam is given"
+    );
+}
+
 #[cfg(not(feature = "test-seams"))]
 #[test]
 fn seam_flags_are_unknown_without_the_feature() {
@@ -990,6 +1006,10 @@ fn seam_flags_are_unknown_without_the_feature() {
     assert_eq!(
         problems(&refs(&with(&RUN, &["--test-parent-job-trusted", "--", "cmd"]))),
         ["gate: unknown option --test-parent-job-trusted"]
+    );
+    assert_eq!(
+        problems(&refs(&with(&RUN, &["--test-job-breakaway", "--", "cmd"]))),
+        ["gate: unknown option --test-job-breakaway"]
     );
     assert_eq!(
         problems(&refs(&with(&RUN, &["--test-remote-snapshot", "--", "cmd"]))),

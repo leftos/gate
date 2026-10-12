@@ -24,10 +24,11 @@ pub struct Accounting {
     pub active_processes: u32,
 }
 
-/// A job object, named or anonymous. One made by [`Job::create`] has no limits, and nothing is killed when it is
-/// dropped, which only closes this handle; one made by [`Job::create_kill_on_close`] or
+/// A job object, named or anonymous. One made by [`Job::create`] or [`Job::create_breakaway`] has no other limits, and
+/// nothing is killed when it is dropped, which only closes this handle; one made by [`Job::create_kill_on_close`] or
 /// [`Job::anonymous_kill_on_close`] ends every process in it when its last handle is closed. A process in a job cannot
-/// break away from it, unless the job was made by [`Job::anonymous_kill_on_close_breakaway`].
+/// break away from it, unless the job was made by [`Job::create_breakaway`] or
+/// [`Job::anonymous_kill_on_close_breakaway`].
 pub struct Job {
     handle: OwnedHandle,
     name: String,
@@ -89,7 +90,7 @@ impl Job {
     ///
     /// As [`Job::create`]; and the system's error when the limit cannot be set, the job's handle closed again.
     pub fn create_kill_on_close(name: &str) -> io::Result<Job> {
-        Job::create_closing(Some(name), JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE)
+        Job::create_limited(Some(name), JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE)
     }
 
     /// Creates an anonymous job that ends every process in it when its last handle is closed, as
@@ -99,7 +100,7 @@ impl Job {
     ///
     /// The system's error when the job cannot be created, or its limit cannot be set.
     pub fn anonymous_kill_on_close() -> io::Result<Job> {
-        Job::create_closing(None, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE)
+        Job::create_limited(None, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE)
     }
 
     /// Creates an anonymous job as [`Job::anonymous_kill_on_close`] does, and lets a process in it create one outside
@@ -110,12 +111,23 @@ impl Job {
     ///
     /// As [`Job::anonymous_kill_on_close`].
     pub fn anonymous_kill_on_close_breakaway() -> io::Result<Job> {
-        Job::create_closing(None, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK)
+        Job::create_limited(None, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK)
     }
 
-    /// Creates the job `name`, or an anonymous one for `None`, with the limits `flags`, which hold
-    /// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`.
-    fn create_closing(name: Option<&str>, flags: u32) -> io::Result<Job> {
+    /// Creates the job `name` as [`Job::create`] does, with nothing killed when it is dropped, and lets a process in it
+    /// create one outside it with `CREATE_BREAKAWAY_FROM_JOB` (`JOB_OBJECT_LIMIT_BREAKAWAY_OK`): the process it creates
+    /// is not in the job, as a packaged app a process of the job starts is not.
+    ///
+    /// # Errors
+    ///
+    /// As [`Job::create`]; and the system's error when the limit cannot be set, the job's handle closed again.
+    pub fn create_breakaway(name: &str) -> io::Result<Job> {
+        Job::create_limited(Some(name), JOB_OBJECT_LIMIT_BREAKAWAY_OK)
+    }
+
+    /// Creates the job `name`, or an anonymous one for `None`, with the limits `flags`; it ends every process in it when
+    /// its last handle is closed only when they hold `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`.
+    fn create_limited(name: Option<&str>, flags: u32) -> io::Result<Job> {
         let mut job = Job::created(name)?;
         let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
         limits.BasicLimitInformation.LimitFlags = flags;
@@ -132,7 +144,7 @@ impl Job {
         if set == 0 {
             return Err(io::Error::last_os_error());
         }
-        job.kill_on_close = true;
+        job.kill_on_close = flags & JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE != 0;
         Ok(job)
     }
 

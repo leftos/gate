@@ -1027,7 +1027,12 @@ impl Run<'_> {
             return self.interrupted_before_start(console);
         }
         let name = self.root.root.object_name(KernelObject::Job { gate_pid: self.gate.pid });
-        let job = match Job::create(&name) {
+        let created = if self.request.test_seams.job_breakaway {
+            Job::create_breakaway(&name)
+        } else {
+            Job::create(&name)
+        };
+        let job = match created {
             Ok(job) => job,
             Err(error) => return self.gate_failed(&format!("cannot create the job {name}: {error}"), None, console),
         };

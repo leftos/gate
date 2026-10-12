@@ -54,6 +54,10 @@ pub struct Sample {
     pub shared_servers: BTreeMap<u32, u64>,
     /// Whether the job holds a build client, one that may hand its compile to a build server.
     pub build_client: bool,
+    /// The processes outside the job under the processes it holds, the build servers and everything under them left
+    /// out, by pid and start (in 100 ns ticks since 1601), with the CPU time each has used in 100 ns ticks: a packaged
+    /// app a process of the job starts runs in a job of its own, and its CPU is the command's own.
+    pub escaped: BTreeMap<(u32, u64), u64>,
     /// The WSL VM's cumulative CPU time in 100 ns ticks, or `None` when it is not read, or could not be.
     pub vm_cpu: Option<u64>,
 }
@@ -78,6 +82,10 @@ pub struct Watch {
     pids: BTreeSet<u32>,
     new_servers: BTreeMap<u32, u64>,
     shared_servers: BTreeMap<u32, u64>,
+    escaped: BTreeMap<(u32, u64), u64>,
+    /// The CPU the processes outside the job gained, sample by sample, since the last progress: one that exits takes
+    /// none of it with it.
+    escaped_busy: u64,
     vm_cpu: Option<u64>,
     vm_busy: u64,
     vm_percent: f64,
@@ -127,6 +135,8 @@ impl Watch {
             pids: BTreeSet::new(),
             new_servers: BTreeMap::new(),
             shared_servers: BTreeMap::new(),
+            escaped: BTreeMap::new(),
+            escaped_busy: 0,
             vm_cpu,
             vm_busy: 0,
             vm_percent: 0.0,
@@ -143,23 +153,24 @@ impl Watch {
     /// a progress sample marks its own end stamp as the last progress, since the CPU and the job's figures that show
     /// it were read next to that stamp; the stall is judged at the latest sample's begin stamp, so a watcher starved
     /// between its two stamps does not count its own read time as the command's quiet time. The sample is progress
-    /// when the log's size changed either way, the job's CPU since the last progress reached 1% of one core over the
-    /// stall window, a pid appeared that the last sample did not have, a build server the job's client is using gained
-    /// CPU, the WSL VM passed its floor, or the run is paused.
+    /// when the log's size changed either way, the CPU of the job and of the processes outside it since the last
+    /// progress reached 1% of one core over the stall window, a pid appeared in the job that the last sample did not
+    /// have or a process outside it the last sample did not have, a build server the job's client is using gained CPU,
+    /// the WSL VM passed its floor, or the run is paused.
     pub fn sample(&mut self, sample: &Sample) {
         let interval = sample.at.saturating_sub(self.last_at).max(MIN_INTERVAL);
-        let new_servers = measure_cpu(&self.new_servers, &sample.new_servers);
-        let shared_servers = measure_cpu(&self.shared_servers, &sample.shared_servers);
-        let own_gained = own_gained(
-            sample.job_cpu.saturating_sub(self.job_cpu),
-            new_servers,
-            shared_servers,
-            sample.build_client,
-        );
+        let outside = Outside {
+            new_servers: measure_cpu(&self.new_servers, &sample.new_servers),
+            shared_servers: measure_cpu(&self.shared_servers, &sample.shared_servers),
+            escaped: measure_cpu(&self.escaped, &sample.escaped),
+        };
+        let own_gained = own_gained(sample.job_cpu.saturating_sub(self.job_cpu), outside, sample.build_client);
         let vm_working = self.vm_working(sample.vm_cpu, interval);
-        if self.progressed(sample, new_servers, shared_servers, vm_working) {
+        self.escaped_busy = self.escaped_busy.saturating_add(outside.escaped.gained);
+        if self.progressed(sample, outside, vm_working) {
             self.last_progress = sample.at;
             self.progress_cpu = sample.job_cpu;
+            self.escaped_busy = 0;
             self.vm_busy = 0;
         }
         let free_cores = free_cores(self.machine, self.system, sample.system, own_gained, interval.as_secs_f64());
@@ -181,18 +192,21 @@ impl Watch {
         self.pids.clone_from(&sample.pids);
         self.new_servers.clone_from(&sample.new_servers);
         self.shared_servers.clone_from(&sample.shared_servers);
+        self.escaped.clone_from(&sample.escaped);
     }
 
-    /// Whether `sample` is progress: the log changed either way, the job's CPU since the last progress reached 1% of
-    /// one core over the stall window, a pid appeared that the last sample did not have, a build server the job's
+    /// Whether `sample` is progress: the log changed either way, the job's CPU since the last progress and the CPU the
+    /// processes outside it gained sample by sample since then reached 1% of one core over the stall window together,
+    /// a pid appeared in the job or a process outside it that the last sample did not have, a build server the job's
     /// client is using rose, the WSL VM worked, or a gate under this one waits. A server counts only while the job
     /// holds a build client, and a server that merely appeared is no progress.
-    fn progressed(&self, sample: &Sample, new_servers: CpuMove, shared_servers: CpuMove, vm_working: bool) -> bool {
+    fn progressed(&self, sample: &Sample, outside: Outside, vm_working: bool) -> bool {
         let floor = self.config.stall.as_nanos() / FLOOR_NANOS_PER_TICK;
         let grew = sample.output_size != self.output_size;
-        let working = u128::from(sample.job_cpu.saturating_sub(self.progress_cpu).0) >= floor;
-        let appeared = !sample.pids.is_subset(&self.pids);
-        let servers = sample.build_client && (new_servers.rose || shared_servers.rose);
+        let job_busy = u128::from(sample.job_cpu.saturating_sub(self.progress_cpu).0);
+        let working = job_busy + u128::from(self.escaped_busy) >= floor;
+        let appeared = !sample.pids.is_subset(&self.pids) || outside.escaped.appeared;
+        let servers = sample.build_client && (outside.new_servers.rose || outside.shared_servers.rose);
         grew || working || appeared || servers || sample.paused || vm_working
     }
 
@@ -230,24 +244,32 @@ impl Watch {
         tally.unpaused_samples += 1;
     }
 
-    /// The command's CPU read once more as it exited: the job's total CPU `job_cpu`, and the CPU of the build servers
-    /// the last sample counted that still run, by pid, `new_servers` and `shared_servers` as a sample carries them.
+    /// The command's CPU read once more as it exited: the job's total CPU `job_cpu`, the CPU of the build servers the
+    /// last sample counted that still run, by pid, `new_servers` and `shared_servers` as a sample carries them, and that
+    /// of the processes outside the job the last sample counted that still run, `escaped` as a sample carries them.
     /// The stretch since the last sample counts toward the average on the same basis as a sample's: the servers count
     /// only when the last sample's job held a build client. Nothing is counted once the sampler has failed.
-    pub fn final_cpu(&mut self, job_cpu: Ticks, new_servers: &BTreeMap<u32, u64>, shared_servers: &BTreeMap<u32, u64>) {
+    pub fn final_cpu(
+        &mut self,
+        job_cpu: Ticks,
+        new_servers: &BTreeMap<u32, u64>,
+        shared_servers: &BTreeMap<u32, u64>,
+        escaped: &BTreeMap<(u32, u64), u64>,
+    ) {
         if self.sampler_failed {
             return;
         }
-        let gained = own_gained(
-            job_cpu.saturating_sub(self.job_cpu),
-            measure_cpu(&self.new_servers, new_servers),
-            measure_cpu(&self.shared_servers, shared_servers),
-            self.build_client,
-        );
+        let outside = Outside {
+            new_servers: measure_cpu(&self.new_servers, new_servers),
+            shared_servers: measure_cpu(&self.shared_servers, shared_servers),
+            escaped: measure_cpu(&self.escaped, escaped),
+        };
+        let gained = own_gained(job_cpu.saturating_sub(self.job_cpu), outside, self.build_client);
         self.tally.own_ticks = self.tally.own_ticks.saturating_add(gained.0);
         self.job_cpu = job_cpu;
         self.new_servers.clone_from(new_servers);
         self.shared_servers.clone_from(shared_servers);
+        self.escaped.clone_from(escaped);
     }
 
     /// Records that the command's CPU could not be read at its end, so its cores are unknown; the load-adjusted clock
@@ -415,14 +437,14 @@ pub struct CpuMove {
     pub appeared: bool,
 }
 
-/// The CPU the processes of `after` gained on `before`, as the PowerShell gate's `Measure-Cpu` measures it: an appearing
-/// process adds its whole CPU to `gained` alone, and only a process seen before can rise, so a server that merely
-/// appeared is no progress.
+/// The CPU the processes of `after` gained on `before`, each known by its key (a pid, or a pid and a start), as the
+/// PowerShell gate's `Measure-Cpu` measures it: an appearing process adds its whole CPU to `gained` alone, and only a
+/// process seen before can rise, so a server that merely appeared is no progress.
 #[must_use]
-pub fn measure_cpu(before: &BTreeMap<u32, u64>, after: &BTreeMap<u32, u64>) -> CpuMove {
+pub fn measure_cpu<K: Ord>(before: &BTreeMap<K, u64>, after: &BTreeMap<K, u64>) -> CpuMove {
     let mut moved = CpuMove::default();
-    for (&pid, &cpu) in after {
-        match before.get(&pid) {
+    for (key, &cpu) in after {
+        match before.get(key) {
             None => {
                 moved.appeared = true;
                 moved.gained += cpu;
@@ -445,13 +467,25 @@ fn ticks_seconds(ticks: Ticks) -> f64 {
     Duration::from_nanos(ticks.0.saturating_mul(100)).as_secs_f64()
 }
 
-/// The command's own CPU over the interval, in ticks: its job's gain, plus, while the job holds a build client, the
-/// build servers the command started and the shared compiler servers' continuing CPU.
-fn own_gained(job: Ticks, new_servers: CpuMove, shared_servers: CpuMove, client: bool) -> Ticks {
-    if !client {
-        return job;
-    }
-    Ticks(job.0 + new_servers.gained + shared_servers.continued)
+/// How far the processes outside the job moved between two samples: the build servers the command started, the shared
+/// compiler servers, and the processes that left the job under the processes it holds.
+#[derive(Clone, Copy, Debug)]
+struct Outside {
+    new_servers: CpuMove,
+    shared_servers: CpuMove,
+    escaped: CpuMove,
+}
+
+/// The command's own CPU over the interval, in ticks: its job's gain and the gain of the processes that left it, plus,
+/// while the job holds a build client, the build servers the command started and the shared compiler servers'
+/// continuing CPU.
+fn own_gained(job: Ticks, outside: Outside, client: bool) -> Ticks {
+    let servers = if client {
+        outside.new_servers.gained + outside.shared_servers.continued
+    } else {
+        0
+    };
+    Ticks(job.0 + outside.escaped.gained + servers)
 }
 
 /// Why a watched command was killed, with the figures its line says: the kill is decided at one sample and its line
@@ -600,6 +634,7 @@ mod tests {
             new_servers: BTreeMap::new(),
             shared_servers: BTreeMap::new(),
             build_client: false,
+            escaped: BTreeMap::new(),
             vm_cpu: None,
         }
     }
@@ -618,6 +653,7 @@ mod tests {
             new_servers: BTreeMap::new(),
             shared_servers: BTreeMap::new(),
             build_client: false,
+            escaped: BTreeMap::new(),
             vm_cpu: None,
         }
     }
@@ -634,6 +670,14 @@ mod tests {
         ticked.new_servers = new.iter().copied().collect();
         ticked.shared_servers = shared.iter().copied().collect();
         ticked.build_client = client;
+        ticked
+    }
+
+    /// A sample at `ms` of an idle machine whose job holds one process and has used `job_cpu`, with `escaped` the
+    /// processes outside the job by pid and start, each with its CPU.
+    fn away_tick(ms: u64, job_cpu: u64, escaped: &[((u32, u64), u64)]) -> Sample {
+        let mut ticked = tick(ms, job_cpu, 0, &[10], false);
+        ticked.escaped = escaped.iter().copied().collect();
         ticked
     }
 
@@ -1466,7 +1510,7 @@ mod tests {
         // 20 core-seconds over the first 5 s, 10 over the next 5, then 4 over the last 2 s that only the exit's read sees.
         watch.sample(&tick(5000, 20 * CORE_SECOND, 0, &[], false));
         watch.sample(&tick(10_000, 30 * CORE_SECOND, 0, &[], false));
-        watch.final_cpu(Ticks(34 * CORE_SECOND), &BTreeMap::new(), &BTreeMap::new());
+        watch.final_cpu(Ticks(34 * CORE_SECOND), &BTreeMap::new(), &BTreeMap::new(), &BTreeMap::new());
         watch.exited(Duration::from_secs(12));
         let cores = known_cores(&watch);
         assert_near(cores.avg, 2.8, "34 core-seconds over 12 s is 2.83, kept to one decimal");
@@ -1483,7 +1527,7 @@ mod tests {
 
         let mut watch = watching(config(60_000, 5000));
         watch.sample(&tick(5000, 0, 0, &[], false));
-        watch.final_cpu(Ticks(10 * CORE_SECOND), &BTreeMap::new(), &BTreeMap::new());
+        watch.final_cpu(Ticks(10 * CORE_SECOND), &BTreeMap::new(), &BTreeMap::new(), &BTreeMap::new());
         watch.exited(Duration::from_millis(10_000));
         assert_near(known_cores(&watch).avg, 1.0, "10 core-seconds over 10 s");
         assert_near(known_cores(&watch).peak, 0.0, "the final stretch is no sampler interval");
@@ -1501,7 +1545,7 @@ mod tests {
             let mut watch = watching(config(60_000, 5000));
             watch.sample(&server_tick(5000, &[], &new, &shared, client));
             let sampled = ticks_seconds(Ticks(watch.tally.own_ticks));
-            watch.final_cpu(Ticks(0), &ended_new, &ended_shared);
+            watch.final_cpu(Ticks(0), &ended_new, &ended_shared, &BTreeMap::new());
             watch.exited(Duration::from_millis(10_000));
             let last_stretch = ticks_seconds(Ticks(watch.tally.own_ticks)) - sampled;
             assert_near(
@@ -1554,7 +1598,7 @@ mod tests {
     #[test]
     fn cores_are_unknown_without_an_unpaused_sample_or_once_the_sampler_failed() {
         let mut watch = watching(config(60_000, 5000));
-        watch.final_cpu(Ticks(10 * CORE_SECOND), &BTreeMap::new(), &BTreeMap::new());
+        watch.final_cpu(Ticks(10 * CORE_SECOND), &BTreeMap::new(), &BTreeMap::new(), &BTreeMap::new());
         watch.exited(Duration::from_millis(3000));
         assert_eq!(watch.cores(), None, "no sample");
 
@@ -1580,5 +1624,94 @@ mod tests {
             watch.kill_check(Duration::from_millis(5000)).is_none(),
             "the first sample counts the 0.5 core-seconds the VM used since the watch began"
         );
+    }
+
+    #[test]
+    fn escaped_cpu_is_own_cpu_in_the_cores_and_no_other_load() {
+        // 1.6 core-seconds over the first 1 s sample of a 16-core machine busy on every core: read as the job's CPU, as
+        // a process outside the job's, and not at all.
+        let watched = |job_cpu: u64, escaped: &[((u32, u64), u64)]| {
+            let mut watch = watching(config(60_000, 5000));
+            let mut first = away_tick(1000, job_cpu, escaped);
+            first.system = FULLY_BUSY;
+            watch.sample(&first);
+            (watch.last_free_percent(), known_cores(&watch))
+        };
+        let (job_share, job) = watched(16 * CORE_SECOND / 10, &[]);
+        let (away_share, away) = watched(0, &[((20, 1), 16 * CORE_SECOND / 10)]);
+        let (none_share, none) = watched(0, &[]);
+
+        assert_eq!((away_share, job_share, none_share), (Some(10), Some(10), Some(5)), "the clock's share");
+        assert_near(away.avg, job.avg, "the average counts it as the job's own");
+        assert_near(away.avg, 1.6, "1.6 core-seconds over 1 s");
+        assert_near(away.peak, 1.6, "the busiest interval's cores");
+        assert_near(away.free, none.free + 1.6, "the cores others held are fewer by the escaped cores");
+    }
+
+    #[test]
+    fn an_escapee_that_exits_does_not_pull_the_stall_accrual_down() {
+        // A 2 s window's floor is 200 000 ticks. Two escaped processes appear at 1 s; by 2 s one has used 120 000
+        // ticks; by 3 s it has exited and the other has used `last`: the floor when `last` is 80 000, though the CPU of
+        // the processes still running fell.
+        let checked = |last: u64| {
+            let mut watch = watching(config(2000, 5000));
+            watch.sample(&away_tick(1000, 0, &[((20, 1), 0), ((21, 1), 0)]));
+            watch.sample(&away_tick(2000, 0, &[((20, 1), 120_000), ((21, 1), 0)]));
+            watch.sample(&away_tick(3000, 0, &[((21, 1), last)]));
+            watch.kill_check(Duration::from_millis(3000))
+        };
+        assert!(checked(80_000).is_none(), "the CPU each gained between samples reaches the floor");
+        assert!(
+            matches!(checked(79_999), Some(Kill::Stalled { .. })),
+            "a tick short of the floor is no progress"
+        );
+    }
+
+    #[test]
+    fn a_new_escaped_process_is_progress_and_a_pid_with_a_new_start_is_a_new_one() {
+        for (next, what) in [
+            (((21, 1), 0), "a pid the last sample did not have"),
+            (((20, 2), 0), "the same pid, started later"),
+        ] {
+            let mut watch = watching(config(1000, 5000));
+            watch.sample(&away_tick(1000, 0, &[((20, 1), 0)]));
+            watch.sample(&away_tick(2000, 0, &[next]));
+            assert!(watch.kill_check(Duration::from_millis(2000)).is_none(), "{what} is progress");
+            watch.sample(&away_tick(3000, 0, &[next]));
+            assert!(
+                matches!(watch.kill_check(Duration::from_millis(3000)), Some(Kill::Stalled { .. })),
+                "{what}, seen again, is no progress"
+            );
+        }
+    }
+
+    #[test]
+    fn escaped_cpu_at_the_floor_is_progress_while_the_job_is_flat() {
+        // The floor of a 1 s window is 100 000 ticks; the job's own CPU does not move after the first sample.
+        for (cpu, progress) in [(100_000, true), (99_999, false)] {
+            let mut watch = watching(config(1000, 5000));
+            watch.sample(&away_tick(1000, 50, &[((20, 1), 0)]));
+            watch.sample(&away_tick(2000, 50, &[((20, 1), cpu)]));
+            assert_eq!(
+                watch.kill_check(Duration::from_millis(2000)).is_none(),
+                progress,
+                "{cpu} ticks outside the job against the floor of 100 000"
+            );
+        }
+    }
+
+    #[test]
+    fn job_and_escaped_cpu_each_under_the_floor_are_progress_together() {
+        // The floor of a 1 s window is 100 000 ticks; the job and the process outside it each gain under it.
+        for (job, away, progress) in [(50_000, 50_000, true), (50_000, 49_999, false)] {
+            let mut watch = watching(config(1000, 5000));
+            watch.sample(&away_tick(1000, 0, &[((20, 1), 0)]));
+            watch.sample(&away_tick(2000, job, &[((20, 1), away)]));
+            assert_eq!(
+                watch.kill_check(Duration::from_millis(2000)).is_none(),
+                progress,
+                "{job} ticks in the job and {away} outside it against the floor of 100 000"
+            );
+        }
     }
 }

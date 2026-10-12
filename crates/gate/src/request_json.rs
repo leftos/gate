@@ -50,6 +50,7 @@ pub(crate) fn run(request: &RunRequest, log: &Path, root: &ResolvedRoot) -> Stri
             "bridgePwsh": seams.bridge_pwsh.as_ref().map(|path| path.to_string_lossy()),
             "ownStartFails": seams.own_start_fails,
             "parentJobTrusted": seams.parent_job_trusted,
+            "jobBreakaway": seams.job_breakaway,
         },
     })
     .to_string()

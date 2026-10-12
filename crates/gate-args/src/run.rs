@@ -96,6 +96,8 @@ pub(crate) enum SwitchOption {
     #[cfg(feature = "test-seams")]
     RemoteSnapshot,
     #[cfg(feature = "test-seams")]
+    JobBreakaway,
+    #[cfg(feature = "test-seams")]
     CutoverInterruptAfterList,
 }
 
@@ -271,6 +273,8 @@ impl RunBuilder {
             SwitchOption::DiagnosticsFail => self.test_seams.diagnostics_fail = on,
             #[cfg(feature = "test-seams")]
             SwitchOption::RemoteSnapshot => self.test_seams.remote_snapshot = on,
+            #[cfg(feature = "test-seams")]
+            SwitchOption::JobBreakaway => self.test_seams.job_breakaway = on,
             #[cfg(feature = "test-seams")]
             SwitchOption::CutoverInterruptAfterList => self.cutover_seams.interrupt_after_list = on,
         }

@@ -20,6 +20,7 @@ use jiff::Timestamp;
 use proc_table::{ProcessInfo, ProcessTable, ProcessTree, Win32ProcessTable, filetime_to_timestamp};
 
 use crate::console::Console;
+use crate::escaped;
 use crate::log::Log;
 use crate::nesting::Parent;
 use crate::pause::PauseReader;
@@ -77,6 +78,8 @@ pub(crate) struct Watcher<'a> {
     under: Option<PathBuf>,
     /// The build servers the last sample counted, each with whether it started after the command.
     counted: Vec<(u32, bool)>,
+    /// The processes outside the job the last sample counted, by pid and start.
+    counted_escaped: Vec<(u32, u64)>,
     sampler_works: bool,
     /// Whether every sample fails (`--test-sampler-fail`).
     sampler_fail: bool,
@@ -103,6 +106,10 @@ pub(crate) struct Watcher<'a> {
 
 /// Build servers' CPU time in 100 ns ticks, by pid, as a sample carries them.
 type ServerCpu = BTreeMap<u32, u64>;
+
+/// The CPU time in 100 ns ticks of the processes outside the job under its members, by pid and start, as a sample
+/// carries them.
+type EscapedCpu = BTreeMap<(u32, u64), u64>;
 
 /// A read of the WSL VM's cumulative CPU in 100 ns ticks, `None` when no VM runs.
 type VmRead = fn() -> io::Result<Option<u64>>;
@@ -227,6 +234,7 @@ impl<'a> Watcher<'a> {
             servers: Servers::new(request.test_seams.server_image.clone()),
             under: request.test_seams.servers_under.as_deref().map(absolute),
             counted: Vec::new(),
+            counted_escaped: Vec::new(),
             sampler_works: true,
             sampler_fail: request.test_seams.sampler_fail,
             diagnostics_fail: request.test_seams.diagnostics_fail,
@@ -287,14 +295,16 @@ impl<'a> Watcher<'a> {
         self.watch.cores()
     }
 
-    /// Brings the watch to the command's end: the job's accounting and the CPU of the build servers the last sample
-    /// counted are read once more, so the CPU since the last sample counts toward the cores, and the stretch since that
-    /// sample is counted at the share it found. A job accounting read that fails leaves the cores unknown and is noted
-    /// in the log only, since the run's verdict does not depend on it.
+    /// Brings the watch to the command's end: the job's accounting and the CPU of the build servers and of the processes
+    /// outside the job the last sample counted are read once more, so the CPU since the last sample counts toward the
+    /// cores, and the stretch since that sample is counted at the share it found. A job accounting read that fails
+    /// leaves the cores unknown and is noted in the log only, since the run's verdict does not depend on it.
     fn end(&mut self, console: &mut Console) {
         if self.sampler_works {
             match self.final_read() {
-                Ok((job_cpu, new_servers, shared_servers)) => self.watch.final_cpu(job_cpu, &new_servers, &shared_servers),
+                Ok((job_cpu, (new_servers, shared_servers), escaped)) => {
+                    self.watch.final_cpu(job_cpu, &new_servers, &shared_servers, &escaped);
+                }
                 Err(error) => {
                     self.watch.cores_unread();
                     console.note(&format!("gate: cannot read the command's CPU at its end: {error}; its cores are unknown"));
@@ -304,12 +314,14 @@ impl<'a> Watcher<'a> {
         self.watch.exited(self.started.elapsed());
     }
 
-    /// The job's total CPU now, and the CPU of the build servers the last sample counted that can still be read
-    /// ([`server_cpu`]); only the job's accounting failing fails the read.
-    fn final_read(&self) -> io::Result<(Ticks, ServerCpu, ServerCpu)> {
+    /// The job's total CPU now, the CPU of the build servers the last sample counted that can still be read
+    /// ([`server_cpu`]), and that of the processes outside the job it counted that still run ([`escaped_cpu`]); only the
+    /// job's accounting failing fails the read.
+    fn final_read(&self) -> io::Result<(Ticks, (ServerCpu, ServerCpu), EscapedCpu)> {
         let job_cpu = Ticks(self.job.accounting()?.cpu);
-        let (new_servers, shared_servers) = server_cpu(&self.counted, gate_win32::process_times);
-        Ok((job_cpu, new_servers, shared_servers))
+        let servers = server_cpu(&self.counted, gate_win32::process_times);
+        let escaped = escaped_cpu(&self.counted_escaped, gate_win32::process_times);
+        Ok((job_cpu, servers, escaped))
     }
 
     /// Waits at most `timeout` for the command's exit, or for the interrupt when it was installed.
@@ -343,6 +355,7 @@ impl<'a> Watcher<'a> {
                 // Only a sample that came back whole becomes the one a kill's block lists the servers of; one that
                 // failed part way leaves the last good sample's servers in place.
                 self.counted = counted(&sample.new_servers, &sample.shared_servers);
+                self.counted_escaped = sample.escaped.keys().copied().collect();
                 self.watch.sample(&sample);
                 self.record(&sample, log_bytes, err_bytes, vm_failed);
                 self.prioritize(console);
@@ -509,18 +522,22 @@ impl<'a> Watcher<'a> {
 
     /// The facts of one sample that began at `began`: the size of the log and its `.err` file, the two kept apart for
     /// the diagnostics block, the job's processes created since the command started, the build servers outside the job
-    /// and the build client inside it, the WSL VM's CPU for a wsl command (its unreadable line said once, when it first
-    /// fails), and last the system's times and the job's accounting, stamped with the watch's end time: the interval
-    /// the watch counts them over is exactly the stretch the end stamp closes. Under `--test-sampler-fail` every
-    /// sample fails.
+    /// and the build client inside it, the processes outside the job under its members and their CPU, the WSL VM's CPU
+    /// for a wsl command (its unreadable line said once, when it first fails), and last the system's times and the
+    /// job's accounting, stamped with the watch's end time: the interval the watch counts them over is exactly the
+    /// stretch the end stamp closes. Under `--test-sampler-fail` every sample fails.
     fn sample(&mut self, console: &mut Console, began: Duration, paused: bool) -> io::Result<Gathered> {
         if self.sampler_fail {
             return Err(io::Error::other(SAMPLER_FAIL));
         }
         let log_bytes = size(self.log.path())?;
         let err_bytes = size(self.log.err_path())?;
-        let pids = self.pids()?;
+        let looked = escaped::now().ok_or_else(|| io::Error::other(escaped::NO_CLOCK))?;
+        let before = self.job.process_ids()?;
+        let pids = members(before.iter().copied(), self.since, gate_win32::process_times)?;
         let processes = Win32ProcessTable.snapshot_without_command_lines();
+        // The snapshot takes a while: a process that joined the job meanwhile is a member, not one that left it.
+        let after = self.job.process_ids()?;
         let scope = Scope {
             members: &pids,
             since: self.since,
@@ -536,6 +553,11 @@ impl<'a> Watcher<'a> {
             build_client,
         } = found;
         self.classified = servers;
+        let tree = ProcessTree::new(processes);
+        let away = escaped::outside_the_job(before, &after, looked, &tree, |process| {
+            self.servers.spares(process, proc_table::command_line_of)
+        });
+        let escaped = escaped::cpu_of(&away, gate_win32::process_times);
         let (vm, line) = self.vm.sample();
         if let Some(line) = line {
             console.err(&line);
@@ -554,6 +576,7 @@ impl<'a> Watcher<'a> {
             new_servers,
             shared_servers,
             build_client,
+            escaped,
             vm_cpu: vm.as_ref().ok().copied().flatten(),
         };
         Ok(Gathered {
@@ -563,12 +586,20 @@ impl<'a> Watcher<'a> {
             vm_failed: vm.is_err(),
         })
     }
+}
 
-    /// The job's processes created at or after the command's start; one that exited since the job listed it is left
-    /// out.
-    fn pids(&self) -> io::Result<BTreeSet<u32>> {
-        members(self.job.process_ids()?, self.since, gate_win32::process_times)
+/// The CPU `times` reads now for each of the processes outside the job the last sample `counted`, by pid and start. One
+/// that has exited, whose times cannot be read, or whose pid a process with another start has taken since is skipped.
+fn escaped_cpu(counted: &[(u32, u64)], times: impl Fn(u32) -> io::Result<Option<ProcessTimes>>) -> EscapedCpu {
+    let mut escaped = BTreeMap::new();
+    for &(pid, created) in counted {
+        if let Ok(Some(read)) = times(pid)
+            && read.created == created
+        {
+            escaped.insert((pid, created), read.cpu);
+        }
     }
+    escaped
 }
 
 /// The CPU `times` reads now for each of the `counted` build servers, by pid, the ones the command started (`true`)

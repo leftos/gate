@@ -4,12 +4,12 @@
 //! the job and ends them parents first, each checked through its own handle to be the process the snapshot saw, and
 //! makes one more pass for the children they started meanwhile.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::io;
 use std::time::{Duration, Instant};
 
 use gate_state::{KernelObject, StateRoot};
-use gate_win32::{Job, OpenedJob, StoppableProcess, WaitableProcess, file_time_now};
+use gate_win32::{Job, OpenedJob, ProcessTimes, StoppableProcess, WaitableProcess, file_time_now};
 use jiff::Timestamp;
 use proc_table::{ProcessInfo, ProcessTree, Win32ProcessTable, command_line_of, filetime_to_timestamp};
 
@@ -24,7 +24,7 @@ const GATE_IMAGE: &str = "gate.exe";
 /// Why a look whose snapshot listed no process could not look: the snapshot itself failed.
 const EMPTY_SNAPSHOT: &str = "the process snapshot listed no processes";
 /// Why a look could not begin: the system time is outside the range a timestamp holds.
-const NO_CLOCK: &str = "the system time is outside the range a timestamp holds";
+pub(crate) const NO_CLOCK: &str = "the system time is outside the range a timestamp holds";
 
 /// One process outside the job, under a process the job holds.
 #[derive(Clone, Debug)]
@@ -299,9 +299,42 @@ fn wait_left(deadline: Option<Instant>, wait: Duration, now: Instant) -> (Instan
     (deadline, deadline.saturating_duration_since(now))
 }
 
+/// The processes outside the job in the snapshot `tree` under the members the reads `before` and `after` it listed, the
+/// look having begun at `since`, as a kill's look finds them: parents first, each process `spare` keeps running left
+/// out with everything under it, as [`spared`] judges it for the kill. A process whose start or whose parent's is
+/// unknown is left out, as one the watch cannot judge.
+pub(crate) fn outside_the_job(
+    before: Vec<u32>,
+    after: &[u32],
+    since: Timestamp,
+    tree: &ProcessTree,
+    spare: impl Fn(&ProcessInfo) -> bool,
+) -> Vec<Escaped> {
+    let members = members(before, after, since, tree);
+    // What the watch counts does not need the processes it cannot judge, so whether one still runs is never asked.
+    outside(&members, tree, spare, |_| false).escaped
+}
+
+/// The CPU time of each of `escaped` that `times` reads as the process the snapshot saw, in 100 ns ticks, by its pid
+/// and its start as `times` reads it (100 ns ticks since 1601). One that has exited, cannot be read, has no known start,
+/// or whose pid another process has taken since is left out, as the watch leaves out a build server it cannot read.
+pub(crate) fn cpu_of(escaped: &[Escaped], times: impl Fn(u32) -> io::Result<Option<ProcessTimes>>) -> BTreeMap<(u32, u64), u64> {
+    let mut cpu = BTreeMap::new();
+    for process in escaped {
+        let Ok(Some(read)) = times(process.node.pid) else {
+            continue;
+        };
+        let started = i64::try_from(read.created).ok().and_then(filetime_to_timestamp);
+        if started.is_some() && started == process.node.created {
+            cpu.insert((process.node.pid, read.created), read.cpu);
+        }
+    }
+    cpu
+}
+
 /// Now, on the clock and in the units the snapshot gives start times in: the system time in whole microseconds;
 /// `None` when outside the range a timestamp holds.
-fn now() -> Option<Timestamp> {
+pub(crate) fn now() -> Option<Timestamp> {
     i64::try_from(file_time_now()).ok().and_then(filetime_to_timestamp)
 }
 
@@ -437,7 +470,7 @@ fn kinship(created: Option<Timestamp>, parent: &Ended) -> Kin {
 /// Whether `process` is left running with everything under it: a build server, shared with every other build on the
 /// machine, or a `dotnet` host whose command line `read` cannot give, which may be one (an `MSBuild` node or a
 /// `VBCSCompiler.dll` host). `server_image` is one more compiler server's image (`--test-server-image`).
-fn spared(process: &ProcessInfo, server_image: Option<&str>, read: impl FnOnce(u32) -> Option<String>) -> bool {
+pub(crate) fn spared(process: &ProcessInfo, server_image: Option<&str>, read: impl FnOnce(u32) -> Option<String>) -> bool {
     let mut unread = false;
     let server = servers::is_server(&process.name, server_image, || {
         read(process.pid).unwrap_or_else(|| {
@@ -498,16 +531,20 @@ fn could_not_judge(count: usize) -> String {
 #[cfg(test)]
 #[expect(clippy::expect_used, reason = "a test timestamp that does not parse must fail loudly")]
 mod tests {
-    use std::collections::HashSet;
+    use std::cell::Cell;
+    use std::collections::{BTreeMap, BTreeSet, HashSet};
+    use std::io;
     use std::time::{Duration, Instant};
 
+    use gate_win32::ProcessTimes;
     use jiff::Timestamp;
     use proc_table::{ProcessInfo, ProcessTree};
 
     use super::{
-        EMPTY_SNAPSHOT, Ended, Escaped, Found, Members, children_since, could_not_end, could_not_judge, could_not_look, is_gate, members, outside,
-        spared, terminated_line, union, wait_left,
+        EMPTY_SNAPSHOT, Ended, Escaped, Found, Members, children_since, could_not_end, could_not_judge, could_not_look, cpu_of, is_gate, members,
+        outside, outside_the_job, spared, terminated_line, union, wait_left,
     };
+    use crate::servers::{Scope, Servers};
     use crate::stopping::Node;
 
     /// The test moment `second` seconds past 10:00 on the test day.
@@ -597,6 +634,58 @@ mod tests {
             vec![2, 3],
             "the pwsh and its child, parents first; no build server, no unreadable dotnet host, nor what they started"
         );
+    }
+
+    /// The `FILETIME` ticks of the test moment `second`, as a process's own times give its start.
+    fn filetime(second: u32) -> u64 {
+        u64::try_from(at(second).as_microsecond() * 10 + 116_444_736_000_000_000).expect("a test moment is after 1601")
+    }
+
+    #[test]
+    fn a_dotnet_host_whose_line_a_later_sample_cannot_read_keeps_its_first_judgement() {
+        // Member 1 started a dotnet host running an app (2) outside the job. Its command line reads on the first sample
+        // and fails on every later one.
+        let processes = vec![process(1, 0, "cmd.exe", 0), process(2, 1, "dotnet.exe", 1)];
+        let failing = Cell::new(false);
+        let reads = Cell::new(0);
+        let line = |pid: u32| {
+            reads.set(reads.get() + 1);
+            (pid == 2 && !failing.get()).then(|| r"dotnet C:\app\app.dll".to_owned())
+        };
+        let times = |pid: u32| -> io::Result<Option<ProcessTimes>> {
+            Ok(Some(ProcessTimes {
+                created: filetime(pid - 1),
+                cpu: 5_000,
+            }))
+        };
+        let members = BTreeSet::from([1]);
+        let scope = Scope {
+            members: &members,
+            since: filetime(0),
+            under: None,
+        };
+        let mut servers = Servers::new(None);
+        let mut sample = || {
+            servers.read(&processes, &scope, times, line);
+            let tree = ProcessTree::new(processes.clone());
+            let away = outside_the_job(vec![1], &[1], at(0), &tree, |process| servers.spares(process, line));
+            cpu_of(&away, times)
+        };
+
+        let first = sample();
+        failing.set(true);
+        let second = sample();
+
+        assert_eq!(
+            first,
+            BTreeMap::from([((2, filetime(1)), 5_000)]),
+            "the app's host is outside the job and no server"
+        );
+        assert_eq!(
+            second, first,
+            "the line the first sample read still judges it: neither dropped nor counted anew"
+        );
+        assert_eq!(reads.get(), 1, "its line is read once for its pid and start");
     }
 
     #[test]

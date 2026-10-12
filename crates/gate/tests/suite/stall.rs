@@ -6,11 +6,99 @@ use std::os::windows::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use gate_win32::StoppableProcess;
+use gate_win32::{EnvironmentBlock, Job, Launch, LaunchOutput, StoppableProcess};
 use regex::Regex;
 use serde_json::Value;
 
-use crate::support::{Case, FAKE_TOOL, assert_in_order, release, run_words, said_pid, shown, wait_until, wait_until_closed};
+use crate::support::{
+    CORE_SECOND, Case, Escapee, FAKE_TOOL, assert_in_order, cpu_ticks, release, run_words, said_pid, shown, wait_until, wait_until_closed,
+};
+
+#[test]
+fn a_process_started_with_breakaway_leaves_a_job_that_allows_it() {
+    let case = Case::new("a_process_started_with_breakaway_leaves_a_job_that_allows_it");
+    let job = Job::create_breakaway(&format!(r"Local\gate-suite-{}-breakaway", std::process::id())).expect("the job is created");
+    let escapee = Escapee::new(&case);
+    let line = escapee
+        .command("0")
+        .iter()
+        .map(|word| format!(r#""{word}""#))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let launch = Launch {
+        application: PathBuf::from(FAKE_TOOL),
+        command_line: line.encode_utf16().collect(),
+        directory: case.folder(),
+        environment: EnvironmentBlock::new(std::env::vars_os()).expect("the block is built"),
+        output: LaunchOutput::Files {
+            log: case.folder().join("out.log"),
+            err_log: case.folder().join("out.log.err"),
+        },
+        priority: None,
+    };
+
+    let running = launch
+        .start_suspended()
+        .expect("the command starts")
+        .assign_and_resume(&job)
+        .expect("the command is assigned and resumed");
+    let ended = || !matches!(running.wait(Duration::ZERO), Ok(None));
+    let (_, away) = escapee.open(ended);
+    let parent = StoppableProcess::open(running.pid())
+        .expect("the command is opened")
+        .expect("it runs: it waits on the stop file");
+
+    let log = || fs::read_to_string(case.folder().join("out.log.err")).unwrap_or_default();
+    assert!(parent.in_job(&job).expect("the command's job is read"), "the command is in the job");
+    assert!(
+        !away.in_job(&job).expect("the escapee's job is read"),
+        "the escapee left the job: {}",
+        log()
+    );
+    escapee.stop();
+    assert_eq!(running.wait(Duration::from_secs(600)).expect("the wait answers"), Some(0), "{}", log());
+}
+
+/// The words of a gate with a 2 s stall window and a 100 ms sample, whose command's job lets a process in it create
+/// one outside it.
+const AWAY_SEAMS: [&str; 5] = ["--test-stall-ms", "2000", "--test-sample-ms", "100", "--test-job-breakaway"];
+
+#[test]
+#[ignore = "needs the machine alone: run with -Slot critical and --ignored"]
+fn a_command_whose_only_work_is_a_child_outside_its_job_is_not_stalled() {
+    let case = Case::new("a_command_whose_only_work_is_a_child_outside_its_job_is_not_stalled");
+    let escapee = Escapee::new(&case);
+    let command = escapee.command("2");
+    let words: Vec<&str> = command.iter().map(String::as_str).collect();
+
+    let mut running = case.start(&run_words("out.log", &AWAY_SEAMS, &words));
+    let (pid, _held) = escapee.open(|| !running.is_running());
+    // Eight core-seconds on two threads take at least 4 s: two stall windows in which the command itself only waits.
+    wait_until("the escapee using 8 core-seconds, or the gate ending", || {
+        cpu_ticks(pid) >= 8 * CORE_SECOND || !running.is_running()
+    });
+    escapee.stop();
+    let outcome = running.finish();
+
+    assert_eq!(outcome.code, Some(0), "the escapee's CPU is the quiet command's progress: {outcome:?}");
+    assert!(!outcome.stderr.contains("STALLED"), "{outcome:?}");
+}
+
+#[test]
+fn a_command_whose_child_outside_its_job_idles_is_still_stalled() {
+    let case = Case::new("a_command_whose_child_outside_its_job_idles_is_still_stalled");
+    // Neither the command nor its child outside the job polls or spins: what either does is no progress, so the stall
+    // kill ends the command, and the escapee's guard ends the child.
+    let escapee = Escapee::new(&case);
+    let command = escapee.idle_command();
+    let words: Vec<&str> = command.iter().map(String::as_str).collect();
+
+    let outcome = case.run(&run_words("out.log", &AWAY_SEAMS, &words));
+
+    assert_eq!(outcome.code, Some(124), "{outcome:?}");
+    assert!(outcome.stderr.contains("gate: STALLED: "), "{outcome:?}");
+    assert_eq!(release(&case)["verdict"], "stalled", "{outcome:?}");
+}
 
 #[test]
 fn a_silent_idle_command_is_killed_as_stalled() {

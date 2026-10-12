@@ -189,6 +189,7 @@ fn seam_option(name: &str) -> Option<RunOption> {
         "test-own-start-fails" => Some(RunOption::Switch(SwitchOption::OwnStartFails)),
         "test-parent-job-trusted" => Some(RunOption::Switch(SwitchOption::ParentJobTrusted)),
         "test-diagnostics-fail" => Some(RunOption::Switch(SwitchOption::DiagnosticsFail)),
+        "test-job-breakaway" => Some(RunOption::Switch(SwitchOption::JobBreakaway)),
         "test-remote-client" => Some(RunOption::Value(ValueOption::RemoteClient)),
         "test-remote-wait-ms" => Some(RunOption::Value(ValueOption::RemoteWaitMs)),
         "test-git-limit-ms" => Some(RunOption::Value(ValueOption::GitLimitMs)),

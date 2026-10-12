@@ -7,7 +7,7 @@
 
 use serde_json::Value;
 
-use crate::support::{Case, FAKE_TOOL, GATE, Outcome, events, heavy_words, none_words, run_words};
+use crate::support::{CORE_SECOND, Case, Escapee, FAKE_TOOL, GATE, Outcome, cpu_ticks, events, heavy_words, none_words, run_words, wait_until};
 
 /// The fields the release line carries the cores in.
 const CORES_FIELDS: [&str; 3] = ["avgCores", "peakCores", "freeCores"];
@@ -226,6 +226,51 @@ fn a_no_slot_run_whose_nested_gate_took_no_slot_keeps_its_hint() {
     match cores {
         Some(cores) if cores.0 >= 1.5 => assert_no_slot_line_before_passed(&outcome, cores),
         _ => assert_no_cores_line(&outcome),
+    }
+}
+
+#[test]
+fn a_command_whose_child_left_its_job_counts_that_child_s_cores() {
+    // The core-seconds the child outside the job burns before the case stops it: on two threads, at least 10 s, so the
+    // run is long enough to be judged.
+    const BURNED: u32 = 20;
+    let case = Case::new("a_command_whose_child_left_its_job_counts_that_child_s_cores");
+    let escapee = Escapee::new(&case);
+    let command = escapee.command("2");
+    let words: Vec<&str> = command.iter().map(String::as_str).collect();
+
+    let mut running = case.start(&none_words("out.log", &["--test-sample-ms", "100", "--test-job-breakaway"], &words));
+    let gate = running.id();
+    let (pid, _held) = escapee.open(|| !running.is_running());
+    wait_until(&format!("the escapee using {BURNED} core-seconds, or the gate ending"), || {
+        cpu_ticks(pid) >= u64::from(BURNED) * CORE_SECOND || !running.is_running()
+    });
+    escapee.stop();
+    let outcome = running.finish();
+
+    assert_eq!((outcome.code, outcome.stderr.as_str()), (Some(0), ""), "{outcome:?}");
+    let release = release_of(&case, gate);
+    let wall = release["wallSeconds"].as_f64();
+    assert!(wall.is_some(), "the release has its wall seconds: {release}");
+    let wall = wall.expect("checked above");
+    match journalled_cores(&release) {
+        Some(cores) => {
+            // The gate counts the child's CPU up to its last sample of it, short of what it burned by at most the
+            // stretch after that sample, so half of it is a floor no load lowers: the wall a load stretches divides
+            // both. The average is kept to a tenth, so it can read up to 0.05 under the CPU over the wall. Were the
+            // child not counted, the average would be the waiting command's own, 0.0.
+            assert!(
+                (cores.0 + 0.05) * wall >= f64::from(BURNED) / 2.0,
+                "{} core-seconds counted over {wall} s, under half the {BURNED} the child burned: {release}",
+                cores.0 * wall
+            );
+            if cores.0 >= 1.5 {
+                assert_no_slot_line_before_passed(&outcome, cores);
+            } else {
+                assert_no_cores_line(&outcome);
+            }
+        }
+        None => assert_no_cores_line(&outcome),
     }
 }
 

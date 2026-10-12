@@ -11,6 +11,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use std::{fs, process, thread};
 
+use gate_win32::StoppableProcess;
 use jiff::Timestamp;
 use serde_json::{Value, json};
 
@@ -855,4 +856,106 @@ pub fn print_run(command: &[&'static str]) -> Vec<&'static str> {
     ];
     words.extend(command);
     words
+}
+
+/// 100 ns ticks in one core-second.
+pub const CORE_SECOND: u64 = 10_000_000;
+
+/// A process a case's command starts outside its job with fake-tool's `spawn-away`, spinning until its stop file
+/// exists, or, idle, sleeping without ever looking at it. It is ended on every path out of the case, a panic included:
+/// its stop file is written, then the process the pid file names, checked to be the one that started then, is
+/// terminated, which is what ends an idle one.
+pub struct Escapee {
+    pid_file: PathBuf,
+    stop: PathBuf,
+}
+
+impl Escapee {
+    /// The escapee whose pid file and stop file are `away.pid` and `stop` in `case`'s folder.
+    pub fn new(case: &Case) -> Escapee {
+        Escapee {
+            pid_file: case.folder().join("away.pid"),
+            stop: case.folder().join("stop"),
+        }
+    }
+
+    /// The words of a command that starts the escapee spinning on `threads` threads (`0`: sleeping, its stop file never
+    /// read), then waits for the escapee's stop file itself.
+    pub fn command(&self, threads: &str) -> Vec<String> {
+        let (pid_file, stop) = (shown(&self.pid_file), shown(&self.stop));
+        [FAKE_TOOL, "spawn-away", &pid_file, threads, &stop, "wait", &stop]
+            .map(str::to_owned)
+            .to_vec()
+    }
+
+    /// The words of a command that starts the escapee sleeping, then sleeps itself for 30 s: neither process polls a
+    /// file or uses a tick of CPU, so nothing they do is progress.
+    pub fn idle_command(&self) -> Vec<String> {
+        let (pid_file, stop) = (shown(&self.pid_file), shown(&self.stop));
+        [FAKE_TOOL, "spawn-away", &pid_file, "0", &stop, "sleep", "30000"]
+            .map(str::to_owned)
+            .to_vec()
+    }
+
+    /// The escapee's pid and the process, once the pid file holds its whole line, checked to be the process that
+    /// started then. Fails at once, rather than at the hang guard, when `ended` says the command that would write the
+    /// file has ended without it.
+    #[expect(clippy::panic, reason = "a command that ended before it wrote the pid file fails the case saying so")]
+    pub fn open(&self, mut ended: impl FnMut() -> bool) -> (u32, StoppableProcess) {
+        let mut said = None;
+        wait_until(
+            &format!("{} holding a pid and a start, or its writer ending", self.pid_file.display()),
+            || {
+                said = self.said();
+                said.is_some() || ended()
+            },
+        );
+        let Some((pid, start)) = said else {
+            panic!("the command ended before it wrote {}", self.pid_file.display());
+        };
+        let process = StoppableProcess::open(pid)
+            .expect("the escapee is opened")
+            .expect("it runs: it spins until its stop file exists, or sleeps");
+        let created = process.created().expect("the escapee's start is read");
+        assert_eq!(
+            Some(created),
+            proc_table::filetime_to_timestamp(start),
+            "pid {pid} is the escapee spawn-away started"
+        );
+        (pid, process)
+    }
+
+    /// Ends the escapee's `spin` by writing its stop file.
+    pub fn stop(&self) {
+        fs::write(&self.stop, "").expect("the escapee's stop file is written");
+    }
+
+    /// The pid and the start, in 100 ns ticks since 1601, of the whole line `spawn-away` wrote; `None` until it is
+    /// whole.
+    fn said(&self) -> Option<(u32, i64)> {
+        let text = fs::read_to_string(&self.pid_file).ok()?;
+        let (pid, start) = text.strip_suffix('\n')?.split_once(' ')?;
+        Some((pid.parse().ok()?, start.parse().ok()?))
+    }
+}
+
+impl Drop for Escapee {
+    fn drop(&mut self) {
+        // Each fails only when there is nothing left to end: the escapee has ended or never started, or the case's
+        // folder is gone.
+        let _ = fs::write(&self.stop, "");
+        let Some((pid, start)) = self.said() else {
+            return;
+        };
+        if let Ok(Some(process)) = StoppableProcess::open(pid)
+            && process.created().ok() == proc_table::filetime_to_timestamp(start)
+        {
+            let _ = process.terminate(1);
+        }
+    }
+}
+
+/// The CPU time the running process `pid` has used, in 100 ns ticks; 0 once it has ended.
+pub fn cpu_ticks(pid: u32) -> u64 {
+    gate_win32::process_times(pid).ok().flatten().map_or(0, |times| times.cpu)
 }

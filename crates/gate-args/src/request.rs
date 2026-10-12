@@ -181,6 +181,9 @@ pub struct TestSeams {
     /// Count every live parent a slot marker names as one this gate runs inside the command of, so a marker naming the
     /// test process is trusted as a real parent gate's is.
     pub parent_job_trusted: bool,
+    /// Let a process in the command's job create one outside it (`JOB_OBJECT_LIMIT_BREAKAWAY_OK`), so a case can stand
+    /// a process that left the job in for a packaged app the command's descendant starts.
+    pub job_breakaway: bool,
 }
 
 /// A valid `gate run`.

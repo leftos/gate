@@ -24,6 +24,13 @@
 //! `noise <path> <bytes>` writes a file of that many bytes no compression shrinks at the path, the same bytes on every
 //! run, from a fixed-seed generator, its folders made when missing;
 //! `burn-threads <n> <ms>` spins on the CPU on n threads for ms of wall time, then goes on to its next step;
+//! `spin <n> <stop-path>` spins on the CPU on n threads, n at least 1, until the file at the path exists, then goes on,
+//! and exits 1 when it has not appeared after 600 s;
+//! `spawn-away <pid-path> <n> <stop-path>` starts `fake-tool spin <n> <stop-path>`, or, when n is 0, `fake-tool sleep
+//! 600000`, which never looks at the stop path and uses no CPU, outside this process's job
+//! (`CREATE_BREAKAWAY_FROM_JOB`, which the job must allow) with no standard handles, writes the line
+//! `<its pid> <its start>` to the file at the pid path, the start in 100 ns ticks since 1601, prints `spawned <its pid>` and goes on without
+//! waiting for it, so a case can stand it in for a packaged app the command's descendant starts;
 //! `argv` prints every word after it, each on its own line, and ends, so it is always the last step.
 //! With no `exit` step it exits 0. For example `fake-tool out hi err oops exit 3`.
 
@@ -34,8 +41,9 @@
 
 use std::ffi::OsString;
 use std::io::{self, Read, Write};
+use std::os::windows::process::CommandExt as _;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -48,6 +56,9 @@ const WAIT_LIMIT: Duration = Duration::from_secs(600);
 const BURN_STEP: Duration = Duration::from_millis(10);
 /// How long `chatter` waits between two of its lines.
 const CHATTER_STEP: Duration = Duration::from_millis(50);
+/// `CREATE_BREAKAWAY_FROM_JOB`: the process `spawn-away` creates is in none of this process's jobs below the one that
+/// allows it, as `windows-sys` spells it under a feature this crate does not build with.
+const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
 
 /// Exits through `std::process::exit`, because `ExitCode` carries 8 bits and the suite needs codes above 255 and
 /// negative ones.
@@ -150,15 +161,13 @@ fn run(args: &[OsString]) -> Result<i32, String> {
                 writeln!(stdout, "pid {}", std::process::id()).map_err(|error| write_failed(&error))?;
                 stdout.flush().map_err(|error| write_failed(&error))?;
             }
-            "burn-threads" => {
-                let threads = operand(&mut steps, "burn-threads")?;
-                let threads: usize = threads
-                    .parse()
-                    .map_err(|_| format!("burn-threads takes a thread count, got '{threads}'"))?;
-                let ms = operand(&mut steps, "burn-threads")?;
-                let ms: u64 = ms.parse().map_err(|_| format!("burn-threads takes milliseconds, got '{ms}'"))?;
-                burn_threads(threads, Duration::from_millis(ms))?;
+            "burn-threads" => burn_threads(&mut steps)?,
+            "spin" => {
+                if !spin(&mut steps)? {
+                    return Ok(1);
+                }
             }
+            "spawn-away" => spawn_away(&mut steps, &mut stdout)?,
             other => return Err(format!("unknown step '{other}'")),
         }
     }
@@ -205,10 +214,13 @@ fn burn_until(path: &str) -> Result<(), String> {
     }
 }
 
-/// Spins on the CPU on `threads` threads until `wall` has passed, so the command keeps that many cores busy for as long
-/// as the machine gives them.
-fn burn_threads(threads: usize, wall: Duration) -> Result<(), String> {
-    let until = Instant::now() + wall;
+/// The `burn-threads <n> <ms>` step: spins on the CPU on n threads until ms of wall time have passed, so the command
+/// keeps that many cores busy for as long as the machine gives them.
+fn burn_threads<'a>(steps: &mut impl Iterator<Item = &'a OsString>) -> Result<(), String> {
+    let threads = count(&operand(steps, "burn-threads")?, "burn-threads")?;
+    let ms = operand(steps, "burn-threads")?;
+    let ms: u64 = ms.parse().map_err(|_| format!("burn-threads takes milliseconds, got '{ms}'"))?;
+    let until = Instant::now() + Duration::from_millis(ms);
     let burners: Vec<_> = (0..threads)
         .map(|_| {
             thread::spawn(move || {
@@ -223,6 +235,84 @@ fn burn_threads(threads: usize, wall: Duration) -> Result<(), String> {
         burner.join().map_err(|_| "a burning thread panicked".to_owned())?;
     }
     Ok(())
+}
+
+/// The thread count `text` spells for the step `step`.
+fn count(text: &str, step: &str) -> Result<usize, String> {
+    text.parse().map_err(|_| format!("{step} takes a thread count, got '{text}'"))
+}
+
+/// The `spin <n> <stop-path>` step: spins on the CPU on n threads, n at least 1, until the file at the path exists,
+/// each looking about every [`BURN_STEP`]; gives up after [`WAIT_LIMIT`], so a helper no case lets go never burns for
+/// ever. Whether the path came.
+fn spin<'a>(steps: &mut impl Iterator<Item = &'a OsString>) -> Result<bool, String> {
+    let threads = count(&operand(steps, "spin")?, "spin")?;
+    let path = operand(steps, "spin")?;
+    if threads == 0 {
+        return Err("spin takes at least one thread".to_owned());
+    }
+    let deadline = Instant::now() + WAIT_LIMIT;
+    let spinners: Vec<_> = (0..threads)
+        .map(|_| {
+            let path = path.clone();
+            thread::spawn(move || spin_until(&path, deadline))
+        })
+        .collect();
+    let mut came = true;
+    for spinner in spinners {
+        came &= spinner.join().map_err(|_| "a spinning thread panicked".to_owned())??;
+    }
+    Ok(came)
+}
+
+/// Spins on the CPU until the file at `path` exists or `deadline` has passed, looking about every [`BURN_STEP`];
+/// whether the path came.
+fn spin_until(path: &str, deadline: Instant) -> Result<bool, String> {
+    let mut state: u64 = 1;
+    loop {
+        let until = Instant::now() + BURN_STEP;
+        while Instant::now() < until {
+            state = std::hint::black_box(state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407));
+        }
+        match Path::new(path).try_exists() {
+            Ok(true) => return Ok(true),
+            Ok(false) if Instant::now() >= deadline => return Ok(false),
+            Ok(false) => {}
+            Err(error) => return Err(format!("cannot check {path}: {error}")),
+        }
+    }
+}
+
+/// The `spawn-away <pid-path> <n> <stop-path>` step: starts `fake-tool spin <n> <stop-path>`, or `fake-tool sleep` for
+/// [`WAIT_LIMIT`] when n is 0, so an idle helper neither polls its stop file nor uses CPU, outside this process's job
+/// with no standard handles, writes `<its pid> <its start>` to the file at the pid path while this process still holds
+/// its handle, so the start read is that process's, and prints `spawned <its pid>`.
+fn spawn_away<'a>(steps: &mut impl Iterator<Item = &'a OsString>, stdout: &mut impl Write) -> Result<(), String> {
+    let pid_path = operand(steps, "spawn-away")?;
+    let threads = operand(steps, "spawn-away")?;
+    let idle = count(&threads, "spawn-away")? == 0;
+    let stop = operand(steps, "spawn-away")?;
+    let me = std::env::current_exe().map_err(|error| format!("cannot find this program: {error}"))?;
+    let words = if idle {
+        vec!["sleep".to_owned(), WAIT_LIMIT.as_millis().to_string()]
+    } else {
+        vec!["spin".to_owned(), threads, stop]
+    };
+    let child = Command::new(me)
+        .args(&words)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(CREATE_BREAKAWAY_FROM_JOB)
+        .spawn()
+        .map_err(|error| format!("cannot start the helper outside the job: {error}"))?;
+    let pid = child.id();
+    let times = gate_win32::process_times(pid)
+        .map_err(|error| format!("cannot read the start of the helper {pid}: {error}"))?
+        .ok_or_else(|| format!("the helper {pid} ended as it started"))?;
+    write_file(&pid_path, &format!("{pid} {}\n", times.created))?;
+    writeln!(stdout, "spawned {pid}").map_err(|error| write_failed(&error))?;
+    stdout.flush().map_err(|error| write_failed(&error))
 }
 
 /// Prints a numbered line about every [`CHATTER_STEP`], flushing each, until the file at `path` exists: the log a case's

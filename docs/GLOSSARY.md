@@ -42,7 +42,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Drain**: see critical drain.
 - **Drained cutover**: a cutover in which every gate of the old generation finishes before the switch completes, while the two generations share the slot mutexes and take turns on them.
 - **Dynamic name**: one of cmd.exe's built-in variables (`%CD%`, `%RANDOM%`, `%ERRORLEVEL%` and the like) that it expands though the environment block holds no such variable; a batch target's words are refused when they hold one.
-- **Escaped process**: a process outside the command's job under a process the job holds, such as a packaged desktop app a non-packaged descendant started, or what that app started; a kill of `gate run` ends them, sparing build servers.
+- **Escaped process**: a process outside the command's job under a process the job holds, such as a packaged desktop app a non-packaged descendant started, or what that app started; the watch counts their CPU as the command's own, and a kill of `gate run` ends them, sparing build servers.
 - **Fallback**: a routed run that runs locally instead, after its builder refused it, the remote pool stayed full or the remote client could not start; journalled as a `fallback` event with its reason.
 - **Fallback poll**: the short timeout on every slot wait, which re-reads counts and tickets so a dead waiter's ticket is cleared even when no wake event comes.
 - **Free share**: the fraction of the cores the command could use that other work left free in a sample, at least 5%; the load-adjusted clock advances by it.
