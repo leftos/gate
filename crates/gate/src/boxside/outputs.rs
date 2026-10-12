@@ -2,13 +2,18 @@
 //! removes the outputs archives older than a day, lists the files under the globs before the command, and after a
 //! passing command and its back commit packs the files the PC lacks or holds otherwise into `<key>-<nonce>.tar.zst` in
 //! the output folder, as the PowerShell wrapper's `Publish-RunOutput` does. The `outputs` verb sends one such archive
-//! raw on stdout, then removes it; it takes no work folder lock, so it never waits on a run.
+//! raw on stdout, then removes it; it takes no work folder lock, so it never waits on a run. A pack that pushes the
+//! folder past its size budget removes the archives last written before its own, oldest first, never one written with
+//! or after it, and removes its own when that alone is over the budget, ending the run's outputs as not brought back.
 
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, BufWriter, Read, Write};
 use std::os::windows::fs::OpenOptionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
+
+use gate_args::BoxSeams;
+use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
 
 use crate::answer::{FAILED_STATUS, USAGE_STATUS};
 use crate::boxside::payload::{Payload, archive_file_name, archive_key, escaped};
@@ -25,14 +30,23 @@ use crate::outputs::walk::{in_context, walk};
 const ARCHIVE_AGE: Duration = Duration::from_hours(24);
 /// The most the PC's manifest line may hold, its newline included.
 const MANIFEST_LIMIT: u64 = 64 * 1024 * 1024;
+/// The bytes in one gibibyte, as [`OUTPUTS_BUDGET`] and an over-large archive's size in the line saying so are counted.
+const GIB: u64 = 1024 * 1024 * 1024;
+/// The most of the output folder's outputs archives the box keeps, in bytes: 50 GiB. A pack that pushes the folder past
+/// it removes the other archives, oldest first, until it fits again.
+const OUTPUTS_BUDGET: u64 = 50 * GIB;
+/// The line a pack says when there was nothing to bring back, and so no archive was written.
+pub(super) const NOTHING_PACKED: &str = "gate-remote-outputs: 0";
 
 /// What a run with output globs asks for: the globs, whether every file counts as changed (`OutputsFull`), the name of
 /// its archive and the folder it goes in.
 pub(super) struct Asked<'a> {
     globs: Globs,
     full: bool,
-    archive: String,
-    folder: &'a str,
+    /// The name of the run's own outputs archive in its output folder.
+    pub(super) archive: String,
+    /// The output folder the archive is written in.
+    pub(super) folder: &'a str,
 }
 
 impl<'a> Asked<'a> {
@@ -92,13 +106,26 @@ pub(super) fn prune(asked: &Asked<'_>, now: SystemTime) -> Vec<String> {
             }
         };
         if let Err(error) = remove_if_old(&entry, now) {
-            lines.push(format!(
-                "gate: remote could not remove the old outputs archive {}",
-                escaped(&in_context(&entry.path(), &error).to_string())
-            ));
+            lines.push(could_not_remove(&entry.path(), &error));
         }
     }
     lines
+}
+
+/// The line saying the outputs archive at `path` could not be removed, for `error`.
+fn could_not_remove(path: &Path, error: &io::Error) -> String {
+    format!(
+        "gate: remote could not remove the old outputs archive {}",
+        escaped(&in_context(path, error).to_string())
+    )
+}
+
+/// The line saying the outputs archive at `path` could not be read, for `error`.
+fn could_not_read(path: &Path, error: &io::Error) -> String {
+    format!(
+        "gate: remote could not read the outputs archive {}",
+        escaped(&in_context(path, error).to_string())
+    )
 }
 
 /// The line saying the output folder `folder` could not be listed for its old archives, for `error`.
@@ -120,9 +147,155 @@ fn remove_if_old(entry: &fs::DirEntry, now: SystemTime) -> io::Result<()> {
     if !(metadata.is_file() && old) {
         return Ok(());
     }
-    match fs::remove_file(entry.path()) {
+    remove_archive(&entry.path())
+}
+
+/// Removes the outputs archive at `path`; one already gone, as another run's trim may take it, counts as removed.
+fn remove_archive(path: &Path) -> io::Result<()> {
+    match fs::remove_file(path) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         removed => removed,
+    }
+}
+
+/// An outputs archive in the output folder: where it is, how big it is, its last write, and whether it is the run's own.
+struct Archive {
+    path: PathBuf,
+    size: u64,
+    modified: SystemTime,
+    own: bool,
+}
+
+/// What a trim of the output folder found.
+pub(super) struct Trimmed {
+    /// The lines saying each archive that could not be removed, in the order they were tried.
+    pub(super) lines: Vec<String>,
+    /// Why the run's own archive is not brought back, `None` when it is: [`over_budget_reason`]'s line for one alone
+    /// over the budget, which has been removed, or [`GONE_BEFORE_SENT`] for one gone before the trim.
+    pub(super) reason: Option<String>,
+}
+
+/// The output folder's size budget: the `--test-outputs-budget-bytes` seam's bytes when given, else [`OUTPUTS_BUDGET`].
+pub(super) fn budget(seams: &BoxSeams) -> u64 {
+    seams.outputs_budget_bytes.unwrap_or(OUTPUTS_BUDGET)
+}
+
+/// Brings the output folder back within `budget` bytes after a pack wrote the run's own archive named `own`. An own
+/// archive gone before the trim is not brought back ([`GONE_BEFORE_SENT`]); one alone larger than the budget is removed
+/// and no other archive is touched, since none of them could bring the folder within it and they belong to runs whose
+/// PCs may still fetch them; else the archives last written strictly before the run's own are removed, oldest first,
+/// until the folder fits. An archive last written with the run's own or after it is never removed, so two runs packing
+/// at once never remove each other's fresh archives: the newer run's own trim covers the older ones. The lines saying
+/// each archive that could not be removed are returned beside why the run's own archive is not brought back, `None`
+/// when it is. A folder that could not be listed whole is left as it is, its line returned.
+pub(super) fn trim(folder: &Path, own: &str, budget: u64) -> Trimmed {
+    let mut lines = Vec::new();
+    let Some(archives) = archives(folder, own, &mut lines) else {
+        return Trimmed { lines, reason: None };
+    };
+    let Some(mine) = archives.iter().find(|archive| archive.own) else {
+        return Trimmed {
+            lines,
+            reason: Some(GONE_BEFORE_SENT.to_owned()),
+        };
+    };
+    if mine.size > budget {
+        if let Err(error) = remove_archive(&mine.path) {
+            lines.push(could_not_remove(&mine.path, &error));
+        }
+        return Trimmed {
+            lines,
+            reason: Some(over_budget_reason(mine.size)),
+        };
+    }
+    let total = archives.iter().fold(0_u64, |total, archive| total.saturating_add(archive.size));
+    trim_to_fit(&archives, mine, total, budget, &mut lines);
+    Trimmed { lines, reason: None }
+}
+
+/// The reason a passing run's outputs are not brought back when the run's own archive was gone before the trim, as
+/// another run's trim or the age prune may take it.
+const GONE_BEFORE_SENT: &str = "the archive was removed before it could be sent";
+
+/// The reason a passing run's outputs are not brought back when the run's own archive alone is over the budget: its
+/// size in GiB to one decimal, and the budget the box keeps.
+fn over_budget_reason(bytes: u64) -> String {
+    let tenths = bytes.saturating_mul(10) / GIB;
+    format!(
+        "the archive is {}.{} GiB, more than the box keeps ({} GiB)",
+        tenths / 10,
+        tenths % 10,
+        OUTPUTS_BUDGET / GIB
+    )
+}
+
+/// The outputs archives in `folder`, the run's own named `own` marked, with their sizes and last writes; `None` when
+/// the folder or an entry of the listing could not be read, its line pushed to `lines`, so a trim is never taken from a
+/// listing that is not whole. An entry that is not an outputs archive, or is not a plain file, is left out, and one
+/// whose metadata cannot be read is said and left out too.
+fn archives(folder: &Path, own: &str, lines: &mut Vec<String>) -> Option<Vec<Archive>> {
+    let entries = match fs::read_dir(folder) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Some(Vec::new()),
+        Err(error) => {
+            lines.push(not_listed(folder, &error));
+            return None;
+        }
+    };
+    let mut archives = Vec::new();
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                lines.push(not_listed(folder, &error));
+                return None;
+            }
+        };
+        match archive_of(&entry, own) {
+            Ok(Some(archive)) => archives.push(archive),
+            Ok(None) => {}
+            Err(error) => lines.push(could_not_read(&entry.path(), &error)),
+        }
+    }
+    Some(archives)
+}
+
+/// The outputs archive `entry` is, the run's own when its name is `own`; `None` when it is not an outputs archive or is
+/// not a plain file; else why it could not be read.
+fn archive_of(entry: &fs::DirEntry, own: &str) -> io::Result<Option<Archive>> {
+    let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+        return Ok(None);
+    };
+    if archive_key(&name).is_none() {
+        return Ok(None);
+    }
+    let metadata = entry.metadata()?;
+    if !metadata.is_file() {
+        return Ok(None);
+    }
+    Ok(Some(Archive {
+        path: entry.path(),
+        size: metadata.len(),
+        modified: metadata.modified()?,
+        own: name == own,
+    }))
+}
+
+/// Removes the archives of `archives` last written strictly before the run's own `mine`, oldest first and by path among
+/// ones last written together, until their `total` size is within `budget`, saying each that cannot be removed and going
+/// on to the next. An archive written with the run's own or after it is left alone, and the folder stays over the budget
+/// when no older one is left.
+fn trim_to_fit(archives: &[Archive], mine: &Archive, mut total: u64, budget: u64, lines: &mut Vec<String>) {
+    let mut older: Vec<&Archive> = archives.iter().filter(|archive| archive.modified < mine.modified).collect();
+    older.sort_by(|left, right| left.modified.cmp(&right.modified).then_with(|| left.path.cmp(&right.path)));
+    for archive in older {
+        if total <= budget {
+            return;
+        }
+        match remove_archive(&archive.path) {
+            Ok(()) => total = total.saturating_sub(archive.size),
+            Err(error) => lines.push(could_not_remove(&archive.path, &error)),
+        }
     }
 }
 
@@ -148,7 +321,8 @@ pub(super) fn listing(asked: &Asked<'_>, work: &Path) -> (Option<Listing>, Optio
 /// `skip`, the paths of the run's back commit: the line saying how many were packed and the archive's name, or
 /// `gate-remote-outputs: 0` with no archive written when none were. Else why the outputs are not brought back; an
 /// archive left half written is removed. The archive is made anew: a file or a link already at its name fails the pack
-/// and is left as it is. A file whose final path is not inside `work` fails the pack ([`pack`]).
+/// and is left as it is. A file whose final path is not inside `work` fails the pack ([`pack`]). The archive is opened
+/// sharing reads only while it is packed, so another run's trim cannot remove it before it is whole.
 pub(super) fn bring_back(
     asked: &Asked<'_>,
     manifest: &Result<Manifest, String>,
@@ -160,13 +334,14 @@ pub(super) fn bring_back(
     let found = walk(work, &asked.globs).map_err(|error| format!("the outputs could not be listed: {error}"))?;
     let chosen = select(&found, manifest, listing, skip, |file| file_sha256(&file.full)).map_err(|error| error.to_string())?;
     if chosen.is_empty() {
-        return Ok("gate-remote-outputs: 0".to_owned());
+        return Ok(NOTHING_PACKED.to_owned());
     }
     fs::create_dir_all(asked.folder).map_err(|error| format!("cannot make the output folder {}: {error}", asked.folder))?;
     let path = Path::new(asked.folder).join(&asked.archive);
     let file = OpenOptions::new()
         .write(true)
         .create_new(true)
+        .share_mode(FILE_SHARE_READ)
         .open(&path)
         .map_err(|error| format!("cannot create {}: {error}", path.display()))?;
     match pack(BufWriter::new(file), work, &chosen) {
@@ -187,7 +362,7 @@ pub(super) fn not_brought_back(reason: &str) -> String {
 /// removed. A work folder or output folder the payload gets wrong, or a payload without a `Name`, is a usage error (2);
 /// a `Name` given that is not an outputs archive of the work folder, an archive that does not exist or one that cannot
 /// be read or sent ends with status 1, and a sent archive that cannot be removed is said and left for a later run's
-/// [`prune`], status 0.
+/// [`prune`], status 0; one already gone says nothing.
 pub(super) fn outputs(payload: &Payload, console: &mut Console) -> u32 {
     let folder = match payload.work_folder().and_then(|(_, work)| payload.output_folder(work)) {
         Ok(folder) => folder,
@@ -209,7 +384,7 @@ pub(super) fn outputs(payload: &Payload, console: &mut Console) -> u32 {
         console.err(&unsent.line(name));
         return u32::from(FAILED_STATUS);
     }
-    if let Err(error) = fs::remove_file(&path) {
+    if let Err(error) = remove_archive(&path) {
         console.err(&format!(
             "gate: remote could not remove the outputs archive {name}: {}",
             escaped(&error.to_string())
@@ -262,10 +437,11 @@ fn send(path: &Path, sink: &mut impl Write) -> Result<(), Unsent> {
 mod tests {
     use std::fs::{self, File};
     use std::io::Cursor;
+    use std::os::windows::fs::OpenOptionsExt;
     use std::path::PathBuf;
     use std::time::{Duration, SystemTime};
 
-    use super::{ARCHIVE_AGE, Asked, MANIFEST_LIMIT, prune, read_manifest, remove_if_old};
+    use super::{ARCHIVE_AGE, Asked, GONE_BEFORE_SENT, MANIFEST_LIMIT, prune, read_manifest, remove_archive, remove_if_old, trim};
 
     /// The name of an outputs archive of the work folder `k`, its nonce 32 copies of `digit`.
     fn archive(digit: char) -> String {
@@ -390,5 +566,187 @@ mod tests {
         let listing = format!(r"gate: remote could not list the old outputs archives in {parent}\a\u{{1}}b: ");
         assert!(lines[0].starts_with(&listing), "{listing:?} in {lines:?}");
         assert!(!lines[0].contains('\u{1}'), "{lines:?}");
+    }
+
+    /// Makes a file `name` in `folder` holding `bytes` zero bytes, last written `age` before `now`.
+    fn sized(folder: &std::path::Path, name: &str, bytes: usize, now: SystemTime, age: Duration) {
+        let path = folder.join(name);
+        fs::write(&path, vec![0_u8; bytes]).expect("a file of many bytes can be written");
+        let file = fs::OpenOptions::new().write(true).open(&path).expect("the file can be opened");
+        file.set_modified(now - age).expect("its last write can be set");
+    }
+
+    #[test]
+    fn the_trim_removes_the_oldest_archives_until_the_folder_fits() {
+        let folder = scratch("trim-fits");
+        let now = SystemTime::now();
+        sized(&folder, &archive('9'), 100, now, Duration::ZERO);
+        sized(&folder, &archive('1'), 100, now, Duration::from_secs(3));
+        sized(&folder, &archive('2'), 100, now, Duration::from_secs(2));
+        sized(&folder, &archive('3'), 100, now, Duration::from_secs(1));
+
+        let trimmed = trim(&folder, &archive('9'), 250);
+
+        assert!(trimmed.lines.is_empty(), "{:?}", trimmed.lines);
+        assert!(trimmed.reason.is_none(), "the run's own archive fits the budget");
+        assert!(!folder.join(archive('1')).exists(), "the oldest archive is removed");
+        assert!(!folder.join(archive('2')).exists(), "so is the next oldest");
+        assert!(
+            folder.join(archive('3')).exists(),
+            "the folder fits once they are gone, so the newest stays"
+        );
+        assert!(folder.join(archive('9')).exists(), "the run's own archive stays");
+        fs::remove_dir_all(&folder).expect("the scratch folder can be removed");
+    }
+
+    #[test]
+    fn the_trim_never_removes_the_runs_own_archive() {
+        let folder = scratch("trim-own");
+        let now = SystemTime::now();
+        sized(&folder, &archive('9'), 100, now, Duration::from_secs(5));
+        sized(&folder, &archive('1'), 100, now, Duration::from_secs(9));
+        sized(&folder, &archive('2'), 100, now, Duration::from_secs(8));
+
+        let trimmed = trim(&folder, &archive('9'), 100);
+
+        assert!(trimmed.lines.is_empty(), "{:?}", trimmed.lines);
+        assert!(trimmed.reason.is_none(), "the run's own archive is within the budget");
+        assert!(folder.join(archive('9')).exists(), "the run's own archive stays");
+        assert!(!folder.join(archive('1')).exists(), "an older archive is removed instead");
+        assert!(!folder.join(archive('2')).exists(), "and the next older one, until none is left");
+        fs::remove_dir_all(&folder).expect("the scratch folder can be removed");
+    }
+
+    #[test]
+    fn the_trim_never_removes_an_archive_newer_than_its_own() {
+        let folder = scratch("trim-newer");
+        let now = SystemTime::now();
+        sized(&folder, &archive('9'), 100, now, Duration::from_secs(5));
+        sized(&folder, &archive('1'), 100, now, Duration::from_secs(5));
+        sized(&folder, &archive('2'), 100, now, Duration::from_secs(1));
+        sized(&folder, &archive('3'), 100, now, Duration::from_secs(9));
+
+        let trimmed = trim(&folder, &archive('9'), 100);
+
+        assert!(trimmed.lines.is_empty(), "{:?}", trimmed.lines);
+        assert!(trimmed.reason.is_none());
+        assert!(!folder.join(archive('3')).exists(), "an archive older than the run's own is removed");
+        assert!(
+            folder.join(archive('1')).exists(),
+            "an archive last written with the run's own is left alone"
+        );
+        assert!(folder.join(archive('2')).exists(), "an archive newer than the run's own is left alone");
+        assert!(folder.join(archive('9')).exists(), "the run's own archive stays");
+        fs::remove_dir_all(&folder).expect("the scratch folder can be removed");
+    }
+
+    #[test]
+    fn files_that_are_not_archives_are_neither_counted_nor_removed() {
+        let folder = scratch("trim-not-archives");
+        let now = SystemTime::now();
+        sized(&folder, &archive('9'), 100, now, Duration::ZERO);
+        sized(&folder, &archive('1'), 100, now, Duration::from_secs(2));
+        sized(&folder, "old.txt", 10_000, now, Duration::from_secs(2));
+        sized(&folder, "k-old.tar.zst", 10_000, now, Duration::from_secs(2));
+
+        let trimmed = trim(&folder, &archive('9'), 250);
+
+        assert!(trimmed.lines.is_empty(), "{:?}", trimmed.lines);
+        assert!(trimmed.reason.is_none());
+        assert!(
+            folder.join(archive('1')).exists(),
+            "no archive is removed to make room for a file that is not counted"
+        );
+        assert!(folder.join("old.txt").exists(), "a file that is not an archive is left alone");
+        assert!(
+            folder.join("k-old.tar.zst").exists(),
+            "a .tar.zst file not named as an outputs archive is left alone"
+        );
+        assert!(folder.join(archive('9')).exists());
+        fs::remove_dir_all(&folder).expect("the scratch folder can be removed");
+    }
+
+    #[test]
+    fn an_own_archive_larger_than_the_budget_is_reported() {
+        let folder = scratch("trim-own-large");
+        let now = SystemTime::now();
+        sized(&folder, &archive('9'), 1_000, now, Duration::from_secs(1));
+        sized(&folder, &archive('1'), 100, now, Duration::from_secs(9));
+
+        let trimmed = trim(&folder, &archive('9'), 500);
+
+        assert_eq!(
+            trimmed.reason.as_deref(),
+            Some("the archive is 0.0 GiB, more than the box keeps (50 GiB)"),
+            "the run's own archive alone is over the budget"
+        );
+        assert!(trimmed.lines.is_empty(), "{:?}", trimmed.lines);
+        assert!(!folder.join(archive('9')).exists(), "the run's own archive is removed");
+        assert!(folder.join(archive('1')).exists(), "every other archive is left alone");
+        fs::remove_dir_all(&folder).expect("the scratch folder can be removed");
+    }
+
+    #[test]
+    fn an_own_archive_gone_before_the_trim_is_not_brought_back() {
+        let folder = scratch("trim-own-gone");
+        let now = SystemTime::now();
+        sized(&folder, &archive('1'), 100, now, Duration::from_secs(9));
+
+        let trimmed = trim(&folder, &archive('9'), 100);
+
+        assert_eq!(
+            trimmed.reason.as_deref(),
+            Some(GONE_BEFORE_SENT),
+            "an own archive gone before the trim is not brought back"
+        );
+        assert!(trimmed.lines.is_empty(), "{:?}", trimmed.lines);
+        assert!(
+            folder.join(archive('1')).exists(),
+            "nothing is removed while the run's own archive cannot be found"
+        );
+        fs::remove_dir_all(&folder).expect("the scratch folder can be removed");
+    }
+
+    #[test]
+    fn a_failed_removal_moves_on_to_the_next_oldest() {
+        let folder = scratch("trim-failed-removal");
+        let now = SystemTime::now();
+        sized(&folder, &archive('9'), 100, now, Duration::ZERO);
+        sized(&folder, &archive('1'), 100, now, Duration::from_secs(9));
+        sized(&folder, &archive('2'), 100, now, Duration::from_secs(8));
+        let held = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(folder.join(archive('1')))
+            .expect("the oldest archive can be held open sharing nothing");
+
+        let trimmed = trim(&folder, &archive('9'), 100);
+
+        let refused = format!(
+            "gate: remote could not remove the old outputs archive {}: ",
+            folder.join(archive('1')).display()
+        );
+        assert_eq!(trimmed.lines.len(), 1, "{:?}", trimmed.lines);
+        assert!(trimmed.lines[0].starts_with(&refused), "{refused:?} in {:?}", trimmed.lines);
+        assert!(folder.join(archive('1')).exists(), "an archive that cannot be removed stays");
+        assert!(!folder.join(archive('2')).exists(), "the trim goes on to the next oldest");
+        drop(held);
+        fs::remove_dir_all(&folder).expect("the scratch folder can be removed");
+    }
+
+    #[test]
+    fn an_archive_gone_before_its_removal_counts_as_removed() {
+        let folder = scratch("trim-gone");
+        let now = SystemTime::now();
+        sized(&folder, &archive('1'), 100, now, Duration::from_secs(1));
+        let path = folder.join(archive('1'));
+        fs::remove_file(&path).expect("the archive can be removed first, as another run's trim may");
+
+        assert_eq!(
+            remove_archive(&path).map_err(|error| error.to_string()),
+            Ok(()),
+            "an archive another run removed counts as removed"
+        );
+        fs::remove_dir_all(&folder).expect("the scratch folder can be removed");
     }
 }

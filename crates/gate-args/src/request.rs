@@ -54,6 +54,9 @@ pub struct BoxSeams {
     /// Make `gate box run` wait, just before it starts the command, until this path exists; `None` without the
     /// feature.
     pub park_launch: Option<PathBuf>,
+    /// The outputs folder's size budget in bytes for `gate box run`, over the built-in 50 GiB; `None` without the
+    /// feature.
+    pub outputs_budget_bytes: Option<u64>,
 }
 
 /// What `gate box` was asked to do on the builder.

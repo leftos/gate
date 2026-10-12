@@ -289,18 +289,39 @@ impl<'a> RunOutputs<'a> {
     }
 
     /// Packs the outputs of a passed command run in `work`, leaving out `skip`, the back commit's paths or why they
-    /// could not be read, and says how it went: 0, or 1 when the outputs are not brought back.
+    /// could not be read, and says how it went: 0, or 1 when the outputs are not brought back, the run's own archive
+    /// among them when it alone is over the box's outputs budget.
     fn bring_back(&self, work: &Path, skip: Result<Vec<String>, String>, beat: &Beat<'_>, console: &mut Console) -> u32 {
         let brought = skip.and_then(|skip| outputs::bring_back(self.asked, &self.manifest, self.listing.as_ref(), work, &skip));
         match brought {
             Ok(line) => {
                 beat.say(console, &line);
-                0
+                self.trim_outputs(line != outputs::NOTHING_PACKED, beat, console)
             }
             Err(reason) => {
                 beat.say(console, &outputs::not_brought_back(&reason));
                 FAILED_STATUS
             }
+        }
+    }
+
+    /// Brings the output folder back within the box's budget once a pack wrote an archive, saying each archive that
+    /// could not be removed; the run's own archive alone over the budget, or gone before the trim, leaves its outputs
+    /// not brought back. 0, or 1 when the run's own archive is not brought back.
+    fn trim_outputs(&self, wrote_archive: bool, beat: &Beat<'_>, console: &mut Console) -> u32 {
+        if !wrote_archive {
+            return 0;
+        }
+        let trimmed = outputs::trim(Path::new(self.asked.folder), &self.asked.archive, outputs::budget(beat.seams));
+        for line in &trimmed.lines {
+            beat.say(console, line);
+        }
+        match &trimmed.reason {
+            Some(reason) => {
+                beat.say(console, &outputs::not_brought_back(reason));
+                FAILED_STATUS
+            }
+            None => 0,
         }
     }
 }

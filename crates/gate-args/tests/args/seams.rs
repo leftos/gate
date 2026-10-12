@@ -628,6 +628,88 @@ fn box_seam_heartbeat_ms_is_an_unknown_word_without_the_feature() {
 
 #[cfg(feature = "test-seams")]
 #[test]
+fn box_seam_outputs_budget_bytes_is_read_before_the_verb() {
+    use std::ffi::OsString;
+
+    use gate_args::{BoxRequest, BoxSeams, BoxVerb, Invocation};
+
+    use crate::support::invocation;
+
+    let budgeted = |outputs_budget_bytes| {
+        Invocation::Box(BoxRequest {
+            verb: BoxVerb::Run,
+            payload: OsString::from("e30="),
+            seams: BoxSeams {
+                outputs_budget_bytes,
+                ..BoxSeams::default()
+            },
+        })
+    };
+    assert_eq!(
+        invocation(&["box", "--test-outputs-budget-bytes", "1024", "run", "e30="]),
+        budgeted(Some(1024))
+    );
+    assert_eq!(
+        invocation(&["box", "--test-outputs-budget-bytes=1024", "run", "e30="]),
+        budgeted(Some(1024))
+    );
+    assert_eq!(invocation(&["box", "run", "e30="]), budgeted(None), "no seam given, none set");
+    assert_eq!(
+        invocation(&["box", "--test-outputs-budget-bytes", "2147483647", "run", "e30="]),
+        budgeted(Some(2_147_483_647))
+    );
+}
+
+#[cfg(feature = "test-seams")]
+#[test]
+fn box_seam_outputs_budget_bytes_refuses_what_the_run_seams_refuse() {
+    let rows: [(&[&str], &[&str]); 7] = [
+        (
+            &["box", "--test-outputs-budget-bytes", "--test-outputs-budget-bytes=2", "run", "e30="],
+            &[
+                "gate: --test-outputs-budget-bytes needs a value",
+                "gate: --test-outputs-budget-bytes is given twice",
+            ],
+        ),
+        (
+            &["box", "--test-outputs-budget-bytes=", "run", "e30="],
+            &["gate: --test-outputs-budget-bytes needs a value"],
+        ),
+        (
+            &["box", "--test-outputs-budget-bytes", "0", "run", "e30="],
+            &["gate: --test-outputs-budget-bytes must be a whole number above 0, got '0'"],
+        ),
+        (
+            &["box", "--test-outputs-budget-bytes", "fast", "run", "e30="],
+            &["gate: --test-outputs-budget-bytes must be a whole number above 0, got 'fast'"],
+        ),
+        (
+            &["box", "--test-outputs-budget-bytes", "2147483648", "run", "e30="],
+            &["gate: --test-outputs-budget-bytes must be at most 2147483647, got '2147483648'"],
+        ),
+        (
+            &["box", "--test-outputs-budget-bytes", "1", "--test-outputs-budget-bytes=2", "run", "e30="],
+            &["gate: --test-outputs-budget-bytes is given twice"],
+        ),
+        (
+            &["box", "--test-outputs-budget-bytes"],
+            &["gate: --test-outputs-budget-bytes needs a value", BOX_USAGE],
+        ),
+    ];
+    for (words, want) in rows {
+        assert_eq!(problems(words), want, "{words:?}");
+    }
+}
+
+#[cfg(not(feature = "test-seams"))]
+#[test]
+fn box_seam_outputs_budget_bytes_is_an_unknown_word_without_the_feature() {
+    assert_eq!(problems(&["box", "--test-outputs-budget-bytes", "30", "run", "e30="]), [BOX_USAGE]);
+    assert_eq!(problems(&["box", "--test-outputs-budget-bytes=30", "run", "e30="]), [BOX_USAGE]);
+}
+
+#[cfg(feature = "test-seams")]
+#[test]
 fn box_seam_console_and_park_launch_are_read_before_the_verb() {
     use std::ffi::OsString;
     use std::path::PathBuf;
@@ -683,6 +765,7 @@ fn box_seam_console_and_park_launch_are_read_before_the_verb() {
                 heartbeat_ms: Some(30),
                 fail_console: true,
                 park_launch: Some(PathBuf::from(r"X:\case\park")),
+                outputs_budget_bytes: None,
             },
         }),
         "the seams come in any order before the verb"

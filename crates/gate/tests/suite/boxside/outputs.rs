@@ -529,6 +529,13 @@ fn file_aged(path: &Path, age: Duration) {
     file.set_modified(SystemTime::now() - age).expect("the file's last write can be set");
 }
 
+/// Makes a file at `path` holding `bytes` zero bytes, last written `age` ago.
+fn file_sized_aged(path: &Path, bytes: usize, age: Duration) {
+    fs::write(path, vec![0_u8; bytes]).expect("the file can be written");
+    let file = OpenOptions::new().write(true).open(path).expect("the file can be opened");
+    file.set_modified(SystemTime::now() - age).expect("the file's last write can be set");
+}
+
 #[test]
 fn box_run_removes_the_outputs_archives_older_than_a_day() {
     let case = Case::new("box_outputs_prune");
@@ -569,6 +576,69 @@ fn box_run_removes_the_outputs_archives_older_than_a_day() {
         "{refused:?} in {outcome:?}"
     );
     assert!(has_line(&outcome.stderr, "gate-remote-outputs: 0"), "{outcome:?}");
+}
+
+#[test]
+fn a_pack_past_the_budget_removes_the_oldest_archives() {
+    let case = Case::new("box_outputs_budget");
+    let mut payload = outputs_payload(&case, &[FAKE_TOOL, "write", r"bin\a.txt", "a"], &["bin/**"]);
+    snapshot(&case, &mut payload, &[IGNORE_BIN]);
+    let folder = PathBuf::from(field(&payload, "OutputFolder"));
+    fs::create_dir_all(&folder).expect("the outputs folder can be made");
+    let archive = |digit: char| folder.join(format!("k-{}.tar.zst", digit.to_string().repeat(32)));
+    let oldest = archive('a');
+    let newer = archive('b');
+    // A megabyte and a byte against a megabyte budget: the oldest goes and the newer stays, since the run's own
+    // archive is far under the megabyte left once the oldest is gone.
+    file_sized_aged(&oldest, 1_000_000, Duration::from_secs(3600));
+    file_sized_aged(&newer, 1, Duration::from_secs(1));
+
+    let outcome = finish_with_manifest(
+        box_command(&case, &["box", "--test-outputs-budget-bytes", "1000000", "run", &self::payload(&payload)]),
+        &manifest(&[]),
+    );
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(has_line(&outcome.stderr, &packed_line(&payload, 1)), "{outcome:?}");
+    assert!(!oldest.exists(), "the oldest archive is removed to make room");
+    assert!(newer.exists(), "the newer archive fits and stays");
+    assert!(archive_path(&payload).exists(), "the run's own archive stays");
+    assert!(
+        !outcome.stderr.lines().any(|line| line.starts_with("gate: remote could not remove")),
+        "{outcome:?}"
+    );
+}
+
+#[test]
+fn an_archive_larger_than_the_budget_is_not_brought_back() {
+    let case = Case::new("box_outputs_over_budget");
+    let mut payload = outputs_payload(&case, &[FAKE_TOOL, "write", r"bin\a.txt", "a"], &["bin/**"]);
+    snapshot(&case, &mut payload, &[IGNORE_BIN]);
+    let folder = PathBuf::from(field(&payload, "OutputFolder"));
+    fs::create_dir_all(&folder).expect("the outputs folder can be made");
+    let other = folder.join(format!("k-{}.tar.zst", "a".repeat(32)));
+    file_sized_aged(&other, 1, Duration::from_secs(60));
+
+    let outcome = finish_with_manifest(
+        box_command(&case, &["box", "--test-outputs-budget-bytes", "1", "run", &self::payload(&payload)]),
+        &manifest(&[]),
+    );
+
+    assert_eq!(
+        outcome.code,
+        Some(1),
+        "a passing run whose outputs are not brought back exits 1: {outcome:?}"
+    );
+    assert!(has_line(&outcome.stderr, &packed_line(&payload, 1)), "{outcome:?}");
+    assert!(
+        has_line(
+            &outcome.stderr,
+            "gate: remote outputs not brought back: the archive is 0.0 GiB, more than the box keeps (50 GiB)"
+        ),
+        "{outcome:?}"
+    );
+    assert!(!archive_path(&payload).exists(), "the over-large archive is removed");
+    assert!(other.exists(), "the other archive is left alone");
 }
 
 /// The payload of the `outputs` verb for the archive `name` of the work folder `k`.
