@@ -61,15 +61,27 @@ pub(crate) struct Inherited<'h> {
     pub(crate) others: &'h [(&'h OwnedHandle, Option<u32>)],
 }
 
+/// The `PROC_THREAD_ATTRIBUTE_DESKTOP_APP_POLICY` a command is created with.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum DesktopPolicy {
+    /// None.
+    Absent,
+    /// This policy; a system that cannot set it fails the launch.
+    Required(u32),
+    /// This policy where the system can set it (Windows 10 1703 and later); elsewhere the command is created without
+    /// it, and its [`Suspended::note`] says so.
+    Wanted(u32),
+}
+
 /// Creates the command of `creation` as [`create_process`] does, inheriting the handles of `inherited` and no other,
-/// with `desktop_policy` as its `PROC_THREAD_ATTRIBUTE_DESKTOP_APP_POLICY` when there is one. Under the spawn lock it
-/// makes an inheritable copy of each handle, creates the command with the copies and closes them, so a copy is open
-/// only while the lock is held.
+/// with `desktop_policy` as its `PROC_THREAD_ATTRIBUTE_DESKTOP_APP_POLICY`. Under the spawn lock it makes an
+/// inheritable copy of each handle, creates the command with the copies and closes them, so a copy is open only while
+/// the lock is held.
 pub(crate) fn create_inheriting(
     creation: &Creation<'_>,
     flags: PROCESS_CREATION_FLAGS,
     inherited: &Inherited<'_>,
-    desktop_policy: Option<u32>,
+    desktop_policy: DesktopPolicy,
 ) -> Result<Suspended, LaunchError> {
     // Declared first, so it is released last, after the copies are closed.
     let _spawning = lock_spawns();
@@ -85,17 +97,28 @@ pub(crate) fn create_inheriting(
         .map(|&(handle, access)| inheritable_copy(handle, access))
         .collect::<Result<Vec<_>, _>>()?;
     let other_refs: Vec<&OwnedHandle> = others.iter().collect();
-    let mut attributes = AttributeList::new(u32::from(desktop_policy.is_some()), stdio.each_ref(), &other_refs)?;
-    if let Some(policy) = desktop_policy.as_ref() {
-        // SAFETY: `policy` points into the parameter `desktop_policy`, which outlives the list and is not changed while
-        // the list lives; it is one DWORD, as the attribute wants.
-        unsafe {
+    let (policy, required) = match desktop_policy {
+        DesktopPolicy::Absent => (None, false),
+        DesktopPolicy::Required(policy) => (Some(policy), true),
+        DesktopPolicy::Wanted(policy) => (Some(policy), false),
+    };
+    let mut attributes = AttributeList::new(u32::from(policy.is_some()), stdio.each_ref(), &other_refs)?;
+    let mut note = None;
+    if let Some(policy) = policy.as_ref() {
+        // SAFETY: `policy` points into the local `policy`, which outlives the list and is not changed while the list
+        // lives; it is one DWORD, as the attribute wants.
+        let set = unsafe {
             attributes.update(
                 PROC_THREAD_ATTRIBUTE_DESKTOP_APP_POLICY,
                 std::ptr::from_ref(policy).cast(),
                 size_of::<u32>(),
             )
-        }?;
+        };
+        // A list whose update failed is unchanged, so the command is created as though the policy was never asked for.
+        match set {
+            Err(error) if !required => note = Some(format!("created without the desktop-app policy: {error}")),
+            other => other?,
+        }
     }
     let startup = startup_info(&mut attributes);
     #[cfg(test)]
@@ -105,7 +128,9 @@ pub(crate) fn create_inheriting(
         let copies: Vec<HANDLE> = stdio.iter().chain(&others).map(OwnedHandle::raw).collect();
         tests::in_window(&originals, &copies);
     }
-    create_process(creation, flags, &startup)
+    let mut suspended = create_process(creation, flags, &startup)?;
+    suspended.note = note;
+    Ok(suspended)
 }
 
 /// An inheritable copy of `handle` for one `CreateProcessW` call, with `access`, or the same access as `handle` for
@@ -317,6 +342,7 @@ fn create_process(creation: &Creation<'_>, flags: PROCESS_CREATION_FLAGS, startu
         thread,
         pid: created.dwProcessId,
         pipes: None,
+        note: None,
     })
 }
 

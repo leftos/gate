@@ -3,32 +3,22 @@
 //! already broken, then each process of the tree still running, deepest first, except this one.
 
 use std::collections::HashSet;
-use std::io;
 use std::time::{Duration, Instant};
 
 use gate_args::USAGE;
 use gate_state::{KernelObject, StateRoot};
-use gate_win32::{OpenedJob, StoppableProcess, win32_message};
-use jiff::Timestamp;
+use gate_win32::OpenedJob;
 use proc_table::{ProcessTree, Win32ProcessTable};
 
 use crate::answer::USAGE_STATUS;
 use crate::console::Console;
+use crate::stopping::{Node, Stop, failure, stop_process};
 
 /// The status every job and process this stops ends with.
 const STOP_STATUS: u32 = 124;
 /// How long, in all, the processes a terminated job held are given to end on their own, a job's termination being
 /// asynchronous.
 const JOB_END: Duration = Duration::from_secs(2);
-/// How long a process whose termination failed is given to end before the failure counts.
-const TERMINATE_CHECK: Duration = Duration::from_secs(1);
-
-/// One process of the tree, as the snapshot saw it.
-#[derive(Debug, PartialEq, Eq)]
-struct Node {
-    pid: u32,
-    created: Option<Timestamp>,
-}
 
 /// What a stop did: the gate jobs it terminated, the processes it had to terminate itself, and why it could not stop
 /// the rest.
@@ -114,6 +104,7 @@ fn found_in(pid: u32, state: RootState, snapshot: &ProcessTree) -> Found {
     };
     let nodes = std::iter::once(root).chain(snapshot.descendants(pid)).map(|process| Node {
         pid: process.pid,
+        parent: process.parent_pid,
         created: process.created,
     });
     Found::Tree(nodes.collect())
@@ -149,13 +140,17 @@ fn stop_job(job: &OpenedJob, members: &mut HashSet<u32>, stopped: &mut Stopped) 
     }
 }
 
-/// Stops each process of the tree deepest first, except this one. The processes a terminated job held share
-/// [`JOB_END`] to end on their own; any other is stopped at once.
+/// Stops each process of the tree deepest first, except this one; only a process this had to terminate itself is
+/// counted. The processes a terminated job held share [`JOB_END`] to end on their own; any other is stopped at once.
 fn stop_processes(tree: &[Node], members: &HashSet<u32>, stopped: &mut Stopped) {
     let me = std::process::id();
     let began = Instant::now();
     for node in tree.iter().rev().filter(|node| node.pid != me) {
-        stop_process(node, grace(members.contains(&node.pid), began.elapsed()), stopped);
+        match stop_process(node, grace(members.contains(&node.pid), began.elapsed()), STOP_STATUS) {
+            Stop::Gone => {}
+            Stop::Terminated => stopped.processes += 1,
+            Stop::Failed(failure) => stopped.failures.push(failure),
+        }
     }
 }
 
@@ -165,56 +160,15 @@ fn grace(member: bool, elapsed: Duration) -> Duration {
     if member { JOB_END.saturating_sub(elapsed) } else { Duration::ZERO }
 }
 
-/// Whether the process now behind a pid is the one the snapshot saw: both creation times known and equal, so a pid
-/// that went to a process created after the snapshot is passed over.
-fn same_process(snapshot: Option<Timestamp>, now: io::Result<Timestamp>) -> bool {
-    snapshot.is_some() && now.ok() == snapshot
-}
-
-/// Terminates one process of the tree unless it has ended, ends within `grace`, or its pid now belongs to a process
-/// created after the snapshot; only a process this had to terminate itself is counted. A failed termination counts as
-/// a failure only when the process is still running [`TERMINATE_CHECK`] later.
-fn stop_process(node: &Node, grace: Duration, stopped: &mut Stopped) {
-    let process = match StoppableProcess::open(node.pid) {
-        Ok(Some(process)) => process,
-        Ok(None) => return,
-        Err(error) => {
-            stopped.failures.push(failure(&format!("OpenProcess({})", node.pid), &error));
-            return;
-        }
-    };
-    // A wait that fails has not seen the process end, so the process is terminated as one still running is.
-    if !same_process(node.created, process.created()) || matches!(process.wait(grace), Ok(true)) {
-        return;
-    }
-    match process.terminate(STOP_STATUS) {
-        Ok(()) => stopped.processes += 1,
-        Err(error) => {
-            if !matches!(process.wait(TERMINATE_CHECK), Ok(true)) {
-                stopped.failures.push(failure(&format!("TerminateProcess({})", node.pid), &error));
-            }
-        }
-    }
-}
-
-/// `<operation> failed with Win32 error <code>: <message>`, as the PowerShell gate words a failed call.
-fn failure(operation: &str, error: &io::Error) -> String {
-    match error.raw_os_error().and_then(|code| u32::try_from(code).ok()) {
-        Some(code) => format!("{operation} failed with Win32 error {code}: {}", win32_message(code)),
-        None => format!("{operation} failed: {error}"),
-    }
-}
-
 #[cfg(test)]
 #[expect(clippy::expect_used, reason = "a test timestamp that does not parse must fail loudly")]
 mod tests {
-    use std::io;
     use std::time::Duration;
 
     use jiff::Timestamp;
     use proc_table::{ProcessInfo, ProcessTree};
 
-    use super::{Found, JOB_END, Node, RootState, found_in, grace, same_process};
+    use super::{Found, JOB_END, Node, RootState, found_in, grace};
 
     fn ts(text: &str) -> Timestamp {
         text.parse().expect("a test timestamp parses")
@@ -239,18 +193,19 @@ mod tests {
         ])
     }
 
-    fn node(pid: u32, created: &str) -> Node {
+    fn node(pid: u32, parent: u32, created: &str) -> Node {
         Node {
             pid,
+            parent,
             created: Some(ts(created)),
         }
     }
 
     fn chain_tree() -> Found {
         Found::Tree(vec![
-            node(1, "2026-10-01T10:00:01Z"),
-            node(2, "2026-10-01T10:00:02Z"),
-            node(3, "2026-10-01T10:00:03Z"),
+            node(1, 0, "2026-10-01T10:00:01Z"),
+            node(2, 1, "2026-10-01T10:00:02Z"),
+            node(3, 2, "2026-10-01T10:00:03Z"),
         ])
     }
 
@@ -291,17 +246,5 @@ mod tests {
     #[test]
     fn a_process_no_job_held_gets_no_grace() {
         assert_eq!(grace(false, Duration::ZERO), Duration::ZERO);
-    }
-
-    #[test]
-    fn only_equal_known_creation_times_are_the_same_process() {
-        let seen = ts("2026-10-01T10:00:00Z");
-        assert!(same_process(Some(seen), Ok(seen)));
-        assert!(!same_process(Some(seen), Ok(ts("2026-10-01T10:00:05Z"))), "a reused pid is passed over");
-        assert!(!same_process(None, Ok(seen)), "a start the snapshot could not read is never matched");
-        assert!(
-            !same_process(Some(seen), Err(io::Error::other("unreadable"))),
-            "a start that cannot be read now is not matched"
-        );
     }
 }

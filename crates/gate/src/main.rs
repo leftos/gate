@@ -14,6 +14,7 @@ mod console;
 mod covered;
 mod cutover;
 mod environment;
+mod escaped;
 mod journal;
 mod log;
 mod machine;
@@ -38,6 +39,7 @@ mod run;
 mod servers;
 mod slots;
 mod stop_tree;
+mod stopping;
 mod wait;
 mod watch;
 

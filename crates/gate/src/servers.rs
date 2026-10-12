@@ -54,6 +54,15 @@ pub(crate) fn counted(new_servers: &BTreeMap<u32, u64>, shared_servers: &BTreeMa
         .collect()
 }
 
+/// Whether a process whose image is `name` is a build server, as a sample and a kill both classify one, by the
+/// watchdog's [`is_build_server`]: a compiler server's image by its name alone, or the `dotnet` host whose command line
+/// names a compiler server or an `MSBuild` node. `line` gives the command line and is called only for the `dotnet`
+/// host; a line that cannot be read is the empty string the classifier takes.
+pub(crate) fn is_server(name: &str, test_image: Option<&str>, line: impl FnOnce() -> String) -> bool {
+    let line = if name.eq_ignore_ascii_case(DOTNET) { line() } else { String::new() };
+    is_build_server(name, &line, test_image)
+}
+
 /// What one sample's read is confined to: the pids of the job's processes, the command's start, and the folder a build
 /// server must live under.
 #[derive(Clone, Copy, Debug)]
@@ -161,7 +170,7 @@ impl Servers {
         };
         found.build_client |= is_build_client(&process.name, &line);
         if let Some(created) = created
-            && is_build_server(&process.name, &line, self.test_image.as_deref())
+            && is_server(&process.name, self.test_image.as_deref(), || line.clone())
         {
             found.servers.push(Classified {
                 pid: process.pid,
@@ -195,7 +204,7 @@ impl Servers {
         alive.insert(key);
         let line = self.line(key, process.pid, read);
         let test_image = self.test_image.as_deref();
-        if !is_build_server(&process.name, &line, test_image) || scope.under.is_some_and(|under| !under_folder(&line, under)) {
+        if !is_server(&process.name, test_image, || line.clone()) || scope.under.is_some_and(|under| !under_folder(&line, under)) {
             return None;
         }
         let counted = if times.created >= scope.since {

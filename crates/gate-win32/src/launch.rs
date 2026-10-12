@@ -1,6 +1,7 @@
 //! Commands created suspended, with an explicit environment and exactly three inherited handles (stdin from `NUL`,
 //! stdout to the log and stderr to the log's `.err` file; or stdin and stdout each a pipe this process holds the other
-//! end of, and stderr this process's own), then put in a job and resumed, so nothing they start runs outside the job.
+//! end of, and stderr this process's own), then put in a job and resumed, so what they start runs in the job, except a
+//! packaged desktop app a non-packaged descendant starts, which Windows puts in a job of its own.
 
 use std::cmp::Ordering;
 use std::ffi::{OsStr, OsString};
@@ -27,7 +28,7 @@ use windows_sys::Win32::System::Threading::{
 };
 use windows_sys::Win32::System::WindowsProgramming::PROCESS_CREATION_DESKTOP_APP_BREAKAWAY_DISABLE_PROCESS_TREE;
 
-use crate::create::{Creation, Inherited, check_launch, create_inheriting};
+use crate::create::{Creation, DesktopPolicy, Inherited, check_launch, create_inheriting};
 use crate::interrupt::{Woken, wait_again_with, wait_with};
 use crate::piped::{pipe_from_child, pipe_to_child};
 use crate::{Interrupt, Job, own_handle, wait_millis, win32_message};
@@ -285,7 +286,12 @@ impl Launch {
             others: &[],
         };
         let policy = PROCESS_CREATION_DESKTOP_APP_BREAKAWAY_DISABLE_PROCESS_TREE;
-        let mut suspended = create_inheriting(&creation, self.priority.map_or(0, PriorityClass::flag), &inherited, Some(policy))?;
+        let mut suspended = create_inheriting(
+            &creation,
+            self.priority.map_or(0, PriorityClass::flag),
+            &inherited,
+            DesktopPolicy::Required(policy),
+        )?;
         // The command holds its own copies of its ends now; with these closed, each pipe ends when the command's does.
         drop((input, output, errors));
         suspended.pipes = pipes;
@@ -411,6 +417,9 @@ pub struct Suspended {
     pub(crate) pid: u32,
     /// This process's ends of the command's pipes, for a [`LaunchOutput::Piped`] launch, until taken.
     pub(crate) pipes: Option<StdioPipes>,
+    /// What the launch could not give the command, for the caller to log: set when a desktop-app policy it only
+    /// wanted could not be set, and the command was created without it.
+    pub(crate) note: Option<String>,
 }
 
 impl Suspended {
@@ -420,13 +429,21 @@ impl Suspended {
         self.pid
     }
 
+    /// What the launch could not give the command, for the caller to log: `Some` when a [`crate::PipedLaunch`] could
+    /// not set the desktop-app policy, which needs Windows 10 1703 or later, and created the command without it.
+    #[must_use]
+    pub fn note(&self) -> Option<&str> {
+        self.note.as_deref()
+    }
+
     /// This process's ends of the command's stdin and stdout: `Some` once for a [`LaunchOutput::Piped`] launch, else
     /// `None`. Ends not taken close when the command is resumed or dropped.
     pub fn take_pipes(&mut self) -> Option<StdioPipes> {
         self.pipes.take()
     }
 
-    /// Puts the command in `job`, then lets it run, so nothing it starts can run outside the job.
+    /// Puts the command in `job`, then lets it run, so what it starts runs in the job (but see the module doc for a
+    /// packaged desktop app).
     ///
     /// # Errors
     ///

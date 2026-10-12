@@ -37,6 +37,8 @@ Suite = `crates/gate/tests/suite/` (binary `suite`, needs `--all-features`; test
 | cutover.rs | `cutover` (`gate cutover`, flag, counts copy, drain, Ctrl+C, resume), `launcher` (hand-over after flag) | no: cutover, launcher |
 | push.rs | `push` (`gate push`, `--test-push-ssh`, `--test-push-bound-ms`, fake-ssh) | no: push |
 | stop_tree.rs | `stop_tree` (`gate stop-tree`) | no: stop_tree |
+| stopping.rs | `stop_tree` (the checked open `gate stop-tree` shares), `stall` (the kill's escaped processes) | no: stop_tree, stall |
+| escaped.rs | `stall` (`a_stall_kill_ends_a_packaged_app_the_command_started`, machine-dependent; the unit tests inside), `interrupt` and `ceiling` (the other kills run it too) | no: stall, interrupt, ceiling |
 | burn.rs | `burn` (`gate burn`: start line, status, parent watch), `cli` (usage and refusals) | no: burn, cli |
 | request_json.rs | `request`, `compat`, `cutover` (`--test-print-request`), `launcher`, `harness`, `support` | no: request, compat, cutover, launcher, harness |
 | route.rs | `routing` (decisions, `--test-git`, remote.json), `remote_client`, `bridge`, `request` | no: routing, remote_client, bridge |
@@ -75,11 +77,11 @@ Suite = `crates/gate/tests/suite/` (binary `suite`, needs `--all-features`; test
 | gate-win32 job.rs / create.rs / launch.rs / lib.rs / mutex.rs | all (started command, job, slot mutexes): CENTRAL | `gate-win32` tests (launch, mutex, event, interrupt, `io` for `Job::written_bytes`...) | CENTRAL |
 | gate-win32 piped.rs / console.rs | `boxside` (`--test-box-console`, `--test-box-park-launch`), `bridge`, `remote_client` | win32 `launch` | no |
 | gate-win32 priority.rs | `priority`, `critical`, `build_servers` | win32 `priority` | no |
-| gate-win32 tree.rs | `stop_tree`, `interrupt`, `boxside` (stop), `burn` (`WaitableProcess`) | - | no |
+| gate-win32 tree.rs | `stop_tree`, `stall` (escaped processes), `interrupt`, `boxside` (stop), `burn` (`WaitableProcess`) | - | no |
 | gate-win32 interrupt.rs / event.rs | `interrupt`, `critical`, `cutover`, `routing`, `remote_client`, `boxside` (stop event), `slots` (wake) | win32 `interrupt`, `interrupt_again`, `event` | no |
 | gate-win32 device.rs | `routing` (subst drives in route facts) | - | no |
 | gate-win32 times.rs / memory.rs | `stall`, `ceiling`, `cores`, `pause` (samples) | - | no |
-| proc-table | `stop_tree` (imports `Win32ProcessTable`), `cutover` (`command_line_of`), `diagnostics`, `priority` (via servers/OtherGates) | proc-table unit | no |
+| proc-table | `stop_tree`, `stall` (`parent_pid_of`) (imports `Win32ProcessTable`), `cutover` (`command_line_of`), `diagnostics`, `priority` (via servers/OtherGates) | proc-table unit | no |
 | tools/gate.ps1 | `launcher` (runs the checked-in launcher), `cutover` (hand-over), `checkout` (`repo_file`) | - | no |
 | tools/install.ps1 | `install`, `checkout` | - | no |
 | tools/remote-bridge.ps1 | `bridge`, `routing` (via `--test-remote-script`), `install` (also installed) | - | no |
@@ -111,6 +113,8 @@ Always add `checkout` to any change that touches a suite file or adds a seam.
 | cutover.rs | `-E 'binary(suite) and test(/^(cutover\|launcher)::/) or (U and test(/^cutover::/))'` |
 | push.rs, bin/fake-ssh.rs (push side) | `-E 'binary(suite) and test(/^(push\|remote_client)::/)'` (fake-ssh also serves remote_client) |
 | stop_tree.rs | `-E 'binary(suite) and test(/^stop_tree::/)'` |
+| stopping.rs | `-E 'binary(suite) and test(/^(stop_tree\|stall)::/) or (U and test(/^stopping::/))'` |
+| escaped.rs | `-E 'binary(suite) and test(/^(stall\|interrupt\|ceiling)::/) or (U and test(/^escaped::/))'` |
 | burn.rs | `-E 'binary(suite) and test(/^(burn\|cli)::/) or (U and test(/^burn::/))'` |
 | request_json.rs | `-E 'binary(suite) and test(/^(request\|compat\|cutover\|launcher\|harness)::/)'` |
 | route.rs | `-E 'binary(suite) and test(/^(routing\|remote_client\|bridge\|request)::/) or (U and test(/^route::/))'` |
@@ -140,11 +144,11 @@ Always add `checkout` to any change that touches a suite file or adds a seam.
 | gate-win32 job/create/launch/lib/mutex | `-E 'rdeps(gate-win32)'` |
 | gate-win32 piped/console | `-E 'package(gate-win32) or (binary(suite) and test(/^(boxside\|bridge\|remote_client)::/))'` |
 | gate-win32 priority | `-E 'package(gate-win32) or (binary(suite) and test(/^(priority\|critical\|build_servers)::/))'` |
-| gate-win32 tree | `-E 'package(gate-win32) or (binary(suite) and test(/^(stop_tree\|interrupt\|boxside\|burn)::/))'` |
+| gate-win32 tree | `-E 'package(gate-win32) or (binary(suite) and test(/^(stop_tree\|stall\|interrupt\|boxside\|burn)::/))'` |
 | gate-win32 interrupt/event | `-E 'package(gate-win32) or (binary(suite) and test(/^(interrupt\|critical\|cutover\|routing\|remote_client\|boxside\|slots)::/))'` |
 | gate-win32 device | `-E 'package(gate-win32) or (binary(suite) and test(/^routing::/))'` |
 | gate-win32 times/memory | `-E 'package(gate-win32) or (binary(suite) and test(/^(stall\|ceiling\|cores\|pause)::/))'` |
-| proc-table | `-E 'package(proc-table) or (binary(suite) and test(/^(stop_tree\|cutover\|diagnostics\|priority)::/))'` (`rdeps(proc-table)` would pull gate-state and all of gate) |
+| proc-table | `-E 'package(proc-table) or (binary(suite) and test(/^(stop_tree\|stall\|cutover\|diagnostics\|priority)::/))'` (`rdeps(proc-table)` would pull gate-state and all of gate) |
 | docs only | no tests |
 
 (In a real `-E`, the pipe inside a regex is a plain `|`; the backslashes above only keep the Markdown table intact. Nextest regexes use `/.../`. Precedence: `and` binds tighter than `or`, add parentheses as written.)

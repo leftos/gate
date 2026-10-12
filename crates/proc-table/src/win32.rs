@@ -1,9 +1,11 @@
 //! The process table on 64-bit Windows: a `ToolHelp` snapshot, each process's start time, and its command line read
 //! from its PEB. [`Win32ProcessTable::snapshot_without_command_lines`] gives the same entries with no command line.
 //! The handle guard, [`open_process`] and [`read_parameters_string`] are public for callers that read another PEB
-//! string, such as a process's working directory.
+//! string, such as a process's working directory, and [`parent_pid_of`] for one that checks a process's parent through
+//! a handle it holds.
 
 use std::ffi::c_void;
+use std::io;
 use std::mem::size_of;
 use std::ptr::{self, with_exposed_provenance};
 
@@ -168,23 +170,7 @@ fn creation_time(process: &OwnedHandle) -> Option<Timestamp> {
 /// when any read fails or the string is empty. The process must be open with `PROCESS_VM_READ` and a query right.
 #[must_use]
 pub fn read_parameters_string(process: &OwnedHandle, offset: usize) -> Option<String> {
-    let mut information = PROCESS_BASIC_INFORMATION::default();
-    let size = u32::try_from(size_of::<PROCESS_BASIC_INFORMATION>()).ok()?;
-    let mut returned = 0;
-    // SAFETY: the process handle is open, `information` is a writable PROCESS_BASIC_INFORMATION of `size` bytes, and
-    // `returned` is a writable u32; all outlive the call.
-    let status = unsafe {
-        NtQueryInformationProcess(
-            process.0,
-            ProcessBasicInformation,
-            ptr::from_mut(&mut information).cast::<c_void>(),
-            size,
-            &raw mut returned,
-        )
-    };
-    if status != 0 {
-        return None;
-    }
+    let information = basic_information(process).ok()?;
     let parameters = read_address(
         process,
         information.PebBaseAddress.expose_provenance().checked_add(PEB_PROCESS_PARAMETERS)?,
@@ -198,6 +184,44 @@ pub fn read_parameters_string(process: &OwnedHandle, offset: usize) -> Option<St
     let bytes = read_memory(process, buffer, length)?;
     let units: Vec<u16> = bytes.as_chunks::<2>().0.iter().map(|pair| u16::from_le_bytes(*pair)).collect();
     Some(String::from_utf16_lossy(&units))
+}
+
+/// The id of the process that started the process behind `process`, as the process's own record holds it
+/// (`InheritedFromUniqueProcessId`): read through the handle, so it belongs to the process the handle holds, whatever has
+/// become of the pid since. The process must be open with `PROCESS_QUERY_LIMITED_INFORMATION`.
+///
+/// # Errors
+///
+/// An error naming the `NTSTATUS` when the process's basic information cannot be read, or one saying the id does not
+/// fit a pid.
+pub fn parent_pid_of(process: &OwnedHandle) -> io::Result<u32> {
+    let information = basic_information(process)?;
+    u32::try_from(information.InheritedFromUniqueProcessId).map_err(io::Error::other)
+}
+
+/// The process's basic information (`ProcessBasicInformation`): its PEB's address and its parent's id among others.
+fn basic_information(process: &OwnedHandle) -> io::Result<PROCESS_BASIC_INFORMATION> {
+    let mut information = PROCESS_BASIC_INFORMATION::default();
+    let size = u32::try_from(size_of::<PROCESS_BASIC_INFORMATION>()).map_err(io::Error::other)?;
+    let mut returned = 0;
+    // SAFETY: the process handle is open, `information` is a writable PROCESS_BASIC_INFORMATION of `size` bytes, and
+    // `returned` is a writable u32; all outlive the call.
+    let status = unsafe {
+        NtQueryInformationProcess(
+            process.0,
+            ProcessBasicInformation,
+            ptr::from_mut(&mut information).cast::<c_void>(),
+            size,
+            &raw mut returned,
+        )
+    };
+    if status != 0 {
+        return Err(io::Error::other(format!(
+            "NtQueryInformationProcess(ProcessBasicInformation) failed with NTSTATUS 0x{:08x}",
+            status.cast_unsigned()
+        )));
+    }
+    Ok(information)
 }
 
 /// The command line the process `pid` was started with, or `None` when it cannot be read: the process belongs to

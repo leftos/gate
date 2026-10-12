@@ -29,7 +29,7 @@ use windows_sys::Win32::System::Threading::{
     CREATE_BREAKAWAY_FROM_JOB, CREATE_NO_WINDOW, OpenProcess, PROCESS_CREATION_FLAGS, PROCESS_SYNCHRONIZE, TerminateProcess,
 };
 
-use crate::create::{Creation, Inherited, create_inheriting};
+use crate::create::{Creation, DesktopPolicy, Inherited, create_inheriting};
 use crate::event::signalled;
 use crate::launch::{LaunchError, open_shared};
 use crate::{EnvironmentBlock, Job, Running, Suspended, own_handle, system_directory};
@@ -439,7 +439,7 @@ fn start_helper(feed: &Feed, flags: PROCESS_CREATION_FLAGS, job: Option<&Job>, w
         stdio: [&feed.read, &feed.nul, &feed.nul],
         others: &[],
     };
-    let suspended = create_inheriting(&creation, flags, &inherited, None).map_err(|error| cannot(&error))?;
+    let suspended = create_inheriting(&creation, flags, &inherited, DesktopPolicy::Absent).map_err(|error| cannot(&error))?;
     resume(suspended, job).map_err(|error| cannot(&error))
 }
 

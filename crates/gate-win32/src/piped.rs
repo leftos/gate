@@ -20,8 +20,9 @@ use windows_sys::Win32::System::JobObjects::{
 use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::SystemServices::JOB_OBJECT_QUERY;
 use windows_sys::Win32::System::Threading::{CREATE_BREAKAWAY_FROM_JOB, CREATE_NO_WINDOW, GetCurrentProcess, PROCESS_CREATION_FLAGS};
+use windows_sys::Win32::System::WindowsProgramming::PROCESS_CREATION_DESKTOP_APP_BREAKAWAY_DISABLE_PROCESS_TREE;
 
-use crate::create::{Creation, Inherited, check_launch, create_inheriting};
+use crate::create::{Creation, DesktopPolicy, Inherited, check_launch, create_inheriting};
 use crate::launch::{open_shared, setup, struct_size};
 use crate::{EnvironmentBlock, Job, LaunchError, Suspended, own_handle, wide};
 
@@ -113,7 +114,12 @@ impl PipedLaunch {
     }
 
     /// Creates the command suspended with the creation flag `breakaway`, `CREATE_BREAKAWAY_FROM_JOB` or none, its stdin
-    /// `input`, a handle the caller made, which is closed here once the command holds its own copy.
+    /// `input`, a handle the caller made, which is closed here once the command holds its own copy. It is created with
+    /// the desktop-app policy `PROCESS_CREATION_DESKTOP_APP_BREAKAWAY_DISABLE_PROCESS_TREE`, as
+    /// [`crate::Launch::start_suspended`] creates its command, so a command that is a packaged app, such as the Store's
+    /// pwsh, starts its children inside its package, and so inside the job it is put in. A system that cannot set the
+    /// policy (before Windows 10 1703) gets the command without it, and [`Suspended::note`] says so, rather than a
+    /// failed launch.
     fn created(&self, job: &Job, breakaway: PROCESS_CREATION_FLAGS, input: OwnedHandle) -> Result<PipedSuspended, LaunchError> {
         check_launch(&self.command_line, &self.application, &[("working folder", self.directory.as_path())])?;
         let job_handle = if job.kills_on_close() { None } else { Some(open_job(job)?) };
@@ -134,7 +140,8 @@ impl PipedLaunch {
             PipedConsole::Hidden => breakaway | CREATE_NO_WINDOW,
             PipedConsole::Attached => breakaway,
         };
-        let suspended = create_inheriting(&creation, flags, &inherited, None)?;
+        let policy = DesktopPolicy::Wanted(PROCESS_CREATION_DESKTOP_APP_BREAKAWAY_DISABLE_PROCESS_TREE);
+        let suspended = create_inheriting(&creation, flags, &inherited, policy)?;
         // The command holds its own copies now; with these closed, each read end ends when the command's copies do.
         drop((input, output, errors, job_handle));
         Ok(PipedSuspended { suspended, stdout, stderr })

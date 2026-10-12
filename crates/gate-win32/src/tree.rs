@@ -14,7 +14,7 @@ use windows_sys::Win32::System::Threading::{
     TerminateProcess, WaitForSingleObject,
 };
 
-use crate::{job, own_handle, start_of, wait_millis, wide};
+use crate::{Job, exit_of, job, own_handle, start_of, wait_millis, wide};
 
 /// A job another process created, opened by its name with the access to list its processes, and to end them when it
 /// was opened to be stopped. Dropping it only closes this handle.
@@ -112,6 +112,37 @@ impl StoppableProcess {
     pub fn created(&self) -> io::Result<Timestamp> {
         // SAFETY: the handle is open for as long as `self` lives, with `PROCESS_QUERY_LIMITED_INFORMATION` access.
         unsafe { start_of(self.handle.raw()) }
+    }
+
+    /// When it ended, as [`StoppableProcess::created`] gives its start (whole microseconds), so a process that started
+    /// after it ended is told from one it started; it has an end once [`StoppableProcess::wait`] has found it ended.
+    ///
+    /// # Errors
+    ///
+    /// The system's error when its times cannot be read; an error when it has not ended, or when the time is outside a
+    /// [`Timestamp`]'s range.
+    pub fn exited(&self) -> io::Result<Timestamp> {
+        // SAFETY: the handle is open for as long as `self` lives, with `PROCESS_QUERY_LIMITED_INFORMATION` access.
+        unsafe { exit_of(self.handle.raw()) }
+    }
+
+    /// The id of the process that started it, read through this handle, so it is this process's parent whatever has
+    /// become of its pid since it was opened.
+    ///
+    /// # Errors
+    ///
+    /// An error naming the status when its basic information cannot be read.
+    pub fn parent_pid(&self) -> io::Result<u32> {
+        proc_table::win32::parent_pid_of(&self.handle)
+    }
+
+    /// Whether it is in `job`, or in a job nested inside it.
+    ///
+    /// # Errors
+    ///
+    /// The system's error when that cannot be read.
+    pub fn in_job(&self, job: &Job) -> io::Result<bool> {
+        job.holds(&self.handle)
     }
 
     /// Waits at most `timeout` for the process to end: true when it has ended, false when it still runs.
@@ -214,4 +245,58 @@ fn wait_handle(handle: &OwnedHandle, timeout: Duration) -> io::Result<bool> {
 /// Whether `error` is the Win32 error `code`.
 pub(crate) fn is_error(error: &io::Error, code: u32) -> bool {
     error.raw_os_error() == i32::try_from(code).ok()
+}
+
+#[cfg(test)]
+#[expect(clippy::expect_used, reason = "a test that cannot start or open its process must fail loudly")]
+mod tests {
+    use std::process::{Command, Stdio};
+
+    use super::StoppableProcess;
+
+    #[test]
+    fn a_child_s_parent_read_through_its_handle_is_this_process() {
+        let cmd = crate::system_directory().expect("the system folder is known").join("cmd.exe");
+        // `set /p` waits for a line on its stdin, so the child runs until this test drops its end of the pipe.
+        let mut child = crate::spawn(
+            Command::new(cmd)
+                .args(["/d", "/c", "set /p line="])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null()),
+        )
+        .expect("cmd starts");
+        let opened = StoppableProcess::open(child.id()).expect("the child opens").expect("the child runs");
+
+        let parent = opened.parent_pid();
+
+        opened.terminate(1).expect("the child is ended");
+        child.wait().expect("the child is waited for");
+        assert_eq!(parent.expect("the child's parent is read"), std::process::id());
+    }
+
+    #[test]
+    fn an_unrelated_process_s_parent_read_through_its_handle_is_the_one_the_snapshot_lists() {
+        let me = std::process::id();
+        let snapshot = proc_table::Win32ProcessTable.snapshot_without_command_lines();
+        let listed_parent = |pid: u32| {
+            snapshot
+                .iter()
+                .find(|process| process.pid == pid)
+                .map(|process| process.parent_pid)
+                .expect("the snapshot lists the process")
+        };
+        let parent_pid = StoppableProcess::open(me)
+            .expect("this process opens")
+            .expect("it runs")
+            .parent_pid()
+            .expect("this process's parent is read");
+        assert_eq!(parent_pid, listed_parent(me), "this process's parent, as the snapshot lists it");
+        // The test runner that started this test runs until it ends.
+        let parent = StoppableProcess::open(parent_pid).expect("this process's parent opens").expect("it runs");
+
+        let grandparent = parent.parent_pid().expect("the parent's own parent is read");
+
+        assert_ne!(grandparent, me, "the parent was not started by this process");
+        assert_eq!(grandparent, listed_parent(parent_pid), "the parent's parent, as the snapshot lists it");
+    }
 }

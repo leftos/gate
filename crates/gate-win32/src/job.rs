@@ -5,7 +5,7 @@ use std::io;
 use proc_table::win32::OwnedHandle;
 use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, ERROR_MORE_DATA, GetLastError, SetLastError};
 use windows_sys::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_BREAKAWAY_OK, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_BREAKAWAY_OK, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_BASIC_AND_IO_ACCOUNTING_INFORMATION, JOBOBJECT_BASIC_PROCESS_ID_LIST,
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectBasicAccountingInformation, JobObjectBasicAndIoAccountingInformation, JobObjectBasicProcessIdList,
     JobObjectExtendedLimitInformation, QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
@@ -162,6 +162,18 @@ impl Job {
     /// The system's error when the job cannot be queried.
     pub fn process_ids(&self) -> io::Result<Vec<u32>> {
         process_ids(&self.handle)
+    }
+
+    /// Whether the process behind `process`, open with `PROCESS_QUERY_LIMITED_INFORMATION`, is in the job, or in a job
+    /// nested inside it (`IsProcessInJob`).
+    pub(crate) fn holds(&self, process: &OwnedHandle) -> io::Result<bool> {
+        let mut inside = 0;
+        // SAFETY: both handles are open for the whole call, the job's with the `JOB_OBJECT_QUERY` access a new job's
+        // handle has, and `inside` is writable.
+        if unsafe { IsProcessInJob(process.raw(), self.handle.raw(), &raw mut inside) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(inside != 0)
     }
 
     /// The CPU time the job has used, every process ever in it counted, and the processes it holds now.

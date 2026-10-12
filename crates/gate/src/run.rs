@@ -24,6 +24,7 @@ use crate::answer::USAGE_STATUS;
 use crate::console::Console;
 use crate::covered::Covered;
 use crate::environment::{self, Variables};
+use crate::escaped::{self, Found, Reach, Reached};
 use crate::journal::{self, RunJournal};
 use crate::log::Log;
 use crate::machine::{self, Machine, MachineWait, MachineWaited};
@@ -1049,7 +1050,16 @@ impl Run<'_> {
     /// Watches the started command to its exit, a kill or a Ctrl+C, then reaches the verdict. Should the gate fail
     /// or panic first, the job is terminated, so the command does not outlive the run.
     fn watched(&mut self, job: &Job, running: &Running, start: &Start, console: &mut Console) -> Ended {
-        let mut stopper = Stopper { job, armed: true };
+        // Copies of the run's own references, so the stopper holds no borrow of the run while it is watched.
+        let (request, root) = (self.request, self.root);
+        let mut stopper = Stopper {
+            reach: Reach {
+                job,
+                server_image: request.test_seams.server_image.as_deref(),
+                root: &root.root,
+            },
+            armed: true,
+        };
         let ended = match self.watch(job, running, start, console) {
             Ok((watched, timing)) => self.after_watch(watched, timing, (job, running), console),
             Err(problem) => self.gate_failed(&problem, Some((job, running)), console),
@@ -1105,7 +1115,7 @@ impl Run<'_> {
                     console.note(note);
                 }
                 console.err(&line);
-                kill(job, running, processes, console);
+                kill(&self.reach(job), running, processes, console);
                 console.err(&format!("gate: diagnostics written to {}", self.log.path().display()));
                 let exited = i64::from(STOPPED);
                 self.ended(
@@ -1121,7 +1131,7 @@ impl Run<'_> {
                 )
             }
             Watched::Interrupted => {
-                let exited = interrupted(job, running, console);
+                let exited = interrupted(&self.reach(job), running, console);
                 self.ended(&Outcome { exited, timing, kill: None }, true, &[], started, console)
             }
         }
@@ -1272,11 +1282,21 @@ impl Run<'_> {
         Ok((found, tail_without_block(self.log.tail(wanted)?, diagnostics, self.request.tail)))
     }
 
+    /// What a kill of the command in `job` reaches: the job, the one more compiler server image it leaves running
+    /// (`--test-server-image`), as the watch reads it, and the state root that names a gate's job.
+    fn reach<'s>(&'s self, job: &'s Job) -> Reach<'s> {
+        Reach {
+            job,
+            server_image: self.request.test_seams.server_image.as_deref(),
+            root: &self.root.root,
+        }
+    }
+
     /// Says the gate's own failure, terminates the job of a command that started, and completes the log; status 1.
     fn gate_failed(&mut self, problem: &str, started: Option<(&Job, &Running)>, console: &mut Console) -> Ended {
         console.err(&format!("gate: the gate failed while running the command: {problem}"));
         if let Some((job, running)) = started {
-            stop(job, running, console);
+            stop(&self.reach(job), running, console);
         }
         if let Err(error) = self.log.finish(console) {
             console.err(&format!(
@@ -1291,9 +1311,11 @@ impl Run<'_> {
     }
 }
 
-/// Terminates the job when dropped armed: on a return or a panic the run did not plan for after the command started.
+/// Terminates the job, and ends the processes that left it, when dropped armed: on a return or a panic the run did not
+/// plan for after the command started.
 struct Stopper<'a> {
-    job: &'a Job,
+    /// The job and what its stop reaches outside it.
+    reach: Reach<'a>,
     armed: bool,
 }
 
@@ -1301,40 +1323,55 @@ impl Drop for Stopper<'_> {
     fn drop(&mut self) {
         if self.armed {
             // The run is already leaving on a failure, with nowhere left to report a failed terminate to.
-            let _ = self.job.terminate(STOPPED);
+            let _ = self.reach.terminate(STOPPED, STOP_WAIT, Found::default());
         }
     }
 }
 
-/// Terminates the job after a failure of the gate's own, and gives the command a moment to end.
-fn stop(job: &Job, running: &Running, console: &mut Console) {
-    if let Err(error) = job.terminate(STOPPED) {
-        console.err(&format!("gate: and could not terminate the command's job: {error}"));
-        return;
+/// Terminates the job `reach` names after a failure of the gate's own, ends the processes that left it but the build
+/// servers, and gives the command a moment to end.
+fn stop(reach: &Reach<'_>, running: &Running, console: &mut Console) {
+    match reach.terminate(STOPPED, STOP_WAIT, Found::default()) {
+        Ok(reached) => say_problems(&reached, console),
+        Err(error) => {
+            console.err(&format!("gate: and could not terminate the command's job: {error}"));
+            return;
+        }
     }
     await_stopped(running, console);
 }
 
-/// Terminates the job of a killed command, which held `processes` processes, and gives the command a moment to end.
-fn kill(job: &Job, running: &Running, processes: u32, console: &mut Console) {
-    if let Err(error) = job.terminate(STOPPED) {
-        console.err(&format!("gate: could not terminate the command's job: {error}"));
-        return;
+/// Terminates the job `reach` names of a killed command, which held `processes` processes, ends the processes that left
+/// it but the build servers, and gives the command a moment to end.
+fn kill(reach: &Reach<'_>, running: &Running, processes: u32, console: &mut Console) {
+    match reach.terminate(STOPPED, STOP_WAIT, Found::default()) {
+        Ok(reached) => {
+            console.err(&escaped::terminated_line(processes, &reached.ended));
+            say_problems(&reached, console);
+        }
+        Err(error) => {
+            console.err(&format!("gate: could not terminate the command's job: {error}"));
+            return;
+        }
     }
-    console.err(&format!("gate: terminated the job's {processes} process(es)"));
     await_stopped(running, console);
 }
 
-/// Waits up to [`STOP_WAIT`] for a command the console interrupted, which had the Ctrl+C too, to end on its own; its
-/// own status, with whatever it left in its job terminated. One still running then has its job terminated, and the
-/// status is `STATUS_CONTROL_C_EXIT`.
-fn interrupted(job: &Job, running: &Running, console: &mut Console) -> i64 {
+/// Looks for the processes that left the command's job as soon as the interrupt arrives, while the in-job process that
+/// started them may still run, then waits up to [`STOP_WAIT`] for the command, which had the Ctrl+C too, to end on its
+/// own; its own status, with whatever it left in its job terminated and the processes that left it ended: those that
+/// first look found and those a second look at the terminate finds. One still running then has its job terminated and
+/// those processes ended the same way, and the status is `STATUS_CONTROL_C_EXIT`. The build servers outside the job are
+/// left running.
+fn interrupted(reach: &Reach<'_>, running: &Running, console: &mut Console) -> i64 {
     console.err("gate: interrupted; stopping the command");
+    let early = reach.look();
     match running.wait(STOP_WAIT) {
         Ok(Some(code)) => {
-            // What the command left running in its job does not outlive the gate after a Ctrl+C.
-            if let Err(error) = job.terminate(CONTROL_C_EXIT) {
-                console.err(&format!("gate: could not terminate the command's job: {error}"));
+            // What the command left running in its job, or outside it, does not outlive the gate after a Ctrl+C.
+            match reach.terminate(CONTROL_C_EXIT, STOP_WAIT, early) {
+                Ok(reached) => say_problems(&reached, console),
+                Err(error) => console.err(&format!("gate: could not terminate the command's job: {error}")),
             }
             return i64::from(code.cast_signed());
         }
@@ -1343,13 +1380,21 @@ fn interrupted(job: &Job, running: &Running, console: &mut Console) -> i64 {
             "gate: cannot wait for the command after the interrupt: {error}; terminating its job"
         )),
     }
-    match job.terminate(CONTROL_C_EXIT) {
-        Ok(()) => {
+    match reach.terminate(CONTROL_C_EXIT, STOP_WAIT, early) {
+        Ok(reached) => {
+            say_problems(&reached, console);
             await_stopped(running, console);
         }
         Err(error) => console.err(&format!("gate: could not terminate the command's job: {error}")),
     }
     i64::from(CONTROL_C_EXIT.cast_signed())
+}
+
+/// Says each problem ending the processes that left the job.
+fn say_problems(reached: &Reached, console: &mut Console) {
+    for problem in &reached.problems {
+        console.err(problem);
+    }
 }
 
 /// Waits up to [`STOP_WAIT`] for the command whose job was terminated; its exit code, or `None`, said, when it did not

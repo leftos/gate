@@ -269,6 +269,33 @@ fn exit_code_says_exited(process: &OwnedHandle) -> io::Result<bool> {
 ///
 /// `process` is open for the whole call, with `PROCESS_QUERY_LIMITED_INFORMATION` access.
 unsafe fn start_of(process: HANDLE) -> io::Result<Timestamp> {
+    // SAFETY: the caller guarantees the handle is open with query access.
+    let (created, _) = unsafe { start_and_exit_of(process) }?;
+    timestamp_of(created).ok_or_else(|| io::Error::other("the process start time is out of range"))
+}
+
+/// The exit time of the process behind `process`, as [`start_of`] gives its start (whole microseconds).
+///
+/// # Safety
+///
+/// `process` is open for the whole call, with `PROCESS_QUERY_LIMITED_INFORMATION` access.
+unsafe fn exit_of(process: HANDLE) -> io::Result<Timestamp> {
+    // SAFETY: the caller guarantees the handle is open with query access.
+    let (_, exited) = unsafe { start_and_exit_of(process) }?;
+    // A process that still runs has no exit time: its FILETIME is zero.
+    if exited == 0 {
+        return Err(io::Error::other("the process has not exited"));
+    }
+    timestamp_of(exited).ok_or_else(|| io::Error::other("the process exit time is out of range"))
+}
+
+/// The creation time and the exit time of the process behind `process`, as FILETIME ticks; the exit time is zero
+/// while it runs.
+///
+/// # Safety
+///
+/// `process` is open for the whole call, with `PROCESS_QUERY_LIMITED_INFORMATION` access.
+unsafe fn start_and_exit_of(process: HANDLE) -> io::Result<(u64, u64)> {
     let mut created = FILETIME::default();
     let mut exited = FILETIME::default();
     let mut kernel = FILETIME::default();
@@ -278,11 +305,13 @@ unsafe fn start_of(process: HANDLE) -> io::Result<Timestamp> {
     if ok == 0 {
         return Err(io::Error::last_os_error());
     }
-    let ticks = (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime);
-    i64::try_from(ticks)
-        .ok()
-        .and_then(proc_table::filetime_to_timestamp)
-        .ok_or_else(|| io::Error::other("the process start time is out of range"))
+    let ticks = |time: FILETIME| (u64::from(time.dwHighDateTime) << 32) | u64::from(time.dwLowDateTime);
+    Ok((ticks(created), ticks(exited)))
+}
+
+/// FILETIME `ticks` as the process table's timestamp; `None` when outside its range.
+fn timestamp_of(ticks: u64) -> Option<Timestamp> {
+    i64::try_from(ticks).ok().and_then(proc_table::filetime_to_timestamp)
 }
 
 #[cfg(test)]
