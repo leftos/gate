@@ -110,6 +110,20 @@ pub fn pause_path(root: &Path, parent_pid: u32, parent_start_ms: u64, pid: u32, 
     paused_dir(root).join(pause_name(parent_pid, parent_start_ms, pid, start_ms))
 }
 
+/// The folder of the remote client's state, `<root>\remote`.
+#[must_use]
+pub fn remote_dir(root: &Path) -> PathBuf {
+    root.join("remote")
+}
+
+/// The pending marker of the work folder `key`, `<root>\remote\<key>.outputs-pending`: written before a routed run
+/// with output globs makes its run call and removed once its outputs step completes, so the next routed run of that
+/// worktree asks for every output that differs from the PC's (`OutputsFull`).
+#[must_use]
+pub fn outputs_pending_path(root: &Path, key: &str) -> PathBuf {
+    remote_dir(root).join(format!("{key}.outputs-pending"))
+}
+
 /// A pause marker's name read: the gate waiting under a parent's slot, and the parent gate it runs under.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PauseMarker {

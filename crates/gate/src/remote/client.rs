@@ -29,12 +29,15 @@ use std::time::{Duration, Instant};
 
 use gate_args::RunRequest;
 use gate_state::{FallbackReason, KernelObject, key_hash};
-use gate_win32::{AcquireError, Interrupt, Job, NamedMutex, OwnedMutexGuard, PipedConsole, PipedSuspended, Running};
+use gate_win32::{
+    AcquireError, Interrupt, Job, LaunchError, NamedMutex, OwnedMutexGuard, PipedConsole, PipedFed, PipedLaunch, PipedSuspended, Running, Suspended,
+};
 use jiff::{SignedDuration, Timestamp};
 use regex::Regex;
 
 use super::git::{self, Git, GitError, last_update};
 use super::launch::{DRAIN, KILL_WAIT, KILLED, call_job, piped_launch};
+use super::outputs;
 use super::payload::{self, Location, RunCall};
 use super::retry::{self, Ended, GIT_SSH_FAILED, SSH_FAILED};
 use super::snapshot::{self, Snapshot};
@@ -294,6 +297,8 @@ pub(super) struct Called {
     first_error: Option<String>,
     last_error: Option<String>,
     pub(super) lines: Vec<String>,
+    /// Its last standard error line that is the box's outputs line, however many lines came after it.
+    outputs_line: Option<String>,
 }
 
 impl Called {
@@ -329,20 +334,28 @@ impl Attempt<'_, '_> {
         let snapshot = self.snapshot()?;
         let location = Location::under(self.transport.root(), self.call.repo, self.call.key, &payload::job_nonce());
         let nonce = payload::run_nonce();
+        let sent = outputs::sent(self)?;
         let run = RunCall {
             words: self.call.words,
             subfolder: self.call.subfolder,
             nonce: &nonce,
             snapshot: &snapshot.commit,
+            outputs: sent.globs,
+            full: sent.full,
         };
         let run_line = payload::capped("run", payload::line("run", &payload::run_word(&location, &run))).map_err(End::Failed)?;
         let prepared = self.preflight(&location)?;
         self.push(&snapshot, prepared.created)?;
-        let end = self.run_call(&run_line, &location)?;
+        let (end, heard) = self.run_call(&run_line, &location, sent.manifest.as_ref())?;
         // The sync-back runs after a run call that ended with the command's own status; a refusal, an interrupt, a
         // kill, a lost connection or a failed call ended the attempt before it, so a box refusal's 75 never syncs back.
+        // The pending marker stays on every end but a passing run whose box packed nothing.
         match end {
-            End::Status(status) => syncback::sync_back(self, &snapshot, status),
+            End::Status(status) => {
+                let synced = syncback::sync_back(self, &snapshot, status)?;
+                let brought = outputs::accepted(heard.as_deref(), self.call.key, &nonce);
+                Ok(outputs::ended(self, &sent, status, synced, brought.as_ref()))
+            }
             End::Lost(output) => Ok(self.connection_lost(&location, prepared.boot.as_deref(), output)),
             end => Ok(end),
         }
@@ -373,7 +386,7 @@ impl Attempt<'_, '_> {
         let line = payload::capped("preflight", payload::line("preflight", &payload::location_word(location))).map_err(End::Failed)?;
         let watch = Watch::Run(self.limits_for("preflight"));
         let raise = self.raises_at("preflight");
-        let (mut called, _) = self.with_retry(SSH_FAILED, |attempt| attempt.ssh(&line, Echo::LogOnly, watch, raise))?;
+        let (mut called, _) = self.with_retry(SSH_FAILED, |attempt| attempt.ssh(&line, Echo::LogOnly, watch, raise, None))?;
         let theirs = their_version(&called.lines).map(str::to_owned);
         let created = called.lines.iter().any(|line| line.starts_with(CREATED));
         let boot = boot_time(&called.lines).map(str::to_owned);
@@ -484,12 +497,19 @@ impl Attempt<'_, '_> {
     /// The run call to the builder at `location`: the command's own status; `unreachable` when it failed before the
     /// banner twice, as the command never started; a refusal when its 75 comes with the box's own refusal line; a lost
     /// connection when it exited 255 otherwise. A watchdog kill says its line, stops the command and ends the run
-    /// killed; a Ctrl+C stops the command too.
-    fn run_call(&mut self, line: &str, location: &Location) -> Result<End, End> {
+    /// killed; a Ctrl+C stops the command too. Each call made is fed `input` on its standard input, when given. With
+    /// the end, the last standard error line of the call that counts that is the box's outputs line.
+    fn run_call(&mut self, line: &str, location: &Location, input: Option<&Arc<str>>) -> Result<(End, Option<String>), End> {
         self.go_on()?;
         let limits = self.limits_for("run");
         let raise = self.raises_at("run");
-        self.run_call_made(location, limits, |attempt| attempt.ssh(line, Echo::Console, Watch::Run(limits), raise))
+        let mut heard = None;
+        let end = self.run_call_made(location, limits, |attempt| {
+            let called = attempt.ssh(line, Echo::Console, Watch::Run(limits), raise, input.cloned())?;
+            heard.clone_from(&called.outputs_line);
+            Ok(called)
+        })?;
+        Ok((end, heard))
     }
 
     /// The run call as `make` makes it, watched by `limits`, as [`Attempt::run_call`] says. The command is stopped only
@@ -626,7 +646,7 @@ impl Attempt<'_, '_> {
         };
         let bound = self.limits.bound;
         let begun = Instant::now();
-        let mut made = self.ssh(&line, Echo::LogOnly, Watch::Bounded(bound), false);
+        let mut made = self.ssh(&line, Echo::LogOnly, Watch::Bounded(bound), false, None);
         let again = matches!(&made, Ok(first) if first.before_the_banner(SSH_FAILED)) && retry::retry_allowed(bound, begun.elapsed(), self.pause);
         if again {
             if let Ok(first) = &mut made {
@@ -634,7 +654,7 @@ impl Attempt<'_, '_> {
             }
             self.say(retry::retry_line(self.call.host));
             thread::sleep(self.pause);
-            made = self.ssh(&line, Echo::LogOnly, Watch::Bounded(bound.saturating_sub(begun.elapsed())), false);
+            made = self.ssh(&line, Echo::LogOnly, Watch::Bounded(bound.saturating_sub(begun.elapsed())), false, None);
         }
         match made {
             Ok(called) => {
@@ -670,14 +690,15 @@ impl Attempt<'_, '_> {
     }
 
     /// One call of `gate box` on the builder carrying `line`, watched as `watch` says; the console interrupt raised
-    /// after its first output byte when `raise`.
-    fn ssh(&mut self, line: &str, echo: Echo, watch: Watch, raise: bool) -> Result<Called, End> {
+    /// after its first output byte when `raise`; `input`, when given, fed on its standard input.
+    fn ssh(&mut self, line: &str, echo: Echo, watch: Watch, raise: bool, input: Option<Arc<str>>) -> Result<Called, End> {
         let Program { program, args } = self.transport.call(self.call.host, line);
         let mut command = Command::new(program);
         command.args(args);
         let starts = Starts {
             breakaway: self.transport.box_runs_here(),
             raise,
+            input,
         };
         self.started(&command, echo, watch, starts)
     }
@@ -693,13 +714,15 @@ impl Attempt<'_, '_> {
         let starts = Starts {
             breakaway: false,
             raise: false,
+            input: None,
         };
         self.started(&command, echo, watch, starts)
     }
 
-    /// Starts `command` with no standard input, created suspended and put in an anonymous job of its own before it
-    /// runs, and reads its two streams line by line into the log, and onto the console as `echo` says, until both end
-    /// and it has exited, watched as `watch` says meanwhile. Every call's line is capped at 64 KiB but the run call's,
+    /// Starts `command` with no standard input, or one fed what `starts` gives on a thread of its own and then closed,
+    /// created suspended and put in an anonymous job of its own before it runs, and reads its two streams line by line
+    /// into the log, and onto the console as `echo` says, until both end and it has exited, watched as `watch` says
+    /// meanwhile. Every call's line is capped at 64 KiB but the run call's,
     /// whose longer lines are passed on in pieces. A call the watch cuts has its whole job ended, and its readers are
     /// given [`DRAIN`] to end; a Ctrl+C ends a call a bound does not limit the same way, as the attempt's interrupt.
     fn started(&mut self, command: &Command, echo: Echo, watch: Watch, starts: Starts) -> Result<Called, End> {
@@ -715,8 +738,15 @@ impl Attempt<'_, '_> {
         let job = call_job(starts.breakaway).map_err(|error| End::Failed(format!("cannot make a job for {shown}: {error}")))?;
         let cannot_start = |error: String| End::Failed(format!("cannot start {shown}: {error}"));
         let launch = piped_launch(command, console_of(watch)).map_err(|error| cannot_start(error.to_string()))?;
-        let PipedSuspended { suspended, stdout, stderr } = launch.start_suspended_within(&job).map_err(|error| cannot_start(error.to_string()))?;
+        let feed_log = match (&starts.input, &err_log) {
+            (Some(_), Some(log)) => Some(log.try_clone().map_err(cannot_log)?),
+            _ => None,
+        };
+        let (suspended, stdout, stderr, stdin) = launched(&launch, &job, starts.input.is_some()).map_err(|error| cannot_start(error.to_string()))?;
         let running = suspended.assign_and_resume(&job).map_err(|error| cannot_start(error.to_string()))?;
+        if let (Some(stdin), Some(input)) = (stdin, starts.input) {
+            fed(stdin, input, feed_log);
+        }
         let shared = Arc::new(Shared::new());
         let (done, readers) = mpsc::channel();
         let reading = Reading {
@@ -855,6 +885,7 @@ fn called_of(ended: CallEnd, too_long: bool, mut heard: Heard) -> Result<Called,
         first_error: heard.first_error,
         last_error: heard.last_error,
         lines: heard.kept.into_lines(),
+        outputs_line: heard.outputs_line,
     })
 }
 
@@ -949,11 +980,42 @@ fn cannot_wait(shown: &str, error: &io::Error) -> End {
 
 /// How a call starts: whether its job lets a process in it start one outside it, which only the ssh of a transport
 /// whose `gate box` runs on this machine needs; and whether the console interrupt is raised after its first output
-/// byte.
-#[derive(Clone, Copy)]
+/// byte; and what is fed on its standard input, `None` for none.
 struct Starts {
     breakaway: bool,
     raise: bool,
+    input: Option<Arc<str>>,
+}
+
+/// `launch` created suspended within `job`: the process, the read ends of its stdout and stderr, and the write end of
+/// its stdin when `fed`, else `None` and its stdin `NUL`.
+fn launched(launch: &PipedLaunch, job: &Job, fed: bool) -> Result<(Suspended, File, File, Option<File>), LaunchError> {
+    if fed {
+        let PipedFed {
+            suspended,
+            stdin,
+            stdout,
+            stderr,
+        } = launch.start_suspended_within_fed(job)?;
+        return Ok((suspended, stdout, stderr, Some(stdin)));
+    }
+    let PipedSuspended { suspended, stdout, stderr } = launch.start_suspended_within(job)?;
+    Ok((suspended, stdout, stderr, None))
+}
+
+/// Writes `input` to a call's `stdin` on a thread of its own, then closes it. A write that fails, as one to a call that
+/// ended without reading its input does, is noted in the call's `log` and never fails the call, whose own end stands.
+fn fed(mut stdin: File, input: Arc<str>, log: Option<File>) {
+    thread::spawn(move || {
+        let Err(error) = stdin.write_all(input.as_bytes()) else {
+            return;
+        };
+        drop(stdin);
+        if let Some(mut log) = log {
+            // A note that cannot be written has nowhere else to go: the call's readers own its console streams.
+            let _ = writeln!(log, "gate: the run call's input was not sent: {error}");
+        }
+    });
 }
 
 /// The console a call watched as `watch` is created on: this process's, whose Ctrl+C reaches it too, for every call a
@@ -1001,13 +1063,15 @@ fn git_end(error: GitError) -> End {
 }
 
 /// What one call's two streams said so far, kept for the call's end, each line cut to the cap: whether it wrote on
-/// standard output, its first and last standard error lines, its last lines, and the first problem reading them.
+/// standard output, its first and last standard error lines, its last standard error line that is the box's outputs
+/// line, its last lines, and the first problem reading them.
 #[derive(Default)]
 struct Heard {
     kept: Kept,
     output_seen: bool,
     first_error: Option<String>,
     last_error: Option<String>,
+    outputs_line: Option<String>,
     problem: Option<String>,
 }
 
@@ -1027,6 +1091,7 @@ impl Heard {
         if error {
             self.last_error = Some(line.to_owned());
         }
+        outputs::keep_outputs_line(&mut self.outputs_line, line, error);
         self.kept.push(line);
     }
 
@@ -1476,6 +1541,7 @@ mod tests {
             no_markers: false,
             interrupt: Some(raised()),
             state: &STATE,
+            state_dir: Path::new(r"C:\gate-client-tests-state"),
         }
     }
 
@@ -1514,6 +1580,7 @@ mod tests {
             first_error: Some(first_error.to_owned()),
             last_error: Some(first_error.to_owned()),
             lines: vec![first_error.to_owned()],
+            outputs_line: None,
         }
     }
 
@@ -1561,6 +1628,24 @@ mod tests {
 
         assert!(matches!(ended, Err(End::Interrupted)), "an interrupt, not the status: {ended:?}");
         assert!(stopped(&attempt), "the stop is made: {:?}", attempt.lines);
+    }
+
+    #[test]
+    fn the_outputs_line_survives_a_stdout_flood_after_it() {
+        let mut heard = Heard::default();
+        let line = "gate-remote-outputs: 2 app-1a2b3c4d-0123456789abcdef0123456789abcdef.tar.zst";
+        heard.record("gate-remote-outputs: 0", false);
+        heard.record(line, true);
+        for number in 0..1500 {
+            heard.record(&format!("build output {number}"), false);
+        }
+        heard.record("gate-remote-outputs: 0", false);
+        heard.record("gate: remote said something else", true);
+
+        let called = called_of(CallEnd::Exited(0), false, heard).expect("a call that ended");
+
+        assert!(!called.lines.iter().any(|kept| kept == line), "the window no longer holds the line");
+        assert_eq!(called.outputs_line.as_deref(), Some(line), "the last standard error outputs line is kept");
     }
 
     #[test]
@@ -1760,7 +1845,7 @@ mod tests {
 
         assert!(matches!(attempt.preflight(&location), Err(End::Interrupted)), "the preflight");
         assert!(matches!(attempt.push(&snapshot, false), Err(End::Interrupted)), "the push");
-        assert!(matches!(attempt.run_call("line", &location), Err(End::Interrupted)), "the run call");
+        assert!(matches!(attempt.run_call("line", &location, None), Err(End::Interrupted)), "the run call");
         let outcome = attempt.outcome(End::Interrupted);
         assert_eq!(outcome.status, i64::from(CONTROL_C_EXIT.cast_signed()), "{outcome:?}");
         assert!(outcome.lines.is_empty(), "an interrupt says no failure line: {outcome:?}");

@@ -19,7 +19,11 @@ mod machine;
 mod nesting;
 #[cfg_attr(
     not(test),
-    expect(dead_code, reason = "the manifest writer and the unpack serve the remote client, which no code calls")
+    expect(
+        dead_code,
+        reason = "the unpack serves the remote client's install, which no code calls; without the test seams, the manifest \
+                  writer serves the dormant client too"
+    )
 )]
 mod outputs;
 mod pause;

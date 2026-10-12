@@ -857,6 +857,7 @@ mod tests {
             no_markers: false,
             interrupt: None,
             state: &STATE,
+            state_dir: Path::new(r"C:\gate-bridge-tests"),
         };
 
         let text = request(&call, NONCE).to_string();

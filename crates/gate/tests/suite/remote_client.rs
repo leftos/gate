@@ -331,8 +331,8 @@ const STEPS_VARIABLE: &str = "GATE_FAKE_SSH_STEPS";
 /// The variable naming the gate the stand-in runs `box <verb> <payload>` with.
 const GATE_VARIABLE: &str = "GATE_FAKE_SSH_GATE";
 /// What a client case's snapshot leaves out: the gate's state root, LOCALAPPDATA and logs, the builder root and the
-/// stand-in's files. `tool.exe` is sent, so the builder runs it.
-const CLIENT_IGNORED: &str = "state/\nappdata/\n*.log\nbuilder/\nssh/\n";
+/// stand-in's files, and `.tmp/`, which the client writes in. `tool.exe` is sent, so the builder runs it.
+const CLIENT_IGNORED: &str = "state/\nappdata/\n*.log\nbuilder/\nssh/\n.tmp/\n";
 const RETRY_LINE: &str = "gate: builder did not answer the ssh banner; trying once more";
 const BUSY_LINE: &str = "gate: remote builder busy; running here";
 const UNREACHABLE_LINE: &str = "gate: remote builder unreachable; running here";
@@ -342,8 +342,8 @@ const LOST_LINE: &str = "gate: lost the connection to builder";
 const BOOTED: &str = "2026-10-10T08:00:00.0000000Z";
 
 /// A case folder made a checkout of its own holding fake-tool as `tool.exe`, which its snapshot sends, with a routing
-/// file that sends its `*tool*` commands to the builder and gives the remote pool two slots. The suite enters a job
-/// that allows breakaway first, as the box's command needs.
+/// file that sends its `*tool*` commands to the builder with no output globs and gives the remote pool two slots. The
+/// suite enters a job that allows breakaway first, as the box's command needs.
 fn client_case(name: &str) -> Case {
     client_case_of(name, 2)
 }
@@ -357,8 +357,29 @@ fn client_case_of(name: &str, slots: u32) -> Case {
     write(&case, ".gitignore", CLIENT_IGNORED);
     fs::create_dir_all(case.folder().join("ssh")).expect("the stand-in's folder can be made");
     let repo = repo_name(&case.folder().file_name().expect("the case folder has a name").to_string_lossy());
-    write_remote_json(&case, &json!({ "host": HOST, "slots": slots, "repos": { repo: ["*tool*"] } }).to_string());
+    let routing = json!({ "host": HOST, "slots": slots, "repos": { &repo: ["*tool*"] }, "outputs": { &repo: [] } });
+    write_remote_json(&case, &routing.to_string());
     case
+}
+
+/// The output globs of an outputs case: every file under a `bin` folder.
+const BIN: [&str; 1] = ["**/bin/**"];
+
+/// A [`client_case`] whose routing file gives its repo the output globs `globs` and sends its `*dotnet*` commands to
+/// the builder too, and whose `.gitignore` leaves `bin/` out, as a build's does: what a command builds there comes back
+/// as outputs, not as synced-back changes, and stays in the builder's work folder from one run to the next.
+fn outputs_case(name: &str, globs: &[&str]) -> Case {
+    let case = client_case(name);
+    write(&case, ".gitignore", &format!("{CLIENT_IGNORED}bin/\n"));
+    let repo = repo_name(&case.folder().file_name().expect("the case folder has a name").to_string_lossy());
+    let routing = json!({ "host": HOST, "slots": 2, "repos": { &repo: ["*tool*", "*dotnet*"] }, "outputs": { &repo: globs } });
+    write_remote_json(&case, &routing.to_string());
+    case
+}
+
+/// The outputs pending marker of the case's work-folder key, which its first run's queue line names, in its state root.
+fn pending_marker(case: &Case) -> PathBuf {
+    case.root().join("remote").join(format!("{}.outputs-pending", key_of(&events(case))))
 }
 
 /// Writes `steps`, one a line, as the stand-in's steps file `name` in the case's `ssh` folder; its path.
@@ -1661,4 +1682,245 @@ fn a_transport_s_form_is_refused_before_the_stand_in_is_looked_for() {
     assert_eq!(outcome.code, Some(1), "{outcome:?}");
     assert!(outcome.stderr.contains(&line), "{outcome:?}");
     assert_eq!(calls(&steps), Vec::<String>::new(), "no ssh call is made");
+}
+
+/// The PC holds `bin/same.txt` as the command writes it on the builder and `bin/differs.txt` otherwise: only the second
+/// comes back, which the box can tell only from the manifest the run call carried on its standard input.
+#[test]
+fn a_routed_run_sends_its_outputs_manifest() {
+    let case = outputs_case("client-outputs-manifest", &BIN);
+    write(&case, r"bin\same.txt", "same");
+    write(&case, r"bin\differs.txt", "pc");
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+    let command = [r".\tool.exe", "write", r"bin\same.txt", "same", "write", r"bin\differs.txt", "box"];
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &command));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(outcome.stderr.contains("gate-remote-outputs: 1 "), "one file comes back: {outcome:?}");
+    let log = fs::read_to_string(case.folder().join("out.log")).expect("the log was written");
+    assert!(log.contains("gate-remote-outputs: 1 "), "the box's line is in the log: {log}");
+    assert_eq!(calls(&steps), ["preflight", "run"]);
+    assert!(pending_marker(&case).exists(), "an archive waits, so the marker stays: {outcome:?}");
+}
+
+#[test]
+fn outputs_zero_clears_the_pending_marker() {
+    let case = outputs_case("client-outputs-zero", &BIN);
+    let go = case.folder().join("ssh").join("go");
+    let steps = ssh_steps(&case, "ssh", &["ok", &format!("hold {}", shown(&go))]);
+    let run = start(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "out", "ran there"]));
+    wait_until("the run call", || calls(&steps).len() == 2);
+    let marker = pending_marker(&case);
+    assert!(marker.exists(), "the marker is written before the run call");
+    fs::write(&go, "").expect("the go file can be made");
+
+    let outcome = run.finish();
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(outcome.stderr.contains("gate-remote-outputs: 0"), "{outcome:?}");
+    assert!(!marker.exists(), "nothing to bring back completes the outputs step: {outcome:?}");
+}
+
+/// The first run builds `bin/built.txt` on the builder and fails, so nothing comes back, and the builder's work folder
+/// keeps the ignored file. The second run leaves it as it is, so only `OutputsFull` brings it back: the PC holds another.
+#[test]
+fn a_failing_run_leaves_the_marker_and_the_next_run_sends_outputs_full() {
+    let case = outputs_case("client-outputs-full", &BIN);
+    write(&case, r"bin\built.txt", "pc");
+    let first = ssh_steps(&case, "first", &["ok", "ok"]);
+    let failed = finish(client_gate(
+        &case,
+        "first.log",
+        &first,
+        &[r".\tool.exe", "write", r"bin\built.txt", "box", "exit", "3"],
+    ));
+    assert_eq!(failed.code, Some(3), "{failed:?}");
+    assert!(!failed.stderr.contains("gate-remote-outputs:"), "a failing run packs nothing: {failed:?}");
+    assert!(pending_marker(&case).exists(), "a failing run leaves the marker: {failed:?}");
+    let second = ssh_steps(&case, "second", &["ok", "ok"]);
+
+    let outcome = finish(client_gate(&case, "second.log", &second, &[r".\tool.exe", "out", "ran there"]));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(
+        outcome.stderr.contains("gate-remote-outputs: 1 "),
+        "the file this run left alone comes back: {outcome:?}"
+    );
+}
+
+/// Three worktrees: a run the box refuses, as `a_refused_run_call_syncs_nothing_back` does once a first run named the
+/// key; one the watchdog kills; and one whose connection is lost.
+#[test]
+fn a_refused_killed_or_lost_run_leaves_the_marker() {
+    let refused = outputs_case("client-outputs-refused", &BIN);
+    let first = ssh_steps(&refused, "first", &["ok", "ok"]);
+    let cleared = finish(client_gate(&refused, "first.log", &first, &[r".\tool.exe", "out", "ran there"]));
+    assert_eq!(cleared.code, Some(0), "{cleared:?}");
+    let marker = pending_marker(&refused);
+    assert!(!marker.exists(), "the first run brought nothing back: {cleared:?}");
+    let busy = format!("say-exit 75 gate: remote work folder {} is busy", key_of(&events(&refused)));
+    let second = ssh_steps(&refused, "second", &["ok", &busy]);
+    let outcome = finish(client_gate(&refused, "second.log", &second, &[r".\tool.exe", "out", "ran here"]));
+    assert!(outcome.stderr.contains(BUSY_LINE), "{outcome:?}");
+    assert!(marker.exists(), "a refused run leaves the marker: {outcome:?}");
+
+    let killed = outputs_case("client-outputs-killed", &BIN);
+    let steps = ssh_steps(&killed, "ssh", &["ok", &format!("hold {}", never(&killed)), "ok"]);
+    let tuned = Tuned {
+        extra: &["--test-remote-watch-call", "run", "--test-stall-ms", WATCHED_MS],
+        ..Tuned::default()
+    };
+    let outcome = finish(client_gate_tuned(
+        &killed,
+        "out.log",
+        &steps,
+        &tuned,
+        &[r".\tool.exe", "out", "ran there"],
+    ));
+    assert_eq!(outcome.code, Some(124), "{outcome:?}");
+    assert!(pending_marker(&killed).exists(), "a killed run leaves the marker: {outcome:?}");
+
+    let lost = outputs_case("client-outputs-lost", &BIN);
+    let booted = format!("boot {BOOTED}");
+    let steps = ssh_steps(&lost, "ssh", &[&booted, "drop", "ok", &booted]);
+    let outcome = finish(lost_gate(&lost, "local", &steps, &[r".\tool.exe", "out", "ran there"]));
+    assert_eq!(outcome.code, Some(255), "{outcome:?}");
+    assert!(outcome.stderr.contains(LOST_LINE), "{outcome:?}");
+    assert!(pending_marker(&lost).exists(), "a lost run leaves the marker: {outcome:?}");
+}
+
+#[test]
+fn a_run_whose_worktree_changed_says_outputs_were_not_brought_back() {
+    let case = outputs_case("client-outputs-worktree-changed", &BIN);
+    write(&case, "a.txt", "before\n");
+    let go = case.folder().join("ssh").join("go");
+    let steps = ssh_steps(&case, "ssh", &["ok", &format!("hold {}", shown(&go))]);
+    let run = start(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "mark", "made-on-box.txt"]));
+    wait_until("the run call", || calls(&steps).len() == 2);
+    write(&case, "a.txt", "after\n");
+    fs::write(&go, "").expect("the go file can be made");
+
+    let outcome = run.finish();
+
+    assert_eq!(outcome.code, Some(1), "a passing run becomes 1: {outcome:?}");
+    let line = "gate: remote outputs not brought back: the worktree changed during the run";
+    assert!(outcome.stderr.contains(line), "{outcome:?}");
+    assert!(
+        pending_marker(&case).exists(),
+        "the box packed nothing, but the run did not pass: {outcome:?}"
+    );
+}
+
+/// The PC's `bin/locked.txt` is held open, sharing nothing, while the run hashes it.
+#[test]
+fn a_manifest_that_cannot_be_built_still_runs_and_fails_a_pass() {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let case = outputs_case("client-outputs-unbuilt", &BIN);
+    write(&case, r"bin\locked.txt", "pc");
+    let held = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(case.folder().join("bin").join("locked.txt"))
+        .expect("the file can be held");
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "out", "ran there"]));
+    drop(held);
+
+    assert_eq!(outcome.code, Some(1), "a passing run becomes 1: {outcome:?}");
+    assert!(outcome.stdout.contains("ran there"), "the run still runs: {outcome:?}");
+    let line = "gate: remote outputs not brought back: the manifest could not be built: ";
+    assert!(outcome.stderr.contains(line) && outcome.stderr.contains("locked.txt"), "{outcome:?}");
+    assert!(!outcome.stderr.contains("gate-remote-outputs:"), "no globs were sent: {outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "run"]);
+    assert!(pending_marker(&case).exists(), "the marker is still written: {outcome:?}");
+}
+
+/// The command prints `gate-remote-outputs: 0` on both its streams, then builds a file the PC lacks, so the box's own
+/// line, naming its archive, comes last.
+#[test]
+fn a_forged_outputs_line_from_the_command_is_not_accepted() {
+    let case = outputs_case("client-outputs-forged", &BIN);
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+    let forged = "gate-remote-outputs: 0";
+    let command = [r".\tool.exe", "err", forged, "out", forged, "write", r"bin\new.txt", "built"];
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &command));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(outcome.stderr.contains(forged), "the command's line is passed on: {outcome:?}");
+    assert!(outcome.stderr.contains("gate-remote-outputs: 1 "), "the box's own line: {outcome:?}");
+    assert!(pending_marker(&case).exists(), "only the box's last line counts: {outcome:?}");
+}
+
+/// The stand-in writes `gate-remote-outputs: 0` on standard output once the box has said its own line on standard error.
+#[test]
+fn an_outputs_line_on_stdout_after_the_box_is_ignored() {
+    let case = outputs_case("client-outputs-stdout", &BIN);
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok-then-out gate-remote-outputs: 0"]);
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "write", r"bin\new.txt", "built"]));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(outcome.stderr.contains("gate-remote-outputs: 1 "), "the box's own line: {outcome:?}");
+    assert!(outcome.stdout.contains("gate-remote-outputs: 0"), "the stand-in's line: {outcome:?}");
+    assert!(pending_marker(&case).exists(), "a line on standard output never counts: {outcome:?}");
+}
+
+/// A dotnet `--no-build` command brings no outputs back, though its repo has globs and it builds a file under them.
+#[test]
+fn a_no_build_command_sends_no_manifest() {
+    let case = outputs_case("client-outputs-no-build", &BIN);
+    copy_tool(&case, "dotnet.exe");
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+    let command = [r".\dotnet.exe", "out", "ran there", "write", r"bin\new.txt", "built", "--no-build"];
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &command));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(outcome.stdout.contains("ran there"), "{outcome:?}");
+    assert!(
+        outcome.stderr.contains("gate: outputs: none brought back for a --no-build command"),
+        "{outcome:?}"
+    );
+    assert!(!outcome.stderr.contains("gate-remote-outputs:"), "no globs were sent: {outcome:?}");
+    assert!(!outcome.stderr.contains("gate: remote outputs not brought back"), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "run"]);
+    assert!(!pending_marker(&case).exists(), "no marker is written: {outcome:?}");
+}
+
+/// The run call runs nothing and exits 0 (`exit 0`), so no box says an outputs line.
+#[test]
+fn a_pass_without_an_outputs_line_fails() {
+    let case = outputs_case("client-outputs-no-line", &BIN);
+    let steps = ssh_steps(&case, "ssh", &["ok", "exit 0"]);
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "out", "ran there"]));
+
+    assert_eq!(outcome.code, Some(1), "a passing run becomes 1: {outcome:?}");
+    let line = "gate: remote outputs not brought back: the box printed no 'gate-remote-outputs: <n> <archive>' line";
+    assert!(outcome.stderr.contains(line), "{outcome:?}");
+    assert_eq!(outcome.stderr.matches("gate: remote outputs not brought back").count(), 1, "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "run"]);
+    assert!(pending_marker(&case).exists(), "the marker stays: {outcome:?}");
+}
+
+/// The run call's first attempt fails before the banner; the second is fed the manifest again, so the PC's identical
+/// `bin/same.txt` stays out of the archive and only `bin/differs.txt` comes back.
+#[test]
+fn a_pre_banner_retry_feeds_the_manifest_again() {
+    let case = outputs_case("client-outputs-retry", &BIN);
+    write(&case, r"bin\same.txt", "same");
+    write(&case, r"bin\differs.txt", "pc");
+    let steps = ssh_steps(&case, "ssh", &["ok", "fail-banner", "ok"]);
+    let command = [r".\tool.exe", "write", r"bin\same.txt", "same", "write", r"bin\differs.txt", "box"];
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &command));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(outcome.stderr.matches(RETRY_LINE).count(), 1, "{outcome:?}");
+    assert!(outcome.stderr.contains("gate-remote-outputs: 1 "), "one file comes back: {outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "run", "run"]);
 }

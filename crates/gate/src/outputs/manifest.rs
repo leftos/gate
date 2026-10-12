@@ -29,9 +29,23 @@ pub(crate) struct Manifest {
 impl Manifest {
     /// The manifest of the files a walk `found`, each hashed as a stream; else why the first that cannot be read failed.
     pub(crate) fn build(found: &[Found]) -> io::Result<Manifest> {
+        Manifest::build_with(found, usize::MAX, |file| file_sha256(&file.full))
+    }
+
+    /// The manifest of the files a walk `found`, each hashed by `hash`, as [`select`] takes it, so a caller can stop the
+    /// build between two reads of a file. Before a file is hashed, the bytes its entry adds to the manifest's line are
+    /// counted, the line's outer braces and newline left out: once they pass `limit`, the build fails as
+    /// [`io::ErrorKind::FileTooLarge`], no further file hashed. Else the error of the first hash that fails.
+    pub(crate) fn build_with(found: &[Found], limit: usize, mut hash: impl FnMut(&Found) -> io::Result<String>) -> io::Result<Manifest> {
         let mut manifest = Manifest::default();
+        let mut length = 0_usize;
         for file in found {
-            let sha256 = file_sha256(&file.full)?;
+            length = length.saturating_add(entry_length(file)?);
+            if length > limit {
+                let passed = format!("the outputs manifest passes {limit} bytes");
+                return Err(io::Error::new(io::ErrorKind::FileTooLarge, passed));
+            }
+            let sha256 = hash(file)?;
             manifest.insert(file.path.clone(), Held { stamp: file.stamp, sha256 });
         }
         Ok(manifest)
@@ -77,6 +91,18 @@ impl Manifest {
         }
         Ok(manifest)
     }
+}
+
+/// The characters of one manifest entry besides its quoted path, its digits and its hash:
+/// `:{"size":`, `,"modified":`, `,"sha256":"`, `"}` and the comma after it.
+const ENTRY_PUNCTUATION: usize = 35;
+
+/// The bytes the entry of `file` adds to the manifest's line: `"<path>":{"size":<n>,"modified":<n>,"sha256":"<hex>"},`,
+/// its path escaped as JSON escapes it.
+fn entry_length(file: &Found) -> io::Result<usize> {
+    let path = serde_json::to_string(&file.path).map_err(io::Error::other)?;
+    let digits = file.stamp.size.to_string().len() + file.stamp.modified.to_string().len();
+    Ok(path.len() + ENTRY_PUNCTUATION + SHA256_DIGITS + digits)
 }
 
 /// What the manifest's entry `file` for `path` holds; else why it is not a file.
@@ -276,6 +302,28 @@ mod tests {
             Manifest::build(&[found("absent", stamp(0, 0))]).map(|_| ()).map_err(|error| error.kind()),
             Err(io::ErrorKind::NotFound)
         );
+    }
+
+    #[test]
+    fn a_build_past_its_limit_stops_before_hashing_the_rest() {
+        // Each entry is 113 bytes: the quoted path's 11, 35 of punctuation, 64 of hash and the 3 digits of its stamp.
+        let files = [found("bin/a.dll", stamp(1, 10)), found("bin/b.dll", stamp(1, 10))];
+        let entry = files[0].path.len() + 2 + 35 + 64 + 3;
+        assert_eq!(
+            manifest(&[("bin/a.dll", stamp(1, 10), 'a')]).line().len(),
+            entry - 1 + "{\"files\":{}}\n".len()
+        );
+        for (limit, hashed_before) in [(entry - 1, 0), (2 * entry - 1, 1), (2 * entry, 2)] {
+            let mut hashed = Vec::new();
+            let built = Manifest::build_with(&files, limit, |file| {
+                hashed.push(file.path.clone());
+                Ok(sha('a'))
+            });
+            assert_eq!(hashed.len(), hashed_before, "limit {limit}");
+            let refused = built.err().map(|error| error.kind());
+            let expected = (hashed_before < 2).then_some(io::ErrorKind::FileTooLarge);
+            assert_eq!(refused, expected, "limit {limit}");
+        }
     }
 
     #[test]

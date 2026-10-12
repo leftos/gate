@@ -93,7 +93,7 @@ fn check_inside(opened: &File, root: &Path, file: &Found) -> io::Result<()> {
 
 /// The final path of the open file `opened`, as `GetFinalPathNameByHandleW` gives it: `\\?\`-prefixed, normalized, its
 /// links and junctions resolved as the open went through them.
-fn final_path(opened: &File) -> io::Result<PathBuf> {
+pub(crate) fn final_path(opened: &File) -> io::Result<PathBuf> {
     let mut buffer = vec![0_u16; 512];
     loop {
         let capacity = u32::try_from(buffer.len()).map_err(io::Error::other)?;

@@ -81,12 +81,16 @@ pub(crate) fn bare(root: &str, repo: &str) -> String {
 }
 
 /// What a run call carries beside the location: the words the builder runs, the folder below the work folder they run
-/// in, the run's outputs nonce, and the snapshot the box checks out. No outputs are asked for.
+/// in, the run's outputs nonce, the snapshot the box checks out, the output globs the run brings back (none asks for no
+/// outputs), and whether every file under them counts as changed (`OutputsFull`), as after an outputs step that did not
+/// complete.
 pub(crate) struct RunCall<'a> {
     pub words: &'a [String],
     pub subfolder: &'a str,
     pub nonce: &'a str,
     pub snapshot: &'a str,
+    pub outputs: &'a [String],
+    pub full: bool,
 }
 
 /// The payload word of the preflight, and of every verb that reads only the location.
@@ -105,9 +109,9 @@ pub(crate) fn run_word(location: &Location, run: &RunCall<'_>) -> String {
         ("Command", json!(run.words)),
         ("Subfolder", json!(run.subfolder)),
         ("Identity", Value::Object(identity)),
-        ("Outputs", json!([])),
+        ("Outputs", json!(run.outputs)),
         ("Nonce", json!(run.nonce)),
-        ("OutputsFull", json!(false)),
+        ("OutputsFull", json!(run.full)),
         ("Snapshot", json!(run.snapshot)),
     ] {
         object.insert(name.to_owned(), value);
@@ -215,6 +219,8 @@ mod tests {
             subfolder: "sub",
             nonce: "n1",
             snapshot: sha,
+            outputs: &[],
+            full: false,
         };
         let mut expected = preflight;
         let extra = json!({
@@ -235,6 +241,26 @@ mod tests {
             expected[name] = value.clone();
         }
         assert_eq!(decoded(&run_word(&location(), &run)), expected);
+    }
+
+    #[test]
+    fn a_run_with_output_globs_sends_them_and_outputs_full() {
+        let words = ["./tool.exe".to_owned()];
+        let globs = ["**/bin/**".to_owned(), "out/*.dll".to_owned()];
+        let run = RunCall {
+            words: &words,
+            subfolder: "",
+            nonce: "n2",
+            snapshot: "0123456789abcdef0123456789abcdef01234567",
+            outputs: &globs,
+            full: true,
+        };
+
+        let sent = decoded(&run_word(&location(), &run));
+
+        assert_eq!(sent["Outputs"], json!(["**/bin/**", "out/*.dll"]));
+        assert_eq!(sent["OutputsFull"], json!(true));
+        assert_eq!(sent["Nonce"], json!("n2"));
     }
 
     #[test]

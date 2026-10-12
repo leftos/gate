@@ -4,8 +4,9 @@
 //! `--test-remote-snapshot`, which stops once it has made the snapshot, and the Rust client of
 //! `--test-remote-transport`, which runs the command on a builder. [`git`] runs git for the routing decision and the
 //! client; [`snapshot`] makes the snapshot and bridge commits; `client` runs the Rust client's phases, `transport`
-//! reaches the builder, `payload` builds what `gate box` is sent, `retry` holds the rule a call is retried on, and
-//! `syncback` fetches and applies the changes the command left on the builder.
+//! reaches the builder, `payload` builds what `gate box` is sent, `retry` holds the rule a call is retried on,
+//! `outputs` builds the outputs manifest the run call carries, keeps the outputs pending marker and reads the box's
+//! outputs line, and `syncback` fetches and applies the changes the command left on the builder.
 
 use std::fs::OpenOptions;
 use std::io::{self, Write};
@@ -20,6 +21,8 @@ mod bridge;
 mod client;
 pub(crate) mod git;
 mod launch;
+#[cfg(feature = "test-seams")]
+mod outputs;
 #[cfg(feature = "test-seams")]
 mod payload;
 #[cfg(feature = "test-seams")]
@@ -98,6 +101,8 @@ pub(crate) struct RemoteCall<'a> {
     pub interrupt: Option<Interrupt>,
     /// The run's state root, whose hash names the work-folder key's lock.
     pub state: &'a StateRoot,
+    /// The state root's folder, which holds the work-folder key's outputs pending marker.
+    pub state_dir: &'a Path,
 }
 
 /// What the client hands back: the status, a refusal's reason, whether it killed the run, the lines it wrote to the
@@ -266,6 +271,7 @@ mod snapshot_only {
                 no_markers: false,
                 interrupt,
                 state: &STATE,
+                state_dir: Path::new(r"C:\gate-snapshot-client-tests"),
             }
         }
 

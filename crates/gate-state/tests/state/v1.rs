@@ -162,6 +162,17 @@ fn paths_sit_under_the_root_as_design_md_names_them() {
 }
 
 #[test]
+fn the_outputs_pending_marker_sits_in_the_remote_folder() {
+    let root = Path::new("state-root");
+
+    assert_eq!(parts_under(root, &v1::remote_dir(root)), ["remote"]);
+    assert_eq!(
+        parts_under(root, &v1::outputs_pending_path(root, "app-1a2b3c4d")),
+        ["remote", "app-1a2b3c4d.outputs-pending"]
+    );
+}
+
+#[test]
 fn a_pause_marker_name_builds_and_parses_and_refuses_anything_else() {
     let marker = v1::PauseMarker {
         parent_pid: 4242,

@@ -465,6 +465,7 @@ fn call_of<'r>(request: &'r RunRequest, log: &'r Log, host: &Host, root: &'r Res
         no_markers: request.no_markers,
         interrupt: host.interrupt,
         state: &root.root,
+        state_dir: &root.path,
     }
 }
 

@@ -22,7 +22,8 @@
 //! standard error and exits `<n>`, as the box says its own refusal; `flood <n>` runs nothing, writes `<n>` bytes of `x`
 //! and no line end on standard error, which git passes through as its own, and exits 0; `say-hold <word> <path>` writes
 //! the word as a line on standard output, then does as `hold <path>`; `progress-ok <n>` writes at least `<n>` bytes of
-//! short progress updates, each ended by a carriage return, and a line end on standard error, then does as `ok`.
+//! short progress updates, each ended by a carriage return, and a line end on standard error, then does as `ok`;
+//! `ok-then-out <line>` does as `ok`, then writes the line on standard output, after all the call wrote.
 
 #![expect(clippy::disallowed_methods, reason = "a test helper standing in for ssh, which holds no launch's handles")]
 
@@ -92,6 +93,11 @@ fn run() -> Result<i32, String> {
         Some(("progress-ok", bytes)) => {
             progress(&step, bytes)?;
             call.ok()
+        }
+        Some(("ok-then-out", line)) => {
+            let status = call.ok()?;
+            writeln!(io::stdout().lock(), "{line}").map_err(|error| format!("cannot write: {error}"))?;
+            Ok(status)
         }
         Some(("say-hold", rest)) => {
             let (word, path) = rest.split_once(' ').ok_or_else(|| format!("the step '{step}' names no path"))?;
