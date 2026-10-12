@@ -70,7 +70,9 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Output cap**: the remote client's limit of 64 KiB on one line of a call's output (a `\r` resets the line, so git's progress counts per update), which kills a capped call that sends a longer one.
 - **Outputs archive**: the `<key>-<nonce>.tar.zst` a routed run's changed output files travel in, its last member `.gate-outputs.json` listing the files before it.
 - **Outputs manifest**: the Manifest of the PC's files under a routed run's output globs, as the Rust client builds it before the run call and writes it as one line on that call's stdin, for the box to read.
-- **Outputs-pending marker**: the empty file `remote\<key>.outputs-pending` in the state root, written before a routed run's run call and removed only after an accepted `gate-remote-outputs: 0`; while it stands, the next run sends `OutputsFull`.
+- **Outputs stage**: the folder `<worktree>\.tmp\<key>-<nonce>` a fetched outputs archive is unpacked and checked in before any file is moved into the worktree.
+- **Outputs-pending marker**: the empty file `remote\<key>.outputs-pending` in the state root, written before a routed run's run call and removed only after an accepted `gate-remote-outputs: 0` or an install that skipped no file; while it stands, the next run sends `OutputsFull`.
+- **OutputsFull**: the run payload's flag, true when the outputs-pending marker was there, that asks the box for every output that differs from the PC's, not only those the run changed.
 - **Parity refusal**: the `parity` refusal of a routed run whose builder lacks the .NET SDK the snapshot needs (its `global.json` pin under the rollForward policy, or, with no pin, an SDK of this PC's newest major); the run goes local.
 - **Pause marker**: an empty file a gate under a parent gate's slot rewrites on every pass while it waits behind a critical request, which stops its parent's watchdog clocks for that time, the watchdog reading it on each sample; one older than 30 s is stale.
 - **Pipe-closed stop**: the box's stop of a job whose client's connection closed: `gate box run` terminates the job, waits for its processes and exits 255.

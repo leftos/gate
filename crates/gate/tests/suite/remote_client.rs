@@ -2186,7 +2186,9 @@ fn a_routed_run_sends_its_outputs_manifest() {
     let log = fs::read_to_string(case.folder().join("out.log")).expect("the log was written");
     assert!(log.contains("gate-remote-outputs: 1 "), "the box's line is in the log: {log}");
     assert_eq!(calls(&steps), ["preflight", "run", "outputs"]);
-    assert!(pending_marker(&case).exists(), "an archive waits, so the marker stays: {outcome:?}");
+    let differs = fs::read_to_string(case.folder().join("bin").join("differs.txt")).expect("the file is there");
+    assert_eq!(differs, "box", "the file that came back is installed: {outcome:?}");
+    assert!(!pending_marker(&case).exists(), "the outputs step completed: {outcome:?}");
 }
 
 #[test]
@@ -2347,8 +2349,6 @@ fn a_run_whose_worktree_changed_says_outputs_were_not_brought_back() {
 /// The PC's `bin/locked.txt` is held open, sharing nothing, while the run hashes it.
 #[test]
 fn a_manifest_that_cannot_be_built_still_runs_and_fails_a_pass() {
-    use std::os::windows::fs::OpenOptionsExt;
-
     let case = outputs_case("client-outputs-unbuilt", &BIN);
     write(&case, r"bin\locked.txt", "pc");
     let held = fs::OpenOptions::new()
@@ -2384,7 +2384,8 @@ fn a_forged_outputs_line_from_the_command_is_not_accepted() {
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert!(outcome.stderr.contains(forged), "the command's line is passed on: {outcome:?}");
     assert!(outcome.stderr.contains("gate-remote-outputs: 1 "), "the box's own line: {outcome:?}");
-    assert!(pending_marker(&case).exists(), "only the box's last line counts: {outcome:?}");
+    let installed = fs::read_to_string(case.folder().join("bin").join("new.txt"));
+    assert_eq!(installed.ok().as_deref(), Some("built"), "only the box's last line counts: {outcome:?}");
 }
 
 /// The stand-in writes `gate-remote-outputs: 0` on standard output once the box has said its own line on standard error.
@@ -2398,7 +2399,12 @@ fn an_outputs_line_on_stdout_after_the_box_is_ignored() {
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert!(outcome.stderr.contains("gate-remote-outputs: 1 "), "the box's own line: {outcome:?}");
     assert!(outcome.stdout.contains("gate-remote-outputs: 0"), "the stand-in's line: {outcome:?}");
-    assert!(pending_marker(&case).exists(), "a line on standard output never counts: {outcome:?}");
+    let installed = fs::read_to_string(case.folder().join("bin").join("new.txt"));
+    assert_eq!(
+        installed.ok().as_deref(),
+        Some("built"),
+        "a line on standard output never counts: {outcome:?}"
+    );
 }
 
 /// A dotnet `--no-build` command brings no outputs back, though its repo has globs and it builds a file under them.
@@ -2483,13 +2489,30 @@ fn named_archive(stderr: &str) -> String {
     line.rsplit(' ').next().expect("the line names its archive").to_owned()
 }
 
-/// The magic number every zstd frame starts with.
-const ZSTD_MAGIC: [u8; 4] = [0x28, 0xb5, 0x2f, 0xfd];
 /// The line of a fetch the watchdog stopped.
 const FETCH_STOPPED_LINE: &str = "gate: remote outputs not brought back: the fetch was stopped by the watchdog";
 
+/// What the case's `.tmp` folder holds of its outputs steps: the archives and the stage folders beside them, each named
+/// for the case's work-folder key, `<key>-<nonce>` and `<key>-<nonce>.tar.zst`.
+fn outputs_leftovers(case: &Case) -> Vec<PathBuf> {
+    let key = key_of(&events(case));
+    let Ok(entries) = fs::read_dir(case.folder().join(".tmp")) else {
+        return Vec::new();
+    };
+    entries
+        .map(|entry| entry.expect("an entry of .tmp can be read").path())
+        .filter(|path| {
+            let name = path.file_name().expect("an entry has a name").to_string_lossy();
+            name.starts_with(&format!("{key}-"))
+        })
+        .collect()
+}
+
+/// The success line of an outputs step that installed one file, its figures any.
+const ONE_INSTALLED: &str = r"(?m)^gate: outputs: 1 file\(s\), \d+\.\d MB \(\d+\.\d MB compressed\) in \d+\.\d s\r?$";
+
 #[test]
-fn a_passing_run_fetches_its_outputs_archive_to_tmp() {
+fn a_passing_run_installs_its_fetched_outputs() {
     let case = outputs_case("client-outputs-fetch", &BIN);
     let steps = ssh_steps(&case, "ssh", &["ok", "ok", "ok"]);
 
@@ -2497,11 +2520,12 @@ fn a_passing_run_fetches_its_outputs_archive_to_tmp() {
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert_eq!(calls(&steps), ["preflight", "run", "outputs"]);
-    let archive = case.folder().join(".tmp").join(named_archive(&outcome.stderr));
-    assert_eq!(fetched_archives(&case), std::slice::from_ref(&archive), "{outcome:?}");
-    let bytes = fs::read(&archive).expect("the fetched archive can be read");
-    assert!(bytes.starts_with(&ZSTD_MAGIC), "a zstd archive, {} bytes", bytes.len());
-    assert!(pending_marker(&case).exists(), "the archive waits to be installed: {outcome:?}");
+    let installed = fs::read_to_string(case.folder().join("bin").join("new.txt")).expect("the built file is installed");
+    assert_eq!(installed, "built", "the box's content");
+    let line = regex::Regex::new(ONE_INSTALLED).expect("the line's pattern");
+    assert!(line.is_match(&outcome.stderr), "{outcome:?}");
+    assert_eq!(outputs_leftovers(&case), Vec::<PathBuf>::new(), "the archive and the stage are removed");
+    assert!(!pending_marker(&case).exists(), "the outputs step completed: {outcome:?}");
     assert!(!outcome.stderr.contains("not brought back"), "{outcome:?}");
 }
 
@@ -2637,17 +2661,134 @@ fn an_outputs_call_with_a_line_past_the_cap_fails_a_pass() {
     assert!(pending_marker(&case).exists(), "{outcome:?}");
 }
 
-/// What the fetch wrote is no archive at all; telling so is the install's, so this fetch keeps it as it came.
+/// What the fetch wrote, ending 0, is no archive at all: the install cannot open it.
 #[test]
-fn a_garbage_fetch_that_ends_0_keeps_its_file() {
+fn a_garbage_fetch_cannot_be_opened_and_fails_a_pass() {
     let case = outputs_case("client-outputs-fetch-garbage", &BIN);
     let steps = ssh_steps(&case, "ssh", &["ok", "ok", "garbage 64"]);
 
     let outcome = finish(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "write", r"bin\new.txt", "built"]));
 
-    assert_eq!(outcome.code, Some(0), "{outcome:?}");
-    let archive = case.folder().join(".tmp").join(named_archive(&outcome.stderr));
-    assert_eq!(fetched_archives(&case), std::slice::from_ref(&archive), "{outcome:?}");
-    assert_eq!(fs::read(&archive).expect("the file can be read"), vec![b'x'; 64]);
+    assert_eq!(outcome.code, Some(1), "a passing run becomes 1: {outcome:?}");
+    let name = named_archive(&outcome.stderr);
+    let line = format!("gate: remote outputs not brought back: the outputs archive {name} cannot be opened: ");
+    assert!(outcome.stderr.contains(&line), "{outcome:?}");
+    assert!(!case.folder().join("bin").join("new.txt").exists(), "nothing is installed");
+    assert_eq!(outputs_leftovers(&case), Vec::<PathBuf>::new(), "the archive and the stage are removed");
     assert!(pending_marker(&case).exists(), "{outcome:?}");
+}
+
+/// The text of the case's worktree file `name`, which must be there.
+fn worktree_text(case: &Case, name: &str) -> String {
+    fs::read_to_string(case.folder().join(name)).expect("the worktree file is there")
+}
+
+/// Asserts an install that refused, `outcome`, saying `reason`: a passing run becomes 1, the PC's `bin/both.txt` keeps
+/// `kept`, `bin/new.txt`, which the archive held after it, is not moved, the archive and the stage are removed, and the
+/// marker stays.
+fn assert_refused_install(case: &Case, outcome: &Outcome, reason: &str, kept: &str) {
+    assert_eq!(outcome.code, Some(1), "a passing run becomes 1: {outcome:?}");
+    let line = format!("gate: remote outputs not brought back: {reason}");
+    assert!(outcome.stderr.contains(&line), "{outcome:?}");
+    assert_eq!(worktree_text(case, r"bin\both.txt"), kept);
+    assert!(!case.folder().join("bin").join("new.txt").exists(), "nothing is moved: {outcome:?}");
+    assert_eq!(outputs_leftovers(case), Vec::<PathBuf>::new(), "the archive and the stage are removed");
+    assert!(pending_marker(case).exists(), "{outcome:?}");
+}
+
+/// The command on the builder writes `bin/both.txt`, which the PC holds too, and `bin/new.txt`.
+const BOTH_AND_NEW: [&str; 7] = [r".\tool.exe", "write", r"bin\both.txt", "box", "write", r"bin\new.txt", "built"];
+
+/// The PC's `bin/both.txt` is edited while the run call is held, after the manifest recorded it.
+#[test]
+fn a_pc_output_edited_during_the_run_is_not_overwritten() {
+    let case = outputs_case("client-outputs-install-changed", &BIN);
+    write(&case, r"bin\both.txt", "pc");
+    let go = Go(case.folder().join("ssh").join("go"));
+    let steps = ssh_steps(&case, "ssh", &["ok", &format!("hold {}", shown(go.path())), "ok"]);
+    let run = start(client_gate(&case, "out.log", &steps, &BOTH_AND_NEW));
+    wait_until("the run call", || calls(&steps).len() == 2);
+    write(&case, r"bin\both.txt", "edited during the run");
+    fs::write(go.path(), "").expect("the go file can be made");
+
+    let outcome = run.finish();
+
+    assert_refused_install(&case, &outcome, "bin/both.txt changed during the run", "edited during the run");
+}
+
+/// The PC's `bin/both.txt` is held open, sharing nothing, from the run call to the run's end: it alone is skipped, the
+/// pass stands, and the marker stays for the next run to ask for every output.
+#[test]
+fn a_pc_output_held_open_is_skipped_and_the_rest_installed() {
+    let case = outputs_case("client-outputs-install-in-use", &BIN);
+    write(&case, r"bin\both.txt", "pc");
+    let go = Go(case.folder().join("ssh").join("go"));
+    let steps = ssh_steps(&case, "ssh", &["ok", &format!("hold {}", shown(go.path())), "ok"]);
+    let run = start(client_gate(&case, "out.log", &steps, &BOTH_AND_NEW));
+    wait_until("the run call", || calls(&steps).len() == 2);
+    let held = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(case.folder().join("bin").join("both.txt"))
+        .expect("the file can be held");
+    fs::write(go.path(), "").expect("the go file can be made");
+
+    let outcome = run.finish();
+    drop(held);
+
+    assert_eq!(outcome.code, Some(0), "the pass stands: {outcome:?}");
+    let skipped = "gate: remote outputs not fully brought back: bin/both.txt is in use or read-only";
+    assert!(outcome.stderr.contains(skipped), "{outcome:?}");
+    assert!(!outcome.stderr.contains("not brought back:"), "{outcome:?}");
+    assert_eq!(worktree_text(&case, r"bin\both.txt"), "pc", "the held file is not overwritten");
+    assert_eq!(worktree_text(&case, r"bin\new.txt"), "built", "the other file is installed");
+    let line = regex::Regex::new(ONE_INSTALLED).expect("the line's pattern");
+    assert!(line.is_match(&outcome.stderr), "only the installed file is counted: {outcome:?}");
+    assert_eq!(outputs_leftovers(&case), Vec::<PathBuf>::new(), "the archive and the stage are removed");
+    assert!(pending_marker(&case).exists(), "the marker stays: {outcome:?}");
+}
+
+#[test]
+fn ctrl_c_during_the_install_says_how_many_files_were_installed() {
+    let case = outputs_case("client-outputs-install-ctrl-c", &BIN);
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok", "ok"]);
+    let tuned = Tuned {
+        extra: &["--test-remote-interrupt-at", "install"],
+        ..Tuned::default()
+    };
+    let command = [r".\tool.exe", "write", r"bin\a.txt", "a", "write", r"bin\b.txt", "b"];
+
+    let outcome = finish(client_gate_tuned(&case, "out.log", &steps, &tuned, &command));
+
+    assert_eq!(outcome.code, Some(CONTROL_C_EXIT), "{outcome:?}");
+    let line = "gate: remote outputs not brought back: 1 of 2 files were installed before the interrupt";
+    assert!(outcome.stderr.contains(line), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "run", "outputs"], "no stop: the command had ended");
+    assert_eq!(worktree_text(&case, r"bin\a.txt"), "a", "the file moved before the interrupt stays");
+    assert!(!case.folder().join("bin").join("b.txt").exists(), "{outcome:?}");
+    assert_eq!(outputs_leftovers(&case), Vec::<PathBuf>::new(), "the archive and the stage are removed");
+    assert!(pending_marker(&case).exists(), "{outcome:?}");
+}
+
+/// A first run names the work-folder key, so the second's command can write the builder's work folder, in another
+/// case, into the test host's manifest it builds.
+#[test]
+fn an_installed_test_host_manifest_names_the_worktree() {
+    let case = outputs_case("client-outputs-install-rewrite", &BIN);
+    let first = ssh_steps(&case, "first", &["ok", "ok"]);
+    let cleared = finish(client_gate(&case, "first.log", &first, &[r".\tool.exe", "out", "ran there"]));
+    assert_eq!(cleared.code, Some(0), "{cleared:?}");
+    let builder = std::path::absolute(case.folder().join("builder")).expect("the builder root has a full path");
+    let work = format!(r"{}\work\{}", builder.display(), key_of(&events(&case)));
+    // After a `_`, the path is not one the router rewrites into the work folder: the builder sits in the worktree here.
+    let recorded = format!(r"Root_{}\src\App", work.to_uppercase());
+    let second = ssh_steps(&case, "second", &["ok", "ok", "ok"]);
+    let command = [r".\tool.exe", "write", r"bin\MvcTestingAppManifest.json", &recorded];
+
+    let outcome = finish(client_gate(&case, "second.log", &second, &command));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let root = std::path::absolute(case.folder()).expect("the case folder has a full path");
+    let expected = format!(r"Root_{}\src\App", root.display());
+    assert_eq!(worktree_text(&case, r"bin\MvcTestingAppManifest.json"), expected, "{outcome:?}");
 }

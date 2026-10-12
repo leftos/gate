@@ -5,7 +5,7 @@
 mod boot;
 mod forward;
 mod heartbeat;
-mod outputs;
+pub(crate) mod outputs;
 pub(crate) mod payload;
 mod preflight;
 mod run;

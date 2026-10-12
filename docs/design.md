@@ -953,7 +953,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
     The client accepts only the last stderr line starting `gate-remote-outputs: `, kept as it is heard so a stdout flood cannot push it out, and echoes it like any box line. It must be `gate-remote-outputs: 0` or `gate-remote-outputs: <n> <key>-<this run's nonce>.tar.zst` with n above 0.
 
-    After an accepted `0` the marker is removed (`gate: cannot remove the outputs pending marker <path>: <error>` if it cannot, and the status stands); every other end leaves it, so the next run sends `OutputsFull`. An accepted line naming an archive leaves the marker; the fetch of the archive (the Outputs fetch phase, below the sync-back) is built and its install (part D) is not.
+    After an accepted `0` the marker is removed (`gate: cannot remove the outputs pending marker <path>: <error>` if it cannot, and the status stands); every other end leaves it, so the next run sends `OutputsFull`. An accepted line naming an archive leaves the marker; the fetch of the archive and its install (the Outputs fetch and Outputs install phases, below the sync-back) follow.
 
     A passing run says at most one of these lines and then exits 1: `gate: remote outputs not brought back: the worktree changed during the run` (wins when it applies), `gate: remote outputs not brought back: the manifest could not be built: <msg>` (`<path> resolves outside the worktree`, `it is larger than the box takes (64 MiB)`, checked as the manifest is built before the rest is hashed, or the read error), or `gate: remote outputs not brought back: the box printed no 'gate-remote-outputs: <n> <archive>' line`.
 
@@ -993,12 +993,25 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
   - **Outputs fetch.** In `remote/outputs.rs` and `remote/client.rs`, after a passing run whose box said an accepted outputs line naming an archive and a passing sync-back.
 
-    The client calls `gate box outputs` over ssh with the payload's location word and `Name` `<key>-<nonce>.tar.zst`, built from this PC's own key and nonce, never from the box's line, and copies the call's stdout raw into `<worktree>\.tmp\<key>-<nonce>.tar.zst` (`.tmp` created when missing). The archive and the pending marker are kept for the install (part D). The call's stderr goes to the log only.
+    The client calls `gate box outputs` over ssh with the payload's location word and `Name` `<key>-<nonce>.tar.zst`, built from this PC's own key and nonce, never from the box's line, and copies the call's stdout raw into `<worktree>\.tmp\<key>-<nonce>.tar.zst` (`.tmp` created when missing). The archive and the pending marker are kept for the install. The call's stderr goes to the log only.
 
     - A fetch the watchdog stops says its `gate: STALLED: ...` or `gate: TIMED OUT after <n> s` line, then `gate: remote outputs not brought back: the fetch was stopped by the watchdog`, and the run ends 124.
     - Any other failed fetch says `gate: remote outputs not brought back: <reason>`: the box's last stderr line (escaped, its first 4 KiB), `the outputs call failed (status <n>)`, `the outputs call sent a line longer than 64 KiB` or `cannot write <path>: <error>`. A passing run becomes 1. The partial archive is removed; a removal that fails says `gate: cannot remove the partial outputs archive <path>: <error>`.
     - A Ctrl+C during the fetch, or noticed by the end of an outputs call however it ended, ends the run as an interrupt with no `stop` call, and removes the partial archive.
     - A fetch that already sent a byte is never retried as a pre-banner drop; one dropped before any byte is retried once like the other calls.
+
+  - **Outputs install.** In `remote/install.rs`, after a whole fetch. The archive is unpacked through `outputs::archive::unpack` into a stage `<worktree>\.tmp\<key>-<nonce>` with the box's 50 GiB `OUTPUTS_BUDGET` (one shared constant) as the decompressed limit; a stage folder that was there before the install is not removed.
+
+    Before any move, in order, each member is checked against the run's output globs, against the manifest (the file must still have its size and last write; a file the manifest lacked that now exists counts as changed) and for being writable. `MvcTestingAppManifest.json` and `.msCoverageSourceRootsMapping_*` are rewritten from the box's work folder to the PC's root (the JSON-escaped form, then the raw one, case-insensitive; the byte order mark and the last write kept); one over 16 MiB or not UTF-8 is refused. The client does not skip the back-commit paths again; the box does.
+
+    Each file is then moved with a rename, after a link and junction check on the way, its last write clamped to the PC's clock in the stage before the move and `unchanged` checked once more just before the rename. A target in use or read-only is skipped, not refused: `gate: remote outputs not fully brought back: <path> is in use or read-only`, one line per file before the success line; the other files install, a passing status stays 0 and the pending marker is kept, so the next routed run sends `OutputsFull`.
+
+    The success line is `gate: outputs: <n> file(s), <X.X> MB (<Y.Y> MB compressed) in <Z.Z> s`: `<n>` counts installed files only, the seconds run from the start of the fetch to the end of the install, and each decimal rounds a half away from zero. A fully installed run clears the pending marker.
+
+    - A passing run becomes 1 with the marker kept, the archive and stage removed and nothing installed, and says `gate: remote outputs not brought back: ` then `the outputs archive <name> cannot be opened: <detail>`, `the archive member <path> is not under the output globs`, `<path> changed during the run`, `<path> is not a file`, `<path> is too large to rewrite (<size> bytes, over 16 MiB)` or `cannot rewrite <path>: it is not UTF-8`.
+    - A move that fails after others were made says `gate: remote outputs not brought back: <n> of <m> files were installed before <path> failed: <detail>` (a file that changed between the checks and its move gives `<path> changed during the run`); the files already moved stay and the status is 1. `<m>` counts only the files to be moved.
+    - A Ctrl+C during the moves says `gate: remote outputs not brought back: <n> of <m> files were installed before the interrupt`, then the interrupt ending, with the marker kept and no `stop` call; one before the first move says nothing extra.
+    - The archive and the stage are removed on every end; a failure says `gate: cannot remove the outputs stage <path>: <error>` or, after a whole fetch, `gate: cannot remove the fetched outputs archive <path>: <error>` (a cut fetch still says "partial").
 
   A pre-banner failure, which is exit 255 (128 for git) with empty stdout, no start marker heard and a first stderr line starting `Connection timed out during banner exchange`, `kex_exchange_identification: ` or `banner exchange: `, says `gate: <host> did not answer the ssh banner; trying once more` and is retried once after a 2 s pause. A run call whose box said the start marker is never retried or read as a pre-banner failure, whatever its first stderr line: the command may have started.
 
@@ -1249,7 +1262,7 @@ Built verbs:
 
   A sent archive that cannot be removed prints `gate: remote could not remove the outputs archive <name>: <error>` and still exits 0; a later run's prune takes it. An archive already gone at its removal (another run's trim took it after it was sent) says nothing and exits 0.
 
-**The outputs module** (GATE-44) is shared by both ends, this exe, in `crates/gate/src/outputs/`. The box's `run` packs with it and the box's `outputs` verb sends the archive; the PC's install is not built yet. The PC's manifest, the pending marker, the reading of the box's `gate-remote-outputs: ` line and the fetch of the archive are built in the Rust remote client, which is dormant ([The remote client's run](#routing-and-the-remoteps1-bridge)).
+**The outputs module** (GATE-44) is shared by both ends, this exe, in `crates/gate/src/outputs/`. The box's `run` packs with it and the box's `outputs` verb sends the archive. The PC's manifest, the pending marker, the reading of the box's `gate-remote-outputs: ` line, the fetch of the archive and its install are built in the Rust remote client, which is dormant ([The remote client's run](#routing-and-the-remoteps1-bridge)).
 
 - Globs: each is relative to the work folder's root and `/`-separated, matched without regard to case: `**/` is any number of folders (none included), `**` anything, `*` any run of characters within one name, `?` one character within one name. Never brought back, whatever the globs: anything under a `.git`, `.tmp` or `TestResults` folder at any depth, and a `.env` file (`.env`, `.env.<name>`, `<name>.env`).
 - Walk: lists the files below a folder that the globs match, ordered by relative path, and does not enter an excluded folder. A link or a junction, to a file or to a folder, is neither followed nor listed. A folder or name that cannot be read, or is not Unicode, fails the walk.
@@ -1403,13 +1416,13 @@ A Rust integration suite drives the built `gate.exe` through its CLI and reads o
 
   `--test-local-sdks <comma list|none>` (needs `--test-remote-transport`) replaces the `dotnet --list-sdks` read of the parity check with a list of versions separated by commas, or `none` for no SDK.
 
-  `--test-remote-bound-ms <n>` (whole milliseconds above 0) replaces the 30 s bound of the client's `stop` and `boot` calls. `--test-remote-interrupt-at <preflight|run|outputs>` makes the client raise the console interrupt itself after that call's first output byte. `--test-remote-timeout-ms <n>` (whole milliseconds above 0) replaces the run's ceiling for the client.
+  `--test-remote-bound-ms <n>` (whole milliseconds above 0) replaces the 30 s bound of the client's `stop` and `boot` calls. `--test-remote-interrupt-at <preflight|run|outputs|install>` makes the client raise the console interrupt itself after that call's first output byte; `install` raises it before the second file's move, so an install of one file is never interrupted. `--test-remote-timeout-ms <n>` (whole milliseconds above 0) replaces the run's ceiling for the client.
 
   `--test-remote-watch-call <preflight|push|run|ls-remote|fetch|outputs>` makes `--test-stall-ms` and `--test-remote-timeout-ms` apply to that one call alone, its ceiling counted from the call's own start, every other call keeping the run's own window and ceiling.
 
   With `ls-remote`, `--test-remote-timeout-ms` is that call's deadline and `--test-stall-ms` alone leaves it on the git limit. With `fetch`, the stall and ceiling seams apply to the fetch alone; with `outputs`, to the outputs fetch alone.
 
-  A value outside a seam's calls says `gate: --test-remote-watch-call must be preflight, push, run, ls-remote, fetch or outputs, got '<v>'`, and `--test-remote-interrupt-at` says `must be preflight, run or outputs`. The four need the transport; `--test-print-request` shows them as `testSeams.remoteBoundMs`, `remoteInterruptAt`, `remoteWatchCall` and `remoteTimeoutMs`, after `remoteRetryPauseMs`.
+  A value outside a seam's calls says `gate: --test-remote-watch-call must be preflight, push, run, ls-remote, fetch or outputs, got '<v>'`, and `--test-remote-interrupt-at` says `must be preflight, run, outputs or install`. The four need the transport; `--test-print-request` shows them as `testSeams.remoteBoundMs`, `remoteInterruptAt`, `remoteWatchCall` and `remoteTimeoutMs`, after `remoteRetryPauseMs`.
 
   `--test-remote-fetch-cap-bytes <n>` (a whole number of bytes above 0, default 4 GiB) replaces the cap on what the sync-back fetch's job may write. Refused without the transport with `gate: --test-remote-fetch-cap-bytes needs --test-remote-transport`, and a value that is not a whole number above 0 with `gate: --test-remote-fetch-cap-bytes must be a whole number above 0, got '<v>'`. `--test-print-request` does not show it.
 

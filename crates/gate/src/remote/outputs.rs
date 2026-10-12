@@ -3,19 +3,21 @@
 //! and before the run call and removed once the outputs step completes, whose presence makes the next routed run of the
 //! worktree ask for every output that differs from the PC's (`OutputsFull`); the box's `gate-remote-outputs:` line the
 //! client takes from the run call; and the outputs call that fetches the archive it names into the worktree's `.tmp`
-//! folder.
+//! folder, for [`install`](super::install) to put into the worktree.
 
 use std::cell::Cell;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
 use gate_state::v1;
 
 use super::RemoteCall;
 use super::client::{self, Attempt, Called, End, Limits, RawSink};
 use super::git::FAILURE_BYTES;
+use super::install::{self, Fetched};
 use super::payload::Location;
 use crate::boxside::payload::{archive_file_name, escaped};
 use crate::outputs::archive::final_path;
@@ -35,6 +37,11 @@ const NO_OUTPUTS_LINE: &str = "the box printed no 'gate-remote-outputs: <n> <arc
 const TMP: &str = ".tmp";
 /// Why a fetch the watchdog stopped brings nothing back, as the PowerShell client says it.
 const STOPPED: &str = "the fetch was stopped by the watchdog";
+/// What an archive a fetch was cut short of, or that was not installed for the run's end, is called when it cannot be
+/// removed.
+const PARTIAL: &str = "partial";
+/// What an archive fetched whole and handed to the install is called when it cannot be removed.
+pub(super) const FETCHED: &str = "fetched";
 
 /// How a run's run call ended, for its outputs step: the work folder's place on the builder, the outputs nonce the run
 /// sent, and the call's status, the command's own.
@@ -54,6 +61,11 @@ impl Archive {
     /// The file at `path`, which no attempt made yet.
     pub(super) fn new(path: PathBuf) -> Archive {
         Archive { path, made: false }
+    }
+
+    /// The file's path.
+    pub(super) fn path(&self) -> &Path {
+        &self.path
     }
 
     /// The file an outputs call's attempt writes its standard output to raw: made new, its folder made when missing,
@@ -79,14 +91,14 @@ impl Archive {
     }
 
     /// Removes the file an attempt of this run made, when one did; one already gone counts as removed. Else why it
-    /// could not be removed.
-    fn remove(&self) -> Result<(), String> {
+    /// could not be removed, the archive called `which`: [`PARTIAL`] or [`FETCHED`].
+    fn remove(&self, which: &str) -> Result<(), String> {
         if !self.made {
             return Ok(());
         }
         match fs::remove_file(&self.path) {
             Err(error) if error.kind() != io::ErrorKind::NotFound => {
-                Err(format!("cannot remove the partial outputs archive {}: {error}", self.path.display()))
+                Err(format!("cannot remove the {which} outputs archive {}: {error}", self.path.display()))
             }
             _ => Ok(()),
         }
@@ -117,8 +129,9 @@ pub(super) struct Sent<'a> {
     pub(super) manifest: Option<Arc<str>>,
     /// The pending marker, written after the push by [`marked`]; `None` for a run with no output globs.
     marker: Option<PathBuf>,
-    /// Why the manifest could not be built, which a passing run says as it fails.
-    unbuilt: Option<String>,
+    /// The manifest the line holds, its files' stamps, which the install checks the PC's files against; empty for a
+    /// run with no output globs. Else why it could not be built, which a passing run says as it fails.
+    built: Result<Manifest, String>,
 }
 
 /// What `attempt`'s run call carries of its outputs. A run with no output globs carries none, and reads no pending
@@ -133,7 +146,7 @@ pub(super) fn sent<'a>(attempt: &mut Attempt<'_, 'a>) -> Result<Sent<'a>, End> {
         full: false,
         manifest: None,
         marker: None,
-        unbuilt: None,
+        built: Ok(Manifest::default()),
     };
     if call.outputs.is_empty() {
         return Ok(sent);
@@ -141,13 +154,14 @@ pub(super) fn sent<'a>(attempt: &mut Attempt<'_, 'a>) -> Result<Sent<'a>, End> {
     let marker = v1::outputs_pending_path(call.state_dir, call.key);
     let full = pending(&marker);
     match manifest_line(Path::new(call.root), call.outputs, MANIFEST_LIMIT, || attempt.go_on().is_ok()) {
-        Ok(line) => {
+        Ok((line, files)) => {
             sent.globs = call.outputs;
             sent.full = full;
             sent.manifest = Some(Arc::from(line));
+            sent.built = Ok(files);
         }
         Err(Unbuilt::Interrupted) => return Err(End::Interrupted),
-        Err(Unbuilt::Failed(reason)) => sent.unbuilt = Some(reason),
+        Err(Unbuilt::Failed(reason)) => sent.built = Err(reason),
     }
     sent.marker = Some(marker);
     Ok(sent)
@@ -182,11 +196,18 @@ pub(super) fn ended(attempt: &mut Attempt<'_, '_>, sent: &Sent<'_>, ran: &Ran<'_
     if *now != 0 {
         return synced;
     }
-    let reason = match (&sent.unbuilt, brought) {
-        (Some(reason), _) => format!("the manifest could not be built: {reason}"),
-        (None, None) => NO_OUTPUTS_LINE.to_owned(),
-        (None, Some(Brought::Archive { .. })) => return fetched(attempt, ran, synced),
-        (None, Some(Brought::Nothing)) => {
+    let reason = match (&sent.built, brought) {
+        (Err(reason), _) => format!("the manifest could not be built: {reason}"),
+        (Ok(_), None) => NO_OUTPUTS_LINE.to_owned(),
+        (Ok(files), Some(Brought::Archive { .. })) => {
+            let kept = Kept {
+                globs: sent.globs,
+                files,
+                marker,
+            };
+            return fetched(attempt, &kept, ran, synced);
+        }
+        (Ok(_), Some(Brought::Nothing)) => {
             if let Err(why) = clear_pending(marker) {
                 attempt.say(format!("gate: {why}"));
             }
@@ -197,21 +218,47 @@ pub(super) fn ended(attempt: &mut Attempt<'_, '_>, sent: &Sent<'_>, ran: &Ran<'_
     End::Status(1)
 }
 
+/// What the outputs step of a passing run whose box packed an archive keeps for its install: the run's output globs,
+/// the PC's manifest and the pending marker.
+struct Kept<'k> {
+    globs: &'k [String],
+    files: &'k Manifest,
+    marker: &'k Path,
+}
+
 /// The outputs call of a passing run whose box packed an archive, `synced` its end so far: the archive the run's own
 /// key and nonce name, never the box's line, is fetched raw into the worktree's `.tmp` folder. One fetched whole is
-/// kept with the pending marker, and the run's end stands. A fetch the watchdog stops says the watchdog's line and
-/// ends the run killed; a Ctrl+C ends it as an interrupt, with no `stop` call; any other failure says why, the box's
-/// last standard error line when it said one, and fails the run. Each of these removes what was fetched, and says so
-/// when it cannot; each says the outputs were not brought back but the interrupt.
-fn fetched(attempt: &mut Attempt<'_, '_>, ran: &Ran<'_>, synced: End) -> End {
+/// installed, as [`install::installed`] says, through a stage folder beside it named for the same key and nonce. A
+/// fetch the watchdog stops says the watchdog's line and ends the run killed; a Ctrl+C ends it as an interrupt, with no
+/// `stop` call; any other failure says why, the box's last standard error line when it said one, and fails the run.
+/// Each of these removes what was fetched, and says so when it cannot; each says the outputs were not brought back but
+/// the interrupt.
+fn fetched(attempt: &mut Attempt<'_, '_>, kept: &Kept<'_>, ran: &Ran<'_>, synced: End) -> End {
+    let started = Instant::now();
     let name = archive_file_name(attempt.call.key, ran.nonce);
-    let mut archive = Archive::new(Path::new(attempt.call.root).join(TMP).join(&name));
+    let tmp = Path::new(attempt.call.root).join(TMP);
+    let mut archive = Archive::new(tmp.join(&name));
     let limits = attempt.limits_for("outputs");
     match attempt.outputs_call(ran.location, &name, &mut archive, limits) {
-        Ok(called) => judged(attempt, &archive, &called, limits, synced),
+        // `judged` hands back the run's passing end only when the archive was fetched whole.
+        Ok(called) => match judged(attempt, &archive, &called, limits, synced) {
+            End::Status(0) => {
+                let fetched = Fetched {
+                    archive: &archive,
+                    stage: tmp.join(format!("{}-{}", attempt.call.key, ran.nonce)),
+                    marker: kept.marker,
+                    manifest: kept.files,
+                    globs: kept.globs,
+                    box_work: &ran.location.work,
+                    started,
+                };
+                install::installed(attempt, &fetched)
+            }
+            end => end,
+        },
         Err(End::Failed(reason)) => unfetched(attempt, &archive, &reason, End::Status(1)),
         Err(end) => {
-            removed(attempt, &archive);
+            removed(attempt, &archive, PARTIAL);
             end
         }
     }
@@ -222,7 +269,7 @@ fn fetched(attempt: &mut Attempt<'_, '_>, ran: &Ran<'_>, synced: End) -> End {
 pub(super) fn judged(attempt: &mut Attempt<'_, '_>, archive: &Archive, called: &Called, limits: Limits, synced: End) -> End {
     // A Ctrl+C raised by the call's end is the run's end, however the call ended, as after the run call.
     if attempt.go_on().is_err() {
-        removed(attempt, archive);
+        removed(attempt, archive, PARTIAL);
         return End::Interrupted;
     }
     if let Some(cut) = called.cut {
@@ -247,13 +294,14 @@ pub(super) fn judged(attempt: &mut Attempt<'_, '_>, archive: &Archive, called: &
 /// Says the run's outputs were not brought back, for `reason`, and removes what `archive` holds of them; `end`.
 fn unfetched(attempt: &mut Attempt<'_, '_>, archive: &Archive, reason: &str, end: End) -> End {
     attempt.say(not_brought_back(reason));
-    removed(attempt, archive);
+    removed(attempt, archive, PARTIAL);
     end
 }
 
-/// Removes what `archive` holds of a fetch that did not complete; a removal that fails is said, and changes no end.
-fn removed(attempt: &mut Attempt<'_, '_>, archive: &Archive) {
-    if let Err(why) = archive.remove() {
+/// Removes what `archive`, called `which` ([`Archive::remove`]), holds of a fetch; a removal that fails is said, and
+/// changes no end.
+pub(super) fn removed(attempt: &mut Attempt<'_, '_>, archive: &Archive, which: &str) {
+    if let Err(why) = archive.remove(which) {
         attempt.say(format!("gate: {why}"));
     }
 }
@@ -263,7 +311,7 @@ fn removed(attempt: &mut Attempt<'_, '_>, archive: &Archive) {
 /// than `cap` bytes is refused, its files' entries counted before each is hashed and the whole line checked at the
 /// end. [`Unbuilt::Interrupted`] once `go_on` says no; else why the globs, the walk or a file cannot be read, or why
 /// the line is not sent.
-fn manifest_line(root: &Path, globs: &[String], cap: usize, go_on: impl Fn() -> bool) -> Result<String, Unbuilt> {
+fn manifest_line(root: &Path, globs: &[String], cap: usize, go_on: impl Fn() -> bool) -> Result<(String, Manifest), Unbuilt> {
     let failed = |error: io::Error| Unbuilt::Failed(error.to_string());
     let globs = Globs::new(globs).map_err(Unbuilt::Failed)?;
     let found = walk(root, &globs).map_err(failed)?;
@@ -273,13 +321,14 @@ fn manifest_line(root: &Path, globs: &[String], cap: usize, go_on: impl Fn() -> 
     if stopped.get() {
         return Err(Unbuilt::Interrupted);
     }
-    let line = match built {
-        Ok(manifest) => manifest.line(),
+    let manifest = match built {
+        Ok(manifest) => manifest,
         Err(error) if error.kind() == io::ErrorKind::FileTooLarge => return Err(Unbuilt::Failed(PAST_THE_CAP.to_owned())),
         Err(error) => return Err(failed(error)),
     };
+    let line = manifest.line();
     within_cap(line.len(), cap).map_err(Unbuilt::Failed)?;
-    Ok(line)
+    Ok((line, manifest))
 }
 
 /// The SHA-256 of the file at `path`, read through a [`Polled`] reader, once its final path, as the system resolves the
@@ -295,10 +344,10 @@ fn hashed(path: &Path, inside: &Path, go_on: &dyn Fn() -> bool, stopped: &Cell<b
 }
 
 /// A reader that asks `go_on` before each read, and fails the read once it says no, marking `stopped`.
-struct Polled<'p, R> {
-    inner: R,
-    go_on: &'p dyn Fn() -> bool,
-    stopped: &'p Cell<bool>,
+pub(super) struct Polled<'p, R> {
+    pub(super) inner: R,
+    pub(super) go_on: &'p dyn Fn() -> bool,
+    pub(super) stopped: &'p Cell<bool>,
 }
 
 impl<R: Read> Read for Polled<'_, R> {
@@ -321,7 +370,7 @@ fn within_cap(length: usize, cap: usize) -> Result<(), String> {
 }
 
 /// The line saying a run's outputs are not brought back, for `reason`.
-fn not_brought_back(reason: &str) -> String {
+pub(super) fn not_brought_back(reason: &str) -> String {
     format!("gate: remote outputs not brought back: {}", escaped(reason))
 }
 
@@ -341,7 +390,7 @@ fn mark_pending(marker: &Path) -> Result<(), String> {
 }
 
 /// Removes the pending marker at `marker`; one already gone counts as removed. Else why it could not be removed.
-fn clear_pending(marker: &Path) -> Result<(), String> {
+pub(super) fn clear_pending(marker: &Path) -> Result<(), String> {
     match fs::remove_file(marker) {
         Err(error) if error.kind() != io::ErrorKind::NotFound => {
             Err(format!("cannot remove the outputs pending marker {}: {error}", marker.display()))
@@ -385,7 +434,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::process::Command;
 
-    use super::{Archive, Brought, MANIFEST_LIMIT, Unbuilt, accepted, hashed, keep_outputs_line, manifest_line, pending, within_cap};
+    use super::{Archive, Brought, MANIFEST_LIMIT, PARTIAL, Unbuilt, accepted, hashed, keep_outputs_line, manifest_line, pending, within_cap};
 
     const KEY: &str = "app-1a2b3c4d";
     const NONCE: &str = "0123456789abcdef0123456789abcdef";
@@ -516,9 +565,10 @@ mod tests {
         fs::create_dir_all(root.join("bin")).expect("the folder can be made");
         fs::write(root.join("bin").join("a.dll"), "abc").expect("the file can be written");
         let globs = ["**".to_owned()];
-        let line = manifest_line(&root, &globs, MANIFEST_LIMIT, || true).expect("the manifest is built");
+        let (line, _) = manifest_line(&root, &globs, MANIFEST_LIMIT, || true).expect("the manifest is built");
 
-        assert_eq!(manifest_line(&root, &globs, line.len(), || true), Ok(line.clone()));
+        let fits = manifest_line(&root, &globs, line.len(), || true).map(|(fitting, _)| fitting);
+        assert_eq!(fits, Ok(line.clone()));
         let refused = Err(Unbuilt::Failed("it is larger than the box takes (64 MiB)".to_owned()));
         assert_eq!(manifest_line(&root, &globs, line.len() - 1, || true), refused, "the whole line");
         assert_eq!(manifest_line(&root, &globs, 10, || true), refused, "the entries, before any hash");
@@ -550,7 +600,7 @@ mod tests {
     fn an_archive_file_is_made_anew_for_each_attempt_and_removed_only_when_made() {
         let path = scratch("archive").join(".tmp").join("app.tar.zst");
         let mut archive = Archive::new(path.clone());
-        assert_eq!(archive.remove(), Ok(()), "nothing made, nothing removed");
+        assert_eq!(archive.remove(PARTIAL), Ok(()), "nothing made, nothing removed");
 
         let mut first = archive.create().expect("the first attempt's file is made, its folder too");
         first.file.write_all(b"partial").expect("the file can be written");
@@ -561,7 +611,7 @@ mod tests {
             Vec::<u8>::new(),
             "the retry's file starts empty"
         );
-        assert_eq!(archive.remove(), Ok(()));
+        assert_eq!(archive.remove(PARTIAL), Ok(()));
         assert!(!path.exists(), "a file this run made is removed");
 
         fs::write(&path, "another run's").expect("the file can be written");
@@ -569,7 +619,7 @@ mod tests {
         let refused = fresh.create().map(drop);
         let cannot = format!("cannot write {}: ", path.display());
         assert!(refused.as_ref().is_err_and(|why| why.starts_with(&cannot)), "{refused:?}");
-        assert_eq!(fresh.remove(), Ok(()));
+        assert_eq!(fresh.remove(PARTIAL), Ok(()));
         assert_eq!(
             fs::read_to_string(&path).expect("the file is there"),
             "another run's",

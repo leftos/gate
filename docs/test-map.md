@@ -47,13 +47,13 @@ Suite = `crates/gate/tests/suite/` (binary `suite`, needs `--all-features`; test
 | bin/fake-ssh.rs | `remote_client` (`--test-remote-ssh`), `push` (`--test-push-ssh`), `routing`? (no) | no: remote_client, push |
 | remote/mod.rs | `routing` (scripted client `--test-remote-client`, fallback reason `client`), `bridge`, `remote_client` | no: routing, bridge, remote_client |
 | remote/bridge.rs | `bridge` (`--test-remote-script`, `--test-bridge`), `routing` (5 uses of `--test-remote-script`), `request` (print only) | no: bridge, routing |
-| remote/{client,parity,retry,transport,watchdog,syncback,outputs,payload,snapshot}.rs | `remote_client` (`--test-remote-transport local:`, `--test-local-sdks`, `--test-remote-ssh`, `--test-remote-snapshot`, `--test-remote-watch-call`, `--test-remote-timeout-ms`, `--test-remote-fetch-cap-bytes`...); `transport.rs` ssh words + `Ssh::find` also `push`; `payload.rs` is what `boxside` payload tests read through `local:` builder | no: remote_client (+ push for transport.rs, + boxside for payload.rs/outputs.rs) |
+| remote/{client,parity,retry,transport,watchdog,syncback,outputs,install,payload,snapshot}.rs | `remote_client` (`--test-remote-transport local:`, `--test-local-sdks`, `--test-remote-ssh`, `--test-remote-snapshot`, `--test-remote-watch-call`, `--test-remote-timeout-ms`, `--test-remote-fetch-cap-bytes`...); `transport.rs` ssh words + `Ssh::find` also `push`; `payload.rs` is what `boxside` payload tests read through `local:` builder | no: remote_client (+ push for transport.rs, + boxside for payload.rs/outputs.rs) |
 | remote/{git,launch}.rs | `remote_client` (`--test-git`), `routing` (`--test-git`, route facts), `request` | no: remote_client, routing |
 | boxside/mod.rs, payload.rs, preflight.rs, boot.rs, run.rs, stop.rs | `boxside` (29 flag/verb uses; the case runs `gate box boot/preflight/run/stop`), `remote_client` (builder is `gate box` via `local:`) | no: boxside, remote_client |
 | boxside/heartbeat.rs, forward.rs | `boxside` (`--test-heartbeat-ms`), `remote_client` | no: boxside, remote_client |
 | boxside/tools.rs | `boxside` (dotnet tool restore, boxside.rs:1845) | no: boxside |
 | boxside/outputs.rs | `boxside` sub-module `boxside::outputs` (manifest, pack, prune, `outputs` verb, `--test-outputs-budget-bytes`), `remote_client` | no: boxside, remote_client |
-| outputs/ (glob, walk, hash, manifest, archive) | `boxside::outputs` (pack), `remote_client` (manifest the client sends); unit tests inside | no: boxside, remote_client |
+| outputs/ (glob, walk, hash, manifest, archive) | `boxside::outputs` (pack), `remote_client` (manifest the client sends, the fetched archive's install); unit tests inside | no: boxside, remote_client |
 
 ## 2. Table: other crates and files
 
@@ -121,7 +121,7 @@ Always add `checkout` to any change that touches a suite file or adds a seam.
 | route.rs | `-E 'binary(suite) and test(/^(routing\|remote_client\|bridge\|request)::/) or (U and test(/^route::/))'` |
 | remote/mod.rs | `-E 'binary(suite) and test(/^(routing\|bridge\|remote_client)::/) or (U and test(/^remote::/))'` |
 | remote/bridge.rs, tools/remote-bridge.ps1 | `-E 'binary(suite) and test(/^(bridge\|routing\|install)::/) or (U and test(/^remote::bridge::/))'` |
-| remote/{client,retry,watchdog,syncback,snapshot,outputs,payload,git,launch,transport}.rs | `-E 'binary(suite) and test(/^(remote_client\|routing)::/) or (U and test(/^remote::/))'`; add `push` for transport.rs, `boxside` for payload.rs/outputs.rs |
+| remote/{client,retry,watchdog,syncback,snapshot,outputs,install,payload,git,launch,transport}.rs | `-E 'binary(suite) and test(/^(remote_client\|routing)::/) or (U and test(/^remote::/))'`; add `push` for transport.rs, `boxside` for payload.rs/outputs.rs |
 | boxside/{mod,payload,preflight,boot,run,stop,forward,heartbeat,tools}.rs | `-E 'binary(suite) and test(/^(boxside\|remote_client)::/) or (U and test(/^boxside::/))'` |
 | boxside/outputs.rs, outputs/* | `-E 'binary(suite) and test(/^(boxside::outputs\|remote_client)::/) or (U and test(/^(boxside::outputs\|outputs)::/))'` |
 | tools/gate.ps1 | `-E 'binary(suite) and test(/^(launcher\|cutover\|checkout)::/)'` |

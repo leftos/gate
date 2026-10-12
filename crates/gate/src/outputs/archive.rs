@@ -247,7 +247,7 @@ impl Folders {
 }
 
 /// Whether `folder` is a folder itself, not a link or a junction; else the refusal.
-fn check_folder(folder: &Path) -> io::Result<()> {
+pub(crate) fn check_folder(folder: &Path) -> io::Result<()> {
     let metadata = fs::symlink_metadata(folder).map_err(|error| in_context(folder, &error))?;
     if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
         Err(in_context(folder, &refused("it is a link or a junction, not a folder".to_owned())))

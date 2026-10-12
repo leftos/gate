@@ -23,8 +23,8 @@ mod nesting;
     not(test),
     expect(
         dead_code,
-        reason = "the unpack serves the remote client's install, which no code calls; without the test seams, the manifest \
-                  writer serves the dormant client too"
+        reason = "the manifest's plain build serves only tests; without the test seams, the unpack and the manifest writer \
+                  serve the dormant remote client too"
     )
 )]
 mod outputs;

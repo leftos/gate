@@ -388,7 +388,9 @@ pub(super) struct Attempt<'c, 'a> {
     pause: Duration,
     pub(super) limits: Limits,
     one_call: Option<OneCall<'c>>,
-    /// The call, `preflight` or `run`, after whose first output byte the console interrupt is raised, as a Ctrl+C would.
+    /// The call, `preflight`, `run` or `outputs`, after whose first output byte the console interrupt is raised, as a
+    /// Ctrl+C would; or `install`, once the install has moved its first file and before it moves a second, so its line
+    /// reads `1 of {m}`: an install of a single file ends before the seam is reached.
     interrupt_at: Option<&'c str>,
     /// `--test-local-sdks`: this PC's SDK list, read in place of `dotnet --list-sdks`.
     local_sdks: Option<&'c str>,
@@ -847,7 +849,7 @@ impl Attempt<'_, '_> {
 
     /// Whether the console interrupt is raised after the first output byte of the call `verb`:
     /// `--test-remote-interrupt-at`.
-    fn raises_at(&self, verb: &str) -> bool {
+    pub(super) fn raises_at(&self, verb: &str) -> bool {
         self.interrupt_at == Some(verb)
     }
 

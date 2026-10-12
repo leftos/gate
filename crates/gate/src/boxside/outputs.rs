@@ -33,8 +33,8 @@ const MANIFEST_LIMIT: u64 = crate::outputs::manifest::MANIFEST_LIMIT as u64;
 /// The bytes in one gibibyte, as [`OUTPUTS_BUDGET`] and an over-large archive's size in the line saying so are counted.
 const GIB: u64 = 1024 * 1024 * 1024;
 /// The most of the output folder's outputs archives the box keeps, in bytes: 50 GiB. A pack that pushes the folder past
-/// it removes the other archives, oldest first, until it fits again.
-const OUTPUTS_BUDGET: u64 = 50 * GIB;
+/// it removes the other archives, oldest first, until it fits again. The client unpacks an archive to no more bytes.
+pub(crate) const OUTPUTS_BUDGET: u64 = 50 * GIB;
 /// The line a pack says when there was nothing to bring back, and so no archive was written.
 pub(super) const NOTHING_PACKED: &str = "gate-remote-outputs: 0";
 
