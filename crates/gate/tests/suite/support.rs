@@ -3,8 +3,10 @@
 use std::ffi::{OsStr, OsString};
 use std::io::{self, Read, Write};
 use std::os::windows::fs::OpenOptionsExt;
+use std::os::windows::io::AsRawHandle;
+use std::os::windows::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
@@ -14,6 +16,8 @@ use std::{fs, process, thread};
 use gate_win32::StoppableProcess;
 use jiff::Timestamp;
 use serde_json::{Value, json};
+use windows_sys::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
+use windows_sys::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject};
 
 /// The gate under test.
 pub const GATE: &str = env!("CARGO_BIN_EXE_gate");
@@ -296,15 +300,18 @@ pub struct Running {
 }
 
 impl Running {
-    /// Returns once stderr contains `needle`; fails with the stderr so far after the hang guard.
+    /// Returns once stderr contains `needle`; fails as [`Running::wait_for`] does.
     pub fn wait_for_stderr(&self, needle: &str) {
-        wait_for_text(&self.stderr, "stderr", needle);
+        self.wait_for_text(Stream::Stderr, needle);
     }
 
-    /// Returns stderr so far once `check` holds for it; fails saying `what` did not happen, with the stderr so far,
-    /// after the hang guard.
+    /// Returns stderr so far once `check` holds for it; fails as [`Running::wait_for`] does, naming `what`.
     pub fn wait_for_stderr_where(&self, what: &str, check: impl Fn(&str) -> bool) -> String {
-        wait_for_stderr_check(&self.stderr, what, check, || true)
+        self.wait_for(&Wanted {
+            stream: Stream::Stderr,
+            what,
+            check: &check,
+        })
     }
 
     /// Returns stderr so far once `check` holds for it and the program is seen running after that stderr was read, so
@@ -317,9 +324,84 @@ impl Running {
         })
     }
 
-    /// Returns stdout so far once it contains `needle`; fails with the stdout so far after the hang guard.
+    /// Returns stdout so far once it contains `needle`; fails as [`Running::wait_for`] does.
     pub fn wait_for_stdout(&self, needle: &str) -> String {
-        wait_for_text(&self.stdout, "stdout", needle)
+        self.wait_for_text(Stream::Stdout, needle)
+    }
+
+    /// Returns the text of `stream` so far once it contains `needle`; fails as [`Running::wait_for`] does.
+    fn wait_for_text(&self, stream: Stream, needle: &str) -> String {
+        let what = format!("{needle:?}");
+        let check = |text: &str| text.contains(needle);
+        self.wait_for(&Wanted {
+            stream,
+            what: &what,
+            check: &check,
+        })
+    }
+
+    /// Returns the text of the wanted stream so far once its check holds for it. Fails at once, with the exit status
+    /// and the output so far, when the program has exited without saying it, after the readers have had
+    /// [`READER_GRACE`] to drain what it wrote before it exited; fails after the hang guard while it still runs.
+    #[expect(
+        clippy::panic,
+        reason = "a program that exited without saying what its case waits for fails the case with its status and output"
+    )]
+    fn wait_for(&self, wanted: &Wanted<'_>) -> String {
+        let deadline = Instant::now() + HANG_GUARD;
+        loop {
+            let ended = self.exit_status();
+            let mut said = self.said();
+            let mut found = verdict(&said, wanted, ended);
+            if matches!(found, Verdict::Failed(_)) {
+                self.wait_for_readers();
+                said = self.said();
+                found = verdict(&said, wanted, ended);
+            }
+            match found {
+                Verdict::Found => return said.of(wanted.stream).to_owned(),
+                Verdict::Failed(message) => panic!("{message}"),
+                Verdict::Waiting => {}
+            }
+            let stream = wanted.stream.name();
+            assert!(
+                Instant::now() < deadline,
+                "{} did not appear on {stream}; {stream} so far:\n{}",
+                wanted.what,
+                said.of(wanted.stream)
+            );
+            thread::sleep(LOOK_AGAIN);
+        }
+    }
+
+    /// The program's exit status once it has exited, read through its handle so a wait that only borrows it can ask.
+    fn exit_status(&self) -> Option<ExitStatus> {
+        let process = self.child.as_raw_handle();
+        // SAFETY: `process` is the program's handle, which `self.child` keeps open while it lives; a zero timeout
+        // only asks whether it is signalled.
+        let waited = unsafe { WaitForSingleObject(process, 0) };
+        if waited == WAIT_TIMEOUT {
+            return None;
+        }
+        assert_eq!(
+            waited,
+            WAIT_OBJECT_0,
+            "the program's handle can be waited on: {}",
+            io::Error::last_os_error()
+        );
+        let mut code = 0;
+        // SAFETY: as above, and `code` is a valid place for the exit code.
+        let read = unsafe { GetExitCodeProcess(process, &raw mut code) };
+        assert_ne!(read, 0, "the program's exit code can be read: {}", io::Error::last_os_error());
+        Some(ExitStatus::from_raw(code))
+    }
+
+    /// Both streams as they stand.
+    fn said(&self) -> Said {
+        Said {
+            stdout: text(&self.stdout),
+            stderr: text(&self.stderr),
+        }
     }
 
     /// The program's pid.
@@ -348,14 +430,20 @@ impl Running {
     /// Joins the readers that end within [`READER_GRACE`] of the program's exit. A reader whose pipe a grandchild still
     /// holds is left running; its buffer is taken as it stands.
     fn let_readers_end(&mut self) {
-        let deadline = Instant::now() + READER_GRACE;
-        while Instant::now() < deadline && !self.readers.iter().all(JoinHandle::is_finished) {
-            thread::sleep(LOOK_AGAIN);
-        }
+        self.wait_for_readers();
         for reader in self.readers.drain(..) {
             if reader.is_finished() {
                 reader.join().expect("an output reader ends");
             }
+        }
+    }
+
+    /// Waits up to [`READER_GRACE`] for the output readers to end, as they do once the program and everything holding
+    /// its pipes have exited.
+    fn wait_for_readers(&self) {
+        let deadline = Instant::now() + READER_GRACE;
+        while Instant::now() < deadline && !self.readers.iter().all(JoinHandle::is_finished) {
+            thread::sleep(LOOK_AGAIN);
         }
     }
 
@@ -513,21 +601,139 @@ fn wait_for_stderr_check(stderr: &Buffer, what: &str, check: impl Fn(&str) -> bo
     }
 }
 
-/// Returns the text of `buffer`, the program's `stream`, once it contains `needle`; fails with the text so far after
-/// the hang guard.
-fn wait_for_text(buffer: &Buffer, stream: &str, needle: &str) -> String {
-    let deadline = Instant::now() + HANG_GUARD;
-    loop {
-        let text = text(buffer);
-        if text.contains(needle) {
-            return text;
+/// One of a program's two output streams.
+#[derive(Clone, Copy)]
+enum Stream {
+    Stdout,
+    Stderr,
+}
+
+impl Stream {
+    fn name(self) -> &'static str {
+        match self {
+            Stream::Stdout => "stdout",
+            Stream::Stderr => "stderr",
         }
-        assert!(
-            Instant::now() < deadline,
-            "{needle:?} did not appear on {stream}; {stream} so far:\n{text}"
-        );
-        thread::sleep(LOOK_AGAIN);
     }
+}
+
+/// A program's output so far, both streams read at one look.
+struct Said {
+    stdout: String,
+    stderr: String,
+}
+
+impl Said {
+    fn of(&self, stream: Stream) -> &str {
+        match stream {
+            Stream::Stdout => &self.stdout,
+            Stream::Stderr => &self.stderr,
+        }
+    }
+}
+
+/// What a wait waits for: `check` holding for the text of `stream`, which the failure messages name as `what`.
+struct Wanted<'a> {
+    stream: Stream,
+    what: &'a str,
+    check: &'a dyn Fn(&str) -> bool,
+}
+
+/// What one look at a program's output makes of a wait.
+#[derive(Debug, PartialEq)]
+enum Verdict {
+    /// The wanted text is there.
+    Found,
+    /// The text is not there yet and the program still runs, so it may yet say it.
+    Waiting,
+    /// The program has exited without saying it: the failure message, with the exit status and the output so far.
+    Failed(String),
+}
+
+/// The verdict on `wanted`, given `said` and the program's exit status when it has `ended`.
+fn verdict(said: &Said, wanted: &Wanted<'_>, ended: Option<ExitStatus>) -> Verdict {
+    if (wanted.check)(said.of(wanted.stream)) {
+        return Verdict::Found;
+    }
+    let Some(status) = ended else {
+        return Verdict::Waiting;
+    };
+    Verdict::Failed(format!(
+        "{} did not appear on {} before the program exited with {status}; stdout so far:\n{}\nstderr so far:\n{}",
+        wanted.what,
+        wanted.stream.name(),
+        said.stdout,
+        said.stderr
+    ))
+}
+
+/// `ready` on stdout and `started` on stderr, the output the verdict cases look at.
+fn said_ready_then_started() -> Said {
+    Said {
+        stdout: "ready\n".to_owned(),
+        stderr: "started\n".to_owned(),
+    }
+}
+
+fn has_started(text: &str) -> bool {
+    text.contains("started")
+}
+
+#[test]
+fn a_wait_finds_text_its_stream_holds_whether_or_not_the_program_has_exited() {
+    let said = said_ready_then_started();
+    let wanted = Wanted {
+        stream: Stream::Stderr,
+        what: "\"started\"",
+        check: &has_started,
+    };
+
+    assert_eq!(verdict(&said, &wanted, None), Verdict::Found);
+    assert_eq!(verdict(&said, &wanted, Some(ExitStatus::from_raw(3))), Verdict::Found);
+}
+
+#[test]
+fn a_wait_goes_on_while_the_program_runs_without_the_text_on_its_stream() {
+    let wanted = Wanted {
+        stream: Stream::Stdout,
+        what: "\"started\"",
+        check: &has_started,
+    };
+
+    assert_eq!(verdict(&said_ready_then_started(), &wanted, None), Verdict::Waiting);
+}
+
+#[test]
+fn a_wait_fails_at_once_when_the_program_has_exited_without_the_text_naming_its_status() {
+    let wanted = Wanted {
+        stream: Stream::Stdout,
+        what: "\"started\"",
+        check: &has_started,
+    };
+
+    let message = match verdict(&said_ready_then_started(), &wanted, Some(ExitStatus::from_raw(3))) {
+        Verdict::Failed(message) => message,
+        other => format!("{other:?}"),
+    };
+
+    for part in [
+        "\"started\" did not appear on stdout",
+        "exited with exit code: 3",
+        "stdout so far:\nready\n",
+        "stderr so far:\nstarted\n",
+    ] {
+        assert!(message.contains(part), "{part:?} is in the failure: {message:?}");
+    }
+}
+
+#[test]
+#[should_panic(expected = "\"started\" did not appear on stdout before the program exited with exit code: 3")]
+fn a_wait_for_output_fails_at_once_when_the_program_exits_without_it() {
+    let mut command = Command::new(FAKE_TOOL);
+    command.args(["exit", "3"]);
+    let running = start(command);
+
+    running.wait_for_stdout("started");
 }
 
 fn text(buffer: &Buffer) -> String {
