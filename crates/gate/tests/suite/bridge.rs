@@ -91,16 +91,38 @@ public static extern bool GenerateConsoleCtrlEvent(uint ctrlEvent, uint processG
 }
 "#;
 
-/// Puts the checked-in bridge script beside the gate under test, where the gate looks for it, once: copied to a name
-/// of this process's own and moved into place, so no gate reads it half written.
+/// Puts the checked-in bridge script beside the gate under test, where the gate looks for it, once: nothing when those
+/// bytes are already there, else copied to a name of this process's own and moved into place, so no gate reads it half
+/// written. Concurrent test processes install the same script; the one that loses the move leaves the winner's copy in
+/// place.
 fn install_shim() {
     static INSTALLED: OnceLock<()> = OnceLock::new();
     INSTALLED.get_or_init(|| {
         let target = shim();
+        let source = checked_in("remote-bridge.ps1");
+        let bytes = fs::read(&source).expect("the checked-in bridge script can be read");
+        if holds_bytes(&target, &bytes) {
+            return;
+        }
         let staged = target.with_file_name(format!("remote-bridge.ps1.{}.part", process::id()));
-        fs::copy(checked_in("remote-bridge.ps1"), &staged).expect("the bridge script can be copied beside the gate");
-        fs::rename(&staged, &target).expect("the bridge script can be moved into place");
+        fs::copy(&source, &staged).expect("the bridge script can be copied beside the gate");
+        let moved = match fs::rename(&staged, &target) {
+            Ok(()) => Ok(()),
+            // Another test process installed the same bytes while a gate held the target open, so the rename was
+            // refused. That process's copy is the one now in place: this one's staging copy is left to clear.
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied && holds_bytes(&target, &bytes) => {
+                let _ = fs::remove_file(&staged); // Best effort: the staging copy beside the gate is not the script the gate reads.
+                Ok(())
+            }
+            Err(error) => Err(error),
+        };
+        moved.expect("the bridge script can be moved into place");
     });
+}
+
+/// Whether `path` holds exactly `bytes`: a script already in place needs no copy or move.
+fn holds_bytes(path: &Path, bytes: &[u8]) -> bool {
+    fs::read(path).is_ok_and(|found| found == bytes)
 }
 
 /// The bridge script's path beside the gate under test.
