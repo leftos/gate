@@ -6,6 +6,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Abandoned slot**: a slot taken from a gate that died holding it, seen as an abandoned mutex or, when the take is clean, a claim whose pid and start are no longer alive; the next gate takes it as its own and journals the takeover.
 - **Archive**: the gzipped `release` lines of a rolled journal, kept in `<state root>\archive\events-<stamp>.jsonl.gz` for 180 days; the gate whose append rolled the journal writes it before releasing the journal mutex.
 - **Aside copy**: the old `gate.exe` an install moves to `gate.exe.<stamp>.<pid>.old` beside the new one; a later install deletes it once no process holds it.
+- **Back commit**: the commit at the back ref, holding the files a routed command changed on the builder, with the run's snapshot as its only parent; a sync-back kept or applied it.
 - **Back ref**: either `refs/gate-back/<key>` on the builder, where the box writes the commit of the files its command changed, or a local `refs/gate-remote/<key>-back` ref, that result kept by the gate when it could not apply it; the bridge commit's choice of parent skips the local one.
 - **Backfill guest**: a waiting gate admitted, during a critical drain, onto a slot the critical gate lends, because its expected run ends before the drain's shadow end; one still running when the drain completes is killed and re-queued.
 - **Backstop**: the watchdog's last limit, five times the ceiling in wall time (less time paused behind a critical request), whatever the load.
@@ -83,6 +84,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Progress**: what resets the stall clock in a sample: the output size changed, the job's CPU reached 1% of one core over the stall window since the last progress, a new pid appeared, or a nested gate is paused.
 - **Pure crate**: a crate with no Windows types in its API that builds and unit-tests on Linux as well (`gate-state`, `gate-watchdog`, `gate-args`, `gate-router`).
 - **Push**: `gate push`, which copies the installed `gate.exe` to every builder on the builders list over ssh and installs it there with the old exe set aside. Not the remote client's push of a snapshot to the builder's git repo.
+- **Quarantine (sync-back)**: the folder `objects\incoming-gate-<pid>-<start ms>-<nonce>` in the repository's object store that a sync-back's fetch writes into, so no object reaches the real store unless the back commit is kept or applied; deleted at the sync-back's end, or kept with a `gate-kept` mark when moving its objects failed, until a later sweep removes it.
 - **Refusal**: a builder's or the remote client's answer that a routed run cannot run there, with a reason (`busy`, `unreachable`, `parity`, `rebooted`, `tools`, `version`, `client`); the gate then falls back to a local run.
 - **Refusal tag**: the stderr line `gate-remote-refused: <nonce> busy|tools` that `gate box run` says just before the human line of a refusal; the remote client reads a `busy` or `tools` fallback from it alone, and ignores it once it has heard the start marker.
 - **Release**: see take.

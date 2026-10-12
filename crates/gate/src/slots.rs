@@ -155,12 +155,13 @@ impl ThisGate {
 /// the source the sweepers read, so a gate that reads its start this way is judged live by construction. The
 /// `--test-own-start-fails` seam makes both reads fail.
 fn read_start(request: &RunRequest) -> io::Result<Timestamp> {
-    read_start_with(
-        request.test_seams.own_start_fails,
-        gate_win32::process_start,
-        gate_win32::process_start_of,
-        std::process::id(),
-    )
+    own_start(request.test_seams.own_start_fails)
+}
+
+/// This gate's own start, read as [`read_start`] reads it, with the `--test-own-start-fails` seam `seam`: what a part
+/// of the gate that holds no request, only the seam, reads.
+pub(crate) fn own_start(seam: bool) -> io::Result<Timestamp> {
+    read_start_with(seam, gate_win32::process_start, gate_win32::process_start_of, std::process::id())
 }
 
 /// [`read_start`] over the reads `first` and `second`, with the `--test-own-start-fails` seam `seam`: a failed second

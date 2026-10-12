@@ -903,7 +903,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
   Once the fetched back commit is confirmed as this snapshot's, every step up to a successful `apply` (the changed-file listing, the worktree check, the patch and the `apply` itself) that fails or is interrupted first keeps the back commit at `refs/gate-remote/<key>-back` and says so:
   - a failure: `gate: the remote run failed: <reason>; the changes are kept: see git diff <snapshot 8 hex> <back 8 hex>`;
   - an interrupt: `gate: the run was interrupted; the changes are kept: see git diff <snapshot 8 hex> <back 8 hex>`, with the interrupt's own status;
-  - a keep that fails too: `gate: the remote run failed: <reason>; the changes could not be kept either: <why>`, or after an interrupt `gate: the remote run failed: the run was interrupted, and the changes could not be kept: <why>` (status 1).
+  - a keep that fails too: `gate: the remote run failed: <reason>; the changes could not be kept either: <why>`, or after an interrupt `gate: the remote run failed: the run was interrupted, and the changes could not be kept: <why>` (status 1). When the fetched objects could not be moved into the repository (Sync-back, below), the owner line is said first and `<why>` is `see the line above`.
 
   A patch that applied but cannot be removed fails the run (`gate: the remote run failed: cannot remove <patch>: <error>`) and keeps nothing: the changes are already in the worktree.
 
@@ -959,9 +959,15 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
   - **Sync-back.** In `remote/syncback.rs`, after a run call that ended with the command's own status (a refusal, an interrupt or a failed call never syncs back).
 
-    `git ls-remote -- <url> refs/gate-back/<key>` then `git -c fetch.fsckObjects=true -c maintenance.auto=false -c gc.auto=0 fetch --progress --no-recurse-submodules --no-tags -- <url> <ref>` run with the push's `GIT_SSH_COMMAND` and `--upload-pack=pwsh -NoProfile -NonInteractive -Command git-upload-pack`; a bare repository on this machine names no pack command.
+    The sync-back first runs `git rev-parse --git-path objects` (the real object store), even when there turns out to be no back commit, and sweeps the quarantines of earlier gates (below). Then `git ls-remote -- <url> refs/gate-back/<key>` then `git -c fetch.fsckObjects=true -c maintenance.auto=false -c gc.auto=0 fetch --progress --no-recurse-submodules --no-tags -- <url> <ref>` run with the push's `GIT_SSH_COMMAND` and `--upload-pack=pwsh -NoProfile -NonInteractive -Command git-upload-pack`; a bare repository on this machine names no pack command.
+
+    The fetch writes into a quarantine, a new folder `<git common dir>\objects\incoming-gate-<pid>-<start ms>-<nonce>` (this gate's pid, its start in Unix epoch milliseconds and a nonce), with `GIT_OBJECT_DIRECTORY` the quarantine and `GIT_ALTERNATE_OBJECT_DIRECTORIES` the real store (C-quoted when its path holds `;` or starts with `"`), so nothing reaches the real store before the back commit is kept or applied.
+
+    The fetch and the calls that read its objects (`rev-list --parents`, the `diff-tree` calls, `cat-file --batch-check`) run with that environment; `rev-parse FETCH_HEAD`, the snapshot calls, `update-ref` and `git apply` run without it. A folder that cannot be made says `gate: the remote run failed: cannot make <folder>: <error>`, and a start of this gate that cannot be read (`--test-own-start-fails` makes it fail) `gate: the remote run failed: cannot read this gate's start: <error>`.
 
     The fetch runs with the console's interrupt, so it starts no automatic `maintenance run --auto` or `gc --auto` whose lock a Ctrl+C could leave in the user's repository.
+
+    The quarantine is deleted at the sync-back's end, whatever the ending (a Ctrl+C, a cut, an ignored commit, a failed git call, or a kept or applied commit whose objects were moved out), except after a failed move (below).
 
     Their output stays out of the run's log. No back ref on the builder means the command changed nothing, and the run ends with the command's status and no line. A Ctrl+C during either call ends the run as an interrupt.
     - A back commit whose only parent is not this run's snapshot, or a fetched commit that is not the one `ls-remote` advertised for exactly that ref, says `gate: ignored stale remote changes <back 8 hex>: not made from snapshot <snapshot 8 hex>`, applies nothing and leaves the status.
@@ -984,9 +990,16 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
       The cut says on stderr and in the log `gate: remote sync-back stopped: the fetch wrote more than <size>; the run's changes stay on the builder (refs/gate-back/<key>)`. `<size>` is in the largest of B, KiB, MiB and GiB whose value rounded to one decimal is at least 1.0 (`4.0 GiB`, `256.0 KiB`).
 
       Nothing is applied and the outputs step still runs. A passing run exits 1; a failing command keeps its status. The cap is the sync-back fetch's alone: the outputs fetch has none yet.
-    - After any fetch end that is not a clean exit 0 (a cut, Ctrl+C or git's non-zero status), the call's job is terminated and the client waits up to 30 s for its processes to exit. It then removes the `tmp_pack_*` files in `git rev-parse --git-path objects/pack` that were not there before the fetch, retrying a file another process holds (os error 32) for up to 30 s. A file still left says `gate: remote could not remove <path>: <error>` on stderr and changes no status.
+    - After any fetch end that is not a clean exit 0 (a cut, Ctrl+C or git's non-zero status), the call's job is terminated and the client waits up to 30 s for its processes to exit. The quarantine is then deleted with the rest of the sync-back's endings, so a half-written pack goes with it; `FETCH_HEAD` is left to git.
+    - The delete of the quarantine retries a file another process holds (os error 32) for up to 30 s. A folder still left says `gate: remote could not remove <path>: <error>` on stderr, naming the quarantine, and changes no status.
+    - The objects move into the real store only when the back commit is kept (every case above) or applied, before either `update-ref` or `git apply`. Each pack's files move first with the `.idx` last, then the loose objects; a `.keep` never moves, and a target that exists is skipped. Each is a no-replace rename (`gate_win32::move_no_replace`), a file another process holds open retried for up to 30 s.
 
-      The pack folder is listed before the fetch: a missing folder counts as empty, and any other error fails the sync-back with `cannot list <folder>: <error>`. A complete pack that only the after-exit size check caught, and `FETCH_HEAD`, are left to git.
+      A move that fails part-way returns the files it moved to the quarantine, keeps the quarantine with a `gate-kept` mark, writes no back ref and applies nothing. It says `gate: remote changes not applied: the fetched objects could not be moved into the repository: <detail>; they are kept in <folder>`, and a passing run becomes 1.
+
+      `<detail>` is `<path relative to the quarantine>: <error>` or `cannot list the quarantine: <error>`; when some moved files could not be returned it adds `; <n> moved files could not be returned: <first path>`. A quarantine that is gone says `...into the repository: the quarantine folder is gone` and keeps nothing. After a failed step or an interrupt, this line is said first and the run's ending says the changes could not be kept, see the line above.
+    - At the start of each sync-back, the quarantines in the object store are swept, silently. A folder whose gate ended (its pid and start checked) is removed; one whose liveness is unknown, or whose name does not parse, is left.
+
+      A folder with a `gate-kept` mark is removed 7 days after the mark's time (the folder's creation time when the mark's is unreadable or in the future), and at most 3 kept folders stay per object store, the oldest past 3 removed. A folder the sweep cannot remove says the `gate: remote could not remove <path>: <error>` line once per sync-back, and a store that cannot be listed says `gate: remote could not list <objects> for leftover sync-backs: <error>`.
 
       The log alone gets `gate: cannot read the bytes <program> wrote: <error>` (the first failed counter read of a call), `gate: the processes of <program> did not end within 30 s`, `gate: cannot read the processes of <program>: <error>` and `gate: cannot end <program>: <error>`.
     - A `fetch` that fails before the banner is not retried when its job wrote more than 1 MiB.
@@ -1430,7 +1443,7 @@ A Rust integration suite drives the built `gate.exe` through its CLI and reads o
 
   `--test-remote-script <path>` and `--test-bridge-pwsh <path>` (on `gate run` only) replace the bridge's `remote.ps1` and `pwsh`; `--test-print-request` shows them as `testSeams.remoteScript` and `testSeams.bridgePwsh`, after `remoteTimeoutMs`.
 
-  `--test-own-start-fails` (a switch, on `gate run` only) makes both reads of the gate's own start fail, so the run ends with the refusal line of [Output lines](#output-lines); `--test-print-request` shows it as `testSeams.ownStartFails`, after `bridgePwsh`.
+  `--test-own-start-fails` (a switch, on `gate run` only) makes both reads of the gate's own start fail, so the run ends with the refusal line of [Output lines](#output-lines), and the quarantine's start read in a sync-back too; `--test-print-request` shows it as `testSeams.ownStartFails`, after `bridgePwsh`.
 
   `--test-parent-job-trusted` (a switch, on `gate run` and in the compatibility layer) skips the binding of the slot marker to the parent's job, so a case can run under a marker that names the test process; `--test-print-request` shows it as `testSeams.parentJobTrusted`, after `ownStartFails`.
 

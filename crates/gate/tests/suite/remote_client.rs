@@ -1108,12 +1108,12 @@ fn a_file_the_command_changes_on_the_box_is_synced_back() {
 /// The bytes of the file a fetch-cap case's command writes on the box, which no compression shrinks: 1 MiB.
 const NOISE_BYTES: &str = "1048576";
 
-/// The `tmp_pack_*` files a fetch left in the case's own `objects/pack` folder.
-fn tmp_packs(case: &Case) -> Vec<String> {
-    fs::read_dir(case.folder().join(".git").join("objects").join("pack"))
-        .expect("the pack folder can be listed")
+/// The `incoming-gate-*` quarantine folders a sync-back left in the case's own `objects` folder.
+fn quarantines(case: &Case) -> Vec<String> {
+    fs::read_dir(case.folder().join(".git").join("objects"))
+        .expect("the objects folder can be listed")
         .map(|entry| entry.expect("an entry can be read").file_name().to_string_lossy().into_owned())
-        .filter(|name| name.starts_with("tmp_pack_"))
+        .filter(|name| name.starts_with("incoming-gate-"))
         .collect()
 }
 
@@ -1150,7 +1150,11 @@ fn a_back_commit_over_the_fetch_cap_is_not_applied_and_fails_a_passing_run() {
         !kept.lines().any(|name| name.ends_with("-back")),
         "nothing was kept in the worktree: {kept}"
     );
-    assert_eq!(tmp_packs(&case), Vec::<String>::new(), "no part of the pack is left");
+    assert_eq!(
+        quarantines(&case),
+        Vec::<String>::new(),
+        "no quarantine, and so no part of the pack, is left"
+    );
     assert!(
         is_sha(&builder_ref(&case, &format!("refs/gate-back/{key}"))),
         "the changes stay on the builder"

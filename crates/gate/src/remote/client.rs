@@ -100,6 +100,8 @@ pub(crate) struct RustClient {
     /// The most bytes the files a back commit writes into the worktree may total: `--test-remote-apply-cap-bytes`,
     /// else 4 GiB.
     apply_cap: u64,
+    /// `--test-own-start-fails`: this gate's start, which names the sync-back's quarantine, cannot be read.
+    own_start_fails: bool,
 }
 
 impl RustClient {
@@ -124,6 +126,7 @@ impl RustClient {
             local_sdks: seams.local_sdks.clone(),
             fetch_cap: seams.remote_fetch_cap_bytes.unwrap_or(watchdog::FETCH_CAP),
             apply_cap: seams.remote_apply_cap_bytes.unwrap_or(watchdog::APPLY_CAP),
+            own_start_fails: seams.own_start_fails,
         })
     }
 }
@@ -181,6 +184,7 @@ impl RemoteClient for RustClient {
             local_sdks: self.local_sdks.as_deref(),
             fetch_cap: self.fetch_cap,
             apply_cap: self.apply_cap,
+            own_start_fails: self.own_start_fails,
             lines: Vec::new(),
             problem: None,
         };
@@ -398,6 +402,8 @@ pub(super) struct Attempt<'c, 'a> {
     pub(super) fetch_cap: u64,
     /// The most bytes the files a back commit writes into the worktree may total.
     pub(super) apply_cap: u64,
+    /// `--test-own-start-fails`: this gate's start, which names the sync-back's quarantine, cannot be read.
+    pub(super) own_start_fails: bool,
     lines: Vec<String>,
     problem: Option<String>,
 }
@@ -588,9 +594,11 @@ impl Attempt<'_, '_> {
         args.extend(bridge.map(|bridge| format!("+{bridge}:refs/gate-bridge/{key}")));
         let git = Git::find(root).map_err(End::Failed)?;
         let started = Instant::now();
-        let ssh_command = target.ssh_command.as_deref();
+        let ssh_command = target.ssh_command.as_deref().map(|ssh| ("GIT_SSH_COMMAND", std::ffi::OsStr::new(ssh)));
         let watch = Watch::Run(self.limits_for("push"));
-        let (mut called, _) = self.with_retry(GIT_SSH_FAILED, |attempt| attempt.git(&git, &args, ssh_command, Echo::Progress, watch))?;
+        let (mut called, _) = self.with_retry(GIT_SSH_FAILED, |attempt| {
+            attempt.git(&git, &args, ssh_command.as_slice(), Echo::Progress, watch)
+        })?;
         let size = push_size(&called.lines);
         self.lines.append(&mut called.lines);
         self.not_started_if_killed("the push", &called)?;
@@ -896,14 +904,11 @@ impl Attempt<'_, '_> {
         Ok(called)
     }
 
-    /// git with `args` in the worktree, given `ssh_command` as the ssh it runs when there is one, its lines going where
-    /// `echo` says, watched as `watch` says.
-    pub(super) fn git(&mut self, git: &Git, args: &[String], ssh_command: Option<&str>, echo: Echo, watch: Watch) -> Result<Called, End> {
+    /// git with `args` in the worktree, given the variables `set` beside the ones every call is given, among them the ssh
+    /// it runs as `GIT_SSH_COMMAND` when there is one, its lines going where `echo` says, watched as `watch` says.
+    pub(super) fn git(&mut self, git: &Git, args: &[String], set: &[(&str, &std::ffi::OsStr)], echo: Echo, watch: Watch) -> Result<Called, End> {
         let mut command = git.command(Path::new(self.call.root));
-        command.args(args);
-        if let Some(ssh) = ssh_command {
-            command.env("GIT_SSH_COMMAND", ssh);
-        }
+        command.args(args).envs(set.iter().copied());
         let starts = Starts {
             breakaway: false,
             raise: false,
@@ -1071,6 +1076,7 @@ impl<'c, 'a> Attempt<'c, 'a> {
             local_sdks: None,
             fetch_cap: watchdog::FETCH_CAP,
             apply_cap: watchdog::APPLY_CAP,
+            own_start_fails: false,
             lines: Vec::new(),
             problem: None,
         }
@@ -1993,6 +1999,7 @@ mod tests {
             local_sdks: None,
             fetch_cap: watchdog::FETCH_CAP,
             apply_cap: watchdog::APPLY_CAP,
+            own_start_fails: false,
             lines: Vec::new(),
             problem: None,
         }

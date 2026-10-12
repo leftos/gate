@@ -7,16 +7,21 @@
 //! take further, as it failed or was interrupted, is kept there too, and the line that ends the run says where to see
 //! its changes. A fetch whose job writes more than the fetch cap is stopped and fails a run that had passed, the
 //! changes left on the builder and nothing applied.
+//! The fetch writes its objects into a quarantine folder of its own inside the repository's object store, which git
+//! reads beside the store; they are moved into the store only when the back commit is kept or applied, and the folder
+//! is removed at the sync-back's end, unless a move that failed keeps it. The quarantines gates that ended left are
+//! swept at the start of the next sync-back; a kept one stays for a week.
 //! The two git calls that reach the builder take the pre-banner retry and keep their lines out of the log; any other
 //! git failure is the run's, status 1 and `gate: the remote run failed: ...`, with no fallback. Every name and git line
 //! said here has its control characters escaped.
 
-use std::ffi::OsString;
+use std::cell::Cell;
+use std::ffi::{OsStr, OsString};
 use std::fs::OpenOptions;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use super::client::{Attempt, Called, Echo, End, Watch};
 use super::git::{self, Git, GitError};
@@ -26,6 +31,7 @@ use super::retry::GIT_SSH_FAILED;
 use super::snapshot::{self, BACK, REFS, Snapshot};
 use super::watchdog::{self, Cut};
 use crate::boxside::payload::escaped;
+use crate::slots::{self, Liveness};
 
 /// The patch an applied sync-back is written to in the git folder, named for the process and a nonce, and removed
 /// whether or not it applied.
@@ -52,18 +58,54 @@ pub(super) fn sync_back(attempt: &mut Attempt<'_, '_>, snapshot: &Snapshot, stat
         reference: &reference,
     };
     let git = Git::find(Path::new(attempt.call.root)).map_err(End::Failed)?;
+    let objects = objects_folder(attempt, &git)?;
+    for line in swept(&objects, SystemTime::now(), slots::gate_liveness) {
+        attempt.say(line);
+    }
     let Some(advertised) = has_back(attempt, &git, &remote)? else {
         return Ok(End::Status(status));
     };
-    if let Some(stopped) = fetch(attempt, &git, &remote, status)? {
-        return Ok(stopped);
+    let name = incoming_name(std::process::id(), own_start(attempt.own_start_fails)?, &payload::job_nonce());
+    let quarantine = Quarantine::made(&objects, &name).map_err(End::Failed)?;
+    let back = Back {
+        commit: &advertised,
+        quarantine: &quarantine,
+    };
+    let end = fetch(attempt, &git, &remote, &quarantine, status).and_then(|stopped| match stopped {
+        Some(stopped) => Ok(stopped),
+        None => taken(attempt, &git, snapshot, &back, status),
+    });
+    // However the sync-back ended, the quarantine goes, unless a move that failed kept it; the end stands as it would
+    // without the removal, and its lines come before the removal's.
+    if let Some(line) = quarantine.removed(KILL_WAIT, || {}) {
+        attempt.say(line);
     }
-    let back = line(attempt, &git, &["rev-parse", "FETCH_HEAD"])?;
-    if back != advertised || !made_from(attempt, &git, &back, &snapshot.commit)? {
-        attempt.say(ignored_line(&back, &snapshot.commit));
+    end
+}
+
+/// This gate's start in Unix epoch milliseconds, read as the gate reads it for its slots, with the
+/// `--test-own-start-fails` seam `seam`, which names its quarantine beside its pid; else why it cannot be read.
+fn own_start(seam: bool) -> Result<u64, End> {
+    slots::own_start(seam)
+        .map(slots::epoch_ms)
+        .map_err(|error| End::Failed(format!("cannot read this gate's start: {error}")))
+}
+
+/// The back commit the fetch brought, applied or kept when it is the one the builder advertised, `back`, and was made
+/// from the snapshot; else it is ignored, and the run ends as `status`.
+fn taken(attempt: &mut Attempt<'_, '_>, git: &Git, snapshot: &Snapshot, back: &Back<'_>, status: i64) -> Result<End, End> {
+    let fetched = line(attempt, git, &["rev-parse", "FETCH_HEAD"], &[])?;
+    if fetched != back.commit || !made_from(attempt, git, back, &snapshot.commit)? {
+        attempt.say(ignored_line(&fetched, &snapshot.commit));
         return Ok(End::Status(status));
     }
-    receive(attempt, &git, snapshot, &back, status)
+    receive(attempt, git, snapshot, back, status)
+}
+
+/// The back commit the builder advertised, and the quarantine its fetched objects are read from.
+struct Back<'a> {
+    commit: &'a str,
+    quarantine: &'a Quarantine,
 }
 
 /// The back commit the builder advertises for this run, from `ls-remote` of its ref; `None` when it holds none.
@@ -71,6 +113,7 @@ fn has_back(attempt: &mut Attempt<'_, '_>, git: &Git, remote: &Remote<'_>) -> Re
     let ls_remote = Network {
         verb: "ls-remote",
         watch: Watch::Deadline(attempt.deadline_for("ls-remote", attempt.limit)),
+        set: &[],
     };
     let called = to_the_builder(attempt, git, remote, &ls_remote, &remote.args(&["ls-remote"]))?;
     Ok(advertised(&called.lines, remote.reference))
@@ -93,47 +136,37 @@ const FETCH_WORDS: [&str; 10] = [
     "--no-tags",
 ];
 
-/// Fetches the back ref the builder holds into `FETCH_HEAD`, every object it sends checked, and no tag or submodule.
-/// It says its progress, which a live fetch keeps sending on standard error, so only a fetch that went quiet stalls.
-/// Its job may write at most the attempt's fetch cap: past it the fetch is stopped, and the run of the command that
-/// ended `status` ends with the line saying the changes stay on the builder, a passing run as 1. A fetch that did not
-/// exit cleanly has the parts of a pack it left in the repository's pack folder removed, however it ended. That end;
-/// `None` when the fetch went through.
-fn fetch(attempt: &mut Attempt<'_, '_>, git: &Git, remote: &Remote<'_>, status: i64) -> Result<Option<End>, End> {
-    let packs = pack_folder(attempt, git)?;
-    let before = tmp_packs(&packs).map_err(|error| End::Failed(escaped(&format!("cannot list {}: {error}", packs.display()))))?;
+/// Fetches the back ref the builder holds into `FETCH_HEAD`, its objects written into `quarantine` alone, every object
+/// it sends checked, and no tag or submodule. It says its progress, which a live fetch keeps sending on standard error,
+/// so only a fetch that went quiet stalls. Its job may write at most the attempt's fetch cap: past it the fetch is
+/// stopped, and the run of the command that ended `status` ends with the line saying the changes stay on the builder, a
+/// passing run as 1. That end; `None` when the fetch went through.
+fn fetch(attempt: &mut Attempt<'_, '_>, git: &Git, remote: &Remote<'_>, quarantine: &Quarantine, status: i64) -> Result<Option<End>, End> {
+    let set = quarantine.env();
     let fetch = Network {
         verb: "fetch",
         watch: Watch::Fetch(attempt.limits_for("fetch"), Some(attempt.fetch_cap)),
+        set: &set,
     };
     let args = remote.args(&FETCH_WORDS);
-    let made = reached(attempt, git, remote, &fetch, &args);
-    // Any end but a clean exit may leave part of a pack, which no later fetch removes: a cut, an interrupt, a git that
-    // failed. The end itself stands as it would without the removal, and its lines come before the removal's.
-    let clean = matches!(&made, Ok(called) if called.cut.is_none() && called.status == 0);
-    let unremoved = if clean {
-        Vec::new()
-    } else {
-        remove_new_tmp_packs(&packs, &before, KILL_WAIT, || {})
-    };
-    let end = made.and_then(|called| {
-        if let Some(Cut::TooBig(cap)) = called.cut {
-            attempt.noted(&called);
-            attempt.say(stopped_line(cap, remote.reference));
-            return Ok(Some(End::Status(if status == 0 { 1 } else { status })));
-        }
-        checked(attempt, &fetch, &args, called).map(|_| None)
-    });
-    for line in unremoved {
-        attempt.say(line);
+    let called = reached(attempt, git, remote, &fetch, &args)?;
+    if let Some(Cut::TooBig(cap)) = called.cut {
+        attempt.noted(&called);
+        attempt.say(stopped_line(cap, remote.reference));
+        return Ok(Some(End::Status(not_passing(status))));
     }
-    end
+    checked(attempt, &fetch, &args, called).map(|_| None)
 }
 
-/// The pack folder of the worktree's repository, as `git rev-parse --git-path objects/pack` names it, asked with no
-/// interrupt: a Ctrl+C meanwhile is left to the fetch that follows, which ends as the run's interrupt.
-fn pack_folder(attempt: &Attempt<'_, '_>, git: &Git) -> Result<PathBuf, End> {
-    let args = ["rev-parse", "--git-path", "objects/pack"];
+/// `status`, but 1 for a passing run: how a run whose changes were not applied ends.
+fn not_passing(status: i64) -> i64 {
+    if status == 0 { 1 } else { status }
+}
+
+/// The object store of the worktree's repository, as `git rev-parse --git-path objects` names it, asked with no
+/// interrupt: a Ctrl+C meanwhile is left to the call that follows, which ends as the run's interrupt.
+fn objects_folder(attempt: &Attempt<'_, '_>, git: &Git) -> Result<PathBuf, End> {
+    let args = ["rev-parse", "--git-path", "objects"];
     let printed = git
         .output(&git::Call::plain(Path::new(attempt.call.root), &args, attempt.limit))
         .map_err(escaped_end)?;
@@ -146,62 +179,324 @@ fn pack_folder(attempt: &Attempt<'_, '_>, git: &Git) -> Result<PathBuf, End> {
     Ok(Path::new(attempt.call.root).join(folder))
 }
 
-/// What a pack being written into the pack folder is named until git renames it: `tmp_pack_` and six random characters.
-const TMP_PACK: &str = "tmp_pack_";
-/// Windows' error for a file another process holds open, which refuses its removal.
-const SHARING_VIOLATION: i32 = 32;
-/// How long a removal waits before it tries again a file another process holds open.
-const REMOVE_STEP: Duration = Duration::from_millis(20);
-
-/// The names of the `tmp_pack_*` files in the pack folder `folder`; none when there is no such folder.
-fn tmp_packs(folder: &Path) -> io::Result<Vec<OsString>> {
-    let entries = match std::fs::read_dir(folder) {
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        listed => listed?,
-    };
-    let mut names = Vec::new();
-    for entry in entries {
-        let name = entry?.file_name();
-        if name.to_string_lossy().starts_with(TMP_PACK) {
-            names.push(name);
+/// The real object store `objects` as `GIT_ALTERNATE_OBJECT_DIRECTORIES` names it: as it is, or C-quoted, its `\` and
+/// `"` escaped, when it holds the list's separator `;` or starts with the `"` git reads a quoted entry by.
+fn alternates(objects: &Path) -> OsString {
+    let bytes = objects.as_os_str().as_encoded_bytes();
+    if !bytes.contains(&b';') && bytes.first() != Some(&b'"') {
+        return objects.as_os_str().to_owned();
+    }
+    let mut quoted = String::from('"');
+    for character in objects.to_string_lossy().chars() {
+        if matches!(character, '\\' | '"') {
+            quoted.push('\\');
         }
+        quoted.push(character);
+    }
+    quoted.push('"');
+    OsString::from(quoted)
+}
+
+/// What the folder a sync-back's fetch writes its objects into is named, in the repository's object store:
+/// `incoming-gate-<pid>-<start>-<nonce>`, for the gate's pid, its start in Unix epoch milliseconds and a nonce.
+const INCOMING: &str = "incoming-gate-";
+/// The file a quarantine whose objects could not be moved in holds, so that no sweep removes it at once.
+const KEPT_MARK: &str = "gate-kept";
+/// What the reason a move into the store failed for starts with.
+const UNMOVED: &str = "the fetched objects could not be moved into the repository";
+/// What the name of a pack's own file starts with: `pack-<hash>.<kind>`.
+const PACK_FILE: &str = "pack-";
+/// Windows' error for a file another process holds open, which refuses its move or its removal.
+const SHARING_VIOLATION: i32 = 32;
+/// How long a move or a removal waits before it tries again a file another process holds open.
+const RETRY_STEP: Duration = Duration::from_millis(20);
+
+/// The name of the quarantine of the gate `pid` started at `start`, in Unix epoch milliseconds, for the nonce `nonce`.
+fn incoming_name(pid: u32, start: u64, nonce: &str) -> String {
+    format!("{INCOMING}{pid}-{start}-{nonce}")
+}
+
+/// The pid and the start of the gate the quarantine `name` was made for; `None` for a name that does not read as one.
+fn incoming_owner(name: &str) -> Option<(u32, u64)> {
+    let mut parts = name.strip_prefix(INCOMING)?.splitn(3, '-');
+    let pid = parts.next()?.parse().ok()?;
+    let start = parts.next()?.parse().ok()?;
+    parts.next().filter(|nonce| !nonce.is_empty())?;
+    Some((pid, start))
+}
+
+/// The folder a sync-back's fetch writes its objects into, inside the repository's object store `objects` so that each
+/// move into the store is a rename. git is given it as its object store and the real one as its alternate, so nothing
+/// reaches the store before the back commit is kept or applied; it is removed at the sync-back's end, unless a move
+/// that failed kept it.
+struct Quarantine {
+    folder: PathBuf,
+    objects: PathBuf,
+    /// The store as the alternates variable names it.
+    alternates: OsString,
+    /// Whether a move that failed kept the folder.
+    kept: Cell<bool>,
+    /// How long the sync-back's move waits for a file another process holds open: [`KILL_WAIT`], or a test's own.
+    wait: Duration,
+}
+
+impl Quarantine {
+    /// The new folder `name` made in the object store `objects`; else why it could not be made, escaped.
+    fn made(objects: &Path, name: &str) -> Result<Quarantine, String> {
+        let folder = objects.join(name);
+        std::fs::create_dir(&folder).map_err(|error| escaped(&format!("cannot make {}: {error}", folder.display())))?;
+        Ok(Quarantine {
+            folder,
+            objects: objects.to_path_buf(),
+            alternates: alternates(objects),
+            kept: Cell::new(false),
+            wait: KILL_WAIT,
+        })
+    }
+
+    /// The variables that point git at the quarantine, the store its alternate: what the fetch and every call that reads
+    /// the objects it brought are given.
+    fn env(&self) -> [(&'static str, &OsStr); 2] {
+        [
+            ("GIT_OBJECT_DIRECTORY", self.folder.as_os_str()),
+            ("GIT_ALTERNATE_OBJECT_DIRECTORIES", self.alternates.as_os_str()),
+        ]
+    }
+
+    /// Moves the fetched objects into the store as [`move_plan`] orders them, a file the store holds already left where
+    /// it is; a file another process holds open is tried again for up to `wait`, `held` called before each wait. A move
+    /// that fails even so, or a quarantine that cannot be listed, stops there: every file the move put into the store
+    /// is returned to the quarantine, and the quarantine is kept, marked: why, and where the objects are kept. A
+    /// quarantine that is gone keeps nothing, and the reason says so.
+    fn moved_in(&self, wait: Duration, mut held: impl FnMut()) -> Result<(), String> {
+        let deadline = Instant::now() + wait;
+        let plan = match move_plan(&self.folder, &self.objects) {
+            Ok(plan) => plan,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Err(format!("{UNMOVED}: the quarantine folder is gone")),
+            Err(error) => return Err(self.kept_for(&format!("cannot list the quarantine: {error}"))),
+        };
+        let mut done = Vec::new();
+        for (source, target) in &plan {
+            match moved(source, target, deadline, &mut held) {
+                Ok(true) => done.push((source, target)),
+                Ok(false) => {}
+                Err(error) => {
+                    let shown = source.strip_prefix(&self.folder).unwrap_or(source).display();
+                    let unreturned = returned(&done, wait, &mut held);
+                    return Err(self.kept_for(&format!("{shown}: {error}{unreturned}")));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Keeps the quarantine after a move that failed for `detail`, marked with [`KEPT_MARK`]: the reason, escaped, which
+    /// says where the objects are kept, and when the mark could not be written, that a later sweep may remove them.
+    fn kept_for(&self, detail: &str) -> String {
+        self.kept.set(true);
+        let unmarked = match std::fs::write(self.folder.join(KEPT_MARK), "") {
+            Ok(()) => String::new(),
+            Err(error) => format!("; it could not be marked kept, so the next sync-back may remove it: {error}"),
+        };
+        escaped(&format!("{UNMOVED}: {detail}; they are kept in {}{unmarked}", self.folder.display()))
+    }
+
+    /// Removes the quarantine whole, unless a move that failed kept it; a file another process holds open is tried
+    /// again for up to `wait`, `held` called before each wait. The line saying it could not be removed even so.
+    fn removed(&self, wait: Duration, mut held: impl FnMut()) -> Option<String> {
+        if self.kept.get() {
+            return None;
+        }
+        tree_removed(&self.folder, Instant::now() + wait, &mut held)
+            .err()
+            .map(|error| unremoved_line(&self.folder, &error))
+    }
+}
+
+/// The moves that bring the quarantine `folder`'s objects into the store `objects`, in order, each a file and where it
+/// goes: the packs' own files, every `.idx` after all the others, so that git sees no pack before its data is in;
+/// then the loose objects of each two-hex-digit folder. A `.keep`, or any other file, is left to the quarantine's
+/// removal, and a `pack` folder the quarantine lacks holds nothing; a quarantine `folder` that is gone is a `NotFound`
+/// error.
+fn move_plan(folder: &Path, objects: &Path) -> io::Result<Vec<(PathBuf, PathBuf)>> {
+    let mut loose = listed(folder)?;
+    let mut packs = names_in(&folder.join("pack"))?;
+    packs.retain(|name| name.starts_with(PACK_FILE) && !is_kind(name, "keep"));
+    packs.sort();
+    packs.sort_by_key(|name| is_kind(name, "idx"));
+    let mut plan: Vec<(PathBuf, PathBuf)> = packs
+        .iter()
+        .map(|name| (folder.join("pack").join(name), objects.join("pack").join(name)))
+        .collect();
+    loose.retain(|name| name.len() == 2 && is_hex(name));
+    loose.sort();
+    for part in loose {
+        let mut files = names_in(&folder.join(&part))?;
+        files.retain(|name| is_hex(name));
+        files.sort();
+        plan.extend(files.iter().map(|name| (folder.join(&part).join(name), objects.join(&part).join(name))));
+    }
+    Ok(plan)
+}
+
+/// Whether the file `name`'s extension is `kind`, its letter case aside.
+fn is_kind(name: &str, kind: &str) -> bool {
+    Path::new(name).extension().is_some_and(|extension| extension.eq_ignore_ascii_case(kind))
+}
+
+/// Whether `name` is hex digits alone, as the folders and the files of loose objects are named.
+fn is_hex(name: &str) -> bool {
+    !name.is_empty() && name.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// The names in `folder` that are text, as git names every file it writes; a folder that cannot be listed, or is not
+/// there, is an error.
+fn listed(folder: &Path) -> io::Result<Vec<String>> {
+    let mut names = Vec::new();
+    for entry in std::fs::read_dir(folder)? {
+        names.extend(entry?.file_name().into_string().ok());
     }
     Ok(names)
 }
 
-/// Removes the `tmp_pack_*` files in the pack folder `folder` that were not among `before`: the part of a pack a fetch
-/// that did not end cleanly left. A file another process still holds open is tried again for up to `wait`, `held`
-/// called each time before the removal waits for one; the lines saying each file that could not be removed even so. A
-/// folder that cannot be listed leaves everything, unsaid.
-fn remove_new_tmp_packs(folder: &Path, before: &[OsString], wait: Duration, mut held: impl FnMut()) -> Vec<String> {
-    let Ok(now) = tmp_packs(folder) else {
-        return Vec::new();
-    };
-    let deadline = Instant::now() + wait;
-    now.iter()
-        .filter(|name| !before.contains(name))
-        .filter_map(|name| {
-            let path = folder.join(name);
-            removed(&path, deadline, &mut held)
-                .err()
-                .map(|error| format!("gate: remote could not remove {}: {error}", escaped(&path.display().to_string())))
-        })
-        .collect()
+/// The names [`listed`] reads in `folder`; none when there is no such folder.
+fn names_in(folder: &Path) -> io::Result<Vec<String>> {
+    match listed(folder) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+        names => names,
+    }
 }
 
-/// Removes the file at `path`, trying again every [`REMOVE_STEP`] until `deadline` while another process holds it
-/// open, `held` called before each wait; a file already gone counts as removed.
-fn removed(path: &Path, deadline: Instant, held: &mut impl FnMut()) -> io::Result<()> {
+/// Moves the file `source` to `target`, its folder made when missing, never replacing a file `target` names, which
+/// has the same content under the same name: whether it moved, `false` when `target` was there already. Tried again
+/// every [`RETRY_STEP`] until `deadline` while another process holds it open, `held` called before each wait.
+fn moved(source: &Path, target: &Path, deadline: Instant, held: &mut impl FnMut()) -> io::Result<bool> {
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    match retried(deadline, held, || gate_win32::move_no_replace(source, target)) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+/// Returns each file a move that failed put into the store, `done` as its source in the quarantine and its target in
+/// the store, to the quarantine, the last moved first; a file another process holds open is tried again for up to
+/// `wait`, `held` called before each wait. What the kept line adds: nothing when every file went back, else how many
+/// could not and where the first of them is.
+fn returned(done: &[(&PathBuf, &PathBuf)], wait: Duration, held: &mut impl FnMut()) -> String {
+    let deadline = Instant::now() + wait;
+    let stuck: Vec<&PathBuf> = done
+        .iter()
+        .rev()
+        .filter(|(source, target)| retried(deadline, &mut *held, || gate_win32::move_no_replace(target, source)).is_err())
+        .map(|(_, target)| *target)
+        .collect();
+    match stuck.first() {
+        None => String::new(),
+        Some(first) => format!("; {} moved files could not be returned: {}", stuck.len(), first.display()),
+    }
+}
+
+/// Removes the folder `path` whole, tried again every [`RETRY_STEP`] until `deadline` while another process holds a
+/// file of it open, `held` called before each wait; a folder already gone counts as removed.
+fn tree_removed(path: &Path, deadline: Instant, held: &mut impl FnMut()) -> io::Result<()> {
+    retried(deadline, held, || match std::fs::remove_dir_all(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        done => done,
+    })
+}
+
+/// What `act` ends with, tried again every [`RETRY_STEP`] until `deadline` while it fails as another process holds its
+/// file open, `held` called before each wait.
+fn retried(deadline: Instant, held: &mut impl FnMut(), mut act: impl FnMut() -> io::Result<()>) -> io::Result<()> {
     loop {
-        match std::fs::remove_file(path) {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        match act() {
             Err(error) if error.raw_os_error() == Some(SHARING_VIOLATION) && Instant::now() < deadline => {
                 held();
-                thread::sleep(REMOVE_STEP);
+                thread::sleep(RETRY_STEP);
             }
             done => return done,
         }
     }
+}
+
+/// The line said for the folder `path`, which could not be removed for `error`.
+fn unremoved_line(path: &Path, error: &io::Error) -> String {
+    format!("gate: remote could not remove {}: {error}", escaped(&path.display().to_string()))
+}
+
+/// The line said for the store `objects`, which could not be listed for `error` to sweep the quarantines left in it.
+fn unlisted_line(objects: &Path, error: &io::Error) -> String {
+    escaped(&format!(
+        "gate: remote could not list {} for leftover sync-backs: {error}",
+        objects.display()
+    ))
+}
+
+/// The line said for a back commit whose fetched objects could not be moved into the repository, for `reason`.
+fn unmoved_line(reason: &str) -> String {
+    format!("gate: remote changes not applied: {reason}")
+}
+
+/// How long a quarantine marked kept stays, from its mark's last write, before a sweep removes it.
+const KEPT_FOR: Duration = Duration::from_hours(7 * 24);
+
+/// The most quarantines marked kept, of gates that ended, a sweep leaves in an object store.
+const KEPT_MOST: usize = 3;
+
+/// Removes the quarantines in the store `objects` that gates which ended left, tried once each: one whose gate is gone
+/// by `liveness` at once, unless it is marked kept, and a kept one once it is [`KEPT_FOR`] old at `now`, or once
+/// [`KEPT_MOST`] kept ones are newer. A live gate's own, one whose gate's liveness cannot be read, and a folder whose
+/// name does not read as a quarantine's are left, and not counted. Nothing is said of a removal: the lines saying each
+/// quarantine that could not be removed, or the store that could not be listed.
+fn swept(objects: &Path, now: SystemTime, liveness: impl Fn(u32, u64) -> Liveness) -> Vec<String> {
+    let names = match names_in(objects) {
+        Ok(names) => names,
+        Err(error) => return vec![unlisted_line(objects, &error)],
+    };
+    let mut ended = Vec::new();
+    let mut kept = Vec::new();
+    for folder in names.iter().filter_map(|name| ended_quarantine(objects, name, &liveness)) {
+        match kept_since(&folder, now) {
+            Some(since) if now.duration_since(since).is_ok_and(|age| age < KEPT_FOR) => kept.push((since, folder)),
+            _ => ended.push(folder),
+        }
+    }
+    // The oldest go first, so the newest kept ones stay.
+    kept.sort();
+    let extra = kept.len().saturating_sub(KEPT_MOST);
+    ended.extend(kept.into_iter().take(extra).map(|(_, folder)| folder));
+    ended
+        .iter()
+        .filter_map(|folder| {
+            tree_removed(folder, Instant::now(), &mut || {})
+                .err()
+                .map(|error| unremoved_line(folder, &error))
+        })
+        .collect()
+}
+
+/// The quarantine `name` in the store `objects` when it is a folder whose gate is gone by `liveness`; `None` for a live
+/// gate's, one whose gate's liveness cannot be read, and a name that does not read as a quarantine's.
+fn ended_quarantine(objects: &Path, name: &str, liveness: &impl Fn(u32, u64) -> Liveness) -> Option<PathBuf> {
+    let (pid, start) = incoming_owner(name)?;
+    let folder = objects.join(name);
+    (folder.is_dir() && matches!(liveness(pid, start), Liveness::Gone)).then_some(folder)
+}
+
+/// When the quarantine `folder` was marked kept, as a sweep ages it: its mark's last write; when that cannot be read or
+/// lies past `now`, the folder's creation; when that cannot be read or lies past `now` either, `now`, so it counts as
+/// newly kept and [`KEPT_MOST`] still bounds it. `None` when it is not marked kept.
+fn kept_since(folder: &Path, now: SystemTime) -> Option<SystemTime> {
+    let mark = match std::fs::metadata(folder.join(KEPT_MARK)) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return None,
+        mark => mark,
+    };
+    let past = |time: io::Result<SystemTime>| time.ok().filter(|time| *time <= now);
+    let since = past(mark.and_then(|mark| mark.modified())).or_else(|| past(std::fs::metadata(folder).and_then(|folder| folder.created())));
+    Some(since.unwrap_or(now))
 }
 
 /// The line said for a fetch stopped once its job wrote more than `cap` bytes, whose changes stay at `reference`.
@@ -215,31 +510,34 @@ fn stopped_line(cap: u64, reference: &str) -> String {
 /// One git call of the sync-back that reaches the builder: its verb, and how it is watched. `ls-remote` gets the git
 /// limit; `fetch`, which may take long, ends once nothing came from it for the run's stall window, or at the run's
 /// ceiling.
-struct Network {
+struct Network<'a> {
     verb: &'static str,
     watch: Watch,
+    /// The variables the call is given beside the ssh it runs: the quarantine's, for the fetch.
+    set: &'a [(&'a str, &'a OsStr)],
 }
 
 /// git with `args`, the call `network` that reaches the builder: retried once when it failed before the banner, its
 /// lines kept out of the log, and killed as its watch says or at a line longer than the cap. A failure is the run's,
 /// or its interrupt when the console interrupt was raised during the call.
-fn to_the_builder(attempt: &mut Attempt<'_, '_>, git: &Git, remote: &Remote<'_>, network: &Network, args: &[String]) -> Result<Called, End> {
+fn to_the_builder(attempt: &mut Attempt<'_, '_>, git: &Git, remote: &Remote<'_>, network: &Network<'_>, args: &[String]) -> Result<Called, End> {
     let called = reached(attempt, git, remote, network, args)?;
     checked(attempt, network, args, called)
 }
 
 /// git with `args`, the call `network` that reaches the builder, made as [`to_the_builder`] makes it: the call that
-/// counts, however it ended.
-fn reached(attempt: &mut Attempt<'_, '_>, git: &Git, remote: &Remote<'_>, network: &Network, args: &[String]) -> Result<Called, End> {
-    let (called, _) = attempt.with_retry(GIT_SSH_FAILED, |attempt| {
-        attempt.git(git, args, remote.ssh, Echo::Unlogged, network.watch)
-    })?;
+/// counts, however it ended. A retried call is given the same variables, so a retried fetch writes into the same
+/// quarantine.
+fn reached(attempt: &mut Attempt<'_, '_>, git: &Git, remote: &Remote<'_>, network: &Network<'_>, args: &[String]) -> Result<Called, End> {
+    let mut set = network.set.to_vec();
+    set.extend(remote.ssh.map(|ssh| ("GIT_SSH_COMMAND", OsStr::new(ssh))));
+    let (called, _) = attempt.with_retry(GIT_SSH_FAILED, |attempt| attempt.git(git, args, &set, Echo::Unlogged, network.watch))?;
     Ok(called)
 }
 
 /// The call `network` with `args` that [`reached`] made, as [`to_the_builder`] ends it: a cut or a failure is the run's,
 /// or its interrupt when the console interrupt was raised during the call.
-fn checked(attempt: &mut Attempt<'_, '_>, network: &Network, args: &[String], called: Called) -> Result<Called, End> {
+fn checked(attempt: &mut Attempt<'_, '_>, network: &Network<'_>, args: &[String], called: Called) -> Result<Called, End> {
     if let Some(cut) = called.cut {
         attempt.noted(&called);
         return Err(End::Failed(escaped(&cut.reason(&format!("git {}", network.verb)))));
@@ -251,49 +549,68 @@ fn checked(attempt: &mut Attempt<'_, '_>, network: &Network, args: &[String], ca
     Ok(called)
 }
 
-/// Whether `back` was made from `snapshot`, as its `rev-list --parents` line says.
-fn made_from(attempt: &Attempt<'_, '_>, git: &Git, back: &str, snapshot: &str) -> Result<bool, End> {
-    let parents = line(attempt, git, &["rev-list", "--parents", "-n", "1", back])?;
+/// Whether `back` was made from `snapshot`, as its `rev-list --parents` line says, read through its quarantine.
+fn made_from(attempt: &Attempt<'_, '_>, git: &Git, back: &Back<'_>, snapshot: &str) -> Result<bool, End> {
+    let parents = line(attempt, git, &["rev-list", "--parents", "-n", "1", back.commit], &back.quarantine.env())?;
     Ok(from_snapshot(&parents, snapshot))
 }
 
 /// Applies the back commit `back`, or keeps it when it touches what a sync-back never writes, its files would write
 /// more than the apply cap into the worktree, or the worktree no longer matches the snapshot. A step that fails or is
 /// interrupted before the patch applied keeps it as well, so its changes are not lost; a patch that applied but cannot
-/// be removed then fails the run with nothing kept.
-fn receive(attempt: &mut Attempt<'_, '_>, git: &Git, snapshot: &Snapshot, back: &str, status: i64) -> Result<End, End> {
+/// be removed then fails the run with nothing kept. Its fetched objects are moved into the store before it is kept or
+/// applied; when they cannot be, nothing is kept or applied, the line says where they are kept, and a passing run is 1.
+fn receive(attempt: &mut Attempt<'_, '_>, git: &Git, snapshot: &Snapshot, back: &Back<'_>, status: i64) -> Result<End, End> {
     let commit = snapshot.commit.as_str();
     let refused = refusal(attempt, git, snapshot, back).map_err(|failed| kept_after(attempt, git, commit, back, failed))?;
     if let Some(said) = refused {
-        keep(attempt, git, back).map_err(End::Failed)?;
-        attempt.say(said);
-        return Ok(End::Status(if status == 0 { 1 } else { status }));
+        return refused_end(attempt, git, back, said, status);
     }
-    let (names, patch) = apply(attempt, git, snapshot, back).map_err(|failed| kept_after(attempt, git, commit, back, failed))?;
+    let (names, patch) = written_patch(attempt, git, snapshot, back).map_err(|failed| kept_after(attempt, git, commit, back, failed))?;
+    if let Err(unmoved) = back.quarantine.moved_in(back.quarantine.wait, || {}) {
+        attempt.say(unmoved_line(&unmoved));
+        remove(&patch)?;
+        return Ok(End::Status(not_passing(status)));
+    }
+    applied(attempt, git, &patch).map_err(|failed| kept_after(attempt, git, commit, back, failed))?;
     remove(&patch)?;
     attempt.say(synced_line(&names));
     Ok(End::Status(status))
 }
 
+/// How the run of the command that ended `status` ends once its back commit `back` is refused for the line `said`: its
+/// objects moved in, the commit kept and the line said, a passing run as 1. Objects that cannot be moved in keep
+/// nothing, and the line saying where they are kept is said instead.
+fn refused_end(attempt: &mut Attempt<'_, '_>, git: &Git, back: &Back<'_>, said: String, status: i64) -> Result<End, End> {
+    if let Err(unmoved) = back.quarantine.moved_in(back.quarantine.wait, || {}) {
+        attempt.say(unmoved_line(&unmoved));
+        return Ok(End::Status(not_passing(status)));
+    }
+    keep(attempt, git, back.commit).map_err(End::Failed)?;
+    attempt.say(said);
+    Ok(End::Status(not_passing(status)))
+}
+
 /// Why `back` is kept rather than applied: the line said for a back commit that touches what a sync-back never writes,
 /// for one whose files would write more than the apply cap into the worktree, or for one the worktree changed under
 /// during the run; `None` when it may be applied.
-fn refusal(attempt: &Attempt<'_, '_>, git: &Git, snapshot: &Snapshot, back: &str) -> Result<Option<String>, End> {
-    let listing = git_call(attempt, git, &["diff-tree", "-r", "-z", "--raw", &snapshot.commit, back])?;
+fn refusal(attempt: &Attempt<'_, '_>, git: &Git, snapshot: &Snapshot, back: &Back<'_>) -> Result<Option<String>, End> {
+    let set = back.quarantine.env();
+    let listing = git_call(attempt, git, &["diff-tree", "-r", "-z", "--raw", &snapshot.commit, back.commit], &set)?;
     if let Some(path) = forbidden(&listing) {
-        return Ok(Some(touched_line(&path, &snapshot.commit, back)));
+        return Ok(Some(touched_line(&path, &snapshot.commit, back.commit)));
     }
-    let size = written_size(attempt, git, &listing)?;
-    if let Some(line) = written_line(size, attempt.apply_cap, &snapshot.commit, back) {
+    let size = written_size(attempt, git, &listing, &set)?;
+    if let Some(line) = written_line(size, attempt.apply_cap, &snapshot.commit, back.commit) {
         return Ok(Some(line));
     }
-    Ok(changed(attempt, git, snapshot)?.then(|| not_applied_line(&snapshot.commit, back)))
+    Ok(changed(attempt, git, snapshot)?.then(|| not_applied_line(&snapshot.commit, back.commit)))
 }
 
 /// The bytes the files the back commit's `diff-tree -r -z --raw` `listing` writes total, each path counted: the sizes
-/// of their blobs, asked of one `git cat-file --batch-check=%(objectsize)` fed their ids. An answer that is not a size
-/// for each of them is the run's failure.
-fn written_size(attempt: &Attempt<'_, '_>, git: &Git, listing: &str) -> Result<u64, End> {
+/// of their blobs, asked of one `git cat-file --batch-check=%(objectsize)` given the variables `set` and fed their ids.
+/// An answer that is not a size for each of them is the run's failure.
+fn written_size(attempt: &Attempt<'_, '_>, git: &Git, listing: &str, set: &[(&str, &OsStr)]) -> Result<u64, End> {
     let blobs = written_blobs(listing);
     if blobs.is_empty() {
         return Ok(0);
@@ -303,6 +620,7 @@ fn written_size(attempt: &Attempt<'_, '_>, git: &Git, listing: &str) -> Result<u
     let call = git::Call {
         interrupt: attempt.call.interrupt,
         stdin: Some(ids.as_bytes()),
+        set,
         ..git::Call::plain(Path::new(attempt.call.root), &args, attempt.limit)
     };
     let answer = git.output(&call).map_err(escaped_end)?;
@@ -381,11 +699,22 @@ fn written_line(size: u64, cap: u64, snapshot: &str, back: &str) -> Option<Strin
     })
 }
 
-/// How the run ends once `back`, which a step before its apply could not take past `failed`, is kept; what
-/// [`after_keep`] decides, and its line said.
-fn kept_after(attempt: &mut Attempt<'_, '_>, git: &Git, snapshot: &str, back: &str, failed: End) -> End {
-    let kept = keep(attempt, git, back);
-    let (end, said) = after_keep(failed, kept, &see_diff(snapshot, back));
+/// What a run whose back commit's objects could not be moved in says it could not keep: the line said before it says
+/// why.
+const SEE_ABOVE: &str = "see the line above";
+
+/// How the run ends once `back`, which a step before its apply could not take past `failed`, has its objects moved in
+/// and is kept; what [`after_keep`] decides, and its line said. Objects that cannot be moved in are not kept: the line
+/// saying where they are kept is said first, and the run's ending says the changes could not be kept, see above.
+fn kept_after(attempt: &mut Attempt<'_, '_>, git: &Git, snapshot: &str, back: &Back<'_>, failed: End) -> End {
+    let kept = match back.quarantine.moved_in(back.quarantine.wait, || {}) {
+        Ok(()) => keep(attempt, git, back.commit),
+        Err(unmoved) => {
+            attempt.say(unmoved_line(&unmoved));
+            Err(SEE_ABOVE.to_owned())
+        }
+    };
+    let (end, said) = after_keep(failed, kept, &see_diff(snapshot, back.commit));
     if let Some(line) = said {
         attempt.say(line);
     }
@@ -423,7 +752,7 @@ fn see_diff(snapshot: &str, back: &str) -> String {
 /// snapshot's own.
 fn changed(attempt: &Attempt<'_, '_>, git: &Git, snapshot: &Snapshot) -> Result<bool, End> {
     let now = snapshot::worktree(Path::new(attempt.call.root), attempt.limit, attempt.call.interrupt).map_err(escaped_end)?;
-    let then = line(attempt, git, &["rev-parse", &format!("{}^{{tree}}", snapshot.commit)])?;
+    let then = line(attempt, git, &["rev-parse", &format!("{}^{{tree}}", snapshot.commit)], &[])?;
     Ok(now != then)
 }
 
@@ -436,32 +765,49 @@ fn keep(attempt: &Attempt<'_, '_>, git: &Git, back: &str) -> Result<(), String> 
     git.output(&call).map(drop).map_err(|error| escaped(&String::from(error)))
 }
 
-/// Writes the back commit's changes as a patch into the git folder and applies it to the worktree; the names of the
-/// files it changed, and the patch, which the caller removes. A patch that did not apply is removed here, and the
-/// apply's failure is the one the run ends with.
-fn apply(attempt: &Attempt<'_, '_>, git: &Git, snapshot: &Snapshot, back: &str) -> Result<(Vec<String>, PathBuf), End> {
+/// Writes the back commit's changes as a patch into the git folder, read through its quarantine: the names of the
+/// files it changes, and the patch, which the caller applies and removes. A patch that could not be written is removed
+/// here, and the diff's failure is the one the run ends with.
+fn written_patch(attempt: &Attempt<'_, '_>, git: &Git, snapshot: &Snapshot, back: &Back<'_>) -> Result<(Vec<String>, PathBuf), End> {
+    let set = back.quarantine.env();
     let names = names(attempt, git, snapshot, back)?;
     let patch = patch_file(attempt, git)?;
+    let output = format!("--output={}", patch.display());
+    let diff = [
+        "diff-tree",
+        "-p",
+        "--binary",
+        "--full-index",
+        "-r",
+        &output,
+        &snapshot.commit,
+        back.commit,
+    ];
+    if let Err(failed) = git_call(attempt, git, &diff, &set) {
+        // The diff's failure is the run's; a patch that cannot be removed after it is the lesser problem.
+        drop(remove(&patch));
+        return Err(failed);
+    }
+    Ok((names, patch))
+}
+
+/// Applies the patch `patch` to the worktree. A patch that did not apply is removed here, and the apply's failure is
+/// the one the run ends with.
+fn applied(attempt: &Attempt<'_, '_>, git: &Git, patch: &Path) -> Result<(), End> {
     let shown = patch.display().to_string();
-    let output = format!("--output={shown}");
-    let diff = ["diff-tree", "-p", "--binary", "--full-index", "-r", &output, &snapshot.commit, back];
-    let made = git_call(attempt, git, &diff);
     // NTFS protection refuses a path that names `.git` by its 8.3 short name or an alternate stream, whatever the
     // repository's own setting.
     let apply = ["-c", "core.protectNTFS=true", "apply", "--whitespace=nowarn", "--", &shown];
-    match made.and_then(|_| locked_call(attempt, git, &apply)) {
-        Ok(_) => Ok((names, patch)),
-        Err(failed) => {
-            // The apply's failure is the run's; a patch that cannot be removed after it is the lesser problem.
-            drop(remove(&patch));
-            Err(failed)
-        }
-    }
+    locked_call(attempt, git, &apply).map(drop).inspect_err(|_| {
+        // The apply's failure is the run's; a patch that cannot be removed after it is the lesser problem.
+        drop(remove(patch));
+    })
 }
 
 /// The names of the files the back commit `back` changes, against the snapshot, as git's plumbing lists them.
-fn names(attempt: &Attempt<'_, '_>, git: &Git, snapshot: &Snapshot, back: &str) -> Result<Vec<String>, End> {
-    let listed = git_call(attempt, git, &["diff-tree", "-r", "-z", "--name-only", &snapshot.commit, back])?;
+fn names(attempt: &Attempt<'_, '_>, git: &Git, snapshot: &Snapshot, back: &Back<'_>) -> Result<Vec<String>, End> {
+    let args = ["diff-tree", "-r", "-z", "--name-only", &snapshot.commit, back.commit];
+    let listed = git_call(attempt, git, &args, &back.quarantine.env())?;
     Ok(listed.split('\0').filter(|name| !name.is_empty()).map(str::to_owned).collect())
 }
 
@@ -469,7 +815,7 @@ fn names(attempt: &Attempt<'_, '_>, git: &Git, snapshot: &Snapshot, back: &str) 
 /// can name it beforehand; one already there fails the run.
 fn patch_file(attempt: &Attempt<'_, '_>, git: &Git) -> Result<PathBuf, End> {
     let name = format!("{PATCH}{}-{}{PATCH_SUFFIX}", std::process::id(), payload::job_nonce());
-    let printed = line(attempt, git, &["rev-parse", "--git-path", &name])?;
+    let printed = line(attempt, git, &["rev-parse", "--git-path", &name], &[])?;
     let path = Path::new(attempt.call.root).join(printed);
     OpenOptions::new()
         .write(true)
@@ -487,10 +833,12 @@ fn remove(patch: &Path) -> Result<(), End> {
     }
 }
 
-/// Runs git with `args` in the worktree and returns what it wrote on standard output; a failure is the run's.
-fn git_call(attempt: &Attempt<'_, '_>, git: &Git, args: &[&str]) -> Result<String, End> {
+/// Runs git with `args` in the worktree, given the variables `set`, and returns what it wrote on standard output; a
+/// failure is the run's.
+fn git_call(attempt: &Attempt<'_, '_>, git: &Git, args: &[&str], set: &[(&str, &OsStr)]) -> Result<String, End> {
     let call = git::Call {
         interrupt: attempt.call.interrupt,
+        set,
         ..git::Call::plain(Path::new(attempt.call.root), args, attempt.limit)
     };
     git.output(&call).map_err(escaped_end)
@@ -511,9 +859,10 @@ fn escaped_end(error: GitError) -> End {
     }
 }
 
-/// The first line of what git with `args` wrote on standard output: what every call that asks git for one value reads.
-fn line(attempt: &Attempt<'_, '_>, git: &Git, args: &[&str]) -> Result<String, End> {
-    git_call(attempt, git, args)?
+/// The first line of what git with `args`, given the variables `set`, wrote on standard output: what every call that
+/// asks git for one value reads.
+fn line(attempt: &Attempt<'_, '_>, git: &Git, args: &[&str], set: &[(&str, &OsStr)]) -> Result<String, End> {
+    git_call(attempt, git, args, set)?
         .lines()
         .next()
         .map(|line| line.trim_end().to_owned())
@@ -623,24 +972,28 @@ impl Remote<'_> {
 #[cfg(test)]
 #[expect(clippy::expect_used, reason = "a test whose interrupt, transport or git cannot be had must fail loudly")]
 mod tests {
-    use std::fs::{File, OpenOptions};
-    use std::os::windows::fs::OpenOptionsExt;
+    use std::ffi::OsStr;
+    use std::fs::{File, FileTimes, OpenOptions};
+    use std::os::windows::fs::{FileTimesExt, OpenOptionsExt};
     use std::path::{Path, PathBuf};
-    use std::time::Duration;
+    use std::time::{Duration, SystemTime};
 
     use gate_state::StateRoot;
     use gate_win32::Interrupt;
-    use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_READ, FILE_WRITE_ATTRIBUTES};
 
     use super::{
-        FETCH_WORDS, Remote, advertised, after_keep, entries, fetch, forbidden, from_snapshot, has_back, ignored_line, not_applied_line,
-        remove_new_tmp_packs, see_diff, synced_line, tmp_packs, total, touched_line, written_blobs, written_line,
+        Back, FETCH_WORDS, Quarantine, Remote, advertised, after_keep, alternates, entries, fetch, forbidden, from_snapshot, has_back, ignored_line,
+        incoming_name, incoming_owner, move_plan, not_applied_line, receive, refused_end, see_diff, swept, synced_line, total, touched_line,
+        unmoved_line, written_blobs, written_line,
     };
     use crate::boxside::payload::escaped;
     use crate::remote::RemoteCall;
     use crate::remote::client::{Attempt, End};
     use crate::remote::git::{self, Git};
+    use crate::remote::snapshot::{Snapshot, repository};
     use crate::remote::transport::Local;
+    use crate::slots;
 
     const BACK: &str = "8e8777a0e71c530018dc15bdebd7288f4f432aa4";
     const SNAPSHOT: &str = "b8a4812193314ab4b2404479b93f2338078c69eb";
@@ -732,6 +1085,8 @@ mod tests {
         let git = Git::find(&folder).expect("git is found");
         git.output(&git::Call::plain(&folder, &["init", "--quiet"], git::GIT_LIMIT))
             .expect("the test's folder is made a repository");
+        let objects = folder.join(".git").join("objects");
+        let quarantine = Quarantine::made(&objects, &incoming_name(std::process::id(), 1, NONCE)).expect("the quarantine is made");
         let remote = Remote {
             url: r"C:\gate-sync-back-tests\no-such.git",
             pack: None,
@@ -741,7 +1096,7 @@ mod tests {
 
         let listed = has_back(&mut attempt, &git, &remote);
         std::fs::remove_file(&log).expect("the ls-remote's call opened the log");
-        let fetched = fetch(&mut attempt, &git, &remote, 0);
+        let fetched = fetch(&mut attempt, &git, &remote, &quarantine, 0);
 
         assert!(matches!(listed, Err(End::Interrupted)), "the ls-remote: {listed:?}");
         assert!(matches!(fetched, Err(End::Interrupted)), "the fetch: {fetched:?}");
@@ -749,92 +1104,392 @@ mod tests {
         std::fs::remove_dir_all(&folder).expect("the test's folder can be removed");
     }
 
-    /// A pack folder holding `tmp_pack_*` files from before a fetch, and after it new ones, one read-only as index-pack
-    /// makes them, a finished pack and a new `tmp_idx_*`: only the new `tmp_pack_*` files are removed.
-    #[test]
-    fn only_the_tmp_packs_new_since_the_listing_are_removed() {
-        let folder = std::env::temp_dir().join(format!("gate-sync-back-tmp-packs-{}", std::process::id()));
-        if folder.exists() {
-            std::fs::remove_dir_all(&folder).expect("an earlier run's folder is removed");
-        }
-        std::fs::create_dir_all(&folder).expect("the pack folder can be made");
-        let make = |name: &str| std::fs::write(folder.join(name), b"pack").expect("a file can be made");
-        make("tmp_pack_Earlr1");
-        make("tmp_pack_Earlr2");
-        let before = tmp_packs(&folder).expect("the folder can be listed");
-        for name in ["tmp_pack_Newnw1", "tmp_pack_Newnw2", "pack-0123.pack", "tmp_idx_Newnw1"] {
-            make(name);
-        }
-        let read_only = folder.join("tmp_pack_Newnw2");
-        let mut permissions = std::fs::metadata(&read_only).expect("the file is there").permissions();
-        permissions.set_readonly(true);
-        std::fs::set_permissions(&read_only, permissions).expect("the file is made read-only");
+    /// The longest a move or removal test lets a held file be waited for: a guard against a hang, never a timing bound.
+    const HANG_GUARD: Duration = Duration::from_secs(600);
+    /// The nonce of every test's quarantine.
+    const NONCE: &str = "0123456789ab";
 
-        let unremoved = remove_new_tmp_packs(&folder, &before, HANG_GUARD, || {});
-
-        assert_eq!(unremoved, Vec::<String>::new(), "every new tmp_pack_* was removed");
-        let mut left: Vec<String> = std::fs::read_dir(&folder)
-            .expect("the folder can be listed")
-            .map(|entry| entry.expect("an entry can be read").file_name().to_string_lossy().into_owned())
-            .collect();
-        left.sort();
-        assert_eq!(left, ["pack-0123.pack", "tmp_idx_Newnw1", "tmp_pack_Earlr1", "tmp_pack_Earlr2"]);
-        std::fs::remove_dir_all(&folder).expect("the test's folder can be removed");
+    /// A new, empty object store of the test `name`'s own, holding only its `pack` folder.
+    fn store(name: &str) -> PathBuf {
+        let objects = std::env::temp_dir().join(format!("gate-quarantine-{name}-{}", std::process::id()));
+        if objects.exists() {
+            std::fs::remove_dir_all(&objects).expect("an earlier run's store is removed");
+        }
+        std::fs::create_dir_all(objects.join("pack")).expect("the store can be made");
+        objects
     }
 
-    /// The longest a removal test lets a held file be waited for: a guard against a hang, never a timing bound.
-    const HANG_GUARD: Duration = Duration::from_secs(600);
+    /// The store of the test `name`'s own and this process's quarantine in it, started at 1.
+    fn quarantined(name: &str) -> (PathBuf, Quarantine) {
+        let objects = store(name);
+        let quarantine = Quarantine::made(&objects, &incoming_name(std::process::id(), 1, NONCE)).expect("the quarantine is made");
+        (objects, quarantine)
+    }
 
-    /// An empty pack folder of the test `name`'s own, holding the new file `tmp_pack_Heldh1` opened without delete
-    /// sharing, as a live index-pack holds its pack: the folder, the file's path, and the handle.
-    fn held_tmp_pack(name: &str) -> (PathBuf, PathBuf, File) {
-        let folder = std::env::temp_dir().join(format!("gate-sync-back-{name}-{}", std::process::id()));
-        if folder.exists() {
-            std::fs::remove_dir_all(&folder).expect("an earlier run's folder is removed");
-        }
-        std::fs::create_dir_all(&folder).expect("the pack folder can be made");
-        let path = folder.join("tmp_pack_Heldh1");
-        std::fs::write(&path, b"pack").expect("the file can be made");
-        let handle = OpenOptions::new()
+    /// Writes `text` to the file `path`, making its folder.
+    fn put(path: &Path, text: &str) {
+        std::fs::create_dir_all(path.parent().expect("a file has a folder")).expect("the file's folder can be made");
+        std::fs::write(path, text).expect("the file can be written");
+    }
+
+    /// The file `path` opened without delete sharing, as a scanner or a live git holds it, which refuses its move.
+    fn held_open(path: &Path) -> File {
+        OpenOptions::new()
             .read(true)
             .share_mode(FILE_SHARE_READ)
-            .open(&path)
-            .expect("the file can be held open");
-        (folder, path, handle)
+            .open(path)
+            .expect("the file can be held open")
     }
 
-    /// A new `tmp_pack_*` held open when the removal first tries it is let go at its first wait: it is removed then.
     #[test]
-    fn a_tmp_pack_let_go_while_the_removal_waits_is_removed() {
-        let (folder, path, handle) = held_tmp_pack("let-go");
-        let mut held = Some(handle);
+    fn the_quarantine_is_named_for_the_gate_s_pid_start_and_nonce() {
+        assert_eq!(
+            incoming_name(4242, 1_760_000_000_123, NONCE),
+            "incoming-gate-4242-1760000000123-0123456789ab"
+        );
+        assert_eq!(
+            incoming_owner("incoming-gate-4242-1760000000123-0123456789ab"),
+            Some((4242, 1_760_000_000_123))
+        );
+        for name in [
+            "incoming-gate-x-1-ab",
+            "incoming-gate-4242-1760000000123",
+            "incoming-gate-4242-1760000000123-",
+            "incoming-gate-4242--ab",
+            "incoming-gate-",
+            "incoming-1-2-ab",
+        ] {
+            assert_eq!(incoming_owner(name), None, "{name}");
+        }
+        let (objects, quarantine) = quarantined("name");
+        let folder = objects.join(format!("incoming-gate-{}-1-{NONCE}", std::process::id()));
+        assert_eq!(quarantine.folder, folder);
+        assert!(folder.is_dir(), "the folder is made");
+        assert_eq!(
+            quarantine.env(),
+            [
+                ("GIT_OBJECT_DIRECTORY", folder.as_os_str()),
+                ("GIT_ALTERNATE_OBJECT_DIRECTORIES", objects.as_os_str())
+            ]
+        );
+        std::fs::remove_dir_all(&objects).expect("the test's store can be removed");
+    }
+
+    /// The packs go in first, every `.idx` after every other file of the packs and a `.keep` or a `tmp_*` never, then
+    /// the loose objects, into a two-digit folder made when missing; a file the store already holds is not replaced,
+    /// and its copy stays in the quarantine until the quarantine is removed.
+    #[test]
+    fn the_move_puts_the_indexes_last_never_a_keep_and_replaces_nothing() {
+        let (objects, quarantine) = quarantined("order");
+        let folder = quarantine.folder.clone();
+        let pack = folder.join("pack");
+        for name in [
+            "pack-aa.idx",
+            "pack-aa.pack",
+            "pack-aa.rev",
+            "pack-aa.keep",
+            "pack-bb.idx",
+            "pack-bb.pack",
+            "tmp_pack_x1",
+        ] {
+            put(&pack.join(name), name);
+        }
+        put(&folder.join("ab").join("cdef"), "new loose");
+        put(&folder.join("12").join("3456"), "loose copy");
+        put(&objects.join("12").join("3456"), "loose held");
+        put(&objects.join("pack").join("pack-bb.pack"), "pack held");
+
+        let plan: Vec<PathBuf> = move_plan(&folder, &objects)
+            .expect("the quarantine can be listed")
+            .into_iter()
+            .map(|(source, _)| source)
+            .collect();
+        let moved = quarantine.moved_in(HANG_GUARD, || {});
+
+        let sources = ["pack-aa.pack", "pack-aa.rev", "pack-bb.pack", "pack-aa.idx", "pack-bb.idx"].map(|name| pack.join(name));
+        let loose = [folder.join("12").join("3456"), folder.join("ab").join("cdef")];
+        assert_eq!(plan, [&sources[..], &loose[..]].concat());
+        assert_eq!(moved, Ok(()));
+        let read = |path: PathBuf| std::fs::read_to_string(path).expect("the file is there");
+        for name in ["pack-aa.pack", "pack-aa.rev", "pack-aa.idx", "pack-bb.idx"] {
+            assert_eq!(read(objects.join("pack").join(name)), name, "{name} went in");
+        }
+        assert!(!objects.join("pack").join("pack-aa.keep").exists(), "a .keep never goes in");
+        assert!(pack.join("pack-aa.keep").exists(), "the .keep stays for the quarantine's removal");
+        assert_eq!(
+            read(objects.join("pack").join("pack-bb.pack")),
+            "pack held",
+            "a pack the store holds is not replaced"
+        );
+        assert_eq!(
+            read(objects.join("ab").join("cdef")),
+            "new loose",
+            "a loose object went in, its folder made"
+        );
+        assert_eq!(
+            read(objects.join("12").join("3456")),
+            "loose held",
+            "a loose object the store holds is not replaced"
+        );
+        assert!(folder.join("12").join("3456").exists(), "its copy is left to the quarantine's removal");
+        assert_eq!(quarantine.removed(HANG_GUARD, || {}), None);
+        assert!(!folder.exists(), "the quarantine is removed whole");
+        std::fs::remove_dir_all(&objects).expect("the test's store can be removed");
+    }
+
+    /// A file held open when the move first tries it is let go at its first wait: it is moved then.
+    #[test]
+    fn a_file_let_go_while_the_move_waits_is_moved() {
+        let (objects, quarantine) = quarantined("let-go");
+        let source = quarantine.folder.join("pack").join("pack-cc.pack");
+        put(&source, "pack");
+        let mut held = Some(held_open(&source));
         let mut waits = 0;
 
-        let unremoved = remove_new_tmp_packs(&folder, &[], HANG_GUARD, || {
+        let moved = quarantine.moved_in(HANG_GUARD, || {
             waits += 1;
             held.take();
         });
 
-        assert_eq!(unremoved, Vec::<String>::new(), "the file let go was removed");
-        assert!(!path.exists(), "the file is gone");
-        assert!(waits >= 1, "the removal waited for the held file");
-        std::fs::remove_dir_all(&folder).expect("the test's folder can be removed");
+        assert_eq!(moved, Ok(()));
+        assert!(objects.join("pack").join("pack-cc.pack").exists(), "the pack went in");
+        assert!(waits >= 1, "the move waited for the held file");
+        assert_eq!(quarantine.removed(HANG_GUARD, || {}), None);
+        std::fs::remove_dir_all(&objects).expect("the test's store can be removed");
     }
 
-    /// A new `tmp_pack_*` held open past the removal's wait stays, and the line saying so is given.
+    /// A pack held open past the move's wait stops the move before its index goes in: the quarantine is marked kept and
+    /// is not removed, and the reason names the file and the folder it is kept in.
     #[test]
-    fn a_tmp_pack_held_past_the_wait_stays_and_is_said() {
-        let (folder, path, handle) = held_tmp_pack("held");
+    fn a_file_held_past_the_wait_keeps_the_quarantine_and_says_where() {
+        let (objects, quarantine) = quarantined("held");
+        let folder = quarantine.folder.clone();
+        let source = folder.join("pack").join("pack-dd.pack");
+        put(&source, "pack");
+        put(&folder.join("pack").join("pack-dd.idx"), "idx");
+        let handle = held_open(&source);
 
-        let unremoved = remove_new_tmp_packs(&folder, &[], Duration::from_millis(50), || {});
+        let moved = quarantine.moved_in(Duration::from_millis(50), || {});
 
-        assert!(path.exists(), "the held file stays");
-        let start = format!("gate: remote could not remove {}: ", escaped(&path.display().to_string()));
-        assert_eq!(unremoved.len(), 1, "{unremoved:?}");
-        assert!(unremoved[0].starts_with(&start), "{unremoved:?}");
-        assert!(unremoved[0].ends_with("(os error 32)"), "{unremoved:?}");
+        let why = moved.expect_err("a file held past the wait cannot move");
+        let start = format!(
+            "the fetched objects could not be moved into the repository: {}: ",
+            escaped(&Path::new("pack").join("pack-dd.pack").display().to_string())
+        );
+        assert!(why.starts_with(&start), "{why}");
+        let end = format!("(os error 32); they are kept in {}", escaped(&folder.display().to_string()));
+        assert!(why.ends_with(&end), "{why}");
+        assert_eq!(unmoved_line(&why), format!("gate: remote changes not applied: {why}"));
+        assert!(
+            !objects.join("pack").join("pack-dd.idx").exists(),
+            "the index never goes in before its pack"
+        );
+        assert!(folder.join("gate-kept").exists(), "the quarantine is marked kept");
         drop(handle);
-        std::fs::remove_dir_all(&folder).expect("the test's folder can be removed");
+        assert_eq!(
+            quarantine.removed(HANG_GUARD, || {}),
+            None,
+            "a kept quarantine is not removed, and nothing is said"
+        );
+        assert!(source.exists(), "the kept quarantine holds the pack");
+        std::fs::remove_dir_all(&objects).expect("the test's store can be removed");
+    }
+
+    /// A pid no process has: Windows pids are multiples of 4.
+    const DEAD_PID: u32 = u32::MAX - 1;
+    /// A day.
+    const DAY: Duration = Duration::from_hours(24);
+
+    /// A folder `name` in the store `objects` holding a pack: the folder.
+    fn leftover(objects: &Path, name: &str) -> PathBuf {
+        let folder = objects.join(name);
+        put(&folder.join("pack").join("pack-ee.pack"), "pack");
+        folder
+    }
+
+    /// Marks the quarantine `folder` kept, its mark last written at `at`.
+    fn marked(folder: &Path, at: SystemTime) {
+        let mark = folder.join("gate-kept");
+        std::fs::write(&mark, "").expect("the mark can be written");
+        let file = OpenOptions::new().write(true).open(&mark).expect("the mark can be opened");
+        file.set_modified(at).expect("the mark's last write can be set");
+    }
+
+    /// The sweep removes the quarantine of a gate whose pid no process has, and of one whose pid a process started at
+    /// another time has, and a kept one whose mark is over 7 days old; it leaves this live gate's own, a kept one whose
+    /// mark is younger, and every folder whose name does not read as a quarantine's, and says nothing.
+    #[test]
+    fn the_sweep_removes_the_quarantines_of_gates_that_ended_and_leaves_the_rest() {
+        let objects = store("sweep");
+        let pid = std::process::id();
+        let start = slots::epoch_ms(gate_win32::process_start().expect("this process's start can be read"));
+        let now = SystemTime::now();
+        let dead = leftover(&objects, &incoming_name(DEAD_PID, 1, NONCE));
+        let reused = leftover(&objects, &incoming_name(pid, start + 1, NONCE));
+        let live = leftover(&objects, &incoming_name(pid, start, NONCE));
+        let young = leftover(&objects, &incoming_name(DEAD_PID, 2, NONCE));
+        marked(&young, now - 6 * DAY);
+        let old = leftover(&objects, &incoming_name(DEAD_PID, 3, NONCE));
+        marked(&old, now - 8 * DAY);
+        let unreadable = leftover(&objects, &format!("incoming-gate-x-1-{NONCE}"));
+        let other = leftover(&objects, "info");
+
+        let said = swept(&objects, now, slots::gate_liveness);
+
+        assert_eq!(said, Vec::<String>::new(), "a removal says nothing");
+        assert!(!dead.exists(), "a dead pid's quarantine is removed");
+        assert!(!reused.exists(), "a quarantine whose pid another process now has is removed");
+        assert!(live.exists(), "a live gate's quarantine is left");
+        assert!(young.exists(), "a kept quarantine under 7 days old is left");
+        assert!(!old.exists(), "a kept quarantine over 7 days old is removed");
+        assert!(unreadable.exists(), "a name that does not read as a quarantine's is left");
+        assert!(other.exists(), "a folder that is no quarantine is left");
+        std::fs::remove_dir_all(&objects).expect("the test's store can be removed");
+    }
+
+    /// A dead gate's quarantine holding a file another process holds open cannot be removed: one line says so.
+    #[test]
+    fn a_quarantine_the_sweep_cannot_remove_is_said_once() {
+        let objects = store("sweep-held");
+        let folder = leftover(&objects, &incoming_name(DEAD_PID, 1, NONCE));
+        put(&folder.join("pack").join("pack-ee.idx"), "idx");
+        let handle = held_open(&folder.join("pack").join("pack-ee.pack"));
+
+        let said = swept(&objects, SystemTime::now(), slots::gate_liveness);
+
+        let start = format!("gate: remote could not remove {}: ", escaped(&folder.display().to_string()));
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(said[0].starts_with(&start), "{said:?}");
+        assert!(folder.exists(), "the folder stays");
+        drop(handle);
+        std::fs::remove_dir_all(&objects).expect("the test's store can be removed");
+    }
+
+    /// A quarantine whose `pack` is a file cannot be listed: the move fails as any move that fails does, the folder
+    /// kept and marked, and the reason says the listing failed.
+    #[test]
+    fn a_quarantine_that_cannot_be_listed_is_kept_as_a_failed_move() {
+        let (objects, quarantine) = quarantined("unlisted");
+        let folder = quarantine.folder.clone();
+        put(&folder.join("pack"), "not a folder");
+
+        let moved = quarantine.moved_in(HANG_GUARD, || {});
+
+        let why = moved.expect_err("a quarantine that cannot be listed cannot be moved");
+        let start = "the fetched objects could not be moved into the repository: cannot list the quarantine: ";
+        assert!(why.starts_with(start), "{why}");
+        let end = format!("; they are kept in {}", escaped(&folder.display().to_string()));
+        assert!(why.ends_with(&end), "{why}");
+        assert!(folder.join("gate-kept").exists(), "the quarantine is marked kept");
+        assert_eq!(quarantine.removed(HANG_GUARD, || {}), None);
+        assert!(folder.exists(), "a kept quarantine is not removed");
+        std::fs::remove_dir_all(&objects).expect("the test's store can be removed");
+    }
+
+    /// A pack's index held open past the wait stops the move after its other files went in: they are returned to the
+    /// quarantine, so the store holds no file of the pack, and the quarantine is kept whole.
+    #[test]
+    fn a_move_that_fails_part_way_returns_what_it_moved() {
+        let (objects, quarantine) = quarantined("rollback");
+        let folder = quarantine.folder.clone();
+        let pack = folder.join("pack");
+        let names = ["pack-ff.pack", "pack-ff.rev", "pack-ff.idx"];
+        for name in names {
+            put(&pack.join(name), name);
+        }
+        put(&folder.join("ab").join("cdef"), "loose");
+        let handle = held_open(&pack.join("pack-ff.idx"));
+
+        let moved = quarantine.moved_in(Duration::from_millis(50), || {});
+
+        drop(handle);
+        let why = moved.expect_err("an index held past the wait cannot move");
+        assert!(why.contains("pack-ff.idx"), "{why}");
+        assert!(!why.contains("could not be returned"), "{why}");
+        let store: Vec<_> = std::fs::read_dir(objects.join("pack"))
+            .expect("the store's pack folder can be listed")
+            .collect();
+        assert!(store.is_empty(), "the store holds no file of the pack: {store:?}");
+        for name in names {
+            assert!(pack.join(name).exists(), "{name} is in the quarantine");
+        }
+        assert!(!objects.join("ab").join("cdef").exists(), "no loose object went in");
+        assert!(folder.join("gate-kept").exists(), "the quarantine is marked kept");
+        std::fs::remove_dir_all(&objects).expect("the test's store can be removed");
+    }
+
+    /// A quarantine folder that is gone by the move fails it: nothing is kept, and the reason says the folder is gone.
+    #[test]
+    fn a_quarantine_that_is_gone_fails_the_move() {
+        let (objects, quarantine) = quarantined("gone");
+        std::fs::remove_dir(&quarantine.folder).expect("the quarantine can be removed");
+
+        let moved = quarantine.moved_in(HANG_GUARD, || {});
+
+        assert_eq!(
+            moved,
+            Err("the fetched objects could not be moved into the repository: the quarantine folder is gone".to_owned())
+        );
+        assert_eq!(quarantine.removed(HANG_GUARD, || {}), None, "a folder already gone counts as removed");
+        std::fs::remove_dir_all(&objects).expect("the test's store can be removed");
+    }
+
+    /// Sets the creation time of the folder `folder` to `at`.
+    fn created(folder: &Path, at: SystemTime) {
+        let handle = OpenOptions::new()
+            .access_mode(FILE_WRITE_ATTRIBUTES)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(folder)
+            .expect("the folder can be opened");
+        handle
+            .set_times(FileTimes::new().set_created(at))
+            .expect("the folder's creation time can be set");
+    }
+
+    /// A kept quarantine whose mark was last written in the future is aged by its folder's creation instead: one made 8
+    /// days ago is removed, one made now is left.
+    #[test]
+    fn a_kept_quarantine_whose_mark_lies_in_the_future_is_aged_by_its_folder() {
+        let objects = store("sweep-future");
+        let now = SystemTime::now();
+        let old = leftover(&objects, &incoming_name(DEAD_PID, 1, NONCE));
+        marked(&old, now + DAY);
+        created(&old, now - 8 * DAY);
+        let young = leftover(&objects, &incoming_name(DEAD_PID, 2, NONCE));
+        marked(&young, now + DAY);
+
+        let said = swept(&objects, now, slots::gate_liveness);
+
+        assert_eq!(said, Vec::<String>::new());
+        assert!(!old.exists(), "a folder made 8 days ago is removed");
+        assert!(young.exists(), "a folder made now is left");
+        std::fs::remove_dir_all(&objects).expect("the test's store can be removed");
+    }
+
+    /// The sweep leaves at most 3 kept quarantines of gates that ended, the newest, whatever their age; a live gate's
+    /// kept quarantine is neither touched nor counted.
+    #[test]
+    fn the_sweep_leaves_the_three_newest_kept_quarantines() {
+        let objects = store("sweep-most");
+        let now = SystemTime::now();
+        let kept: Vec<PathBuf> = (1..=5_u64)
+            .map(|days| {
+                let folder = leftover(&objects, &incoming_name(DEAD_PID, days, NONCE));
+                marked(&folder, now - u32::try_from(days).expect("a few days") * DAY);
+                folder
+            })
+            .collect();
+        let start = slots::epoch_ms(gate_win32::process_start().expect("this process's start can be read"));
+        let live = leftover(&objects, &incoming_name(std::process::id(), start, NONCE));
+        marked(&live, now);
+
+        let said = swept(&objects, now, slots::gate_liveness);
+
+        assert_eq!(said, Vec::<String>::new());
+        let left: Vec<bool> = kept.iter().map(|folder| folder.exists()).collect();
+        assert_eq!(left, [true, true, true, false, false], "the two oldest are removed");
+        assert!(live.exists(), "a live gate's quarantine is left");
+        std::fs::remove_dir_all(&objects).expect("the test's store can be removed");
     }
 
     #[test]
@@ -1081,5 +1736,303 @@ mod tests {
         let pairs: Vec<(&str, &str)> = args[..verb].windows(2).map(|pair| (pair[0].as_str(), pair[1].as_str())).collect();
         assert!(pairs.contains(&("-c", "maintenance.auto=false")), "{args:?}");
         assert!(pairs.contains(&("-c", "gc.auto=0")), "{args:?}");
+    }
+
+    /// The `-c` words that let a test's repository commit whatever the user's own configuration says.
+    const COMMITTER: [&str; 6] = [
+        "-c",
+        "user.name=gate",
+        "-c",
+        "user.email=gate@example.invalid",
+        "-c",
+        "commit.gpgsign=false",
+    ];
+
+    /// git with `args` in `root`, given the variables `set`: what it printed, or why it failed.
+    fn asked(root: &Path, set: &[(&str, &OsStr)], args: &[&str]) -> Result<String, git::GitError> {
+        let git = Git::find(root).expect("git is found");
+        git.output(&git::Call {
+            set,
+            ..git::Call::plain(root, args, git::GIT_LIMIT)
+        })
+    }
+
+    /// Every file under `objects` but those in the folder `left_out`, sorted.
+    fn stored(objects: &Path, left_out: &Path) -> Vec<PathBuf> {
+        let mut files = Vec::new();
+        let mut folders = vec![objects.to_path_buf()];
+        while let Some(folder) = folders.pop() {
+            for entry in std::fs::read_dir(&folder).expect("a folder of the store can be listed") {
+                let path = entry.expect("an entry can be read").path();
+                if path == left_out {
+                    continue;
+                }
+                if path.is_dir() {
+                    folders.push(path);
+                } else {
+                    files.push(path);
+                }
+            }
+        }
+        files.sort();
+        files
+    }
+
+    /// A fetch run with the quarantine's two variables writes nothing into the real store, and the commit it brought
+    /// is read through them alone: `FETCH_HEAD` names it, the real store lacks it, and the quarantine holds it.
+    #[test]
+    fn a_fetch_into_the_quarantine_leaves_the_real_store_alone_and_is_read_through_it() {
+        let builder = repository("quarantine-builder");
+        asked(&builder, &[], &["add", "-A"]).expect("the builder's file is added");
+        asked(&builder, &[], &[&COMMITTER[..], &["commit", "--quiet", "-m", "back"]].concat()).expect("the builder commits");
+        let client = repository("quarantine-client");
+        let objects = client.join(".git").join("objects");
+        let folder = objects.join("incoming-gate-test");
+        std::fs::create_dir(&folder).expect("the quarantine can be made");
+        let before = stored(&objects, &folder);
+        let real = alternates(&objects);
+        let set = [
+            ("GIT_OBJECT_DIRECTORY", folder.as_os_str()),
+            ("GIT_ALTERNATE_OBJECT_DIRECTORIES", real.as_os_str()),
+        ];
+        let url = builder.to_string_lossy();
+
+        asked(&client, &set, &["fetch", "--quiet", "--no-tags", "--", &url, "HEAD"]).expect("the fetch goes through");
+
+        assert_eq!(stored(&objects, &folder), before, "the real store is as it was");
+        let back = asked(&client, &[], &["rev-parse", "FETCH_HEAD"]).expect("FETCH_HEAD names the commit");
+        let back = back.trim_end();
+        assert!(asked(&client, &[], &["cat-file", "-e", back]).is_err(), "the real store lacks {back}");
+        assert_eq!(
+            asked(&client, &set, &["cat-file", "-e", back]),
+            Ok(String::new()),
+            "the quarantine holds {back}"
+        );
+        std::fs::remove_dir_all(&builder).expect("the builder can be removed");
+        std::fs::remove_dir_all(&client).expect("the client can be removed");
+    }
+
+    /// git reads a C-quoted entry of `GIT_ALTERNATE_OBJECT_DIRECTORIES` whole, so a real store whose path holds the
+    /// list's separator `;` is still read through it; unquoted, the path splits there and the object is not found.
+    #[test]
+    fn an_alternate_quoted_for_a_path_holding_a_semicolon_is_honoured() {
+        let root = repository("alternates;semicolon");
+        let objects = root.join(".git").join("objects");
+        let id = asked(&root, &[], &["hash-object", "-w", "a.txt"]).expect("the file is stored");
+        let id = id.trim_end();
+        let folder = objects.join("incoming-gate-test");
+        std::fs::create_dir(&folder).expect("the quarantine can be made");
+        let quoted = alternates(&objects);
+        let through = |alternate: &OsStr| {
+            let set = [
+                ("GIT_OBJECT_DIRECTORY", folder.as_os_str()),
+                ("GIT_ALTERNATE_OBJECT_DIRECTORIES", alternate),
+            ];
+            asked(&root, &set, &["cat-file", "-e", id])
+        };
+
+        assert!(quoted.to_string_lossy().starts_with('"'), "a path holding ';' is quoted: {quoted:?}");
+        assert_eq!(through(&quoted), Ok(String::new()), "the quoted store is read");
+        assert!(through(objects.as_os_str()).is_err(), "unquoted, the path splits at its ';'");
+        assert_eq!(
+            alternates(Path::new(r"C:\work\app\.git\objects")),
+            OsStr::new(r"C:\work\app\.git\objects"),
+            "no ';', no quotes"
+        );
+        std::fs::remove_dir_all(&root).expect("the repository can be removed");
+    }
+
+    /// The work-folder key of every wiring test's call.
+    const KEY: &str = "app-1a2b3c4d";
+
+    /// The call of a wiring test in the repository `root`, its lines written to `log`.
+    fn call_in<'a>(root: &'a str, log: &'a Path, state: &'a StateRoot) -> RemoteCall<'a> {
+        RemoteCall {
+            host: "builder",
+            key: KEY,
+            root,
+            repo: "app",
+            subfolder: "",
+            words: &[],
+            outputs: &[],
+            log,
+            timeout: 60,
+            stall: 60,
+            tail: 0,
+            no_markers: false,
+            interrupt: None,
+            state,
+            state_dir: Path::new(r"C:\gate-sync-back-tests"),
+        }
+    }
+
+    /// The log of the wiring test `name`, outside its repository, and none there yet.
+    fn test_log(name: &str) -> PathBuf {
+        let log = std::env::temp_dir().join(format!("gate-sync-back-{name}-{}.log", std::process::id()));
+        if log.exists() {
+            std::fs::remove_file(&log).expect("an earlier run's log is removed");
+        }
+        log
+    }
+
+    /// The repository of the test `name`'s own whose one commit is the snapshot, and this process's quarantine in it,
+    /// which waits 50 ms for a held file and holds a back commit of the snapshot's own tree: the repository, the
+    /// snapshot, the back commit and the quarantine.
+    fn backed(name: &str) -> (PathBuf, Snapshot, String, Quarantine) {
+        let root = repository(name);
+        asked(&root, &[], &["add", "-A"]).expect("the file is added");
+        asked(&root, &[], &[&COMMITTER[..], &["commit", "--quiet", "-m", "snapshot"]].concat()).expect("the snapshot is committed");
+        let snapshot = asked(&root, &[], &["rev-parse", "HEAD"]).expect("HEAD is read").trim_end().to_owned();
+        let objects = root.join(".git").join("objects");
+        let mut quarantine = Quarantine::made(&objects, &incoming_name(std::process::id(), 1, NONCE)).expect("the quarantine is made");
+        quarantine.wait = Duration::from_millis(50);
+        let tree = format!("{snapshot}^{{tree}}");
+        let words = [&COMMITTER[..], &["commit-tree", "-p", &snapshot, "-m", "back", &tree]].concat();
+        let back = asked(&root, &quarantine.env(), &words).expect("the back commit is made");
+        let snapshot = Snapshot {
+            commit: snapshot,
+            bridge: None,
+        };
+        (root, snapshot, back.trim_end().to_owned(), quarantine)
+    }
+
+    /// How a sync-back whose move failed ends: `ended` is a passing run's 1, the repository `root` holds no kept ref, the
+    /// quarantine stays marked after the sync-back's removal, and the log `log` says one line of where it is kept.
+    fn assert_unmoved(ended: &Result<End, End>, root: &Path, quarantine: &Quarantine, log: &Path) {
+        assert!(matches!(ended, Ok(End::Status(1))), "{ended:?}");
+        let kept = format!("refs/gate-remote/{KEY}-back");
+        assert!(asked(root, &[], &["rev-parse", "--verify", "--quiet", &kept]).is_err(), "no kept ref");
+        assert_eq!(quarantine.removed(HANG_GUARD, || {}), None, "the sync-back's removal says nothing");
+        assert!(quarantine.folder.join("gate-kept").exists(), "the quarantine stays, marked kept");
+        let said = std::fs::read_to_string(log).expect("the log was written");
+        let owner = "gate: remote changes not applied: the fetched objects could not be moved into the repository: ";
+        assert_eq!(said.lines().filter(|line| line.starts_with(owner)).count(), 1, "{said}");
+    }
+
+    /// The back commit `back`'s loose object in the quarantine `folder`.
+    fn loose_object(folder: &Path, back: &str) -> PathBuf {
+        folder.join(&back[..2]).join(&back[2..])
+    }
+
+    /// A back commit that may be applied, whose objects cannot be moved in as one is held open past the wait, is
+    /// neither applied nor kept.
+    #[test]
+    fn a_back_commit_whose_objects_cannot_be_moved_in_is_not_applied() {
+        let (root, snapshot, back, quarantine) = backed("unmoved-receive");
+        let shown = root.to_string_lossy().into_owned();
+        let log = test_log("unmoved-receive");
+        let state = StateRoot::new(r"C:\gate-sync-back-tests", None);
+        let call = call_in(&shown, &log, &state);
+        let transport = Local::new(r"local:C:\gate-sync-back-tests", None).expect("a local transport");
+        let mut attempt = Attempt::for_tests(&call, &transport);
+        let git = Git::find(&root).expect("git is found");
+        let handle = held_open(&loose_object(&quarantine.folder, &back));
+
+        let back_of = Back {
+            commit: &back,
+            quarantine: &quarantine,
+        };
+        let ended = receive(&mut attempt, &git, &snapshot, &back_of, 0);
+
+        drop(handle);
+        assert_unmoved(&ended, &root, &quarantine, &log);
+        assert!(
+            !std::fs::read_to_string(&log).expect("the log").contains("synced back"),
+            "nothing is applied"
+        );
+        std::fs::remove_dir_all(&root).expect("the repository can be removed");
+        std::fs::remove_file(&log).expect("the log can be removed");
+    }
+
+    /// A refused back commit whose objects cannot be moved in, as one is held open past the wait, is not kept, and the
+    /// refusal's own line is not said.
+    #[test]
+    fn a_refused_back_commit_whose_objects_cannot_be_moved_in_is_not_kept() {
+        let (root, _, back, quarantine) = backed("unmoved-refused");
+        let shown = root.to_string_lossy().into_owned();
+        let log = test_log("unmoved-refused");
+        let state = StateRoot::new(r"C:\gate-sync-back-tests", None);
+        let call = call_in(&shown, &log, &state);
+        let transport = Local::new(r"local:C:\gate-sync-back-tests", None).expect("a local transport");
+        let mut attempt = Attempt::for_tests(&call, &transport);
+        let git = Git::find(&root).expect("git is found");
+        let handle = held_open(&loose_object(&quarantine.folder, &back));
+
+        let back_of = Back {
+            commit: &back,
+            quarantine: &quarantine,
+        };
+        let ended = refused_end(&mut attempt, &git, &back_of, "gate: the refusal's own line".to_owned(), 0);
+
+        drop(handle);
+        assert_unmoved(&ended, &root, &quarantine, &log);
+        assert!(
+            !std::fs::read_to_string(&log).expect("the log").contains("the refusal's own line"),
+            "the refusal is not said"
+        );
+        std::fs::remove_dir_all(&root).expect("the repository can be removed");
+        std::fs::remove_file(&log).expect("the log can be removed");
+    }
+
+    /// A fetch whose first try fails before the banner is tried again with the same variables, so the retry writes into
+    /// the same quarantine: the commit it brought is read through it, and the real store lacks it. The first try's
+    /// pack command fails as ssh does when the builder closes the connection before its banner.
+    #[test]
+    fn a_fetch_retried_before_the_banner_writes_into_the_same_quarantine() {
+        let builder = repository("retry-builder");
+        asked(&builder, &[], &["add", "-A"]).expect("the builder's file is added");
+        asked(&builder, &[], &[&COMMITTER[..], &["commit", "--quiet", "-m", "back"]].concat()).expect("the builder commits");
+        let client = repository("retry-client");
+        let objects = client.join(".git").join("objects");
+        let quarantine = Quarantine::made(&objects, &incoming_name(std::process::id(), 1, NONCE)).expect("the quarantine is made");
+        let marker = std::env::temp_dir().join(format!("gate-sync-back-retry-{}", std::process::id()));
+        if marker.exists() {
+            std::fs::remove_file(&marker).expect("an earlier run's marker is removed");
+        }
+        let at = marker.to_string_lossy().replace('\\', "/");
+        let pack = format!(
+            "f() {{ if [ -e '{at}' ]; then git-upload-pack \"$@\"; else : > '{at}'; \
+             echo 'kex_exchange_identification: read: Connection reset by peer' >&2; exit 128; fi; }}; f"
+        );
+        let url = builder.to_string_lossy().into_owned();
+        let remote = Remote {
+            url: &url,
+            pack: Some(&pack),
+            ssh: None,
+            reference: "HEAD",
+        };
+        let shown = client.to_string_lossy().into_owned();
+        let log = test_log("retry");
+        let state = StateRoot::new(r"C:\gate-sync-back-tests", None);
+        let call = call_in(&shown, &log, &state);
+        let transport = Local::new(r"local:C:\gate-sync-back-tests", None).expect("a local transport");
+        let mut attempt = Attempt::for_tests(&call, &transport);
+        let git = Git::find(&client).expect("git is found");
+
+        let fetched = fetch(&mut attempt, &git, &remote, &quarantine, 0);
+
+        assert!(matches!(fetched, Ok(None)), "{fetched:?}");
+        let said = std::fs::read_to_string(&log).expect("the log was written");
+        assert!(said.contains("gate: builder did not answer the ssh banner; trying once more"), "{said}");
+        let back = asked(&client, &[], &["rev-parse", "FETCH_HEAD"]).expect("FETCH_HEAD names the commit");
+        let back = back.trim_end();
+        assert!(asked(&client, &[], &["cat-file", "-e", back]).is_err(), "the real store lacks {back}");
+        assert_eq!(
+            asked(&client, &quarantine.env(), &["cat-file", "-e", back]),
+            Ok(String::new()),
+            "the quarantine holds {back}"
+        );
+        let quarantines = std::fs::read_dir(&objects)
+            .expect("the store can be listed")
+            .filter(|entry| {
+                let entry = entry.as_ref().expect("an entry can be read");
+                entry.file_name().to_string_lossy().starts_with("incoming-gate-")
+            })
+            .count();
+        assert_eq!(quarantines, 1, "no other quarantine was made");
+        std::fs::remove_dir_all(&builder).expect("the builder can be removed");
+        std::fs::remove_dir_all(&client).expect("the client can be removed");
+        std::fs::remove_file(&marker).expect("the marker can be removed");
+        std::fs::remove_file(&log).expect("the log can be removed");
     }
 }
