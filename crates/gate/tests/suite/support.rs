@@ -897,6 +897,31 @@ impl Escapee {
             .to_vec()
     }
 
+    /// The words of a command whose child, the launcher, starts the escapee sleeping and ends a second later, while the
+    /// command holds the launcher's handle until a release file no case writes: from then on no process of the job is
+    /// the escapee's parent, so only what the watch recorded of it reaches it. Only `spawn-pid`'s look for its release
+    /// file every 20 ms uses CPU, far under the stall floor.
+    pub fn launched_command(&self) -> Vec<String> {
+        let (pid_file, stop) = (shown(&self.pid_file), shown(&self.stop));
+        let launcher = shown(&self.pid_file.with_file_name("launcher.pid"));
+        let release = shown(&self.pid_file.with_file_name("release"));
+        [
+            FAKE_TOOL,
+            "spawn-pid",
+            &launcher,
+            &release,
+            FAKE_TOOL,
+            "spawn-away",
+            &pid_file,
+            "0",
+            &stop,
+            "sleep",
+            "1000",
+        ]
+        .map(str::to_owned)
+        .to_vec()
+    }
+
     /// The escapee's pid and the process, once the pid file holds its whole line, checked to be the process that
     /// started then. Fails at once, rather than at the hang guard, when `ended` says the command that would write the
     /// file has ended without it.
@@ -923,6 +948,28 @@ impl Escapee {
             "pid {pid} is the escapee spawn-away started"
         );
         (pid, process)
+    }
+
+    /// The launcher [`Escapee::launched_command`] starts, once it has ended on its own: opened by the pid `spawn-pid`
+    /// wrote, which goes on naming the launcher while `spawn-pid` holds its handle, then waited for within the hang
+    /// guard. Fails unless it exited 0, its own end after its sleep rather than a kill's.
+    pub fn launcher_ended(&self) -> StoppableProcess {
+        let path = self.pid_file.with_file_name("launcher.pid");
+        let mut pid = None;
+        wait_until(&format!("{} holding the launcher's pid", path.display()), || {
+            pid = fs::read_to_string(&path).ok().and_then(|text| text.parse::<u32>().ok());
+            pid.is_some()
+        });
+        let pid = pid.expect("the wait returns once the launcher's pid is read");
+        let launcher = StoppableProcess::open(pid)
+            .expect("the launcher is opened")
+            .expect("spawn-pid holds its handle, so its pid still names it");
+        assert!(
+            matches!(launcher.wait(HANG_GUARD), Ok(true)),
+            "the launcher {pid} ended within the hang guard"
+        );
+        assert_eq!(launcher.exit_code().ok(), Some(0), "the launcher {pid} ended on its own, not by a kill");
+        launcher
     }
 
     /// Ends the escapee's `spin` by writing its stop file.

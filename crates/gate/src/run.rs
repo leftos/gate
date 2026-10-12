@@ -4,6 +4,7 @@
 //! covers the gate, the command started in its job with its environment and priority and waited for, the log completed,
 //! the failure markers scanned, the tail and the verdict line said, and the slot released.
 
+use std::cell::RefCell;
 use std::ffi::OsString;
 use std::fs::OpenOptions;
 use std::os::windows::ffi::OsStrExt;
@@ -24,7 +25,7 @@ use crate::answer::USAGE_STATUS;
 use crate::console::Console;
 use crate::covered::Covered;
 use crate::environment::{self, Variables};
-use crate::escaped::{self, Found, Reach, Reached};
+use crate::escaped::{self, Found, Reach, Reached, Recorded};
 use crate::journal::{self, RunJournal};
 use crate::log::Log;
 use crate::machine::{self, Machine, MachineWait, MachineWaited};
@@ -1062,28 +1063,45 @@ impl Run<'_> {
     fn watched(&mut self, job: &Job, running: &Running, start: &Start, console: &mut Console) -> Ended {
         // Copies of the run's own references, so the stopper holds no borrow of the run while it is watched.
         let (request, root) = (self.request, self.root);
+        let recorded = RefCell::new(Recorded::default());
+        let started = Started {
+            job,
+            running,
+            recorded: Some(&recorded),
+        };
         let mut stopper = Stopper {
-            reach: Reach {
-                job,
-                server_image: request.test_seams.server_image.as_deref(),
-                root: &root.root,
+            ends: Ender {
+                reach: Reach {
+                    job,
+                    server_image: request.test_seams.server_image.as_deref(),
+                    root: &root.root,
+                },
+                running,
             },
+            recorded: &recorded,
             armed: true,
         };
-        let ended = match self.watch(job, running, start, console) {
-            Ok((watched, timing)) => self.after_watch(watched, timing, (job, running), console),
-            Err(problem) => self.gate_failed(&problem, Some((job, running)), console),
+        let ended = match self.watch(started, &recorded, start, console) {
+            Ok((watched, timing)) => self.after_watch(watched, timing, started, console),
+            Err(problem) => self.gate_failed(&problem, Some(started), console),
         };
         stopper.armed = false;
         ended
     }
 
     /// Watches the command until it exits, is killed or the console is interrupted; how it ended and how long it ran,
-    /// with the cores it kept busy, else the gate's problem.
-    fn watch(&mut self, job: &Job, running: &Running, start: &Start, console: &mut Console) -> Result<(Watched, Timing), String> {
+    /// with the cores it kept busy, else the gate's problem. The watch's samples write what they find outside the job to
+    /// `recorded`.
+    fn watch(
+        &mut self,
+        started: Started<'_>,
+        recorded: &RefCell<Recorded>,
+        start: &Start,
+        console: &mut Console,
+    ) -> Result<(Watched, Timing), String> {
         let watching = Watching {
-            job,
-            running,
+            job: started.job,
+            running: started.running,
             log: &self.log,
             interrupt: self.host.interrupt,
             runs_as: self.nesting.runs_as(self.request.slot),
@@ -1091,6 +1109,7 @@ impl Run<'_> {
             gate: &self.gate,
             hands_on: self.nesting.handed_on(self.lent),
             survey: &mut self.survey,
+            recorded,
         };
         let mut watcher = Watcher::begin(self.request, watching, start, self.host.processors)
             .map_err(|error| format!("cannot begin to watch the command: {error}"))?;
@@ -1108,9 +1127,14 @@ impl Run<'_> {
     /// Ends the run as the watch ended it: a command that exited has its verdict; one killed as stalled, timed out or
     /// past the backstop has its diagnostics written to the log, its kill line and the pointer to them said, its job
     /// terminated and the verdict of status 124; an interrupted one is given 5 s to end before its job is stopped, and
-    /// has the verdict of its own status, neither scanned for markers.
-    fn after_watch(&mut self, watched: Watched, timing: Timing, started: (&Job, &Running), console: &mut Console) -> Ended {
-        let (job, running) = started;
+    /// has the verdict of its own status, neither scanned for markers. A gate failure after a command's own exit ends its
+    /// job, not what it left running outside it.
+    fn after_watch(&mut self, watched: Watched, timing: Timing, started: Started<'_>, console: &mut Console) -> Ended {
+        let started = Started {
+            recorded: records_after(&watched, started.recorded),
+            ..started
+        };
+        let Started { job, running, recorded } = started;
         match watched {
             Watched::Exited(code) => {
                 let exited = i64::from(code.cast_signed());
@@ -1125,7 +1149,7 @@ impl Run<'_> {
                     console.note(note);
                 }
                 console.err(&line);
-                kill(&self.reach(job), running, processes, console);
+                kill(&self.ender(job, running), recorded, processes, console);
                 console.err(&format!("gate: diagnostics written to {}", self.log.path().display()));
                 let exited = i64::from(STOPPED);
                 self.ended(
@@ -1141,7 +1165,7 @@ impl Run<'_> {
                 )
             }
             Watched::Interrupted => {
-                let exited = interrupted(&self.reach(job), running, console);
+                let exited = interrupted(&self.ender(job, running), recorded, console);
                 self.ended(&Outcome { exited, timing, kill: None }, true, &[], started, console)
             }
         }
@@ -1149,7 +1173,7 @@ impl Run<'_> {
 
     /// Reaches the verdict of `outcome`, its markers not scanned when `unscanned`, and the facts its release carries.
     /// `diagnostics` is the block a kill wrote to the log, whose lines the verdict's tail leaves out.
-    fn ended(&mut self, outcome: &Outcome<'_>, unscanned: bool, diagnostics: &[String], started: (&Job, &Running), console: &mut Console) -> Ended {
+    fn ended(&mut self, outcome: &Outcome<'_>, unscanned: bool, diagnostics: &[String], started: Started<'_>, console: &mut Console) -> Ended {
         let timing = self.without_nested_cores(outcome.timing, console);
         match self.verdict(outcome.exited, Some(Pass::Here(timing)), unscanned, diagnostics, console) {
             Ok(status) => Ended {
@@ -1302,11 +1326,19 @@ impl Run<'_> {
         }
     }
 
+    /// What ends the command `running` in `job`: the job with what its kill reaches outside it, and the command.
+    fn ender<'s>(&'s self, job: &'s Job, running: &'s Running) -> Ender<'s> {
+        Ender {
+            reach: self.reach(job),
+            running,
+        }
+    }
+
     /// Says the gate's own failure, terminates the job of a command that started, and completes the log; status 1.
-    fn gate_failed(&mut self, problem: &str, started: Option<(&Job, &Running)>, console: &mut Console) -> Ended {
+    fn gate_failed(&mut self, problem: &str, started: Option<Started<'_>>, console: &mut Console) -> Ended {
         console.err(&format!("gate: the gate failed while running the command: {problem}"));
-        if let Some((job, running)) = started {
-            stop(&self.reach(job), running, console);
+        if let Some(Started { job, running, recorded }) = started {
+            stop(&self.ender(job, running), recorded, console);
         }
         if let Err(error) = self.log.finish(console) {
             console.err(&format!(
@@ -1323,38 +1355,98 @@ impl Run<'_> {
 
 /// Terminates the job, and ends the processes that left it, when dropped armed: on a return or a panic the run did not
 /// plan for after the command started.
-struct Stopper<'a> {
+struct Stopper<'a, E: Ends> {
     /// The job and what its stop reaches outside it.
-    reach: Reach<'a>,
+    ends: E,
+    /// The processes outside the job the watch recorded, which the stop ends too.
+    recorded: &'a RefCell<Recorded>,
     armed: bool,
 }
 
-impl Drop for Stopper<'_> {
+impl<E: Ends> Drop for Stopper<'_, E> {
     fn drop(&mut self) {
         if self.armed {
             // The run is already leaving on a failure, with nowhere left to report a failed terminate to.
-            let _ = self.reach.terminate(STOPPED, STOP_WAIT, Found::default());
+            let _ = self.ends.terminate(STOPPED, STOP_WAIT, earlier(Some(self.recorded)));
         }
     }
 }
 
-/// Terminates the job `reach` names after a failure of the gate's own, ends the processes that left it but the build
-/// servers, and gives the command a moment to end.
-fn stop(reach: &Reach<'_>, running: &Running, console: &mut Console) {
-    match reach.terminate(STOPPED, STOP_WAIT, Found::default()) {
+/// What the ends of a run stop: the command's job with the processes that left it, and the command itself.
+trait Ends {
+    /// What `earlier` found with what a look now finds outside the job ([`Reach::look`]).
+    fn look(&self, earlier: Found) -> Found;
+    /// Terminates the job with `status` and ends the processes outside it, `earlier`'s with those a look finds now
+    /// ([`Reach::terminate`]).
+    fn terminate(&self, status: u32, wait: Duration, earlier: Found) -> io::Result<Reached>;
+    /// Waits at most `timeout` for the command; its exit code once it has exited, `None` while it still runs.
+    fn wait(&self, timeout: Duration) -> io::Result<Option<u32>>;
+}
+
+/// The command's job, what its stop reaches outside it, and the command's process.
+struct Ender<'a> {
+    reach: Reach<'a>,
+    running: &'a Running,
+}
+
+impl Ends for Ender<'_> {
+    fn look(&self, earlier: Found) -> Found {
+        self.reach.look(earlier)
+    }
+
+    fn terminate(&self, status: u32, wait: Duration, earlier: Found) -> io::Result<Reached> {
+        self.reach.terminate(status, wait, earlier)
+    }
+
+    fn wait(&self, timeout: Duration) -> io::Result<Option<u32>> {
+        self.running.wait(timeout)
+    }
+}
+
+/// The command's started job and process, and the processes outside the job its watch records, which every end of the
+/// run but the command's own exit ends: `None` once the command has exited.
+#[derive(Clone, Copy)]
+struct Started<'a> {
+    job: &'a Job,
+    running: &'a Running,
+    recorded: Option<&'a RefCell<Recorded>>,
+}
+
+/// The processes outside the job the watch `recorded` that an end of the run after `watched` reaches: none after the
+/// command's own exit, which leaves what it left running outside its job.
+fn records_after<'a>(watched: &Watched, recorded: Option<&'a RefCell<Recorded>>) -> Option<&'a RefCell<Recorded>> {
+    match watched {
+        Watched::Exited(_) => None,
+        Watched::Killed { .. } | Watched::Interrupted => recorded,
+    }
+}
+
+/// What the watch `recorded` outside the job, as a kill's earlier look: its processes, parents first; nothing when
+/// there is no record. A record the watch is still writing, which no end of the run reads while a sample runs, is
+/// nothing, so the stop on a panic never panics itself.
+fn earlier(recorded: Option<&RefCell<Recorded>>) -> Found {
+    recorded
+        .and_then(|recorded| recorded.try_borrow().ok())
+        .map_or_else(Found::default, |recorded| Found::recorded(&recorded))
+}
+
+/// Terminates the job `ends` names after a failure of the gate's own, ends the processes that left it, those the watch
+/// `recorded` with them, but the build servers, and gives the command a moment to end.
+fn stop(ends: &impl Ends, recorded: Option<&RefCell<Recorded>>, console: &mut Console) {
+    match ends.terminate(STOPPED, STOP_WAIT, earlier(recorded)) {
         Ok(reached) => say_problems(&reached, console),
         Err(error) => {
             console.err(&format!("gate: and could not terminate the command's job: {error}"));
             return;
         }
     }
-    await_stopped(running, console);
+    await_stopped(ends, console);
 }
 
-/// Terminates the job `reach` names of a killed command, which held `processes` processes, ends the processes that left
-/// it but the build servers, and gives the command a moment to end.
-fn kill(reach: &Reach<'_>, running: &Running, processes: u32, console: &mut Console) {
-    match reach.terminate(STOPPED, STOP_WAIT, Found::default()) {
+/// Terminates the job `ends` names of a killed command, which held `processes` processes, ends the processes that left
+/// it, those the watch `recorded` with them, but the build servers, and gives the command a moment to end.
+fn kill(ends: &impl Ends, recorded: Option<&RefCell<Recorded>>, processes: u32, console: &mut Console) {
+    match ends.terminate(STOPPED, STOP_WAIT, earlier(recorded)) {
         Ok(reached) => {
             console.err(&escaped::terminated_line(processes, &reached.ended));
             say_problems(&reached, console);
@@ -1364,22 +1456,22 @@ fn kill(reach: &Reach<'_>, running: &Running, processes: u32, console: &mut Cons
             return;
         }
     }
-    await_stopped(running, console);
+    await_stopped(ends, console);
 }
 
 /// Looks for the processes that left the command's job as soon as the interrupt arrives, while the in-job process that
 /// started them may still run, then waits up to [`STOP_WAIT`] for the command, which had the Ctrl+C too, to end on its
 /// own; its own status, with whatever it left in its job terminated and the processes that left it ended: those that
 /// first look found and those a second look at the terminate finds. One still running then has its job terminated and
-/// those processes ended the same way, and the status is `STATUS_CONTROL_C_EXIT`. The build servers outside the job are
-/// left running.
-fn interrupted(reach: &Reach<'_>, running: &Running, console: &mut Console) -> i64 {
+/// those processes ended the same way, and the status is `STATUS_CONTROL_C_EXIT`. The processes the watch `recorded`
+/// outside the job are ended with those the first look found. The build servers outside the job are left running.
+fn interrupted(ends: &impl Ends, recorded: Option<&RefCell<Recorded>>, console: &mut Console) -> i64 {
     console.err("gate: interrupted; stopping the command");
-    let early = reach.look();
-    match running.wait(STOP_WAIT) {
+    let early = ends.look(earlier(recorded));
+    match ends.wait(STOP_WAIT) {
         Ok(Some(code)) => {
             // What the command left running in its job, or outside it, does not outlive the gate after a Ctrl+C.
-            match reach.terminate(CONTROL_C_EXIT, STOP_WAIT, early) {
+            match ends.terminate(CONTROL_C_EXIT, STOP_WAIT, early) {
                 Ok(reached) => say_problems(&reached, console),
                 Err(error) => console.err(&format!("gate: could not terminate the command's job: {error}")),
             }
@@ -1390,10 +1482,10 @@ fn interrupted(reach: &Reach<'_>, running: &Running, console: &mut Console) -> i
             "gate: cannot wait for the command after the interrupt: {error}; terminating its job"
         )),
     }
-    match reach.terminate(CONTROL_C_EXIT, STOP_WAIT, early) {
+    match ends.terminate(CONTROL_C_EXIT, STOP_WAIT, early) {
         Ok(reached) => {
             say_problems(&reached, console);
-            await_stopped(running, console);
+            await_stopped(ends, console);
         }
         Err(error) => console.err(&format!("gate: could not terminate the command's job: {error}")),
     }
@@ -1407,10 +1499,10 @@ fn say_problems(reached: &Reached, console: &mut Console) {
     }
 }
 
-/// Waits up to [`STOP_WAIT`] for the command whose job was terminated; its exit code, or `None`, said, when it did not
-/// end or could not be waited for.
-fn await_stopped(running: &Running, console: &mut Console) -> Option<u32> {
-    match running.wait(STOP_WAIT) {
+/// Waits up to [`STOP_WAIT`] for the command `ends` names, whose job was terminated; its exit code, or `None`, said,
+/// when it did not end or could not be waited for.
+fn await_stopped(ends: &impl Ends, console: &mut Console) -> Option<u32> {
+    match ends.wait(STOP_WAIT) {
         Ok(Some(code)) => Some(code),
         Ok(None) => {
             console.err("gate: the command was still running 5 s after its job was terminated");
@@ -1527,7 +1619,9 @@ fn take_event(slots: Vec<String>, waited_seconds: f64, abandoned: Vec<String>, p
     reason = "a unit test starts cmd.exe directly, with no launch of its own open"
 )]
 mod tests {
+    use std::cell::RefCell;
     use std::fs;
+    use std::io;
     use std::process::Command;
 
     use std::time::Duration;
@@ -1535,8 +1629,136 @@ mod tests {
     use gate_args::Slot;
     use gate_watchdog::{Cores, Hint};
 
-    use super::{Judged, Timing, cores_hint_for, cores_line, log_in_state_root, takes_own_slot};
+    use super::{
+        Ends, Judged, Stopper, Timing, cores_hint_for, cores_line, earlier, interrupted, kill, log_in_state_root, records_after, stop, takes_own_slot,
+    };
+    use crate::console::Console;
+    use crate::escaped::{Found, Look, Reached, Recorded};
     use crate::nesting::{Nesting, Parent};
+    use crate::watch::Watched;
+
+    /// Ends that note the pids of the processes outside the job each terminate is given, whose look finds nothing more
+    /// than it is given, and whose command has exited 0.
+    struct Noted<'a>(&'a RefCell<Vec<Vec<u32>>>);
+
+    impl Ends for Noted<'_> {
+        fn look(&self, earlier: Found) -> Found {
+            earlier
+        }
+
+        fn terminate(&self, _status: u32, _wait: Duration, earlier: Found) -> io::Result<Reached> {
+            self.0.borrow_mut().push(earlier.pids());
+            Ok(Reached {
+                ended: Vec::new(),
+                problems: Vec::new(),
+            })
+        }
+
+        fn wait(&self, _timeout: Duration) -> io::Result<Option<u32>> {
+            Ok(Some(0))
+        }
+    }
+
+    #[test]
+    fn a_stall_ceiling_or_backstop_kill_passes_the_records_to_terminate() {
+        let (recorded, terminated) = (recorded(), RefCell::new(Vec::new()));
+
+        kill(&Noted(&terminated), Some(&recorded), 3, &mut Console::new());
+
+        assert_eq!(terminated.into_inner(), vec![vec![2, 3]]);
+    }
+
+    #[test]
+    fn a_ctrl_c_passes_the_records_to_terminate() {
+        let (recorded, terminated) = (recorded(), RefCell::new(Vec::new()));
+
+        let exited = interrupted(&Noted(&terminated), Some(&recorded), &mut Console::new());
+
+        assert_eq!(exited, 0, "the command's own status");
+        assert_eq!(terminated.into_inner(), vec![vec![2, 3]]);
+    }
+
+    #[test]
+    fn a_gate_failure_passes_the_records_to_terminate() {
+        let (recorded, terminated) = (recorded(), RefCell::new(Vec::new()));
+
+        stop(&Noted(&terminated), Some(&recorded), &mut Console::new());
+
+        assert_eq!(terminated.into_inner(), vec![vec![2, 3]]);
+    }
+
+    #[test]
+    fn the_stopper_on_a_panic_passes_the_records_to_terminate() {
+        let (recorded, terminated) = (recorded(), RefCell::new(Vec::new()));
+
+        drop(Stopper {
+            ends: Noted(&terminated),
+            recorded: &recorded,
+            armed: true,
+        });
+
+        assert_eq!(terminated.into_inner(), vec![vec![2, 3]]);
+    }
+
+    #[test]
+    fn a_gate_failure_after_the_command_s_own_exit_passes_no_records() {
+        let (recorded, terminated) = (recorded(), RefCell::new(Vec::new()));
+        let killed = Watched::Killed {
+            line: String::new(),
+            processes: 1,
+            diagnostics: Vec::new(),
+        };
+
+        stop(
+            &Noted(&terminated),
+            records_after(&Watched::Exited(0), Some(&recorded)),
+            &mut Console::new(),
+        );
+
+        assert_eq!(
+            terminated.into_inner(),
+            vec![Vec::<u32>::new()],
+            "a normal exit leaves what it leaves running"
+        );
+        assert!(records_after(&killed, Some(&recorded)).is_some(), "a kill keeps them");
+        assert!(records_after(&Watched::Interrupted, Some(&recorded)).is_some(), "a Ctrl+C keeps them");
+    }
+
+    /// What a watch recorded of member 1's process 2 outside the job, which started 3.
+    fn recorded() -> RefCell<Recorded> {
+        let process = |pid: u32, parent_pid: u32, second: i64| proc_table::ProcessInfo {
+            pid,
+            parent_pid,
+            name: "pwsh.exe".to_owned(),
+            command_line: None,
+            created: jiff::Timestamp::from_second(1_790_000_000 + second).ok(),
+        };
+        let tree = proc_table::ProcessTree::new(vec![process(1, 0, 0), process(2, 1, 1), process(3, 2, 2)]);
+        let look = Look {
+            before: vec![1],
+            after: vec![1],
+            since: jiff::Timestamp::UNIX_EPOCH,
+            tree: &tree,
+        };
+        let recorded = RefCell::new(Recorded::default());
+        recorded.borrow_mut().record(look, |_| false);
+        recorded
+    }
+
+    #[test]
+    fn a_kill_a_gate_failure_and_a_panic_reach_what_the_watch_recorded_parents_first() {
+        let recorded = recorded();
+
+        assert_eq!(earlier(Some(&recorded)).pids(), vec![2, 3]);
+        assert_eq!(earlier(None).pids(), Vec::<u32>::new(), "no record is nothing");
+        let writing = recorded.borrow_mut();
+        assert_eq!(
+            earlier(Some(&recorded)).pids(),
+            Vec::<u32>::new(),
+            "a record a sample is still writing is nothing, never a panic"
+        );
+        drop(writing);
+    }
 
     #[test]
     fn only_a_run_neither_covered_nor_lent_takes_its_own_slot() {

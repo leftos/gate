@@ -2,12 +2,13 @@
 //! terminated and the gate exits as Ctrl+C does; a queued gate deletes its ticket, journals the abandon and exits so.
 
 use std::fs;
+use std::time::Duration;
 
 use gate_state::v1::ticket_path;
 use serde_json::Value;
 
 use crate::support::{
-    Case, FAKE_TOOL, assert_in_order, events, release, run_words, said_pid, shown, wait_for_journal_line, wait_until, write_counts,
+    Case, Escapee, FAKE_TOOL, assert_in_order, events, release, run_words, said_pid, shown, wait_for_journal_line, wait_until, write_counts,
 };
 
 /// The status Windows reports for a process Ctrl+C ended, `STATUS_CONTROL_C_EXIT`, as a signed exit code.
@@ -38,6 +39,33 @@ fn a_command_still_running_5_s_after_a_ctrl_c_has_its_job_terminated() {
     wait_until(&format!("the interrupted command {pid} ending"), || {
         gate_win32::process_start_of(pid).is_ok_and(|start| start.is_none())
     });
+}
+
+#[test]
+#[ignore = "needs the machine alone: run with -Slot critical and --ignored"]
+fn a_ctrl_c_ends_a_child_outside_the_job_whose_launcher_has_ended() {
+    let case = Case::new("a_ctrl_c_ends_a_child_outside_the_job_whose_launcher_has_ended");
+    // The launcher lives a second, so a sample sees the escapee under it; the interrupt comes 30 samples in, at least
+    // 3 s, when nothing in the job is the escapee's parent.
+    let escapee = Escapee::new(&case);
+    let command = escapee.launched_command();
+    let words: Vec<&str> = command.iter().map(String::as_str).collect();
+    let seams = ["--test-sample-ms", "100", "--test-interrupt-after-samples", "30", "--test-job-breakaway"];
+
+    let mut running = case.start(&run_words("out.log", &seams, &words));
+    let (pid, away) = escapee.open(|| !running.is_running());
+    let launcher = escapee.launcher_ended();
+    let outcome = running.finish();
+
+    assert_eq!(outcome.code, Some(CONTROL_C_EXIT), "{outcome:?}");
+    assert!(
+        matches!(away.wait(Duration::ZERO), Ok(true)),
+        "the escapee {pid}, whose launcher had ended, was ended at the interrupt: {outcome:?}"
+    );
+    assert!(
+        matches!((launcher.exited(), away.exited()), (Ok(left), Ok(ended)) if left < ended),
+        "the launcher had ended before the interrupt ended the escapee {pid}: {outcome:?}"
+    );
 }
 
 #[test]

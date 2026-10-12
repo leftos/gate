@@ -96,7 +96,9 @@ pub struct SampleFacts {
     pub new_servers_cpu: Ticks,
     /// The CPU time of the build servers already running, counted while the job holds a build client.
     pub shared_servers_cpu: Ticks,
-    /// Whether a build client was in the job.
+    /// The CPU time of the processes outside the job under its members, the build servers left out.
+    pub escaped_cpu: Ticks,
+    /// Whether a build client was in the job, or among the processes outside it under its members.
     pub build_client_in_job: bool,
 }
 
@@ -243,7 +245,7 @@ fn sample_line(sample: &SampleFacts) -> String {
     };
     format!(
         "gate:   sample at {} s (load-adjusted {} s, free {}%): log {} B, err {} B, job cpu {} s, {vm}{}, \
-         new servers cpu {} s, shared servers cpu {} s, build client in job: {}",
+         new servers cpu {} s, shared servers cpu {} s, escaped cpu {} s, build client in job: {}",
         round_half_even(sample.wall_seconds, 1),
         round_half_even(sample.adjusted_seconds, 1),
         sample.free_percent,
@@ -253,6 +255,7 @@ fn sample_line(sample: &SampleFacts) -> String {
         process_count(sample.processes),
         seconds(sample.new_servers_cpu),
         seconds(sample.shared_servers_cpu),
+        seconds(sample.escaped_cpu),
         if sample.build_client_in_job { "yes" } else { "no" }
     )
 }
@@ -368,6 +371,7 @@ mod tests {
             processes: 3,
             new_servers_cpu: Ticks(0),
             shared_servers_cpu: cpu(1000),
+            escaped_cpu: cpu(2500),
             build_client_in_job: true,
         }
     }
@@ -415,7 +419,7 @@ mod tests {
                 "gate:   build server 300 VBCSCompiler.exe: cpu 2 s (started after the command)",
                 "gate:   build server 200 MSBuild.exe: cpu 0.5 s (already running; counts while the job holds a build client)",
                 "gate:   sample at 12.3 s (load-adjusted 6.1 s, free 49%): log 1024 B, err 0 B, job cpu 3.46 s, 3 processes, \
-                 new servers cpu 0 s, shared servers cpu 1 s, build client in job: yes",
+                 new servers cpu 0 s, shared servers cpu 1 s, escaped cpu 2.5 s, build client in job: yes",
                 "gate:   ... diagnostics cut at 2003 ms",
             ]
         );

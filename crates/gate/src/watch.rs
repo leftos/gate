@@ -3,7 +3,8 @@
 //! kill gathers before it terminates the job, and the end of the wait: the command's exit, a kill as stalled, timed out
 //! or past the backstop, or a Ctrl+C.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -20,7 +21,7 @@ use jiff::Timestamp;
 use proc_table::{ProcessInfo, ProcessTable, ProcessTree, Win32ProcessTable, filetime_to_timestamp};
 
 use crate::console::Console;
-use crate::escaped;
+use crate::escaped::{self, Look, Recorded};
 use crate::log::Log;
 use crate::nesting::Parent;
 use crate::pause::PauseReader;
@@ -80,6 +81,8 @@ pub(crate) struct Watcher<'a> {
     counted: Vec<(u32, bool)>,
     /// The processes outside the job the last sample counted, by pid and start.
     counted_escaped: Vec<(u32, u64)>,
+    /// The processes outside the job the samples have recorded, which the run's kill ends.
+    recorded: &'a RefCell<Recorded>,
     sampler_works: bool,
     /// Whether every sample fails (`--test-sampler-fail`).
     sampler_fail: bool,
@@ -181,6 +184,8 @@ pub(crate) struct Watching<'a> {
     pub hands_on: Option<&'a Parent>,
     /// The state root's tickets, claims and jobs, as the build servers' guard reads them.
     pub survey: &'a mut Survey,
+    /// Where the samples record the processes outside the job, which the run's kill reads.
+    pub recorded: &'a RefCell<Recorded>,
 }
 
 /// One sample pass's gathered facts: the sample itself, the sizes of the log and its `.err` file, the two kept apart
@@ -210,6 +215,7 @@ impl<'a> Watcher<'a> {
             gate,
             hands_on,
             survey,
+            recorded,
         } = run;
         let system = system_times()?;
         let job_cpu = Ticks(job.accounting()?.cpu);
@@ -235,6 +241,7 @@ impl<'a> Watcher<'a> {
             under: request.test_seams.servers_under.as_deref().map(absolute),
             counted: Vec::new(),
             counted_escaped: Vec::new(),
+            recorded,
             sampler_works: true,
             sampler_fail: request.test_seams.sampler_fail,
             diagnostics_fail: request.test_seams.diagnostics_fail,
@@ -378,21 +385,10 @@ impl<'a> Watcher<'a> {
             (Some(_), true) => WslVm::Unavailable,
             (Some(percent), false) => WslVm::Percent(percent),
         };
-        self.history.push(SampleFacts {
-            wall_seconds: sample.at.as_secs_f64(),
-            adjusted_seconds: self.watch.adjusted_seconds(),
-            // The sample just taken leaves the share it found, so this is `Some`; 100 is the watch's answer while
-            // nothing has been counted.
-            free_percent: self.watch.last_free_percent().unwrap_or(100),
-            log_bytes,
-            err_bytes,
-            job_cpu: sample.job_cpu,
-            wsl_vm,
-            processes: u32::try_from(sample.pids.len()).unwrap_or(u32::MAX),
-            new_servers_cpu: Ticks(sample.new_servers.values().copied().sum()),
-            shared_servers_cpu: Ticks(sample.shared_servers.values().copied().sum()),
-            build_client_in_job: sample.build_client,
-        });
+        // The sample just taken leaves the share it found, so this is `Some`; 100 is the watch's answer while nothing has
+        // been counted.
+        let figures = (self.watch.adjusted_seconds(), self.watch.last_free_percent().unwrap_or(100));
+        self.history.push(sample_facts(sample, figures, (log_bytes, err_bytes), wsl_vm));
     }
 
     /// Moves the build servers this sample classified ([`Prioritizer`]): the other gates' guard is read at most once,
@@ -467,18 +463,25 @@ impl<'a> Watcher<'a> {
     }
 
     /// The live descendants of the job's members and of the command that are not members themselves, breadth first,
-    /// read up to the block's cap, with the number the cap or the budget left unread.
+    /// then each process outside the job the samples recorded that `tree` still lists as itself, with its descendants,
+    /// as the kill ends them though the process that started it has ended; read up to the block's cap, with the number
+    /// the cap or the budget left unread.
     fn outside_facts(&self, tree: &ProcessTree, ids: &[u32], started: Instant) -> (Vec<ProcessFacts>, usize) {
-        let members: HashSet<u32> = ids.iter().copied().collect();
-        let mut seen = members.clone();
+        let children = tree.children();
+        let mut seen: HashSet<u32> = ids.iter().copied().collect();
         let mut found: Vec<&ProcessInfo> = Vec::new();
         let roots = ids.iter().copied().chain(std::iter::once(self.running.pid()));
         for root in roots {
             found.extend(
-                tree.descendants(root)
+                children
+                    .descendants(root)
                     .into_iter()
                     .filter(|info| seen.insert(info.pid) && self.after_start(info)),
             );
+        }
+        for recorded in self.recorded.borrow().processes(tree) {
+            let under = std::iter::once(recorded).chain(children.descendants(recorded.pid));
+            found.extend(under.filter(|info| seen.insert(info.pid) && self.after_start(info)));
         }
         let mut facts = Vec::new();
         for (index, info) in found.iter().enumerate() {
@@ -554,10 +557,21 @@ impl<'a> Watcher<'a> {
         } = found;
         self.classified = servers;
         let tree = ProcessTree::new(processes);
-        let away = escaped::outside_the_job(before, &after, looked, &tree, |process| {
-            self.servers.spares(process, proc_table::command_line_of)
-        });
-        let escaped = escaped::cpu_of(&away, gate_win32::process_times);
+        let look = Look {
+            before,
+            after,
+            since: looked,
+            tree: &tree,
+        };
+        let (escaped, escaped_client) = outside_the_job(
+            &mut self.recorded.borrow_mut(),
+            &self.servers,
+            look,
+            gate_win32::process_times,
+            proc_table::command_line_of,
+        );
+        // An escaped build client hands its compile to the build servers as one in the job does.
+        let build_client = build_client || escaped_client;
         let (vm, line) = self.vm.sample();
         if let Some(line) = line {
             console.err(&line);
@@ -585,6 +599,47 @@ impl<'a> Watcher<'a> {
             err_bytes,
             vm_failed: vm.is_err(),
         })
+    }
+}
+
+/// What one sample finds outside the job at `look` and records in `recorded` ([`Recorded::record`]), each process
+/// `servers` spares left out with everything under it: the CPU of each recorded process as `times` reads it, and
+/// whether one is a build client ([`Servers::holds_client`]). The walk and the build client's judgement take the same
+/// command line of a process, `read` at most once in the sample.
+fn outside_the_job(
+    recorded: &mut Recorded,
+    servers: &Servers,
+    look: Look<'_>,
+    times: impl Fn(u32) -> io::Result<Option<ProcessTimes>>,
+    read: impl Fn(u32) -> Option<String>,
+) -> (BTreeMap<(u32, u64), u64>, bool) {
+    let tree = look.tree;
+    let lines: RefCell<HashMap<u32, Option<String>>> = RefCell::new(HashMap::new());
+    // The snapshot lists one process for each pid, so within the sample a pid names one process and its start.
+    let line = |pid: u32| lines.borrow_mut().entry(pid).or_insert_with(|| read(pid)).clone();
+    recorded.record(look, |process| servers.spares(process, line));
+    let cpu = recorded.cpu(times);
+    let client = servers.holds_client(&recorded.processes(tree), line);
+    (cpu, client)
+}
+
+/// The facts the diagnostics block keeps of `sample`: its own figures, the watch's load-adjusted seconds and the free
+/// share it found (`figures`), the sizes of the log and its `.err` file, and the WSL VM's CPU.
+fn sample_facts(sample: &Sample, figures: (f64, u32), sizes: (u64, u64), wsl_vm: WslVm) -> SampleFacts {
+    let ((adjusted_seconds, free_percent), (log_bytes, err_bytes)) = (figures, sizes);
+    SampleFacts {
+        wall_seconds: sample.at.as_secs_f64(),
+        adjusted_seconds,
+        free_percent,
+        log_bytes,
+        err_bytes,
+        job_cpu: sample.job_cpu,
+        wsl_vm,
+        processes: u32::try_from(sample.pids.len()).unwrap_or(u32::MAX),
+        new_servers_cpu: Ticks(sample.new_servers.values().copied().sum()),
+        shared_servers_cpu: Ticks(sample.shared_servers.values().copied().sum()),
+        escaped_cpu: Ticks(sample.escaped.values().copied().sum()),
+        build_client_in_job: sample.build_client,
     }
 }
 
@@ -742,7 +797,73 @@ mod tests {
     use gate_watchdog::wsl_unavailable_line;
     use gate_win32::ProcessTimes;
 
-    use super::{ACCESS_DENIED, VmReader, config, machine, members, server_cpu};
+    use super::{ACCESS_DENIED, VmReader, config, machine, members, outside_the_job, sample_facts, server_cpu};
+    use crate::escaped::{Look, Recorded};
+    use crate::servers::Servers;
+
+    /// The test moment `second` seconds into the run.
+    fn at(second: i64) -> jiff::Timestamp {
+        jiff::Timestamp::from_second(1_790_000_000 + second).expect("a test moment is a timestamp")
+    }
+
+    #[test]
+    fn an_escaped_build_client_makes_the_sample_hold_one_on_a_single_read_of_its_line() {
+        // Member 1 started a dotnet build (2) outside the job.
+        let process = |pid: u32, parent_pid: u32, name: &str| proc_table::ProcessInfo {
+            pid,
+            parent_pid,
+            name: name.to_owned(),
+            command_line: None,
+            created: Some(at(i64::from(pid))),
+        };
+        let tree = proc_table::ProcessTree::new(vec![process(1, 0, "cmd.exe"), process(2, 1, "dotnet.exe")]);
+        let reads = std::cell::Cell::new(0);
+        let read = |pid: u32| {
+            reads.set(reads.get() + 1);
+            (pid == 2).then(|| "dotnet build".to_owned())
+        };
+        let times = |pid: u32| -> io::Result<Option<ProcessTimes>> {
+            let created = at(i64::from(pid)).as_microsecond() * 10 + 116_444_736_000_000_000;
+            Ok(Some(ProcessTimes {
+                created: u64::try_from(created).expect("a test moment is after 1601"),
+                cpu: 1_000,
+            }))
+        };
+        let look = Look {
+            before: vec![1],
+            after: vec![1],
+            since: at(0),
+            tree: &tree,
+        };
+
+        let (cpu, client) = outside_the_job(&mut Recorded::default(), &Servers::new(None), look, times, read);
+
+        assert!(client, "the escaped dotnet builds, so the job holds a build client");
+        assert_eq!(cpu.values().copied().collect::<Vec<_>>(), [1_000], "its CPU is counted");
+        assert_eq!(reads.get(), 1, "the walk and the build client's judgement take one read of its line");
+    }
+
+    #[test]
+    fn a_sample_s_escaped_cpu_reaches_its_diagnostics_facts() {
+        let sample = gate_watchdog::Sample {
+            began: std::time::Duration::from_secs(9),
+            at: std::time::Duration::from_secs(10),
+            system: gate_watchdog::SystemTimes { idle: 0, kernel: 0, user: 0 },
+            job_cpu: gate_watchdog::Ticks(1),
+            output_size: 0,
+            pids: BTreeSet::from([1]),
+            paused: false,
+            new_servers: std::collections::BTreeMap::new(),
+            shared_servers: std::collections::BTreeMap::new(),
+            build_client: false,
+            escaped: std::collections::BTreeMap::from([((2, 10), 15_000_000), ((3, 20), 10_000_000)]),
+            vm_cpu: None,
+        };
+
+        let facts = sample_facts(&sample, (4.0, 50), (0, 0), gate_watchdog::WslVm::NotWatched);
+
+        assert_eq!(facts.escaped_cpu, gate_watchdog::Ticks(25_000_000), "both escapees' CPU");
+    }
 
     #[test]
     fn an_end_read_skips_a_server_that_exited_or_cannot_be_read() {

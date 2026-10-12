@@ -230,16 +230,36 @@ impl Servers {
     /// one judgement holds for the process's life and its PEB is not read again; `read` reads the line of a process no
     /// sample read one for.
     pub(crate) fn spares(&self, process: &ProcessInfo, read: impl FnOnce(u32) -> Option<String>) -> bool {
-        // The snapshot gives the start in whole microseconds, the key in 100 ns ticks.
-        let known = process.created.and_then(|started| {
-            self.command_lines
-                .range((process.pid, 0)..=(process.pid, u64::MAX))
-                .find(|((_, created), _)| i64::try_from(*created).ok().and_then(filetime_to_timestamp) == Some(started))
-        });
+        let known = self.known_line(process);
         escaped::spared(process, self.test_image.as_deref(), |pid| match known {
-            Some((_, line)) => line.clone(),
+            Some(line) => line.clone(),
             None => read(pid),
         })
+    }
+
+    /// Whether any of `escaped`, the processes outside the job under its members a sample recorded, is a build client,
+    /// as a job member is one ([`is_build_client`]): `MSBuild.exe` by its name alone, and a `dotnet.exe` unless its
+    /// command line names `--no-build`, on the line a sample of this watch read for its pid and start, else the one
+    /// `read` reads; a line that cannot be read is the empty string the classifier takes, as for a member.
+    pub(crate) fn holds_client(&self, escaped: &[&ProcessInfo], read: impl Fn(u32) -> Option<String>) -> bool {
+        escaped.iter().any(|process| {
+            let line = if process.name.eq_ignore_ascii_case(DOTNET) {
+                self.known_line(process).cloned().unwrap_or_else(|| read(process.pid)).unwrap_or_default()
+            } else {
+                String::new()
+            };
+            is_build_client(&process.name, &line)
+        })
+    }
+
+    /// The command line a sample of this watch read for `process`'s pid and start, `None` when none did.
+    fn known_line(&self, process: &ProcessInfo) -> Option<&Option<String>> {
+        let started = process.created?;
+        // The snapshot gives the start in whole microseconds, the key in 100 ns ticks.
+        self.command_lines
+            .range((process.pid, 0)..=(process.pid, u64::MAX))
+            .find(|((_, created), _)| i64::try_from(*created).ok().and_then(filetime_to_timestamp) == Some(started))
+            .map(|(_, line)| line)
     }
 
     /// The command line of the process behind `key`, read now and kept for later samples unless it was read before; an
@@ -292,6 +312,37 @@ mod tests {
     /// are held.
     fn ticks(seconds: i64) -> i64 {
         seconds * 10_000_000 + 116_444_736_000_000_000
+    }
+
+    #[test]
+    fn an_escaped_build_client_holds_the_servers_as_one_in_the_job_does() {
+        let servers = Servers::new(None);
+        let escaped = |name: &str, pid: u32| ProcessInfo {
+            pid,
+            parent_pid: 1,
+            name: name.to_owned(),
+            command_line: None,
+            created: None,
+        };
+        let line = |pid: u32| match pid {
+            2 => Some("dotnet build".to_owned()),
+            3 => Some("dotnet test --no-build".to_owned()),
+            _ => None,
+        };
+
+        assert!(servers.holds_client(&[&escaped("dotnet.exe", 2)], line), "a dotnet that builds");
+        assert!(
+            servers.holds_client(&[&escaped("pwsh.exe", 4), &escaped("MSBuild.exe", 5)], line),
+            "MSBuild by its name alone"
+        );
+        assert!(
+            servers.holds_client(&[&escaped("dotnet.exe", 6)], line),
+            "a dotnet whose line cannot be read"
+        );
+        assert!(
+            !servers.holds_client(&[&escaped("dotnet.exe", 3), &escaped("pwsh.exe", 4)], line),
+            "a dotnet with --no-build, and no build tool, hold none"
+        );
     }
 
     /// The `since` of a command that started `seconds` after the epoch.

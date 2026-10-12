@@ -32,14 +32,14 @@ Suite = `crates/gate/tests/suite/` (binary `suite`, needs `--all-features`; test
 | nesting.rs | `nesting` (marker parse, liveness, covered/refused/own), `critical` (refusal under marker), `pause`, `slots` | no, but run.rs calls it on every run (`admitted`, run.rs:154): nesting, critical, pause, slots, journal |
 | pause.rs | `pause` (marker rewritten each pass), `stall`/`ceiling` (paused time via `watch.rs` PauseReader), `nesting` | no: pause, nesting, stall, ceiling, cores |
 | journal.rs | `journal` (v1 lines, verdict, quoted command, rollover), plus any case asserting a journal line: `slots`, `critical`, `nesting`, `cores`, `routing`, `interrupt`, `cutover`?, `stall` (load-adjusted s), `bridge` | CENTRAL-ish (writes every run; run `journal`, `cores`, `nesting`, `slots`, `critical`, `routing`, `stall`, `interrupt`, `launch`, `hold`) |
-| watch.rs | `stall`, `ceiling` (`--test-sampler-fail`, backstop), `cores`, `diagnostics`, `build_servers`, `priority`, `pause`, `interrupt` (`--test-interrupt-after-samples`), `hold`, `launch` (every command is watched) | CENTRAL (every launched command is watched) |
+| watch.rs | `stall`, `ceiling` (`--test-sampler-fail`, backstop), `cores`, `diagnostics`, `build_servers`, `priority`, `pause`, `interrupt` (`--test-interrupt-after-samples`), `hold`, `launch` (every command is watched); unit tests inside (an escaped build client, the sample's `escaped cpu`) | CENTRAL (every launched command is watched) |
 | servers.rs | `build_servers` (client in job, server outside), `priority` (`--test-server-image`, `--test-servers-under`), `ceiling`, `diagnostics`, `launch`/`cli`/`install` pass `--test-servers-under` only to confine the scan | no: build_servers, priority, diagnostics, ceiling, stall, pause (sampling) |
 | priority.rs | `priority` (lower/raise servers, OtherGates guard), `critical` (raise to High), `build_servers` | no: priority, critical |
 | cutover.rs | `cutover` (`gate cutover`, flag, counts copy, drain, Ctrl+C, resume), `launcher` (hand-over after flag) | no: cutover, launcher |
 | push.rs | `push` (`gate push`, `--test-push-ssh`, `--test-push-bound-ms`, fake-ssh) | no: push |
 | stop_tree.rs | `stop_tree` (`gate stop-tree`) | no: stop_tree |
 | stopping.rs | `stop_tree` (the checked open `gate stop-tree` shares), `stall` (the kill's escaped processes) | no: stop_tree, stall |
-| escaped.rs | `stall` (`a_stall_kill_ends_a_packaged_app_the_command_started`, machine-dependent; the escapee cases that start it with `fake-tool spawn-away` under `--test-job-breakaway`; the unit tests inside), `cores` (`a_command_whose_child_left_its_job_counts_that_child_s_cores`), `interrupt` and `ceiling` (the other kills run it too) | no: stall, cores, interrupt, ceiling |
+| escaped.rs | `stall` (`a_stall_kill_ends_a_packaged_app_the_command_started`, machine-dependent; `a_stall_kill_ends_a_child_outside_the_job_whose_launcher_has_ended`, machine-alone `#[ignore]`, with `ceiling::a_ceiling_kill_ends_a_child_outside_the_job_whose_launcher_has_ended` and `interrupt::a_ctrl_c_ends_a_child_outside_the_job_whose_launcher_has_ended`; the escapee cases that start it with `fake-tool spawn-away` under `--test-job-breakaway`; the unit tests inside), `cores` (`a_command_whose_child_left_its_job_counts_that_child_s_cores`), `interrupt` and `ceiling` (the other kills run it too) | no: stall, cores, interrupt, ceiling |
 | burn.rs | `burn` (`gate burn`: start line, status, parent watch), `cli` (usage and refusals) | no: burn, cli |
 | request_json.rs | `request`, `compat`, `cutover` (`--test-print-request`), `launcher`, `harness`, `support` | no: request, compat, cutover, launcher, harness |
 | route.rs | `routing` (decisions, `--test-git`, remote.json), `remote_client`, `bridge`, `request` | no: routing, remote_client, bridge |
@@ -83,7 +83,7 @@ Suite = `crates/gate/tests/suite/` (binary `suite`, needs `--all-features`; test
 | gate-win32 file.rs | `syncback_quarantine`, `remote_client` (`move_no_replace` moves a sync-back's fetched objects) | win32 `file` | no |
 | gate-win32 device.rs | `routing` (subst drives in route facts) | - | no |
 | gate-win32 times.rs / memory.rs | `stall`, `ceiling`, `cores`, `pause` (samples) | - | no |
-| proc-table | `stop_tree`, `stall` (`parent_pid_of`) (imports `Win32ProcessTable`), `cutover` (`command_line_of`), `diagnostics`, `priority` (via servers/OtherGates) | proc-table unit | no |
+| proc-table | `stop_tree`, `stall` (`parent_pid_of`) (imports `Win32ProcessTable`), `cutover` (`command_line_of`), `diagnostics`, `priority` (via servers/OtherGates), `stall`/`cores` (`ProcessTree::children` through the escaped walk) | proc-table unit | no |
 | tools/gate.ps1 | `launcher` (runs the checked-in launcher), `cutover` (hand-over), `checkout` (`repo_file`) | - | no |
 | tools/install.ps1 | `install`, `checkout` | - | no |
 | tools/remote-bridge.ps1 | `bridge`, `routing` (via `--test-remote-script`), `install` (also installed) | - | no |

@@ -3,11 +3,12 @@
 //! passes after its sampler failed says its load-adjusted time is unknown.
 
 use std::fs;
+use std::time::Duration;
 
 use regex::Regex;
 use serde_json::Value;
 
-use crate::support::{Case, FAKE_TOOL, assert_in_order, release, run_words, shown};
+use crate::support::{Case, Escapee, FAKE_TOOL, assert_in_order, release, run_words, shown};
 
 /// The line the gate says once `--test-sampler-fail` has failed its first sample.
 const SAMPLER_FAILED: &str = "gate: sampler failed: --test-sampler-fail makes every sample fail (test seam only); watching by wall time only";
@@ -37,6 +38,34 @@ fn assert_killed_as(case: &Case, verdict: &str) {
         (&release["verdict"], &release["status"]),
         (&Value::from(verdict), &Value::from(124)),
         "{release}"
+    );
+}
+
+#[test]
+#[ignore = "needs the machine alone: run with -Slot critical and --ignored"]
+fn a_ceiling_kill_ends_a_child_outside_the_job_whose_launcher_has_ended() {
+    let case = Case::new("a_ceiling_kill_ends_a_child_outside_the_job_whose_launcher_has_ended");
+    // The launcher lives a second, so a sample sees the escapee under it; then nothing in the job is its parent, and
+    // the command idles until the 3 s ceiling, or the backstop past it.
+    let escapee = Escapee::new(&case);
+    let command = escapee.launched_command();
+    let mut words = run_words("out.log", &["--test-sample-ms", "100", "--test-job-breakaway"], &[]);
+    words[4] = "3";
+    words.extend(command.iter().map(String::as_str));
+
+    let mut running = case.start(&words);
+    let (pid, away) = escapee.open(|| !running.is_running());
+    let launcher = escapee.launcher_ended();
+    let outcome = running.finish();
+
+    assert_eq!(outcome.code, Some(124), "{outcome:?}");
+    assert!(
+        matches!(away.wait(Duration::ZERO), Ok(true)),
+        "the escapee {pid}, whose launcher had ended, was ended by the kill: {outcome:?}"
+    );
+    assert!(
+        matches!((launcher.exited(), away.exited()), (Ok(left), Ok(ended)) if left < ended),
+        "the launcher had ended before the kill ended the escapee {pid}: {outcome:?}"
     );
 }
 

@@ -112,18 +112,39 @@ impl ProcessTree {
     /// unknown is left out with everything under it. Empty when the snapshot has no `pid` or its start time is unknown.
     #[must_use]
     pub fn descendants(&self, pid: u32) -> Vec<&ProcessInfo> {
-        let mut children: HashMap<u32, Vec<&ProcessInfo>> = HashMap::new();
+        self.children().descendants(pid)
+    }
+
+    /// Each process's children, indexed once for walks below many processes of this snapshot.
+    #[must_use]
+    pub fn children(&self) -> Children<'_> {
+        let mut by_parent: HashMap<u32, Vec<&ProcessInfo>> = HashMap::new();
         for process in self.iter().filter(|process| process.pid != process.parent_pid) {
-            children.entry(process.parent_pid).or_default().push(process);
+            by_parent.entry(process.parent_pid).or_default().push(process);
         }
+        Children { tree: self, by_parent }
+    }
+}
+
+/// The children of each process of a [`ProcessTree`], by its pid, in snapshot order.
+#[derive(Clone, Debug)]
+pub struct Children<'a> {
+    tree: &'a ProcessTree,
+    by_parent: HashMap<u32, Vec<&'a ProcessInfo>>,
+}
+
+impl<'a> Children<'a> {
+    /// The processes under `pid`, as [`ProcessTree::descendants`] gives them.
+    #[must_use]
+    pub fn descendants(&self, pid: u32) -> Vec<&'a ProcessInfo> {
         let mut visited = HashSet::from([pid]);
         let mut found = Vec::new();
-        let mut queue: VecDeque<&ProcessInfo> = self.get(pid).into_iter().collect();
+        let mut queue: VecDeque<&ProcessInfo> = self.tree.get(pid).into_iter().collect();
         while let Some(parent) = queue.pop_front() {
             let Some(parent_created) = parent.created else {
                 continue;
             };
-            for &child in children.get(&parent.pid).into_iter().flatten() {
+            for &child in self.by_parent.get(&parent.pid).into_iter().flatten() {
                 if child.created.is_some_and(|created| created >= parent_created) && visited.insert(child.pid) {
                     found.push(child);
                     queue.push_back(child);
