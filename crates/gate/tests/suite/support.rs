@@ -1,5 +1,6 @@
 //! The harness: a [`Case`] with its own state root, the programs under test, and order-only assertions.
 
+use std::ffi::{OsStr, OsString};
 use std::io::{self, Read, Write};
 use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
@@ -59,6 +60,12 @@ const HANG_GUARD: Duration = Duration::from_secs(600);
 const READER_GRACE: Duration = Duration::from_secs(60);
 /// How often a wait looks again.
 const LOOK_AGAIN: Duration = Duration::from_millis(10);
+/// How long the `gate stop-tree` a drop runs is given to end before the drop kills that one too: a hang guard, never a
+/// bound a case asserts on, so a stop-tree that cannot end never holds a case for the whole run.
+const STOP_TREE_GUARD: Duration = Duration::from_secs(60);
+/// The status `gate stop-tree` ends with when no live process has the pid: by the time it looked, the program had gone,
+/// which a drop takes as nothing left to stop rather than a failure to report.
+const STOP_TREE_GONE: i32 = 2;
 /// The fallback poll of every gate a case starts, so a wake missed costs a case 20 ms, not 2 s.
 pub const POLL: [&str; 2] = ["--test-poll-ms", "20"];
 /// .NET ticks (100 ns since 0001-01-01) at the Unix epoch.
@@ -224,6 +231,7 @@ pub fn start_with_stdin(mut command: Command) -> (Running, ChildStdin) {
 /// Starts `command`, its stdin as the caller set it, both output streams piped and gathered as they arrive.
 fn gathered(mut command: Command) -> Running {
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let stop_tree = stop_tree_of(&command);
     let mut child = command.spawn().expect("the program starts");
     let (stdout, stdout_reader) = gather(child.stdout.take().expect("stdout is piped"));
     let (stderr, stderr_reader) = gather(child.stderr.take().expect("stderr is piped"));
@@ -232,6 +240,7 @@ fn gathered(mut command: Command) -> Running {
         stdout,
         stderr,
         readers: vec![stdout_reader, stderr_reader],
+        stop_tree,
     }
 }
 
@@ -246,6 +255,7 @@ pub enum Closed {
 /// once, so the program's next write to that stream fails; the other stream is gathered as [`start`] gathers it.
 pub fn start_with_closed(closed: Closed, mut command: Command) -> Running {
     command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let stop_tree = stop_tree_of(&command);
     let mut child = command.spawn().expect("the program starts");
     let out_pipe = child.stdout.take().expect("stdout is piped");
     let err_pipe = child.stderr.take().expect("stderr is piped");
@@ -266,6 +276,7 @@ pub fn start_with_closed(closed: Closed, mut command: Command) -> Running {
         stdout,
         stderr,
         readers: vec![reader],
+        stop_tree,
     }
 }
 
@@ -278,6 +289,9 @@ pub struct Running {
     stdout: Buffer,
     stderr: Buffer,
     readers: Vec<JoinHandle<()>>,
+    /// The `gate stop-tree` the drop runs for this program while it still runs, so the command the program left behind
+    /// goes with it; its words and environment are ready but for the pid it is given then.
+    stop_tree: Command,
 }
 
 impl Running {
@@ -369,15 +383,94 @@ impl Running {
 }
 
 impl Drop for Running {
-    /// Kills a program its case left running, as when the case failed before finishing it. A test declares its
-    /// `Running` after its [`Case`], so the locals' reverse drop order ends the program before the case root goes.
+    /// Kills a program its case left running, as when the case failed before finishing it, and the tree under it: a
+    /// gate under test leaves its command running by design, so killing the gate's pid alone would leave that command
+    /// holding the files of the build. A test declares its `Running` after its [`Case`], so the locals' reverse drop
+    /// order ends the program before the case root goes. A drop never panics: a failure is reported on stderr and the
+    /// pid is killed as before.
     fn drop(&mut self) {
         if !matches!(self.child.try_wait(), Ok(None)) {
+            return;
+        }
+        stop_tree(&mut self.stop_tree, self.child.id());
+        if matches!(self.child.try_wait(), Ok(Some(_))) {
             return;
         }
         if let Err(error) = self.child.kill().and_then(|()| self.child.wait().map(drop)) {
             // A panic in drop would abort the run; the program is left for the machine to end.
             let _ = writeln!(io::stderr(), "could not kill a case's program {}: {error}", self.child.id());
+        }
+    }
+}
+
+/// The `gate stop-tree` command for a program started with `command`: this suite's gate, the state root `command`'s
+/// words name, and the environment it was given, so the stop reads the same root the program's own gate does. Only the
+/// pid, the one word left, is added when the command runs.
+fn stop_tree_of(command: &Command) -> Command {
+    let mut stop = Command::new(GATE);
+    stop.arg("stop-tree");
+    if let Some(root) = state_dir_of(command) {
+        stop.arg("--state-dir").arg(root);
+    }
+    for (name, value) in command.get_envs() {
+        match value {
+            Some(value) => {
+                stop.env(name, value);
+            }
+            None => {
+                stop.env_remove(name);
+            }
+        }
+    }
+    stop.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
+    stop
+}
+
+/// The root `command`'s words name after `--state-dir`, as [`Case::prepare`] places it, or none when they name none.
+fn state_dir_of(command: &Command) -> Option<OsString> {
+    let words: Vec<&OsStr> = command.get_args().collect();
+    let at = words.iter().position(|word| *word == OsStr::new("--state-dir"))?;
+    words.get(at + 1).copied().map(OsStr::to_os_string)
+}
+
+/// Ends the tree of the program `pid`, which still runs, by running the `stop-tree` command prepared for that program,
+/// so the gate's command and everything under it go with the gate, and waits for that stop up to [`STOP_TREE_GUARD`],
+/// killing it past that. Every failure is reported on stderr and none panics, so the drop goes on to kill the pid.
+fn stop_tree(command: &mut Command, pid: u32) {
+    let mut stop = match command.arg(pid.to_string()).spawn() {
+        Ok(stop) => stop,
+        Err(error) => {
+            let _ = writeln!(io::stderr(), "could not run gate stop-tree for {pid}: {error}");
+            return;
+        }
+    };
+    let deadline = Instant::now() + STOP_TREE_GUARD;
+    let status = loop {
+        match stop.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if Instant::now() < deadline => thread::sleep(LOOK_AGAIN),
+            Ok(None) => {
+                let _ = stop.kill();
+                let _ = stop.wait();
+                break None;
+            }
+            Err(error) => {
+                let _ = writeln!(io::stderr(), "could not wait for the gate stop-tree of {pid}: {error}");
+                return;
+            }
+        }
+    };
+    let mut said = String::new();
+    if let Some(mut stderr) = stop.stderr.take() {
+        let _ = stderr.read_to_string(&mut said);
+    }
+    match status {
+        Some(status) if status.success() || status.code() == Some(STOP_TREE_GONE) => {}
+        Some(status) => {
+            let _ = writeln!(io::stderr(), "gate stop-tree of {pid} ended with {status}: {}", said.trim());
+        }
+        None => {
+            let _ = writeln!(io::stderr(), "gate stop-tree of {pid} did not end within {} s", STOP_TREE_GUARD.as_secs());
         }
     }
 }

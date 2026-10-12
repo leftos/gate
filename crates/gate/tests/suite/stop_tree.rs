@@ -1,5 +1,5 @@
 //! `gate stop-tree`: a gate and its command's processes stopped, a process only the gate's job still reaches, a tree
-//! with no gate in it, and a pid no live process has.
+//! with no gate in it, a pid no live process has, and a case's own drop ending the command its gate left.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -9,7 +9,7 @@ use jiff::Timestamp;
 use proc_table::{ProcessTable as _, ProcessTree, Win32ProcessTable};
 use regex::Regex;
 
-use crate::support::{Case, FAKE_TOOL, USAGE, run_words, shown, start, wait_until, wait_until_closed};
+use crate::support::{Case, FAKE_TOOL, USAGE, run_words, said_pid, shown, start, wait_until, wait_until_closed};
 
 /// Writes the go file when dropped, so a helper a failing case leaves behind ends without waiting out its limit. A
 /// case declares it after its [`Case`] and before its running programs, so it lets them go before the folder goes.
@@ -37,6 +37,19 @@ fn spawned_pid(log: &Path, after: &str) -> u32 {
         pid.is_some()
     });
     pid.expect("checked by the wait")
+}
+
+/// The pid of the case's command, from the `pid <pid>` line its own `pid` step printed, once the log holds it.
+fn command_pid(log: &Path) -> u32 {
+    let text = || {
+        fs::read(log)
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+            .unwrap_or_default()
+    };
+    wait_until(&format!("{} naming its command's pid", log.display()), || {
+        text().lines().any(|line| line.starts_with("pid "))
+    });
+    said_pid(&text(), "pid ")
 }
 
 /// A running process: its pid and its start, so that a later process given the same pid is not taken for it.
@@ -158,6 +171,22 @@ fn stop_tree_of_a_tree_without_a_gate() {
     for process in &started_tree {
         wait_gone(process);
     }
+}
+
+#[test]
+fn a_dropped_case_ends_its_gates_command() {
+    let case = Case::new("a_dropped_case_ends_its_gates_command");
+    let stop = case.folder().join("stop");
+    let _let_go = LetGo(stop.clone());
+    let stop = shown(&stop);
+    let log = case.folder().join("out.log");
+    let gate = case.start(&run_words("out.log", &[], &[FAKE_TOOL, "pid", "chatter", &stop]));
+    let command = started(command_pid(&log));
+
+    drop(gate);
+
+    wait_gone(&command);
+    wait_until_closed(&log);
 }
 
 #[test]
