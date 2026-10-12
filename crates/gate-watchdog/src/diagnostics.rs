@@ -103,8 +103,8 @@ pub struct SampleFacts {
 /// Everything the gathering found, uncapped: [`lines`] sorts the job by pid and keeps to the block's limits itself.
 ///
 /// A gathering that ran out of time says what it did not read: the processes it found but left unread are counted on
-/// the line after the process lines, and servers it never reached print no server line at all. The gatherer reads the
-/// job's processes in pid order, so the ones it read are the lowest pids.
+/// the line after the process lines, and the build servers the last sample counted are listed all the same. The
+/// gatherer reads the job's processes in pid order, so the ones it read are the lowest pids.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Report {
     /// The processes in the job that were read.
@@ -116,8 +116,8 @@ pub struct Report {
     pub outside: Vec<ProcessFacts>,
     /// The processes outside the job found but not read before the time ran out.
     pub outside_unread: usize,
-    /// The build servers the last sample counted that were read, or `None` when the time ran out before the servers.
-    pub servers: Option<Vec<ServerFacts>>,
+    /// The build servers the last sample counted, listed in the block whether or not the gathering ran out of time.
+    pub servers: Vec<ServerFacts>,
     /// The samples, oldest first.
     pub samples: Vec<SampleFacts>,
     /// The milliseconds after which the gathering ran out of time, or `None` when it finished.
@@ -155,9 +155,7 @@ pub fn lines(report: &Report) -> Vec<String> {
     job.sort_by_key(|process| process.pid);
     push_processes(&mut lines, "job", job.into_iter(), report.job_unread, JOB_LINES);
     push_processes(&mut lines, "outside job", report.outside.iter(), report.outside_unread, OUTSIDE_LINES);
-    if let Some(servers) = &report.servers {
-        push_servers(&mut lines, servers);
-    }
+    push_servers(&mut lines, &report.servers);
     push_samples(&mut lines, &report.samples);
     if let Some(ms) = report.cut_at_ms {
         lines.push(format!("gate:   ... diagnostics cut at {ms} ms"));
@@ -381,7 +379,7 @@ mod tests {
             job_unread: 0,
             outside: Vec::new(),
             outside_unread: 0,
-            servers: Some(Vec::new()),
+            servers: Vec::new(),
             samples: Vec::new(),
             cut_at_ms: None,
         }
@@ -392,7 +390,7 @@ mod tests {
         let mut report = empty();
         report.job = vec![process(1)];
         report.outside = vec![process(2)];
-        report.servers = Some(vec![
+        report.servers = vec![
             ServerFacts {
                 pid: 300,
                 name: "VBCSCompiler.exe".to_owned(),
@@ -405,7 +403,7 @@ mod tests {
                 cpu: Some(cpu(500)),
                 started_after_command: false,
             },
-        ]);
+        ];
         report.samples = vec![sample(12.34)];
         report.cut_at_ms = Some(2003);
         assert_eq!(
@@ -476,14 +474,21 @@ mod tests {
     }
 
     #[test]
-    fn servers_never_reached_print_no_server_line() {
+    fn a_cut_report_still_prints_its_server_lines() {
         let mut report = empty();
-        report.servers = None;
+        report.servers = vec![ServerFacts {
+            pid: 300,
+            name: "VBCSCompiler.exe".to_owned(),
+            cpu: Some(cpu(2000)),
+            started_after_command: true,
+        }];
+        report.samples = vec![sample(12.34)];
         report.cut_at_ms = Some(2001);
-        assert_eq!(
-            lines(&report),
-            ["gate: diagnostics", "gate:   samples: none", "gate:   ... diagnostics cut at 2001 ms"]
-        );
+        let lines = lines(&report);
+        assert_eq!(lines[0], "gate: diagnostics");
+        assert_eq!(lines[1], "gate:   build server 300 VBCSCompiler.exe: cpu 2 s (started after the command)");
+        assert!(lines[2].starts_with("gate:   sample at 12.3 s "), "got {}", lines[2]);
+        assert_eq!(lines[3], "gate:   ... diagnostics cut at 2001 ms");
     }
 
     #[test]
@@ -529,12 +534,12 @@ mod tests {
             working_set_bytes: None,
             command_line: None,
         }];
-        report.servers = Some(vec![ServerFacts {
+        report.servers = vec![ServerFacts {
             pid: 9,
             name: "(exited)".to_owned(),
             cpu: None,
             started_after_command: true,
-        }]);
+        }];
         let lines = lines(&report);
         assert_eq!(lines[1], "gate:   job 7 parent ? svchost.exe: cpu ?, working set ?: ?");
         assert_eq!(lines[2], "gate:   build server 9 (exited): cpu ? (started after the command)");

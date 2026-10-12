@@ -678,7 +678,7 @@ All kept, with each knob's default unchanged:
   - Up to six sample lines, `gate:   sample at <w> s (load-adjusted <a> s, free <p>%): log <n> B, err <n> B, job cpu <s> s, <n> processes, new servers cpu <s> s, shared servers cpu <s> s, build client in job: yes|no`, or `gate:   samples: none` when no sample was taken. `<w>` is the sample's `at` stamp.
 
     A `wsl` command's sample line also carries `wsl vm cpu <p>%` after the process count: the VM's CPU in percent of one core since the previous reading (`Watch::last_vm_percent`), `wsl vm cpu unavailable` when that sample's read failed, and 0% with no VM. Any other command shows nothing there.
-  - `gate:   ... diagnostics cut at <n> ms` when the 2000 ms gather budget ran out. A gathering that failed writes `gate: diagnostics` then `gate: diagnostics failed: <message>` in its place.
+  - `gate:   ... diagnostics cut at <n> ms` when the 2000 ms gather budget ran out. A cut block still lists the build servers: their facts are a lookup in the snapshot already taken, so only the job and outside process lines are left unread, and a starved gate on a busy PC keeps the server lines it needs most. A gathering that failed writes `gate: diagnostics` then `gate: diagnostics failed: <message>` in its place.
   - The working set comes from `gate_win32::working_set` (`None` for a gone or exited process). stderr gets one line, `gate: diagnostics written to <log>` (also in the log), after the terminated line; the block's lines are not on stderr.
 - A command still running 5 s after its job was terminated is reported: `gate: the command was still running 5 s after its job was terminated`. A job that cannot be terminated says `gate: could not terminate the command's job: <error>`. A killed run is not scanned for markers, and its release verdict is `stalled`, `timed-out` or `backstop` by the kill line that ended it.
 - What a sample reads: the job's CPU by accounting (exited members included), the job's pids created at or after the command's start (a pid that answers access denied is not a member), the log's and `.err`'s sizes, and the system times. A critical run counts as High priority for the free share, and a light gate's demand is `min(cores, light threads)`.
@@ -1259,6 +1259,8 @@ A Rust integration suite drives the built `gate.exe` through its CLI and reads o
   `--test-print-request`, on `run`, `stop-tree`, `cutover` and the compatibility form, prints the parsed request as one JSON line on stdout and exits 0, so the suite sees what a command line asked for; it is the one hidden switch the compatibility layer accepts.
 
   `--test-sampler-fail` (a switch) makes every sample fail with `--test-sampler-fail makes every sample fail (test seam only)`, so the run says `gate: sampler failed: ...; watching by wall time only` and only the backstop watches; `--test-print-request` shows it as `testSeams.samplerFail`, after `interruptQueued`.
+
+  `--test-diagnostics-budget-ms <n>` (whole milliseconds above 0) replaces the 2000 ms diagnostics gather budget, so a case can make every block it gets cut; `--test-print-request` does not show it.
 
   `--test-diagnostics-fail` (a switch) makes the diagnostics gathering of a kill fail, so the log carries `gate: diagnostics failed: <message>` in place of the block; `--test-print-request` shows it as `testSeams.diagnosticsFail`, after `samplerFail`.
 

@@ -70,7 +70,7 @@ Suite = `crates/gate/tests/suite/` (binary `suite`, needs `--all-features`; test
 | gate-watchdog share.rs / watch.rs | `stall`, `ceiling`, `cores`, `pause`, `diagnostics`, `interrupt`, `build_servers`, `priority` | unit | no (wide) |
 | gate-watchdog cores.rs | `cores`, `journal` (cores fields) | unit | no |
 | gate-watchdog servers.rs | `build_servers`, `priority`, `diagnostics`, `ceiling` | unit | no |
-| gate-watchdog diagnostics.rs | `diagnostics`, `stall`, `ceiling` | unit | no |
+| gate-watchdog diagnostics.rs | `diagnostics`, `stall`, `ceiling`, `build_servers` (`--test-diagnostics-budget-ms` cuts every block) | unit | no |
 | gate-watchdog heartbeat.rs | `boxside`, `boxside::outputs`, `remote_client`, `critical`/`slots`/`pause` only via `--test-heartbeat-ms` flag (the wait heartbeat is gate/src/wait.rs, not this) | unit | no |
 | gate-win32 job.rs / create.rs / launch.rs / lib.rs / mutex.rs | all (started command, job, slot mutexes): CENTRAL | `gate-win32` tests (launch, mutex, event, interrupt...) | CENTRAL |
 | gate-win32 piped.rs / console.rs | `boxside` (`--test-box-console`, `--test-box-park-launch`), `bridge`, `remote_client` | win32 `launch` | no |

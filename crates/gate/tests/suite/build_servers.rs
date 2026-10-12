@@ -266,8 +266,10 @@ fn a_stall_kill_lists_the_build_server_its_last_sample_counted() {
     let compiler = tool(&case, "VBCSCompiler.exe");
     // A 60 s stall window and no interrupt: the block lists the server the last sample classified, whether or not its
     // CPU rose, so a window that long keeps the case's meaning while a loaded machine starves the command and the
-    // server. The command sleeps past any case, so only the stall ends it.
-    let seams = seams_with_stall("60000");
+    // server. The command sleeps past any case, so only the stall ends it. A 1 ms diagnostics budget cuts every block
+    // the case gets, so the server line the block must hold cannot depend on the machine's load.
+    let mut seams = seams_with_stall("60000");
+    seams.extend(["--test-diagnostics-budget-ms", "1"].map(str::to_owned));
     let seams: Vec<&str> = seams.iter().map(String::as_str).collect();
     let log = case.folder().join("out.log");
     let chatter = shown(&chatter_path(&case));
@@ -289,6 +291,14 @@ fn a_stall_kill_lists_the_build_server_its_last_sample_counted() {
     assert_eq!(outcome.code, Some(124), "{outcome:?}");
     let text = fs::read_to_string(&log).expect("the log was written");
     let line = format!("gate:   build server {} VBCSCompiler.exe: cpu ", server.pid);
-    assert_in_order(&text, &["gate: diagnostics\n", &line, " (started after the command)\n"]);
+    assert_in_order(
+        &text,
+        &[
+            "gate: diagnostics\n",
+            &line,
+            " (started after the command)\n",
+            "gate:   ... diagnostics cut at ",
+        ],
+    );
     assert!(text.contains("gate: STALLED: "), "{outcome:?}");
 }

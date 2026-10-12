@@ -31,6 +31,8 @@ pub(crate) enum ValueOption {
     #[cfg(feature = "test-seams")]
     StallMs,
     #[cfg(feature = "test-seams")]
+    DiagnosticsBudgetMs,
+    #[cfg(feature = "test-seams")]
     InterruptAfterSamples,
     #[cfg(feature = "test-seams")]
     RemoteClient,
@@ -187,6 +189,10 @@ impl RunBuilder {
             ValueOption::PollMs => self.test_seams.poll_ms = Some(values::above_zero(spelled, value)?),
             #[cfg(feature = "test-seams")]
             ValueOption::StallMs => self.test_seams.stall_ms = Some(values::above_zero(spelled, value)?),
+            #[cfg(feature = "test-seams")]
+            ValueOption::DiagnosticsBudgetMs => {
+                self.test_seams.diagnostics_budget_ms = Some(values::above_zero(spelled, value)?);
+            }
             #[cfg(feature = "test-seams")]
             ValueOption::InterruptAfterSamples => self.test_seams.interrupt_after_samples = Some(values::above_zero(spelled, value)?),
             #[cfg(feature = "test-seams")]

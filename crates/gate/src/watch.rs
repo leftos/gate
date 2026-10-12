@@ -81,6 +81,9 @@ pub(crate) struct Watcher<'a> {
     sampler_fail: bool,
     /// Whether gathering a kill's diagnostics fails (`--test-diagnostics-fail`).
     diagnostics_fail: bool,
+    /// The milliseconds a gathering of the kill's diagnostics may take before it is cut
+    /// (`--test-diagnostics-budget-ms`), the gate's own budget unless the suite sets one.
+    diagnostics_budget_ms: u128,
     /// The samples taken so far, which `--test-interrupt-after-samples` counts.
     samples: u64,
     /// After how many samples the gate raises the interrupt itself (`--test-interrupt-after-samples`).
@@ -226,6 +229,7 @@ impl<'a> Watcher<'a> {
             sampler_works: true,
             sampler_fail: request.test_seams.sampler_fail,
             diagnostics_fail: request.test_seams.diagnostics_fail,
+            diagnostics_budget_ms: request.test_seams.diagnostics_budget_ms.map_or(DIAGNOSTICS_BUDGET_MS, u128::from),
             samples: 0,
             interrupt_after: request.test_seams.interrupt_after_samples,
             vm,
@@ -434,15 +438,15 @@ impl<'a> Watcher<'a> {
         // The snapshot can take a while: a process that joined the job meanwhile is a member of it like any other.
         let after = self.job.process_ids().map_err(|error| error.to_string())?;
         let ids: Vec<u32> = before.into_iter().chain(after).collect();
-        let (job, job_unread) = job_facts(&tree, &ids, started);
+        let (job, job_unread) = job_facts(&tree, &ids, started, self.diagnostics_budget_ms);
         let (outside, outside_unread) = self.outside_facts(&tree, &ids, started);
-        let cut = out_of_time(started);
+        let cut = out_of_time(started, self.diagnostics_budget_ms);
         Ok(Report {
             job,
             job_unread,
             outside,
             outside_unread,
-            servers: if cut { None } else { Some(self.server_facts(&tree)) },
+            servers: self.server_facts(&tree),
             samples: self.history.to_vec(),
             cut_at_ms: if cut { Some(cut_at(started)) } else { None },
         })
@@ -464,7 +468,7 @@ impl<'a> Watcher<'a> {
         }
         let mut facts = Vec::new();
         for (index, info) in found.iter().enumerate() {
-            if index >= OUTSIDE_LINES || out_of_time(started) {
+            if index >= OUTSIDE_LINES || out_of_time(started, self.diagnostics_budget_ms) {
                 return (facts, found.len() - index);
             }
             facts.push(process_facts(info.pid, info));
@@ -595,9 +599,9 @@ fn config(request: &RunRequest) -> Config {
     }
 }
 
-/// Whether the gathering that began at `started` has used up its budget.
-fn out_of_time(started: Instant) -> bool {
-    started.elapsed().as_millis() >= DIAGNOSTICS_BUDGET_MS
+/// Whether the gathering that began at `started` has used up its `budget_ms` milliseconds.
+fn out_of_time(started: Instant, budget_ms: u128) -> bool {
+    started.elapsed().as_millis() >= budget_ms
 }
 
 /// The milliseconds the gathering that began at `started` is cut at.
@@ -618,13 +622,13 @@ fn absolute(path: &Path) -> PathBuf {
 
 /// The job's processes of `ids` read in pid order, and the number the cap or the budget left unread: only the ones the
 /// snapshot still has, since a pid it no longer lists has no facts to show.
-fn job_facts(tree: &ProcessTree, ids: &[u32], started: Instant) -> (Vec<ProcessFacts>, usize) {
+fn job_facts(tree: &ProcessTree, ids: &[u32], started: Instant, budget_ms: u128) -> (Vec<ProcessFacts>, usize) {
     let mut sorted: Vec<u32> = ids.to_vec();
     sorted.sort_unstable();
     sorted.dedup();
     let mut facts = Vec::new();
     for (index, &pid) in sorted.iter().enumerate() {
-        if index >= JOB_LINES || out_of_time(started) {
+        if index >= JOB_LINES || out_of_time(started, budget_ms) {
             return (facts, sorted[index..].iter().filter(|&&pid| tree.get(pid).is_some()).count());
         }
         // A pid the snapshot no longer lists has exited since the job listed it, so it has no facts to show.

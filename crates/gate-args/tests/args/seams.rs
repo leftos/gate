@@ -112,6 +112,23 @@ fn seam_flags_parse_with_the_feature() {
 
 #[cfg(feature = "test-seams")]
 #[test]
+fn the_diagnostics_budget_seam_is_read_once_and_refuses_zero() {
+    use crate::support::run_request;
+
+    let words = with(&RUN, &["--test-diagnostics-budget-ms", "1", "--", "cmd"]);
+    assert_eq!(run_request(&refs(&words)).test_seams.diagnostics_budget_ms, Some(1));
+    assert_eq!(
+        problems(&refs(&with(&RUN, &["--test-diagnostics-budget-ms", "--", "cmd"]))),
+        ["gate: --test-diagnostics-budget-ms needs a value"]
+    );
+    assert_eq!(
+        problems(&refs(&with(&RUN, &["--test-diagnostics-budget-ms", "0", "--", "cmd"]))),
+        ["gate: --test-diagnostics-budget-ms must be a whole number above 0, got '0'"]
+    );
+}
+
+#[cfg(feature = "test-seams")]
+#[test]
 fn remote_seams_need_a_value_once() {
     assert_eq!(
         problems(&refs(&with(&RUN, &["--test-remote-client", "--", "cmd"]))),
@@ -880,6 +897,7 @@ fn seam_flags_are_unknown_without_the_feature() {
         "--test-remote-timeout-ms",
         "--test-local-sdks",
         "--test-server-image",
+        "--test-diagnostics-budget-ms",
     ] {
         assert_eq!(
             problems(&refs(&with(&RUN, &[flag, "5", "--", "cmd"]))),

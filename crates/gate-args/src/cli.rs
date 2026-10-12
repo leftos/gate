@@ -181,6 +181,7 @@ fn seam_option(name: &str) -> Option<RunOption> {
         "test-heartbeat-ms" => Some(RunOption::Value(ValueOption::HeartbeatMs)),
         "test-poll-ms" => Some(RunOption::Value(ValueOption::PollMs)),
         "test-stall-ms" => Some(RunOption::Value(ValueOption::StallMs)),
+        "test-diagnostics-budget-ms" => Some(RunOption::Value(ValueOption::DiagnosticsBudgetMs)),
         "test-interrupt-after-samples" => Some(RunOption::Value(ValueOption::InterruptAfterSamples)),
         "test-print-request" => Some(RunOption::Switch(SwitchOption::PrintRequest)),
         "test-interrupt-queued" => Some(RunOption::Switch(SwitchOption::InterruptQueued)),

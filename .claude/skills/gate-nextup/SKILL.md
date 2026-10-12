@@ -60,6 +60,8 @@ The machine-alone cases are `build_servers::a_quiet_build_waiting_on_a_busy_shar
 
 To check a timing case holds under load, run it inside `~/.claude/tools/load-burn/load-burn.ps1`, which burns every core only while it holds the machine on a critical slot. A burn takes the owner's whole PC: one burn is at most 120 s (`-TimeoutSeconds 120`), one investigation spends at most about 5 minutes of burn time in all, and a brief that allows load-burn states that budget. Anything longer is asked of the owner first.
 
+load-burn does not starve a BelowNormal process: its critical gate runs the command at High, and Windows hands a child only Idle or BelowNormal, so a test under the burn runs at Normal beside the burners. A fault that shows only in the BelowNormal full suite is reproduced by suspending just the gate under test for seconds at a time (`NtSuspendProcess` / `NtResumeProcess` on the gate.exe the suite started), which costs no burn budget; GATE-128 was found that way.
+
 A commit goes through the gate: `-Slot heavy -TimeoutSeconds 300 -- git commit -F .tmp/msg-<slug>.txt`.
 
 ## Docs-owner map
