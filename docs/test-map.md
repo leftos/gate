@@ -69,6 +69,7 @@ Suite = `crates/gate/tests/suite/` (binary `suite`, needs `--all-features`; test
 | gate-state journal_writer.rs / verdict.rs | `journal` + any journal assertion: `cores, nesting, routing, slots, critical, stall, launch, interrupt, bridge` | state `journal_write`, `verdict` | no, but wide (writes on every run) |
 | gate-state archive.rs | `journal` (rollover and archive with concurrent appenders) | state `archive` | no |
 | gate-state cutover.rs / drain.rs / counts.rs | `cutover`, `launcher` (gate/src/cutover.rs imports `copy_slot_counts_to_v1, powershell_gates, write_cutover_flag`) | state `cutover`, `counts` | no |
+| gate-state tests/state/fixtures/ (captured files, `capture-*.ps1`) and tests/state/fixtures.rs | none (the fixtures are captured from `gate.exe` and the PowerShell gate by script and only read by the state tests) | state `fixtures` (incl. `remote_run_journal_from_gate_exe_is_read_into_runs_and_a_split_summary`) | no |
 | gate-state claims.rs / remote.rs / state.rs / win32.rs / journal.rs (reader) | NOT imported by gate src (ops-tower-only, ARCHITECTURE.md Layers; except `normalize_command` from journal.rs, used by `slots.rs`:642 and journal.rs's command text -> `journal`, `slots`) | state tests | no (journal.rs: `journal`, `slots`) |
 | gate-watchdog share.rs / watch.rs | `stall`, `ceiling`, `cores`, `pause`, `diagnostics`, `interrupt`, `build_servers`, `priority` | unit | no (wide) |
 | gate-watchdog cores.rs | `cores`, `journal` (cores fields) | unit | no |
@@ -135,6 +136,7 @@ Always add `checkout` to any change that touches a suite file or adds a seam.
 | gate-state journal_writer/verdict | `-E 'package(gate-state) or (binary(suite) and test(/^(journal\|cores\|nesting\|slots\|critical\|routing\|stall\|launch\|interrupt\|bridge)::/))'` |
 | gate-state archive | `-E 'package(gate-state) or (binary(suite) and test(/^journal::/))'` |
 | gate-state cutover/drain/counts | `-E 'package(gate-state) or (binary(suite) and test(/^(cutover\|launcher)::/))'` |
+| gate-state fixtures and fixtures.rs | `-E 'package(gate-state)'` |
 | gate-state claims/remote/state/win32 (ops-tower-only readers) | `-E 'package(gate-state)'` (no gate suite module reads them; gate src does not import them) |
 | gate-state journal.rs (reader, `normalize_command`) | `-E 'package(gate-state) or (binary(suite) and test(/^(journal\|slots)::/))'` |
 | gate-state v1/root/model/lib | full: `-E 'rdeps(gate-state)'` (includes whole gate suite; accurate, the binary uses v1 on every run) |

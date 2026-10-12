@@ -32,6 +32,10 @@ const REMOTE_SETTINGS: &str = include_str!("fixtures/remote.json");
 /// The journal of nine routed and local gates captured under a stub remote: a remote run, a run the full pool sent back,
 /// five runs refused after their remote take, one that fell back onto its parent's slot, and a local one.
 const REMOTE_JOURNAL: &str = include_str!("fixtures/remote-journal.jsonl");
+/// The journal of fifteen routed and local gate.exe runs captured with `capture-remote-run.ps1`: through the scripted
+/// client, a remote run, a run the full pool sent back, five runs refused after their remote take, one that fell back
+/// onto its parent's slot and a local one; then through the Rust client and fake-ssh, six runs it refused itself.
+const REMOTE_RUN_JOURNAL: &str = include_str!("fixtures/remote-run-journal.jsonl");
 /// The self-test prefix the capture ran under, in front of the claim's name and the waiting folder's.
 const PREFIX: &str = "ops28-";
 /// The self-test prefix the remote fixtures are read under.
@@ -263,6 +267,105 @@ fn remote_journal_is_read_into_runs_and_a_split_summary() {
             (true, 1, 12.558, 12.558, 12.558)
         ],
         "the remote runs of a command are a row of their own; the failed run and the run on its parent's slot are not counted"
+    );
+}
+
+#[test]
+fn remote_run_journal_from_gate_exe_is_read_into_runs_and_a_split_summary() {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join("gate-state")
+        .join("remote_run_journal_from_gate_exe_is_read_into_runs_and_a_split_summary");
+    if dir.exists() {
+        fs::remove_dir_all(&dir).expect("the test's old folder can be removed");
+    }
+    fs::create_dir_all(&dir).expect("the test's folder can be made");
+    fs::write(dir.join("events.jsonl"), REMOTE_RUN_JOURNAL).expect("the journal can be written");
+    let not_live = |_pid: u32, _process_start: &str| false;
+    let last_segment = |cwd: &str| cwd.rsplit(['\\', '/']).next().map(str::to_owned);
+
+    let history = JournalCache::default()
+        .read(&dir, "", ts("2026-10-12T08:00:00Z"), not_live, last_segment)
+        .expect("the journal can be read");
+
+    for line in REMOTE_RUN_JOURNAL.lines() {
+        let line: Value = serde_json::from_str(line).expect("a journal line is JSON");
+        assert_eq!(line.get("v").and_then(Value::as_u64), Some(1), "gate.exe writes the v1 format: {line}");
+    }
+    let rows: Vec<RunRow<'_>> = history
+        .runs
+        .iter()
+        .map(|run| (run.slot, run.remote, run.host.as_deref(), run.fallback.as_deref(), run.state))
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            (Some(0), false, None, Some("version"), RunState::Ok),
+            (Some(0), false, None, Some("busy"), RunState::Ok),
+            (Some(0), false, None, Some("parity"), RunState::Ok),
+            (Some(0), false, None, Some("tools"), RunState::Ok),
+            (Some(0), false, None, Some("rebooted"), RunState::Ok),
+            (Some(0), false, None, Some("unreachable"), RunState::Ok),
+            (Some(0), false, None, None, RunState::Ok),
+            (None, false, None, Some("busy"), RunState::Parent),
+            (Some(0), false, None, Some("tools"), RunState::Ok),
+            (Some(0), false, None, Some("rebooted"), RunState::Ok),
+            (Some(0), false, None, Some("parity"), RunState::Failed),
+            (Some(0), false, None, Some("busy"), RunState::Ok),
+            (Some(0), false, None, Some("unreachable"), RunState::Ok),
+            (Some(0), false, None, Some("full"), RunState::Ok),
+            (Some(0), true, Some("builder"), None, RunState::Ok),
+        ],
+        "newest first: the Rust client's six refusals, the local run, the run on its parent's slot, the scripted client's \
+         refusals and the full pool's fallback on their local slot, the remote run on the remote slot"
+    );
+    let parent = &history.runs[7];
+    assert_eq!(parent.parent_pid, Some(70000), "the run names the gate whose slot it ran on");
+    assert_eq!(
+        (parent.started.as_deref(), parent.status, parent.held_seconds),
+        (None, None, None),
+        "the parent's run is not in the journal, so there is no end to copy"
+    );
+    let full = &history.runs[13];
+    assert_eq!(
+        full.queued.as_deref(),
+        Some("2026-10-12T06:00:00.1523518Z"),
+        "a run the full pool sent back queues once"
+    );
+    assert_eq!(
+        full.started.as_deref(),
+        Some("2026-10-12T06:00:01.2721171Z"),
+        "its local take is its start"
+    );
+    assert_eq!(full.waited_seconds, Some(0.022), "gate.exe counts the wait of its local take alone");
+    let remote = &history.runs[14];
+    assert_eq!(
+        (remote.verdict.as_deref(), remote.wall_seconds, remote.adjusted_seconds),
+        (Some("passed"), Some(2.911), None),
+        "a remote run's release has its wall time and no adjusted time"
+    );
+    let summary: Vec<(&str, bool, usize, f64, f64, f64)> = history
+        .summary
+        .iter()
+        .map(|row| {
+            (
+                row.command.as_str(),
+                row.remote,
+                row.count,
+                row.p50_seconds,
+                row.p90_seconds,
+                row.max_seconds,
+            )
+        })
+        .collect();
+    assert_eq!(
+        summary,
+        [
+            (r#".\tool.exe out "ran here""#, false, 11, 0.023, 1.312, 1.665),
+            (r#".\tool.exe out "ran here""#, true, 1, 2.915, 2.915, 2.915),
+            ("cmd /c exit 0", false, 1, 0.027, 0.027, 0.027),
+        ],
+        "the remote run of a command is a row of its own and the runs that fell back count as local; the failed run and \
+         the run on its parent's slot are not counted"
     );
 }
 

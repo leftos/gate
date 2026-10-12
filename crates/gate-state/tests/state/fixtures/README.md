@@ -1,6 +1,6 @@
 # gate.ps1 fixtures
 
-Files captured from a real run of the gate, not written by hand (except three of the `remote*` files and the two pid 58200 lines of `journal.jsonl` and `journal-powershell.jsonl`, below), so `fixtures.rs` proves `gate-state` reads what the gate writes. `journal.jsonl` comes from an early `gate.exe` that launched nothing and took no slot; the other captured files are still from `~/.claude/tools/gate/gate.ps1`.
+Files captured from a real run of the gate, not written by hand (except three of the `remote*` files and the two pid 58200 lines of `journal.jsonl` and `journal-powershell.jsonl`, below), so `fixtures.rs` proves `gate-state` reads what the gate writes. `journal.jsonl` comes from an early `gate.exe` that launched nothing and took no slot; `remote-run-journal.jsonl` comes from the current `gate.exe`; the other captured files are still from `~/.claude/tools/gate/gate.ps1`.
 
 Each is kept as captured (UTF-8 without a byte order mark, one line), except that the worktree path the capture ran in is replaced by `C:\work\repo` in `cwd` and `log`, and the repo's `end-of-file-fixer` hook adds the trailing newline the gate does not write (the tests parse the JSON, so it does not matter).
 
@@ -15,8 +15,9 @@ Each is kept as captured (UTF-8 without a byte order mark, one line), except tha
 | `remote-ticket.json` | **Hand-written**: the arrival ticket of a heavy gate routed to the remote pool and waiting for a remote slot, a heavy ticket plus `remote: true`. | `%LOCALAPPDATA%\gate\<prefix>waiting\<pid>-<start ticks>.json`, here `ops225-waiting\60090-639265725620427420.json` |
 | `remote.json` | **Hand-written**: the gate's remote settings, two remote slots plus routing keys that `gate-state` ignores. | `%LOCALAPPDATA%\gate\remote.json` |
 | `remote-journal.jsonl` | The journal of the real PowerShell gate's remote route (no `v`), captured sandboxed by `capture-remote-journal.ps1`: a remote run that passed, runs that fell back to the local queue (`full`, then one for each reason `unreachable`, `busy`, `parity` with a failing command, `rebooted`, `tools`), a run that fell back onto its parent gate's slot (a `parent` line follows its `fallback`), and a local control run. | `%LOCALAPPDATA%\gate\<prefix>events.jsonl`, here `ops225-events.jsonl` |
+| `remote-run-journal.jsonl` | The v1 journal of `gate.exe`'s remote route (69 lines, 15 runs), captured by `capture-remote-run.ps1`: a remote run that passed, `full`, `unreachable`, `busy`, `parity` (its command fails), `rebooted` and `tools` from the scripted client, a parent fallback, a local control run, then `unreachable`, `rebooted`, `tools`, `parity`, box-lock `busy` and `version` from the Rust client over the `local:` transport and fake-ssh. | `<state root>\events.jsonl` |
 
-The three other `remote*` files are written by hand from the gate's remote-slot design (`docs/design/gate-remote-slot.md`), since the gate does not write a remote claim or ticket a test can capture; they are re-captured from a real gate once it does. claude-config keeps a copy of `remote-journal.jsonl` (`tools/gate/fixtures/remote-journal.jsonl`).
+The three other `remote*` files (`remote-claim.json`, `remote-ticket.json`, `remote.json`) are the PowerShell gate's formats, written by hand from the gate's remote-slot design (`docs/design/gate-remote-slot.md`), since that gate does not write a remote claim or ticket a test can capture. `gate.exe` writes the v1 forms, whose reference examples are the `v1-remote-*` files below, and `capture-remote-run.ps1` captures only its journal. claude-config keeps a copy of `remote-journal.jsonl` (`tools/gate/fixtures/remote-journal.jsonl`).
 
 ## The v1 reference examples
 
@@ -54,6 +55,14 @@ From the worktree root, in pwsh, with `LOCALAPPDATA` pointed at a scratch folder
 From the repo root, in pwsh: `pwsh -NoProfile -File tools/gate.ps1 -Log .tmp/cap.log -TimeoutSeconds 600 -Slot light -- pwsh -NoProfile -File crates/gate-state/tests/state/fixtures/capture-remote-journal.ps1`, with an optional `-Scratch <folder>` (default `.tmp\cap-remote-journal\run-<stamp>`, left for you to delete).
 
 The script runs the real gate under a scratch `LOCALAPPDATA`, a self-test slot prefix and a stub remote, so no live journal, mutex or build box is touched, and writes `remote-journal.jsonl` with LF line ends, the scratch repo's path as `C:\work\repo`, renumbered pids and shifted times. Update the figures `fixtures.rs` expects if the sequence changes.
+
+## Re-capturing the remote run journal
+
+From the repo root, in pwsh: `pwsh -NoProfile -File tools/gate.ps1 -Log .tmp/cap-remote-run.log -TimeoutSeconds 900 -Slot light -- pwsh -NoProfile -File crates/gate-state/tests/state/fixtures/capture-remote-run.ps1`, with an optional `-Scratch <folder>` (default `.tmp\cap-remote-run`).
+
+The script builds `gate.exe` with `--features test-seams` and runs it into a scratch state root. Pass 1 drives the scripted client (`--test-remote-client`) through a remote run that passes, `full`, `unreachable`, `busy`, `parity`, `rebooted` and `tools`, then a parent fallback and a local control run. Pass 2 drives the Rust client over the `local:` transport and fake-ssh for `unreachable`, `rebooted`, `tools`, `parity`, box-lock `busy` and `version`.
+
+It writes `remote-run-journal.jsonl` with LF line ends, the repo path as `C:\work\repo`, the root hash as `5ca1ab1e`, the work-folder key as `repo-c0ffee00`, renumbered pids and every ISO time shifted to start at `2026-10-12T06:00:00Z`. Update the figures `fixtures.rs` expects if the sequence changes.
 
 ## Re-capturing the journal
 
