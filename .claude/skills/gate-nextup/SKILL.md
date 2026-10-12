@@ -64,7 +64,11 @@ There is no changelog.
 
 ## Reinstall
 
-This PC is cut over: every gate on it runs the installed `gate.exe`. After each landing whose diff changes code the local gate runs (the run, watchdog, slots, waiting, launch, the CLI and its subcommands, the journal, gate-state's writers), run `pwsh -NoProfile -File tools/install.ps1` from the main checkout on `main`, and name the installed version in the landing's report. A landing that changes only dormant code (the Rust remote client under `test-seams`, the box side builders run, the outputs module before it is wired) waits for the checkpoint, where one install covers them.
+This PC is cut over: every gate on it runs the installed `gate.exe`, and each builder runs the copy `gate push` put there.
+
+After each landing whose diff changes code the local gate runs (the run, watchdog, slots, waiting, launch, the CLI and its subcommands, the journal, gate-state's writers) or code the builders run (`gate box` and its verbs), run `pwsh -NoProfile -File tools/install.ps1` from the main checkout on `main`, then `& "$env:LOCALAPPDATA\gate\bin\gate.exe" push`. The landing's report names the installed version and each builder's result line.
+
+A push that fails is reported in the landing's report and never undoes the local install; the next reinstall pushes again. A landing that changes only dormant code (the Rust remote client under `test-seams`) waits for the checkpoint, where one install and one push cover them.
 
 The install is safe while gates run (rename-aside). A bad build is taken back by reinstalling the previous commit, or by deleting `%LOCALAPPDATA%\gate\cutover.flag`.
 
