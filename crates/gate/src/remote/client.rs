@@ -414,6 +414,8 @@ impl Attempt<'_, '_> {
         let prepared = self.preflight(&location)?;
         self.parity(&snapshot, prepared.sdks.as_deref())?;
         self.push(&snapshot, prepared.created)?;
+        // After the push: a run refused before it, at the preflight or by the parity check, leaves no marker.
+        outputs::marked(&sent)?;
         let (end, heard) = self.run_call(&run_line, &location, sent.manifest.as_ref(), &nonce)?;
         // The sync-back runs after a run call that ended with the command's own status; a refusal, an interrupt, a
         // kill, a lost connection or a failed call ended the attempt before it, so a box refusal's 75 never syncs back.

@@ -1,8 +1,9 @@
 //! A routed run's outputs on the PC, up to its run call's end: the manifest of the files the PC holds under the run's
-//! output globs, hashed before the run call and sent on its standard input; the pending marker, written before the run
-//! call and removed once the outputs step completes, whose presence makes the next routed run of the worktree ask for
-//! every output that differs from the PC's (`OutputsFull`); the box's `gate-remote-outputs:` line the client takes
-//! from the run call; and the outputs call that fetches the archive it names into the worktree's `.tmp` folder.
+//! output globs, hashed before the run call and sent on its standard input; the pending marker, written after the push
+//! and before the run call and removed once the outputs step completes, whose presence makes the next routed run of the
+//! worktree ask for every output that differs from the PC's (`OutputsFull`); the box's `gate-remote-outputs:` line the
+//! client takes from the run call; and the outputs call that fetches the archive it names into the worktree's `.tmp`
+//! folder.
 
 use std::cell::Cell;
 use std::fs::{self, File, OpenOptions};
@@ -114,16 +115,17 @@ pub(super) struct Sent<'a> {
     pub(super) full: bool,
     /// The manifest line, fed on the run call's standard input.
     pub(super) manifest: Option<Arc<str>>,
-    /// The pending marker, written before the run call; `None` for a run with no output globs.
+    /// The pending marker, written after the push by [`marked`]; `None` for a run with no output globs.
     marker: Option<PathBuf>,
     /// Why the manifest could not be built, which a passing run says as it fails.
     unbuilt: Option<String>,
 }
 
-/// What `attempt`'s run call carries of its outputs. A run with no output globs carries none, and reads and writes no
-/// pending marker. One with globs reads whether the marker is there, builds the manifest, polling the console
-/// interrupt as it hashes, and writes the marker; a manifest that cannot be built is kept for the outputs step, and
-/// the run call then carries no globs. Else the interrupt that ended the build, or why the marker could not be written.
+/// What `attempt`'s run call carries of its outputs. A run with no output globs carries none, and reads no pending
+/// marker. One with globs reads whether the marker is there, builds the manifest, polling the console interrupt as it
+/// hashes, and records the marker's path for [`marked`] to write once the snapshot is pushed; a manifest that cannot
+/// be built is kept for the outputs step, and the run call then carries no globs. Else the interrupt that ended the
+/// build.
 pub(super) fn sent<'a>(attempt: &mut Attempt<'_, 'a>) -> Result<Sent<'a>, End> {
     let call: &RemoteCall<'a> = attempt.call;
     let mut sent = Sent {
@@ -147,9 +149,19 @@ pub(super) fn sent<'a>(attempt: &mut Attempt<'_, 'a>) -> Result<Sent<'a>, End> {
         Err(Unbuilt::Interrupted) => return Err(End::Interrupted),
         Err(Unbuilt::Failed(reason)) => sent.unbuilt = Some(reason),
     }
-    mark_pending(&marker).map_err(End::Failed)?;
     sent.marker = Some(marker);
     Ok(sent)
+}
+
+/// Writes the pending marker `sent` records, once the snapshot is pushed and before the run call, so a run the client
+/// sends after the push leaves it on every end but a passing run whose box packed nothing, and a run refused before
+/// the push, at the preflight or by the parity check, leaves none. A run with no output globs records none. Else why
+/// it could not be written.
+pub(super) fn marked(sent: &Sent<'_>) -> Result<(), End> {
+    match &sent.marker {
+        Some(marker) => mark_pending(marker).map_err(End::Failed),
+        None => Ok(()),
+    }
 }
 
 /// The end of `attempt`'s run once its sync-back ended it `synced`, its run call having ended as `ran` says, and the

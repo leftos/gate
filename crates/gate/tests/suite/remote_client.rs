@@ -2138,6 +2138,52 @@ fn a_failing_run_leaves_the_marker_and_the_next_run_sends_outputs_full() {
     );
 }
 
+/// A routed run with output globs that the parity check refuses is refused before the push, so the builder's work
+/// folder is never reached: it must leave no outputs pending marker, which would make the next run of the worktree ask
+/// for every output that differs from the PC's (`OutputsFull`). That next run carries the PC's manifest as `Outputs`: a
+/// file under the globs the builder's work folder held from an earlier run and this run leaves alone comes back only
+/// under `OutputsFull`, so it stays where it is.
+#[test]
+fn a_parity_refusal_leaves_no_outputs_pending_marker_and_the_next_run_sends_outputs() {
+    let case = outputs_case("client-outputs-parity-refusal", &BIN);
+    write(&case, "global.json", r#"{"sdk": {"version": "999.0.100"}}"#);
+    write(&case, "src/App/App.csproj", "<Project />\n");
+    write(&case, r"bin\left.txt", "pc");
+    let refused_steps = ssh_steps(&case, "refused", &["ok"]);
+    let mut refused_gate = client_gate(&case, "refused.log", &refused_steps, &[r".\tool.exe", "out", "ran here"]);
+    refused_gate.env("PATH", box_path_with_dotnet(&case, &["8.0.404"]));
+
+    let (pid, refused) = finish_with_pid(refused_gate);
+
+    assert_eq!(refused.code, Some(0), "the run here passed: {refused:?}");
+    assert_eq!(fallbacks(&own(&case, pid)), ["parity"], "{refused:?}");
+    assert!(refused.stderr.contains(PARITY_LINE), "{refused:?}");
+    assert_eq!(calls(&refused_steps), ["preflight"], "the preflight alone reached the builder");
+    // Read now and asserted at the end, so the red case shows the marker the refusal leaves and the run it makes.
+    let refused_left_the_marker = pending_marker(&case).exists();
+    // The builder's work folder keeps an earlier run's build output, as `hold_box_lock` and `plant_back` stand in for
+    // an earlier run's files on the builder: the next run leaves it alone, and only the pre-command listing tells such
+    // a file from one the run made.
+    let key = key_of(&events(&case));
+    write(&case, &format!(r"builder\work\{key}\bin\left.txt"), "box");
+    let served_steps = ssh_steps(&case, "served", &["ok", "ok", "ok"]);
+    let mut served_gate = client_gate(&case, "served.log", &served_steps, &[r".\tool.exe", "out", "ran there"]);
+    served_gate.env("PATH", box_path_with_dotnet(&case, &["999.0.100"]));
+
+    let outcome = finish(served_gate);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(
+        !outcome.stderr.contains("gate-remote-outputs: 1 "),
+        "the file this run left alone comes back only under OutputsFull: {outcome:?}"
+    );
+    assert!(
+        outcome.stderr.contains("gate-remote-outputs: 0"),
+        "the run brought nothing back: {outcome:?}"
+    );
+    assert!(!refused_left_the_marker, "a parity refusal leaves no marker: {refused:?}");
+}
+
 /// Three worktrees: a run the box refuses, as `a_refused_run_call_syncs_nothing_back` does once a first run named the
 /// key; one the watchdog kills; and one whose connection is lost.
 #[test]
