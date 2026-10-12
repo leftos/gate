@@ -56,7 +56,7 @@ A test that asserts on timing must hold on a busy machine: no wall-clock bound a
 
 The machine-alone cases are `build_servers::a_quiet_build_waiting_on_a_busy_shared_compiler_is_not_stalled`, `build_servers::a_dotnet_server_is_told_by_its_command_line` and `build_servers::a_server_started_after_the_command_counts_while_the_job_holds_a_client`. Each proves "not stalled" inside a short window, held off by a build server the gate lowers to BelowNormal. When the diff touches the watchdog, the build-server classification or the priority code, also run `-Slot critical -TimeoutSeconds 600 -- cargo nextest run -p gate --all-features --cargo-profile test-release --run-ignored only -E 'binary(suite)'`.
 
-To check a timing case holds under load, run it inside `~/.claude/tools/load-burn/load-burn.ps1`, which burns every core only while it holds the machine on a critical slot.
+To check a timing case holds under load, run it inside `~/.claude/tools/load-burn/load-burn.ps1`, which burns every core only while it holds the machine on a critical slot. A burn takes the owner's whole PC: one burn is at most 120 s (`-TimeoutSeconds 120`), one investigation spends at most about 5 minutes of burn time in all, and a brief that allows load-burn states that budget. Anything longer is asked of the owner first.
 
 A commit goes through the gate: `-Slot heavy -TimeoutSeconds 300 -- git commit -F .tmp/msg-<slug>.txt`.
 
