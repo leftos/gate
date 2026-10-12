@@ -103,6 +103,8 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Sync-back**: applying the files a routed command changed on the builder to the PC's worktree, refused when the worktree changed during the run.
 - **Take**: a gate acquiring its slot, journalled as `take`; **release** is letting it go, journalled as `release` before the slot is freed.
 - **Take-back**: returning a machine to the PowerShell gate by deleting the cutover flag by hand, which works even when `gate.exe` is what is broken.
+- **Test map**: [test-map.md](test-map.md), which maps each source area to the suite modules and unit tests that reach it, as nextest filtersets; an item in test mode `mvp` runs only those.
+- **Test mode**: the `gate-nextup` profile's `test mode: mvp|full` line; `mvp` runs each item's reached tests and the full suite at checkpoints, `full` runs the full suite for every item.
 - **Test seam**: a hidden `--test-*` flag, compiled only with the `test-seams` cargo feature, by which the suite sets a timing knob or prints the parsed request.
 - **Ticket**: the JSON file `waiting\<pid>-<start>.json` a gate writes when it queues for a slot, holding its kind and `arrived` time; waiters of one kind take slots in ticket order.
 - **Usage error**: a command line the gate refuses (a missing, unknown, repeated or invalid input): each problem on its own `gate: ` line, then the usage, exit 2, before any slot is queued.
