@@ -260,8 +260,9 @@ impl Pin {
 }
 
 /// The pin of the `global.json` whose text is `global_json`, `None` when the snapshot has none. Its comments are
-/// stripped as dotnet strips them, its members are spelled exactly as dotnet spells them, and a leading byte order
-/// mark is skipped; a `global.json` dotnet would ignore holds no readable pin.
+/// stripped as dotnet strips them, its members are spelled exactly as dotnet spells them, a leading byte order mark
+/// is skipped, only its first JSON value is read, as dotnet reads it, and any text after it is ignored; a
+/// `global.json` dotnet would ignore holds no readable pin.
 pub(crate) fn pin_of(global_json: Option<&str>) -> Pin {
     let mut pin = Pin {
         found: global_json.is_some(),
@@ -276,7 +277,9 @@ pub(crate) fn pin_of(global_json: Option<&str>) -> Pin {
     if text.contains('\u{fffd}') {
         return pin;
     }
-    let Ok(parsed) = serde_json::from_str::<Value>(&without_comments(text.trim_start_matches('\u{feff}'))) else {
+    let stripped = without_comments(text.trim_start_matches('\u{feff}'));
+    let mut values = serde_json::Deserializer::from_str(&stripped).into_iter::<Value>();
+    let Some(Ok(parsed)) = values.next() else {
         return pin;
     };
     let Some(sdk) = member(&parsed, "sdk") else {
@@ -649,6 +652,19 @@ mod tests {
             // A removed block comment is one space, so `1/**/2` does not join into `12`.
             (Some(r#"{ "sdk": { "version": "999.0.0"/**/ } }"#), pin(true, Some("999.0.0"), None, true)),
             (Some(r#"{"sdk":{"version":"9.0.100","x":1/**/2}}"#), pin(true, None, None, true)),
+            // dotnet reads the first JSON value and ignores any text after it.
+            (
+                Some("{ \"sdk\": { \"version\": \"10.0.401\" } }\n}\n"),
+                pin(true, Some("10.0.401"), None, true),
+            ),
+            (
+                Some("{ \"sdk\": { \"version\": \"10.0.401\" } }\ngarbage text\n"),
+                pin(true, Some("10.0.401"), None, true),
+            ),
+            (
+                Some(r#"{ "sdk": { "version": "10.0.401" } } { "sdk": { "version": "8.0.425" } }"#),
+                pin(true, Some("10.0.401"), None, true),
+            ),
         ];
         for (text, want) in rows {
             assert_eq!(pin_of(text), want, "{text:?}");
