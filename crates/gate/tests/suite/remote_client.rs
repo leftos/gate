@@ -2417,7 +2417,16 @@ fn a_no_build_command_sends_no_manifest() {
     let case = outputs_case("client-outputs-no-build", &BIN);
     copy_tool(&case, "dotnet.exe");
     let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
-    let command = [r".\dotnet.exe", "out", "ran there", "write", r"bin\new.txt", "built", "--no-build"];
+    let command = [
+        r".\dotnet.exe",
+        "test",
+        "out",
+        "ran there",
+        "write",
+        r"bin\new.txt",
+        "built",
+        "--no-build",
+    ];
 
     let outcome = finish(client_gate(&case, "out.log", &steps, &command));
 

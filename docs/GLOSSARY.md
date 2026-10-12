@@ -69,6 +69,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Nesting**: a gate started inside another gate's command (a build hook under a gated `git commit`), which reads its parent from the slot marker.
 - **No slot**: the slot kind `none` (`--slot none`), for a command that only dispatches or watches remote work: it takes no slot, mutex, ticket or claim, never waits, and still has its job, log, ceiling and watchdog.
 - **Notes**: the gate's own lines gathered while a run goes and appended to the end of its log.
+- **Nothing-back record**: the JSON file `remote\<key>.nothing-back` in the state root, left by a routed dotnet build that ended on the builder without its outputs known to be brought back; while it stands, a local dotnet `test` or `run` drops its `--no-build`. A passing local build of the whole worktree with the same configuration, framework and runtime removes it.
 - **Output cap**: the remote client's limit of 64 KiB on one line of a call's output (a `\r` resets the line, so git's progress counts per update), which kills a capped call that sends a longer one.
 - **Outputs archive**: the `<key>-<nonce>.tar.zst` a routed run's changed output files travel in, its last member `.gate-outputs.json` listing the files before it.
 - **Outputs manifest**: the Manifest of the PC's files under a routed run's output globs, as the Rust client builds it before the run call and writes it as one line on that call's stdin, for the box to read.

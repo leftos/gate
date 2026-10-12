@@ -755,6 +755,8 @@ fn outcome_of(answer: &Answer, log: &Path) -> RemoteOutcome {
         reason,
         killed: answer.killed,
         lines: if reason.is_some() { attempt_lines(log) } else { Vec::new() },
+        // The result line does not say whether the outputs came back.
+        brought_back: None,
         ..RemoteOutcome::default()
     }
 }

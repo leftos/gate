@@ -19,6 +19,7 @@ mod journal;
 mod log;
 mod machine;
 mod nesting;
+mod no_build;
 #[cfg_attr(
     not(test),
     expect(

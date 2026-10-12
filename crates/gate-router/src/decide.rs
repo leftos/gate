@@ -3,6 +3,7 @@
 //! that needs it: a light or critical gate, `--local` or a covering parent read no routing file, and a machine with no
 //! routing file costs no git call.
 
+use std::ops::Range;
 use std::path::PathBuf;
 
 use crate::config::{Config, ConfigProblem, ignored_line};
@@ -17,8 +18,13 @@ pub const NO_OUTPUTS_LINE: &str = "gate: outputs: none brought back for a --no-b
 
 const NO_BUILD: &str = "--no-build";
 
-/// The word that ends a dotnet command's own arguments: what follows it goes to the program the command runs.
+/// The word that ends a dotnet command's own arguments: what follows it goes to the program the command runs. After a
+/// wrapping script's words it starts the dotnet command the script is handed.
 const SEPARATOR: &str = "--";
+/// The program name of a dotnet command.
+const DOTNET: &str = "dotnet";
+/// The program names whose script, handed a dotnet command after its `--`, counts as that dotnet command.
+const WRAPPERS: [&str; 2] = ["pwsh", "powershell"];
 /// The `MSBuild` property a routed build pins the worktree's `HEAD` sha to, so the builder does not throw away a
 /// build whose revision changed.
 const SOURCE_REVISION: &str = "SourceRevisionId";
@@ -26,6 +32,86 @@ const SOURCE_REVISION: &str = "SourceRevisionId";
 const PROPERTY_SWITCHES: [&str; 5] = ["-p:", "/p:", "-property:", "/property:", "--property:"];
 /// The dotnet verbs that build: the ones a command-line property reaches `MSBuild` through.
 const BUILD_VERBS: [&str; 6] = ["build", "test", "publish", "pack", "run", "msbuild"];
+/// The dotnet verbs whose `--no-build` the gate drops; `pack` and `publish` keep theirs.
+const NO_BUILD_DROP_VERBS: [&str; 2] = ["test", "run"];
+/// The dotnet verb that hands its words to `MSBuild` as they are: a target such as `-t:Restore` may build nothing.
+const MSBUILD: &str = "msbuild";
+/// The option that names the project a dotnet command builds.
+const PROJECT_OPTION: &str = "--project";
+/// The file extensions of a project file, compared ignoring letter case.
+pub const PROJECT_EXTENSIONS: [&str; 3] = [".csproj", ".fsproj", ".vbproj"];
+/// The file extensions of a solution file, compared ignoring letter case.
+const SOLUTION_EXTENSIONS: [&str; 3] = [".sln", ".slnx", ".slnf"];
+/// The start of a dotnet word that names a response file, whose words the gate cannot see.
+const RESPONSE_FILE: char = '@';
+/// The spellings of the options [`BuildSettings`] reads: short, then long.
+const CONFIGURATION_OPTIONS: [&str; 2] = ["-c", "--configuration"];
+const FRAMEWORK_OPTIONS: [&str; 2] = ["-f", "--framework"];
+const RUNTIME_OPTIONS: [&str; 2] = ["-r", "--runtime"];
+/// The other dotnet build options that take the next word as their value when written without `=` or `:`; a value of
+/// an option not listed reads as a named target ([`BuildTarget::Other`]).
+const VALUE_OPTIONS: [&str; 18] = [
+    "-o",
+    "--output",
+    "-v",
+    "--verbosity",
+    "-a",
+    "--arch",
+    "--os",
+    "-s",
+    "--source",
+    "--settings",
+    "-l",
+    "--logger",
+    "--filter",
+    "--results-directory",
+    "--collect",
+    "--version-suffix",
+    "-lp",
+    "--launch-profile",
+];
+
+/// The configuration, framework and runtime a dotnet command's own words set (`-c`, `-f`, `-r` and their long forms),
+/// each as written and `None` when the words set none.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BuildSettings {
+    pub configuration: Option<String>,
+    pub framework: Option<String>,
+    pub runtime: Option<String>,
+}
+
+impl BuildSettings {
+    /// Whether `other` sets each of the three as these do, ignoring letter case; one set and one absent differ.
+    #[must_use]
+    pub fn same_as(&self, other: &BuildSettings) -> bool {
+        let same = |left: &Option<String>, right: &Option<String>| match (left, right) {
+            (Some(left), Some(right)) => left.to_lowercase() == right.to_lowercase(),
+            (None, None) => true,
+            _ => false,
+        };
+        same(&self.configuration, &other.configuration) && same(&self.framework, &other.framework) && same(&self.runtime, &other.runtime)
+    }
+}
+
+/// What a dotnet build's own words name ([`sdk_build_target`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuildTarget {
+    /// A solution file.
+    Solution,
+    /// Nothing: the build is of the folder it runs in.
+    Unnamed,
+    /// Anything else: a project, `--project`, a folder, a file-based app or a word the gate cannot read.
+    Other,
+}
+
+/// What a dotnet command's own words name to build ([`dotnet_target`]), as written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DotnetTarget {
+    /// One project: a project file, or the value of `--project`, a project file or its folder.
+    Project(String),
+    /// A solution file, which lists the projects it builds.
+    Solution(String),
+}
 
 /// The slot kind a gate asks for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -262,8 +348,172 @@ fn stays_local(words: &[String]) -> bool {
     })
 }
 
-fn is_dotnet(words: &[String]) -> bool {
-    first_word(words).is_some_and(|(_, word)| eq_ignoring_case(file_stem(word), "dotnet"))
+/// Whether the words are a dotnet command: the first non-empty word's file name without extension is `dotnet`, or the
+/// first non-empty word's is `pwsh` or `powershell` and the word just after its first `--` is such a `dotnet` word (a
+/// script handed a dotnet command to run), each name compared ignoring letter case.
+#[must_use]
+pub fn is_dotnet(words: &[String]) -> bool {
+    dotnet_start(words).is_some()
+}
+
+/// Whether the words are a dotnet command ([`is_dotnet`]) that builds: the dotnet command's verb, the next non-empty
+/// word after its dotnet word, is one of [`BUILD_VERBS`] ignoring letter case, and none of its own words is exactly
+/// `--no-build`.
+#[must_use]
+pub fn dotnet_builds(words: &[String]) -> bool {
+    dotnet_own(words).is_some_and(|own| builds(&words[own.clone()]) && !words[own].iter().any(|word| word == NO_BUILD))
+}
+
+/// The project or solution a dotnet command ([`is_dotnet`]) names among its own words: the value of `--project`
+/// (`--project X`, `--project=X` or `--project:X`; empty when it has none), or the first word not starting with `-`
+/// or `/` whose extension, ignoring letter case, is a project's or a solution's. `None` for a command that names
+/// neither, a folder argument included, and for any other command.
+#[must_use]
+pub fn dotnet_target(words: &[String]) -> Option<DotnetTarget> {
+    let own = dotnet_own(words)?;
+    let mut rest = words[own].iter().skip(1);
+    while let Some(word) = rest.next() {
+        if word == PROJECT_OPTION {
+            return Some(DotnetTarget::Project(rest.next().cloned().unwrap_or_default()));
+        }
+        if let Some(value) = word.strip_prefix(PROJECT_OPTION).and_then(|after| after.strip_prefix(['=', ':'])) {
+            return Some(DotnetTarget::Project(value.to_owned()));
+        }
+        if word.starts_with(['-', '/']) {
+            continue;
+        }
+        if has_extension(word, &PROJECT_EXTENSIONS) {
+            return Some(DotnetTarget::Project(word.clone()));
+        }
+        if has_extension(word, &SOLUTION_EXTENSIONS) {
+            return Some(DotnetTarget::Solution(word.clone()));
+        }
+    }
+    None
+}
+
+/// The configuration, framework and runtime a dotnet command's own words set, the last of each spelling winning; all
+/// `None` for a command that is no dotnet command ([`is_dotnet`]) or names a response file.
+#[must_use]
+pub fn build_settings(words: &[String]) -> BuildSettings {
+    let Some(own) = dotnet_own(words) else {
+        return BuildSettings::default();
+    };
+    let own = &words[own];
+    BuildSettings {
+        configuration: option_value(own, &CONFIGURATION_OPTIONS),
+        framework: option_value(own, &FRAMEWORK_OPTIONS),
+        runtime: option_value(own, &RUNTIME_OPTIONS),
+    }
+}
+
+/// The value of the last of `own`'s words spelled as one of `spellings`: `-c X`, `-c=X` or `-c:X`.
+fn option_value(own: &[String], spellings: &[&str]) -> Option<String> {
+    let mut value = None;
+    let mut rest = own.iter();
+    while let Some(word) = rest.next() {
+        for spelling in spellings {
+            if word == spelling {
+                value = rest.next().cloned();
+            } else if let Some(inline) = word.strip_prefix(spelling).and_then(|after| after.strip_prefix(['=', ':'])) {
+                value = Some(inline.to_owned());
+            }
+        }
+    }
+    value
+}
+
+/// What a dotnet build names among its own words, for a command that builds ([`dotnet_builds`]) with an SDK verb other
+/// than `msbuild`: a solution file, nothing, or anything else ([`BuildTarget`]). Every word not starting with `-` or
+/// `/` that is no value of a known option ([`BuildSettings`]'s, [`VALUE_OPTIONS`]) is a named target. `None` for any
+/// other command.
+#[must_use]
+pub fn sdk_build_target(words: &[String]) -> Option<BuildTarget> {
+    let own = dotnet_own(words)?;
+    let own = &words[own];
+    if !dotnet_builds(words) || verb(own).is_some_and(|verb| eq_ignoring_case(verb, MSBUILD)) {
+        return None;
+    }
+    if matches!(dotnet_target(words), Some(DotnetTarget::Project(_))) {
+        return Some(BuildTarget::Other);
+    }
+    let takes_value = |word: &str| {
+        [&CONFIGURATION_OPTIONS[..], &FRAMEWORK_OPTIONS, &RUNTIME_OPTIONS, &VALUE_OPTIONS]
+            .iter()
+            .any(|spellings| spellings.contains(&word))
+    };
+    let mut named = Vec::new();
+    let mut rest = own.iter().skip(verb_at(own)? + 1);
+    while let Some(word) = rest.next() {
+        if takes_value(word) {
+            rest.next();
+        } else if !word.is_empty() && !word.starts_with(['-', '/']) {
+            named.push(word);
+        }
+    }
+    Some(match named.as_slice() {
+        [] => BuildTarget::Unnamed,
+        [one] if has_extension(one, &SOLUTION_EXTENSIONS) => BuildTarget::Solution,
+        _ => BuildTarget::Other,
+    })
+}
+
+/// The verb of a dotnet command's own words, its dotnet word first: the next non-empty word after it.
+fn verb(own: &[String]) -> Option<&str> {
+    verb_at(own).map(|at| own[at].as_str())
+}
+
+/// The index of the verb ([`verb`]) among a dotnet command's own words.
+fn verb_at(own: &[String]) -> Option<usize> {
+    let (index, _) = first_word(own)?;
+    own[index + 1..].iter().position(|word| !word.is_empty()).map(|at| index + 1 + at)
+}
+
+/// Whether a dotnet command's own words, its dotnet word first, have a verb ([`verb`]) that is one of `verbs`,
+/// compared ignoring letter case.
+fn verb_in(own: &[String], verbs: &[&str]) -> bool {
+    verb(own).is_some_and(|verb| verbs.iter().any(|listed| eq_ignoring_case(verb, listed)))
+}
+
+/// Whether `word` ends in one of `extensions`, ignoring letter case.
+fn has_extension(word: &str, extensions: &[&str]) -> bool {
+    extensions.iter().any(|extension| {
+        word.len() > extension.len()
+            && word
+                .get(word.len() - extension.len()..)
+                .is_some_and(|end| eq_ignoring_case(end, extension))
+    })
+}
+
+/// The index of the dotnet word of a dotnet command ([`is_dotnet`]); `None` for any other command.
+fn dotnet_start(words: &[String]) -> Option<usize> {
+    let (index, first) = first_word(words)?;
+    if is_named(first, DOTNET) {
+        return Some(index);
+    }
+    if !WRAPPERS.iter().any(|wrapper| is_named(first, wrapper)) {
+        return None;
+    }
+    let after = index + words[index..].iter().position(|word| word == SEPARATOR)? + 1;
+    words.get(after).filter(|word| is_named(word, DOTNET)).map(|_| after)
+}
+
+/// The dotnet command's own words: from its dotnet word up to, not including, the first `--` after it, whose words go
+/// to the program the command runs; `None` for a command that is no dotnet command, and for one whose own words name
+/// a response file (a word starting with `@`), whose words the gate cannot see: no rule reads such a command.
+fn dotnet_own(words: &[String]) -> Option<Range<usize>> {
+    let start = dotnet_start(words)?;
+    let end = words[start + 1..]
+        .iter()
+        .position(|word| word == SEPARATOR)
+        .map_or(words.len(), |at| start + 1 + at);
+    let opaque = words[start..end].iter().any(|word| word.starts_with(RESPONSE_FILE));
+    (!opaque).then_some(start..end)
+}
+
+/// Whether a word names the program `name`: its file name without extension is `name`, ignoring letter case.
+fn is_named(word: &str, name: &str) -> bool {
+    eq_ignoring_case(file_stem(word), name)
 }
 
 /// The first non-empty word and its index.
@@ -317,18 +567,17 @@ fn subst_drives(root: &str, words: &[String], facts: &dyn Facts) -> Vec<(char, S
 }
 
 fn remote_run(matched: Matched<'_>, subfolder: String, given: &[String], facts: &dyn Facts) -> RemoteRun {
-    let dotnet = is_dotnet(given);
     let sent_count = matched.words.len();
-    let mut words = without_no_build(matched.words, dotnet);
+    let mut words = without_no_build(matched.words);
     let dropped_no_build = words.len() != sent_count;
-    let fallback = without_no_build(given.to_vec(), dotnet);
+    let fallback = without_no_build(given.to_vec());
     let mut outputs = matched.config.outputs(&matched.repo);
     let outputs_withheld = fallback.len() != given.len() && !outputs.is_empty();
     if outputs_withheld {
         outputs.clear();
     }
     mark_bare_first_word(&mut words, facts);
-    stamp_source_revision(&mut words, dotnet, &matched.place, facts);
+    stamp_source_revision(&mut words, &matched.place, facts);
     RemoteRun {
         host: matched.config.host().to_owned(),
         slots: matched.config.slots(),
@@ -345,12 +594,21 @@ fn remote_run(matched: Matched<'_>, subfolder: String, given: &[String], facts: 
     }
 }
 
-/// The words without each that is exactly `--no-build`, for a dotnet command; any other command's words unchanged.
-fn without_no_build(words: Vec<String>, dotnet: bool) -> Vec<String> {
-    if !dotnet {
+/// The words without each of the dotnet command's own words ([`is_dotnet`]) that is exactly `--no-build`, when its
+/// verb is one of [`NO_BUILD_DROP_VERBS`]: a word before a wrapping script's `--` or after the dotnet command's own
+/// `--` stays, and the words of any other command, `dotnet pack`, `dotnet publish`, `dotnet app.dll`, `dotnet exec`,
+/// `dotnet tool run` and a command naming a response file among them, are unchanged.
+#[must_use]
+pub fn without_no_build(words: Vec<String>) -> Vec<String> {
+    let Some(own) = dotnet_own(&words).filter(|own| verb_in(&words[own.clone()], &NO_BUILD_DROP_VERBS)) else {
         return words;
-    }
-    words.into_iter().filter(|word| word != NO_BUILD).collect()
+    };
+    words
+        .into_iter()
+        .enumerate()
+        .filter(|(index, word)| !(own.contains(index) && word == NO_BUILD))
+        .map(|(_, word)| word)
+        .collect()
 }
 
 /// Writes the first non-empty word `./name` when it is a bare name (no separator, drive or `.`/`..`) of a file in the
@@ -366,11 +624,11 @@ fn mark_bare_first_word(words: &mut [String], facts: &dyn Facts) {
 }
 
 /// Writes `-p:SourceRevisionId=<the worktree's HEAD sha>` into the builder's words of a dotnet command that builds,
-/// before the first word that is exactly `--` (or after the last word when it has none), so the builder's build is
-/// pinned to the revision the snapshot came from. The words of a command that is no such dotnet command, that already
-/// sets `SourceRevisionId` before its `--`, or whose HEAD cannot be read are left as they are.
-fn stamp_source_revision(words: &mut Vec<String>, dotnet: bool, place: &Place, facts: &dyn Facts) {
-    let Some(at) = stamp_at(words, dotnet) else {
+/// after the dotnet command's own words (before its own `--`, or after the last word when it has none), so the
+/// builder's build is pinned to the revision the snapshot came from. The words of a command that is no such dotnet
+/// command, whose own words already set `SourceRevisionId`, or whose HEAD cannot be read are left as they are.
+fn stamp_source_revision(words: &mut Vec<String>, place: &Place, facts: &dyn Facts) {
+    let Some(at) = stamp_at(words) else {
         return;
     };
     if let Ok(Some(sha)) = facts.head_sha(place) {
@@ -379,24 +637,16 @@ fn stamp_source_revision(words: &mut Vec<String>, dotnet: bool, place: &Place, f
 }
 
 /// Where the source-revision word goes in the builder's words, or `None` when the command gets none: not a dotnet
-/// command, no verb that builds, or a word before the `--` that already sets `SourceRevisionId`.
-fn stamp_at(words: &[String], dotnet: bool) -> Option<usize> {
-    if !dotnet || !builds(words) {
-        return None;
-    }
-    let before = words.iter().position(|word| word == SEPARATOR).unwrap_or(words.len());
-    (!words[..before].iter().any(|word| sets_property(word, SOURCE_REVISION))).then_some(before)
+/// command, no verb that builds, or one of the dotnet command's own words already sets `SourceRevisionId`.
+fn stamp_at(words: &[String]) -> Option<usize> {
+    let own = dotnet_own(words)?;
+    let own_words = &words[own.clone()];
+    (builds(own_words) && !own_words.iter().any(|word| sets_property(word, SOURCE_REVISION))).then_some(own.end)
 }
 
-/// Whether a dotnet command's words build: the next non-empty word after the dotnet word is one of [`BUILD_VERBS`],
-/// compared ignoring letter case.
+/// Whether a dotnet command's words, its dotnet word first, build: its verb ([`verb`]) is one of [`BUILD_VERBS`].
 fn builds(words: &[String]) -> bool {
-    first_word(words).is_some_and(|(index, _)| {
-        words[index + 1..]
-            .iter()
-            .find(|word| !word.is_empty())
-            .is_some_and(|verb| BUILD_VERBS.iter().any(|building| eq_ignoring_case(verb, building)))
-    })
+    verb_in(words, &BUILD_VERBS)
 }
 
 /// Whether a word sets the `MSBuild` property `name`: one of [`PROPERTY_SWITCHES`] and a `;`- or `,`-separated list in

@@ -86,6 +86,8 @@ fn run(args: &[OsString]) -> Result<i32, String> {
                 }
                 break;
             }
+            // A dotnet verb that builds, which a copy named dotnet.exe takes first, as dotnet does, and then runs on.
+            "test" => {}
             "out" => writeln!(stdout, "{}", operand(&mut steps, "out")?).map_err(|error| write_failed(&error))?,
             "env" => writeln!(stdout, "{}", variable(&operand(&mut steps, "env")?)).map_err(|error| write_failed(&error))?,
             "bytes" => stdout

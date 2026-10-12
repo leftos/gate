@@ -148,7 +148,7 @@ pub(crate) struct RemoteCall<'a> {
 }
 
 /// What the client hands back: the status, a refusal's reason, whether it killed the run, the lines it wrote to the
-/// log, and why it could not start.
+/// log, why it could not start, and whether the run's outputs were brought back.
 #[derive(Debug, Default)]
 pub(crate) struct RemoteOutcome {
     pub status: i64,
@@ -157,6 +157,9 @@ pub(crate) struct RemoteOutcome {
     pub lines: Vec<String>,
     /// Why the client could not start its run, or could not say its lines.
     pub detail: Option<String>,
+    /// Whether the run's outputs were brought back: `None` when the client cannot tell, which counts as not brought
+    /// back.
+    pub brought_back: Option<bool>,
 }
 
 impl RemoteOutcome {

@@ -18,7 +18,8 @@ Suite = `crates/gate/tests/suite/` (binary `suite`, needs `--all-features`; test
 |---|---|---|
 | main.rs | all (entry; `answer::answer`, exit-status cast) | CENTRAL |
 | answer.rs | all; dispatch per subcommand, usage errors (`cli`), `--test-print-request` branch (`request`, `compat`, `cutover`, `harness`, `launcher`) | CENTRAL |
-| run.rs | all runs: launch, hold, stall, ceiling, cores, journal, slots, critical, nesting, routing, bridge, remote_client, interrupt, diagnostics, priority, build_servers, pause | CENTRAL |
+| run.rs | all runs: launch, hold, stall, ceiling, cores, journal, slots, critical, nesting, routing (the local `--no-build` drop, its lines and kinds, the nothing-back record's write and clear), bridge, remote_client, interrupt, diagnostics, priority, build_servers, pause | CENTRAL |
+| no_build.rs | `routing` (the drop reasons, the obj check, the record's write, clear and unreadable cases); the unit tests inside (record read, solution readers, `Directory.Build.*` skip, listing parse) | no: routing |
 | resolve.rs | `request` (state root from `--state-dir`/`GATE_STATE_DIR`, log path), `compat`, `harness`, `launch` (log inside state root); used by every run | CENTRAL (resolve.rs:`root`/`log` on every run) |
 | console.rs | every case reads stdout/stderr lines; `launch`, `hold`, `cli` | CENTRAL |
 | log.rs | `launch` (log, `.err`, marker scan, tail, verdict line), `diagnostics` (block before kill, tail), `stall`/`ceiling` (kill lines in log), `hold` | no: launch, diagnostics, stall, ceiling, hold, cli, interrupt, boxside (shares log rules? no, box has own) |
@@ -64,11 +65,11 @@ Suite = `crates/gate/tests/suite/` (binary `suite`, needs `--all-features`; test
 | gate-args compat.rs | `compat`, `launcher`, `request`, `cli` | args `compat` | no |
 | gate-args boxcmd.rs | `boxside`, `boxside::outputs`, `remote_client` | args `boxcmd` | no |
 | gate-args cmdline.rs / batch.rs / program.rs | `launch` (quoting, refused batch word, `.cmd`), `journal` (`command_text`), `boxside`, `remote_client` | args `quoting`, `batch`, `program` | no |
-| gate-router (decide, rewrite, key, like, config) | `routing` (imports `DROPPED_NO_BUILD_LINE`, `NO_OUTPUTS_LINE`), `remote_client` (`repo_name`), `bridge`, `request` | `gate-router::router` | no |
-| gate-state v1.rs / root.rs / model.rs / lib.rs | everything (claim/ticket/counts/root hash/kernel names): CENTRAL. Suite itself reads `v1` in `critical, interrupt, journal, launch, nesting, pause, priority, slots` | `gate-state::state` | CENTRAL |
+| gate-router (decide, rewrite, key, like, config) | `routing` (imports `DROPPED_NO_BUILD_LINE`, `NO_OUTPUTS_LINE`; `decide.rs`'s dotnet readers also drive the local drop and the record), `remote_client` (`repo_name`), `bridge`, `request` | `gate-router::router` (`decide`: the wrapped form, the drop verbs, the targets and settings) | no |
+| gate-state v1.rs / root.rs / model.rs / lib.rs | everything (claim/ticket/counts/root hash/kernel names): CENTRAL. Suite itself reads `v1` in `critical, interrupt, journal, launch, nesting, pause, priority, slots`; `v1.rs`'s nothing-back record (path, write, strict read) is also read in `routing` | `gate-state::state` (`v1`: the record's shape and strict read) | CENTRAL |
 | gate-state journal_writer.rs / verdict.rs | `journal` + any journal assertion: `cores, nesting, routing, slots, critical, stall, launch, interrupt, bridge` | state `journal_write`, `verdict` | no, but wide (writes on every run) |
 | gate-state archive.rs | `journal` (rollover and archive with concurrent appenders) | state `archive` | no |
-| gate-state cutover.rs / drain.rs / counts.rs | `cutover`, `launcher` (gate/src/cutover.rs imports `copy_slot_counts_to_v1, powershell_gates, write_cutover_flag`) | state `cutover`, `counts` | no |
+| gate-state cutover.rs / drain.rs / counts.rs | `cutover`, `launcher` (gate/src/cutover.rs imports `copy_slot_counts_to_v1, powershell_gates, write_cutover_flag`); `counts.rs`'s `write_replacing` (the temp names) also writes the v1 files, so a change there adds `routing` | state `cutover`, `counts`; a unit test inside `counts.rs` for the temp names | no |
 | gate-state tests/state/fixtures/ (captured files, `capture-*.ps1`) and tests/state/fixtures.rs | none (the fixtures are captured from `gate.exe` and the PowerShell gate by script and only read by the state tests) | state `fixtures` (incl. `remote_run_journal_from_gate_exe_is_read_into_runs_and_a_split_summary`) | no |
 | gate-state claims.rs / remote.rs / state.rs / win32.rs / journal.rs (reader) | NOT imported by gate src (ops-tower-only, ARCHITECTURE.md Layers; except `normalize_command` from journal.rs, used by `slots.rs`:642 and journal.rs's command text -> `journal`, `slots`) | state tests | no (journal.rs: `journal`, `slots`) |
 | gate-watchdog share.rs / watch.rs | `stall`, `ceiling`, `cores`, `pause`, `diagnostics`, `interrupt`, `build_servers`, `priority` | unit | no (wide) |
@@ -120,6 +121,7 @@ Always add `checkout` to any change that touches a suite file or adds a seam.
 | escaped.rs | `-E 'binary(suite) and test(/^(stall\|cores\|interrupt\|ceiling)::/) or (U and test(/^escaped::/))'` |
 | burn.rs | `-E 'binary(suite) and test(/^(burn\|cli)::/) or (U and test(/^burn::/))'` |
 | request_json.rs | `-E 'binary(suite) and test(/^(request\|compat\|cutover\|launcher\|harness)::/)'` |
+| no_build.rs | `-E 'binary(suite) and test(/^routing::/) or (U and test(/^(no_build\|run)::/))'` |
 | route.rs | `-E 'binary(suite) and test(/^(routing\|remote_client\|bridge\|request)::/) or (U and test(/^route::/))'` |
 | remote/mod.rs | `-E 'binary(suite) and test(/^(routing\|bridge\|remote_client)::/) or (U and test(/^remote::/))'` |
 | remote/bridge.rs, tools/remote-bridge.ps1 | `-E 'binary(suite) and test(/^(bridge\|routing\|install)::/) or (U and test(/^remote::bridge::/))'` |

@@ -173,6 +173,83 @@ fn the_outputs_pending_marker_sits_in_the_remote_folder() {
 }
 
 #[test]
+fn the_nothing_back_record_sits_in_the_remote_folder() {
+    let root = Path::new("state-root");
+
+    assert_eq!(
+        parts_under(root, &v1::nothing_back_path(root, "app-1a2b3c4d")),
+        ["remote", "app-1a2b3c4d.nothing-back"]
+    );
+}
+
+#[test]
+fn a_nothing_back_record_is_written_whole_over_any_other_and_read_back() {
+    let root = scratch("nothing-back");
+    let path = v1::nothing_back_path(&root, "app-1a2b3c4d");
+
+    v1::write_nothing_back(&path, &record("builder", None)).expect("the record can be written");
+    let first = fs::read(&path).expect("the record can be read");
+    let other = v1::NothingBackRecord {
+        framework: Some("net10.0".to_owned()),
+        runtime: Some("win-x64".to_owned()),
+        ..record("other", Some("Release"))
+    };
+    v1::write_nothing_back(&path, &other).expect("a record can be written over another");
+
+    assert_eq!(
+        String::from_utf8_lossy(&first),
+        r#"{"v":1,"host":"builder"}"#,
+        "an absent setting is left out"
+    );
+    let bytes = fs::read(&path).expect("the record can be read");
+    assert_eq!(
+        String::from_utf8_lossy(&bytes),
+        r#"{"v":1,"host":"other","configuration":"Release","framework":"net10.0","runtime":"win-x64"}"#
+    );
+    assert_eq!(v1::nothing_back_record(&bytes).expect("the record reads"), other);
+    let names: Vec<_> = fs::read_dir(v1::remote_dir(&root))
+        .expect("the remote folder can be listed")
+        .map(|entry| entry.expect("an entry can be read").file_name())
+        .collect();
+    assert_eq!(names, ["app-1a2b3c4d.nothing-back"], "no temp file is left beside it");
+}
+
+/// A nothing-back record naming `host`, with `configuration` and no framework or runtime.
+fn record(host: &str, configuration: Option<&str>) -> v1::NothingBackRecord {
+    v1::NothingBackRecord {
+        host: host.to_owned(),
+        configuration: configuration.map(str::to_owned),
+        framework: None,
+        runtime: None,
+    }
+}
+
+#[test]
+fn a_nothing_back_record_of_another_shape_names_no_builder() {
+    let rows: [(&str, &[u8]); 8] = [
+        ("no JSON", b"{\"v\":1,"),
+        ("another version", br#"{"v":2,"host":"builder"}"#),
+        ("no version", br#"{"host":"builder"}"#),
+        ("no host", br#"{"v":1}"#),
+        ("a host that is no string", br#"{"v":1,"host":7}"#),
+        ("a duplicate key", br#"{"v":1,"host":"a","host":"b"}"#),
+        ("not UTF-8", b"{\"v\":1,\"host\":\"\xff\"}"),
+        ("a setting that is no string", br#"{"v":1,"host":"builder","runtime":7}"#),
+    ];
+    for (label, bytes) in rows {
+        assert!(v1::nothing_back_record(bytes).is_err(), "{label}");
+    }
+    assert_eq!(
+        v1::nothing_back_record(br#"{"v":1,"host":"builder"}"#).expect("a record from before the settings"),
+        record("builder", None)
+    );
+    assert_eq!(
+        v1::nothing_back_record(br#"{"v":1,"host":"builder","configuration":"Debug"}"#).expect("a record"),
+        record("builder", Some("Debug"))
+    );
+}
+
+#[test]
 fn a_pause_marker_name_builds_and_parses_and_refuses_anything_else() {
     let marker = v1::PauseMarker {
         parent_pid: 4242,

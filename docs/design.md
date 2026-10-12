@@ -247,6 +247,7 @@ The lines of a run that starts its command:
   The second line is said for `--local` (`gate: not routed: --local`), a word outside the worktree (`gate: not routed: <word> is outside the worktree`), a folder that holds nothing the snapshot sends (`gate: not routed: <sub> holds nothing the snapshot sends`), a word of the command that is not valid Unicode (`gate: not routed: a word of the command is not valid Unicode`), or a fact that could not be read (`gate: not routed: cannot run git: <error>`, or the working directory or git's output).
 
   A gate that is not heavy, has a covering parent, matches no pattern or has no `remote.json` says nothing.
+- A local run that drops its dotnet `--no-build`, on stderr and in the log, before it takes a slot: `gate: dropped --no-build: <reason>; building on a heavy slot`, or `gate: dropped --no-build: <reason>; building on the parent gate's <heavy|critical|light> slot` for a gate covered or lent a slot ([Routing](#routing-and-the-remoteps1-bridge)).
 - A routed run, on stderr and in the log, after any `gate: dropped --no-build: the last build may have run on the other machine` and `gate: outputs: none brought back for a --no-build command` lines. While it waits for a remote slot: `gate: waiting for a remote slot on <host> (<n> busy)` and `gate: still waiting for a remote slot on <host> (<s> s)`, as a local wait says them.
 
   A run the builder does not take says why and goes on here: `gate: remote <host> <reason>; running here`, with `<reason>` one of `full` (no remote slot within 60 s), `busy`, `unreachable`, `parity`, `rebooted`, `tools` or `version`, and `gate: remote <host> client could not start: <detail>; running here` when the remote client cannot start.
@@ -358,7 +359,10 @@ For any other root, every kernel object name carries `<h>`, the first 8 lower-ca
 | `archive\events-<yyyyMMddTHHmmssZ>.jsonl.gz` | the gate whose append rolled the journal | the durations summary | [Archive](#archive). |
 | `durations.json`, `backfill\<pid>.json` and the backfill bar record | gates | gates | Reserved for learned durations (GATE-7; [design/gate-durations.md](design/gate-durations.md)). |
 | `remote\<key>.outputs-pending` | the bridged remote client, and the Rust remote client (dormant) | the same | Empty file. Written by `remote.ps1` while the bridge stands (D1). The Rust client writes it after the push and before a routed run's run call when the run has output globs, so a run refused at the preflight or by the parity check leaves none, removes it only after an accepted `gate-remote-outputs: 0`, and sends `OutputsFull` while it stands ([The remote client's run](#routing-and-the-remoteps1-bridge)). |
-`<start>` everywhere in a name is the process start time in Unix epoch milliseconds. Claims, tickets and counts are written to a temporary sibling (`<file>.<pid>.<n>.tmp`, where `<n>` is a per-process counter so two threads of one process never share one) and moved over the target, so a reader never sees a torn file (kept, L1, Q1).
+| `remote\<key>.nothing-back` | the gate, after a routed dotnet build ends on the builder | every gate (the `--no-build` drop and the clear) | JSON `{"v":1,"host":"…","configuration":"…","framework":"…","runtime":"…"}`; the last three are optional and come from the routed build's own `-c`, `-f` and `-r` words. A passing local build of the whole worktree with the same three removes it ([Routing](#routing-and-the-remoteps1-bridge)). Written with create-new and the reparse-point flag, and read the same way, 4096 bytes at most; one that cannot be read counts as present. |
+`<start>` everywhere in a name is the process start time in Unix epoch milliseconds. Claims, tickets, counts and the nothing-back record are written to a temporary sibling (`<file>.<pid>.<n>.tmp`, where `<n>` is a per-process counter so two threads of one process never share one) and moved over the target, so a reader never sees a torn file (kept, L1, Q1).
+
+The temporary sibling is made new, a link or junction at its name opened as itself, and an entry that already stands at a name is left and the next name tried. A write never removes an entry it did not create: after 16 names it fails with `something already stands at each of 16 temp names beside <path>`.
 
 ### Kernel object names
 
@@ -856,15 +860,41 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
   A matched command still runs here, saying why, when a word names a path outside the worktree or the gate's folder holds nothing the snapshot sends.
 
-  `--no-build` is dropped from the builder's words of a dotnet command, saying so (T4); the fallback here drops each exact `--no-build` word of a dotnet command after every refusal, rebuilding locally as the builder would have, because an earlier routed step (a repo's test-all build) may have built only on the builder, so a later `dotnet test --no-build` that falls back here would find no build output.
+  `--no-build` is dropped from the builder's words of a dotnet `test` or `run` command, saying so (T4); `build`, `msbuild`, `pack` and `publish` keep it everywhere. The fallback here drops the same words after every refusal, rebuilding locally as the builder would have, because an earlier routed step (a repo's test-all build) may have built only on the builder, so a later `dotnet test --no-build` that falls back here would find no build output.
 
   A step that really did build here pays a second local build on a refusal, a cost accepted. A fallback that drops no word reuses the first plan.
 
+  A dotnet command is one whose first word's file name without extension is `dotnet`, or is `pwsh` or `powershell` with `--` followed by a `dotnet` word (a script handed a dotnet command to run), each compared in any letter case. A dotnet command's own words run from its `dotnet` word to its next `--`, and only they are read: a `--no-build` after that `--`, or before a wrapping script's `--`, belongs to another program and stays, so plain `dotnet test -- --no-build` keeps the word.
+
+  A dotnet command with a word starting with `@` (a response file) is opaque, since the gate cannot see its words: it drops no word, gets no `SourceRevisionId` stamp, writes no nothing-back record and clears none.
+
+  A run that stays local (the Local route) drops the same `--no-build` words before it takes a slot, when it would find no build here, saying `gate: dropped --no-build: <reason>; building on a heavy slot`, or `gate: dropped --no-build: <reason>; building on the parent gate's <heavy|critical|light> slot` under a covering or lending parent. A routed run is never dropped here. `<reason>` is one of two:
+  - `the last build ran on <host> and brought nothing back`, when the worktree's nothing-back record stands (`<host>` is the record's builder, else `the builder`).
+  - `<project> has no obj\project.assets.json here`, asked only when no record stands.
+
+  A dropped run is a build, so it takes a heavy slot whatever kind it named: its queue, take and release journal lines, its ticket and its claim show kind `heavy` and the command without `--no-build`. A light child of a light parent is no longer covered after the drop, and a heavy run the drop makes uncovered asks its light parent again whether it lends its slot. The covered, ignored-marker and could-not-judge lines are said after the drop is decided and name the final kind.
+
+  The obj check covers the project the command names (a project file, or `--project`), else the projects a named `.sln`, `.slnx` or `.slnf` lists, else the worktree's tracked `*.csproj`, `*.fsproj` and `*.vbproj` (`git ls-files`).
+
+  The check is skipped, and the word kept, when the worktree root's `Directory.Build.props` or `Directory.Build.targets` names `UseArtifactsOutput`, `ArtifactsPath`, `BaseIntermediateOutputPath` or `MSBuildProjectExtensionsPath`. Solution entries that are not plain names inside the worktree are skipped.
+
+  Props and solution files are read only as regular files up to 1 MiB; otherwise the gate says `gate: cannot read <path>: it is a link, a junction or not a file` or `gate: cannot read <path>: it is larger than 1 MiB`, and the word is kept. Printed paths escape control characters. When git fails the gate says `gate: cannot find the command's git worktree: <error>` or `gate: cannot list the worktree's projects: <error>` and keeps the word.
+
+  The git calls of the drop and the clear run with `LC_ALL=C`. The clear prints nothing when git is missing or the folder is outside a repository.
+
+  The nothing-back record ([State root](#files), [Glossary](GLOSSARY.md)) is written by every routed dotnet build (verb `build`, `test`, `publish`, `pack`, `run` or `msbuild`, with no `--no-build` of its own) that ends on the builder, a failed, killed or interrupted run included, because the bridge cannot tell what came back.
+
+  A fallback after a refusal writes none, and neither does a client that knows all the outputs were brought back. A routed run whose outputs were not fully brought back counts as nothing brought back. A record that cannot be written says `gate: cannot write <path>: <error>`.
+
+  A passing build here clears the record only when all three hold: its verb is not `msbuild`; it names a solution, or names nothing and runs at the worktree root; its `-c`, `-f` and `-r` words match the record's, ignoring letter case, an absent word equal to an absent one. A build that names one project, or runs from a subfolder, does not clear it. A record that cannot be removed says `gate: cannot remove <path>: <error>`.
+
+  A record that cannot be read counts as present, saying `gate: cannot read <path>: <error>`: a record wrongly taken as present costs one build here, one wrongly taken as missing a `--no-build` run that finds no build.
+
   Each routed run pushes a new snapshot commit, and the .NET SDK stamps the source revision into every assembly's informational version, so without a pinned revision a routed build recompiled every project on every run.
 
-  A routed dotnet command whose verb (the next non-empty word after `dotnet`, in any letter case) is `build`, `test`, `publish`, `pack`, `run` or `msbuild` therefore gets `-p:SourceRevisionId=<the worktree's HEAD sha>` on the builder's words only: before the first standalone `--`, else at the end.
+  A routed dotnet command whose verb (the next non-empty word after `dotnet`, in any letter case) is `build`, `test`, `publish`, `pack`, `run` or `msbuild` therefore gets `-p:SourceRevisionId=<the worktree's HEAD sha>` on the builder's words only: after the dotnet command's own words, before its own `--`, else at the end (a wrapped dotnet command gets it before dotnet's own `--` too).
 
-  The word is not added when a word before the `--` already sets `SourceRevisionId` (`-p:`, `/p:`, `-property:`, `/property:` or `--property:`, in any letter case, alone or in a list separated by `;` or `,`). The sha comes from `git rev-parse --verify -q HEAD` in the worktree root, asked only of a command that would get the word; when that fails or the branch is unborn the run routes without it.
+  The word is not added when one of the dotnet command's own words already sets `SourceRevisionId` (`-p:`, `/p:`, `-property:`, `/property:` or `--property:`, in any letter case, alone or in a list separated by `;` or `,`). The sha comes from `git rev-parse --verify -q HEAD` in the worktree root, asked only of a command that would get the word; when that fails or the branch is unborn the run routes without it.
 
   The SDK keeps an explicit value (its git targets fill `SourceRevisionId` only when it is empty) and a `-p:` global property overrides a repo's own `<SourceRevisionId>`, so the builder's DLLs read `1.0.0+<HEAD sha>` as a local build's do, and a no-change routed build compiles nothing. The fallback here, the journal and the claim keep the command as given, and no output line says the word was added.
 - **The decision is `gate-router`'s**, pure, over facts the caller gives it and the decision asks for lazily, in this order. A light or critical gate, or one under a covering or lending parent, stays local silently and reads nothing. `--local` stays local, saying `gate: not routed: --local`. Only then is `remote.json` read: no file stays local silently, and a file that is not a file, cannot be read or is refused stays local saying `gate: ignored <path>: <reason>; running locally`.
@@ -1443,7 +1473,7 @@ A virtual Cargo workspace (`resolver = "3"`) with every crate under `crates/`, l
 | `gate-win32` | The Win32 layer: job objects, process creation, named mutexes and events, priority, console, the WSL VM's CPU reader, the samples the watchdog consumes. | no |
 | `gate-watchdog` | Free-share, load-adjusted clock, stall, ceiling and backstop arithmetic over samples with the kill lines, and the box heartbeat, on an injected clock; the cores-hint verdict. | yes; a pure crate |
 | `gate-args` | The gate's own argv: the subcommand CLI, the compatibility layer, the C-runtime and cmd.exe quoting, the `%VAR%` refusals and the PATHEXT resolution rules over an injected environment and file lookup. | yes; a pure crate |
-| `gate-router` | The routing rules (T2-T4) over strings: what routes, the path rewrite, the `--no-build` drop. | yes; a pure crate |
+| `gate-router` | The routing rules (T2-T4) over strings: what routes, the path rewrite, the `--no-build` drop (`test` and `run` only), the wrapped dotnet form. | yes; a pure crate |
 | `gate` | The `gate` binary: the subcommands, the wait loop, the run, the journal writes, the bridge and `gate box`. | no |
 
 Rules:

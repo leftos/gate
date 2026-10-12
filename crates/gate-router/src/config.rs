@@ -295,6 +295,13 @@ const HOSTS_REFUSALS: HostRefusals = HostRefusals {
     characters: "hosts entries must each be an ssh alias or user@host of letters, digits, '.', '_' and '-', not starting with '-'",
 };
 
+/// Whether `host` is one a routing file's `host` may hold: an ssh alias or `user@host` of letters, digits, `.`, `_`
+/// and `-`, not starting with `-`, and not one letter.
+#[must_use]
+pub fn is_usable_host(host: &str) -> bool {
+    checked_host(&Value::String(host.to_owned()), &HOST_REFUSALS).is_ok()
+}
+
 /// `value` as a host, or the reason from `refusals` it is refused for.
 fn checked_host(value: &Value, refusals: &HostRefusals) -> Result<String, String> {
     match value {

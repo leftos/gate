@@ -5,7 +5,9 @@
 use std::path::PathBuf;
 
 use gate_router::{
-    Config, ConfigProblem, DROPPED_NO_BUILD_LINE, Inputs, LocalReason, NO_OUTPUTS_LINE, Place, RemoteRun, Route, Slot, decide, work_folder_key,
+    BuildSettings, BuildTarget, Config, ConfigProblem, DROPPED_NO_BUILD_LINE, DotnetTarget, Inputs, LocalReason, NO_OUTPUTS_LINE, PROJECT_EXTENSIONS,
+    Place, RemoteRun, Route, Slot, build_settings, decide, dotnet_builds, dotnet_target, is_dotnet, is_usable_host, sdk_build_target,
+    without_no_build, work_folder_key,
 };
 
 use crate::support::{FakeFacts, HEAD, ROOT, heavy, words};
@@ -424,6 +426,305 @@ fn a_dotnet_no_build_command_brings_no_outputs_back() {
     assert!(run.outputs_withheld);
     assert_eq!(run.lines(), [DROPPED_NO_BUILD_LINE, NO_OUTPUTS_LINE]);
     assert_eq!(NO_OUTPUTS_LINE, "gate: outputs: none brought back for a --no-build command");
+}
+
+/// Asserts whether `given` is a dotnet command, and the words it leaves once each `--no-build` of the dotnet command's
+/// own is dropped.
+fn assert_dotnet(given: &[&str], dotnet: bool, dropped: &[&str]) {
+    let given = words(given);
+    assert_eq!(is_dotnet(&given), dotnet, "{given:?}");
+    assert_eq!(without_no_build(given.clone()), dropped, "{given:?}");
+}
+
+#[test]
+fn a_dot_sourced_pwsh_script_handed_dotnet_after_its_separator_is_a_dotnet_command() {
+    assert_dotnet(
+        &["pwsh", ".", "tools/hidden-desktop.ps1", "--", "dotnet", "test", "--no-build", "."],
+        true,
+        &["pwsh", ".", "tools/hidden-desktop.ps1", "--", "dotnet", "test", "."],
+    );
+}
+
+#[test]
+fn a_pwsh_file_script_handed_dotnet_build_is_a_dotnet_command() {
+    let given = ["pwsh", "-NoProfile", "-File", "tools/x.ps1", "--", "dotnet", "build"];
+    assert_dotnet(&given, true, &given);
+}
+
+#[test]
+fn the_pwsh_and_dotnet_words_are_file_stems_compared_ignoring_case() {
+    assert_dotnet(
+        &["pwsh.exe", "-File", "x.ps1", "--", "DOTNET.exe", "test", "--no-build"],
+        true,
+        &["pwsh.exe", "-File", "x.ps1", "--", "DOTNET.exe", "test"],
+    );
+}
+
+#[test]
+fn powershell_wraps_a_dotnet_command_as_pwsh_does() {
+    assert_dotnet(
+        &["powershell.exe", "-File", "x.ps1", "--", "dotnet", "test", "--no-build"],
+        true,
+        &["powershell.exe", "-File", "x.ps1", "--", "dotnet", "test"],
+    );
+}
+
+#[test]
+fn dotnet_itself_is_a_dotnet_command() {
+    assert_dotnet(&["dotnet", "test", "--no-build"], true, &["dotnet", "test"]);
+}
+
+#[test]
+fn a_pwsh_script_handed_dotnet_without_a_separator_is_no_dotnet_command() {
+    let given = ["pwsh", "-File", "x.ps1", "dotnet", "test", "--no-build"];
+    assert_dotnet(&given, false, &given);
+}
+
+#[test]
+fn a_pwsh_script_whose_separator_is_not_followed_by_dotnet_is_no_dotnet_command() {
+    let given = ["pwsh", "-File", "x.ps1", "--", "echo", "dotnet"];
+    assert_dotnet(&given, false, &given);
+}
+
+#[test]
+fn a_script_run_by_anything_but_pwsh_is_no_dotnet_command() {
+    let given = ["cmd", "/c", "x.cmd", "--", "dotnet", "test", "--no-build"];
+    assert_dotnet(&given, false, &given);
+}
+
+#[test]
+fn a_no_build_after_the_wrapped_dotnet_commands_own_separator_is_kept() {
+    let given = ["pwsh", "-File", "x.ps1", "--", "dotnet", "test", "--", "--no-build"];
+    assert_dotnet(&given, true, &given);
+}
+
+#[test]
+fn only_the_words_after_the_wrapping_separator_lose_their_no_build() {
+    assert_dotnet(
+        &["pwsh", "-File", "x.ps1", "--no-build", "--", "dotnet", "test", "--no-build"],
+        true,
+        &["pwsh", "-File", "x.ps1", "--no-build", "--", "dotnet", "test"],
+    );
+}
+
+#[test]
+fn a_no_build_after_dotnets_own_separator_is_left_for_the_program_it_runs() {
+    let given = ["dotnet", "test", "--", "--no-build"];
+    assert_dotnet(&given, true, &given);
+}
+
+#[test]
+fn only_the_sdk_verbs_that_take_no_build_lose_it() {
+    let kept: [&[&str]; 4] = [
+        &["dotnet", "app.dll", "--no-build"],
+        &["dotnet", "exec", "x.dll", "--no-build"],
+        &["dotnet", "tool", "run", "t", "--no-build"],
+        &["pwsh", "-File", "x.ps1", "--", "dotnet", "exec", "x.dll", "--no-build"],
+    ];
+    for given in kept {
+        assert_dotnet(given, true, given);
+    }
+    for verb in ["test", "run", "Test", "RUN"] {
+        assert_dotnet(&["dotnet", verb, "--no-build"], true, &["dotnet", verb]);
+    }
+    for verb in ["build", "publish", "pack", "msbuild", "Pack"] {
+        let given = ["dotnet", verb, "--no-build"];
+        assert_dotnet(&given, true, &given);
+    }
+}
+
+#[test]
+fn a_dotnet_command_with_a_response_file_is_opaque() {
+    for given in [
+        &["dotnet", "test", "@x.rsp", "--no-build"][..],
+        &["pwsh", "-File", "x.ps1", "--", "dotnet", "test", "--no-build", "@args.rsp"],
+    ] {
+        assert_eq!(without_no_build(words(given)), given, "no drop: {given:?}");
+    }
+    assert!(!dotnet_builds(&words(&["dotnet", "build", "@x.rsp"])), "no record and no clear");
+    assert_eq!(dotnet_target(&words(&["dotnet", "build", "All.sln", "@x.rsp"])), None);
+    assert_eq!(sdk_build_target(&words(&["dotnet", "build", "@x.rsp"])), None);
+    assert!(
+        dotnet_builds(&words(&["dotnet", "test", "--", "@x.rsp"])),
+        "a word for the program it runs is not dotnet's"
+    );
+    let run = routed(decide(&heavy(&words(&["dotnet", "test", "@x.rsp", "--no-build"])), &FakeFacts::at_root()));
+    assert_eq!(run.words, ["dotnet", "test", "@x.rsp", "--no-build"], "no drop and no stamp");
+    assert!(!run.dropped_no_build);
+}
+
+#[test]
+fn a_dotnet_build_reads_its_configuration_framework_and_runtime_in_every_spelling() {
+    let settings = |given: &[&str]| build_settings(&words(given));
+    let set = |configuration: Option<&str>, framework: Option<&str>, runtime: Option<&str>| BuildSettings {
+        configuration: configuration.map(str::to_owned),
+        framework: framework.map(str::to_owned),
+        runtime: runtime.map(str::to_owned),
+    };
+    assert_eq!(settings(&["dotnet", "build"]), BuildSettings::default());
+    for given in [
+        &["dotnet", "build", "-c", "Release", "-f", "net10.0", "-r", "win-x64"][..],
+        &["dotnet", "build", "-c:Release", "-f:net10.0", "-r:win-x64"],
+        &["dotnet", "build", "-c=Release", "-f=net10.0", "-r=win-x64"],
+        &[
+            "dotnet",
+            "build",
+            "--configuration",
+            "Release",
+            "--framework",
+            "net10.0",
+            "--runtime",
+            "win-x64",
+        ],
+        &["dotnet", "build", "--configuration=Release", "--framework=net10.0", "--runtime=win-x64"],
+        &["dotnet", "build", "--configuration:Release", "--framework:net10.0", "--runtime:win-x64"],
+    ] {
+        assert_eq!(settings(given), set(Some("Release"), Some("net10.0"), Some("win-x64")), "{given:?}");
+    }
+    assert_eq!(
+        settings(&["dotnet", "test", "-c", "Debug", "-c", "Release"]),
+        set(Some("Release"), None, None),
+        "the last wins"
+    );
+    assert_eq!(
+        settings(&["dotnet", "test", "--", "-c", "Release"]),
+        BuildSettings::default(),
+        "the program's words"
+    );
+    assert_eq!(
+        settings(&["pwsh", "-File", "x.ps1", "-c", "X", "--", "dotnet", "build", "-r", "linux-x64"]),
+        set(None, None, Some("linux-x64"))
+    );
+    assert!(
+        set(Some("Release"), None, None).same_as(&set(Some("release"), None, None)),
+        "letter case aside"
+    );
+    assert!(
+        !set(Some("Release"), None, None).same_as(&BuildSettings::default()),
+        "absent is not present"
+    );
+    assert!(BuildSettings::default().same_as(&BuildSettings::default()), "absent equals absent");
+    assert!(!set(None, Some("net9.0"), None).same_as(&set(None, Some("net10.0"), None)));
+}
+
+#[test]
+fn a_dotnet_build_names_a_solution_nothing_or_something_else() {
+    let target = |given: &[&str]| sdk_build_target(&words(given));
+    assert_eq!(target(&["dotnet", "build"]), Some(BuildTarget::Unnamed));
+    assert_eq!(
+        target(&["dotnet", "test", "-c", "Release", "-v", "q", "--no-restore"]),
+        Some(BuildTarget::Unnamed)
+    );
+    assert_eq!(target(&["dotnet", "build", "All.sln"]), Some(BuildTarget::Solution));
+    assert_eq!(target(&["dotnet", "build", "-c", "Release", "All.SLNX"]), Some(BuildTarget::Solution));
+    for given in [
+        &["dotnet", "build", "One.csproj"][..],
+        &["dotnet", "run", "--project", "One"],
+        &["dotnet", "build", "src/App"],
+        &["dotnet", "run", "app.cs"],
+        &["dotnet", "build", "-unknown", "value"],
+    ] {
+        assert_eq!(target(given), Some(BuildTarget::Other), "{given:?}");
+    }
+    assert_eq!(target(&["dotnet", "msbuild", "-t:Restore"]), None, "msbuild");
+    assert_eq!(target(&["dotnet", "test", "--no-build"]), None, "no build");
+    assert_eq!(target(&["dotnet", "format"]), None, "a verb that does not build");
+    assert_eq!(PROJECT_EXTENSIONS, [".csproj", ".fsproj", ".vbproj"]);
+}
+
+#[test]
+fn a_dotnet_command_names_the_project_or_solution_it_builds() {
+    let target = |given: &[&str]| dotnet_target(&words(given));
+    let project = |name: &str| Some(DotnetTarget::Project(name.to_owned()));
+    let solution = |name: &str| Some(DotnetTarget::Solution(name.to_owned()));
+    assert_eq!(target(&["dotnet", "build", "One.csproj"]), project("One.csproj"));
+    assert_eq!(
+        target(&["dotnet", "test", "-c", "Release", r"src\Two.FSPROJ"]),
+        project(r"src\Two.FSPROJ")
+    );
+    assert_eq!(target(&["dotnet", "build", "lib/Three.vbproj"]), project("lib/Three.vbproj"));
+    assert_eq!(target(&["dotnet", "run", "--project", "One"]), project("One"));
+    assert_eq!(target(&["dotnet", "run", "--project=One"]), project("One"));
+    assert_eq!(target(&["dotnet", "run", "--project:One"]), project("One"));
+    assert_eq!(target(&["dotnet", "run", "--project"]), project(""));
+    assert_eq!(target(&["dotnet", "build", "All.sln"]), solution("All.sln"));
+    assert_eq!(target(&["dotnet", "build", "All.slnx"]), solution("All.slnx"));
+    assert_eq!(target(&["dotnet", "test", "All.SLNF"]), solution("All.SLNF"));
+    assert_eq!(
+        target(&["pwsh", "-File", "x.ps1", "One.csproj", "--", "dotnet", "build", "All.sln"]),
+        solution("All.sln")
+    );
+    assert_eq!(target(&["dotnet", "build"]), None, "no project");
+    assert_eq!(target(&["dotnet", "build", "src/App"]), None, "a folder names none");
+    assert_eq!(
+        target(&["dotnet", "build", "-p:Main=One.csproj", "/p:X=a.sln"]),
+        None,
+        "a switch names none"
+    );
+    assert_eq!(target(&["dotnet", "test", "--", "One.csproj"]), None, "a word for the program it runs");
+    assert_eq!(target(&["dotnet", "build", ".csproj"]), None, "an extension alone");
+    assert_eq!(target(&["cargo", "build", "One.csproj"]), None, "no dotnet command");
+}
+
+#[test]
+fn a_usable_host_is_one_a_routing_file_may_hold() {
+    assert!(is_usable_host("builder"));
+    assert!(is_usable_host("me@builder-1.lan"));
+    for host in ["", "b", "-x", "bad host", "a@b@c", "x;y"] {
+        assert!(!is_usable_host(host), "{host:?}");
+    }
+}
+
+#[test]
+fn a_dotnet_build_is_a_dotnet_command_whose_verb_builds_without_no_build() {
+    let builds = |given: &[&str]| dotnet_builds(&words(given));
+    assert!(builds(&["dotnet", "build"]));
+    assert!(builds(&[
+        "pwsh",
+        "-File",
+        "x.ps1",
+        "--no-build",
+        "--",
+        "dotnet",
+        "Test",
+        "--",
+        "--no-build"
+    ]));
+    assert!(!builds(&["dotnet", "test", "--no-build"]), "--no-build");
+    assert!(
+        !builds(&["pwsh", "-File", "x.ps1", "--", "dotnet", "test", "--no-build"]),
+        "a wrapped --no-build"
+    );
+    assert!(!builds(&["dotnet", "format"]), "a verb that does not build");
+    assert!(!builds(&["pwsh", "-File", "x.ps1", "dotnet", "build"]), "no dotnet command");
+}
+
+#[test]
+fn a_wrapped_dotnet_command_routes_as_a_dotnet_command() {
+    let command = words(&["pwsh", "-File", "x.ps1", "--no-build", "--", "dotnet", "test", "--no-build", "--", "--x"]);
+    let run = routed(decide(&heavy(&command), &FakeFacts::at_root()));
+    assert_eq!(
+        run.words,
+        [
+            "pwsh",
+            "-File",
+            "x.ps1",
+            "--no-build",
+            "--",
+            "dotnet",
+            "test",
+            stamp().as_str(),
+            "--",
+            "--x"
+        ],
+        "the sha stands before the dotnet command's own --"
+    );
+    assert_eq!(
+        run.fallback,
+        ["pwsh", "-File", "x.ps1", "--no-build", "--", "dotnet", "test", "--", "--x"]
+    );
+    assert_eq!(run.outputs, Vec::<String>::new());
+    assert_eq!(run.lines(), [DROPPED_NO_BUILD_LINE, NO_OUTPUTS_LINE]);
 }
 
 #[test]

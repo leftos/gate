@@ -13,8 +13,11 @@ mod key;
 mod like;
 mod rewrite;
 
-pub use config::{Config, ConfigProblem, DEFAULT_OUTPUTS, ignored_line};
-pub use decide::{DROPPED_NO_BUILD_LINE, Facts, Inputs, LocalReason, NO_OUTPUTS_LINE, Place, RemoteRun, Route, Slot, decide};
+pub use config::{Config, ConfigProblem, DEFAULT_OUTPUTS, ignored_line, is_usable_host};
+pub use decide::{
+    BuildSettings, BuildTarget, DROPPED_NO_BUILD_LINE, DotnetTarget, Facts, Inputs, LocalReason, NO_OUTPUTS_LINE, PROJECT_EXTENSIONS, Place,
+    RemoteRun, Route, Slot, build_settings, decide, dotnet_builds, dotnet_target, is_dotnet, sdk_build_target, without_no_build,
+};
 pub use key::{repo_name, work_folder_key};
 pub use like::{InvalidPattern, Pattern};
 pub use rewrite::{Rewritten, rewrite_words};

@@ -1,6 +1,7 @@
 //! Where a run's command runs: the facts [`gate_router::decide`] asks for, read from the routing file, git and the
 //! drive table, and the lines its decision says. git runs on the run thread, before any command is started.
 
+use std::cell::RefCell;
 use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read};
@@ -21,8 +22,9 @@ const NOT_UNICODE: &str = "a word of the command is not valid Unicode";
 
 /// Decides where `request`'s command runs and says the decision's lines, on stderr and in the log: why a command runs
 /// here when there is a reason to say, or the lines of a routed run. A command that would route but has a word that is
-/// not valid Unicode runs here, saying so. A gate under a `covering_parent`'s slot runs here, saying nothing.
-pub(crate) fn route(request: &RunRequest, environment: &Environment, covering_parent: bool, console: &mut Console) -> Route {
+/// not valid Unicode runs here, saying so. A gate under a `covering_parent`'s slot runs here, saying nothing. With the
+/// route, the gate's place in its git worktree when the decision asked git for it and git gave one.
+pub(crate) fn route(request: &RunRequest, environment: &Environment, covering_parent: bool, console: &mut Console) -> (Route, Option<Place>) {
     let words: Vec<String> = request.command.iter().map(|word| word.to_string_lossy().into_owned()).collect();
     let unicode = request.command.iter().all(|word| word.to_str().is_some());
     let inputs = Inputs {
@@ -37,6 +39,7 @@ pub(crate) fn route(request: &RunRequest, environment: &Environment, covering_pa
         local_app_data: environment.local_app_data.as_deref(),
         git_limit: git::limit(&request.test_seams),
         git_drain: git::drain(&request.test_seams),
+        found: RefCell::new(None),
     };
     let route = match decide(&inputs, &machine) {
         Route::Routed(_) if !unicode => Route::Local {
@@ -51,7 +54,7 @@ pub(crate) fn route(request: &RunRequest, environment: &Environment, covering_pa
         Route::Local { reason: None } => {}
         Route::Routed(run) => run.lines().into_iter().for_each(|line| console.err(line)),
     }
-    route
+    (route, machine.found.into_inner())
 }
 
 /// The queue line's `notRouted`: `--local` for a heavy gate its caller kept here with `--local`, else none.
@@ -92,12 +95,14 @@ pub(crate) fn read_remote_json(path: &Path) -> Result<Option<Config>, ConfigProb
 }
 
 /// This machine's facts: the gate's working folder, or why it cannot be read, the LOCALAPPDATA folder that holds the
-/// routing file, how long each of the decision's git calls may take, and how long its readers get once git has exited.
+/// routing file, how long each of the decision's git calls may take, how long its readers get once git has exited, and
+/// the place git gave when the decision asked.
 struct Machine<'a> {
     folder: io::Result<PathBuf>,
     local_app_data: Option<&'a OsStr>,
     git_limit: Duration,
     git_drain: Duration,
+    found: RefCell<Option<Place>>,
 }
 
 impl Machine<'_> {
@@ -140,7 +145,9 @@ impl Facts for Machine<'_> {
             .read_to_end(&mut bytes)
             .map_err(|error| format!("cannot read git rev-parse's output: {error}"))?;
         let text = String::from_utf8(bytes).map_err(|_| "git rev-parse's output is not valid UTF-8".to_owned())?;
-        parse_place(&text).map(Some)
+        let place = parse_place(&text)?;
+        self.found.replace(Some(place.clone()));
+        Ok(Some(place))
     }
 
     /// The first path `git ls-files` lists, tracked or untracked and not ignored, that is still on disk: an unstaged

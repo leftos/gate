@@ -139,6 +139,19 @@ impl ThisGate {
         })
     }
 
+    /// This gate once it runs `request` in place of the request it was read for: the same process, with `request`'s
+    /// slot kind and command.
+    pub(crate) fn running(&self, request: &RunRequest) -> ThisGate {
+        ThisGate {
+            pid: self.pid,
+            start: self.start,
+            start_ms: self.start_ms,
+            kind: request.slot.as_str(),
+            cwd: self.cwd.clone(),
+            command: gate_args::command_text(&request.command),
+        }
+    }
+
     /// What every journal line of this gate carries, or why the journal cannot be written.
     pub(crate) fn journal_identity(&self) -> Result<JournalIdentity, String> {
         Ok(JournalIdentity {

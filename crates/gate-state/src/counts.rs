@@ -4,7 +4,7 @@
 use std::ffi::OsString;
 use std::fmt;
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
@@ -21,6 +21,11 @@ const WRITE_ATTEMPTS: u32 = 10;
 const WRITE_RETRY_DELAY: Duration = Duration::from_millis(100);
 /// The next `<n>` a temp file name takes, counted across every thread of this process.
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+/// The most temp names one write tries before it gives up on finding one nothing stands at.
+const TEMP_NAMES: u64 = 16;
+/// `FILE_FLAG_OPEN_REPARSE_POINT`: a link or junction is opened as itself. Kept here, as gate-state has no windows-sys.
+#[cfg(windows)]
+const OPEN_REPARSE_POINT: u32 = 0x0020_0000;
 
 /// Why the counts file could not be written.
 #[derive(Debug, thiserror::Error)]
@@ -283,21 +288,52 @@ fn write_counts_file(path: &Path, counts: SlotCounts, text: fn(SlotCounts) -> se
 /// parent folder is made. A reader holding the file blocks the move for that moment, so the move
 /// is tried up to ten times, 100 ms apart.
 pub(crate) fn write_replacing(path: &Path, text: &str) -> io::Result<()> {
+    replace_with(path, |file| file.write_all(text.as_bytes()))
+}
+
+/// [`write_replacing`] with the temp file written by `stage`, which is handed it open: the temp file is made new, a
+/// link or junction standing at its name opened as itself; a name something already stands at is passed over for the
+/// next, up to [`TEMP_NAMES`] names, and what stands there is left. A temp file `stage` fails to write is removed, and
+/// the move over `path` is tried as [`write_replacing`] tries it.
+fn replace_with(path: &Path, stage: impl FnOnce(&mut fs::File) -> io::Result<()>) -> io::Result<()> {
     if let Some(folder) = path.parent()
         && !folder.as_os_str().is_empty()
     {
         fs::create_dir_all(folder)?;
     }
-    let temp = temp_path(path);
-    if let Err(error) = fs::write(&temp, text) {
+    let (temp, mut file) = new_temp(path)?;
+    if let Err(error) = stage(&mut file) {
+        drop(file);
         return Err(remove_partial(&temp, error));
     }
+    drop(file);
     let moved = with_retry(|| fs::rename(&temp, path));
     if moved.is_err() {
         // The write has failed and says so; a temp file this cannot remove stays beside the target, since no later write uses its name.
         let _ = fs::remove_file(&temp);
     }
     moved
+}
+
+/// A temp file made new beside `path` ([`temp_path`]) and its name: a name an entry already stands at is passed over,
+/// the entry left as it is, up to [`TEMP_NAMES`] names.
+fn new_temp(path: &Path) -> io::Result<(PathBuf, fs::File)> {
+    for _ in 0..TEMP_NAMES {
+        let temp = temp_path(path);
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(windows)]
+        std::os::windows::fs::OpenOptionsExt::custom_flags(&mut options, OPEN_REPARSE_POINT);
+        match options.open(&temp) {
+            Ok(file) => return Ok((temp, file)),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        format!("something already stands at each of {TEMP_NAMES} temp names beside {}", path.display()),
+    ))
 }
 
 /// Removes the partial file a failed write left at `temp` and returns `error`, the write's failure; a file that is not
@@ -416,5 +452,54 @@ fn number_text(number: &serde_json::Number) -> String {
         Some(float) if float.fract() == 0.0 && float.abs() < 1e15 => format!("{float:.0}"),
         Some(float) => float.to_string(),
         None => number.to_string(),
+    }
+}
+
+#[cfg(test)]
+#[expect(clippy::expect_used, reason = "a test that cannot make its files must fail loudly")]
+mod tests {
+    use std::fs;
+    use std::io::Write;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::Ordering;
+
+    use super::{TEMP_COUNTER, TEMP_NAMES, replace_with};
+
+    /// The temp name the `n`th write of this process beside `path` takes.
+    fn temp_name(path: &Path, n: u64) -> PathBuf {
+        PathBuf::from(format!("{}.{}.{n}.tmp", path.display(), std::process::id()))
+    }
+
+    #[test]
+    fn a_temp_name_something_stands_at_is_passed_over_and_what_stands_there_is_left() {
+        let folder = std::env::temp_dir().join(format!("gate-state-replace-{}", std::process::id()));
+        fs::create_dir_all(&folder).expect("the folder can be made");
+        let path = folder.join("record");
+        let planted = temp_name(&path, TEMP_COUNTER.load(Ordering::Relaxed));
+        fs::write(&planted, "planted").expect("an entry can be planted");
+
+        replace_with(&path, |file| file.write_all(b"written")).expect("the next name is free");
+
+        assert_eq!(fs::read_to_string(&path).expect("the file reads"), "written");
+        assert_eq!(fs::read_to_string(&planted).expect("the planted entry stays"), "planted");
+
+        let next = TEMP_COUNTER.load(Ordering::Relaxed);
+        let names: Vec<PathBuf> = (next..next + TEMP_NAMES).map(|n| temp_name(&path, n)).collect();
+        for name in &names {
+            fs::write(name, "planted").expect("an entry can be planted");
+        }
+        let error = replace_with(&path, |file| file.write_all(b"other")).expect_err("no temp name is free");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists, "{error}");
+        assert_eq!(fs::read_to_string(&path).expect("the file reads"), "written", "the file stands");
+        for name in &names {
+            assert_eq!(
+                fs::read_to_string(name).expect("the planted entry stays"),
+                "planted",
+                "{}",
+                name.display()
+            );
+        }
+        fs::remove_dir_all(&folder).expect("the folder can be removed");
     }
 }

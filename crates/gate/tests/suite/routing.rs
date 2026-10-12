@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use gate_router::{DROPPED_NO_BUILD_LINE, NO_OUTPUTS_LINE, repo_name};
 use serde_json::{Value, json};
 
+use crate::bridge::{answer, bridge_words, stand_in};
 use crate::nesting::{marked, test_marker};
 
 use crate::support::{
@@ -132,12 +133,12 @@ pub(crate) fn assert_refused(events: &[Value], reason: &str) {
 }
 
 /// A case folder made a checkout of its own, holding fake-tool as `tool.exe`, with a routing file that sends its
-/// `*tool*` and `*dotnet.exe*` commands to the builder.
+/// `*tool*`, `*dotnet.exe*` and `*dotnet.cmd*` commands to the builder.
 pub(crate) fn routed_case(name: &str) -> Case {
     let case = Case::new(name);
     git_init(&case);
     copy_tool(&case, "tool.exe");
-    let routing = json!({ "host": HOST, "repos": { repo(&case): ["*tool*", "*dotnet.exe*"] } });
+    let routing = json!({ "host": HOST, "repos": { repo(&case): ["*tool*", "*dotnet.exe*", "*dotnet.cmd*"] } });
     write_remote_json(&case, &routing.to_string());
     case
 }
@@ -390,7 +391,7 @@ fn a_glob_argument_reaches_the_box_literally() {
 #[test]
 fn no_build_and_other_flags_that_are_not_paths_are_left_alone() {
     let case = routed_case("routing-flags");
-    copy_tool(&case, "dotnet.exe");
+    dotnet_cmd(&case);
     let (other_call, dotnet_call) = (case.folder().join("other.json"), case.folder().join("dotnet.json"));
     let other_steps = shown(&stub(&case, &[&format!("record {}", shown(&other_call)), "refuse busy"]));
     let dotnet_steps = shown(&stub(&case, &[&format!("record {}", shown(&dotnet_call)), "refuse busy"]));
@@ -398,7 +399,7 @@ fn no_build_and_other_flags_that_are_not_paths_are_left_alone() {
     let mut tool = vec![r".\tool.exe", "argv"];
     tool.extend(flags);
     let other = finish(case.gate(&routed_words("tool.log", &other_steps, &[], &tool)));
-    let dotnet_command = [r".\dotnet.exe", "argv", "build", "--no-build"];
+    let dotnet_command = [r".\dotnet.cmd", "test", "--no-build"];
     let dotnet = finish(case.gate(&routed_words("dotnet.log", &dotnet_steps, &[], &dotnet_command)));
 
     assert_eq!((other.code, dotnet.code), (Some(0), Some(0)), "{other:?} {dotnet:?}");
@@ -409,13 +410,14 @@ fn no_build_and_other_flags_that_are_not_paths_are_left_alone() {
     assert_eq!(recorded_words(&recorded(&other_call))[2..], flags, "the box gets the flags as given");
     assert_eq!(
         recorded_words(&recorded(&dotnet_call))[1..],
-        ["argv", "build"],
+        ["test"],
         "the box's dotnet drops --no-build"
     );
     assert!(stdout_lines(&other.stdout).windows(3).any(|words| words == flags), "{other:?}");
     assert_in_order(&dotnet.stderr, &[DROPPED_NO_BUILD_LINE, NO_OUTPUTS_LINE, BUSY_LINE]);
-    assert!(
-        !stdout_lines(&dotnet.stdout).contains(&"--no-build"),
+    assert_eq!(
+        command_lines(&dotnet.stdout),
+        ["test"],
         "a fallback after any refusal drops --no-build: {dotnet:?}"
     );
     let events = events(&case);
@@ -426,7 +428,7 @@ fn no_build_and_other_flags_that_are_not_paths_are_left_alone() {
 #[test]
 fn a_dotnet_no_build_command_on_a_full_pool_runs_here_without_it() {
     let case = routed_case("routing-no-build-full");
-    copy_tool(&case, "dotnet.exe");
+    dotnet_cmd(&case);
     let go = case.folder().join("go");
     let holder = remote_holder(&case, "holder.log", &go);
     let call = case.folder().join("dotnet.json");
@@ -435,17 +437,17 @@ fn a_dotnet_no_build_command_on_a_full_pool_runs_here_without_it() {
         "dotnet.log",
         &steps,
         &["--test-remote-wait-ms", "1"],
-        &[r".\dotnet.exe", "argv", "test", "--no-build"],
+        &[r".\dotnet.cmd", "test", "--no-build"],
     ));
     let pid = waiter.id();
     let outcome = waiter.finish();
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert_in_order(&outcome.stderr, &[DROPPED_NO_BUILD_LINE, FULL_LINE]);
-    let words = stdout_lines(&outcome.stdout);
-    assert!(
-        words.contains(&"test") && !words.contains(&"--no-build"),
-        "the fallback runs here as `argv test`, without --no-build: {outcome:?}"
+    assert_eq!(
+        command_lines(&outcome.stdout),
+        ["test"],
+        "the fallback runs here as `test`, without --no-build: {outcome:?}"
     );
     assert!(!call.exists(), "the waiter's client never ran");
     let own = own(&case, pid);
@@ -687,31 +689,569 @@ fn a_routed_dotnet_build_carries_the_worktree_head_as_its_source_revision() {
 #[test]
 fn no_build_is_dropped_for_the_box_and_the_fallback() {
     let case = routed_case("routing-no-build");
-    copy_tool(&case, "dotnet.exe");
+    dotnet_cmd(&case);
     let (busy_call, tool_call) = (case.folder().join("busy.json"), case.folder().join("tool.json"));
     let busy = shown(&stub(&case, &[&format!("record {}", shown(&busy_call)), "refuse busy"]));
     let rebooted = shown(&stub(&case, &["refuse rebooted"]));
     let tool = shown(&stub(&case, &[&format!("record {}", shown(&tool_call)), "status 0"]));
-    let dotnet = [r".\dotnet.exe", "argv", "build", "--no-build"];
+    let pack_call = case.folder().join("pack.json");
+    let pack_steps = shown(&stub(&case, &[&format!("record {}", shown(&pack_call)), "refuse busy"]));
+    let dotnet = [r".\dotnet.cmd", "test", "--no-build"];
     let before = finish(case.gate(&routed_words("busy.log", &busy, &[], &dotnet)));
     let after = finish(case.gate(&routed_words("rebooted.log", &rebooted, &[], &dotnet)));
     let other = finish(case.gate(&routed_words("tool.log", &tool, &[], &[r".\tool.exe", "argv", "--no-build"])));
+    let pack = finish(case.gate(&routed_words("pack.log", &pack_steps, &[], &[r".\dotnet.cmd", "pack", "--no-build"])));
 
-    assert_eq!((before.code, after.code, other.code), (Some(0), Some(0), Some(0)));
+    assert_eq!((before.code, after.code, other.code, pack.code), (Some(0), Some(0), Some(0), Some(0)));
     let call = recorded(&busy_call);
     assert!(!recorded_words(&call).contains(&"--no-build"), "{call}");
     assert_eq!(call["outputs"], json!([]), "{call}");
     assert_in_order(&before.stderr, &[DROPPED_NO_BUILD_LINE, NO_OUTPUTS_LINE, BUSY_LINE]);
-    assert!(
-        !stdout_lines(&before.stdout).contains(&"--no-build"),
+    assert_eq!(
+        command_lines(&before.stdout),
+        ["test"],
         "a fallback after any refusal drops --no-build: {before:?}"
     );
-    let after_lines = stdout_lines(&after.stdout);
-    assert!(after_lines.contains(&"build") && !after_lines.contains(&"--no-build"), "{after:?}");
+    assert_eq!(command_lines(&after.stdout), ["test"], "{after:?}");
     assert!(
         recorded_words(&recorded(&tool_call)).contains(&"--no-build"),
         "a non-dotnet command keeps it"
     );
+    assert_eq!(
+        recorded_words(&recorded(&pack_call))[1..],
+        ["pack", "--no-build"],
+        "pack keeps it on the box"
+    );
+    assert!(!pack.stderr.contains(DROPPED_NO_BUILD_LINE), "{pack:?}");
+    assert_eq!(command_lines(&pack.stdout), ["pack --no-build"], "and here: {pack:?}");
+}
+
+/// The line a run here that takes a slot of its own says as it drops `--no-build` after a routed build on [`HOST`]
+/// brought nothing back.
+const NOTHING_BACK_LINE: &str = "gate: dropped --no-build: the last build ran on builder and brought nothing back; building on a heavy slot";
+/// The line a run here says as it drops `--no-build` for a record that names no usable builder.
+const UNKNOWN_BUILDER_LINE: &str = "gate: dropped --no-build: the last build ran on the builder and brought nothing back; building on a heavy slot";
+/// The record a routed build on [`HOST`] that brought nothing back leaves.
+const NOTHING_BACK_RECORD: &str = r#"{"v":1,"host":"builder"}"#;
+/// The start of every line a run here says as it drops `--no-build`.
+const DROPPED: &str = "gate: dropped --no-build";
+/// A dotnet test with `--no-build`, run by the stand-in dotnet ([`dotnet_cmd`]).
+const NO_BUILD_TEST: [&str; 3] = [r".\dotnet.cmd", "test", "--no-build"];
+
+/// The case's nothing-back record, the one `*.nothing-back` entry of the state root's `remote` folder; `None` when
+/// there is none.
+fn record_path(case: &Case) -> Option<PathBuf> {
+    let entries = fs::read_dir(case.root().join("remote")).ok()?;
+    let found: Vec<PathBuf> = entries
+        .map(|entry| entry.expect("a remote entry can be read").path())
+        .filter(|path| path.extension().is_some_and(|extension| extension == "nothing-back"))
+        .collect();
+    assert!(found.len() <= 1, "one worktree leaves one record: {found:?}");
+    found.into_iter().next()
+}
+
+/// The text of the case's nothing-back record ([`record_path`]); `None` when there is none.
+fn nothing_back(case: &Case) -> Option<String> {
+    record_path(case).map(|path| fs::read_to_string(path).expect("the record can be read"))
+}
+
+/// Writes `text` over the case's nothing-back record.
+fn rewrite_record(case: &Case, text: &str) {
+    let path = record_path(case).expect("the case has a record");
+    fs::write(path, text).expect("the record can be written");
+}
+
+/// The lines the command printed: the stdout lines before the first of the gate's own, which the tail repeats.
+fn command_lines(stdout: &str) -> Vec<&str> {
+    stdout.lines().take_while(|line| !line.starts_with("gate: ")).collect()
+}
+
+/// Whether the last slot the case's gates took is a heavy one (`...-slot-<n>`), taken by a gate of the heavy kind
+/// running `command`.
+fn took_heavy(case: &Case, command: &str) -> bool {
+    events(case).iter().rev().find(|event| event["event"] == "take").is_some_and(|take| {
+        let slot = take["slots"][0].as_str().unwrap_or_default();
+        let heavy_slot = slot.contains("-slot-") && !slot.contains("light-slot") && !slot.contains("remote-slot");
+        heavy_slot && take["kind"] == "heavy" && take["command"] == command
+    })
+}
+
+/// Writes `dotnet.cmd` in the case folder: a dotnet that says its words on one line and exits 1 when its second word
+/// is `bad`, else 0, so a run here can be a dotnet command of any verb that passes or fails.
+fn dotnet_cmd(case: &Case) {
+    let script = "@echo off\r\necho %*\r\nif \"%2\"==\"bad\" exit /b 1\r\nexit /b 0\r\n";
+    fs::write(case.folder().join("dotnet.cmd"), script).expect("the stand-in dotnet can be written");
+}
+
+/// Writes the project file `project` in the case folder and tracks it, with an `obj\project.assets.json` beside it
+/// when `restored`.
+fn tracked_project(case: &Case, project: &str, restored: bool) {
+    let path = case.folder().join(project);
+    let folder = path.parent().expect("a project has a folder");
+    fs::create_dir_all(folder.join("obj")).expect("the project's folders can be made");
+    fs::write(&path, "<Project />\n").expect("the project can be written");
+    if restored {
+        fs::write(folder.join("obj").join("project.assets.json"), "{}\n").expect("the assets file can be written");
+    }
+    git(case, &["add", project]);
+}
+
+/// Runs a routed `dotnet build` the scripted client passes, logging to `log`, and asserts the record it leaves.
+fn routed_build(case: &Case, log: &str) {
+    let steps = shown(&stub(case, &["status 0"]));
+    let routed = finish(case.gate(&routed_words(log, &steps, &[], &[r".\dotnet.exe", "build"])));
+    assert_eq!(routed.code, Some(0), "{routed:?}");
+    assert_eq!(nothing_back(case).as_deref(), Some(NOTHING_BACK_RECORD), "{routed:?}");
+}
+
+#[test]
+fn a_routed_build_through_the_bridge_leaves_a_record_a_later_light_no_build_drops_the_word_on_a_heavy_slot() {
+    let case = routed_case("routing-nothing-back");
+    copy_tool(&case, "dotnet.exe");
+    dotnet_cmd(&case);
+    let script = stand_in(&case, "remote.ps1", &answer(0, false, None));
+    let routed = finish(case.gate(&bridge_words("routed.log", &script, &[], &[r".\dotnet.exe", "build"])));
+    assert_eq!(routed.code, Some(0), "{routed:?}");
+    assert_eq!(nothing_back(&case).as_deref(), Some(NOTHING_BACK_RECORD), "{routed:?}");
+
+    let here = finish(case.gate(&run_words("here.log", &[], &NO_BUILD_TEST)));
+
+    assert_eq!(here.code, Some(0), "{here:?}");
+    assert!(here.stderr.contains(NOTHING_BACK_LINE), "{here:?}");
+    assert_eq!(command_lines(&here.stdout), ["test"], "the words that ran lack --no-build: {here:?}");
+    assert!(
+        took_heavy(&case, r".\dotnet.cmd test"),
+        "a dropped light run takes a heavy slot: {:#?}",
+        events(&case)
+    );
+}
+
+#[test]
+fn a_build_here_clears_the_record_only_when_it_passes() {
+    let case = routed_case("routing-nothing-back-cleared");
+    copy_tool(&case, "dotnet.exe");
+    dotnet_cmd(&case);
+    routed_build(&case, "routed.log");
+
+    let failed = finish(case.gate(&run_words("failed.log", &[], &[r".\dotnet.cmd", "build", "bad"])));
+    let dropped = finish(case.gate(&run_words("dropped.log", &[], &NO_BUILD_TEST)));
+    let passed = finish(case.gate(&run_words("passed.log", &[], &[r".\dotnet.cmd", "build"])));
+    let cleared = nothing_back(&case);
+    let kept = finish(case.gate(&run_words("kept.log", &[], &NO_BUILD_TEST)));
+
+    assert_eq!(failed.code, Some(1), "{failed:?}");
+    assert!(
+        dropped.stderr.contains(NOTHING_BACK_LINE),
+        "a failed build here leaves the record: {dropped:?}"
+    );
+    assert_eq!(command_lines(&dropped.stdout), ["test"], "{dropped:?}");
+    assert_eq!(passed.code, Some(0), "{passed:?}");
+    assert_eq!(cleared, None, "a passing build here clears the record: {passed:?}");
+    assert!(!kept.stderr.contains(DROPPED), "{kept:?}");
+    assert_eq!(command_lines(&kept.stdout), ["test --no-build"], "{kept:?}");
+}
+
+#[test]
+fn only_a_passing_build_of_the_whole_worktree_clears_the_record() {
+    let case = routed_case("routing-nothing-back-whole");
+    copy_tool(&case, "dotnet.exe");
+    dotnet_cmd(&case);
+    routed_build(&case, "routed.log");
+
+    let one = finish(case.gate(&run_words("one.log", &[], &[r".\dotnet.cmd", "build", "One.csproj"])));
+    let after_one = nothing_back(&case);
+    let project = finish(case.gate(&run_words("project.log", &[], &[r".\dotnet.cmd", "run", "--project", "One"])));
+    let after_project = nothing_back(&case);
+    let whole = finish(case.gate(&run_words("whole.log", &[], &[r".\dotnet.cmd", "build"])));
+    let after_whole = nothing_back(&case);
+    routed_build(&case, "routed-again.log");
+    let solution = finish(case.gate(&run_words("solution.log", &[], &[r".\dotnet.cmd", "build", "All.sln"])));
+
+    assert_eq!((one.code, project.code, whole.code, solution.code), (Some(0), Some(0), Some(0), Some(0)));
+    assert_eq!(
+        after_one.as_deref(),
+        Some(NOTHING_BACK_RECORD),
+        "a build of one project leaves it: {one:?}"
+    );
+    assert_eq!(after_project.as_deref(), Some(NOTHING_BACK_RECORD), "--project leaves it: {project:?}");
+    assert_eq!(after_whole, None, "a build naming no project clears it: {whole:?}");
+    assert_eq!(nothing_back(&case), None, "a build of a solution clears it: {solution:?}");
+}
+
+#[test]
+fn a_routed_build_that_falls_back_here_writes_no_record_and_its_passing_build_clears_one() {
+    let case = routed_case("routing-nothing-back-fallback");
+    copy_tool(&case, "dotnet.exe");
+    dotnet_cmd(&case);
+    let steps = shown(&stub(&case, &["refuse busy"]));
+    // The fallback runs fake-tool as `dotnet.exe build`, which fails on the word it does not take: no build clears.
+    let failed = finish(case.gate(&routed_words("failed.log", &steps, &[], &[r".\dotnet.exe", "build"])));
+    let wrote = nothing_back(&case);
+    routed_build(&case, "routed.log");
+    let steps = shown(&stub(&case, &["refuse busy"]));
+    let passed = finish(case.gate(&routed_words("passed.log", &steps, &[], &[r".\dotnet.cmd", "build"])));
+
+    assert!(failed.stderr.contains(BUSY_LINE), "{failed:?}");
+    assert_eq!(wrote, None, "{failed:?}");
+    assert!(passed.stderr.contains(BUSY_LINE), "{passed:?}");
+    assert_eq!(passed.code, Some(0), "{passed:?}");
+    assert_eq!(nothing_back(&case), None, "a passing fallback build clears the record: {passed:?}");
+}
+
+#[test]
+fn a_failed_or_killed_routed_build_leaves_a_record() {
+    let case = routed_case("routing-nothing-back-failed");
+    copy_tool(&case, "dotnet.exe");
+    for (log, step) in [("failed.log", "status 1"), ("killed.log", "killed")] {
+        let steps = shown(&stub(&case, &[step]));
+        let routed = finish(case.gate(&routed_words(log, &steps, &[], &[r".\dotnet.exe", "build"])));
+        assert_eq!(nothing_back(&case).as_deref(), Some(NOTHING_BACK_RECORD), "{step}: {routed:?}");
+        fs::remove_file(record_path(&case).expect("the record is there")).expect("the record can be removed");
+    }
+}
+
+#[test]
+fn a_routed_no_build_is_not_dropped_here_and_leaves_the_record_alone() {
+    let case = routed_case("routing-nothing-back-routed-no-build");
+    copy_tool(&case, "dotnet.exe");
+    routed_build(&case, "routed.log");
+    let earlier = r#"{"v":1,"host":"earlier"}"#;
+    rewrite_record(&case, earlier);
+    let steps = shown(&stub(&case, &["status 0"]));
+
+    let outcome = finish(case.gate(&routed_words("no-build.log", &steps, &[], &[r".\dotnet.exe", "test", "--no-build"])));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(outcome.stderr.contains(DROPPED_NO_BUILD_LINE), "{outcome:?}");
+    assert!(!outcome.stderr.contains("the last build ran on"), "{outcome:?}");
+    assert_eq!(nothing_back(&case).as_deref(), Some(earlier), "{outcome:?}");
+}
+
+#[test]
+fn a_heavy_local_no_build_drops_the_word() {
+    let case = routed_case("routing-nothing-back-local");
+    copy_tool(&case, "dotnet.exe");
+    dotnet_cmd(&case);
+    routed_build(&case, "routed.log");
+
+    let outcome = finish(case.gate(&heavy_words_with_limit("local.log", &["--local"], &NO_BUILD_TEST)));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(outcome.stderr.contains(NOTHING_BACK_LINE), "{outcome:?}");
+    assert_eq!(command_lines(&outcome.stdout), ["test"], "{outcome:?}");
+}
+
+#[test]
+fn a_light_no_build_under_a_light_parent_takes_a_heavy_slot_of_its_own() {
+    let case = routed_case("routing-nothing-back-under-light");
+    copy_tool(&case, "dotnet.exe");
+    dotnet_cmd(&case);
+    routed_build(&case, "routed.log");
+
+    let outcome = finish(marked(&case, &run_words("nested.log", &[], &NO_BUILD_TEST), &test_marker(&case, "light")));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_in_order(&outcome.stderr, &[NOTHING_BACK_LINE, "does not cover a heavy gate; taking a heavy slot"]);
+    assert!(
+        !outcome.stderr.contains("gate: running under the light slot"),
+        "a gate the drop uncovered never says it runs under the parent's slot: {outcome:?}"
+    );
+    assert_eq!(command_lines(&outcome.stdout), ["test"], "{outcome:?}");
+    assert!(took_heavy(&case, r".\dotnet.cmd test"), "{:#?}", events(&case));
+}
+
+#[test]
+fn an_ignored_marker_line_names_the_heavy_slot_a_dropped_light_run_takes() {
+    let case = routed_case("routing-nothing-back-ignored-marker");
+    copy_tool(&case, "dotnet.exe");
+    dotnet_cmd(&case);
+    routed_build(&case, "routed.log");
+
+    let outcome = finish(marked(&case, &run_words("nested.log", &[], &NO_BUILD_TEST), "x:y"));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_in_order(
+        &outcome.stderr,
+        &[
+            NOTHING_BACK_LINE,
+            "gate: ignored GATE_SLOT_HELD='x:y', which is not <kind>:<pid>:<start>; taking a heavy slot",
+        ],
+    );
+    assert!(!outcome.stderr.contains("taking a light slot"), "{outcome:?}");
+    assert!(took_heavy(&case, r".\dotnet.cmd test"), "{:#?}", events(&case));
+}
+
+#[test]
+fn a_light_no_build_under_a_critical_parent_builds_on_the_parent_slot() {
+    let case = routed_case("routing-nothing-back-under-critical");
+    copy_tool(&case, "dotnet.exe");
+    dotnet_cmd(&case);
+    routed_build(&case, "routed.log");
+
+    let outcome = finish(marked(
+        &case,
+        &run_words("nested.log", &[], &NO_BUILD_TEST),
+        &test_marker(&case, "critical"),
+    ));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(
+        outcome.stderr.contains(
+            "gate: dropped --no-build: the last build ran on builder and brought nothing back; building on the parent gate's critical slot"
+        ),
+        "{outcome:?}"
+    );
+    assert_eq!(command_lines(&outcome.stdout), ["test"], "{outcome:?}");
+}
+
+#[test]
+fn a_command_whose_verb_takes_no_no_build_keeps_it_while_a_record_stands() {
+    let case = routed_case("routing-nothing-back-kept");
+    copy_tool(&case, "dotnet.exe");
+    dotnet_cmd(&case);
+    routed_build(&case, "routed.log");
+    let rows: [&[&str]; 5] = [
+        &[r".\dotnet.cmd", "app.dll", "--no-build"],
+        &[r".\dotnet.cmd", "exec", "x.dll", "--no-build"],
+        &[r".\dotnet.cmd", "tool", "run", "t", "--no-build"],
+        &[r".\dotnet.cmd", "pack", "--no-build"],
+        &[r".\dotnet.cmd", "publish", "--no-build"],
+    ];
+
+    for (index, command) in rows.into_iter().enumerate() {
+        let outcome = finish(case.gate(&run_words(&format!("kept-{index}.log"), &[], command)));
+        assert!(!outcome.stderr.contains(DROPPED), "{outcome:?}");
+        assert_eq!(command_lines(&outcome.stdout), [command[1..].join(" ")], "{outcome:?}");
+        assert_eq!(
+            nothing_back(&case).as_deref(),
+            Some(NOTHING_BACK_RECORD),
+            "the record stands: {outcome:?}"
+        );
+    }
+    let other = finish(case.gate(&run_words("tool.log", &[], &[r".\tool.exe", "argv", "--no-build"])));
+    assert!(!other.stderr.contains(DROPPED), "{other:?}");
+    assert_eq!(
+        command_lines(&other.stdout),
+        ["--no-build"],
+        "a command that is no dotnet command: {other:?}"
+    );
+    assert_eq!(nothing_back(&case).as_deref(), Some(NOTHING_BACK_RECORD), "the record stands: {other:?}");
+}
+
+#[test]
+fn a_build_that_may_not_have_rebuilt_what_the_record_stands_for_leaves_it() {
+    let case = routed_case("routing-nothing-back-settings");
+    copy_tool(&case, "dotnet.exe");
+    dotnet_cmd(&case);
+    fs::create_dir_all(case.folder().join("sub")).expect("the subfolder can be made");
+    let steps = shown(&stub(&case, &["status 0"]));
+    let routed = finish(case.gate(&routed_words("routed.log", &steps, &[], &[r".\dotnet.exe", "build", "-c", "Release"])));
+    let written = nothing_back(&case);
+    let run = |log: &str, command: &[&str]| {
+        let outcome = finish(case.gate(&run_words(log, &[], command)));
+        assert_eq!(outcome.code, Some(0), "{outcome:?}");
+        (outcome, nothing_back(&case))
+    };
+
+    let (restore, after_restore) = run("restore.log", &[r".\dotnet.cmd", "msbuild", "-t:Restore"]);
+    let sub = finish(case.gate_in("sub", &run_words("sub.log", &[], &[r"..\dotnet.cmd", "build", "-c", "Release"])));
+    let after_sub = nothing_back(&case);
+    let (debug, after_debug) = run("debug.log", &[r".\dotnet.cmd", "build"]);
+    let (release, after_release) = run("release.log", &[r".\dotnet.cmd", "build", "--configuration:release"]);
+
+    let record = r#"{"v":1,"host":"builder","configuration":"Release"}"#;
+    assert_eq!(written.as_deref(), Some(record), "{routed:?}");
+    assert_eq!(after_restore.as_deref(), Some(record), "msbuild may build nothing: {restore:?}");
+    assert_eq!(sub.code, Some(0), "{sub:?}");
+    assert_eq!(after_sub.as_deref(), Some(record), "a build below the root: {sub:?}");
+    assert_eq!(after_debug.as_deref(), Some(record), "another configuration: {debug:?}");
+    assert_eq!(after_release, None, "the same configuration, its letter case aside: {release:?}");
+}
+
+#[test]
+fn a_dotnet_command_naming_a_response_file_is_opaque() {
+    let case = routed_case("routing-nothing-back-response-file");
+    copy_tool(&case, "dotnet.exe");
+    dotnet_cmd(&case);
+    let steps = shown(&stub(&case, &["status 0"]));
+
+    let routed = finish(case.gate(&routed_words("routed.log", &steps, &[], &[r".\dotnet.exe", "build", "@x.rsp"])));
+    let unwritten = nothing_back(&case);
+    routed_build(&case, "routed-plain.log");
+    let test = finish(case.gate(&run_words("test.log", &[], &[r".\dotnet.cmd", "test", "@x.rsp", "--no-build"])));
+    let build = finish(case.gate(&run_words("build.log", &[], &[r".\dotnet.cmd", "build", "@x.rsp"])));
+
+    assert_eq!(routed.code, Some(0), "{routed:?}");
+    assert_eq!(unwritten, None, "no record: {routed:?}");
+    assert!(!test.stderr.contains(DROPPED), "no drop: {test:?}");
+    assert_eq!(command_lines(&test.stdout), ["test @x.rsp --no-build"], "{test:?}");
+    assert_eq!(build.code, Some(0), "{build:?}");
+    assert_eq!(nothing_back(&case).as_deref(), Some(NOTHING_BACK_RECORD), "no clear: {build:?}");
+}
+
+#[test]
+fn a_record_naming_no_usable_builder_or_that_cannot_be_read_names_the_builder() {
+    let case = routed_case("routing-nothing-back-unknown");
+    copy_tool(&case, "dotnet.exe");
+    dotnet_cmd(&case);
+    routed_build(&case, "routed.log");
+    rewrite_record(&case, r#"{"v":1,"host":"bad host!"}"#);
+
+    let path = record_path(&case).expect("the case has a record");
+    let unusable = finish(case.gate(&run_words("unusable.log", &[], &NO_BUILD_TEST)));
+    assert_eq!(nothing_back(&case), None, "the passing dropped test cleared the record: {unusable:?}");
+    fs::create_dir(&path).expect("a folder stands where the record would");
+    let unreadable = finish(case.gate(&run_words("unreadable.log", &[], &NO_BUILD_TEST)));
+
+    assert!(unusable.stderr.contains(UNKNOWN_BUILDER_LINE), "{unusable:?}");
+    assert_eq!(command_lines(&unusable.stdout), ["test"], "{unusable:?}");
+    assert_in_order(
+        &unreadable.stderr,
+        &[&format!("gate: cannot read {}: ", path.display()), UNKNOWN_BUILDER_LINE],
+    );
+    assert_eq!(command_lines(&unreadable.stdout), ["test"], "{unreadable:?}");
+}
+
+#[test]
+fn a_wrapped_dotnet_no_build_after_a_routed_build_drops_only_the_word_after_the_separator() {
+    let case = routed_case("routing-nothing-back-wrapped");
+    copy_tool(&case, "dotnet.exe");
+    routed_build(&case, "routed.log");
+    let script = case.folder().join("words.ps1");
+    fs::write(&script, "[Environment]::GetCommandLineArgs()\n").expect("the script can be written");
+    let script = shown(&script);
+    let wrapped = [
+        "pwsh",
+        "-NoProfile",
+        "-NonInteractive",
+        "-File",
+        &script,
+        "--no-build",
+        "--",
+        "dotnet",
+        "test",
+        "--no-build",
+    ];
+
+    let outcome = finish(case.gate(&run_words("wrapped.log", &[], &wrapped)));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(outcome.stderr.contains(NOTHING_BACK_LINE), "{outcome:?}");
+    let lines = command_lines(&outcome.stdout);
+    let separator = lines.iter().position(|line| *line == "--").expect("pwsh was handed the --");
+    assert_eq!(lines[separator - 1], "--no-build", "the script's own word stays: {outcome:?}");
+    assert_eq!(lines[separator + 1..], ["dotnet", "test"], "{outcome:?}");
+}
+
+#[test]
+fn a_wrapped_routed_dotnet_command_is_stamped_before_its_own_separator() {
+    let case = routed_case("routing-wrapped-stamp");
+    fs::write(case.folder().join("a.txt"), "a\n").expect("a file can be written");
+    git(&case, &["add", "a.txt"]);
+    git(&case, &["commit", "--quiet", "-m", "first"]);
+    let sha = git(&case, &["rev-parse", "HEAD"]);
+    let call = case.folder().join("call.json");
+    let steps = shown(&stub(&case, &[&format!("record {}", shown(&call)), "status 0"]));
+    let wrapped = ["pwsh", "-File", "x.ps1", "--", r".\dotnet.exe", "test", "--", "--x"];
+
+    let outcome = finish(case.gate(&routed_words("wrapped.log", &steps, &[], &wrapped)));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let recorded = recorded(&call);
+    let words = recorded_words(&recorded);
+    let stamp = format!("-p:SourceRevisionId={sha}");
+    assert_eq!(words[5..], ["test", stamp.as_str(), "--", "--x"], "{recorded}");
+}
+
+#[test]
+fn a_no_build_here_is_dropped_while_a_tracked_project_has_no_assets_file() {
+    let case = Case::new("routing-no-build-assets");
+    git_init(&case);
+    dotnet_cmd(&case);
+    tracked_project(&case, "app/App.csproj", false);
+
+    let missing = finish(case.gate(&run_words("missing.log", &[], &NO_BUILD_TEST)));
+    fs::write(case.folder().join(r"app\obj\project.assets.json"), "{}\n").expect("the assets file can be written");
+    let present = finish(case.gate(&run_words("present.log", &[], &NO_BUILD_TEST)));
+
+    assert!(
+        missing
+            .stderr
+            .contains(r"gate: dropped --no-build: app/App.csproj has no obj\project.assets.json here; building on a heavy slot"),
+        "{missing:?}"
+    );
+    assert_eq!(command_lines(&missing.stdout), ["test"], "{missing:?}");
+    assert!(!present.stderr.contains(DROPPED), "{present:?}");
+    assert_eq!(command_lines(&present.stdout), ["test --no-build"], "{present:?}");
+}
+
+#[test]
+fn a_named_project_or_solution_alone_is_checked_for_its_assets_file() {
+    let case = Case::new("routing-no-build-named");
+    git_init(&case);
+    dotnet_cmd(&case);
+    tracked_project(&case, "app/App.csproj", false);
+    tracked_project(&case, "lib/Lib.csproj", true);
+    let sln = "Project(\"{FAE04EC0}\") = \"Lib\", \"lib\\Lib.csproj\", \"{1}\"\r\nEndProject\r\n";
+    fs::write(case.folder().join("Lib.sln"), sln).expect("the solution can be written");
+    let app_sln = "Project(\"{FAE04EC0}\") = \"App\", \"app\\App.csproj\", \"{2}\"\r\nEndProject\r\n";
+    fs::write(case.folder().join("App.sln"), app_sln).expect("the solution can be written");
+    let line = r"gate: dropped --no-build: app/App.csproj has no obj\project.assets.json here; building on a heavy slot";
+    let run = |log: &str, command: &[&str]| finish(case.gate(&run_words(log, &[], command)));
+
+    let project = run("project.log", &[r".\dotnet.cmd", "test", "lib/Lib.csproj", "--no-build"]);
+    let solution = run("solution.log", &[r".\dotnet.cmd", "test", "Lib.sln", "--no-build"]);
+    let unrestored = run("unrestored.log", &[r".\dotnet.cmd", "test", "App.sln", "--no-build"]);
+    assert!(
+        unrestored.stderr.contains(line),
+        "a solution listing an unrestored project drops it: {unrestored:?}"
+    );
+    assert_eq!(command_lines(&unrestored.stdout), ["test App.sln"], "{unrestored:?}");
+    let named = run("named.log", &[r".\dotnet.cmd", "test", "app/App.csproj", "--no-build"]);
+    let whole = run("whole.log", &NO_BUILD_TEST);
+
+    assert!(!project.stderr.contains(DROPPED), "only the named project is checked: {project:?}");
+    assert_eq!(command_lines(&project.stdout), ["test lib/Lib.csproj --no-build"], "{project:?}");
+    assert!(
+        !solution.stderr.contains(DROPPED),
+        "only the solution's projects are checked: {solution:?}"
+    );
+    assert!(named.stderr.contains(line), "{named:?}");
+    assert_eq!(command_lines(&named.stdout), ["test app/App.csproj"], "{named:?}");
+    assert!(whole.stderr.contains(line), "{whole:?}");
+}
+
+#[test]
+fn a_repo_whose_build_files_move_the_assets_skips_the_check_but_not_the_record() {
+    let case = routed_case("routing-no-build-artifacts");
+    copy_tool(&case, "dotnet.exe");
+    dotnet_cmd(&case);
+    tracked_project(&case, "app/App.csproj", false);
+    let props = "<Project><PropertyGroup><UseArtifactsOutput>true</UseArtifactsOutput></PropertyGroup></Project>\n";
+    fs::write(case.folder().join("Directory.Build.props"), props).expect("the props file can be written");
+
+    let unchecked = finish(case.gate(&run_words("unchecked.log", &[], &NO_BUILD_TEST)));
+    routed_build(&case, "routed.log");
+    let recorded = finish(case.gate(&run_words("recorded.log", &[], &NO_BUILD_TEST)));
+
+    assert!(!unchecked.stderr.contains(DROPPED), "{unchecked:?}");
+    assert_eq!(command_lines(&unchecked.stdout), ["test --no-build"], "{unchecked:?}");
+    assert!(recorded.stderr.contains(NOTHING_BACK_LINE), "{recorded:?}");
+    assert_eq!(command_lines(&recorded.stdout), ["test"], "{recorded:?}");
+}
+
+#[test]
+fn a_project_listing_git_cannot_give_keeps_the_word() {
+    let case = Case::new("routing-no-build-listing");
+    git_init(&case);
+    dotnet_cmd(&case);
+    fs::write(case.folder().join(".git").join("index"), "not an index").expect("the index can be spoiled");
+
+    let outcome = finish(case.gate(&run_words("listing.log", &[], &NO_BUILD_TEST)));
+
+    assert!(outcome.stderr.contains("gate: cannot list the worktree's projects: "), "{outcome:?}");
+    assert!(!outcome.stderr.contains(DROPPED), "{outcome:?}");
+    assert_eq!(command_lines(&outcome.stdout), ["test --no-build"], "{outcome:?}");
 }
 
 #[test]

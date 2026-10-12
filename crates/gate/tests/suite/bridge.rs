@@ -132,7 +132,7 @@ fn shim() -> PathBuf {
 
 /// Writes the stand-in remote.ps1 `name` in the case folder, whose `Invoke-RemoteCommand` runs `body`, with the bridge
 /// script installed; its path, as `--test-remote-script` takes it.
-fn stand_in(case: &Case, name: &str, body: &str) -> String {
+pub(crate) fn stand_in(case: &Case, name: &str, body: &str) -> String {
     stand_in_with(case, name, "", body)
 }
 
@@ -151,14 +151,14 @@ fn quoted(path: &Path) -> String {
 }
 
 /// The line that ends a stand-in's body: the attempt's status, kill flag and reason, as `Invoke-RemoteCommand` returns them.
-fn answer(status: i64, killed: bool, reason: Option<&str>) -> String {
+pub(crate) fn answer(status: i64, killed: bool, reason: Option<&str>) -> String {
     let reason = reason.map_or_else(|| "$null".to_owned(), |reason| format!("'{reason}'"));
     format!("    return [pscustomobject]@{{ Status = {status}; Killed = ${killed}; Reason = {reason} }}")
 }
 
 /// The words of a heavy run logging to `log` whose remote attempt goes through the bridge to the remote.ps1 `script`,
 /// `extra` before `--` and `command` after it.
-fn bridge_words<'a>(log: &'a str, script: &'a str, extra: &[&'a str], command: &[&'a str]) -> Vec<&'a str> {
+pub(crate) fn bridge_words<'a>(log: &'a str, script: &'a str, extra: &[&'a str], command: &[&'a str]) -> Vec<&'a str> {
     let mut before = vec!["--test-remote-script", script];
     before.extend(extra);
     heavy_words_with_limit(log, &before, command)

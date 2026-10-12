@@ -144,6 +144,18 @@ impl Nesting {
         }
     }
 
+    /// This nesting for the gate once it asks for a heavy slot in place of the kind it was read for: a live parent's
+    /// slot judged again for a heavy gate ([`Nesting::under`]), so a light parent no longer covers it; any other
+    /// nesting as it is.
+    pub(crate) fn as_heavy(&self) -> Nesting {
+        match self {
+            Nesting::Covered(parent) | Nesting::Refused(parent) | Nesting::Under(parent) | Nesting::Beside(parent) => {
+                Nesting::under(parent.clone(), Slot::Heavy)
+            }
+            Nesting::Own | Nesting::Malformed(_) | Nesting::Ended { .. } | Nesting::Unbound { .. } => self.clone(),
+        }
+    }
+
     /// The parent whose slot this gate runs under, when it covers the gate.
     pub(crate) fn covering(&self) -> Option<&Parent> {
         match self {

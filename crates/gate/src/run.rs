@@ -14,8 +14,11 @@ use std::time::{Duration, Instant};
 use std::{fs, io};
 
 use gate_args::{ProgramSearch, RunRequest, Slot, batch_command_line, batch_refusal, command_line, is_batch_target, resolve_program};
-use gate_router::{RemoteRun, Route};
-use gate_state::{FallbackReason, JournalEvent, KernelObject, RemoteTag, RunFacts, StateRoot, Verdict, log_hash};
+use gate_router::{
+    BuildSettings, BuildTarget, Place, RemoteRun, Route, build_settings, dotnet_builds, dotnet_target, sdk_build_target, without_no_build,
+    work_folder_key,
+};
+use gate_state::{FallbackReason, JournalEvent, KernelObject, RemoteTag, RunFacts, StateRoot, Verdict, log_hash, v1};
 use gate_watchdog::{Cores, Hint, SlotKind, hint};
 use gate_win32::{AcquireError, Interrupt, Job, Launch, LaunchError, LaunchOutput, NamedMutex, OwnedMutexGuard, PriorityClass, Running};
 use jiff::Timestamp;
@@ -30,7 +33,8 @@ use crate::journal::{self, RunJournal};
 use crate::log::Log;
 use crate::machine::{self, Machine, MachineWait, MachineWaited};
 use crate::nesting::{Nesting, Parent};
-use crate::remote::{self, RemoteCall, RemoteClient, RemoteOutcome};
+use crate::no_build::{self, NothingBack, Unfound, Worktree};
+use crate::remote::{self, RemoteCall, RemoteClient, RemoteOutcome, git};
 use crate::resolve::{Environment, ResolvedRoot};
 use crate::route;
 use crate::slots::{self, ClaimOf, Pool, Survey, Taken, Takes, ThisGate, epoch_ms};
@@ -111,6 +115,8 @@ pub(crate) fn run(request: &RunRequest, log: &Path, root: &ResolvedRoot, environ
         processors: wait::processors(console),
         interrupt,
     };
+    // The request and nesting of a run here that dropped its `--no-build` and asks for a heavy slot.
+    let mut heavy = None;
     let mut run = Run {
         request,
         root,
@@ -126,16 +132,25 @@ pub(crate) fn run(request: &RunRequest, log: &Path, root: &ResolvedRoot, environ
         lent: false,
         covered: None,
     };
-    let route = run.queue(environment, console);
+    let (route, place) = run.route(environment, console);
+    let local = run.local_words(&route, place.as_ref(), console);
+    take_heavy(&mut run, &mut heavy, local.as_ref(), console);
+    say_nesting(run.nesting, run.request, console);
+    run.queue(&route, console);
     let mut hold = Hold {
         taken: None,
         machine: None,
         took: Instant::now(),
     };
-    let watched = panic::catch_unwind(AssertUnwindSafe(|| run.through(&route, plan, &mut hold, console)));
+    let watched = panic::catch_unwind(AssertUnwindSafe(|| run.through(&route, plan, local, &mut hold, console)));
     let status = match watched {
-        Ok(Some(ended)) => {
+        Ok(Some((ended, here))) => {
             run.release(hold, Some(&ended), console);
+            if ended.status == 0
+                && let Some(here) = here
+            {
+                run.clear_nothing_back(here, console);
+            }
             exit_status(ended.status)
         }
         Ok(None) => CONTROL_C_EXIT,
@@ -150,9 +165,31 @@ pub(crate) fn run(request: &RunRequest, log: &Path, root: &ResolvedRoot, environ
     status
 }
 
-/// The nesting `request` runs under, its line said, or the status of a run refused before anything is taken or
-/// written: a log inside the state root, or a critical gate under a heavy or light parent's slot, which leaves an
-/// earlier log in place. A gate a parent's slot does not cover says so only as it goes on to take a local slot.
+/// Has `run` take the request and nesting of a run here that asks for a heavy slot ([`Run::as_heavy`]), kept in
+/// `heavy`, when `local` dropped its `--no-build` ([`Run::local_words`]), and says the line saying so. Its journal
+/// lines, ticket and claim then name the heavy kind and the command it runs. A light parent whose slot no longer covers
+/// it is asked again whether it lends that slot before the run queues ([`Run::lend_again`]).
+fn take_heavy<'a>(run: &mut Run<'a>, heavy: &'a mut Option<(RunRequest, Nesting)>, local: Option<&HereWords>, console: &mut Console) {
+    let Some(HereWords {
+        words,
+        dropped: Some(reason),
+        ..
+    }) = local
+    else {
+        return;
+    };
+    let (request, nesting) = heavy.insert(run.as_heavy(words));
+    run.request = request;
+    run.nesting = nesting;
+    run.gate = run.gate.running(request);
+    run.journal = RunJournal::open(run.root, &run.gate);
+    run.lend_again(console);
+    console.err(&run.dropped_line(reason));
+}
+
+/// The nesting `request` runs under, or the status of a run refused before anything is taken or written, its lines
+/// said: a log inside the state root, or a critical gate under a heavy or light parent's slot, which leaves an earlier
+/// log in place. Any other nesting's lines are said once the run knows the slot it asks for ([`say_nesting`]).
 fn admitted(request: &RunRequest, log: &Path, root: &ResolvedRoot, environment: &Environment, console: &mut Console) -> Result<Nesting, u32> {
     if log_in_state_root(log, &root.path) {
         console.err(&format!(
@@ -163,10 +200,21 @@ fn admitted(request: &RunRequest, log: &Path, root: &ResolvedRoot, environment: 
         return Err(u32::from(USAGE_STATUS));
     }
     let nesting = Nesting::read(environment, request.slot, &root.root, request.test_seams.parent_job_trusted);
+    if matches!(nesting, Nesting::Refused(_)) {
+        say_nesting(&nesting, request, console);
+        return Err(u32::from(USAGE_STATUS));
+    }
+    Ok(nesting)
+}
+
+/// Says the lines of the `nesting` a gate of `request` runs under, once it is final: the line of a marker whose binding
+/// could not be judged first, then the line of an ignored marker, a covering parent or a refusing one. An uncovered
+/// gate says so only as it goes on to take a local slot.
+fn say_nesting(nesting: &Nesting, request: &RunRequest, console: &mut Console) {
     if let Some(line) = nesting.unjudged_line() {
         console.err(&line);
     }
-    let said = match &nesting {
+    let said = match nesting {
         Nesting::Own | Nesting::Under(_) | Nesting::Beside(_) => None,
         Nesting::Malformed(_) | Nesting::Ended { .. } | Nesting::Unbound { .. } | Nesting::Covered(_) | Nesting::Refused(_) => {
             nesting.line(request.slot, request.spelling)
@@ -175,10 +223,6 @@ fn admitted(request: &RunRequest, log: &Path, root: &ResolvedRoot, environment: 
     if let Some(line) = said {
         console.err(&line);
     }
-    if matches!(nesting, Nesting::Refused(_)) {
-        return Err(u32::from(USAGE_STATUS));
-    }
-    Ok(nesting)
 }
 
 /// The run's plan and its remote client, or the failure that stops it before its log is taken: the command as given,
@@ -235,7 +279,7 @@ fn resolved(path: &Path) -> PathBuf {
 
 /// Whether `path` is `folder` or lies inside it, both absolute and normalised: `folder`'s components are the first of
 /// `path`'s, each compared whole and without regard to case, as Windows compares file names.
-fn is_within(path: &Path, folder: &Path) -> bool {
+pub(crate) fn is_within(path: &Path, folder: &Path) -> bool {
     let mut own = path.components();
     folder.components().all(|part| own.next().is_some_and(|mine| same_name(mine, part)))
 }
@@ -540,22 +584,20 @@ struct Ended {
 }
 
 impl Run<'_> {
-    /// Decides where the command runs, then journals the queue: with `notRouted` for a heavy gate its caller kept here
-    /// with `--local`, with the remote tag for a routed one. A gate a parent's slot covers runs here, journalling
-    /// `covered` with the parent's pid in place of the queue, then writing its covered marker ([`Covered`]). A gate
-    /// whose light parent lends it its slot before it queues, while a critical request drains, is not routed and
-    /// journals nothing here ([`Run::on_parent`]). The
-    /// route.
-    fn queue(&mut self, environment: &Environment, console: &mut Console) -> Route {
+    /// Decides where the command runs, and sets the remote tag of a routed run. A gate a parent's slot covers runs
+    /// here, as does one whose light parent lends it its slot before it queues, while a critical request drains, which
+    /// is not routed ([`Run::on_parent`]). The route, and the gate's place in its worktree when the decision asked git
+    /// for it.
+    fn route(&mut self, environment: &Environment, console: &mut Console) -> (Route, Option<Place>) {
         let nesting = self.nesting;
         if let Nesting::Under(parent) = nesting
             && wait::lent_before_queue(self.root, parent.pid, self.host.processors, &mut self.survey, console)
         {
             self.lent = true;
-            return Route::Local { reason: None };
+            return (Route::Local { reason: None }, None);
         }
-        let covering = nesting.covering().map(|parent| parent.pid);
-        let route = route::route(self.request, environment, covering.is_some(), console);
+        let covering = nesting.covering().is_some();
+        let (route, place) = route::route(self.request, environment, covering, console);
         self.tag = match &route {
             Route::Routed(remote) => Some(RemoteTag {
                 host: remote.host.clone(),
@@ -563,35 +605,70 @@ impl Run<'_> {
             }),
             Route::Local { .. } => None,
         };
+        (route, place)
+    }
+
+    /// Asks a light parent whose slot does not cover this run, once it dropped its `--no-build` and asks for a heavy
+    /// slot, whether it lends that slot before the run queues, as [`Run::route`] asked of the nesting the run was read
+    /// with; a run already lent its parent's slot keeps it.
+    fn lend_again(&mut self, console: &mut Console) {
+        if let Nesting::Under(parent) = self.nesting
+            && !self.lent
+        {
+            self.lent = wait::lent_before_queue(self.root, parent.pid, self.host.processors, &mut self.survey, console);
+        }
+    }
+
+    /// Journals the queue of the run `route` sends: with `notRouted` for a heavy gate its caller kept here with
+    /// `--local`, with the remote tag for a routed one. A gate a parent's slot covers journals `covered` with the
+    /// parent's pid in place of the queue, then writes its covered marker ([`Covered`]). A gate its light parent lent
+    /// its slot before it queued journals nothing here.
+    fn queue(&mut self, route: &Route, console: &mut Console) {
+        if self.lent {
+            return;
+        }
+        let covering = self.nesting.covering().map(|parent| parent.pid);
         let event = match covering {
             Some(parent_pid) => JournalEvent::Covered { parent_pid },
             None => JournalEvent::Queue {
                 log: self.log.path().to_string_lossy().into_owned(),
-                not_routed: route::not_routed(&route),
+                not_routed: route::not_routed(route),
             },
         };
         self.journal.write(&event, self.tag.as_ref(), console);
         if let Some(parent_pid) = covering {
             self.covered = Some(Covered::write(&self.root.path, &self.gate, parent_pid, console));
         }
-        route
     }
 
-    /// Runs the command where `route` sends it: on the builder, and here after a fallback; or here ([`Run::here`]). How
-    /// the run ended; `None` when a Ctrl+C ended a wait for a slot.
-    fn through(&mut self, route: &Route, plan: Plan, hold: &mut Hold, console: &mut Console) -> Option<Ended> {
-        let plan = match route {
-            Route::Local { .. } => plan,
+    /// Runs the command where `route` sends it: on the builder, and here after a fallback; or here ([`Run::here`]), as
+    /// the words `local` says when it dropped the command's `--no-build` ([`Run::local_words`]). How the run ended, with
+    /// the words a run here ran, whose passing build clears the worktree's nothing-back record
+    /// ([`Run::clear_nothing_back`]); `None` when a Ctrl+C ended a wait for a slot.
+    fn through(
+        &mut self,
+        route: &Route,
+        plan: Plan,
+        local: Option<HereWords>,
+        hold: &mut Hold,
+        console: &mut Console,
+    ) -> Option<(Ended, Option<HereWords>)> {
+        let planned = match route {
+            Route::Local { .. } => self.plan_local(plan, local, console),
             Route::Routed(remote) => match self.routed(remote, hold, console) {
-                Remotely::Ended(ended) => return Some(ended),
+                Remotely::Ended(ended) => return Some((ended, None)),
                 Remotely::Interrupted => return None,
-                Remotely::Here => match self.plan_here(remote, plan, console) {
-                    Ok(plan) => plan,
-                    Err(ended) => return Some(ended),
-                },
+                Remotely::Here => self
+                    .plan_here(remote, plan, console)
+                    .map(|plan| (plan, Some(HereWords::fallback(remote)))),
             },
         };
-        self.here(plan, hold, console)
+        let (plan, here) = match planned {
+            Ok(planned) => planned,
+            Err(ended) => return Some((ended, None)),
+        };
+        let ended = self.here(plan, hold, console)?;
+        Some((ended, here))
     }
 
     /// Runs the command here. A gate a parent's slot covers takes no slot; nor does one whose light parent lends it its
@@ -704,9 +781,34 @@ impl Run<'_> {
         if fallback.is_some() && self.host.interrupt.is_some_and(Interrupt::is_raised) {
             return Remotely::Ended(self.interrupted_before_start(console));
         }
-        match fallback {
-            Some(reason) => self.fell_back(reason, &outcome, hold.taken.take(), console),
-            None => Remotely::Ended(self.remote_ended(&remote.host, &outcome, started, console)),
+        if let Some(reason) = fallback {
+            return self.fell_back(reason, &outcome, hold.taken.take(), console);
+        }
+        self.leave_nothing_back(remote, &outcome, console);
+        Remotely::Ended(self.remote_ended(&remote.host, &outcome, started, console))
+    }
+
+    /// Writes the worktree's nothing-back record after a routed run that ended on the builder, killed, interrupted or
+    /// unreported among them, when its command is a dotnet build ([`dotnet_builds`]) whose outputs `outcome` does not
+    /// know were brought back: the builder, and the configuration, framework and runtime its words set
+    /// ([`build_settings`]). A record that cannot be written is said.
+    fn leave_nothing_back(&self, remote: &RemoteRun, outcome: &RemoteOutcome, console: &mut Console) {
+        let Some(words) = unicode_words(&self.request.command).filter(|words| dotnet_builds(words)) else {
+            return;
+        };
+        if outcome.brought_back == Some(true) {
+            return;
+        }
+        let settings = build_settings(&words);
+        let record = v1::NothingBackRecord {
+            host: remote.host.clone(),
+            configuration: settings.configuration,
+            framework: settings.framework,
+            runtime: settings.runtime,
+        };
+        let path = v1::nothing_back_path(&self.root.path, &remote.key);
+        if let Err(error) = v1::write_nothing_back(&path, &record) {
+            console.err(&format!("gate: cannot write {}: {error}", path.display()));
         }
     }
 
@@ -774,13 +876,183 @@ impl Run<'_> {
         if words == self.request.command {
             return Ok(plan);
         }
+        self.replan(&words, console)
+    }
+
+    /// The plan of a run here from the start: the first plan, unless `local` dropped the command's `--no-build`
+    /// ([`Run::local_words`]); then a plan of the words it left. With the words it runs; else how the run ended when
+    /// they cannot be planned.
+    fn plan_local(&self, plan: Plan, local: Option<HereWords>, console: &mut Console) -> Result<(Plan, Option<HereWords>), Ended> {
+        match local {
+            Some(here) if here.dropped.is_some() => {
+                let plan = self.replan(&here.words.iter().map(OsString::from).collect::<Vec<_>>(), console)?;
+                Ok((plan, Some(here)))
+            }
+            local => Ok((plan, local)),
+        }
+    }
+
+    /// The words of a run here from the start, its worktree when it is known, and why its `--no-build` was dropped: a
+    /// dotnet command with an exact `--no-build` word of its own that would find no build here
+    /// ([`Run::no_build_reason`]) loses each such word. Its worktree comes from the route's `place`, else from one git
+    /// call; a command outside a worktree keeps its words. `None` for a routed run, and for a command with a word that
+    /// is not valid Unicode, which runs as it is.
+    fn local_words(&self, route: &Route, place: Option<&Place>, console: &mut Console) -> Option<HereWords> {
+        if matches!(route, Route::Routed(_)) {
+            return None;
+        }
+        let words = unicode_words(&self.request.command)?;
+        let known = place.map(|place| Worktree {
+            root: place.root.clone(),
+            prefix: place.prefix.clone(),
+        });
+        let dropped = without_no_build(words.clone());
+        let kept = |words, worktree| HereWords {
+            words,
+            worktree,
+            dropped: None,
+        };
+        if dropped.len() == words.len() {
+            return Some(kept(words, known));
+        }
+        let Some(worktree) = known.or_else(|| self.worktree(false, console)) else {
+            return Some(kept(words, None));
+        };
+        let Some(reason) = self.no_build_reason(&worktree.root, &words, console) else {
+            return Some(kept(words, Some(worktree)));
+        };
+        Some(HereWords {
+            words: dropped,
+            worktree: Some(worktree),
+            dropped: Some(reason),
+        })
+    }
+
+    /// The request and nesting of this run once its `--no-build` is dropped: the run here is a build, so it asks for a
+    /// heavy slot whatever slot the caller named, runs `words`, and is under its parent as a heavy gate is.
+    fn as_heavy(&self, words: &[String]) -> (RunRequest, Nesting) {
+        let request = RunRequest {
+            slot: Slot::Heavy,
+            command: words.iter().map(OsString::from).collect(),
+            ..self.request.clone()
+        };
+        (request, self.nesting.as_heavy())
+    }
+
+    /// The line a run says as it drops its `--no-build` for `reason`, naming where it builds: on the slot of the parent
+    /// gate that covers or lent it, else on a heavy slot of its own.
+    fn dropped_line(&self, reason: &str) -> String {
+        let building = match self.nesting.handed_on(self.lent) {
+            Some(parent) => format!("building on the parent gate's {} slot", parent.held.as_str()),
+            None => "building on a heavy slot".to_owned(),
+        };
+        format!("gate: dropped --no-build: {reason}; {building}")
+    }
+
+    /// Why a dotnet `--no-build` run of `words` in the worktree at `root` drops the word, `None` when it keeps it: the
+    /// worktree has a nothing-back record, or a project it builds has no `obj\project.assets.json` ([`Run::without_assets`]),
+    /// asked only without a record ([`no_build::drop_reason`]). A record that cannot be read counts as there, said.
+    fn no_build_reason(&self, root: &str, words: &[String], console: &mut Console) -> Option<String> {
+        let path = v1::nothing_back_path(&self.root.path, &work_folder_key(root));
+        let record = no_build::read_record(&path).unwrap_or_else(|error| {
+            console.err(&format!("gate: cannot read {}: {error}", path.display()));
+            Some(NothingBack {
+                host: None,
+                settings: BuildSettings::default(),
+            })
+        });
+        no_build::drop_reason(record, || self.without_assets(Path::new(root), words, console))
+    }
+
+    /// The first project of the worktree at `root` the dotnet command `words` builds with no `obj\project.assets.json`:
+    /// of the project or solution it names ([`no_build::named_without_assets`]), else of the worktree's tracked projects
+    /// ([`no_build::first_without_assets`]). `None` when each has it, when the worktree's build files may move it
+    /// ([`no_build::moves_intermediates`]), and when the projects cannot be listed or the build files read, which is
+    /// said.
+    fn without_assets(&self, root: &Path, words: &[String], console: &mut Console) -> Option<String> {
+        let cannot = |console: &mut Console, line: String| {
+            console.err(&line);
+            None
+        };
+        match no_build::moves_intermediates(root) {
+            Ok(true) => return None,
+            Ok(false) => {}
+            Err(error) => return cannot(console, format!("gate: {error}")),
+        }
+        if let Some(target) = dotnet_target(words) {
+            return no_build::named_without_assets(&target, root).unwrap_or_else(|error| cannot(console, format!("gate: {error}")));
+        }
+        match no_build::project_listing(root, git::limit(&self.request.test_seams)) {
+            Ok(listing) => no_build::first_without_assets(root, &listing),
+            Err(error) => cannot(console, format!("gate: cannot list the worktree's projects: {error}")),
+        }
+    }
+
+    /// The git worktree the gate runs in ([`no_build::worktree`]); `None` outside a repository, and when git cannot be
+    /// asked or fails otherwise, which is said, unless `quiet_without_git` and git cannot be found or started.
+    fn worktree(&self, quiet_without_git: bool, console: &mut Console) -> Option<Worktree> {
+        match no_build::worktree(git::limit(&self.request.test_seams)) {
+            Ok(worktree) => worktree,
+            Err(Unfound::NoGit(_)) if quiet_without_git => None,
+            Err(error) => {
+                console.err(&format!("gate: cannot find the command's git worktree: {}", error.text()));
+                None
+            }
+        }
+    }
+
+    /// Removes the worktree's nothing-back record after a run here that passed, once its slot is released, when the
+    /// words it ran are a dotnet build of the whole worktree that rebuilt what the record stands for
+    /// ([`Run::cleared_record`]). A record that cannot be removed is said.
+    fn clear_nothing_back(&self, here: HereWords, console: &mut Console) {
+        let Some(path) = self.cleared_record(here, console) else {
+            return;
+        };
+        match fs::remove_file(&path) {
+            Err(error) if error.kind() != io::ErrorKind::NotFound => {
+                console.err(&format!("gate: cannot remove {}: {error}", path.display()));
+            }
+            _ => {}
+        }
+    }
+
+    /// The nothing-back record a passing run here of `here`'s words clears: that of its worktree (`here`'s, else the
+    /// one git gives, git that cannot be found or started counting as none, unsaid), when the words are an SDK dotnet
+    /// build other than `msbuild` ([`sdk_build_target`]) of a solution, or of nothing run at the worktree's root, and
+    /// set the configuration, framework and runtime the record's build set ([`BuildSettings::same_as`]). `None` when
+    /// there is no such record; a record that cannot be read is said and left.
+    fn cleared_record(&self, here: HereWords, console: &mut Console) -> Option<PathBuf> {
+        let target = sdk_build_target(&here.words).filter(|target| *target != BuildTarget::Other)?;
+        let worktree = here.worktree.or_else(|| self.worktree(true, console))?;
+        let whole = match target {
+            BuildTarget::Solution => true,
+            BuildTarget::Unnamed => worktree.prefix.is_empty(),
+            BuildTarget::Other => false,
+        };
+        if !whole {
+            return None;
+        }
+        let path = v1::nothing_back_path(&self.root.path, &work_folder_key(&worktree.root));
+        let record = match no_build::read_record(&path) {
+            Ok(record) => record?,
+            Err(error) => {
+                console.err(&format!("gate: cannot read {}: {error}", path.display()));
+                return None;
+            }
+        };
+        record.settings.same_as(&build_settings(&here.words)).then_some(path)
+    }
+
+    /// A plan of `words`, which a run here runs in place of the command as given; else how the run ended when they
+    /// cannot be planned.
+    fn replan(&self, words: &[OsString], console: &mut Console) -> Result<Plan, Ended> {
         let at = Where {
             root: self.root,
             gate: &self.gate,
             log: &self.log,
             nesting: self.nesting,
         };
-        Plan::prepare(self.request, &words, &at, console).map_err(|NotRun { status, line }| {
+        Plan::prepare(self.request, words, &at, console).map_err(|NotRun { status, line }| {
             console.err(&line);
             Ended {
                 status: i64::from(status),
@@ -1610,6 +1882,34 @@ fn take_event(slots: Vec<String>, waited_seconds: f64, abandoned: Vec<String>, p
         machine: None,
         parent_pid,
     }
+}
+
+/// The words a run here runs, its worktree when it is already known, and why the command's `--no-build` was dropped
+/// from them when it was: what plans a run here from the start ([`Run::local_words`]) and clears the worktree's
+/// nothing-back record once the run passes ([`Run::clear_nothing_back`]).
+struct HereWords {
+    words: Vec<String>,
+    worktree: Option<Worktree>,
+    dropped: Option<String>,
+}
+
+impl HereWords {
+    /// The words of the run here after `remote`'s fallback, in the worktree and folder the route placed it in.
+    fn fallback(remote: &RemoteRun) -> HereWords {
+        HereWords {
+            words: remote.fallback.clone(),
+            worktree: Some(Worktree {
+                root: remote.root.clone(),
+                prefix: remote.subfolder.clone(),
+            }),
+            dropped: None,
+        }
+    }
+}
+
+/// The command's words as text, `None` when one of them is not valid Unicode.
+fn unicode_words(command: &[OsString]) -> Option<Vec<String>> {
+    command.iter().map(|word| word.to_str().map(str::to_owned)).collect()
 }
 
 #[cfg(test)]

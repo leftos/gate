@@ -1057,6 +1057,7 @@ impl Attempt<'_, '_> {
             killed,
             lines: self.lines,
             detail: self.problem,
+            brought_back: None,
         }
     }
 }

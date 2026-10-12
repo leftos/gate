@@ -124,6 +124,50 @@ pub fn outputs_pending_path(root: &Path, key: &str) -> PathBuf {
     remote_dir(root).join(format!("{key}.outputs-pending"))
 }
 
+/// The nothing-back record of the work folder `key`, `<root>\remote\<key>.nothing-back`: the JSON object
+/// `{"v": 1, "host": "<builder>", "configuration": …, "framework": …, "runtime": …}` ([`NothingBackRecord`]), written
+/// when a routed dotnet build of that worktree ends without its outputs known to be brought back and removed by a
+/// passing dotnet build of the whole worktree here, so a dotnet `--no-build` run here meanwhile builds.
+#[must_use]
+pub fn nothing_back_path(root: &Path, key: &str) -> PathBuf {
+    remote_dir(root).join(format!("{key}.nothing-back"))
+}
+
+/// The body of a nothing-back record ([`nothing_back_path`]) after its `v`: the builder the routed build ran on, and
+/// the configuration, framework and runtime its words set, each left out when they set none.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NothingBackRecord {
+    pub host: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub configuration: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub framework: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<String>,
+}
+
+/// Writes the nothing-back `record` at `path` whole or not at all, as [`write_replacing`] writes: the temp file beside
+/// it is made new, a link or junction standing at its name opened as itself rather than followed, then moved over any
+/// record there.
+///
+/// # Errors
+///
+/// A folder, temp file or move that fails.
+pub fn write_nothing_back(path: &Path, record: &NothingBackRecord) -> io::Result<()> {
+    write_versioned(path, record)
+}
+
+/// The nothing-back record a file's bytes hold, read strictly as every file of this module is; a record without the
+/// settings, written before they were, reads with none.
+///
+/// # Errors
+///
+/// Bytes that are not UTF-8 or not the record's format.
+pub fn nothing_back_record(bytes: &[u8]) -> Result<NothingBackRecord, FormatError> {
+    let text = std::str::from_utf8(bytes).map_err(|_| FormatError::Syntax("not UTF-8".to_owned()))?;
+    parse_strict(text)
+}
+
 /// A pause marker's name read: the gate waiting under a parent's slot, and the parent gate it runs under.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PauseMarker {
