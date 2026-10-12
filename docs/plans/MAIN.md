@@ -11,7 +11,6 @@
 ## Remote
 
 - [ ] GATE-10 Port the remote client and box wrapper, then the remote cutover
-  - [ ] GATE-131 Sync-back: bound what a back commit writes into the worktree
   - [ ] GATE-109 Remote: carry every verb of a routed run over one ssh connection (gate box serve)
   - [ ] GATE-18 Remote preflight: refuse with `parity` when the builder lacks a .NET workload the repo needs
   - [ ] GATE-19 Remote: send a repo's declared sibling worktrees with a routed run
@@ -24,7 +23,7 @@
   - [ ] GATE-135 Remote client: bound the PC's dotnet --list-sdks and find dotnet on PATH only
   - [ ] GATE-137 Remote client: cap the bytes the outputs fetch writes
   - [ ] GATE-138 Sync-back: fetch into a quarantine object folder
-- [ ] GATE-107 Make the sync-back git-failure case independent of a held bare repository
+- [ ] GATE-145 Sync-back: bound what checkout conversions write (LFS smudge, ident, encoding, CRLF) and refuse .lfsconfig
 
 ## Cutover sweep
 
@@ -41,8 +40,8 @@
 
 ## Backlog
 
-- [/] GATE-99 Bind a slot marker to a real parent gate's job before covering
+- [ ] GATE-140 End an escaped tree at the box, remote client, bridge and push kill sites
+- [/] GATE-139 Count a packaged app's escaped tree in the cores, clock and stall check
 - [ ] GATE-101 A covered gate outlives its parent's slot
-- [/] GATE-125 Find how far a packaged app escapes the gate's kill-on-close jobs
-  - [ ] GATE-139 Count a packaged app's escaped tree in the cores, clock and stall check
-  - [ ] GATE-140 End an escaped tree at the box, remote client, bridge and push kill sites
+- [ ] GATE-143 Measure which other shared daemons leave a gate's job, and spare them from the escaped-tree kill
+- [ ] GATE-144 Harden the slot marker against a same-user forger: job DACL, parent claim check, job-name squatting
