@@ -44,7 +44,7 @@ Suite = `crates/gate/tests/suite/` (binary `suite`, needs `--all-features`; test
 | bin/fake-ssh.rs | `remote_client` (`--test-remote-ssh`), `push` (`--test-push-ssh`), `routing`? (no) | no: remote_client, push |
 | remote/mod.rs | `routing` (scripted client `--test-remote-client`, fallback reason `client`), `bridge`, `remote_client` | no: routing, bridge, remote_client |
 | remote/bridge.rs | `bridge` (`--test-remote-script`, `--test-bridge`), `routing` (5 uses of `--test-remote-script`), `request` (print only) | no: bridge, routing |
-| remote/{client,parity,retry,transport,watchdog,syncback,outputs,payload,snapshot}.rs | `remote_client` (`--test-remote-transport local:`, `--test-local-sdks`, `--test-remote-ssh`, `--test-remote-snapshot`, `--test-remote-watch-call`, `--test-remote-timeout-ms`...); `transport.rs` ssh words + `Ssh::find` also `push`; `payload.rs` is what `boxside` payload tests read through `local:` builder | no: remote_client (+ push for transport.rs, + boxside for payload.rs/outputs.rs) |
+| remote/{client,parity,retry,transport,watchdog,syncback,outputs,payload,snapshot}.rs | `remote_client` (`--test-remote-transport local:`, `--test-local-sdks`, `--test-remote-ssh`, `--test-remote-snapshot`, `--test-remote-watch-call`, `--test-remote-timeout-ms`, `--test-remote-fetch-cap-bytes`...); `transport.rs` ssh words + `Ssh::find` also `push`; `payload.rs` is what `boxside` payload tests read through `local:` builder | no: remote_client (+ push for transport.rs, + boxside for payload.rs/outputs.rs) |
 | remote/{git,launch}.rs | `remote_client` (`--test-git`), `routing` (`--test-git`, route facts), `request` | no: remote_client, routing |
 | boxside/mod.rs, payload.rs, preflight.rs, boot.rs, run.rs, stop.rs | `boxside` (29 flag/verb uses; the case runs `gate box boot/preflight/run/stop`), `remote_client` (builder is `gate box` via `local:`) | no: boxside, remote_client |
 | boxside/heartbeat.rs, forward.rs | `boxside` (`--test-heartbeat-ms`), `remote_client` | no: boxside, remote_client |
@@ -72,7 +72,7 @@ Suite = `crates/gate/tests/suite/` (binary `suite`, needs `--all-features`; test
 | gate-watchdog servers.rs | `build_servers`, `priority`, `diagnostics`, `ceiling` | unit | no |
 | gate-watchdog diagnostics.rs | `diagnostics`, `stall`, `ceiling`, `build_servers` (`--test-diagnostics-budget-ms` cuts every block) | unit | no |
 | gate-watchdog heartbeat.rs | `boxside`, `boxside::outputs`, `remote_client`, `critical`/`slots`/`pause` only via `--test-heartbeat-ms` flag (the wait heartbeat is gate/src/wait.rs, not this) | unit | no |
-| gate-win32 job.rs / create.rs / launch.rs / lib.rs / mutex.rs | all (started command, job, slot mutexes): CENTRAL | `gate-win32` tests (launch, mutex, event, interrupt...) | CENTRAL |
+| gate-win32 job.rs / create.rs / launch.rs / lib.rs / mutex.rs | all (started command, job, slot mutexes): CENTRAL | `gate-win32` tests (launch, mutex, event, interrupt, `io` for `Job::written_bytes`...) | CENTRAL |
 | gate-win32 piped.rs / console.rs | `boxside` (`--test-box-console`, `--test-box-park-launch`), `bridge`, `remote_client` | win32 `launch` | no |
 | gate-win32 priority.rs | `priority`, `critical`, `build_servers` | win32 `priority` | no |
 | gate-win32 tree.rs | `stop_tree`, `interrupt`, `boxside` (stop), `burn` (`WaitableProcess`) | - | no |

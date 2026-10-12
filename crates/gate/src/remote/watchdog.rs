@@ -16,6 +16,8 @@ const SHORTEST_TICK: Duration = Duration::from_millis(10);
 pub(super) const LINE_CAP: usize = 64 * 1024;
 const BYTES_KEPT: usize = 1024 * 1024;
 const LINES_KEPT: usize = 1000;
+/// The most bytes the job of the sync-back's fetch may write: 4 GiB.
+pub(super) const FETCH_CAP: u64 = 4 << 30;
 
 /// Why the watchdog killed a call.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -39,6 +41,8 @@ pub(super) enum Cut {
     TooLong,
     /// It was still running at the run's ceiling.
     Ceiling,
+    /// Its job wrote more than this many bytes.
+    TooBig(u64),
 }
 
 impl Cut {
@@ -51,8 +55,23 @@ impl Cut {
             Cut::Late(limit) => format!("{what} did not answer within {}", amount(limit)),
             Cut::TooLong => format!("{what} sent a line longer than 64 KiB"),
             Cut::Ceiling => format!("{what} did not finish within the run's ceiling"),
+            Cut::TooBig(cap) => format!("{what} wrote more than {}", size(cap)),
         }
     }
+}
+
+/// `bytes` in the largest binary unit, KiB, MiB or GiB, in which it is at least 1.0 once rounded half up to one
+/// decimal, so 1023.99 KiB is `1.0 MiB`; in bytes when it is not even 1.0 KiB.
+pub(super) fn size(bytes: u64) -> String {
+    const UNITS: [(&str, u32); 3] = [("GiB", 30), ("MiB", 20), ("KiB", 10)];
+    for (unit, shift) in UNITS {
+        let one = 1_u128 << shift;
+        let tenths = (u128::from(bytes) * 10 + one / 2) / one;
+        if tenths >= 10 {
+            return format!("{}.{} {unit}", tenths / 10, tenths % 10);
+        }
+    }
+    format!("{bytes} B")
 }
 
 /// `duration` in whole seconds when it is a whole number of them, else in whole milliseconds.
@@ -178,7 +197,7 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        BYTES_KEPT, Cut, Kept, Kill, LINE_CAP, LINES_KEPT, complete, kill, kill_line, stall_window, tick, too_long, truncated, whole_seconds,
+        BYTES_KEPT, Cut, Kept, Kill, LINE_CAP, LINES_KEPT, complete, kill, kill_line, size, stall_window, tick, too_long, truncated, whole_seconds,
     };
 
     const SECOND: Duration = Duration::from_secs(1);
@@ -192,6 +211,31 @@ mod tests {
         assert_eq!(complete(&"\u{1f600}".as_bytes()[..3]), 0, "three bytes of a four-byte character");
         assert_eq!(complete("\u{1f600}".as_bytes()), 4, "a finished four-byte character");
         assert_eq!(complete(b""), 0);
+    }
+
+    #[test]
+    fn a_call_cut_for_what_it_wrote_names_the_cap_in_its_largest_binary_unit() {
+        assert_eq!(Cut::TooBig(4 << 30).reason("git fetch"), "git fetch wrote more than 4.0 GiB");
+        assert_eq!(Cut::TooBig(262_144).reason("git fetch"), "git fetch wrote more than 256.0 KiB");
+        assert_eq!(Cut::TooBig(64 << 20).reason("git fetch"), "git fetch wrote more than 64.0 MiB");
+        assert_eq!(Cut::TooBig(1536 << 20).reason("git fetch"), "git fetch wrote more than 1.5 GiB");
+    }
+
+    #[test]
+    fn a_size_is_rounded_before_its_unit_is_chosen() {
+        for (bytes, shown) in [
+            (971, "971 B"),
+            (1023, "1.0 KiB"),
+            (1024, "1.0 KiB"),
+            (985_661, "962.6 KiB"),
+            (1_048_565, "1.0 MiB"),
+            (1_048_575, "1.0 MiB"),
+            (1 << 20, "1.0 MiB"),
+            ((1 << 30) - 1, "1.0 GiB"),
+            (1 << 30, "1.0 GiB"),
+        ] {
+            assert_eq!(size(bytes), shown, "{bytes}");
+        }
     }
 
     #[test]

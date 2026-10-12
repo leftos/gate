@@ -6,9 +6,9 @@ use proc_table::win32::OwnedHandle;
 use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, ERROR_MORE_DATA, GetLastError, SetLastError};
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_BREAKAWAY_OK, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-    JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_BASIC_PROCESS_ID_LIST, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-    JobObjectBasicAccountingInformation, JobObjectBasicProcessIdList, JobObjectExtendedLimitInformation, QueryInformationJobObject,
-    SetInformationJobObject, TerminateJobObject,
+    JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_BASIC_AND_IO_ACCOUNTING_INFORMATION, JOBOBJECT_BASIC_PROCESS_ID_LIST,
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectBasicAccountingInformation, JobObjectBasicAndIoAccountingInformation, JobObjectBasicProcessIdList,
+    JobObjectExtendedLimitInformation, QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
 };
 
 use crate::launch::struct_size;
@@ -173,6 +173,16 @@ impl Job {
         accounting(&self.handle)
     }
 
+    /// The bytes every process ever in the job has written, to files, pipes and devices alike, those that have exited
+    /// and those in the jobs nested inside it included.
+    ///
+    /// # Errors
+    ///
+    /// The system's error when the job cannot be queried.
+    pub fn written_bytes(&self) -> io::Result<u64> {
+        written_bytes(&self.handle)
+    }
+
     /// Ends every process in the job, and in the jobs nested inside it, with `exit_code`.
     ///
     /// # Errors
@@ -247,6 +257,28 @@ pub(crate) fn accounting(job: &OwnedHandle) -> io::Result<Accounting> {
         cpu: user + kernel,
         active_processes: information.ActiveProcesses,
     })
+}
+
+/// The bytes every process ever in the job behind `job` has written: its I/O accounting's write transfer count. A
+/// handle without `JOB_OBJECT_QUERY` access gets the system's error.
+pub(crate) fn written_bytes(job: &OwnedHandle) -> io::Result<u64> {
+    let mut information = JOBOBJECT_BASIC_AND_IO_ACCOUNTING_INFORMATION::default();
+    let length = u32::try_from(size_of_val(&information)).map_err(io::Error::other)?;
+    // SAFETY: the handle is open for the whole call, and one without the `JOB_OBJECT_QUERY` access the call asks for
+    // only makes it fail; `information` is writable for `length` bytes, and no returned length is asked for.
+    let read = unsafe {
+        QueryInformationJobObject(
+            job.raw(),
+            JobObjectBasicAndIoAccountingInformation,
+            (&raw mut information).cast(),
+            length,
+            std::ptr::null_mut(),
+        )
+    };
+    if read == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(information.IoInfo.WriteTransferCount)
 }
 
 /// Ends every process in the job behind `job`, and in the jobs nested inside it, with `exit_code`. A handle without

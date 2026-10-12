@@ -61,6 +61,8 @@ pub(crate) enum ValueOption {
     #[cfg(feature = "test-seams")]
     LocalSdks,
     #[cfg(feature = "test-seams")]
+    RemoteFetchCapBytes,
+    #[cfg(feature = "test-seams")]
     RemoteScript,
     #[cfg(feature = "test-seams")]
     BridgePwsh,
@@ -226,6 +228,8 @@ impl RunBuilder {
             #[cfg(feature = "test-seams")]
             ValueOption::LocalSdks => self.test_seams.local_sdks = Some(value.to_owned()),
             #[cfg(feature = "test-seams")]
+            ValueOption::RemoteFetchCapBytes => self.test_seams.remote_fetch_cap_bytes = Some(values::above_zero(spelled, value)?),
+            #[cfg(feature = "test-seams")]
             ValueOption::RemoteScript => self.test_seams.remote_script = Some(PathBuf::from(value)),
             #[cfg(feature = "test-seams")]
             ValueOption::BridgePwsh => self.test_seams.bridge_pwsh = Some(PathBuf::from(value)),
@@ -317,8 +321,9 @@ impl RunBuilder {
 
     /// Refuses the remote client's seams that cannot work together: `--test-remote-ssh`,
     /// `--test-remote-retry-pause-ms`, `--test-remote-bound-ms`, `--test-remote-interrupt-at`,
-    /// `--test-remote-watch-call`, `--test-remote-timeout-ms` and `--test-local-sdks` without `--test-remote-transport`,
-    /// whose client alone reads them, and `--test-remote-snapshot` with it, as each chooses the client.
+    /// `--test-remote-watch-call`, `--test-remote-timeout-ms`, `--test-local-sdks` and `--test-remote-fetch-cap-bytes`
+    /// without `--test-remote-transport`, whose client alone reads them, and `--test-remote-snapshot` with it, as each
+    /// chooses the client.
     #[cfg(feature = "test-seams")]
     fn check_remote_seams(&mut self) {
         const TRANSPORT: &str = "--test-remote-transport";
@@ -332,6 +337,7 @@ impl RunBuilder {
             (self.test_seams.remote_watch_call.is_some(), "--test-remote-watch-call"),
             (self.test_seams.remote_timeout_ms.is_some(), "--test-remote-timeout-ms"),
             (self.test_seams.local_sdks.is_some(), "--test-local-sdks"),
+            (self.test_seams.remote_fetch_cap_bytes.is_some(), "--test-remote-fetch-cap-bytes"),
         ] {
             if read && !transport {
                 self.problems.push(Problem::SeamNeeds {

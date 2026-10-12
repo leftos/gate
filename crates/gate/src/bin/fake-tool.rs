@@ -21,6 +21,8 @@
 //! kept; `write <path> <text>` writes the text to the file at the path, replacing it, its folders made when missing;
 //! `fill <path> <bytes>` writes a file of that many `x` bytes at the path, its folders made when missing, through a
 //! fixed buffer, so its size never sits in memory;
+//! `noise <path> <bytes>` writes a file of that many bytes no compression shrinks at the path, the same bytes on every
+//! run, from a fixed-seed generator, its folders made when missing;
 //! `burn-threads <n> <ms>` spins on the CPU on n threads for ms of wall time, then goes on to its next step;
 //! `argv` prints every word after it, each on its own line, and ends, so it is always the last step.
 //! With no `exit` step it exits 0. For example `fake-tool out hi err oops exit 3`.
@@ -142,6 +144,7 @@ fn run(args: &[OsString]) -> Result<i32, String> {
                 let size: u64 = text.parse().map_err(|_| format!("fill takes a byte count, got '{text}'"))?;
                 fill(&path, size)?;
             }
+            "noise" => noise(&mut steps)?,
             "free-console" => free_console()?,
             "pid" => {
                 writeln!(stdout, "pid {}", std::process::id()).map_err(|error| write_failed(&error))?;
@@ -326,6 +329,32 @@ fn fill(path: &str, size: u64) -> Result<(), String> {
     } else {
         Err(format!("cannot fill {path}: {copied} of {size} bytes were written"))
     }
+}
+
+/// The `noise <path> <bytes>` step: writes a file of that many bytes that no compression shrinks at the path, its
+/// folders made when missing, the output of a splitmix64 generator of a fixed seed, so every run writes the same bytes.
+fn noise<'a>(steps: &mut impl Iterator<Item = &'a OsString>) -> Result<(), String> {
+    let path = operand(steps, "noise")?;
+    let text = operand(steps, "noise")?;
+    let size: u64 = text.parse().map_err(|_| format!("noise takes a byte count, got '{text}'"))?;
+    make_folders(&path)?;
+    let failed = |error: io::Error| format!("cannot write noise to {path}: {error}");
+    let mut file = io::BufWriter::new(std::fs::File::create(&path).map_err(failed)?);
+    let mut state: u64 = 0x5EED;
+    let mut left = size;
+    while left > 0 {
+        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut word = state;
+        word = (word ^ (word >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        word = (word ^ (word >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        word ^= word >> 31;
+        let bytes = word.to_le_bytes();
+        let step = left.min(8);
+        let take = usize::try_from(step).map_err(|error| format!("cannot write noise to {path}: {error}"))?;
+        file.write_all(&bytes[..take]).map_err(failed)?;
+        left -= step;
+    }
+    file.flush().map_err(failed)
 }
 
 /// Leaves this process's console; its standard handles, the pipes it was given, stay as they are.

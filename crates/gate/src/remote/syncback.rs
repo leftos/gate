@@ -4,20 +4,26 @@
 //! not made from this snapshot, is ignored. One that touches a `.git*` path or makes a link or a submodule, or one the
 //! worktree changed under during the run, is kept at `refs/gate-remote/<key>-back` and fails a run that had passed;
 //! one that a step before its apply could not take further, as it failed or was interrupted, is kept there too, and
-//! the line that ends the run says where to see its changes.
+//! the line that ends the run says where to see its changes. A fetch whose job writes more than the fetch cap is
+//! stopped and fails a run that had passed, the changes left on the builder and nothing applied.
 //! The two git calls that reach the builder take the pre-banner retry and keep their lines out of the log; any other
 //! git failure is the run's, status 1 and `gate: the remote run failed: ...`, with no fallback. Every name and git line
 //! said here has its control characters escaped.
 
+use std::ffi::OsString;
 use std::fs::OpenOptions;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use super::client::{Attempt, Called, Echo, End, Watch};
 use super::git::{self, Git, GitError};
+use super::launch::KILL_WAIT;
 use super::payload;
 use super::retry::GIT_SSH_FAILED;
 use super::snapshot::{self, BACK, REFS, Snapshot};
+use super::watchdog::{self, Cut};
 use crate::boxside::payload::escaped;
 
 /// The patch an applied sync-back is written to in the git folder, named for the process and a nonce, and removed
@@ -46,7 +52,9 @@ pub(super) fn sync_back(attempt: &mut Attempt<'_, '_>, snapshot: &Snapshot, stat
     let Some(advertised) = has_back(attempt, &git, &remote)? else {
         return Ok(End::Status(status));
     };
-    fetch(attempt, &git, &remote)?;
+    if let Some(stopped) = fetch(attempt, &git, &remote, status)? {
+        return Ok(stopped);
+    }
     let back = line(attempt, &git, &["rev-parse", "FETCH_HEAD"])?;
     if back != advertised || !made_from(attempt, &git, &back, &snapshot.commit)? {
         attempt.say(ignored_line(&back, &snapshot.commit));
@@ -84,12 +92,121 @@ const FETCH_WORDS: [&str; 10] = [
 
 /// Fetches the back ref the builder holds into `FETCH_HEAD`, every object it sends checked, and no tag or submodule.
 /// It says its progress, which a live fetch keeps sending on standard error, so only a fetch that went quiet stalls.
-fn fetch(attempt: &mut Attempt<'_, '_>, git: &Git, remote: &Remote<'_>) -> Result<(), End> {
+/// Its job may write at most the attempt's fetch cap: past it the fetch is stopped, and the run of the command that
+/// ended `status` ends with the line saying the changes stay on the builder, a passing run as 1. A fetch that did not
+/// exit cleanly has the parts of a pack it left in the repository's pack folder removed, however it ended. That end;
+/// `None` when the fetch went through.
+fn fetch(attempt: &mut Attempt<'_, '_>, git: &Git, remote: &Remote<'_>, status: i64) -> Result<Option<End>, End> {
+    let packs = pack_folder(attempt, git)?;
+    let before = tmp_packs(&packs).map_err(|error| End::Failed(escaped(&format!("cannot list {}: {error}", packs.display()))))?;
     let fetch = Network {
         verb: "fetch",
-        watch: Watch::Fetch(attempt.limits_for("fetch")),
+        watch: Watch::Fetch(attempt.limits_for("fetch"), Some(attempt.fetch_cap)),
     };
-    to_the_builder(attempt, git, remote, &fetch, &remote.args(&FETCH_WORDS)).map(drop)
+    let args = remote.args(&FETCH_WORDS);
+    let made = reached(attempt, git, remote, &fetch, &args);
+    // Any end but a clean exit may leave part of a pack, which no later fetch removes: a cut, an interrupt, a git that
+    // failed. The end itself stands as it would without the removal, and its lines come before the removal's.
+    let clean = matches!(&made, Ok(called) if called.cut.is_none() && called.status == 0);
+    let unremoved = if clean {
+        Vec::new()
+    } else {
+        remove_new_tmp_packs(&packs, &before, KILL_WAIT, || {})
+    };
+    let end = made.and_then(|called| {
+        if let Some(Cut::TooBig(cap)) = called.cut {
+            attempt.noted(&called);
+            attempt.say(stopped_line(cap, remote.reference));
+            return Ok(Some(End::Status(if status == 0 { 1 } else { status })));
+        }
+        checked(attempt, &fetch, &args, called).map(|_| None)
+    });
+    for line in unremoved {
+        attempt.say(line);
+    }
+    end
+}
+
+/// The pack folder of the worktree's repository, as `git rev-parse --git-path objects/pack` names it, asked with no
+/// interrupt: a Ctrl+C meanwhile is left to the fetch that follows, which ends as the run's interrupt.
+fn pack_folder(attempt: &Attempt<'_, '_>, git: &Git) -> Result<PathBuf, End> {
+    let args = ["rev-parse", "--git-path", "objects/pack"];
+    let printed = git
+        .output(&git::Call::plain(Path::new(attempt.call.root), &args, attempt.limit))
+        .map_err(escaped_end)?;
+    let folder = printed
+        .lines()
+        .next()
+        .map(str::trim_end)
+        .filter(|folder| !folder.is_empty())
+        .ok_or_else(|| End::Failed(format!("git {} printed nothing", args.join(" "))))?;
+    Ok(Path::new(attempt.call.root).join(folder))
+}
+
+/// What a pack being written into the pack folder is named until git renames it: `tmp_pack_` and six random characters.
+const TMP_PACK: &str = "tmp_pack_";
+/// Windows' error for a file another process holds open, which refuses its removal.
+const SHARING_VIOLATION: i32 = 32;
+/// How long a removal waits before it tries again a file another process holds open.
+const REMOVE_STEP: Duration = Duration::from_millis(20);
+
+/// The names of the `tmp_pack_*` files in the pack folder `folder`; none when there is no such folder.
+fn tmp_packs(folder: &Path) -> io::Result<Vec<OsString>> {
+    let entries = match std::fs::read_dir(folder) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        listed => listed?,
+    };
+    let mut names = Vec::new();
+    for entry in entries {
+        let name = entry?.file_name();
+        if name.to_string_lossy().starts_with(TMP_PACK) {
+            names.push(name);
+        }
+    }
+    Ok(names)
+}
+
+/// Removes the `tmp_pack_*` files in the pack folder `folder` that were not among `before`: the part of a pack a fetch
+/// that did not end cleanly left. A file another process still holds open is tried again for up to `wait`, `held`
+/// called each time before the removal waits for one; the lines saying each file that could not be removed even so. A
+/// folder that cannot be listed leaves everything, unsaid.
+fn remove_new_tmp_packs(folder: &Path, before: &[OsString], wait: Duration, mut held: impl FnMut()) -> Vec<String> {
+    let Ok(now) = tmp_packs(folder) else {
+        return Vec::new();
+    };
+    let deadline = Instant::now() + wait;
+    now.iter()
+        .filter(|name| !before.contains(name))
+        .filter_map(|name| {
+            let path = folder.join(name);
+            removed(&path, deadline, &mut held)
+                .err()
+                .map(|error| format!("gate: remote could not remove {}: {error}", escaped(&path.display().to_string())))
+        })
+        .collect()
+}
+
+/// Removes the file at `path`, trying again every [`REMOVE_STEP`] until `deadline` while another process holds it
+/// open, `held` called before each wait; a file already gone counts as removed.
+fn removed(path: &Path, deadline: Instant, held: &mut impl FnMut()) -> io::Result<()> {
+    loop {
+        match std::fs::remove_file(path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) if error.raw_os_error() == Some(SHARING_VIOLATION) && Instant::now() < deadline => {
+                held();
+                thread::sleep(REMOVE_STEP);
+            }
+            done => return done,
+        }
+    }
+}
+
+/// The line said for a fetch stopped once its job wrote more than `cap` bytes, whose changes stay at `reference`.
+fn stopped_line(cap: u64, reference: &str) -> String {
+    format!(
+        "gate: remote sync-back stopped: the fetch wrote more than {}; the run's changes stay on the builder ({reference})",
+        watchdog::size(cap)
+    )
 }
 
 /// One git call of the sync-back that reaches the builder: its verb, and how it is watched. `ls-remote` gets the git
@@ -104,9 +221,22 @@ struct Network {
 /// lines kept out of the log, and killed as its watch says or at a line longer than the cap. A failure is the run's,
 /// or its interrupt when the console interrupt was raised during the call.
 fn to_the_builder(attempt: &mut Attempt<'_, '_>, git: &Git, remote: &Remote<'_>, network: &Network, args: &[String]) -> Result<Called, End> {
+    let called = reached(attempt, git, remote, network, args)?;
+    checked(attempt, network, args, called)
+}
+
+/// git with `args`, the call `network` that reaches the builder, made as [`to_the_builder`] makes it: the call that
+/// counts, however it ended.
+fn reached(attempt: &mut Attempt<'_, '_>, git: &Git, remote: &Remote<'_>, network: &Network, args: &[String]) -> Result<Called, End> {
     let (called, _) = attempt.with_retry(GIT_SSH_FAILED, |attempt| {
         attempt.git(git, args, remote.ssh, Echo::Unlogged, network.watch)
     })?;
+    Ok(called)
+}
+
+/// The call `network` with `args` that [`reached`] made, as [`to_the_builder`] ends it: a cut or a failure is the run's,
+/// or its interrupt when the console interrupt was raised during the call.
+fn checked(attempt: &mut Attempt<'_, '_>, network: &Network, args: &[String], called: Called) -> Result<Called, End> {
     if let Some(cut) = called.cut {
         attempt.noted(&called);
         return Err(End::Failed(escaped(&cut.reason(&format!("git {}", network.verb)))));
@@ -408,18 +538,23 @@ impl Remote<'_> {
 #[cfg(test)]
 #[expect(clippy::expect_used, reason = "a test whose interrupt, transport or git cannot be had must fail loudly")]
 mod tests {
-    use std::path::Path;
+    use std::fs::{File, OpenOptions};
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::path::{Path, PathBuf};
+    use std::time::Duration;
 
     use gate_state::StateRoot;
     use gate_win32::Interrupt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
 
     use super::{
-        FETCH_WORDS, Remote, advertised, after_keep, fetch, forbidden, from_snapshot, has_back, ignored_line, not_applied_line, see_diff,
-        synced_line, touched_line,
+        FETCH_WORDS, Remote, advertised, after_keep, fetch, forbidden, from_snapshot, has_back, ignored_line, not_applied_line, remove_new_tmp_packs,
+        see_diff, synced_line, tmp_packs, touched_line,
     };
+    use crate::boxside::payload::escaped;
     use crate::remote::RemoteCall;
     use crate::remote::client::{Attempt, End};
-    use crate::remote::git::Git;
+    use crate::remote::git::{self, Git};
     use crate::remote::transport::Local;
 
     const BACK: &str = "8e8777a0e71c530018dc15bdebd7288f4f432aa4";
@@ -479,12 +614,14 @@ mod tests {
     }
 
     /// git's call to the builder fails while the console interrupt is raised, as a Ctrl+C ends the git it reaches: the
-    /// run is an interrupt, not the client's failure.
+    /// run is an interrupt, not the client's failure. The worktree is a repository of the test's own, so the fetch finds
+    /// its pack folder and git's fetch itself runs.
     #[test]
     fn a_ctrl_c_during_a_sync_back_call_to_the_builder_is_an_interrupt() {
-        let folder = std::env::temp_dir();
-        let root = folder.to_string_lossy();
-        let log = folder.join(format!("gate-sync-back-interrupt-{}.log", std::process::id()));
+        let folder = std::env::temp_dir().join(format!("gate-sync-back-interrupt-{}", std::process::id()));
+        std::fs::create_dir_all(&folder).expect("the test's folder can be made");
+        let root = folder.to_string_lossy().into_owned();
+        let log = folder.join("out.log");
         let state = StateRoot::new(r"C:\gate-sync-back-tests", None);
         let interrupt = Interrupt::install().expect("the console handler is installed");
         interrupt.raise();
@@ -507,7 +644,9 @@ mod tests {
         };
         let transport = Local::new(r"local:C:\gate-sync-back-tests", None).expect("a local transport");
         let mut attempt = Attempt::for_tests(&call, &transport);
-        let git = Git::find(Path::new(&*root)).expect("git is found");
+        let git = Git::find(&folder).expect("git is found");
+        git.output(&git::Call::plain(&folder, &["init", "--quiet"], git::GIT_LIMIT))
+            .expect("the test's folder is made a repository");
         let remote = Remote {
             url: r"C:\gate-sync-back-tests\no-such.git",
             pack: None,
@@ -516,11 +655,101 @@ mod tests {
         };
 
         let listed = has_back(&mut attempt, &git, &remote);
-        let fetched = fetch(&mut attempt, &git, &remote);
+        std::fs::remove_file(&log).expect("the ls-remote's call opened the log");
+        let fetched = fetch(&mut attempt, &git, &remote, 0);
 
         assert!(matches!(listed, Err(End::Interrupted)), "the ls-remote: {listed:?}");
         assert!(matches!(fetched, Err(End::Interrupted)), "the fetch: {fetched:?}");
-        std::fs::remove_file(&log).expect("the log the calls opened can be removed");
+        assert!(log.exists(), "the fetch's own git call was started, which opens the log");
+        std::fs::remove_dir_all(&folder).expect("the test's folder can be removed");
+    }
+
+    /// A pack folder holding `tmp_pack_*` files from before a fetch, and after it new ones, one read-only as index-pack
+    /// makes them, a finished pack and a new `tmp_idx_*`: only the new `tmp_pack_*` files are removed.
+    #[test]
+    fn only_the_tmp_packs_new_since_the_listing_are_removed() {
+        let folder = std::env::temp_dir().join(format!("gate-sync-back-tmp-packs-{}", std::process::id()));
+        if folder.exists() {
+            std::fs::remove_dir_all(&folder).expect("an earlier run's folder is removed");
+        }
+        std::fs::create_dir_all(&folder).expect("the pack folder can be made");
+        let make = |name: &str| std::fs::write(folder.join(name), b"pack").expect("a file can be made");
+        make("tmp_pack_Earlr1");
+        make("tmp_pack_Earlr2");
+        let before = tmp_packs(&folder).expect("the folder can be listed");
+        for name in ["tmp_pack_Newnw1", "tmp_pack_Newnw2", "pack-0123.pack", "tmp_idx_Newnw1"] {
+            make(name);
+        }
+        let read_only = folder.join("tmp_pack_Newnw2");
+        let mut permissions = std::fs::metadata(&read_only).expect("the file is there").permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&read_only, permissions).expect("the file is made read-only");
+
+        let unremoved = remove_new_tmp_packs(&folder, &before, HANG_GUARD, || {});
+
+        assert_eq!(unremoved, Vec::<String>::new(), "every new tmp_pack_* was removed");
+        let mut left: Vec<String> = std::fs::read_dir(&folder)
+            .expect("the folder can be listed")
+            .map(|entry| entry.expect("an entry can be read").file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["pack-0123.pack", "tmp_idx_Newnw1", "tmp_pack_Earlr1", "tmp_pack_Earlr2"]);
+        std::fs::remove_dir_all(&folder).expect("the test's folder can be removed");
+    }
+
+    /// The longest a removal test lets a held file be waited for: a guard against a hang, never a timing bound.
+    const HANG_GUARD: Duration = Duration::from_secs(600);
+
+    /// An empty pack folder of the test `name`'s own, holding the new file `tmp_pack_Heldh1` opened without delete
+    /// sharing, as a live index-pack holds its pack: the folder, the file's path, and the handle.
+    fn held_tmp_pack(name: &str) -> (PathBuf, PathBuf, File) {
+        let folder = std::env::temp_dir().join(format!("gate-sync-back-{name}-{}", std::process::id()));
+        if folder.exists() {
+            std::fs::remove_dir_all(&folder).expect("an earlier run's folder is removed");
+        }
+        std::fs::create_dir_all(&folder).expect("the pack folder can be made");
+        let path = folder.join("tmp_pack_Heldh1");
+        std::fs::write(&path, b"pack").expect("the file can be made");
+        let handle = OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .open(&path)
+            .expect("the file can be held open");
+        (folder, path, handle)
+    }
+
+    /// A new `tmp_pack_*` held open when the removal first tries it is let go at its first wait: it is removed then.
+    #[test]
+    fn a_tmp_pack_let_go_while_the_removal_waits_is_removed() {
+        let (folder, path, handle) = held_tmp_pack("let-go");
+        let mut held = Some(handle);
+        let mut waits = 0;
+
+        let unremoved = remove_new_tmp_packs(&folder, &[], HANG_GUARD, || {
+            waits += 1;
+            held.take();
+        });
+
+        assert_eq!(unremoved, Vec::<String>::new(), "the file let go was removed");
+        assert!(!path.exists(), "the file is gone");
+        assert!(waits >= 1, "the removal waited for the held file");
+        std::fs::remove_dir_all(&folder).expect("the test's folder can be removed");
+    }
+
+    /// A new `tmp_pack_*` held open past the removal's wait stays, and the line saying so is given.
+    #[test]
+    fn a_tmp_pack_held_past_the_wait_stays_and_is_said() {
+        let (folder, path, handle) = held_tmp_pack("held");
+
+        let unremoved = remove_new_tmp_packs(&folder, &[], Duration::from_millis(50), || {});
+
+        assert!(path.exists(), "the held file stays");
+        let start = format!("gate: remote could not remove {}: ", escaped(&path.display().to_string()));
+        assert_eq!(unremoved.len(), 1, "{unremoved:?}");
+        assert!(unremoved[0].starts_with(&start), "{unremoved:?}");
+        assert!(unremoved[0].ends_with("(os error 32)"), "{unremoved:?}");
+        drop(handle);
+        std::fs::remove_dir_all(&folder).expect("the test's folder can be removed");
     }
 
     #[test]

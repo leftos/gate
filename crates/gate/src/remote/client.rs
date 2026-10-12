@@ -54,6 +54,9 @@ use crate::run::{CONTROL_C_EXIT, ERROR_FILE_NOT_FOUND, find_program};
 /// and a gate's usage error for a payload it does not read.
 const NOT_RECOGNIZED: i32 = 9009;
 const USAGE: i32 = 2;
+/// The most bytes a call's job may have written and still be made once more after a failure before the banner: ssh's
+/// own failure writes one line, and a second fetch from a builder would start a fresh count against its cap.
+const RETRY_WRITTEN: u64 = 1 << 20;
 /// How often the retry pause looks at the console interrupt.
 const PAUSE_STEP: Duration = Duration::from_millis(20);
 /// The box's heartbeat, `gate-remote-heartbeat: <digits>` on standard error: progress, kept out of the log.
@@ -94,6 +97,8 @@ pub(crate) struct RustClient {
     interrupt_at: Option<String>,
     /// `--test-local-sdks`: this PC's SDK list, read in place of `dotnet --list-sdks`.
     local_sdks: Option<String>,
+    /// The most bytes the job of the sync-back's fetch may write: `--test-remote-fetch-cap-bytes`, else 4 GiB.
+    fetch_cap: u64,
 }
 
 impl RustClient {
@@ -116,6 +121,7 @@ impl RustClient {
             watch_call: seams.remote_watch_call.clone(),
             interrupt_at: seams.remote_interrupt_at.clone(),
             local_sdks: seams.local_sdks.clone(),
+            fetch_cap: seams.remote_fetch_cap_bytes.unwrap_or(watchdog::FETCH_CAP),
         })
     }
 }
@@ -171,6 +177,7 @@ impl RemoteClient for RustClient {
             }),
             interrupt_at: self.interrupt_at.as_deref(),
             local_sdks: self.local_sdks.as_deref(),
+            fetch_cap: self.fetch_cap,
             lines: Vec::new(),
             problem: None,
         };
@@ -240,8 +247,9 @@ pub(super) enum Watch {
     /// By the run's watchdog under these limits: killed once it sent nothing for the stall window, or the run outlived
     /// its ceiling.
     Run(Limits),
-    /// Killed once it sent nothing for the stall window of these limits, or at the run's ceiling: the sync-back's fetch.
-    Fetch(Limits),
+    /// Killed once it sent nothing for the stall window of these limits, or at the run's ceiling, or once its job wrote
+    /// more bytes than the cap when it has one: the sync-back's fetch, and the outputs call.
+    Fetch(Limits, Option<u64>),
     /// Killed once it ran for this long.
     Deadline(Duration),
     /// As [`Watch::Deadline`], but a Ctrl+C does not end it: the bounded calls, the `stop`, made after one, and the
@@ -250,27 +258,48 @@ pub(super) enum Watch {
 }
 
 impl Watch {
-    /// Why a call watched so, started at `begun`, is killed at `now`, nothing having come from it for `idle`, and
-    /// whether a capped call sent a line `too_long`; `None` while it may run on.
-    fn cut(self, now: Instant, begun: Instant, idle: Duration, too_long: bool) -> Option<Cut> {
+    /// Why a call watched so, started at `begun`, is killed at `now`, nothing having come from it for `idle`, whether
+    /// a capped call sent a line `too_long`, and the bytes its job has `written`, `None` when they were not read;
+    /// `None` while it may run on. A line too long comes first, then a fetch's bytes past its cap, then its clocks.
+    fn cut(self, now: Instant, begun: Instant, idle: Duration, too_long: bool, written: Option<u64>) -> Option<Cut> {
         if too_long {
             return Some(Cut::TooLong);
+        }
+        if let Some(cut) = self.over(written) {
+            return Some(cut);
         }
         match self {
             Watch::Run(limits) => {
                 let elapsed = now.saturating_duration_since(limits.started);
                 watchdog::kill(idle, elapsed, limits.stall, limits.ceiling).map(Cut::Watchdog)
             }
-            Watch::Fetch(limits) if idle >= limits.stall => Some(Cut::Silent(limits.stall)),
-            Watch::Fetch(limits) => (now.saturating_duration_since(limits.started) >= limits.ceiling).then_some(Cut::Ceiling),
+            Watch::Fetch(limits, _) if idle >= limits.stall => Some(Cut::Silent(limits.stall)),
+            Watch::Fetch(limits, _) => (now.saturating_duration_since(limits.started) >= limits.ceiling).then_some(Cut::Ceiling),
             Watch::Deadline(limit) | Watch::Bounded(limit) => (now.saturating_duration_since(begun) >= limit).then_some(Cut::Late(limit)),
+        }
+    }
+
+    /// The cut of a call watched so whose job has `written` bytes: [`Cut::TooBig`] once a fetch with a cap wrote more
+    /// than it; `None` for any other call, and when the bytes were not read.
+    fn over(self, written: Option<u64>) -> Option<Cut> {
+        match (self, written) {
+            (Watch::Fetch(_, Some(cap)), Some(bytes)) if bytes > cap => Some(Cut::TooBig(cap)),
+            _ => None,
+        }
+    }
+
+    /// The most bytes the job of a call watched so may write: a fetch's cap; `None` for any other call.
+    fn byte_cap(self) -> Option<u64> {
+        match self {
+            Watch::Fetch(_, cap) => cap,
+            Watch::Run(_) | Watch::Deadline(_) | Watch::Bounded(_) => None,
         }
     }
 
     /// How long the client waits between two looks at a call watched so.
     fn tick(self) -> Duration {
         match self {
-            Watch::Run(limits) | Watch::Fetch(limits) => watchdog::tick(limits.stall),
+            Watch::Run(limits) | Watch::Fetch(limits, _) => watchdog::tick(limits.stall),
             Watch::Deadline(limit) | Watch::Bounded(limit) => watchdog::tick(limit),
         }
     }
@@ -314,9 +343,18 @@ pub(super) struct Called {
     started: bool,
     /// The reason the box's refusal tag for the run named on standard error, the first when it said more than one.
     refused: Option<FallbackReason>,
+    /// The bytes its job had written at the last look, for a call whose watch caps them; `None` for any other call, or
+    /// when no look succeeded.
+    written: Option<u64>,
 }
 
 impl Called {
+    /// Whether the call's job wrote more than [`RETRY_WRITTEN`]: more than a failure before the banner writes, so a call
+    /// that reached a builder, which is not made again.
+    fn wrote_much(&self) -> bool {
+        self.written.is_some_and(|bytes| bytes > RETRY_WRITTEN)
+    }
+
     /// Whether the call failed before the banner, for a program that exits `fail_status` when ssh failed.
     fn before_the_banner(&self, fail_status: i32) -> bool {
         retry::before_the_banner(&Ended {
@@ -351,6 +389,8 @@ pub(super) struct Attempt<'c, 'a> {
     interrupt_at: Option<&'c str>,
     /// `--test-local-sdks`: this PC's SDK list, read in place of `dotnet --list-sdks`.
     local_sdks: Option<&'c str>,
+    /// The most bytes the job of the sync-back's fetch may write.
+    pub(super) fetch_cap: u64,
     lines: Vec<String>,
     problem: Option<String>,
 }
@@ -673,12 +713,13 @@ impl Attempt<'_, '_> {
         }
     }
 
-    /// Makes a call with `make` and, when it failed before the banner, says so, pauses and makes it once more; a Ctrl+C
+    /// Makes a call with `make` and, when it failed before the banner and its job did not write more than 1 MiB, says
+    /// so, pauses and makes it once more; a Ctrl+C
     /// before the retry or during its pause ends the attempt instead. The call that counts, its lines not yet kept, and
     /// whether the retry failed before the banner too.
     pub(super) fn with_retry(&mut self, fail_status: i32, mut make: impl FnMut(&mut Self) -> Result<Called, End>) -> Result<(Called, bool), End> {
         let mut first = make(self)?;
-        if !first.before_the_banner(fail_status) {
+        if !first.before_the_banner(fail_status) || first.wrote_much() {
             return Ok((first, false));
         }
         self.lines.append(&mut first.lines);
@@ -840,7 +881,7 @@ impl Attempt<'_, '_> {
                 sink: Some(archive.create().map_err(End::Failed)?),
                 ..CallOnly::default()
             };
-            attempt.ssh(&line, Echo::LogOnly, Watch::Fetch(limits), raise, only)
+            attempt.ssh(&line, Echo::LogOnly, Watch::Fetch(limits, None), raise, only)
         })?;
         self.lines.append(&mut called.lines);
         Ok(called)
@@ -913,10 +954,19 @@ impl Attempt<'_, '_> {
             shown: &shown,
         };
         let raise = self.call.interrupt.filter(|_| starts.raise);
-        let ended = watched.watch(watch, self.call.interrupt, raise)?;
+        let Watching { ended, looks } = watched.watch(watch, self.call.interrupt, raise)?;
+        if let Some(line) = &looks.unread {
+            self.logged(line);
+        }
+        if watch.byte_cap().is_some() && !matches!(ended, CallEnd::Exited(0)) {
+            self.emptied(&job, &shown);
+        }
         let heard = std::mem::take(&mut *held(&shared.heard));
         match called_of(ended, shared.progress.too_long(), heard) {
-            Ok(called) => Ok(called),
+            Ok(called) => Ok(Called {
+                written: looks.written,
+                ..called
+            }),
             Err(Unfinished::Failed(why)) => Err(End::Failed(why)),
             Err(Unfinished::Interrupted(note)) => {
                 // The interrupt stays the run's end, whose caller stops a command the call may have started.
@@ -934,6 +984,38 @@ impl Attempt<'_, '_> {
             self.problem.get_or_insert(why);
         }
         self.lines.push(line);
+    }
+
+    /// Ends every process of `job`, the job of the capped call `shown` that did not exit cleanly, and waits at most
+    /// [`KILL_WAIT`] for them to be gone, so the files they hold open are let go before the sync-back removes what they
+    /// left: a process that outlived the call's own exit is ended at once rather than waited for. Logs why it could
+    /// not end them, or stopped waiting before they were gone.
+    fn emptied(&mut self, job: &Job, shown: &str) {
+        if let Err(error) = job.terminate(KILLED.cast_unsigned()) {
+            self.logged(&format!("gate: cannot end {shown}: {error}"));
+        }
+        let deadline = Instant::now() + KILL_WAIT;
+        loop {
+            match job.accounting() {
+                Ok(held) if held.active_processes == 0 => return,
+                Ok(_) if Instant::now() >= deadline => {
+                    self.logged(&format!("gate: the processes of {shown} did not end within {} s", KILL_WAIT.as_secs()));
+                    return;
+                }
+                Ok(_) => thread::sleep(PAUSE_STEP),
+                Err(error) => {
+                    self.logged(&format!("gate: cannot read the processes of {shown}: {error}"));
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Appends the gate's own `line` to the log alone; the first failure to is kept.
+    fn logged(&mut self, line: &str) {
+        if let Err(why) = super::say(self.call.log, &[line], io::sink()) {
+            self.problem.get_or_insert(why);
+        }
     }
 
     /// The outcome of an attempt that ended at `end`; a line that could not be written fails the run.
@@ -978,6 +1060,7 @@ impl<'c, 'a> Attempt<'c, 'a> {
             one_call: None,
             interrupt_at: None,
             local_sdks: None,
+            fetch_cap: watchdog::FETCH_CAP,
             lines: Vec::new(),
             problem: None,
         }
@@ -997,11 +1080,12 @@ impl Limits {
     }
 }
 
-/// How a watched call ended: it exited with its status; the client cut it; or a Ctrl+C ended it. With what went wrong
-/// ending it.
+/// How a watched call ended: it exited with its status; it exited, but the look after its exit found it past a cap; the
+/// client cut it; or a Ctrl+C ended it. With what went wrong ending it.
 #[derive(Debug)]
 enum CallEnd {
     Exited(i32),
+    ExitedOver(Cut),
     Cut(Cut, Option<String>),
     Interrupted(Option<String>),
 }
@@ -1020,8 +1104,10 @@ fn called_of(ended: CallEnd, too_long: bool, mut heard: Heard) -> Result<Called,
     let (status, cut, ending) = match ended {
         CallEnd::Interrupted(ending) => return Err(Unfinished::Interrupted(joined(heard.problem.take(), ending))),
         CallEnd::Cut(cut, ending) => (KILLED, Some(cut), ending),
-        // A line past the cap cuts the call even when it ended before the watch saw the line.
-        CallEnd::Exited(_) if too_long => (KILLED, Some(Cut::TooLong), None),
+        // A line past the cap cuts the call even when it ended before the watch saw the line, and comes before bytes
+        // past a cap that the look after the exit found.
+        CallEnd::Exited(_) | CallEnd::ExitedOver(_) if too_long => (KILLED, Some(Cut::TooLong), None),
+        CallEnd::ExitedOver(cut) => (KILLED, Some(cut), None),
         CallEnd::Exited(status) => (status, None, None),
     };
     let problem = joined(heard.problem.take(), ending);
@@ -1039,6 +1125,7 @@ fn called_of(ended: CallEnd, too_long: bool, mut heard: Heard) -> Result<Called,
         outputs_line: heard.outputs_line,
         started: heard.started,
         refused: heard.refused,
+        written: None,
     })
 }
 
@@ -1048,6 +1135,20 @@ fn joined(read: Option<String>, ending: Option<String>) -> Option<String> {
         (Some(read), Some(ending)) => Some(format!("{read}; {ending}")),
         (read, ending) => read.or(ending),
     }
+}
+
+/// What watching a call came to: how it ended, and what the looks at the bytes its job wrote found.
+struct Watching {
+    ended: CallEnd,
+    looks: Looks,
+}
+
+/// What the looks at the bytes a capped call's job wrote found: the count at the last look that succeeded, and the
+/// line saying the first look that failed.
+#[derive(Default)]
+struct Looks {
+    written: Option<u64>,
+    unread: Option<String>,
 }
 
 /// A started call the client watches: its process and job, when its streams last sent a byte, the channel each of its
@@ -1061,18 +1162,23 @@ struct Watched<'w> {
 }
 
 impl Watched<'_> {
-    /// Watches the call as `watch` says until both its readers ended and it exited: how it ended; the attempt's
-    /// interrupt when the console `interrupt` ended it. `raise`, when given, is raised once the call sent its first
-    /// byte, as a Ctrl+C would be.
-    fn watch(self, watch: Watch, interrupt: Option<Interrupt>, mut raise: Option<Interrupt>) -> Result<CallEnd, End> {
+    /// Watches the call as `watch` says until both its readers ended and it exited: how it ended, and the line saying
+    /// the first look at the bytes its job wrote that failed, which cuts nothing; the attempt's interrupt when the
+    /// console `interrupt` ended it. A fetch with a cap has those bytes looked at on each tick and once more after its
+    /// exit, so a fetch that ends between two ticks is found past its cap too. `raise`, when given, is raised once the
+    /// call sent its first byte, as a Ctrl+C would be.
+    fn watch(self, watch: Watch, interrupt: Option<Interrupt>, mut raise: Option<Interrupt>) -> Result<Watching, End> {
         let begun = Instant::now();
         let tick = watch.tick();
         let mut open = 2;
+        let mut looks = Looks::default();
         loop {
             if open == 0
                 && let Some(code) = self.running.wait(Duration::ZERO).map_err(|error| cannot_wait(self.shown, &error))?
             {
-                return Ok(CallEnd::Exited(code.cast_signed()));
+                let over = watch.over(self.written(watch, &mut looks));
+                let ended = over.map_or(CallEnd::Exited(code.cast_signed()), CallEnd::ExitedOver);
+                return Ok(Watching { ended, looks });
             }
             if self.progress.heard_any()
                 && let Some(interrupt) = raise.take()
@@ -1080,12 +1186,33 @@ impl Watched<'_> {
                 interrupt.raise();
             }
             if watch.interruptible() && interrupt.is_some_and(Interrupt::is_raised) {
-                return Ok(CallEnd::Interrupted(self.end(open)));
+                let ended = CallEnd::Interrupted(self.end(open));
+                return Ok(Watching { ended, looks });
             }
-            if let Some(cut) = watch.cut(Instant::now(), begun, self.progress.idle(), self.progress.too_long()) {
-                return Ok(CallEnd::Cut(cut, self.end(open)));
+            let written = self.written(watch, &mut looks);
+            if let Some(cut) = watch.cut(Instant::now(), begun, self.progress.idle(), self.progress.too_long(), written) {
+                let ended = CallEnd::Cut(cut, self.end(open));
+                return Ok(Watching { ended, looks });
             }
             open -= self.readers_ended(open, tick);
+        }
+    }
+
+    /// The bytes the call's job has written, looked at only when `watch` caps them, and kept in `looks`; `None` when
+    /// it does not, or when the look failed, whose first failure's line `looks` keeps.
+    fn written(&self, watch: Watch, looks: &mut Looks) -> Option<u64> {
+        watch.byte_cap()?;
+        match self.job.written_bytes() {
+            Ok(bytes) => {
+                looks.written = Some(bytes);
+                Some(bytes)
+            }
+            Err(error) => {
+                looks
+                    .unread
+                    .get_or_insert_with(|| format!("gate: cannot read the bytes {} wrote: {error}", self.shown));
+                None
+            }
         }
     }
 
@@ -1718,7 +1845,7 @@ pub(super) fn watchdog_line(cut: Cut, limits: Limits) -> Option<String> {
     let kill = match cut {
         Cut::Silent(_) => Kill::Stalled,
         Cut::Ceiling => Kill::TimedOut,
-        Cut::Watchdog(_) | Cut::Late(_) | Cut::TooLong => return None,
+        Cut::Watchdog(_) | Cut::Late(_) | Cut::TooLong | Cut::TooBig(_) => return None,
     };
     Some(watchdog::kill_line(kill, limits.stall, limits.ceiling))
 }
@@ -1823,7 +1950,7 @@ mod tests {
     use crate::remote::payload::Location;
     use crate::remote::snapshot::Snapshot;
     use crate::remote::transport::Local;
-    use crate::remote::watchdog::Kill;
+    use crate::remote::watchdog::{self, Kill};
     use crate::remote::{Refusal, RemoteCall, busy_line, refused_line, started_line};
     use crate::run::CONTROL_C_EXIT;
 
@@ -1870,6 +1997,7 @@ mod tests {
             one_call: None,
             interrupt_at: None,
             local_sdks: None,
+            fetch_cap: watchdog::FETCH_CAP,
             lines: Vec::new(),
             problem: None,
         }
@@ -1899,6 +2027,7 @@ mod tests {
             outputs_line: None,
             started: false,
             refused: None,
+            written: None,
         }
     }
 
@@ -2201,29 +2330,91 @@ mod tests {
             bound: 30 * second,
         };
         let begun = started + 40 * second;
-        let fetch = Watch::Fetch(limits);
-        assert_eq!(fetch.cut(started + 59 * second, begun, 9 * second, false), None, "neither yet");
+        let fetch = Watch::Fetch(limits, None);
+        assert_eq!(fetch.cut(started + 59 * second, begun, 9 * second, false, None), None, "neither yet");
         assert_eq!(
-            fetch.cut(started + 50 * second, begun, 10 * second, false),
+            fetch.cut(started + 50 * second, begun, 10 * second, false, None),
             Some(Cut::Silent(10 * second)),
             "silent for the stall window"
         );
         assert_eq!(
-            fetch.cut(started + 60 * second, begun, second, false),
+            fetch.cut(started + 60 * second, begun, second, false, None),
             Some(Cut::Ceiling),
             "a live fetch at the run's ceiling"
         );
-        assert_eq!(fetch.cut(started + 41 * second, begun, Duration::ZERO, true), Some(Cut::TooLong));
+        assert_eq!(fetch.cut(started + 41 * second, begun, Duration::ZERO, true, None), Some(Cut::TooLong));
         assert_eq!(
-            Watch::Run(limits).cut(started + 60 * second, begun, second, false),
+            Watch::Run(limits).cut(started + 60 * second, begun, second, false, None),
             Some(Cut::Watchdog(Kill::TimedOut))
         );
         assert_eq!(
-            Watch::Deadline(5 * second).cut(begun + 5 * second, begun, Duration::ZERO, false),
+            Watch::Deadline(5 * second).cut(begun + 5 * second, begun, Duration::ZERO, false, None),
             Some(Cut::Late(5 * second)),
             "a deadline counts from the call's own start"
         );
-        assert_eq!(Watch::Deadline(5 * second).cut(begun + 4 * second, begun, Duration::ZERO, false), None);
+        assert_eq!(
+            Watch::Deadline(5 * second).cut(begun + 4 * second, begun, Duration::ZERO, false, None),
+            None
+        );
+    }
+
+    #[test]
+    fn a_capped_fetch_is_cut_once_it_wrote_more_than_its_cap_and_an_uncapped_one_never_for_its_bytes() {
+        let second = Duration::from_secs(1);
+        let started = Instant::now();
+        let limits = Limits {
+            started,
+            stall: 10 * second,
+            ceiling: 60 * second,
+            bound: 30 * second,
+        };
+        let (now, cap) = (started + second, 262_144);
+        let capped = Watch::Fetch(limits, Some(cap));
+        assert_eq!(capped.cut(now, started, Duration::ZERO, false, Some(cap - 1)), None, "under the cap");
+        assert_eq!(
+            capped.cut(now, started, Duration::ZERO, false, Some(cap)),
+            None,
+            "at the cap is not over it"
+        );
+        assert_eq!(
+            capped.cut(now, started, Duration::ZERO, false, Some(cap + 1)),
+            Some(Cut::TooBig(cap)),
+            "over the cap"
+        );
+        assert_eq!(
+            capped.cut(now, started, Duration::ZERO, false, None),
+            None,
+            "a count that could not be read cuts nothing"
+        );
+        assert_eq!(
+            capped.cut(now, started, 10 * second, false, Some(cap + 1)),
+            Some(Cut::TooBig(cap)),
+            "its size before its silence"
+        );
+        assert_eq!(
+            capped.cut(now, started, Duration::ZERO, true, Some(cap + 1)),
+            Some(Cut::TooLong),
+            "a line past the cap first"
+        );
+        assert_eq!(
+            Watch::Fetch(limits, None).cut(now, started, Duration::ZERO, false, Some(u64::MAX)),
+            None,
+            "a fetch with no cap"
+        );
+        assert_eq!(
+            Watch::Run(limits).cut(now, started, Duration::ZERO, false, Some(u64::MAX)),
+            None,
+            "a call that is no fetch"
+        );
+    }
+
+    #[test]
+    fn a_fetch_found_over_its_cap_after_its_exit_is_cut_for_it_unless_a_line_was_too_long() {
+        let cap = 262_144;
+        let over = called_of(CallEnd::ExitedOver(Cut::TooBig(cap)), false, Heard::default()).expect("a cut call");
+        assert_eq!((over.status, over.cut), (124, Some(Cut::TooBig(cap))), "the look after the exit");
+        let both = called_of(CallEnd::ExitedOver(Cut::TooBig(cap)), true, Heard::default()).expect("a cut call");
+        assert_eq!((both.status, both.cut), (124, Some(Cut::TooLong)), "a line past the cap wins");
     }
 
     /// What a stream of `input` gives a reader of standard error that keeps the lines and caps them when `capped`, its
@@ -2450,6 +2641,33 @@ mod tests {
         let said = std::fs::read_to_string(&log).expect("the retry line was written");
         let retry_line = "gate: builder did not answer the ssh banner; trying once more";
         assert_eq!(said.lines().filter(|line| *line == retry_line).count(), 1, "{said}");
+        std::fs::remove_file(&log).expect("the log can be removed");
+    }
+
+    /// A fetch that failed as if before the banner but whose job wrote more than 1 MiB is not made again, so a builder
+    /// cannot buy a second fetch of a fresh count: ssh's own failure writes one line.
+    #[test]
+    fn a_call_whose_job_wrote_more_than_1_mib_is_not_made_again_after_a_failure_before_the_banner() {
+        const MIB: u64 = 1 << 20;
+        let log = std::env::temp_dir().join(format!("gate-client-retry-written-{}.log", std::process::id()));
+        let mut given = call(&log);
+        given.interrupt = None;
+        let transport = Local::new(r"local:C:\builder", None).expect("a local transport");
+        let mut attempt = attempt(&given, &transport);
+        attempt.pause = Duration::ZERO;
+        for (written, times) in [(Some(MIB + 1), 1), (Some(MIB), 2), (None, 2)] {
+            let mut made = 0;
+            let retried = attempt.with_retry(GIT_SSH_FAILED, |_| {
+                made += 1;
+                Ok(Called {
+                    written,
+                    ..ended_with(GIT_SSH_FAILED, "kex_exchange_identification: Connection closed by remote host")
+                })
+            });
+            let (called, _) = retried.expect("a call that ends without an interrupt");
+            assert_eq!(made, times, "{written:?}");
+            assert_eq!(called.status, GIT_SSH_FAILED);
+        }
         std::fs::remove_file(&log).expect("the log can be removed");
     }
 
@@ -2761,7 +2979,7 @@ mod tests {
         assert_eq!(console_of(Watch::Bounded(second)), PipedConsole::Hidden, "the stop");
         for watch in [
             Watch::Run(Limits::for_tests()),
-            Watch::Fetch(Limits::for_tests()),
+            Watch::Fetch(Limits::for_tests(), None),
             Watch::Deadline(second),
         ] {
             assert_eq!(console_of(watch), PipedConsole::Attached, "{watch:?}");

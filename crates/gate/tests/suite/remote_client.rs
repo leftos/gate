@@ -1083,6 +1083,84 @@ fn a_file_the_command_changes_on_the_box_is_synced_back() {
     assert_eq!(calls(&steps), ["preflight", "run"]);
 }
 
+/// The bytes of the file a fetch-cap case's command writes on the box, which no compression shrinks: 1 MiB.
+const NOISE_BYTES: &str = "1048576";
+
+/// The `tmp_pack_*` files a fetch left in the case's own `objects/pack` folder.
+fn tmp_packs(case: &Case) -> Vec<String> {
+    fs::read_dir(case.folder().join(".git").join("objects").join("pack"))
+        .expect("the pack folder can be listed")
+        .map(|entry| entry.expect("an entry can be read").file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("tmp_pack_"))
+        .collect()
+}
+
+/// The box's command writes 1 MiB that no compression shrinks, and the fetch's job may write 256 KiB: the fetch is
+/// stopped, nothing is fetched into the worktree's refs or applied, and the passing run fails with the line saying the
+/// changes stay on the builder.
+#[test]
+fn a_back_commit_over_the_fetch_cap_is_not_applied_and_fails_a_passing_run() {
+    let case = client_case("client-fetch-over-cap");
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+    let before = porcelain(&case);
+    let tuned = Tuned {
+        extra: &["--test-remote-fetch-cap-bytes", "262144"],
+        ..Tuned::default()
+    };
+
+    let outcome = finish(client_gate_tuned(
+        &case,
+        "out.log",
+        &steps,
+        &tuned,
+        &[r".\tool.exe", "noise", "noise.bin", NOISE_BYTES],
+    ));
+
+    assert_eq!(outcome.code, Some(1), "a passing run becomes 1: {outcome:?}");
+    let key = key_of(&events(&case));
+    let line =
+        format!("gate: remote sync-back stopped: the fetch wrote more than 256.0 KiB; the run's changes stay on the builder (refs/gate-back/{key})");
+    assert!(outcome.stderr.lines().any(|said| said == line), "{outcome:?}");
+    assert!(!case.folder().join("noise.bin").exists(), "the box's file is not here: {outcome:?}");
+    assert_eq!(porcelain(&case), before, "the worktree has no new file: {outcome:?}");
+    let kept = git_out(&case, &[], &["for-each-ref", "--format=%(refname)", "refs/gate-remote/"]);
+    assert!(
+        !kept.lines().any(|name| name.ends_with("-back")),
+        "nothing was kept in the worktree: {kept}"
+    );
+    assert_eq!(tmp_packs(&case), Vec::<String>::new(), "no part of the pack is left");
+    assert!(
+        is_sha(&builder_ref(&case, &format!("refs/gate-back/{key}"))),
+        "the changes stay on the builder"
+    );
+    assert_eq!(calls(&steps), ["preflight", "run"]);
+}
+
+/// The same 1 MiB under a 16 MiB cap syncs back: what a fetch writes besides the pack does not trip the cap.
+#[test]
+fn a_back_commit_under_the_fetch_cap_syncs_back() {
+    let case = client_case("client-fetch-under-cap");
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+    let tuned = Tuned {
+        extra: &["--test-remote-fetch-cap-bytes", "16777216"],
+        ..Tuned::default()
+    };
+
+    let outcome = finish(client_gate_tuned(
+        &case,
+        "out.log",
+        &steps,
+        &tuned,
+        &[r".\tool.exe", "noise", "noise.bin", NOISE_BYTES],
+    ));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(outcome.stderr.contains("gate: synced back 1 file(s): noise.bin"), "{outcome:?}");
+    let synced = fs::metadata(case.folder().join("noise.bin")).expect("the box's file is here").len();
+    assert_eq!(synced.to_string(), NOISE_BYTES, "the whole file came back");
+    assert_eq!(calls(&steps), ["preflight", "run"]);
+}
+
 #[test]
 fn a_command_that_changes_nothing_syncs_nothing_back() {
     let case = client_case("client-nothing-back");
