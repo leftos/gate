@@ -118,13 +118,12 @@ pub struct HistoryRun {
     /// How long the gate waited for its slot, from its take or its abandon.
     pub waited_seconds: Option<f64>,
     /// How long the gate held its slot, from its release; for a [`RunState::Parent`] or [`RunState::Covered`] run, how
-    /// long its parent's run held its slot, `None` until the journal holds that run's release, and only while the journal
-    /// read still holds the parent's run (the 7-day prune can drop it once it is not among the runs the history lists).
-    /// The status, verdict, wall and adjusted seconds below follow the same rule.
+    /// long its parent's run held its slot, `None` until the journal holds that run's release. The status, verdict, wall
+    /// and adjusted seconds below follow the same rule.
     pub held_seconds: Option<f64>,
     /// The gate's exit status, from its release; `None` without a release or when the gate failed before its command
-    /// ran. For a [`RunState::Parent`] or [`RunState::Covered`] run, its parent's run's status, `None` until the journal holds that run's release,
-    /// and only while the journal read still holds the parent's run.
+    /// ran. For a [`RunState::Parent`] or [`RunState::Covered`] run, its parent's run's status, `None` until the journal
+    /// holds that run's release.
     pub status: Option<i64>,
     /// How the command ended, from its release's `verdict`, which both gates write; `None` without a release or when the
     /// release line lacks the field, or holds null. For a [`RunState::Parent`] or [`RunState::Covered`] run, its parent's run's, as for `status`.
@@ -475,21 +474,28 @@ impl JournalCache {
 
     /// The run a gate that said `parent` at `at` ran under, once that run has released its slot: of the runs of gate
     /// `pid` that took their slot at or before `at`, the latest.
-    fn released_parent(&self, (pid, at): (u32, Timestamp)) -> Option<&Run> {
+    fn released_parent(&self, (pid, at): (u32, Timestamp)) -> Option<(&RunKey, &Run)> {
         self.runs
             .iter()
             .filter(|((run_pid, _), run)| *run_pid == pid && run.started.as_ref().is_some_and(|started| started.at <= at))
             .max_by_key(|(_, run)| run.started.as_ref().map(|started| started.at))
-            .map(|(_, run)| run)
-            .filter(|run| run.end == Some(End::Released))
+            .filter(|(_, run)| run.end == Some(End::Released))
     }
 
     /// Drops the runs that started more than 7 days before `now`, unless `listed`, the keys [`listed`] gives of the runs
-    /// the history lists, names them.
+    /// the history lists, names them, or it is the run [`Self::released_parent`] picks for a listed covered or fallen-back
+    /// run, whose row fills its status and held time from it.
     fn prune(&mut self, now: Timestamp, listed: &[RunKey]) {
         let cutoff = now - SUMMARY_WINDOW;
-        self.runs
-            .retain(|key, run| run.started.as_ref().map_or(run.first, |started| started.at) >= cutoff || listed.contains(key));
+        let parents: Vec<RunKey> = listed
+            .iter()
+            .filter_map(|key| self.runs.get(key))
+            .filter_map(|run| run.parent)
+            .filter_map(|parent| self.released_parent(parent).map(|(key, _)| key.clone()))
+            .collect();
+        self.runs.retain(|key, run| {
+            run.started.as_ref().map_or(run.first, |started| started.at) >= cutoff || listed.contains(key) || parents.contains(key)
+        });
     }
 
     /// The history of the `listed` runs, in their order, and the summary of every run; `listed` runs [`Self::prune`]
@@ -499,7 +505,7 @@ impl JournalCache {
             .iter()
             .filter_map(|key| self.runs.get(key).map(|run| (key, run)))
             .map(|(key, run)| {
-                let parent = run.parent.and_then(|parent| self.released_parent(parent));
+                let parent = run.parent.and_then(|parent| self.released_parent(parent)).map(|(_, run)| run);
                 run.row(key, is_live, run.repo(repo_of), parent)
             })
             .collect();

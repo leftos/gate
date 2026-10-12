@@ -946,6 +946,38 @@ fn prune_keeps_the_runs_a_covered_flood_would_push_out() {
 }
 
 #[test]
+fn prune_keeps_a_listed_covered_runs_parent() {
+    let week = 7 * 24 * 60;
+    let mut lines = Vec::new();
+    let parent = Gate::new(100, START, "git commit -F .tmp/msg.txt");
+    lines.extend([parent.queue(&ago(week + 300)), parent.take(&ago(week + 299), 0.5)]);
+    for pid in 1..=50_u32 {
+        lines.extend(Gate::new(pid, START, COMMAND).run(week + 200 - 3 * i64::from(pid), 1.0, json!(0)));
+    }
+    lines.extend(covered_flood(200, 1, 100, 40));
+    lines.push(parent.release(&ago(30), 99.0, json!(0)));
+
+    let history = history_of("prune_keeps_a_listed_covered_runs_parent", &lines);
+
+    assert!(
+        !history.runs.iter().any(|run| run.pid == 100),
+        "the parent queued behind the 50 newest counted runs, so it is not listed"
+    );
+    let covered = history.runs.iter().find(|run| run.pid == 200).expect("the covered run is listed");
+    assert_eq!(covered.state, RunState::Covered);
+    assert_eq!(
+        covered.status,
+        Some(0),
+        "the covered row's status comes from its parent's run, kept past the 7-day prune"
+    );
+    assert_eq!(
+        covered.held_seconds,
+        Some(99.0),
+        "the covered row's held time comes from its parent's run, kept past the 7-day prune"
+    );
+}
+
+#[test]
 fn cache_parses_only_appended_lines() {
     let dir = journal_dir("cache_parses_only_appended_lines");
     let journal = dir.join("events.jsonl");
