@@ -2,20 +2,10 @@
 
 use std::fs;
 
-use gate_state::{RemotePool, SlotKind, SlotRow, SlotState};
+use gate_state::{RemotePool, SlotKind, SlotState};
 use serde_json::{Value, json};
 
-use crate::support::{Machine, START, START_CLOSE, START_FAR, claim, pool, remote_claim};
-
-fn heavy_slot(machine: &Machine, index: u32) -> SlotRow {
-    let state = machine.state();
-    pool(&state, SlotKind::Heavy)
-        .slots
-        .iter()
-        .find(|slot| slot.index == index)
-        .expect("the heavy pool has the slot")
-        .clone()
-}
+use crate::support::{Machine, START, START_CLOSE, START_FAR, claim, heavy_slot, pool, remote_claim};
 
 #[test]
 fn live_claim_is_busy_with_descendants_and_last_line() {
@@ -310,4 +300,149 @@ fn claim_exactly_two_seconds_off_is_not_live() {
 
     assert_eq!(row.state, SlotState::Free);
     assert_eq!((row.claim, row.stale), (None, Some(stale)));
+}
+
+/// A claim of a gate whose process started at `process_start`, which the snapshot may not hold.
+fn claim_started_at(pid: u32, process_start: &str) -> Value {
+    let mut claim = claim(pid, None, "C:\\work");
+    claim["processStart"] = json!(process_start);
+    claim
+}
+
+#[test]
+fn a_claim_whose_gate_started_after_the_process_snapshot_is_busy() {
+    let mut machine = Machine::new("a_claim_whose_gate_started_after_the_process_snapshot_is_busy");
+    let claim = claim_started_at(100, "2026-10-01T11:00:01.5Z");
+    machine.write_claim("gate-slot-1.json", &claim.to_string());
+    machine.add_process(5, 1, "pwsh.exe", None, Some("2026-10-01T11:00:01Z"));
+    machine.open.insert("gate-slot-1".to_owned());
+
+    let row = heavy_slot(&machine, 1);
+
+    assert_eq!(
+        (row.state, row.claim.as_ref(), row.stale.as_ref()),
+        (SlotState::Busy, Some(&claim), None),
+        "the snapshot was taken before the gate started, so its claim is newer than the table"
+    );
+    assert_eq!(row.processes, 0, "the snapshot holds no descendants of a gate it does not hold");
+}
+
+#[test]
+fn a_claim_younger_than_the_snapshot_on_a_closed_mutex_is_not_busy() {
+    let mut machine = Machine::new("a_claim_younger_than_the_snapshot_on_a_closed_mutex_is_not_busy");
+    let claim = claim_started_at(100, "2026-10-01T11:00:01.5Z");
+    machine.write_claim("gate-slot-1.json", &claim.to_string());
+    machine.add_process(5, 1, "pwsh.exe", None, Some("2026-10-01T11:00:01Z"));
+
+    let row = heavy_slot(&machine, 1);
+
+    assert_eq!(
+        (row.state, row.claim.as_ref(), row.stale.as_ref()),
+        (SlotState::Free, None, Some(&claim)),
+        "a released mutex means the gate is gone, however new its claim is"
+    );
+}
+
+#[test]
+fn a_claim_older_than_the_snapshot_on_an_open_mutex_is_held_and_stale() {
+    let mut machine = Machine::new("a_claim_older_than_the_snapshot_on_an_open_mutex_is_held_and_stale");
+    let claim = claim(100, None, "C:\\work");
+    machine.write_claim("gate-slot-1.json", &claim.to_string());
+    machine.add_process(5, 1, "pwsh.exe", None, Some("2026-10-01T11:00:02Z"));
+    machine.open.insert("gate-slot-1".to_owned());
+
+    let row = heavy_slot(&machine, 1);
+
+    assert_eq!(
+        (row.state, row.claim.as_ref(), row.stale.as_ref()),
+        (SlotState::Held, None, Some(&claim)),
+        "the snapshot holds a process created after the claim's gate, so the claim is not newer than the table"
+    );
+}
+
+#[test]
+fn a_claim_started_with_the_snapshots_newest_process_is_held() {
+    let mut machine = Machine::new("a_claim_started_with_the_snapshots_newest_process_is_held");
+    let claim = claim_started_at(100, "2026-10-01T11:00:02Z");
+    machine.write_claim("gate-slot-1.json", &claim.to_string());
+    machine.add_process(5, 1, "pwsh.exe", None, Some("2026-10-01T11:00:02Z"));
+    machine.open.insert("gate-slot-1".to_owned());
+
+    let row = heavy_slot(&machine, 1);
+
+    assert_eq!(
+        (row.state, row.claim.as_ref(), row.stale.as_ref()),
+        (SlotState::Held, None, Some(&claim)),
+        "a claim started with the snapshot's newest process is not strictly later than it"
+    );
+}
+
+#[test]
+fn an_empty_snapshot_never_makes_a_claim_live() {
+    let mut machine = Machine::new("an_empty_snapshot_never_makes_a_claim_live");
+    let claim = claim(100, None, "C:\\work");
+    machine.write_claim("gate-slot-1.json", &claim.to_string());
+    machine.open.insert("gate-slot-1".to_owned());
+
+    let row = heavy_slot(&machine, 1);
+
+    assert_eq!(
+        (row.state, row.claim.as_ref(), row.stale.as_ref()),
+        (SlotState::Held, None, Some(&claim)),
+        "a snapshot with no process start holds no gate whose claim is newer than it"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn a_claim_being_deleted_is_skipped() {
+    use std::ffi::c_void;
+    use std::io;
+    use std::os::windows::ffi::OsStrExt as _;
+    use std::ptr;
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, DELETE, FILE_ATTRIBUTE_NORMAL, FILE_DISPOSITION_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileDispositionInfo,
+        OPEN_EXISTING, SetFileInformationByHandle,
+    };
+
+    let machine = Machine::new("a_claim_being_deleted_is_skipped");
+    let path = machine.dir.join("gate").join("slots").join("gate-slot-1.json");
+    fs::write(&path, claim(100, None, "C:\\work").to_string()).expect("the claim can be written");
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    // The classic mark-for-deletion-on-close, not the POSIX delete `fs::remove_file` takes on this Windows: it leaves
+    // the claim's name in the folder and makes a later open of it fail with access denied, which is what a gate
+    // deleting its claim as the state reads it does.
+    // SAFETY: `wide` is a NUL-terminated UTF-16 string that outlives the call, the security attributes and template
+    // handle are null, and the access and share modes are the constants CreateFileW takes.
+    let held = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            DELETE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            ptr::null(),
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            ptr::null_mut(),
+        )
+    };
+    assert_ne!(held, INVALID_HANDLE_VALUE, "the claim can be opened for its delete");
+    let info = FILE_DISPOSITION_INFO { DeleteFile: true };
+    let size = u32::try_from(size_of::<FILE_DISPOSITION_INFO>()).expect("the info fits in a u32");
+    // SAFETY: `held` is the handle just opened with DELETE access, `info` is a FILE_DISPOSITION_INFO that outlives the
+    // call, and `size` is its size in bytes.
+    let set = unsafe { SetFileInformationByHandle(held, FileDispositionInfo, ptr::from_ref(&info).cast::<c_void>(), size) };
+    assert_ne!(set, 0, "the claim's delete can be set: {}", io::Error::last_os_error());
+    let error = fs::read(&path).expect_err("a claim whose delete is pending cannot be read");
+    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "the staging this test needs: {error}");
+
+    let row = heavy_slot(&machine, 1);
+
+    assert_eq!(
+        (row.state, row.claim.as_ref(), row.stale.as_ref()),
+        (SlotState::Free, None, None),
+        "a claim its gate is deleting as the state reads it is going away, not stale"
+    );
+    // SAFETY: `held` is the handle this test opened and has not closed.
+    unsafe { CloseHandle(held) };
 }

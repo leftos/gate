@@ -14,7 +14,7 @@ use gate_state::{
 use jiff::Timestamp;
 use serde_json::json;
 
-use crate::support::{HEAVY_GATE, LIGHT_GATE, Machine, START, START_CLOSE, START_FAR, claim, ms, pool, ticket, ticks};
+use crate::support::{HEAVY_GATE, LIGHT_GATE, Machine, START, START_CLOSE, START_FAR, claim, heavy_slot, ms, pool, ticket, ticks};
 
 const V1_CRITICAL_CLAIM: &str = include_str!("fixtures/v1-critical-claim.json");
 const V1_CRITICAL_TICKET: &str = include_str!("fixtures/v1-critical-ticket.json");
@@ -77,6 +77,79 @@ fn the_flag_switches_the_state_to_the_v1_root() {
     let remote = state.remote.as_ref().expect("gate.exe's remote claim shows the remote pool");
     let slots: Vec<(u32, SlotState)> = remote.slots.iter().map(|slot| (slot.index, slot.state)).collect();
     assert_eq!(slots, [(1, SlotState::Busy)]);
+}
+
+#[test]
+fn a_powershell_gate_holding_a_slot_after_the_cutover_is_busy_with_its_claim() {
+    let mut machine = Machine::v1("a_powershell_gate_holding_a_slot_after_the_cutover_is_busy_with_its_claim");
+    let claim = claim(100, None, r"C:\work");
+    machine.write_claim("gate-slot-1.json", &claim.to_string());
+    machine.add_process(100, 1, "pwsh.exe", Some(HEAVY_GATE), Some(START));
+    machine.open.insert("gate-slot-1".to_owned());
+
+    let row = heavy_slot(&machine, 1);
+
+    assert_eq!(
+        (row.state, row.claim.as_ref(), row.stale.as_ref()),
+        (SlotState::Busy, Some(&claim), None),
+        "a gate started through a stale launcher holds gate.exe's mutex and writes its claim under the PowerShell root"
+    );
+}
+
+#[test]
+fn a_powershell_claim_does_not_beat_a_live_v1_claim() {
+    let mut machine = Machine::v1("a_powershell_claim_does_not_beat_a_live_v1_claim");
+    let v1_claim = claim(100, None, r"C:\v1");
+    let powershell = claim(200, None, r"C:\powershell");
+    machine.write_v1_claim("gate-slot-1.json", &v1_claim.to_string());
+    machine.write_claim("gate-slot-1.json", &powershell.to_string());
+    machine.add_process(100, 1, "gate.exe", Some(GATE_EXE), Some(START));
+    machine.add_process(200, 1, "pwsh.exe", Some(HEAVY_GATE), Some(START));
+    machine.open.insert("gate-slot-1".to_owned());
+
+    let row = heavy_slot(&machine, 1);
+
+    assert_eq!(
+        (row.state, row.claim.as_ref(), row.stale.as_ref()),
+        (SlotState::Busy, Some(&v1_claim), None),
+        "the generation's own live claim is what the slot holds"
+    );
+}
+
+#[test]
+fn a_dead_v1_claim_gives_way_to_a_live_powershell_claim() {
+    let mut machine = Machine::v1("a_dead_v1_claim_gives_way_to_a_live_powershell_claim");
+    machine.write_v1_claim("gate-slot-1.json", &claim(100, None, r"C:\v1").to_string());
+    let powershell = claim(200, None, r"C:\powershell");
+    machine.write_claim("gate-slot-1.json", &powershell.to_string());
+    machine.add_process(200, 1, "pwsh.exe", Some(HEAVY_GATE), Some(START));
+    machine.open.insert("gate-slot-1".to_owned());
+
+    let row = heavy_slot(&machine, 1);
+
+    assert_eq!(
+        (row.state, row.claim.as_ref(), row.stale.as_ref()),
+        (SlotState::Busy, Some(&powershell), None),
+        "the v1 claim's gate is gone, so the live PowerShell claim is what the slot holds"
+    );
+}
+
+#[test]
+fn a_powershell_claim_started_after_the_snapshot_is_busy() {
+    let mut machine = Machine::v1("a_powershell_claim_started_after_the_snapshot_is_busy");
+    let mut powershell = claim(100, None, r"C:\work");
+    powershell["processStart"] = json!("2026-10-01T11:00:02Z");
+    machine.write_claim("gate-slot-1.json", &powershell.to_string());
+    machine.add_process(5, 1, "pwsh.exe", Some(HEAVY_GATE), Some("2026-10-01T11:00:01Z"));
+    machine.open.insert("gate-slot-1".to_owned());
+
+    let row = heavy_slot(&machine, 1);
+
+    assert_eq!(
+        (row.state, row.claim.as_ref(), row.stale.as_ref()),
+        (SlotState::Busy, Some(&powershell), None),
+        "the snapshot was taken before the PowerShell gate started, so its claim is newer than the table"
+    );
 }
 
 #[test]

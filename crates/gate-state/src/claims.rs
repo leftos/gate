@@ -77,7 +77,8 @@ pub(crate) struct Ticket {
 
 /// The claim files of the slots and of the critical gate in `dir`, keyed by mutex name in lower case: the files named
 /// `<prefix>gate-slot-<n>`, `<prefix>gate-light-slot-<n>`, `<prefix>gate-remote-slot-<n>` or `<prefix>gate-critical`
-/// with a `.json` extension, in any letter case. A claim without the prefix is left out; a missing folder holds none.
+/// with a `.json` extension, in any letter case. A claim without the prefix is left out, so is one that is gone, and a
+/// missing folder holds none.
 pub(crate) fn read_claims(dir: &Path, prefix: &str) -> HashMap<String, Claim> {
     let mut claims = HashMap::new();
     let Ok(entries) = fs::read_dir(dir) else {
@@ -89,8 +90,10 @@ pub(crate) fn read_claims(dir: &Path, prefix: &str) -> HashMap<String, Claim> {
         let Some(name) = mutex_name(&path, &prefix) else {
             continue;
         };
-        if path.is_file() {
-            claims.insert(name, read_claim(&path));
+        if path.is_file()
+            && let Some(claim) = read_claim(&path)
+        {
+            claims.insert(name, claim);
         }
     }
     claims
@@ -189,16 +192,21 @@ pub(crate) fn timestamp_of_ticks(ticks: i64) -> Option<Timestamp> {
     Timestamp::from_nanosecond((i128::from(ticks) - UNIX_EPOCH_TICKS) * 100).ok()
 }
 
-fn read_claim(path: &Path) -> Claim {
+/// The claim at `path`, or `None` when the claim is gone: a read that fails with not-found is a claim its gate deleted
+/// between the listing and this read, one that fails with access denied is a claim whose delete is pending and that
+/// Windows refuses to open — each is going away, not unreadable. Every other read error is the claim as an unreadable
+/// stale claim.
+fn read_claim(path: &Path) -> Option<Claim> {
     let text = match read_text(path) {
         Ok(text) => text,
-        Err(error) => return unreadable(&error.to_string()),
+        Err(error) if matches!(error.kind(), io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied) => return None,
+        Err(error) => return Some(unreadable(&error.to_string())),
     };
-    match serde_json::from_str::<Value>(&text) {
+    Some(match serde_json::from_str::<Value>(&text) {
         Ok(Value::Object(object)) => parse_claim(object),
         Ok(_) => unreadable("the claim is not a JSON object"),
         Err(error) => unreadable(&error.to_string()),
-    }
+    })
 }
 
 fn parse_claim(object: Map<String, Value>) -> Claim {
@@ -291,7 +299,7 @@ fn open_shared(path: &Path) -> io::Result<File> {
 mod tests {
     use jiff::{SignedDuration, Timestamp};
 
-    use super::{MAX_TICKS, UNIX_EPOCH_TICKS, claim_started_by, ticket_started_by, ticks_of, timestamp_of_ticks};
+    use super::{MAX_TICKS, UNIX_EPOCH_TICKS, claim_started_by, read_claim, ticket_started_by, ticks_of, timestamp_of_ticks};
 
     const START: &str = "2026-10-01T11:00:00.5Z";
 
@@ -345,5 +353,13 @@ mod tests {
             Some("0001-01-01T00:00:00Z".parse().expect("year one is a timestamp")),
             "the first tick"
         );
+    }
+
+    #[test]
+    fn a_claim_that_is_not_there_is_no_claim() {
+        let path = std::env::temp_dir().join("gate-state-no-such-claim.json");
+        assert!(!path.exists(), "the test's path is free");
+
+        assert!(read_claim(&path).is_none(), "a claim that is gone is no claim");
     }
 }

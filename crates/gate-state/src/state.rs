@@ -29,18 +29,31 @@ const CRITICAL: &str = "critical";
 /// and, when it is full or a critical request bars it, the gates waiting for it; then the remote pool, when the gate's
 /// `remote.json` or a remote claim file exists. A gate routed to the remote pool shows only as its queue ticket.
 ///
-/// The claims, tickets and counts file are the PowerShell gate's under `gate\` or, for [`Generation::V1`], only
-/// `gate.exe`'s under `gate\v1\`, where a missing folder is an empty state. `gate.exe`'s waiting gates are its live
-/// tickets' gates; the PowerShell gate's are found by their command lines. `gate.exe`'s gates running under a parent
-/// gate's slot are its live covered markers' gates; the PowerShell gate writes no marker.
+/// The claims, tickets and counts file are the PowerShell gate's under `gate\` or, for [`Generation::V1`], `gate.exe`'s
+/// under `gate\v1\` and the slots' claims under the PowerShell root, where a missing folder is an empty state.
+/// `gate.exe`'s waiting gates are its live tickets' gates; the PowerShell gate's are found by their command lines.
+/// `gate.exe`'s gates running under a parent gate's slot are its live covered markers' gates; the PowerShell gate
+/// writes no marker.
+///
+/// Past the cutover a slot's row also reads the claims under the PowerShell root, where a gate started through a stale
+/// per-repo launcher writes its claim while holding a mutex `gate.exe` names: with the mutex open and no live claim of
+/// this generation, such a claim is what the slot holds.
 #[must_use]
 pub fn dashboard_state(inputs: &StateInputs, processes: &dyn ProcessTable, mutexes: &dyn MutexProbe, cwds: &dyn CwdReader) -> DashboardState {
     let table = Table::new(processes.snapshot());
     let state_dir = inputs.generation.state_dir(&inputs.local_app_data);
     let claims = read_claims(&state_dir.join("slots"), &inputs.slot_prefix);
+    let powershell_claims = match inputs.generation {
+        Generation::PowerShell => HashMap::new(),
+        Generation::V1 => read_claims(
+            &Generation::PowerShell.state_dir(&inputs.local_app_data).join("slots"),
+            &inputs.slot_prefix,
+        ),
+    };
     let machine = Machine {
         table: &table,
         claims: &claims,
+        powershell_claims: &powershell_claims,
         mutexes,
     };
     let tickets = read_queue(inputs.generation, &state_dir.join(format!("{}waiting", inputs.slot_prefix)));
@@ -224,10 +237,13 @@ fn age_seconds(now: i128, arrived: i64) -> f64 {
 struct Table {
     tree: ProcessTree,
     children: HashMap<u32, Vec<u32>>,
+    /// The latest `created` the snapshot holds, the moment a claim must start after to be newer than the table.
+    latest_created: Option<Timestamp>,
 }
 
 impl Table {
     fn new(processes: Vec<ProcessInfo>) -> Self {
+        let latest_created = processes.iter().filter_map(|process| process.created).max();
         let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
         for process in &processes {
             children.entry(process.parent_pid).or_default().push(process.pid);
@@ -235,6 +251,7 @@ impl Table {
         Self {
             tree: ProcessTree::new(processes),
             children,
+            latest_created,
         }
     }
 
@@ -264,6 +281,13 @@ impl Table {
         self.get(claim.pid)
             .and_then(|process| process.created)
             .is_some_and(|created| claim_started_by(claim.process_start, created))
+    }
+
+    /// True when the claim's pid is absent from the snapshot and its start is later than every process the snapshot
+    /// holds: a gate that started after the snapshot was taken, whose claim is newer than the table. A snapshot with no
+    /// process start at all holds no such gate.
+    fn claim_after_snapshot(&self, claim: &ReadableClaim) -> bool {
+        self.get(claim.pid).is_none() && self.latest_created.is_some_and(|created| claim.process_start > created)
     }
 
     /// True when the process has a child other than a console host, which a waiting gate does not have yet.
@@ -388,6 +412,9 @@ fn waiting_pattern(kind: &str) -> Regex {
 struct Machine<'a> {
     table: &'a Table,
     claims: &'a HashMap<String, Claim>,
+    /// The PowerShell root's claims, empty for the PowerShell generation: past the cutover a gate started through a
+    /// stale launcher writes there while holding one of this generation's mutexes.
+    powershell_claims: &'a HashMap<String, Claim>,
     mutexes: &'a dyn MutexProbe,
 }
 
@@ -449,9 +476,11 @@ impl Machine<'_> {
         slots
     }
 
-    /// The row of the mutex `name`; its claim is looked up by the name in any letter case.
+    /// The row of the mutex `name`; its claim is looked up by the name in any letter case. A claim whose gate started
+    /// after the snapshot was taken holds the slot while the mutex is open, and past the cutover so does a live claim
+    /// under the PowerShell root when this generation has no live claim of its own.
     fn slot_row(&self, name: String, index: u32) -> SlotRow {
-        let claim = self.claims.get(&name.to_ascii_lowercase());
+        let key = name.to_ascii_lowercase();
         let mut row = SlotRow {
             index,
             name,
@@ -463,19 +492,38 @@ impl Machine<'_> {
             critical: false,
             extra: Some(false),
         };
+        let open = self.mutexes.is_open(&row.name);
+        let claim = self.claims.get(&key);
         if let Some(Claim::Readable(readable)) = claim
-            && self.table.claim_live(readable)
+            && self.claim_holds(readable, open)
         {
-            row.state = SlotState::Busy;
-            row.claim = Some(readable.value.clone());
-            row.processes = self.table.descendant_count(readable.pid);
-            row.last_line = last_log_line(readable.log.as_deref());
-            return row;
+            return self.held_by(row, readable);
+        }
+        if open
+            && let Some(Claim::Readable(readable)) = self.powershell_claims.get(&key)
+            && self.claim_holds(readable, open)
+        {
+            return self.held_by(row, readable);
         }
         row.stale = claim.map(|claim| claim.as_value().clone());
-        if self.mutexes.is_open(&row.name) {
+        if open {
             row.state = SlotState::Held;
         }
+        row
+    }
+
+    /// True when the claim is what the slot holds: the gate runs as the process the claim names, or, while the mutex is
+    /// open, the gate started after the snapshot was taken and so is newer than the table.
+    fn claim_holds(&self, claim: &ReadableClaim, open: bool) -> bool {
+        self.table.claim_live(claim) || (open && self.table.claim_after_snapshot(claim))
+    }
+
+    /// The row of a slot a live claim holds: busy, with the claim, its gate's descendants and its log's last line.
+    fn held_by(&self, mut row: SlotRow, claim: &ReadableClaim) -> SlotRow {
+        row.state = SlotState::Busy;
+        row.claim = Some(claim.value.clone());
+        row.processes = self.table.descendant_count(claim.pid);
+        row.last_line = last_log_line(claim.log.as_deref());
         row
     }
 }

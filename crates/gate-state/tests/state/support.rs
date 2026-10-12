@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use gate_state::{CwdReader, DashboardState, Generation, MutexProbe, PoolState, SlotKind, StateInputs, dashboard_state};
+use gate_state::{CwdReader, DashboardState, Generation, MutexProbe, PoolState, SlotKind, SlotRow, StateInputs, dashboard_state};
 use jiff::Timestamp;
 use proc_table::{ProcessInfo, ProcessTable};
 use serde_json::{Value, json};
@@ -241,6 +241,16 @@ pub fn pool(state: &DashboardState, kind: SlotKind) -> &PoolState {
         .iter()
         .find(|pool| pool.kind == kind)
         .expect("the state has a pool of each kind")
+}
+
+/// The heavy pool's slot `index`, as `machine`'s state describes it.
+pub fn heavy_slot(machine: &Machine, index: u32) -> SlotRow {
+    pool(&machine.state(), SlotKind::Heavy)
+        .slots
+        .iter()
+        .find(|slot| slot.index == index)
+        .expect("the heavy pool has the slot")
+        .clone()
 }
 
 /// The keys of a JSON object, in order.

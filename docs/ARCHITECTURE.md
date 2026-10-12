@@ -78,7 +78,7 @@ The rule that shapes it: every file and kernel object another process sees is de
 
   It reads two layouts, told apart by `Generation` (`model.rs`; `Generation::detect` looks for `%LOCALAPPDATA%\gate\cutover.flag`, and `StateInputs.generation` carries the answer). `v1.rs` is `gate.exe`'s, under the state root (`counts_path`, `read_counts`).
 
-  `counts.rs`, `claims.rs`, `remote.rs`, `state.rs` and `win32.rs` (`slot_count_path`, `live_inputs`, `dashboard_state`) are what ops-tower uses; the `gate` binary never does. They read the PowerShell gate's layout under `%LOCALAPPDATA%\gate\` until the flag exists and then `gate.exe`'s under `%LOCALAPPDATA%\gate\v1\`, with the waiters taken from its tickets.
+  `counts.rs`, `claims.rs`, `remote.rs`, `state.rs` and `win32.rs` (`slot_count_path`, `live_inputs`, `dashboard_state`) are what ops-tower uses; the `gate` binary never does. They read the PowerShell gate's layout under `%LOCALAPPDATA%\gate\` until the flag exists and then `gate.exe`'s under `%LOCALAPPDATA%\gate\v1\` (a slot's row also reads the PowerShell root's claims while its mutex is open), with the waiters taken from its tickets.
 
   `cutover.rs` is what `gate cutover` writes: `write_cutover_flag` (the flag, holding its write time in RFC 3339 UTC, replacing any flag there) and `copy_slot_counts_to_v1` (the PowerShell gate's counts into the default root's `v1\slot-counts.json`, never replacing a file there; its outcome is `CountsCopy`).
 
