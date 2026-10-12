@@ -11,8 +11,6 @@
 ## Remote
 
 - [ ] GATE-10 Port the remote client and box wrapper, then the remote cutover
-  - [ ] GATE-121 Remote client: bound the size of the sync-back's fetched pack
-  - [ ] GATE-133 Remote client: write the outputs-pending marker after the push
   - [ ] GATE-131 Sync-back: bound what a back commit writes into the worktree
   - [ ] GATE-109 Remote: carry every verb of a routed run over one ssh connection (gate box serve)
   - [ ] GATE-18 Remote preflight: refuse with `parity` when the builder lacks a .NET workload the repo needs
@@ -24,8 +22,8 @@
   - [ ] GATE-29 Sync-back: narrow the 'worktree changed during the run' refusal to changes that could matter
   - [ ] GATE-105 Decide whether the box caps its dotnet tool restore
   - [ ] GATE-135 Remote client: bound the PC's dotnet --list-sdks and find dotnet on PATH only
-  - [ ] GATE-136 Parity: check whether dotnet honours a global.json with trailing text
   - [ ] GATE-137 Remote client: cap the bytes the outputs fetch writes
+  - [ ] GATE-138 Sync-back: fetch into a quarantine object folder
 - [ ] GATE-107 Make the sync-back git-failure case independent of a held bare repository
 
 ## Cutover sweep
@@ -40,10 +38,11 @@
   - [ ] GATE-16 Durations part 4: `--timeout auto` as a floor, and ceiling and hang hints
   - [ ] GATE-17 Durations part 5: backfill guests during a critical drain
 - [ ] GATE-8 `--slot auto` picks heavy or light from the command's history
-- [ ] GATE-134 Add a no-slot kind for commands that only wait on remote work
 
 ## Backlog
 
-- [ ] GATE-99 Bind a slot marker to a real parent gate's job before covering
+- [/] GATE-99 Bind a slot marker to a real parent gate's job before covering
 - [ ] GATE-101 A covered gate outlives its parent's slot
-- [ ] GATE-125 Find how far a packaged app escapes the gate's kill-on-close jobs
+- [/] GATE-125 Find how far a packaged app escapes the gate's kill-on-close jobs
+  - [ ] GATE-139 Count a packaged app's escaped tree in the cores, clock and stall check
+  - [ ] GATE-140 End an escaped tree at the box, remote client, bridge and push kill sites
