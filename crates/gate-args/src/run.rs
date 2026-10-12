@@ -88,6 +88,8 @@ pub(crate) enum SwitchOption {
     #[cfg(feature = "test-seams")]
     OwnStartFails,
     #[cfg(feature = "test-seams")]
+    ParentJobTrusted,
+    #[cfg(feature = "test-seams")]
     DiagnosticsFail,
     #[cfg(feature = "test-seams")]
     RemoteSnapshot,
@@ -259,6 +261,8 @@ impl RunBuilder {
             SwitchOption::SamplerFail => self.test_seams.sampler_fail = on,
             #[cfg(feature = "test-seams")]
             SwitchOption::OwnStartFails => self.test_seams.own_start_fails = on,
+            #[cfg(feature = "test-seams")]
+            SwitchOption::ParentJobTrusted => self.test_seams.parent_job_trusted = on,
             #[cfg(feature = "test-seams")]
             SwitchOption::DiagnosticsFail => self.test_seams.diagnostics_fail = on,
             #[cfg(feature = "test-seams")]

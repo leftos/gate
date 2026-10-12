@@ -1,14 +1,18 @@
 //! Nesting under a parent gate's slot marker, `GATE_SLOT_HELD`: a gate a live parent's slot covers takes no slot and
 //! journals `covered`, a critical gate under a heavy or light marker is refused, a heavy gate under a light marker takes
 //! a heavy slot, and a marker that is malformed, names a gate no longer running or belongs to another root is ignored. A
-//! covered gate keeps its covered marker while its command runs, and a gate that queues deletes a dead gate's.
+//! marker naming a live process whose gate's command this gate does not run inside is ignored too, unless the
+//! `--test-parent-job-trusted` seam trusts it, as the cases naming the test process do. A covered gate keeps its
+//! covered marker while its command runs, and a gate that queues deletes a dead gate's.
 
+use std::env;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{self, Command};
 
-use gate_state::StateRoot;
 use gate_state::v1::{self, CoveredMarker};
+use gate_state::{KernelObject, StateRoot};
+use gate_win32::Job;
 use jiff::Timestamp;
 use serde_json::Value;
 
@@ -52,8 +56,20 @@ pub(crate) fn test_marker(case: &Case, held: &str) -> String {
     format!("{held}:{pid}:{}:{}", start_ms(pid), root_hash(case))
 }
 
-/// The gate with `args` as the case readies it, started under `marker`.
+/// The seam that has a gate trust a marker naming the test process, which is no gate and has no job.
+const TRUSTED: &str = "--test-parent-job-trusted";
+
+/// The gate with `args` as the case readies it, started under `marker`, which it trusts as a real parent gate's
+/// ([`TRUSTED`] given before the command).
 pub(crate) fn marked(case: &Case, args: &[&str], marker: &str) -> Command {
+    let mut words = args.to_vec();
+    let command = words.iter().position(|word| *word == "--").expect("the words have a command");
+    words.insert(command, TRUSTED);
+    forged(case, &words, marker)
+}
+
+/// The gate with `args` as the case readies it, started under `marker`, which it judges as any gate does.
+fn forged(case: &Case, args: &[&str], marker: &str) -> Command {
     let mut command = case.gate(args);
     command.env("GATE_SLOT_HELD", marker);
     command
@@ -283,7 +299,7 @@ fn a_critical_gate_under_a_heavy_or_light_marker_is_refused() {
     for held in ["heavy", "light"] {
         let name = format!("a_critical_gate_under_a_heavy_or_light_marker_is_refused_{held}");
         let (outcome, _case) = refused(&name, held, |case| {
-            case.gate(&critical_words("refused.log", &[], &[FAKE_TOOL, "exit", "0"]))
+            case.gate(&critical_words("refused.log", &[TRUSTED], &[FAKE_TOOL, "exit", "0"]))
         });
         assert_eq!(outcome.stderr, refusal("--slot", held));
     }
@@ -300,6 +316,7 @@ fn a_critical_gate_refused_through_the_powershell_form_names_its_flag_so() {
             "60",
             "-Slot",
             "critical",
+            TRUSTED,
             "--",
             FAKE_TOOL,
             "exit",
@@ -485,6 +502,94 @@ fn a_gate_under_a_no_slot_run_is_not_lent_a_slot_during_a_critical_request() {
     assert!(!outcome.stderr.contains("taking no slot"), "{outcome:?}");
     assert_eq!(events_of(&case, child_pid), ["queue", "take", "release"]);
     assert_eq!(take_of(&case, child_pid)["parentPid"], Value::from(process::id()));
+}
+
+/// The line of a gate that ignores `marker`, naming this test process, because it does not run inside that process's
+/// gate's command, then goes on as `going_on` says.
+fn unbound_line(marker: &str, going_on: &str) -> String {
+    format!(
+        "gate: ignored GATE_SLOT_HELD='{marker}': this gate does not run inside the command of gate {}; {going_on}",
+        process::id()
+    )
+}
+
+/// Runs a light gate under a heavy marker naming this test process, the marker judged as any gate judges it, and
+/// asserts that the gate ignored it with its line and took a light slot of its own under no parent.
+fn ignores_the_test_processs_marker(case: &Case) {
+    let marker = test_marker(case, "heavy");
+    let outcome = finish(forged(case, &run_words("out.log", &[], &[FAKE_TOOL, "exit", "0"]), &marker));
+    assert_passed(&outcome);
+    assert!(outcome.stderr.contains(&unbound_line(&marker, "taking a light slot")), "{outcome:?}");
+    assert_eq!(
+        events_besides(case, 0),
+        ["queue", "take", "release"],
+        "the gate took a slot of its own and journalled no covered line"
+    );
+    assert_eq!(events(case)[1]["parentPid"], Value::Null, "the gate names no parent");
+}
+
+#[test]
+fn a_marker_naming_a_live_process_that_is_not_a_gate_is_not_honoured() {
+    ignores_the_test_processs_marker(&Case::new("a_marker_naming_a_live_process_that_is_not_a_gate_is_not_honoured"));
+}
+
+#[test]
+fn a_marker_naming_a_gate_whose_job_does_not_hold_this_gate_is_not_honoured() {
+    let case = Case::new("a_marker_naming_a_gate_whose_job_does_not_hold_this_gate_is_not_honoured");
+    let name = StateRoot::new(&shown(&case.root()), None).object_name(KernelObject::Job { gate_pid: process::id() });
+    let _job = Job::create(&name).expect("the job of the test process's name is created, empty");
+    ignores_the_test_processs_marker(&case);
+}
+
+#[test]
+fn a_critical_gate_under_a_forged_heavy_marker_takes_the_machine_instead_of_being_refused() {
+    let case = Case::new("a_critical_gate_under_a_forged_heavy_marker_takes_the_machine_instead_of_being_refused");
+    let marker = test_marker(&case, "heavy");
+    let outcome = finish(forged(&case, &critical_words("out.log", &[], &[FAKE_TOOL, "exit", "0"]), &marker));
+
+    assert_passed(&outcome);
+    assert!(outcome.stderr.contains(&unbound_line(&marker, "taking a critical slot")), "{outcome:?}");
+    assert!(!outcome.stderr.contains("cannot run under"), "{outcome:?}");
+    assert!(outcome.stderr.contains("gate: holds the machine (critical) at "), "{outcome:?}");
+    assert_eq!(events_besides(&case, 0), ["queue", "take", "release"]);
+}
+
+/// The `pwsh.exe` the first folder on `PATH` that has one holds, an app execution alias included.
+fn pwsh_on_path() -> Option<PathBuf> {
+    env::split_paths(&env::var_os("PATH")?)
+        .map(|folder| folder.join("pwsh.exe"))
+        .find(|path| fs::symlink_metadata(path).is_ok())
+}
+
+#[test]
+#[expect(clippy::print_stderr, reason = "a case this machine cannot run says why it skipped")]
+fn a_gate_under_cmd_and_pwsh_in_its_parents_command_is_covered() {
+    if pwsh_on_path().is_none() {
+        eprintln!("skipped: no pwsh on PATH");
+        return;
+    }
+    let case = Case::new("a_gate_under_cmd_and_pwsh_in_its_parents_command_is_covered");
+    let inner: Vec<String> = std::iter::once(GATE)
+        .chain(run_words("inner.log", &[], &[FAKE_TOOL, "exit", "0"]))
+        .map(|word| format!("'{word}'"))
+        .collect();
+    let script = format!("& {}", inner.join(" "));
+    let outer = case.start(&heavy_words(
+        "outer.log",
+        &[],
+        &["cmd", "/d", "/c", "pwsh", "-NoProfile", "-Command", &script],
+    ));
+    let outer_pid = u64::from(outer.id());
+    assert_passed(&outer.finish());
+
+    let line = covered(&case);
+    let inner_pid = line["pid"].as_u64().expect("the covered line has a pid");
+    let expected: Vec<(String, u64)> = [("queue", outer_pid), ("take", outer_pid), ("covered", inner_pid), ("release", outer_pid)]
+        .into_iter()
+        .map(|(name, pid)| (name.to_owned(), pid))
+        .collect();
+    assert_eq!(sequence(&case), expected, "the gate under cmd and pwsh runs under the outer's slot");
+    assert_eq!((&line["parentPid"], &line["kind"]), (&Value::from(outer_pid), &Value::from("light")));
 }
 
 #[test]

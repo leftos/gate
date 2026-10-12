@@ -73,6 +73,7 @@ fn print_request_shows_the_new_cli_request() {
             "remoteScript": null,
             "bridgePwsh": null,
             "ownStartFails": false,
+            "parentJobTrusted": false,
         },
     });
     assert_eq!(outcome.stdout, format!("{expected}\n"), "the keys come in the published order");

@@ -1,5 +1,5 @@
-//! What stopping a process tree or waiting for one process needs: another gate's job opened by its name, a process
-//! opened to be stopped, and one opened to wait for its end.
+//! What stopping a process tree or waiting for one process needs: another gate's job opened by its name, which also
+//! answers whether a process is in it, a process opened to be stopped, and one opened to wait for its end.
 
 use std::io;
 use std::time::Duration;
@@ -82,6 +82,43 @@ impl OpenedJob {
     pub fn terminate(&self, exit_code: u32) -> io::Result<()> {
         job::terminate(&self.handle, exit_code)
     }
+
+    /// Whether the process `pid`, created at `created` (whole microseconds, as the process table gives start times), is
+    /// in the job or in a job nested inside it. The process is opened with `PROCESS_QUERY_LIMITED_INFORMATION` alone,
+    /// all `IsProcessInJob` needs; one that cannot be opened, for any reason, is [`Membership::NotOpened`].
+    ///
+    /// # Errors
+    ///
+    /// The system's error when `IsProcessInJob` fails on a process that opened.
+    pub fn holds(&self, pid: u32, created: Timestamp) -> io::Result<Membership> {
+        // A process snapshot reads each start with this same access, so a process the snapshot saw that cannot be
+        // opened now changed after it: no process has the pid any more, or the one that has it may not be queried.
+        let Ok(Some(process)) = open_process(pid, PROCESS_QUERY_LIMITED_INFORMATION) else {
+            return Ok(Membership::NotOpened);
+        };
+        // SAFETY: the handle is open for as long as `process` lives, with `PROCESS_QUERY_LIMITED_INFORMATION` access.
+        if unsafe { start_of(process.raw()) }.ok() != Some(created) {
+            return Ok(Membership::Reused);
+        }
+        Ok(if job::holds(&self.handle, &process)? {
+            Membership::Member
+        } else {
+            Membership::Outside
+        })
+    }
+}
+
+/// Whether a process, named by its pid and the creation time it is expected to have, is in a job.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Membership {
+    /// The process is in the job, or in a job nested inside it.
+    Member,
+    /// The process runs outside the job.
+    Outside,
+    /// No process of that pid could be opened: none runs, or this process may not query it.
+    NotOpened,
+    /// The pid belongs to a process created at another time than the one expected, or its creation time cannot be read.
+    Reused,
 }
 
 /// A process opened to be stopped: with the access to read its creation time and its exit code, to wait for it and to

@@ -336,6 +336,45 @@ fn the_own_start_seam_is_a_switch_given_once() {
 
 #[cfg(feature = "test-seams")]
 #[test]
+fn the_parent_job_seam_is_a_switch_given_once_in_either_form() {
+    use crate::support::run_request;
+
+    assert!(
+        run_request(&refs(&with(&RUN, &["--test-parent-job-trusted", "--", "cmd"])))
+            .test_seams
+            .parent_job_trusted
+    );
+    assert!(
+        !run_request(&refs(&with(&RUN, &["--", "cmd"]))).test_seams.parent_job_trusted,
+        "off unless given"
+    );
+    let compat = run_request(&[
+        "-Log",
+        "x",
+        "-TimeoutSeconds",
+        "5",
+        "-Slot",
+        "critical",
+        "--test-parent-job-trusted",
+        "--",
+        "cmd",
+    ]);
+    assert!(compat.test_seams.parent_job_trusted, "the compatibility layer reads the hidden switch");
+    assert_eq!(
+        problems(&refs(&with(
+            &RUN,
+            &["--test-parent-job-trusted", "--test-parent-job-trusted", "--", "cmd"]
+        ))),
+        ["gate: --test-parent-job-trusted is given twice"]
+    );
+    assert_eq!(
+        problems(&["stop-tree", "--test-parent-job-trusted", "1"]),
+        ["gate: unknown option --test-parent-job-trusted"]
+    );
+}
+
+#[cfg(feature = "test-seams")]
+#[test]
 fn the_remote_client_seams_need_a_value_once() {
     use crate::support::run_request;
 
@@ -918,6 +957,10 @@ fn seam_flags_are_unknown_without_the_feature() {
     assert_eq!(
         problems(&refs(&with(&RUN, &["--test-own-start-fails", "--", "cmd"]))),
         ["gate: unknown option --test-own-start-fails"]
+    );
+    assert_eq!(
+        problems(&refs(&with(&RUN, &["--test-parent-job-trusted", "--", "cmd"]))),
+        ["gate: unknown option --test-parent-job-trusted"]
     );
     assert_eq!(
         problems(&refs(&with(&RUN, &["--test-remote-snapshot", "--", "cmd"]))),

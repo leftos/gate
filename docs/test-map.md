@@ -28,6 +28,7 @@ Suite = `crates/gate/tests/suite/` (binary `suite`, needs `--all-features`; test
 | wait.rs | `slots` (wait lines, ticket order), `critical` (barrier, reserved light), `nesting` (lend of a light parent's slot), `pause` (pause marker writer), `hold`, `routing` (remote pool wait), `interrupt` | CENTRAL (every queued/taking run passes `Wait`) |
 | machine.rs | `critical` (critical mutex, drain, take all, snapshot, release), `priority` (critical raises servers), `interrupt`(`--test-interrupt-queued` on critical via critical.rs) | no: critical, priority, nesting (critical refused), interrupt |
 | covered.rs | `nesting` (`covered` journal line, covered marker), `journal` | no: nesting, journal |
+| nesting/binding.rs | `nesting` (marker bound to the parent's job: `a_gate_under_cmd_and_pwsh_in_its_parents_command_is_covered`, unbound and unjudged lines) | no: nesting, critical, pause, slots, journal |
 | nesting.rs | `nesting` (marker parse, liveness, covered/refused/own), `critical` (refusal under marker), `pause`, `slots` | no, but run.rs calls it on every run (`admitted`, run.rs:154): nesting, critical, pause, slots, journal |
 | pause.rs | `pause` (marker rewritten each pass), `stall`/`ceiling` (paused time via `watch.rs` PauseReader), `nesting` | no: pause, nesting, stall, ceiling, cores |
 | journal.rs | `journal` (v1 lines, verdict, quoted command, rollover), plus any case asserting a journal line: `slots`, `critical`, `nesting`, `cores`, `routing`, `interrupt`, `cutover`?, `stall` (load-adjusted s), `bridge` | CENTRAL-ish (writes every run; run `journal`, `cores`, `nesting`, `slots`, `critical`, `routing`, `stall`, `interrupt`, `launch`, `hold`) |
@@ -77,7 +78,7 @@ Suite = `crates/gate/tests/suite/` (binary `suite`, needs `--all-features`; test
 | gate-win32 job.rs / create.rs / launch.rs / lib.rs / mutex.rs | all (started command, job, slot mutexes): CENTRAL | `gate-win32` tests (launch, mutex, event, interrupt, `io` for `Job::written_bytes`...) | CENTRAL |
 | gate-win32 piped.rs / console.rs | `boxside` (`--test-box-console`, `--test-box-park-launch`), `bridge`, `remote_client` | win32 `launch` | no |
 | gate-win32 priority.rs | `priority`, `critical`, `build_servers` | win32 `priority` | no |
-| gate-win32 tree.rs | `stop_tree`, `stall` (escaped processes), `interrupt`, `boxside` (stop), `burn` (`WaitableProcess`) | - | no |
+| gate-win32 tree.rs | `stop_tree`, `stall` (escaped processes), `interrupt`, `boxside` (stop), `burn` (`WaitableProcess`), `nesting` (`OpenedJob::holds`) | win32 `membership` | no |
 | gate-win32 interrupt.rs / event.rs | `interrupt`, `critical`, `cutover`, `routing`, `remote_client`, `boxside` (stop event), `slots` (wake) | win32 `interrupt`, `interrupt_again`, `event` | no |
 | gate-win32 device.rs | `routing` (subst drives in route facts) | - | no |
 | gate-win32 times.rs / memory.rs | `stall`, `ceiling`, `cores`, `pause` (samples) | - | no |
@@ -106,7 +107,7 @@ Always add `checkout` to any change that touches a suite file or adds a seam.
 | acquire.rs | `-E 'binary(suite) and test(/^(slots\|critical\|interrupt\|routing\|nesting\|pause)::/)'` |
 | machine.rs | `-E 'binary(suite) and test(/^(critical\|priority\|nesting\|interrupt)::/) or (U and test(/^machine::/))'` |
 | covered.rs | `-E 'binary(suite) and test(/^(nesting\|journal)::/) or (U and test(/^covered::/))'` |
-| nesting.rs | `-E 'binary(suite) and test(/^(nesting\|critical\|pause\|slots\|journal)::/) or (U and test(/^nesting::/))'` |
+| nesting.rs, nesting/binding.rs | `-E 'binary(suite) and test(/^(nesting\|critical\|pause\|slots\|journal)::/) or (U and test(/^nesting::/))'` |
 | pause.rs | `-E 'binary(suite) and test(/^(pause\|nesting\|stall\|ceiling\|cores)::/) or (U and test(/^pause::/))'` |
 | servers.rs | `-E 'binary(suite) and test(/^(build_servers\|priority\|diagnostics\|ceiling\|stall)::/) or (U and test(/^servers::/))'` |
 | priority.rs | `-E 'binary(suite) and test(/^(priority\|critical\|build_servers)::/) or (U and test(/^priority::/))'` |
@@ -144,7 +145,7 @@ Always add `checkout` to any change that touches a suite file or adds a seam.
 | gate-win32 job/create/launch/lib/mutex | `-E 'rdeps(gate-win32)'` |
 | gate-win32 piped/console | `-E 'package(gate-win32) or (binary(suite) and test(/^(boxside\|bridge\|remote_client)::/))'` |
 | gate-win32 priority | `-E 'package(gate-win32) or (binary(suite) and test(/^(priority\|critical\|build_servers)::/))'` |
-| gate-win32 tree | `-E 'package(gate-win32) or (binary(suite) and test(/^(stop_tree\|stall\|interrupt\|boxside\|burn)::/))'` |
+| gate-win32 tree | `-E 'package(gate-win32) or (binary(suite) and test(/^(stop_tree\|stall\|interrupt\|boxside\|burn\|nesting)::/))'` |
 | gate-win32 interrupt/event | `-E 'package(gate-win32) or (binary(suite) and test(/^(interrupt\|critical\|cutover\|routing\|remote_client\|boxside\|slots)::/))'` |
 | gate-win32 device | `-E 'package(gate-win32) or (binary(suite) and test(/^routing::/))'` |
 | gate-win32 times/memory | `-E 'package(gate-win32) or (binary(suite) and test(/^(stall\|ceiling\|cores\|pause)::/))'` |

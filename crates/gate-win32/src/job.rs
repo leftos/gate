@@ -167,13 +167,7 @@ impl Job {
     /// Whether the process behind `process`, open with `PROCESS_QUERY_LIMITED_INFORMATION`, is in the job, or in a job
     /// nested inside it (`IsProcessInJob`).
     pub(crate) fn holds(&self, process: &OwnedHandle) -> io::Result<bool> {
-        let mut inside = 0;
-        // SAFETY: both handles are open for the whole call, the job's with the `JOB_OBJECT_QUERY` access a new job's
-        // handle has, and `inside` is writable.
-        if unsafe { IsProcessInJob(process.raw(), self.handle.raw(), &raw mut inside) } == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(inside != 0)
+        holds(&self.handle, process)
     }
 
     /// The CPU time the job has used, every process ever in it counted, and the processes it holds now.
@@ -291,6 +285,19 @@ pub(crate) fn written_bytes(job: &OwnedHandle) -> io::Result<u64> {
         return Err(io::Error::last_os_error());
     }
     Ok(information.IoInfo.WriteTransferCount)
+}
+
+/// Whether the process behind `process` is in the job behind `job`, or in a job nested inside it (`IsProcessInJob`). A
+/// process handle without `PROCESS_QUERY_LIMITED_INFORMATION` access, or a job handle without `JOB_OBJECT_QUERY`
+/// access, gets the system's error.
+pub(crate) fn holds(job: &OwnedHandle, process: &OwnedHandle) -> io::Result<bool> {
+    let mut inside = 0;
+    // SAFETY: both handles are open for the whole call, and one without the access the call asks for only makes it
+    // fail; `inside` is writable.
+    if unsafe { IsProcessInJob(process.raw(), job.raw(), &raw mut inside) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(inside != 0)
 }
 
 /// Ends every process in the job behind `job`, and in the jobs nested inside it, with `exit_code`. A handle without

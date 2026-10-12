@@ -176,6 +176,9 @@ pub struct TestSeams {
     pub bridge_pwsh: Option<PathBuf>,
     /// Make this gate's own start unreadable both ways, so the run refuses before it writes anything.
     pub own_start_fails: bool,
+    /// Count every live parent a slot marker names as one this gate runs inside the command of, so a marker naming the
+    /// test process is trusted as a real parent gate's is.
+    pub parent_job_trusted: bool,
 }
 
 /// A valid `gate run`.

@@ -1,7 +1,9 @@
 //! The compatibility layer: the PowerShell gate's `-Log <path> -TimeoutSeconds <n> -Slot <kind> [...] -- <command>`
 //! and `-StopTree <pid>`. Exactly its eight options are read, by name in any ASCII case, in the `-Name value` and the
 //! `-Name:value` forms; `--` is required before the command. A `test-seams` build also reads the hidden
-//! `--test-print-request` switch, spelled exactly so, so the suite can see what a compat run asked for.
+//! `--test-print-request` switch, spelled exactly so, so the suite can see what a compat run asked for, and the hidden
+//! `--test-parent-job-trusted` switch, spelled exactly so, so a compat run under a marker naming the test process
+//! trusts it.
 
 use std::ffi::OsString;
 use std::iter::Peekable;
@@ -48,6 +50,11 @@ pub(crate) fn parse(words: impl Iterator<Item = OsString>) -> Result<Invocation,
         #[cfg(feature = "test-seams")]
         if text == "--test-print-request" {
             compat.builder.switch(SwitchOption::PrintRequest, &text, true);
+            continue;
+        }
+        #[cfg(feature = "test-seams")]
+        if text == "--test-parent-job-trusted" {
+            compat.builder.switch(SwitchOption::ParentJobTrusted, &text, true);
             continue;
         }
         match text.strip_prefix('-') {

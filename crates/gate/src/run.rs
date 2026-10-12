@@ -161,10 +161,15 @@ fn admitted(request: &RunRequest, log: &Path, root: &ResolvedRoot, environment: 
         ));
         return Err(u32::from(USAGE_STATUS));
     }
-    let nesting = Nesting::read(environment, request.slot, &root.root);
+    let nesting = Nesting::read(environment, request.slot, &root.root, request.test_seams.parent_job_trusted);
+    if let Some(line) = nesting.unjudged_line() {
+        console.err(&line);
+    }
     let said = match &nesting {
         Nesting::Own | Nesting::Under(_) | Nesting::Beside(_) => None,
-        Nesting::Malformed(_) | Nesting::Ended { .. } | Nesting::Covered(_) | Nesting::Refused(_) => nesting.line(request.slot, request.spelling),
+        Nesting::Malformed(_) | Nesting::Ended { .. } | Nesting::Unbound { .. } | Nesting::Covered(_) | Nesting::Refused(_) => {
+            nesting.line(request.slot, request.spelling)
+        }
     };
     if let Some(line) = said {
         console.err(&line);
@@ -1535,13 +1540,23 @@ mod tests {
             pid: 4242,
             start_ms: 1,
             marker: "light:4242:1".to_owned(),
+            unjudged: None,
         };
-        let rows: [(&str, Nesting, bool, bool); 5] = [
+        let rows: [(&str, Nesting, bool, bool); 6] = [
             ("covered by its parent's slot", Nesting::Covered(parent.clone()), false, false),
             ("lent its light parent's slot", Nesting::Under(parent.clone()), true, false),
             ("under a parent whose slot does not cover it", Nesting::Under(parent), false, true),
             ("under no parent, here after a fallback or from the start", Nesting::Own, false, true),
             ("with an ignored marker", Nesting::Malformed("x".to_owned()), false, true),
+            (
+                "under a marker it does not run inside the command of",
+                Nesting::Unbound {
+                    marker: "light:4242:1".to_owned(),
+                    pid: 4242,
+                },
+                false,
+                true,
+            ),
         ];
         for (name, nesting, lent, want) in rows {
             assert_eq!(takes_own_slot(&nesting, lent), want, "{name}");
