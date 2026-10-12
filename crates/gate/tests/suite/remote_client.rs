@@ -6,6 +6,8 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::hash::{DefaultHasher, Hasher};
+use std::io::ErrorKind;
+use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::SystemTime;
@@ -646,6 +648,117 @@ fn a_drop_with_another_first_line_is_not_retried() {
     assert_eq!(fallbacks(&events(&case)), ["unreachable"]);
 }
 
+/// The file a case's command marks each time it runs, relative to the folder it runs in: the case folder here, the work
+/// folder on the builder. A path the command names inside the worktree is sent relative, and one outside it keeps the
+/// run here, so each place keeps its own count; a `*.log`, so no snapshot sends it and no sync-back brings it.
+const RAN: &str = "ran.log";
+
+/// How many times the case's command marked [`RAN`] in `folder`: none when it never ran there.
+fn runs_in(folder: &Path) -> usize {
+    match fs::read_to_string(folder.join(RAN)) {
+        Err(error) if error.kind() == ErrorKind::NotFound => 0,
+        read => read.expect("the ran file can be read").lines().count(),
+    }
+}
+
+/// How many times the case's command ran here, and how many on the builder in the work folder of the case's first run.
+fn runs(case: &Case) -> (usize, usize) {
+    let work = case.folder().join("builder").join("work").join(key_of(&events(case)));
+    (runs_in(&case.folder()), runs_in(&work))
+}
+
+/// Holds the builder's lock of the work folder `key`, as another run on the builder holds it, until it is dropped.
+fn hold_box_lock(case: &Case, key: &str) -> fs::File {
+    let lock = case.folder().join("builder").join("work").join(format!("{key}.lock"));
+    fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .share_mode(0)
+        .open(&lock)
+        .expect("the builder's work folder lock can be held")
+}
+
+#[test]
+fn a_command_that_prints_the_banner_words_and_exits_255_runs_once() {
+    let case = client_case("client-own-banner-words");
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok", "ok", "ok"]);
+    let command = [
+        r".\tool.exe",
+        "mark",
+        RAN,
+        "err",
+        "Connection timed out during banner exchange",
+        "exit",
+        "255",
+    ];
+
+    let outcome = finish(lost_gate(&case, "local", &steps, &command));
+
+    assert_eq!(outcome.code, Some(255), "a lost connection's status: {outcome:?}");
+    assert!(!outcome.stderr.contains(RETRY_LINE), "no retry: {outcome:?}");
+    assert!(outcome.stderr.contains(LOST_LINE), "a lost connection: {outcome:?}");
+    assert!(!outcome.stderr.contains(UNREACHABLE_LINE), "{outcome:?}");
+    assert_eq!(runs(&case), (0, 1), "the command ran once, on the builder: {outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "run", "stop", "boot"], "the stop, then the boot query");
+    assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new());
+}
+
+/// A run whose command says the box's human refusal line for its work folder, `line` of the key, and exits 75, after a
+/// first run that names the key: the 75 is the command's own, with no fallback and no run here.
+fn a_command_s_own_refusal_line_is_no_refusal(name: &str, line: fn(&str) -> String) {
+    let case = client_case(name);
+    let first = ssh_steps(&case, "first", &["ok", "ok"]);
+    let named = finish(client_gate(&case, "first.log", &first, &[r".\tool.exe", "out", "ran there"]));
+    assert_eq!(named.code, Some(0), "{named:?}");
+    let said = line(&key_of(&events(&case)));
+    let second = ssh_steps(&case, "second", &["ok", "ok"]);
+
+    let command = [r".\tool.exe", "mark", RAN, "err", &said, "exit", "75"];
+    let (pid, outcome) = finish_with_pid(client_gate(&case, "second.log", &second, &command));
+
+    assert_eq!(outcome.code, Some(75), "the command's own status: {outcome:?}");
+    assert!(outcome.stderr.contains(&said), "the command's line is passed on: {outcome:?}");
+    assert_eq!(fallbacks(&own(&case, pid)), Vec::<&str>::new(), "no fallback: {outcome:?}");
+    assert_eq!(runs(&case), (0, 1), "the command ran once, on the builder: {outcome:?}");
+    assert_eq!(calls(&second), ["preflight", "run"]);
+}
+
+#[test]
+fn a_command_that_prints_the_busy_line_and_exits_75_is_not_a_refusal() {
+    a_command_s_own_refusal_line_is_no_refusal("client-own-busy-line", |key| format!("gate: remote work folder {key} is busy"));
+}
+
+#[test]
+fn a_command_that_prints_the_tools_line_and_exits_75_is_not_a_refusal() {
+    a_command_s_own_refusal_line_is_no_refusal("client-own-tools-line", |key| {
+        format!("gate: remote work folder {key} could not restore its dotnet tools")
+    });
+}
+
+/// The builder's `dotnet` fails the restore of the snapshot's tool manifest, so the box refuses the run `tools`.
+#[test]
+fn a_tools_refusal_of_the_box_falls_back_and_runs_the_command_here_once() {
+    let case = client_case("client-tools-refused");
+    write(&case, ".config/dotnet-tools.json", "{\n  \"version\": 1\n}\n");
+    let stub = case.folder().join("ssh").join("stub");
+    fs::create_dir_all(&stub).expect("the stub's folder can be made");
+    fs::write(stub.join("dotnet.cmd"), "@exit /b 1\r\n").expect("the stub dotnet can be written");
+    let own_path = std::env::var_os("PATH").expect("PATH is set");
+    let path = std::env::join_paths(std::iter::once(stub).chain(std::env::split_paths(&own_path))).expect("the folders join into a PATH");
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+    let mut gate = client_gate(&case, "out.log", &steps, &[r".\tool.exe", "mark", RAN, "out", "ran"]);
+    gate.env("PATH", path);
+
+    let (pid, outcome) = finish_with_pid(gate);
+
+    assert_eq!(outcome.code, Some(0), "the run here passed: {outcome:?}");
+    assert_eq!(fallbacks(&own(&case, pid)), ["tools"], "{outcome:?}");
+    assert_eq!(runs(&case), (1, 0), "the command ran once, here: {outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "run"]);
+}
+
 #[test]
 fn a_run_call_longer_than_the_cap_fails_before_anything_is_sent() {
     let case = client_case("client-cap");
@@ -1020,14 +1133,17 @@ fn a_refused_run_call_syncs_nothing_back() {
     assert_eq!(pushed.code, Some(0), "{pushed:?}");
     let key = key_of(&events(&case));
     plant_back(&case, &key);
-    let busy = format!("say-exit 75 gate: remote work folder {key} is busy");
-    let second = ssh_steps(&case, "second", &["ok", &busy]);
+    let held = hold_box_lock(&case, &key);
+    let second = ssh_steps(&case, "second", &["ok", "ok"]);
 
-    let (pid, outcome) = finish_with_pid(client_gate(&case, "second.log", &second, &[r".\tool.exe", "out", "ran here"]));
+    let command = [r".\tool.exe", "mark", RAN, "out", "ran here"];
+    let (pid, outcome) = finish_with_pid(client_gate(&case, "second.log", &second, &command));
 
+    drop(held);
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert!(outcome.stderr.contains(BUSY_LINE), "{outcome:?}");
     assert!(outcome.stdout.contains("ran here"), "it ran here: {outcome:?}");
+    assert_eq!(runs(&case), (1, 0), "the command ran once, here: {outcome:?}");
     assert!(
         !outcome.stderr.contains("gate: ignored stale remote changes"),
         "no sync-back: {outcome:?}"
@@ -1759,9 +1875,10 @@ fn a_refused_killed_or_lost_run_leaves_the_marker() {
     assert_eq!(cleared.code, Some(0), "{cleared:?}");
     let marker = pending_marker(&refused);
     assert!(!marker.exists(), "the first run brought nothing back: {cleared:?}");
-    let busy = format!("say-exit 75 gate: remote work folder {} is busy", key_of(&events(&refused)));
-    let second = ssh_steps(&refused, "second", &["ok", &busy]);
+    let held = hold_box_lock(&refused, &key_of(&events(&refused)));
+    let second = ssh_steps(&refused, "second", &["ok", "ok"]);
     let outcome = finish(client_gate(&refused, "second.log", &second, &[r".\tool.exe", "out", "ran here"]));
+    drop(held);
     assert!(outcome.stderr.contains(BUSY_LINE), "{outcome:?}");
     assert!(marker.exists(), "a refused run leaves the marker: {outcome:?}");
 

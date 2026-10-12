@@ -69,13 +69,14 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Pause marker**: an empty file a gate under a parent gate's slot rewrites on every pass while it waits behind a critical request, which stops its parent's watchdog clocks for that time, the watchdog reading it on each sample; one older than 30 s is stale.
 - **Pipe-closed stop**: the box's stop of a job whose client's connection closed: `gate box run` terminates the job, waits for its processes and exits 255.
 - **Pool**: the set of slots of one kind (heavy, light, remote); pools never wait on each other.
-- **Pre-banner failure**: an ssh call, or a git call over ssh, that ended before the builder's sshd sent its banner (status 255, or 128 for git, with empty stdout and a first stderr line naming the banner exchange); the remote client retries it once after 2 s.
+- **Pre-banner failure**: an ssh call, or a git call over ssh, that ended before the builder's sshd sent its banner (status 255, or 128 for git, with empty stdout, no start marker and a first stderr line naming the banner exchange); the remote client retries it once after 2 s.
 - **Preflight**: the box's first call of a routed run (`gate box preflight`): it creates the bare repo and the work folder and reports the gate version, the boot time and the SDKs.
 - **Probe by open**: reading whether a slot is held by opening its mutex's name: it is held while any handle to that name exists.
 - **Progress**: what resets the stall clock in a sample: the output size changed, the job's CPU reached 1% of one core over the stall window since the last progress, a new pid appeared, or a nested gate is paused.
 - **Pure crate**: a crate with no Windows types in its API that builds and unit-tests on Linux as well (`gate-state`, `gate-watchdog`, `gate-args`, `gate-router`).
 - **Push**: `gate push`, which copies the installed `gate.exe` to every builder on the builders list over ssh and installs it there with the old exe set aside. Not the remote client's push of a snapshot to the builder's git repo.
 - **Refusal**: a builder's or the remote client's answer that a routed run cannot run there, with a reason (`busy`, `unreachable`, `parity`, `rebooted`, `tools`, `version`, `client`); the gate then falls back to a local run.
+- **Refusal tag**: the stderr line `gate-remote-refused: <nonce> busy|tools` that `gate box run` says just before the human line of a refusal; the remote client reads a `busy` or `tools` fallback from it alone, and ignores it once it has heard the start marker.
 - **Release**: see take.
 - **Remote client**: what `gate run` calls to run a routed command on a builder: `RemoteClient` in the gate binary; the `remote.ps1` bridge is the client of a production gate, and a client that cannot start makes the run fall back with reason `client`.
 - **Reserved field**: an optional field readers accept before any gate writes it, such as `expected`.
@@ -97,6 +98,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Spawn lock**: the `gate-win32` lock held while the gate starts any process, so only the launched command inherits the copies of its handles.
 - **Stable line**: one of the three published `gate:` line forms callers may parse (STALLED, TIMED OUT or BACKSTOP; `waiting for the machine (critical)`; `Full output:`); every other `gate:` line is prose.
 - **Stall**: a kill for no progress (no output, CPU, new process or build-server work) for the stall window, `--stall` seconds.
+- **Start marker**: the stderr line `gate-remote-started: <nonce>` that `gate box run` says just before it launches the command; a run call that carried it is never retried and is not a pre-banner failure.
 - **State root**: the folder holding every file the gate writes, `%LOCALAPPDATA%\gate\v1\` by default, overridden by `--state-dir` or `GATE_STATE_DIR`.
 - **Stop event**: the manual-reset event `<box job name>-stopped` that `gate box run` creates before its job and `gate box stop` sets before it terminates the job, so a launch that finds it set ends the command unstarted.
 - **Stop-tree**: `gate stop-tree <pid>`, which terminates the gate jobs and then the processes of a pid's tree, deepest first, so a kill reaches processes that no longer have a parent.

@@ -3,6 +3,7 @@
 
 use std::ffi::OsString;
 use std::fs;
+use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -620,11 +621,73 @@ fn box_run_a_second_run_on_a_held_lock_is_busy() {
 
     assert_eq!(second.code, Some(75), "{second:?}");
     assert_eq!(second.stdout, "");
-    assert_eq!(second.stderr, "gate: remote work folder k is busy\n");
+    assert_eq!(
+        second.stderr,
+        format!("{}\ngate: remote work folder k is busy\n", refused_line(&renamed(&held, 1), "busy"))
+    );
     let_go(&go);
     let outcome = first.finish();
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     wait_until_closed(Path::new(field(&held, "Lock")));
+}
+
+/// The start marker the box says for the run of `payload` just before its command starts.
+fn started_line(payload: &Value) -> String {
+    format!("gate-remote-started: {}", field(payload, "Nonce"))
+}
+
+/// The tag the box says for the run of `payload` just before its human refusal line, refused for `reason`.
+fn refused_line(payload: &Value, reason: &str) -> String {
+    format!("gate-remote-refused: {} {reason}", field(payload, "Nonce"))
+}
+
+#[test]
+fn the_start_marker_comes_before_the_commands_first_output() {
+    let case = Case::new("box_run_start_marker");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "err", "first", "out", "first"]);
+    snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
+
+    let outcome = run_box(&case, &payload);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let said = lines(&outcome.stderr);
+    let marker = started_line(&payload);
+    assert_eq!(said.iter().filter(|line| **line == marker).count(), 1, "one marker: {outcome:?}");
+    let marked = said.iter().position(|line| *line == marker);
+    let first = said.iter().position(|line| *line == "first");
+    assert!(
+        matches!((marked, first), (Some(marked), Some(first)) if marked < first),
+        "the marker comes before the command's first line: {outcome:?}"
+    );
+    assert!(lines(&outcome.stdout).contains(&"first"), "{outcome:?}");
+}
+
+#[test]
+fn a_busy_refusal_is_tagged_and_has_no_marker() {
+    let case = Case::new("box_run_busy_tagged");
+    let marker = case.folder().join("marker");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "mark", &shown(&marker)]);
+    snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
+    let held = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .share_mode(0)
+        .open(field(&payload, "Lock"))
+        .expect("the work folder's lock can be held");
+
+    let outcome = run_box(&case, &payload);
+
+    drop(held);
+    assert_eq!(outcome.code, Some(75), "{outcome:?}");
+    let tag = refused_line(&payload, "busy");
+    assert_eq!(
+        lines(&outcome.stderr),
+        [tag.as_str(), "gate: remote work folder k is busy"],
+        "the tag comes just before the busy line, and no marker: {outcome:?}"
+    );
+    assert!(!marker.exists(), "the command never ran");
 }
 
 #[test]
@@ -994,7 +1057,7 @@ fn box_run_forwards_each_stream_line_by_line_ending_each_line_lf() {
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert_eq!(outcome.stdout, "a1\na2\nb\nc\nd\n", "CR LF and a lone CR each end a line");
-    assert_eq!(outcome.stderr, "e1\ne2\n");
+    assert_eq!(outcome.stderr, format!("{}\ne1\ne2\n", started_line(&payload)));
 }
 
 #[test]
@@ -1220,7 +1283,11 @@ fn box_run_gives_the_command_a_utf8_console() {
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert_eq!(outcome.stdout, "Active code page: 65001\n", "{outcome:?}");
-    assert_eq!(outcome.stderr, "", "no fallback: {outcome:?}");
+    assert_eq!(
+        outcome.stderr,
+        format!("{}\n", started_line(&payload)),
+        "the marker, no fallback: {outcome:?}"
+    );
 
     let mut bytes = renamed(&payload, 1);
     bytes["Command"] = json!([FAKE_TOOL, "bytes", "c3a9e282ac0a"]);
@@ -1228,7 +1295,7 @@ fn box_run_gives_the_command_a_utf8_console() {
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert_eq!(outcome.raw_stdout, "é€\n".as_bytes(), "non-ASCII bytes arrive intact: {outcome:?}");
-    assert_eq!(outcome.stderr, "", "{outcome:?}");
+    assert_eq!(outcome.stderr, format!("{}\n", started_line(&bytes)), "{outcome:?}");
 }
 
 #[test]
@@ -1247,7 +1314,11 @@ fn box_run_falls_back_before_the_start_and_runs_the_command() {
     assert_eq!(outcome.code, Some(0), "the fallback never fails the run: {outcome:?}");
     assert_eq!(outcome.stdout, "ran\n", "{outcome:?}");
     let said: Vec<&str> = outcome.stderr.lines().collect();
-    assert!(matches!(said[..], [line] if is_console_fallback(line)), "one fallback line: {outcome:?}");
+    let marker = started_line(&payload);
+    assert!(
+        matches!(said[..], [first, line] if first == marker && is_console_fallback(line)),
+        "the marker, then one fallback line: {outcome:?}"
+    );
     assert_eq!(marks(&count), "run\n", "the command ran once");
 }
 
@@ -1521,25 +1592,34 @@ fn box_run_echoes_a_command_word_with_control_characters_escaped() {
         .replace('\r', r"\r")
         .replace('\n', r"\n");
     let cases = [
+        // A word the box cannot find is refused before the start marker; one whose launch fails, after it.
         (
             "gate-suite-no-such-\u{1b}\r\n-program".to_owned(),
             r"gate-suite-no-such-\u{1b}\r\n-program".to_owned(),
             String::new(),
+            false,
         ),
         (
             "sub\\no-such-\u{1b}\r\n.exe".to_owned(),
             r"sub\no-such-\u{1b}\r\n.exe".to_owned(),
             format!(" ({resolved})"),
+            true,
         ),
     ];
-    for (word, shown, shown_resolved) in cases {
+    for (word, shown, shown_resolved, marked) in cases {
         payload["Command"] = json!([word]);
 
         let outcome = run_box(&case, &payload);
 
         assert_eq!(outcome.code, Some(127), "{word:?}: {outcome:?}");
         assert_eq!(outcome.stdout, "", "{word:?}");
-        let line = outcome.stderr.strip_suffix('\n').expect("the refusal is one line");
+        let marker = format!("{}\n", started_line(&payload));
+        let said = if marked {
+            outcome.stderr.strip_prefix(&marker).expect("the marker comes first")
+        } else {
+            outcome.stderr.as_str()
+        };
+        let line = said.strip_suffix('\n').expect("the refusal is one line");
         let prefix = format!("gate: could not start {shown}{shown_resolved}: ");
         assert!(
             line.starts_with(&prefix),
@@ -1848,9 +1928,39 @@ fn box_run_without_dotnet_refuses_the_run_with_75() {
         [
             cannot_start.as_str(),
             "gate: remote tool restore failed (status 1)",
+            refused_line(&payload, "tools").as_str(),
             "gate: remote work folder k could not restore its dotnet tools",
         ],
         "{outcome:?}"
+    );
+    assert!(!marker.exists(), "the command never ran");
+}
+
+#[test]
+fn a_tools_refusal_is_tagged_and_has_no_marker() {
+    let case = Case::new("box_run_tools_tagged");
+    let marker = case.folder().join("marker");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "mark", &shown(&marker)]);
+    snapshot(&case, &mut payload, &[(TOOLS_MANIFEST_PATH, TOOLS_MANIFEST)]);
+    let stub = stub_dotnet(&case, 7);
+
+    let outcome = run_box_with_path(&case, &payload, Some(&path_for_run(&[stub])));
+
+    assert_eq!(outcome.code, Some(75), "{outcome:?}");
+    let said = lines(&outcome.stderr);
+    let tag = refused_line(&payload, "tools");
+    let tagged = said.iter().position(|line| *line == tag);
+    let refused = said
+        .iter()
+        .position(|line| *line == "gate: remote work folder k could not restore its dotnet tools");
+    assert!(
+        matches!((tagged, refused), (Some(tagged), Some(refused)) if tagged + 1 == refused),
+        "the tag comes just before the tools line: {outcome:?}"
+    );
+    assert_eq!(said.iter().filter(|line| **line == tag).count(), 1, "one tag: {outcome:?}");
+    assert!(
+        !said.iter().any(|line| line.starts_with("gate-remote-started: ")),
+        "no marker: {outcome:?}"
     );
     assert!(!marker.exists(), "the command never ran");
 }

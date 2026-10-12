@@ -23,18 +23,22 @@ const PRE_BANNER: [&str; 3] = [
 ];
 
 /// How one call ended, as the rule reads it: its exit status, the status its program exits with when ssh failed,
-/// whether it wrote anything on standard output, and its first standard error line as it came.
+/// whether it wrote anything on standard output, its first standard error line as it came, and whether the box said
+/// the run's start marker.
 pub(crate) struct Ended<'a> {
     pub status: i32,
     pub fail_status: i32,
     pub output_seen: bool,
     pub first_error: Option<&'a str>,
+    pub started: bool,
 }
 
-/// Whether the call failed before the banner: ssh's own failure status, nothing on standard output, and a first
-/// standard error line that starts with one of ssh's pre-banner words, compared case-sensitively.
+/// Whether the call failed before the banner: no start marker from the box, ssh's own failure status, nothing on
+/// standard output, and a first standard error line that starts with one of ssh's pre-banner words, compared
+/// case-sensitively. A call whose box said the start marker reached the builder, whatever its first line.
 pub(crate) fn before_the_banner(ended: &Ended<'_>) -> bool {
-    ended.status == ended.fail_status
+    !ended.started
+        && ended.status == ended.fail_status
         && !ended.output_seen
         && ended
             .first_error
@@ -87,7 +91,26 @@ mod tests {
             fail_status: SSH_FAILED,
             output_seen,
             first_error,
+            started: false,
         })
+    }
+
+    #[test]
+    fn a_call_whose_box_said_its_start_marker_never_failed_before_the_banner() {
+        for line in [
+            "Connection timed out during banner exchange",
+            "kex_exchange_identification: read: Connection reset by peer",
+            "banner exchange: Connection to 192.0.2.1 port 22: invalid format",
+        ] {
+            let started = before_the_banner(&Ended {
+                status: SSH_FAILED,
+                fail_status: SSH_FAILED,
+                output_seen: false,
+                first_error: Some(line),
+                started: true,
+            });
+            assert!(!started, "{line}");
+        }
     }
 
     #[test]
@@ -109,6 +132,7 @@ mod tests {
                 fail_status: GIT_SSH_FAILED,
                 output_seen: false,
                 first_error: Some("kex_exchange_identification: Connection closed by remote host"),
+                started: false,
             })
         };
         assert!(git(128));

@@ -1,18 +1,18 @@
 //! The Rust remote client, in the phases the PowerShell client runs: the snapshot; the run call built and checked
 //! against the most cmd takes before anything is sent; the preflight and the builder's version; the push and the saved
 //! ref; and the run call, its output passed through to the log and the console. A call that failed before the ssh
-//! banner is made once more. A Ctrl+C ends the attempt between its calls, during the retry pause, and during any call;
-//! one during the run call stops the command on the builder. Each call goes through the [`Transport`]; every process
-//! is created suspended, put in an anonymous job of its own that ends its whole tree when it is killed, and only then
-//! let run. The preflight, the push and the run call run under the run's watchdog, whose clock starts with the
-//! attempt: a call that sends nothing for the stall window, or outlives the run's ceiling, is killed. A kill before the
-//! run call falls back `unreachable`, as the command never started; a kill of the run call stops the command and ends
-//! the run 124. A run call that exits 255 other than a failure before the banner lost its connection: nothing is synced
-//! back and the command is stopped; then, when the preflight said the builder's boot time, the builder is asked for it
-//! again. One that booted more than 30 s later restarted, and the run falls back `rebooted`; one that gives no boot
-//! time, or when either value is no timestamp, falls back `unreachable`; else the run ends 255. No call holds more than
-//! 64 KiB of a line in memory, nor keeps more than a call's last 1,000 lines, totalling at most 1 MiB: a longer line
-//! ends any call but the run call, whose output is passed on whole. The run
+//! banner is made once more, unless the box said the run's start marker. A Ctrl+C ends the attempt between its calls,
+//! during the retry pause, and during any call; one during the run call stops the command on the builder. Each call
+//! goes through the [`Transport`]; every process is created suspended, put in an anonymous job of its own that ends its
+//! whole tree when it is killed, and only then let run. The preflight, the push and the run call run under the run's
+//! watchdog, whose clock starts with the attempt: a call that sends nothing for the stall window, or outlives the run's
+//! ceiling, is killed. A kill before the run call falls back `unreachable`, as the command never started; a kill of the
+//! run call stops the command and ends the run 124. A run call that exits 255 other than a failure before the banner
+//! lost its connection: nothing is synced back and the command is stopped; then, when the preflight said the builder's
+//! boot time, the builder is asked for it again. One that booted more than 30 s later restarted, and the run falls back
+//! `rebooted`; one that gives no boot time, or when either value is no timestamp, falls back `unreachable`; else the
+//! run ends 255. No call holds more than 64 KiB of a line in memory, nor keeps more than a call's last 1,000 lines,
+//! totalling at most 1 MiB: a longer line ends any call but the run call, whose output is passed on whole. The run
 //! takes the work-folder key's lock, [`hold_key`], before its remote slot, so a second routed run of one worktree falls
 //! back `busy` at once.
 
@@ -44,7 +44,7 @@ use super::snapshot::{self, Snapshot};
 use super::syncback;
 use super::transport::{Local, Program, Transport};
 use super::watchdog::{self, Cut, Kept, LINE_CAP};
-use super::{FAILED, FAILED_RUN, REFUSED, RemoteCall, RemoteClient, RemoteOutcome, busy_line};
+use super::{FAILED, FAILED_RUN, REFUSED, Refusal, RemoteCall, RemoteClient, RemoteOutcome, refused_line, started_line};
 use crate::boxside::payload::escaped;
 use crate::environment::Variables;
 use crate::run::{CONTROL_C_EXIT, find_program};
@@ -287,7 +287,8 @@ pub(super) enum Echo {
 
 /// One call's process as it ended: its exit status, 124 when the client killed it, and why it did; whether it wrote on
 /// standard output, its first standard error line (a heartbeat included) and its last one (none), and the last lines
-/// it wrote but heartbeats, each cut to the cap; and, for a call the client killed, what else went wrong meanwhile.
+/// it wrote but heartbeats, each cut to the cap; for a run call, whether the box said the run's start marker and the
+/// refusal its tag named; and, for a call the client killed, what else went wrong meanwhile.
 pub(super) struct Called {
     pub(super) status: i32,
     pub(super) cut: Option<Cut>,
@@ -299,6 +300,10 @@ pub(super) struct Called {
     pub(super) lines: Vec<String>,
     /// Its last standard error line that is the box's outputs line, however many lines came after it.
     outputs_line: Option<String>,
+    /// Whether the box said the run's start marker on standard error.
+    started: bool,
+    /// The reason the box's refusal tag for the run named on standard error, the first when it said more than one.
+    refused: Option<FallbackReason>,
 }
 
 impl Called {
@@ -309,7 +314,17 @@ impl Called {
             fail_status,
             output_seen: self.output_seen,
             first_error: self.first_error.as_deref(),
+            started: self.started,
         })
+    }
+
+    /// The box's refusal of the run, from its tag; none once the box said the start marker, which no refusal follows.
+    ///
+    /// The nonce in the tag and the marker only tells runs apart: it is no secret, as it is on the box's and ssh's
+    /// command lines. That a command cannot forge a refusal rests on the box saying the marker before it creates the
+    /// command's process, and on this ignoring every tag once the marker was seen, whatever order the two came in.
+    fn refusal(&self) -> Option<FallbackReason> {
+        self.refused.filter(|_| !self.started)
     }
 }
 
@@ -346,7 +361,7 @@ impl Attempt<'_, '_> {
         let run_line = payload::capped("run", payload::line("run", &payload::run_word(&location, &run))).map_err(End::Failed)?;
         let prepared = self.preflight(&location)?;
         self.push(&snapshot, prepared.created)?;
-        let (end, heard) = self.run_call(&run_line, &location, sent.manifest.as_ref())?;
+        let (end, heard) = self.run_call(&run_line, &location, sent.manifest.as_ref(), &nonce)?;
         // The sync-back runs after a run call that ended with the command's own status; a refusal, an interrupt, a
         // kill, a lost connection or a failed call ended the attempt before it, so a box refusal's 75 never syncs back.
         // The pending marker stays on every end but a passing run whose box packed nothing.
@@ -386,7 +401,7 @@ impl Attempt<'_, '_> {
         let line = payload::capped("preflight", payload::line("preflight", &payload::location_word(location))).map_err(End::Failed)?;
         let watch = Watch::Run(self.limits_for("preflight"));
         let raise = self.raises_at("preflight");
-        let (mut called, _) = self.with_retry(SSH_FAILED, |attempt| attempt.ssh(&line, Echo::LogOnly, watch, raise, None))?;
+        let (mut called, _) = self.with_retry(SSH_FAILED, |attempt| attempt.ssh(&line, Echo::LogOnly, watch, raise, RunOnly::default()))?;
         let theirs = their_version(&called.lines).map(str::to_owned);
         let created = called.lines.iter().any(|line| line.starts_with(CREATED));
         let boot = boot_time(&called.lines).map(str::to_owned);
@@ -495,17 +510,23 @@ impl Attempt<'_, '_> {
     }
 
     /// The run call to the builder at `location`: the command's own status; `unreachable` when it failed before the
-    /// banner twice, as the command never started; a refusal when its 75 comes with the box's own refusal line; a lost
-    /// connection when it exited 255 otherwise. A watchdog kill says its line, stops the command and ends the run
-    /// killed; a Ctrl+C stops the command too. Each call made is fed `input` on its standard input, when given. With
-    /// the end, the last standard error line of the call that counts that is the box's outputs line.
-    fn run_call(&mut self, line: &str, location: &Location, input: Option<&Arc<str>>) -> Result<(End, Option<String>), End> {
+    /// banner twice, as the command never started; a refusal when its 75 comes with the box's refusal tag for the run
+    /// whose nonce is `nonce` and no start marker; a lost connection when it exited 255 otherwise. A watchdog kill says
+    /// its line, stops the command and ends the run killed; a Ctrl+C stops the command too. Each call made is fed
+    /// `input` on its standard input, when given. With the end, the last standard error line of the call that counts
+    /// that is the box's outputs line.
+    fn run_call(&mut self, line: &str, location: &Location, input: Option<&Arc<str>>, nonce: &str) -> Result<(End, Option<String>), End> {
         self.go_on()?;
         let limits = self.limits_for("run");
         let raise = self.raises_at("run");
+        let nonce: Arc<str> = Arc::from(nonce);
         let mut heard = None;
         let end = self.run_call_made(location, limits, |attempt| {
-            let called = attempt.ssh(line, Echo::Console, Watch::Run(limits), raise, input.cloned())?;
+            let run = RunOnly {
+                input: input.cloned(),
+                nonce: Some(Arc::clone(&nonce)),
+            };
+            let called = attempt.ssh(line, Echo::Console, Watch::Run(limits), raise, run)?;
             heard.clone_from(&called.outputs_line);
             Ok(called)
         })?;
@@ -531,7 +552,7 @@ impl Attempt<'_, '_> {
             }
             Err(end) => return Err(end),
         };
-        let reason = refusal(self.call.key, &called.lines);
+        let reason = called.refusal();
         let kept = self.lines.len();
         self.lines.append(&mut called.lines);
         let output = kept..self.lines.len();
@@ -646,7 +667,7 @@ impl Attempt<'_, '_> {
         };
         let bound = self.limits.bound;
         let begun = Instant::now();
-        let mut made = self.ssh(&line, Echo::LogOnly, Watch::Bounded(bound), false, None);
+        let mut made = self.ssh(&line, Echo::LogOnly, Watch::Bounded(bound), false, RunOnly::default());
         let again = matches!(&made, Ok(first) if first.before_the_banner(SSH_FAILED)) && retry::retry_allowed(bound, begun.elapsed(), self.pause);
         if again {
             if let Ok(first) = &mut made {
@@ -654,7 +675,13 @@ impl Attempt<'_, '_> {
             }
             self.say(retry::retry_line(self.call.host));
             thread::sleep(self.pause);
-            made = self.ssh(&line, Echo::LogOnly, Watch::Bounded(bound.saturating_sub(begun.elapsed())), false, None);
+            made = self.ssh(
+                &line,
+                Echo::LogOnly,
+                Watch::Bounded(bound.saturating_sub(begun.elapsed())),
+                false,
+                RunOnly::default(),
+            );
         }
         match made {
             Ok(called) => {
@@ -690,15 +717,16 @@ impl Attempt<'_, '_> {
     }
 
     /// One call of `gate box` on the builder carrying `line`, watched as `watch` says; the console interrupt raised
-    /// after its first output byte when `raise`; `input`, when given, fed on its standard input.
-    fn ssh(&mut self, line: &str, echo: Echo, watch: Watch, raise: bool, input: Option<Arc<str>>) -> Result<Called, End> {
+    /// after its first output byte when `raise`; what only the run call gives it, `run`.
+    fn ssh(&mut self, line: &str, echo: Echo, watch: Watch, raise: bool, run: RunOnly) -> Result<Called, End> {
         let Program { program, args } = self.transport.call(self.call.host, line);
         let mut command = Command::new(program);
         command.args(args);
         let starts = Starts {
             breakaway: self.transport.box_runs_here(),
             raise,
-            input,
+            input: run.input,
+            nonce: run.nonce,
         };
         self.started(&command, echo, watch, starts)
     }
@@ -715,6 +743,7 @@ impl Attempt<'_, '_> {
             breakaway: false,
             raise: false,
             input: None,
+            nonce: None,
         };
         self.started(&command, echo, watch, starts)
     }
@@ -752,8 +781,9 @@ impl Attempt<'_, '_> {
         let reading = Reading {
             echo,
             capped: echo != Echo::Console,
+            lines: starts.nonce.as_deref().map(|nonce| Arc::new(ProtocolLines::new(nonce))),
         };
-        relayed(stdout, Reader::new(false, reading, out_log), &shared, done.clone());
+        relayed(stdout, Reader::new(false, reading.clone(), out_log), &shared, done.clone());
         relayed(stderr, Reader::new(true, reading, err_log), &shared, done);
         let watched = Watched {
             running: &running,
@@ -886,6 +916,8 @@ fn called_of(ended: CallEnd, too_long: bool, mut heard: Heard) -> Result<Called,
         last_error: heard.last_error,
         lines: heard.kept.into_lines(),
         outputs_line: heard.outputs_line,
+        started: heard.started,
+        refused: heard.refused,
     })
 }
 
@@ -980,11 +1012,21 @@ fn cannot_wait(shown: &str, error: &io::Error) -> End {
 
 /// How a call starts: whether its job lets a process in it start one outside it, which only the ssh of a transport
 /// whose `gate box` runs on this machine needs; and whether the console interrupt is raised after its first output
-/// byte; and what is fed on its standard input, `None` for none.
+/// byte; and what is fed on its standard input, `None` for none; and the run's nonce its readers match the box's start
+/// marker and refusal tags by, `None` for every call but the run call.
 struct Starts {
     breakaway: bool,
     raise: bool,
     input: Option<Arc<str>>,
+    nonce: Option<Arc<str>>,
+}
+
+/// What only the run call gives a call of `gate box`: what is fed on its standard input, and the run's nonce; neither
+/// for any other call.
+#[derive(Default)]
+struct RunOnly {
+    input: Option<Arc<str>>,
+    nonce: Option<Arc<str>>,
 }
 
 /// `launch` created suspended within `job`: the process, the read ends of its stdout and stderr, and the write end of
@@ -1064,7 +1106,8 @@ fn git_end(error: GitError) -> End {
 
 /// What one call's two streams said so far, kept for the call's end, each line cut to the cap: whether it wrote on
 /// standard output, its first and last standard error lines, its last standard error line that is the box's outputs
-/// line, its last lines, and the first problem reading them.
+/// line, whether the box said the run's start marker and the refusal its first tag named, its last lines, and the
+/// first problem reading them.
 #[derive(Default)]
 struct Heard {
     kept: Kept,
@@ -1072,18 +1115,32 @@ struct Heard {
     first_error: Option<String>,
     last_error: Option<String>,
     outputs_line: Option<String>,
+    started: bool,
+    refused: Option<FallbackReason>,
     problem: Option<String>,
 }
 
 impl Heard {
-    /// Keeps one `line` of standard error when `error`, else of standard output, cut to the cap: a heartbeat only
-    /// marks the first error line.
-    fn record(&mut self, line: &str, error: bool) {
+    /// Keeps one `line` of standard error when `error`, else of standard output, cut to the cap: a heartbeat, and the
+    /// box's start marker or refusal tag its reader read the line as, `protocol`, only mark the first error line, the
+    /// latter two also marking the run started or refused.
+    fn record(&mut self, line: &str, error: bool, protocol: Option<Protocol>) {
         let line = watchdog::truncated(line);
         if error {
             self.first_error.get_or_insert_with(|| line.to_owned());
         } else {
             self.output_seen = true;
+        }
+        match protocol {
+            Some(Protocol::Started) => {
+                self.started = true;
+                return;
+            }
+            Some(Protocol::Refused(reason)) => {
+                self.refused.get_or_insert(reason);
+                return;
+            }
+            None => {}
         }
         if error && is_heartbeat(line) {
             return;
@@ -1173,11 +1230,21 @@ fn held(heard: &Mutex<Heard>) -> MutexGuard<'_, Heard> {
     heard.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// How a reader takes a call's lines: where they go, and whether a line past the cap stops it.
-#[derive(Clone, Copy)]
+/// How a reader takes a call's lines: where they go, whether a line past the cap stops it, and the run's start marker
+/// and refusal tags its lines are matched against, `None` for every call but the run call.
+#[derive(Clone)]
 struct Reading {
     echo: Echo,
     capped: bool,
+    lines: Option<Arc<ProtocolLines>>,
+}
+
+impl Reading {
+    /// The box's start marker or refusal tag for the run that `line` is, of standard error when `error`; `None` for a
+    /// line of standard output, any line of a call that is no run call, and any other line.
+    fn protocol(&self, line: &str, error: bool) -> Option<Protocol> {
+        self.lines.as_deref().filter(|_| error).and_then(|lines| lines.of(line))
+    }
 }
 
 /// One stream's reader: standard error when `error`; how it takes the lines; its own handle to the log, `None` when
@@ -1271,17 +1338,18 @@ impl Reader {
     }
 
     /// A whole line, `bytes`, came: it is passed on and kept, unless it is past the cap of a capped reading, which
-    /// stops, `false`.
+    /// stops, `false`. The box's heartbeat, start marker and refusal tag are kept but never passed on.
     fn line_ended(&mut self, bytes: &[u8], shared: &Shared) -> bool {
         if self.reading.capped && watchdog::too_long(bytes) {
             shared.progress.cut_too_long();
             return false;
         }
         let line = line_of(bytes, self.reading.echo);
-        if !(self.error && is_heartbeat(&line)) {
+        let protocol = self.reading.protocol(&line, self.error);
+        if protocol.is_none() && !(self.error && is_heartbeat(&line)) {
             self.passed(&line, true, shared);
         }
-        held(&shared.heard).record(&line, self.error);
+        held(&shared.heard).record(&line, self.error, protocol);
         true
     }
 
@@ -1291,7 +1359,7 @@ impl Reader {
         if ended {
             self.passed(&line_of(&piece, self.reading.echo), true, shared);
             if let Some(head) = self.head.take() {
-                held(&shared.heard).record(&head, self.error);
+                held(&shared.heard).record(&head, self.error, None);
             }
             return;
         }
@@ -1447,18 +1515,43 @@ fn first_bytes(text: &str, most: usize) -> &str {
     text.get(..end).unwrap_or_default()
 }
 
-/// The reason of the box's own refusal line for the work folder `key` among `lines`; `None` when there is none, as
-/// for a command that exits 75 itself.
-fn refusal(key: &str, lines: &[String]) -> Option<FallbackReason> {
-    let busy = busy_line(key);
-    let tools = format!("gate: remote work folder {key} could not restore its dotnet tools");
-    let has = |wanted: &str| lines.iter().any(|line| line.trim() == wanted);
-    if has(&busy) {
-        Some(FallbackReason::Busy)
-    } else if has(&tools) {
-        Some(FallbackReason::Tools)
-    } else {
-        None
+/// A line the box says on a run call's standard error for the client alone, besides its heartbeat: the start marker
+/// said just before the command starts, or a refusal tag and the fallback reason it names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Protocol {
+    Started,
+    Refused(FallbackReason),
+}
+
+/// The start marker and the two refusal tags of one run, made once for its run call's readers.
+struct ProtocolLines {
+    started: String,
+    busy: String,
+    tools: String,
+}
+
+impl ProtocolLines {
+    /// The lines of the run whose nonce is `nonce`.
+    fn new(nonce: &str) -> ProtocolLines {
+        ProtocolLines {
+            started: started_line(nonce),
+            busy: refused_line(nonce, Refusal::Busy),
+            tools: refused_line(nonce, Refusal::Tools),
+        }
+    }
+
+    /// What `line`, compared as a whole line, is of the run: its start marker or one of its refusal tags; `None` for
+    /// any other line, another run's marker or tag included, as for a command's own line.
+    fn of(&self, line: &str) -> Option<Protocol> {
+        if line == self.started {
+            Some(Protocol::Started)
+        } else if line == self.busy {
+            Some(Protocol::Refused(FallbackReason::Busy))
+        } else if line == self.tools {
+            Some(Protocol::Refused(FallbackReason::Tools))
+        } else {
+            None
+        }
     }
 }
 
@@ -1500,8 +1593,8 @@ mod tests {
     use gate_win32::{Interrupt, PipedConsole};
 
     use super::{
-        Attempt, CallEnd, Called, Cut, Echo, End, GIT_SSH_FAILED, Heard, LINE_CAP, Limits, Loss, Reader, Reading, SSH_FAILED, Shared, Unfinished,
-        Watch, after_loss, boot_time, called_of, console_of, held, is_heartbeat, last_update, paused, push_size, refusal, relay, seconds,
+        Attempt, CallEnd, Called, Cut, Echo, End, GIT_SSH_FAILED, Heard, LINE_CAP, Limits, Loss, ProtocolLines, Reader, Reading, SSH_FAILED, Shared,
+        Unfinished, Watch, after_loss, boot_time, called_of, console_of, held, is_heartbeat, last_update, paused, push_size, relay, seconds,
         their_version, version_refusal,
     };
     use crate::remote::git::GIT_LIMIT;
@@ -1509,7 +1602,7 @@ mod tests {
     use crate::remote::snapshot::Snapshot;
     use crate::remote::transport::Local;
     use crate::remote::watchdog::Kill;
-    use crate::remote::{RemoteCall, busy_line};
+    use crate::remote::{Refusal, RemoteCall, busy_line, refused_line, started_line};
     use crate::run::CONTROL_C_EXIT;
 
     /// A state root no gate uses; no test here takes its key's lock.
@@ -1581,6 +1674,8 @@ mod tests {
             last_error: Some(first_error.to_owned()),
             lines: vec![first_error.to_owned()],
             outputs_line: None,
+            started: false,
+            refused: None,
         }
     }
 
@@ -1634,13 +1729,13 @@ mod tests {
     fn the_outputs_line_survives_a_stdout_flood_after_it() {
         let mut heard = Heard::default();
         let line = "gate-remote-outputs: 2 app-1a2b3c4d-0123456789abcdef0123456789abcdef.tar.zst";
-        heard.record("gate-remote-outputs: 0", false);
-        heard.record(line, true);
+        heard.record("gate-remote-outputs: 0", false, None);
+        heard.record(line, true, None);
         for number in 0..1500 {
-            heard.record(&format!("build output {number}"), false);
+            heard.record(&format!("build output {number}"), false, None);
         }
-        heard.record("gate-remote-outputs: 0", false);
-        heard.record("gate: remote said something else", true);
+        heard.record("gate-remote-outputs: 0", false, None);
+        heard.record("gate: remote said something else", true, None);
 
         let called = called_of(CallEnd::Exited(0), false, heard).expect("a call that ended");
 
@@ -1693,7 +1788,11 @@ mod tests {
         let input = format!("{updates}Receiving objects: 100%, done.\r\n");
         for echo in [Echo::Progress, Echo::Unlogged] {
             let shared = Shared::new();
-            let reading = Reading { echo, capped: true };
+            let reading = Reading {
+                echo,
+                capped: true,
+                lines: None,
+            };
 
             relay(input.as_bytes(), Reader::new(true, reading, None), &shared);
 
@@ -1762,9 +1861,107 @@ mod tests {
     fn read_through(input: &[u8], capped: bool, log: Option<&Path>) -> Shared {
         let shared = Shared::new();
         let file = log.map(|path| std::fs::File::create(path).expect("the log can be made"));
-        let reading = Reading { echo: Echo::LogOnly, capped };
+        let reading = Reading {
+            echo: Echo::LogOnly,
+            capped,
+            lines: None,
+        };
         relay(input, Reader::new(true, reading, file), &shared);
         shared
+    }
+
+    /// The nonce of the run the protocol cases read.
+    const NONCE: &str = "0123456789abcdef0123456789abcdef";
+
+    /// The run call of the run whose nonce is [`NONCE`] that said `stdout` and `stderr` and exited 75, each stream read
+    /// as the run call reads it; with what its readers wrote to the log, which a line it passes on reaches as it reaches
+    /// the console.
+    fn run_call_said(stdout: &str, stderr: &str, test: &str) -> (Called, String) {
+        let log = std::env::temp_dir().join(format!("gate-client-protocol-{}-{test}.log", std::process::id()));
+        let shared = Shared::new();
+        let reading = Reading {
+            echo: Echo::LogOnly,
+            capped: false,
+            lines: Some(std::sync::Arc::new(ProtocolLines::new(NONCE))),
+        };
+        let file = std::fs::File::create(&log).expect("the log can be made");
+        let other = file.try_clone().expect("the log can be shared");
+        relay(stdout.as_bytes(), Reader::new(false, reading.clone(), Some(other)), &shared);
+        relay(stderr.as_bytes(), Reader::new(true, reading, Some(file)), &shared);
+        let heard = std::mem::take(&mut *held(&shared.heard));
+        let called = called_of(CallEnd::Exited(75), false, heard).expect("a call that ended");
+        let said = std::fs::read_to_string(&log).expect("the log can be read");
+        std::fs::remove_file(&log).expect("the log can be removed");
+        (called, said)
+    }
+
+    #[test]
+    fn a_refusal_is_read_from_this_run_s_tag_on_standard_error_alone() {
+        let busy = busy_line("app-1a2b3c4d");
+        let tools = "gate: remote work folder app-1a2b3c4d could not restore its dotnet tools";
+        let busy_tag = refused_line(NONCE, Refusal::Busy);
+        let tools_tag = refused_line(NONCE, Refusal::Tools);
+        let marker = started_line(NONCE);
+        let other = refused_line("fedcba9876543210fedcba9876543210", Refusal::Busy);
+        let cases: [(&str, String, String, Option<FallbackReason>); 10] = [
+            ("busy", String::new(), format!("{busy_tag}\n{busy}\n"), Some(FallbackReason::Busy)),
+            (
+                "busy-crlf",
+                String::new(),
+                format!("{busy_tag}\r\n{busy}\r\n"),
+                Some(FallbackReason::Busy),
+            ),
+            ("after-marker-crlf", String::new(), format!("{marker}\r\n{busy_tag}\r\n{busy}\r\n"), None),
+            ("tools", String::new(), format!("{tools_tag}\n{tools}\n"), Some(FallbackReason::Tools)),
+            ("untagged-busy", String::new(), format!("{busy}\n"), None),
+            ("untagged-tools", String::new(), format!("{tools}\n"), None),
+            ("stdout", format!("{busy_tag}\n"), format!("{busy}\n"), None),
+            ("other-nonce", String::new(), format!("{other}\n{busy}\n"), None),
+            ("after-marker", String::new(), format!("{marker}\n{busy_tag}\n{busy}\n"), None),
+            ("padded", String::new(), format!("{busy_tag} \n{busy}\n"), None),
+        ];
+        for (name, stdout, stderr, refused) in cases {
+            let (called, _) = run_call_said(&stdout, &stderr, name);
+            assert_eq!(called.refusal(), refused, "{name}");
+        }
+    }
+
+    #[test]
+    fn the_start_marker_and_the_refusal_tags_are_kept_out_of_the_log_and_the_lines() {
+        let busy = busy_line("app-1a2b3c4d");
+        let busy_tag = refused_line(NONCE, Refusal::Busy);
+        let marker = started_line(NONCE);
+
+        let (refused, said) = run_call_said("", &format!("{busy_tag}\n{busy}\n"), "hidden-tag");
+        assert_eq!(said, format!("{busy}\n"), "the tag is not passed on");
+        assert_eq!(refused.lines, std::slice::from_ref(&busy), "nor kept");
+
+        let (started, said) = run_call_said("out\n", &format!("{marker}\nerr\n"), "hidden-marker");
+        assert!(started.started, "the marker is heard");
+        assert_eq!(said.lines().collect::<Vec<_>>().len(), 2, "{said:?}");
+        assert!(!said.contains("gate-remote-started"), "the marker is not passed on: {said:?}");
+        assert!(!started.lines.contains(&marker), "nor kept: {:?}", started.lines);
+
+        let (crlf, said) = run_call_said("", &format!("{marker}\r\n"), "hidden-marker-crlf");
+        assert!(crlf.started, "a marker ended CR LF is heard");
+        assert_eq!(said, "", "and not passed on");
+
+        let other = started_line("fedcba9876543210fedcba9876543210");
+        let (another, said) = run_call_said("", &format!("{other}\n"), "another-marker");
+        assert!(!another.started, "another run's marker is a line like any other");
+        assert_eq!(said, format!("{other}\n"), "and is passed on");
+    }
+
+    #[test]
+    fn a_run_call_whose_box_said_the_start_marker_never_failed_before_the_banner() {
+        let marker = started_line(NONCE);
+        let (mut called, _) = run_call_said("", &format!("Connection timed out during banner exchange\n{marker}\n"), "banner-words");
+        called.status = SSH_FAILED;
+        assert!(!called.before_the_banner(SSH_FAILED), "the command's own banner words, after the marker");
+
+        let (mut unmarked, _) = run_call_said("", "Connection timed out during banner exchange\n", "banner-unmarked");
+        unmarked.status = SSH_FAILED;
+        assert!(unmarked.before_the_banner(SSH_FAILED), "ssh's own words, with no marker");
     }
 
     #[test]
@@ -1845,7 +2042,10 @@ mod tests {
 
         assert!(matches!(attempt.preflight(&location), Err(End::Interrupted)), "the preflight");
         assert!(matches!(attempt.push(&snapshot, false), Err(End::Interrupted)), "the push");
-        assert!(matches!(attempt.run_call("line", &location, None), Err(End::Interrupted)), "the run call");
+        assert!(
+            matches!(attempt.run_call("line", &location, None, NONCE), Err(End::Interrupted)),
+            "the run call"
+        );
         let outcome = attempt.outcome(End::Interrupted);
         assert_eq!(outcome.status, i64::from(CONTROL_C_EXIT.cast_signed()), "{outcome:?}");
         assert!(outcome.lines.is_empty(), "an interrupt says no failure line: {outcome:?}");
@@ -1884,9 +2084,11 @@ mod tests {
     }
 
     #[test]
-    fn the_box_s_busy_line_is_the_one_its_refusal_is_read_from() {
+    fn the_box_s_protocol_lines_name_the_run_s_nonce() {
         assert_eq!(busy_line("app-1a2b3c4d"), "gate: remote work folder app-1a2b3c4d is busy");
-        assert_eq!(refusal("app-1a2b3c4d", &lines(&[&busy_line("app-1a2b3c4d")])), Some(FallbackReason::Busy));
+        assert_eq!(started_line(NONCE), format!("gate-remote-started: {NONCE}"));
+        assert_eq!(refused_line(NONCE, Refusal::Busy), format!("gate-remote-refused: {NONCE} busy"));
+        assert_eq!(refused_line(NONCE, Refusal::Tools), format!("gate-remote-refused: {NONCE} tools"));
     }
 
     #[test]
@@ -1900,33 +2102,6 @@ mod tests {
 
     fn lines(texts: &[&str]) -> Vec<String> {
         texts.iter().map(|text| (*text).to_owned()).collect()
-    }
-
-    #[test]
-    fn only_the_box_s_own_line_makes_a_75_a_refusal() {
-        let key = "app-1a2b3c4d";
-        assert_eq!(
-            refusal(key, &lines(&["out", "gate: remote work folder app-1a2b3c4d is busy"])),
-            Some(FallbackReason::Busy)
-        );
-        assert_eq!(
-            refusal(
-                key,
-                &lines(&["gate: remote work folder app-1a2b3c4d could not restore its dotnet tools  "])
-            ),
-            Some(FallbackReason::Tools)
-        );
-        assert_eq!(refusal(key, &lines(&["the command exits 75 itself"])), None, "a command's own 75");
-        assert_eq!(
-            refusal(key, &lines(&["gate: remote work folder other-00000000 is busy"])),
-            None,
-            "another work folder's line"
-        );
-        assert_eq!(
-            refusal(key, &lines(&["x gate: remote work folder app-1a2b3c4d is busy"])),
-            None,
-            "the whole line"
-        );
     }
 
     #[test]
@@ -2167,7 +2342,12 @@ mod tests {
                 (&apart[..], "the return in the next chunk"),
             ] {
                 let shared = Shared::new();
-                let mut reader = Reader::new(true, Reading { echo, capped: true }, None);
+                let reading = Reading {
+                    echo,
+                    capped: true,
+                    lines: None,
+                };
+                let mut reader = Reader::new(true, reading, None);
                 for (part, ended) in chunks {
                     if !reader.take(part, *ended, &shared) {
                         break;

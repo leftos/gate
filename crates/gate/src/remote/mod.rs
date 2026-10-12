@@ -47,9 +47,47 @@ const FAILED: i64 = 1;
 #[cfg(feature = "test-seams")]
 const FAILED_RUN: &str = "gate: the remote run failed";
 
-/// The line the box says when another run holds the work folder `key`, which the client reads its refusal from.
+/// The line the box says when another run holds the work folder `key`, just after its refusal tag.
 pub(crate) fn busy_line(key: &str) -> String {
     format!("gate: remote work folder {key} is busy")
+}
+
+/// Why the box refused a run, as its refusal tag names it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Refusal {
+    /// Another run holds the work folder.
+    Busy,
+    /// The work folder's dotnet tools could not be restored.
+    Tools,
+}
+
+impl Refusal {
+    /// The word the refusal tag names it by.
+    fn word(self) -> &'static str {
+        match self {
+            Refusal::Busy => "busy",
+            Refusal::Tools => "tools",
+        }
+    }
+}
+
+/// The start marker the box says on stderr just before it starts the command of the run whose payload carries `nonce`:
+/// `gate-remote-started: <nonce>`. A call that said it is past the banner, so the client never makes it again.
+///
+/// The nonce only tells runs apart: it is no secret, as it is on the box's and ssh's command lines. That a command
+/// cannot forge a refusal rests on the box saying this line before it creates the command's process, and on the
+/// client ignoring every refusal tag once it has seen this line, whatever order the two came in.
+pub(crate) fn started_line(nonce: &str) -> String {
+    format!("gate-remote-started: {nonce}")
+}
+
+/// The refusal tag the box says on stderr just before the human line of a refusal of the run whose payload carries
+/// `nonce`: `gate-remote-refused: <nonce> busy|tools`. The client reads a refusal from this line alone.
+///
+/// The nonce is no secret, as [`started_line`] says: a command can say this line too, and the client ignores it
+/// because the box's start marker came before anything the command says.
+pub(crate) fn refused_line(nonce: &str, refusal: Refusal) -> String {
+    format!("gate-remote-refused: {nonce} {}", refusal.word())
 }
 
 /// What runs a routed command on the builder.

@@ -13,6 +13,7 @@ use std::fs::OpenOptions;
 use std::io::{self, Read, Write};
 use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::PoisonError;
 
 use sha2::{Digest, Sha256};
 
@@ -28,6 +29,7 @@ use crate::boxside::run::{
 use crate::boxside::stop::{restore_job_name, terminate_and_wait};
 use crate::console::Console;
 use crate::environment::Variables;
+use crate::remote::{Refusal, refused_line};
 use crate::run::{ERROR_FILE_NOT_FOUND, Written, written};
 
 /// The manifest names `dotnet` reads in one folder, the one under `.config` first, as `dotnet` looks for them.
@@ -39,8 +41,7 @@ const HEX: &[u8; 16] = b"0123456789abcdef";
 /// What the box does instead when it cannot read the stop signal just before it starts the restore.
 const STARTING_RESTORE: &str = "starting the restore";
 
-/// The line the box says when the work folder `key` could not restore its dotnet tools; the client reads its refusal
-/// reason from it.
+/// The line the box says when the work folder `key` could not restore its dotnet tools, just after its refusal tag.
 pub(crate) fn tools_line(key: &str) -> String {
     format!("gate: remote work folder {key} could not restore its dotnet tools")
 }
@@ -272,7 +273,12 @@ pub(crate) fn update(request: &Request<'_>, work: &Path, place: &Path, beat: &Be
         return write_record(&record, &digest, console);
     }
     console.err(&format!("gate: remote tool restore failed (status {status})"));
-    console.err(&tools_line(request.key));
+    {
+        // Held across both lines, so no heartbeat lands between the tag and the line it tags.
+        let _held = beat.lock.lock().unwrap_or_else(PoisonError::into_inner);
+        console.err(&refused_line(request.nonce, Refusal::Tools));
+        console.err(&tools_line(request.key));
+    }
     Err(REFUSED_STATUS)
 }
 

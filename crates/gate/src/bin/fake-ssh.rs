@@ -19,7 +19,7 @@
 //! `Connection timed out during banner exchange` on standard error and exits 255; `fail-other` writes another first line
 //! there and exits 255; `out-then-drop` writes a line on standard output and exits 255; `exit <n>` runs nothing and
 //! exits `<n>`, as cmd's 9009 for a program it cannot find; `say-exit <n> <line>` runs nothing, writes the line on
-//! standard error and exits `<n>`, as the box says its own refusal; `flood <n>` runs nothing, writes `<n>` bytes of `x`
+//! standard error and exits `<n>`, as a call that fails with a line of its own does; `flood <n>` runs nothing, writes `<n>` bytes of `x`
 //! and no line end on standard error, which git passes through as its own, and exits 0; `say-hold <word> <path>` writes
 //! the word as a line on standard output, then does as `hold <path>`; `progress-ok <n>` writes at least `<n>` bytes of
 //! short progress updates, each ended by a carriage return, and a line end on standard error, then does as `ok`;

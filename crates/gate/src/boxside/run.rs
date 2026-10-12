@@ -39,6 +39,7 @@ use crate::boxside::tools;
 use crate::console::Console;
 use crate::environment::Variables;
 use crate::outputs::manifest::{Listing, Manifest};
+use crate::remote::{Refusal, refused_line, started_line};
 use crate::run::{Written, find_program, written};
 
 /// The status of a run refused: another run holds the work folder, or the work folder's dotnet tools could not be
@@ -91,6 +92,8 @@ pub(super) struct Request<'a> {
     identity: Vec<(String, String)>,
     /// The outputs the run brings back, `None` when it has no output globs.
     outputs: Option<Asked<'a>>,
+    /// The run's `Nonce`, which its start marker and its refusal tags name.
+    pub(super) nonce: &'a str,
 }
 
 impl Request<'_> {
@@ -98,15 +101,12 @@ impl Request<'_> {
         // The snapshot first, as the wrapper refuses a payload without one before the lock or the checkout.
         let snapshot = payload.snapshot()?;
         let (key, work) = payload.work_folder()?;
-        let outputs = Asked::new(
-            &payload.output_globs()?,
-            payload.outputs_full()?,
-            key,
-            payload.nonce()?,
-            payload.output_folder(work)?,
-        )?;
+        let (globs, full) = (payload.output_globs()?, payload.outputs_full()?);
+        let nonce = payload.nonce()?;
+        let outputs = Asked::new(&globs, full, key, nonce, payload.output_folder(work)?)?;
         Ok(Request {
             outputs,
+            nonce,
             key,
             snapshot,
             bare: payload.path("Bare")?,
@@ -158,6 +158,7 @@ pub(crate) fn run(payload: &Payload, seams: &BoxSeams, console: &mut Console) ->
     let _lock = match take_lock(request.lock) {
         Ok(Some(lock)) => lock,
         Ok(None) => {
+            console.err(&refused_line(request.nonce, Refusal::Busy));
             console.err(&crate::remote::busy_line(request.key));
             return REFUSED_STATUS;
         }
@@ -528,6 +529,7 @@ fn command(request: &Request<'_>, place: &Path, beat: &Beat<'_>, console: &mut C
         stop: &beat.stop,
         word,
         program: &program,
+        nonce: request.nonce,
     };
     let launched = match start_command(&mut start, donor.as_ref().map_err(String::as_str), beat, console) {
         Ok(launched) => launched,
@@ -541,13 +543,15 @@ fn command(request: &Request<'_>, place: &Path, beat: &Beat<'_>, console: &mut C
     watched
 }
 
-/// The command to start: its launch, its job and the job's stop signal, and the word and program a start failure names.
+/// The command to start: its launch, its job and the job's stop signal, the word and program a start failure names, and
+/// the run's nonce its start marker names.
 struct Start<'a> {
     launch: PipedLaunch,
     job: &'a Job,
     stop: &'a StopSignal<'a>,
     word: &'a str,
     program: &'a Path,
+    nonce: &'a str,
 }
 
 /// A command started in its job, and the read ends of its pipes.
@@ -567,9 +571,13 @@ fn console_donor(job: &Job, seams: &BoxSeams) -> Result<Donor, String> {
 /// Starts the command on `donor`'s UTF-8 console, or, when the console cannot be had (`donor` may say why none
 /// started), on the plain hidden console, which is said and never fails the run. A stop signalled before the command
 /// is resumed keeps it from starting ([`launch`]), which stops the job and fails the run with status 1. What the launch
-/// has to say is said once it is over and the box is home ([`Ended::say`]). The command started, or the run's answer:
-/// `Ok(127)` for a command that could not be started, `Err` with the status of the box's own failure, its line said.
+/// has to say is said once it is over and the box is home ([`Ended::say`]). The start marker is said first, before the
+/// launch and while the box is home, so the client hears it before any output of the command; a launch then refused or
+/// stopped has said it too, which only keeps the client from making the call again. The command started, or the run's
+/// answer: `Ok(127)` for a command that could not be started, `Err` with the status of the box's own failure, its line
+/// said.
 fn start_command(start: &mut Start<'_>, donor: Result<&Donor, &str>, beat: &Beat<'_>, console: &mut Console) -> Result<Launched, Result<u32, u32>> {
+    beat.say(console, &started_line(start.nonce));
     let ended = match donor {
         Ok(donor) => on_utf8_console(start, donor, beat, console),
         Err(reason) => Ended {
