@@ -30,7 +30,7 @@ pub(crate) const GIT_LIMIT: Duration = Duration::from_secs(60);
 const GIT_POLL: Duration = Duration::from_millis(5);
 /// The most of its standard output a call through [`Git::output`] is read for, as the sync-back's calls read the
 /// builder's file lists: one that writes more fails.
-const OUTPUT_CAP: usize = 16 * 1024 * 1024;
+pub(crate) const OUTPUT_CAP: usize = 16 * 1024 * 1024;
 /// The most of the end of its standard error a call through [`Git::output`] keeps for its failure line, which carries
 /// at most [`FAILURE_LINES`] and [`FAILURE_BYTES`] of it.
 const ERRORS_KEPT: usize = 64 * 1024;

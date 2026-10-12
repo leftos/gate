@@ -47,8 +47,8 @@ Suite = `crates/gate/tests/suite/` (binary `suite`, needs `--all-features`; test
 | bin/fake-ssh.rs | `remote_client` (`--test-remote-ssh`), `push` (`--test-push-ssh`), `routing`? (no) | no: remote_client, push |
 | remote/mod.rs | `routing` (scripted client `--test-remote-client`, fallback reason `client`), `bridge`, `remote_client` | no: routing, bridge, remote_client |
 | remote/bridge.rs | `bridge` (`--test-remote-script`, `--test-bridge`), `routing` (5 uses of `--test-remote-script`), `request` (print only) | no: bridge, routing |
-| remote/{client,parity,retry,transport,watchdog,syncback,outputs,install,payload,snapshot}.rs | `remote_client` (`--test-remote-transport local:`, `--test-local-sdks`, `--test-remote-ssh`, `--test-remote-snapshot`, `--test-remote-watch-call`, `--test-remote-timeout-ms`, `--test-remote-fetch-cap-bytes`...), `syncback_quarantine` (the sync-back's quarantine, move and sweep); `transport.rs` ssh words + `Ssh::find` also `push`; `payload.rs` is what `boxside` payload tests read through `local:` builder | no: remote_client, syncback_quarantine (+ push for transport.rs, + boxside for payload.rs/outputs.rs) |
-| remote/{git,launch}.rs | `remote_client` (`--test-git`), `routing` (`--test-git`, route facts), `syncback_quarantine` (`Call.set`, the sync-back's git environment), `request` | no: remote_client, routing, syncback_quarantine |
+| remote/{client,parity,retry,transport,watchdog,syncback,outputs,install,payload,snapshot}.rs | `remote_client` (`--test-remote-transport local:`, `--test-local-sdks`, `--test-remote-ssh`, `--test-remote-snapshot`, `--test-remote-watch-call`, `--test-remote-timeout-ms`, `--test-remote-fetch-cap-bytes`...), `syncback_quarantine` (the sync-back's quarantine, move and sweep), `syncback_conversions` (the checkout-filter refusal, the `.lfsconfig` and spelled names, the weighted apply cap; a `test-seams` build feeds `check-attr` about two paths at a time); `transport.rs` ssh words + `Ssh::find` also `push`; `payload.rs` is what `boxside` payload tests read through `local:` builder | no: remote_client, syncback_quarantine, syncback_conversions (+ push for transport.rs, + boxside for payload.rs/outputs.rs) |
+| remote/{git,launch}.rs | `remote_client` (`--test-git`), `routing` (`--test-git`, route facts), `syncback_quarantine` (`Call.set`, the sync-back's git environment), `syncback_conversions` (`OUTPUT_CAP` bounds the `check-attr` slices), `request` | no: remote_client, routing, syncback_quarantine, syncback_conversions |
 | boxside/mod.rs, payload.rs, preflight.rs, boot.rs, run.rs, stop.rs | `boxside` (29 flag/verb uses; the case runs `gate box boot/preflight/run/stop`), `remote_client` (builder is `gate box` via `local:`) | no: boxside, remote_client |
 | boxside/heartbeat.rs, forward.rs | `boxside` (`--test-heartbeat-ms`), `remote_client` | no: boxside, remote_client |
 | boxside/tools.rs | `boxside` (dotnet tool restore, boxside.rs:1845) | no: boxside |
@@ -81,7 +81,7 @@ Suite = `crates/gate/tests/suite/` (binary `suite`, needs `--all-features`; test
 | gate-win32 priority.rs | `priority`, `critical`, `build_servers` | win32 `priority` | no |
 | gate-win32 tree.rs | `stop_tree`, `stall` (escaped processes), `interrupt`, `boxside` (stop), `burn` (`WaitableProcess`), `nesting` (`OpenedJob::holds`) | win32 `membership` | no |
 | gate-win32 interrupt.rs / event.rs | `interrupt`, `critical`, `cutover`, `routing`, `remote_client`, `boxside` (stop event), `slots` (wake) | win32 `interrupt`, `interrupt_again`, `event` | no |
-| gate-win32 file.rs | `syncback_quarantine`, `remote_client` (`move_no_replace` moves a sync-back's fetched objects) | win32 `file` | no |
+| gate-win32 file.rs | `syncback_quarantine`, `syncback_conversions`, `remote_client` (`move_no_replace` moves a sync-back's fetched objects) | win32 `file` | no |
 | gate-win32 device.rs | `routing` (subst drives in route facts) | - | no |
 | gate-win32 times.rs / memory.rs | `stall`, `ceiling`, `cores`, `pause` (samples) | - | no |
 | proc-table | `stop_tree`, `stall` (`parent_pid_of`) (imports `Win32ProcessTable`), `cutover` (`command_line_of`), `diagnostics`, `priority` (via servers/OtherGates), `stall`/`cores` (`ProcessTree::children` through the escaped walk) | proc-table unit | no |
@@ -123,7 +123,7 @@ Always add `checkout` to any change that touches a suite file or adds a seam.
 | route.rs | `-E 'binary(suite) and test(/^(routing\|remote_client\|bridge\|request)::/) or (U and test(/^route::/))'` |
 | remote/mod.rs | `-E 'binary(suite) and test(/^(routing\|bridge\|remote_client)::/) or (U and test(/^remote::/))'` |
 | remote/bridge.rs, tools/remote-bridge.ps1 | `-E 'binary(suite) and test(/^(bridge\|routing\|install)::/) or (U and test(/^remote::bridge::/))'` |
-| remote/{client,retry,watchdog,syncback,snapshot,outputs,install,payload,git,launch,transport}.rs | `-E 'binary(suite) and test(/^(remote_client\|routing\|syncback_quarantine)::/) or (U and test(/^remote::/))'`; add `push` for transport.rs, `boxside` for payload.rs/outputs.rs |
+| remote/{client,retry,watchdog,syncback,snapshot,outputs,install,payload,git,launch,transport}.rs | `-E 'binary(suite) and test(/^(remote_client\|routing\|syncback_quarantine\|syncback_conversions)::/) or (U and test(/^remote::/))'`; add `push` for transport.rs, `boxside` for payload.rs/outputs.rs |
 | boxside/{mod,payload,preflight,boot,run,stop,forward,heartbeat,tools}.rs | `-E 'binary(suite) and test(/^(boxside\|remote_client)::/) or (U and test(/^boxside::/))'` |
 | boxside/outputs.rs, outputs/* | `-E 'binary(suite) and test(/^(boxside::outputs\|remote_client)::/) or (U and test(/^(boxside::outputs\|outputs)::/))'` |
 | tools/gate.ps1 | `-E 'binary(suite) and test(/^(launcher\|cutover\|checkout)::/)'` |
@@ -150,7 +150,7 @@ Always add `checkout` to any change that touches a suite file or adds a seam.
 | gate-win32 priority | `-E 'package(gate-win32) or (binary(suite) and test(/^(priority\|critical\|build_servers)::/))'` |
 | gate-win32 tree | `-E 'package(gate-win32) or (binary(suite) and test(/^(stop_tree\|stall\|interrupt\|boxside\|burn\|nesting)::/))'` |
 | gate-win32 interrupt/event | `-E 'package(gate-win32) or (binary(suite) and test(/^(interrupt\|critical\|cutover\|routing\|remote_client\|boxside\|slots)::/))'` |
-| gate-win32 file | `-E 'package(gate-win32) or (binary(suite) and test(/^(syncback_quarantine\|remote_client)::/))'` |
+| gate-win32 file | `-E 'package(gate-win32) or (binary(suite) and test(/^(syncback_quarantine\|syncback_conversions\|remote_client)::/))'` |
 | gate-win32 device | `-E 'package(gate-win32) or (binary(suite) and test(/^routing::/))'` |
 | gate-win32 times/memory | `-E 'package(gate-win32) or (binary(suite) and test(/^(stall\|ceiling\|cores\|pause)::/))'` |
 | proc-table | `-E 'package(proc-table) or (binary(suite) and test(/^(stop_tree\|stall\|cutover\|diagnostics\|priority)::/))'` (`rdeps(proc-table)` would pull gate-state and all of gate) |

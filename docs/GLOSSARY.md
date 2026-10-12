@@ -24,6 +24,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Builders list**: the builders `gate push` reaches: `host` of `remote.json`, then each entry of its optional `hosts` in file order, an entry equal to an earlier one in any letter case skipped. Routing uses `host` alone.
 - **Burn**: `gate burn`, one process that spins a number of threads on the CPU for a set time at the priority it inherited, taking no slot; the load-burn tool runs it inside a critical gate.
 - **Ceiling**: the `--timeout` limit, counted in load-adjusted seconds; passing it kills the command as TIMED OUT.
+- **Checkout filter**: a `filter` driver (or `ident`) that a path's git attributes put its worktree file through; a sync-back that writes or deletes such a path is refused, since `git apply` would run the user's filter program on it.
 - **Claim**: the JSON file `slots\<name>.json` a gate writes while it holds a slot, naming its pid, command, log and ceiling.
 - **Compatibility layer**: `gate.exe`'s acceptance of the PowerShell gate's argument form (`-Log`, `-TimeoutSeconds`, `-Slot` and the rest), kept until no caller uses it.
 - **Confirmation window**: the 5 s across which every scan of the cutover's drain must find no PowerShell gate before it ends, because the PowerShell gate deletes its ticket when it takes a slot and writes its claim up to about 2 s later; a scan that finds a gate resets it.

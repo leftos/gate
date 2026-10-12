@@ -1,9 +1,12 @@
 //! The client's sync-back: after a run call that ended with the command's own status, the changes the command left on
 //! the builder are fetched from `refs/gate-back/<key>` and applied to the worktree when it still matches the snapshot.
 //! The builder is trusted less than this PC. A fetched commit that is not the one the builder advertised, or that was
-//! not made from this snapshot, is ignored. One that touches a `.git*` path or makes a link or a submodule, one whose
-//! files would write more than the apply cap into the worktree, or one the worktree changed under during the run, is
-//! kept at `refs/gate-remote/<key>-back` and fails a run that had passed; one that a step before its apply could not
+//! not made from this snapshot, is ignored. One that touches a `.git*` path or a `.lfsconfig` or makes a link or a
+//! submodule, one that writes or deletes a path the worktree's attributes give a checkout filter or `ident`, one whose
+//! files would write more than the apply cap into the worktree (a file the checkout converts to CRLF counted twice, one
+//! with a `working-tree-encoding` four times, and one with both eight), or one the worktree changed under during the
+//! run, is kept at
+//! `refs/gate-remote/<key>-back` and fails a run that had passed; one that a step before its apply could not
 //! take further, as it failed or was interrupted, is kept there too, and the line that ends the run says where to see
 //! its changes. A fetch whose job writes more than the fetch cap is stopped and fails a run that had passed, the
 //! changes left on the builder and nothing applied.
@@ -43,6 +46,12 @@ const LINK_MODES: [&str; 2] = ["120000", "160000"];
 const REGULAR_MODE: &str = "100";
 /// What the name of a path's component starts with, its letter case aside, when git reads the file itself.
 const GIT_NAME: &str = ".git";
+/// The name of the file git-lfs reads its settings from in the worktree, its server's URL among them.
+const LFS_CONFIG: &str = ".lfsconfig";
+/// The name every `.git*` name starts with as an 8.3 alias reads it: upper case, its dot removed.
+const GIT_ALIAS: &str = "GIT";
+/// [`LFS_CONFIG`] as an 8.3 alias reads it: upper case, its dot removed.
+const LFS_ALIAS: &str = "LFSCONFIG";
 
 /// Fetches and applies the builder's changes for `snapshot`, or ends the run as `status` when there is nothing to do,
 /// the run's own when the changes were ignored, and 1 when a passing run's changes could not be applied.
@@ -592,29 +601,42 @@ fn refused_end(attempt: &mut Attempt<'_, '_>, git: &Git, back: &Back<'_>, said: 
 }
 
 /// Why `back` is kept rather than applied: the line said for a back commit that touches what a sync-back never writes,
-/// for one whose files would write more than the apply cap into the worktree, or for one the worktree changed under
-/// during the run; `None` when it may be applied.
+/// for one that writes, or deletes, a path through a checkout filter or `ident`, for one whose files would write more
+/// than the apply cap into the worktree, or for one the worktree changed under during the run; `None` when it may be
+/// applied.
 fn refusal(attempt: &Attempt<'_, '_>, git: &Git, snapshot: &Snapshot, back: &Back<'_>) -> Result<Option<String>, End> {
     let set = back.quarantine.env();
     let listing = git_call(attempt, git, &["diff-tree", "-r", "-z", "--raw", &snapshot.commit, back.commit], &set)?;
     if let Some(path) = forbidden(&listing) {
         return Ok(Some(touched_line(&path, &snapshot.commit, back.commit)));
     }
-    let size = written_size(attempt, git, &listing, &set)?;
+    let paths = listed_paths(&listing);
+    let attributes = attributes(attempt, git, &paths)?;
+    let config = if paths.is_empty() {
+        String::new()
+    } else {
+        git_call(attempt, git, &["config", "-z", "--list"], &[])?
+    };
+    if let Some((path, attribute)) = filtered(&paths, &attributes, names_odd_driver(&config)) {
+        return Ok(Some(filtered_line(path, &attribute, &snapshot.commit, back.commit)));
+    }
+    let written = written_blobs(&listing);
+    let weights = weights(&written, &attributes, LineEnds::of(&config));
+    let size = written_size(attempt, git, &written, &weights, &set)?;
     if let Some(line) = written_line(size, attempt.apply_cap, &snapshot.commit, back.commit) {
         return Ok(Some(line));
     }
     Ok(changed(attempt, git, snapshot)?.then(|| not_applied_line(&snapshot.commit, back.commit)))
 }
 
-/// The bytes the files the back commit's `diff-tree -r -z --raw` `listing` writes total, each path counted: the sizes
-/// of their blobs, asked of one `git cat-file --batch-check=%(objectsize)` given the variables `set` and fed their ids.
-/// An answer that is not a size for each of them is the run's failure.
-fn written_size(attempt: &Attempt<'_, '_>, git: &Git, listing: &str, set: &[(&str, &OsStr)]) -> Result<u64, End> {
-    let blobs = written_blobs(listing);
-    if blobs.is_empty() {
+/// The bytes the files `written` write into the worktree total, each path counted: the sizes of their blobs, asked of
+/// one `git cat-file --batch-check=%(objectsize)` given the variables `set` and fed their ids, each times its weight in
+/// `weights`. An answer that is not a size for each of them is the run's failure.
+fn written_size(attempt: &Attempt<'_, '_>, git: &Git, written: &[Written<'_>], weights: &[u64], set: &[(&str, &OsStr)]) -> Result<u64, End> {
+    if written.is_empty() {
         return Ok(0);
     }
+    let blobs: Vec<&str> = written.iter().map(|file| file.id).collect();
     let ids: String = blobs.iter().flat_map(|id| [*id, "\n"]).collect();
     let args = ["cat-file", "--batch-check=%(objectsize)"];
     let call = git::Call {
@@ -624,18 +646,309 @@ fn written_size(attempt: &Attempt<'_, '_>, git: &Git, listing: &str, set: &[(&st
         ..git::Call::plain(Path::new(attempt.call.root), &args, attempt.limit)
     };
     let answer = git.output(&call).map_err(escaped_end)?;
-    total(&answer, &blobs).map_err(|why| escaped_end(GitError::Failed(format!("git {} failed in {}: {why}", args.join(" "), attempt.call.root))))
+    total(&answer, &blobs, weights).map_err(|why| unreadable(attempt, &args, &why))
 }
 
-/// The blob ids of the files a back commit's `diff-tree -r -z --raw` `listing` writes, one per path in the listing's
-/// order: each path it adds or changes to a regular or executable file, so a blob two paths share is written, and
-/// counted, twice. A deletion, whose new id is all zeros, writes nothing.
-fn written_blobs(listing: &str) -> Vec<&str> {
-    entries(listing)
-        .into_iter()
-        .filter(|entry| entry.new_mode.starts_with(REGULAR_MODE) && !entry.new_id.bytes().all(|digit| digit == b'0'))
-        .map(|entry| entry.new_id)
+/// The run's failure for git with `args`, whose answer could not be read for `why`.
+fn unreadable(attempt: &Attempt<'_, '_>, args: &[&str], why: &str) -> End {
+    escaped_end(GitError::Failed(format!("git {} failed in {}: {why}", args.join(" "), attempt.call.root)))
+}
+
+/// One file a back commit writes: the id of the blob written there, and where its path stands among every path the
+/// listing names.
+struct Written<'a> {
+    id: &'a str,
+    at: usize,
+}
+
+/// The files a back commit's `diff-tree -r -z --raw` `listing` writes, one per path in the listing's order: each path
+/// it adds or changes to a regular or executable file, a rename's or a copy's destination, so a blob two paths share is
+/// written, and counted, twice. A deletion, whose new id is all zeros, writes nothing.
+fn written_blobs(listing: &str) -> Vec<Written<'_>> {
+    let mut written = Vec::new();
+    let mut at = 0;
+    for entry in entries(listing) {
+        let writes = entry.new_mode.starts_with(REGULAR_MODE) && !entry.new_id.bytes().all(|digit| digit == b'0');
+        if writes && !entry.paths.is_empty() {
+            written.push(Written {
+                id: entry.new_id,
+                at: at + entry.paths.len() - 1,
+            });
+        }
+        at += entry.paths.len();
+    }
+    written
+}
+
+/// Every path a back commit's `diff-tree -r -z --raw` `listing` names, in its order: what it writes, what it deletes,
+/// and a rename's or a copy's source, each of which `git apply` reads from the worktree through its clean filter.
+fn listed_paths(listing: &str) -> Vec<&str> {
+    entries(listing).into_iter().flat_map(|entry| entry.paths).collect()
+}
+
+/// The attributes `git check-attr` is asked of each listed path, in the order it answers them.
+const ATTRIBUTES: [&str; 6] = ["filter", "ident", "working-tree-encoding", "text", "eol", "crlf"];
+/// The bytes `git check-attr -z` is allowed per attribute of a path beside the path itself: two NULs, the attribute's
+/// name and its value, with room to spare, so that each slice of paths it is fed answers well under the runner's cap.
+/// An answer that is larger even so fails closed: the runner's over-cap failure ends the run, the back commit kept.
+const ATTRIBUTE_ROOM: usize = 256;
+/// The bytes the answer of each slice of paths fed to `git check-attr` is planned within: the runner's cap.
+#[cfg(not(feature = "test-seams"))]
+const SLICE_CAP: usize = git::OUTPUT_CAP;
+/// The bytes the answer of each slice of paths fed to `git check-attr` is planned within, in a `test-seams` build: room
+/// for two paths of up to 32 bytes, so that a suite case's few files span slices.
+#[cfg(feature = "test-seams")]
+const SLICE_CAP: usize = 2 * ATTRIBUTES.len() * (32 + ATTRIBUTE_ROOM);
+/// What `git check-attr` says of an attribute no file sets, and of one a file unsets.
+const NOT_GIVEN: [&str; 2] = ["unspecified", "unset"];
+/// What the config keys of a filter driver named as `git check-attr` says of an attribute not given start with: a
+/// `filter` that reads so may name that driver.
+const ODD_DRIVERS: [&str; 2] = ["filter.unspecified.", "filter.unset."];
+/// How many times a path the checkout converts to CRLF is counted: each LF may become two bytes.
+const CRLF_WEIGHT: u64 = 2;
+/// How many times a path with a `working-tree-encoding` is counted: UTF-32 writes four bytes for each one.
+const ENCODED_WEIGHT: u64 = 4;
+
+/// The checkout attributes of one listed path, as `git check-attr` gives them: `unspecified`, `set`, `unset` or the
+/// value.
+#[derive(Debug, PartialEq, Eq)]
+struct Attributes {
+    filter: String,
+    ident: String,
+    encoding: String,
+    text: String,
+    eol: String,
+    crlf: String,
+}
+
+/// The worktree's attributes of each of `paths`, in its order, read by `git check-attr -z --stdin` in the worktree, so
+/// its own `.git/info/attributes` counts as the apply would read it, fed the paths in slices whose answers stay under
+/// the runner's cap. An answer that does not give each attribute of each path is the run's failure.
+fn attributes(attempt: &Attempt<'_, '_>, git: &Git, paths: &[&str]) -> Result<Vec<Attributes>, End> {
+    let args = [
+        "check-attr",
+        "-z",
+        "--stdin",
+        ATTRIBUTES[0],
+        ATTRIBUTES[1],
+        ATTRIBUTES[2],
+        ATTRIBUTES[3],
+        ATTRIBUTES[4],
+        ATTRIBUTES[5],
+    ];
+    let mut read = Vec::with_capacity(paths.len());
+    for slice in attribute_slices(paths, SLICE_CAP) {
+        let fed: String = slice.iter().flat_map(|path| [*path, "\0"]).collect();
+        let call = git::Call {
+            interrupt: attempt.call.interrupt,
+            stdin: Some(fed.as_bytes()),
+            ..git::Call::plain(Path::new(attempt.call.root), &args, attempt.limit)
+        };
+        let answer = git.output(&call).map_err(escaped_end)?;
+        read.extend(read_attributes(&answer, slice).map_err(|why| unreadable(attempt, &args, &why))?);
+    }
+    Ok(read)
+}
+
+/// `paths` cut into slices, in order, each holding as many paths as `git check-attr` can answer within `cap` bytes,
+/// [`ATTRIBUTE_ROOM`] allowed for each attribute beside the path; a path that alone needs more is a slice of its own.
+fn attribute_slices<'a>(paths: &'a [&'a str], cap: usize) -> Vec<&'a [&'a str]> {
+    let mut slices = Vec::new();
+    let mut rest = paths;
+    while !rest.is_empty() {
+        let mut used = 0_usize;
+        let count = rest
+            .iter()
+            .take_while(|path| {
+                used = used.saturating_add(ATTRIBUTES.len() * (path.len() + ATTRIBUTE_ROOM));
+                used <= cap
+            })
+            .count()
+            .max(1);
+        let (slice, after) = rest.split_at(count);
+        slices.push(slice);
+        rest = after;
+    }
+    slices
+}
+
+/// The attributes of each of `paths` from `git check-attr -z`'s `answer`: a `path`, attribute, value triple for each
+/// attribute of [`ATTRIBUTES`] of each path, in their order; else why the answer cannot be read.
+fn read_attributes(answer: &str, paths: &[&str]) -> Result<Vec<Attributes>, String> {
+    let mut fields = answer.split('\0');
+    let mut read = Vec::with_capacity(paths.len());
+    for path in paths {
+        let mut values = [""; ATTRIBUTES.len()];
+        for (value, name) in values.iter_mut().zip(ATTRIBUTES) {
+            match (fields.next(), fields.next(), fields.next()) {
+                (Some(said), Some(attribute), Some(given)) if said == *path && attribute == name => *value = given,
+                _ => return Err(format!("it did not answer {name} for {path}")),
+            }
+        }
+        let [filter, ident, encoding, text, eol, crlf] = values.map(str::to_owned);
+        read.push(Attributes {
+            filter,
+            ident,
+            encoding,
+            text,
+            eol,
+            crlf,
+        });
+    }
+    if fields.any(|field| !field.is_empty()) {
+        return Err(format!("it answered more than the {} path(s) it was asked", paths.len()));
+    }
+    Ok(read)
+}
+
+/// Whether an attribute `git check-attr` gave as `value` is set to anything: neither unspecified nor unset.
+fn is_given(value: &str) -> bool {
+    !NOT_GIVEN.contains(&value)
+}
+
+/// Whether the config `git config -z --list` gave as `listed` defines a filter driver named `unspecified` or `unset`,
+/// which a path's `filter` names in the words `git check-attr` says of an attribute not given.
+fn names_odd_driver(listed: &str) -> bool {
+    listed.split('\0').any(|entry| ODD_DRIVERS.iter().any(|start| entry.starts_with(start)))
+}
+
+/// The first of `paths`, in its order, that the apply would read or write through a checkout filter, with the
+/// attribute `attributes` gives it; `None` when no path is. `odd_driver` says whether the config defines a driver named
+/// as an attribute not given reads.
+fn filtered<'a>(paths: &[&'a str], attributes: &[Attributes], odd_driver: bool) -> Option<(&'a str, String)> {
+    paths
+        .iter()
+        .zip(attributes)
+        .find_map(|(path, given)| checkout_filter(given, odd_driver).map(|attribute| (*path, attribute)))
+}
+
+/// The checkout filter the attributes `given` set, as the refusal names it: `filter=<driver>`, `filter (no driver)` for
+/// a `filter` set with no value, or `ident` for any `ident` given; a `filter` not given counts as `filter=<what it
+/// reads>` when `odd_driver` says the config defines a driver of that name. `None` for no checkout filter.
+fn checkout_filter(given: &Attributes, odd_driver: bool) -> Option<String> {
+    match given.filter.as_str() {
+        "set" => return Some("filter (no driver)".to_owned()),
+        driver if is_given(driver) || odd_driver => return Some(format!("filter={driver}")),
+        _ => {}
+    }
+    is_given(&given.ident).then(|| "ident".to_owned())
+}
+
+/// How `core.autocrlf` is set: `true`, `input`, or false.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AutoCrlf {
+    True,
+    Input,
+    False,
+}
+
+/// The worktree's line-end config, as the checkout reads it: its `core.autocrlf`, and whether its `core.eol` writes
+/// CRLF, as `crlf`, `native` and no setting do in Git for Windows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LineEnds {
+    autocrlf: AutoCrlf,
+    eol_crlf: bool,
+}
+
+impl LineEnds {
+    /// The line ends `git config -z --list`'s `listed` sets, the last of each key winning as it does for git: a
+    /// `core.autocrlf` is read by [`auto_crlf`], and a `core.eol` that is not `lf` is taken to write CRLF.
+    fn of(listed: &str) -> LineEnds {
+        let mut autocrlf = AutoCrlf::False;
+        let mut eol_crlf = true;
+        for entry in listed.split('\0') {
+            let (key, value) = entry.split_once('\n').map_or((entry, None), |(key, value)| (key, Some(value)));
+            match key {
+                "core.autocrlf" => autocrlf = auto_crlf(value),
+                "core.eol" => eol_crlf = !value.is_some_and(|value| value.eq_ignore_ascii_case("lf")),
+                _ => {}
+            }
+        }
+        LineEnds { autocrlf, eol_crlf }
+    }
+
+    /// Whether a path the checkout takes as text is written with CRLF.
+    fn text_is_crlf(self) -> bool {
+        self.autocrlf == AutoCrlf::True || (self.autocrlf != AutoCrlf::Input && self.eol_crlf)
+    }
+}
+
+/// How `core.autocrlf`'s `value` sets it, failing toward true: `false`, `no`, `off`, an empty value or a number that
+/// is 0 is false, `input` is input, its letter case aside, and anything else, no value included, is true.
+fn auto_crlf(value: Option<&str>) -> AutoCrlf {
+    let Some(value) = value else {
+        return AutoCrlf::True;
+    };
+    let lower = value.to_ascii_lowercase();
+    match lower.as_str() {
+        "input" => AutoCrlf::Input,
+        "false" | "no" | "off" | "" => AutoCrlf::False,
+        number if number.parse::<i64>().is_ok_and(|number| number == 0) => AutoCrlf::False,
+        _ => AutoCrlf::True,
+    }
+}
+
+/// How many times each of `written` is counted toward the apply cap, in its order, by the attributes `attributes`
+/// gives every listed path, under the line-end config `ends`. A file whose attributes are missing counts as much as
+/// any can.
+fn weights(written: &[Written<'_>], attributes: &[Attributes], ends: LineEnds) -> Vec<u64> {
+    written
+        .iter()
+        .map(|file| attributes.get(file.at).map_or(ENCODED_WEIGHT * CRLF_WEIGHT, |given| weight(given, ends)))
         .collect()
+}
+
+/// How many times a path with the attributes `given` is counted under the line-end config `ends`: four times with a
+/// `working-tree-encoding`, twice when the checkout converts it to CRLF, and both multiplied when it does both.
+fn weight(given: &Attributes, ends: LineEnds) -> u64 {
+    let encoded = if is_given(&given.encoding) { ENCODED_WEIGHT } else { 1 };
+    let crlf = if converts_to_crlf(given, ends) { CRLF_WEIGHT } else { 1 };
+    encoded * crlf
+}
+
+/// What a path's `text` attribute, or its legacy `crlf` attribute when `text` is not given, makes of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Reading {
+    /// Set: text.
+    Text,
+    /// Unset: binary, never converted.
+    Binary,
+    /// `input`: text written with LF.
+    Input,
+    /// `auto`: text unless git detects binary, which is not done here.
+    Auto,
+    /// Neither, nor another value: `core.autocrlf` decides.
+    Undecided,
+}
+
+/// What the attribute value `value` makes of a path, as git reads `text` and `crlf`.
+fn text_of(value: &str) -> Reading {
+    match value {
+        "set" => Reading::Text,
+        "unset" => Reading::Binary,
+        "input" => Reading::Input,
+        "auto" => Reading::Auto,
+        _ => Reading::Undecided,
+    }
+}
+
+/// Whether the checkout may write a path with the attributes `given` with CRLF under the line-end config `ends`: its
+/// `eol` is `crlf`; else not when it is binary, `input` or its `eol` is `lf`; else, as text or `auto`, when the config
+/// writes text with CRLF, and when its text is undecided, when `core.autocrlf` is true.
+fn converts_to_crlf(given: &Attributes, ends: LineEnds) -> bool {
+    if given.eol == "crlf" {
+        return true;
+    }
+    let text = match text_of(&given.text) {
+        Reading::Undecided => text_of(&given.crlf),
+        text => text,
+    };
+    match text {
+        Reading::Binary | Reading::Input => false,
+        _ if given.eol == "lf" => false,
+        Reading::Text | Reading::Auto => ends.text_is_crlf(),
+        Reading::Undecided => ends.autocrlf == AutoCrlf::True,
+    }
 }
 
 /// One entry of a `diff-tree -r -z --raw` listing: the mode and the blob id it gives its path, each empty when its
@@ -672,16 +985,19 @@ fn entries(listing: &str) -> Vec<Entry<'_>> {
 }
 
 /// The bytes the blobs `blobs` total, from `cat-file --batch-check=%(objectsize)`'s `answer`, one line for each in
-/// their order, summed up to `u64::MAX` at most; else why the answer cannot be read: a line that is not a size, as
-/// `<id> missing` is not, or a line count other than the blobs'.
-fn total(answer: &str, blobs: &[&str]) -> Result<u64, String> {
+/// their order, each size times its weight in `weights`, summed up to `u64::MAX` at most; else why the answer cannot be
+/// read: a line that is not a size, as `<id> missing` is not, or a line count other than the blobs'.
+fn total(answer: &str, blobs: &[&str], weights: &[u64]) -> Result<u64, String> {
     let lines: Vec<&str> = answer.lines().collect();
     if lines.len() != blobs.len() {
         return Err(format!("it answered {} line(s) for {} object(s)", lines.len(), blobs.len()));
     }
-    lines.iter().zip(blobs).try_fold(0_u64, |sum, (line, id)| {
+    if weights.len() != blobs.len() {
+        return Err(format!("{} weight(s) were given for {} object(s)", weights.len(), blobs.len()));
+    }
+    lines.iter().zip(blobs).zip(weights).try_fold(0_u64, |sum, ((line, id), weight)| {
         line.parse::<u64>()
-            .map(|size| sum.saturating_add(size))
+            .map(|size| sum.saturating_add(size.saturating_mul(*weight)))
             .map_err(|_| format!("it answered '{line}' for {id}"))
     })
 }
@@ -888,19 +1204,49 @@ fn advertised(lines: &[String], reference: &str) -> Option<String> {
 }
 
 /// The first path the back commit's `diff-tree -r -z --raw` listing names that a sync-back never writes: one with a
-/// component whose name starts with `.git`, its letter case aside, or one the back commit makes a symbolic link or a
-/// submodule. `None` when every path may be written.
+/// component whose name starts with `.git`, its letter case aside, a `.lfsconfig` at any depth, which git-lfs reads
+/// from the worktree, either named as Windows opens it or by a name shaped as its 8.3 alias, or one the back commit
+/// makes a symbolic link or a submodule. `None` when every path may be written.
 fn forbidden(listing: &str) -> Option<String> {
     entries(listing).into_iter().find_map(|entry| {
         let link = LINK_MODES.contains(&entry.new_mode);
-        entry.paths.into_iter().find(|path| link || is_git_s(path)).map(str::to_owned)
+        entry
+            .paths
+            .into_iter()
+            .find(|path| link || is_git_s(path) || is_lfs_config(path))
+            .map(str::to_owned)
     })
 }
 
-/// Whether `path` has a component whose name starts with `.git`, its letter case aside.
+/// Whether the file `path` names is a `.lfsconfig`, its letter case aside, or any component of it looks like the 8.3
+/// alias of one, each read by [`components`].
+fn is_lfs_config(path: &str) -> bool {
+    components(path).last().is_some_and(|name| name.eq_ignore_ascii_case(LFS_CONFIG))
+        || components(path).any(|name| alias_stem(name).is_some_and(|stem| LFS_ALIAS.starts_with(&stem)))
+}
+
+/// The names of `path`'s components as Windows opens them: split at `/` and at `\`, each cut at its first `:`, after
+/// which an alternate stream is named, and stripped of the trailing dots and spaces Windows drops.
+fn components(path: &str) -> impl Iterator<Item = &str> {
+    path.split(['/', '\\'])
+        .map(|part| part.split_once(':').map_or(part, |(name, _)| name).trim_end_matches(['.', ' ']))
+}
+
+/// What the component `name` holds before its first `~` followed by a digit, upper-cased, as an 8.3 alias such as
+/// `GITATT~1` is shaped; `None` when it holds no such `~`.
+fn alias_stem(name: &str) -> Option<String> {
+    let at = name.as_bytes().windows(2).position(|pair| pair[0] == b'~' && pair[1].is_ascii_digit())?;
+    name.get(..at).map(str::to_ascii_uppercase)
+}
+
+/// Whether `path` has a component, read by [`components`], whose name starts with `.git`, its letter case aside, or
+/// that looks like the 8.3 alias of such a name: what comes before its `~` and digit is a start of `GIT` or starts
+/// with it.
 fn is_git_s(path: &str) -> bool {
-    path.split('/')
-        .any(|part| part.get(..GIT_NAME.len()).is_some_and(|start| start.eq_ignore_ascii_case(GIT_NAME)))
+    components(path).any(|part| {
+        part.get(..GIT_NAME.len()).is_some_and(|start| start.eq_ignore_ascii_case(GIT_NAME))
+            || alias_stem(part).is_some_and(|stem| GIT_ALIAS.starts_with(&stem) || stem.starts_with(GIT_ALIAS))
+    })
 }
 
 /// Whether the back commit whose `rev-list --parents -n 1` line is `parents` was made from `snapshot`: one parent, and
@@ -934,6 +1280,17 @@ fn touched_line(path: &str, snapshot: &str, back: &str) -> String {
     format!(
         "gate: remote changes not applied: they touch {}, which a sync-back never writes; {}",
         escaped(path),
+        see_diff(snapshot, back)
+    )
+}
+
+/// The line said for a back commit that writes `path` through the checkout filter `attribute`, `filter=<driver>` or
+/// `ident`, which a sync-back does not take.
+fn filtered_line(path: &str, attribute: &str, snapshot: &str, back: &str) -> String {
+    format!(
+        "gate: remote changes not applied: {} is written through a checkout filter ({}), which a sync-back does not take; {}",
+        escaped(path),
+        escaped(attribute),
         see_diff(snapshot, back)
     )
 }
@@ -983,9 +1340,10 @@ mod tests {
     use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_READ, FILE_WRITE_ATTRIBUTES};
 
     use super::{
-        Back, FETCH_WORDS, Quarantine, Remote, advertised, after_keep, alternates, entries, fetch, forbidden, from_snapshot, has_back, ignored_line,
-        incoming_name, incoming_owner, move_plan, not_applied_line, receive, refused_end, see_diff, swept, synced_line, total, touched_line,
-        unmoved_line, written_blobs, written_line,
+        ATTRIBUTE_ROOM, ATTRIBUTES, Attributes, AutoCrlf, Back, FETCH_WORDS, LineEnds, Quarantine, Remote, advertised, after_keep, alternates,
+        attribute_slices, auto_crlf, converts_to_crlf, entries, fetch, filtered, forbidden, from_snapshot, has_back, ignored_line, incoming_name,
+        incoming_owner, listed_paths, move_plan, names_odd_driver, not_applied_line, read_attributes, receive, refused_end, see_diff, swept,
+        synced_line, total, touched_line, unmoved_line, weight, written_blobs, written_line,
     };
     use crate::boxside::payload::escaped;
     use crate::remote::RemoteCall;
@@ -1568,6 +1926,11 @@ mod tests {
         assert_eq!(forbidden(&first), Some("one".to_owned()), "the first path it names");
     }
 
+    /// The blob ids of the files the `diff-tree -r -z --raw` `listing` writes, in its order.
+    fn ids(listing: &str) -> Vec<&str> {
+        written_blobs(listing).iter().map(|file| file.id).collect()
+    }
+
     /// One entry of `diff-tree -r -z --raw` whose new blob is `new_id`: its modes, its change and its paths.
     fn written_entry(old: &str, new: &str, new_id: &str, change: &str, paths: &[&str]) -> String {
         let mut text = format!(":{old} {new} {SNAPSHOT} {new_id} {change}\0");
@@ -1592,14 +1955,14 @@ mod tests {
         ]
         .concat();
 
-        let blobs = written_blobs(&listing);
+        let blobs = ids(&listing);
 
         assert_eq!(blobs, [shared, shared, other, other], "per path, the deletion left out");
-        assert_eq!(total("5\n5\n7\n7\n", &blobs), Ok(24), "a blob two paths share counts twice");
-        assert_eq!(written_blobs(""), Vec::<&str>::new(), "no change writes nothing");
-        assert_eq!(total("", &[]), Ok(0));
+        assert_eq!(total("5\n5\n7\n7\n", &blobs, &[1; 4]), Ok(24), "a blob two paths share counts twice");
+        assert_eq!(ids(""), Vec::<&str>::new(), "no change writes nothing");
+        assert_eq!(total("", &[], &[]), Ok(0));
         assert_eq!(
-            total("18446744073709551615\n1\n", &[shared, other]),
+            total("18446744073709551615\n1\n", &[shared, other], &[1, 1]),
             Ok(u64::MAX),
             "the sum stops at the most a u64 holds"
         );
@@ -1620,19 +1983,19 @@ mod tests {
         let paths: Vec<&[&str]> = read.iter().map(|entry| entry.paths.as_slice()).collect();
         assert_eq!(paths, [&[crafted][..], &["evil"][..]]);
         assert_eq!(forbidden(&listing), Some("evil".to_owned()), "the link the second entry makes");
-        assert_eq!(written_blobs(&listing), [first], "the crafted name is a file the first entry writes");
+        assert_eq!(ids(&listing), [first], "the crafted name is a file the first entry writes");
     }
 
     #[test]
     fn an_answer_that_is_not_a_size_for_each_blob_is_never_a_size() {
         let id = "1111111111111111111111111111111111111111";
         assert_eq!(
-            total(&format!("{id} missing\n"), &[id]),
+            total(&format!("{id} missing\n"), &[id], &[1]),
             Err(format!("it answered '{id} missing' for {id}"))
         );
-        assert_eq!(total("5\n", &[id, id]), Err("it answered 1 line(s) for 2 object(s)".to_owned()));
-        assert_eq!(total("5\n5\n", &[id]), Err("it answered 2 line(s) for 1 object(s)".to_owned()));
-        assert_eq!(total("-1\n", &[id]), Err(format!("it answered '-1' for {id}")));
+        assert_eq!(total("5\n", &[id, id], &[1, 1]), Err("it answered 1 line(s) for 2 object(s)".to_owned()));
+        assert_eq!(total("5\n5\n", &[id], &[1]), Err("it answered 2 line(s) for 1 object(s)".to_owned()));
+        assert_eq!(total("-1\n", &[id], &[1]), Err(format!("it answered '-1' for {id}")));
     }
 
     #[test]
@@ -2034,5 +2397,276 @@ mod tests {
         std::fs::remove_dir_all(&client).expect("the client can be removed");
         std::fs::remove_file(&marker).expect("the marker can be removed");
         std::fs::remove_file(&log).expect("the log can be removed");
+    }
+
+    /// Every attribute of a path not given: what `git check-attr` says of a path no attribute file names.
+    const PLAIN: [&str; 6] = ["unspecified"; 6];
+
+    /// The attributes `values` give, in [`ATTRIBUTES`]' order.
+    fn given(values: [&str; 6]) -> Attributes {
+        let [filter, ident, encoding, text, eol, crlf] = values.map(str::to_owned);
+        Attributes {
+            filter,
+            ident,
+            encoding,
+            text,
+            eol,
+            crlf,
+        }
+    }
+
+    /// What `git check-attr -z` answers for each path and its values, in [`ATTRIBUTES`]' order.
+    fn answer(paths: &[(&str, [&str; 6])]) -> String {
+        let mut text = String::new();
+        for (path, values) in paths {
+            for (name, value) in ATTRIBUTES.iter().zip(values) {
+                text.extend([*path, "\0", name, "\0", value, "\0"]);
+            }
+        }
+        text
+    }
+
+    #[test]
+    fn check_attr_s_answer_is_read_path_by_path_and_attribute_by_attribute() {
+        let lfs = ["lfs", "unspecified", "unspecified", "unset", "unspecified", "unspecified"];
+        let whole = answer(&[("a.txt", PLAIN), ("b.lfs", lfs)]);
+
+        assert_eq!(read_attributes(&whole, &["a.txt", "b.lfs"]), Ok(vec![given(PLAIN), given(lfs)]));
+        assert_eq!(read_attributes("", &[]), Ok(vec![]), "no path, no answer");
+        assert_eq!(
+            read_attributes(&answer(&[("c.txt", lfs)]), &["c.txt"]),
+            Ok(vec![given(lfs)]),
+            "a second slice is read on its own"
+        );
+        assert_eq!(
+            read_attributes(&whole, &["a.txt", "other"]),
+            Err("it did not answer filter for other".to_owned()),
+            "the wrong path"
+        );
+        assert_eq!(
+            read_attributes(&whole.replacen("\0ident\0", "\0idents\0", 1), &["a.txt", "b.lfs"]),
+            Err("it did not answer ident for a.txt".to_owned()),
+            "the wrong attribute name"
+        );
+        assert_eq!(
+            read_attributes(&answer(&[("a.txt", PLAIN)]), &["a.txt", "b.lfs"]),
+            Err("it did not answer filter for b.lfs".to_owned()),
+            "a short answer"
+        );
+        let cut = whole
+            .strip_suffix("b.lfs\0crlf\0unspecified\0")
+            .expect("the answer ends with b.lfs's crlf");
+        assert_eq!(
+            read_attributes(cut, &["a.txt", "b.lfs"]),
+            Err("it did not answer crlf for b.lfs".to_owned()),
+            "an answer cut short"
+        );
+        assert_eq!(
+            read_attributes(&whole, &["a.txt"]),
+            Err("it answered more than the 1 path(s) it was asked".to_owned()),
+            "a surplus path"
+        );
+    }
+
+    #[test]
+    fn the_paths_fed_to_check_attr_are_cut_into_slices_that_fit_the_cap() {
+        let cost = ATTRIBUTES.len() * (1 + ATTRIBUTE_ROOM);
+        let paths = ["a", "b", "c"];
+
+        assert_eq!(attribute_slices(&[], cost), Vec::<&[&str]>::new(), "no path, no slice");
+        assert_eq!(attribute_slices(&paths, 3 * cost), [&paths[..]], "exactly at the cap: one slice");
+        assert_eq!(
+            attribute_slices(&paths, 3 * cost - 1),
+            [&paths[..2], &paths[2..]],
+            "a byte past the cap: the last path goes on"
+        );
+        let long = "x".repeat(10 * cost);
+        let mixed = ["a", long.as_str(), "b"];
+        assert_eq!(
+            attribute_slices(&mixed, 2 * cost),
+            [&mixed[..1], &mixed[1..2], &mixed[2..]],
+            "a path over the cap alone is a slice of its own"
+        );
+        let many: Vec<String> = (0..50).map(|number| format!("path-{number}")).collect();
+        let many: Vec<&str> = many.iter().map(String::as_str).collect();
+        let slices = attribute_slices(&many, 4 * cost);
+        assert!(slices.len() > 1, "{slices:?}");
+        assert_eq!(slices.concat(), many, "the slices join back in order");
+    }
+
+    #[test]
+    fn the_line_end_config_takes_each_key_s_last_value() {
+        let native = LineEnds {
+            autocrlf: AutoCrlf::False,
+            eol_crlf: true,
+        };
+        assert_eq!(LineEnds::of(""), native, "nothing set: no autocrlf, native CRLF");
+        assert_eq!(
+            LineEnds::of("core.autocrlf\ntrue\0core.eol\nlf\0core.autocrlf\nfalse\0core.eol\ncrlf\0"),
+            native,
+            "the last of each key wins"
+        );
+        assert_eq!(
+            LineEnds::of("core.autocrlf\0core.eol\0"),
+            LineEnds {
+                autocrlf: AutoCrlf::True,
+                eol_crlf: true
+            },
+            "valueless keys"
+        );
+        assert_eq!(
+            LineEnds::of("core.eol\nLF\0core.autocrlf\nINPUT\0"),
+            LineEnds {
+                autocrlf: AutoCrlf::Input,
+                eol_crlf: false
+            },
+            "values in any letter case"
+        );
+        assert_eq!(LineEnds::of("user.name\nlf\0core.eolx\nlf\0core.autocrlfx\ntrue\0"), native, "other keys");
+    }
+
+    #[test]
+    fn core_autocrlf_fails_toward_true() {
+        for (value, read) in [
+            (None, AutoCrlf::True),
+            (Some("yes"), AutoCrlf::True),
+            (Some("on"), AutoCrlf::True),
+            (Some("1"), AutoCrlf::True),
+            (Some("-1"), AutoCrlf::True),
+            (Some("0x1"), AutoCrlf::True),
+            (Some("1k"), AutoCrlf::True),
+            (Some("0"), AutoCrlf::False),
+            (Some(""), AutoCrlf::False),
+            (Some("FALSE"), AutoCrlf::False),
+            (Some("no"), AutoCrlf::False),
+            (Some("off"), AutoCrlf::False),
+            (Some("INPUT"), AutoCrlf::Input),
+        ] {
+            assert_eq!(auto_crlf(value), read, "{value:?}");
+        }
+    }
+
+    #[test]
+    fn a_path_counts_as_its_checkout_converts_it() {
+        let ends = |autocrlf, eol_crlf| LineEnds { autocrlf, eol_crlf };
+        let (auto, lf, native, input) = (
+            ends(AutoCrlf::True, false),
+            ends(AutoCrlf::False, false),
+            ends(AutoCrlf::False, true),
+            ends(AutoCrlf::Input, true),
+        );
+        let u = "unspecified";
+        for (values, line_ends, counted) in [
+            (PLAIN, lf, 1),
+            (PLAIN, auto, 2),
+            (PLAIN, native, 1),
+            ([u, u, u, "set", u, u], native, 2),
+            ([u, u, u, "set", u, u], lf, 1),
+            ([u, u, u, "set", u, u], input, 1),
+            ([u, u, u, "auto", u, u], native, 2),
+            ([u, u, u, "unset", u, u], auto, 1),
+            ([u, u, u, "input", u, u], auto, 1),
+            ([u, u, u, "set", "lf", u], auto, 1),
+            ([u, u, u, u, "lf", u], auto, 1),
+            ([u, u, u, u, "crlf", u], lf, 2),
+            ([u, u, u, "unset", "crlf", u], lf, 2),
+            ([u, u, u, u, u, "set"], native, 2),
+            ([u, u, u, u, u, "unset"], auto, 1),
+            ([u, u, u, u, u, "input"], auto, 1),
+            ([u, u, u, "set", u, "unset"], native, 2),
+            ([u, u, "UTF-16", u, u, u], lf, 4),
+            ([u, u, "UTF-16", "set", u, u], native, 8),
+            ([u, u, "UTF-16", u, "crlf", u], lf, 8),
+        ] {
+            let attributes = given(values);
+            assert_eq!(weight(&attributes, line_ends), counted, "{values:?} under {line_ends:?}");
+            assert_eq!(
+                converts_to_crlf(&attributes, line_ends),
+                matches!(counted, 2 | 8),
+                "{values:?} under {line_ends:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_filter_any_driver_or_none_or_ident_refuses_the_first_path_it_is_on() {
+        let u = "unspecified";
+        let paths = ["a", "b", "c"];
+        let refused = |values: [&str; 6], odd: bool| filtered(&paths, &[given(PLAIN), given(values), given(PLAIN)], odd);
+
+        assert_eq!(refused(PLAIN, false), None, "no filter");
+        assert_eq!(refused(["foo", u, u, u, u, u], false), Some(("b", "filter=foo".to_owned())));
+        assert_eq!(refused(["set", u, u, u, u, u], false), Some(("b", "filter (no driver)".to_owned())));
+        assert_eq!(refused([u, "set", u, u, u, u], false), Some(("b", "ident".to_owned())));
+        assert_eq!(
+            refused([u, "foo", u, u, u, u], false),
+            Some(("b", "ident".to_owned())),
+            "an ident with a value"
+        );
+        assert_eq!(refused(["unset", u, u, u, u, u], false), None, "a filter unset");
+        assert_eq!(
+            refused(["unset", u, u, u, u, u], true),
+            Some(("a", "filter=unspecified".to_owned())),
+            "a driver named as a filter not given may be any path's"
+        );
+        assert!(names_odd_driver("core.eol\nlf\0filter.unset.clean\nx\0"));
+        assert!(names_odd_driver("filter.unspecified.smudge\nx\0"));
+        assert!(!names_odd_driver("filter.unsets.clean\nx\0filter.lfs.smudge\nx\0"));
+        assert!(!names_odd_driver(""));
+    }
+
+    #[test]
+    fn every_listed_path_is_checked_and_only_the_written_ones_are_counted() {
+        let zeros = "0000000000000000000000000000000000000000";
+        let new = "1111111111111111111111111111111111111111";
+        let listing = [
+            written_entry("100644", "000000", zeros, "D", &["gone.x"]),
+            written_entry("100644", "100644", new, "R100", &["old.txt", "new.txt"]),
+            written_entry("000000", "100644", new, "A", &["added.txt"]),
+        ]
+        .concat();
+
+        let listed = listed_paths(&listing);
+        assert_eq!(listed, ["gone.x", "old.txt", "new.txt", "added.txt"]);
+        let written: Vec<&str> = written_blobs(&listing).iter().map(|file| listed[file.at]).collect();
+        assert_eq!(written, ["new.txt", "added.txt"], "each written file's place among the listed paths");
+    }
+
+    #[test]
+    fn a_back_commit_may_not_write_an_lfsconfig_or_any_spelling_of_a_refused_name() {
+        for path in [
+            ".lfsconfig",
+            "sub/.lfsconfig",
+            ".LfsConfig",
+            ".lfsconfig.",
+            ".lfsconfig::$DATA",
+            ".lfsconfig. . ",
+            r"sub\.gitattributes",
+            ".gitignore:stream",
+            "GITHUB~1/workflows/x.yml",
+            "LFSCON~1",
+            "sub/gitatt~1",
+            "GIT~1/config",
+            "G~1",
+        ] {
+            let listing = entry("000000", "100644", "A", &[path]);
+            assert_eq!(forbidden(&listing), Some(path.to_owned()), "{path}");
+        }
+        for path in [".lfsconfig/x", "x.lfsconfig", "A~1.txt", "notes~1.txt", "sub/lfs~x", "agit~1"] {
+            let listing = entry("000000", "100644", "A", &[path]);
+            assert_eq!(forbidden(&listing), None, "{path}");
+        }
+    }
+
+    #[test]
+    fn each_blob_counts_its_weight_and_every_blob_needs_one() {
+        let (one, two) = ("1111111111111111111111111111111111111111", "2222222222222222222222222222222222222222");
+        assert_eq!(total("5\n7\n", &[one, two], &[2, 8]), Ok(66));
+        assert_eq!(total("5\n", &[one], &[]), Err("0 weight(s) were given for 1 object(s)".to_owned()));
+        assert_eq!(
+            total("18446744073709551615\n", &[one], &[8]),
+            Ok(u64::MAX),
+            "a weighted size stops at the most a u64 holds"
+        );
     }
 }
