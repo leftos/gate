@@ -296,8 +296,9 @@ impl Survey {
                 Listed::Unreadable(path, reason) => {
                     self.say_once("ignored the ticket", &path.display().to_string(), reason, console);
                 }
-                Listed::Dead(path) => match delete(&path) {
-                    Ok(()) => deleted = true,
+                Listed::Dead(path) => match delete_dead(&path) {
+                    Ok(Swept::Deleted) => deleted = true,
+                    Ok(Swept::Refused) => {}
                     Err(error) => self.say_once("cannot delete the dead gate's ticket", &path.display().to_string(), error, console),
                 },
             }
@@ -319,7 +320,7 @@ impl Survey {
         };
         for (path, marker) in markers {
             if !self.is_live(&path, marker.pid, marker.process_start, console)
-                && let Err(error) = delete(&path)
+                && let Err(error) = delete_dead(&path)
             {
                 self.say_once(
                     "cannot delete the dead gate's covered marker",
@@ -632,6 +633,33 @@ pub(crate) fn delete(path: &Path) -> io::Result<()> {
     }
 }
 
+/// What [`delete_dead`] did with the file it was given.
+#[derive(Debug, PartialEq, Eq)]
+enum Swept {
+    /// The file is gone: this gate deleted it, or it was already gone.
+    Deleted,
+    /// The delete was refused access denied: another gate is deleting the same file, whose delete is then pending, or
+    /// the file cannot be deleted at all. Nothing was deleted here.
+    Refused,
+}
+
+/// Deletes the file at `path`, as [`delete`] does, and says what became of it: [`Swept::Deleted`] for the file this
+/// gate deleted or one already gone, [`Swept::Refused`] for one whose delete came back access denied. A refused delete
+/// is passed over unsaid and never counts as a delete, so no waiter is woken for it: the gate that really deletes the
+/// file gets [`Swept::Deleted`] and sends the wake itself. On this Windows `fs::remove_file` takes the POSIX delete and
+/// clears the read-only attribute, so the usual cause is another gate deleting the same dead gate's ticket, whose delete
+/// is then pending, which every open and delete of it refuses until that gate's handle closes. The accepted cost: a
+/// dead gate's file that can never be deleted stays in place unsaid, and each pass tries it once more; it never blocks
+/// the queue, since a dead ticket is never ahead. Any error other than access denied comes back as [`delete`] returns
+/// it.
+fn delete_dead(path: &Path) -> io::Result<Swept> {
+    match delete(path) {
+        Ok(()) => Ok(Swept::Deleted),
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => Ok(Swept::Refused),
+        Err(error) => Err(error),
+    }
+}
+
 #[cfg(test)]
 #[expect(clippy::expect_used, reason = "a test whose fixed times cannot be built must fail loudly")]
 mod tests {
@@ -772,5 +800,116 @@ mod tests {
             read.expect_err("the seam makes both reads fail").to_string(),
             "--test-own-start-fails makes the start unreadable (test seam only)"
         );
+    }
+
+    /// A scratch folder for one delete test, emptied first.
+    #[cfg(windows)]
+    fn scratch(test: &str) -> std::path::PathBuf {
+        use std::fs;
+
+        let folder = std::env::temp_dir().join(format!("gate-slots-{}-{test}", std::process::id()));
+        let _ = fs::remove_dir_all(&folder);
+        fs::create_dir_all(&folder).expect("the scratch folder can be made");
+        folder
+    }
+
+    /// A dead gate's ticket whose delete another gate has already started: this gate's own delete comes back access
+    /// denied, which is refused rather than counted, so no waiter is woken for it.
+    #[cfg(windows)]
+    #[test]
+    fn a_dead_file_whose_delete_is_pending_is_refused() {
+        use std::ffi::c_void;
+        use std::fs;
+        use std::io;
+        use std::os::windows::ffi::OsStrExt as _;
+        use std::ptr;
+        use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::Storage::FileSystem::{
+            CreateFileW, DELETE, FILE_ATTRIBUTE_NORMAL, FILE_DISPOSITION_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+            FileDispositionInfo, OPEN_EXISTING, SetFileInformationByHandle,
+        };
+
+        /// The handle of a staged delete-pending, closed however the test ends.
+        struct Held(HANDLE);
+
+        impl Drop for Held {
+            fn drop(&mut self) {
+                // SAFETY: `self.0` is the handle this test opened and has not closed until here.
+                unsafe { CloseHandle(self.0) };
+            }
+        }
+
+        use super::{Swept, delete, delete_dead};
+
+        let folder = scratch("delete-pending");
+        let path = folder.join("32232-1791776169671.json");
+        fs::write(&path, "a dead gate's ticket").expect("the ticket can be written");
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+        // The classic mark-for-deletion-on-close, not the POSIX delete `fs::remove_file` takes on this Windows: it
+        // leaves the ticket's name in the folder and makes a later open of it fail with access denied, which is what a
+        // second gate deleting the same dead ticket as this one sweeps it runs into.
+        // SAFETY: `wide` is a NUL-terminated UTF-16 string that outlives the call, the security attributes and template
+        // handle are null, and the access and share modes are the constants CreateFileW takes.
+        let held = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                DELETE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                ptr::null(),
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                ptr::null_mut(),
+            )
+        };
+        assert_ne!(held, INVALID_HANDLE_VALUE, "the ticket can be opened for its delete");
+        let staged = Held(held);
+        let info = FILE_DISPOSITION_INFO { DeleteFile: true };
+        let size = u32::try_from(size_of::<FILE_DISPOSITION_INFO>()).expect("the info fits in a u32");
+        // SAFETY: `held` is the handle just opened with DELETE access, `info` is a FILE_DISPOSITION_INFO that outlives
+        // the call, and `size` is its size in bytes.
+        let set = unsafe { SetFileInformationByHandle(held, FileDispositionInfo, ptr::from_ref(&info).cast::<c_void>(), size) };
+        assert_ne!(set, 0, "the ticket's delete can be set: {}", io::Error::last_os_error());
+        let error = fs::read(&path).expect_err("a ticket whose delete is pending cannot be read");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "the staging this test needs: {error}");
+
+        assert_eq!(
+            delete_dead(&path).map_err(|error| error.kind()),
+            Ok(Swept::Refused),
+            "a ticket whose delete is pending is refused, never counted as a delete this gate made"
+        );
+        assert_eq!(
+            delete(&path).map_err(|error| error.kind()),
+            Err(io::ErrorKind::PermissionDenied),
+            "deleting it plainly is the access denial this test pins"
+        );
+        drop(staged);
+        let _ = fs::remove_dir_all(&folder);
+    }
+
+    /// A dead gate's ticket that is deleted, or was already gone: either way this gate's delete counts, and it is the
+    /// one that sends the wake.
+    #[cfg(windows)]
+    #[test]
+    fn a_deleted_dead_file_counts_as_deleted() {
+        use std::fs;
+
+        use super::{Swept, delete_dead};
+
+        let folder = scratch("deleted");
+        let path = folder.join("32232-1791776169671.json");
+        fs::write(&path, "a dead gate's ticket").expect("the ticket can be written");
+
+        assert_eq!(
+            delete_dead(&path).map_err(|error| error.kind()),
+            Ok(Swept::Deleted),
+            "a ticket this gate deletes counts"
+        );
+        assert!(!path.exists(), "and it is gone");
+        assert_eq!(
+            delete_dead(&path).map_err(|error| error.kind()),
+            Ok(Swept::Deleted),
+            "a ticket already gone counts too, as `delete` maps a missing file to success"
+        );
+        let _ = fs::remove_dir_all(&folder);
     }
 }

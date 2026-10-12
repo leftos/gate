@@ -36,6 +36,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Cutover**: switching a machine's gates from the PowerShell gate to `gate.exe`; `gate cutover` runs the local one.
 - **Cutover flag**: the file `%LOCALAPPDATA%\gate\cutover.flag`, whose existence tells the PowerShell launcher to hand every call to `gate.exe`, and ops-tower's state to read `gate.exe`'s files.
 - **Cutover sweep**: the later change of every calling repo from the PowerShell launcher to `gate` on PATH, after which the PowerShell gate is deleted.
+- **Delete pending**: a file marked for deletion when its last handle closes (the classic delete, not the POSIX one `fs::remove_file` takes); until then its name stays listed and every open or delete of it is refused with access denied, so the gate passes it over as going away.
 - **Diagnostics block**: the record of what was running that a kill writes to the log before it terminates the job: the job's processes, the descendants outside the job, the build servers and the last samples.
 - **Drain**: see critical drain.
 - **Drained cutover**: a cutover in which every gate of the old generation finishes before the switch completes, while the two generations share the slot mutexes and take turns on them.

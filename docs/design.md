@@ -283,6 +283,8 @@ A missing file or key means the default; an unreadable or invalid value is ignor
 
    More: `gate: cannot read the tickets in <dir>: <error>`, `gate: cannot read the claims in <dir>: <error>`, `gate: ignored the ticket <path>: <reason>`, `gate: cannot check the gate of <path>: <error>` and `gate: cannot delete the ticket|the claim|the dead gate's ticket <path>: <error>`.
 
+   A dead gate's ticket or covered marker whose delete is refused with access denied is passed over unsaid and never counts as a delete, so it wakes no waiter. The usual cause is another gate deleting the same file (a [delete pending](GLOSSARY.md), which refuses every open and delete), and that gate sends the wake. A dead gate's file that can never be deleted stays in place unsaid and is tried again each pass; it never blocks the queue, since a dead ticket is never ahead.
+
    A gate under a parent's slot says `gate: cannot write the covered marker <path>: <error>` and `gate: cannot delete the covered marker <path>: <error>`, and the survey says `gate: cannot read the covered markers in <dir>: <error>` and `gate: cannot delete the dead gate's covered marker <path>: <error>`, each of the last two once; the run goes on after each.
 
 Ordering by ticket replaces the PowerShell gate's free-for-all among waiters of one kind (Q2), and the wake events replace its 2 s polling as the way a waiter learns of a release.
