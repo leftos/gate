@@ -14,6 +14,7 @@ use std::io::{self, Read, Write};
 use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::PoisonError;
+use std::time::Instant;
 
 use sha2::{Digest, Sha256};
 
@@ -181,10 +182,11 @@ fn restore_launch(place: &Path) -> Result<PipedLaunch, String> {
 
 /// Runs `dotnet tool restore` in `place`, in a job of its own named after the run's job ([`restore_job_name`]), its two
 /// streams forwarded through the box's output lock as the command's are, and sees it to its end: [`Restored::Status`]
-/// with the status it exited with, or [`Restored::Ended`] when a stop set the run's signal before or while it ran, when
-/// the box could not wait for it, or when a write to the box's own output failed, the client's connection gone. `Err`
-/// carries the message of a restore that could not be started. Its job kills on close, so a box that dies or is killed
-/// ends it, and is terminated on every way out of here, so nothing dotnet started outlives the restore.
+/// with the status it exited with, after a line saying how long it ran, or [`Restored::Ended`] when a stop set the run's
+/// signal before or while it ran, when the box could not wait for it, or when a write to the box's own output failed,
+/// the client's connection gone. `Err` carries the message of a restore that could not be started. Its job kills on
+/// close, so a box that dies or is killed ends it, and is terminated on every way out of here, so nothing dotnet
+/// started outlives the restore.
 fn restore(request: &Request<'_>, place: &Path, beat: &Beat<'_>, console: &mut Console) -> Result<Restored, String> {
     // A stop that came while the snapshot was checked out ends the run here, before dotnet is even looked for.
     if let Err(status) = before_the_job(beat.stop.look(STARTING_RESTORE), request.job, console) {
@@ -194,6 +196,7 @@ fn restore(request: &Request<'_>, place: &Path, beat: &Beat<'_>, console: &mut C
     let name = restore_job_name(request.job);
     let job = Job::create_kill_on_close(&name).map_err(|error| format!("cannot create its job {name}: {error}"))?;
     let _stopper = Stopper { job: &job, armed: true };
+    let started = Instant::now();
     let PipedSuspended { suspended, stdout, stderr } = launch.start_suspended(&job).map_err(|error| error.to_string())?;
     suspended.assign(&job).map_err(|error| error.to_string())?;
     let running = suspended.resume().map_err(|error| error.to_string())?;
@@ -215,11 +218,16 @@ fn restore(request: &Request<'_>, place: &Path, beat: &Beat<'_>, console: &mut C
         WaitEnd::ClientGone => Restored::Ended(watched.client_gone(console)),
         WaitEnd::Exited { stopped: true, .. } => Restored::Ended(stopped(watched, console)),
         WaitEnd::Exited { code, stopped: false } => {
+            let took = started.elapsed();
             let drained = watched.drained(console);
             // A process the restore left running ends here, after the line saying it held the output.
             end_job(&job, console);
             match drained {
-                Ok(()) => Restored::Status(code.cast_signed()),
+                Ok(()) => {
+                    // Said after the restore's own output and before any line saying it failed.
+                    console.err(&format!("gate: dotnet tool restore took {:.1} s", took.as_secs_f64()));
+                    Restored::Status(code.cast_signed())
+                }
                 Err(status) => Restored::Ended(status),
             }
         }

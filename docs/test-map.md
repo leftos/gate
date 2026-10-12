@@ -51,7 +51,7 @@ Suite = `crates/gate/tests/suite/` (binary `suite`, needs `--all-features`; test
 | remote/{git,launch}.rs | `remote_client` (`--test-git`), `routing` (`--test-git`, route facts), `syncback_quarantine` (`Call.set`, the sync-back's git environment), `syncback_conversions` (`OUTPUT_CAP` bounds the `check-attr` slices), `request` | no: remote_client, routing, syncback_quarantine, syncback_conversions |
 | boxside/mod.rs, payload.rs, preflight.rs, boot.rs, run.rs, stop.rs | `boxside` (29 flag/verb uses; the case runs `gate box boot/preflight/run/stop`), `remote_client` (builder is `gate box` via `local:`) | no: boxside, remote_client |
 | boxside/heartbeat.rs, forward.rs | `boxside` (`--test-heartbeat-ms`), `remote_client` | no: boxside, remote_client |
-| boxside/tools.rs | `boxside` (dotnet tool restore, boxside.rs:1845) | no: boxside |
+| boxside/tools.rs | `boxside` (dotnet tool restore and its elapsed line, `boxside::box_run_*restore*` cases) | no: boxside |
 | boxside/outputs.rs | `boxside` sub-module `boxside::outputs` (manifest, pack, prune, `outputs` verb, `--test-outputs-budget-bytes`), `remote_client` | no: boxside, remote_client |
 | outputs/ (glob, walk, hash, manifest, archive) | `boxside::outputs` (pack), `remote_client` (manifest the client sends, the fetched archive's install); unit tests inside | no: boxside, remote_client |
 

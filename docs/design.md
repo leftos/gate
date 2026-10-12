@@ -1225,7 +1225,11 @@ Built verbs:
 
   The record `<Work>.tools`, beside the lock, is 64 lower-case hex digits (SHA-256 over, per manifest in walk order, the UTF-8 path relative to the work folder, a NUL, the file bytes, a NUL), UTF-8, no BOM, no newline; the restore is skipped while the record equals the hash of the manifests.
 
-  A restore that cannot start prints `gate: remote could not start the dotnet tool restore: <message>`, and a non-zero one prints `gate: remote tool restore failed (status <n>)` then `gate-remote-refused: <nonce> tools` and `gate: remote work folder <key> could not restore its dotnet tools` (the tag and the line together, under the heartbeat's lock); both exit 75 with the command never started, the record unchanged and the back ref left cleared, and the PC side reads the 75 plus the tag as fallback reason `tools`.
+  A restore that exits, passing or failing, first prints `gate: dotnet tool restore took <s> s` (one decimal, timed from its start to its exit; nothing caps it yet), after its own output.
+
+  A restore that cannot start prints `gate: remote could not start the dotnet tool restore: <message>`, and a non-zero one prints `gate: remote tool restore failed (status <n>)` then `gate-remote-refused: <nonce> tools` and `gate: remote work folder <key> could not restore its dotnet tools` (the tag and the line together, under the heartbeat's lock).
+
+  Both exit 75 with the command never started, the record unchanged and the back ref left cleared, and the PC side reads the 75 plus the tag as fallback reason `tools`.
 
   A manifest that cannot be read prints `gate: remote could not read the tool manifest <path>: <error>`, one that does not lie under the work folder prints `gate: remote could not place the tool manifest <path> under the work folder <work>`, and a record that cannot be written prints `gate: remote could not write <record>: <error>`; the first and last exit 1.
 

@@ -1769,6 +1769,60 @@ fn box_run_a_failed_restore_reports_the_stub_s_status() {
     assert!(!Path::new(&format!("{}.tools", field(&payload, "Work"))).exists(), "no record is written");
 }
 
+/// The shape of the line the box says once a restore it ran has ended: its elapsed seconds, one decimal.
+const RESTORE_TOOK: &str = r"^gate: dotnet tool restore took \d+\.\d s$";
+
+/// The positions of the lines of `stderr` that say how long a restore took.
+fn took_positions(stderr: &str) -> Vec<usize> {
+    let took = Regex::new(RESTORE_TOOK).expect("the pattern compiles");
+    lines(stderr)
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| took.is_match(line))
+        .map(|(position, _)| position)
+        .collect()
+}
+
+#[test]
+fn box_run_says_how_long_a_passing_restore_took() {
+    let case = Case::new("box_run_tools_took_passing");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "exit", "0"]);
+    snapshot(&case, &mut payload, &[(TOOLS_MANIFEST_PATH, TOOLS_MANIFEST)]);
+    let stub = stub_dotnet(&case, 0);
+
+    let outcome = run_box_with_path(&case, &payload, Some(&path_for_run(&[stub])));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(took_positions(&outcome.stderr).len(), 1, "one elapsed line: {outcome:?}");
+}
+
+#[test]
+fn box_run_says_how_long_a_failing_restore_took_before_its_failure_lines() {
+    let case = Case::new("box_run_tools_took_failing");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "exit", "0"]);
+    snapshot(&case, &mut payload, &[(TOOLS_MANIFEST_PATH, TOOLS_MANIFEST)]);
+    let stub = stub_dotnet(&case, 7);
+
+    let outcome = run_box_with_path(&case, &payload, Some(&path_for_run(&[stub])));
+
+    assert_eq!(outcome.code, Some(75), "{outcome:?}");
+    let said = lines(&outcome.stderr);
+    let took = took_positions(&outcome.stderr);
+    let failed = said.iter().position(|line| *line == "gate: remote tool restore failed (status 7)");
+    let tag = refused_line(&payload, "tools");
+    let tagged = said.iter().position(|line| *line == tag);
+    let refused = said
+        .iter()
+        .position(|line| *line == "gate: remote work folder k could not restore its dotnet tools");
+    assert!(
+        matches!(
+            (took.as_slice(), failed, tagged, refused),
+            ([took], Some(failed), Some(tagged), Some(refused)) if *took < failed && failed < tagged && tagged < refused
+        ),
+        "one elapsed line, then the status line, the tag and the tools line: {outcome:?}"
+    );
+}
+
 #[test]
 fn box_run_a_work_folder_with_no_manifest_runs_no_restore() {
     let case = Case::new("box_run_tools_no_manifest");
@@ -1783,6 +1837,10 @@ fn box_run_a_work_folder_with_no_manifest_runs_no_restore() {
     assert!(
         !counter(&case).exists(),
         "a work folder with no manifest never looks for dotnet: {outcome:?}"
+    );
+    assert!(
+        !outcome.stderr.contains("gate: dotnet tool restore took"),
+        "a run that restores nothing says no elapsed line: {outcome:?}"
     );
     assert!(marker.exists(), "the command still ran: {outcome:?}");
     assert!(!Path::new(&format!("{}.tools", field(&payload, "Work"))).exists(), "no record is written");
