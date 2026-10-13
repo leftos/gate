@@ -857,6 +857,7 @@ mod tests {
             stall: 120,
             tail: 20,
             no_markers: false,
+            bring_tracked: &[],
             interrupt: None,
             state: &STATE,
             state_dir: Path::new(r"C:\gate-bridge-tests"),

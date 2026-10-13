@@ -3262,6 +3262,87 @@ fn an_archive_member_that_is_an_lfsconfig_is_refused_by_the_install() {
     assert!(pending_marker(&case).exists(), "{outcome:?}");
 }
 
+/// A routed run, the gate given `extra` before the command, whose PC's `bin/kept.txt` (`pc`) is committed though `bin/`
+/// is ignored, and whose box's archive is swapped, before the outputs call reads it, for one carrying `bin/kept.txt` as
+/// `box`; its case and outcome.
+fn tracked_member_run(name: &str, extra: &[&str]) -> (Case, Outcome) {
+    let case = outputs_case(name, &BIN);
+    write(&case, r"bin\kept.txt", "pc");
+    git(&case, &["add", "--force", "bin/kept.txt"]);
+    git(&case, &["commit", "--quiet", "-m", "check in an output"]);
+    let outcome = swapped_archive_run(&case, extra, "bin/kept.txt");
+    (case, outcome)
+}
+
+/// A routed run of `case`, the gate given `extra` before the command, whose box's archive is swapped, before the
+/// outputs call reads it, for one carrying `member` as `box`.
+fn swapped_archive_run(case: &Case, extra: &[&str], member: &str) -> Outcome {
+    let go = Go(case.folder().join("ssh").join("go"));
+    let steps = ssh_steps(case, "ssh", &["ok", "ok", &format!("hold {}", shown(go.path()))]);
+    let tuned = Tuned { extra, ..Tuned::default() };
+    let run = start(client_gate_tuned(
+        case,
+        "out.log",
+        &steps,
+        &tuned,
+        &[r".\tool.exe", "write", r"bin\new.txt", "built"],
+    ));
+    wait_until("the outputs call", || calls(&steps).len() == 3);
+    fs::write(box_output_archive(case), crafted_archive(member, "box")).expect("the archive can be replaced");
+    fs::write(go.path(), "").expect("the go file can be made");
+    run.finish()
+}
+
+/// The PC's index holds a submodule `lib`, never initialised (a gitlink and an empty folder), whose files no index the
+/// install reads lists: a member under it is not installed.
+#[test]
+fn an_archive_member_under_a_submodule_is_not_installed() {
+    let case = outputs_case("client-outputs-submodule", &BIN);
+    fs::create_dir_all(case.folder().join("lib")).expect("the submodule's folder can be made");
+    let gitlink = format!("160000,{},lib", "1".repeat(40));
+    git(&case, &["update-index", "--add", "--cacheinfo", &gitlink]);
+    git(&case, &["commit", "--quiet", "-m", "add a submodule"]);
+
+    let outcome = swapped_archive_run(&case, &[], "lib/bin/a.txt");
+
+    assert_eq!(outcome.code, Some(0), "the pass stands: {outcome:?}");
+    let skipped = "gate: remote outputs not fully brought back: lib/bin/a.txt is tracked by git";
+    assert!(outcome.stderr.contains(skipped), "{outcome:?}");
+    assert!(!case.folder().join("lib").join("bin").exists(), "nothing is installed: {outcome:?}");
+    assert!(pending_marker(&case).exists(), "the marker stays: {outcome:?}");
+}
+
+/// A builder's archive carries a file the worktree's git index holds: the install skips it and says so, the pass
+/// stands, and the marker stays.
+#[test]
+fn an_archive_member_git_tracks_is_not_installed() {
+    let (case, outcome) = tracked_member_run("client-outputs-tracked", &[]);
+
+    assert_eq!(outcome.code, Some(0), "the pass stands: {outcome:?}");
+    let skipped = "gate: remote outputs not fully brought back: bin/kept.txt is tracked by git";
+    assert!(outcome.stderr.contains(skipped), "{outcome:?}");
+    assert!(!outcome.stderr.contains("not brought back:"), "{outcome:?}");
+    assert!(outcome.stderr.contains("gate: outputs: 0 file(s)"), "nothing is counted: {outcome:?}");
+    assert_eq!(worktree_text(&case, r"bin\kept.txt"), "pc", "the tracked file is not overwritten");
+    assert_eq!(outputs_leftovers(&case), Vec::<PathBuf>::new(), "the archive and the stage are removed");
+    assert!(pending_marker(&case).exists(), "the marker stays: {outcome:?}");
+}
+
+/// `--bring-tracked BIN/**` matches the tracked file's folder, though its letter case differs: the file is installed as
+/// before, and the marker cleared.
+#[test]
+fn a_tracked_member_a_bring_tracked_glob_matches_is_installed() {
+    let (case, outcome) = tracked_member_run("client-outputs-bring-tracked", &["--bring-tracked", "BIN/**"]);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(!outcome.stderr.contains("brought back"), "{outcome:?}");
+    let line = regex::Regex::new(ONE_INSTALLED).expect("the line's pattern");
+    assert!(line.is_match(&outcome.stderr), "{outcome:?}");
+    assert_eq!(worktree_text(&case, r"bin\kept.txt"), "box", "the tracked file is installed");
+    assert_eq!(outputs_leftovers(&case), Vec::<PathBuf>::new(), "the archive and the stage are removed");
+    assert!(!pending_marker(&case).exists(), "the marker is cleared: {outcome:?}");
+}
+
 /// The text of the case's worktree file `name`, which must be there.
 fn worktree_text(case: &Case, name: &str) -> String {
     fs::read_to_string(case.folder().join(name)).expect("the worktree file is there")

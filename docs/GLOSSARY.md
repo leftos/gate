@@ -126,6 +126,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Test mode**: the `gate-nextup` profile's `test mode: unstable|stable` line; `unstable` runs each item's reached tests and the full suite before a push or reinstall, `stable` runs the full suite for every item.
 - **Test seam**: a hidden `--test-*` flag, compiled only with the `test-seams` cargo feature, by which the suite sets a timing knob or prints the parsed request.
 - **Ticket**: the JSON file `waiting\<pid>-<start>.json` a gate writes when it queues for a slot, holding its kind and `arrived` time; waiters of one kind take slots in ticket order.
+- **Tracked member**: a member of a routed run's fetched outputs archive whose path the worktree's git index holds, or that sits under a submodule or a nested repository; the install skips it (`... is tracked by git`) unless a `--bring-tracked` glob of the call matches it.
 - **Unbound marker**: a `GATE_SLOT_HELD` marker naming a live gate whose job does not hold this gate or the first ancestor of it that any job holds; the gate ignores it and runs as one under no parent. A marker whose binding cannot be judged is honoured, not unbound.
 - **Usage error**: a command line the gate refuses (a missing, unknown, repeated or invalid input): each problem on its own `gate: ` line, then the usage, exit 2, before any slot is queued.
 - **Verdict**: the outcome a `release` line records: `passed`, `failed`, `log-failure`, `stalled`, `timed-out`, `backstop` or `unknown` (no run facts).

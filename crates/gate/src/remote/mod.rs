@@ -132,6 +132,9 @@ pub(crate) struct RemoteCall<'a> {
     pub words: &'a [String],
     /// The output globs the run brings back.
     pub outputs: &'a [String],
+    /// The `--bring-tracked` globs: a fetched output git tracks is installed only when one matches it. The bridge
+    /// ignores them.
+    pub bring_tracked: &'a [String],
     /// The log the client writes the run's output to.
     pub log: &'a Path,
     pub timeout: u64,
@@ -314,6 +317,7 @@ mod snapshot_only {
                 stall: 0,
                 tail: 0,
                 no_markers: false,
+                bring_tracked: &[],
                 interrupt,
                 state: &STATE,
                 state_dir: Path::new(r"C:\gate-snapshot-client-tests"),

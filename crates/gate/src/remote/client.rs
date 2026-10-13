@@ -579,7 +579,7 @@ impl Attempt<'_, '_> {
 
     /// What git writes on standard output for `args` in the worktree, as the bytes it wrote, a call the console
     /// interrupt ends; a failure is the run's to tell apart.
-    fn git_bytes(&self, git: &Git, args: &[&str]) -> Result<Vec<u8>, GitError> {
+    pub(super) fn git_bytes(&self, git: &Git, args: &[&str]) -> Result<Vec<u8>, GitError> {
         let call = git::Call {
             interrupt: self.call.interrupt,
             ..git::Call::plain(Path::new(self.call.root), args, self.limit)
@@ -2180,6 +2180,7 @@ mod tests {
             stall: 60,
             tail: 0,
             no_markers: false,
+            bring_tracked: &[],
             interrupt: Some(raised()),
             state: &STATE,
             state_dir: Path::new(r"C:\gate-client-tests-state"),

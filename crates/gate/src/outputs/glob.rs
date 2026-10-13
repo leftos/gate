@@ -27,11 +27,22 @@ pub(crate) struct Globs {
 }
 
 impl Globs {
-    /// The matcher of `globs`; else why one of them cannot be matched.
+    /// The matcher of the output globs `globs`; else why one of them cannot be matched.
     pub(crate) fn new(globs: &[String]) -> Result<Globs, String> {
+        Globs::named(globs, "output glob")
+    }
+
+    /// The matcher of a routed run's `--bring-tracked` globs `globs`, which the output globs' exclusions hold for too;
+    /// else why one of them cannot be matched.
+    pub(crate) fn bring_tracked(globs: &[String]) -> Result<Globs, String> {
+        Globs::named(globs, "--bring-tracked glob")
+    }
+
+    /// The matcher of `globs`, each a `noun`; else why one of them cannot be matched, naming it by `noun`.
+    fn named(globs: &[String], noun: &str) -> Result<Globs, String> {
         let patterns = globs
             .iter()
-            .map(|glob| Regex::new(&regex_of(glob)).map_err(|error| format!("the output glob '{}' cannot be matched: {error}", escaped(glob))))
+            .map(|glob| Regex::new(&regex_of(glob)).map_err(|error| format!("the {noun} '{}' cannot be matched: {error}", escaped(glob))))
             .collect::<Result<_, _>>()?;
         let excluded = Regex::new(EXCLUDED).map_err(|error| format!("the output exclusions cannot be matched: {error}"))?;
         Ok(Globs { patterns, excluded })
@@ -112,6 +123,16 @@ mod tests {
     fn globs(globs: &[&str]) -> Globs {
         let owned: Vec<String> = globs.iter().map(|glob| (*glob).to_owned()).collect();
         Globs::new(&owned).expect("the globs can be matched")
+    }
+
+    #[test]
+    fn a_glob_too_large_to_match_is_named_by_its_option() {
+        let huge = vec!["?".repeat(200_000)];
+        let output = Globs::new(&huge).err().expect("the glob is past the matcher's size limit");
+        assert!(output.starts_with("the output glob '???"), "{}", &output[..40]);
+        let brought = Globs::bring_tracked(&huge).err().expect("the glob is past the matcher's size limit");
+        assert!(brought.starts_with("the --bring-tracked glob '???"), "{}", &brought[..40]);
+        assert!(brought.contains("' cannot be matched: "), "the matcher's reason follows the glob");
     }
 
     /// Checks `glob` matches each of `yes` and none of `no`.

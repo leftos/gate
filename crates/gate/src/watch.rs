@@ -913,6 +913,7 @@ mod tests {
             tail: 0,
             no_markers: false,
             local: false,
+            bring_tracked: Vec::new(),
             state_dir: None,
             command: command.iter().map(OsString::from).collect(),
             test_seams: TestSeams::default(),

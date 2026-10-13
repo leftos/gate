@@ -61,7 +61,7 @@ Suite = `crates/gate/tests/suite/` (binary `suite`, needs `--all-features`; test
 | Area | Suite modules that reach it | Own tests | Central? |
 |---|---|---|---|
 | gate-args lib.rs / cli.rs / values.rs / problem.rs / usage.rs | every case parses argv: all suite (parse errors `cli`, usage `cli`) | `gate-args::args` (top, run, boxcmd), unit | CENTRAL |
-| gate-args request.rs / run.rs (seam parsing) | `request`, plus every module whose flags it parses | args tests `run` | CENTRAL (a seam rename breaks callers) |
+| gate-args request.rs / run.rs (seam parsing) | `request`, plus every module whose flags it parses (`--bring-tracked`: `remote_client`) | args tests `run` | CENTRAL (a seam rename breaks callers) |
 | gate-args compat.rs | `compat`, `launcher`, `request`, `cli` | args `compat` | no |
 | gate-args boxcmd.rs | `boxside`, `boxside::outputs`, `remote_client` | args `boxcmd` | no |
 | gate-args cmdline.rs / batch.rs / program.rs | `launch` (quoting, refused batch word, `.cmd`), `journal` (`command_text`), `boxside`, `remote_client` | args `quoting`, `batch`, `program` | no |

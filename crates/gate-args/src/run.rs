@@ -22,6 +22,7 @@ pub(crate) enum ValueOption {
     StateDir,
     Cores,
     Seconds,
+    BringTracked,
     #[cfg(feature = "test-seams")]
     SampleMs,
     #[cfg(feature = "test-seams")]
@@ -126,6 +127,7 @@ pub(crate) struct RunBuilder {
     seconds: Option<u32>,
     no_markers: bool,
     local: bool,
+    bring_tracked: Vec<String>,
     print_request: bool,
     test_seams: TestSeams,
     /// `gate cutover`'s own seams, `--test-confirm-ms` and `--test-cutover-interrupt-after-list`; its poll and
@@ -143,9 +145,10 @@ impl RunBuilder {
         self.given.iter().any(|option| !is_print_request(*option))
     }
 
-    /// Records `option` as given, or the problem of its being given twice.
+    /// Records `option` as given, or the problem of its being given twice; `--bring-tracked` may be given any number of
+    /// times.
     fn first_time(&mut self, option: RunOption, spelled: &str) -> bool {
-        if self.given.contains(&option) {
+        if self.given.contains(&option) && option != RunOption::Value(ValueOption::BringTracked) {
             self.problems.push(Problem::GivenTwice(spelled.to_owned()));
             return false;
         }
@@ -195,6 +198,7 @@ impl RunBuilder {
             ValueOption::StateDir => self.state_dir = Some(PathBuf::from(value)),
             ValueOption::Cores => self.cores = Some(values::above_zero_u32(spelled, value)?),
             ValueOption::Seconds => self.seconds = Some(values::in_range(spelled, value, 1, values::MAX_BURN_SECONDS)?),
+            ValueOption::BringTracked => self.bring_tracked.push(value.to_owned()),
             #[cfg(feature = "test-seams")]
             ValueOption::SampleMs => self.test_seams.sample_ms = Some(values::above_zero(spelled, value)?),
             #[cfg(feature = "test-seams")]
@@ -320,6 +324,7 @@ impl RunBuilder {
                 tail: self.tail.unwrap_or(DEFAULT_TAIL_LINES),
                 no_markers: self.no_markers,
                 local: self.local,
+                bring_tracked: self.bring_tracked,
                 state_dir: self.state_dir,
                 command,
                 test_seams: self.test_seams,

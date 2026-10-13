@@ -1,13 +1,15 @@
 //! A routed run's fetched outputs archive put into the worktree: unpacked into a stage folder beside it, which checks
 //! every member's path and hash; each member then checked against the run's output globs, against the PC's manifest
-//! (a file it held must still have its size and last write, one it lacked must still be missing), and one whose PC file
-//! is in use or read-only skipped and said;
+//! (a file it held must still have its size and last write, one it lacked must still be missing), and one that counts as
+//! tracked (its git index, a submodule or a nested repository holds it) unless a `--bring-tracked` glob matches it, or
+//! whose PC file is in use or read-only, skipped and said;
 //! the box's work folder rewritten to the worktree's in the files that record it; and each file, its last write clamped
 //! to this PC's clock in the stage and checked unchanged once more, moved into place. The success line says what came
 //! back; every end removes the archive and the stage this run made, and only a success that skipped nothing clears the
 //! pending marker.
 
 use std::cell::Cell;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read};
 use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
@@ -17,6 +19,7 @@ use std::time::{Instant, SystemTime};
 use windows_sys::Win32::Storage::FileSystem::FILE_WRITE_ATTRIBUTES;
 
 use super::client::{Attempt, End};
+use super::git::{Git, GitError};
 use super::outputs::{self, Archive, Polled};
 use crate::boxside::payload::{escaped, ordinal_upper};
 use crate::outputs::archive::{Entry, check_folder, unpack};
@@ -51,12 +54,31 @@ pub(super) struct Fetched<'f> {
 }
 
 /// What an install put into the worktree: its files, their bytes, and the archive's bytes; and the paths of the files
-/// it skipped, the PC's file being in use or read-only.
+/// it skipped, each with why.
 struct Installed {
     count: usize,
     bytes: u64,
     compressed: u64,
-    skipped: Vec<String>,
+    skipped: Vec<(String, Skip)>,
+}
+
+/// Why the install skipped a member, which then counts as not brought back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Skip {
+    /// The worktree's git index holds its path, and no `--bring-tracked` glob matches it.
+    Tracked,
+    /// The PC's file is in use or read-only ([`writable`]).
+    InUse,
+}
+
+impl Skip {
+    /// The end of the line that says a member was skipped for this reason.
+    fn said(self) -> &'static str {
+        match self {
+            Skip::Tracked => "is tracked by git",
+            Skip::InUse => "is in use or read-only",
+        }
+    }
 }
 
 /// Why an install did not complete.
@@ -78,7 +100,8 @@ enum Unmoved {
 }
 
 /// The end of a passing run whose outputs archive `fetched` holds was fetched whole: installed, it says the success
-/// line and ends 0, clearing the pending marker unless it skipped a file in use or read-only, which it says ([`said`]).
+/// line and ends 0, clearing the pending marker unless it skipped a file git tracks or one in use or read-only, which it
+/// says ([`said`]).
 /// A refusal says why the outputs were not brought back and ends the run 1; a Ctrl+C ends it as an interrupt, saying how
 /// many files were installed when any were ([`ending`]). Every end removes the archive and the stage folder this run
 /// made, never one that was there before, saying a removal that fails; only a success that skipped nothing clears the
@@ -147,8 +170,10 @@ fn install(attempt: &Attempt<'_, '_>, fetched: &Fetched<'_>, staged: &Cell<bool>
     let root =
         std::path::absolute(attempt.call.root).map_err(|error| Unmet::Refused(in_context(Path::new(attempt.call.root), &error).to_string()))?;
     let globs = Globs::new(fetched.globs).map_err(Unmet::Refused)?;
-    let skipped = checked(&root, &entries, &globs, fetched.manifest).map_err(Unmet::Refused)?;
-    let entries: Vec<Entry> = entries.into_iter().filter(|entry| !skipped.contains(&entry.path)).collect();
+    let in_use = checked(&root, &entries, &globs, fetched.manifest).map_err(Unmet::Refused)?;
+    let skipped = skips(attempt, &root, &entries, &in_use)?;
+    let skipped_paths: HashSet<&str> = skipped.iter().map(|(path, _)| path.as_str()).collect();
+    let entries: Vec<Entry> = entries.into_iter().filter(|entry| !skipped_paths.contains(entry.path.as_str())).collect();
     let pc_root = root.display().to_string();
     rewritten(&fetched.stage, &entries, fetched.box_work, &pc_root).map_err(Unmet::Refused)?;
     let raise = attempt.call.interrupt.filter(|_| attempt.raises_at(INSTALL));
@@ -173,16 +198,174 @@ fn install(attempt: &Attempt<'_, '_>, fetched: &Fetched<'_>, staged: &Cell<bool>
     })
 }
 
+/// What the install skips of `entries`, below the worktree `root`, `in_use` being the paths of those whose PC file is in
+/// use or read-only: each member that counts as tracked and no `--bring-tracked` glob matches ([`tracked`]), its index
+/// read with one `git ls-files -z -s` over the whole of it, and each in use ([`reasons`]). An archive with no members
+/// asks git nothing. Else why the install is refused, or the interrupt ([`unmet_of`]).
+fn skips(attempt: &Attempt<'_, '_>, root: &Path, entries: &[Entry], in_use: &[String]) -> Result<Vec<(String, Skip)>, Unmet> {
+    if entries.is_empty() {
+        return Ok(Vec::new());
+    }
+    let bring = Globs::bring_tracked(attempt.call.bring_tracked).map_err(Unmet::Refused)?;
+    let git = Git::find(Path::new(attempt.call.root)).map_err(Unmet::Refused)?;
+    let listing = attempt.git_bytes(&git, &["ls-files", "-z", "-s"]).map_err(unmet_of)?;
+    let index = Index::of(&listing).map_err(Unmet::Refused)?;
+    let in_use: HashSet<&str> = in_use.iter().map(String::as_str).collect();
+    Ok(reasons(entries, &tracked(&index, root, entries, &bring), &in_use))
+}
+
+/// The end of an install whose read of the git index failed as `error`: the console interrupt is an interrupt before
+/// any move; a failure, or a listing past the git runner's cap, refuses the install.
+fn unmet_of(error: GitError) -> Unmet {
+    match error {
+        GitError::Interrupted => Unmet::Interrupted { done: 0, total: 0 },
+        GitError::Failed(why) | GitError::OverCap(why) => Unmet::Refused(why),
+    }
+}
+
+/// The mode `git ls-files -s` gives a gitlink, a submodule's entry in its superproject's index.
+const GITLINK: &str = "160000";
+
+/// What the worktree's git index holds, as `git ls-files -z -s` lists it, each path keyed by [`ordinal_upper`]: the
+/// worktree's files match without regard to case.
+#[derive(Debug, Default)]
+struct Index {
+    /// Each path it lists.
+    paths: HashSet<String>,
+    /// Each folder every member below which counts as tracked: a submodule's (a gitlink), whose files the index does not
+    /// list, initialised or not; and the one holding a folder whose name is not UTF-8.
+    below: HashSet<String>,
+    /// Each folder every member directly in which counts as tracked: the one holding a file whose name is not UTF-8,
+    /// which Git for Windows checks out under a decoded name the install cannot match exactly.
+    within: HashSet<String>,
+}
+
+impl Index {
+    /// The index `listing` lists, each record `<mode> <object> <stage>\t<path>` ended by a NUL; else why it cannot be
+    /// read.
+    fn of(listing: &[u8]) -> Result<Index, String> {
+        let mut index = Index::default();
+        for record in listing.split(|byte| *byte == 0).filter(|record| !record.is_empty()) {
+            let Some((mode, path)) = record_parts(record) else {
+                return Err(format!(
+                    "git ls-files -z -s wrote a record that is not '<mode> <object> <stage>\\t<path>': {}",
+                    escaped(&String::from_utf8_lossy(record))
+                ));
+            };
+            match std::str::from_utf8(path) {
+                Ok(path) if mode == GITLINK => {
+                    index.below.insert(ordinal_upper(path));
+                    index.paths.insert(ordinal_upper(path));
+                }
+                Ok(path) => {
+                    index.paths.insert(ordinal_upper(path));
+                }
+                Err(_) => index.undecodable(path),
+            }
+        }
+        Ok(index)
+    }
+
+    /// Records the listed `path`, which is not UTF-8, by the folder its first part that is not holds: the members
+    /// directly in that folder count as tracked when the part is the file's name, every member below it when the part
+    /// is a folder's.
+    fn undecodable(&mut self, path: &[u8]) {
+        let parts: Vec<&str> = path
+            .split(|byte| *byte == b'/')
+            .map_while(|part| std::str::from_utf8(part).ok())
+            .collect();
+        let folder = ordinal_upper(&parts.join("/"));
+        // A `/` is never inside a UTF-8 sequence, so the parts that decode end at a part of its own that does not.
+        let named_file = path.split(|byte| *byte == b'/').count() == parts.len() + 1;
+        if named_file {
+            self.within.insert(folder);
+        } else {
+            self.below.insert(folder);
+        }
+    }
+
+    /// Whether the member at `path` counts as tracked: the index lists it, or its folder or one above it is one whose
+    /// members all count ([`Index::below`], [`Index::within`]).
+    fn holds(&self, path: &str) -> bool {
+        let key = ordinal_upper(path);
+        let parent = key.rfind('/').map_or("", |end| &key[..end]);
+        self.paths.contains(&key)
+            || self.within.contains(parent)
+            || std::iter::once("")
+                .chain(key.match_indices('/').map(|(end, _)| &key[..end]))
+                .any(|folder| self.below.contains(folder))
+    }
+}
+
+/// The mode and the path of a `git ls-files -z -s` record, `<mode> <object> <stage>\t<path>`; `None` for one of
+/// another shape.
+fn record_parts(record: &[u8]) -> Option<(&str, &[u8])> {
+    let tab = record.iter().position(|byte| *byte == b'\t')?;
+    let fields: Vec<&str> = std::str::from_utf8(&record[..tab]).ok()?.split(' ').collect();
+    match fields.as_slice() {
+        [mode, _object, _stage] => Some((mode, &record[tab + 1..])),
+        _ => None,
+    }
+}
+
+/// The paths of the `entries` below the worktree `root` that count as tracked, but for those a `bring` glob matches:
+/// each `index` holds ([`Index::holds`]), and each below a folder holding a repository of its own ([`nested`]).
+fn tracked<'e>(index: &Index, root: &Path, entries: &'e [Entry], bring: &Globs) -> HashSet<&'e str> {
+    let mut seen = HashMap::new();
+    entries
+        .iter()
+        .filter(|entry| !bring.matches(&entry.path) && (index.holds(&entry.path) || nested(root, &entry.path, &mut seen)))
+        .map(|entry| entry.path.as_str())
+        .collect()
+}
+
+/// Whether a folder of the member at the `/`-separated `path` below the worktree `root`, the root not counted, holds a
+/// `.git` entry of its own: a repository the worktree's does not track, whose files no index the install reads lists.
+/// `seen` keeps each folder's answer.
+fn nested(root: &Path, path: &str, seen: &mut HashMap<String, bool>) -> bool {
+    path.match_indices('/').any(|(end, _)| {
+        let folder = &path[..end];
+        *seen.entry(ordinal_upper(folder)).or_insert_with(|| holds_git(&below(root, folder)))
+    })
+}
+
+/// Whether `folder` holds a `.git` file or folder. A missing folder, or a file in its place, holds none; one that
+/// cannot be read counts as holding one, so a tracked file is never overwritten for want of a look.
+fn holds_git(folder: &Path) -> bool {
+    match fs::symlink_metadata(folder.join(".git")) {
+        Ok(_) => true,
+        Err(error) => !matches!(error.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory),
+    }
+}
+
+/// Each of `entries` the install skips and why, in order: one in `tracked` as tracked, whether or not it is also
+/// `in_use`, then one in `in_use` as in use.
+fn reasons(entries: &[Entry], tracked: &HashSet<&str>, in_use: &HashSet<&str>) -> Vec<(String, Skip)> {
+    entries
+        .iter()
+        .filter_map(|entry| {
+            let skip = if tracked.contains(entry.path.as_str()) {
+                Skip::Tracked
+            } else if in_use.contains(entry.path.as_str()) {
+                Skip::InUse
+            } else {
+                return None;
+            };
+            Some((entry.path.clone(), skip))
+        })
+        .collect()
+}
+
 /// The lines an install that put `installed` into the worktree says, `seconds` after its fetch started: one for each
-/// file it skipped, the PC's file being in use or read-only, then the success line.
+/// file it skipped, saying why, then the success line.
 fn said(installed: &Installed, seconds: f64) -> Vec<String> {
     let mut lines: Vec<String> = installed
         .skipped
         .iter()
-        .map(|path| {
+        .map(|(path, skip)| {
             format!(
                 "gate: remote outputs not fully brought back: {}",
-                escaped(&format!("{path} is in use or read-only"))
+                escaped(&format!("{path} {}", skip.said()))
             )
         })
         .collect();
@@ -402,6 +585,7 @@ fn move_one(stage: &Path, root: &Path, entry: &Entry, manifest: &Manifest, now: 
 #[expect(clippy::expect_used, reason = "a test that cannot make its files must fail loudly")]
 mod tests {
     use std::cell::Cell;
+    use std::collections::HashSet;
     use std::fs::{self, File};
     use std::io::{self, Read, Write};
     use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
@@ -411,13 +595,17 @@ mod tests {
 
     use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_DELETE;
 
-    use super::{Installed, Unmet, Unmoved, checked, ending, moved, rewritten, said, stage_made, success_line, unpacked};
+    use super::{
+        Index, Installed, Skip, Unmet, Unmoved, checked, ending, moved, reasons, rewritten, said, stage_made, success_line, tracked, unmet_of,
+        unpacked,
+    };
     use crate::boxside::outputs::OUTPUTS_BUDGET;
     use crate::outputs::archive::{Entry, pack};
     use crate::outputs::glob::Globs;
     use crate::outputs::manifest::{Held, Manifest};
     use crate::outputs::walk::{Stamp, walk};
     use crate::remote::client::End;
+    use crate::remote::git::GitError;
 
     const BOX_WORK: &str = r"D:\gate-remote\work\app-1a2b3c4d";
     const PC_ROOT: &str = r"C:\src\app";
@@ -616,12 +804,189 @@ mod tests {
             count: 3,
             bytes: 3_145_728,
             compressed: 1_048_576,
-            skipped: vec!["bin/held.dll".to_owned()],
+            skipped: vec![("bin/held.dll".to_owned(), Skip::InUse), ("bin/kept.dll".to_owned(), Skip::Tracked)],
         };
         let success = "gate: outputs: 3 file(s), 3.0 MB (1.0 MB compressed) in 2.3 s";
         assert_eq!(success_line(&installed, 2.25), success, "half a tenth rounds away from zero");
-        let skipped = "gate: remote outputs not fully brought back: bin/held.dll is in use or read-only";
-        assert_eq!(said(&installed, 2.25), [skipped, success], "each skipped file, then the success line");
+        let in_use = "gate: remote outputs not fully brought back: bin/held.dll is in use or read-only";
+        let tracked = "gate: remote outputs not fully brought back: bin/kept.dll is tracked by git";
+        assert_eq!(
+            said(&installed, 2.25),
+            [in_use, tracked, success],
+            "each skipped file and why, then the success line"
+        );
+    }
+
+    /// The globs of no `--bring-tracked`.
+    fn none_brought() -> Globs {
+        Globs::bring_tracked(&[]).expect("no globs can be matched")
+    }
+
+    /// A `git ls-files -z -s` listing of `records`, each a mode and a path.
+    fn listed(records: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut listing = Vec::new();
+        for (mode, path) in records {
+            listing.extend_from_slice(format!("{mode} {} 0\t", "1".repeat(40)).as_bytes());
+            listing.extend_from_slice(path);
+            listing.push(0);
+        }
+        listing
+    }
+
+    /// A file's listing of each of `paths`.
+    fn files(paths: &[&[u8]]) -> Vec<u8> {
+        listed(&paths.iter().map(|path| ("100644", *path)).collect::<Vec<_>>())
+    }
+
+    /// The members among `entries` the index `listing` makes tracked, below a worktree `root` and with `bring` the
+    /// `--bring-tracked` globs.
+    fn tracked_of<'e>(listing: &[u8], root: &Path, entries: &'e [Entry], bring: &Globs) -> HashSet<&'e str> {
+        tracked(&Index::of(listing).expect("the listing can be read"), root, entries, bring)
+    }
+
+    fn set<'p>(paths: &[&'p str]) -> HashSet<&'p str> {
+        paths.iter().copied().collect()
+    }
+
+    #[test]
+    fn a_member_the_index_lists_is_tracked_whatever_its_case() {
+        let root = scratch("tracked-case");
+        let entries = [entry("bin/a.dll"), entry("BIN/B.dll"), entry("bin/c.dll")];
+        let listing = files(&[b"src/main.rs", b"bin/a.dll", b"bin/b.DLL"]);
+
+        assert_eq!(tracked_of(&listing, &root, &entries, &none_brought()), set(&["bin/a.dll", "BIN/B.dll"]));
+        assert_eq!(tracked_of(b"", &root, &entries, &none_brought()), set(&[]), "an empty index");
+    }
+
+    #[test]
+    fn a_member_under_a_submodule_is_tracked() {
+        let root = scratch("tracked-gitlink");
+        let entries = [
+            entry("lib/sub/bin/a.dll"),
+            entry("LIB/SUB/x.dll"),
+            entry("lib/sub"),
+            entry("lib/subway/a.dll"),
+            entry("lib/a.dll"),
+        ];
+        let listing = listed(&[("160000", b"lib/sub"), ("100644", b"src/main.rs")]);
+
+        assert_eq!(
+            tracked_of(&listing, &root, &entries, &none_brought()),
+            set(&["lib/sub/bin/a.dll", "LIB/SUB/x.dll", "lib/sub"])
+        );
+    }
+
+    #[test]
+    fn a_member_below_a_folder_holding_its_own_git_is_tracked() {
+        let root = scratch("tracked-nested");
+        put(&root, ".git/HEAD", b"ref: refs/heads/main");
+        put(&root, "vendor/lib/.git", b"gitdir: elsewhere");
+        put(&root, "tools/.git/HEAD", b"ref: refs/heads/main");
+        let entries = [
+            entry("vendor/lib/bin/a.dll"),
+            entry("vendor/bin/a.dll"),
+            entry("Tools/bin/x.dll"),
+            entry("bin/a.dll"),
+            entry("missing/bin/a.dll"),
+        ];
+
+        assert_eq!(
+            tracked_of(b"", &root, &entries, &none_brought()),
+            set(&["vendor/lib/bin/a.dll", "Tools/bin/x.dll"]),
+            "the worktree's own .git does not count"
+        );
+    }
+
+    #[test]
+    fn an_index_path_that_is_not_utf8_makes_its_folder_tracked() {
+        let root = scratch("tracked-not-utf8");
+        let entries = [
+            entry("bin/\u{FFFD}.dll"),
+            entry("BIN/a.dll"),
+            entry("bin/sub/a.dll"),
+            entry("obj/a.dll"),
+            entry("obj/sub/a.dll"),
+            entry("a.dll"),
+            entry("lib/a.dll"),
+        ];
+
+        let file_name = files(&[b"bin/\xFF.dll"]);
+        assert_eq!(
+            tracked_of(&file_name, &root, &entries, &none_brought()),
+            set(&["bin/\u{FFFD}.dll", "BIN/a.dll"]),
+            "the members in its folder, none below"
+        );
+        let folder_name = files(&[b"obj/\xFF/a.dll"]);
+        assert_eq!(
+            tracked_of(&folder_name, &root, &entries, &none_brought()),
+            set(&["obj/a.dll", "obj/sub/a.dll"]),
+            "a folder name that is not UTF-8: every member below the folder holding it"
+        );
+        let at_the_root = files(&[b"\xFF.txt"]);
+        assert_eq!(tracked_of(&at_the_root, &root, &entries, &none_brought()), set(&["a.dll"]));
+    }
+
+    #[test]
+    fn a_listing_record_git_does_not_write_refuses_the_install() {
+        assert_eq!(
+            Index::of(b"100644 1111 0\tbin/a.dll\0bin/b.dll\0").err(),
+            Some("git ls-files -z -s wrote a record that is not '<mode> <object> <stage>\\t<path>': bin/b.dll".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_bring_tracked_glob_installs_the_members_it_matches_and_no_excluded_one() {
+        let root = scratch("tracked-bring");
+        let listing = files(&[b"bin/a.dll", b"obj/a.dll", b"bin/TestResults/a.trx"]);
+        let entries = [entry("bin/a.dll"), entry("obj/a.dll"), entry("bin/TestResults/a.trx")];
+        let bin = Globs::bring_tracked(&["BIN/**".to_owned()]).expect("the glob can be matched");
+        assert_eq!(
+            tracked_of(&listing, &root, &entries, &bin),
+            set(&["obj/a.dll", "bin/TestResults/a.trx"]),
+            "matched in any case"
+        );
+
+        let everything = Globs::bring_tracked(&["**".to_owned()]).expect("the glob can be matched");
+        assert_eq!(
+            tracked_of(&listing, &root, &entries, &everything),
+            set(&["bin/TestResults/a.trx"]),
+            "an excluded path is never brought"
+        );
+    }
+
+    #[test]
+    fn a_member_tracked_and_in_use_is_said_once_as_tracked() {
+        let entries = [entry("bin/a.dll"), entry("bin/b.dll"), entry("bin/c.dll"), entry("bin/d.dll")];
+        let tracked = set(&["bin/c.dll", "bin/b.dll"]);
+        let in_use = set(&["bin/b.dll", "bin/d.dll"]);
+
+        assert_eq!(
+            reasons(&entries, &tracked, &in_use),
+            [
+                ("bin/b.dll".to_owned(), Skip::Tracked),
+                ("bin/c.dll".to_owned(), Skip::Tracked),
+                ("bin/d.dll".to_owned(), Skip::InUse)
+            ]
+        );
+    }
+
+    #[test]
+    fn an_index_that_cannot_be_read_whole_refuses_the_install_and_an_interrupt_ends_it() {
+        for error in [
+            GitError::Failed("git ls-files -z failed in C:\\src\\app (status 128): fatal: bad index".to_owned()),
+            GitError::OverCap("git ls-files -z in C:\\src\\app wrote more than 16 MiB".to_owned()),
+        ] {
+            let why = String::from(match &error {
+                GitError::Failed(why) | GitError::OverCap(why) => why.as_str(),
+                GitError::Interrupted => "",
+            });
+            let (end, line) = ending(unmet_of(error));
+            assert!(matches!(end, End::Status(1)), "{end:?}");
+            assert_eq!(line, Some(format!("gate: remote outputs not brought back: {why}")));
+        }
+        assert_eq!(unmet_of(GitError::Interrupted), Unmet::Interrupted { done: 0, total: 0 });
+        let (end, line) = ending(unmet_of(GitError::Interrupted));
+        assert!(matches!(end, End::Interrupted) && line.is_none(), "{end:?} {line:?}");
     }
 
     /// The reason of a move that failed; else what stopped it, which no failure's reason starts with.

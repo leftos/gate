@@ -210,6 +210,8 @@ pub struct RunRequest {
     pub tail: u64,
     pub no_markers: bool,
     pub local: bool,
+    /// The `--bring-tracked` globs, in the order given: a fetched output git tracks is installed only when one matches it.
+    pub bring_tracked: Vec<String>,
     /// `--state-dir` as given.
     pub state_dir: Option<PathBuf>,
     /// The words after `--`, unchanged.

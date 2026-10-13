@@ -519,6 +519,7 @@ fn call_of<'r>(request: &'r RunRequest, log: &'r Log, host: &Host, root: &'r Res
         stall: request.stall,
         tail: request.tail,
         no_markers: request.no_markers,
+        bring_tracked: &request.bring_tracked,
         interrupt: host.interrupt,
         state: &root.root,
         state_dir: &root.path,

@@ -27,6 +27,7 @@ fn run_reads_every_option_and_the_defaults() {
             tail: DEFAULT_TAIL_LINES,
             no_markers: false,
             local: false,
+            bring_tracked: Vec::new(),
             state_dir: None,
             command: os(&["cmd", "/c", "echo hi"]),
             test_seams: TestSeams::default(),
@@ -212,6 +213,38 @@ fn run_repeated_option_is_usage_error() {
     assert_eq!(
         problems(&["-Log", "a", "-log", "b", "-TimeoutSeconds", "5", "-Slot", "heavy", "--", "cmd"]),
         ["gate: -log is given twice"]
+    );
+}
+
+#[test]
+fn run_collects_every_bring_tracked_glob_in_order() {
+    let request = run_with(&[
+        "--bring-tracked",
+        "bin/**",
+        "--bring-tracked=obj/*.dll",
+        "--bring-tracked",
+        "bin/**",
+        "--",
+        "cmd",
+    ]);
+    assert_eq!(request.bring_tracked, ["bin/**", "obj/*.dll", "bin/**"]);
+    assert_eq!(run_with(&["--", "cmd"]).bring_tracked, Vec::<String>::new(), "none by default");
+}
+
+#[test]
+fn run_bring_tracked_needs_a_value_each_time() {
+    assert_eq!(problems_with(&["--bring-tracked", "--", "cmd"]), ["gate: --bring-tracked needs a value"]);
+    assert_eq!(
+        problems_with(&["--bring-tracked", "bin/**", "--bring-tracked=", "--", "cmd"]),
+        ["gate: --bring-tracked needs a value"]
+    );
+}
+
+#[test]
+fn a_repeated_bring_tracked_leaves_other_options_given_once() {
+    assert_eq!(
+        problems_with(&["--bring-tracked", "a", "--bring-tracked", "b", "--timeout", "9", "--", "cmd"]),
+        ["gate: --timeout is given twice"]
     );
 }
 
