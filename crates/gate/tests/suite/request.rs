@@ -71,6 +71,7 @@ fn print_request_shows_the_new_cli_request() {
             "remoteInterruptAt": null,
             "remoteWatchCall": null,
             "remoteTimeoutMs": null,
+            "remoteOutputsBudgetBytes": null,
             "remoteScript": null,
             "bridgePwsh": null,
             "ownStartFails": false,

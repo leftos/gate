@@ -2543,6 +2543,30 @@ fn a_passing_run_installs_its_fetched_outputs() {
     assert!(!outcome.stderr.contains("not brought back"), "{outcome:?}");
 }
 
+/// The builder streams more than the fetch cap the lowered outputs budget gives (`--test-remote-outputs-budget-bytes
+/// 1 MiB`, so 1 MiB + 1 MiB/64 + 1 MiB of slack, said as `2.0 MiB`): a cut, but the run keeps its passing status, the
+/// partial archive is removed and nothing is installed.
+#[test]
+fn an_outputs_call_past_the_fetch_cap_keeps_the_pass_and_brings_nothing_back() {
+    let case = outputs_case("client-outputs-fetch-cap", &BIN);
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok", "garbage 3000000"]);
+    let tuned = Tuned {
+        extra: &["--test-remote-outputs-budget-bytes", "1048576"],
+        ..Tuned::default()
+    };
+    let command = [r".\tool.exe", "write", r"bin\new.txt", "built"];
+
+    let outcome = finish(client_gate_tuned(&case, "out.log", &steps, &tuned, &command));
+
+    assert_eq!(outcome.code, Some(0), "the pass stands: {outcome:?}");
+    let line = "gate: remote outputs not brought back: the archive passed 2.0 MiB";
+    assert!(outcome.stderr.contains(line), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "run", "outputs"], "{outcome:?}");
+    assert_eq!(outputs_leftovers(&case), Vec::<PathBuf>::new(), "the archive and no stage are left");
+    assert!(!case.folder().join("bin").join("new.txt").exists(), "nothing is installed");
+    assert!(pending_marker(&case).exists(), "the next run asks for every output: {outcome:?}");
+}
+
 #[test]
 fn a_failing_run_makes_no_outputs_call() {
     let case = outputs_case("client-outputs-failing", &BIN);

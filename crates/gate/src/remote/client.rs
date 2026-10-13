@@ -18,6 +18,7 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
+use std::num::NonZeroU64;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -44,8 +45,10 @@ use super::syncback;
 use super::transport::{Local, Program, Transport};
 use super::watchdog::{self, Cut, Kept, Kill, LINE_CAP};
 use super::{FAILED, FAILED_RUN, REFUSED, Refusal, RemoteCall, RemoteClient, RemoteOutcome, refused_line, started_line};
+use crate::boxside::outputs::OUTPUTS_BUDGET;
 use crate::boxside::payload::escaped;
 use crate::environment::Variables;
+use crate::outputs::archive::sent_limit;
 use crate::run::{CONTROL_C_EXIT, ERROR_FILE_NOT_FOUND, find_program};
 
 /// The statuses of a preflight whose builder has no `gate box` that takes the run: cmd's for a program it cannot find,
@@ -100,6 +103,9 @@ pub(crate) struct RustClient {
     /// The most bytes the files a back commit writes into the worktree may total: `--test-remote-apply-cap-bytes`,
     /// else 4 GiB.
     apply_cap: u64,
+    /// The box's outputs budget: `--test-remote-outputs-budget-bytes`, else 50 GiB. What the outputs fetch is capped
+    /// at, and what the install unpacks its archive to.
+    outputs_budget: u64,
     /// `--test-own-start-fails`: this gate's start, which names the sync-back's quarantine, cannot be read.
     own_start_fails: bool,
 }
@@ -126,6 +132,7 @@ impl RustClient {
             local_sdks: seams.local_sdks.clone(),
             fetch_cap: seams.remote_fetch_cap_bytes.unwrap_or(watchdog::FETCH_CAP),
             apply_cap: seams.remote_apply_cap_bytes.unwrap_or(watchdog::APPLY_CAP),
+            outputs_budget: seams.remote_outputs_budget_bytes.unwrap_or(OUTPUTS_BUDGET),
             own_start_fails: seams.own_start_fails,
         })
     }
@@ -184,6 +191,7 @@ impl RemoteClient for RustClient {
             local_sdks: self.local_sdks.as_deref(),
             fetch_cap: self.fetch_cap,
             apply_cap: self.apply_cap,
+            outputs_budget: self.outputs_budget,
             own_start_fails: self.own_start_fails,
             lines: Vec::new(),
             problem: None,
@@ -265,12 +273,13 @@ pub(super) enum Watch {
 }
 
 impl Watch {
-    /// Why a call watched so, started at `begun`, is killed at `now`, nothing having come from it for `idle`, whether
-    /// a capped call sent a line `too_long`, and the bytes its job has `written`, `None` when they were not read;
-    /// `None` while it may run on. A line too long comes first, then a fetch's bytes past its cap, then its clocks.
-    fn cut(self, now: Instant, begun: Instant, idle: Duration, too_long: bool, written: Option<u64>) -> Option<Cut> {
-        if too_long {
-            return Some(Cut::TooLong);
+    /// Why a call watched so, started at `begun`, is killed at `now`, nothing having come from it for `idle`, with
+    /// what its readers have `raised`, and the bytes its job has `written`, `None` when they were not read; `None`
+    /// while it may run on. A raised line past the line cap comes first, then a raw copy past its archive cap, then a
+    /// fetch's job bytes past its cap, then its clocks.
+    fn cut(self, now: Instant, begun: Instant, idle: Duration, raised: Raised, written: Option<u64>) -> Option<Cut> {
+        if let Some(cut) = raised.cut() {
+            return Some(cut);
         }
         if let Some(cut) = self.over(written) {
             return Some(cut);
@@ -402,6 +411,9 @@ pub(super) struct Attempt<'c, 'a> {
     pub(super) fetch_cap: u64,
     /// The most bytes the files a back commit writes into the worktree may total.
     pub(super) apply_cap: u64,
+    /// The box's outputs budget: the outputs fetch is capped at zstd's worst case for it, and the install unpacks its
+    /// archive to it.
+    pub(super) outputs_budget: u64,
     /// `--test-own-start-fails`: this gate's start, which names the sync-back's quarantine, cannot be read.
     pub(super) own_start_fails: bool,
     lines: Vec<String>,
@@ -894,8 +906,9 @@ impl Attempt<'_, '_> {
         let line = payload::capped("outputs", payload::line("outputs", &payload::outputs_word(location, name))).map_err(End::Failed)?;
         let raise = self.raises_at("outputs");
         let (mut called, _) = self.with_retry(SSH_FAILED, |attempt| {
+            let cap = sent_limit(attempt.outputs_budget);
             let only = CallOnly {
-                sink: Some(archive.create().map_err(End::Failed)?),
+                sink: Some(archive.create(cap).map_err(End::Failed)?),
                 ..CallOnly::default()
             };
             attempt.ssh(&line, Echo::LogOnly, Watch::Fetch(limits, None), raise, only)
@@ -955,10 +968,23 @@ impl Attempt<'_, '_> {
             capped: echo != Echo::Console,
             lines: starts.nonce.as_deref().map(|nonce| Arc::new(ProtocolLines::new(nonce))),
         };
-        match starts.sink {
-            Some(sink) => relayed_raw(stdout, sink.file, sink.shown, &shared, done.clone()),
-            None => relayed(stdout, Reader::new(false, reading.clone(), out_log), &shared, done.clone()),
-        }
+        let raw = if let Some(sink) = starts.sink {
+            Some(relayed_raw(
+                stdout,
+                Capped {
+                    inner: sink.file,
+                    cap: sink.cap,
+                    shared: Arc::clone(&shared),
+                    written: 0,
+                },
+                sink.shown,
+                &shared,
+                done.clone(),
+            ))
+        } else {
+            relayed(stdout, Reader::new(false, reading.clone(), out_log), &shared, done.clone());
+            None
+        };
         relayed(stderr, Reader::new(true, reading, err_log), &shared, done);
         let watched = Watched {
             running: &running,
@@ -968,7 +994,14 @@ impl Attempt<'_, '_> {
             shown: &shown,
         };
         let raise = self.call.interrupt.filter(|_| starts.raise);
-        let Watching { ended, looks } = watched.watch(watch, self.call.interrupt, raise)?;
+        let watching = watched.watch(watch, self.call.interrupt, raise);
+        if let Some(raw) = raw {
+            // The call's end has come: the copy writes nothing more into an archive the fetch is about to remove.
+            shared.stop();
+            let drained = watching.as_ref().is_ok_and(|watching| watching.ended.drained());
+            self.ended_raw(raw, drained);
+        }
+        let Watching { ended, looks } = watching?;
         if let Some(line) = &looks.unread {
             self.logged(line);
         }
@@ -976,7 +1009,7 @@ impl Attempt<'_, '_> {
             self.emptied(&job, &shown);
         }
         let heard = std::mem::take(&mut *held(&shared.heard));
-        match called_of(ended, shared.progress.too_long(), heard) {
+        match called_of(ended, shared.progress.raised(), heard) {
             Ok(called) => Ok(Called {
                 written: looks.written,
                 ..called
@@ -989,6 +1022,23 @@ impl Attempt<'_, '_> {
                 }
                 Err(End::Interrupted)
             }
+        }
+    }
+
+    /// Gives the raw copy's reader `raw` the rest of its [`DRAIN`] to end, when the call's own end did not already
+    /// drain the readers (`drained`), joins it, and says a reader that panicked or one that has not ended by then. The
+    /// sink has already been made to stop writing, so nothing more goes into the archive the fetch is about to remove.
+    fn ended_raw(&mut self, raw: thread::JoinHandle<()>, drained: bool) {
+        let deadline = if drained { Instant::now() } else { Instant::now() + DRAIN };
+        while !raw.is_finished() && Instant::now() < deadline {
+            thread::sleep(PAUSE_STEP);
+        }
+        if raw.is_finished() {
+            if raw.join().is_err() {
+                self.logged("gate: the outputs call's raw copy panicked");
+            }
+        } else {
+            self.logged(&format!("gate: the outputs call's raw copy did not end within {} s", DRAIN.as_secs()));
         }
     }
 
@@ -1077,6 +1127,7 @@ impl<'c, 'a> Attempt<'c, 'a> {
             local_sdks: None,
             fetch_cap: watchdog::FETCH_CAP,
             apply_cap: watchdog::APPLY_CAP,
+            outputs_budget: OUTPUTS_BUDGET,
             own_start_fails: false,
             lines: Vec::new(),
             problem: None,
@@ -1107,6 +1158,18 @@ enum CallEnd {
     Interrupted(Option<String>),
 }
 
+impl CallEnd {
+    /// Whether the call's own end gave its readers their whole [`DRAIN`]: the watch heard both of them end, or the
+    /// cut's [`Watched::end`] waited the drain out. It gives up on them early, and says so in its problem, when it
+    /// cannot end the call's job, when the call's own process outlives [`KILL_WAIT`], and when it cannot wait.
+    fn drained(&self) -> bool {
+        match self {
+            CallEnd::Exited(_) | CallEnd::ExitedOver(_) | CallEnd::Cut(_, None) | CallEnd::Interrupted(None) => true,
+            CallEnd::Cut(_, Some(_)) | CallEnd::Interrupted(Some(_)) => false,
+        }
+    }
+}
+
 /// Why a watched call gave no result: the client failed it, or a Ctrl+C ended it, with what else went wrong meanwhile.
 #[derive(Debug)]
 enum Unfinished {
@@ -1114,16 +1177,16 @@ enum Unfinished {
     Interrupted(Option<String>),
 }
 
-/// The call that ended as `ended`, a capped one having sent a line `too_long` or not, from what its streams said: a
+/// The call that ended as `ended`, with what its readers have `raised` by its end, from what its streams said: a
 /// reader's problem fails a call that ended on its own, and is kept as a note of one the client cut or a Ctrl+C
 /// ended, whose end stands.
-fn called_of(ended: CallEnd, too_long: bool, mut heard: Heard) -> Result<Called, Unfinished> {
+fn called_of(ended: CallEnd, raised: Raised, mut heard: Heard) -> Result<Called, Unfinished> {
     let (status, cut, ending) = match ended {
         CallEnd::Interrupted(ending) => return Err(Unfinished::Interrupted(joined(heard.problem.take(), ending))),
         CallEnd::Cut(cut, ending) => (KILLED, Some(cut), ending),
-        // A line past the cap cuts the call even when it ended before the watch saw the line, and comes before bytes
-        // past a cap that the look after the exit found.
-        CallEnd::Exited(_) | CallEnd::ExitedOver(_) if too_long => (KILLED, Some(Cut::TooLong), None),
+        // A line past the line cap, or a raw copy past its archive cap, cuts the call even when it ended before the
+        // watch saw either, and comes before bytes past a job's cap that the look after the exit found.
+        CallEnd::Exited(_) | CallEnd::ExitedOver(_) if raised.cut().is_some() => (KILLED, raised.cut(), None),
         CallEnd::ExitedOver(cut) => (KILLED, Some(cut), None),
         CallEnd::Exited(status) => (status, None, None),
     };
@@ -1207,7 +1270,7 @@ impl Watched<'_> {
                 return Ok(Watching { ended, looks });
             }
             let written = self.written(watch, &mut looks);
-            if let Some(cut) = watch.cut(Instant::now(), begun, self.progress.idle(), self.progress.too_long(), written) {
+            if let Some(cut) = watch.cut(Instant::now(), begun, self.progress.idle(), self.progress.raised(), written) {
                 let ended = CallEnd::Cut(cut, self.end(open));
                 return Ok(Watching { ended, looks });
             }
@@ -1298,10 +1361,43 @@ struct CallOnly {
 }
 
 /// Where a call's standard output is copied raw, byte for byte, rather than read as lines: the outputs call's archive
-/// file, and its path as the line saying it cannot be written shows it.
+/// file, its path as the line saying it cannot be written shows it, and the most bytes the copy may write into it.
 pub(super) struct RawSink {
     pub(super) file: File,
     pub(super) shown: String,
+    pub(super) cap: NonZeroU64,
+}
+
+/// The sink a raw copy writes through: the archive's file and the cap it may write, with the call's progress to raise
+/// the passed flag on. Past the cap no further byte reaches the file, and the copy reports no failure, so it ends with
+/// its stream rather than on a write error; the watch cuts the call for the flag. Once the call's end has come, nothing
+/// more is written either: the archive is about to be removed.
+struct Capped<W: Write> {
+    inner: W,
+    cap: NonZeroU64,
+    shared: Arc<Shared>,
+    written: u64,
+}
+
+impl<W: Write> Write for Capped<W> {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        if self.shared.stopped() {
+            return Ok(buffer.len());
+        }
+        let room = self.cap.get().saturating_sub(self.written);
+        if room == 0 {
+            self.shared.progress.cap_passed(self.cap.get());
+            return Ok(buffer.len());
+        }
+        let taken = usize::try_from(room).unwrap_or(usize::MAX).min(buffer.len());
+        let written = self.inner.write(buffer.get(..taken).unwrap_or(buffer))?;
+        self.written += written as u64;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 /// Writes `input` to a call's `stdin` on a thread of its own, then closes it. A write that fails, as one to a call that
@@ -1417,14 +1513,35 @@ impl Heard {
     }
 }
 
-/// When a call's streams last sent a byte, whether they sent any, and whether a capped one sent a line past the cap:
-/// what the watcher reads, with no lock and no wait on a reader's writes.
+/// When a call's streams last sent a byte, whether they sent any, whether a capped one sent a line past the cap, and
+/// the cap a raw copy of its standard output passed: what the watcher reads, with no lock and no wait on a reader's
+/// writes.
 struct Progress {
     begun: Instant,
     /// Milliseconds from `begun` to the last byte.
     last_byte: AtomicU64,
     any: AtomicBool,
     too_long: AtomicBool,
+    /// The cap a raw copy of the call's standard output passed, 0 until one did: every cap is above 0.
+    passed: AtomicU64,
+}
+
+/// What a call's readers have raised that cuts it: a line past the line cap, and the cap a raw copy of its standard
+/// output passed, `None` until one did.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Raised {
+    too_long: bool,
+    passed: Option<u64>,
+}
+
+impl Raised {
+    /// The cut a raised flag calls for, a line past the line cap first: `None` while neither was raised.
+    fn cut(self) -> Option<Cut> {
+        if self.too_long {
+            return Some(Cut::TooLong);
+        }
+        self.passed.map(Cut::ArchiveTooBig)
+    }
 }
 
 impl Progress {
@@ -1434,6 +1551,7 @@ impl Progress {
             last_byte: AtomicU64::new(0),
             any: AtomicBool::new(false),
             too_long: AtomicBool::new(false),
+            passed: AtomicU64::new(0),
         }
     }
 
@@ -1461,13 +1579,37 @@ impl Progress {
     fn cut_too_long(&self) {
         self.too_long.store(true, Ordering::Relaxed);
     }
+
+    /// The cap a raw copy of the call's standard output passed, `None` until one did.
+    fn passed(&self) -> Option<u64> {
+        match self.passed.load(Ordering::Relaxed) {
+            0 => None,
+            cap => Some(cap),
+        }
+    }
+
+    /// Raises the flag for a raw copy that passed `cap` bytes.
+    fn cap_passed(&self, cap: u64) {
+        self.passed.store(cap, Ordering::Relaxed);
+    }
+
+    /// What the call's readers have raised by now.
+    fn raised(&self) -> Raised {
+        Raised {
+            too_long: self.too_long(),
+            passed: self.passed(),
+        }
+    }
 }
 
 /// What a call's two readers share with each other and its watcher: what they heard, behind a lock no write is made
-/// under, and their progress.
+/// under, their progress, and whether the call's end has come.
 struct Shared {
     heard: Mutex<Heard>,
     progress: Progress,
+    /// Set once the watch has returned: the call ended, so a reader still going writes nothing more into what the
+    /// fetch is about to remove.
+    stopped: AtomicBool,
 }
 
 impl Shared {
@@ -1475,7 +1617,18 @@ impl Shared {
         Shared {
             heard: Mutex::new(Heard::default()),
             progress: Progress::new(),
+            stopped: AtomicBool::new(false),
         }
+    }
+
+    /// Marks that the call has ended.
+    fn stop(&self) {
+        self.stopped.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether the call has ended.
+    fn stopped(&self) -> bool {
+        self.stopped.load(Ordering::Relaxed)
     }
 }
 
@@ -1667,8 +1820,15 @@ fn relayed(stream: impl Read + Send + 'static, reader: Reader, shared: &Arc<Shar
     });
 }
 
-/// Copies `stream` into `sink`, shown as `shown`, on a thread of its own as [`relay_raw`] does, then says so on `done`.
-fn relayed_raw(stream: impl Read + Send + 'static, mut sink: impl Write + Send + 'static, shown: String, shared: &Arc<Shared>, done: Sender<()>) {
+/// Copies `stream` into `sink`, shown as `shown`, on a thread of its own as [`relay_raw`] does, then says so on `done`,
+/// and hands the thread back, so the fetch can join it before it removes the archive the copy wrote to.
+fn relayed_raw(
+    stream: impl Read + Send + 'static,
+    mut sink: impl Write + Send + 'static,
+    shown: String,
+    shared: &Arc<Shared>,
+    done: Sender<()>,
+) -> thread::JoinHandle<()> {
     let shared = Arc::clone(shared);
     thread::spawn(move || {
         relay_raw(stream, &mut sink, &shown, &shared);
@@ -1676,10 +1836,10 @@ fn relayed_raw(stream: impl Read + Send + 'static, mut sink: impl Write + Send +
         drop(sink);
         // A killed call's watcher stops listening once its drain is over: a reader that ends later has no one to tell.
         done.send(()).ok();
-    });
+    })
 }
 
-/// Copies `stream` into `sink`, shown as `shown`, byte for byte until it ends, in chunks of at most [`RAW_CHUNK`]: no
+/// Copies `stream` into `sink`, shown as `shown`, byte for byte until it ends, in chunks of at most [`RAW_CHUNK`]: no/// Copies `stream` into `sink`, shown as `shown`, byte for byte until it ends, in chunks of at most [`RAW_CHUNK`]: no
 /// line is read, so no length cuts it. Each chunk marks the call's progress, and marks that the call wrote on standard
 /// output, so a call that sent a byte is past the banner. A read or a write that fails is the call's problem, and ends
 /// the copy. No write is made under the lock the watcher could take.
@@ -1846,7 +2006,7 @@ pub(super) fn watchdog_line(cut: Cut, limits: Limits) -> Option<String> {
     let kill = match cut {
         Cut::Silent(_) => Kill::Stalled,
         Cut::Ceiling => Kill::TimedOut,
-        Cut::Watchdog(_) | Cut::Late(_) | Cut::TooLong | Cut::TooBig(_) => return None,
+        Cut::Watchdog(_) | Cut::Late(_) | Cut::TooLong | Cut::TooBig(_) | Cut::ArchiveTooBig(_) => return None,
     };
     Some(watchdog::kill_line(kill, limits.stall, limits.ceiling))
 }
@@ -1934,7 +2094,7 @@ mod tests {
     use std::io::{self, Cursor, Read, Write};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Arc, LazyLock, mpsc};
+    use std::sync::{Arc, LazyLock, Mutex, mpsc};
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -1942,9 +2102,9 @@ mod tests {
     use gate_win32::{Interrupt, PipedConsole};
 
     use super::{
-        Attempt, CallEnd, Called, Cut, Echo, End, GIT_SSH_FAILED, Heard, LINE_CAP, Limits, Loss, ProtocolLines, Reader, Reading, SSH_FAILED, Shared,
-        Unfinished, Watch, after_loss, boot_time, called_of, console_of, held, is_heartbeat, last_update, paused, push_size, relay, relay_raw,
-        relayed_raw, sdks_of, seconds, their_version, version_refusal,
+        Attempt, CallEnd, Called, Capped, Cut, Echo, End, GIT_SSH_FAILED, Heard, LINE_CAP, Limits, Loss, NonZeroU64, OUTPUTS_BUDGET, ProtocolLines,
+        Raised, Reader, Reading, SSH_FAILED, Shared, Unfinished, Watch, after_loss, boot_time, called_of, console_of, held, is_heartbeat,
+        last_update, paused, push_size, relay, relay_raw, relayed_raw, sdks_of, seconds, their_version, version_refusal,
     };
     use crate::remote::git::GIT_LIMIT;
     use crate::remote::outputs;
@@ -2000,6 +2160,7 @@ mod tests {
             local_sdks: None,
             fetch_cap: watchdog::FETCH_CAP,
             apply_cap: watchdog::APPLY_CAP,
+            outputs_budget: OUTPUTS_BUDGET,
             own_start_fails: false,
             lines: Vec::new(),
             problem: None,
@@ -2139,7 +2300,7 @@ mod tests {
         let shared = Arc::new(Shared::new());
         let (done, ended) = mpsc::channel();
 
-        relayed_raw(
+        let raw = relayed_raw(
             &b"archive bytes"[..],
             SlowToClose(Arc::clone(&closed)),
             "the archive".to_owned(),
@@ -2149,6 +2310,42 @@ mod tests {
 
         ended.recv().expect("the copy says it ended");
         assert!(closed.load(Ordering::SeqCst), "the sink was closed first");
+        raw.join().expect("the copy's thread ended");
+    }
+
+    /// A sink that records what it is written, so a copy's bytes can be checked once its thread has ended.
+    struct Recording(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for Recording {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().expect("the sink is not poisoned").extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The raw copy hands back the thread that writes the archive, so the fetch can join it within the drain before the
+    /// archive it wrote to is removed.
+    #[test]
+    fn a_raw_copy_hands_back_its_reader_thread_to_be_joined() {
+        let shared = Arc::new(Shared::new());
+        let (done, ended) = mpsc::channel();
+        let written = Arc::new(Mutex::new(Vec::new()));
+
+        let raw = relayed_raw(
+            &b"archive bytes"[..],
+            Recording(Arc::clone(&written)),
+            "the archive".to_owned(),
+            &shared,
+            done,
+        );
+
+        ended.recv().expect("the copy says it ended");
+        raw.join().expect("the copy's thread ended without panicking");
+        assert_eq!(&*written.lock().expect("the sink is not poisoned"), b"archive bytes");
     }
 
     #[test]
@@ -2156,7 +2353,7 @@ mod tests {
         let shared = Arc::new(Shared::new());
         let (done, ended) = mpsc::channel();
 
-        relayed_raw(
+        let raw = relayed_raw(
             Cursor::new(vec![0x28_u8; 200_000]),
             Full { room: 70_000 },
             "the archive".to_owned(),
@@ -2165,8 +2362,171 @@ mod tests {
         );
 
         ended.recv().expect("the copy says it ended");
+        raw.join().expect("the copy's thread ended");
         let problem = held(&shared.heard).problem.clone();
         assert_eq!(problem.as_deref(), Some("cannot write the archive: the disk is full"));
+    }
+
+    /// The raw copy writes no byte past its cap, raises the call's passed flag rather than failing the write, and ends.
+    #[test]
+    fn a_raw_copy_past_its_cap_writes_no_further_byte_and_raises_the_call_s_flag() {
+        let cap = NonZeroU64::new(1_000).expect("the cap is above 0");
+        let room = usize::try_from(cap.get()).expect("the cap fits a usize");
+        let shared = Arc::new(Shared::new());
+        let mut stream = Cursor::new(vec![b'x'; 3 * room]);
+        let mut sink = Capped {
+            inner: Vec::new(),
+            cap,
+            shared: Arc::clone(&shared),
+            written: 0,
+        };
+
+        relay_raw(&mut stream, &mut sink, "the archive", &shared);
+
+        assert_eq!(sink.inner.len(), room, "no byte past the cap is written");
+        assert_eq!(shared.progress.passed(), Some(cap.get()), "the cap is raised on the call's progress");
+        assert_eq!(shared.progress.raised().cut(), Some(Cut::ArchiveTooBig(cap.get())));
+        assert_eq!(held(&shared.heard).problem, None, "the cap is no write failure");
+    }
+
+    /// A stream of exactly the cap is not past it: every byte is written and no flag is raised.
+    #[test]
+    fn a_raw_copy_of_exactly_its_cap_writes_all_of_it_and_raises_nothing() {
+        let cap = NonZeroU64::new(1_000).expect("the cap is above 0");
+        let room = usize::try_from(cap.get()).expect("the cap fits a usize");
+        let shared = Arc::new(Shared::new());
+        let mut stream = Cursor::new(vec![b'x'; room]);
+        let mut sink = Capped {
+            inner: Vec::new(),
+            cap,
+            shared: Arc::clone(&shared),
+            written: 0,
+        };
+
+        relay_raw(&mut stream, &mut sink, "the archive", &shared);
+
+        assert_eq!(sink.inner.len(), room, "the cap's own bytes all reach the archive");
+        assert_eq!(shared.progress.passed(), None, "at the cap is not past it");
+        assert_eq!(shared.progress.raised().cut(), None);
+    }
+
+    /// One byte past the cap is past it: the cap's bytes reach the archive, no more do, and the flag is raised.
+    #[test]
+    fn a_raw_copy_one_byte_past_its_cap_writes_the_cap_and_raises_the_flag() {
+        let cap = NonZeroU64::new(1_000).expect("the cap is above 0");
+        let room = usize::try_from(cap.get()).expect("the cap fits a usize");
+        let shared = Arc::new(Shared::new());
+        let mut stream = Cursor::new(vec![b'x'; room + 1]);
+        let mut sink = Capped {
+            inner: Vec::new(),
+            cap,
+            shared: Arc::clone(&shared),
+            written: 0,
+        };
+
+        relay_raw(&mut stream, &mut sink, "the archive", &shared);
+
+        assert_eq!(sink.inner.len(), room, "the byte past the cap does not reach the archive");
+        assert_eq!(shared.progress.passed(), Some(cap.get()), "the cap is raised on the call's progress");
+        assert_eq!(shared.progress.raised().cut(), Some(Cut::ArchiveTooBig(cap.get())));
+    }
+
+    /// Once the call has ended, the copy writes nothing more into the archive the fetch is about to remove.
+    #[test]
+    fn a_raw_copy_of_a_call_that_has_stopped_writes_nothing() {
+        let cap = NonZeroU64::new(1_000).expect("the cap is above 0");
+        let shared = Arc::new(Shared::new());
+        let mut stream = Cursor::new(vec![b'x'; 500]);
+        let mut sink = Capped {
+            inner: Vec::new(),
+            cap,
+            shared: Arc::clone(&shared),
+            written: 0,
+        };
+        shared.stop();
+
+        relay_raw(&mut stream, &mut sink, "the archive", &shared);
+
+        assert_eq!(sink.inner.len(), 0, "nothing is written into an archive the fetch is about to remove");
+        assert_eq!(shared.progress.passed(), None, "the cap is not raised by a copy that writes nothing");
+        assert_eq!(held(&shared.heard).problem, None, "and it is no write failure");
+    }
+
+    #[test]
+    fn a_call_that_passed_a_raw_copy_s_cap_is_cut_for_it_even_after_its_exit() {
+        let second = Duration::from_secs(1);
+        let started = Instant::now();
+        let limits = Limits {
+            started,
+            stall: 10 * second,
+            ceiling: 60 * second,
+            bound: 30 * second,
+        };
+        let cap = 262_144;
+        let raised = Raised {
+            too_long: false,
+            passed: Some(cap),
+        };
+        let fetched = Watch::Fetch(limits, None);
+
+        assert_eq!(
+            fetched.cut(started + second, started, Duration::ZERO, raised, None),
+            Some(Cut::ArchiveTooBig(cap)),
+            "the watch cuts it for the archive it passed"
+        );
+        assert_eq!(
+            fetched.cut(started + second, started, Duration::ZERO, Raised { too_long: true, ..raised }, None),
+            Some(Cut::TooLong),
+            "a line past the line cap comes first"
+        );
+        let over = called_of(CallEnd::Exited(0), raised, Heard::default()).expect("a cut call");
+        assert_eq!((over.status, over.cut), (124, Some(Cut::ArchiveTooBig(cap))), "the look after the exit");
+    }
+
+    #[test]
+    fn an_outputs_call_cut_for_the_archive_it_passed_keeps_the_run_s_status() {
+        let log = unwritten_log();
+        let mut call = call(&log);
+        // No interrupt is raised: this cut keeps the run's status, unlike the failed fetch a Ctrl+C or a bad call end.
+        call.interrupt = None;
+        let transport = nowhere();
+        let mut attempt = attempt(&call, &transport);
+        let archive = outputs::Archive::new(
+            Path::new(r"C:\gate-client-tests-no-such-folder"),
+            PathBuf::from(r"C:\gate-client-tests-no-such-folder\app.tar.zst"),
+        );
+        let mut cut = ended_with(0, "");
+        cut.cut = Some(Cut::ArchiveTooBig(262_144));
+
+        let end = outputs::judged(&mut attempt, &archive, &cut, Limits::for_tests(), End::Status(0));
+
+        assert!(matches!(end, End::Status(0)), "the run keeps its status: {end:?}");
+        assert_eq!(attempt.lines, ["gate: remote outputs not brought back: the archive passed 256.0 KiB"]);
+    }
+
+    #[test]
+    fn an_outputs_archive_past_the_fetch_cap_is_removed_when_its_cut_is_judged() {
+        let log = unwritten_log();
+        let mut call = call(&log);
+        call.interrupt = None;
+        let transport = nowhere();
+        let mut attempt = attempt(&call, &transport);
+        let folder = std::env::temp_dir().join(format!("gate-client-archive-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&folder);
+        std::fs::create_dir_all(&folder).expect("the folder can be made");
+        let path = folder.join(".tmp").join("app.tar.zst");
+        let mut archive = outputs::Archive::new(&folder, path.clone());
+        let mut sink = archive.create(NonZeroU64::MAX).expect("the archive is made");
+        sink.file.write_all(b"partial").expect("the file can be written");
+        drop(sink);
+        let mut cut = ended_with(0, "");
+        cut.cut = Some(Cut::ArchiveTooBig(262_144));
+
+        let end = outputs::judged(&mut attempt, &archive, &cut, Limits::for_tests(), End::Status(0));
+
+        assert!(matches!(end, End::Status(0)), "the run keeps its status: {end:?}");
+        assert!(!path.exists(), "the partial archive a cut fetch wrote is removed");
+        assert_eq!(attempt.lines, ["gate: remote outputs not brought back: the archive passed 256.0 KiB"]);
     }
 
     /// The outputs call failed, but the console interrupt was raised by its end: the interrupt is the run's end, and
@@ -2177,7 +2537,10 @@ mod tests {
         let call = call(&log);
         let transport = nowhere();
         let mut attempt = attempt(&call, &transport);
-        let archive = outputs::Archive::new(PathBuf::from(r"C:\gate-client-tests-no-such-folder\app.tar.zst"));
+        let archive = outputs::Archive::new(
+            Path::new(r"C:\gate-client-tests-no-such-folder"),
+            PathBuf::from(r"C:\gate-client-tests-no-such-folder\app.tar.zst"),
+        );
         let failed = ended_with(SSH_FAILED, "Connection reset by peer");
 
         let end = outputs::judged(&mut attempt, &archive, &failed, Limits::for_tests(), End::Status(0));
@@ -2239,7 +2602,7 @@ mod tests {
         heard.record("gate-remote-outputs: 0", false, None);
         heard.record("gate: remote said something else", true, None);
 
-        let called = called_of(CallEnd::Exited(0), false, heard).expect("a call that ended");
+        let called = called_of(CallEnd::Exited(0), Raised::default(), heard).expect("a call that ended");
 
         assert!(!called.lines.iter().any(|kept| kept == line), "the window no longer holds the line");
         assert_eq!(called.outputs_line.as_deref(), Some(line), "the last standard error outputs line is kept");
@@ -2251,8 +2614,12 @@ mod tests {
         heard.failed("cannot write to the log: the disk is full".to_owned());
         let cut = Cut::Watchdog(Kill::Stalled);
 
-        let called =
-            called_of(CallEnd::Cut(cut, Some("cannot end ssh.exe: access denied".to_owned())), false, heard).expect("a kill, not the run's failure");
+        let called = called_of(
+            CallEnd::Cut(cut, Some("cannot end ssh.exe: access denied".to_owned())),
+            Raised::default(),
+            heard,
+        )
+        .expect("a kill, not the run's failure");
 
         assert_eq!((called.status, called.cut), (124, Some(cut)));
         assert_eq!(
@@ -2268,7 +2635,7 @@ mod tests {
         heard.failed("cannot say a line: the pipe is closed".to_owned());
         let ending = Some("ssh.exe did not end within 30 s of its kill".to_owned());
 
-        let ended = called_of(CallEnd::Interrupted(ending), false, heard);
+        let ended = called_of(CallEnd::Interrupted(ending), Raised::default(), heard);
 
         assert!(
             matches!(
@@ -2308,13 +2675,21 @@ mod tests {
     fn a_reader_s_problem_fails_a_call_that_ended_on_its_own() {
         let mut heard = Heard::default();
         heard.failed("cannot say a line: the pipe is closed".to_owned());
-        let failed = called_of(CallEnd::Exited(0), false, heard);
+        let failed = called_of(CallEnd::Exited(0), Raised::default(), heard);
         assert!(
             matches!(&failed, Err(Unfinished::Failed(why)) if why == "cannot say a line: the pipe is closed"),
             "{:?}",
             failed.err()
         );
-        let cut = called_of(CallEnd::Exited(0), true, Heard::default()).expect("a cut call");
+        let cut = called_of(
+            CallEnd::Exited(0),
+            Raised {
+                too_long: true,
+                ..Raised::default()
+            },
+            Heard::default(),
+        )
+        .expect("a cut call");
         assert_eq!(
             (cut.status, cut.cut),
             (124, Some(Cut::TooLong)),
@@ -2334,29 +2709,45 @@ mod tests {
         };
         let begun = started + 40 * second;
         let fetch = Watch::Fetch(limits, None);
-        assert_eq!(fetch.cut(started + 59 * second, begun, 9 * second, false, None), None, "neither yet");
         assert_eq!(
-            fetch.cut(started + 50 * second, begun, 10 * second, false, None),
+            fetch.cut(started + 59 * second, begun, 9 * second, Raised::default(), None),
+            None,
+            "neither yet"
+        );
+        assert_eq!(
+            fetch.cut(started + 50 * second, begun, 10 * second, Raised::default(), None),
             Some(Cut::Silent(10 * second)),
             "silent for the stall window"
         );
         assert_eq!(
-            fetch.cut(started + 60 * second, begun, second, false, None),
+            fetch.cut(started + 60 * second, begun, second, Raised::default(), None),
             Some(Cut::Ceiling),
             "a live fetch at the run's ceiling"
         );
-        assert_eq!(fetch.cut(started + 41 * second, begun, Duration::ZERO, true, None), Some(Cut::TooLong));
         assert_eq!(
-            Watch::Run(limits).cut(started + 60 * second, begun, second, false, None),
+            fetch.cut(
+                started + 41 * second,
+                begun,
+                Duration::ZERO,
+                Raised {
+                    too_long: true,
+                    ..Raised::default()
+                },
+                None
+            ),
+            Some(Cut::TooLong)
+        );
+        assert_eq!(
+            Watch::Run(limits).cut(started + 60 * second, begun, second, Raised::default(), None),
             Some(Cut::Watchdog(Kill::TimedOut))
         );
         assert_eq!(
-            Watch::Deadline(5 * second).cut(begun + 5 * second, begun, Duration::ZERO, false, None),
+            Watch::Deadline(5 * second).cut(begun + 5 * second, begun, Duration::ZERO, Raised::default(), None),
             Some(Cut::Late(5 * second)),
             "a deadline counts from the call's own start"
         );
         assert_eq!(
-            Watch::Deadline(5 * second).cut(begun + 4 * second, begun, Duration::ZERO, false, None),
+            Watch::Deadline(5 * second).cut(begun + 4 * second, begun, Duration::ZERO, Raised::default(), None),
             None
         );
     }
@@ -2373,39 +2764,52 @@ mod tests {
         };
         let (now, cap) = (started + second, 262_144);
         let capped = Watch::Fetch(limits, Some(cap));
-        assert_eq!(capped.cut(now, started, Duration::ZERO, false, Some(cap - 1)), None, "under the cap");
         assert_eq!(
-            capped.cut(now, started, Duration::ZERO, false, Some(cap)),
+            capped.cut(now, started, Duration::ZERO, Raised::default(), Some(cap - 1)),
+            None,
+            "under the cap"
+        );
+        assert_eq!(
+            capped.cut(now, started, Duration::ZERO, Raised::default(), Some(cap)),
             None,
             "at the cap is not over it"
         );
         assert_eq!(
-            capped.cut(now, started, Duration::ZERO, false, Some(cap + 1)),
+            capped.cut(now, started, Duration::ZERO, Raised::default(), Some(cap + 1)),
             Some(Cut::TooBig(cap)),
             "over the cap"
         );
         assert_eq!(
-            capped.cut(now, started, Duration::ZERO, false, None),
+            capped.cut(now, started, Duration::ZERO, Raised::default(), None),
             None,
             "a count that could not be read cuts nothing"
         );
         assert_eq!(
-            capped.cut(now, started, 10 * second, false, Some(cap + 1)),
+            capped.cut(now, started, 10 * second, Raised::default(), Some(cap + 1)),
             Some(Cut::TooBig(cap)),
             "its size before its silence"
         );
         assert_eq!(
-            capped.cut(now, started, Duration::ZERO, true, Some(cap + 1)),
+            capped.cut(
+                now,
+                started,
+                Duration::ZERO,
+                Raised {
+                    too_long: true,
+                    ..Raised::default()
+                },
+                Some(cap + 1)
+            ),
             Some(Cut::TooLong),
             "a line past the cap first"
         );
         assert_eq!(
-            Watch::Fetch(limits, None).cut(now, started, Duration::ZERO, false, Some(u64::MAX)),
+            Watch::Fetch(limits, None).cut(now, started, Duration::ZERO, Raised::default(), Some(u64::MAX)),
             None,
             "a fetch with no cap"
         );
         assert_eq!(
-            Watch::Run(limits).cut(now, started, Duration::ZERO, false, Some(u64::MAX)),
+            Watch::Run(limits).cut(now, started, Duration::ZERO, Raised::default(), Some(u64::MAX)),
             None,
             "a call that is no fetch"
         );
@@ -2414,9 +2818,17 @@ mod tests {
     #[test]
     fn a_fetch_found_over_its_cap_after_its_exit_is_cut_for_it_unless_a_line_was_too_long() {
         let cap = 262_144;
-        let over = called_of(CallEnd::ExitedOver(Cut::TooBig(cap)), false, Heard::default()).expect("a cut call");
+        let over = called_of(CallEnd::ExitedOver(Cut::TooBig(cap)), Raised::default(), Heard::default()).expect("a cut call");
         assert_eq!((over.status, over.cut), (124, Some(Cut::TooBig(cap))), "the look after the exit");
-        let both = called_of(CallEnd::ExitedOver(Cut::TooBig(cap)), true, Heard::default()).expect("a cut call");
+        let both = called_of(
+            CallEnd::ExitedOver(Cut::TooBig(cap)),
+            Raised {
+                too_long: true,
+                ..Raised::default()
+            },
+            Heard::default(),
+        )
+        .expect("a cut call");
         assert_eq!((both.status, both.cut), (124, Some(Cut::TooLong)), "a line past the cap wins");
     }
 
@@ -2453,7 +2865,7 @@ mod tests {
         relay(stdout.as_bytes(), Reader::new(false, reading.clone(), Some(other)), &shared);
         relay(stderr.as_bytes(), Reader::new(true, reading, Some(file)), &shared);
         let heard = std::mem::take(&mut *held(&shared.heard));
-        let called = called_of(CallEnd::Exited(75), false, heard).expect("a call that ended");
+        let called = called_of(CallEnd::Exited(75), Raised::default(), heard).expect("a call that ended");
         let said = std::fs::read_to_string(&log).expect("the log can be read");
         std::fs::remove_file(&log).expect("the log can be removed");
         (called, said)

@@ -8,17 +8,25 @@
 use std::cell::Cell;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read};
+use std::num::NonZeroU64;
+use std::os::windows::fs::OpenOptionsExt;
+use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
 use gate_state::v1;
+use windows_sys::Win32::Storage::FileSystem::{
+    BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_REPARSE_POINT, FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    FILE_SHARE_READ, FILE_SHARE_WRITE, FileDispositionInfo, GetFileInformationByHandle, SetFileInformationByHandle,
+};
 
 use super::RemoteCall;
 use super::client::{self, Attempt, Called, End, Limits, RawSink};
 use super::git::FAILURE_BYTES;
 use super::install::{self, Fetched};
 use super::payload::Location;
+use super::watchdog::Cut;
 use crate::boxside::payload::{archive_file_name, escaped};
 use crate::outputs::archive::final_path;
 use crate::outputs::glob::Globs;
@@ -40,6 +48,12 @@ const STOPPED: &str = "the fetch was stopped by the watchdog";
 /// What an archive a fetch was cut short of, or that was not installed for the run's end, is called when it cannot be
 /// removed.
 const PARTIAL: &str = "partial";
+/// `GENERIC_WRITE`, which lives in `Win32_Foundation`, a feature this crate does not enable: the access the archive
+/// file is made with, beside [`DELETE`] so a make it refuses can remove that file through the same handle.
+const GENERIC_WRITE: u32 = 0x4000_0000;
+/// `DELETE`, from `Win32_Foundation` too: the access that lets [`Archive::create`] remove a file it refuses through the
+/// handle it made it with, whatever its name now resolves to.
+const DELETE: u32 = 0x0001_0000;
 /// What an archive fetched whole and handed to the install is called when it cannot be removed.
 pub(super) const FETCHED: &str = "fetched";
 
@@ -51,16 +65,27 @@ pub(super) struct Ran<'r> {
     pub(super) status: i64,
 }
 
-/// The file in the worktree a fetched archive is written to, and whether an attempt of this run made it.
+/// The file in the worktree a fetched archive is written to, the worktree it must sit inside, the `.tmp` folder held
+/// open for the run's life, and whether an attempt of this run made the file.
 pub(super) struct Archive {
+    root: PathBuf,
     path: PathBuf,
+    /// The archive's own folder, opened and held from the first make until this run's end: the handle shares neither
+    /// its delete nor its rename, so the folder cannot be moved or removed while the archive and the stage the install
+    /// makes beside it are in it, and it is the worktree's own `.tmp`, not a link or a junction.
+    hold: Option<File>,
     made: bool,
 }
 
 impl Archive {
-    /// The file at `path`, which no attempt made yet.
-    pub(super) fn new(path: PathBuf) -> Archive {
-        Archive { path, made: false }
+    /// The file at `path` in the worktree `root`, which no attempt made yet.
+    pub(super) fn new(root: &Path, path: PathBuf) -> Archive {
+        Archive {
+            root: root.to_path_buf(),
+            path,
+            hold: None,
+            made: false,
+        }
     }
 
     /// The file's path.
@@ -68,26 +93,69 @@ impl Archive {
         &self.path
     }
 
-    /// The file an outputs call's attempt writes its standard output to raw: made new, its folder made when missing,
-    /// once the file an earlier attempt of this run made is removed; a file of the name this run did not make is never
-    /// removed, and fails the make. Else why it cannot be written.
-    pub(super) fn create(&mut self) -> Result<RawSink, String> {
-        let cannot = |error: io::Error| format!("cannot write {}: {error}", self.path.display());
+    /// The file an outputs call's attempt writes its standard output to raw: made new, its folder made when missing
+    /// and held from then on, once the file an earlier attempt of this run made is removed; a file of the name this run
+    /// did not make is never removed, and fails the make. The copy into it is capped at `cap` bytes. The folder must be
+    /// a folder itself, and the worktree's own `.tmp`, or the make fails; a file whose own final path is outside the
+    /// worktree fails the make too, and is removed through its own handle. Else why it cannot be written.
+    pub(super) fn create(&mut self, cap: NonZeroU64) -> Result<RawSink, String> {
+        let shown = self.path.display().to_string();
+        let cannot = |error: io::Error| format!("cannot write {shown}: {error}");
         if self.made {
             match fs::remove_file(&self.path) {
                 Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(cannot(error)),
                 _ => self.made = false,
             }
         }
-        if let Some(folder) = self.path.parent() {
-            fs::create_dir_all(folder).map_err(cannot)?;
+        if let Some(folder) = self.path.parent().map(Path::to_path_buf) {
+            fs::create_dir_all(&folder).map_err(cannot)?;
+            self.hold(&folder).map_err(cannot)?;
         }
-        let file = OpenOptions::new().write(true).create_new(true).open(&self.path).map_err(cannot)?;
+        let inside = fs::canonicalize(&self.root).map_err(cannot)?;
+        let file = OpenOptions::new()
+            .write(true)
+            .access_mode(GENERIC_WRITE | DELETE)
+            .create_new(true)
+            .open(&self.path)
+            .map_err(cannot)?;
         self.made = true;
-        Ok(RawSink {
-            file,
-            shown: self.path.display().to_string(),
-        })
+        if !final_path(&file).map_err(cannot)?.starts_with(&inside) {
+            let outside = format!("the outputs archive {} is not inside the worktree", self.path.display());
+            if let Err(error) = delete_through(&file) {
+                // Still made: the failed fetch removes it by name once more, and says its own line when that fails.
+                return Err(format!("{outside}; and it could not be removed: {error}"));
+            }
+            self.made = false;
+            return Err(outside);
+        }
+        Ok(RawSink { file, shown, cap })
+    }
+
+    /// Holds the folder `folder` for the rest of this run, opening it once: a handle that shares neither its delete
+    /// nor its rename, so nothing can move the folder or remove it while the archive, and the stage the install makes
+    /// beside it, are in it. The handle also says through the folder itself that it is a folder, not a link or a
+    /// junction, and that its final path is the worktree's own `.tmp`. Else why it cannot be held.
+    fn hold(&mut self, folder: &Path) -> io::Result<()> {
+        if self.hold.is_some() {
+            return Ok(());
+        }
+        let opened = OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(folder)?;
+        if attributes(&opened)? & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(io::Error::other("it is a link or a junction, not a folder"));
+        }
+        let inside = fs::canonicalize(&self.root)?;
+        if final_path(&opened)? != inside.join(TMP) {
+            return Err(io::Error::other(format!(
+                "it is not the worktree's {TMP} folder, but {}",
+                folder.display()
+            )));
+        }
+        self.hold = Some(opened);
+        Ok(())
     }
 
     /// Removes the file an attempt of this run made, when one did; one already gone counts as removed. Else why it
@@ -103,6 +171,30 @@ impl Archive {
             _ => Ok(()),
         }
     }
+}
+
+/// The file attributes the system holds for the open file `opened`.
+fn attributes(opened: &File) -> io::Result<u32> {
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: `opened` owns an open handle for the whole call, and `info` is a writable `BY_HANDLE_FILE_INFORMATION`.
+    if unsafe { GetFileInformationByHandle(opened.as_raw_handle(), &raw mut info) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(info.dwFileAttributes)
+}
+
+/// Removes the open file `file` by setting its delete on the handle it is already open with, so it goes however its
+/// name now resolves: a name a link or a junction was swapped in at cannot redirect the removal.
+fn delete_through(file: &File) -> io::Result<()> {
+    let info = FILE_DISPOSITION_INFO { DeleteFile: true };
+    let size = u32::try_from(size_of::<FILE_DISPOSITION_INFO>()).map_err(io::Error::other)?;
+    // SAFETY: `file` owns the handle for the whole call and was made with [`DELETE`] access, `info` is a
+    // `FILE_DISPOSITION_INFO` that outlives the call, and `size` is its size in bytes.
+    let set = unsafe { SetFileInformationByHandle(file.as_raw_handle(), FileDispositionInfo, std::ptr::from_ref(&info).cast(), size) };
+    if set == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// Why the manifest was not built: the console interrupt was raised while it was, or a reason it could not be.
@@ -227,22 +319,24 @@ struct Kept<'k> {
 }
 
 /// The outputs call of a passing run whose box packed an archive, `synced` its end so far: the archive the run's own
-/// key and nonce name, never the box's line, is fetched raw into the worktree's `.tmp` folder. One fetched whole is
-/// installed, as [`install::installed`] says, through a stage folder beside it named for the same key and nonce. A
-/// fetch the watchdog stops says the watchdog's line and ends the run killed; a Ctrl+C ends it as an interrupt, with no
-/// `stop` call; any other failure says why, the box's last standard error line when it said one, and fails the run.
+/// key and nonce name, never the box's line, is fetched raw into the worktree's `.tmp` folder, which is held until this
+/// run's end. One fetched whole is installed, as [`install::installed`] says, through a stage folder beside it named
+/// for the same key and nonce. A fetch the watchdog stops says the watchdog's line and ends the run killed; a Ctrl+C
+/// ends it as an interrupt, with no `stop` call; any other failure says why, the box's last standard error line when it
+/// said one, and fails the run, but one whose archive passed the fetch cap keeps the run's status and installs nothing.
 /// Each of these removes what was fetched, and says so when it cannot; each says the outputs were not brought back but
 /// the interrupt.
 fn fetched(attempt: &mut Attempt<'_, '_>, kept: &Kept<'_>, ran: &Ran<'_>, synced: End) -> End {
     let started = Instant::now();
     let name = archive_file_name(attempt.call.key, ran.nonce);
     let tmp = Path::new(attempt.call.root).join(TMP);
-    let mut archive = Archive::new(tmp.join(&name));
+    let mut archive = Archive::new(Path::new(attempt.call.root), tmp.join(&name));
     let limits = attempt.limits_for("outputs");
     match attempt.outputs_call(ran.location, &name, &mut archive, limits) {
-        // `judged` hands back the run's passing end only when the archive was fetched whole.
+        // `judged` hands back the run's passing end only when the archive was fetched whole, and `called` a cut when it
+        // was not: an archive past the fetch cap keeps the pass and installs nothing.
         Ok(called) => match judged(attempt, &archive, &called, limits, synced) {
-            End::Status(0) => {
+            End::Status(0) if called.cut.is_none() => {
                 let fetched = Fetched {
                     archive: &archive,
                     stage: tmp.join(format!("{}-{}", attempt.call.key, ran.nonce)),
@@ -279,7 +373,13 @@ pub(super) fn judged(attempt: &mut Attempt<'_, '_>, archive: &Archive, called: &
             return unfetched(attempt, archive, STOPPED, End::Killed);
         }
         attempt.noted(called);
-        return unfetched(attempt, archive, &cut.reason("the outputs call"), End::Status(1));
+        // An archive past the fetch cap is the one failed fetch that keeps the run's status: the box's work is sound,
+        // the archive of it is not, and the next routed run asks for it again.
+        let (reason, end) = match cut {
+            Cut::ArchiveTooBig(_) => (cut.reason("the archive"), synced),
+            _ => (cut.reason("the outputs call"), End::Status(1)),
+        };
+        return unfetched(attempt, archive, &reason, end);
     }
     if called.status != 0 {
         let reason = match &called.last_error {
@@ -437,7 +537,9 @@ mod tests {
 
     use gate_router::DEFAULT_OUTPUTS;
 
-    use super::{Archive, Brought, MANIFEST_LIMIT, PARTIAL, Unbuilt, accepted, hashed, keep_outputs_line, manifest_line, pending, within_cap};
+    use super::{
+        Archive, Brought, MANIFEST_LIMIT, NonZeroU64, PARTIAL, Unbuilt, accepted, hashed, keep_outputs_line, manifest_line, pending, within_cap,
+    };
     use crate::outputs::glob::Globs;
     use crate::outputs::walk::walk;
 
@@ -602,15 +704,76 @@ mod tests {
     }
 
     #[test]
+    fn an_archive_create_whose_tmp_is_a_junction_is_refused_and_writes_nothing_through_it() {
+        let folder = scratch("archive-create-junction");
+        let (root, elsewhere) = (folder.join("worktree"), folder.join("elsewhere"));
+        fs::create_dir_all(&root).expect("the worktree can be made");
+        fs::create_dir_all(&elsewhere).expect("the outside folder can be made");
+        junction(&root.join(".tmp"), &elsewhere);
+        let path = root.join(".tmp").join("app.tar.zst");
+        let mut archive = Archive::new(&root, path.clone());
+
+        let refused = archive.create(NonZeroU64::MAX).map(drop);
+
+        let why = refused.expect_err("a junction .tmp is refused");
+        assert!(why.ends_with("it is a link or a junction, not a folder"), "{why}");
+        assert!(!elsewhere.join("app.tar.zst").exists(), "nothing is written through the junction");
+        assert!(!path.exists(), "no archive is made");
+    }
+
+    /// The `.tmp` folder is held for the archive's and the stage's life: while it is held it can be neither renamed nor
+    /// removed, so no one can swap it for a junction under the fetch or the install that follow.
+    #[test]
+    fn an_archive_holds_its_tmp_folder_against_a_rename_until_it_is_dropped() {
+        let root = scratch("archive-hold");
+        let path = root.join(".tmp").join("app.tar.zst");
+        let mut archive = Archive::new(&root, path.clone());
+        let made = archive.create(NonZeroU64::MAX).expect("the archive is made");
+        drop(made);
+        let elsewhere = root.join("elsewhere");
+
+        let renamed = fs::rename(root.join(".tmp"), &elsewhere);
+
+        assert!(renamed.is_err(), "a held .tmp cannot be renamed: {renamed:?}");
+        assert!(root.join(".tmp").is_dir(), "it is still the worktree's .tmp");
+        drop(archive);
+        let freed = fs::rename(root.join(".tmp"), &elsewhere);
+        assert!(freed.is_ok(), "the hold lasted as long as the archive: {freed:?}");
+    }
+
+    /// A path whose folder is not the worktree's own `.tmp` is refused before anything is made there.
+    #[test]
+    fn an_archive_made_outside_the_worktree_s_tmp_folder_is_refused() {
+        let folder = scratch("archive-outside");
+        let (root, elsewhere) = (folder.join("worktree"), folder.join("elsewhere"));
+        fs::create_dir_all(&root).expect("the worktree can be made");
+        fs::create_dir_all(&elsewhere).expect("the outside folder can be made");
+        let path = elsewhere.join("app.tar.zst");
+        let mut archive = Archive::new(&root, path.clone());
+
+        let refused = archive.create(NonZeroU64::MAX).map(drop);
+
+        let why = refused.expect_err("a folder that is not the worktree's .tmp is refused");
+        assert!(why.contains("is not the worktree's .tmp folder"), "{why}");
+        assert!(!path.exists(), "no archive is made");
+        assert_eq!(archive.remove(PARTIAL), Ok(()), "nothing this run made is removed");
+    }
+
+    #[test]
     fn an_archive_file_is_made_anew_for_each_attempt_and_removed_only_when_made() {
-        let path = scratch("archive").join(".tmp").join("app.tar.zst");
-        let mut archive = Archive::new(path.clone());
+        let root = scratch("archive");
+        let path = root.join(".tmp").join("app.tar.zst");
+        let mut archive = Archive::new(&root, path.clone());
         assert_eq!(archive.remove(PARTIAL), Ok(()), "nothing made, nothing removed");
 
-        let mut first = archive.create().expect("the first attempt's file is made, its folder too");
+        let mut first = archive.create(NonZeroU64::MAX).expect("the first attempt's file is made, its folder too");
         first.file.write_all(b"partial").expect("the file can be written");
         drop(first);
-        drop(archive.create().expect("a retry removes the first attempt's file and makes it anew"));
+        drop(
+            archive
+                .create(NonZeroU64::MAX)
+                .expect("a retry removes the first attempt's file and makes it anew"),
+        );
         assert_eq!(
             fs::read(&path).expect("the file can be read"),
             Vec::<u8>::new(),
@@ -620,8 +783,8 @@ mod tests {
         assert!(!path.exists(), "a file this run made is removed");
 
         fs::write(&path, "another run's").expect("the file can be written");
-        let mut fresh = Archive::new(path.clone());
-        let refused = fresh.create().map(drop);
+        let mut fresh = Archive::new(&root, path.clone());
+        let refused = fresh.create(NonZeroU64::MAX).map(drop);
         let cannot = format!("cannot write {}: ", path.display());
         assert!(refused.as_ref().is_err_and(|why| why.starts_with(&cannot)), "{refused:?}");
         assert_eq!(fresh.remove(PARTIAL), Ok(()));

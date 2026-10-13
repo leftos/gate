@@ -175,6 +175,9 @@ pub struct TestSeams {
     pub remote_fetch_cap_bytes: Option<u64>,
     /// The most bytes the files a back commit of the remote client's sync-back writes may total, in place of 4 GiB.
     pub remote_apply_cap_bytes: Option<u64>,
+    /// The box's outputs budget the remote client reads, in place of 50 GiB: the outputs fetch is capped at zstd's
+    /// worst case for it, and the install unpacks its archive to it.
+    pub remote_outputs_budget_bytes: Option<u64>,
     /// The script the remote.ps1 bridge dot-sources in place of `%USERPROFILE%\.claude\tools\gate\remote.ps1`.
     pub remote_script: Option<PathBuf>,
     /// The program the remote.ps1 bridge starts in place of the pwsh found on `PATH`.

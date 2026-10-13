@@ -8,6 +8,7 @@ use std::cell::Cell;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
+use std::num::NonZeroU64;
 use std::os::windows::ffi::OsStringExt;
 use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 use std::os::windows::io::AsRawHandle;
@@ -44,6 +45,15 @@ const LONG_NAME_LIMIT: u64 = 4 * 1024;
 const PATH_DEPTH_LIMIT: usize = 64;
 /// What the stream as sent may hold beyond zstd's worst-case expansion of the limit's bytes: frame and block headers.
 const SENT_SLACK: u64 = 1024 * 1024;
+
+/// The most bytes a `.tar.zst` stream may hold for an archive of a `limit`-byte limit: zstd's worst case expansion of
+/// the limit's bytes, the ratio a decoder could reach through a skippable frame or empty blocks, plus [`SENT_SLACK`].
+/// The reader refuses a longer stream, and the client fetching one caps its fetch at the same figure, so every archive
+/// the box can legitimately send is one the reader would take. Saturating, and never 0: [`SENT_SLACK`] alone is above
+/// it, so the cap the client writes under can never drop every byte.
+pub(crate) fn sent_limit(limit: u64) -> NonZeroU64 {
+    NonZeroU64::new(limit.saturating_add(limit / 64).saturating_add(SENT_SLACK)).unwrap_or(NonZeroU64::MIN)
+}
 /// The largest zstd window the reader accepts, as a power of two: 8 MiB, four times what [`LEVEL`] uses.
 const WINDOW_LOG_MAX: u32 = 23;
 /// How far past the reader's clock a member's last write may be: a day, for clocks that disagree.
@@ -367,7 +377,7 @@ fn file_header(size: u64, modified: u64) -> Header {
 /// returns the entries, else why the archive was refused.
 fn read_members(source: impl Read, limit: u64, mut member: impl FnMut(&str, SystemTime, &mut dyn Read) -> io::Result<()>) -> io::Result<Vec<Entry>> {
     // zstd's worst case for `limit` bytes, so a skippable frame or empty blocks cannot be read without end either.
-    let sent = limit.saturating_add(limit / 64).saturating_add(SENT_SLACK);
+    let sent = sent_limit(limit).get();
     let source = Limited {
         inner: source,
         left: Rc::new(Cell::new(sent)),
@@ -640,7 +650,10 @@ mod tests {
 
     use tar::{EntryType, Header};
 
-    use super::{Entry, LIST_NAME, MEMBER_LIMIT, Packer, extract_into, is_device, list_json, member_path, pack, pack_file, read_members, unpack};
+    use super::{
+        Entry, LIST_NAME, MEMBER_LIMIT, Packer, extract_into, is_device, list_json, member_path, pack, pack_file, read_members, sent_limit, unpack,
+    };
+    use crate::boxside::outputs::OUTPUTS_BUDGET;
     use crate::boxside::payload::escaped;
     use crate::outputs::glob::Globs;
     use crate::outputs::hash::sha256_of;
@@ -1056,6 +1069,20 @@ mod tests {
             unpack(&stamped(octal(now))[..], &scratch("mtime-now"), LIMIT).is_ok(),
             "a last write of now"
         );
+    }
+
+    #[test]
+    fn the_sent_limit_is_zstd_s_worst_case_for_the_limit_and_saturates() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        assert_eq!(sent_limit(50 * GIB).get(), 50 * GIB + (50 * GIB) / 64 + 1024 * 1024, "the box's budget");
+        assert_eq!(
+            sent_limit(OUTPUTS_BUDGET).get(),
+            50 * GIB + (50 * GIB) / 64 + 1024 * 1024,
+            "the shared constant"
+        );
+        assert_eq!(sent_limit(0).get(), 1024 * 1024, "the slack alone");
+        assert_eq!(sent_limit(u64::MAX).get(), u64::MAX, "it saturates rather than wrapping");
+        assert_eq!(sent_limit(u64::MAX - 1024).get(), u64::MAX, "past what the slack can be added to");
     }
 
     #[test]

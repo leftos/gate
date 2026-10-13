@@ -45,6 +45,8 @@ pub(super) enum Cut {
     Ceiling,
     /// Its job wrote more than this many bytes.
     TooBig(u64),
+    /// A raw copy of its standard output passed this many bytes.
+    ArchiveTooBig(u64),
 }
 
 impl Cut {
@@ -58,6 +60,7 @@ impl Cut {
             Cut::TooLong => format!("{what} sent a line longer than 64 KiB"),
             Cut::Ceiling => format!("{what} did not finish within the run's ceiling"),
             Cut::TooBig(cap) => format!("{what} wrote more than {}", size(cap)),
+            Cut::ArchiveTooBig(cap) => format!("{what} passed {}", size(cap)),
         }
     }
 }
@@ -238,6 +241,14 @@ mod tests {
         ] {
             assert_eq!(size(bytes), shown, "{bytes}");
         }
+    }
+
+    #[test]
+    fn a_call_cut_for_the_archive_it_passed_says_how_far_it_passed() {
+        let cap = crate::outputs::archive::sent_limit(crate::boxside::outputs::OUTPUTS_BUDGET).get();
+        assert_eq!(Cut::ArchiveTooBig(cap).reason("the archive"), "the archive passed 50.8 GiB");
+        assert_eq!(Cut::ArchiveTooBig(262_144).reason("the archive"), "the archive passed 256.0 KiB");
+        assert_eq!(Cut::ArchiveTooBig(cap).reason("the outputs call"), "the outputs call passed 50.8 GiB");
     }
 
     #[test]

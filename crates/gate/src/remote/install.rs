@@ -18,7 +18,6 @@ use windows_sys::Win32::Storage::FileSystem::FILE_WRITE_ATTRIBUTES;
 
 use super::client::{Attempt, End};
 use super::outputs::{self, Archive, Polled};
-use crate::boxside::outputs::OUTPUTS_BUDGET;
 use crate::boxside::payload::{escaped, ordinal_upper};
 use crate::outputs::archive::{Entry, check_folder, unpack};
 use crate::outputs::glob::Globs;
@@ -136,7 +135,7 @@ fn install(attempt: &Attempt<'_, '_>, fetched: &Fetched<'_>, staged: &Cell<bool>
     let file = File::open(path).map_err(|error| unopened(&error))?;
     let compressed = file.metadata().map_err(|error| unopened(&error))?.len();
     let stopped = Cell::new(false);
-    let unpacking = unpacked(file, &fetched.stage, &|| attempt.go_on().is_ok(), &stopped);
+    let unpacking = unpacked(file, &fetched.stage, attempt.outputs_budget, &|| attempt.go_on().is_ok(), &stopped);
     staged.set(stage_made(&unpacking));
     let entries = unpacking.map_err(|error| {
         if stopped.get() {
@@ -216,8 +215,8 @@ fn stage_made(unpacking: &io::Result<Vec<Entry>>) -> bool {
 }
 
 /// Unpacks the archive `source` into the folder `stage`, which must not exist yet, asking `go_on` before each read
-/// and marking `stopped` once it says no, within the box's outputs budget; the entries, else why not.
-fn unpacked(source: impl Read, stage: &Path, go_on: &dyn Fn() -> bool, stopped: &Cell<bool>) -> io::Result<Vec<Entry>> {
+/// and marking `stopped` once it says no, to at most `limit` bytes; the entries, else why not.
+fn unpacked(source: impl Read, stage: &Path, limit: u64, go_on: &dyn Fn() -> bool, stopped: &Cell<bool>) -> io::Result<Vec<Entry>> {
     unpack(
         Polled {
             inner: source,
@@ -225,7 +224,7 @@ fn unpacked(source: impl Read, stage: &Path, go_on: &dyn Fn() -> bool, stopped: 
             stopped,
         },
         stage,
-        OUTPUTS_BUDGET,
+        limit,
     )
 }
 
@@ -413,6 +412,7 @@ mod tests {
     use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_DELETE;
 
     use super::{Installed, Unmet, Unmoved, checked, ending, moved, rewritten, said, stage_made, success_line, unpacked};
+    use crate::boxside::outputs::OUTPUTS_BUDGET;
     use crate::outputs::archive::{Entry, pack};
     use crate::outputs::glob::Globs;
     use crate::outputs::manifest::{Held, Manifest};
@@ -795,7 +795,7 @@ mod tests {
         let stage = folder.join("stage");
         put(&stage, "kept.txt", b"another run's");
 
-        let refused = unpacked(&archive[..], &stage, &|| true, &Cell::new(false));
+        let refused = unpacked(&archive[..], &stage, OUTPUTS_BUDGET, &|| true, &Cell::new(false));
 
         assert!(
             refused.as_ref().is_err_and(|error| error.kind() == io::ErrorKind::AlreadyExists),
@@ -803,9 +803,15 @@ mod tests {
         );
         assert!(!stage_made(&refused), "a folder there before is not the install's to remove");
         assert_eq!(fs::read_to_string(stage.join("kept.txt")).expect("its file survives"), "another run's");
-        let fresh = unpacked(&archive[..], &folder.join("fresh"), &|| true, &Cell::new(false));
+        let fresh = unpacked(&archive[..], &folder.join("fresh"), OUTPUTS_BUDGET, &|| true, &Cell::new(false));
         assert!(fresh.is_ok() && stage_made(&fresh), "{fresh:?}");
-        let garbage = unpacked(&b"not an archive"[..], &folder.join("garbage"), &|| true, &Cell::new(false));
+        let garbage = unpacked(
+            &b"not an archive"[..],
+            &folder.join("garbage"),
+            OUTPUTS_BUDGET,
+            &|| true,
+            &Cell::new(false),
+        );
         assert!(garbage.is_err() && stage_made(&garbage), "{garbage:?}");
     }
 
@@ -914,7 +920,7 @@ mod tests {
             widest: &widest,
         };
 
-        let entries = unpacked(watched, &stage, &|| true, &Cell::new(false)).expect("the archive unpacks");
+        let entries = unpacked(watched, &stage, OUTPUTS_BUDGET, &|| true, &Cell::new(false)).expect("the archive unpacks");
 
         assert_eq!(entries.iter().map(|entry| entry.size).collect::<Vec<_>>(), [LARGE]);
         assert!(widest.get() <= HELD_BACK, "the unpack held back {} bytes", widest.get());
@@ -931,7 +937,7 @@ mod tests {
         pack(&mut archive, &source, &chosen).expect("the file packs");
         let stopped = Cell::new(false);
 
-        let unpacked = unpacked(&archive[..], &folder.join("stage"), &|| false, &stopped);
+        let unpacked = unpacked(&archive[..], &folder.join("stage"), OUTPUTS_BUDGET, &|| false, &stopped);
 
         assert!(unpacked.is_err() && stopped.get(), "{unpacked:?}");
         assert!(!folder.join("stage").exists(), "the stage is removed");

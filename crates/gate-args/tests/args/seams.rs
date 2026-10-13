@@ -550,6 +550,24 @@ fn the_fetch_cap_seam_takes_a_whole_number_of_bytes_above_0() {
 
 #[cfg(feature = "test-seams")]
 #[test]
+fn the_outputs_budget_seam_takes_a_whole_number_of_bytes_above_0() {
+    use crate::support::run_request;
+
+    const FLAG: &str = "--test-remote-outputs-budget-bytes";
+    let words = with(&RUN, &["--test-remote-transport", "local:b", FLAG, "1048576", "--", "cmd"]);
+    assert_eq!(run_request(&refs(&words)).test_seams.remote_outputs_budget_bytes, Some(1_048_576));
+    for value in ["0", "4GiB"] {
+        assert_eq!(
+            problems(&refs(&with(&RUN, &["--test-remote-transport", "local:b", FLAG, value, "--", "cmd"]))),
+            [format!("gate: {FLAG} must be a whole number above 0, got '{value}'")]
+        );
+    }
+    let none = run_request(&refs(&with(&RUN, &["--", "cmd"]))).test_seams;
+    assert_eq!(none.remote_outputs_budget_bytes, None, "none unless given");
+}
+
+#[cfg(feature = "test-seams")]
+#[test]
 fn the_apply_cap_seam_takes_a_whole_number_of_bytes_above_0_once() {
     use crate::support::run_request;
 
@@ -612,6 +630,10 @@ fn the_remote_client_seams_that_conflict_are_refused() {
         (
             &["--test-remote-apply-cap-bytes", "1048576"][..],
             "gate: --test-remote-apply-cap-bytes needs --test-remote-transport",
+        ),
+        (
+            &["--test-remote-outputs-budget-bytes", "1048576"][..],
+            "gate: --test-remote-outputs-budget-bytes needs --test-remote-transport",
         ),
         (
             &["--test-remote-snapshot", "--test-remote-transport", "local:b"][..],
@@ -1026,6 +1048,7 @@ fn seam_flags_are_unknown_without_the_feature() {
         "--test-local-sdks",
         "--test-remote-fetch-cap-bytes",
         "--test-remote-apply-cap-bytes",
+        "--test-remote-outputs-budget-bytes",
         "--test-server-image",
         "--test-diagnostics-budget-ms",
     ] {
