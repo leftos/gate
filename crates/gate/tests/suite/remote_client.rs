@@ -12,7 +12,7 @@ use std::io::{self, ErrorKind, Write as _};
 use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use gate_router::repo_name;
 use serde_json::{Value, json};
@@ -385,6 +385,51 @@ fn outputs_case(name: &str, globs: &[&str]) -> Case {
 /// The outputs pending marker of the case's work-folder key, which its first run's queue line names, in its state root.
 fn pending_marker(case: &Case) -> PathBuf {
     case.root().join("remote").join(format!("{}.outputs-pending", key_of(&events(case))))
+}
+
+/// The hash cache of the case's work-folder key, which its first run's queue line names, in its state root.
+fn hashes_file(case: &Case) -> PathBuf {
+    case.root().join("remote").join(format!("{}.outputs-hashes", key_of(&events(case))))
+}
+
+/// The case's hash cache, read as JSON.
+fn hashes(case: &Case) -> Value {
+    let text = fs::read_to_string(hashes_file(case)).expect("the hash cache was saved");
+    serde_json::from_str(&text).expect("the hash cache is JSON")
+}
+
+/// Rewrites the case's hash cache so it holds `sha256` for the file `path`, its stamp left as saved.
+fn plant(case: &Case, path: &str, sha256: &str) {
+    let mut cache = hashes(case);
+    assert!(cache["files"].get(path).is_some(), "the cache holds {path}: {cache}");
+    cache["files"][path]["sha256"] = Value::from(sha256);
+    fs::write(hashes_file(case), format!("{cache}\n")).expect("the hash cache can be rewritten");
+}
+
+/// An hour, the age a file is given so a run takes it as settled.
+const HOUR: Duration = Duration::from_hours(1);
+
+/// Sets the last write of the case folder's file `name` to `at`.
+fn written_at(case: &Case, name: &str, at: SystemTime) {
+    fs::File::options()
+        .write(true)
+        .open(case.folder().join(name))
+        .and_then(|file| file.set_modified(at))
+        .expect("the file's last write can be set");
+}
+
+/// Sets the last write of the case folder's file `name` to `age` before now: a freshly written file is not settled,
+/// and a run keeps no hash of it.
+fn backdate(case: &Case, name: &str, age: Duration) {
+    written_at(case, name, SystemTime::now() - age);
+}
+
+/// The SHA-256 of `text`, in lower-case hex.
+fn sha256_hex(text: &str) -> String {
+    Sha256::digest(text.as_bytes()).iter().fold(String::new(), |mut said, byte| {
+        let _ = write!(said, "{byte:02x}");
+        said
+    })
 }
 
 /// Writes `steps`, one a line, as the stand-in's steps file `name` in the case's `ssh` folder; its path.
@@ -2466,6 +2511,267 @@ fn a_parity_refusal_leaves_no_outputs_pending_marker_and_the_next_run_sends_outp
     assert!(!refused_left_the_marker, "a parity refusal leaves no marker: {refused:?}");
 }
 
+/// A routed run saves the hash of each file under its globs last written well before it, as the manifest it built
+/// holds it: one line in the state root, no temporary file left beside it. A file written ahead of the run's start
+/// is not saved.
+#[test]
+fn a_routed_run_saves_the_hashes_of_its_stable_files() {
+    let case = outputs_case("client-hashes-saved", &BIN);
+    write(&case, r"bin\same.txt", "same");
+    write(&case, r"bin\differs.txt", "pc");
+    write(&case, r"bin\ahead.txt", "ahead");
+    backdate(&case, r"bin\same.txt", HOUR);
+    backdate(&case, r"bin\differs.txt", HOUR);
+    written_at(&case, r"bin\ahead.txt", SystemTime::now() + HOUR);
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok", "ok"]);
+    let command = [r".\tool.exe", "write", r"bin\same.txt", "same", "write", r"bin\differs.txt", "box"];
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &command));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(outcome.stderr.contains("gate-remote-outputs: 1 "), "one file comes back: {outcome:?}");
+    let text = fs::read_to_string(hashes_file(&case)).expect("the hash cache was saved");
+    assert!(text.ends_with('\n') && text.matches('\n').count() == 1, "one line: {text}");
+    let files = &hashes(&case)["files"];
+    assert_eq!(files["bin/same.txt"]["size"], 4, "{text}");
+    assert_eq!(files["bin/same.txt"]["sha256"], sha256_hex("same"), "{text}");
+    assert_eq!(
+        files["bin/differs.txt"]["sha256"],
+        sha256_hex("pc"),
+        "the file as the run found it: {text}"
+    );
+    assert!(files.get("bin/ahead.txt").is_none(), "a file written ahead of the run: {text}");
+    let temps: Vec<PathBuf> = fs::read_dir(case.root().join("remote"))
+        .expect("the state root's remote folder can be listed")
+        .map(|entry| entry.expect("an entry can be read").path())
+        .filter(|path| path.extension().is_some_and(|kind| kind.eq_ignore_ascii_case("tmp")))
+        .collect();
+    assert_eq!(temps, Vec::<PathBuf>::new(), "no temporary file is left");
+}
+
+/// The second run takes the PC's hash of a file whose size and last write match the saved ones from the cache, not
+/// from the file: a cache saying the PC holds what the builder writes makes the box bring nothing back.
+#[test]
+fn a_second_run_uses_the_cached_hash_not_the_file() {
+    let case = outputs_case("client-hashes-used", &BIN);
+    write(&case, r"bin\differs.txt", "pc");
+    backdate(&case, r"bin\differs.txt", HOUR);
+    let first = ssh_steps(&case, "first", &["ok", "ok"]);
+    let seeded = finish(client_gate(&case, "first.log", &first, &[r".\tool.exe", "out", "ran there"]));
+    assert_eq!(seeded.code, Some(0), "{seeded:?}");
+    plant(&case, "bin/differs.txt", &sha256_hex("box"));
+    let second = ssh_steps(&case, "second", &["ok", "ok", "ok"]);
+
+    let outcome = finish(client_gate(
+        &case,
+        "second.log",
+        &second,
+        &[r".\tool.exe", "write", r"bin\differs.txt", "box"],
+    ));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(
+        outcome.stderr.contains("gate-remote-outputs: 0"),
+        "the manifest carried the cached hash: {outcome:?}"
+    );
+    let differs = fs::read_to_string(case.folder().join("bin").join("differs.txt")).expect("the file is there");
+    assert_eq!(differs, "pc", "{outcome:?}");
+}
+
+/// A file whose size or last write differs from the saved stamp is read again, its cached hash not taken: with the
+/// cache saying the PC holds what the builder writes, both files still come back.
+#[test]
+fn a_rewritten_file_is_hashed_again() {
+    let case = outputs_case("client-hashes-stale", &BIN);
+    write(&case, r"bin\longer.txt", "pc");
+    write(&case, r"bin\older.txt", "pc");
+    backdate(&case, r"bin\longer.txt", HOUR);
+    backdate(&case, r"bin\older.txt", HOUR);
+    let first = ssh_steps(&case, "first", &["ok", "ok"]);
+    let seeded = finish(client_gate(&case, "first.log", &first, &[r".\tool.exe", "out", "ran there"]));
+    assert_eq!(seeded.code, Some(0), "{seeded:?}");
+    plant(&case, "bin/longer.txt", &sha256_hex("box"));
+    plant(&case, "bin/older.txt", &sha256_hex("box"));
+    write(&case, r"bin\longer.txt", "pc!");
+    backdate(&case, r"bin\longer.txt", HOUR);
+    backdate(&case, r"bin\older.txt", 2 * HOUR);
+    let second = ssh_steps(&case, "second", &["ok", "ok", "ok"]);
+    let command = [r".\tool.exe", "write", r"bin\longer.txt", "box", "write", r"bin\older.txt", "box"];
+
+    let outcome = finish(client_gate(&case, "second.log", &second, &command));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(outcome.stderr.contains("gate-remote-outputs: 2 "), "both files come back: {outcome:?}");
+    for name in ["longer.txt", "older.txt"] {
+        let text = fs::read_to_string(case.folder().join("bin").join(name)).expect("the file is there");
+        assert_eq!(text, "box", "{name}: {outcome:?}");
+    }
+}
+
+/// A hash cache that is not an outputs manifest counts as empty, says nothing, and the run saves a good one over it,
+/// even one that keeps no hash: the only file under the globs is written ahead of the run.
+#[test]
+fn a_corrupt_hashes_file_is_ignored_and_replaced() {
+    let case = outputs_case("client-hashes-corrupt", &BIN);
+    write(&case, r"bin\ahead.txt", "ahead");
+    written_at(&case, r"bin\ahead.txt", SystemTime::now() + HOUR);
+    let first = ssh_steps(&case, "first", &["ok", "ok"]);
+    let seeded = finish(client_gate(&case, "first.log", &first, &[r".\tool.exe", "out", "ran there"]));
+    assert_eq!(seeded.code, Some(0), "{seeded:?}");
+    assert!(
+        !hashes_file(&case).exists(),
+        "a run that keeps no hash saves no cache over none: {seeded:?}"
+    );
+    fs::write(hashes_file(&case), "not json").expect("the hash cache can be spoiled");
+    let second = ssh_steps(&case, "second", &["ok", "ok"]);
+
+    let outcome = finish(client_gate(&case, "second.log", &second, &[r".\tool.exe", "out", "ran there"]));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(outcome.stderr.contains("gate-remote-outputs: 0"), "{outcome:?}");
+    assert!(!outcome.stderr.contains("outputs-hashes"), "the cache is not said: {outcome:?}");
+    assert_eq!(hashes(&case)["files"], json!({}), "{outcome:?}");
+}
+
+/// While the pending marker stands the manifest takes no hash from the cache, and the cache is saved from the hashes
+/// the build read: a cache saying the PC holds what the builder writes still sees the file come back, and then holds
+/// the PC's own hash.
+#[test]
+fn a_pending_marker_builds_the_manifest_without_the_cache_and_saves_it() {
+    let case = outputs_case("client-hashes-full", &BIN);
+    write(&case, r"bin\differs.txt", "pc");
+    backdate(&case, r"bin\differs.txt", HOUR);
+    let first = ssh_steps(&case, "first", &["ok", "ok"]);
+    let seeded = finish(client_gate(&case, "first.log", &first, &[r".\tool.exe", "out", "ran there"]));
+    assert_eq!(seeded.code, Some(0), "{seeded:?}");
+    plant(&case, "bin/differs.txt", &sha256_hex("box"));
+    fs::write(pending_marker(&case), "").expect("the pending marker can be made");
+    let second = ssh_steps(&case, "second", &["ok", "ok", "ok"]);
+    let command = [r".\tool.exe", "write", r"bin\differs.txt", "box"];
+
+    let outcome = finish(client_gate(&case, "second.log", &second, &command));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(
+        outcome.stderr.contains("gate-remote-outputs: 1 "),
+        "the manifest carried the file's own hash: {outcome:?}"
+    );
+    let differs = fs::read_to_string(case.folder().join("bin").join("differs.txt")).expect("the file is there");
+    assert_eq!(differs, "box", "{outcome:?}");
+    assert_eq!(
+        hashes(&case)["files"]["bin/differs.txt"]["sha256"],
+        sha256_hex("pc"),
+        "the cache holds the hash the build read: {outcome:?}"
+    );
+}
+
+/// A build that fails saves no hash cache, not even the hash of a settled file it read before the file it could not.
+#[test]
+fn a_manifest_that_cannot_be_built_saves_no_hashes() {
+    let case = outputs_case("client-hashes-unbuilt", &BIN);
+    write(&case, r"bin\kept.txt", "kept");
+    write(&case, r"bin\locked.txt", "pc");
+    backdate(&case, r"bin\kept.txt", HOUR);
+    backdate(&case, r"bin\locked.txt", HOUR);
+    let held = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(case.folder().join("bin").join("locked.txt"))
+        .expect("the file can be held");
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "out", "ran there"]));
+    drop(held);
+
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert!(
+        outcome.stderr.contains("the manifest could not be built: "),
+        "the build failed: {outcome:?}"
+    );
+    assert!(!hashes_file(&case).exists(), "no cache is saved: {outcome:?}");
+}
+
+/// A run whose build finds every file as the cache holds it does not write the cache again: the file keeps the last
+/// write the test gave it.
+#[test]
+fn a_run_that_changes_no_hash_leaves_the_cache_file_alone() {
+    let case = outputs_case("client-hashes-unchanged", &BIN);
+    write(&case, r"bin\same.txt", "same");
+    backdate(&case, r"bin\same.txt", HOUR);
+    let first = ssh_steps(&case, "first", &["ok", "ok"]);
+    let seeded = finish(client_gate(&case, "first.log", &first, &[r".\tool.exe", "out", "ran there"]));
+    assert_eq!(seeded.code, Some(0), "{seeded:?}");
+    let path = hashes_file(&case);
+    let saved = fs::read_to_string(&path).expect("the first run saves the cache");
+    fs::File::options()
+        .write(true)
+        .open(&path)
+        .and_then(|file| file.set_modified(SystemTime::now() - HOUR))
+        .expect("the cache's last write can be set");
+    let aged = fs::metadata(&path).and_then(|held| held.modified()).expect("the cache's last write");
+    let second = ssh_steps(&case, "second", &["ok", "ok"]);
+
+    let outcome = finish(client_gate(&case, "second.log", &second, &[r".\tool.exe", "out", "ran there"]));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let now = fs::metadata(&path).and_then(|held| held.modified()).expect("the cache's last write");
+    assert_eq!(now, aged, "the cache is not written again: {outcome:?}");
+    assert_eq!(fs::read_to_string(&path).expect("the cache can be read"), saved, "{outcome:?}");
+}
+
+/// The hash cache is saved once the manifest is built, whatever the run's end: a failing run leaves it beside the
+/// pending marker, and the next run's `OutputsFull` still brings back the file that run left alone.
+#[test]
+fn a_failed_run_still_leaves_the_pcs_valid_hashes() {
+    let case = outputs_case("client-hashes-failed", &BIN);
+    write(&case, r"bin\built.txt", "pc");
+    backdate(&case, r"bin\built.txt", HOUR);
+    let first = ssh_steps(&case, "first", &["ok", "ok"]);
+    let failed = finish(client_gate(
+        &case,
+        "first.log",
+        &first,
+        &[r".\tool.exe", "write", r"bin\built.txt", "box", "exit", "3"],
+    ));
+    assert_eq!(failed.code, Some(3), "{failed:?}");
+    assert!(pending_marker(&case).exists(), "a failing run leaves the marker: {failed:?}");
+    assert_eq!(hashes(&case)["files"]["bin/built.txt"]["sha256"], sha256_hex("pc"), "{failed:?}");
+    let second = ssh_steps(&case, "second", &["ok", "ok", "ok"]);
+
+    let outcome = finish(client_gate(&case, "second.log", &second, &[r".\tool.exe", "out", "ran there"]));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(
+        outcome.stderr.contains("gate-remote-outputs: 1 "),
+        "the file this run left alone comes back: {outcome:?}"
+    );
+    let built = fs::read_to_string(case.folder().join("bin").join("built.txt")).expect("the file is there");
+    assert_eq!(built, "box", "{outcome:?}");
+}
+
+/// A file gone from the worktree drops out of the hash cache at its next save.
+#[test]
+fn a_deleted_file_drops_out_of_the_hashes() {
+    let case = outputs_case("client-hashes-deleted", &BIN);
+    write(&case, r"bin\same.txt", "same");
+    write(&case, r"bin\kept.txt", "kept");
+    backdate(&case, r"bin\same.txt", HOUR);
+    backdate(&case, r"bin\kept.txt", HOUR);
+    let first = ssh_steps(&case, "first", &["ok", "ok"]);
+    let seeded = finish(client_gate(&case, "first.log", &first, &[r".\tool.exe", "out", "ran there"]));
+    assert_eq!(seeded.code, Some(0), "{seeded:?}");
+    assert!(hashes(&case)["files"].get("bin/same.txt").is_some(), "the first run saves it: {seeded:?}");
+    fs::remove_file(case.folder().join("bin").join("same.txt")).expect("the file can be removed");
+    let second = ssh_steps(&case, "second", &["ok", "ok"]);
+
+    let outcome = finish(client_gate(&case, "second.log", &second, &[r".\tool.exe", "out", "ran there"]));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let files = &hashes(&case)["files"];
+    assert!(files.get("bin/same.txt").is_none(), "{files}");
+    assert_eq!(files["bin/kept.txt"]["sha256"], sha256_hex("kept"), "{files}");
+}
+
 /// Three worktrees: a run the box refuses, as `a_refused_run_call_syncs_nothing_back` does once a first run named the
 /// key; one the watchdog kills; and one whose connection is lost.
 #[test]
@@ -2911,10 +3217,7 @@ fn box_output_archive(case: &Case) -> PathBuf {
 /// A `.tar.zst` outputs archive holding one member `path` of `text` and the `.gate-outputs.json` list agreeing with it,
 /// as a broken or hostile builder would send.
 fn crafted_archive(path: &str, text: &str) -> Vec<u8> {
-    let sha256: String = Sha256::digest(text.as_bytes()).iter().fold(String::new(), |mut said, byte| {
-        let _ = write!(said, "{byte:02x}");
-        said
-    });
+    let sha256 = sha256_hex(text);
     let list = format!(r#"[{{"path":"{path}","size":{},"sha256":"{sha256}"}}]"#, text.len());
     let mut tar = tar::Builder::new(Vec::new());
     for (name, data) in [(path.as_bytes(), text.as_bytes()), (".gate-outputs.json".as_bytes(), list.as_bytes())] {

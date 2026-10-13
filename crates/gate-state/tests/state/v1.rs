@@ -173,6 +173,16 @@ fn the_outputs_pending_marker_sits_in_the_remote_folder() {
 }
 
 #[test]
+fn the_outputs_hash_cache_sits_in_the_remote_folder() {
+    let root = Path::new("state-root");
+
+    assert_eq!(
+        parts_under(root, &v1::outputs_hashes_path(root, "app-1a2b3c4d")),
+        ["remote", "app-1a2b3c4d.outputs-hashes"]
+    );
+}
+
+#[test]
 fn the_nothing_back_record_sits_in_the_remote_folder() {
     let root = Path::new("state-root");
 

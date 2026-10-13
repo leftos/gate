@@ -1,15 +1,16 @@
 //! A routed run's outputs on the PC, up to its run call's end: the manifest of the files the PC holds under the run's
-//! output globs, hashed before the run call and sent on its standard input; the pending marker, written after the push
-//! and before the run call and removed once the outputs step completes, whose presence makes the next routed run of the
-//! worktree ask for every output that differs from the PC's (`OutputsFull`); the box's `gate-remote-outputs:` line the
-//! client takes from the run call; and the outputs call that fetches the archive it names into the worktree's `.tmp`
-//! folder, for [`install`](super::install) to put into the worktree.
+//! output globs, hashed before the run call, each file whose stamp the hash cache holds taking its hash from it, and
+//! sent on its standard input; the pending marker, written after the push and before the run call and removed once the
+//! outputs step completes, whose presence makes the next routed run of the worktree ask for every output that differs
+//! from the PC's (`OutputsFull`); the box's `gate-remote-outputs:` line the client takes from the run call; and the
+//! outputs call that fetches the archive it names into the worktree's `.tmp` folder, for [`install`](super::install)
+//! to put into the worktree.
 
 use std::cell::Cell;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read};
 use std::num::NonZeroU64;
-use std::os::windows::fs::OpenOptionsExt;
+use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -29,10 +30,11 @@ use super::payload::Location;
 use super::watchdog::Cut;
 use crate::boxside::payload::{archive_file_name, escaped};
 use crate::outputs::archive::final_path;
+use crate::outputs::cache::{HashCache, file_time_now};
 use crate::outputs::glob::Globs;
 use crate::outputs::hash::sha256_of;
 use crate::outputs::manifest::{MANIFEST_LIMIT, Manifest};
-use crate::outputs::walk::{in_context, walk};
+use crate::outputs::walk::{Found, in_context, walk};
 
 /// Why a manifest line longer than [`MANIFEST_LIMIT`] is not sent.
 const PAST_THE_CAP: &str = "it is larger than the box takes (64 MiB)";
@@ -228,9 +230,10 @@ pub(super) struct Sent<'a> {
 
 /// What `attempt`'s run call carries of its outputs. A run with no output globs carries none, and reads no pending
 /// marker. One with globs reads whether the marker is there, builds the manifest, polling the console interrupt as it
-/// hashes, and records the marker's path for [`marked`] to write once the snapshot is pushed; a manifest that cannot
-/// be built is kept for the outputs step, and the run call then carries no globs. Else the interrupt that ended the
-/// build.
+/// hashes and taking each hash the worktree's hash cache holds at the file's stamp, unless the marker is there, saves
+/// the cache that build leaves, whatever the run's end, unless it equals the one it read, and records the marker's path
+/// for [`marked`] to write once the snapshot is pushed; a manifest that cannot be built is kept for the outputs step,
+/// saves no cache, and the run call then carries no globs. Else the interrupt that ended the build.
 pub(super) fn sent<'a>(attempt: &mut Attempt<'_, 'a>) -> Result<Sent<'a>, End> {
     let call: &RemoteCall<'a> = attempt.call;
     let mut sent = Sent {
@@ -245,8 +248,16 @@ pub(super) fn sent<'a>(attempt: &mut Attempt<'_, 'a>) -> Result<Sent<'a>, End> {
     }
     let marker = v1::outputs_pending_path(call.state_dir, call.key);
     let full = pending(&marker);
-    match manifest_line(Path::new(call.root), call.outputs, MANIFEST_LIMIT, || attempt.go_on().is_ok()) {
-        Ok((line, files)) => {
+    let hashes = v1::outputs_hashes_path(call.state_dir, call.key);
+    // The full send is the recovery path: it reuses no hash that may be wrong, and its own then replace the cache's.
+    let previous = if full { None } else { HashCache::load(&hashes) };
+    let none = HashCache::default();
+    let cache = previous.as_ref().unwrap_or(&none);
+    match manifest_line(Path::new(call.root), call.outputs, MANIFEST_LIMIT, cache, || attempt.go_on().is_ok()) {
+        Ok((line, files, next)) => {
+            if previous.as_ref() != Some(&next) {
+                next.save(&hashes);
+            }
             sent.globs = call.outputs;
             sent.full = full;
             sent.manifest = Some(Arc::from(line));
@@ -406,18 +417,32 @@ pub(super) fn removed(attempt: &mut Attempt<'_, '_>, archive: &Archive, which: &
     }
 }
 
-/// The manifest line, newline included, of the files under `globs` in the worktree `root`, each hashed as a stream
-/// that asks `go_on` before each of its reads, and refused when its final path is not inside `root`'s. A line longer
-/// than `cap` bytes is refused, its files' entries counted before each is hashed and the whole line checked at the
-/// end. [`Unbuilt::Interrupted`] once `go_on` says no; else why the globs, the walk or a file cannot be read, or why
+/// The manifest line, newline included, of the files under `globs` in the worktree `root`, the manifest it holds, and
+/// the hash cache the next build may reuse. Each file whose stamp `cache` holds takes its hash from it; each other is
+/// hashed as a stream that asks `go_on` before each of its reads; either is refused when its final path is not inside
+/// `root`'s. The cache returned holds each file last written at least [`WINDOW`](crate::outputs::cache::WINDOW) before
+/// the walk began. A line longer than `cap` bytes is refused, its files' entries counted before each is hashed and the
+/// whole line checked at the end. [`Unbuilt::Interrupted`] once `go_on` says no; else why the globs, the walk or a file cannot be read, or why
 /// the line is not sent.
-fn manifest_line(root: &Path, globs: &[String], cap: usize, go_on: impl Fn() -> bool) -> Result<(String, Manifest), Unbuilt> {
+fn manifest_line(
+    root: &Path,
+    globs: &[String],
+    cap: usize,
+    cache: &HashCache,
+    go_on: impl Fn() -> bool,
+) -> Result<(String, Manifest, HashCache), Unbuilt> {
     let failed = |error: io::Error| Unbuilt::Failed(error.to_string());
     let globs = Globs::new(globs).map_err(Unbuilt::Failed)?;
+    let started = file_time_now();
     let found = walk(root, &globs).map_err(failed)?;
     let inside = fs::canonicalize(root).map_err(|error| failed(in_context(root, &error)))?;
     let stopped = Cell::new(false);
-    let built = Manifest::build_with(&found, cap, |file| hashed(&file.full, &inside, &go_on, &stopped));
+    let mut next = HashCache::default();
+    let built = Manifest::build_with(&found, cap, |file| {
+        let sha256 = sha256_for(file, &inside, cache, &go_on, &stopped)?;
+        next.keep(file, &sha256, started);
+        Ok(sha256)
+    });
     if stopped.get() {
         return Err(Unbuilt::Interrupted);
     }
@@ -428,17 +453,51 @@ fn manifest_line(root: &Path, globs: &[String], cap: usize, go_on: impl Fn() -> 
     };
     let line = manifest.line();
     within_cap(line.len(), cap).map_err(Unbuilt::Failed)?;
-    Ok((line, manifest))
+    Ok((line, manifest, next))
 }
 
-/// The SHA-256 of the file at `path`, read through a [`Polled`] reader, once its final path, as the system resolves the
-/// open file, is found inside `inside`, the worktree's own final path: a folder swapped for a junction after the walk
-/// is not followed out of it. Else why it cannot be read or is refused, its path named.
-fn hashed(path: &Path, inside: &Path, go_on: &dyn Fn() -> bool, stopped: &Cell<bool>) -> io::Result<String> {
+/// The SHA-256 of the file a walk `found`. One whose stamp `cache` holds asks `go_on` as a read does, is opened as
+/// [`opened_inside`] checks it, and takes the cached hash when the opened file's handle reads the same stamp: the
+/// walk's comes from the folder listing, which can lag a file still being written. Else, and for every other file, as
+/// [`hashed`] reads it.
+fn sha256_for(file: &Found, inside: &Path, cache: &HashCache, go_on: &dyn Fn() -> bool, stopped: &Cell<bool>) -> io::Result<String> {
+    let Some(sha256) = cache.hit(file) else {
+        return hashed(&file.full, inside, go_on, stopped);
+    };
+    asked(go_on, stopped)?;
+    let opened = opened_inside(&file.full, inside)?;
+    let held = opened.metadata().map_err(|error| in_context(&file.full, &error))?;
+    if held.file_size() == file.stamp.size && held.last_write_time() == file.stamp.modified {
+        return Ok(sha256.to_owned());
+    }
+    hashed(&file.full, inside, go_on, stopped)
+}
+
+/// Asks `go_on` whether to go on; once it says no, marks `stopped` and fails as the console interrupt.
+fn asked(go_on: &dyn Fn() -> bool, stopped: &Cell<bool>) -> io::Result<()> {
+    if go_on() {
+        return Ok(());
+    }
+    stopped.set(true);
+    // Not `ErrorKind::Interrupted`, which a copy retries.
+    Err(io::Error::other("the console interrupt was raised"))
+}
+
+/// The file at `path`, opened, once its final path, as the system resolves the open file, is found inside `inside`,
+/// the worktree's own final path: a folder swapped for a junction after the walk is not followed out of it. Else why
+/// it cannot be opened or is refused, its path named.
+fn opened_inside(path: &Path, inside: &Path) -> io::Result<File> {
     let file = File::open(path).map_err(|error| in_context(path, &error))?;
     if !final_path(&file).map_err(|error| in_context(path, &error))?.starts_with(inside) {
         return Err(io::Error::other(format!("{} resolves outside the worktree", path.display())));
     }
+    Ok(file)
+}
+
+/// The SHA-256 of the file at `path`, read through a [`Polled`] reader once [`opened_inside`] finds it inside
+/// `inside`. Else why it cannot be read or is refused, its path named.
+fn hashed(path: &Path, inside: &Path, go_on: &dyn Fn() -> bool, stopped: &Cell<bool>) -> io::Result<String> {
+    let file = opened_inside(path, inside)?;
     let polled = Polled { inner: file, go_on, stopped };
     sha256_of(polled).map(|(sha256, _)| sha256).map_err(|error| in_context(path, &error))
 }
@@ -452,11 +511,7 @@ pub(super) struct Polled<'p, R> {
 
 impl<R: Read> Read for Polled<'_, R> {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        if !(self.go_on)() {
-            self.stopped.set(true);
-            // Not `ErrorKind::Interrupted`, which a copy retries.
-            return Err(io::Error::other("the console interrupt was raised"));
-        }
+        asked(self.go_on, self.stopped)?;
         self.inner.read(buffer)
     }
 }
@@ -529,19 +584,22 @@ pub(super) fn accepted(line: Option<&str>, key: &str, nonce: &str) -> Option<Bro
 #[expect(clippy::expect_used, reason = "a test that cannot make its files must fail loudly")]
 mod tests {
     use std::cell::Cell;
-    use std::fs;
+    use std::fs::{self, File};
     use std::io::Write;
     use std::path::{Path, PathBuf};
     use std::process::Command;
-    use std::time::Instant;
+    use std::time::{Duration, Instant, SystemTime};
 
     use gate_router::DEFAULT_OUTPUTS;
 
     use super::{
-        Archive, Brought, MANIFEST_LIMIT, NonZeroU64, PARTIAL, Unbuilt, accepted, hashed, keep_outputs_line, manifest_line, pending, within_cap,
+        Archive, Brought, MANIFEST_LIMIT, NonZeroU64, PARTIAL, Unbuilt, accepted, hashed, keep_outputs_line, manifest_line, pending, sha256_for,
+        within_cap,
     };
+    use crate::outputs::cache::{HashCache, file_time_now};
     use crate::outputs::glob::Globs;
-    use crate::outputs::walk::walk;
+    use crate::outputs::hash::file_sha256;
+    use crate::outputs::walk::{Found, walk};
 
     const KEY: &str = "app-1a2b3c4d";
     const NONCE: &str = "0123456789abcdef0123456789abcdef";
@@ -672,14 +730,155 @@ mod tests {
         fs::create_dir_all(root.join("bin")).expect("the folder can be made");
         fs::write(root.join("bin").join("a.dll"), "abc").expect("the file can be written");
         let globs = ["**".to_owned()];
-        let (line, _) = manifest_line(&root, &globs, MANIFEST_LIMIT, || true).expect("the manifest is built");
+        let none = HashCache::default();
+        let (line, _, _) = manifest_line(&root, &globs, MANIFEST_LIMIT, &none, || true).expect("the manifest is built");
 
-        let fits = manifest_line(&root, &globs, line.len(), || true).map(|(fitting, _)| fitting);
+        let fits = manifest_line(&root, &globs, line.len(), &none, || true).map(|(fitting, _, _)| fitting);
         assert_eq!(fits, Ok(line.clone()));
         let refused = Err(Unbuilt::Failed("it is larger than the box takes (64 MiB)".to_owned()));
-        assert_eq!(manifest_line(&root, &globs, line.len() - 1, || true), refused, "the whole line");
-        assert_eq!(manifest_line(&root, &globs, 10, || true), refused, "the entries, before any hash");
-        assert_eq!(manifest_line(&root, &globs, MANIFEST_LIMIT, || false), Err(Unbuilt::Interrupted));
+        assert_eq!(manifest_line(&root, &globs, line.len() - 1, &none, || true), refused, "the whole line");
+        assert_eq!(manifest_line(&root, &globs, 10, &none, || true), refused, "the entries, before any hash");
+        assert_eq!(manifest_line(&root, &globs, MANIFEST_LIMIT, &none, || false), Err(Unbuilt::Interrupted));
+    }
+
+    /// An hour, the age a file is given so a build takes it as settled.
+    const HOUR: Duration = Duration::from_hours(1);
+
+    /// A SHA-256 no file of a test holds, which a build can take only from the cache.
+    fn sentinel() -> String {
+        "f".repeat(64)
+    }
+
+    /// Sets the last write of the file at `path` to `at`.
+    fn written_at(path: &Path, at: SystemTime) {
+        File::options()
+            .write(true)
+            .open(path)
+            .and_then(|file| file.set_modified(at))
+            .expect("the file's last write can be set");
+    }
+
+    /// The files below `root`, as a build's walk finds them.
+    fn walked(root: &Path) -> Vec<Found> {
+        walk(root, &Globs::new(&["**".to_owned()]).expect("a glob")).expect("the walk")
+    }
+
+    /// A worktree holding `bin/a.dll`, last written an hour ago, and a cache holding the sentinel for it at its stamp.
+    fn cached_worktree(name: &str) -> (PathBuf, HashCache) {
+        let root = scratch(name);
+        fs::create_dir_all(root.join("bin")).expect("the folder can be made");
+        let file = root.join("bin").join("a.dll");
+        fs::write(&file, "abc").expect("the file can be written");
+        written_at(&file, SystemTime::now() - HOUR);
+        let mut cache = HashCache::default();
+        cache.keep(&walked(&root)[0], &sentinel(), file_time_now());
+        (root, cache)
+    }
+
+    /// The SHA-256 a manifest built of the worktree `root` with `cache` holds for `bin/a.dll`.
+    fn built_sha256(root: &Path, cache: &HashCache) -> Option<String> {
+        let (_, files, _) = manifest_line(root, &["**".to_owned()], MANIFEST_LIMIT, cache, || true).expect("the manifest is built");
+        files.get("bin/a.dll").map(|held| held.sha256.clone())
+    }
+
+    /// A hit takes the sentinel, which no file holds, and asks `go_on` as a read does: a `go_on` that says no stops a
+    /// build that would read no byte.
+    #[test]
+    fn a_cached_stamp_is_not_hashed_again() {
+        let (root, cache) = cached_worktree("cache-hit");
+        let globs = ["**".to_owned()];
+
+        let (line, files, next) = manifest_line(&root, &globs, MANIFEST_LIMIT, &cache, || true).expect("the manifest is built");
+
+        assert!(line.contains(&sentinel()), "{line}");
+        assert_eq!(files.get("bin/a.dll").map(|held| held.sha256.clone()), Some(sentinel()));
+        assert_eq!(next, cache, "the hash taken from the cache is kept");
+        let asked = manifest_line(&root, &globs, MANIFEST_LIMIT, &cache, || false).map(|(asked, _, _)| asked);
+        assert_eq!(asked, Err(Unbuilt::Interrupted), "a hit asks go_on");
+    }
+
+    /// The walk's stamp comes from the folder listing, which can lag a file still being written: a hit whose stamp
+    /// differs from the one the opened file's handle reads is hashed.
+    #[test]
+    fn a_hit_whose_handle_stamp_differs_from_the_walks_is_hashed() {
+        let (root, _) = cached_worktree("cache-handle-stamp");
+        let mut listed = walked(&root).remove(0);
+        listed.stamp.modified -= 10_000_000;
+        let mut cache = HashCache::default();
+        cache.keep(&listed, &sentinel(), file_time_now());
+        assert_eq!(cache.hit(&listed), Some(sentinel().as_str()), "the cache holds the listed stamp");
+        let inside = fs::canonicalize(&root).expect("the worktree resolves");
+
+        let taken = sha256_for(&listed, &inside, &cache, &|| true, &Cell::new(false));
+
+        let abc = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        assert_eq!(taken.map_err(|error| error.to_string()), Ok(abc.to_owned()));
+    }
+
+    #[test]
+    fn a_changed_size_or_modified_is_hashed_again() {
+        let (root, cache) = cached_worktree("cache-miss");
+        let file = root.join("bin").join("a.dll");
+
+        written_at(&file, SystemTime::now() - 2 * HOUR);
+        let other_write = built_sha256(&root, &cache);
+        fs::write(&file, "abcd").expect("the file can be rewritten");
+        written_at(&file, SystemTime::now() - HOUR);
+        let other_size = built_sha256(&root, &cache);
+
+        assert_eq!(
+            other_write.as_deref(),
+            Some("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"),
+            "the same size, another last write"
+        );
+        assert_eq!(other_size, Some(file_sha256(&file).expect("the file can be hashed")), "another size");
+    }
+
+    #[test]
+    fn a_build_keeps_the_hashes_of_settled_files_only() {
+        let root = scratch("cache-keep");
+        fs::create_dir_all(root.join("bin")).expect("the folder can be made");
+        for (name, at) in [("settled.dll", SystemTime::now() - HOUR), ("ahead.dll", SystemTime::now() + HOUR)] {
+            fs::write(root.join("bin").join(name), "abc").expect("the file can be written");
+            written_at(&root.join("bin").join(name), at);
+        }
+
+        let (_, files, next) =
+            manifest_line(&root, &["**".to_owned()], MANIFEST_LIMIT, &HashCache::default(), || true).expect("the manifest is built");
+
+        let abc = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        let found = walked(&root);
+        let (ahead, settled) = (&found[0], &found[1]);
+        assert_eq!(next.hit(settled), Some(abc), "a file written an hour before the build");
+        assert_eq!(next.hit(ahead), None, "a file written after the build began");
+        assert!(files.get("bin/ahead.dll").is_some(), "the manifest holds every file");
+    }
+
+    /// The junction check of [`hashed`] holds for a hash taken from the cache too: a folder swapped for a junction
+    /// after the walk is not followed out of the worktree.
+    #[test]
+    fn a_cache_hit_still_refuses_a_file_that_leaves_the_worktree() {
+        let folder = scratch("cache-final-path");
+        let (root, elsewhere) = (folder.join("worktree"), folder.join("elsewhere"));
+        fs::create_dir_all(&root).expect("the worktree can be made");
+        fs::create_dir_all(&elsewhere).expect("the outside folder can be made");
+        fs::write(elsewhere.join("secret.dll"), "abc").expect("the file can be written");
+        written_at(&elsewhere.join("secret.dll"), SystemTime::now() - HOUR);
+        junction(&root.join("bin"), &elsewhere);
+        let through = Found {
+            path: "bin/secret.dll".to_owned(),
+            full: root.join("bin").join("secret.dll"),
+            stamp: walked(&elsewhere)[0].stamp,
+        };
+        let mut cache = HashCache::default();
+        cache.keep(&through, &sentinel(), file_time_now());
+        assert_eq!(cache.hit(&through), Some(sentinel().as_str()), "the cache holds the file");
+        let inside = fs::canonicalize(&root).expect("the worktree resolves");
+
+        let taken = sha256_for(&through, &inside, &cache, &|| true, &Cell::new(false));
+
+        let refused = taken.expect_err("a file reached through a junction is refused").to_string();
+        assert_eq!(refused, format!("{} resolves outside the worktree", through.full.display()));
     }
 
     #[test]
@@ -805,7 +1004,7 @@ mod tests {
     }
 
     /// A lab measurement, not a check: how long the walk and the whole manifest build take on a real built worktree,
-    /// so the write of a `(path, size, mtime)` hash cache can be decided on a number. Reads the tree from
+    /// cold, with an empty hash cache, and warm, with the cache the cold build saves loaded back. Reads the tree from
     /// `GATE_MEASURE_ROOT` and its globs from `GATE_MEASURE_GLOBS` (`;`-separated, [`DEFAULT_OUTPUTS`] when unset),
     /// prints one line of figures, and asserts nothing about time.
     #[test]
@@ -830,12 +1029,22 @@ mod tests {
         let bytes: u64 = found.iter().map(|file| file.stamp.size).sum();
 
         let started = Instant::now();
-        let (line, _) = manifest_line(&root, &globs, usize::MAX, || true).expect("the measured tree can be hashed");
-        let manifest_seconds = started.elapsed().as_secs_f64();
+        let built = manifest_line(&root, &globs, usize::MAX, &HashCache::default(), || true);
+        let (line, _, saved) = built.expect("the measured tree can be hashed");
+        let cold_seconds = started.elapsed().as_secs_f64();
+        let path = scratch("measure").join("measure.outputs-hashes");
+        saved.save(&path);
+
+        let started = Instant::now();
+        let cache = HashCache::load(&path).expect("the saved cache loads");
+        manifest_line(&root, &globs, usize::MAX, &cache, || true).expect("the measured tree can be hashed again");
+        let warm_seconds = started.elapsed().as_secs_f64();
+        let cached = found.iter().filter(|file| cache.hit(file).is_some()).count();
 
         let mib = bytes as f64 / (1024.0 * 1024.0);
         println!(
-            "manifest: {}: {} files, {mib:.1} MiB; walk {walk_seconds:.3} s; manifest_line {manifest_seconds:.3} s; line {} bytes",
+            "manifest: {}: {} files, {mib:.1} MiB; walk {walk_seconds:.3} s; manifest_line cold {cold_seconds:.3} s, warm {warm_seconds:.3} s \
+             ({cached} files cached); line {} bytes",
             root.display(),
             found.len(),
             line.len()

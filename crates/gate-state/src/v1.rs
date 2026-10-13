@@ -124,6 +124,14 @@ pub fn outputs_pending_path(root: &Path, key: &str) -> PathBuf {
     remote_dir(root).join(format!("{key}.outputs-pending"))
 }
 
+/// The hash cache of the work folder `key`, `<root>\remote\<key>.outputs-hashes`: the outputs manifest line of the
+/// worktree's last built manifest, its files whose last write came well before that build, so the next build reuses
+/// the hash of each file whose size and last write still match instead of reading it again.
+#[must_use]
+pub fn outputs_hashes_path(root: &Path, key: &str) -> PathBuf {
+    remote_dir(root).join(format!("{key}.outputs-hashes"))
+}
+
 /// The nothing-back record of the work folder `key`, `<root>\remote\<key>.nothing-back`: the JSON object
 /// `{"v": 1, "host": "<builder>", "configuration": …, "framework": …, "runtime": …}` ([`NothingBackRecord`]), written
 /// when a routed dotnet build of that worktree ends without its outputs known to be brought back and removed by a
