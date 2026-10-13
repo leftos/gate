@@ -19,8 +19,8 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::support::{
-    Case, FAKE_TOOL, GATE, GIT_REDIRECTS, Go, Outcome, allow_breakaway, copy_tool, events, finish, git, git_init, heavy_words, nothing_back, release,
-    shown, start, wait_for_journal_line, wait_until, wait_until_closed, write_remote_json,
+    Case, FAKE_TOOL, GATE, GIT_REDIRECTS, Go, Outcome, allow_breakaway, build_version, copy_tool, events, finish, git, git_init, heavy_words,
+    nothing_back, release, shown, start, wait_for_journal_line, wait_until, wait_until_closed, write_remote_json,
 };
 
 const HOST: &str = "builder";
@@ -853,7 +853,7 @@ fn a_box_of_another_version_is_not_routed() {
     let outcome = finish(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "out", "ran here"]));
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
-    let line = format!("gate: not routed: builder runs gate 0.0.0-other, this PC {}", env!("CARGO_PKG_VERSION"));
+    let line = format!("gate: not routed: builder runs gate 0.0.0-other, this PC {}", build_version(&case));
     assert!(outcome.stderr.contains(&line), "{outcome:?}");
     assert!(outcome.stderr.contains("gate: remote builder version; running here"), "{outcome:?}");
     assert!(outcome.stdout.contains("ran here"), "{outcome:?}");
@@ -861,6 +861,28 @@ fn a_box_of_another_version_is_not_routed() {
     let events = events(&case);
     assert_eq!(fallbacks(&events), ["version"]);
     assert_eq!(builder_ref(&case, &format!("refs/gate/{}", key_of(&events))), "", "nothing was pushed");
+}
+
+#[test]
+fn a_builder_gate_of_the_same_version_without_this_build_falls_back_version() {
+    let case = client_case("client-version-no-build");
+    let step = format!("version {}", env!("CARGO_PKG_VERSION"));
+    let steps = ssh_steps(&case, "ssh", &[step.as_str()]);
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "out", "ran here"]));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    // The same package version, another build: the whole text is compared, so this is not the builder's own gate.
+    let line = format!(
+        "gate: not routed: builder runs gate {}, this PC {}",
+        env!("CARGO_PKG_VERSION"),
+        build_version(&case)
+    );
+    assert!(outcome.stderr.contains(&line), "{outcome:?}");
+    assert!(outcome.stderr.contains("gate: remote builder version; running here"), "{outcome:?}");
+    assert!(outcome.stdout.contains("ran here"), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight"]);
+    assert_eq!(fallbacks(&events(&case)), ["version"]);
 }
 
 /// The line a run the builder lacks the toolchain for falls back under.
@@ -1467,7 +1489,7 @@ fn a_builder_version_holding_escapes_is_refused_in_an_escaped_line() {
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     let line = format!(
         r"gate: not routed: builder runs gate 9.9.9\u{{1b}}[2J\u{{202e}}, this PC {}",
-        env!("CARGO_PKG_VERSION")
+        build_version(&case)
     );
     assert!(outcome.stderr.contains(&line), "{outcome:?}");
     assert!(!outcome.stderr.contains(['\u{1b}', '\u{202e}']), "no raw escape: {outcome:?}");

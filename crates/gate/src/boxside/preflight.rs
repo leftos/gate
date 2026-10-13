@@ -17,6 +17,7 @@ use crate::console::Console;
 use crate::environment::Variables;
 use crate::remote::git;
 use crate::run::{ERROR_FILE_NOT_FOUND, find_program};
+use crate::version::build_version;
 
 /// The status of a step that failed with no status of its own: git or a folder that could not be made or written.
 const FAILED_STATUS: u32 = 1;
@@ -68,7 +69,7 @@ pub(crate) fn preflight(payload: &Payload, seams: &BoxSeams, console: &mut Conso
         console.err(&failed.line);
         return failed.status;
     }
-    console.out(&format!("gate: remote version {}", env!("CARGO_PKG_VERSION")));
+    console.out(&format!("gate: remote version {}", build_version()));
     boot::say(console);
     say_sdks(seams.dotnet_limit_ms.map_or(git::DOTNET_LIMIT, Duration::from_millis), console);
     0

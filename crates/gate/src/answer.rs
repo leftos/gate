@@ -7,6 +7,7 @@ use gate_args::{Invocation, Problem, RunRequest, StopRequest, USAGE, parse};
 use crate::console::Console;
 use crate::request_json;
 use crate::resolve::{self, Environment};
+use crate::version::build_version;
 
 /// The status of a step that failed with no status of its own.
 pub(crate) const FAILED_STATUS: u8 = 1;
@@ -18,7 +19,7 @@ pub(crate) const USAGE_STATUS: u8 = 2;
 pub(crate) fn answer(args: Vec<OsString>, environment: &Environment, console: &mut Console) -> u32 {
     match parse(args) {
         Ok(Invocation::Version) => {
-            console.out(&format!("gate {}", env!("CARGO_PKG_VERSION")));
+            console.out(&format!("gate {}", build_version()));
             0
         }
         Ok(Invocation::Help) => {

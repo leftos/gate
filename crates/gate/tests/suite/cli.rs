@@ -7,8 +7,21 @@ fn version_exits_0() {
     let outcome = Case::new("version_exits_0").run(&["--version"]);
 
     assert_eq!(outcome.code, Some(0));
-    assert_eq!(outcome.stdout, format!("gate {}\n", env!("CARGO_PKG_VERSION")));
+    assert!(outcome.stdout.starts_with("gate "), "{outcome:?}");
     assert_eq!(outcome.stderr, "");
+}
+
+#[test]
+fn version_names_the_package_version_and_the_build() {
+    let outcome = Case::new("version_names_the_package_version_and_the_build").run(&["--version"]);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(outcome.stderr, "", "{outcome:?}");
+    // A test build carries no `GATE_BUILD_ID`, so this is the package version and the `+dev` build, never a literal id.
+    assert!(
+        outcome.stdout.starts_with(&format!("gate {}+", env!("CARGO_PKG_VERSION"))),
+        "the version is the package version and the build: {outcome:?}"
+    );
 }
 
 #[test]

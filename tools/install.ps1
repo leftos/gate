@@ -58,16 +58,90 @@ function Get-GateVersion {
     return $Matches[1]
 }
 
-# Runs the release build through the repo gate from the repo root, where the gate's -Log lands, and returns its status.
-function Invoke-ReleaseBuild {
+# The first 8 hex of the SHA-256 of what `git diff HEAD --binary` writes in $Root, hashed as the bytes git writes them;
+# $null when git cannot be run or fails.
+function Get-DiffHash {
     param([string]$Root)
+
+    $start = [Diagnostics.ProcessStartInfo]::new('git')
+    foreach ($arg in '--no-optional-locks', '-C', $Root, 'diff', 'HEAD', '--binary') { $start.ArgumentList.Add($arg) }
+    $start.UseShellExecute = $false
+    $start.RedirectStandardOutput = $true
+    $start.RedirectStandardError = $true
+    try {
+        $process = [Diagnostics.Process]::Start($start)
+        try {
+            $errors = $process.StandardError.ReadToEndAsync()
+            $sha = [Security.Cryptography.SHA256]::Create()
+            try {
+                $digest = $sha.ComputeHash($process.StandardOutput.BaseStream)
+            }
+            finally {
+                $sha.Dispose()
+            }
+            $process.WaitForExit()
+            $null = $errors.Result
+            if ($process.ExitCode -ne 0) { return $null }
+        }
+        finally {
+            $process.Dispose()
+        }
+    }
+    catch {
+        return $null
+    }
+    return -join ($digest[0..3] | ForEach-Object { $_.ToString('x2') })
+}
+
+# The commit this build is being made from, as `gate --version` names it: `git rev-parse --short=12 HEAD`, with
+# `-dirty.<hash>` added when tracked files differ, <hash> the first 8 hex of the SHA-256 of `git diff HEAD --binary`, so a
+# build of a dirty tree is told apart from a build of its commit and from a build of other changes to it. Git runs with
+# --no-optional-locks, so reading the tree never takes the index lock. $null when git cannot be run here or any of its
+# calls fails, which builds a gate that names no commit and so says `+dev`.
+function Get-BuildId {
+    param([string]$Root)
+
+    try {
+        $head = & git --no-optional-locks -C $Root rev-parse --short=12 HEAD 2>$null
+        if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace([string]$head)) { return $null }
+        $dirty = & git --no-optional-locks -C $Root status --porcelain --untracked-files=no 2>$null
+        if ($LASTEXITCODE -ne 0) { return $null }
+    }
+    catch {
+        return $null
+    }
+    $id = ([string]$head).Trim()
+    if ([string]::IsNullOrWhiteSpace([string]$dirty)) { return $id }
+    $hash = Get-DiffHash -Root $Root
+    if ($null -eq $hash) { return $null }
+    return "$id-dirty.$hash"
+}
+
+# Runs the release build through the repo gate from the repo root, where the gate's -Log lands, and returns its status.
+# The build runs with -Local, so it is never routed to a builder. $BuildId reaches cargo as GATE_BUILD_ID for this one
+# build, so the exe it writes names the commit it was made from; an empty one removes GATE_BUILD_ID for the build, so a
+# value the caller set never leaks in, and builds a gate that names no commit (`+dev`).
+function Invoke-ReleaseBuild {
+    param([string]$Root, [string]$BuildId)
 
     $gate = Join-Path $Root 'tools\gate.ps1'
     Push-Location $Root
     try {
-        & pwsh -NoProfile -File $gate -Log '.tmp/install-build.log' -TimeoutSeconds 900 -Slot heavy -- `
-            cargo build --release -p gate | Out-Host
-        return [int]$LASTEXITCODE
+        $before = $env:GATE_BUILD_ID
+        try {
+            if ([string]::IsNullOrEmpty($BuildId)) {
+                Remove-Item Env:GATE_BUILD_ID -ErrorAction Ignore
+            }
+            else {
+                $env:GATE_BUILD_ID = $BuildId
+            }
+            & pwsh -NoProfile -File $gate -Log '.tmp/install-build.log' -TimeoutSeconds 900 -Slot heavy -Local -- `
+                cargo build --release -p gate | Out-Host
+            return [int]$LASTEXITCODE
+        }
+        finally {
+            $env:GATE_BUILD_ID = $before
+        }
     }
     finally {
         Pop-Location
@@ -194,7 +268,11 @@ $dest = Join-Path $installDir 'gate.exe'
 if ([string]::IsNullOrEmpty($Exe)) {
     $built = Join-Path $repoRoot 'target\release\gate.exe'
     if ($PSCmdlet.ShouldProcess($repoRoot, 'cargo build --release -p gate')) {
-        if ((Invoke-ReleaseBuild -Root $repoRoot) -ne 0) {
+        $buildId = Get-BuildId -Root $repoRoot
+        if ($null -eq $buildId) {
+            Write-InstallError 'install: git could not say which commit this is or what changed in it; building a gate whose version ends +dev'
+        }
+        if ((Invoke-ReleaseBuild -Root $repoRoot -BuildId $buildId) -ne 0) {
             Write-InstallError 'install: cargo build --release failed; see .tmp/install-build.log'
             exit 1
         }

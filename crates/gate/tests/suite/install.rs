@@ -6,7 +6,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use crate::support::{Case, FAKE_TOOL, Outcome, finish, shown, start, wait_for_journal_line, wait_until_closed};
+use crate::support::{Case, FAKE_TOOL, Outcome, finish, shown, start, version_of, wait_for_journal_line, wait_until_closed};
 
 /// `tools/install.ps1`, the script under test: a checked-in file a case runs.
 fn script() -> PathBuf {
@@ -117,20 +117,6 @@ fn copy_gate_with_a_byte(case: &Case, name: &str) -> PathBuf {
     bytes.push(b'\0');
     fs::write(&copy, bytes).expect("the copy can be written");
     copy
-}
-
-/// What the gate at `exe` prints after `gate `.
-fn version_of(exe: &Path) -> String {
-    let mut command = Command::new(exe);
-    command.arg("--version");
-    let outcome = finish(command);
-    assert_eq!(outcome.code, Some(0), "{outcome:?}");
-    outcome
-        .stdout
-        .trim_end()
-        .strip_prefix("gate ")
-        .expect("a gate prints its version after `gate `")
-        .to_owned()
 }
 
 /// Asserts `left` and `right` hold the same bytes, the same thing the script's SHA-256 comparison decides.
@@ -256,6 +242,29 @@ fn install_copies_the_exe_and_adds_the_path() {
         path_value(&key),
         Some(("ExpandString".to_owned(), dir)),
         "the folder is added once, as an expand-string"
+    );
+}
+
+#[test]
+fn install_says_the_version_the_installed_exe_prints() {
+    let case = Case::new("install_says_the_version_the_installed_exe_prints");
+    let key = EnvironmentKey::new("install_says_the_version_the_installed_exe_prints");
+    let exe = copy_gate(&case, "gate-a.exe");
+    let version = version_of(&exe);
+
+    let outcome = install(&case, &key, &["-Exe", &shown(&exe)]);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    // `-Exe` skips the release build the suite does not run, so this pins the text path install.ps1 carries: what
+    // follows `gate ` is the whole version, the package version and the build's own id, which `Get-GateVersion` keeps
+    // (a suite build has no `GATE_BUILD_ID`, so its id is `dev`).
+    assert!(
+        version.starts_with(&format!("{}+", env!("CARGO_PKG_VERSION"))),
+        "the installed gate names the build it was built from: {version}"
+    );
+    assert!(
+        unix(&outcome.stdout).contains(&format!("install: installed gate {version} at {}", shown(&installed_gate(&case)))),
+        "{outcome:?}"
     );
 }
 

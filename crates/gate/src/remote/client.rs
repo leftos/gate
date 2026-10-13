@@ -50,6 +50,7 @@ use crate::boxside::payload::escaped;
 use crate::environment::Variables;
 use crate::outputs::archive::sent_limit;
 use crate::run::{CONTROL_C_EXIT, find_program, is_within, resolved};
+use crate::version::build_version;
 
 /// The statuses of a preflight whose builder has no `gate box` that takes the run: cmd's for a program it cannot find,
 /// and a gate's usage error for a payload it does not read.
@@ -71,8 +72,6 @@ const BOOT: &str = "gate: remote boot ";
 const SDKS: &str = "gate: remote sdks ";
 /// How far apart two boot times of one builder may be and still be one boot.
 const BOOT_SLACK: SignedDuration = SignedDuration::from_secs(30);
-/// This gate's version, which the builder's must be.
-const OURS: &str = env!("CARGO_PKG_VERSION");
 /// The line said when `--test-remote-interrupt-at` is given but the console handler that would carry the interrupt
 /// could not be installed.
 const NO_HANDLER: &str = "gate: --test-remote-interrupt-at needs the console handler; it could not be installed";
@@ -540,7 +539,8 @@ impl Attempt<'_, '_> {
                 return Err(End::Status(i64::from(status)));
             }
         }
-        if let Some(line) = version_refusal(host, theirs.as_deref(), OURS) {
+        // The builder's whole text must be this build's, so another build of the same package version is refused too.
+        if let Some(line) = version_refusal(host, theirs.as_deref(), &build_version()) {
             self.say(line);
             return Err(End::Refused(FallbackReason::Version));
         }
@@ -2116,7 +2116,7 @@ fn after_loss<'n>(before: Option<&str>, now: Option<&'n str>) -> Loss<'n> {
 fn version_refusal(host: &str, theirs: Option<&str>, ours: &str) -> Option<String> {
     (theirs != Some(ours)).then(|| {
         let shown = theirs.map_or_else(|| "unknown".to_owned(), |theirs| escaped(first_bytes(theirs, git::FAILURE_BYTES)));
-        format!("gate: not routed: {host} runs gate {shown}, this PC {ours}")
+        format!("gate: not routed: {host} runs gate {shown}, this PC {ours}; run gate push")
     })
 }
 
@@ -3575,12 +3575,12 @@ mod tests {
         assert_eq!(version_refusal("builder", Some("0.1.0"), "0.1.0"), None, "the same version");
         assert_eq!(
             version_refusal("builder", Some("0.2.0"), "0.1.0"),
-            Some("gate: not routed: builder runs gate 0.2.0, this PC 0.1.0".to_owned())
+            Some("gate: not routed: builder runs gate 0.2.0, this PC 0.1.0; run gate push".to_owned())
         );
         assert_eq!(their_version(&lines(&["gate: remote boot x"])), None);
         assert_eq!(
             version_refusal("builder", None, "0.1.0"),
-            Some("gate: not routed: builder runs gate unknown, this PC 0.1.0".to_owned())
+            Some("gate: not routed: builder runs gate unknown, this PC 0.1.0; run gate push".to_owned())
         );
     }
 
@@ -3800,12 +3800,15 @@ mod tests {
     fn a_builder_s_version_is_shown_escaped_and_cut_to_4_kib() {
         assert_eq!(
             version_refusal("builder", Some("0.2.0\u{1b}[31m\u{202e}"), "0.1.0"),
-            Some(r"gate: not routed: builder runs gate 0.2.0\u{1b}[31m\u{202e}, this PC 0.1.0".to_owned())
+            Some(r"gate: not routed: builder runs gate 0.2.0\u{1b}[31m\u{202e}, this PC 0.1.0; run gate push".to_owned())
         );
         let long = "9".repeat(5000);
         assert_eq!(
             version_refusal("builder", Some(&long), "0.1.0"),
-            Some(format!("gate: not routed: builder runs gate {}, this PC 0.1.0", "9".repeat(4096))),
+            Some(format!(
+                "gate: not routed: builder runs gate {}, this PC 0.1.0; run gate push",
+                "9".repeat(4096)
+            )),
             "its first 4 KiB"
         );
         let escapes = "\u{1b}".repeat(5000);

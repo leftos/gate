@@ -16,8 +16,8 @@ use regex::Regex;
 use serde_json::{Value, json};
 
 use crate::support::{
-    Case, Closed, FAKE_TOOL, GIT_REDIRECTS, Go, Outcome, Running, allow_breakaway, box_payload, finish, shown, start, start_with_closed, wait_until,
-    wait_until_closed,
+    Case, Closed, FAKE_TOOL, GIT_REDIRECTS, Go, Outcome, Running, allow_breakaway, box_payload, build_version, finish, shown, start,
+    start_with_closed, wait_until, wait_until_closed,
 };
 
 mod outputs;
@@ -180,7 +180,7 @@ fn preflight_creates_the_bare_repo_and_work_folder() {
     let printed = passed(&outcome);
     assert_eq!(printed.len(), 4, "{outcome:?}");
     assert_eq!(printed[0], format!("gate: remote created {}", folders.bare));
-    assert_eq!(printed[1], format!("gate: remote version {}", env!("CARGO_PKG_VERSION")));
+    assert_eq!(printed[1], format!("gate: remote version {}", build_version(&case)));
     assert!(printed[2].starts_with("gate: remote boot "), "{outcome:?}");
     assert!(printed[3].starts_with("gate: remote sdks "), "{outcome:?}");
     assert!(Path::new(&folders.work).join(".git").is_dir());
@@ -325,7 +325,7 @@ fn preflight_twice_creates_nothing_the_second_time() {
 
     let printed = passed(&outcome);
     assert!(!printed.iter().any(|line| line.starts_with("gate: remote created")), "{outcome:?}");
-    assert_eq!(printed[0], format!("gate: remote version {}", env!("CARGO_PKG_VERSION")));
+    assert_eq!(printed[0], format!("gate: remote version {}", build_version(&case)));
     assert_eq!(folders.alternates(), alternates);
 }
 
@@ -441,16 +441,15 @@ fn preflight_does_not_run_a_dotnet_in_its_working_folder() {
 }
 
 #[test]
-fn preflight_version_line_is_the_package_version() {
-    let case = Case::new("preflight_version_line_is_the_package_version");
+fn preflight_version_line_is_the_build_version() {
+    let case = Case::new("preflight_version_line_is_the_build_version");
     let folders = Folders::new(&case);
-    let version = case.run(&["--version"]);
-    let number = version.stdout.trim_end().strip_prefix("gate ").expect("--version prints gate <number>");
+    let version = build_version(&case);
 
     let outcome = gate_box(&case, "preflight", &folders.payload(), None);
 
     assert!(
-        passed(&outcome).contains(&format!("gate: remote version {number}").as_str()),
+        passed(&outcome).contains(&format!("gate: remote version {version}").as_str()),
         "{outcome:?}"
     );
 }

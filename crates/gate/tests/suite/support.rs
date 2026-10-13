@@ -220,6 +220,30 @@ pub fn finish(command: Command) -> Outcome {
     start(command).finish()
 }
 
+/// What the gate at `exe` prints after `gate ` for `--version`: the package version and the build's own id.
+pub fn version_of(exe: &Path) -> String {
+    let mut command = Command::new(exe);
+    command.arg("--version");
+    after_gate(&finish(command))
+}
+
+/// What `case`'s gate prints after `gate ` for `--version`, run as [`Case::run`] runs it: read from the gate itself, so a
+/// case need not know the id the build was made with.
+pub fn build_version(case: &Case) -> String {
+    after_gate(&case.run(&["--version"]))
+}
+
+/// The version a `--version` that exited 0 printed after `gate `.
+fn after_gate(outcome: &Outcome) -> String {
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    outcome
+        .stdout
+        .trim_end()
+        .strip_prefix("gate ")
+        .expect("a gate prints its version after `gate `")
+        .to_owned()
+}
+
 /// Starts `command` with stdin null and its output gathered as it arrives.
 pub fn start(mut command: Command) -> Running {
     command.stdin(Stdio::null());

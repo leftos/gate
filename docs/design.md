@@ -35,7 +35,7 @@ The CLI is subcommands with GNU-style flags: `--name value` or `--name=value`, a
 | `gate push` | Copy the installed `gate.exe` to every builder `remote.json` names. |
 | `gate burn` | Spin the CPU for a set time, for the load-burn tool. |
 | `gate box` | Hidden: the builder side of a routed run. |
-| `gate --version` | Print the version and exit 0. |
+| `gate --version` | Print `gate <package version>+<build id>` and exit 0 ([Build id](#build-id)). |
 | `gate --help`, `gate help` | Print the usage on stdout and exit 0. |
 
 An unknown subcommand, an unknown flag or a missing value prints what is wrong on its own `gate: ` line, then the usage, and exits 2 before any slot is queued (kept, C1). Every problem found is printed, one per line: invalid values in the order the words came, then the missing inputs in the order slot, timeout, log, command. A state-root failure ([State root](#state-root)) exits 2 with its one line and no usage.
@@ -134,7 +134,7 @@ With nothing to push or nowhere to push it, `gate push` tries no builder, prints
 - `push: could not read the version of <path>`, when the installed exe's `--version` gives no `gate <version>` line or takes over 30 s;
 - `push: cannot read <path>: <error>`, when the installed exe cannot be read.
 
-`<v>`, `<old>` and `<new>` are the text after `gate ` in `gate.exe --version`, as `tools/install.ps1` reads it; the local one is read once, before the first builder. Per builder, on stdout:
+`<v>`, `<old>` and `<new>` are the whole text after `gate ` in `gate.exe --version`, build id included, as `tools/install.ps1` reads it; the local one is read once, before the first builder. Per builder, on stdout:
 
 1. `push: <host>: sending gate <v>`, before the transfer.
 2. Then one of `push: <host>: gate <v> already installed` (an identical SHA-256: nothing was replaced), or `push: <host>: replaced gate <old>` followed by `push: <host>: installed gate <new>` (`replaced` only when a gate was there before), or on stderr `push: <host> failed: <reason>`.
@@ -1005,7 +1005,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
   - **Run line.** The run call is one cmd line, `"%LOCALAPPDATA%\gate\bin\gate.exe" box run <base64 JSON>`, built before anything is sent. It may be at most 8127 characters, counting `%LOCALAPPDATA%` as 100 (8191, cmd's limit, less 64 for sshd's own `cmd.exe /c`). A longer one says `gate: the remote run failed: the run call is <n> characters, longer than the 8127 cmd takes (8191 less 64 for sshd's own cmd.exe /c); shorten the command` and sends nothing.
   - **Preflight.** `gate box preflight` over ssh. Status 255, ssh's own status for a lost connection, says `gate: remote <host> unreachable: <last stderr line>` and falls back `unreachable`; the line is the last `\r` update of the last stderr line, its first 4 KiB, escaped (Escaping, below). Status 9009 or 2 (no `gate box` verb there) says `gate: not routed: <host> has no gate box that takes this run (preflight status <n>)` and falls back `version`.
 
-    Any other non-zero status says `gate: preparing <builder root> on <host> failed (status <n>)` and ends the run with that status. A reported version other than this PC's says `gate: not routed: <host> runs gate <theirs|unknown>, this PC <ours>` and falls back `version`; the builder's version is its first 4 KiB, escaped.
+    Any other non-zero status says `gate: preparing <builder root> on <host> failed (status <n>)` and ends the run with that status. A reported version text other than this PC's whole one, build id included, says `gate: not routed: <host> runs gate <theirs|unknown>, this PC <ours>; run gate push` and falls back `version`; the builder's version is its first 4 KiB, escaped.
   - **Parity.** After the preflight and before the push, `remote/parity.rs` checks that the builder's `gate: remote sdks` line (from the preflight) has what the snapshot needs. A builder with no sdks line, or a tree that is not .NET (no `global.json`, `.sln`, `.slnx` or `.csproj` anywhere in the snapshot), skips the check.
 
     A lacking builder says `gate: remote toolchain mismatch: <repo> needs <need>; <host> has <sdks>` then `gate: remote <host> parity; running here`, and falls back `parity` (status 75).
@@ -1328,7 +1328,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
 A builder runs the same `gate.exe`, under the hidden `gate box` subcommand, from its own `%LOCALAPPDATA%\gate\bin`. The exe is pushed to every builder the local `remote.json` names, over ssh, by `gate push` ([`gate push`](#gate-push)), not by the local install script.
 
-A routed run first learns the builder's gate version; when it differs from its own, the run falls back to local, saying `gate: not routed: <host> runs gate <version>, this PC <version>`, and journals `fallback` with reason `version`.
+A routed run first learns the builder's gate version; when its whole version text, build id included, differs from its own, the run falls back to local, saying `gate: not routed: <host> runs gate <version>, this PC <version>; run gate push`, and journals `fallback` with reason `version`. A builder running another build of the same package version falls back too.
 
 Builders are configured only in the local `%LOCALAPPDATA%\gate\remote.json`. The repo, its docs and its tests name no builder; the suite's remote cases run against a stub.
 
@@ -1369,7 +1369,7 @@ Built verbs:
   When the time cannot be read it prints `gate: remote could not read the boot time: <message>` on stderr and exits 1, so the client's boot query after a lost connection says the call failed rather than taking a status 0 with no time. The preflight says the same line and goes on: an unreadable boot time fails no preflight, and the client then makes no boot query.
 - **`preflight`** creates the bare repo at `Bare` when missing and the work folder at `Work` with `.git`, `origin` set to `Bare`, `core.autocrlf false` and `core.eol lf`, and writes `.git\objects\info\alternates` as `<Bare with />/objects` and a line feed, without a byte order mark, only when the file is missing or empty.
 
-  It prints on stdout, in order: `gate: remote created <Bare>` (only when it created the bare repo), `gate: remote version <gate version>`, the boot line, and `gate: remote sdks <v1,v2|none>`; git's own output passes through. A payload without `Bare` or `Work` prints `gate: box payload lacks <key>` and exits 2.
+  It prints on stdout, in order: `gate: remote created <Bare>` (only when it created the bare repo), `gate: remote version <gate version>` (the same text as `gate --version` after `gate `, build id included), the boot line, and `gate: remote sdks <v1,v2|none>`; git's own output passes through. A payload without `Bare` or `Work` prints `gate: box payload lacks <key>` and exits 2.
 - A failing git step prints `gate: remote <step> failed (status <n>)` and exits with that status; a git that cannot start prints `gate: remote <step> failed: <OS message>` and exits 1. The steps are `git init --bare`, `git init`, `git remote add`, `git config core.autocrlf` and `git config core.eol`.
 
   A folder or file that cannot be made prints `gate: remote could not create the folder <path>: <error>` or `gate: remote could not write <path>: <error>` and exits 1. An SDK list that cannot be read prints `gate: remote could not read the SDK list: <message>`, omits the sdks line and still exits 0; the client then skips the parity check.
@@ -1549,6 +1549,16 @@ The rest of the protocol, the transport of snapshots and outputs, is the remote 
 - Every install also copies `tools/remote-bridge.ps1` to `%LOCALAPPDATA%\gate\bin\remote-bridge.ps1`, where the bridge looks for it. The copy goes to `remote-bridge.ps1.<pid>.tmp` beside it and is moved into place with `Move-Item -Force`.
 - The script installs locally only. `gate push` copies the installed exe to each builder in `remote.json` (`host`, then `hosts`), with the same rename-aside on the builder, so a machine with builders runs `pwsh tools/install.ps1` and then `gate push` ([`gate push`](#gate-push)). It pushes the installed exe, never one from `target/`, and never installs here.
 - Install is a script, not a `gate install` subcommand.
+
+### Build id
+
+`gate --version` prints `gate <package version>+<build id>`, and the box preflight's `gate: remote version` line says the same text. The id is the 12-hex head commit, or `<12-hex>-dirty.<8-hex>` for a build of changed tracked files, the 8 hex being the first 8 of the SHA-256 of `git diff HEAD --binary`. Untracked files do not count.
+
+`tools/install.ps1` works the id out and sets `GATE_BUILD_ID` for its release build only, running git with `--no-optional-locks`. An empty id removes any `GATE_BUILD_ID` the caller had set, so the build never takes an outer one. The build runs with the launcher's `-Local`, so it is never routed to a builder.
+
+A build with no id (not made by the install script, or git failing) says `+dev`, and compares equal only to another `+dev`. When git cannot say, the script prints `install: git could not say which commit this is or what changed in it; building a gate whose version ends +dev`.
+
+The remote client compares the builder's whole version text with its own ([Routing](#routing-and-the-remoteps1-bridge)), so another build of one package version falls back with reason `version`; `gate push` still decides "already installed" by the exe's SHA-256, and its lines name the whole version text.
 
 ## Cutover
 

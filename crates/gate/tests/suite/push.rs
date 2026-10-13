@@ -13,7 +13,7 @@ use std::time::{Duration, Instant, SystemTime};
 use serde_json::{Value, json};
 
 use crate::install::unix;
-use crate::support::{Case, FAKE_TOOL, GATE, Outcome, finish, shown, start, write_remote_json};
+use crate::support::{Case, FAKE_TOOL, GATE, Outcome, finish, shown, start, version_of, write_remote_json};
 
 /// The suite's stand-in for ssh, which `--test-push-ssh` names.
 const FAKE_SSH: &str = env!("CARGO_BIN_EXE_fake-ssh");
@@ -151,19 +151,7 @@ fn merged(case: &Case, mut command: Command) -> (Option<i32>, String) {
 }
 
 /// What the built gate prints after `gate `, read once: the version every case's installed gate says.
-static VERSION: LazyLock<String> = LazyLock::new(|| {
-    let output = Command::new(GATE)
-        .arg("--version")
-        .stdin(Stdio::null())
-        .output()
-        .expect("the gate says its version");
-    assert!(output.status.success(), "the gate's --version failed: {output:?}");
-    String::from_utf8_lossy(&output.stdout)
-        .trim_end()
-        .strip_prefix("gate ")
-        .expect("a gate prints its version after `gate `")
-        .to_owned()
-});
+static VERSION: LazyLock<String> = LazyLock::new(|| version_of(Path::new(GATE)));
 
 /// [`VERSION`].
 fn version() -> &'static str {
@@ -254,6 +242,33 @@ fn a_push_to_an_identical_gate_says_already_installed() {
     assert_eq!(outcome.stderr, "", "{outcome:?}");
     assert_eq!(modified(&theirs), before, "the builder's gate was not written");
     assert_eq!(names(&builder_bin(&case, HOST)), ["gate.exe"], "nothing was replaced");
+}
+
+#[test]
+fn a_push_reports_the_build_it_sends() {
+    let case = push_case("a_push_reports_the_build_it_sends");
+    // The builder holds this version's own bytes with one byte appended: another build of the same package version, so
+    // its SHA-256 differs from the sent copy's and the push replaces it rather than reading it as already installed.
+    let mut other = fs::read(GATE).expect("the built gate can be read");
+    other.push(b'\0');
+    let theirs = builder_file(&case, HOST, "gate.exe", &other);
+    let steps = steps(&case, &["ok"]);
+
+    let outcome = push(&case, &steps);
+
+    let version = version();
+    assert!(
+        version.starts_with(&format!("{}+", env!("CARGO_PKG_VERSION"))),
+        "the push names the package version and the build it sends: {version}"
+    );
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(
+        unix(&outcome.stdout),
+        format!("push: {HOST}: sending gate {version}\npush: {HOST}: replaced gate {version}\npush: {HOST}: installed gate {version}\n"),
+        "another build of this version is not already installed: {outcome:?}"
+    );
+    assert_eq!(outcome.stderr, "", "{outcome:?}");
+    assert_holds(&theirs, &fs::read(installed_gate(&case)).expect("the installed gate can be read"));
 }
 
 #[test]
