@@ -45,10 +45,13 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Diagnostics block**: the record of what was running that a kill writes to the log before it terminates the job: the job's processes, the descendants outside the job, the build servers and the last samples.
 - **Drain**: see critical drain.
 - **Drained cutover**: a cutover in which every gate of the old generation finishes before the switch completes, while the two generations share the slot mutexes and take turns on them.
+- **Durations store**: the file `durations.json` in the state root, holding for each key the newest passing runs (at most 30), its failure count and its newest release; the estimate is made from it. A missing, stale or unreadable one is rebuilt from the journal and the archive.
 - **Dynamic name**: one of cmd.exe's built-in variables (`%CD%`, `%RANDOM%`, `%ERRORLEVEL%` and the like), or one it sets for itself when its block lacks it (`%COMSPEC%`, `%PATHEXT%`, `%PROMPT%`), that it expands though the environment block holds no such variable; a batch target's words are refused when they hold one.
 - **Escaped process**: a process outside the command's job under a process the job holds, such as a packaged desktop app a non-packaged descendant started, or what that app started; the watch counts their CPU as the command's own, and a kill of `gate run` ends them, sparing build servers.
+- **Exact key**: the durations key with a command's filter values kept (`{place}:{class}:{repo[/sub]} | {normalised command}`); the estimate uses it when it has enough passing runs, else the family key.
 - **Fallback**: a routed run that runs locally instead, after its builder refused it, the remote pool stayed full or the remote client could not start; journalled as a `fallback` event with its reason.
 - **Fallback poll**: the short timeout on every slot wait, which re-reads counts and tickets so a dead waiter's ticket is cleared even when no wake event comes.
+- **Family key**: the exact key with each filter value replaced by `<filter>`, so runs of one command with different filters count together; an estimate from it is marked as such.
 - **Free share**: the fraction of the cores the command could use that other work left free in a sample, at least 5%; the load-adjusted clock advances by it.
 - **Generation**: the PowerShell gate or `gate.exe`, as `gate-state` tells them apart (`Generation`): ops-tower reads the PowerShell gate's files until the cutover flag exists and then `gate.exe`'s, plus the PowerShell claims of a slot whose mutex is open.
 - **Hash cache**: the file `remote\<key>.outputs-hashes` in the state root, the outputs manifest line of a worktree's last built manifest, holding only its files last written at least 2 s before that build, and the files a complete outputs install put in place, at the stamp it read after the move and the hash it verified.
@@ -62,6 +65,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Journal**: the append-only `events.jsonl` in the state root, one JSON line per gate event (`queue`, `take`, `release` and others), with its rolled file and gzip archive.
 - **Journal mutex**: the named mutex `Local\gate-journal` (with the root hash under a non-default root) that every gate holds, waiting up to 2 s, while it appends to the journal, rolls it and archives.
 - **Keeper**: the `cmd.exe` `gate box run` starts on its own console while it is away on the donor's console, so its own console stays alive for it to return to.
+- **Key version**: `keyVersion` in the durations store, naming the rule set that made its keys; a store written under another one is rebuilt.
 - **Late arrival**: a PowerShell gate whose earliest claim or ticket `since` is later than the cutover flag's write time, because its caller bypassed the launcher; the cutover's drain names it.
 - **Lending**: a light parent gate letting a nested heavy gate, which its slot does not cover, run on that slot while a critical request drains and before one holds the machine, instead of queueing behind it; the gate is the lent gate. A parent on a reserved light slot lends nothing.
 - **Lent window**: the span during a critical drain in which the critical gate lends one slot to backfill guests, ending at the shadow end.

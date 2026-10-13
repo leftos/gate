@@ -1,6 +1,6 @@
 # Gate durations: learn each command's usual runtime and schedule with it
 
-Design for CC-178 (Gate: learn each command's usual runtime and schedule with it), built on `feat/gate-durations`. The explorer's evidence (file:line, the real-journal key table and the backfill replay) is in `.tmp/map-cc-178.md` while the work is open; the rulings below are the owner's (CC-178 description, two decision rounds, 2026-10-09).
+Design for CC-178 (Gate: learn each command's usual runtime and schedule with it), built on `feat/gate-durations`. The rulings below are the owner's (CC-178 description, two decision rounds).
 
 ## What v1 does
 
@@ -25,23 +25,25 @@ Each part is a sub-issue of CC-178 and lands on `feat/gate-durations`. Part 1 co
 - **Key.** `<place>:<class>:<repo>[/<sub>] | <normalised command>`. `place` is `local` or `remote:<host>`; `class` is `crit` for a critical gate, else empty. Repo and subfolder are derived from git, so no machine path is configured or hard-coded:
   - The repo is the main checkout's folder name, taken from `git rev-parse --git-common-dir`, so every worktree of a repo shares one key.
   - The subfolder is the `cwd` relative to the worktree root.
-  - A `cwd` outside git keys on its full path.
+  - A folder git cannot place falls back to its path's shape (a `{repo}.wt/{slug}/…` path is repo `{repo}` at the folders after the slug); any other folder is keyed as outside git, on its full path in lower case with `/` separators.
 - **Normalised command**, rules applied in order:
   1. The first word becomes its basename without `.exe`, `.cmd` or `.bat`.
-  2. A word starting with a worktree root (`X:/dev/<repo>.wt/<slug>/`, `C:/Users/someone/.claude-wt/<name>/`, `/mnt/c/Users/someone/.claude-wt/<name>/`, either slash) loses the root, with `/` separators.
-  3. A word under a temp or scratchpad root becomes `<temp>`, and a `.tmp/` word becomes `<tmp>`.
+  2. A word under the run's own worktree root loses it, with `/` separators. The `.wt` component rule of the history key applies to the paths of other worktrees and to the value of a `--flag=value` word.
+  3. A `.tmp/` word, or a word under the system temp root, becomes `…`, the elision the history key uses.
   4. A bare word of 7 to 40 hex characters holding a digit and a letter becomes `<sha>`.
   5. The words after `--include` or `--files`, up to the next `-` word, become `<files>`.
-  6. Filter values (`-Filter`, `--filter*`, `-t`) are kept in the **exact key**; the **family key** replaces them with `<filter>`.
+  6. Filter values (`-Filter`, `--filter*`, `-t` except under `dotnet`, `-E`) are kept in the **exact key**; the **family key** replaces them with `<filter>`. A filter flag never takes a following word that starts with `-`.
   7. A key over 200 characters is cut to 200 plus 8 hex characters of its SHA-256.
 
-  The words are split, and written back, by the rules `gate_state::normalize_command` uses: the C runtime's argument rules for the split, the word rules on each unquoted word, and `quote_arg_str`'s quoting for the output.
+  The words are split, and written back, by the rules `gate_state::normalize_command` uses (`split_words` and `quote_word` in `journal.rs`, shared with `normalize_for_durations`): the C runtime's argument rules for the split, the word rules on each unquoted word, and `quote_arg_str`'s quoting for the output.
 
-  The map's 19-row table of real commands is the self-test's fixture for these rules. `keyVersion` in the summary names the rule set; a mismatch rebuilds the summary from the archive and the live journal.
-- **Estimate.** p90 and p99 of `wallSeconds` (and of `adjustedSeconds` for ceilings) over the last 30 passing runs or 14 days, whichever holds fewer runs. p50 is the median of the 5 most recent of those runs, so it follows a real change within three runs while one outlier cannot move it (Tsafrir et al. find recent runs predict better than a long history); p90 and p99 are raised to p50 when a slower recent stretch puts it above them. A key needs 5 passing runs.
+  The normalise table in `crates/gate-state/tests/state/durations.rs` is the fixture for these rules. `keyVersion` in the summary names the rule set; a mismatch rebuilds the summary from the archive and the live journal.
+- **Estimate.** p90 and p99 (nearest rank) of `wallSeconds` (and of `adjustedSeconds` for ceilings) over the last 30 passing runs or 14 days, whichever holds fewer runs. p50 is the median of the 5 most recent of those runs, so it follows a real change within three runs while one outlier cannot move it (Tsafrir et al. find recent runs predict better than a long history); p90 and p99 are raised to p50 when a slower recent stretch puts it above them. A key needs 5 passing runs.
 
   Runs carry no cold- or warm-cache mark: nothing the gate sees tells a cold run reliably, and a cold run past its window is caught by the backfill overrun rule, which kills it once and bars its key for 24 h. The exact key is used when it qualifies. Otherwise the family key is used for lines and hints, and for backfill only when its p90 is at most 2x its p50. Failures are counted, never timed.
-- **Store.** `%LOCALAPPDATA%\gate\durations.json`, updated by the gate right after the `release` line, inside the journal mutex, written to a temp file and moved over the old one (the claim files' pattern). Hot-path readers take no lock. A torn or missing file reads as "no history" and is said once. Keys without enough history may live only in the archive, to keep the file small.
+- **Store.** `durations.json` in the gate's state root, updated by the gate right after the `release` line, inside the journal mutex, written to a temp file and moved over the old one (the claim files' pattern). Hot-path readers take no lock. Its shape is `{"v":1,"keyVersion":1,"keys":{"<key>":{"last":"<iso>","failed":N,"samples":[{"time","wall","adjusted","avgCores","peakCores"}]}}}`, at most 30 samples per key, and a key with no release in 14 days is pruned. ops-tower does not read it.
+
+  A missing, stale (`keyVersion`) or unreadable store needs a rebuild. One gate rebuilds at a time, holding the `durations.rebuilding` marker (`{"pid","start"}`) in the state root; a marker whose holder is dead, or that is unreadable, is taken over. The rebuild reads the live journal newest first, then the archives within 14 days, outside the journal mutex; then, under the mutex, it files the releases written since and swaps the store in.
 - **Lines.** When the gate takes its slot: `gate: expected about <n> min (usual <p50>, p90 <p90>, <n> runs)`, or nothing for a command without history. `gate.ps1 -Expect -- <command>` prints the same figure for the current folder, or `no history`, and exits 0 without queueing.
 
 ### Part 3: ETAs in wait lines, claims and tickets
@@ -81,7 +83,8 @@ Each part is a sub-issue of CC-178 and lands on `feat/gate-durations`. Part 1 co
 Parts 2 to 5 are built in the Rust gate (GATE-7) after the local cutover, on the journal facts of part 1 (GATE-33). The rulings above hold with these spellings and boundaries:
 
 - `gate expect -- <command>` replaces `-Expect`, and `--timeout auto` and `--slot auto` are options of the new CLI only, with no compatibility-layer spelling. The form that carries the caller's number `n` for `--timeout auto` (`--timeout 900 --auto` or `--timeout auto:900`) is settled in this document when part 4 is built (GATE-16).
-- The key and command normalisation are `gate_state::normalize_command`'s, and the key is git-derived as in part 2: the repo is the main checkout's folder name from `git rev-parse --git-common-dir`, the subfolder is the cwd relative to the worktree root, and a cwd outside git keys on its full path. No machine path is configured or hard-coded.
+- The key and command normalisation are `gate_state::duration_key` and `normalize_for_durations`, over the history key's word rules, and the key is git-derived as in part 2: the repo is the main checkout's folder name from `git rev-parse --git-common-dir`, the subfolder is the cwd relative to the worktree root, and a folder git cannot place falls back to its path shape, else is keyed as outside git. gate-state never runs git: the caller passes the place (`KeyPlace`). No machine path is configured or hard-coded.
+- The library (key, estimate, store, rebuild, and `append_line_then` in `journal_writer.rs`, which runs the store write in the journal hold) is in `gate-state`. The `gate` crate does not call it yet, so the expected-time line and `gate expect` are not built.
 - The `expected` field is reserved as optional in the v1 claim and ticket formats ([Reserved fields](../design.md#reserved-fields)), so part 3 fills it without a format change or a second drain. gate-state exposes it, and ops-tower is told by repo inbox that its ticket view can show it. Command text placed in a wait line's format template is escaped.
 - `--timeout auto` resolves to `max(n, 3 x p99)` as a floor and is never a learned kill time; a command with no history runs on `n`.
 - A guest is killed and re-queued by its own gate when the drain completes before it ends, and its key is barred 24 h. Lending a slot releases a `Local\` mutex the critical gate holds, which relaxes the critical drain's rule that the critical gate lets go of nothing, so the design names the released slot and the named release event it signals when part 5 is built.

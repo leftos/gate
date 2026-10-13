@@ -40,7 +40,7 @@ const SELFTEST_MARKER: &str = "gate-selftest";
 /// The flags whose next word names the tree a command runs in.
 const TREE_FLAGS: [&str; 4] = ["--manifest-path", "--directory", "--dir", "-C"];
 /// What a scratch file under `.tmp` becomes.
-const ELIDED: &str = "\u{2026}";
+pub(crate) const ELIDED: &str = "\u{2026}";
 
 /// How a run stands.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize)]
@@ -216,10 +216,10 @@ pub struct JournalCache {
 type RunKey = (u32, String);
 
 /// A file's length and last write time, compared between reads to see that it changed.
-type FileIdentity = (u64, Option<SystemTime>);
+pub(crate) type FileIdentity = (u64, Option<SystemTime>);
 
 /// The identity of the file at `path`, or `None` when there is none.
-fn file_identity(path: &Path) -> io::Result<Option<FileIdentity>> {
+pub(crate) fn file_identity(path: &Path) -> io::Result<Option<FileIdentity>> {
     match fs::metadata(path) {
         Ok(metadata) => Ok(Some((metadata.len(), metadata.modified().ok()))),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
@@ -775,7 +775,7 @@ fn summarize<'a>(runs: impl Iterator<Item = &'a Run>, cutoff: Timestamp, repo_of
 }
 
 /// The `percent`th percentile of the sorted `values` by nearest rank: the value at `ceil(percent / 100 * n) - 1`.
-fn nearest_rank(sorted: &[f64], percent: usize) -> Option<f64> {
+pub(crate) fn nearest_rank(sorted: &[f64], percent: usize) -> Option<f64> {
     let rank = (percent * sorted.len()).div_ceil(100);
     sorted.get(rank.checked_sub(1)?).copied()
 }
@@ -831,7 +831,7 @@ pub fn normalize_command(command: &str) -> String {
 /// separate words, `"` opens or closes a quoted span, `""` inside a span is one literal quote and the span continues,
 /// and a backslash run before a `"` is halved with the quote literal when the run is odd (any other backslash is
 /// literal). A word that was `""` is empty and kept. The first word takes the same rule as the rest.
-fn split_words(command: &str) -> Vec<String> {
+pub(crate) fn split_words(command: &str) -> Vec<String> {
     let mut words = Vec::new();
     let mut word = String::new();
     let mut started = false;
@@ -902,29 +902,47 @@ fn rewrite_word(word: &str) -> String {
     if word.starts_with(".tmp/") || word.starts_with(r".tmp\") {
         return ELIDED.to_owned();
     }
+    worktree_path(word).map_or_else(|| word.to_owned(), |path| path.rest)
+}
+
+/// An absolute path through a repo's worktrees folder: a component ending `.wt` (in any case) and one more after it.
+pub(crate) struct WorktreePath<'a> {
+    /// The worktrees folder's name without its `.wt`.
+    pub(crate) repo: &'a str,
+    /// The worktree's folder name, the component after the worktrees folder.
+    pub(crate) slug: &'a str,
+    /// What follows the worktree's folder, with `/` separators, or `.` when nothing does.
+    pub(crate) rest: String,
+}
+
+/// The worktree `word` is a path through, or `None` when it is no absolute path through a worktrees folder.
+pub(crate) fn worktree_path(word: &str) -> Option<WorktreePath<'_>> {
     if !is_absolute(word) {
-        return word.to_owned();
+        return None;
     }
     let components: Vec<&str> = word.split(['/', '\\']).collect();
-    let is_worktrees = |component: &&str| {
-        Path::new(component)
-            .extension()
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("wt"))
-    };
-    let Some(worktrees) = components.iter().position(is_worktrees) else {
-        return word.to_owned();
-    };
-    if worktrees + 1 >= components.len() {
-        return word.to_owned();
-    }
+    let worktrees = components.iter().position(|component| is_worktrees_folder(component))?;
+    let slug = *components.get(worktrees + 1)?;
+    let folder = components[worktrees];
     let rest = components[worktrees + 2..].join("/");
-    if rest.is_empty() { ".".to_owned() } else { rest }
+    Some(WorktreePath {
+        repo: &folder[..folder.len() - ".wt".len()],
+        slug,
+        rest: if rest.is_empty() { ".".to_owned() } else { rest },
+    })
+}
+
+/// Whether a path component names a repo's worktrees folder: it ends `.wt`, in any case, after a name.
+pub(crate) fn is_worktrees_folder(component: &str) -> bool {
+    Path::new(component)
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("wt"))
 }
 
 /// One word written back as the C runtime's quoting writes it: plain when it is non-empty and holds no whitespace
 /// (Unicode's, as .NET's `\s`) and no `"`; otherwise wrapped in quotes, `"` as `\"`, and a backslash run before a quote
 /// or at the end doubled.
-fn quote_word(word: &str) -> String {
+pub(crate) fn quote_word(word: &str) -> String {
     if is_plain_word(word) {
         return word.to_owned();
     }

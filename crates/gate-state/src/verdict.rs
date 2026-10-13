@@ -55,6 +55,20 @@ impl Verdict {
             Verdict::Unknown => "unknown",
         }
     }
+
+    /// The verdict the journal writes as `name`, the inverse of [`Verdict::as_str`]; `None` for any other word.
+    pub(crate) fn named(name: &str) -> Option<Verdict> {
+        match name {
+            "passed" => Some(Verdict::Passed),
+            "failed" => Some(Verdict::Failed),
+            "log-failure" => Some(Verdict::LogFailure),
+            "stalled" => Some(Verdict::Stalled),
+            "timed-out" => Some(Verdict::TimedOut),
+            "backstop" => Some(Verdict::Backstop),
+            "unknown" => Some(Verdict::Unknown),
+            _ => None,
+        }
+    }
 }
 
 /// The kill verdict `line` gives, or `None` when it is no kill line. Case is ignored, as PowerShell's `-match` ignores it.

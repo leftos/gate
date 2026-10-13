@@ -23,7 +23,7 @@ use crate::v1;
 /// .NET ticks in a millisecond, the unit of `gate.exe`'s ticket times.
 const TICKS_PER_MILLISECOND: i128 = 10_000;
 /// The `-Slot` value of a gate that asks for the machine.
-const CRITICAL: &str = "critical";
+pub(crate) const CRITICAL: &str = "critical";
 
 /// The state the Gates tab shows: the critical request, the queue of arrival tickets, each pool's counts, its slots
 /// and, when it is full or a critical request bars it, the gates waiting for it; then the remote pool, when the gate's

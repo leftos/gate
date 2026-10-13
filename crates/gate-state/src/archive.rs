@@ -104,7 +104,7 @@ struct EventOnly {
 
 /// The lines of `bytes` holding `"event":"release"` that parse as an object whose `event` is `release`, as written,
 /// and how many of the lines holding that text did not parse.
-fn release_lines(bytes: &[u8]) -> (Vec<&[u8]>, usize) {
+pub(crate) fn release_lines(bytes: &[u8]) -> (Vec<&[u8]>, usize) {
     let mut kept = Vec::new();
     let mut skipped = 0;
     for line in bytes.split(|byte| *byte == b'\n') {
@@ -160,18 +160,30 @@ fn prune(dir: &Path, now: Timestamp) -> Vec<String> {
 /// 180 days before `now`, or `events-<stamp>.jsonl.gz.<pid>.tmp` stamped more than a day before it. Any other name never
 /// is.
 fn expired(name: &str, now: Timestamp) -> bool {
-    let Some(rest) = name.strip_prefix("events-") else {
+    let Some((stamp, tail)) = split_name(name) else {
         return false;
     };
-    let Some((stamp, tail)) = rest.split_at_checked(STAMP_LENGTH) else {
-        return false;
-    };
-    let kept = match tail.strip_prefix(".jsonl.gz") {
-        Some("") => ARCHIVE_KEPT,
-        Some(temp) if is_temp_suffix(temp) => TEMP_KEPT,
+    let kept = match tail {
+        "" => ARCHIVE_KEPT,
+        temp if is_temp_suffix(temp) => TEMP_KEPT,
         _ => return false,
     };
     stamp_time(stamp).is_some_and(|when| when < now - kept)
+}
+
+/// The moment an archive's name, `events-<stamp>.jsonl.gz`, is stamped with, or `None` for any other name, a temporary
+/// file beside an archive included.
+pub(crate) fn archive_stamp(name: &str) -> Option<Timestamp> {
+    match split_name(name)? {
+        (stamp, "") => stamp_time(stamp),
+        _ => None,
+    }
+}
+
+/// The stamp of a name `events-<stamp>.jsonl.gz<tail>` and its tail, or `None` when the name is not of that shape.
+fn split_name(name: &str) -> Option<(&str, &str)> {
+    let (stamp, tail) = name.strip_prefix("events-")?.split_at_checked(STAMP_LENGTH)?;
+    Some((stamp, tail.strip_prefix(".jsonl.gz")?))
 }
 
 /// The length of a `yyyyMMddTHHmmssZ` stamp.
