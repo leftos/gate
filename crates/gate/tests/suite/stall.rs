@@ -11,7 +11,8 @@ use regex::Regex;
 use serde_json::Value;
 
 use crate::support::{
-    CORE_SECOND, Case, Escapee, FAKE_TOOL, assert_in_order, cpu_ticks, release, run_words, said_pid, shown, wait_until, wait_until_closed,
+    CORE_SECOND, Case, Escapee, FAKE_TOOL, UNTIL_KILLED, assert_in_order, cpu_ticks, release, run_words, said_pid, shown, wait_until,
+    wait_until_closed,
 };
 
 #[test]
@@ -134,15 +135,16 @@ fn a_silent_idle_command_is_killed_as_stalled() {
     let seams = ["--test-stall-ms", "1500", "--test-sample-ms", "100"];
 
     // `sleep` blocks without a tick of CPU, where `wait` would poll.
-    let outcome = case.run(&run_words("out.log", &seams, &[FAKE_TOOL, "pid", "out", "hi", "sleep", "30000"]));
+    let outcome = case.run(&run_words("out.log", &seams, &[FAKE_TOOL, "pid", "out", "hi", "sleep", UNTIL_KILLED]));
 
     assert_eq!(outcome.code, Some(124), "{outcome:?}");
     let stalled = Regex::new(&format!(
         concat!(
             r"(?m)^gate: STALLED: no output and no CPU for \d+ s \(machine free \d+% on average\); ",
-            r"killed {} pid out hi sleep 30000 and its children$"
+            r"killed {} pid out hi sleep {} and its children$"
         ),
-        regex::escape(FAKE_TOOL)
+        regex::escape(FAKE_TOOL),
+        UNTIL_KILLED
     ))
     .expect("the pattern is valid");
     let found = stalled.find(&outcome.stderr);
@@ -175,7 +177,11 @@ fn a_stalled_command_is_killed_with_its_grandchild() {
     // window, so the stall can only come once both processes are in the job and the command has gone quiet.
     let seams = ["--test-stall-ms", "3000", "--test-sample-ms", "100"];
 
-    let outcome = case.run(&run_words("out.log", &seams, &[FAKE_TOOL, "pid", "spawn-wait", &go, "sleep", "30000"]));
+    let outcome = case.run(&run_words(
+        "out.log",
+        &seams,
+        &[FAKE_TOOL, "pid", "spawn-wait", &go, "sleep", UNTIL_KILLED],
+    ));
 
     assert_eq!(outcome.code, Some(124), "{outcome:?}");
     let after = ["gate: terminated the job's 2 process(es)", "gate: FAILED (status 124)"];

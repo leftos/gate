@@ -6,11 +6,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::support::{Case, Running, assert_in_order, copy_tool, release, run_words, shown, start, wait_until};
+use crate::support::{Case, Running, UNTIL_KILLED, assert_in_order, copy_tool, release, run_words, shown, start, wait_until};
 
 /// The status Windows reports for a process Ctrl+C ended, `STATUS_CONTROL_C_EXIT`, as a signed exit code.
 const CONTROL_C_EXIT: i32 = 0xC000_013A_u32.cast_signed();
-
 /// Copies fake-tool into the case folder as `name` and returns its absolute path, so a command or a burner names it
 /// inside the case's working directory.
 pub(crate) fn tool(case: &Case, name: &str) -> String {
@@ -126,7 +125,11 @@ fn a_quiet_build_waiting_on_a_busy_shared_compiler_is_not_stalled() {
     // The server is created before the gate's command, so it counts as shared; it burns for the whole run.
     let server = Burner::spawn(&case, &compiler, &[], "stop-compiler");
 
-    let outcome = case.run(&run_words("out.log", &seams, &[msbuild.as_str(), "out", "building", "sleep", "30000"]));
+    let outcome = case.run(&run_words(
+        "out.log",
+        &seams,
+        &[msbuild.as_str(), "out", "building", "sleep", UNTIL_KILLED],
+    ));
     server.stop();
 
     assert_eq!(outcome.code, Some(CONTROL_C_EXIT), "{outcome:?}");
@@ -147,7 +150,11 @@ fn a_quiet_command_is_stalled_once_the_shared_compiler_goes_quiet() {
     let log = case.folder().join("out.log");
     let server = Burner::spawn(&case, &compiler, &[], "stop-compiler");
 
-    let running = case.start(&run_words("out.log", &seams, &[msbuild.as_str(), "out", "building", "sleep", "30000"]));
+    let running = case.start(&run_words(
+        "out.log",
+        &seams,
+        &[msbuild.as_str(), "out", "building", "sleep", UNTIL_KILLED],
+    ));
     let running = wait_for_log(running, &log, "building");
     server.stop();
     let outcome = running.finish();
@@ -174,7 +181,7 @@ fn a_server_started_after_the_command_counts_while_the_job_holds_a_client() {
     let running = case.start(&run_words(
         "out.log",
         &seams,
-        &[msbuild.as_str(), "chatter", chatter.as_str(), "sleep", "30000"],
+        &[msbuild.as_str(), "chatter", chatter.as_str(), "sleep", UNTIL_KILLED],
     ));
     let running = wait_for_log(running, &log, "chatter 1");
     let server = Burner::spawn(&case, &compiler, &[], "stop-compiler");
@@ -200,7 +207,11 @@ fn a_dotnet_server_is_told_by_its_command_line() {
 
     // The copy's command line names VBCSCompiler.dll, so the classifier reads a server out of it.
     let named = Burner::spawn(&case, &dotnet, &["VBCSCompiler.dll"], "stop-named");
-    let outcome = case.run(&run_words("named.log", &seams, &[msbuild.as_str(), "out", "building", "sleep", "30000"]));
+    let outcome = case.run(&run_words(
+        "named.log",
+        &seams,
+        &[msbuild.as_str(), "out", "building", "sleep", UNTIL_KILLED],
+    ));
     named.stop();
     assert_eq!(outcome.code, Some(CONTROL_C_EXIT), "the dotnet server counts:\n{outcome:?}");
     assert!(!outcome.stderr.contains("STALLED"), "{outcome:?}");
@@ -215,8 +226,14 @@ fn a_dotnet_host_without_a_server_on_its_command_line_is_no_server() {
     let seams: Vec<&str> = seams.iter().map(String::as_str).collect();
 
     // A burning dotnet copy whose command line names no server is no server, so nothing keeps the quiet build alive.
+    // The case waits on the stall kill itself: the command sleeps until killed, so a classifier that counted the copy
+    // holds the stall off until the hang guard and the case fails, however starved the gate's watch is.
     let plain = Burner::spawn(&case, &dotnet, &[], "stop-plain");
-    let outcome = case.run(&run_words("plain.log", &seams, &[msbuild.as_str(), "out", "building", "sleep", "30000"]));
+    let outcome = case.run(&run_words(
+        "plain.log",
+        &seams,
+        &[msbuild.as_str(), "out", "building", "sleep", UNTIL_KILLED],
+    ));
     plain.stop();
 
     assert_eq!(outcome.code, Some(124), "{outcome:?}");
@@ -233,8 +250,13 @@ fn a_build_with_no_build_is_not_a_client() {
     let server = Burner::spawn(&case, &compiler, &[], "stop-compiler");
 
     // The command's own line names --no-build, so its dotnet host is no client: the burning shared compiler is no
-    // progress for it and the quiet command stalls.
-    let outcome = case.run(&run_words("out.log", &seams, &[dotnet.as_str(), "out", "--no-build", "sleep", "30000"]));
+    // progress for it and the quiet command stalls. The case waits on that stall kill: the command sleeps until killed,
+    // so a gate that took it for a client holds the stall off until the hang guard and the case fails.
+    let outcome = case.run(&run_words(
+        "out.log",
+        &seams,
+        &[dotnet.as_str(), "out", "--no-build", "sleep", UNTIL_KILLED],
+    ));
     server.stop();
 
     assert_eq!(outcome.code, Some(124), "{outcome:?}");
@@ -249,10 +271,15 @@ fn an_old_msbuild_node_never_counts() {
     let seams = seams();
     let seams: Vec<&str> = seams.iter().map(String::as_str).collect();
     // An MSBuild node started before the command burns outside the job. It is a build server, but no compiler server,
-    // so nothing counts it and the quiet build with a client of its own stalls.
+    // so nothing counts it and the quiet build with a client of its own stalls. The case waits on that stall kill: the
+    // command sleeps until killed, so a watch that counted the node holds the stall off until the hang guard.
     let node = Burner::spawn(&case, &dotnet, &["MSBuild.dll", "nodemode"], "stop-node");
 
-    let outcome = case.run(&run_words("out.log", &seams, &[msbuild.as_str(), "out", "building", "sleep", "30000"]));
+    let outcome = case.run(&run_words(
+        "out.log",
+        &seams,
+        &[msbuild.as_str(), "out", "building", "sleep", UNTIL_KILLED],
+    ));
     node.stop();
 
     assert_eq!(outcome.code, Some(124), "{outcome:?}");
@@ -280,7 +307,7 @@ fn a_stall_kill_lists_the_build_server_its_last_sample_counted() {
     let running = case.start(&run_words(
         "out.log",
         &seams,
-        &[msbuild.as_str(), "chatter", chatter.as_str(), "sleep", "590000"],
+        &[msbuild.as_str(), "chatter", chatter.as_str(), "sleep", UNTIL_KILLED],
     ));
     let running = wait_for_log(running, &log, "chatter 1");
     let server = Burner::spawn(&case, &compiler, &[], "stop-compiler");

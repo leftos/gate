@@ -858,6 +858,11 @@ pub fn print_run(command: &[&'static str]) -> Vec<&'static str> {
     words
 }
 
+/// How long a command the gate is meant to end sleeps, as fake-tool's `sleep` takes it in milliseconds: past any case
+/// and just inside the suite's 600 s hang guard, so only the gate's kill or interrupt ends it. A starved watch delays
+/// that end, but the command never ends first on a timer of its own and turns the case's 124 into a pass.
+pub const UNTIL_KILLED: &str = "590000";
+
 /// 100 ns ticks in one core-second.
 pub const CORE_SECOND: u64 = 10_000_000;
 
@@ -888,11 +893,11 @@ impl Escapee {
             .to_vec()
     }
 
-    /// The words of a command that starts the escapee sleeping, then sleeps itself for 30 s: neither process polls a
-    /// file or uses a tick of CPU, so nothing they do is progress.
+    /// The words of a command that starts the escapee sleeping, then sleeps itself until just inside the hang guard, so
+    /// only the gate's kill ends it: neither process polls a file or uses a tick of CPU, so nothing they do is progress.
     pub fn idle_command(&self) -> Vec<String> {
         let (pid_file, stop) = (shown(&self.pid_file), shown(&self.stop));
-        [FAKE_TOOL, "spawn-away", &pid_file, "0", &stop, "sleep", "30000"]
+        [FAKE_TOOL, "spawn-away", &pid_file, "0", &stop, "sleep", UNTIL_KILLED]
             .map(str::to_owned)
             .to_vec()
     }

@@ -924,7 +924,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
   A patch that applied but cannot be removed fails the run (`gate: the remote run failed: cannot remove <patch>: <error>`) and keeps nothing: the changes are already in the worktree.
 
-  Once git has exited, its readers get 2 s to reach their pipes' ends, else the call fails with `cannot read git's output: it did not end within 2 s of git's exit`. A failure line carries the last 10 of git's lines joined by ` | `, escaped and cut to the last 4 KiB at a whole escape.
+  Once git has exited, its readers get 2 s to reach their pipes' ends (the routing decision's calls, `--test-git-drain-ms` of them), else the call fails with `cannot read git's output: it did not end within <n> s of git's exit`, `<n>` being the call's own drain in whole seconds. A failure line carries the last 10 of git's lines joined by ` | `, escaped and cut to the last 4 KiB at a whole escape.
 
   Only `gate run --test-remote-snapshot` and `--test-remote-transport` reach the client. The first makes the snapshot, says `gate: remote snapshot <sha> bridge <sha or none>` on stderr and in the log, and ends with status 0. A snapshot that fails says `gate: the remote run failed: git <args> failed in <root> (status <n>): <git's lines joined by ' | '>` and ends with status 1, with no fallback.
 
@@ -1460,6 +1460,8 @@ A Rust integration suite drives the built `gate.exe` through its CLI and reads o
 - **Load.** Watchdog-timing cases depend on the scheduler. The gate under test runs at Normal priority, and its command and the build servers it watches run at BelowNormal. Under an all-core load, the gate was measured runnable but not running for up to 13.7 s, and a BelowNormal command for up to 31.8 s with no CPU.
 
   So a case never races a fixed sleep against the watcher: its command sleeps past the 600 s hang guard, and only the behaviour under test ends it. A stall window a case relies on is far past those gaps, or the case is ignored and run with `--ignored` on a critical slot (the repo's nextup profile lists them).
+
+  The load rule: a case never asserts that something did or did not happen within a wall-clock window a loaded PC can cross. A case that expects a kill runs a command that sleeps until killed (`support::UNTIL_KILLED`), so a starved gate is late, never wrong. A case that cannot be written without a timer is a machine-alone case, `#[ignore = "needs the machine alone: run with -Slot critical and --ignored"]`, listed in the nextup profile and run on a critical gate with `--run-ignored only`. Widening a window until it passes on one PC is not a fix: it fails again on a busier one.
 - **Test seams.** Hidden `--test-*` flags, compiled only with the `test-seams` cargo feature, set the timing knobs: `--test-sample-ms` (sample period), `--test-heartbeat-ms` (wait heartbeat; on `gate box` the command heartbeat's period), `--test-poll-ms` (fallback poll) and `--test-stall-ms` (stall window below a second). Each takes whole milliseconds above 0 on `gate run`. The sample and stall knobs drive the watchdog.
 
   Two seams of `gate box` shape the command's console: `--test-box-console fail-before` makes the UTF-8 console fail before the command starts, and `--test-box-park-launch <path>` parks the launch until `<path>` exists ([The box side](#the-box-side)). `--test-outputs-budget-bytes <n>` replaces the 50 GiB outputs budget of the box's trim.
@@ -1481,6 +1483,8 @@ A Rust integration suite drives the built `gate.exe` through its CLI and reads o
   `--test-remote-client <path>` replaces the remote client with a scripted one that runs in the gate's own process: the file's steps, one a line, are `out`, `err`, `record`, `wait`, `interrupt`, `killed`, `status`, `refuse` and `fail-start`. `--test-remote-wait-ms <n>` (whole milliseconds above 0) replaces the 60 s limit of the wait for a remote slot. `--test-print-request` shows them as `testSeams.remoteClient` and `testSeams.remoteWaitMs`.
 
   `--test-git-limit-ms <n>` (whole milliseconds above 0, on `gate run` only) replaces the 60 s limit of each git call of the routing decision; `--test-print-request` shows it as `testSeams.gitLimitMs`, after `remoteWaitMs`.
+
+  `--test-git-drain-ms <n>` (whole milliseconds above 0, on `gate run` only) replaces the 2 s the readers of each git call of the routing decision get to end once git has exited; `--test-print-request` shows it as `testSeams.gitDrainMs`, after `gitLimitMs`. The suite's routing cases pass it with a very long drain, so a starved gate does not fail a call that a loaded machine only delays.
 
   `--test-servers-under <folder>` (on `gate run` only; refused empty or given twice) makes a build server outside the job count only when its program path lies under the folder (whole path components, case-insensitive, the folder made absolute), so a case never counts the machine's real servers; `--test-print-request` shows it as `testSeams.serversUnder`, after `gitLimitMs`.
 

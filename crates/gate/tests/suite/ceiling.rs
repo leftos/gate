@@ -8,7 +8,7 @@ use std::time::Duration;
 use regex::Regex;
 use serde_json::Value;
 
-use crate::support::{Case, Escapee, FAKE_TOOL, assert_in_order, release, run_words, shown};
+use crate::support::{Case, Escapee, FAKE_TOOL, UNTIL_KILLED, assert_in_order, release, run_words, shown};
 
 /// The line the gate says once `--test-sampler-fail` has failed its first sample.
 const SAMPLER_FAILED: &str = "gate: sampler failed: --test-sampler-fail makes every sample fail (test seam only); watching by wall time only";
@@ -73,7 +73,7 @@ fn a_ceiling_kill_ends_a_child_outside_the_job_whose_launcher_has_ended() {
 fn a_run_past_its_ceiling_is_killed_as_timed_out() {
     let case = Case::new("a_run_past_its_ceiling_is_killed_as_timed_out");
     // One process that does nothing it could be late for: the kill comes 1 s in whatever the command has done by then.
-    let command = [FAKE_TOOL, "sleep", "30000"];
+    let command = [FAKE_TOOL, "sleep", UNTIL_KILLED];
 
     // A critical run is High priority, so its free share is 1 and the load-adjusted clock is wall time: the ceiling
     // comes before the 5 s backstop however busy the machine is.
@@ -99,7 +99,7 @@ fn a_run_past_its_ceiling_is_killed_as_timed_out() {
 #[test]
 fn a_run_whose_clock_never_moves_is_killed_by_the_backstop() {
     let case = Case::new("a_run_whose_clock_never_moves_is_killed_by_the_backstop");
-    let command = [FAKE_TOOL, "sleep", "30000"];
+    let command = [FAKE_TOOL, "sleep", UNTIL_KILLED];
     let seams = ["--test-sampler-fail", "--test-sample-ms", "100"];
 
     let outcome = case.run(&ceiling_words("light", &seams, &command));

@@ -6,7 +6,7 @@ use std::fs;
 
 use regex::Regex;
 
-use crate::support::{Case, FAKE_TOOL, assert_in_order, release, run_words, said_pid, shown};
+use crate::support::{Case, FAKE_TOOL, UNTIL_KILLED, assert_in_order, release, run_words, said_pid, shown};
 
 /// The failure `--test-diagnostics-fail` makes at the start of a gathering.
 const DIAGNOSTICS_FAIL: &str = "--test-diagnostics-fail makes the diagnostics fail (test seam only)";
@@ -63,7 +63,7 @@ fn a_kill_writes_its_diagnostics_to_the_log_before_the_kill_line() {
     let seams = ["--test-stall-ms", "1500", "--test-sample-ms", "100"];
     let log_path = case.folder().join("out.log");
 
-    let outcome = case.run(&run_words("out.log", &seams, &[FAKE_TOOL, "pid", "out", "hi", "sleep", "30000"]));
+    let outcome = case.run(&run_words("out.log", &seams, &[FAKE_TOOL, "pid", "out", "hi", "sleep", UNTIL_KILLED]));
 
     assert_eq!(outcome.code, Some(124), "{outcome:?}");
     let log = fs::read_to_string(&log_path).expect("the log was written");
@@ -103,7 +103,7 @@ fn a_failing_diagnostics_gathering_still_kills() {
     let case = Case::new("a_failing_diagnostics_gathering_still_kills");
     let seams = ["--test-stall-ms", "1500", "--test-sample-ms", "100", "--test-diagnostics-fail"];
 
-    let outcome = case.run(&run_words("out.log", &seams, &[FAKE_TOOL, "sleep", "30000"]));
+    let outcome = case.run(&run_words("out.log", &seams, &[FAKE_TOOL, "sleep", UNTIL_KILLED]));
 
     assert_eq!(outcome.code, Some(124), "{outcome:?}");
     let log = fs::read_to_string(case.folder().join("out.log")).expect("the log was written");
@@ -124,7 +124,7 @@ fn the_failed_tail_holds_the_last_lines_around_a_big_block() {
     let seams = ["--test-stall-ms", "1500", "--test-sample-ms", "100"];
     let log_path = case.folder().join("out.log");
 
-    let outcome = case.run(&run_words("out.log", &seams, &[FAKE_TOOL, "lines", "30", "n", "sleep", "30000"]));
+    let outcome = case.run(&run_words("out.log", &seams, &[FAKE_TOOL, "lines", "30", "n", "sleep", UNTIL_KILLED]));
 
     assert_eq!(outcome.code, Some(124), "{outcome:?}");
     let log = fs::read_to_string(&log_path).expect("the log was written");
@@ -134,23 +134,53 @@ fn the_failed_tail_holds_the_last_lines_around_a_big_block() {
     let terminated = "gate: terminated the job's 1 process(es)";
     let pointer = format!("gate: diagnostics written to {}", shown(&log_path));
 
-    // The tail is the last 20 lines of the log once the block is dropped by position: the command's last 17 numbered
-    // lines, then the kill, the terminated count and the pointer. Nothing else is dropped, so a command line equal to a
-    // block line would still be shown.
+    // The tail is the last 20 lines of the log up to the pointer once the block is dropped by position. Nothing else is
+    // dropped, so a command line equal to a block line would still be shown. How many numbered lines the command got
+    // out before the stall, and whether a starved command outlived its kill by the gate's wait, are the machine's: the
+    // expected tail is read from the log the gate wrote, not from a count.
     let tail: Vec<&str> = outcome.stdout.lines().collect();
-    let numbered: Vec<String> = (14..=30).map(|number| format!("n{number}")).collect();
-    let expected: Vec<&str> = numbered.iter().map(String::as_str).collect();
-    assert_eq!(tail.len(), 20, "{outcome:?}");
-    assert_eq!(tail[..17], expected[..], "{outcome:?}");
-    assert_eq!(tail[17], kill);
-    assert_eq!(tail[18], terminated);
-    assert_eq!(tail[19], pointer);
+    assert_eq!(tail, expected_tail(&log, &pointer), "{outcome:?}");
+    assert!(
+        tail.iter().all(|line| !line.starts_with("gate:   ") && *line != "gate: diagnostics"),
+        "the failed tail leaves the block out: {outcome:?}"
+    );
+    let still = "gate: the command was still running 5 s after its job was terminated";
+    let ending: &[&str] = if tail.len() > 3 && tail[tail.len() - 2] == still {
+        &[kill, terminated, still, &pointer]
+    } else {
+        &[kill, terminated, &pointer]
+    };
+    assert!(tail.ends_with(ending), "the tail ends with {ending:?}: {outcome:?}");
+    // Whenever the command got its numbered lines out before the block, the tail holds the last of them.
+    if let Some(last) = log.lines().rfind(|line| is_numbered(line)) {
+        assert!(tail.contains(&last), "the tail holds the command's last line {last:?}: {outcome:?}");
+    }
+}
+
+/// Whether `line` is one of the case command's numbered lines, `n` and a number.
+fn is_numbered(line: &str) -> bool {
+    line.strip_prefix('n')
+        .is_some_and(|number| !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
+/// The last 20 lines of `log` up to and including the `pointer` line, with the diagnostics block, its heading and every
+/// `gate:   ` line after it, dropped by position.
+fn expected_tail<'a>(log: &'a str, pointer: &str) -> Vec<&'a str> {
+    let lines: Vec<&str> = log.lines().collect();
+    let heading = lines
+        .iter()
+        .position(|line| *line == "gate: diagnostics")
+        .expect("the log has its diagnostics heading");
+    let block = 1 + lines[heading + 1..].iter().take_while(|line| line.starts_with("gate:   ")).count();
+    let end = lines.iter().position(|line| *line == pointer).expect("the log has the pointer line");
+    let kept: Vec<&str> = lines[..heading].iter().chain(&lines[heading + block..=end]).copied().collect();
+    kept[kept.len().saturating_sub(20)..].to_vec()
 }
 
 #[test]
 fn a_timed_out_kill_writes_its_diagnostics_too() {
     let case = Case::new("a_timed_out_kill_writes_its_diagnostics_too");
-    let command = [FAKE_TOOL, "sleep", "30000"];
+    let command = [FAKE_TOOL, "sleep", UNTIL_KILLED];
 
     // A critical run's free share is 1, so its load-adjusted clock is wall time and the ceiling comes before the
     // backstop however busy the machine is.
@@ -165,7 +195,7 @@ fn a_timed_out_kill_writes_its_diagnostics_too() {
 #[test]
 fn a_backstop_kill_writes_its_diagnostics_too() {
     let case = Case::new("a_backstop_kill_writes_its_diagnostics_too");
-    let command = [FAKE_TOOL, "sleep", "30000"];
+    let command = [FAKE_TOOL, "sleep", UNTIL_KILLED];
     let seams = ["--test-sampler-fail", "--test-sample-ms", "100"];
 
     // Once the sampler has failed there are no samples to show, so the block says so.

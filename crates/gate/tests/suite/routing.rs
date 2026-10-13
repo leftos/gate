@@ -37,17 +37,21 @@ fn stub(case: &Case, steps: &[&str]) -> PathBuf {
 }
 
 /// The words of a heavy run logging to `log` that calls the scripted client of the step file `stub`, `extra` before
-/// `--` and `command` after it, with a routing git limit no machine reaches.
+/// `--` and `command` after it, with a routing git limit and drain no machine reaches.
 fn routed_words<'a>(log: &'a str, stub: &'a str, extra: &[&'a str], command: &[&'a str]) -> Vec<&'a str> {
-    let mut before = vec!["--test-remote-client", stub, "--test-git-limit-ms", "3600000"];
+    let mut before = vec!["--test-remote-client", stub];
+    before.extend(GIT_HANG_GUARDS);
     before.extend(extra);
     heavy_words(log, &before, command)
 }
 
-/// The words of a heavy run of this suite, with a routing git limit of an hour: a case holds however long git takes
-/// on a loaded machine, not only within the gate's default limit.
+/// The routing git limit of an hour and the drain of the suite's 600 s hang guard: a starved gate whose git readers
+/// reach their pipes' ends late still routes, so a case holds however long git takes on a loaded machine.
+const GIT_HANG_GUARDS: [&str; 4] = ["--test-git-limit-ms", "3600000", "--test-git-drain-ms", "600000"];
+
+/// The words of a heavy run of this suite, with [`GIT_HANG_GUARDS`] for the routing decision's git calls.
 pub(crate) fn heavy_words_with_limit<'a>(log: &'a str, extra: &[&'a str], command: &[&'a str]) -> Vec<&'a str> {
-    let mut before = vec!["--test-git-limit-ms", "3600000"];
+    let mut before = GIT_HANG_GUARDS.to_vec();
     before.extend(extra);
     heavy_words(log, &before, command)
 }

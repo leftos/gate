@@ -60,6 +60,7 @@ fn print_request_shows_the_new_cli_request() {
             "remoteClient": null,
             "remoteWaitMs": null,
             "gitLimitMs": null,
+            "gitDrainMs": null,
             "serversUnder": null,
             "serverImage": null,
             "remoteSnapshot": false,
@@ -102,6 +103,8 @@ fn the_seams_given_are_printed(case: &Case) {
             "5",
             "--test-git-limit-ms",
             "7",
+            "--test-git-drain-ms",
+            "8",
             "--test-servers-under",
             r"target\case",
             "--test-server-image",
@@ -121,6 +124,7 @@ fn the_seams_given_are_printed(case: &Case) {
         ),
         (&json!(r"steps\client.txt"), &json!(5), &json!(7), &json!(r"target\case"), &json!(true))
     );
+    assert_eq!(request["testSeams"]["gitDrainMs"], json!(8));
     assert_eq!(request["testSeams"]["serverImage"], json!("gate-test-server.exe"));
     assert_eq!(request["testSeams"]["jobBreakaway"], json!(true));
     // The snapshot-only client and the Rust client's transport are refused together, so the transport's seams are

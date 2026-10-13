@@ -82,6 +82,12 @@ pub(crate) fn limit(seams: &TestSeams) -> Duration {
     seams.git_limit_ms.map_or(GIT_LIMIT, Duration::from_millis)
 }
 
+/// How long the readers of each git call of a run get to end once git has exited: `--test-git-drain-ms` when given,
+/// else [`DRAIN`].
+pub(crate) fn drain(seams: &TestSeams) -> Duration {
+    seams.git_drain_ms.map_or(DRAIN, Duration::from_millis)
+}
+
 /// Why a git call did not finish: the console interrupt ended it, or it failed, with the failure in the words the
 /// PowerShell client uses.
 #[derive(Debug, PartialEq, Eq)]
@@ -248,7 +254,7 @@ impl Git {
                 // Whatever ended the wait, the job is ended now, so the readers reach their pipes' ends; what they
                 // read is no longer needed, and they are given a short while to end before they are left to it.
                 let error = with_job_ended(error, &job);
-                let until = Instant::now() + DRAIN;
+                let until = Instant::now() + call.drain;
                 drop((received(&output, until), received(&errors, until)));
                 return Err(error);
             }
@@ -256,26 +262,27 @@ impl Git {
         // git has exited; whatever it left running, which would hold its pipes open, ends with the job, and the
         // readers then reach their pipes' ends within a short while.
         drop(job);
-        let until = Instant::now() + DRAIN;
+        let until = Instant::now() + call.drain;
         let unread = || {
             GitError::Failed(format!(
                 "cannot read git's output: it did not end within {} s of git's exit",
-                DRAIN.as_secs()
+                call.drain.as_secs()
             ))
         };
         let output = received(&output, until).ok_or_else(unread)?;
         let errors = received(&errors, until).ok_or_else(unread)?;
         let cannot_read = |error: io::Error| GitError::Failed(format!("cannot read git's output: {error}"));
         let status = ExitStatus::from_raw(code);
-        fed_whole(fed.as_ref(), status, until)?;
+        fed_whole(fed.as_ref(), status, until, call.drain)?;
         Ok((status, output.map_err(cannot_read)?, errors.map_err(cannot_read)?))
     }
 }
 
 /// Whether git, which exited with `status`, was fed its whole input by `fed`, waited for until `until`: a git that
 /// failed says why in its own lines, so a feed it cut short by exiting is no failure of its own, and a call with no
-/// input has nothing to check. A git that succeeded while its feed failed, or whose feed did not end, fails the call.
-fn fed_whole(fed: Option<&Receiver<io::Result<()>>>, status: ExitStatus, until: Instant) -> Result<(), GitError> {
+/// input has nothing to check. A git that succeeded while its feed failed, or whose feed did not end within the call's
+/// `drain`, fails the call.
+fn fed_whole(fed: Option<&Receiver<io::Result<()>>>, status: ExitStatus, until: Instant, drain: Duration) -> Result<(), GitError> {
     let Some(fed) = fed.filter(|_| status.success()) else {
         return Ok(());
     };
@@ -284,7 +291,7 @@ fn fed_whole(fed: Option<&Receiver<io::Result<()>>>, status: ExitStatus, until: 
         Some(Err(error)) => Err(GitError::Failed(format!("cannot feed git its input: {error}"))),
         None => Err(GitError::Failed(format!(
             "cannot feed git its input: it did not end within {} s of git's exit",
-            DRAIN.as_secs()
+            drain.as_secs()
         ))),
     }
 }
@@ -388,6 +395,8 @@ pub(crate) struct Call<'a> {
     /// The variables git is not given, beside [`GIT_LOCATION`].
     pub unset: &'a [&'a str],
     pub limit: Duration,
+    /// How long git's readers get to reach their pipes' ends once git has exited, or once the call's job was ended.
+    pub drain: Duration,
     /// The console interrupt a Ctrl+C raises: git is ended with it, and the call is [`GitError::Interrupted`].
     pub interrupt: Option<Interrupt>,
     /// The console git is created on: this process's, so a Ctrl+C reaches git as it reaches the gate, or a hidden one
@@ -399,8 +408,8 @@ pub(crate) struct Call<'a> {
 }
 
 impl<'a> Call<'a> {
-    /// A call on this process's console that sets and removes no variables of its own and answers to no interrupt:
-    /// the routing decision asks git this way, before a command is started.
+    /// A call on this process's console that sets and removes no variables of its own, answers to no interrupt and
+    /// gives its readers [`DRAIN`]: the routing decision asks git this way, before a command is started.
     pub(crate) fn plain(folder: &'a Path, args: &'a [&'a str], limit: Duration) -> Call<'a> {
         Call {
             folder,
@@ -408,6 +417,7 @@ impl<'a> Call<'a> {
             set: &[],
             unset: &[],
             limit,
+            drain: DRAIN,
             interrupt: None,
             console: PipedConsole::Attached,
             stdin: None,

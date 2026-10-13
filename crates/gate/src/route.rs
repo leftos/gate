@@ -36,6 +36,7 @@ pub(crate) fn route(request: &RunRequest, environment: &Environment, covering_pa
         folder: std::env::current_dir(),
         local_app_data: environment.local_app_data.as_deref(),
         git_limit: git::limit(&request.test_seams),
+        git_drain: git::drain(&request.test_seams),
     };
     let route = match decide(&inputs, &machine) {
         Route::Routed(_) if !unicode => Route::Local {
@@ -91,11 +92,22 @@ pub(crate) fn read_remote_json(path: &Path) -> Result<Option<Config>, ConfigProb
 }
 
 /// This machine's facts: the gate's working folder, or why it cannot be read, the LOCALAPPDATA folder that holds the
-/// routing file, and how long each of the decision's git calls may take.
+/// routing file, how long each of the decision's git calls may take, and how long its readers get once git has exited.
 struct Machine<'a> {
     folder: io::Result<PathBuf>,
     local_app_data: Option<&'a OsStr>,
     git_limit: Duration,
+    git_drain: Duration,
+}
+
+impl Machine<'_> {
+    /// The decision's git call in `folder` with `args`, under the decision's limit and drain.
+    fn git_call<'a>(&self, folder: &'a Path, args: &'a [&'a str]) -> git::Call<'a> {
+        git::Call {
+            drain: self.git_drain,
+            ..git::Call::plain(folder, args, self.git_limit)
+        }
+    }
 }
 
 impl Facts for Machine<'_> {
@@ -119,7 +131,7 @@ impl Facts for Machine<'_> {
             "--path-format=absolute",
             "--git-common-dir",
         ];
-        let mut ran = git::Git::find(folder)?.run(&git::Call::plain(folder, &args, self.git_limit))?;
+        let mut ran = git::Git::find(folder)?.run(&self.git_call(folder, &args))?;
         if !ran.status.success() {
             return Ok(None);
         }
@@ -145,7 +157,7 @@ impl Facts for Machine<'_> {
             "--",
             &place.prefix,
         ];
-        let ran = git::Git::find(root)?.run(&git::Call::plain(root, &args, self.git_limit))?;
+        let ran = git::Git::find(root)?.run(&self.git_call(root, &args))?;
         if !ran.status.success() {
             let code = ran.status.code().map_or_else(|| "unknown".to_owned(), |code| code.to_string());
             return Err(format!("git ls-files failed with status {code}"));
@@ -158,7 +170,7 @@ impl Facts for Machine<'_> {
     fn head_sha(&self, place: &Place) -> Result<Option<String>, String> {
         let root = Path::new(&place.root);
         let args = ["rev-parse", "--verify", "-q", "HEAD"];
-        let mut ran = git::Git::find(root)?.run(&git::Call::plain(root, &args, self.git_limit))?;
+        let mut ran = git::Git::find(root)?.run(&self.git_call(root, &args))?;
         if !ran.status.success() {
             return Ok(None);
         }

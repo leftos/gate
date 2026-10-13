@@ -137,6 +137,9 @@ pub struct TestSeams {
     pub remote_wait_ms: Option<u64>,
     /// How long each git call of the routing decision may take before git is killed and the run goes ahead here.
     pub git_limit_ms: Option<u64>,
+    /// How long the readers of a routing-decision git call that has exited may take to reach their pipes' ends before
+    /// the call fails, in place of 2 s.
+    pub git_drain_ms: Option<u64>,
     /// The folder the watched command's build servers must live under, `None` for every process on the machine: in a
     /// suite whose cases run at once, it keeps one case's build server out of another's watch.
     pub servers_under: Option<PathBuf>,
