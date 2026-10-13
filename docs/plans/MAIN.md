@@ -5,12 +5,19 @@
 ## Do first
 
 - [ ] GATE-46 Remote slice 5: drained remote cutover and deleting the remote.ps1 bridge — Urgent · Remote
-- [/] GATE-146 A local --no-build run after a routed build that brought nothing back finds no build — High · Remote
 
 ## Remote
 
 - [ ] GATE-10 Port the remote client and box wrapper, then the remote cutover
   - [ ] GATE-109 Remote: carry every verb of a routed run over one ssh connection (gate box serve)
+  - [ ] GATE-174 Build the production Rust remote client over ssh and select it when the state root holds remote-cutover.flag
+  - [ ] GATE-177 Add gate remote-cutover: write the flag, drain the PC's and every builder's routed runs, clear the marker
+  - [ ] GATE-178 A routed run that starts during the remote cutover's drain waits for it, then starts on the Rust client
+  - [ ] GATE-179 Say what the remote stop waits for after a Ctrl+C
+  - [ ] GATE-180 Move the routing suite's default-client cases onto the Rust client
+  - [ ] GATE-181 Delete the remote.ps1 bridge, its shim, its install copy and its test seams
+  - [ ] GATE-182 Retire the remote-cutover flag and gate remote-cutover
+  - [ ] GATE-183 Merge feat/remote-cutover (#184)
   - [ ] GATE-18 Remote preflight: refuse with `parity` when the builder lacks a .NET workload the repo needs
   - [ ] GATE-19 Remote: send a repo's declared sibling worktrees with a routed run
   - [ ] GATE-22 Remote: send a routed command's ignored inputs to the builder, compressed
@@ -18,9 +25,7 @@
   - [ ] GATE-21 Remote: a critical pool on the builder for timing-sensitive gates (decide after measuring)
   - [ ] GATE-29 Sync-back: narrow the 'worktree changed during the run' refusal to changes that could matter
 - [ ] GATE-159 Box: choose the dotnet tool restore cap from its logged times
-- [ ] GATE-164 Suite: pin the abandon wait after a full fallback (needs an interrupt seam for the local wait)
-- [ ] GATE-169 Outputs install: write hash cache entries for the files it installs
-- [ ] GATE-171 Outputs: take the manifest's file stamps from the handle, as the install's clobber check does
+- [ ] GATE-172 After a full fallback, the local wait's still-waiting lines count only the local wait
 
 ## Cutover sweep
 
