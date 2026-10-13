@@ -2101,6 +2101,8 @@ fn a_stalled_run_call_is_killed_and_the_command_stopped() {
     assert!(outcome.stderr.contains(STALLED_LINE), "{outcome:?}");
     let log = fs::read_to_string(case.folder().join("out.log")).expect("the log was written");
     assert!(log.contains(STALLED_LINE), "the kill line is in the log: {log}");
+    assert!(!log.contains(STOPPING), "a stall's stop says only its kill line: {log}");
+    assert!(!outcome.stderr.contains(STOPPING), "{outcome:?}");
     assert_eq!(verdict(&case), "stalled");
     let made = calls(&steps);
     assert!(
@@ -2123,6 +2125,11 @@ fn a_run_past_its_ceiling_is_killed_with_a_timed_out_line() {
 
     assert_eq!(outcome.code, Some(124), "{outcome:?}");
     assert!(outcome.stderr.contains("gate: TIMED OUT after 1 s"), "{outcome:?}");
+    assert!(
+        !outcome.stderr.contains(STOPPING),
+        "a ceiling's stop says only its kill line: {outcome:?}"
+    );
+    assert!(!out_log(&case).contains(STOPPING), "{outcome:?}");
     assert_eq!(verdict(&case), "timed-out");
     let made = calls(&steps);
     assert!(made_but_maybe(&made, &["preflight", "run", "stop"], "run"), "{made:?}");
@@ -2286,6 +2293,61 @@ fn a_ctrl_c_during_the_preflight_stops_nothing() {
     // The interrupt comes once the preflight wrote its first byte, by when the stand-in has logged its call.
     assert_eq!(calls(&steps), ["preflight"], "no stop: the command never started");
     assert!(!outcome.stdout.contains("ran here"), "nothing ran here: {outcome:?}");
+}
+
+/// The line a Ctrl+C that stops the command says before the stop call, with that call's bound, 30 s unless a seam
+/// sets it.
+const STOPPING_LINE: &str = "gate: stopping the command on builder (up to 30 s)";
+/// What that line starts with, whatever its bound.
+const STOPPING: &str = "gate: stopping the command on builder (up to ";
+
+/// The case's log, `out.log`.
+fn out_log(case: &Case) -> String {
+    fs::read_to_string(case.folder().join("out.log")).expect("the log was written")
+}
+
+#[test]
+fn a_ctrl_c_says_once_what_the_stop_waits_for() {
+    let case = client_case("client-ctrl-c-says-stop");
+    let steps = ssh_steps(&case, "ssh", &["ok", &format!("say-hold running-there {}", never(&case)), "ok"]);
+    let tuned = Tuned {
+        extra: &["--test-remote-interrupt-at", "run"],
+        ..Tuned::default()
+    };
+
+    let outcome = finish(client_gate_tuned(&case, "out.log", &steps, &tuned, &[r".\tool.exe", "out", "ran there"]));
+
+    assert_eq!(outcome.code, Some(CONTROL_C_EXIT), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "run", "stop"], "the command is stopped");
+    assert_eq!(outcome.stderr.matches(STOPPING).count(), 1, "said once: {outcome:?}");
+    let said = outcome.stderr.find(STOPPING_LINE).expect("the stop's line is said on stderr");
+    let ended = outcome.stderr.find("gate: FAILED (status").expect("the run's end is said");
+    assert!(said < ended, "said before the run ends: {outcome:?}");
+    let log = out_log(&case);
+    assert_eq!(log.matches(STOPPING).count(), 1, "logged once: {log}");
+    // The interrupt comes after the run call's first line, which the log keeps before anything said after it.
+    let interrupted = log.find("running-there").expect("the run call's first line is logged");
+    let logged = log.find(STOPPING_LINE).expect("the stop's line is logged");
+    assert!(interrupted < logged, "said after the Ctrl+C: {log}");
+}
+
+#[test]
+fn a_second_ctrl_c_during_the_stop_adds_nothing() {
+    let case = client_case("client-ctrl-c-twice");
+    let steps = ssh_steps(&case, "ssh", &["ok", &format!("say-hold running-there {}", never(&case)), "ok"]);
+    let tuned = Tuned {
+        extra: &["--test-remote-interrupt-at", "stop"],
+        ..Tuned::default()
+    };
+
+    let outcome = finish(client_gate_tuned(&case, "out.log", &steps, &tuned, &[r".\tool.exe", "out", "ran there"]));
+
+    assert_eq!(outcome.code, Some(CONTROL_C_EXIT), "the run still ends: {outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "run", "stop"], "the command is stopped once");
+    assert_eq!(outcome.stderr.matches(STOPPING).count(), 1, "said once: {outcome:?}");
+    assert!(outcome.stderr.contains(STOPPING_LINE), "{outcome:?}");
+    let log = out_log(&case);
+    assert_eq!(log.matches(STOPPING).count(), 1, "logged once: {log}");
 }
 
 /// The preflight, the push's receive-pack and the run call through `local-ssh`, then the sync-back's `ls-remote` and,

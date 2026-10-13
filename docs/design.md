@@ -1305,6 +1305,8 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
   **The stop** is a `stop` call to the builder's `gate box`, made after a kill and after a Ctrl+C that ended a call that may have started the command. It is bounded to 30 s, is retried once after a pre-banner failure while 5 s of the bound would be left, and runs on a hidden console of its own (`CREATE_NO_WINDOW`), so a second Ctrl+C cannot end it.
 
+  After a Ctrl+C, and before the stop call, the client says once `gate: stopping the command on <host> (up to <n> s)` to stderr and the log, with `<n>` the stop's bound in whole seconds, rounded up (30 by default); a second Ctrl+C adds nothing. A stall or ceiling kill, and a Ctrl+C after a lost connection, say no such line.
+
   The stop says `gate: stopping the command on <host> did not finish in <n> s` or `gate: stopping the command on <host> failed (status <n>)`; the run ends the same either way.
 
   **A lost connection** is any exit 255 of the run call that is not a pre-banner failure (`End::Lost`); a command that itself exits 255 is treated the same, as the PowerShell wrapper does; so is one that prints ssh's banner words and exits 255, since its call said the start marker (`gate: lost the connection to <host>`, not `unreachable`).
@@ -1775,13 +1777,13 @@ A Rust integration suite drives the built `gate.exe` through its CLI and reads o
 
   `--test-remote-bound-ms <n>` (whole milliseconds above 0) replaces the 30 s bound of the client's `stop` and `boot` calls.
 
-  `--test-remote-interrupt-at <preflight|run|outputs|install|sdks>` makes the client raise the console interrupt itself after that call's first output byte; `install` raises it before the second file's move, so an install of one file is never interrupted, and `sdks` just before the parity check reads this PC's SDK list with `dotnet --list-sdks`. `--test-remote-timeout-ms <n>` (whole milliseconds above 0) replaces the run's ceiling for the client.
+  `--test-remote-interrupt-at <preflight|run|outputs|install|sdks|stop>` makes the client raise the console interrupt itself after that call's first output byte; `install` raises it before the second file's move, so an install of one file is never interrupted, and `sdks` just before the parity check reads this PC's SDK list with `dotnet --list-sdks`; `stop` raises it at the run call's first byte and again while the stop call runs. `--test-remote-timeout-ms <n>` (whole milliseconds above 0) replaces the run's ceiling for the client.
 
   `--test-remote-watch-call <preflight|push|run|ls-remote|fetch|outputs>` makes `--test-stall-ms` and `--test-remote-timeout-ms` apply to that one call alone, its ceiling counted from the call's own start, every other call keeping the run's own window and ceiling.
 
   With `ls-remote`, `--test-remote-timeout-ms` is that call's deadline and `--test-stall-ms` alone leaves it on the git limit. With `fetch`, the stall and ceiling seams apply to the fetch alone; with `outputs`, to the outputs fetch alone.
 
-  A value outside a seam's calls says `gate: --test-remote-watch-call must be preflight, push, run, ls-remote, fetch or outputs, got '<v>'`, and `--test-remote-interrupt-at` says `must be preflight, run, outputs, install or sdks`. The four need the transport; `--test-print-request` shows them as `testSeams.remoteBoundMs`, `remoteInterruptAt`, `remoteWatchCall` and `remoteTimeoutMs`, after `remoteRetryPauseMs`.
+  A value outside a seam's calls says `gate: --test-remote-watch-call must be preflight, push, run, ls-remote, fetch or outputs, got '<v>'`, and `--test-remote-interrupt-at` says `must be preflight, run, outputs, install, sdks or stop`. The four need the transport; `--test-print-request` shows them as `testSeams.remoteBoundMs`, `remoteInterruptAt`, `remoteWatchCall` and `remoteTimeoutMs`, after `remoteRetryPauseMs`.
 
   `--test-remote-fetch-cap-bytes <n>` (a whole number of bytes above 0, default 4 GiB) replaces the cap on what the sync-back fetch's job may write. Refused without the transport with `gate: --test-remote-fetch-cap-bytes needs --test-remote-transport`, and a value that is not a whole number above 0 with `gate: --test-remote-fetch-cap-bytes must be a whole number above 0, got '<v>'`. `--test-print-request` does not show it.
 

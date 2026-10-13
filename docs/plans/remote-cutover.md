@@ -2,6 +2,8 @@
 
 The plan for `feat/remote-cutover`: the Rust remote client replaces the remote.ps1 bridge. Owner and agent rulings are in GATE-46's description; this file holds the split and the runbook. Part 1 (R1–R7) selects the Rust client behind a flag and drains; the orchestrator flips once part 1 is green. Part 2 (R8–R10) deletes the bridge.
 
+Routing is off on the PC since the decommission of the PowerShell remote: every run is local until the Rust client is trialled (GATE-191) and routing is turned back on (GATE-192). Nothing drains first.
+
 ## Part 1: select the Rust client behind the flag, and drain
 
 ### R1. Stamp the build's commit into `gate --version` and the box preflight; fall back on a stale builder copy
@@ -73,15 +75,15 @@ The plan for `feat/remote-cutover`: the Rust remote client replaces the remote.p
 
 ## Runbook (orchestrator, after R7 is green)
 
+Routing is off on the PC, so every run is local; R8–R10 delete the bridge with no drain. The trial (GATE-191) runs before routing comes back on the Rust client, and GATE-192 turns it back on.
+
 0. The branch has main merged (GATE-146 part B included); full suite and both clippy runs pass.
-1. Install on the PC from the branch head; `gate --version` shows `0.1.0+{head}`. No flag yet, routing unchanged. Rollback: reinstall main's commit.
+1. Install on the PC from the branch head; `gate --version` shows `0.1.0+{head}`. Rollback: reinstall main's commit.
 2. `gate push`: every builder says installed `0.1.0+{head}` or already installed. Rollback: reinstall the previous commit and push.
-3. Rehearse: `gate remote-cutover --state-dir {scratch root}` with no routed work running; it asks every builder through `inflight` and says `done`. Rollback: delete the scratch root.
-4. Verified routed run through the scratch flag: `gate run --state-dir {scratch root} … -- dotnet build` on a solution in a repo `remote.json` lists; check no fallback, a remote take/release in the scratch journal, the sync-back applied, outputs installed, no nothing-back record. Once, a long routed command with Ctrl+C: the stop line appears once. Rollback: delete the scratch root.
-5. Drain and flip: `gate remote-cutover` on the default root until `done`. Rollback at any point: delete the flag and `.draining` in the state root.
-6. Confirm on the next ordinary routed runs: no `client` or `version` fallbacks, no nothing-back record after a build that brought its outputs back.
-7. Watch one working session: fallback reasons, busy counts, stop lines.
-8. After R9 merges to main: install from main and push; `remote-bridge.ps1` is gone from the install. Rollback: reinstall the part-1 commit (the flag still selects the Rust client; deleting it returns to the bridge).
-9. After R10: reinstall, push, delete the leftover flag. The builders' old PowerShell wrappers and claude-config's remote scripts are GATE-11's.
+3. Rehearse in a scratch root: `gate run --state-dir {scratch root} … -- dotnet build` on a solution in a repo `remote.json` lists; check no fallback, a remote take/release in the scratch journal, the sync-back applied, outputs installed, no nothing-back record. Once, a long routed command with Ctrl+C: the stop line appears once. Rollback: delete the scratch root.
+4. The trial (GATE-191), before routing comes back: watch one working session for fallback reasons, busy counts and stop lines.
+5. Turn routing back on for the Rust client (GATE-192). Confirm on the next ordinary routed runs: no `client` or `version` fallbacks, no nothing-back record after a build that brought its outputs back.
+6. After R9 merges to main: install from main and push; `remote-bridge.ps1` is gone from the install.
+7. After R10: reinstall, push, delete any leftover flag. The builders' old PowerShell wrappers and claude-config's remote scripts are GATE-11's.
 
 GATE-109 (one ssh connection) follows the cutover.

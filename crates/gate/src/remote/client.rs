@@ -440,7 +440,8 @@ pub(super) struct Attempt<'c, 'a> {
     one_call: Option<OneCall<'c>>,
     /// The call, `preflight`, `run` or `outputs`, after whose first output byte the console interrupt is raised, as a
     /// Ctrl+C would; or `install`, once the install has moved its first file and before it moves a second, so its line
-    /// reads `1 of {m}`: an install of a single file ends before the seam is reached.
+    /// reads `1 of {m}`: an install of a single file ends before the seam is reached; or `stop`, as `run` and then once
+    /// more while the stop call that Ctrl+C leads to runs.
     interrupt_at: Option<&'c str>,
     /// `--test-local-sdks`: this PC's SDK list, read in place of `dotnet --list-sdks`.
     local_sdks: Option<&'c str>,
@@ -746,7 +747,8 @@ impl Attempt<'_, '_> {
     fn run_call(&mut self, line: &str, location: &Location, input: Option<&Arc<str>>, nonce: &str) -> Result<RunEnd, End> {
         self.go_on()?;
         let limits = self.limits_for("run");
-        let raise = self.raises_at("run");
+        // `stop` raises the interrupt during the run call too, so the stop it leads to can be interrupted again.
+        let raise = self.raises_at("run") || self.raises_at("stop");
         let nonce: Arc<str> = Arc::from(nonce);
         let mut heard = None;
         let mut names_skipped = false;
@@ -782,7 +784,7 @@ impl Attempt<'_, '_> {
         let (mut called, again) = match made {
             Ok(made) => made,
             Err(End::Interrupted) if running => {
-                self.stop(location);
+                self.stop_after_ctrl_c(location);
                 return Err(End::Interrupted);
             }
             Err(end) => return Err(end),
@@ -801,7 +803,7 @@ impl Attempt<'_, '_> {
             return Ok(End::Refused(FallbackReason::Unreachable));
         }
         if self.go_on().is_err() {
-            self.stop(location);
+            self.stop_after_ctrl_c(location);
             return Err(End::Interrupted);
         }
         if called.status == SSH_FAILED {
@@ -889,10 +891,19 @@ impl Attempt<'_, '_> {
         self.bounded("stop", location, &what);
     }
 
+    /// [`Attempt::stop`] after a Ctrl+C, saying first how long the stop may take, its bound in whole seconds, so the
+    /// wait that follows the Ctrl+C is explained. A Ctrl+C during the stop does not end it and says nothing more.
+    fn stop_after_ctrl_c(&mut self, location: &Location) {
+        let bound = watchdog::whole_seconds(self.limits.bound);
+        self.say(format!("gate: stopping the command on {} (up to {bound} s)", self.call.host));
+        self.stop(location);
+    }
+
     /// The bounded call `verb` to the builder at `location`, which the bound limits and a Ctrl+C does not end; it is
     /// made once more after a failure before the banner while 5 s of the bound would be left. Keeps the lines of the
     /// call that counts, says when it did not finish or failed, `what` it does named, and gives it back; `None` when it
-    /// could not be made.
+    /// could not be made. With `--test-remote-interrupt-at` naming `verb`, its first call raises the console interrupt
+    /// as soon as it runs.
     fn bounded(&mut self, verb: &str, location: &Location, what: &str) -> Option<Called> {
         let line = match payload::capped(verb, payload::line(verb, &payload::location_word(location))) {
             Ok(line) => line,
@@ -903,7 +914,8 @@ impl Attempt<'_, '_> {
         };
         let bound = self.limits.bound;
         let begun = Instant::now();
-        let mut made = self.ssh(&line, Echo::LogOnly, Watch::Bounded(bound), false, CallOnly::default());
+        let raise = self.raises_at(verb);
+        let mut made = self.ssh(&line, Echo::LogOnly, Watch::Bounded(bound), raise, CallOnly::default());
         let again = matches!(&made, Ok(first) if first.before_the_banner(SSH_FAILED)) && retry::retry_allowed(bound, begun.elapsed(), self.pause);
         if again {
             if let Ok(first) = &mut made {
@@ -1323,7 +1335,8 @@ impl Watched<'_> {
     /// the first look at the bytes its job wrote that failed, which cuts nothing; the attempt's interrupt when the
     /// console `interrupt` ended it. A fetch with a cap has those bytes looked at on each tick and once more after its
     /// exit, so a fetch that ends between two ticks is found past its cap too. `raise`, when given, is raised once the
-    /// call sent its first byte, as a Ctrl+C would be.
+    /// call sent its first byte, as a Ctrl+C would be; at the first look for a call a Ctrl+C does not end, which has no
+    /// output to wait for.
     fn watch(self, watch: Watch, interrupt: Option<Interrupt>, mut raise: Option<Interrupt>) -> Result<Watching, End> {
         let begun = Instant::now();
         let tick = watch.tick();
@@ -1337,7 +1350,7 @@ impl Watched<'_> {
                 let ended = over.map_or(CallEnd::Exited(code.cast_signed()), CallEnd::ExitedOver);
                 return Ok(Watching { ended, looks });
             }
-            if self.progress.heard_any()
+            if (self.progress.heard_any() || !watch.interruptible())
                 && let Some(interrupt) = raise.take()
             {
                 interrupt.raise();

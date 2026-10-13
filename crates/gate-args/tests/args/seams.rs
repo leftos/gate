@@ -520,7 +520,7 @@ fn the_remote_client_seams_need_a_value_once() {
         ))),
         ["gate: --test-remote-bound-ms must be a whole number above 0, got '0'"]
     );
-    for call in ["preflight", "run", "outputs", "install", "sdks"] {
+    for call in ["preflight", "run", "outputs", "install", "sdks", "stop"] {
         let words = with(
             &RUN,
             &["--test-remote-transport", "local:b", "--test-remote-interrupt-at", call, "--", "cmd"],
@@ -532,7 +532,7 @@ fn the_remote_client_seams_need_a_value_once() {
             &RUN,
             &["--test-remote-transport", "local:b", "--test-remote-interrupt-at", "push", "--", "cmd"]
         ))),
-        ["gate: --test-remote-interrupt-at must be preflight, run, outputs, install or sdks, got 'push'"]
+        ["gate: --test-remote-interrupt-at must be preflight, run, outputs, install, sdks or stop, got 'push'"]
     );
 }
 
@@ -1223,6 +1223,10 @@ fn seam_flags_are_unknown_without_the_feature() {
             "{flag}"
         );
     }
+    assert_eq!(
+        problems(&refs(&with(&RUN, &["--test-remote-interrupt-at", "stop", "--", "cmd"]))),
+        ["gate: unknown option --test-remote-interrupt-at", "gate: unexpected argument stop"]
+    );
     assert_eq!(
         problems(&["stop-tree", "--test-print-request", "1"]),
         ["gate: unknown option --test-print-request"]
