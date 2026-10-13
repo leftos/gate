@@ -402,6 +402,92 @@ fn box_run_packs_a_file_with_a_non_ascii_name() {
 }
 
 #[test]
+fn box_run_never_packs_a_name_the_pcs_install_refuses_and_says_so() {
+    let case = Case::new("box_outputs_unplain_name");
+    let command = [FAKE_TOOL, "write", r"bin\m~10.txt", "x", "write", r"bin\ok.txt", "ok"];
+    let mut payload = outputs_payload(&case, &command, &["bin/**"]);
+    snapshot(&case, &mut payload, &[IGNORE_BIN]);
+
+    let outcome = run_with_manifest(&case, &payload, &manifest(&[]));
+
+    assert_eq!(outcome.code, Some(0), "the run keeps its status: {outcome:?}");
+    assert_eq!(archive_files(&archive_path(&payload)), expected(&[("bin/ok.txt", "ok")]));
+    let skipped = "gate: remote outputs: skipped 1 file(s) with names this PC cannot take: bin/m~10.txt";
+    let lines: Vec<&str> = outcome.stderr.lines().collect();
+    let said = lines.iter().position(|line| *line == skipped);
+    let packed = lines.iter().position(|line| *line == packed_line(&payload, 1));
+    assert!(
+        said.is_some() && said < packed,
+        "the skip is said once, before the packed line: {outcome:?}"
+    );
+    assert_eq!(lines.iter().filter(|line| line.contains("skipped")).count(), 1, "{outcome:?}");
+}
+
+#[test]
+fn box_run_that_skips_several_names_names_the_first_and_marks_the_rest() {
+    let case = Case::new("box_outputs_unplain_names");
+    let command = [
+        FAKE_TOOL,
+        "write",
+        r"bin\m~2.txt",
+        "m",
+        "write",
+        r"bin\m~10.txt",
+        "x",
+        "write",
+        r"bin\l~10.txt",
+        "l",
+        "write",
+        r"bin\x~1\a.txt",
+        "a",
+        "write",
+        r"bin\ok.txt",
+        "ok",
+    ];
+    let mut payload = outputs_payload(&case, &command, &["bin/**"]);
+    snapshot(&case, &mut payload, &[IGNORE_BIN]);
+
+    let outcome = run_with_manifest(&case, &payload, &manifest(&[]));
+
+    assert_eq!(outcome.code, Some(0), "the run keeps its status: {outcome:?}");
+    assert_eq!(archive_files(&archive_path(&payload)), expected(&[("bin/ok.txt", "ok")]));
+    let skipped = "gate: remote outputs: skipped 4 file(s) with names this PC cannot take: bin/l~10.txt, \u{2026}";
+    assert!(has_line(&outcome.stderr, skipped), "{outcome:?}");
+}
+
+#[test]
+fn box_run_whose_only_output_is_skipped_says_so_and_packs_nothing() {
+    let case = Case::new("box_outputs_only_unplain");
+    let mut payload = outputs_payload(&case, &[FAKE_TOOL, "write", r"bin\m~10.txt", "x"], &["bin/**"]);
+    snapshot(&case, &mut payload, &[IGNORE_BIN]);
+
+    let outcome = run_with_manifest(&case, &payload, &manifest(&[]));
+
+    assert_eq!(outcome.code, Some(0), "the run keeps its status: {outcome:?}");
+    let skipped = "gate: remote outputs: skipped 1 file(s) with names this PC cannot take: bin/m~10.txt";
+    let lines: Vec<&str> = outcome.stderr.lines().collect();
+    let said = lines.iter().position(|line| *line == skipped);
+    let nothing = lines.iter().position(|line| *line == "gate-remote-outputs: 0");
+    assert!(said.is_some() && said < nothing, "the skip, then nothing packed: {outcome:?}");
+    assert!(!archive_path(&payload).exists(), "no archive is written");
+}
+
+#[test]
+fn box_run_skips_an_output_named_as_the_archive_s_own_list() {
+    let case = Case::new("box_outputs_list_name");
+    let command = [FAKE_TOOL, "write", ".gate-outputs.json", "{}", "write", r"bin\ok.txt", "ok"];
+    let mut payload = outputs_payload(&case, &command, &["bin/**", "*.json"]);
+    snapshot(&case, &mut payload, &[(".gitignore", "bin/\n/.gate-outputs.json\n")]);
+
+    let outcome = run_with_manifest(&case, &payload, &manifest(&[]));
+
+    assert_eq!(outcome.code, Some(0), "the run keeps its status: {outcome:?}");
+    assert_eq!(archive_files(&archive_path(&payload)), expected(&[("bin/ok.txt", "ok")]));
+    let skipped = "gate: remote outputs: skipped 1 file(s) with names this PC cannot take: .gate-outputs.json";
+    assert!(has_line(&outcome.stderr, skipped), "{outcome:?}");
+}
+
+#[test]
 fn box_run_whose_archive_cannot_be_written_brings_nothing_back_and_fails() {
     let case = Case::new("box_outputs_unwritable");
     let mut payload = outputs_payload(&case, &[FAKE_TOOL, "write", r"bin\a.txt", "a"], &["bin/**"]);

@@ -1179,6 +1179,20 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
     The box never packs such a file, and the PC's install refuses one that still arrives through the existing `the archive member <path> is not under the output globs` line.
 
+    **Never a name the PC's install refuses** (GATE-166): a builder output can have a name that is not plain (the member rule under **The outputs module** below): an 8.3-shaped `m~10.txt`, a trailing dot, a device name such as `COM1.txt`, a bidirectional mark, or more than 64 parts.
+
+    So can a file named as the archive's own list, `.gate-outputs.json` at the root in any letter case, or a name that is not Unicode. Packing one would fail the pack, lose the whole archive and turn a passing run into 1.
+
+    `Globs::matches` is therefore false for a path that is not plain (`is_plain_path` in `outputs/names.rs`, which `outputs/archive.rs` imports for its pack and unpack checks) or is the list name, and `Globs::enters` for a folder whose own name `is_plain_part` refuses (the 64-part limit is the file's, not the folder's). The walk passes over a name that is not Unicode. The PC's manifest walk leaves all of these out silently.
+
+    The box's pack skips them and says so once, before its `gate-remote-outputs:` line, and the run keeps its status: `gate: remote outputs: skipped <n> file(s) with names this PC cannot take: <first path>`, with `, …` after the path when n is above 1.
+
+    The line counts the files the pack would have taken but for the name (the back commit's paths and the PC's unchanged copies left out, as for any file), names the first by relative path, `/`-separated, a name that is not Unicode read lossily, cut to at most 1024 bytes at a character boundary and followed by `…` when cut, and escaped as other box lines escape paths. It is not said when the pack fails.
+
+    The walk reads long names, so an alias-shaped name such as `l~10.txt` or `GITATT~1` is a real file and is counted, though the PC never takes it. Only a name spelled as a `.git*` component or a `.lfsconfig` (letter case, `\`, a `:` stream and trailing dots and spaces aside) stays silent, as does an excluded path.
+
+    A folder the walk does not enter because its name is not plain or not Unicode (`bin/x~1/`, `bin/con/`, `bin/report./`) is read through a verbatim `\\?\` path only to count the files below it that the globs select, which are never packed (`Globs::counts_below`). That read enters no excluded or `.git*`-spelled folder and no folder of 64 parts or more. A folder or entry it cannot read leaves those files uncounted and the walk goes on, so the outputs are still brought back.
+
   A pre-banner failure, which is exit 255 (128 for git) with empty stdout, no start marker heard and a first stderr line starting `Connection timed out during banner exchange`, `kex_exchange_identification: ` or `banner exchange: `, says `gate: <host> did not answer the ssh banner; trying once more` and is retried once after a 2 s pause. A run call whose box said the start marker is never retried or read as a pre-banner failure, whatever its first stderr line: the command may have started.
 
   Two pre-banner failures of the run call fall back `unreachable`; the sync-back's `ls-remote` and `fetch` are retried the same way, and two failures of either end the run with status 1.
@@ -1412,6 +1426,7 @@ Built verbs:
     An archive already gone counts as removed; one that cannot be removed, or a folder that cannot be listed, is said (`gate: remote could not remove the old outputs archive <path>`, `gate: remote could not list the old outputs archives in <folder>`) and fails nothing.
   - Just before the command, unless `OutputsFull`, it lists the files under the globs (size and last write); a listing that fails is said (`gate: remote could not list the outputs before the command: <error>`) and leaves every file counting as changed.
   - After a command that exited 0 and its back commit, with the commit pushed, it reads the commit's paths (`git diff-tree`) and packs the files to bring back into `<OutputFolder>\<key>-<nonce>.tar.zst`, created new. It says `gate-remote-outputs: <n> <archive name>` on stderr, or `gate-remote-outputs: 0` with no archive when nothing is to come back. The paths are read only after the push, so failing to read them fails the outputs and never the sync-back.
+  - A file the pack would take but whose name does not fit the archive (not plain, the list name or not Unicode), or that sits below a folder whose name is not plain, is skipped, and the box says `gate: remote outputs: skipped <n> file(s) with names this PC cannot take: <first path>` (`, …` after the path when n is above 1) on stderr once, just before its `gate-remote-outputs:` line; the run keeps its status, and the client echoes the line like any box line.
   - Right after a pack that wrote an archive, the box trims `OutputFolder` to at most 50 GiB of outputs archives (files named as in the first step; other files are neither counted nor removed). It removes the archives last written strictly before the run's own, oldest first (by path among equals), until the total fits; an archive written with the run's own or after it is never removed, so the folder may stay over the budget until the newer run's own trim.
   - The run's own archive is opened sharing reads only, so another run's trim cannot remove it mid-write; such a removal fails, is said as above (`gate: remote could not remove the old outputs archive <path>: <error>`) and that trim goes on to the next oldest. An entry whose metadata cannot be read is said (`gate: remote could not read the outputs archive <path>: <error>`, control characters escaped), left out of the total, and the trim goes on.
   - A run whose own archive alone is larger than the budget removes only its own archive, leaves the others, and says `gate: remote outputs not brought back: the archive is <X.X> GiB, more than the box keeps (50 GiB)`. A run whose own archive is gone before its trim says `gate: remote outputs not brought back: the archive was removed before it could be sent`. Either turns a passed 0 into 1.
@@ -1434,8 +1449,16 @@ Built verbs:
 
 **The outputs module** (GATE-44) is shared by both ends, this exe, in `crates/gate/src/outputs/`. The box's `run` packs with it and the box's `outputs` verb sends the archive. The PC's manifest, the pending marker, the reading of the box's `gate-remote-outputs: ` line, the fetch of the archive and its install are built in the Rust remote client, which is dormant ([The remote client's run](#routing-and-the-remoteps1-bridge)).
 
-- Globs: each is relative to the work folder's root and `/`-separated, matched without regard to case: `**/` is any number of folders (none included), `**` anything, `*` any run of characters within one name, `?` one character within one name. Never brought back, whatever the globs: anything under a `.git`, `.tmp` or `TestResults` folder at any depth, a `.env` file (`.env`, `.env.<name>`, `<name>.env`), any path component starting `.git` (`.git`, `.github`, `.gitattributes`) and a `.lfsconfig` at any depth, spelled any way the sync-back's names check reads (`\` as a separator, a cut at the first `:`, trailing dots and spaces stripped, 8.3 aliases such as `GITATT~1` and `LFSCON~1`).
-- Walk: lists the files below a folder that the globs match, ordered by relative path, and does not enter an excluded folder, a `.git*` folder included. A link or a junction, to a file or to a folder, is neither followed nor listed. A folder or name that cannot be read, or is not Unicode, fails the walk.
+- Globs: each is relative to the work folder's root and `/`-separated, matched without regard to case: `**/` is any number of folders (none included), `**` anything, `*` any run of characters within one name, `?` one character within one name.
+
+  Never brought back, whatever the globs: anything under a `.git`, `.tmp` or `TestResults` folder at any depth, a `.env` file (`.env`, `.env.<name>`, `<name>.env`), any path component starting `.git` (`.git`, `.github`, `.gitattributes`) and a `.lfsconfig` at any depth, spelled any way the sync-back's names check reads (`\` as a separator, a cut at the first `:`, trailing dots and spaces stripped, 8.3 aliases such as `GITATT~1` and `LFSCON~1`).
+
+  Nor is a path that is not plain (the member rule below), the archive's own list `.gate-outputs.json` at the root in any letter case, or a name that is not Unicode, each of which the box's pack skips and says.
+- Walk: lists the files below a folder that the globs match, ordered by relative path, and does not enter an excluded folder, a `.git*` folder included, or a folder whose name is not plain or not Unicode, however deep.
+
+  The box's pack also takes from it the files the globs would select but for their names, those below such a folder included, to say them.
+
+  A link or a junction, to a file or to a folder, is neither followed nor listed. A folder that cannot be read, or an entry whose metadata cannot be, fails the walk; a name that is not Unicode does not.
 - Manifest: the PC's list of its matching files, sent as one line of JSON and a newline, `{"files":{"<path>":{"size":<bytes>,"modified":<file time>,"sha256":"<hex>"}}}`, paths relative to the worktree root and found without regard to case.
 
   The box's pack takes each file the manifest lacks, and each it holds that the run created or changed (the box's stat listing from just before the command lacks it or holds another size or last write) whose SHA-256 differs from the manifest's, skipping the paths of the run's back commit. Under `OutputsFull` there is no listing, so every file counts as changed and each that differs from the PC's comes back.
@@ -1445,6 +1468,8 @@ Built verbs:
 `unpack` creates its destination, which must not exist, and refuses an archive for any of these, a member before anything of it is written:
 
 - A member name that is not a plain relative path inside the destination: `.git` in any case, an 8.3 short name (`~` before a digit), a part ending in `.` or a space, any of `<>"|?*:` or `\`, a control or bidirectional character, a device name (`CON`, `PRN`, `AUX`, `NUL`, `CONIN$`, `CONOUT$`, `COM0` to `COM9`, `LPT0` to `LPT9`, also with an extension), or more than 64 parts.
+
+  The rule is `is_plain_path` in `outputs/names.rs`. The globs and the walk apply it too, so the box never packs such a name; the pack still refuses one (`the output '<path>' has a name the outputs archive's reader refuses`), a backstop the walk leaves unreachable.
 - A GNU long name over 4096 bytes, and any pax, `g`, `K` or `S` entry.
 - More than 50,000 files or folders.
 - A member over the bytes left of the caller's limit (and over 16 GiB).

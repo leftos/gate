@@ -1,11 +1,13 @@
 //! The output globs as the PowerShell gate matched them (remote-wrapper.ps1's `ConvertTo-OutputRegex`), plus the paths
-//! never brought back whatever the globs: `$OutputExcluded`'s, and any `.git*` component or `.lfsconfig`, matched as the
-//! sync-back matches them.
+//! never brought back whatever the globs: `$OutputExcluded`'s, any `.git*` component or `.lfsconfig`, matched as the
+//! sync-back matches them, and any path that does not fit the outputs archive: one that is not plain, which the
+//! archive's reader refuses, or the archive's own list name.
 
 use regex::Regex;
 
 use crate::boxside::payload::escaped;
-use crate::outputs::names::{is_git_s, is_lfs_config};
+use crate::outputs::archive::LIST_NAME;
+use crate::outputs::names::{PATH_DEPTH_LIMIT, is_git_s, is_lfs_config, is_plain_part, is_plain_path, is_spelled_git_s, is_spelled_lfs_config};
 
 /// The paths never brought back, whatever the globs: anything under a `.git`, `.tmp` or `TestResults` folder at any
 /// depth, and a `.env` file (`.env`, `.env.<name>`, `<name>.env`). Matched without regard to case. Its `.git/` arm
@@ -16,7 +18,9 @@ const EXCLUDED: &str = r"(?i)(^|/)(\.git|\.tmp|TestResults)/|(^|/)\.env\.[^/]*$|
 /// none included, `**` anything, `*` any run of characters within one name, `?` one character within one name, and
 /// every other character itself. They match without regard to case, as the PowerShell gate's did. Whatever the globs, a
 /// path a sync-back never writes — a `.git*` component or a `.lfsconfig`, read by [`is_git_s`] and [`is_lfs_config`] —
-/// never comes back and its folder is never entered.
+/// never comes back and its folder is never entered, nor does a path that does not fit the outputs archive ([`fits`]):
+/// one that is not plain ([`is_plain_path`]) or the archive's own list name. The box's walk notes such a file
+/// ([`Globs::refuses_name`]), and reads a folder whose name is not plain only to count them ([`Globs::counts_below`]).
 pub(crate) struct Globs {
     patterns: Vec<Regex>,
     excluded: Regex,
@@ -33,17 +37,47 @@ impl Globs {
         Ok(Globs { patterns, excluded })
     }
 
-    /// Whether the file at the `/`-separated relative `path` may come back: a glob matches it, no exclusion holds it,
-    /// and it is neither a `.git*` path nor a `.lfsconfig` ([`is_git_s`], [`is_lfs_config`]).
+    /// Whether the file at the `/`-separated relative `path` may come back: [`Globs::selects`] it, it is neither a
+    /// `.git*` path nor a `.lfsconfig`, 8.3 aliases included ([`is_git_s`], [`is_lfs_config`]), and its name fits the
+    /// outputs archive ([`fits`]).
     pub(crate) fn matches(&self, path: &str) -> bool {
-        !is_git_s(path) && !is_lfs_config(path) && !self.excluded.is_match(path) && self.patterns.iter().any(|pattern| pattern.is_match(path))
+        fits(path) && !is_git_s(path) && !is_lfs_config(path) && self.selects(path)
     }
 
-    /// Whether a walk enters the folder at the `/`-separated relative `path`: no exclusion holds everything in it and
-    /// it is no `.git*` folder ([`is_git_s`]).
-    pub(crate) fn enters(&self, path: &str) -> bool {
-        !is_git_s(path) && !self.excluded.is_match(&format!("{path}/"))
+    /// Whether the file at the `/`-separated relative `path` would come back but for its name: [`Globs::selects`] it,
+    /// yet its name does not fit the outputs archive ([`fits`]).
+    pub(crate) fn refuses_name(&self, path: &str) -> bool {
+        !fits(path) && self.selects(path)
     }
+
+    /// Whether a glob matches the file at the `/`-separated relative `path`, no exclusion holds it, and no component
+    /// of it is spelled as a `.git*` name or a `.lfsconfig` ([`is_spelled_git_s`], [`is_spelled_lfs_config`]); an 8.3
+    /// alias of one counts as any other name.
+    pub(crate) fn selects(&self, path: &str) -> bool {
+        !is_spelled_git_s(path)
+            && !is_spelled_lfs_config(path)
+            && !self.excluded.is_match(path)
+            && self.patterns.iter().any(|pattern| pattern.is_match(path))
+    }
+
+    /// Whether a walk enters the folder at the `/`-separated relative `path`, whose folders it entered: no exclusion
+    /// holds everything in it, it is no `.git*` folder ([`is_git_s`]) and its own name is plain ([`is_plain_part`]).
+    pub(crate) fn enters(&self, path: &str) -> bool {
+        !is_git_s(path) && path.rsplit('/').next().is_some_and(is_plain_part) && !self.excluded.is_match(&format!("{path}/"))
+    }
+
+    /// Whether a walk reads the folder at the `/`-separated relative `path` only to count the files below it that
+    /// [`Globs::refuses_name`] would: no exclusion holds everything in it, no component of it is spelled as a `.git*`
+    /// name, and it has fewer than [`PATH_DEPTH_LIMIT`] parts, so a file below it may have that many.
+    pub(crate) fn counts_below(&self, path: &str) -> bool {
+        !is_spelled_git_s(path) && path.split('/').count() < PATH_DEPTH_LIMIT && !self.excluded.is_match(&format!("{path}/"))
+    }
+}
+
+/// Whether the `/`-separated `path` fits the outputs archive: a plain path ([`is_plain_path`]) other than the archive's
+/// own list, [`LIST_NAME`], in any letter case.
+fn fits(path: &str) -> bool {
+    is_plain_path(path) && !path.eq_ignore_ascii_case(LIST_NAME)
 }
 
 /// `glob` as an anchored, case-insensitive regex.
@@ -95,8 +129,8 @@ mod tests {
     fn a_double_star_and_slash_is_any_number_of_folders_none_included() {
         check(
             "**/bin/**",
-            &["bin/a.dll", "src/app/bin/Debug/a.dll", "bin/sub/"],
-            &["binx/a.dll", "abin/a.dll", "src/bin", "bin"],
+            &["bin/a.dll", "src/app/bin/Debug/a.dll"],
+            &["binx/a.dll", "abin/a.dll", "src/bin", "bin", "bin/sub/"],
         );
     }
 
@@ -109,7 +143,7 @@ mod tests {
     #[test]
     fn a_star_is_any_run_of_characters_within_one_name() {
         check("*.dll", &["a.dll", ".dll"], &["x/a.dll", "a.dll.bak"]);
-        check("bin/*/a.dll", &["bin/Debug/a.dll", "bin//a.dll"], &["bin/a.dll", "bin/x/y/a.dll"]);
+        check("bin/*/a.dll", &["bin/Debug/a.dll"], &["bin/a.dll", "bin/x/y/a.dll", "bin//a.dll"]);
     }
 
     #[test]
@@ -231,6 +265,78 @@ mod tests {
         }
         for entered in ["bin", "bin/agit"] {
             assert!(matcher.enters(entered), "{entered} is entered");
+        }
+    }
+
+    #[test]
+    fn a_name_the_archive_reader_refuses_is_never_brought_back() {
+        let matcher = globs(&["**"]);
+        let deep = vec!["a"; 65].join("/");
+        for refused in [
+            "bin/m~10.txt",
+            "bin/report.",
+            "bin/report ",
+            "bin/COM1.txt",
+            "con/x",
+            "bin/a\u{202e}b.dll",
+            deep.as_str(),
+        ] {
+            assert!(!matcher.matches(refused), "{refused} is never brought back");
+        }
+        let deepest = vec!["a"; 64].join("/");
+        for kept in ["bin/a.txt", "bin/l~x.txt", deepest.as_str()] {
+            assert!(matcher.matches(kept), "{kept} may come back");
+        }
+    }
+
+    #[test]
+    fn a_walk_enters_no_folder_whose_name_the_archive_reader_refuses() {
+        let matcher = globs(&["**"]);
+        for refused in ["bin/con", "bin/x~1", "nul.d", "bin/a\u{202e}b"] {
+            assert!(!matcher.enters(refused), "{refused} is not entered");
+        }
+        assert!(matcher.enters(&vec!["a"; 65].join("/")), "a folder's depth alone does not stop the walk");
+    }
+
+    #[test]
+    fn the_archive_s_own_list_name_is_refused_as_an_output_at_the_root_only() {
+        let matcher = globs(&["**"]);
+        for refused in [".gate-outputs.json", ".GATE-Outputs.JSON"] {
+            assert!(!matcher.matches(refused), "{refused} is never brought back");
+            assert!(matcher.refuses_name(refused), "{refused} is refused for its name");
+        }
+        assert!(matcher.matches("bin/.gate-outputs.json"), "a list name below the root may come back");
+    }
+
+    #[test]
+    fn a_name_is_refused_aloud_unless_it_is_a_spelled_git_or_lfsconfig_name_or_excluded() {
+        let matcher = globs(&["**"]);
+        for loud in ["bin/l~10.txt", "GITATT~1", "bin/LFSCON~1", "bin/m~10.txt", "bin/report."] {
+            assert!(matcher.refuses_name(loud), "{loud} is refused for its name");
+        }
+        for silent in [
+            ".gitattributes",
+            ".lfsconfig",
+            ".lfsconfig.",
+            ".github/x~1.txt",
+            ".tmp/m~1.txt",
+            "bin/ok.txt",
+        ] {
+            assert!(!matcher.refuses_name(silent), "{silent} is not refused for its name");
+        }
+        assert!(!globs(&["*.dll"]).refuses_name("bin/m~10.txt"), "a name no glob matches is not refused");
+    }
+
+    #[test]
+    fn a_walk_counts_below_a_folder_whose_name_is_not_plain_down_to_the_depth_limit() {
+        let matcher = globs(&["**"]);
+        let deep = vec!["a"; 63].join("/");
+        for counted in ["bin/x~1", "bin/con", "bin/report.", "GIT~1", deep.as_str()] {
+            assert!(matcher.counts_below(counted), "{counted} is read to count its files");
+        }
+        let too_deep = vec!["a"; 64].join("/");
+        for silent in [".github/x~1", ".tmp/x~1", "a/.git", too_deep.as_str()] {
+            assert!(!matcher.counts_below(silent), "{silent} is not read");
         }
     }
 }

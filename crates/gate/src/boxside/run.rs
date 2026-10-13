@@ -295,7 +295,10 @@ impl<'a> RunOutputs<'a> {
     fn bring_back(&self, work: &Path, skip: Result<Vec<String>, String>, beat: &Beat<'_>, console: &mut Console) -> u32 {
         let brought = skip.and_then(|skip| outputs::bring_back(self.asked, &self.manifest, self.listing.as_ref(), work, &skip));
         match brought {
-            Ok(line) => {
+            Ok((skipped, line)) => {
+                if let Some(skipped) = skipped {
+                    beat.say(console, &skipped);
+                }
                 beat.say(console, &line);
                 self.trim_outputs(line != outputs::NOTHING_PACKED, beat, console)
             }

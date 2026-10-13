@@ -22,8 +22,9 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_NAME_NORMALIZED, GetFinalPathNameByHandleW, VOLUME_NAME_DOS,
 };
 
-use crate::boxside::payload::{escaped, is_reordering_mark};
+use crate::boxside::payload::escaped;
 use crate::outputs::hash::{Hashing, SHA256_DIGITS, is_lower_hex};
+use crate::outputs::names::is_plain_path;
 use crate::outputs::walk::{Found, in_context};
 
 /// The extension of an outputs archive's name.
@@ -41,8 +42,6 @@ const MEMBER_LIMIT: usize = 50_000;
 const MEMBER_SIZE_LIMIT: u64 = 16 * 1024 * 1024 * 1024;
 /// The most bytes a GNU long name member may hold.
 const LONG_NAME_LIMIT: u64 = 4 * 1024;
-/// The most `/`-separated parts a member's path may have, its file's name included.
-const PATH_DEPTH_LIMIT: usize = 64;
 /// What the stream as sent may hold beyond zstd's worst-case expansion of the limit's bytes: frame and block headers.
 const SENT_SLACK: u64 = 1024 * 1024;
 
@@ -529,35 +528,6 @@ fn member_path(bytes: &[u8]) -> io::Result<String> {
     if is_plain_path(path) { Ok(path.to_owned()) } else { Err(outside(path)) }
 }
 
-/// Whether the `/`-separated `path` is relative, of at most [`PATH_DEPTH_LIMIT`] parts, each one [`is_plain_part`].
-fn is_plain_path(path: &str) -> bool {
-    path.split('/').count() <= PATH_DEPTH_LIMIT && path.split('/').all(is_plain_part)
-}
-
-/// Whether `part` names a file or a folder that Windows would create under that very name and git does not own: not
-/// empty, not ending in `.` or a space (so neither `.` nor `..`), with no `\ : < > " | ? *`, control character or
-/// bidirectional mark, no `~` before a digit (an 8.3 short name), not `.git` in any case, and not a device name.
-fn is_plain_part(part: &str) -> bool {
-    !part.is_empty()
-        && !part.ends_with(['.', ' '])
-        && !part.contains(['\\', ':', '<', '>', '"', '|', '?', '*'])
-        && !part.chars().any(|character| character.is_control() || is_reordering_mark(character))
-        && !part.as_bytes().windows(2).any(|pair| pair[0] == b'~' && pair[1].is_ascii_digit())
-        && !part.trim_end_matches(['.', ' ']).eq_ignore_ascii_case(".git")
-        && !is_device(part)
-}
-
-/// Whether the name `part` opens a Windows device, whatever its extension: `CON`, `PRN`, `AUX`, `NUL`, `CONIN$`,
-/// `CONOUT$`, or `COM` or `LPT` and one digit, `0` to `9`, `¹`, `²` or `³`.
-fn is_device(part: &str) -> bool {
-    let stem = part.split('.').next().unwrap_or(part).trim_end_matches(' ').to_ascii_uppercase();
-    let numbered = |prefix: &str| {
-        stem.strip_prefix(prefix)
-            .is_some_and(|digit| matches!(digit, "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"))
-    };
-    matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$") || numbered("COM") || numbered("LPT")
-}
-
 /// The entries of the list member `data`; else why it is not a list.
 fn read_list(data: &mut impl Read) -> io::Result<Vec<Entry>> {
     let mut text = String::new();
@@ -650,13 +620,12 @@ mod tests {
 
     use tar::{EntryType, Header};
 
-    use super::{
-        Entry, LIST_NAME, MEMBER_LIMIT, Packer, extract_into, is_device, list_json, member_path, pack, pack_file, read_members, sent_limit, unpack,
-    };
+    use super::{Entry, LIST_NAME, MEMBER_LIMIT, Packer, extract_into, list_json, member_path, pack, pack_file, read_members, sent_limit, unpack};
     use crate::boxside::outputs::OUTPUTS_BUDGET;
     use crate::boxside::payload::escaped;
     use crate::outputs::glob::Globs;
     use crate::outputs::hash::sha256_of;
+    use crate::outputs::names::is_device;
     use crate::outputs::walk::{Found, Stamp, walk};
 
     /// The byte limit the cases unpack under, far above what any of them holds.

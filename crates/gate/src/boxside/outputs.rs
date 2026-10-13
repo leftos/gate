@@ -23,7 +23,7 @@ use crate::outputs::archive::pack;
 use crate::outputs::glob::Globs;
 use crate::outputs::hash::file_sha256;
 use crate::outputs::manifest::{Listing, Manifest, select};
-use crate::outputs::walk::{in_context, walk};
+use crate::outputs::walk::{Found, in_context, walk, walk_with_refused};
 
 /// How long an outputs archive is kept in the output folder before a run with output globs removes it, as the wrapper's
 /// `$OutputArchiveHours` keeps it.
@@ -319,22 +319,26 @@ pub(super) fn listing(asked: &Asked<'_>, work: &Path) -> (Option<Listing>, Optio
 
 /// Packs the files under `asked`'s globs in `work` to bring back after a passing command ([`select`]), leaving out
 /// `skip`, the paths of the run's back commit: the line saying how many were packed and the archive's name, or
-/// `gate-remote-outputs: 0` with no archive written when none were. Else why the outputs are not brought back; an
-/// archive left half written is removed. The archive is made anew: a file or a link already at its name fails the pack
-/// and is left as it is. A file whose final path is not inside `work` fails the pack ([`pack`]). The archive is opened
-/// sharing reads only while it is packed, so another run's trim cannot remove it before it is whole.
+/// `gate-remote-outputs: 0` with no archive written when none were, and before it the line saying the files [`select`]
+/// would have packed but for a name this PC cannot take ([`skipped_line`]), when there were any. Else why the outputs
+/// are not brought back; an archive left half written is removed. The archive is made anew: a file or a link already
+/// at its name fails the pack and is left as it is. A file whose final path is not inside `work` fails the pack
+/// ([`pack`]). The archive is opened sharing reads only while it is packed, so another run's trim cannot remove it
+/// before it is whole.
 pub(super) fn bring_back(
     asked: &Asked<'_>,
     manifest: &Result<Manifest, String>,
     listing: Option<&Listing>,
     work: &Path,
     skip: &[String],
-) -> Result<String, String> {
+) -> Result<(Option<String>, String), String> {
     let manifest = manifest.as_ref().map_err(Clone::clone)?;
-    let found = walk(work, &asked.globs).map_err(|error| format!("the outputs could not be listed: {error}"))?;
-    let chosen = select(&found, manifest, listing, skip, |file| file_sha256(&file.full)).map_err(|error| error.to_string())?;
+    let walked = walk_with_refused(work, &asked.globs).map_err(|error| format!("the outputs could not be listed: {error}"))?;
+    let hash = |file: &Found| file_sha256(&file.full);
+    let skipped = skipped_line(&select(&walked.refused, manifest, listing, skip, hash).map_err(|error| error.to_string())?);
+    let chosen = select(&walked.found, manifest, listing, skip, hash).map_err(|error| error.to_string())?;
     if chosen.is_empty() {
-        return Ok(NOTHING_PACKED.to_owned());
+        return Ok((skipped, NOTHING_PACKED.to_owned()));
     }
     fs::create_dir_all(asked.folder).map_err(|error| format!("cannot make the output folder {}: {error}", asked.folder))?;
     let path = Path::new(asked.folder).join(&asked.archive);
@@ -345,13 +349,30 @@ pub(super) fn bring_back(
         .open(&path)
         .map_err(|error| format!("cannot create {}: {error}", path.display()))?;
     match pack(BufWriter::new(file), work, &chosen) {
-        Ok(packed) => Ok(format!("gate-remote-outputs: {} {}", packed.entries.len(), asked.archive)),
+        Ok(packed) => Ok((skipped, format!("gate-remote-outputs: {} {}", packed.entries.len(), asked.archive))),
         Err(error) => match fs::remove_file(&path) {
             Ok(()) => Err(error.to_string()),
             Err(removal) => Err(format!("{error}; and {} could not be removed: {removal}", path.display())),
         },
     }
 }
+
+/// The line saying the run's outputs leave out the files `skipped` for names this PC cannot take, naming the first, cut
+/// to [`NAMED_PATH_LIMIT`] bytes, and marking that more follow; `None` when there are none.
+fn skipped_line(skipped: &[&Found]) -> Option<String> {
+    let first = skipped.first()?;
+    let named = &first.path[..first.path.floor_char_boundary(NAMED_PATH_LIMIT)];
+    let cut = if named.len() < first.path.len() { "\u{2026}" } else { "" };
+    let more = if skipped.len() > 1 { ", \u{2026}" } else { "" };
+    Some(format!(
+        "gate: remote outputs: skipped {} file(s) with names this PC cannot take: {}{cut}{more}",
+        skipped.len(),
+        escaped(named)
+    ))
+}
+
+/// The most bytes of a path [`skipped_line`] names, which keeps the line well under the PC's line cap.
+const NAMED_PATH_LIMIT: usize = 1024;
 
 /// The line saying a passing run's outputs are not brought back, for `reason`.
 pub(super) fn not_brought_back(reason: &str) -> String {
@@ -441,7 +462,8 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{Duration, SystemTime};
 
-    use super::{ARCHIVE_AGE, Asked, GONE_BEFORE_SENT, MANIFEST_LIMIT, prune, read_manifest, remove_archive, remove_if_old, trim};
+    use super::{ARCHIVE_AGE, Asked, GONE_BEFORE_SENT, MANIFEST_LIMIT, prune, read_manifest, remove_archive, remove_if_old, skipped_line, trim};
+    use crate::outputs::walk::{Found, Stamp};
 
     /// The name of an outputs archive of the work folder `k`, its nonce 32 copies of `digit`.
     fn archive(digit: char) -> String {
@@ -748,5 +770,41 @@ mod tests {
             "an archive another run removed counts as removed"
         );
         fs::remove_dir_all(&folder).expect("the scratch folder can be removed");
+    }
+
+    /// A refused file at the relative `path`.
+    fn refused(path: &str) -> Found {
+        Found {
+            path: path.to_owned(),
+            full: PathBuf::from(path),
+            stamp: Stamp { size: 1, modified: 1 },
+        }
+    }
+
+    #[test]
+    fn the_skipped_line_names_the_first_path_whole_when_it_is_short() {
+        let (first, second) = (refused("bin/m~10.txt"), refused("bin/report."));
+        assert_eq!(skipped_line(&[]), None);
+        assert_eq!(
+            skipped_line(&[&first]).as_deref(),
+            Some("gate: remote outputs: skipped 1 file(s) with names this PC cannot take: bin/m~10.txt")
+        );
+        assert_eq!(
+            skipped_line(&[&first, &second]).as_deref(),
+            Some("gate: remote outputs: skipped 2 file(s) with names this PC cannot take: bin/m~10.txt, \u{2026}")
+        );
+    }
+
+    #[test]
+    fn the_skipped_line_cuts_a_long_first_path_at_a_char_boundary_below_one_kib() {
+        let long = refused(&format!("a{}", "\u{e9}".repeat(600)));
+        let line = skipped_line(&[&long, &long]).expect("two files were skipped");
+        assert_eq!(
+            line,
+            format!(
+                "gate: remote outputs: skipped 2 file(s) with names this PC cannot take: a{}\u{2026}, \u{2026}",
+                "\u{e9}".repeat(511)
+            )
+        );
     }
 }
