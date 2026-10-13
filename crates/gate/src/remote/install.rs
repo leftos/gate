@@ -2,12 +2,13 @@
 //! every member's path and hash; each member then checked against the run's output globs, against the PC's manifest
 //! (a file it held must still have its size and last write, one it lacked must still be missing), and one that counts as
 //! tracked (its git index, a submodule or a nested repository holds it) unless a `--bring-tracked` glob matches it, or
-//! whose PC file is in use or read-only, skipped and said;
-//! the box's work folder rewritten to the worktree's in the files that record it; and each file, its last write clamped
-//! to this PC's clock in the stage and checked unchanged once more, moved into place. A complete install also keeps the
-//! hash of each file it put in place, at the stamp that file's handle reads after the move, in the worktree's hash
-//! cache, so the next run takes it instead of reading the file again. The success line says what came back; every end
-//! removes the archive and the stage this run made, and only a success that skipped nothing clears the pending marker.
+//! whose PC file is in use or read-only, or that records the box's work folder but is not text the install can rewrite,
+//! skipped and said; the box's work folder rewritten to the worktree's in the files that record it; and each file, its
+//! last write clamped to this PC's clock in the stage and checked unchanged once more, moved into place. A complete
+//! install also keeps the hash of each file it put in place, at the stamp that file's handle reads after the move, in
+//! the worktree's hash cache, so the next run takes it instead of reading the file again. The success line says what
+//! came back; every end removes the archive and the stage this run made, and the pending marker is cleared by a success
+//! whose skips a refetch would not clear, and by a refusal a refetch of the same archive would be refused the same way.
 
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
@@ -24,7 +25,7 @@ use super::client::{Attempt, End};
 use super::git::{Git, GitError};
 use super::outputs::{self, Archive, Polled};
 use crate::boxside::payload::{escaped, ordinal_upper};
-use crate::outputs::archive::{Entry, check_folder, unpack};
+use crate::outputs::archive::{Entry, UnpackError, check_folder, unpack};
 use crate::outputs::cache::{HashCache, file_time_now};
 use crate::outputs::glob::Globs;
 use crate::outputs::manifest::Manifest;
@@ -36,7 +37,14 @@ const TEST_HOST_MANIFEST: &str = "MvcTestingAppManifest.json";
 const COVERAGE_ROOTS: &str = ".msCoverageSourceRootsMapping_";
 /// The bytes a UTF-8 text file may start with to say it is UTF-8.
 const UTF8_BOM: &[u8] = b"\xEF\xBB\xBF";
-/// The largest file the install rewrites, 16 MiB: a larger one is refused before it is read.
+/// The bytes a UTF-16 text file starts with to say its body is 16-bit units in little-endian byte order.
+const UTF16_LE_BOM: &[u8] = b"\xFF\xFE";
+/// The bytes a UTF-16 text file starts with to say its body is 16-bit units in big-endian byte order.
+const UTF16_BE_BOM: &[u8] = b"\xFE\xFF";
+/// The bytes a UTF-32 text file starts with to say its body is 32-bit units in little-endian byte order, which would
+/// otherwise read as UTF-16 little-endian with a leading NUL unit: a file the install rewrites is never one.
+const UTF32_LE_BOM: &[u8] = b"\xFF\xFE\x00\x00";
+/// The largest file the install rewrites, 16 MiB: a larger one is skipped before it is read.
 const REWRITE_LIMIT: u64 = 16 * 1024 * 1024;
 /// The bytes in a megabyte, as the success line counts them.
 const MB: f64 = 1024.0 * 1024.0;
@@ -75,6 +83,15 @@ struct Moved {
     stamp: Option<Stamp>,
 }
 
+impl Installed {
+    /// Whether the install left the PC every output the box packed: false only for a skip that keeps the pending marker,
+    /// so a file the install cannot rewrite leaves an install whole, since a later run would skip it the same way and
+    /// the skip line says so each time. Every other end is incomplete.
+    fn complete(&self) -> bool {
+        self.skipped.iter().all(|(_, skip)| !skip.keeps_marker())
+    }
+}
+
 /// Why the install skipped a member, which then counts as not brought back.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Skip {
@@ -82,16 +99,40 @@ enum Skip {
     Tracked,
     /// The PC's file is in use or read-only ([`writable`]).
     InUse,
+    /// It records the box's work folder but is not text the install can rewrite ([`Unrewritable`]).
+    Unrewritable(Unrewritable),
 }
 
 impl Skip {
     /// The end of the line that says a member was skipped for this reason.
-    fn said(self) -> &'static str {
+    fn said(self) -> String {
         match self {
-            Skip::Tracked => "is tracked by git",
-            Skip::InUse => "is in use or read-only",
+            Skip::Tracked => "is tracked by git".to_owned(),
+            Skip::InUse => "is in use or read-only".to_owned(),
+            Skip::Unrewritable(Unrewritable::NotText) => "cannot be rewritten (it is not UTF-8 or UTF-16 with a byte order mark)".to_owned(),
+            Skip::Unrewritable(Unrewritable::TooLarge(bytes)) => format!("cannot be rewritten ({bytes} bytes, over 16 MiB)"),
         }
     }
+
+    /// Whether this skip keeps the pending marker and makes the install incomplete, so a later run asks for every output
+    /// again: a file git tracks, or one in use or read-only, differs from the PC's next run, while a file the install
+    /// cannot rewrite is the same on every run, so it needs no full send and does not stop an install counting whole.
+    fn keeps_marker(self) -> bool {
+        match self {
+            Skip::Tracked | Skip::InUse => true,
+            Skip::Unrewritable(_) => false,
+        }
+    }
+}
+
+/// Why a file that records the box's work folder is one the install cannot rewrite, and so is skipped rather than
+/// installed with the box's paths in it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Unrewritable {
+    /// It is not UTF-8, nor UTF-16 whose byte order mark names the order of its body.
+    NotText,
+    /// It is over [`REWRITE_LIMIT`] bytes, which the rewrite refuses before it is read.
+    TooLarge(u64),
 }
 
 /// Why an install did not complete.
@@ -100,7 +141,61 @@ enum Unmet {
     /// The console interrupt, once `done` of `total` files were moved; none when it came before the move.
     Interrupted { done: usize, total: usize },
     /// Why the outputs were not brought back.
-    Refused(String),
+    Refused(Refused),
+}
+
+/// Why an install refused to bring the outputs back, and whether a refetch of the same outputs would be refused the
+/// same way.
+#[derive(Debug, PartialEq, Eq)]
+struct Refused {
+    reason: String,
+    kind: Kind,
+}
+
+/// Whether a refusal would happen again for the same archive. The archive's own members and the run's globs decide one
+/// of the first kind, which leaves the pending marker cleared: a later run of the worktree would refetch everything only
+/// to refuse again, so it is left to send its normal manifest. Any other refusal keeps the marker, since the next fetch
+/// may succeed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Kind {
+    /// The archive's own entries and the globs decide it.
+    Deterministic,
+    /// Anything else: a refetch may clear it.
+    Transient,
+}
+
+impl Refused {
+    /// The refusal a refetch of the same outputs would be refused the same way.
+    fn deterministic(reason: impl Into<String>) -> Refused {
+        Refused {
+            reason: reason.into(),
+            kind: Kind::Deterministic,
+        }
+    }
+
+    /// The refusal of anything a refetch may clear.
+    fn transient(reason: impl Into<String>) -> Refused {
+        Refused {
+            reason: reason.into(),
+            kind: Kind::Transient,
+        }
+    }
+}
+
+/// The refusal of anything but the archive's own members and the run's globs ([`Refused::transient`]), in the [`Unmet`]
+/// it ends an install with.
+fn transient(reason: String) -> Unmet {
+    Unmet::Refused(Refused::transient(reason))
+}
+
+/// The refusal of an archive `detail` says the install could not read: one whose own members `members` reports the
+/// archive's reader refusing for what they are is refused for good, and any other fault may be cleared by a refetch.
+fn unpack_refused(detail: String, members: bool) -> Unmet {
+    if members {
+        Unmet::Refused(Refused::deterministic(detail))
+    } else {
+        transient(detail)
+    }
 }
 
 /// Why the move of the files stopped.
@@ -113,24 +208,28 @@ enum Unmoved {
 }
 
 /// The end of a passing run whose outputs archive `fetched` holds was fetched whole: installed, it says the success
-/// line and ends 0, clearing the pending marker unless it skipped a file git tracks or one in use or read-only, which it
-/// says ([`said`]).
-/// A refusal says why the outputs were not brought back and ends the run 1; a Ctrl+C ends it as an interrupt, saying how
-/// many files were installed when any were ([`ending`]). Every end removes the archive and the stage folder this run
-/// made, never one that was there before, saying a removal that fails; only a success that skipped nothing clears the
-/// marker, and only one keeps the hashes of the files it put in place ([`cached`]), which no other end does.
-/// With the end, whether the install was complete: a success that skipped nothing.
+/// line and ends 0, clearing the pending marker unless it skipped a file that keeps it ([`Skip::keeps_marker`]): one git
+/// tracks, one in use or read-only, which it says ([`said`]).
+/// A refusal says why the outputs were not brought back and ends the run 1, clearing the marker when a refetch of the
+/// same archive would be refused the same way ([`Kind`]); a Ctrl+C ends it as an interrupt, saying how many files were
+/// installed when any were ([`ending`]). Every end removes the archive and the stage folder this run made, never one
+/// that was there before, saying a removal that fails; only a success that skipped nothing keeps the hashes of the files
+/// it put in place ([`cached`]), which no other end does.
+/// With the end, whether the install was complete ([`Installed::complete`]): a success whose skips are all ones a
+/// refetch of the same outputs would clear, and so the one whose files the hash cache may keep.
 pub(super) fn installed(attempt: &mut Attempt<'_, '_>, fetched: &Fetched<'_>) -> (End, bool) {
     let staged = Cell::new(false);
-    let (end, lines, complete) = match install(attempt, fetched, &staged) {
+    let (end, lines, complete, clear) = match install(attempt, fetched, &staged) {
         Ok((done, started)) => {
             cached(&v1::outputs_hashes_path(attempt.call.state_dir, attempt.call.key), &done, started);
             let lines = said(&done, fetched.started.elapsed().as_secs_f64());
-            (End::Status(0), lines, done.skipped.is_empty())
+            let complete = done.complete();
+            (End::Status(0), lines, complete, complete)
         }
         Err(unmet) => {
+            let clear = matches!(&unmet, Unmet::Refused(refused) if refused.kind == Kind::Deterministic);
             let (end, line) = ending(unmet);
-            (end, line.into_iter().collect(), false)
+            (end, line.into_iter().collect(), false, clear)
         }
     };
     for line in lines {
@@ -143,7 +242,7 @@ pub(super) fn installed(attempt: &mut Attempt<'_, '_>, fetched: &Fetched<'_>) ->
         attempt.say(format!("gate: cannot remove the outputs stage {}: {error}", fetched.stage.display()));
     }
     outputs::removed(attempt, fetched.archive, outputs::FETCHED);
-    if complete && let Err(why) = outputs::clear_pending(fetched.marker) {
+    if clear && let Err(why) = outputs::clear_pending(fetched.marker) {
         attempt.say(format!("gate: {why}"));
     }
     (end, complete)
@@ -158,7 +257,7 @@ fn ending(unmet: Unmet) -> (End, Option<String>) {
             let reason = format!("{done} of {total} files were installed before the interrupt");
             (End::Interrupted, Some(outputs::not_brought_back(&reason)))
         }
-        Unmet::Refused(reason) => (End::Status(1), Some(outputs::not_brought_back(&reason))),
+        Unmet::Refused(refused) => (End::Status(1), Some(outputs::not_brought_back(&refused.reason))),
     }
 }
 
@@ -170,9 +269,9 @@ fn install(attempt: &Attempt<'_, '_>, fetched: &Fetched<'_>, staged: &Cell<bool>
     let name = path
         .file_name()
         .map_or_else(|| path.display().to_string(), |name| name.to_string_lossy().into_owned());
-    let unopened = |error: &io::Error| Unmet::Refused(format!("the outputs archive {name} cannot be opened: {error}"));
-    let file = File::open(path).map_err(|error| unopened(&error))?;
-    let compressed = file.metadata().map_err(|error| unopened(&error))?.len();
+    let unopened = |error: &UnpackError| unpack_refused(format!("the outputs archive {name} cannot be opened: {error}"), error.members());
+    let file = File::open(path).map_err(|error| unopened(&error.into()))?;
+    let compressed = file.metadata().map_err(|error| unopened(&error.into()))?.len();
     let stopped = Cell::new(false);
     let unpacking = unpacked(file, &fetched.stage, attempt.outputs_budget, &|| attempt.go_on().is_ok(), &stopped);
     staged.set(stage_made(&unpacking));
@@ -183,15 +282,17 @@ fn install(attempt: &Attempt<'_, '_>, fetched: &Fetched<'_>, staged: &Cell<bool>
             unopened(&error)
         }
     })?;
-    let root =
-        std::path::absolute(attempt.call.root).map_err(|error| Unmet::Refused(in_context(Path::new(attempt.call.root), &error).to_string()))?;
-    let globs = Globs::new(fetched.globs).map_err(Unmet::Refused)?;
+    let root = std::path::absolute(attempt.call.root).map_err(|error| transient(in_context(Path::new(attempt.call.root), &error).to_string()))?;
+    let globs = Globs::new(fetched.globs).map_err(transient)?;
     let in_use = checked(&root, &entries, &globs, fetched.manifest).map_err(Unmet::Refused)?;
-    let skipped = skips(attempt, &root, &entries, &in_use)?;
+    let mut skipped = skips(attempt, &root, &entries, &in_use)?;
     let skipped_paths: HashSet<&str> = skipped.iter().map(|(path, _)| path.as_str()).collect();
     let entries: Vec<Entry> = entries.into_iter().filter(|entry| !skipped_paths.contains(entry.path.as_str())).collect();
     let pc_root = root.display().to_string();
-    rewritten(&fetched.stage, &entries, fetched.box_work, &pc_root).map_err(Unmet::Refused)?;
+    let unrewritable = rewritten(&fetched.stage, &entries, fetched.box_work, &pc_root).map_err(Unmet::Refused)?;
+    let unrewritten: HashSet<&str> = unrewritable.iter().map(|(path, _)| path.as_str()).collect();
+    let entries: Vec<Entry> = entries.into_iter().filter(|entry| !unrewritten.contains(entry.path.as_str())).collect();
+    skipped.extend(unrewritable);
     let raise = attempt.call.interrupt.filter(|_| attempt.raises_at(INSTALL));
     let total = entries.len();
     // The file time the moves begin at, from which the racy rule keeps the hash of a file written long enough before.
@@ -206,7 +307,7 @@ fn install(attempt: &Attempt<'_, '_>, fetched: &Fetched<'_>, staged: &Cell<bool>
     })
     .map_err(|unmoved| match unmoved {
         Unmoved::Interrupted { done } => Unmet::Interrupted { done, total },
-        Unmoved::Failed(reason) => Unmet::Refused(reason),
+        Unmoved::Failed(reason) => transient(reason),
     })?;
     Ok((
         Installed {
@@ -228,10 +329,10 @@ fn skips(attempt: &Attempt<'_, '_>, root: &Path, entries: &[Entry], in_use: &[St
     if entries.is_empty() {
         return Ok(Vec::new());
     }
-    let bring = Globs::bring_tracked(attempt.call.bring_tracked).map_err(Unmet::Refused)?;
-    let git = Git::find(Path::new(attempt.call.root)).map_err(Unmet::Refused)?;
+    let bring = Globs::bring_tracked(attempt.call.bring_tracked).map_err(transient)?;
+    let git = Git::find(Path::new(attempt.call.root)).map_err(transient)?;
     let listing = attempt.git_bytes(&git, &["ls-files", "-z", "-s"]).map_err(unmet_of)?;
-    let index = Index::of(&listing).map_err(Unmet::Refused)?;
+    let index = Index::of(&listing).map_err(transient)?;
     let in_use: HashSet<&str> = in_use.iter().map(String::as_str).collect();
     Ok(reasons(entries, &tracked(&index, root, entries, &bring), &in_use))
 }
@@ -241,7 +342,7 @@ fn skips(attempt: &Attempt<'_, '_>, root: &Path, entries: &[Entry], in_use: &[St
 fn unmet_of(error: GitError) -> Unmet {
     match error {
         GitError::Interrupted => Unmet::Interrupted { done: 0, total: 0 },
-        GitError::Failed(why) | GitError::OverCap(why) => Unmet::Refused(why),
+        GitError::Failed(why) | GitError::OverCap(why) => transient(why),
     }
 }
 
@@ -415,13 +516,13 @@ fn one_decimal(value: f64) -> String {
 
 /// Whether an unpack into the stage folder that ended as `unpacking` made the folder, which is then this run's to
 /// remove: not when the folder was there before, which the unpack refuses and leaves as it is.
-fn stage_made(unpacking: &io::Result<Vec<Entry>>) -> bool {
-    !matches!(unpacking, Err(error) if error.kind() == io::ErrorKind::AlreadyExists)
+fn stage_made(unpacking: &Result<Vec<Entry>, UnpackError>) -> bool {
+    !matches!(unpacking, Err(error) if error.is_fault(io::ErrorKind::AlreadyExists))
 }
 
 /// Unpacks the archive `source` into the folder `stage`, which must not exist yet, asking `go_on` before each read
 /// and marking `stopped` once it says no, to at most `limit` bytes; the entries, else why not.
-fn unpacked(source: impl Read, stage: &Path, limit: u64, go_on: &dyn Fn() -> bool, stopped: &Cell<bool>) -> io::Result<Vec<Entry>> {
+fn unpacked(source: impl Read, stage: &Path, limit: u64, go_on: &dyn Fn() -> bool, stopped: &Cell<bool>) -> Result<Vec<Entry>, UnpackError> {
     unpack(
         Polled {
             inner: source,
@@ -439,11 +540,15 @@ fn below(root: &Path, path: &str) -> PathBuf {
 }
 
 /// Whether each of `entries`, to be installed below the worktree `root`, may be: every one under `globs`, then every
-/// one unchanged since `manifest`; else the first refusal. The paths, in order, of those whose PC file is not
-/// replaceable ([`writable`]), which the install skips.
-fn checked(root: &Path, entries: &[Entry], globs: &Globs, manifest: &Manifest) -> Result<Vec<String>, String> {
+/// one unchanged since `manifest`; else the first refusal. The one kind a refetch of the same archive would be refused
+/// for again is a member outside the globs ([`Refused::deterministic`]); the PC's own worktree decides the rest. The
+/// paths, in order, of those whose PC file is not replaceable ([`writable`]), which the install skips.
+fn checked(root: &Path, entries: &[Entry], globs: &Globs, manifest: &Manifest) -> Result<Vec<String>, Refused> {
     if let Some(outside) = entries.iter().find(|entry| !globs.matches(&entry.path)) {
-        return Err(format!("the archive member {} is not under the output globs", outside.path));
+        return Err(Refused::deterministic(format!(
+            "the archive member {} is not under the output globs",
+            outside.path
+        )));
     }
     for entry in entries {
         unchanged(root, entry, manifest)?;
@@ -457,18 +562,20 @@ fn checked(root: &Path, entries: &[Entry], globs: &Globs, manifest: &Manifest) -
 
 /// Whether the PC's file of `entry` below `root` is as `manifest` holds it: one it holds still has its size and last
 /// write, one it lacks is still missing; else the refusal, which names a folder in the file's place as not a file.
-fn unchanged(root: &Path, entry: &Entry, manifest: &Manifest) -> Result<(), String> {
+/// Every one of these depends on the PC's own worktree, whose next run may find it otherwise, so each is refused as one
+/// a refetch may clear ([`Refused::transient`]).
+fn unchanged(root: &Path, entry: &Entry, manifest: &Manifest) -> Result<(), Refused> {
     let target = below(root, &entry.path);
     let now = match fs::metadata(&target) {
-        Ok(metadata) if !metadata.is_file() => return Err(format!("{} is not a file", entry.path)),
+        Ok(metadata) if !metadata.is_file() => return Err(Refused::transient(format!("{} is not a file", entry.path))),
         Ok(metadata) => Some(Stamp::of(&metadata)),
         Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-        Err(error) => return Err(in_context(&target, &error).to_string()),
+        Err(error) => return Err(Refused::transient(in_context(&target, &error).to_string())),
     };
     match (manifest.get(&entry.path), now) {
         (Some(held), Some(stamp)) if held.stamp == stamp => Ok(()),
         (None, None) => Ok(()),
-        _ => Err(format!("{} changed during the run", entry.path)),
+        _ => Err(Refused::transient(format!("{} changed during the run", entry.path))),
     }
 }
 
@@ -481,14 +588,20 @@ fn writable(root: &Path, entry: &Entry) -> bool {
 }
 
 /// Rewrites `box_work` to `pc_root` in each of the staged `entries` below `stage` that records it ([`records_a_root`]),
-/// as [`rewrite_file`] does; else why one cannot be.
-fn rewritten(stage: &Path, entries: &[Entry], box_work: &str, pc_root: &str) -> Result<(), String> {
+/// as [`rewrite_file`] does: the paths, in order, of those that are not text the install can rewrite, each with its
+/// [`Skip`], since one installed as it stands would keep the box's paths; else why one cannot be read or written.
+fn rewritten(stage: &Path, entries: &[Entry], box_work: &str, pc_root: &str) -> Result<Vec<(String, Skip)>, Refused> {
     let from = box_work.trim_end_matches('\\');
     let to = pc_root.trim_end_matches('\\');
+    let mut skipped = Vec::new();
     for entry in entries.iter().filter(|entry| records_a_root(&entry.path)) {
-        rewrite_file(&below(stage, &entry.path), &entry.path, from, to)?;
+        match rewrite_file(&below(stage, &entry.path), &entry.path, from, to) {
+            Ok(()) => {}
+            Err(CannotRewrite::Skipped(why)) => skipped.push((entry.path.clone(), Skip::Unrewritable(why))),
+            Err(CannotRewrite::Failed(refused)) => return Err(refused),
+        }
     }
-    Ok(())
+    Ok(skipped)
 }
 
 /// Whether the file at the `/`-separated `path` records the folder it was built in: its name, in any case, is the test
@@ -501,39 +614,133 @@ fn records_a_root(path: &str) -> bool {
             .is_some_and(|start| start.eq_ignore_ascii_case(COVERAGE_ROOTS))
 }
 
-/// Rewrites `from` to `to` in the UTF-8 text file at `path`, shown as `shown`: its JSON-escaped form (each `\` doubled)
-/// first, then its raw form, each without regard to case as .NET's `OrdinalIgnoreCase` compares. A file whose text
-/// changes is written back with the byte order mark it had, and its last write kept. Else the refusal: a file larger
-/// than [`REWRITE_LIMIT`], refused before it is read, one that is not UTF-8 after its byte order mark, or why it cannot
-/// be read or written.
-fn rewrite_file(path: &Path, shown: &str, from: &str, to: &str) -> Result<(), String> {
-    let cannot = |error: io::Error| format!("cannot rewrite {shown}: {error}");
+/// Rewrites `from` to `to` in the text file at `path`, shown as `shown`: its JSON-escaped form (each `\` doubled) first,
+/// then its raw form, each without regard to case as .NET's `OrdinalIgnoreCase` compares. The file is read in the
+/// encoding its byte order mark names ([`Encoding`]): UTF-8, or UTF-16 in the byte order its mark gives, read as 16-bit
+/// units. A file whose text changes is written back in the same encoding, with the same byte order mark, and its last
+/// write kept. Else the skip ([`CannotRewrite::Skipped`]): a file over [`REWRITE_LIMIT`] bytes, refused before it is
+/// read, or one whose body is not text in the encoding its mark names. A file that cannot be read or written is refused.
+fn rewrite_file(path: &Path, shown: &str, from: &str, to: &str) -> Result<(), CannotRewrite> {
+    let cannot = |error: io::Error| CannotRewrite::Failed(Refused::transient(format!("cannot rewrite {shown}: {error}")));
     let mut file = File::open(path).map_err(cannot)?;
     let metadata = file.metadata().map_err(cannot)?;
     if metadata.len() > REWRITE_LIMIT {
-        return Err(format!("{shown} is too large to rewrite ({} bytes, over 16 MiB)", metadata.len()));
+        return Err(CannotRewrite::Skipped(Unrewritable::TooLarge(metadata.len())));
     }
     let modified = metadata.modified().map_err(cannot)?;
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes).map_err(cannot)?;
     drop(file);
-    let (bom, body) = match bytes.strip_prefix(UTF8_BOM) {
-        Some(body) => (UTF8_BOM, body),
-        None => (&[][..], &bytes[..]),
-    };
-    // Which byte is not UTF-8 is no use to the reader; that the file is not is the one reason said.
-    let text = std::str::from_utf8(body).map_err(|_| format!("cannot rewrite {shown}: it is not UTF-8"))?;
-    let escaped = replaced(text, &from.replace('\\', r"\\"), &to.replace('\\', r"\\"));
+    // Which byte is not text in the encoding the mark names is no use to the reader; that the file is not is the one
+    // reason said.
+    let (encoding, text) = decoded(&bytes).ok_or(CannotRewrite::Skipped(Unrewritable::NotText))?;
+    let escaped = replaced(&text, &from.replace('\\', r"\\"), &to.replace('\\', r"\\"));
     let new = replaced(&escaped, from, to);
     if new == text {
         return Ok(());
     }
-    fs::write(path, [bom, new.as_bytes()].concat()).map_err(cannot)?;
+    fs::write(path, encoded(&new, encoding)).map_err(cannot)?;
     OpenOptions::new()
         .write(true)
         .open(path)
         .and_then(|file| file.set_modified(modified))
         .map_err(cannot)
+}
+
+/// Why a file the install rewrites was not: either its member is skipped, or the install is refused.
+#[derive(Debug, PartialEq, Eq)]
+enum CannotRewrite {
+    /// The file is not one the install rewrites, or is over its limit: its member is skipped ([`Skip::Unrewritable`]).
+    Skipped(Unrewritable),
+    /// Why the file could not be read or written: the install is refused, as any other I/O failure.
+    Failed(Refused),
+}
+
+/// How a file the install rewrites is encoded, as its byte order mark says: UTF-8 with or without its mark, or UTF-16
+/// whose mark names the byte order of its body. A file with no byte order mark is read as UTF-8; no other encoding is
+/// guessed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Encoding {
+    /// UTF-8, with no byte order mark.
+    Utf8,
+    /// UTF-8 with its byte order mark.
+    Utf8Bom,
+    /// UTF-16 in the byte order, whose byte order mark the file has.
+    Utf16(Order),
+}
+
+/// The byte order a UTF-16 body's 16-bit units are in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Order {
+    /// Little-endian.
+    Little,
+    /// Big-endian.
+    Big,
+}
+
+/// The encoding `bytes` is in and the text it holds: UTF-8 when it starts with the UTF-8 mark or with none, UTF-16 in
+/// the byte order its mark names. `None` for a body that is not text in the encoding its mark names: not UTF-8, a
+/// UTF-16 body of an odd length, or one holding an unpaired surrogate, and for the mark of a UTF-32 little-endian file,
+/// which this never reads as UTF-16.
+fn decoded(bytes: &[u8]) -> Option<(Encoding, String)> {
+    if let Some(body) = bytes.strip_prefix(UTF8_BOM) {
+        return std::str::from_utf8(body).ok().map(|text| (Encoding::Utf8Bom, text.to_owned()));
+    }
+    if bytes.starts_with(UTF32_LE_BOM) {
+        return None;
+    }
+    if let Some(body) = bytes.strip_prefix(UTF16_LE_BOM) {
+        return from_utf16(body, Order::Little).map(|text| (Encoding::Utf16(Order::Little), text));
+    }
+    if let Some(body) = bytes.strip_prefix(UTF16_BE_BOM) {
+        return from_utf16(body, Order::Big).map(|text| (Encoding::Utf16(Order::Big), text));
+    }
+    std::str::from_utf8(bytes).ok().map(|text| (Encoding::Utf8, text.to_owned()))
+}
+
+/// The text the UTF-16 body `body` holds, each pair of bytes a 16-bit unit in `order`'s byte order; `None` for an odd
+/// body, or one holding an unpaired surrogate.
+fn from_utf16(body: &[u8], order: Order) -> Option<String> {
+    let (pairs, rest) = body.as_chunks::<2>();
+    if !rest.is_empty() {
+        return None;
+    }
+    let units: Vec<u16> = pairs.iter().map(|pair| bytes_to_unit(*pair, order)).collect();
+    String::from_utf16(&units).ok()
+}
+
+/// The 16-bit unit the two bytes `pair` hold, in `order`'s byte order.
+fn bytes_to_unit(pair: [u8; 2], order: Order) -> u16 {
+    match order {
+        Order::Little => u16::from_le_bytes(pair),
+        Order::Big => u16::from_be_bytes(pair),
+    }
+}
+
+/// The two bytes `unit` is written as, in `order`'s byte order.
+fn unit_to_bytes(unit: u16, order: Order) -> [u8; 2] {
+    match order {
+        Order::Little => unit.to_le_bytes(),
+        Order::Big => unit.to_be_bytes(),
+    }
+}
+
+/// `text` in `encoding`, the byte order mark it had written before it.
+fn encoded(text: &str, encoding: Encoding) -> Vec<u8> {
+    match encoding {
+        Encoding::Utf8 => text.as_bytes().to_vec(),
+        Encoding::Utf8Bom => [UTF8_BOM, text.as_bytes()].concat(),
+        Encoding::Utf16(order) => {
+            let mut bytes = match order {
+                Order::Little => UTF16_LE_BOM.to_vec(),
+                Order::Big => UTF16_BE_BOM.to_vec(),
+            };
+            for unit in text.encode_utf16() {
+                bytes.extend_from_slice(&unit_to_bytes(unit, order));
+            }
+            bytes
+        }
+    }
 }
 
 /// `text` with each run of characters equal to `from`, without regard to case, replaced by `to`.
@@ -601,7 +808,9 @@ fn move_one(stage: &Path, root: &Path, entry: &Entry, manifest: &Manifest, now: 
         // Its attributes alone: a handle open on the staged file, sharing its deletion, then neither refuses nor is moved.
         OpenOptions::new().access_mode(FILE_WRITE_ATTRIBUTES).open(&source)?.set_modified(now)?;
     }
-    unchanged(root, entry, manifest).map_err(io::Error::other)?;
+    // A file refused here was checked before the moves; one that changed in between is the reason said, of the kind a
+    // refetch may clear ([`Refused::transient`]).
+    unchanged(root, entry, manifest).map_err(|refused| io::Error::other(refused.reason))?;
     // Its attributes alone, every sharing given: the handle neither refuses the move nor any other opener.
     let handle = OpenOptions::new()
         .access_mode(FILE_READ_ATTRIBUTES)
@@ -615,13 +824,14 @@ fn move_one(stage: &Path, root: &Path, entry: &Entry, manifest: &Manifest, now: 
 /// Writes the hash cache at `path` for the files an install put in place: an entry for each of `installed.moved`, at
 /// the stamp its handle read after the move and the hash [`unpack`] verified, kept against `started`, the file time the
 /// moves began, so the next run reads no file whose size and last write still match. Nothing is written when the install
-/// skipped a file ([`Skip`]): only an archive installed whole is one whose files the run after it may take as the PC's,
-/// a partial one costing the next run a rehash. A file the install rewrote ([`records_a_root`]) is left out, its bytes
+/// is not complete ([`Installed::complete`]): only an archive whose skips a later run repeats none of is one whose files
+/// the run after it may take as the PC's, an incomplete one costing the next run a rehash. A file the install rewrote
+/// ([`records_a_root`]) is left out, its bytes
 /// no longer the hash's, and so is one whose stamp could not be read after its move. The cache the file at `path` holds
 /// is read first, so entries another run saved meanwhile are kept; one missing or corrupt starts empty. The cache is
 /// saved only when it kept at least one entry.
 fn cached(path: &Path, installed: &Installed, started: u64) {
-    if !installed.skipped.is_empty() {
+    if !installed.complete() {
         return;
     }
     let mut cache = HashCache::load(path).unwrap_or_default();
@@ -655,8 +865,8 @@ mod tests {
     use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_DELETE;
 
     use super::{
-        Index, Installed, Moved, Skip, Unmet, Unmoved, cached, checked, ending, moved, reasons, rewritten, said, stage_made, success_line, tracked,
-        unmet_of, unpacked,
+        Index, Installed, Moved, Refused, Skip, Unmet, Unmoved, Unrewritable, cached, checked, ending, moved, reasons, rewritten, said, stage_made,
+        success_line, tracked, unmet_of, unpacked,
     };
     use crate::boxside::outputs::OUTPUTS_BUDGET;
     use crate::outputs::archive::{Entry, pack};
@@ -722,13 +932,35 @@ mod tests {
         Globs::new(&["**/bin/**".to_owned()]).expect("the globs can be matched")
     }
 
+    /// `text` as UTF-16 little-endian bytes, the byte order mark first.
+    fn utf16_le(text: &str) -> Vec<u8> {
+        let mut bytes = b"\xFF\xFE".to_vec();
+        for unit in text.encode_utf16() {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        bytes
+    }
+
+    /// `text` as UTF-16 big-endian bytes, the byte order mark first.
+    fn utf16_be(text: &str) -> Vec<u8> {
+        let mut bytes = b"\xFE\xFF".to_vec();
+        for unit in text.encode_utf16() {
+            bytes.extend_from_slice(&unit.to_be_bytes());
+        }
+        bytes
+    }
+
     #[test]
     fn a_member_outside_the_globs_or_under_an_excluded_folder_is_refused() {
         let root = scratch("globs");
         let manifest = Manifest::default();
         for path in ["obj/a.dll", "bin/.tmp/a.dll", ".git/bin/a", "src/bin/TestResults/a.trx"] {
             let refused = checked(&root, &[entry("bin/ok.dll"), entry(path)], &bin_globs(), &manifest);
-            assert_eq!(refused, Err(format!("the archive member {path} is not under the output globs")), "{path}");
+            assert_eq!(
+                refused,
+                Err(Refused::deterministic(format!("the archive member {path} is not under the output globs"))),
+                "{path}"
+            );
         }
         assert_eq!(checked(&root, &[entry("src/bin/a.dll")], &bin_globs(), &manifest), Ok(Vec::new()));
     }
@@ -750,11 +982,11 @@ mod tests {
 
         for path in ["bin/size.dll", "bin/time.dll", "bin/new.dll"] {
             let refused = checked(&root, &[entry(path)], &bin_globs(), &manifest);
-            assert_eq!(refused, Err(format!("{path} changed during the run")), "{path}");
+            assert_eq!(refused, Err(Refused::transient(format!("{path} changed during the run"))), "{path}");
         }
         fs::create_dir_all(root.join("bin").join("folder.dll")).expect("a folder in a file's place");
         let folder = checked(&root, &[entry("bin/folder.dll")], &bin_globs(), &manifest);
-        assert_eq!(folder, Err("bin/folder.dll is not a file".to_owned()));
+        assert_eq!(folder, Err(Refused::transient("bin/folder.dll is not a file".to_owned())));
         assert_eq!(
             checked(&root, &[entry("bin/same.dll"), entry("bin/absent.dll")], &bin_globs(), &manifest),
             Ok(Vec::new())
@@ -802,7 +1034,7 @@ mod tests {
             entry("bin/app.deps.json"),
         ];
 
-        assert_eq!(rewritten(&stage, &entries, BOX_WORK, PC_ROOT), Ok(()));
+        assert_eq!(rewritten(&stage, &entries, BOX_WORK, PC_ROOT), Ok(Vec::new()));
 
         let pc_escaped = PC_ROOT.replace('\\', r"\\");
         let mut expected = b"\xEF\xBB\xBF".to_vec();
@@ -826,7 +1058,66 @@ mod tests {
     }
 
     #[test]
-    fn a_file_to_rewrite_over_16_mib_is_refused_and_one_of_16_mib_rewritten() {
+    fn a_utf16_file_to_rewrite_is_rewritten_in_its_own_byte_order_with_its_bom() {
+        for (order, encode) in [("LE", utf16_le as fn(&str) -> Vec<u8>), ("BE", utf16_be)] {
+            let stage = scratch(&format!("rewrite-utf16-{}", order.to_lowercase()));
+            let recorded = format!("{BOX_WORK}\\src;{BOX_WORK}\\tests\n");
+            let full = put(&stage, "bin/.msCoverageSourceRootsMapping_App", &encode(&recorded));
+            let old = SystemTime::now() - Duration::from_hours(2);
+            File::options()
+                .write(true)
+                .open(&full)
+                .and_then(|file| file.set_modified(old))
+                .expect("the last write can be set");
+            let entries = [entry("bin/.msCoverageSourceRootsMapping_App")];
+
+            assert_eq!(rewritten(&stage, &entries, BOX_WORK, PC_ROOT), Ok(Vec::new()), "{order}");
+
+            let expected = encode(&format!("{PC_ROOT}\\src;{PC_ROOT}\\tests\n"));
+            assert_eq!(fs::read(&full).expect("the file is there"), expected, "UTF-16 {order}, its BOM kept");
+            let modified = fs::metadata(&full).and_then(|metadata| metadata.modified()).expect("a last write");
+            assert_eq!(modified, old, "{order} keeps its last write");
+        }
+    }
+
+    /// Asserts that the coverage mapping of `bytes`, in a stage of its own named `name`, is skipped as text the install
+    /// cannot rewrite, and so is not installed with the box's paths in it.
+    fn assert_not_text(name: &str, bytes: &[u8]) {
+        let stage = scratch(name);
+        put(&stage, "bin/.msCoverageSourceRootsMapping_App", bytes);
+
+        assert_eq!(
+            rewritten(&stage, &[entry("bin/.msCoverageSourceRootsMapping_App")], BOX_WORK, PC_ROOT),
+            Ok(vec![(
+                "bin/.msCoverageSourceRootsMapping_App".to_owned(),
+                Skip::Unrewritable(Unrewritable::NotText)
+            )])
+        );
+    }
+
+    #[test]
+    fn a_file_to_rewrite_that_is_not_text_is_skipped() {
+        assert_not_text("rewrite-not-text", b"\xEF\xBB\xBF\xFF\xFE");
+    }
+
+    #[test]
+    fn a_utf16_file_of_odd_length_cannot_be_rewritten_and_is_skipped() {
+        assert_not_text("rewrite-utf16-odd", b"\xFF\xFEa");
+    }
+
+    #[test]
+    fn a_utf16_file_with_an_unpaired_surrogate_cannot_be_rewritten_and_is_skipped() {
+        assert_not_text("rewrite-utf16-surrogate", b"\xFF\xFE\x00\xD8");
+    }
+
+    #[test]
+    fn a_utf32_le_file_cannot_be_rewritten_and_is_skipped() {
+        // `FF FE 00 00` then `A` as a 32-bit little-endian unit: the mark of a UTF-32 LE file, never read as UTF-16 LE.
+        assert_not_text("rewrite-utf32-le", b"\xFF\xFE\x00\x00A\x00\x00\x00");
+    }
+
+    #[test]
+    fn a_file_to_rewrite_over_16_mib_is_skipped_and_one_of_16_mib_rewritten() {
         let stage = scratch("rewrite-large");
         let full = put(&stage, "bin/MvcTestingAppManifest.json", b"");
         let entries = [entry("bin/MvcTestingAppManifest.json")];
@@ -841,21 +1132,57 @@ mod tests {
         sized(16 * 1024 * 1024 + 1);
         assert_eq!(
             rewritten(&stage, &entries, BOX_WORK, PC_ROOT),
-            Err("bin/MvcTestingAppManifest.json is too large to rewrite (16777217 bytes, over 16 MiB)".to_owned())
+            Ok(vec![(
+                "bin/MvcTestingAppManifest.json".to_owned(),
+                Skip::Unrewritable(Unrewritable::TooLarge(16 * 1024 * 1024 + 1))
+            )])
         );
         sized(16 * 1024 * 1024);
-        assert_eq!(rewritten(&stage, &entries, BOX_WORK, PC_ROOT), Ok(()), "16 MiB is not over");
+        assert_eq!(rewritten(&stage, &entries, BOX_WORK, PC_ROOT), Ok(Vec::new()), "16 MiB is not over");
     }
 
     #[test]
-    fn a_file_to_rewrite_that_is_not_utf8_is_refused() {
-        let stage = scratch("rewrite-not-utf8");
-        put(&stage, "bin/.msCoverageSourceRootsMapping_App", b"\xEF\xBB\xBF\xFF\xFE");
+    fn an_unrewritable_file_is_said_with_its_size() {
+        let installed = Installed {
+            count: 0,
+            bytes: 0,
+            compressed: 0,
+            skipped: vec![(
+                "bin/big.json".to_owned(),
+                Skip::Unrewritable(Unrewritable::TooLarge(16 * 1024 * 1024 + 1)),
+            )],
+            moved: Vec::new(),
+        };
 
-        assert_eq!(
-            rewritten(&stage, &[entry("bin/.msCoverageSourceRootsMapping_App")], BOX_WORK, PC_ROOT),
-            Err("cannot rewrite bin/.msCoverageSourceRootsMapping_App: it is not UTF-8".to_owned())
-        );
+        let line = "gate: remote outputs not fully brought back: bin/big.json cannot be rewritten (16777217 bytes, over 16 MiB)";
+        assert_eq!(said(&installed, 0.0).first().map(String::as_str), Some(line));
+    }
+
+    /// An install that skipped a file it cannot rewrite is whole, which the marker, `brought_back` and the hash cache
+    /// all follow; one in-use skip beside it makes it short again, since a later run finds the holder gone.
+    #[test]
+    fn an_in_use_skip_beside_an_unrewritable_one_leaves_the_install_incomplete() {
+        let mapping = "bin/.msCoverageSourceRootsMapping_App".to_owned();
+        let unrewritable = Installed {
+            count: 1,
+            bytes: 1,
+            compressed: 1,
+            skipped: vec![(mapping.clone(), Skip::Unrewritable(Unrewritable::NotText))],
+            moved: Vec::new(),
+        };
+        assert!(unrewritable.complete(), "a file it cannot rewrite leaves the install whole");
+
+        let held = Installed {
+            count: 1,
+            bytes: 1,
+            compressed: 1,
+            skipped: vec![
+                (mapping, Skip::Unrewritable(Unrewritable::NotText)),
+                ("bin/held.dll".to_owned(), Skip::InUse),
+            ],
+            moved: Vec::new(),
+        };
+        assert!(!held.complete(), "the in-use skip leaves it short of the box's outputs");
     }
 
     #[test]
@@ -1340,7 +1667,7 @@ mod tests {
         let refused = unpacked(&archive[..], &stage, OUTPUTS_BUDGET, &|| true, &Cell::new(false));
 
         assert!(
-            refused.as_ref().is_err_and(|error| error.kind() == io::ErrorKind::AlreadyExists),
+            refused.as_ref().is_err_and(|error| error.is_fault(io::ErrorKind::AlreadyExists)),
             "{refused:?}"
         );
         assert!(!stage_made(&refused), "a folder there before is not the install's to remove");
@@ -1367,7 +1694,7 @@ mod tests {
         let counted = "gate: remote outputs not brought back: 1 of 3 files were installed before the interrupt";
         assert_eq!(line.as_deref(), Some(counted));
 
-        let (end, line) = ending(Unmet::Refused("bin/a.dll changed during the run".to_owned()));
+        let (end, line) = ending(Unmet::Refused(Refused::transient("bin/a.dll changed during the run".to_owned())));
         assert!(matches!(end, End::Status(1)), "{end:?}");
         let refused = "gate: remote outputs not brought back: bin/a.dll changed during the run";
         assert_eq!(line.as_deref(), Some(refused));
@@ -1382,13 +1709,18 @@ mod tests {
         put(&root, "bin/changed.dll", b"abcd");
 
         let globs_first = checked(&root, &[entry("bin/changed.dll"), entry("obj/a.dll")], &bin_globs(), &manifest);
-        assert_eq!(globs_first, Err("the archive member obj/a.dll is not under the output globs".to_owned()));
+        assert_eq!(
+            globs_first,
+            Err(Refused::deterministic(
+                "the archive member obj/a.dll is not under the output globs".to_owned()
+            ))
+        );
 
         fs::write(&both, b"abcd").expect("the file can be written");
         let held = fs::OpenOptions::new().read(true).share_mode(0).open(&both).expect("the file can be held");
         let changed_first = checked(&root, &[entry("bin/both.dll")], &bin_globs(), &manifest);
         drop(held);
-        assert_eq!(changed_first, Err("bin/both.dll changed during the run".to_owned()));
+        assert_eq!(changed_first, Err(Refused::transient("bin/both.dll changed during the run".to_owned())));
     }
 
     /// The size of the member the streaming case unpacks.

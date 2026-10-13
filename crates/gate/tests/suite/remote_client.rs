@@ -3854,8 +3854,31 @@ fn crafted_archive(path: &str, text: &str) -> Vec<u8> {
     zstd::encode_all(&tar.into_inner().expect("the tar ends")[..], 3).expect("the tar compresses")
 }
 
+/// A `.tar.zst` outputs archive holding one symlink member `path` and the `.gate-outputs.json` list agreeing with an
+/// empty file, as a hostile builder would send: the reader refuses a member that is not a file, for what it is.
+fn crafted_link_archive(path: &str) -> Vec<u8> {
+    let list = format!(r#"[{{"path":"{path}","size":0,"sha256":"{}"}}]"#, sha256_hex(""));
+    let mut tar = tar::Builder::new(Vec::new());
+    let members: [(&str, tar::EntryType, &[u8]); 2] = [
+        (path, tar::EntryType::Symlink, &b""[..]),
+        (".gate-outputs.json", tar::EntryType::Regular, list.as_bytes()),
+    ];
+    for (name, kind, data) in members {
+        let mut header = tar::Header::new_gnu();
+        header.as_gnu_mut().expect("a GNU header").name[..name.len()].copy_from_slice(name.as_bytes());
+        header.set_entry_type(kind);
+        header.set_size(data.len() as u64);
+        header.set_mode(0o644);
+        header.set_link_name("bin/target").expect("the link's target is set");
+        header.set_cksum();
+        tar.append(&header, data).expect("the member can be appended");
+    }
+    zstd::encode_all(&tar.into_inner().expect("the tar ends")[..], 3).expect("the tar compresses")
+}
+
 /// A hostile builder's archive carries a root `.lfsconfig`, which a sync-back never writes: the install refuses it, so
-/// nothing of it reaches the worktree, and the run becomes 1.
+/// nothing of it reaches the worktree, the run becomes 1, and the refusal, decided by the archive's own members, clears
+/// the pending marker.
 #[test]
 fn an_archive_member_that_is_an_lfsconfig_is_refused_by_the_install() {
     let case = outputs_case("client-outputs-lfsconfig", &["**"]);
@@ -3874,7 +3897,108 @@ fn an_archive_member_that_is_an_lfsconfig_is_refused_by_the_install() {
     assert!(outcome.stderr.contains(line), "{outcome:?}");
     assert!(!case.folder().join(".lfsconfig").exists(), "nothing of it is installed: {outcome:?}");
     assert_eq!(outputs_leftovers(&case), Vec::<PathBuf>::new(), "the archive and the stage are removed");
-    assert!(pending_marker(&case).exists(), "{outcome:?}");
+    assert!(
+        !pending_marker(&case).exists(),
+        "a refusal of the archive's own members clears the marker: {outcome:?}"
+    );
+}
+
+/// A refusal the archive's own members decide still ends the run 1, but leaves the pending marker cleared, so the next
+/// routed run of the worktree sends its normal manifest: a file the builder's work folder holds from an earlier run that
+/// this run leaves alone comes back only under `OutputsFull`, and so it stays where it is.
+#[test]
+fn a_refused_install_of_a_member_outside_the_globs_clears_the_pending_marker() {
+    let case = outputs_case("client-outputs-refusal-marker", &BIN);
+    write(&case, r"bin\left.txt", "pc");
+    let go = Go(case.folder().join("ssh").join("go"));
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok", &format!("hold {}", shown(go.path()))]);
+    let run = start(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "write", r"bin\a.txt", "built"]));
+    wait_until("the outputs call", || calls(&steps).len() == 3);
+    fs::write(box_output_archive(&case), crafted_archive(".lfsconfig", "lfs")).expect("the archive can be replaced");
+    fs::write(go.path(), "").expect("the go file can be made");
+
+    let outcome = run.finish();
+
+    assert_eq!(outcome.code, Some(1), "a passing run becomes 1: {outcome:?}");
+    let line = "gate: remote outputs not brought back: the archive member .lfsconfig is not under the output globs";
+    assert!(outcome.stderr.contains(line), "{outcome:?}");
+    assert!(
+        !pending_marker(&case).exists(),
+        "a refusal of the archive's own members clears the marker: {outcome:?}"
+    );
+    // The run refused its archive whole, so the PC keeps no `bin/a.txt`; the builder's work folder, which holds it, gains
+    // a file an earlier run built and this run leaves alone.
+    let key = key_of(&events(&case));
+    write(&case, &format!(r"builder\work\{key}\bin\left.txt"), "box");
+    let second = ssh_steps(&case, "second", &["ok", "ok", "ok"]);
+
+    let outcome = finish(client_gate(&case, "second.log", &second, &[r".\tool.exe", "out", "ran there"]));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(
+        outcome.stderr.contains("gate-remote-outputs: 1 "),
+        "the file only this run's own delta holds comes back: {outcome:?}"
+    );
+    assert_eq!(
+        worktree_text(&case, r"bin\left.txt"),
+        "pc",
+        "the file only a full send would bring back stays: {outcome:?}"
+    );
+}
+
+/// A builder's archive carries a member that is not a file: the install's reader refuses it for what it is, so the run
+/// becomes 1, nothing of it is installed, and the refusal clears the pending marker.
+#[test]
+fn an_archive_with_a_link_member_is_refused_and_the_pending_marker_cleared() {
+    let case = outputs_case("client-outputs-link", &BIN);
+    let go = Go(case.folder().join("ssh").join("go"));
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok", &format!("hold {}", shown(go.path()))]);
+    let run = start(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "write", r"bin\a.txt", "built"]));
+    wait_until("the outputs call", || calls(&steps).len() == 3);
+    fs::write(box_output_archive(&case), crafted_link_archive("bin/link")).expect("the archive can be replaced");
+    fs::write(go.path(), "").expect("the go file can be made");
+
+    let outcome = run.finish();
+
+    assert_eq!(outcome.code, Some(1), "a passing run becomes 1: {outcome:?}");
+    let refused = "cannot be opened: the outputs archive member 'bin/link' is not a file";
+    assert!(outcome.stderr.contains(refused), "{outcome:?}");
+    assert!(
+        !case.folder().join("bin").join("link").exists(),
+        "nothing of it is installed: {outcome:?}"
+    );
+    assert_eq!(outputs_leftovers(&case), Vec::<PathBuf>::new(), "the archive and the stage are removed");
+    assert!(
+        !pending_marker(&case).exists(),
+        "a refusal of the archive's own members clears the marker: {outcome:?}"
+    );
+}
+
+/// A builder's archive arrives cut short: the install cannot read the stream, a fault a refetch may clear, so the run
+/// becomes 1 and the pending marker stays for the next run's full send.
+#[test]
+fn a_truncated_archive_keeps_the_pending_marker() {
+    let case = outputs_case("client-outputs-cut", &BIN);
+    let go = Go(case.folder().join("ssh").join("go"));
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok", &format!("hold {}", shown(go.path()))]);
+    let run = start(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "write", r"bin\a.txt", "built"]));
+    wait_until("the outputs call", || calls(&steps).len() == 3);
+    let whole = crafted_archive("bin/a.txt", "box");
+    fs::write(box_output_archive(&case), &whole[..whole.len() / 2]).expect("the archive can be cut short");
+    fs::write(go.path(), "").expect("the go file can be made");
+
+    let outcome = run.finish();
+
+    assert_eq!(outcome.code, Some(1), "a passing run becomes 1: {outcome:?}");
+    assert!(outcome.stderr.contains("cannot be opened: "), "{outcome:?}");
+    assert!(
+        !outcome.stderr.contains("is not a file"),
+        "the stream, not a member, is what failed: {outcome:?}"
+    );
+    assert!(
+        pending_marker(&case).exists(),
+        "a fault a refetch may clear keeps the marker: {outcome:?}"
+    );
 }
 
 /// A routed run, the gate given `extra` before the command, whose PC's `bin/kept.txt` (`pc`) is committed though `bin/`
@@ -4357,6 +4481,75 @@ fn an_installed_test_host_manifest_names_the_worktree() {
     assert_eq!(worktree_text(&case, r"bin\MvcTestingAppManifest.json"), expected, "{outcome:?}");
 }
 
+/// The coverage collector writes its mapping in UTF-16, unlike the test host's manifest: the install reads it in that
+/// encoding, rewrites the builder's work folder to the worktree, and writes it back as UTF-16 with its byte order mark.
+#[test]
+fn an_installed_utf16_coverage_mapping_names_the_worktree() {
+    let case = outputs_case("client-outputs-install-utf16", &BIN);
+    first_run(&case);
+    let builder = std::path::absolute(case.folder().join("builder")).expect("the builder root has a full path");
+    let work = format!(r"{}\work\{}", builder.display(), key_of(&events(&case)));
+    // After a `_`, the path is not one the router rewrites into the work folder: the builder sits in the worktree here.
+    let recorded = utf16_le(&format!(r"Root_{}\src\App", work.to_uppercase()));
+    install_bytes_from_the_box(&case, "bin/.msCoverageSourceRootsMapping_App", &recorded);
+    let second = ssh_steps(&case, "second", &["ok", "ok", "ok"]);
+
+    let outcome = finish(client_gate(&case, "second.log", &second, &[r".\tool.exe", "out", "ran there"]));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let root = std::path::absolute(case.folder()).expect("the case folder has a full path");
+    let expected = utf16_le(&format!(r"Root_{}\src\App", root.display()));
+    let installed = fs::read(case.folder().join("bin").join(".msCoverageSourceRootsMapping_App")).expect("the file is installed");
+    assert_eq!(installed, expected, "UTF-16 LE, its BOM kept, the worktree named: {outcome:?}");
+    assert_eq!(outputs_leftovers(&case), Vec::<PathBuf>::new(), "the archive and the stage are removed");
+    assert!(!pending_marker(&case).exists(), "the install completed: {outcome:?}");
+}
+
+/// A fetched `.msCoverageSourceRootsMapping_*` whose bytes are not text the install can read is skipped, not installed:
+/// the pass stands, the file beside it is installed, the skip is said, and the marker is cleared, since a refetch of the
+/// same bytes would be skipped the same way.
+#[test]
+fn a_coverage_file_that_cannot_be_rewritten_is_skipped_and_the_marker_cleared() {
+    let case = outputs_case("client-outputs-install-not-text", &BIN);
+    first_run(&case);
+    install_bytes_from_the_box(&case, "bin/.msCoverageSourceRootsMapping_App", b"\xEF\xBB\xBF\xFF\xFE");
+    install_from_the_box(&case, "bin/x.dll", "built");
+    let second = ssh_steps(&case, "second", &["ok", "ok", "ok"]);
+
+    let outcome = finish(client_gate(&case, "second.log", &second, &[r".\tool.exe", "out", "ran there"]));
+
+    assert_eq!(outcome.code, Some(0), "the pass stands: {outcome:?}");
+    assert!(
+        outcome.stderr.contains("not fully brought back: bin/.msCoverageSourceRootsMapping_App"),
+        "{outcome:?}"
+    );
+    assert!(
+        outcome
+            .stderr
+            .contains("cannot be rewritten (it is not UTF-8 or UTF-16 with a byte order mark)"),
+        "{outcome:?}"
+    );
+    assert!(!outcome.stderr.contains("not brought back:"), "{outcome:?}");
+    assert!(
+        !case.folder().join("bin").join(".msCoverageSourceRootsMapping_App").exists(),
+        "the unrewritable file is not installed: {outcome:?}"
+    );
+    assert_eq!(worktree_text(&case, r"bin\x.dll"), "built", "the other file is installed: {outcome:?}");
+    let line = regex::Regex::new(ONE_INSTALLED).expect("the line's pattern");
+    assert!(line.is_match(&outcome.stderr), "only the installed file is counted: {outcome:?}");
+    assert_eq!(outputs_leftovers(&case), Vec::<PathBuf>::new(), "the archive and the stage are removed");
+    assert!(
+        !pending_marker(&case).exists(),
+        "a skip a refetch would repeat clears the marker: {outcome:?}"
+    );
+    // The install counts as whole, so it caches what it moved: the next run reads no file it put in place. The
+    // nothing-back record is not observable here, since only a routed dotnet build writes one.
+    assert!(
+        hashes(&case)["files"].get("bin/x.dll").is_some(),
+        "a skip a refetch would repeat still caches what it installed: {outcome:?}"
+    );
+}
+
 /// A first run of `case`, which names the work-folder key, so a builder file can be put in its work folder after it.
 fn first_run(case: &Case) {
     let steps = ssh_steps(case, "first", &["ok", "ok"]);
@@ -4367,15 +4560,30 @@ fn first_run(case: &Case) {
 /// Writes `text` to the builder's work folder file `path`, its folders made, its last write [`HOUR`] ago: the install
 /// keeps no hash of a file written inside the 2 s window of its moves.
 fn install_from_the_box(case: &Case, path: &str, text: &str) {
+    install_bytes_from_the_box(case, path, text.as_bytes());
+}
+
+/// Writes `bytes` to the builder's work folder file `path`, its folders made, its last write [`HOUR`] ago, as
+/// [`install_from_the_box`] does for text.
+fn install_bytes_from_the_box(case: &Case, path: &str, bytes: &[u8]) {
     let work = case.folder().join("builder").join("work").join(key_of(&events(case)));
     let full = work.join(path.replace('/', "\\"));
     fs::create_dir_all(full.parent().expect("a file has a folder")).expect("the folder can be made");
-    fs::write(&full, text).expect("the builder's file can be written");
+    fs::write(&full, bytes).expect("the builder's file can be written");
     fs::File::options()
         .write(true)
         .open(&full)
         .and_then(|file| file.set_modified(SystemTime::now() - HOUR))
         .expect("the file's last write can be set");
+}
+
+/// `text` as UTF-16 little-endian bytes, the byte order mark first, as the .NET coverage collector writes it.
+fn utf16_le(text: &str) -> Vec<u8> {
+    let mut bytes = vec![0xFF, 0xFE];
+    for unit in text.encode_utf16() {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    bytes
 }
 
 /// A run that installs a file the builder wrote an hour ago keeps its hash at the stamp the installed file's own

@@ -173,21 +173,19 @@ fn pack_file<W: Write>(packer: &mut Packer<W>, file: &Found, opened: &File, data
 /// list's, a member the list lacks or one it holds that the archive lacks is refused after extraction.
 ///
 /// Nothing is written outside the destination, and on a refusal `unpack` removes the destination it made, and all it
-/// extracted there; when that removal fails too, the refusal says so.
-pub(crate) fn unpack(source: impl Read, destination: &Path, limit: u64) -> io::Result<Vec<Entry>> {
+/// extracted there; when that removal fails too, the refusal says so. The error says whether a member of the archive is
+/// refused for what it is ([`UnpackError::Members`]) or the stream could not be read ([`UnpackError::Fault`]).
+pub(crate) fn unpack(source: impl Read, destination: &Path, limit: u64) -> Result<Vec<Entry>, UnpackError> {
     fs::create_dir(destination).map_err(|error| in_context(destination, &error))?;
     extract_into(source, destination, limit, MEMBER_LIMIT).map_err(|error| match fs::remove_dir_all(destination) {
         Ok(()) => error,
-        Err(removal) => io::Error::new(
-            error.kind(),
-            format!("{error}; and {} could not be removed: {removal}", destination.display()),
-        ),
+        Err(removal) => error.and_removal(destination, &removal),
     })
 }
 
 /// Extracts `source` into the folder `destination`, which exists, as [`unpack`] does, making at most `folder_limit`
 /// folders.
-fn extract_into(source: impl Read, destination: &Path, limit: u64, folder_limit: usize) -> io::Result<Vec<Entry>> {
+fn extract_into(source: impl Read, destination: &Path, limit: u64, folder_limit: usize) -> Result<Vec<Entry>, UnpackError> {
     let root = std::path::absolute(destination).map_err(|error| in_context(destination, &error))?;
     check_folder(&root)?;
     let mut folders = Folders {
@@ -202,18 +200,19 @@ fn extract_into(source: impl Read, destination: &Path, limit: u64, folder_limit:
             .open(&target)
             .map_err(|error| in_context(&target, &error))?;
         io::copy(data, &mut file).map_err(|error| in_context(&target, &error))?;
-        file.set_modified(modified).map_err(|error| in_context(&target, &error))
+        file.set_modified(modified)
+            .map_err(|error| UnpackError::Fault(in_context(&target, &error)))
     })
 }
 
 /// The full path of the member `path` below the folder `root`, making each folder between them that does not exist;
 /// else the refusal, when the full path leaves `root`, a folder on the way is a link, a junction or not a folder, or
 /// `folders` may make no more.
-fn target_below(root: &Path, path: &str, folders: &mut Folders) -> io::Result<PathBuf> {
+fn target_below(root: &Path, path: &str, folders: &mut Folders) -> Result<PathBuf, UnpackError> {
     let target = path.split('/').fold(root.to_path_buf(), |target, part| target.join(part));
     let full = std::path::absolute(&target).map_err(|error| in_context(&target, &error))?;
     if !full.starts_with(root) {
-        return Err(refused(format!(
+        return Err(member_refused(format!(
             "the outputs archive member '{}' is not a relative path inside the destination",
             escaped(path)
         )));
@@ -236,13 +235,13 @@ struct Folders {
 
 impl Folders {
     /// Makes `folder` when it does not exist, counting it; else why not, the limit refused before the folder is made.
-    fn make(&mut self, folder: &Path) -> io::Result<()> {
+    fn make(&mut self, folder: &Path) -> Result<(), UnpackError> {
         match fs::symlink_metadata(folder) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             _ => return Ok(()),
         }
         if self.made == self.limit {
-            return Err(refused(format!("the outputs archive makes more than {} folders", self.limit)));
+            return Err(member_refused(format!("the outputs archive makes more than {} folders", self.limit)));
         }
         match fs::create_dir(folder) {
             Ok(()) => {
@@ -250,7 +249,7 @@ impl Folders {
                 Ok(())
             }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(()),
-            Err(error) => Err(in_context(folder, &error)),
+            Err(error) => Err(in_context(folder, &error).into()),
         }
     }
 }
@@ -374,7 +373,11 @@ fn file_header(size: u64, modified: u64) -> Header {
 /// Reads the `.tar.zst` stream `source`, decompressed to at most `limit` bytes, handing each file member's path, last
 /// write and data to `member` and hashing the data as `member` reads it, then checks the members against the list;
 /// returns the entries, else why the archive was refused.
-fn read_members(source: impl Read, limit: u64, mut member: impl FnMut(&str, SystemTime, &mut dyn Read) -> io::Result<()>) -> io::Result<Vec<Entry>> {
+fn read_members(
+    source: impl Read,
+    limit: u64,
+    mut member: impl FnMut(&str, SystemTime, &mut dyn Read) -> Result<(), UnpackError>,
+) -> Result<Vec<Entry>, UnpackError> {
     // zstd's worst case for `limit` bytes, so a skippable frame or empty blocks cannot be read without end either.
     let sent = sent_limit(limit).get();
     let source = Limited {
@@ -404,13 +407,13 @@ fn read_members(source: impl Read, limit: u64, mut member: impl FnMut(&str, Syst
         members.take(&mut entry?, &mut member)?;
     }
     if members.long_name.is_some() {
-        return Err(refused("the outputs archive ends with a long name".to_owned()));
+        return Err(member_refused("the outputs archive ends with a long name".to_owned()));
     }
     // To the end of the zstd frame, so a stream cut short after the tar's end is refused too.
     io::copy(&mut archive.into_inner(), &mut io::sink())?;
     let listed = members
         .listed
-        .ok_or_else(|| refused("the outputs archive holds no list of its files".to_owned()))?;
+        .ok_or_else(|| member_refused("the outputs archive holds no list of its files".to_owned()))?;
     agree(&members.seen, &listed)?;
     Ok(members.seen)
 }
@@ -432,10 +435,10 @@ impl Members {
     fn take(
         &mut self,
         entry: &mut tar::Entry<'_, impl Read>,
-        member: &mut impl FnMut(&str, SystemTime, &mut dyn Read) -> io::Result<()>,
-    ) -> io::Result<()> {
+        member: &mut impl FnMut(&str, SystemTime, &mut dyn Read) -> Result<(), UnpackError>,
+    ) -> Result<(), UnpackError> {
         if self.listed.is_some() {
-            return Err(refused("the outputs archive has a member after its list".to_owned()));
+            return Err(member_refused("the outputs archive has a member after its list".to_owned()));
         }
         let kind = entry.header().entry_type();
         if kind.is_gnu_longname() {
@@ -444,7 +447,7 @@ impl Members {
         let name = self.long_name.take().unwrap_or_else(|| entry.path_bytes().into_owned());
         if kind != EntryType::Regular {
             let shown = String::from_utf8_lossy(&name);
-            return Err(refused(format!("the outputs archive member '{}' is not a file", escaped(&shown))));
+            return Err(member_refused(format!("the outputs archive member '{}' is not a file", escaped(&shown))));
         }
         let path = member_path(&name)?;
         if path.eq_ignore_ascii_case(LIST_NAME) {
@@ -453,7 +456,7 @@ impl Members {
         }
         self.check_room(&path, entry.size())?;
         let modified = last_write(entry.header(), self.now)
-            .map_err(|reason| refused(format!("the outputs archive member '{}' has a last write {reason}", escaped(&path))))?;
+            .map_err(|reason| member_refused(format!("the outputs archive member '{}' has a last write {reason}", escaped(&path))))?;
         let mut hashing = Hashing::new(entry);
         member(&path, modified, &mut hashing)?;
         let (sha256, size) = hashing.finish();
@@ -463,28 +466,28 @@ impl Members {
 
     /// Whether one more file, `path` of `size` bytes, fits: within [`MEMBER_LIMIT`] files, and no larger than
     /// [`MEMBER_SIZE_LIMIT`] or what is left of the archive's byte limit; else the refusal.
-    fn check_room(&self, path: &str, size: u64) -> io::Result<()> {
+    fn check_room(&self, path: &str, size: u64) -> Result<(), UnpackError> {
         if self.seen.len() == MEMBER_LIMIT {
-            return Err(refused(format!("the outputs archive holds more than {MEMBER_LIMIT} files")));
+            return Err(member_refused(format!("the outputs archive holds more than {MEMBER_LIMIT} files")));
         }
         let most = MEMBER_SIZE_LIMIT.min(self.left.get());
         if size > most {
-            return Err(refused(format!(
+            return Err(UnpackError::Fault(refused(format!(
                 "the outputs archive member '{}' is {size} bytes, more than the {most} it may be",
                 escaped(path)
-            )));
+            ))));
         }
         Ok(())
     }
 
     /// Takes the GNU long name `entry` holds, of at most [`LONG_NAME_LIMIT`] bytes, for the next member; else the
     /// refusal.
-    fn take_long_name(&mut self, entry: &mut tar::Entry<'_, impl Read>) -> io::Result<()> {
+    fn take_long_name(&mut self, entry: &mut tar::Entry<'_, impl Read>) -> Result<(), UnpackError> {
         if self.long_name.is_some() {
-            return Err(refused("the outputs archive has two long names in a row".to_owned()));
+            return Err(member_refused("the outputs archive has two long names in a row".to_owned()));
         }
         if entry.size() > LONG_NAME_LIMIT {
-            return Err(refused(format!(
+            return Err(member_refused(format!(
                 "the outputs archive has a long name of more than {LONG_NAME_LIMIT} bytes"
             )));
         }
@@ -517,9 +520,9 @@ fn last_write(header: &Header, now: SystemTime) -> Result<SystemTime, String> {
 
 /// The member name `bytes` as a `/`-separated path inside the destination: UTF-8 and a plain path (see
 /// [`is_plain_path`]); else the refusal.
-fn member_path(bytes: &[u8]) -> io::Result<String> {
+fn member_path(bytes: &[u8]) -> Result<String, UnpackError> {
     let outside = |shown: &str| {
-        refused(format!(
+        member_refused(format!(
             "the outputs archive member '{}' is not a relative path inside the destination",
             escaped(shown)
         ))
@@ -529,15 +532,15 @@ fn member_path(bytes: &[u8]) -> io::Result<String> {
 }
 
 /// The entries of the list member `data`; else why it is not a list.
-fn read_list(data: &mut impl Read) -> io::Result<Vec<Entry>> {
+fn read_list(data: &mut impl Read) -> Result<Vec<Entry>, UnpackError> {
     let mut text = String::new();
     data.take(LIST_LIMIT + 1)
         .read_to_string(&mut text)
         .map_err(|error| refused(format!("the outputs archive's list cannot be read: {error}")))?;
     if text.len() as u64 > LIST_LIMIT {
-        return Err(refused(format!("the outputs archive's list is longer than {LIST_LIMIT} bytes")));
+        return Err(member_refused(format!("the outputs archive's list is longer than {LIST_LIMIT} bytes")));
     }
-    let not_a_list = || refused("the outputs archive's list is not a list of paths, sizes and SHA-256s".to_owned());
+    let not_a_list = || member_refused("the outputs archive's list is not a list of paths, sizes and SHA-256s".to_owned());
     let value: Value = serde_json::from_str(&text).map_err(|_| not_a_list())?;
     let items = value.as_array().ok_or_else(not_a_list)?;
     items
@@ -607,6 +610,58 @@ fn refused(reason: String) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, reason)
 }
 
+/// Why an archive could not be unpacked: whether its own members are refused for what they are, which a refetch of the
+/// same archive would be refused the same way, or the stream could not be read, which a refetch may clear.
+#[derive(Debug)]
+pub(crate) enum UnpackError {
+    /// A member of the archive is refused for what it is: its path or its kind, a last write it cannot hold, a name the
+    /// reader never takes, or the file or folder limit it passes.
+    Members(io::Error),
+    /// The stream could not be read: an I/O fault, a bad frame or one cut short, a limit it passed as it was read, or a
+    /// member that does not match the archive's own list.
+    Fault(io::Error),
+}
+
+impl UnpackError {
+    /// Whether the archive's own members are refused for what they are, which a refetch would refuse the same way.
+    pub(crate) fn members(&self) -> bool {
+        matches!(self, UnpackError::Members(_))
+    }
+
+    /// Whether this is the fault `kind` names, for a caller that tells one fault from another.
+    pub(crate) fn is_fault(&self, kind: io::ErrorKind) -> bool {
+        matches!(self, UnpackError::Fault(error) if error.kind() == kind)
+    }
+
+    /// This error, with `removal`'s failure to remove `destination` said after it, of the same kind.
+    fn and_removal(self, destination: &Path, removal: &io::Error) -> UnpackError {
+        let said = format!("{self}; and {} could not be removed: {removal}", destination.display());
+        match self {
+            UnpackError::Members(_) => UnpackError::Members(refused(said)),
+            UnpackError::Fault(error) => UnpackError::Fault(io::Error::new(error.kind(), said)),
+        }
+    }
+}
+
+impl std::fmt::Display for UnpackError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            UnpackError::Members(error) | UnpackError::Fault(error) => write!(formatter, "{error}"),
+        }
+    }
+}
+
+impl From<io::Error> for UnpackError {
+    fn from(error: io::Error) -> UnpackError {
+        UnpackError::Fault(error)
+    }
+}
+
+/// The refusal of a member of the archive for what it is, which a refetch of the same archive would refuse the same way.
+fn member_refused(reason: String) -> UnpackError {
+    UnpackError::Members(refused(reason))
+}
+
 #[cfg(test)]
 #[expect(clippy::expect_used, reason = "a test that cannot make its files or archives must fail loudly")]
 mod tests {
@@ -620,7 +675,9 @@ mod tests {
 
     use tar::{EntryType, Header};
 
-    use super::{Entry, LIST_NAME, MEMBER_LIMIT, Packer, extract_into, list_json, member_path, pack, pack_file, read_members, sent_limit, unpack};
+    use super::{
+        Entry, LIST_NAME, MEMBER_LIMIT, Packer, UnpackError, extract_into, list_json, member_path, pack, pack_file, read_members, sent_limit, unpack,
+    };
     use crate::boxside::outputs::OUTPUTS_BUDGET;
     use crate::boxside::payload::escaped;
     use crate::outputs::glob::Globs;
@@ -682,13 +739,20 @@ mod tests {
         zstd::encode_all(&tar.into_inner().expect("the tar ends")[..], 3).expect("the tar compresses")
     }
 
-    /// The refusal `unpack` gives for `archive`, and the files left of what it extracted before it: none, as it removes
+    /// The error `unpack` gives for `archive`, and the files left of what it extracted before it: none, as it removes
     /// the destination it made.
-    fn refusal(test: &str, archive: &[u8]) -> (String, Vec<String>) {
+    fn unpack_error(test: &str, archive: &[u8]) -> (UnpackError, Vec<String>) {
         let destination = scratch(test);
         let error = unpack(archive, &destination, LIMIT).expect_err("the archive is refused");
         assert!(!destination.exists(), "{test}: the destination is removed");
-        (error.to_string(), files_below(&destination))
+        (error, files_below(&destination))
+    }
+
+    /// The refusal `unpack` gives for `archive`, and the files left of what it extracted before it: none, as it removes
+    /// the destination it made.
+    fn refusal(test: &str, archive: &[u8]) -> (String, Vec<String>) {
+        let (error, files) = unpack_error(test, archive);
+        (error.to_string(), files)
     }
 
     /// The refusal `unpack` gives for `archive`, which it refused before it extracted anything.
@@ -815,6 +879,24 @@ mod tests {
                 "{kind:?}"
             );
         }
+    }
+
+    /// A member the archive's own reader refuses for what it is is a member error, which a refetch of the same archive
+    /// would be refused the same way; a stream cut short is a fault, which a refetch may clear.
+    #[test]
+    fn a_refused_member_is_a_member_error_and_a_cut_stream_is_a_fault() {
+        let link = raw(&[(b"bin/link", EntryType::Symlink, b"")], &[]);
+        assert!(
+            unpack_error("members-error", &link).0.members(),
+            "a link member is refused for what it is"
+        );
+
+        let whole = raw(&[(b"a", EntryType::Regular, b"a")], &[entry("a", b"a")]);
+        let cut = &whole[..whole.len() / 2];
+        assert!(
+            !unpack_error("fault-error", cut).0.members(),
+            "a stream cut short is not a member refusal"
+        );
     }
 
     #[test]
@@ -1060,7 +1142,7 @@ mod tests {
         fs::create_dir_all(&destination).expect("the folder can be made");
         let archive = raw(&[(b"a", EntryType::Regular, b"a")], &[entry("a", b"a")]);
         let error = unpack(&archive[..], &destination, LIMIT).expect_err("an existing destination is refused");
-        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists, "{error}");
+        assert!(error.is_fault(io::ErrorKind::AlreadyExists), "{error}");
         assert!(destination.exists(), "a folder unpack did not make is not removed");
         assert_eq!(files_below(&destination), Vec::<String>::new());
     }
@@ -1386,7 +1468,7 @@ mod tests {
                 at_last_write: taken.get(),
                 widest: Rc::clone(&widest),
             };
-            io::copy(data, &mut sink).map(|_| ())
+            io::copy(data, &mut sink).map(|_| ()).map_err(UnpackError::from)
         });
         let packed = writer.join().expect("the writer ends").expect("the archive packs");
         assert_eq!(read.expect("the archive extracts"), packed.entries);
