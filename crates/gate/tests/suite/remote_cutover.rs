@@ -18,9 +18,8 @@ use gate_win32::{NamedMutex, OwnedMutexGuard};
 use jiff::Timestamp;
 use serde_json::json;
 
-use crate::bridge::start_in_own_console;
 use crate::routing::{CONTROL_C_EXIT, send_ctrl_c_to_the_console_of};
-use crate::support::{Case, FAKE_TOOL, GATE, assert_in_order, finish, shown, start, wait_until, write_remote_json};
+use crate::support::{Case, FAKE_TOOL, GATE, assert_in_order, finish, shown, start, start_in_own_console, wait_until, write_remote_json};
 
 /// The suite's stand-in for ssh, which `--test-remote-ssh` names.
 const FAKE_SSH: &str = env!("CARGO_BIN_EXE_fake-ssh");

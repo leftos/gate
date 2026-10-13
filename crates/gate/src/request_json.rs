@@ -36,8 +36,6 @@ pub(crate) fn run(request: &RunRequest, log: &Path, root: &ResolvedRoot) -> Stri
         "remoteWatchCall": seams.remote_watch_call,
         "remoteTimeoutMs": seams.remote_timeout_ms,
         "remoteOutputsBudgetBytes": seams.remote_outputs_budget_bytes,
-        "remoteScript": seams.remote_script.as_ref().map(|path| path.to_string_lossy()),
-        "bridgePwsh": seams.bridge_pwsh.as_ref().map(|path| path.to_string_lossy()),
         "ownStartFails": seams.own_start_fails,
         "parentJobTrusted": seams.parent_job_trusted,
         "jobBreakaway": seams.job_breakaway,

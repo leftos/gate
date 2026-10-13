@@ -29,7 +29,7 @@ use windows_sys::Win32::System::Threading::{
 use windows_sys::Win32::System::WindowsProgramming::PROCESS_CREATION_DESKTOP_APP_BREAKAWAY_DISABLE_PROCESS_TREE;
 
 use crate::create::{Creation, DesktopPolicy, Inherited, check_launch, create_inheriting};
-use crate::interrupt::{Woken, wait_again_with, wait_with};
+use crate::interrupt::{Woken, wait_with};
 use crate::piped::{pipe_from_child, pipe_to_child};
 use crate::{Interrupt, Job, own_handle, wait_millis, win32_message};
 
@@ -554,23 +554,6 @@ impl Running {
         // SAFETY: the handle is open for as long as `self` lives, with the `SYNCHRONIZE` access a created process's
         // handle has.
         match unsafe { wait_with(interrupt, self.process.raw(), timeout) }? {
-            Woken::Signaled => self.exit_code().map(Waited::Exited),
-            Woken::Interrupted => Ok(Waited::Interrupted),
-            Woken::TimedOut => Ok(Waited::Running),
-        }
-    }
-
-    /// Waits at most `timeout` for the command to exit or `interrupt` to be raised a second time, as
-    /// [`Running::wait_or_interrupt`] does for the first: a caller that let the first press through waits here for
-    /// another. A second press that came before the call ends it at once.
-    ///
-    /// # Errors
-    ///
-    /// The system's error when the wait fails or the exit code cannot be read.
-    pub fn wait_or_interrupt_again(&self, timeout: Duration, interrupt: Interrupt) -> io::Result<Waited> {
-        // SAFETY: the handle is open for as long as `self` lives, with the `SYNCHRONIZE` access a created process's
-        // handle has.
-        match unsafe { wait_again_with(interrupt, self.process.raw(), timeout) }? {
             Woken::Signaled => self.exit_code().map(Waited::Exited),
             Woken::Interrupted => Ok(Waited::Interrupted),
             Woken::TimedOut => Ok(Waited::Running),

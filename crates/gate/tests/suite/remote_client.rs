@@ -15,6 +15,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime};
 
 use gate_router::{repo_name, work_folder_key};
+use proc_table::{ProcessTable as _, ProcessTree, Win32ProcessTable};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
@@ -618,6 +619,57 @@ fn a_second_routed_run_of_one_worktree_falls_back_busy_at_once() {
     assert_eq!(first.code, Some(0), "{first:?}");
     assert!(first.stdout.contains("ran there"), "{first:?}");
     assert_eq!(calls(&first_steps), ["preflight", "run"]);
+}
+
+/// The running stand-in whose parent is the gate `pid`, with its start, once there is exactly one.
+fn ssh_child_of(pid: u32) -> (u32, jiff::Timestamp) {
+    let mut found = None;
+    wait_until(&format!("one fake-ssh under gate {pid}"), || {
+        let children: Vec<u32> = ProcessTree::new(Win32ProcessTable.snapshot())
+            .iter()
+            .filter(|process| process.parent_pid == pid && process.name.eq_ignore_ascii_case("fake-ssh.exe"))
+            .map(|process| process.pid)
+            .collect();
+        found = match children[..] {
+            [child] => gate_win32::process_start_of(child).ok().flatten().map(|at| (child, at)),
+            _ => None,
+        };
+        found.is_some()
+    });
+    found.expect("checked by the wait")
+}
+
+#[test]
+fn gate_stop_tree_reaches_the_ssh_client() {
+    let case = client_case("client-stop-tree");
+    let go = Go(case.folder().join("ssh").join("go"));
+    let steps = ssh_steps(&case, "ssh", &["ok", &format!("hold {}", shown(go.path()))]);
+    let running = start(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "out", "ran here"]));
+    wait_until("the run call", || calls(&steps).len() == 2);
+    let gate_pid = running.id();
+    let (ssh, at) = ssh_child_of(gate_pid);
+
+    let stopped = case.run(&["stop-tree", &gate_pid.to_string()]);
+    let outcome = running.finish();
+
+    assert_eq!((stopped.code, stopped.stderr.as_str()), (Some(0), ""), "{stopped:?}");
+    // The ssh call's job is anonymous, so stop-tree finds no gate job: it ends the tree under the gate, the gate and the
+    // ssh it holds, by their pids.
+    assert_eq!(
+        stopped.stdout,
+        format!("gate: stopped 0 gate job(s) and 2 process(es) under {gate_pid}\n"),
+        "{stopped:?}"
+    );
+    // A gate whose ssh ended before it did ends its run with status 1, never here.
+    assert!(matches!(outcome.code, Some(124 | 1)), "the gate ends stopped: {outcome:?}");
+    assert!(!outcome.stdout.contains("ran here"), "the command never ran here: {outcome:?}");
+    let takes = events(&case).iter().filter(|event| event["event"] == "take").count();
+    assert_eq!(takes, 1, "no take after the remote one: {:?}", events(&case));
+    wait_until(
+        &format!("fake-ssh {ssh} ending"),
+        || !matches!(gate_win32::process_start_of(ssh), Ok(Some(start)) if start == at),
+    );
+    assert_eq!(calls(&steps), ["preflight", "run"], "the held call was the last");
 }
 
 #[test]

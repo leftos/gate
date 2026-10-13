@@ -36,7 +36,7 @@ use gate_win32::{AcquireError, Interrupt, Job, NamedMutex, OwnedMutexGuard, Pipe
 use jiff::{SignedDuration, Timestamp};
 use regex::Regex;
 
-use super::git::{self, Git, GitError, last_update};
+use super::git::{self, Git, GitError, NO_CURRENT_FOLDER, last_update};
 use super::launch::{DRAIN, KILL_WAIT, KILLED, call_job, launched, piped_launch};
 use super::outputs;
 use super::parity;
@@ -85,10 +85,11 @@ const NO_HANDLER: &str = "gate: --test-remote-interrupt-at needs the console han
 /// The most of a call's standard output one read of a raw copy takes.
 const RAW_CHUNK: usize = 64 * 1024;
 
-/// The Rust client: over ssh when the state root holds the remote-cutover flag, or over the local transport of
-/// `--test-remote-transport`.
+/// The Rust client: over ssh, or over the local transport of `--test-remote-transport`.
 pub(crate) struct RustClient {
-    transport: Box<dyn Transport>,
+    /// The way to the builder: `None` for the ssh transport until a routed attempt first needs it ([`found`]), so a
+    /// run that never routes never looks for ssh.
+    transport: Option<Box<dyn Transport>>,
     /// How long each git call of the snapshot and the saved ref may take.
     limit: Duration,
     /// The pause before a retry.
@@ -122,11 +123,10 @@ pub(crate) struct RustClient {
 }
 
 impl RustClient {
-    /// The client over `ssh.exe` found along the gate's own `PATH`, whose builder root is the builder layout's, with
-    /// the run's `seams`; else the line saying why ssh cannot be found.
-    pub(crate) fn ssh(seams: &TestSeams) -> Result<RustClient, String> {
-        let ssh = Ssh::find()?;
-        Ok(RustClient::over(Box::new(ssh), seams))
+    /// The client over `ssh.exe`, whose builder root is the builder layout's, with the run's `seams`. ssh is looked for
+    /// along the gate's own `PATH` only once a routed attempt needs it ([`found`]).
+    pub(crate) fn ssh(seams: &TestSeams) -> RustClient {
+        RustClient::over(None, seams)
     }
 
     /// The client of the local transport `transport` names, with the request's seams; else the line saying why the
@@ -139,12 +139,12 @@ impl RustClient {
         Local::new(transport, seams.remote_ssh.as_deref())?;
         let stub = seams.remote_ssh.as_deref().map(|word| stand_in(transport, word)).transpose()?;
         let local = Local::new(transport, stub.as_deref())?;
-        Ok(RustClient::over(Box::new(local), seams))
+        Ok(RustClient::over(Some(Box::new(local)), seams))
     }
 
-    /// The client over `transport`, each limit its constant unless `seams` gives one in its place, as only a gate built
-    /// with the test seams can.
-    fn over(transport: Box<dyn Transport>, seams: &TestSeams) -> RustClient {
+    /// The client over `transport`, the ssh one looked for later when `None`, each limit its constant unless `seams`
+    /// gives one in its place, as only a gate built with the test seams can.
+    fn over(transport: Option<Box<dyn Transport>>, seams: &TestSeams) -> RustClient {
         RustClient {
             transport,
             limit: git::limit(seams),
@@ -188,14 +188,43 @@ pub(crate) fn hold_key(call: &RemoteCall<'_>) -> Result<OwnedMutexGuard, Option<
     }
 }
 
+/// The command of one call of `program`: its words, the system folder `system` as its working folder and
+/// [`NO_CURRENT_FOLDER`] set, so neither ssh nor a program or library it looks for by name, a `ProxyCommand`'s say, is
+/// found in the gate's own working folder, which may be the worktree.
+fn call_command(program: Program, system: &Path) -> Command {
+    let mut command = Command::new(program.program);
+    command.args(program.args).current_dir(system).env(NO_CURRENT_FOLDER, "1");
+    command
+}
+
+/// The transport in `slot`, the ssh one found along the gate's own `PATH` and kept there when the slot is empty; else
+/// why ssh cannot be found.
+fn found(slot: &mut Option<Box<dyn Transport>>) -> Result<&mut dyn Transport, String> {
+    let transport = match slot {
+        Some(transport) => transport,
+        None => slot.insert(Box::new(Ssh::find()?)),
+    };
+    Ok(transport.as_mut())
+}
+
 impl RemoteClient for RustClient {
     fn hold_key(&self, call: &RemoteCall<'_>) -> Result<Option<OwnedMutexGuard>, Option<String>> {
         hold_key(call).map(Some)
     }
 
+    /// Looks for ssh on the routed attempt's first need of it, so a run that cannot find it falls back `client` before
+    /// it takes a key lock, a ticket or a remote slot.
+    fn ready(&mut self) -> Result<(), String> {
+        found(&mut self.transport).map(drop)
+    }
+
     fn run(&mut self, call: &RemoteCall<'_>) -> RemoteOutcome {
+        let transport = match found(&mut self.transport) {
+            Ok(transport) => transport,
+            Err(why) => return RemoteOutcome::not_started(why),
+        };
         // The worktree is known only now: a transport whose program lies inside it starts nothing.
-        if let Err(why) = self.transport.judge(Path::new(call.root)) {
+        if let Err(why) = transport.judge(Path::new(call.root)) {
             return RemoteOutcome::not_started(why);
         }
         let started = Instant::now();
@@ -205,7 +234,7 @@ impl RemoteClient for RustClient {
         let (stall, raised) = watchdog::stall_window(call.stall, stall_ms);
         let mut attempt = Attempt {
             call,
-            transport: self.transport.as_ref(),
+            transport: &*transport,
             limit: self.limit,
             pause: self.pause,
             limits: Limits {
@@ -967,9 +996,8 @@ impl Attempt<'_, '_> {
     /// One call of `gate box` on the builder carrying `line`, watched as `watch` says; the console interrupt raised
     /// after its first output byte when `raise`; what only this call gives it, `only`.
     fn ssh(&mut self, line: &str, echo: Echo, watch: Watch, raise: bool, only: CallOnly) -> Result<Called, End> {
-        let Program { program, args } = self.transport.call(self.call.host, line);
-        let mut command = Command::new(program);
-        command.args(args);
+        let system = gate_win32::system_directory().map_err(|error| End::Failed(format!("cannot read the system folder: {error}")))?;
+        let command = call_command(self.transport.call(self.call.host, line), &system);
         let starts = Starts {
             breakaway: self.transport.box_runs_here(),
             raise,
@@ -3916,14 +3944,39 @@ mod tests {
             program: PathBuf::from(r"C:\Program Files\OpenSSH\ssh.exe"),
         };
 
-        let client = RustClient::over(Box::new(ssh), &TestSeams::default());
+        let mut client = RustClient::over(Some(Box::new(ssh)), &TestSeams::default());
 
         assert_eq!(
-            client.transport.root(),
+            super::found(&mut client.transport).expect("the transport is given").root(),
             r"D:\gate-remote",
             "every work folder and bare repository lives there"
         );
         assert_eq!(client.limit, GIT_LIMIT, "a request with no seams keeps the constants");
         assert_eq!(client.dotnet_limit, DOTNET_LIMIT, "a request with no seams keeps the constants");
+    }
+
+    #[test]
+    fn a_call_runs_in_the_system_folder_and_finds_no_program_in_the_working_folder() {
+        use std::ffi::{OsStr, OsString};
+
+        use crate::remote::git::NO_CURRENT_FOLDER;
+        use crate::remote::transport::Program;
+
+        let program = Program {
+            program: PathBuf::from(r"C:\Program Files\OpenSSH\ssh.exe"),
+            args: vec![OsString::from("--"), OsString::from("builder")],
+        };
+
+        let command = super::call_command(program, Path::new(r"C:\Windows\System32"));
+
+        assert_eq!(command.get_program(), OsStr::new(r"C:\Program Files\OpenSSH\ssh.exe"));
+        assert_eq!(command.get_args().collect::<Vec<_>>(), ["--", "builder"]);
+        assert_eq!(command.get_current_dir(), Some(Path::new(r"C:\Windows\System32")));
+        let set: Vec<Option<&OsStr>> = command
+            .get_envs()
+            .filter(|(name, _)| *name == OsStr::new(NO_CURRENT_FOLDER))
+            .map(|(_, value)| value)
+            .collect();
+        assert_eq!(set, [Some(OsStr::new("1"))], "ssh and what it starts skip the working folder");
     }
 }

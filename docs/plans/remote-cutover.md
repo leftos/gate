@@ -71,11 +71,13 @@ Routing is off on the PC since the decommission of the PowerShell remote: every 
 ### R8. Move the routing suite's default-client cases onto the Rust client
 
 - Cases that rely on the bridge as the default client move to the flag plus fake-ssh, or the scripted client; `with_no_test_client_a_routed_run_falls_back_with_reason_client` becomes `routing::with_no_ssh_a_routed_run_falls_back_with_reason_client`. Files: suite `routing.rs`, `support.rs`. Depends on R2.
+- Done: the cases run on fake-ssh as `ssh.exe` on `PATH`, or the scripted client.
 
 ### R9. Delete the remote.ps1 bridge, its shim, its install copy and its test seams
 
 - `chosen` always builds the Rust client. Delete `remote/bridge.rs`, `tools/remote-bridge.ps1`, the install copy (install removes a leftover shim), the `--test-remote-script`/`--test-bridge-pwsh` seams and their JSON keys, suite `bridge.rs` and the related cases; `Interrupt::presses` only if nothing else uses it. Test: `install::an_install_removes_a_leftover_bridge_shim`. Depends on R8.
-- Docs: design.md "Routing and the remote.ps1 bridge" (keep the anchor), the Bridge subsection and its mentions; ARCHITECTURE; test-map; GLOSSARY bridge entries; `docs/design/gate-remote-slot.md`.
+- Docs: design.md "Routing" (renamed from "Routing and the remote.ps1 bridge", its links updated), the Bridge subsection and its mentions; ARCHITECTURE; test-map; GLOSSARY bridge entries. Neither `README.md` nor `docs/design/gate-remote-slot.md` has bridge text.
+- Done: the switch client and its drain wait are deleted too, and so are `Interrupt::presses`, `Running::wait_or_interrupt_again`, `cancel_pending_io` and `cancelled`, since nothing else used them. `RemoteClient::ready` returns `Result<(), String>` and looks up ssh lazily, so a run with no usable ssh falls back `client`. The client's ssh calls start in the system folder with `NoDefaultCurrentDirectoryInExePath=1`.
 
 ### R10. Retire the remote-cutover flag and `gate remote-cutover`
 

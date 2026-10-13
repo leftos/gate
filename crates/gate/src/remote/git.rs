@@ -73,6 +73,9 @@ const GIT_LOCATION: [&str; 26] = [
     "GIT_SSH",
     "GIT_PROXY_COMMAND",
 ];
+/// The variable that, set, keeps the working folder out of a program's search for another program by name, as
+/// `CreateProcess` and `SearchPath` make it.
+pub(crate) const NO_CURRENT_FOLDER: &str = "NoDefaultCurrentDirectoryInExePath";
 /// The prefixes of the config variables `GIT_CONFIG_COUNT` indexes: `GIT_CONFIG_KEY_<n>` and `GIT_CONFIG_VALUE_<n>`.
 const GIT_CONFIG_INDEXED: [&str; 2] = ["GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"];
 /// `FILE_FLAG_DELETE_ON_CLOSE`: the file of git's output is gone once its last handle closes.
@@ -169,10 +172,12 @@ impl Git {
         Ok(output)
     }
 
-    /// git asked about `folder` alone, as every call starts it: the location and config variables removed, `-C
+    /// git asked about `folder` alone, as every call starts it: the location and config variables removed,
+    /// [`NO_CURRENT_FOLDER`] set, so the ssh git starts finds no program by name in the gate's working folder, `-C
     /// <folder>`, and no file-system monitor. Its arguments, streams and start are the caller's.
     pub(crate) fn command(&self, folder: &Path) -> Command {
         let mut command = Command::new(&self.program);
+        command.env(NO_CURRENT_FOLDER, "1");
         for name in GIT_LOCATION {
             command.env_remove(name);
         }
@@ -230,7 +235,7 @@ struct Spawn<'a> {
 pub(crate) fn sdk_listing(variables: Variables, limit: Duration, interrupt: Option<Interrupt>, worktree: Option<&Path>) -> Result<String, GitError> {
     let cannot_run = |why: String| GitError::Failed(format!("cannot run dotnet: {why}"));
     let folder = gate_win32::system_directory().map_err(|error| cannot_run(format!("cannot read the system folder: {error}")))?;
-    let variables = variables.with("NoDefaultCurrentDirectoryInExePath", "1");
+    let variables = variables.with(NO_CURRENT_FOLDER, "1");
     let dotnet = match find_program("dotnet", &variables, &folder) {
         Ok(dotnet) => dotnet,
         // `find_program` says a word it does not find with this message, and every other failure with another.
@@ -591,13 +596,6 @@ pub(crate) struct Ran {
     pub stdout: File,
 }
 
-/// Whether `name` is a variable git is never given: one of [`GIT_LOCATION`] or an indexed config variable, its letter
-/// case aside as Windows reads a variable's name.
-pub(crate) fn is_location_variable(name: &OsStr) -> bool {
-    name.to_str()
-        .is_some_and(|name| GIT_LOCATION.iter().any(|location| location.eq_ignore_ascii_case(name)) || is_indexed_config(name))
-}
-
 /// Whether `name` is one of the config variables `GIT_CONFIG_COUNT` indexes, its letter case aside as Windows reads a
 /// variable's name.
 fn is_indexed_config(name: &str) -> bool {
@@ -762,8 +760,8 @@ mod tests {
     use jiff::Timestamp;
 
     use super::{
-        Call, ERRORS_KEPT, FAILURE_BYTES, GIT_LIMIT, Git, GitError, OUTPUT_CAP, capped, failed_line, failure_text, is_indexed_config, late_git_line,
-        sdk_listing, tail, without_verbatim,
+        Call, ERRORS_KEPT, FAILURE_BYTES, GIT_LIMIT, Git, GitError, NO_CURRENT_FOLDER, OUTPUT_CAP, capped, failed_line, failure_text,
+        is_indexed_config, late_git_line, sdk_listing, tail, without_verbatim,
     };
     use crate::boxside::payload::escaped;
     use crate::environment::Variables;
@@ -1268,6 +1266,22 @@ mod tests {
             .collect();
 
         assert_eq!(ssh, [Some(OsStr::new("ssh -o BatchMode=yes"))], "a call's own ssh command reaches git");
+    }
+
+    #[test]
+    fn git_and_the_ssh_it_starts_find_no_program_in_the_working_folder() {
+        let git = Git {
+            program: PathBuf::from("git.exe"),
+        };
+
+        let command = git.command(Path::new(r"C:\work\app"));
+
+        let set: Vec<Option<&OsStr>> = command
+            .get_envs()
+            .filter(|(name, _)| *name == OsStr::new(NO_CURRENT_FOLDER))
+            .map(|(_, value)| value)
+            .collect();
+        assert_eq!(set, [Some(OsStr::new("1"))], "git's children inherit it");
     }
 
     #[test]

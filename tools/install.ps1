@@ -375,20 +375,15 @@ elseif ($PSCmdlet.ShouldProcess($dest, 'Install')) {
     Write-Output "install: installed gate $newVersion at $dest"
 }
 
-# The script gate.exe starts a routed run's remote.ps1 through, which gate.exe finds beside itself. It is copied beside
-# the installed one first and moved into place, so a gate never reads it half written.
-$bridge = Join-Path $PSScriptRoot 'remote-bridge.ps1'
-$bridgeDest = Join-Path $installDir 'remote-bridge.ps1'
-if ((Test-Path -LiteralPath $installDir) -and $PSCmdlet.ShouldProcess($bridgeDest, 'Install')) {
-    $bridgeTemp = $bridgeDest + '.' + $PID + '.tmp'
+# The remote.ps1 bridge script an earlier install put beside gate.exe, which no gate starts any more. One that cannot be
+# removed, as when a pwsh still holds it, is said once and left; the install goes on.
+$oldBridge = Join-Path $installDir 'remote-bridge.ps1'
+if ((Test-Path -LiteralPath $oldBridge -PathType Leaf) -and $PSCmdlet.ShouldProcess($oldBridge, 'Delete')) {
     try {
-        Copy-Item -LiteralPath $bridge -Destination $bridgeTemp -Force -ErrorAction Stop
-        Move-Item -LiteralPath $bridgeTemp -Destination $bridgeDest -Force -ErrorAction Stop
+        Remove-Item -LiteralPath $oldBridge -Force -ErrorAction Stop
     }
     catch {
-        Remove-Item -LiteralPath $bridgeTemp -Force -ErrorAction SilentlyContinue
-        Write-InstallError "install: could not install ${bridgeDest}: $($_.Exception.Message)"
-        exit 1
+        Write-InstallError "install: cannot remove the old remote-bridge.ps1 ($($_.Exception.Message)); it is unused"
     }
 }
 

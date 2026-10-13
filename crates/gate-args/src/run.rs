@@ -74,10 +74,6 @@ pub(crate) enum ValueOption {
     #[cfg(feature = "test-seams")]
     RemoteLogCapBytes,
     #[cfg(feature = "test-seams")]
-    RemoteScript,
-    #[cfg(feature = "test-seams")]
-    BridgePwsh,
-    #[cfg(feature = "test-seams")]
     ConfirmMs,
     #[cfg(feature = "test-seams")]
     PushSsh,
@@ -264,10 +260,6 @@ impl RunBuilder {
             ValueOption::RemoteOutputsBudgetBytes => self.test_seams.remote_outputs_budget_bytes = Some(values::above_zero(spelled, value)?),
             #[cfg(feature = "test-seams")]
             ValueOption::RemoteLogCapBytes => self.test_seams.remote_log_cap_bytes = Some(values::above_zero(spelled, value)?),
-            #[cfg(feature = "test-seams")]
-            ValueOption::RemoteScript => self.test_seams.remote_script = Some(PathBuf::from(value)),
-            #[cfg(feature = "test-seams")]
-            ValueOption::BridgePwsh => self.test_seams.bridge_pwsh = Some(PathBuf::from(value)),
             #[cfg(feature = "test-seams")]
             ValueOption::ConfirmMs => self.cutover_seams.confirm_ms = Some(values::above_zero(spelled, value)?),
             #[cfg(feature = "test-seams")]

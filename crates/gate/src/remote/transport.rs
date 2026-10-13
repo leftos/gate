@@ -189,8 +189,8 @@ fn box_words(line: &str) -> Vec<OsString> {
 
 /// The ssh transport: OpenSSH found along the gate's own `PATH`, the builder's root `D:\gate-remote`, and git pushing
 /// over ssh to a receive-pack started through pwsh, which reads the single-quoted path git sends through cmd.
-/// `gate push` runs its calls with ssh's own path; a routed run uses the ssh transport when the state root holds the
-/// remote-cutover flag, and judges the ssh it found against the run's worktree before its first call.
+/// `gate push` runs its calls with ssh's own path; a routed run that no test seam gives a client uses the ssh
+/// transport, and judges the ssh it found against the run's worktree before its first call.
 pub(crate) mod ssh {
     use std::path::{Path, PathBuf};
 

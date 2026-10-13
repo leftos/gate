@@ -269,19 +269,19 @@ fn install_says_the_version_the_installed_exe_prints() {
 }
 
 #[test]
-fn install_puts_the_bridge_script_beside_the_exe() {
-    let case = Case::new("install_puts_the_bridge_script_beside_the_exe");
-    let key = EnvironmentKey::new("install_puts_the_bridge_script_beside_the_exe");
+fn an_install_removes_a_leftover_bridge_shim() {
+    let case = Case::new("an_install_removes_a_leftover_bridge_shim");
+    let key = EnvironmentKey::new("an_install_removes_a_leftover_bridge_shim");
     let exe = copy_gate(&case, "gate-a.exe");
+    let shim = install_dir(&case).join("remote-bridge.ps1");
+    fs::create_dir_all(install_dir(&case)).expect("the install folder can be made");
+    fs::write(&shim, "# the bridge shim an earlier install left\n").expect("the leftover shim can be written");
 
     let outcome = install(&case, &key, &["-Exe", &shown(&exe)]);
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
-    assert_eq!(
-        fs::read(install_dir(&case).join("remote-bridge.ps1")).expect("the bridge script is installed"),
-        fs::read(checked_in("remote-bridge.ps1")).expect("the checked-in bridge script can be read"),
-        "the installed bridge script is the checked-in one"
-    );
+    assert!(!shim.exists(), "the leftover shim is gone: {outcome:?}");
+    assert!(!outcome.stderr.contains("remote-bridge.ps1"), "a removed shim says nothing: {outcome:?}");
 }
 
 #[test]

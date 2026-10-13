@@ -1,6 +1,6 @@
 //! The remote client a routed run calls: the call it is given, the outcome it hands back, and the clients there are.
-//! A routed run that no test seam gives a client calls the [`switch`], which sends it to the [`bridge`] to remote.ps1,
-//! or to the Rust client over ssh when the state root holds the remote-cutover flag. A gate built with the
+//! A routed run that no test seam gives a client calls the Rust client over ssh, which looks for ssh when the run first
+//! routes; a run whose ssh cannot be found falls back `client`. A gate built with the
 //! `test-seams` feature has the scripted client `--test-remote-client` names, which runs a step file in this process,
 //! and the client of `--test-remote-snapshot`, which stops once it has made the snapshot, and the Rust client of
 //! `--test-remote-transport`, which runs the command on a builder of the local transport. [`git`] runs git for the
@@ -17,9 +17,6 @@ use gate_args::RunRequest;
 use gate_state::{FallbackReason, StateRoot};
 use gate_win32::{Interrupt, OwnedMutexGuard};
 
-use crate::console::Console;
-
-mod bridge;
 mod client;
 pub(crate) mod git;
 mod install;
@@ -29,7 +26,6 @@ mod parity;
 mod payload;
 mod retry;
 mod snapshot;
-mod switch;
 mod syncback;
 pub(crate) mod transport;
 mod watchdog;
@@ -93,26 +89,14 @@ pub(crate) trait RemoteClient {
         Ok(None)
     }
 
-    /// Whether the client can start, checked before the run takes a key lock, a ticket or a remote slot: a client may
-    /// wait here first, saying why on `console`, until `interrupt` is raised. `Err` with why it cannot, when the run
-    /// falls back `client` at once, or ends as an interrupt.
-    fn ready(&self, _console: &mut Console, _interrupt: Option<Interrupt>) -> Result<(), Unready> {
+    /// Whether the client can start, checked before the run takes a key lock, a ticket or a remote slot. `Err` with why
+    /// a part it starts is missing, which the run's `client` fallback line names as it falls back at once.
+    fn ready(&mut self) -> Result<(), String> {
         Ok(())
     }
 
     /// Runs the call to its end, or to its refusal, on the run's thread.
     fn run(&mut self, call: &RemoteCall<'_>) -> RemoteOutcome;
-}
-
-/// Why a client cannot start its run ([`RemoteClient::ready`]).
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum Unready {
-    /// A part the client starts is missing: why, which the run's `client` fallback line names.
-    Missing(String),
-    /// The client will not start, and the line, which ends `running here`, says why in place of the fallback line.
-    RunsHere(String),
-    /// A Ctrl+C came while the client waited to start.
-    Interrupted,
 }
 
 /// What the client is asked to run, and where: the route's facts, the run's log and limits, and the interrupt that
@@ -121,7 +105,7 @@ pub(crate) enum Unready {
     not(feature = "test-seams"),
     expect(
         dead_code,
-        reason = "the bridge leaves the markers to the gate's verdict, and only the scripted client records them"
+        reason = "the Rust client leaves the tail and the markers to the gate's verdict, and only the scripted client records them"
     )
 )]
 pub(crate) struct RemoteCall<'a> {
@@ -135,10 +119,9 @@ pub(crate) struct RemoteCall<'a> {
     /// The output globs the run brings back.
     pub outputs: &'a [String],
     /// Whether the route withheld the run's outputs, its command a dotnet `--no-build` one whose word the builder
-    /// dropped: the builder builds, and nothing comes back. The bridge ignores it.
+    /// dropped: the builder builds, and nothing comes back.
     pub outputs_withheld: bool,
-    /// The `--bring-tracked` globs: a fetched output git tracks is installed only when one matches it. The bridge
-    /// ignores them.
+    /// The `--bring-tracked` globs: a fetched output git tracks is installed only when one matches it.
     pub bring_tracked: &'a [String],
     /// The log the client writes the run's output to.
     pub log: &'a Path,
@@ -167,8 +150,8 @@ pub(crate) struct RemoteOutcome {
     pub detail: Option<String>,
     /// Whether the run's outputs were brought back: `Some(true)` only when the run's outputs step installed its archive
     /// whole, or the box packed nothing for a PC that held outputs, and in either case the box skipped no name this PC
-    /// cannot take: a skipped name makes it `Some(false)` on both paths. `None` when the client cannot tell, the bridge
-    /// always, which counts as not brought back.
+    /// cannot take: a skipped name makes it `Some(false)` on both paths. `None` when the client cannot tell, which
+    /// counts as not brought back.
     pub brought_back: Option<bool>,
 }
 
@@ -207,11 +190,10 @@ fn say<S: AsRef<str>>(log: &Path, lines: &[S], mut stream: impl Write) -> Result
 }
 
 /// The client `request` names: the one of `--test-remote-snapshot`, else the Rust client of `--test-remote-transport`,
-/// else the scripted one of `--test-remote-client`, else the switch of the state root `state_dir`, whose bridge has the
-/// remote.ps1 of `--test-remote-script` and the pwsh of `--test-bridge-pwsh` when given; or the line saying why its
+/// else the scripted one of `--test-remote-client`, else the Rust client over ssh; or the line saying why its
 /// transport or its step file cannot be used.
 #[cfg(feature = "test-seams")]
-pub(crate) fn chosen(request: &RunRequest, state_dir: &Path) -> Result<Box<dyn RemoteClient>, String> {
+pub(crate) fn chosen(request: &RunRequest) -> Result<Box<dyn RemoteClient>, String> {
     if request.test_seams.remote_snapshot {
         let limit = git::limit(&request.test_seams);
         return Ok(Box::new(snapshot_only::SnapshotOnly { limit }));
@@ -223,22 +205,17 @@ pub(crate) fn chosen(request: &RunRequest, state_dir: &Path) -> Result<Box<dyn R
     if let Some(path) = &seams.remote_client {
         return scripted::ScriptedClient::load(path).map(|client| Box::new(client) as Box<dyn RemoteClient>);
     }
-    let bridge = bridge::Bridge::new(seams.remote_script.clone(), seams.bridge_pwsh.clone());
-    Ok(Box::new(switch::Switch::new(seams, state_dir, bridge)))
+    Ok(Box::new(client::RustClient::ssh(seams)))
 }
 
-/// The client `request` names: the switch of the state root `state_dir`, in a gate built without the test seams.
+/// The client `request` names: the Rust client over ssh, in a gate built without the test seams.
 #[cfg(not(feature = "test-seams"))]
 #[expect(
     clippy::unnecessary_wraps,
     reason = "the signature of the test-seams build, whose step file can fail to load"
 )]
-pub(crate) fn chosen(request: &RunRequest, state_dir: &Path) -> Result<Box<dyn RemoteClient>, String> {
-    Ok(Box::new(switch::Switch::new(
-        &request.test_seams,
-        state_dir,
-        bridge::Bridge::new(None, None),
-    )))
+pub(crate) fn chosen(request: &RunRequest) -> Result<Box<dyn RemoteClient>, String> {
+    Ok(Box::new(client::RustClient::ssh(&request.test_seams)))
 }
 
 /// The client of `--test-remote-snapshot`: makes the snapshot and bridge commits of the call's worktree and says each

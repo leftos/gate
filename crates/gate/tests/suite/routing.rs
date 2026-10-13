@@ -6,19 +6,17 @@ use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::os::windows::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
-use std::process::{self, Command, Output, Stdio};
+use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use gate_router::{DROPPED_NO_BUILD_LINE, NO_OUTPUTS_LINE, repo_name};
-use gate_state::v1;
 use serde_json::{Value, json};
 
-use crate::bridge::{answer, bridge_words, stand_in, start_in_own_console};
 use crate::nesting::{LOOK_OFTEN, end_parent, first_event, marked, orphaned_as, spawned, test_marker};
 
 use crate::support::{
     Case, FAKE_TOOL, GATE, Running, assert_in_order, copy_tool, events, finish, git, git_init, heavy_words, nothing_back, powershell_folder,
-    record_path, release, run_words, shown, start, wait_for_journal_line, wait_until, write_counts, write_remote_json,
+    record_path, release, run_words, shown, wait_for_journal_line, wait_until, write_counts, write_remote_json,
 };
 
 pub(crate) const HOST: &str = "builder";
@@ -59,17 +57,6 @@ pub(crate) fn heavy_words_with_limit<'a>(log: &'a str, extra: &[&'a str], comman
     let mut before = GIT_HANG_GUARDS.to_vec();
     before.extend(extra);
     heavy_words(log, &before, command)
-}
-
-/// The remote.ps1 a routed run of the case that selects no test client is given, `--test-remote-script`'s value: a
-/// file the case folder never holds, so the run never reads the real remote.ps1.
-fn missing_script(case: &Case) -> String {
-    word(case, "no-remote.ps1")
-}
-
-/// The line a routed run given the remote.ps1 `script`, which is missing, says as it falls back.
-fn client_line(script: &str) -> String {
-    format!("gate: remote builder client could not start: cannot find remote.ps1 at {script}; running here")
 }
 
 /// The path of a file `name` in the case folder, as a step's or a command's word.
@@ -208,37 +195,16 @@ fn stdout_lines(stdout: &str) -> Vec<&str> {
     stdout.lines().collect()
 }
 
-#[test]
-fn with_no_test_client_a_routed_run_falls_back_with_reason_client() {
-    let case = routed_case("routing-no-client");
-    let script = missing_script(&case);
-    let seam = ["--test-remote-script", script.as_str()];
-    let outcome = finish(case.gate(&heavy_words_with_limit("out.log", &seam, &[r".\tool.exe", "out", "ran here"])));
-
-    let client_line = client_line(&script);
-    assert_eq!(outcome.code, Some(0), "{outcome:?}");
-    assert!(outcome.stderr.contains(&client_line), "{outcome:?}");
-    assert!(outcome.stdout.contains("ran here"), "{outcome:?}");
-    assert_fell_back(&case, &events(&case));
-    let log = fs::read_to_string(case.folder().join("out.log")).expect("the log was written");
-    assert_in_order(&log, &["ran here", &client_line]);
-}
-
-/// The suite's stand-in for ssh, which a remote-cutover case copies as `ssh.exe` into a folder first on the gate's
-/// `PATH`, so the gate finds it as ssh with no seam naming it.
+/// The suite's stand-in for ssh, which an ssh case copies as `ssh.exe` into a folder first on the gate's `PATH`, so the
+/// gate finds it as ssh with no seam naming it.
 const FAKE_SSH: &str = env!("CARGO_BIN_EXE_fake-ssh");
 /// The line a routed run says when its builder's preflight ends with cmd's status for a program it cannot find.
 const NO_BOX_LINE: &str = "gate: not routed: builder has no gate box that takes this run (preflight status 9009)";
 
-/// A [`routed_case`] whose `.gitignore` leaves the gate's own files and an `ssh` folder out of the snapshot, and, when
-/// `flag`, the remote-cutover flag in its state root.
-fn cutover_case(name: &str, flag: bool) -> Case {
+/// A [`routed_case`] whose `.gitignore` leaves the gate's own files and an `ssh` folder out of the snapshot.
+fn ssh_case(name: &str) -> Case {
     let case = routed_case(name);
     fs::write(case.folder().join(".gitignore"), "state/\nappdata/\n*.log\nssh/\n.tmp/\n").expect("the ignore file can be written");
-    if flag {
-        fs::create_dir_all(case.root()).expect("the state root can be made");
-        fs::write(case.root().join("remote-cutover.flag"), "").expect("the flag can be written");
-    }
     case
 }
 
@@ -267,11 +233,10 @@ fn git_folder() -> PathBuf {
         .expect("git.exe is on PATH; the routing cases need it")
 }
 
-/// The gate of a routed run of a [`cutover_case`] logging to `out.log`, given the missing remote.ps1 `script`, with
-/// `path` as its `PATH` and the stand-in reading `steps`.
-fn cutover_gate(case: &Case, path: &OsStr, steps: &Path, script: &str) -> Command {
-    let seam = ["--test-remote-script", script];
-    let mut gate = case.gate(&heavy_words_with_limit("out.log", &seam, &[r".\tool.exe", "out", "ran here"]));
+/// The gate of a routed run of an [`ssh_case`] logging to `out.log`, with `path` as its `PATH` and the stand-in
+/// reading `steps`.
+fn ssh_gate(case: &Case, path: &OsStr, steps: &Path) -> Command {
+    let mut gate = case.gate(&heavy_words_with_limit("out.log", &[], &[r".\tool.exe", "out", "ran here"]));
     gate.env("PATH", path).env("GATE_FAKE_SSH_STEPS", steps);
     gate
 }
@@ -284,63 +249,45 @@ fn ssh_calls(steps: &Path) -> Vec<String> {
 }
 
 #[test]
-fn the_remote_cutover_flag_routes_through_ssh_to_the_builders_gate() {
-    let case = cutover_case("routing-cutover-flag", true);
-    let outside = Case::new("routing-cutover-flag-ssh");
+fn a_routed_run_goes_through_ssh_to_the_builders_gate() {
+    let case = ssh_case("routing-ssh");
+    let outside = Case::new("routing-ssh-stand-in");
     let steps = fake_ssh_in(&outside.folder());
-    let script = missing_script(&case);
 
-    let outcome = finish(cutover_gate(&case, &path_with(&outside.folder()), &steps, &script));
+    let outcome = finish(ssh_gate(&case, &path_with(&outside.folder()), &steps));
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert!(outcome.stderr.contains(NO_BOX_LINE), "{outcome:?}");
     assert!(outcome.stderr.contains("gate: remote builder version; running here"), "{outcome:?}");
-    assert!(!outcome.stderr.contains(&client_line(&script)), "the bridge is not called: {outcome:?}");
     assert!(outcome.stdout.contains("ran here"), "{outcome:?}");
     assert_eq!(ssh_calls(&steps), ["preflight"], "the builder's gate box was asked through ssh");
     assert_refused(&events(&case), "version");
 }
 
 #[test]
-fn without_the_flag_a_routed_run_keeps_the_bridge() {
-    let case = cutover_case("routing-cutover-no-flag", false);
-    let outside = Case::new("routing-cutover-no-flag-ssh");
-    let steps = fake_ssh_in(&outside.folder());
-    let script = missing_script(&case);
-
-    let outcome = finish(cutover_gate(&case, &path_with(&outside.folder()), &steps, &script));
-
-    assert_eq!(outcome.code, Some(0), "{outcome:?}");
-    assert!(outcome.stderr.contains(&client_line(&script)), "{outcome:?}");
-    assert!(outcome.stdout.contains("ran here"), "{outcome:?}");
-    assert_eq!(ssh_calls(&steps), Vec::<String>::new(), "ssh was never called");
-    assert_fell_back(&case, &events(&case));
-}
-
-#[test]
-fn with_the_flag_and_no_ssh_a_routed_run_falls_back_with_reason_client() {
-    let case = cutover_case("routing-cutover-no-ssh", true);
+fn with_no_ssh_a_routed_run_falls_back_with_reason_client() {
+    let case = ssh_case("routing-no-ssh");
     let git = git_folder();
     assert!(!git.join("ssh.exe").exists(), "git's folder holds no ssh.exe: {}", git.display());
-    let script = missing_script(&case);
 
-    let outcome = finish(cutover_gate(&case, git.as_os_str(), &case.folder().join("no-ssh.steps"), &script));
+    let outcome = finish(ssh_gate(&case, git.as_os_str(), &case.folder().join("no-ssh.steps")));
 
+    let no_ssh = "gate: remote builder client could not start: cannot run ssh: ";
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
-    assert!(outcome.stderr.contains("client could not start: cannot run ssh: "), "{outcome:?}");
-    assert!(!outcome.stderr.contains(&client_line(&script)), "the bridge is not called: {outcome:?}");
+    assert!(outcome.stderr.contains(no_ssh), "{outcome:?}");
     assert!(outcome.stdout.contains("ran here"), "{outcome:?}");
     assert_fell_back(&case, &events(&case));
+    let log = fs::read_to_string(case.folder().join("out.log")).expect("the log was written");
+    assert_in_order(&log, &["ran here", no_ssh]);
 }
 
 #[test]
-fn with_the_flag_an_ssh_inside_the_worktree_is_refused_with_reason_client() {
-    let case = cutover_case("routing-cutover-ssh-inside", true);
+fn an_ssh_inside_the_worktree_is_refused_with_reason_client() {
+    let case = ssh_case("routing-ssh-inside");
     let folder = case.folder().join("ssh");
     let steps = fake_ssh_in(&folder);
-    let script = missing_script(&case);
 
-    let outcome = finish(cutover_gate(&case, &path_with(&folder), &steps, &script));
+    let outcome = finish(ssh_gate(&case, &path_with(&folder), &steps));
 
     let line = format!(
         "gate: remote builder client could not start: cannot run ssh: {} lies inside the worktree; running here",
@@ -351,188 +298,6 @@ fn with_the_flag_an_ssh_inside_the_worktree_is_refused_with_reason_client() {
     assert!(outcome.stdout.contains("ran here"), "{outcome:?}");
     assert_eq!(ssh_calls(&steps), Vec::<String>::new(), "the refused ssh was never run");
     assert_refused(&events(&case), "client");
-}
-
-/// The line a routed run says when the drain marker names a drainer that is not running.
-const DRAIN_NOT_RUNNING_LINE: &str = "gate: the remote cutover's drain is not running; run gate remote-cutover again; running here";
-
-/// The line a routed run says once as it waits for the remote cutover's drain, whose drainer is this test process.
-fn drain_waiting_line() -> String {
-    format!("gate: waiting for the remote cutover's drain (pid {}) before routing", process::id())
-}
-
-/// The start of this test process in Unix epoch milliseconds, which a drain marker naming it as a live drainer carries.
-fn own_start_ms() -> u64 {
-    gate_win32::process_start_of(process::id())
-        .expect("this process's start can be read")
-        .expect("this process runs")
-        .as_millisecond()
-        .unsigned_abs()
-}
-
-/// Writes the drain marker in the case's root naming this test process, started at `start_ms`, as the drainer: alive
-/// with [`own_start_ms`], dead with any other start.
-fn write_drain_marker(case: &Case, start_ms: u64) {
-    v1::write_drain_marker(&case.root(), process::id(), start_ms, own_start_ms()).expect("the drain marker can be written");
-}
-
-/// The gate of a routed run of a [`cutover_case`] as [`cutover_gate`] makes it, whose wait for the drain reads the flag
-/// and the marker every 50 ms.
-fn drain_gate(case: &Case, path: &OsStr, steps: &Path, script: &str) -> Command {
-    let seams = ["--test-remote-script", script, "--test-poll-ms", "50"];
-    let mut gate = case.gate(&heavy_words_with_limit("out.log", &seams, &[r".\tool.exe", "out", "ran here"]));
-    gate.env("PATH", path).env("GATE_FAKE_SSH_STEPS", steps);
-    gate
-}
-
-/// Returns once the routed run `running` of `case` says it waits for the drain, while it still runs, having asked ssh
-/// nothing and taken no ticket and no remote slot.
-fn wait_for_the_drain_wait(case: &Case, running: &mut Running, steps: &Path) {
-    let line = drain_waiting_line();
-    running.wait_for_stderr_while_running("the drain's waiting line", |stderr| stderr.contains(&line));
-    assert_eq!(ssh_calls(steps), Vec::<String>::new(), "ssh is not called while the run waits");
-    assert!(!has_ticket(case, running.id()), "the waiting run holds no ticket");
-    assert!(!remote_claim(case).exists(), "the waiting run holds no remote slot");
-    assert_eq!(names(&own(case, running.id())), ["queue"], "the waiting run took nothing");
-}
-
-#[test]
-fn a_routed_run_during_the_drain_waits_then_routes_on_the_rust_client() {
-    let case = cutover_case("routing-drain-wait", true);
-    let outside = Case::new("routing-drain-wait-ssh");
-    let steps = fake_ssh_in(&outside.folder());
-    let script = missing_script(&case);
-    write_drain_marker(&case, own_start_ms());
-
-    let mut running = start(drain_gate(&case, &path_with(&outside.folder()), &steps, &script));
-    wait_for_the_drain_wait(&case, &mut running, &steps);
-    fs::remove_file(v1::remote_cutover_draining_path(&case.root())).expect("the drain marker can be removed");
-    let outcome = running.finish();
-
-    assert_eq!(outcome.code, Some(0), "{outcome:?}");
-    assert_eq!(
-        outcome.stderr.matches(&drain_waiting_line()).count(),
-        1,
-        "the waiting line is said once: {outcome:?}"
-    );
-    assert!(outcome.stderr.contains(NO_BOX_LINE), "{outcome:?}");
-    assert!(outcome.stderr.contains("gate: remote builder version; running here"), "{outcome:?}");
-    assert!(!outcome.stderr.contains(&client_line(&script)), "the bridge is not called: {outcome:?}");
-    assert!(outcome.stdout.contains("ran here"), "{outcome:?}");
-    assert_eq!(ssh_calls(&steps), ["preflight"], "the builder's gate box was asked through ssh");
-    assert_refused(&events(&case), "version");
-}
-
-#[test]
-fn a_routed_run_whose_drainer_has_ended_runs_here_with_reason_client() {
-    let case = cutover_case("routing-drain-dead", true);
-    let outside = Case::new("routing-drain-dead-ssh");
-    let steps = fake_ssh_in(&outside.folder());
-    let script = missing_script(&case);
-    write_drain_marker(&case, own_start_ms() + 1);
-
-    let outcome = finish(drain_gate(&case, &path_with(&outside.folder()), &steps, &script));
-
-    assert_eq!(outcome.code, Some(0), "{outcome:?}");
-    assert_eq!(outcome.stderr.matches(DRAIN_NOT_RUNNING_LINE).count(), 1, "{outcome:?}");
-    assert!(!outcome.stderr.contains("gate: waiting for the remote cutover's drain"), "{outcome:?}");
-    assert!(
-        !outcome.stderr.contains("client could not start"),
-        "the drain's line is the only fallback line: {outcome:?}"
-    );
-    assert!(outcome.stdout.contains("ran here"), "{outcome:?}");
-    assert_eq!(ssh_calls(&steps), Vec::<String>::new(), "ssh was never called");
-    assert_fell_back(&case, &events(&case));
-}
-
-#[test]
-fn deleting_the_flag_during_the_wait_returns_the_run_to_the_bridge() {
-    let case = cutover_case("routing-drain-rollback", true);
-    let outside = Case::new("routing-drain-rollback-ssh");
-    let steps = fake_ssh_in(&outside.folder());
-    let script = missing_script(&case);
-    write_drain_marker(&case, own_start_ms());
-
-    let mut running = start(drain_gate(&case, &path_with(&outside.folder()), &steps, &script));
-    wait_for_the_drain_wait(&case, &mut running, &steps);
-    fs::remove_file(v1::remote_cutover_flag_path(&case.root())).expect("the flag can be removed");
-    let outcome = running.finish();
-
-    assert_eq!(outcome.code, Some(0), "{outcome:?}");
-    assert!(outcome.stderr.contains(&client_line(&script)), "the bridge is called: {outcome:?}");
-    assert!(outcome.stdout.contains("ran here"), "{outcome:?}");
-    assert_eq!(ssh_calls(&steps), Vec::<String>::new(), "ssh was never called");
-    assert_fell_back(&case, &events(&case));
-}
-
-/// The lines of `stderr` that say a routed run waits for the remote cutover because it cannot read the drain marker.
-fn refused_marker_lines(stderr: &str) -> Vec<&str> {
-    stderr
-        .lines()
-        .filter(|line| line.starts_with("gate: waiting for the remote cutover; cannot read "))
-        .collect()
-}
-
-#[test]
-fn a_drain_marker_whose_opening_is_refused_keeps_the_run_waiting() {
-    let case = cutover_case("routing-drain-refused", true);
-    let outside = Case::new("routing-drain-refused-ssh");
-    let steps = fake_ssh_in(&outside.folder());
-    let script = missing_script(&case);
-    // Opening a folder at the marker's name as a file is refused, as opening a marker held without sharing is.
-    let marker = v1::remote_cutover_draining_path(&case.root());
-    fs::create_dir(&marker).expect("a folder can stand at the drain marker's name");
-
-    let mut running = start(drain_gate(&case, &path_with(&outside.folder()), &steps, &script));
-    // Five 50 ms polls of refused reads say the line, and the run still waits after it.
-    running.wait_for_stderr_while_running("the refused marker's line", |stderr| !refused_marker_lines(stderr).is_empty());
-    assert_eq!(ssh_calls(&steps), Vec::<String>::new(), "ssh is not called while the marker stands");
-    fs::remove_file(v1::remote_cutover_flag_path(&case.root())).expect("the flag can be removed");
-    let outcome = running.finish();
-
-    assert_eq!(outcome.code, Some(0), "{outcome:?}");
-    let refused = refused_marker_lines(&outcome.stderr);
-    assert_eq!(refused.len(), 1, "the refused marker's line is said once: {outcome:?}");
-    let named = format!("{} (", marker.file_name().expect("the marker has a name").to_string_lossy());
-    assert!(
-        refused[0].contains(&named) && refused[0].ends_with(')'),
-        "the line names the marker and why: {outcome:?}"
-    );
-    assert!(
-        !outcome.stderr.contains("gate: waiting for the remote cutover's drain"),
-        "no read named a drainer: {outcome:?}"
-    );
-    assert!(outcome.stderr.contains(&client_line(&script)), "the bridge is called: {outcome:?}");
-    assert!(outcome.stdout.contains("ran here"), "{outcome:?}");
-    assert_eq!(ssh_calls(&steps), Vec::<String>::new(), "ssh was never called");
-    assert_fell_back(&case, &events(&case));
-}
-
-#[test]
-fn a_ctrl_c_during_the_drain_wait_ends_before_the_command() {
-    let case = cutover_case("routing-drain-ctrl-c", true);
-    let outside = Case::new("routing-drain-ctrl-c-ssh");
-    let steps = fake_ssh_in(&outside.folder());
-    let script = missing_script(&case);
-    write_drain_marker(&case, own_start_ms());
-
-    let mut running = start_in_own_console(drain_gate(&case, &path_with(&outside.folder()), &steps, &script));
-    wait_for_the_drain_wait(&case, &mut running, &steps);
-    let sent = send_ctrl_c_to_the_console_of(running.id());
-    assert!(
-        sent.status.success(),
-        "pwsh sent the Ctrl+C ({}): {}",
-        sent.status,
-        String::from_utf8_lossy(&sent.stderr)
-    );
-    wait_until("the gate ending at the Ctrl+C", || !running.is_running());
-    let outcome = running.finish();
-
-    assert_eq!(outcome.code, Some(CONTROL_C_EXIT), "{outcome:?}");
-    assert!(outcome.stderr.contains("gate: interrupted before the command started"), "{outcome:?}");
-    assert!(!outcome.stdout.contains("ran here"), "the command never ran: {outcome:?}");
-    assert_eq!(ssh_calls(&steps), Vec::<String>::new(), "ssh was never called");
-    assert_eq!(names(&events(&case)), ["queue", "abandon"], "the run abandoned its wait and took no slot");
 }
 
 /// Sends a Ctrl+C to the console of the process `pid` from a pwsh that leaves its own console, attaches to that one and
@@ -651,39 +416,40 @@ fn a_folder_named_with_spaces_and_brackets_holding_a_file_routes() {
     let empty = case.folder().join("empty.gitconfig");
     fs::write(&empty, "").expect("an empty git config can be written");
     let log = log_path(&case, "out.log");
-    let script = missing_script(&case);
-    let seam = ["--test-remote-script", script.as_str()];
-    let mut command = case.gate_in("my dir [1]", &heavy_words_with_limit(&log, &seam, &[r".\tool.exe", "out", "ran here"]));
+    let call = case.folder().join("call.json");
+    let steps = shown(&stub(&case, &[&format!("record {}", shown(&call)), "refuse busy"]));
+    let mut command = case.gate_in("my dir [1]", &routed_words(&log, &steps, &[], &[r".\tool.exe", "out", "ran here"]));
     command.env("GIT_CONFIG_GLOBAL", &empty).env("GIT_CONFIG_NOSYSTEM", "1");
     let outcome = finish(command);
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
-    assert!(
-        outcome.stderr.contains(&client_line(&script)),
-        "the folder's name is a literal path: {outcome:?}"
-    );
-    assert_fell_back(&case, &events(&case));
+    assert!(outcome.stderr.contains(BUSY_LINE), "{outcome:?}");
+    let call = recorded(&call);
+    assert_eq!(call["subfolder"], "my dir [1]", "the folder's name is a literal path: {call}");
+    assert_refused(&events(&case), "busy");
 }
 
 #[test]
 fn with_git_dir_and_work_tree_inherited_a_gate_in_a_subfolder_still_routes() {
     let case = routed_case("routing-git-dir");
     sub_folder(&case, "sub", true);
-    let script = missing_script(&case);
-    let seam = ["--test-remote-script", script.as_str()];
-    let at_root = finish(case.gate(&heavy_words_with_limit("root.log", &seam, &[r".\tool.exe", "out", "hi"])));
+    let refuse = shown(&stub(&case, &["refuse busy"]));
+    let at_root = finish(case.gate(&routed_words("root.log", &refuse, &[], &[r".\tool.exe", "out", "hi"])));
     let log = log_path(&case, "sub.log");
-    let mut command = case.gate_in("sub", &heavy_words_with_limit(&log, &seam, &[r".\tool.exe", "out", "hi"]));
+    let call = case.folder().join("call.json");
+    let steps = shown(&stub(&case, &[&format!("record {}", shown(&call)), "refuse busy"]));
+    let mut command = case.gate_in("sub", &routed_words(&log, &steps, &[], &[r".\tool.exe", "out", "hi"]));
     // As a hook run at the worktree's root exports them: relative, so they name the case's repo only from its root.
     command.env("GIT_DIR", ".git").env("GIT_WORK_TREE", ".");
     let in_sub = finish(command);
 
     assert_eq!((at_root.code, in_sub.code), (Some(0), Some(0)), "{at_root:?} {in_sub:?}");
-    assert!(in_sub.stderr.contains(&client_line(&script)), "{in_sub:?}");
+    assert!(in_sub.stderr.contains(BUSY_LINE), "{in_sub:?}");
+    assert_eq!(recorded(&call)["subfolder"], "sub", "the subfolder's gate is routed from its folder");
     let events = events(&case);
-    assert_fell_back(&case, &events[..4]);
-    assert_fell_back(&case, &events[4..]);
-    assert_eq!(events[4]["key"], events[0]["key"], "the subfolder's gate is placed in the same worktree");
+    assert_refused(&events[..5], "busy");
+    assert_refused(&events[5..], "busy");
+    assert_eq!(events[5]["key"], events[0]["key"], "the subfolder's gate is placed in the same worktree");
 }
 
 #[test]
@@ -705,14 +471,19 @@ fn a_worktree_with_unstaged_deletes_does_not_count_a_deleted_folder_as_holding_f
 fn a_path_argument_with_spaces_routes_with_the_word_intact() {
     let case = routed_case("routing-spaces");
     let word = r"dir with spaces\file.txt";
-    let script = missing_script(&case);
-    let seam = ["--test-remote-script", script.as_str()];
-    let outcome = finish(case.gate(&heavy_words_with_limit("out.log", &seam, &[r".\tool.exe", "argv", word])));
+    let call = case.folder().join("call.json");
+    let steps = shown(&stub(&case, &[&format!("record {}", shown(&call)), "refuse busy"]));
+    let outcome = finish(case.gate(&routed_words("out.log", &steps, &[], &[r".\tool.exe", "argv", word])));
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
-    assert!(outcome.stderr.contains(&client_line(&script)), "{outcome:?}");
+    assert!(outcome.stderr.contains(BUSY_LINE), "{outcome:?}");
+    assert_eq!(
+        recorded_words(&recorded(&call))[1..],
+        ["argv", word],
+        "the builder is sent the word whole"
+    );
     assert!(stdout_lines(&outcome.stdout).contains(&word), "{outcome:?}");
-    assert_fell_back(&case, &events(&case));
+    assert_refused(&events(&case), "busy");
 }
 
 #[test]
@@ -1129,14 +900,11 @@ fn routed_build(case: &Case, log: &str) {
 }
 
 #[test]
-fn a_routed_build_through_the_bridge_leaves_a_record_a_later_light_no_build_drops_the_word_on_a_heavy_slot() {
+fn a_routed_build_leaves_a_record_a_later_light_no_build_drops_the_word_on_a_heavy_slot() {
     let case = routed_case("routing-nothing-back");
     copy_tool(&case, "dotnet.exe");
     dotnet_cmd(&case);
-    let script = stand_in(&case, "remote.ps1", &answer(0, false, None));
-    let routed = finish(case.gate(&bridge_words("routed.log", &script, &[], &[r".\dotnet.exe", "build"])));
-    assert_eq!(routed.code, Some(0), "{routed:?}");
-    assert_eq!(nothing_back(&case).as_deref(), Some(NOTHING_BACK_RECORD), "{routed:?}");
+    routed_build(&case, "routed.log");
 
     let here = finish(case.gate(&run_words("here.log", &[], &NO_BUILD_TEST)));
 

@@ -18,7 +18,7 @@ Suite = `crates/gate/tests/suite/` (binary `suite`, needs `--all-features`; test
 |---|---|---|
 | main.rs | all (entry; `answer::answer`, exit-status cast) | CENTRAL |
 | answer.rs | all; dispatch per subcommand, usage errors (`cli`), `--test-print-request` branch (`request`, `compat`, `cutover`, `harness`, `launcher`) | CENTRAL |
-| run.rs | all runs: launch, hold, stall, ceiling, cores, journal, slots, critical, nesting, routing (the local `--no-build` drop, its lines and kinds, the nothing-back record's write and clear), bridge, remote_client, interrupt, diagnostics, priority, build_servers, pause | CENTRAL |
+| run.rs | all runs: launch, hold, stall, ceiling, cores, journal, slots, critical, nesting, routing (the local `--no-build` drop, its lines and kinds, the nothing-back record's write and clear), remote_client, interrupt, diagnostics, priority, build_servers, pause | CENTRAL |
 | no_build.rs | `routing` (the drop reasons, the obj check, the record's write, clear and unreadable cases); the unit tests inside (record read, solution readers, `Directory.Build.*` skip, listing parse) | no: routing |
 | resolve.rs | `request` (state root from `--state-dir`/`GATE_STATE_DIR`, log path), `compat`, `harness`, `launch` (log inside state root); used by every run | CENTRAL (resolve.rs:`root`/`log` on every run) |
 | console.rs | every case reads stdout/stderr lines; `launch`, `hold`, `cli` | CENTRAL |
@@ -33,7 +33,7 @@ Suite = `crates/gate/tests/suite/` (binary `suite`, needs `--all-features`; test
 | nesting/binding.rs | `nesting` (marker bound to the parent's job: `a_gate_under_cmd_and_pwsh_in_its_parents_command_is_covered`, unbound and unjudged lines) | no: nesting, critical, pause, slots, journal |
 | nesting.rs | `nesting` (marker parse, liveness, covered/refused/own), `critical` (refusal under marker), `pause`, `slots` | no, but run.rs calls it on every run (`admitted`, run.rs:154): nesting, critical, pause, slots, journal |
 | pause.rs | `pause` (marker rewritten each pass), `stall`/`ceiling` (paused time via `watch.rs` PauseReader), `nesting` | no: pause, nesting, stall, ceiling, cores |
-| journal.rs | `journal` (v1 lines, verdict, quoted command, rollover), plus any case asserting a journal line: `slots`, `critical`, `nesting`, `cores`, `routing`, `interrupt`, `cutover`?, `stall` (load-adjusted s), `bridge` | CENTRAL-ish (writes every run; run `journal`, `cores`, `nesting`, `slots`, `critical`, `routing`, `stall`, `interrupt`, `launch`, `hold`) |
+| journal.rs | `journal` (v1 lines, verdict, quoted command, rollover), plus any case asserting a journal line: `slots`, `critical`, `nesting`, `cores`, `routing`, `interrupt`, `cutover`?, `stall` (load-adjusted s) | CENTRAL-ish (writes every run; run `journal`, `cores`, `nesting`, `slots`, `critical`, `routing`, `stall`, `interrupt`, `launch`, `hold`) |
 | watch.rs | `stall`, `ceiling` (`--test-sampler-fail`, backstop), `cores`, `diagnostics`, `build_servers`, `priority`, `pause`, `interrupt` (`--test-interrupt-after-samples`), `hold`, `launch` (every command is watched); unit tests inside (an escaped build client, the sample's `escaped cpu`, the departed members' children in the diagnostics) | CENTRAL (every launched command is watched) |
 | servers.rs | `build_servers` (client in job, server outside), `priority` (`--test-server-image`, `--test-servers-under`), `ceiling`, `diagnostics`, `launch`/`cli`/`install` pass `--test-servers-under` only to confine the scan | no: build_servers, priority, diagnostics, ceiling, stall, pause (sampling) |
 | priority.rs | `priority` (lower/raise servers, OtherGates guard), `critical` (raise to High), `build_servers` | no: priority, critical |
@@ -45,12 +45,10 @@ Suite = `crates/gate/tests/suite/` (binary `suite`, needs `--all-features`; test
 | escaped.rs | `stall` (`a_stall_kill_ends_a_packaged_app_the_command_started`, machine-dependent; `a_stall_kill_ends_a_child_outside_the_job_whose_launcher_has_ended`, machine-alone `#[ignore]`, with `stall::a_stall_kill_ends_a_child_outside_the_job_whose_launcher_exited_at_once` (machine-alone `#[ignore]`: the launcher ends before the first sample, so only the job's memory of it reaches the escapee), `ceiling::a_ceiling_kill_ends_a_child_outside_the_job_whose_launcher_has_ended` and `interrupt::a_ctrl_c_ends_a_child_outside_the_job_whose_launcher_has_ended`; the escapee cases that start it with `fake-tool spawn-away` under `--test-job-breakaway`; the unit tests inside), `cores` (`a_command_whose_child_left_its_job_counts_that_child_s_cores`), `interrupt` and `ceiling` (the other kills run it too) | no: stall, cores, interrupt, ceiling |
 | burn.rs | `burn` (`gate burn`: start line, status, parent watch), `cli` (usage and refusals) | no: burn, cli |
 | request_json.rs | `request`, `compat`, `cutover` (`--test-print-request`), `launcher`, `harness`, `support` | no: request, compat, cutover, launcher, harness |
-| route.rs | `routing` (decisions, `--test-git`, remote.json), `remote_client`, `bridge`, `request` | no: routing, remote_client, bridge |
+| route.rs | `routing` (decisions, `--test-git`, remote.json), `remote_client`, `request` | no: routing, remote_client |
 | bin/fake-tool.rs | helper for nearly every module (`support.rs`); signature change -> whole suite | CENTRAL (helper) |
 | bin/fake-ssh.rs | `remote_client` (`--test-remote-ssh`), `push` (`--test-push-ssh`), `routing` (copied as `ssh.exe` on `PATH` for the remote-cutover cases) | no: remote_client, push, routing |
-| remote/mod.rs | `routing` (scripted client `--test-remote-client`, fallback reason `client`), `bridge`, `remote_client` | no: routing, bridge, remote_client |
-| remote/switch.rs | `routing` (the remote-cutover flag present or absent, a drain marker naming a live, dead or unreadable drainer, `ssh.exe` on `PATH`; the cases that name no client seam), the unit tests inside | no: routing |
-| remote/bridge.rs | `bridge` (`--test-remote-script`, `--test-bridge`), `routing` (5 uses of `--test-remote-script`), `request` (print only) | no: bridge, routing |
+| remote/mod.rs | `routing` (scripted client `--test-remote-client`, fallback reason `client`, a run with no ssh), `remote_client` | no: routing, remote_client |
 | remote/{client,parity,retry,transport,watchdog,syncback,outputs,install,payload,snapshot}.rs | `remote_client` (`--test-remote-transport local:`, `--test-local-sdks`, `--test-dotnet-limit-ms`, `--test-remote-log-cap-bytes`, `--test-remote-ssh`, `--test-remote-snapshot`, `--test-remote-watch-call`, `--test-remote-timeout-ms`, `--test-remote-fetch-cap-bytes`, `--test-remote-outputs-budget-bytes`...), `syncback_quarantine` (the sync-back's quarantine, move and sweep), `syncback_conversions` (the checkout-filter refusal, the `.lfsconfig` and spelled names, the weighted apply cap; a `test-seams` build feeds `check-attr` about two paths at a time, so the unit module `remote::syncback::output_cap_slices` checks the slicing at `OUTPUT_CAP` in either build); `transport.rs` ssh words + `Ssh::find` + `Ssh::find_in` also `push` and `routing` (through the switch), and `transport.rs`'s `Transport::judge` and `sent_repo` are also reached by `routing`; `payload.rs` is what `boxside` payload tests read through `local:` builder | no: remote_client, syncback_quarantine, syncback_conversions (+ push and routing for transport.rs, + boxside for payload.rs/outputs.rs) |
 | remote/{git,launch}.rs | `remote_client` (`--test-git`), `routing` (`--test-git`, `--test-git-limit-ms` and `--test-git-drain-ms` in `GIT_HANG_GUARDS`, route facts), `syncback_quarantine` (`Call.set`, the sync-back's git environment), `syncback_conversions` (`OUTPUT_CAP` bounds the `check-attr` slices), `request`, `boxside` (`sdk_listing` reads the preflight's SDK list) | no: remote_client, routing, syncback_quarantine, syncback_conversions (+ boxside for git.rs) |
 | boxside/mod.rs, payload.rs, preflight.rs, boot.rs, run.rs, stop.rs, inflight.rs | `boxside` (29 flag/verb uses; the case runs `gate box boot/preflight/run/stop/inflight`; `--test-dotnet-limit-ms` bounds the preflight's SDK read, as in `boxside::preflight_a_dotnet_that_does_not_answer_is_an_unreadable_sdk_list`), `remote_client` (builder is `gate box` via `local:`) | no: boxside, remote_client |
@@ -64,13 +62,13 @@ Suite = `crates/gate/tests/suite/` (binary `suite`, needs `--all-features`; test
 | Area | Suite modules that reach it | Own tests | Central? |
 |---|---|---|---|
 | gate-args lib.rs / cli.rs / values.rs / problem.rs / usage.rs | every case parses argv: all suite (parse errors `cli`, usage `cli`) | `gate-args::args` (top, run, boxcmd), unit | CENTRAL |
-| gate-args request.rs / run.rs (seam parsing) | `request`, plus every module whose flags it parses (`--bring-tracked`: `remote_client`; the `remote-cutover` words and seams: `remote_cutover`) | args tests `run`, `remote_cutover` | CENTRAL (a seam rename breaks callers) |
+| gate-args request.rs / run.rs (seam parsing) | `request`, plus every module whose flags it parses (`--bring-tracked`: `remote_client`; the `remote-cutover` words and seams: `remote_cutover`) | args tests `run`, `remote_cutover`, `seams` (the removed bridge seams are unknown options) | CENTRAL (a seam rename breaks callers) |
 | gate-args compat.rs | `compat`, `launcher`, `request`, `cli` | args `compat` | no |
 | gate-args boxcmd.rs | `boxside`, `boxside::outputs`, `remote_client` | args `boxcmd` | no |
 | gate-args cmdline.rs / batch.rs / program.rs | `launch` (quoting, refused batch word, `.cmd`), `journal` (`command_text`), `boxside`, `remote_client` | args `quoting`, `batch`, `program` | no |
-| gate-router (decide, rewrite, key, like, config) | `routing` (imports `DROPPED_NO_BUILD_LINE`, `NO_OUTPUTS_LINE`; `decide.rs`'s dotnet readers also drive the local drop and the record), `remote_client` (`repo_name`), `bridge`, `request` | `gate-router::router` (`decide`: the wrapped form, the drop verbs, the targets and settings) | no |
+| gate-router (decide, rewrite, key, like, config) | `routing` (imports `DROPPED_NO_BUILD_LINE`, `NO_OUTPUTS_LINE`; `decide.rs`'s dotnet readers also drive the local drop and the record), `remote_client` (`repo_name`), `request` | `gate-router::router` (`decide`: the wrapped form, the drop verbs, the targets and settings) | no |
 | gate-state v1.rs / root.rs / model.rs / lib.rs | everything (claim/ticket/counts/root hash/kernel names): CENTRAL. Suite itself reads `v1` in `critical, interrupt, journal, launch, nesting, pause, priority, slots`; `v1.rs`'s nothing-back record (path, write, strict read) is also read in `routing`, and its outputs cap record (`remote/outputs.rs`) in `remote_client` and the `remote::client` unit tests | `gate-state::state` (`v1`: the record's shape and strict read) | CENTRAL |
-| gate-state journal_writer.rs / verdict.rs | `journal` + any journal assertion: `cores, nesting, routing, slots, critical, stall, launch, interrupt, bridge` | state `journal_write`, `verdict` | no, but wide (writes on every run) |
+| gate-state journal_writer.rs / verdict.rs | `journal` + any journal assertion: `cores, nesting, routing, slots, critical, stall, launch, interrupt` | state `journal_write`, `verdict` | no, but wide (writes on every run) |
 | gate-state archive.rs | `journal` (rollover and archive with concurrent appenders) | state `archive` | no |
 | gate-state cutover.rs / drain.rs / counts.rs | `cutover`, `launcher` (gate/src/cutover.rs imports `copy_slot_counts_to_v1, powershell_gates, write_cutover_flag`); `counts.rs`'s `write_replacing` (the temp names) also writes the v1 files, so a change there adds `routing` | state `cutover`, `counts`; a unit test inside `counts.rs` for the temp names | no |
 | gate-state tests/state/fixtures/ (captured files, `capture-*.ps1`) and tests/state/fixtures.rs | none (the fixtures are captured from `gate.exe` and the PowerShell gate by script and only read by the state tests) | state `fixtures` (incl. `remote_run_journal_from_gate_exe_is_read_into_runs_and_a_split_summary`) | no |
@@ -81,17 +79,16 @@ Suite = `crates/gate/tests/suite/` (binary `suite`, needs `--all-features`; test
 | gate-watchdog diagnostics.rs | `diagnostics`, `stall`, `ceiling`, `build_servers` (`--test-diagnostics-budget-ms` cuts every block) | unit | no |
 | gate-watchdog heartbeat.rs | `boxside`, `boxside::outputs`, `remote_client`, `critical`/`slots`/`pause` only via `--test-heartbeat-ms` flag (the wait heartbeat is gate/src/wait.rs, not this) | unit | no |
 | gate-win32 job.rs / create.rs / launch.rs / lib.rs / mutex.rs | all (started command, job, slot mutexes): CENTRAL | `gate-win32` tests (launch, mutex, event, interrupt, `io` for `Job::written_bytes`...; unit tests of the completion port: `Job::remember` and its thread, `departed`, `forget`, among them `a_member_that_ended_before_any_look_keeps_its_exact_window_and_no_handle`, `a_member_found_gone_takes_no_one`, `a_member_put_in_the_job_after_its_start_can_have_started_a_process_only_since_the_job_was_created`, `an_exit_message_closes_the_handle_of_that_member_alone`, `the_members_a_memory_could_not_read_are_named_up_to_a_few_and_counted_after` and `dropping_a_remembering_job_ends_its_drain_thread_and_releases_what_it_shares`; in `crates/gate/src/escaped.rs`, `a_look_whose_snapshot_listed_nothing_forgets_no_member` and `a_child_whose_start_is_unknown_of_a_stranger_holding_a_remembered_member_s_pid_is_not_counted`) | CENTRAL |
-| gate-win32 piped.rs / console.rs | `boxside` (`--test-box-console`, `--test-box-park-launch`), `bridge`, `remote_client` | win32 `launch` | no |
+| gate-win32 piped.rs / console.rs | `boxside` (`--test-box-console`, `--test-box-park-launch`), `remote_client` | win32 `launch` | no |
 | gate-win32 priority.rs | `priority`, `critical`, `build_servers` | win32 `priority` | no |
 | gate-win32 tree.rs | `stop_tree`, `stall` (escaped processes), `interrupt`, `boxside` (stop), `burn` (`WaitableProcess`), `nesting` (`OpenedJob::holds`) | win32 `membership` | no |
-| gate-win32 interrupt.rs / event.rs | `interrupt`, `critical`, `cutover`, `routing`, `remote_client`, `boxside` (stop event), `slots` (wake) | win32 `interrupt`, `interrupt_again`, `event` | no |
+| gate-win32 interrupt.rs / event.rs | `interrupt`, `critical`, `cutover`, `routing`, `remote_client`, `boxside` (stop event), `slots` (wake) | win32 `interrupt`, `event` | no |
 | gate-win32 file.rs | `syncback_quarantine`, `syncback_conversions`, `remote_client` (`move_no_replace` moves a sync-back's fetched objects) | win32 `file` | no |
 | gate-win32 device.rs | `routing` (subst drives in route facts) | - | no |
 | gate-win32 times.rs / memory.rs | `stall`, `ceiling`, `cores`, `pause` (samples) | - | no |
 | proc-table | `stop_tree`, `stall` (`parent_pid_of`) (imports `Win32ProcessTable`), `cutover` (`command_line_of`), `diagnostics`, `priority` (via servers/OtherGates), `stall`/`cores` (`ProcessTree::children` through the escaped walk) | proc-table unit | no |
 | tools/gate.ps1 | `launcher` (runs the checked-in launcher), `cutover` (hand-over), `checkout` (`repo_file`) | - | no |
 | tools/install.ps1 | `install`, `checkout` | - | no |
-| tools/remote-bridge.ps1 | `bridge`, `routing` (via `--test-remote-script`), `install` (also installed) | - | no |
 | suite support.rs / harness.rs / main.rs / fake tools | all suite (support.rs is `Case`): CENTRAL for suite; `harness` self-tests | - | CENTRAL |
 | suite module file `X.rs` | its own module only (`test(/^X::/)`), plus `boxside/outputs.rs` -> `boxside::` | - | no |
 | Cargo.toml (workspace), Cargo.lock, crates/gate/Cargo.toml, rust-toolchain, .cargo/, clippy config | whole workspace | - | CENTRAL |
@@ -127,9 +124,8 @@ Always add `checkout` to any change that touches a suite file or adds a seam.
 | burn.rs | `-E 'binary(suite) and test(/^(burn\|cli)::/) or (U and test(/^burn::/))'` |
 | request_json.rs | `-E 'binary(suite) and test(/^(request\|compat\|cutover\|launcher\|harness)::/)'` |
 | no_build.rs | `-E 'binary(suite) and test(/^routing::/) or (U and test(/^(no_build\|run)::/))'` |
-| route.rs | `-E 'binary(suite) and test(/^(routing\|remote_client\|bridge\|request)::/) or (U and test(/^route::/))'` |
-| remote/mod.rs | `-E 'binary(suite) and test(/^(routing\|bridge\|remote_client)::/) or (U and test(/^remote::/))'` |
-| remote/bridge.rs, tools/remote-bridge.ps1 | `-E 'binary(suite) and test(/^(bridge\|routing\|install)::/) or (U and test(/^remote::bridge::/))'` |
+| route.rs | `-E 'binary(suite) and test(/^(routing\|remote_client\|request)::/) or (U and test(/^route::/))'` |
+| remote/mod.rs | `-E 'binary(suite) and test(/^(routing\|remote_client)::/) or (U and test(/^remote::/))'` |
 | remote/{client,retry,watchdog,syncback,snapshot,outputs,install,payload,git,launch,transport}.rs | `-E 'binary(suite) and test(/^(remote_client\|routing\|syncback_quarantine\|syncback_conversions)::/) or (U and test(/^remote::/))'`; add `push` for transport.rs, `boxside` for payload.rs/outputs.rs/git.rs |
 | boxside/{mod,payload,preflight,boot,run,stop,inflight,forward,heartbeat,tools}.rs | `-E 'binary(suite) and test(/^(boxside\|remote_client)::/) or (U and test(/^boxside::/))'` |
 | boxside/outputs.rs, outputs/* | `-E 'binary(suite) and test(/^(boxside::outputs\|remote_client)::/) or (U and test(/^(boxside::outputs\|outputs)::/))'` |
@@ -139,8 +135,8 @@ Always add `checkout` to any change that touches a suite file or adds a seam.
 | gate-args compat.rs | `-E 'package(gate-args) or (binary(suite) and test(/^(compat\|launcher\|request\|cli)::/))'` |
 | gate-args boxcmd.rs | `-E 'package(gate-args) or (binary(suite) and test(/^(boxside\|remote_client)::/))'` |
 | gate-args cmdline/batch/program.rs | `-E 'package(gate-args) or (binary(suite) and test(/^(launch\|journal\|boxside\|remote_client)::/))'`; also `gate-state` `journal` tests mirror cmdline (ARCH Task Index "history key splits"): add `package(gate-state)` |
-| gate-router (any) | `-E 'package(gate-router) or (binary(suite) and test(/^(routing\|remote_client\|bridge\|request)::/)) or (U and test(/^(route\|remote)::/))'` (do NOT use `rdeps(gate-router)`: it pulls the full gate package) |
-| gate-state journal_writer/verdict | `-E 'package(gate-state) or (binary(suite) and test(/^(journal\|cores\|nesting\|slots\|critical\|routing\|stall\|launch\|interrupt\|bridge)::/))'` |
+| gate-router (any) | `-E 'package(gate-router) or (binary(suite) and test(/^(routing\|remote_client\|request)::/)) or (U and test(/^(route\|remote)::/))'` (do NOT use `rdeps(gate-router)`: it pulls the full gate package) |
+| gate-state journal_writer/verdict | `-E 'package(gate-state) or (binary(suite) and test(/^(journal\|cores\|nesting\|slots\|critical\|routing\|stall\|launch\|interrupt)::/))'` |
 | gate-state archive | `-E 'package(gate-state) or (binary(suite) and test(/^journal::/))'` |
 | gate-state cutover/drain/counts | `-E 'package(gate-state) or (binary(suite) and test(/^(cutover\|launcher)::/))'` |
 | gate-state fixtures and fixtures.rs | `-E 'package(gate-state)'` |
@@ -153,7 +149,7 @@ Always add `checkout` to any change that touches a suite file or adds a seam.
 | gate-watchdog diagnostics | `-E 'package(gate-watchdog) or (binary(suite) and test(/^(diagnostics\|stall\|ceiling)::/))'` |
 | gate-watchdog heartbeat | `-E 'package(gate-watchdog) or (binary(suite) and test(/^(boxside\|remote_client)::/))'` |
 | gate-win32 job/create/launch/lib/mutex | `-E 'rdeps(gate-win32)'` |
-| gate-win32 piped/console | `-E 'package(gate-win32) or (binary(suite) and test(/^(boxside\|bridge\|remote_client)::/))'` |
+| gate-win32 piped/console | `-E 'package(gate-win32) or (binary(suite) and test(/^(boxside\|remote_client)::/))'` |
 | gate-win32 priority | `-E 'package(gate-win32) or (binary(suite) and test(/^(priority\|critical\|build_servers)::/))'` |
 | gate-win32 tree | `-E 'package(gate-win32) or (binary(suite) and test(/^(stop_tree\|stall\|interrupt\|boxside\|burn\|nesting)::/))'` |
 | gate-win32 interrupt/event | `-E 'package(gate-win32) or (binary(suite) and test(/^(interrupt\|critical\|cutover\|routing\|remote_client\|boxside\|slots)::/))'` |
