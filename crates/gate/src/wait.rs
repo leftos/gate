@@ -70,7 +70,7 @@ impl Waiter {
             queued: arrival.queued,
             poll: seams.poll_ms.map_or(POLL, Duration::from_millis),
             heartbeat,
-            next_heartbeat: heartbeat,
+            next_heartbeat: first_heartbeat(heartbeat, arrival.queued.elapsed()),
             event,
             interrupt: host.interrupt,
             interrupt_when_waiting: host
@@ -146,6 +146,14 @@ impl Waiter {
     }
 }
 
+/// When the first still-waiting line of a wait is due, counted from the queueing: the first multiple of `heartbeat`
+/// strictly past the time `waited` already at queueing. So a wait entering from a fallback never says a line at once,
+/// and an ordinary wait says its first after one period.
+fn first_heartbeat(heartbeat: Duration, waited: Duration) -> Duration {
+    let periods = waited.as_nanos() / heartbeat.as_nanos() + 1;
+    heartbeat.saturating_mul(u32::try_from(periods).unwrap_or(u32::MAX))
+}
+
 /// Writes `ticket` at `path`, saying so when it cannot be written; the gate waits on either way.
 fn write_ticket(path: &Path, ticket: &Ticket, console: &mut Console) {
     if let Err(error) = v1::write_ticket(path, ticket) {
@@ -210,17 +218,19 @@ pub(crate) struct Host {
     pub interrupt: Option<Interrupt>,
 }
 
-/// The gate that queues and what it asked: which gate it is, its request, when it queued for this wait, its first
+/// The gate that queues and what it asked: which gate it is, its request, the moment the wait counts from, its first
 /// arrival in Unix epoch milliseconds, which its ticket keeps across a fallback, and the builder of a remote wait.
 #[derive(Clone, Copy)]
 pub(crate) struct Arrival<'g> {
     pub gate: &'g ThisGate,
     pub request: &'g RunRequest,
+    /// The moment the wait counts from: the run's own `queue` line for a run the full remote pool sent back, and this
+    /// arrival for every other wait. The wait, its still-waiting lines and its journal all count from that one instant.
     pub queued: Instant,
     pub arrived: u64,
     pub builder: Option<&'g str>,
     /// Whether this wait follows a `full` fallback here from the builder, the only reason that keeps `Run::queued_at`,
-    /// the moment the wait counts from; `false` for every other wait, which counts from the arrival itself.
+    /// the instant [`Arrival::queued`] takes; `false` for every other wait, whose `queued` is the arrival itself.
     pub after_fallback: bool,
     /// The parent gate whose slot does not cover this gate, which lends it while a critical request drains, or the parent
     /// that holds no slot, which lends nothing; `None` for any other gate.
@@ -638,7 +648,9 @@ mod tests {
     use gate_state::SlotKind;
     use gate_state::v1::{Ticket, TicketKind};
 
-    use super::{Barrier, LendFacts, barrier, lends, slot_range};
+    use std::time::Duration;
+
+    use super::{Barrier, LendFacts, barrier, first_heartbeat, lends, slot_range};
     use crate::slots;
 
     /// A ticket of the gate `pid`, started at `pid * 10` ms, of `kind`, arrived at `arrived`.
@@ -652,6 +664,26 @@ mod tests {
             remote: None,
             expected: None,
         }
+    }
+
+    #[test]
+    fn the_first_still_waiting_line_after_a_fallback_comes_at_the_next_period() {
+        let period = Duration::from_millis(1000);
+        assert_eq!(
+            first_heartbeat(period, Duration::ZERO),
+            period,
+            "an ordinary wait says it still waits after one period"
+        );
+        assert_eq!(
+            first_heartbeat(period, Duration::from_millis(2500)),
+            Duration::from_millis(3000),
+            "a wait 2.5 periods in says its first line at 3 periods, never at once"
+        );
+        assert_eq!(
+            first_heartbeat(period, period),
+            Duration::from_millis(2000),
+            "a whole period already waited moves the line to the next one"
+        );
     }
 
     #[test]

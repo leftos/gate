@@ -308,6 +308,8 @@ A missing file or key means the default; an unreadable or invalid value is ignor
    It prints `gate: still waiting for a <kind> slot (<s> s)` every 30 s from its queueing, on stderr and in the log, so a gate around it does not read the wait as a stall (kept, S4). Its watchdog starts only once it holds a slot.
 
    `waitedSeconds` in its `take` counts from its `queue` line; the local `take` of a routed run that fell back counts from the `fallback` line, as the PowerShell gate does, except after a `full` fallback, whose local `take` counts from the run's `queue` line (as the PowerShell gate did for it).
+
+   After a `full` fallback the wait's schedule, its still-waiting lines and its `take` or `abandon` `waitedSeconds` all count from that one instant, the run's `queue` line, so the `(<s> s)` includes the remote wait. The first still-waiting line of a wait entering from a fallback comes at the next whole heartbeat period past what it has already waited, never at once: for a 60 s remote wait and a 30 s heartbeat, the first line comes at 90 s.
 7. A problem a pass meets is said as a prose line, once per name or path per wait: `gate: could not take <name>: <error>`, `gate: cannot probe <name>: <error>`, `gate: cannot create the wake event <name>: <error>` (the gate then waits on the poll alone), `gate: cannot wait on the wake event <name>: <error>`, `gate: cannot write the ticket <path>: <error>`, `gate: cannot write the claim <path>: <error>`.
 
    More: `gate: cannot read the tickets in <dir>: <error>`, `gate: cannot read the claims in <dir>: <error>`, `gate: ignored the ticket <path>: <reason>`, `gate: cannot check the gate of <path>: <error>` and `gate: cannot delete the ticket|the claim|the dead gate's ticket <path>: <error>`.

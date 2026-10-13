@@ -1137,12 +1137,13 @@ impl Run<'_> {
 
     /// Waits its turn for a slot of `pool` and takes it into `held` the moment it has it, then journals the take, with
     /// the remote tag while the run has one, and writes the claim. `since` is the moment the wait counts from, the run's
-    /// own `queue` line for a run the full remote pool sent back and `None` for every other wait, which counts from now.
+    /// own `queue` line for a run the full remote pool sent back and `None` for every other wait, which counts from now;
+    /// the wait, its still-waiting lines and its journal all count from that one instant.
     /// When the slot was taken; else a Ctrl+C ended the wait, which deletes the ticket at once, wakes the waiters and
     /// journals the abandon, or a remote pool stayed full past the wait's limit, which deletes the ticket, or a light
     /// parent lent the run its slot, which deletes the ticket and wakes the waiters.
     fn take(&mut self, pool: Pool, since: Option<Instant>, held: &mut Option<Taken>, console: &mut Console) -> Taking {
-        let queued = Instant::now();
+        let queued = since.unwrap_or_else(Instant::now);
         let arrival = Arrival {
             gate: &self.gate,
             request: self.request,
@@ -1174,7 +1175,7 @@ impl Run<'_> {
                 return Taking::Lent;
             }
             Waited::Interrupted => {
-                self.abandon(wait, pool, since.unwrap_or(queued), console);
+                self.abandon(wait, pool, queued, console);
                 return Taking::Interrupted;
             }
             Waited::TimedOut => {
@@ -1183,7 +1184,7 @@ impl Run<'_> {
                 return Taking::Full;
             }
         };
-        let waited = since.unwrap_or(queued).elapsed().as_secs_f64();
+        let waited = queued.elapsed().as_secs_f64();
         let name = taken.held.name().to_owned();
         let mut abandoned = Vec::new();
         if taken.abandoned {

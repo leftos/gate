@@ -23,6 +23,8 @@ pub(crate) const HOST: &str = "builder";
 pub(crate) const BUSY_LINE: &str = "gate: remote builder busy; running here";
 /// The line a routed run says as it falls back here from a full remote pool.
 const FULL_LINE: &str = "gate: remote builder full; running here";
+/// The first still-waiting line a local heavy wait says, which counts from the moment the wait counts from.
+const STILL_WAITING_HEAVY: &str = "gate: still waiting for a heavy slot (";
 const NOTHING_SENT_LINE: &str = "gate: not routed: sub holds nothing the snapshot sends";
 const REMOTE_WAITING: &str = "gate: waiting for a remote slot on builder (1 busy)";
 /// The status Windows reports for a process Ctrl+C ended, `STATUS_CONTROL_C_EXIT`, as a signed exit code.
@@ -1315,6 +1317,49 @@ fn a_full_fallback_counts_the_local_takes_wait_from_the_queue_line() {
     );
     let_go(&go);
     assert_eq!(holder.finish().code, Some(0));
+}
+
+/// A run that waited out the remote pool's limit and fell back to a held local heavy pool says its first still-waiting
+/// line with the whole wait in it, never with the seconds since its local take began.
+#[test]
+fn a_full_fallback_says_the_whole_wait_in_its_still_waiting_lines() {
+    let case = routed_case("routing-full-still-waiting");
+    write_counts(&case.root(), r#"{"v":1,"heavy":1}"#);
+    let local_go = case.folder().join("local-go");
+    let local_go_word = shown(&local_go);
+    let local_holder = case.start(&heavy_words_with_limit(
+        "local.log",
+        &["--local"],
+        &[r".\tool.exe", "wait", &local_go_word],
+    ));
+    wait_for_journal_line(&case.root(), &format!(r#""event":"take","pid":{},"#, local_holder.id()));
+    let go = case.folder().join("go");
+    let holder = remote_holder(&case, "holder.log", &go);
+    let steps = shown(&stub(&case, &["status 0"]));
+    let seams = ["--test-remote-wait-ms", "2000", "--test-heartbeat-ms", "1000", "--test-poll-ms", "100"];
+    let waiter = case.start(&routed_words("waiter.log", &steps, &seams, &[r".\tool.exe", "out", "hi"]));
+    let stderr = waiter.wait_for_stderr_where("the local wait's first still-waiting line", |text| text.contains(STILL_WAITING_HEAVY));
+
+    let line = stderr
+        .lines()
+        .find(|line| line.starts_with(STILL_WAITING_HEAVY))
+        .expect("the local wait says it still waits");
+    let seconds: u64 = line
+        .trim_start_matches(STILL_WAITING_HEAVY)
+        .trim_end_matches(" s)")
+        .parse()
+        .expect("the line names the whole seconds waited");
+    assert!(
+        seconds >= 2,
+        "the local wait counts from the run's queue line, so the 2 s remote wait is in it: {line}"
+    );
+
+    let_go(&local_go);
+    let_go(&go);
+    let outcome = waiter.finish();
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_in_order(&outcome.stderr, &[REMOTE_WAITING, FULL_LINE, STILL_WAITING_HEAVY]);
+    assert_eq!((local_holder.finish().code, holder.finish().code), (Some(0), Some(0)));
 }
 
 /// A Ctrl+C during the local wait that follows a full fallback journals its abandon with the waited time counted from
