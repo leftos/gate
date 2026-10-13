@@ -1573,21 +1573,7 @@ impl Run<'_> {
 
     /// The passed line of a run that ran as `pass` says, its log shown as `shown`.
     fn passed_line(&self, pass: Pass<'_>, shown: &str) -> String {
-        let ceiling = self.request.timeout;
-        match pass {
-            Pass::Here(timing) => format!(
-                "gate: passed in {} s (load-adjusted {}, ceiling {ceiling} s). Full output: {shown}",
-                whole_seconds(timing.wall.as_secs_f64()),
-                timing.adjusted.map_or_else(
-                    || "unknown: the sampler failed".to_owned(),
-                    |adjusted| format!("{} s", whole_seconds(adjusted))
-                ),
-            ),
-            Pass::On(host, wall) => format!(
-                "gate: passed in {} s on {host} (wall clock, ceiling {ceiling} s). Full output: {shown}",
-                whole_seconds(wall.as_secs_f64())
-            ),
-        }
+        passed_line(pass, self.request.timeout, shown)
     }
 
     /// The log's first marker lines, none when the run turned the scan off or is `unscanned`, and its tail: the last
@@ -1822,6 +1808,39 @@ fn last_run(lines: &[String], block: &[String]) -> Option<usize> {
         .find(|&at| &lines[at..at + block.len()] == block)
 }
 
+/// The passed line of a run that ran as `pass`, its ceiling as `ceiling` whole seconds and its log shown as `shown`.
+///
+/// A run here whose clock has reached its ceiling says so, naming the ceiling it ran past: the load-adjusted clock the
+/// ceiling kill is enforced on, or the wall time the watch falls back to once the sampler has failed. The comparison is
+/// the kill's own, so the line says it ran past exactly when the kill would have fired.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "the ceiling is read as the double the clock counts in, as the ceiling kill reads it"
+)]
+fn passed_line(pass: Pass<'_>, ceiling: u64, shown: &str) -> String {
+    match pass {
+        Pass::Here(timing) => {
+            let (adjusted, over) = match timing.adjusted {
+                Some(adjusted) => (format!("{} s", whole_seconds(adjusted)), adjusted >= ceiling as f64),
+                None => ("unknown: the sampler failed".to_owned(), timing.wall.as_secs_f64() >= ceiling as f64),
+            };
+            let ceiling = if over {
+                format!("past its ceiling of {ceiling} s")
+            } else {
+                format!("ceiling {ceiling} s")
+            };
+            format!(
+                "gate: passed in {} s (load-adjusted {adjusted}, {ceiling}). Full output: {shown}",
+                whole_seconds(timing.wall.as_secs_f64()),
+            )
+        }
+        Pass::On(host, wall) => format!(
+            "gate: passed in {} s on {host} (wall clock, ceiling {ceiling} s). Full output: {shown}",
+            whole_seconds(wall.as_secs_f64())
+        ),
+    }
+}
+
 /// `seconds` in whole seconds, rounded half to even as the PowerShell gate's `[math]::Round` rounds.
 fn whole_seconds(seconds: f64) -> f64 {
     seconds.round_ties_even()
@@ -1945,7 +1964,8 @@ mod tests {
     use gate_watchdog::{Cores, Hint};
 
     use super::{
-        Ends, Judged, Stopper, Timing, cores_hint_for, cores_line, earlier, interrupted, kill, log_in_state_root, records_after, stop, takes_own_slot,
+        Ends, Judged, Pass, Stopper, Timing, cores_hint_for, cores_line, earlier, interrupted, kill, log_in_state_root, passed_line, records_after,
+        stop, takes_own_slot,
     };
     use crate::console::Console;
     use crate::escaped::{Found, Look, Reached, Recorded};
@@ -2192,6 +2212,60 @@ mod tests {
         assert_eq!(
             cores_line(busy, Hint::Busy),
             "gate: used 1.5 cores on average (peak 2) on no slot; work that keeps 1.5 or more busy belongs on light or heavy"
+        );
+    }
+
+    /// A `Pass::Here` of a run of `wall_s` wall seconds and `adjusted` load-adjusted seconds, `None` once the sampler
+    /// has failed.
+    fn here(wall_s: f64, adjusted: Option<f64>) -> Pass<'static> {
+        Pass::Here(Timing {
+            wall: Duration::from_secs_f64(wall_s),
+            adjusted,
+            paused: Duration::ZERO,
+            cores: None,
+            nested_took_slot: false,
+        })
+    }
+
+    #[test]
+    fn a_passed_line_says_a_run_here_ran_past_a_ceiling_its_clock_reached() {
+        let rows: [(&str, Pass<'_>, &str); 5] = [
+            (
+                "so far past the ceiling the kill could not have missed it",
+                here(41.0, Some(41.0)),
+                "gate: passed in 41 s (load-adjusted 41 s, past its ceiling of 1 s). Full output: out.log",
+            ),
+            (
+                "at the ceiling, which the kill reaches at once",
+                here(41.0, Some(1.0)),
+                "gate: passed in 41 s (load-adjusted 1 s, past its ceiling of 1 s). Full output: out.log",
+            ),
+            (
+                "under the ceiling",
+                here(41.0, Some(0.4)),
+                "gate: passed in 41 s (load-adjusted 0 s, ceiling 1 s). Full output: out.log",
+            ),
+            (
+                "the sampler failed with the wall time past the ceiling",
+                here(41.0, None),
+                "gate: passed in 41 s (load-adjusted unknown: the sampler failed, past its ceiling of 1 s). Full output: out.log",
+            ),
+            (
+                "the sampler failed with the wall time under the ceiling",
+                here(0.4, None),
+                "gate: passed in 0 s (load-adjusted unknown: the sampler failed, ceiling 1 s). Full output: out.log",
+            ),
+        ];
+        for (name, pass, want) in rows {
+            assert_eq!(passed_line(pass, 1, "out.log"), want, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_passed_line_on_a_builder_keeps_the_wall_clock_and_the_ceiling_alone() {
+        assert_eq!(
+            passed_line(Pass::On("builder", Duration::from_secs(41)), 1, "out.log"),
+            "gate: passed in 41 s on builder (wall clock, ceiling 1 s). Full output: out.log"
         );
     }
 

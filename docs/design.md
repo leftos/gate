@@ -229,6 +229,8 @@ Every other `gate: ` line is prose: it informs people and agents and may change 
 The lines of a run that starts its command:
 
 - Passed, on stdout: `gate: passed in <w> s (load-adjusted <a> s, ceiling <n> s). Full output: <log>`, `<w>` and `<a>` in whole seconds rounded half to even. Once the sampler failed there is no load-adjusted time, and the line reads `gate: passed in <w> s (load-adjusted unknown: the sampler failed, ceiling <n> s). Full output: <log>`.
+
+  A command that ends with status 0 after its clock reached the ceiling (a gate starved between samples can miss the kill) still passes, and the line names the ceiling it ran past: `ceiling <n> s` becomes `past its ceiling of <n> s`. The clock is the one the ceiling kill reads, the load-adjusted time, or the wall time once the sampler failed, compared as the kill compares it (reached or passed).
 - The cores hint, on stdout just before the passed line, when its conditions hold ([Cores hint](#cores-hint)): `gate: used <avg> cores on average (peak <peak>, <free> free) on a light slot; work that keeps more than 2 busy belongs on heavy` or `... on a heavy slot; work that keeps under 1.5 busy fits on light`.
 
   Two notes go to the log only, and the hint is left out: `gate: cannot read the command's CPU at its end: <error>; its cores are unknown` and `gate: cannot tell whether a gate under this one took a slot of its own: <error>; its cores are unknown`.
