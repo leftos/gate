@@ -61,6 +61,8 @@ Each part is a sub-issue of CC-178 and lands on `feat/gate-durations`. Part 1 co
 
   The ceiling resolves at each take, a lent take included. A run on no slot, a covered run and a late-slot run have no estimate and run on `n`. A routed run's builder key has no adjusted seconds yet (GATE-187), so it runs on `n`; after a fallback the ceiling returns to `n` until the local take resolves it. `-TimeoutSeconds` refuses `auto:<n>`: the form exists in the new CLI only.
 
+  A late-slot run (a covered gate that takes its own slot when its parent gate ends, `crates/gate/src/late.rs`) files nothing in the durations store at its release, like every other covered run: a covered run opens no durations (`Run::open_durations`), so `write_release` has nothing to file. Its time includes the stretch it ran covered under the parent, so filing it would skew the command's learned duration.
+
   Why not a learned kill time: Tsafrir, Etsion and Feitelson keep the user's estimate as the kill time and use predictions for scheduling only, since about 20% of jobs are underpredicted and would be killed early, and a p99 over at most 30 runs sits close to the sample maximum (`docs/research/2026-10-09-gate-prior-art-local.md`, section 4).
 - A line after the expected-time line when history raised the floor: `gate: ceiling <resolved> (3x this command's p99 of <p99>, above the given <n>)`.
 - A hint after it when the resolved ceiling is below the command's p90: `gate: the ceiling <resolved> is below this command's usual p90 of <p90>`. Figures are the expected-time line's: `<n> s` below 90 s, whole minutes from 90 s. A family key's lines read `similar commands'` in place of `this command's`.
