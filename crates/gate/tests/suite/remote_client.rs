@@ -3057,6 +3057,250 @@ fn an_outputs_call_past_the_fetch_cap_keeps_the_pass_and_brings_nothing_back() {
     assert_eq!(outputs_leftovers(&case), Vec::<PathBuf>::new(), "the archive and no stage are left");
     assert!(!case.folder().join("bin").join("new.txt").exists(), "nothing is installed");
     assert!(pending_marker(&case).exists(), "the next run asks for every output: {outcome:?}");
+    assert_eq!(cap_record_text(&case).as_deref(), Some(r#"{"v":1,"hits":1}"#), "the hit is counted");
+}
+
+/// The seam that lowers the outputs budget to 1 MiB, so a `garbage 3000000` outputs call passes the fetch cap.
+const LOW_BUDGET: [&str; 2] = ["--test-remote-outputs-budget-bytes", "1048576"];
+/// The outputs call step that streams past the fetch cap [`LOW_BUDGET`] gives.
+const PAST_THE_CAP: &str = "garbage 3000000";
+/// The line of an outputs call cut for the archive it passed, at the cap [`LOW_BUDGET`] gives.
+const CAPPED_LINE: &str = "gate: remote outputs not brought back: the archive passed 2.0 MiB";
+/// A passing command that writes one output file.
+const WRITE_BUILT: [&str; 4] = [r".\tool.exe", "write", r"bin\new.txt", "built"];
+
+/// The line of the `hits`-th fetch in a row past the cap, which fails its run.
+fn capped_again(hits: u64) -> String {
+    format!("gate: the builder's outputs passed the cap again, {hits} runs in a row; this run fails")
+}
+
+/// The case's outputs cap record, as text; none when there is none.
+fn cap_record_text(case: &Case) -> Option<String> {
+    let record = case.root().join("remote").join(format!("{}.outputs-capped", key_of(&events(case))));
+    let read = fs::read_to_string(&record);
+    if matches!(&read, Err(error) if error.kind() == ErrorKind::NotFound) {
+        return None;
+    }
+    Some(read.expect("the record, when there, can be read"))
+}
+
+/// One routed run of `command` under [`LOW_BUDGET`], logging to `log`, its calls taking the steps of `steps` after
+/// those the case's earlier runs took.
+fn low_budget_run(case: &Case, steps: &Path, log: &str, command: &[&str]) -> Outcome {
+    low_budget_run_with(case, steps, log, &[], command)
+}
+
+/// [`low_budget_run`] with the seams `more` added.
+fn low_budget_run_with(case: &Case, steps: &Path, log: &str, more: &[&str], command: &[&str]) -> Outcome {
+    let extra: Vec<&str> = LOW_BUDGET.iter().chain(more).copied().collect();
+    let tuned = Tuned {
+        extra: &extra,
+        ..Tuned::default()
+    };
+    finish(client_gate_tuned(case, log, steps, &tuned, command))
+}
+
+/// A run between two fetches past the cap: its calls take `steps`, under the seams `more`, for `command`.
+struct Between<'b> {
+    steps: &'b [&'b str],
+    more: &'b [&'b str],
+    command: &'b [&'b str],
+}
+
+/// A fetch past the cap that keeps its pass, then the run `between` once `prepare` has readied the case, then another
+/// fetch past the cap of an output that differs from any the PC holds: the run between, the case's outputs cap record
+/// after it, and the last run.
+fn between_two_hits(case: &Case, prepare: impl FnOnce(&Case), between: &Between<'_>) -> (Outcome, Option<String>, Outcome) {
+    let hit = ["ok", "ok", PAST_THE_CAP];
+    let all: Vec<&str> = hit.iter().chain(between.steps).chain(&hit).copied().collect();
+    let steps = ssh_steps(case, "ssh", &all);
+    let first = low_budget_run(case, &steps, "first.log", &WRITE_BUILT);
+    assert_eq!(first.code, Some(0), "{first:?}");
+    assert_eq!(cap_record_text(case).as_deref(), Some(r#"{"v":1,"hits":1}"#), "{first:?}");
+    prepare(case);
+    let middle = low_budget_run_with(case, &steps, "second.log", between.more, between.command);
+    let after = cap_record_text(case);
+    let last = low_budget_run(case, &steps, "third.log", &[r".\tool.exe", "write", r"bin\new.txt", "rebuilt"]);
+    assert!(last.stderr.contains(CAPPED_LINE), "the last run's fetch passed the cap: {last:?}");
+    (middle, after, last)
+}
+
+/// The PC already holds the file the first run built on the box, and the run between builds nothing, so the box packs
+/// nothing.
+#[test]
+fn a_box_that_packs_nothing_between_two_fetches_past_the_cap_clears_the_count() {
+    let case = outputs_case("client-outputs-cap-then-nothing", &BIN);
+    let between = Between {
+        steps: &["ok", "ok"],
+        more: &[],
+        command: &[r".\tool.exe", "out", "ran there"],
+    };
+
+    let (middle, after, last) = between_two_hits(&case, |case| write(case, r"bin\new.txt", "built"), &between);
+
+    assert_eq!(middle.code, Some(0), "{middle:?}");
+    assert!(middle.stderr.contains("gate-remote-outputs: 0"), "the box packed nothing: {middle:?}");
+    assert_eq!(after, None, "a box that packed nothing clears the count: {middle:?}");
+    assert_eq!(last.code, Some(0), "a hit after it is the first in a row: {last:?}");
+}
+
+#[test]
+fn a_ctrl_c_during_a_fetch_between_two_fetches_past_the_cap_leaves_the_count() {
+    let case = outputs_case("client-outputs-cap-then-ctrl-c", &BIN);
+    let hold = format!("bytes-hold 100 {}", never(&case));
+    let between = Between {
+        steps: &["ok", "ok", &hold],
+        more: &["--test-remote-interrupt-at", "outputs"],
+        command: &WRITE_BUILT,
+    };
+
+    let (middle, after, last) = between_two_hits(&case, |_| {}, &between);
+
+    assert_eq!(middle.code, Some(CONTROL_C_EXIT), "{middle:?}");
+    assert_eq!(
+        after.as_deref(),
+        Some(r#"{"v":1,"hits":1}"#),
+        "a Ctrl+C during the fetch leaves the count: {middle:?}"
+    );
+    assert_eq!(last.code, Some(1), "{last:?}");
+    assert!(last.stderr.contains(&capped_again(2)), "{last:?}");
+}
+
+#[test]
+fn a_fetch_the_watchdog_stops_between_two_fetches_past_the_cap_clears_the_count() {
+    let case = outputs_case("client-outputs-cap-then-stalled", &BIN);
+    let hold = format!("bytes-hold 100 {}", never(&case));
+    let between = Between {
+        steps: &["ok", "ok", &hold],
+        more: &["--test-remote-watch-call", "outputs", "--test-stall-ms", WATCHED_MS],
+        command: &WRITE_BUILT,
+    };
+
+    let (middle, after, last) = between_two_hits(&case, |_| {}, &between);
+
+    assert_eq!(middle.code, Some(124), "{middle:?}");
+    assert!(middle.stderr.contains(FETCH_STOPPED_LINE), "{middle:?}");
+    assert_eq!(after, None, "a fetch the watchdog stopped clears the count: {middle:?}");
+    assert_eq!(last.code, Some(0), "a hit after it is the first in a row: {last:?}");
+}
+
+/// The fetch between ends whole, under the cap; the Ctrl+C comes during its install.
+#[test]
+fn a_ctrl_c_during_an_install_between_two_fetches_past_the_cap_clears_the_count() {
+    let case = outputs_case("client-outputs-cap-then-install-ctrl-c", &BIN);
+    let between = Between {
+        steps: &["ok", "ok", "ok"],
+        more: &["--test-remote-interrupt-at", "install"],
+        command: &[r".\tool.exe", "write", r"bin\a.txt", "a", "write", r"bin\b.txt", "b"],
+    };
+
+    let (middle, after, last) = between_two_hits(&case, |_| {}, &between);
+
+    assert_eq!(middle.code, Some(CONTROL_C_EXIT), "{middle:?}");
+    assert!(middle.stderr.contains("files were installed before the interrupt"), "{middle:?}");
+    assert_eq!(after, None, "a fetch that ended whole clears the count: {middle:?}");
+    assert_eq!(last.code, Some(0), "a hit after it is the first in a row: {last:?}");
+}
+
+/// The second fetch in a row past the cap fails the run, saying so after the cut's own line, and the record is kept, so
+/// the third fails too.
+#[test]
+fn a_second_outputs_call_past_the_fetch_cap_in_a_row_fails_the_run_and_so_does_a_third() {
+    let case = outputs_case("client-outputs-cap-twice", &BIN);
+    let steps = ssh_steps(
+        &case,
+        "ssh",
+        &["ok", "ok", PAST_THE_CAP, "ok", "ok", PAST_THE_CAP, "ok", "ok", PAST_THE_CAP],
+    );
+
+    let first = low_budget_run(&case, &steps, "first.log", &WRITE_BUILT);
+    let second = low_budget_run(&case, &steps, "second.log", &WRITE_BUILT);
+    let after_second = cap_record_text(&case);
+    let third = low_budget_run(&case, &steps, "third.log", &WRITE_BUILT);
+
+    assert_eq!(first.code, Some(0), "the first hit keeps the pass: {first:?}");
+    assert!(!first.stderr.contains("passed the cap again"), "{first:?}");
+    assert_eq!(second.code, Some(1), "{second:?}");
+    let cut = second.stderr.find(CAPPED_LINE).expect("the cut's line");
+    let again = second.stderr.find(&capped_again(2)).expect("the line saying the cap was passed again");
+    assert!(cut < again, "the cut's line comes first: {second:?}");
+    assert_eq!(after_second.as_deref(), Some(r#"{"v":1,"hits":2}"#), "{second:?}");
+    assert_eq!(third.code, Some(1), "{third:?}");
+    assert!(third.stderr.contains(&capped_again(3)), "{third:?}");
+    assert_eq!(
+        outputs_leftovers(&case),
+        Vec::<PathBuf>::new(),
+        "the archive and no stage are left: {third:?}"
+    );
+    assert!(!case.folder().join("bin").join("new.txt").exists(), "nothing is installed: {third:?}");
+    assert!(pending_marker(&case).exists(), "the next run asks for every output: {third:?}");
+    assert_eq!(cap_record_text(&case).as_deref(), Some(r#"{"v":1,"hits":3}"#), "{third:?}");
+}
+
+#[test]
+fn outputs_brought_back_between_two_fetches_past_the_cap_clear_the_count() {
+    let case = outputs_case("client-outputs-cap-then-back", &BIN);
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok", PAST_THE_CAP, "ok", "ok", "ok", "ok", "ok", PAST_THE_CAP]);
+
+    let first = low_budget_run(&case, &steps, "first.log", &WRITE_BUILT);
+    let back = low_budget_run(&case, &steps, "second.log", &WRITE_BUILT);
+    let after_back = cap_record_text(&case);
+    // Another content, so the box has an output that differs from the one brought back to pack.
+    let third = low_budget_run(&case, &steps, "third.log", &[r".\tool.exe", "write", r"bin\new.txt", "rebuilt"]);
+
+    assert_eq!(first.code, Some(0), "{first:?}");
+    assert_eq!(back.code, Some(0), "{back:?}");
+    assert_eq!(worktree_text(&case, r"bin\new.txt"), "built", "the outputs came back");
+    assert_eq!(after_back, None, "outputs brought back clear the count");
+    assert_eq!(third.code, Some(0), "a hit after them is the first in a row: {third:?}");
+    assert!(third.stderr.contains(CAPPED_LINE), "{third:?}");
+    assert_eq!(cap_record_text(&case).as_deref(), Some(r#"{"v":1,"hits":1}"#));
+}
+
+#[test]
+fn a_fetch_failing_another_way_between_two_fetches_past_the_cap_clears_the_count() {
+    let case = outputs_case("client-outputs-cap-then-failed-fetch", &BIN);
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok", PAST_THE_CAP, "ok", "ok", "exit 3", "ok", "ok", PAST_THE_CAP]);
+
+    let first = low_budget_run(&case, &steps, "first.log", &WRITE_BUILT);
+    let failed = low_budget_run(&case, &steps, "second.log", &WRITE_BUILT);
+    let after_failed = cap_record_text(&case);
+    let third = low_budget_run(&case, &steps, "third.log", &WRITE_BUILT);
+
+    assert_eq!(first.code, Some(0), "{first:?}");
+    assert_eq!(failed.code, Some(1), "{failed:?}");
+    assert!(
+        failed
+            .stderr
+            .contains("gate: remote outputs not brought back: the outputs call failed (status 3)"),
+        "{failed:?}"
+    );
+    assert_eq!(after_failed, None, "a fetch that failed another way clears the count");
+    assert_eq!(third.code, Some(0), "a hit after it is the first in a row: {third:?}");
+    assert_eq!(cap_record_text(&case).as_deref(), Some(r#"{"v":1,"hits":1}"#));
+}
+
+/// A failing run makes no outputs call, so it leaves the count: the hits on either side of it are in a row.
+#[test]
+fn a_failing_run_between_two_fetches_past_the_cap_leaves_the_count() {
+    let case = outputs_case("client-outputs-cap-then-failing-run", &BIN);
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok", PAST_THE_CAP, "ok", "ok", "ok", "ok", PAST_THE_CAP]);
+    let failing = [r".\tool.exe", "write", r"bin\new.txt", "built", "exit", "3"];
+
+    let first = low_budget_run(&case, &steps, "first.log", &WRITE_BUILT);
+    let failed = low_budget_run(&case, &steps, "second.log", &failing);
+    let after_failed = cap_record_text(&case);
+    let third = low_budget_run(&case, &steps, "third.log", &WRITE_BUILT);
+
+    assert_eq!(first.code, Some(0), "{first:?}");
+    assert_eq!(failed.code, Some(3), "{failed:?}");
+    assert_eq!(after_failed.as_deref(), Some(r#"{"v":1,"hits":1}"#), "the failing run leaves the count");
+    assert_eq!(third.code, Some(1), "{third:?}");
+    assert!(third.stderr.contains(&capped_again(2)), "{third:?}");
+    assert_eq!(
+        calls(&steps),
+        ["preflight", "run", "outputs", "preflight", "run", "preflight", "run", "outputs"]
+    );
 }
 
 #[test]

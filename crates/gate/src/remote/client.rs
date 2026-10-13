@@ -2523,12 +2523,31 @@ mod tests {
         assert_eq!((over.status, over.cut), (124, Some(Cut::ArchiveTooBig(cap))), "the look after the exit");
     }
 
-    #[test]
-    fn an_outputs_call_cut_for_the_archive_it_passed_keeps_the_run_s_status() {
+    /// The line of an outputs call cut for the archive it passed, at the cap a 256 KiB budget gives.
+    const CAPPED_LINE: &str = "gate: remote outputs not brought back: the archive passed 256.0 KiB";
+
+    /// An empty state folder of the test `name`'s own, which a cap hit writes its outputs cap record under.
+    fn fresh_state(name: &str) -> PathBuf {
+        let folder = std::env::temp_dir().join(format!("gate-client-state-{name}-{}", std::process::id()));
+        if folder.exists() {
+            fs::remove_dir_all(&folder).expect("a state folder left by an earlier run can be removed");
+        }
+        folder
+    }
+
+    /// The outputs cap record of the unit call's key under `state`.
+    fn capped_record(state: &Path) -> PathBuf {
+        gate_state::v1::outputs_capped_path(state, "app-1a2b3c4d")
+    }
+
+    /// An outputs call cut for the archive it passed, judged for a passing run whose state folder is `state`: its end
+    /// and the lines it said.
+    fn cap_hit(state: &Path) -> (End, Vec<String>) {
         let log = unwritten_log();
         let mut call = call(&log);
-        // No interrupt is raised: this cut keeps the run's status, unlike the failed fetch a Ctrl+C or a bad call end.
+        // No interrupt is raised: this cut is judged by the cap record, unlike the failed fetch a Ctrl+C ends.
         call.interrupt = None;
+        call.state_dir = state;
         let transport = nowhere();
         let mut attempt = attempt(&call, &transport);
         let archive = outputs::Archive::new(
@@ -2537,18 +2556,105 @@ mod tests {
         );
         let mut cut = ended_with(0, "");
         cut.cut = Some(Cut::ArchiveTooBig(262_144));
-
         let end = outputs::judged(&mut attempt, &archive, &cut, Limits::for_tests(), End::Status(0));
+        (end, std::mem::take(&mut attempt.lines))
+    }
+
+    #[test]
+    fn an_outputs_call_cut_for_the_archive_it_passed_keeps_the_run_s_status() {
+        let state = fresh_state("first-cap");
+
+        let (end, lines) = cap_hit(&state);
 
         assert!(matches!(end, End::Status(0)), "the run keeps its status: {end:?}");
-        assert_eq!(attempt.lines, ["gate: remote outputs not brought back: the archive passed 256.0 KiB"]);
+        assert_eq!(lines, [CAPPED_LINE]);
+        let bytes = fs::read(capped_record(&state)).expect("the record is written");
+        assert_eq!(String::from_utf8_lossy(&bytes), r#"{"v":1,"hits":1}"#);
+    }
+
+    #[test]
+    fn a_second_outputs_call_cut_for_the_archive_in_a_row_fails_the_run_and_so_does_a_third() {
+        let state = fresh_state("caps-in-a-row");
+
+        let (first, _) = cap_hit(&state);
+        let (second, second_lines) = cap_hit(&state);
+        let (third, third_lines) = cap_hit(&state);
+
+        assert!(matches!(first, End::Status(0)), "{first:?}");
+        assert!(matches!(second, End::Status(1)), "{second:?}");
+        let again = "gate: the builder's outputs passed the cap again, 2 runs in a row; this run fails";
+        assert_eq!(second_lines, [CAPPED_LINE, again]);
+        assert!(matches!(third, End::Status(1)), "{third:?}");
+        let again = "gate: the builder's outputs passed the cap again, 3 runs in a row; this run fails";
+        assert_eq!(third_lines, [CAPPED_LINE, again]);
+        let bytes = fs::read(capped_record(&state)).expect("the record is kept");
+        assert_eq!(String::from_utf8_lossy(&bytes), r#"{"v":1,"hits":3}"#);
+    }
+
+    #[test]
+    fn an_outputs_cap_record_that_cannot_be_read_counts_no_hit() {
+        let state = fresh_state("unreadable-cap");
+        let record = capped_record(&state);
+        fs::create_dir_all(record.parent().expect("the record has a folder")).expect("the folder can be made");
+        fs::write(&record, "not a record").expect("the record can be spoiled");
+
+        let (end, lines) = cap_hit(&state);
+
+        assert!(matches!(end, End::Status(0)), "{end:?}");
+        assert_eq!(lines, [CAPPED_LINE]);
+        assert_eq!(fs::read_to_string(&record).expect("the record is rewritten"), r#"{"v":1,"hits":1}"#);
+    }
+
+    /// A folder stands at the record's name: it reads as no record and cannot be written over.
+    #[test]
+    fn an_outputs_cap_record_that_cannot_be_written_is_said_and_the_count_read_decides() {
+        let state = fresh_state("unwritable-cap");
+        let record = capped_record(&state);
+        fs::create_dir_all(&record).expect("a folder can stand at the record's name");
+
+        let (end, lines) = cap_hit(&state);
+
+        assert!(matches!(end, End::Status(0)), "the first hit read keeps the pass: {end:?}");
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert_eq!(lines[0], CAPPED_LINE);
+        let cannot = format!("gate: cannot write the outputs cap record {}: ", record.display());
+        assert!(lines[1].starts_with(&cannot), "{lines:?}");
+    }
+
+    #[test]
+    fn clearing_the_outputs_cap_record_removes_it_and_says_one_it_cannot_remove() {
+        let state = fresh_state("clear-cap");
+        let record = capped_record(&state);
+        let log = unwritten_log();
+        let mut call = call(&log);
+        call.interrupt = None;
+        call.state_dir = &state;
+        let transport = nowhere();
+        let mut attempt = attempt(&call, &transport);
+        let (hit, _) = cap_hit(&state);
+
+        outputs::uncapped(&mut attempt);
+        let removed = !record.exists();
+        outputs::uncapped(&mut attempt);
+        let quiet = attempt.lines.is_empty();
+        fs::create_dir_all(record.join("held")).expect("a folder can stand at the record's name");
+        outputs::uncapped(&mut attempt);
+
+        assert!(matches!(hit, End::Status(0)), "{hit:?}");
+        assert!(removed, "the record is removed");
+        assert!(quiet, "a record already gone is removed silently");
+        let cannot = format!("gate: cannot remove the outputs cap record {}: ", record.display());
+        assert_eq!(attempt.lines.len(), 1, "{:?}", attempt.lines);
+        assert!(attempt.lines[0].starts_with(&cannot), "{:?}", attempt.lines);
     }
 
     #[test]
     fn an_outputs_archive_past_the_fetch_cap_is_removed_when_its_cut_is_judged() {
+        let state = fresh_state("cap-removes-archive");
         let log = unwritten_log();
         let mut call = call(&log);
         call.interrupt = None;
+        call.state_dir = &state;
         let transport = nowhere();
         let mut attempt = attempt(&call, &transport);
         let folder = std::env::temp_dir().join(format!("gate-client-archive-{}", std::process::id()));

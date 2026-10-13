@@ -56,6 +56,8 @@ const GENERIC_WRITE: u32 = 0x4000_0000;
 /// `DELETE`, from `Win32_Foundation` too: the access that lets [`Archive::create`] remove a file it refuses through the
 /// handle it made it with, whatever its name now resolves to.
 const DELETE: u32 = 0x0001_0000;
+/// The most of an outputs cap record that is read: its one count fits many times over.
+const CAP_RECORD_BYTES: u64 = 4096;
 /// What an archive fetched whole and handed to the install is called when it cannot be removed.
 pub(super) const FETCHED: &str = "fetched";
 
@@ -286,8 +288,8 @@ pub(super) fn marked(sent: &Sent<'_>) -> Result<(), End> {
 /// output globs. A run whose passing status the sync-back turned to 1 says its outputs were not brought back, the
 /// worktree having changed. A passing run whose manifest was not built, or whose box said no outputs line the client
 /// accepts, says why and ends 1. A passing run whose box packed an archive fetches it, as [`fetched`] says. A passing
-/// run whose box packed nothing removes the pending marker, which every other end leaves; one that cannot be removed
-/// is said, and the run's status stands.
+/// run whose box packed nothing removes the pending marker and the outputs cap record ([`uncapped`]); one that cannot be
+/// removed is said, and the run's status stands. The other ends that do not reach [`fetched`] leave both.
 pub(super) fn ended(attempt: &mut Attempt<'_, '_>, sent: &Sent<'_>, ran: &Ran<'_>, synced: End, brought: Option<&Brought>) -> End {
     let (Some(marker), End::Status(now)) = (&sent.marker, &synced) else {
         return synced;
@@ -314,6 +316,7 @@ pub(super) fn ended(attempt: &mut Attempt<'_, '_>, sent: &Sent<'_>, ran: &Ran<'_
             if let Err(why) = clear_pending(marker) {
                 attempt.say(format!("gate: {why}"));
             }
+            uncapped(attempt);
             return synced;
         }
     };
@@ -334,9 +337,10 @@ struct Kept<'k> {
 /// run's end. One fetched whole is installed, as [`install::installed`] says, through a stage folder beside it named
 /// for the same key and nonce. A fetch the watchdog stops says the watchdog's line and ends the run killed; a Ctrl+C
 /// ends it as an interrupt, with no `stop` call; any other failure says why, the box's last standard error line when it
-/// said one, and fails the run, but one whose archive passed the fetch cap keeps the run's status and installs nothing.
-/// Each of these removes what was fetched, and says so when it cannot; each says the outputs were not brought back but
-/// the interrupt.
+/// said one, and fails the run, but one whose archive passed the fetch cap installs nothing and is judged as [`capped`]
+/// says. Each of these removes what was fetched, and says so when it cannot; each says the outputs were not brought back
+/// but the interrupt. The worktree's outputs cap record ([`uncapped`]) is removed once the fetch ends whole, before the
+/// install, and on every other end but the cap and a Ctrl+C during the fetch.
 fn fetched(attempt: &mut Attempt<'_, '_>, kept: &Kept<'_>, ran: &Ran<'_>, synced: End) -> End {
     let started = Instant::now();
     let name = archive_file_name(attempt.call.key, ran.nonce);
@@ -345,28 +349,45 @@ fn fetched(attempt: &mut Attempt<'_, '_>, kept: &Kept<'_>, ran: &Ran<'_>, synced
     let limits = attempt.limits_for("outputs");
     match attempt.outputs_call(ran.location, &name, &mut archive, limits) {
         // `judged` hands back the run's passing end only when the archive was fetched whole, and `called` a cut when it
-        // was not: an archive past the fetch cap keeps the pass and installs nothing.
-        Ok(called) => match judged(attempt, &archive, &called, limits, synced) {
-            End::Status(0) if called.cut.is_none() => {
-                let fetched = Fetched {
-                    archive: &archive,
-                    stage: tmp.join(format!("{}-{}", attempt.call.key, ran.nonce)),
-                    marker: kept.marker,
-                    manifest: kept.files,
-                    globs: kept.globs,
-                    box_work: &ran.location.work,
-                    started,
-                };
-                install::installed(attempt, &fetched)
+        // was not: an archive past the fetch cap installs nothing.
+        Ok(called) => {
+            let at_the_cap = matches!(called.cut, Some(Cut::ArchiveTooBig(_)));
+            match judged(attempt, &archive, &called, limits, synced) {
+                End::Status(0) if called.cut.is_none() => {
+                    // The fetch ended whole, under the cap: how the install ends no longer bears on the count.
+                    uncapped(attempt);
+                    let fetched = Fetched {
+                        archive: &archive,
+                        stage: tmp.join(format!("{}-{}", attempt.call.key, ran.nonce)),
+                        marker: kept.marker,
+                        manifest: kept.files,
+                        globs: kept.globs,
+                        box_work: &ran.location.work,
+                        started,
+                    };
+                    install::installed(attempt, &fetched)
+                }
+                end => settled(attempt, at_the_cap, end),
             }
-            end => end,
-        },
-        Err(End::Failed(reason)) => unfetched(attempt, &archive, &reason, End::Status(1)),
+        }
+        Err(End::Failed(reason)) => {
+            let end = unfetched(attempt, &archive, &reason, End::Status(1));
+            settled(attempt, false, end)
+        }
         Err(end) => {
             removed(attempt, &archive, PARTIAL);
-            end
+            settled(attempt, false, end)
         }
     }
+}
+
+/// `end`, that of a fetch that did not end whole, the worktree's outputs cap record removed first ([`uncapped`]) unless
+/// the fetch ended `at_the_cap` or by a Ctrl+C.
+fn settled(attempt: &mut Attempt<'_, '_>, at_the_cap: bool, end: End) -> End {
+    if !at_the_cap && !matches!(end, End::Interrupted) {
+        uncapped(attempt);
+    }
+    end
 }
 
 /// The end of the outputs step once its outputs call, watched by `limits`, ended as `called`, having written to
@@ -384,13 +405,10 @@ pub(super) fn judged(attempt: &mut Attempt<'_, '_>, archive: &Archive, called: &
             return unfetched(attempt, archive, STOPPED, End::Killed);
         }
         attempt.noted(called);
-        // An archive past the fetch cap is the one failed fetch that keeps the run's status: the box's work is sound,
-        // the archive of it is not, and the next routed run asks for it again.
-        let (reason, end) = match cut {
-            Cut::ArchiveTooBig(_) => (cut.reason("the archive"), synced),
-            _ => (cut.reason("the outputs call"), End::Status(1)),
-        };
-        return unfetched(attempt, archive, &reason, end);
+        if let Cut::ArchiveTooBig(_) = cut {
+            return capped(attempt, archive, &cut.reason("the archive"), synced);
+        }
+        return unfetched(attempt, archive, &cut.reason("the outputs call"), End::Status(1));
     }
     if called.status != 0 {
         let reason = match &called.last_error {
@@ -400,6 +418,57 @@ pub(super) fn judged(attempt: &mut Attempt<'_, '_>, archive: &Archive, called: &
         return unfetched(attempt, archive, &reason, End::Status(1));
     }
     synced
+}
+
+/// The end of a fetch cut for the archive it passed, `reason` saying so, the run's end so far `synced`: the outputs are
+/// said not brought back, `archive` is removed and the hit is counted in the worktree's outputs cap record. The first
+/// hit in a row keeps the run's status: the box's work is sound, the archive of it is not, and the next routed run asks
+/// for it again. A later hit in a row says the cap was passed again and fails the run.
+fn capped(attempt: &mut Attempt<'_, '_>, archive: &Archive, reason: &str, synced: End) -> End {
+    let end = unfetched(attempt, archive, reason, synced);
+    let hits = counted_hit(attempt);
+    if hits < 2 {
+        return end;
+    }
+    attempt.say(format!(
+        "gate: the builder's outputs passed the cap again, {hits} runs in a row; this run fails"
+    ));
+    End::Status(1)
+}
+
+/// The cap hits in a row of the worktree's outputs cap record once this one is added, the record written with them. A
+/// record that is missing or cannot be read holds none; one that cannot be written is said, and the count stands.
+fn counted_hit(attempt: &mut Attempt<'_, '_>) -> u64 {
+    let path = v1::outputs_capped_path(attempt.call.state_dir, attempt.call.key);
+    let hits = hits_read(&path).saturating_add(1);
+    if let Err(error) = v1::write_outputs_capped(&path, &v1::OutputsCappedRecord { hits }) {
+        attempt.say(format!("gate: cannot write the outputs cap record {}: {error}", path.display()));
+    }
+    hits
+}
+
+/// The hits the outputs cap record at `path` holds: a link or junction at its name is read as itself, and at most
+/// [`CAP_RECORD_BYTES`] of it. One that is missing, cannot be opened or read, or is not of its format holds none.
+fn hits_read(path: &Path) -> u64 {
+    let Ok(file) = OpenOptions::new().read(true).custom_flags(FILE_FLAG_OPEN_REPARSE_POINT).open(path) else {
+        return 0;
+    };
+    let mut bytes = Vec::new();
+    if file.take(CAP_RECORD_BYTES).read_to_end(&mut bytes).is_err() {
+        return 0;
+    }
+    v1::outputs_capped_record(&bytes).map_or(0, |record| record.hits)
+}
+
+/// Removes the worktree's outputs cap record, its outputs step having ended other than at the fetch cap; one already
+/// gone counts as removed, and one that cannot be removed is said and changes no end.
+pub(super) fn uncapped(attempt: &mut Attempt<'_, '_>) {
+    let path = v1::outputs_capped_path(attempt.call.state_dir, attempt.call.key);
+    if let Err(error) = fs::remove_file(&path)
+        && error.kind() != io::ErrorKind::NotFound
+    {
+        attempt.say(format!("gate: cannot remove the outputs cap record {}: {error}", path.display()));
+    }
 }
 
 /// Says the run's outputs were not brought back, for `reason`, and removes what `archive` holds of them; `end`.

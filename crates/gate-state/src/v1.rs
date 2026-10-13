@@ -176,6 +176,39 @@ pub fn nothing_back_record(bytes: &[u8]) -> Result<NothingBackRecord, FormatErro
     parse_strict(text)
 }
 
+/// The outputs cap record of the work folder `key`, `<root>\remote\<key>.outputs-capped`: the JSON object
+/// `{"v": 1, "hits": <n>}` ([`OutputsCappedRecord`]), the number of that worktree's routed runs in a row whose outputs
+/// fetch passed the fetch cap; written at each such fetch and removed when a fetch ends any other way.
+#[must_use]
+pub fn outputs_capped_path(root: &Path, key: &str) -> PathBuf {
+    remote_dir(root).join(format!("{key}.outputs-capped"))
+}
+
+/// The body of an outputs cap record ([`outputs_capped_path`]) after its `v`: the fetches in a row that passed the cap.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutputsCappedRecord {
+    pub hits: u64,
+}
+
+/// Writes the outputs cap `record` at `path` whole or not at all, as [`write_nothing_back`] writes.
+///
+/// # Errors
+///
+/// A folder, temp file or move that fails.
+pub fn write_outputs_capped(path: &Path, record: &OutputsCappedRecord) -> io::Result<()> {
+    write_versioned(path, record)
+}
+
+/// The outputs cap record a file's bytes hold, read strictly as every file of this module is.
+///
+/// # Errors
+///
+/// Bytes that are not UTF-8 or not the record's format.
+pub fn outputs_capped_record(bytes: &[u8]) -> Result<OutputsCappedRecord, FormatError> {
+    let text = std::str::from_utf8(bytes).map_err(|_| FormatError::Syntax("not UTF-8".to_owned()))?;
+    parse_strict(text)
+}
+
 /// A pause marker's name read: the gate waiting under a parent's slot, and the parent gate it runs under.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PauseMarker {

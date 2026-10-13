@@ -260,6 +260,56 @@ fn a_nothing_back_record_of_another_shape_names_no_builder() {
 }
 
 #[test]
+fn the_outputs_cap_record_sits_in_the_remote_folder() {
+    let root = Path::new("state-root");
+
+    assert_eq!(
+        parts_under(root, &v1::outputs_capped_path(root, "app-1a2b3c4d")),
+        ["remote", "app-1a2b3c4d.outputs-capped"]
+    );
+}
+
+#[test]
+fn an_outputs_cap_record_is_written_whole_over_any_other_and_read_back() {
+    let root = scratch("outputs-capped");
+    let path = v1::outputs_capped_path(&root, "app-1a2b3c4d");
+
+    v1::write_outputs_capped(&path, &v1::OutputsCappedRecord { hits: 1 }).expect("the record can be written");
+    let first = fs::read(&path).expect("the record can be read");
+    v1::write_outputs_capped(&path, &v1::OutputsCappedRecord { hits: 2 }).expect("a record can be written over another");
+
+    assert_eq!(String::from_utf8_lossy(&first), r#"{"v":1,"hits":1}"#);
+    let bytes = fs::read(&path).expect("the record can be read");
+    assert_eq!(String::from_utf8_lossy(&bytes), r#"{"v":1,"hits":2}"#);
+    assert_eq!(
+        v1::outputs_capped_record(&bytes).expect("the record reads"),
+        v1::OutputsCappedRecord { hits: 2 }
+    );
+    let names: Vec<_> = fs::read_dir(v1::remote_dir(&root))
+        .expect("the remote folder can be listed")
+        .map(|entry| entry.expect("an entry can be read").file_name())
+        .collect();
+    assert_eq!(names, ["app-1a2b3c4d.outputs-capped"], "no temp file is left beside it");
+}
+
+#[test]
+fn an_outputs_cap_record_of_another_shape_holds_no_count() {
+    let rows: [(&str, &[u8]); 8] = [
+        ("no JSON", b"{\"v\":1,"),
+        ("another version", br#"{"v":2,"hits":1}"#),
+        ("no version", br#"{"hits":1}"#),
+        ("no count", br#"{"v":1}"#),
+        ("a count that is no number", br#"{"v":1,"hits":"1"}"#),
+        ("a negative count", br#"{"v":1,"hits":-1}"#),
+        ("a duplicate key", br#"{"v":1,"hits":1,"hits":2}"#),
+        ("not UTF-8", b"{\"v\":1,\"hits\":1}\xff"),
+    ];
+    for (label, bytes) in rows {
+        assert!(v1::outputs_capped_record(bytes).is_err(), "{label}");
+    }
+}
+
+#[test]
 fn a_pause_marker_name_builds_and_parses_and_refuses_anything_else() {
     let marker = v1::PauseMarker {
         parent_pid: 4242,
