@@ -78,11 +78,22 @@ pub(crate) struct Ticket {
 /// The claim files of the slots and of the critical gate in `dir`, keyed by mutex name in lower case: the files named
 /// `<prefix>gate-slot-<n>`, `<prefix>gate-light-slot-<n>`, `<prefix>gate-remote-slot-<n>` or `<prefix>gate-critical`
 /// with a `.json` extension, in any letter case. A claim without the prefix is left out, so is one that is gone, and a
-/// missing folder holds none.
+/// missing folder holds none, and so does one that cannot be listed.
 pub(crate) fn read_claims(dir: &Path, prefix: &str) -> HashMap<String, Claim> {
+    try_read_claims(dir, prefix).unwrap_or_default()
+}
+
+/// The claim files [`read_claims`] reads, from a folder that must list: a missing folder holds none.
+///
+/// # Errors
+///
+/// The io error when the folder exists but cannot be listed.
+pub(crate) fn try_read_claims(dir: &Path, prefix: &str) -> io::Result<HashMap<String, Claim>> {
     let mut claims = HashMap::new();
-    let Ok(entries) = fs::read_dir(dir) else {
-        return claims;
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(claims),
+        Err(error) => return Err(error),
     };
     let prefix = prefix.to_ascii_lowercase();
     for entry in entries.flatten() {
@@ -96,7 +107,7 @@ pub(crate) fn read_claims(dir: &Path, prefix: &str) -> HashMap<String, Claim> {
             claims.insert(name, claim);
         }
     }
-    claims
+    Ok(claims)
 }
 
 /// The mutex name a claim file's name gives, lowered, when it is a slot's or the critical gate's under the lowered
@@ -172,6 +183,12 @@ pub(crate) fn claim_started_by(claim_process_start: Timestamp, created: Timestam
 /// than 2 s apart.
 pub(crate) fn ticket_started_by(start_ticks: i64, created: Timestamp) -> bool {
     (ticks_of(created) - i128::from(start_ticks)).abs() < TICKET_START_TOLERANCE_TICKS
+}
+
+/// Whether a process created at `created` is the `gate.exe` gate whose ticket, covered marker or drain marker records a
+/// start of `start_ms` Unix epoch milliseconds: the two agree to the millisecond.
+pub(crate) fn started_at_ms(created: Timestamp, start_ms: u64) -> bool {
+    created.as_millisecond().unsigned_abs() == start_ms
 }
 
 /// A timestamp as .NET ticks, truncated to the tick.

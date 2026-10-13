@@ -1,6 +1,7 @@
 //! The live machine behind the state's seams: the slot mutexes by the names `gate.ps1` gives them and a
 //! process's working directory from its PEB; the process table comes from the caller.
 
+use std::io;
 use std::path::PathBuf;
 
 use jiff::Timestamp;
@@ -154,12 +155,17 @@ fn trim_directory(directory: String) -> String {
 }
 
 impl MutexProbe for Win32MutexProbe {
+    /// True unless no process holds the mutex: a name this process may not open, an elevated gate's mutex made with a
+    /// DACL it cannot pass, counts as open, and so does any other failure to ask, as `gate.exe` counts them.
     fn is_open(&self, name: &str) -> bool {
         let wide: Vec<u16> = format!("Local\\{name}").encode_utf16().chain([0]).collect();
         // SAFETY: `wide` is a NUL-terminated UTF-16 string that outlives the call. Only SYNCHRONIZE is asked for and the
         // handle is never waited on, so the mutex is not taken. The handle is fresh and nothing else owns it, so the guard
         // alone closes it, at once.
-        unsafe { OwnedHandle::new(OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, 0, wide.as_ptr())) }.is_some()
+        let opened = unsafe { OwnedHandle::new(OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, 0, wide.as_ptr())) };
+        // `OpenMutexW` reports a name no process holds as `ERROR_FILE_NOT_FOUND`; the guard's check calls nothing that
+        // sets the thread's last error.
+        opened.is_some() || io::Error::last_os_error().kind() != io::ErrorKind::NotFound
     }
 }
 
@@ -175,7 +181,10 @@ fn is_wow64(process: &OwnedHandle) -> bool {
 mod tests {
     use jiff::Timestamp;
     use proc_table::win32::OwnedHandle;
-    use windows_sys::Win32::System::Threading::CreateMutexW;
+    use windows_sys::Win32::Security::{
+        ACL, ACL_REVISION, InitializeAcl, InitializeSecurityDescriptor, SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR, SetSecurityDescriptorDacl,
+    };
+    use windows_sys::Win32::System::Threading::{CreateMutexW, OpenMutexW, SYNCHRONIZATION_SYNCHRONIZE};
 
     use super::{Win32CwdReader, Win32MutexProbe, trim_directory};
     use crate::model::{CwdReader, MutexProbe};
@@ -200,6 +209,46 @@ mod tests {
         // is fresh and nothing else owns it, so the guard alone closes it.
         let held = unsafe { OwnedHandle::new(CreateMutexW(std::ptr::null(), 0, wide.as_ptr())) }.expect("the test mutex can be created");
         assert!(Win32MutexProbe.is_open(&name));
+        drop(held);
+        assert!(!Win32MutexProbe.is_open(&name));
+    }
+
+    #[test]
+    fn mutex_probe_counts_a_refused_mutex_as_open() {
+        // An empty DACL grants no one SYNCHRONIZE, so this process's own open is refused, as an elevated gate's is.
+        const SECURITY_DESCRIPTOR_REVISION: u32 = 1;
+        let name = format!("ops-tower-test-refused-{}-{}", std::process::id(), Timestamp::now().as_nanosecond());
+        let wide: Vec<u16> = format!("Local\\{name}").encode_utf16().chain([0]).collect();
+        // SAFETY: the descriptor and the ACL are zeroed plain structs this test owns, initialised before use, and outlive
+        // the mutex's creation, which copies them into the object; `wide` is NUL-terminated and outlives the call. The
+        // handle is fresh and nothing else owns it, so the guard alone closes it.
+        let held = unsafe {
+            let mut acl: ACL = std::mem::zeroed();
+            let mut descriptor: SECURITY_DESCRIPTOR = std::mem::zeroed();
+            let descriptor_ptr = (&raw mut descriptor).cast();
+            let acl_size = u32::try_from(size_of::<ACL>()).expect("an ACL header's size fits a u32");
+            assert_ne!(InitializeAcl(&raw mut acl, acl_size, ACL_REVISION), 0, "the empty ACL can be made");
+            assert_ne!(InitializeSecurityDescriptor(descriptor_ptr, SECURITY_DESCRIPTOR_REVISION), 0);
+            assert_ne!(
+                SetSecurityDescriptorDacl(descriptor_ptr, 1, &raw const acl, 0),
+                0,
+                "the empty DACL can be set"
+            );
+            let attributes = SECURITY_ATTRIBUTES {
+                nLength: u32::try_from(size_of::<SECURITY_ATTRIBUTES>()).expect("the attributes' size fits a u32"),
+                lpSecurityDescriptor: descriptor_ptr,
+                bInheritHandle: 0,
+            };
+            OwnedHandle::new(CreateMutexW(&raw const attributes, 0, wide.as_ptr()))
+        }
+        .expect("the refusing mutex can be created");
+        // SAFETY: as in the probe; a refused open returns no handle, and a granted one is closed by the guard at once.
+        let opened = unsafe { OwnedHandle::new(OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, 0, wide.as_ptr())) };
+        let refusal = std::io::Error::last_os_error();
+        assert!(opened.is_none(), "the empty DACL refuses this process's own open");
+        assert_eq!(refusal.kind(), std::io::ErrorKind::PermissionDenied, "{refusal}");
+
+        assert!(Win32MutexProbe.is_open(&name), "a mutex this process may not open is held by someone");
         drop(held);
         assert!(!Win32MutexProbe.is_open(&name));
     }

@@ -9,8 +9,8 @@ use proc_table::{ProcessInfo, ProcessTable, ProcessTree};
 use regex::Regex;
 
 use crate::claims::{
-    Claim, ReadableClaim, TICKS_PER_SECOND, Ticket, UNIX_EPOCH_TICKS, claim_started_by, last_log_line, read_claims, read_tickets, ticket_started_by,
-    ticks_in_range, ticks_of,
+    Claim, ReadableClaim, TICKS_PER_SECOND, Ticket, UNIX_EPOCH_TICKS, claim_started_by, last_log_line, read_claims, read_tickets, started_at_ms,
+    ticket_started_by, ticks_in_range, ticks_of,
 };
 use crate::counts::{PoolCount, pool_count, read_counts_file, state_counts_path};
 use crate::model::{
@@ -155,12 +155,6 @@ fn ticket_from_v1(ticket: &v1::Ticket) -> Option<Ticket> {
         remote: ticket.remote == Some(true),
         exact_start_ms: Some(ticket.start_ms),
     })
-}
-
-/// Whether a process created at `created` is the `gate.exe` gate started at `start_ms`, Unix epoch milliseconds: the
-/// two agree to the millisecond.
-fn started_at_ms(created: Timestamp, start_ms: u64) -> bool {
-    created.as_millisecond().unsigned_abs() == start_ms
 }
 
 /// A covered marker's row, its times as ISO text, or `None` when one is no moment a `DateTime` holds.

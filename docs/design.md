@@ -330,6 +330,8 @@ A slot is held while any handle to its name exists: a reader opens the name with
 
 A name the prober may not open (an elevated gate made it with an access list this process is refused) counts as held, since the refusal proves the name exists; any other failure is the prober's error.
 
+`gate-state`'s `Win32MutexProbe`, which the dashboard and the remote cutover's drain use, reads the other way round: a mutex is closed only when no process holds the name, and access denied (an elevated gate's mutex) or any other failure counts as open, so the dashboard shows such a slot as Held.
+
 A gate that is trying a slot holds a handle for an instant, so a probe can read a transient "held"; only waiters with a free slot for them try ([Taking a slot](#taking-a-slot)), which keeps such reads rare. The same rule bounds crash recovery: a mutex comes back abandoned only if another handle to its name was open when its owner was killed, so a take cannot rely on the abandoned result alone ([Abandoned slots](#abandoned-slots)).
 
 ## State root
@@ -360,6 +362,8 @@ For any other root, every kernel object name carries `<h>`, the first 8 lower-ca
 | `paused\<parent pid>-<parent start>-<pid>-<start>.pause` | a gate waiting behind a critical request under a parent gate's slot | its parent gate's watchdog | Empty file; [Critical drain and nesting](#critical-drain-and-nesting) (kept, N3). |
 | `events.jsonl`, `events.1.jsonl` | every gate, under the journal mutex | ops-tower, the durations summary, people | [Journal](#journal). |
 | `archive\events-<yyyyMMddTHHmmssZ>.jsonl.gz` | the gate whose append rolled the journal | the durations summary | [Archive](#archive). |
+| `remote-cutover.draining` | the remote cutover, at the start of its drain | the remote cutover (a rerun, to tell a live drain from a dead one) | The drain marker: JSON `{"v":1,"pid":<n>,"start":<ms>,"since":<ms>}`, the writer's pid, its start in epoch milliseconds and when the drain began; written to a temporary sibling and renamed, by `gate_state::v1::write_drain_marker`. Read as Alive (the pid runs and started at `start` to the millisecond, or its start cannot be read), Dead or Unreadable; a missing file, or one whose open is refused as a pending delete, is absent. |
+| `remote-cutover.flag` | the remote cutover | the remote cutover | Only its path is defined (`remote_cutover_flag_path`); nothing writes it yet. |
 | `durations.json`, `backfill\<pid>.json` and the backfill bar record | gates | gates | Reserved for learned durations (GATE-7; [design/gate-durations.md](design/gate-durations.md)). |
 | `remote\<key>.outputs-pending` | the bridged remote client, and the Rust remote client (dormant) | the same | Empty file. Written by `remote.ps1` while the bridge stands (D1). The Rust client writes it after the push and before a routed run's run call when the run has output globs, or when the route withheld its outputs (a dotnet `--no-build` command the builder built; that marker no end clears), so a run refused at the preflight or by the parity check leaves none, removes it only after an accepted `gate-remote-outputs: 0` or an install that skipped no file, and sends `OutputsFull` while it stands ([The remote client's run](#routing-and-the-remoteps1-bridge)). |
 | `remote\<key>.outputs-hashes` | the Rust remote client (dormant) | the same | The hash cache: one outputs manifest line, `{"files":{"<path>":{"size":…,"modified":…,"sha256":"…"}}}`, of the files of the worktree's last built manifest last written at least 2 s before that build. Saved after each manifest the client builds, and by an outputs install that skipped nothing, for the files it put in place, through `<key>.outputs-hashes.<pid>.tmp` and a rename; one that cannot be read, is not a manifest line or is over 64 MiB gives no hash and is replaced by the next save, and deleting the file resets the cache ([The remote client's run](#routing-and-the-remoteps1-bridge), Manifest time). |
@@ -412,6 +416,8 @@ The environment carries one more name: `GATE_SLOT_HELD`, the slot marker ([Criti
   In the `PowerShell` generation the state and the history read `%LOCALAPPDATA%\gate\`; in `V1` they read `%LOCALAPPDATA%\gate\v1\`, and a missing `v1\` folder is an empty state.
 
   In `V1` a slot's row also reads the claims in the PowerShell root's `slots\` folder (`%LOCALAPPDATA%\gate\slots\`) while the slot's mutex is open and no live `v1\` claim holds it: a PowerShell gate holding the slot shows `busy` with that claim, its processes and last line.
+
+  A mutex that cannot be probed counts as open, so a slot whose mutex an elevated gate holds shows as Held.
 
   A claim whose pid is absent from the process snapshot but whose `processStart` is later than every process's creation time in the snapshot counts as live, only while the slot's mutex is open. A claim file whose read fails with access denied (delete-pending) or not found (deleted after the listing) is skipped, never a stale claim; the cutover drain reads claims the same way.
 
@@ -1579,7 +1585,15 @@ The default root's mutex names are the PowerShell gate's, so a PowerShell gate s
 1. Before it runs, ops-tower's Gates tab already writes the default root's `slot-counts.json` (`%LOCALAPPDATA%\gate\v1\`) on every edit, through `gate-state`'s writer, since `gate.exe` never reads the PowerShell gate's `%LOCALAPPDATA%\gate\slot-counts.json` ([Counts file](#counts-file)).
 
    `gate cutover` copies the PowerShell gate's slot counts into the default root's `slot-counts.json`, so both generations count the same slots, then writes `%LOCALAPPDATA%\gate\cutover.flag`, holding its write time in RFC 3339 UTC (the launcher never reads it). The PowerShell launcher in each repo reads the flag, and from then on every new gate runs `gate.exe` through the compatibility layer.
-2. It then waits until every PowerShell gate's claims and tickets in `%LOCALAPPDATA%\gate\` are gone or stale, naming on stderr what it still waits on, and exits 0 once none is left. The drain reads claims and tickets only and probes no mutex.
+2. It then waits until every PowerShell gate's claims and tickets in `%LOCALAPPDATA%\gate\` are gone or stale, naming on stderr what it still waits on, and exits 0 once none is left. The drain of the PowerShell gates (`powershell_gates`) reads claims and tickets only and probes no mutex; a pid whose start cannot be read counts as live.
+
+   `gate-state` also reads the PC's live routed work for the remote cutover's drain: `remote_gates` lists the live `gate-remote-slot-N` claims and live `remote: true` tickets of the v1 root and, when given, the PowerShell root; a remote-slot mutex that is open with no live claim, as a gate with an unknown pid (`gate.exe` holds the mutex between deleting its ticket and writing its claim, and a claim write can fail); and a claim newer than the process snapshot while its mutex is open.
+
+   Under the default root a slot a live PowerShell claim holds counts once.
+
+   It probes slots `0..remote_count` and every index a v1 claim names, reading tickets, then claims, then mutexes, and a process whose start cannot be read counts as live.
+
+   What it cannot read (a remote-slot claim, a ticket of any kind, an out-of-range index or arrival, a `slots` or `waiting` folder that exists but cannot be listed) it reports by the root's real path in `unreadable`; a v1 ticket whose open is refused is going away, not unreadable. The drain marker and flag are in [State root](#state-root).
 
    It ends only when every scan across a 5 s confirmation window finds no gate, because the PowerShell gate deletes its ticket when it takes a slot and writes its claim up to about 2 s later, and a single empty scan could fall in that gap. The lines are in [`gate cutover`](#gate-cutover).
 

@@ -6,10 +6,10 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use gate_state::v1::{self, Claim, ClaimKind, Counts, CoveredMarker, FormatError, PoolSetting, Ticket, TicketKind};
-use gate_state::{KernelObject, SlotKind, reserved_light};
+use gate_state::{DrainMarker, KernelObject, SlotKind, read_drain_marker, reserved_light};
 use serde_json::json;
 
-use crate::support::{Machine, ts};
+use crate::support::{Machine, START, START_FAR, ms, ts};
 
 const CLAIM_TEXT: &str = include_str!("fixtures/v1-claim.json");
 const TICKET_TEXT: &str = include_str!("fixtures/v1-ticket.json");
@@ -793,4 +793,92 @@ fn a_counts_key_in_another_case_is_ignored() {
             light: setting(4, None),
         }
     );
+}
+
+#[test]
+fn the_drain_marker_round_trips_and_names_a_live_drainer() {
+    let mut machine = Machine::new("v1-drain-marker-live");
+    machine.add_process(4242, 1, "gate.exe", None, Some(START));
+    let root = machine.v1_root();
+    let path = v1::remote_cutover_draining_path(&root);
+    let since = ms("2026-10-01T11:00:05Z");
+
+    v1::write_drain_marker(&root, 4242, ms(START), since).expect("the marker is written");
+    let text = fs::read_to_string(&path).expect("the marker is there");
+
+    assert_eq!(
+        text,
+        format!(r#"{{"v":1,"pid":4242,"start":{},"since":{since}}}"#, ms(START)),
+        "v, then the drainer's pid, its start and the moment the drain began"
+    );
+    assert_eq!(
+        read_drain_marker(&root, &machine),
+        Some(DrainMarker::Alive {
+            pid: 4242,
+            since: ts("2026-10-01T11:00:05Z")
+        })
+    );
+    let names: Vec<String> = fs::read_dir(&root)
+        .expect("the v1 root lists")
+        .map(|entry| entry.expect("the entry lists").file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, ["remote-cutover.draining"], "no temp file is left beside it");
+}
+
+#[test]
+fn the_drain_marker_names_a_dead_drainer() {
+    let mut machine = Machine::new("v1-drain-marker-dead");
+    machine.add_process(4242, 1, "gate.exe", None, Some(START_FAR));
+    let root = machine.v1_root();
+
+    v1::write_drain_marker(&root, 4242, ms(START), ms("2026-10-01T11:00:05Z")).expect("the marker is written");
+    assert_eq!(
+        read_drain_marker(&root, &machine),
+        Some(DrainMarker::Dead),
+        "the pid runs since another start, 3 s off"
+    );
+
+    v1::write_drain_marker(&root, 9999, ms(START), ms("2026-10-01T11:00:05Z")).expect("a marker for a gone drainer is written");
+    assert_eq!(read_drain_marker(&root, &machine), Some(DrainMarker::Dead), "no process runs the pid");
+}
+
+#[test]
+fn an_unreadable_drain_marker_reads_as_unreadable() {
+    let machine = Machine::new("v1-drain-marker-unreadable");
+    let root = machine.v1_root();
+
+    assert_eq!(read_drain_marker(&root, &machine), None, "no marker at all");
+    fs::create_dir_all(&root).expect("the v1 root can be made");
+    let path = v1::remote_cutover_draining_path(&root);
+    for text in [
+        "not json",
+        r#"{"v":2,"pid":1,"start":0,"since":0}"#,
+        r#"{"v":1,"pid":1,"start":0}"#,
+        "\u{feff}{\"v\":1,\"pid\":1,\"start\":0,\"since\":0}",
+        r#"{"v":1,"pid":1,"start":0,"since":18446744073709551615}"#,
+    ] {
+        fs::write(&path, text).expect("the marker can be written");
+        assert_eq!(read_drain_marker(&root, &machine), Some(DrainMarker::Unreadable), "{text}");
+    }
+}
+
+#[test]
+fn a_drain_marker_whose_open_is_refused_reads_as_absent() {
+    let machine = Machine::new("v1-drain-marker-refused");
+    let root = machine.v1_root();
+    let path = v1::remote_cutover_draining_path(&root);
+    fs::create_dir_all(&path).expect("a folder can stand where the marker would be");
+
+    let refused = fs::read(&path).expect_err("a folder cannot be read as a file");
+    assert_eq!(
+        refused.kind(),
+        io::ErrorKind::PermissionDenied,
+        "Windows refuses to open a folder as a file"
+    );
+    assert_eq!(
+        v1::read_drain_record(&path).expect("a refused open is no error"),
+        None,
+        "refused, as a marker whose delete is pending is"
+    );
+    assert_eq!(read_drain_marker(&root, &machine), None);
 }

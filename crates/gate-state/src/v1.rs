@@ -1,6 +1,6 @@
 //! The formats `gate.exe` writes under a state root (design.md "Formats"): the claim a gate holding a slot writes, the
-//! arrival ticket a waiting gate writes, the covered marker a gate running under a parent gate's slot writes, and the slot
-//! counts file people and ops-tower write, plus the paths they sit at.
+//! arrival ticket a waiting gate writes, the covered marker a gate running under a parent gate's slot writes, the slot
+//! counts file people and ops-tower write and the remote cutover's drain marker, plus the paths they sit at.
 //!
 //! Each file is read as strict JSON with case-sensitive keys: a syntax error, a byte order mark, a duplicate key
 //! anywhere, a missing or unknown `v`, a missing required key or a wrong type makes it unreadable, while an unknown key
@@ -88,6 +88,20 @@ pub fn covered_path(root: &Path, pid: u32, start_ms: u64) -> PathBuf {
 #[must_use]
 pub fn counts_path(root: &Path) -> PathBuf {
     root.join("slot-counts.json")
+}
+
+/// The remote-cutover drain marker, `<root>\remote-cutover.draining`: the file the drain writes while this PC still
+/// holds routed runs, so a routed run that starts meanwhile waits for it.
+#[must_use]
+pub fn remote_cutover_draining_path(root: &Path) -> PathBuf {
+    root.join("remote-cutover.draining")
+}
+
+/// The remote-cutover flag, `<root>\remote-cutover.flag`: its presence routes a routed attempt through the Rust remote
+/// client rather than the bridge.
+#[must_use]
+pub fn remote_cutover_flag_path(root: &Path) -> PathBuf {
+    root.join("remote-cutover.flag")
 }
 
 /// The folder of the pause markers, `<root>\paused`.
@@ -209,6 +223,50 @@ pub fn write_outputs_capped(path: &Path, record: &OutputsCappedRecord) -> io::Re
 pub fn outputs_capped_record(bytes: &[u8]) -> Result<OutputsCappedRecord, FormatError> {
     let text = std::str::from_utf8(bytes).map_err(|_| FormatError::Syntax("not UTF-8".to_owned()))?;
     parse_strict(text)
+}
+
+/// The body of the drain marker ([`remote_cutover_draining_path`]) after its `v`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DrainRecord {
+    /// The drainer's pid: the `gate remote-cutover` process that wrote the marker.
+    pub pid: u32,
+    /// The drainer's process start, Unix epoch milliseconds, which its process must match to the millisecond to be
+    /// the drainer still.
+    pub start: u64,
+    /// The moment the drain began, Unix epoch milliseconds.
+    pub since: u64,
+}
+
+/// Writes the drain marker under `root` ([`remote_cutover_draining_path`]), naming the drainer `pid`, its process start
+/// `start_ms` and the moment the drain began `since_ms`, both Unix epoch milliseconds, whole or not at all, as
+/// [`write_nothing_back`] writes.
+///
+/// # Errors
+///
+/// A folder, temp file or move that fails.
+pub fn write_drain_marker(root: &Path, pid: u32, start_ms: u64, since_ms: u64) -> io::Result<()> {
+    write_versioned(
+        &remote_cutover_draining_path(root),
+        &DrainRecord {
+            pid,
+            start: start_ms,
+            since: since_ms,
+        },
+    )
+}
+
+/// Reads the drain marker at `path`: `None` when there is none, or when opening it is refused, as Windows refuses a
+/// file whose delete is pending — a marker going away.
+///
+/// # Errors
+///
+/// [`FormatError`] when the file cannot be read for another reason or is unreadable as a drain marker.
+pub fn read_drain_record(path: &Path) -> Result<Option<DrainRecord>, FormatError> {
+    match read_strict(path) {
+        Ok(record) => Ok(Some(record)),
+        Err(FormatError::Io(error)) if matches!(error.kind(), io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied) => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 /// A pause marker's name read: the gate waiting under a parent's slot, and the parent gate it runs under.
