@@ -13,6 +13,7 @@ mod burn;
 mod console;
 mod covered;
 mod cutover;
+mod durations;
 mod environment;
 mod escaped;
 mod journal;

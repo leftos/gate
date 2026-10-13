@@ -13,10 +13,10 @@ use std::time::Duration;
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use gate_state::{
-    DurationKey, DurationStore, Held, JournalEvent, JournalIdentity, JournalLock, KeyInputs, KeyPlace, LockError, RebuildOwner, RebuildReads,
-    RebuildReason, Recorded, RemoteTag, RunFacts, StoreError, StoreRead, StoreReadError, Swapped, Verdict, append_line_then, archive_rolled_journal,
-    begin_rebuild, duration_key, durations_path, journal_line, normalize_for_durations, place_by_shape, read_store, rebuild_store, rebuilding_path,
-    record_run, swap_rebuilt, write_store,
+    DurationKey, DurationStore, Held, JournalEvent, JournalIdentity, JournalLock, KEY_VERSION, KeyInputs, KeyPlace, LockError, RebuildOwner,
+    RebuildReads, RebuildReason, Recorded, RemoteTag, RunFacts, StoreError, StoreRead, StoreReadError, Swapped, Verdict, append_line_then,
+    archive_rolled_journal, begin_rebuild, duration_key, durations_path, journal_line, normalize_for_durations, place_by_shape, read_store,
+    rebuild_store, rebuilding_path, record_run, swap_rebuilt, write_store,
 };
 use jiff::{SignedDuration, Timestamp};
 use proptest::prelude::*;
@@ -96,7 +96,7 @@ fn record_walls(store: &mut DurationStore, key: &DurationKey, walls: &[f64]) {
 fn current(root: &Path) -> Option<DurationStore> {
     match read_store(root) {
         StoreRead::Current(store) => Some(store),
-        StoreRead::NeedsRebuild(_) | StoreRead::Unavailable(_) => None,
+        StoreRead::NeedsRebuild(_) | StoreRead::Unavailable(_) | StoreRead::Newer => None,
     }
 }
 
@@ -439,6 +439,27 @@ fn window_is_30_runs_or_14_days_whichever_is_fewer() {
 }
 
 #[test]
+fn the_mean_is_over_the_window() {
+    let key = local_key("cargo build");
+    let mut store = DurationStore::new();
+    for _ in 0..3 {
+        store.record(&key, days_before_now(20), &passed(5000.0));
+    }
+    let mut walls = vec![1000.0; 10];
+    walls.extend((1..=30).map(f64::from));
+    record_walls(&mut store, &key, &walls);
+    store.record(&key, ts(NOW), &failed(9000.0));
+
+    let estimate = store.estimate(&key, ts(NOW)).expect("forty recent runs give an estimate");
+
+    assert_eq!(
+        (estimate.runs, estimate.mean),
+        (30, 15.5),
+        "the mean of the newest thirty passing runs, without older runs or failures"
+    );
+}
+
+#[test]
 fn failures_are_counted_not_timed() {
     let key = local_key("cargo build");
     let mut store = DurationStore::new();
@@ -598,6 +619,32 @@ fn a_key_version_mismatch_asks_for_a_rebuild() {
     assert_eq!(record_run(&root, &key, ts(NOW), &passed(1.0)), Ok(Recorded::Written));
     let store = current(&root).expect("the store is current after a run wrote it");
     assert_eq!(walls_of(&store, &key.exact), [1.0]);
+}
+
+#[test]
+fn a_newer_key_version_is_left_alone() {
+    let root = fresh_dir("durations_newer_key_version");
+    let path = durations_path(&root);
+    let newer = format!(r#"{{"v":1,"keyVersion":{},"keys":{{}}}}"#, KEY_VERSION + 1);
+    fs::write(&path, &newer).expect("a newer build's store can be seeded");
+    let key = local_key("cargo build");
+
+    assert_eq!(read_store(&root), StoreRead::Newer, "no history, no rebuild and nothing to say");
+    assert_eq!(record_run(&root, &key, ts(NOW), &passed(1.0)), Ok(Recorded::Newer));
+    write_lines(&root.join("events.jsonl"), &[build_at("2026-10-03T01:00:00Z", 10.0)]);
+    let rebuilt = rebuild_store(&root, Some(TEMP), ts(NOW), lookup);
+    let swap = swap_rebuilt(&root, &FakeLock::Free, &rebuilt, ts(NOW), ME).expect("the swap runs");
+
+    assert_eq!(
+        swap.outcome,
+        Swapped::Kept,
+        "a rebuild begun before the newer store came does not replace it"
+    );
+    assert_eq!(
+        fs::read_to_string(&path).expect("the store can be read"),
+        newer,
+        "a newer build's store is never written"
+    );
 }
 
 #[test]

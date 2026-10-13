@@ -18,7 +18,7 @@ use gate_router::{
     BuildSettings, BuildTarget, Place, RemoteRun, Route, build_settings, dotnet_builds, dotnet_target, sdk_build_target, without_no_build,
     work_folder_key,
 };
-use gate_state::{FallbackReason, JournalEvent, KernelObject, RemoteTag, RunFacts, StateRoot, Verdict, log_hash, v1};
+use gate_state::{FallbackReason, JournalEvent, KernelObject, RebuildOwner, RemoteTag, RunFacts, StateRoot, Verdict, log_hash, v1};
 use gate_watchdog::{Cores, Hint, SlotKind, hint};
 use gate_win32::{AcquireError, Interrupt, Job, Launch, LaunchError, LaunchOutput, NamedMutex, OwnedMutexGuard, PriorityClass, Running};
 use jiff::Timestamp;
@@ -27,6 +27,7 @@ use crate::acquire;
 use crate::answer::USAGE_STATUS;
 use crate::console::Console;
 use crate::covered::Covered;
+use crate::durations::{RunDurations, RunIdentity};
 use crate::environment::{self, Variables};
 use crate::escaped::{self, Found, Reach, Reached, Recorded};
 use crate::journal::{self, RunJournal};
@@ -36,7 +37,7 @@ use crate::nesting::{Nesting, Parent};
 use crate::no_build::{self, NothingBack, Unfound, Worktree};
 use crate::remote::{self, RemoteCall, RemoteClient, RemoteOutcome, git};
 use crate::resolve::{Environment, ResolvedRoot};
-use crate::route;
+use crate::route::{self, Placed};
 use crate::slots::{self, ClaimOf, Pool, Survey, Taken, Takes, ThisGate, epoch_ms};
 use crate::wait::{self, Arrival, Host, UnderParent, Wait, Waited};
 use crate::watch::{Start, Watched, Watcher, Watching};
@@ -132,10 +133,12 @@ pub(crate) fn run(request: &RunRequest, log: &Path, root: &ResolvedRoot, environ
         queued_at: None,
         lent: false,
         covered: None,
+        durations: None,
     };
-    let (route, place) = run.route(environment, console);
-    let local = run.local_words(&route, place.as_ref(), console);
+    let (route, placed) = run.route(environment, console);
+    let local = run.local_words(&route, placed.place(), console);
     take_heavy(&mut run, &mut heavy, local.as_ref(), console);
+    run.durations = run.open_durations(&placed);
     say_nesting(run.nesting, run.request, console);
     run.queue(&route, console);
     let mut hold = Hold {
@@ -152,6 +155,7 @@ pub(crate) fn run(request: &RunRequest, log: &Path, root: &ResolvedRoot, environ
             {
                 run.clear_nothing_back(here, console);
             }
+            run.rebuild_durations(console);
             exit_status(ended.status)
         }
         Ok(None) => CONTROL_C_EXIT,
@@ -501,6 +505,8 @@ struct Run<'a> {
     lent: bool,
     /// The covered marker of a run a parent's slot covers, from its `covered` line to its release.
     covered: Option<Covered>,
+    /// The durations of a run that takes a slot of its own ([`Run::open_durations`]).
+    durations: Option<RunDurations>,
 }
 
 /// The client's call for `remote`, with the run's log, limits and interrupt, made of the run's parts so the run's
@@ -593,15 +599,14 @@ struct Ended {
 impl Run<'_> {
     /// Decides where the command runs, and sets the remote tag of a routed run. A gate a parent's slot covers runs
     /// here, as does one whose light parent lends it its slot before it queues, while a critical request drains, which
-    /// is not routed ([`Run::on_parent`]). The route, and the gate's place in its worktree when the decision asked git
-    /// for it.
-    fn route(&mut self, environment: &Environment, console: &mut Console) -> (Route, Option<Place>) {
+    /// is not routed ([`Run::on_parent`]). The route, and what the decision learnt of the gate's place in its worktree.
+    fn route(&mut self, environment: &Environment, console: &mut Console) -> (Route, Placed) {
         let nesting = self.nesting;
         if let Nesting::Under(parent) = nesting
             && wait::lent_before_queue(self.root, parent.pid, self.host.processors, &mut self.survey, console)
         {
             self.lent = true;
-            return (Route::Local { reason: None }, None);
+            return (Route::Local { reason: None }, Placed::NotAsked);
         }
         let covering = nesting.covering().is_some();
         let (route, place) = route::route(self.request, environment, covering, console);
@@ -613,6 +618,66 @@ impl Run<'_> {
             Route::Local { .. } => None,
         };
         (route, place)
+    }
+
+    /// The durations of a run that takes a slot of its own, read once it knows the command it journals and before it
+    /// queues, its folder placed as the routing decision `placed` it when the decision asked git: `None` for a no-slot
+    /// run, one a parent's slot covers or lends, and one whose journal lines cannot be written.
+    fn open_durations(&self, placed: &Placed) -> Option<RunDurations> {
+        if matches!(self.request.slot, Slot::None) || !takes_own_slot(self.nesting, self.lent) {
+            return None;
+        }
+        let identity = self.gate.journal_identity().ok()?;
+        let run = RunIdentity {
+            cwd: &identity.cwd,
+            command: &identity.command,
+            critical: matches!(self.request.slot, Slot::Critical),
+            owner: RebuildOwner {
+                pid: self.gate.pid,
+                start_ms: self.gate.start_ms,
+            },
+        };
+        Some(RunDurations::open(&self.root.path, &run, placed, &self.request.test_seams))
+    }
+
+    /// Says the expected-time line of the slot just taken, keyed by where the run takes it: on the builder of a routed
+    /// attempt, else here.
+    fn say_expected(&mut self, console: &mut Console) {
+        if let Some(durations) = &mut self.durations {
+            durations.say_expected(self.tag.as_ref().map(|tag| tag.host.as_str()), console);
+        }
+    }
+
+    /// Journals the run's `release` line of `slots`, held `held_seconds`, with how the run `ended` and the run's remote
+    /// tag, and files the run in the durations store in the same hold of the journal mutex when it took a slot of its own
+    /// and reached a verdict.
+    fn write_release(&mut self, slots: Vec<String>, held_seconds: f64, ended: Option<&Ended>, console: &mut Console) {
+        let facts = ended.and_then(|ended| ended.facts);
+        let release = JournalEvent::Release {
+            slots,
+            held_seconds,
+            status: ended.map(|ended| ended.status),
+            facts,
+        };
+        let remote = self.tag.as_ref();
+        let filing = self
+            .durations
+            .as_ref()
+            .and_then(|durations| durations.filing(remote.map(|tag| tag.host.as_str()), facts));
+        let filed = self
+            .journal
+            .write_then(&release, remote, console, |time| filing.as_ref().map(|filing| filing.file(time)));
+        if let (Some(durations), Some(Some(filed))) = (&mut self.durations, filed) {
+            durations.filed(filed, console);
+        }
+    }
+
+    /// Rebuilds the durations store once the run has released, when a read of the run asked for it, unless a Ctrl+C
+    /// comes before or during the rebuild.
+    fn rebuild_durations(&mut self, console: &mut Console) {
+        if let (Some(durations), Some(lock)) = (&mut self.durations, self.journal.mutex()) {
+            durations.rebuild(lock, self.host.interrupt, console);
+        }
     }
 
     /// Asks a light parent whose slot does not cover this run, once it dropped its `--no-build` and asks for a heavy
@@ -1203,6 +1268,7 @@ impl Run<'_> {
         };
         slots::write_claim(&taken.held, pool.claim_kind(), &of, console);
         slots::wake_waiters(self.root, &mut self.survey, console);
+        self.say_expected(console);
         Taking::Took(took)
     }
 
@@ -1254,6 +1320,7 @@ impl Run<'_> {
         };
         machine.write_claim(&of, console);
         slots::wake_waiters(self.root, &mut self.survey, console);
+        self.say_expected(console);
         Taking::Took(took)
     }
 
@@ -1281,7 +1348,8 @@ impl Run<'_> {
     }
 
     /// Deletes the claim, journals the release with how the run `ended` (status and verdict unknown when it did not
-    /// end on its own path) and lets the slot go, then wakes the waiters. A critical gate journals the release of every
+    /// end on its own path), filing a run that reached a verdict in the durations store in the same journal hold
+    /// ([`Run::write_release`]), and lets the slot go, then wakes the waiters. A critical gate journals the release of every
     /// slot it held first, then lets the machine go ([`Machine::release`]). A gate a parent's slot covers deletes its
     /// covered marker; it, and a gate a light parent lent its slot, took no slot and journals no release.
     fn release(&mut self, hold: Hold, ended: Option<&Ended>, console: &mut Console) {
@@ -1293,16 +1361,8 @@ impl Run<'_> {
         }
         let Hold { taken, machine, took } = hold;
         let held_seconds = took.elapsed().as_secs_f64();
-        let status = ended.map(|ended| ended.status);
-        let facts = ended.and_then(|ended| ended.facts);
         if let Some(machine) = machine {
-            let release = JournalEvent::Release {
-                slots: machine.names(),
-                held_seconds,
-                status,
-                facts,
-            };
-            self.journal.write(&release, None, console);
+            self.write_release(machine.names(), held_seconds, ended, console);
             machine.release(self.root, &mut self.survey, console);
             return;
         }
@@ -1313,13 +1373,7 @@ impl Run<'_> {
             }
             None => Vec::new(),
         };
-        let release = JournalEvent::Release {
-            slots,
-            held_seconds,
-            status,
-            facts,
-        };
-        self.journal.write(&release, self.tag.as_ref(), console);
+        self.write_release(slots, held_seconds, ended, console);
         if let Some(taken) = taken {
             drop(taken);
             slots::wake_waiters(self.root, &mut self.survey, console);

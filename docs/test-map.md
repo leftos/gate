@@ -43,7 +43,8 @@ Suite = `crates/gate/tests/suite/` (binary `suite`, needs `--all-features`; test
 | escaped.rs | `stall` (`a_stall_kill_ends_a_packaged_app_the_command_started`, machine-dependent; `a_stall_kill_ends_a_child_outside_the_job_whose_launcher_has_ended`, machine-alone `#[ignore]`, with `stall::a_stall_kill_ends_a_child_outside_the_job_whose_launcher_exited_at_once` (machine-alone `#[ignore]`: the launcher ends before the first sample, so only the job's memory of it reaches the escapee), `ceiling::a_ceiling_kill_ends_a_child_outside_the_job_whose_launcher_has_ended` and `interrupt::a_ctrl_c_ends_a_child_outside_the_job_whose_launcher_has_ended`; the escapee cases that start it with `fake-tool spawn-away` under `--test-job-breakaway`; the unit tests inside), `cores` (`a_command_whose_child_left_its_job_counts_that_child_s_cores`), `interrupt` and `ceiling` (the other kills run it too) | no: stall, cores, interrupt, ceiling |
 | burn.rs | `burn` (`gate burn`: start line, status, parent watch), `cli` (usage and refusals) | no: burn, cli |
 | request_json.rs | `request`, `compat`, `cutover` (`--test-print-request`), `launcher`, `harness`, `support` | no: request, compat, cutover, launcher, harness |
-| route.rs | `routing` (decisions, `--test-git`, remote.json), `remote_client`, `bridge`, `request` | no: routing, remote_client, bridge |
+| route.rs | `routing` (decisions, `--test-git`, remote.json), `remote_client`, `bridge`, `request`, `durations` (`read_place` and `Placed` place the durations key) | no: routing, remote_client, bridge, durations |
+| durations.rs | `durations` (the expected-time line, the filing of each release, the key of a critical, routed, fallback and outside-git run, the rebuild and its marker, the unreadable and unwritable store lines), `hold` (the rebuild line a store that cannot be made says); the unit tests inside (the line's units, the rebuild's claim and interrupt) | no: durations, hold, journal |
 | bin/fake-tool.rs | helper for nearly every module (`support.rs`); signature change -> whole suite | CENTRAL (helper) |
 | bin/fake-ssh.rs | `remote_client` (`--test-remote-ssh`), `push` (`--test-push-ssh`), `routing`? (no) | no: remote_client, push |
 | remote/mod.rs | `routing` (scripted client `--test-remote-client`, fallback reason `client`), `bridge`, `remote_client` | no: routing, bridge, remote_client |
@@ -69,7 +70,7 @@ Suite = `crates/gate/tests/suite/` (binary `suite`, needs `--all-features`; test
 | gate-state v1.rs / root.rs / model.rs / lib.rs | everything (claim/ticket/counts/root hash/kernel names): CENTRAL. Suite itself reads `v1` in `critical, interrupt, journal, launch, nesting, pause, priority, slots`; `v1.rs`'s nothing-back record (path, write, strict read) is also read in `routing`, and its outputs cap record (`remote/outputs.rs`) in `remote_client` and the `remote::client` unit tests | `gate-state::state` (`v1`: the record's shape and strict read) | CENTRAL |
 | gate-state journal_writer.rs / verdict.rs | `journal` + any journal assertion: `cores, nesting, routing, slots, critical, stall, launch, interrupt, bridge` | state `journal_write`, `verdict` | no, but wide (writes on every run) |
 | gate-state archive.rs | `journal` (rollover and archive with concurrent appenders) | state `archive` | no |
-| gate-state durations.rs | none yet (the `gate` crate does not call it) | state `durations` | no |
+| gate-state durations.rs | `durations` (the `gate` crate's `durations.rs` calls it), `hold`, `journal` | state `durations` | no |
 | gate-state cutover.rs / drain.rs / counts.rs | `cutover`, `launcher` (gate/src/cutover.rs imports `copy_slot_counts_to_v1, powershell_gates, write_cutover_flag`); `counts.rs`'s `write_replacing` (the temp names) also writes the v1 files, so a change there adds `routing` | state `cutover`, `counts`; a unit test inside `counts.rs` for the temp names | no |
 | gate-state tests/state/fixtures/ (captured files, `capture-*.ps1`) and tests/state/fixtures.rs | none (the fixtures are captured from `gate.exe` and the PowerShell gate by script and only read by the state tests) | state `fixtures` (incl. `remote_run_journal_from_gate_exe_is_read_into_runs_and_a_split_summary`) | no |
 | gate-state claims.rs / remote.rs / state.rs / win32.rs / journal.rs (reader) | NOT imported by gate src (ops-tower-only, ARCHITECTURE.md Layers; except `normalize_command` from journal.rs, used by `slots.rs`:642 and journal.rs's command text -> `journal`, `slots`) | state tests | no (journal.rs: `journal`, `slots`) |
@@ -123,7 +124,8 @@ Always add `checkout` to any change that touches a suite file or adds a seam.
 | burn.rs | `-E 'binary(suite) and test(/^(burn\|cli)::/) or (U and test(/^burn::/))'` |
 | request_json.rs | `-E 'binary(suite) and test(/^(request\|compat\|cutover\|launcher\|harness)::/)'` |
 | no_build.rs | `-E 'binary(suite) and test(/^routing::/) or (U and test(/^(no_build\|run)::/))'` |
-| route.rs | `-E 'binary(suite) and test(/^(routing\|remote_client\|bridge\|request)::/) or (U and test(/^route::/))'` |
+| route.rs | `-E 'binary(suite) and test(/^(routing\|remote_client\|bridge\|request\|durations)::/) or (U and test(/^route::/))'` |
+| durations.rs | `-E 'binary(suite) and test(/^(durations\|hold\|journal)::/) or (U and test(/^durations::/))'` |
 | remote/mod.rs | `-E 'binary(suite) and test(/^(routing\|bridge\|remote_client)::/) or (U and test(/^remote::/))'` |
 | remote/bridge.rs, tools/remote-bridge.ps1 | `-E 'binary(suite) and test(/^(bridge\|routing\|install)::/) or (U and test(/^remote::bridge::/))'` |
 | remote/{client,retry,watchdog,syncback,snapshot,outputs,install,payload,git,launch,transport}.rs | `-E 'binary(suite) and test(/^(remote_client\|routing\|syncback_quarantine\|syncback_conversions)::/) or (U and test(/^remote::/))'`; add `push` for transport.rs, `boxside` for payload.rs/outputs.rs/git.rs |
@@ -138,7 +140,7 @@ Always add `checkout` to any change that touches a suite file or adds a seam.
 | gate-router (any) | `-E 'package(gate-router) or (binary(suite) and test(/^(routing\|remote_client\|bridge\|request)::/)) or (U and test(/^(route\|remote)::/))'` (do NOT use `rdeps(gate-router)`: it pulls the full gate package) |
 | gate-state journal_writer/verdict | `-E 'package(gate-state) or (binary(suite) and test(/^(journal\|cores\|nesting\|slots\|critical\|routing\|stall\|launch\|interrupt\|bridge)::/))'` |
 | gate-state archive | `-E 'package(gate-state) or (binary(suite) and test(/^journal::/))'` |
-| gate-state durations | `-E 'package(gate-state)'` |
+| gate-state durations | `-E 'package(gate-state) or (binary(suite) and test(/^(durations\|hold\|journal)::/))'` |
 | gate-state cutover/drain/counts | `-E 'package(gate-state) or (binary(suite) and test(/^(cutover\|launcher)::/))'` |
 | gate-state fixtures and fixtures.rs | `-E 'package(gate-state)'` |
 | gate-state claims/remote/state/win32 (ops-tower-only readers) | `-E 'package(gate-state)'` (no gate suite module reads them; gate src does not import them) |

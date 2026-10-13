@@ -55,6 +55,8 @@ const SHA: &str = "<sha>";
 const FILES: &str = "<files>";
 /// What a filter value becomes in the family key.
 const FILTER: &str = "<filter>";
+/// The `kind` a `--slot none` run's journal lines carry.
+const NO_SLOT: &str = "none";
 
 /// The store's path under the state root `root`.
 #[must_use]
@@ -433,6 +435,8 @@ pub struct Estimate {
     pub p99: f64,
     /// The 99th percentile of the adjusted seconds by nearest rank, or `None` when no run has them.
     pub adjusted_p99: Option<f64>,
+    /// The mean wall seconds of the window's runs.
+    pub mean: f64,
     /// How many passing runs the window holds.
     pub runs: usize,
     /// The key the figures are of.
@@ -576,11 +580,14 @@ fn estimate_of(history: &KeyHistory, now: Timestamp, key: &str, family: bool) ->
     let p50 = nearest_rank(&recent, 50)?;
     let walls = sorted(window.iter().map(|sample| sample.wall).collect());
     let adjusted = sorted(window.iter().filter_map(|sample| sample.adjusted).collect());
+    #[expect(clippy::cast_precision_loss, reason = "a window holds at most 30 runs")]
+    let mean = walls.iter().sum::<f64>() / walls.len() as f64;
     Some(Estimate {
         p50,
         p90: nearest_rank(&walls, 90)?.max(p50),
         p99: nearest_rank(&walls, 99)?.max(p50),
         adjusted_p99: nearest_rank(&adjusted, 99),
+        mean,
         runs: window.len(),
         key: key.to_owned(),
         family,
@@ -612,6 +619,9 @@ pub enum StoreRead {
     /// The store is there but cannot be read now, such as while another process holds it: no history for this run, no
     /// rebuild, the reason said once.
     Unavailable(StoreReadError),
+    /// A store a newer build wrote under a higher key version: no history for this build, which neither files into it
+    /// nor rebuilds it, and says nothing of it.
+    Newer,
 }
 
 /// Why the store needs a rebuild.
@@ -690,8 +700,10 @@ fn parse_store(text: &str) -> Result<StoreRead, String> {
         Some(other) => return Err(format!("format version {other} is not {STORE_VERSION}")),
         None => return Err("no format version".to_owned()),
     }
-    if value.get("keyVersion").and_then(Value::as_u64) != Some(KEY_VERSION) {
-        return Ok(StoreRead::NeedsRebuild(RebuildReason::Stale));
+    match value.get("keyVersion").and_then(Value::as_u64) {
+        Some(KEY_VERSION) => {}
+        Some(newer) if newer > KEY_VERSION => return Ok(StoreRead::Newer),
+        _ => return Ok(StoreRead::NeedsRebuild(RebuildReason::Stale)),
     }
     let file: StoreFileIn = serde_json::from_value(value).map_err(|error| error.to_string())?;
     Ok(StoreRead::Current(DurationStore { keys: file.keys }))
@@ -720,6 +732,8 @@ pub enum Recorded {
     NeedsRebuild(RebuildReason),
     /// The store cannot be read now: this run is not recorded, and nothing was written.
     Unavailable(StoreReadError),
+    /// A newer build's store ([`StoreRead::Newer`]): this run is not recorded, and nothing was written.
+    Newer,
 }
 
 /// Files a run released at `time` in `root`'s store, drops the keys with no release in the 14 days before `time`, and
@@ -739,6 +753,7 @@ pub fn record_run(root: &Path, key: &DurationKey, time: Timestamp, facts: &RunFa
         }
         StoreRead::NeedsRebuild(reason) => Ok(Recorded::NeedsRebuild(reason)),
         StoreRead::Unavailable(error) => Ok(Recorded::Unavailable(error)),
+        StoreRead::Newer => Ok(Recorded::Newer),
     }
 }
 
@@ -763,12 +778,14 @@ pub struct RebuildOwner {
 /// file beside it and hard-linked to its name, which fails when a marker is already there, so no gate reads one half
 /// written. Returns whether this gate rebuilds. A marker already there is judged under the journal lock, waiting
 /// [`JOURNAL_WAIT`] for it, so two gates never take one over together: one whose holder `holder_live` finds running
-/// means another gate rebuilds; one whose holder is gone, or that does not read, is replaced by this gate's.
-/// [`swap_rebuilt`] removes it.
+/// means another gate rebuilds; one whose holder is gone, or that does not read, is replaced by this gate's, unless
+/// another process holds it open so it cannot be removed, which also means this gate does not rebuild.
+/// [`swap_rebuilt`] removes it, or [`abandon_rebuild`] for a rebuild that ends without a swap.
 ///
 /// # Errors
 ///
-/// The marker could not be made, or a dead one removed, or the journal lock was not taken to judge one already there.
+/// The marker could not be made, or a dead one removed for a reason other than another process holding it open, or the
+/// journal lock was not taken to judge one already there.
 pub fn begin_rebuild<L: JournalLock>(
     root: &Path,
     lock: &L,
@@ -790,10 +807,27 @@ pub fn begin_rebuild<L: JournalLock>(
         MarkerRead::Holder(_) | MarkerRead::Unreadable => match fs::remove_file(&path) {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) if held_open(&error) => return Ok(false),
             Err(error) => return Err(failed(error)),
         },
     }
     link_marker(&path, owner).map_err(failed)
+}
+
+/// `ERROR_SHARING_VIOLATION`: another process has the file open without sharing its delete.
+const ERROR_SHARING_VIOLATION: i32 = 32;
+
+/// Whether `error`, met removing the marker, says another process holds it open: a sharing violation, or access denied,
+/// as Windows says it of a file another handle keeps pending delete.
+fn held_open(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::PermissionDenied || (cfg!(windows) && error.raw_os_error() == Some(ERROR_SHARING_VIOLATION))
+}
+
+/// Ends `owner`'s rebuild without a swap, as a gate interrupted while it rebuilds does: removes the marker when it is
+/// still `owner`'s, so the next gate claims the rebuild at once. Why the marker could not be removed, when it could not.
+#[must_use]
+pub fn abandon_rebuild(root: &Path, owner: RebuildOwner) -> Option<String> {
+    remove_own_marker(root, owner)
 }
 
 /// What the marker holds.
@@ -977,11 +1011,15 @@ impl Releases {
         }
     }
 
-    /// Files the runs oldest first under the keys their folders give, placed by `place_of`.
+    /// Files the runs oldest first under the keys their folders give, placed by `place_of`. A `--slot none` run took no
+    /// slot, and is left out as a live run leaves it out.
     fn file_into(&mut self, store: &mut DurationStore, temp_root: Option<&str>, mut place_of: impl FnMut(&str) -> KeyPlace) {
         let mut runs = std::mem::take(&mut self.runs);
         runs.sort_by_key(|run| run.time);
         for run in &runs {
+            if run.kind == NO_SLOT {
+                continue;
+            }
             let Some(outcome) = run.outcome() else {
                 continue;
             };
@@ -1115,7 +1153,7 @@ fn read_gzip(path: &Path) -> io::Result<Vec<u8>> {
 pub enum Swapped {
     /// The rebuilt store, with the runs released since its reads, is in place.
     Replaced,
-    /// A current store was written while the rebuild ran, and is kept.
+    /// A current store, or a newer build's, was written while the rebuild ran, and is kept.
     Kept,
 }
 
@@ -1131,7 +1169,8 @@ pub struct Swap {
 
 /// Puts a rebuilt store in place under the journal lock, waiting [`JOURNAL_WAIT`] for it, then removes the rebuild
 /// marker when it is still `owner`'s, on every path: when the lock is not taken and when the write fails too. A store
-/// that is current by then is kept (the swap that made it current filed the runs the same way); any other is replaced
+/// that is current by then is kept (the swap that made it current filed the runs the same way), as is a newer build's
+/// ([`StoreRead::Newer`]); any other is replaced
 /// by the rebuilt store with every release line written after its reads filed: the rest of the journal it read, or
 /// after a roll the whole rolled journal, the whole journal and the archives stamped from an hour before its read on,
 /// each line counted once. A folder the rebuild did not place is placed under the longest worktree root it did place
@@ -1152,7 +1191,7 @@ pub fn swap_rebuilt<L: JournalLock>(root: &Path, lock: &L, rebuilt: &Rebuilt, no
 /// [`swap_rebuilt`] up to the marker's removal.
 fn swap_holding<L: JournalLock>(root: &Path, lock: &L, rebuilt: &Rebuilt, now: Timestamp) -> Result<Swap, StoreError> {
     let _held = lock.acquire(JOURNAL_WAIT)?;
-    if matches!(read_store(root), StoreRead::Current(_)) {
+    if matches!(read_store(root), StoreRead::Current(_) | StoreRead::Newer) {
         return Ok(Swap {
             outcome: Swapped::Kept,
             notes: Vec::new(),

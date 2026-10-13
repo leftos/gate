@@ -33,8 +33,8 @@ pub use drain::{PowerShellGate, PowerShellGates, PowerShellHold, PowerShellSlot,
 pub use durations::{
     DURATIONS_FILE, DurationKey, DurationStore, Estimate, KEY_VERSION, KeyHistory, KeyInputs, KeyPlace, NormalizedCommand, REBUILDING_FILE,
     RebuildOwner, RebuildReads, RebuildReason, Rebuilt, Recorded, Sample, StoreError, StoreRead, StoreReadError, StoreWriteError, Swap, Swapped,
-    begin_rebuild, duration_key, durations_path, normalize_for_durations, place_by_shape, read_store, rebuild_store, rebuilding_path, record_run,
-    swap_rebuilt, write_store,
+    abandon_rebuild, begin_rebuild, duration_key, durations_path, normalize_for_durations, place_by_shape, read_store, rebuild_store,
+    rebuilding_path, record_run, swap_rebuilt, write_store,
 };
 pub use journal::{CommandSummary, History, HistoryRun, JournalCache, RemoteTake, RunState, normalize_command};
 pub use journal_writer::{
