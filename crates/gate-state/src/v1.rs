@@ -133,9 +133,11 @@ pub fn outputs_hashes_path(root: &Path, key: &str) -> PathBuf {
 }
 
 /// The nothing-back record of the work folder `key`, `<root>\remote\<key>.nothing-back`: the JSON object
-/// `{"v": 1, "host": "<builder>", "configuration": …, "framework": …, "runtime": …}` ([`NothingBackRecord`]), written
-/// when a routed dotnet build of that worktree ends without its outputs known to be brought back and removed by a
-/// passing dotnet build of the whole worktree here, so a dotnet `--no-build` run here meanwhile builds.
+/// `{"v": 1, "host": "<builder>", "configuration": …, "framework": …, "runtime": …}` ([`NothingBackRecord`]). It is
+/// written when a routed dotnet build of that worktree ends without its outputs known to be brought back, and when a
+/// routed dotnet `--no-build` run whose word the builder dropped ends while no record stands. It is removed by a
+/// passing dotnet build of the whole worktree here, and under the same rule by a routed one that brought all its
+/// outputs back, so a dotnet `--no-build` run here meanwhile builds.
 #[must_use]
 pub fn nothing_back_path(root: &Path, key: &str) -> PathBuf {
     remote_dir(root).join(format!("{key}.nothing-back"))

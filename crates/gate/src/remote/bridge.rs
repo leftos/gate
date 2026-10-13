@@ -852,6 +852,7 @@ mod tests {
             subfolder: "sub",
             words: &words,
             outputs: &outputs,
+            outputs_withheld: false,
             log: Path::new(r"C:\logs\out.log"),
             timeout: 3600,
             stall: 120,

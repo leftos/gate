@@ -14,13 +14,13 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime};
 
-use gate_router::repo_name;
+use gate_router::{repo_name, work_folder_key};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::support::{
-    Case, FAKE_TOOL, GATE, GIT_REDIRECTS, Go, Outcome, allow_breakaway, copy_tool, events, finish, git, git_init, heavy_words, release, shown, start,
-    wait_for_journal_line, wait_until, wait_until_closed, write_remote_json,
+    Case, FAKE_TOOL, GATE, GIT_REDIRECTS, Go, Outcome, allow_breakaway, copy_tool, events, finish, git, git_init, heavy_words, nothing_back, release,
+    shown, start, wait_for_journal_line, wait_until, wait_until_closed, write_remote_json,
 };
 
 const HOST: &str = "builder";
@@ -3097,7 +3097,8 @@ fn an_outputs_line_on_stdout_after_the_box_is_ignored() {
     );
 }
 
-/// A dotnet `--no-build` command brings no outputs back, though its repo has globs and it builds a file under them.
+/// A dotnet `--no-build` command brings no outputs back, though its repo has globs and it builds a file under them, and
+/// leaves the pending marker for the outputs it left on the builder.
 #[test]
 fn a_no_build_command_sends_no_manifest() {
     let case = outputs_case("client-outputs-no-build", &BIN);
@@ -3125,7 +3126,7 @@ fn a_no_build_command_sends_no_manifest() {
     assert!(!outcome.stderr.contains("gate-remote-outputs:"), "no globs were sent: {outcome:?}");
     assert!(!outcome.stderr.contains("gate: remote outputs not brought back"), "{outcome:?}");
     assert_eq!(calls(&steps), ["preflight", "run"]);
-    assert!(!pending_marker(&case).exists(), "no marker is written: {outcome:?}");
+    assert!(pending_marker(&case).exists(), "the next run asks for every output: {outcome:?}");
 }
 
 /// The run call runs nothing and exits 0 (`exit 0`), so no box says an outputs line.
@@ -3848,6 +3849,290 @@ fn a_pc_output_held_open_is_skipped_and_the_rest_installed() {
     assert!(line.is_match(&outcome.stderr), "only the installed file is counted: {outcome:?}");
     assert_eq!(outputs_leftovers(&case), Vec::<PathBuf>::new(), "the archive and the stage are removed");
     assert!(pending_marker(&case).exists(), "the marker stays: {outcome:?}");
+}
+
+/// The nothing-back record a routed `-c Release` dotnet build on [`HOST`] leaves, planted by [`record_case`].
+const RELEASE_RECORD: &str = r#"{"v":1,"host":"builder","configuration":"Release"}"#;
+/// The settings of a routed build [`RELEASE_RECORD`] stands for.
+const RELEASE: [&str; 2] = ["-c", "Release"];
+/// The steps of a routed build that writes `bin/new.txt`, which the PC lacks.
+const WRITE_NEW: [&str; 3] = ["write", r"bin\new.txt", "built"];
+/// The steps of a routed build that writes `bin/same.txt` as the PC holds it ([`with_same`]).
+const WRITE_SAME: [&str; 3] = ["write", r"bin\same.txt", "same"];
+
+/// An [`outputs_case`] with the output globs [`BIN`] holding fake-tool as `pwsh.exe` too, and its `.gitignore`
+/// committed so a routed build has a `HEAD` to pin.
+fn build_case(name: &str) -> Case {
+    let case = outputs_case(name, &BIN);
+    copy_tool(&case, "pwsh.exe");
+    git(&case, &["add", ".gitignore"]);
+    git(&case, &["commit", "--quiet", "-m", "start"]);
+    case
+}
+
+/// A [`build_case`] with `record` planted as its worktree's nothing-back record.
+fn planted_case(name: &str, record: &str) -> Case {
+    let case = build_case(name);
+    let key = work_folder_key(&git(&case, &["rev-parse", "--show-toplevel"]));
+    let path = case.root().join("remote").join(format!("{key}.nothing-back"));
+    fs::create_dir_all(path.parent().expect("the record has a folder")).expect("the record's folder can be made");
+    fs::write(path, record).expect("the record can be planted");
+    case
+}
+
+/// A [`planted_case`] whose record is [`RELEASE_RECORD`].
+fn record_case(name: &str) -> Case {
+    planted_case(name, RELEASE_RECORD)
+}
+
+/// [`record_case`] whose PC holds `bin/same.txt` as [`WRITE_SAME`] writes it, so its manifest is not empty.
+fn with_same(name: &str) -> Case {
+    let case = record_case(name);
+    write(&case, r"bin\same.txt", "same");
+    case
+}
+
+/// The words of a routed dotnet build that fake-tool, as `pwsh.exe`, runs: a wrapper that takes `steps`, then says the
+/// words after them, and whose words after `--` are the dotnet build the gate reads: `dotnet build` and `settings`.
+fn wrapped_build<'a>(steps: &[&'a str], settings: &[&'a str]) -> Vec<&'a str> {
+    let mut dotnet = vec!["build"];
+    dotnet.extend_from_slice(settings);
+    wrapped_dotnet(steps, &dotnet)
+}
+
+/// The words of a routed dotnet command that fake-tool, as `pwsh.exe`, runs: a wrapper that takes `steps`, then says
+/// the words after them, and whose words after `--` are the dotnet command the gate reads: `dotnet` and `dotnet_words`.
+fn wrapped_dotnet<'a>(steps: &[&'a str], dotnet_words: &[&'a str]) -> Vec<&'a str> {
+    let mut words = vec![r".\pwsh.exe"];
+    words.extend_from_slice(steps);
+    words.extend_from_slice(&["argv", "--", "dotnet"]);
+    words.extend_from_slice(dotnet_words);
+    words
+}
+
+/// A dotnet test of the `-c Release` build that asks for no build: the builder runs it with `--no-build` dropped and
+/// brings no outputs back.
+const NO_BUILD_RELEASE_TEST: [&str; 4] = ["test", "--no-build", "-c", "Release"];
+
+/// A routed run of `case`'s `command` whose ssh calls are the stand-in's `steps`, passing; its outcome.
+fn passing_build(case: &Case, steps: &[&str], command: &[&str]) -> Outcome {
+    let steps = ssh_steps(case, "ssh", steps);
+    let outcome = finish(client_gate(case, "out.log", &steps, command));
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    outcome
+}
+
+#[test]
+fn a_routed_build_that_installs_all_its_outputs_clears_the_nothing_back_record() {
+    let case = record_case("client-record-installed");
+
+    let outcome = passing_build(&case, &["ok", "ok", "ok"], &wrapped_build(&WRITE_NEW, &RELEASE));
+
+    assert_eq!(worktree_text(&case, r"bin\new.txt"), "built", "{outcome:?}");
+    assert_eq!(nothing_back(&case), None, "{outcome:?}");
+}
+
+#[test]
+fn a_routed_build_that_packs_nothing_clears_the_nothing_back_record() {
+    let case = with_same("client-record-packs-nothing");
+
+    let outcome = passing_build(&case, &["ok", "ok"], &wrapped_build(&WRITE_SAME, &RELEASE));
+
+    assert!(outcome.stderr.contains("gate-remote-outputs: 0"), "{outcome:?}");
+    assert_eq!(nothing_back(&case), None, "{outcome:?}");
+}
+
+/// The PC holds no output, so the box packing nothing does not say the PC is up to date.
+#[test]
+fn a_routed_build_whose_pc_had_no_outputs_and_packs_nothing_leaves_the_nothing_back_record() {
+    let case = record_case("client-record-no-outputs");
+
+    let outcome = passing_build(&case, &["ok", "ok"], &wrapped_build(&["out", "ran there"], &RELEASE));
+
+    assert!(outcome.stderr.contains("gate-remote-outputs: 0"), "{outcome:?}");
+    assert_eq!(nothing_back(&case).as_deref(), Some(RELEASE_RECORD), "{outcome:?}");
+}
+
+/// The box packs nothing the PC lacks but skips `bin/m~10.txt`, a name this PC cannot take.
+#[test]
+fn a_routed_build_that_skips_a_name_leaves_the_nothing_back_record() {
+    let case = with_same("client-record-names-skip");
+    let steps = ["write", r"bin\same.txt", "same", "write", r"bin\m~10.txt", "x"];
+
+    let outcome = passing_build(&case, &["ok", "ok"], &wrapped_build(&steps, &RELEASE));
+
+    let skipped = "gate: remote outputs: skipped 1 file(s) with names this PC cannot take: bin/m~10.txt";
+    assert!(outcome.stderr.contains(skipped), "{outcome:?}");
+    assert!(outcome.stderr.contains("gate-remote-outputs: 0"), "{outcome:?}");
+    assert_eq!(nothing_back(&case).as_deref(), Some(RELEASE_RECORD), "{outcome:?}");
+}
+
+/// The PC's `bin/both.txt` is held open from the run call to the run's end, so the install skips it.
+#[test]
+fn a_routed_build_with_an_output_in_use_leaves_the_nothing_back_record() {
+    let case = record_case("client-record-in-use");
+    write(&case, r"bin\both.txt", "pc");
+    let go = Go(case.folder().join("ssh").join("go"));
+    let steps = ssh_steps(&case, "ssh", &["ok", &format!("hold {}", shown(go.path())), "ok"]);
+    let command = wrapped_build(&BOTH_AND_NEW[1..], &RELEASE);
+    let run = start(client_gate(&case, "out.log", &steps, &command));
+    wait_until("the run call", || calls(&steps).len() == 2);
+    let held = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(case.folder().join("bin").join("both.txt"))
+        .expect("the file can be held");
+    fs::write(go.path(), "").expect("the go file can be made");
+
+    let outcome = run.finish();
+    drop(held);
+
+    assert_eq!(outcome.code, Some(0), "the pass stands: {outcome:?}");
+    let skipped = "gate: remote outputs not fully brought back: bin/both.txt is in use or read-only";
+    assert!(outcome.stderr.contains(skipped), "{outcome:?}");
+    assert_eq!(nothing_back(&case).as_deref(), Some(RELEASE_RECORD), "{outcome:?}");
+}
+
+#[test]
+fn a_routed_build_past_the_fetch_cap_leaves_the_nothing_back_record() {
+    let case = record_case("client-record-fetch-cap");
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok", PAST_THE_CAP]);
+    let tuned = Tuned {
+        extra: &LOW_BUDGET,
+        ..Tuned::default()
+    };
+
+    let outcome = finish(client_gate_tuned(&case, "out.log", &steps, &tuned, &wrapped_build(&WRITE_NEW, &RELEASE)));
+
+    assert_eq!(outcome.code, Some(0), "the pass stands: {outcome:?}");
+    assert!(outcome.stderr.contains(CAPPED_LINE), "{outcome:?}");
+    assert_eq!(nothing_back(&case).as_deref(), Some(RELEASE_RECORD), "{outcome:?}");
+}
+
+/// A Debug build that brought everything back says nothing of the Release build the record stands for.
+#[test]
+fn a_routed_debug_build_that_brings_everything_back_leaves_a_release_record() {
+    let case = record_case("client-record-debug");
+
+    let outcome = passing_build(&case, &["ok", "ok", "ok"], &wrapped_build(&WRITE_NEW, &["-c", "Debug"]));
+
+    assert_eq!(worktree_text(&case, r"bin\new.txt"), "built", "{outcome:?}");
+    assert_eq!(nothing_back(&case).as_deref(), Some(RELEASE_RECORD), "{outcome:?}");
+}
+
+/// A build of one project says nothing of the others the record may stand for. The record names a framework the build
+/// does not set, so a record the run rewrote would differ from it.
+#[test]
+fn a_routed_build_of_one_project_that_brings_everything_back_leaves_the_record() {
+    let planted = r#"{"v":1,"host":"builder","configuration":"Release","framework":"net8.0"}"#;
+    let case = planted_case("client-record-one-project", planted);
+    let settings = ["app.csproj", "-c", "Release"];
+
+    let outcome = passing_build(&case, &["ok", "ok", "ok"], &wrapped_build(&WRITE_NEW, &settings));
+
+    assert_eq!(worktree_text(&case, r"bin\new.txt"), "built", "{outcome:?}");
+    assert_eq!(nothing_back(&case).as_deref(), Some(planted), "{outcome:?}");
+}
+
+/// The box installs `bin/new.txt` but skips `bin/m~10.txt`, a name this PC cannot take: the install is complete, but
+/// the PC still lacks an output the build made.
+#[test]
+fn a_routed_build_whose_archive_installs_but_a_name_was_skipped_leaves_the_record() {
+    let case = record_case("client-record-archive-names-skip");
+    let steps = ["write", r"bin\new.txt", "built", "write", r"bin\m~10.txt", "x"];
+
+    let outcome = passing_build(&case, &["ok", "ok", "ok"], &wrapped_build(&steps, &RELEASE));
+
+    let skipped = "gate: remote outputs: skipped 1 file(s) with names this PC cannot take: bin/m~10.txt";
+    assert!(outcome.stderr.contains(skipped), "{outcome:?}");
+    assert!(outcome.stderr.contains("gate-remote-outputs: 1 "), "{outcome:?}");
+    assert_eq!(worktree_text(&case, r"bin\new.txt"), "built", "{outcome:?}");
+    assert_eq!(nothing_back(&case).as_deref(), Some(RELEASE_RECORD), "{outcome:?}");
+}
+
+/// The builder builds `bin/new.txt` for a dotnet test whose `--no-build` it dropped, and brings no outputs back.
+#[test]
+fn a_routed_no_build_test_whose_outputs_are_withheld_writes_the_pending_marker_and_the_record() {
+    let case = build_case("client-record-withheld");
+    let command = wrapped_dotnet(&WRITE_NEW, &NO_BUILD_RELEASE_TEST);
+
+    let outcome = passing_build(&case, &["ok", "ok"], &command);
+
+    assert!(outcome.stderr.contains("gate: dropped --no-build"), "{outcome:?}");
+    assert!(!outcome.stderr.contains("gate-remote-outputs:"), "no outputs are asked for: {outcome:?}");
+    assert!(!case.folder().join("bin").join("new.txt").exists(), "nothing comes back: {outcome:?}");
+    assert!(pending_marker(&case).exists(), "the next run asks for every output: {outcome:?}");
+    assert_eq!(nothing_back(&case).as_deref(), Some(RELEASE_RECORD), "{outcome:?}");
+}
+
+/// A record already stands for a Debug build: the builder built a Release one for the withheld run, but the record is
+/// never rewritten.
+#[test]
+fn a_routed_no_build_test_leaves_a_record_that_stands_unchanged() {
+    let debug = r#"{"v":1,"host":"builder","configuration":"Debug"}"#;
+    let case = planted_case("client-record-withheld-stands", debug);
+
+    let outcome = passing_build(&case, &["ok", "ok"], &wrapped_dotnet(&WRITE_NEW, &NO_BUILD_RELEASE_TEST));
+
+    assert!(outcome.stderr.contains("gate: dropped --no-build"), "{outcome:?}");
+    assert_eq!(nothing_back(&case).as_deref(), Some(debug), "{outcome:?}");
+}
+
+/// A repo with no output globs: the builder still builds once `--no-build` is dropped, so the record is written, but
+/// nothing is withheld and no pending marker is needed.
+#[test]
+fn a_routed_no_build_test_in_a_repo_without_output_globs_writes_the_record() {
+    let case = build_case("client-record-no-globs");
+    let repo = repo_name(&case.folder().file_name().expect("the case folder has a name").to_string_lossy());
+    let routing = json!({ "host": HOST, "slots": 2, "repos": { &repo: ["*tool*", "*dotnet*"] }, "outputs": { &repo: [] } });
+    write_remote_json(&case, &routing.to_string());
+
+    let outcome = passing_build(&case, &["ok", "ok"], &wrapped_dotnet(&WRITE_NEW, &NO_BUILD_RELEASE_TEST));
+
+    assert!(outcome.stderr.contains("gate: dropped --no-build"), "{outcome:?}");
+    assert!(
+        !outcome.stderr.contains("gate: outputs: none brought back"),
+        "nothing is withheld: {outcome:?}"
+    );
+    assert!(!pending_marker(&case).exists(), "{outcome:?}");
+    assert_eq!(nothing_back(&case).as_deref(), Some(RELEASE_RECORD), "{outcome:?}");
+}
+
+/// The withheld run rebuilds `bin/app.txt` in the builder's work folder only, leaving the PC's stale. The next
+/// `-c Release` build has nothing to rebuild, so only a full manifest finds the PC's copy differs: without one the box
+/// compares only the files the command changed, packs nothing for a PC that holds outputs, and the record would be
+/// cleared over the stale file. The fetch passes the cap, so nothing comes back and the record stands.
+#[test]
+fn a_routed_build_after_a_withheld_run_sends_a_full_manifest_and_keeps_the_record_if_nothing_comes_back() {
+    let case = build_case("client-record-withheld-then-build");
+    write(&case, r"bin\app.txt", "stale");
+    let withheld_steps = ["write", r"bin\app.txt", "rebuilt"];
+    let first = ssh_steps(&case, "first", &["ok", "ok"]);
+    let withheld = finish(client_gate(
+        &case,
+        "first.log",
+        &first,
+        &wrapped_dotnet(&withheld_steps, &NO_BUILD_RELEASE_TEST),
+    ));
+    assert_eq!(withheld.code, Some(0), "{withheld:?}");
+    assert_eq!(nothing_back(&case).as_deref(), Some(RELEASE_RECORD), "{withheld:?}");
+    let second = ssh_steps(&case, "second", &["ok", "ok", PAST_THE_CAP]);
+    let tuned = Tuned {
+        extra: &LOW_BUDGET,
+        ..Tuned::default()
+    };
+
+    let outcome = finish(client_gate_tuned(&case, "second.log", &second, &tuned, &wrapped_build(&[], &RELEASE)));
+
+    assert_eq!(outcome.code, Some(0), "the pass stands: {outcome:?}");
+    assert!(
+        outcome.stderr.contains("gate-remote-outputs: 1 "),
+        "the box packs the output the PC holds stale: {outcome:?}"
+    );
+    assert!(outcome.stderr.contains(CAPPED_LINE), "{outcome:?}");
+    assert_eq!(worktree_text(&case, r"bin\app.txt"), "stale", "nothing comes back: {outcome:?}");
+    assert!(pending_marker(&case).exists(), "the next run asks for every output again: {outcome:?}");
+    assert_eq!(nothing_back(&case).as_deref(), Some(RELEASE_RECORD), "{outcome:?}");
 }
 
 #[test]

@@ -62,11 +62,13 @@ const CAP_RECORD_BYTES: u64 = 4096;
 pub(super) const FETCHED: &str = "fetched";
 
 /// How a run's run call ended, for its outputs step: the work folder's place on the builder, the outputs nonce the run
-/// sent, and the call's status, the command's own.
+/// sent, the call's status, the command's own, and whether the box said it skipped outputs for names this PC cannot
+/// take.
 pub(super) struct Ran<'r> {
     pub(super) location: &'r Location,
     pub(super) nonce: &'r str,
     pub(super) status: i64,
+    pub(super) names_skipped: bool,
 }
 
 /// The file in the worktree a fetched archive is written to, the worktree it must sit inside, the `.tmp` folder held
@@ -225,17 +227,21 @@ pub(super) struct Sent<'a> {
     pub(super) manifest: Option<Arc<str>>,
     /// The pending marker, written after the push by [`marked`]; `None` for a run with no output globs.
     marker: Option<PathBuf>,
+    /// The pending marker a run whose outputs the route withheld writes after the push ([`marked`]) and never clears:
+    /// the builder builds and nothing comes back, so the next run asks for every output that differs from the PC's.
+    withheld: Option<PathBuf>,
     /// The manifest the line holds, its files' stamps, which the install checks the PC's files against; empty for a
     /// run with no output globs. Else why it could not be built, which a passing run says as it fails.
     built: Result<Manifest, String>,
 }
 
 /// What `attempt`'s run call carries of its outputs. A run with no output globs carries none, and reads no pending
-/// marker. One with globs reads whether the marker is there, builds the manifest, polling the console interrupt as it
-/// hashes and taking each hash the worktree's hash cache holds at the file's stamp, unless the marker is there, saves
-/// the cache that build leaves, whatever the run's end, unless it equals the one it read, and records the marker's path
-/// for [`marked`] to write once the snapshot is pushed; a manifest that cannot be built is kept for the outputs step,
-/// saves no cache, and the run call then carries no globs. Else the interrupt that ended the build.
+/// marker; one whose outputs the route withheld records the marker's path for [`marked`] to write. One with globs reads
+/// whether the marker is there, builds the manifest, polling the console interrupt as it hashes and taking each hash
+/// the worktree's hash cache holds at the file's stamp, unless the marker is there, saves the cache that build leaves,
+/// whatever the run's end, unless it equals the one it read, and records the marker's path for [`marked`] to write
+/// once the snapshot is pushed; a manifest that cannot be built is kept for the outputs step, saves no cache, and the
+/// run call then carries no globs. Else the interrupt that ended the build.
 pub(super) fn sent<'a>(attempt: &mut Attempt<'_, 'a>) -> Result<Sent<'a>, End> {
     let call: &RemoteCall<'a> = attempt.call;
     let mut sent = Sent {
@@ -243,9 +249,13 @@ pub(super) fn sent<'a>(attempt: &mut Attempt<'_, 'a>) -> Result<Sent<'a>, End> {
         full: false,
         manifest: None,
         marker: None,
+        withheld: None,
         built: Ok(Manifest::default()),
     };
     if call.outputs.is_empty() {
+        if call.outputs_withheld {
+            sent.withheld = Some(v1::outputs_pending_path(call.state_dir, call.key));
+        }
         return Ok(sent);
     }
     let marker = v1::outputs_pending_path(call.state_dir, call.key);
@@ -274,10 +284,10 @@ pub(super) fn sent<'a>(attempt: &mut Attempt<'_, 'a>) -> Result<Sent<'a>, End> {
 
 /// Writes the pending marker `sent` records, once the snapshot is pushed and before the run call, so a run the client
 /// sends after the push leaves it on every end but a passing run whose box packed nothing, and a run refused before
-/// the push, at the preflight or by the parity check, leaves none. A run with no output globs records none. Else why
-/// it could not be written.
+/// the push, at the preflight or by the parity check, leaves none. A run with no output globs records none, unless the
+/// route withheld its outputs, whose marker no end clears. Else why it could not be written.
 pub(super) fn marked(sent: &Sent<'_>) -> Result<(), End> {
-    match &sent.marker {
+    match sent.marker.as_ref().or(sent.withheld.as_ref()) {
         Some(marker) => mark_pending(marker).map_err(End::Failed),
         None => Ok(()),
     }
@@ -290,16 +300,28 @@ pub(super) fn marked(sent: &Sent<'_>) -> Result<(), End> {
 /// accepts, says why and ends 1. A passing run whose box packed an archive fetches it, as [`fetched`] says. A passing
 /// run whose box packed nothing removes the pending marker and the outputs cap record ([`uncapped`]); one that cannot be
 /// removed is said, and the run's status stands. The other ends that do not reach [`fetched`] leave both.
+///
+/// The attempt's outputs are marked brought back only when the install ends complete, as [`install::installed`] says,
+/// or when the box packed nothing for a manifest that held files; never when the box said it skipped outputs for names
+/// this PC cannot take. Every other end marks them not brought back.
 pub(super) fn ended(attempt: &mut Attempt<'_, '_>, sent: &Sent<'_>, ran: &Ran<'_>, synced: End, brought: Option<&Brought>) -> End {
+    let (end, complete) = step_end(attempt, sent, ran, synced, brought);
+    attempt.brought_back = Some(complete && !ran.names_skipped);
+    end
+}
+
+/// The end of the outputs step [`ended`] says, and whether it left the PC every output the box packed or found the PC
+/// holding them all, the box's names skip aside.
+fn step_end(attempt: &mut Attempt<'_, '_>, sent: &Sent<'_>, ran: &Ran<'_>, synced: End, brought: Option<&Brought>) -> (End, bool) {
     let (Some(marker), End::Status(now)) = (&sent.marker, &synced) else {
-        return synced;
+        return (synced, false);
     };
     if ran.status == 0 && *now == 1 {
         attempt.say(not_brought_back("the worktree changed during the run"));
-        return synced;
+        return (synced, false);
     }
     if *now != 0 {
-        return synced;
+        return (synced, false);
     }
     let reason = match (&sent.built, brought) {
         (Err(reason), _) => format!("the manifest could not be built: {reason}"),
@@ -312,16 +334,16 @@ pub(super) fn ended(attempt: &mut Attempt<'_, '_>, sent: &Sent<'_>, ran: &Ran<'_
             };
             return fetched(attempt, &kept, ran, synced);
         }
-        (Ok(_), Some(Brought::Nothing)) => {
+        (Ok(files), Some(Brought::Nothing)) => {
             if let Err(why) = clear_pending(marker) {
                 attempt.say(format!("gate: {why}"));
             }
             uncapped(attempt);
-            return synced;
+            return (synced, *files != Manifest::default());
         }
     };
     attempt.say(not_brought_back(&reason));
-    End::Status(1)
+    (End::Status(1), false)
 }
 
 /// What the outputs step of a passing run whose box packed an archive keeps for its install: the run's output globs,
@@ -340,8 +362,9 @@ struct Kept<'k> {
 /// said one, and fails the run, but one whose archive passed the fetch cap installs nothing and is judged as [`capped`]
 /// says. Each of these removes what was fetched, and says so when it cannot; each says the outputs were not brought back
 /// but the interrupt. The worktree's outputs cap record ([`uncapped`]) is removed once the fetch ends whole, before the
-/// install, and on every other end but the cap and a Ctrl+C during the fetch.
-fn fetched(attempt: &mut Attempt<'_, '_>, kept: &Kept<'_>, ran: &Ran<'_>, synced: End) -> End {
+/// install, and on every other end but the cap and a Ctrl+C during the fetch. With the end, whether the install was
+/// complete; a fetch that did not end whole installs nothing.
+fn fetched(attempt: &mut Attempt<'_, '_>, kept: &Kept<'_>, ran: &Ran<'_>, synced: End) -> (End, bool) {
     let started = Instant::now();
     let name = archive_file_name(attempt.call.key, ran.nonce);
     let tmp = Path::new(attempt.call.root).join(TMP);
@@ -367,16 +390,16 @@ fn fetched(attempt: &mut Attempt<'_, '_>, kept: &Kept<'_>, ran: &Ran<'_>, synced
                     };
                     install::installed(attempt, &fetched)
                 }
-                end => settled(attempt, at_the_cap, end),
+                end => (settled(attempt, at_the_cap, end), false),
             }
         }
         Err(End::Failed(reason)) => {
             let end = unfetched(attempt, &archive, &reason, End::Status(1));
-            settled(attempt, false, end)
+            (settled(attempt, false, end), false)
         }
         Err(end) => {
             removed(attempt, &archive, PARTIAL);
-            settled(attempt, false, end)
+            (settled(attempt, false, end), false)
         }
     }
 }

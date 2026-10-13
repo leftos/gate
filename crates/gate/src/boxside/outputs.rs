@@ -357,6 +357,11 @@ pub(super) fn bring_back(
     }
 }
 
+/// The start of the line saying the run's outputs leave out files for names this PC cannot take ([`skipped_line`]),
+/// which the PC's client reads on standard error. A command can print it too, which only makes the PC count the run's
+/// outputs as not brought back.
+pub(crate) const NAMES_SKIPPED: &str = "gate: remote outputs: skipped ";
+
 /// The line saying the run's outputs leave out the files `skipped` for names this PC cannot take, naming the first, cut
 /// to [`NAMED_PATH_LIMIT`] bytes, and marking that more follow; `None` when there are none.
 fn skipped_line(skipped: &[&Found]) -> Option<String> {
@@ -365,7 +370,7 @@ fn skipped_line(skipped: &[&Found]) -> Option<String> {
     let cut = if named.len() < first.path.len() { "\u{2026}" } else { "" };
     let more = if skipped.len() > 1 { ", \u{2026}" } else { "" };
     Some(format!(
-        "gate: remote outputs: skipped {} file(s) with names this PC cannot take: {}{cut}{more}",
+        "{NAMES_SKIPPED}{} file(s) with names this PC cannot take: {}{cut}{more}",
         skipped.len(),
         escaped(named)
     ))

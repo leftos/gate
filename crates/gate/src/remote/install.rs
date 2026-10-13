@@ -105,8 +105,8 @@ enum Unmoved {
 /// A refusal says why the outputs were not brought back and ends the run 1; a Ctrl+C ends it as an interrupt, saying how
 /// many files were installed when any were ([`ending`]). Every end removes the archive and the stage folder this run
 /// made, never one that was there before, saying a removal that fails; only a success that skipped nothing clears the
-/// marker.
-pub(super) fn installed(attempt: &mut Attempt<'_, '_>, fetched: &Fetched<'_>) -> End {
+/// marker. With the end, whether the install was complete: a success that skipped nothing.
+pub(super) fn installed(attempt: &mut Attempt<'_, '_>, fetched: &Fetched<'_>) -> (End, bool) {
     let staged = Cell::new(false);
     let (end, lines, complete) = match install(attempt, fetched, &staged) {
         Ok(done) => {
@@ -131,7 +131,7 @@ pub(super) fn installed(attempt: &mut Attempt<'_, '_>, fetched: &Fetched<'_>) ->
     if complete && let Err(why) = outputs::clear_pending(fetched.marker) {
         attempt.say(format!("gate: {why}"));
     }
-    end
+    (end, complete)
 }
 
 /// The end of an install that did not complete as `unmet` says, and the line it says: none for a Ctrl+C before any file

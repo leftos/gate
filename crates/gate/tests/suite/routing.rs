@@ -15,8 +15,8 @@ use crate::bridge::{answer, bridge_words, stand_in};
 use crate::nesting::{marked, test_marker};
 
 use crate::support::{
-    Case, FAKE_TOOL, Running, assert_in_order, copy_tool, events, finish, git, git_init, heavy_words, release, run_words, shown,
-    wait_for_journal_line, wait_until, write_counts, write_remote_json,
+    Case, FAKE_TOOL, Running, assert_in_order, copy_tool, events, finish, git, git_init, heavy_words, nothing_back, record_path, release, run_words,
+    shown, wait_for_journal_line, wait_until, write_counts, write_remote_json,
 };
 
 pub(crate) const HOST: &str = "builder";
@@ -738,23 +738,6 @@ const DROPPED: &str = "gate: dropped --no-build";
 /// A dotnet test with `--no-build`, run by the stand-in dotnet ([`dotnet_cmd`]).
 const NO_BUILD_TEST: [&str; 3] = [r".\dotnet.cmd", "test", "--no-build"];
 
-/// The case's nothing-back record, the one `*.nothing-back` entry of the state root's `remote` folder; `None` when
-/// there is none.
-fn record_path(case: &Case) -> Option<PathBuf> {
-    let entries = fs::read_dir(case.root().join("remote")).ok()?;
-    let found: Vec<PathBuf> = entries
-        .map(|entry| entry.expect("a remote entry can be read").path())
-        .filter(|path| path.extension().is_some_and(|extension| extension == "nothing-back"))
-        .collect();
-    assert!(found.len() <= 1, "one worktree leaves one record: {found:?}");
-    found.into_iter().next()
-}
-
-/// The text of the case's nothing-back record ([`record_path`]); `None` when there is none.
-fn nothing_back(case: &Case) -> Option<String> {
-    record_path(case).map(|path| fs::read_to_string(path).expect("the record can be read"))
-}
-
 /// Writes `text` over the case's nothing-back record.
 fn rewrite_record(case: &Case, text: &str) {
     let path = record_path(case).expect("the case has a record");
@@ -910,6 +893,7 @@ fn a_failed_or_killed_routed_build_leaves_a_record() {
     }
 }
 
+/// The builder builds for a routed `--no-build` command, but a record already stands, so it is left as it is.
 #[test]
 fn a_routed_no_build_is_not_dropped_here_and_leaves_the_record_alone() {
     let case = routed_case("routing-nothing-back-routed-no-build");

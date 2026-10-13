@@ -45,7 +45,7 @@ use super::syncback;
 use super::transport::{Local, Program, Transport};
 use super::watchdog::{self, Cut, Kept, Kill, LINE_CAP};
 use super::{FAILED, FAILED_RUN, REFUSED, Refusal, RemoteCall, RemoteClient, RemoteOutcome, refused_line, started_line};
-use crate::boxside::outputs::OUTPUTS_BUDGET;
+use crate::boxside::outputs::{NAMES_SKIPPED, OUTPUTS_BUDGET};
 use crate::boxside::payload::escaped;
 use crate::environment::Variables;
 use crate::outputs::archive::sent_limit;
@@ -201,6 +201,7 @@ impl RemoteClient for RustClient {
             outputs_budget: self.outputs_budget,
             log_cap: self.log_cap,
             own_start_fails: self.own_start_fails,
+            brought_back: None,
             lines: Vec::new(),
             problem: None,
         };
@@ -363,6 +364,8 @@ pub(super) struct Called {
     pub(super) lines: Vec<String>,
     /// Its last standard error line that is the box's outputs line, however many lines came after it.
     outputs_line: Option<String>,
+    /// Whether it said on standard error that the box skipped outputs for names this PC cannot take.
+    names_skipped: bool,
     /// Whether the box said the run's start marker on standard error.
     started: bool,
     /// The reason the box's refusal tag for the run named on standard error, the first when it said more than one.
@@ -428,8 +431,20 @@ pub(super) struct Attempt<'c, 'a> {
     log_cap: u64,
     /// `--test-own-start-fails`: this gate's start, which names the sync-back's quarantine, cannot be read.
     pub(super) own_start_fails: bool,
+    /// Whether the run's outputs were brought back, as its outputs step ended ([`outputs::ended`]); `None` for a run
+    /// that never reached it.
+    pub(super) brought_back: Option<bool>,
     lines: Vec<String>,
     problem: Option<String>,
+}
+
+/// How a run call ended ([`Attempt::run_call`]): its end, the last standard error line of the call that counts that is
+/// the box's outputs line, and whether that call said on standard error that the box skipped outputs for names this PC
+/// cannot take.
+struct RunEnd {
+    end: End,
+    outputs_line: Option<String>,
+    names_skipped: bool,
 }
 
 impl Attempt<'_, '_> {
@@ -453,18 +468,19 @@ impl Attempt<'_, '_> {
         self.push(&snapshot, prepared.created)?;
         // After the push: a run refused before it, at the preflight or by the parity check, leaves no marker.
         outputs::marked(&sent)?;
-        let (end, heard) = self.run_call(&run_line, &location, sent.manifest.as_ref(), &nonce)?;
+        let called = self.run_call(&run_line, &location, sent.manifest.as_ref(), &nonce)?;
         // The sync-back runs after a run call that ended with the command's own status; a refusal, an interrupt, a
         // kill, a lost connection or a failed call ended the attempt before it, so a box refusal's 75 never syncs back.
         // The pending marker stays on every end but a passing run whose box packed nothing.
-        match end {
+        match called.end {
             End::Status(status) => {
                 let synced = syncback::sync_back(self, &snapshot, status)?;
-                let brought = outputs::accepted(heard.as_deref(), self.call.key, &nonce);
+                let brought = outputs::accepted(called.outputs_line.as_deref(), self.call.key, &nonce);
                 let ran = outputs::Ran {
                     location: &location,
                     nonce: &nonce,
                     status,
+                    names_skipped: called.names_skipped,
                 };
                 Ok(outputs::ended(self, &sent, &ran, synced, brought.as_ref()))
             }
@@ -698,14 +714,15 @@ impl Attempt<'_, '_> {
     /// banner twice, as the command never started; a refusal when its 75 comes with the box's refusal tag for the run
     /// whose nonce is `nonce` and no start marker; a lost connection when it exited 255 otherwise. A watchdog kill says
     /// its line, stops the command and ends the run killed; a Ctrl+C stops the command too. Each call made is fed
-    /// `input` on its standard input, when given. With the end, the last standard error line of the call that counts
-    /// that is the box's outputs line.
-    fn run_call(&mut self, line: &str, location: &Location, input: Option<&Arc<str>>, nonce: &str) -> Result<(End, Option<String>), End> {
+    /// `input` on its standard input, when given. With the end, what the call that counts said of the outputs
+    /// ([`RunEnd`]).
+    fn run_call(&mut self, line: &str, location: &Location, input: Option<&Arc<str>>, nonce: &str) -> Result<RunEnd, End> {
         self.go_on()?;
         let limits = self.limits_for("run");
         let raise = self.raises_at("run");
         let nonce: Arc<str> = Arc::from(nonce);
         let mut heard = None;
+        let mut names_skipped = false;
         let end = self.run_call_made(location, limits, |attempt| {
             let run = CallOnly {
                 input: input.cloned(),
@@ -714,9 +731,14 @@ impl Attempt<'_, '_> {
             };
             let called = attempt.ssh(line, Echo::Console, Watch::Run(limits), raise, run)?;
             heard.clone_from(&called.outputs_line);
+            names_skipped = called.names_skipped;
             Ok(called)
         })?;
-        Ok((end, heard))
+        Ok(RunEnd {
+            end,
+            outputs_line: heard,
+            names_skipped,
+        })
     }
 
     /// The run call as `make` makes it, watched by `limits`, as [`Attempt::run_call`] says. The command is stopped only
@@ -1131,7 +1153,7 @@ impl Attempt<'_, '_> {
             killed,
             lines: self.lines,
             detail: self.problem,
-            brought_back: None,
+            brought_back: self.brought_back,
         }
     }
 }
@@ -1155,6 +1177,7 @@ impl<'c, 'a> Attempt<'c, 'a> {
             outputs_budget: OUTPUTS_BUDGET,
             log_cap: watchdog::LOG_CAP,
             own_start_fails: false,
+            brought_back: None,
             lines: Vec::new(),
             problem: None,
         }
@@ -1229,6 +1252,7 @@ fn called_of(ended: CallEnd, raised: Raised, mut heard: Heard) -> Result<Called,
         last_error: heard.last_error,
         lines: heard.kept.into_lines(),
         outputs_line: heard.outputs_line,
+        names_skipped: heard.names_skipped,
         started: heard.started,
         refused: heard.refused,
         written: None,
@@ -1487,8 +1511,8 @@ fn git_end(error: GitError) -> End {
 
 /// What one call's two streams said so far, kept for the call's end, each line cut to the cap: whether it wrote on
 /// standard output, its first and last standard error lines, its last standard error line that is the box's outputs
-/// line, whether the box said the run's start marker and the refusal its first tag named, its last lines, and the
-/// first problem reading them.
+/// line, whether a standard error line said the box skipped outputs for names ([`NAMES_SKIPPED`]), whether the box
+/// said the run's start marker and the refusal its first tag named, its last lines, and the first problem reading them.
 #[derive(Default)]
 struct Heard {
     kept: Kept,
@@ -1496,6 +1520,7 @@ struct Heard {
     first_error: Option<String>,
     last_error: Option<String>,
     outputs_line: Option<String>,
+    names_skipped: bool,
     started: bool,
     refused: Option<FallbackReason>,
     problem: Option<String>,
@@ -1530,6 +1555,7 @@ impl Heard {
             self.last_error = Some(line.to_owned());
         }
         outputs::keep_outputs_line(&mut self.outputs_line, line, error);
+        self.names_skipped |= error && line.starts_with(NAMES_SKIPPED);
         self.kept.push(line);
     }
 
@@ -2313,6 +2339,7 @@ mod tests {
             subfolder: "",
             words: &[],
             outputs: &[],
+            outputs_withheld: false,
             log,
             timeout: 60,
             stall: 60,
@@ -2341,6 +2368,7 @@ mod tests {
             outputs_budget: OUTPUTS_BUDGET,
             log_cap: LOG_CAP,
             own_start_fails: false,
+            brought_back: None,
             lines: Vec::new(),
             problem: None,
         }
@@ -2368,6 +2396,7 @@ mod tests {
             last_error: Some(first_error.to_owned()),
             lines: vec![first_error.to_owned()],
             outputs_line: None,
+            names_skipped: false,
             started: false,
             refused: None,
             written: None,
@@ -2834,6 +2863,131 @@ mod tests {
         assert_eq!(attempt.lines, Vec::<String>::new());
     }
 
+    /// A worktree folder of the test `name`'s own, made empty, holding the output `bin/a.txt` when `held`.
+    fn outputs_worktree(name: &str, held: bool) -> PathBuf {
+        let folder = std::env::temp_dir().join(format!("gate-client-worktree-{name}-{}", std::process::id()));
+        if folder.exists() {
+            fs::remove_dir_all(&folder).expect("a worktree left by an earlier run can be removed");
+        }
+        fs::create_dir_all(folder.join("bin")).expect("the worktree can be made");
+        if held {
+            fs::write(folder.join("bin").join("a.txt"), "pc").expect("the output can be written");
+        }
+        folder
+    }
+
+    /// An outputs step as [`brought_back_after`] ends it: the worktree its manifest is built from, whether the run has
+    /// output globs, the run call's status and the one the sync-back left, what the box said it packed, and whether it
+    /// said it skipped outputs for names.
+    struct Step<'s> {
+        root: &'s Path,
+        globs: bool,
+        status: i64,
+        synced: i64,
+        brought: Option<outputs::Brought>,
+        names_skipped: bool,
+    }
+
+    /// The outputs step of a passing run with output globs in `root`, the box having said it packed `brought` and, when
+    /// `names_skipped`, that it skipped outputs for names.
+    fn passed(root: &Path, brought: Option<outputs::Brought>, names_skipped: bool) -> Step<'_> {
+        Step {
+            root,
+            globs: true,
+            status: 0,
+            synced: 0,
+            brought,
+            names_skipped,
+        }
+    }
+
+    /// Whether an attempt's outputs are brought back once its outputs step ended as `step` says, through a transport
+    /// whose every call fails to start, the state in a fresh folder of the test `name`'s own.
+    fn brought_back_after(name: &str, step: &Step<'_>) -> Option<bool> {
+        let state = fresh_state(name);
+        let log = unwritten_log();
+        let globs = ["**/bin/**".to_owned()];
+        let mut call = call(&log);
+        call.interrupt = None;
+        call.root = step.root.to_str().expect("a test worktree's path is Unicode");
+        call.state_dir = &state;
+        call.outputs = if step.globs { &globs[..] } else { &[] };
+        let transport = nowhere();
+        let mut attempt = Attempt::for_tests(&call, &transport);
+        let sent = outputs::sent(&mut attempt).expect("no interrupt ends the manifest's build");
+        let location = location();
+        let ran = outputs::Ran {
+            location: &location,
+            nonce: "0123456789ab",
+            status: step.status,
+            names_skipped: step.names_skipped,
+        };
+        outputs::ended(&mut attempt, &sent, &ran, End::Status(step.synced), step.brought.as_ref());
+        attempt.brought_back
+    }
+
+    #[test]
+    fn ended_sets_brought_back_for_each_outputs_end() {
+        let held = outputs_worktree("held", true);
+        let empty = outputs_worktree("empty", false);
+        let unbuilt = Path::new(r"C:\gate-client-tests-no-such-folder");
+        let archive = || {
+            Some(outputs::Brought::Archive {
+                count: 1,
+                name: "app-1a2b3c4d-0123456789ab.tar.zst".to_owned(),
+            })
+        };
+        let nothing = || Some(outputs::Brought::Nothing);
+        let rows = [
+            (
+                "no output globs",
+                Step {
+                    globs: false,
+                    ..passed(&held, None, false)
+                },
+                Some(false),
+            ),
+            (
+                "a failed run",
+                Step {
+                    status: 3,
+                    synced: 3,
+                    ..passed(&held, None, false)
+                },
+                Some(false),
+            ),
+            (
+                "a worktree changed during the run",
+                Step {
+                    synced: 1,
+                    ..passed(&held, nothing(), false)
+                },
+                Some(false),
+            ),
+            ("no manifest", passed(unbuilt, nothing(), false), Some(false)),
+            ("no outputs line", passed(&held, None, false), Some(false)),
+            ("nothing packed for a PC holding outputs", passed(&held, nothing(), false), Some(true)),
+            ("nothing packed for a PC holding none", passed(&empty, nothing(), false), Some(false)),
+            ("nothing packed, names skipped", passed(&held, nothing(), true), Some(false)),
+            ("an archive whose fetch failed", passed(&held, archive(), false), Some(false)),
+        ];
+        let log = unwritten_log();
+        let call = call(&log);
+        let transport = nowhere();
+
+        let unreached = Attempt::for_tests(&call, &transport).brought_back;
+        let ended: Vec<(&str, Option<bool>, Option<bool>)> = rows
+            .into_iter()
+            .enumerate()
+            .map(|(index, (end, step, want))| (end, brought_back_after(&format!("brought-back-{index}"), &step), want))
+            .collect();
+
+        assert_eq!(unreached, None, "an attempt that never reached the outputs step cannot tell");
+        for (end, got, want) in ended {
+            assert_eq!(got, want, "{end}");
+        }
+    }
+
     #[test]
     fn a_ctrl_c_after_a_run_call_that_failed_before_the_banner_stops_nothing() {
         let log = unwritten_log();
@@ -2891,6 +3045,21 @@ mod tests {
 
         assert!(!called.lines.iter().any(|kept| kept == line), "the window no longer holds the line");
         assert_eq!(called.outputs_line.as_deref(), Some(line), "the last standard error outputs line is kept");
+    }
+
+    #[test]
+    fn only_a_standard_error_line_counts_as_a_names_skip() {
+        let line = "gate: remote outputs: skipped 1 file(s) with names this PC cannot take: bin/m~10.txt";
+        let mut printed = Heard::default();
+        printed.record(line, false, None);
+        let mut said = Heard::default();
+        said.record(line, true, None);
+
+        let printed = called_of(CallEnd::Exited(0), Raised::default(), printed).expect("a call that ended");
+        let said = called_of(CallEnd::Exited(0), Raised::default(), said).expect("a call that ended");
+
+        assert!(!printed.names_skipped, "a standard output line is the command's own");
+        assert!(said.names_skipped, "the box says it on standard error");
     }
 
     #[test]

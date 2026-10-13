@@ -514,6 +514,7 @@ fn call_of<'r>(request: &'r RunRequest, log: &'r Log, host: &Host, root: &'r Res
         subfolder: &remote.subfolder,
         words: &remote.words,
         outputs: &remote.outputs,
+        outputs_withheld: remote.outputs_withheld,
         log: log.path(),
         timeout: request.timeout,
         stall: request.stall,
@@ -769,7 +770,8 @@ impl Run<'_> {
     /// calls the client and ends the run as the client ended it, the lock held until then. A key lock held elsewhere, a
     /// full remote pool, a refusal or a client that cannot start falls back here; with a client missing a part, the run
     /// falls back before it takes a remote slot. A Ctrl+C ends the run here, with the remote slot released: one raised
-    /// before the call, or during it over a refusal. A client that ended on its own keeps its own status.
+    /// before the call, or during it over a refusal. A client that ended on its own keeps its own status, and the run
+    /// writes or clears the worktree's nothing-back record ([`Run::leave_nothing_back`]).
     fn routed(&mut self, remote: &RemoteRun, hold: &mut Hold, console: &mut Console) -> Remotely {
         if let Err(why) = self.client.ready() {
             return self.fell_back(FallbackReason::Client, &RemoteOutcome::not_started(why), None, console);
@@ -798,15 +800,31 @@ impl Run<'_> {
         Remotely::Ended(self.remote_ended(&remote.host, &outcome, started, console))
     }
 
-    /// Writes the worktree's nothing-back record after a routed run that ended on the builder, killed, interrupted or
-    /// unreported among them, when its command is a dotnet build ([`dotnet_builds`]) whose outputs `outcome` does not
-    /// know were brought back: the builder, and the configuration, framework and runtime its words set
-    /// ([`build_settings`]). A record that cannot be written is said.
+    /// Updates the worktree's nothing-back record after a routed run that ended on the builder, killed, interrupted or
+    /// unreported among them. A dotnet command whose `--no-build` the builder dropped built there and brings nothing
+    /// back: it writes the record when none stands, and never rewrites or clears one. A dotnet build ([`dotnet_builds`])
+    /// that passed with its outputs brought back ([`brought_everything_back`]) clears the record, as a passing build here
+    /// of its words would ([`Run::clear_nothing_back`]); any other dotnet build writes it, an unknown counting as not
+    /// brought back. The record names the builder and the configuration, framework and runtime the words set
+    /// ([`build_settings`]); one that cannot be written, or whose presence cannot be read, is said.
     fn leave_nothing_back(&self, remote: &RemoteRun, outcome: &RemoteOutcome, console: &mut Console) {
-        let Some(words) = unicode_words(&self.request.command).filter(|words| dotnet_builds(words)) else {
+        let Some(words) = unicode_words(&self.request.command) else {
             return;
         };
-        if outcome.brought_back == Some(true) {
+        let path = v1::nothing_back_path(&self.root.path, &remote.key);
+        if remote.dropped_no_build {
+            match path.try_exists() {
+                Ok(false) => {}
+                Ok(true) => return,
+                Err(error) => {
+                    console.err(&format!("gate: cannot read {}: {error}", path.display()));
+                    return;
+                }
+            }
+        } else if !dotnet_builds(&words) {
+            return;
+        } else if brought_everything_back(outcome) {
+            self.clear_nothing_back(HereWords::routed(remote, words), console);
             return;
         }
         let settings = build_settings(&words);
@@ -816,7 +834,6 @@ impl Run<'_> {
             framework: settings.framework,
             runtime: settings.runtime,
         };
-        let path = v1::nothing_back_path(&self.root.path, &remote.key);
         if let Err(error) = v1::write_nothing_back(&path, &record) {
             console.err(&format!("gate: cannot write {}: {error}", path.display()));
         }
@@ -1016,9 +1033,10 @@ impl Run<'_> {
         }
     }
 
-    /// Removes the worktree's nothing-back record after a run here that passed, once its slot is released, when the
-    /// words it ran are a dotnet build of the whole worktree that rebuilt what the record stands for
-    /// ([`Run::cleared_record`]). A record that cannot be removed is said.
+    /// Removes the worktree's nothing-back record after a run here that passed, once its slot is released, or after a
+    /// routed run that brought its outputs back ([`Run::leave_nothing_back`]), when the words it ran are a dotnet build
+    /// of the whole worktree that rebuilt what the record stands for ([`Run::cleared_record`]). A record that cannot be
+    /// removed is said.
     fn clear_nothing_back(&self, here: HereWords, console: &mut Console) {
         let Some(path) = self.cleared_record(here, console) else {
             return;
@@ -1934,10 +1952,10 @@ struct HereWords {
 }
 
 impl HereWords {
-    /// The words of the run here after `remote`'s fallback, in the worktree and folder the route placed it in.
-    fn fallback(remote: &RemoteRun) -> HereWords {
+    /// `words`, in the worktree and folder `remote`'s route placed the run in.
+    fn routed(remote: &RemoteRun, words: Vec<String>) -> HereWords {
         HereWords {
-            words: remote.fallback.clone(),
+            words,
             worktree: Some(Worktree {
                 root: remote.root.clone(),
                 prefix: remote.subfolder.clone(),
@@ -1945,6 +1963,17 @@ impl HereWords {
             dropped: None,
         }
     }
+
+    /// The words of the run here after `remote`'s fallback, in the worktree and folder the route placed it in.
+    fn fallback(remote: &RemoteRun) -> HereWords {
+        HereWords::routed(remote, remote.fallback.clone())
+    }
+}
+
+/// Whether a routed run's `outcome` lets it clear the worktree's nothing-back record: it passed, as a run here must to
+/// clear it, and its outputs are known to be brought back.
+fn brought_everything_back(outcome: &RemoteOutcome) -> bool {
+    outcome.status == 0 && outcome.brought_back == Some(true)
 }
 
 /// The command's words as text, `None` when one of them is not valid Unicode.
@@ -1970,13 +1999,34 @@ mod tests {
     use gate_watchdog::{Cores, Hint};
 
     use super::{
-        Ends, Judged, Pass, Stopper, Timing, cores_hint_for, cores_line, earlier, interrupted, kill, log_in_state_root, passed_line, records_after,
-        stop, takes_own_slot,
+        Ends, Judged, Pass, Stopper, Timing, brought_everything_back, cores_hint_for, cores_line, earlier, interrupted, kill, log_in_state_root,
+        passed_line, records_after, stop, takes_own_slot,
     };
     use crate::console::Console;
     use crate::escaped::{Found, Look, Reached, Recorded};
     use crate::nesting::{Nesting, Parent};
+    use crate::remote::RemoteOutcome;
     use crate::watch::Watched;
+
+    #[test]
+    fn only_a_passing_routed_run_that_brought_its_outputs_back_clears_the_record() {
+        let outcome = |status, brought_back| RemoteOutcome {
+            status,
+            brought_back,
+            ..RemoteOutcome::default()
+        };
+
+        assert!(
+            brought_everything_back(&outcome(0, Some(true))),
+            "a passing run that brought everything back"
+        );
+        assert!(
+            !brought_everything_back(&outcome(1, Some(true))),
+            "a run whose status was forced to fail after a complete install"
+        );
+        assert!(!brought_everything_back(&outcome(0, Some(false))), "outputs not brought back");
+        assert!(!brought_everything_back(&outcome(0, None)), "a client that cannot tell");
+    }
 
     /// Ends that note the pids of the processes outside the job each terminate is given, whose look finds nothing more
     /// than it is given, and whose command has exited 0.

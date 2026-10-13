@@ -132,6 +132,9 @@ pub(crate) struct RemoteCall<'a> {
     pub words: &'a [String],
     /// The output globs the run brings back.
     pub outputs: &'a [String],
+    /// Whether the route withheld the run's outputs, its command a dotnet `--no-build` one whose word the builder
+    /// dropped: the builder builds, and nothing comes back. The bridge ignores it.
+    pub outputs_withheld: bool,
     /// The `--bring-tracked` globs: a fetched output git tracks is installed only when one matches it. The bridge
     /// ignores them.
     pub bring_tracked: &'a [String],
@@ -160,8 +163,10 @@ pub(crate) struct RemoteOutcome {
     pub lines: Vec<String>,
     /// Why the client could not start its run, or could not say its lines.
     pub detail: Option<String>,
-    /// Whether the run's outputs were brought back: `None` when the client cannot tell, which counts as not brought
-    /// back.
+    /// Whether the run's outputs were brought back: `Some(true)` only when the run's outputs step installed its archive
+    /// whole, or the box packed nothing for a PC that held outputs, and in either case the box skipped no name this PC
+    /// cannot take: a skipped name makes it `Some(false)` on both paths. `None` when the client cannot tell, the bridge
+    /// always, which counts as not brought back.
     pub brought_back: Option<bool>,
 }
 
@@ -312,6 +317,7 @@ mod snapshot_only {
                 subfolder: "",
                 words: &[],
                 outputs: &[],
+                outputs_withheld: false,
                 log,
                 timeout: 3600,
                 stall: 0,

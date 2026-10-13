@@ -910,6 +910,23 @@ pub fn write_remote_json(case: &Case, json: &str) -> PathBuf {
     path
 }
 
+/// The case's nothing-back record, the one `*.nothing-back` entry of the state root's `remote` folder; `None` when
+/// there is none.
+pub fn record_path(case: &Case) -> Option<PathBuf> {
+    let entries = fs::read_dir(case.root().join("remote")).ok()?;
+    let found: Vec<PathBuf> = entries
+        .map(|entry| entry.expect("a remote entry can be read").path())
+        .filter(|path| path.extension().is_some_and(|extension| extension == "nothing-back"))
+        .collect();
+    assert!(found.len() <= 1, "one worktree leaves one record: {found:?}");
+    found.into_iter().next()
+}
+
+/// The text of the case's nothing-back record ([`record_path`]); `None` when there is none.
+pub fn nothing_back(case: &Case) -> Option<String> {
+    record_path(case).map(|path| fs::read_to_string(path).expect("the record can be read"))
+}
+
 /// The PowerShell gate's folder under `case`'s LOCALAPPDATA, `%LOCALAPPDATA%\gate`.
 pub fn powershell_folder(case: &Case) -> PathBuf {
     case.local_app_data().join("gate")
