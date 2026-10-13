@@ -40,7 +40,8 @@ use crate::console::Console;
 use crate::environment::Variables;
 use crate::outputs::manifest::{Listing, Manifest};
 use crate::remote::{Refusal, refused_line, started_line};
-use crate::run::{Written, find_program, written};
+use crate::resolve::{self, Environment};
+use crate::run::{Written, end_leftovers, find_program, written};
 
 /// The status of a run refused: another run holds the work folder, or the work folder's dotnet tools could not be
 /// restored.
@@ -230,7 +231,7 @@ impl<'a> StopSignal<'a> {
 }
 
 impl Beat<'_> {
-    /// Has the heartbeat count the CPU of `job` and the box's build servers from now on.
+    /// Has the heartbeat count the CPU of `job` from now on.
     fn watch(&self, job: &Arc<Job>) {
         if let Some(pump) = self.pump {
             pump.watch(heartbeat::job_cpu(Arc::clone(job)));
@@ -489,12 +490,15 @@ pub(super) fn full_path(path: &Path) -> Option<PathBuf> {
 /// nothing; the restore looks at it the same way before it runs, so such a stop runs no restore either
 /// ([`crate::boxside::tools`]). The command starts on a UTF-8 console when it can have one ([`start_command`]), whose
 /// donor lives until the wait for the command is over, however it ends. The heartbeat watches the job while [`watch`]
-/// waits for it. The command's environment is the box's own with `MSBUILDNODEHANDSHAKESALT` set to the work folder's
-/// key, replacing any value the box inherited, so `MSBuild`'s worker nodes stay warm within one work folder and are
-/// never reused across work folders ([`Variables::with`]), and with git's `safe.directory` set to `*`
-/// ([`with_safe_directory`]). The command runs with a restricted copy of the box's token ([`restricted_token`]).
+/// waits for it. The command's environment is the box's own with the build-server settings of its run set over it
+/// ([`Variables::with_build_servers`]), replacing any value the box inherited: the compiler server's pipe and
+/// `MSBuild`'s node handshake are named by the run id `gate-box-<Nonce>`, so no other run's command, on the box or on
+/// the PC, uses the servers this one starts, and the `MSBuild` server and node reuse are off. Git's `safe.directory` is
+/// set to `*` over that ([`with_safe_directory`]). The command runs with a restricted copy of the box's token
+/// ([`restricted_token`]).
 fn command(request: &Request<'_>, place: &Path, beat: &Beat<'_>, console: &mut Console) -> Result<u32, u32> {
-    let variables = with_safe_directory(Variables::from_process().with("MSBUILDNODEHANDSHAKESALT", request.key));
+    let run = format!("gate-box-{}", request.nonce);
+    let variables = with_safe_directory(Variables::from_process().with_build_servers(&run));
     let environment = variables
         .block()
         .map_err(|error| failed(console, &format!("cannot build the command's environment: {error}")))?;
@@ -542,7 +546,8 @@ fn command(request: &Request<'_>, place: &Path, beat: &Beat<'_>, console: &mut C
         Err(answer) => return answer,
     };
     let mut stopper = Stopper { job: &job, armed: true };
-    let watched = watch(&job, &launched.running, launched.pipes, beat, console);
+    let keep: Vec<u32> = donor.as_ref().map(Donor::pid).into_iter().collect();
+    let watched = watch(&job, launched, &keep, beat, console);
     stopper.armed = false;
     // Ended only now, so the command's console stays up for as long as the command may use it.
     drop(donor);
@@ -946,7 +951,11 @@ struct Pipes {
 /// [`CLOSED_STATUS`] answered for it instead. Should the box fail first, the job is terminated, so the command does
 /// not outlive a run that no longer watches it. The heartbeat watches the job once the readers drain its pipes, so no
 /// CPU read runs while the command's output is left unread, and stops watching it once the wait ends, however it ends.
-fn watch(job: &Arc<Job>, running: &Running, pipes: Pipes, beat: &Beat<'_>, console: &mut Console) -> Result<u32, u32> {
+/// Once the command has exited, what it left in its job but the processes of `keep` is ended ([`end_what_it_left`])
+/// before the readers drain, so a leftover holding its output open costs no drain time, and before the outputs are
+/// listed.
+fn watch(job: &Arc<Job>, launched: Launched, keep: &[u32], beat: &Beat<'_>, console: &mut Console) -> Result<u32, u32> {
+    let Launched { running, pipes } = launched;
     let forwarders = match Forwarders::start(pipes.stdout, pipes.stderr, beat.lock) {
         Ok(forwarders) => forwarders,
         Err(error) => {
@@ -957,7 +966,7 @@ fn watch(job: &Arc<Job>, running: &Running, pipes: Pipes, beat: &Beat<'_>, conso
     };
     let watched = Watched {
         job,
-        running,
+        running: &running,
         forwarders,
         watching: Watching::Command,
     };
@@ -966,9 +975,26 @@ fn watch(job: &Arc<Job>, running: &Running, pipes: Pipes, beat: &Beat<'_>, conso
     let waited = watched.wait(None, console);
     beat.unwatch();
     match waited {
-        WaitEnd::Exited { code, .. } => watched.drained(console).map(|()| code),
+        WaitEnd::Exited { code, .. } => {
+            end_what_it_left(job, keep, console);
+            watched.drained(console).map(|()| code)
+        }
         WaitEnd::ClientGone => Err(watched.client_gone(console)),
         WaitEnd::Failed(status) => Err(status),
+    }
+}
+
+/// Ends what the command that exited left in its `job` as a local run does ([`end_leftovers`]), its gates spared,
+/// under the box's own state root, resolved as `gate run` resolves it with no `--state-dir`, and the processes of
+/// `keep` spared too: the console's donor, which a spared gate may still be using, and which the box ends itself once
+/// the wait for the command is over. A root that cannot be resolved is said in a fixed line, naming no path, and the
+/// whole job terminated, so no build server outlives the run; the run's status stands.
+fn end_what_it_left(job: &Job, keep: &[u32], console: &mut Console) {
+    if let Ok(root) = resolve::root(None, &Environment::from_process()) {
+        end_leftovers(job, &root.root, keep, console);
+    } else {
+        console.err("gate: cannot end the run's job: the box's state root cannot be resolved; ending the whole job");
+        end_job(job, console);
     }
 }
 

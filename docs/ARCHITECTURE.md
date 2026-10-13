@@ -206,7 +206,7 @@ The rule that shapes it: every file and kernel object another process sees is de
 
   `push.rs` is `gate push`: it reads the builders from the routing file (`read_remote_json`, `Config::builders`) and the installed exe, then makes one ssh call per builder through `transport.rs`'s `ssh_words` and `Ssh::find`, feeding the exe, gzipped, as base64 on stdin to an embedded PowerShell script, and maps the script's `gate-push: ` lines to the `push: ` lines.
 
-  Also `run.rs` (the run lifecycle: program, batch refusal, queue, take, launch, wait, verdict, run end, release; `end_leftovers` ends what the command left in its job), `log.rs` (the log, its tail and the failure markers), `environment.rs` (the command's environment, run id and slot marker) and `nesting.rs` (the slot marker a gate was started under: its parse, the parent's liveness, and the covered, refused or own-slot decision, and the search for a stand-in when the parent has ended).
+  Also `run.rs` (the run lifecycle: program, batch refusal, queue, take, launch, wait, run end, verdict, release; `end_leftovers` ends what the command left in its job, before the verdict), `log.rs` (the log, its tail and the failure markers), `environment.rs` (the command's environment, run id and slot marker) and `nesting.rs` (the slot marker a gate was started under: its parse, the parent's liveness, and the covered, refused or own-slot decision, and the search for a stand-in when the parent has ended).
 
   `late.rs` is the late take of a covered heavy or light gate: the watch of its parent gate through a waitable handle, the stand-in search once the parent ends, and the queue and take of a slot of its own kind beside the running command, driven one step a wake by the watch loop in `watch.rs`; `covered.rs` rewrites the covered marker's `kind` to `none` when the watch is given up.
 
@@ -220,7 +220,7 @@ The rule that shapes it: every file and kernel object another process sees is de
 
 It also holds `run.rs` (the lock, the git flags, the sync, the command, the back commit and the call to pack outputs), `outputs.rs` (the PC's manifest read, the old-archive prune, the pack of a run's outputs, the 50 GiB trim of the outputs folder and the `outputs` verb that sends and deletes the archive).
 
-It also holds `tools.rs` (the dotnet tool restore and its `<Work>.tools` record), `forward.rs` (the pipes forwarded to stdout and stderr), `heartbeat.rs` (the command heartbeat: the job's and the build servers' CPU on `gate-watchdog`'s `Pump`), `inflight.rs` (the `inflight` verb: which locks under `{Root}\work` a routed run holds) and `stop.rs` (terminating the job).
+It also holds `tools.rs` (the dotnet tool restore and its `<Work>.tools` record), `forward.rs` (the pipes forwarded to stdout and stderr), `heartbeat.rs` (the command heartbeat: the job's CPU on `gate-watchdog`'s `Pump`), `inflight.rs` (the `inflight` verb: which locks under `{Root}\work` a routed run holds) and `stop.rs` (terminating the job).
 
 `outputs/` is a routed run's outputs, shared by both ends: `glob.rs` (the output globs and the exclusions, case-insensitive), `walk.rs` (the matching files below a folder, skipping links and junctions; `walk_with_refused` also notes the files refused for their names, reading a folder whose name is not plain through a verbatim path to count them), `hash.rs` (SHA-256 and `is_lower_hex`).
 

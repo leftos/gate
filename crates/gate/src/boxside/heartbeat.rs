@@ -1,22 +1,19 @@
 //! `gate box run`'s heartbeat: `gate-remote-heartbeat: <cpu ms>` on stderr every period, on `gate-watchdog`'s
 //! [`Pump`], so the client knows a quiet command is still working. While no command is watched the pump writes every
-//! period; while one is, only when the CPU its job and every build server on the box used since the last beat reaches
-//! 1% of the time since it, as the PowerShell wrapper's heartbeat counts it. The box keeps build servers warm, so a
-//! quiet `dotnet build` works in a compiler server or `MSBuild` node outside its job. Each line takes the box's output
-//! lock, so none lands inside a forwarded line. The heartbeat starts no process.
+//! period; while one is, only when the CPU its job used since the last beat reaches 1% of the time since it, as the
+//! PowerShell wrapper's heartbeat counts it. The command's build servers are its run's own and run in its job, so the
+//! job's CPU counts them. Each line takes the box's output lock, so none lands inside a forwarded line. The heartbeat
+//! starts no process.
 
-use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Write};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, PoisonError};
 use std::time::{Duration, Instant};
 
 use gate_args::BoxSeams;
 use gate_watchdog::{CpuSource, Pump, Ticker};
 use gate_win32::Job;
-use proc_table::Win32ProcessTable;
 
 use crate::boxside::forward::OutputLock;
-use crate::servers::{Scope, Servers};
 
 /// How often the heartbeat looks, and so the most often it writes.
 const PERIOD: Duration = Duration::from_secs(5);
@@ -42,12 +39,9 @@ pub(crate) fn start(lock: &OutputLock, period: Duration) -> io::Result<Pump> {
     Pump::start(writer, Arc::new(BoxClock { started: Instant::now() }), period)
 }
 
-/// The CPU source of the command running in `job`: the job's own CPU plus every build server's on the box outside it.
+/// The CPU source of the command running in `job`: the job's own CPU, its processes that ended included.
 pub(crate) fn job_cpu(job: Arc<Job>) -> Arc<dyn CpuSource> {
-    Arc::new(JobAndServers {
-        job,
-        counted: Mutex::new(Counted::default()),
-    })
+    Arc::new(JobCpu { job })
 }
 
 /// The box's monotonic clock in 100 ns ticks since the heartbeat started.
@@ -81,101 +75,47 @@ impl<W: Write> Write for Locked<W> {
     }
 }
 
-/// The heartbeat's CPU source for one command: its job, and what the reads so far have counted.
-struct JobAndServers {
+/// The heartbeat's CPU source for one command: its job.
+struct JobCpu {
     job: Arc<Job>,
-    counted: Mutex<Counted>,
 }
 
-/// The build servers' command lines read so far, and the running sum.
-#[derive(Default)]
-struct Counted {
-    servers: Servers,
-    sum: RunningSum,
-}
-
-impl CpuSource for JobAndServers {
-    /// The running sum of the job's CPU and the build servers' outside it. Every build server on the box counts, warm
-    /// ones started before the command included; the job's own processes are left to the job's CPU, which counts them
-    /// already. A server whose CPU or command line cannot be read is skipped; a job that cannot be read is the error.
+impl CpuSource for JobCpu {
+    /// The job's CPU, in 100 ns ticks; it only rises, as the job's accounting keeps what its ended processes used.
     fn job_cpu_ticks(&self) -> Result<u64, String> {
-        let name = self.job.name();
-        let members: BTreeSet<u32> = self
-            .job
-            .process_ids()
-            .map_err(|error| format!("cannot list the processes of job {name}: {error}"))?
-            .into_iter()
-            .collect();
-        let processes = Win32ProcessTable.snapshot_without_command_lines();
-        let listed: BTreeSet<u32> = processes.iter().map(|process| process.pid).collect();
-        // Every server counts as new from a start of 0, so warm MSBuild nodes count as well as compiler servers.
-        let scope = Scope {
-            members: &members,
-            since: 0,
-            under: None,
-        };
-        let mut counted = self.counted.lock().unwrap_or_else(PoisonError::into_inner);
-        let found = counted
-            .servers
-            .read(&processes, &scope, gate_win32::process_times, proc_table::command_line_of);
-        let job = self
-            .job
+        self.job
             .accounting()
-            .map_err(|error| format!("cannot read the CPU of job {name}: {error}"))?
-            .cpu;
-        Ok(counted.sum.add(job, found.new_servers, &listed))
-    }
-}
-
-/// The CPU counted so far, in 100 ns ticks, and the last read it was counted from. It only rises, as [`Pump`] takes
-/// the rise between two reads as the CPU used.
-#[derive(Debug, Default)]
-struct RunningSum {
-    total: u64,
-    job: u64,
-    servers: BTreeMap<u32, u64>,
-}
-
-impl RunningSum {
-    /// Adds what the job's CPU `job` and each build server's in `servers`, by pid, rose since the last read, and
-    /// returns the sum so far; `listed` is every pid the read's process snapshot held. A server new since the last
-    /// read, or whose total fell (its id now another process's), adds all its CPU. A read is no reason to forget a
-    /// server: an empty snapshot, which is a failed one, keeps every server's last total, and so does a pid it still
-    /// lists whose times could not be read; only a pid a good snapshot no longer lists is dropped, adding nothing.
-    fn add(&mut self, job: u64, servers: BTreeMap<u32, u64>, listed: &BTreeSet<u32>) -> u64 {
-        let mut used = job.saturating_sub(self.job);
-        self.job = job;
-        if !listed.is_empty() {
-            for (pid, &cpu) in &servers {
-                let rise = match self.servers.get(pid) {
-                    Some(&last) if cpu >= last => cpu - last,
-                    _ => cpu,
-                };
-                used = used.saturating_add(rise);
-            }
-            let kept: Vec<(u32, u64)> = std::mem::take(&mut self.servers)
-                .into_iter()
-                .filter(|(pid, _)| listed.contains(pid) && !servers.contains_key(pid))
-                .collect();
-            self.servers = servers;
-            self.servers.extend(kept);
-        }
-        self.total = self.total.saturating_add(used);
-        self.total
+            .map(|accounting| accounting.cpu)
+            .map_err(|error| format!("cannot read the CPU of job {}: {error}", self.job.name()))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, BTreeSet};
     use std::io::{self, Write};
+    use std::path::PathBuf;
     use std::sync::mpsc::channel;
     use std::sync::{Arc, Mutex, PoisonError};
     use std::thread;
     use std::time::Duration;
 
-    use super::{Locked, RunningSum};
+    use gate_win32::{EnvironmentBlock, Launch, LaunchOutput};
+
+    use super::{Locked, job_cpu};
     use crate::boxside::forward::OutputLock;
+
+    /// The CPU the job-alone test burns outside the job: 50 ms in 100 ns ticks.
+    const BURN: u64 = 500_000;
+
+    /// How many reads of its own CPU the job-alone test makes before it calls the burn broken rather than spin forever.
+    const READ_GUARD: u64 = 100_000_000;
+
+    /// How long the job-alone test sleeps between two looks for its burner's CPU.
+    const RISE_STEP: Duration = Duration::from_millis(10);
+
+    /// How many looks for its burner's CPU the job-alone test makes before it calls the job's accounting broken: 600 s of
+    /// them, a hang guard a starved burner never reaches.
+    const RISE_LOOKS: u64 = 60_000;
 
     /// How long a test waits for an event before it calls the run hung.
     const GUARD: Duration = Duration::from_secs(30);
@@ -197,139 +137,72 @@ mod tests {
         }
     }
 
-    /// A process every good snapshot lists that is no build server.
-    const OTHER: u32 = 4;
-
-    /// An hour of CPU in 100 ns ticks: what a warm server may have used before the run.
-    const HOUR: u64 = 36_000_000_000;
-
-    fn servers(pairs: &[(u32, u64)]) -> BTreeMap<u32, u64> {
-        pairs.iter().copied().collect()
+    /// The CPU this test process has used so far, in 100 ns ticks.
+    #[expect(clippy::expect_used, reason = "a test that cannot read its own CPU must fail loudly")]
+    fn own_cpu() -> u64 {
+        gate_win32::process_times(std::process::id())
+            .expect("this process's times can be read")
+            .expect("this process runs")
+            .cpu
     }
 
-    fn listed(pids: &[u32]) -> BTreeSet<u32> {
-        pids.iter().copied().collect()
-    }
-
-    /// One good read: a snapshot listing [`OTHER`] and every server in `servers`, each one's times read.
-    fn read(sum: &mut RunningSum, job: u64, servers: BTreeMap<u32, u64>) -> u64 {
-        let listed = servers.keys().copied().chain([OTHER]).collect();
-        sum.add(job, servers, &listed)
-    }
-
-    #[test]
-    fn heartbeat_sum_keeps_every_server_over_a_failed_snapshot() {
-        let mut sum = RunningSum::default();
-        let first = read(&mut sum, 0, servers(&[(7, HOUR)]));
-        assert_eq!(
-            sum.add(10, servers(&[]), &listed(&[])),
-            first + 10,
-            "an empty snapshot adds the job's rise alone"
-        );
-        assert_eq!(
-            read(&mut sum, 10, servers(&[(7, HOUR + 5)])),
-            first + 15,
-            "the server is still known after it: its 5 more ticks, no hour-long jump"
-        );
-    }
-
-    #[test]
-    fn heartbeat_sum_keeps_a_listed_server_whose_times_could_not_be_read() {
-        let mut sum = RunningSum::default();
-        let first = read(&mut sum, 0, servers(&[(7, HOUR)]));
-        assert_eq!(
-            sum.add(0, servers(&[]), &listed(&[OTHER, 7])),
-            first,
-            "a listed server not read adds nothing"
-        );
-        assert_eq!(
-            read(&mut sum, 0, servers(&[(7, HOUR + 5)])),
-            first + 5,
-            "its last total was kept: 5 more ticks, no hour-long jump"
-        );
-    }
-
-    #[test]
-    fn heartbeat_sum_drops_a_server_only_once_a_good_snapshot_no_longer_lists_it() {
-        let mut sum = RunningSum::default();
-        let first = read(&mut sum, 0, servers(&[(7, HOUR)]));
-        assert_eq!(
-            sum.add(0, servers(&[]), &listed(&[OTHER])),
-            first,
-            "gone from a good snapshot, it adds nothing"
-        );
-        assert_eq!(
-            read(&mut sum, 0, servers(&[(7, HOUR + 5)])),
-            first + HOUR + 5,
-            "the id back again is a new process: all its CPU"
-        );
-    }
-
-    #[test]
-    fn heartbeat_sum_first_read_counts_the_job_and_every_server_whole() {
-        let mut sum = RunningSum::default();
-        assert_eq!(read(&mut sum, 100, servers(&[(7, 30), (9, 5)])), 135);
-    }
-
-    #[test]
-    fn heartbeat_sum_adds_the_job_delta() {
-        let mut sum = RunningSum::default();
-        read(&mut sum, 100, servers(&[]));
-        assert_eq!(read(&mut sum, 130, servers(&[])), 130, "the job's 30 more ticks");
-        assert_eq!(read(&mut sum, 130, servers(&[])), 130, "a job that used nothing adds nothing");
-    }
-
-    #[test]
-    fn heartbeat_sum_adds_a_rising_servers_delta() {
-        let mut sum = RunningSum::default();
-        read(&mut sum, 0, servers(&[(7, 10)]));
-        assert_eq!(read(&mut sum, 0, servers(&[(7, 25)])), 25, "the server's 15 more ticks");
-    }
-
-    #[test]
-    fn heartbeat_sum_adds_a_new_server_whole() {
-        let mut sum = RunningSum::default();
-        read(&mut sum, 0, servers(&[(7, 10)]));
-        assert_eq!(
-            read(&mut sum, 0, servers(&[(7, 10), (8, 40)])),
-            50,
-            "the server new since the last read, all 40"
-        );
-    }
-
-    #[test]
-    fn heartbeat_sum_adds_a_server_whose_total_fell_whole() {
-        let mut sum = RunningSum::default();
-        read(&mut sum, 0, servers(&[(7, 50)]));
-        assert_eq!(read(&mut sum, 0, servers(&[(7, 20)])), 70, "the id reused by another process, all 20");
-    }
-
-    #[test]
-    fn heartbeat_sum_adds_nothing_for_a_vanished_server_and_all_of_one_back_again() {
-        let mut sum = RunningSum::default();
-        read(&mut sum, 0, servers(&[(7, 50)]));
-        assert_eq!(read(&mut sum, 0, servers(&[])), 50, "a server gone adds nothing");
-        assert_eq!(read(&mut sum, 0, servers(&[(7, 60)])), 110, "back again it is new, all 60");
-    }
-
-    #[test]
-    fn heartbeat_sum_never_falls() {
-        let mut sum = RunningSum::default();
-        let reads: [(u64, &[(u32, u64)]); 6] = [
-            (10, &[(1, 100), (2, 5)]),
-            (12, &[(1, 40)]),
-            (12, &[]),
-            (20, &[(2, 1), (3, 9)]),
-            (20, &[(2, 0), (3, 9)]),
-            (25, &[(3, 12)]),
-        ];
-        let mut last = 0;
-        for (job, pairs) in reads {
-            let total = read(&mut sum, job, servers(pairs));
-            assert!(total >= last, "{total} after {last} for {job} {pairs:?}");
-            last = total;
+    /// A `cmd.exe` that spins on the CPU until it is ended, writing nothing.
+    #[expect(clippy::expect_used, reason = "a test that cannot find the system folder must fail loudly")]
+    fn burner() -> Launch {
+        let system = PathBuf::from(std::env::var_os("SystemRoot").expect("SystemRoot is set"));
+        Launch {
+            application: system.join(r"System32\cmd.exe"),
+            command_line: r#"cmd.exe /d /c "for /l %i in (0,0,1) do @rem""#.encode_utf16().collect(),
+            directory: system,
+            environment: EnvironmentBlock::new(std::env::vars_os()).expect("the block is built"),
+            output: LaunchOutput::Piped,
+            priority: None,
         }
-        assert_eq!(last, 10 + 105 + 2 + 40 + 8 + 10 + 5 + 3, "every read's rise, summed");
+    }
+
+    #[test]
+    #[expect(clippy::expect_used, reason = "a test that cannot create its job or start its burner must fail loudly")]
+    fn heartbeat_counts_the_job_alone() {
+        let name = format!("gate-heartbeat-test-{}", std::process::id());
+        // Kill-on-close, so a failing case leaves no burner spinning.
+        let job = Arc::new(gate_win32::Job::create_kill_on_close(&name).expect("the job is created"));
+        let source = job_cpu(Arc::clone(&job));
+        let first = source.job_cpu_ticks();
+
+        let start = own_cpu();
+        let mut reads: u64 = 0;
+        while own_cpu() < start + BURN {
+            reads += 1;
+            assert!(
+                reads < READ_GUARD,
+                "the process's own CPU did not rise by {BURN} ticks in {READ_GUARD} reads"
+            );
+        }
+        let second = source.job_cpu_ticks();
+
+        assert_eq!((first, second), (Ok(0), Ok(0)), "CPU outside the empty job counts nothing");
+
+        let burning = burner()
+            .start_suspended()
+            .expect("the burner starts")
+            .assign_and_resume(&job)
+            .expect("the burner is put in the job and resumed");
+        let mut looks: u64 = 0;
+        while source.job_cpu_ticks().expect("the job's CPU can be read") == 0 {
+            looks += 1;
+            assert!(
+                looks < RISE_LOOKS,
+                "the job's CPU did not rise in {RISE_LOOKS} looks while a process in it burned"
+            );
+            thread::sleep(RISE_STEP);
+        }
+        job.terminate(1).expect("the job is terminated");
+
+        assert_eq!(
+            burning.wait(GUARD).expect("the burner is waited for"),
+            Some(1),
+            "the burner ends with its job"
+        );
     }
 
     #[test]

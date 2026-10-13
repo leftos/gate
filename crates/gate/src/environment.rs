@@ -34,6 +34,12 @@ impl Variables {
         Variables(applied(self.0, vec![(OsString::from(name), Some(OsString::from(value)))]))
     }
 
+    /// This environment with the build-server settings of the run `run` ([`build_servers`]) set over it, replacing
+    /// every value it holds for each name, names compared as Windows compares them.
+    pub(crate) fn with_build_servers(self, run: &str) -> Variables {
+        Variables(applied(self.0, build_servers(run)))
+    }
+
     /// The value the command gets for `name`, names compared as Windows compares them.
     pub(crate) fn get(&self, name: &str) -> Option<&OsStr> {
         let name = OsStr::new(name);
@@ -59,20 +65,28 @@ impl Variables {
     }
 }
 
-/// What the gate sets over its own environment for the command: the slot marker, the build-server settings, and the
-/// state root when it is not the default. The compiler server's pipe and `MSBuild`'s node handshake are named by the
-/// run id `run`, so no other run's command uses the servers this one starts, and the `MSBuild` server is off,
-/// an inherited `MSBUILDUSESERVER` included. Under the default root an inherited `GATE_STATE_DIR` is unset, so a gate
-/// nested in the command uses the same root.
+/// What the gate sets over its own environment for the command: the slot marker, the build-server settings of the run
+/// `run` ([`build_servers`]), and the state root when it is not the default. Under the default root an inherited
+/// `GATE_STATE_DIR` is unset, so a gate nested in the command uses the same root.
 fn overrides(root: &ResolvedRoot, run: &str, marker: &str) -> Vec<Override> {
     let state_dir = (!root.root.is_default()).then(|| root.path.clone().into_os_string());
+    let mut overrides = vec![(OsString::from("GATE_SLOT_HELD"), Some(OsString::from(marker)))];
+    overrides.extend(build_servers(run));
+    overrides.push((OsString::from("GATE_STATE_DIR"), state_dir));
+    overrides
+}
+
+/// The build-server settings of the run `run`: the compiler server's pipe and `MSBuild`'s node handshake are named by
+/// the run id, so no other run's command uses the servers this one starts; the `MSBuild` server is off, an inherited
+/// `MSBUILDUSESERVER` included; and `MSBuild`'s node reuse is off, so no node idles in the command's job after its
+/// build, keeping alive whatever in the command waits for its whole tree.
+fn build_servers(run: &str) -> Vec<Override> {
     vec![
-        (OsString::from("GATE_SLOT_HELD"), Some(OsString::from(marker))),
         (OsString::from("SharedCompilationId"), Some(OsString::from(run))),
         (OsString::from("MSBUILDNODEHANDSHAKESALT"), Some(OsString::from(run))),
         (OsString::from("MSBUILDUSESERVER"), Some(OsString::from("0"))),
         (OsString::from("DOTNET_CLI_USE_MSBUILD_SERVER"), Some(OsString::from("0"))),
-        (OsString::from("GATE_STATE_DIR"), state_dir),
+        (OsString::from("MSBUILDDISABLENODEREUSE"), Some(OsString::from("1"))),
     ]
 }
 
@@ -164,6 +178,7 @@ mod tests {
 
         assert_eq!(variables.get("SharedCompilationId"), Some(OsStr::new("gate-1-2-abcdef12")));
         assert_eq!(variables.get("MSBUILDNODEHANDSHAKESALT"), Some(OsStr::new("gate-1-2-abcdef12")));
+        assert_eq!(variables.get("MSBUILDDISABLENODEREUSE"), Some(OsStr::new("1")), "node reuse is off");
         let named = |wanted: &str| {
             variables
                 .0
@@ -176,6 +191,31 @@ mod tests {
             (1, 1),
             "the inherited values are gone"
         );
+    }
+
+    #[test]
+    fn with_build_servers_replaces_inherited_values_under_any_case() {
+        let inherited = vec![
+            (OsString::from("sharedcompilationid"), OsString::from("x")),
+            (OsString::from("MSBuildUseServer"), OsString::from("1")),
+            (OsString::from("MSBuildDisableNodeReuse"), OsString::from("0")),
+        ];
+
+        let variables = Variables(inherited).with_build_servers("gate-box-ab");
+
+        let named = |wanted: &str| {
+            variables
+                .0
+                .iter()
+                .filter(|(name, _)| same_variable_name(name, OsStr::new(wanted)))
+                .map(|(_, value)| value.as_os_str())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(named("SharedCompilationId"), [OsStr::new("gate-box-ab")]);
+        assert_eq!(named("MSBUILDNODEHANDSHAKESALT"), [OsStr::new("gate-box-ab")]);
+        assert_eq!(named("MSBUILDUSESERVER"), [OsStr::new("0")]);
+        assert_eq!(named("DOTNET_CLI_USE_MSBUILD_SERVER"), [OsStr::new("0")]);
+        assert_eq!(named("MSBUILDDISABLENODEREUSE"), [OsStr::new("1")]);
     }
 
     #[test]

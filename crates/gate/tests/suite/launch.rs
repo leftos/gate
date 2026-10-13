@@ -7,10 +7,10 @@ use std::fs;
 use std::path::PathBuf;
 
 use gate_state::{KernelObject, StateRoot};
-use gate_win32::StoppableProcess;
+use gate_win32::{NamedEvent, StoppableProcess};
 
 use crate::support::{
-    Case, Escapee, FAKE_TOOL, assert_in_order, events, finish, run_words, said_pid, shown, start, wait_for_journal_line, wait_until,
+    Case, Escapee, FAKE_TOOL, Go, assert_in_order, copy_tool, events, finish, run_words, said_pid, shown, start, wait_for_journal_line, wait_until,
     wait_until_closed, write_counts,
 };
 
@@ -202,7 +202,8 @@ fn the_build_server_environment_reaches_the_command() {
         "GATE_STATE_DIR",
     ];
     let mut gate = case.gate(&run_words("out.log", &[], &command));
-    // An inherited MSBuild server switch is overridden; a gate above the suite's own run sets no node-reuse switch.
+    // An inherited MSBuild server switch is overridden; node reuse is turned off by the gate itself, not inherited from a
+    // gate above the suite's own run.
     gate.env("MSBUILDUSESERVER", "1").env_remove("MSBUILDDISABLENODEREUSE");
     let running = start(gate);
     let pid = running.id();
@@ -224,7 +225,7 @@ fn the_build_server_environment_reaches_the_command() {
         [run_id.as_str(), run_id.as_str()],
         "the compiler server and the nodes are the run's: {text}"
     );
-    assert_eq!(lines[2..5], ["0", "0", "fake-tool: MSBUILDDISABLENODEREUSE is not set"], "{text}");
+    assert_eq!(lines[2..5], ["0", "0", "1"], "the MSBuild server and node reuse are off: {text}");
     assert_eq!(lines[6], shown(&case.root()), "{text}");
 }
 
@@ -490,6 +491,46 @@ fn a_process_left_in_the_job_ends_with_the_run() {
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert_eq!(child, Some(STOPPED), "the gate ended the child at the run's end: {outcome:?}");
     assert!(!outcome.stderr.contains("cannot end the run's job"), "{outcome:?}");
+}
+
+/// The name of the job the gate `gate` runs its command in under the case's root.
+fn job_name(case: &Case, gate: u32) -> String {
+    StateRoot::new(&shown(&case.root()), None).object_name(KernelObject::Job { gate_pid: gate })
+}
+
+/// The run's end looks at what its command left before the verdict is reached, so all it says comes before the verdict
+/// line. A gate in the job is spared, and one whose job cannot be listed, as when an event holds the name its job would
+/// have, is said on a `cannot end` line, on stderr and in the log, where this case reads it before the verdict line. The
+/// gate is fake-tool copied as `gate.exe`, since the run's end judges a gate by its image name.
+#[test]
+fn a_leftover_s_last_output_is_in_the_log_before_the_verdict() {
+    let case = Case::new("a_leftover_s_last_output_is_in_the_log_before_the_verdict");
+    copy_tool(&case, "gate.exe");
+    let gate = shown(&case.folder().join("gate.exe"));
+    let (go, release) = (Go(case.folder().join("go")), case.folder().join("release"));
+    let (go_text, release_text, pid_text) = (shown(go.path()), shown(&release), shown(&case.folder().join("pid")));
+    let command = [FAKE_TOOL, "spawn-pid", &pid_text, &release_text, &gate, "wait", &go_text];
+    let running = case.start(&run_words("out.log", &[], &command));
+    wait_until("the spared gate's pid in the log", || {
+        fs::read_to_string(log_path(&case)).is_ok_and(|text| text.contains("spawned "))
+    });
+    let pid = said_pid(&log_text(&case), "spawned ");
+    let spared = StoppableProcess::open(pid)
+        .expect("the spared gate is looked for")
+        .expect("it runs: it waits for a go file no one has written");
+    let _squatter = NamedEvent::create(&job_name(&case, pid)).expect("the event holding its job's name is created");
+
+    fs::write(&release, "").expect("the release file can be written");
+    let outcome = running.finish();
+    // The spared gate is let go before any assertion, so a failing case leaves no helper waiting.
+    drop(go);
+    let ended = Escapee::exit_code_once_ended(&spared);
+
+    let cannot = format!("gate: cannot end the run's job: listing the job of gate {pid} failed");
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(outcome.stderr.contains(&cannot), "{outcome:?}");
+    assert_in_order(&log_text(&case), &[&cannot, "gate: passed in "]);
+    assert_eq!(ended, Some(0), "the spared gate was left running, then ended on its go file: {outcome:?}");
 }
 
 #[test]

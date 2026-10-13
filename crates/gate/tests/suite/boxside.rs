@@ -10,14 +10,15 @@ use std::time::Duration;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
-use gate_win32::{EnvironmentBlock, Job, Launch, LaunchOutput, OpenedJob};
+use gate_win32::{EnvironmentBlock, Job, Launch, LaunchOutput, OpenedJob, StoppableProcess};
 use jiff::{SignedDuration, Timestamp};
+use proc_table::Win32ProcessTable;
 use regex::Regex;
 use serde_json::{Value, json};
 
 use crate::support::{
-    Case, Closed, FAKE_TOOL, GIT_REDIRECTS, Go, Outcome, Running, allow_breakaway, box_payload, build_version, finish, shown, start,
-    start_with_closed, wait_until, wait_until_closed,
+    Case, Closed, Escapee, FAKE_TOOL, GIT_REDIRECTS, Go, Outcome, Running, allow_breakaway, box_payload, build_version, copy_tool, finish, shown,
+    start, start_with_closed, wait_until, wait_until_closed,
 };
 
 mod outputs;
@@ -820,27 +821,39 @@ fn box_run_runs_the_command_in_its_subfolder() {
 }
 
 #[test]
-fn box_run_salts_msbuild_nodes_with_the_work_folder_key() {
-    let case = Case::new("box_run_msbuild_salt");
-    let mut payload = box_payload(&case, "k", &[r".\salt.cmd"]);
-    snapshot(&case, &mut payload, &[("salt.cmd", "@echo %MSBUILDNODEHANDSHAKESALT%\r\n")]);
+fn box_run_gives_the_command_its_run_s_compiler_server_id() {
+    let case = Case::new("box_run_compiler_server_id");
+    let mut payload = box_payload(&case, "k", &[r".\servers.cmd"]);
+    let script = "@echo %SharedCompilationId% %MSBUILDNODEHANDSHAKESALT% %MSBUILDUSESERVER% %DOTNET_CLI_USE_MSBUILD_SERVER% \
+                  %MSBUILDDISABLENODEREUSE%\r\n";
+    snapshot(&case, &mut payload, &[("servers.cmd", script)]);
 
-    let outcome = run_box(&case, &payload);
+    // Node reuse inherited on, so the case sees the box turn it off rather than a gate above the suite's own run.
+    let outcome = run_box_with_env(&case, &payload, "MSBUILDDISABLENODEREUSE", "0");
 
+    let run = format!("gate-box-{}", field(&payload, "Nonce"));
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
-    assert_eq!(outcome.stdout, "k\n", "the command reads the work folder's key: {outcome:?}");
+    assert_eq!(
+        outcome.stdout,
+        format!("{run} {run} 0 0 1\n"),
+        "the command's servers are named by its run, the MSBuild server and node reuse off: {outcome:?}"
+    );
 }
 
 #[test]
-fn box_run_replaces_an_inherited_handshake_salt() {
-    let case = Case::new("box_run_msbuild_salt_inherited");
-    let mut payload = box_payload(&case, "k", &[r".\salt.cmd"]);
-    snapshot(&case, &mut payload, &[("salt.cmd", "@echo %MSBUILDNODEHANDSHAKESALT%\r\n")]);
+fn box_run_replaces_an_inherited_compiler_server_id() {
+    let case = Case::new("box_run_compiler_server_id_inherited");
+    let mut payload = box_payload(&case, "k", &[r".\servers.cmd"]);
+    snapshot(&case, &mut payload, &[("servers.cmd", "@echo %SharedCompilationId%\r\n")]);
 
-    let outcome = run_box_with_env(&case, &payload, "MSBUILDNODEHANDSHAKESALT", "other");
+    let outcome = run_box_with_env(&case, &payload, "SharedCompilationId", "other");
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
-    assert_eq!(outcome.stdout, "k\n", "the key replaces the box's inherited value: {outcome:?}");
+    assert_eq!(
+        outcome.stdout,
+        format!("gate-box-{}\n", field(&payload, "Nonce")),
+        "the run's id replaces the box's inherited value: {outcome:?}"
+    );
 }
 
 #[test]
@@ -1191,15 +1204,29 @@ fn a_git_warning_is_never_split_by_a_heartbeat() {
     assert_eq!(warned, WARNED_FILES, "each of git's warnings arrives whole: {outcome:?}");
 }
 
+/// A live nested gate in the command's job, which the run's end spares, still holds the command's output once the
+/// command exits: the box stops reading after the drain and says so, and the run still ends. The spared gate is
+/// fake-tool copied as `gate.exe`, whose `spawn-wait` child runs from the same image, since the run's end judges a gate
+/// by its image name.
 #[test]
 fn box_run_stops_reading_output_a_leftover_process_holds_open() {
     let case = Case::new("box_run_drain");
+    copy_tool(&case, "gate.exe");
+    let gate = shown(&case.folder().join("gate.exe"));
     let never = case.folder().join("never");
     let never_word = shown(&never);
-    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "spawn-wait", &never_word, "exit", "0"]);
+    let mut payload = box_payload(&case, "k", &[&gate, "spawn-wait", &never_word, "exit", "0"]);
     snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
 
     let outcome = run_box(&case, &payload);
+    // The spared child still waits for a go file no one has written, so its pid is still its own when it is opened.
+    let child = StoppableProcess::open(spawned_pid(&outcome.stdout))
+        .expect("the spared child is looked for")
+        .expect("the spared child still runs");
+    let_go(&never);
+    // It may be ending on its go file already, which refuses the terminate; the wait below sees it end either way.
+    let _ = child.terminate(1);
+    let ended = Escapee::exit_code_once_ended(&child);
 
     assert_eq!(outcome.code, Some(0), "the run still ends: {outcome:?}");
     assert!(
@@ -1209,8 +1236,67 @@ fn box_run_stops_reading_output_a_leftover_process_holds_open() {
             .any(|line| line == "gate: remote command's output is still held open by a leftover process; stopped reading"),
         "{outcome:?}"
     );
-    let_go(&never);
-    wait_until_gone(spawned_pid(&outcome.stdout));
+    assert!(ended.is_some(), "the spared child is cleaned up: {outcome:?}");
+}
+
+/// Runs `gate box run` of a command that starts a child in its job, a `fake-tool wait` on a go file no one writes until
+/// the case ends, holding the command's output open, then exits 0 once the case lets it; `with` is set in the box's
+/// environment when given. The box's outcome and the child's exit code once it has ended, `None` while it still runs.
+/// The child is opened while the command still runs, so its pid is pinned.
+fn run_box_leaving_a_child(case: &Case, with: Option<(&str, &str)>) -> (Outcome, Option<u32>) {
+    let (go, proceed) = (case.folder().join("go"), case.folder().join("proceed"));
+    let (go_word, proceed_word) = (shown(&go), shown(&proceed));
+    let command = [FAKE_TOOL, "spawn-wait", &go_word, "wait", &proceed_word, "exit", "0"];
+    let mut payload = box_payload(case, "k", &command);
+    snapshot(case, &mut payload, &[("a.txt", "a\n")]);
+    let mut box_run = box_command(case, &["box", "run", &self::payload(&payload)]);
+    if let Some((name, value)) = with {
+        box_run.env(name, value);
+    }
+    let running = start(box_run);
+    let pid = spawned_pid(&running.wait_for_stdout("\n"));
+    let child = StoppableProcess::open(pid)
+        .expect("the child is opened")
+        .expect("the child runs: it waits for a go file no one has written");
+
+    let_go(&proceed);
+    let outcome = running.finish();
+    let ended = Escapee::exit_code_once_ended(&child);
+    // The child is let go before any assertion, so a failing case leaves no helper waiting.
+    let_go(&go);
+    (outcome, ended)
+}
+
+#[test]
+fn box_run_ends_what_the_command_left_in_its_job() {
+    let case = Case::new("box_run_ends_leftovers");
+
+    let (outcome, ended) = run_box_leaving_a_child(&case, None);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(ended, Some(124), "the box ended the child at the run's end: {outcome:?}");
+    assert!(!outcome.stderr.contains("cannot end the run's job"), "{outcome:?}");
+    assert!(
+        !outcome.stderr.contains("still held open by a leftover process"),
+        "the child is ended before the output drains, so it holds nothing open: {outcome:?}"
+    );
+}
+
+#[test]
+fn box_run_that_cannot_resolve_its_state_root_ends_the_whole_job() {
+    let case = Case::new("box_run_unresolved_root");
+
+    let (outcome, ended) = run_box_leaving_a_child(&case, Some(("LOCALAPPDATA", "")));
+
+    assert_eq!(outcome.code, Some(0), "the command's status stands: {outcome:?}");
+    assert_eq!(ended, Some(124), "the whole job was terminated: {outcome:?}");
+    assert!(
+        outcome
+            .stderr
+            .lines()
+            .any(|line| line == "gate: cannot end the run's job: the box's state root cannot be resolved; ending the whole job"),
+        "{outcome:?}"
+    );
 }
 
 #[test]
@@ -1495,6 +1581,47 @@ fn box_run_appends_safe_directory_after_the_callers_git_config_entries() {
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert_eq!(outcome.stdout, "3\nsafe.directory\n*\n", "the entry takes the next index: {outcome:?}");
+}
+
+/// The console's donor sits in the command's job until the wait for the command is over, while a gate the run's end
+/// spares may still use its console: the run's end leaves the donor running, and the box ends it once the wait is
+/// over, with status 0, where the run's end would have given it 124.
+#[test]
+fn box_run_end_spares_the_console_donor() {
+    let case = Case::new("box_run_spares_donor");
+    let proceed = case.folder().join("proceed");
+    let proceed_word = shown(&proceed);
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "out", "ready", "wait", &proceed_word, "exit", "0"]);
+    snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
+    let running = start_box(&case, &payload);
+    running.wait_for_stdout("ready\n");
+    let donor = donor_of(field(&payload, "Job"));
+
+    let_go(&proceed);
+    let outcome = running.finish();
+    let ended = Escapee::exit_code_once_ended(&donor);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(ended, Some(0), "the box ended its donor itself, the run's end did not: {outcome:?}");
+}
+
+/// The console's donor of the box whose command runs in the job `job`, opened: the one `cmd.exe` in that job.
+fn donor_of(job: &str) -> StoppableProcess {
+    let members = OpenedJob::open_to_list(job)
+        .expect("the job can be opened")
+        .expect("the job exists while its command waits")
+        .process_ids()
+        .expect("the job's processes are listed");
+    let donors: Vec<u32> = Win32ProcessTable
+        .snapshot_without_command_lines()
+        .into_iter()
+        .filter(|process| members.contains(&process.pid) && process.name.eq_ignore_ascii_case("cmd.exe"))
+        .map(|process| process.pid)
+        .collect();
+    assert_eq!(donors.len(), 1, "one donor in the job {members:?}: {donors:?}");
+    StoppableProcess::open(*donors.first().expect("checked above"))
+        .expect("the donor is looked for")
+        .expect("the donor runs while the command waits")
 }
 
 #[test]

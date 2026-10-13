@@ -9,7 +9,7 @@ use gate_win32::{Job, StoppableProcess, win32_message};
 use jiff::Timestamp;
 
 /// How long a process whose termination failed is given to end before the failure counts.
-const TERMINATE_CHECK: Duration = Duration::from_secs(1);
+pub(crate) const TERMINATE_CHECK: Duration = Duration::from_secs(1);
 
 /// One process, as the snapshot saw it.
 #[derive(Clone, Debug, PartialEq, Eq)]

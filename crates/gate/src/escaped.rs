@@ -420,7 +420,7 @@ impl Ending<'_> {
 
 /// The deadline of a kill's waits and how long a wait that begins at `now` may last: the `deadline` the kill's first
 /// wait set, else `wait` from `now`; and what is left of it, zero once it has passed.
-fn wait_left(deadline: Option<Instant>, wait: Duration, now: Instant) -> (Instant, Duration) {
+pub(crate) fn wait_left(deadline: Option<Instant>, wait: Duration, now: Instant) -> (Instant, Duration) {
     let deadline = deadline.unwrap_or(now + wait);
     (deadline, deadline.saturating_duration_since(now))
 }

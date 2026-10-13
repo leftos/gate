@@ -1,6 +1,6 @@
 # Per-run build servers (GATE-190)
 
-Part A (GATE-196, the run id, the per-run settings and the run end) is done.
+Part A (GATE-196, the run id, the per-run settings and the run end) and part B (GATE-197, the box) are done. The command gets `MSBUILDDISABLENODEREUSE=1`, local and on the box, beside the per-run `SharedCompilationId` and `MSBUILDNODEHANDSHAKESALT` (open decision 3 settled for off): with node reuse on, MSBuild nodes idle about 15 minutes inside the command's job, so anything waiting on its whole tree would hang. The measurement and inventory sections below describe the code before the change, the box without that variable included.
 
 The plan for `feat/per-run-servers`: no gate run shares build servers with another, on this PC or the builder. The owner ruling and the orchestrator decisions (the per-run settings, the run id, ending the whole job at run end, what is removed, the brief order A, B, C1, C2) are in GATE-190's description and win over the open decisions below, which they settle. This file holds the measurements, the mechanisms with their sources, and the inventory of code that goes.
 
@@ -145,7 +145,7 @@ Full line-level inventory: [the appendix below](#appendix-dead-code-inventory) (
 | A busy process outside the job no longer keeps a quiet command alive | suite `stall::a_quiet_command_is_stalled_beside_a_busy_compiler_server_outside_its_job` (a fake-tool copy named `VBCSCompiler.exe`, started by the test, burns outside the job; the command is quiet; the kill line arrives), replacing `build_servers::a_quiet_build_waiting_on_a_busy_shared_compiler_is_not_stalled` and dropping its machine-alone mark |
 | The kill's diagnostics carry no server lines | suite `diagnostics::a_kill_writes_its_diagnostics_to_the_log_before_the_kill_line` (diagnostics.rs:59), updated |
 | The box gives the command a per-run id and ends its job with the run | suite `boxside::box_run_gives_the_command_its_run_s_compiler_server_id` and `boxside::box_run_ends_what_the_command_left_in_its_job`, replacing `boxside.rs:823,835` |
-| The box heartbeat counts the job alone | unit `heartbeat::tests::heartbeat_sum_counts_the_job_alone` (crates/gate/src/boxside/heartbeat.rs), replacing the server sum tests |
+| The box heartbeat counts the job alone | unit `heartbeat::tests::heartbeat_counts_the_job_alone` (crates/gate/src/boxside/heartbeat.rs), replacing the server sum tests |
 | A critical gate raises its own members to High (only if kept) | suite `priority::a_critical_gate_raises_a_member_its_command_started_at_normal`, replacing `priority.rs:515` |
 | The server seams are gone | `crates/gate-args/tests/args/seams.rs`: `--test-servers-under` and `--test-server-image` join the unknown-flag list (1217) |
 
