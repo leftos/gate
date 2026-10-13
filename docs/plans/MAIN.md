@@ -10,9 +10,13 @@
 
 - [ ] GATE-10 Port the remote client and box wrapper, then the remote cutover
   - [ ] GATE-109 Remote: carry every verb of a routed run over one ssh connection (gate box serve)
-  - [ ] GATE-191 Trial the Rust remote client on the busiest repos' build and test commands before the flip
-  - [ ] GATE-183 Merge feat/remote-cutover (#186)
   - [ ] GATE-192 Turn routing back on, on the Rust remote client
+  - [ ] GATE-215 Routed outputs install refuses UTF-16 files (coverage mapping) and fails a passing build
+  - [ ] GATE-216 A refused outputs install leaves the pending marker, failing every later routed run
+  - [ ] GATE-217 Routed outputs too large for the ceiling: per-repo output globs or a transfer outside the ceiling
+  - [ ] GATE-218 A new worktree's first routed push sends the whole repo again
+  - [ ] GATE-219 Routed commands run elevated on the builder, so a pipe-owner test fails there
+  - [ ] GATE-220 A routed cargo build brings nothing back: default outputs miss target/
   - [ ] GATE-18 Remote preflight: refuse with `parity` when the builder lacks a .NET workload the repo needs
   - [ ] GATE-19 Remote: send a repo's declared sibling worktrees with a routed run
   - [ ] GATE-22 Remote: send a routed command's ignored inputs to the builder, compressed
@@ -22,23 +26,33 @@
 - [ ] GATE-159 Box: choose the dotnet tool restore cap from its logged times
 - [!] GATE-187 Count a routed run's ceiling in load-adjusted time on the builder
 - [ ] GATE-195 Check git and gate push's ssh against the worktree, as the remote client checks ssh and dotnet
+- [ ] GATE-206 A per-repo toolchain manifest: check and prepare builders, and check a fresh clone
+  - [ ] GATE-208 Toolchain 1: parity checks a list of needs, one mismatch line each
+  - [ ] GATE-209 Toolchain 2: the .gate/toolchain.toml format and its reader
+  - [ ] GATE-210 Toolchain 3: the box probes the needs the PC sends
+  - [ ] GATE-211 Toolchain 4: refuse a routed run with parity when the builder lacks a declared tool
+  - [ ] GATE-212 Toolchain 5: gate check, for this machine and for a builder
+  - [ ] GATE-213 Toolchain 6: siblings declared under .gate/
+  - [ ] GATE-214 Toolchain 7: roll the manifest out to the gated repos
 
 ## Cutover sweep
 
 - [ ] GATE-11 Caller sweep to gate on PATH; delete the PowerShell gate
+  - [ ] GATE-200 Sweep part 1: claude-config hooks recognise the gate run spelling
+  - [ ] GATE-201 Sweep part 2: each caller repo moves to gate run and deletes its launcher
+  - [ ] GATE-202 Sweep part 3: claude-config's tools and skills move to gate run; delete the PowerShell gate
+  - [ ] GATE-204 Sweep part 4: drop the compatibility layer and the launcher from the gate repo
 
 ## After cutover
 
 - [ ] GATE-7 Learned command durations: summary, expected-time line, ETAs, auto ceiling, backfill
-  - [ ] GATE-16 Durations part 4: `--timeout auto` as a floor, and ceiling and hang hints
   - [ ] GATE-17 Durations part 5: backfill guests during a critical drain
 - [ ] GATE-8 `--slot auto` picks heavy or light from the command's history
 - [/] GATE-190 Run each gate's build servers inside its own job, never shared between runs
-  - [/] GATE-196 Per-run servers A: the local run's per-run settings and ending its job at run end
-  - [ ] GATE-197 Per-run servers B: the box's per-run settings and ending its job at run end
   - [ ] GATE-198 Per-run servers C: remove build-server recognition, the priority pass over outside servers, and their seams
 - [ ] GATE-194 Decide whether a late-slot run is estimated and filed in the durations store
 - [ ] GATE-199 Merge feat/per-run-servers (#203)
+- [ ] GATE-207 Per-run servers: fix the run end's review findings before the branch merges
 
 ## Backlog
 
@@ -51,6 +65,8 @@
 - [ ] GATE-168 Run the gate's watch, sampler and kill threads at time-critical priority
 - [ ] GATE-188 A freed slot sits idle up to one watch slice while a late ticket heads the queue
 - [ ] GATE-193 Test whether a gate under a stand-in or a late take ever lends its slot
+- [ ] GATE-203 Retire gate cutover, cutover.flag and the PowerShell-layout readers
+- [ ] GATE-205 Run-end sparing judges a live gate by its image name and the ender's own state root
 
 ## No project
 
