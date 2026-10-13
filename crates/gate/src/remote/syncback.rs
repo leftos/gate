@@ -1288,6 +1288,99 @@ impl Remote<'_> {
     }
 }
 
+/// The `check-attr` slicing at the runner's own cap, which a `test-seams` build never slices with, run by a test build
+/// with or without the feature.
+#[cfg(test)]
+mod output_cap_slices {
+    use std::collections::HashSet;
+
+    #[cfg(not(feature = "test-seams"))]
+    use super::SLICE_CAP;
+    use super::{ATTRIBUTE_ROOM, ATTRIBUTES, attribute_slices, git};
+
+    /// The UTF-16 units of the longest path Windows opens, each at most three bytes in UTF-8: no worktree path is longer.
+    const LONGEST_PATH_UNITS: usize = 32_767;
+
+    /// The bytes `git check-attr` is planned to answer for `paths`, by the figure the slicing plans each path with.
+    fn planned(paths: &[&str]) -> usize {
+        paths.iter().map(|path| ATTRIBUTES.len() * (path.len() + ATTRIBUTE_ROOM)).sum()
+    }
+
+    /// Short ASCII paths, short non-ASCII ones and non-ASCII ones near the longest a worktree path can be, all distinct.
+    fn mixed_paths() -> Vec<String> {
+        (0..180)
+            .map(|number| match number % 3 {
+                0 => format!("src/file-{number}.rs"),
+                1 => format!("données/été-{number}.txt"),
+                _ => format!("{number:04}/{}", "日".repeat(LONGEST_PATH_UNITS - 64)),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_path_lands_in_exactly_one_slice_in_order_at_the_output_cap() {
+        let owned = mixed_paths();
+        let paths: Vec<&str> = owned.iter().map(String::as_str).collect();
+        assert_eq!(paths.iter().collect::<HashSet<_>>().len(), paths.len(), "the paths are distinct");
+
+        let slices = attribute_slices(&paths, git::OUTPUT_CAP);
+
+        let joined = slices.concat();
+        assert!(
+            joined == paths,
+            "the slices join back to {} path(s) of {}, not each once in order",
+            joined.len(),
+            paths.len()
+        );
+    }
+
+    #[test]
+    fn paths_whose_answers_pass_the_output_cap_take_more_than_one_slice() {
+        let owned = mixed_paths();
+        let paths: Vec<&str> = owned.iter().map(String::as_str).collect();
+        assert!(
+            planned(&paths) > git::OUTPUT_CAP,
+            "the paths plan {} bytes, within the cap",
+            planned(&paths)
+        );
+
+        let slices = attribute_slices(&paths, git::OUTPUT_CAP);
+
+        assert!(slices.len() >= 2, "{} slice(s)", slices.len());
+    }
+
+    #[test]
+    fn each_slice_s_planned_answer_stays_within_the_output_cap() {
+        let owned = mixed_paths();
+        let paths: Vec<&str> = owned.iter().map(String::as_str).collect();
+
+        for (at, slice) in attribute_slices(&paths, git::OUTPUT_CAP).iter().enumerate() {
+            assert!(planned(slice) <= git::OUTPUT_CAP, "slice {at} plans {} bytes", planned(slice));
+        }
+    }
+
+    #[test]
+    fn a_path_whose_answer_alone_passes_the_output_cap_is_a_slice_of_its_own() {
+        let huge = "日".repeat(git::OUTPUT_CAP / 3);
+        let paths = ["a.txt", huge.as_str(), "été.txt"];
+        assert!(planned(&paths[1..2]) > git::OUTPUT_CAP, "the huge path plans within the cap");
+
+        let slices = attribute_slices(&paths, git::OUTPUT_CAP);
+
+        let sizes: Vec<usize> = slices.iter().map(|slice| slice.len()).collect();
+        assert!(
+            slices == [&paths[..1], &paths[1..2], &paths[2..]],
+            "the huge path is not kept alone between its neighbours: slices of {sizes:?} path(s)"
+        );
+    }
+
+    #[cfg(not(feature = "test-seams"))]
+    #[test]
+    fn a_build_without_test_seams_slices_at_the_output_cap() {
+        assert_eq!(SLICE_CAP, git::OUTPUT_CAP);
+    }
+}
+
 #[cfg(all(test, feature = "test-seams"))]
 #[expect(clippy::expect_used, reason = "a test whose interrupt, transport or git cannot be had must fail loudly")]
 mod tests {
