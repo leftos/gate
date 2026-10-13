@@ -16,6 +16,7 @@ use std::time::SystemTime;
 
 use gate_router::repo_name;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 use crate::support::{
     Case, GATE, GIT_REDIRECTS, Outcome, allow_breakaway, copy_tool, events, finish, git, git_init, heavy_words, release, shown, start,
@@ -2687,6 +2688,63 @@ fn a_garbage_fetch_cannot_be_opened_and_fails_a_pass() {
     let line = format!("gate: remote outputs not brought back: the outputs archive {name} cannot be opened: ");
     assert!(outcome.stderr.contains(&line), "{outcome:?}");
     assert!(!case.folder().join("bin").join("new.txt").exists(), "nothing is installed");
+    assert_eq!(outputs_leftovers(&case), Vec::<PathBuf>::new(), "the archive and the stage are removed");
+    assert!(pending_marker(&case).exists(), "{outcome:?}");
+}
+
+/// The builder's own archive of the case's work folder: the one file ending `.zst` in the box's outputs folder, beside
+/// its work folders.
+fn box_output_archive(case: &Case) -> PathBuf {
+    let folder = case.folder().join("builder").join("outputs");
+    let archives: Vec<PathBuf> = fs::read_dir(&folder)
+        .expect("the box's outputs folder can be listed")
+        .map(|entry| entry.expect("an entry can be read").path())
+        .filter(|path| path.extension().is_some_and(|kind| kind == "zst"))
+        .collect();
+    assert_eq!(archives.len(), 1, "the box left one archive of its own: {archives:?}");
+    archives.into_iter().next().expect("the archive is there")
+}
+
+/// A `.tar.zst` outputs archive holding one member `path` of `text` and the `.gate-outputs.json` list agreeing with it,
+/// as a broken or hostile builder would send.
+fn crafted_archive(path: &str, text: &str) -> Vec<u8> {
+    let sha256: String = Sha256::digest(text.as_bytes()).iter().fold(String::new(), |mut said, byte| {
+        let _ = write!(said, "{byte:02x}");
+        said
+    });
+    let list = format!(r#"[{{"path":"{path}","size":{},"sha256":"{sha256}"}}]"#, text.len());
+    let mut tar = tar::Builder::new(Vec::new());
+    for (name, data) in [(path.as_bytes(), text.as_bytes()), (".gate-outputs.json".as_bytes(), list.as_bytes())] {
+        let mut header = tar::Header::new_gnu();
+        header.as_gnu_mut().expect("a GNU header").name[..name.len()].copy_from_slice(name);
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_size(data.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        tar.append(&header, data).expect("the member can be appended");
+    }
+    zstd::encode_all(&tar.into_inner().expect("the tar ends")[..], 3).expect("the tar compresses")
+}
+
+/// A hostile builder's archive carries a root `.lfsconfig`, which a sync-back never writes: the install refuses it, so
+/// nothing of it reaches the worktree, and the run becomes 1.
+#[test]
+fn an_archive_member_that_is_an_lfsconfig_is_refused_by_the_install() {
+    let case = outputs_case("client-outputs-lfsconfig", &["**"]);
+    let go = Go(case.folder().join("ssh").join("go"));
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok", &format!("hold {}", shown(go.path()))]);
+    let run = start(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "write", r"bin\a.txt", "built"]));
+    wait_until("the outputs call", || calls(&steps).len() == 3);
+    // The box's own archive is swapped for one carrying the `.lfsconfig`, before the call reads it.
+    fs::write(box_output_archive(&case), crafted_archive(".lfsconfig", "lfs")).expect("the archive can be replaced");
+    fs::write(go.path(), "").expect("the go file can be made");
+
+    let outcome = run.finish();
+
+    assert_eq!(outcome.code, Some(1), "a passing run becomes 1: {outcome:?}");
+    let line = "gate: remote outputs not brought back: the archive member .lfsconfig is not under the output globs";
+    assert!(outcome.stderr.contains(line), "{outcome:?}");
+    assert!(!case.folder().join(".lfsconfig").exists(), "nothing of it is installed: {outcome:?}");
     assert_eq!(outputs_leftovers(&case), Vec::<PathBuf>::new(), "the archive and the stage are removed");
     assert!(pending_marker(&case).exists(), "{outcome:?}");
 }

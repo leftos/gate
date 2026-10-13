@@ -1,17 +1,22 @@
-//! The output globs of a run and the paths never brought back whatever the globs, as the PowerShell gate matches them
-//! (remote-wrapper.ps1's `ConvertTo-OutputRegex` and `$OutputExcluded`).
+//! The output globs as the PowerShell gate matched them (remote-wrapper.ps1's `ConvertTo-OutputRegex`), plus the paths
+//! never brought back whatever the globs: `$OutputExcluded`'s, and any `.git*` component or `.lfsconfig`, matched as the
+//! sync-back matches them.
 
 use regex::Regex;
 
 use crate::boxside::payload::escaped;
+use crate::outputs::names::{is_git_s, is_lfs_config};
 
 /// The paths never brought back, whatever the globs: anything under a `.git`, `.tmp` or `TestResults` folder at any
-/// depth, and a `.env` file (`.env`, `.env.<name>`, `<name>.env`). Matched without regard to case.
+/// depth, and a `.env` file (`.env`, `.env.<name>`, `<name>.env`). Matched without regard to case. Its `.git/` arm
+/// stays though [`is_git_s`] covers the same paths.
 const EXCLUDED: &str = r"(?i)(^|/)(\.git|\.tmp|TestResults)/|(^|/)\.env\.[^/]*$|\.env$";
 
 /// A run's output globs. Each is relative to the work folder's root and `/`-separated: `**/` is any number of folders,
 /// none included, `**` anything, `*` any run of characters within one name, `?` one character within one name, and
-/// every other character itself. They match without regard to case, as the PowerShell gate's did.
+/// every other character itself. They match without regard to case, as the PowerShell gate's did. Whatever the globs, a
+/// path a sync-back never writes — a `.git*` component or a `.lfsconfig`, read by [`is_git_s`] and [`is_lfs_config`] —
+/// never comes back and its folder is never entered.
 pub(crate) struct Globs {
     patterns: Vec<Regex>,
     excluded: Regex,
@@ -28,14 +33,16 @@ impl Globs {
         Ok(Globs { patterns, excluded })
     }
 
-    /// Whether the file at the `/`-separated relative `path` may come back: a glob matches it and no exclusion does.
+    /// Whether the file at the `/`-separated relative `path` may come back: a glob matches it, no exclusion holds it,
+    /// and it is neither a `.git*` path nor a `.lfsconfig` ([`is_git_s`], [`is_lfs_config`]).
     pub(crate) fn matches(&self, path: &str) -> bool {
-        !self.excluded.is_match(path) && self.patterns.iter().any(|pattern| pattern.is_match(path))
+        !is_git_s(path) && !is_lfs_config(path) && !self.excluded.is_match(path) && self.patterns.iter().any(|pattern| pattern.is_match(path))
     }
 
-    /// Whether a walk enters the folder at the `/`-separated relative `path`: no exclusion holds everything in it.
+    /// Whether a walk enters the folder at the `/`-separated relative `path`: no exclusion holds everything in it and
+    /// it is no `.git*` folder ([`is_git_s`]).
     pub(crate) fn enters(&self, path: &str) -> bool {
-        !self.excluded.is_match(&format!("{path}/"))
+        !is_git_s(path) && !self.excluded.is_match(&format!("{path}/"))
     }
 }
 
@@ -157,8 +164,6 @@ mod tests {
             "bin/.envx",
             "src/.tmpx/a",
             "src/x.tmp/a",
-            "bin/.gitignore",
-            ".github/a.yml",
             "MyTestResults/a",
             "bin/.env/a.dll",
         ] {
@@ -172,7 +177,59 @@ mod tests {
         for excluded in [".git", "a/.tmp", "x/testresults", "TestResults"] {
             assert!(!matcher.enters(excluded), "{excluded} is not entered");
         }
-        for entered in ["bin", ".github", "a/.tmpx", ".env", "Über"] {
+        for entered in ["bin", "a/.tmpx", ".env", "Über"] {
+            assert!(matcher.enters(entered), "{entered} is entered");
+        }
+    }
+
+    #[test]
+    fn a_git_path_or_an_lfsconfig_is_never_brought_back() {
+        let matcher = globs(&["**"]);
+        for excluded in [
+            ".gitattributes",
+            "sub/dir/.gitattributes",
+            ".gitignore",
+            ".GitModules",
+            ".lfsconfig",
+            "a/.LFSCONFIG",
+            ".lfsconfig.",
+            ".lfsconfig ",
+            r"bin\.gitattributes",
+            "bin/.gitattributes:stream",
+            "GITATT~1",
+            "bin/LFSCON~1",
+            ".github/workflows/x.yml",
+        ] {
+            assert!(!matcher.matches(excluded), "{excluded} is never brought back");
+        }
+        for kept in [
+            "bin/agit/x.dll",
+            "bin/x.gitkeep.dll",
+            "bin/lfsconfig.txt",
+            ".gıtattributes",
+            ".lfſconfig",
+            "bin/app.dll",
+        ] {
+            assert!(matcher.matches(kept), "{kept} may come back");
+        }
+    }
+
+    #[test]
+    fn a_star_glob_brings_back_no_git_path_or_lfsconfig_either() {
+        let matcher = globs(&["*"]);
+        for excluded in [".gitattributes", ".gitignore", ".lfsconfig"] {
+            assert!(!matcher.matches(excluded), "{excluded} is never brought back");
+        }
+        assert!(matcher.matches("app.dll"), "the other names still match");
+    }
+
+    #[test]
+    fn a_walk_enters_no_git_path() {
+        let matcher = globs(&["**"]);
+        for excluded in [".github", "sub/.gitlab", "GIT~1"] {
+            assert!(!matcher.enters(excluded), "{excluded} is not entered");
+        }
+        for entered in ["bin", "bin/agit"] {
             assert!(matcher.enters(entered), "{entered} is entered");
         }
     }
