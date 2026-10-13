@@ -82,6 +82,7 @@ Routing is off on the PC since the decommission of the PowerShell remote: every 
 ### R10. Retire the remote-cutover flag and `gate remote-cutover`
 
 - Remove the flag and marker reads, the drain wait, the subcommand and their paths; keep `gate box inflight` and the drain reader. Tests: `cli::remote_cutover_is_an_unknown_subcommand`, guard `routing::a_flag_left_in_the_state_root_changes_nothing`. Depends on R9.
+- Done: the subcommand, the flag and marker paths and reads, the drain mutex and the `remote_cutover` suites are deleted; gate-state's `remote_gates` reader went with them, as nothing read it.
 
 ## Runbook (orchestrator, after R7 is green)
 
@@ -95,9 +96,8 @@ Routing is off on the PC, so every run is local; R8–R10 delete the bridge with
 5. Turn routing back on for the Rust client (GATE-192). Confirm on the next ordinary routed runs: no `client` or `version` fallbacks, no nothing-back record after a build that brought its outputs back.
 6. With routing back on, remove every routing exclusion made because of the bridge, putting each pattern back in `remote.json`, and send each caller repo whose routing changed a repo inbox note: the new remote gate is released, and it should be evaluated on its own merits, not by what the bridge did. The exclusions so far are listed under "Routing exclusions" below.
 7. After R9 merges to main: install from main and push; `remote-bridge.ps1` is gone from the install.
-8. After R10: reinstall, push, delete any leftover flag. The builders' old PowerShell wrappers and claude-config's remote scripts are GATE-11's.
 
-GATE-109 (one ssh connection) follows the cutover.
+The builders' old PowerShell wrappers and claude-config's remote scripts are GATE-11's. GATE-109 (one ssh connection) follows the cutover.
 
 ## Routing exclusions
 

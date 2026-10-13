@@ -82,14 +82,11 @@ pub enum KernelObject {
     /// The mutex a routed run holds from before its preflight to its end, by its work-folder key's [`key_hash`], so a
     /// second routed run of one worktree finds it taken and runs here.
     Routed { hash: u64 },
-    /// The mutex a `gate remote-cutover` holds for its whole drain, so one drains at a time.
-    RemoteCutover,
 }
 
 impl KernelObject {
     fn suffix(self) -> String {
         match self {
-            KernelObject::RemoteCutover => "remote-cutover".to_owned(),
             KernelObject::HeavySlot(index) => format!("slot-{index}"),
             KernelObject::LightSlot(index) => format!("light-slot-{index}"),
             KernelObject::RemoteSlot(index) => format!("remote-slot-{index}"),
@@ -115,8 +112,7 @@ impl KernelObject {
             | KernelObject::WakeEvent { .. }
             | KernelObject::Job { .. }
             | KernelObject::Log { .. }
-            | KernelObject::Routed { .. }
-            | KernelObject::RemoteCutover => None,
+            | KernelObject::Routed { .. } => None,
         }
     }
 }

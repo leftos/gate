@@ -17,7 +17,7 @@ use crate::like::{Pattern, eq_ignoring_case};
 pub const DEFAULT_OUTPUTS: [&str; 2] = ["**/bin/**", "**/.godot/mono/temp/bin/**"];
 
 /// The most slots the remote pool may have.
-pub const MAX_SLOTS: u32 = 16;
+const MAX_SLOTS: u32 = 16;
 
 /// A usable routing file.
 #[derive(Debug, Clone)]

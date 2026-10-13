@@ -6,7 +6,7 @@ Suite = `crates/gate/tests/suite/` (binary `suite`, needs `--all-features`; test
 
 ## 0. How the suite reaches src (the shape that decides everything)
 
-- Every case builds a `Case` (`support.rs`, own `--state-dir`), runs the built `gate.exe` and the `fake-tool` helper. `main.rs` -> `answer::answer` (`crates/gate/src/answer.rs:18`) dispatches: Run -> `run::run`; StopTree -> `stop_tree.rs`; Cutover -> `cutover.rs`; RemoteCutover -> `remote_cutover.rs`; Push -> `push.rs`; Box -> `boxside::answer`; `--version/--help` in-place.
+- Every case builds a `Case` (`support.rs`, own `--state-dir`), runs the built `gate.exe` and the `fake-tool` helper. `main.rs` -> `answer::answer` (`crates/gate/src/answer.rs:18`) dispatches: Run -> `run::run`; StopTree -> `stop_tree.rs`; Cutover -> `cutover.rs`; Push -> `push.rs`; Box -> `boxside::answer`; `--version/--help` in-place.
 - Every `Run` goes `answer.rs` -> `resolve.rs` -> `run.rs` (`run.rs:63`), which uses `acquire, covered, environment, journal, log, machine, nesting, remote, route, slots, wait, watch` (`run.rs:22-36`). So run.rs, answer.rs, main.rs, resolve.rs, console.rs, slots.rs, wait.rs, journal.rs, log.rs, environment.rs, watch.rs are on the path of nearly every case.
 - Seam flags are declared in `crates/gate-args/src/{run,request,boxcmd,values}.rs` and parsed to the per-feature behaviour below.
 
@@ -38,16 +38,15 @@ Suite = `crates/gate/tests/suite/` (binary `suite`, needs `--all-features`; test
 | servers.rs | `build_servers` (client in job, server outside), `priority` (`--test-server-image`, `--test-servers-under`), `ceiling`, `diagnostics`, `launch`/`cli`/`install` pass `--test-servers-under` only to confine the scan | no: build_servers, priority, diagnostics, ceiling, stall, pause (sampling) |
 | priority.rs | `priority` (lower/raise servers, OtherGates guard), `critical` (raise to High), `build_servers` | no: priority, critical |
 | cutover.rs | `cutover` (`gate cutover`, flag, counts copy, drain, Ctrl+C, resume), `launcher` (hand-over after flag) | no: cutover, launcher |
-| push.rs | `push` (`gate push`, `--test-push-ssh`, `--test-push-bound-ms`, fake-ssh), `remote_cutover` (`Call`, `called` and `End` are the builder calls' own) | no: push, remote_cutover |
-| remote_cutover.rs | `remote_cutover` (`gate remote-cutover`: the drain mutex and marker, the flag, this PC's drain and the builders' rounds through fake-ssh, Ctrl+C and resume, `--test-poll-ms`, `--test-confirm-ms`, `--test-remote-bound-ms`, `--test-remote-ssh`, `--test-cutover-interrupt-after-list`, `--test-cutover-interrupt-after-round`); the unit tests inside (the ssh found, the escaped command, the slot lines, the count line) | no: remote_cutover |
+| push.rs | `push` (`gate push`, `--test-push-ssh`, `--test-push-bound-ms`, fake-ssh) | no: push |
 | stop_tree.rs | `stop_tree` (`gate stop-tree`) | no: stop_tree |
 | stopping.rs | `stop_tree` (the checked open `gate stop-tree` shares), `stall` (the kill's escaped processes) | no: stop_tree, stall |
 | escaped.rs | `stall` (`a_stall_kill_ends_a_packaged_app_the_command_started`, machine-dependent; `a_stall_kill_ends_a_child_outside_the_job_whose_launcher_has_ended`, machine-alone `#[ignore]`, with `stall::a_stall_kill_ends_a_child_outside_the_job_whose_launcher_exited_at_once` (machine-alone `#[ignore]`: the launcher ends before the first sample, so only the job's memory of it reaches the escapee), `ceiling::a_ceiling_kill_ends_a_child_outside_the_job_whose_launcher_has_ended` and `interrupt::a_ctrl_c_ends_a_child_outside_the_job_whose_launcher_has_ended`; the escapee cases that start it with `fake-tool spawn-away` under `--test-job-breakaway`; the unit tests inside), `cores` (`a_command_whose_child_left_its_job_counts_that_child_s_cores`), `interrupt` and `ceiling` (the other kills run it too) | no: stall, cores, interrupt, ceiling |
 | burn.rs | `burn` (`gate burn`: start line, status, parent watch), `cli` (usage and refusals) | no: burn, cli |
 | request_json.rs | `request`, `compat`, `cutover` (`--test-print-request`), `launcher`, `harness`, `support` | no: request, compat, cutover, launcher, harness |
-| route.rs | `routing` (decisions, `--test-git`, remote.json), `remote_client`, `request` | no: routing, remote_client |
+| route.rs | `routing` (decisions, `--test-git`, remote.json, a flag left in the state root changes nothing), `remote_client`, `request` | no: routing, remote_client |
 | bin/fake-tool.rs | helper for nearly every module (`support.rs`); signature change -> whole suite | CENTRAL (helper) |
-| bin/fake-ssh.rs | `remote_client` (`--test-remote-ssh`), `push` (`--test-push-ssh`), `routing` (copied as `ssh.exe` on `PATH` for the remote-cutover cases) | no: remote_client, push, routing |
+| bin/fake-ssh.rs | `remote_client` (`--test-remote-ssh`), `push` (`--test-push-ssh`), `routing` (copied as `ssh.exe` on `PATH` for the routed cases) | no: remote_client, push, routing |
 | remote/mod.rs | `routing` (scripted client `--test-remote-client`, fallback reason `client`, a run with no ssh), `remote_client` | no: routing, remote_client |
 | remote/{client,parity,retry,transport,watchdog,syncback,outputs,install,payload,snapshot}.rs | `remote_client` (`--test-remote-transport local:`, `--test-local-sdks`, `--test-dotnet-limit-ms`, `--test-remote-log-cap-bytes`, `--test-remote-ssh`, `--test-remote-snapshot`, `--test-remote-watch-call`, `--test-remote-timeout-ms`, `--test-remote-fetch-cap-bytes`, `--test-remote-outputs-budget-bytes`...), `syncback_quarantine` (the sync-back's quarantine, move and sweep), `syncback_conversions` (the checkout-filter refusal, the `.lfsconfig` and spelled names, the weighted apply cap; a `test-seams` build feeds `check-attr` about two paths at a time, so the unit module `remote::syncback::output_cap_slices` checks the slicing at `OUTPUT_CAP` in either build); `transport.rs` ssh words + `Ssh::find` + `Ssh::find_in` also `push` and `routing` (through the switch), and `transport.rs`'s `Transport::judge` and `sent_repo` are also reached by `routing`; `payload.rs` is what `boxside` payload tests read through `local:` builder | no: remote_client, syncback_quarantine, syncback_conversions (+ push and routing for transport.rs, + boxside for payload.rs/outputs.rs) |
 | remote/{git,launch}.rs | `remote_client` (`--test-git`), `routing` (`--test-git`, `--test-git-limit-ms` and `--test-git-drain-ms` in `GIT_HANG_GUARDS`, route facts), `syncback_quarantine` (`Call.set`, the sync-back's git environment), `syncback_conversions` (`OUTPUT_CAP` bounds the `check-attr` slices), `request`, `boxside` (`sdk_listing` reads the preflight's SDK list) | no: remote_client, routing, syncback_quarantine, syncback_conversions (+ boxside for git.rs) |
@@ -62,7 +61,7 @@ Suite = `crates/gate/tests/suite/` (binary `suite`, needs `--all-features`; test
 | Area | Suite modules that reach it | Own tests | Central? |
 |---|---|---|---|
 | gate-args lib.rs / cli.rs / values.rs / problem.rs / usage.rs | every case parses argv: all suite (parse errors `cli`, usage `cli`) | `gate-args::args` (top, run, boxcmd), unit | CENTRAL |
-| gate-args request.rs / run.rs (seam parsing) | `request`, plus every module whose flags it parses (`--bring-tracked`: `remote_client`; the `remote-cutover` words and seams: `remote_cutover`) | args tests `run`, `remote_cutover`, `seams` (the removed bridge seams are unknown options) | CENTRAL (a seam rename breaks callers) |
+| gate-args request.rs / run.rs (seam parsing) | `request`, plus every module whose flags it parses (`--bring-tracked`: `remote_client`) | args tests `run`, `seams` (the removed bridge seams are unknown options) | CENTRAL (a seam rename breaks callers) |
 | gate-args compat.rs | `compat`, `launcher`, `request`, `cli` | args `compat` | no |
 | gate-args boxcmd.rs | `boxside`, `boxside::outputs`, `remote_client` | args `boxcmd` | no |
 | gate-args cmdline.rs / batch.rs / program.rs | `launch` (quoting, refused batch word, `.cmd`), `journal` (`command_text`), `boxside`, `remote_client` | args `quoting`, `batch`, `program` | no |
@@ -72,7 +71,7 @@ Suite = `crates/gate/tests/suite/` (binary `suite`, needs `--all-features`; test
 | gate-state archive.rs | `journal` (rollover and archive with concurrent appenders) | state `archive` | no |
 | gate-state cutover.rs / drain.rs / counts.rs | `cutover`, `launcher` (gate/src/cutover.rs imports `copy_slot_counts_to_v1, powershell_gates, write_cutover_flag`); `counts.rs`'s `write_replacing` (the temp names) also writes the v1 files, so a change there adds `routing` | state `cutover`, `counts`; a unit test inside `counts.rs` for the temp names | no |
 | gate-state tests/state/fixtures/ (captured files, `capture-*.ps1`) and tests/state/fixtures.rs | none (the fixtures are captured from `gate.exe` and the PowerShell gate by script and only read by the state tests) | state `fixtures` (incl. `remote_run_journal_from_gate_exe_is_read_into_runs_and_a_split_summary`) | no |
-| gate-state claims.rs / remote.rs / state.rs / win32.rs / journal.rs (reader) | NOT imported by gate src (ops-tower-only, ARCHITECTURE.md Layers; `Win32MutexProbe` is also read by `drain.rs`'s `remote_gates`, for the remote cutover (`remote_cutover`); except `normalize_command` from journal.rs, used by `slots.rs`:642 and journal.rs's command text -> `journal`, `slots`) | state tests | no (journal.rs: `journal`, `slots`) |
+| gate-state claims.rs / remote.rs / state.rs / win32.rs / journal.rs (reader) | NOT imported by gate src (ops-tower-only, ARCHITECTURE.md Layers; except `normalize_command` from journal.rs, used by `slots.rs`:642 and journal.rs's command text -> `journal`, `slots`) | state tests | no (journal.rs: `journal`, `slots`) |
 | gate-watchdog share.rs / watch.rs | `stall`, `ceiling`, `cores`, `pause`, `diagnostics`, `interrupt`, `build_servers`, `priority` | unit | no (wide) |
 | gate-watchdog cores.rs | `cores`, `journal` (cores fields) | unit | no |
 | gate-watchdog servers.rs | `build_servers`, `priority`, `diagnostics`, `ceiling` | unit | no |
@@ -116,8 +115,7 @@ Always add `checkout` to any change that touches a suite file or adds a seam.
 | servers.rs | `-E 'binary(suite) and test(/^(build_servers\|priority\|diagnostics\|ceiling\|stall)::/) or (U and test(/^servers::/))'` |
 | priority.rs | `-E 'binary(suite) and test(/^(priority\|critical\|build_servers)::/) or (U and test(/^priority::/))'` |
 | cutover.rs | `-E 'binary(suite) and test(/^(cutover\|launcher)::/) or (U and test(/^cutover::/))'` |
-| push.rs, bin/fake-ssh.rs (push side) | `-E 'binary(suite) and test(/^(push\|remote_client\|remote_cutover)::/)'` (fake-ssh also serves remote_client; `push.rs`'s call is shared with `remote_cutover.rs`) |
-| remote_cutover.rs | `-E 'binary(suite) and test(/^remote_cutover::/) or (U and test(/^remote_cutover::/))'` |
+| push.rs, bin/fake-ssh.rs (push side) | `-E 'binary(suite) and test(/^(push\|remote_client)::/)'` (fake-ssh also serves remote_client) |
 | stop_tree.rs | `-E 'binary(suite) and test(/^stop_tree::/)'` |
 | stopping.rs | `-E 'binary(suite) and test(/^(stop_tree\|stall)::/) or (U and test(/^stopping::/))'` |
 | escaped.rs | `-E 'binary(suite) and test(/^(stall\|cores\|interrupt\|ceiling)::/) or (U and test(/^escaped::/))'` |

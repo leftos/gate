@@ -185,8 +185,8 @@ pub(crate) fn ticket_started_by(start_ticks: i64, created: Timestamp) -> bool {
     (ticks_of(created) - i128::from(start_ticks)).abs() < TICKET_START_TOLERANCE_TICKS
 }
 
-/// Whether a process created at `created` is the `gate.exe` gate whose ticket, covered marker or drain marker records a
-/// start of `start_ms` Unix epoch milliseconds: the two agree to the millisecond.
+/// Whether a process created at `created` is the `gate.exe` gate whose ticket or covered marker records a start of
+/// `start_ms` Unix epoch milliseconds: the two agree to the millisecond.
 pub(crate) fn started_at_ms(created: Timestamp, start_ms: u64) -> bool {
     created.as_millisecond().unsigned_abs() == start_ms
 }

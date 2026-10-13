@@ -6,8 +6,8 @@ use std::path::PathBuf;
 
 use crate::problem::{Problem, Required, Spelling};
 use crate::request::{
-    BurnRequest, CutoverRequest, CutoverSeams, DEFAULT_STALL_SECONDS, DEFAULT_TAIL_LINES, PushRequest, PushSeams, RemoteCutoverRequest,
-    RemoteCutoverSeams, RunRequest, Slot, StopRequest, TestSeams,
+    BurnRequest, CutoverRequest, CutoverSeams, DEFAULT_STALL_SECONDS, DEFAULT_TAIL_LINES, PushRequest, PushSeams, RunRequest, Slot, StopRequest,
+    TestSeams,
 };
 use crate::values;
 
@@ -106,8 +106,6 @@ pub(crate) enum SwitchOption {
     JobBreakaway,
     #[cfg(feature = "test-seams")]
     CutoverInterruptAfterList,
-    #[cfg(feature = "test-seams")]
-    CutoverInterruptAfterRound,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -137,9 +135,6 @@ pub(crate) struct RunBuilder {
     cutover_seams: CutoverSeams,
     /// `gate push`'s own seams, `--test-push-ssh` and `--test-push-bound-ms`.
     push_seams: PushSeams,
-    /// `gate remote-cutover`'s own seam, `--test-cutover-interrupt-after-round`; its others are read into `test_seams`
-    /// and `cutover_seams`, as a run's and a cutover's are.
-    remote_cutover_seams: RemoteCutoverSeams,
     given: Vec<RunOption>,
     pub(crate) problems: Vec<Problem>,
 }
@@ -298,8 +293,6 @@ impl RunBuilder {
             SwitchOption::JobBreakaway => self.test_seams.job_breakaway = on,
             #[cfg(feature = "test-seams")]
             SwitchOption::CutoverInterruptAfterList => self.cutover_seams.interrupt_after_list = on,
-            #[cfg(feature = "test-seams")]
-            SwitchOption::CutoverInterruptAfterRound => self.remote_cutover_seams.interrupt_after_round = on,
         }
     }
 
@@ -426,26 +419,6 @@ impl RunBuilder {
                 heartbeat_ms: self.test_seams.heartbeat_ms,
                 confirm_ms: self.cutover_seams.confirm_ms,
                 interrupt_after_list: self.cutover_seams.interrupt_after_list,
-            },
-        })
-    }
-
-    /// The remote cutover request, its state root and its seams taken from the poll, the confirmation window, the
-    /// interrupt switches, the call bound, the transport and the ssh read, or every problem found.
-    pub(crate) fn finish_remote_cutover(self) -> Result<RemoteCutoverRequest, Vec<Problem>> {
-        if !self.problems.is_empty() {
-            return Err(self.problems);
-        }
-        Ok(RemoteCutoverRequest {
-            state_dir: self.state_dir,
-            seams: RemoteCutoverSeams {
-                poll_ms: self.test_seams.poll_ms,
-                confirm_ms: self.cutover_seams.confirm_ms,
-                interrupt_after_list: self.cutover_seams.interrupt_after_list,
-                interrupt_after_round: self.remote_cutover_seams.interrupt_after_round,
-                bound_ms: self.test_seams.remote_bound_ms,
-                transport: self.test_seams.remote_transport,
-                ssh: self.test_seams.remote_ssh,
             },
         })
     }

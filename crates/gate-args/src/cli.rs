@@ -4,7 +4,7 @@ use std::ffi::OsString;
 use std::iter::Peekable;
 
 use crate::problem::{Problem, Spelling};
-use crate::request::{BurnRequest, CutoverRequest, PushRequest, RemoteCutoverRequest, RunRequest, StopRequest};
+use crate::request::{BurnRequest, CutoverRequest, PushRequest, RunRequest, StopRequest};
 use crate::run::{RunBuilder, RunOption, SwitchOption, ValueOption, next_text};
 use crate::values;
 
@@ -61,21 +61,6 @@ pub(crate) fn parse_cutover(words: impl Iterator<Item = OsString>) -> Result<Cut
         }
     }
     builder.finish_cutover()
-}
-
-/// Reads the words after `gate remote-cutover`: `--state-dir`, and the hidden seams of a build with the `test-seams`
-/// feature; every other word is a problem, `--` included.
-pub(crate) fn parse_remote_cutover(words: impl Iterator<Item = OsString>) -> Result<RemoteCutoverRequest, Vec<Problem>> {
-    let mut words = words.peekable();
-    let mut builder = RunBuilder::default();
-    while let Some(text) = next_text(&mut words, &mut builder.problems) {
-        if text.starts_with('-') && text != "--" {
-            read_option(&mut builder, &mut words, &text, remote_cutover_option);
-        } else {
-            builder.problems.push(Problem::UnexpectedArgument(text));
-        }
-    }
-    builder.finish_remote_cutover()
 }
 
 /// Reads the words after `gate push`, which takes none: every word is a problem, `--` included, save the hidden seams
@@ -173,32 +158,6 @@ fn cutover_option(name: &str) -> Option<RunOption> {
 
 #[cfg(not(feature = "test-seams"))]
 fn cutover_option(_name: &str) -> Option<RunOption> {
-    None
-}
-
-fn remote_cutover_option(name: &str) -> Option<RunOption> {
-    match name {
-        "state-dir" => Some(RunOption::Value(ValueOption::StateDir)),
-        _ => remote_cutover_seam(name),
-    }
-}
-
-#[cfg(feature = "test-seams")]
-fn remote_cutover_seam(name: &str) -> Option<RunOption> {
-    match name {
-        "test-poll-ms" => Some(RunOption::Value(ValueOption::PollMs)),
-        "test-confirm-ms" => Some(RunOption::Value(ValueOption::ConfirmMs)),
-        "test-cutover-interrupt-after-list" => Some(RunOption::Switch(SwitchOption::CutoverInterruptAfterList)),
-        "test-cutover-interrupt-after-round" => Some(RunOption::Switch(SwitchOption::CutoverInterruptAfterRound)),
-        "test-remote-bound-ms" => Some(RunOption::Value(ValueOption::RemoteBoundMs)),
-        "test-remote-transport" => Some(RunOption::Value(ValueOption::RemoteTransport)),
-        "test-remote-ssh" => Some(RunOption::Value(ValueOption::RemoteSsh)),
-        _ => None,
-    }
-}
-
-#[cfg(not(feature = "test-seams"))]
-fn remote_cutover_seam(_name: &str) -> Option<RunOption> {
     None
 }
 

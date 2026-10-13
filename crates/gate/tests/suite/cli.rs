@@ -55,6 +55,15 @@ fn unknown_subcommand_exits_2_with_usage() {
 }
 
 #[test]
+fn remote_cutover_is_an_unknown_subcommand() {
+    let outcome = Case::new("remote_cutover_unknown").run(&["remote-cutover"]);
+
+    assert_eq!(outcome.code, Some(2), "{outcome:?}");
+    assert_eq!(outcome.stdout, "");
+    assert_eq!(outcome.stderr, format!("gate: unknown subcommand remote-cutover\n{USAGE}"));
+}
+
+#[test]
 fn run_reports_missing_inputs_then_usage_exit_2() {
     let case = Case::new("run_reports_missing_inputs");
     let outcome = case.run(&["run"]);

@@ -4,7 +4,7 @@ use std::ffi::{OsStr, OsString};
 use std::io::{self, Read, Write};
 use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::io::AsRawHandle;
-use std::os::windows::process::{CommandExt, ExitStatusExt};
+use std::os::windows::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -17,8 +17,7 @@ use gate_win32::StoppableProcess;
 use jiff::Timestamp;
 use serde_json::{Value, json};
 use windows_sys::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
-use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
-use windows_sys::Win32::System::Threading::{CREATE_NO_WINDOW, GetExitCodeProcess, WaitForSingleObject};
+use windows_sys::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject};
 
 /// The gate under test.
 pub const GATE: &str = env!("CARGO_BIN_EXE_gate");
@@ -30,7 +29,6 @@ pub const USAGE: &str = "\
 usage: gate run --slot heavy|light|critical|none --timeout <seconds> --log <path> [options] -- <command> [args...]
        gate stop-tree <pid>
        gate cutover
-       gate remote-cutover [--state-dir <path>]
        gate push
        gate burn [--cores <n>] --seconds <s>
        gate --version | --help
@@ -250,21 +248,6 @@ fn after_gate(outcome: &Outcome) -> String {
 pub fn start(mut command: Command) -> Running {
     command.stdin(Stdio::null());
     gathered(command)
-}
-
-/// Starts the gate `command` in a console of its own with no window, which the processes it starts share, so a Ctrl+C
-/// sent to its console reaches the gate and them and nothing else. The suite first lets the processes it starts see
-/// Ctrl+C, which they would otherwise inherit ignoring when the suite itself was started so.
-pub fn start_in_own_console(mut command: Command) -> Running {
-    static ALLOWED: OnceLock<()> = OnceLock::new();
-    ALLOWED.get_or_init(|| {
-        // SAFETY: a null handler with FALSE only clears this process's ignore-Ctrl+C attribute, which its children
-        // inherit; no pointer is passed.
-        let set = unsafe { SetConsoleCtrlHandler(None, 0) };
-        assert_ne!(set, 0, "the suite's children can see Ctrl+C: {}", io::Error::last_os_error());
-    });
-    command.creation_flags(CREATE_NO_WINDOW);
-    start(command)
 }
 
 /// Starts `command` with its output gathered as [`start`] gathers it and its stdin a pipe, whose write end it returns:

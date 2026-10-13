@@ -1590,7 +1590,7 @@ fn inflight_leaves_a_free_lock_takeable() {
     drop(taken);
 }
 
-/// A `work` folder the box cannot list holds the drain: no count line, the reason, and status 1. A plain file where
+/// A `work` folder the box cannot list gives no count: no count line, the reason, and status 1. A plain file where
 /// the work folder goes is such a case, and one the suite can make with no right it may not have.
 #[test]
 fn inflight_cannot_list_a_work_folder_and_exits_1() {
@@ -1627,8 +1627,8 @@ fn hold_lock(work: &Path, name: &str) -> fs::File {
         .expect("the work folder's lock can be held, as a run holds it")
 }
 
-/// A lock the probe cannot open at all counts as held — a folder where a lock file goes is one — since the drain must
-/// not pass on a lock it could not read; the line says why.
+/// A lock the probe cannot open at all counts as held — a folder where a lock file goes is one — since a lock it could
+/// not read is never counted free; the line says why.
 #[test]
 fn inflight_counts_a_lock_it_cannot_read_as_held() {
     let case = Case::new("inflight_counts_a_lock_it_cannot_read_as_held");

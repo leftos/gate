@@ -27,8 +27,6 @@ pub enum Invocation {
     StopTree(StopRequest),
     /// `gate cutover`.
     Cutover(CutoverRequest),
-    /// `gate remote-cutover`.
-    RemoteCutover(RemoteCutoverRequest),
     /// `gate push`.
     Push(PushRequest),
     /// `gate burn`.
@@ -74,7 +72,7 @@ pub enum BoxVerb {
     Stop,
     Boot,
     Outputs,
-    /// How many of the builder's work folders a run holds, which the remote cutover's drain asks of every builder.
+    /// How many of the builder's work folders a run holds.
     Inflight,
 }
 
@@ -261,40 +259,6 @@ pub struct CutoverSeams {
     /// Raise the console interrupt right after the first list of the gates waited on is said
     /// (`--test-cutover-interrupt-after-list`).
     pub interrupt_after_list: bool,
-}
-
-/// A valid `gate remote-cutover`: the state root it drains, and the hidden seams the black-box suite gives it.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RemoteCutoverRequest {
-    /// `--state-dir` as given.
-    pub state_dir: Option<PathBuf>,
-    /// The hidden `--test-*` flags that set the drain's timing, its interrupt and the way to the builders.
-    pub seams: RemoteCutoverSeams,
-}
-
-/// What the black-box suite sets on `gate remote-cutover` through its hidden `--test-*` flags; each field keeps its
-/// default, `None` or off, in a gate built without the `test-seams` feature.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct RemoteCutoverSeams {
-    /// The drain's poll of this PC and the period of its builder rounds, in milliseconds (`--test-poll-ms`).
-    pub poll_ms: Option<u64>,
-    /// How long every scan of this PC must find no routed gate before its drain ends, in milliseconds
-    /// (`--test-confirm-ms`).
-    pub confirm_ms: Option<u64>,
-    /// Raise the console interrupt right after the first list of the routed gates waited on is said
-    /// (`--test-cutover-interrupt-after-list`).
-    pub interrupt_after_list: bool,
-    /// Raise the console interrupt once the first round of builder calls has answered, before the round is judged
-    /// (`--test-cutover-interrupt-after-round`).
-    pub interrupt_after_round: bool,
-    /// How long one builder's `gate box inflight` call may take before it is killed, in milliseconds
-    /// (`--test-remote-bound-ms`).
-    pub bound_ms: Option<u64>,
-    /// The transport the builders are asked through, as given: `local:<folder>` or `local-ssh:<folder>`
-    /// (`--test-remote-transport`).
-    pub transport: Option<String>,
-    /// The program each builder's call runs in place of the ssh found along `PATH` (`--test-remote-ssh`).
-    pub ssh: Option<PathBuf>,
 }
 
 /// A valid `gate push`, which takes no words: only the hidden seams the black-box suite gives it.

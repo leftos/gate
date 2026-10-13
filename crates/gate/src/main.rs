@@ -1,11 +1,10 @@
 //! `gate.exe`: runs a heavy command under a machine-wide queue of CPU slots. This build reads its command line,
 //! resolves the state root and the log path, answers `--version` and `--help`, decides whether a heavy command routes
 //! to a builder, and runs a command under a slot in a job of its own, watched for a stall, its ceiling and the
-//! backstop, saying each line as it goes. It stops a process tree with the gates in it, and moves the machine from the
-//! PowerShell gate to itself (`gate cutover`), drains the routed runs before the Rust remote client takes over from
-//! the bridge (`gate remote-cutover`), and copies the installed exe to the builders (`gate push`). A routed
-//! command falls back to running here, as no remote client is built yet. On a builder, the hidden `gate box` answers
-//! `boot`, `preflight`, `run`, `stop` and `outputs`.
+//! backstop, saying each line as it goes. A routed command runs on the builder through the remote client, and falls back
+//! to running here when the builder turns it away. It stops a process tree with the gates in it, moves the machine from
+//! the PowerShell gate to itself (`gate cutover`), and copies the installed exe to the builders (`gate push`). On a
+//! builder, the hidden `gate box` answers `boot`, `preflight`, `run`, `stop`, `outputs` and `inflight`.
 
 mod acquire;
 mod answer;
@@ -35,7 +34,6 @@ mod pause;
 mod priority;
 mod push;
 mod remote;
-mod remote_cutover;
 mod request_json;
 mod resolve;
 mod route;

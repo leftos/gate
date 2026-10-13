@@ -6,7 +6,7 @@ use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::os::windows::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{self, Command};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use gate_router::{DROPPED_NO_BUILD_LINE, NO_OUTPUTS_LINE, repo_name};
@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 use crate::nesting::{LOOK_OFTEN, end_parent, first_event, marked, orphaned_as, spawned, test_marker};
 
 use crate::support::{
-    Case, FAKE_TOOL, GATE, Running, assert_in_order, copy_tool, events, finish, git, git_init, heavy_words, nothing_back, powershell_folder,
+    Case, FAKE_TOOL, GATE, Outcome, Running, assert_in_order, copy_tool, events, finish, git, git_init, heavy_words, nothing_back, powershell_folder,
     record_path, release, run_words, shown, wait_for_journal_line, wait_until, write_counts, write_remote_json,
 };
 
@@ -248,11 +248,18 @@ fn ssh_calls(steps: &Path) -> Vec<String> {
     fs::read_to_string(PathBuf::from(log)).map_or_else(|_| Vec::new(), |text| text.lines().map(str::to_owned).collect())
 }
 
-#[test]
-fn a_routed_run_goes_through_ssh_to_the_builders_gate() {
-    let case = ssh_case("routing-ssh");
-    let outside = Case::new("routing-ssh-stand-in");
+/// Runs a routed run of an [`ssh_case`] named `name` through the stand-in ssh, its state root first holding `left`
+/// (each a file name and its text), and checks it asked the builder's gate box through ssh and, on the stand-in's 9009,
+/// ran here with reason `version`; what the gate said.
+fn routed_through_ssh(name: &str, left: &[(&str, String)]) -> Outcome {
+    let case = ssh_case(name);
+    let outside = Case::new(&format!("{name}-stand-in"));
     let steps = fake_ssh_in(&outside.folder());
+    let root = case.root();
+    for (file, text) in left {
+        fs::create_dir_all(&root).expect("the state root can be made");
+        fs::write(root.join(file), text).expect("the left file can be written");
+    }
 
     let outcome = finish(ssh_gate(&case, &path_with(&outside.folder()), &steps));
 
@@ -262,6 +269,29 @@ fn a_routed_run_goes_through_ssh_to_the_builders_gate() {
     assert!(outcome.stdout.contains("ran here"), "{outcome:?}");
     assert_eq!(ssh_calls(&steps), ["preflight"], "the builder's gate box was asked through ssh");
     assert_refused(&events(&case), "version");
+    outcome
+}
+
+#[test]
+fn a_routed_run_goes_through_ssh_to_the_builders_gate() {
+    routed_through_ssh("routing-ssh", &[]);
+}
+
+#[test]
+fn a_flag_left_in_the_state_root_changes_nothing() {
+    let pid = process::id();
+    let start = gate_win32::process_start_of(pid)
+        .expect("this process's start can be read")
+        .expect("this process runs")
+        .as_millisecond();
+    let marker = format!(r#"{{"v":1,"pid":{pid},"start":{start},"since":{start}}}"#);
+
+    let outcome = routed_through_ssh(
+        "routing-left-flag",
+        &[("remote-cutover.flag", String::new()), ("remote-cutover.draining", marker)],
+    );
+
+    assert!(!outcome.stderr.contains("remote cutover"), "{outcome:?}");
 }
 
 #[test]
@@ -298,32 +328,6 @@ fn an_ssh_inside_the_worktree_is_refused_with_reason_client() {
     assert!(outcome.stdout.contains("ran here"), "{outcome:?}");
     assert_eq!(ssh_calls(&steps), Vec::<String>::new(), "the refused ssh was never run");
     assert_refused(&events(&case), "client");
-}
-
-/// Sends a Ctrl+C to the console of the process `pid` from a pwsh that leaves its own console, attaches to that one and
-/// ignores the Ctrl+C itself; what pwsh said and its status.
-pub(crate) fn send_ctrl_c_to_the_console_of(pid: u32) -> Output {
-    let script = format!(
-        "Add-Type -Namespace GateSuite -Name Attach -MemberDefinition @'\n\
-         [DllImport(\"kernel32.dll\", SetLastError = true)] public static extern bool FreeConsole();\n\
-         [DllImport(\"kernel32.dll\", SetLastError = true)] public static extern bool AttachConsole(uint pid);\n\
-         [DllImport(\"kernel32.dll\", SetLastError = true)] public static extern bool SetConsoleCtrlHandler(System.IntPtr handler, bool add);\n\
-         [DllImport(\"kernel32.dll\", SetLastError = true)] public static extern bool GenerateConsoleCtrlEvent(uint ctrlEvent, uint group);\n\
-         '@\n\
-         [void][GateSuite.Attach]::FreeConsole()\n\
-         if (-not [GateSuite.Attach]::AttachConsole({pid})) {{\n\
-         throw \"AttachConsole failed: $([System.Runtime.InteropServices.Marshal]::GetLastWin32Error())\"\n\
-         }}\n\
-         [void][GateSuite.Attach]::SetConsoleCtrlHandler([System.IntPtr]::Zero, $true)\n\
-         if (-not [GateSuite.Attach]::GenerateConsoleCtrlEvent(0, 0)) {{\n\
-         throw \"GenerateConsoleCtrlEvent failed: $([System.Runtime.InteropServices.Marshal]::GetLastWin32Error())\"\n\
-         }}\n"
-    );
-    Command::new("pwsh")
-        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-        .stdin(Stdio::null())
-        .output()
-        .expect("pwsh starts")
 }
 
 #[test]

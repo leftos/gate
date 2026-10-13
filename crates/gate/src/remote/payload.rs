@@ -126,14 +126,6 @@ pub(crate) fn run_word(location: &Location, run: &RunCall<'_>) -> String {
     word(&object)
 }
 
-/// The payload word of the inflight probe, which asks a builder how many of its work folders a run holds: the `Root`
-/// its work folders live under, which is all the probe reads.
-pub(crate) fn inflight_word(root: &str) -> String {
-    let mut object = Map::new();
-    object.insert("Root".to_owned(), Value::String(root.to_owned()));
-    word(&object)
-}
-
 /// `object` as one word: base64 of its compact UTF-8 JSON.
 fn word(object: &Map<String, Value>) -> String {
     STANDARD.encode(Value::Object(object.clone()).to_string())
@@ -185,7 +177,7 @@ mod tests {
     use base64::engine::general_purpose::STANDARD;
     use serde_json::{Value, json};
 
-    use super::{BOX_EXE, LINE_LIMIT, Location, RunCall, capped, inflight_word, job_nonce, line, location_word, run_nonce, run_word};
+    use super::{BOX_EXE, LINE_LIMIT, Location, RunCall, capped, job_nonce, line, location_word, run_nonce, run_word};
 
     fn decoded(word: &str) -> Value {
         let bytes = STANDARD.decode(word).expect("the word is base64");
@@ -281,16 +273,6 @@ mod tests {
     #[test]
     fn the_line_runs_the_builder_s_gate_with_the_verb_and_the_word() {
         assert_eq!(line("run", "e30="), r#""%LOCALAPPDATA%\gate\bin\gate.exe" box run e30="#);
-    }
-
-    #[test]
-    fn the_inflight_word_carries_the_builders_root_and_nothing_else() {
-        assert_eq!(decoded(&inflight_word(r"D:\gate-remote")), json!({ "Root": r"D:\gate-remote" }));
-        assert_eq!(
-            decoded(&inflight_word(r"D:\gate-remote\")),
-            json!({ "Root": r"D:\gate-remote\" }),
-            "the builder sends the root as it is given, and the probe folds a trailing separator off it"
-        );
     }
 
     #[test]

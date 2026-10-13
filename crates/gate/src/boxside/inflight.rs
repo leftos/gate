@@ -1,5 +1,4 @@
-//! `gate box inflight`: how many of the builder's work folders a run holds, which the remote cutover's drain asks of
-//! every builder before a routed run may start here. A run holds its work folder by holding `<root>\work\<key>.lock`
+//! `gate box inflight`: how many of the builder's work folders a run holds. A run holds its work folder by holding `<root>\work\<key>.lock`
 //! open with no sharing at all (`gate box run`, and the PowerShell wrapper's `Invoke-Run`), so a probe that opens each
 //! lock for reading, sharing everything, is refused exactly while a run holds it. Each handle is closed at once, so a
 //! run that starts just after the probe can still take its lock; one whose own open lands while the probe holds it is

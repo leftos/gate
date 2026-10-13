@@ -95,7 +95,7 @@ fn hand_over(local_app_data: &Path, console: &mut Console) -> Result<(PathBuf, T
 
 /// How a drain ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Drained {
+enum Drained {
     /// Nothing is left to wait for: every scan over the confirmation window found no gate.
     Empty,
     /// The console was interrupted first.
@@ -171,20 +171,20 @@ impl Heartbeat {
 
 /// Whether the drain is over: every scan over a window, from the first empty scan on, found no gate.
 #[derive(Debug)]
-pub(crate) struct Confirm {
+struct Confirm {
     window: Duration,
     /// When the empty scans began, counted from the start of the drain; `None` while the last scan found a gate.
     empty_since: Option<Duration>,
 }
 
 impl Confirm {
-    pub(crate) fn new(window: Duration) -> Confirm {
+    fn new(window: Duration) -> Confirm {
         Confirm { window, empty_since: None }
     }
 
     /// Whether the drain is over after a scan made `elapsed` into it that found no gate (`empty`) or some; a scan that
     /// finds one starts the window again.
-    pub(crate) fn over(&mut self, elapsed: Duration, empty: bool) -> bool {
+    fn over(&mut self, elapsed: Duration, empty: bool) -> bool {
         if !empty {
             self.empty_since = None;
             return false;
@@ -249,7 +249,7 @@ fn command_text(gate: &Gate, read_command: &mut dyn FnMut(u32) -> Option<String>
 }
 
 /// `count` and `noun`, the noun given an `s` unless the count is 1.
-pub(crate) fn counted(count: usize, noun: &str) -> String {
+fn counted(count: usize, noun: &str) -> String {
     if count == 1 { format!("1 {noun}") } else { format!("{count} {noun}s") }
 }
 
