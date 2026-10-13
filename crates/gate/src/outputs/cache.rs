@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::outputs::manifest::{Held, MANIFEST_LIMIT, Manifest};
-use crate::outputs::walk::Found;
+use crate::outputs::walk::Stamp;
 
 /// How long before a build's walk began a file's last write must be for its hash to be kept: 2 s, in the 100 ns ticks
 /// of a Windows file time. A file written closer to the build could be written again within the same tick at the same
@@ -41,24 +41,24 @@ impl HashCache {
         Some(HashCache { held })
     }
 
-    /// The SHA-256 the cache holds for `file`, when it holds its path with the stamp the walk found it at.
-    pub(crate) fn hit(&self, file: &Found) -> Option<&str> {
-        self.held
-            .get(&file.path)
-            .filter(|held| held.stamp == file.stamp)
-            .map(|held| held.sha256.as_str())
+    /// What the cache holds at `path`, found without regard to case: the stamp its hash was read at and that hash, or
+    /// nothing when it holds no entry for the path. A caller takes the hash only when that stamp is the one the file's
+    /// handle reads.
+    pub(crate) fn held(&self, path: &str) -> Option<&Held> {
+        self.held.get(path)
     }
 
-    /// Keeps `sha256` as the hash of `file`, read by a build whose walk began at the file time `started`, when the
-    /// file's last write is at least [`WINDOW`] before it; a last write after it is never kept.
-    pub(crate) fn keep(&mut self, file: &Found, sha256: &str, started: u64) {
-        let settled = file.stamp.modified.checked_add(WINDOW).is_some_and(|end| end <= started);
+    /// Keeps `sha256` as the hash of the file at `path`, whose stamp `stamp` a handle read before the hash, kept by a
+    /// build whose walk began at the file time `started`, when the stamp's last write is at least [`WINDOW`] before it;
+    /// a last write after it is never kept.
+    pub(crate) fn keep(&mut self, path: &str, stamp: Stamp, sha256: &str, started: u64) {
+        let settled = stamp.modified.checked_add(WINDOW).is_some_and(|end| end <= started);
         if settled {
             let held = Held {
-                stamp: file.stamp,
+                stamp,
                 sha256: sha256.to_owned(),
             };
-            self.held.insert(file.path.clone(), held);
+            self.held.insert(path.to_owned(), held);
         }
     }
 
@@ -132,11 +132,15 @@ mod tests {
         digit.to_string().repeat(64)
     }
 
+    fn stamp(size: u64, modified: u64) -> Stamp {
+        Stamp { size, modified }
+    }
+
     fn found(path: &str, size: u64, modified: u64) -> Found {
         Found {
             path: path.to_owned(),
             full: PathBuf::from(format!(r"C:\work\{path}")),
-            stamp: Stamp { size, modified },
+            stamp: stamp(size, modified),
         }
     }
 
@@ -145,7 +149,7 @@ mod tests {
     fn cache_of(files: &[(&Found, char)]) -> HashCache {
         let mut cache = HashCache::default();
         for (file, digit) in files {
-            cache.keep(file, &sha(*digit), u64::MAX);
+            cache.keep(&file.path, file.stamp, &sha(*digit), u64::MAX);
         }
         cache
     }
@@ -169,21 +173,23 @@ mod tests {
         names
     }
 
+    /// The cache holds an entry by its path, found without regard to case, with the stamp and the hash it was kept at,
+    /// and holds nothing for a path it lacks: whether an entry is taken is the caller's comparison of that stamp.
     #[test]
-    fn a_stamp_that_matches_hits_and_any_other_stamp_misses() {
+    fn an_entry_is_found_by_its_path_without_regard_to_case() {
         let kept = found("Bin/A.dll", 3, STARTED);
         let cache = cache_of(&[(&kept, 'f')]);
-        let cached = sha('f');
 
-        assert_eq!(cache.hit(&kept), Some(cached.as_str()));
         assert_eq!(
-            cache.hit(&found("bin/a.DLL", 3, STARTED)),
-            Some(cached.as_str()),
+            cache.held(&kept.path).map(|held| (held.stamp, held.sha256.as_str())),
+            Some((stamp(3, STARTED), sha('f').as_str()))
+        );
+        assert_eq!(
+            cache.held("bin/a.DLL").map(|held| held.stamp),
+            Some(stamp(3, STARTED)),
             "a path in another case"
         );
-        assert_eq!(cache.hit(&found("Bin/A.dll", 4, STARTED)), None, "another size");
-        assert_eq!(cache.hit(&found("Bin/A.dll", 3, STARTED + 1)), None, "another last write");
-        assert_eq!(cache.hit(&found("Bin/B.dll", 3, STARTED)), None, "a path the cache lacks");
+        assert_eq!(cache.held("Bin/B.dll"), None, "a path the cache lacks");
     }
 
     #[test]
@@ -195,15 +201,19 @@ mod tests {
         let past_any_clock = found("bin/past.dll", 1, u64::MAX);
         let mut cache = HashCache::default();
         for file in [&settled, &racy, &at_start, &ahead, &past_any_clock] {
-            cache.keep(file, &sha('a'), STARTED);
+            cache.keep(&file.path, file.stamp, &sha('a'), STARTED);
         }
 
         assert_eq!(WINDOW, 20_000_000, "2 s of 100 ns ticks");
-        assert_eq!(cache.hit(&settled), Some(sha('a').as_str()), "written the whole window before the build");
-        assert_eq!(cache.hit(&racy), None, "written inside the window");
-        assert_eq!(cache.hit(&at_start), None, "written as the build began");
-        assert_eq!(cache.hit(&ahead), None, "written after the build began");
-        assert_eq!(cache.hit(&past_any_clock), None, "a last write no clock reaches");
+        assert_eq!(
+            cache.held(&settled.path).map(|held| (held.stamp, held.sha256.as_str())),
+            Some((stamp(1, STARTED - WINDOW), sha('a').as_str())),
+            "written the whole window before the build"
+        );
+        assert_eq!(cache.held(&racy.path), None, "written inside the window");
+        assert_eq!(cache.held(&at_start.path), None, "written as the build began");
+        assert_eq!(cache.held(&ahead.path), None, "written after the build began");
+        assert_eq!(cache.held(&past_any_clock.path), None, "a last write no clock reaches");
     }
 
     #[test]
@@ -220,7 +230,6 @@ mod tests {
         fs::create_dir_all(&folder_at_the_name).expect("a folder stands at the cache's name");
         assert_eq!(HashCache::load(&folder_at_the_name), None, "a cache that cannot be read");
 
-        let held = found("bin/a.dll", 3, 10);
         let line = format!(
             "{{\"files\":{{\"bin/a.dll\":{{\"size\":3,\"modified\":10,\"sha256\":\"{}\"}}}}}}",
             sha('a')
@@ -232,8 +241,8 @@ mod tests {
         drop(file);
         let loaded = HashCache::load(&path).expect("a cache of the limit's length loads");
         assert_eq!(
-            loaded.hit(&held),
-            Some(sha('a').as_str()),
+            loaded.held("bin/a.dll").map(|held| (held.stamp, held.sha256.as_str())),
+            Some((stamp(3, 10), sha('a').as_str())),
             "a cache of the limit's length, its padding blank"
         );
         let mut file = File::options().append(true).open(&path).expect("the cache can be opened");

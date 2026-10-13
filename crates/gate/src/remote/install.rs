@@ -12,7 +12,7 @@ use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read};
-use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime};
 
@@ -439,10 +439,7 @@ fn unchanged(root: &Path, entry: &Entry, manifest: &Manifest) -> Result<(), Stri
     let target = below(root, &entry.path);
     let now = match fs::metadata(&target) {
         Ok(metadata) if !metadata.is_file() => return Err(format!("{} is not a file", entry.path)),
-        Ok(metadata) => Some(Stamp {
-            size: metadata.file_size(),
-            modified: metadata.last_write_time(),
-        }),
+        Ok(metadata) => Some(Stamp::of(&metadata)),
         Err(error) if error.kind() == io::ErrorKind::NotFound => None,
         Err(error) => return Err(in_context(&target, &error).to_string()),
     };

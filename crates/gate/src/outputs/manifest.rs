@@ -7,8 +7,15 @@ use std::io;
 use serde_json::{Map, Value, json};
 
 use crate::boxside::payload::{escaped, ordinal_upper};
-use crate::outputs::hash::{SHA256_DIGITS, file_sha256, is_lower_hex};
+use crate::outputs::hash::{SHA256_DIGITS, is_lower_hex};
 use crate::outputs::walk::{Found, Stamp};
+
+#[cfg(test)]
+use crate::outputs::hash::sha256_of;
+#[cfg(test)]
+use crate::outputs::walk::in_context;
+#[cfg(test)]
+use std::fs::File;
 
 /// The most a manifest line may hold, its newline included: 64 MiB, what the box reads and the client sends at most.
 pub(crate) const MANIFEST_LIMIT: usize = 64 * 1024 * 1024;
@@ -31,25 +38,40 @@ pub(crate) struct Manifest {
 
 impl Manifest {
     /// The manifest of the files a walk `found`, each hashed as a stream; else why the first that cannot be read failed.
+    /// No production caller: the run's own manifest is built by [`build_with`], which stops at the cap, so this serves
+    /// tests only.
+    #[cfg(test)]
     pub(crate) fn build(found: &[Found]) -> io::Result<Manifest> {
-        Manifest::build_with(found, usize::MAX, |file| file_sha256(&file.full))
+        Manifest::build_with(found, usize::MAX, |file| {
+            let opened = File::open(&file.full).map_err(|error| in_context(&file.full, &error))?;
+            let metadata = opened.metadata().map_err(|error| in_context(&file.full, &error))?;
+            let sha256 = sha256_of(opened)
+                .map(|(sha256, _)| sha256)
+                .map_err(|error| in_context(&file.full, &error))?;
+            Ok((sha256, Stamp::of(&metadata)))
+        })
     }
 
-    /// The manifest of the files a walk `found`, each hashed by `hash`, as [`select`] takes it, so a caller can stop the
-    /// build between two reads of a file. Before a file is hashed, the bytes its entry adds to the manifest's line are
-    /// counted, the line's outer braces and newline left out: once they pass `limit`, the build fails as
-    /// [`io::ErrorKind::FileTooLarge`], no further file hashed. Else the error of the first hash that fails.
-    pub(crate) fn build_with(found: &[Found], limit: usize, mut hash: impl FnMut(&Found) -> io::Result<String>) -> io::Result<Manifest> {
+    /// The manifest of the files a walk `found`, each hashed by `hash` and stamped by the stamp it returns, as [`select`]
+    /// takes it, so a caller can stop the build between two reads of a file. Before a file is hashed, the bytes its entry
+    /// adds to the manifest's line are counted from the stamp the walk found it at, the line's outer braces and newline
+    /// left out: once they pass `limit`, the build fails as [`io::ErrorKind::FileTooLarge`], no further file hashed. The
+    /// count is then corrected to the entry actually written, whose stamp is the hash's own and can carry a digit the
+    /// walk's does not, so the next file is weighed against the entry the line will hold. Else the error of the first
+    /// hash that fails.
+    pub(crate) fn build_with(found: &[Found], limit: usize, mut hash: impl FnMut(&Found) -> io::Result<(String, Stamp)>) -> io::Result<Manifest> {
         let mut manifest = Manifest::default();
         let mut length = 0_usize;
         for file in found {
-            length = length.saturating_add(entry_length(file)?);
+            let listed = entry_length(&file.path, file.stamp)?;
+            length = length.saturating_add(listed);
             if length > limit {
                 let passed = format!("the outputs manifest passes {limit} bytes");
                 return Err(io::Error::new(io::ErrorKind::FileTooLarge, passed));
             }
-            let sha256 = hash(file)?;
-            manifest.insert(file.path.clone(), Held { stamp: file.stamp, sha256 });
+            let (sha256, stamp) = hash(file)?;
+            length = length.saturating_sub(listed).saturating_add(entry_length(&file.path, stamp)?);
+            manifest.insert(file.path.clone(), Held { stamp, sha256 });
         }
         Ok(manifest)
     }
@@ -100,12 +122,12 @@ impl Manifest {
 /// `:{"size":`, `,"modified":`, `,"sha256":"`, `"}` and the comma after it.
 const ENTRY_PUNCTUATION: usize = 35;
 
-/// The bytes the entry of `file` adds to the manifest's line: `"<path>":{"size":<n>,"modified":<n>,"sha256":"<hex>"},`,
-/// its path escaped as JSON escapes it.
-fn entry_length(file: &Found) -> io::Result<usize> {
-    let path = serde_json::to_string(&file.path).map_err(io::Error::other)?;
-    let digits = file.stamp.size.to_string().len() + file.stamp.modified.to_string().len();
-    Ok(path.len() + ENTRY_PUNCTUATION + SHA256_DIGITS + digits)
+/// The bytes the entry of the file at `path`, stamped `stamp`, adds to the manifest's line:
+/// `"<path>":{"size":<n>,"modified":<n>,"sha256":"<hex>"},`, its path escaped as JSON escapes it.
+fn entry_length(path: &str, stamp: Stamp) -> io::Result<usize> {
+    let quoted = serde_json::to_string(path).map_err(io::Error::other)?;
+    let digits = stamp.size.to_string().len() + stamp.modified.to_string().len();
+    Ok(quoted.len() + ENTRY_PUNCTUATION + SHA256_DIGITS + digits)
 }
 
 /// What the manifest's entry `file` for `path` holds; else why it is not a file.
@@ -320,7 +342,7 @@ mod tests {
             let mut hashed = Vec::new();
             let built = Manifest::build_with(&files, limit, |file| {
                 hashed.push(file.path.clone());
-                Ok(sha('a'))
+                Ok((sha('a'), file.stamp))
             });
             assert_eq!(hashed.len(), hashed_before, "limit {limit}");
             let refused = built.err().map(|error| error.kind());

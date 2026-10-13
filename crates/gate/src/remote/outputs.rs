@@ -10,7 +10,7 @@ use std::cell::Cell;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read};
 use std::num::NonZeroU64;
-use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -34,7 +34,7 @@ use crate::outputs::cache::{HashCache, file_time_now};
 use crate::outputs::glob::Globs;
 use crate::outputs::hash::sha256_of;
 use crate::outputs::manifest::{MANIFEST_LIMIT, Manifest};
-use crate::outputs::walk::{Found, in_context, walk};
+use crate::outputs::walk::{Found, Stamp, in_context, walk};
 
 /// Why a manifest line longer than [`MANIFEST_LIMIT`] is not sent.
 const PAST_THE_CAP: &str = "it is larger than the box takes (64 MiB)";
@@ -487,9 +487,11 @@ pub(super) fn removed(attempt: &mut Attempt<'_, '_>, archive: &Archive, which: &
 }
 
 /// The manifest line, newline included, of the files under `globs` in the worktree `root`, the manifest it holds, and
-/// the hash cache the next build may reuse. Each file whose stamp `cache` holds takes its hash from it; each other is
-/// hashed as a stream that asks `go_on` before each of its reads; either is refused when its final path is not inside
-/// `root`'s. The cache returned holds each file last written at least [`WINDOW`](crate::outputs::cache::WINDOW) before
+/// the hash cache the next build may reuse. `go_on` is asked before a file is opened, and again before each of its
+/// reads; the file is opened once and its stamp read from that handle (`GetFileInformationByHandle`), which the folder
+/// listing the walk read can lag behind. Each file whose path `cache` holds takes its hash from it when that stamp is
+/// the one the entry was kept at, and is hashed otherwise; either is refused when its final path is not inside `root`'s.
+/// The cache returned holds each file last written at least [`WINDOW`](crate::outputs::cache::WINDOW) before
 /// the walk began. A line longer than `cap` bytes is refused, its files' entries counted before each is hashed and the
 /// whole line checked at the end. [`Unbuilt::Interrupted`] once `go_on` says no; else why the globs, the walk or a file cannot be read, or why
 /// the line is not sent.
@@ -508,9 +510,9 @@ fn manifest_line(
     let stopped = Cell::new(false);
     let mut next = HashCache::default();
     let built = Manifest::build_with(&found, cap, |file| {
-        let sha256 = sha256_for(file, &inside, cache, &go_on, &stopped)?;
-        next.keep(file, &sha256, started);
-        Ok(sha256)
+        let (sha256, stamp) = sha256_for(file, &inside, cache, &go_on, &stopped)?;
+        next.keep(&file.path, stamp, &sha256, started);
+        Ok((sha256, stamp))
     });
     if stopped.get() {
         return Err(Unbuilt::Interrupted);
@@ -525,21 +527,25 @@ fn manifest_line(
     Ok((line, manifest, next))
 }
 
-/// The SHA-256 of the file a walk `found`. One whose stamp `cache` holds asks `go_on` as a read does, is opened as
-/// [`opened_inside`] checks it, and takes the cached hash when the opened file's handle reads the same stamp: the
-/// walk's comes from the folder listing, which can lag a file still being written. Else, and for every other file, as
-/// [`hashed`] reads it.
-fn sha256_for(file: &Found, inside: &Path, cache: &HashCache, go_on: &dyn Fn() -> bool, stopped: &Cell<bool>) -> io::Result<String> {
-    let Some(sha256) = cache.hit(file) else {
+/// The SHA-256 of the file a walk `found` and the stamp its handle reads, taken before the hash. `go_on` is asked first,
+/// as a read asks it, so an interrupt stops the file before it is opened. A file whose path the cache does not hold is
+/// then read by [`hashed`]; one it holds is opened as [`opened_inside`] checks it and takes the hash the cache holds at
+/// the stamp that handle reads: the walk's stamp comes from the folder listing, which can lag a file still being
+/// written, and only the handle's is what the install compares. On a mismatch the file is hashed through the handle
+/// already opened. The stamp is taken before the hash, never after: a write during the hash then leaves the file refused
+/// by the install as changed during the run, where a stamp read after would pair the old hash with the new stamp and let
+/// the install replace the write.
+fn sha256_for(file: &Found, inside: &Path, cache: &HashCache, go_on: &dyn Fn() -> bool, stopped: &Cell<bool>) -> io::Result<(String, Stamp)> {
+    asked(go_on, stopped)?;
+    let Some(held) = cache.held(&file.path) else {
         return hashed(&file.full, inside, go_on, stopped);
     };
-    asked(go_on, stopped)?;
     let opened = opened_inside(&file.full, inside)?;
-    let held = opened.metadata().map_err(|error| in_context(&file.full, &error))?;
-    if held.file_size() == file.stamp.size && held.last_write_time() == file.stamp.modified {
-        return Ok(sha256.to_owned());
+    let stamp = Stamp::of(&opened.metadata().map_err(|error| in_context(&file.full, &error))?);
+    if held.stamp == stamp {
+        return Ok((held.sha256.clone(), stamp));
     }
-    hashed(&file.full, inside, go_on, stopped)
+    Ok((read_sha256(&opened, &file.full, go_on, stopped)?, stamp))
 }
 
 /// Asks `go_on` whether to go on; once it says no, marks `stopped` and fails as the console interrupt.
@@ -563,10 +569,17 @@ fn opened_inside(path: &Path, inside: &Path) -> io::Result<File> {
     Ok(file)
 }
 
-/// The SHA-256 of the file at `path`, read through a [`Polled`] reader once [`opened_inside`] finds it inside
-/// `inside`. Else why it cannot be read or is refused, its path named.
-fn hashed(path: &Path, inside: &Path, go_on: &dyn Fn() -> bool, stopped: &Cell<bool>) -> io::Result<String> {
+/// The SHA-256 of the file at `path` and the stamp its handle reads, taken before the hash, opened once as
+/// [`opened_inside`] finds it inside `inside`. Else why it cannot be read or is refused, its path named.
+fn hashed(path: &Path, inside: &Path, go_on: &dyn Fn() -> bool, stopped: &Cell<bool>) -> io::Result<(String, Stamp)> {
     let file = opened_inside(path, inside)?;
+    let stamp = Stamp::of(&file.metadata().map_err(|error| in_context(path, &error))?);
+    Ok((read_sha256(&file, path, go_on, stopped)?, stamp))
+}
+
+/// The SHA-256 of an opened `file` at `path`, read through a [`Polled`] reader that asks `go_on` before each of its
+/// reads; else why its read failed, its path named.
+fn read_sha256(file: &File, path: &Path, go_on: &dyn Fn() -> bool, stopped: &Cell<bool>) -> io::Result<String> {
     let polled = Polled { inner: file, go_on, stopped };
     sha256_of(polled).map(|(sha256, _)| sha256).map_err(|error| in_context(path, &error))
 }
@@ -662,13 +675,13 @@ mod tests {
     use gate_router::DEFAULT_OUTPUTS;
 
     use super::{
-        Archive, Brought, MANIFEST_LIMIT, NonZeroU64, PARTIAL, Unbuilt, accepted, hashed, keep_outputs_line, manifest_line, pending, sha256_for,
-        within_cap,
+        Archive, Brought, MANIFEST_LIMIT, NonZeroU64, PARTIAL, PAST_THE_CAP, Unbuilt, accepted, hashed, keep_outputs_line, manifest_line, pending,
+        sha256_for, within_cap,
     };
     use crate::outputs::cache::{HashCache, file_time_now};
     use crate::outputs::glob::Globs;
     use crate::outputs::hash::file_sha256;
-    use crate::outputs::walk::{Found, walk};
+    use crate::outputs::walk::{Found, Stamp, walk};
 
     const KEY: &str = "app-1a2b3c4d";
     const NONCE: &str = "0123456789abcdef0123456789abcdef";
@@ -840,7 +853,8 @@ mod tests {
         fs::write(&file, "abc").expect("the file can be written");
         written_at(&file, SystemTime::now() - HOUR);
         let mut cache = HashCache::default();
-        cache.keep(&walked(&root)[0], &sentinel(), file_time_now());
+        let file = &walked(&root)[0];
+        cache.keep(&file.path, file.stamp, &sentinel(), file_time_now());
         (root, cache)
     }
 
@@ -866,22 +880,198 @@ mod tests {
         assert_eq!(asked, Err(Unbuilt::Interrupted), "a hit asks go_on");
     }
 
-    /// The walk's stamp comes from the folder listing, which can lag a file still being written: a hit whose stamp
-    /// differs from the one the opened file's handle reads is hashed.
+    /// The cache is keyed by the stamp the opened file's handle reads, which the walk's listing can lag behind: an entry
+    /// saved at the listing's stamp is a miss, and the file is hashed.
     #[test]
-    fn a_hit_whose_handle_stamp_differs_from_the_walks_is_hashed() {
+    fn an_entry_saved_at_the_listing_stamp_misses_when_the_handle_stamp_differs() {
         let (root, _) = cached_worktree("cache-handle-stamp");
         let mut listed = walked(&root).remove(0);
         listed.stamp.modified -= 10_000_000;
         let mut cache = HashCache::default();
-        cache.keep(&listed, &sentinel(), file_time_now());
-        assert_eq!(cache.hit(&listed), Some(sentinel().as_str()), "the cache holds the listed stamp");
+        cache.keep(&listed.path, listed.stamp, &sentinel(), file_time_now());
+        assert_eq!(
+            cache.held(&listed.path).map(|held| held.stamp),
+            Some(listed.stamp),
+            "the cache holds the listed stamp"
+        );
         let inside = fs::canonicalize(&root).expect("the worktree resolves");
 
         let taken = sha256_for(&listed, &inside, &cache, &|| true, &Cell::new(false));
 
         let abc = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
-        assert_eq!(taken.map_err(|error| error.to_string()), Ok(abc.to_owned()));
+        assert_eq!(
+            taken.map(|(sha256, _)| sha256).map_err(|error| error.to_string()),
+            Ok(abc.to_owned()),
+            "an entry at the listing's stamp is not the handle's"
+        );
+    }
+
+    /// A `go_on` that writes each of `writes` in turn over the file at `path`, setting its last write to `at` after
+    /// each, and says to go on; once every write has landed, later asks only say to go on. The build asks `go_on` before
+    /// it opens a file and again before each read of one, so which of the two a write lands between is the test's choice.
+    fn written_during<'a>(path: &'a Path, writes: &'static [&'static [u8]], at: SystemTime) -> impl Fn() -> bool + 'a {
+        let done = Cell::new(0_usize);
+        move || {
+            if let Some(bytes) = writes.get(done.get()) {
+                let mut file = File::options().write(true).open(path).expect("the file can be written during the run");
+                file.write_all(bytes).expect("the file can be written during the run");
+                file.set_modified(at).expect("the file's last write can be set");
+                done.set(done.get() + 1);
+            }
+            true
+        }
+    }
+
+    /// The stamp the file at `path` reads from its handle, as a cache lookup takes it.
+    fn read_stamp(path: &Path) -> Stamp {
+        let held = File::open(path)
+            .expect("the file opens")
+            .metadata()
+            .expect("the file's handle reads its stamp");
+        Stamp::of(&held)
+    }
+
+    /// A worktree holding `bin/a.dll` written `abc`, its last write `at`, and that file's path.
+    fn abc_worktree(name: &str, at: SystemTime) -> (PathBuf, PathBuf) {
+        let root = scratch(name);
+        fs::create_dir_all(root.join("bin")).expect("the folder can be made");
+        let file = root.join("bin").join("a.dll");
+        fs::write(&file, "abc").expect("the file can be written");
+        written_at(&file, at);
+        (root, file)
+    }
+
+    /// The manifest's stamp is the one the file's handle read at the open, not the walk's: the walk's comes from the
+    /// folder listing, which can lag a file still being written, while the install compares the manifest's stamp
+    /// against a handle read of its own. The file is written during the run, after the walk and before the open.
+    #[test]
+    fn a_miss_takes_its_manifest_stamp_from_the_handle() {
+        let at = SystemTime::now() - HOUR;
+        let (root, file) = abc_worktree("miss-handle-stamp", at);
+        let listed = walked(&root).remove(0);
+
+        let (_, files, _) = manifest_line(
+            &root,
+            &["**".to_owned()],
+            MANIFEST_LIMIT,
+            &HashCache::default(),
+            written_during(&file, &[b"abcd"], at),
+        )
+        .expect("the manifest is built");
+
+        assert_eq!(
+            files.get("bin/a.dll").map(|held| held.stamp),
+            Some(Stamp {
+                size: 4,
+                modified: listed.stamp.modified
+            }),
+            "the stamp the handle read of the written file, not the walk's of the one before it"
+        );
+    }
+
+    /// The cache is keyed by the stamp the file's handle reads, not the walk's: an entry saved at the handle's stamp
+    /// hits a file whose listing stamp is another, so the run takes the saved hash instead of reading the file.
+    #[test]
+    fn a_hit_is_keyed_by_the_handle_stamp_not_the_listing_one() {
+        let at = SystemTime::now() - HOUR;
+        let (root, file) = abc_worktree("hit-handle-key", at);
+        fs::write(&file, "abcd").expect("the file can be written");
+        written_at(&file, at);
+        let handled = walked(&root).remove(0).stamp;
+        fs::write(&file, "abc").expect("the file can be written back");
+        written_at(&file, at);
+        let path = scratch("hit-handle-key-cache").join("app-1a2b3c4d.outputs-hashes");
+        let entry = format!(
+            "{{\"files\":{{\"bin/a.dll\":{{\"size\":{},\"modified\":{},\"sha256\":\"{}\"}}}}}}\n",
+            handled.size,
+            handled.modified,
+            sentinel()
+        );
+        fs::write(&path, entry).expect("the cache can be written");
+        let cache = HashCache::load(&path).expect("the cache loads");
+
+        let (_, files, _) =
+            manifest_line(&root, &["**".to_owned()], MANIFEST_LIMIT, &cache, written_during(&file, &[b"abcd"], at)).expect("the manifest is built");
+
+        assert_eq!(files.get("bin/a.dll").map(|held| held.sha256.clone()), Some(sentinel()));
+    }
+
+    /// A file written while it is hashed keeps the stamp read before the hash, never one read after: the install then
+    /// refuses it as changed during the run rather than replacing the write. This build is asked to go on before it
+    /// opens the file and again before each read of it, and the file is written on each of the first two asks: `abcd`
+    /// before the open, so the handle reads the written file, and `abcde` between the stamp read and the hash. A stamp
+    /// read after the hash would be the last write's, letting the install replace the write.
+    #[test]
+    fn a_write_during_the_hash_leaves_the_stamp_read_before_it() {
+        let at = SystemTime::now() - HOUR;
+        let (root, file) = abc_worktree("write-during-hash", at);
+        let listed = walked(&root).remove(0);
+
+        let (_, files, _) = manifest_line(
+            &root,
+            &["**".to_owned()],
+            MANIFEST_LIMIT,
+            &HashCache::default(),
+            written_during(&file, &[b"abcd", b"abcde"], at),
+        )
+        .expect("the manifest is built");
+
+        assert_eq!(
+            files.get("bin/a.dll").map(|held| held.stamp),
+            Some(Stamp {
+                size: 4,
+                modified: listed.stamp.modified
+            }),
+            "the stamp the handle read before the hash, not the one the last write left after it"
+        );
+    }
+
+    /// The cap counts the entry the line will hold, not the walk's: a file written during the run whose handle stamp
+    /// carries a size digit the walk's does not pushes the count past the cap, so the file after it is never read. That
+    /// file is removed on the same ask, so a build that reaches it fails some other way than the cap.
+    #[test]
+    fn a_written_files_entry_is_counted_as_the_line_holds_it() {
+        let at = SystemTime::now() - HOUR;
+        let (one, one_file) = abc_worktree("cap-count-one", at);
+        let line = manifest_line(
+            &one,
+            &["**".to_owned()],
+            MANIFEST_LIMIT,
+            &HashCache::default(),
+            written_during(&one_file, &[b"0123456789"], at),
+        )
+        .map(|(line, _, _)| line)
+        .expect("the manifest is built");
+        // The bytes one entry of `bin/a.dll` counts, from the line of one file: that line is the entry without its last
+        // comma, plus `{"files":{}}` and a newline. Both files here are `abc` at the same instant, so the walk's own
+        // count of the two is that entry twice — one byte under what the count becomes once the write's ten bytes, with
+        // a size digit the walk's three does not have, are read.
+        let entry = line.len() - "{\"files\":{}}\n".len();
+        let cap = 2 * entry;
+
+        let (two, two_file) = abc_worktree("cap-count-two", at);
+        let later = two.join("bin").join("b.dll");
+        fs::write(&later, "abc").expect("the file can be written");
+        written_at(&later, at);
+        let done = Cell::new(false);
+        let during = || {
+            if !done.replace(true) {
+                let mut file = File::options()
+                    .write(true)
+                    .open(&two_file)
+                    .expect("the file can be written during the run");
+                file.write_all(b"0123456789").expect("the file can be written during the run");
+                file.set_modified(at).expect("the file's last write can be set");
+                fs::remove_file(&later).expect("the file after it can be removed");
+            }
+            true
+        };
+
+        assert_eq!(
+            manifest_line(&two, &["**".to_owned()], cap, &HashCache::default(), during),
+            Err(Unbuilt::Failed(PAST_THE_CAP.to_owned())),
+            "the count of the entry the line holds stops the build before the file after it"
+        );
     }
 
     #[test]
@@ -918,8 +1108,12 @@ mod tests {
         let abc = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
         let found = walked(&root);
         let (ahead, settled) = (&found[0], &found[1]);
-        assert_eq!(next.hit(settled), Some(abc), "a file written an hour before the build");
-        assert_eq!(next.hit(ahead), None, "a file written after the build began");
+        assert_eq!(
+            next.held(&settled.path).map(|held| held.sha256.as_str()),
+            Some(abc),
+            "a file written an hour before the build"
+        );
+        assert_eq!(next.held(&ahead.path), None, "a file written after the build began");
         assert!(files.get("bin/ahead.dll").is_some(), "the manifest holds every file");
     }
 
@@ -940,8 +1134,12 @@ mod tests {
             stamp: walked(&elsewhere)[0].stamp,
         };
         let mut cache = HashCache::default();
-        cache.keep(&through, &sentinel(), file_time_now());
-        assert_eq!(cache.hit(&through), Some(sentinel().as_str()), "the cache holds the file");
+        cache.keep(&through.path, through.stamp, &sentinel(), file_time_now());
+        assert_eq!(
+            cache.held(&through.path).map(|held| held.sha256.as_str()),
+            Some(sentinel().as_str()),
+            "the cache holds the file"
+        );
         let inside = fs::canonicalize(&root).expect("the worktree resolves");
 
         let taken = sha256_for(&through, &inside, &cache, &|| true, &Cell::new(false));
@@ -1108,7 +1306,10 @@ mod tests {
         let cache = HashCache::load(&path).expect("the saved cache loads");
         manifest_line(&root, &globs, usize::MAX, &cache, || true).expect("the measured tree can be hashed again");
         let warm_seconds = started.elapsed().as_secs_f64();
-        let cached = found.iter().filter(|file| cache.hit(file).is_some()).count();
+        let cached = found
+            .iter()
+            .filter(|file| cache.held(&file.path).is_some_and(|held| held.stamp == read_stamp(&file.full)))
+            .count();
 
         let mib = bytes as f64 / (1024.0 * 1024.0);
         println!(
