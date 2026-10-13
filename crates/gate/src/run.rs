@@ -6,7 +6,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashSet;
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsString;
 use std::fs::OpenOptions;
 use std::os::windows::ffi::OsStrExt;
 use std::panic::{self, AssertUnwindSafe};
@@ -22,8 +22,7 @@ use gate_router::{
 use gate_state::{Estimate, FallbackReason, JournalEvent, KernelObject, RebuildOwner, RemoteTag, RunFacts, StateRoot, Verdict, log_hash, v1};
 use gate_watchdog::{Cores, Hint, SlotKind, hint};
 use gate_win32::{
-    AcquireError, Interrupt, Job, Launch, LaunchError, LaunchOutput, NamedMutex, OpenedJob, OwnedMutexGuard, PriorityClass, Running,
-    StoppableProcess, same_variable_name,
+    AcquireError, Interrupt, Job, Launch, LaunchError, LaunchOutput, NamedMutex, OpenedJob, OwnedMutexGuard, PriorityClass, Running, StoppableProcess,
 };
 use jiff::Timestamp;
 use proc_table::{ProcessTree, Win32ProcessTable};
@@ -2101,44 +2100,50 @@ struct EndPass {
 }
 
 /// Runs `pass` over the run's job, ending what it finds (`pass(true)`), until a pass finds nothing left to end, at most
-/// [`END_PASSES`] times; one more pass then only counts (`pass(false)`). What to say: why a pass could not run, how many
-/// processes the passes left with the first process one could not open, judge or end after it, or that first process
-/// alone; `None` when all went.
+/// [`END_PASSES`] times; one more pass then only counts (`pass(false)`). What to say: why a pass could not run; when
+/// the passes left processes, how many, with the first problem of the last pass that ended processes or, after it, of
+/// the counting pass, so a terminate refused up to the cap is said; else the first problem of the pass that found
+/// nothing left, or `None` when it met none. A problem of an earlier pass is not said once a pass finds nothing left,
+/// since the process it was about had gone by then, or was met again.
 fn in_passes(mut pass: impl FnMut(bool) -> Result<EndPass, String>) -> Option<String> {
-    let mut problems = Vec::new();
-    for round in 0..=END_PASSES {
-        let ending = round < END_PASSES;
-        let found = match pass(ending) {
+    let mut ending_problems = Vec::new();
+    for _ in 0..END_PASSES {
+        let found = match pass(true) {
             Ok(found) => found,
             Err(problem) => return Some(problem),
         };
-        problems.extend(found.problems);
         if found.left == 0 {
-            break;
+            return found.problems.into_iter().next();
         }
-        if !ending {
-            let count = format!("{} of its processes still ran after {END_PASSES} passes", found.left);
-            return Some(match problems.first() {
-                Some(first) => format!("{count}; first: {first}"),
-                None => count,
-            });
-        }
+        ending_problems = found.problems;
     }
-    problems.into_iter().next()
+    let counted = match pass(false) {
+        Ok(counted) => counted,
+        Err(problem) => return Some(problem),
+    };
+    if counted.left == 0 {
+        return counted.problems.into_iter().next();
+    }
+    let count = format!("{} of its processes still ran after {END_PASSES} passes", counted.left);
+    Some(match ending_problems.into_iter().chain(counted.problems).next() {
+        Some(first) => format!("{count}; first: {first}"),
+        None => count,
+    })
 }
 
-/// One pass of the run's end over `job`, ending what it finds when `ending`: the job's processes are listed after the
-/// time is noted, the gates among them spared with what runs under them and the console hosts ([`spared_gates`]), and
-/// the processes of `keep`, and every other one ended that its own handle shows in the job still ([`opened_members`])
-/// and started before the listing ([`by_start`]), so a pid freed and taken since by a new process, a spared gate's
-/// command's child included, is passed over, and left to the next pass to look at again. The processes ended are given
-/// [`TERMINATE_CHECK`] together to leave the job before the next pass lists it ([`end_and_wait`]).
+/// One pass of the run's end over `job`, ending what it finds when `ending`: the job's processes are listed, then the
+/// machine's in a snapshot, the gates among them spared with what runs under them and the console hosts
+/// ([`spared_gates`]), and the processes of `keep`, and every other one ended that its own handle shows in the job still
+/// ([`opened_members`]) and with the start and the parent the snapshot lists for its pid ([`by_start`]), so a pid freed
+/// and taken by a new process since the snapshot, a spared gate's command's child included, is passed over, and left to
+/// the next pass
+/// to look at again. The processes ended are given [`TERMINATE_CHECK`] together to leave the job before the next pass
+/// lists it ([`end_and_wait`]).
 ///
 /// # Errors
 ///
-/// The time, the job's processes or the process snapshot cannot be read: nothing is ended.
+/// The job's processes or the process snapshot cannot be read: nothing is ended.
 fn end_pass(job: &Job, root: &StateRoot, keep: &[u32], ending: bool) -> Result<EndPass, String> {
-    let listed_at = escaped::now().ok_or_else(|| escaped::NO_CLOCK.to_owned())?;
     let members = job.process_ids().map_err(|error| failure("QueryInformationJobObject", &error))?;
     let mut problems = Vec::new();
     if members.is_empty() {
@@ -2148,7 +2153,7 @@ fn end_pass(job: &Job, root: &StateRoot, keep: &[u32], ending: bool) -> Result<E
     let mut spared = spared_gates(&members, &tree, |gate| gate_job(root, gate), &mut problems)?;
     spared.extend(keep);
     let opened = opened_members(job, members.into_iter().filter(|pid| !spared.contains(pid)), &mut problems);
-    let found = by_start(started(opened, &mut problems), listed_at);
+    let found = by_start(started(opened, &mut problems), &tree);
     let left = found.left();
     if ending {
         end_and_wait(&found.ended, &mut problems);
@@ -2170,20 +2175,35 @@ fn opened_members(job: &Job, members: impl Iterator<Item = u32>, problems: &mut 
     opened
 }
 
-/// Each of `opened` with its start; one whose start cannot be read is left out, the failure added to `problems`.
-fn started(opened: Vec<(u32, StoppableProcess)>, problems: &mut Vec<String>) -> Vec<((u32, StoppableProcess), Timestamp)> {
+/// A member's start and the id of the process that started it, as its own handle reads them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Origin {
+    start: Timestamp,
+    parent: u32,
+}
+
+/// Each of `opened` with its [`Origin`]; one whose start or parent cannot be read is left out, the failure added to
+/// `problems`.
+fn started(opened: Vec<(u32, StoppableProcess)>, problems: &mut Vec<String>) -> Vec<((u32, StoppableProcess), Origin)> {
     let mut started = Vec::new();
     for (pid, process) in opened {
-        match process.created() {
-            Ok(created) => started.push(((pid, process), created)),
-            Err(error) => problems.push(failure(&format!("GetProcessTimes({pid})"), &error)),
+        let start = match process.created() {
+            Ok(start) => start,
+            Err(error) => {
+                problems.push(failure(&format!("GetProcessTimes({pid})"), &error));
+                continue;
+            }
+        };
+        match process.parent_pid() {
+            Ok(parent) => started.push(((pid, process), Origin { start, parent })),
+            Err(error) => problems.push(failure(&format!("reading the parent of {pid}"), &error)),
         }
     }
     started
 }
 
-/// What a pass found among the members it opened: those it ends, and how many it passed over as started after the
-/// job was listed.
+/// What a pass found among the members it opened: those it ends, and how many it passed over as not the process the
+/// snapshot listed under their pid.
 struct ByStart<T> {
     ended: Vec<T>,
     passed_over: usize,
@@ -2191,17 +2211,27 @@ struct ByStart<T> {
 
 impl<T> ByStart<T> {
     /// How many members the pass leaves for the next one to look at: those it ends, which may not have left the job by
-    /// then, and those it passed over, which the next listing sees as started before it.
+    /// then, and those it passed over, which the next pass's snapshot lists.
     fn left(&self) -> usize {
         self.ended.len() + self.passed_over
     }
 }
 
-/// The members of `started`, each with its start, that a pass ends: every one started at or before the job was listed
-/// at `listed_at`; the others are passed over and counted, since a process that started since took the pid of one that
-/// ended.
-fn by_start<T>(started: Vec<(T, Timestamp)>, listed_at: Timestamp) -> ByStart<T> {
-    let (ended, passed_over): (Vec<_>, Vec<_>) = started.into_iter().partition(|(_, created)| *created <= listed_at);
+/// The members of `started`, each a pid with its [`Origin`] as its own handle reads it, that a pass ends: every one the
+/// snapshot `tree` lists under its pid with that same start and parent, as [`crate::stopping::judged`] compares them.
+/// The others are passed over and counted: a pid the snapshot lacks, or lists with another start or parent, has been
+/// taken by a process that started since the snapshot, or since the snapshot read the name and parent of the one
+/// before it there, and one whose start the snapshot could not read cannot be judged.
+fn by_start<T>(started: Vec<((u32, T), Origin)>, tree: &ProcessTree) -> ByStart<(u32, T)> {
+    let listed = |pid: u32| {
+        tree.get(pid).and_then(|process| {
+            Some(Origin {
+                start: process.created?,
+                parent: process.parent_pid,
+            })
+        })
+    };
+    let (ended, passed_over): (Vec<_>, Vec<_>) = started.into_iter().partition(|((pid, _), origin)| listed(*pid) == Some(*origin));
     ByStart {
         ended: ended.into_iter().map(|(member, _)| member).collect(),
         passed_over: passed_over.len(),
@@ -2246,15 +2276,32 @@ impl Endable for StoppableProcess {
     }
 }
 
-/// The processes in the job of the gate `gate` under `root`, those in the jobs nested inside it included; `None` when
-/// no job has its name, as for a gate whose command has not started.
+/// The processes in the job of the gate `gate`, those in the jobs nested inside it included, looked for under `root`,
+/// then under the default root ([`job_under_roots`]); `None` when no job has its name, as for a gate whose command has
+/// not started.
 fn gate_job(root: &StateRoot, gate: u32) -> io::Result<Option<Vec<u32>>> {
-    let name = root.object_name(KernelObject::Job { gate_pid: gate });
-    OpenedJob::open_to_list(&name).and_then(|opened| opened.map(|opened| opened.process_ids()).transpose())
+    job_under_roots(root, gate, |name| {
+        OpenedJob::open_to_list(name).and_then(|opened| opened.map(|opened| opened.process_ids()).transpose())
+    })
+}
+
+/// What `list` gives for the name of the job of the gate `gate` under `root`, or, when no job has that name and `root`
+/// is not the default root, for its name under the default root, where a gate given no `--state-dir` or
+/// `GATE_STATE_DIR` names its job. A failure under `root` is returned as it is, and the default root is not looked at.
+fn job_under_roots(root: &StateRoot, gate: u32, list: impl Fn(&str) -> io::Result<Option<Vec<u32>>>) -> io::Result<Option<Vec<u32>>> {
+    let job = KernelObject::Job { gate_pid: gate };
+    let own = list(&root.object_name(job))?;
+    if own.is_some() || root.is_default() {
+        return Ok(own);
+    }
+    // A root judged against itself is the default root, whose object names no root path enters.
+    let default = StateRoot::new(root.normalized(), Some(root.normalized()));
+    list(&default.object_name(job))
 }
 
 /// The processes among `members` that a run's end leaves running: each one the snapshot `tree` names as a gate, the
-/// processes under it, and those in its job, as `gate_job` lists them; and each one it names as a console host
+/// processes above it in the job up to the first that is not a member, which launched it and wait on it, the processes
+/// under it, and those in its job, as `gate_job` lists them; and each one it names as a console host
 /// ([`is_console_host`]), which ends by itself with its console's last client, and whose end would take the console
 /// from a spared gate still on it. A gate whose job cannot be listed is spared with what the snapshot shows under it,
 /// and the failure added to `problems`.
@@ -2277,6 +2324,8 @@ fn spared_gates(
     let gates = members.iter().filter(|&&pid| image(pid).is_some_and(escaped::is_gate));
     for &gate in gates {
         spared.insert(gate);
+        let launchers = tree.ancestors(gate).take_while(|process| members.contains(&process.pid));
+        spared.extend(launchers.map(|process| process.pid));
         spared.extend(children.descendants(gate).iter().map(|process| process.pid));
         match gate_job(gate) {
             Ok(inside) => spared.extend(inside.into_iter().flatten()),
@@ -2286,9 +2335,9 @@ fn spared_gates(
     Ok(spared)
 }
 
-/// Whether `image` is a console host's, `conhost.exe`, its name compared as Windows compares names.
+/// Whether `image` is a console host's, `conhost.exe`, compared as a gate's image is ([`escaped::is_image`]).
 fn is_console_host(image: &str) -> bool {
-    same_variable_name(OsStr::new(image), OsStr::new(CONSOLE_HOST_IMAGE))
+    escaped::is_image(image, CONSOLE_HOST_IMAGE)
 }
 
 /// The process `pid`, opened to be ended, when its own handle shows it in `job`; `None` when no process has that pid
@@ -2943,7 +2992,9 @@ mod end_tests {
     use jiff::Timestamp;
     use proc_table::{ProcessInfo, ProcessTree};
 
-    use super::{END_PASSES, EndPass, Endable, by_start, end_and_wait, in_passes, spared_gates};
+    use gate_state::{KernelObject, StateRoot};
+
+    use super::{END_PASSES, EndPass, Endable, Origin, by_start, end_and_wait, in_passes, job_under_roots, spared_gates};
     use crate::escaped::EMPTY_SNAPSHOT;
 
     /// `ERROR_ACCESS_DENIED`, as a refused terminate reports it.
@@ -3030,6 +3081,71 @@ mod end_tests {
     }
 
     #[test]
+    fn a_gate_s_launcher_in_the_job_is_spared_with_it() {
+        let tree = ProcessTree::new(vec![
+            listed(1, 0, "fake-tool.exe"),
+            listed(2, 1, "cmd.exe"),
+            listed(3, 2, "gate.exe"),
+            listed(4, 1, "fake-tool.exe"),
+        ]);
+        let mut problems = Vec::new();
+
+        let spared = spared_gates(&[2, 3, 4], &tree, |_| Ok(None), &mut problems);
+
+        assert_eq!(
+            spared,
+            Ok(HashSet::from([2, 3])),
+            "the gate and its launcher in the job; not the command outside the job above them, nor the sibling leftover"
+        );
+        assert!(problems.is_empty(), "{problems:?}");
+    }
+
+    /// What [`job_under_roots`] finds for the gate 7 under `root` among `jobs`, each a job name with the processes in
+    /// it, or `None` for a name another object holds, which fails to open; and the names it looked up, in order.
+    fn looked_up(root: &StateRoot, jobs: &[(&str, Option<Vec<u32>>)]) -> (Result<Option<Vec<u32>>, String>, Vec<String>) {
+        let looked = RefCell::new(Vec::new());
+        let found = job_under_roots(root, 7, |name| {
+            looked.borrow_mut().push(name.to_owned());
+            match jobs.iter().find(|(held, _)| *held == name) {
+                None => Ok(None),
+                Some((_, Some(inside))) => Ok(Some(inside.clone())),
+                Some((_, None)) => Err(io::Error::other("the name is held by another object")),
+            }
+        });
+        (found.map_err(|error| error.to_string()), looked.into_inner())
+    }
+
+    #[test]
+    fn a_spared_gate_s_job_is_found_under_the_default_root() {
+        let default_path = r"C:\Users\me\AppData\Local\gate\v1";
+        let custom = StateRoot::new(r"D:\state", Some(default_path));
+        let default = StateRoot::new(default_path, Some(default_path));
+        let own = custom.object_name(KernelObject::Job { gate_pid: 7 });
+        let under_default = r"Local\gate-job-7";
+
+        assert_eq!(
+            looked_up(&custom, &[(under_default, Some(vec![8]))]),
+            (Ok(Some(vec![8])), vec![own.clone(), under_default.to_owned()]),
+            "a nested gate under the default root has its job found"
+        );
+        assert_eq!(
+            looked_up(&default, &[]),
+            (Ok(None), vec![under_default.to_owned()]),
+            "an ender under the default root looks once"
+        );
+        assert_eq!(
+            looked_up(&custom, &[(&own, Some(vec![9])), (under_default, Some(vec![8]))]),
+            (Ok(Some(vec![9])), vec![own.clone()]),
+            "a job found under the ender's root is not looked for again"
+        );
+        assert_eq!(
+            looked_up(&custom, &[(&own, None)]),
+            (Err("the name is held by another object".to_owned()), vec![own.clone()]),
+            "a failure under the ender's root is said, and the default root is not looked at"
+        );
+    }
+
+    #[test]
     fn a_console_host_in_the_job_is_never_ended() {
         let tree = ProcessTree::new(vec![
             listed(1, 0, "fake-tool.exe"),
@@ -3050,6 +3166,25 @@ mod end_tests {
         assert!(
             problems.is_empty(),
             "a console host is no gate, so no job of its own is looked for: {problems:?}"
+        );
+    }
+
+    #[test]
+    fn a_console_host_name_is_compared_ascii_case_insensitively() {
+        let tree = ProcessTree::new(vec![
+            listed(1, 0, "fake-tool.exe"),
+            listed(2, 1, "CONHOST.EXE"),
+            listed(3, 1, "conho\u{17F}t.exe"),
+            listed(4, 1, "GATE.EXE"),
+        ]);
+        let mut problems = Vec::new();
+
+        let spared = spared_gates(&[2, 3, 4], &tree, |_| Ok(None), &mut problems);
+
+        assert_eq!(
+            spared,
+            Ok(HashSet::from([2, 4])),
+            "the console host and the gate in ASCII capitals; not a long s standing in for an s"
         );
     }
 
@@ -3079,24 +3214,64 @@ mod end_tests {
         );
     }
 
+    /// The member `pid` whose own handle reads its start as second `second` and its parent as `parent`.
+    fn member(pid: u32, second: i64, parent: u32) -> ((u32, ()), Origin) {
+        ((pid, ()), Origin { start: at(second), parent })
+    }
+
     #[test]
-    fn a_member_that_started_after_the_listing_is_passed_over() {
-        let starts = vec![(2, at(10)), (3, at(20)), (4, at(21))];
+    fn a_member_the_listing_lacks_is_passed_over() {
+        let tree = ProcessTree::new(vec![listed(2, 0, "fake-tool.exe"), listed(3, 0, "fake-tool.exe")]);
+        let starts = vec![member(2, 2, 0), member(3, 3, 0), member(4, 21, 0)];
 
-        let found = by_start(starts, at(20));
+        let found = by_start(starts, &tree);
 
-        assert_eq!(found.ended, [2, 3], "a pid taken since the listing is left running");
+        assert_eq!(found.ended, [(2, ()), (3, ())], "a pid the snapshot does not list is left running");
+        assert_eq!(found.passed_over, 1);
+    }
+
+    #[test]
+    fn a_member_whose_start_differs_from_the_listing_is_passed_over() {
+        let mut unread = listed(4, 0, "fake-tool.exe");
+        unread.created = None;
+        let tree = ProcessTree::new(vec![listed(2, 0, "fake-tool.exe"), listed(3, 0, "fake-tool.exe"), unread]);
+        let starts = vec![member(2, 2, 0), member(3, 20, 0), member(4, 4, 0)];
+
+        let found = by_start(starts, &tree);
+
+        assert_eq!(
+            found.ended,
+            [(2, ())],
+            "a pid taken in the snapshot's tick by a process with another start is left running, as is one whose listed \
+             start is unknown"
+        );
+        assert_eq!(found.passed_over, 2);
+    }
+
+    #[test]
+    fn a_member_whose_parent_differs_from_the_listing_is_passed_over() {
+        let tree = ProcessTree::new(vec![listed(2, 1, "fake-tool.exe"), listed(3, 1, "fake-tool.exe")]);
+        let starts = vec![member(2, 2, 1), member(3, 3, 9)];
+
+        let found = by_start(starts, &tree);
+
+        assert_eq!(
+            found.ended,
+            [(2, ())],
+            "a pid taken by a process with the listed start but another parent is left running"
+        );
         assert_eq!(found.passed_over, 1);
     }
 
     #[test]
     fn a_pass_that_passes_over_a_new_member_is_followed_by_another() {
         let calls = RefCell::new(Vec::new());
-        let mut listings = [vec![(4, at(21))], vec![]].into_iter();
+        let tree = ProcessTree::new(vec![listed(2, 0, "fake-tool.exe")]);
+        let mut listings = [vec![member(4, 21, 0)], vec![]].into_iter();
 
         let said = in_passes(|ending| {
             calls.borrow_mut().push(ending);
-            let found = by_start(listings.next().expect("no more passes than planned"), at(20));
+            let found = by_start(listings.next().expect("no more passes than planned"), &tree);
             pass(found.left(), &[])
         });
 
@@ -3152,10 +3327,45 @@ mod end_tests {
     #[test]
     fn a_pass_that_cannot_run_or_end_a_process_is_said_once() {
         let failed = in_passes(|_| Err::<EndPass, _>("the snapshot failed".to_owned()));
-        let mut left = [1, 0].into_iter();
-        let refused = in_passes(|_| pass(left.next().expect("two passes"), &["TerminateProcess(7) failed"]));
+        let mut passes = [pass(1, &[]), pass(0, &["OpenProcess(7) failed", "OpenProcess(8) failed"])].into_iter();
+        let unopened = in_passes(|_| passes.next().expect("two passes"));
 
         assert_eq!(failed, Some("the snapshot failed".to_owned()));
-        assert_eq!(refused, Some("TerminateProcess(7) failed".to_owned()), "the first problem, once");
+        assert_eq!(unopened, Some("OpenProcess(7) failed".to_owned()), "the first problem, once");
+    }
+
+    #[test]
+    fn a_refused_terminate_that_lasts_to_the_cap_is_said_with_the_count() {
+        let refusing = |ending: bool| {
+            let refused: &[&str] = if ending { &["TerminateProcess(7) failed"] } else { &[] };
+            pass(1, refused)
+        };
+        let mut left = [1; END_PASSES].into_iter().chain([0]);
+
+        let lasting = in_passes(refusing);
+        let gone_by_the_count = in_passes(|ending| {
+            refusing(ending).map(|found| EndPass {
+                left: left.next().expect("no more passes than planned"),
+                ..found
+            })
+        });
+
+        assert_eq!(
+            lasting,
+            Some(format!(
+                "1 of its processes still ran after {END_PASSES} passes; first: TerminateProcess(7) failed"
+            )),
+            "the last ending pass's refusal, which only an ending pass can meet, is said with the count"
+        );
+        assert_eq!(gone_by_the_count, None, "a refused process gone by the counting pass is not said");
+    }
+
+    #[test]
+    fn a_problem_of_an_earlier_pass_is_not_said_when_the_last_pass_found_none() {
+        let mut passes = [pass(1, &["OpenProcess(7) failed"]), pass(0, &[])].into_iter();
+
+        let said = in_passes(|_| passes.next().expect("two passes"));
+
+        assert_eq!(said, None, "the process the first pass could not open had gone by the last");
     }
 }

@@ -10,8 +10,8 @@ use gate_state::{KernelObject, StateRoot};
 use gate_win32::{NamedEvent, StoppableProcess};
 
 use crate::support::{
-    Case, Escapee, FAKE_TOOL, Go, assert_in_order, copy_tool, events, finish, run_words, said_pid, shown, start, wait_for_journal_line, wait_until,
-    wait_until_closed, write_counts,
+    Case, Escapee, FAKE_TOOL, GATE, Go, assert_in_order, copy_tool, events, finish, none_words, run_words, said_pid, shown, start, wait_for_file,
+    wait_for_journal_line, wait_until, wait_until_closed, write_counts,
 };
 
 /// The exit code a process the gate ends at its run's end is given.
@@ -503,8 +503,8 @@ fn job_name(case: &Case, gate: u32) -> String {
 /// have, is said on a `cannot end` line, on stderr and in the log, where this case reads it before the verdict line. The
 /// gate is fake-tool copied as `gate.exe`, since the run's end judges a gate by its image name.
 #[test]
-fn a_leftover_s_last_output_is_in_the_log_before_the_verdict() {
-    let case = Case::new("a_leftover_s_last_output_is_in_the_log_before_the_verdict");
+fn a_spared_gate_whose_job_cannot_be_listed_is_said_before_the_verdict() {
+    let case = Case::new("a_spared_gate_whose_job_cannot_be_listed_is_said_before_the_verdict");
     copy_tool(&case, "gate.exe");
     let gate = shown(&case.folder().join("gate.exe"));
     let (go, release) = (Go(case.folder().join("go")), case.folder().join("release"));
@@ -531,6 +531,87 @@ fn a_leftover_s_last_output_is_in_the_log_before_the_verdict() {
     assert!(outcome.stderr.contains(&cannot), "{outcome:?}");
     assert_in_order(&log_text(&case), &[&cannot, "gate: passed in "]);
     assert_eq!(ended, Some(0), "the spared gate was left running, then ended on its go file: {outcome:?}");
+}
+
+/// The verdict's scan of the log sees what a leftover wrote there before its command exited: a leftover's `error CS1`
+/// line fails a command that exits 0, and the run's end still ends the leftover. The line is written before the command
+/// exits, so this shows the scan reads a leftover's output, not the order of the run's end and the scan.
+#[test]
+fn a_leftover_s_failure_output_fails_a_passing_command() {
+    let case = Case::new("a_leftover_s_failure_output_fails_a_passing_command");
+    let (go, release) = (Go(case.folder().join("go")), case.folder().join("release"));
+    let (go_text, release_text, pid_text) = (shown(go.path()), shown(&release), shown(&case.folder().join("pid")));
+    let command = [
+        FAKE_TOOL,
+        "spawn-pid",
+        &pid_text,
+        &release_text,
+        FAKE_TOOL,
+        "out",
+        "error CS1",
+        "wait",
+        &go_text,
+    ];
+    let running = case.start(&run_words("out.log", &[], &command));
+    wait_until("the leftover's pid and its failure line in the log", || {
+        fs::read_to_string(log_path(&case)).is_ok_and(|text| text.contains("spawned ") && text.contains("error CS1"))
+    });
+    let pid = said_pid(&log_text(&case), "spawned ");
+    let leftover = StoppableProcess::open(pid)
+        .expect("the leftover is looked for")
+        .expect("it runs: it waits for a go file no one has written");
+
+    fs::write(&release, "").expect("the release file can be written");
+    let outcome = running.finish();
+    // The leftover is let go before any assertion, so a failing case leaves no helper waiting.
+    drop(go);
+    let ended = Escapee::exit_code_once_ended(&leftover);
+
+    assert_eq!(outcome.code, Some(1), "the leftover's failure line fails the run: {outcome:?}");
+    assert!(
+        outcome.stderr.contains("gate: command exited 0 but its log reports a failure"),
+        "{outcome:?}"
+    );
+    assert_eq!(ended, Some(STOPPED), "the run's end ended the leftover: {outcome:?}");
+}
+
+/// A real gate the command starts through `cmd /c` is spared at the run's end with its launcher, the processes above
+/// it in the run's job: the launcher is left to end when the nested gate does, with its status, rather than ended
+/// with the run's end's own.
+#[test]
+fn a_nested_gate_s_launcher_is_not_ended_by_the_run_end() {
+    let case = Case::new("a_nested_gate_s_launcher_is_not_ended_by_the_run_end");
+    let (started, go) = (case.folder().join("started"), Go(case.folder().join("go")));
+    let (release, pid_file) = (case.folder().join("release"), case.folder().join("launcher.pid"));
+    let texts = [&started, go.path(), &release, &pid_file].map(shown);
+    let mut command = vec![FAKE_TOOL, "spawn-pid", &texts[3], &texts[2], "cmd.exe", "/c", GATE];
+    command.extend(none_words("inner.log", &[], &[FAKE_TOOL, "mark", &texts[0], "wait", &texts[1]]));
+    let running = case.start(&run_words("out.log", &[], &command));
+    wait_for_file(&started);
+    let pid: u32 = fs::read_to_string(&pid_file)
+        .expect("the launcher's pid is written before the nested gate starts")
+        .trim()
+        .parse()
+        .expect("the pid file holds a pid");
+    let launcher = StoppableProcess::open(pid)
+        .expect("the launcher is looked for")
+        .expect("it runs: its nested gate's command waits for a go file no one has written");
+
+    fs::write(&release, "").expect("the release file can be written");
+    let outcome = running.finish();
+    // The nested gate is let go, and seen to close its log as it ends, before any assertion, so a failing case leaves no
+    // helper waiting.
+    drop(go);
+    let ended = Escapee::exit_code_once_ended(&launcher);
+    wait_until_closed(&case.folder().join("inner.log"));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(!outcome.stderr.contains("cannot end the run's job"), "{outcome:?}");
+    assert_eq!(
+        ended,
+        Some(0),
+        "the launcher was left running, then ended with its nested gate's status: {outcome:?}"
+    );
 }
 
 #[test]

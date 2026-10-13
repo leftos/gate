@@ -773,9 +773,15 @@ pub(crate) fn spared(process: &ProcessInfo, server_image: Option<&str>, read: im
     server || unread
 }
 
-/// Whether `image` is a gate's.
+/// Whether `image` is a gate's ([`is_image`]).
 pub(crate) fn is_gate(image: &str) -> bool {
-    image.eq_ignore_ascii_case(GATE_IMAGE)
+    is_image(image, GATE_IMAGE)
+}
+
+/// Whether the image name `image` is `wanted`, compared ASCII case-insensitively: the comparison of a gate's image
+/// ([`is_gate`]) and of a console host's at a run's end, which spares both.
+pub(crate) fn is_image(image: &str, wanted: &str) -> bool {
+    image.eq_ignore_ascii_case(wanted)
 }
 
 /// The kill's line: the job's `processes` process(es) it terminated, and those of `ended` outside the job, up to
