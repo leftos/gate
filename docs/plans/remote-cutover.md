@@ -85,9 +85,16 @@ The plan for `feat/remote-cutover`: the Rust remote client replaces the remote.p
 3. Rehearse: `gate remote-cutover --state-dir {scratch root}` with no routed work running; it asks every builder through `inflight` and says `done`. Rollback: delete the scratch root.
 4. Verified routed run through the scratch flag: `gate run --state-dir {scratch root} … -- dotnet build` on a solution in a repo `remote.json` lists; check no fallback, a remote take/release in the scratch journal, the sync-back applied, outputs installed, no nothing-back record. Once, a long routed command with Ctrl+C: the stop line appears once. Rollback: delete the scratch root.
 5. Drain and flip: `gate remote-cutover` on the default root until `done`. Rollback at any point: delete the flag and `.draining` in the state root.
-6. Confirm on the next ordinary routed runs: no `client` or `version` fallbacks, no nothing-back record after a build that brought its outputs back.
-7. Watch one working session: fallback reasons, busy counts, stop lines.
-8. After R9 merges to main: install from main and push; `remote-bridge.ps1` is gone from the install. Rollback: reinstall the part-1 commit (the flag still selects the Rust client; deleting it returns to the bridge).
-9. After R10: reinstall, push, delete the leftover flag. The builders' old PowerShell wrappers and claude-config's remote scripts are GATE-11's.
+6. Remove every routing exclusion made because of the bridge, putting each pattern back in `remote.json`, and send each caller repo whose routing changed a repo inbox note: the new remote gate is released, and it should be evaluated on its own merits, not by what the bridge did. The exclusions so far are listed under "Routing exclusions" below.
+7. Confirm on the next ordinary routed runs: no `client` or `version` fallbacks, no nothing-back record after a build that brought its outputs back.
+8. Watch one working session: fallback reasons, busy counts, stop lines.
+9. After R9 merges to main: install from main and push; `remote-bridge.ps1` is gone from the install. Rollback: reinstall the part-1 commit (the flag still selects the Rust client; deleting it returns to the bridge).
+10. After R10: reinstall, push, delete the leftover flag. The builders' old PowerShell wrappers and claude-config's remote scripts are GATE-11's.
 
 GATE-109 (one ssh connection) follows the cutover.
+
+## Routing exclusions
+
+Patterns taken out of `remote.json` because of how the bridge behaved; runbook step 6 puts them back. The file's backup from before each change sits beside it as `remote.json.bak-{date}`.
+
+- godot-mcp, at its request: the `scratch` itest group (the `--filter-class GodotMcp.IntegrationTests.ScratchRunnerTests` pattern) and the `csharp` itest group (the five `run.ps1 itest-csharp` patterns). Reasons: a passing run failed because an output DLL was in use here, and a wall-clock ceiling killed a healthy run on a busy builder (the second is GATE-187).
