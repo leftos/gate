@@ -2,10 +2,11 @@
 //! the builder through the scripted remote client (`--test-remote-client`), the remote pool and its wait, and the
 //! fallback here of a routed run that the pool, the builder or the client turned away.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::os::windows::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use gate_router::{DROPPED_NO_BUILD_LINE, NO_OUTPUTS_LINE, repo_name};
@@ -218,6 +219,135 @@ fn with_no_test_client_a_routed_run_falls_back_with_reason_client() {
     assert_fell_back(&case, &events(&case));
     let log = fs::read_to_string(case.folder().join("out.log")).expect("the log was written");
     assert_in_order(&log, &["ran here", &client_line]);
+}
+
+/// The suite's stand-in for ssh, which a remote-cutover case copies as `ssh.exe` into a folder first on the gate's
+/// `PATH`, so the gate finds it as ssh with no seam naming it.
+const FAKE_SSH: &str = env!("CARGO_BIN_EXE_fake-ssh");
+/// The line a routed run says when its builder's preflight ends with cmd's status for a program it cannot find.
+const NO_BOX_LINE: &str = "gate: not routed: builder has no gate box that takes this run (preflight status 9009)";
+
+/// A [`routed_case`] whose `.gitignore` leaves the gate's own files and an `ssh` folder out of the snapshot, and, when
+/// `flag`, the remote-cutover flag in its state root.
+fn cutover_case(name: &str, flag: bool) -> Case {
+    let case = routed_case(name);
+    fs::write(case.folder().join(".gitignore"), "state/\nappdata/\n*.log\nssh/\n.tmp/\n").expect("the ignore file can be written");
+    if flag {
+        fs::create_dir_all(case.root()).expect("the state root can be made");
+        fs::write(case.root().join("remote-cutover.flag"), "").expect("the flag can be written");
+    }
+    case
+}
+
+/// Copies fake-ssh as `ssh.exe` into `folder`, made when missing, beside the steps file `ssh.steps`, which answers the
+/// first call with cmd's 9009; the steps file's path.
+fn fake_ssh_in(folder: &Path) -> PathBuf {
+    fs::create_dir_all(folder).expect("the stand-in's folder can be made");
+    fs::copy(FAKE_SSH, folder.join("ssh.exe")).expect("fake-ssh can be copied as ssh.exe");
+    let steps = folder.join("ssh.steps");
+    fs::write(&steps, "exit 9009\n").expect("the steps file can be written");
+    steps
+}
+
+/// A `PATH` of `folder`, then the suite's own.
+fn path_with(folder: &Path) -> OsString {
+    let path = std::env::var_os("PATH").expect("PATH is set");
+    let folders = std::iter::once(folder.to_owned()).chain(std::env::split_paths(&path));
+    std::env::join_paths(folders).expect("the folders join into a PATH")
+}
+
+/// The folder on the suite's `PATH` that holds git.exe.
+fn git_folder() -> PathBuf {
+    let path = std::env::var_os("PATH").expect("PATH is set");
+    std::env::split_paths(&path)
+        .find(|folder| folder.join("git.exe").is_file())
+        .expect("git.exe is on PATH; the routing cases need it")
+}
+
+/// The gate of a routed run of a [`cutover_case`] logging to `out.log`, given the missing remote.ps1 `script`, with
+/// `path` as its `PATH` and the stand-in reading `steps`.
+fn cutover_gate(case: &Case, path: &OsStr, steps: &Path, script: &str) -> Command {
+    let seam = ["--test-remote-script", script];
+    let mut gate = case.gate(&heavy_words_with_limit("out.log", &seam, &[r".\tool.exe", "out", "ran here"]));
+    gate.env("PATH", path).env("GATE_FAKE_SSH_STEPS", steps);
+    gate
+}
+
+/// The verbs the stand-in reading `steps` was called with, in order; none before its first call.
+fn ssh_calls(steps: &Path) -> Vec<String> {
+    let mut log = steps.as_os_str().to_owned();
+    log.push(".log");
+    fs::read_to_string(PathBuf::from(log)).map_or_else(|_| Vec::new(), |text| text.lines().map(str::to_owned).collect())
+}
+
+#[test]
+fn the_remote_cutover_flag_routes_through_ssh_to_the_builders_gate() {
+    let case = cutover_case("routing-cutover-flag", true);
+    let outside = Case::new("routing-cutover-flag-ssh");
+    let steps = fake_ssh_in(&outside.folder());
+    let script = missing_script(&case);
+
+    let outcome = finish(cutover_gate(&case, &path_with(&outside.folder()), &steps, &script));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(outcome.stderr.contains(NO_BOX_LINE), "{outcome:?}");
+    assert!(outcome.stderr.contains("gate: remote builder version; running here"), "{outcome:?}");
+    assert!(!outcome.stderr.contains(&client_line(&script)), "the bridge is not called: {outcome:?}");
+    assert!(outcome.stdout.contains("ran here"), "{outcome:?}");
+    assert_eq!(ssh_calls(&steps), ["preflight"], "the builder's gate box was asked through ssh");
+    assert_refused(&events(&case), "version");
+}
+
+#[test]
+fn without_the_flag_a_routed_run_keeps_the_bridge() {
+    let case = cutover_case("routing-cutover-no-flag", false);
+    let outside = Case::new("routing-cutover-no-flag-ssh");
+    let steps = fake_ssh_in(&outside.folder());
+    let script = missing_script(&case);
+
+    let outcome = finish(cutover_gate(&case, &path_with(&outside.folder()), &steps, &script));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(outcome.stderr.contains(&client_line(&script)), "{outcome:?}");
+    assert!(outcome.stdout.contains("ran here"), "{outcome:?}");
+    assert_eq!(ssh_calls(&steps), Vec::<String>::new(), "ssh was never called");
+    assert_fell_back(&case, &events(&case));
+}
+
+#[test]
+fn with_the_flag_and_no_ssh_a_routed_run_falls_back_with_reason_client() {
+    let case = cutover_case("routing-cutover-no-ssh", true);
+    let git = git_folder();
+    assert!(!git.join("ssh.exe").exists(), "git's folder holds no ssh.exe: {}", git.display());
+    let script = missing_script(&case);
+
+    let outcome = finish(cutover_gate(&case, git.as_os_str(), &case.folder().join("no-ssh.steps"), &script));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(outcome.stderr.contains("client could not start: cannot run ssh: "), "{outcome:?}");
+    assert!(!outcome.stderr.contains(&client_line(&script)), "the bridge is not called: {outcome:?}");
+    assert!(outcome.stdout.contains("ran here"), "{outcome:?}");
+    assert_fell_back(&case, &events(&case));
+}
+
+#[test]
+fn with_the_flag_an_ssh_inside_the_worktree_is_refused_with_reason_client() {
+    let case = cutover_case("routing-cutover-ssh-inside", true);
+    let folder = case.folder().join("ssh");
+    let steps = fake_ssh_in(&folder);
+    let script = missing_script(&case);
+
+    let outcome = finish(cutover_gate(&case, &path_with(&folder), &steps, &script));
+
+    let line = format!(
+        "gate: remote builder client could not start: cannot run ssh: {} lies inside the worktree; running here",
+        shown(&folder.join("ssh.exe"))
+    );
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(outcome.stderr.contains(&line), "{outcome:?}");
+    assert!(outcome.stdout.contains("ran here"), "{outcome:?}");
+    assert_eq!(ssh_calls(&steps), Vec::<String>::new(), "the refused ssh was never run");
+    assert_refused(&events(&case), "client");
 }
 
 #[test]

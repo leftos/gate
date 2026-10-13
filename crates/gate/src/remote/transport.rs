@@ -5,11 +5,9 @@
 //! words, and pushes to the bare repository's own path; its `local-ssh:` form pushes and fetches as the ssh transport
 //! does, to `<host>:<path>` with the stand-in as git's ssh.
 //!
-//! A gate built without the `test-seams` feature has only what `gate push` needs of it: the ssh options, ssh's words
-//! and ssh itself.
+//! A gate built without the `test-seams` feature has the ssh transport alone.
 
 use std::ffi::OsString;
-#[cfg(feature = "test-seams")]
 use std::path::{Path, PathBuf};
 
 #[cfg(feature = "test-seams")]
@@ -32,7 +30,6 @@ pub(crate) const SSH_OPTIONS: [&str; 12] = [
 ];
 
 /// A program and the words it is started with.
-#[cfg(feature = "test-seams")]
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Program {
     pub program: PathBuf,
@@ -41,7 +38,6 @@ pub(crate) struct Program {
 
 /// Where a snapshot is pushed: the URL, the receive-pack the builder runs, and the ssh command git runs; the latter two
 /// `None` for a bare repository on this machine.
-#[cfg(feature = "test-seams")]
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct PushTarget {
     pub url: String,
@@ -50,20 +46,35 @@ pub(crate) struct PushTarget {
 }
 
 /// The way to the builder.
-#[cfg(feature = "test-seams")]
 pub(crate) trait Transport {
     /// The builder's root, which every work folder and bare repository lives under.
     fn root(&self) -> &str;
     /// The program that runs `line` on the builder `host`.
     fn call(&self, host: &str, line: &str) -> Program;
-    /// Where the snapshot of `repo` is pushed on the builder `host`.
-    fn push_target(&self, host: &str, repo: &str) -> PushTarget;
+    /// Where the snapshot of `repo` is pushed on the builder `host`; else why the repo's name cannot be sent there.
+    fn push_target(&self, host: &str, repo: &str) -> Result<PushTarget, String>;
     /// The command git runs on the builder to serve the sync-back's fetch, the upload-pack counterpart of the push's
     /// receive-pack; `None` for a bare repository on this machine, where the push names none either.
     fn upload_pack(&self) -> Option<String>;
     /// Whether `gate box` runs on this machine, as a call's child: then a call's job must let the box start its
     /// command outside it, and else it lets nothing leave.
     fn box_runs_here(&self) -> bool;
+    /// Checks the program the transport runs against the run's `worktree` before its first call, and from then on runs
+    /// the file it was judged as; else why it is refused. A transport whose program the test seams give checks nothing.
+    fn judge(&mut self, _worktree: &Path) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+/// `repo` when it is a name gate-router makes, `[A-Za-z0-9_-]+`, so the URL built from it carries no quote or other
+/// character cmd.exe or pwsh on the builder would read; else why it is refused.
+fn sent_repo(repo: &str) -> Result<&str, String> {
+    let named = !repo.is_empty() && repo.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'));
+    if named {
+        Ok(repo)
+    } else {
+        Err(format!("cannot push to the repo '{repo}': a repo name is letters, digits, '_' and '-'"))
+    }
 }
 
 /// ssh's words for running `line` on `host`: the options, `--`, the host and the line, each a word of its own.
@@ -133,9 +144,9 @@ impl Transport for Local {
         }
     }
 
-    fn push_target(&self, host: &str, repo: &str) -> PushTarget {
+    fn push_target(&self, host: &str, repo: &str) -> Result<PushTarget, String> {
         let bare = payload::bare(&self.root, repo);
-        match &self.git_ssh {
+        Ok(match &self.git_ssh {
             Some(ssh_command) => PushTarget {
                 url: format!("{host}:{}", bare.replace('\\', "/")),
                 receive_pack: None,
@@ -146,7 +157,7 @@ impl Transport for Local {
                 receive_pack: None,
                 ssh_command: None,
             },
-        }
+        })
     }
 
     fn upload_pack(&self) -> Option<String> {
@@ -170,39 +181,42 @@ fn box_words(line: &str) -> Vec<OsString> {
 
 /// The ssh transport: OpenSSH found along the gate's own `PATH`, the builder's root `D:\gate-remote`, and git pushing
 /// over ssh to a receive-pack started through pwsh, which reads the single-quoted path git sends through cmd.
-/// `gate push` runs its calls with ssh's own path; no seam selects the ssh transport for a routed run.
+/// `gate push` runs its calls with ssh's own path; a routed run uses the ssh transport when the state root holds the
+/// remote-cutover flag, and judges the ssh it found against the run's worktree before its first call.
 pub(crate) mod ssh {
-    #[cfg(feature = "test-seams")]
-    use std::path::Path;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
-    #[cfg(feature = "test-seams")]
-    use super::{Program, PushTarget, SSH_OPTIONS, Transport, ssh_words};
+    use super::{Program, PushTarget, SSH_OPTIONS, Transport, sent_repo, ssh_words};
     use crate::environment::Variables;
+    use crate::remote::git::judged;
     use crate::run::find_program;
 
-    #[cfg(feature = "test-seams")]
     const BUILDER_ROOT: &str = r"D:\gate-remote";
-    #[cfg(feature = "test-seams")]
     const RECEIVE_PACK: &str = "pwsh -NoProfile -NonInteractive -Command git-receive-pack";
-    #[cfg(feature = "test-seams")]
     const UPLOAD_PACK: &str = "pwsh -NoProfile -NonInteractive -Command git-upload-pack";
+    /// The one name ssh is looked for by: no `ssh.cmd` or `ssh.bat` shim earlier on `PATH` runs in its place.
+    const SSH_EXE: &str = "ssh.exe";
 
     pub(crate) struct Ssh {
         pub(crate) program: PathBuf,
     }
 
     impl Ssh {
-        /// ssh found along the gate's own `PATH`, read against the working directory; else why it cannot be found.
+        /// `ssh.exe` found along the gate's own `PATH`, read against the working directory; else why it cannot be
+        /// found.
         pub(crate) fn find() -> Result<Ssh, String> {
             let folder = std::env::current_dir().map_err(|error| format!("cannot read the working directory: {error}"))?;
-            find_program("ssh", &Variables::from_process(), &folder)
+            Ssh::find_in(&Variables::from_process(), &folder)
+        }
+
+        /// `ssh.exe` found along the `PATH` of `variables`, read against `folder`; else why it cannot be found.
+        pub(super) fn find_in(variables: &Variables, folder: &Path) -> Result<Ssh, String> {
+            find_program(SSH_EXE, variables, folder)
                 .map(|program| Ssh { program })
                 .map_err(|why| format!("cannot run ssh: {why}"))
         }
     }
 
-    #[cfg(feature = "test-seams")]
     impl Transport for Ssh {
         fn root(&self) -> &str {
             BUILDER_ROOT
@@ -215,12 +229,13 @@ pub(crate) mod ssh {
             }
         }
 
-        fn push_target(&self, host: &str, repo: &str) -> PushTarget {
-            PushTarget {
+        fn push_target(&self, host: &str, repo: &str) -> Result<PushTarget, String> {
+            let repo = sent_repo(repo)?;
+            Ok(PushTarget {
                 url: format!("{host}:{}/{repo}.git", BUILDER_ROOT.replace('\\', "/")),
                 receive_pack: Some(RECEIVE_PACK.to_owned()),
                 ssh_command: Some(git_ssh_command(&self.program)),
-            }
+            })
         }
 
         fn upload_pack(&self) -> Option<String> {
@@ -230,11 +245,17 @@ pub(crate) mod ssh {
         fn box_runs_here(&self) -> bool {
             false
         }
+
+        /// Follows the ssh found through links and refuses it when that leads inside `worktree`; else every call, and
+        /// git's ssh command, runs the file it leads to.
+        fn judge(&mut self, worktree: &Path) -> Result<(), String> {
+            self.program = judged(&self.program, worktree).map_err(|why| format!("cannot run ssh: {why}"))?;
+            Ok(())
+        }
     }
 
     /// The ssh command git runs: ssh's path with `/` separators, single-quoted for the shell git starts it through, and
     /// the options.
-    #[cfg(feature = "test-seams")]
     pub(super) fn git_ssh_command(ssh: &Path) -> String {
         let path = ssh.to_string_lossy().replace('\\', "/");
         let quoted = format!("'{}'", path.replace('\'', r"'\''"));
@@ -246,10 +267,12 @@ pub(crate) mod ssh {
 #[expect(clippy::expect_used, reason = "a test whose transport cannot be made must fail loudly")]
 mod tests {
     use std::ffi::OsString;
+    use std::fs;
     use std::path::PathBuf;
 
     use super::ssh::{Ssh, git_ssh_command};
     use super::{Local, Program, PushTarget, Transport, box_words, ssh_words};
+    use crate::environment::Variables;
 
     fn words(texts: &[&str]) -> Vec<OsString> {
         texts.iter().map(OsString::from).collect()
@@ -300,11 +323,11 @@ mod tests {
         );
         assert_eq!(
             ssh.push_target("builder", "app"),
-            PushTarget {
+            Ok(PushTarget {
                 url: "builder:D:/gate-remote/app.git".to_owned(),
                 receive_pack: Some("pwsh -NoProfile -NonInteractive -Command git-receive-pack".to_owned()),
                 ssh_command: Some(git_ssh_command(&ssh.program)),
-            }
+            })
         );
         assert_eq!(
             ssh.upload_pack(),
@@ -327,7 +350,7 @@ mod tests {
         let local = Local::new(r"local:C:\builder", None).expect("a local transport");
         assert_eq!(local.root(), r"C:\builder");
         assert_eq!(local.call("builder", line).args, words(&["box", "preflight", "e30="]));
-        assert_eq!(local.push_target("builder", "app").url, r"C:\builder\app.git");
+        assert_eq!(local.push_target("builder", "app").expect("a push target").url, r"C:\builder\app.git");
         assert_eq!(local.upload_pack(), None, "a bare repository here names no pack command");
         let stubbed = Local::new(r"local:C:\builder", Some(PathBuf::from("fake-ssh.exe").as_path())).expect("a local transport");
         assert_eq!(
@@ -350,11 +373,11 @@ mod tests {
         assert_eq!(local.root(), r"C:\builder");
         assert_eq!(
             local.push_target("builder", "app"),
-            PushTarget {
+            Ok(PushTarget {
                 url: "builder:C:/builder/app.git".to_owned(),
                 receive_pack: None,
                 ssh_command: Some(git_ssh_command(&stub)),
-            }
+            })
         );
         assert_eq!(local.upload_pack(), None, "git runs its own service names");
         assert_eq!(
@@ -368,5 +391,37 @@ mod tests {
             Local::new("local:", None).err(),
             Some("gate: cannot use the remote transport 'local:': it is not local:<folder>".to_owned())
         );
+    }
+
+    #[test]
+    fn a_repo_name_holding_a_quote_is_never_pushed_to() {
+        let ssh = Ssh {
+            program: PathBuf::from(r"C:\Program Files\OpenSSH\ssh.exe"),
+        };
+
+        assert_eq!(
+            ssh.push_target("builder", "app'x"),
+            Err("cannot push to the repo 'app'x': a repo name is letters, digits, '_' and '-'".to_owned())
+        );
+        assert!(ssh.push_target("builder", "").is_err(), "an empty name is refused too");
+        assert!(ssh.push_target("builder", "App_1-b").is_ok(), "a name gate-router makes is sent");
+    }
+
+    #[test]
+    fn ssh_is_found_as_ssh_exe_past_an_earlier_ssh_cmd() {
+        let root = std::env::temp_dir().join(format!("gate-ssh-find-{}", std::process::id()));
+        let (shim, real) = (root.join("shim"), root.join("real"));
+        for folder in [&shim, &real] {
+            fs::create_dir_all(folder).expect("a PATH folder can be made");
+        }
+        fs::write(shim.join("ssh.cmd"), "").expect("the shim can be written");
+        fs::write(real.join("ssh.exe"), "").expect("the stand-in exe can be written");
+        let path = std::env::join_paths([&shim, &real]).expect("the folders join into a PATH");
+        let variables = Variables::from_process().with("PATH", &path.to_string_lossy());
+
+        let found = Ssh::find_in(&variables, &root).expect("ssh.exe is found");
+
+        assert_eq!(found.program, real.join("ssh.exe"), "the .cmd earlier on PATH is passed over");
+        fs::remove_dir_all(&root).expect("the folders can be removed");
     }
 }

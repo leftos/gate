@@ -50,7 +50,7 @@ const REGULAR_MODE: &str = "100";
 /// the run's own when the changes were ignored, and 1 when a passing run's changes could not be applied.
 pub(super) fn sync_back(attempt: &mut Attempt<'_, '_>, snapshot: &Snapshot, status: i64) -> Result<End, End> {
     attempt.go_on()?;
-    let target = attempt.transport.push_target(attempt.call.host, attempt.call.repo);
+    let target = attempt.transport.push_target(attempt.call.host, attempt.call.repo).map_err(End::Failed)?;
     let pack = attempt.transport.upload_pack();
     let reference = format!("refs/gate-back/{}", attempt.call.key);
     let remote = Remote {
@@ -1288,7 +1288,7 @@ impl Remote<'_> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-seams"))]
 #[expect(clippy::expect_used, reason = "a test whose interrupt, transport or git cannot be had must fail loudly")]
 mod tests {
     use std::ffi::OsStr;

@@ -230,7 +230,7 @@ fn say_nesting(nesting: &Nesting, request: &RunRequest, console: &mut Console) {
 /// and the client a routed run calls.
 fn ready(request: &RunRequest, at: &Where<'_>, console: &mut Console) -> Result<(Plan, Box<dyn RemoteClient>), NotRun> {
     let plan = Plan::prepare(request, &request.command, at, console)?;
-    let client = remote::chosen(request).map_err(NotRun::failed)?;
+    let client = remote::chosen(request, &at.root.path).map_err(NotRun::failed)?;
     Ok((plan, client))
 }
 

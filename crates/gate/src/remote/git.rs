@@ -144,13 +144,6 @@ impl Git {
 
     /// Runs git as [`Git::run`] does and returns what it wrote on standard output, read up to [`OUTPUT_CAP`]; else why
     /// the call failed, from the last [`ERRORS_KEPT`] of its standard error.
-    #[cfg_attr(
-        not(any(test, feature = "test-seams")),
-        expect(
-            dead_code,
-            reason = "only the remote client asks git this way, and a gate without the test seams has none"
-        )
-    )]
     pub(crate) fn output(&self, call: &Call<'_>) -> Result<String, GitError> {
         let output = self.output_bytes(call)?;
         String::from_utf8(output).map_err(|_| GitError::Failed("git's output is not valid UTF-8".to_owned()))
@@ -274,13 +267,14 @@ pub(crate) fn sdk_listing(variables: Variables, limit: Duration, interrupt: Opti
     Ok(String::from_utf8_lossy(&output).into_owned())
 }
 
-/// The file `dotnet`, found along a `PATH` without the worktree's folders, leads to, followed through links, which is
-/// what is then launched, so a link retargeted after the check cannot change what runs; else why it is refused: a
-/// folder outside the worktree may still hold a link that leads into it.
-fn judged(dotnet: &Path, worktree: &Path) -> Result<PathBuf, String> {
-    let target = resolved(dotnet);
+/// The file `program`, found along a `PATH`, leads to, followed through links, which is what is then launched, so a
+/// link retargeted after the check cannot change what runs; else why it is refused, when that file lies inside
+/// `worktree`: a folder outside the worktree may still hold a link that leads into it. dotnet and the client's ssh are
+/// judged so.
+pub(crate) fn judged(program: &Path, worktree: &Path) -> Result<PathBuf, String> {
+    let target = resolved(program);
     if is_within(&target, &resolved(worktree)) {
-        return Err(format!("{} lies inside the worktree", dotnet.display()));
+        return Err(format!("{} lies inside the worktree", program.display()));
     }
     Ok(without_verbatim(&target))
 }

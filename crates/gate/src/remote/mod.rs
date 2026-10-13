@@ -1,12 +1,13 @@
 //! The remote client a routed run calls: the call it is given, the outcome it hands back, and the clients there are.
-//! Every gate has the [`bridge`] to remote.ps1. A gate built with the `test-seams` feature has the scripted client
-//! `--test-remote-client` names, which runs a step file in this process, and the client of
-//! `--test-remote-snapshot`, which stops once it has made the snapshot, and the Rust client of
-//! `--test-remote-transport`, which runs the command on a builder. [`git`] runs git for the routing decision and the
-//! client; [`snapshot`] makes the snapshot and bridge commits; `client` runs the Rust client's phases, `transport`
-//! reaches the builder, `payload` builds what `gate box` is sent, `retry` holds the rule a call is retried on,
-//! `outputs` builds the outputs manifest the run call carries, keeps the outputs pending marker and reads the box's
-//! outputs line, and `syncback` fetches and applies the changes the command left on the builder.
+//! A routed run that no test seam gives a client calls the [`switch`], which sends it to the [`bridge`] to remote.ps1,
+//! or to the Rust client over ssh when the state root holds the remote-cutover flag. A gate built with the
+//! `test-seams` feature has the scripted client `--test-remote-client` names, which runs a step file in this process,
+//! and the client of `--test-remote-snapshot`, which stops once it has made the snapshot, and the Rust client of
+//! `--test-remote-transport`, which runs the command on a builder of the local transport. [`git`] runs git for the
+//! routing decision and the client; [`snapshot`] makes the snapshot and bridge commits; `client` runs the Rust
+//! client's phases, `transport` reaches the builder, `payload` builds what `gate box` is sent, `retry` holds the rule
+//! a call is retried on, `outputs` builds the outputs manifest the run call carries, keeps the outputs pending marker
+//! and reads the box's outputs line, and `syncback` fetches and applies the changes the command left on the builder.
 
 use std::fs::OpenOptions;
 use std::io::{self, Write};
@@ -17,38 +18,25 @@ use gate_state::{FallbackReason, StateRoot};
 use gate_win32::{Interrupt, OwnedMutexGuard};
 
 mod bridge;
-#[cfg(feature = "test-seams")]
 mod client;
 pub(crate) mod git;
-#[cfg(feature = "test-seams")]
 mod install;
 mod launch;
-#[cfg(feature = "test-seams")]
 mod outputs;
-#[cfg(feature = "test-seams")]
 mod parity;
-#[cfg(feature = "test-seams")]
 mod payload;
-#[cfg(feature = "test-seams")]
 mod retry;
-#[cfg_attr(
-    not(any(test, feature = "test-seams")),
-    expect(dead_code, reason = "a gate without the test seams has no client that makes a snapshot")
-)]
 mod snapshot;
-#[cfg(feature = "test-seams")]
+mod switch;
 mod syncback;
 pub(crate) mod transport;
-#[cfg(feature = "test-seams")]
 mod watchdog;
 
 /// The status a client hands back with a refusal's reason.
 pub(crate) const REFUSED: i64 = 75;
 /// The status of a run whose client failed.
-#[cfg(feature = "test-seams")]
 const FAILED: i64 = 1;
 /// What a client failure says: `gate: the remote run failed: <why>`.
-#[cfg(feature = "test-seams")]
 const FAILED_RUN: &str = "gate: the remote run failed";
 
 /// The line the box says when another run holds the work folder `key`, just after its refusal tag.
@@ -194,7 +182,6 @@ impl RemoteOutcome {
 
 /// Appends each of `lines` to `log` and says them on `stream`: the one log-and-console writer the clients say their
 /// lines with.
-#[cfg_attr(not(feature = "test-seams"), expect(dead_code, reason = "only the clients the test seams name say lines"))]
 fn say<S: AsRef<str>>(log: &Path, lines: &[S], mut stream: impl Write) -> Result<(), String> {
     let cannot = |error: io::Error| format!("cannot write to {}: {error}", log.display());
     let mut file = OpenOptions::new().append(true).create(true).open(log).map_err(cannot)?;
@@ -206,10 +193,11 @@ fn say<S: AsRef<str>>(log: &Path, lines: &[S], mut stream: impl Write) -> Result
 }
 
 /// The client `request` names: the one of `--test-remote-snapshot`, else the Rust client of `--test-remote-transport`,
-/// else the scripted one of `--test-remote-client`, else the bridge, with the remote.ps1 of `--test-remote-script` and
-/// the pwsh of `--test-bridge-pwsh` when given; or the line saying why its transport or its step file cannot be used.
+/// else the scripted one of `--test-remote-client`, else the switch of the state root `state_dir`, whose bridge has the
+/// remote.ps1 of `--test-remote-script` and the pwsh of `--test-bridge-pwsh` when given; or the line saying why its
+/// transport or its step file cannot be used.
 #[cfg(feature = "test-seams")]
-pub(crate) fn chosen(request: &RunRequest) -> Result<Box<dyn RemoteClient>, String> {
+pub(crate) fn chosen(request: &RunRequest, state_dir: &Path) -> Result<Box<dyn RemoteClient>, String> {
     if request.test_seams.remote_snapshot {
         let limit = git::limit(&request.test_seams);
         return Ok(Box::new(snapshot_only::SnapshotOnly { limit }));
@@ -222,17 +210,21 @@ pub(crate) fn chosen(request: &RunRequest) -> Result<Box<dyn RemoteClient>, Stri
         return scripted::ScriptedClient::load(path).map(|client| Box::new(client) as Box<dyn RemoteClient>);
     }
     let bridge = bridge::Bridge::new(seams.remote_script.clone(), seams.bridge_pwsh.clone());
-    Ok(Box::new(bridge))
+    Ok(Box::new(switch::Switch::new(seams, state_dir, bridge)))
 }
 
-/// The client `request` names: the bridge, in a gate built without the test seams.
+/// The client `request` names: the switch of the state root `state_dir`, in a gate built without the test seams.
 #[cfg(not(feature = "test-seams"))]
 #[expect(
     clippy::unnecessary_wraps,
     reason = "the signature of the test-seams build, whose step file can fail to load"
 )]
-pub(crate) fn chosen(_request: &RunRequest) -> Result<Box<dyn RemoteClient>, String> {
-    Ok(Box::new(bridge::Bridge::new(None, None)))
+pub(crate) fn chosen(request: &RunRequest, state_dir: &Path) -> Result<Box<dyn RemoteClient>, String> {
+    Ok(Box::new(switch::Switch::new(
+        &request.test_seams,
+        state_dir,
+        bridge::Bridge::new(None, None),
+    )))
 }
 
 /// The client of `--test-remote-snapshot`: makes the snapshot and bridge commits of the call's worktree and says each

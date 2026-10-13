@@ -16,7 +16,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Bounded call**: a call of the Rust remote client to the builder's `gate box` that is not the run itself (the `stop` and the `boot` after a lost connection), ended after 30 s and retried once after a pre-banner failure while 5 s of the bound would be left.
 - **Box**: a builder; the word the gate's prose and its hidden `gate box` subcommand use.
 - **Box job**: the named job `Local\gate-remote-<key>-<12 hex>` that a `gate box run` puts its command in, named by the payload and stopped by `gate box stop`; it has no limits and no kill-on-close.
-- **Bridge**: the stand-in, until the remote port, by which `gate.exe` runs a routed run's remote part through the PowerShell remote client, `remote.ps1`, through a **Shim**, with the request on pwsh's stdin and the answer as **Control lines**.
+- **Bridge**: the stand-in, until the remote port, which the **Switch** picks when there is no remote-cutover flag, and by which `gate.exe` runs a routed run's remote part through the PowerShell remote client, `remote.ps1`, through a **Shim**, with the request on pwsh's stdin and the answer as **Control lines**.
 - **Bridge commit**: a commit with a snapshot's tree whose parent is the previous snapshot, which the Rust remote client builds so a push can send only what changed; none when there is no previous snapshot. Not the **Bridge** to `remote.ps1`.
 - **Build client**: a process in the command's job that drives a build (`MSBuild.exe`, or `dotnet` without `--no-build`); only while one runs does a build server's CPU count as the command's progress.
 - **Build id**: the text after `+` in the gate's version (`gate --version` prints `gate <package version>+<build id>`): the 12-hex head commit of the build, `<12-hex>-dirty.<8-hex>` for a build of changed tracked files (the 8 hex are the first 8 of the SHA-256 of `git diff HEAD --binary`), or `dev` for a build `tools/install.ps1` did not make with a commit. The client compares the whole version text, so another build of one package version is another version.
@@ -100,7 +100,8 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Refusal**: a builder's or the remote client's answer that a routed run cannot run there, with a reason (`busy`, `unreachable`, `parity`, `rebooted`, `tools`, `version`, `client`); the gate then falls back to a local run.
 - **Refusal tag**: the stderr line `gate-remote-refused: <nonce> busy|tools` that `gate box run` says just before the human line of a refusal; the remote client reads a `busy` or `tools` fallback from it alone, and ignores it once it has heard the start marker.
 - **Release**: see take.
-- **Remote client**: what `gate run` calls to run a routed command on a builder: `RemoteClient` in the gate binary; the `remote.ps1` bridge is the client of a production gate, and a client that cannot start makes the run fall back with reason `client`.
+- **Remote client**: what `gate run` calls to run a routed command on a builder: `RemoteClient` in the gate binary; the **Switch** gives a routed run the `remote.ps1` bridge or, under the **Remote-cutover flag**, the Rust client over ssh, and a client that cannot start makes the run fall back with reason `client`.
+- **Remote-cutover flag**: the file `remote-cutover.flag` in the state root (`remote_cutover_flag_path`), the switch between the two remote clients: a routed run whose state root holds it when its routed attempt starts goes through the Rust client over ssh, and one without it through the bridge; only its existence counts, and nothing writes it yet.
 - **Reserved field**: an optional field readers accept before any gate writes it, such as `expected`.
 - **Reserved light slot**: one of the up to two highest light slots a critical gate never takes, so light gates run beside it.
 - **Rollover**: the move of `events.jsonl` over `events.1.jsonl` by the append that finds the journal at or above 5,242,880 bytes, followed by the archive of the rolled file.
@@ -125,6 +126,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **State root**: the folder holding every file the gate writes, `%LOCALAPPDATA%\gate\v1\` by default, overridden by `--state-dir` or `GATE_STATE_DIR`.
 - **Stop event**: the manual-reset event `<box job name>-stopped` that `gate box run` creates before its job and `gate box stop` sets before it terminates the job, so a launch that finds it set ends the command unstarted.
 - **Stop-tree**: `gate stop-tree <pid>`, which terminates the gate jobs and then the processes of a pid's tree, deepest first, so a kill reaches processes that no longer have a parent.
+- **Switch**: the `Switch` in `remote/switch.rs`, the client a routed run calls when no test seam names one; on its first call it looks for the **Remote-cutover flag** once and sends every call of the run to the bridge or to the Rust client.
 - **Sync-back**: applying the files a routed command changed on the builder to the PC's worktree, refused when the worktree changed during the run.
 - **Take**: a gate acquiring its slot, journalled as `take`; **release** is letting it go, journalled as `release` before the slot is freed.
 - **Take-back**: returning a machine to the PowerShell gate by deleting the cutover flag by hand, which works even when `gate.exe` is what is broken.

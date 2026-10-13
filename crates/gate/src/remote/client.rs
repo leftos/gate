@@ -28,7 +28,9 @@ use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use gate_args::{RunRequest, TestSeams};
+#[cfg(feature = "test-seams")]
+use gate_args::RunRequest;
+use gate_args::TestSeams;
 use gate_state::{FallbackReason, KernelObject, key_hash};
 use gate_win32::{AcquireError, Interrupt, Job, NamedMutex, OwnedMutexGuard, PipedConsole, Running};
 use jiff::{SignedDuration, Timestamp};
@@ -42,14 +44,19 @@ use super::payload::{self, Location, RunCall};
 use super::retry::{self, Ended, GIT_SSH_FAILED, SSH_FAILED};
 use super::snapshot::{self, Snapshot};
 use super::syncback;
-use super::transport::{Local, Program, Transport};
+#[cfg(feature = "test-seams")]
+use super::transport::Local;
+use super::transport::ssh::Ssh;
+use super::transport::{Program, Transport};
 use super::watchdog::{self, Cut, Kept, Kill, LINE_CAP};
 use super::{FAILED, FAILED_RUN, REFUSED, Refusal, RemoteCall, RemoteClient, RemoteOutcome, refused_line, started_line};
 use crate::boxside::outputs::{NAMES_SKIPPED, OUTPUTS_BUDGET};
 use crate::boxside::payload::escaped;
 use crate::environment::Variables;
 use crate::outputs::archive::sent_limit;
-use crate::run::{CONTROL_C_EXIT, find_program, is_within, resolved};
+#[cfg(feature = "test-seams")]
+use crate::run::find_program;
+use crate::run::{CONTROL_C_EXIT, is_within, resolved};
 use crate::version::build_version;
 
 /// The statuses of a preflight whose builder has no `gate box` that takes the run: cmd's for a program it cannot find,
@@ -78,7 +85,8 @@ const NO_HANDLER: &str = "gate: --test-remote-interrupt-at needs the console han
 /// The most of a call's standard output one read of a raw copy takes.
 const RAW_CHUNK: usize = 64 * 1024;
 
-/// The client of `--test-remote-transport`.
+/// The Rust client: over ssh when the state root holds the remote-cutover flag, or over the local transport of
+/// `--test-remote-transport`.
 pub(crate) struct RustClient {
     transport: Box<dyn Transport>,
     /// How long each git call of the snapshot and the saved ref may take.
@@ -114,8 +122,16 @@ pub(crate) struct RustClient {
 }
 
 impl RustClient {
+    /// The client over `ssh.exe` found along the gate's own `PATH`, whose builder root is the builder layout's, with
+    /// the run's `seams`; else the line saying why ssh cannot be found.
+    pub(crate) fn ssh(seams: &TestSeams) -> Result<RustClient, String> {
+        let ssh = Ssh::find()?;
+        Ok(RustClient::over(Box::new(ssh), seams))
+    }
+
     /// The client of the local transport `transport` names, with the request's seams; else the line saying why the
     /// transport cannot be used, or why the stand-in `--test-remote-ssh` names cannot be found.
+    #[cfg(feature = "test-seams")]
     pub(crate) fn local(request: &RunRequest, transport: &str) -> Result<RustClient, String> {
         let seams = &request.test_seams;
         // The transport's form is refused first, so `--test-remote-transport remote:x` reports the form and not a
@@ -123,8 +139,14 @@ impl RustClient {
         Local::new(transport, seams.remote_ssh.as_deref())?;
         let stub = seams.remote_ssh.as_deref().map(|word| stand_in(transport, word)).transpose()?;
         let local = Local::new(transport, stub.as_deref())?;
-        Ok(RustClient {
-            transport: Box::new(local),
+        Ok(RustClient::over(Box::new(local), seams))
+    }
+
+    /// The client over `transport`, each limit its constant unless `seams` gives one in its place, as only a gate built
+    /// with the test seams can.
+    fn over(transport: Box<dyn Transport>, seams: &TestSeams) -> RustClient {
+        RustClient {
+            transport,
             limit: git::limit(seams),
             pause: retry::pause(seams),
             bound: retry::bound(seams),
@@ -139,12 +161,13 @@ impl RustClient {
             outputs_budget: seams.remote_outputs_budget_bytes.unwrap_or(OUTPUTS_BUDGET),
             log_cap: seams.remote_log_cap_bytes.unwrap_or(watchdog::LOG_CAP),
             own_start_fails: seams.own_start_fails,
-        })
+        }
     }
 }
 
 /// The stand-in `--test-remote-ssh` names, resolved as the gate resolves its own programs: a name with a folder part
 /// against the gate's working folder, a bare name along its `PATH` alone; else the line saying why it cannot be found.
+#[cfg(feature = "test-seams")]
 fn stand_in(transport: &str, word: &Path) -> Result<PathBuf, String> {
     let cannot = |why: String| format!("gate: cannot use the remote transport '{transport}': {why}");
     let folder = std::env::current_dir().map_err(|error| cannot(format!("cannot read the working directory: {error}")))?;
@@ -171,6 +194,10 @@ impl RemoteClient for RustClient {
     }
 
     fn run(&mut self, call: &RemoteCall<'_>) -> RemoteOutcome {
+        // The worktree is known only now: a transport whose program lies inside it starts nothing.
+        if let Err(why) = self.transport.judge(Path::new(call.root)) {
+            return RemoteOutcome::not_started(why);
+        }
         let started = Instant::now();
         let one = self.watch_call.as_deref();
         // With `--test-remote-watch-call`, the stall and ceiling seams are that one call's, and the run keeps its own.
@@ -637,7 +664,7 @@ impl Attempt<'_, '_> {
     fn push(&mut self, snapshot: &Snapshot, created: bool) -> Result<(), End> {
         self.go_on()?;
         let (root, key) = (Path::new(self.call.root), self.call.key);
-        let target = self.transport.push_target(self.call.host, self.call.repo);
+        let target = self.transport.push_target(self.call.host, self.call.repo).map_err(End::Failed)?;
         let mut args: Vec<String> = ["push", "--no-verify", "--no-recurse-submodules", "--progress"].map(str::to_owned).into();
         args.extend(target.receive_pack.iter().map(|pack| format!("--receive-pack={pack}")));
         args.extend(["--".to_owned(), target.url.clone(), format!("+{}:refs/gate/{key}", snapshot.commit)]);
@@ -1158,7 +1185,7 @@ impl Attempt<'_, '_> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-seams"))]
 impl<'c, 'a> Attempt<'c, 'a> {
     /// An attempt of `call` through `transport` with no pause before a retry, as the sync-back's tests drive one.
     pub(super) fn for_tests(call: &'c RemoteCall<'a>, transport: &'c dyn Transport) -> Attempt<'c, 'a> {
@@ -1184,7 +1211,7 @@ impl<'c, 'a> Attempt<'c, 'a> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-seams"))]
 impl Limits {
     /// Limits no test reaches, the bounded calls' bound aside: an hour for the stall window and the ceiling.
     fn for_tests() -> Limits {
@@ -2207,7 +2234,7 @@ fn seconds(elapsed: Duration) -> String {
     format!("{tenths}")
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-seams"))]
 #[expect(clippy::expect_used, reason = "a test whose interrupt or transport cannot be made must fail loudly")]
 mod tests {
     use std::collections::VecDeque;
@@ -2219,14 +2246,15 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
 
+    use gate_args::TestSeams;
     use gate_state::{FallbackReason, StateRoot};
     use gate_win32::{Interrupt, PipedConsole};
 
     use super::{
         Attempt, CallEnd, Called, Capped, Cut, Echo, End, GIT_SSH_FAILED, Heard, LINE_CAP, Limits, Loss, NonZeroU64, OUTPUTS_BUDGET, ProtocolLines,
-        Raised, Reader, Reading, SSH_FAILED, Shared, Unfinished, Watch, after_loss, boot_time, called_of, console_of, held, is_heartbeat,
-        last_update, local_sdk_listing, path_outside, paused, push_size, relay, relay_raw, relayed_raw, sdks_of, seconds, their_version,
-        version_refusal,
+        Raised, Reader, Reading, RustClient, SSH_FAILED, Shared, Ssh, Unfinished, Watch, after_loss, boot_time, called_of, console_of, held,
+        is_heartbeat, last_update, local_sdk_listing, path_outside, paused, push_size, relay, relay_raw, relayed_raw, sdks_of, seconds,
+        their_version, version_refusal,
     };
     use crate::environment::Variables;
     use crate::remote::git::{DOTNET_LIMIT, GIT_LIMIT, GitError};
@@ -3867,5 +3895,22 @@ mod tests {
         assert_eq!(seconds(Duration::from_millis(250)), "0.2");
         assert_eq!(seconds(Duration::from_millis(1340)), "1.3");
         assert_eq!(seconds(Duration::from_secs(2)), "2");
+    }
+
+    #[test]
+    fn the_ssh_client_has_the_builder_layout_root() {
+        let ssh = Ssh {
+            program: PathBuf::from(r"C:\Program Files\OpenSSH\ssh.exe"),
+        };
+
+        let client = RustClient::over(Box::new(ssh), &TestSeams::default());
+
+        assert_eq!(
+            client.transport.root(),
+            r"D:\gate-remote",
+            "every work folder and bare repository lives there"
+        );
+        assert_eq!(client.limit, GIT_LIMIT, "a request with no seams keeps the constants");
+        assert_eq!(client.dotnet_limit, DOTNET_LIMIT, "a request with no seams keeps the constants");
     }
 }
