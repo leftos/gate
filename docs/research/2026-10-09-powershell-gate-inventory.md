@@ -133,7 +133,9 @@ Written for `docs/plans/gate-rust-port.md`, step 1. The port may redesign the CL
   Each sample reads: system idle/kernel/user times, a process snapshot, the job's accounting (`TotalUserTime + TotalKernelTime` including nested jobs and exited processes, and `ActiveProcesses`), the job's process ids, log and `.err` sizes. Nothing goes through WMI ("a CIM query can block for seconds or for good"). Where: G:2929-2989, G:3285-3330, G:3648-3670. **Essential**.
 - **W2 Stall.**
 
-  `gate: STALLED: no output and no CPU for <n> s (machine free <p>% on average); killed <command> and its children` when for `-StallSeconds` none of these happened: the log or `<log>.err` grew; the job gained at least `StallSeconds * 100000` ticks of CPU since the last progress (1% of one core: job CPU is charged in 15.625 ms ticks and a hung `dotnet test` still gains one every few seconds); the wsl VM busy (below); a process new to the job appeared; a build server the command started gained CPU while the job holds a build client; a shared compiler server gained CPU while the job holds a build client; a gate under this one waits behind a critical request (N3).
+  `gate: STALLED: no output and no CPU for <n> s (machine free <p>% on average); killed <command> and its children` when for `-StallSeconds` none of these happened: the log or `<log>.err` grew; the job gained at least `StallSeconds * 100000` ticks of CPU since the last progress (1% of one core: job CPU is charged in 15.625 ms ticks and a hung `dotnet test` still gains one every few seconds).
+
+  Nor did any of these happen: the wsl VM busy (below); a process new to the job appeared; a build server the command started gained CPU while the job holds a build client; a shared compiler server gained CPU while the job holds a build client; a gate under this one waits behind a critical request (N3).
 
   Where: G:3285-3330, G:3423-3444.
 
@@ -178,7 +180,11 @@ Written for `docs/plans/gate-rust-port.md`, step 1. The port may redesign the CL
 - **X2 Kill sequence.** On a kill reason the gate gathers the diagnostics (below), then `TerminateJobObject(job, 124)`, adds `gate: terminated the job's <n> process[es]` (n from the job's accounting before the kill), waits up to 5 s for the command (`gate: the command was still running 5 s after its job was terminated` if not), and exits 124. Where: G:3633-3644. **Essential**.
 - **X3 Diagnostics block.**
 
-  Before the terminate line the log gets `gate: diagnostics`, then each line indented: `gate:   job <pid> parent <ppid> <name>: cpu <s> s, working set <mb> MB: <command line>` for each process in the job (command line cut at 200 characters plus `...`, `?` for a part that cannot be read), `gate:   outside job <pid> ...` for each live descendant of the command or of a job process (created at or after its parent and after the command started) that is not in the job, at most 40 job lines and 20 outside lines each followed by `gate:   ... and <n> more <label> processes`, `gate:   build server <pid> <name>: cpu <s> s (started after the command | already running; counts while the job holds a build client)` or `gate:   build servers: none`, and the last six samples as `gate:   sample at <w> s (load-adjusted <a> s, free <p>%): log <n> B, err <n> B, job cpu <s> s, [wsl vm cpu <p>%, ]<n> processes, new servers cpu <s> s, shared servers cpu <s> s, build client in job: yes|no` (or `gate:   samples: none`).
+  Before the terminate line the log gets `gate: diagnostics`, then each line indented: `gate:   job <pid> parent <ppid> <name>: cpu <s> s, working set <mb> MB: <command line>` for each process in the job (command line cut at 200 characters plus `...`, `?` for a part that cannot be read).
+
+  Next come `gate:   outside job <pid> ...` for each live descendant of the command or of a job process (created at or after its parent and after the command started) that is not in the job, at most 40 job lines and 20 outside lines each followed by `gate:   ... and <n> more <label> processes`.
+
+  Last come `gate:   build server <pid> <name>: cpu <s> s (started after the command | already running; counts while the job holds a build client)` or `gate:   build servers: none`, and the last six samples as `gate:   sample at <w> s (load-adjusted <a> s, free <p>%): log <n> B, err <n> B, job cpu <s> s, [wsl vm cpu <p>%, ]<n> processes, new servers cpu <s> s, shared servers cpu <s> s, build client in job: yes|no` (or `gate:   samples: none`).
 
   Gathering has a 2 s budget (`gate:   ... diagnostics cut at <n> ms`), and a failure ends the block with `gate: diagnostics failed: <message>` and the kill goes ahead (`GATE_TEST_DIAGNOSTICS_FAIL=1`).
   - Pins: `Test-DiagnosticsFailure` (still killed, status 124, the log says why), `Test-DiagnosticsCap` (45 waiting processes: 40 listed, the rest counted), `Test-OutsideJob` (WSL relay named outside the job).
@@ -233,9 +239,13 @@ Written for `docs/plans/gate-rust-port.md`, step 1. The port may redesign the CL
 - **J4 Journal failure is non-fatal.** A gate that cannot write a line (mutex not free in 2 s, a folder where the file should be) says once on stderr `gate: could not write the journal <path> (<reason>)`, skips only that line and runs on; a journal throw at the end is said the same way so the ticket and slots are still released. Pins: `Test-JournalUnwritable` (the command still runs, exit 0, one line though it tried at queue, take and release). Where: G:2444-2470, G:3941-3956. **Essential**.
 - **J5 Release facts and archive [durations].**
 
-  `release` gains `wallSeconds` (command wall time less the seconds paused behind a critical request, as the backstop counts it; a routed run's is the whole remote wall time), `adjustedSeconds` (null for a routed run and after a sampler failure) and `verdict` (`passed`, `failed`, `log-failure`, `stalled`, `timed-out`, `backstop`, `unknown` when the gate ended before the command had one, its two times then null); a routed run is judged a kill only when the gate killed it (a command that exits 124 itself after an inner `TIMED OUT` is `failed`).
+  `release` gains `wallSeconds` (command wall time less the seconds paused behind a critical request, as the backstop counts it; a routed run's is the whole remote wall time), `adjustedSeconds` (null for a routed run and after a sampler failure) and `verdict` (`passed`, `failed`, `log-failure`, `stalled`, `timed-out`, `backstop`, `unknown` when the gate ended before the command had one, its two times then null).
 
-  The gate whose append moved the journal writes `events.1.jsonl`'s `release` lines, gzipped, to `%LOCALAPPDATA%\gate\<prefix>archive\events-<yyyyMMddTHHmmssZ>.jsonl.gz` after releasing its slot (`Complete-JournalArchive`, in `Exit-Gate`), skipping and counting lines that do not parse (`gate: archived the release lines of <path>; skipped <n> line(s) that do not parse`), then deletes archives older than 180 days and stray temporary files older than a day; a gate killed after its rolling append never archives.
+  A routed run is judged a kill only when the gate killed it (a command that exits 124 itself after an inner `TIMED OUT` is `failed`).
+
+  The gate whose append moved the journal writes `events.1.jsonl`'s `release` lines, gzipped, to `%LOCALAPPDATA%\gate\<prefix>archive\events-<yyyyMMddTHHmmssZ>.jsonl.gz` after releasing its slot (`Complete-JournalArchive`, in `Exit-Gate`), skipping and counting lines that do not parse (`gate: archived the release lines of <path>; skipped <n> line(s) that do not parse`).
+
+  It then deletes archives older than 180 days and stray temporary files older than a day; a gate killed after its rolling append never archives.
 
   Pins: `Test-JournalVerdict`, `Test-RemoteVerdict`, `Test-JournalArchive`, `Test-JournalArchiveRetention`. Where: [durations] G:`Get-RunVerdict`, `Get-RemoteVerdict`, `Save-ReleaseArchive`, `Complete-JournalArchive`, `Write-EndEvent`. **Essential** (feeds [planned] durations).
 
@@ -268,7 +278,9 @@ Written for `docs/plans/gate-rust-port.md`, step 1. The port may redesign the CL
   - Where: R:369-471. **Essential**; the format is free (**open**: JSON `-like` globs vs another matcher, section 7).
 - **T2 What routes.**
 
-  A command routes only when: the config is present, the gate is heavy and not `-Local`, no parent slot covers or lends to it, `GIT_INDEX_FILE` is unset (a gated `git commit`'s hooks never route), the first non-empty word's file name without extension is not `git` or `prek` (`git.exe`, a full path to git also stay local), the repo name is a key of `repos` case-insensitively (the main checkout's folder name with leading dots dropped and anything outside letters, digits, `-` and `_` turned into `-`: `~/.claude` is `claude`), the gate sits in a git worktree, and the words with inside paths rewritten (T3), joined by single spaces, match a pattern with PowerShell `-like` (case-insensitive, `[ab]` a class, first match wins).
+  A command routes only when: the config is present, the gate is heavy and not `-Local`, no parent slot covers or lends to it, `GIT_INDEX_FILE` is unset (a gated `git commit`'s hooks never route), the first non-empty word's file name without extension is not `git` or `prek` (`git.exe`, a full path to git also stay local).
+
+  A command also routes only when the repo name is a key of `repos` case-insensitively (the main checkout's folder name with leading dots dropped and anything outside letters, digits, `-` and `_` turned into `-`: `~/.claude` is `claude`), the gate sits in a git worktree, and the words with inside paths rewritten (T3), joined by single spaces, match a pattern with PowerShell `-like` (case-insensitive, `[ab]` a class, first match wins).
 
   A command a pattern matches still runs here, saying why, when a word names a path outside the worktree (`gate: not routed: <word> is outside the worktree`) or the gate's folder holds nothing the snapshot sends (`gate: not routed: <subfolder> holds nothing the snapshot sends`, from `git ls-files --cached --others --exclude-standard -- <prefix>` read to its first line). When the decision throws (a git call, the routing file's read) the gate says `gate: not routed: <reason>` and runs here.
   - Pins: `Test-RemoteRoutedPass` (stub run, passed line names the host, remote claim gone at the end, journal queue/take/release with remote fields), `Test-RemoteRoutedFailure` (a failing status passes through), `Test-RemoteUnlistedStaysLocal`, `Test-RemoteKindStaysLocal` (light and critical), `Test-RemoteCoveredStaysLocal`, `Test-RemoteRouteErrorRunsLocal`, `Test-RemoteOutsideStaysLocal`, `Test-RouteRefusals`.
@@ -290,7 +302,9 @@ Written for `docs/plans/gate-rust-port.md`, step 1. The port may redesign the CL
 
   The log then holds the local run's output, then the remote attempt's lines, the fallback line and the local wait's lines (carried as notes, since the local run's start replaces the log); a gate stopped while waiting for the local slot writes those lines as its log (`Write-PendingNote`).
   - Reasons: `full`, `busy`, `unreachable`, `parity`, `rebooted`, `tools`.
-  - Pins: `Test-RemotePoolFullFallsBack`, `Test-RemoteRefusalFallsBack` (unreachable, busy, parity, rebooted, tools in turn; in the busy row a second routed gate queued for the one remote slot takes it only after the fallback is journaled), `Test-RemoteFailureNoFallback` (a stub returning 3 with reason busy: exit 3; 75 with no reason: exit 75), `Test-RemoteWaitKillLeavesNothing` (Ctrl+C-style stop while waiting for the pool or for the local slot after fallback leaves no ticket and no claim), `Test-RemoteFallbackToParent`, `Test-CriticalWaitsForFallback`, `Test-CriticalSkipsRemote`.
+  - Pins: `Test-RemotePoolFullFallsBack`, `Test-RemoteRefusalFallsBack` (unreachable, busy, parity, rebooted, tools in turn; in the busy row a second routed gate queued for the one remote slot takes it only after the fallback is journaled), `Test-RemoteFailureNoFallback` (a stub returning 3 with reason busy: exit 3; 75 with no reason: exit 75).
+
+    More pins: `Test-RemoteWaitKillLeavesNothing` (Ctrl+C-style stop while waiting for the pool or for the local slot after fallback leaves no ticket and no claim), `Test-RemoteFallbackToParent`, `Test-CriticalWaitsForFallback`, `Test-CriticalSkipsRemote`.
   - Where: G:3815-3861, G:4172-4228, G:1944-1960. **Essential**.
 
 ### 1.16 The remote client (`remote.ps1`)
@@ -306,12 +320,20 @@ Written for `docs/plans/gate-rust-port.md`, step 1. The port may redesign the CL
   The URL is `<host>:D:/gate-remote/<repo>.git`, pushed with `--receive-pack`/`--upload-pack` `pwsh -NoProfile -NonInteractive -Command git-receive-pack|git-upload-pack` (cmd keeps git's single-quoted path as literal quotes). Where: R:325-337, R:718-727, R:1339-1380. **Open** (the box protocol is free to change).
 - **RC4 Calls to the box.**
 
-  Every call is `ssh -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=4 <host> "if exist <wrapper> (pwsh -NoProfile -NonInteractive -File <wrapper> <verb> <base64 UTF-8 JSON>) else (exit 99)"`; the line may not exceed 8191 less 64 = 8127 characters (a longer one fails before anything is pushed: `gate: the remote run failed: the run call is N characters, longer than the 8127 cmd takes ...; shorten the command`); on 99 the wrapper's bytes are uploaded on the stdin of an `ssh ... pwsh -EncodedCommand` script (temp file, SHA-256 prefix check, move into place, always remove the temp) and the call is repeated.
+  Every call is `ssh -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=4 <host> "if exist <wrapper> (pwsh -NoProfile -NonInteractive -File <wrapper> <verb> <base64 UTF-8 JSON>) else (exit 99)"`.
+
+  The line may not exceed 8191 less 64 = 8127 characters (a longer one fails before anything is pushed: `gate: the remote run failed: the run call is N characters, longer than the 8127 cmd takes ...; shorten the command`).
+
+  On 99 the wrapper's bytes are uploaded on the stdin of an `ssh ... pwsh -EncodedCommand` script (temp file, SHA-256 prefix check, move into place, always remove the temp) and the call is repeated.
 
   Pins: `Test-CommandTooLong`, `Test-RemotePassFail` (live). Where: R:94-103, R:704-714, R:772-806. **Open** (a native wrapper binary changes all of this; cmd is the sshd default shell).
 - **RC5 Preflight and health refusals.**
 
-  The preflight creates the bare repo and work folder when missing and prints `gate: remote boot <UTC "o">`, `gate: remote sdks <v1,v2,...|none>`; before the push the snapshot's `global.json` is resolved against the box's SDKs by dotnet's `rollForward` table (nine policies, `allowPrerelease`, x.y.znn version shapes with band and patch) and a failure is 75 `parity`: `gate: remote toolchain mismatch: <repo> needs .NET SDK <version> (rollForward <policy>); <alias> has <versions>`; with no readable pin and a tree holding `global.json`, `*.sln`, `*.slnx` or `*.csproj`, the box needs the major of this PC's newest SDK (`a .NET <major> SDK`; `gate: global.json has no readable sdk pin; checking the SDK major only`).
+  The preflight creates the bare repo and work folder when missing and prints `gate: remote boot <UTC "o">`, `gate: remote sdks <v1,v2,...|none>`.
+
+  Before the push the snapshot's `global.json` is resolved against the box's SDKs by dotnet's `rollForward` table (nine policies, `allowPrerelease`, x.y.znn version shapes with band and patch) and a failure is 75 `parity`: `gate: remote toolchain mismatch: <repo> needs .NET SDK <version> (rollForward <policy>); <alias> has <versions>`.
+
+  With no readable pin and a tree holding `global.json`, `*.sln`, `*.slnx` or `*.csproj`, the box needs the major of this PC's newest SDK (`a .NET <major> SDK`; `gate: global.json has no readable sdk pin; checking the SDK major only`).
 
   Pins: `Test-SdkRollForward`, `Test-SdkPinFromSnapshot`, `Test-ParityNoPinScope`, `Test-RemoteParityRefused` (live). Where: R:1065-1287. **Essential**.
 - **RC6 Watchdog of a remote run.** One-second checks: `gate: STALLED: no output or remote CPU for <n> s` when the log took no line for `-StallSeconds` (heartbeat lines count as progress), `gate: TIMED OUT after <n> s` when this PC's wall clock passes the ceiling (never load-adjusted, heartbeats included); the kill stops the local ssh (`Process.Kill(true)`) and sends `stop` (30 s limit, `gate: stopping the command on <host> did not finish in 30 s`).
@@ -327,7 +349,11 @@ Written for `docs/plans/gate-rust-port.md`, step 1. The port may redesign the CL
   Pins: `Test-RemoteCommand75NotBusy`, `Test-RemoteToolsReason`, `Test-RemoteRefusedSkipsSync`. Where: R:1384-1410, R:1425-1443. **Essential** (the reason must come from a channel a command cannot forge: the exact-line match in the run's output is a weak version of that; **open**).
 - **RC9 Sync-back.**
 
-  After the run, `refs/gate-back/<key>` is fetched (`ls-remote` then `fetch -q`, with `--upload-pack` as above); a back commit not made from this run's snapshot (its single parent must equal the snapshot) is ignored (`gate: ignored stale remote changes <sha8>: not made from snapshot <sha8>`); when the worktree's tree still equals the snapshot's, `git diff --binary` is applied with `git apply --whitespace=nowarn` (`gate: synced back <n> file(s): <names>`); otherwise nothing is applied, the changes are kept at `refs/gate-remote/<key>-back` and a passing run becomes exit 1 (`gate: remote changes not applied: the worktree changed during the run; see git diff <snap8> <back8>`).
+  After the run, `refs/gate-back/<key>` is fetched (`ls-remote` then `fetch -q`, with `--upload-pack` as above).
+
+  A back commit not made from this run's snapshot (its single parent must equal the snapshot) is ignored (`gate: ignored stale remote changes <sha8>: not made from snapshot <sha8>`); when the worktree's tree still equals the snapshot's, `git diff --binary` is applied with `git apply --whitespace=nowarn` (`gate: synced back <n> file(s): <names>`).
+
+  Otherwise nothing is applied, the changes are kept at `refs/gate-remote/<key>-back` and a passing run becomes exit 1 (`gate: remote changes not applied: the worktree changed during the run; see git diff <snap8> <back8>`).
 
   Pins: `Test-SyncBackApplies`, `Test-SyncBackRefusesChangedWorktree`, `Test-StaleBackIgnored`, `Test-RemoteSyncBack` (live), `Test-RemoteLineEndings` (LF in, LF back). Where: R:994-1039. **Essential** (the refusal's breadth is **open**, CC-204).
 - **RC10 Break handling.** A Ctrl+C/stop/exception in the phase kills the local ssh/git process and, once the run call had started, sends `stop`; a run that stopped early returns status 1. Pins: `Test-RemoteExceptionStopsRun`, `Test-RemoteCommandNoVerdict` (the gate-facing call writes no verdict, no tail), `Test-RemoteLogTypeLazy` (dot-sourcing compiles nothing). Where: R:1459-1509. **Essential**.
@@ -340,7 +366,11 @@ Written for `docs/plans/gate-rust-port.md`, step 1. The port may redesign the CL
   No verb: `usage: remote-wrapper.ps1 preflight|run|stop|boot <base64 JSON payload>` and exit 2. Dot-sourced it defines functions and runs nothing. Where: W:1775-1802. **Open** (the protocol is free; a native `gate-box.exe` could take JSON on stdin).
 - **BW2 Preflight.**
 
-  Creates the bare repo (`gate: remote created <bare>`) and work folder when missing, adds `origin` even when `.git` exists (so a half-finished preflight is repaired), sets `core.autocrlf false` and `core.eol lf` in the work folder's own config, writes `.git/objects/info/alternates` (forward slashes, LF) pointing at the bare repo's objects (otherwise every fetch copied the whole tree), prints the boot and SDK lines (a value it cannot read prints no line and `gate: remote could not read the boot time: <message>` / `... the SDK list: ...` on stderr; the check is skipped), then touches its own file's last-write time and removes other `gate-remote-<8 hex>.ps1` copies last written more than 7 days ago (failures reported on stderr, never fatal).
+  Creates the bare repo (`gate: remote created <bare>`) and work folder when missing, adds `origin` even when `.git` exists (so a half-finished preflight is repaired), sets `core.autocrlf false` and `core.eol lf` in the work folder's own config.
+
+  It writes `.git/objects/info/alternates` (forward slashes, LF) pointing at the bare repo's objects (otherwise every fetch copied the whole tree), prints the boot and SDK lines (a value it cannot read prints no line and `gate: remote could not read the boot time: <message>` / `... the SDK list: ...` on stderr; the check is skipped).
+
+  It then touches its own file's last-write time and removes other `gate-remote-<8 hex>.ps1` copies last written more than 7 days ago (failures reported on stderr, never fatal).
 
   Pins: `Test-WrapperPreflightRepairs`, `Test-WrapperPrunesOldCopies`, `Test-WrapperPruneUnlistedFolder`, `Test-RemoteBootLine`, `Test-RemoteLineEndings`. Where: W:1319-1345, W:1714-1773. **Essential** (the effects; the 7-day prune is a PowerShell-era artefact of content-addressed copies: **open**).
 - **BW3 Work lock.** `run` opens `work\<key>.lock` with `FileShare.None` (exclusive) and holds it for the wrapper's life; ERROR_SHARING_VIOLATION (32) or ERROR_LOCK_VIOLATION (33) is busy: `gate: remote work folder <key> is busy`, exit 75. .NET opens files non-inheritable and the command inherits only its handles, so no process a command leaves running can keep the folder busy.
@@ -351,7 +381,9 @@ Written for `docs/plans/gate-rust-port.md`, step 1. The port may redesign the CL
   A Subfolder that is rooted or climbs out of the work folder is refused before the checkout (exit 2, `gate: remote subfolder <sub> is not a folder inside the work folder`, back ref deleted); one the snapshot does not hold as a folder (git keeps no empty folder) after it (`gate: remote subfolder <sub> does not exist in the snapshot`, exit 2). Pins: `Test-WrapperSubfolder` (all three), `Test-RunPayloadSubfolder`. Where: W:1461-1474, W:1619-1629, W:1653-1695. **Essential**.
 - **BW5 Dotnet local tools.**
 
-  Before the command, `dotnet tool restore` runs in the Subfolder when the manifests dotnet would read for it (that folder and its parents up to the work root; each folder's `.config/dotnet-tools.json` else `dotnet-tools.json`) changed since the last restore, recorded as one SHA-256 over their relative paths and bytes (separated by NULs) in `work\<key>.tools`; a failed restore exits 75 with `gate: remote tool restore failed (status N)` and `gate: remote work folder <key> could not restore its dotnet tools`, the command never run.
+  Before the command, `dotnet tool restore` runs in the Subfolder when the manifests dotnet would read for it (that folder and its parents up to the work root; each folder's `.config/dotnet-tools.json` else `dotnet-tools.json`) changed since the last restore, recorded as one SHA-256 over their relative paths and bytes (separated by NULs) in `work\<key>.tools`.
+
+  A failed restore exits 75 with `gate: remote tool restore failed (status N)` and `gate: remote work folder <key> could not restore its dotnet tools`, the command never run.
 
   Known limit: after the box's NuGet cache is cleared, `work\*.tools` must be deleted by hand. Pins: `Test-WrapperToolRestore`, `Test-WrapperToolRestoreWalk` (a manifest only in a subfolder; moving a manifest's bytes to another path restores again). Where: W:1510-1596, call site W:1724. **Essential**; **open** whether the port keeps dotnet-specific knowledge in the gate.
 - **BW6 Running the command.** In the Subfolder (PowerShell location and process current directory both, restored after), with a `.cmd`/`.bat` refused (exit 2) for a word holding a line break or `%NAME%` of a variable set on the box; the first word resolved on PATH with PATHEXT; the line quoted as C4/C5.
@@ -363,7 +395,9 @@ Written for `docs/plans/gate-rust-port.md`, step 1. The port may redesign the CL
   Pins: `Test-WrapperCommandLine` (a `.cmd` in a folder with a space), `Test-WrapperBatchRefusal`, `Test-RemoteBatchMetacharacters` (live), `Test-WrapperJobPerRun`, `Test-WrapperStopByName`, `Test-RemoteStop`, `Test-RemoteStopSparesNextRun`. Where: W:1396-1457, W:815-935, W:1566-1651. **Essential**.
 - **BW7 UTF-8 console.**
 
-  The command gets a hidden console of its own whose input and output code pages are 65001 from its first instruction (a .NET tool's non-ASCII output decodes right): a suspended donor `cmd.exe /d /q /k` is put in the job; the wrapper leaves its own console (`FreeConsole`, first starting a keeper `cmd.exe` on it when alone so it never closes), `AttachConsole(donor)`, `SetConsoleCP(65001)`, `SetConsoleOutputCP(65001)`, creates the command to inherit that console, waits (10 s) until it is attached (`GetConsoleProcessList`), then returns through the keeper or its parent, restoring any standard handle that was not a console handle (the ssh pipes).
+  The command gets a hidden console of its own whose input and output code pages are 65001 from its first instruction (a .NET tool's non-ASCII output decodes right): a suspended donor `cmd.exe /d /q /k` is put in the job.
+
+  The wrapper leaves its own console (`FreeConsole`, first starting a keeper `cmd.exe` on it when alone so it never closes), `AttachConsole(donor)`, `SetConsoleCP(65001)`, `SetConsoleOutputCP(65001)`, creates the command to inherit that console, waits (10 s) until it is attached (`GetConsoleProcessList`), then returns through the keeper or its parent, restoring any standard handle that was not a console handle (the ssh pipes).
 
   If this cannot be done the command runs on a plain hidden console with the box's default code page and the wrapper says `gate: remote could not give the command a UTF-8 console (<reason>); running it on the box's default code page` (a command already started on the UTF-8 console is first ended with its whole job and started again in a replacement job of the same name; the run never fails for it).
 
@@ -373,7 +407,9 @@ Written for `docs/plans/gate-rust-port.md`, step 1. The port may redesign the CL
   Pins: `Test-WrapperDrainCutoff`, `Test-RemoteDetachedChildHoldsOutput` (live). Where: W:319-365, W:379-397, W:1583-1585. **Essential**.
 - **BW9 Heartbeats.**
 
-  `gate-remote-heartbeat: <CPU ms counted so far>` on stderr every 5 s while it checks out, drains and syncs back (unconditionally); while the command runs, on the 5 s tick only once the CPU of the command's job plus every build server on the box (VBCSCompiler and `dotnet` running `VBCSCompiler.dll` or an MSBuild node, in whatever job) since the last heartbeat reaches 1% of one core (10 ms per second, carried forward; `BeatClock`; a server new in a sample, or whose total fell because its id was reused, counts all its CPU).
+  `gate-remote-heartbeat: <CPU ms counted so far>` on stderr every 5 s while it checks out, drains and syncs back (unconditionally).
+
+  While the command runs, on the 5 s tick only once the CPU of the command's job plus every build server on the box (VBCSCompiler and `dotnet` running `VBCSCompiler.dll` or an MSBuild node, in whatever job) since the last heartbeat reaches 1% of one core (10 ms per second, carried forward; `BeatClock`; a server new in a sample, or whose total fell because its id was reused, counts all its CPU).
 
   A write that fails ends the heartbeats silently; a CPU sample that cannot be read writes `gate: remote heartbeat stopped: <message>`. Known limit: another run's busy build on the box can keep a silent idle command from stalling until the wall-clock timeout. Pins: `Test-HeartbeatBeatClock`, `Test-HeartbeatServerSum`, `Test-HeartbeatWriteFailure` (flaky under load: a 2 s wall-clock bound, CC-209), `Test-HeartbeatOutsideCommand`. Where: W:1118-1284. **Essential**.
 - **BW10 Back commit.** After the command, the changed tree is committed (`add -A` through a copy of the work folder's index, `write-tree`, compare to `HEAD^{tree}`, `commit-tree -p HEAD`, `push -q origin <sha>:refs/gate-back/<key>`); nothing when unchanged. A failure writes `gate: remote sync-back failed: <reason>` and makes a passing status 1. Pins: `Test-RemoteSyncBack` (live), `Test-RemoteLineEndings`. Where: W:1596-1614, W:1683-1688. **Essential**.
@@ -394,17 +430,29 @@ Written for `docs/plans/gate-rust-port.md`, step 1. The port may redesign the CL
 
   The marker `%LOCALAPPDATA%\gate\remote\<key>.outputs-pending` (`GATE_TEST_OUTPUTS_PENDING` in tests) is written before the run call and removed only when the step completed; a run that finds it sends `OutputsFull` and the box packs every differing file. A failure anywhere makes a passing run exit 1 with `gate: remote outputs not brought back: <reason>`; the box drops archives older than 24 h at every run.
 
-  Pins (a partial list from the branch's `sync-back` section): `Test-OutputsPackDiffersOnly`, `Test-OutputsPackExcludes`, `Test-OutputsObjOptIn`, `Test-OutputsNothingWritten`, `Test-OutputsExtractApplies`, `Test-OutputsClobberSkips`, `Test-OutputsRejectsEscapingMember`, `Test-OutputsHashMismatch`, `Test-OutputsMtimeClamped`, `Test-OutputsSkippedOnChangedWorktree`, `Test-OutputsFailingRunKeepsStatus`, `Test-OutputsGlobMatchersAgree`, `Test-OutputsOldCopyPacked`, `Test-OutputsUnchangedNotPacked`, `Test-OutputsFullResends`, `Test-OutputsPendingMarker`, `Test-OutputsNonAsciiRefused` (bsdtar reads its list in the box's ANSI code page), `Test-OutputsTargetLockedMovesNothing`, `Test-OutputsFetchKilledSaysSo`, `Test-OutputsSkipBackCommitPaths`, `Test-OutputsManifestProblemFails`, `Test-PublishBackCommitPaths`; gate side `Test-GateRouteCarriesOutputs`.
+  Pins (a partial list from the branch's `sync-back` section): `Test-OutputsPackDiffersOnly`, `Test-OutputsPackExcludes`, `Test-OutputsObjOptIn`, `Test-OutputsNothingWritten`, `Test-OutputsExtractApplies`, `Test-OutputsClobberSkips`, `Test-OutputsRejectsEscapingMember`, `Test-OutputsHashMismatch`, `Test-OutputsMtimeClamped`.
+
+  More pins: `Test-OutputsSkippedOnChangedWorktree`, `Test-OutputsFailingRunKeepsStatus`, `Test-OutputsGlobMatchersAgree`, `Test-OutputsOldCopyPacked`, `Test-OutputsUnchangedNotPacked`, `Test-OutputsFullResends`, `Test-OutputsPendingMarker`, `Test-OutputsNonAsciiRefused` (bsdtar reads its list in the box's ANSI code page).
+
+  More pins: `Test-OutputsTargetLockedMovesNothing`, `Test-OutputsFetchKilledSaysSo`, `Test-OutputsSkipBackCommitPaths`, `Test-OutputsManifestProblemFails`, `Test-PublishBackCommitPaths`; gate side `Test-GateRouteCarriesOutputs`.
 
   **Essential** (the behaviour; CC-163's rules); the transport (tar.xz over ssh stdout) is **open**.
 - **D2 [outputs] Pre-banner retry.**
 
-  Every ssh call of a run (preflight, upload, push, run call, outputs fetch, stop, boot) and sync-back's `ls-remote`/`fetch` is retried once after `gate: <host> did not answer the ssh banner; trying once more` and a 2 s pause when it ended with ssh's 255 (git's 128 for push/`ls-remote`/`fetch`), was not killed by the watchdog, wrote nothing on stdout and its first stderr line starts with `Connection timed out during banner exchange`, `kex_exchange_identification: ` or `banner exchange: `; stop and boot keep 30 s for both attempts together (no retry with under 5 s left); an outputs fetch that already copied a byte is never retried.
+  Every ssh call of a run (preflight, upload, push, run call, outputs fetch, stop, boot) and sync-back's `ls-remote`/`fetch` is retried once after `gate: <host> did not answer the ssh banner; trying once more` and a 2 s pause when it ended with ssh's 255 (git's 128 for push/`ls-remote`/`fetch`), was not killed by the watchdog, wrote nothing on stdout and its first stderr line starts with `Connection timed out during banner exchange`, `kex_exchange_identification: ` or `banner exchange: `.
+
+  Stop and boot keep 30 s for both attempts together (no retry with under 5 s left).
+
+  An outputs fetch that already copied a byte is never retried.
 
   Pins: `Test-RemotePreBannerRetried`, `Test-RemoteSyncPreBannerRetried`, `Test-RemoteBoundedRetry`, `Test-RemoteKilledPushIsFinal`. **Essential** (CC-146).
 - **D3 [outputs] Gate-facing change.** `Invoke-RemoteWatched` passes the route's `Outputs` globs; `Get-RemoteRoute` returns `{Host; Slots; Pattern; Outputs}`; the self-test counts become 88 local and 22 remote cases (README on the branch).
 - **D4 [durations] Journal facts and archive** (J5); `gate.selftest.ps1` grows to 5,356 lines and `journal` to 11 cases (adds `Test-JournalVerdict`, `Test-JournalArchive`, `Test-JournalArchiveRetention`, `Test-RemoteVerdict`).
-- **D5 [planned] Durations summary, `-Expect`, ETAs, `auto`, backfill** (`docs/plans/gate-durations.md`, CC-182 to CC-185, CC-197, CC-199): `%LOCALAPPDATA%\gate\durations.json` (key `<place>:<class>:<repo>[/<sub>] | <normalised command>` with a family key; p50/p90/p99 of `wallSeconds` over the last 30 passing runs or 14 days, 5 runs needed, `keyVersion` rebuilds from the archive), `gate: expected about <n> min (usual <p50>, p90 <p90>, <n> runs)` at take, `gate -Expect -- <command>`, ETAs in wait lines, `expected {p50,p90,n,key}` in claims and tickets (ops-tower fixtures and struct change), `-TimeoutSeconds auto` as a floor (`max(n, 3 x load-adjusted p99)`), hang hints at p90 and 3 x p90, and backfill guests during a critical drain (window file `%LOCALAPPDATA%\gate\backfill\<pid>.json`; guest admitted when its p90 + 10% ends before the shadow end, ceiling at most 2x the window, key qualified and not barred, command safe to repeat; a guest still running when the drain completes is killed and re-queued per the CC-198 ruling; the key barred 24 h).
+- **D5 [planned] Durations summary, `-Expect`, ETAs, `auto`, backfill** (`docs/plans/gate-durations.md`, CC-182 to CC-185, CC-197, CC-199): `%LOCALAPPDATA%\gate\durations.json` (key `<place>:<class>:<repo>[/<sub>] | <normalised command>` with a family key; p50/p90/p99 of `wallSeconds` over the last 30 passing runs or 14 days, 5 runs needed, `keyVersion` rebuilds from the archive).
+
+  Also `gate: expected about <n> min (usual <p50>, p90 <p90>, <n> runs)` at take, `gate -Expect -- <command>`, ETAs in wait lines, `expected {p50,p90,n,key}` in claims and tickets (ops-tower fixtures and struct change), `-TimeoutSeconds auto` as a floor (`max(n, 3 x load-adjusted p99)`), hang hints at p90 and 3 x p90.
+
+  Also backfill guests during a critical drain (window file `%LOCALAPPDATA%\gate\backfill\<pid>.json`; guest admitted when its p90 + 10% ends before the shadow end, ceiling at most 2x the window, key qualified and not barred, command safe to repeat; a guest still running when the drain completes is killed and re-queued per the CC-198 ruling; the key barred 24 h).
 
   The plan builds these in Rust, not in PowerShell. **Essential** (as roadmap, not as port scope).
 
@@ -553,7 +601,9 @@ Searches (run 2026-10-09; quote them to re-size the sweep):
 - `~/.claude`: Grep tool, path `C:\Users\someone\.claude`, pattern `tools/gate\.ps1|gate\.ps1|gate-launcher|-Slot (heavy|light|critical)|gate-slot|LOCALAPPDATA.{1,3}gate|events\.jsonl|gate-remote|remote-wrapper|tools[/\\]gate[/\\]|gate:`, output count, glob `!{.tmp,projects,sessions,file-history,shell-snapshots,paste-cache,cache,debug,backups,plugins,tasks,jobs,session-env,skill-observations,history.jsonl,debug.log,daemon.log,.git}/**`.
 
   Result: 82 files, 960 occurrences, of which `tools/gate/` itself holds 10 files and 656.
-- Each repo under `X:\dev` (top-level folders, `_ext` and `*.wt` skipped): `.tmp/consumers.sh` in `~/.claude` (untracked helper) runs `rg --hidden -g '!.git' -g '!.tmp' -g '!node_modules' -g '!target' -g '!bin' -g '!obj' -g '!.venv' -g '!dist' -g '!build' -g '!.godot' -g '!.vs' -g '!*.log' -g '!*.jsonl' -g '!*.lock' -c -e <pattern> <repo>` with three patterns: `calls` = `gate\.ps1|gate-launcher`, `slot` = `-Slot[ =:]+(heavy|light|critical)`, `state` = `gate-slot|gate-remote|LOCALAPPDATA.{0,4}gate|events\.jsonl|GATE_(SLOT|TEST|SAMPLE)|gate:`.
+- Each repo under `X:\dev` (top-level folders, `_ext` and `*.wt` skipped): `.tmp/consumers.sh` in `~/.claude` (untracked helper) runs `rg --hidden -g '!.git' -g '!.tmp' -g '!node_modules' -g '!target' -g '!bin' -g '!obj' -g '!.venv' -g '!dist' -g '!build' -g '!.godot' -g '!.vs' -g '!*.log' -g '!*.jsonl' -g '!*.lock' -c -e <pattern> <repo>`.
+
+  The three patterns are: `calls` = `gate\.ps1|gate-launcher`, `slot` = `-Slot[ =:]+(heavy|light|critical)`, `state` = `gate-slot|gate-remote|LOCALAPPDATA.{0,4}gate|events\.jsonl|GATE_(SLOT|TEST|SAMPLE)|gate:`.
 
   The per-file lists are in `.tmp/consumers2.out`. Counts are files/matches and include each repo's launcher copy (1 file, 11 call matches, 18 state matches), so a repo showing exactly `calls=1f/11m` has no consumer beyond its launcher. `rg` respects `.gitignore`, so ignored files (including most `.claude/settings.local.json`) are not counted.
 
@@ -581,7 +631,9 @@ Searches (run 2026-10-09; quote them to re-size the sweep):
 
 - 15 repos carry the launcher: exactly `$gateRepos` in `tools/sync-launchers.ps1:34` (the paths there mix `D:\` and `X:\dev\` spellings).
 
-  `-StopTree` is called from 2 repos (opening-hand and in-the-sky `test-all.ps1`); `-Tail` and `-NoMarkers` from godot-mcp's `run.ps1`; no repo script passing `-Local` was found (agents may); `-NoMarkers`, `-StopTree` or `-StallSeconds` appear in the docs of 6 repos (in-the-sky, godot-mcp, delve-the-dungeon, yaat, rustling-tulip, opening-hand). delve-the-dungeon also restates the gate's slot-count formula and `slot-counts.json` override in prose (`docs/DEVELOPMENT.md:279-281`, `docs/GLOSSARY.md:75-76`), so a changed default count is a doc change there too.
+  `-StopTree` is called from 2 repos (opening-hand and in-the-sky `test-all.ps1`); `-Tail` and `-NoMarkers` from godot-mcp's `run.ps1`; no repo script passing `-Local` was found (agents may).
+
+  `-NoMarkers`, `-StopTree` or `-StallSeconds` appear in the docs of 6 repos (in-the-sky, godot-mcp, delve-the-dungeon, yaat, rustling-tulip, opening-hand). delve-the-dungeon also restates the gate's slot-count formula and `slot-counts.json` override in prose (`docs/DEVELOPMENT.md:279-281`, `docs/GLOSSARY.md:75-76`), so a changed default count is a doc change there too.
 - Each `<project>-nextup` profile (11 repos, plus `claude-config-nextup` here) has a Gates table of `pwsh tools/gate.ps1 ...` commands; the sweep must rewrite every one. The global `CLAUDE.md` rule and the `implementer`/`nextup` skills say the same.
 - Other places that call it by absolute path rather than the launcher: `tools/ci-local` (WSL job runs `pwsh tools/gate/gate.ps1 ... -- wsl -d Ubuntu ...`), `tools/ck/index-active.sh` (`GATE="$HOME/.claude/tools/gate/gate.ps1"`), `tools/gate/test-all.ps1` (`$HOME/.claude/tools/gate/gate.ps1`), delegate bench (`Path.home()/.claude/tools/gate/gate.ps1`).
 
@@ -636,7 +688,9 @@ Branch deltas: `[outputs]` 88 local and 22 remote cases (the README's own count)
   - the remaining sections on a light gate: 405 s, 454 s, 521 s, 1,330 s (cc-181, beside two other sessions' suites and a pytest run) and 475 s;
   - `remote.selftest.ps1` without a host (local cases): 150 s to 700 s (150, 304, 358, 610, 700); with `-HostAlias <box>` (live cases): 259 s (cc-169b), 541 s (cc173-land), 963 s and 1,055 s (cc-163), 1,139 s (cc-179), 1,142 s (cc-146);
   - before `test-all.ps1` the full `gate.selftest.ps1` on a critical gate took 320 s to 328 s and the remote suite 712 s to 1,134 s. The plan's "9 to 22 minutes" matches 541 s to 1,330 s.
-- Slowest cases of one `[outputs]` rebase run (`C:\Users\someone\.claude-wt\feat-gate-remote-outputs\.tmp\rb-remote-slot.log`; the log ends `4 case(s) failed.`): `Test-FormatFixtureRemote` 117.3 s, `Test-RemoteOutsideStaysLocal` 102.2 s, `Test-RemoteWaitKillLeavesNothing` 74.1 s, `Test-FormatFixture` 68.1 s, `Test-RemoteNoBuildDropped` 65.5 s, `Test-RemoteRefusalFallsBack` 57.7 s, `Test-RemoteWordsRewritten` 51.5 s, `Test-RemotePoolFullFallsBack` 39.1 s. The same `Test-FormatFixtureRemote` alone took 32.7 s (`rb-fixture-remote.log`).
+- Slowest cases of one `[outputs]` rebase run (`C:\Users\someone\.claude-wt\feat-gate-remote-outputs\.tmp\rb-remote-slot.log`; the log ends `4 case(s) failed.`): `Test-FormatFixtureRemote` 117.3 s, `Test-RemoteOutsideStaysLocal` 102.2 s, `Test-RemoteWaitKillLeavesNothing` 74.1 s, `Test-FormatFixture` 68.1 s.
+
+  Then `Test-RemoteNoBuildDropped` 65.5 s, `Test-RemoteRefusalFallsBack` 57.7 s, `Test-RemoteWordsRewritten` 51.5 s, `Test-RemotePoolFullFallsBack` 39.1 s. The same `Test-FormatFixtureRemote` alone took 32.7 s (`rb-fixture-remote.log`).
 - `test-all.ps1` ceilings: 900 s critical, 1,800 s light; each case process 600 s; each started gate in the suite 90 s.
 - Journal volume: `events.jsonl` 4.3 MB and `events.1.jsonl` 5.2 MB on 2026-10-09 (rolls at 5 MB; about 22.5K lines, two days; `docs/plans/gate-durations.md`/CC-178).
 
@@ -683,7 +737,9 @@ The Linear read-only tools, team CC, projects "Gate and launchers", "Remote slot
 | CC-178 | Learn each command's usual runtime and schedule with it (umbrella) | **Carried**. Its description still says an overrunning guest is "let finish, never killed"; the CC-198 ruling and `gate-durations.md:70` say killed once the drain completes |
 | CC-212 | Port the gate to Rust (this) | umbrella |
 
-Done issues that shape the port: CC-206 (lending a heavy slot while a command waits on a lock: measured, not worth building; `docs/research/2026-10-09-gate-lock-waits.md`), CC-198 (backfill guests are killed and re-queued when the drain completes), CC-196 (`-TimeoutSeconds auto` is a floor, never a learned kill time), CC-186 (`-Local`), CC-172 (two light gates beside a critical gate), CC-146 (pre-banner retry), CC-145/CC-147 (cmd quoting, wrapper quoting, UTF-8 console), CC-169/CC-167/CC-155 (self-test sections, parallel landing run).
+Done issues that shape the port: CC-206 (lending a heavy slot while a command waits on a lock: measured, not worth building; `docs/research/2026-10-09-gate-lock-waits.md`), CC-198 (backfill guests are killed and re-queued when the drain completes), CC-196 (`-TimeoutSeconds auto` is a floor, never a learned kill time).
+
+Also CC-186 (`-Local`), CC-172 (two light gates beside a critical gate), CC-146 (pre-banner retry), CC-145/CC-147 (cmd quoting, wrapper quoting, UTF-8 console), CC-169/CC-167/CC-155 (self-test sections, parallel landing run).
 
 ## 7. Open decisions the redesign forces
 
@@ -736,13 +792,19 @@ The inventory took far more than a Task Index row and one doc (about 110 reads a
 
 - Task in the caller's words: "Port the gate, or size a cutover: what does the gate do, and who reads or calls it".
 
-  Files, in order: `docs/plans/gate-rust-port.md` → `tools/gate/README.md` ("Formats other tools read", "Journal", "Load-critical requests", "Remote runs") → `tools/gate/gate.ps1` (the help header, lines 3-411, is the behaviour spec; the native C# at 468-1280) → `tools/gate/remote.ps1` and `remote-wrapper.ps1` (help headers) → the `$sections` tables of `tools/gate/gate.selftest.ps1:179` and `remote.selftest.ps1:155` (case names are the edge-case record) → ops-tower `crates/gate-state/src/` (`claims.rs`, `state.rs`, `journal.rs`, `win32.rs`) and `src/agents/activity.rs` → the consumer list: `tools/sync-launchers.ps1:34` (`$gateRepos`), `hooks/block-bad-dotnet.ps1:159`, `hooks/gate-reminder.ps1`, `hooks/subagent-context.ps1:15`, each repo's `.claude/skills/*-nextup/SKILL.md` Gates table, `tools/ci-local/README.md`, `tools/ck/index-active.sh` → `.tmp/map-gate-behaviour.md` while the port is open.
+  Files, in order: `docs/plans/gate-rust-port.md` → `tools/gate/README.md` ("Formats other tools read", "Journal", "Load-critical requests", "Remote runs") → `tools/gate/gate.ps1` (the help header, lines 3-411, is the behaviour spec; the native C# at 468-1280) → `tools/gate/remote.ps1` and `remote-wrapper.ps1` (help headers).
+
+  Next in order: the `$sections` tables of `tools/gate/gate.selftest.ps1:179` and `remote.selftest.ps1:155` (case names are the edge-case record) → ops-tower `crates/gate-state/src/` (`claims.rs`, `state.rs`, `journal.rs`, `win32.rs`) and `src/agents/activity.rs`.
+
+  Next in order: the consumer list: `tools/sync-launchers.ps1:34` (`$gateRepos`), `hooks/block-bad-dotnet.ps1:159`, `hooks/gate-reminder.ps1`, `hooks/subagent-context.ps1:15`, each repo's `.claude/skills/*-nextup/SKILL.md` Gates table, `tools/ci-local/README.md`, `tools/ck/index-active.sh` → `.tmp/map-gate-behaviour.md` while the port is open.
 - A second row: "Find every caller of the gate in a repo" → `tools/sync-launchers.ps1` (`$gateRepos`) then `rg 'gate\.ps1|gate-launcher|-Slot'` per repo (the three patterns in section 4).
 
 ## MISSING ENTRY POINT
 
 - No missing `docs/README.md` or `docs/ARCHITECTURE.md`; the architecture doc has a Task Index.
 
-  Glossary gaps (terms the gate docs and the port plan use in a project sense with no entry in `docs/GLOSSARY.md`): **Claim (gate)** (only the inbox claim is defined, line 22; the gate's claim file is used throughout the README), **Slot marker** / `GATE_SLOT_HELD` and **covered** (a gate a parent's slot covers), **Drain** (a critical gate's wait for the gates ahead of it), **Holds the machine**, **Take / release** as journal events, **Verdict** (the journal field on `[durations]`), **Key** (the work-folder key; only "Work folder" mentions it), **Strangler**, **Drained cutover** and **Cutover sweep** (`docs/plans/gate-rust-port.md`).
+  Glossary gaps (terms the gate docs and the port plan use in a project sense with no entry in `docs/GLOSSARY.md`): **Claim (gate)** (only the inbox claim is defined, line 22; the gate's claim file is used throughout the README), **Slot marker** / `GATE_SLOT_HELD` and **covered** (a gate a parent's slot covers), **Drain** (a critical gate's wait for the gates ahead of it).
+
+  More gaps: **Holds the machine**, **Take / release** as journal events, **Verdict** (the journal field on `[durations]`), **Key** (the work-folder key; only "Work folder" mentions it), **Strangler**, **Drained cutover** and **Cutover sweep** (`docs/plans/gate-rust-port.md`).
 
   On `feat/gate-remote-outputs` the glossary already adds **Outputs** and **Outputs-pending marker**.

@@ -106,7 +106,9 @@ The rule that shapes it: every file and kernel object another process sees is de
   `counts.rs` also writes the counts files for ops-tower's Gates tab (`apply_slot_count`, `write_slot_counts`): the PowerShell layout's file, then `gate.exe`'s `v1\slot-counts.json` beside it. `apply_slot_count` keeps the other pool's valid count, replaces a missing, blank, invalid or non-object file, and fails with `ApplyError::Read` on a file that exists but cannot be read, leaving it untouched.
 - **`gate-watchdog`** (`crates/gate-watchdog/`, pure): owns the free-share, load-adjusted clock, stall, ceiling and backstop arithmetic over samples (`share.rs`, `watch.rs`, including `measure_cpu` and the progress that build servers and the WSL VM add).
 
-  It also owns the classifiers of build servers, build clients and `wsl` commands over names and command lines (`servers.rs`: `is_build_server`, `is_compiler_server` and `is_compiler_image`, which takes the test seam's image name; with the build servers' priority rule `server_target` and `server_left` over an `Option<PriorityClass>`, `None` being an unreadable class), the kill lines, and the pure formatting of the diagnostics block a kill writes (`diagnostics.rs`: `lines`, `failed_block`, `failed_line` and the caps `JOB_LINES` and `OUTSIDE_LINES`).
+  It also owns the classifiers of build servers, build clients and `wsl` commands over names and command lines (`servers.rs`: `is_build_server`, `is_compiler_server` and `is_compiler_image`, which takes the test seam's image name; with the build servers' priority rule `server_target` and `server_left` over an `Option<PriorityClass>`, `None` being an unreadable class), and the kill lines.
+
+  It also owns the pure formatting of the diagnostics block a kill writes (`diagnostics.rs`: `lines`, `failed_block`, `failed_line` and the caps `JOB_LINES` and `OUTSIDE_LINES`).
 
   The box heartbeat's beat rule and pump are in `heartbeat.rs`.
 
@@ -119,7 +121,9 @@ The rule that shapes it: every file and kernel object another process sees is de
 
   Built so far: named mutexes, events and process start times (the gate's own, and `process_start_of(pid)` for another process, `None` for a pid that is gone or exited).
 
-  Also `move_no_replace` (`file.rs`: a rename that never replaces its target, which a sync-back moves fetched objects with), `device_target` (`device.rs`: the target of a drive letter's DOS device over `QueryDosDevice`, which the routing facts use to follow `subst` drives), `system_directory` (the folder holding cmd.exe), `runs_below_normal` (the gate's own priority class), `win32_message`, `boot_time` (when the machine booted), and job objects (`Job`: create, `create_kill_on_close` (a job whose last handle ends its processes, never handed to a piped command), terminate, process ids, `accounting`; `OpenedJob`: open by name with query and terminate access, `open_to_list` with query access only (the priority guard uses it), process ids, terminate).
+  Also `move_no_replace` (`file.rs`: a rename that never replaces its target, which a sync-back moves fetched objects with), `device_target` (`device.rs`: the target of a drive letter's DOS device over `QueryDosDevice`, which the routing facts use to follow `subst` drives), `system_directory` (the folder holding cmd.exe), `runs_below_normal` (the gate's own priority class), `win32_message`, `boot_time` (when the machine booted).
+
+  Also job objects (`Job`: create, `create_kill_on_close` (a job whose last handle ends its processes, never handed to a piped command), terminate, process ids, `accounting`; `OpenedJob`: open by name with query and terminate access, `open_to_list` with query access only (the priority guard uses it), process ids, terminate).
 
   Process stopping is `StoppableProcess` (open, created, parent_pid, in_job, exited, wait, exit_code, terminate; in `tree.rs`; `Job::holds` is the job-membership question it asks), and `WaitableProcess` (open, created, wait; also in `tree.rs`) is a process opened only to wait for its end, which `gate burn` uses for its parent.
 
@@ -172,7 +176,9 @@ The rule that shapes it: every file and kernel object another process sees is de
 
   `client.rs` runs the calls in anonymous kill-on-close jobs and holds the watch, the stop and Ctrl+C.
 
-  Beside them are `slots.rs` (`ThisGate`, the gate's identity built once and shared with the journal; the pool, liveness, take, claim, wake and deletes), `wait.rs` (the wait loop and its lines, the barrier of a critical request ahead, the reserved light slots beside it, the lend of a light parent's slot and the writing of the pause marker, over `Waiter`, the wake event, ticket, sleep and heartbeat that `Wait` and the critical `MachineWait` share), `acquire.rs` (`try_slot` and the abandoned-take line) and `journal.rs` (`RunJournal`, the run's journal lines).
+  Beside them are `slots.rs` (`ThisGate`, the gate's identity built once and shared with the journal; the pool, liveness, take, claim, wake and deletes), `wait.rs` (the wait loop and its lines, the barrier of a critical request ahead, the reserved light slots beside it, the lend of a light parent's slot and the writing of the pause marker, over `Waiter`, the wake event, ticket, sleep and heartbeat that `Wait` and the critical `MachineWait` share).
+
+  Beside them are also `acquire.rs` (`try_slot` and the abandoned-take line) and `journal.rs` (`RunJournal`, the run's journal lines).
 
   `machine.rs` is a critical gate's wait for the machine: the critical mutex, the drain, the take of every heavy and unreserved light slot, its lines, the snapshot its `take` journals and the release.
 
@@ -198,9 +204,15 @@ The rule that shapes it: every file and kernel object another process sees is de
 
   And `watch.rs` (the watch of a running command: the sampler, the pause read, the load-adjusted clock, the stall kill and the Ctrl+C stop), `servers.rs` (the build servers outside the job and the build client inside it, read once per sample) and `priority.rs` (the per-watch `Prioritizer` that lowers or raises the classified build servers, and `OtherGates`, the guard it reads, at most once a pass and only when a server to move asks, from the tickets, claims and other gates' jobs).
 
-`boxside/` is `gate box`: `mod.rs` (the verbs and their exits), `payload.rs` (the base64 JSON payload), `preflight.rs` (the bare repo, the work folder and the report lines), `boot.rs` (the boot-time line), `run.rs` (the lock, the git flags, the sync, the command, the back commit and the call to pack outputs), `outputs.rs` (the PC's manifest read, the old-archive prune, the pack of a run's outputs, the 50 GiB trim of the outputs folder and the `outputs` verb that sends and deletes the archive), `tools.rs` (the dotnet tool restore and its `<Work>.tools` record), `forward.rs` (the pipes forwarded to stdout and stderr), `heartbeat.rs` (the command heartbeat: the job's and the build servers' CPU on `gate-watchdog`'s `Pump`) and `stop.rs` (terminating the job).
+`boxside/` is `gate box`: `mod.rs` (the verbs and their exits), `payload.rs` (the base64 JSON payload), `preflight.rs` (the bare repo, the work folder and the report lines), `boot.rs` (the boot-time line).
 
-`outputs/` is a routed run's outputs, shared by both ends: `glob.rs` (the output globs and the exclusions, case-insensitive), `walk.rs` (the matching files below a folder, skipping links and junctions; `walk_with_refused` also notes the files refused for their names, reading a folder whose name is not plain through a verbatim path to count them), `hash.rs` (SHA-256 and `is_lower_hex`), `manifest.rs` (the PC's manifest and `select`, which picks the files a run changed or the PC lacks), `cache.rs` (the PC's hash cache: the hashes of its last built manifest, reused for a file whose size and last write still match) and `archive.rs` (`pack` and `unpack` of the `.tar.zst`, with strict refusals and limits).
+It also holds `run.rs` (the lock, the git flags, the sync, the command, the back commit and the call to pack outputs), `outputs.rs` (the PC's manifest read, the old-archive prune, the pack of a run's outputs, the 50 GiB trim of the outputs folder and the `outputs` verb that sends and deletes the archive).
+
+It also holds `tools.rs` (the dotnet tool restore and its `<Work>.tools` record), `forward.rs` (the pipes forwarded to stdout and stderr), `heartbeat.rs` (the command heartbeat: the job's and the build servers' CPU on `gate-watchdog`'s `Pump`) and `stop.rs` (terminating the job).
+
+`outputs/` is a routed run's outputs, shared by both ends: `glob.rs` (the output globs and the exclusions, case-insensitive), `walk.rs` (the matching files below a folder, skipping links and junctions; `walk_with_refused` also notes the files refused for their names, reading a folder whose name is not plain through a verbatim path to count them), `hash.rs` (SHA-256 and `is_lower_hex`).
+
+Also in it are `manifest.rs` (the PC's manifest and `select`, which picks the files a run changed or the PC lacks), `cache.rs` (the PC's hash cache: the hashes of its last built manifest, reused for a file whose size and last write still match) and `archive.rs` (`pack` and `unpack` of the `.tar.zst`, with strict refusals and limits).
 
 `outputs/names.rs` holds `is_git_s` and `is_lfs_config`, the `.git*` and `.lfsconfig` names that the globs and the sync-back both refuse, and `is_plain_path`, `is_plain_part` and `is_device`, the plain-path rule the globs, the walk, the pack and the unpack share.
 
@@ -214,7 +226,9 @@ The box packs and sends with it (`boxside/outputs.rs`, GATE-44 part B); the PC's
 - **Write a test that starts `gate.exe`** → give it a non-default state root (`--state-dir`): a gate on the default root takes the machine's real slots and writes the real journal, where it fights every session's gates.
 - **Change the cmd.exe word rules** → the gate and `gate box` share them in `gate-args`; a fix in one place is a fix in both, and its test covers both callers.
 - **Change the slot marker or a kernel object name** → nested gates (`crates/gate/src/nesting.rs::parse` reads the marker, and `nesting/binding.rs` opens the parent's job by the same name to check the marker binds to it), `gate stop-tree` and ops-tower's mutex probe all read names; the root hash rule in [design.md, State root](design.md#state-root) applies to every name.
-- **Change how a kill reaches a command's tree** → the escaped-tree kill in `crates/gate/src/escaped.rs` (a `gate run` kill) and the other kill sites (the box's stop, the remote client, the bridge, `gate push`: GATE-140) must agree on what is ended and what is spared, build servers included; the stall check, the cores and the clock already count the escaped tree under the job's members (`escaped::outside_the_job` in each sample), and every kill of a running `gate run` command ends the recorded escaped processes too, whose launcher may have exited.
+- **Change how a kill reaches a command's tree** → the escaped-tree kill in `crates/gate/src/escaped.rs` (a `gate run` kill) and the other kill sites (the box's stop, the remote client, the bridge, `gate push`: GATE-140) must agree on what is ended and what is spared, build servers included.
+
+  The stall check, the cores and the clock already count the escaped tree under the job's members (`escaped::outside_the_job` in each sample), and every kill of a running `gate run` command ends the recorded escaped processes too, whose launcher may have exited.
 - **Change `gate-state` or `proc-table`'s public API** → ops-tower builds against them by git rev; a breaking change needs its matching change there, by inbox request.
 
 ## Test locations
