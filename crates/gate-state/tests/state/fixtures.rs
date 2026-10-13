@@ -328,19 +328,24 @@ fn remote_run_journal_from_gate_exe_is_read_into_runs_and_a_split_summary() {
     let full = &history.runs[13];
     assert_eq!(
         full.queued.as_deref(),
-        Some("2026-10-12T06:00:00.1523518Z"),
+        Some("2026-10-12T06:00:00.1970353Z"),
         "a run the full pool sent back queues once"
     );
     assert_eq!(
         full.started.as_deref(),
-        Some("2026-10-12T06:00:01.2721171Z"),
+        Some("2026-10-12T06:00:01.2235979Z"),
         "its local take is its start"
     );
-    assert_eq!(full.waited_seconds, Some(0.022), "gate.exe counts the wait of its local take alone");
+    assert_eq!(
+        full.waited_seconds,
+        Some(1.026),
+        "its wait counts from the run's own queue line, so the remote pool's wait is in it"
+    );
+    assert_remote_takes_stand(&history.runs);
     let remote = &history.runs[14];
     assert_eq!(
         (remote.verdict.as_deref(), remote.wall_seconds, remote.adjusted_seconds),
-        (Some("passed"), Some(2.911), None),
+        (Some("passed"), Some(1.31), None),
         "a remote run's release has its wall time and no adjusted time"
     );
     let summary: Vec<(&str, bool, usize, f64, f64, f64)> = history
@@ -360,13 +365,37 @@ fn remote_run_journal_from_gate_exe_is_read_into_runs_and_a_split_summary() {
     assert_eq!(
         summary,
         [
-            (r#".\tool.exe out "ran here""#, false, 11, 0.023, 1.312, 1.665),
-            (r#".\tool.exe out "ran here""#, true, 1, 2.915, 2.915, 2.915),
-            ("cmd /c exit 0", false, 1, 0.027, 0.027, 0.027),
+            (r#".\tool.exe out "ran here""#, false, 11, 0.035, 0.072, 0.117),
+            (r#".\tool.exe out "ran here""#, true, 1, 1.312, 1.312, 1.312),
+            ("cmd /c exit 0", false, 1, 0.2, 0.2, 0.2),
         ],
         "the remote run of a command is a row of its own and the runs that fell back count as local; the failed run and \
          the run on its parent's slot are not counted"
     );
+}
+
+/// Asserts what the fixture's fallbacks kept: the remote take stands for each run a fallback sent back after it took a
+/// remote slot, and its start, wait and fallback time hold together. The runs are newest first.
+fn assert_remote_takes_stand(runs: &[HistoryRun]) {
+    let kept: Vec<bool> = runs.iter().map(|run| run.remote_take.is_some()).collect();
+    assert_eq!(
+        kept,
+        [
+            true, true, true, true, true, true, false, true, true, true, true, true, true, false, false
+        ],
+        "the remote take stands for each run a fallback sent back after it took one: the eleven refusals and the run on \
+         its parent's slot; the local run, the run the full pool sent back before any remote take and the remote run keep none"
+    );
+    for run in runs {
+        let Some(take) = &run.remote_take else {
+            continue;
+        };
+        assert!(
+            take.started <= take.fell_back_at,
+            "the remote take begins before the fallback that ends it: {take:?}"
+        );
+        assert!(take.waited_seconds.is_some(), "gate.exe's remote take says how long it waited: {take:?}");
+    }
 }
 
 #[test]
@@ -441,6 +470,7 @@ fn captured_journal_is_read_into_runs() {
             wall_seconds: Some(0.0),
             adjusted_seconds: None,
             abandoned: Vec::new(),
+            remote_take: None,
         },
         "the captured run took no slot"
     );
@@ -471,6 +501,7 @@ fn captured_journal_is_read_into_runs() {
             wall_seconds: Some(0.0),
             adjusted_seconds: None,
             abandoned: Vec::new(),
+            remote_take: None,
         }
     );
     assert_eq!(history.runs[3].waited_seconds, Some(1.7), "the abandoned gate's wait");
@@ -540,6 +571,7 @@ fn powershell_journal_is_read_into_runs() {
         wall_seconds: None,
         adjusted_seconds: None,
         abandoned: Vec::new(),
+        remote_take: None,
     };
     assert_eq!(history.runs[4], exit_0);
     assert_eq!(

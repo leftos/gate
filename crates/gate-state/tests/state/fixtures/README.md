@@ -62,7 +62,7 @@ From the repo root, in pwsh: `pwsh -NoProfile -File tools/gate.ps1 -Log .tmp/cap
 
 The script builds `gate.exe` with `--features test-seams` and runs it into a scratch state root. Pass 1 drives the scripted client (`--test-remote-client`) through a remote run that passes, `full`, `unreachable`, `busy`, `parity`, `rebooted` and `tools`, then a parent fallback and a local control run. Pass 2 drives the Rust client over the `local:` transport and fake-ssh for `unreachable`, `rebooted`, `tools`, `parity`, box-lock `busy` and `version`.
 
-It writes `remote-run-journal.jsonl` with LF line ends, the repo path as `C:\work\repo`, the root hash as `5ca1ab1e`, the work-folder key as `repo-c0ffee00`, renumbered pids and every ISO time shifted to start at `2026-10-12T06:00:00Z`. Update the figures `fixtures.rs` expects if the sequence changes.
+It writes `remote-run-journal.jsonl` with LF line ends, the repo path as `C:\work\repo`, the root hash as `5ca1ab1e`, the work-folder key as `repo-c0ffee00`, renumbered pids and every ISO time shifted to start at `2026-10-12T06:00:00Z`. A re-capture shifts every time and seconds figure, so the figures the reader case in `fixtures.rs` pins are re-pinned after every re-capture, and the pids and reasons too if the sequence changes.
 
 ## Re-capturing the journal
 

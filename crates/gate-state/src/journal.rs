@@ -94,8 +94,8 @@ pub struct HistoryRun {
     pub host: Option<String>,
     /// Why the run, routed to the remote pool, was sent back to the local queue: `full` (the pool stayed full for
     /// 60 s), `busy` (the box's work folder is locked by another run), `unreachable`, `rebooted`, `parity`, `tools`
-    /// (the box could not restore the repo's dotnet local tools), or `unknown` when the line names none; `None` when it
-    /// was not.
+    /// (the box could not restore the repo's dotnet local tools), `version` (the box's gate is of another version) or
+    /// `client` (the remote client could not start); `unknown` when the line names none. `None` when it was not.
     pub fallback: Option<String>,
     /// The run's own gate's pid, from its run key.
     pub pid: u32,
@@ -140,6 +140,26 @@ pub struct HistoryRun {
     /// Every name a line of the run lists in `abandoned`: slots it took from a gate that died holding them and a journal
     /// mutex it took abandoned, in line order without repeats; empty when none.
     pub abandoned: Vec<String>,
+    /// The remote slot the run held before a fallback sent it back to run here: the remote take's start and wait, and
+    /// the time of the `fallback` line that ended it. `None` for a run that never fell back, one whose fallback came
+    /// before any remote take (`full`, key-lock `busy`, `client`), and one a later remote line made remote again.
+    /// Serialized as `remoteTake`, absent for `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_take: Option<RemoteTake>,
+}
+
+/// The remote slot a routed run held before it fell back to run here: the `take` of its remote attempt, and when the
+/// attempt ended. A later remote line for the same run drops it with the fallback.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteTake {
+    /// When the run took the remote slot, as the journal wrote it (ISO 8601 UTC, seven fractional digits).
+    pub started: String,
+    /// How long the run waited for the remote slot, from its take; `None` when that line has no `waitedSeconds`.
+    pub waited_seconds: Option<f64>,
+    /// When the run fell back, as the journal wrote it: the `fallback` line's own time, after which the remote take no
+    /// longer stands.
+    pub fell_back_at: String,
 }
 
 /// How long the runs of one command in one repository that passed held their slot, the remote runs apart from the local
@@ -240,6 +260,8 @@ struct Run {
     remote: bool,
     host: Option<String>,
     fallback: Option<String>,
+    /// The remote take a fallback ended, kept for the reader: its start and wait, and when the run fell back.
+    remote_take: Option<RemoteTake>,
     waited_seconds: Option<f64>,
     held_seconds: Option<f64>,
     status: Option<i64>,
@@ -534,6 +556,7 @@ impl Run {
             remote: false,
             host: None,
             fallback: None,
+            remote_take: None,
             waited_seconds: None,
             held_seconds: None,
             status: None,
@@ -585,6 +608,16 @@ impl Run {
                 }
             }
             "fallback" => {
+                // The remote take the fallback ended stands for the reader, with the fallback line's own time as the
+                // moment it fell back; a run the full pool sent back took no remote slot, so it keeps none.
+                let kept = match (&self.started, self.remote) {
+                    (Some(started), true) => Some(RemoteTake {
+                        started: started.text.clone(),
+                        waited_seconds: self.waited_seconds,
+                        fell_back_at: stamp.text,
+                    }),
+                    _ => None,
+                };
                 // The run holds nothing until a local take: a remote take's slots, snapshot, start and wait no longer stand.
                 self.route(false, None);
                 self.slot = None;
@@ -592,6 +625,7 @@ impl Run {
                 self.machine = None;
                 self.started = None;
                 self.waited_seconds = None;
+                self.remote_take = kept;
                 self.fallback = Some(line.reason.clone().unwrap_or_else(|| "unknown".to_owned()));
             }
             _ => {
@@ -601,12 +635,14 @@ impl Run {
         }
     }
 
-    /// Marks the run remote on `host`, or local. A remote line after a `fallback` makes the run a plain remote one again.
+    /// Marks the run remote on `host`, or local. A remote line after a `fallback` makes the run a plain remote one again,
+    /// dropping the remote take that fallback kept.
     fn route(&mut self, remote: bool, host: Option<String>) {
         self.remote = remote;
         self.host = host.filter(|_| remote);
         if remote {
             self.fallback = None;
+            self.remote_take = None;
         }
     }
 
@@ -658,6 +694,7 @@ impl Run {
             wall_seconds: end.and_then(|end| end.wall_seconds),
             adjusted_seconds: end.and_then(|end| end.adjusted_seconds),
             abandoned: self.abandoned.clone(),
+            remote_take: self.remote_take.clone(),
         }
     }
 

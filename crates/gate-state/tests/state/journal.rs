@@ -510,6 +510,7 @@ fn runs_pair_queue_take_release_by_pid_and_process_start() {
                 wall_seconds: None,
                 adjusted_seconds: None,
                 abandoned: Vec::new(),
+                remote_take: None,
             },
             HistoryRun {
                 command: "cargo build".to_owned(),
@@ -536,6 +537,7 @@ fn runs_pair_queue_take_release_by_pid_and_process_start() {
                 wall_seconds: None,
                 adjusted_seconds: None,
                 abandoned: Vec::new(),
+                remote_take: None,
             },
         ]
     );
@@ -1299,6 +1301,123 @@ fn a_remote_take_ended_by_a_fallback_reads_as_the_local_run() {
     assert_eq!(run.started.as_deref(), Some(ago(27).as_str()));
     assert_eq!(run.waited_seconds, Some(60.0), "the local take's wait, counted from the fallback");
     assert_eq!(run.held_seconds, Some(45.0));
+}
+
+/// A fallback after a remote take keeps that take: its start, its wait, and the fallback line's own time.
+#[test]
+fn a_fallback_after_a_remote_take_keeps_the_take_and_when_it_fell_back() {
+    let gate = Gate::new(1, START, COMMAND);
+    let lines = [
+        gate.remote_queue(&ago(30)),
+        gate.remote_take(&ago(29), 1),
+        gate.fallback(&ago(28), Some("rebooted")),
+        gate.take(&ago(27), 0.2),
+        gate.release(&ago(26), 60.0, json!(0)),
+    ];
+    let history = history_of("a_fallback_after_a_remote_take_keeps_the_take_and_when_it_fell_back", &lines);
+    let run = &history.runs[0];
+    let kept = run.remote_take.as_ref().expect("the fallback keeps the remote take it ended");
+    assert_eq!(
+        (kept.started.as_str(), kept.waited_seconds, kept.fell_back_at.as_str()),
+        (ago(29).as_str(), Some(0.5), ago(28).as_str()),
+        "the remote take's start and wait, and the fallback line's own time"
+    );
+    assert_eq!(run.started.as_deref(), Some(ago(27).as_str()), "the local take is still the run's start");
+    assert_eq!(run.waited_seconds, Some(0.2), "and the run's wait is the local take's");
+}
+
+/// A remote take an `unreachable` fallback ends keeps it too, even when the run takes no local slot after.
+#[test]
+fn an_unreachable_fallback_keeps_the_remote_take_it_ended() {
+    let gate = Gate::new(1, START, COMMAND);
+    let lines = [
+        gate.remote_queue(&ago(30)),
+        gate.remote_take(&ago(29), 0),
+        gate.fallback(&ago(28), Some("unreachable")),
+    ];
+    let history = history_of("an_unreachable_fallback_keeps_the_remote_take_it_ended", &lines);
+    let run = &history.runs[0];
+    let kept = run.remote_take.as_ref().expect("the fallback keeps the remote take it ended");
+    assert_eq!((kept.started.as_str(), kept.fell_back_at.as_str()), (ago(29).as_str(), ago(28).as_str()));
+    assert_eq!(
+        (run.started.as_deref(), run.waited_seconds),
+        (None, None),
+        "the take the fallback cleared still stands in the kept one"
+    );
+}
+
+/// A `full` fallback follows no remote take, so the run keeps none.
+#[test]
+fn a_full_fallback_keeps_no_remote_take() {
+    let gate = Gate::new(1, START, COMMAND);
+    let lines = [
+        gate.remote_queue(&ago(30)),
+        gate.fallback(&ago(29), Some("full")),
+        gate.take(&ago(28), 60.0),
+        gate.release(&ago(27), 30.0, json!(0)),
+    ];
+    let history = history_of("a_full_fallback_keeps_no_remote_take", &lines);
+    let run = &history.runs[0];
+    assert_eq!(run.remote_take, None, "the pool stayed full before the run took a remote slot");
+    assert_eq!(run.waited_seconds, Some(60.0));
+}
+
+/// A run that ended on the remote slot it took keeps no remote take: nothing sent it back.
+#[test]
+fn a_run_that_never_fell_back_keeps_no_remote_take() {
+    let gate = Gate::new(1, START, COMMAND);
+    let lines = [
+        gate.remote_queue(&ago(30)),
+        gate.remote_take(&ago(29), 0),
+        gate.release(&ago(28), 60.0, json!(0)),
+    ];
+    let history = history_of("a_run_that_never_fell_back_keeps_no_remote_take", &lines);
+    let run = &history.runs[0];
+    assert_eq!(run.remote_take, None);
+    assert!(run.remote, "it ran on the remote slot to its end");
+}
+
+/// A remote take after a fallback makes the run a plain remote one again, dropping the keep of the first attempt.
+#[test]
+fn a_remote_take_after_a_fallback_drops_the_kept_take() {
+    let gate = Gate::new(1, START, COMMAND);
+    let lines = [
+        gate.remote_queue(&ago(30)),
+        gate.remote_take(&ago(29), 0),
+        gate.fallback(&ago(28), Some("busy")),
+        gate.remote_take(&ago(27), 0),
+    ];
+    let history = history_of("a_remote_take_after_a_fallback_drops_the_kept_take", &lines);
+    let run = &history.runs[0];
+    assert_eq!(run.remote_take, None, "the run's second remote attempt is the one it holds");
+}
+
+/// The kept remote take serializes as `remoteTake` with its three camelCase keys; a run without one omits the field.
+#[test]
+fn a_kept_remote_take_serializes_as_remote_take_with_camel_case_keys() {
+    let gate = Gate::new(1, START, COMMAND);
+    let kept = history_of(
+        "a_kept_remote_take_serializes_as_remote_take_with_camel_case_keys_kept",
+        &[
+            gate.remote_queue(&ago(30)),
+            gate.remote_take(&ago(29), 0),
+            gate.fallback(&ago(28), Some("rebooted")),
+        ],
+    );
+    let plain = history_of(
+        "a_kept_remote_take_serializes_as_remote_take_with_camel_case_keys_plain",
+        &[gate.queue(&ago(30)), gate.take(&ago(29), 0.5), gate.release(&ago(28), 1.0, json!(0))],
+    );
+    let shape = |run: &HistoryRun| serde_json::to_value(run).expect("a run serializes");
+    assert_eq!(
+        shape(&kept.runs[0])["remoteTake"],
+        json!({"started": ago(29), "waitedSeconds": 0.5, "fellBackAt": ago(28)})
+    );
+    assert!(
+        shape(&plain.runs[0]).get("remoteTake").is_none(),
+        "a run with no remote take omits the field: {}",
+        shape(&plain.runs[0])
+    );
 }
 
 /// A gate that fell back onto its parent's slot: remote queue, remote take, fallback (`busy`), then `parent` naming pid 9.

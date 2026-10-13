@@ -1300,6 +1300,39 @@ fn a_full_remote_pool_falls_back_with_reason_full() {
     assert_eq!(holder.finish().code, Some(0));
 }
 
+/// A run the full pool sent back counts its local take's wait from its own queue line: the wait was the remote pool's,
+/// and the local take follows the fallback at once.
+#[test]
+fn a_full_fallback_counts_the_local_takes_wait_from_the_queue_line() {
+    let case = routed_case("routing-full-wait");
+    let go = case.folder().join("go");
+    let holder = remote_holder(&case, "holder.log", &go);
+    let steps = shown(&stub(&case, &["status 0"]));
+    let waiter = case.start(&routed_words(
+        "waiter.log",
+        &steps,
+        &["--test-remote-wait-ms", "400"],
+        &[r".\tool.exe", "out", "hi"],
+    ));
+    let pid = waiter.id();
+    let outcome = waiter.finish();
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_in_order(&outcome.stderr, &[REMOTE_WAITING, FULL_LINE]);
+    let own = own(&case, pid);
+    assert_eq!(names(&own), ["queue", "fallback", "take", "release"], "{own:#?}");
+    assert!(own[..2].iter().all(has_remote_tag), "{own:#?}");
+    assert_eq!(own[1]["reason"], "full");
+    assert!(own[2..].iter().all(has_no_remote_fields), "{own:#?}");
+    let waited = own[2]["waitedSeconds"].as_f64().expect("the local take says how long the run waited");
+    assert!(
+        waited >= 0.35,
+        "the local take counts the wait from the run's queue line, so the remote wait is in it: {waited} s"
+    );
+    let_go(&go);
+    assert_eq!(holder.finish().code, Some(0));
+}
+
 #[test]
 fn a_waiter_takes_the_remote_slot_when_the_holder_releases() {
     let case = routed_case("routing-waiter");

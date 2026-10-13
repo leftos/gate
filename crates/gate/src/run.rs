@@ -129,6 +129,7 @@ pub(crate) fn run(request: &RunRequest, log: &Path, root: &ResolvedRoot, environ
         client,
         tag: None,
         arrived: epoch_ms(Timestamp::now()),
+        queued_at: None,
         lent: false,
         covered: None,
     };
@@ -491,6 +492,10 @@ struct Run<'a> {
     tag: Option<RemoteTag>,
     /// The run's first arrival in Unix epoch milliseconds, which every ticket it writes keeps.
     arrived: u64,
+    /// The moment of the run's `queue` line: the moment the local `take` of a run the full remote pool sent back counts
+    /// its wait from, while every other wait counts from its own take. `None` for a run that is not routed, and for one
+    /// sent back for any other reason.
+    queued_at: Option<Instant>,
     /// Whether the run's light parent lent it its slot while a critical request drained, before it queued or once it
     /// journalled `parent` as it waited, so it takes, journals and releases no slot.
     lent: bool,
@@ -622,7 +627,8 @@ impl Run<'_> {
     /// Journals the queue of the run `route` sends: with `notRouted` for a heavy gate its caller kept here with
     /// `--local`, with the remote tag for a routed one. A gate a parent's slot covers journals `covered` with the
     /// parent's pid in place of the queue, then writes its covered marker ([`Covered`]). A gate its light parent lent
-    /// its slot before it queued journals nothing here.
+    /// its slot before it queued journals nothing here. A routed run keeps the moment of its queue line in
+    /// [`Run::queued_at`], which its local take counts from when the full remote pool sent it back.
     fn queue(&mut self, route: &Route, console: &mut Console) {
         if self.lent {
             return;
@@ -635,6 +641,9 @@ impl Run<'_> {
                 not_routed: route::not_routed(route),
             },
         };
+        if matches!(route, Route::Routed(_)) {
+            self.queued_at = Some(Instant::now());
+        }
         self.journal.write(&event, self.tag.as_ref(), console);
         if let Some(parent_pid) = covering {
             self.covered = Some(Covered::write(&self.root.path, &self.gate, parent_pid, console));
@@ -702,7 +711,7 @@ impl Run<'_> {
     /// takes nothing and waits for nothing ([`Run::take_nothing`]).
     fn take_own(&mut self, hold: &mut Hold, console: &mut Console) -> Taking {
         match Takes::of(self.request.slot) {
-            Takes::Pool(pool) => self.take(pool, &mut hold.taken, console),
+            Takes::Pool(pool) => self.take(pool, self.queued_at, &mut hold.taken, console),
             Takes::Machine => self.take_machine(&mut hold.machine, console),
             Takes::Nothing => self.take_nothing(console),
         }
@@ -827,7 +836,7 @@ impl Run<'_> {
                 return Err(self.fell_back(FallbackReason::Busy, &RemoteOutcome::default(), None, console));
             }
         };
-        match self.take(Pool::Remote(remote.slots), &mut hold.taken, console) {
+        match self.take(Pool::Remote(remote.slots), None, &mut hold.taken, console) {
             Taking::Took(took) => hold.took = took,
             Taking::Lent => unreachable!("only a local wait is lent a parent's slot"),
             Taking::Interrupted => return Err(Remotely::Interrupted),
@@ -847,6 +856,11 @@ impl Run<'_> {
     /// log's notes unsaid, and says the run goes on here.
     fn fell_back(&mut self, reason: FallbackReason, outcome: &RemoteOutcome, held: Option<Taken>, console: &mut Console) -> Remotely {
         let tag = self.tag.take();
+        // Only the run the full remote pool sent back counts its local take from its own queue line; the local take of
+        // every other fallback counts from the take itself, as a run that never fell back does.
+        if reason != FallbackReason::Full {
+            self.queued_at = None;
+        }
         self.journal.write(&JournalEvent::Fallback { reason }, tag.as_ref(), console);
         if let Some(taken) = held {
             slots::delete_claim(&taken.held, console);
@@ -1103,11 +1117,12 @@ impl Run<'_> {
     }
 
     /// Waits its turn for a slot of `pool` and takes it into `held` the moment it has it, then journals the take, with
-    /// the remote tag while the run has one, and writes the claim. When the slot was taken; else a Ctrl+C ended the
-    /// wait, which deletes the ticket at once, wakes the waiters and journals the abandon, or a remote pool stayed full
-    /// past the wait's limit, which deletes the ticket, or a light parent lent the run its slot, which deletes the
-    /// ticket and wakes the waiters.
-    fn take(&mut self, pool: Pool, held: &mut Option<Taken>, console: &mut Console) -> Taking {
+    /// the remote tag while the run has one, and writes the claim. `since` is the moment the wait counts from, the run's
+    /// own `queue` line for a run the full remote pool sent back and `None` for every other wait, which counts from now.
+    /// When the slot was taken; else a Ctrl+C ended the wait, which deletes the ticket at once, wakes the waiters and
+    /// journals the abandon, or a remote pool stayed full past the wait's limit, which deletes the ticket, or a light
+    /// parent lent the run its slot, which deletes the ticket and wakes the waiters.
+    fn take(&mut self, pool: Pool, since: Option<Instant>, held: &mut Option<Taken>, console: &mut Console) -> Taking {
         let queued = Instant::now();
         let arrival = Arrival {
             gate: &self.gate,
@@ -1139,7 +1154,7 @@ impl Run<'_> {
                 return Taking::Lent;
             }
             Waited::Interrupted => {
-                self.abandon(wait, pool, queued, console);
+                self.abandon(wait, pool, since.unwrap_or(queued), console);
                 return Taking::Interrupted;
             }
             Waited::TimedOut => {
@@ -1148,7 +1163,7 @@ impl Run<'_> {
                 return Taking::Full;
             }
         };
-        let waited = queued.elapsed().as_secs_f64();
+        let waited = since.unwrap_or(queued).elapsed().as_secs_f64();
         let name = taken.held.name().to_owned();
         let mut abandoned = Vec::new();
         if taken.abandoned {

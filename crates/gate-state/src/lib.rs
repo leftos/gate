@@ -29,7 +29,7 @@ pub use counts::{ApplyError, WriteError, apply_slot_count, read_slot_count_setti
 pub use cutover::link_no_replace;
 pub use cutover::{CountsCopy, copy_slot_counts_to_v1, write_cutover_flag};
 pub use drain::{PowerShellGate, PowerShellGates, PowerShellHold, PowerShellSlot, powershell_gates};
-pub use journal::{CommandSummary, History, HistoryRun, JournalCache, RunState, normalize_command};
+pub use journal::{CommandSummary, History, HistoryRun, JournalCache, RemoteTake, RunState, normalize_command};
 pub use journal_writer::{
     Appended, FallbackReason, HeavyLight, Held, JOURNAL_CAP_BYTES, JOURNAL_FILE, JOURNAL_WAIT, JournalEvent, JournalIdentity, JournalLock,
     JournalNote, LockError, MachineSnapshot, OtherClaim, ROLLED_JOURNAL_FILE, RemoteTag, RunFacts, append_line, journal_line,
