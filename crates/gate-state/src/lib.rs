@@ -12,6 +12,7 @@ mod claims;
 mod counts;
 mod cutover;
 mod drain;
+mod durations;
 mod journal;
 mod journal_writer;
 mod model;
@@ -29,10 +30,16 @@ pub use counts::{ApplyError, WriteError, apply_slot_count, read_slot_count_setti
 pub use cutover::link_no_replace;
 pub use cutover::{CountsCopy, copy_slot_counts_to_v1, write_cutover_flag};
 pub use drain::{PowerShellGate, PowerShellGates, PowerShellHold, PowerShellSlot, powershell_gates};
+pub use durations::{
+    DURATIONS_FILE, DurationKey, DurationStore, Estimate, KEY_VERSION, KeyHistory, KeyInputs, KeyPlace, NormalizedCommand, REBUILDING_FILE,
+    RebuildOwner, RebuildReads, RebuildReason, Rebuilt, Recorded, Sample, StoreError, StoreRead, StoreReadError, StoreWriteError, Swap, Swapped,
+    abandon_rebuild, begin_rebuild, duration_key, durations_path, normalize_for_durations, place_by_shape, read_store, rebuild_store,
+    rebuilding_path, record_run, swap_rebuilt, write_store,
+};
 pub use journal::{CommandSummary, History, HistoryRun, JournalCache, RemoteTake, RunState, normalize_command};
 pub use journal_writer::{
     Appended, FallbackReason, HeavyLight, Held, JOURNAL_CAP_BYTES, JOURNAL_FILE, JOURNAL_WAIT, JournalEvent, JournalIdentity, JournalLock,
-    JournalNote, LockError, MachineSnapshot, OtherClaim, ROLLED_JOURNAL_FILE, RemoteTag, RunFacts, append_line, journal_line,
+    JournalNote, LockError, MachineSnapshot, OtherClaim, ROLLED_JOURNAL_FILE, RemoteTag, RunFacts, append_line, append_line_then, journal_line,
 };
 pub use model::{
     CRITICAL_LIGHT_RESERVE, CoveredRun, CriticalState, CwdReader, DashboardState, Generation, MutexProbe, ParseError, PoolState, QueueTicket,

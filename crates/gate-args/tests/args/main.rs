@@ -8,6 +8,7 @@ mod boxcmd;
 mod burn;
 mod compat;
 mod cutover;
+mod expect;
 mod program;
 mod push;
 mod quoting;

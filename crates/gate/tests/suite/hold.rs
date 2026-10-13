@@ -53,6 +53,7 @@ fn a_gate_says_its_problem_lines_while_it_runs() {
         "gate: cannot write the claim {}: ",
         shown(&root.join("slots").join("gate-light-slot-0.json"))
     );
+    let rebuild = format!("gate: cannot rebuild {} (", shown(&root.join("durations.json")));
 
     running.wait_for_stderr(&claim);
     assert!(running.is_running(), "the lines are said while the gate holds");
@@ -63,11 +64,15 @@ fn a_gate_says_its_problem_lines_while_it_runs() {
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert!(outcome.stdout.contains("gate: passed in "), "the run passes: {outcome:?}");
     let lines: Vec<&str> = outcome.stderr.lines().collect();
-    assert_eq!(lines.len(), 3, "each problem is said once: {outcome:?}");
+    assert_eq!(lines.len(), 4, "each problem is said once: {outcome:?}");
     assert!(
         lines[0].starts_with(&line) && lines[0].ends_with(')'),
         "the root that cannot be made is said once for the run's three journal lines: {outcome:?}"
     );
     assert!(lines[1].starts_with(&ticket), "then the ticket that cannot be written: {outcome:?}");
     assert!(lines[2].starts_with(&claim), "then the claim that cannot be written: {outcome:?}");
+    assert!(
+        lines[3].starts_with(&rebuild) && lines[3].ends_with("; expected times are unavailable"),
+        "then, once the run has released, the durations store that cannot be rebuilt: {outcome:?}"
+    );
 }

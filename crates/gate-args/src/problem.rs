@@ -33,6 +33,11 @@ pub enum Problem {
         option: String,
         value: String,
     },
+    /// A `gate expect` slot other than heavy, light or critical: a none-slot run has no expected time.
+    BadExpectSlot {
+        option: String,
+        value: String,
+    },
     #[cfg(feature = "test-seams")]
     BadRemoteCall {
         option: String,
@@ -98,6 +103,7 @@ impl fmt::Display for Problem {
         match self {
             Problem::Missing(required, spelling) => write!(f, "gate: missing {}", missing_text(*required, *spelling)),
             Problem::BadSlot { option, value } => write!(f, "gate: {option} must be heavy, light, critical or none, got '{value}'"),
+            Problem::BadExpectSlot { option, value } => write!(f, "gate: {option} must be heavy, light or critical, got '{value}'"),
             #[cfg(feature = "test-seams")]
             Problem::BadRemoteCall { option, value, calls } => write!(f, "gate: {option} must be {}, got '{value}'", one_of(calls)),
             Problem::NotAboveZero { option, value } => write!(f, "gate: {option} must be a whole number above 0, got '{value}'"),

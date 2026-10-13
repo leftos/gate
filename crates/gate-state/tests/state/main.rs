@@ -7,6 +7,7 @@ mod counts;
 mod critical;
 mod cutover;
 mod drain;
+mod durations;
 mod fixtures;
 mod journal;
 mod journal_write;

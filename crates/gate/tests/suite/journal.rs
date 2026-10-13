@@ -28,18 +28,25 @@ fn quoted(words: &[&str]) -> String {
 }
 
 /// JSON lines of `total` bytes in all, each ending in a line feed, every thousandth a `release` and the rest `queue`: a
-/// handful of release lines near the cap, so the archive written inside the journal mutex's hold is little work.
+/// handful of release lines near the cap, so the archive written inside the journal mutex's hold is little work. A
+/// release line has the time, folder and command a durations rebuild reads, and no verdict, so a rebuild reads it
+/// without a word and files nothing of it.
 fn seed_lines(total: u64) -> Vec<String> {
     const LINE: usize = 1000;
     const RELEASE_EVERY: usize = 1000;
+    const RELEASE_FIELDS: &str = r#","time":"2026-10-03T12:00:00.0000000Z","cwd":"seed","command":"seed""#;
     let mut left = usize::try_from(total).expect("a seed size fits in memory");
     let mut lines = Vec::new();
     while left > 0 {
         let size = if left >= 2 * LINE { LINE } else { left };
-        let event = if lines.len().is_multiple_of(RELEASE_EVERY) { "release" } else { "queue" };
-        let base = format!(r#"{{"v":1,"event":"{event}","seed":{},"pad":""}}"#, lines.len());
+        let (event, fields) = if lines.len().is_multiple_of(RELEASE_EVERY) {
+            ("release", RELEASE_FIELDS)
+        } else {
+            ("queue", "")
+        };
+        let base = format!(r#"{{"v":1,"event":"{event}"{fields},"seed":{},"pad":""}}"#, lines.len());
         let pad = "x".repeat(size - 1 - base.len());
-        lines.push(format!(r#"{{"v":1,"event":"{event}","seed":{},"pad":"{pad}"}}"#, lines.len()));
+        lines.push(format!(r#"{{"v":1,"event":"{event}"{fields},"seed":{},"pad":"{pad}"}}"#, lines.len()));
         left -= size;
     }
     lines

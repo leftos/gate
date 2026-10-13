@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use gate_state::{
     Held, JOURNAL_FILE, JournalEvent, JournalIdentity, JournalLock, JournalNote, KernelObject, LockError, ROLLED_JOURNAL_FILE, RemoteTag,
-    append_line, journal_line,
+    append_line_then, journal_line,
 };
 use gate_win32::{AcquireError, MutexGuard, NamedMutex};
 use jiff::Timestamp;
@@ -20,7 +20,7 @@ use crate::resolve::ResolvedRoot;
 use crate::slots::ThisGate;
 
 /// A state root's journal mutex.
-struct JournalMutex(NamedMutex);
+pub(crate) struct JournalMutex(NamedMutex);
 
 impl JournalLock for JournalMutex {
     type Guard<'a> = MutexGuard<'a>;
@@ -68,10 +68,24 @@ impl RunJournal {
     /// Appends `event`'s line, with the `remote` tag of a routed run before its fallback, saying on stderr a mutex taken
     /// abandoned and what the append had to say.
     pub(crate) fn write(&mut self, event: &JournalEvent, remote: Option<&RemoteTag>, console: &mut Console) {
-        let appended = match &self.writer {
+        self.write_then(event, remote, console, |_| ());
+    }
+
+    /// [`RunJournal::write`], then `after` with the line's time once the line is written, in the same hold of the
+    /// journal mutex; what `after` returned, or `None` when the line was not written and `after` did not run. `after`
+    /// holds every other gate's journal line for as long as it runs, so it runs no git and parses no journal.
+    pub(crate) fn write_then<T>(
+        &mut self,
+        event: &JournalEvent,
+        remote: Option<&RemoteTag>,
+        console: &mut Console,
+        after: impl FnOnce(Timestamp) -> T,
+    ) -> Option<T> {
+        let (appended, ran) = match &self.writer {
             Ok((identity, mutex)) => {
                 let now = Timestamp::now();
-                append_line(&self.root, mutex, |abandoned| journal_line(identity, now, event, remote, abandoned), now)
+                let build = |abandoned: Option<&str>| journal_line(identity, now, event, remote, abandoned);
+                append_line_then(&self.root, mutex, build, now, || after(now))
             }
             Err(reason) => {
                 let note = JournalNote::NotWritten {
@@ -79,7 +93,7 @@ impl RunJournal {
                     reason: reason.clone(),
                 };
                 self.say(&note, console);
-                return;
+                return None;
             }
         };
         if appended.abandoned
@@ -90,6 +104,12 @@ impl RunJournal {
         for note in &appended.notes {
             self.say(note, console);
         }
+        ran
+    }
+
+    /// The state root's journal mutex, or `None` when the journal cannot be written at all.
+    pub(crate) fn mutex(&self) -> Option<&JournalMutex> {
+        self.writer.as_ref().ok().map(|(_, mutex)| mutex)
     }
 
     /// Says `note` on stderr, unless it is a missing line or a failed rollover and one of its kind was said already.

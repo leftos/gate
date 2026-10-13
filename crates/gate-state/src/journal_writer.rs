@@ -481,17 +481,32 @@ fn tenths(value: f64) -> Value {
 /// `build` is called once, with the lock's name when the lock was taken abandoned and `None` otherwise, so the line it
 /// returns carries `abandoned`; [`Appended::abandoned`] reports the abandoned acquisition either way.
 pub fn append_line<L: JournalLock>(root: &Path, lock: &L, build: impl FnOnce(Option<&str>) -> String, now: Timestamp) -> Appended {
+    append_line_then(root, lock, build, now, || ()).0
+}
+
+/// [`append_line`], then `after` once the line is written and before the lock is let go, so what `after` writes is
+/// written in the same hold as the line; returns what `after` returned, or `None` when the line was not written and
+/// `after` did not run. `after` holds every other gate's append for as long as it runs, so it runs no git and parses no
+/// journal.
+pub fn append_line_then<L: JournalLock, T>(
+    root: &Path,
+    lock: &L,
+    build: impl FnOnce(Option<&str>) -> String,
+    now: Timestamp,
+    after: impl FnOnce() -> T,
+) -> (Appended, Option<T>) {
     let journal = root.join(JOURNAL_FILE);
     let held = match lock.acquire(JOURNAL_WAIT) {
         Ok(held) => held,
         Err(error) => {
-            return Appended {
+            let appended = Appended {
                 notes: vec![JournalNote::NotWritten {
                     journal,
                     reason: error.to_string(),
                 }],
                 ..Appended::default()
             };
+            return (appended, None);
         }
     };
     let mut appended = Appended {
@@ -503,19 +518,25 @@ pub fn append_line<L: JournalLock>(root: &Path, lock: &L, build: impl FnOnce(Opt
             journal,
             reason: error.to_string(),
         });
-        return appended;
+        return (appended, None);
     }
     roll(root, &journal, now, &mut appended.notes);
     let line = build(held.abandoned.then(|| lock.name()));
-    match write_line(&journal, &line) {
-        Ok(()) => appended.written = true,
-        Err(error) => appended.notes.push(JournalNote::NotWritten {
-            journal,
-            reason: error.to_string(),
-        }),
-    }
+    let ran = match write_line(&journal, &line) {
+        Ok(()) => {
+            appended.written = true;
+            Some(after())
+        }
+        Err(error) => {
+            appended.notes.push(JournalNote::NotWritten {
+                journal,
+                reason: error.to_string(),
+            });
+            None
+        }
+    };
     drop(held);
-    appended
+    (appended, ran)
 }
 
 /// Moves a journal at or above the cap over `events.1.jsonl` and archives it, or notes why it could not be moved.

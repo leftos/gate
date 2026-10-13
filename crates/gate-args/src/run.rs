@@ -6,8 +6,8 @@ use std::path::PathBuf;
 
 use crate::problem::{Problem, Required, Spelling};
 use crate::request::{
-    BurnRequest, CutoverRequest, CutoverSeams, DEFAULT_STALL_SECONDS, DEFAULT_TAIL_LINES, PushRequest, PushSeams, RunRequest, Slot, StopRequest,
-    TestSeams,
+    BurnRequest, CutoverRequest, CutoverSeams, DEFAULT_STALL_SECONDS, DEFAULT_TAIL_LINES, ExpectRequest, PushRequest, PushSeams, RunRequest, Slot,
+    StopRequest, TestSeams,
 };
 use crate::values;
 
@@ -441,6 +441,37 @@ impl RunBuilder {
             Some(seconds) if self.problems.is_empty() => Ok(BurnRequest { cores: self.cores, seconds }),
             _ => Err(self.problems),
         }
+    }
+
+    /// The expect request for `command`, its slot `heavy` when none was given, or every problem: those found while
+    /// reading, a slot of `none`, then a missing command. A slot is refused as one of heavy, light or critical, the
+    /// slots a run says an expected time in.
+    pub(crate) fn finish_expect(mut self, command: Vec<OsString>) -> Result<ExpectRequest, Vec<Problem>> {
+        for problem in &mut self.problems {
+            if let Problem::BadSlot { option, value } = problem {
+                *problem = Problem::BadExpectSlot {
+                    option: std::mem::take(option),
+                    value: std::mem::take(value),
+                };
+            }
+        }
+        if self.slot == Some(Slot::None) {
+            self.problems.push(Problem::BadExpectSlot {
+                option: "--slot".to_owned(),
+                value: Slot::None.as_str().to_owned(),
+            });
+        }
+        if command.is_empty() {
+            self.problems.push(Problem::Missing(Required::Command, Spelling::Cli));
+        }
+        if !self.problems.is_empty() {
+            return Err(self.problems);
+        }
+        Ok(ExpectRequest {
+            slot: self.slot.unwrap_or(Slot::Heavy),
+            state_dir: self.state_dir,
+            command,
+        })
     }
 }
 

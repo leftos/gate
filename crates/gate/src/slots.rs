@@ -14,6 +14,7 @@ use gate_state::v1::{self, Claim, ClaimKind, Counts, FormatError, PoolSetting, T
 use gate_state::{JournalIdentity, KernelObject, RemoteTag, SlotKind, reserved_light};
 use gate_win32::{NamedEvent, OwnedMutexGuard, mutex_exists};
 use jiff::Timestamp;
+use serde_json::{Map, Value};
 
 use crate::acquire;
 use crate::console::Console;
@@ -399,20 +400,26 @@ impl Survey {
         Ok(claims)
     }
 
-    /// The pid and slot index of each other gate's live light claim under `root`, as [`Survey::other_claims`] reads
-    /// them. A claims folder that cannot be listed holds none, said once.
-    pub(crate) fn light_claims(&mut self, root: &Path, console: &mut Console) -> Vec<(u32, u32)> {
+    /// The other gates' live claims under `root`, as [`Survey::other_claims`] reads them. A claims folder that cannot be
+    /// listed holds none, said once.
+    pub(crate) fn live_claims(&mut self, root: &Path, console: &mut Console) -> Vec<Claim> {
         match self.other_claims(root, console) {
-            Ok(claims) => claims
-                .into_iter()
-                .filter(|(_, claim)| claim.kind == ClaimKind::Light)
-                .map(|(_, claim)| (claim.pid, claim.index))
-                .collect(),
+            Ok(claims) => claims.into_iter().map(|(_, claim)| claim).collect(),
             Err(error) => {
                 self.say_once("cannot read the claims in", &v1::slots_dir(root).display().to_string(), error, console);
                 Vec::new()
             }
         }
+    }
+
+    /// The pid and slot index of each other gate's live light claim under `root`, as [`Survey::live_claims`] reads
+    /// them.
+    pub(crate) fn light_claims(&mut self, root: &Path, console: &mut Console) -> Vec<(u32, u32)> {
+        self.live_claims(root, console)
+            .into_iter()
+            .filter(|claim| claim.kind == ClaimKind::Light)
+            .map(|claim| (claim.pid, claim.index))
+            .collect()
     }
 
     /// The pid and start, in epoch milliseconds, of every gate a live claim under `root` names: the gates that hold a
@@ -580,12 +587,14 @@ pub(crate) fn listed_tickets(root: &Path, own: (u32, u64)) -> io::Result<Vec<Lis
     Ok(listed)
 }
 
-/// Whose claim a slot holds: the gate, its request and log, and the remote tag of a routed run's remote slot.
+/// Whose claim a slot holds: the gate, its request and log, the remote tag of a routed run's remote slot, and what the
+/// durations store expects of the run, `None` without history.
 pub(crate) struct ClaimOf<'a> {
     pub gate: &'a ThisGate,
     pub request: &'a RunRequest,
     pub log: &'a Path,
     pub remote: Option<&'a RemoteTag>,
+    pub expected: Option<&'a Map<String, Value>>,
 }
 
 /// Writes this gate's claim of `kind` on `held`, saying so when it cannot be written; the run goes on either way.
@@ -600,7 +609,13 @@ pub(crate) fn write_claim(held: &Held, kind: ClaimKind, of: &ClaimOf<'_>, consol
 }
 
 fn claim(held: &Held, kind: ClaimKind, of: &ClaimOf<'_>) -> io::Result<Claim> {
-    let ClaimOf { gate, request, log, remote } = *of;
+    let ClaimOf {
+        gate,
+        request,
+        log,
+        remote,
+        expected,
+    } = *of;
     Ok(Claim {
         kind,
         index: held.index,
@@ -614,7 +629,7 @@ fn claim(held: &Held, kind: ClaimKind, of: &ClaimOf<'_>) -> io::Result<Claim> {
         remote: remote.map(|_| true),
         host: remote.map(|tag| tag.host.clone()),
         key: remote.map(|tag| tag.key.clone()),
-        expected: None,
+        expected: expected.cloned(),
     })
 }
 

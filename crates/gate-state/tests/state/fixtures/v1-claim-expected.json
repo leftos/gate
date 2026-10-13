@@ -1,0 +1,1 @@
+{"v":1,"kind":"heavy","index":0,"pid":57000,"processStart":"2026-10-01T11:00:00.5000000Z","started":"2026-10-01T11:00:05.0000000Z","cwd":"C:\\work\\repo","command":"cargo build","log":"C:\\work\\repo\\.tmp\\build.log","timeoutSeconds":900.0,"expected":{"p50":240.5,"p90":380.25,"n":30,"key":"local::repo | cargo build"}}

@@ -20,11 +20,39 @@ const LOCAL_FLAG: &str = "--local";
 /// Why a command that would route runs here when one of its words is not valid Unicode.
 const NOT_UNICODE: &str = "a word of the command is not valid Unicode";
 
+/// The arguments of the git call that places a folder: its worktree root, the folder below it, and the common git
+/// folder, whose parent's name is the checkout's.
+pub(crate) const PLACE_ARGS: [&str; 5] = [
+    "rev-parse",
+    "--show-toplevel",
+    "--show-prefix",
+    "--path-format=absolute",
+    "--git-common-dir",
+];
+
+/// What the routing decision learnt of the gate's place in its git worktree.
+pub(crate) enum Placed {
+    /// The decision did not ask git.
+    NotAsked,
+    /// The decision asked git: the place git gave, `None` when it gave none or the call failed.
+    Asked(Option<Place>),
+}
+
+impl Placed {
+    /// The place git gave, when the decision asked and git gave one.
+    pub(crate) fn place(&self) -> Option<&Place> {
+        match self {
+            Placed::Asked(place) => place.as_ref(),
+            Placed::NotAsked => None,
+        }
+    }
+}
+
 /// Decides where `request`'s command runs and says the decision's lines, on stderr and in the log: why a command runs
 /// here when there is a reason to say, or the lines of a routed run. A command that would route but has a word that is
 /// not valid Unicode runs here, saying so. A gate under a `covering_parent`'s slot runs here, saying nothing. With the
-/// route, the gate's place in its git worktree when the decision asked git for it and git gave one.
-pub(crate) fn route(request: &RunRequest, environment: &Environment, covering_parent: bool, console: &mut Console) -> (Route, Option<Place>) {
+/// route, what the decision learnt of the gate's place in its git worktree.
+pub(crate) fn route(request: &RunRequest, environment: &Environment, covering_parent: bool, console: &mut Console) -> (Route, Placed) {
     let words: Vec<String> = request.command.iter().map(|word| word.to_string_lossy().into_owned()).collect();
     let unicode = request.command.iter().all(|word| word.to_str().is_some());
     let inputs = Inputs {
@@ -39,7 +67,7 @@ pub(crate) fn route(request: &RunRequest, environment: &Environment, covering_pa
         local_app_data: environment.local_app_data.as_deref(),
         git_limit: git::limit(&request.test_seams),
         git_drain: git::drain(&request.test_seams),
-        found: RefCell::new(None),
+        found: RefCell::new(Placed::NotAsked),
     };
     let route = match decide(&inputs, &machine) {
         Route::Routed(_) if !unicode => Route::Local {
@@ -96,13 +124,13 @@ pub(crate) fn read_remote_json(path: &Path) -> Result<Option<Config>, ConfigProb
 
 /// This machine's facts: the gate's working folder, or why it cannot be read, the LOCALAPPDATA folder that holds the
 /// routing file, how long each of the decision's git calls may take, how long its readers get once git has exited, and
-/// the place git gave when the decision asked.
+/// what git said of the gate's place when the decision asked.
 struct Machine<'a> {
     folder: io::Result<PathBuf>,
     local_app_data: Option<&'a OsStr>,
     git_limit: Duration,
     git_drain: Duration,
-    found: RefCell<Option<Place>>,
+    found: RefCell<Placed>,
 }
 
 impl Machine<'_> {
@@ -125,29 +153,16 @@ impl Facts for Machine<'_> {
     }
 
     fn place(&self) -> Result<Option<Place>, String> {
-        let folder = self
+        let placed = self
             .folder
             .as_ref()
-            .map_err(|error| format!("cannot read the working directory: {error}"))?;
-        let args = [
-            "rev-parse",
-            "--show-toplevel",
-            "--show-prefix",
-            "--path-format=absolute",
-            "--git-common-dir",
-        ];
-        let mut ran = git::Git::find(folder)?.run(&self.git_call(folder, &args))?;
-        if !ran.status.success() {
-            return Ok(None);
-        }
-        let mut bytes = Vec::new();
-        ran.stdout
-            .read_to_end(&mut bytes)
-            .map_err(|error| format!("cannot read git rev-parse's output: {error}"))?;
-        let text = String::from_utf8(bytes).map_err(|_| "git rev-parse's output is not valid UTF-8".to_owned())?;
-        let place = parse_place(&text)?;
-        self.found.replace(Some(place.clone()));
-        Ok(Some(place))
+            .map_err(|error| format!("cannot read the working directory: {error}"))
+            .and_then(|folder| {
+                let git = git::Git::find(folder)?;
+                read_place(&git, &self.git_call(folder, &PLACE_ARGS))
+            });
+        self.found.replace(Placed::Asked(placed.as_ref().ok().and_then(Option::clone)));
+        placed
     }
 
     /// The first path `git ls-files` lists, tracked or untracked and not ignored, that is still on disk: an unstaged
@@ -198,6 +213,21 @@ impl Facts for Machine<'_> {
         // is judged as written.
         gate_win32::device_target(letter).ok().flatten()
     }
+}
+
+/// Runs `call`, git asked [`PLACE_ARGS`] in a folder, and reads the place it printed: `Ok(None)` for any non-zero exit
+/// (the folder is in no worktree, among others); else why the call failed or its output does not read as a place.
+pub(crate) fn read_place(git: &git::Git, call: &git::Call<'_>) -> Result<Option<Place>, String> {
+    let mut ran = git.run(call)?;
+    if !ran.status.success() {
+        return Ok(None);
+    }
+    let mut bytes = Vec::new();
+    ran.stdout
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("cannot read git rev-parse's output: {error}"))?;
+    let text = String::from_utf8(bytes).map_err(|_| "git rev-parse's output is not valid UTF-8".to_owned())?;
+    parse_place(&text).map(Some)
 }
 
 /// The place `git rev-parse --show-toplevel --show-prefix --path-format=absolute --git-common-dir` printed, in exactly

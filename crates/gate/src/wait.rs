@@ -10,11 +10,14 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use gate_args::RunRequest;
-use gate_state::v1::{self, Counts, Ticket, TicketKind};
+use gate_state::v1::{self, Claim, ClaimKind, Counts, Ticket, TicketKind};
 use gate_state::{KernelObject, SlotKind, reserved_light};
 use gate_win32::{Interrupt, NamedEvent, mutex_exists};
+use jiff::Timestamp;
+use serde_json::{Map, Value};
 
 use crate::console::Console;
+use crate::durations::span_text;
 use crate::pause::Pause;
 use crate::resolve::ResolvedRoot;
 use crate::slots::{self, Pool, Survey, Taken, ThisGate};
@@ -195,6 +198,8 @@ pub(crate) struct Wait<'a> {
     under: Option<UnderParent>,
     /// The critical request that held the gate back on the last pass; `None` when none did.
     barrier: Option<Barrier>,
+    /// The slots the last pass tried, which the still-waiting line probes; none before the first pass.
+    range: Range<u32>,
     /// The pause marker this gate keeps while it waits behind a critical request; no marker for a gate under no parent.
     pause: Pause,
     waiter: Waiter,
@@ -235,6 +240,8 @@ pub(crate) struct Arrival<'g> {
     /// The parent gate whose slot does not cover this gate, which lends it while a critical request drains, or the parent
     /// that holds no slot, which lends nothing; `None` for any other gate.
     pub under: Option<UnderParent>,
+    /// What the durations store expects of the run, which its ticket carries; `None` without history.
+    pub expected: Option<&'g Map<String, Value>>,
 }
 
 /// How a wait ended.
@@ -258,6 +265,7 @@ impl<'a> Wait<'a> {
             arrived,
             builder,
             under,
+            expected,
             ..
         } = arrival;
         let ticket = Ticket {
@@ -267,7 +275,7 @@ impl<'a> Wait<'a> {
             start_ms: gate.start_ms,
             holds: false,
             remote: pool.is_remote().then_some(true),
-            expected: None,
+            expected: expected.cloned(),
         };
         let waiter = Waiter::queue(root, arrival, &ticket, host, console);
         let under = under.filter(|_| !pool.is_remote());
@@ -286,6 +294,7 @@ impl<'a> Wait<'a> {
             },
             under,
             barrier: None,
+            range: 0..0,
             pause,
             waiter,
             said_waiting: false,
@@ -307,7 +316,7 @@ impl<'a> Wait<'a> {
             if self.waiter.interrupted() {
                 return Waited::Interrupted;
             }
-            self.say_heartbeat(console);
+            self.say_heartbeat(survey, console);
         }
     }
 
@@ -327,6 +336,7 @@ impl<'a> Wait<'a> {
         self.barrier = self.barrier_in(&others);
         self.pause.refresh(self.barrier.is_some(), console);
         let (range, probe) = self.range(count, survey, console);
+        self.range = range.clone();
         let (may_try, probe) = self.may_try(&others, range.clone(), probe, survey, console);
         if may_try && let Some(taken) = slots::try_pool(self.root, self.pool, range.clone(), survey, console) {
             return Some(Waited::Taken(taken));
@@ -475,10 +485,35 @@ impl<'a> Wait<'a> {
     }
 
     /// The first line of a gate that finds none of the slots `range` free by `probe`, made now when the pass made
-    /// none, with the busy slots of that same probe; `None` when one is free.
+    /// none, with the busy slots of that same probe and when the first of their holders frees its slot ([`Wait::eta`]);
+    /// `None` when one is free.
     fn busy_line(&self, probe: Option<Probe>, range: Range<u32>, survey: &mut Survey, console: &mut Console) -> Option<String> {
-        let probe = probe.unwrap_or_else(|| self.probe(range, survey, console));
-        (slots_where(&probe, false) == 0).then(|| format!("gate: waiting for a {} ({} busy)", self.place, slots_where(&probe, true)))
+        let probe = probe.unwrap_or_else(|| self.probe(range.clone(), survey, console));
+        if slots_where(&probe, false) != 0 {
+            return None;
+        }
+        let busy = format!("{} busy", slots_where(&probe, true));
+        let figures = with_eta(busy, self.eta(&probe, range, survey, console));
+        Some(format!("gate: waiting for a {} ({figures})", self.place))
+    }
+
+    /// When the first holder of the busy slots of `range` frees its slot, by `probe`, that range's probe, and the
+    /// other gates' live claims as they stand ([`holder_eta`]); `None` when a slot of the probe could not be probed.
+    fn eta(&self, probe: &[Option<bool>], range: Range<u32>, survey: &mut Survey, console: &mut Console) -> Option<String> {
+        if probe.iter().any(Option::is_none) {
+            return None;
+        }
+        let kind = self.pool.claim_kind();
+        let busy: Vec<(ClaimKind, u32)> = range
+            .zip(probe)
+            .filter(|(_, slot)| **slot == Some(true))
+            .map(|(index, _)| (kind, index))
+            .collect();
+        if busy.is_empty() {
+            return None;
+        }
+        let claims = survey.live_claims(&self.root.path, console);
+        holder_eta(&claims, &busy, Which::First, Timestamp::now())
     }
 
     /// The first line of a gate the critical request of the last pass holds back; `None` when none did.
@@ -522,16 +557,105 @@ impl<'a> Wait<'a> {
     }
 
     /// Says the still-waiting line when it is due, with the whole seconds since the gate queued; a light gate held
-    /// back by a critical request names it.
-    pub(crate) fn say_heartbeat(&mut self, console: &mut Console) {
-        if let Some(waited) = self.waiter.heartbeat_due() {
-            let place = match (self.pool, self.barrier) {
-                (Pool::Local(SlotKind::Light), Some(barrier)) => beside_place(barrier.pid),
-                _ => self.place.clone(),
-            };
-            console.err(&format!("gate: still waiting for a {place} ({} s)", waited.as_secs()));
-        }
+    /// back by a critical request names it. A gate no critical request holds back probes the slots of the last pass,
+    /// and when every one is busy says how many and when the first of their holders frees its slot ([`Wait::eta`]).
+    pub(crate) fn say_heartbeat(&mut self, survey: &mut Survey, console: &mut Console) {
+        let Some(waited) = self.waiter.heartbeat_due() else {
+            return;
+        };
+        let seconds = format!("{} s", waited.as_secs());
+        let line = match (self.pool, self.barrier) {
+            (Pool::Local(SlotKind::Light), Some(barrier)) => format!("gate: still waiting for a {} ({seconds})", beside_place(barrier.pid)),
+            (_, Some(_)) => format!("gate: still waiting for a {} ({seconds})", self.place),
+            (_, None) => format!(
+                "gate: still waiting for a {} ({})",
+                self.place,
+                self.heartbeat_figures(seconds, survey, console)
+            ),
+        };
+        console.err(&line);
     }
+
+    /// The figures of a still-waiting line, `seconds` waited first: with the busy count and the first holder's ETA when
+    /// a probe of the last pass's slots finds every one busy, else `seconds` alone, as for a gate that waits behind
+    /// earlier tickets while a slot is free, or one whose probe failed.
+    fn heartbeat_figures(&self, seconds: String, survey: &mut Survey, console: &mut Console) -> String {
+        let range = self.range.clone();
+        let probe = self.probe(range.clone(), survey, console);
+        if probe.is_empty() || probe.iter().any(|slot| *slot != Some(true)) {
+            return seconds;
+        }
+        let busy = format!("{seconds}; {} busy", probe.len());
+        with_eta(busy, self.eta(&probe, range, survey, console))
+    }
+}
+
+/// `figures` of a wait line, followed by `eta` when there is one.
+fn with_eta(figures: String, eta: Option<String>) -> String {
+    match eta {
+        Some(eta) => format!("{figures}, {eta}"),
+        None => figures,
+    }
+}
+
+/// Which holder a wait line names: the first to free its slot, the one a slot's waiter gets, or the last, the one a
+/// critical gate waits for once the others have freed theirs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Which {
+    First,
+    Last,
+}
+
+/// One holder as its ETA reads it: the seconds of its usual run time left, negative once past it, its usual run time,
+/// the claim's `expected.p50`, and its ceiling in seconds.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Usual {
+    left: f64,
+    p50: f64,
+    ceiling: f64,
+}
+
+/// When the holders of the busy slots `busy`, each a claim kind and slot index, free them, by their live claims
+/// `claims` at `now`: the expected end of the holder `which` names, its claim's `started` plus its `expected.p50`, as
+/// `the first frees in about 4 min`, or once that end is at or before `now`, how far past it the holder is, with its
+/// usual and its ceiling ([`eta_text`]). `None` when no slot is busy, or a busy slot has no claim carrying a usual.
+pub(crate) fn holder_eta(claims: &[Claim], busy: &[(ClaimKind, u32)], which: Which, now: Timestamp) -> Option<String> {
+    let mut holders = Vec::with_capacity(busy.len());
+    for &(kind, index) in busy {
+        let claim = claims.iter().find(|claim| claim.kind == kind && claim.index == index)?;
+        let p50 = claim.expected.as_ref()?.get("p50")?.as_f64()?;
+        let ran = now.duration_since(claim.started).as_secs_f64();
+        holders.push(Usual {
+            left: p50 - ran,
+            p50,
+            ceiling: claim.timeout_seconds,
+        });
+    }
+    let by_left = |one: &Usual, other: &Usual| one.left.total_cmp(&other.left);
+    let named = match which {
+        Which::First => holders.into_iter().min_by(by_left),
+        Which::Last => holders.into_iter().max_by(by_left),
+    }?;
+    Some(eta_text(named, which))
+}
+
+/// What a wait line says of `holder`, the holder `which` names: `the first frees in about {left}` while its usual run
+/// time lasts, else `the first is {over} past its usual {p50}, ceiling {ceiling}`; each figure by the expected-time
+/// line's rule ([`span_text`]).
+fn eta_text(holder: Usual, which: Which) -> String {
+    let name = match which {
+        Which::First => "the first",
+        Which::Last => "the last",
+    };
+    if holder.left > 0.0 {
+        return format!("{name} frees in about {}", span_text(holder.left));
+    }
+    format!(
+        "{name} is {} past its usual {}, ceiling {}",
+        span_text(-holder.left),
+        span_text(holder.p50),
+        span_text(holder.ceiling)
+    )
 }
 
 /// What a light gate kept to the reserved light slots by the critical request of gate `pid` waits for.
@@ -668,7 +792,10 @@ pub(crate) mod scratch {
     use std::thread;
 
     use gate_args::{RunRequest, Slot, Spelling, TestSeams};
+    use gate_state::v1::{Claim, ClaimKind};
     use gate_state::{KernelObject, StateRoot, v1};
+    use jiff::Timestamp;
+    use serde_json::json;
 
     use crate::acquire;
     use crate::resolve::ResolvedRoot;
@@ -738,6 +865,32 @@ pub(crate) mod scratch {
         }
     }
 
+    /// The live claim of another gate holding slot `index` of `kind` since `started` under a 900 s ceiling, with a usual
+    /// run time of `p50` seconds when its command has history.
+    pub(crate) fn holding(kind: ClaimKind, index: u32, started: Timestamp, p50: Option<f64>) -> Claim {
+        let expected = p50.map(|p50| {
+            json!({"p50": p50, "p90": p50, "n": 5, "key": "local:: | cargo build"})
+                .as_object()
+                .cloned()
+                .expect("expected is an object")
+        });
+        Claim {
+            kind,
+            index,
+            pid: 1,
+            process_start: started,
+            started,
+            cwd: r"C:\work".to_owned(),
+            command: "cargo build".to_owned(),
+            log: r"C:\work\out.log".to_owned(),
+            timeout_seconds: 900.0,
+            remote: None,
+            host: None,
+            key: None,
+            expected,
+        }
+    }
+
     /// A slot held by a thread of its own, as another gate holds one: the mutex is let go on that thread when this is
     /// dropped.
     pub(crate) struct Holder {
@@ -784,10 +937,155 @@ mod tests {
 
     use std::time::{Duration, Instant};
 
-    use super::scratch::{Holder, Scratch, request};
-    use super::{Arrival, Barrier, Host, LendFacts, Wait, Waited, barrier, first_heartbeat, lends, slot_range};
+    use gate_state::v1::ClaimKind;
+    use jiff::{SignedDuration, Timestamp};
+
+    use super::scratch::{Holder, Scratch, holding, request};
+    use super::{Arrival, Barrier, Host, LendFacts, Wait, Waited, Which, barrier, first_heartbeat, holder_eta, lends, slot_range};
     use crate::console::Console;
     use crate::slots::{self, Pool, Survey, ThisGate};
+
+    /// The fixed moment the ETA cases count from.
+    fn now() -> Timestamp {
+        "2026-10-13T12:00:00Z".parse().expect("a fixed time")
+    }
+
+    /// `seconds` before [`now`].
+    fn ago(seconds: i64) -> Timestamp {
+        now().checked_sub(SignedDuration::from_secs(seconds)).expect("a moment after the epoch")
+    }
+
+    const HEAVY_0: (ClaimKind, u32) = (ClaimKind::Heavy, 0);
+    const HEAVY_1: (ClaimKind, u32) = (ClaimKind::Heavy, 1);
+
+    #[test]
+    fn the_eta_names_the_holder_that_frees_its_slot_first() {
+        let claims = [
+            holding(ClaimKind::Heavy, 0, now(), Some(600.0)),
+            holding(ClaimKind::Heavy, 1, ago(200), Some(260.0)),
+        ];
+
+        assert_eq!(
+            holder_eta(&claims, &[HEAVY_0, HEAVY_1], Which::First, now()).as_deref(),
+            Some("the first frees in about 60 s"),
+            "60 s left of the second holder's usual, 600 s of the first's"
+        );
+        assert_eq!(
+            holder_eta(&claims, &[HEAVY_0], Which::First, now()).as_deref(),
+            Some("the first frees in about 10 min"),
+            "only the busy slots' holders count"
+        );
+    }
+
+    #[test]
+    fn the_eta_is_in_seconds_below_90_s_and_whole_minutes_from_90_s_never_below_1() {
+        let eta = |p50: f64| {
+            holder_eta(
+                &[holding(ClaimKind::Light, 0, now(), Some(p50))],
+                &[(ClaimKind::Light, 0)],
+                Which::First,
+                now(),
+            )
+        };
+
+        assert_eq!(eta(89.0).as_deref(), Some("the first frees in about 89 s"));
+        assert_eq!(eta(90.0).as_deref(), Some("the first frees in about 2 min"));
+        assert_eq!(eta(0.4).as_deref(), Some("the first frees in about 1 s"));
+    }
+
+    #[test]
+    fn a_busy_slot_whose_holder_has_no_usual_hides_the_eta() {
+        let with_history = holding(ClaimKind::Heavy, 0, now(), Some(240.0));
+        let without = holding(ClaimKind::Heavy, 1, now(), None);
+        let light = holding(ClaimKind::Light, 1, now(), Some(240.0));
+
+        assert_eq!(
+            holder_eta(&[with_history.clone(), without], &[HEAVY_0, HEAVY_1], Which::First, now()),
+            None,
+            "a holder without expected"
+        );
+        assert_eq!(
+            holder_eta(&[with_history.clone(), light], &[HEAVY_0, HEAVY_1], Which::First, now()),
+            None,
+            "a busy slot with no claim of its kind"
+        );
+        assert_eq!(holder_eta(&[with_history], &[], Which::First, now()), None, "no busy slot");
+    }
+
+    #[test]
+    fn a_holder_past_its_usual_is_said_with_its_usual_and_ceiling() {
+        let past = |started| holder_eta(&[holding(ClaimKind::Heavy, 0, started, Some(240.0))], &[HEAVY_0], Which::First, now());
+
+        assert_eq!(past(ago(420)).as_deref(), Some("the first is 3 min past its usual 4 min, ceiling 15 min"));
+        assert_eq!(
+            past(ago(240)).as_deref(),
+            Some("the first is 1 s past its usual 4 min, ceiling 15 min"),
+            "an end at now is past, never 0 s"
+        );
+    }
+
+    /// The still-waiting line `wait` says when one is due now, its whole seconds waited shown as `N`.
+    fn heartbeat(wait: &mut Wait<'_>, survey: &mut Survey, console: &mut Console) -> Vec<String> {
+        wait.waiter.next_heartbeat = Duration::ZERO;
+        wait.say_heartbeat(survey, console);
+        console
+            .take_notes()
+            .iter()
+            .map(|line| {
+                let (head, tail) = line.split_once('(').expect("the line has its figures");
+                format!("{head}(N{}", tail.trim_start_matches(|digit: char| digit.is_ascii_digit()))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_still_waiting_line_says_the_busy_count_only_while_every_slot_is_busy() {
+        let scratch = Scratch::new("heartbeat");
+        scratch.one_light_slot();
+        let request = request(Slot::Light);
+        let gate = ThisGate::read(&request).expect("this process's start can be read");
+        let mut survey = Survey::new(&gate);
+        let mut console = Console::new();
+        let holder = Holder::take(scratch.name(KernelObject::LightSlot(0)));
+        let arrival = Arrival {
+            gate: &gate,
+            request: &request,
+            queued: Instant::now(),
+            arrived: gate.start_ms,
+            builder: None,
+            after_fallback: false,
+            under: None,
+            expected: None,
+        };
+        let host = Host {
+            processors: 4,
+            interrupt: None,
+        };
+        let mut wait = Wait::queue(&scratch.root, Pool::Local(SlotKind::Light), arrival, host, &mut console);
+        assert!(wait.pass(&mut survey, &mut console).is_none(), "the one light slot is held");
+        console.take_notes();
+
+        assert_eq!(
+            heartbeat(&mut wait, &mut survey, &mut console),
+            ["gate: still waiting for a light slot (N s; 1 busy)"],
+            "every slot busy, its holder without history"
+        );
+        drop(holder);
+        assert_eq!(
+            heartbeat(&mut wait, &mut survey, &mut console),
+            ["gate: still waiting for a light slot (N s)"],
+            "a slot free, as for a gate that defers to earlier tickets"
+        );
+        let held_again = Holder::take(scratch.name(KernelObject::LightSlot(0)));
+        wait.barrier = Some(Barrier { pid: 9, holding: false });
+        assert_eq!(
+            heartbeat(&mut wait, &mut survey, &mut console),
+            ["gate: still waiting for a light slot beside the critical request of gate 9 (N s)"],
+            "held back by a critical request, the line is as it was"
+        );
+        drop(held_again);
+        wait.end(&mut console);
+    }
 
     #[test]
     fn a_pass_waits_while_the_pool_is_full_and_takes_the_slot_once_it_frees() {
@@ -806,6 +1104,7 @@ mod tests {
             builder: None,
             after_fallback: false,
             under: None,
+            expected: None,
         };
         let host = Host {
             processors: 4,

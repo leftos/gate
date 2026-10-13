@@ -7,6 +7,7 @@ usage: gate run --slot heavy|light|critical|none --timeout <seconds> --log <path
        gate cutover
        gate push
        gate burn [--cores <n>] --seconds <s>
+       gate expect [--state-dir <path>] [--slot heavy|light|critical] -- <command> [args...]
        gate --version | --help
 
 run options:

@@ -120,4 +120,5 @@ fn valid_run_runs_its_command_and_exits_with_its_status() {
     assert!(case.folder().join("out.log").is_file(), "the log is in the working folder");
     let entries = case.root_entries();
     assert!(entries.iter().any(|entry| entry == "events.jsonl"), "events.jsonl in {entries:?}");
+    assert!(entries.iter().any(|entry| entry == "durations.json"), "durations.json in {entries:?}");
 }

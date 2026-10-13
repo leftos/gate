@@ -34,6 +34,7 @@ The CLI is subcommands with GNU-style flags: `--name value` or `--name=value`, a
 | `gate cutover` | Switch this machine from the PowerShell gate to `gate.exe`, draining it first. |
 | `gate push` | Copy the installed `gate.exe` to every builder `remote.json` names. |
 | `gate burn` | Spin the CPU for a set time, for the load-burn tool. |
+| `gate expect` | Print the expected time of a command here and on each builder, from the durations store. |
 | `gate box` | Hidden: the builder side of a routed run. |
 | `gate --version` | Print `gate <package version>+<build id>` and exit 0 ([Build id](#build-id)). |
 | `gate --help`, `gate help` | Print the usage on stdout and exit 0. |
@@ -177,6 +178,21 @@ It also ends when the process that started it ends: `gate: burn: the parent proc
 - The PowerShell spelling (`-Burn`, `-Cores`, `-OwnerApproved`) is accepted by the compatibility layer while the launcher's form stays.
 - Plain `gate burn` stays as the subcommand `gate run --burn` builds on: one process that spins the CPU, takes no slot, runs no command and enforces no 120 s cap (its limit is the 180 s above).
 
+### `gate expect`
+
+`gate expect [--state-dir <path>] [--slot heavy|light|critical] -- <command> [args...]` prints how long the command would take in the current folder, from the durations store ([design/gate-durations.md](design/gate-durations.md)). Its usage line is listed after `gate burn`. It is a pure reader: it queues for nothing, takes no slot or mutex, writes no journal line, and neither writes nor rebuilds the store.
+
+- `--state-dir` and `GATE_STATE_DIR` resolve the [state root](#state-root) as for `gate stop-tree`.
+- `--slot` defaults to `heavy`; `critical` keys the `crit` class. `none` and any other value are refused: `gate: --slot must be heavy, light or critical, got '<value>'`, then the usage, exit 2.
+- Other usage errors, each on its own `gate: ` line before the usage, exit 2: `gate: missing the command after --`, `gate: --slot is given twice`, `gate: --state-dir is given twice`, `gate: unknown option {word}` and `gate: unexpected argument {word}`.
+- It keys the command as a `gate run` of the same words in the same folder would: the same git call with the folder-shape fallback, the same temp root, class and exact-then-family estimate. The one difference is that it keys the words as given, so a dotnet `--no-build` that a local run would drop is keyed with it.
+
+It prints one line per place with an estimate on stdout, the local one first, then each builder in host order: `gate: expected about {n} {s|min} (usual {p50}, p90 {p90}, {runs} runs[ of similar commands]) here`, and for a builder the same text ending ` on {host}`. It exits 0.
+
+`no history` on stdout, exit 0, when no place has an estimate, when the store is missing, and, silently, when it is of an older or newer key version. A torn or unreadable store also prints `no history` and exits 0, with `gate: cannot read {path} ({reason}); expected times are unavailable` on stderr. A working directory that cannot be read prints `gate: cannot read the working directory: {error}` on stderr and exits 1.
+
+The launcher maps no `-Expect`: the compatibility layer refuses it, and callers run `gate.exe expect -- <command>` directly.
+
 ### `gate box`
 
 Hidden from the usage and from `--help`. It is the builder side of a routed run, run over ssh on the builder ([The box side](#the-box-side)).
@@ -185,7 +201,7 @@ Hidden from the usage and from `--help`. It is the builder side of a routed run,
 
 ### Later subcommands
 
-Further modes arrive as subcommands of the same binary, each designed with its issue: `gate expect -- <command>` (the expected duration of a command, GATE-13), `gate status` and `gate drain`. New options, such as `--timeout auto` (GATE-16) and `--slot auto` (GATE-8), exist only in the new CLI, never in the compatibility layer.
+Further modes arrive as subcommands of the same binary, each designed with its issue: `gate status` and `gate drain`. New options, such as `--timeout auto` (GATE-16) and `--slot auto` (GATE-8), exist only in the new CLI, never in the compatibility layer.
 
 ### Compatibility layer
 
@@ -253,7 +269,7 @@ The lines of a run that starts its command:
 
   A gate that is not heavy, has a covering parent, matches no pattern or has no `remote.json` says nothing.
 - A local run that drops its dotnet `--no-build`, on stderr and in the log, before it takes a slot: `gate: dropped --no-build: <reason>; building on a heavy slot`, or `gate: dropped --no-build: <reason>; building on the parent gate's <heavy|critical|light> slot` for a gate covered or lent a slot ([Routing](#routing)).
-- A routed run, on stderr and in the log, after any `gate: dropped --no-build: the last build may have run on the other machine` and `gate: outputs: none brought back for a --no-build command` lines. While it waits for a remote slot: `gate: waiting for a remote slot on <host> (<n> busy)` and `gate: still waiting for a remote slot on <host> (<s> s)`, as a local wait says them.
+- A routed run, on stderr and in the log, after any `gate: dropped --no-build: the last build may have run on the other machine` and `gate: outputs: none brought back for a --no-build command` lines. While it waits for a remote slot: `gate: waiting for a remote slot on <host> (<n> busy)` and `gate: still waiting for a remote slot on <host> (<s> s)`, as a local wait says them, ETA included.
 
   A run the builder does not take says why and goes on here: `gate: remote <host> <reason>; running here`, with `<reason>` one of `full` (no remote slot within 60 s), `busy`, `unreachable`, `parity`, `rebooted`, `tools` or `version`, and `gate: remote <host> client could not start: <detail>; running here` when the remote client cannot start.
 
@@ -268,7 +284,13 @@ The lines of a run that starts its command:
 - Nesting, on stderr and in the log, from the slot marker in the gate's environment: the `running under` (including the lend's `while a critical request drains`), `ignored GATE_SLOT_HELD`, `could not judge GATE_SLOT_HELD` and `does not cover` lines, the barrier's `waiting for a heavy slot behind the critical request` and `waiting for a light slot beside the critical request` lines, and the refusal of a critical gate, all in [Critical drain and nesting](#critical-drain-and-nesting).
 
   The late take adds `the parent gate <pid> ended; ...` and `cannot watch the parent gate ...` lines, in the same section.
-- The gate prints no `queued for` or `took ... slot` line, for a local, a routed or a no-slot run: the queue and the take are in the journal, and a wait longer than 30 s says `gate: still waiting for a <kind> slot (<s> s)`. A no-slot run never waits.
+- The gate prints no `queued for` or `took ... slot` line, for a local, a routed or a no-slot run: the queue and the take are in the journal, and a wait longer than 30 s says `gate: still waiting for a <kind> slot (<s> s)`, with the busy count and an ETA when every slot is busy ([Slots](#slots), step 6). A no-slot run never waits.
+- The expected-time line, on stderr and in the log, once a run that takes a slot has written its claim and woken the waiters and before the command's output: `gate: expected about <n> s (usual <n> s, p90 <n> s, <runs> runs)`, or in whole minutes from 90 s: `gate: expected about <n> min (usual <n> min, p90 <n> min, <runs> runs)`. A local light or heavy take says it, a critical gate after its holds line, a routed run at its remote take, and a fallback a second one at its local take.
+
+  `about` is the mean wall time over the estimate's window (the last 30 passing runs or those within 14 days, whichever holds fewer), `usual` the median of the 5 newest, and every figure is rounded and floored at 1 s (or 1 min). An estimate from the family key ends `<runs> runs of similar commands)`. A key with fewer than 5 passing runs, a `--slot none` run, and a run a parent's slot covers or lends say nothing ([design/gate-durations.md](design/gate-durations.md), Estimate).
+- The durations store's notes, on stderr and in the log. Said once a run: `gate: cannot read <path> (<reason>); expected times are unavailable` for a store that is torn or cannot be read, said before the run queues, so it can come before a waiting line, and `gate: could not write <path> (<reason>)` for a failed store write, which leaves the run's exit code as it was. `gate: cannot rebuild <store path> (<reason>); expected times are unavailable` when the run's claim on a rebuild fails other than by another gate holding it.
+
+  A rebuild says `gate: <note>` for each of `skipped <n> release line(s) of <file> that do not parse`, `could not read <path>: <error>`, `could not list the archive folder <dir>: <error>` and the swap's own notes, and `gate: could not remove <marker path>: <error>` when an interrupted rebuild cannot remove its marker.
 - Notes that never fail the gate: `gate: cannot remove <log>.err: <error>`, `gate: cannot remove the log <path> of the attempt: <error>` (a routed run that fell back could not delete the log the client wrote), `gate: cannot append <log>.err to the log: <error>` and `gate: cannot read this gate's priority class, so the command runs below normal: <error>`.
 
 ## Slots
@@ -307,9 +329,11 @@ A missing file or key means the default; an unreadable or invalid value is ignor
 3. A take deletes the gate's own ticket, journals `take`, writes the claim and wakes the waiters, so the next in line tries at once. A release deletes the claim, journals `release`, lets the mutex go and wakes the waiters. A critical gate takes the machine instead ([Critical drain and nesting](#critical-drain-and-nesting)): its `take` and `release` list every slot it holds, and it writes one claim, `gate-critical.json`, and none for the slots.
 4. A waiter sleeps on its own wake event, `Local\gate-wake-<pid>-<start>` (auto-reset). A gate that takes or releases a slot, or deletes a dead gate's ticket, signals the wake event of every live ticket in its state root. An auto-reset event stays signalled until its waiter wakes, so no wakeup is lost between a waiter's check and its wait. A wake that cannot be opened or set is not said: the fallback poll covers it.
 5. Each wait has a fallback poll as its timeout (2 s, kept from S4's interval). The poll re-reads the counts and the tickets, which deletes a dead waiter's ticket so it cannot hold the queue (Q1), and picks up a count changed by hand.
-6. A waiter prints `gate: waiting for a <kind> slot (<n> busy)` once, on the first pass whose own [probe by open](#probe-by-open) finds none of the pool's slots free, where `<n>` is how many slots that same probe reports held. A gate that waits only behind earlier tickets while a slot is free for it does not print it. A gate held back by a critical request prints the barrier line instead, on its first pass ([Critical drain and nesting](#critical-drain-and-nesting)).
+6. A waiter prints `gate: waiting for a <kind> slot (<n> busy)` once, on the first pass whose own [probe by open](#probe-by-open) finds none of the pool's slots free, where `<n>` is how many slots that same probe reports held, followed by `, the first frees in about <eta>` when the ETA below is known. A gate that waits only behind earlier tickets while a slot is free for it does not print it. A gate held back by a critical request prints the barrier line instead, on its first pass ([Critical drain and nesting](#critical-drain-and-nesting)).
 
-   It prints `gate: still waiting for a <kind> slot (<s> s)` every 30 s from its queueing, on stderr and in the log, so a gate around it does not read the wait as a stall (kept, S4). Its watchdog starts only once it holds a slot.
+   It prints `gate: still waiting for a <kind> slot (<s> s)` every 30 s from its queueing, on stderr and in the log, so a gate around it does not read the wait as a stall (kept, S4). When a probe of the last pass's slots finds every one busy, the line reads `(<s> s; <n> busy)`, with the ETA before the `)`. Its watchdog starts only once it holds a slot.
+
+   The ETA, on the heavy, light and remote queue lines and these heartbeats, names the soonest expected end among the busy slots, `started + expected.p50` of each holder's live claim. It reads `, the first frees in about <eta>`, or once that end has passed `, the first is <over> past its usual <p50>, ceiling <ceiling>`, the ceiling being the claim's `timeoutSeconds`. It is left out, and the line is as without it, when any busy slot has no live claim carrying `expected` or any slot of the probe could not be probed. A gate held back by a critical request, and a gate with a free slot behind earlier tickets, prints no ETA. Each figure is `<n> s` below 90 s and otherwise whole `<n> min`, never below 1, its unit picked by itself.
 
    `waitedSeconds` in its `take` counts from its `queue` line; the local `take` of a routed run that fell back counts from the `fallback` line, as the PowerShell gate does, except after a `full` fallback, whose local `take` counts from the run's `queue` line (as the PowerShell gate did for it).
 
@@ -372,9 +396,11 @@ For any other root, every kernel object name carries `<h>`, the first 8 lower-ca
 | `waiting\<pid>-<start>.json` | the waiting gate | other gates, ops-tower | [Ticket](#ticket). |
 | `covered\<pid>-<start>.json` | a gate running under a parent gate's slot | other gates (the survey), ops-tower | [Covered marker](#covered-marker). |
 | `paused\<parent pid>-<parent start>-<pid>-<start>.pause` | a gate waiting behind a critical request under a parent gate's slot | its parent gate's watchdog | Empty file; [Critical drain and nesting](#critical-drain-and-nesting) (kept, N3). |
-| `events.jsonl`, `events.1.jsonl` | every gate, under the journal mutex | ops-tower, the durations summary, people | [Journal](#journal). |
-| `archive\events-<yyyyMMddTHHmmssZ>.jsonl.gz` | the gate whose append rolled the journal | the durations summary | [Archive](#archive). |
-| `durations.json`, `backfill\<pid>.json` and the backfill bar record | gates | gates | Reserved for learned durations (GATE-7; [design/gate-durations.md](design/gate-durations.md)). |
+| `events.jsonl`, `events.1.jsonl` | every gate, under the journal mutex | ops-tower, the durations store's rebuild, people | [Journal](#journal). |
+| `archive\events-<yyyyMMddTHHmmssZ>.jsonl.gz` | the gate whose append rolled the journal | the durations store's rebuild | [Archive](#archive). |
+| `durations.json` | every slot-taking gate that reaches a verdict, inside the journal mutex right after its `release` line; a rebuilding gate swaps one in | gates, `gate expect` (no lock); ops-tower does not read it | The learned durations store, `{"v":1,"keyVersion":1,"keys":{…}}`, at most 30 samples per key ([design/gate-durations.md](design/gate-durations.md), Store). Written to a temporary sibling and moved over. A gate rebuilds a missing, stale or torn file from the journal and the archive once it has released, outside the journal hold, leaving out `--slot none` runs; a run whose release was filed into a current store does not rebuild, and the store is read again just before the rebuild claim. A store whose `keyVersion` is above this build's is read as no history, and neither filed into nor rebuilt. |
+| `durations.rebuilding`, `durations.rebuilding.<pid>.tmp` | the gate rebuilding the store | other gates | JSON `{"pid":<pid>,"start":<ms>}`; one gate rebuilds at a time, and a marker whose holder is dead or that cannot be read is taken over. Both exist only while a rebuild runs; a Ctrl+C during it swaps nothing and removes the marker. |
+| `backfill\<pid>.json` and the backfill bar record | gates | gates | Reserved for backfill guests (GATE-7; [design/gate-durations.md](design/gate-durations.md)). |
 | `remote\<key>.outputs-pending` | the Rust remote client | the same | Empty file. The Rust client writes it after the push and before a routed run's run call when the run has output globs, or when the route withheld its outputs (a dotnet `--no-build` command the builder built; that marker no end clears), so a run refused at the preflight or by the parity check leaves none, removes it only after an accepted `gate-remote-outputs: 0` or an install that skipped no file, and sends `OutputsFull` while it stands ([The remote client's run](#routing)). |
 | `remote\<key>.outputs-hashes` | the Rust remote client | the same | The hash cache: one outputs manifest line, `{"files":{"<path>":{"size":…,"modified":…,"sha256":"…"}}}`, of the files of the worktree's last built manifest last written at least 2 s before that build. Saved after each manifest the client builds, and by an outputs install that skipped nothing, for the files it put in place, through `<key>.outputs-hashes.<pid>.tmp` and a rename; one that cannot be read, is not a manifest line or is over 64 MiB gives no hash and is replaced by the next save, and deleting the file resets the cache ([The remote client's run](#routing), Manifest time). |
 | `remote\<key>.nothing-back` | the gate, after a routed dotnet build ends on the builder without its outputs known to be brought back, or, when none stands, a routed dotnet `--no-build` command whose word the builder dropped | every gate (the `--no-build` drop and the clear) | JSON `{"v":1,"host":"…","configuration":"…","framework":"…","runtime":"…"}`; the last three are optional and come from the routed build's own `-c`, `-f` and `-r` words. A passing local build of the whole worktree with the same three removes it, as does a passing routed build of that kind that brought all its outputs back ([Routing](#routing)). Written with create-new and the reparse-point flag, and read the same way, 4096 bytes at most; one that cannot be read counts as present. |
@@ -459,7 +485,7 @@ The environment carries one more name: `GATE_SLOT_HELD`, the slot marker ([Criti
 | `log` | string | the log's full path |
 | `timeoutSeconds` | number | the ceiling; the writer refuses a value JSON cannot carry (not finite) |
 | `remote`, `host`, `key` | bool, string, string | a remote slot's claim only (L1) |
-| `expected` | object | reserved, optional ([Reserved fields](#reserved-fields)); `null` reads as absent, any other non-object is unreadable |
+| `expected` | object | optional, last: what the durations store expects of the run, `{"p50": <s>, "p90": <s>, "n": <runs>, "key": "<key>"}` with the seconds to 3 decimals, rounded half to even; absent for a run without history. It is the builder's estimate for a remote take and `crit`'s for a critical gate. The wait lines read `p50` ([Slots](#slots), step 6); `null` reads as absent, any other non-object is unreadable |
 
 The file name `<name>` is `gate-slot-<i>`, `gate-light-slot-<i>`, `gate-remote-slot-<i>` or `gate-critical`, the same whatever the root: a non-default root's claims sit in that root's own `slots\` folder, so the file name carries no root hash.
 
@@ -482,7 +508,7 @@ A pid the checking gate may not query is dead too, since it is another user's pr
 | `startTicks` | number | the gate's process start, epoch ms (the field keeps its name) |
 | `holds` | bool | true only for a critical gate that holds the machine: it rewrites its ticket with `true` once every slot is held and keeps the ticket until it ends |
 | `remote` | bool | present and true only while queued for the remote pool |
-| `expected` | object | reserved, optional; `null` reads as absent |
+| `expected` | object | optional, last: the same object as a claim's `expected`, written when the gate has history for its command; a critical gate's rewritten holding ticket keeps it; `null` reads as absent |
 
 Waiters of one kind queue by (`arrived`, `pid`). The ticket reader lists only `*.json` files in `waiting\` (a `*.tmp` file is skipped), and leaves out a ticket deleted between the listing and the read, since a gate that took its slot deletes it.
 
@@ -621,12 +647,6 @@ Two rolls within one second collide on the archive name: the second archive fail
 - `archived the release lines of <path> but could not delete <temp>: <error>`;
 - `could not delete old archive <name>: <error>`.
 
-### Reserved fields
-
-Readers accept this optional field now; its issue writes it:
-
-- `expected`: `{"p50": <s>, "p90": <s>, "n": <runs>, "key": "<key>"}` in claims and tickets, present when the gate has history for the command (GATE-15).
-
 ### remote.json
 
 `remote.json` keeps the PowerShell gate's format (T1), read by `gate-router` as [Routing](#routing) describes: `host`, `slots`, `repos` and the optional per-repo `outputs`, read afresh by each routed gate and ignored as a whole with one line when unusable. A host of one letter is refused (`host must not be a single letter, which a git host:path URL reads as a drive`).
@@ -734,6 +754,8 @@ What `gate.exe` does of it today is part A, nesting under the slot marker (N1, K
 - **Lines**, on stderr and in the log:
   - `gate: waiting for the machine (critical): <h> heavy and <l> light slots held (<r> light slot|light slots reserved for light gates beside it), <n> earlier waiters`, the first time a pass falls short; a critical gate that takes the machine on its first pass says nothing.
   - `gate: still waiting for the machine (critical): <status> (<s> s)`, with the same status, on each heartbeat.
+
+  On both lines, when no earlier waiter and no earlier critical gate is ahead and every heavy slot and unreserved light slot the gate does not hold yet and some gate has open has a live claim carrying `expected`, the status ends `, the last frees in about <eta>`, or `, the last is <over> past its usual <p50>, ceiling <ceiling>`, naming the latest expected end instead of the soonest, in the figures of [Slots](#slots), step 6.
   - `gate: holds the machine (critical) at <yyyy-MM-ddTHH:mm:ss.fffffffZ> after <s.d> s: counts heavy <H>, light <L>; other gates hold <h> heavy and <l> light slots (<r> ... reserved for light gates beside it); other live claims: <pid> <kind> <index> <command>, ...`, the claims ending as `none` or `unknown (<reason>)` when they could not be listed.
   - `gate: waiting for a heavy slot behind the critical request of gate <pid>`, from a heavy gate the barrier holds back, on its first pass whether or not a slot is free, with `<pid>` the earliest request's gate; then `gate: still waiting for a heavy slot (<s> s)` on each heartbeat.
   - `gate: waiting for a light slot beside the critical request of gate <pid>`, from a light gate the barrier holds back, likewise, then `gate: still waiting for a light slot beside the critical request of gate <pid> (<s> s)`.
@@ -1863,7 +1885,7 @@ When a run that passed did not fit its slot, the gate says how many cores the co
 - Whether a gate under the run took a slot of its own is read from the journal (`nested_took_slot`): a gate under `Nesting::Under` or `Nesting::Beside` writes `parentPid` on its `take`, and the parent drops its hint and cores only when that `take` lists a slot or took the machine (a critical `take`).
 - A nested no-slot gate takes nothing, so it leaves its parent's hint and cores. When the CPU at the end or the journal cannot be read, the hint is left out with a log-only note ([Output lines](#output-lines)).
 - The journal's `release` line records `avgCores`, `peakCores` and `freeCores` ([Journal](#journal)), the history `--slot auto` will read (GATE-8). `--slot auto` runs a command with too little history on heavy and says it guessed; it never chooses critical or none.
-- Learned durations and `--slot auto` are built after the local cutover; the v1 formats reserve their optional fields ([Reserved fields](#reserved-fields)).
+- The gate learns durations and says the expected-time line ([Output lines](#output-lines)); `--slot auto` is built after the local cutover.
 
 ## Open questions
 
