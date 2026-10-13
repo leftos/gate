@@ -14,18 +14,17 @@
   - [ ] GATE-18 Remote preflight: refuse with `parity` when the builder lacks a .NET workload the repo needs
   - [ ] GATE-19 Remote: send a repo's declared sibling worktrees with a routed run
   - [ ] GATE-22 Remote: send a routed command's ignored inputs to the builder, compressed
-  - [ ] GATE-23 Outputs: measure the manifest time, cache hashes by (path, size, mtime) if slow
+  - [/] GATE-23 Outputs: measure the manifest time, cache hashes by (path, size, mtime) if slow
   - [ ] GATE-27 Remote: remember a builder's failures per host (short backoff, loss counter)
   - [ ] GATE-21 Remote: a critical pool on the builder for timing-sensitive gates (decide after measuring)
   - [ ] GATE-29 Sync-back: narrow the 'worktree changed during the run' refusal to changes that could matter
   - [ ] GATE-135 Remote client: bound the PC's dotnet --list-sdks and find dotnet on PATH only
-  - [ ] GATE-137 Remote client: cap the bytes the outputs fetch writes
 - [ ] GATE-148 Outputs install: decide whether to refuse a member git tracks
-- [/] GATE-150 A passed routed run fails when an output it brings back is in use
-- [ ] GATE-155 Outputs install: never write .git* paths or .lfsconfig
-- [ ] GATE-156 A full fallback's take reports only the local wait, not the wait since its queue line
-- [ ] GATE-157 History: keep a fallen-back remote take's start and wait for ops-tower
 - [ ] GATE-159 Box: choose the dotnet tool restore cap from its logged times
+- [ ] GATE-164 Suite: pin the abandon wait after a full fallback (needs an interrupt seam for the local wait)
+- [ ] GATE-165 Remote client: cap the bytes a builder's output may write to the gate's log
+- [ ] GATE-166 Outputs walk: never pack a name the PC's install refuses as not plain
+- [ ] GATE-167 Outputs fetch: fail a run whose builder passes the cap twice in a row
 
 ## Cutover sweep
 
@@ -47,9 +46,6 @@
 - [ ] GATE-143 Measure which other shared daemons leave a gate's job, and spare them from the escaped-tree kill
 - [ ] GATE-144 Harden the slot marker against a same-user forger: job DACL, parent claim check, job-name squatting
 - [/] GATE-152 Reach the escapee of a launcher that exits before the first sample (job member memory)
-- [/] GATE-153 Suite: a box-run case waited 600 s for its first line on a loaded machine
-- [/] GATE-158 Suite: four stall and backstop cases pass instead of being killed on a loaded machine
 - [ ] GATE-160 gate run --burn: a capped CPU burn on a critical slot, retiring load-burn.ps1
-- [ ] GATE-161 A gate starved past its ceiling reports passed with a load-adjusted time over the ceiling
 - [ ] GATE-162 Suite: make the remaining timer-raced interrupt and remote-client git cases load-proof
 - [ ] GATE-163 A process starved during its kill can outlive the gate that killed it
