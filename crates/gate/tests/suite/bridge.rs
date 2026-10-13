@@ -220,10 +220,10 @@ fn wait_gone(pwsh: (u32, Timestamp)) {
     wait_until(&format!("pwsh {} ending", pwsh.0), || gone(pwsh));
 }
 
-/// Starts the gate with `args` in a console of its own with no window, which the pwsh it starts shares, so a Ctrl+C a
-/// stand-in sends to its console reaches the gate and pwsh and nothing else. The suite first lets the processes it
-/// starts see Ctrl+C, which they would otherwise inherit ignoring when the suite itself was started so.
-fn start_in_own_console(case: &Case, args: &[&str]) -> Running {
+/// Starts the gate `command` in a console of its own with no window, which the processes it starts share, so a Ctrl+C
+/// sent to its console reaches the gate and them and nothing else. The suite first lets the processes it starts see
+/// Ctrl+C, which they would otherwise inherit ignoring when the suite itself was started so.
+pub(crate) fn start_in_own_console(mut command: process::Command) -> Running {
     static ALLOWED: OnceLock<()> = OnceLock::new();
     ALLOWED.get_or_init(|| {
         // SAFETY: a null handler with FALSE only clears this process's ignore-Ctrl+C attribute, which its children
@@ -231,7 +231,6 @@ fn start_in_own_console(case: &Case, args: &[&str]) -> Running {
         let set = unsafe { SetConsoleCtrlHandler(None, 0) };
         assert_ne!(set, 0, "the suite's children can see Ctrl+C: {}", io::Error::last_os_error());
     });
-    let mut command = case.gate(args);
     command.creation_flags(CREATE_NO_WINDOW);
     start(command)
 }
@@ -547,7 +546,7 @@ fn a_ctrl_c_before_the_run_starts_ends_the_bridge_at_once() {
     );
     let script = stand_in_with(&case, "remote.ps1", &top, &answer(0, false, None));
     let _let_go = LetGo(vec![markers.go.clone(), markers.never.clone()]);
-    let running = start_in_own_console(&case, &bridge_words("out.log", &script, &[], &COMMAND));
+    let running = start_in_own_console(case.gate(&bridge_words("out.log", &script, &[], &COMMAND)));
     let pwsh = started_pwsh(&markers.started);
     fs::write(&markers.go, "").expect("the go file can be made");
     let outcome = running.finish();
@@ -568,7 +567,7 @@ fn a_ctrl_c_runs_the_shim_s_stop_path_and_waits_for_it() {
     );
     let script = stand_in(&case, "remote.ps1", &markers.body(&on_break));
     let _let_go = LetGo(vec![markers.go.clone(), markers.release.clone(), markers.never.clone()]);
-    let mut running = start_in_own_console(&case, &bridge_words("out.log", &script, &[], &COMMAND));
+    let mut running = start_in_own_console(case.gate(&bridge_words("out.log", &script, &[], &COMMAND)));
     let pwsh = started_pwsh(&markers.started);
     fs::write(&markers.go, "").expect("the go file can be made");
     wait_for_file(&markers.stopping);
@@ -594,7 +593,7 @@ fn a_second_ctrl_c_kills_the_shim_at_once() {
     );
     let script = stand_in(&case, "remote.ps1", &markers.body(&on_break));
     let _let_go = LetGo(vec![markers.go.clone(), markers.never.clone()]);
-    let mut running = start_in_own_console(&case, &bridge_words("out.log", &script, &[], &COMMAND));
+    let mut running = start_in_own_console(case.gate(&bridge_words("out.log", &script, &[], &COMMAND)));
     let pwsh = started_pwsh(&markers.started);
     fs::write(&markers.go, "").expect("the go file can be made");
     wait_for_file(&markers.stopping);

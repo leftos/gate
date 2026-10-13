@@ -17,6 +17,8 @@ use gate_args::RunRequest;
 use gate_state::{FallbackReason, StateRoot};
 use gate_win32::{Interrupt, OwnedMutexGuard};
 
+use crate::console::Console;
+
 mod bridge;
 mod client;
 pub(crate) mod git;
@@ -91,14 +93,26 @@ pub(crate) trait RemoteClient {
         Ok(None)
     }
 
-    /// Whether the client has every part it starts, checked before the run takes a key lock or a remote slot: `Err`
-    /// with why one is missing, when the run falls back `client` at once.
-    fn ready(&self) -> Result<(), String> {
+    /// Whether the client can start, checked before the run takes a key lock, a ticket or a remote slot: a client may
+    /// wait here first, saying why on `console`, until `interrupt` is raised. `Err` with why it cannot, when the run
+    /// falls back `client` at once, or ends as an interrupt.
+    fn ready(&self, _console: &mut Console, _interrupt: Option<Interrupt>) -> Result<(), Unready> {
         Ok(())
     }
 
     /// Runs the call to its end, or to its refusal, on the run's thread.
     fn run(&mut self, call: &RemoteCall<'_>) -> RemoteOutcome;
+}
+
+/// Why a client cannot start its run ([`RemoteClient::ready`]).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Unready {
+    /// A part the client starts is missing: why, which the run's `client` fallback line names.
+    Missing(String),
+    /// The client will not start, and the line, which ends `running here`, says why in place of the fallback line.
+    RunsHere(String),
+    /// A Ctrl+C came while the client waited to start.
+    Interrupted,
 }
 
 /// What the client is asked to run, and where: the route's facts, the run's log and limits, and the interrupt that

@@ -32,7 +32,8 @@ use gate_state::{FallbackReason, KernelObject};
 use gate_win32::{EnvironmentBlock, Interrupt, Job, Launch, LaunchError, LaunchOutput, Running, StdioPipes, Waited, cancel_pending_io, cancelled};
 use serde_json::{Value, json};
 
-use super::{REFUSED, RemoteCall, RemoteClient, RemoteOutcome, git};
+use super::{REFUSED, RemoteCall, RemoteClient, RemoteOutcome, Unready, git};
+use crate::console::Console;
 use crate::run::CONTROL_C_EXIT;
 
 /// The bridge script's file name, beside gate.exe.
@@ -108,8 +109,8 @@ impl Bridge {
 
 impl RemoteClient for Bridge {
     /// remote.ps1, the bridge script and pwsh are there; [`Bridge::run`] looks again, for one gone since.
-    fn ready(&self) -> Result<(), String> {
-        self.parts().map(drop)
+    fn ready(&self, _console: &mut Console, _interrupt: Option<Interrupt>) -> Result<(), Unready> {
+        self.parts().map(drop).map_err(Unready::Missing)
     }
 
     fn run(&mut self, call: &RemoteCall<'_>) -> RemoteOutcome {

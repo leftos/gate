@@ -6,18 +6,19 @@ use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::os::windows::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{self, Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use gate_router::{DROPPED_NO_BUILD_LINE, NO_OUTPUTS_LINE, repo_name};
+use gate_state::v1;
 use serde_json::{Value, json};
 
-use crate::bridge::{answer, bridge_words, stand_in};
+use crate::bridge::{answer, bridge_words, stand_in, start_in_own_console};
 use crate::nesting::{marked, test_marker};
 
 use crate::support::{
     Case, FAKE_TOOL, Running, assert_in_order, copy_tool, events, finish, git, git_init, heavy_words, nothing_back, record_path, release, run_words,
-    shown, wait_for_journal_line, wait_until, write_counts, write_remote_json,
+    shown, start, wait_for_journal_line, wait_until, write_counts, write_remote_json,
 };
 
 pub(crate) const HOST: &str = "builder";
@@ -348,6 +349,214 @@ fn with_the_flag_an_ssh_inside_the_worktree_is_refused_with_reason_client() {
     assert!(outcome.stdout.contains("ran here"), "{outcome:?}");
     assert_eq!(ssh_calls(&steps), Vec::<String>::new(), "the refused ssh was never run");
     assert_refused(&events(&case), "client");
+}
+
+/// The line a routed run says when the drain marker names a drainer that is not running.
+const DRAIN_NOT_RUNNING_LINE: &str = "gate: the remote cutover's drain is not running; run gate remote-cutover again; running here";
+
+/// The line a routed run says once as it waits for the remote cutover's drain, whose drainer is this test process.
+fn drain_waiting_line() -> String {
+    format!("gate: waiting for the remote cutover's drain (pid {}) before routing", process::id())
+}
+
+/// The start of this test process in Unix epoch milliseconds, which a drain marker naming it as a live drainer carries.
+fn own_start_ms() -> u64 {
+    gate_win32::process_start_of(process::id())
+        .expect("this process's start can be read")
+        .expect("this process runs")
+        .as_millisecond()
+        .unsigned_abs()
+}
+
+/// Writes the drain marker in the case's root naming this test process, started at `start_ms`, as the drainer: alive
+/// with [`own_start_ms`], dead with any other start.
+fn write_drain_marker(case: &Case, start_ms: u64) {
+    v1::write_drain_marker(&case.root(), process::id(), start_ms, own_start_ms()).expect("the drain marker can be written");
+}
+
+/// The gate of a routed run of a [`cutover_case`] as [`cutover_gate`] makes it, whose wait for the drain reads the flag
+/// and the marker every 50 ms.
+fn drain_gate(case: &Case, path: &OsStr, steps: &Path, script: &str) -> Command {
+    let seams = ["--test-remote-script", script, "--test-poll-ms", "50"];
+    let mut gate = case.gate(&heavy_words_with_limit("out.log", &seams, &[r".\tool.exe", "out", "ran here"]));
+    gate.env("PATH", path).env("GATE_FAKE_SSH_STEPS", steps);
+    gate
+}
+
+/// Returns once the routed run `running` of `case` says it waits for the drain, while it still runs, having asked ssh
+/// nothing and taken no ticket and no remote slot.
+fn wait_for_the_drain_wait(case: &Case, running: &mut Running, steps: &Path) {
+    let line = drain_waiting_line();
+    running.wait_for_stderr_while_running("the drain's waiting line", |stderr| stderr.contains(&line));
+    assert_eq!(ssh_calls(steps), Vec::<String>::new(), "ssh is not called while the run waits");
+    assert!(!has_ticket(case, running.id()), "the waiting run holds no ticket");
+    assert!(!remote_claim(case).exists(), "the waiting run holds no remote slot");
+    assert_eq!(names(&own(case, running.id())), ["queue"], "the waiting run took nothing");
+}
+
+#[test]
+fn a_routed_run_during_the_drain_waits_then_routes_on_the_rust_client() {
+    let case = cutover_case("routing-drain-wait", true);
+    let outside = Case::new("routing-drain-wait-ssh");
+    let steps = fake_ssh_in(&outside.folder());
+    let script = missing_script(&case);
+    write_drain_marker(&case, own_start_ms());
+
+    let mut running = start(drain_gate(&case, &path_with(&outside.folder()), &steps, &script));
+    wait_for_the_drain_wait(&case, &mut running, &steps);
+    fs::remove_file(v1::remote_cutover_draining_path(&case.root())).expect("the drain marker can be removed");
+    let outcome = running.finish();
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(
+        outcome.stderr.matches(&drain_waiting_line()).count(),
+        1,
+        "the waiting line is said once: {outcome:?}"
+    );
+    assert!(outcome.stderr.contains(NO_BOX_LINE), "{outcome:?}");
+    assert!(outcome.stderr.contains("gate: remote builder version; running here"), "{outcome:?}");
+    assert!(!outcome.stderr.contains(&client_line(&script)), "the bridge is not called: {outcome:?}");
+    assert!(outcome.stdout.contains("ran here"), "{outcome:?}");
+    assert_eq!(ssh_calls(&steps), ["preflight"], "the builder's gate box was asked through ssh");
+    assert_refused(&events(&case), "version");
+}
+
+#[test]
+fn a_routed_run_whose_drainer_has_ended_runs_here_with_reason_client() {
+    let case = cutover_case("routing-drain-dead", true);
+    let outside = Case::new("routing-drain-dead-ssh");
+    let steps = fake_ssh_in(&outside.folder());
+    let script = missing_script(&case);
+    write_drain_marker(&case, own_start_ms() + 1);
+
+    let outcome = finish(drain_gate(&case, &path_with(&outside.folder()), &steps, &script));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(outcome.stderr.matches(DRAIN_NOT_RUNNING_LINE).count(), 1, "{outcome:?}");
+    assert!(!outcome.stderr.contains("gate: waiting for the remote cutover's drain"), "{outcome:?}");
+    assert!(
+        !outcome.stderr.contains("client could not start"),
+        "the drain's line is the only fallback line: {outcome:?}"
+    );
+    assert!(outcome.stdout.contains("ran here"), "{outcome:?}");
+    assert_eq!(ssh_calls(&steps), Vec::<String>::new(), "ssh was never called");
+    assert_fell_back(&case, &events(&case));
+}
+
+#[test]
+fn deleting_the_flag_during_the_wait_returns_the_run_to_the_bridge() {
+    let case = cutover_case("routing-drain-rollback", true);
+    let outside = Case::new("routing-drain-rollback-ssh");
+    let steps = fake_ssh_in(&outside.folder());
+    let script = missing_script(&case);
+    write_drain_marker(&case, own_start_ms());
+
+    let mut running = start(drain_gate(&case, &path_with(&outside.folder()), &steps, &script));
+    wait_for_the_drain_wait(&case, &mut running, &steps);
+    fs::remove_file(v1::remote_cutover_flag_path(&case.root())).expect("the flag can be removed");
+    let outcome = running.finish();
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(outcome.stderr.contains(&client_line(&script)), "the bridge is called: {outcome:?}");
+    assert!(outcome.stdout.contains("ran here"), "{outcome:?}");
+    assert_eq!(ssh_calls(&steps), Vec::<String>::new(), "ssh was never called");
+    assert_fell_back(&case, &events(&case));
+}
+
+/// The lines of `stderr` that say a routed run waits for the remote cutover because it cannot read the drain marker.
+fn refused_marker_lines(stderr: &str) -> Vec<&str> {
+    stderr
+        .lines()
+        .filter(|line| line.starts_with("gate: waiting for the remote cutover; cannot read "))
+        .collect()
+}
+
+#[test]
+fn a_drain_marker_whose_opening_is_refused_keeps_the_run_waiting() {
+    let case = cutover_case("routing-drain-refused", true);
+    let outside = Case::new("routing-drain-refused-ssh");
+    let steps = fake_ssh_in(&outside.folder());
+    let script = missing_script(&case);
+    // Opening a folder at the marker's name as a file is refused, as opening a marker held without sharing is.
+    let marker = v1::remote_cutover_draining_path(&case.root());
+    fs::create_dir(&marker).expect("a folder can stand at the drain marker's name");
+
+    let mut running = start(drain_gate(&case, &path_with(&outside.folder()), &steps, &script));
+    // Five 50 ms polls of refused reads say the line, and the run still waits after it.
+    running.wait_for_stderr_while_running("the refused marker's line", |stderr| !refused_marker_lines(stderr).is_empty());
+    assert_eq!(ssh_calls(&steps), Vec::<String>::new(), "ssh is not called while the marker stands");
+    fs::remove_file(v1::remote_cutover_flag_path(&case.root())).expect("the flag can be removed");
+    let outcome = running.finish();
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let refused = refused_marker_lines(&outcome.stderr);
+    assert_eq!(refused.len(), 1, "the refused marker's line is said once: {outcome:?}");
+    let named = format!("{} (", marker.file_name().expect("the marker has a name").to_string_lossy());
+    assert!(
+        refused[0].contains(&named) && refused[0].ends_with(')'),
+        "the line names the marker and why: {outcome:?}"
+    );
+    assert!(
+        !outcome.stderr.contains("gate: waiting for the remote cutover's drain"),
+        "no read named a drainer: {outcome:?}"
+    );
+    assert!(outcome.stderr.contains(&client_line(&script)), "the bridge is called: {outcome:?}");
+    assert!(outcome.stdout.contains("ran here"), "{outcome:?}");
+    assert_eq!(ssh_calls(&steps), Vec::<String>::new(), "ssh was never called");
+    assert_fell_back(&case, &events(&case));
+}
+
+#[test]
+fn a_ctrl_c_during_the_drain_wait_ends_before_the_command() {
+    let case = cutover_case("routing-drain-ctrl-c", true);
+    let outside = Case::new("routing-drain-ctrl-c-ssh");
+    let steps = fake_ssh_in(&outside.folder());
+    let script = missing_script(&case);
+    write_drain_marker(&case, own_start_ms());
+
+    let mut running = start_in_own_console(drain_gate(&case, &path_with(&outside.folder()), &steps, &script));
+    wait_for_the_drain_wait(&case, &mut running, &steps);
+    let sent = send_ctrl_c_to_the_console_of(running.id());
+    assert!(
+        sent.status.success(),
+        "pwsh sent the Ctrl+C ({}): {}",
+        sent.status,
+        String::from_utf8_lossy(&sent.stderr)
+    );
+    wait_until("the gate ending at the Ctrl+C", || !running.is_running());
+    let outcome = running.finish();
+
+    assert_eq!(outcome.code, Some(CONTROL_C_EXIT), "{outcome:?}");
+    assert!(outcome.stderr.contains("gate: interrupted before the command started"), "{outcome:?}");
+    assert!(!outcome.stdout.contains("ran here"), "the command never ran: {outcome:?}");
+    assert_eq!(ssh_calls(&steps), Vec::<String>::new(), "ssh was never called");
+    assert_eq!(names(&events(&case)), ["queue", "abandon"], "the run abandoned its wait and took no slot");
+}
+
+/// Sends a Ctrl+C to the console of the process `pid` from a pwsh that leaves its own console, attaches to that one and
+/// ignores the Ctrl+C itself; what pwsh said and its status.
+fn send_ctrl_c_to_the_console_of(pid: u32) -> Output {
+    let script = format!(
+        "Add-Type -Namespace GateSuite -Name Attach -MemberDefinition @'\n\
+         [DllImport(\"kernel32.dll\", SetLastError = true)] public static extern bool FreeConsole();\n\
+         [DllImport(\"kernel32.dll\", SetLastError = true)] public static extern bool AttachConsole(uint pid);\n\
+         [DllImport(\"kernel32.dll\", SetLastError = true)] public static extern bool SetConsoleCtrlHandler(System.IntPtr handler, bool add);\n\
+         [DllImport(\"kernel32.dll\", SetLastError = true)] public static extern bool GenerateConsoleCtrlEvent(uint ctrlEvent, uint group);\n\
+         '@\n\
+         [void][GateSuite.Attach]::FreeConsole()\n\
+         if (-not [GateSuite.Attach]::AttachConsole({pid})) {{\n\
+         throw \"AttachConsole failed: $([System.Runtime.InteropServices.Marshal]::GetLastWin32Error())\"\n\
+         }}\n\
+         [void][GateSuite.Attach]::SetConsoleCtrlHandler([System.IntPtr]::Zero, $true)\n\
+         if (-not [GateSuite.Attach]::GenerateConsoleCtrlEvent(0, 0)) {{\n\
+         throw \"GenerateConsoleCtrlEvent failed: $([System.Runtime.InteropServices.Marshal]::GetLastWin32Error())\"\n\
+         }}\n"
+    );
+    Command::new("pwsh")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .stdin(Stdio::null())
+        .output()
+        .expect("pwsh starts")
 }
 
 #[test]

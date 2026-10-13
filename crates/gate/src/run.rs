@@ -34,7 +34,7 @@ use crate::log::Log;
 use crate::machine::{self, Machine, MachineWait, MachineWaited};
 use crate::nesting::{Nesting, Parent};
 use crate::no_build::{self, NothingBack, Unfound, Worktree};
-use crate::remote::{self, RemoteCall, RemoteClient, RemoteOutcome, git};
+use crate::remote::{self, RemoteCall, RemoteClient, RemoteOutcome, Unready, git};
 use crate::resolve::{Environment, ResolvedRoot};
 use crate::route;
 use crate::slots::{self, ClaimOf, Pool, Survey, Taken, Takes, ThisGate, epoch_ms};
@@ -550,7 +550,7 @@ enum Taking {
 enum Remotely {
     /// The client ran the command to its end.
     Ended(Ended),
-    /// A Ctrl+C ended the wait for a remote slot.
+    /// A Ctrl+C ended the wait for the remote client to start or for a remote slot.
     Interrupted,
     /// The run falls back here.
     Here,
@@ -655,7 +655,7 @@ impl Run<'_> {
     /// Runs the command where `route` sends it: on the builder, and here after a fallback; or here ([`Run::here`]), as
     /// the words `local` says when it dropped the command's `--no-build` ([`Run::local_words`]). How the run ended, with
     /// the words a run here ran, whose passing build clears the worktree's nothing-back record
-    /// ([`Run::clear_nothing_back`]); `None` when a Ctrl+C ended a wait for a slot.
+    /// ([`Run::clear_nothing_back`]); `None` when a Ctrl+C ended a wait for a slot or for the remote client to start.
     fn through(
         &mut self,
         route: &Route,
@@ -768,13 +768,28 @@ impl Run<'_> {
 
     /// Runs the routed command on the builder: takes the client's work-folder key lock and a remote slot into `hold`,
     /// calls the client and ends the run as the client ended it, the lock held until then. A key lock held elsewhere, a
-    /// full remote pool, a refusal or a client that cannot start falls back here; with a client missing a part, the run
-    /// falls back before it takes a remote slot. A Ctrl+C ends the run here, with the remote slot released: one raised
-    /// before the call, or during it over a refusal. A client that ended on its own keeps its own status, and the run
-    /// writes or clears the worktree's nothing-back record ([`Run::leave_nothing_back`]).
+    /// full remote pool, a refusal or a client that cannot start falls back here; with a client not ready, the run
+    /// falls back before it takes a remote slot, or ends at a Ctrl+C that came while the client waited to start
+    /// ([`Run::interrupted_waiting_to_start`]). A
+    /// Ctrl+C ends the run here, with the remote slot released: one raised before the call, or during it over a refusal.
+    /// A client that ended on its own keeps its own status, and the run writes or clears the worktree's nothing-back
+    /// record ([`Run::leave_nothing_back`]).
     fn routed(&mut self, remote: &RemoteRun, hold: &mut Hold, console: &mut Console) -> Remotely {
-        if let Err(why) = self.client.ready() {
-            return self.fell_back(FallbackReason::Client, &RemoteOutcome::not_started(why), None, console);
+        let waiting = Instant::now();
+        match self.client.ready(console, self.host.interrupt) {
+            Ok(()) => {}
+            Err(Unready::Missing(why)) => {
+                return self.fell_back(FallbackReason::Client, &RemoteOutcome::not_started(why), None, console);
+            }
+            Err(Unready::RunsHere(line)) => {
+                self.give_up(FallbackReason::Client, &RemoteOutcome::default(), None, console);
+                console.err(&line);
+                return Remotely::Here;
+            }
+            Err(Unready::Interrupted) => {
+                self.interrupted_waiting_to_start(waiting, console);
+                return Remotely::Interrupted;
+            }
         }
         let _key = match self.hold_remote(remote, hold, console) {
             Ok(key) => key,
@@ -863,6 +878,15 @@ impl Run<'_> {
         Ok(key)
     }
 
+    /// Ends a routed run at a Ctrl+C that came while its client waited to start, since `waiting`: says the command never
+    /// started and completes the log ([`Run::interrupted_before_start`]), then journals the abandon of the wait with the
+    /// remote tag, as a Ctrl+C during a slot wait does. The run took no slot, so it journals no release.
+    fn interrupted_waiting_to_start(&mut self, waiting: Instant, console: &mut Console) {
+        self.interrupted_before_start(console);
+        let waited_seconds = waiting.elapsed().as_secs_f64();
+        self.journal.write(&JournalEvent::Abandon { waited_seconds }, self.tag.as_ref(), console);
+    }
+
     /// The client's call for `remote`, with the run's log, limits and interrupt.
     fn call<'r>(&'r self, remote: &'r RemoteRun) -> RemoteCall<'r> {
         call_of(self.request, &self.log, &self.host, self.root, remote)
@@ -871,8 +895,16 @@ impl Run<'_> {
     /// Gives up the remote attempt for `reason`: journals the fallback, the run's last line with the remote tag, while
     /// the remote slot `held` is still held, then deletes its claim, lets it go and wakes the waiters, removes the log
     /// so the client's own bytes do not stand beside the notes that say them, gathers the attempt's lines into the
-    /// log's notes unsaid, and says the run goes on here.
+    /// log's notes unsaid ([`Run::give_up`]), and says the run goes on here.
     fn fell_back(&mut self, reason: FallbackReason, outcome: &RemoteOutcome, held: Option<Taken>, console: &mut Console) -> Remotely {
+        let host = self.give_up(reason, outcome, held, console);
+        console.err(&fallback_line(&host, reason, outcome.detail.as_deref()));
+        Remotely::Here
+    }
+
+    /// Gives up the remote attempt for `reason` as [`Run::fell_back`] does, saying no line that the run goes on here:
+    /// the host the run was routed to.
+    fn give_up(&mut self, reason: FallbackReason, outcome: &RemoteOutcome, held: Option<Taken>, console: &mut Console) -> String {
         let tag = self.tag.take();
         // Only the run the full remote pool sent back counts its local take from its own queue line; the local take of
         // every other fallback counts from the take itself, as a run that never fell back does.
@@ -895,9 +927,7 @@ impl Run<'_> {
         for line in &outcome.lines {
             console.note(line);
         }
-        let host = tag.map_or_else(String::new, |tag| tag.host);
-        console.err(&fallback_line(&host, reason, outcome.detail.as_deref()));
-        Remotely::Here
+        tag.map_or_else(String::new, |tag| tag.host)
     }
 
     /// The plan of the run here after a fallback of any reason: the first plan unchanged when the fallback drops no

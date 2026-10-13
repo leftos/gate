@@ -43,7 +43,8 @@ The plan for `feat/remote-cutover`: the Rust remote client replaces the remote.p
 ### R6. A routed run that starts during the drain waits for it, then starts on the Rust client
 
 - In the switch client's `ready()`: flag and live marker, say once `gate: waiting for the remote cutover's drain (pid {pid}) before routing`, hold no key lock, ticket or slot, poll every 1 s, then the Rust client once the marker is gone; flag gone while waiting, the bridge (rollback); marker whose drainer is dead or unreadable, `gate: the remote cutover's drain is not running; run gate remote-cutover again; running here` and fall back `client`; Ctrl+C, `gate: interrupted before the command started`, 0xC000013A. `ready()` gains the console and the interrupt.
-- Files: `remote/mod.rs`, `run.rs`, suite `routing.rs`.
+- A marker that stands but whose opening is refused (a pending delete) keeps the run waiting; refusals that last 5 polls are said once, `gate: waiting for the remote cutover; cannot read {marker path} ({reason})`. The Ctrl+C journals `abandon` after `queue`, not a `release`.
+- Files: `remote/{mod,bridge,switch}.rs`, `run.rs`, suite `routing.rs`, `bridge.rs` (`start_in_own_console` shared).
 - Tests: `routing::a_routed_run_during_the_drain_waits_then_routes_on_the_rust_client`, `…::a_routed_run_whose_drainer_has_ended_runs_here_with_reason_client`, `…::deleting_the_flag_during_the_wait_returns_the_run_to_the_bridge`, `…::a_ctrl_c_during_the_drain_wait_ends_before_the_command`.
 - Depends on R2, R4.
 
