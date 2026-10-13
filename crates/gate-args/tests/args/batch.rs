@@ -163,7 +163,6 @@ fn batch_refusal_line() {
     let refusal = refused("%CD%").expect("%CD% is refused");
     assert_eq!(
         refusal.to_string(),
-        "gate: a .cmd or .bat command cannot take a word holding a line break or %NAME% of a set variable, which cmd.exe \
-         would split or expand: %CD%"
+        "gate: a .cmd or .bat command cannot take a word holding a line break or a %NAME% cmd.exe would expand: %CD%"
     );
 }

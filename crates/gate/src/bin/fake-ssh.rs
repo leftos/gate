@@ -20,14 +20,17 @@
 //! there and exits 255; `out-then-drop` writes a line on standard output and exits 255; `exit <n>` runs nothing and
 //! exits `<n>`, as cmd's 9009 for a program it cannot find; `say-exit <n> <line>` runs nothing, writes the line on
 //! standard error and exits `<n>`, as a call that fails with a line of its own does; `flood <n>` runs nothing, writes `<n>` bytes of `x`
-//! and no line end on standard error, which git passes through as its own, and exits 0; `say-hold <word> <path>` writes
+//! and no line end on standard error, which git passes through as its own, and exits 0; `lines <count> <length>` writes
+//! that many numbered lines of that many bytes, by turns on standard output and standard error, then does as `ok`;
+//! `say-hold <word> <path>` writes
 //! the word as a line on standard output, then does as `hold <path>`; `progress-ok <n>` writes at least `<n>` bytes of
 //! short progress updates, each ended by a carriage return, and a line end on standard error, then does as `ok`;
 //! `ok-then-out <line>` does as `ok`, then writes the line on standard output, after all the call wrote;
 //! `truncate <n>` does as `ok` with the call's standard output read, only its first `<n>` bytes passed on raw and the
 //! rest read and dropped, then writes ssh's `Connection timed out during banner exchange` on standard error and exits
 //! 255, so only the bytes it sent tell the drop from one before the banner; `garbage <n>` runs nothing, writes `<n>`
-//! bytes of `x`, no outputs archive, raw on standard output and exits 0; `bytes-hold <n> <path>` writes `<n>` bytes of
+//! bytes of `x`, no outputs archive, raw on standard output and exits 0; `flood-ok <n>` writes `<n>` bytes of `x` and
+//! no line end on standard output, then does as `ok`, whose output goes on that one line; `bytes-hold <n> <path>` writes `<n>` bytes of
 //! `x` raw on standard output, then does as `hold <path>`.
 
 #![expect(clippy::disallowed_methods, reason = "a test helper standing in for ssh, which holds no launch's handles")]
@@ -97,6 +100,10 @@ fn run() -> Result<i32, String> {
         Some(("exit", status)) => status.parse().map_err(|_| format!("the step '{step}' names no status")),
         Some(("say-exit", rest)) => say_exit(&step, rest),
         Some(("flood", bytes)) => flood(&step, bytes),
+        Some(("lines", rest)) => {
+            lines(&step, rest)?;
+            call.ok()
+        }
         Some(("progress-ok", bytes)) => {
             progress(&step, bytes)?;
             call.ok()
@@ -107,6 +114,10 @@ fn run() -> Result<i32, String> {
             Ok(status)
         }
         Some(("truncate", bytes)) => call.truncated(byte_count(&step, bytes)?),
+        Some(("flood-ok", bytes)) => {
+            filler(byte_count(&step, bytes)?)?;
+            call.ok()
+        }
         Some(("garbage", bytes)) => {
             filler(byte_count(&step, bytes)?)?;
             Ok(0)
@@ -140,6 +151,26 @@ fn flood(step: &str, bytes: &str) -> Result<i32, String> {
         .and_then(|()| stderr.flush())
         .map_err(|error| format!("cannot write: {error}"))?;
     Ok(0)
+}
+
+/// `lines <count> <length>`, given as `rest` after the step's name: writes that many lines, each that many bytes before
+/// its line end, `line <n> ` and then `x` up to the length, the even-numbered ones on standard output and the odd ones
+/// on standard error, so each stream carries half of them.
+fn lines(step: &str, rest: &str) -> Result<(), String> {
+    let (count, length) = rest.split_once(' ').ok_or_else(|| format!("the step '{step}' names no line length"))?;
+    let (count, length) = (byte_count(step, count)?, byte_count(step, length)?);
+    let (mut stdout, mut stderr) = (io::stdout().lock(), io::stderr().lock());
+    for number in 0..count {
+        let mut line = format!("line {number} ");
+        line.extend(std::iter::repeat_n('x', length.saturating_sub(line.len())));
+        line.push('\n');
+        let stream: &mut dyn Write = if number % 2 == 0 { &mut stdout } else { &mut stderr };
+        stream.write_all(line.as_bytes()).map_err(|error| format!("cannot write: {error}"))?;
+    }
+    stdout
+        .flush()
+        .and_then(|()| stderr.flush())
+        .map_err(|error| format!("cannot write: {error}"))
 }
 
 /// The byte count `bytes` the step `step` names after its name.

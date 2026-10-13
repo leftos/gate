@@ -72,6 +72,8 @@ pub(crate) enum ValueOption {
     #[cfg(feature = "test-seams")]
     RemoteOutputsBudgetBytes,
     #[cfg(feature = "test-seams")]
+    RemoteLogCapBytes,
+    #[cfg(feature = "test-seams")]
     RemoteScript,
     #[cfg(feature = "test-seams")]
     BridgePwsh,
@@ -254,6 +256,8 @@ impl RunBuilder {
             #[cfg(feature = "test-seams")]
             ValueOption::RemoteOutputsBudgetBytes => self.test_seams.remote_outputs_budget_bytes = Some(values::above_zero(spelled, value)?),
             #[cfg(feature = "test-seams")]
+            ValueOption::RemoteLogCapBytes => self.test_seams.remote_log_cap_bytes = Some(values::above_zero(spelled, value)?),
+            #[cfg(feature = "test-seams")]
             ValueOption::RemoteScript => self.test_seams.remote_script = Some(PathBuf::from(value)),
             #[cfg(feature = "test-seams")]
             ValueOption::BridgePwsh => self.test_seams.bridge_pwsh = Some(PathBuf::from(value)),
@@ -351,7 +355,8 @@ impl RunBuilder {
     /// Refuses the remote client's seams that cannot work together: `--test-remote-ssh`,
     /// `--test-remote-retry-pause-ms`, `--test-remote-bound-ms`, `--test-remote-interrupt-at`,
     /// `--test-remote-watch-call`, `--test-remote-timeout-ms`, `--test-local-sdks`, `--test-remote-fetch-cap-bytes`,
-    /// `--test-remote-apply-cap-bytes` and `--test-remote-outputs-budget-bytes` without `--test-remote-transport`,
+    /// `--test-remote-apply-cap-bytes`, `--test-remote-outputs-budget-bytes` and `--test-remote-log-cap-bytes` without
+    /// `--test-remote-transport`,
     /// whose client alone reads them, and `--test-remote-snapshot` with it, as each chooses the client.
     #[cfg(feature = "test-seams")]
     fn check_remote_seams(&mut self) {
@@ -372,6 +377,7 @@ impl RunBuilder {
                 self.test_seams.remote_outputs_budget_bytes.is_some(),
                 "--test-remote-outputs-budget-bytes",
             ),
+            (self.test_seams.remote_log_cap_bytes.is_some(), "--test-remote-log-cap-bytes"),
         ] {
             if read && !transport {
                 self.problems.push(Problem::SeamNeeds {

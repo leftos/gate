@@ -20,6 +20,8 @@ const LINES_KEPT: usize = 1000;
 pub(super) const FETCH_CAP: u64 = 4 << 30;
 /// The most bytes the files a back commit writes into the worktree may total, each path counted: 4 GiB.
 pub(super) const APPLY_CAP: u64 = 4 << 30;
+/// The most bytes of one call's output, its two streams counted together, the client writes to the gate's log: 256 MiB.
+pub(super) const LOG_CAP: u64 = 256 << 20;
 
 /// Why the watchdog killed a call.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -77,6 +79,18 @@ pub(super) fn size(bytes: u64) -> String {
         }
     }
     format!("{bytes} B")
+}
+
+/// `bytes` as a whole number of the largest binary unit, GiB, MiB or KiB, it is a multiple of, so 256 MiB is `256 MiB`;
+/// else as [`size`] spells it.
+pub(super) fn whole_size(bytes: u64) -> String {
+    const UNITS: [(&str, u32); 3] = [("GiB", 30), ("MiB", 20), ("KiB", 10)];
+    for (unit, shift) in UNITS {
+        if bytes > 0 && bytes.trailing_zeros() >= shift {
+            return format!("{} {unit}", bytes >> shift);
+        }
+    }
+    size(bytes)
 }
 
 /// `duration` in whole seconds when it is a whole number of them, else in whole milliseconds.
@@ -202,7 +216,8 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        BYTES_KEPT, Cut, Kept, Kill, LINE_CAP, LINES_KEPT, complete, kill, kill_line, size, stall_window, tick, too_long, truncated, whole_seconds,
+        BYTES_KEPT, Cut, Kept, Kill, LINE_CAP, LINES_KEPT, LOG_CAP, complete, kill, kill_line, size, stall_window, tick, too_long, truncated,
+        whole_seconds, whole_size,
     };
 
     const SECOND: Duration = Duration::from_secs(1);
@@ -224,6 +239,23 @@ mod tests {
         assert_eq!(Cut::TooBig(262_144).reason("git fetch"), "git fetch wrote more than 256.0 KiB");
         assert_eq!(Cut::TooBig(64 << 20).reason("git fetch"), "git fetch wrote more than 64.0 MiB");
         assert_eq!(Cut::TooBig(1536 << 20).reason("git fetch"), "git fetch wrote more than 1.5 GiB");
+    }
+
+    #[test]
+    fn a_whole_size_is_a_whole_number_of_its_largest_unit() {
+        for (bytes, shown) in [
+            (LOG_CAP, "256 MiB"),
+            (65_536, "64 KiB"),
+            (4 << 30, "4 GiB"),
+            (1536 << 20, "1536 MiB"),
+            (1024, "1 KiB"),
+            (1000, "1.0 KiB"),
+            (971, "971 B"),
+            (100_000, "97.7 KiB"),
+            (0, "0 B"),
+        ] {
+            assert_eq!(whole_size(bytes), shown, "{bytes}");
+        }
     }
 
     #[test]

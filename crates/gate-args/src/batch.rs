@@ -8,9 +8,10 @@ use crate::cmdline::{QUOTE, SPACE, is_plain, quote_arg, wide, wrapped};
 /// What cmd.exe reads as its own syntax or splits a batch file's parameters at.
 const CMD_SPECIALS: [char; 10] = ['&', '|', '<', '>', '^', '(', ')', ',', ';', '='];
 
-/// The names cmd.exe expands though no variable of that name is set: its dynamic names, and `COMSPEC`, `PATHEXT` and
-/// `PROMPT`, which it sets for itself when the block it is started with lacks them.
-const DYNAMIC_NAMES: [&str; 13] = [
+/// The names cmd.exe gives a value of its own, so it expands them though the block it is started with sets no such
+/// variable: `COMSPEC`, `PATHEXT` and `PROMPT`, which it sets for itself when the block lacks them, and its dynamic
+/// names.
+const SELF_SET_NAMES: [&str; 13] = [
     "COMSPEC",
     "PATHEXT",
     "PROMPT",
@@ -86,8 +87,7 @@ impl fmt::Display for BatchRefusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "gate: a .cmd or .bat command cannot take a word holding a line break or %NAME% of a set variable, which cmd.exe \
-             would split or expand: {}",
+            "gate: a .cmd or .bat command cannot take a word holding a line break or a %NAME% cmd.exe would expand: {}",
             String::from_utf16_lossy(&self.word)
         )
     }
@@ -137,7 +137,7 @@ fn cmd_expands(name: &str, is_set: &impl Fn(&str) -> bool) -> bool {
         return true;
     }
     let variable = name.split_once(':').map_or(name, |(variable, _)| variable);
-    !variable.is_empty() && (is_set(variable) || DYNAMIC_NAMES.iter().any(|dynamic| dynamic.eq_ignore_ascii_case(variable)))
+    !variable.is_empty() && (is_set(variable) || SELF_SET_NAMES.iter().any(|own| own.eq_ignore_ascii_case(variable)))
 }
 
 fn position_from(word: &[u16], from: usize) -> Option<usize> {

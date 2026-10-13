@@ -108,6 +108,8 @@ pub(crate) struct RustClient {
     /// The box's outputs budget: `--test-remote-outputs-budget-bytes`, else 50 GiB. What the outputs fetch is capped
     /// at, and what the install unpacks its archive to.
     outputs_budget: u64,
+    /// The most bytes of one call's output written to the gate's log: `--test-remote-log-cap-bytes`, else 256 MiB.
+    log_cap: u64,
     /// `--test-own-start-fails`: this gate's start, which names the sync-back's quarantine, cannot be read.
     own_start_fails: bool,
 }
@@ -136,6 +138,7 @@ impl RustClient {
             fetch_cap: seams.remote_fetch_cap_bytes.unwrap_or(watchdog::FETCH_CAP),
             apply_cap: seams.remote_apply_cap_bytes.unwrap_or(watchdog::APPLY_CAP),
             outputs_budget: seams.remote_outputs_budget_bytes.unwrap_or(OUTPUTS_BUDGET),
+            log_cap: seams.remote_log_cap_bytes.unwrap_or(watchdog::LOG_CAP),
             own_start_fails: seams.own_start_fails,
         })
     }
@@ -196,6 +199,7 @@ impl RemoteClient for RustClient {
             fetch_cap: self.fetch_cap,
             apply_cap: self.apply_cap,
             outputs_budget: self.outputs_budget,
+            log_cap: self.log_cap,
             own_start_fails: self.own_start_fails,
             lines: Vec::new(),
             problem: None,
@@ -420,6 +424,8 @@ pub(super) struct Attempt<'c, 'a> {
     /// The box's outputs budget: the outputs fetch is capped at zstd's worst case for it, and the install unpacks its
     /// archive to it.
     pub(super) outputs_budget: u64,
+    /// The most bytes of one call's output, its two streams counted together, written to the gate's log.
+    log_cap: u64,
     /// `--test-own-start-fails`: this gate's start, which names the sync-back's quarantine, cannot be read.
     pub(super) own_start_fails: bool,
     lines: Vec<String>,
@@ -984,6 +990,7 @@ impl Attempt<'_, '_> {
             echo,
             capped: echo != Echo::Console,
             lines: starts.nonce.as_deref().map(|nonce| Arc::new(ProtocolLines::new(nonce))),
+            log_cap: self.log_cap,
         };
         let raw = if let Some(sink) = starts.sink {
             Some(relayed_raw(
@@ -1146,6 +1153,7 @@ impl<'c, 'a> Attempt<'c, 'a> {
             fetch_cap: watchdog::FETCH_CAP,
             apply_cap: watchdog::APPLY_CAP,
             outputs_budget: OUTPUTS_BUDGET,
+            log_cap: watchdog::LOG_CAP,
             own_start_fails: false,
             lines: Vec::new(),
             problem: None,
@@ -1621,13 +1629,28 @@ impl Progress {
 }
 
 /// What a call's two readers share with each other and its watcher: what they heard, behind a lock no write is made
-/// under, their progress, and whether the call's end has come.
+/// under, their progress, how much of the call's output they wrote to the log, and whether the call's end has come.
 struct Shared {
     heard: Mutex<Heard>,
     progress: Progress,
+    /// The bytes of the call's output the readers have charged to the log, both streams together, and whether one of
+    /// them has said that they passed the log cap: the line is said once, by whichever reader passed it first. A charge
+    /// and its write are not one step, so a piece the other reader was cleared to write just before can land after
+    /// the cut line: at most one piece per stream, and the log still holds no more than the cap of the call's output.
+    logged: AtomicU64,
+    log_cut: AtomicBool,
     /// Set once the watch has returned: the call ended, so a reader still going writes nothing more into what the
     /// fetch is about to remove.
     stopped: AtomicBool,
+}
+
+/// What a reader does with a piece of the call's output it charged to the log: write it, say once that the call's
+/// output passed the log cap, or drop it, as every piece after that one.
+#[derive(Debug, PartialEq, Eq)]
+enum Logged {
+    Write,
+    Cut,
+    Drop,
 }
 
 impl Shared {
@@ -1635,7 +1658,28 @@ impl Shared {
         Shared {
             heard: Mutex::new(Heard::default()),
             progress: Progress::new(),
+            logged: AtomicU64::new(0),
+            log_cut: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
+        }
+    }
+
+    /// Charges `bytes` more of the call's output to the log, whose cap is `cap`: [`Logged::Write`] while all the call's
+    /// output charged so far fits, else [`Logged::Cut`] for the one charge, of either reader, that first passes it, and
+    /// [`Logged::Drop`] for every other.
+    fn charged(&self, bytes: usize, cap: u64) -> Logged {
+        let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
+        // The update always gives a value, so it never fails; either way it hands back the sum before it.
+        let before = self
+            .logged
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |sum| Some(sum.saturating_add(bytes)))
+            .unwrap_or_else(|sum| sum);
+        if before.saturating_add(bytes) <= cap {
+            Logged::Write
+        } else if self.log_cut.swap(true, Ordering::AcqRel) {
+            Logged::Drop
+        } else {
+            Logged::Cut
         }
     }
 
@@ -1660,13 +1704,15 @@ fn held(heard: &Mutex<Heard>) -> MutexGuard<'_, Heard> {
     heard.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// How a reader takes a call's lines: where they go, whether a line past the cap stops it, and the run's start marker
-/// and refusal tags its lines are matched against, `None` for every call but the run call.
+/// How a reader takes a call's lines: where they go, whether a line past the cap stops it, the run's start marker and
+/// refusal tags its lines are matched against, `None` for every call but the run call, and the most bytes of the
+/// call's output its log gets.
 #[derive(Clone)]
 struct Reading {
     echo: Echo,
     capped: bool,
     lines: Option<Arc<ProtocolLines>>,
+    log_cap: u64,
 }
 
 impl Reading {
@@ -1688,6 +1734,9 @@ struct Reader {
     /// character the last piece cut.
     pending: Vec<u8>,
     head: Option<String>,
+    /// Whether the last piece this reader wrote to the log left its line open, so a cut line it writes next starts on a
+    /// line of its own.
+    log_open: bool,
 }
 
 impl Reader {
@@ -1698,6 +1747,7 @@ impl Reader {
             log,
             pending: Vec::new(),
             head: None,
+            log_open: false,
         }
     }
 
@@ -1802,18 +1852,31 @@ impl Reader {
         self.passed(&String::from_utf8_lossy(&piece), false, shared);
     }
 
-    /// Writes `text`, with a line end when `end`, to the log unless the reading keeps it out, and on its own stream
-    /// when it echoes to the console; the first failure to is kept.
+    /// Writes `text`, with a line end when `end`, to the log unless the reading keeps it out or the call's output has
+    /// passed the log cap, which the log is told once, and on its own stream when it echoes to the console, past the
+    /// cap too; the first failure to is kept.
     fn passed(&mut self, text: &str, end: bool, shared: &Shared) {
         let mut said = String::with_capacity(text.len() + 1);
         said.push_str(text);
         if end {
             said.push('\n');
         }
-        if let Some(log) = &mut self.log
-            && let Err(error) = log.write_all(said.as_bytes())
-        {
-            held(&shared.heard).failed(format!("cannot write to the log: {error}"));
+        if let Some(log) = &mut self.log {
+            let written = match shared.charged(said.len(), self.reading.log_cap) {
+                Logged::Write => {
+                    self.log_open = !end;
+                    log.write_all(said.as_bytes())
+                }
+                Logged::Cut => {
+                    let line = log_cut_line(self.reading.log_cap);
+                    let line = if self.log_open { format!("\n{line}") } else { line };
+                    log.write_all(line.as_bytes())
+                }
+                Logged::Drop => Ok(()),
+            };
+            if let Err(error) = written {
+                held(&shared.heard).failed(format!("cannot write to the log: {error}"));
+            }
         }
         if self.reading.echo == Echo::Console {
             let written = if self.error {
@@ -1826,6 +1889,14 @@ impl Reader {
             }
         }
     }
+}
+
+/// The line the log of a call whose output passed the log cap `cap` gets, once, with its line end.
+fn log_cut_line(cap: u64) -> String {
+    format!(
+        "gate: the builder's output passed {}; the rest is not logged\n",
+        watchdog::whole_size(cap)
+    )
 }
 
 /// Reads `stream` on a thread of its own as [`relay`] does, then says so on `done`.
@@ -1951,22 +2022,29 @@ fn dotnet_limit(seams: &TestSeams) -> Duration {
 }
 
 /// What `dotnet --list-sdks` lists on this PC, as [`git::sdk_listing`] reads it, with the folders inside `worktree`
-/// dropped from the `PATH` of `variables`, each compared by its canonical path so a junction does not get around it.
+/// dropped from the `PATH` of `variables`, each compared by its canonical path so a junction does not get around it,
+/// and a dotnet found that still lies inside it refused. A `PATH` that cannot be read that way cannot be read at all.
 fn local_sdk_listing(variables: Variables, worktree: &Path, limit: Duration, interrupt: Option<Interrupt>) -> Result<String, GitError> {
-    let path = path_outside(&variables, worktree);
-    git::sdk_listing(variables.with("PATH", &path), limit, interrupt)
+    let path = path_outside(&variables, worktree).map_err(GitError::Failed)?;
+    git::sdk_listing(variables.with("PATH", &path), limit, interrupt, Some(worktree))
 }
 
 /// The `PATH` of `variables` without the folders inside `worktree`, each compared by its canonical path: an `npm run`
 /// or an activated venv puts folders of the repo first on `PATH`, where a `dotnet.cmd` of the repo would be found.
-fn path_outside(variables: &Variables, worktree: &Path) -> String {
+/// Else why it cannot be rebuilt: an unmatched quote reads every folder after it as one, which no search finds a
+/// dotnet in, so a list read along it would look empty rather than unreadable.
+fn path_outside(variables: &Variables, worktree: &Path) -> Result<String, String> {
     let worktree = resolved(worktree);
     let path = variables.get("PATH").unwrap_or_default();
+    if path.to_string_lossy().matches('"').count() % 2 == 1 {
+        return Err("PATH holds an unmatched quote, so the folders after it read as one".to_owned());
+    }
     let kept: Vec<PathBuf> = std::env::split_paths(path)
         .filter(|folder| !is_within(&resolved(folder), &worktree))
         .collect();
-    // Folders `split_paths` read from `PATH` join back; one that would not is dropped with the rest, so no dotnet is found.
-    std::env::join_paths(kept).map_or_else(|_| String::new(), |joined| joined.to_string_lossy().into_owned())
+    std::env::join_paths(kept)
+        .map(|joined| joined.to_string_lossy().into_owned())
+        .map_err(|error| format!("PATH cannot be rebuilt without the worktree's folders: {error}"))
 }
 
 /// The builder's boot time, from the last `gate: remote boot <time>` line of a preflight or a `boot` call; `None` when
@@ -2121,7 +2199,8 @@ mod tests {
     use super::{
         Attempt, CallEnd, Called, Capped, Cut, Echo, End, GIT_SSH_FAILED, Heard, LINE_CAP, Limits, Loss, NonZeroU64, OUTPUTS_BUDGET, ProtocolLines,
         Raised, Reader, Reading, SSH_FAILED, Shared, Unfinished, Watch, after_loss, boot_time, called_of, console_of, held, is_heartbeat,
-        last_update, local_sdk_listing, paused, push_size, relay, relay_raw, relayed_raw, sdks_of, seconds, their_version, version_refusal,
+        last_update, local_sdk_listing, path_outside, paused, push_size, relay, relay_raw, relayed_raw, sdks_of, seconds, their_version,
+        version_refusal,
     };
     use crate::environment::Variables;
     use crate::remote::git::{DOTNET_LIMIT, GIT_LIMIT, GitError};
@@ -2129,7 +2208,7 @@ mod tests {
     use crate::remote::payload::Location;
     use crate::remote::snapshot::Snapshot;
     use crate::remote::transport::Local;
-    use crate::remote::watchdog::{self, Kill};
+    use crate::remote::watchdog::{self, Kill, LOG_CAP};
     use crate::remote::{Refusal, RemoteCall, busy_line, refused_line, started_line};
     use crate::run::CONTROL_C_EXIT;
 
@@ -2163,6 +2242,65 @@ mod tests {
         fs::remove_dir_all(&folder).expect("the stub's folder can be removed");
         assert_eq!(read, Err(GitError::Interrupted));
         assert!(!ran, "an interrupted read started dotnet");
+    }
+
+    #[test]
+    fn a_path_with_an_unmatched_quote_cannot_be_rebuilt() {
+        let worktree = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let unmatched = Variables::from_process().with("PATH", r#"C:\gate-a;"C:\gate-b;C:\gate-c"#);
+        assert_eq!(
+            path_outside(&unmatched, worktree),
+            Err("PATH holds an unmatched quote, so the folders after it read as one".to_owned())
+        );
+        let quoted = Variables::from_process().with("PATH", r#"C:\gate-a;"C:\gate-b;c";C:\gate-d"#);
+        assert_eq!(path_outside(&quoted, worktree), Ok(r#"C:\gate-a;"C:\gate-b;c";C:\gate-d"#.to_owned()));
+        let inside = format!(r"C:\gate-a;{}\src;C:\gate-d", worktree.display());
+        let with_inside = Variables::from_process().with("PATH", &inside);
+        assert_eq!(path_outside(&with_inside, worktree), Ok(r"C:\gate-a;C:\gate-d".to_owned()));
+    }
+
+    /// Two readers of one call whose output together passes the log cap, each on a thread of its own and let go at
+    /// once, say so in exactly one line between them, and log every whole line that fits under the cap and no other.
+    #[test]
+    fn two_readers_past_the_log_cap_say_it_once() {
+        const CAP: u64 = 4096;
+        let log = std::env::temp_dir().join(format!("gate-client-log-cap-{}.log", std::process::id()));
+        let file = fs::File::create(&log).expect("the log can be made");
+        let shared = Arc::new(Shared::new());
+        let reading = Reading {
+            echo: Echo::LogOnly,
+            capped: true,
+            lines: None,
+            log_cap: CAP,
+        };
+        // 100 lines of 101 bytes, line end counted, on each stream: either stream alone passes the cap.
+        let input: Vec<u8> = (0..100)
+            .flat_map(|number| format!("{number:03}{}\n", "x".repeat(97)).into_bytes())
+            .collect();
+        let start = Arc::new(std::sync::Barrier::new(2));
+        let readers: Vec<thread::JoinHandle<()>> = [false, true]
+            .into_iter()
+            .map(|error| {
+                let (shared, start, input) = (Arc::clone(&shared), Arc::clone(&start), input.clone());
+                let reader = Reader::new(error, reading.clone(), Some(file.try_clone().expect("the log can be shared")));
+                thread::spawn(move || {
+                    start.wait();
+                    relay(input.as_slice(), reader, &shared);
+                })
+            })
+            .collect();
+        for reader in readers {
+            reader.join().expect("a reader ends");
+        }
+        drop(file);
+        let said = fs::read_to_string(&log).expect("the log can be read");
+        fs::remove_file(&log).expect("the log can be removed");
+
+        let cut = "gate: the builder's output passed 4 KiB; the rest is not logged";
+        assert_eq!(said.lines().filter(|line| *line == cut).count(), 1, "{said}");
+        let logged: Vec<&str> = said.lines().filter(|line| *line != cut).collect();
+        assert_eq!(logged.len(), 40, "the whole lines that fit under the cap: {said}");
+        assert!(logged.iter().all(|line| line.len() == 100), "{said}");
     }
 
     /// A call whose interrupt is raised, logging to `log`, which no test here writes.
@@ -2201,6 +2339,7 @@ mod tests {
             fetch_cap: watchdog::FETCH_CAP,
             apply_cap: watchdog::APPLY_CAP,
             outputs_budget: OUTPUTS_BUDGET,
+            log_cap: LOG_CAP,
             own_start_fails: false,
             lines: Vec::new(),
             problem: None,
@@ -2807,6 +2946,7 @@ mod tests {
                 echo,
                 capped: true,
                 lines: None,
+                log_cap: LOG_CAP,
             };
 
             relay(input.as_bytes(), Reader::new(true, reading, None), &shared);
@@ -2987,6 +3127,7 @@ mod tests {
             echo: Echo::LogOnly,
             capped,
             lines: None,
+            log_cap: LOG_CAP,
         };
         relay(input, Reader::new(true, reading, file), &shared);
         shared
@@ -3005,6 +3146,7 @@ mod tests {
             echo: Echo::LogOnly,
             capped: false,
             lines: Some(std::sync::Arc::new(ProtocolLines::new(NONCE))),
+            log_cap: LOG_CAP,
         };
         let file = std::fs::File::create(&log).expect("the log can be made");
         let other = file.try_clone().expect("the log can be shared");
@@ -3522,6 +3664,7 @@ mod tests {
                     echo,
                     capped: true,
                     lines: None,
+                    log_cap: LOG_CAP,
                 };
                 let mut reader = Reader::new(true, reading, None);
                 for (part, ended) in chunks {

@@ -979,6 +979,28 @@ pub fn copy_tool(case: &Case, name: &str) {
     fs::copy(FAKE_TOOL, case.folder().join(name)).expect("fake-tool can be copied into the case folder");
 }
 
+/// The go file of a case that parks a stand-in or a stub until it exists: writing it when it drops releases what waits
+/// for it even when the case panics before its own write, and writing one the case already made is harmless. A write
+/// that fails is said unless the file is there after all.
+pub struct Go(pub PathBuf);
+
+impl Go {
+    /// The path of the go file the case writes and what it parked waits for.
+    pub fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for Go {
+    fn drop(&mut self) {
+        if let Err(error) = fs::write(&self.0, "")
+            && !self.0.exists()
+        {
+            let _ = writeln!(io::stderr(), "the go file {} cannot be made: {error}", self.0.display());
+        }
+    }
+}
+
 /// Returns once every handle on `path` is closed: an open that shares nothing succeeds only then. A command a killed
 /// gate left running holds its log open until it ends, so this waits until no process of that command has the log
 /// open.

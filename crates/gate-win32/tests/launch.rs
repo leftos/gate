@@ -420,6 +420,26 @@ fn a_piped_command_gets_exactly_the_environment_given() {
     assert_eq!(names, ["GATE_WIN32_ONLY", "SystemRoot"], "{text}");
 }
 
+/// cmd.exe gives `COMSPEC`, `PATHEXT` and `PROMPT` a value of its own when the block it is started with lacks them,
+/// which is why a batch target's `%COMSPEC%`, `%PATHEXT%` and `%PROMPT%` are refused though no such variable is set.
+#[test]
+fn cmd_sets_comspec_pathext_and_prompt_when_the_block_lacks_them() {
+    let dir = case_dir("piped-cmd-own-names");
+    let system_root = std::env::var_os("SystemRoot").expect("SystemRoot is set");
+    let environment = EnvironmentBlock::new([(OsString::from("SystemRoot"), system_root)]).expect("the block is built");
+
+    let (code, text) = run_piped("piped-cmd-own-names", &piped(&dir, cmd(), "cmd /d /c set", environment), b"");
+
+    assert_eq!(code, 0, "{text}");
+    for name in ["COMSPEC", "PATHEXT", "PROMPT"] {
+        let set = text
+            .lines()
+            .filter_map(|line| line.split_once('='))
+            .any(|(said, value)| said.eq_ignore_ascii_case(name) && !value.is_empty());
+        assert!(set, "cmd.exe set {name} itself: {text}");
+    }
+}
+
 #[test]
 fn a_second_job_of_a_held_name_is_refused() {
     let name = unique_name("held");

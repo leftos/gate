@@ -56,10 +56,7 @@ fn write_shim(case: &Case) -> String {
 
 /// The line the gate refuses a batch target's `word` with.
 fn refusal(word: &str) -> String {
-    format!(
-        "gate: a .cmd or .bat command cannot take a word holding a line break or %NAME% of a set variable, which cmd.exe \
-         would split or expand: {word}\n"
-    )
+    format!("gate: a .cmd or .bat command cannot take a word holding a line break or a %NAME% cmd.exe would expand: {word}\n")
 }
 
 /// What `fake-tool argv` writes for `words`: each on its own line.

@@ -229,10 +229,10 @@ fn say_sdks(limit: Duration, console: &mut Console) {
 }
 
 /// The SDK list of `dotnet --list-sdks`, `none` when no dotnet is found along the gate's own `PATH`; else why it could
-/// not be read. dotnet is run as [`git::sdk_listing`] runs it, with no console interrupt, ended with its job past
-/// `limit`.
+/// not be read. dotnet is run as [`git::sdk_listing`] runs it, with no console interrupt and no worktree to keep it out
+/// of, ended with its job past `limit`.
 fn sdks(limit: Duration) -> Result<String, String> {
-    let listing = git::sdk_listing(Variables::from_process(), limit, None)?;
+    let listing = git::sdk_listing(Variables::from_process(), limit, None, None)?;
     Ok(sdk_list(&listing))
 }
 

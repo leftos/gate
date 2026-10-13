@@ -64,6 +64,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Lent window**: the span during a critical drain in which the critical gate lends one slot to backfill guests, ending at the shadow end.
 - **Light**: the slot kind for work that keeps one or two cores busy; its pool's thread budget is 2.
 - **Load-adjusted time**: wall time scaled by the free share in each sample, the clock the ceiling runs on, so a command slowed by other work is not killed for it.
+- **Log cap**: the most bytes of one remote call's output, its standard output and standard error together, the remote client writes to the gate's log (256 MiB); past it the log gets one `gate: the builder's output passed 256 MiB; the rest is not logged` line and the console keeps echoing.
 - **Log hash**: the first 16 hex digits of the SHA-256 of a lower-cased, normalised absolute log path, carried in the name of that log's mutex.
 - **Lost connection**: a remote run call that ended with ssh's status 255 after the banner (or whose command itself exited 255); nothing is synced back, the client sends the stop, and a boot-time check tells a restarted builder from a dropped link.
 - **Manifest**: the PC's list of its files under a routed run's output globs (path, size, last write, SHA-256), sent to the box so it packs only the files the PC lacks or that differ.

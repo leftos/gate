@@ -16,7 +16,7 @@ use regex::Regex;
 use serde_json::{Value, json};
 
 use crate::support::{
-    Case, Closed, FAKE_TOOL, GIT_REDIRECTS, Outcome, Running, allow_breakaway, box_payload, finish, shown, start, start_with_closed, wait_until,
+    Case, Closed, FAKE_TOOL, GIT_REDIRECTS, Go, Outcome, Running, allow_breakaway, box_payload, finish, shown, start, start_with_closed, wait_until,
     wait_until_closed,
 };
 
@@ -377,9 +377,13 @@ fn preflight_a_dotnet_that_does_not_answer_is_an_unreadable_sdk_list() {
     let folders = Folders::new(&case);
     let stub = case.folder().join("stub");
     fs::create_dir_all(&stub).expect("the stub folder can be made");
-    let go = case.folder().join("dotnet-go");
+    let go = Go(case.folder().join("dotnet-go"));
     let held = case.folder().join("dotnet-held");
-    let hang = format!("@echo off\r\n\"{FAKE_TOOL}\" wait \"{}\" >\"{}\"\r\n", go.display(), held.display());
+    let hang = format!(
+        "@echo off\r\n\"{FAKE_TOOL}\" wait \"{}\" >\"{}\"\r\n",
+        go.path().display(),
+        held.display()
+    );
     fs::write(stub.join("dotnet.cmd"), hang).expect("the dotnet stub can be written");
     let mut command = box_command(&case, &["box", "--test-dotnet-limit-ms", "1000", "preflight", &folders.payload()]);
     command.env("PATH", path_with_git(&[stub]));
@@ -390,7 +394,6 @@ fn preflight_a_dotnet_that_does_not_answer_is_an_unreadable_sdk_list() {
     if held.exists() {
         wait_until_closed(&held);
     }
-    fs::write(&go, "").expect("the go file can be written");
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert!(!outcome.stdout.contains("gate: remote sdks"), "{outcome:?}");
     let unreadable = "gate: remote could not read the SDK list: dotnet --list-sdks did not answer in 1 s";
@@ -1304,8 +1307,7 @@ fn box_run_refuses_a_batch_word_cmd_would_expand() {
     assert_eq!(outcome.stdout, "");
     assert_eq!(
         outcome.stderr,
-        "gate: a .cmd or .bat command cannot take a word holding a line break or %NAME% of a set variable, which cmd.exe \
-         would split or expand: %PATH%\n"
+        "gate: a .cmd or .bat command cannot take a word holding a line break or a %NAME% cmd.exe would expand: %PATH%\n"
     );
     assert!(!Path::new(field(&payload, "Work")).join("new.txt").exists(), "the command did not run");
 }

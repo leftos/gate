@@ -19,7 +19,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::support::{
-    Case, FAKE_TOOL, GATE, GIT_REDIRECTS, Outcome, allow_breakaway, copy_tool, events, finish, git, git_init, heavy_words, release, shown, start,
+    Case, FAKE_TOOL, GATE, GIT_REDIRECTS, Go, Outcome, allow_breakaway, copy_tool, events, finish, git, git_init, heavy_words, release, shown, start,
     wait_for_journal_line, wait_until, wait_until_closed, write_remote_json,
 };
 
@@ -444,28 +444,6 @@ fn calls(steps: &Path) -> Vec<String> {
     let mut log = steps.as_os_str().to_owned();
     log.push(".log");
     fs::read_to_string(PathBuf::from(log)).map_or_else(|_| Vec::new(), |text| text.lines().map(str::to_owned).collect())
-}
-
-/// The go file of a case that parks a call in `hold <go>`: writing it when it drops releases the stand-in even when the
-/// case panics before its own write, and writing one the case already made is harmless. A write that fails is said
-/// unless the file is there after all.
-struct Go(PathBuf);
-
-impl Go {
-    /// The path of the go file the case writes and its parked stand-in waits for.
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for Go {
-    fn drop(&mut self) {
-        if let Err(error) = fs::write(&self.0, "")
-            && !self.0.exists()
-        {
-            let _ = writeln!(io::stderr(), "the go file {} cannot be made: {error}", self.0.display());
-        }
-    }
 }
 
 /// The gate of a routed run logging to `log` through the Rust client: the builder root `builder` in the case folder,
@@ -970,29 +948,31 @@ fn holds_dotnet(folder: &Path) -> bool {
         .any(|extension| folder.join(format!("dotnet.{extension}")).is_file())
 }
 
-/// A routed run of a case whose tree the builder lacks the toolchain for, the client given `extra`: it falls back
-/// `parity` after the preflight alone, so nothing is pushed, says `need` in the mismatch line on the console and in the
-/// log, and runs the command here once.
+/// The one SDK the builder of every parity refusal lists, which its mismatch line ends in.
+const BUILDER_SDK: &str = "8.0.404";
+
+/// A routed run of a case whose tree the builder lacks the toolchain for, the client given `extra` and the `PATH`
+/// `box_path`, else one whose builder's dotnet lists [`BUILDER_SDK`] alone: it falls back `parity` after the preflight
+/// alone, so nothing is pushed, says the whole mismatch line, `need` and then [`BUILDER_SDK`], on the console and in the
+/// log, so a builder that found no dotnet cannot pass for one that did, and runs the command here once.
 fn a_parity_refusal(case: &Case, extra: &[&str], need: &str, box_path: Option<&OsString>) -> Outcome {
     let steps = ssh_steps(case, "ssh", &["ok", "ok"]);
     let tuned = Tuned { extra, ..Tuned::default() };
     let command = [r".\tool.exe", "mark", RAN, "out", "ran"];
 
     let mut gate = client_gate_tuned(case, "out.log", &steps, &tuned, &command);
-    if let Some(path) = box_path {
-        gate.env("PATH", path);
-    }
+    gate.env("PATH", box_path.cloned().unwrap_or_else(|| box_path_with_dotnet(case, &[BUILDER_SDK])));
     let (pid, outcome) = finish_with_pid(gate);
 
     assert_eq!(outcome.code, Some(0), "the run here passed: {outcome:?}");
     let events = own(case, pid);
     assert_eq!(fallbacks(&events), ["parity"], "{outcome:?}");
     let repo = repo_name(&case.folder().file_name().expect("the case folder has a name").to_string_lossy());
-    let mismatch = format!("gate: remote toolchain mismatch: {repo} needs {need}; builder has ");
-    assert!(outcome.stderr.contains(&mismatch), "{mismatch}: {outcome:?}");
+    let mismatch = format!("gate: remote toolchain mismatch: {repo} needs {need}; builder has {BUILDER_SDK}");
+    assert!(outcome.stderr.lines().any(|said| said == mismatch), "{mismatch}: {outcome:?}");
     assert!(outcome.stderr.contains(PARITY_LINE), "{outcome:?}");
     let log = fs::read_to_string(case.folder().join("out.log")).expect("the log was written");
-    assert!(log.contains(&mismatch), "{mismatch}: {log}");
+    assert!(log.lines().any(|said| said == mismatch), "{mismatch}: {log}");
     assert_eq!(calls(&steps), ["preflight"], "the preflight alone reached the builder");
     assert_eq!(builder_ref(case, &format!("refs/gate/{}", key_of(&events))), "", "nothing was pushed");
     assert_eq!(runs(case), (1, 0), "the command ran once, here: {outcome:?}");
@@ -1159,10 +1139,223 @@ fn a_dotnet_on_path_inside_the_worktree_is_not_run_for_the_sdk_list() {
     );
 }
 
-/// A Ctrl+C as this PC's SDK list is read ends the run as an interrupt: no `cannot read` line, nothing pushed, and no
-/// call after the preflight reaches the builder.
+/// A junction outside the worktree that leads into a folder inside it, first on `PATH`, is skipped for this PC's SDK
+/// list as that folder is, each `PATH` folder compared by its canonical path: the stub later on `PATH` is read, so this
+/// PC lists 999. The builder's `gate box`, which skips no folder, takes the `dotnet.cmd` behind the junction, which
+/// notes each run: it ran once, for the builder alone.
 #[test]
-fn a_ctrl_c_during_the_sdk_list_read_ends_the_run_as_an_interrupt() {
+fn a_junction_on_path_into_the_worktree_is_not_run_for_the_sdk_list() {
+    let case = client_case("client-parity-path-junction");
+    write(&case, "src/App/App.csproj", "<Project />\n");
+    let inside = case.folder().join("ssh").join("repo-bin");
+    fs::create_dir_all(&inside).expect("the folder inside the worktree can be made");
+    let marker = case.folder().join("ssh").join("inside-ran");
+    let decoy = format!("@echo off\r\n>>\"{}\" echo ran\r\n{}", marker.display(), listing(&[BUILDER_SDK]));
+    fs::write(inside.join("dotnet.cmd"), decoy).expect("the dotnet inside the worktree can be written");
+    let junction = Junction::to(&case, &inside);
+    let later = pc_dotnet(&case, "echo 999.0.100 [C:\\stub]\r\n");
+    let folders = std::iter::once(junction.0.clone()).chain(std::env::split_paths(&later.path));
+    let path = std::env::join_paths(folders).expect("the folders join into a PATH");
+
+    a_parity_refusal(&case, &[], "a .NET 999 SDK", Some(&path));
+
+    let ran = fs::read_to_string(&marker).expect("the builder ran the dotnet.cmd behind the junction");
+    assert_eq!(
+        ran.lines().count(),
+        1,
+        "the dotnet.cmd behind the junction ran for the builder alone: {ran:?}"
+    );
+}
+
+/// A junction beside the case folder, outside its worktree, made with `mklink /J`; removed, and not what it leads to,
+/// when it drops.
+struct Junction(PathBuf);
+
+impl Junction {
+    /// A junction that leads to `target`.
+    fn to(case: &Case, target: &Path) -> Junction {
+        let mut link = case.folder().into_os_string();
+        link.push("-junction");
+        let link = PathBuf::from(link);
+        // A junction an earlier run of the case left would make `mklink` refuse.
+        drop(fs::remove_dir(&link));
+        let made = Command::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .arg(&link)
+            .arg(target)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .status()
+            .expect("cmd starts");
+        assert!(made.success(), "the junction is made");
+        Junction(link)
+    }
+}
+
+impl Drop for Junction {
+    fn drop(&mut self) {
+        if let Err(error) = fs::remove_dir(&self.0) {
+            // A junction left beside the case harms no later case, which removes it first, and a panic in drop aborts.
+            let _ = writeln!(io::stderr(), "could not remove the junction {}: {error}", self.0.display());
+        }
+    }
+}
+
+/// A `PATH` with an unmatched quote reads every folder after it as one, so the `dotnet` there would not be found and
+/// this PC's SDK list would read as empty: the list counts as unreadable instead, the run says so and checks no SDK
+/// major.
+#[test]
+fn a_path_with_an_unmatched_quote_is_an_unreadable_sdk_list() {
+    let case = client_case("client-parity-path-quote");
+    write(&case, "src/App/App.csproj", "<Project />\n");
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+    let mut gate = client_gate(&case, "out.log", &steps, &[r".\tool.exe", "mark", RAN, "out", "ran there"]);
+    let dotnet = pc_dotnet(&case, "echo 999.0.100 [C:\\stub]\r\n");
+    let mut folders = std::env::split_paths(&dotnet.path);
+    let stub = folders.next().expect("the stub's folder is first");
+    let mut path = std::env::join_paths(folders).expect("the folders join into a PATH");
+    path.push(format!(";\"C:\\gate-no-such-folder;{}", stub.display()));
+    gate.env("PATH", &path);
+
+    let outcome = finish(gate);
+
+    let unreadable = "gate: cannot read this PC's SDK list: PATH holds an unmatched quote, so the folders after it read as one; \
+                      checking no SDK major";
+    assert!(outcome.stderr.lines().any(|said| said == unreadable), "{unreadable}: {outcome:?}");
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(!outcome.stderr.contains("gate: remote toolchain mismatch: "), "{outcome:?}");
+}
+
+/// The log cap a log cap case lowers the client's to, in bytes, and the line its log then gets, once a call's output
+/// passes it.
+const LOG_CAP: &str = "65536";
+const LOG_CUT: &str = "gate: the builder's output passed 64 KiB; the rest is not logged";
+/// The output of the command a log cap case runs on the builder, after the flood the stand-in writes.
+const RAN_THERE: &str = "ran there";
+
+/// A routed run of a [`client_case`] whose ssh calls take `steps` and whose log cap is [`LOG_CAP`]: what it said, and its
+/// log. The run passes, and its command ran once, on the builder.
+fn log_capped(name: &str, steps: &[&str]) -> (Outcome, String) {
+    log_capped_at(name, steps, LOG_CAP)
+}
+
+/// [`log_capped`] with the log cap `cap`, in bytes.
+fn log_capped_at(name: &str, steps: &[&str], cap: &str) -> (Outcome, String) {
+    let case = client_case(name);
+    let steps = ssh_steps(&case, "ssh", steps);
+    let tuned = Tuned {
+        extra: &["--test-remote-log-cap-bytes", cap],
+        ..Tuned::default()
+    };
+    let outcome = finish(client_gate_tuned(
+        &case,
+        "out.log",
+        &steps,
+        &tuned,
+        &[r".\tool.exe", "mark", RAN, "out", RAN_THERE],
+    ));
+    assert_eq!(outcome.code, Some(0), "the run keeps its status: {outcome:?}");
+    assert_eq!(runs(&case), (0, 1), "the command ran once, on the builder: {outcome:?}");
+    let log = fs::read_to_string(case.folder().join("out.log")).expect("the log was written");
+    (outcome, log)
+}
+
+/// How many times `log` says a call's output passed the cap.
+fn cuts(log: &str) -> usize {
+    log.lines().filter(|line| *line == LOG_CUT).count()
+}
+
+/// The bytes of the stand-in's `lines` flood `log` holds, line ends counted.
+fn flood_logged(log: &str) -> usize {
+    log.lines().filter(|line| line.starts_with("line ")).map(|line| line.len() + 1).sum()
+}
+
+/// The index of the line `want` in `log`, when it holds it.
+fn line_at(log: &str, want: &str) -> Option<usize> {
+    log.lines().position(|line| line == want)
+}
+
+/// A preflight that floods the log is logged up to the cap and then says so once, and none of it reaches the console:
+/// the run goes on, and the run call, counted afresh, is logged whole after it.
+#[test]
+fn a_flooded_preflight_writes_at_most_the_cap_to_the_log() {
+    let (outcome, log) = log_capped("client-log-cap-preflight", &["lines 200 1000", "ok"]);
+
+    assert_eq!(cuts(&log), 1, "{log}");
+    assert!(flood_logged(&log) <= 65_536, "{} bytes of the flood were logged", flood_logged(&log));
+    assert!(!log.contains("line 199 "), "the flood's end is not logged");
+    assert!(
+        !outcome.stdout.contains("line 0 ") && !outcome.stderr.contains("line 1 "),
+        "the preflight is not echoed: {outcome:?}"
+    );
+    let (cut, ran) = (line_at(&log, LOG_CUT), line_at(&log, RAN_THERE));
+    assert!(cut.is_some() && cut < ran, "the run call is logged after the preflight's cut: {log}");
+}
+
+/// A run call that floods the log is logged up to the cap and then says so once, while the console keeps echoing it to
+/// its end, so the end of the run is still seen live; nothing past the cap reaches the log.
+#[test]
+fn a_flooded_run_call_is_echoed_whole_and_logged_to_the_cap() {
+    let (outcome, log) = log_capped("client-log-cap-run", &["ok", "lines 200 1000"]);
+
+    let said = format!("{}{}", outcome.stdout, outcome.stderr);
+    assert!(
+        said.contains("line 198 ") && said.contains("line 199 "),
+        "the console shows the whole flood"
+    );
+    assert!(
+        outcome.stdout.lines().any(|line| line == RAN_THERE),
+        "the end of the run is seen live: {outcome:?}"
+    );
+    assert_eq!(cuts(&log), 1, "{log}");
+    assert!(flood_logged(&log) <= 65_536, "{} bytes of the flood were logged", flood_logged(&log));
+    assert!(!log.contains("line 199 "), "the flood's end is not logged");
+    assert_eq!(line_at(&log, RAN_THERE), None, "the command's output past the cap is not logged");
+}
+
+/// Each stream of the run call carries 50 of the flood's lines, about 50 KB, under the 64 KiB cap; together they pass
+/// it, so the cap counts a call's two streams together.
+#[test]
+fn the_log_cap_counts_a_calls_two_streams_together() {
+    let (_, log) = log_capped("client-log-cap-streams", &["ok", "lines 100 1000"]);
+
+    assert_eq!(cuts(&log), 1, "{log}");
+    assert!(flood_logged(&log) <= 65_536, "{} bytes of the flood were logged", flood_logged(&log));
+    assert_eq!(line_at(&log, RAN_THERE), None, "the command's output past the cap is not logged");
+}
+
+/// A run call that floods one line with no line end, 4 MiB passed on in pieces past the 64 KiB line cap, is logged in
+/// pieces up to its 1 MiB cap, which a cut line of its own then says once, while the console shows the whole flood.
+#[test]
+fn a_run_call_flooding_one_endless_line_is_logged_to_the_cap() {
+    const FLOOD: usize = 4 << 20;
+    let (outcome, log) = log_capped_at("client-log-cap-one-line", &["ok", &format!("flood-ok {FLOOD}")], "1048576");
+
+    let cut = "gate: the builder's output passed 1 MiB; the rest is not logged";
+    assert_eq!(log.lines().filter(|line| *line == cut).count(), 1, "one cut line of its own");
+    let flood: usize = log.lines().filter(|line| line.starts_with("xxxx")).map(str::len).sum();
+    assert!(flood > 0 && flood <= 1 << 20, "{flood} bytes of the flood were logged");
+    assert!(outcome.stdout.matches('x').count() >= FLOOD, "the console shows the whole flood");
+    assert!(outcome.stdout.contains(RAN_THERE), "the end of the run is seen live");
+}
+
+/// A run call whose output stays under the cap is logged whole, with no cut line.
+#[test]
+fn a_call_under_the_log_cap_is_logged_whole() {
+    let (_, log) = log_capped("client-log-cap-under", &["ok", "lines 20 1000"]);
+
+    assert_eq!(cuts(&log), 0, "{log}");
+    for number in 0..20 {
+        let start = format!("line {number} ");
+        assert!(log.lines().any(|line| line.starts_with(&start)), "{start}is logged");
+    }
+    assert!(line_at(&log, RAN_THERE).is_some(), "the command's output is logged: {log}");
+}
+
+/// A Ctrl+C raised just before this PC's SDK list is read ends the run as an interrupt: no `cannot read` line, nothing
+/// pushed, and no call after the preflight reaches the builder.
+#[test]
+fn a_ctrl_c_before_the_sdk_list_read_ends_the_run_as_an_interrupt() {
     let case = client_case("client-parity-dotnet-ctrl-c");
     write(&case, "src/App/App.csproj", "<Project />\n");
     let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);

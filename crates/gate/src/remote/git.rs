@@ -9,7 +9,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::process::ExitStatusExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf, Prefix};
 use std::process::{Command, ExitStatus};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -23,7 +23,7 @@ use gate_win32::{Interrupt, Job, PipedConsole, PipedLaunch, Running};
 use super::launch::{DRAIN, KILL_WAIT, KILLED, call_job, launched, piped_launch};
 use crate::boxside::payload::escaped;
 use crate::environment::Variables;
-use crate::run::{CONTROL_C_EXIT, ERROR_FILE_NOT_FOUND, Written, find_program, written};
+use crate::run::{CONTROL_C_EXIT, ERROR_FILE_NOT_FOUND, Written, find_program, is_within, resolved, written};
 
 /// How long one git call may take before git is killed.
 pub(crate) const GIT_LIMIT: Duration = Duration::from_secs(60);
@@ -227,12 +227,14 @@ struct Spawn<'a> {
 }
 
 /// What `dotnet --list-sdks` lists, empty when no dotnet is found along the `PATH` of `variables`; the search never
-/// looks in the working folder. dotnet runs in the system folder with `variables` as its environment and
-/// `NoDefaultCurrentDirectoryInExePath=1`, as the client's git calls run: in a kill-on-close job of its own, on this
-/// process's console, ended past `limit` or by the console `interrupt`, its standard output read up to [`OUTPUT_CAP`]
-/// and its standard error dropped. This PC's parity check and the builder's preflight both read the list this way.
-/// Else why the list cannot be read, or [`GitError::Interrupted`].
-pub(crate) fn sdk_listing(variables: Variables, limit: Duration, interrupt: Option<Interrupt>) -> Result<String, GitError> {
+/// looks in the working folder, and when `worktree` is given a dotnet found is followed through links, refused when
+/// that leads inside it and else launched as the file it leads to. dotnet
+/// runs in the system folder with `variables` as its environment and `NoDefaultCurrentDirectoryInExePath=1`, as the
+/// client's git calls run: in a kill-on-close job of its own, on this process's console, ended past `limit` or by the
+/// console `interrupt`, its standard output read up to [`OUTPUT_CAP`] and the end of its standard error kept, whose
+/// last lines a failed read's reason carries. This PC's parity check and the builder's preflight both read the list
+/// this way. Else why the list cannot be read, or [`GitError::Interrupted`].
+pub(crate) fn sdk_listing(variables: Variables, limit: Duration, interrupt: Option<Interrupt>, worktree: Option<&Path>) -> Result<String, GitError> {
     let cannot_run = |why: String| GitError::Failed(format!("cannot run dotnet: {why}"));
     let folder = gate_win32::system_directory().map_err(|error| cannot_run(format!("cannot read the system folder: {error}")))?;
     let variables = variables.with("NoDefaultCurrentDirectoryInExePath", "1");
@@ -241,6 +243,10 @@ pub(crate) fn sdk_listing(variables: Variables, limit: Duration, interrupt: Opti
         // `find_program` says a word it does not find with this message, and every other failure with another.
         Err(message) if message == gate_win32::win32_message(ERROR_FILE_NOT_FOUND) => return Ok(String::new()),
         Err(message) => return Err(cannot_run(message)),
+    };
+    let dotnet = match worktree {
+        Some(worktree) => judged(&dotnet, worktree).map_err(cannot_run)?,
+        None => dotnet,
     };
     let args = ["--list-sdks"];
     let call = Call {
@@ -253,12 +259,54 @@ pub(crate) fn sdk_listing(variables: Variables, limit: Duration, interrupt: Opti
         launch: sdk_launch(&dotnet, &folder, &variables),
     };
     let over = format!("dotnet --list-sdks wrote more than {} MiB", OUTPUT_CAP / (1024 * 1024));
-    let (status, output) = output_of(&spawn, &call, over)?;
+    let (status, output, errors) = output_of(&spawn, &call, over)?;
     if !status.success() {
         let status = status.code().map_or_else(|| "unknown".to_owned(), |code| code.to_string());
-        return Err(GitError::Failed(format!("dotnet --list-sdks exited with status {status}")));
+        let errors = String::from_utf8_lossy(&errors);
+        let lines: Vec<&str> = errors.lines().filter(|line| !line.trim().is_empty()).collect();
+        let said = if lines.is_empty() {
+            String::new()
+        } else {
+            format!(": {}", failure_text(&lines))
+        };
+        return Err(GitError::Failed(format!("dotnet --list-sdks exited with status {status}{said}")));
     }
     Ok(String::from_utf8_lossy(&output).into_owned())
+}
+
+/// The file `dotnet`, found along a `PATH` without the worktree's folders, leads to, followed through links, which is
+/// what is then launched, so a link retargeted after the check cannot change what runs; else why it is refused: a
+/// folder outside the worktree may still hold a link that leads into it.
+fn judged(dotnet: &Path, worktree: &Path) -> Result<PathBuf, String> {
+    let target = resolved(dotnet);
+    if is_within(&target, &resolved(worktree)) {
+        return Err(format!("{} lies inside the worktree", dotnet.display()));
+    }
+    Ok(without_verbatim(&target))
+}
+
+/// `path` without the `\\?\` prefix a canonical path carries, which cmd.exe does not take: `\\?\C:\a` as `C:\a`, and
+/// `\\?\UNC\server\share\a` as `\\server\share\a`. Any other path is kept as it is.
+fn without_verbatim(path: &Path) -> PathBuf {
+    let mut parts = path.components();
+    let Some(Component::Prefix(prefix)) = parts.next() else {
+        return path.to_owned();
+    };
+    let mut root = OsString::new();
+    match prefix.kind() {
+        Prefix::VerbatimDisk(disk) => root.push(format!("{}:\\", char::from(disk))),
+        Prefix::VerbatimUNC(server, share) => {
+            root.push(r"\\");
+            root.push(server);
+            root.push(r"\");
+            root.push(share);
+            root.push(r"\");
+        }
+        _ => return path.to_owned(),
+    }
+    parts
+        .filter(|part| !matches!(part, Component::RootDir))
+        .fold(PathBuf::from(root), |joined, part| joined.join(part))
 }
 
 /// The launch of `dotnet --list-sdks` with the program `dotnet` found, in `folder`, on this process's console, with
@@ -277,16 +325,17 @@ fn sdk_launch(dotnet: &Path, folder: &Path, variables: &Variables) -> io::Result
     })
 }
 
-/// Runs `spawn`'s process as `call` bounds it, as [`Git::output_bytes`] runs git: its exit status and what it wrote on
-/// standard output, read up to [`OUTPUT_CAP`], its standard error read and dropped. One that writes more is ended as
-/// soon as its reader sees it, and the call is [`GitError::OverCap`] with the line `over`.
-fn output_of(spawn: &Spawn<'_>, call: &Call<'_>, over: String) -> Result<(ExitStatus, Vec<u8>), GitError> {
+/// Runs `spawn`'s process as `call` bounds it, as [`Git::output_bytes`] runs git: its exit status, what it wrote on
+/// standard output, read up to [`OUTPUT_CAP`], and the last [`ERRORS_KEPT`] bytes of its standard error. One that
+/// writes more on standard output is ended as soon as its reader sees it, and the call is [`GitError::OverCap`] with
+/// the line `over`.
+fn output_of(spawn: &Spawn<'_>, call: &Call<'_>, over: String) -> Result<(ExitStatus, Vec<u8>, Vec<u8>), GitError> {
     let (over, read_capped) = capped_reader(OUTPUT_CAP, over);
-    let (status, output, ()) = bounded(spawn, call, read_capped, dropped, Some(&over))?;
+    let (status, output, errors) = bounded(spawn, call, read_capped, |pipe: File| tail(pipe, ERRORS_KEPT), Some(&over))?;
     let Some(output) = output else {
         return Err(GitError::OverCap(over.line));
     };
-    Ok((status, output))
+    Ok((status, output, errors))
 }
 
 /// Runs `spawn`'s process, created suspended with no standard input, or with `call`'s input fed by a thread of its own
@@ -720,9 +769,10 @@ mod tests {
 
     use super::{
         Call, ERRORS_KEPT, FAILURE_BYTES, GIT_LIMIT, Git, GitError, OUTPUT_CAP, capped, failed_line, failure_text, is_indexed_config, late_git_line,
-        tail,
+        sdk_listing, tail, without_verbatim,
     };
     use crate::boxside::payload::escaped;
+    use crate::environment::Variables;
     use crate::remote::snapshot::repository;
 
     /// How long a case waits for what a passing run always sees: only a broken product reaches it.
@@ -854,6 +904,124 @@ mod tests {
         });
         assert_eq!(ended, Err(GitError::Interrupted));
         wait_until_gone(pid, started);
+    }
+
+    /// A folder of its own in the temporary folder for the case `name` of this process, holding a `dotnet.cmd` that runs
+    /// `body` after `@echo off`, and the `PATH` that names it alone.
+    fn dotnet_folder(name: &str, body: &str) -> (PathBuf, Variables) {
+        let folder = std::env::temp_dir().join(format!("gate-sdk-{name}-{}", std::process::id()));
+        drop(fs::remove_dir_all(&folder));
+        fs::create_dir_all(&folder).expect("the stub's folder can be made");
+        fs::write(folder.join("dotnet.cmd"), format!("@echo off\r\n{body}")).expect("the stub dotnet can be written");
+        let variables = Variables::from_process().with("PATH", &folder.to_string_lossy());
+        (folder, variables)
+    }
+
+    #[test]
+    fn an_interrupt_while_dotnet_runs_ends_as_interrupted() {
+        // The console interrupt is the process's own and never lowered, and other cases here raise it: this case runs
+        // in a process of its own, the test binary run on this case alone, where only it raises the interrupt.
+        if std::env::var_os(OWN_PROCESS).is_none() {
+            let name = "remote::git::tests::an_interrupt_while_dotnet_runs_ends_as_interrupted";
+            let mut own = Command::new(std::env::current_exe().expect("the test binary has a path"));
+            own.args(["--exact", name, "--test-threads=1"])
+                .env(OWN_PROCESS, "1")
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let ran = gate_win32::spawn(&mut own)
+                .and_then(Child::wait_with_output)
+                .expect("the test binary runs the case in a process of its own");
+            let said = format!("{}{}", String::from_utf8_lossy(&ran.stdout), String::from_utf8_lossy(&ran.stderr));
+            assert!(ran.status.success() && said.contains("1 passed"), "{}: {said}", ran.status);
+            return;
+        }
+        let (folder, variables) = dotnet_folder("interrupt", "");
+        let _removed = Removed(folder.clone());
+        let (pid_file, go) = (folder.join("dotnet.pid"), folder.join("go"));
+        let _let_go = LetGo(&go);
+        // Windows PowerShell, named by its full path as the stub's PATH names its own folder alone, writes its pid and
+        // then waits for the go file no case writes.
+        let slashed = |path: &Path| path.display().to_string().replace('\\', "/");
+        let waits = format!(
+            "\"%SystemRoot%\\System32\\WindowsPowerShell\\v1.0\\powershell.exe\" -NoProfile -NonInteractive -Command \
+             \"Set-Content -LiteralPath '{}' -Value ('pid ' + $PID); \
+             while (-not (Test-Path -LiteralPath '{}')) {{ Start-Sleep -Milliseconds 100 }}\"\r\n",
+            slashed(&pid_file),
+            slashed(&go)
+        );
+        fs::write(folder.join("dotnet.cmd"), format!("@echo off\r\n{waits}")).expect("the stub dotnet can be written");
+        let interrupt = Interrupt::install().expect("the console handler is installed");
+        // The hang guard as limit: in a passing run only the interrupt ends the call.
+        let (ended, pid, started) = thread::scope(|scope| {
+            let running = scope.spawn(|| sdk_listing(variables, HANG_GUARD, Some(interrupt), None));
+            let pid = pid_while_running(&pid_file, &running);
+            let started = gate_win32::process_start_of(pid).expect("the stub can be looked for");
+            interrupt.raise();
+            (running.join().expect("the read returns"), pid, started)
+        });
+        assert_eq!(ended, Err(GitError::Interrupted));
+        wait_until_gone(pid, started);
+    }
+
+    #[test]
+    fn a_failing_dotnet_says_its_last_error_lines() {
+        let (folder, variables) = dotnet_folder("failing", ">&2 echo first\r\n>&2 echo the SDK resolver failed\r\nexit /b 3\r\n");
+        let _removed = Removed(folder);
+
+        let read = sdk_listing(variables, HANG_GUARD, None, None);
+
+        let said = "dotnet --list-sdks exited with status 3: first | the SDK resolver failed";
+        assert_eq!(read, Err(GitError::Failed(said.to_owned())));
+    }
+
+    #[test]
+    fn a_failing_dotnet_that_says_nothing_says_its_status_alone() {
+        let (folder, variables) = dotnet_folder("failing-quiet", "exit /b 3\r\n");
+        let _removed = Removed(folder);
+
+        let read = sdk_listing(variables, HANG_GUARD, None, None);
+
+        assert_eq!(read, Err(GitError::Failed("dotnet --list-sdks exited with status 3".to_owned())));
+    }
+
+    #[test]
+    fn a_verbatim_path_loses_its_prefix_for_cmd() {
+        for (path, plain) in [
+            (r"\\?\C:\Program Files\dotnet\dotnet.exe", r"C:\Program Files\dotnet\dotnet.exe"),
+            (r"\\?\UNC\server\share\dotnet\dotnet.cmd", r"\\server\share\dotnet\dotnet.cmd"),
+            (r"C:\dotnet\dotnet.exe", r"C:\dotnet\dotnet.exe"),
+            (r"\\server\share\dotnet.cmd", r"\\server\share\dotnet.cmd"),
+        ] {
+            assert_eq!(without_verbatim(Path::new(path)), PathBuf::from(plain), "{path}");
+        }
+    }
+
+    #[test]
+    fn a_dotnet_that_lies_inside_the_worktree_is_not_run() {
+        let (folder, variables) = dotnet_folder("inside", "");
+        let _removed = Removed(folder.clone());
+        let marker = folder.join("ran");
+        let stub = format!("@echo off\r\n>\"{}\" echo ran\r\necho 9.0.100 [C:\\stub]\r\n", marker.display());
+        fs::write(folder.join("dotnet.cmd"), stub).expect("the stub dotnet can be written");
+
+        let refused = sdk_listing(variables, HANG_GUARD, None, Some(&folder));
+        let ran_inside = marker.exists();
+        let again = Variables::from_process().with("PATH", &folder.to_string_lossy());
+        let elsewhere = sdk_listing(again, HANG_GUARD, None, Some(Path::new(env!("CARGO_MANIFEST_DIR"))));
+
+        let Err(GitError::Failed(why)) = refused else {
+            panic!("a dotnet inside the worktree was read: {refused:?}");
+        };
+        assert!(
+            why.starts_with("cannot run dotnet: ") && why.ends_with(" lies inside the worktree"),
+            "{why}"
+        );
+        assert!(!ran_inside, "the dotnet inside the worktree ran");
+        assert_eq!(
+            elsewhere,
+            Ok("9.0.100 [C:\\stub]\r\n".to_owned()),
+            "the same dotnet outside the worktree is read"
+        );
     }
 
     #[test]
