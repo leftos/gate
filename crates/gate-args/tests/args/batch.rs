@@ -100,6 +100,19 @@ fn batch_refusal_refuses_equals_names_and_nul_with_nothing_set() {
     }
 }
 
+/// cmd.exe sets `COMSPEC`, `PATHEXT` and `PROMPT` for itself when the block it is started with lacks them, so they
+/// expand whatever the command's environment holds.
+#[test]
+fn batch_refusal_refuses_the_names_cmd_sets_for_itself_with_nothing_set() {
+    for word in ["%PROMPT%", "%prompt%", "%COMSPEC%", "%PathExt%", "x%PROMPT:~0,1%", "%COMSPEC:a=b%"] {
+        assert_eq!(
+            batch_refusal(&[wide("run.cmd"), wide(word)], |_| false),
+            Some(BatchRefusal { word: wide(word) }),
+            "word {word:?}"
+        );
+    }
+}
+
 /// The whole name between the `%`s is looked up as well as the part before its first `:`.
 #[test]
 fn batch_refusal_looks_up_the_whole_name() {

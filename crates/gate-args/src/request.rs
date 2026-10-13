@@ -140,6 +140,9 @@ pub struct TestSeams {
     /// How long the readers of a routing-decision git call that has exited may take to reach their pipes' ends before
     /// the call fails, in place of 2 s.
     pub git_drain_ms: Option<u64>,
+    /// How long the remote client's `dotnet --list-sdks` of this PC may take before it is killed and the SDK list
+    /// counts as unreadable, in place of 30 s.
+    pub dotnet_limit_ms: Option<u64>,
     /// The folder the watched command's build servers must live under, `None` for every process on the machine: in a
     /// suite whose cases run at once, it keeps one case's build server out of another's watch.
     pub servers_under: Option<PathBuf>,
@@ -158,8 +161,9 @@ pub struct TestSeams {
     pub remote_retry_pause_ms: Option<u64>,
     /// How long the remote client's `stop` call may take before its ssh is killed, in milliseconds.
     pub remote_bound_ms: Option<u64>,
-    /// The call of the remote client, `preflight` or `run`, after whose first output byte the client raises the console
-    /// interrupt itself.
+    /// The call of the remote client, `preflight`, `run`, `outputs` or `install`, after whose first output byte (for
+    /// `install`, its first moved file) the client raises the console interrupt itself; or `sdks`, before it reads this
+    /// PC's SDK list.
     pub remote_interrupt_at: Option<String>,
     /// The one call of the remote client, `preflight`, `push`, `run`, `ls-remote` or `fetch`, that `--test-stall-ms`
     /// and `--test-remote-timeout-ms` apply to; every other call keeps the run's own stall window and ceiling, and

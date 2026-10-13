@@ -260,7 +260,7 @@ fn log_in_state_root(log: &Path, root: &Path) -> bool {
 
 /// `path` with the nearest of itself and its folders that can be made canonical made so, following links and
 /// junctions, and the rest joined on as written; `path` as written when no part of it can be made canonical.
-fn resolved(path: &Path) -> PathBuf {
+pub(crate) fn resolved(path: &Path) -> PathBuf {
     let mut rest = Vec::new();
     let mut existing = path;
     loop {

@@ -19,8 +19,8 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::support::{
-    Case, GATE, GIT_REDIRECTS, Outcome, allow_breakaway, copy_tool, events, finish, git, git_init, heavy_words, release, shown, start,
-    wait_for_journal_line, wait_until, write_remote_json,
+    Case, FAKE_TOOL, GATE, GIT_REDIRECTS, Outcome, allow_breakaway, copy_tool, events, finish, git, git_init, heavy_words, release, shown, start,
+    wait_for_journal_line, wait_until, wait_until_closed, write_remote_json,
 };
 
 const HOST: &str = "builder";
@@ -847,18 +847,72 @@ const LOCAL_SDKS: [&str; 2] = ["--test-local-sdks", "999.0.100"];
 
 /// A folder holding a `dotnet.cmd` that lists `versions` for `--list-sdks`, one to a line as dotnet does, and this
 /// PC's own `PATH` with it first and every folder holding a real `dotnet` dropped, so the builder's `dotnet` is this
-/// stub and no other: what a case that fixes the SDKs the builder serves passes to its run.
+/// stub and no other: what a case that fixes the SDKs the builder serves passes to its run. The folder is inside the
+/// worktree, where this PC's gate never looks for its own dotnet, so it serves a case whose tree has a pin.
 fn box_path_with_dotnet(case: &Case, versions: &[&str]) -> OsString {
-    let stub = case.folder().join("ssh").join("stub-dotnet");
-    fs::create_dir_all(&stub).expect("the stub's folder can be made");
+    path_with_stub(&case.folder().join("ssh").join("stub-dotnet"), &listing(versions))
+}
+
+/// A stub dotnet beside the case folder, outside its worktree, so this PC's gate finds it as the builder's does, and
+/// the `PATH` that names it; the folder is removed when it drops.
+struct PcDotnet {
+    path: OsString,
+    folder: PathBuf,
+}
+
+impl Drop for PcDotnet {
+    fn drop(&mut self) {
+        if let Err(error) = fs::remove_dir_all(&self.folder) {
+            // A folder left under the target directory harms no later case, and a panic in drop would abort the run.
+            let _ = writeln!(io::stderr(), "could not remove the stub folder {}: {error}", self.folder.display());
+        }
+    }
+}
+
+/// A [`PcDotnet`] whose `dotnet.cmd` runs `body` after `@echo off`.
+fn pc_dotnet(case: &Case, body: &str) -> PcDotnet {
+    let mut folder = case.folder().into_os_string();
+    folder.push("-dotnet");
+    let folder = PathBuf::from(folder);
+    let path = path_with_stub(&folder, body);
+    PcDotnet { path, folder }
+}
+
+/// A [`PcDotnet`] that runs `pc`, lines of a batch file, when its working folder is the system folder, where this PC's
+/// gate runs `dotnet --list-sdks`, and lists `versions` anywhere else, as for the builder's `gate box`, which runs in the
+/// case folder: so this PC's SDK list and the builder's can differ.
+fn box_path_with_pc_dotnet(case: &Case, versions: &[&str], pc: &str) -> PcDotnet {
+    pc_dotnet(case, &by_folder(&listing(versions), pc))
+}
+
+/// Batch lines that run `pc` when the working folder is the system folder, and `elsewhere` anywhere else.
+fn by_folder(elsewhere: &str, pc: &str) -> String {
+    format!("if /i \"%CD%\"==\"{}\" goto pc\r\n{elsewhere}exit /b 0\r\n:pc\r\n{pc}", system_folder())
+}
+
+/// The system folder as `%CD%` says it, with no trailing backslash: where this PC's gate runs its dotnet.
+fn system_folder() -> String {
+    let folder = gate_win32::system_directory().expect("the system folder can be read");
+    folder.to_string_lossy().trim_end_matches('\\').to_owned()
+}
+
+/// The batch lines that list `versions` as `dotnet --list-sdks` does, one to a line.
+fn listing(versions: &[&str]) -> String {
     let mut listed = String::new();
     for version in versions {
         write!(listed, "echo {version} [C:\\stub]\r\n").expect("a String writes");
     }
-    fs::write(stub.join("dotnet.cmd"), format!("@echo off\r\n{listed}")).expect("the stub dotnet can be written");
+    listed
+}
+
+/// The folder `stub`, made to hold a `dotnet.cmd` that runs `body` after `@echo off`, and this PC's own `PATH` with it
+/// first and every folder holding a real `dotnet` dropped, so every `dotnet` the run finds is this stub.
+fn path_with_stub(stub: &Path, body: &str) -> OsString {
+    fs::create_dir_all(stub).expect("the stub's folder can be made");
+    fs::write(stub.join("dotnet.cmd"), format!("@echo off\r\n{body}")).expect("the stub dotnet can be written");
     let own = std::env::var_os("PATH").expect("PATH is set");
     let without_dotnet = std::env::split_paths(&own).filter(|folder| !holds_dotnet(folder));
-    std::env::join_paths(std::iter::once(stub).chain(without_dotnet)).expect("the folders join into a PATH")
+    std::env::join_paths(std::iter::once(stub.to_path_buf()).chain(without_dotnet)).expect("the folders join into a PATH")
 }
 
 /// Whether `folder` holds a `dotnet` under any of the extensions a `PATHEXT` search tries, so [`box_path_with_dotnet`]
@@ -976,6 +1030,131 @@ fn a_dotnet_tree_without_a_pin_needs_the_pcs_newest_major() {
     assert!(
         !outcome.stderr.contains("gate: global.json has no readable sdk pin"),
         "no global.json: {outcome:?}"
+    );
+}
+
+/// A `dotnet.cmd` in the repo root, the gate's working folder, is never run for this PC's SDK list: dotnet is found
+/// along `PATH` alone, so the mismatch names the major the `PATH` stub lists for this PC, and the decoy leaves no mark.
+#[test]
+fn a_dotnet_in_the_repo_root_is_not_run_for_the_sdk_list() {
+    let case = client_case("client-parity-root-dotnet");
+    write(&case, "src/App/App.csproj", "<Project />\n");
+    let marker = case.folder().join("ssh").join("decoy-ran");
+    write(
+        &case,
+        "dotnet.cmd",
+        &format!("@echo off\r\n>\"{}\" echo ran\r\necho 997.0.100 [C:\\decoy]\r\n", marker.display()),
+    );
+    let dotnet = box_path_with_pc_dotnet(&case, &["8.0.404"], "echo 999.0.100 [C:\\stub]\r\n");
+
+    a_parity_refusal(&case, &[], "a .NET 999 SDK", Some(&dotnet.path));
+
+    assert!(!marker.exists(), "the repo root's dotnet.cmd ran");
+}
+
+/// This PC's `dotnet --list-sdks` that never answers is ended with its job at the bound `--test-dotnet-limit-ms` sets:
+/// the list counts as unreadable, the run checks no SDK major and goes remote, and nothing the stub started is left
+/// running. Only the bound ends the call, so no load changes what the run says.
+#[test]
+fn a_dotnet_that_does_not_answer_counts_as_an_unreadable_sdk_list() {
+    let case = client_case("client-parity-dotnet-hangs");
+    write(&case, "src/App/App.csproj", "<Project />\n");
+    let go = Go(case.folder().join("ssh").join("dotnet-go"));
+    let held = case.folder().join("ssh").join("dotnet-held");
+    let hang = format!("\"{FAKE_TOOL}\" wait \"{}\" >\"{}\"\r\n", go.path().display(), held.display());
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+    let tuned = Tuned {
+        extra: &["--test-dotnet-limit-ms", "2000"],
+        ..Tuned::default()
+    };
+    let mut gate = client_gate_tuned(&case, "out.log", &steps, &tuned, &[r".\tool.exe", "mark", RAN, "out", "ran there"]);
+    let dotnet = box_path_with_pc_dotnet(&case, &["8.0.404"], &hang);
+    gate.env("PATH", &dotnet.path);
+
+    let (pid, outcome) = finish_with_pid(gate);
+
+    let unreadable = "gate: cannot read this PC's SDK list: dotnet --list-sdks did not answer in 2 s; checking no SDK major";
+    assert!(outcome.stderr.lines().any(|said| said == unreadable), "{unreadable}: {outcome:?}");
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(!outcome.stderr.contains("gate: remote toolchain mismatch: "), "{outcome:?}");
+    assert_eq!(fallbacks(&own(&case, pid)), Vec::<&str>::new(), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "run"]);
+    assert_eq!(runs(&case), (0, 1), "the command ran once, on the builder: {outcome:?}");
+    // A stub that started holds its output file open until its job's kill ends it; one the kill came first never made it.
+    if held.exists() {
+        wait_until_closed(&held);
+    }
+}
+
+/// A `dotnet.cmd` in a folder inside the worktree that `PATH` names first, as an `npm run` or an activated venv puts
+/// one, is skipped for this PC's SDK list: the stub later on `PATH` is read, and the one inside leaves no mark. The
+/// builder's `gate box`, which skips no folder, takes the one inside, which lists `8.0.404` for it.
+#[test]
+fn a_dotnet_on_path_inside_the_worktree_is_not_run_for_the_sdk_list() {
+    let case = client_case("client-parity-path-in-worktree");
+    write(&case, "src/App/App.csproj", "<Project />\n");
+    let inside = case.folder().join("ssh").join("repo-bin");
+    fs::create_dir_all(&inside).expect("the folder inside the worktree can be made");
+    let marker = case.folder().join("ssh").join("inside-ran");
+    let pc = format!(">\"{}\" echo ran\r\necho 997.0.100 [C:\\inside]\r\n", marker.display());
+    let decoy = format!("@echo off\r\n{}", by_folder(&listing(&["8.0.404"]), &pc));
+    fs::write(inside.join("dotnet.cmd"), decoy).expect("the dotnet inside the worktree can be written");
+    let later = box_path_with_pc_dotnet(&case, &["8.0.404"], "echo 999.0.100 [C:\\stub]\r\n");
+    let path = std::env::join_paths(std::iter::once(inside).chain(std::env::split_paths(&later.path))).expect("the folders join into a PATH");
+
+    a_parity_refusal(&case, &[], "a .NET 999 SDK", Some(&path));
+
+    assert!(!marker.exists(), "the dotnet.cmd inside the worktree ran");
+}
+
+/// A Ctrl+C as this PC's SDK list is read ends the run as an interrupt: no `cannot read` line, nothing pushed, and no
+/// call after the preflight reaches the builder.
+#[test]
+fn a_ctrl_c_during_the_sdk_list_read_ends_the_run_as_an_interrupt() {
+    let case = client_case("client-parity-dotnet-ctrl-c");
+    write(&case, "src/App/App.csproj", "<Project />\n");
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+    let tuned = Tuned {
+        extra: &["--test-remote-interrupt-at", "sdks"],
+        ..Tuned::default()
+    };
+    let mut gate = client_gate_tuned(&case, "out.log", &steps, &tuned, &[r".\tool.exe", "mark", RAN, "out", "ran"]);
+    let dotnet = box_path_with_pc_dotnet(&case, &["8.0.404"], "echo 999.0.100 [C:\\stub]\r\n");
+    gate.env("PATH", &dotnet.path);
+
+    let (pid, outcome) = finish_with_pid(gate);
+
+    assert_eq!(outcome.code, Some(CONTROL_C_EXIT), "{outcome:?}");
+    assert!(!outcome.stderr.contains("gate: cannot read this PC's SDK list"), "{outcome:?}");
+    assert!(!outcome.stderr.contains("gate: remote toolchain mismatch: "), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight"], "nothing after the preflight reached the builder");
+    let events = own(&case, pid);
+    assert_eq!(builder_ref(&case, &format!("refs/gate/{}", key_of(&events))), "", "nothing was pushed");
+    assert_eq!(runs(&case), (0, 0), "the command ran nowhere: {outcome:?}");
+}
+
+/// This PC's `dotnet --list-sdks` runs in the system folder, not the repo root: the `PATH` stub writes the folder it
+/// runs in, first for the builder's call, made in the case folder by the preflight, then for this PC's.
+#[test]
+fn the_pcs_dotnet_runs_in_the_system_folder() {
+    let case = client_case("client-parity-dotnet-folder");
+    write(&case, "src/App/App.csproj", "<Project />\n");
+    let folders = case.folder().join("ssh").join("dotnet-folders");
+    let body = format!(">>\"{}\" echo %CD%\r\n{}", folders.display(), listing(&["999.0.100"]));
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+    let mut gate = client_gate(&case, "out.log", &steps, &[r".\tool.exe", "mark", RAN, "out", "ran there"]);
+    let dotnet = pc_dotnet(&case, &body);
+    gate.env("PATH", &dotnet.path);
+
+    let (_, outcome) = finish_with_pid(gate);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let ran_in = fs::read_to_string(&folders).expect("the stub wrote the folders it ran in");
+    let ran_in: Vec<&str> = ran_in.lines().map(str::trim_end).collect();
+    let want = [case.folder().display().to_string(), system_folder()];
+    assert!(
+        ran_in.len() == want.len() && ran_in.iter().zip(&want).all(|(ran, want)| ran.eq_ignore_ascii_case(want)),
+        "{want:?}, the builder's then this PC's: {ran_in:?}"
     );
 }
 

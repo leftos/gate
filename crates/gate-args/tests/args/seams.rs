@@ -202,6 +202,46 @@ fn remote_seams_need_a_value_once() {
 
 #[cfg(feature = "test-seams")]
 #[test]
+fn the_dotnet_limit_seam_is_read_once_and_refuses_zero() {
+    use crate::support::run_request;
+
+    let words = with(&RUN, &["--test-dotnet-limit-ms", "96", "--", "cmd"]);
+    assert_eq!(run_request(&refs(&words)).test_seams.dotnet_limit_ms, Some(96));
+    assert_eq!(run_request(&refs(&with(&RUN, &["--", "cmd"]))).test_seams.dotnet_limit_ms, None);
+    assert_eq!(
+        problems(&refs(&with(&RUN, &["--test-dotnet-limit-ms=", "--", "cmd"]))),
+        ["gate: --test-dotnet-limit-ms needs a value"]
+    );
+    assert_eq!(
+        problems(&refs(&with(&RUN, &["--test-dotnet-limit-ms", "0", "--", "cmd"]))),
+        ["gate: --test-dotnet-limit-ms must be a whole number above 0, got '0'"]
+    );
+    assert_eq!(
+        problems(&refs(&with(
+            &RUN,
+            &["--test-dotnet-limit-ms", "1", "--test-dotnet-limit-ms", "2", "--", "cmd"]
+        ))),
+        ["gate: --test-dotnet-limit-ms is given twice"]
+    );
+    assert_eq!(
+        problems(&[
+            "-Log",
+            "x",
+            "-TimeoutSeconds",
+            "5",
+            "-Slot",
+            "heavy",
+            "--test-dotnet-limit-ms",
+            "5",
+            "--",
+            "cmd"
+        ]),
+        ["gate: unknown option --test-dotnet-limit-ms", "gate: unexpected argument 5"]
+    );
+}
+
+#[cfg(feature = "test-seams")]
+#[test]
 fn the_servers_under_seam_needs_a_value_once() {
     assert_eq!(
         problems(&refs(&with(&RUN, &["--test-servers-under=", "--", "cmd"]))),
@@ -460,7 +500,7 @@ fn the_remote_client_seams_need_a_value_once() {
         ))),
         ["gate: --test-remote-bound-ms must be a whole number above 0, got '0'"]
     );
-    for call in ["preflight", "run", "outputs", "install"] {
+    for call in ["preflight", "run", "outputs", "install", "sdks"] {
         let words = with(
             &RUN,
             &["--test-remote-transport", "local:b", "--test-remote-interrupt-at", call, "--", "cmd"],
@@ -472,7 +512,7 @@ fn the_remote_client_seams_need_a_value_once() {
             &RUN,
             &["--test-remote-transport", "local:b", "--test-remote-interrupt-at", "push", "--", "cmd"]
         ))),
-        ["gate: --test-remote-interrupt-at must be preflight, run, outputs or install, got 'push'"]
+        ["gate: --test-remote-interrupt-at must be preflight, run, outputs, install or sdks, got 'push'"]
     );
 }
 
@@ -1046,6 +1086,7 @@ fn seam_flags_are_unknown_without_the_feature() {
         "--test-remote-watch-call",
         "--test-remote-timeout-ms",
         "--test-local-sdks",
+        "--test-dotnet-limit-ms",
         "--test-remote-fetch-cap-bytes",
         "--test-remote-apply-cap-bytes",
         "--test-remote-outputs-budget-bytes",

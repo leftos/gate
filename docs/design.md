@@ -796,7 +796,7 @@ The box heartbeat (BW9) is the box wrapper's command-time heartbeat, not the wai
   - a word holding a CR, LF or U+0000;
   - `%NAME%` of a variable set in the command's environment, names compared case-insensitively over all of Unicode and the lookup answering for the exact environment block the command gets;
   - any `%=…%` name (`%=ExitCode%`, `%=C:%`), set or not, since cmd.exe's hidden variables appear in no environment listing;
-  - a dynamic name cmd.exe expands though no variable is set: `%CD%`, `%DATE%`, `%TIME%`, `%RANDOM%`, `%ERRORLEVEL%`, `%CMDCMDLINE%`, `%CMDEXTVERSION%`, `%HIGHESTNUMANODENUMBER%`, `%__CD__%`, `%__APPDIR__%`;
+  - a dynamic name cmd.exe expands though no variable is set: `%CD%`, `%DATE%`, `%TIME%`, `%RANDOM%`, `%ERRORLEVEL%`, `%CMDCMDLINE%`, `%CMDEXTVERSION%`, `%HIGHESTNUMANODENUMBER%`, `%__CD__%`, `%__APPDIR__%`, and `%COMSPEC%`, `%PATHEXT%` and `%PROMPT%`, which cmd.exe sets for itself when the block it is started with lacks them;
   - the substring and substitution forms `%NAME:~a,b%` and `%NAME:a=b%` of a set or dynamic name, and a whole `%NAME:…%` name that is itself set.
 
   A lone `%` and an unset name pass. The gate and the box side share this one implementation.
@@ -992,9 +992,17 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
     This PC's SDKs come from `dotnet --list-sdks`; if that cannot be read the run says `gate: cannot read this PC's SDK list: <why>; checking no SDK major` and checks no major. A snapshot whose file listing passes 16 MiB, or holds a path that is not UTF-8, says `gate: cannot list the snapshot's files: <why>; skipping the toolchain check` (`<why>` the over-cap line, or `a path is not valid UTF-8`), and the run goes remote unchecked.
 
-    **Bounded SDK read** (GATE-135), planned, not built: `dotnet --list-sdks` runs like the client's git calls, in a kill-on-close job with the run's interrupt and a 30 s bound (a test seam, `--test-dotnet-limit-ms`, lowers it), with a neutral working folder (the system temp folder) rather than the repo root; the spawn-and-wait part of `Git::spawned` is one function both use. Without it a `dotnet` that hangs (a broken install, a first-run prompt) holds the routed run with no end.
+    **Bounded SDK read**: `dotnet --list-sdks` runs like the client's git calls, through the same start-and-wait function in `remote/git.rs`: in an anonymous kill-on-close job of its own, on the gate's console, with the run's interrupt and a 30 s bound (the test seam `--test-dotnet-limit-ms` lowers it), its standard output read up to 16 MiB and its standard error dropped. A `dotnet` that hangs (a broken install, a first-run prompt) is killed with its whole job at the bound.
 
-    Past the bound the list counts as unreadable and the run says `gate: cannot read this PC's SDK list: dotnet --list-sdks did not answer in {n} s; checking no SDK major`; a Ctrl+C during the call ends the run as an interrupt, as during git. `dotnet` is found on `PATH` only: `find_program` never searches the working folder for a bare name, and a suite case pins that a `dotnet.cmd` or `dotnet.exe` in the repo root is not run.
+    It runs in the system folder (`GetSystemDirectoryW`), not the repo root nor the temp folder: `TMP`/`TEMP` can point back into the repo and any process of the user can write there, while cmd.exe searches the working folder for each bare command in a `dotnet.cmd`. Its environment also sets `NoDefaultCurrentDirectoryInExePath=1`. A `dotnet.cmd` found on `PATH` runs through the system folder's cmd.exe.
+
+    `dotnet` is found on `PATH` only: `find_program` never searches the working folder for a bare name, and a `PATH` folder inside the worktree is skipped, compared by canonical path so a junction does not get around it (an `npm run` or an activated venv puts repo folders first on `PATH`). The dotnet the run starts sees that `PATH` too. The search on `PATH` is outside the 30 s bound, which starts with dotnet's launch.
+
+    Past the bound the list counts as unreadable and the run says `gate: cannot read this PC's SDK list: dotnet --list-sdks did not answer in 30 s; checking no SDK major` (a bound that is not a whole number of seconds is said in milliseconds, as the git limit is: `in 200 ms`).
+
+    An output past 16 MiB counts as unreadable too (`dotnet --list-sdks wrote more than 16 MiB`), as does a dotnet that cannot be looked for or started, or a system folder that cannot be read (`cannot run dotnet: <why>`), or one that exits non-zero (`dotnet --list-sdks exited with status <n>`).
+
+    A Ctrl+C during the call kills dotnet's job and ends the run as an interrupt, as during git: nothing is pushed, and a read that failed while the interrupt is raised says no `cannot read` line. `--test-remote-interrupt-at sdks` raises the interrupt just before the read.
 
     **Workload parity** (GATE-18), planned, not built: the parity check compares SDK versions only, so a repo that needs a .NET workload the builder lacks (`wasm-tools`) fails on the builder with `NETSDK1147` as the gate's own exit 1 instead of a refusal.
 
@@ -1546,13 +1554,17 @@ A Rust integration suite drives the built `gate.exe` through its CLI and reads o
 
   `--test-local-sdks <comma list|none>` (needs `--test-remote-transport`) replaces the `dotnet --list-sdks` read of the parity check with a list of versions separated by commas, or `none` for no SDK.
 
-  `--test-remote-bound-ms <n>` (whole milliseconds above 0) replaces the 30 s bound of the client's `stop` and `boot` calls. `--test-remote-interrupt-at <preflight|run|outputs|install>` makes the client raise the console interrupt itself after that call's first output byte; `install` raises it before the second file's move, so an install of one file is never interrupted. `--test-remote-timeout-ms <n>` (whole milliseconds above 0) replaces the run's ceiling for the client.
+  `--test-dotnet-limit-ms <n>` (whole milliseconds above 0, on `gate run` only; refused given twice) replaces the 30 s bound of the parity check's `dotnet --list-sdks` read.
+
+  `--test-remote-bound-ms <n>` (whole milliseconds above 0) replaces the 30 s bound of the client's `stop` and `boot` calls.
+
+  `--test-remote-interrupt-at <preflight|run|outputs|install|sdks>` makes the client raise the console interrupt itself after that call's first output byte; `install` raises it before the second file's move, so an install of one file is never interrupted, and `sdks` just before the parity check reads this PC's SDK list with `dotnet --list-sdks`. `--test-remote-timeout-ms <n>` (whole milliseconds above 0) replaces the run's ceiling for the client.
 
   `--test-remote-watch-call <preflight|push|run|ls-remote|fetch|outputs>` makes `--test-stall-ms` and `--test-remote-timeout-ms` apply to that one call alone, its ceiling counted from the call's own start, every other call keeping the run's own window and ceiling.
 
   With `ls-remote`, `--test-remote-timeout-ms` is that call's deadline and `--test-stall-ms` alone leaves it on the git limit. With `fetch`, the stall and ceiling seams apply to the fetch alone; with `outputs`, to the outputs fetch alone.
 
-  A value outside a seam's calls says `gate: --test-remote-watch-call must be preflight, push, run, ls-remote, fetch or outputs, got '<v>'`, and `--test-remote-interrupt-at` says `must be preflight, run, outputs or install`. The four need the transport; `--test-print-request` shows them as `testSeams.remoteBoundMs`, `remoteInterruptAt`, `remoteWatchCall` and `remoteTimeoutMs`, after `remoteRetryPauseMs`.
+  A value outside a seam's calls says `gate: --test-remote-watch-call must be preflight, push, run, ls-remote, fetch or outputs, got '<v>'`, and `--test-remote-interrupt-at` says `must be preflight, run, outputs, install or sdks`. The four need the transport; `--test-print-request` shows them as `testSeams.remoteBoundMs`, `remoteInterruptAt`, `remoteWatchCall` and `remoteTimeoutMs`, after `remoteRetryPauseMs`.
 
   `--test-remote-fetch-cap-bytes <n>` (a whole number of bytes above 0, default 4 GiB) replaces the cap on what the sync-back fetch's job may write. Refused without the transport with `gate: --test-remote-fetch-cap-bytes needs --test-remote-transport`, and a value that is not a whole number above 0 with `gate: --test-remote-fetch-cap-bytes must be a whole number above 0, got '<v>'`. `--test-print-request` does not show it.
 

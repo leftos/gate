@@ -8,8 +8,12 @@ use crate::cmdline::{QUOTE, SPACE, is_plain, quote_arg, wide, wrapped};
 /// What cmd.exe reads as its own syntax or splits a batch file's parameters at.
 const CMD_SPECIALS: [char; 10] = ['&', '|', '<', '>', '^', '(', ')', ',', ';', '='];
 
-/// The names cmd.exe expands though no variable of that name is set.
-const DYNAMIC_NAMES: [&str; 10] = [
+/// The names cmd.exe expands though no variable of that name is set: its dynamic names, and `COMSPEC`, `PATHEXT` and
+/// `PROMPT`, which it sets for itself when the block it is started with lacks them.
+const DYNAMIC_NAMES: [&str; 13] = [
+    "COMSPEC",
+    "PATHEXT",
+    "PROMPT",
     "CD",
     "DATE",
     "TIME",
@@ -93,7 +97,7 @@ impl fmt::Display for BatchRefusal {
 ///
 /// That is a word holding a CR, an LF or a U+0000, or a `%…%` pair whose name cmd.exe expands: a name starting with
 /// `=` (cmd's hidden `=ExitCode`, `=C:` variables, which no environment listing shows), a name `is_set` answers for, a
-/// dynamic name cmd.exe expands unset (`%CD%`, `%RANDOM%`, ...), or the `%NAME:~a,b%` or `%NAME:a=b%` form of a set or
+/// name cmd.exe expands unset (`%CD%`, `%RANDOM%`, `%PROMPT%`, ...), or the `%NAME:~a,b%` or `%NAME:a=b%` form of a set or
 /// dynamic `NAME` (both the whole name and the part before its first `:` are looked up). A lone `%` and an unset name
 /// pass. An unset `%A%` stays as written and its closing `%` can open the next name, so the scan resumes there: `%A%B%`
 /// with `A` unset and `B` set is refused.

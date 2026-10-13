@@ -1,7 +1,8 @@
 //! git as the routing decision and the remote client run it: the executable found once along the gate's own `PATH`,
 //! asked about one folder alone, started suspended in an anonymous kill-on-close job of its own on this process's
 //! console or a hidden one of its own, its output read from pipes by a thread per stream, and ended with its whole job
-//! after a time limit or by the console interrupt.
+//! after a time limit or by the console interrupt. Another program the client asks, this PC's `dotnet --list-sdks`, is
+//! started, bounded and ended the same way ([`output_of`]).
 
 use std::ffi::OsStr;
 use std::fs::{File, OpenOptions};
@@ -17,7 +18,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use gate_args::TestSeams;
-use gate_win32::{Interrupt, Job, PipedConsole, Running};
+use gate_win32::{Interrupt, Job, PipedConsole, PipedLaunch, Running};
 
 use super::launch::{DRAIN, KILL_WAIT, KILLED, call_job, launched, piped_launch};
 use crate::boxside::payload::escaped;
@@ -135,7 +136,6 @@ impl Git {
             file.seek(SeekFrom::Start(0))?;
             Ok(file)
         };
-        let dropped = |mut pipe: File| io::copy(&mut pipe, &mut io::sink()).map(drop);
         let (status, stdout, ()) = self.spawned(call, into_file, dropped, None)?;
         Ok(Ran { status, stdout })
     }
@@ -163,18 +163,7 @@ impl Git {
     /// [`Git::output_bytes`] with standard output read up to `cap` bytes and the last `kept` bytes of standard error
     /// kept: a call that writes more than `cap` is ended as soon as its reader sees it, and is an over-cap call.
     fn output_within(&self, call: &Call<'_>, cap: usize, kept: usize) -> Result<Vec<u8>, GitError> {
-        let over = Over {
-            seen: Arc::new(AtomicBool::new(false)),
-            line: over_line(call, cap),
-        };
-        let seen = Arc::clone(&over.seen);
-        let read_capped = move |pipe: File| {
-            let held = capped(pipe, cap)?;
-            if held.is_none() {
-                seen.store(true, Ordering::Release);
-            }
-            Ok(held)
-        };
+        let (over, read_capped) = capped_reader(cap, over_line(call, cap));
         let (status, output, errors) = self.spawned(call, read_capped, move |pipe: File| tail(pipe, kept), Some(&over))?;
         let Some(output) = output else {
             return Err(GitError::OverCap(over.line));
@@ -201,13 +190,7 @@ impl Git {
         command
     }
 
-    /// Runs git with `call`'s args and variables, created suspended on the console `call` names with no standard input,
-    /// or with `call`'s input fed by a thread of its own and then closed, and put in an anonymous kill-on-close job of
-    /// its own before it runs; a thread per stream reads its standard output with `stdout` and its standard error with
-    /// `stderr`, and what they read is returned with its exit status once it has exited. Whatever git left running then
-    /// is ended with its job. A call made while the console interrupt is already raised starts no process; one whose
-    /// wait ends otherwise than in git's exit (it outlived its limit, was interrupted, wrote more than `over` allows, or
-    /// could not be waited for) has its whole job ended.
+    /// Runs git with `call`'s args and variables on the console `call` names, through [`bounded`].
     fn spawned<O, E>(
         &self,
         call: &Call<'_>,
@@ -219,71 +202,132 @@ impl Git {
         O: Send + 'static,
         E: Send + 'static,
     {
-        if call.interrupt.is_some_and(Interrupt::is_raised) {
-            return Err(GitError::Interrupted);
-        }
         let mut command = self.command(call.folder);
         for name in call.unset {
             command.env_remove(*name);
         }
         command.envs(call.set.iter().copied()).args(call.args);
-        let deadline = Instant::now() + call.limit;
-        let cannot_run = |error: &dyn std::fmt::Display| GitError::Failed(format!("cannot run git: {error}"));
-        let job = call_job(false).map_err(|error| cannot_run(&error))?;
-        let launch = piped_launch(&command, call.console).map_err(|error| cannot_run(&error))?;
-        let (suspended, out_pipe, err_pipe, in_pipe) = launched(&launch, &job, call.stdin.is_some()).map_err(|error| cannot_run(&error))?;
-        let running = suspended.assign_and_resume(&job).map_err(|error| cannot_run(&error))?;
-        let output = reading(out_pipe, stdout);
-        let errors = reading(err_pipe, stderr);
-        // The feed writes on a thread of its own so this thread keeps watching the limit, the interrupt and the output
-        // cap: a git that stops reading its input would block the write forever, and its limit would never fire.
-        let fed = in_pipe.zip(call.stdin).map(|(pipe, bytes)| {
-            let bytes = bytes.to_vec();
-            reading(pipe, move |mut pipe: File| pipe.write_all(&bytes))
-        });
-        let code = match waited(&running, &job, call, over, deadline) {
-            Ok(code) => code,
-            Err(error) => {
-                // Whatever ended the wait, the job is ended now, so the readers reach their pipes' ends; what they
-                // read is no longer needed, and they are given a short while to end before they are left to it.
-                let error = with_job_ended(error, &job);
-                let until = Instant::now() + call.drain;
-                drop((received(&output, until), received(&errors, until)));
-                return Err(error);
-            }
+        let spawn = Spawn {
+            name: "git",
+            late: late_git_line(call.limit),
+            launch: piped_launch(&command, call.console),
         };
-        // git has exited; whatever it left running, which would hold its pipes open, ends with the job, and the
-        // readers then reach their pipes' ends within a short while.
-        drop(job);
-        let until = Instant::now() + call.drain;
-        let unread = || {
-            GitError::Failed(format!(
-                "cannot read git's output: it did not end within {} s of git's exit",
-                call.drain.as_secs()
-            ))
-        };
-        let output = received(&output, until).ok_or_else(unread)?;
-        let errors = received(&errors, until).ok_or_else(unread)?;
-        let cannot_read = |error: io::Error| GitError::Failed(format!("cannot read git's output: {error}"));
-        let status = ExitStatus::from_raw(code);
-        fed_whole(fed.as_ref(), status, until, call.drain)?;
-        Ok((status, output.map_err(cannot_read)?, errors.map_err(cannot_read)?))
+        bounded(&spawn, call, stdout, stderr, over)
     }
 }
 
-/// Whether git, which exited with `status`, was fed its whole input by `fed`, waited for until `until`: a git that
-/// failed says why in its own lines, so a feed it cut short by exiting is no failure of its own, and a call with no
-/// input has nothing to check. A git that succeeded while its feed failed, or whose feed did not end within the call's
-/// `drain`, fails the call.
-fn fed_whole(fed: Option<&Receiver<io::Result<()>>>, status: ExitStatus, until: Instant, drain: Duration) -> Result<(), GitError> {
+/// A process a bounded call starts: the name its failure lines call it by, the line it is killed under once it outlives
+/// its call's limit, and its launch, or why none could be made.
+pub(crate) struct Spawn<'a> {
+    pub name: &'a str,
+    pub late: String,
+    pub launch: io::Result<PipedLaunch>,
+}
+
+/// Runs `spawn`'s process as `call` bounds it, as [`Git::output_bytes`] runs git: its exit status and what it wrote on
+/// standard output, read up to [`OUTPUT_CAP`], its standard error read and dropped. One that writes more is ended as
+/// soon as its reader sees it, and the call is [`GitError::OverCap`] with the line `over`.
+#[cfg_attr(
+    not(feature = "test-seams"),
+    expect(
+        dead_code,
+        reason = "only the remote client reads this PC's SDK list this way, and a gate without the test seams has none"
+    )
+)]
+pub(crate) fn output_of(spawn: &Spawn<'_>, call: &Call<'_>, over: String) -> Result<(ExitStatus, Vec<u8>), GitError> {
+    let (over, read_capped) = capped_reader(OUTPUT_CAP, over);
+    let (status, output, ()) = bounded(spawn, call, read_capped, dropped, Some(&over))?;
+    let Some(output) = output else {
+        return Err(GitError::OverCap(over.line));
+    };
+    Ok((status, output))
+}
+
+/// Runs `spawn`'s process, created suspended with no standard input, or with `call`'s input fed by a thread of its own
+/// and then closed, and put in an anonymous kill-on-close job of its own before it runs; a thread per stream reads its
+/// standard output with `stdout` and its standard error with `stderr`, and what they read is returned with its exit
+/// status once it has exited. Whatever it left running then is ended with its job. A call made while the console
+/// interrupt is already raised starts no process; one whose wait ends otherwise than in the process's exit (it outlived
+/// `call`'s limit, was interrupted, wrote more than `over` allows, or could not be waited for) has its whole job ended.
+fn bounded<O, E>(
+    spawn: &Spawn<'_>,
+    call: &Call<'_>,
+    stdout: impl FnOnce(File) -> io::Result<O> + Send + 'static,
+    stderr: impl FnOnce(File) -> io::Result<E> + Send + 'static,
+    over: Option<&Over>,
+) -> Result<(ExitStatus, O, E), GitError>
+where
+    O: Send + 'static,
+    E: Send + 'static,
+{
+    if call.interrupt.is_some_and(Interrupt::is_raised) {
+        return Err(GitError::Interrupted);
+    }
+    let name = spawn.name;
+    let stops = Stops {
+        deadline: Instant::now() + call.limit,
+        over,
+    };
+    let cannot_run = |error: &dyn std::fmt::Display| GitError::Failed(format!("cannot run {name}: {error}"));
+    let job = call_job(false).map_err(|error| cannot_run(&error))?;
+    let launch = spawn.launch.as_ref().map_err(|error| cannot_run(error))?;
+    let (suspended, out_pipe, err_pipe, in_pipe) = launched(launch, &job, call.stdin.is_some()).map_err(|error| cannot_run(&error))?;
+    let running = suspended.assign_and_resume(&job).map_err(|error| cannot_run(&error))?;
+    let output = reading(out_pipe, stdout);
+    let errors = reading(err_pipe, stderr);
+    // The feed writes on a thread of its own so this thread keeps watching the limit, the interrupt and the output
+    // cap: a process that stops reading its input would block the write forever, and its limit would never fire.
+    let fed = in_pipe.zip(call.stdin).map(|(pipe, bytes)| {
+        let bytes = bytes.to_vec();
+        reading(pipe, move |mut pipe: File| pipe.write_all(&bytes))
+    });
+    let code = match waited(&running, &job, spawn, call, &stops) {
+        Ok(code) => code,
+        Err(error) => {
+            // Whatever ended the wait, the job is ended now, so the readers reach their pipes' ends; what they
+            // read is no longer needed, and they are given a short while to end before they are left to it.
+            let error = with_job_ended(error, &job, name);
+            let until = Instant::now() + call.drain;
+            drop((received(&output, until), received(&errors, until)));
+            return Err(error);
+        }
+    };
+    // The process has exited; whatever it left running, which would hold its pipes open, ends with the job, and the
+    // readers then reach their pipes' ends within a short while.
+    drop(job);
+    let until = Instant::now() + call.drain;
+    let unread = || {
+        GitError::Failed(format!(
+            "cannot read {name}'s output: it did not end within {} s of {name}'s exit",
+            call.drain.as_secs()
+        ))
+    };
+    let output = received(&output, until).ok_or_else(unread)?;
+    let errors = received(&errors, until).ok_or_else(unread)?;
+    let cannot_read = |error: io::Error| GitError::Failed(format!("cannot read {name}'s output: {error}"));
+    let status = ExitStatus::from_raw(code);
+    fed_whole(fed.as_ref(), status, until, call.drain, name)?;
+    Ok((status, output.map_err(cannot_read)?, errors.map_err(cannot_read)?))
+}
+
+/// Reads `pipe` to its end and drops what it read: the standard error of a call that reads none of it.
+fn dropped(mut pipe: File) -> io::Result<()> {
+    io::copy(&mut pipe, &mut io::sink()).map(drop)
+}
+
+/// Whether the process `name`, which exited with `status`, was fed its whole input by `fed`, waited for until `until`:
+/// one that failed says why in its own lines, so a feed it cut short by exiting is no failure of its own, and a call
+/// with no input has nothing to check. One that succeeded while its feed failed, or whose feed did not end within the
+/// call's `drain`, fails the call.
+fn fed_whole(fed: Option<&Receiver<io::Result<()>>>, status: ExitStatus, until: Instant, drain: Duration, name: &str) -> Result<(), GitError> {
     let Some(fed) = fed.filter(|_| status.success()) else {
         return Ok(());
     };
     match received(fed, until) {
         Some(Ok(())) => Ok(()),
-        Some(Err(error)) => Err(GitError::Failed(format!("cannot feed git its input: {error}"))),
+        Some(Err(error)) => Err(GitError::Failed(format!("cannot feed {name} its input: {error}"))),
         None => Err(GitError::Failed(format!(
-            "cannot feed git its input: it did not end within {} s of git's exit",
+            "cannot feed {name} its input: it did not end within {} s of {name}'s exit",
             drain.as_secs()
         ))),
     }
@@ -293,6 +337,30 @@ fn fed_whole(fed: Option<&Receiver<io::Result<()>>>, status: ExitStatus, until: 
 struct Over {
     seen: Arc<AtomicBool>,
     line: String,
+}
+
+/// A reader of standard output that reads up to `cap` bytes, and the [`Over`] it tells when it saw more, which fails
+/// with `line`.
+fn capped_reader(cap: usize, line: String) -> (Over, impl FnOnce(File) -> io::Result<Option<Vec<u8>>> + Send + 'static) {
+    let over = Over {
+        seen: Arc::new(AtomicBool::new(false)),
+        line,
+    };
+    let seen = Arc::clone(&over.seen);
+    let read_capped = move |pipe: File| {
+        let held = capped(pipe, cap)?;
+        if held.is_none() {
+            seen.store(true, Ordering::Release);
+        }
+        Ok(held)
+    };
+    (over, read_capped)
+}
+
+/// What ends a running call's wait besides its exit: its deadline, and its reader seeing more output than its cap.
+struct Stops<'s> {
+    deadline: Instant,
+    over: Option<&'s Over>,
 }
 
 /// Reads `pipe` with `read` on a thread of its own; its result arrives on the channel returned.
@@ -449,35 +517,37 @@ fn is_indexed_config(name: &str) -> bool {
         .any(|prefix| name.get(..prefix.len()).is_some_and(|start| start.eq_ignore_ascii_case(prefix)) && name.len() > prefix.len())
 }
 
-/// git's exit code once it ends, or [`GitError::Interrupted`] when that is a Ctrl+C's with the console interrupt
-/// raised. Past `deadline` its job is ended and the call fails; once its reader saw more of its output than `over`
-/// allows, its job is ended and the call is an over-cap call, whether git had ended of it or not; a console interrupt
-/// raised while it runs ends its job as [`GitError::Interrupted`].
-fn waited(running: &Running, job: &Job, call: &Call<'_>, over: Option<&Over>, deadline: Instant) -> Result<u32, GitError> {
+/// The exit code of `spawn`'s process once it ends, or [`GitError::Interrupted`] when that is a Ctrl+C's with the
+/// console interrupt raised. Past the deadline of `stops` its job is ended and the call fails with `spawn`'s late line;
+/// once its reader saw more of its output than the cap of `stops` allows, its job is ended and the call is an over-cap
+/// call, whether the process had ended of it or not; a console interrupt raised while it runs ends its job as
+/// [`GitError::Interrupted`].
+fn waited(running: &Running, job: &Job, spawn: &Spawn<'_>, call: &Call<'_>, stops: &Stops<'_>) -> Result<u32, GitError> {
+    let name = spawn.name;
     loop {
         if call.interrupt.is_some_and(Interrupt::is_raised) {
             return Err(match ended(running, job) {
                 Ok(()) => GitError::Interrupted,
-                Err(error) => GitError::Failed(format!("the run was interrupted, and git could not be stopped: {error}")),
+                Err(error) => GitError::Failed(format!("the run was interrupted, and {name} could not be stopped: {error}")),
             });
         }
-        if let Some(over) = over.filter(|over| over.seen.load(Ordering::Acquire)) {
+        if let Some(over) = stops.over.filter(|over| over.seen.load(Ordering::Acquire)) {
             return Err(stopped(over.line.clone(), GitError::OverCap, running, job));
         }
         if let Some(code) = running
             .wait(GIT_POLL)
-            .map_err(|error| GitError::Failed(format!("cannot wait for git: {error}")))?
+            .map_err(|error| GitError::Failed(format!("cannot wait for {name}: {error}")))?
         {
             return exited(code, call);
         }
-        if Instant::now() >= deadline {
-            return Err(stopped(late_git_line(call.limit), GitError::Failed, running, job));
+        if Instant::now() >= stops.deadline {
+            return Err(stopped(spawn.late.clone(), GitError::Failed, running, job));
         }
     }
 }
 
-/// git's exit `code`, or [`GitError::Interrupted`] when git exited of a Ctrl+C and the console interrupt is raised by
-/// now: a Ctrl+C reaches git as it reaches the gate, so git may exit of it before the wait saw the interrupt.
+/// The process's exit `code`, or [`GitError::Interrupted`] when it exited of a Ctrl+C and the console interrupt is
+/// raised by now: a Ctrl+C reaches it as it reaches the gate, so it may exit of it before the wait saw the interrupt.
 fn exited(code: u32, call: &Call<'_>) -> Result<u32, GitError> {
     if code == CONTROL_C_EXIT && call.interrupt.is_some_and(Interrupt::is_raised) {
         Err(GitError::Interrupted)
@@ -486,12 +556,12 @@ fn exited(code: u32, call: &Call<'_>) -> Result<u32, GitError> {
     }
 }
 
-/// `error`, the end of a call whose wait did not end in git's exit, once git's whole job is ended, so nothing of it
-/// keeps running or holds its pipes open; with why the job could not be ended when it could not.
-fn with_job_ended(error: GitError, job: &Job) -> GitError {
+/// `error`, the end of a call whose wait did not end in the exit of its process `name`, once its whole job is ended,
+/// so nothing of it keeps running or holds its pipes open; with why the job could not be ended when it could not.
+fn with_job_ended(error: GitError, job: &Job, name: &str) -> GitError {
     match job.terminate(KILLED.cast_unsigned()) {
         Ok(()) => error,
-        Err(kill) => GitError::Failed(format!("{}, and git could not be stopped: {kill}", String::from(error))),
+        Err(kill) => GitError::Failed(format!("{}, and {name} could not be stopped: {kill}", String::from(error))),
     }
 }
 
@@ -505,7 +575,7 @@ fn stopped(why: String, end: fn(String) -> GitError, running: &Running, job: &Jo
     }
 }
 
-/// Ends every process of git's job and waits [`KILL_WAIT`] for git itself to exit; else why it could not.
+/// Ends every process of a call's job and waits [`KILL_WAIT`] for its own process to exit; else why it could not.
 fn ended(running: &Running, job: &Job) -> Result<(), String> {
     job.terminate(KILLED.cast_unsigned()).map_err(|error| error.to_string())?;
     match running.wait(KILL_WAIT) {
@@ -515,12 +585,17 @@ fn ended(running: &Running, job: &Job) -> Result<(), String> {
     }
 }
 
-/// The line a git that outlived `limit` is killed under: the limit in whole seconds when it is a whole number of
-/// seconds, else in whole milliseconds.
+/// The line a git that outlived `limit` is killed under, the limit as [`spelled_limit`] says it.
 fn late_git_line(limit: Duration) -> String {
+    format!("git did not answer within {}", spelled_limit(limit))
+}
+
+/// A call's `limit` as its late line says it: in whole seconds when it is a whole number of seconds, else in whole
+/// milliseconds.
+pub(crate) fn spelled_limit(limit: Duration) -> String {
     match limit.as_millis() % 1000 {
-        0 => format!("git did not answer within {} s", limit.as_secs()),
-        _ => format!("git did not answer within {} ms", limit.as_millis()),
+        0 => format!("{} s", limit.as_secs()),
+        _ => format!("{} ms", limit.as_millis()),
     }
 }
 
