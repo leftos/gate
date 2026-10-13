@@ -128,7 +128,6 @@ pub(crate) fn run_word(location: &Location, run: &RunCall<'_>) -> String {
 
 /// The payload word of the inflight probe, which asks a builder how many of its work folders a run holds: the `Root`
 /// its work folders live under, which is all the probe reads.
-#[cfg_attr(not(test), expect(dead_code, reason = "only its unit test calls it"))]
 pub(crate) fn inflight_word(root: &str) -> String {
     let mut object = Map::new();
     object.insert("Root".to_owned(), Value::String(root.to_owned()));

@@ -30,6 +30,7 @@ mod pause;
 mod priority;
 mod push;
 mod remote_client;
+mod remote_cutover;
 mod request;
 mod routing;
 mod slots;

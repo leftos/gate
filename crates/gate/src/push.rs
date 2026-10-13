@@ -17,7 +17,7 @@ use std::time::Duration;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use gate_args::PushRequest;
-use gate_win32::{EnvironmentBlock, Job, LaunchError, PipedConsole, PipedFed, PipedLaunch};
+use gate_win32::{EnvironmentBlock, Interrupt, Job, LaunchError, PipedConsole, PipedFed, PipedLaunch, Running, Waited};
 use regex::Regex;
 use sha2::{Digest, Sha256};
 
@@ -115,6 +115,7 @@ pub(crate) fn push(request: &PushRequest, environment: &Environment, console: &m
                 input: input.as_bytes(),
                 variables: &variables,
                 bound,
+                interrupt: None,
             }),
             Err(why) => Heard::failed(why.clone()),
         };
@@ -192,10 +193,11 @@ fn local_version(exe: &Path, variables: &[(OsString, OsString)]) -> Result<Strin
         input: b"",
         variables,
         bound: VERSION_BOUND,
+        interrupt: None,
     });
     let version = match heard.end {
         End::Exited(_) => heard.first.as_deref().and_then(version_of),
-        End::TimedOut | End::Failed(_) => None,
+        End::TimedOut | End::Interrupted | End::Failed(_) => None,
     };
     version.ok_or_else(|| format!("push: could not read the version of {}", exe.display()))
 }
@@ -232,22 +234,26 @@ fn encoded_line(script: &str) -> String {
     format!("{PWSH}{}", STANDARD.encode(wide))
 }
 
-/// One call: the program, its words, what it is fed on stdin, its whole environment, and how long it may take.
-struct Call<'a> {
-    program: &'a Path,
-    args: Vec<OsString>,
-    input: &'a [u8],
-    variables: &'a [(OsString, OsString)],
-    bound: Duration,
+/// One call: the program, its words, what it is fed on stdin, its whole environment, how long it may take, and the
+/// console interrupt that ends it early; `None` waits out the call or its bound.
+pub(crate) struct Call<'a> {
+    pub(crate) program: &'a Path,
+    pub(crate) args: Vec<OsString>,
+    pub(crate) input: &'a [u8],
+    pub(crate) variables: &'a [(OsString, OsString)],
+    pub(crate) bound: Duration,
+    pub(crate) interrupt: Option<Interrupt>,
 }
 
 /// How a call ended.
 #[derive(Debug, PartialEq, Eq)]
-enum End {
+pub(crate) enum End {
     /// It exited with this status.
     Exited(u32),
     /// The bound ended it.
     TimedOut,
+    /// The console was interrupted while it ran, which ended it.
+    Interrupted,
     /// It could not be made or waited for, for this reason.
     Failed(String),
 }
@@ -256,9 +262,9 @@ enum End {
 /// lines, the last in the last place, its last standard error line that is not blank, and the first problem feeding or
 /// reading it. Every line is cut to [`LINE_CAP`] bytes.
 #[derive(Debug)]
-struct Heard {
-    end: End,
-    first: Option<String>,
+pub(crate) struct Heard {
+    pub(crate) end: End,
+    pub(crate) first: Option<String>,
     marked: Vec<String>,
     last_error: Option<String>,
     problem: Option<String>,
@@ -278,8 +284,8 @@ impl Heard {
 }
 
 /// Makes `call` in an anonymous job that ends every process in it once the call ends: its stdin fed, its two streams
-/// read, and the whole job ended at the bound.
-fn called(call: &Call<'_>) -> Heard {
+/// read, and the whole job ended at the bound or the interrupt.
+pub(crate) fn called(call: &Call<'_>) -> Heard {
     started(call).unwrap_or_else(Heard::failed)
 }
 
@@ -301,11 +307,7 @@ fn started(call: &Call<'_>) -> Result<Heard, String> {
         let fed = scope.spawn(|| fed(stdin, call.input));
         let out = scope.spawn(|| kept(stdout));
         let err = scope.spawn(|| kept(stderr));
-        let end = match running.wait(call.bound) {
-            Ok(Some(status)) => End::Exited(status),
-            Ok(None) => End::TimedOut,
-            Err(error) => End::Failed(format!("cannot wait for {shown}: {error}")),
-        };
+        let end = waited(&running, call.bound, call.interrupt, &shown);
         // Closing the job's one handle ends every process left in it, so no pipe stays open past here.
         drop(job);
         let out = joined(out.join());
@@ -319,6 +321,25 @@ fn started(call: &Call<'_>) -> Result<Heard, String> {
             problem: fed_problem.or(out.problem).or(err.problem),
         })
     })
+}
+
+/// How the call `running`, shown as `shown`, ended: within `bound`, or at `interrupt` when it is given, whose wait wakes
+/// the moment it is raised; a call that has exited wins over an interrupt raised at the same time.
+fn waited(running: &Running, bound: Duration, interrupt: Option<Interrupt>, shown: &str) -> End {
+    let cannot = |error: io::Error| End::Failed(format!("cannot wait for {shown}: {error}"));
+    match interrupt {
+        Some(interrupt) => match running.wait_or_interrupt(bound, interrupt) {
+            Ok(Waited::Exited(status)) => End::Exited(status),
+            Ok(Waited::Interrupted) => End::Interrupted,
+            Ok(Waited::Running) => End::TimedOut,
+            Err(error) => cannot(error),
+        },
+        None => match running.wait(bound) {
+            Ok(Some(status)) => End::Exited(status),
+            Ok(None) => End::TimedOut,
+            Err(error) => cannot(error),
+        },
+    }
 }
 
 /// The launch of `call` on a hidden console of its own, in the working folder.
@@ -464,6 +485,7 @@ fn said(host: &str, version: &str, heard: &Heard, bound: Duration) -> Said {
 fn ended(host: &str, version: &str, heard: &Heard, facts: &[Fact], bound: Duration) -> Result<Vec<String>, String> {
     let status = match &heard.end {
         End::TimedOut => return Err(format!("timed out after {} s", bound.as_millis().div_ceil(1000))),
+        End::Interrupted => return Err("interrupted".to_owned()),
         End::Failed(why) => return Err(why.clone()),
         End::Exited(status) => *status,
     };
@@ -777,6 +799,7 @@ mod tests {
             input: input.as_bytes(),
             variables: &variables,
             bound: BOUND,
+            interrupt: None,
         })
     }
 
@@ -792,6 +815,7 @@ mod tests {
             input: b"",
             variables: &variables,
             bound: BOUND,
+            interrupt: None,
         });
         assert_eq!(heard.end, End::Exited(1), "{heard:?}");
         let last = heard.last_error.expect("the error reaches stderr");

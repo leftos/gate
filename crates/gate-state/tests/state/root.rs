@@ -118,6 +118,7 @@ fn claim_files_drop_local_and_the_root_hash() {
         KernelObject::Job { gate_pid: 4242 },
         KernelObject::Log { hash: 1 },
         KernelObject::Routed { hash: 1 },
+        KernelObject::RemoteCutover,
     ] {
         assert_eq!(object.claim_file_name(), None, "{object:?} has no claim");
     }
@@ -173,6 +174,11 @@ fn object_names_match_the_design_table() {
             KernelObject::Routed { hash: 0xab },
             r"Local\gate-routed-00000000000000ab",
             r"Local\gate-7ef6faae-routed-00000000000000ab",
+        ),
+        (
+            KernelObject::RemoteCutover,
+            r"Local\gate-remote-cutover",
+            r"Local\gate-7ef6faae-remote-cutover",
         ),
     ];
 

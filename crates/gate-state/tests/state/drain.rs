@@ -209,12 +209,15 @@ fn an_empty_or_missing_folder_has_no_gates() {
 /// The remote pool's size the routed tests probe.
 const REMOTE_COUNT: u32 = 3;
 
-/// A held remote slot with no live claim: a gate whose pid is not known.
-const UNKNOWN: RemoteGate = RemoteGate {
-    pid: None,
-    command: None,
-    since: None,
-};
+/// The held remote slot `slot` with no live claim: a gate whose pid is not known.
+fn unknown(slot: u32) -> RemoteGate {
+    RemoteGate {
+        pid: None,
+        command: None,
+        since: None,
+        slot: Some(slot),
+    }
+}
 
 /// The machine's default state root, `gate\v1`, judged against itself, so its kernel objects carry the PowerShell
 /// gate's names.
@@ -238,6 +241,7 @@ fn known(pid: u32, command: Option<&str>, since: Timestamp) -> RemoteGate {
         pid: Some(pid),
         command: command.map(str::to_owned),
         since: Some(since),
+        slot: None,
     }
 }
 
@@ -339,7 +343,7 @@ fn an_open_remote_slot_with_no_claim_is_a_live_gate() {
 
     assert_eq!(
         routed(&machine),
-        found(vec![UNKNOWN, UNKNOWN], Vec::new()),
+        found(vec![unknown(0), unknown(2)], Vec::new()),
         "slot 0's gate has deleted its ticket and not written its claim yet; slot 2's claim names a gone pid that started \
          before the snapshot's latest process, so its holder is another gate"
     );
@@ -425,7 +429,7 @@ fn a_non_default_roots_held_remote_slot_is_probed_by_its_hashed_name() {
     };
     let routed = remote_gates(at, None, REMOTE_COUNT, &machine, &probe);
 
-    assert_eq!(routed, found(vec![UNKNOWN], Vec::new()), "the held slot under the root's own name");
+    assert_eq!(routed, found(vec![unknown(1)], Vec::new()), "the held slot under the root's own name");
     assert_eq!(
         probe.asked.into_inner(),
         [name(0), name(1), name(2)],
@@ -488,7 +492,7 @@ fn a_dead_claim_past_the_count_with_its_mutex_open_is_one_unknown_gate() {
 
     assert_eq!(
         routed(&machine),
-        found(vec![UNKNOWN], Vec::new()),
+        found(vec![unknown(5)], Vec::new()),
         "slot 5 is past the count of 3 but a claim names it, so its mutex is probed; the claim's gate is gone"
     );
 }

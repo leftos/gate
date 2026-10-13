@@ -167,6 +167,9 @@ pub struct RemoteGate {
     /// When the gate took its remote slot, the claim's `started` (its `processStart` when it has none), or when it
     /// arrived, the ticket's `arrived`; `None` for a held remote slot with no live claim.
     pub since: Option<Timestamp>,
+    /// The index of a held remote slot with no live claim, by which it is told from another; `None` for a claim or a
+    /// ticket, whose gate's pid is known.
+    pub slot: Option<u32>,
 }
 
 /// The routed gates [`remote_gates`] found.
@@ -372,6 +375,7 @@ impl RemoteGates {
                     pid: None,
                     command: None,
                     since: None,
+                    slot: Some(index),
                 }),
                 _ => {}
             }
@@ -411,6 +415,7 @@ fn claimed(claim: &ReadableClaim) -> RemoteGate {
         pid: Some(claim.pid),
         command: claim_command(claim),
         since: Some(claim_since(claim)),
+        slot: None,
     }
 }
 
@@ -420,6 +425,7 @@ fn ticket_gate(pid: u32, since: Timestamp) -> RemoteGate {
         pid: Some(pid),
         command: None,
         since: Some(since),
+        slot: None,
     }
 }
 

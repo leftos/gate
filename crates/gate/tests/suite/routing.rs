@@ -535,7 +535,7 @@ fn a_ctrl_c_during_the_drain_wait_ends_before_the_command() {
 
 /// Sends a Ctrl+C to the console of the process `pid` from a pwsh that leaves its own console, attaches to that one and
 /// ignores the Ctrl+C itself; what pwsh said and its status.
-fn send_ctrl_c_to_the_console_of(pid: u32) -> Output {
+pub(crate) fn send_ctrl_c_to_the_console_of(pid: u32) -> Output {
     let script = format!(
         "Add-Type -Namespace GateSuite -Name Attach -MemberDefinition @'\n\
          [DllImport(\"kernel32.dll\", SetLastError = true)] public static extern bool FreeConsole();\n\

@@ -13,7 +13,7 @@ mod key;
 mod like;
 mod rewrite;
 
-pub use config::{Config, ConfigProblem, DEFAULT_OUTPUTS, ignored_line, is_usable_host};
+pub use config::{Config, ConfigProblem, DEFAULT_OUTPUTS, MAX_SLOTS, ignored_line, is_usable_host};
 pub use decide::{
     BuildSettings, BuildTarget, DROPPED_NO_BUILD_LINE, DotnetTarget, Facts, Inputs, LocalReason, NO_OUTPUTS_LINE, PROJECT_EXTENSIONS, Place,
     RemoteRun, Route, Slot, build_settings, decide, dotnet_builds, dotnet_target, is_dotnet, sdk_build_target, without_no_build,

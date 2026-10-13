@@ -32,6 +32,7 @@ The CLI is subcommands with GNU-style flags: `--name value` or `--name=value`, a
 | `gate run` | Run one command under a slot and the watchdog. |
 | `gate stop-tree` | Stop a process tree, reaching the gate jobs inside it. |
 | `gate cutover` | Switch this machine from the PowerShell gate to `gate.exe`, draining it first. |
+| `gate remote-cutover` | Switch this machine's routed runs from the `remote.ps1` bridge to the Rust remote client, draining the routed runs of this PC and of every builder first. |
 | `gate push` | Copy the installed `gate.exe` to every builder `remote.json` names. |
 | `gate burn` | Spin the CPU for a set time, for the load-burn tool. |
 | `gate box` | Hidden: the builder side of a routed run. |
@@ -119,9 +120,59 @@ The drain ends only when every scan across a 5 s confirmation window finds no ga
 
 Test-seams builds accept hidden options on `cutover`: `--test-poll-ms`, `--test-heartbeat-ms`, `--test-confirm-ms` and the switch `--test-cutover-interrupt-after-list` (raises the interrupt once the first list is printed). `--test-print-request` prints `{"mode":"cutover","localAppData":...,"testSeams":{"pollMs","heartbeatMs","confirmMs","interruptAfterList"}}`.
 
+### `gate remote-cutover`
+
+`gate remote-cutover [--state-dir <path>]`; its usage line is `       gate remote-cutover [--state-dir <path>]`, after `gate cutover`. The state root is resolved as for a run (`--state-dir`, else `GATE_STATE_DIR`, else the default; [State root](#state-root)); any other word prints `gate: unexpected argument <word>` and any other option, `--` included, `gate: unknown option <opt>`, each followed by the usage, exit 2.
+
+What it does and why is [The remote cutover](#the-remote-cutover); this is what it says. Every line goes to stderr.
+
+`LOCALAPPDATA` must be an absolute folder whatever the root, as the routing file `remote.json` is read from it: unset or empty prints `gate: remote-cutover needs LOCALAPPDATA`, a relative one `gate: remote-cutover needs LOCALAPPDATA to be an absolute folder, not <value>`, exit 2, as does a state root that cannot be resolved.
+
+Exit codes: 0 when the drain is done (or ended with its marker left to another live drain, below), 1 for a refusal or a failure, 2 for usage, 0xC000013A for a Ctrl+C. The steps, in order:
+
+1. Take the drain mutex ([Kernel object names](#kernel-object-names)) without waiting. A run that cannot take it is refused, exit 1.
+
+   The line is `gate: remote-cutover: pid <pid> drains already; let it finish, or end it and run gate remote-cutover again` when the drain marker names a drainer that lives, else `gate: remote-cutover: another run drains already and has not written its marker <marker path> yet; let it finish and run gate remote-cutover again` (the marker is read up to 5 times, 200 ms apart, as a run that has just taken the mutex is about to write it).
+
+   A mutex whose open or take is refused as access denied (an elevated drain's, seen from a run that is not elevated) counts as held by another run and gets one of these two lines; any other failure prints `gate: remote-cutover: cannot open the mutex <name>: <error>` or `gate: remote-cutover: cannot take the mutex <name>: <error>`, exit 1.
+2. Check the marker with the mutex held. One that stands but cannot be read prints `gate: remote-cutover: cannot read the drain marker <path>: <error>; no other run drains, so delete it and run gate remote-cutover again`, exit 1; one that names a drainer that lives (another logon session's mutex, or another spelling of the root's) prints the `pid <pid> drains already` line, exit 1; one that names a dead drainer is taken over.
+3. Write the marker naming this gate (`gate: remote-cutover: cannot write the drain marker <path>: <error>` and exit 1 on failure), then the flag, left as it is when it exists already. A flag that cannot be written prints `gate: remote-cutover: cannot write the flag <flag>: <error>`, removes the marker this run wrote and exits 1. Success prints `gate: remote-cutover: flag written; routed runs now wait for the drain`.
+4. Drain, below.
+5. End: a Ctrl+C seen at any point prints `gate: remote-cutover: interrupted; the flag and the drain marker stay, and running gate remote-cutover again resumes the drain` and exits 0xC000013A, even when the drain ended as it came, and removes nothing. Otherwise the marker is read (5 reads, 200 ms apart, while a read fails).
+
+   A marker that names another drainer that lives, a different pid or start from this gate's, is left to it, and the drain ends there: `gate: remote-cutover: drained, but the drain marker <path> now names pid <pid>, whose drain removes it`, exit 0.
+
+   A readable marker of this gate's or of a dead drainer is removed (5 tries, 200 ms apart; `gate: remote-cutover: cannot remove the drain marker <path>: <error>; delete it by hand`, exit 1). One that cannot be read prints `gate: remote-cutover: cannot read the drain marker <path>: <error or "it exists but reads as none">; it is left`, exit 1.
+6. Then, if the flag no longer stands, `gate: remote-cutover: the flag <flag> was deleted during the drain; routed runs use the bridge`, exit 1, never `done`. Else `gate: remote-cutover: done; routed runs use the Rust client`, then `gate: remote-cutover: to go back to the bridge, delete <flag path>`, exit 0.
+
+The drain reads this PC's routed gates every 2 s and ends this part only when every scan across a 5 s confirmation window finds none, as `gate cutover` does.
+
+The first list is `gate: remote-cutover: waiting for 1 routed gate to finish:` (or `... <n> routed gates to finish:`), then one line per entry, `gate:   pid <pid>  <command>`: a gate is told by its pid whatever number of claims and tickets it holds, and `<command>` is the first claim's command, else the process's command line, else `(command line unreadable)`; any command text from another process has its control characters escaped. Two more kinds of entry exist:
+
+- a remote slot whose mutex is held with no live claim, `gate:   remote slot <n>, held by a gate that is not known`: all 16 remote-slot mutexes (`gate_router::MAX_SLOTS`) are probed, whatever `slots` in `remote.json` says, so a slot held under an earlier file is still seen;
+- a claim, ticket or folder that cannot be read, `gate:   <path>, which cannot be read; remove it once no gate uses it`, which holds the drain until it is gone.
+
+After the list, each scan says `gate: remote-cutover: pid <pid> finished (<n> left)` (or `remote slot <n> is free (<n> left)`, or `<path> is gone (<n> left)`) for each entry gone, then `gate: remote-cutover: also waiting for <entry>` for each new one, an entry named once; a slot held again after it was freed is named again. Under the default root the PowerShell root's remote claims and tickets are read too; a rehearsal's root reads none.
+
+Once this PC is clear the drain asks every builder `remote.json` names, `host` then `hosts` as `gate push` reads them, by `gate box inflight` through ssh, one call per builder, and again every 10 s round until a round finds each at 0.
+
+A builder that holds runs gets `gate: remote-cutover: <host>: <n> run(s) in flight`. One that cannot say holds the drain: `gate: remote-cutover: <host> cannot say what runs there (status <n>); run gate push` (the call exited non-zero, or with 0 and no count line), `... (no answer in <s> s)` (killed after 30 s), or `... : <why>` when the call cannot be made, `cannot run ssh: <path> lies in the working folder` among them.
+
+The ssh is `ssh.exe` found along `PATH` as `gate push` finds it, but one that lies in the working folder itself is refused; one in an absolute `PATH` folder elsewhere is taken, a system one under the working folder too.
+
+The call is made as `gate push` makes its calls, and no builder is called once a Ctrl+C is seen: the call under way ends at once.
+
+Routing file lines, each holding the round: `gate: remote-cutover: <remote.json path> is gone since the drain began; no builder can be asked until it is back` (a file there when the drain began, now gone), and `gate: remote-cutover: ignored <path>: <reason>; no builder can be asked until it is fixed` for a file routing refuses. With no file when the drain began, `gate: remote-cutover: no remote.json at <path>; no builder to ask` and the builders count as drained.
+
+Last, the drain scans this PC once more and starts over from the first scan when a gate came meanwhile. Only then is it drained.
+
+Test-seams builds accept hidden options on `remote-cutover`: `--test-poll-ms` (the PC poll and the builder round period), `--test-confirm-ms`, `--test-remote-bound-ms` (the 30 s bound of a builder call), `--test-remote-ssh <path>` (the program each call runs in place of the ssh found), `--test-remote-transport local:<folder>|local-ssh:<folder>` (the builder as a local folder).
+
+The switches are `--test-cutover-interrupt-after-list` (raises the interrupt once the first list is printed) and `--test-cutover-interrupt-after-round` (once the first round of builder calls has answered, before it is judged). `remote-cutover` has no `--test-print-request`.
+
 ### `gate push`
 
-`gate push` takes no words; its usage line is `       gate push`, after `gate cutover`. A word prints `gate: unexpected argument <word>` and any option, `--state-dir` included, prints `gate: unknown option <opt>`, each followed by the usage, exit 2. It reads `%LOCALAPPDATA%` only; `GATE_STATE_DIR` is ignored. What it does is [Install](#install); this is what it says.
+`gate push` takes no words; its usage line is `       gate push`, after `gate remote-cutover [--state-dir <path>]`. A word prints `gate: unexpected argument <word>` and any option, `--state-dir` included, prints `gate: unknown option <opt>`, each followed by the usage, exit 2. It reads `%LOCALAPPDATA%` only; `GATE_STATE_DIR` is ignored. What it does is [Install](#install); this is what it says.
 
 It copies the installed `%LOCALAPPDATA%\gate\bin\gate.exe` to each builder, one after another, in the order `host` then `hosts` of `remote.json` ([remote.json](#remotejson)). The routing file must be one routing accepts, so `repos` and the other keys are checked as routing checks them. Every builder is tried, whatever happened to an earlier one. The exit is 1 if any builder failed or nothing could be pushed, else 0.
 
@@ -362,8 +413,8 @@ For any other root, every kernel object name carries `<h>`, the first 8 lower-ca
 | `paused\<parent pid>-<parent start>-<pid>-<start>.pause` | a gate waiting behind a critical request under a parent gate's slot | its parent gate's watchdog | Empty file; [Critical drain and nesting](#critical-drain-and-nesting) (kept, N3). |
 | `events.jsonl`, `events.1.jsonl` | every gate, under the journal mutex | ops-tower, the durations summary, people | [Journal](#journal). |
 | `archive\events-<yyyyMMddTHHmmssZ>.jsonl.gz` | the gate whose append rolled the journal | the durations summary | [Archive](#archive). |
-| `remote-cutover.draining` | the remote cutover, at the start of its drain | the remote cutover (a rerun, to tell a live drain from a dead one) and every routed run (the switch client, `remote/switch.rs`, to wait out a live drain) | The drain marker: JSON `{"v":1,"pid":<n>,"start":<ms>,"since":<ms>}`, the writer's pid, its start in epoch milliseconds and when the drain began; written to a temporary sibling and renamed, by `gate_state::v1::write_drain_marker`. Read as Alive (the pid runs and started at `start` to the millisecond, or its start cannot be read), Dead or Unreadable; a missing file, or one whose open is refused as a pending delete, is absent. A routed run that reads it as absent while the file still stands treats it as refused, not gone, and goes on waiting ([Routing](#routing-and-the-remoteps1-bridge), The remote client's run). |
-| `remote-cutover.flag` | the remote cutover | every routed run (the switch client, `remote/switch.rs`) | Its path is `remote_cutover_flag_path`; nothing writes it yet. A routed run whose state root holds it when its routed attempt starts goes through the Rust remote client over ssh, and one without it through the `remote.ps1` bridge; the file's content is not read, only whether it exists ([Routing](#routing-and-the-remoteps1-bridge), The remote client's run). |
+| `remote-cutover.draining` | `gate remote-cutover`, at the start of its drain, with the drain mutex held | the remote cutover (a rerun, to tell a live drain from a dead one) and every routed run (the switch client, `remote/switch.rs`, to wait out a live drain) | The drain marker: JSON `{"v":1,"pid":<n>,"start":<ms>,"since":<ms>}`, the writer's pid, its start in epoch milliseconds and when the drain began; written to a temporary sibling and renamed, by `gate_state::v1::write_drain_marker`. A drain removes it when it ends drained, unless it names another drainer that lives; a Ctrl+C or a failure leaves it. A new drain, with the mutex held, takes over a readable marker whose pid is not alive with that start, and refuses one whose drainer lives (a drain under another mutex) and one that cannot be read ([`gate remote-cutover`](#gate-remote-cutover)). Read as Alive (the pid runs and started at `start` to the millisecond, or its start cannot be read), Dead or Unreadable; a missing file, or one whose open is refused as a pending delete, is absent. A routed run that reads it as absent while the file still stands treats it as refused, not gone, and goes on waiting ([Routing](#routing-and-the-remoteps1-bridge), The remote client's run). |
+| `remote-cutover.flag` | the remote cutover | every routed run (the switch client, `remote/switch.rs`) | Its path is `remote_cutover_flag_path`; `gate remote-cutover` creates it, empty, and keeps it when it ends drained, and the take-back is deleting it by hand. A routed run whose state root holds it when its routed attempt starts goes through the Rust remote client over ssh, and one without it through the `remote.ps1` bridge; the file's content is not read, only whether it exists ([Routing](#routing-and-the-remoteps1-bridge), The remote client's run). |
 | `durations.json`, `backfill\<pid>.json` and the backfill bar record | gates | gates | Reserved for learned durations (GATE-7; [design/gate-durations.md](design/gate-durations.md)). |
 | `remote\<key>.outputs-pending` | the bridged remote client, and the Rust remote client | the same | Empty file. Written by `remote.ps1` while the bridge stands (D1). The Rust client writes it after the push and before a routed run's run call when the run has output globs, or when the route withheld its outputs (a dotnet `--no-build` command the builder built; that marker no end clears), so a run refused at the preflight or by the parity check leaves none, removes it only after an accepted `gate-remote-outputs: 0` or an install that skipped no file, and sends `OutputsFull` while it stands ([The remote client's run](#routing-and-the-remoteps1-bridge)). |
 | `remote\<key>.outputs-hashes` | the Rust remote client | the same | The hash cache: one outputs manifest line, `{"files":{"<path>":{"size":…,"modified":…,"sha256":"…"}}}`, of the files of the worktree's last built manifest last written at least 2 s before that build. Saved after each manifest the client builds, and by an outputs install that skipped nothing, for the files it put in place, through `<key>.outputs-hashes.<pid>.tmp` and a rename; one that cannot be read, is not a manifest line or is over 64 MiB gives no hash and is replaced by the next save, and deleting the file resets the cache ([The remote client's run](#routing-and-the-remoteps1-bridge), Manifest time). |
@@ -388,6 +439,7 @@ The temporary sibling is made new, a link or junction at its name opened as itse
 | box command's stop event | `Local\gate-remote-<key>-<nonce>-stopped` | the same; the name is not root-dependent |
 | log's mutex | `Local\gate-log-<l>` | `Local\gate-<h>-log-<l>` |
 | routed lock | `Local\gate-routed-<k>` | `Local\gate-<h>-routed-<k>` |
+| remote-cutover drain | `Local\gate-remote-cutover` | `Local\gate-<h>-remote-cutover` |
 
 The critical mutex is taken by a critical gate once no earlier live critical ticket exists, and held for its whole run. An abandoned one counts as taken ([Abandoned slots](#abandoned-slots)).
 
@@ -396,6 +448,8 @@ The box command's job name comes from the payload's `Job` (`<key>` is the payloa
 `<l>` is the log hash: 16 lower-case hex digits, the first 8 bytes of the SHA-256 of the lower-cased, normalised absolute log path. Each run takes its log's mutex without waiting, before it readies the log, and holds it until after the slot release and the final append to the log, so two gates never write one log; a second gate fails at once ([Output lines](#output-lines)).
 
 `<k>` is the key hash: 16 lower-case hex digits, the first 8 bytes of the SHA-256 of the lower-cased work-folder key. The Rust remote client takes the routed lock without waiting, before the remote slot, and holds it for the whole remote attempt ([Routing](#routing-and-the-remoteps1-bridge)).
+
+`gate remote-cutover` takes the remote-cutover drain mutex without waiting and holds it for its whole run, so one drain runs at a time per root; a run that cannot take it is refused ([`gate remote-cutover`](#gate-remote-cutover)). The marker, not the mutex, names the drainer, and a drain under another logon session's mutex or another spelling of the root is told by its marker.
 
 The environment carries one more name: `GATE_SLOT_HELD`, the slot marker ([Critical drain and nesting](#critical-drain-and-nesting)).
 
@@ -1595,7 +1649,7 @@ The default root's mutex names are the PowerShell gate's, so a PowerShell gate s
    `gate cutover` copies the PowerShell gate's slot counts into the default root's `slot-counts.json`, so both generations count the same slots, then writes `%LOCALAPPDATA%\gate\cutover.flag`, holding its write time in RFC 3339 UTC (the launcher never reads it). The PowerShell launcher in each repo reads the flag, and from then on every new gate runs `gate.exe` through the compatibility layer.
 2. It then waits until every PowerShell gate's claims and tickets in `%LOCALAPPDATA%\gate\` are gone or stale, naming on stderr what it still waits on, and exits 0 once none is left. The drain of the PowerShell gates (`powershell_gates`) reads claims and tickets only and probes no mutex; a pid whose start cannot be read counts as live.
 
-   `gate-state` also reads the PC's live routed work for the remote cutover's drain: `remote_gates` lists the live `gate-remote-slot-N` claims and live `remote: true` tickets of the v1 root and, when given, the PowerShell root; a remote-slot mutex that is open with no live claim, as a gate with an unknown pid (`gate.exe` holds the mutex between deleting its ticket and writing its claim, and a claim write can fail); and a claim newer than the process snapshot while its mutex is open.
+   `gate-state` also reads the PC's live routed work for the remote cutover's drain: `remote_gates` lists the live `gate-remote-slot-N` claims and live `remote: true` tickets of the v1 root and, when given, the PowerShell root; a remote-slot mutex that is open with no live claim, as a gate with an unknown pid and its slot index in `slot` (`gate.exe` holds the mutex between deleting its ticket and writing its claim, and a claim write can fail); and a claim newer than the process snapshot while its mutex is open.
 
    Under the default root a slot a live PowerShell claim holds counts once.
 
@@ -1610,6 +1664,18 @@ The default root's mutex names are the PowerShell gate's, so a PowerShell gate s
    The copy never replaces: the file is written beside the target and hard-linked into place, so one that appears meanwhile wins, and a target that exists but cannot be read is kept too.
 
    Callers that start the PowerShell gate without the launcher keep starting PowerShell gates after the flag is set. The drain names on stderr each PowerShell gate whose earliest claim or ticket `since` is later than the flag's write time (a late arrival), with its command line, so a bypassing caller is visible rather than holding the drain open silently; each pid is named once. The cutover is not run until claude-config lists the callers it moved.
+
+### The remote cutover
+
+`gate remote-cutover` moves a PC's routed runs from the `remote.ps1` bridge to the Rust remote client, in the state root it is given (`--state-dir`, else the default). The switch is the `remote-cutover.flag` file ([State root](#state-root), Files): a routed run whose attempt starts with the flag present goes through the Rust client over ssh, and without it through the bridge.
+
+A drain holds the remote-cutover mutex for its whole run, writes the drain marker naming itself, then the flag. A routed run that starts from then on, seeing the flag and a live marker, waits ([Routing](#routing-and-the-remoteps1-bridge), The remote client's run), so no new routed run starts on either client while the drain runs.
+
+The drain waits for the routed work that started before the flag: this PC's, through `remote_gates` over all 16 remote-slot mutexes (`gate_router::MAX_SLOTS`), then every builder `remote.json` names, through `gate box inflight` over ssh, which counts the runs holding a lock in the Rust client's builder root.
+
+A builder that cannot say what runs there, and a `remote.json` that is gone since the drain began, hold the drain, so it never reports done on a guess.
+
+A final scan of this PC follows the builders, as a gate may have started meanwhile. When all is clear the drain removes the marker and keeps the flag; a Ctrl+C or a failure keeps both, and running it again resumes. The take-back is deleting the flag (and a marker left behind) by hand, which works even when `gate.exe` is what is broken. The lines are in [`gate remote-cutover`](#gate-remote-cutover).
 
 ### The launcher's hand-over
 
@@ -1670,6 +1736,8 @@ A Rust integration suite drives the built `gate.exe` through its CLI and reads o
   `--test-interrupt-queued-after-fallback` (a switch) raises it once the gate has said it waits for its own slot after a `full` fallback from the builder, the wait that counts from the run's queue line, so a case can pin how a Ctrl+C there counts that wait; `--test-print-request` shows it as `testSeams.interruptAfterFallback`, after `interruptQueued`.
 
   On `cutover` the seams are `--test-poll-ms`, `--test-heartbeat-ms`, `--test-confirm-ms` (the confirmation window) and the switch `--test-cutover-interrupt-after-list`; `--test-print-request` shows them as `testSeams.pollMs`, `heartbeatMs`, `confirmMs` and `interruptAfterList` ([`gate cutover`](#gate-cutover)).
+
+  On `remote-cutover` the seams are `--test-poll-ms`, `--test-confirm-ms`, `--test-remote-bound-ms`, `--test-remote-ssh <path>`, `--test-remote-transport` and the switches `--test-cutover-interrupt-after-list` and `--test-cutover-interrupt-after-round`; it has no `--test-print-request` ([`gate remote-cutover`](#gate-remote-cutover)).
 
   On `push` the seams are `--test-push-ssh <path>` (the ssh program to run instead of the one found along `PATH`, the suite's `fake-ssh`) and `--test-push-bound-ms <n>` (each builder's bound); `push` has no `--test-print-request` ([`gate push`](#gate-push)).
 

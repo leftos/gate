@@ -10,8 +10,9 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
+use crate::remote::payload;
 #[cfg(feature = "test-seams")]
-use crate::remote::payload::{self, BOX_EXE};
+use crate::remote::payload::BOX_EXE;
 
 /// The options of every ssh call, git's own included: no prompt, the timeouts, and nothing forwarded to the builder.
 pub(crate) const SSH_OPTIONS: [&str; 12] = [
@@ -75,6 +76,13 @@ fn sent_repo(repo: &str) -> Result<&str, String> {
     } else {
         Err(format!("cannot push to the repo '{repo}': a repo name is letters, digits, '_' and '-'"))
     }
+}
+
+/// The program that asks the builder `host` how many of its work folders a run holds, `gate box inflight`, the
+/// payload's `Root` the transport's own root, so the probe looks where the runs this transport starts hold their locks.
+pub(crate) fn inflight_call(transport: &dyn Transport, host: &str) -> Program {
+    let word = payload::inflight_word(transport.root());
+    transport.call(host, &payload::line("inflight", &word))
 }
 
 /// ssh's words for running `line` on `host`: the options, `--`, the host and the line, each a word of its own.
