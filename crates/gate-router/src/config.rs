@@ -16,6 +16,10 @@ use crate::like::{Pattern, eq_ignoring_case};
 /// The output globs of a repo the `outputs` key does not name.
 pub const DEFAULT_OUTPUTS: [&str; 2] = ["**/bin/**", "**/.godot/mono/temp/bin/**"];
 
+/// The output globs of a cargo repo the `outputs` key does not name: the top-level files of each profile folder, not
+/// `deps/`, `build/` or `incremental/`.
+pub const CARGO_OUTPUTS: [&str; 3] = ["target/*/*.exe", "target/*/*.dll", "target/*/*.pdb"];
+
 /// The most slots the remote pool may have.
 const MAX_SLOTS: u32 = 16;
 
@@ -123,13 +127,17 @@ impl Config {
         find(&self.repos, repo)
     }
 
-    /// The output globs of `repo`: its `outputs` list, or [`DEFAULT_OUTPUTS`] when `outputs` does not name it.
+    /// The output globs `outputs` lists for `repo`, or `None` when it does not name it.
+    #[must_use]
+    pub fn own_outputs(&self, repo: &str) -> Option<Vec<String>> {
+        find(&self.outputs, repo).map(|globs| globs.iter().map(|glob| glob.as_str().to_owned()).collect())
+    }
+
+    /// The output globs of `repo`: its own `outputs` list, or [`DEFAULT_OUTPUTS`] when `outputs` does not name it.
     #[must_use]
     pub fn outputs(&self, repo: &str) -> Vec<String> {
-        match find(&self.outputs, repo) {
-            Some(globs) => globs.iter().map(|glob| glob.as_str().to_owned()).collect(),
-            None => DEFAULT_OUTPUTS.iter().map(|glob| (*glob).to_owned()).collect(),
-        }
+        self.own_outputs(repo)
+            .unwrap_or_else(|| DEFAULT_OUTPUTS.iter().map(|glob| (*glob).to_owned()).collect())
     }
 }
 

@@ -1048,6 +1048,8 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
   Any other host refuses the file (`host must be an ssh alias or user@host of letters, digits, '.', '_' and '-', not starting with '-'`), a recorded deviation: the PowerShell reader accepts any non-empty string. An IPv6 literal or a `host:port` is written as an alias in `~/.ssh/config`.
 
   `slots` is a whole number 1 to 16 (1 when missing), `repos` an object whose values are arrays of non-empty `-like` patterns, and `outputs` an optional object of the same shape whose globs may not hold `[` or `]`; a repo with no `outputs` entry brings back `**/bin/**` and `**/.godot/mono/temp/bin/**`.
+
+  A cargo command instead (its first word's file stem is `cargo` in any case; one a `pwsh` script is handed after `--` is not) brings back `target/*/*.exe`, `target/*/*.dll` and `target/*/*.pdb`: each profile folder's own files, never `deps/`, `build/` or `incremental/`. A repo's own `outputs` list replaces either default.
 - **The `-like` matcher** is PowerShell's wildcard match, case-insensitive, over the words joined by single spaces. It folds case by simple case folding. Inside a `[...]` set, a non-ASCII member whose .NET case-insensitive equivalents differ (the Kelvin sign and `k`) can match in PowerShell and not here.
 - **The in-worktree path rewrite** (T3) finds a path wherever a drive letter, a colon and a separator start one inside a word (`--flag=X:\a`, `-p:Name=X:\a`, a script's text), each start judged on its own.
 

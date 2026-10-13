@@ -168,6 +168,23 @@ mod tests {
     }
 
     #[test]
+    fn the_cargo_output_globs_reach_a_profile_folder_s_own_files_only() {
+        let matcher = globs(&["target/*/*.exe", "target/*/*.dll", "target/*/*.pdb"]);
+        for kept in ["target/debug/x.exe", "target/release/x.dll", "target/debug/x.pdb", "target/release/x.exe"] {
+            assert!(matcher.matches(kept), "{kept} is brought back");
+        }
+        for skipped in [
+            "target/debug/deps/x.exe",
+            "target/debug/build/x/y.exe",
+            "target/debug/incremental/a/b.pdb",
+            "target/x.exe",
+            "x/target/debug/y.exe",
+        ] {
+            assert!(!matcher.matches(skipped), "{skipped} is never brought back");
+        }
+    }
+
+    #[test]
     fn a_question_mark_is_one_character_within_one_name() {
         check("bin/?.dll", &["bin/a.dll", "bin/é.dll"], &["bin/ab.dll", "bin/.dll", "bin//.dll"]);
     }

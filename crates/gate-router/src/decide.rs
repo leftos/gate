@@ -6,7 +6,7 @@
 use std::ops::Range;
 use std::path::PathBuf;
 
-use crate::config::{Config, ConfigProblem, ignored_line};
+use crate::config::{CARGO_OUTPUTS, Config, ConfigProblem, ignored_line};
 use crate::key::{repo_name, work_folder_key};
 use crate::like::eq_ignoring_case;
 use crate::rewrite::{drive_letters, rewrite_words};
@@ -23,6 +23,8 @@ const NO_BUILD: &str = "--no-build";
 const SEPARATOR: &str = "--";
 /// The program name of a dotnet command.
 const DOTNET: &str = "dotnet";
+/// The program name of a cargo command.
+const CARGO: &str = "cargo";
 /// The program names whose script, handed a dotnet command after its `--`, counts as that dotnet command.
 const WRAPPERS: [&str; 2] = ["pwsh", "powershell"];
 /// The `MSBuild` property a routed build pins the worktree's `HEAD` sha to, so the builder does not throw away a
@@ -356,6 +358,14 @@ pub fn is_dotnet(words: &[String]) -> bool {
     dotnet_start(words).is_some()
 }
 
+/// Whether the words are a cargo command: the first non-empty word's file name without extension is `cargo`, compared
+/// ignoring letter case (`cargo`, `Cargo.exe`, a full path to it). A cargo command a wrapping script is handed after its
+/// `--` is not read as one.
+#[must_use]
+pub fn is_cargo(words: &[String]) -> bool {
+    first_word(words).is_some_and(|(_, word)| is_named(word, CARGO))
+}
+
 /// Whether the words are a dotnet command ([`is_dotnet`]) that builds: the dotnet command's verb, the next non-empty
 /// word after its dotnet word, is one of [`BUILD_VERBS`] ignoring letter case, and none of its own words is exactly
 /// `--no-build`.
@@ -568,10 +578,15 @@ fn subst_drives(root: &str, words: &[String], facts: &dyn Facts) -> Vec<(char, S
 
 fn remote_run(matched: Matched<'_>, subfolder: String, given: &[String], facts: &dyn Facts) -> RemoteRun {
     let sent_count = matched.words.len();
+    let cargo = is_cargo(&matched.words);
     let mut words = without_no_build(matched.words);
     let dropped_no_build = words.len() != sent_count;
     let fallback = without_no_build(given.to_vec());
-    let mut outputs = matched.config.outputs(&matched.repo);
+    let mut outputs = match matched.config.own_outputs(&matched.repo) {
+        Some(globs) => globs,
+        None if cargo => CARGO_OUTPUTS.iter().map(|glob| (*glob).to_owned()).collect(),
+        None => matched.config.outputs(&matched.repo),
+    };
     let outputs_withheld = fallback.len() != given.len() && !outputs.is_empty();
     if outputs_withheld {
         outputs.clear();

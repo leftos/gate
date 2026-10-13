@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 use gate_router::{
     BuildSettings, BuildTarget, Config, ConfigProblem, DROPPED_NO_BUILD_LINE, DotnetTarget, Inputs, LocalReason, NO_OUTPUTS_LINE, PROJECT_EXTENSIONS,
-    Place, RemoteRun, Route, Slot, build_settings, decide, dotnet_builds, dotnet_target, is_dotnet, is_usable_host, sdk_build_target,
+    Place, RemoteRun, Route, Slot, build_settings, decide, dotnet_builds, dotnet_target, is_cargo, is_dotnet, is_usable_host, sdk_build_target,
     without_no_build, work_folder_key,
 };
 
@@ -732,6 +732,48 @@ fn a_repo_with_its_own_outputs_gets_them() {
     let config = Config::parse(r#"{"host": "builder-1", "repos": {"yaat": ["*"]}, "outputs": {"Yaat": ["target/**"]}}"#).expect("usable");
     let command = words(&["cargo", "build"]);
     assert_eq!(routed(decide(&heavy(&command), &FakeFacts::with_config(config))).outputs, ["target/**"]);
+}
+
+#[test]
+fn a_repo_s_own_outputs_replace_the_cargo_default() {
+    let config = Config::parse(r#"{"host": "builder-1", "repos": {"yaat": ["cargo *"]}, "outputs": {"yaat": ["target/**"]}}"#).expect("usable");
+    let command = words(&["cargo", "build"]);
+    let run = routed(decide(&heavy(&command), &FakeFacts::with_config(config)));
+    assert_eq!(run.outputs, ["target/**"], "the repo's own list, not the cargo default");
+}
+
+#[test]
+fn a_cargo_command_of_a_repo_without_outputs_brings_back_the_profile_folders() {
+    let config = Config::parse(r#"{"host": "builder-1", "repos": {"yaat": ["cargo *"]}}"#).expect("usable");
+    let command = words(&["cargo", "build"]);
+    let run = routed(decide(&heavy(&command), &FakeFacts::with_config(config)));
+    assert_eq!(run.outputs, ["target/*/*.exe", "target/*/*.dll", "target/*/*.pdb"]);
+}
+
+#[test]
+fn a_cargo_command_spelled_in_another_case_or_with_an_extension_gets_the_cargo_default() {
+    let config = Config::parse(r#"{"host": "builder-1", "repos": {"yaat": ["*"]}}"#).expect("usable");
+    let command = words(&["Cargo.exe", "test"]);
+    let run = routed(decide(&heavy(&command), &FakeFacts::with_config(config)));
+    assert_eq!(run.outputs, ["target/*/*.exe", "target/*/*.dll", "target/*/*.pdb"]);
+}
+
+#[test]
+fn a_cargo_command_is_any_spelling_of_cargo_and_a_wrapped_one_is_not() {
+    for cargo in [
+        vec!["cargo", "build"],
+        vec!["Cargo.exe", "test"],
+        vec![r"C:\bin\cargo", "check"],
+        vec!["CARGO", "fmt"],
+    ] {
+        let given = words(&cargo);
+        assert!(is_cargo(&given), "{given:?} is a cargo command");
+    }
+    assert!(
+        !is_cargo(&words(&["pwsh", "-File", "x.ps1", "--", "cargo", "build"])),
+        "a cargo command a script is handed after its -- is not read as one"
+    );
+    assert!(!is_cargo(&words(&["dotnet", "build"])), "another command is not a cargo command");
 }
 
 #[test]
