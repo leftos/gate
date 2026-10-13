@@ -71,6 +71,7 @@ fn covered() -> CoveredMarker {
         command: "cargo fmt --check".to_owned(),
         cwd: r"C:\work\repo".to_owned(),
         since: 1_790_852_402_000,
+        kind: None,
     }
 }
 

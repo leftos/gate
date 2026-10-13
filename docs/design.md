@@ -280,6 +280,8 @@ The lines of a run that starts its command:
   A routed run that passed says `gate: passed in <w> s on <host> (wall clock, ceiling <n> s). Full output: <log>`, with no load-adjusted time. The client's status is the gate's own, passed through as `N`.
 - A critical gate, on stderr and in the log: the `waiting for the machine (critical)`, `still waiting for the machine (critical)`, `holds the machine (critical)` and `interrupted while waiting for the machine` lines, in [Critical drain and nesting](#critical-drain-and-nesting).
 - Nesting, on stderr and in the log, from the slot marker in the gate's environment: the `running under` (including the lend's `while a critical request drains`), `ignored GATE_SLOT_HELD`, `could not judge GATE_SLOT_HELD` and `does not cover` lines, the barrier's `waiting for a heavy slot behind the critical request` and `waiting for a light slot beside the critical request` lines, and the refusal of a critical gate, all in [Critical drain and nesting](#critical-drain-and-nesting).
+
+  The late take adds `the parent gate <pid> ended; ...` and `cannot watch the parent gate ...` lines, in the same section.
 - The gate prints no `queued for` or `took ... slot` line, for a local, a routed or a no-slot run: the queue and the take are in the journal, and a wait longer than 30 s says `gate: still waiting for a <kind> slot (<s> s)`. A no-slot run never waits.
 - The expected-time line, on stderr and in the log, once a run that takes a slot has written its claim and woken the waiters and before the command's output: `gate: expected about <n> s (usual <n> s, p90 <n> s, <runs> runs)`, or in whole minutes from 90 s: `gate: expected about <n> min (usual <n> min, p90 <n> min, <runs> runs)`. A local light or heavy take says it, a critical gate after its holds line, a routed run at its remote take, and a fallback a second one at its local take.
 
@@ -330,13 +332,17 @@ A missing file or key means the default; an unreadable or invalid value is ignor
    It prints `gate: still waiting for a <kind> slot (<s> s)` every 30 s from its queueing, on stderr and in the log, so a gate around it does not read the wait as a stall (kept, S4). Its watchdog starts only once it holds a slot.
 
    `waitedSeconds` in its `take` counts from its `queue` line; the local `take` of a routed run that fell back counts from the `fallback` line, as the PowerShell gate does, except after a `full` fallback, whose local `take` counts from the run's `queue` line (as the PowerShell gate did for it).
+
+   After a `full` fallback the wait's schedule, its still-waiting lines and its `take` or `abandon` `waitedSeconds` all count from that one instant, the run's `queue` line, so the `(<s> s)` includes the remote wait. The first still-waiting line of a wait entering from a fallback comes at the next whole heartbeat period past what it has already waited, never at once: for a 60 s remote wait and a 30 s heartbeat, the first line comes at 90 s.
 7. A problem a pass meets is said as a prose line, once per name or path per wait: `gate: could not take <name>: <error>`, `gate: cannot probe <name>: <error>`, `gate: cannot create the wake event <name>: <error>` (the gate then waits on the poll alone), `gate: cannot wait on the wake event <name>: <error>`, `gate: cannot write the ticket <path>: <error>`, `gate: cannot write the claim <path>: <error>`.
 
    More: `gate: cannot read the tickets in <dir>: <error>`, `gate: cannot read the claims in <dir>: <error>`, `gate: ignored the ticket <path>: <reason>`, `gate: cannot check the gate of <path>: <error>` and `gate: cannot delete the ticket|the claim|the dead gate's ticket <path>: <error>`.
 
    A dead gate's ticket or covered marker whose delete is refused with access denied is passed over unsaid and never counts as a delete, so it wakes no waiter. The usual cause is another gate deleting the same file (a [delete pending](GLOSSARY.md), which refuses every open and delete), and that gate sends the wake. A dead gate's file that can never be deleted stays in place unsaid and is tried again each pass; it never blocks the queue, since a dead ticket is never ahead.
 
-   A gate under a parent's slot says `gate: cannot write the covered marker <path>: <error>` and `gate: cannot delete the covered marker <path>: <error>`, and the survey says `gate: cannot read the covered markers in <dir>: <error>` and `gate: cannot delete the dead gate's covered marker <path>: <error>`, each of the last two once; the run goes on after each.
+   A gate under a parent's slot says `gate: cannot write the covered marker <path>: <error>`, `gate: cannot rewrite the covered marker <path>: <error>` and `gate: cannot delete the covered marker <path>: <error>`, and the survey says `gate: cannot read the covered markers in <dir>: <error>` and `gate: cannot delete the dead gate's covered marker <path>: <error>`, each of the last two once; the run goes on after each.
+
+   A gate that looks for a stand-in says the read line too ([Critical drain and nesting](#critical-drain-and-nesting)).
 
 Ordering by ticket replaces the PowerShell gate's free-for-all among waiters of one kind (Q2), and the wake events replace its 2 s polling as the way a waiter learns of a release.
 
@@ -511,6 +517,9 @@ A ticket whose gate is dead by the [liveness rule](#claim) is ignored and delete
 | `command` | string | the command text, as the claim's [`command`](#claim) |
 | `cwd` | string | the gate's working directory |
 | `since` | number | when the marker was written, epoch ms |
+| `kind` | string | optional: the covered gate's own slot kind (`heavy`, `light`, `critical` or `none`), the kind of slot it takes if its parent gate ends first; `none` after the gate gave up watching its parent |
+
+A written marker looks like `{"v":1,"pid":...,"processStart":...,"parentPid":...,"command":...,"cwd":...,"since":...,"kind":"light"}`. The gate rewrites it once, with `kind` `none`, when it cannot watch its parent gate and so stays covered by it to its end. Only a marker whose `kind` is `heavy` or `light` is a stand-in ([Critical drain and nesting](#critical-drain-and-nesting)); a missing or unknown `kind` never is.
 
 The gate deletes the marker when it releases, after a panic and on drop. It writes none when it cannot read its working folder, the condition that also leaves out the `covered` journal line. A gate whose own start cannot be read never gets this far: it refuses to run (see Output lines).
 
@@ -541,7 +550,7 @@ The event's own fields:
 | Event | Fields after the common ones |
 |---|---|
 | `queue` | `log` (the log's full path), `notRouted` (written right after `log`, only when a heavy gate's caller kept it local with `--local`, with the value `--local`; other reasons for a local run write none) |
-| `take` | `slots` (the slot names taken; a critical gate lists every heavy and unreserved light slot it holds; a `none` run lists none, `[]`, with `waitedSeconds` 0.0), `waitedSeconds`, optionally `parentPid`, and for a critical gate `counts`, `otherHeld`, then `otherClaims` or `snapshotError` |
+| `take` | `slots` (the slot names taken; a critical gate lists every heavy and unreserved light slot it holds; a `none` run lists none, `[]`, with `waitedSeconds` 0.0), `waitedSeconds`, optionally `parentPid` (also on the late take of a covered gate), and for a critical gate `counts`, `otherHeld`, then `otherClaims` or `snapshotError` |
 | `release` | `slots` (the same list), `heldSeconds`, `status` (null when the gate failed before its command had one), `wallSeconds`, `adjustedSeconds`, optionally `avgCores`, `peakCores`, `freeCores`, `verdict` |
 | `abandon` | `waitedSeconds`: the gate ended while still queued (Ctrl+C while waiting for a slot) |
 | `parent`, `covered` | `parentPid`; a lent gate writes `parent` after its `queue` when it was lent the slot as it waited, and alone, with no `queue`, when it was lent it before it queued |
@@ -555,9 +564,13 @@ Fields beyond J1's:
 - `take`: a critical gate's `take` carries, after `waitedSeconds` and in this order, `counts` (`{"heavy": <n>, "light": <n>}`, the counts of the pass that took the machine), `otherHeld` (the same shape: the slots within the counts that other gates hold), then `otherClaims` or `snapshotError`; `abandoned` stays last (K5, GATE-38).
 
   `otherClaims` is a list of `{pid, kind, index, command, file}`, one per live claim of another gate in this root's `slots\` folder, sorted by file name: only the `gate-*.json` files, the remote pool's claims and this gate's own left out, `file` the claim's file name. `snapshotError` replaces it only when the claims folder cannot be listed, and holds the reason.
-- `take`: `parentPid`, an integer after `waitedSeconds` (and a critical take's snapshot fields) and before the remote fields and `abandoned`, written by a gate under a parent whose slot did not cover it ([Cores hint](#cores-hint)), or under a no-slot parent. `gate-state`'s reader accepts it and does not treat the run as on the parent's slot.
+- `take`: `parentPid`, an integer after `waitedSeconds` (and a critical take's snapshot fields) and before the remote fields and `abandoned`, written by a gate under a parent whose slot did not cover it ([Cores hint](#cores-hint)), or under a no-slot parent, and by a covered gate that takes a slot late once its parent ended ([Critical drain and nesting](#critical-drain-and-nesting)), where it names the parent that ended, or the stand-in that ended last.
+
+  `gate-state`'s reader accepts it and does not treat the run as on the parent's slot, except for a covered run, which it reads as a run with a slot of its own.
 - `take` of a `none` run: `"kind":"none"` on its `queue`, `take` and `release`, and a `take` with `"slots":[]` and `"waitedSeconds":0.0`, no `abandoned`, no machine fields, and `parentPid` only under a live no-slot parent. Its `release` has `"slots":[]` and is written like any run's, unlike a covered or lent run's. `v` stays 1. The history reader gives the run `kind` `none`, no `slot`, and `started` from the `take`.
-- `release`: `avgCores`, `peakCores`, `freeCores`, optional numbers of one decimal after `adjustedSeconds` and before `verdict` ([Cores hint](#cores-hint)). They are omitted when there is no unpaused sample, the sampler failed, the read of the command's CPU at its end failed, a gate under the run took a slot of its own (or the machine), the journal could not be read to tell, or the run was routed. Covered and lent runs write no `release`.
+- `release`: `avgCores`, `peakCores`, `freeCores`, optional numbers of one decimal after `adjustedSeconds` and before `verdict` ([Cores hint](#cores-hint)). They are omitted when there is no unpaused sample, the sampler failed, the read of the command's CPU at its end failed, a gate under the run took a slot of its own (or the machine), the journal could not be read to tell, or the run was routed.
+
+  Covered and lent runs write no `release`, except a covered run that took a slot late, which writes one when it lets that slot go: its `slots` the one it took, its `heldSeconds` counted from that take.
 - `release`: `wallSeconds` (the command's wall time less the seconds paused behind a critical request; a routed run's whole remote wall time), `adjustedSeconds` (load-adjusted seconds, 3 decimals, a number for every run that started; null for a routed run and for a run whose sampler failed) and `verdict`, one of `passed`, `failed`, `log-failure`, `stalled`, `timed-out`, `backstop`, `unknown` (kept, J5).
 
   A routed run is a kill only when the gate killed it; a command that exits 124 on its own is `failed`.
@@ -568,13 +581,17 @@ The verdict comes from the run's end: a kill line matching `^gate: (STALLED|TIME
 
 The reader starts a run from a lone `parent` line that names a parent: state `parent` and `parentPid`, no queued or started time, and the status and held time of the parent's run. A `parent` line naming no parent is skipped. A lent gate whose command's environment cannot be built writes no `parent` line: one that had queued writes a `release` with `"slots":[]` and `"status":1`, and one lent before it queued writes nothing.
 
-A lone `covered` line is its own state, `covered` (`RunState::Covered`), distinct from a run that lent its slot: the run has `parentPid`, no queued or started time, the kind and first time of the `covered` line, and the status and verdict of the parent's released run. A covered run is never counted in the summary.
+A lone `covered` line is its own state, `covered` (`RunState::Covered`), distinct from a run that lent its slot: the run has `parentPid`, no queued or started time, the kind and first time of the `covered` line, and the status and verdict of the parent's released run.
+
+The parent's run is the run of that pid whose first line is the latest at or before the `covered` line, whether or not it had taken its slot by then, so a gate covered by a stand-in reads its end from the stand-in's `release`. A covered run is never counted in the summary.
+
+A covered run that also journals a `take` of its own (it took a slot late) is no longer a lone `covered` line: it reads as a run with its own take, `running` while its gate runs, `unrecorded` once the gate is gone without a `release`, and released with its own `release`, its status, held time and verdict its own. It counts toward the 50 newest runs, outside the covered quota, and the per-command held-time summary leaves it out, its held time covering only the stretch after the parent ended.
 
 The history that ops-tower serves (`HistoryRun`, `GET /api/gate/history`) carries `verdict`, `wallSeconds` and `adjustedSeconds`, null when a line has none, and `abandoned`: every name any line of the run lists (`parent` and `covered` lines included), in line order without repeats, always present and empty when there are none.
 
 The history lists the 50 newest runs that are not covered, and at most the 50 newest covered runs newer than the oldest of them: at most 100 runs, newest first by the time of each run's first journal line (its queue line, or the `parent` or `covered` line of a gate that never queued), then by pid and process start.
 
-A run fallen back onto or lent its parent's slot counts toward the 50; a covered run does not, so a parent with many nested covered gates never crowds other runs out. The 7-day prune keeps every run the history lists, and the parent run of each listed covered or fallen-back run, whose row takes its status, held time and verdict from it.
+A run fallen back onto or lent its parent's slot counts toward the 50; a covered run does not (one that took a slot late does), so a parent with many nested covered gates never crowds other runs out. The 7-day prune keeps every run the history lists, and the parent run of each listed covered or fallen-back run, whose row takes its status, held time and verdict from it.
 
 It also carries `pid` (a number), `processStart` (the ISO string from the journal) and `running` (a bool, true while the run's gate is live by the same pid-and-start check as the tickets', for every run): a covered run's `state` stays `covered` while it runs.
 
@@ -653,28 +670,50 @@ What `gate.exe` does of it today is part A, nesting under the slot marker (N1, K
   It then keeps a [covered marker](#covered-marker) until it releases, so ops-tower sees it run.
 
   Its command gets the parent's marker verbatim, and a heavy gate covered by any parent is never routed.
-- Under a critical parent the command runs at High priority and the watchdog measures it as a critical gate's.
+- Under a critical parent the command runs at High priority and the watchdog measures it as a critical gate's, until a late take gives the gate a slot of its own kind.
 - A parent is live by the three-way liveness dead-gate cleanup uses (`slots::Liveness`): gone means no such process, a start mismatch or access denied; any other error reading its start counts as running, with no extra line.
 - A malformed marker says `gate: ignored GATE_SLOT_HELD='<text>', which is not <kind>:<pid>:<start>; taking a <kind> slot`, with every character outside `[A-Za-z0-9:]` in `<text>` shown as `?` and at most 64 characters, then `...`.
 
-  A marker whose parent is gone says `gate: ignored GATE_SLOT_HELD='<marker>': gate <pid> is no longer running; taking a <kind> slot`. A marker hashed for another root, or unhashed under a non-default root, is ignored silently. Each of these gates then takes its own slot; a no-slot gate says `...; running on no slot` in place of `taking a <kind> slot`.
+  A marker whose parent is gone says `gate: ignored GATE_SLOT_HELD='<marker>': gate <pid> is no longer running; taking a <kind> slot`. A marker hashed for another root, or unhashed under a non-default root, is ignored silently. Each of these gates then takes its own slot, unless a stand-in is found for it (below); a no-slot gate says `...; running on no slot` in place of `taking a <kind> slot`.
 - A marker is honoured only when it binds to a real parent gate's job, since any process can set the variable. It binds when the parent gate's named job holds this gate itself, asked first from this gate's own handle without a snapshot, or, walking up one process snapshot without command lines, the first ancestor the job holds. Each process is checked by its creation time against pid reuse, and a job the gate may only list is enough.
 
   Under `cmd` then `pwsh` (a git hook's pwsh) the binding is found two ancestors up.
-- A marker that does not bind says `gate: ignored GATE_SLOT_HELD='<marker>': this gate does not run inside the command of gate <pid>; taking a <kind> slot` (`running on no slot` for a no-slot gate), and the gate runs as one under no parent, never refused, a critical gate included.
+- A marker that does not bind says `gate: ignored GATE_SLOT_HELD='<marker>': this gate does not run inside the command of gate <pid>; taking a <kind> slot` (`running on no slot` for a no-slot gate), and the gate runs as one under no parent, never refused, a critical gate included, unless a stand-in is found for it (below), which replaces this line.
 
   A marker is unbound when no job has the parent's name, the chain ends with no member, a process was reused, an ancestor's start is missing from the snapshot, the job name is held by another kind of object, or access to the job is denied while the marker's gate, by pid and start, is not among this gate's ancestors.
 - A binding that cannot be judged covers: access to the job denied while the marker's gate is among this gate's ancestors (an elevated parent), a membership query that fails, or a snapshot that does not list this gate.
 
   A process on the walk that cannot be opened is unbound, not unjudged: the snapshot read its start through the same open, so it changed after the snapshot. The gate first prints `gate: could not judge GATE_SLOT_HELD='<marker>' (<reason>); running under the <held kind> slot of gate <pid>`, and then goes on as under a bound marker.
 - The binding guards against an inherited, copied or leaked marker, not against a same-user process that sets out to forge one (GATE-144 tracks hardening).
-- **A covered gate whose parent gate ends first** (GATE-101), planned, not built: the parent is checked once, before the command runs, and a gate job has no kill-on-close, so a nested gate the parent's command backgrounded, or one whose parent was killed from Task Manager, keeps running uncounted after the parent's slot is released and taken by another gate.
+- **A covered gate whose parent gate ends first** (the late take, `crates/gate/src/late.rs`). A gate job has no kill-on-close, so a nested gate the parent's command backgrounded, or one whose parent was killed from Task Manager, would keep running uncounted after the parent's slot is released and taken by another gate; a covered gate therefore takes a slot of its own, or runs under a live stand-in's.
 
-  The covered gate holds a waitable handle on its parent (`WaitableProcess` in `crates/gate-win32/src/tree.rs`, as `burn.rs` uses it), bound by the same check that binds the marker, and the watch loop gains a parent-ended arm. When the parent ends while the command still runs, it says `gate: the parent gate {pid} ended; taking a {kind} slot for the rest of this run` and takes a slot of its kind as soon as one frees, and the journal records the take.
+  A heavy or light covered gate holds a waitable handle on its parent (`WaitableProcess` in `crates/gate-win32/src/tree.rs`, as `burn.rs` uses it), opened as its watch begins and looked at on every step of the watch loop. A `none` or critical gate takes no late slot and watches nothing.
 
-  The take happens beside the running command, never through `Hold`/`take_own` before it: the command never pauses while it waits. Until a slot frees the machine is one gate over its pool, as today, and the slot is released with the run as any claim is.
+  When the parent ends while the command still runs, the gate looks for a stand-in (below); finding none it says `gate: the parent gate <pid> ended; taking a <kind> slot for the rest of this run`, queues a ticket of its own kind with the run's first arrival, and takes a slot as soon as one frees. The journal records a `take` with `parentPid` naming the ended parent, the claim is written, and the run's end journals a `release` of that slot and lets it go as any slot is.
 
-  Rejected: the parent ending its job's remaining processes once its command exits. A parent does not kill its leftovers on a clean exit, since build servers and deliberate background work keep running, as today.
+  The take happens beside the running command, on the thread that will release the slot, never through `Hold`/`take_own` before it: the command never pauses while it waits. Until a slot frees the machine is one gate over its pool, and a command that ends while the gate still waits deletes the ticket and says nothing more. The wait's `still waiting` lines are the ordinary ones.
+
+  Under a critical parent that ended, the command had run at High as a critical gate's; once the gate holds its own slot (or runs under a stand-in's) the watch measures it as its own kind, stops raising the servers to High, and lowers every process of the command's job still at High to BelowNormal.
+
+  A process it cannot lower, or a job whose processes it cannot list, is said: `gate: could not lower the command's process <pid> from High: <error>` and `gate: cannot list the command's processes to lower them from High: <error>`.
+
+  A parent that cannot be watched is said once, and the run stays covered by it to its end: `gate: cannot watch the parent gate <pid> (<reason>); this run stays covered by it` for an open or start read that fails and for access denied to a live or unknown parent, and `... (no covered marker); this run stays covered by it` for a run that wrote no covered marker, since a gate started inside its command could not find it to run under its slot.
+
+  The gate then rewrites its covered marker with `kind` `none` ([Covered marker](#covered-marker)) so no gate runs under it in the parent's place.
+
+  **The stand-in.** A stand-in is a live covered gate, heavy or light by its marker's `kind`, whose command holds this gate and whose own slot kind covers this gate's, standing in for the ended parent.
+
+  The command holds the gate when the candidate's job holds this gate's own process, else when one walk up this gate's ancestors in a process snapshot finds the candidate's job holding one (the same test that binds a marker); a binding that cannot be judged binds nothing, since queueing is the safe failure. Candidates are tried outermost first (by start, then pid), those whose kind covers this gate's before the others, and a gate whose liveness is gone is passed over.
+
+  This gate then stays covered, says `gate: the parent gate <ended pid> ended; running under the <held> slot of gate <A>` (`<held>` is the stand-in's own kind), watches the stand-in in turn, and names it in `parentPid` should it take a slot itself, so one build tree holds one slot.
+
+  A stand-in that cannot be watched is passed over with `gate: cannot watch gate <pid> (<reason>) to run under its slot in place of the parent gate <ended pid>`, and the search goes on. A covered folder that cannot be read says `gate: cannot read the covered markers in <dir>: <error>` and finds none.
+
+  A gate started after its marker's gate ended, or whose live parent's command no longer holds it (its job closed as it ended), is taken up by a stand-in at start-up the same way, and says `gate: running under the <held> slot of gate <A>` in place of the `ignored GATE_SLOT_HELD=...` line.
+
+  A critical gate there is refused as under a live heavy or light gate (below). A heavy gate whose only stand-in is light says `gate: the light slot of gate <A> does not cover a heavy gate; taking a heavy slot`, and a light gate turned heavy by a dropped `--no-build` searches again for a heavy stand-in.
+
+  Rejected: the parent ending its job's remaining processes once its command exits. A parent does not kill its leftovers on a clean exit, since build servers and deliberate background work keep running.
 - A critical gate under a heavy or light marker is refused (K7) on stderr only, exit 2, before the log mutex, with nothing queued or journalled: `gate: --slot critical cannot run under the <held kind> slot of gate <pid>: it would wait for that slot for good; run the critical command outside that gate` (`-Slot critical` through the PowerShell spelling).
 - A heavy gate under a light marker takes its own slot and says `gate: the <held kind> slot of gate <pid> does not cover a <kind> gate; taking a <kind> slot` just before its local take (after a Local route or a fallback, before its wait lines); a gate routed to the builder never says it.
 - **No slot.** A `none` run takes nothing and is never held by the drain or the barrier. Its marker is `GATE_SLOT_HELD=none:<pid>:<start>[:<h>]`. A gate under a `none` marker (the case `Nesting::Beside`) takes its own slot as a top-level gate would: a critical child takes the machine and is never refused (K7 applies to heavy and light markers only).

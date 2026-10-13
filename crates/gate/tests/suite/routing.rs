@@ -12,17 +12,19 @@ use gate_router::{DROPPED_NO_BUILD_LINE, NO_OUTPUTS_LINE, repo_name};
 use serde_json::{Value, json};
 
 use crate::bridge::{answer, bridge_words, stand_in};
-use crate::nesting::{marked, test_marker};
+use crate::nesting::{LOOK_OFTEN, end_parent, first_event, marked, orphaned_as, spawned, test_marker};
 
 use crate::support::{
-    Case, FAKE_TOOL, Running, assert_in_order, copy_tool, events, finish, git, git_init, heavy_words, nothing_back, record_path, release, run_words,
-    shown, wait_for_journal_line, wait_until, write_counts, write_remote_json,
+    Case, FAKE_TOOL, GATE, Running, assert_in_order, copy_tool, events, finish, git, git_init, heavy_words, nothing_back, powershell_folder,
+    record_path, release, run_words, shown, wait_for_journal_line, wait_until, write_counts, write_remote_json,
 };
 
 pub(crate) const HOST: &str = "builder";
 pub(crate) const BUSY_LINE: &str = "gate: remote builder busy; running here";
 /// The line a routed run says as it falls back here from a full remote pool.
 const FULL_LINE: &str = "gate: remote builder full; running here";
+/// The first still-waiting line a local heavy wait says, which counts from the moment the wait counts from.
+const STILL_WAITING_HEAVY: &str = "gate: still waiting for a heavy slot (";
 const NOTHING_SENT_LINE: &str = "gate: not routed: sub holds nothing the snapshot sends";
 const REMOTE_WAITING: &str = "gate: waiting for a remote slot on builder (1 busy)";
 /// The status Windows reports for a process Ctrl+C ended, `STATUS_CONTROL_C_EXIT`, as a signed exit code.
@@ -945,6 +947,48 @@ fn a_light_no_build_under_a_light_parent_takes_a_heavy_slot_of_its_own() {
 }
 
 #[test]
+fn a_light_no_build_under_a_light_stand_in_runs_under_the_heavy_slot_its_own_gate_took() {
+    let case = routed_case("routing-nothing-back-stand-in");
+    copy_tool(&case, "dotnet.exe");
+    dotnet_cmd(&case);
+    routed_build(&case, "routed.log");
+    // The record is left; with no routing file, no gate of the chain below is routed.
+    fs::remove_file(powershell_folder(&case).join("remote.json")).expect("the routing file can be removed");
+    write_counts(&case.root(), r#"{"v":1,"heavy":1}"#);
+    let paths = ["b.pid", "b.release", "b-go", "g.pid", "g.release", "outer.release"].map(|name| case.folder().join(name));
+    let [b_pid, b_release, b_go, g_pid, g_release, release] = &paths;
+    let texts = paths.each_ref().map(|path| shown(path));
+    let mut b_command = vec![FAKE_TOOL, "wait", &texts[2], "spawn-pid", &texts[3], &texts[4], GATE];
+    b_command.extend(run_words("g.log", &[], &NO_BUILD_TEST));
+    let mut a_command = vec![FAKE_TOOL, "spawn-pid", &texts[0], &texts[1], GATE];
+    a_command.extend(heavy_words("b.log", &LOOK_OFTEN, &b_command));
+    let a_words = run_words("a.log", &LOOK_OFTEN, &a_command);
+
+    // P (heavy) > A (light) > B (heavy). P ends: A takes a light slot of its own, and B, which A's light slot does
+    // not cover, takes the one heavy slot.
+    let (outer, a) = orphaned_as(&case, "heavy", &a_words, release);
+    let b = spawned(&case, b_pid);
+    end_parent(outer, release);
+    wait_for_journal_line(&case.root(), &format!(r#""event":"take","pid":{},"#, a.pid));
+    wait_for_journal_line(&case.root(), &format!(r#""event":"take","pid":{},"#, b.pid));
+
+    // B's command starts G, a light dotnet test under P's marker whose --no-build is dropped, so it runs as a heavy gate:
+    // under B's heavy slot, not queued behind it as a gate A's light slot does not cover.
+    let_go(b_go);
+    let (g, first) = first_event(&case, g_pid);
+    assert_eq!(
+        (&first["event"], &first["parentPid"]),
+        (&Value::from("covered"), &Value::from(b.pid)),
+        "G runs under B's heavy slot: {first}"
+    );
+    assert_eq!(g.ended(), 0);
+    let_go(g_release);
+    assert_eq!(b.ended(), 0);
+    let_go(b_release);
+    assert_eq!(a.ended(), 0);
+}
+
+#[test]
 fn an_ignored_marker_line_names_the_heavy_slot_a_dropped_light_run_takes() {
     let case = routed_case("routing-nothing-back-ignored-marker");
     copy_tool(&case, "dotnet.exe");
@@ -1315,6 +1359,49 @@ fn a_full_fallback_counts_the_local_takes_wait_from_the_queue_line() {
     );
     let_go(&go);
     assert_eq!(holder.finish().code, Some(0));
+}
+
+/// A run that waited out the remote pool's limit and fell back to a held local heavy pool says its first still-waiting
+/// line with the whole wait in it, never with the seconds since its local take began.
+#[test]
+fn a_full_fallback_says_the_whole_wait_in_its_still_waiting_lines() {
+    let case = routed_case("routing-full-still-waiting");
+    write_counts(&case.root(), r#"{"v":1,"heavy":1}"#);
+    let local_go = case.folder().join("local-go");
+    let local_go_word = shown(&local_go);
+    let local_holder = case.start(&heavy_words_with_limit(
+        "local.log",
+        &["--local"],
+        &[r".\tool.exe", "wait", &local_go_word],
+    ));
+    wait_for_journal_line(&case.root(), &format!(r#""event":"take","pid":{},"#, local_holder.id()));
+    let go = case.folder().join("go");
+    let holder = remote_holder(&case, "holder.log", &go);
+    let steps = shown(&stub(&case, &["status 0"]));
+    let seams = ["--test-remote-wait-ms", "2000", "--test-heartbeat-ms", "1000", "--test-poll-ms", "100"];
+    let waiter = case.start(&routed_words("waiter.log", &steps, &seams, &[r".\tool.exe", "out", "hi"]));
+    let stderr = waiter.wait_for_stderr_where("the local wait's first still-waiting line", |text| text.contains(STILL_WAITING_HEAVY));
+
+    let line = stderr
+        .lines()
+        .find(|line| line.starts_with(STILL_WAITING_HEAVY))
+        .expect("the local wait says it still waits");
+    let seconds: u64 = line
+        .trim_start_matches(STILL_WAITING_HEAVY)
+        .trim_end_matches(" s)")
+        .parse()
+        .expect("the line names the whole seconds waited");
+    assert!(
+        seconds >= 2,
+        "the local wait counts from the run's queue line, so the 2 s remote wait is in it: {line}"
+    );
+
+    let_go(&local_go);
+    let_go(&go);
+    let outcome = waiter.finish();
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_in_order(&outcome.stderr, &[REMOTE_WAITING, FULL_LINE, STILL_WAITING_HEAVY]);
+    assert_eq!((local_holder.finish().code, holder.finish().code), (Some(0), Some(0)));
 }
 
 /// A Ctrl+C during the local wait that follows a full fallback journals its abandon with the waited time counted from

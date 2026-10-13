@@ -496,13 +496,15 @@ impl JournalCache {
         run.covered = line.event == "covered";
     }
 
-    /// The run a gate that said `parent` at `at` ran under, once that run has released its slot: of the runs of gate
-    /// `pid` that took their slot at or before `at`, the latest.
+    /// The run a gate that said `parent` or `covered` at `at` ran under, once that run has released its slot: the run of
+    /// gate `pid` alive at `at`, the one whose first line is the latest at or before it, whether it had taken its slot
+    /// by then or, standing in for an ended parent, took it after. An older run of a gate that had the same pid is never
+    /// it.
     fn released_parent(&self, (pid, at): (u32, Timestamp)) -> Option<(&RunKey, &Run)> {
         self.runs
             .iter()
-            .filter(|((run_pid, _), run)| *run_pid == pid && run.started.as_ref().is_some_and(|started| started.at <= at))
-            .max_by_key(|(_, run)| run.started.as_ref().map(|started| started.at))
+            .filter(|((run_pid, _), run)| *run_pid == pid && run.first <= at)
+            .max_by_key(|(_, run)| run.first)
             .filter(|(_, run)| run.end == Some(End::Released))
     }
 
@@ -646,8 +648,21 @@ impl Run {
         }
     }
 
+    /// Whether the run is a covered run that took a slot of its own once its parent ended as its command ran: a covered
+    /// run journals a `take` for no other slot.
+    fn took_late(&self) -> bool {
+        self.covered && self.started.is_some()
+    }
+
+    /// Whether the run ran on its parent's slot, which its row reads its end from: a run with a parent, unless it is a
+    /// covered run that took a slot of its own ([`Self::took_late`]), which reads as any run with its own take does,
+    /// running, unrecorded or released.
+    fn on_parent(&self) -> bool {
+        self.parent.is_some() && !self.took_late()
+    }
+
     fn state(&self, (pid, process_start): &RunKey, is_live: &impl Fn(u32, &str) -> bool) -> RunState {
-        if self.parent.is_some() {
+        if self.on_parent() {
             return if self.covered { RunState::Covered } else { RunState::Parent };
         }
         match self.end {
@@ -665,9 +680,9 @@ impl Run {
     }
 
     /// The row of the run keyed `key`, its state and whether its gate runs judged by `is_live`; a run on its parent's
-    /// slot takes its status and held time from `parent`, its parent's ended run.
+    /// slot ([`Self::on_parent`]) takes its status and held time from `parent`, its parent's ended run.
     fn row(&self, key: &RunKey, is_live: &impl Fn(u32, &str) -> bool, repo: Option<String>, parent: Option<&Self>) -> HistoryRun {
-        let end = if self.parent.is_some() { parent } else { Some(self) };
+        let end = if self.on_parent() { parent } else { Some(self) };
         let (pid, process_start) = key;
         HistoryRun {
             command: self.command.clone(),
@@ -698,10 +713,11 @@ impl Run {
         }
     }
 
-    /// The held time of a run that passed and took its slot at or after `cutoff`; never a run on its parent's slot,
-    /// whose parent's run counts the time.
+    /// The held time of a run that passed and took its slot at or after `cutoff`; never a run on its parent's slot
+    /// ([`Self::on_parent`]), whose parent's run counts the time, nor a covered run that took its slot late
+    /// ([`Self::took_late`]), whose held time covers only the stretch after its parent ended.
     fn counted_held_seconds(&self, cutoff: Timestamp) -> Option<f64> {
-        let passed = self.end == Some(End::Released) && self.status == Some(0) && self.parent.is_none();
+        let passed = self.end == Some(End::Released) && self.status == Some(0) && !self.on_parent() && !self.took_late();
         let recent = self.started.as_ref().is_some_and(|started| started.at >= cutoff);
         if passed && recent { self.held_seconds } else { None }
     }
@@ -716,7 +732,8 @@ fn newest_first(runs: &HashMap<RunKey, Run>) -> Vec<(&RunKey, &Run)> {
 
 /// The keys of the runs the history lists, newest first as [`newest_first`] orders them: the [`RECENT_RUNS`] newest
 /// runs that are not covered, and the [`RECENT_COVERED_RUNS`] newest covered runs newer than the oldest of them; every
-/// run that is not covered when fewer are.
+/// run that is not covered when fewer are. A covered run that took a slot of its own ([`Run::took_late`]) counts as a
+/// run that is not covered.
 fn listed(runs: &HashMap<RunKey, Run>) -> Vec<RunKey> {
     let mut listed = Vec::new();
     let (mut counted, mut covered) = (0, 0);
@@ -724,7 +741,7 @@ fn listed(runs: &HashMap<RunKey, Run>) -> Vec<RunKey> {
         if counted == RECENT_RUNS {
             break;
         }
-        if run.covered {
+        if run.covered && !run.took_late() {
             if covered == RECENT_COVERED_RUNS {
                 continue;
             }

@@ -24,8 +24,10 @@ use windows_sys::Win32::System::Threading::{
 };
 
 use crate::build_servers::tool;
-use crate::nesting::{marked, test_marker};
-use crate::support::{Case, critical_words, run_words, said_pid, shown, start, wait_until, write_counts};
+use crate::nesting::{LOOK_OFTEN, end_parent, let_go, line_with, marked, orphaned_as, spawned, test_marker};
+use crate::support::{
+    Case, FAKE_TOOL, GATE, critical_words, events_of, heavy_words, run_words, said_pid, shown, start, wait_for_journal_line, wait_until, write_counts,
+};
 
 /// The status Windows reports for a process Ctrl+C ended, `STATUS_CONTROL_C_EXIT`, as a signed exit code: how a case's
 /// run ends when the gate raises its own interrupt and stops the command.
@@ -428,6 +430,85 @@ fn high_gate_leaves_a_server_in_another_gates_job() {
     let outcome = critical.finish();
 
     assert_eq!(outcome.code, Some(CONTROL_C_EXIT), "{outcome:?}");
+}
+
+#[test]
+fn a_gate_covered_by_a_critical_parent_that_ends_lowers_its_command_and_moves_servers_as_its_own_kind() {
+    let case = Case::new("a_gate_covered_by_a_critical_parent_that_ends_lowers_its_command_and_moves_servers_as_its_own_kind");
+    let compiler = tool(&case, SERVER);
+    let go = go_path(&case);
+    let release = case.folder().join("outer.release");
+    let mut extra = LOOK_OFTEN.to_vec();
+    extra.extend(["--test-server-image", SERVER]);
+    let inner = heavy_words("inner.log", &extra, &[FAKE_TOOL, "pid", "wait", &go]);
+    // The heavy gate runs under the critical outer gate's slot, as critical: its command at High.
+    let (outer, orphan) = orphaned_as(&case, "critical", &inner, &release);
+    let log = case.folder().join("inner.log");
+    wait_until("the command to say its pid", || {
+        fs::read_to_string(&log).is_ok_and(|text| text.lines().any(|line| line.starts_with("pid ")))
+    });
+    let command = said_pid(&fs::read_to_string(&log).expect("the log can be read"), "pid ");
+    assert_eq!(class_of(command), HIGH_PRIORITY_CLASS, "the command runs as critical");
+
+    end_parent(outer, &release);
+    wait_for_journal_line(&case.root(), &format!(r#""event":"take","pid":{},"#, orphan.pid));
+    wait_until("the command lowered from High at the take", || {
+        class_of(command) == BELOW_NORMAL_PRIORITY_CLASS
+    });
+    // A server in the job of another live gate holding a slot, which a High gate leaves alone and a heavy gate with no
+    // critical request holding the machine lowers: only a gate whose servers and guard both moved off High lowers it.
+    let other = InJob::start(&case, process::id(), &compiler);
+    write_claim(&case, KernelObject::LightSlot(0), ClaimKind::Light);
+    // Not read back: the gate may lower it at once.
+    put_class(other.pid(), NORMAL_PRIORITY_CLASS);
+    wait_until("the server in the other gate's job lowered as a heavy gate's pass lowers it", || {
+        class_of(other.pid()) == BELOW_NORMAL_PRIORITY_CLASS
+    });
+
+    fs::write(&go, "").expect("the go file can be written");
+    assert_eq!(orphan.ended(), 0);
+}
+
+#[test]
+fn a_light_gate_under_a_critical_parent_that_ends_runs_as_light_under_a_heavy_stand_in() {
+    let case = Case::new("a_light_gate_under_a_critical_parent_that_ends_runs_as_light_under_a_heavy_stand_in");
+    let compiler = tool(&case, SERVER);
+    let paths = ["c.pid", "c.release", "c-go", "outer.release"].map(|name| case.folder().join(name));
+    let [c_pid, c_release, c_go, release] = &paths;
+    let texts = paths.each_ref().map(|path| shown(path));
+    // Only C reads the case's server image as a server's, so only C moves the server outside every job: up to High
+    // while it runs as critical, down to below normal once it runs as light.
+    let mut c_extra = LOOK_OFTEN.to_vec();
+    c_extra.extend(["--test-server-image", SERVER]);
+    let mut a_command = vec![FAKE_TOOL, "spawn-pid", &texts[0], &texts[1], GATE];
+    a_command.extend(run_words("c.log", &c_extra, &[FAKE_TOOL, "wait", &texts[2]]));
+    let a_words = heavy_words("a.log", &LOOK_OFTEN, &a_command);
+    let server = Waiter::start(&case, &compiler);
+    set_class(server.pid(), BELOW_NORMAL_PRIORITY_CLASS);
+
+    // O (critical) > A (heavy) > C (light): both run as critical.
+    let (outer, a) = orphaned_as(&case, "critical", &a_words, release);
+    let c = spawned(&case, c_pid);
+    wait_until("C raising the server as a critical gate does", || {
+        class_of(server.pid()) == HIGH_PRIORITY_CLASS
+    });
+
+    let outer_pid = end_parent(outer, release);
+    let c_line = line_with(&case.folder().join("a.log.err"), &format!("gate: the parent gate {outer_pid} ended;"));
+    assert_eq!(
+        c_line,
+        format!("gate: the parent gate {outer_pid} ended; running under the heavy slot of gate {}", a.pid),
+        "A stands in with the heavy slot it takes, not the critical one O held"
+    );
+    wait_until("C lowering the server as a light gate does", || {
+        class_of(server.pid()) == BELOW_NORMAL_PRIORITY_CLASS
+    });
+
+    let_go(c_go);
+    assert_eq!(c.ended(), 0);
+    let_go(c_release);
+    assert_eq!(a.ended(), 0);
+    assert_eq!(events_of(&case, c.pid), ["covered"]);
 }
 
 #[test]

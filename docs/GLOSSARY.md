@@ -69,6 +69,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Keeper**: the `cmd.exe` `gate box run` starts on its own console while it is away on the donor's console, so its own console stays alive for it to return to.
 - **Key version**: `keyVersion` in the durations store, naming the rule set that made its keys; a store written under another one is rebuilt.
 - **Late arrival**: a PowerShell gate whose earliest claim or ticket `since` is later than the cutover flag's write time, because its caller bypassed the launcher; the cutover's drain names it.
+- **Late take**: the slot of its own kind that a covered gate takes, beside its running command, when its parent gate ends first; its `take` names the ended parent in `parentPid`.
 - **Lending**: a light parent gate letting a nested heavy gate, which its slot does not cover, run on that slot while a critical request drains and before one holds the machine, instead of queueing behind it; the gate is the lent gate. A parent on a reserved light slot lends nothing.
 - **Lent window**: the span during a critical drain in which the critical gate lends one slot to backfill guests, ending at the shadow end.
 - **Light**: the slot kind for work that keeps one or two cores busy; its pool's thread budget is 2.
@@ -128,6 +129,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Spawn lock**: the `gate-win32` lock held while the gate starts any process, so only the launched command inherits the copies of its handles.
 - **Stable line**: one of the three published `gate:` line forms callers may parse (STALLED, TIMED OUT or BACKSTOP; `waiting for the machine (critical)`; `Full output:`); every other `gate:` line is prose.
 - **Stall**: a kill for no progress (no output, CPU, new process or build-server work) for the stall window, `--stall` seconds.
+- **Stand-in**: a live covered gate whose command holds a nested gate and whose own slot kind covers it, which that gate runs under in place of its ended parent gate, so one build tree holds one slot; only a covered marker with `kind` `heavy` or `light` is one.
 - **Start marker**: the stderr line `gate-remote-started: <nonce>` that `gate box run` says just before it launches the command; a run call that carried it is never retried and is not a pre-banner failure.
 - **State root**: the folder holding every file the gate writes, `%LOCALAPPDATA%\gate\v1\` by default, overridden by `--state-dir` or `GATE_STATE_DIR`.
 - **Stop event**: the manual-reset event `<box job name>-stopped` that `gate box run` creates before its job and `gate box stop` sets before it terminates the job, so a launch that finds it set ends the command unstarted.

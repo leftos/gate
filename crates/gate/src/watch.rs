@@ -16,12 +16,13 @@ use gate_watchdog::{
     Config, Cores, JOB_LINES, Machine, OUTSIDE_LINES, ProcessFacts, Report, Sample, SampleFacts, SampleHistory, ServerFacts, SystemTimes, Ticks,
     Watch, WslVm, failed_block, is_wsl_command, lines, wsl_unavailable_line,
 };
-use gate_win32::{Interrupt, Job, ProcessTimes, Running, Waited};
+use gate_win32::{Interrupt, Job, Priority, ProcessTimes, Running, Waited};
 use jiff::Timestamp;
 use proc_table::{ProcessInfo, ProcessTable, ProcessTree, Win32ProcessTable, filetime_to_timestamp};
 
 use crate::console::Console;
 use crate::escaped::{self, Departed, Look, Recorded};
+use crate::late::Late;
 use crate::log::Log;
 use crate::nesting::Parent;
 use crate::pause::PauseReader;
@@ -107,6 +108,17 @@ pub(crate) struct Watcher<'a> {
     others: OtherGates<'a>,
     /// The classes this watch moves the sample's build servers to.
     priority: Prioritizer<'a>,
+    /// The watch of the parent gate whose slot covers this one, and the slot it takes once that parent ends ([`Late`]);
+    /// `None` for any other run.
+    late: Option<Late<'a>>,
+    /// When the last sample ended, or the watch began: the next sample comes a whole period after it, and while the late
+    /// take waits for a slot, the watch wakes on its poll in between.
+    sampled: Instant,
+    /// The slot kind the command runs as ([`Watching::runs_as`]), and the gate's own kind, which it runs as once a late
+    /// take gave it a slot of that kind.
+    runs_as: Slot,
+    kind: Slot,
+    processors: usize,
 }
 
 /// Build servers' CPU time in 100 ns ticks, by pid, as a sample carries them.
@@ -188,6 +200,9 @@ pub(crate) struct Watching<'a> {
     pub survey: &'a mut Survey,
     /// Where the samples record the processes outside the job, which the run's kill reads.
     pub recorded: &'a RefCell<Recorded>,
+    /// The watch of the parent gate whose slot covers a heavy or light run, which takes a slot of the run's kind once
+    /// that parent ends; `None` for any other run.
+    pub late: Option<Late<'a>>,
 }
 
 /// One sample pass's gathered facts: the sample itself, the sizes of the log and its `.err` file, the two kept apart
@@ -218,6 +233,7 @@ impl<'a> Watcher<'a> {
             hands_on,
             survey,
             recorded,
+            late,
         } = run;
         let system = system_times()?;
         let job_cpu = Ticks(job.accounting()?.cpu);
@@ -256,18 +272,35 @@ impl<'a> Watcher<'a> {
             classified: Vec::new(),
             others: OtherGates::new(high, gate, root, survey),
             priority: Prioritizer::new(high),
+            late,
+            sampled: Instant::now(),
+            runs_as,
+            kind: request.slot,
+            processors,
         })
     }
 
     /// Waits for the command to exit, sampling it every period, until it exits, is killed or the console is
-    /// interrupted. A sample that fails is said once, and the watch goes on by wall time alone.
+    /// interrupted. A sample that fails is said once, and the watch goes on by wall time alone. Each wake also looks at
+    /// the covering parent gate, or takes a pass of the wait for a slot once it has ended ([`Late::step`]); while that
+    /// wait goes on, the watch wakes on its poll, and a wait still going when the watch ends ends with it.
     ///
     /// # Errors
     ///
     /// The system's error when the wait fails, or when the job's processes cannot be counted for a kill.
     pub(crate) fn until_end(&mut self, console: &mut Console) -> io::Result<Watched> {
+        let watched = self.watch_to_end(console);
+        if let Some(late) = &mut self.late {
+            late.end(console);
+        }
+        watched
+    }
+
+    /// The loop of [`Watcher::until_end`].
+    fn watch_to_end(&mut self, console: &mut Console) -> io::Result<Watched> {
         loop {
-            match self.wait(self.period)? {
+            let polling = self.late.as_ref().and_then(Late::polling);
+            match self.wait(slice(self.period, self.sampled.elapsed(), polling))? {
                 Waited::Exited(code) => {
                     self.end(console);
                     return Ok(Watched::Exited(code));
@@ -278,7 +311,14 @@ impl<'a> Watcher<'a> {
                 }
                 Waited::Running => {}
             }
+            if self.late.as_mut().is_some_and(|late| late.step(console)) {
+                self.after_late_take(console);
+            }
+            if !sample_due(self.period, self.sampled.elapsed(), polling.is_some()) {
+                continue;
+            }
             self.take_sample(console);
+            self.sampled = Instant::now();
             self.samples += 1;
             if let Some(interrupt) = self.interrupt.filter(|_| self.interrupt_after == Some(self.samples)) {
                 interrupt.raise();
@@ -286,6 +326,31 @@ impl<'a> Watcher<'a> {
             if let Some(watched) = self.kill(console)? {
                 return Ok(watched);
             }
+        }
+    }
+
+    /// Runs the command as the gate's own kind once a late take gave it a slot of that kind, or a heavy or light gate
+    /// stands in for its ended parent, when a critical parent's slot had it run as critical ([`own_kind_after_take`]):
+    /// the watch measures it on the machine of its own kind from
+    /// the next sample on, its build servers are no longer raised to High, and its processes still at High are lowered to
+    /// below normal, as a command of its kind starts. A process that cannot be lowered is said.
+    fn after_late_take(&mut self, console: &mut Console) {
+        let Some(kind) = own_kind_after_take(self.runs_as, self.kind) else {
+            return;
+        };
+        self.runs_as = kind;
+        self.watch.run_on(machine(kind, self.processors));
+        self.priority.set_high(false);
+        self.others.set_high(false);
+        let pids = match self.job.process_ids() {
+            Ok(pids) => pids,
+            Err(error) => {
+                console.err(&format!("gate: cannot list the command's processes to lower them from High: {error}"));
+                return;
+            }
+        };
+        for (pid, error) in lowered(&pids, gate_win32::priority_of, gate_win32::set_priority) {
+            console.err(&format!("gate: could not lower the command's process {pid} from High: {error}"));
         }
     }
 
@@ -704,6 +769,49 @@ fn config(request: &RunRequest) -> Config {
     }
 }
 
+/// How long the watch waits for the command on this pass, `since` the last sample ended: what is left of the sample
+/// period, or while a late take waits for a slot (`polling`), its poll when that is shorter; rounded up to a whole
+/// millisecond, the wait's own unit, so a wait that ends a fraction of a millisecond early is not followed by one of 0.
+fn slice(period: Duration, since: Duration, polling: Option<Duration>) -> Duration {
+    let left = period.saturating_sub(since);
+    let slice = polling.map_or(left, |poll| poll.min(left));
+    let millis = slice.as_nanos().div_ceil(1_000_000);
+    Duration::from_millis(u64::try_from(millis).unwrap_or(u64::MAX))
+}
+
+/// Whether a pass samples, `since` the last sample ended: every pass that waited the rest of the period, and while a
+/// late take waits for a slot (`polling`), only the first pass once a whole period has passed.
+fn sample_due(period: Duration, since: Duration, polling: bool) -> bool {
+    !polling || since >= period
+}
+
+/// The kind a command run as `runs_as` runs as once a late take gave the gate `kind` a slot of its own kind: its own,
+/// when a critical parent's slot had it run as critical; `None` when it ran as its own kind already.
+fn own_kind_after_take(runs_as: Slot, kind: Slot) -> Option<Slot> {
+    (runs_as != kind).then_some(kind)
+}
+
+/// Lowers each process of `pids` that `class_of` reads at High to below normal through `set`; the processes that
+/// could not be read or lowered, with why. A process that has ended meanwhile is passed over.
+fn lowered(
+    pids: &[u32],
+    class_of: impl Fn(u32) -> io::Result<Option<Priority>>,
+    set: impl Fn(u32, Priority) -> io::Result<Option<()>>,
+) -> Vec<(u32, io::Error)> {
+    let mut failed = Vec::new();
+    for &pid in pids {
+        let lowered = match class_of(pid) {
+            Ok(Some(Priority::High)) => set(pid, Priority::BelowNormal).map(|_| ()),
+            Ok(_) => Ok(()),
+            Err(error) => Err(error),
+        };
+        if let Err(error) = lowered {
+            failed.push((pid, error));
+        }
+    }
+    failed
+}
+
 /// Whether the gathering that began at `started` has used up its `budget_ms` milliseconds.
 fn out_of_time(started: Instant, budget_ms: u128) -> bool {
     started.elapsed().as_millis() >= budget_ms
@@ -810,12 +918,17 @@ mod tests {
     use std::ffi::OsString;
     use std::io;
     use std::path::PathBuf;
+    use std::time::Duration;
 
     use gate_args::{RunRequest, Slot, Spelling, TestSeams};
     use gate_watchdog::wsl_unavailable_line;
     use gate_win32::ProcessTimes;
 
-    use super::{ACCESS_DENIED, VmReader, config, machine, members, outside_the_job, sample_facts, server_cpu};
+    use gate_win32::Priority;
+
+    use super::{
+        ACCESS_DENIED, VmReader, config, lowered, machine, members, outside_the_job, own_kind_after_take, sample_due, sample_facts, server_cpu, slice,
+    };
     use crate::escaped::{Look, Recorded};
     use crate::servers::Servers;
 
@@ -985,6 +1098,72 @@ mod tests {
     fn a_no_slot_command_asks_for_one_core() {
         let none = machine(Slot::None, 16);
         assert_eq!((none.cores, none.demand, none.high), (16, 1, false));
+    }
+
+    #[test]
+    fn a_watch_wakes_on_the_late_take_s_poll_and_still_samples_once_a_period() {
+        let period = Duration::from_secs(5);
+        let poll = Duration::from_secs(2);
+        assert_eq!(slice(period, Duration::ZERO, None), period, "no late wait: a whole period after a sample");
+        assert_eq!(
+            slice(period, Duration::from_secs(1), None),
+            Duration::from_secs(4),
+            "no late wait: what is left of the period, so a wait that took the slot does not stretch it"
+        );
+        assert!(sample_due(period, Duration::ZERO, false), "no late wait: every pass samples");
+        assert_eq!(slice(period, Duration::ZERO, Some(poll)), poll, "the poll, while a period is ahead");
+        assert_eq!(
+            slice(period, Duration::from_secs(4), Some(poll)),
+            Duration::from_secs(1),
+            "cut to what is left of the period"
+        );
+        assert_eq!(slice(period, Duration::from_secs(6), Some(poll)), Duration::ZERO, "a sample already due");
+        assert!(
+            !sample_due(period, Duration::from_secs(4), true),
+            "a pass inside the period does not sample"
+        );
+        assert!(sample_due(period, period, true), "the first pass a whole period on samples");
+    }
+
+    #[test]
+    fn a_slice_is_rounded_up_to_a_whole_millisecond_so_no_wait_of_0_ms_repeats() {
+        let period = Duration::from_secs(5);
+        let poll = Duration::from_secs(2);
+        let almost = Duration::from_micros(4_999_700);
+        assert_eq!(slice(period, almost, Some(poll)), Duration::from_millis(1), "300 µs left waits 1 ms");
+        assert_eq!(slice(period, almost, None), Duration::from_millis(1));
+        let after = slice(period, almost, Some(poll));
+        assert!(sample_due(period, almost + after, true), "the pass after that wait samples");
+    }
+
+    #[test]
+    fn only_a_command_run_as_critical_switches_to_its_own_kind_at_a_late_take() {
+        assert_eq!(own_kind_after_take(Slot::Critical, Slot::Heavy), Some(Slot::Heavy));
+        assert_eq!(own_kind_after_take(Slot::Critical, Slot::Light), Some(Slot::Light));
+        assert_eq!(own_kind_after_take(Slot::Heavy, Slot::Heavy), None, "it ran as its own kind already");
+        assert_eq!(own_kind_after_take(Slot::Light, Slot::Light), None);
+    }
+
+    #[test]
+    fn only_the_command_s_processes_at_high_are_lowered_and_each_failure_is_kept() {
+        let set_calls = std::cell::RefCell::new(Vec::new());
+        let class_of = |pid: u32| match pid {
+            1 | 4 => Ok(Some(Priority::High)),
+            2 => Ok(Some(Priority::Normal)),
+            3 => Ok(None),
+            _ => Err(io::Error::other("cannot read")),
+        };
+        let set = |pid: u32, priority: Priority| {
+            set_calls.borrow_mut().push((pid, priority));
+            if pid == 4 { Err(io::Error::other("denied")) } else { Ok(Some(())) }
+        };
+        let failed: Vec<u32> = lowered(&[1, 2, 3, 4, 5], class_of, set).into_iter().map(|(pid, _)| pid).collect();
+        assert_eq!(failed, [4, 5], "the one that could not be set and the one that could not be read");
+        assert_eq!(
+            set_calls.into_inner(),
+            [(1, Priority::BelowNormal), (4, Priority::BelowNormal)],
+            "only the processes at High are moved, to below normal"
+        );
     }
 
     #[test]

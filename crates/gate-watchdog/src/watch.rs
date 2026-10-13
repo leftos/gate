@@ -147,6 +147,12 @@ impl Watch {
         }
     }
 
+    /// Measures the command on `machine` from the next sample on: a command that ran on a critical parent's slot runs on
+    /// a slot of its own kind once its gate took one.
+    pub fn run_on(&mut self, machine: Machine) {
+        self.machine = machine;
+    }
+
     /// Takes one sample: the interval since the last one advances the clock at the share of the machine the command
     /// could have had, or counts as paused time while a gate under this one waits behind a critical request. The
     /// interval runs between the samples' end stamps, the moment their system times and job accounting were read, and

@@ -18,6 +18,7 @@ mod environment;
 mod escaped;
 mod expect;
 mod journal;
+mod late;
 mod log;
 mod machine;
 mod nesting;
