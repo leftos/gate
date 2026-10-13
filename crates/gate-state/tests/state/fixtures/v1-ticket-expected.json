@@ -1,0 +1,1 @@
+{"v":1,"kind":"heavy","arrived":1790852402000,"pid":57100,"startTicks":1790852400500,"holds":false,"expected":{"p50":240.5,"p90":380.25,"n":30,"key":"local::repo | cargo build"}}

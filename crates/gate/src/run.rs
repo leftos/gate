@@ -18,16 +18,17 @@ use gate_router::{
     BuildSettings, BuildTarget, Place, RemoteRun, Route, build_settings, dotnet_builds, dotnet_target, sdk_build_target, without_no_build,
     work_folder_key,
 };
-use gate_state::{FallbackReason, JournalEvent, KernelObject, RebuildOwner, RemoteTag, RunFacts, StateRoot, Verdict, log_hash, v1};
+use gate_state::{Estimate, FallbackReason, JournalEvent, KernelObject, RebuildOwner, RemoteTag, RunFacts, StateRoot, Verdict, log_hash, v1};
 use gate_watchdog::{Cores, Hint, SlotKind, hint};
 use gate_win32::{AcquireError, Interrupt, Job, Launch, LaunchError, LaunchOutput, NamedMutex, OwnedMutexGuard, PriorityClass, Running};
 use jiff::Timestamp;
+use serde_json::{Map, Value};
 
 use crate::acquire;
 use crate::answer::USAGE_STATUS;
 use crate::console::Console;
 use crate::covered::Covered;
-use crate::durations::{RunDurations, RunIdentity};
+use crate::durations::{RunDurations, RunIdentity, expected_field, expected_line};
 use crate::environment::{self, Variables};
 use crate::escaped::{self, Found, Reach, Reached, Recorded};
 use crate::journal::{self, RunJournal};
@@ -515,7 +516,8 @@ struct Run<'a> {
 }
 
 /// What a take of a pool's slot is journalled and claimed with: the run's state root, gate, request and log, its remote
-/// tag while it has one, its journal, and the parent gate its `take` names.
+/// tag while it has one, its journal, the parent gate its `take` names, and what the durations store expects of the
+/// run, which its claim carries.
 pub(crate) struct Taker<'t> {
     pub root: &'t ResolvedRoot,
     pub gate: &'t ThisGate,
@@ -524,6 +526,7 @@ pub(crate) struct Taker<'t> {
     pub tag: Option<&'t RemoteTag>,
     pub journal: &'t mut RunJournal,
     pub parent_pid: Option<u32>,
+    pub expected: Option<&'t Map<String, Value>>,
 }
 
 impl Taker<'_> {
@@ -543,9 +546,17 @@ impl Taker<'_> {
             request: self.request,
             log: self.log.path(),
             remote: self.tag,
+            expected: self.expected,
         };
         slots::write_claim(&taken.held, pool.claim_kind(), &of, console);
         slots::wake_waiters(self.root, survey, console);
+    }
+}
+
+/// Says the expected-time line of the slot just taken, for its `estimate`; nothing for a key without history.
+fn say_expected(estimate: Option<&Estimate>, console: &mut Console) {
+    if let Some(estimate) = estimate {
+        console.err(&expected_line(estimate));
     }
 }
 
@@ -680,12 +691,11 @@ impl Run<'_> {
         Some(RunDurations::open(&self.root.path, &run, placed, &self.request.test_seams))
     }
 
-    /// Says the expected-time line of the slot just taken, keyed by where the run takes it: on the builder of a routed
-    /// attempt, else here.
-    fn say_expected(&mut self, console: &mut Console) {
-        if let Some(durations) = &mut self.durations {
-            durations.say_expected(self.tag.as_ref().map(|tag| tag.host.as_str()), console);
-        }
+    /// The estimate of the slot the run is about to take, keyed by where it takes it: on the builder of a routed attempt,
+    /// else here. `None` for a run without durations or a key without history.
+    fn estimate(&mut self, console: &mut Console) -> Option<Estimate> {
+        let host = self.tag.as_ref().map(|tag| tag.host.as_str());
+        self.durations.as_mut()?.estimate(host, console)
     }
 
     /// Journals the run's `release` line of `slots`, held `held_seconds`, with how the run `ended` and the run's remote
@@ -1245,8 +1255,12 @@ impl Run<'_> {
 
     /// What a take of the run's slot is journalled and claimed with, naming `parent_pid` ([`Taker`]), with the parts the
     /// caller borrows beside it: the survey the run reads the other gates with, where it keeps the slot it takes once
-    /// a covering parent ends ([`Run::late`]), and its covered marker ([`Run::covered`]).
-    fn taker(&mut self, parent_pid: Option<u32>) -> (Taker<'_>, &mut Survey, &mut Option<LateSlot>, &mut Option<Covered>) {
+    /// a covering parent ends ([`Run::late`]), and its covered marker ([`Run::covered`]). The claim carries `expected`.
+    fn taker<'t>(
+        &'t mut self,
+        parent_pid: Option<u32>,
+        expected: Option<&'t Map<String, Value>>,
+    ) -> (Taker<'t>, &'t mut Survey, &'t mut Option<LateSlot>, &'t mut Option<Covered>) {
         let taker = Taker {
             root: self.root,
             gate: &self.gate,
@@ -1255,6 +1269,7 @@ impl Run<'_> {
             tag: self.tag.as_ref(),
             journal: &mut self.journal,
             parent_pid,
+            expected,
         };
         (taker, &mut self.survey, &mut self.late, &mut self.covered)
     }
@@ -1268,6 +1283,8 @@ impl Run<'_> {
     /// parent lent the run its slot, which deletes the ticket and wakes the waiters.
     fn take(&mut self, pool: Pool, since: Option<Instant>, held: &mut Option<Taken>, console: &mut Console) -> Taking {
         let queued = since.unwrap_or_else(Instant::now);
+        let estimate = self.estimate(console);
+        let expected = estimate.as_ref().map(expected_field);
         let arrival = Arrival {
             gate: &self.gate,
             request: self.request,
@@ -1289,6 +1306,7 @@ impl Run<'_> {
                 }),
                 _ => None,
             },
+            expected: expected.as_ref(),
         };
         let mut wait = Wait::queue(self.root, pool, arrival, self.host, console);
         let taken = match wait.until_taken(&mut self.survey, console) {
@@ -1311,9 +1329,10 @@ impl Run<'_> {
         let waited = queued.elapsed().as_secs_f64();
         wait.end(console);
         let took = Instant::now();
-        let (mut taker, survey, _, _) = self.taker(self.nesting.uncovering().map(|parent| parent.pid));
+        let parent_pid = self.nesting.uncovering().map(|parent| parent.pid);
+        let (mut taker, survey, _, _) = self.taker(parent_pid, expected.as_ref());
         taker.took(taken, pool, waited, survey, console);
-        self.say_expected(console);
+        say_expected(estimate.as_ref(), console);
         Taking::Took(took)
     }
 
@@ -1323,6 +1342,8 @@ impl Run<'_> {
     /// releases what it took so far, deletes the ticket and wakes the waiters.
     fn take_machine(&mut self, held: &mut Option<Machine>, console: &mut Console) -> Taking {
         let queued = Instant::now();
+        let estimate = self.estimate(console);
+        let expected = estimate.as_ref().map(expected_field);
         let arrival = Arrival {
             gate: &self.gate,
             request: self.request,
@@ -1331,6 +1352,7 @@ impl Run<'_> {
             builder: None,
             after_fallback: false,
             under: None,
+            expected: expected.as_ref(),
         };
         let wait = MachineWait::queue(self.root, arrival, self.host, console);
         let (machine, snapshot) = match wait.until_held(&mut self.survey, console) {
@@ -1362,10 +1384,11 @@ impl Run<'_> {
             request: self.request,
             log: self.log.path(),
             remote: None,
+            expected: expected.as_ref(),
         };
         machine.write_claim(&of, console);
         slots::wake_waiters(self.root, &mut self.survey, console);
-        self.say_expected(console);
+        say_expected(estimate.as_ref(), console);
         Taking::Took(took)
     }
 
@@ -1523,7 +1546,8 @@ impl Run<'_> {
     ) -> Result<(Watched, Timing), String> {
         let (nesting, host, arrived, lent) = (self.nesting, self.host, self.arrived, self.lent);
         let covering = nesting.covering();
-        let (taker, survey, held, covered) = self.taker(covering.map(|parent| parent.pid));
+        // A run a parent's slot covers has no durations, so its late take's claim expects nothing.
+        let (taker, survey, held, covered) = self.taker(covering.map(|parent| parent.pid), None);
         let (root, gate, request, log) = (taker.root, taker.gate, taker.request, taker.log);
         let late = match (covering, Takes::of(request.slot), covered) {
             (Some(parent), Takes::Pool(pool), Some(covered)) => {

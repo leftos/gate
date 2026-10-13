@@ -8,12 +8,13 @@ use std::time::Duration;
 use gate_args::TestSeams;
 use gate_router::Place;
 use gate_state::{
-    DurationKey, Estimate, JournalLock, KeyInputs, KeyPlace, RebuildOwner, RebuildReason, Rebuilt, Recorded, RunFacts, StoreError, StoreRead,
-    StoreReadError, abandon_rebuild, begin_rebuild, duration_key, durations_path, place_by_shape, read_store, rebuild_store, record_run,
+    DurationKey, DurationStore, Estimate, JournalLock, KeyInputs, KeyPlace, RebuildOwner, RebuildReason, Rebuilt, Recorded, RunFacts, StoreError,
+    StoreRead, StoreReadError, abandon_rebuild, begin_rebuild, duration_key, durations_path, place_by_shape, read_store, rebuild_store, record_run,
     swap_rebuilt,
 };
 use gate_win32::Interrupt;
 use jiff::Timestamp;
+use serde_json::{Map, Value};
 
 use crate::console::Console;
 use crate::remote::git::{self, Git};
@@ -27,14 +28,8 @@ const MINUTES_FROM: f64 = 90.0;
 /// {p90}, {runs} runs)`, every figure in whole seconds when the mean is under 90 s, else in whole minutes, each rounded to
 /// the nearest and never below 1. An estimate of the family key ends `runs of similar commands)`.
 pub(crate) fn expected_line(estimate: &Estimate) -> String {
-    let in_seconds = estimate.mean < MINUTES_FROM;
-    let shown = |seconds: f64| {
-        if in_seconds {
-            format!("{} s", seconds.round().max(1.0))
-        } else {
-            format!("{} min", (seconds / 60.0).round().max(1.0))
-        }
-    };
+    let in_minutes = in_minutes(estimate.mean);
+    let shown = |seconds: f64| in_unit(seconds, in_minutes);
     let of = if estimate.family { " of similar commands" } else { "" };
     format!(
         "gate: expected about {} (usual {}, p90 {}, {} runs{of})",
@@ -43,6 +38,40 @@ pub(crate) fn expected_line(estimate: &Estimate) -> String {
         shown(estimate.p90),
         estimate.runs
     )
+}
+
+/// A span of `seconds` alone, by the expected-time line's rule: whole seconds below 90 s, whole minutes from 90 s,
+/// rounded to the nearest and never below 1.
+pub(crate) fn span_text(seconds: f64) -> String {
+    in_unit(seconds, in_minutes(seconds))
+}
+
+/// Whether a span of `seconds` is said in minutes: from 90 s once rounded to the whole second, so no span reads `90 s`.
+fn in_minutes(seconds: f64) -> bool {
+    seconds.round() >= MINUTES_FROM
+}
+
+/// A span of `seconds` in whole minutes when `in_minutes`, else in whole seconds, rounded to the nearest and never
+/// below 1; the minutes are those of the whole seconds, so 89.6 s, which is 90 s, reads as 90 s does.
+fn in_unit(seconds: f64, in_minutes: bool) -> String {
+    let whole_seconds = seconds.round();
+    if in_minutes {
+        format!("{} min", (whole_seconds / 60.0).round().max(1.0))
+    } else {
+        format!("{} s", whole_seconds.max(1.0))
+    }
+}
+
+/// The `expected` field of a claim and a ticket for `estimate`: its usual and p90 seconds to three decimals, a midpoint
+/// to the even digit as the journal writes seconds, its run count and the key it was read under.
+pub(crate) fn expected_field(estimate: &Estimate) -> Map<String, Value> {
+    let seconds = |value: f64| Value::from((value * 1000.0).round_ties_even() / 1000.0);
+    let mut field = Map::new();
+    field.insert("p50".to_owned(), seconds(estimate.p50));
+    field.insert("p90".to_owned(), seconds(estimate.p90));
+    field.insert("n".to_owned(), Value::from(estimate.runs));
+    field.insert("key".to_owned(), Value::from(estimate.key.clone()));
+    field
 }
 
 /// How long each git call that places a folder may take, and how long its readers get once git has exited.
@@ -121,7 +150,18 @@ pub(crate) struct RunDurations {
     git: GitLimits,
     /// Whether a read of the store found it missing, stale or torn, so the run rebuilds it once it has released.
     rebuild: bool,
+    /// The store as the run's one read found it.
+    store: StoreSeen,
     said: Said,
+}
+
+/// The store as a run's one read of it found it.
+enum StoreSeen {
+    /// Not read yet.
+    Unread,
+    Current(DurationStore),
+    /// Missing, stale, torn, unreadable or a newer build's: no estimates this run.
+    NotCurrent,
 }
 
 /// Which of a run's once-a-run durations lines it has said.
@@ -160,6 +200,7 @@ impl RunDurations {
             owner: run.owner,
             git: limits,
             rebuild: false,
+            store: StoreSeen::Unread,
             said: Said::default(),
         }
     }
@@ -175,23 +216,33 @@ impl RunDurations {
         })
     }
 
-    /// Says the expected-time line of the run's key on `remote_host`, read from the store with no lock; nothing for a
-    /// key without history, a missing store or a newer build's, and a store that cannot be read said once a run.
-    pub(crate) fn say_expected(&mut self, remote_host: Option<&str>, console: &mut Console) {
-        let store = match read_store(&self.root) {
-            StoreRead::Current(store) => store,
-            StoreRead::NeedsRebuild(reason) => {
-                self.needs_rebuild(reason, console);
-                return;
-            }
-            StoreRead::Unavailable(error) => {
-                self.say_unreadable(&error, console);
-                return;
-            }
-            StoreRead::Newer => return,
-        };
-        if let Some(estimate) = store.estimate(&self.key(remote_host), Timestamp::now()) {
-            console.err(&expected_line(&estimate));
+    /// The estimate of the run's key on `remote_host`, from the store as the run's first call read it with no lock:
+    /// `None` for a key without history, a missing store or a newer build's, and a store that cannot be read, said at
+    /// that read. Every take of the run, its ticket, claim and expected-time line, shares the one read.
+    pub(crate) fn estimate(&mut self, remote_host: Option<&str>, console: &mut Console) -> Option<Estimate> {
+        let key = self.key(remote_host);
+        self.store(console)?.estimate(&key, Timestamp::now())
+    }
+
+    /// The store as the run read it once, read now on the first call; `None` when it was not current.
+    fn store(&mut self, console: &mut Console) -> Option<&DurationStore> {
+        if matches!(self.store, StoreSeen::Unread) {
+            self.store = match read_store(&self.root) {
+                StoreRead::Current(store) => StoreSeen::Current(store),
+                StoreRead::NeedsRebuild(reason) => {
+                    self.needs_rebuild(reason, console);
+                    StoreSeen::NotCurrent
+                }
+                StoreRead::Unavailable(error) => {
+                    self.say_unreadable(&error, console);
+                    StoreSeen::NotCurrent
+                }
+                StoreRead::Newer => StoreSeen::NotCurrent,
+            };
+        }
+        match &self.store {
+            StoreSeen::Current(store) => Some(store),
+            StoreSeen::Unread | StoreSeen::NotCurrent => None,
         }
     }
 
@@ -342,7 +393,7 @@ mod tests {
     use jiff::Timestamp;
     use serde_json::json;
 
-    use super::{GitLimits, RunDurations, Said, expected_line};
+    use super::{GitLimits, RunDurations, Said, StoreSeen, expected_line, in_unit, span_text};
     use crate::console::Console;
 
     fn estimate(mean: f64, p50: f64, p90: f64, runs: usize, family: bool) -> Estimate {
@@ -363,6 +414,11 @@ mod tests {
         assert_eq!(
             expected_line(&estimate(19.4, 18.0, 31.2, 12, false)),
             "gate: expected about 19 s (usual 18 s, p90 31 s, 12 runs)"
+        );
+        assert_eq!(
+            expected_line(&estimate(89.6, 80.0, 120.0, 7, false)),
+            "gate: expected about 2 min (usual 1 min, p90 2 min, 7 runs)",
+            "a mean of 89.6 s is 90 s once rounded, so the line is in minutes"
         );
         assert_eq!(
             expected_line(&estimate(89.4, 80.0, 120.0, 7, false)),
@@ -391,6 +447,17 @@ mod tests {
             expected_line(&estimate(240.0, 230.0, 380.0, 30, false)),
             "gate: expected about 4 min (usual 4 min, p90 6 min, 30 runs)"
         );
+    }
+
+    #[test]
+    fn a_span_alone_is_in_seconds_below_90_s_and_in_whole_minutes_from_90_s_never_below_1() {
+        assert_eq!(span_text(89.0), "89 s");
+        assert_eq!(span_text(89.4), "89 s", "still below 90 s");
+        assert_eq!(span_text(89.6), "2 min", "rounds to 90 s, so it is in minutes, never 90 s");
+        assert_eq!(span_text(90.0), "2 min", "90 s is 1.5 min, rounded to 2");
+        assert_eq!(span_text(240.0), "4 min");
+        assert_eq!(span_text(0.2), "1 s", "never 0 s");
+        assert_eq!(in_unit(20.0, true), "1 min", "never 0 min in the unit of a longer figure");
     }
 
     #[test]
@@ -468,6 +535,7 @@ mod tests {
                 drain: Duration::ZERO,
             },
             rebuild: true,
+            store: StoreSeen::Unread,
             said: Said::default(),
         }
     }

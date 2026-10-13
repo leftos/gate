@@ -354,6 +354,23 @@ fn the_v1_ticket_fixture_reads_with_its_queue_order() {
 }
 
 #[test]
+fn the_expected_fixtures_read_with_their_expected_and_the_plain_ones_without() {
+    let expected = json!({"p50": 240.5, "p90": 380.25, "n": 30, "key": "local::repo | cargo build"})
+        .as_object()
+        .cloned()
+        .expect("expected is an object");
+
+    let claim = v1::read_claim(&fixture("v1-claim-expected.json")).expect("the claim with expected reads");
+    let ticket = v1::read_ticket(&fixture("v1-ticket-expected.json")).expect("the ticket with expected reads");
+
+    assert_eq!(claim.expected.as_ref(), Some(&expected));
+    assert_eq!(ticket.expected.as_ref(), Some(&expected));
+    let plain_claim = v1::read_claim(&fixture("v1-claim.json")).expect("the fixture claim reads");
+    let plain_ticket = v1::read_ticket(&fixture("v1-ticket.json")).expect("the fixture ticket reads");
+    assert_eq!((plain_claim.expected, plain_ticket.expected), (None, None), "no key reads as none");
+}
+
+#[test]
 fn the_v1_counts_fixture_sets_both_pools() {
     let counts = v1::read_counts(&fixture("v1-slot-counts.json"), 17);
 

@@ -15,13 +15,17 @@ use crate::acquire;
 use crate::console::Console;
 use crate::resolve::ResolvedRoot;
 use crate::slots::{self, ClaimOf, Held, Survey, Taken};
-use crate::wait::{self, Arrival, Host, Waiter};
+use crate::wait::{self, Arrival, Host, Waiter, Which};
 
 /// The kinds of earlier gate the waiting line counts and a drain with an unreserved light slot waits for.
 const LOCAL_KINDS: [TicketKind; 2] = [TicketKind::Heavy, TicketKind::Light];
 
 /// The pid and start, in epoch milliseconds, of the gates that hold a slot by a live claim.
 type Holders = HashSet<(u32, u64)>;
+
+/// One slot of a probe: its claim kind and index, and whether some gate has its mutex open, `None` when it could not be
+/// probed.
+type SlotProbe = (ClaimKind, u32, Option<bool>);
 
 /// What a critical gate holds of the machine: the critical mutex, the heavy and unreserved light slots, and its ticket,
 /// which it keeps until it ends.
@@ -124,7 +128,7 @@ impl<'a> MachineWait<'a> {
             start_ms: arrival.gate.start_ms,
             holds: false,
             remote: None,
-            expected: None,
+            expected: arrival.expected.cloned(),
         };
         let waiter = Waiter::queue(root, arrival, &ticket, host, console);
         MachineWait {
@@ -272,37 +276,45 @@ impl<'a> MachineWait<'a> {
         }
     }
 
-    /// What the gate waits for, as its waiting lines say it, from the tickets and claims the last pass read.
+    /// What the gate waits for, as its waiting lines say it, from the tickets and claims the last pass read and one
+    /// probe of the slots; then, when no gate is ahead of it ([`eta_blockers`]), when the last holder of the slots it
+    /// waits for frees its slot, by the other gates' live claims as they stand ([`wait::holder_eta`]).
     fn status(&self, survey: &mut Survey, console: &mut Console) -> String {
-        let earlier = earlier_waiters(&self.others, &self.holders, self.ticket.queue_order());
-        status_text(self.other_held(survey, console), self.counts.light, earlier)
-    }
-
-    /// The heavy and light slots of the counts, its own left out, whose mutex some gate has open. A slot that cannot be
-    /// probed is said once and counts as not held.
-    fn other_held(&self, survey: &mut Survey, console: &mut Console) -> HeavyLight {
-        let heavy = (0..self.counts.heavy).map(KernelObject::HeavySlot);
-        let light = (0..self.counts.light).map(KernelObject::LightSlot);
-        HeavyLight {
-            heavy: self.open_others(heavy, survey, console),
-            light: self.open_others(light, survey, console),
+        let order = self.ticket.queue_order();
+        let earlier = earlier_waiters(&self.others, &self.holders, order);
+        let probe = self.probe_slots(survey, console);
+        let status = status_text(held_of(&probe), self.counts.light, earlier);
+        if eta_blockers(&self.others, &self.holders, order) > 0 {
+            return status;
+        }
+        let Some(busy) = waited_for(&probe, self.counts.light).filter(|busy| !busy.is_empty()) else {
+            return status;
+        };
+        let claims = survey.live_claims(&self.root.path, console);
+        match wait::holder_eta(&claims, &busy, Which::Last, Timestamp::now()) {
+            Some(eta) => format!("{status}, {eta}"),
+            None => status,
         }
     }
 
-    fn open_others(&self, objects: impl Iterator<Item = KernelObject>, survey: &mut Survey, console: &mut Console) -> u32 {
-        let mut open = 0;
-        for object in objects {
-            let name = self.root.root.object_name(object);
-            if self.machine.holds(&name) {
-                continue;
-            }
-            match mutex_exists(&name) {
-                Ok(true) => open += 1,
-                Ok(false) => {}
-                Err(error) => survey.say_once("cannot probe", &name, error, console),
-            }
-        }
-        open
+    /// One probe of the heavy and light slots of the counts, its own left out: each slot's claim kind and index, and
+    /// whether some gate has its mutex open, `None` for one that cannot be probed, said once.
+    fn probe_slots(&self, survey: &mut Survey, console: &mut Console) -> Vec<SlotProbe> {
+        let heavy = (0..self.counts.heavy).map(|index| (KernelObject::HeavySlot(index), ClaimKind::Heavy, index));
+        let light = (0..self.counts.light).map(|index| (KernelObject::LightSlot(index), ClaimKind::Light, index));
+        heavy
+            .chain(light)
+            .filter_map(|(object, kind, index)| {
+                let name = self.root.root.object_name(object);
+                if self.machine.holds(&name) {
+                    return None;
+                }
+                let open = mutex_exists(&name)
+                    .inspect_err(|error| survey.say_once("cannot probe", &name, error, console))
+                    .ok();
+                Some((kind, index, open))
+            })
+            .collect()
     }
 
     /// What the gate found as it took the machine: the counts of the pass that took it, the slots other gates hold,
@@ -327,7 +339,7 @@ impl<'a> MachineWait<'a> {
             .map_err(|error| format!("cannot read the claims in {}: {error}", folder.display()));
         MachineSnapshot {
             counts: self.counts,
-            other_held: self.other_held(survey, console),
+            other_held: held_of(&self.probe_slots(survey, console)),
             other_claims,
         }
     }
@@ -394,6 +406,44 @@ fn status_text(held: HeavyLight, light: u32, earlier: usize) -> String {
     )
 }
 
+/// How many of the other gates' tickets `others` keep a critical gate at `order` from saying when the slots it waits for
+/// free: the earlier heavy and light waiters ([`earlier_waiters`]), which take the freed slots first, and the earlier
+/// critical requests, waiting or holding the machine, each of which runs its whole command first.
+fn eta_blockers(others: &[Ticket], holders: &Holders, order: (u64, u32)) -> usize {
+    let critical = others.iter().filter(|ticket| is_earlier(ticket, order, &[TicketKind::Critical])).count();
+    earlier_waiters(others, holders, order) + critical
+}
+
+/// The slots other gates hold by `probe`, by kind; a slot that could not be probed counts as not held.
+fn held_of(probe: &[SlotProbe]) -> HeavyLight {
+    let held = |kind: ClaimKind| {
+        let count = probe.iter().filter(|(of, _, open)| *of == kind && *open == Some(true)).count();
+        u32::try_from(count).unwrap_or(u32::MAX)
+    };
+    HeavyLight {
+        heavy: held(ClaimKind::Heavy),
+        light: held(ClaimKind::Light),
+    }
+}
+
+/// The slots of `probe` a critical gate takes, every heavy slot and the light slots below the reserved ones of a count
+/// of `light`, that some gate holds, each as a claim kind and slot index; `None` when one of them could not be probed.
+fn waited_for(probe: &[SlotProbe], light: u32) -> Option<Vec<(ClaimKind, u32)>> {
+    let unreserved = light.saturating_sub(reserved_light(light));
+    let mut busy = Vec::new();
+    for &(kind, index, open) in probe {
+        if kind == ClaimKind::Light && index >= unreserved {
+            continue;
+        }
+        match open {
+            Some(true) => busy.push((kind, index)),
+            Some(false) => {}
+            None => return None,
+        }
+    }
+    Some(busy)
+}
+
 /// The line a critical gate says as it takes the machine `at`, after waiting `waited` seconds, with what it found.
 pub(crate) fn holds_line(at: Timestamp, waited: f64, snapshot: &MachineSnapshot) -> String {
     let claims = match &snapshot.other_claims {
@@ -425,8 +475,82 @@ mod tests {
     use gate_state::v1::{Ticket, TicketKind};
     use gate_state::{HeavyLight, KernelObject, MachineSnapshot, OtherClaim};
 
-    use super::{Holders, drain_waits_for, earlier_waiters, holds_line, is_earlier, machine_slots, status_text};
+    use gate_state::v1::ClaimKind;
+    use jiff::{SignedDuration, Timestamp};
+
+    use super::{Holders, drain_waits_for, earlier_waiters, eta_blockers, held_of, holds_line, is_earlier, machine_slots, status_text, waited_for};
     use crate::slots;
+    use crate::wait::scratch::holding;
+    use crate::wait::{Which, holder_eta};
+
+    #[test]
+    fn the_critical_eta_names_the_last_holder() {
+        let now: Timestamp = "2026-10-13T12:00:00Z".parse().expect("a fixed time");
+        let long_ago = now.checked_sub(SignedDuration::from_secs(1000)).expect("a moment after the epoch");
+        let claims = [
+            holding(ClaimKind::Heavy, 0, now, Some(60.0)),
+            holding(ClaimKind::Light, 1, now, Some(600.0)),
+        ];
+        let busy = [(ClaimKind::Heavy, 0), (ClaimKind::Light, 1)];
+
+        assert_eq!(
+            holder_eta(&claims, &busy, Which::Last, now).as_deref(),
+            Some("the last frees in about 10 min"),
+            "the latest end of the slots it waits for"
+        );
+        let past = [holding(ClaimKind::Heavy, 0, long_ago, Some(240.0))];
+        assert_eq!(
+            holder_eta(&past, &[(ClaimKind::Heavy, 0)], Which::Last, now).as_deref(),
+            Some("the last is 13 min past its usual 4 min, ceiling 15 min")
+        );
+    }
+
+    #[test]
+    fn no_critical_eta_while_an_earlier_waiter_or_critical_request_is_ahead() {
+        let own = ticket(TicketKind::Critical, 100, 7);
+        let order = own.queue_order();
+        let none = Holders::new();
+
+        assert_eq!(
+            eta_blockers(&[ticket(TicketKind::Heavy, 50, 8)], &none, order),
+            1,
+            "an earlier heavy waiter"
+        );
+        assert_eq!(
+            eta_blockers(&[ticket(TicketKind::Critical, 50, 9)], &none, order),
+            1,
+            "an earlier critical request runs its whole command first"
+        );
+        let mut holding_machine = ticket(TicketKind::Critical, 40, 10);
+        holding_machine.holds = true;
+        assert_eq!(eta_blockers(&[holding_machine], &none, order), 1, "one that holds the machine");
+        let later = [ticket(TicketKind::Critical, 200, 11), ticket(TicketKind::Heavy, 200, 12)];
+        assert_eq!(eta_blockers(&later, &none, order), 0, "gates that came after it");
+    }
+
+    #[test]
+    fn one_probe_gives_the_held_counts_and_the_slots_a_critical_gate_waits_for() {
+        let probe = [
+            (ClaimKind::Heavy, 0, Some(true)),
+            (ClaimKind::Heavy, 1, Some(false)),
+            (ClaimKind::Light, 0, Some(true)),
+            (ClaimKind::Light, 1, Some(true)),
+            (ClaimKind::Light, 2, None),
+        ];
+
+        assert_eq!(held_of(&probe), HeavyLight { heavy: 1, light: 2 }, "an unprobed slot is not held");
+        assert_eq!(
+            waited_for(&probe[..4], 3),
+            Some(vec![(ClaimKind::Heavy, 0), (ClaimKind::Light, 0)]),
+            "of 3 light slots the highest 2 are reserved and not waited for"
+        );
+        assert_eq!(waited_for(&probe, 5), None, "a slot it waits for could not be probed");
+        assert_eq!(
+            waited_for(&probe, 3),
+            Some(vec![(ClaimKind::Heavy, 0), (ClaimKind::Light, 0)]),
+            "a reserved slot's probe does not matter"
+        );
+    }
 
     /// A ticket of the gate `pid`, started at `pid * 10` ms, of `kind`, arrived at `arrived`.
     fn ticket(kind: TicketKind, arrived: u64, pid: u32) -> Ticket {

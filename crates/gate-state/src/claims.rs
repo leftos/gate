@@ -73,6 +73,9 @@ pub(crate) struct Ticket {
     /// For a `gate.exe` ticket, the gate's start in Unix epoch milliseconds, which its process's start must match to the
     /// millisecond as `gate.exe` checks it; `None` for a PowerShell ticket, whose start may be 2 s off.
     pub exact_start_ms: Option<u64>,
+    /// For a `gate.exe` ticket, what the durations store expected of the gate's run as it queued; `None` for a ticket
+    /// without one and for a PowerShell ticket, which never carries it.
+    pub expected: Option<Map<String, Value>>,
 }
 
 /// The claim files of the slots and of the critical gate in `dir`, keyed by mutex name in lower case: the files named
@@ -153,6 +156,7 @@ pub(crate) fn read_ticket(path: &Path) -> Option<Ticket> {
         arrived_ticks: object.get("arrived")?.as_i64()?,
         remote: object.get("remote").and_then(Value::as_bool).unwrap_or(false),
         exact_start_ms: None,
+        expected: None,
     })
 }
 

@@ -1386,11 +1386,14 @@ fn a_full_fallback_says_the_whole_wait_in_its_still_waiting_lines() {
         .lines()
         .find(|line| line.starts_with(STILL_WAITING_HEAVY))
         .expect("the local wait says it still waits");
+    // The seconds come first, before the busy count of a pool with no slot free: `(3 s)` or `(3 s; 1 busy)`.
     let seconds: u64 = line
         .trim_start_matches(STILL_WAITING_HEAVY)
-        .trim_end_matches(" s)")
+        .split_once(" s")
+        .map(|(seconds, _)| seconds)
+        .expect("the line names the whole seconds waited")
         .parse()
-        .expect("the line names the whole seconds waited");
+        .expect("the seconds are a whole number");
     assert!(
         seconds >= 2,
         "the local wait counts from the run's queue line, so the 2 s remote wait is in it: {line}"

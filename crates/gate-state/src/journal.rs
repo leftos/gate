@@ -279,8 +279,8 @@ struct Run {
     abandoned: Vec<String>,
 }
 
-/// The fields of a journal line the history reads. The reserved fields (`avgCores`, `peakCores`, `freeCores` on a
-/// release) are not read, and a line parses with or without them. A critical take's snapshot fields are read as they
+/// The fields of a journal line the history reads. The release's cores fields (`avgCores`, `peakCores`, `freeCores`)
+/// are not read, and a line parses with or without them. A critical take's snapshot fields are read as they
 /// are, so a snapshot that does not read as one leaves the run without it rather than dropping the line.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]

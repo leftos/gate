@@ -38,6 +38,8 @@ The claims and tickets other than `v1-claim.json` and `v1-ticket.json` name proc
 | `v1-critical-ticket.json` | The ticket critical gate 52000 keeps to its end, `holds` true. | `<state root>\waiting\52000-1790852400500.json` |
 | `v1-remote-claim.json` | The claim of heavy gate 53000 holding remote slot 1: `kind` `remote`, then `remote`, `host` and `key`. | `<state root>\slots\gate-remote-slot-1.json` |
 | `v1-remote-ticket.json` | The ticket of heavy gate 53100 queued for the remote pool, `remote` true. | `<state root>\waiting\53100-1790852400500.json` |
+| `v1-claim-expected.json` | The claim of heavy gate 57000 holding slot 0, run with history: a claim's required keys, then `expected`, `{p50, p90, n, key}` with the seconds to three decimals. | `<state root>\slots\gate-slot-0.json` |
+| `v1-ticket-expected.json` | The ticket of heavy gate 57100 queued in the local queue with history, `expected` last. | `<state root>\waiting\57100-1790852400500.json` |
 | `v1-covered.json` | The covered marker of light gate 54000 running under the slot of critical gate 52000: `processStart` and `since` in Unix epoch milliseconds, as a ticket's machine times are. It has no `kind`, the optional field naming the gate's own slot kind, which a marker without it never carries as a stand-in. | `<state root>\covered\54000-1790852400500.json` |
 | `v1-journal.jsonl` | A journal of five gates: light gate 56000 runs on `gate-light-slot-0` and lends it to 55000 (a lone `parent` line) before releasing it; critical gate 52000 takes eight slots with its machine snapshot (`counts`, `otherHeld`, `otherClaims`) and covers light gate 54000 (a lone `covered` line); critical gate 52100's take carries `snapshotError` and it fails. | `<state root>\events.jsonl` |
 

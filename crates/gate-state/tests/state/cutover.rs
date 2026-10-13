@@ -12,7 +12,7 @@ use gate_state::{
     write_cutover_flag,
 };
 use jiff::Timestamp;
-use serde_json::json;
+use serde_json::{Value, json};
 
 use crate::support::{HEAVY_GATE, LIGHT_GATE, Machine, START, START_CLOSE, START_FAR, claim, heavy_slot, ms, pool, ticket, ticks};
 
@@ -22,9 +22,12 @@ const V1_REMOTE_CLAIM: &str = include_str!("fixtures/v1-remote-claim.json");
 const V1_REMOTE_TICKET: &str = include_str!("fixtures/v1-remote-ticket.json");
 const V1_SLOT_COUNTS: &str = include_str!("fixtures/v1-slot-counts.json");
 const V1_COVERED: &str = include_str!("fixtures/v1-covered.json");
-/// The file names gate.exe gives the two fixture tickets: `<pid>-<start ms>.json`.
+const V1_CLAIM_EXPECTED: &str = include_str!("fixtures/v1-claim-expected.json");
+const V1_TICKET_EXPECTED: &str = include_str!("fixtures/v1-ticket-expected.json");
+/// The file names gate.exe gives the fixture tickets: `<pid>-<start ms>.json`.
 const V1_CRITICAL_TICKET_NAME: &str = "52000-1790852400500.json";
 const V1_REMOTE_TICKET_NAME: &str = "53100-1790852400500.json";
+const V1_TICKET_EXPECTED_NAME: &str = "57100-1790852400500.json";
 /// A gate.exe gate's command line, which a waiting gate's row shows as it is.
 const GATE_EXE: &str = r"C:\Users\me\AppData\Local\gate\bin\gate.exe --log .tmp\b.log --slot heavy -- cargo build";
 
@@ -275,6 +278,41 @@ fn a_v1_ticket_queue_is_ordered_by_epoch_ms() {
          (700) is not a v1 ticket"
     );
     assert_eq!(state.queue[0].command_line.as_deref(), Some(GATE_EXE));
+}
+
+#[test]
+fn expected_passes_from_v1_claims_and_tickets_into_the_state_and_is_absent_without_it() {
+    let mut machine = Machine::v1("expected_passes_from_v1_claims_and_tickets_into_the_state_and_is_absent_without_it");
+    for pid in [52000, 57000, 57100, 53100] {
+        machine.add_process(pid, 1, "gate.exe", Some(GATE_EXE), Some(START));
+    }
+    machine.write_v1_claim("gate-slot-0.json", V1_CLAIM_EXPECTED);
+    machine.open.insert("gate-slot-0".to_owned());
+    machine.write_v1_claim("gate-critical.json", V1_CRITICAL_CLAIM);
+    machine.write_v1_ticket(V1_TICKET_EXPECTED_NAME, V1_TICKET_EXPECTED);
+    machine.write_v1_ticket(V1_REMOTE_TICKET_NAME, V1_REMOTE_TICKET);
+    let expected = json!({"p50": 240.5, "p90": 380.25, "n": 30, "key": "local::repo | cargo build"});
+
+    let state = machine.state();
+
+    let heavy = &pool(&state, SlotKind::Heavy).slots[0];
+    let claim = heavy.claim.as_ref().expect("the busy slot has its claim");
+    assert_eq!(
+        (heavy.state, claim.get("expected")),
+        (SlotState::Busy, Some(&expected)),
+        "the claim as the file has it"
+    );
+    let critical = state.critical.holder.claim.as_ref().expect("the critical holder has its claim");
+    assert_eq!(critical.get("expected"), None, "a claim without it has none");
+    let rows: Vec<(u32, Option<Value>)> = state.queue.iter().map(|row| (row.pid, row.expected.clone().map(Value::Object))).collect();
+    assert_eq!(rows, [(53100, None), (57100, Some(expected.clone()))], "arrived together, ordered by pid");
+    let serialised = serde_json::to_value(&state).expect("the state serialises");
+    let queue = serialised["queue"].as_array().expect("the queue is an array");
+    assert_eq!(
+        (queue[0].get("expected"), queue[1].get("expected")),
+        (None, Some(&expected)),
+        "a ticket without it serialises no key"
+    );
 }
 
 /// A covered marker of gate `pid` started at `start`, under the slot of gate 52000, written at `since`.

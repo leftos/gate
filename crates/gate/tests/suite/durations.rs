@@ -3,7 +3,7 @@
 
 use std::fs::{self, OpenOptions};
 use std::os::windows::fs::OpenOptionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
@@ -15,7 +15,7 @@ use serde_json::Value;
 use crate::routing::{heavy_words_with_limit, routed_case};
 use crate::support::{
     Case, FAKE_TOOL, Outcome, USAGE, assert_in_order, critical_words, events, finish, git, git_init, heavy_words, none_words, run_words, shown,
-    wait_for_file, write_counts,
+    wait_for_file, wait_until, write_counts,
 };
 
 /// `FILE_SHARE_READ`: a handle that lets others read the file, but not write, move or delete it.
@@ -689,4 +689,291 @@ fn gate_expect_keys_a_worktree_as_the_run_does() {
         format!("{} here\n", run.stderr.trim_end_matches('\n')),
         "the figure is the line the next run in the worktree says: {run:?}"
     );
+}
+
+/// The one claim or ticket file in the folder `dir` of `case`'s state root, as JSON.
+fn only_file(case: &Case, dir: &str) -> Value {
+    let files: Vec<PathBuf> = fs::read_dir(case.root().join(dir))
+        .expect("the folder can be listed")
+        .map(|entry| entry.expect("the folder's entry can be read").path())
+        .filter(|path| path.extension().is_some_and(|extension| extension == "json"))
+        .collect();
+    assert_eq!(files.len(), 1, "one file in {dir}: {files:?}");
+    serde_json::from_str(&fs::read_to_string(&files[0]).expect("the file can be read")).expect("the file is JSON")
+}
+
+/// What a holder and a waiter wrote as the waiter queued behind it and then took the slot: the holder's claim and the
+/// waiter's ticket as both ran, the waiter's stderr up to its waiting line, and the waiter's own claim once it held the
+/// slot.
+struct Queued {
+    claim: Value,
+    ticket: Value,
+    waiting: String,
+    waiter_claim: Value,
+}
+
+/// A light run of `command`, which waits for the file `go`.
+struct Waiting<'c> {
+    command: &'c [&'c str],
+    go: &'c Path,
+}
+
+/// Runs a light `holder` on the case's one light slot and a light `waiter` behind it, reads what [`Queued`] holds as
+/// both run, then lets the holder end, reads the waiter's claim once it holds the slot, and lets the waiter end.
+fn hold_and_queue(case: &Case, holder: &Waiting<'_>, waiter: &Waiting<'_>) -> Queued {
+    write_counts(&case.root(), r#"{"v":1,"light":1}"#);
+    let claim_path = case.root().join("slots").join("gate-light-slot-0.json");
+    let holding = case.start(&run_words("holder.log", &[], holder.command));
+    // A claim is written whole, through a file moved over it.
+    wait_for_file(&claim_path);
+    let queued = case.start(&run_words("waiter.log", &[], waiter.command));
+    let waiting = queued.wait_for_stderr_where("the waiting line", |stderr| stderr.contains("gate: waiting for a light slot"));
+    let (claim, ticket) = (only_file(case, "slots"), only_file(case, "waiting"));
+    fs::write(holder.go, "").expect("the holder's go file can be made");
+    let pid = queued.id();
+    wait_until("the waiter's claim", || {
+        fs::read_to_string(&claim_path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+            .is_some_and(|claim| claim["pid"] == pid)
+    });
+    let waiter_claim = only_file(case, "slots");
+    fs::write(waiter.go, "").expect("the waiter's go file can be made");
+    for outcome in [holding.finish(), queued.finish()] {
+        assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    }
+    Queued {
+        claim,
+        ticket,
+        waiting,
+        waiter_claim,
+    }
+}
+
+/// Runs `run` 5 times in a light slot of `case` with its go file there, then removes it.
+fn five_runs(case: &Case, run: &Waiting<'_>) {
+    fs::write(run.go, "").expect("the go file can be made");
+    for _ in 0..5 {
+        passing(case.gate(&run_words("out.log", &[], run.command)));
+    }
+    fs::remove_file(run.go).expect("the go file can be removed");
+}
+
+/// The one key of `case`'s store that ends with `ending`.
+fn key_ending(case: &Case, ending: &str) -> String {
+    let matching: Vec<String> = keys(case).into_iter().filter(|key| key.ends_with(ending)).collect();
+    assert_eq!(matching.len(), 1, "one key ends with {ending:?}: {matching:?}");
+    matching[0].clone()
+}
+
+/// Asserts `expected` is the field of a key with history: `p50`, `p90`, `n` and `key`, in that order, `n` runs of `key`.
+fn assert_expected(expected: &Value, key: &str, runs: u64) {
+    let field = expected.as_object().expect("expected is an object");
+    let names: Vec<&str> = field.keys().map(String::as_str).collect();
+    assert_eq!(names, ["p50", "p90", "n", "key"], "{expected}");
+    let (p50, p90) = (expected["p50"].as_f64(), expected["p90"].as_f64());
+    assert!(p50.is_some_and(|p50| p50 >= 0.0) && p90 >= p50, "seconds: {expected}");
+    assert_eq!((&expected["n"], &expected["key"]), (&Value::from(runs), &Value::from(key)), "{expected}");
+}
+
+#[test]
+fn the_claim_and_the_ticket_carry_what_the_store_expects() {
+    let case = Case::new("durations-expected-field");
+    let (go_held, go_ran) = (case.folder().join("go-held"), case.folder().join("go-ran"));
+    let (held_word, ran_word) = (shown(&go_held), shown(&go_ran));
+    let held: [&str; 5] = [FAKE_TOOL, "wait", &held_word, "out", "held"];
+    let ran: [&str; 5] = [FAKE_TOOL, "wait", &ran_word, "out", "ran"];
+    let (holder, waiter) = (
+        Waiting {
+            command: &held,
+            go: &go_held,
+        },
+        Waiting { command: &ran, go: &go_ran },
+    );
+    five_runs(&case, &waiter);
+    let key = key_ending(&case, " out ran");
+
+    let queued = hold_and_queue(&case, &holder, &waiter);
+
+    assert_eq!(
+        queued.claim.get("expected"),
+        None,
+        "the holder's command has no history: {}",
+        queued.claim
+    );
+    assert_expected(&queued.ticket["expected"], &key, 5);
+    assert_eq!(
+        queued.waiter_claim["expected"], queued.ticket["expected"],
+        "the waiter's ticket and claim carry one estimate of one store read"
+    );
+}
+
+#[test]
+fn without_history_neither_the_claim_nor_the_ticket_has_expected() {
+    let case = Case::new("durations-no-expected-field");
+    let (go_held, go_ran) = (case.folder().join("go-held"), case.folder().join("go-ran"));
+    let (held_word, ran_word) = (shown(&go_held), shown(&go_ran));
+    let held: [&str; 5] = [FAKE_TOOL, "wait", &held_word, "out", "held"];
+    let ran: [&str; 5] = [FAKE_TOOL, "wait", &ran_word, "out", "ran"];
+    let (holder, waiter) = (
+        Waiting {
+            command: &held,
+            go: &go_held,
+        },
+        Waiting { command: &ran, go: &go_ran },
+    );
+
+    let queued = hold_and_queue(&case, &holder, &waiter);
+
+    for file in [&queued.claim, &queued.ticket, &queued.waiter_claim] {
+        assert_eq!(file.get("expected"), None, "{file}");
+    }
+    assert!(
+        queued.waiting.contains("gate: waiting for a light slot (1 busy)\n"),
+        "no ETA without the holder's history: {}",
+        queued.waiting
+    );
+}
+
+#[test]
+fn a_waiter_says_when_the_first_holder_frees_its_slot() {
+    let case = Case::new("durations-eta");
+    let (go_held, go_ran) = (case.folder().join("go-held"), case.folder().join("go-ran"));
+    let (held_word, ran_word) = (shown(&go_held), shown(&go_ran));
+    let held: [&str; 5] = [FAKE_TOOL, "wait", &held_word, "out", "held"];
+    let ran: [&str; 5] = [FAKE_TOOL, "wait", &ran_word, "out", "ran"];
+    let (holder, waiter) = (
+        Waiting {
+            command: &held,
+            go: &go_held,
+        },
+        Waiting { command: &ran, go: &go_ran },
+    );
+    five_runs(&case, &holder);
+    // Every run of the holder's key took 240 s, so its usual run time is 4 min.
+    let mut seeded = store(&case).expect("the store was written");
+    for history in seeded["keys"].as_object_mut().expect("the store holds its keys").values_mut() {
+        for sample in history["samples"].as_array_mut().expect("a history holds its samples") {
+            sample["wall"] = Value::from(240.0);
+        }
+    }
+    fs::write(case.root().join("durations.json"), seeded.to_string()).expect("the store can be seeded");
+
+    let queued = hold_and_queue(&case, &holder, &waiter);
+
+    let line = Regex::new(r"(?m)^gate: waiting for a light slot \(1 busy, the first frees in about \d+ min\)$").expect("the pattern is valid");
+    assert!(line.is_match(&queued.waiting), "{}", queued.waiting);
+    assert_eq!(queued.claim["expected"]["p50"], 240.0, "{}", queued.claim);
+}
+
+#[test]
+fn a_critical_gates_claim_and_ticket_carry_the_crit_key() {
+    let case = Case::new("durations-critical-field");
+    let (go_held, go_ran) = (case.folder().join("go-held"), case.folder().join("go-ran"));
+    let (held_word, ran_word) = (shown(&go_held), shown(&go_ran));
+    let held = [FAKE_TOOL, "wait", held_word.as_str()];
+    let ran: [&str; 5] = [FAKE_TOOL, "wait", &ran_word, "out", "ran"];
+    fs::write(&go_ran, "").expect("the go file can be made");
+    for _ in 0..5 {
+        passing(case.gate(&critical_words("out.log", &[], &ran)));
+    }
+    fs::remove_file(&go_ran).expect("the go file can be removed");
+    let key = key_ending(&case, " out ran");
+    assert!(key.starts_with("local:crit:"), "{key}");
+    write_counts(&case.root(), r#"{"v":1,"heavy":1}"#);
+    let holder = case.start(&heavy_words("holder.log", &[], &held));
+    wait_for_file(&case.root().join("slots").join("gate-slot-0.json"));
+
+    let mut critical = case.start(&critical_words("critical.log", &[], &ran));
+    critical.wait_for_stderr("gate: waiting for the machine (critical)");
+    let ticket = only_file(&case, "waiting");
+    fs::write(&go_held, "").expect("the holder's go file can be made");
+    // The expected-time line comes once the critical claim is written.
+    critical.wait_for_stderr_while_running("the expected-time line", |stderr| stderr.contains("gate: expected about"));
+    let claim = only_file(&case, "slots");
+    fs::write(&go_ran, "").expect("the go file can be made");
+    let (holder, critical) = (holder.finish(), critical.finish());
+
+    assert_eq!((holder.code, critical.code), (Some(0), Some(0)), "{holder:?}\n{critical:?}");
+    assert_eq!((&ticket["kind"], &claim["kind"]), (&Value::from("critical"), &Value::from("critical")));
+    assert_expected(&ticket["expected"], &key, 5);
+    assert_expected(&claim["expected"], &key, 5);
+}
+
+#[test]
+fn a_routed_run_that_falls_back_claims_and_queues_here_with_the_local_key() {
+    let case = routed_case("durations-fallback-field");
+    let steps = |name: &str, line: &str| {
+        let path = case.folder().join(name);
+        fs::write(&path, line).expect("the step file can be written");
+        shown(&path)
+    };
+    let (passed, refused) = (steps("passed.txt", "status 0"), steps("refused.txt", "refuse unreachable"));
+    let (go_local, go_ran) = (case.folder().join("go-local"), case.folder().join("go-ran"));
+    let (local_word, ran_word) = (shown(&go_local), shown(&go_ran));
+    let command = [r".\tool.exe", "wait", ran_word.as_str()];
+    fs::write(&go_ran, "").expect("the go file can be made");
+    for extra in [&["--test-remote-client", passed.as_str()], &["--test-remote-client", refused.as_str()]] {
+        for _ in 0..5 {
+            passing(case.gate(&heavy_words_with_limit("out.log", extra, &command)));
+        }
+    }
+    fs::remove_file(&go_ran).expect("the go file can be removed");
+    let mut keys = keys(&case);
+    keys.sort();
+    assert!(keys[0].starts_with("local:") && keys[1].starts_with("remote:builder:"), "{keys:?}");
+    write_counts(&case.root(), r#"{"v":1,"heavy":1}"#);
+    let holder = case.start(&heavy_words_with_limit("local.log", &["--local"], &[r".\tool.exe", "wait", &local_word]));
+    wait_for_file(&case.root().join("slots").join("gate-slot-0.json"));
+
+    let mut routed = case.start(&heavy_words_with_limit("routed.log", &["--test-remote-client", &refused], &command));
+    routed.wait_for_stderr("gate: waiting for a heavy slot");
+    let ticket = only_file(&case, "waiting");
+    fs::write(&go_local, "").expect("the local go file can be made");
+    // The local take's expected-time line, the second of the run, comes once its claim is written.
+    routed.wait_for_stderr_while_running("the local take's expected-time line", |stderr| {
+        stderr.matches("gate: expected about").count() == 2
+    });
+    let claim = only_file(&case, "slots");
+    fs::write(&go_ran, "").expect("the go file can be made");
+    let (holder, routed) = (holder.finish(), routed.finish());
+
+    assert_eq!((holder.code, routed.code), (Some(0), Some(0)), "{holder:?}\n{routed:?}");
+    assert_eq!((ticket.get("remote"), &claim["kind"]), (None, &Value::from("heavy")), "{ticket}\n{claim}");
+    assert_expected(&ticket["expected"], &keys[0], 5);
+    assert_expected(&claim["expected"], &keys[0], 5);
+}
+
+#[test]
+fn a_routed_runs_claim_and_ticket_carry_the_builders_key() {
+    let case = routed_case("durations-routed-field");
+    let steps = |name: &str, lines: &[String]| {
+        let path = case.folder().join(name);
+        fs::write(&path, lines.join("\n")).expect("the step file can be written");
+        shown(&path)
+    };
+    let (call, go) = (case.folder().join("call.json"), case.folder().join("go"));
+    let passed = steps("passed.txt", &["status 0".to_owned()]);
+    let held = steps("held.txt", &[format!("record {}", shown(&call)), format!("wait {}", shown(&go))]);
+    let command = [r".\tool.exe", "exit", "0"];
+    for _ in 0..5 {
+        passing(case.gate(&heavy_words_with_limit("out.log", &["--test-remote-client", &passed], &command)));
+    }
+    let key = keys(&case).pop().expect("the runs are filed");
+    assert!(key.starts_with("remote:builder:"), "{key}");
+
+    let holder = case.start(&heavy_words_with_limit("holder.log", &["--test-remote-client", &held], &command));
+    // The client runs once the claim is written.
+    wait_for_file(&call);
+    let waiter = case.start(&heavy_words_with_limit("waiter.log", &["--test-remote-client", &passed], &command));
+    waiter.wait_for_stderr("gate: waiting for a remote slot on builder");
+    let (claim, ticket) = (only_file(&case, "slots"), only_file(&case, "waiting"));
+    fs::write(&go, "").expect("the go file can be made");
+    let (holder, waiter) = (holder.finish(), waiter.finish());
+
+    assert_eq!((holder.code, waiter.code), (Some(0), Some(0)), "{holder:?}\n{waiter:?}");
+    assert_eq!(claim["kind"], "remote", "{claim}");
+    assert_eq!(ticket["remote"], true, "{ticket}");
+    assert_expected(&claim["expected"], &key, 5);
+    assert_expected(&ticket["expected"], &key, 5);
 }

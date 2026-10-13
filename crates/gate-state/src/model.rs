@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use jiff::Timestamp;
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use crate::counts::{format_count_value, powershell_text};
 
@@ -363,6 +363,10 @@ pub struct QueueTicket {
     /// The gate's command line, when it could be read.
     #[serde(rename = "commandLine")]
     pub command_line: Option<String>,
+    /// What the durations store expected of the gate's run as it queued, `{p50, p90, n, key}` as its `gate.exe` ticket
+    /// has it; serialised only when the ticket carries it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected: Option<Map<String, Value>>,
 }
 
 /// One pool of slots.

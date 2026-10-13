@@ -154,6 +154,7 @@ fn ticket_from_v1(ticket: &v1::Ticket) -> Option<Ticket> {
         arrived_ticks: ticks_of_ms(ticket.arrived)?,
         remote: ticket.remote == Some(true),
         exact_start_ms: Some(ticket.start_ms),
+        expected: ticket.expected.clone(),
     })
 }
 
@@ -396,6 +397,7 @@ impl Table {
             holds: ticket.holds,
             remote: ticket.remote,
             pid: ticket.pid,
+            expected: ticket.expected.clone(),
         })
     }
 }

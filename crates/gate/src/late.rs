@@ -200,6 +200,7 @@ impl<'a> Late<'a> {
             builder: None,
             after_fallback: false,
             under: None,
+            expected: None,
         };
         let host = Host {
             processors: self.of.processors,
@@ -217,7 +218,7 @@ impl<'a> Late<'a> {
         let State::Waiting { wait, since } = &mut self.state else {
             return false;
         };
-        wait.say_heartbeat(console);
+        wait.say_heartbeat(&mut self.survey, console);
         let Some(waited) = wait.pass(&mut self.survey, console) else {
             return false;
         };
@@ -420,6 +421,7 @@ mod tests {
                     tag: None,
                     journal: &mut self.journal,
                     parent_pid: Some(self.parent.pid),
+                    expected: None,
                 },
                 held: &mut self.held,
                 covered: &mut self.marker,

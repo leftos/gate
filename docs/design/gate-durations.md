@@ -50,10 +50,10 @@ Each part is a sub-issue of CC-178 and lands on `feat/gate-durations`. Part 1 co
 
 ### Part 3: ETAs in wait lines, claims and tickets
 
-- The wait lines gain the slowest holder's ETA where it is known, e.g. `gate: waiting for a heavy slot (2 busy, the first frees in about 4 min)`. Command text placed into a `-f` template is brace-escaped.
-- Once that holder is past its expected end, the line gives how far past its usual time it is and the latest its timeout ends it, never a new guess: `gate: still waiting for a heavy slot (2 busy, the first is 3 min past its usual 4 min; its timeout ends it within 8 min)`.
+- The wait lines gain the ETA of the first holder to free its slot where it is known, e.g. `gate: waiting for a heavy slot (2 busy, the first frees in about 4 min)`; a critical gate's lines name the last holder to free its slot, as it waits for them all. No wait line holds command text, so the Rust gate escapes nothing.
+- Once that holder is past its expected end, the line gives how far past its usual time it is and its ceiling, never a new guess: `gate: still waiting for a heavy slot (2 busy, the first is 3 min past its usual 4 min, ceiling 15 min)`.
 - Claims and tickets gain `expected: {p50, p90, n, key}`, written when the gate has history, absent otherwise.
-- ops-tower: re-capture the fixtures there, copy them to `tools/gate/fixtures/`, and send ops-tower an inbox request for the ticket struct field and the tab's display.
+- ops-tower: the v1 fixtures are hand-written, not re-captured, and ops-tower gets an inbox request for the ticket struct field and the tab's display.
 
 ### Part 4: `-TimeoutSeconds auto` and hints
 
@@ -90,7 +90,7 @@ Parts 2 to 5 are built in the Rust gate (GATE-7) after the local cutover, on the
 - Every run that takes a slot of its own runs one `git rev-parse` before it queues to place its folder, reusing the answer of the routing decision for a heavy run whose route asked; a failed call keys the folder by its shape, silently. A `--slot none` run, and one a parent's slot covers or lends, has no key and is neither timed nor filed.
 - The expected-time line is said once the run's claim is written and the waiters woken: at a local light or heavy take, at a critical take after its holds line, at a routed run's remote take (keyed by the builder) and, for a fallback, a second time at its local take. Its figures are in [Output lines](../design.md#output-lines): `about` is the mean wall time over the estimate's window, `usual` the p50.
 - A release is filed by every slot-taking run that reaches a verdict, inside the journal hold of its `release` line, which is unchanged. A rebuild runs after the release, outside the hold, when a read found the store missing, stale or torn and the store is still so just before the claim; a rebuild leaves out `--slot none` runs, as live filing does. A store under a `keyVersion` above this build's is read as no history and is neither filed into nor rebuilt.
-- The `expected` field is reserved as optional in the v1 claim and ticket formats ([Reserved fields](../design.md#reserved-fields)), so part 3 fills it without a format change or a second drain. gate-state exposes it, and ops-tower is told by repo inbox that its ticket view can show it. Command text placed in a wait line's format template is escaped.
+- The `expected` field is optional in the v1 claim and ticket formats ([Claim](../design.md#claim), [Ticket](../design.md#ticket)), so part 3 fills it without a format change or a second drain. gate-state exposes it, and ops-tower is told by repo inbox that its ticket view can show it. The durations store is read once per run, before it queues, and that read serves the ticket, the claim and the expected-time line; the wait lines read other gates' live claims.
 - `--timeout auto` resolves to `max(n, 3 x p99)` as a floor and is never a learned kill time; a command with no history runs on `n`.
 - A guest is killed and re-queued by its own gate when the drain completes before it ends, and its key is barred 24 h. Lending a slot releases a `Local\` mutex the critical gate holds, which relaxes the critical drain's rule that the critical gate lets go of nothing, so the design names the released slot and the named release event it signals when part 5 is built.
 
