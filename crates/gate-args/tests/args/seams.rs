@@ -110,6 +110,26 @@ fn seam_flags_parse_with_the_feature() {
     );
 }
 
+/// The seam that ends a run Ctrl+C during the local wait after a `full` fallback is a switch of its own, off in a run
+/// that does not give it.
+#[cfg(feature = "test-seams")]
+#[test]
+fn the_interrupt_after_fallback_seam_is_a_switch() {
+    use crate::support::run_request;
+
+    let words = with(&RUN, &["--test-interrupt-queued-after-fallback", "--", "cmd"]);
+    let seams = run_request(&refs(&words)).test_seams;
+    assert!(seams.interrupt_after_fallback);
+    assert!(
+        !seams.interrupt_queued,
+        "it is its own switch, not the one that fires on any waiting line"
+    );
+    assert!(
+        !run_request(&refs(&with(&RUN, &["--", "cmd"]))).test_seams.interrupt_after_fallback,
+        "off unless given"
+    );
+}
+
 #[cfg(feature = "test-seams")]
 #[test]
 fn the_diagnostics_budget_seam_is_read_once_and_refuses_zero() {

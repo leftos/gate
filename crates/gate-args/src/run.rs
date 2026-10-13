@@ -95,6 +95,8 @@ pub(crate) enum SwitchOption {
     #[cfg(feature = "test-seams")]
     InterruptQueued,
     #[cfg(feature = "test-seams")]
+    InterruptAfterFallback,
+    #[cfg(feature = "test-seams")]
     SamplerFail,
     #[cfg(feature = "test-seams")]
     OwnStartFails,
@@ -283,6 +285,8 @@ impl RunBuilder {
             SwitchOption::PrintRequest => self.print_request = on,
             #[cfg(feature = "test-seams")]
             SwitchOption::InterruptQueued => self.test_seams.interrupt_queued = on,
+            #[cfg(feature = "test-seams")]
+            SwitchOption::InterruptAfterFallback => self.test_seams.interrupt_after_fallback = on,
             #[cfg(feature = "test-seams")]
             SwitchOption::SamplerFail => self.test_seams.sampler_fail = on,
             #[cfg(feature = "test-seams")]

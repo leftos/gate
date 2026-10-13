@@ -186,6 +186,7 @@ fn seam_option(name: &str) -> Option<RunOption> {
         "test-interrupt-after-samples" => Some(RunOption::Value(ValueOption::InterruptAfterSamples)),
         "test-print-request" => Some(RunOption::Switch(SwitchOption::PrintRequest)),
         "test-interrupt-queued" => Some(RunOption::Switch(SwitchOption::InterruptQueued)),
+        "test-interrupt-queued-after-fallback" => Some(RunOption::Switch(SwitchOption::InterruptAfterFallback)),
         "test-sampler-fail" => Some(RunOption::Switch(SwitchOption::SamplerFail)),
         "test-own-start-fails" => Some(RunOption::Switch(SwitchOption::OwnStartFails)),
         "test-parent-job-trusted" => Some(RunOption::Switch(SwitchOption::ParentJobTrusted)),

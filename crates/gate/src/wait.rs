@@ -43,7 +43,8 @@ pub(crate) struct Waiter {
     event: Option<NamedEvent>,
     /// The console interrupt that ends the wait, or `None` when it could not be installed.
     interrupt: Option<Interrupt>,
-    /// The interrupt the gate raises itself once it has said it waits (`--test-interrupt-queued`), else `None`.
+    /// The interrupt the gate raises itself once it has said it waits (`--test-interrupt-queued`, and
+    /// `--test-interrupt-queued-after-fallback` in a wait that follows a `full` fallback), else `None`.
     interrupt_when_waiting: Option<Interrupt>,
     /// Where the gate's ticket is.
     ticket: PathBuf,
@@ -72,7 +73,9 @@ impl Waiter {
             next_heartbeat: heartbeat,
             event,
             interrupt: host.interrupt,
-            interrupt_when_waiting: host.interrupt.filter(|_| seams.interrupt_queued),
+            interrupt_when_waiting: host
+                .interrupt
+                .filter(|_| seams.interrupt_queued || (seams.interrupt_after_fallback && arrival.after_fallback)),
             ticket: path,
             said_wait_failed: false,
         }
@@ -216,6 +219,9 @@ pub(crate) struct Arrival<'g> {
     pub queued: Instant,
     pub arrived: u64,
     pub builder: Option<&'g str>,
+    /// Whether this wait follows a `full` fallback here from the builder, the only reason that keeps `Run::queued_at`,
+    /// the moment the wait counts from; `false` for every other wait, which counts from the arrival itself.
+    pub after_fallback: bool,
     /// The parent gate whose slot does not cover this gate, which lends it while a critical request drains, or the parent
     /// that holds no slot, which lends nothing; `None` for any other gate.
     pub under: Option<UnderParent>,

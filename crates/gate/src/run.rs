@@ -1131,6 +1131,7 @@ impl Run<'_> {
             queued,
             arrived: self.arrived,
             builder: self.tag.as_ref().map(|tag| tag.host.as_str()),
+            after_fallback: since.is_some(),
             under: match self.nesting {
                 Nesting::Under(parent) => Some(UnderParent {
                     pid: parent.pid,
@@ -1199,6 +1200,7 @@ impl Run<'_> {
             queued,
             arrived: self.arrived,
             builder: None,
+            after_fallback: false,
             under: None,
         };
         let wait = MachineWait::queue(self.root, arrival, self.host, console);

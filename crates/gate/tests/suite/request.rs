@@ -42,6 +42,7 @@ fn print_request_shows_the_new_cli_request() {
         "stallMs": null,
         "interruptAfterSamples": null,
         "interruptQueued": false,
+        "interruptAfterFallback": false,
         "samplerFail": false,
         "diagnosticsFail": false,
         "remoteClient": null,

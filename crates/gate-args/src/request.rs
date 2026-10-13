@@ -130,6 +130,9 @@ pub struct TestSeams {
     pub interrupt_after_samples: Option<u64>,
     /// Raise the console interrupt once the gate has said it is waiting for a slot.
     pub interrupt_queued: bool,
+    /// Raise the console interrupt once the gate has said it is waiting for a slot here, after the remote pool sent the
+    /// run back with reason `full`, so the wait counts from the run's own queue line.
+    pub interrupt_after_fallback: bool,
     /// Make every sample of the running command fail, so the watch goes by wall time alone.
     pub sampler_fail: bool,
     /// Make the gathering of a kill's diagnostics fail, so the block is the heading and the failed line.

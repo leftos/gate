@@ -18,6 +18,7 @@ pub(crate) fn run(request: &RunRequest, log: &Path, root: &ResolvedRoot) -> Stri
         "stallMs": seams.stall_ms,
         "interruptAfterSamples": seams.interrupt_after_samples,
         "interruptQueued": seams.interrupt_queued,
+        "interruptAfterFallback": seams.interrupt_after_fallback,
         "samplerFail": seams.sampler_fail,
         "diagnosticsFail": seams.diagnostics_fail,
         "remoteClient": seams.remote_client.as_ref().map(|path| path.to_string_lossy()),

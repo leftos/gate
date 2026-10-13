@@ -1619,13 +1619,15 @@ A Rust integration suite drives the built `gate.exe` through its CLI and reads o
 
   Two more seams make a run end by Ctrl+C without a console: `--test-interrupt-after-samples <n>` raises the interrupt after the n-th sample, and `--test-interrupt-queued` raises it when the waiting line is printed, so once no slot is free for the gate. `--test-print-request` shows them as `testSeams.interruptAfterSamples` and `testSeams.interruptQueued`.
 
+  `--test-interrupt-queued-after-fallback` (a switch) raises it once the gate has said it waits for its own slot after a `full` fallback from the builder, the wait that counts from the run's queue line, so a case can pin how a Ctrl+C there counts that wait; `--test-print-request` shows it as `testSeams.interruptAfterFallback`, after `interruptQueued`.
+
   On `cutover` the seams are `--test-poll-ms`, `--test-heartbeat-ms`, `--test-confirm-ms` (the confirmation window) and the switch `--test-cutover-interrupt-after-list`; `--test-print-request` shows them as `testSeams.pollMs`, `heartbeatMs`, `confirmMs` and `interruptAfterList` ([`gate cutover`](#gate-cutover)).
 
   On `push` the seams are `--test-push-ssh <path>` (the ssh program to run instead of the one found along `PATH`, the suite's `fake-ssh`) and `--test-push-bound-ms <n>` (each builder's bound); `push` has no `--test-print-request` ([`gate push`](#gate-push)).
 
   `--test-print-request`, on `run`, `stop-tree`, `cutover` and the compatibility form, prints the parsed request as one JSON line on stdout and exits 0, so the suite sees what a command line asked for; it is the one hidden switch the compatibility layer accepts.
 
-  `--test-sampler-fail` (a switch) makes every sample fail with `--test-sampler-fail makes every sample fail (test seam only)`, so the run says `gate: sampler failed: ...; watching by wall time only` and only the backstop watches; `--test-print-request` shows it as `testSeams.samplerFail`, after `interruptQueued`.
+  `--test-sampler-fail` (a switch) makes every sample fail with `--test-sampler-fail makes every sample fail (test seam only)`, so the run says `gate: sampler failed: ...; watching by wall time only` and only the backstop watches; `--test-print-request` shows it as `testSeams.samplerFail`, after `interruptAfterFallback`.
 
   `--test-diagnostics-budget-ms <n>` (whole milliseconds above 0) replaces the 2000 ms diagnostics gather budget, so a case can make every block it gets cut; `--test-print-request` does not show it.
 

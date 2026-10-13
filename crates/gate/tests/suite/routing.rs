@@ -1333,6 +1333,53 @@ fn a_full_fallback_counts_the_local_takes_wait_from_the_queue_line() {
     assert_eq!(holder.finish().code, Some(0));
 }
 
+/// A Ctrl+C during the local wait that follows a full fallback journals its abandon with the waited time counted from
+/// the run's own queue line, so the remote wait before the fallback is in it.
+#[test]
+fn a_ctrl_c_in_the_local_wait_after_a_full_fallback_journals_the_abandon_from_the_queue_line() {
+    let case = routed_case("routing-ctrl-c-full-fallback");
+    write_counts(&case.root(), r#"{"v":1,"heavy":1}"#);
+    let local_go = case.folder().join("local-go");
+    let local_go_word = shown(&local_go);
+    let local_holder = case.start(&heavy_words_with_limit(
+        "local.log",
+        &["--local"],
+        &[r".\tool.exe", "wait", &local_go_word],
+    ));
+    wait_for_journal_line(&case.root(), &format!(r#""event":"take","pid":{},"#, local_holder.id()));
+    let go = case.folder().join("go");
+    let holder = remote_holder(&case, "holder.log", &go);
+    let steps = shown(&stub(&case, &["status 0"]));
+    let waiter = case.start(&routed_words(
+        "waiter.log",
+        &steps,
+        &["--test-remote-wait-ms", "400", "--test-interrupt-queued-after-fallback"],
+        &[r".\tool.exe", "out", "hi"],
+    ));
+    let pid = waiter.id();
+    let outcome = waiter.finish();
+
+    assert_eq!(outcome.code, Some(CONTROL_C_EXIT), "{outcome:?}");
+    assert_in_order(
+        &outcome.stderr,
+        &[REMOTE_WAITING, FULL_LINE, "gate: interrupted while waiting for a heavy slot"],
+    );
+    let own = own(&case, pid);
+    assert_eq!(names(&own), ["queue", "fallback", "abandon"], "{own:#?}");
+    assert!(own[..2].iter().all(has_remote_tag), "{own:#?}");
+    assert_eq!(own[1]["reason"], "full");
+    assert!(has_no_remote_fields(&own[2]), "{own:#?}");
+    assert!(!has_ticket(&case, pid), "the waiter's ticket is gone");
+    let waited = own[2]["waitedSeconds"].as_f64().expect("the abandon says how long the run waited");
+    assert!(
+        waited >= 0.35,
+        "the abandon counts the wait from the run's queue line, so the remote wait is in it: {waited} s"
+    );
+    let_go(&local_go);
+    let_go(&go);
+    assert_eq!((local_holder.finish().code, holder.finish().code), (Some(0), Some(0)));
+}
+
 #[test]
 fn a_waiter_takes_the_remote_slot_when_the_holder_releases() {
     let case = routed_case("routing-waiter");
