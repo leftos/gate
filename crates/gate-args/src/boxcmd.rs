@@ -1,8 +1,8 @@
 //! The hidden `gate box <verb> <payload>`: the builder side of a routed run. Only the words are read here; the payload
 //! word is passed on unread, since decoding it is the binary's. A `test-seams` build also reads the hidden
-//! `--test-heartbeat-ms <n>`, `--test-box-console fail-before`, `--test-box-park-launch <path>` and
-//! `--test-outputs-budget-bytes <n>` (each also as `--<seam>=<value>`) before the verb; without the feature each is no
-//! verb, and so the box usage.
+//! `--test-heartbeat-ms <n>`, `--test-box-console fail-before`, `--test-box-park-launch <path>`,
+//! `--test-outputs-budget-bytes <n>` and `--test-dotnet-limit-ms <n>` (each also as `--<seam>=<value>`) before the verb;
+//! without the feature each is no verb, and so the box usage.
 
 use std::ffi::{OsStr, OsString};
 use std::iter::Peekable;
@@ -52,6 +52,8 @@ enum Seam {
     ParkLaunch,
     /// `--test-outputs-budget-bytes <n>`: the output folder's outputs size budget, in bytes.
     OutputsBudgetBytes,
+    /// `--test-dotnet-limit-ms <n>`: how long the preflight's `dotnet --list-sdks` may take.
+    DotnetLimitMs,
 }
 
 #[cfg(feature = "test-seams")]
@@ -64,6 +66,7 @@ impl Seam {
             "--test-box-console" => Some(Seam::Console),
             "--test-box-park-launch" => Some(Seam::ParkLaunch),
             "--test-outputs-budget-bytes" => Some(Seam::OutputsBudgetBytes),
+            "--test-dotnet-limit-ms" => Some(Seam::DotnetLimitMs),
             _ => None,
         }
     }
@@ -75,6 +78,7 @@ impl Seam {
             Seam::Console => "--test-box-console",
             Seam::ParkLaunch => "--test-box-park-launch",
             Seam::OutputsBudgetBytes => "--test-outputs-budget-bytes",
+            Seam::DotnetLimitMs => "--test-dotnet-limit-ms",
         }
     }
 }
@@ -107,8 +111,8 @@ fn seams(words: &mut Peekable<impl Iterator<Item = OsString>>, problems: &mut Ve
     seams
 }
 
-/// Sets `seam` from `value`: whole milliseconds above 0 for the heartbeat, `fail-before` for the console, any path for
-/// the park, whole bytes above 0 for the outputs budget. An empty or missing value is no value.
+/// Sets `seam` from `value`: whole milliseconds above 0 for the heartbeat and the dotnet limit, `fail-before` for the
+/// console, any path for the park, whole bytes above 0 for the outputs budget. An empty or missing value is no value.
 #[cfg(feature = "test-seams")]
 fn set_seam(seams: &mut BoxSeams, seam: Seam, value: Result<Option<String>, Problem>) -> Result<(), Problem> {
     let name = seam.name();
@@ -119,6 +123,7 @@ fn set_seam(seams: &mut BoxSeams, seam: Seam, value: Result<Option<String>, Prob
     match seam {
         Seam::HeartbeatMs => seams.heartbeat_ms = Some(crate::values::above_zero(name, &value)?),
         Seam::OutputsBudgetBytes => seams.outputs_budget_bytes = Some(crate::values::above_zero(name, &value)?),
+        Seam::DotnetLimitMs => seams.dotnet_limit_ms = Some(crate::values::above_zero(name, &value)?),
         Seam::Console if value == "fail-before" => seams.fail_console = true,
         Seam::Console => {
             return Err(Problem::BadConsoleFailure {

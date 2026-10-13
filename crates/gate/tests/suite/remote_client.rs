@@ -923,16 +923,18 @@ fn pc_dotnet(case: &Case, body: &str) -> PcDotnet {
     PcDotnet { path, folder }
 }
 
-/// A [`PcDotnet`] that runs `pc`, lines of a batch file, when its working folder is the system folder, where this PC's
-/// gate runs `dotnet --list-sdks`, and lists `versions` anywhere else, as for the builder's `gate box`, which runs in the
-/// case folder: so this PC's SDK list and the builder's can differ.
+/// A [`PcDotnet`] that runs `pc`, lines of a batch file, for this PC's gate, behind a `dotnet.cmd` that lists
+/// `versions` for the builder's `gate box`: that one is in a folder inside the worktree that `PATH` names first, which
+/// this PC's gate skips and the builder's, which skips no folder, takes. Both read their list in the system folder, so
+/// the folder each stub sits in is what lets this PC's SDK list and the builder's differ.
 fn box_path_with_pc_dotnet(case: &Case, versions: &[&str], pc: &str) -> PcDotnet {
-    pc_dotnet(case, &by_folder(&listing(versions), pc))
-}
-
-/// Batch lines that run `pc` when the working folder is the system folder, and `elsewhere` anywhere else.
-fn by_folder(elsewhere: &str, pc: &str) -> String {
-    format!("if /i \"%CD%\"==\"{}\" goto pc\r\n{elsewhere}exit /b 0\r\n:pc\r\n{pc}", system_folder())
+    let mut dotnet = pc_dotnet(case, pc);
+    let builder = case.folder().join("ssh").join("builder-dotnet");
+    fs::create_dir_all(&builder).expect("the builder's stub folder can be made");
+    fs::write(builder.join("dotnet.cmd"), format!("@echo off\r\n{}", listing(versions))).expect("the builder's stub dotnet can be written");
+    let folders = std::iter::once(builder).chain(std::env::split_paths(&dotnet.path));
+    dotnet.path = std::env::join_paths(folders).expect("the folders join into a PATH");
+    dotnet
 }
 
 /// The system folder as `%CD%` says it, with no trailing backslash: where this PC's gate runs its dotnet.
@@ -1132,8 +1134,9 @@ fn a_dotnet_that_does_not_answer_counts_as_an_unreadable_sdk_list() {
 }
 
 /// A `dotnet.cmd` in a folder inside the worktree that `PATH` names first, as an `npm run` or an activated venv puts
-/// one, is skipped for this PC's SDK list: the stub later on `PATH` is read, and the one inside leaves no mark. The
-/// builder's `gate box`, which skips no folder, takes the one inside, which lists `8.0.404` for it.
+/// one, is skipped for this PC's SDK list: the stub later on `PATH` is read, so this PC lists 999. The builder's
+/// `gate box`, which skips no folder, takes the one inside, which lists `8.0.404` for it and notes each run: it ran
+/// once, for the builder alone.
 #[test]
 fn a_dotnet_on_path_inside_the_worktree_is_not_run_for_the_sdk_list() {
     let case = client_case("client-parity-path-in-worktree");
@@ -1141,15 +1144,19 @@ fn a_dotnet_on_path_inside_the_worktree_is_not_run_for_the_sdk_list() {
     let inside = case.folder().join("ssh").join("repo-bin");
     fs::create_dir_all(&inside).expect("the folder inside the worktree can be made");
     let marker = case.folder().join("ssh").join("inside-ran");
-    let pc = format!(">\"{}\" echo ran\r\necho 997.0.100 [C:\\inside]\r\n", marker.display());
-    let decoy = format!("@echo off\r\n{}", by_folder(&listing(&["8.0.404"]), &pc));
+    let decoy = format!("@echo off\r\n>>\"{}\" echo ran\r\n{}", marker.display(), listing(&["8.0.404"]));
     fs::write(inside.join("dotnet.cmd"), decoy).expect("the dotnet inside the worktree can be written");
-    let later = box_path_with_pc_dotnet(&case, &["8.0.404"], "echo 999.0.100 [C:\\stub]\r\n");
+    let later = pc_dotnet(&case, "echo 999.0.100 [C:\\stub]\r\n");
     let path = std::env::join_paths(std::iter::once(inside).chain(std::env::split_paths(&later.path))).expect("the folders join into a PATH");
 
     a_parity_refusal(&case, &[], "a .NET 999 SDK", Some(&path));
 
-    assert!(!marker.exists(), "the dotnet.cmd inside the worktree ran");
+    let ran = fs::read_to_string(&marker).expect("the builder ran the dotnet.cmd inside the worktree");
+    assert_eq!(
+        ran.lines().count(),
+        1,
+        "the dotnet.cmd inside the worktree ran for the builder alone: {ran:?}"
+    );
 }
 
 /// A Ctrl+C as this PC's SDK list is read ends the run as an interrupt: no `cannot read` line, nothing pushed, and no
@@ -1178,8 +1185,8 @@ fn a_ctrl_c_during_the_sdk_list_read_ends_the_run_as_an_interrupt() {
     assert_eq!(runs(&case), (0, 0), "the command ran nowhere: {outcome:?}");
 }
 
-/// This PC's `dotnet --list-sdks` runs in the system folder, not the repo root: the `PATH` stub writes the folder it
-/// runs in, first for the builder's call, made in the case folder by the preflight, then for this PC's.
+/// `dotnet --list-sdks` runs in the system folder, not the repo root nor the folder the builder's `gate box` starts in:
+/// the `PATH` stub writes the folder it runs in, first for the builder's call, made by the preflight, then for this PC's.
 #[test]
 fn the_pcs_dotnet_runs_in_the_system_folder() {
     let case = client_case("client-parity-dotnet-folder");
@@ -1196,7 +1203,7 @@ fn the_pcs_dotnet_runs_in_the_system_folder() {
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     let ran_in = fs::read_to_string(&folders).expect("the stub wrote the folders it ran in");
     let ran_in: Vec<&str> = ran_in.lines().map(str::trim_end).collect();
-    let want = [case.folder().display().to_string(), system_folder()];
+    let want = [system_folder(), system_folder()];
     assert!(
         ran_in.len() == want.len() && ran_in.iter().zip(&want).all(|(ran, want)| ran.eq_ignore_ascii_case(want)),
         "{want:?}, the builder's then this PC's: {ran_in:?}"

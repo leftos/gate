@@ -16,7 +16,6 @@
 //! takes the work-folder key's lock, [`hold_key`], before its remote slot, so a second routed run of one worktree falls
 //! back `busy` at once.
 
-use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::num::NonZeroU64;
@@ -31,7 +30,7 @@ use std::time::{Duration, Instant};
 
 use gate_args::{RunRequest, TestSeams};
 use gate_state::{FallbackReason, KernelObject, key_hash};
-use gate_win32::{AcquireError, Interrupt, Job, NamedMutex, OwnedMutexGuard, PipedConsole, PipedLaunch, Running};
+use gate_win32::{AcquireError, Interrupt, Job, NamedMutex, OwnedMutexGuard, PipedConsole, Running};
 use jiff::{SignedDuration, Timestamp};
 use regex::Regex;
 
@@ -50,7 +49,7 @@ use crate::boxside::outputs::OUTPUTS_BUDGET;
 use crate::boxside::payload::escaped;
 use crate::environment::Variables;
 use crate::outputs::archive::sent_limit;
-use crate::run::{CONTROL_C_EXIT, ERROR_FILE_NOT_FOUND, Written, find_program, is_within, resolved, written};
+use crate::run::{CONTROL_C_EXIT, find_program, is_within, resolved};
 
 /// The statuses of a preflight whose builder has no `gate box` that takes the run: cmd's for a program it cannot find,
 /// and a gate's usage error for a payload it does not read.
@@ -79,8 +78,6 @@ const OURS: &str = env!("CARGO_PKG_VERSION");
 const NO_HANDLER: &str = "gate: --test-remote-interrupt-at needs the console handler; it could not be installed";
 /// The most of a call's standard output one read of a raw copy takes.
 const RAW_CHUNK: usize = 64 * 1024;
-/// How long this PC's `dotnet --list-sdks` may take before it is killed and its list counts as unreadable.
-const DOTNET_LIMIT: Duration = Duration::from_secs(30);
 
 /// The client of `--test-remote-transport`.
 pub(crate) struct RustClient {
@@ -1145,7 +1142,7 @@ impl<'c, 'a> Attempt<'c, 'a> {
             one_call: None,
             interrupt_at: None,
             local_sdks: None,
-            dotnet_limit: DOTNET_LIMIT,
+            dotnet_limit: git::DOTNET_LIMIT,
             fetch_cap: watchdog::FETCH_CAP,
             apply_cap: watchdog::APPLY_CAP,
             outputs_budget: OUTPUTS_BUDGET,
@@ -1948,46 +1945,16 @@ fn sdks_of(lines: &[String]) -> Option<Vec<String>> {
         .map(parity::listed)
 }
 
-/// How long this PC's `dotnet --list-sdks` may take: `--test-dotnet-limit-ms` when given, else [`DOTNET_LIMIT`].
+/// How long this PC's `dotnet --list-sdks` may take: `--test-dotnet-limit-ms` when given, else [`git::DOTNET_LIMIT`].
 fn dotnet_limit(seams: &TestSeams) -> Duration {
-    seams.dotnet_limit_ms.map_or(DOTNET_LIMIT, Duration::from_millis)
+    seams.dotnet_limit_ms.map_or(git::DOTNET_LIMIT, Duration::from_millis)
 }
 
-/// What `dotnet --list-sdks` lists on this PC, empty when no dotnet is found along the `PATH` of `variables`. The
-/// search never looks in the working folder, nor in a `PATH` folder inside `worktree`, compared by canonical path so a
-/// junction does not get around it, and is not bounded. dotnet runs in the system folder, not the repo, with `variables`
-/// as its environment, that `PATH` and `NoDefaultCurrentDirectoryInExePath=1`, as the client's git calls run: in a
-/// kill-on-close job of its own, on this process's console, ended past `limit` or by the console `interrupt`, its
-/// standard output read up to [`git::OUTPUT_CAP`] and its standard error dropped. Else why the list cannot be read,
-/// or [`GitError::Interrupted`].
+/// What `dotnet --list-sdks` lists on this PC, as [`git::sdk_listing`] reads it, with the folders inside `worktree`
+/// dropped from the `PATH` of `variables`, each compared by its canonical path so a junction does not get around it.
 fn local_sdk_listing(variables: Variables, worktree: &Path, limit: Duration, interrupt: Option<Interrupt>) -> Result<String, GitError> {
-    let cannot_run = |why: String| GitError::Failed(format!("cannot run dotnet: {why}"));
-    let folder = gate_win32::system_directory().map_err(|error| cannot_run(format!("cannot read the system folder: {error}")))?;
     let path = path_outside(&variables, worktree);
-    let variables = variables.with("PATH", &path).with("NoDefaultCurrentDirectoryInExePath", "1");
-    let dotnet = match find_program("dotnet", &variables, &folder) {
-        Ok(dotnet) => dotnet,
-        // `find_program` says a word it does not find with this message, and every other failure with another.
-        Err(message) if message == gate_win32::win32_message(ERROR_FILE_NOT_FOUND) => return Ok(String::new()),
-        Err(message) => return Err(cannot_run(message)),
-    };
-    let args = ["--list-sdks"];
-    let call = git::Call {
-        interrupt,
-        ..git::Call::plain(&folder, &args, limit)
-    };
-    let spawn = git::Spawn {
-        name: "dotnet",
-        late: format!("dotnet --list-sdks did not answer in {}", git::spelled_limit(limit)),
-        launch: sdk_launch(&dotnet, &folder, &variables),
-    };
-    let over = format!("dotnet --list-sdks wrote more than {} MiB", git::OUTPUT_CAP / (1024 * 1024));
-    let (status, output) = git::output_of(&spawn, &call, over)?;
-    if !status.success() {
-        let status = status.code().map_or_else(|| "unknown".to_owned(), |code| code.to_string());
-        return Err(GitError::Failed(format!("dotnet --list-sdks exited with status {status}")));
-    }
-    Ok(String::from_utf8_lossy(&output).into_owned())
+    git::sdk_listing(variables.with("PATH", &path), limit, interrupt)
 }
 
 /// The `PATH` of `variables` without the folders inside `worktree`, each compared by its canonical path: an `npm run`
@@ -2000,22 +1967,6 @@ fn path_outside(variables: &Variables, worktree: &Path) -> String {
         .collect();
     // Folders `split_paths` read from `PATH` join back; one that would not is dropped with the rest, so no dotnet is found.
     std::env::join_paths(kept).map_or_else(|_| String::new(), |joined| joined.to_string_lossy().into_owned())
-}
-
-/// The launch of `dotnet --list-sdks` with the program `dotnet` found, in `folder`, on this process's console, with
-/// `variables` as its environment: a batch file runs through the system folder's cmd.exe, as `gate run` starts one.
-fn sdk_launch(dotnet: &Path, folder: &Path, variables: &Variables) -> io::Result<PipedLaunch> {
-    let (application, command_line) = match written(dotnet, &[OsString::from("--list-sdks")], variables) {
-        Written::Line(application, command_line) => (application, command_line),
-        Written::Refused(why) | Written::NoShell(why) => return Err(io::Error::other(why)),
-    };
-    Ok(PipedLaunch {
-        application,
-        command_line,
-        directory: folder.to_owned(),
-        environment: variables.block()?,
-        console: PipedConsole::Attached,
-    })
 }
 
 /// The builder's boot time, from the last `gate: remote boot <time>` line of a preflight or a `boot` call; `None` when
@@ -2168,13 +2119,12 @@ mod tests {
     use gate_win32::{Interrupt, PipedConsole};
 
     use super::{
-        Attempt, CallEnd, Called, Capped, Cut, DOTNET_LIMIT, Echo, End, GIT_SSH_FAILED, Heard, LINE_CAP, Limits, Loss, NonZeroU64, OUTPUTS_BUDGET,
-        ProtocolLines, Raised, Reader, Reading, SSH_FAILED, Shared, Unfinished, Watch, after_loss, boot_time, called_of, console_of, held,
-        is_heartbeat, last_update, local_sdk_listing, paused, push_size, relay, relay_raw, relayed_raw, sdks_of, seconds, their_version,
-        version_refusal,
+        Attempt, CallEnd, Called, Capped, Cut, Echo, End, GIT_SSH_FAILED, Heard, LINE_CAP, Limits, Loss, NonZeroU64, OUTPUTS_BUDGET, ProtocolLines,
+        Raised, Reader, Reading, SSH_FAILED, Shared, Unfinished, Watch, after_loss, boot_time, called_of, console_of, held, is_heartbeat,
+        last_update, local_sdk_listing, paused, push_size, relay, relay_raw, relayed_raw, sdks_of, seconds, their_version, version_refusal,
     };
     use crate::environment::Variables;
-    use crate::remote::git::{GIT_LIMIT, GitError};
+    use crate::remote::git::{DOTNET_LIMIT, GIT_LIMIT, GitError};
     use crate::remote::outputs;
     use crate::remote::payload::Location;
     use crate::remote::snapshot::Snapshot;

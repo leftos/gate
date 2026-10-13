@@ -59,6 +59,9 @@ pub struct BoxSeams {
     /// The outputs folder's size budget in bytes for `gate box run`, over the built-in 50 GiB; `None` without the
     /// feature.
     pub outputs_budget_bytes: Option<u64>,
+    /// How long `gate box preflight`'s `dotnet --list-sdks` may take, in milliseconds, under the built-in 30 s; `None`
+    /// without the feature.
+    pub dotnet_limit_ms: Option<u64>,
 }
 
 /// What `gate box` was asked to do on the builder.

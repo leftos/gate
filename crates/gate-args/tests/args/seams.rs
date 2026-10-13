@@ -903,6 +903,73 @@ fn box_seam_outputs_budget_bytes_is_an_unknown_word_without_the_feature() {
 
 #[cfg(feature = "test-seams")]
 #[test]
+fn box_seam_dotnet_limit_ms_is_read_before_the_verb() {
+    use std::ffi::OsString;
+
+    use gate_args::{BoxRequest, BoxSeams, BoxVerb, Invocation};
+
+    use crate::support::invocation;
+
+    let limited = |dotnet_limit_ms| {
+        Invocation::Box(BoxRequest {
+            verb: BoxVerb::Preflight,
+            payload: OsString::from("e30="),
+            seams: BoxSeams {
+                dotnet_limit_ms,
+                ..BoxSeams::default()
+            },
+        })
+    };
+    assert_eq!(
+        invocation(&["box", "--test-dotnet-limit-ms", "1000", "preflight", "e30="]),
+        limited(Some(1000))
+    );
+    assert_eq!(
+        invocation(&["box", "--test-dotnet-limit-ms=1500", "preflight", "e30="]),
+        limited(Some(1500))
+    );
+    assert_eq!(invocation(&["box", "preflight", "e30="]), limited(None), "no seam given, none set");
+}
+
+#[cfg(feature = "test-seams")]
+#[test]
+fn box_seam_dotnet_limit_ms_refuses_what_the_run_seams_refuse() {
+    let rows: [(&[&str], &[&str]); 5] = [
+        (
+            &["box", "--test-dotnet-limit-ms", "1", "--test-dotnet-limit-ms=2", "preflight", "e30="],
+            &["gate: --test-dotnet-limit-ms is given twice"],
+        ),
+        (
+            &["box", "--test-dotnet-limit-ms", "0", "preflight", "e30="],
+            &["gate: --test-dotnet-limit-ms must be a whole number above 0, got '0'"],
+        ),
+        (
+            &["box", "--test-dotnet-limit-ms", "fast", "preflight", "e30="],
+            &["gate: --test-dotnet-limit-ms must be a whole number above 0, got 'fast'"],
+        ),
+        (
+            &["box", "--test-dotnet-limit-ms=", "preflight", "e30="],
+            &["gate: --test-dotnet-limit-ms needs a value"],
+        ),
+        (
+            &["box", "--test-dotnet-limit-ms"],
+            &["gate: --test-dotnet-limit-ms needs a value", BOX_USAGE],
+        ),
+    ];
+    for (words, want) in rows {
+        assert_eq!(problems(words), want, "{words:?}");
+    }
+}
+
+#[cfg(not(feature = "test-seams"))]
+#[test]
+fn box_seam_dotnet_limit_ms_is_an_unknown_word_without_the_feature() {
+    assert_eq!(problems(&["box", "--test-dotnet-limit-ms", "1000", "preflight", "e30="]), [BOX_USAGE]);
+    assert_eq!(problems(&["box", "--test-dotnet-limit-ms=1000", "preflight", "e30="]), [BOX_USAGE]);
+}
+
+#[cfg(feature = "test-seams")]
+#[test]
 fn box_seam_console_and_park_launch_are_read_before_the_verb() {
     use std::ffi::OsString;
     use std::path::PathBuf;
@@ -959,6 +1026,7 @@ fn box_seam_console_and_park_launch_are_read_before_the_verb() {
                 fail_console: true,
                 park_launch: Some(PathBuf::from(r"X:\case\park")),
                 outputs_budget_bytes: None,
+                dotnet_limit_ms: None,
             },
         }),
         "the seams come in any order before the verb"

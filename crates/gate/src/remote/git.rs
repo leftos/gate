@@ -1,10 +1,10 @@
 //! git as the routing decision and the remote client run it: the executable found once along the gate's own `PATH`,
 //! asked about one folder alone, started suspended in an anonymous kill-on-close job of its own on this process's
 //! console or a hidden one of its own, its output read from pipes by a thread per stream, and ended with its whole job
-//! after a time limit or by the console interrupt. Another program the client asks, this PC's `dotnet --list-sdks`, is
-//! started, bounded and ended the same way ([`output_of`]).
+//! after a time limit or by the console interrupt. One other program, `dotnet --list-sdks`, which this PC's parity
+//! check and the builder's preflight read, is started, bounded and ended the same way ([`sdk_listing`]).
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::windows::fs::OpenOptionsExt;
@@ -23,10 +23,12 @@ use gate_win32::{Interrupt, Job, PipedConsole, PipedLaunch, Running};
 use super::launch::{DRAIN, KILL_WAIT, KILLED, call_job, launched, piped_launch};
 use crate::boxside::payload::escaped;
 use crate::environment::Variables;
-use crate::run::{CONTROL_C_EXIT, find_program};
+use crate::run::{CONTROL_C_EXIT, ERROR_FILE_NOT_FOUND, Written, find_program, written};
 
 /// How long one git call may take before git is killed.
 pub(crate) const GIT_LIMIT: Duration = Duration::from_secs(60);
+/// How long a `dotnet --list-sdks` may take before it is killed and its list counts as unreadable.
+pub(crate) const DOTNET_LIMIT: Duration = Duration::from_secs(30);
 /// How often a git call is looked at while it runs.
 const GIT_POLL: Duration = Duration::from_millis(5);
 /// The most of its standard output a call through [`Git::output`] is read for, as the sync-back's calls read the
@@ -218,23 +220,67 @@ impl Git {
 
 /// A process a bounded call starts: the name its failure lines call it by, the line it is killed under once it outlives
 /// its call's limit, and its launch, or why none could be made.
-pub(crate) struct Spawn<'a> {
-    pub name: &'a str,
-    pub late: String,
-    pub launch: io::Result<PipedLaunch>,
+struct Spawn<'a> {
+    name: &'a str,
+    late: String,
+    launch: io::Result<PipedLaunch>,
+}
+
+/// What `dotnet --list-sdks` lists, empty when no dotnet is found along the `PATH` of `variables`; the search never
+/// looks in the working folder. dotnet runs in the system folder with `variables` as its environment and
+/// `NoDefaultCurrentDirectoryInExePath=1`, as the client's git calls run: in a kill-on-close job of its own, on this
+/// process's console, ended past `limit` or by the console `interrupt`, its standard output read up to [`OUTPUT_CAP`]
+/// and its standard error dropped. This PC's parity check and the builder's preflight both read the list this way.
+/// Else why the list cannot be read, or [`GitError::Interrupted`].
+pub(crate) fn sdk_listing(variables: Variables, limit: Duration, interrupt: Option<Interrupt>) -> Result<String, GitError> {
+    let cannot_run = |why: String| GitError::Failed(format!("cannot run dotnet: {why}"));
+    let folder = gate_win32::system_directory().map_err(|error| cannot_run(format!("cannot read the system folder: {error}")))?;
+    let variables = variables.with("NoDefaultCurrentDirectoryInExePath", "1");
+    let dotnet = match find_program("dotnet", &variables, &folder) {
+        Ok(dotnet) => dotnet,
+        // `find_program` says a word it does not find with this message, and every other failure with another.
+        Err(message) if message == gate_win32::win32_message(ERROR_FILE_NOT_FOUND) => return Ok(String::new()),
+        Err(message) => return Err(cannot_run(message)),
+    };
+    let args = ["--list-sdks"];
+    let call = Call {
+        interrupt,
+        ..Call::plain(&folder, &args, limit)
+    };
+    let spawn = Spawn {
+        name: "dotnet",
+        late: format!("dotnet --list-sdks did not answer in {}", spelled_limit(limit)),
+        launch: sdk_launch(&dotnet, &folder, &variables),
+    };
+    let over = format!("dotnet --list-sdks wrote more than {} MiB", OUTPUT_CAP / (1024 * 1024));
+    let (status, output) = output_of(&spawn, &call, over)?;
+    if !status.success() {
+        let status = status.code().map_or_else(|| "unknown".to_owned(), |code| code.to_string());
+        return Err(GitError::Failed(format!("dotnet --list-sdks exited with status {status}")));
+    }
+    Ok(String::from_utf8_lossy(&output).into_owned())
+}
+
+/// The launch of `dotnet --list-sdks` with the program `dotnet` found, in `folder`, on this process's console, with
+/// `variables` as its environment: a batch file runs through the system folder's cmd.exe, as `gate run` starts one.
+fn sdk_launch(dotnet: &Path, folder: &Path, variables: &Variables) -> io::Result<PipedLaunch> {
+    let (application, command_line) = match written(dotnet, &[OsString::from("--list-sdks")], variables) {
+        Written::Line(application, command_line) => (application, command_line),
+        Written::Refused(why) | Written::NoShell(why) => return Err(io::Error::other(why)),
+    };
+    Ok(PipedLaunch {
+        application,
+        command_line,
+        directory: folder.to_owned(),
+        environment: variables.block()?,
+        console: PipedConsole::Attached,
+    })
 }
 
 /// Runs `spawn`'s process as `call` bounds it, as [`Git::output_bytes`] runs git: its exit status and what it wrote on
 /// standard output, read up to [`OUTPUT_CAP`], its standard error read and dropped. One that writes more is ended as
 /// soon as its reader sees it, and the call is [`GitError::OverCap`] with the line `over`.
-#[cfg_attr(
-    not(feature = "test-seams"),
-    expect(
-        dead_code,
-        reason = "only the remote client reads this PC's SDK list this way, and a gate without the test seams has none"
-    )
-)]
-pub(crate) fn output_of(spawn: &Spawn<'_>, call: &Call<'_>, over: String) -> Result<(ExitStatus, Vec<u8>), GitError> {
+fn output_of(spawn: &Spawn<'_>, call: &Call<'_>, over: String) -> Result<(ExitStatus, Vec<u8>), GitError> {
     let (over, read_capped) = capped_reader(OUTPUT_CAP, over);
     let (status, output, ()) = bounded(spawn, call, read_capped, dropped, Some(&over))?;
     let Some(output) = output else {

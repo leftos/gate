@@ -5,6 +5,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::sync::PoisonError;
+use std::time::Duration;
+
+use gate_args::BoxSeams;
 
 use crate::answer::USAGE_STATUS;
 use crate::boxside::boot;
@@ -12,6 +15,7 @@ use crate::boxside::forward::{ChildPipes, DRAIN, Drained, OutputLock};
 use crate::boxside::payload::Payload;
 use crate::console::Console;
 use crate::environment::Variables;
+use crate::remote::git;
 use crate::run::{ERROR_FILE_NOT_FOUND, find_program};
 
 /// The status of a step that failed with no status of its own: git or a folder that could not be made or written.
@@ -50,8 +54,9 @@ pub(crate) fn git_failed(step: &str, code: i32) -> Failed {
     }
 }
 
-/// Readies the folders the payload's `Bare` and `Work` name, then says the three trailing lines; returns the status.
-pub(crate) fn preflight(payload: &Payload, console: &mut Console) -> u32 {
+/// Readies the folders the payload's `Bare` and `Work` name, then says the three trailing lines, the SDK list read
+/// within `--test-dotnet-limit-ms` when `seams` gives it, else [`git::DOTNET_LIMIT`]; returns the status.
+pub(crate) fn preflight(payload: &Payload, seams: &BoxSeams, console: &mut Console) -> u32 {
     let (bare, work) = match payload.path("Bare").and_then(|bare| Ok((bare, payload.work_folder()?.1))) {
         Ok(folders) => folders,
         Err(line) => {
@@ -65,7 +70,7 @@ pub(crate) fn preflight(payload: &Payload, console: &mut Console) -> u32 {
     }
     console.out(&format!("gate: remote version {}", env!("CARGO_PKG_VERSION")));
     boot::say(console);
-    say_sdks(console);
+    say_sdks(seams.dotnet_limit_ms.map_or(git::DOTNET_LIMIT, Duration::from_millis), console);
     0
 }
 
@@ -214,33 +219,21 @@ pub(crate) fn locate(word: &str) -> Result<Option<PathBuf>, String> {
     }
 }
 
-/// Says the SDK line on stdout; a list that cannot be read is said on stderr instead, and fails nothing.
-fn say_sdks(console: &mut Console) {
-    match sdks() {
+/// Says the SDK line on stdout, the list read within `limit`; a list that cannot be read is said on stderr instead, and
+/// fails nothing.
+fn say_sdks(limit: Duration, console: &mut Console) {
+    match sdks(limit) {
         Ok(list) => console.out(&format!("gate: remote sdks {list}")),
         Err(message) => console.err(&format!("gate: remote could not read the SDK list: {message}")),
     }
 }
 
-/// The SDK list of `dotnet --list-sdks`, `none` when no dotnet is found; else why it could not be read.
-fn sdks() -> Result<String, String> {
-    let Some(dotnet) = locate("dotnet")? else {
-        return Ok(sdk_list(""));
-    };
-    // Started under the spawn lock, so it inherits no launch's handles.
-    let output = gate_win32::spawn(
-        Command::new(&dotnet)
-            .arg("--list-sdks")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit()),
-    )
-    .and_then(std::process::Child::wait_with_output)
-    .map_err(|error| format!("cannot start {}: {error}", dotnet.display()))?;
-    if !output.status.success() {
-        return Err(format!("dotnet --list-sdks exited with status {}", exit_code(output.status)));
-    }
-    Ok(sdk_list(&String::from_utf8_lossy(&output.stdout)))
+/// The SDK list of `dotnet --list-sdks`, `none` when no dotnet is found along the gate's own `PATH`; else why it could
+/// not be read. dotnet is run as [`git::sdk_listing`] runs it, with no console interrupt, ended with its job past
+/// `limit`.
+fn sdks(limit: Duration) -> Result<String, String> {
+    let listing = git::sdk_listing(Variables::from_process(), limit, None)?;
+    Ok(sdk_list(&listing))
 }
 
 /// The first space-separated word of each non-empty line of `listing`, joined by `,`; `none` when there is none.

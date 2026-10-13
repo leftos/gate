@@ -368,6 +368,75 @@ fn preflight_sdks_none_without_dotnet() {
     assert_eq!(passed(&outcome).last(), Some(&"gate: remote sdks none"), "{outcome:?}");
 }
 
+/// The builder's `dotnet --list-sdks` that never answers is ended with its job at the bound `--test-dotnet-limit-ms`
+/// sets: the preflight says why it has no SDK list and still passes, and nothing the stub started is left running. Only
+/// the bound ends the call, so no load changes what the preflight says.
+#[test]
+fn preflight_a_dotnet_that_does_not_answer_is_an_unreadable_sdk_list() {
+    let case = Case::new("preflight_dotnet_hangs");
+    let folders = Folders::new(&case);
+    let stub = case.folder().join("stub");
+    fs::create_dir_all(&stub).expect("the stub folder can be made");
+    let go = case.folder().join("dotnet-go");
+    let held = case.folder().join("dotnet-held");
+    let hang = format!("@echo off\r\n\"{FAKE_TOOL}\" wait \"{}\" >\"{}\"\r\n", go.display(), held.display());
+    fs::write(stub.join("dotnet.cmd"), hang).expect("the dotnet stub can be written");
+    let mut command = box_command(&case, &["box", "--test-dotnet-limit-ms", "1000", "preflight", &folders.payload()]);
+    command.env("PATH", path_with_git(&[stub]));
+
+    let outcome = finish(command);
+
+    // A stub that started holds its output file open until its job's kill ends it; one the kill came first never made it.
+    if held.exists() {
+        wait_until_closed(&held);
+    }
+    fs::write(&go, "").expect("the go file can be written");
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(!outcome.stdout.contains("gate: remote sdks"), "{outcome:?}");
+    let unreadable = "gate: remote could not read the SDK list: dotnet --list-sdks did not answer in 1 s";
+    assert!(outcome.stderr.lines().any(|line| line == unreadable), "{unreadable}: {outcome:?}");
+}
+
+/// The builder's `dotnet --list-sdks` runs in the system folder, not the folder `gate box` was started in: the stub
+/// writes the folder it runs in.
+#[test]
+fn preflight_runs_dotnet_in_the_system_folder() {
+    let case = Case::new("preflight_dotnet_folder");
+    let folders = Folders::new(&case);
+    let stub = case.folder().join("stub");
+    fs::create_dir_all(&stub).expect("the stub folder can be made");
+    let ran_in = case.folder().join("dotnet-folder");
+    let body = format!("@echo off\r\n>\"{}\" echo %CD%\r\necho 8.0.404 [C:\\stub]\r\n", ran_in.display());
+    fs::write(stub.join("dotnet.cmd"), body).expect("the dotnet stub can be written");
+
+    let outcome = gate_box(&case, "preflight", &folders.payload(), Some(&path_with_git(&[stub])));
+
+    assert_eq!(passed(&outcome).last(), Some(&"gate: remote sdks 8.0.404"), "{outcome:?}");
+    let ran_in = fs::read_to_string(&ran_in).expect("the stub wrote the folder it ran in");
+    let system = gate_win32::system_directory().expect("the system folder can be read");
+    let system = system.to_string_lossy();
+    assert!(
+        ran_in.trim_end().eq_ignore_ascii_case(system.trim_end_matches('\\')),
+        "{system}: {ran_in:?}"
+    );
+}
+
+/// A `dotnet.cmd` in the folder `gate box` was started in, which no `PATH` folder names, is not run for the SDK list:
+/// the preflight says it has none, and the stub leaves no mark.
+#[test]
+fn preflight_does_not_run_a_dotnet_in_its_working_folder() {
+    let case = Case::new("preflight_dotnet_in_working_folder");
+    let folders = Folders::new(&case);
+    let marker = case.folder().join("dotnet-ran");
+    let decoy = format!("@echo off\r\n>\"{}\" echo ran\r\necho 997.0.100 [C:\\decoy]\r\n", marker.display());
+    fs::write(case.folder().join("dotnet.cmd"), decoy).expect("the dotnet in the working folder can be written");
+
+    let outcome = gate_box(&case, "preflight", &folders.payload(), Some(&path_with_git(&[])));
+
+    assert_eq!(passed(&outcome).last(), Some(&"gate: remote sdks none"), "{outcome:?}");
+    assert!(!marker.exists(), "the dotnet.cmd in the working folder ran");
+}
+
 #[test]
 fn preflight_version_line_is_the_package_version() {
     let case = Case::new("preflight_version_line_is_the_package_version");

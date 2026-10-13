@@ -1014,9 +1014,13 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
     **Bounded SDK read**: `dotnet --list-sdks` runs like the client's git calls, through the same start-and-wait function in `remote/git.rs`: in an anonymous kill-on-close job of its own, on the gate's console, with the run's interrupt and a 30 s bound (the test seam `--test-dotnet-limit-ms` lowers it), its standard output read up to 16 MiB and its standard error dropped. A `dotnet` that hangs (a broken install, a first-run prompt) is killed with its whole job at the bound.
 
+    The builder's `gate box preflight` reads its own list through the same function (`sdk_listing` in `remote/git.rs`), with no interrupt ([The box side](#the-box-side)); only the `PATH` it searches differs, as below.
+
     It runs in the system folder (`GetSystemDirectoryW`), not the repo root nor the temp folder: `TMP`/`TEMP` can point back into the repo and any process of the user can write there, while cmd.exe searches the working folder for each bare command in a `dotnet.cmd`. Its environment also sets `NoDefaultCurrentDirectoryInExePath=1`. A `dotnet.cmd` found on `PATH` runs through the system folder's cmd.exe.
 
     `dotnet` is found on `PATH` only: `find_program` never searches the working folder for a bare name, and a `PATH` folder inside the worktree is skipped, compared by canonical path so a junction does not get around it (an `npm run` or an activated venv puts repo folders first on `PATH`). The dotnet the run starts sees that `PATH` too. The search on `PATH` is outside the 30 s bound, which starts with dotnet's launch.
+
+    The builder's preflight skips no `PATH` folder: the box's work folder holds the snapshot this PC sent, and this PC already refuses its own repo's folders.
 
     Past the bound the list counts as unreadable and the run says `gate: cannot read this PC's SDK list: dotnet --list-sdks did not answer in 30 s; checking no SDK major` (a bound that is not a whole number of seconds is said in milliseconds, as the git limit is: `in 200 ms`).
 
@@ -1312,9 +1316,13 @@ The value is empty for a missing key or JSON null, the string as given with cont
 
 Every path comes from the payload and nothing is written under the gate's state root; `gate box` takes no `--state-dir`. Test seams are `test-seams`-gated flags, never environment variables, and sit before the verb (`gate box --test-... run <payload>`) in a `BoxSeams` struct on `BoxRequest`, apart from the `gate run` seams, so `--test-print-request` is unchanged.
 
-The box seams, in any order before the verb and each also as `--<seam>=<value>`, are `--test-heartbeat-ms <n>`, the period of the command heartbeat; `--test-box-console fail-before`, which makes the command's UTF-8 console fail before the command starts (the only accepted value, else `gate: --test-box-console must be fail-before, got '<value>'`); `--test-box-park-launch <path>`, which parks the launch after the donor is in the job and before the output lock, writes the empty file `<path>.parked`, and goes on once `<path>` exists (at most 600 s); and `--test-outputs-budget-bytes <n>`, which replaces the 50 GiB outputs budget of the box's trim, in bytes.
+The box seams go in any order before the verb, each also as `--<seam>=<value>`. `--test-heartbeat-ms <n>` sets the period of the command heartbeat, and `--test-box-console fail-before` makes the command's UTF-8 console fail before the command starts (the only accepted value, else `gate: --test-box-console must be fail-before, got '<value>'`).
 
-A seam is refused as the `gate run` seams are: no value, given twice, and for the heartbeat and the outputs budget not a whole number above 0 or above 2147483647 (`gate: --test-outputs-budget-bytes must be a whole number above 0, got '<v>'`, `... must be at most 2147483647 ...`, `... needs a value`, `... is given twice`). Without the feature each word gets the box usage line.
+`--test-box-park-launch <path>` parks the launch after the donor is in the job and before the output lock, writes the empty file `<path>.parked`, and goes on once `<path>` exists (at most 600 s).
+
+The other two box seams are `--test-outputs-budget-bytes <n>`, which replaces the 50 GiB outputs budget of the box's trim, in bytes, and `--test-dotnet-limit-ms <n>`, which replaces the 30 s bound of the preflight's `dotnet --list-sdks` read, in milliseconds.
+
+A seam is refused as the `gate run` seams are: no value, given twice, and for the heartbeat, the outputs budget and the dotnet limit not a whole number above 0 or above 2147483647 (`gate: --test-outputs-budget-bytes must be a whole number above 0, got '<v>'`, `... must be at most 2147483647 ...`, `... needs a value`, `... is given twice`). Without the feature each word gets the box usage line.
 
 The box leaves build servers warm on purpose: it does not set `MSBUILDDISABLENODEREUSE` (the local gate sets it to 1 for every command), so MSBuild nodes and compiler servers survive between runs. It sets `MSBUILDNODEHANDSHAKESALT` in the command's environment to the work-folder key, replacing any inherited value, so the nodes stay warm within a worktree and are never reused across them; the box's own git calls and tool restore do not get it.
 
@@ -1332,7 +1340,11 @@ Built verbs:
   It prints on stdout, in order: `gate: remote created <Bare>` (only when it created the bare repo), `gate: remote version <gate version>`, the boot line, and `gate: remote sdks <v1,v2|none>`; git's own output passes through. A payload without `Bare` or `Work` prints `gate: box payload lacks <key>` and exits 2.
 - A failing git step prints `gate: remote <step> failed (status <n>)` and exits with that status; a git that cannot start prints `gate: remote <step> failed: <OS message>` and exits 1. The steps are `git init --bare`, `git init`, `git remote add`, `git config core.autocrlf` and `git config core.eol`.
 
-  A folder or file that cannot be made prints `gate: remote could not create the folder <path>: <error>` or `gate: remote could not write <path>: <error>` and exits 1. An SDK list that cannot be read prints `gate: remote could not read the SDK list: <message>`, omits the sdks line and still exits 0.
+  A folder or file that cannot be made prints `gate: remote could not create the folder <path>: <error>` or `gate: remote could not write <path>: <error>` and exits 1. An SDK list that cannot be read prints `gate: remote could not read the SDK list: <message>`, omits the sdks line and still exits 0; the client then skips the parity check.
+
+  The SDK list is read as this PC's is ([Bounded SDK read](#routing-and-the-remoteps1-bridge)): `dotnet` found on the box's `PATH`, run in the system folder with `NoDefaultCurrentDirectoryInExePath=1`, in a kill-on-close job of its own, on the box's console, its standard output read up to 16 MiB and its standard error dropped (it reaches neither the box's stderr nor the client's log). The box has no interrupt; the job is killed at a 30 s bound (`--test-dotnet-limit-ms` lowers it).
+
+  Past the bound the line reads `gate: remote could not read the SDK list: dotnet --list-sdks did not answer in 30 s`. The other `<message>`s are `dotnet --list-sdks wrote more than 16 MiB`, `dotnet --list-sdks exited with status <n>` and `cannot run dotnet: <why>`.
 - **`run`** runs the payload's `Command` (a list of texts) in `Work`, and exits with the command's own whole 32-bit status after a successful run. Its stdout is the command's stdout, LF-terminated; its stderr is the command's stderr plus the box's own lines.
 
   The heartbeat: `gate box run` writes `gate-remote-heartbeat: <cpu ms>` on stderr every 5 s, on `gate-watchdog`'s `BeatClock` and `Pump`. Before the command starts (from just before the checkout) and after the command's wait ends it is not CPU-gated, so every period writes a beat, the first one period after it begins. While the command runs it writes only when the CPU of the command's job, plus every build server on the box outside the job, since the last beat reaches 1% of the time since it.
@@ -1615,7 +1627,7 @@ A Rust integration suite drives the built `gate.exe` through its CLI and reads o
 
   `--test-local-sdks <comma list|none>` (needs `--test-remote-transport`) replaces the `dotnet --list-sdks` read of the parity check with a list of versions separated by commas, or `none` for no SDK.
 
-  `--test-dotnet-limit-ms <n>` (whole milliseconds above 0, on `gate run` only; refused given twice) replaces the 30 s bound of the parity check's `dotnet --list-sdks` read.
+  `--test-dotnet-limit-ms <n>` (whole milliseconds above 0; refused given twice) replaces the 30 s bound of the parity check's `dotnet --list-sdks` read. `gate box` takes the same seam before the verb for the preflight's read ([The box side](#the-box-side)).
 
   `--test-remote-bound-ms <n>` (whole milliseconds above 0) replaces the 30 s bound of the client's `stop` and `boot` calls.
 

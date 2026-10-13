@@ -30,7 +30,7 @@ pub(crate) fn answer(request: &BoxRequest, console: &mut Console) -> u32 {
         }
     };
     match request.verb {
-        BoxVerb::Preflight => preflight::preflight(&payload, console),
+        BoxVerb::Preflight => preflight::preflight(&payload, &request.seams, console),
         BoxVerb::Boot => boot_status(boot::say(console)),
         BoxVerb::Run => run::run(&payload, &request.seams, console),
         BoxVerb::Stop => stop::stop(&payload, console),
