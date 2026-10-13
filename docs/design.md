@@ -259,6 +259,7 @@ The lines of a run that starts its command:
 - Failed, on stderr: `gate: FAILED (status <n>). Full output: <log>`. A command that exited 0 with a marker in its log first says `gate: command exited 0 but its log reports a failure -> <log>` on stderr, and its status is 1.
 - On a non-zero status, up to 40 `<line number>:<line>` marker lines on stdout, before the tail.
 - A start failure, on stderr and in the log: `gate: could not start <word> (<resolved full path>): <system message>`, exit 127. The parenthesis is left out when the resolved path is the word itself, and a program found nowhere gets the message of error 2 with no parenthesis. `gate: cannot read the system folder, which holds cmd.exe: <error>` and `gate: cannot make <path> a full path: <error>` are start failures too.
+- A run end that cannot end the job's leftovers, said at most once, on stderr and in the log: `gate: cannot end the run's job: <reason>`, the reason `the process snapshot listed no processes`, `<n> of its processes still ran after 5 passes`, or the first process that could not be opened, judged or ended. The run's status and verdict stand.
 - A gate failure after the slot is taken: `gate: the gate failed while running the command: <message>`, exit 1. The job is terminated with 124, with its follow-up lines `gate: and could not terminate the command's job: <error>`, `gate: the command was still running 5 s after its job was terminated` or `gate: cannot wait for the command after terminating its job: <error>`.
 - Failures before queueing, exit 1: `gate: cannot read the working directory: <error>`, `gate: cannot build the command's environment: <error>`, `gate: cannot create the log's folder <dir>: <error>` and `gate: cannot remove the earlier <path>: <error>`.
 - A gate that cannot read its own start, exit 1, before it writes any ticket, claim, slot marker, pause marker, wake event, covered marker or journal line: `gate: cannot read this gate's own start: <error>; not running <command>`.
@@ -735,7 +736,7 @@ What `gate.exe` does of it today is part A, nesting under the slot marker (N1, K
 
   A critical gate there is refused as under a live heavy or light gate (below). A heavy gate whose only stand-in is light says `gate: the light slot of gate <A> does not cover a heavy gate; taking a heavy slot`, and a light gate turned heavy by a dropped `--no-build` searches again for a heavy stand-in.
 
-  Rejected: the parent ending its job's remaining processes once its command exits. A parent does not kill its leftovers on a clean exit, since build servers and deliberate background work keep running.
+  A parent ends the processes its command left in its job once the command exits, but spares a covered gate there, its process tree and its job ([Run end](#watchdog)), so the late take above still covers a covered gate the command left running.
 - A critical gate under a heavy or light marker is refused (K7) on stderr only, exit 2, before the log mutex, with nothing queued or journalled: `gate: --slot critical cannot run under the <held kind> slot of gate <pid>: it would wait for that slot for good; run the critical command outside that gate` (`-Slot critical` through the PowerShell spelling).
 - A heavy gate under a light marker takes its own slot and says `gate: the <held kind> slot of gate <pid> does not cover a <kind> gate; taking a <kind> slot` just before its local take (after a Local route or a fallback, before its wait lines); a gate routed to the builder never says it.
 - **No slot.** A `none` run takes nothing and is never held by the drain or the barrier. Its marker is `GATE_SLOT_HELD=none:<pid>:<start>[:<h>]`. A gate under a `none` marker (the case `Nesting::Beside`) takes its own slot as a top-level gate would: a critical child takes the machine and is never refused (K7 applies to heavy and light markers only).
@@ -812,7 +813,7 @@ All kept, with each knob's default unchanged:
 
   A read that fails is said once per run, by the first sample whose read fails, on stderr and in the log: `gate: WSL VM CPU unavailable (<message>); retrying each sample, and until a read succeeds this wsl command counts only output and job CPU as progress`. A failed read at the watch's start alone says nothing, and every sample retries.
 - A command that exits on its own before the kill keeps its status (W7).
-- Build servers: classification (B1), their priority (B2), and `MSBUILDDISABLENODEREUSE=1` and `DOTNET_CLI_USE_MSBUILD_SERVER=0` so worker nodes run in the command's job (B3).
+- Build servers: classification (B1), their priority (B2), and the per-run server settings of [Command launching](#command-launching) (the run id as `SharedCompilationId` and `MSBUILDNODEHANDSHAKESALT`, `MSBUILDUSESERVER=0`, `DOTNET_CLI_USE_MSBUILD_SERVER=0`), so each run has its own compiler server and MSBuild nodes (B3).
 
   Every sample reads the build servers outside the command's job: `VBCSCompiler.exe`, `dotnet.exe` whose command line names `VBCSCompiler.dll`, and `MSBuild.dll` with `nodemode`. It takes one ToolHelp snapshot, which carries no command lines, and each process's times; a command line is read once per (pid, start) through `proc_table::command_line_of(pid)` (OpenProcess and ReadProcessMemory), never through a child process. A process the gate cannot read is skipped.
 
@@ -836,6 +837,11 @@ All kept, with each knob's default unchanged:
 - Kill, on a STALLED, TIMED OUT or BACKSTOP alike: the diagnostics block (X3), then `TerminateJobObject(job, 124)` and the end of the processes that left the job (below), `gate: terminated the job's <n> process(es)` (with the escaped processes named, below), `gate: diagnostics written to <log>`, a 5 s wait for the command and exit 124 (X2).
 
   A failure inside the gate while the command runs terminates the job and ends the escaped processes first (X4); one after the command's own exit ends none of them.
+- **Run end.** Once the command exits, clean or failing, and after the verdict and exit status are taken, the gate ends every process the command left in its job, with exit code 124 (`end_leftovers` in `crates/gate/src/run.rs`). The exit status and verdict are unchanged.
+
+  It spares `gate.exe` members (a covered gate the command left running, GATE-101's late slot), their process trees and their own jobs; each spared gate ends its own job when its own command exits. It lists the job again after each pass, up to 5 passes, and a process created after a pass's listing is passed over until a later pass.
+
+  An empty process snapshot ends nothing, and a process whose start or job membership cannot be read is left running. A gate killed hard still leaves its job's processes running, since the job has no kill-on-close. The kill, stall, ceiling and Ctrl+C paths end the whole job, as above.
 - The processes that left the job: a packaged desktop app started by a process of the job without package identity runs in a job of its own, outside the command's ([Command launching](#command-launching)), and so does what it starts. Every kill of a `gate run` command (a stall, the ceiling, the backstop, Ctrl+C and the stopper after a gate failure) also ends them, in `crates/gate/src/escaped.rs`:
 
   - Before the job is terminated, while the process that started them still runs, one snapshot and the job's members read before and after it give the processes that are not members and are descendants of a member, parents first. A descendant counts only when its start is at or after its parent's, so a recycled pid adopts no one. A job with no members takes no snapshot.
@@ -965,7 +971,9 @@ The box heartbeat (BW9) is the box wrapper's command-time heartbeat, not the wai
 
   The start-failure message is the system message for the CreateProcessW error code, as `Win32Exception.Message` gives it, with no `(os error N)` suffix. That failure alone maps to status 127; every other start failure is the gate's own.
 - **Priority.** BelowNormal, or the gate's own class when that is already BelowNormal or Idle; High for a critical gate and any gate under a critical marker (kept, P2). The classes of the build servers outside the job are moved while the command runs ([Watchdog](#watchdog), B2).
-- **Environment.** Every command gets the gate's environment with these set over it (names compared case-insensitively): `GATE_SLOT_HELD=<kind>:<pid>:<start_ms>[:<h>]` (the held slot's marker, `none` too, or the parent's for a covered gate), `MSBUILDDISABLENODEREUSE=1`, `DOTNET_CLI_USE_MSBUILD_SERVER=0` (kept, P3, B3), and `GATE_STATE_DIR=<root>` under a non-default root. Under the default root an inherited `GATE_STATE_DIR` is removed. The gate's own environment is never changed.
+- **Environment.** Every command gets the gate's environment with these set over it (names compared case-insensitively): `GATE_SLOT_HELD=<kind>:<pid>:<start_ms>[:<h>]` (the held slot's marker, `none` too, or the parent's for a covered gate), `SharedCompilationId` and `MSBUILDNODEHANDSHAKESALT`, both the run id, `MSBUILDUSESERVER=0` (over an inherited value), `DOTNET_CLI_USE_MSBUILD_SERVER=0` (kept, P3, B3), and `GATE_STATE_DIR=<root>` under a non-default root. Under the default root an inherited `GATE_STATE_DIR` is removed. The gate's own environment is never changed. `MSBUILDDISABLENODEREUSE` is not set: an inherited value passes through.
+
+  The run id is `gate-{pid}-{start ms}`, with `-{root hash}` added under a non-default state root. Each nested gate has its own id. So each run gets its own .NET compiler server and MSBuild nodes, reused within the run and never across runs, and the gate ends what the run left at its [end](#watchdog).
 
   The batch refusal's `%NAME%` check answers for this exact block.
 
@@ -1501,7 +1509,7 @@ The other two box seams are `--test-outputs-budget-bytes <n>`, which replaces th
 
 A seam is refused as the `gate run` seams are: no value, given twice, and for the heartbeat, the outputs budget and the dotnet limit not a whole number above 0 or above 2147483647 (`gate: --test-outputs-budget-bytes must be a whole number above 0, got '<v>'`, `... must be at most 2147483647 ...`, `... needs a value`, `... is given twice`). Without the feature each word gets the box usage line.
 
-The box leaves build servers warm on purpose: it does not set `MSBUILDDISABLENODEREUSE` (the local gate sets it to 1 for every command), so MSBuild nodes and compiler servers survive between runs. It sets `MSBUILDNODEHANDSHAKESALT` in the command's environment to the work-folder key, replacing any inherited value, so the nodes stay warm within a worktree and are never reused across them; the box's own git calls and tool restore do not get it.
+The box leaves build servers warm on purpose: it does not set `MSBUILDDISABLENODEREUSE`, so MSBuild nodes and compiler servers survive between runs. It sets `MSBUILDNODEHANDSHAKESALT` in the command's environment to the work-folder key, replacing any inherited value, so the nodes stay warm within a worktree and are never reused across them; the box's own git calls and tool restore do not get it.
 
 Measured without the salt, one pool of worker nodes served routed builds from every work folder on the builder (sequential runs added no nodes, concurrent ones two per extra build, reclaimed after idling). A run in another work folder therefore inherited nodes started for a different one, which the salt stops, at the cost of each worktree's first routed build starting its own nodes.
 

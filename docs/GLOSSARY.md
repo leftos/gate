@@ -121,6 +121,8 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Routed lock**: the mutex `Local\gate-[<root hash>-]routed-<16 hex>` (the hash of the lower-cased work-folder key) that a routed run takes without waiting, before its remote slot and until its remote attempt ends; a run that finds it taken runs here with reason `busy`.
 - **Routed run**: a heavy gate whose command `remote.json` sends to a builder.
 - **Routing file**: `remote.json` in `%LOCALAPPDATA%\gate\`, naming the builder's host (and, for `gate push`, further `hosts`), the remote pool's size and, per repo, the `-like` patterns of the commands that route and the globs of the files a routed run brings back.
+- **Run end**: what a gate does once its command has exited and its verdict and status are taken: it ends every process the command left in its job with exit code 124, sparing covered gates, their trees and their jobs.
+- **Run id**: `gate-{pid}-{start ms}`, with `-{root hash}` under a non-default state root; the command gets it as `SharedCompilationId` and `MSBUILDNODEHANDSHAKESALT`, so its compiler server and MSBuild nodes are its run's own.
 - **Sample**: one reading of a running command taken every 5 s by the sampler: the system's CPU times, the job's CPU and pids, and the log's size, stamped `began` before its reads and `at` after them; the watchdog's clocks advance only by samples.
 - **Sampler**: the Win32 side of the watchdog that takes the samples; if one fails, the watch goes by wall time alone.
 - **Script word**: a command word holding a line break or one of `, ; " ' ) | & < >`, such as a script's text or a list; in it a path ends at white space, where in any other word a path runs through its spaces.

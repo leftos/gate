@@ -20,8 +20,8 @@ use jiff::Timestamp;
 use serde_json::Value;
 
 use crate::support::{
-    Case, FAKE_TOOL, GATE, Outcome, POLL, Running, assert_in_order, critical_words, events, events_of, finish, heavy_words, none_words, run_words,
-    shown, start, take_of, wait_for_file, wait_for_journal_line, wait_until, write_counts,
+    Case, Escapee, FAKE_TOOL, GATE, Outcome, POLL, Running, assert_in_order, critical_words, events, events_of, finish, heavy_words, none_words,
+    run_words, said_pid, shown, start, take_of, wait_for_file, wait_for_journal_line, wait_until, write_counts,
 };
 
 /// A heavy pool of one slot.
@@ -1088,6 +1088,42 @@ fn a_covered_gate_takes_a_slot_when_its_parent_gate_ends() {
         "heavy",
         KernelObject::HeavySlot(0),
     );
+}
+
+#[test]
+fn a_parent_s_run_end_ends_its_plain_child_and_spares_its_covered_gate() {
+    let case = Case::new("a_parent_s_run_end_ends_its_plain_child_and_spares_its_covered_gate");
+    let started = case.folder().join("started");
+    let go = case.folder().join("go");
+    let plain_go = case.folder().join("plain.go");
+    let release = case.folder().join("outer.release");
+    let pid_file = case.folder().join("inner.pid");
+    let texts = [&started, &go, &plain_go, &release, &pid_file].map(|path| shown(path));
+    let mut command = vec![FAKE_TOOL, "spawn-wait", &texts[2], "spawn-pid", &texts[4], &texts[3], GATE];
+    let mut inner = run_words("inner.log", &LOOK_OFTEN, &[FAKE_TOOL, "mark", &texts[0], "wait", &texts[1]]);
+    inner[2] = "heavy";
+    command.extend(inner);
+    let outer = case.start(&heavy_words("outer.log", &[], &command));
+    let orphan = spawned(&case, &pid_file);
+    wait_for_file(&started);
+    let outer_log = fs::read_to_string(case.folder().join("outer.log")).expect("the outer gate's log is written");
+    let plain_pid = said_pid(&outer_log, "spawned ");
+    let plain = StoppableProcess::open(plain_pid)
+        .expect("the plain child is opened")
+        .expect("the plain child runs: it waits for a go file no one has written");
+
+    let outer_pid = end_parent(outer, &release);
+    let plain_ended = Escapee::exit_code_once_ended(&plain);
+    // The plain child is let go before any assertion, so a failing case leaves no helper waiting.
+    let_go(&plain_go);
+    wait_for_journal_line(&case.root(), &format!(r#""event":"take","pid":{},"#, orphan.pid));
+    let take = take_of(&case, orphan.pid);
+    let_go(&go);
+
+    assert_eq!(plain_ended, Some(124), "the parent's run end ended its plain child");
+    assert_eq!(take["parentPid"], Value::from(outer_pid), "the covered gate took its late slot: {take}");
+    assert_eq!(orphan.ended(), 0, "the covered gate lived on to its own command's end");
+    assert_eq!(events_of(&case, orphan.pid), ["covered", "take", "release"]);
 }
 
 #[test]

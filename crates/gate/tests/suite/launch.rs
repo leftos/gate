@@ -7,10 +7,15 @@ use std::fs;
 use std::path::PathBuf;
 
 use gate_state::{KernelObject, StateRoot};
+use gate_win32::StoppableProcess;
 
 use crate::support::{
-    Case, FAKE_TOOL, assert_in_order, events, finish, run_words, shown, wait_for_journal_line, wait_until, wait_until_closed, write_counts,
+    Case, Escapee, FAKE_TOOL, assert_in_order, events, finish, run_words, said_pid, shown, start, wait_for_journal_line, wait_until,
+    wait_until_closed, write_counts,
 };
+
+/// The exit code a process the gate ends at its run's end is given.
+const STOPPED: u32 = 124;
 
 /// A light pool of one slot.
 const ONE_LIGHT: &str = r#"{"v":1,"light":1}"#;
@@ -182,15 +187,24 @@ fn the_build_server_environment_reaches_the_command() {
     let command = [
         FAKE_TOOL,
         "env",
-        "MSBUILDDISABLENODEREUSE",
+        "SharedCompilationId",
+        "env",
+        "MSBUILDNODEHANDSHAKESALT",
+        "env",
+        "MSBUILDUSESERVER",
         "env",
         "DOTNET_CLI_USE_MSBUILD_SERVER",
+        "env",
+        "MSBUILDDISABLENODEREUSE",
         "env",
         "GATE_SLOT_HELD",
         "env",
         "GATE_STATE_DIR",
     ];
-    let running = case.start(&run_words("out.log", &[], &command));
+    let mut gate = case.gate(&run_words("out.log", &[], &command));
+    // An inherited MSBuild server switch is overridden; a gate above the suite's own run sets no node-reuse switch.
+    gate.env("MSBUILDUSESERVER", "1").env_remove("MSBUILDDISABLENODEREUSE");
+    let running = start(gate);
     let pid = running.id();
 
     let outcome = running.finish();
@@ -198,14 +212,37 @@ fn the_build_server_environment_reaches_the_command() {
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     let text = log_text(&case);
     let lines: Vec<&str> = text.lines().collect();
-    assert_eq!(lines[..2], ["1", "0"], "{text}");
-    let marker: Vec<&str> = lines[2].split(':').collect();
+    let marker: Vec<&str> = lines[5].split(':').collect();
     let root = StateRoot::new(&shown(&case.root()), None);
     let hash = root.hash().expect("a case root is not the default root");
     assert_eq!(marker.len(), 4, "{text}");
     assert_eq!((marker[0], marker[1], marker[3]), ("light", pid.to_string().as_str(), hash), "{text}");
     assert!(marker[2].parse::<u64>().is_ok(), "the gate's start in epoch ms: {text}");
-    assert_eq!(lines[3], shown(&case.root()), "{text}");
+    let run_id = format!("gate-{pid}-{}-{hash}", marker[2]);
+    assert_eq!(
+        lines[..2],
+        [run_id.as_str(), run_id.as_str()],
+        "the compiler server and the nodes are the run's: {text}"
+    );
+    assert_eq!(lines[2..5], ["0", "0", "fake-tool: MSBUILDDISABLENODEREUSE is not set"], "{text}");
+    assert_eq!(lines[6], shown(&case.root()), "{text}");
+}
+
+#[test]
+fn two_runs_give_their_commands_different_compiler_server_ids() {
+    let case = Case::new("two_runs_give_their_commands_different_compiler_server_ids");
+    let first = case.run(&run_words("first.log", &[], &[FAKE_TOOL, "env", "SharedCompilationId"]));
+    let second = case.run(&run_words("second.log", &[], &[FAKE_TOOL, "env", "SharedCompilationId"]));
+
+    assert_eq!((first.code, second.code), (Some(0), Some(0)), "{first:?} {second:?}");
+    let id = |log: &str| {
+        let text = fs::read_to_string(case.folder().join(log)).expect("the log was written");
+        text.lines().next().unwrap_or_default().to_owned()
+    };
+    let (first_id, second_id) = (id("first.log"), id("second.log"));
+    assert!(first_id.starts_with("gate-"), "{first_id}");
+    assert!(second_id.starts_with("gate-"), "{second_id}");
+    assert_ne!(first_id, second_id, "each run has its own id");
 }
 
 #[test]
@@ -418,6 +455,51 @@ fn a_log_held_by_a_leftover_process_does_not_block_the_next_run() {
         text.starts_with("second\ngate: passed in "),
         "the second run's own output and verdict: {text}"
     );
+}
+
+/// Runs a command that starts a child in its job, a `fake-tool wait` on a go file no one writes until the case ends,
+/// then exits with `status` once the case lets it; the gate's outcome and the child's exit code once it has ended,
+/// `None` while it still runs. The child is opened while the command still runs, so its pid is pinned.
+fn run_leaving_a_child(case: &Case, status: &str) -> (crate::support::Outcome, Option<u32>) {
+    let (go, proceed) = (case.folder().join("go"), case.folder().join("proceed"));
+    let (go_text, proceed_text) = (shown(&go), shown(&proceed));
+    let command = [FAKE_TOOL, "spawn-wait", &go_text, "wait", &proceed_text, "exit", status];
+    let running = case.start(&run_words("out.log", &[], &command));
+    wait_until("the child's pid in the log", || {
+        fs::read_to_string(log_path(case)).is_ok_and(|text| text.contains("spawned "))
+    });
+    let pid = said_pid(&log_text(case), "spawned ");
+    let child = StoppableProcess::open(pid)
+        .expect("the child is opened")
+        .expect("the child runs: it waits for a go file no one has written");
+
+    fs::write(&proceed, "").expect("the proceed file can be written");
+    let outcome = running.finish();
+    let ended = Escapee::exit_code_once_ended(&child);
+    // The child is let go before any assertion, so a failing case leaves no helper waiting.
+    fs::write(&go, "").expect("the go file can be written");
+    (outcome, ended)
+}
+
+#[test]
+fn a_process_left_in_the_job_ends_with_the_run() {
+    let case = Case::new("a_process_left_in_the_job_ends_with_the_run");
+
+    let (outcome, child) = run_leaving_a_child(&case, "0");
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(child, Some(STOPPED), "the gate ended the child at the run's end: {outcome:?}");
+    assert!(!outcome.stderr.contains("cannot end the run's job"), "{outcome:?}");
+}
+
+#[test]
+fn a_failed_run_ends_what_it_left_in_its_job_and_keeps_the_command_s_status() {
+    let case = Case::new("a_failed_run_ends_what_it_left_in_its_job_and_keeps_the_command_s_status");
+
+    let (outcome, child) = run_leaving_a_child(&case, "3");
+
+    assert_eq!(outcome.code, Some(3), "the command's own status: {outcome:?}");
+    assert_eq!(child, Some(STOPPED), "the gate ended the child at the run's end: {outcome:?}");
 }
 
 #[test]

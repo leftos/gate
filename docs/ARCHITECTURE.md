@@ -206,7 +206,7 @@ The rule that shapes it: every file and kernel object another process sees is de
 
   `push.rs` is `gate push`: it reads the builders from the routing file (`read_remote_json`, `Config::builders`) and the installed exe, then makes one ssh call per builder through `transport.rs`'s `ssh_words` and `Ssh::find`, feeding the exe, gzipped, as base64 on stdin to an embedded PowerShell script, and maps the script's `gate-push: ` lines to the `push: ` lines.
 
-  Also `run.rs` (the run lifecycle: program, batch refusal, queue, take, launch, wait, verdict, release), `log.rs` (the log, its tail and the failure markers), `environment.rs` (the command's environment and slot marker) and `nesting.rs` (the slot marker a gate was started under: its parse, the parent's liveness, and the covered, refused or own-slot decision, and the search for a stand-in when the parent has ended).
+  Also `run.rs` (the run lifecycle: program, batch refusal, queue, take, launch, wait, verdict, run end, release; `end_leftovers` ends what the command left in its job), `log.rs` (the log, its tail and the failure markers), `environment.rs` (the command's environment, run id and slot marker) and `nesting.rs` (the slot marker a gate was started under: its parse, the parent's liveness, and the covered, refused or own-slot decision, and the search for a stand-in when the parent has ended).
 
   `late.rs` is the late take of a covered heavy or light gate: the watch of its parent gate through a waitable handle, the stand-in search once the parent ends, and the queue and take of a slot of its own kind beside the running command, driven one step a wake by the watch loop in `watch.rs`; `covered.rs` rewrites the covered marker's `kind` to `none` when the watch is given up.
 

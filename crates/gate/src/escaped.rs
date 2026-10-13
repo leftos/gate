@@ -22,7 +22,7 @@ const NAMED: usize = 5;
 /// A gate's image: one among the processes that left the job has its own command's job terminated before it is ended.
 const GATE_IMAGE: &str = "gate.exe";
 /// Why a look whose snapshot listed no process could not look: the snapshot itself failed.
-const EMPTY_SNAPSHOT: &str = "the process snapshot listed no processes";
+pub(crate) const EMPTY_SNAPSHOT: &str = "the process snapshot listed no processes";
 /// Why a look could not begin: the system time is outside the range a timestamp holds.
 pub(crate) const NO_CLOCK: &str = "the system time is outside the range a timestamp holds";
 
@@ -774,7 +774,7 @@ pub(crate) fn spared(process: &ProcessInfo, server_image: Option<&str>, read: im
 }
 
 /// Whether `image` is a gate's.
-fn is_gate(image: &str) -> bool {
+pub(crate) fn is_gate(image: &str) -> bool {
     image.eq_ignore_ascii_case(GATE_IMAGE)
 }
 

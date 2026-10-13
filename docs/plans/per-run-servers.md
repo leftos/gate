@@ -1,5 +1,7 @@
 # Per-run build servers (GATE-190)
 
+Part A (GATE-196, the run id, the per-run settings and the run end) is done.
+
 The plan for `feat/per-run-servers`: no gate run shares build servers with another, on this PC or the builder. The owner ruling and the orchestrator decisions (the per-run settings, the run id, ending the whole job at run end, what is removed, the brief order A, B, C1, C2) are in GATE-190's description and win over the open decisions below, which they settle. This file holds the measurements, the mechanisms with their sources, and the inventory of code that goes.
 
 Investigation only; no tracked file changed in any repo. Sources: GATE-190 and GATE-187 (description and comments, read through Linear), the gated repos' docs and scripts, Microsoft Learn, the dotnet/msbuild, dotnet/sdk and dotnet/roslyn sources (quotes below, pins: msbuild c1c99ee0, sdk 680d5f1e, roslyn `main`), the local SDK 10.0.401 targets, a code inventory of the gate at `806a42d` (main), and 28 gated builds plus one probe on this PC.

@@ -17,9 +17,10 @@ pub(crate) struct Variables(Vec<(OsString, OsString)>);
 type Override = (OsString, Option<OsString>);
 
 impl Variables {
-    /// The gate's environment with the overrides of a gate holding the slot `marker` ([`slot_marker`]) under `root`.
-    pub(crate) fn for_command(root: &ResolvedRoot, marker: &str) -> Variables {
-        Variables(applied(std::env::vars_os().collect(), overrides(root, marker)))
+    /// The gate's environment with the overrides of `gate`, holding the slot `marker` ([`slot_marker`]) under `root`.
+    pub(crate) fn for_command(root: &ResolvedRoot, gate: &ThisGate, marker: &str) -> Variables {
+        let run = run_id(gate, &root.root);
+        Variables(applied(std::env::vars_os().collect(), overrides(root, &run, marker)))
     }
 
     /// The gate's own environment, unchanged: what a program the gate starts for itself sees.
@@ -58,17 +59,31 @@ impl Variables {
     }
 }
 
-/// What the gate sets over its own environment for the command: the slot marker, the build-server settings that keep
-/// `MSBuild`'s worker nodes and server in the command's job, and the state root when it is not the default. Under the
-/// default root an inherited `GATE_STATE_DIR` is unset, so a gate nested in the command uses the same root.
-fn overrides(root: &ResolvedRoot, marker: &str) -> Vec<Override> {
+/// What the gate sets over its own environment for the command: the slot marker, the build-server settings, and the
+/// state root when it is not the default. The compiler server's pipe and `MSBuild`'s node handshake are named by the
+/// run id `run`, so no other run's command uses the servers this one starts, and the `MSBuild` server is off,
+/// an inherited `MSBUILDUSESERVER` included. Under the default root an inherited `GATE_STATE_DIR` is unset, so a gate
+/// nested in the command uses the same root.
+fn overrides(root: &ResolvedRoot, run: &str, marker: &str) -> Vec<Override> {
     let state_dir = (!root.root.is_default()).then(|| root.path.clone().into_os_string());
     vec![
         (OsString::from("GATE_SLOT_HELD"), Some(OsString::from(marker))),
-        (OsString::from("MSBUILDDISABLENODEREUSE"), Some(OsString::from("1"))),
+        (OsString::from("SharedCompilationId"), Some(OsString::from(run))),
+        (OsString::from("MSBUILDNODEHANDSHAKESALT"), Some(OsString::from(run))),
+        (OsString::from("MSBUILDUSESERVER"), Some(OsString::from("0"))),
         (OsString::from("DOTNET_CLI_USE_MSBUILD_SERVER"), Some(OsString::from("0"))),
         (OsString::from("GATE_STATE_DIR"), state_dir),
     ]
+}
+
+/// The run id of `gate` under `root`: `gate-<pid>-<start ms>`, and `-<h>` after it under a non-default root, so a run
+/// under another root never shares an id with a run of the machine's own.
+fn run_id(gate: &ThisGate, root: &StateRoot) -> String {
+    let id = format!("gate-{}-{}", gate.pid, gate.start_ms);
+    match root.hash() {
+        Some(hash) => format!("{id}-{hash}"),
+        None => id,
+    }
 }
 
 /// `variables` with each override applied in turn: every pair of its name removed, names compared as Windows compares
@@ -126,13 +141,41 @@ mod tests {
         let path = (OsString::from("Path"), OsString::from(r"C:\bin"));
         let inherited = vec![(OsString::from("gate_state_dir"), OsString::from(r"D:\elsewhere")), path.clone()];
 
-        let under_default = applied(inherited.clone(), overrides(&root(DEFAULT), "heavy:1:2"));
-        let under_other = applied(inherited, overrides(&root(r"D:\test-root"), "heavy:1:2:abcdef12"));
+        let under_default = applied(inherited.clone(), overrides(&root(DEFAULT), "gate-1-2", "heavy:1:2"));
+        let under_other = applied(inherited, overrides(&root(r"D:\test-root"), "gate-1-2-abcdef12", "heavy:1:2:abcdef12"));
 
         assert_eq!(state_dirs(&under_default), Vec::<&OsString>::new());
         assert_eq!(state_dirs(&under_other), [&OsString::from(r"D:\test-root")]);
         assert!(under_default.contains(&path), "other variables pass through");
         assert!(under_default.contains(&(OsString::from("GATE_SLOT_HELD"), OsString::from("heavy:1:2"))));
+    }
+
+    #[test]
+    fn the_command_gets_its_run_s_compiler_server_id_over_an_inherited_one() {
+        let inherited = vec![
+            (OsString::from("sharedcompilationid"), OsString::from("someone-else")),
+            (OsString::from("MSBuildNodeHandshakeSalt"), OsString::from("work-folder-key")),
+        ];
+
+        let variables = Variables(applied(
+            inherited,
+            overrides(&root(r"D:\test-root"), "gate-1-2-abcdef12", "heavy:1:2:abcdef12"),
+        ));
+
+        assert_eq!(variables.get("SharedCompilationId"), Some(OsStr::new("gate-1-2-abcdef12")));
+        assert_eq!(variables.get("MSBUILDNODEHANDSHAKESALT"), Some(OsStr::new("gate-1-2-abcdef12")));
+        let named = |wanted: &str| {
+            variables
+                .0
+                .iter()
+                .filter(|(name, _)| same_variable_name(name, OsStr::new(wanted)))
+                .count()
+        };
+        assert_eq!(
+            (named("SharedCompilationId"), named("MSBUILDNODEHANDSHAKESALT")),
+            (1, 1),
+            "the inherited values are gone"
+        );
     }
 
     #[test]

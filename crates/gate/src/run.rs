@@ -5,6 +5,7 @@
 //! the failure markers scanned, the tail and the verdict line said, and the slot released.
 
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fs::OpenOptions;
 use std::os::windows::ffi::OsStrExt;
@@ -20,8 +21,11 @@ use gate_router::{
 };
 use gate_state::{Estimate, FallbackReason, JournalEvent, KernelObject, RebuildOwner, RemoteTag, RunFacts, StateRoot, Verdict, log_hash, v1};
 use gate_watchdog::{Cores, Hint, SlotKind, hint};
-use gate_win32::{AcquireError, Interrupt, Job, Launch, LaunchError, LaunchOutput, NamedMutex, OwnedMutexGuard, PriorityClass, Running};
+use gate_win32::{
+    AcquireError, Interrupt, Job, Launch, LaunchError, LaunchOutput, NamedMutex, OpenedJob, OwnedMutexGuard, PriorityClass, Running, StoppableProcess,
+};
 use jiff::Timestamp;
+use proc_table::{ProcessTree, Win32ProcessTable};
 use serde_json::{Map, Value};
 
 use crate::acquire;
@@ -43,6 +47,7 @@ use crate::remote::{self, RemoteCall, RemoteClient, RemoteOutcome, Split, git};
 use crate::resolve::{Environment, ResolvedRoot};
 use crate::route::{self, Placed};
 use crate::slots::{self, ClaimOf, Pool, Survey, Taken, Takes, ThisGate, epoch_ms};
+use crate::stopping::failure;
 use crate::wait::{self, Arrival, Host, UnderParent, Wait, Waited};
 use crate::watch::{Start, Watched, Watcher, Watching};
 
@@ -60,6 +65,11 @@ pub(crate) const CONTROL_C_EXIT: u32 = 0xC000_013A;
 pub(crate) const ERROR_FILE_NOT_FOUND: u32 = 2;
 /// How long the gate waits for the command to end once it has terminated its job, or once a Ctrl+C came.
 const STOP_WAIT: Duration = Duration::from_secs(5);
+/// How long a process the run's end could not terminate is given to end before the failure counts.
+const END_CHECK: Duration = Duration::from_secs(1);
+/// How many passes over its job the run's end makes to end what the command left there, each ending what the last
+/// one's processes started meanwhile.
+const END_PASSES: usize = 5;
 /// The wall time under which a passed run is too short to judge its slot by, so it gets no cores line.
 const HINT_MIN_WALL: Duration = Duration::from_secs(10);
 
@@ -359,7 +369,7 @@ impl Plan {
             Some(parent) => parent.marker.clone(),
             None => environment::slot_marker(request.slot.as_str(), gate, &root.root),
         };
-        let variables = Variables::for_command(root, &marker);
+        let variables = Variables::for_command(root, gate, &marker);
         let environment = variables
             .block()
             .map_err(|error| NotRun::failed(format!("gate: cannot build the command's environment: {error}")))?;
@@ -409,9 +419,9 @@ impl Plan {
     /// # Errors
     ///
     /// An environment the gate cannot build (status 1).
-    fn handing_on(mut self, root: &ResolvedRoot, marker: &str) -> Result<Plan, NotRun> {
+    fn handing_on(mut self, root: &ResolvedRoot, gate: &ThisGate, marker: &str) -> Result<Plan, NotRun> {
         if let Ok(launch) = &mut self.launch {
-            launch.environment = Variables::for_command(root, marker)
+            launch.environment = Variables::for_command(root, gate, marker)
                 .block()
                 .map_err(|error| NotRun::failed(format!("gate: cannot build the command's environment: {error}")))?;
         }
@@ -946,7 +956,7 @@ impl Run<'_> {
     /// it says or journals the lend: a gate lent the slot before it queued then journals nothing, and one that queued
     /// journals its release as any gate that fails before its command does. The command runs under `figures`.
     fn on_parent(&mut self, parent: &Parent, plan: Plan, figures: Figures, console: &mut Console) -> Ended {
-        let plan = match plan.handing_on(self.root, &parent.marker) {
+        let plan = match plan.handing_on(self.root, &self.gate, &parent.marker) {
             Ok(plan) => plan,
             Err(NotRun { status, line }) => {
                 console.err(&line);
@@ -1712,7 +1722,8 @@ impl Run<'_> {
         Ok((watched, timing))
     }
 
-    /// Ends the run as the watch ended it: a command that exited has its verdict; one killed as stalled, timed out or
+    /// Ends the run as the watch ended it: a command that exited has its verdict, then what it left in its job ended but
+    /// the gates there ([`end_leftovers`]); one killed as stalled, timed out or
     /// past the backstop has its diagnostics written to the log, its kill line and the pointer to them said, its job
     /// terminated and the verdict of status 124; an interrupted one is given 5 s to end before its job is stopped, and
     /// has the verdict of its own status, neither scanned for markers. A gate failure after a command's own exit ends its
@@ -1726,7 +1737,9 @@ impl Run<'_> {
         match watched {
             Watched::Exited(code) => {
                 let exited = i64::from(code.cast_signed());
-                self.ended(&Outcome { exited, timing, kill: None }, false, &[], started, console)
+                let ended = self.ended(&Outcome { exited, timing, kill: None }, false, &[], started, console);
+                end_leftovers(job, &self.root.root, console);
+                ended
             }
             Watched::Killed {
                 line,
@@ -2065,6 +2078,164 @@ fn interrupted(ends: &impl Ends, recorded: Option<&RefCell<Recorded>>, console: 
         Err(error) => console.err(&format!("gate: could not terminate the command's job: {error}")),
     }
     i64::from(CONTROL_C_EXIT.cast_signed())
+}
+
+/// Ends what a command that exited left in its `job`, once its verdict and status are taken: every process in it but
+/// the gates it holds, with the processes each one started and those in its job under `root`, since each such gate ends
+/// what its own command leaves when that command exits. It goes over the job in passes ([`in_passes`], [`end_pass`]),
+/// so what a leftover starts while one pass ends it is ended by the next. A run that left nothing says nothing; a
+/// failure, or processes left after the last pass, is said once, on stderr and in the log, and the run's status stands.
+fn end_leftovers(job: &Job, root: &StateRoot, console: &mut Console) {
+    if let Some(problem) = in_passes(|ending| end_pass(job, root, ending)) {
+        console.err(&format!("gate: cannot end the run's job: {problem}"));
+    }
+}
+
+/// What one pass over the run's job found: how many of its processes it would end, and ended when it was let, and what
+/// it could not open, judge or end.
+struct EndPass {
+    left: usize,
+    problems: Vec<String>,
+}
+
+/// Runs `pass` over the run's job, ending what it finds (`pass(true)`), until a pass finds nothing left to end, at most
+/// [`END_PASSES`] times; one more pass then only counts (`pass(false)`). What to say: why a pass could not run, how many
+/// processes the passes left, or the first process one could not open, judge or end; `None` when all went.
+fn in_passes(mut pass: impl FnMut(bool) -> Result<EndPass, String>) -> Option<String> {
+    let mut problems = Vec::new();
+    for round in 0..=END_PASSES {
+        let ending = round < END_PASSES;
+        let found = match pass(ending) {
+            Ok(found) => found,
+            Err(problem) => return Some(problem),
+        };
+        problems.extend(found.problems);
+        if found.left == 0 {
+            break;
+        }
+        if !ending {
+            return Some(format!("{} of its processes still ran after {END_PASSES} passes", found.left));
+        }
+    }
+    problems.into_iter().next()
+}
+
+/// One pass of the run's end over `job`, ending what it finds when `ending`: the job's processes are listed after the
+/// time is noted, the gates among them spared with what runs under them ([`spared_gates`]), and every other one ended
+/// that its own handle shows in the job still and started before the listing ([`ended_members`]), so a pid freed and
+/// taken since by a new process, a spared gate's command's child included, is passed over. Each process ended is given
+/// [`END_CHECK`] to leave the job before the next pass lists it.
+///
+/// # Errors
+///
+/// The time, the job's processes or the process snapshot cannot be read: nothing is ended.
+fn end_pass(job: &Job, root: &StateRoot, ending: bool) -> Result<EndPass, String> {
+    let listed_at = escaped::now().ok_or_else(|| escaped::NO_CLOCK.to_owned())?;
+    let members = job.process_ids().map_err(|error| failure("QueryInformationJobObject", &error))?;
+    let mut problems = Vec::new();
+    if members.is_empty() {
+        return Ok(EndPass { left: 0, problems });
+    }
+    let tree = ProcessTree::new(Win32ProcessTable.snapshot_without_command_lines());
+    let spared = spared_gates(&members, &tree, |gate| gate_job(root, gate), &mut problems)?;
+    let mut opened = Vec::new();
+    for pid in members.into_iter().filter(|pid| !spared.contains(pid)) {
+        match opened_member(job, pid) {
+            Ok(Some(process)) => opened.push((pid, process)),
+            Ok(None) => {}
+            Err(problem) => problems.push(problem),
+        }
+    }
+    let mut starts = Vec::new();
+    for (pid, process) in &opened {
+        match process.created() {
+            Ok(created) => starts.push((*pid, created)),
+            Err(error) => problems.push(failure(&format!("GetProcessTimes({pid})"), &error)),
+        }
+    }
+    let ended = ended_members(&starts, listed_at, &spared);
+    let doomed: Vec<&(u32, StoppableProcess)> = opened.iter().filter(|(pid, _)| ended.contains(pid)).collect();
+    if ending {
+        for (pid, process) in &doomed {
+            // A process that was ending already refuses the terminate, and is not a failure once it has ended.
+            if let Err(error) = process.terminate(STOPPED)
+                && !matches!(process.wait(END_CHECK), Ok(true))
+            {
+                problems.push(failure(&format!("TerminateProcess({pid})"), &error));
+            }
+        }
+        for (_, process) in &doomed {
+            // A wait that fails leaves the process to the next pass, which lists it again if it has not left the job.
+            let _ = process.wait(END_CHECK);
+        }
+    }
+    Ok(EndPass {
+        left: doomed.len(),
+        problems,
+    })
+}
+
+/// The processes in the job of the gate `gate` under `root`, those in the jobs nested inside it included; `None` when
+/// no job has its name, as for a gate whose command has not started.
+fn gate_job(root: &StateRoot, gate: u32) -> io::Result<Option<Vec<u32>>> {
+    let name = root.object_name(KernelObject::Job { gate_pid: gate });
+    OpenedJob::open_to_list(&name).and_then(|opened| opened.map(|opened| opened.process_ids()).transpose())
+}
+
+/// The processes among `members` that a run's end leaves running: each one the snapshot `tree` names as a gate, the
+/// processes under it, and those in its job, as `gate_job` lists them. A gate whose job cannot be listed is spared with
+/// what the snapshot shows under it, and the failure added to `problems`.
+///
+/// # Errors
+///
+/// A snapshot that listed no process, which says nothing of which members are gates.
+fn spared_gates(
+    members: &[u32],
+    tree: &ProcessTree,
+    gate_job: impl Fn(u32) -> io::Result<Option<Vec<u32>>>,
+    problems: &mut Vec<String>,
+) -> Result<HashSet<u32>, String> {
+    if tree.iter().next().is_none() {
+        return Err(escaped::EMPTY_SNAPSHOT.to_owned());
+    }
+    let mut spared = HashSet::new();
+    let gates = members
+        .iter()
+        .filter(|pid| tree.get(**pid).is_some_and(|process| escaped::is_gate(&process.name)));
+    for &gate in gates {
+        spared.insert(gate);
+        spared.extend(tree.descendants(gate).iter().map(|process| process.pid));
+        match gate_job(gate) {
+            Ok(inside) => spared.extend(inside.into_iter().flatten()),
+            Err(error) => problems.push(failure(&format!("listing the job of gate {gate}"), &error)),
+        }
+    }
+    Ok(spared)
+}
+
+/// The members a pass ends, of those `starts` gives with their starts: every one neither `spared` nor started after the
+/// job was listed at `listed_at`, since a process that started since took the pid of one that ended.
+fn ended_members(starts: &[(u32, Timestamp)], listed_at: Timestamp, spared: &HashSet<u32>) -> Vec<u32> {
+    starts
+        .iter()
+        .filter(|(pid, created)| !spared.contains(pid) && *created <= listed_at)
+        .map(|(pid, _)| *pid)
+        .collect()
+}
+
+/// The process `pid`, opened to be ended, when its own handle shows it in `job`; `None` when no process has that pid
+/// now or the one that has it is outside the job; the failure, when it cannot be opened or judged.
+fn opened_member(job: &Job, pid: u32) -> Result<Option<StoppableProcess>, String> {
+    let process = match StoppableProcess::open(pid) {
+        Ok(Some(process)) => process,
+        Ok(None) => return Ok(None),
+        Err(error) => return Err(failure(&format!("OpenProcess({pid})"), &error)),
+    };
+    match process.in_job(job) {
+        Ok(true) => Ok(Some(process)),
+        Ok(false) => Ok(None),
+        Err(error) => Err(failure(&format!("IsProcessInJob({pid})"), &error)),
+    }
 }
 
 /// Says each problem ending the processes that left the job.
@@ -2690,5 +2861,122 @@ mod tests {
         );
         assert!(!log_in_state_root(&folder.join("x.log"), &state), "beside the state folder");
         fs::remove_dir_all(&folder).expect("the test folder can be removed");
+    }
+}
+
+#[cfg(test)]
+#[expect(clippy::expect_used, reason = "a test timestamp that does not parse must fail loudly")]
+mod end_tests {
+    use std::cell::RefCell;
+    use std::collections::HashSet;
+
+    use jiff::Timestamp;
+    use proc_table::{ProcessInfo, ProcessTree};
+
+    use super::{END_PASSES, EndPass, ended_members, in_passes, spared_gates};
+    use crate::escaped::EMPTY_SNAPSHOT;
+
+    fn at(second: i64) -> Timestamp {
+        Timestamp::from_second(1_791_900_000 + second).expect("a test timestamp is in range")
+    }
+
+    fn listed(pid: u32, parent_pid: u32, name: &str) -> ProcessInfo {
+        ProcessInfo {
+            pid,
+            parent_pid,
+            name: name.to_owned(),
+            command_line: None,
+            created: Some(at(i64::from(pid))),
+        }
+    }
+
+    #[expect(clippy::unnecessary_wraps, reason = "every pass a case fakes is one that ran")]
+    fn pass(left: usize, problems: &[&str]) -> Result<EndPass, String> {
+        Ok(EndPass {
+            left,
+            problems: problems.iter().map(|&problem| problem.to_owned()).collect(),
+        })
+    }
+
+    #[test]
+    fn an_empty_snapshot_spares_nothing_and_ends_nothing() {
+        let mut problems = Vec::new();
+
+        let spared = spared_gates(&[2, 3], &ProcessTree::new(Vec::new()), |_| Ok(None), &mut problems);
+
+        assert_eq!(
+            spared,
+            Err(EMPTY_SNAPSHOT.to_owned()),
+            "a pass with no snapshot fails before it ends anything"
+        );
+    }
+
+    #[test]
+    fn a_gate_is_spared_with_what_runs_under_it_and_in_its_job() {
+        let tree = ProcessTree::new(vec![
+            listed(1, 0, "fake-tool.exe"),
+            listed(2, 1, "gate.exe"),
+            listed(3, 2, "fake-tool.exe"),
+            listed(4, 1, "VBCSCompiler.exe"),
+        ]);
+        let mut problems = Vec::new();
+
+        let spared = spared_gates(&[2, 3, 4, 9], &tree, |gate| Ok((gate == 2).then(|| vec![3, 9])), &mut problems);
+
+        assert_eq!(
+            spared,
+            Ok(HashSet::from([2, 3, 9])),
+            "the gate, its child, and its job's orphan; not the server"
+        );
+        assert!(problems.is_empty(), "{problems:?}");
+    }
+
+    #[test]
+    fn a_member_that_started_after_the_listing_is_passed_over() {
+        let spared = HashSet::from([5]);
+        let starts = [(2, at(10)), (3, at(20)), (4, at(21)), (5, at(1))];
+
+        let ended = ended_members(&starts, at(20), &spared);
+
+        assert_eq!(ended, [2, 3], "a pid taken since the listing, and a spared member, are left running");
+    }
+
+    #[test]
+    fn passes_go_on_while_each_finds_something_left_to_end() {
+        let calls = RefCell::new(Vec::new());
+        let mut left = [2, 1, 0].into_iter();
+
+        let said = in_passes(|ending| {
+            calls.borrow_mut().push(ending);
+            pass(left.next().expect("no more passes than planned"), &[])
+        });
+
+        assert_eq!(said, None, "everything went, so nothing is said");
+        assert_eq!(calls.into_inner(), [true, true, true]);
+    }
+
+    #[test]
+    fn passes_stop_at_the_cap_and_say_how_many_processes_are_left() {
+        let calls = RefCell::new(Vec::new());
+
+        let said = in_passes(|ending| {
+            calls.borrow_mut().push(ending);
+            pass(3, &[])
+        });
+
+        assert_eq!(said, Some(format!("3 of its processes still ran after {END_PASSES} passes")));
+        let mut expected = vec![true; END_PASSES];
+        expected.push(false);
+        assert_eq!(calls.into_inner(), expected, "five passes end, the last only counts");
+    }
+
+    #[test]
+    fn a_pass_that_cannot_run_or_end_a_process_is_said_once() {
+        let failed = in_passes(|_| Err::<EndPass, _>("the snapshot failed".to_owned()));
+        let mut left = [1, 0].into_iter();
+        let refused = in_passes(|_| pass(left.next().expect("two passes"), &["TerminateProcess(7) failed"]));
+
+        assert_eq!(failed, Some("the snapshot failed".to_owned()));
+        assert_eq!(refused, Some("TerminateProcess(7) failed".to_owned()), "the first problem, once");
     }
 }
