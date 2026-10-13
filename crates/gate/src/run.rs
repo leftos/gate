@@ -30,9 +30,10 @@ use crate::covered::Covered;
 use crate::environment::{self, Variables};
 use crate::escaped::{self, Found, Reach, Reached, Recorded};
 use crate::journal::{self, RunJournal};
+use crate::late::{Late, LateOf, LateSlot};
 use crate::log::Log;
 use crate::machine::{self, Machine, MachineWait, MachineWaited};
-use crate::nesting::{Nesting, Parent};
+use crate::nesting::{Nesting, Parent, enclosing_of};
 use crate::no_build::{self, NothingBack, Unfound, Worktree};
 use crate::remote::{self, RemoteCall, RemoteClient, RemoteOutcome, git};
 use crate::resolve::{Environment, ResolvedRoot};
@@ -132,6 +133,7 @@ pub(crate) fn run(request: &RunRequest, log: &Path, root: &ResolvedRoot, environ
         queued_at: None,
         lent: false,
         covered: None,
+        late: None,
     };
     let (route, place) = run.route(environment, console);
     let local = run.local_words(&route, place.as_ref(), console);
@@ -179,7 +181,7 @@ fn take_heavy<'a>(run: &mut Run<'a>, heavy: &'a mut Option<(RunRequest, Nesting)
     else {
         return;
     };
-    let (request, nesting) = heavy.insert(run.as_heavy(words));
+    let (request, nesting) = heavy.insert(run.as_heavy(words, console));
     run.request = request;
     run.nesting = nesting;
     run.gate = run.gate.running(request);
@@ -200,7 +202,7 @@ fn admitted(request: &RunRequest, log: &Path, root: &ResolvedRoot, environment: 
         ));
         return Err(u32::from(USAGE_STATUS));
     }
-    let nesting = Nesting::read(environment, request.slot, &root.root, request.test_seams.parent_job_trusted);
+    let nesting = Nesting::read(environment, request.slot, root, request.test_seams.parent_job_trusted, console);
     if matches!(nesting, Nesting::Refused(_)) {
         say_nesting(&nesting, request, console);
         return Err(u32::from(USAGE_STATUS));
@@ -501,6 +503,44 @@ struct Run<'a> {
     lent: bool,
     /// The covered marker of a run a parent's slot covers, from its `covered` line to its release.
     covered: Option<Covered>,
+    /// The slot a run a parent's slot covers took when that parent ended as its command ran ([`Late`]), until its
+    /// release.
+    late: Option<LateSlot>,
+}
+
+/// What a take of a pool's slot is journalled and claimed with: the run's state root, gate, request and log, its remote
+/// tag while it has one, its journal, and the parent gate its `take` names.
+pub(crate) struct Taker<'t> {
+    pub root: &'t ResolvedRoot,
+    pub gate: &'t ThisGate,
+    pub request: &'t RunRequest,
+    pub log: &'t Log,
+    pub tag: Option<&'t RemoteTag>,
+    pub journal: &'t mut RunJournal,
+    pub parent_pid: Option<u32>,
+}
+
+impl Taker<'_> {
+    /// Journals the take of `taken`, a slot of `pool` the run waited `waited` seconds for, says and names it when a
+    /// killed gate had left it held, writes its claim and wakes the waiters. The gate's ticket is already deleted.
+    pub(crate) fn took(&mut self, taken: &Taken, pool: Pool, waited: f64, survey: &mut Survey, console: &mut Console) {
+        let name = taken.held.name().to_owned();
+        let mut abandoned = Vec::new();
+        if taken.abandoned {
+            acquire::say_taken_abandoned(console, &name);
+            abandoned.push(name.clone());
+        }
+        self.journal
+            .write(&take_event(vec![name], waited, abandoned, self.parent_pid), self.tag, console);
+        let of = ClaimOf {
+            gate: self.gate,
+            request: self.request,
+            log: self.log.path(),
+            remote: self.tag,
+        };
+        slots::write_claim(&taken.held, pool.claim_kind(), &of, console);
+        slots::wake_waiters(self.root, survey, console);
+    }
 }
 
 /// The client's call for `remote`, with the run's log, limits and interrupt, made of the run's parts so the run's
@@ -961,14 +1001,17 @@ impl Run<'_> {
     }
 
     /// The request and nesting of this run once its `--no-build` is dropped: the run here is a build, so it asks for a
-    /// heavy slot whatever slot the caller named, runs `words`, and is under its parent as a heavy gate is.
-    fn as_heavy(&self, words: &[String]) -> (RunRequest, Nesting) {
+    /// heavy slot whatever slot the caller named, runs `words`, and is under its parent as a heavy gate is, a parent
+    /// that stands in for an ended one looked for again for a heavy gate ([`Nesting::as_heavy`]).
+    fn as_heavy(&self, words: &[String], console: &mut Console) -> (RunRequest, Nesting) {
         let request = RunRequest {
             slot: Slot::Heavy,
             command: words.iter().map(OsString::from).collect(),
             ..self.request.clone()
         };
-        (request, self.nesting.as_heavy())
+        let trusted = self.request.test_seams.parent_job_trusted;
+        let nesting = self.nesting.as_heavy(|| enclosing_of(self.root, Slot::Heavy, &[], trusted, console));
+        (request, nesting)
     }
 
     /// The line a run says as it drops its `--no-build` for `reason`, naming where it builds: on the slot of the parent
@@ -1135,6 +1178,22 @@ impl Run<'_> {
             .flatten()
     }
 
+    /// What a take of the run's slot is journalled and claimed with, naming `parent_pid` ([`Taker`]), with the parts the
+    /// caller borrows beside it: the survey the run reads the other gates with, where it keeps the slot it takes once
+    /// a covering parent ends ([`Run::late`]), and its covered marker ([`Run::covered`]).
+    fn taker(&mut self, parent_pid: Option<u32>) -> (Taker<'_>, &mut Survey, &mut Option<LateSlot>, &mut Option<Covered>) {
+        let taker = Taker {
+            root: self.root,
+            gate: &self.gate,
+            request: self.request,
+            log: &self.log,
+            tag: self.tag.as_ref(),
+            journal: &mut self.journal,
+            parent_pid,
+        };
+        (taker, &mut self.survey, &mut self.late, &mut self.covered)
+    }
+
     /// Waits its turn for a slot of `pool` and takes it into `held` the moment it has it, then journals the take, with
     /// the remote tag while the run has one, and writes the claim. `since` is the moment the wait counts from, the run's
     /// own `queue` line for a run the full remote pool sent back and `None` for every other wait, which counts from now;
@@ -1185,25 +1244,10 @@ impl Run<'_> {
             }
         };
         let waited = queued.elapsed().as_secs_f64();
-        let name = taken.held.name().to_owned();
-        let mut abandoned = Vec::new();
-        if taken.abandoned {
-            acquire::say_taken_abandoned(console, &name);
-            abandoned.push(name.clone());
-        }
         wait.end(console);
         let took = Instant::now();
-        let parent_pid = self.nesting.uncovering().map(|parent| parent.pid);
-        self.journal
-            .write(&take_event(vec![name], waited, abandoned, parent_pid), self.tag.as_ref(), console);
-        let of = ClaimOf {
-            gate: &self.gate,
-            request: self.request,
-            log: self.log.path(),
-            remote: self.tag.as_ref(),
-        };
-        slots::write_claim(&taken.held, pool.claim_kind(), &of, console);
-        slots::wake_waiters(self.root, &mut self.survey, console);
+        let (mut taker, survey, _, _) = self.taker(self.nesting.uncovering().map(|parent| parent.pid));
+        taker.took(taken, pool, waited, survey, console);
         Taking::Took(took)
     }
 
@@ -1284,29 +1328,40 @@ impl Run<'_> {
     /// Deletes the claim, journals the release with how the run `ended` (status and verdict unknown when it did not
     /// end on its own path) and lets the slot go, then wakes the waiters. A critical gate journals the release of every
     /// slot it held first, then lets the machine go ([`Machine::release`]). A gate a parent's slot covers deletes its
-    /// covered marker; it, and a gate a light parent lent its slot, took no slot and journals no release.
+    /// covered marker, then lets go the slot it took when that parent ended as its command ran ([`Late`]), as any slot
+    /// is let go; it took no other slot, and journals no release when it took none. A gate a light parent lent its slot
+    /// took no slot and journals no release.
     fn release(&mut self, hold: Hold, ended: Option<&Ended>, console: &mut Console) {
         if let Some(mut covered) = self.covered.take() {
             covered.end(console);
+        }
+        if let Some(LateSlot { taken, took }) = self.late.take() {
+            self.let_go(Some(taken), took, ended, console);
         }
         if self.nesting.covering().is_some() || self.lent {
             return;
         }
         let Hold { taken, machine, took } = hold;
-        let held_seconds = took.elapsed().as_secs_f64();
-        let status = ended.map(|ended| ended.status);
-        let facts = ended.and_then(|ended| ended.facts);
         if let Some(machine) = machine {
             let release = JournalEvent::Release {
                 slots: machine.names(),
-                held_seconds,
-                status,
-                facts,
+                held_seconds: took.elapsed().as_secs_f64(),
+                status: ended.map(|ended| ended.status),
+                facts: ended.and_then(|ended| ended.facts),
             };
             self.journal.write(&release, None, console);
             machine.release(self.root, &mut self.survey, console);
             return;
         }
+        self.let_go(taken, took, ended, console);
+    }
+
+    /// Deletes the claim of `taken`, the slot of a pool the run took at `took`, journals the release with how the run
+    /// `ended` and lets the slot go, then wakes the waiters; a run that took no slot journals a release of none.
+    fn let_go(&mut self, taken: Option<Taken>, took: Instant, ended: Option<&Ended>, console: &mut Console) {
+        let held_seconds = took.elapsed().as_secs_f64();
+        let status = ended.map(|ended| ended.status);
+        let facts = ended.and_then(|ended| ended.facts);
         let slots = match &taken {
             Some(taken) => {
                 slots::delete_claim(&taken.held, console);
@@ -1403,7 +1458,8 @@ impl Run<'_> {
 
     /// Watches the command until it exits, is killed or the console is interrupted; how it ended and how long it ran,
     /// with the cores it kept busy, else the gate's problem. The watch's samples write what they find outside the job to
-    /// `recorded`.
+    /// `recorded`. A heavy or light run a parent's slot covers watches that parent too, and takes a slot of its own kind
+    /// into [`Run::late`] when the parent ends first ([`Late`]), its covered marker in hand.
     fn watch(
         &mut self,
         started: Started<'_>,
@@ -1411,20 +1467,40 @@ impl Run<'_> {
         start: &Start,
         console: &mut Console,
     ) -> Result<(Watched, Timing), String> {
+        let (nesting, host, arrived, lent) = (self.nesting, self.host, self.arrived, self.lent);
+        let covering = nesting.covering();
+        let (taker, survey, held, covered) = self.taker(covering.map(|parent| parent.pid));
+        let (root, gate, request, log) = (taker.root, taker.gate, taker.request, taker.log);
+        let late = match (covering, Takes::of(request.slot), covered) {
+            (Some(parent), Takes::Pool(pool), Some(covered)) => {
+                let of = LateOf {
+                    parent: parent.clone(),
+                    pool,
+                    processors: host.processors,
+                    arrived,
+                    taker,
+                    held,
+                    covered,
+                };
+                Late::watch(of, console)
+            }
+            _ => None,
+        };
         let watching = Watching {
             job: started.job,
             running: started.running,
-            log: &self.log,
-            interrupt: self.host.interrupt,
-            runs_as: self.nesting.runs_as(self.request.slot),
-            root: self.root,
-            gate: &self.gate,
-            hands_on: self.nesting.handed_on(self.lent),
-            survey: &mut self.survey,
+            log,
+            interrupt: host.interrupt,
+            runs_as: nesting.runs_as(request.slot),
+            root,
+            gate,
+            hands_on: nesting.handed_on(lent),
+            survey,
             recorded,
+            late,
         };
-        let mut watcher = Watcher::begin(self.request, watching, start, self.host.processors)
-            .map_err(|error| format!("cannot begin to watch the command: {error}"))?;
+        let mut watcher =
+            Watcher::begin(request, watching, start, host.processors).map_err(|error| format!("cannot begin to watch the command: {error}"))?;
         let watched = watcher.until_end(console).map_err(|error| format!("cannot watch the command: {error}"))?;
         let timing = Timing {
             wall: start.started.elapsed(),
@@ -2179,6 +2255,7 @@ mod tests {
             start_ms: 1,
             marker: "light:4242:1".to_owned(),
             unjudged: None,
+            stand_in: false,
         };
         let rows: [(&str, Nesting, bool, bool); 6] = [
             ("covered by its parent's slot", Nesting::Covered(parent.clone()), false, false),

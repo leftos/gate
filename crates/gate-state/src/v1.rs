@@ -379,6 +379,11 @@ pub struct CoveredMarker {
     pub cwd: String,
     /// When the covered gate wrote the marker, Unix epoch milliseconds.
     pub since: u64,
+    /// The covered gate's own slot kind, `heavy`, `light`, `critical` or `none`: the kind of slot it takes for the rest
+    /// of its run should its parent gate end first, which a gate its command starts may run under then. `None` in a
+    /// marker written without it, whose kind is unknown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
 }
 
 /// Writes `marker` at `path` through `<path>.<pid>.<n>.tmp` moved over it, making a missing folder.

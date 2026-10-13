@@ -12,11 +12,11 @@ use gate_router::{DROPPED_NO_BUILD_LINE, NO_OUTPUTS_LINE, repo_name};
 use serde_json::{Value, json};
 
 use crate::bridge::{answer, bridge_words, stand_in};
-use crate::nesting::{marked, test_marker};
+use crate::nesting::{LOOK_OFTEN, end_parent, first_event, marked, orphaned_as, spawned, test_marker};
 
 use crate::support::{
-    Case, FAKE_TOOL, Running, assert_in_order, copy_tool, events, finish, git, git_init, heavy_words, nothing_back, record_path, release, run_words,
-    shown, wait_for_journal_line, wait_until, write_counts, write_remote_json,
+    Case, FAKE_TOOL, GATE, Running, assert_in_order, copy_tool, events, finish, git, git_init, heavy_words, nothing_back, powershell_folder,
+    record_path, release, run_words, shown, wait_for_journal_line, wait_until, write_counts, write_remote_json,
 };
 
 pub(crate) const HOST: &str = "builder";
@@ -944,6 +944,48 @@ fn a_light_no_build_under_a_light_parent_takes_a_heavy_slot_of_its_own() {
     );
     assert_eq!(command_lines(&outcome.stdout), ["test"], "{outcome:?}");
     assert!(took_heavy(&case, r".\dotnet.cmd test"), "{:#?}", events(&case));
+}
+
+#[test]
+fn a_light_no_build_under_a_light_stand_in_runs_under_the_heavy_slot_its_own_gate_took() {
+    let case = routed_case("routing-nothing-back-stand-in");
+    copy_tool(&case, "dotnet.exe");
+    dotnet_cmd(&case);
+    routed_build(&case, "routed.log");
+    // The record is left; with no routing file, no gate of the chain below is routed.
+    fs::remove_file(powershell_folder(&case).join("remote.json")).expect("the routing file can be removed");
+    write_counts(&case.root(), r#"{"v":1,"heavy":1}"#);
+    let paths = ["b.pid", "b.release", "b-go", "g.pid", "g.release", "outer.release"].map(|name| case.folder().join(name));
+    let [b_pid, b_release, b_go, g_pid, g_release, release] = &paths;
+    let texts = paths.each_ref().map(|path| shown(path));
+    let mut b_command = vec![FAKE_TOOL, "wait", &texts[2], "spawn-pid", &texts[3], &texts[4], GATE];
+    b_command.extend(run_words("g.log", &[], &NO_BUILD_TEST));
+    let mut a_command = vec![FAKE_TOOL, "spawn-pid", &texts[0], &texts[1], GATE];
+    a_command.extend(heavy_words("b.log", &LOOK_OFTEN, &b_command));
+    let a_words = run_words("a.log", &LOOK_OFTEN, &a_command);
+
+    // P (heavy) > A (light) > B (heavy). P ends: A takes a light slot of its own, and B, which A's light slot does
+    // not cover, takes the one heavy slot.
+    let (outer, a) = orphaned_as(&case, "heavy", &a_words, release);
+    let b = spawned(&case, b_pid);
+    end_parent(outer, release);
+    wait_for_journal_line(&case.root(), &format!(r#""event":"take","pid":{},"#, a.pid));
+    wait_for_journal_line(&case.root(), &format!(r#""event":"take","pid":{},"#, b.pid));
+
+    // B's command starts G, a light dotnet test under P's marker whose --no-build is dropped, so it runs as a heavy gate:
+    // under B's heavy slot, not queued behind it as a gate A's light slot does not cover.
+    let_go(b_go);
+    let (g, first) = first_event(&case, g_pid);
+    assert_eq!(
+        (&first["event"], &first["parentPid"]),
+        (&Value::from("covered"), &Value::from(b.pid)),
+        "G runs under B's heavy slot: {first}"
+    );
+    assert_eq!(g.ended(), 0);
+    let_go(g_release);
+    assert_eq!(b.ended(), 0);
+    let_go(b_release);
+    assert_eq!(a.ended(), 0);
 }
 
 #[test]

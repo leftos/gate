@@ -16,6 +16,7 @@ mod cutover;
 mod environment;
 mod escaped;
 mod journal;
+mod late;
 mod log;
 mod machine;
 mod nesting;

@@ -7,13 +7,16 @@
 
 mod binding;
 
+use std::cell::OnceCell;
 use std::ffi::OsStr;
 
 use gate_args::{Slot, Spelling};
 use gate_state::StateRoot;
+use gate_state::v1::{self, CoveredMarker};
 
-use crate::nesting::binding::{Binding, runs_inside_command_of};
-use crate::resolve::Environment;
+use crate::console::Console;
+use crate::nesting::binding::{Binding, holds_this_gate, runs_inside_command_of, runs_inside_command_with};
+use crate::resolve::{Environment, ResolvedRoot};
 use crate::slots::{Liveness, gate_liveness};
 
 /// The most digits a marker's pid may have.
@@ -24,7 +27,8 @@ const START_DIGITS: usize = 18;
 const MARKER_SHOWN: usize = 64;
 
 /// A live parent gate named by the marker: the slot kind it holds, its pid, the start it runs since in Unix epoch
-/// milliseconds, its marker as written, and why this gate's binding to it could not be judged, when it could not.
+/// milliseconds, its marker as written, why this gate's binding to it could not be judged, when it could not, and
+/// whether it stands in for the ended gate the marker names ([`Parent::standing_in`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Parent {
     pub held: Slot,
@@ -32,6 +36,7 @@ pub(crate) struct Parent {
     pub start_ms: u64,
     pub marker: String,
     pub unjudged: Option<String>,
+    pub stand_in: bool,
 }
 
 /// What a gate does under the marker it was started with.
@@ -68,16 +73,21 @@ struct Marker<'m> {
 impl Nesting {
     /// The nesting of a gate of `kind` under the state root `root`, from the marker in `environment`, the marker's gate
     /// judged by the start the system gives its pid and bound to this gate by its job; `job_trusted`, the
-    /// `--test-parent-job-trusted` seam, counts every live marker as bound.
-    pub(crate) fn read(environment: &Environment, kind: Slot, root: &StateRoot, job_trusted: bool) -> Nesting {
-        let inside = |pid, start_ms| {
-            if job_trusted {
-                Binding::Inside
-            } else {
-                runs_inside_command_of(root, pid, start_ms)
-            }
+    /// `--test-parent-job-trusted` seam, counts every live marker as bound. A marker whose gate has ended, or whose live
+    /// gate's command no longer holds this gate (its job closed as it ends), is taken up by a live heavy or light covered
+    /// gate whose command this gate runs inside ([`enclosing`]), as that gate's late take stands in for the ended one:
+    /// this gate is judged under that gate's slot as under a live parent's ([`Nesting::under`]), so a critical gate
+    /// there is refused.
+    pub(crate) fn read(environment: &Environment, kind: Slot, root: &ResolvedRoot, job_trusted: bool, console: &mut Console) -> Nesting {
+        let inside = |pid, start_ms| bound(&root.root, pid, start_ms, job_trusted);
+        let nesting = Nesting::decide(environment.slot_held.as_deref(), kind, root.root.hash(), gate_liveness, inside);
+        let (Nesting::Ended { marker, .. } | Nesting::Unbound { marker, .. }) = &nesting else {
+            return nesting;
         };
-        Nesting::decide(environment.slot_held.as_deref(), kind, root.hash(), gate_liveness, inside)
+        match enclosing_of(root, kind, &[], job_trusted, console) {
+            Some(found) => Nesting::under(Parent::standing_in(marker.clone(), found), kind),
+            None => nesting,
+        }
     }
 
     /// The nesting of a gate of `kind` under the root hashed `root_hash` (`None` for the default root) for `marker`,
@@ -126,6 +136,7 @@ impl Nesting {
                 start_ms: start,
                 marker: text.into_owned(),
                 unjudged,
+                stand_in: false,
             },
             kind,
         )
@@ -146,11 +157,15 @@ impl Nesting {
 
     /// This nesting for the gate once it asks for a heavy slot in place of the kind it was read for: a live parent's
     /// slot judged again for a heavy gate ([`Nesting::under`]), so a light parent no longer covers it; any other
-    /// nesting as it is.
-    pub(crate) fn as_heavy(&self) -> Nesting {
+    /// nesting as it is. A parent that stands in for an ended one is looked for again first, `search` finding the gate
+    /// that stands in for a heavy gate ([`enclosing_of`]): a heavy covered gate this gate runs inside covers it where
+    /// the light one found for its first kind does not. The parent found first stays when the search finds none.
+    pub(crate) fn as_heavy(&self, search: impl FnOnce() -> Option<Enclosing>) -> Nesting {
         match self {
             Nesting::Covered(parent) | Nesting::Refused(parent) | Nesting::Under(parent) | Nesting::Beside(parent) => {
-                Nesting::under(parent.clone(), Slot::Heavy)
+                let found = parent.stand_in.then(search).flatten();
+                let parent = found.map_or_else(|| parent.clone(), |found| Parent::standing_in(parent.marker.clone(), found));
+                Nesting::under(parent, Slot::Heavy)
             }
             Nesting::Own | Nesting::Malformed(_) | Nesting::Ended { .. } | Nesting::Unbound { .. } => self.clone(),
         }
@@ -237,6 +252,19 @@ impl Nesting {
 }
 
 impl Parent {
+    /// The parent `found` is once it stands in for the ended parent gate whose marker, `marker`, this gate was given:
+    /// the slot of `found`'s own kind, which it holds once it took it, its binding to this gate judged.
+    pub(crate) fn standing_in(marker: String, found: Enclosing) -> Parent {
+        Parent {
+            held: found.held,
+            pid: found.pid,
+            start_ms: found.start_ms,
+            marker,
+            unjudged: None,
+            stand_in: true,
+        }
+    }
+
     /// The line a gate says when it honours this parent's marker without having judged its binding to it, for the
     /// reason kept; none when the binding was judged.
     fn unjudged_line(&self) -> Option<String> {
@@ -257,6 +285,145 @@ impl Parent {
             self.held.as_str(),
             self.pid
         )
+    }
+
+    /// The line a gate of `kind` this parent's slot covers says when the parent ends while its command still runs, as
+    /// it goes on to take a slot of its own kind for the rest of its run.
+    pub(crate) fn ended_line(&self, kind: Slot) -> String {
+        format!(
+            "gate: the parent gate {} ended; taking a {} slot for the rest of this run",
+            self.pid,
+            kind.as_str()
+        )
+    }
+
+    /// The line a covered gate says when its parent gate `ended` has ended while its command runs, and this parent, a
+    /// live covered gate whose command this gate runs inside, stands in for it with a slot of its own kind.
+    pub(crate) fn taken_up_line(&self, ended: u32) -> String {
+        format!(
+            "gate: the parent gate {ended} ended; running under the {} slot of gate {}",
+            self.held.as_str(),
+            self.pid
+        )
+    }
+
+    /// The line a gate this parent's slot covers says when it cannot watch the parent for its end, for `reason`, and so
+    /// runs covered by it to its end.
+    pub(crate) fn unwatched_line(&self, reason: &str) -> String {
+        format!("gate: cannot watch the parent gate {} ({reason}); this run stays covered by it", self.pid)
+    }
+
+    /// The line a covered gate whose parent gate `ended` has ended says when it cannot watch this parent, found to stand
+    /// in for that one, for `reason`, and so passes it over.
+    pub(crate) fn unwatched_stand_in_line(&self, ended: u32, reason: &str) -> String {
+        format!(
+            "gate: cannot watch gate {} ({reason}) to run under its slot in place of the parent gate {ended}",
+            self.pid
+        )
+    }
+}
+
+/// Whether this gate runs inside the command of the live gate `pid` started at `start_ms` under `root`
+/// ([`runs_inside_command_of`]); every gate is, under the `--test-parent-job-trusted` seam `job_trusted`.
+fn bound(root: &StateRoot, pid: u32, start_ms: u64, job_trusted: bool) -> Binding {
+    if job_trusted {
+        Binding::Inside
+    } else {
+        runs_inside_command_of(root, pid, start_ms)
+    }
+}
+
+/// A live covered gate whose command this gate runs inside, which stands in for this gate's ended parent gate: its pid,
+/// its start in Unix epoch milliseconds, and the slot kind it holds once its own parent has ended, its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Enclosing {
+    pub pid: u32,
+    pub start_ms: u64,
+    pub held: Slot,
+}
+
+/// The gate that stands in for the ended parent gate of this gate of `kind` ([`enclosing`]), read from the covered
+/// markers under `root`, none of the gates `skip` names by pid and start (this gate's own, when it keeps a marker
+/// itself); a covered folder that cannot be read is said, and none stands in. Each candidate's job is asked first
+/// whether it holds this gate's own process; the walk up this gate's ancestors that follows when none does reads one
+/// process snapshot, taken once for every candidate.
+pub(crate) fn enclosing_of(root: &ResolvedRoot, kind: Slot, skip: &[(u32, u64)], job_trusted: bool, console: &mut Console) -> Option<Enclosing> {
+    let dir = v1::covered_dir(&root.path);
+    let markers: Vec<CoveredMarker> = match v1::read_covered(&dir) {
+        Ok(read) => read.into_iter().map(|(_, marker)| marker).collect(),
+        Err(error) => {
+            console.err(&format!("gate: cannot read the covered markers in {}: {error}", dir.display()));
+            return None;
+        }
+    };
+    let snapshot = OnceCell::new();
+    let tree = || snapshot.get_or_init(binding::snapshot);
+    let member = |pid, _| job_trusted || holds_this_gate(&root.root, pid);
+    let inside = |pid, start_ms| {
+        if job_trusted {
+            Binding::Inside
+        } else {
+            runs_inside_command_with(&root.root, pid, start_ms, tree)
+        }
+    };
+    enclosing(candidates(&markers, skip), kind, gate_liveness, member, inside)
+}
+
+/// The covered gates of `markers` that may stand in for an ended parent, but those `skip` names by pid and start:
+/// those whose own kind is heavy or light ([`own_kind`]), the outermost of the nested gates first, by their start.
+pub(crate) fn candidates(markers: &[CoveredMarker], skip: &[(u32, u64)]) -> Vec<Enclosing> {
+    let mut candidates: Vec<Enclosing> = markers
+        .iter()
+        .filter(|marker| !skip.contains(&(marker.pid, marker.process_start)))
+        .filter_map(|marker| {
+            own_kind(marker.kind.as_deref()).map(|held| Enclosing {
+                pid: marker.pid,
+                start_ms: marker.process_start,
+                held,
+            })
+        })
+        .collect();
+    candidates.sort_by_key(|candidate| (candidate.start_ms, candidate.pid));
+    candidates
+}
+
+/// Of the `candidates`, outermost first, the gate that stands in for the ended parent gate of this gate of `kind`: one
+/// that `liveness_of` does not judge gone and whose command holds this gate, first of those whose own kind covers
+/// this gate's, else of the others, judged then as a live parent's slot that does not cover the gate is ([`Nesting::under`]).
+/// Within each, a candidate whose job `member` says holds this gate's own process is taken first, as every ancestor's
+/// job does, since jobs nest; then one whose command `inside` binds this gate to. A binding that cannot be judged binds
+/// nothing here: a gate that queues is the safe failure once the parent has ended. None when no such gate runs.
+pub(crate) fn enclosing(
+    candidates: Vec<Enclosing>,
+    kind: Slot,
+    liveness_of: impl Fn(u32, u64) -> Liveness,
+    member: impl Fn(u32, u64) -> bool,
+    inside: impl Fn(u32, u64) -> Binding,
+) -> Option<Enclosing> {
+    let (covering, others): (Vec<Enclosing>, Vec<Enclosing>) = candidates
+        .into_iter()
+        .filter(|candidate| !matches!(liveness_of(candidate.pid, candidate.start_ms), Liveness::Gone))
+        .partition(|candidate| covers(candidate.held, kind));
+    [covering, others].into_iter().find_map(|group| {
+        let held = group.iter().find(|candidate| member(candidate.pid, candidate.start_ms));
+        held.or_else(|| {
+            group
+                .iter()
+                .find(|candidate| inside(candidate.pid, candidate.start_ms) == Binding::Inside)
+        })
+        .copied()
+    })
+}
+
+/// The slot a covered gate whose marker names its own kind `marker_kind` holds once its parent has ended: a heavy or
+/// light one. A no-slot or critical gate takes none, so it stands in for no gate; nor does a gate that gave up watching
+/// its parent, whose marker names `none`, or one whose marker names no kind, which a gate wrote before markers named
+/// one and which never takes a slot of its own.
+fn own_kind(marker_kind: Option<&str>) -> Option<Slot> {
+    match marker_kind {
+        Some("heavy") => Some(Slot::Heavy),
+        Some("light") => Some(Slot::Light),
+        _ => None,
     }
 }
 
@@ -282,7 +449,7 @@ fn shown_marker(marker: &str) -> String {
 
 /// Whether a parent holding a `held` slot covers a gate of `kind`: heavy covers heavy, light and no slot, light covers
 /// light and no slot, critical covers every kind, and a parent holding no slot covers none.
-fn covers(held: Slot, kind: Slot) -> bool {
+pub(crate) fn covers(held: Slot, kind: Slot) -> bool {
     match held {
         Slot::Heavy => kind != Slot::Critical,
         Slot::Light => matches!(kind, Slot::Light | Slot::None),
@@ -337,9 +504,10 @@ mod tests {
     use std::io;
 
     use gate_args::{Slot, Spelling};
+    use gate_state::v1::CoveredMarker;
 
     use super::binding::Binding;
-    use super::{Nesting, Parent};
+    use super::{Enclosing, Nesting, Parent, candidates, enclosing};
     use crate::slots::Liveness;
 
     /// The hash of the state root every decision here is made under.
@@ -379,6 +547,7 @@ mod tests {
             start_ms: START,
             marker: marker(held.as_str()),
             unjudged: None,
+            stand_in: false,
         };
         assert_eq!(decided(&marker("heavy"), Slot::Light), Nesting::Covered(parent(Slot::Heavy)));
         assert_eq!(decided(&marker("heavy"), Slot::Critical), Nesting::Refused(parent(Slot::Heavy)));
@@ -412,6 +581,7 @@ mod tests {
             start_ms: START,
             marker: marker(held),
             unjudged: None,
+            stand_in: false,
         }
     }
 
@@ -497,6 +667,7 @@ mod tests {
                 start_ms: START,
                 marker: hashless.clone(),
                 unjudged: None,
+                stand_in: false,
             }),
             "no hash under the default root"
         );
@@ -670,6 +841,229 @@ mod tests {
             assert_eq!(nesting.line(kind, spelling).as_deref(), line, "{nesting:?}");
             assert_eq!(nesting.unjudged_line(), None, "{nesting:?} was judged");
         }
+    }
+
+    #[test]
+    fn a_covered_gate_says_when_its_parent_ends_or_cannot_be_watched() {
+        let parent = parent(Slot::Heavy);
+        assert_eq!(
+            parent.ended_line(Slot::Light),
+            "gate: the parent gate 4242 ended; taking a light slot for the rest of this run",
+            "the gate's own kind, not the parent's"
+        );
+        assert_eq!(
+            parent.ended_line(Slot::Heavy),
+            "gate: the parent gate 4242 ended; taking a heavy slot for the rest of this run"
+        );
+        assert_eq!(
+            parent.unwatched_line("Access is denied. (os error 5)"),
+            "gate: cannot watch the parent gate 4242 (Access is denied. (os error 5)); this run stays covered by it"
+        );
+    }
+
+    /// A covered marker of the gate `pid` started at `start`, its own kind `kind` (`None` for a marker naming none).
+    fn covered_marker(pid: u32, start: u64, kind: Option<&str>) -> CoveredMarker {
+        CoveredMarker {
+            pid,
+            process_start: start,
+            parent_pid: 1,
+            command: "cargo build".to_owned(),
+            cwd: r"C:\work".to_owned(),
+            since: start,
+            kind: kind.map(str::to_owned),
+        }
+    }
+
+    /// The stand-in `pid` started at `start_ms`, holding a `held` slot.
+    fn found(pid: u32, start_ms: u64, held: Slot) -> Enclosing {
+        Enclosing { pid, start_ms, held }
+    }
+
+    /// No candidate's job holds this gate's own process, so each is judged by `inside`'s walk.
+    fn no_member(_: u32, _: u64) -> bool {
+        false
+    }
+
+    /// The stand-in of `markers`, none skipped, for a gate of `kind`, judged by `liveness` and the walk `inside` alone.
+    fn walked(
+        markers: &[CoveredMarker],
+        kind: Slot,
+        skip: &[(u32, u64)],
+        liveness: impl Fn(u32, u64) -> Liveness,
+        inside: impl Fn(u32, u64) -> Binding,
+    ) -> Option<Enclosing> {
+        enclosing(candidates(markers, skip), kind, liveness, no_member, inside)
+    }
+
+    #[test]
+    fn the_outermost_live_covered_gate_whose_command_holds_this_gate_stands_in_for_its_ended_parent() {
+        let heavy = Some("heavy");
+        let markers = [
+            covered_marker(10, 300, heavy),
+            covered_marker(11, 200, heavy),
+            covered_marker(12, 100, heavy),
+            covered_marker(14, 40, heavy),
+            covered_marker(15, 30, heavy),
+            covered_marker(16, 20, heavy),
+        ];
+        // 12 is gone, 14's command does not hold this gate, 15's start cannot be read and its command does not hold
+        // this gate either, and 16's binding cannot be judged.
+        let liveness = |pid, _| match pid {
+            12 => Liveness::Gone,
+            15 => Liveness::Unknown(io::Error::other("no times")),
+            _ => Liveness::Live,
+        };
+        let inside = |pid, _| match pid {
+            14 | 15 => Binding::Outside,
+            16 => Binding::Unjudged("denied".to_owned()),
+            _ => Binding::Inside,
+        };
+        assert_eq!(
+            walked(&markers, Slot::Heavy, &[], liveness, inside),
+            Some(found(11, 200, Slot::Heavy)),
+            "the earliest started; a binding that cannot be judged binds nothing"
+        );
+        assert_eq!(
+            walked(&markers, Slot::Heavy, &[(11, 200), (16, 20)], liveness, inside),
+            Some(found(10, 300, Slot::Heavy)),
+            "never a gate skipped, as the gate itself"
+        );
+        let unknown = |_, _| Liveness::Unknown(io::Error::other("no times"));
+        assert_eq!(
+            walked(&[covered_marker(15, 30, heavy)], Slot::Heavy, &[], unknown, |_, _| Binding::Inside),
+            Some(found(15, 30, Slot::Heavy)),
+            "a gate whose start cannot be read counts as running"
+        );
+        assert_eq!(walked(&[], Slot::Heavy, &[], liveness, inside), None, "no covered gate runs");
+    }
+
+    #[test]
+    fn a_candidate_whose_job_holds_this_gate_is_taken_without_a_walk_and_the_walk_follows_only_when_none_does() {
+        let markers = [covered_marker(10, 300, Some("heavy")), covered_marker(11, 200, Some("heavy"))];
+        let walks = std::cell::Cell::new(0);
+        let inside = |_, _| {
+            walks.set(walks.get() + 1);
+            Binding::Inside
+        };
+        let found_by = |member: fn(u32, u64) -> bool| enclosing(candidates(&markers, &[]), Slot::Heavy, judged_live, member, inside);
+        assert_eq!(
+            found_by(|pid, _| pid == 10),
+            Some(found(10, 300, Slot::Heavy)),
+            "the member, before an outer gate that only the walk binds"
+        );
+        assert_eq!(walks.get(), 0, "no walk while a candidate's job holds this gate");
+        assert_eq!(found_by(no_member), Some(found(11, 200, Slot::Heavy)), "the outermost the walk binds");
+        assert_eq!(walks.get(), 1, "the walk asks only until one binds");
+    }
+
+    #[test]
+    fn a_heavy_or_light_gate_stands_in_and_one_whose_own_kind_covers_this_gate_comes_first() {
+        use Slot::{Critical, Heavy, Light, None as NoSlot};
+
+        let stand_in = |own: Option<&str>, kind| walked(&[covered_marker(10, 300, own)], kind, &[], judged_live, bound);
+        let table = [
+            (Some("heavy"), Heavy, Some(found(10, 300, Heavy))),
+            (Some("heavy"), Light, Some(found(10, 300, Heavy))),
+            (Some("heavy"), NoSlot, Some(found(10, 300, Heavy))),
+            (Some("heavy"), Critical, Some(found(10, 300, Heavy))),
+            (Some("light"), Heavy, Some(found(10, 300, Light))),
+            (Some("light"), Light, Some(found(10, 300, Light))),
+            (Some("light"), Critical, Some(found(10, 300, Light))),
+            (Some("none"), Light, None),
+            (Some("critical"), Light, None),
+            (Some("critical"), Heavy, None),
+            (Some("medium"), Light, None),
+            (None, Heavy, None),
+            (None, Light, None),
+        ];
+        for (own, kind, expected) in table {
+            assert_eq!(stand_in(own, kind), expected, "a {own:?} stand-in for a {kind:?} gate");
+        }
+        let outer_light_inner_heavy = [covered_marker(10, 100, Some("light")), covered_marker(11, 200, Some("heavy"))];
+        assert_eq!(
+            walked(&outer_light_inner_heavy, Heavy, &[], judged_live, bound),
+            Some(found(11, 200, Heavy)),
+            "the inner heavy gate, whose slot covers a heavy gate, before the outer light one"
+        );
+        assert_eq!(
+            walked(&outer_light_inner_heavy, Light, &[], judged_live, bound),
+            Some(found(10, 100, Light)),
+            "the outermost, when both cover"
+        );
+    }
+
+    #[test]
+    fn a_critical_gate_under_a_gate_standing_in_for_its_ended_parent_is_refused_as_under_a_live_one() {
+        for held in [Slot::Heavy, Slot::Light] {
+            let parent = Parent::standing_in(marker(Slot::Critical), found(77, 88, held));
+            let nesting = Nesting::under(parent.clone(), Slot::Critical);
+            assert_eq!(nesting, Nesting::Refused(parent), "under a {held:?} stand-in");
+            assert_eq!(
+                nesting.line(Slot::Critical, Spelling::Cli),
+                Some(format!(
+                    "gate: --slot critical cannot run under the {} slot of gate 77: it would wait for that slot for good; run the \
+                     critical command outside that gate",
+                    held.as_str()
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn a_gate_turned_heavy_looks_for_its_stand_in_again_and_a_live_parent_is_only_judged_again() {
+        let light = Parent::standing_in(marker(Slot::Heavy), found(10, 100, Slot::Light));
+        let heavy = Parent::standing_in(marker(Slot::Heavy), found(11, 200, Slot::Heavy));
+        assert_eq!(
+            Nesting::Covered(light.clone()).as_heavy(|| Some(found(11, 200, Slot::Heavy))),
+            Nesting::Covered(heavy),
+            "the heavy gate the search finds covers it"
+        );
+        assert_eq!(
+            Nesting::Covered(light.clone()).as_heavy(|| None),
+            Nesting::Under(light),
+            "the stand-in found first, when the search finds none"
+        );
+        let live = parent(Slot::Light);
+        assert_eq!(
+            Nesting::Covered(live.clone()).as_heavy(|| unreachable!("a live parent is not looked for again")),
+            Nesting::Under(live)
+        );
+    }
+
+    /// Every gate runs.
+    fn judged_live(_: u32, _: u64) -> Liveness {
+        Liveness::Live
+    }
+
+    #[test]
+    fn a_gate_standing_in_for_an_ended_parent_names_its_own_slot_kind_and_says_so() {
+        let parent = Parent::standing_in(
+            marker(Slot::Critical),
+            Enclosing {
+                pid: 77,
+                start_ms: 88,
+                held: Slot::Light,
+            },
+        );
+        assert_eq!(
+            parent,
+            Parent {
+                held: Slot::Light,
+                pid: 77,
+                start_ms: 88,
+                marker: marker(Slot::Critical),
+                unjudged: None,
+                stand_in: true,
+            },
+            "the stand-in's own kind, not the ended parent's"
+        );
+        assert_eq!(
+            parent.taken_up_line(PID),
+            "gate: the parent gate 4242 ended; running under the light slot of gate 77"
+        );
+        let nesting = Nesting::under(parent.clone(), Slot::Light);
+        assert_eq!(nesting, Nesting::Covered(parent), "nested under the stand-in's slot");
+        assert_eq!(nesting.runs_as(Slot::Light), Slot::Light, "no longer as critical");
     }
 
     #[test]

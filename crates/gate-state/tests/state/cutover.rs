@@ -286,6 +286,7 @@ fn covered_marker(pid: u32, start: &str, since: &str) -> CoveredMarker {
         command: "cargo fmt --check".to_owned(),
         cwd: r"C:\work\repo".to_owned(),
         since: ms(since),
+        kind: None,
     }
 }
 

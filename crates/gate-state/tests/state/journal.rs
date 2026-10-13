@@ -975,6 +975,159 @@ fn prune_keeps_the_runs_a_covered_flood_would_push_out() {
 }
 
 #[test]
+fn a_covered_run_that_released_a_slot_of_its_own_reads_as_an_ordinary_run() {
+    let parent = Gate::new(100, START, "git commit -F .tmp/msg.txt");
+    let covered = Gate::new(200, START, COMMAND);
+    let mut lines = parent.run(60, 10.0, json!(0));
+    lines.extend([
+        covered.line("covered", &ago(59), json!({"parentPid": 100})),
+        covered.line(
+            "take",
+            &ago(55),
+            json!({"slots": [r"Local\gate-slot-1"], "waitedSeconds": 2.0, "parentPid": 100}),
+        ),
+        covered.release(&ago(30), 25.0, json!(3)),
+    ]);
+
+    let history = history_of("a_covered_run_that_released_a_slot_of_its_own_reads_as_an_ordinary_run", &lines);
+
+    let run = history.runs.iter().find(|run| run.pid == 200).expect("the covered run is listed");
+    assert_eq!(
+        (run.state, run.status, run.held_seconds, run.parent_pid),
+        (RunState::Failed, Some(3), Some(25.0), Some(100)),
+        "its own release, not its parent's, ends the row"
+    );
+    assert!(run.started.is_some(), "its own take starts it");
+}
+
+#[test]
+fn a_covered_run_that_took_a_slot_of_its_own_reads_as_running_while_its_gate_runs_and_unrecorded_once_it_is_gone() {
+    let parent = Gate::new(100, START, "git commit -F .tmp/msg.txt");
+    let covered = Gate::new(200, START, COMMAND);
+    let mut lines = parent.run(60, 10.0, json!(0));
+    lines.extend([
+        covered.line("covered", &ago(59), json!({"parentPid": 100})),
+        covered.line(
+            "take",
+            &ago(55),
+            json!({"slots": [r"Local\gate-slot-1"], "waitedSeconds": 2.0, "parentPid": 100}),
+        ),
+    ]);
+    let dir = journal_dir("a_covered_run_that_took_a_slot_of_its_own_reads_as_running_while_its_gate_runs_and_unrecorded_once_it_is_gone");
+    fs::write(dir.join("events.jsonl"), text(&lines)).expect("the journal can be written");
+    let row = |is_live: fn(u32, &str) -> bool| {
+        let history = JournalCache::default()
+            .read(&dir, "", ts(NOW), is_live, last_segment)
+            .expect("the journal can be read");
+        let run = history.runs.into_iter().find(|run| run.pid == 200).expect("the covered run is listed");
+        (run.state, run.status, run.held_seconds, run.started.is_some())
+    };
+
+    assert_eq!(
+        row(|pid, _| pid == 200),
+        (RunState::Running, None, None, true),
+        "a live gate holding the slot it took runs, its parent's end not its own"
+    );
+    assert_eq!(
+        row(not_live),
+        (RunState::Unrecorded, None, None, true),
+        "a gate gone with no release, as one killed after its take, is unrecorded"
+    );
+}
+
+#[test]
+fn a_gate_covered_by_a_stand_in_reads_its_end_from_the_stand_in_s_release() {
+    let parent = Gate::new(100, START, "git commit -F .tmp/msg.txt");
+    let stand_in = Gate::new(200, START, COMMAND);
+    let nested = Gate::new(300, START, "cargo build");
+    let mut lines = parent.run(60, 10.0, json!(0));
+    lines.extend([
+        stand_in.line("covered", &ago(59), json!({"parentPid": 100})),
+        // The nested gate starts after the parent ended, under the stand-in, which takes its own slot only after.
+        nested.line("covered", &ago(50), json!({"parentPid": 200})),
+        stand_in.line(
+            "take",
+            &ago(45),
+            json!({"slots": [r"Local\gate-slot-1"], "waitedSeconds": 1.0, "parentPid": 100}),
+        ),
+        stand_in.release(&ago(30), 15.0, json!(4)),
+    ]);
+
+    let history = history_of("a_gate_covered_by_a_stand_in_reads_its_end_from_the_stand_in_s_release", &lines);
+
+    let run = history.runs.iter().find(|run| run.pid == 300).expect("the nested run is listed");
+    assert_eq!(
+        (run.state, run.status, run.held_seconds, run.parent_pid),
+        (RunState::Covered, Some(4), Some(15.0), Some(200)),
+        "the stand-in's release ends the row"
+    );
+}
+
+#[test]
+fn a_gate_covered_by_a_stand_in_reads_its_end_from_the_stand_in_not_from_an_older_run_of_its_pid() {
+    let older = Gate::new(200, "2026-10-03T08:30:00.25Z", "cargo build");
+    let parent = Gate::new(100, START, "git commit -F .tmp/msg.txt");
+    let stand_in = Gate::new(200, START, COMMAND);
+    let nested = Gate::new(300, START, "cargo build");
+    // An older gate of the stand-in's pid took and released a slot long before.
+    let mut lines = older.run(200, 99.0, json!(0));
+    lines.extend(parent.run(60, 10.0, json!(0)));
+    lines.extend([
+        stand_in.line("covered", &ago(59), json!({"parentPid": 100})),
+        nested.line("covered", &ago(50), json!({"parentPid": 200})),
+        stand_in.line(
+            "take",
+            &ago(45),
+            json!({"slots": [r"Local\gate-slot-1"], "waitedSeconds": 1.0, "parentPid": 100}),
+        ),
+        stand_in.release(&ago(30), 15.0, json!(4)),
+    ]);
+
+    let history = history_of(
+        "a_gate_covered_by_a_stand_in_reads_its_end_from_the_stand_in_not_from_an_older_run_of_its_pid",
+        &lines,
+    );
+
+    let run = history.runs.iter().find(|run| run.pid == 300).expect("the nested run is listed");
+    assert_eq!(
+        (run.state, run.status, run.held_seconds, run.parent_pid),
+        (RunState::Covered, Some(4), Some(15.0), Some(200)),
+        "the run of pid 200 alive at the nested gate's line, not the older one that took a slot before it"
+    );
+}
+
+#[test]
+fn a_covered_run_that_took_a_slot_late_is_left_out_of_the_held_time_summary() {
+    let parent = Gate::new(100, START, "git commit -F .tmp/msg.txt");
+    let covered = Gate::new(200, START, COMMAND);
+    let mut lines = parent.run(60, 10.0, json!(0));
+    lines.extend([
+        covered.line("covered", &ago(59), json!({"parentPid": 100})),
+        covered.line(
+            "take",
+            &ago(55),
+            json!({"slots": [r"Local\gate-slot-1"], "waitedSeconds": 2.0, "parentPid": 100}),
+        ),
+        covered.release(&ago(54), 60.0, json!(0)),
+    ]);
+
+    let history = history_of("a_covered_run_that_took_a_slot_late_is_left_out_of_the_held_time_summary", &lines);
+
+    let run = history.runs.iter().find(|run| run.pid == 200).expect("the covered run is listed");
+    assert_eq!(
+        (run.state, run.held_seconds),
+        (RunState::Ok, Some(60.0)),
+        "its row keeps its own held time"
+    );
+    let counted: Vec<(usize, f64)> = history.summary.iter().map(|row| (row.count, row.max_seconds)).collect();
+    assert_eq!(
+        counted,
+        [(1, 10.0)],
+        "only the parent's run counts: the late take held its slot only from the parent's end"
+    );
+}
+
+#[test]
 fn prune_keeps_a_listed_covered_runs_parent() {
     let week = 7 * 24 * 60;
     let mut lines = Vec::new();

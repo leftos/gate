@@ -3,22 +3,25 @@
 //! a heavy slot, and a marker that is malformed, names a gate no longer running or belongs to another root is ignored. A
 //! marker naming a live process whose gate's command this gate does not run inside is ignored too, unless the
 //! `--test-parent-job-trusted` seam trusts it, as the cases naming the test process do. A covered gate keeps its
-//! covered marker while its command runs, and a gate that queues deletes a dead gate's.
+//! covered marker while its command runs, and a gate that queues deletes a dead gate's. A covered gate whose parent gate
+//! ends while its command still runs takes a slot of its own kind for the rest of the run, waiting for one without
+//! pausing its command, and ends that wait silently when its command ends first.
 
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{self, Command};
+use std::time::Duration;
 
 use gate_state::v1::{self, CoveredMarker};
 use gate_state::{KernelObject, StateRoot};
-use gate_win32::Job;
+use gate_win32::{Job, StoppableProcess};
 use jiff::Timestamp;
 use serde_json::Value;
 
 use crate::support::{
     Case, FAKE_TOOL, GATE, Outcome, POLL, Running, assert_in_order, critical_words, events, events_of, finish, heavy_words, none_words, run_words,
-    shown, start, take_of, wait_for_file, wait_for_journal_line, write_counts,
+    shown, start, take_of, wait_for_file, wait_for_journal_line, wait_until, write_counts,
 };
 
 /// A heavy pool of one slot.
@@ -118,7 +121,7 @@ fn heavy_holder(case: &Case, go: &Path) -> Running {
     holder
 }
 
-fn let_go(go: &Path) {
+pub(crate) fn let_go(go: &Path) {
     fs::write(go, "").expect("the go file can be made");
 }
 
@@ -224,6 +227,7 @@ fn a_dead_gates_covered_marker_is_deleted_by_the_next_gate_that_queues() {
         command: "cargo fmt --check".to_owned(),
         cwd: shown(&case.folder()),
         since: 1_790_852_402_000,
+        kind: Some("light".to_owned()),
     };
     v1::write_covered(&v1::covered_path(&root, dead.pid, dead.process_start), &dead).expect("the dead marker can be written");
     let own = process::id();
@@ -590,6 +594,599 @@ fn a_gate_under_cmd_and_pwsh_in_its_parents_command_is_covered() {
         .collect();
     assert_eq!(sequence(&case), expected, "the gate under cmd and pwsh runs under the outer's slot");
     assert_eq!((&line["parentPid"], &line["kind"]), (&Value::from(outer_pid), &Value::from("light")));
+}
+
+/// The seams of a covered gate whose parent ends as its command runs: it looks at its parent every 100 ms, polls for a
+/// free slot every 20 ms, and says it still waits only once an hour, so no case's lines depend on how long it took.
+pub(crate) const LOOK_OFTEN: [&str; 6] = ["--test-sample-ms", "100", "--test-poll-ms", "20", "--test-heartbeat-ms", "3600000"];
+
+/// A covered gate the outer gate's command started and left running: its process, opened while that command still
+/// held it, so its pid is pinned, and its pid. Dropping it while the gate still runs ends it, so no failure leaves it
+/// waiting.
+pub(crate) struct Orphan {
+    process: StoppableProcess,
+    pub(crate) pid: u32,
+}
+
+impl Orphan {
+    /// Whether the gate has ended.
+    pub(crate) fn has_ended(&self) -> bool {
+        self.process.wait(Duration::ZERO).expect("the covered gate can be waited for")
+    }
+
+    /// Waits for the covered gate to end; its exit code.
+    pub(crate) fn ended(&self) -> u32 {
+        wait_until("the covered gate ending", || {
+            self.process.wait(Duration::ZERO).expect("the covered gate can be waited for")
+        });
+        self.process.exit_code().expect("the covered gate's exit code can be read")
+    }
+}
+
+impl Drop for Orphan {
+    fn drop(&mut self) {
+        if !self.process.wait(Duration::ZERO).unwrap_or(true) {
+            // A gate that is stopping already refuses this, which is no failure of its case.
+            let _ = self.process.terminate(1);
+        }
+    }
+}
+
+/// Starts a heavy outer gate whose command starts the gate of `inner` words through fake-tool's `spawn-pid` and holds
+/// it until the file `release` comes, and returns once the covered gate has journalled its `covered` line.
+fn orphaned(case: &Case, inner: &[&str], release: &Path) -> (Running, Orphan) {
+    orphaned_as(case, "heavy", inner, release)
+}
+
+/// [`orphaned`], the outer gate taking a slot of `outer_kind`.
+pub(crate) fn orphaned_as(case: &Case, outer_kind: &str, inner: &[&str], release: &Path) -> (Running, Orphan) {
+    let pid_file = case.folder().join("inner.pid");
+    let (pid_text, release_text) = (shown(&pid_file), shown(release));
+    let mut command = vec![FAKE_TOOL, "spawn-pid", &pid_text, &release_text, GATE];
+    command.extend(inner);
+    let mut words = heavy_words("outer.log", &[], &command);
+    words[2] = outer_kind;
+    let outer = case.start(&words);
+    (outer, spawned(case, &pid_file))
+}
+
+/// The gate a fake-tool `spawn-pid` step started and still holds, its pid read from `pid_file`, once it has journalled
+/// its `covered` line.
+pub(crate) fn spawned(case: &Case, pid_file: &Path) -> Orphan {
+    let orphan = started_gate(pid_file);
+    wait_for_journal_line(&case.root(), &format!(r#""event":"covered","pid":{},"#, orphan.pid));
+    orphan
+}
+
+/// The gate a fake-tool `spawn-pid` step started and still holds, its pid read from `pid_file`, once it has written it.
+fn started_gate(pid_file: &Path) -> Orphan {
+    let read_pid = || fs::read_to_string(pid_file).ok().and_then(|text| text.trim().parse::<u32>().ok());
+    wait_until("the spawned gate's pid written", || read_pid().is_some());
+    let pid = read_pid().expect("checked above");
+    let process = StoppableProcess::open(pid)
+        .expect("the spawned gate can be opened")
+        .expect("the spawned gate its starter holds is running");
+    Orphan { process, pid }
+}
+
+/// The gate a fake-tool `spawn-pid` step started, its pid read from `pid_file`, and the first event it journalled,
+/// once it has journalled one: `covered` when it runs under a parent's slot, `queue` when it queues for its own.
+pub(crate) fn first_event(case: &Case, pid_file: &Path) -> (Orphan, Value) {
+    let orphan = started_gate(pid_file);
+    let first = || events_or_none_of(case).into_iter().find(|event| event["pid"] == orphan.pid);
+    wait_until("the spawned gate's first journal line", || first().is_some());
+    let event = first().expect("checked above");
+    (orphan, event)
+}
+
+/// The case's journal lines, none when it was not written yet.
+fn events_or_none_of(case: &Case) -> Vec<Value> {
+    if case.root().join("events.jsonl").exists() {
+        events(case)
+    } else {
+        Vec::new()
+    }
+}
+
+/// The pids of the gates that journalled a `take`, in order, but `but`'s.
+fn takers_but(case: &Case, but: u32) -> Vec<u64> {
+    events(case)
+        .into_iter()
+        .filter(|event| event["event"] == "take" && event["pid"] != but)
+        .filter_map(|event| event["pid"].as_u64())
+        .collect()
+}
+
+/// Waits until the file at `path` holds a line containing `needle`, and returns that line.
+pub(crate) fn line_with(path: &Path, needle: &str) -> String {
+    let found = || {
+        fs::read_to_string(path)
+            .ok()
+            .and_then(|text| text.lines().find(|line| line.contains(needle)).map(str::to_owned))
+    };
+    wait_until(&format!("a line with {needle:?} in {}", path.display()), || found().is_some());
+    found().expect("checked above")
+}
+
+#[test]
+fn a_gate_started_after_two_parents_ended_runs_covered_by_the_gate_that_took_the_slot() {
+    let case = Case::new("a_gate_started_after_two_parents_ended_runs_covered_by_the_gate_that_took_the_slot");
+    write_counts(&case.root(), ONE_HEAVY);
+    let paths = ["a-go", "c.pid", "c.release", "c-go", "e.pid", "e.release", "outer.release"].map(|name| case.folder().join(name));
+    let [a_go, c_pid, c_release, c_go, e_pid, e_release, release] = &paths;
+    let texts = paths.each_ref().map(|path| shown(path));
+    let e_words = heavy_words("e.log", &LOOK_OFTEN, &[FAKE_TOOL, "exit", "0"]);
+    let mut c_command = vec![FAKE_TOOL, "wait", &texts[3], "spawn-pid", &texts[4], &texts[5], GATE];
+    c_command.extend(e_words);
+    let c_words = heavy_words("c.log", &LOOK_OFTEN, &c_command);
+    let mut a_command = vec![FAKE_TOOL, "wait", &texts[0], "spawn-pid", &texts[1], &texts[2], GATE];
+    a_command.extend(c_words);
+    let a_words = heavy_words("a.log", &LOOK_OFTEN, &a_command);
+
+    // The outer gate ends, so A takes the one heavy slot; then A's command starts C, covered by A.
+    let (outer, a) = orphaned(&case, &a_words, release);
+    let outer_pid = end_parent(outer, release);
+    wait_for_journal_line(&case.root(), &format!(r#""event":"take","pid":{},"#, a.pid));
+    let_go(a_go);
+    let c = spawned(&case, c_pid);
+    // A's command ends, leaving C running, so C takes the slot A lets go.
+    let_go(c_release);
+    assert_eq!(a.ended(), 0);
+    wait_for_journal_line(&case.root(), &format!(r#""event":"take","pid":{},"#, c.pid));
+
+    // C's command starts E, still under the outer gate's marker, while C holds the one slot.
+    let_go(c_go);
+    let (e, first) = first_event(&case, e_pid);
+    assert_eq!(
+        (&first["event"], &first["parentPid"]),
+        (&Value::from("covered"), &Value::from(c.pid)),
+        "E runs under C, which holds the slot, rather than queueing behind it: {first}"
+    );
+    assert_eq!(e.ended(), 0, "E ran without waiting for a slot");
+    let_go(e_release);
+    assert_eq!(c.ended(), 0);
+    assert_eq!(events_of(&case, e.pid), ["covered"]);
+    assert_eq!(events_of(&case, c.pid), ["covered", "take", "release"]);
+    assert_eq!(takers_but(&case, outer_pid), [u64::from(a.pid), u64::from(c.pid)], "one slot at a time");
+}
+
+#[test]
+fn a_critical_gate_under_a_gate_standing_in_for_an_ended_critical_parent_is_refused() {
+    let case = Case::new("a_critical_gate_under_a_gate_standing_in_for_an_ended_critical_parent_is_refused");
+    write_counts(&case.root(), r#"{"v":1,"heavy":2}"#);
+    let paths = ["a-go", "d.pid", "d.release", "outer.release"].map(|name| case.folder().join(name));
+    let [a_go, d_pid, d_release, release] = &paths;
+    let texts = paths.each_ref().map(|path| shown(path));
+    let mut a_command = vec![FAKE_TOOL, "wait", &texts[0], "spawn-pid", &texts[1], &texts[2], GATE];
+    a_command.extend(critical_words("d.log", &[], &[FAKE_TOOL, "exit", "0"]));
+    let a_words = heavy_words("a.log", &LOOK_OFTEN, &a_command);
+
+    // Pc (critical) > A (heavy): Pc's command ends, so A takes a heavy slot of its own for the rest of its run.
+    let (outer, a) = orphaned_as(&case, "critical", &a_words, release);
+    end_parent(outer, release);
+    wait_for_journal_line(&case.root(), &format!(r#""event":"take","pid":{},"#, a.pid));
+
+    // A's command starts D, a critical gate under Pc's marker, inside A's command, whose heavy slot would never free
+    // for D's request for the machine.
+    let_go(a_go);
+    let d = started_gate(d_pid);
+    let journalled = || events_or_none_of(&case).into_iter().any(|event| event["pid"] == d.pid);
+    wait_until("D ending or journalling", || d.has_ended() || journalled());
+    assert!(!journalled(), "D never queues for the machine behind A's slot");
+    assert_eq!(d.ended(), 2, "D is refused");
+    assert_eq!(
+        line_with(&case.folder().join("a.log.err"), "critical cannot run under"),
+        format!(
+            "gate: --slot critical cannot run under the heavy slot of gate {}: it would wait for that slot for good; run the critical \
+             command outside that gate",
+            a.pid
+        )
+    );
+    // No critical request is left pending, so another heavy gate takes the free slot and runs.
+    assert_passed(&finish(case.gate(&heavy_words("other.log", &[], &[FAKE_TOOL, "exit", "0"]))));
+
+    let_go(d_release);
+    assert_eq!(a.ended(), 0);
+    assert_eq!(events_of(&case, a.pid), ["covered", "take", "release"]);
+}
+
+#[test]
+fn a_nested_chain_whose_stand_in_ends_too_holds_one_slot() {
+    let case = Case::new("a_nested_chain_whose_stand_in_ends_too_holds_one_slot");
+    write_counts(&case.root(), ONE_HEAVY);
+    let paths = ["b.pid", "b.release", "c.pid", "c.release", "c-started", "c-go", "outer.release"].map(|name| case.folder().join(name));
+    let [b_pid, b_release, c_pid, c_release, c_started, c_go, release] = &paths;
+    let texts = paths.each_ref().map(|path| shown(path));
+    let c_words = heavy_words("c.log", &LOOK_OFTEN, &[FAKE_TOOL, "mark", &texts[4], "wait", &texts[5]]);
+    let mut b_command = vec![FAKE_TOOL, "spawn-pid", &texts[2], &texts[3], GATE];
+    b_command.extend(c_words);
+    let b_words = heavy_words("b.log", &LOOK_OFTEN, &b_command);
+    let mut a_command = vec![FAKE_TOOL, "spawn-pid", &texts[0], &texts[1], GATE];
+    a_command.extend(b_words);
+    let a_words = heavy_words("a.log", &LOOK_OFTEN, &a_command);
+
+    // O > A > B > C, all three under O's marker. O ends: A takes the one slot, and B and C stand in under A.
+    let (outer, a) = orphaned(&case, &a_words, release);
+    let b = spawned(&case, b_pid);
+    let c = spawned(&case, c_pid);
+    wait_for_file(c_started);
+    let outer_pid = end_parent(outer, release);
+    wait_for_journal_line(&case.root(), &format!(r#""event":"take","pid":{},"#, a.pid));
+    // Each gate's lines reach the `.err` file of the gate whose command it runs as.
+    let (a_err, b_err) = (case.folder().join("a.log.err"), case.folder().join("b.log.err"));
+    let under_a = format!("gate: the parent gate {outer_pid} ended; running under the heavy slot of gate {}", a.pid);
+    assert_eq!(line_with(&a_err, &format!("gate: the parent gate {outer_pid} ended;")), under_a, "B");
+    assert_eq!(line_with(&b_err, &format!("gate: the parent gate {outer_pid} ended;")), under_a, "C");
+
+    // A's command ends, leaving B and C running: B takes the slot A lets go, and C stands in under B.
+    let_go(b_release);
+    assert_eq!(a.ended(), 0);
+    let c_line = line_with(&b_err, &format!("gate: the parent gate {} ended;", a.pid));
+    assert_eq!(
+        c_line,
+        format!("gate: the parent gate {} ended; running under the heavy slot of gate {}", a.pid, b.pid),
+        "C finds B, though B's marker names O and not A"
+    );
+    wait_for_journal_line(&case.root(), &format!(r#""event":"take","pid":{},"#, b.pid));
+    assert_eq!(claimant(&case, KernelObject::HeavySlot(0)), b.pid, "one claim: B's");
+
+    let_go(c_go);
+    assert_eq!(c.ended(), 0);
+    let_go(c_release);
+    assert_eq!(b.ended(), 0);
+    assert_eq!(takers_but(&case, outer_pid), [u64::from(a.pid), u64::from(b.pid)], "one slot at a time");
+    assert_eq!(events_of(&case, c.pid), ["covered"], "C took no slot of its own");
+}
+
+#[test]
+fn a_gate_started_as_its_parent_gate_ends_runs_covered_by_the_gate_whose_command_holds_it() {
+    let case = Case::new("a_gate_started_as_its_parent_gate_ends_runs_covered_by_the_gate_whose_command_holds_it");
+    let paths = ["go", "e.pid", "e.release"].map(|name| case.folder().join(name));
+    let [go, e_pid, e_release] = &paths;
+    let texts = paths.each_ref().map(|path| shown(path));
+    // E judges its marker as any gate does: the marker names this test process, which is live but whose job is gone,
+    // as a parent gate's is between its command's end and its release.
+    let mut a_command = vec![FAKE_TOOL, "wait", &texts[0], "spawn-pid", &texts[1], &texts[2], GATE];
+    a_command.extend(heavy_words("e.log", &[], &[FAKE_TOOL, "exit", "0"]));
+    let a = start(marked(
+        &case,
+        &heavy_words("a.log", &LOOK_OFTEN, &a_command),
+        &test_marker(&case, "heavy"),
+    ));
+    wait_for_journal_line(&case.root(), &format!(r#""event":"covered","pid":{},"#, a.id()));
+
+    let_go(go);
+    let (e, first) = first_event(&case, e_pid);
+    assert_eq!(
+        (&first["event"], &first["parentPid"]),
+        (&Value::from("covered"), &Value::from(a.id())),
+        "E runs under A rather than queueing before its command: {first}"
+    );
+    assert_eq!(e.ended(), 0);
+    let e_log = fs::read_to_string(case.folder().join("e.log")).expect("E wrote its log");
+    assert!(
+        e_log.contains(&format!("gate: running under the heavy slot of gate {}", a.id())) && !e_log.contains("ignored GATE_SLOT_HELD"),
+        "{e_log}"
+    );
+    let_go(e_release);
+    assert_passed(&a.finish());
+    assert_eq!(events_of(&case, e.pid), ["covered"]);
+}
+
+#[test]
+fn a_heavy_gate_under_a_light_covered_gate_takes_its_own_slot_when_their_parent_ends() {
+    let case = Case::new("a_heavy_gate_under_a_light_covered_gate_takes_its_own_slot_when_their_parent_ends");
+    let paths = ["c.pid", "c.release", "c-started", "c-go", "outer.release"].map(|name| case.folder().join(name));
+    let [c_pid, c_release, c_started, c_go, release] = &paths;
+    let texts = paths.each_ref().map(|path| shown(path));
+    let mut a_command = vec![FAKE_TOOL, "spawn-pid", &texts[0], &texts[1], GATE];
+    a_command.extend(heavy_words("c.log", &LOOK_OFTEN, &[FAKE_TOOL, "mark", &texts[2], "wait", &texts[3]]));
+    let a_words = run_words("a.log", &LOOK_OFTEN, &a_command);
+
+    // O (heavy) > A (light) > C (heavy): O's slot covers both.
+    let (outer, a) = orphaned(&case, &a_words, release);
+    let c = spawned(&case, c_pid);
+    wait_for_file(c_started);
+    let outer_pid = end_parent(outer, release);
+    let c_line = line_with(&case.folder().join("a.log.err"), &format!("gate: the parent gate {outer_pid} ended;"));
+    assert_eq!(c_line, parent_ended_line(outer_pid, "heavy"), "A's light slot does not cover C");
+    wait_for_journal_line(&case.root(), &format!(r#""event":"take","pid":{},"#, c.pid));
+    assert_eq!(
+        take_of(&case, c.pid)["slots"],
+        Value::from(vec![slot_name(&case, KernelObject::HeavySlot(0))])
+    );
+    wait_for_journal_line(&case.root(), &format!(r#""event":"take","pid":{},"#, a.pid));
+    assert_eq!(
+        take_of(&case, a.pid)["slots"],
+        Value::from(vec![slot_name(&case, KernelObject::LightSlot(0))])
+    );
+
+    let_go(c_go);
+    assert_eq!(c.ended(), 0);
+    let_go(c_release);
+    assert_eq!(a.ended(), 0);
+    assert_eq!(events_of(&case, c.pid), ["covered", "take", "release"]);
+    assert_eq!(events_of(&case, a.pid), ["covered", "take", "release"]);
+}
+
+#[test]
+fn a_gate_started_after_the_parent_ended_runs_covered_by_the_late_gate() {
+    let case = Case::new("a_gate_started_after_the_parent_ended_runs_covered_by_the_late_gate");
+    write_counts(&case.root(), ONE_HEAVY);
+    let started = case.folder().join("started");
+    let child_go = case.folder().join("child-go");
+    let child_pid = case.folder().join("child.pid");
+    let child_release = case.folder().join("child.release");
+    let release = case.folder().join("outer.release");
+    let texts = [&started, &child_go, &child_pid, &child_release].map(|path| shown(path));
+    let mut command = vec![FAKE_TOOL, "mark", &texts[0], "wait", &texts[1], "spawn-pid", &texts[2], &texts[3], GATE];
+    command.extend(heavy_words("child.log", &[], &[FAKE_TOOL, "exit", "0"]));
+    let inner = heavy_words("inner.log", &LOOK_OFTEN, &command);
+    let (outer, late) = orphaned(&case, &inner, &release);
+    wait_for_file(&started);
+    let outer_pid = end_parent(outer, &release);
+    wait_for_journal_line(&case.root(), &format!(r#""event":"take","pid":{},"#, late.pid));
+
+    // The late gate's command now starts a heavy gate under the ended outer gate's marker, and waits for it to end.
+    let_go(&child_go);
+    let child = spawned(&case, &child_pid);
+    assert_eq!(
+        child.ended(),
+        0,
+        "the gate the late gate's command started ran without waiting for a slot"
+    );
+    assert_eq!(events_of(&case, child.pid), ["covered"], "it took no slot of its own");
+    let line = events(&case)
+        .into_iter()
+        .find(|event| event["event"] == "covered" && event["pid"] == child.pid)
+        .expect("checked above");
+    assert_eq!(line["parentPid"], Value::from(late.pid), "it runs under the late gate, not the ended one");
+    assert_eq!(claimant(&case, KernelObject::HeavySlot(0)), late.pid, "one claim: the late gate's");
+    let child_log = fs::read_to_string(case.folder().join("child.log")).expect("the child gate wrote its log");
+    assert!(
+        child_log.contains(&format!("gate: running under the heavy slot of gate {}", late.pid)),
+        "{child_log}"
+    );
+    assert!(
+        !child_log.contains(&format!("gate {outer_pid} is no longer running")),
+        "it does not ignore the marker as an ended gate's: {child_log}"
+    );
+
+    let_go(&child_release);
+    assert_eq!(late.ended(), 0);
+    assert_eq!(events_of(&case, late.pid), ["covered", "take", "release"]);
+}
+
+#[test]
+fn a_nested_chain_whose_parent_ended_holds_one_slot() {
+    let case = Case::new("a_nested_chain_whose_parent_ended_holds_one_slot");
+    write_counts(&case.root(), ONE_HEAVY);
+    let started = case.folder().join("started");
+    let go = case.folder().join("go");
+    let release = case.folder().join("outer.release");
+    let (started_text, go_text) = (shown(&started), shown(&go));
+    let mut command = vec![GATE];
+    command.extend(heavy_words(
+        "nested.log",
+        &LOOK_OFTEN,
+        &[FAKE_TOOL, "mark", &started_text, "wait", &go_text],
+    ));
+    let inner = heavy_words("inner.log", &LOOK_OFTEN, &command);
+    let (outer, late) = orphaned(&case, &inner, &release);
+    wait_for_file(&started);
+    let nested = events(&case)
+        .into_iter()
+        .find(|event| event["event"] == "covered" && event["pid"] != late.pid)
+        .and_then(|event| event["pid"].as_u64())
+        .expect("the nested gate is covered too");
+
+    let outer_pid = end_parent(outer, &release);
+    wait_for_journal_line(&case.root(), &format!(r#""event":"take","pid":{},"#, late.pid));
+    // The nested gate runs as the late gate's command, so its lines reach the late gate's `.err` file as it says them.
+    let err = case.folder().join("inner.log.err");
+    let taken_up = format!(
+        "gate: the parent gate {outer_pid} ended; running under the heavy slot of gate {}",
+        late.pid
+    );
+    wait_until("the nested gate staying covered by the late gate", || {
+        fs::read_to_string(&err).is_ok_and(|text| text.contains(&taken_up))
+    });
+    assert!(!has_tickets(&case), "the nested gate never queued for a slot");
+    assert_eq!(claimant(&case, KernelObject::HeavySlot(0)), late.pid, "one claim: the late gate's");
+
+    let_go(&go);
+    assert_eq!(late.ended(), 0);
+    let takes: Vec<u64> = events(&case)
+        .into_iter()
+        .filter(|event| event["event"] == "take" && event["pid"] != outer_pid)
+        .filter_map(|event| event["pid"].as_u64())
+        .collect();
+    assert_eq!(takes, [u64::from(late.pid)], "one take after the outer gate's: the late gate's");
+    let nested_events: Vec<String> = events(&case)
+        .into_iter()
+        .filter(|event| event["pid"] == nested)
+        .map(|event| event["event"].as_str().expect("a line names its event").to_owned())
+        .collect();
+    assert_eq!(nested_events, ["covered"]);
+}
+
+/// Lets the outer gate's command end, which leaves the covered gate running, and waits for the outer gate to pass;
+/// the outer gate's pid.
+pub(crate) fn end_parent(outer: Running, release: &Path) -> u32 {
+    let pid = outer.id();
+    let_go(release);
+    assert_passed(&outer.finish());
+    pid
+}
+
+/// The full name of the slot `object` under the case root.
+fn slot_name(case: &Case, object: KernelObject) -> String {
+    StateRoot::new(&shown(&case.root()), None).object_name(object)
+}
+
+/// The pid the claim of the slot `object` under the case root names, once it is written: a gate journals its `take`
+/// before it writes its claim.
+fn claimant(case: &Case, object: KernelObject) -> u32 {
+    let claim = v1::claim_path(&case.root(), object).expect("a pool's slot has a claim");
+    wait_for_file(&claim);
+    v1::read_claim(&claim).expect("the slot's claim can be read").pid
+}
+
+/// The line a covered gate of `kind` says when its parent gate `pid` ends as its command runs.
+fn parent_ended_line(pid: u32, kind: &str) -> String {
+    format!("gate: the parent gate {pid} ended; taking a {kind} slot for the rest of this run")
+}
+
+/// Runs a `kind` gate covered by a heavy outer gate that ends while the covered gate's command still runs, and asserts
+/// that the covered gate says so, takes the slot `object` of its kind naming the ended parent, claims it while its
+/// command runs and releases it at its end.
+fn a_covered_gate_takes_a_slot_when_its_parent_gate_ends_as(name: &str, kind: &str, object: KernelObject) {
+    let case = Case::new(name);
+    let started = case.folder().join("started");
+    let go = case.folder().join("go");
+    let release = case.folder().join("outer.release");
+    let (started_text, go_text) = (shown(&started), shown(&go));
+    let mut inner = run_words("inner.log", &LOOK_OFTEN, &[FAKE_TOOL, "mark", &started_text, "wait", &go_text]);
+    inner[2] = kind;
+    let (outer, orphan) = orphaned(&case, &inner, &release);
+    wait_for_file(&started);
+
+    let outer_pid = end_parent(outer, &release);
+    wait_for_journal_line(&case.root(), &format!(r#""event":"take","pid":{},"#, orphan.pid));
+    let take = take_of(&case, orphan.pid);
+    assert_eq!(
+        (&take["slots"], &take["parentPid"]),
+        (&Value::from(vec![slot_name(&case, object)]), &Value::from(outer_pid)),
+        "{take}"
+    );
+    assert_eq!(
+        claimant(&case, object),
+        orphan.pid,
+        "the covered gate claims its slot while its command runs"
+    );
+
+    let_go(&go);
+    assert_eq!(orphan.ended(), 0);
+    let claim = v1::claim_path(&case.root(), object).expect("a pool's slot has a claim");
+    assert!(!claim.exists(), "the claim goes with the release");
+    assert_eq!(events_of(&case, orphan.pid), ["covered", "take", "release"]);
+    assert_eq!(covered_files(&case), Vec::<String>::new(), "the covered marker goes with the release");
+    let inner_log = fs::read_to_string(case.folder().join("inner.log")).expect("the covered gate wrote its log");
+    assert_in_order(
+        &inner_log,
+        &[
+            &format!("gate: running under the heavy slot of gate {outer_pid}"),
+            &parent_ended_line(outer_pid, kind),
+        ],
+    );
+}
+
+#[test]
+fn a_covered_gate_takes_a_slot_when_its_parent_gate_ends() {
+    a_covered_gate_takes_a_slot_when_its_parent_gate_ends_as(
+        "a_covered_gate_takes_a_slot_when_its_parent_gate_ends",
+        "heavy",
+        KernelObject::HeavySlot(0),
+    );
+}
+
+#[test]
+fn a_covered_light_gate_takes_a_light_slot() {
+    a_covered_gate_takes_a_slot_when_its_parent_gate_ends_as("a_covered_light_gate_takes_a_light_slot", "light", KernelObject::LightSlot(0));
+}
+
+/// A light pool of one slot.
+const ONE_LIGHT: &str = r#"{"v":1,"light":1}"#;
+
+/// Starts a light gate whose command holds its slot until `go` exists, and returns once it has taken the slot.
+fn light_holder(case: &Case, go: &Path) -> Running {
+    let go = shown(go);
+    let holder = case.start(&run_words("holder.log", &[], &[FAKE_TOOL, "out", "holding", "wait", &go]));
+    wait_for_journal_line(&case.root(), &format!(r#""event":"take","pid":{},"#, holder.id()));
+    holder
+}
+
+/// The size of the file at `path`.
+fn size(path: &Path) -> u64 {
+    fs::metadata(path).expect("the file's size can be read").len()
+}
+
+#[test]
+fn a_covered_gate_waits_for_a_slot_without_pausing_its_command() {
+    let case = Case::new("a_covered_gate_waits_for_a_slot_without_pausing_its_command");
+    write_counts(&case.root(), ONE_LIGHT);
+    let holder_go = case.folder().join("holder-go");
+    let holder = light_holder(&case, &holder_go);
+    let go = case.folder().join("go");
+    let release = case.folder().join("outer.release");
+    let go_text = shown(&go);
+    let inner = run_words("inner.log", &LOOK_OFTEN, &[FAKE_TOOL, "chatter", &go_text]);
+    let (outer, orphan) = orphaned(&case, &inner, &release);
+
+    let outer_pid = end_parent(outer, &release);
+    wait_until("the covered gate queueing for a light slot", || has_tickets(&case));
+    let log = case.folder().join("inner.log");
+    let queued_size = size(&log);
+    wait_until("the covered gate's command writing on as the gate waits", || size(&log) > queued_size);
+    assert_eq!(events_of(&case, orphan.pid), ["covered"], "no take while the one light slot is held");
+
+    let_go(&holder_go);
+    assert_passed(&holder.finish());
+    wait_for_journal_line(&case.root(), &format!(r#""event":"take","pid":{},"#, orphan.pid));
+    let take = take_of(&case, orphan.pid);
+    assert_eq!(take["parentPid"], Value::from(outer_pid));
+    assert!(take["waitedSeconds"].as_f64().expect("a take has its wait") > 0.0, "{take}");
+
+    let_go(&go);
+    assert_eq!(orphan.ended(), 0);
+    assert_eq!(events_of(&case, orphan.pid), ["covered", "take", "release"]);
+    let inner_log = fs::read_to_string(&log).expect("the covered gate wrote its log");
+    assert_in_order(
+        &inner_log,
+        &[&parent_ended_line(outer_pid, "light"), "gate: waiting for a light slot (1 busy)"],
+    );
+}
+
+#[test]
+fn a_covered_gate_whose_command_ends_while_waiting_says_nothing_more() {
+    let case = Case::new("a_covered_gate_whose_command_ends_while_waiting_says_nothing_more");
+    write_counts(&case.root(), ONE_LIGHT);
+    let holder_go = case.folder().join("holder-go");
+    let holder = light_holder(&case, &holder_go);
+    let go = case.folder().join("go");
+    let release = case.folder().join("outer.release");
+    let go_text = shown(&go);
+    // A still-waiting line is due on every pass of the wait, so a pass after the command's end would say one.
+    let seams = ["--test-sample-ms", "100", "--test-poll-ms", "20", "--test-heartbeat-ms", "1"];
+    let inner = run_words("inner.log", &seams, &[FAKE_TOOL, "wait", &go_text]);
+    let (outer, orphan) = orphaned(&case, &inner, &release);
+
+    let outer_pid = end_parent(outer, &release);
+    wait_until("the covered gate queueing for a light slot", || has_tickets(&case));
+    let_go(&go);
+    assert_eq!(orphan.ended(), 0);
+
+    assert_eq!(events_of(&case, orphan.pid), ["covered"], "no take and no release");
+    assert!(!has_tickets(&case), "the covered gate's ticket is deleted");
+    assert_eq!(claimant(&case, KernelObject::LightSlot(0)), holder.id(), "only the holder claims a slot");
+    assert_eq!(covered_files(&case), Vec::<String>::new(), "the covered marker goes with the run");
+    let inner_log = fs::read_to_string(case.folder().join("inner.log")).expect("the covered gate wrote its log");
+    assert_in_order(
+        &inner_log,
+        &[&parent_ended_line(outer_pid, "light"), "gate: waiting for a light slot (1 busy)"],
+    );
+    let (waiting, ended) = inner_log.split_once("gate: passed in").expect("the covered gate passed");
+    assert!(
+        !waiting.contains("gate: interrupted") && !waiting.contains("gate: took"),
+        "the wait ends silently: {inner_log}"
+    );
+    assert!(
+        !ended.contains("gate: still waiting") && !ended.contains("gate: waiting"),
+        "no line of the wait follows the run's end: {inner_log}"
+    );
+
+    let_go(&holder_go);
+    assert_passed(&holder.finish());
 }
 
 #[test]

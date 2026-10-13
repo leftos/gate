@@ -300,26 +300,8 @@ impl<'a> Wait<'a> {
     /// limit, which ends the wait at once; timed out when a pass fails at or after the wait's limit.
     pub(crate) fn until_taken(&mut self, survey: &mut Survey, console: &mut Console) -> Waited {
         loop {
-            if self.waiter.interrupted() {
-                return Waited::Interrupted;
-            }
-            let (count, light) = self.counts(console);
-            let others = live_others(self.root, survey, console);
-            if self.lent(&others, light, survey, console) {
-                return Waited::Lent;
-            }
-            self.barrier = self.barrier_in(&others);
-            self.pause.refresh(self.barrier.is_some(), console);
-            let (range, probe) = self.range(count, survey, console);
-            let (may_try, probe) = self.may_try(&others, range.clone(), probe, survey, console);
-            if may_try && let Some(taken) = slots::try_pool(self.root, self.pool, range.clone(), survey, console) {
-                return Waited::Taken(taken);
-            }
-            if !self.said_waiting {
-                self.say_waiting(probe, range, survey, console);
-            }
-            if let Some(ended) = self.pass_ended() {
-                return ended;
+            if let Some(waited) = self.pass(survey, console) {
+                return waited;
             }
             self.waiter.sleep(self.limit, console);
             if self.waiter.interrupted() {
@@ -327,6 +309,37 @@ impl<'a> Wait<'a> {
             }
             self.say_heartbeat(console);
         }
+    }
+
+    /// One pass of the wait, which never sleeps: reads the counts and the tickets, ends the wait when the gate's light
+    /// parent lends it its slot, tries the slots a critical request ahead leaves it when fewer live tickets of the
+    /// gate's kind are ahead of it than those slots are free, and says the gate waits the first time it finds none free.
+    /// How the wait ended on this pass, or `None` while it goes on.
+    pub(crate) fn pass(&mut self, survey: &mut Survey, console: &mut Console) -> Option<Waited> {
+        if self.waiter.interrupted() {
+            return Some(Waited::Interrupted);
+        }
+        let (count, light) = self.counts(console);
+        let others = live_others(self.root, survey, console);
+        if self.lent(&others, light, survey, console) {
+            return Some(Waited::Lent);
+        }
+        self.barrier = self.barrier_in(&others);
+        self.pause.refresh(self.barrier.is_some(), console);
+        let (range, probe) = self.range(count, survey, console);
+        let (may_try, probe) = self.may_try(&others, range.clone(), probe, survey, console);
+        if may_try && let Some(taken) = slots::try_pool(self.root, self.pool, range.clone(), survey, console) {
+            return Some(Waited::Taken(taken));
+        }
+        if !self.said_waiting {
+            self.say_waiting(probe, range, survey, console);
+        }
+        self.pass_ended()
+    }
+
+    /// The fallback poll of this wait: the longest a waiter goes between two passes (`--test-poll-ms`, else 2 s).
+    pub(crate) fn poll(&self) -> Duration {
+        self.waiter.poll
     }
 
     /// Whether this pass ended the wait, and how. The console is read first, so a Ctrl+C raised by this pass's own
@@ -510,7 +523,7 @@ impl<'a> Wait<'a> {
 
     /// Says the still-waiting line when it is due, with the whole seconds since the gate queued; a light gate held
     /// back by a critical request names it.
-    fn say_heartbeat(&mut self, console: &mut Console) {
+    pub(crate) fn say_heartbeat(&mut self, console: &mut Console) {
         if let Some(waited) = self.waiter.heartbeat_due() {
             let place = match (self.pool, self.barrier) {
                 (Pool::Local(SlotKind::Light), Some(barrier)) => beside_place(barrier.pid),
@@ -643,15 +656,180 @@ pub(crate) fn processors(console: &mut Console) -> usize {
     )
 }
 
+/// What the unit tests of a wait over a real state root share: a scratch root, a request of this test process, and a
+/// slot held by another thread, as another gate holds one.
 #[cfg(test)]
+#[expect(clippy::expect_used, reason = "a scratch root or a slot the test cannot set up must fail the test loudly")]
+pub(crate) mod scratch {
+    use std::ffi::OsString;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::mpsc;
+    use std::thread;
+
+    use gate_args::{RunRequest, Slot, Spelling, TestSeams};
+    use gate_state::{KernelObject, StateRoot, v1};
+
+    use crate::acquire;
+    use crate::resolve::ResolvedRoot;
+
+    /// A state root for one test, its folder removed when it ends.
+    pub(crate) struct Scratch {
+        pub root: ResolvedRoot,
+    }
+
+    impl Scratch {
+        /// A fresh root named after `test` and this process, so no two tests share one.
+        pub(crate) fn new(test: &str) -> Scratch {
+            let folder = std::env::temp_dir().join(format!("gate-wait-{}-{test}", std::process::id()));
+            // A folder an earlier run of this test left behind is cleared; one that is not there is no failure.
+            let _ = fs::remove_dir_all(&folder);
+            fs::create_dir_all(&folder).expect("the scratch folder can be made");
+            let root = StateRoot::new(folder.to_str().expect("the scratch folder has a Unicode path"), None);
+            Scratch {
+                root: ResolvedRoot { path: folder, root },
+            }
+        }
+
+        /// The root's folder.
+        pub(crate) fn path(&self) -> &Path {
+            &self.root.path
+        }
+
+        /// The full name of `object` under the root.
+        pub(crate) fn name(&self, object: KernelObject) -> String {
+            self.root.root.object_name(object)
+        }
+
+        /// Makes the root's light pool one slot.
+        pub(crate) fn one_light_slot(&self) {
+            fs::write(v1::counts_path(self.path()), r#"{"v":1,"light":1}"#).expect("the counts file can be written");
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            // A folder a test still holds a file of is left for the next run to clear.
+            let _ = fs::remove_dir_all(&self.root.path);
+        }
+    }
+
+    /// A run of `slot` of `fake-tool exit 0`, as the gate reads one, logging to `out.log`, whose still-waiting lines come
+    /// an hour apart, so no test's lines depend on how long it took.
+    pub(crate) fn request(slot: Slot) -> RunRequest {
+        let test_seams = TestSeams {
+            heartbeat_ms: Some(3_600_000),
+            ..TestSeams::default()
+        };
+        RunRequest {
+            slot,
+            timeout: 60,
+            log: PathBuf::from("out.log"),
+            stall: 60,
+            tail: 0,
+            no_markers: false,
+            local: false,
+            bring_tracked: Vec::new(),
+            state_dir: None,
+            command: ["fake-tool", "exit", "0"].into_iter().map(OsString::from).collect(),
+            test_seams,
+            print_request: false,
+            spelling: Spelling::Cli,
+        }
+    }
+
+    /// A slot held by a thread of its own, as another gate holds one: the mutex is let go on that thread when this is
+    /// dropped.
+    pub(crate) struct Holder {
+        go: Option<mpsc::Sender<()>>,
+        thread: Option<thread::JoinHandle<()>>,
+    }
+
+    impl Holder {
+        /// Takes the mutex `name` on a thread of its own, and returns once it holds it.
+        pub(crate) fn take(name: String) -> Holder {
+            let (taken, has_taken) = mpsc::channel();
+            let (go, wait_for_go) = mpsc::channel::<()>();
+            let thread = thread::spawn(move || {
+                let guard = acquire::try_slot(&name).expect("the slot can be tried").expect("the slot is free");
+                taken.send(()).expect("the test waits for the take");
+                // The sender dropped is the signal: the guard goes on this thread, which owns the mutex.
+                let _ = wait_for_go.recv();
+                drop(guard);
+            });
+            has_taken.recv().expect("the holder took the slot");
+            Holder {
+                go: Some(go),
+                thread: Some(thread),
+            }
+        }
+    }
+
+    impl Drop for Holder {
+        fn drop(&mut self) {
+            drop(self.go.take());
+            if let Some(thread) = self.thread.take() {
+                thread.join().expect("the holder let the slot go");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+#[expect(clippy::expect_used, reason = "a wait the test cannot set up must fail the test loudly")]
 mod tests {
-    use gate_state::SlotKind;
-    use gate_state::v1::{Ticket, TicketKind};
+    use gate_args::Slot;
+    use gate_state::v1::{self, Ticket, TicketKind};
+    use gate_state::{KernelObject, SlotKind};
 
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
-    use super::{Barrier, LendFacts, barrier, first_heartbeat, lends, slot_range};
-    use crate::slots;
+    use super::scratch::{Holder, Scratch, request};
+    use super::{Arrival, Barrier, Host, LendFacts, Wait, Waited, barrier, first_heartbeat, lends, slot_range};
+    use crate::console::Console;
+    use crate::slots::{self, Pool, Survey, ThisGate};
+
+    #[test]
+    fn a_pass_waits_while_the_pool_is_full_and_takes_the_slot_once_it_frees() {
+        let scratch = Scratch::new("one-pass");
+        scratch.one_light_slot();
+        let request = request(Slot::Light);
+        let gate = ThisGate::read(&request).expect("this process's start can be read");
+        let mut survey = Survey::new(&gate);
+        let mut console = Console::new();
+        let holder = Holder::take(scratch.name(KernelObject::LightSlot(0)));
+        let arrival = Arrival {
+            gate: &gate,
+            request: &request,
+            queued: Instant::now(),
+            arrived: gate.start_ms,
+            builder: None,
+            after_fallback: false,
+            under: None,
+        };
+        let host = Host {
+            processors: 4,
+            interrupt: None,
+        };
+        let mut wait = Wait::queue(&scratch.root, Pool::Local(SlotKind::Light), arrival, host, &mut console);
+        let ticket = v1::ticket_path(scratch.path(), gate.pid, gate.start_ms);
+
+        assert!(wait.pass(&mut survey, &mut console).is_none(), "the one light slot is held");
+        assert_eq!(console.take_notes(), ["gate: waiting for a light slot (1 busy)"]);
+        assert!(wait.pass(&mut survey, &mut console).is_none(), "still held");
+        assert!(console.take_notes().is_empty(), "the waiting line is said once");
+        assert!(ticket.exists(), "the gate keeps its ticket while it waits");
+
+        drop(holder);
+        let taken = match wait.pass(&mut survey, &mut console) {
+            Some(Waited::Taken(taken)) => Some(taken),
+            _ => None,
+        }
+        .expect("the freed slot is taken on the next pass");
+        assert_eq!(taken.held.name(), scratch.name(KernelObject::LightSlot(0)));
+        wait.end(&mut console);
+        assert!(!ticket.exists(), "the wait's end deletes the ticket");
+    }
 
     /// A ticket of the gate `pid`, started at `pid * 10` ms, of `kind`, arrived at `arrived`.
     fn ticket(kind: TicketKind, arrived: u64, pid: u32) -> Ticket {

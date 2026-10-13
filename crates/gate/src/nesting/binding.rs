@@ -5,6 +5,7 @@
 //! opened. A process the walk cannot open, for any reason, unbinds the marker: the snapshot opened it with the same
 //! access, so it changed since, and a race a process can retry must not cover it.
 
+use std::borrow::Borrow;
 use std::io;
 
 use gate_state::{KernelObject, StateRoot};
@@ -41,6 +42,11 @@ pub(crate) struct Gates {
 /// Whether this gate runs inside the command of the gate `pid` started at `start_ms` under `root`, as [`runs_inside`]
 /// judges it from that gate's job, opened to list, this gate's own start and one snapshot without command lines.
 pub(crate) fn runs_inside_command_of(root: &StateRoot, pid: u32, start_ms: u64) -> Binding {
+    runs_inside_command_with(root, pid, start_ms, snapshot)
+}
+
+/// [`runs_inside_command_of`], the snapshot given by `tree` when it is needed, so several judgements can share one.
+pub(crate) fn runs_inside_command_with<T: Borrow<ProcessTree>>(root: &StateRoot, pid: u32, start_ms: u64, tree: impl FnOnce() -> T) -> Binding {
     let name = root.object_name(KernelObject::Job { gate_pid: pid });
     let gates = Gates {
         own: std::process::id(),
@@ -50,22 +56,33 @@ pub(crate) fn runs_inside_command_of(root: &StateRoot, pid: u32, start_ms: u64) 
         parent: pid,
         parent_start_ms: start_ms,
     };
-    runs_inside(
-        OpenedJob::open_to_list(&name),
-        || ProcessTree::new(Win32ProcessTable.snapshot_without_command_lines()),
-        &gates,
-        OpenedJob::holds,
-    )
+    runs_inside(OpenedJob::open_to_list(&name), tree, &gates, OpenedJob::holds)
+}
+
+/// A snapshot of the processes without their command lines, as the walk reads it.
+pub(crate) fn snapshot() -> ProcessTree {
+    ProcessTree::new(Win32ProcessTable.snapshot_without_command_lines())
+}
+
+/// Whether the job of the gate `pid` under `root` holds this gate's own process, by the start its own handle gives:
+/// the question [`runs_inside`] asks first, with no snapshot. False when the job cannot be opened, this gate's start
+/// cannot be read or the query fails, which the walk would ask about again.
+pub(crate) fn holds_this_gate(root: &StateRoot, pid: u32) -> bool {
+    let name = root.object_name(KernelObject::Job { gate_pid: pid });
+    let Ok(Some(job)) = OpenedJob::open_to_list(&name) else {
+        return false;
+    };
+    gate_win32::process_start().is_ok_and(|created| matches!(job.holds(std::process::id(), created), Ok(Membership::Member)))
 }
 
 /// Whether the gate `gates.own` runs inside the command whose job is `job`, as opened. Outside when no job has the name,
 /// and when the name opens with an error other than access denied, as when another kind of object holds it. A job
 /// this gate may not open, as an elevated parent's, is unjudged under a parent among this gate's ancestors in the
-/// snapshot `tree` takes, and outside under any other. A job that opens is asked first whether it holds this gate
+/// snapshot `tree` gives, and outside under any other. A job that opens is asked first whether it holds this gate
 /// itself, by the start its own handle gives, with no snapshot taken; when it does not, the [`walk`] judges.
-pub(crate) fn runs_inside<J>(
+pub(crate) fn runs_inside<J, T: Borrow<ProcessTree>>(
     job: io::Result<Option<J>>,
-    tree: impl FnOnce() -> ProcessTree,
+    tree: impl FnOnce() -> T,
     gates: &Gates,
     holds: impl Fn(&J, u32, Timestamp) -> io::Result<Membership>,
 ) -> Binding {
@@ -78,10 +95,10 @@ pub(crate) fn runs_inside<J>(
             if holds_itself {
                 Binding::Inside
             } else {
-                walk(&job, &tree(), gates.own, holds)
+                walk(&job, tree().borrow(), gates.own, holds)
             }
         }
-        Err(error) if error.raw_os_error() == Some(ERROR_ACCESS_DENIED) => denied(&error, &tree(), gates),
+        Err(error) if error.raw_os_error() == Some(ERROR_ACCESS_DENIED) => denied(&error, tree().borrow(), gates),
         // No job has the name, or the name opens as something no gate made: whoever holds it is not this gate's parent.
         Ok(None) | Err(_) => Binding::Outside,
     }

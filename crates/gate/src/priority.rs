@@ -105,6 +105,12 @@ impl Prioritizer<'static> {
 }
 
 impl Prioritizer<'_> {
+    /// Moves the servers as a gate that is `high` or not from the next pass on: a gate that ran on a critical parent's
+    /// slot is no longer High once it took a slot of its own kind.
+    pub(crate) fn set_high(&mut self, high: bool) {
+        self.high = high;
+    }
+
     /// One sample's pass over the `servers` it classified: every classified server is moved, the old `MSBuild` nodes
     /// and other gates' compiler servers included, and a High gate's own job's too. `guard` is read at most once, on
     /// the first server the pass would move.
@@ -180,6 +186,11 @@ impl<'a> OtherGates<'a> {
             survey,
             said: HashSet::new(),
         }
+    }
+
+    /// Reads the other gates' facts as a gate that is `high` or not from the next pass on ([`Prioritizer::set_high`]).
+    pub(crate) fn set_high(&mut self, high: bool) {
+        self.high = high;
     }
 
     /// Whether a critical ticket under this root holds the machine, and the pids of the gates holding it. Dead tickets

@@ -139,6 +139,7 @@ fn covered_keys_follow_dashboard_order() {
         command: "cargo fmt --check".to_owned(),
         cwd: r"C:\work\repo".to_owned(),
         since: ms(NOW),
+        kind: None,
     };
     v1::write_covered(&v1::covered_path(&machine.v1_root(), 54000, ms(START)), &marker).expect("the marker can be written");
     let state = serde_json::to_value(machine.state()).expect("the state serialises");
