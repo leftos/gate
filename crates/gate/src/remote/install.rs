@@ -4,9 +4,10 @@
 //! tracked (its git index, a submodule or a nested repository holds it) unless a `--bring-tracked` glob matches it, or
 //! whose PC file is in use or read-only, skipped and said;
 //! the box's work folder rewritten to the worktree's in the files that record it; and each file, its last write clamped
-//! to this PC's clock in the stage and checked unchanged once more, moved into place. The success line says what came
-//! back; every end removes the archive and the stage this run made, and only a success that skipped nothing clears the
-//! pending marker.
+//! to this PC's clock in the stage and checked unchanged once more, moved into place. A complete install also keeps the
+//! hash of each file it put in place, at the stamp that file's handle reads after the move, in the worktree's hash
+//! cache, so the next run takes it instead of reading the file again. The success line says what came back; every end
+//! removes the archive and the stage this run made, and only a success that skipped nothing clears the pending marker.
 
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
@@ -16,13 +17,15 @@ use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime};
 
-use windows_sys::Win32::Storage::FileSystem::FILE_WRITE_ATTRIBUTES;
+use gate_state::v1;
+use windows_sys::Win32::Storage::FileSystem::{FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES};
 
 use super::client::{Attempt, End};
 use super::git::{Git, GitError};
 use super::outputs::{self, Archive, Polled};
 use crate::boxside::payload::{escaped, ordinal_upper};
 use crate::outputs::archive::{Entry, check_folder, unpack};
+use crate::outputs::cache::{HashCache, file_time_now};
 use crate::outputs::glob::Globs;
 use crate::outputs::manifest::Manifest;
 use crate::outputs::walk::{Stamp, in_context};
@@ -53,13 +56,23 @@ pub(super) struct Fetched<'f> {
     pub(super) started: Instant,
 }
 
-/// What an install put into the worktree: its files, their bytes, and the archive's bytes; and the paths of the files
-/// it skipped, each with why.
+/// What an install put into the worktree: its files, their bytes, and the archive's bytes; the paths of the files it
+/// skipped, each with why; and the files it moved into place, for the hash cache it keeps ([`cached`]).
 struct Installed {
     count: usize,
     bytes: u64,
     compressed: u64,
     skipped: Vec<(String, Skip)>,
+    /// Each file the install moved into place, with the stamp its handle read after the move.
+    moved: Vec<Moved>,
+}
+
+/// A file the install moved into place: the archive's entry for it, whose SHA-256 [`unpack`] verified against the
+/// staged bytes, and the stamp the installed file's handle reads after the move; none when that read failed.
+#[derive(Debug, PartialEq, Eq)]
+struct Moved {
+    entry: Entry,
+    stamp: Option<Stamp>,
 }
 
 /// Why the install skipped a member, which then counts as not brought back.
@@ -105,11 +118,13 @@ enum Unmoved {
 /// A refusal says why the outputs were not brought back and ends the run 1; a Ctrl+C ends it as an interrupt, saying how
 /// many files were installed when any were ([`ending`]). Every end removes the archive and the stage folder this run
 /// made, never one that was there before, saying a removal that fails; only a success that skipped nothing clears the
-/// marker. With the end, whether the install was complete: a success that skipped nothing.
+/// marker, and only one keeps the hashes of the files it put in place ([`cached`]), which no other end does.
+/// With the end, whether the install was complete: a success that skipped nothing.
 pub(super) fn installed(attempt: &mut Attempt<'_, '_>, fetched: &Fetched<'_>) -> (End, bool) {
     let staged = Cell::new(false);
     let (end, lines, complete) = match install(attempt, fetched, &staged) {
-        Ok(done) => {
+        Ok((done, started)) => {
+            cached(&v1::outputs_hashes_path(attempt.call.state_dir, attempt.call.key), &done, started);
             let lines = said(&done, fetched.started.elapsed().as_secs_f64());
             (End::Status(0), lines, done.skipped.is_empty())
         }
@@ -148,8 +163,9 @@ fn ending(unmet: Unmet) -> (End, Option<String>) {
 }
 
 /// Installs the archive `fetched` holds into the attempt's worktree, as [`installed`] says, marking `staged` once the
-/// unpack ended having made the stage folder ([`stage_made`]).
-fn install(attempt: &Attempt<'_, '_>, fetched: &Fetched<'_>, staged: &Cell<bool>) -> Result<Installed, Unmet> {
+/// unpack ended having made the stage folder ([`stage_made`]); what it installed, and the file time its moves began,
+/// which the hash cache keeps their hashes against ([`cached`]).
+fn install(attempt: &Attempt<'_, '_>, fetched: &Fetched<'_>, staged: &Cell<bool>) -> Result<(Installed, u64), Unmet> {
     let path = fetched.archive.path();
     let name = path
         .file_name()
@@ -178,7 +194,9 @@ fn install(attempt: &Attempt<'_, '_>, fetched: &Fetched<'_>, staged: &Cell<bool>
     rewritten(&fetched.stage, &entries, fetched.box_work, &pc_root).map_err(Unmet::Refused)?;
     let raise = attempt.call.interrupt.filter(|_| attempt.raises_at(INSTALL));
     let total = entries.len();
-    moved(&fetched.stage, &root, &entries, fetched.manifest, |done| {
+    // The file time the moves begin at, from which the racy rule keeps the hash of a file written long enough before.
+    let started = file_time_now();
+    let moved = moved(&fetched.stage, &root, &entries, fetched.manifest, |done| {
         if done == 1
             && let Some(interrupt) = raise
         {
@@ -190,12 +208,16 @@ fn install(attempt: &Attempt<'_, '_>, fetched: &Fetched<'_>, staged: &Cell<bool>
         Unmoved::Interrupted { done } => Unmet::Interrupted { done, total },
         Unmoved::Failed(reason) => Unmet::Refused(reason),
     })?;
-    Ok(Installed {
-        count: total,
-        bytes: entries.iter().map(|entry| entry.size).sum(),
-        compressed,
-        skipped,
-    })
+    Ok((
+        Installed {
+            count: total,
+            bytes: entries.iter().map(|entry| entry.size).sum(),
+            compressed,
+            skipped,
+            moved,
+        },
+        started,
+    ))
 }
 
 /// What the install skips of `entries`, below the worktree `root`, `in_use` being the paths of those whose PC file is in
@@ -539,25 +561,30 @@ fn replaced(text: &str, from: &str, to: &str) -> String {
 
 /// Moves each of `entries` from `stage` into place below `root`, as [`move_one`] does against `manifest`, asking
 /// `go_on`, given the files moved so far, before each one; else the interrupt once `go_on` says no, or why a file
-/// failed, the files moved before it counted and left in place.
-fn moved(stage: &Path, root: &Path, entries: &[Entry], manifest: &Manifest, mut go_on: impl FnMut(usize) -> bool) -> Result<(), Unmoved> {
+/// failed, the files moved before it counted and left in place. Each file moved is returned with the stamp its handle
+/// read after the move, none when that read failed.
+fn moved(stage: &Path, root: &Path, entries: &[Entry], manifest: &Manifest, mut go_on: impl FnMut(usize) -> bool) -> Result<Vec<Moved>, Unmoved> {
     let now = SystemTime::now();
     let total = entries.len();
+    let mut moved = Vec::with_capacity(total);
     for (done, entry) in entries.iter().enumerate() {
         if !go_on(done) {
             return Err(Unmoved::Interrupted { done });
         }
-        move_one(stage, root, entry, manifest, now)
+        let stamp = move_one(stage, root, entry, manifest, now)
             .map_err(|error| Unmoved::Failed(format!("{done} of {total} files were installed before {} failed: {error}", entry.path)))?;
+        moved.push(Moved { entry: entry.clone(), stamp });
     }
-    Ok(())
+    Ok(moved)
 }
 
 /// Moves the staged file of `entry` below `stage` to the same path below `root`, replacing a file there, each folder
 /// between `root` and it made when missing and refused when it is a link, a junction or not a folder. Its last write,
 /// when past `now`, is set to `now` in the stage, before the move; the PC's file is then checked unchanged since
-/// `manifest` once more ([`unchanged`]), just before the move.
-fn move_one(stage: &Path, root: &Path, entry: &Entry, manifest: &Manifest, now: SystemTime) -> io::Result<()> {
+/// `manifest` once more ([`unchanged`]), just before the move. The stamp read after the move through a handle opened on
+/// the staged file before it, the clamp included, is returned: the moved file's own, never that of a file put at its
+/// path after the move. None when the handle cannot be opened or read, which costs the file its hash cache entry only.
+fn move_one(stage: &Path, root: &Path, entry: &Entry, manifest: &Manifest, now: SystemTime) -> io::Result<Option<Stamp>> {
     let path = entry.path.as_str();
     let source = below(stage, path);
     let (parents, _) = path.rsplit_once('/').unwrap_or(("", path));
@@ -575,7 +602,42 @@ fn move_one(stage: &Path, root: &Path, entry: &Entry, manifest: &Manifest, now: 
         OpenOptions::new().access_mode(FILE_WRITE_ATTRIBUTES).open(&source)?.set_modified(now)?;
     }
     unchanged(root, entry, manifest).map_err(io::Error::other)?;
-    fs::rename(&source, below(root, path))
+    // Its attributes alone, every sharing given: the handle neither refuses the move nor any other opener.
+    let handle = OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .open(&source);
+    fs::rename(&source, below(root, path))?;
+    // No stamp is the right answer for a handle that cannot be opened or read: the file is installed, its hash not kept.
+    Ok(handle.and_then(|file| file.metadata()).ok().map(|metadata| Stamp::of(&metadata)))
+}
+
+/// Writes the hash cache at `path` for the files an install put in place: an entry for each of `installed.moved`, at
+/// the stamp its handle read after the move and the hash [`unpack`] verified, kept against `started`, the file time the
+/// moves began, so the next run reads no file whose size and last write still match. Nothing is written when the install
+/// skipped a file ([`Skip`]): only an archive installed whole is one whose files the run after it may take as the PC's,
+/// a partial one costing the next run a rehash. A file the install rewrote ([`records_a_root`]) is left out, its bytes
+/// no longer the hash's, and so is one whose stamp could not be read after its move. The cache the file at `path` holds
+/// is read first, so entries another run saved meanwhile are kept; one missing or corrupt starts empty. The cache is
+/// saved only when it kept at least one entry.
+fn cached(path: &Path, installed: &Installed, started: u64) {
+    if !installed.skipped.is_empty() {
+        return;
+    }
+    let mut cache = HashCache::load(path).unwrap_or_default();
+    let mut kept = false;
+    for moved in &installed.moved {
+        let Some(stamp) = moved.stamp else { continue };
+        if records_a_root(&moved.entry.path) {
+            continue;
+        }
+        let (file, sha256) = (moved.entry.path.as_str(), moved.entry.sha256.as_str());
+        cache.keep(file, stamp, sha256, started);
+        kept |= cache.held(file).is_some_and(|held| held.stamp == stamp && held.sha256 == sha256);
+    }
+    if kept {
+        cache.save(path);
+    }
 }
 
 #[cfg(test)]
@@ -593,11 +655,12 @@ mod tests {
     use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_DELETE;
 
     use super::{
-        Index, Installed, Skip, Unmet, Unmoved, checked, ending, moved, reasons, rewritten, said, stage_made, success_line, tracked, unmet_of,
-        unpacked,
+        Index, Installed, Moved, Skip, Unmet, Unmoved, cached, checked, ending, moved, reasons, rewritten, said, stage_made, success_line, tracked,
+        unmet_of, unpacked,
     };
     use crate::boxside::outputs::OUTPUTS_BUDGET;
     use crate::outputs::archive::{Entry, pack};
+    use crate::outputs::cache::{HashCache, file_time_now};
     use crate::outputs::glob::Globs;
     use crate::outputs::manifest::{Held, Manifest};
     use crate::outputs::walk::{Stamp, walk};
@@ -802,6 +865,7 @@ mod tests {
             bytes: 3_145_728,
             compressed: 1_048_576,
             skipped: vec![("bin/held.dll".to_owned(), Skip::InUse), ("bin/kept.dll".to_owned(), Skip::Tracked)],
+            moved: Vec::new(),
         };
         let success = "gate: outputs: 3 file(s), 3.0 MB (1.0 MB compressed) in 2.3 s";
         assert_eq!(success_line(&installed, 2.25), success, "half a tenth rounds away from zero");
@@ -1083,7 +1147,7 @@ mod tests {
         }
 
         let entries = [entry("bin/ahead.txt"), entry("bin/behind.txt")];
-        assert_eq!(moved(&stage, &root, &entries, &Manifest::default(), |_| true), Ok(()));
+        assert!(moved(&stage, &root, &entries, &Manifest::default(), |_| true).is_ok());
 
         let modified = |name: &str| {
             fs::metadata(root.join("bin").join(name))
@@ -1092,6 +1156,122 @@ mod tests {
         };
         assert!(modified("ahead.txt") <= SystemTime::now(), "clamped to this clock");
         assert_eq!(modified("behind.txt"), past, "kept");
+    }
+
+    /// An install that moved `moved` into place and skipped no file.
+    fn installed_of(moved: Vec<Moved>) -> Installed {
+        Installed {
+            count: moved.len(),
+            bytes: 0,
+            compressed: 0,
+            skipped: Vec::new(),
+            moved,
+        }
+    }
+
+    /// Sets the last write of the file at `full` to `age` before now, so a run takes it as settled.
+    fn aged(full: &Path, age: Duration) {
+        File::options()
+            .write(true)
+            .open(full)
+            .and_then(|file| file.set_modified(SystemTime::now() - age))
+            .expect("the last write can be set");
+    }
+
+    /// The hash cache path of a scratch `folder`, as the client names it.
+    fn cache_path(folder: &Path) -> PathBuf {
+        folder.join("app-1a2b3c4d.outputs-hashes")
+    }
+
+    #[test]
+    fn a_moved_file_is_returned_with_its_installed_stamp() {
+        let folder = scratch("moved-stamp");
+        let (stage, root) = (folder.join("stage"), folder.join("root"));
+        aged(&put(&stage, "bin/a.txt", b"box"), Duration::from_hours(2));
+        fs::create_dir_all(&root).expect("the root can be made");
+
+        let moved = moved(&stage, &root, &[entry("bin/a.txt")], &Manifest::default(), |_| true).expect("the file is moved");
+
+        assert_eq!(moved.len(), 1, "{moved:?}");
+        assert_eq!(moved[0].entry.path, "bin/a.txt");
+        assert_eq!(
+            moved[0].stamp,
+            Some(stamp(&root.join("bin").join("a.txt"))),
+            "the stamp the installed file's handle reads"
+        );
+    }
+
+    #[test]
+    fn a_file_clamped_to_now_is_not_cached() {
+        let folder = scratch("cache-clamped");
+        let (stage, root) = (folder.join("stage"), folder.join("root"));
+        let ahead = put(&stage, "bin/ahead.txt", b"a");
+        aged(&put(&stage, "bin/behind.txt", b"b"), Duration::from_hours(3));
+        File::options()
+            .write(true)
+            .open(&ahead)
+            .and_then(|file| file.set_modified(SystemTime::now() + Duration::from_hours(3)))
+            .expect("the last write can be set");
+        fs::create_dir_all(&root).expect("the root can be made");
+        let entries = [entry("bin/ahead.txt"), entry("bin/behind.txt")];
+        // Taken before the moves, as the install takes it: the clamp to this clock then falls at or after it.
+        let started = file_time_now();
+        let moved = moved(&stage, &root, &entries, &Manifest::default(), |_| true).expect("both files are moved");
+        let clamped = moved
+            .iter()
+            .find(|file| file.entry.path == "bin/ahead.txt")
+            .and_then(|file| file.stamp)
+            .expect("the clamped file's stamp is read");
+        assert!(clamped.modified >= started, "clamped at or after the moves began: {clamped:?}, {started}");
+        let path = cache_path(&folder);
+
+        cached(&path, &installed_of(moved), started);
+
+        let cache = HashCache::load(&path).expect("the install saves the cache");
+        assert!(cache.held("bin/behind.txt").is_some(), "a file written long before the moves is kept");
+        assert_eq!(cache.held("bin/ahead.txt"), None, "a file clamped to this clock is not kept");
+    }
+
+    #[test]
+    fn a_rewritten_member_is_not_cached() {
+        let folder = scratch("cache-rewritten");
+        let (stage, root) = (folder.join("stage"), folder.join("root"));
+        let paths = [
+            "bin/MvcTestingAppManifest.json",
+            "bin/.msCoverageSourceRootsMapping_App",
+            "bin/app.deps.json",
+        ];
+        for path in paths {
+            aged(&put(&stage, path, b"text"), Duration::from_hours(2));
+        }
+        fs::create_dir_all(&root).expect("the root can be made");
+        let entries: Vec<Entry> = paths.iter().map(|path| entry(path)).collect();
+        let moved = moved(&stage, &root, &entries, &Manifest::default(), |_| true).expect("every file is moved");
+        let path = cache_path(&folder);
+
+        cached(&path, &installed_of(moved), file_time_now());
+
+        let cache = HashCache::load(&path).expect("the install saves the cache");
+        for rewritten in ["bin/MvcTestingAppManifest.json", "bin/.msCoverageSourceRootsMapping_App"] {
+            assert_eq!(cache.held(rewritten), None, "a file the install rewrites is not cached");
+        }
+        assert!(cache.held("bin/app.deps.json").is_some(), "a file it leaves alone is cached");
+    }
+
+    #[test]
+    fn a_partial_install_writes_no_cache_entry() {
+        let folder = scratch("cache-partial");
+        let (stage, root) = (folder.join("stage"), folder.join("root"));
+        aged(&put(&stage, "bin/a.txt", b"a"), Duration::from_hours(2));
+        fs::create_dir_all(&root).expect("the root can be made");
+        let moved = moved(&stage, &root, &[entry("bin/a.txt")], &Manifest::default(), |_| true).expect("the file is moved");
+        let mut installed = installed_of(moved);
+        installed.skipped = vec![("bin/held.dll".to_owned(), Skip::InUse)];
+        let path = cache_path(&folder);
+
+        cached(&path, &installed, file_time_now());
+
+        assert!(!path.exists(), "an install that skipped a file keeps no hash");
     }
 
     /// The staged file is held, sharing only its deletion, so it moves with its handle open and no one may open it for
@@ -1116,7 +1296,7 @@ mod tests {
         let result = moved(&stage, &root, &[entry("bin/ahead.txt")], &Manifest::default(), |_| true);
         drop(held);
 
-        assert_eq!(result, Ok(()));
+        assert!(result.is_ok(), "{result:?}");
         let target = root.join("bin").join("ahead.txt");
         let modified = fs::metadata(&target).and_then(|metadata| metadata.modified()).expect("a last write");
         assert!(modified <= SystemTime::now(), "clamped to this clock");

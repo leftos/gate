@@ -9,7 +9,7 @@ use std::fmt::Write as _;
 use std::fs;
 use std::hash::{DefaultHasher, Hasher};
 use std::io::{self, ErrorKind, Write as _};
-use std::os::windows::fs::OpenOptionsExt;
+use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime};
@@ -2733,9 +2733,11 @@ fn a_parity_refusal_leaves_no_outputs_pending_marker_and_the_next_run_sends_outp
     assert!(!refused_left_the_marker, "a parity refusal leaves no marker: {refused:?}");
 }
 
-/// A routed run saves the hash of each file under its globs last written well before it, as the manifest it built
-/// holds it: one line in the state root, no temporary file left beside it. A file written ahead of the run's start
-/// is not saved.
+/// A routed run saves the hash of each file under its globs last written well before it: one line in the state root, no
+/// temporary file left beside it. A file written ahead of the run's start is not saved, and one the run brought back
+/// holds the hash of the file the outputs step put in place, not the PC's hash of the file it replaced. The builder's
+/// file was written an hour before the run, after a first run named its work folder, so the install keeps its hash; the
+/// pending marker has the box bring it back though the run did not write it.
 #[test]
 fn a_routed_run_saves_the_hashes_of_its_stable_files() {
     let case = outputs_case("client-hashes-saved", &BIN);
@@ -2745,8 +2747,11 @@ fn a_routed_run_saves_the_hashes_of_its_stable_files() {
     backdate(&case, r"bin\same.txt", HOUR);
     backdate(&case, r"bin\differs.txt", HOUR);
     written_at(&case, r"bin\ahead.txt", SystemTime::now() + HOUR);
-    let steps = ssh_steps(&case, "ssh", &["ok", "ok", "ok"]);
-    let command = [r".\tool.exe", "write", r"bin\same.txt", "same", "write", r"bin\differs.txt", "box"];
+    first_run(&case);
+    install_from_the_box(&case, "bin/differs.txt", "box");
+    fs::write(pending_marker(&case), "").expect("the pending marker can be made");
+    let steps = ssh_steps(&case, "second", &["ok", "ok", "ok"]);
+    let command = [r".\tool.exe", "write", r"bin\same.txt", "same"];
 
     let outcome = finish(client_gate(&case, "out.log", &steps, &command));
 
@@ -2759,8 +2764,8 @@ fn a_routed_run_saves_the_hashes_of_its_stable_files() {
     assert_eq!(files["bin/same.txt"]["sha256"], sha256_hex("same"), "{text}");
     assert_eq!(
         files["bin/differs.txt"]["sha256"],
-        sha256_hex("pc"),
-        "the file as the run found it: {text}"
+        sha256_hex("box"),
+        "the file the outputs step put in place: {text}"
     );
     assert!(files.get("bin/ahead.txt").is_none(), "a file written ahead of the run: {text}");
     let temps: Vec<PathBuf> = fs::read_dir(case.root().join("remote"))
@@ -2857,7 +2862,7 @@ fn a_corrupt_hashes_file_is_ignored_and_replaced() {
 
 /// While the pending marker stands the manifest takes no hash from the cache, and the cache is saved from the hashes
 /// the build read: a cache saying the PC holds what the builder writes still sees the file come back, and then holds
-/// the PC's own hash.
+/// the hash of the file the outputs step put in place, which the builder wrote an hour before the run.
 #[test]
 fn a_pending_marker_builds_the_manifest_without_the_cache_and_saves_it() {
     let case = outputs_case("client-hashes-full", &BIN);
@@ -2868,8 +2873,9 @@ fn a_pending_marker_builds_the_manifest_without_the_cache_and_saves_it() {
     assert_eq!(seeded.code, Some(0), "{seeded:?}");
     plant(&case, "bin/differs.txt", &sha256_hex("box"));
     fs::write(pending_marker(&case), "").expect("the pending marker can be made");
+    install_from_the_box(&case, "bin/differs.txt", "box");
     let second = ssh_steps(&case, "second", &["ok", "ok", "ok"]);
-    let command = [r".\tool.exe", "write", r"bin\differs.txt", "box"];
+    let command = [r".\tool.exe", "out", "ran there"];
 
     let outcome = finish(client_gate(&case, "second.log", &second, &command));
 
@@ -2882,8 +2888,8 @@ fn a_pending_marker_builds_the_manifest_without_the_cache_and_saves_it() {
     assert_eq!(differs, "box", "{outcome:?}");
     assert_eq!(
         hashes(&case)["files"]["bin/differs.txt"]["sha256"],
-        sha256_hex("pc"),
-        "the cache holds the hash the build read: {outcome:?}"
+        sha256_hex("box"),
+        "the cache holds the hash of the file the outputs step put in place: {outcome:?}"
     );
 }
 
@@ -4200,4 +4206,111 @@ fn an_installed_test_host_manifest_names_the_worktree() {
     let root = std::path::absolute(case.folder()).expect("the case folder has a full path");
     let expected = format!(r"Root_{}\src\App", root.display());
     assert_eq!(worktree_text(&case, r"bin\MvcTestingAppManifest.json"), expected, "{outcome:?}");
+}
+
+/// A first run of `case`, which names the work-folder key, so a builder file can be put in its work folder after it.
+fn first_run(case: &Case) {
+    let steps = ssh_steps(case, "first", &["ok", "ok"]);
+    let cleared = finish(client_gate(case, "first.log", &steps, &[r".\tool.exe", "out", "ran there"]));
+    assert_eq!(cleared.code, Some(0), "{cleared:?}");
+}
+
+/// Writes `text` to the builder's work folder file `path`, its folders made, its last write [`HOUR`] ago: the install
+/// keeps no hash of a file written inside the 2 s window of its moves.
+fn install_from_the_box(case: &Case, path: &str, text: &str) {
+    let work = case.folder().join("builder").join("work").join(key_of(&events(case)));
+    let full = work.join(path.replace('/', "\\"));
+    fs::create_dir_all(full.parent().expect("a file has a folder")).expect("the folder can be made");
+    fs::write(&full, text).expect("the builder's file can be written");
+    fs::File::options()
+        .write(true)
+        .open(&full)
+        .and_then(|file| file.set_modified(SystemTime::now() - HOUR))
+        .expect("the file's last write can be set");
+}
+
+/// A run that installs a file the builder wrote an hour ago keeps its hash at the stamp the installed file's own
+/// handle reads: the next run then takes that hash instead of reading the file.
+#[test]
+fn an_installed_file_is_cached_at_its_installed_stamp() {
+    let case = outputs_case("client-outputs-cached", &BIN);
+    first_run(&case);
+    install_from_the_box(&case, "bin/x.dll", "built");
+    let second = ssh_steps(&case, "second", &["ok", "ok", "ok"]);
+
+    let outcome = finish(client_gate(&case, "second.log", &second, &[r".\tool.exe", "out", "ran there"]));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let installed = case.folder().join("bin").join("x.dll");
+    assert_eq!(
+        fs::read_to_string(&installed).expect("the built file is installed"),
+        "built",
+        "{outcome:?}"
+    );
+    let held = hashes(&case)["files"]
+        .get("bin/x.dll")
+        .cloned()
+        .expect("the install caches what it installed");
+    let stamp = fs::metadata(&installed).expect("the installed file is there");
+    assert_eq!(held["sha256"], json!(sha256_hex("built")), "the box's hash: {outcome:?}");
+    assert_eq!(held["size"], json!(stamp.len()), "the installed file's size: {outcome:?}");
+    assert_eq!(
+        held["modified"],
+        json!(stamp.last_write_time()),
+        "the installed file's own stamp: {outcome:?}"
+    );
+}
+
+/// The run after an install takes the hash the cache holds at the installed file's stamp, not the file's: a hash
+/// planted in the cache changes what the box brings back, where reading the file again would bring nothing.
+#[test]
+fn a_run_after_an_install_does_not_rehash_what_it_installed() {
+    let case = outputs_case("client-outputs-installed-hash", &BIN);
+    first_run(&case);
+    install_from_the_box(&case, "bin/x.dll", "built");
+    let second = ssh_steps(&case, "second", &["ok", "ok", "ok"]);
+    let installed = finish(client_gate(&case, "second.log", &second, &[r".\tool.exe", "out", "ran there"]));
+    assert_eq!(installed.code, Some(0), "{installed:?}");
+    plant(&case, "bin/x.dll", &sha256_hex("sentinel"));
+    let third = ssh_steps(&case, "third", &["ok", "ok", "ok"]);
+    let command = [r".\tool.exe", "write", r"bin\x.dll", "built"];
+
+    let outcome = finish(client_gate(&case, "third.log", &third, &command));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(
+        outcome.stderr.contains("gate-remote-outputs: 1 "),
+        "the manifest carried the cache's hash, not the file's: {outcome:?}"
+    );
+}
+
+/// An install the Ctrl+C stops keeps no hash, not even of the settled file it moved before the interrupt.
+#[test]
+fn an_interrupted_install_caches_nothing() {
+    let case = outputs_case("client-outputs-install-ctrl-c-cache", &BIN);
+    first_run(&case);
+    install_from_the_box(&case, "bin/a.txt", "a");
+    install_from_the_box(&case, "bin/b.txt", "b");
+    let steps = ssh_steps(&case, "second", &["ok", "ok", "ok"]);
+    let tuned = Tuned {
+        extra: &["--test-remote-interrupt-at", "install"],
+        ..Tuned::default()
+    };
+
+    let outcome = finish(client_gate_tuned(
+        &case,
+        "second.log",
+        &steps,
+        &tuned,
+        &[r".\tool.exe", "out", "ran there"],
+    ));
+
+    assert_eq!(outcome.code, Some(CONTROL_C_EXIT), "{outcome:?}");
+    assert_eq!(
+        worktree_text(&case, r"bin\a.txt"),
+        "a",
+        "the file moved before the interrupt stays: {outcome:?}"
+    );
+    let cache = fs::read_to_string(hashes_file(&case)).map_or(Value::Null, |text| serde_json::from_str(&text).expect("the hash cache is JSON"));
+    assert!(cache["files"].get("bin/a.txt").is_none(), "an interrupted install keeps no hash: {cache}");
 }

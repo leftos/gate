@@ -54,7 +54,7 @@ Suite = `crates/gate/tests/suite/` (binary `suite`, needs `--all-features`; test
 | boxside/heartbeat.rs, forward.rs | `boxside` (`--test-heartbeat-ms`), `remote_client` | no: boxside, remote_client |
 | boxside/tools.rs | `boxside` (dotnet tool restore and its elapsed line, `boxside::box_run_*restore*` cases) | no: boxside |
 | boxside/outputs.rs | `boxside` sub-module `boxside::outputs` (manifest, pack, prune, `outputs` verb, `--test-outputs-budget-bytes`), `remote_client` | no: boxside, remote_client |
-| outputs/ (glob, walk, hash, manifest, cache, archive, names) | `boxside::outputs` (pack), `remote_client` (manifest the client sends, the hash cache it saves and reuses, the fetched archive's install), `syncback_quarantine` and `syncback_conversions` (names, through the sync-back's forbidden paths); unit tests inside | no: boxside, remote_client, syncback_quarantine, syncback_conversions |
+| outputs/ (glob, walk, hash, manifest, cache, archive, names) | `boxside::outputs` (pack), `remote_client` (manifest the client sends, the hash cache it saves and reuses, the fetched archive's install, the hashes a complete install keeps in that cache), `syncback_quarantine` and `syncback_conversions` (names, through the sync-back's forbidden paths); unit tests inside | no: boxside, remote_client, syncback_quarantine, syncback_conversions |
 
 ## 2. Table: other crates and files
 
