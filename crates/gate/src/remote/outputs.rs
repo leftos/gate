@@ -433,8 +433,13 @@ mod tests {
     use std::io::Write;
     use std::path::{Path, PathBuf};
     use std::process::Command;
+    use std::time::Instant;
+
+    use gate_router::DEFAULT_OUTPUTS;
 
     use super::{Archive, Brought, MANIFEST_LIMIT, PARTIAL, Unbuilt, accepted, hashed, keep_outputs_line, manifest_line, pending, within_cap};
+    use crate::outputs::glob::Globs;
+    use crate::outputs::walk::walk;
 
     const KEY: &str = "app-1a2b3c4d";
     const NONCE: &str = "0123456789abcdef0123456789abcdef";
@@ -634,5 +639,43 @@ mod tests {
         fs::write(folder.join("app-1a2b3c4d.outputs-pending"), "").expect("the marker can be written");
         assert!(pending(&folder.join("app-1a2b3c4d.outputs-pending")), "a marker that is there");
         assert!(pending(Path::new("app\0.outputs-pending")), "a path the system cannot look up");
+    }
+
+    /// A lab measurement, not a check: how long the walk and the whole manifest build take on a real built worktree,
+    /// so the write of a `(path, size, mtime)` hash cache can be decided on a number. Reads the tree from
+    /// `GATE_MEASURE_ROOT` and its globs from `GATE_MEASURE_GLOBS` (`;`-separated, [`DEFAULT_OUTPUTS`] when unset),
+    /// prints one line of figures, and asserts nothing about time.
+    #[test]
+    #[ignore = "a lab measurement: set GATE_MEASURE_ROOT to a built worktree"]
+    #[expect(clippy::print_stdout, reason = "a lab measurement prints its figures for the operator to read")]
+    #[expect(clippy::cast_precision_loss, reason = "a size said to one decimal of a megabyte")]
+    fn measure_the_manifest_time_of_a_real_tree() {
+        let Ok(root) = std::env::var("GATE_MEASURE_ROOT") else {
+            println!("measure: set GATE_MEASURE_ROOT to a built worktree to run this measurement");
+            return;
+        };
+        let root = PathBuf::from(root);
+        let globs: Vec<String> = match std::env::var("GATE_MEASURE_GLOBS") {
+            Ok(list) => list.split(';').map(str::to_owned).collect(),
+            Err(_) => DEFAULT_OUTPUTS.map(str::to_owned).to_vec(),
+        };
+
+        let started = Instant::now();
+        let parsed = Globs::new(&globs).expect("the measurement's globs are well formed");
+        let found = walk(&root, &parsed).expect("the measured tree can be walked");
+        let walk_seconds = started.elapsed().as_secs_f64();
+        let bytes: u64 = found.iter().map(|file| file.stamp.size).sum();
+
+        let started = Instant::now();
+        let (line, _) = manifest_line(&root, &globs, usize::MAX, || true).expect("the measured tree can be hashed");
+        let manifest_seconds = started.elapsed().as_secs_f64();
+
+        let mib = bytes as f64 / (1024.0 * 1024.0);
+        println!(
+            "manifest: {}: {} files, {mib:.1} MiB; walk {walk_seconds:.3} s; manifest_line {manifest_seconds:.3} s; line {} bytes",
+            root.display(),
+            found.len(),
+            line.len()
+        );
     }
 }
