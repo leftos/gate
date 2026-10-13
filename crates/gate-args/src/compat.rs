@@ -8,7 +8,7 @@
 use std::ffi::OsString;
 use std::iter::Peekable;
 
-use crate::problem::{Problem, Spelling};
+use crate::problem::Problem;
 use crate::request::Invocation;
 use crate::run::{RunBuilder, RunOption, SwitchOption, ValueOption, next_text, next_value};
 use crate::values;
@@ -31,7 +31,6 @@ const OPTIONS: [(&str, CompatOption); 8] = [
 ];
 
 /// The words read so far.
-#[derive(Default)]
 struct Compat {
     builder: RunBuilder,
     stop_tree: Option<Result<u32, Problem>>,
@@ -40,7 +39,10 @@ struct Compat {
 /// Reads the whole command line in the PowerShell form.
 pub(crate) fn parse(words: impl Iterator<Item = OsString>) -> Result<Invocation, Vec<Problem>> {
     let mut words = words.peekable();
-    let mut compat = Compat::default();
+    let mut compat = Compat {
+        builder: RunBuilder::compat(),
+        stop_tree: None,
+    };
     let mut command = None;
     while let Some(text) = next_text(&mut words, &mut compat.builder.problems) {
         if text == "--" {
@@ -101,10 +103,7 @@ impl Compat {
     /// A stop request when `-StopTree` came alone; a run request otherwise.
     fn finish(mut self, command: Option<Vec<OsString>>) -> Result<Invocation, Vec<Problem>> {
         let Some(pid) = self.stop_tree else {
-            return self
-                .builder
-                .finish_run(command.unwrap_or_default(), Spelling::Compat)
-                .map(Invocation::Run);
+            return self.builder.finish_run(command.unwrap_or_default()).map(Invocation::Run);
         };
         if self.builder.has_options() || command.is_some() {
             self.builder.problems.push(Problem::StopTreeNotAlone);

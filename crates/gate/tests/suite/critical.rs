@@ -11,6 +11,7 @@ use gate_state::{KernelObject, StateRoot};
 use jiff::Timestamp;
 use serde_json::{Value, json};
 
+use crate::durations::seed;
 use crate::nesting::{marked, test_marker};
 use crate::support::{
     Case, FAKE_TOOL, GATE, POLL, Running, assert_in_order, critical_words, events, events_of, finish, heavy_words, none_words, run_words, shown,
@@ -460,6 +461,60 @@ fn a_heavy_child_of_a_light_parent_is_lent_the_parents_slot_while_a_critical_req
     assert_passed(&critical.finish());
     assert_passed(&held.finish());
     assert!(at(&case, "parent", early_pid) < at(&case, "take", critical_pid));
+}
+
+#[test]
+fn a_lent_auto_run_uses_its_history_for_the_ceiling() {
+    let case = Case::new("a_lent_auto_run_uses_its_history_for_the_ceiling");
+    write_counts(&case.root(), r#"{"v":1,"heavy":1,"light":4}"#);
+    let command = [FAKE_TOOL, "env", "GATE_SLOT_HELD"];
+    for _ in 0..5 {
+        assert_passed(&finish(case.gate(&heavy_words("history.log", &POLL, &command))));
+    }
+    // 3x an adjusted p99 of 14 min raises the floor of 15 min to 42 min.
+    seed(&case, " | fake-tool env GATE_SLOT_HELD", 1.0, Some(840.0));
+    let go = case.folder().join("go");
+    let go_word = shown(&go);
+    let held = holder(&case, &heavy_words("holder.log", &POLL, &[FAKE_TOOL, "wait", &go_word, "exit", "0"]));
+    let held_pid = held.id();
+    let mut child = vec![GATE];
+    child.extend(heavy_words("child.log", &POLL, &command));
+    assert_eq!(child[4], "--timeout", "the ceiling's value follows it");
+    child[5] = "auto:900";
+    let parent = holder(&case, &run_words("parent.log", &POLL, &child));
+    let parent_pid = parent.id();
+    wait_until("the child gate queueing", || {
+        sequence(&case)
+            .iter()
+            .any(|(event, pid)| event == "queue" && ![held_pid, parent_pid].contains(pid))
+    });
+
+    let critical = case.start(&critical_words("critical.log", &POLL, &[FAKE_TOOL, "exit", "0"]));
+    critical.wait_for_stderr(WAITING);
+    let parent_outcome = parent.finish();
+
+    assert_passed(&parent_outcome);
+    let child_pid = lent_to(&case, parent_pid);
+    assert_eq!(events_of(&case, child_pid), ["queue", "parent"], "the child was lent as it waited");
+    assert!(
+        parent_outcome.stdout.contains(", ceiling 2520 s). Full output: "),
+        "the lent child's passed line names the ceiling its history resolved: {parent_outcome:?}"
+    );
+    // The parent shows the child's stderr as it runs, up to the child's passed line, and again in its own log's tail.
+    let (child_stream, _) = parent_outcome
+        .stdout
+        .split_once("child.log")
+        .expect("the child's passed line names its log");
+    assert_eq!(
+        child_stream
+            .matches("gate: ceiling 42 min (3x this command's p99 of 14 min, above the given 15 min)")
+            .count(),
+        1,
+        "the lent child says its raised ceiling once: {parent_outcome:?}"
+    );
+    let_go(&go);
+    assert_passed(&critical.finish());
+    assert_passed(&held.finish());
 }
 
 #[test]

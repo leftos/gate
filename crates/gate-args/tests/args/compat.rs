@@ -1,6 +1,6 @@
 //! The compatibility layer: the PowerShell gate's argument form.
 
-use gate_args::{Invocation, RunRequest, Slot, Spelling, StopRequest, parse};
+use gate_args::{Ceiling, Invocation, RunRequest, Slot, Spelling, StopRequest, parse};
 
 use crate::support::{RUN, invocation, os, problems, refs, run_request, stop_request, with};
 
@@ -50,6 +50,21 @@ fn compat_options_are_case_insensitive() {
     ];
     let new = with(&RUN, &["--stall", "30", "--tail", "5", "--no-markers", "--local", "--", "cmd"]);
     assert_eq!(run_request(&old), as_compat(&new));
+}
+
+#[test]
+fn compat_refuses_timeout_seconds_auto() {
+    for value in ["auto", "auto:900"] {
+        assert_eq!(
+            problems(&["-Log", "out.log", "-TimeoutSeconds", value, "-Slot", "heavy", "--", "cmd"]),
+            [format!("gate: -TimeoutSeconds must be a whole number above 0, got '{value}'")],
+            "-TimeoutSeconds {value}"
+        );
+    }
+    assert_eq!(
+        run_request(&["-Log", "out.log", "-TimeoutSeconds", "900", "-Slot", "heavy", "--", "cmd"]).timeout,
+        Ceiling::Given(900)
+    );
 }
 
 #[test]

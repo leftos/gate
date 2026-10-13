@@ -52,6 +52,7 @@ use super::watchdog::{self, Cut, Kept, Kill, LINE_CAP};
 use super::{FAILED, FAILED_RUN, REFUSED, Refusal, RemoteCall, RemoteClient, RemoteOutcome, refused_line, started_line};
 use crate::boxside::outputs::{NAMES_SKIPPED, OUTPUTS_BUDGET};
 use crate::boxside::payload::escaped;
+use crate::durations::{Usual, hang_hint};
 use crate::environment::Variables;
 use crate::outputs::archive::sent_limit;
 #[cfg(feature = "test-seams")]
@@ -259,6 +260,7 @@ impl RemoteClient for RustClient {
             brought_back: None,
             lines: Vec::new(),
             problem: None,
+            hang_said: false,
         };
         if let Some(line) = raised {
             attempt.say(line);
@@ -492,6 +494,8 @@ pub(super) struct Attempt<'c, 'a> {
     pub(super) brought_back: Option<bool>,
     lines: Vec<String>,
     problem: Option<String>,
+    /// Whether the run call said its hang hint, which an attempt says once.
+    hang_said: bool,
 }
 
 /// How a run call ended ([`Attempt::run_call`]): its end, the last standard error line of the call that counts that is
@@ -1074,6 +1078,8 @@ impl Attempt<'_, '_> {
             fed(stdin, input, feed_log);
         }
         let shared = Arc::new(Shared::new());
+        // Only the run call carries the run's nonce, and only it says the hang hint.
+        let run_call = starts.nonce.is_some();
         let (done, readers) = mpsc::channel();
         let reading = Reading {
             echo,
@@ -1105,16 +1111,21 @@ impl Attempt<'_, '_> {
             progress: &shared.progress,
             readers: &readers,
             shown: &shown,
+            hang: self
+                .call
+                .usual
+                .filter(|_| run_call && !self.hang_said)
+                .map(|usual| RunHang { usual, log: self.call.log }),
         };
         let raise = self.call.interrupt.filter(|_| starts.raise);
         let watching = watched.watch(watch, self.call.interrupt, raise);
         if let Some(raw) = raw {
             // The call's end has come: the copy writes nothing more into an archive the fetch is about to remove.
             shared.stop();
-            let drained = watching.as_ref().is_ok_and(|watching| watching.ended.drained());
+            let drained = watching.ended.as_ref().is_ok_and(|(ended, _)| ended.drained());
             self.ended_raw(raw, drained);
         }
-        let Watching { ended, looks } = watching?;
+        let (ended, looks) = self.watched_out(watching)?;
         if let Some(line) = &looks.unread {
             self.logged(line);
         }
@@ -1136,6 +1147,25 @@ impl Attempt<'_, '_> {
                 Err(End::Interrupted)
             }
         }
+    }
+
+    /// How the watched call ended, as `watching` says, once the attempt has kept the run call's hang hint: the line said
+    /// among its lines, or why it could not be said as its problem, and either way the hint as said, so the attempt never
+    /// says it again; also when the watch itself failed after the hint was said.
+    fn watched_out(&mut self, watching: Watching) -> Result<(CallEnd, Looks), End> {
+        let Watching { ended, hinted } = watching;
+        match hinted {
+            Some(Ok(line)) => {
+                self.hang_said = true;
+                self.lines.push(line);
+            }
+            Some(Err(why)) => {
+                self.hang_said = true;
+                self.problem.get_or_insert(why);
+            }
+            None => {}
+        }
+        ended
     }
 
     /// Gives the raw copy's reader `raw` the rest of its [`DRAIN`] to end, when the call's own end did not already
@@ -1247,6 +1277,7 @@ impl<'c, 'a> Attempt<'c, 'a> {
             brought_back: None,
             lines: Vec::new(),
             problem: None,
+            hang_said: false,
         }
     }
 }
@@ -1334,10 +1365,19 @@ fn joined(read: Option<String>, ending: Option<String>) -> Option<String> {
     }
 }
 
-/// What watching a call came to: how it ended, and what the looks at the bytes its job wrote found.
+/// What watching a call came to: how it ended, with what the looks at the bytes its job wrote found, or why it could not
+/// be watched; and the run call's hang hint once said, or why it could not be said, which stands either way.
 struct Watching {
-    ended: CallEnd,
-    looks: Looks,
+    ended: Result<(CallEnd, Looks), End>,
+    hinted: Option<Result<String, String>>,
+}
+
+/// The hang hint a run call says once its command has run 3x its usual p90 on the builder: that p90, and the log the
+/// hint is written to beside stderr.
+#[derive(Clone, Copy)]
+struct RunHang<'w> {
+    usual: Usual,
+    log: &'w Path,
 }
 
 /// What the looks at the bytes a capped call's job wrote found: the count at the last look that succeeded, and the
@@ -1349,13 +1389,14 @@ struct Looks {
 }
 
 /// A started call the client watches: its process and job, when its streams last sent a byte, the channel each of its
-/// two readers says its end on, and its program as shown.
+/// two readers says its end on, its program as shown, and the run call's hang hint while it is still to be said.
 struct Watched<'w> {
     running: &'w Running,
     job: &'w Job,
     progress: &'w Progress,
     readers: &'w Receiver<()>,
     shown: &'w str,
+    hang: Option<RunHang<'w>>,
 }
 
 impl Watched<'_> {
@@ -1364,19 +1405,35 @@ impl Watched<'_> {
     /// console `interrupt` ended it. A fetch with a cap has those bytes looked at on each tick and once more after its
     /// exit, so a fetch that ends between two ticks is found past its cap too. `raise`, when given, is raised once the
     /// call sent its first byte, as a Ctrl+C would be; at the first look for a call a Ctrl+C does not end, which has no
-    /// output to wait for.
-    fn watch(self, watch: Watch, interrupt: Option<Interrupt>, mut raise: Option<Interrupt>) -> Result<Watching, End> {
+    /// output to wait for. The run call's hang hint, once said, is kept however the watch ends.
+    fn watch(self, watch: Watch, interrupt: Option<Interrupt>, raise: Option<Interrupt>) -> Watching {
+        let mut hinted = None;
+        let ended = self.until_ended(watch, interrupt, raise, &mut hinted);
+        Watching { ended, hinted }
+    }
+
+    /// The watch's loop ([`Watched::watch`]), which keeps the run call's hang hint in `hinted` once it is said.
+    fn until_ended(
+        &self,
+        watch: Watch,
+        interrupt: Option<Interrupt>,
+        mut raise: Option<Interrupt>,
+        hinted: &mut Option<Result<String, String>>,
+    ) -> Result<(CallEnd, Looks), End> {
         let begun = Instant::now();
         let tick = watch.tick();
         let mut open = 2;
         let mut looks = Looks::default();
         loop {
+            if hinted.is_none() {
+                *hinted = self.hint_if_hung();
+            }
             if open == 0
                 && let Some(code) = self.running.wait(Duration::ZERO).map_err(|error| cannot_wait(self.shown, &error))?
             {
                 let over = watch.over(self.written(watch, &mut looks));
                 let ended = over.map_or(CallEnd::Exited(code.cast_signed()), CallEnd::ExitedOver);
-                return Ok(Watching { ended, looks });
+                return Ok((ended, looks));
             }
             if (self.progress.heard_any() || !watch.interruptible())
                 && let Some(interrupt) = raise.take()
@@ -1385,15 +1442,25 @@ impl Watched<'_> {
             }
             if watch.interruptible() && interrupt.is_some_and(Interrupt::is_raised) {
                 let ended = CallEnd::Interrupted(self.end(open));
-                return Ok(Watching { ended, looks });
+                return Ok((ended, looks));
             }
             let written = self.written(watch, &mut looks);
             if let Some(cut) = watch.cut(Instant::now(), begun, self.progress.idle(), self.progress.raised(), written) {
                 let ended = CallEnd::Cut(cut, self.end(open));
-                return Ok(Watching { ended, looks });
+                return Ok((ended, looks));
             }
             open -= self.readers_ended(open, tick);
         }
+    }
+
+    /// Says the run call's hang hint, on stderr and in the log, once its command has been running on the builder 3x its
+    /// usual p90, counted from the box's start marker: the line said, or why it could not be said; `None` before then,
+    /// and for every other call.
+    fn hint_if_hung(&self) -> Option<Result<String, String>> {
+        let hang = self.hang?;
+        let running = self.progress.since_started()?;
+        let line = hang_hint(running.as_secs_f64(), hang.usual)?;
+        Some(super::say(hang.log, &[&line], io::stderr().lock()).map(|()| line))
     }
 
     /// The bytes the call's job has written, looked at only when `watch` caps them, and kept in `looks`; `None` when
@@ -1644,7 +1711,12 @@ struct Progress {
     too_long: AtomicBool,
     /// The cap a raw copy of the call's standard output passed, 0 until one did: every cap is above 0.
     passed: AtomicU64,
+    /// Milliseconds from `begun` to the box's start marker of the run, [`NOT_STARTED`] until it came.
+    started: AtomicU64,
 }
+
+/// What [`Progress`] holds for a start marker that has not come.
+const NOT_STARTED: u64 = u64::MAX;
 
 /// What a call's readers have raised that cuts it: a line past the line cap, and the cap a raw copy of its standard
 /// output passed, `None` until one did.
@@ -1672,6 +1744,7 @@ impl Progress {
             any: AtomicBool::new(false),
             too_long: AtomicBool::new(false),
             passed: AtomicU64::new(0),
+            started: AtomicU64::new(NOT_STARTED),
         }
     }
 
@@ -1680,6 +1753,20 @@ impl Progress {
         let millis = u64::try_from(self.begun.elapsed().as_millis()).unwrap_or(u64::MAX);
         self.last_byte.store(millis, Ordering::Relaxed);
         self.any.store(true, Ordering::Relaxed);
+    }
+
+    /// Marks the box's start marker of the run, which came now.
+    fn mark_started(&self) {
+        let millis = u64::try_from(self.begun.elapsed().as_millis()).unwrap_or(NOT_STARTED - 1);
+        self.started.store(millis, Ordering::Relaxed);
+    }
+
+    /// How long since the box's start marker of the run came, `None` before it did.
+    fn since_started(&self) -> Option<Duration> {
+        match self.started.load(Ordering::Relaxed) {
+            NOT_STARTED => None,
+            millis => Some(self.begun.elapsed().saturating_sub(Duration::from_millis(millis))),
+        }
     }
 
     /// How long nothing has come, or since the call started when nothing came yet.
@@ -1920,6 +2007,9 @@ impl Reader {
         }
         let line = line_of(bytes, self.reading.echo);
         let protocol = self.reading.protocol(&line, self.error);
+        if protocol == Some(Protocol::Started) {
+            shared.progress.mark_started();
+        }
         if protocol.is_none() && !(self.error && is_heartbeat(&line)) {
             self.passed(&line, true, shared);
         }
@@ -2293,8 +2383,8 @@ mod tests {
 
     use super::{
         Attempt, CallEnd, Called, Capped, Cut, Echo, End, GIT_SSH_FAILED, Heard, LINE_CAP, Limits, Loss, NonZeroU64, OUTPUTS_BUDGET, ProtocolLines,
-        Raised, Reader, Reading, RustClient, SSH_FAILED, Shared, Ssh, Unfinished, Watch, after_loss, boot_time, called_of, console_of, held,
-        is_heartbeat, last_update, local_sdk_listing, path_outside, paused, push_size, relay, relay_raw, relayed_raw, sdks_of, seconds,
+        Raised, Reader, Reading, RustClient, SSH_FAILED, Shared, Ssh, Unfinished, Watch, Watching, after_loss, boot_time, called_of, console_of,
+        held, is_heartbeat, last_update, local_sdk_listing, path_outside, paused, push_size, relay, relay_raw, relayed_raw, sdks_of, seconds,
         their_version, version_refusal,
     };
     use crate::environment::Variables;
@@ -2411,6 +2501,7 @@ mod tests {
             outputs_withheld: false,
             log,
             timeout: 60,
+            usual: None,
             stall: 60,
             tail: 0,
             no_markers: false,
@@ -2440,7 +2531,27 @@ mod tests {
             brought_back: None,
             lines: Vec::new(),
             problem: None,
+            hang_said: false,
         }
+    }
+
+    #[test]
+    fn a_routed_hint_said_before_a_failed_wait_is_not_said_again() {
+        let log = Path::new(r"C:\gate-client-tests-no-such-folder\out.log");
+        let call = call(log);
+        let transport = nowhere();
+        let mut attempt = attempt(&call, &transport);
+        let line = "gate: still running after 3 s, 3x its usual p90 of 1 s".to_owned();
+        let watching = Watching {
+            ended: Err(End::Failed("cannot wait for ssh".to_owned())),
+            hinted: Some(Ok(line.clone())),
+        };
+
+        let ended = attempt.watched_out(watching);
+
+        assert!(matches!(ended, Err(End::Failed(_))), "the failed watch stays the call's end");
+        assert!(attempt.hang_said, "the hint said before the failure counts as said");
+        assert_eq!(attempt.lines, [line], "the attempt's lines keep the hint said");
     }
 
     /// A transport whose every call is made through a stand-in that does not exist, so a call made by mistake fails to

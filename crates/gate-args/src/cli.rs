@@ -3,7 +3,7 @@
 use std::ffi::OsString;
 use std::iter::Peekable;
 
-use crate::problem::{Problem, Spelling};
+use crate::problem::Problem;
 use crate::request::{BurnRequest, CutoverRequest, ExpectRequest, PushRequest, RunRequest, StopRequest};
 use crate::run::{RunBuilder, RunOption, SwitchOption, ValueOption, next_text};
 use crate::values;
@@ -12,7 +12,7 @@ use crate::values;
 pub(crate) fn parse_run(words: impl Iterator<Item = OsString>) -> Result<RunRequest, Vec<Problem>> {
     let mut builder = RunBuilder::default();
     let command = read_until_command(&mut builder, words, run_option);
-    builder.finish_run(command, Spelling::Cli)
+    builder.finish_run(command)
 }
 
 /// Reads the words after `gate expect`: `--state-dir` and `--slot`, then the command after `--`.

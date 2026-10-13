@@ -394,6 +394,46 @@ fn p90_p99_raised_to_p50() {
     );
 }
 
+/// Records five passing runs of 10 wall seconds under `key`, the first `adjusted` of them with 1 adjusted second.
+fn record_adjusted(store: &mut DurationStore, key: &DurationKey, adjusted: usize) {
+    for minutes in 1..=5 {
+        let facts = RunFacts {
+            adjusted_seconds: (minutes <= adjusted).then_some(1.0),
+            ..passed(10.0)
+        };
+        store.record(key, minutes_before_now(minutes), &facts);
+    }
+}
+
+#[test]
+fn adjusted_p99_is_not_raised_to_the_wall_p50() {
+    let key = local_key("cargo build");
+    let mut store = DurationStore::new();
+    record_adjusted(&mut store, &key, 5);
+
+    let estimate = store.estimate(&key, ts(NOW)).expect("five passing runs give an estimate");
+
+    assert_eq!(
+        (estimate.p50, estimate.adjusted_p99),
+        (10.0, Some(1.0)),
+        "the wall p50 counts wall seconds, the adjusted p99 load-adjusted ones"
+    );
+}
+
+#[test]
+fn adjusted_p99_needs_five_adjusted_samples() {
+    let key = local_key("cargo build");
+    let mut four = DurationStore::new();
+    record_adjusted(&mut four, &key, 4);
+    let mut five = DurationStore::new();
+    record_adjusted(&mut five, &key, 5);
+
+    let of = |store: &DurationStore| store.estimate(&key, ts(NOW)).expect("five passing runs give an estimate").adjusted_p99;
+
+    assert_eq!(of(&four), None, "four runs with adjusted seconds are too few");
+    assert_eq!(of(&five), Some(1.0));
+}
+
 #[test]
 fn five_passing_runs_needed() {
     let key = local_key("cargo build");

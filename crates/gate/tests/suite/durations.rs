@@ -977,3 +977,218 @@ fn a_routed_runs_claim_and_ticket_carry_the_builders_key() {
     assert_expected(&claim["expected"], &key, 5);
     assert_expected(&ticket["expected"], &key, 5);
 }
+
+/// Rewrites every sample of the one key of `case`'s store ending with `ending` to `wall` wall seconds and `adjusted`
+/// load-adjusted seconds, none when `adjusted` is `None`.
+pub(crate) fn seed(case: &Case, ending: &str, wall: f64, adjusted: Option<f64>) {
+    let mut seeded = store(case).expect("the store was written");
+    let keys = seeded["keys"].as_object_mut().expect("the store holds its keys");
+    let matching: Vec<&mut Value> = keys
+        .iter_mut()
+        .filter(|(key, _)| key.ends_with(ending))
+        .map(|(_, history)| history)
+        .collect();
+    assert_eq!(matching.len(), 1, "one key ends with {ending:?}");
+    for history in matching {
+        for sample in history["samples"].as_array_mut().expect("a history holds its samples") {
+            let sample = sample.as_object_mut().expect("a sample is an object");
+            sample.insert("wall".to_owned(), Value::from(wall));
+            match adjusted {
+                Some(adjusted) => sample.insert("adjusted".to_owned(), Value::from(adjusted)),
+                None => sample.remove("adjusted"),
+            };
+        }
+    }
+    fs::write(case.root().join("durations.json"), seeded.to_string()).expect("the store can be seeded");
+}
+
+/// The command [`held_run`] runs, held on the go file `go`, and the ending of its key.
+const HELD_KEY: &str = " out ran";
+
+/// A light run with `--timeout timeout` of a command held on a go file, once five runs of it made its key's history
+/// and [`seed`] rewrote it to `seeded` wall and adjusted seconds; with no history when `seeded` is `None`. The run's
+/// claim as it held its slot, and its outcome. The run is given `extra` before `--`, and is let go once its stderr
+/// holds what `said_first` looks for while the command still waits, so a line it finds came before the command's output.
+fn held_run(case: &Case, timeout: &str, seeded: Option<(f64, Option<f64>)>, extra: &[&str], said_first: impl Fn(&str) -> bool) -> (Value, Outcome) {
+    let go = case.folder().join("go");
+    let go_word = shown(&go);
+    let command: [&str; 5] = [FAKE_TOOL, "wait", &go_word, "out", "ran"];
+    if let Some((wall, adjusted)) = seeded {
+        fs::write(&go, "").expect("the go file can be made");
+        for _ in 0..5 {
+            passing(case.gate(&run_words("out.log", &[], &command)));
+        }
+        fs::remove_file(&go).expect("the go file can be removed");
+        seed(case, HELD_KEY, wall, adjusted);
+    }
+    let mut words = run_words("out.log", extra, &command);
+    words[4] = timeout;
+    let mut running = case.start(&words);
+    wait_for_file(&case.root().join("slots").join("gate-light-slot-0.json"));
+    let claim = only_file(case, "slots");
+    running.wait_for_stderr_while_running("the lines said before the command's output", said_first);
+    fs::write(&go, "").expect("the go file can be made");
+    (claim, running.finish())
+}
+
+/// The log of `case`'s runs.
+fn log(case: &Case) -> String {
+    fs::read_to_string(case.folder().join("out.log")).expect("the log was written")
+}
+
+#[test]
+fn an_auto_ceiling_with_history_is_raised_and_said() {
+    let case = Case::new("durations-auto-raised");
+
+    let (claim, outcome) = held_run(&case, "auto:900", Some((1.0, Some(840.0))), &[], |_| true);
+
+    let raised = "gate: ceiling 42 min (3x this command's p99 of 14 min, above the given 15 min)\n";
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(claim["timeoutSeconds"], 2520.0, "{claim}");
+    for said in [&outcome.stderr, &log(&case)] {
+        assert_eq!(said.matches(raised).count(), 1, "{said}");
+        assert_in_order(said, &["gate: expected about 1 s (usual 1 s, p90 1 s, 5 runs)\n", raised]);
+    }
+    assert!(outcome.stdout.contains(", ceiling 2520 s). Full output: "), "{outcome:?}");
+}
+
+#[test]
+fn an_auto_ceiling_without_history_runs_on_its_floor() {
+    let case = Case::new("durations-auto-floor");
+
+    let (claim, outcome) = held_run(&case, "auto:900", None, &[], |_| true);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(claim["timeoutSeconds"], 900.0, "{claim}");
+    assert_eq!(outcome.stderr, "", "neither the raised ceiling nor a hint: {outcome:?}");
+    assert!(outcome.stdout.contains(", ceiling 900 s). Full output: "), "{outcome:?}");
+}
+
+#[test]
+fn an_auto_floor_never_lowers_the_ceiling() {
+    let case = Case::new("durations-auto-never-lowers");
+
+    let (claim, outcome) = held_run(&case, "auto:900", Some((1.0, Some(1.0))), &[], |_| true);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(claim["timeoutSeconds"], 900.0, "3x 1 s is below the floor: {claim}");
+    assert_eq!(said_runs(&outcome.stderr), 5, "{outcome:?}");
+    assert!(!outcome.stderr.contains("gate: ceiling"), "{outcome:?}");
+    assert!(outcome.stdout.contains(", ceiling 900 s). Full output: "), "{outcome:?}");
+}
+
+#[test]
+fn a_ceiling_below_the_usual_p90_is_hinted_once_after_the_expected_line() {
+    let case = Case::new("durations-ceiling-hint");
+
+    let hint = "gate: the ceiling 5 min is below this command's usual p90 of 10 min\n";
+
+    // The command writes nothing until the go file comes, so the hint said while it waits came before its output.
+    let (claim, outcome) = held_run(&case, "300", Some((600.0, None)), &[], |stderr| stderr.contains(hint));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(claim["timeoutSeconds"], 300.0, "a given ceiling is never resolved: {claim}");
+    assert_eq!(outcome.stderr.matches(hint).count(), 1, "{outcome:?}");
+    assert_in_order(
+        &outcome.stderr,
+        &["gate: expected about 10 min (usual 10 min, p90 10 min, 5 runs)\n", hint],
+    );
+    let log = log(&case);
+    assert_eq!(log.matches(hint).count(), 1, "{log}");
+    assert_in_order(&log, &["gate: expected about 10 min", hint]);
+}
+
+#[test]
+fn no_ceiling_hint_at_or_above_the_p90_or_without_history_or_without_a_slot() {
+    let case = Case::new("durations-no-ceiling-hint");
+    quick_runs(&case, 5);
+    seed(&case, QUICK_KEY, 600.0, None);
+    let with_timeout = |words: Vec<&'static str>, timeout: &'static str| {
+        let mut words = words;
+        words[4] = timeout;
+        passing(case.gate(&words))
+    };
+
+    let at_p90 = with_timeout(run_words("out.log", &[], &QUICK), "600");
+    let no_slot = with_timeout(none_words("out.log", &[], &QUICK), "300");
+    let fresh = Case::new("durations-no-ceiling-hint-fresh");
+    let mut words = run_words("out.log", &[], &QUICK);
+    words[4] = "1";
+    let no_history = passing(fresh.gate(&words));
+
+    assert!(at_p90.stderr.contains("gate: expected about 10 min"), "{at_p90:?}");
+    for outcome in [&at_p90, &no_slot, &no_history] {
+        assert!(!outcome.stderr.contains("gate: the ceiling"), "{outcome:?}");
+    }
+    assert_eq!(no_slot.stderr, "", "{no_slot:?}");
+    assert_eq!(no_history.stderr, "", "{no_history:?}");
+}
+
+#[test]
+fn a_run_past_3x_its_usual_p90_is_hinted_once_and_not_killed() {
+    let case = Case::new("durations-hang-hint");
+    let hint = Regex::new(r"gate: still running after \d+ s, \d+x its usual p90 of 1 s\n").expect("the pattern is valid");
+
+    // Sampled every 100 ms, the run passes 3x its p90 of 1 s while its command waits.
+    let (_, outcome) = held_run(&case, "3600", Some((1.0, None)), &["--test-sample-ms", "100"], |stderr| {
+        hint.is_match(stderr)
+    });
+
+    assert_eq!(outcome.code, Some(0), "the hint kills nothing: {outcome:?}");
+    assert_eq!(hint.find_iter(&outcome.stderr).count(), 1, "{outcome:?}");
+    let log = log(&case);
+    assert_eq!(hint.find_iter(&log).count(), 1, "{log}");
+    assert!(!outcome.stderr.contains("TIMED OUT") && !log.contains("TIMED OUT"), "{outcome:?}");
+}
+
+#[test]
+fn a_run_that_ends_before_3x_its_p90_gets_no_hang_hint() {
+    let case = Case::new("durations-no-hang-hint");
+
+    let (_, outcome) = held_run(&case, "3600", Some((600.0, None)), &["--test-sample-ms", "100"], |stderr| {
+        stderr.contains("gate: expected about 10 min")
+    });
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(!outcome.stderr.contains("gate: still running"), "{outcome:?}");
+    assert!(!log(&case).contains("gate: still running"), "{outcome:?}");
+}
+
+#[test]
+fn a_routed_auto_run_without_builder_adjusted_seconds_runs_on_its_floor() {
+    let case = routed_case("durations-routed-auto");
+    let steps = |name: &str, lines: &[String]| {
+        let path = case.folder().join(name);
+        fs::write(&path, lines.join("\n")).expect("the step file can be written");
+        shown(&path)
+    };
+    let (call, go) = (case.folder().join("call.json"), case.folder().join("go"));
+    let passed = steps("passed.txt", &["status 0".to_owned()]);
+    let held = steps("held.txt", &[format!("record {}", shown(&call)), format!("wait {}", shown(&go))]);
+    let command = [r".\tool.exe", "exit", "0"];
+    for _ in 0..5 {
+        passing(case.gate(&heavy_words_with_limit("out.log", &["--test-remote-client", &passed], &command)));
+    }
+    // A wall p99 of 14 min would raise the floor were it read in place of the adjusted p99 the builder's runs lack.
+    seed(&case, " | tool exit 0", 840.0, None);
+    let mut words = heavy_words_with_limit("held.log", &["--test-remote-client", &held], &command);
+    words[4] = "auto:900";
+
+    let running = case.start(&words);
+    wait_for_file(&call);
+    let claim = only_file(&case, "slots");
+    fs::write(&go, "").expect("the go file can be made");
+    let outcome = running.finish();
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(
+        (&claim["kind"], &claim["timeoutSeconds"]),
+        (&Value::from("remote"), &Value::from(900.0)),
+        "{claim}"
+    );
+    let recorded: Value = serde_json::from_str(&fs::read_to_string(&call).expect("the client recorded its call")).expect("the record is JSON");
+    assert_eq!(recorded["timeout"], 900, "{recorded}");
+    assert!(outcome.stderr.contains("gate: expected about 14 min"), "{outcome:?}");
+    assert!(!outcome.stderr.contains("gate: ceiling"), "{outcome:?}");
+    assert!(outcome.stdout.contains("(wall clock, ceiling 900 s)"), "{outcome:?}");
+}

@@ -3,7 +3,7 @@
 
 use std::path::Path;
 
-use gate_args::{CutoverRequest, RunRequest, StopRequest};
+use gate_args::{Ceiling, CutoverRequest, RunRequest, StopRequest};
 use serde_json::json;
 
 use crate::resolve::ResolvedRoot;
@@ -40,10 +40,15 @@ pub(crate) fn run(request: &RunRequest, log: &Path, root: &ResolvedRoot) -> Stri
         "parentJobTrusted": seams.parent_job_trusted,
         "jobBreakaway": seams.job_breakaway,
     });
+    let (timeout, timeout_auto) = match request.timeout {
+        Ceiling::Given(seconds) => (seconds, false),
+        Ceiling::Auto(floor) => (floor, true),
+    };
     json!({
         "mode": "run",
         "slot": request.slot.as_str(),
-        "timeout": request.timeout,
+        "timeout": timeout,
+        "timeoutAuto": timeout_auto,
         "log": log.to_string_lossy(),
         "stall": request.stall,
         "tail": request.tail,

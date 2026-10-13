@@ -6,6 +6,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Abandoned slot**: a slot taken from a gate that died holding it, seen as an abandoned mutex or, when the take is clean, a claim whose pid and start are no longer alive; the next gate takes it as its own and journals the takeover.
 - **Archive**: the gzipped `release` lines of a rolled journal, kept in `<state root>\archive\events-<stamp>.jsonl.gz` for 180 days; the gate whose append rolled the journal writes it before releasing the journal mutex.
 - **Aside copy**: the old `gate.exe` an install moves to `gate.exe.<stamp>.<pid>.old` beside the new one; a later install deletes it once no process holds it.
+- **Auto ceiling**: a `--timeout auto:<n>` ceiling, which treats `n` as a floor and resolves at each take to `max(n, ceil(3 x the command's adjusted p99))`, capped at 2147483647; with no adjusted p99 it is `n`.
 - **Back commit**: the commit at the back ref, holding the files a routed command changed on the builder, with the run's snapshot as its only parent; a sync-back kept or applied it.
 - **Back ref**: either `refs/gate-back/<key>` on the builder, where the box writes the commit of the files its command changed, or a local `refs/gate-remote/<key>-back` ref, that result kept by the gate when it could not apply it; the bridge commit's choice of parent skips the local one.
 - **Backfill guest**: a waiting gate admitted, during a critical drain, onto a slot the critical gate lends, because its expected run ends before the drain's shadow end; one still running when the drain completes is killed and re-queued.
@@ -23,7 +24,8 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Builder**: a remote Windows machine, named in a PC's own `remote.json`, that runs routed heavy commands with its own copy of `gate.exe`.
 - **Builders list**: the builders `gate push` reaches: `host` of `remote.json`, then each entry of its optional `hosts` in file order, an entry equal to an earlier one in any letter case skipped. Routing uses `host` alone.
 - **Burn**: `gate burn`, one process that spins a number of threads on the CPU for a set time at the priority it inherited, taking no slot and enforcing no 120 s cap (it allows up to 180 s); the load-burn tool runs it inside a critical gate and applies the 120 s cap. `gate run --burn` is the planned owner of the slot, the command and the cap (GATE-160).
-- **Ceiling**: the `--timeout` limit, counted in load-adjusted seconds; passing it kills the command as TIMED OUT.
+- **Ceiling**: the `--timeout` limit, counted in load-adjusted seconds, as given or, for an auto ceiling, as the take resolved it; passing it kills the command as TIMED OUT.
+- **Ceiling hint**: the line `gate: the ceiling <n> is below this command's usual p90 of <p90>`, said after the expected-time line when the resolved ceiling is under the estimate's p90; the line `gate: ceiling <n> (3x ... p99 ..., above the given <floor>)` beside it says history raised an auto ceiling.
 - **Checkout filter**: a `filter` driver (or `ident`) that a path's git attributes put its worktree file through; a sync-back that writes or deletes such a path is refused, since `git apply` would run the user's filter program on it.
 - **Claim**: the JSON file `slots\<name>.json` a gate writes while it holds a slot, naming its pid, command, log and ceiling.
 - **Compatibility layer**: `gate.exe`'s acceptance of the PowerShell gate's argument form (`-Log`, `-TimeoutSeconds`, `-Slot` and the rest), kept until no caller uses it.
@@ -56,6 +58,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Family key**: the exact key with each filter value replaced by `<filter>`, so runs of one command with different filters count together; an estimate from it is marked as such.
 - **Free share**: the fraction of the cores the command could use that other work left free in a sample, at least 5%; the load-adjusted clock advances by it.
 - **Generation**: the PowerShell gate or `gate.exe`, as `gate-state` tells them apart (`Generation`): ops-tower reads the PowerShell gate's files until the cutover flag exists and then `gate.exe`'s, plus the PowerShell claims of a slot whose mutex is open.
+- **Hang hint**: the line `gate: still running after <n>, <k>x its usual p90 of <p90>`, said once when a run passes 3x its estimate's p90 (never for a p90 under 1 s); it kills nothing.
 - **Hash cache**: the file `remote\<key>.outputs-hashes` in the state root, the outputs manifest line of a worktree's last built manifest, holding only its files last written at least 2 s before that build, and the files a complete outputs install put in place, at the stamp it read after the move and the hash it verified.
 
   The next build takes the hash of each file whose size and last write, as the open file's handle reads them, still match from it instead of reading the file, except while the pending marker stands.

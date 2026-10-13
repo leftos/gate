@@ -587,11 +587,11 @@ pub(crate) fn listed_tickets(root: &Path, own: (u32, u64)) -> io::Result<Vec<Lis
     Ok(listed)
 }
 
-/// Whose claim a slot holds: the gate, its request and log, the remote tag of a routed run's remote slot, and what the
-/// durations store expects of the run, `None` without history.
+/// Whose claim a slot holds: the gate, its ceiling in whole seconds as the run resolved it, its log, the remote tag of a
+/// routed run's remote slot, and what the durations store expects of the run, `None` without history.
 pub(crate) struct ClaimOf<'a> {
     pub gate: &'a ThisGate,
-    pub request: &'a RunRequest,
+    pub ceiling: u64,
     pub log: &'a Path,
     pub remote: Option<&'a RemoteTag>,
     pub expected: Option<&'a Map<String, Value>>,
@@ -611,7 +611,7 @@ pub(crate) fn write_claim(held: &Held, kind: ClaimKind, of: &ClaimOf<'_>, consol
 fn claim(held: &Held, kind: ClaimKind, of: &ClaimOf<'_>) -> io::Result<Claim> {
     let ClaimOf {
         gate,
-        request,
+        ceiling,
         log,
         remote,
         expected,
@@ -625,7 +625,7 @@ fn claim(held: &Held, kind: ClaimKind, of: &ClaimOf<'_>) -> io::Result<Claim> {
         cwd: gate.cwd.clone().map_err(io::Error::other)?,
         command: gate.command.clone(),
         log: log.to_string_lossy().into_owned(),
-        timeout_seconds: seconds(request.timeout),
+        timeout_seconds: seconds(ceiling),
         remote: remote.map(|_| true),
         host: remote.map(|tag| tag.host.clone()),
         key: remote.map(|tag| tag.key.clone()),

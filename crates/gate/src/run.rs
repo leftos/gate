@@ -13,7 +13,7 @@ use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 use std::{fs, io};
 
-use gate_args::{ProgramSearch, RunRequest, Slot, batch_command_line, batch_refusal, command_line, is_batch_target, resolve_program};
+use gate_args::{Ceiling, ProgramSearch, RunRequest, Slot, batch_command_line, batch_refusal, command_line, is_batch_target, resolve_program};
 use gate_router::{
     BuildSettings, BuildTarget, Place, RemoteRun, Route, build_settings, dotnet_builds, dotnet_target, sdk_build_target, without_no_build,
     work_folder_key,
@@ -28,7 +28,9 @@ use crate::acquire;
 use crate::answer::USAGE_STATUS;
 use crate::console::Console;
 use crate::covered::Covered;
-use crate::durations::{RunDurations, RunIdentity, expected_field, expected_line};
+use crate::durations::{
+    Resolved, RunDurations, RunIdentity, Usual, ceiling_hint, expected_field, expected_line, raised_ceiling_line, resolve_ceiling,
+};
 use crate::environment::{self, Variables};
 use crate::escaped::{self, Found, Reach, Reached, Recorded};
 use crate::journal::{self, RunJournal};
@@ -144,11 +146,7 @@ pub(crate) fn run(request: &RunRequest, log: &Path, root: &ResolvedRoot, environ
     run.durations = run.open_durations(&placed);
     say_nesting(run.nesting, run.request, console);
     run.queue(&route, console);
-    let mut hold = Hold {
-        taken: None,
-        machine: None,
-        took: Instant::now(),
-    };
+    let mut hold = Hold::nothing();
     let watched = panic::catch_unwind(AssertUnwindSafe(|| run.through(&route, plan, local, &mut hold, console)));
     let status = match watched {
         Ok(Some((ended, here))) => {
@@ -515,13 +513,14 @@ struct Run<'a> {
     durations: Option<RunDurations>,
 }
 
-/// What a take of a pool's slot is journalled and claimed with: the run's state root, gate, request and log, its remote
-/// tag while it has one, its journal, the parent gate its `take` names, and what the durations store expects of the
-/// run, which its claim carries.
+/// What a take of a pool's slot is journalled and claimed with: the run's state root, gate, request, ceiling and log,
+/// its remote tag while it has one, its journal, the parent gate its `take` names, and what the durations store expects
+/// of the run, which its claim carries.
 pub(crate) struct Taker<'t> {
     pub root: &'t ResolvedRoot,
     pub gate: &'t ThisGate,
     pub request: &'t RunRequest,
+    pub ceiling: u64,
     pub log: &'t Log,
     pub tag: Option<&'t RemoteTag>,
     pub journal: &'t mut RunJournal,
@@ -543,7 +542,7 @@ impl Taker<'_> {
             .write(&take_event(vec![name], waited, abandoned, self.parent_pid), self.tag, console);
         let of = ClaimOf {
             gate: self.gate,
-            request: self.request,
+            ceiling: self.ceiling,
             log: self.log.path(),
             remote: self.tag,
             expected: self.expected,
@@ -553,16 +552,79 @@ impl Taker<'_> {
     }
 }
 
-/// Says the expected-time line of the slot just taken, for its `estimate`; nothing for a key without history.
-fn say_expected(estimate: Option<&Estimate>, console: &mut Console) {
-    if let Some(estimate) = estimate {
-        console.err(&expected_line(estimate));
+/// Says the lines of the slot just taken, for its `estimate`: the expected-time line, then the raised-ceiling line when
+/// history raised the run's auto ceiling above its floor to `resolved`, then the ceiling hint when `resolved` is below
+/// the usual p90; nothing for a key without history.
+fn say_expected(estimate: Option<&Estimate>, resolved: Resolved, console: &mut Console) {
+    let Some(estimate) = estimate else {
+        return;
+    };
+    console.err(&expected_line(estimate));
+    say_ceiling(estimate, resolved, console);
+}
+
+/// Says the ceiling lines of a take for its `estimate`: the raised-ceiling line when history raised the run's auto
+/// ceiling above its floor to `resolved`, then the ceiling hint when `resolved` is below the usual p90.
+fn say_ceiling(estimate: &Estimate, resolved: Resolved, console: &mut Console) {
+    if let Some((p99, floor)) = resolved.raised {
+        console.err(&raised_ceiling_line(resolved.seconds, p99, floor, estimate.family));
+    }
+    if let Some(hint) = ceiling_hint(resolved.seconds, estimate) {
+        console.err(&hint);
     }
 }
 
-/// The client's call for `remote`, with the run's log, limits and interrupt, made of the run's parts so the run's
+/// The figures a run runs under, which its claims, its watch, its remote call and its passed line read: its ceiling in
+/// whole seconds, and the usual p90 of the slot it took, which the hang hint reads, the local watch's or the remote
+/// client's; `None` without one.
+#[derive(Clone, Copy)]
+struct Figures {
+    ceiling: u64,
+    usual: Option<Usual>,
+}
+
+impl Figures {
+    /// The figures of a run that takes no slot of its own: its `ceiling`'s floor, and no p90.
+    fn floor(ceiling: Ceiling) -> Figures {
+        Figures {
+            ceiling: ceiling.floor(),
+            usual: None,
+        }
+    }
+
+    /// The figures a take resolves for `ceiling` from the `estimate` of the slot it takes, with how it resolved the
+    /// ceiling.
+    fn resolved(ceiling: Ceiling, estimate: Option<&Estimate>) -> (Figures, Resolved) {
+        let resolved = resolve_ceiling(ceiling, estimate);
+        let figures = Figures {
+            ceiling: resolved.seconds,
+            usual: estimate.and_then(Usual::of),
+        };
+        (figures, resolved)
+    }
+}
+
+/// The parts of a run its client's call is made of, borrowed apart from the run's client.
+#[derive(Clone, Copy)]
+struct CallParts<'r> {
+    request: &'r RunRequest,
+    /// The figures of the run's take.
+    figures: Figures,
+    log: &'r Log,
+    host: &'r Host,
+    root: &'r ResolvedRoot,
+}
+
+/// The client's call for `remote`, with the run's log, limits and interrupt, made of the run's `parts` so the run's
 /// client can be borrowed apart from them.
-fn call_of<'r>(request: &'r RunRequest, log: &'r Log, host: &Host, root: &'r ResolvedRoot, remote: &'r RemoteRun) -> RemoteCall<'r> {
+fn call_of<'r>(parts: CallParts<'r>, remote: &'r RemoteRun) -> RemoteCall<'r> {
+    let CallParts {
+        request,
+        figures: Figures { ceiling, usual },
+        log,
+        host,
+        root,
+    } = parts;
     RemoteCall {
         host: &remote.host,
         key: &remote.key,
@@ -573,7 +635,8 @@ fn call_of<'r>(request: &'r RunRequest, log: &'r Log, host: &Host, root: &'r Res
         outputs: &remote.outputs,
         outputs_withheld: remote.outputs_withheld,
         log: log.path(),
-        timeout: request.timeout,
+        timeout: ceiling,
+        usual,
         stall: request.stall,
         tail: request.tail,
         no_markers: request.no_markers,
@@ -591,12 +654,24 @@ struct Hold {
     took: Instant,
 }
 
+impl Hold {
+    /// A hold of nothing yet, its take counted from now until a slot or the machine is taken.
+    fn nothing() -> Hold {
+        Hold {
+            taken: None,
+            machine: None,
+            took: Instant::now(),
+        }
+    }
+}
+
 /// How a wait for a slot ended.
 enum Taking {
-    /// The slot was taken at this moment.
-    Took(Instant),
-    /// The run's light parent lent it its slot while a critical request drains; the run left the queue.
-    Lent,
+    /// The slot was taken at this moment, and the run runs under these figures.
+    Took(Instant, Figures),
+    /// The run's light parent lent it its slot while a critical request drains; the run left the queue, and runs
+    /// under these figures.
+    Lent(Figures),
     /// A Ctrl+C ended the wait.
     Interrupted,
     /// The remote pool stayed full past the wait's limit.
@@ -619,6 +694,14 @@ enum Remotely {
 enum Pass<'h> {
     Here(Timing),
     On(&'h str, Duration),
+}
+
+/// A run whose verdict may pass: how long it ran, as its passed line says, and the ceiling it ran under in whole
+/// seconds.
+#[derive(Clone, Copy)]
+struct Passing<'h> {
+    pass: Pass<'h>,
+    ceiling: u64,
 }
 
 /// How long a command ran: by the wall clock, in load-adjusted seconds, `None` once the sampler failed and they are
@@ -803,21 +886,22 @@ impl Run<'_> {
     /// ended; `None` when a Ctrl+C ended the wait for a slot.
     fn here(&mut self, plan: Plan, hold: &mut Hold, console: &mut Console) -> Option<Ended> {
         let nesting = self.nesting;
+        let floor = Figures::floor(self.request.timeout);
         if nesting.covering().is_some() {
-            return Some(self.command(plan, console));
+            return Some(self.command(plan, floor, console));
         }
         if let Nesting::Under(parent) = nesting {
             if self.lent {
-                return Some(self.on_parent(parent, plan, console));
+                return Some(self.on_parent(parent, plan, floor, console));
             }
             console.err(&parent.uncovered_line(self.request.slot));
         }
         match self.take_own(hold, console) {
-            Taking::Took(took) => {
+            Taking::Took(took, figures) => {
                 hold.took = took;
-                Some(self.command(plan, console))
+                Some(self.command(plan, figures, console))
             }
-            Taking::Lent => Some(self.lent_as_it_waited(plan, hold, console)),
+            Taking::Lent(figures) => Some(self.lent_as_it_waited(plan, hold, figures, console)),
             Taking::Interrupted => None,
             // Only a remote pool has a wait limit, so a local take never times out.
             Taking::Full => unreachable!("a local pool is never full past a limit"),
@@ -841,26 +925,27 @@ impl Run<'_> {
         let parent_pid = self.nesting.uncovering().map(|parent| parent.pid);
         self.journal
             .write(&take_event(Vec::new(), 0.0, Vec::new(), parent_pid), self.tag.as_ref(), console);
-        Taking::Took(took)
+        Taking::Took(took, Figures::floor(self.request.timeout))
     }
 
-    /// Runs the command on the slot of the light parent that lent it as the gate waited ([`Run::on_parent`]); `hold`'s
-    /// time starts at the end of the wait, which a release journalled for a command that never ran counts from.
-    fn lent_as_it_waited(&mut self, plan: Plan, hold: &mut Hold, console: &mut Console) -> Ended {
+    /// Runs the command on the slot of the light parent that lent it as the gate waited ([`Run::on_parent`]), under the
+    /// `figures` of its take; `hold`'s time starts at the end of the wait, which a release journalled for a command that
+    /// never ran counts from.
+    fn lent_as_it_waited(&mut self, plan: Plan, hold: &mut Hold, figures: Figures, console: &mut Console) -> Ended {
         let nesting = self.nesting;
         let Nesting::Under(parent) = nesting else {
             unreachable!("only a gate under a light parent is lent its parent's slot")
         };
         hold.took = Instant::now();
-        self.on_parent(parent, plan, console)
+        self.on_parent(parent, plan, figures, console)
     }
 
     /// Runs the command on the slot of the light parent `parent`, which lends it while a critical request drains: hands
     /// the command the parent's marker, then says so, journals `parent` with the parent's pid and runs it. The run
     /// takes, claims and releases no slot. A command environment that cannot be built fails the gate (status 1) before
     /// it says or journals the lend: a gate lent the slot before it queued then journals nothing, and one that queued
-    /// journals its release as any gate that fails before its command does.
-    fn on_parent(&mut self, parent: &Parent, plan: Plan, console: &mut Console) -> Ended {
+    /// journals its release as any gate that fails before its command does. The command runs under `figures`.
+    fn on_parent(&mut self, parent: &Parent, plan: Plan, figures: Figures, console: &mut Console) -> Ended {
         let plan = match plan.handing_on(self.root, &parent.marker) {
             Ok(plan) => plan,
             Err(NotRun { status, line }) => {
@@ -878,7 +963,7 @@ impl Run<'_> {
             parent.pid
         ));
         self.journal.write(&JournalEvent::Parent { parent_pid: parent.pid }, None, console);
-        self.command(plan, console)
+        self.command(plan, figures, console)
     }
 
     /// Runs the routed command on the builder: takes the client's work-folder key lock and a remote slot into `hold`,
@@ -891,8 +976,8 @@ impl Run<'_> {
         if let Err(why) = self.client.ready() {
             return self.fell_back(FallbackReason::Client, &RemoteOutcome::not_started(why), None, console);
         }
-        let _key = match self.hold_remote(remote, hold, console) {
-            Ok(key) => key,
+        let (_key, figures) = match self.hold_remote(remote, hold, console) {
+            Ok(held) => held,
             Err(remotely) => return remotely,
         };
         // A Ctrl+C that came once the remote slot was held, before the client was called, ends the run as an
@@ -901,7 +986,14 @@ impl Run<'_> {
             return Remotely::Ended(self.interrupted_before_start(console));
         }
         let started = Instant::now();
-        let call = call_of(self.request, &self.log, &self.host, self.root, remote);
+        let parts = CallParts {
+            request: self.request,
+            figures,
+            log: &self.log,
+            host: &self.host,
+            root: self.root,
+        };
+        let call = call_of(parts, remote);
         let outcome = self.client.run(&call);
         let fallback = outcome.fallback();
         // A Ctrl+C during the call wins over a refusal: the command never runs here.
@@ -912,7 +1004,7 @@ impl Run<'_> {
             return self.fell_back(reason, &outcome, hold.taken.take(), console);
         }
         self.leave_nothing_back(remote, &outcome, console);
-        Remotely::Ended(self.remote_ended(&remote.host, &outcome, started, console))
+        Remotely::Ended(self.remote_ended(&remote.host, &outcome, started, figures.ceiling, console))
     }
 
     /// Updates the worktree's nothing-back record after a routed run that ended on the builder, killed, interrupted or
@@ -955,11 +1047,12 @@ impl Run<'_> {
     }
 
     /// Takes the work-folder key lock the run's client takes, without waiting, then a remote slot into `hold`: the
-    /// lock, held until the remote attempt ends. Else how the run goes on: here, `busy`, when the lock is held
-    /// elsewhere or cannot be opened or taken, which says why; here, `full`, when the pool stayed full; or interrupted
-    /// during the wait.
-    fn hold_remote(&mut self, remote: &RemoteRun, hold: &mut Hold, console: &mut Console) -> Result<Option<OwnedMutexGuard>, Remotely> {
-        let held = self.client.hold_key(&self.call(remote));
+    /// lock, held until the remote attempt ends, with the figures of the remote take. Else how the run goes on: here,
+    /// `busy`, when the lock is held elsewhere or cannot be opened or taken, which says why; here, `full`, when the pool
+    /// stayed full; or interrupted during the wait.
+    fn hold_remote(&mut self, remote: &RemoteRun, hold: &mut Hold, console: &mut Console) -> Result<(Option<OwnedMutexGuard>, Figures), Remotely> {
+        // The key lock reads neither figure of the call; no take has resolved them yet.
+        let held = self.client.hold_key(&self.call(remote, Figures::floor(self.request.timeout)));
         let key = match held {
             Ok(key) => key,
             Err(why) => {
@@ -969,18 +1062,28 @@ impl Run<'_> {
                 return Err(self.fell_back(FallbackReason::Busy, &RemoteOutcome::default(), None, console));
             }
         };
-        match self.take(Pool::Remote(remote.slots), None, &mut hold.taken, console) {
-            Taking::Took(took) => hold.took = took,
-            Taking::Lent => unreachable!("only a local wait is lent a parent's slot"),
+        let figures = match self.take(Pool::Remote(remote.slots), None, &mut hold.taken, console) {
+            Taking::Took(took, figures) => {
+                hold.took = took;
+                figures
+            }
+            Taking::Lent(_) => unreachable!("only a local wait is lent a parent's slot"),
             Taking::Interrupted => return Err(Remotely::Interrupted),
             Taking::Full => return Err(self.fell_back(FallbackReason::Full, &RemoteOutcome::default(), None, console)),
-        }
-        Ok(key)
+        };
+        Ok((key, figures))
     }
 
-    /// The client's call for `remote`, with the run's log, limits and interrupt.
-    fn call<'r>(&'r self, remote: &'r RemoteRun) -> RemoteCall<'r> {
-        call_of(self.request, &self.log, &self.host, self.root, remote)
+    /// The client's call for `remote` under `figures`, with the run's log, limits and interrupt.
+    fn call<'r>(&'r self, remote: &'r RemoteRun, figures: Figures) -> RemoteCall<'r> {
+        let parts = CallParts {
+            request: self.request,
+            figures,
+            log: &self.log,
+            host: &self.host,
+            root: self.root,
+        };
+        call_of(parts, remote)
     }
 
     /// Gives up the remote attempt for `reason`: journals the fallback, the run's last line with the remote tag, while
@@ -1215,7 +1318,7 @@ impl Run<'_> {
     /// Ends a run the client ran to its end: the verdict with the passed line on `host`, its markers not scanned when
     /// the client killed the run or the console was interrupted, and the facts its release carries, with no adjusted
     /// seconds. It is a kill only when the client killed it, by the kill line in the log.
-    fn remote_ended(&mut self, host: &str, outcome: &RemoteOutcome, started: Instant, console: &mut Console) -> Ended {
+    fn remote_ended(&mut self, host: &str, outcome: &RemoteOutcome, started: Instant, ceiling: u64, console: &mut Console) -> Ended {
         let interrupted = self.host.interrupt.is_some_and(Interrupt::is_raised);
         let wall = started.elapsed();
         // A client that wrote nothing left no log; the verdict reads one.
@@ -1223,7 +1326,11 @@ impl Run<'_> {
             let problem = format!("cannot create the log {}: {error}", self.log.path().display());
             return self.gate_failed(&problem, None, console);
         }
-        match self.verdict(outcome.status, Some(Pass::On(host, wall)), outcome.killed || interrupted, &[], console) {
+        let passing = Passing {
+            pass: Pass::On(host, wall),
+            ceiling,
+        };
+        match self.verdict(outcome.status, Some(passing), outcome.killed || interrupted, &[], console) {
             Ok(status) => {
                 let kill = if outcome.killed { self.kill_line(console) } else { None };
                 Ended {
@@ -1255,16 +1362,19 @@ impl Run<'_> {
 
     /// What a take of the run's slot is journalled and claimed with, naming `parent_pid` ([`Taker`]), with the parts the
     /// caller borrows beside it: the survey the run reads the other gates with, where it keeps the slot it takes once
-    /// a covering parent ends ([`Run::late`]), and its covered marker ([`Run::covered`]). The claim carries `expected`.
+    /// a covering parent ends ([`Run::late`]), and its covered marker ([`Run::covered`]). The claim carries `expected`
+    /// and the run's `ceiling`.
     fn taker<'t>(
         &'t mut self,
         parent_pid: Option<u32>,
         expected: Option<&'t Map<String, Value>>,
+        ceiling: u64,
     ) -> (Taker<'t>, &'t mut Survey, &'t mut Option<LateSlot>, &'t mut Option<Covered>) {
         let taker = Taker {
             root: self.root,
             gate: &self.gate,
             request: self.request,
+            ceiling,
             log: &self.log,
             tag: self.tag.as_ref(),
             journal: &mut self.journal,
@@ -1314,7 +1424,13 @@ impl Run<'_> {
             Waited::Lent => {
                 wait.end(console);
                 slots::wake_waiters(self.root, &mut self.survey, console);
-                return Taking::Lent;
+                // The command runs on the parent's slot, under the ceiling this take's estimate resolves, which the
+                // take says as a take of its own slot does; a lent take says no expected-time line.
+                let (figures, resolved) = Figures::resolved(self.request.timeout, estimate.as_ref());
+                if let Some(estimate) = &estimate {
+                    say_ceiling(estimate, resolved, console);
+                }
+                return Taking::Lent(figures);
             }
             Waited::Interrupted => {
                 self.abandon(wait, pool, queued, console);
@@ -1330,10 +1446,11 @@ impl Run<'_> {
         wait.end(console);
         let took = Instant::now();
         let parent_pid = self.nesting.uncovering().map(|parent| parent.pid);
-        let (mut taker, survey, _, _) = self.taker(parent_pid, expected.as_ref());
+        let (figures, resolved) = Figures::resolved(self.request.timeout, estimate.as_ref());
+        let (mut taker, survey, _, _) = self.taker(parent_pid, expected.as_ref(), figures.ceiling);
         taker.took(taken, pool, waited, survey, console);
-        say_expected(estimate.as_ref(), console);
-        Taking::Took(took)
+        say_expected(estimate.as_ref(), resolved, console);
+        Taking::Took(took, figures)
     }
 
     /// Waits for the machine as a critical gate and takes it into `held` once it holds every heavy and unreserved light
@@ -1379,17 +1496,18 @@ impl Run<'_> {
         self.journal.write(&take, None, console);
         console.err(&line);
         let took = Instant::now();
+        let (figures, resolved) = Figures::resolved(self.request.timeout, estimate.as_ref());
         let of = ClaimOf {
             gate: &self.gate,
-            request: self.request,
+            ceiling: figures.ceiling,
             log: self.log.path(),
             remote: None,
             expected: expected.as_ref(),
         };
         machine.write_claim(&of, console);
         slots::wake_waiters(self.root, &mut self.survey, console);
-        say_expected(estimate.as_ref(), console);
-        Taking::Took(took)
+        say_expected(estimate.as_ref(), resolved, console);
+        Taking::Took(took, figures)
     }
 
     /// Leaves the queue of `pool` after a Ctrl+C: deletes the ticket, wakes the waiters, says so and journals the
@@ -1459,8 +1577,8 @@ impl Run<'_> {
         }
     }
 
-    /// Starts the command in the gate's job and sees it to its end.
-    fn command(&mut self, plan: Plan, console: &mut Console) -> Ended {
+    /// Starts the command in the gate's job and sees it to its end under `figures`.
+    fn command(&mut self, plan: Plan, figures: Figures, console: &mut Console) -> Ended {
         let launch = match plan.launch {
             Ok(launch) => launch,
             Err(message) => return self.not_started(&plan.word, plan.resolved.as_deref(), &message, console),
@@ -1483,7 +1601,7 @@ impl Run<'_> {
         };
         let start = Start::now();
         match launch.start_suspended().and_then(|suspended| suspended.assign_and_resume(&job)) {
-            Ok(running) => self.watched(&job, &running, &start, console),
+            Ok(running) => self.watched(&job, &running, &start, figures, console),
             Err(LaunchError::CreateProcess { message, .. }) => self.not_started(&plan.word, plan.resolved.as_deref(), &message, console),
             Err(error) => self.gate_failed(&error.to_string(), None, console),
         }
@@ -1503,8 +1621,8 @@ impl Run<'_> {
     }
 
     /// Watches the started command to its exit, a kill or a Ctrl+C, then reaches the verdict. Should the gate fail
-    /// or panic first, the job is terminated, so the command does not outlive the run.
-    fn watched(&mut self, job: &Job, running: &Running, start: &Start, console: &mut Console) -> Ended {
+    /// or panic first, the job is terminated, so the command does not outlive the run. The command runs under `figures`.
+    fn watched(&mut self, job: &Job, running: &Running, start: &Start, figures: Figures, console: &mut Console) -> Ended {
         // Copies of the run's own references, so the stopper holds no borrow of the run while it is watched.
         let (request, root) = (self.request, self.root);
         let recorded = RefCell::new(Recorded::default());
@@ -1512,6 +1630,7 @@ impl Run<'_> {
             job,
             running,
             recorded: Some(&recorded),
+            figures,
         };
         let mut stopper = Stopper {
             ends: Ender {
@@ -1545,9 +1664,10 @@ impl Run<'_> {
         console: &mut Console,
     ) -> Result<(Watched, Timing), String> {
         let (nesting, host, arrived, lent) = (self.nesting, self.host, self.arrived, self.lent);
+        let Figures { ceiling, usual } = started.figures;
         let covering = nesting.covering();
         // A run a parent's slot covers has no durations, so its late take's claim expects nothing.
-        let (taker, survey, held, covered) = self.taker(covering.map(|parent| parent.pid), None);
+        let (taker, survey, held, covered) = self.taker(covering.map(|parent| parent.pid), None, ceiling);
         let (root, gate, request, log) = (taker.root, taker.gate, taker.request, taker.log);
         let late = match (covering, Takes::of(request.slot), covered) {
             (Some(parent), Takes::Pool(pool), Some(covered)) => {
@@ -1568,6 +1688,8 @@ impl Run<'_> {
             job: started.job,
             running: started.running,
             log,
+            ceiling,
+            usual,
             interrupt: host.interrupt,
             runs_as: nesting.runs_as(request.slot),
             root,
@@ -1600,7 +1722,7 @@ impl Run<'_> {
             recorded: records_after(&watched, started.recorded),
             ..started
         };
-        let Started { job, running, recorded } = started;
+        let Started { job, running, recorded, .. } = started;
         match watched {
             Watched::Exited(code) => {
                 let exited = i64::from(code.cast_signed());
@@ -1641,7 +1763,11 @@ impl Run<'_> {
     /// `diagnostics` is the block a kill wrote to the log, whose lines the verdict's tail leaves out.
     fn ended(&mut self, outcome: &Outcome<'_>, unscanned: bool, diagnostics: &[String], started: Started<'_>, console: &mut Console) -> Ended {
         let timing = self.without_nested_cores(outcome.timing, console);
-        match self.verdict(outcome.exited, Some(Pass::Here(timing)), unscanned, diagnostics, console) {
+        let passing = Passing {
+            pass: Pass::Here(timing),
+            ceiling: started.figures.ceiling,
+        };
+        match self.verdict(outcome.exited, Some(passing), unscanned, diagnostics, console) {
             Ok(status) => Ended {
                 status,
                 facts: Some(RunFacts {
@@ -1694,13 +1820,14 @@ impl Run<'_> {
     }
 
     /// Completes the log with the notes so far, and says the marker lines of a failure, the log's tail and the verdict
-    /// line; the gate's status. `exited` is the command's status, and `pass` how long it ran for the passed line, `None`
-    /// when it never started; a run the gate ended itself is `unscanned`, its markers not read. `diagnostics` is the
-    /// block a kill wrote to the log: the log keeps it, and the tail leaves exactly its lines out.
+    /// line; the gate's status. `exited` is the command's status, and `passing` how long it ran and under what ceiling
+    /// for the passed line, `None` when it never started; a run the gate ended itself is `unscanned`, its markers not
+    /// read. `diagnostics` is the block a kill wrote to the log: the log keeps it, and the tail leaves exactly its lines
+    /// out.
     fn verdict(
         &mut self,
         exited: i64,
-        pass: Option<Pass<'_>>,
+        passing: Option<Passing<'_>>,
         unscanned: bool,
         diagnostics: &[String],
         console: &mut Console,
@@ -1725,12 +1852,12 @@ impl Run<'_> {
         for line in &tail {
             console.out(line);
         }
-        match pass {
-            Some(pass) if status == 0 => {
+        match passing {
+            Some(Passing { pass, ceiling }) if status == 0 => {
                 if let Some(line) = self.cores_hint(pass) {
                     console.note_out(&line);
                 }
-                console.note_out(&self.passed_line(pass, &shown));
+                console.note_out(&passed_line(pass, ceiling, &shown));
             }
             _ => console.err(&format!("gate: FAILED (status {status}). Full output: {shown}")),
         }
@@ -1748,11 +1875,6 @@ impl Run<'_> {
                 Pass::On(..) => None,
             },
         })
-    }
-
-    /// The passed line of a run that ran as `pass` says, its log shown as `shown`.
-    fn passed_line(&self, pass: Pass<'_>, shown: &str) -> String {
-        passed_line(pass, self.request.timeout, shown)
     }
 
     /// The log's first marker lines, none when the run turned the scan off or is `unscanned`, and its tail: the last
@@ -1789,7 +1911,7 @@ impl Run<'_> {
     /// Says the gate's own failure, terminates the job of a command that started, and completes the log; status 1.
     fn gate_failed(&mut self, problem: &str, started: Option<Started<'_>>, console: &mut Console) -> Ended {
         console.err(&format!("gate: the gate failed while running the command: {problem}"));
-        if let Some(Started { job, running, recorded }) = started {
+        if let Some(Started { job, running, recorded, .. }) = started {
             stop(&self.ender(job, running), recorded, console);
         }
         if let Err(error) = self.log.finish(console) {
@@ -1855,13 +1977,14 @@ impl Ends for Ender<'_> {
     }
 }
 
-/// The command's started job and process, and the processes outside the job its watch records, which every end of the
-/// run but the command's own exit ends: `None` once the command has exited.
+/// The command's started job and process, the processes outside the job its watch records, which every end of the run
+/// but the command's own exit ends: `None` once the command has exited; and the figures it runs under.
 #[derive(Clone, Copy)]
 struct Started<'a> {
     job: &'a Job,
     running: &'a Running,
     recorded: Option<&'a RefCell<Recorded>>,
+    figures: Figures,
 }
 
 /// The processes outside the job the watch `recorded` that an end of the run after `watched` reaches: none after the

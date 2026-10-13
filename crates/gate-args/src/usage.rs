@@ -2,7 +2,7 @@
 
 /// The usage, without a final line feed.
 pub const USAGE: &str = "\
-usage: gate run --slot heavy|light|critical|none --timeout <seconds> --log <path> [options] -- <command> [args...]
+usage: gate run --slot heavy|light|critical|none --timeout <seconds>|auto:<seconds> --log <path> [options] -- <command> [args...]
        gate stop-tree <pid>
        gate cutover
        gate push

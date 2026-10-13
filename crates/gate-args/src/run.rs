@@ -6,8 +6,8 @@ use std::path::PathBuf;
 
 use crate::problem::{Problem, Required, Spelling};
 use crate::request::{
-    BurnRequest, CutoverRequest, CutoverSeams, DEFAULT_STALL_SECONDS, DEFAULT_TAIL_LINES, ExpectRequest, PushRequest, PushSeams, RunRequest, Slot,
-    StopRequest, TestSeams,
+    BurnRequest, Ceiling, CutoverRequest, CutoverSeams, DEFAULT_STALL_SECONDS, DEFAULT_TAIL_LINES, ExpectRequest, PushRequest, PushSeams, RunRequest,
+    Slot, StopRequest, TestSeams,
 };
 use crate::values;
 
@@ -118,7 +118,7 @@ pub(crate) enum RunOption {
 #[derive(Default)]
 pub(crate) struct RunBuilder {
     slot: Option<Slot>,
-    timeout: Option<u64>,
+    timeout: Option<Ceiling>,
     log: Option<PathBuf>,
     stall: Option<u64>,
     tail: Option<u64>,
@@ -137,9 +137,19 @@ pub(crate) struct RunBuilder {
     push_seams: PushSeams,
     given: Vec<RunOption>,
     pub(crate) problems: Vec<Problem>,
+    /// The form the command line is read in: the CLI's unless [`RunBuilder::compat`] made the builder.
+    spelling: Spelling,
 }
 
 impl RunBuilder {
+    /// A builder of the compatibility layer's command line, whose `-TimeoutSeconds` takes a whole number alone.
+    pub(crate) fn compat() -> RunBuilder {
+        RunBuilder {
+            spelling: Spelling::Compat,
+            ..RunBuilder::default()
+        }
+    }
+
     /// Whether any option other than the hidden `--test-print-request` was given, valid or not.
     pub(crate) fn has_options(&self) -> bool {
         self.given.iter().any(|option| !is_print_request(*option))
@@ -191,7 +201,13 @@ impl RunBuilder {
     fn apply(&mut self, option: ValueOption, spelled: &str, value: &str) -> Result<(), Problem> {
         match option {
             ValueOption::Slot => self.slot = Some(values::slot(spelled, value)?),
-            ValueOption::Timeout => self.timeout = Some(values::above_zero(spelled, value)?),
+            // Only the subcommand CLI's `--timeout` takes `auto:<n>`; `-TimeoutSeconds` stays a whole number.
+            ValueOption::Timeout => {
+                self.timeout = Some(match self.spelling {
+                    Spelling::Cli => values::ceiling(spelled, value)?,
+                    Spelling::Compat => Ceiling::Given(values::above_zero(spelled, value)?),
+                });
+            }
             ValueOption::Log => self.log = Some(PathBuf::from(value)),
             ValueOption::Stall => self.stall = Some(values::above_zero(spelled, value)?),
             ValueOption::Tail => self.tail = Some(values::zero_or_above(spelled, value)?),
@@ -298,7 +314,8 @@ impl RunBuilder {
 
     /// The run request, or every problem: those found while reading, then the test seams that cannot work together,
     /// then each missing input in the order slot, timeout, log, command.
-    pub(crate) fn finish_run(mut self, command: Vec<OsString>, spelling: Spelling) -> Result<RunRequest, Vec<Problem>> {
+    pub(crate) fn finish_run(mut self, command: Vec<OsString>) -> Result<RunRequest, Vec<Problem>> {
+        let spelling = self.spelling;
         #[cfg(feature = "test-seams")]
         self.check_remote_seams();
         #[cfg(feature = "test-seams")]

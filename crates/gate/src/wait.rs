@@ -791,7 +791,7 @@ pub(crate) mod scratch {
     use std::sync::mpsc;
     use std::thread;
 
-    use gate_args::{RunRequest, Slot, Spelling, TestSeams};
+    use gate_args::{Ceiling, RunRequest, Slot, Spelling, TestSeams};
     use gate_state::v1::{Claim, ClaimKind};
     use gate_state::{KernelObject, StateRoot, v1};
     use jiff::Timestamp;
@@ -850,7 +850,7 @@ pub(crate) mod scratch {
         };
         RunRequest {
             slot,
-            timeout: 60,
+            timeout: Ceiling::Given(60),
             log: PathBuf::from("out.log"),
             stall: 60,
             tail: 0,

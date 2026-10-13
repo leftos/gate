@@ -417,6 +417,7 @@ mod tests {
                     root: &scratch.root,
                     gate: &self.gate,
                     request: &self.request,
+                    ceiling: 60,
                     log: &self.log,
                     tag: None,
                     journal: &mut self.journal,

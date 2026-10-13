@@ -205,11 +205,31 @@ pub struct TestSeams {
     pub job_breakaway: bool,
 }
 
+/// A run's ceiling as the caller gave it, in whole seconds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ceiling {
+    /// `--timeout <n>`: the ceiling is `n`.
+    Given(u64),
+    /// `--timeout auto:<n>`: a floor of `n`, which the command's learned durations may raise and never lower.
+    Auto(u64),
+}
+
+impl Ceiling {
+    /// The ceiling in whole seconds before any history raises it, which a run that takes no slot of its own runs
+    /// under: the given `n`, or an auto ceiling's floor `n`.
+    #[must_use]
+    pub fn floor(self) -> u64 {
+        match self {
+            Ceiling::Given(seconds) | Ceiling::Auto(seconds) => seconds,
+        }
+    }
+}
+
 /// A valid `gate run`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RunRequest {
     pub slot: Slot,
-    pub timeout: u64,
+    pub timeout: Ceiling,
     /// The log path as given; a relative path is read against the working directory by the binary.
     pub log: PathBuf,
     pub stall: u64,

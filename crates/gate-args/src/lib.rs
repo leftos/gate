@@ -29,8 +29,8 @@ pub use cmdline::{command_line, command_text, quote_arg, quote_arg_str};
 pub use problem::{MAX_WHOLE_NUMBER, Problem, Required, Spelling};
 pub use program::{ProgramSearch, resolve_program};
 pub use request::{
-    BoxRequest, BoxSeams, BoxVerb, BurnRequest, CutoverRequest, CutoverSeams, DEFAULT_STALL_SECONDS, DEFAULT_TAIL_LINES, ExpectRequest, Invocation,
-    PushRequest, PushSeams, RunRequest, Slot, StopRequest, TestSeams,
+    BoxRequest, BoxSeams, BoxVerb, BurnRequest, Ceiling, CutoverRequest, CutoverSeams, DEFAULT_STALL_SECONDS, DEFAULT_TAIL_LINES, ExpectRequest,
+    Invocation, PushRequest, PushSeams, RunRequest, Slot, StopRequest, TestSeams,
 };
 pub use usage::USAGE;
 

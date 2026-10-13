@@ -54,6 +54,7 @@ fn print_request_shows_the_new_cli_request() {
         "mode": "run",
         "slot": "heavy",
         "timeout": 5,
+        "timeoutAuto": false,
         "log": shown(&case.folder().join("out.log")),
         "stall": 120,
         "tail": 20,
@@ -68,6 +69,17 @@ fn print_request_shows_the_new_cli_request() {
     });
     assert_eq!(outcome.stdout, format!("{expected}\n"), "the keys come in the published order");
     the_seams_given_are_printed(&case);
+}
+
+#[test]
+fn print_request_shows_an_auto_ceiling_by_its_floor() {
+    let case = Case::new("print_request_shows_an_auto_ceiling_by_its_floor");
+    let mut words = print_run(&["cmd"]);
+    words[4] = "auto:900";
+
+    let request = case.run(&words).request();
+
+    assert_eq!((&request["timeout"], &request["timeoutAuto"]), (&json!(900), &json!(true)), "{request}");
 }
 
 #[test]

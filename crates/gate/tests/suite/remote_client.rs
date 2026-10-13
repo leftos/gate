@@ -16,9 +16,11 @@ use std::time::{Duration, SystemTime};
 
 use gate_router::{repo_name, work_folder_key};
 use proc_table::{ProcessTable as _, ProcessTree, Win32ProcessTable};
+use regex::Regex;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+use crate::durations::seed;
 use crate::support::{
     Case, FAKE_TOOL, GATE, GIT_REDIRECTS, Go, Outcome, allow_breakaway, build_version, copy_tool, events, finish, git, git_init, heavy_words,
     nothing_back, release, shown, start, wait_for_journal_line, wait_until, wait_until_closed, write_remote_json,
@@ -595,6 +597,39 @@ fn a_routed_run_runs_on_the_box_and_passes_its_output_and_status() {
     assert!(is_sha(&snapshot), "the builder holds the snapshot: {snapshot:?}");
     assert_eq!(git_out(&case, &[], &["rev-parse", &format!("refs/gate-remote/{key}")]), snapshot);
     assert!(log.contains(&format!("gate: pushed snapshot {} in ", &snapshot[..8])), "{log}");
+}
+
+#[test]
+fn a_routed_run_past_3x_its_usual_p90_is_hinted_once() {
+    let case = client_case("client-hang-hint");
+    // The command waits for `go` in the folder it runs in: the snapshot of the first five runs sends it, so they pass
+    // at once; the held run's snapshot has none, and the case writes it into the builder's work folder.
+    let command = [r".\tool.exe", "wait", "go", "out", "ran"];
+    let steps = ssh_steps(&case, "ssh", &["ok"; 12]);
+    write(&case, "go", "");
+    for _ in 0..5 {
+        let outcome = finish(client_gate(&case, "history.log", &steps, &command));
+        assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    }
+    fs::remove_file(case.folder().join("go")).expect("the go file can be removed");
+    // The builder key's five runs, rewritten to a wall p90 of 1 s.
+    seed(&case, " out ran", 1.0, None);
+    let hint = Regex::new(r"gate: still running after \d+ s, \d+x its usual p90 of 1 s\n").expect("the pattern is valid");
+    // Written as it drops, the go file lets the command go when the case fails before its own write.
+    let go = Go(case.folder().join("builder").join("work").join(key_of(&events(&case))).join("go"));
+
+    let mut running = start(client_gate(&case, "out.log", &steps, &command));
+    running.wait_for_stderr_while_running("the hang hint", |stderr| hint.is_match(stderr));
+    fs::write(go.path(), "").expect("the go file can be made");
+    let outcome = running.finish();
+
+    assert_eq!(outcome.code, Some(0), "the hint kills nothing: {outcome:?}");
+    assert_eq!(hint.find_iter(&outcome.stderr).count(), 1, "{outcome:?}");
+    let log = fs::read_to_string(case.folder().join("out.log")).expect("the log was written");
+    assert_eq!(hint.find_iter(&log).count(), 1, "{log}");
+    let events = events(&case);
+    assert_eq!(fallbacks(&events), Vec::<&str>::new(), "{events:#?}");
+    assert!(events.iter().all(|event| event["remote"] == true), "every run was routed: {events:#?}");
 }
 
 #[test]

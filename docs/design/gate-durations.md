@@ -7,7 +7,7 @@ Design for CC-178 (Gate: learn each command's usual runtime and schedule with it
 1. Records what each finished gated command took, and keeps a per-command summary the gate reads on its hot path.
 2. Prints the expected time when a gate takes its slot, and answers `gate expect -- <command>` without running anything.
 3. Puts an ETA into the wait lines and an `expected` field into claims and tickets, which ops-tower's Gates tab shows.
-4. Accepts `-TimeoutSeconds auto` and prints hang and ceiling hints.
+4. Accepts `--timeout auto:<n>` and prints hang and ceiling hints.
 5. Lets a waiting gate run as a **guest** while a critical gate drains, when it is known to finish before the slowest gate the drain waits on.
 
 ## Parts and order
@@ -38,7 +38,7 @@ Each part is a sub-issue of CC-178 and lands on `feat/gate-durations`. Part 1 co
   The words are split, and written back, by the rules `gate_state::normalize_command` uses (`split_words` and `quote_word` in `journal.rs`, shared with `normalize_for_durations`): the C runtime's argument rules for the split, the word rules on each unquoted word, and `quote_arg_str`'s quoting for the output.
 
   The normalise table in `crates/gate-state/tests/state/durations.rs` is the fixture for these rules. `keyVersion` in the summary names the rule set; a mismatch rebuilds the summary from the archive and the live journal.
-- **Estimate.** p90 and p99 (nearest rank) of `wallSeconds` (and of `adjustedSeconds` for ceilings) over the last 30 passing runs or 14 days, whichever holds fewer runs. p50 is the median of the 5 most recent of those runs, so it follows a real change within three runs while one outlier cannot move it (Tsafrir et al. find recent runs predict better than a long history); p90 and p99 are raised to p50 when a slower recent stretch puts it above them. A key needs 5 passing runs.
+- **Estimate.** p90 and p99 (nearest rank) of `wallSeconds` (and of `adjustedSeconds` for ceilings) over the last 30 passing runs or 14 days, whichever holds fewer runs. p50 is the median of the 5 most recent of those runs, so it follows a real change within three runs while one outlier cannot move it (Tsafrir et al. find recent runs predict better than a long history); p90 and p99 are raised to p50 when a slower recent stretch puts it above them. The adjusted p99 is not: p50 is a wall figure and the adjusted seconds are load-adjusted, so the two do not compare. It is none unless at least 5 of the window's runs carry adjusted seconds. A key needs 5 passing runs.
 
   The mean of the window's `wallSeconds` is the expected time the line names.
 
@@ -55,13 +55,17 @@ Each part is a sub-issue of CC-178 and lands on `feat/gate-durations`. Part 1 co
 - Claims and tickets gain `expected: {p50, p90, n, key}`, written when the gate has history, absent otherwise.
 - ops-tower: the v1 fixtures are hand-written, not re-captured, and ops-tower gets an inbox request for the ticket struct field and the tab's display.
 
-### Part 4: `-TimeoutSeconds auto` and hints
+### Part 4: `--timeout auto:<n>` and hints
 
-- `-TimeoutSeconds auto` is a floor, never a kill time of its own: it carries the caller's number `n` and resolves to `max(n, 3x the command's load-adjusted p99)`, so a learned duration can only raise the kill time above what a caller chose. A command without history, and the launcher's fallback, which has no history, run on `n`. The form that carries `n` (an `auto:<n>` value or a second switch) is chosen when this part is built.
+- `--timeout auto:<n>` (`auto` in any ASCII case) is a floor, never a kill time of its own: it carries the caller's number `n` and resolves to `max(n, ceil(3 x the command's adjusted p99))`, capped at 2147483647, so a learned duration can only raise the kill time above what a caller chose. A command without an adjusted p99 runs on `n`. The adjusted p99 comes from the take's estimate: none unless at least 5 of the window's runs carry adjusted seconds, and not used from a family key whose p90 is above 2x its p50.
+
+  The ceiling resolves at each take, a lent take included. A run on no slot, a covered run and a late-slot run have no estimate and run on `n`. A routed run's builder key has no adjusted seconds yet (GATE-187), so it runs on `n`; after a fallback the ceiling returns to `n` until the local take resolves it. `-TimeoutSeconds` refuses `auto:<n>`: the form exists in the new CLI only.
 
   Why not a learned kill time: Tsafrir, Etsion and Feitelson keep the user's estimate as the kill time and use predictions for scheduling only, since about 20% of jobs are underpredicted and would be killed early, and a p99 over at most 30 runs sits close to the sample maximum (`docs/research/2026-10-09-gate-prior-art-local.md`, section 4).
-- A hint at start when a given ceiling is below the command's p90: `gate: the ceiling <n> s is below this command's usual p90 of <p90> s`.
-- A one-time hint while running, once the run passes 3x its p90: `gate: still running after <n> s, <k>x its usual p90 of <p90> s`. It kills nothing.
+- A line after the expected-time line when history raised the floor: `gate: ceiling <resolved> (3x this command's p99 of <p99>, above the given <n>)`.
+- A hint after it when the resolved ceiling is below the command's p90: `gate: the ceiling <resolved> is below this command's usual p90 of <p90>`. Figures are the expected-time line's: `<n> s` below 90 s, whole minutes from 90 s. A family key's lines read `similar commands'` in place of `this command's`.
+- A one-time hint while running, once the run passes 3x its p90: `gate: still running after <running>, <k>x its usual p90 of <p90>`, `k` rounded down. A local run counts its wall time less paused time, checked at each watch sample; a routed run counts the wall time since the builder's start marker reached the client, said live. It is never said for a p90 under 1 s, and it kills nothing.
+- The claim's `timeoutSeconds`, the TIMED OUT kill and the 5x backstop, the remote call's timeout and the passed line's `ceiling <n> s` all use the resolved ceiling.
 
 ### Part 5: backfill during a critical drain
 
@@ -84,14 +88,14 @@ Each part is a sub-issue of CC-178 and lands on `feat/gate-durations`. Part 1 co
 
 Parts 2 to 5 are built in the Rust gate (GATE-7) after the local cutover, on the journal facts of part 1 (GATE-33). The rulings above hold with these spellings and boundaries:
 
-- `gate expect -- <command>` is the whole of the old `-Expect` (the launcher maps none, and the compatibility layer refuses it), and `--timeout auto` and `--slot auto` are options of the new CLI only, with no compatibility-layer spelling. The form that carries the caller's number `n` for `--timeout auto` (`--timeout 900 --auto` or `--timeout auto:900`) is settled in this document when part 4 is built (GATE-16).
+- `gate expect -- <command>` is the whole of the old `-Expect` (the launcher maps none, and the compatibility layer refuses it), and `--timeout auto` and `--slot auto` are options of the new CLI only, with no compatibility-layer spelling. `--timeout auto:<n>` carries the caller's number `n` (part 4).
 - The key and command normalisation are `gate_state::duration_key` and `normalize_for_durations`, over the history key's word rules, and the key is git-derived as in part 2: the repo is the main checkout's folder name from `git rev-parse --git-common-dir`, the subfolder is the cwd relative to the worktree root, and a folder git cannot place falls back to its path shape, else is keyed as outside git. gate-state never runs git: the caller passes the place (`KeyPlace`). No machine path is configured or hard-coded.
 - The library (key, estimate, store, rebuild, and `append_line_then` in `journal_writer.rs`, which runs the store write in the journal hold) is in `gate-state`. The `gate` crate calls it from `durations.rs`: it says the expected-time line, files each release in the store and rebuilds the store. `expect.rs` is `gate expect`: it reads the store with no lock and prints one line per place with an estimate (here, then each builder in host order), or `no history`, as specified in [`gate expect`](../design.md#gate-expect).
 - Every run that takes a slot of its own runs one `git rev-parse` before it queues to place its folder, reusing the answer of the routing decision for a heavy run whose route asked; a failed call keys the folder by its shape, silently. A `--slot none` run, and one a parent's slot covers or lends, has no key and is neither timed nor filed.
 - The expected-time line is said once the run's claim is written and the waiters woken: at a local light or heavy take, at a critical take after its holds line, at a routed run's remote take (keyed by the builder) and, for a fallback, a second time at its local take. Its figures are in [Output lines](../design.md#output-lines): `about` is the mean wall time over the estimate's window, `usual` the p50.
 - A release is filed by every slot-taking run that reaches a verdict, inside the journal hold of its `release` line, which is unchanged. A rebuild runs after the release, outside the hold, when a read found the store missing, stale or torn and the store is still so just before the claim; a rebuild leaves out `--slot none` runs, as live filing does. A store under a `keyVersion` above this build's is read as no history and is neither filed into nor rebuilt.
 - The `expected` field is optional in the v1 claim and ticket formats ([Claim](../design.md#claim), [Ticket](../design.md#ticket)), so part 3 fills it without a format change or a second drain. gate-state exposes it, and ops-tower is told by repo inbox that its ticket view can show it. The durations store is read once per run, before it queues, and that read serves the ticket, the claim and the expected-time line; the wait lines read other gates' live claims.
-- `--timeout auto` resolves to `max(n, 3 x p99)` as a floor and is never a learned kill time; a command with no history runs on `n`.
+- `--timeout auto:<n>` resolves to `max(n, ceil(3 x adjusted p99))` as a floor and is never a learned kill time; a command with no adjusted p99 runs on `n`. `resolve_ceiling`, the raised-ceiling line, the ceiling hint and the hang hint are in `durations.rs`; the local hang hint is checked by `watch.rs` and the routed one by `remote/client.rs`.
 - A guest is killed and re-queued by its own gate when the drain completes before it ends, and its key is barred 24 h. Lending a slot releases a `Local\` mutex the critical gate holds, which relaxes the critical drain's rule that the critical gate lets go of nothing, so the design names the released slot and the named release event it signals when part 5 is built.
 
 ### `--slot auto` (GATE-8)

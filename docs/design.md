@@ -47,7 +47,8 @@ Rules both parsers share:
 - A value option takes the next word unless that word is `--`; an empty value counts as missing.
 - A whole number is ASCII digits only: no sign, space or fraction. Timeout, stall, tail and the `--test-*-ms` values are at most 2147483647.
 - `--slot` values compare case-insensitively.
-- `--slot auto` and `--timeout auto` are refused as invalid values until GATE-8 and GATE-16 build them. `--slot none` is accepted.
+- `--slot auto` is refused as an invalid value until GATE-8 builds it. `--slot none` is accepted.
+- `--timeout` takes a whole number or `auto:<n>` (`auto` in any ASCII case), whose `n` follows the whole-number rule. A bare `auto` says `gate: --timeout auto needs a floor in seconds: auto:<n>`, and a bad floor `gate: --timeout must be a whole number above 0, got 'auto:0'` or `gate: --timeout must be at most 2147483647, got 'auto:2147483648'`.
 - A gate option that is not valid Unicode is a usage error; the words after `--` are passed through as the caller gave them.
 - A word before `--` that is not an option is a usage error (`gate: unexpected argument <word>`).
 
@@ -61,14 +62,14 @@ The watchdog samples the command and kills its job on a stall, at the ceiling an
 
 ### `gate run`
 
-`gate run --slot heavy|light|critical|none --timeout <seconds> --log <path> [options] -- <command> [args...]`
+`gate run --slot heavy|light|critical|none --timeout <seconds>|auto:<seconds> --log <path> [options] -- <command> [args...]`
 
 `--slot`, `--timeout`, `--log` and the command are required and have no default, because a gate with no ceiling holds its caller for as long as the command hangs (kept, C1). Each missing or unreadable input is named on its own line before the usage.
 
 | Flag | PowerShell option | Meaning | Source |
 |---|---|---|---|
 | `--slot heavy\|light\|critical\|none` | `-Slot` | The slot kind ([Slots](#slots)); `none` takes no slot and is for a command that only dispatches or watches remote work. | ruling |
-| `--timeout <seconds>` | `-TimeoutSeconds` | The ceiling in load-adjusted seconds, a whole number above 0 (W3). | ruling |
+| `--timeout <seconds>` | `-TimeoutSeconds` | The ceiling in load-adjusted seconds, a whole number above 0 (W3). `auto:<n>` makes `n` a floor: each take resolves the ceiling to `max(n, ceil(3 x the command's adjusted p99))`, capped at 2147483647, and to `n` with no adjusted p99 ([Output lines](#output-lines), [design/gate-durations.md](design/gate-durations.md), part 4). The new CLI only: `-TimeoutSeconds` refuses it. | ruling |
 | `--log <path>` | `-Log` | The command's log; a relative path is read against the working directory once, at start (P5). | ruling |
 | `--stall <seconds>` | `-StallSeconds` | The stall window, default 120 (W2); the gate passes it as given, and the remote client raises a value under 15 to 15 on a routed run (F2). | kept (C1, F2) |
 | `--tail <lines>` | `-Tail` | Lines of the log printed at the end, default 20 (V3). | kept (C1, V3) |
@@ -201,7 +202,7 @@ Hidden from the usage and from `--help`. It is the builder side of a routed run,
 
 ### Later subcommands
 
-Further modes arrive as subcommands of the same binary, each designed with its issue: `gate status` and `gate drain`. New options, such as `--timeout auto` (GATE-16) and `--slot auto` (GATE-8), exist only in the new CLI, never in the compatibility layer.
+Further modes arrive as subcommands of the same binary, each designed with its issue: `gate status` and `gate drain`. New options, such as `--timeout auto:<n>` (GATE-16) and `--slot auto` (GATE-8), exist only in the new CLI, never in the compatibility layer.
 
 ### Compatibility layer
 
@@ -211,7 +212,7 @@ Further modes arrive as subcommands of the same binary, each designed with its i
 
 - It accepts exactly the options `-Log`, `-TimeoutSeconds`, `-Slot`, `-StallSeconds`, `-Tail`, `-NoMarkers`, `-Local` and `-StopTree`, compared case-insensitively, and maps each to the flag in the table above (`-StopTree <pid>` to `gate stop-tree <pid>`).
 
-  Any other option, or a new-CLI flag in the old form (`-StateDir`, `--state-dir`, `--slot`), is a usage error (exit 2). The one exception is the hidden `--test-print-request` of a `test-seams` build ([Black-box suite harness](#black-box-suite-harness)).
+  Any other option, or a new-CLI flag in the old form (`-StateDir`, `--state-dir`, `--slot`), is a usage error (exit 2). `-TimeoutSeconds` refuses `auto:<n>`: `gate: -TimeoutSeconds must be a whole number above 0, got 'auto:900'`. The one exception is the hidden `--test-print-request` of a `test-seams` build ([Black-box suite harness](#black-box-suite-harness)).
 - `--` is required before the command; the command never starts at the first word that is not an option.
 - `-StopTree <pid>` (or `-StopTree:<pid>`) must be the only option.
 - A value option never takes one of the eight option names as its value: `-Log -NoMarkers` is `-Log` with no value, then `-NoMarkers`.
@@ -288,6 +289,8 @@ The lines of a run that starts its command:
 - The expected-time line, on stderr and in the log, once a run that takes a slot has written its claim and woken the waiters and before the command's output: `gate: expected about <n> s (usual <n> s, p90 <n> s, <runs> runs)`, or in whole minutes from 90 s: `gate: expected about <n> min (usual <n> min, p90 <n> min, <runs> runs)`. A local light or heavy take says it, a critical gate after its holds line, a routed run at its remote take, and a fallback a second one at its local take.
 
   `about` is the mean wall time over the estimate's window (the last 30 passing runs or those within 14 days, whichever holds fewer), `usual` the median of the 5 newest, and every figure is rounded and floored at 1 s (or 1 min). An estimate from the family key ends `<runs> runs of similar commands)`. A key with fewer than 5 passing runs, a `--slot none` run, and a run a parent's slot covers or lends say nothing ([design/gate-durations.md](design/gate-durations.md), Estimate).
+- The ceiling lines, on stderr and in the log, right after the expected-time line (at each take, a lent take included): `gate: ceiling 42 min (3x this command's p99 of 14 min, above the given 15 min)` only when history raised an auto ceiling above its floor, then `gate: the ceiling 10 min is below this command's usual p90 of 14 min` when the resolved ceiling, given or auto, is below the estimate's p90. Their figures are the expected-time line's: `<n> s` below 90 s, whole minutes from 90 s. An estimate from the family key reads `similar commands'` in place of `this command's`, and a family key whose p90 is above 2x its p50 does not raise the ceiling.
+- The hang hint, once a run, on stderr and in the log: `gate: still running after 42 min, 3x its usual p90 of 14 min` (`similar commands' usual p90` for a family key), `k` rounded down, from the run's passing 3x the p90 of its take's estimate. A local run counts wall time less paused time, checked at each watch sample; a routed run counts the wall time since the builder's start marker reached the client, said live. It is never said for a usual p90 under 1 s and kills nothing.
 - The durations store's notes, on stderr and in the log. Said once a run: `gate: cannot read <path> (<reason>); expected times are unavailable` for a store that is torn or cannot be read, said before the run queues, so it can come before a waiting line, and `gate: could not write <path> (<reason>)` for a failed store write, which leaves the run's exit code as it was. `gate: cannot rebuild <store path> (<reason>); expected times are unavailable` when the run's claim on a rebuild fails other than by another gate holding it.
 
   A rebuild says `gate: <note>` for each of `skipped <n> release line(s) of <file> that do not parse`, `could not read <path>: <error>`, `could not list the archive folder <dir>: <error>` and the swap's own notes, and `gate: could not remove <marker path>: <error>` when an interrupted rebuild cannot remove its marker.
@@ -483,7 +486,7 @@ The environment carries one more name: `GATE_SLOT_HELD`, the slot marker ([Criti
 | `cwd` | string | the gate's working directory |
 | `command` | string | the command's raw words (the program unresolved), each quoted as for CreateProcess (C4) even for a batch target and joined by spaces, as the PowerShell gate's `Format-CommandText` writes them, such as `cmd /c echo "a b" "x\"y"` |
 | `log` | string | the log's full path |
-| `timeoutSeconds` | number | the ceiling; the writer refuses a value JSON cannot carry (not finite) |
+| `timeoutSeconds` | number | the ceiling as the take resolved it ([`gate run`](#gate-run)); the writer refuses a value JSON cannot carry (not finite) |
 | `remote`, `host`, `key` | bool, string, string | a remote slot's claim only (L1) |
 | `expected` | object | optional, last: what the durations store expects of the run, `{"p50": <s>, "p90": <s>, "n": <runs>, "key": "<key>"}` with the seconds to 3 decimals, rounded half to even; absent for a run without history. It is the builder's estimate for a remote take and `crit`'s for a critical gate. The wait lines read `p50` ([Slots](#slots), step 6); `null` reads as absent, any other non-object is unreadable |
 
@@ -781,7 +784,7 @@ All kept, with each knob's default unchanged:
   Progress as the watchdog crate counts it resets the stall clock when the sum of the log and `.err` sizes changed (grew or shrank), the CPU of the job and of the processes outside it under its members (the escaped tree, below) since the last progress reached 1% of one core over the stall window together, a pid appeared in the job that the last sample did not have, a process outside it appeared that the last sample did not have (by pid and start), or a nested gate is paused.
 
   The stall clock also resets when a build server's CPU counts as progress (see Build servers below), or, for a `wsl` command, the WSL VM's CPU counts as progress (see WSL below).
-- The load-adjusted clock and the ceiling (W3): each sample adds `interval * free`, the interval running between the samples' `at` stamps, to the clock `--timeout` runs on; a sample taken while a nested gate is paused adds to the paused time instead; `gate: TIMED OUT after ...`.
+- The load-adjusted clock and the ceiling (W3): each sample adds `interval * free`, the interval running between the samples' `at` stamps, to the clock `--timeout` runs on (for `auto:<n>`, the ceiling the take resolved; the backstop below uses it too); a sample taken while a nested gate is paused adds to the paused time instead; `gate: TIMED OUT after ...`.
 
   The free share is 1 for a High-priority command; otherwise `busy` is the share of the interval's system time that was not idle, the cores others held are `max(0, busy * cores - own cores)` with `own cores` the CPU gained over the interval by the job and by the escaped tree (below), and `free = clamp((cores - others) / demand, 0.05, 1)`. `demand` is every core, `min(cores, 2)` for a light gate, or 1 for a gate on no slot, so its ceiling stays near wall time on a loaded PC.
 - The backstop (W4): wall time less paused time reaching 5 times the ceiling, whatever the load: `gate: BACKSTOP: ...`. One sample's precedence is STALLED, TIMED OUT, BACKSTOP.
@@ -1761,7 +1764,7 @@ A Rust integration suite drives the built `gate.exe` through its CLI and reads o
 
   On `push` the seams are `--test-push-ssh <path>` (the ssh program to run instead of the one found along `PATH`, the suite's `fake-ssh`) and `--test-push-bound-ms <n>` (each builder's bound); `push` has no `--test-print-request` ([`gate push`](#gate-push)).
 
-  `--test-print-request`, on `run`, `stop-tree`, `cutover` and the compatibility form, prints the parsed request as one JSON line on stdout and exits 0, so the suite sees what a command line asked for; it is the one hidden switch the compatibility layer accepts.
+  `--test-print-request`, on `run`, `stop-tree`, `cutover` and the compatibility form, prints the parsed request as one JSON line on stdout and exits 0, so the suite sees what a command line asked for; it is the one hidden switch the compatibility layer accepts. On `run`, `"timeout"` is the number given, or the floor of `auto:<n>`, and `"timeoutAuto": true|false` follows it, always present.
 
   `--test-sampler-fail` (a switch) makes every sample fail with `--test-sampler-fail makes every sample fail (test seam only)`, so the run says `gate: sampler failed: ...; watching by wall time only` and only the backstop watches; `--test-print-request` shows it as `testSeams.samplerFail`, after `interruptAfterFallback`.
 
@@ -1893,6 +1896,5 @@ What no ruling settles yet, with the issue that owns it:
 
 - **The box protocol and `remote.json`'s next format** (GATE-10): verbs, payload and transport between PC and builder, whether ssh keeps cmd.exe as the builder's shell, and the routing file's version and matcher. Sibling worktrees in a routed run leave three questions of their own (GATE-19).
 - **A prediction a run has passed** (GATE-14): what a holder past its p90 reports in wait lines, and whether the critical gate re-prices its shadow end and closes or shrinks the lent window when a blocker overruns.
-- **The `--timeout auto` spelling** (GATE-16): how the caller's floor travels with `auto` in the new CLI.
 - **The surfaces of `gate status` and `gate drain`** (no issue yet). Install stays a script (`tools/install.ps1`) until a reason for a `gate install` subcommand appears.
 - **The Windows facilities to spike before their slice** (GATE-5): other users' command lines (B1), the desktop-app breakaway policy (X1) and nested jobs, each of which changes kill behaviour if it silently fails.

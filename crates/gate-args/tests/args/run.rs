@@ -3,7 +3,7 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 
-use gate_args::{DEFAULT_STALL_SECONDS, DEFAULT_TAIL_LINES, RunRequest, Slot, Spelling, TestSeams};
+use gate_args::{Ceiling, DEFAULT_STALL_SECONDS, DEFAULT_TAIL_LINES, RunRequest, Slot, Spelling, TestSeams};
 
 use crate::support::{RUN, os, problems, problems_of, refs, run_of, run_request, unreadable_word, with};
 
@@ -21,7 +21,7 @@ fn run_reads_every_option_and_the_defaults() {
         run_with(&["--", "cmd", "/c", "echo hi"]),
         RunRequest {
             slot: Slot::Heavy,
-            timeout: 5,
+            timeout: Ceiling::Given(5),
             log: PathBuf::from("out.log"),
             stall: DEFAULT_STALL_SECONDS,
             tail: DEFAULT_TAIL_LINES,
@@ -61,7 +61,62 @@ fn new_cli_refuses_slot_auto_and_timeout_auto() {
     );
     assert_eq!(
         problems(&["run", "--slot", "heavy", "--timeout", "auto", "--log", "out.log", "--", "cmd"]),
-        ["gate: --timeout must be a whole number above 0, got 'auto'"]
+        ["gate: --timeout auto needs a floor in seconds: auto:<n>"]
+    );
+    assert_eq!(
+        problems(&["run", "--slot", "heavy", "--timeout=AUTO", "--log", "out.log", "--", "cmd"]),
+        ["gate: --timeout auto needs a floor in seconds: auto:<n>"],
+        "a bare auto in any case"
+    );
+}
+
+#[test]
+fn new_cli_takes_timeout_auto_with_a_floor() {
+    for value in ["auto:900", "AUTO:900", "Auto:900"] {
+        assert_eq!(
+            run_request(&["run", "--slot", "heavy", "--timeout", value, "--log", "out.log", "--", "cmd"]).timeout,
+            Ceiling::Auto(900),
+            "--timeout {value}"
+        );
+    }
+    assert_eq!(
+        run_request(&["run", "--slot", "heavy", "--timeout=auto:900", "--log", "out.log", "--", "cmd"]).timeout,
+        Ceiling::Auto(900)
+    );
+    assert_eq!(
+        run_request(&["run", "--slot", "heavy", "--timeout", "900", "--log", "out.log", "--", "cmd"]).timeout,
+        Ceiling::Given(900)
+    );
+}
+
+#[test]
+fn new_cli_refuses_a_bad_auto_floor() {
+    for value in ["auto:0", "auto:x", "auto:", "auto:-5", "auto: 5", "auto:auto:5"] {
+        assert_eq!(
+            problems(&["run", "--slot", "heavy", "--timeout", value, "--log", "out.log", "--", "cmd"]),
+            [format!("gate: --timeout must be a whole number above 0, got '{value}'")],
+            "--timeout {value}"
+        );
+    }
+    assert_eq!(
+        problems(&["run", "--slot", "heavy", "--timeout", "auto:2147483648", "--log", "out.log", "--", "cmd"]),
+        ["gate: --timeout must be at most 2147483647, got 'auto:2147483648'"]
+    );
+    assert_eq!(
+        problems(&[
+            "run",
+            "--slot",
+            "heavy",
+            "--timeout",
+            "auto:5",
+            "--timeout",
+            "auto:6",
+            "--log",
+            "out.log",
+            "--",
+            "cmd"
+        ]),
+        ["gate: --timeout is given twice"]
     );
 }
 
@@ -125,7 +180,7 @@ fn run_caps_whole_numbers_at_i32_max() {
     ]);
     assert_eq!(
         (request.timeout, request.stall, request.tail),
-        (2_147_483_647, 2_147_483_647, 2_147_483_647)
+        (Ceiling::Given(2_147_483_647), 2_147_483_647, 2_147_483_647)
     );
 
     for value in ["2147483648", "4294967296", "99999999999999999999"] {

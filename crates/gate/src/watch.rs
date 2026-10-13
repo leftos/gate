@@ -21,6 +21,7 @@ use jiff::Timestamp;
 use proc_table::{ProcessInfo, ProcessTable, ProcessTree, Win32ProcessTable, filetime_to_timestamp};
 
 use crate::console::Console;
+use crate::durations::{Usual, hang_hint};
 use crate::escaped::{self, Departed, Look, Recorded};
 use crate::late::Late;
 use crate::log::Log;
@@ -119,6 +120,15 @@ pub(crate) struct Watcher<'a> {
     runs_as: Slot,
     kind: Slot,
     processors: usize,
+    /// The hang hint of a run with a usual p90 ([`Watching::usual`]), which a run says once.
+    hang: Option<HangHint>,
+}
+
+/// The usual p90 a run's hang hint compares with, and whether the hint was said.
+#[derive(Clone, Copy, Debug)]
+struct HangHint {
+    usual: Usual,
+    said: bool,
 }
 
 /// Build servers' CPU time in 100 ns ticks, by pid, as a sample carries them.
@@ -185,6 +195,10 @@ pub(crate) struct Watching<'a> {
     pub job: &'a Job,
     pub running: &'a Running,
     pub log: &'a Log,
+    /// The run's ceiling in whole seconds, as its take resolved it.
+    pub ceiling: u64,
+    /// The usual p90 of the run's take, past 3x which the watch says its hang hint once; `None` without history.
+    pub usual: Option<Usual>,
     pub interrupt: Option<Interrupt>,
     /// The slot kind the command runs as, whose machine the watch measures it on: critical under a critical parent's
     /// slot, else the gate's own.
@@ -226,6 +240,8 @@ impl<'a> Watcher<'a> {
             job,
             running,
             log,
+            ceiling,
+            usual,
             interrupt,
             runs_as,
             root,
@@ -237,7 +253,7 @@ impl<'a> Watcher<'a> {
         } = run;
         let system = system_times()?;
         let job_cpu = Ticks(job.accounting()?.cpu);
-        let config = config(request);
+        let config = config(request, ceiling);
         // A command that is not a wsl one reads nothing.
         let read: VmRead = if config.wsl { gate_win32::wsl_vm_cpu } else { || Ok(None) };
         let mut vm = VmReader::new(read);
@@ -277,6 +293,7 @@ impl<'a> Watcher<'a> {
             runs_as,
             kind: request.slot,
             processors,
+            hang: usual.map(|usual| HangHint { usual, said: false }),
         })
     }
 
@@ -323,6 +340,7 @@ impl<'a> Watcher<'a> {
             if let Some(interrupt) = self.interrupt.filter(|_| self.interrupt_after == Some(self.samples)) {
                 interrupt.raise();
             }
+            self.hint_if_hung(console);
             if let Some(watched) = self.kill(console)? {
                 return Ok(watched);
             }
@@ -357,6 +375,19 @@ impl<'a> Watcher<'a> {
     /// The load-adjusted seconds the watch counted, unrounded; `None` once the sampler has failed, as they are unknown.
     pub(crate) fn adjusted_seconds(&self) -> Option<f64> {
         self.sampler_works.then(|| self.watch.adjusted_seconds())
+    }
+
+    /// Says the hang hint once, on the first sample at which the run has been running 3x its usual p90: the wall time
+    /// since the command started less the time paused, as the backstop counts it. It kills nothing.
+    fn hint_if_hung(&mut self, console: &mut Console) {
+        let running = self.started.elapsed().saturating_sub(self.watch.paused_time());
+        let Some(hang) = self.hang.as_mut().filter(|hang| !hang.said) else {
+            return;
+        };
+        if let Some(hint) = hang_hint(running.as_secs_f64(), hang.usual) {
+            hang.said = true;
+            console.err(&hint);
+        }
     }
 
     /// The wall time the watch counted as paused, while a gate under this one waited behind a critical request.
@@ -756,11 +787,11 @@ fn server_cpu(counted: &[(u32, bool)], times: impl Fn(u32) -> io::Result<Option<
     (new_servers, shared_servers)
 }
 
-/// What a run of `request` is watched for: its ceiling, its stall window, and whether it runs through WSL, as a command
-/// whose first word names `wsl` does.
-fn config(request: &RunRequest) -> Config {
+/// What a run of `request` is watched for: its `ceiling` in whole seconds as its take resolved it, its stall window, and
+/// whether it runs through WSL, as a command whose first word names `wsl` does.
+fn config(request: &RunRequest, ceiling: u64) -> Config {
     Config {
-        timeout: request.timeout,
+        timeout: ceiling,
         stall: request
             .test_seams
             .stall_ms
@@ -920,7 +951,7 @@ mod tests {
     use std::path::PathBuf;
     use std::time::Duration;
 
-    use gate_args::{RunRequest, Slot, Spelling, TestSeams};
+    use gate_args::{Ceiling, RunRequest, Slot, Spelling, TestSeams};
     use gate_watchdog::wsl_unavailable_line;
     use gate_win32::ProcessTimes;
 
@@ -1020,7 +1051,7 @@ mod tests {
     fn request(command: &[&str]) -> RunRequest {
         RunRequest {
             slot: Slot::Heavy,
-            timeout: 60,
+            timeout: Ceiling::Given(60),
             log: PathBuf::from("out.log"),
             stall: 60,
             tail: 0,
@@ -1037,9 +1068,12 @@ mod tests {
 
     #[test]
     fn a_command_run_through_wsl_is_watched_as_a_wsl_one() {
-        assert!(config(&request(&["wsl", "-e", "true"])).wsl, "wsl by name");
-        assert!(config(&request(&["C:\\Windows\\System32\\wsl.exe", "-e", "true"])).wsl, "wsl.exe by path");
-        assert!(!config(&request(&["cargo", "test"])).wsl, "any other command is not a wsl one");
+        assert!(config(&request(&["wsl", "-e", "true"]), 60).wsl, "wsl by name");
+        assert!(
+            config(&request(&["C:\\Windows\\System32\\wsl.exe", "-e", "true"]), 60).wsl,
+            "wsl.exe by path"
+        );
+        assert!(!config(&request(&["cargo", "test"]), 60).wsl, "any other command is not a wsl one");
     }
 
     /// A VM reader that reads `reads` in turn, then no VM.

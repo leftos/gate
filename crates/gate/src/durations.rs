@@ -5,7 +5,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use gate_args::TestSeams;
+use gate_args::{Ceiling, MAX_WHOLE_NUMBER, TestSeams};
 use gate_router::Place;
 use gate_state::{
     DurationKey, DurationStore, Estimate, JournalLock, KeyInputs, KeyPlace, RebuildOwner, RebuildReason, Rebuilt, Recorded, RunFacts, StoreError,
@@ -60,6 +60,136 @@ fn in_unit(seconds: f64, in_minutes: bool) -> String {
     } else {
         format!("{} s", whole_seconds.max(1.0))
     }
+}
+
+/// A run's ceiling as a take resolved it: whole seconds, and the adjusted p99 that raised it above an auto ceiling's
+/// floor with that floor, `None` when nothing raised it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Resolved {
+    pub seconds: u64,
+    pub raised: Option<(f64, u64)>,
+}
+
+/// The usual p90 of the slot a run took, which its hang hint reads, and whether it is a family key's.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Usual {
+    pub p90: f64,
+    pub family: bool,
+}
+
+impl Usual {
+    /// The usual p90 of `estimate`; `None` for one too wide to judge by ([`too_wide`]).
+    pub(crate) fn of(estimate: &Estimate) -> Option<Usual> {
+        (!too_wide(estimate)).then_some(Usual {
+            p90: estimate.p90,
+            family: estimate.family,
+        })
+    }
+}
+
+/// Whether `estimate` is too wide to judge a run by: a family key's whose p90 is above 2x its p50. It raises no auto
+/// ceiling and gives neither the ceiling hint nor the hang hint.
+fn too_wide(estimate: &Estimate) -> bool {
+    estimate.family && estimate.p90 > FAMILY_SPREAD * estimate.p50
+}
+
+/// The shortest usual p90 the hang hint is said for, in seconds.
+const HANG_HINT_FLOOR: f64 = 1.0;
+
+/// Whose figures a line names: this command's, or, for a family key's estimate, similar commands'.
+fn whose(family: bool) -> &'static str {
+    if family { "similar commands'" } else { "this command's" }
+}
+
+/// How many times its p99 an auto ceiling allows a command, and how many times its p90 a run goes before its hang hint.
+const USUAL_TIMES: f64 = 3.0;
+
+/// How many times its p50 a family key's p90 may be before its estimate is too wide to raise an auto ceiling.
+const FAMILY_SPREAD: f64 = 2.0;
+
+/// `ceiling` resolved from a take's `estimate`: a given ceiling as given; an auto ceiling at
+/// `max(n, ceil(3 x adjusted p99))`, capped at [`MAX_WHOLE_NUMBER`], and at its floor `n` without an adjusted p99 or
+/// when the estimate is a family key's whose p90 is above 2x its p50.
+#[expect(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "the CLI bounds the floor to 2^31 - 1, which an f64 holds exactly, and the learned figure is capped there before the cast"
+)]
+pub(crate) fn resolve_ceiling(ceiling: Ceiling, estimate: Option<&Estimate>) -> Resolved {
+    let floor = match ceiling {
+        Ceiling::Given(seconds) => return Resolved { seconds, raised: None },
+        Ceiling::Auto(floor) => floor,
+    };
+    let p99 = estimate.filter(|estimate| !too_wide(estimate)).and_then(|estimate| estimate.adjusted_p99);
+    match p99 {
+        Some(p99) => {
+            let learned = (USUAL_TIMES * p99).ceil().min(MAX_WHOLE_NUMBER as f64);
+            if learned > floor as f64 {
+                Resolved {
+                    seconds: learned as u64,
+                    raised: Some((p99, floor)),
+                }
+            } else {
+                Resolved {
+                    seconds: floor,
+                    raised: None,
+                }
+            }
+        }
+        None => Resolved {
+            seconds: floor,
+            raised: None,
+        },
+    }
+}
+
+/// The line a take says after its expected-time line when history raised an auto ceiling above its `floor`: `gate:
+/// ceiling {resolved} (3x this command's p99 of {p99}, above the given {floor})`, each a span by [`span_text`], and
+/// "similar commands'" for a `family` key's p99.
+#[expect(clippy::cast_precision_loss, reason = "the CLI bounds a ceiling to 2^31 - 1, which an f64 holds exactly")]
+pub(crate) fn raised_ceiling_line(resolved: u64, p99: f64, floor: u64, family: bool) -> String {
+    format!(
+        "gate: ceiling {} (3x {} p99 of {}, above the given {})",
+        span_text(resolved as f64),
+        whose(family),
+        span_text(p99),
+        span_text(floor as f64)
+    )
+}
+
+/// The hint a take says when its `resolved` ceiling is below the p90 of its `estimate`: `gate: the ceiling {resolved}
+/// is below this command's usual p90 of {p90}`, each a span by [`span_text`], and "similar commands'" for a family
+/// key's estimate; `None` at or above the p90, and for an estimate too wide to judge by ([`too_wide`]).
+#[expect(clippy::cast_precision_loss, reason = "the CLI bounds a ceiling to 2^31 - 1, which an f64 holds exactly")]
+pub(crate) fn ceiling_hint(resolved: u64, estimate: &Estimate) -> Option<String> {
+    let ceiling = resolved as f64;
+    (ceiling < estimate.p90 && !too_wide(estimate)).then(|| {
+        format!(
+            "gate: the ceiling {} is below {} usual p90 of {}",
+            span_text(ceiling),
+            whose(estimate.family),
+            span_text(estimate.p90)
+        )
+    })
+}
+
+/// The hint a run says once while it runs, when it has been running `running_seconds` and that is 3x or more its
+/// `usual` p90: `gate: still running after {running}, {k}x its usual p90 of {p90}`, each a span by [`span_text`] and `k`
+/// the whole times the p90 it has run, and "similar commands' usual p90" for a family key's; `None` below 3x, and for a
+/// p90 under 1 s.
+pub(crate) fn hang_hint(running_seconds: f64, usual: Usual) -> Option<String> {
+    let Usual { p90, family } = usual;
+    if p90 < HANG_HINT_FLOOR || running_seconds < USUAL_TIMES * p90 {
+        return None;
+    }
+    let whose = if family { "similar commands'" } else { "its" };
+    Some(format!(
+        "gate: still running after {}, {}x {whose} usual p90 of {}",
+        span_text(running_seconds),
+        (running_seconds / p90).floor(),
+        span_text(p90)
+    ))
 }
 
 /// The `expected` field of a claim and a ticket for `estimate`: its usual and p90 seconds to three decimals, a midpoint
@@ -393,7 +523,12 @@ mod tests {
     use jiff::Timestamp;
     use serde_json::json;
 
-    use super::{GitLimits, RunDurations, Said, StoreSeen, expected_line, in_unit, span_text};
+    use gate_args::Ceiling;
+
+    use super::{
+        GitLimits, Resolved, RunDurations, Said, StoreSeen, Usual, ceiling_hint, expected_line, hang_hint, in_unit, raised_ceiling_line,
+        resolve_ceiling, span_text,
+    };
     use crate::console::Console;
 
     fn estimate(mean: f64, p50: f64, p90: f64, runs: usize, family: bool) -> Estimate {
@@ -466,6 +601,218 @@ mod tests {
             expected_line(&estimate(20.0, 18.0, 31.0, 41, true)),
             "gate: expected about 20 s (usual 18 s, p90 31 s, 41 runs of similar commands)"
         );
+    }
+
+    /// An estimate of a usual 10 s with a p90 of 15 s, whose adjusted p99 is `adjusted_p99`.
+    fn adjusted(adjusted_p99: Option<f64>) -> Estimate {
+        Estimate {
+            adjusted_p99,
+            ..estimate(12.0, 10.0, 15.0, 8, false)
+        }
+    }
+
+    #[test]
+    fn an_auto_ceiling_keeps_a_floor_above_3x_the_p99() {
+        assert_eq!(
+            resolve_ceiling(Ceiling::Auto(900), Some(&adjusted(Some(200.0)))),
+            Resolved { seconds: 900, raised: None },
+            "3x 200 s is 600 s, below the floor"
+        );
+        assert_eq!(
+            resolve_ceiling(Ceiling::Auto(900), Some(&adjusted(Some(300.0)))),
+            Resolved { seconds: 900, raised: None },
+            "3x 300 s is the floor itself, which raises nothing"
+        );
+    }
+
+    #[test]
+    fn an_auto_ceiling_rises_to_3x_the_adjusted_p99_rounded_up() {
+        assert_eq!(
+            resolve_ceiling(Ceiling::Auto(900), Some(&adjusted(Some(840.0)))),
+            Resolved {
+                seconds: 2520,
+                raised: Some((840.0, 900))
+            }
+        );
+        assert_eq!(
+            resolve_ceiling(Ceiling::Auto(900), Some(&adjusted(Some(840.1)))),
+            Resolved {
+                seconds: 2521,
+                raised: Some((840.1, 900))
+            },
+            "3x 840.1 s is 2520.3 s, rounded up to the whole second"
+        );
+    }
+
+    #[test]
+    fn an_auto_ceiling_without_an_adjusted_p99_is_its_floor() {
+        assert_eq!(
+            resolve_ceiling(Ceiling::Auto(900), Some(&adjusted(None))),
+            Resolved { seconds: 900, raised: None },
+            "the wall p99 never raises it"
+        );
+        assert_eq!(
+            resolve_ceiling(Ceiling::Auto(900), None),
+            Resolved { seconds: 900, raised: None },
+            "no history"
+        );
+    }
+
+    #[test]
+    fn a_wide_family_estimate_does_not_raise_an_auto_ceiling() {
+        let family = |p90: f64| Estimate {
+            adjusted_p99: Some(1000.0),
+            ..estimate(12.0, 10.0, p90, 8, true)
+        };
+        assert_eq!(
+            resolve_ceiling(Ceiling::Auto(900), Some(&family(20.1))),
+            Resolved { seconds: 900, raised: None },
+            "a family p90 above 2x its p50"
+        );
+        assert_eq!(
+            resolve_ceiling(Ceiling::Auto(900), Some(&family(20.0))).seconds,
+            3000,
+            "a family p90 of exactly 2x its p50 raises it"
+        );
+        let exact = Estimate {
+            family: false,
+            ..family(50.0)
+        };
+        assert_eq!(
+            resolve_ceiling(Ceiling::Auto(900), Some(&exact)).seconds,
+            3000,
+            "a wide exact key raises it"
+        );
+    }
+
+    #[test]
+    fn an_auto_ceiling_is_capped_at_the_largest_whole_number() {
+        assert_eq!(
+            resolve_ceiling(Ceiling::Auto(900), Some(&adjusted(Some(1.0e12)))),
+            Resolved {
+                seconds: 2_147_483_647,
+                raised: Some((1.0e12, 900))
+            }
+        );
+        assert_eq!(
+            resolve_ceiling(Ceiling::Auto(2_147_483_647), Some(&adjusted(Some(1.0e12)))),
+            Resolved {
+                seconds: 2_147_483_647,
+                raised: None
+            },
+            "a floor at the cap is not raised"
+        );
+    }
+
+    #[test]
+    fn a_given_ceiling_is_never_resolved() {
+        assert_eq!(
+            resolve_ceiling(Ceiling::Given(60), Some(&adjusted(Some(1000.0)))),
+            Resolved { seconds: 60, raised: None }
+        );
+        assert_eq!(resolve_ceiling(Ceiling::Given(60), None), Resolved { seconds: 60, raised: None });
+    }
+
+    #[test]
+    fn the_raised_ceiling_line_says_minutes_from_90_s() {
+        assert_eq!(
+            raised_ceiling_line(2520, 840.0, 900, false),
+            "gate: ceiling 42 min (3x this command's p99 of 14 min, above the given 15 min)"
+        );
+        assert_eq!(
+            raised_ceiling_line(60, 20.0, 30, false),
+            "gate: ceiling 60 s (3x this command's p99 of 20 s, above the given 30 s)"
+        );
+    }
+
+    #[test]
+    fn the_ceiling_hint_says_the_owner_s_line() {
+        let usual = |p90: f64| estimate(p90, p90, p90, 5, false);
+        assert_eq!(
+            ceiling_hint(600, &usual(840.0)).as_deref(),
+            Some("gate: the ceiling 10 min is below this command's usual p90 of 14 min")
+        );
+        assert_eq!(
+            ceiling_hint(5, &usual(60.0)).as_deref(),
+            Some("gate: the ceiling 5 s is below this command's usual p90 of 60 s")
+        );
+        assert_eq!(ceiling_hint(840, &usual(840.0)), None, "at the p90");
+        assert_eq!(ceiling_hint(900, &usual(840.0)), None, "above the p90");
+    }
+
+    /// This command's usual p90 of `p90` seconds.
+    fn usual(p90: f64) -> Usual {
+        Usual { p90, family: false }
+    }
+
+    #[test]
+    fn the_hang_hint_fires_from_3x_the_p90_with_a_whole_k() {
+        assert_eq!(hang_hint(2.99 * 840.0, usual(840.0)), None, "below 3x the p90");
+        assert_eq!(
+            hang_hint(2520.0, usual(840.0)).as_deref(),
+            Some("gate: still running after 42 min, 3x its usual p90 of 14 min")
+        );
+        assert_eq!(
+            hang_hint(3.7 * 840.0, usual(840.0)).as_deref(),
+            Some("gate: still running after 52 min, 3x its usual p90 of 14 min"),
+            "3.7x says 3x"
+        );
+        assert_eq!(
+            hang_hint(41.0, usual(10.0)).as_deref(),
+            Some("gate: still running after 41 s, 4x its usual p90 of 10 s")
+        );
+    }
+
+    #[test]
+    fn no_hang_hint_below_a_1_s_p90() {
+        assert_eq!(hang_hint(5.0, usual(0.0)), None, "a p90 of 0 s");
+        assert_eq!(hang_hint(60.0, usual(0.999)), None, "a p90 just under 1 s");
+        assert_eq!(
+            hang_hint(3.0, usual(1.0)).as_deref(),
+            Some("gate: still running after 3 s, 3x its usual p90 of 1 s"),
+            "a p90 of 1 s"
+        );
+    }
+
+    #[test]
+    fn the_lines_say_similar_commands_for_a_family_estimate() {
+        assert_eq!(
+            raised_ceiling_line(2520, 840.0, 900, true),
+            "gate: ceiling 42 min (3x similar commands' p99 of 14 min, above the given 15 min)"
+        );
+        let family = estimate(840.0, 840.0, 840.0, 5, true);
+        assert_eq!(
+            ceiling_hint(600, &family).as_deref(),
+            Some("gate: the ceiling 10 min is below similar commands' usual p90 of 14 min")
+        );
+        assert_eq!(
+            hang_hint(2520.0, Usual { p90: 840.0, family: true }).as_deref(),
+            Some("gate: still running after 42 min, 3x similar commands' usual p90 of 14 min")
+        );
+    }
+
+    #[test]
+    fn a_wide_family_estimate_gives_no_hints() {
+        // A family key's p90 above 2x its p50 raises no auto ceiling, and says neither hint.
+        let wide = estimate(840.0, 400.0, 840.0, 5, true);
+        assert_eq!(ceiling_hint(600, &wide), None, "no ceiling hint");
+        assert_eq!(Usual::of(&wide), None, "no p90 for the hang hint");
+
+        let at_twice = estimate(840.0, 420.0, 840.0, 5, true);
+        assert_eq!(
+            ceiling_hint(600, &at_twice).as_deref(),
+            Some("gate: the ceiling 10 min is below similar commands' usual p90 of 14 min"),
+            "a family p90 of exactly 2x its p50 still hints"
+        );
+        assert_eq!(Usual::of(&at_twice), Some(Usual { p90: 840.0, family: true }));
+
+        let own = estimate(840.0, 400.0, 840.0, 5, false);
+        assert_eq!(
+            ceiling_hint(600, &own).as_deref(),
+            Some("gate: the ceiling 10 min is below this command's usual p90 of 14 min"),
+            "the rule is a family key's only"
+        );
+        assert_eq!(Usual::of(&own), Some(Usual { p90: 840.0, family: false }));
     }
 
     /// A journal lock no other gate holds.

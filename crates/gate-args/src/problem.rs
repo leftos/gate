@@ -6,9 +6,10 @@ use std::fmt;
 pub const MAX_WHOLE_NUMBER: u64 = 2_147_483_647;
 
 /// Which form of the command line a problem is reported in, so a missing input is named in the caller's spelling.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Spelling {
-    /// The subcommand CLI: `--slot`, `--timeout`, `--log`.
+    /// The subcommand CLI: `--slot`, `--timeout`, `--log`; every subcommand's but the compatibility layer's.
+    #[default]
     Cli,
     /// The compatibility layer: `-Slot`, `-TimeoutSeconds`, `-Log`.
     Compat,
@@ -74,6 +75,8 @@ pub enum Problem {
         value: String,
     },
     NeedsValue(String),
+    /// A bare `--timeout auto`, which carries no floor.
+    AutoNeedsFloor(String),
     GivenTwice(String),
     UnknownOption(String),
     UnknownSubcommand(String),
@@ -115,6 +118,7 @@ impl fmt::Display for Problem {
             Problem::NotTrueOrFalse { option, value } => write!(f, "gate: {option} takes true or false, got '{value}'"),
             Problem::BadConsoleFailure { option, value } => write!(f, "gate: {option} must be fail-before, got '{value}'"),
             Problem::NeedsValue(option) => write!(f, "gate: {option} needs a value"),
+            Problem::AutoNeedsFloor(option) => write!(f, "gate: {option} auto needs a floor in seconds: auto:<n>"),
             Problem::GivenTwice(option) => write!(f, "gate: {option} is given twice"),
             Problem::UnknownOption(word) => write!(f, "gate: unknown option {word}"),
             Problem::UnknownSubcommand(word) => write!(f, "gate: unknown subcommand {word}"),

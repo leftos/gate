@@ -17,6 +17,8 @@ use gate_args::RunRequest;
 use gate_state::{FallbackReason, StateRoot};
 use gate_win32::{Interrupt, OwnedMutexGuard};
 
+use crate::durations::Usual;
+
 mod client;
 pub(crate) mod git;
 mod install;
@@ -126,6 +128,8 @@ pub(crate) struct RemoteCall<'a> {
     /// The log the client writes the run's output to.
     pub log: &'a Path,
     pub timeout: u64,
+    /// The usual p90 of the run's remote take, which the run call's hang hint compares with; `None` without history.
+    pub usual: Option<Usual>,
     pub stall: u64,
     pub tail: u64,
     pub no_markers: bool,
@@ -303,6 +307,7 @@ mod snapshot_only {
                 outputs_withheld: false,
                 log,
                 timeout: 3600,
+                usual: None,
                 stall: 0,
                 tail: 0,
                 no_markers: false,

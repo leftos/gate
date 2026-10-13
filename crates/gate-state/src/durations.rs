@@ -433,7 +433,8 @@ pub struct Estimate {
     pub p90: f64,
     /// The 99th percentile of the wall seconds by nearest rank, raised to `p50` when below it.
     pub p99: f64,
-    /// The 99th percentile of the adjusted seconds by nearest rank, or `None` when no run has them.
+    /// The 99th percentile of the adjusted seconds by nearest rank, never raised to the wall `p50`; `None` unless at
+    /// least 5 of the window's runs have them.
     pub adjusted_p99: Option<f64>,
     /// The mean wall seconds of the window's runs.
     pub mean: f64,
@@ -586,7 +587,7 @@ fn estimate_of(history: &KeyHistory, now: Timestamp, key: &str, family: bool) ->
         p50,
         p90: nearest_rank(&walls, 90)?.max(p50),
         p99: nearest_rank(&walls, 99)?.max(p50),
-        adjusted_p99: nearest_rank(&adjusted, 99),
+        adjusted_p99: if adjusted.len() >= MIN_RUNS { nearest_rank(&adjusted, 99) } else { None },
         mean,
         runs: window.len(),
         key: key.to_owned(),

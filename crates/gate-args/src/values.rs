@@ -1,7 +1,7 @@
 //! Value validation, shared by the CLI and the compatibility layer.
 
 use crate::problem::{MAX_WHOLE_NUMBER, Problem};
-use crate::request::Slot;
+use crate::request::{Ceiling, Slot};
 
 /// How a value reads as a whole number.
 enum Whole {
@@ -33,13 +33,33 @@ fn too_large(option: &str, value: &str) -> Problem {
 pub(crate) const MAX_BURN_SECONDS: u32 = 180;
 
 pub(crate) fn above_zero(option: &str, value: &str) -> Result<u64, Problem> {
-    match whole(value) {
+    above_zero_shown(option, value, value)
+}
+
+/// The whole number above 0 that `digits` spell, a problem naming the value as given, `shown`.
+fn above_zero_shown(option: &str, digits: &str, shown: &str) -> Result<u64, Problem> {
+    match whole(digits) {
         Whole::Number(number) if number > 0 => Ok(number),
-        Whole::TooLarge => Err(too_large(option, value)),
+        Whole::TooLarge => Err(too_large(option, shown)),
         Whole::Number(_) | Whole::Invalid => Err(Problem::NotAboveZero {
             option: option.to_owned(),
-            value: value.to_owned(),
+            value: shown.to_owned(),
         }),
+    }
+}
+
+/// The prefix of an auto ceiling's value, read in any ASCII case.
+const AUTO_PREFIX: &str = "auto:";
+
+/// The subcommand CLI's `--timeout`: a whole number above 0, or `auto:<n>` for a floor `n` read the same way, `auto` in
+/// any ASCII case. A problem names the whole value as given; a bare `auto` needs its floor.
+pub(crate) fn ceiling(option: &str, value: &str) -> Result<Ceiling, Problem> {
+    if value.eq_ignore_ascii_case("auto") {
+        return Err(Problem::AutoNeedsFloor(option.to_owned()));
+    }
+    match value.get(..AUTO_PREFIX.len()) {
+        Some(prefix) if prefix.eq_ignore_ascii_case(AUTO_PREFIX) => above_zero_shown(option, &value[AUTO_PREFIX.len()..], value).map(Ceiling::Auto),
+        _ => above_zero(option, value).map(Ceiling::Given),
     }
 }
 
