@@ -5,14 +5,17 @@ use std::fs::{self, OpenOptions};
 use std::os::windows::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::process::Command;
+use std::time::Duration;
 
+use gate_state::{KernelObject, StateRoot};
+use gate_win32::NamedMutex;
 use regex::Regex;
 use serde_json::Value;
 
 use crate::routing::{heavy_words_with_limit, routed_case};
 use crate::support::{
-    Case, FAKE_TOOL, Outcome, assert_in_order, critical_words, events, finish, git, git_init, heavy_words, none_words, run_words, shown,
-    wait_for_file,
+    Case, FAKE_TOOL, Outcome, USAGE, assert_in_order, critical_words, events, finish, git, git_init, heavy_words, none_words, run_words, shown,
+    wait_for_file, write_counts,
 };
 
 /// `FILE_SHARE_READ`: a handle that lets others read the file, but not write, move or delete it.
@@ -438,4 +441,252 @@ fn a_missing_store_is_rebuilt_from_the_journal() {
     assert!(!case.root().join("durations.rebuilding").exists(), "the rebuild marker is gone");
     let after = passing(case.gate(&run_words("out.log", &[], &QUICK)));
     assert_eq!(said_runs(&after.stderr), 6, "{after:?}");
+}
+
+/// `gate expect` of [`QUICK`] in `case`'s folder, `options` before `--`.
+fn expect_quick(case: &Case, options: &[&str]) -> Outcome {
+    let words: Vec<&str> = ["expect"].iter().chain(options).chain(&["--"]).chain(&QUICK).copied().collect();
+    finish(case.gate(&words))
+}
+
+/// The run count of the one line `gate expect` printed, the expected-time line for here, with status 0 and nothing on
+/// stderr.
+fn expected_here(outcome: &Outcome) -> u64 {
+    assert_eq!((outcome.code, outcome.stderr.as_str()), (Some(0), ""), "{outcome:?}");
+    let line = Regex::new(&format!(r"\A{EXPECTED} here\n\z")).expect("the pattern is valid");
+    let captures = line.captures(&outcome.stdout);
+    assert!(captures.is_some(), "one line for here: {outcome:?}");
+    captures.expect("checked above")[1].parse().expect("the run count is a number")
+}
+
+/// Asserts `gate expect` printed `no history` alone, with status 0 and nothing on stderr.
+fn assert_no_history(outcome: &Outcome) {
+    assert_eq!(
+        (outcome.code, outcome.stdout.as_str(), outcome.stderr.as_str()),
+        (Some(0), "no history\n", ""),
+        "{outcome:?}"
+    );
+}
+
+#[test]
+fn gate_expect_prints_the_figure_here() {
+    let case = Case::new("expect-here");
+    quick_runs(&case, 5);
+
+    let outcome = expect_quick(&case, &[]);
+
+    assert_eq!(expected_here(&outcome), 5);
+}
+
+#[test]
+fn gate_expect_prints_each_builder_that_has_history() {
+    let case = Case::new("expect-builders");
+    quick_runs(&case, 5);
+    let mut seeded = store(&case).expect("the store was written");
+    let keys = seeded["keys"].as_object_mut().expect("the store holds its keys");
+    let (local, history) = keys
+        .iter()
+        .next()
+        .map(|(key, history)| (key.clone(), history.clone()))
+        .expect("the runs are filed");
+    // The key after `local`: its empty class, its folder and its command.
+    let rest = local.strip_prefix("local").expect("the runs were filed here").to_owned();
+    keys.insert(format!("remote:me@beta{rest}"), history.clone());
+    keys.insert(format!("remote:alpha{rest}"), history.clone());
+    keys.insert(format!("remote:gamma:crit{}", &rest[1..]), history.clone());
+    keys.insert(format!("remote:delta{}", rest.replace(QUICK_KEY, " | fake-tool exit 1")), history);
+    let path = case.root().join("durations.json");
+    fs::write(&path, seeded.to_string()).expect("the store can be seeded");
+
+    let outcome = expect_quick(&case, &[]);
+
+    assert_eq!((outcome.code, outcome.stderr.as_str()), (Some(0), ""), "{outcome:?}");
+    let here = outcome
+        .stdout
+        .lines()
+        .next()
+        .and_then(|line| line.strip_suffix(" here"))
+        .expect("here comes first");
+    assert!(
+        Regex::new(&format!(r"\A{EXPECTED}\z")).expect("the pattern is valid").is_match(here),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        outcome.stdout,
+        format!("{here} here\n{here} on alpha\n{here} on me@beta\n"),
+        "here, then each builder with history of this command and class, in host order"
+    );
+
+    seeded["keys"].as_object_mut().expect("the store holds its keys").remove(&local);
+    fs::write(&path, seeded.to_string()).expect("the store can be seeded");
+    let builders_only = expect_quick(&case, &[]);
+    assert_eq!(
+        builders_only.stdout,
+        format!("{here} on alpha\n{here} on me@beta\n"),
+        "a place without history has no line: {builders_only:?}"
+    );
+}
+
+#[test]
+fn gate_expect_without_history_prints_no_history_and_exits_0() {
+    let case = Case::new("expect-no-history");
+
+    assert_no_history(&expect_quick(&case, &[]));
+    assert_eq!(case.root_entries(), Vec::<String>::new(), "a missing store is not rebuilt");
+
+    quick_runs(&case, 4);
+    assert_no_history(&expect_quick(&case, &[]));
+    quick_runs(&case, 1);
+    assert_no_history(&finish(case.gate(&["expect", "--", FAKE_TOOL, "out", "hi"])));
+
+    fs::write(case.root().join("durations.json"), r#"{"v":1,"keyVersion":999,"keys":{}}"#).expect("a newer store can be written");
+    assert_no_history(&expect_quick(&case, &[]));
+
+    let older = r#"{"v":1,"keyVersion":0,"keys":{}}"#;
+    fs::write(case.root().join("durations.json"), older).expect("an older store can be written");
+    let entries = sorted_entries(&case);
+    assert_no_history(&expect_quick(&case, &[]));
+    assert_eq!(sorted_entries(&case), entries, "an older store is not rebuilt");
+    assert_eq!(
+        fs::read_to_string(case.root().join("durations.json")).expect("the store reads"),
+        older,
+        "an older store is left as it was"
+    );
+}
+
+#[test]
+fn gate_expect_with_a_torn_store_prints_no_history_and_says_why() {
+    let case = Case::new("expect-torn");
+    let path = case.root().join("durations.json");
+    let torn = r#"{"v":1,"keyVersion":1,"keys":{"#;
+    fs::write(&path, torn).expect("a torn store can be written");
+
+    let outcome = expect_quick(&case, &[]);
+
+    assert_eq!((outcome.code, outcome.stdout.as_str()), (Some(0), "no history\n"), "{outcome:?}");
+    let line = format!(
+        r"\Agate: cannot read {} \(.+\); expected times are unavailable\n\z",
+        regex::escape(&shown(&path))
+    );
+    assert!(Regex::new(&line).expect("the pattern is valid").is_match(&outcome.stderr), "{outcome:?}");
+    assert_eq!(fs::read_to_string(&path).expect("the store reads"), torn, "the store is left as it was");
+    assert_eq!(case.root_entries(), ["durations.json"], "nothing is rebuilt");
+}
+
+/// The entries of `case`'s state root, sorted.
+fn sorted_entries(case: &Case) -> Vec<String> {
+    let mut entries = case.root_entries();
+    entries.sort();
+    entries
+}
+
+#[test]
+fn gate_expect_queues_nothing_and_writes_nothing() {
+    let case = Case::new("expect-reader");
+    write_counts(&case.root(), r#"{"v":1,"light":1}"#);
+    quick_runs(&case, 5);
+    let entries = sorted_entries(&case);
+    let journal = fs::read(case.root().join("events.jsonl")).expect("the journal was written");
+    let durations = fs::read(case.root().join("durations.json")).expect("the store was written");
+    let root = StateRoot::new(&shown(&case.root()), None);
+    let mutexes =
+        [KernelObject::LightSlot(0), KernelObject::Journal].map(|object| NamedMutex::open(&root.object_name(object)).expect("the mutex opens"));
+    // With the one light slot and the journal mutex held, a gate that queued would wait and one that journalled would
+    // say it could not write the journal.
+    let held = mutexes
+        .each_ref()
+        .map(|mutex| mutex.acquire(Duration::from_secs(5)).expect("the mutex is free"));
+
+    let outcome = expect_quick(&case, &["--slot", "light"]);
+    drop(held);
+
+    assert_eq!(expected_here(&outcome), 5);
+    assert_eq!(sorted_entries(&case), entries, "no entry of the state root is made or removed");
+    assert_eq!(
+        fs::read(case.root().join("events.jsonl")).expect("the journal reads"),
+        journal,
+        "no journal line"
+    );
+    assert_eq!(
+        fs::read(case.root().join("durations.json")).expect("the store reads"),
+        durations,
+        "no store write"
+    );
+    assert!(!case.local_app_data().exists(), "nor is the default state root made");
+}
+
+#[test]
+fn gate_expect_needs_a_command() {
+    let case = Case::new("expect-no-command");
+    for words in [&["expect"][..], &["expect", "--"], &["expect", "--slot", "light", "--"]] {
+        let outcome = finish(case.gate(words));
+
+        assert_eq!(
+            (outcome.code, outcome.stdout.as_str(), outcome.stderr),
+            (Some(2), "", format!("gate: missing the command after --\n{USAGE}")),
+            "{words:?}"
+        );
+    }
+    assert_eq!(case.root_entries(), Vec::<String>::new());
+}
+
+#[test]
+fn gate_expect_keys_crit_with_slot_critical() {
+    let case = Case::new("expect-critical");
+    for _ in 0..5 {
+        passing(case.gate(&critical_words("out.log", &[], &QUICK)));
+    }
+
+    let plain = expect_quick(&case, &[]);
+    let critical = expect_quick(&case, &["--slot", "critical"]);
+    let spelled = expect_quick(&case, &["--slot=CRITICAL"]);
+
+    assert_no_history(&plain);
+    assert_eq!(expected_here(&critical), 5);
+    assert_eq!(spelled.stdout, critical.stdout, "the slot is read as a run reads it: {spelled:?}");
+}
+
+#[test]
+fn gate_expect_matches_the_run_line() {
+    let case = Case::new("expect-matches-run");
+    quick_runs(&case, 5);
+
+    let expected = expect_quick(&case, &[]);
+    let run = passing(case.gate(&run_words("out.log", &[], &QUICK)));
+
+    assert_eq!(expected_here(&expected), 5);
+    assert_eq!(
+        expected.stdout,
+        format!("{} here\n", run.stderr.trim_end_matches('\n')),
+        "the figure is the line the next run says: {run:?}"
+    );
+}
+
+#[test]
+fn gate_expect_keys_a_worktree_as_the_run_does() {
+    let case = Case::new("expect-worktree");
+    git_init(&case);
+    git(&case, &["commit", "--quiet", "--allow-empty", "-m", "start"]);
+    git(&case, &["worktree", "add", "--quiet", "wt"]);
+    // Git places `wt` as its own repo's worktree, where its path's shape places it under this checkout. A word under the
+    // worktree, one under `.tmp/` and one under the system temp folder each key as the run keys them only when expect
+    // places the folder by git and knows the temp root.
+    let under_worktree = shown(&case.folder().join("wt").join("x"));
+    let under_temp = shown(&std::env::temp_dir().join("y"));
+    let command = [FAKE_TOOL, "out", under_worktree.as_str(), "out", ".tmp/y", "out", under_temp.as_str()];
+    for _ in 0..5 {
+        let outcome = passing(case.gate_in("wt", &run_words("out.log", &[], &command)));
+        assert_eq!(outcome.stderr, "", "a key with fewer than 5 runs says nothing: {outcome:?}");
+    }
+    let words: Vec<&str> = ["expect", "--"].iter().chain(&command).copied().collect();
+
+    let expected = finish(case.gate_in("wt", &words));
+    let run = passing(case.gate_in("wt", &run_words("out.log", &[], &command)));
+
+    assert_eq!(expected_here(&expected), 5);
+    assert_eq!(
+        expected.stdout,
+        format!("{} here\n", run.stderr.trim_end_matches('\n')),
+        "the figure is the line the next run in the worktree says: {run:?}"
+    );
 }

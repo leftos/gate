@@ -34,6 +34,7 @@ The CLI is subcommands with GNU-style flags: `--name value` or `--name=value`, a
 | `gate cutover` | Switch this machine from the PowerShell gate to `gate.exe`, draining it first. |
 | `gate push` | Copy the installed `gate.exe` to every builder `remote.json` names. |
 | `gate burn` | Spin the CPU for a set time, for the load-burn tool. |
+| `gate expect` | Print the expected time of a command here and on each builder, from the durations store. |
 | `gate box` | Hidden: the builder side of a routed run. |
 | `gate --version` | Print `gate <package version>+<build id>` and exit 0 ([Build id](#build-id)). |
 | `gate --help`, `gate help` | Print the usage on stdout and exit 0. |
@@ -177,6 +178,21 @@ It also ends when the process that started it ends: `gate: burn: the parent proc
 - The PowerShell spelling (`-Burn`, `-Cores`, `-OwnerApproved`) is accepted by the compatibility layer while the launcher's form stays.
 - Plain `gate burn` stays as the subcommand `gate run --burn` builds on: one process that spins the CPU, takes no slot, runs no command and enforces no 120 s cap (its limit is the 180 s above).
 
+### `gate expect`
+
+`gate expect [--state-dir <path>] [--slot heavy|light|critical] -- <command> [args...]` prints how long the command would take in the current folder, from the durations store ([design/gate-durations.md](design/gate-durations.md)). Its usage line is listed after `gate burn`. It is a pure reader: it queues for nothing, takes no slot or mutex, writes no journal line, and neither writes nor rebuilds the store.
+
+- `--state-dir` and `GATE_STATE_DIR` resolve the [state root](#state-root) as for `gate stop-tree`.
+- `--slot` defaults to `heavy`; `critical` keys the `crit` class. `none` and any other value are refused: `gate: --slot must be heavy, light or critical, got '<value>'`, then the usage, exit 2.
+- Other usage errors, each on its own `gate: ` line before the usage, exit 2: `gate: missing the command after --`, `gate: --slot is given twice`, `gate: --state-dir is given twice`, `gate: unknown option {word}` and `gate: unexpected argument {word}`.
+- It keys the command as a `gate run` of the same words in the same folder would: the same git call with the folder-shape fallback, the same temp root, class and exact-then-family estimate. The one difference is that it keys the words as given, so a dotnet `--no-build` that a local run would drop is keyed with it.
+
+It prints one line per place with an estimate on stdout, the local one first, then each builder in host order: `gate: expected about {n} {s|min} (usual {p50}, p90 {p90}, {runs} runs[ of similar commands]) here`, and for a builder the same text ending ` on {host}`. It exits 0.
+
+`no history` on stdout, exit 0, when no place has an estimate, when the store is missing, and, silently, when it is of an older or newer key version. A torn or unreadable store also prints `no history` and exits 0, with `gate: cannot read {path} ({reason}); expected times are unavailable` on stderr. A working directory that cannot be read prints `gate: cannot read the working directory: {error}` on stderr and exits 1.
+
+The launcher maps no `-Expect`: the compatibility layer refuses it, and callers run `gate.exe expect -- <command>` directly.
+
 ### `gate box`
 
 Hidden from the usage and from `--help`. It is the builder side of a routed run, run over ssh on the builder ([The box side](#the-box-side)).
@@ -185,7 +201,7 @@ Hidden from the usage and from `--help`. It is the builder side of a routed run,
 
 ### Later subcommands
 
-Further modes arrive as subcommands of the same binary, each designed with its issue: `gate expect -- <command>` (the expected duration of a command, GATE-13), `gate status` and `gate drain`. New options, such as `--timeout auto` (GATE-16) and `--slot auto` (GATE-8), exist only in the new CLI, never in the compatibility layer.
+Further modes arrive as subcommands of the same binary, each designed with its issue: `gate status` and `gate drain`. New options, such as `--timeout auto` (GATE-16) and `--slot auto` (GATE-8), exist only in the new CLI, never in the compatibility layer.
 
 ### Compatibility layer
 
@@ -370,7 +386,7 @@ For any other root, every kernel object name carries `<h>`, the first 8 lower-ca
 | `paused\<parent pid>-<parent start>-<pid>-<start>.pause` | a gate waiting behind a critical request under a parent gate's slot | its parent gate's watchdog | Empty file; [Critical drain and nesting](#critical-drain-and-nesting) (kept, N3). |
 | `events.jsonl`, `events.1.jsonl` | every gate, under the journal mutex | ops-tower, the durations store's rebuild, people | [Journal](#journal). |
 | `archive\events-<yyyyMMddTHHmmssZ>.jsonl.gz` | the gate whose append rolled the journal | the durations store's rebuild | [Archive](#archive). |
-| `durations.json` | every slot-taking gate that reaches a verdict, inside the journal mutex right after its `release` line; a rebuilding gate swaps one in | gates (no lock); ops-tower does not read it | The learned durations store, `{"v":1,"keyVersion":1,"keys":{…}}`, at most 30 samples per key ([design/gate-durations.md](design/gate-durations.md), Store). Written to a temporary sibling and moved over. A gate rebuilds a missing, stale or torn file from the journal and the archive once it has released, outside the journal hold, leaving out `--slot none` runs; a run whose release was filed into a current store does not rebuild, and the store is read again just before the rebuild claim. A store whose `keyVersion` is above this build's is read as no history, and neither filed into nor rebuilt. |
+| `durations.json` | every slot-taking gate that reaches a verdict, inside the journal mutex right after its `release` line; a rebuilding gate swaps one in | gates, `gate expect` (no lock); ops-tower does not read it | The learned durations store, `{"v":1,"keyVersion":1,"keys":{…}}`, at most 30 samples per key ([design/gate-durations.md](design/gate-durations.md), Store). Written to a temporary sibling and moved over. A gate rebuilds a missing, stale or torn file from the journal and the archive once it has released, outside the journal hold, leaving out `--slot none` runs; a run whose release was filed into a current store does not rebuild, and the store is read again just before the rebuild claim. A store whose `keyVersion` is above this build's is read as no history, and neither filed into nor rebuilt. |
 | `durations.rebuilding`, `durations.rebuilding.<pid>.tmp` | the gate rebuilding the store | other gates | JSON `{"pid":<pid>,"start":<ms>}`; one gate rebuilds at a time, and a marker whose holder is dead or that cannot be read is taken over. Both exist only while a rebuild runs; a Ctrl+C during it swaps nothing and removes the marker. |
 | `backfill\<pid>.json` and the backfill bar record | gates | gates | Reserved for backfill guests (GATE-7; [design/gate-durations.md](design/gate-durations.md)). |
 | `remote\<key>.outputs-pending` | the bridged remote client, and the Rust remote client (dormant) | the same | Empty file. Written by `remote.ps1` while the bridge stands (D1). The Rust client writes it after the push and before a routed run's run call when the run has output globs, or when the route withheld its outputs (a dotnet `--no-build` command the builder built; that marker no end clears), so a run refused at the preflight or by the parity check leaves none, removes it only after an accepted `gate-remote-outputs: 0` or an install that skipped no file, and sends `OutputsFull` while it stands ([The remote client's run](#routing-and-the-remoteps1-bridge)). |

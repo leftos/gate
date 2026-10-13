@@ -2,7 +2,7 @@
 
 use std::ffi::OsString;
 
-use gate_args::{Invocation, Problem, RunRequest, StopRequest, USAGE, parse};
+use gate_args::{ExpectRequest, Invocation, Problem, RunRequest, StopRequest, USAGE, parse};
 
 use crate::console::Console;
 use crate::request_json;
@@ -31,6 +31,7 @@ pub(crate) fn answer(args: Vec<OsString>, environment: &Environment, console: &m
         Ok(Invocation::Cutover(request)) => crate::cutover::cutover(&request, environment, console),
         Ok(Invocation::Push(request)) => crate::push::push(&request, environment, console),
         Ok(Invocation::Burn(request)) => crate::burn::burn(&request, console),
+        Ok(Invocation::Expect(request)) => u32::from(expect(&request, environment, console)),
         Ok(Invocation::Box(request)) => crate::boxside::answer(&request, console),
         Err(problems) => u32::from(usage_error(&problems, console)),
     }
@@ -73,5 +74,15 @@ fn stop_tree(request: &StopRequest, environment: &Environment, console: &mut Con
             0
         }
         Ok(root) => crate::stop_tree::stop_tree(request.pid, &root.root, console),
+    }
+}
+
+fn expect(request: &ExpectRequest, environment: &Environment, console: &mut Console) -> u8 {
+    match resolve::root(request.state_dir.as_deref(), environment) {
+        Err(line) => {
+            console.err(&line);
+            USAGE_STATUS
+        }
+        Ok(root) => crate::expect::expect(request, &root.path, console),
     }
 }

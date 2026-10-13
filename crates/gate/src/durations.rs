@@ -53,6 +53,20 @@ struct GitLimits {
 }
 
 impl GitLimits {
+    fn of(seams: &TestSeams) -> GitLimits {
+        GitLimits {
+            limit: git::limit(seams),
+            drain: git::drain(seams),
+        }
+    }
+
+    /// Where the folder `cwd` sits, placed by one git call, or by its path's shape when git does not place it.
+    fn place_or_shape(self, cwd: &str) -> KeyPlace {
+        let folder = Path::new(cwd);
+        let placed = Git::find(folder).ok().and_then(|git| self.place(&git, folder, None));
+        placed.unwrap_or_else(|| place_by_shape(cwd))
+    }
+
     /// Where git places `folder`, asked as the routing decision asks it ([`route::read_place`]), the call ended when
     /// `interrupt` is raised: in its worktree, under the main checkout's name. `None` when git fails, says the folder
     /// is in no worktree, does not answer in time, or writes what does not read as a place.
@@ -64,6 +78,26 @@ impl GitLimits {
         };
         route::read_place(git, &call).ok().flatten().as_ref().map(from_route)
     }
+}
+
+/// Where the folder `cwd` sits in a key, as a run whose routing decision asked no git places it: by one git call under
+/// the git limit of `seams`, or by its path's shape when git does not place it.
+pub(crate) fn folder_place(cwd: &str, seams: &TestSeams) -> KeyPlace {
+    GitLimits::of(seams).place_or_shape(cwd)
+}
+
+/// The system temp root, whose paths a command word loses in a key; `None` when it is empty.
+pub(crate) fn temp_root() -> Option<String> {
+    Some(std::env::temp_dir().to_string_lossy().into_owned()).filter(|root| !root.is_empty())
+}
+
+/// The line that says the store cannot be read, so no expected time is said.
+pub(crate) fn unreadable_line(error: &StoreReadError) -> String {
+    format!(
+        "gate: cannot read {} ({}); expected times are unavailable",
+        error.path.display(),
+        error.reason
+    )
 }
 
 /// The key place of a folder the routing decision placed.
@@ -111,25 +145,17 @@ impl RunDurations {
     /// decision asked git, else by one git call under the run's git limit, and by its path's shape when git does not
     /// place it.
     pub(crate) fn open(root: &Path, run: &RunIdentity<'_>, placed: &Placed, seams: &TestSeams) -> RunDurations {
-        let limits = GitLimits {
-            limit: git::limit(seams),
-            drain: git::drain(seams),
-        };
+        let limits = GitLimits::of(seams);
         let folder = match placed {
             Placed::Asked(Some(place)) => from_route(place),
             Placed::Asked(None) => place_by_shape(run.cwd),
-            Placed::NotAsked => {
-                let folder = Path::new(run.cwd);
-                let placed = Git::find(folder).ok().and_then(|git| limits.place(&git, folder, None));
-                placed.unwrap_or_else(|| place_by_shape(run.cwd))
-            }
+            Placed::NotAsked => limits.place_or_shape(run.cwd),
         };
-        let temp_root = std::env::temp_dir().to_string_lossy().into_owned();
         RunDurations {
             root: root.to_path_buf(),
             folder,
             command: run.command.to_owned(),
-            temp_root: Some(temp_root).filter(|root| !root.is_empty()),
+            temp_root: temp_root(),
             critical: run.critical,
             owner: run.owner,
             git: limits,
@@ -273,11 +299,7 @@ impl RunDurations {
 
     fn say_unreadable(&mut self, error: &StoreReadError, console: &mut Console) {
         if !std::mem::replace(&mut self.said.unreadable, true) {
-            console.err(&format!(
-                "gate: cannot read {} ({}); expected times are unavailable",
-                error.path.display(),
-                error.reason
-            ));
+            console.err(&unreadable_line(error));
         }
     }
 

@@ -31,6 +31,8 @@ pub enum Invocation {
     Push(PushRequest),
     /// `gate burn`.
     Burn(BurnRequest),
+    /// `gate expect`.
+    Expect(ExpectRequest),
     /// The hidden `gate box <verb> <payload>`.
     Box(BoxRequest),
 }
@@ -275,6 +277,18 @@ pub struct PushRequest {
 pub struct BurnRequest {
     pub cores: Option<u32>,
     pub seconds: u32,
+}
+
+/// A valid `gate expect`: the command whose expected time is asked for, the slot kind it would run in and the state root.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExpectRequest {
+    /// `--slot` as given, `heavy` when it is not given: `critical` reads the critical gates' history, any other kind
+    /// the history the heavy and light gates share.
+    pub slot: Slot,
+    /// `--state-dir` as given.
+    pub state_dir: Option<PathBuf>,
+    /// The words after `--`, unchanged.
+    pub command: Vec<OsString>,
 }
 
 /// What the black-box suite sets on `gate push` through its hidden `--test-*` flags; each field keeps its default,

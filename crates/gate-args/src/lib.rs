@@ -1,8 +1,9 @@
-//! The gate's own argv: the subcommand CLI (`gate run`, `gate burn`, `gate stop-tree`, `gate cutover`, `gate push`, the hidden `gate box`,
-//! `--version`, `--help`) and the compatibility layer that reads the PowerShell gate's `-Log <path> -TimeoutSeconds <n> -Slot
-//! <kind> -- <command>` form. Parsing is pure: it reads the words it is given, opens no file and reads no environment,
-//! so it builds and tests everywhere. A usage error is a list of [`Problem`]s, each printed on its own `gate: ` line
-//! before the [`USAGE`]; a malformed `gate box` is the one [`Problem::BoxUsage`], its own `usage: ` line said alone.
+//! The gate's own argv: the subcommand CLI (`gate run`, `gate burn`, `gate expect`, `gate stop-tree`, `gate cutover`,
+//! `gate push`, the hidden `gate box`, `--version`, `--help`) and the compatibility layer that reads the PowerShell
+//! gate's `-Log <path> -TimeoutSeconds <n> -Slot <kind> -- <command>` form. Parsing is pure: it reads the words it is
+//! given, opens no file and reads no environment, so it builds and tests everywhere. A usage error is a list of
+//! [`Problem`]s, each printed on its own `gate: ` line before the [`USAGE`]; a malformed `gate box` is the one
+//! [`Problem::BoxUsage`], its own `usage: ` line said alone.
 //!
 //! It also owns the rules for the command's words, as pure functions over injected inputs: their C-runtime quoting
 //! ([`command_line`]), their cmd.exe quoting for a `.cmd` or `.bat` target ([`is_batch_target`],
@@ -28,15 +29,15 @@ pub use cmdline::{command_line, command_text, quote_arg, quote_arg_str};
 pub use problem::{MAX_WHOLE_NUMBER, Problem, Required, Spelling};
 pub use program::{ProgramSearch, resolve_program};
 pub use request::{
-    BoxRequest, BoxSeams, BoxVerb, BurnRequest, CutoverRequest, CutoverSeams, DEFAULT_STALL_SECONDS, DEFAULT_TAIL_LINES, Invocation, PushRequest,
-    PushSeams, RunRequest, Slot, StopRequest, TestSeams,
+    BoxRequest, BoxSeams, BoxVerb, BurnRequest, CutoverRequest, CutoverSeams, DEFAULT_STALL_SECONDS, DEFAULT_TAIL_LINES, ExpectRequest, Invocation,
+    PushRequest, PushSeams, RunRequest, Slot, StopRequest, TestSeams,
 };
 pub use usage::USAGE;
 
 /// Reads the gate's arguments, without the program name.
 ///
 /// The first word picks the parser: `--version`, `--help` and `help` first, then a subcommand name (`run`, `burn`,
-/// `stop-tree`, `cutover`, `push`, the hidden `box`) selects the CLI and a first word starting with `-` selects the
+/// `expect`, `stop-tree`, `cutover`, `push`, the hidden `box`) selects the CLI and a first word starting with `-` selects the
 /// compatibility layer.
 ///
 /// # Errors
@@ -60,6 +61,7 @@ pub fn parse(args: Vec<OsString>) -> Result<Invocation, Vec<Problem>> {
         "cutover" => cli::parse_cutover(words).map(Invocation::Cutover),
         "push" => cli::parse_push(words).map(Invocation::Push),
         "burn" => cli::parse_burn(words).map(Invocation::Burn),
+        "expect" => cli::parse_expect(words).map(Invocation::Expect),
         "box" => boxcmd::parse(words).map(Invocation::Box),
         _ if text.starts_with('-') => compat::parse(std::iter::once(first).chain(words)),
         _ => Err(vec![Problem::UnknownSubcommand(text.to_owned())]),

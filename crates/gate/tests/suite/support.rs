@@ -31,6 +31,7 @@ usage: gate run --slot heavy|light|critical|none --timeout <seconds> --log <path
        gate cutover
        gate push
        gate burn [--cores <n>] --seconds <s>
+       gate expect [--state-dir <path>] [--slot heavy|light|critical] -- <command> [args...]
        gate --version | --help
 
 run options:
@@ -112,14 +113,14 @@ impl Case {
 
     /// Readies `command` for this case: the inherited gate variables removed, LOCALAPPDATA under the case folder
     /// ([`Case::local_app_data`]), the working directory the case folder,
-    /// and `args` given with `--state-dir <root>` after a `run` or `stop-tree` subcommand.
+    /// and `args` given with `--state-dir <root>` after a `run`, `stop-tree` or `expect` subcommand.
     pub fn prepare(&self, command: &mut Command, args: &[&str]) {
         self.prepare_without_state_dir(command, &[]);
         let Some((first, rest)) = args.split_first() else {
             return;
         };
         command.arg(first);
-        if matches!(*first, "run" | "stop-tree") {
+        if matches!(*first, "run" | "stop-tree" | "expect") {
             command.arg("--state-dir").arg(&self.state);
         }
         command.args(rest);

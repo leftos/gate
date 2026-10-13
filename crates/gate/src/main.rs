@@ -16,6 +16,7 @@ mod cutover;
 mod durations;
 mod environment;
 mod escaped;
+mod expect;
 mod journal;
 mod log;
 mod machine;

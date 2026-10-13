@@ -42,6 +42,7 @@ Suite = `crates/gate/tests/suite/` (binary `suite`, needs `--all-features`; test
 | stopping.rs | `stop_tree` (the checked open `gate stop-tree` shares), `stall` (the kill's escaped processes) | no: stop_tree, stall |
 | escaped.rs | `stall` (`a_stall_kill_ends_a_packaged_app_the_command_started`, machine-dependent; `a_stall_kill_ends_a_child_outside_the_job_whose_launcher_has_ended`, machine-alone `#[ignore]`, with `stall::a_stall_kill_ends_a_child_outside_the_job_whose_launcher_exited_at_once` (machine-alone `#[ignore]`: the launcher ends before the first sample, so only the job's memory of it reaches the escapee), `ceiling::a_ceiling_kill_ends_a_child_outside_the_job_whose_launcher_has_ended` and `interrupt::a_ctrl_c_ends_a_child_outside_the_job_whose_launcher_has_ended`; the escapee cases that start it with `fake-tool spawn-away` under `--test-job-breakaway`; the unit tests inside), `cores` (`a_command_whose_child_left_its_job_counts_that_child_s_cores`), `interrupt` and `ceiling` (the other kills run it too) | no: stall, cores, interrupt, ceiling |
 | burn.rs | `burn` (`gate burn`: start line, status, parent watch), `cli` (usage and refusals) | no: burn, cli |
+| expect.rs | `durations` (`gate expect`: the line here, a line per builder with history, `no history` for a missing, short, older or newer store, the usage errors), `cli` (usage) | no: durations, cli |
 | request_json.rs | `request`, `compat`, `cutover` (`--test-print-request`), `launcher`, `harness`, `support` | no: request, compat, cutover, launcher, harness |
 | route.rs | `routing` (decisions, `--test-git`, remote.json), `remote_client`, `bridge`, `request`, `durations` (`read_place` and `Placed` place the durations key) | no: routing, remote_client, bridge, durations |
 | durations.rs | `durations` (the expected-time line, the filing of each release, the key of a critical, routed, fallback and outside-git run, the rebuild and its marker, the unreadable and unwritable store lines), `hold` (the rebuild line a store that cannot be made says); the unit tests inside (the line's units, the rebuild's claim and interrupt) | no: durations, hold, journal |
@@ -64,6 +65,7 @@ Suite = `crates/gate/tests/suite/` (binary `suite`, needs `--all-features`; test
 | gate-args lib.rs / cli.rs / values.rs / problem.rs / usage.rs | every case parses argv: all suite (parse errors `cli`, usage `cli`) | `gate-args::args` (top, run, boxcmd), unit | CENTRAL |
 | gate-args request.rs / run.rs (seam parsing) | `request`, plus every module whose flags it parses (`--bring-tracked`: `remote_client`) | args tests `run` | CENTRAL (a seam rename breaks callers) |
 | gate-args compat.rs | `compat`, `launcher`, `request`, `cli` | args `compat` | no |
+| gate-args expect (parse in cli.rs / run.rs / request.rs, usage line in usage.rs) | `durations` (`gate expect`), `cli` (usage) | args `expect` | no (the files themselves are CENTRAL, first row) |
 | gate-args boxcmd.rs | `boxside`, `boxside::outputs`, `remote_client` | args `boxcmd` | no |
 | gate-args cmdline.rs / batch.rs / program.rs | `launch` (quoting, refused batch word, `.cmd`), `journal` (`command_text`), `boxside`, `remote_client` | args `quoting`, `batch`, `program` | no |
 | gate-router (decide, rewrite, key, like, config) | `routing` (imports `DROPPED_NO_BUILD_LINE`, `NO_OUTPUTS_LINE`; `decide.rs`'s dotnet readers also drive the local drop and the record), `remote_client` (`repo_name`), `bridge`, `request` | `gate-router::router` (`decide`: the wrapped form, the drop verbs, the targets and settings) | no |
@@ -122,6 +124,7 @@ Always add `checkout` to any change that touches a suite file or adds a seam.
 | stopping.rs | `-E 'binary(suite) and test(/^(stop_tree\|stall)::/) or (U and test(/^stopping::/))'` |
 | escaped.rs | `-E 'binary(suite) and test(/^(stall\|cores\|interrupt\|ceiling)::/) or (U and test(/^escaped::/))'` |
 | burn.rs | `-E 'binary(suite) and test(/^(burn\|cli)::/) or (U and test(/^burn::/))'` |
+| expect.rs | `-E 'binary(suite) and test(/^(durations\|cli)::/)'` |
 | request_json.rs | `-E 'binary(suite) and test(/^(request\|compat\|cutover\|launcher\|harness)::/)'` |
 | no_build.rs | `-E 'binary(suite) and test(/^routing::/) or (U and test(/^(no_build\|run)::/))'` |
 | route.rs | `-E 'binary(suite) and test(/^(routing\|remote_client\|bridge\|request\|durations)::/) or (U and test(/^route::/))'` |
@@ -135,6 +138,7 @@ Always add `checkout` to any change that touches a suite file or adds a seam.
 | tools/install.ps1 | `-E 'binary(suite) and test(/^(install\|checkout)::/)'` |
 | suite module `X.rs` only | `-E 'binary(suite) and test(/^(X\|checkout)::/)'` |
 | gate-args compat.rs | `-E 'package(gate-args) or (binary(suite) and test(/^(compat\|launcher\|request\|cli)::/))'` |
+| gate-args expect | `-E 'package(gate-args) or (binary(suite) and test(/^(durations\|cli)::/))'` |
 | gate-args boxcmd.rs | `-E 'package(gate-args) or (binary(suite) and test(/^(boxside\|remote_client)::/))'` |
 | gate-args cmdline/batch/program.rs | `-E 'package(gate-args) or (binary(suite) and test(/^(launch\|journal\|boxside\|remote_client)::/))'`; also `gate-state` `journal` tests mirror cmdline (ARCH Task Index "history key splits"): add `package(gate-state)` |
 | gate-router (any) | `-E 'package(gate-router) or (binary(suite) and test(/^(routing\|remote_client\|bridge\|request)::/)) or (U and test(/^(route\|remote)::/))'` (do NOT use `rdeps(gate-router)`: it pulls the full gate package) |

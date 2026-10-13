@@ -5,7 +5,7 @@ Design for CC-178 (Gate: learn each command's usual runtime and schedule with it
 ## What v1 does
 
 1. Records what each finished gated command took, and keeps a per-command summary the gate reads on its hot path.
-2. Prints the expected time when a gate takes its slot, and answers `gate.ps1 -Expect -- <command>` without running anything.
+2. Prints the expected time when a gate takes its slot, and answers `gate expect -- <command>` without running anything.
 3. Puts an ETA into the wait lines and an `expected` field into claims and tickets, which ops-tower's Gates tab shows.
 4. Accepts `-TimeoutSeconds auto` and prints hang and ceiling hints.
 5. Lets a waiting gate run as a **guest** while a critical gate drains, when it is known to finish before the slowest gate the drain waits on.
@@ -20,7 +20,7 @@ Each part is a sub-issue of CC-178 and lands on `feat/gate-durations`. Part 1 co
 - At each journal rollover, the gate whose append rolled the journal gzips the release lines of the rolled `events.1.jsonl` into `<state root>\archive\events-<UTC stamp>.jsonl.gz` and deletes archives older than 180 days, before it releases the journal mutex, in the same hold as the append. A failed archive write is said once on standard error, and the rollover goes on. `events.1.jsonl` is left as it is, since ops-tower detects the roll by its identity.
 - The archive folder lives in the state root, so a test root isolates it as it does the journal.
 
-### Part 2: the durations summary, `-Expect` and the expected-time line
+### Part 2: the durations summary, `gate expect` and the expected-time line
 
 - **Key.** `<place>:<class>:<repo>[/<sub>] | <normalised command>`. `place` is `local` or `remote:<host>`; `class` is `crit` for a critical gate, else empty. Repo and subfolder are derived from git, so no machine path is configured or hard-coded:
   - The repo is the main checkout's folder name, taken from `git rev-parse --git-common-dir`, so every worktree of a repo shares one key.
@@ -46,7 +46,7 @@ Each part is a sub-issue of CC-178 and lands on `feat/gate-durations`. Part 1 co
 - **Store.** `durations.json` in the gate's state root, updated by the gate right after the `release` line, inside the journal mutex, written to a temp file and moved over the old one (the claim files' pattern). Hot-path readers take no lock. Its shape is `{"v":1,"keyVersion":1,"keys":{"<key>":{"last":"<iso>","failed":N,"samples":[{"time","wall","adjusted","avgCores","peakCores"}]}}}`, at most 30 samples per key, and a key with no release in 14 days is pruned. ops-tower does not read it.
 
   A missing, stale (`keyVersion`) or unreadable store needs a rebuild. One gate rebuilds at a time, holding the `durations.rebuilding` marker (`{"pid","start"}`) in the state root; a marker whose holder is dead, or that is unreadable, is taken over. The rebuild reads the live journal newest first, then the archives within 14 days, outside the journal mutex; then, under the mutex, it files the releases written since and swaps the store in.
-- **Lines.** When the gate takes its slot: `gate: expected about <mean> (usual <p50>, p90 <p90>, <n> runs)`, each figure in whole seconds, or in whole minutes from a mean of 90 s, and never below 1; or nothing for a command without history. `gate.ps1 -Expect -- <command>` prints the same figure for the current folder, or `no history`, and exits 0 without queueing.
+- **Lines.** When the gate takes its slot: `gate: expected about <mean> (usual <p50>, p90 <p90>, <n> runs)`, each figure in whole seconds, or in whole minutes from a mean of 90 s, and never below 1; or nothing for a command without history. `gate expect -- <command>` prints the same figure for the current folder, or `no history`, and exits 0 without queueing.
 
 ### Part 3: ETAs in wait lines, claims and tickets
 
@@ -84,9 +84,9 @@ Each part is a sub-issue of CC-178 and lands on `feat/gate-durations`. Part 1 co
 
 Parts 2 to 5 are built in the Rust gate (GATE-7) after the local cutover, on the journal facts of part 1 (GATE-33). The rulings above hold with these spellings and boundaries:
 
-- `gate expect -- <command>` replaces `-Expect`, and `--timeout auto` and `--slot auto` are options of the new CLI only, with no compatibility-layer spelling. The form that carries the caller's number `n` for `--timeout auto` (`--timeout 900 --auto` or `--timeout auto:900`) is settled in this document when part 4 is built (GATE-16).
+- `gate expect -- <command>` is the whole of the old `-Expect` (the launcher maps none, and the compatibility layer refuses it), and `--timeout auto` and `--slot auto` are options of the new CLI only, with no compatibility-layer spelling. The form that carries the caller's number `n` for `--timeout auto` (`--timeout 900 --auto` or `--timeout auto:900`) is settled in this document when part 4 is built (GATE-16).
 - The key and command normalisation are `gate_state::duration_key` and `normalize_for_durations`, over the history key's word rules, and the key is git-derived as in part 2: the repo is the main checkout's folder name from `git rev-parse --git-common-dir`, the subfolder is the cwd relative to the worktree root, and a folder git cannot place falls back to its path shape, else is keyed as outside git. gate-state never runs git: the caller passes the place (`KeyPlace`). No machine path is configured or hard-coded.
-- The library (key, estimate, store, rebuild, and `append_line_then` in `journal_writer.rs`, which runs the store write in the journal hold) is in `gate-state`. The `gate` crate calls it from `durations.rs`: it says the expected-time line, files each release in the store and rebuilds the store. `gate expect` is not built.
+- The library (key, estimate, store, rebuild, and `append_line_then` in `journal_writer.rs`, which runs the store write in the journal hold) is in `gate-state`. The `gate` crate calls it from `durations.rs`: it says the expected-time line, files each release in the store and rebuilds the store. `expect.rs` is `gate expect`: it reads the store with no lock and prints one line per place with an estimate (here, then each builder in host order), or `no history`, as specified in [`gate expect`](../design.md#gate-expect).
 - Every run that takes a slot of its own runs one `git rev-parse` before it queues to place its folder, reusing the answer of the routing decision for a heavy run whose route asked; a failed call keys the folder by its shape, silently. A `--slot none` run, and one a parent's slot covers or lends, has no key and is neither timed nor filed.
 - The expected-time line is said once the run's claim is written and the waiters woken: at a local light or heavy take, at a critical take after its holds line, at a routed run's remote take (keyed by the builder) and, for a fallback, a second time at its local take. Its figures are in [Output lines](../design.md#output-lines): `about` is the mean wall time over the estimate's window, `usual` the p50.
 - A release is filed by every slot-taking run that reaches a verdict, inside the journal hold of its `release` line, which is unchanged. A rebuild runs after the release, outside the hold, when a read found the store missing, stale or torn and the store is still so just before the claim; a rebuild leaves out `--slot none` runs, as live filing does. A store under a `keyVersion` above this build's is read as no history and is neither filed into nor rebuilt.

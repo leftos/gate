@@ -1181,6 +1181,28 @@ fn a_dead_rebuilders_marker_is_taken_over() {
     assert_eq!(marker(&root), json!({"pid": 300, "start": 3000}));
 }
 
+#[test]
+#[cfg(windows)]
+fn an_unreadable_marker_held_open_is_not_taken_over() {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let root = fresh_dir("durations_unreadable_marker_held_open");
+    let path = rebuilding_path(&root);
+    fs::write(&path, r#"{"pid":100,"start":1000}"#).expect("a marker can be seeded");
+    // Opened sharing nothing, the marker can be neither read nor removed by another handle.
+    let held = OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(&path)
+        .expect("the marker can be held open");
+
+    let claimed = begin_rebuild(&root, &FakeLock::Free, gate(200, 2_000), |_, _| false);
+    drop(held);
+
+    assert_eq!(claimed, Ok(false), "a marker another process holds open means this gate does not rebuild");
+    assert_eq!(marker(&root), json!({"pid": 100, "start": 1000}), "the marker is left as it was");
+}
+
 /// A journal lock with one holder at a time: a take while it is held is refused at once.
 #[derive(Default)]
 struct OneHolder(Cell<bool>);

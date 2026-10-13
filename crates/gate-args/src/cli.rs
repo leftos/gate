@@ -4,27 +4,39 @@ use std::ffi::OsString;
 use std::iter::Peekable;
 
 use crate::problem::{Problem, Spelling};
-use crate::request::{BurnRequest, CutoverRequest, PushRequest, RunRequest, StopRequest};
+use crate::request::{BurnRequest, CutoverRequest, ExpectRequest, PushRequest, RunRequest, StopRequest};
 use crate::run::{RunBuilder, RunOption, SwitchOption, ValueOption, next_text};
 use crate::values;
 
 /// Reads the words after `gate run`.
 pub(crate) fn parse_run(words: impl Iterator<Item = OsString>) -> Result<RunRequest, Vec<Problem>> {
-    let mut words = words.peekable();
     let mut builder = RunBuilder::default();
-    let mut command = Vec::new();
+    let command = read_until_command(&mut builder, words, run_option);
+    builder.finish_run(command, Spelling::Cli)
+}
+
+/// Reads the words after `gate expect`: `--state-dir` and `--slot`, then the command after `--`.
+pub(crate) fn parse_expect(words: impl Iterator<Item = OsString>) -> Result<ExpectRequest, Vec<Problem>> {
+    let mut builder = RunBuilder::default();
+    let command = read_until_command(&mut builder, words, expect_option);
+    builder.finish_expect(command)
+}
+
+/// Reads the options `lookup` knows into `builder` up to the first `--`, and returns the words after it: none when there
+/// is no `--`. A word before it that is not an option is a problem.
+fn read_until_command(builder: &mut RunBuilder, words: impl Iterator<Item = OsString>, lookup: fn(&str) -> Option<RunOption>) -> Vec<OsString> {
+    let mut words = words.peekable();
     while let Some(text) = next_text(&mut words, &mut builder.problems) {
         if text == "--" {
-            command = words.collect();
-            break;
+            return words.collect();
         }
         if text.starts_with('-') {
-            read_option(&mut builder, &mut words, &text, run_option);
+            read_option(builder, &mut words, &text, lookup);
         } else {
             builder.problems.push(Problem::UnexpectedArgument(text));
         }
     }
-    builder.finish_run(command, Spelling::Cli)
+    Vec::new()
 }
 
 /// Reads the words after `gate stop-tree`: the pid, and `--state-dir` before it or after it.
@@ -131,6 +143,14 @@ fn burn_option(name: &str) -> Option<RunOption> {
     match name {
         "cores" => Some(RunOption::Value(ValueOption::Cores)),
         "seconds" => Some(RunOption::Value(ValueOption::Seconds)),
+        _ => None,
+    }
+}
+
+fn expect_option(name: &str) -> Option<RunOption> {
+    match name {
+        "slot" => Some(RunOption::Value(ValueOption::Slot)),
+        "state-dir" => Some(RunOption::Value(ValueOption::StateDir)),
         _ => None,
     }
 }
