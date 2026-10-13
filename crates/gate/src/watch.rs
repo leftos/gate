@@ -21,7 +21,7 @@ use jiff::Timestamp;
 use proc_table::{ProcessInfo, ProcessTable, ProcessTree, Win32ProcessTable, filetime_to_timestamp};
 
 use crate::console::Console;
-use crate::escaped::{self, Look, Recorded};
+use crate::escaped::{self, Departed, Look, Recorded};
 use crate::log::Log;
 use crate::nesting::Parent;
 use crate::pause::PauseReader;
@@ -84,6 +84,8 @@ pub(crate) struct Watcher<'a> {
     /// The processes outside the job the samples have recorded, which the run's kill ends.
     recorded: &'a RefCell<Recorded>,
     sampler_works: bool,
+    /// Why the job's memory of its ended members failed, once a sample has said so.
+    memory_said: Option<String>,
     /// Whether every sample fails (`--test-sampler-fail`).
     sampler_fail: bool,
     /// Whether gathering a kill's diagnostics fails (`--test-diagnostics-fail`).
@@ -243,6 +245,7 @@ impl<'a> Watcher<'a> {
             counted_escaped: Vec::new(),
             recorded,
             sampler_works: true,
+            memory_said: None,
             sampler_fail: request.test_seams.sampler_fail,
             diagnostics_fail: request.test_seams.diagnostics_fail,
             diagnostics_budget_ms: request.test_seams.diagnostics_budget_ms.map_or(DIAGNOSTICS_BUDGET_MS, u128::from),
@@ -448,8 +451,10 @@ impl<'a> Watcher<'a> {
         // The snapshot can take a while: a process that joined the job meanwhile is a member of it like any other.
         let after = self.job.process_ids().map_err(|error| error.to_string())?;
         let ids: Vec<u32> = before.into_iter().chain(after).collect();
+        // A member whose children the memory may lack is said by the samples and the kill's look, not by the block.
+        let (departed, _) = escaped::departed(self.job);
         let (job, job_unread) = job_facts(&tree, &ids, started, self.diagnostics_budget_ms);
-        let (outside, outside_unread) = self.outside_facts(&tree, &ids, started);
+        let (outside, outside_unread) = self.outside_facts(&tree, &ids, &departed, started);
         let cut = out_of_time(started, self.diagnostics_budget_ms);
         Ok(Report {
             job,
@@ -463,10 +468,11 @@ impl<'a> Watcher<'a> {
     }
 
     /// The live descendants of the job's members and of the command that are not members themselves, breadth first,
-    /// then each process outside the job the samples recorded that `tree` still lists as itself, with its descendants,
-    /// as the kill ends them though the process that started it has ended; read up to the block's cap, with the number
-    /// the cap or the budget left unread.
-    fn outside_facts(&self, tree: &ProcessTree, ids: &[u32], started: Instant) -> (Vec<ProcessFacts>, usize) {
+    /// then the children of each `departed` member, none of them, as [`escaped::departed_children`] finds them, with
+    /// their descendants, then each process outside the job the samples recorded that `tree` still lists as itself,
+    /// with its descendants, as the kill ends them though the process that started it has ended; read up to the
+    /// block's cap, with the number the cap or the budget left unread.
+    fn outside_facts(&self, tree: &ProcessTree, ids: &[u32], departed: &[Departed], started: Instant) -> (Vec<ProcessFacts>, usize) {
         let children = tree.children();
         let mut seen: HashSet<u32> = ids.iter().copied().collect();
         let mut found: Vec<&ProcessInfo> = Vec::new();
@@ -478,6 +484,10 @@ impl<'a> Watcher<'a> {
                     .into_iter()
                     .filter(|info| seen.insert(info.pid) && self.after_start(info)),
             );
+        }
+        for child in escaped::departed_children(tree, departed) {
+            let under = std::iter::once(child).chain(children.descendants(child.pid));
+            found.extend(under.filter(|info| seen.insert(info.pid) && self.after_start(info)));
         }
         for recorded in self.recorded.borrow().processes(tree) {
             let under = std::iter::once(recorded).chain(children.descendants(recorded.pid));
@@ -541,6 +551,10 @@ impl<'a> Watcher<'a> {
         let processes = Win32ProcessTable.snapshot_without_command_lines();
         // The snapshot takes a while: a process that joined the job meanwhile is a member, not one that left it.
         let after = self.job.process_ids()?;
+        let (departed, trouble) = escaped::departed(self.job);
+        if let Some(line) = escaped::memory_line(&mut self.memory_said, trouble.as_deref()) {
+            console.err(&line);
+        }
         let scope = Scope {
             members: &pids,
             since: self.since,
@@ -562,6 +576,7 @@ impl<'a> Watcher<'a> {
             after,
             since: looked,
             tree: &tree,
+            departed: departed.clone(),
         };
         let (escaped, escaped_client) = outside_the_job(
             &mut self.recorded.borrow_mut(),
@@ -570,6 +585,9 @@ impl<'a> Watcher<'a> {
             gate_win32::process_times,
             proc_table::command_line_of,
         );
+        // What the members that had ended before the look began started is recorded now, and they start nothing more;
+        // a snapshot that failed recorded nothing under them, so they are kept.
+        escaped::forget(self.job, &departed, looked, &tree);
         // An escaped build client hands its compile to the build servers as one in the job does.
         let build_client = build_client || escaped_client;
         let (vm, line) = self.vm.sample();
@@ -834,6 +852,7 @@ mod tests {
             after: vec![1],
             since: at(0),
             tree: &tree,
+            departed: Vec::new(),
         };
 
         let (cpu, client) = outside_the_job(&mut Recorded::default(), &Servers::new(None), look, times, read);

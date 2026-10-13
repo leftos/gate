@@ -76,6 +76,85 @@ struct Members {
     /// The members only the read before the snapshot listed whose pid the snapshot gives to a process that started
     /// after the look began: the member had ended and another process took its pid. Nothing is taken from under them.
     reused: HashSet<u32>,
+    /// The members the job remembers and no longer held when the look ended: what each started that the snapshot
+    /// lists is taken as a member's is, though it has ended.
+    departed: Vec<Departed>,
+}
+
+/// A process that was in the job and has ended, as the job remembers it ([`Job::departed`]): its pid, its start, read
+/// while it ran in the job, and the stretch of time in which it can have started a process as a member, from the later
+/// of its start and the job's creation to its exit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Departed {
+    pub(crate) pid: u32,
+    pub(crate) start: Timestamp,
+    pub(crate) from: Timestamp,
+    pub(crate) until: Timestamp,
+}
+
+/// The members `job` remembers that have ended, those whose pid the job holds again included, with why what it
+/// remembers may lack a member, when it may.
+pub(crate) fn departed(job: &Job) -> (Vec<Departed>, Option<String>) {
+    let (ended, trouble) = job.departed();
+    let departed = ended
+        .into_iter()
+        .map(|departure| Departed {
+            pid: departure.pid,
+            start: departure.start,
+            from: departure.from,
+            until: departure.until,
+        })
+        .collect();
+    (departed, trouble)
+}
+
+/// Has `job` forget the `walked` members a look that began at `since` and saw `tree` has taken everything under
+/// ([`forgettable`]).
+pub(crate) fn forget(job: &Job, walked: &[Departed], since: Timestamp, tree: &ProcessTree) {
+    job.forget(&forgettable(walked, since, tree));
+}
+
+/// The `walked` members a look that began at `since` has taken everything under: those that had ended before it began,
+/// so the snapshot `tree` taken after lists every process they started, and they start nothing more. One that ended
+/// later can have started a process after the snapshot, and is kept for the next look; and all are kept when the
+/// snapshot listed nothing, as a failed one does, so its look took nothing.
+fn forgettable(walked: &[Departed], since: Timestamp, tree: &ProcessTree) -> Vec<(u32, Timestamp, Timestamp)> {
+    if tree.iter().next().is_none() {
+        return Vec::new();
+    }
+    walked
+        .iter()
+        .filter(|member| member.until < since)
+        .map(|member| (member.pid, member.start, member.until))
+        .collect()
+}
+
+/// What a kill's `look` finds outside the job, as [`outside`] finds it under the members and under the `earlier`
+/// processes, with a line saying why the job's memory may lack a member when its `trouble` says so: the look goes on
+/// with the members the memory has.
+fn kill_look(
+    look: Look<'_>,
+    trouble: Option<&str>,
+    earlier: &[Escaped],
+    spared: impl Fn(&ProcessInfo) -> bool,
+    running: impl Fn(u32) -> bool,
+) -> Found {
+    let members = members(look.before, &look.after, look.since, look.tree, look.departed);
+    let mut found = outside(&members, earlier, look.tree, spared, running);
+    found
+        .problems
+        .extend(trouble.map(|why| could_not_look(&format!("the job's memory failed: {why}"))));
+    found
+}
+
+/// The line a watch says the first time the job's memory has `trouble`, which `said` then keeps: the watch goes on
+/// sampling.
+pub(crate) fn memory_line(said: &mut Option<String>, trouble: Option<&str>) -> Option<String> {
+    let why = trouble.filter(|_| said.is_none())?;
+    *said = Some(why.to_owned());
+    Some(format!(
+        "gate: the job's memory failed, so a kill may miss a process that left the job under one that ended: {why}"
+    ))
 }
 
 /// What a kill reaches: the command's job, one more compiler server's image the kill leaves running
@@ -97,13 +176,19 @@ pub(crate) struct Found {
     unjudged: HashSet<u32>,
     /// A line for each look that failed.
     problems: Vec<String>,
+    /// Whether a later look goes under the members the job remembers that have ended, as it goes under the recorded
+    /// processes: only where the watch's records are passed, so an end of the run after the command's own exit, which
+    /// leaves what it left running outside its job, reaches neither.
+    departed: bool,
 }
 
 impl Found {
-    /// What the watch `recorded` outside the job, as a kill's earlier look: its processes, parents first.
+    /// What the watch `recorded` outside the job, as a kill's earlier look: its processes, parents first; a later look
+    /// goes under the members the job remembers that have ended too.
     pub(crate) fn recorded(recorded: &Recorded) -> Found {
         Found {
             escaped: recorded.escaped.clone(),
+            departed: true,
             ..Found::default()
         }
     }
@@ -112,6 +197,12 @@ impl Found {
     #[cfg(test)]
     pub(crate) fn pids(&self) -> Vec<u32> {
         self.escaped.iter().map(|process| process.node.pid).collect()
+    }
+
+    /// Whether a later look goes under the members the job remembers that have ended.
+    #[cfg(test)]
+    pub(crate) fn reaches_departed(&self) -> bool {
+        self.departed
     }
 }
 
@@ -126,10 +217,11 @@ pub(crate) struct Reached {
 
 impl Reach<'_> {
     /// What `earlier` found, then what a look now finds that it did not: the processes that left the job under its
-    /// members and under each of `earlier`'s processes the snapshot still lists as itself, though the process that
-    /// started it has ended. A look that fails says why in the [`Found`].
+    /// members, under the members it remembers that have ended when `earlier` says so, and under each of `earlier`'s
+    /// processes the snapshot still lists as itself, though the process that started it has ended. A look that fails
+    /// says why in the [`Found`].
     pub(crate) fn look(&self, earlier: Found) -> Found {
-        let now = self.find(&earlier.escaped).unwrap_or_else(|problem| Found {
+        let now = self.find(&earlier.escaped, earlier.departed).unwrap_or_else(|problem| Found {
             problems: vec![could_not_look(&problem)],
             ..Found::default()
         });
@@ -137,14 +229,18 @@ impl Reach<'_> {
     }
 
     /// The processes outside the job under the processes it holds, the members read before the snapshot and after
-    /// it, and under each of the `earlier` processes still running as itself; nothing, and no snapshot taken, when
-    /// there is no earlier process and neither of two reads lists a member. The snapshot has no command lines; the
-    /// classification reads one only for a `dotnet` host.
-    fn find(&self, earlier: &[Escaped]) -> Result<Found, String> {
+    /// it, under the members it remembers that had ended by the first read when `with_departed`, and under each of the
+    /// `earlier` processes still running as itself; nothing, and no snapshot taken, when there is no earlier process,
+    /// neither of two reads lists a member and no remembered member is looked under. The remembered members looked
+    /// under are forgotten then, as a sample forgets them. The snapshot has no command lines; the classification reads
+    /// one only for a `dotnet` host.
+    fn find(&self, earlier: &[Escaped], with_departed: bool) -> Result<Found, String> {
         let listed = || self.job.process_ids().map_err(|error| failure("QueryInformationJobObject", &error));
+        let remembered = || if with_departed { departed(self.job) } else { (Vec::new(), None) };
         let since = now().ok_or_else(|| NO_CLOCK.to_owned())?;
         let before = listed()?;
-        if earlier.is_empty() && before.is_empty() && listed()?.is_empty() {
+        let (known, trouble) = remembered();
+        if earlier.is_empty() && before.is_empty() && known.is_empty() && trouble.is_none() && listed()?.is_empty() {
             return Ok(Found::default());
         }
         let snapshot = Win32ProcessTable.snapshot_without_command_lines();
@@ -153,12 +249,21 @@ impl Reach<'_> {
         }
         // The snapshot takes a while: a process that joined the job meanwhile is a member like any other.
         let after = listed()?;
+        // Read after the second read, as a sample reads it: a member that ended meanwhile is among them.
+        let (ended, trouble) = remembered();
         let tree = ProcessTree::new(snapshot);
-        let members = members(before, &after, since, &tree);
-        Ok(outside(
-            &members,
+        forget(self.job, &ended, since, &tree);
+        let look = Look {
+            before,
+            after,
+            since,
+            tree: &tree,
+            departed: ended,
+        };
+        Ok(kill_look(
+            look,
+            trouble.as_deref(),
             earlier,
-            &tree,
             |process| spared(process, self.server_image, command_line_of),
             still_runs,
         ))
@@ -321,12 +426,13 @@ fn wait_left(deadline: Option<Instant>, wait: Duration, now: Instant) -> (Instan
 }
 
 /// What one sample of a watch looks at for the processes outside the job: the job's members read before the snapshot
-/// and after it, when the look began, and the snapshot.
+/// and after it, when the look began, the snapshot, and the members the job remembers that it no longer held after it.
 pub(crate) struct Look<'a> {
     pub(crate) before: Vec<u32>,
     pub(crate) after: Vec<u32>,
     pub(crate) since: Timestamp,
     pub(crate) tree: &'a ProcessTree,
+    pub(crate) departed: Vec<Departed>,
 }
 
 /// The processes outside the job a watch has recorded, parents first, as its last sample found them, each with the CPU
@@ -347,11 +453,9 @@ impl Recorded {
     /// lists as itself is dropped, and so is a process whose start or whose parent's is unknown, as one the watch
     /// cannot judge.
     pub(crate) fn record(&mut self, look: Look<'_>, spare: impl Fn(&ProcessInfo) -> bool) {
-        let members = members(look.before, &look.after, look.since, look.tree);
+        let members = members(look.before, &look.after, look.since, look.tree, look.departed);
         let mut walk = Walk::new(look.tree, &members.held, spare);
-        for &member in &members.roots() {
-            walk.under(member);
-        }
+        walk.members(&members);
         for process in &self.escaped {
             walk.recorded_root(process);
         }
@@ -420,17 +524,35 @@ impl<'t, S: Fn(&ProcessInfo) -> bool> Walk<'t, S> {
         }
     }
 
+    /// Takes the descendants of each of `members`' roots, then the children of each departed member, as
+    /// [`departed_children`] finds them, each with its descendants.
+    fn members(&mut self, members: &Members) {
+        for member in members.roots() {
+            self.under(member);
+        }
+        for child in departed_children(self.tree, &members.departed) {
+            self.judge(child);
+            self.under(child.pid);
+        }
+    }
+
     /// Takes the descendants of `root` breadth first, so a process's parent has been judged before it.
     fn under(&mut self, root: u32) {
         for process in self.children.descendants(root) {
-            if self.held.contains(&process.pid) || !self.seen.insert(process.pid) {
-                continue;
-            }
-            if self.kept.contains(&process.parent_pid) || (self.spared)(process) {
-                self.kept.insert(process.pid);
-            } else {
-                self.escaped.push(Escaped::of(process));
-            }
+            self.judge(process);
+        }
+    }
+
+    /// Takes `process` as outside the job, or keeps it running when `spared` keeps it or its parent was kept; a member,
+    /// or a process the walk has passed already, is left as it is.
+    fn judge(&mut self, process: &ProcessInfo) {
+        if self.held.contains(&process.pid) || !self.seen.insert(process.pid) {
+            return;
+        }
+        if self.kept.contains(&process.parent_pid) || (self.spared)(process) {
+            self.kept.insert(process.pid);
+        } else {
+            self.escaped.push(Escaped::of(process));
         }
     }
 
@@ -463,8 +585,9 @@ fn still_runs(pid: u32) -> bool {
     }
 }
 
-/// The job's members, read `before` the snapshot `tree` and `after` it, the look having begun at `since`.
-fn members(before: Vec<u32>, after: &[u32], since: Timestamp, tree: &ProcessTree) -> Members {
+/// The job's members, read `before` the snapshot `tree` and `after` it, the look having begun at `since`, and those it
+/// remembers that had `departed` it after it.
+fn members(before: Vec<u32>, after: &[u32], since: Timestamp, tree: &ProcessTree, departed: Vec<Departed>) -> Members {
     let started_since = |pid: u32| tree.get(pid).and_then(|process| process.created).is_some_and(|created| created > since);
     let reused = before.iter().copied().filter(|pid| !after.contains(pid) && started_since(*pid)).collect();
     let mut held = before;
@@ -473,7 +596,45 @@ fn members(before: Vec<u32>, after: &[u32], since: Timestamp, tree: &ProcessTree
             held.push(pid);
         }
     }
-    Members { held, reused }
+    Members { held, reused, departed }
+}
+
+/// The processes `tree` lists as children of the `departed` members, by the parent pid they name, members in order: each
+/// started from its member's `from` to its `until`, both included; and while `tree` lists another process under the
+/// member's pid, one that took it since, only those that started before that process did, and none when its start is
+/// unknown.
+pub(crate) fn departed_children<'t>(tree: &'t ProcessTree, departed: &[Departed]) -> Vec<&'t ProcessInfo> {
+    let pids: HashSet<u32> = departed.iter().map(|member| member.pid).collect();
+    let mut by_parent: HashMap<u32, Vec<&'t ProcessInfo>> = HashMap::new();
+    for process in tree
+        .iter()
+        .filter(|process| process.pid != process.parent_pid && pids.contains(&process.parent_pid))
+    {
+        by_parent.entry(process.parent_pid).or_default().push(process);
+    }
+    let mut found = Vec::new();
+    for member in departed {
+        let holder = tree.get(member.pid);
+        let started = by_parent.get(&member.pid).into_iter().flatten();
+        found.extend(started.filter(|child| started_under(member, holder, child.created)).copied());
+    }
+    found
+}
+
+/// Whether a process started at `created` that names the departed `member`'s pid as its parent's is a child it
+/// started: from its `from` to its `until`, and, while `holder` has the pid now, before the holder started, unless the
+/// holder is the member itself ([`is_itself`]).
+fn started_under(member: &Departed, holder: Option<&ProcessInfo>, created: Option<Timestamp>) -> bool {
+    let Some(created) = created else {
+        return false;
+    };
+    let before_holder = holder.is_none_or(|holder| is_itself(member, holder) || holder.created.is_some_and(|held| created < held));
+    (member.from..=member.until).contains(&created) && before_holder
+}
+
+/// Whether `holder`, the process that has the departed `member`'s pid now, is the member itself: started at its start.
+fn is_itself(member: &Departed, holder: &ProcessInfo) -> bool {
+    holder.created == Some(member.start)
 }
 
 impl Members {
@@ -516,14 +677,24 @@ fn outside(
 ) -> Found {
     let roots = members.roots();
     let mut walk = Walk::new(tree, &members.held, spared);
-    for &member in &roots {
-        walk.under(member);
-    }
+    walk.members(members);
     for process in earlier {
         walk.recorded_root(process);
     }
     let Walk { held, seen, escaped, .. } = walk;
-    let parents: HashSet<u32> = roots.iter().copied().chain(escaped.iter().map(|process| process.node.pid)).collect();
+    // Under an ended member's pid, only while nothing but the member itself holds it: a stranger's children are not
+    // the run's.
+    let departed = members
+        .departed
+        .iter()
+        .filter(|member| tree.get(member.pid).is_none_or(|holder| is_itself(member, holder)))
+        .map(|member| member.pid);
+    let parents: HashSet<u32> = roots
+        .iter()
+        .copied()
+        .chain(departed)
+        .chain(escaped.iter().map(|process| process.node.pid))
+        .collect();
     let unjudged = tree
         .iter()
         .filter(|process| process.pid != process.parent_pid && parents.contains(&process.parent_pid))
@@ -534,7 +705,7 @@ fn outside(
     Found {
         escaped,
         unjudged,
-        problems: Vec::new(),
+        ..Found::default()
     }
 }
 
@@ -663,8 +834,8 @@ mod tests {
     use proc_table::{ProcessInfo, ProcessTree};
 
     use super::{
-        EMPTY_SNAPSHOT, Ended, Escaped, Found, Look, Members, Recorded, children_since, could_not_end, could_not_judge, could_not_look, is_gate,
-        members, outside, spared, terminated_line, union, wait_left,
+        Departed, EMPTY_SNAPSHOT, Ended, Escaped, Found, Look, Members, Recorded, children_since, could_not_end, could_not_judge, could_not_look,
+        forgettable, is_gate, kill_look, members, memory_line, outside, spared, terminated_line, union, wait_left,
     };
     use crate::servers::{Scope, Servers};
     use crate::stopping::Node;
@@ -674,12 +845,288 @@ mod tests {
         format!("2026-10-01T10:00:0{second}Z").parse().expect("a test timestamp parses")
     }
 
-    /// The members `pids`, none of whose pids another process took.
+    /// The members `pids`, none of whose pids another process took, and none remembered that has ended.
     fn held(pids: &[u32]) -> Members {
         Members {
             held: pids.to_vec(),
             reused: HashSet::new(),
+            departed: Vec::new(),
         }
+    }
+
+    /// The member `pid` the job remembers, which started in the job at second `start` and can have started a process
+    /// until second `until`.
+    fn gone(pid: u32, start: u32, until: u32) -> Departed {
+        Departed {
+            pid,
+            start: at(start),
+            from: at(start),
+            until: at(until),
+        }
+    }
+
+    #[test]
+    fn a_look_forgets_only_the_members_that_had_ended_before_it_began() {
+        // The look began at second 5: member 2 ended at second 3, before it; member 4 at second 7, after it, and can have
+        // started a process after the snapshot; member 6 at second 5, as the look began, and can have too.
+        let walked = [gone(2, 1, 3), gone(4, 6, 7), gone(6, 4, 5)];
+        let tree = ProcessTree::new(vec![process(1, 0, "cmd.exe", 0)]);
+
+        assert_eq!(
+            forgettable(&walked, at(5), &tree),
+            vec![(2, at(1), at(3))],
+            "members 4 and 6 are kept for the next look"
+        );
+    }
+
+    #[test]
+    fn a_look_whose_snapshot_listed_nothing_forgets_no_member() {
+        let walked = [gone(2, 1, 3)];
+
+        assert_eq!(
+            forgettable(&walked, at(5), &ProcessTree::new(Vec::new())),
+            Vec::new(),
+            "a failed snapshot took nothing under the member"
+        );
+    }
+
+    #[test]
+    fn a_child_started_as_its_member_exited_is_taken() {
+        // The launcher 2 ran from second 1 to second 8; 3 started in the tick of its exit, 4 a tick after.
+        let tree = ProcessTree::new(vec![
+            process(1, 0, "cmd.exe", 0),
+            process(3, 2, "pwsh.exe", 8),
+            process(4, 2, "later.exe", 9),
+        ]);
+
+        let (found, recorded) = found_and_recorded(&[1], &[gone(2, 1, 8)], &tree);
+
+        assert_eq!(found, vec![3], "the exit is a moment the member reached");
+        assert_eq!(recorded, vec![3]);
+    }
+
+    #[test]
+    fn a_member_put_in_the_job_after_its_start_takes_only_what_it_started_since_the_job_was_created() {
+        // The launcher 2 started at second 1 and was put in the job created at second 3; the snapshot still lists it as
+        // itself. It started 3 at second 2, before the job, and 4 at second 4.
+        let tree = ProcessTree::new(vec![
+            process(1, 0, "cmd.exe", 0),
+            process(2, 0, "fake-tool.exe", 1),
+            process(3, 2, "older.exe", 2),
+            process(4, 2, "pwsh.exe", 4),
+        ]);
+        let joined = Departed {
+            from: at(3),
+            ..gone(2, 1, 8)
+        };
+
+        let (found, recorded) = found_and_recorded(&[1], &[joined], &tree);
+
+        assert_eq!(found, vec![4], "nothing from before the job; the holder is told by its start");
+        assert_eq!(recorded, vec![4]);
+    }
+
+    #[test]
+    fn a_member_listed_before_the_snapshot_that_ended_has_its_child_reached_by_the_kill_s_look() {
+        // Member 2, listed by the read before the snapshot, started 3 at second 4 and ended at second 5; its pid went to a
+        // process outside the job that started at second 6, after the look began.
+        let tree = ProcessTree::new(vec![
+            process(1, 0, "cmd.exe", 0),
+            process(2, 0, "other.exe", 6),
+            process(3, 2, "pwsh.exe", 4),
+        ]);
+        let look = Look {
+            before: vec![1, 2],
+            after: vec![1],
+            since: at(5),
+            tree: &tree,
+            departed: vec![gone(2, 1, 5)],
+        };
+
+        let found = kill_look(look, None, &[], |process| spared(process, None, none), all_run);
+
+        assert_eq!(pids(&found), vec![3], "the job's memory reaches what it started");
+    }
+
+    #[test]
+    fn a_kill_s_look_goes_on_with_the_members_the_job_remembers_when_its_memory_failed() {
+        let tree = ProcessTree::new(vec![process(1, 0, "cmd.exe", 0), process(3, 2, "pwsh.exe", 2)]);
+        let look = Look {
+            departed: vec![gone(2, 1, 8)],
+            ..look(&[1], &tree)
+        };
+
+        let found = kill_look(
+            look,
+            Some("its drain thread ended on a panic"),
+            &[],
+            |process| spared(process, None, none),
+            all_run,
+        );
+
+        assert_eq!(pids(&found), vec![3], "the members it has are still looked under");
+        assert_eq!(
+            found.problems,
+            vec![could_not_look("the job's memory failed: its drain thread ended on a panic")]
+        );
+    }
+
+    #[test]
+    fn a_watch_says_the_job_s_memory_failed_once() {
+        let mut said = None;
+
+        assert_eq!(memory_line(&mut said, None), None, "nothing to say");
+        assert!(
+            memory_line(&mut said, Some("refused")).is_some_and(|line| line.ends_with(": refused")),
+            "said"
+        );
+        assert_eq!(memory_line(&mut said, Some("refused")), None, "said once, and the watch goes on");
+    }
+
+    /// What a kill finds outside the job, whose reads list `held` and which remembers `departed`, at `tree`, and what a
+    /// sample records there, no process a server but a compiler server.
+    fn found_and_recorded(held: &[u32], departed: &[Departed], tree: &ProcessTree) -> (Vec<u32>, Vec<u32>) {
+        let members = members(held.to_vec(), held, at(9), tree, departed.to_vec());
+        let found = outside(&members, &[], tree, |process| spared(process, None, none), all_run);
+        let mut recorded = Recorded::default();
+        let look = Look {
+            departed: departed.to_vec(),
+            ..look(held, tree)
+        };
+        recorded.record(look, |process| spared(process, None, none));
+        (pids(&found), recorded_pids(&recorded))
+    }
+
+    #[test]
+    fn a_child_outside_the_job_of_a_remembered_member_that_has_ended_is_found() {
+        // Member 1 runs; the launcher 2 joined the job at second 1, started 3 outside it and ended before any look.
+        let tree = ProcessTree::new(vec![process(1, 0, "cmd.exe", 0), process(3, 2, "pwsh.exe", 2)]);
+
+        let (found, recorded) = found_and_recorded(&[1], &[gone(2, 1, 8)], &tree);
+
+        assert_eq!(found, vec![3], "the kill reaches the child of the ended launcher");
+        assert_eq!(recorded, vec![3], "a sample records it");
+    }
+
+    #[test]
+    fn a_process_under_a_remembered_member_s_pid_that_it_cannot_have_started_is_not_taken() {
+        // The launcher 2 ran from second 3 to second 8; 4 names pid 2 as its parent but is older, so an earlier holder of
+        // the pid started it.
+        let tree = ProcessTree::new(vec![
+            process(1, 0, "cmd.exe", 0),
+            process(3, 2, "pwsh.exe", 4),
+            process(4, 2, "older.exe", 2),
+        ]);
+
+        let (found, recorded) = found_and_recorded(&[1], &[gone(2, 3, 8)], &tree);
+
+        assert_eq!(found, vec![3], "only what started while the launcher held its pid");
+        assert_eq!(recorded, vec![3]);
+    }
+
+    #[test]
+    fn a_process_under_a_remembered_member_s_pid_started_after_its_end_is_not_taken() {
+        // The launcher 2 ran from second 1 to second 4; then a process that has ended since took its pid and started 5.
+        let tree = ProcessTree::new(vec![
+            process(1, 0, "cmd.exe", 0),
+            process(3, 2, "pwsh.exe", 2),
+            process(5, 2, "later.exe", 6),
+        ]);
+
+        let (found, recorded) = found_and_recorded(&[1], &[gone(2, 1, 4)], &tree);
+
+        assert_eq!(found, vec![3], "nothing started after the launcher's end");
+        assert_eq!(recorded, vec![3]);
+    }
+
+    #[test]
+    fn the_children_of_a_process_outside_the_job_that_took_a_remembered_member_s_pid_are_not_taken() {
+        // The launcher 2 ran from second 1 to second 8, having started 3; pid 2 went to a process outside the job, started at
+        // second 6, which started 5.
+        let tree = ProcessTree::new(vec![
+            process(1, 0, "cmd.exe", 0),
+            process(2, 0, "other.exe", 6),
+            process(3, 2, "pwsh.exe", 2),
+            process(5, 2, "later.exe", 7),
+        ]);
+
+        let (found, recorded) = found_and_recorded(&[1], &[gone(2, 1, 8)], &tree);
+
+        assert_eq!(found, vec![3], "not what the pid's new holder started");
+        assert_eq!(recorded, vec![3]);
+    }
+
+    #[test]
+    fn a_remembered_member_the_snapshot_still_lists_as_itself_has_its_children_taken() {
+        // The launcher 2, started at second 1, ended after the snapshot, which lists it with the start it was remembered
+        // by, and its child 3.
+        let tree = ProcessTree::new(vec![
+            process(1, 0, "cmd.exe", 0),
+            process(2, 0, "fake-tool.exe", 1),
+            process(3, 2, "pwsh.exe", 2),
+        ]);
+
+        let (found, recorded) = found_and_recorded(&[1], &[gone(2, 1, 8)], &tree);
+
+        assert_eq!(found, vec![3], "the holder of the pid is the launcher itself");
+        assert_eq!(recorded, vec![3]);
+    }
+
+    #[test]
+    fn a_child_of_a_remembered_member_whose_start_is_unknown_is_counted_as_not_judged() {
+        let tree = ProcessTree::new(vec![process(1, 0, "cmd.exe", 0), unknown_start(3, 2, "pwsh.exe")]);
+        let members = members(vec![1], &[1], at(9), &tree, vec![gone(2, 1, 8)]);
+
+        let found = outside(&members, &[], &tree, |process| spared(process, None, none), all_run);
+
+        assert_eq!(pids(&found), Vec::<u32>::new());
+        assert_eq!(found.unjudged, HashSet::from([3]), "as a live member's child is");
+    }
+
+    #[test]
+    fn a_child_whose_start_is_unknown_of_a_stranger_holding_a_remembered_member_s_pid_is_not_counted() {
+        // Member 2 ended; pid 2 went to a process outside the job, started at second 6, whose child 5's start is unknown.
+        let tree = ProcessTree::new(vec![
+            process(1, 0, "cmd.exe", 0),
+            process(2, 0, "other.exe", 6),
+            unknown_start(5, 2, "later.exe"),
+        ]);
+        let members = members(vec![1], &[1], at(9), &tree, vec![gone(2, 1, 8)]);
+
+        let found = outside(&members, &[], &tree, |process| spared(process, None, none), all_run);
+
+        assert_eq!(found.unjudged, HashSet::new(), "the stranger's child is no process of the run");
+    }
+
+    #[test]
+    fn a_child_whose_start_is_unknown_of_a_remembered_member_the_snapshot_lists_as_itself_is_counted() {
+        // Member 2, started at second 1, ended after the snapshot, which lists it with that start and its child 5.
+        let tree = ProcessTree::new(vec![
+            process(1, 0, "cmd.exe", 0),
+            process(2, 0, "fake-tool.exe", 1),
+            unknown_start(5, 2, "pwsh.exe"),
+        ]);
+        let members = members(vec![1], &[1], at(9), &tree, vec![gone(2, 1, 8)]);
+
+        let found = outside(&members, &[], &tree, |process| spared(process, None, none), all_run);
+
+        assert_eq!(found.unjudged, HashSet::from([5]), "the holder is the member itself");
+    }
+
+    #[test]
+    fn a_build_server_under_a_remembered_member_that_has_ended_is_left_running_with_everything_under_it() {
+        // The ended launcher 2 started a compiler server (3) with a child (4), and a pwsh (5).
+        let tree = ProcessTree::new(vec![
+            process(1, 0, "cmd.exe", 0),
+            process(3, 2, "VBCSCompiler.exe", 2),
+            process(4, 3, "conhost.exe", 3),
+            process(5, 2, "pwsh.exe", 2),
+        ]);
+
+        let (found, recorded) = found_and_recorded(&[1], &[gone(2, 1, 8)], &tree);
+
+        assert_eq!(found, vec![5], "no server, nor what it started");
+        assert_eq!(recorded, vec![5]);
     }
 
     /// `process`, ended at second `exited`, or with an end that could not be read.
@@ -822,6 +1269,7 @@ mod tests {
                 after: vec![1],
                 since: at(0),
                 tree: &tree,
+                departed: Vec::new(),
             };
             recorded.record(look, |process| servers.spares(process, line));
             recorded.cpu(times)
@@ -850,6 +1298,7 @@ mod tests {
             after: members.to_vec(),
             since: at(9),
             tree,
+            departed: Vec::new(),
         }
     }
 
@@ -995,7 +1444,7 @@ mod tests {
             process(3, 1, "pwsh.exe", 1),
         ]);
 
-        let members = members(vec![1], &[1, 2], at(9), &tree);
+        let members = members(vec![1], &[1, 2], at(9), &tree, Vec::new());
         let found = outside(&members, &[], &tree, |process| spared(process, None, none), all_run);
 
         assert_eq!(
@@ -1039,7 +1488,7 @@ mod tests {
             process(10, 9, "pwsh.exe", 2),
         ]);
 
-        let members = members(vec![1, 4, 7, 9], &[1], at(3), &tree);
+        let members = members(vec![1, 4, 7, 9], &[1], at(3), &tree, Vec::new());
         let found = outside(&members, &[], &tree, |process| spared(process, None, none), all_run);
 
         assert_eq!(pids(&found), vec![2, 10], "nothing under the process that took member 4's pid");
@@ -1078,11 +1527,13 @@ mod tests {
             escaped: vec![escaped("pwsh.exe", 2), escaped("fake-tool.exe", 3)],
             unjudged: HashSet::from([7]),
             problems: Vec::new(),
+            departed: true,
         };
         let later = Found {
             escaped: vec![escaped("fake-tool.exe", 3), escaped("fake-tool.exe", 4)],
             unjudged: HashSet::from([7, 8]),
             problems: vec![could_not_look(EMPTY_SNAPSHOT)],
+            departed: false,
         };
 
         let found = union(earlier, later);
@@ -1090,6 +1541,7 @@ mod tests {
         assert_eq!(pids(&found), vec![2, 3, 4]);
         assert_eq!(found.unjudged, HashSet::from([7, 8]));
         assert_eq!(found.problems, vec![could_not_look(EMPTY_SNAPSHOT)]);
+        assert!(found.departed, "the first look's reach under the ended members is kept");
     }
 
     #[test]

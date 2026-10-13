@@ -130,6 +130,35 @@ fn a_stall_kill_ends_a_child_outside_the_job_whose_launcher_has_ended() {
 }
 
 #[test]
+#[ignore = "needs the machine alone: run with -Slot critical and --ignored"]
+fn a_stall_kill_ends_a_child_outside_the_job_whose_launcher_exited_at_once() {
+    let case = Case::new("a_stall_kill_ends_a_child_outside_the_job_whose_launcher_exited_at_once");
+    // The launcher ends as soon as it has started the escapee, long before the watch's first 5 s sample: no sample
+    // sees the escapee under a process of the job, and the command idles until the stall kill.
+    let escapee = Escapee::new(&case);
+    let command = escapee.instant_launched_command();
+    let words: Vec<&str> = command.iter().map(String::as_str).collect();
+    let seams = ["--test-stall-ms", "3000", "--test-job-breakaway"];
+
+    let mut running = case.start(&run_words("out.log", &seams, &words));
+    let (pid, away) = escapee.open(|| !running.is_running());
+    let launcher = escapee.launcher_ended();
+    let outcome = running.finish();
+
+    assert_eq!(outcome.code, Some(124), "{outcome:?}");
+    assert!(outcome.stderr.contains("gate: STALLED: "), "{outcome:?}");
+    assert_eq!(
+        Escapee::exit_code_once_ended(&away),
+        Some(124),
+        "the escapee {pid}, whose launcher exited at once, was ended by the kill with the kill's status: {outcome:?}"
+    );
+    assert!(
+        matches!((launcher.exited(), away.exited()), (Ok(left), Ok(ended)) if left < ended),
+        "the launcher had ended before the kill ended the escapee {pid}: {outcome:?}"
+    );
+}
+
+#[test]
 fn a_silent_idle_command_is_killed_as_stalled() {
     let case = Case::new("a_silent_idle_command_is_killed_as_stalled");
     let seams = ["--test-stall-ms", "1500", "--test-sample-ms", "100"];

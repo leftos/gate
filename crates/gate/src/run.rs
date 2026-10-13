@@ -1320,6 +1320,9 @@ impl Run<'_> {
         } else {
             Job::create(&name)
         };
+        // The job remembers every process put in it from the command on, so a kill still reaches what one that has
+        // ended started outside it.
+        let created = created.and_then(|mut job| job.remember().map(|()| job));
         let job = match created {
             Ok(job) => job,
             Err(error) => return self.gate_failed(&format!("cannot create the job {name}: {error}"), None, console),
@@ -2059,6 +2062,24 @@ mod tests {
         assert!(records_after(&Watched::Interrupted, Some(&recorded)).is_some(), "a Ctrl+C keeps them");
     }
 
+    #[test]
+    fn only_an_end_of_the_run_that_passes_the_records_looks_under_the_job_s_ended_members() {
+        let recorded = recorded();
+        let killed = Watched::Killed {
+            line: String::new(),
+            processes: 1,
+            diagnostics: Vec::new(),
+        };
+
+        let after_exit = earlier(records_after(&Watched::Exited(0), Some(&recorded)));
+        let after_kill = earlier(records_after(&killed, Some(&recorded)));
+        let after_interrupt = earlier(records_after(&Watched::Interrupted, Some(&recorded)));
+
+        assert!(!after_exit.reaches_departed(), "a gate failure after the command's own exit leaves them");
+        assert!(after_kill.reaches_departed(), "a kill reaches them");
+        assert!(after_interrupt.reaches_departed(), "a Ctrl+C reaches them");
+    }
+
     /// What a watch recorded of member 1's process 2 outside the job, which started 3.
     fn recorded() -> RefCell<Recorded> {
         let process = |pid: u32, parent_pid: u32, second: i64| proc_table::ProcessInfo {
@@ -2074,6 +2095,7 @@ mod tests {
             after: vec![1],
             since: jiff::Timestamp::UNIX_EPOCH,
             tree: &tree,
+            departed: Vec::new(),
         };
         let recorded = RefCell::new(Recorded::default());
         recorded.borrow_mut().record(look, |_| false);

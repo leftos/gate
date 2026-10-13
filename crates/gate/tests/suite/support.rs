@@ -1133,6 +1133,23 @@ impl Escapee {
         .to_vec()
     }
 
+    /// The words of [`Escapee::launched_command`] with a launcher that ends as soon as it has started the escapee, so
+    /// no sample of a watch that samples every few seconds sees the escapee under it: only the job's memory of the
+    /// launcher reaches it.
+    pub fn instant_launched_command(&self) -> Vec<String> {
+        let mut words = self.launched_command();
+        words.truncate(words.len() - 2);
+        words
+    }
+
+    /// The exit code of the escapee `process`, once it has ended, waited for at most half the hang guard: an idle
+    /// escapee ends on its own only after its 600 s sleep, so on a broken run the wait ends first and says it still
+    /// runs, and a passing run, whose kill ended it before the gate returned, never waits. `None` when it still runs.
+    pub fn exit_code_once_ended(process: &StoppableProcess) -> Option<u32> {
+        let ended = matches!(process.wait(HANG_GUARD / 2), Ok(true));
+        ended.then(|| process.exit_code().expect("an ended escapee's exit code is read"))
+    }
+
     /// The escapee's pid and the process, once the pid file holds its whole line, checked to be the process that
     /// started then. Fails at once, rather than at the hang guard, when `ended` says the command that would write the
     /// file has ended without it.
