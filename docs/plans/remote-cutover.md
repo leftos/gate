@@ -8,7 +8,9 @@ Routing is off on the PC since the decommission of the PowerShell remote: every 
 
 ### R1. Stamp the build's commit into `gate --version` and the box preflight; fall back on a stale builder copy
 
-- `gate --version` prints `gate 0.1.0+{12 hex}` (`-dirty` for a dirty tree, `+dev` when no id was given); the preflight's `gate: remote version` line carries the same text, and the client compares the whole text, so a builder with the same package version but another build falls back `version`. `tools/install.ps1` sets `GATE_BUILD_ID` from `git rev-parse --short=12 HEAD`; the id is read with `option_env!("GATE_BUILD_ID")` (a hand-built `+dev` compares equal only to another `+dev`). An unreadable id falls back `version`, never routes.
+- `gate --version` prints `gate 0.1.0+{12 hex}` (`-dirty` for a dirty tree, `+dev` when no id was given); the preflight's `gate: remote version` line carries the same text, and the client compares the whole text, so a builder with the same package version but another build falls back `version`.
+
+  `tools/install.ps1` sets `GATE_BUILD_ID` from `git rev-parse --short=12 HEAD`; the id is read with `option_env!("GATE_BUILD_ID")` (a hand-built `+dev` compares equal only to another `+dev`). An unreadable id falls back `version`, never routes.
 - Files: `crates/gate/src/answer.rs`, `boxside/preflight.rs`, `remote/client.rs` (`OURS`, through one shared `build_version()`), `tools/install.ps1`; suite `cli.rs`, `boxside.rs`.
 - Tests: `cli::version_names_the_package_version_and_the_build`, `remote_client::a_builder_gate_of_the_same_version_without_this_build_falls_back_version`, `install::the_installed_gate_names_the_commit_it_was_built_from`; guard `push::a_push_reports_the_build_it_sends`.
 - First: search claude-config and ops-tower for a parser of `gate --version`.
@@ -37,7 +39,9 @@ Routing is off on the PC since the decommission of the PowerShell remote: every 
 
 ### R5. Add `gate remote-cutover`: write the flag, drain this PC's and every builder's routed runs, clear the marker
 
-- New subcommand honouring `--state-dir`/`GATE_STATE_DIR` (so it can be rehearsed in a scratch root): write the marker then the flag (`gate: remote-cutover: flag written; routed runs now wait for the drain`); poll the PC every 2 s with `gate cutover`'s 5 s confirmation window, naming entries as it does; once clear, call `gate box inflight` on each builder in `remote.json`, saying `gate: remote-cutover: {host}: {n} run(s) in flight` every 10 s until all are 0, then check the PC once more. An unreachable builder or one without the verb is not drained and is named (`{host} cannot say what runs there (status {n}); run gate push`). Remove the marker: `gate: remote-cutover: done; routed runs use the Rust client`, then `…to go back to the bridge, delete {flag path}`. Ctrl+C leaves flag and marker and exits 0xC000013A; a rerun resumes.
+- New subcommand honouring `--state-dir`/`GATE_STATE_DIR` (so it can be rehearsed in a scratch root): write the marker then the flag (`gate: remote-cutover: flag written; routed runs now wait for the drain`); poll the PC every 2 s with `gate cutover`'s 5 s confirmation window, naming entries as it does; once clear, call `gate box inflight` on each builder in `remote.json`, saying `gate: remote-cutover: {host}: {n} run(s) in flight` every 10 s until all are 0, then check the PC once more.
+
+  An unreachable builder or one without the verb is not drained and is named (`{host} cannot say what runs there (status {n}); run gate push`). Remove the marker: `gate: remote-cutover: done; routed runs use the Rust client`, then `…to go back to the bridge, delete {flag path}`. Ctrl+C leaves flag and marker and exits 0xC000013A; a rerun resumes.
 - One drainer at a time: a mutex held for the whole drain, and a live drainer's marker is refused; a dead one's is taken over. A Ctrl+C is checked before every "drained" step, and a flag deleted mid-drain ends the run with exit 1 (design.md "gate remote-cutover").
 - Files: `gate-args/src/{cli,request,run,usage}.rs`, `gate/src/{answer,remote_cutover}.rs` (sharing helpers with `cutover.rs` and `push.rs`), `gate-state/src/{drain,root}.rs`, suite `remote_cutover.rs`; seams `--test-poll-ms`, `--test-confirm-ms`, `--test-remote-ssh`, `--test-remote-transport`, `--test-remote-bound-ms`, `--test-cutover-interrupt-after-round`, `--test-cutover-interrupt-after-list`.
 - Tests: `remote_cutover::waits_on_a_live_routed_claim_and_names_it`, `…::waits_while_a_builder_reports_a_run_in_flight`, `…::a_builder_without_inflight_holds_the_drain_and_says_so`, `…::an_interrupt_leaves_the_flag_and_marker_and_a_rerun_resumes`, `…::done_removes_the_marker_and_keeps_the_flag`. Lower-bound waits only.
@@ -45,7 +49,11 @@ Routing is off on the PC since the decommission of the PowerShell remote: every 
 
 ### R6. A routed run that starts during the drain waits for it, then starts on the Rust client
 
-- In the switch client's `ready()`: flag and live marker, say once `gate: waiting for the remote cutover's drain (pid {pid}) before routing`, hold no key lock, ticket or slot, poll every 1 s, then the Rust client once the marker is gone; flag gone while waiting, the bridge (rollback); marker whose drainer is dead or unreadable, `gate: the remote cutover's drain is not running; run gate remote-cutover again; running here` and fall back `client`; Ctrl+C, `gate: interrupted before the command started`, 0xC000013A. `ready()` gains the console and the interrupt.
+- In the switch client's `ready()`: flag and live marker, say once `gate: waiting for the remote cutover's drain (pid {pid}) before routing`, hold no key lock, ticket or slot, poll every 1 s, then the Rust client once the marker is gone; flag gone while waiting, the bridge (rollback).
+
+  Marker whose drainer is dead or unreadable, `gate: the remote cutover's drain is not running; run gate remote-cutover again; running here` and fall back `client`; Ctrl+C, `gate: interrupted before the command started`, 0xC000013A.
+
+  `ready()` gains the console and the interrupt.
 - A marker that stands but whose opening is refused (a pending delete) keeps the run waiting; refusals that last 5 polls are said once, `gate: waiting for the remote cutover; cannot read {marker path} ({reason})`. The Ctrl+C journals `abandon` after `queue`, not a `release`.
 - Files: `remote/{mod,bridge,switch}.rs`, `run.rs`, suite `routing.rs`, `bridge.rs` (`start_in_own_console` shared).
 - Tests: `routing::a_routed_run_during_the_drain_waits_then_routes_on_the_rust_client`, `…::a_routed_run_whose_drainer_has_ended_runs_here_with_reason_client`, `…::deleting_the_flag_during_the_wait_returns_the_run_to_the_bridge`, `…::a_ctrl_c_during_the_drain_wait_ends_before_the_command`.
@@ -83,7 +91,14 @@ Routing is off on the PC, so every run is local; R8–R10 delete the bridge with
 3. Rehearse in a scratch root: `gate run --state-dir {scratch root} … -- dotnet build` on a solution in a repo `remote.json` lists; check no fallback, a remote take/release in the scratch journal, the sync-back applied, outputs installed, no nothing-back record. Once, a long routed command with Ctrl+C: the stop line appears once. Rollback: delete the scratch root.
 4. The trial (GATE-191), before routing comes back: watch one working session for fallback reasons, busy counts and stop lines.
 5. Turn routing back on for the Rust client (GATE-192). Confirm on the next ordinary routed runs: no `client` or `version` fallbacks, no nothing-back record after a build that brought its outputs back.
-6. After R9 merges to main: install from main and push; `remote-bridge.ps1` is gone from the install.
-7. After R10: reinstall, push, delete any leftover flag. The builders' old PowerShell wrappers and claude-config's remote scripts are GATE-11's.
+6. With routing back on, remove every routing exclusion made because of the bridge, putting each pattern back in `remote.json`, and send each caller repo whose routing changed a repo inbox note: the new remote gate is released, and it should be evaluated on its own merits, not by what the bridge did. The exclusions so far are listed under "Routing exclusions" below.
+7. After R9 merges to main: install from main and push; `remote-bridge.ps1` is gone from the install.
+8. After R10: reinstall, push, delete any leftover flag. The builders' old PowerShell wrappers and claude-config's remote scripts are GATE-11's.
 
 GATE-109 (one ssh connection) follows the cutover.
+
+## Routing exclusions
+
+Patterns taken out of `remote.json` because of how the bridge behaved; runbook step 6 puts them back. The file's backup from before each change sits beside it as `remote.json.bak-{date}`.
+
+- godot-mcp, at its request: the `scratch` itest group (the `--filter-class GodotMcp.IntegrationTests.ScratchRunnerTests` pattern) and the `csharp` itest group (the five `run.ps1 itest-csharp` patterns). Reasons: a passing run failed because an output DLL was in use here, and a wall-clock ceiling killed a healthy run on a busy builder (the second is GATE-187).

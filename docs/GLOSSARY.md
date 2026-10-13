@@ -53,7 +53,9 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Fallback poll**: the short timeout on every slot wait, which re-reads counts and tickets so a dead waiter's ticket is cleared even when no wake event comes.
 - **Free share**: the fraction of the cores the command could use that other work left free in a sample, at least 5%; the load-adjusted clock advances by it.
 - **Generation**: the PowerShell gate or `gate.exe`, as `gate-state` tells them apart (`Generation`): ops-tower reads the PowerShell gate's files until the cutover flag exists and then `gate.exe`'s, plus the PowerShell claims of a slot whose mutex is open.
-- **Hash cache**: the file `remote\<key>.outputs-hashes` in the state root, the outputs manifest line of a worktree's last built manifest, holding only its files last written at least 2 s before that build, and the files a complete outputs install put in place, at the stamp it read after the move and the hash it verified; the next build takes the hash of each file whose size and last write, as the open file's handle reads them, still match from it instead of reading the file, except while the pending marker stands.
+- **Hash cache**: the file `remote\<key>.outputs-hashes` in the state root, the outputs manifest line of a worktree's last built manifest, holding only its files last written at least 2 s before that build, and the files a complete outputs install put in place, at the stamp it read after the move and the hash it verified.
+
+  The next build takes the hash of each file whose size and last write, as the open file's handle reads them, still match from it instead of reading the file, except while the pending marker stands.
 - **Heartbeat**: a line printed so a gate around the printer does not read quiet as a stall; the wait heartbeat is a waiting gate's `still waiting` line every 30 s, and the box heartbeat is the `gate-remote-heartbeat: <cpu ms>` line the box wrapper writes while its command's CPU use earns one.
 - **Heavy**: the slot kind for work that keeps several cores busy; its pool's thread budget is 4.
 - **History key**: a journal run's `command` after `gate_state::normalize_command`: split with the C runtime's argument rules, tree flags and their paths dropped, `.tmp` and worktree paths shortened, each word re-quoted; runs with the same key count together.
@@ -63,6 +65,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Journal mutex**: the named mutex `Local\gate-journal` (with the root hash under a non-default root) that every gate holds, waiting up to 2 s, while it appends to the journal, rolls it and archives.
 - **Keeper**: the `cmd.exe` `gate box run` starts on its own console while it is away on the donor's console, so its own console stays alive for it to return to.
 - **Late arrival**: a PowerShell gate whose earliest claim or ticket `since` is later than the cutover flag's write time, because its caller bypassed the launcher; the cutover's drain names it.
+- **Late take**: the slot of its own kind that a covered gate takes, beside its running command, when its parent gate ends first; its `take` names the ended parent in `parentPid`.
 - **Lending**: a light parent gate letting a nested heavy gate, which its slot does not cover, run on that slot while a critical request drains and before one holds the machine, instead of queueing behind it; the gate is the lent gate. A parent on a reserved light slot lends nothing.
 - **Lent window**: the span during a critical drain in which the critical gate lends one slot to backfill guests, ending at the shadow end.
 - **Light**: the slot kind for work that keeps one or two cores busy; its pool's thread budget is 2.
@@ -124,6 +127,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Spawn lock**: the `gate-win32` lock held while the gate starts any process, so only the launched command inherits the copies of its handles.
 - **Stable line**: one of the three published `gate:` line forms callers may parse (STALLED, TIMED OUT or BACKSTOP; `waiting for the machine (critical)`; `Full output:`); every other `gate:` line is prose.
 - **Stall**: a kill for no progress (no output, CPU, new process or build-server work) for the stall window, `--stall` seconds.
+- **Stand-in**: a live covered gate whose command holds a nested gate and whose own slot kind covers it, which that gate runs under in place of its ended parent gate, so one build tree holds one slot; only a covered marker with `kind` `heavy` or `light` is one.
 - **Start marker**: the stderr line `gate-remote-started: <nonce>` that `gate box run` says just before it launches the command; a run call that carried it is never retried and is not a pre-banner failure.
 - **State root**: the folder holding every file the gate writes, `%LOCALAPPDATA%\gate\v1\` by default, overridden by `--state-dir` or `GATE_STATE_DIR`.
 - **Stop event**: the manual-reset event `<box job name>-stopped` that `gate box run` creates before its job and `gate box stop` sets before it terminates the job, so a launch that finds it set ends the command unstarted.

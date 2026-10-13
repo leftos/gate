@@ -49,14 +49,18 @@ Every command runs through the launcher: `pwsh -NoProfile -File tools/gate.ps1 -
 
 The tests, by test mode:
 
-- **unstable** (now): each item's last gate runs its reached tests, the tests its change reaches, from [docs/test-map.md](../../../docs/test-map.md): `-Slot heavy -TimeoutSeconds 900 -- cargo nextest run --workspace --all-features --cargo-profile test-release -E '<the union of the filtersets of every row the diff touches>'`; a diff that touches a central file, or a file the map does not list, runs the full suite. The full suite, `-Slot heavy -TimeoutSeconds 1800 -- cargo nextest run --workspace --all-features --cargo-profile test-release --no-fail-fast` (`--all-features` builds the black-box suite, which needs the `test-seams` feature), runs before every reinstall (the release step), before every push (an unstable repo pushes at the /nextup checkpoint only), and before a cutover or a feature-branch merge; a red full run holds them and becomes the next item, Urgent.
+- **unstable** (now): each item's last gate runs its reached tests, the tests its change reaches, from [docs/test-map.md](../../../docs/test-map.md): `-Slot heavy -TimeoutSeconds 900 -- cargo nextest run --workspace --all-features --cargo-profile test-release -E '<the union of the filtersets of every row the diff touches>'`; a diff that touches a central file, or a file the map does not list, runs the full suite.
+
+  The full suite, `-Slot heavy -TimeoutSeconds 1800 -- cargo nextest run --workspace --all-features --cargo-profile test-release --no-fail-fast` (`--all-features` builds the black-box suite, which needs the `test-seams` feature), runs before every reinstall (the release step), before every push (an unstable repo pushes at the /nextup checkpoint only), and before a cutover or a feature-branch merge; a red full run holds them and becomes the next item, Urgent.
 - **stable**: each item runs the full suite as its last gate. A step's proving loop still narrows to the test map.
 
 The map is kept true by the docs sweep: an item that adds a suite module, a seam flag or a source area adds its row.
 
 A test that asserts on timing must hold on a busy machine: no wall-clock bound a loaded PC can cross (the PowerShell suite's CC-209 is what this avoids). A test that needs the machine alone is marked `#[ignore = "needs the machine alone: run with -Slot critical and --ignored"]` and named here.
 
-The machine-alone cases are `build_servers::a_quiet_build_waiting_on_a_busy_shared_compiler_is_not_stalled`, `build_servers::a_dotnet_server_is_told_by_its_command_line` and `build_servers::a_server_started_after_the_command_counts_while_the_job_holds_a_client` and `stall::a_command_whose_only_work_is_a_child_outside_its_job_is_not_stalled`, plus the escapee kill cases `stall::a_stall_kill_ends_a_child_outside_the_job_whose_launcher_has_ended`, `stall::a_stall_kill_ends_a_child_outside_the_job_whose_launcher_exited_at_once`, `ceiling::a_ceiling_kill_ends_a_child_outside_the_job_whose_launcher_has_ended` and `interrupt::a_ctrl_c_ends_a_child_outside_the_job_whose_launcher_has_ended`.
+The machine-alone cases are `build_servers::a_quiet_build_waiting_on_a_busy_shared_compiler_is_not_stalled`, `build_servers::a_dotnet_server_is_told_by_its_command_line` and `build_servers::a_server_started_after_the_command_counts_while_the_job_holds_a_client` and `stall::a_command_whose_only_work_is_a_child_outside_its_job_is_not_stalled`.
+
+The machine-alone cases also include the escapee kill cases `stall::a_stall_kill_ends_a_child_outside_the_job_whose_launcher_has_ended`, `stall::a_stall_kill_ends_a_child_outside_the_job_whose_launcher_exited_at_once`, `ceiling::a_ceiling_kill_ends_a_child_outside_the_job_whose_launcher_has_ended` and `interrupt::a_ctrl_c_ends_a_child_outside_the_job_whose_launcher_has_ended`.
 
 The first four each prove "not stalled" inside a short window, held off by a build server the gate lowers to BelowNormal, or in the last case by an escapee that runs at BelowNormal and can be starved into a false STALLED. When the diff touches the watchdog, the build-server classification or the priority code, also run `-Slot critical -TimeoutSeconds 600 -- cargo nextest run -p gate --all-features --cargo-profile test-release --run-ignored only -E 'binary(suite)'`.
 
@@ -85,7 +89,9 @@ There is no changelog.
 
 This PC is cut over: every gate on it runs the installed `gate.exe`, and each builder runs the copy `gate push` put there.
 
-After each landing whose diff changes code the local gate runs (the run, watchdog, slots, waiting, launch, the CLI and its subcommands, the journal, gate-state's writers) or code the builders run (`gate box` and its verbs), run the full suite (Gates) on that commit in the main checkout on `main`, and only when it passed, run `pwsh -NoProfile -File tools/install.ps1` from there, then `& "$env:LOCALAPPDATA\gate\bin\gate.exe" push`. The landing's report names the installed version and each builder's result line.
+After each landing whose diff changes code the local gate runs (the run, watchdog, slots, waiting, launch, the CLI and its subcommands, the journal, gate-state's writers) or code the builders run (`gate box` and its verbs), run the full suite (Gates) on that commit in the main checkout on `main`, and only when it passed, run `pwsh -NoProfile -File tools/install.ps1` from there, then `& "$env:LOCALAPPDATA\gate\bin\gate.exe" push`.
+
+The landing's report names the installed version and each builder's result line.
 
 A push that fails is reported in the landing's report and never undoes the local install; the next reinstall pushes again. A landing that changes only dormant code (the Rust remote client under `test-seams`) waits for the checkpoint, where one install and one push cover them.
 

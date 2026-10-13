@@ -17,7 +17,9 @@ Each is kept as captured (UTF-8 without a byte order mark, one line), except tha
 | `remote-journal.jsonl` | The journal of the real PowerShell gate's remote route (no `v`), captured sandboxed by `capture-remote-journal.ps1`: a remote run that passed, runs that fell back to the local queue (`full`, then one for each reason `unreachable`, `busy`, `parity` with a failing command, `rebooted`, `tools`), a run that fell back onto its parent gate's slot (a `parent` line follows its `fallback`), and a local control run. | `%LOCALAPPDATA%\gate\<prefix>events.jsonl`, here `ops225-events.jsonl` |
 | `remote-run-journal.jsonl` | The v1 journal of `gate.exe`'s remote route (69 lines, 15 runs), captured by `capture-remote-run.ps1`: a remote run that passed, `full`, `unreachable`, `busy`, `parity` (its command fails), `rebooted` and `tools` from the scripted client, a parent fallback, a local control run, then `unreachable`, `rebooted`, `tools`, `parity`, box-lock `busy` and `version` from the Rust client over the `local:` transport and fake-ssh. | `<state root>\events.jsonl` |
 
-The three other `remote*` files (`remote-claim.json`, `remote-ticket.json`, `remote.json`) are the PowerShell gate's formats, written by hand from the gate's remote-slot design (`docs/design/gate-remote-slot.md`), since that gate does not write a remote claim or ticket a test can capture. `gate.exe` writes the v1 forms, whose reference examples are the `v1-remote-*` files below, and `capture-remote-run.ps1` captures only its journal. claude-config keeps a copy of `remote-journal.jsonl` (`tools/gate/fixtures/remote-journal.jsonl`).
+The three other `remote*` files (`remote-claim.json`, `remote-ticket.json`, `remote.json`) are the PowerShell gate's formats, written by hand from the gate's remote-slot design (`docs/design/gate-remote-slot.md`), since that gate does not write a remote claim or ticket a test can capture.
+
+`gate.exe` writes the v1 forms, whose reference examples are the `v1-remote-*` files below, and `capture-remote-run.ps1` captures only its journal. claude-config keeps a copy of `remote-journal.jsonl` (`tools/gate/fixtures/remote-journal.jsonl`).
 
 ## The v1 reference examples
 
@@ -36,7 +38,7 @@ The claims and tickets other than `v1-claim.json` and `v1-ticket.json` name proc
 | `v1-critical-ticket.json` | The ticket critical gate 52000 keeps to its end, `holds` true. | `<state root>\waiting\52000-1790852400500.json` |
 | `v1-remote-claim.json` | The claim of heavy gate 53000 holding remote slot 1: `kind` `remote`, then `remote`, `host` and `key`. | `<state root>\slots\gate-remote-slot-1.json` |
 | `v1-remote-ticket.json` | The ticket of heavy gate 53100 queued for the remote pool, `remote` true. | `<state root>\waiting\53100-1790852400500.json` |
-| `v1-covered.json` | The covered marker of light gate 54000 running under the slot of critical gate 52000: `processStart` and `since` in Unix epoch milliseconds, as a ticket's machine times are. | `<state root>\covered\54000-1790852400500.json` |
+| `v1-covered.json` | The covered marker of light gate 54000 running under the slot of critical gate 52000: `processStart` and `since` in Unix epoch milliseconds, as a ticket's machine times are. It has no `kind`, the optional field naming the gate's own slot kind, which a marker without it never carries as a stand-in. | `<state root>\covered\54000-1790852400500.json` |
 | `v1-journal.jsonl` | A journal of five gates: light gate 56000 runs on `gate-light-slot-0` and lends it to 55000 (a lone `parent` line) before releasing it; critical gate 52000 takes eight slots with its machine snapshot (`counts`, `otherHeld`, `otherClaims`) and covers light gate 54000 (a lone `covered` line); critical gate 52100's take carries `snapshotError` and it fails. | `<state root>\events.jsonl` |
 
 ## Re-capturing them

@@ -5,6 +5,7 @@
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
+use gate_args::Slot;
 use gate_state::JournalIdentity;
 use gate_state::v1::{self, CoveredMarker};
 use jiff::Timestamp;
@@ -15,8 +16,8 @@ use crate::slots::{self, ThisGate, epoch_ms};
 /// The covered marker of this gate, written as its covered run starts and deleted as it ends: by [`Covered::end`] on
 /// every ordinary end, by [`Drop`] after a panic or an end that skipped it.
 pub(crate) struct Covered {
-    /// Where the marker is; `None` once it was deleted, or when it was never written.
-    path: Option<PathBuf>,
+    /// Where the marker is, and what it says; `None` once it was deleted, or when it was never written.
+    written: Option<(PathBuf, CoveredMarker)>,
 }
 
 impl Covered {
@@ -30,9 +31,9 @@ impl Covered {
     /// root `root`. A gate whose identity could not be read (`Err`, its working directory unreadable) writes no marker,
     /// as it writes no `covered` line, and says nothing more: the marker's `cwd` field cannot be filled, and its journal
     /// says why it wrote nothing. A marker that cannot be written is said, and the run goes on without one.
-    fn write_as(root: &Path, identity: Result<&JournalIdentity, &String>, parent_pid: u32, console: &mut Console) -> Covered {
+    pub(crate) fn write_as(root: &Path, identity: Result<&JournalIdentity, &String>, parent_pid: u32, console: &mut Console) -> Covered {
         let Ok(identity) = identity else {
-            return Covered { path: None };
+            return Covered { written: None };
         };
         let marker = CoveredMarker {
             pid: identity.pid,
@@ -41,20 +42,42 @@ impl Covered {
             command: identity.command.clone(),
             cwd: identity.cwd.clone(),
             since: epoch_ms(Timestamp::now()),
+            kind: Some(identity.kind.clone()),
         };
         let path = v1::covered_path(root, marker.pid, marker.process_start);
         match v1::write_covered(&path, &marker) {
-            Ok(()) => Covered { path: Some(path) },
+            Ok(()) => Covered {
+                written: Some((path, marker)),
+            },
             Err(error) => {
                 console.err(&format!("gate: cannot write the covered marker {}: {error}", path.display()));
-                Covered { path: None }
+                Covered { written: None }
             }
+        }
+    }
+
+    /// Whether the marker was written and is still there.
+    pub(crate) fn written(&self) -> bool {
+        self.written.is_some()
+    }
+
+    /// Rewrites the marker with the kind `none`, as a gate that holds no slot and takes none writes it: this gate gave
+    /// up watching its parent, so it takes no slot when that parent ends, and no gate started inside its command may run
+    /// under it in that parent's place ([`crate::nesting::enclosing`]). A marker that cannot be rewritten is said, and
+    /// the run goes on.
+    pub(crate) fn disown(&mut self, console: &mut Console) {
+        let Some((path, marker)) = &mut self.written else {
+            return;
+        };
+        marker.kind = Some(Slot::None.as_str().to_owned());
+        if let Err(error) = v1::write_covered(path, marker) {
+            console.err(&format!("gate: cannot rewrite the covered marker {}: {error}", path.display()));
         }
     }
 
     /// Deletes the marker, saying so when it cannot be deleted, and forgets it, so [`Drop`] has nothing left to do.
     pub(crate) fn end(&mut self, console: &mut Console) {
-        if let Some(path) = self.path.take()
+        if let Some((path, _)) = self.written.take()
             && let Err(error) = slots::delete(&path)
         {
             console.err(&format!("gate: cannot delete the covered marker {}: {error}", path.display()));
@@ -66,7 +89,7 @@ impl Drop for Covered {
     /// Deletes a marker a panic left behind, [`Covered::end`] having cleared the path on every ordinary end. The line
     /// for a failure is said on stderr alone, the run's console being out of reach by now.
     fn drop(&mut self) {
-        let Some(path) = self.path.take() else {
+        let Some((path, _)) = self.written.take() else {
             return;
         };
         if let Err(error) = slots::delete(&path) {
@@ -139,12 +162,43 @@ mod tests {
             })
             .collect();
         assert_eq!(markers, [(54000, 1_790_852_400_500, 52000, "cargo fmt --check", r"C:\work\repo")]);
+        let kinds: Vec<Option<&str>> = read.iter().map(|(_, marker)| marker.kind.as_deref()).collect();
+        assert_eq!(kinds, [Some("light")], "the marker names the gate's own kind");
 
         covered.end(&mut console);
         assert!(
             v1::read_covered(&v1::covered_dir(&root)).expect("the covered folder lists").is_empty(),
             "the marker is gone"
         );
+        assert!(console.take_notes().is_empty(), "nothing failed, so nothing is said");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_disowned_marker_names_the_kind_none_until_it_ends() {
+        let root = scratch("disowned");
+        let mut console = Console::new();
+        let identity = JournalIdentity {
+            pid: 54000,
+            process_start: "2026-10-01T11:00:00.5Z".parse().expect("the start parses"),
+            kind: "heavy".to_owned(),
+            cwd: r"C:\work\repo".to_owned(),
+            command: "cargo build".to_owned(),
+        };
+        let kinds = || -> Vec<Option<String>> {
+            v1::read_covered(&v1::covered_dir(&root))
+                .expect("the covered folder lists")
+                .into_iter()
+                .map(|(_, marker)| marker.kind)
+                .collect()
+        };
+
+        let mut covered = Covered::write_as(&root, Ok(&identity), 52000, &mut console);
+        assert!(covered.written());
+        covered.disown(&mut console);
+        assert_eq!(kinds(), [Some("none".to_owned())], "the marker no longer names a kind that takes a slot");
+        covered.end(&mut console);
+        assert!(kinds().is_empty(), "the marker is gone");
         assert!(console.take_notes().is_empty(), "nothing failed, so nothing is said");
         let _ = fs::remove_dir_all(&root);
     }
