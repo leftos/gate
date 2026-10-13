@@ -10,9 +10,8 @@
 
 - [ ] GATE-10 Port the remote client and box wrapper, then the remote cutover
   - [ ] GATE-109 Remote: carry every verb of a routed run over one ssh connection (gate box serve)
-  - [ ] GATE-174 Build the production Rust remote client over ssh and select it when the state root holds remote-cutover.flag
-  - [ ] GATE-177 Add gate remote-cutover: write the flag, drain the PC's and every builder's routed runs, clear the marker
-  - [ ] GATE-178 A routed run that starts during the remote cutover's drain waits for it, then starts on the Rust client
+  - [/] GATE-177 Add gate remote-cutover: write the flag, drain the PC's and every builder's routed runs, clear the marker
+  - [/] GATE-178 A routed run that starts during the remote cutover's drain waits for it, then starts on the Rust client
   - [ ] GATE-179 Say what the remote stop waits for after a Ctrl+C
   - [ ] GATE-180 Move the routing suite's default-client cases onto the Rust client
   - [ ] GATE-181 Delete the remote.ps1 bridge, its shim, its install copy and its test seams
@@ -25,7 +24,8 @@
   - [ ] GATE-21 Remote: a critical pool on the builder for timing-sensitive gates (decide after measuring)
   - [ ] GATE-29 Sync-back: narrow the 'worktree changed during the run' refusal to changes that could matter
 - [ ] GATE-159 Box: choose the dotnet tool restore cap from its logged times
-- [ ] GATE-172 After a full fallback, the local wait's still-waiting lines count only the local wait
+- [ ] GATE-186 Test the sync-back's check-attr slicing at its production cap
+- [ ] GATE-187 Count a routed run's ceiling in load-adjusted time on the builder
 
 ## Cutover sweep
 
@@ -34,19 +34,24 @@
 ## After cutover
 
 - [ ] GATE-7 Learned command durations: summary, expected-time line, ETAs, auto ceiling, backfill
-  - [ ] GATE-13 Durations part 2: durations store, `gate expect`, and the expected-time line
+  - [/] GATE-13 Durations part 2: durations store, `gate expect`, and the expected-time line
   - [ ] GATE-15 Durations part 3: ETAs in wait lines and an `expected` field in claims and tickets
   - [ ] GATE-16 Durations part 4: `--timeout auto` as a floor, and ceiling and hang hints
   - [ ] GATE-17 Durations part 5: backfill guests during a critical drain
 - [ ] GATE-8 `--slot auto` picks heavy or light from the command's history
+- [ ] GATE-184 Merge feat/gate-durations (#191)
 
 ## Backlog
 
 - [ ] GATE-140 End an escaped tree at the box, remote client, bridge and push kill sites
-- [ ] GATE-101 A covered gate outlives its parent's slot
+- [/] GATE-101 A covered gate outlives its parent's slot
 - [ ] GATE-143 Measure which other shared daemons leave a gate's job, and spare them from the escaped-tree kill
 - [ ] GATE-144 Harden the slot marker against a same-user forger: job DACL, parent claim check, job-name squatting
 - [ ] GATE-160 gate run --burn: a capped CPU burn on a critical slot, retiring load-burn.ps1
 - [ ] GATE-162 Suite: make the remaining timer-raced interrupt and remote-client git cases load-proof
 - [ ] GATE-163 A process starved during its kill can outlive the gate that killed it
 - [ ] GATE-168 Run the gate's watch, sampler and kill threads at time-critical priority
+
+## No project
+
+- [ ] GATE-185 A nested critical gate whose parent gate ends runs on uncounted
