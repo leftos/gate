@@ -6,7 +6,7 @@ use gate_args::{BoxRequest, BoxSeams, BoxVerb, Invocation, USAGE};
 
 use crate::support::{invocation, os, problems, problems_of, unreadable_word};
 
-const BOX_USAGE: &str = "usage: gate box preflight|run|stop|boot|outputs <base64 JSON payload>";
+const BOX_USAGE: &str = "usage: gate box preflight|run|stop|boot|outputs|inflight <base64 JSON payload>";
 
 #[test]
 fn each_verb_parses_with_its_payload_word_unread() {
@@ -16,6 +16,7 @@ fn each_verb_parses_with_its_payload_word_unread() {
         ("stop", BoxVerb::Stop),
         ("boot", BoxVerb::Boot),
         ("outputs", BoxVerb::Outputs),
+        ("inflight", BoxVerb::Inflight),
     ] {
         assert_eq!(
             invocation(&["box", word, "not even base64"]),
@@ -47,6 +48,20 @@ fn a_missing_or_unknown_verb_a_missing_payload_or_an_extra_word_is_the_box_usage
     let mut unreadable = os(&["box"]);
     unreadable.extend([unreadable_word(), OsString::from("e30=")]);
     assert_eq!(problems_of(unreadable), [BOX_USAGE], "a verb that is not Unicode is no verb");
+}
+
+/// The hidden probe: a verb of its own, whose one payload word is passed on unread like the others'.
+#[test]
+fn box_takes_the_inflight_verb() {
+    assert_eq!(
+        invocation(&["box", "inflight", "not even base64"]),
+        Invocation::Box(BoxRequest {
+            verb: BoxVerb::Inflight,
+            payload: OsString::from("not even base64"),
+            seams: BoxSeams::default(),
+        })
+    );
+    assert_eq!(BoxVerb::Inflight.as_str(), "inflight", "the verb as the CLI spells it");
 }
 
 #[test]

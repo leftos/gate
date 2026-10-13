@@ -22,7 +22,7 @@ use crate::support::{
 
 mod outputs;
 
-const BOX_USAGE: &str = "usage: gate box preflight|run|stop|boot|outputs <base64 JSON payload>\n";
+const BOX_USAGE: &str = "usage: gate box preflight|run|stop|boot|outputs|inflight <base64 JSON payload>\n";
 
 /// The payload word for `json`, as the remote client encodes it.
 fn payload(json: &Value) -> String {
@@ -1509,6 +1509,206 @@ fn box_stop_with_an_earlier_runs_job_spares_the_next_run() {
     assert!(running.is_running(), "the next run goes on");
     let_go(&go);
     assert_eq!(running.finish().code, Some(0));
+}
+
+/// A `gate box inflight` payload word for the builder's root `root`.
+fn inflight_payload(root: &Path) -> String {
+    payload(&json!({ "Root": shown(root) }))
+}
+
+#[test]
+fn inflight_names_a_work_folder_whose_lock_is_held() {
+    let case = Case::new("inflight_names_a_work_folder_whose_lock_is_held");
+    let root = case.folder().join("remote");
+    let work = root.join("work");
+    fs::create_dir_all(&work).expect("the work folder can be made");
+    let lock = work.join("k.lock");
+    let held = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .share_mode(0)
+        .open(&lock)
+        .expect("the work folder's lock can be held, as a run holds it");
+
+    let outcome = gate_box(&case, "inflight", &inflight_payload(&root), None);
+
+    drop(held);
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(
+        outcome.stdout, "gate: remote in flight 1\ngate: remote in flight k\n",
+        "the held lock is one run in flight, named by its key: {outcome:?}"
+    );
+    assert_eq!(outcome.stderr, "", "{outcome:?}");
+}
+
+#[test]
+fn inflight_counts_none_for_free_locks_or_a_missing_root() {
+    let case = Case::new("inflight_counts_none_for_free_locks_or_a_missing_root");
+    let root = case.folder().join("remote");
+    let work = root.join("work");
+    fs::create_dir_all(&work).expect("the work folder can be made");
+    fs::write(work.join("k.lock"), "").expect("a free lock can be written");
+    fs::write(work.join("k.index"), "").expect("a file beside the lock can be written");
+    let bare = case.folder().join("bare-root");
+    fs::create_dir_all(&bare).expect("a root without a work folder can be made");
+    let nowhere = case.folder().join("nowhere");
+
+    for (what, at) in [
+        ("a free lock", &root),
+        ("a root without a work folder", &bare),
+        ("a root that is not there", &nowhere),
+    ] {
+        let outcome = gate_box(&case, "inflight", &inflight_payload(at), None);
+
+        assert_eq!(outcome.code, Some(0), "{what}: {outcome:?}");
+        assert_eq!(outcome.stdout, "gate: remote in flight 0\n", "{what}: {outcome:?}");
+        assert_eq!(outcome.stderr, "", "{what}: {outcome:?}");
+    }
+}
+
+#[test]
+fn inflight_leaves_a_free_lock_takeable() {
+    let case = Case::new("inflight_leaves_a_free_lock_takeable");
+    let root = case.folder().join("remote");
+    let work = root.join("work");
+    fs::create_dir_all(&work).expect("the work folder can be made");
+    let lock = work.join("k.lock");
+    fs::write(&lock, "").expect("a free lock can be written");
+
+    let outcome = gate_box(&case, "inflight", &inflight_payload(&root), None);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(outcome.stdout, "gate: remote in flight 0\n", "{outcome:?}");
+    let taken = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .share_mode(0)
+        .open(&lock)
+        .expect("the probe closed its handle, so a run can take the free lock");
+    drop(taken);
+}
+
+/// A `work` folder the box cannot list holds the drain: no count line, the reason, and status 1. A plain file where
+/// the work folder goes is such a case, and one the suite can make with no right it may not have.
+#[test]
+fn inflight_cannot_list_a_work_folder_and_exits_1() {
+    let case = Case::new("inflight_cannot_list_a_work_folder");
+    let root = case.folder().join("remote");
+    fs::create_dir_all(&root).expect("the root can be made");
+    let work = root.join("work");
+    fs::write(&work, "a file where the work folder goes").expect("a file can block the work folder");
+
+    let outcome = gate_box(&case, "inflight", &inflight_payload(&root), None);
+
+    assert_eq!(outcome.code, Some(1), "a work folder it cannot list is no pass: {outcome:?}");
+    assert_eq!(outcome.stdout, "", "no count line is said: {outcome:?}");
+    let prefix = format!("gate: remote cannot list {}: ", shown(&work));
+    let reason = outcome
+        .stderr
+        .trim_end()
+        .strip_prefix(&prefix)
+        .expect("the cannot-list line names the work folder");
+    assert!(!reason.is_empty(), "the line names why it cannot list it: {outcome:?}");
+}
+
+/// The lock `name` of the work folder `work`, opened with no sharing at all, as a run holds it; held until the caller
+/// drops it.
+fn hold_lock(work: &Path, name: &str) -> fs::File {
+    let lock = work.join(name);
+    fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .share_mode(0)
+        .open(&lock)
+        .expect("the work folder's lock can be held, as a run holds it")
+}
+
+/// A lock the probe cannot open at all counts as held — a folder where a lock file goes is one — since the drain must
+/// not pass on a lock it could not read; the line says why.
+#[test]
+fn inflight_counts_a_lock_it_cannot_read_as_held() {
+    let case = Case::new("inflight_counts_a_lock_it_cannot_read_as_held");
+    let root = case.folder().join("remote");
+    let work = root.join("work");
+    fs::create_dir_all(work.join("d.lock")).expect("a folder named as a lock can be made");
+
+    let outcome = gate_box(&case, "inflight", &inflight_payload(&root), None);
+
+    assert_eq!(outcome.code, Some(0), "a lock it cannot read fails no verb: {outcome:?}");
+    let said = outcome
+        .stdout
+        .strip_prefix("gate: remote in flight 1\ngate: remote in flight d (cannot read: ")
+        .expect("the count, then the lock it cannot read");
+    let reason = said.trim_end().strip_suffix(')').expect("the reason is closed");
+    assert!(!reason.is_empty(), "the line names why it cannot read the lock: {outcome:?}");
+    assert_eq!(outcome.stderr, "", "{outcome:?}");
+}
+
+/// The keys come out sorted, and a lock named with an upper-case `.LOCK` is one of a run's locks too.
+#[test]
+fn inflight_counts_several_held_keys_in_order_and_an_upper_case_lock() {
+    let case = Case::new("inflight_counts_several_held_keys_in_order_and_an_upper_case_lock");
+    let root = case.folder().join("remote");
+    let work = root.join("work");
+    fs::create_dir_all(&work).expect("the work folder can be made");
+    fs::write(work.join("c.index"), "").expect("a file that is no lock can be written");
+    let held = [hold_lock(&work, "b.lock"), hold_lock(&work, "A.LOCK")];
+
+    let outcome = gate_box(&case, "inflight", &inflight_payload(&root), None);
+
+    drop(held);
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(
+        outcome.stdout, "gate: remote in flight 2\ngate: remote in flight A\ngate: remote in flight b\n",
+        "the keys come out sorted, and `.LOCK` is a lock too: {outcome:?}"
+    );
+    assert_eq!(outcome.stderr, "", "{outcome:?}");
+}
+
+/// A key is printed with the marks `escaped()` changes escaped, so no lock's name can reorder or break the line it is
+/// printed in.
+#[test]
+fn inflight_prints_a_key_it_escapes() {
+    let case = Case::new("inflight_prints_a_key_it_escapes");
+    let root = case.folder().join("remote");
+    let work = root.join("work");
+    fs::create_dir_all(&work).expect("the work folder can be made");
+    let held = hold_lock(&work, "a\u{202e}b.lock");
+
+    let outcome = gate_box(&case, "inflight", &inflight_payload(&root), None);
+
+    drop(held);
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(
+        outcome.stdout, "gate: remote in flight 1\ngate: remote in flight a\\u{202e}b\n",
+        "the reordering mark is escaped: {outcome:?}"
+    );
+    assert!(!outcome.stdout.contains('\u{202e}'), "no mark of the key reaches the line: {outcome:?}");
+}
+
+/// A payload the probe cannot use is refused as every other box verb refuses one: the usage line's own `gate: ` line
+/// and status 2, with nothing said on stdout.
+#[test]
+fn inflight_refuses_a_payload_without_a_usable_root() {
+    let case = Case::new("inflight_refuses_a_payload_without_a_usable_root");
+    for (what, given, refused) in [
+        ("no Root", json!({}), "gate: box payload lacks Root\n"),
+        (
+            "a relative Root",
+            json!({ "Root": "remote" }),
+            "gate: box payload Root is not an absolute path on a drive: \"remote\"\n",
+        ),
+    ] {
+        let outcome = gate_box(&case, "inflight", &payload(&given), None);
+
+        assert_eq!(outcome.code, Some(2), "{what}: {outcome:?}");
+        assert_eq!(outcome.stdout, "", "{what}: nothing is said on stdout");
+        assert_eq!(outcome.stderr, refused, "{what}: the refusal line");
+    }
 }
 
 #[test]

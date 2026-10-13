@@ -5,6 +5,7 @@
 mod boot;
 mod forward;
 mod heartbeat;
+mod inflight;
 pub(crate) mod outputs;
 pub(crate) mod payload;
 mod preflight;
@@ -35,6 +36,7 @@ pub(crate) fn answer(request: &BoxRequest, console: &mut Console) -> u32 {
         BoxVerb::Run => run::run(&payload, &request.seams, console),
         BoxVerb::Stop => stop::stop(&payload, console),
         BoxVerb::Outputs => outputs::outputs(&payload, console),
+        BoxVerb::Inflight => inflight::inflight(&payload, console),
     }
 }
 

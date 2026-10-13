@@ -36,6 +36,7 @@ fn verb(text: &str) -> Option<BoxVerb> {
         "stop" => Some(BoxVerb::Stop),
         "boot" => Some(BoxVerb::Boot),
         "outputs" => Some(BoxVerb::Outputs),
+        "inflight" => Some(BoxVerb::Inflight),
         _ => None,
     }
 }

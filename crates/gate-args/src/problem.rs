@@ -117,7 +117,7 @@ impl fmt::Display for Problem {
             Problem::MissingPid => f.write_str("gate: missing the process id"),
             Problem::BadPid(value) => write!(f, "gate: the process id must be a whole number above 0, got '{value}'"),
             Problem::Unreadable(lossy) => write!(f, "gate: cannot read the argument {lossy}"),
-            Problem::BoxUsage => f.write_str("usage: gate box preflight|run|stop|boot|outputs <base64 JSON payload>"),
+            Problem::BoxUsage => f.write_str("usage: gate box preflight|run|stop|boot|outputs|inflight <base64 JSON payload>"),
             Problem::SeamNeeds { option, needs } => write!(f, "gate: {option} needs {needs}"),
             Problem::SeamsConflict { option, other } => write!(f, "gate: {option} cannot be given with {other}"),
         }

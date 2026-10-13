@@ -799,7 +799,7 @@ fn the_bridge_seams_are_unknown_without_the_feature() {
 }
 
 /// The one line a malformed `gate box` prints.
-const BOX_USAGE: &str = "usage: gate box preflight|run|stop|boot|outputs <base64 JSON payload>";
+const BOX_USAGE: &str = "usage: gate box preflight|run|stop|boot|outputs|inflight <base64 JSON payload>";
 
 #[cfg(feature = "test-seams")]
 #[test]

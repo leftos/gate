@@ -179,7 +179,7 @@ It also ends when the process that started it ends: `gate: burn: the parent proc
 
 Hidden from the usage and from `--help`. It is the builder side of a routed run, run over ssh on the builder ([The box side](#the-box-side)).
 
-`gate box preflight|run|stop|boot|outputs <payload>` takes exactly one verb and one non-empty payload word, and no `--state-dir`: every path comes from the payload. Any other shape (no verb, no payload, an empty payload, an unknown verb, an extra word) prints `usage: gate box preflight|run|stop|boot|outputs <base64 JSON payload>` alone on stderr and exits 2.
+`gate box preflight|run|stop|boot|outputs|inflight <payload>` takes exactly one verb and one non-empty payload word, and no `--state-dir`: every path comes from the payload. Any other shape (no verb, no payload, an empty payload, an unknown verb, an extra word) prints `usage: gate box preflight|run|stop|boot|outputs|inflight <base64 JSON payload>` alone on stderr and exits 2.
 
 ### Later subcommands
 
@@ -1340,7 +1340,7 @@ Each verb is one ssh call today, and the call's cost is its connection, not its 
 
 A routed run therefore moves to one long-lived connection carrying every verb, `gate box serve`, and the per-call client stays until that lands (GATE-70 holds the measurement, and GATE-109 the work).
 
-The payload is one base64 word (standard alphabet, padded) of UTF-8 JSON holding the wrapper's keys: `Key`, `Bare`, `Work`, `Lock`, `Index`, `OutputFolder` and `Job`, and for `run` also `Command`, `Subfolder`, `Identity`, `Outputs`, `Nonce` and `OutputsFull`, and for `outputs` also `Name`.
+The payload is one base64 word (standard alphabet, padded) of UTF-8 JSON holding the wrapper's keys: `Key`, `Bare`, `Work`, `Lock`, `Index`, `OutputFolder` and `Job`, and for `run` also `Command`, `Subfolder`, `Identity`, `Outputs`, `Nonce` and `OutputsFull`, and for `outputs` also `Name`. `inflight` reads only `Root`.
 
 Unknown keys are ignored, and `Outputs`, `OutputsFull` and `OutputFolder`, which the outputs transport owns (GATE-44), are read only by `run` (the outputs) and `outputs` (`Name`, `OutputFolder`); `preflight`, `stop` and `boot` ignore them.
 
@@ -1492,6 +1492,14 @@ Built verbs:
   A `Name` that is not `<Key>-<32 lower-case hex digits>.tar.zst` for the payload's own key (`gate: remote outputs archive name '<name>' is not an outputs archive of this work folder`), an archive that does not exist (`gate: remote outputs archive <name> does not exist`) or one that cannot be read or sent exits 1. The file is opened without following a link, and only a plain file is sent.
 
   A sent archive that cannot be removed prints `gate: remote could not remove the outputs archive <name>: <error>` and still exits 0; a later run's prune takes it. An archive already gone at its removal (another run's trim took it after it was sent) says nothing and exits 0.
+
+- **`inflight`** counts the routed runs holding a lock in the payload's `Root`, for the cutover's drain. It reads only `Root`; a trailing separator is folded off.
+
+  For each `{Root}\work\*.lock` (any case) it opens the file for reading with read, write and delete sharing. A sharing violation means a routed run holds it, since the run and the PowerShell wrapper open the lock share-none. The probe's handle closes at once, so a run that starts after the probe can take the lock, while a run whose open lands during the probe is refused busy (exit 75) and its PC falls back locally.
+
+  It prints `gate: remote in flight <n>`, then `gate: remote in flight <key>` for each held lock, the keys escaped and sorted, and exits 0. A missing `Root` or work folder counts 0. A lock it cannot open for another reason counts as held and reads `gate: remote in flight <key> (cannot read: <error>)`.
+
+  A work folder it cannot list (anything but not found) prints no count line, `gate: remote cannot list <work>: <error>` on stderr, and exits 1. A refused payload exits 2.
 
 **The outputs module** (GATE-44) is shared by both ends, this exe, in `crates/gate/src/outputs/`. The box's `run` packs with it and the box's `outputs` verb sends the archive. The PC's manifest, the pending marker, the reading of the box's `gate-remote-outputs: ` line, the fetch of the archive and its install are built in the Rust remote client, which is dormant ([The remote client's run](#routing-and-the-remoteps1-bridge)).
 

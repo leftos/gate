@@ -72,6 +72,8 @@ pub enum BoxVerb {
     Stop,
     Boot,
     Outputs,
+    /// How many of the builder's work folders a run holds, which the remote cutover's drain asks of every builder.
+    Inflight,
 }
 
 impl BoxVerb {
@@ -84,6 +86,7 @@ impl BoxVerb {
             BoxVerb::Stop => "stop",
             BoxVerb::Boot => "boot",
             BoxVerb::Outputs => "outputs",
+            BoxVerb::Inflight => "inflight",
         }
     }
 }

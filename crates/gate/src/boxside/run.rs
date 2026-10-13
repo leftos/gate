@@ -62,8 +62,8 @@ const PARK_LIMIT: Duration = Duration::from_secs(600);
 /// The reason the console seam gives for the failure it forces.
 const FORCED: &str = "the test seam --test-box-console forced the failure";
 /// The Win32 errors of an open refused because another process has the file open.
-const SHARING_VIOLATION: i32 = 32;
-const LOCK_VIOLATION: i32 = 33;
+pub(super) const SHARING_VIOLATION: i32 = 32;
+pub(super) const LOCK_VIOLATION: i32 = 33;
 /// The Win32 error `CreateProcessW` gives when the box's own job refuses breakaway, among other refusals.
 const ERROR_ACCESS_DENIED: u32 = 5;
 /// `FILE_FLAG_OPEN_REPARSE_POINT`: opens a link or junction itself, never its target.
