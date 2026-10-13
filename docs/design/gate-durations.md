@@ -76,6 +76,20 @@ Each part is a sub-issue of CC-178 and lands on `feat/gate-durations`. Part 1 co
 - **Overrun.** Once the drain completes, a guest still running is killed, and its own gate re-queues it. Its key is barred from backfill for 24 h, recorded beside the window files. This is HTCondor's defrag rule, which admits only interruptible jobs to a draining machine and evicts them when the drain ends: the critical run the drain exists for never waits on a mispredicted guest (`docs/research/2026-10-09-gate-prior-art-local.md`, sections 3 and 4).
 - Nesting (`Test-ParentLend`, pause markers) and CC-172's reserved light slots keep working unchanged.
 
+## In the Rust gate
+
+Parts 2 to 5 are built in the Rust gate (GATE-7) after the local cutover, on the journal facts of part 1 (GATE-33). The rulings above hold with these spellings and boundaries:
+
+- `gate expect -- <command>` replaces `-Expect`, and `--timeout auto` and `--slot auto` are options of the new CLI only, with no compatibility-layer spelling. The form that carries the caller's number `n` for `--timeout auto` (`--timeout 900 --auto` or `--timeout auto:900`) is settled in this document when part 4 is built (GATE-16).
+- The key and command normalisation are `gate_state::normalize_command`'s, and the key is git-derived as in part 2: the repo is the main checkout's folder name from `git rev-parse --git-common-dir`, the subfolder is the cwd relative to the worktree root, and a cwd outside git keys on its full path. No machine path is configured or hard-coded.
+- The `expected` field is reserved as optional in the v1 claim and ticket formats ([Reserved fields](../design.md#reserved-fields)), so part 3 fills it without a format change or a second drain. gate-state exposes it, and ops-tower is told by repo inbox that its ticket view can show it. Command text placed in a wait line's format template is escaped.
+- `--timeout auto` resolves to `max(n, 3 x p99)` as a floor and is never a learned kill time; a command with no history runs on `n`.
+- A guest is killed and re-queued by its own gate when the drain completes before it ends, and its key is barred 24 h. Lending a slot releases a `Local\` mutex the critical gate holds, which relaxes the critical drain's rule that the critical gate lets go of nothing, so the design names the released slot and the named release event it signals when part 5 is built.
+
+### `--slot auto` (GATE-8)
+
+`gate run --slot auto` chooses heavy or light from the command's recorded average and peak cores (the journal's `avgCores` and `peakCores`), using the history store and the key normalisation of part 2. A command with no history, or too few runs, runs on heavy, and the gate says it guessed: no history means heavy. `critical` is never chosen automatically. It is built after the durations store (GATE-13).
+
 ## Not in v1
 
 From the brainstorm, left for later: shortest-expected-first ordering with aging, remote routing by expected time, a regression signal for the friction review, and slot-count tuning.

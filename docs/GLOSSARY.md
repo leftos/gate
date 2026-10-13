@@ -22,7 +22,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Build server**: a long-lived compiler or MSBuild node process (`VBCSCompiler`, a `dotnet` running `VBCSCompiler.dll` or an MSBuild node) that builds share.
 - **Builder**: a remote Windows machine, named in a PC's own `remote.json`, that runs routed heavy commands with its own copy of `gate.exe`.
 - **Builders list**: the builders `gate push` reaches: `host` of `remote.json`, then each entry of its optional `hosts` in file order, an entry equal to an earlier one in any letter case skipped. Routing uses `host` alone.
-- **Burn**: `gate burn`, one process that spins a number of threads on the CPU for a set time at the priority it inherited, taking no slot; the load-burn tool runs it inside a critical gate.
+- **Burn**: `gate burn`, one process that spins a number of threads on the CPU for a set time at the priority it inherited, taking no slot and enforcing no 120 s cap (it allows up to 180 s); the load-burn tool runs it inside a critical gate and applies the 120 s cap. `gate run --burn` is the planned owner of the slot, the command and the cap (GATE-160).
 - **Ceiling**: the `--timeout` limit, counted in load-adjusted seconds; passing it kills the command as TIMED OUT.
 - **Checkout filter**: a `filter` driver (or `ident`) that a path's git attributes put its worktree file through; a sync-back that writes or deletes such a path is refused, since `git apply` would run the user's filter program on it.
 - **Claim**: the JSON file `slots\<name>.json` a gate writes while it holds a slot, naming its pid, command, log and ceiling.
