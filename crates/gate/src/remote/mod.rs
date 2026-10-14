@@ -12,6 +12,7 @@
 use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::path::Path;
+use std::time::Duration;
 
 use gate_args::RunRequest;
 use gate_state::{FallbackReason, StateRoot};
@@ -157,6 +158,19 @@ pub(crate) struct RemoteOutcome {
     /// cannot take: a skipped name makes it `Some(false)` on both paths. `None` when the client cannot tell, which
     /// counts as not brought back.
     pub brought_back: Option<bool>,
+    /// How long the run's parts took, which a passed line says.
+    pub split: Split,
+}
+
+/// How long a routed run's parts took: the run call, the command's own time, which its ceiling counts; the push; and the
+/// sync-back's fetch and the outputs fetch, each `None` when the run made none. A client that times none of them leaves
+/// them all at zero and `None`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Split {
+    pub command: Duration,
+    pub push: Duration,
+    pub sync_back: Option<Duration>,
+    pub outputs: Option<Duration>,
 }
 
 impl RemoteOutcome {

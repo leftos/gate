@@ -176,12 +176,13 @@ pub struct TestSeams {
     /// `install`, its first moved file) the client raises the console interrupt itself; or `sdks`, before it reads this
     /// PC's SDK list.
     pub remote_interrupt_at: Option<String>,
-    /// The one call of the remote client, `preflight`, `push`, `run`, `ls-remote` or `fetch`, that `--test-stall-ms`
-    /// and `--test-remote-timeout-ms` apply to; every other call keeps the run's own stall window and ceiling, and
-    /// `ls-remote` its git limit unless named with a ceiling, which is then its deadline.
+    /// The one call of the remote client, `preflight`, `push`, `run`, `ls-remote`, `fetch` or `outputs`, that
+    /// `--test-stall-ms` and `--test-remote-timeout-ms` apply to; every other call keeps the run's own stall window and
+    /// ceilings, and `ls-remote` its git limit unless named with a ceiling, which is then its deadline.
     pub remote_watch_call: Option<String>,
-    /// The remote client's ceiling in milliseconds, counted from the start of the call `--test-remote-watch-call`
-    /// names, or of the run when it names none.
+    /// The remote client's command ceiling in milliseconds, counted from the run call's start; with
+    /// `--test-remote-watch-call` naming a call other than `run`, that call's transfer ceiling instead, counted from its
+    /// own start, the command's ceiling left as `--timeout` gives it.
     pub remote_timeout_ms: Option<u64>,
     /// This PC's SDK list as the remote client's parity check reads it, in place of `dotnet --list-sdks`: versions
     /// separated by commas, or `none`.

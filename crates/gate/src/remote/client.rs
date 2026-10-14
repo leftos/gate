@@ -49,7 +49,7 @@ use super::transport::Local;
 use super::transport::ssh::Ssh;
 use super::transport::{Program, Transport};
 use super::watchdog::{self, Cut, Kept, Kill, LINE_CAP};
-use super::{FAILED, FAILED_RUN, REFUSED, Refusal, RemoteCall, RemoteClient, RemoteOutcome, refused_line, started_line};
+use super::{FAILED, FAILED_RUN, REFUSED, Refusal, RemoteCall, RemoteClient, RemoteOutcome, Split, refused_line, started_line};
 use crate::boxside::outputs::{NAMES_SKIPPED, OUTPUTS_BUDGET};
 use crate::boxside::payload::escaped;
 use crate::durations::{Usual, hang_hint};
@@ -99,7 +99,8 @@ pub(crate) struct RustClient {
     bound: Duration,
     /// `--test-stall-ms`: the stall window, given as it is, with no floor.
     stall_ms: Option<u64>,
-    /// `--test-remote-timeout-ms`: the ceiling, in milliseconds.
+    /// `--test-remote-timeout-ms`: the command's ceiling, in milliseconds; with `--test-remote-watch-call` naming a call
+    /// other than `run`, that call's transfer ceiling instead, or the `ls-remote` deadline.
     timeout_ms: Option<u64>,
     /// `--test-remote-watch-call`: the one call the two seams above apply to, when they are not the whole run's.
     watch_call: Option<String>,
@@ -241,7 +242,8 @@ impl RemoteClient for RustClient {
             limits: Limits {
                 started,
                 stall,
-                ceiling: timeout_ms.map_or(Duration::from_secs(call.timeout), Duration::from_millis),
+                command: timeout_ms.map_or(Duration::from_secs(call.timeout), Duration::from_millis),
+                transfer: TRANSFER_CEILING,
                 bound: self.bound,
             },
             one_call: one.map(|name| OneCall {
@@ -258,6 +260,7 @@ impl RemoteClient for RustClient {
             log_cap: self.log_cap,
             own_start_fails: self.own_start_fails,
             brought_back: None,
+            split: Split::default(),
             lines: Vec::new(),
             problem: None,
             hang_said: false,
@@ -286,7 +289,8 @@ pub(super) enum End {
     Failed(String),
     /// The console interrupt ended it.
     Interrupted,
-    /// The watchdog killed the run call, and the command was stopped, or it killed the outputs call: status 124.
+    /// The watchdog killed the run call, and the command was stopped, or it killed a fetch after it, the sync-back's or
+    /// the outputs call, at its transfer ceiling or, the outputs call, for its silence: status 124.
     Killed,
     /// The run call's connection was lost: it exited 255, ssh's own failure status, other than before the banner. The
     /// run call returns it before anything is stopped, with where the run call's own lines are among the attempt's, so
@@ -302,19 +306,39 @@ struct Prepared {
     sdks: Option<Vec<String>>,
 }
 
-/// The run's clock, which starts with the attempt, and the limits the client's calls are watched by: the stall window,
-/// the ceiling, and the bound of the bounded calls, the `stop` and the `boot`.
+/// The ceiling of each transfer, whatever `--timeout` says: the setup up to the end of the push, counted from the
+/// attempt's start, and each fetch after the run call, the sync-back's and the outputs', counted from its own start.
+pub(super) const TRANSFER_CEILING: Duration = Duration::from_mins(30);
+
+/// The attempt's clock, which the setup's calls count on, and the limits the client's calls are watched by: the stall window; the
+/// command's ceiling, `--timeout`, which only the run call is cut at; the transfer ceiling, which the setup's calls and
+/// each fetch after the run call are cut at; and the bound of the bounded calls, the `stop` and the `boot`.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Limits {
     started: Instant,
     stall: Duration,
-    ceiling: Duration,
+    command: Duration,
+    transfer: Duration,
     bound: Duration,
 }
 
-/// `--test-remote-watch-call`: the one call, `preflight`, `push`, `run`, `ls-remote` or `fetch`, that the stall window
-/// and the ceiling of `--test-stall-ms` and `--test-remote-timeout-ms` apply to, its ceiling counted from its own start.
-/// For `ls-remote`, which has a deadline rather than a stall window, the ceiling is that deadline.
+impl Limits {
+    /// Why a setup call watched by these limits is killed at `now`, nothing having come from it for `idle`: stalled
+    /// once silent for the stall window, else cut at the transfer ceiling counted from [`Limits::started`]; `None`
+    /// while it may run on.
+    fn setup_cut(self, now: Instant, idle: Duration) -> Option<Cut> {
+        let elapsed = now.saturating_duration_since(self.started);
+        match watchdog::kill(idle, elapsed, self.stall, self.transfer)? {
+            Kill::Stalled => Some(Cut::Watchdog(Kill::Stalled)),
+            Kill::TimedOut => Some(Cut::Ceiling(self.transfer)),
+        }
+    }
+}
+
+/// `--test-remote-watch-call`: the one call, `preflight`, `push`, `run`, `ls-remote`, `fetch` or `outputs`, that the
+/// stall window and the ceiling of `--test-stall-ms` and `--test-remote-timeout-ms` apply to, its ceiling counted from
+/// its own start: the command's ceiling for `run`, the transfer ceiling for any other. For `ls-remote`, which has a
+/// deadline rather than a stall window, the ceiling is that deadline.
 #[derive(Clone, Copy)]
 struct OneCall<'c> {
     name: &'c str,
@@ -325,11 +349,15 @@ struct OneCall<'c> {
 /// How a call is watched while it runs.
 #[derive(Clone, Copy, Debug)]
 pub(super) enum Watch {
-    /// By the run's watchdog under these limits: killed once it sent nothing for the stall window, or the run outlived
-    /// its ceiling.
+    /// By the run's watchdog under these limits: killed once it sent nothing for the stall window, or it outlived the
+    /// command's ceiling counted from its own start, so a call made again after one that failed before the banner, and
+    /// the pause before it, count nothing against it: the run call.
     Run(Limits),
-    /// Killed once it sent nothing for the stall window of these limits, or at the run's ceiling, or once its job wrote
-    /// more bytes than the cap when it has one: the sync-back's fetch, and the outputs call.
+    /// Killed once it sent nothing for the stall window of these limits, or at the transfer ceiling counted from the
+    /// attempt's start: the setup's calls, the preflight and the push.
+    Setup(Limits),
+    /// Killed once it sent nothing for the stall window of these limits, or at the transfer ceiling counted from its own
+    /// start, or once its job wrote more bytes than the cap when it has one: the sync-back's fetch, and the outputs call.
     Fetch(Limits, Option<u64>),
     /// Killed once it ran for this long.
     Deadline(Duration),
@@ -352,11 +380,12 @@ impl Watch {
         }
         match self {
             Watch::Run(limits) => {
-                let elapsed = now.saturating_duration_since(limits.started);
-                watchdog::kill(idle, elapsed, limits.stall, limits.ceiling).map(Cut::Watchdog)
+                let elapsed = now.saturating_duration_since(begun);
+                watchdog::kill(idle, elapsed, limits.stall, limits.command).map(Cut::Watchdog)
             }
+            Watch::Setup(limits) => limits.setup_cut(now, idle),
             Watch::Fetch(limits, _) if idle >= limits.stall => Some(Cut::Silent(limits.stall)),
-            Watch::Fetch(limits, _) => (now.saturating_duration_since(limits.started) >= limits.ceiling).then_some(Cut::Ceiling),
+            Watch::Fetch(limits, _) => (now.saturating_duration_since(begun) >= limits.transfer).then_some(Cut::Ceiling(limits.transfer)),
             Watch::Deadline(limit) | Watch::Bounded(limit) => (now.saturating_duration_since(begun) >= limit).then_some(Cut::Late(limit)),
         }
     }
@@ -374,14 +403,14 @@ impl Watch {
     fn byte_cap(self) -> Option<u64> {
         match self {
             Watch::Fetch(_, cap) => cap,
-            Watch::Run(_) | Watch::Deadline(_) | Watch::Bounded(_) => None,
+            Watch::Run(_) | Watch::Setup(_) | Watch::Deadline(_) | Watch::Bounded(_) => None,
         }
     }
 
     /// How long the client waits between two looks at a call watched so.
     fn tick(self) -> Duration {
         match self {
-            Watch::Run(limits) | Watch::Fetch(limits, _) => watchdog::tick(limits.stall),
+            Watch::Run(limits) | Watch::Setup(limits) | Watch::Fetch(limits, _) => watchdog::tick(limits.stall),
             Watch::Deadline(limit) | Watch::Bounded(limit) => watchdog::tick(limit),
         }
     }
@@ -492,6 +521,8 @@ pub(super) struct Attempt<'c, 'a> {
     /// Whether the run's outputs were brought back, as its outputs step ended ([`outputs::ended`]); `None` for a run
     /// that never reached it.
     pub(super) brought_back: Option<bool>,
+    /// How long the run call and each transfer took, as far as the attempt got.
+    pub(super) split: Split,
     lines: Vec<String>,
     problem: Option<String>,
     /// Whether the run call said its hang hint, which an attempt says once.
@@ -572,7 +603,7 @@ impl Attempt<'_, '_> {
     fn preflight(&mut self, location: &Location) -> Result<Prepared, End> {
         self.go_on()?;
         let line = payload::capped("preflight", payload::line("preflight", &payload::location_word(location))).map_err(End::Failed)?;
-        let watch = Watch::Run(self.limits_for("preflight"));
+        let watch = Watch::Setup(self.limits_for("preflight"));
         let raise = self.raises_at("preflight");
         let (mut called, _) = self.with_retry(SSH_FAILED, |attempt| attempt.ssh(&line, Echo::LogOnly, watch, raise, CallOnly::default()))?;
         let theirs = their_version(&called.lines).map(str::to_owned);
@@ -707,7 +738,7 @@ impl Attempt<'_, '_> {
         let git = Git::find(root).map_err(End::Failed)?;
         let started = Instant::now();
         let ssh_command = target.ssh_command.as_deref().map(|ssh| ("GIT_SSH_COMMAND", std::ffi::OsStr::new(ssh)));
-        let watch = Watch::Run(self.limits_for("push"));
+        let watch = Watch::Setup(self.limits_for("push"));
         let (mut called, _) = self.with_retry(GIT_SSH_FAILED, |attempt| {
             attempt.git(&git, &args, ssh_command.as_slice(), Echo::Progress, watch)
         })?;
@@ -720,7 +751,8 @@ impl Attempt<'_, '_> {
         }
         snapshot::save(root, key, &snapshot.commit, self.limit).map_err(git_end)?;
         let short = snapshot.commit.get(..8).unwrap_or(&snapshot.commit);
-        self.say(format!("gate: pushed snapshot {short} in {} s ({size})", seconds(started.elapsed())));
+        self.split.push = started.elapsed();
+        self.say(format!("gate: pushed snapshot {short} in {} s ({size})", seconds(self.split.push)));
         Ok(())
     }
 
@@ -744,18 +776,25 @@ impl Attempt<'_, '_> {
         }
     }
 
-    /// The limits the call `name` is watched by: the run's own, or for the one call `--test-remote-watch-call` names,
-    /// the seams' stall window and ceiling, the ceiling counted from now.
+    /// The limits the call `name` is watched by: the attempt's, whose clock the setup's calls count on; the run call and
+    /// the fetches count from their own start ([`Watch`]). For the one call `--test-remote-watch-call` names, the seams'
+    /// stall window and ceiling, the ceiling counted from now: the command's for `run`, the transfer ceiling for any
+    /// other.
     pub(super) fn limits_for(&self, name: &str) -> Limits {
-        match self.one_call {
-            Some(one) if one.name == name => Limits {
-                started: if one.ceiling.is_some() { Instant::now() } else { self.limits.started },
-                stall: one.stall.unwrap_or(self.limits.stall),
-                ceiling: one.ceiling.unwrap_or(self.limits.ceiling),
-                bound: self.limits.bound,
-            },
-            _ => self.limits,
+        let mut limits = self.limits;
+        let Some(one) = self.one_call.filter(|one| one.name == name) else {
+            return limits;
+        };
+        limits.stall = one.stall.unwrap_or(limits.stall);
+        if let Some(ceiling) = one.ceiling {
+            limits.started = Instant::now();
+            if name == "run" {
+                limits.command = ceiling;
+            } else {
+                limits.transfer = ceiling;
+            }
         }
+        limits
     }
 
     /// The deadline of the call `name`: `limit`, or the ceiling of `--test-remote-timeout-ms` when
@@ -785,7 +824,10 @@ impl Attempt<'_, '_> {
         let nonce: Arc<str> = Arc::from(nonce);
         let mut heard = None;
         let mut names_skipped = false;
-        let end = self.run_call_made(location, limits, |attempt| {
+        // The command's time counts from the start of the call that counts, as its ceiling does.
+        let mut begun = None;
+        let made = self.run_call_made(location, limits, |attempt| {
+            begun = Some(Instant::now());
             let run = CallOnly {
                 input: input.cloned(),
                 nonce: Some(Arc::clone(&nonce)),
@@ -795,7 +837,9 @@ impl Attempt<'_, '_> {
             heard.clone_from(&called.outputs_line);
             names_skipped = called.names_skipped;
             Ok(called)
-        })?;
+        });
+        self.split.command = begun.map_or(Duration::ZERO, |begun| begun.elapsed());
+        let end = made?;
         Ok(RunEnd {
             end,
             outputs_line: heard,
@@ -827,7 +871,7 @@ impl Attempt<'_, '_> {
         self.lines.append(&mut called.lines);
         let output = kept..self.lines.len();
         if let Some(Cut::Watchdog(kill)) = called.cut {
-            self.say(watchdog::kill_line(kill, limits.stall, limits.ceiling));
+            self.say(watchdog::kill_line(kill, limits.stall, limits.command));
             self.noted(&called);
             self.stop(location);
             return Ok(End::Killed);
@@ -1251,6 +1295,7 @@ impl Attempt<'_, '_> {
             lines: self.lines,
             detail: self.problem,
             brought_back: self.brought_back,
+            split: self.split,
         }
     }
 }
@@ -1275,6 +1320,7 @@ impl<'c, 'a> Attempt<'c, 'a> {
             log_cap: watchdog::LOG_CAP,
             own_start_fails: false,
             brought_back: None,
+            split: Split::default(),
             lines: Vec::new(),
             problem: None,
             hang_said: false,
@@ -1289,7 +1335,8 @@ impl Limits {
         Limits {
             started: Instant::now(),
             stall: Duration::from_secs(3600),
-            ceiling: Duration::from_secs(3600),
+            command: Duration::from_secs(3600),
+            transfer: Duration::from_secs(3600),
             bound: Duration::from_secs(30),
         }
     }
@@ -2278,15 +2325,15 @@ fn version_refusal(host: &str, theirs: Option<&str>, ours: &str) -> Option<Strin
     })
 }
 
-/// The watchdog's line for a call watched as a fetch by `limits` and cut for `cut`: STALLED for one that sent nothing
-/// for the stall window, TIMED OUT for one still running at the ceiling; `None` for any other cut.
-pub(super) fn watchdog_line(cut: Cut, limits: Limits) -> Option<String> {
-    let kill = match cut {
-        Cut::Silent(_) => Kill::Stalled,
-        Cut::Ceiling => Kill::TimedOut,
-        Cut::Watchdog(_) | Cut::Late(_) | Cut::TooLong | Cut::TooBig(_) | Cut::ArchiveTooBig(_) => return None,
-    };
-    Some(watchdog::kill_line(kill, limits.stall, limits.ceiling))
+/// The watchdog's line for a call watched as a fetch, `doing` what it was cut for `cut` doing: STALLED for one that sent
+/// nothing for the stall window, TRANSFER TIMED OUT for one still running at its transfer ceiling; `None` for any other
+/// cut.
+pub(super) fn watchdog_line(cut: Cut, doing: &str) -> Option<String> {
+    match cut {
+        Cut::Silent(window) => Some(watchdog::stalled_line(window)),
+        Cut::Ceiling(ceiling) => Some(watchdog::transfer_line(ceiling, doing)),
+        Cut::Watchdog(_) | Cut::Late(_) | Cut::TooLong | Cut::TooBig(_) | Cut::ArchiveTooBig(_) => None,
+    }
 }
 
 /// `text` cut to its first `most` bytes, at a character's boundary.
@@ -2383,9 +2430,9 @@ mod tests {
 
     use super::{
         Attempt, CallEnd, Called, Capped, Cut, Echo, End, GIT_SSH_FAILED, Heard, LINE_CAP, Limits, Loss, NonZeroU64, OUTPUTS_BUDGET, ProtocolLines,
-        Raised, Reader, Reading, RustClient, SSH_FAILED, Shared, Ssh, Unfinished, Watch, Watching, after_loss, boot_time, called_of, console_of,
-        held, is_heartbeat, last_update, local_sdk_listing, path_outside, paused, push_size, relay, relay_raw, relayed_raw, sdks_of, seconds,
-        their_version, version_refusal,
+        Raised, Reader, Reading, RustClient, SSH_FAILED, Shared, Split, Ssh, Unfinished, Watch, Watching, after_loss, boot_time, called_of,
+        console_of, held, is_heartbeat, last_update, local_sdk_listing, path_outside, paused, push_size, relay, relay_raw, relayed_raw, sdks_of,
+        seconds, their_version, version_refusal,
     };
     use crate::environment::Variables;
     use crate::remote::git::{DOTNET_LIMIT, GIT_LIMIT, GitError};
@@ -2529,6 +2576,7 @@ mod tests {
             log_cap: LOG_CAP,
             own_start_fails: false,
             brought_back: None,
+            split: Split::default(),
             lines: Vec::new(),
             problem: None,
             hang_said: false,
@@ -2847,7 +2895,8 @@ mod tests {
         let limits = Limits {
             started,
             stall: 10 * second,
-            ceiling: 60 * second,
+            command: 60 * second,
+            transfer: 60 * second,
             bound: 30 * second,
         };
         let cap = 262_144;
@@ -2904,7 +2953,7 @@ mod tests {
         );
         let mut cut = ended_with(0, "");
         cut.cut = Some(Cut::ArchiveTooBig(262_144));
-        let end = outputs::judged(&mut attempt, &archive, &cut, Limits::for_tests(), End::Status(0));
+        let end = outputs::judged(&mut attempt, &archive, &cut, End::Status(0));
         (end, std::mem::take(&mut attempt.lines))
     }
 
@@ -3016,7 +3065,7 @@ mod tests {
         let mut cut = ended_with(0, "");
         cut.cut = Some(Cut::ArchiveTooBig(262_144));
 
-        let end = outputs::judged(&mut attempt, &archive, &cut, Limits::for_tests(), End::Status(0));
+        let end = outputs::judged(&mut attempt, &archive, &cut, End::Status(0));
 
         assert!(matches!(end, End::Status(0)), "the run keeps its status: {end:?}");
         assert!(!path.exists(), "the partial archive a cut fetch wrote is removed");
@@ -3037,7 +3086,7 @@ mod tests {
         );
         let failed = ended_with(SSH_FAILED, "Connection reset by peer");
 
-        let end = outputs::judged(&mut attempt, &archive, &failed, Limits::for_tests(), End::Status(0));
+        let end = outputs::judged(&mut attempt, &archive, &failed, End::Status(0));
 
         assert!(matches!(end, End::Interrupted), "{end:?}");
         assert_eq!(attempt.lines, Vec::<String>::new());
@@ -3333,19 +3382,25 @@ mod tests {
     }
 
     #[test]
-    fn a_fetch_ends_at_the_stall_window_or_the_run_s_ceiling_whichever_comes_first() {
+    fn a_fetch_ends_at_the_stall_window_or_its_transfer_ceiling_from_its_own_start_never_at_the_command_s() {
         let second = Duration::from_secs(1);
         let started = Instant::now();
         let limits = Limits {
             started,
             stall: 10 * second,
-            ceiling: 60 * second,
+            command: 60 * second,
+            transfer: 90 * second,
             bound: 30 * second,
         };
         let begun = started + 40 * second;
         let fetch = Watch::Fetch(limits, None);
         assert_eq!(
-            fetch.cut(started + 59 * second, begun, 9 * second, Raised::default(), None),
+            fetch.cut(started + 60 * second, begun, 9 * second, Raised::default(), None),
+            None,
+            "the command's ceiling, counted from the run's start, does not cut a fetch"
+        );
+        assert_eq!(
+            fetch.cut(begun + 89 * second, begun, 9 * second, Raised::default(), None),
             None,
             "neither yet"
         );
@@ -3355,9 +3410,9 @@ mod tests {
             "silent for the stall window"
         );
         assert_eq!(
-            fetch.cut(started + 60 * second, begun, second, Raised::default(), None),
-            Some(Cut::Ceiling),
-            "a live fetch at the run's ceiling"
+            fetch.cut(begun + 90 * second, begun, second, Raised::default(), None),
+            Some(Cut::Ceiling(90 * second)),
+            "a live fetch at its transfer ceiling, counted from its own start"
         );
         assert_eq!(
             fetch.cut(
@@ -3374,7 +3429,28 @@ mod tests {
         );
         assert_eq!(
             Watch::Run(limits).cut(started + 60 * second, begun, second, Raised::default(), None),
-            Some(Cut::Watchdog(Kill::TimedOut))
+            None,
+            "the command's ceiling does not count the time before the run call"
+        );
+        assert_eq!(
+            Watch::Run(limits).cut(begun + 60 * second, begun, second, Raised::default(), None),
+            Some(Cut::Watchdog(Kill::TimedOut)),
+            "the run call at the command's ceiling, counted from its own start"
+        );
+        assert_eq!(
+            Watch::Setup(limits).cut(started + 60 * second, begun, second, Raised::default(), None),
+            None,
+            "a setup call is not cut at the command's ceiling"
+        );
+        assert_eq!(
+            Watch::Setup(limits).cut(started + 90 * second, begun, second, Raised::default(), None),
+            Some(Cut::Ceiling(90 * second)),
+            "a setup call at the transfer ceiling, counted from the attempt's start"
+        );
+        assert_eq!(
+            Watch::Setup(limits).cut(started + second, begun, 10 * second, Raised::default(), None),
+            Some(Cut::Watchdog(Kill::Stalled)),
+            "a silent setup call stalls"
         );
         assert_eq!(
             Watch::Deadline(5 * second).cut(begun + 5 * second, begun, Duration::ZERO, Raised::default(), None),
@@ -3394,7 +3470,8 @@ mod tests {
         let limits = Limits {
             started,
             stall: 10 * second,
-            ceiling: 60 * second,
+            command: 60 * second,
+            transfer: 60 * second,
             bound: 30 * second,
         };
         let (now, cap) = (started + second, 262_144);
@@ -4035,6 +4112,7 @@ mod tests {
         assert_eq!(console_of(Watch::Bounded(second)), PipedConsole::Hidden, "the stop");
         for watch in [
             Watch::Run(Limits::for_tests()),
+            Watch::Setup(Limits::for_tests()),
             Watch::Fetch(Limits::for_tests(), None),
             Watch::Deadline(second),
         ] {

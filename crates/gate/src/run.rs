@@ -39,7 +39,7 @@ use crate::log::Log;
 use crate::machine::{self, Machine, MachineWait, MachineWaited};
 use crate::nesting::{Nesting, Parent, enclosing_of};
 use crate::no_build::{self, NothingBack, Unfound, Worktree};
-use crate::remote::{self, RemoteCall, RemoteClient, RemoteOutcome, git};
+use crate::remote::{self, RemoteCall, RemoteClient, RemoteOutcome, Split, git};
 use crate::resolve::{Environment, ResolvedRoot};
 use crate::route::{self, Placed};
 use crate::slots::{self, ClaimOf, Pool, Survey, Taken, Takes, ThisGate, epoch_ms};
@@ -689,11 +689,11 @@ enum Remotely {
 }
 
 /// What a passed line says of how long the command ran: here, by the wall clock and load-adjusted, or on a builder,
-/// by the wall clock.
+/// by the wall clock, the whole routed run's and its parts'.
 #[derive(Clone, Copy)]
 enum Pass<'h> {
     Here(Timing),
-    On(&'h str, Duration),
+    On(&'h str, Duration, Split),
 }
 
 /// A run whose verdict may pass: how long it ran, as its passed line says, and the ceiling it ran under in whole
@@ -1327,7 +1327,7 @@ impl Run<'_> {
             return self.gate_failed(&problem, None, console);
         }
         let passing = Passing {
-            pass: Pass::On(host, wall),
+            pass: Pass::On(host, wall, outcome.split),
             ceiling,
         };
         match self.verdict(outcome.status, Some(passing), outcome.killed || interrupted, &[], console) {
@@ -2136,11 +2136,22 @@ fn passed_line(pass: Pass<'_>, ceiling: u64, shown: &str) -> String {
                 whole_seconds(timing.wall.as_secs_f64()),
             )
         }
-        Pass::On(host, wall) => format!(
-            "gate: passed in {} s on {host} (wall clock, ceiling {ceiling} s). Full output: {shown}",
-            whole_seconds(wall.as_secs_f64())
+        Pass::On(host, wall, split) => format!(
+            "gate: passed in {} s on {host} ({}). Full output: {shown}",
+            whole_seconds(wall.as_secs_f64()),
+            split_said(split, ceiling)
         ),
     }
+}
+
+/// What a routed run's passed line says of its parts, `split`: the command's own time against its ceiling of `ceiling`
+/// whole seconds, then each transfer the run made, the push always, in the order they ran, each in whole seconds.
+fn split_said(split: Split, ceiling: u64) -> String {
+    let seconds = |part: Duration| whole_seconds(part.as_secs_f64());
+    let mut transfers = vec![format!("push {} s", seconds(split.push))];
+    transfers.extend(split.sync_back.map(|part| format!("sync-back {} s", seconds(part))));
+    transfers.extend(split.outputs.map(|part| format!("outputs {} s", seconds(part))));
+    format!("command {} s of ceiling {ceiling} s; {}", seconds(split.command), transfers.join(", "))
 }
 
 /// `seconds` in whole seconds, rounded half to even as the PowerShell gate's `[math]::Round` rounds.
@@ -2283,7 +2294,7 @@ mod tests {
     use crate::console::Console;
     use crate::escaped::{Found, Look, Reached, Recorded};
     use crate::nesting::{Nesting, Parent};
-    use crate::remote::RemoteOutcome;
+    use crate::remote::{RemoteOutcome, Split};
     use crate::watch::Watched;
 
     #[test]
@@ -2616,11 +2627,41 @@ mod tests {
     }
 
     #[test]
-    fn a_passed_line_on_a_builder_keeps_the_wall_clock_and_the_ceiling_alone() {
-        assert_eq!(
-            passed_line(Pass::On("builder", Duration::from_secs(41)), 1, "out.log"),
-            "gate: passed in 41 s on builder (wall clock, ceiling 1 s). Full output: out.log"
-        );
+    fn a_passed_line_on_a_builder_splits_the_command_s_time_from_each_transfer_it_made() {
+        let second = Duration::from_secs(1);
+        let pushed = Split {
+            command: Duration::from_millis(76_400),
+            push: 224 * second,
+            sync_back: None,
+            outputs: None,
+        };
+        let rows = [
+            (
+                "the push alone",
+                pushed,
+                "gate: passed in 301 s on builder (command 76 s of ceiling 300 s; push 224 s). Full output: out.log",
+            ),
+            (
+                "the outputs fetched",
+                Split {
+                    outputs: Some(Duration::from_millis(1_600)),
+                    ..pushed
+                },
+                "gate: passed in 301 s on builder (command 76 s of ceiling 300 s; push 224 s, outputs 2 s). Full output: out.log",
+            ),
+            (
+                "the sync-back and the outputs fetched, in the order they ran",
+                Split {
+                    sync_back: Some(3 * second),
+                    outputs: Some(Duration::ZERO),
+                    ..pushed
+                },
+                "gate: passed in 301 s on builder (command 76 s of ceiling 300 s; push 224 s, sync-back 3 s, outputs 0 s). Full output: out.log",
+            ),
+        ];
+        for (name, split, want) in rows {
+            assert_eq!(passed_line(Pass::On("builder", 301 * second, split), 300, "out.log"), want, "{name}");
+        }
     }
 
     #[test]

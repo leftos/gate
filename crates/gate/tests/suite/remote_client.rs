@@ -12,7 +12,8 @@ use std::io::{self, ErrorKind, Write as _};
 use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, SystemTime};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime};
 
 use gate_router::{repo_name, work_folder_key};
 use proc_table::{ProcessTable as _, ProcessTree, Win32ProcessTable};
@@ -22,8 +23,8 @@ use sha2::{Digest, Sha256};
 
 use crate::durations::seed;
 use crate::support::{
-    Case, FAKE_TOOL, GATE, GIT_REDIRECTS, Go, Outcome, allow_breakaway, build_version, copy_tool, events, finish, git, git_init, heavy_words,
-    nothing_back, release, shown, start, wait_for_journal_line, wait_until, wait_until_closed, write_remote_json,
+    Case, FAKE_TOOL, GATE, GIT_REDIRECTS, Go, Outcome, Running, allow_breakaway, build_version, copy_tool, events, finish, git, git_init,
+    heavy_words, nothing_back, release, shown, start, wait_for_journal_line, wait_until, wait_until_closed, write_remote_json,
 };
 
 const HOST: &str = "builder";
@@ -597,6 +598,123 @@ fn a_routed_run_runs_on_the_box_and_passes_its_output_and_status() {
     assert!(is_sha(&snapshot), "the builder holds the snapshot: {snapshot:?}");
     assert_eq!(git_out(&case, &[], &["rev-parse", &format!("refs/gate-remote/{key}")]), snapshot);
     assert!(log.contains(&format!("gate: pushed snapshot {} in ", &snapshot[..8])), "{log}");
+}
+
+/// The command makes a file the sync-back brings and one the outputs fetch brings, so each transfer is named.
+#[test]
+fn a_routed_pass_splits_its_time() {
+    let case = outputs_case("client-pass-split", &BIN);
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok", "ok"]);
+    let command = [r".\tool.exe", "write", r"bin\new.txt", "built", "mark", "made-on-box.txt"];
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &command));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "run", "outputs"]);
+    let line = Regex::new(concat!(
+        r"(?m)^gate: passed in \d+ s on builder ",
+        r"\(command \d+ s of ceiling 3600 s; push \d+ s, sync-back \d+ s, outputs \d+ s\)\. ",
+        r"Full output: .*out\.log\r?$",
+    ))
+    .expect("the pattern is valid");
+    assert!(line.is_match(&outcome.stdout), "{outcome:?}");
+    assert!(!outcome.stdout.contains("wall clock"), "{outcome:?}");
+}
+
+/// A folder a case made outside its own, removed with all it holds when it drops; a removal that fails is said.
+struct Removed(PathBuf);
+
+impl Drop for Removed {
+    fn drop(&mut self) {
+        if let Err(error) = fs::remove_dir_all(&self.0)
+            && self.0.exists()
+        {
+            let _ = writeln!(io::stderr(), "the folder {} cannot be removed: {error}", self.0.display());
+        }
+    }
+}
+
+/// `count` bytes no compression shrinks, from a fixed linear congruential sequence.
+fn incompressible(count: usize) -> Vec<u8> {
+    let mut state: u64 = 0x2545_F491_4F6C_DD1D;
+    (0..count)
+        .map(|_| {
+            state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            state.to_be_bytes()[0]
+        })
+        .collect()
+}
+
+/// The bytes the run logging to `log` says its push wrote, from its `gate: pushed snapshot <8> in <s> s (<size>)` line
+/// in git's own units: 0 for `up to date`.
+fn pushed_bytes(log: &Path) -> f64 {
+    let text = fs::read_to_string(log).expect("the log was written");
+    let line = text
+        .lines()
+        .find(|line| line.starts_with("gate: pushed snapshot "))
+        .expect("the run pushed a snapshot");
+    let size = line
+        .rsplit_once(" (")
+        .and_then(|(_, size)| size.strip_suffix(')'))
+        .expect("the line ends with its size");
+    if size == "up to date" {
+        return 0.0;
+    }
+    let unit_at = size.find(|c: char| !(c.is_ascii_digit() || c == '.')).expect("a unit follows the number");
+    let number: f64 = size[..unit_at].parse().expect("the size starts with a number");
+    let unit = size[unit_at..].trim();
+    let scale = match unit {
+        "byte" | "bytes" | "B" => Some(1.0),
+        "KiB" => Some(1024.0),
+        "MiB" => Some(1024.0 * 1024.0),
+        "GiB" => Some(1024.0 * 1024.0 * 1024.0),
+        _ => None,
+    };
+    assert!(scale.is_some(), "an unknown unit {unit:?} in {line:?}");
+    number * scale.expect("checked above")
+}
+
+/// A second worktree of one clone is a key of its own, but its snapshot's bridge is a child of the first worktree's
+/// snapshot, which the builder's bare repository, one for the repo, already holds: only the difference travels.
+#[test]
+fn a_new_worktree_s_first_push_sends_only_its_difference() {
+    let case = client_case("client-second-worktree");
+    fs::write(case.folder().join("big.bin"), incompressible(3 << 20)).expect("the big file can be written");
+    git(&case, &["add", "-A"]);
+    git(&case, &["commit", "--quiet", "-m", "start"]);
+    let first_log = case.folder().join("first.log");
+    let first_steps = ssh_steps(&case, "first", &["ok", "ok", "ok"]);
+    let (first_pid, first) = finish_with_pid(client_gate(&case, &shown(&first_log), &first_steps, &[r".\tool.exe", "out", "a"]));
+    assert_eq!(first.code, Some(0), "{first:?}");
+    let key1 = key_of(&own(&case, first_pid));
+    let mut name = case.folder().file_name().expect("the case folder has a name").to_owned();
+    name.push("-wt2");
+    // Outside the case folder, so the first worktree's snapshot does not take it for a repository inside it.
+    let other = Removed(case.folder().with_file_name(name));
+    git(&case, &["worktree", "add", "--quiet", "--detach", &shown(&other.0)]);
+    fs::write(other.0.join("new.txt"), "only here\n").expect("the new file can be written");
+    let second_log = other.0.join("second.log");
+    let second_steps = ssh_steps(&case, "second", &["ok", "ok", "ok"]);
+    let mut gate = client_gate(&case, &shown(&second_log), &second_steps, &[r".\tool.exe", "out", "b"]);
+    gate.current_dir(&other.0);
+
+    let (second_pid, second) = finish_with_pid(gate);
+
+    assert_eq!(second.code, Some(0), "{second:?}");
+    let key2 = key_of(&own(&case, second_pid));
+    assert_ne!(key2, key1, "a worktree of its own is a key of its own");
+    let first_snapshot = builder_ref(&case, &format!("refs/gate/{key1}"));
+    let bridge = builder_ref(&case, &format!("refs/gate-bridge/{key2}"));
+    assert!(is_sha(&first_snapshot) && is_sha(&bridge), "{first_snapshot:?} {bridge:?}");
+    let parent = git_out(&case, &[], &["--git-dir", &bare_of(&case), "rev-parse", &format!("{bridge}^")]);
+    assert_eq!(parent, first_snapshot, "the bridge's parent is the first worktree's snapshot");
+    let (sent_first, sent_second) = (pushed_bytes(&first_log), pushed_bytes(&second_log));
+    assert!(sent_first >= 1024.0 * 1024.0, "the first push sends the big file: {sent_first} bytes");
+    assert!(sent_second < sent_first, "{sent_second} bytes after {sent_first}");
+    assert!(
+        sent_second < 64.0 * 1024.0,
+        "the second push sends only its difference: {sent_second} bytes"
+    );
 }
 
 #[test]
@@ -2222,6 +2340,79 @@ fn a_run_past_its_ceiling_is_killed_with_a_timed_out_line() {
     assert!(made_but_maybe(&made, &["preflight", "run", "stop"], "run"), "{made:?}");
 }
 
+/// The `--timeout` of a case whose push is held past it, in seconds: the command's ceiling, which the push must not
+/// count against.
+const SHORT_CEILING: &str = "2";
+
+/// Starts `gate`, whose push the stand-in holds on `go` as the second call of `steps`, and lets the push go once it has
+/// been held past [`SHORT_CEILING`]: the push takes at least that long, however the machine runs. A gate that ended
+/// before its push reached the stand-in is not waited for. The running gate, and when it was started.
+fn held_past_the_ceiling(gate: Command, steps: &Path, go: &Go) -> (Running, Instant) {
+    let begun = Instant::now();
+    let mut running = start(gate);
+    wait_until("the push, or the gate's end", || calls(steps).len() >= 2 || !running.is_running());
+    let ceiling: u64 = SHORT_CEILING.parse().expect("the ceiling is a number");
+    thread::sleep(Duration::from_secs(ceiling) + Duration::from_millis(500));
+    fs::write(go.path(), "").expect("the go file can be made");
+    (running, begun)
+}
+
+/// The run call is given a ceiling of its own far past any wait, so only the push could pass [`SHORT_CEILING`].
+#[test]
+fn a_push_slower_than_the_command_s_ceiling_is_not_cut_by_it() {
+    let case = client_case("client-slow-push");
+    let go = Go(case.folder().join("ssh").join("go"));
+    let steps = ssh_steps(&case, "ssh", &["ok", &format!("hold {}", shown(go.path())), "ok", "ok", "ok"]);
+    let tuned = Tuned {
+        kind: "local-ssh",
+        timeout: SHORT_CEILING,
+        extra: &["--test-remote-watch-call", "run", "--test-remote-timeout-ms", "600000"],
+        ..Tuned::default()
+    };
+    let gate = client_gate_tuned(&case, "out.log", &steps, &tuned, &[r".\tool.exe", "out", "ran there"]);
+
+    let (running, _) = held_past_the_ceiling(gate, &steps, &go);
+    let outcome = running.finish();
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(outcome.stdout.contains("ran there"), "{outcome:?}");
+    assert!(outcome.stderr.contains("gate: pushed snapshot "), "the push finished: {outcome:?}");
+    assert!(!outcome.stderr.contains("unreachable"), "no fallback: {outcome:?}");
+    assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new());
+    assert_eq!(&calls(&steps)[..3], ["preflight", "git-receive-pack", "run"]);
+}
+
+/// The push is held past the ceiling, then the run call is held until the client kills it: the ceiling counts from the
+/// run call's start, so the run ends no sooner than the held push and the whole ceiling after it.
+#[test]
+fn a_command_past_its_ceiling_is_still_timed_out_after_the_ceiling() {
+    let case = client_case("client-command-ceiling");
+    let go = Go(case.folder().join("ssh").join("go"));
+    let held = format!("hold {}", shown(go.path()));
+    let steps = ssh_steps(&case, "ssh", &["ok", &held, &format!("hold {}", never(&case)), "ok"]);
+    let tuned = Tuned {
+        kind: "local-ssh",
+        timeout: SHORT_CEILING,
+        ..Tuned::default()
+    };
+    let gate = client_gate_tuned(&case, "out.log", &steps, &tuned, &[r".\tool.exe", "out", "ran there"]);
+
+    let (running, begun) = held_past_the_ceiling(gate, &steps, &go);
+    let outcome = running.finish();
+    let took = begun.elapsed();
+
+    assert_eq!(outcome.code, Some(124), "{outcome:?}");
+    assert!(outcome.stderr.contains("gate: TIMED OUT after 2 s"), "{outcome:?}");
+    assert!(!outcome.stderr.contains("unreachable"), "the push was not cut: {outcome:?}");
+    assert_eq!(verdict(&case), "timed-out");
+    assert!(took >= Duration::from_millis(4500), "the held push, then the whole ceiling: {took:?}");
+    let made = calls(&steps);
+    assert!(
+        made_but_maybe(&made, &["preflight", "git-receive-pack", "run", "stop"], "run"),
+        "{made:?}"
+    );
+}
+
 #[test]
 fn a_stalled_preflight_falls_back_unreachable_and_runs_here() {
     let case = client_case("client-stalled-preflight");
@@ -2488,6 +2679,45 @@ fn a_sync_back_fetch_that_sends_nothing_for_the_stall_window_fails_the_run() {
             .contains("gate: the remote run failed: git fetch did not answer for 300 ms"),
         "{outcome:?}"
     );
+}
+
+/// The sync-back's fetch, through `local-ssh`, held past the transfer ceiling `--test-remote-watch-call fetch` gives it
+/// alone, after a command that made a file on the builder and exited `exit`: the case and how its run ended, the
+/// TRANSFER TIMED OUT line said and nothing applied.
+fn a_sync_back_held_past_its_transfer_ceiling(name: &str, exit: &str) -> (Case, Outcome) {
+    let case = client_case(name);
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok", "ok", "ok", &format!("hold {}", never(&case))]);
+    let tuned = Tuned {
+        kind: "local-ssh",
+        extra: &["--test-remote-watch-call", "fetch", "--test-remote-timeout-ms", WATCHED_MS],
+        ..Tuned::default()
+    };
+    let command = [r".\tool.exe", "mark", "made-on-box.txt", "exit", exit];
+
+    let outcome = finish(client_gate_tuned(&case, "out.log", &steps, &tuned, &command));
+
+    let line = "gate: TRANSFER TIMED OUT after 1 s fetching the sync-back";
+    assert!(outcome.stderr.contains(line), "{outcome:?}");
+    assert!(!case.folder().join("made-on-box.txt").exists(), "nothing was applied: {outcome:?}");
+    assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new(), "no fallback");
+    (case, outcome)
+}
+
+#[test]
+fn a_sync_back_fetch_past_its_transfer_ceiling_after_a_pass_is_transfer_timed_out() {
+    let (case, outcome) = a_sync_back_held_past_its_transfer_ceiling("client-fetch-ceiling", "0");
+
+    assert_eq!(outcome.code, Some(124), "{outcome:?}");
+    assert_eq!(verdict(&case), "transfer-timed-out");
+}
+
+#[test]
+fn a_sync_back_fetch_past_its_transfer_ceiling_keeps_a_failed_command_s_status() {
+    let (case, outcome) = a_sync_back_held_past_its_transfer_ceiling("client-fetch-ceiling-failed", "3");
+
+    assert_eq!(outcome.code, Some(3), "the command's own status: {outcome:?}");
+    assert!(outcome.stderr.contains("gate: FAILED (status 3)"), "{outcome:?}");
+    assert_eq!(verdict(&case), "failed");
 }
 
 #[test]
@@ -3764,9 +3994,10 @@ fn a_fetch_dropped_after_bytes_is_not_retried() {
     assert!(pending_marker(&case).exists(), "{outcome:?}");
 }
 
-/// The outputs call sends a few bytes, then nothing, past the ceiling `--test-remote-watch-call outputs` gives it alone.
+/// The outputs call sends a few bytes, then nothing, past the transfer ceiling `--test-remote-watch-call outputs` gives
+/// it alone.
 #[test]
-fn a_fetch_past_its_ceiling_keeps_124_and_says_so() {
+fn an_outputs_fetch_past_its_transfer_ceiling_is_transfer_timed_out() {
     let case = outputs_case("client-outputs-fetch-ceiling", &BIN);
     let steps = ssh_steps(&case, "ssh", &["ok", "ok", &format!("bytes-hold 100 {}", never(&case))]);
     let tuned = Tuned {
@@ -3778,9 +4009,11 @@ fn a_fetch_past_its_ceiling_keeps_124_and_says_so() {
     let outcome = finish(client_gate_tuned(&case, "out.log", &steps, &tuned, &command));
 
     assert_eq!(outcome.code, Some(124), "{outcome:?}");
-    let timed_out = outcome.stderr.find("gate: TIMED OUT after 1 s").expect("the TIMED OUT line");
+    let line = "gate: TRANSFER TIMED OUT after 1 s fetching the outputs";
+    let timed_out = outcome.stderr.find(line).expect("the TRANSFER TIMED OUT line");
     let stopped = outcome.stderr.find(FETCH_STOPPED_LINE).expect("the outputs line");
     assert!(timed_out < stopped, "the kill line comes first: {outcome:?}");
+    assert_eq!(verdict(&case), "transfer-timed-out");
     let made = calls(&steps);
     assert!(made_but_maybe(&made, &["preflight", "run", "outputs"], "outputs"), "no stop: {made:?}");
     assert_eq!(fetched_archives(&case), Vec::<PathBuf>::new(), "the partial archive is removed");

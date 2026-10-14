@@ -1,7 +1,9 @@
 //! The one word a `release` line gives for how a command ended.
 
-/// The kill lines the watchdog writes, the word each starts with and the verdict it gives.
-const KILL_WORDS: [(&str, Verdict); 3] = [
+/// The kill lines the watchdog writes, the word each starts with and the verdict it gives. No word starts another, so
+/// `TRANSFER TIMED OUT` never reads as `TIMED OUT`.
+const KILL_WORDS: [(&str, Verdict); 4] = [
+    ("TRANSFER TIMED OUT", Verdict::TransferTimedOut),
     ("STALLED", Verdict::Stalled),
     ("TIMED OUT", Verdict::TimedOut),
     ("BACKSTOP", Verdict::Backstop),
@@ -22,15 +24,17 @@ pub enum Verdict {
     TimedOut,
     /// The watchdog killed the command at the backstop.
     Backstop,
+    /// A routed run's transfer, after the command ended, outlived its own transfer ceiling and was stopped.
+    TransferTimedOut,
     /// The gate ended before its command had a verdict.
     Unknown,
 }
 
 impl Verdict {
-    /// The verdict of a command that exited `exited` under a gate whose status is `status`: `stalled`, `timed-out` or
-    /// `backstop` when `kill`, the gate's kill line, starts `gate: STALLED`, `gate: TIMED OUT` or `gate: BACKSTOP` at a
-    /// word boundary, in any case; else `log-failure` when the command exited 0 and the status is not 0; else `passed` for status 0
-    /// and `failed` for any other. A command that exits 124 by itself, with no kill line, is `failed`.
+    /// The verdict of a command that exited `exited` under a gate whose status is `status`: `stalled`, `timed-out`,
+    /// `backstop` or `transfer-timed-out` when `kill`, the gate's kill line, starts `gate: STALLED`, `gate: TIMED OUT`,
+    /// `gate: BACKSTOP` or `gate: TRANSFER TIMED OUT` at a word boundary, in any case; else `log-failure` when the
+    /// command exited 0 and the status is not 0; else `passed` for status 0 and `failed` for any other. A command that exits 124 by itself, with no kill line, is `failed`.
     #[must_use]
     pub fn of(kill: Option<&str>, exited: i64, status: i64) -> Verdict {
         if let Some(verdict) = kill.and_then(kill_verdict) {
@@ -52,6 +56,7 @@ impl Verdict {
             Verdict::Stalled => "stalled",
             Verdict::TimedOut => "timed-out",
             Verdict::Backstop => "backstop",
+            Verdict::TransferTimedOut => "transfer-timed-out",
             Verdict::Unknown => "unknown",
         }
     }
@@ -65,6 +70,7 @@ impl Verdict {
             "stalled" => Some(Verdict::Stalled),
             "timed-out" => Some(Verdict::TimedOut),
             "backstop" => Some(Verdict::Backstop),
+            "transfer-timed-out" => Some(Verdict::TransferTimedOut),
             "unknown" => Some(Verdict::Unknown),
             _ => None,
         }
@@ -85,4 +91,32 @@ fn kill_verdict(line: &str) -> Option<Verdict> {
 fn strip_prefix_ignoring_case<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
     let head = text.get(..prefix.len())?;
     head.eq_ignore_ascii_case(prefix).then(|| &text[prefix.len()..])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Verdict;
+
+    #[test]
+    fn a_transfer_timed_out_kill_line_is_its_own_verdict() {
+        let line = "gate: TRANSFER TIMED OUT after 1800 s fetching the outputs";
+        assert_eq!(Verdict::of(Some(line), 0, 124), Verdict::TransferTimedOut);
+        assert_eq!(Verdict::TransferTimedOut.as_str(), "transfer-timed-out");
+        assert_eq!(
+            Verdict::named("transfer-timed-out"),
+            Some(Verdict::TransferTimedOut),
+            "the word reads back"
+        );
+        assert_eq!(
+            Verdict::of(Some("gate: TIMED OUT after 300 s"), 124, 124),
+            Verdict::TimedOut,
+            "the command's own ceiling is still timed-out"
+        );
+        assert_eq!(Verdict::named("timed-out"), Some(Verdict::TimedOut));
+        assert_eq!(
+            Verdict::of(Some("gate: TRANSFERX TIMED OUT after 1800 s"), 3, 3),
+            Verdict::Failed,
+            "the kill words end at a word boundary"
+        );
+    }
 }

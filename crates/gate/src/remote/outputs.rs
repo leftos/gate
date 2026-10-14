@@ -23,7 +23,7 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 
 use super::RemoteCall;
-use super::client::{self, Attempt, Called, End, Limits, RawSink};
+use super::client::{self, Attempt, Called, End, RawSink};
 use super::git::FAILURE_BYTES;
 use super::install::{self, Fetched};
 use super::payload::Location;
@@ -370,12 +370,14 @@ fn fetched(attempt: &mut Attempt<'_, '_>, kept: &Kept<'_>, ran: &Ran<'_>, synced
     let tmp = Path::new(attempt.call.root).join(TMP);
     let mut archive = Archive::new(Path::new(attempt.call.root), tmp.join(&name));
     let limits = attempt.limits_for("outputs");
-    match attempt.outputs_call(ran.location, &name, &mut archive, limits) {
+    let called = attempt.outputs_call(ran.location, &name, &mut archive, limits);
+    attempt.split.outputs = Some(started.elapsed());
+    match called {
         // `judged` hands back the run's passing end only when the archive was fetched whole, and `called` a cut when it
         // was not: an archive past the fetch cap installs nothing.
         Ok(called) => {
             let at_the_cap = matches!(called.cut, Some(Cut::ArchiveTooBig(_)));
-            match judged(attempt, &archive, &called, limits, synced) {
+            match judged(attempt, &archive, &called, synced) {
                 End::Status(0) if called.cut.is_none() => {
                     // The fetch ended whole, under the cap: how the install ends no longer bears on the count.
                     uncapped(attempt);
@@ -413,16 +415,16 @@ fn settled(attempt: &mut Attempt<'_, '_>, at_the_cap: bool, end: End) -> End {
     end
 }
 
-/// The end of the outputs step once its outputs call, watched by `limits`, ended as `called`, having written to
+/// The end of the outputs step once its outputs call ended as `called`, having written to
 /// `archive`, the run's end so far `synced`: as [`fetched`] says.
-pub(super) fn judged(attempt: &mut Attempt<'_, '_>, archive: &Archive, called: &Called, limits: Limits, synced: End) -> End {
+pub(super) fn judged(attempt: &mut Attempt<'_, '_>, archive: &Archive, called: &Called, synced: End) -> End {
     // A Ctrl+C raised by the call's end is the run's end, however the call ended, as after the run call.
     if attempt.go_on().is_err() {
         removed(attempt, archive, PARTIAL);
         return End::Interrupted;
     }
     if let Some(cut) = called.cut {
-        if let Some(line) = client::watchdog_line(cut, limits) {
+        if let Some(line) = client::watchdog_line(cut, "fetching the outputs") {
             attempt.say(line);
             attempt.noted(called);
             return unfetched(attempt, archive, STOPPED, End::Killed);

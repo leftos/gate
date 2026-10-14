@@ -25,7 +25,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Builder**: a remote Windows machine, named in a PC's own `remote.json`, that runs routed heavy commands with its own copy of `gate.exe`.
 - **Builders list**: the builders `gate push` reaches: `host` of `remote.json`, then each entry of its optional `hosts` in file order, an entry equal to an earlier one in any letter case skipped. Routing uses `host` alone.
 - **Burn**: `gate burn`, one process that spins a number of threads on the CPU for a set time at the priority it inherited, taking no slot and enforcing no 120 s cap (it allows up to 180 s); the load-burn tool runs it inside a critical gate and applies the 120 s cap. `gate run --burn` is the planned owner of the slot, the command and the cap (GATE-160).
-- **Ceiling**: the `--timeout` limit, counted in load-adjusted seconds, as given or, for an auto ceiling, as the take resolved it; passing it kills the command as TIMED OUT.
+- **Ceiling**: the `--timeout` limit, as given or, for an auto ceiling, as the take resolved it; passing it kills the command as TIMED OUT. A local run counts it in load-adjusted seconds; a routed run counts it in wall seconds from the start of the run call that started the command, the push and the fetches being counted by the transfer ceiling.
 - **Ceiling hint**: the line `gate: the ceiling <n> is below this command's usual p90 of <p90>`, said after the expected-time line when the resolved ceiling is under the estimate's p90; the line `gate: ceiling <n> (3x ... p99 ..., above the given <floor>)` beside it says history raised an auto ceiling.
 - **Checkout filter**: a `filter` driver (or `ident`) that a path's git attributes put its worktree file through; a sync-back that writes or deletes such a path is refused, since `git apply` would run the user's filter program on it.
 - **Claim**: the JSON file `slots\<name>.json` a gate writes while it holds a slot, naming its pid, command, log and ceiling.
@@ -130,7 +130,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Slot marker**: the environment variable `GATE_SLOT_HELD`, `<kind>:<pid>:<start>` (plus the root hash under a non-default root), which a gate sets for its command so a nested gate knows its parent.
 - **Snapshot**: either the parentless commit of a worktree as it stands, which a routed run sends to its builder; or the critical gate's record, at take, of the counts and the other gates' claims.
 - **Spawn lock**: the `gate-win32` lock held while the gate starts any process, so only the launched command inherits the copies of its handles.
-- **Stable line**: one of the three published `gate:` line forms callers may parse (STALLED, TIMED OUT or BACKSTOP; `waiting for the machine (critical)`; `Full output:`); every other `gate:` line is prose.
+- **Stable line**: one of the three published `gate:` line forms callers may parse (STALLED, TIMED OUT, TRANSFER TIMED OUT or BACKSTOP; `waiting for the machine (critical)`; `Full output:`); every other `gate:` line is prose.
 - **Stall**: a kill for no progress (no output, CPU, new process or build-server work) for the stall window, `--stall` seconds.
 - **Stand-in**: a live covered gate whose command holds a nested gate and whose own slot kind covers it, which that gate runs under in place of its ended parent gate, so one build tree holds one slot; only a covered marker with `kind` `heavy` or `light` is one.
 - **Start marker**: the stderr line `gate-remote-started: <nonce>` that `gate box run` says just before it launches the command; a run call that carried it is never retried and is not a pre-banner failure.
@@ -145,11 +145,12 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Test seam**: a hidden `--test-*` flag, compiled only with the `test-seams` cargo feature, by which the suite sets a timing knob or prints the parsed request.
 - **Ticket**: the JSON file `waiting\<pid>-<start>.json` a gate writes when it queues for a slot, holding its kind and `arrived` time; waiters of one kind take slots in ticket order.
 - **Tracked member**: a member of a routed run's fetched outputs archive whose path the worktree's git index holds, or that sits under a submodule or a nested repository; the install skips it (`... is tracked by git`) unless a `--bring-tracked` glob of the call matches it.
+- **Transfer ceiling**: the fixed 1800 s limit on a routed run's transfers, whatever `--timeout` says: the setup (preflight and push) counted from the attempt's start, each fetch after the run call counted from its own start; a fetch past it ends TRANSFER TIMED OUT (exit 124, verdict `transfer-timed-out`), a setup call past it falls back `unreachable`.
 - **Unbound marker**: a `GATE_SLOT_HELD` marker naming a live gate whose job does not hold this gate or the first ancestor of it that any job holds; the gate ignores it and runs as one under no parent. A marker whose binding cannot be judged is honoured, not unbound.
 - **Usage error**: a command line the gate refuses (a missing, unknown, repeated or invalid input): each problem on its own `gate: ` line, then the usage, exit 2, before any slot is queued.
-- **Verdict**: the outcome a `release` line records: `passed`, `failed`, `log-failure`, `stalled`, `timed-out`, `backstop` or `unknown` (no run facts).
+- **Verdict**: the outcome a `release` line records: `passed`, `failed`, `log-failure`, `stalled`, `timed-out`, `backstop`, `transfer-timed-out` or `unknown` (no run facts).
 - **Wake event**: the auto-reset named event each waiter sleeps on, which a gate signals when it takes or releases a slot or deletes a dead gate's ticket.
-- **Watch call**: the one remote-client call (`preflight`, `push`, `run`, `ls-remote`, `fetch` or `outputs`) that `--test-remote-watch-call` points the stall and ceiling seams at.
+- **Watch call**: the one remote-client call (`preflight`, `push`, `run`, `ls-remote`, `fetch` or `outputs`) that `--test-remote-watch-call` points the stall and ceiling seams at: the command's ceiling for `run`, the transfer ceiling for any other.
 - **Watchdog**: the part of a running gate that samples the command and kills its job on a stall, the ceiling or the backstop.
 - **Win32 layer**: the `gate-win32` crate, the only code that calls Windows for job objects, processes, mutexes, events and console handling.
 - **Work folder**: the builder's checkout of one PC worktree, reused across routed runs so builds stay incremental.

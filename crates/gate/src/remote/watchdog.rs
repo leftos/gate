@@ -28,7 +28,7 @@ pub(super) const LOG_CAP: u64 = 256 << 20;
 pub(super) enum Kill {
     /// Nothing came from the call for the stall window.
     Stalled,
-    /// The run passed its ceiling.
+    /// The call passed its ceiling.
     TimedOut,
 }
 
@@ -43,8 +43,8 @@ pub(super) enum Cut {
     Late(Duration),
     /// It sent a line longer than [`LINE_CAP`].
     TooLong,
-    /// It was still running at the run's ceiling.
-    Ceiling,
+    /// It was still running at its transfer ceiling, this long.
+    Ceiling(Duration),
     /// Its job wrote more than this many bytes.
     TooBig(u64),
     /// A raw copy of its standard output passed this many bytes.
@@ -55,12 +55,13 @@ impl Cut {
     /// Why the call `what` was killed, as a failure's reason.
     pub(super) fn reason(self, what: &str) -> String {
         match self {
-            Cut::Watchdog(Kill::Stalled) => format!("{what} stalled"),
-            Cut::Watchdog(Kill::TimedOut) => format!("{what} outlived the run's ceiling"),
+            // Only a setup call's watchdog cut is given a reason, and it is cut at its ceiling as `Ceiling`: the run
+            // call's own cut says its kill line instead.
+            Cut::Watchdog(_) => format!("{what} stalled"),
             Cut::Silent(window) => format!("{what} did not answer for {}", amount(window)),
             Cut::Late(limit) => format!("{what} did not answer within {}", amount(limit)),
             Cut::TooLong => format!("{what} sent a line longer than 64 KiB"),
-            Cut::Ceiling => format!("{what} did not finish within the run's ceiling"),
+            Cut::Ceiling(ceiling) => format!("{what} outlived its transfer ceiling of {}", amount(ceiling)),
             Cut::TooBig(cap) => format!("{what} wrote more than {}", size(cap)),
             Cut::ArchiveTooBig(cap) => format!("{what} passed {}", size(cap)),
         }
@@ -102,7 +103,7 @@ fn amount(duration: Duration) -> String {
 }
 
 /// Whether a call is killed: stalled once nothing came for `stall` (`idle` since the last byte), else timed out once
-/// the run's clock (`elapsed`) reached its `ceiling`; `None` while neither holds.
+/// the call's clock (`elapsed`) reached its `ceiling`; `None` while neither holds.
 pub(super) fn kill(idle: Duration, elapsed: Duration, stall: Duration, ceiling: Duration) -> Option<Kill> {
     if idle >= stall {
         Some(Kill::Stalled)
@@ -117,9 +118,20 @@ pub(super) fn kill(idle: Duration, elapsed: Duration, stall: Duration, ceiling: 
 /// seconds, rounded up.
 pub(super) fn kill_line(kill: Kill, stall: Duration, ceiling: Duration) -> String {
     match kill {
-        Kill::Stalled => format!("gate: STALLED: no output or remote CPU for {} s", whole_seconds(stall)),
+        Kill::Stalled => stalled_line(stall),
         Kill::TimedOut => format!("gate: TIMED OUT after {} s", whole_seconds(ceiling)),
     }
+}
+
+/// The line a call silent for the `stall` window is killed under, the window in whole seconds, rounded up.
+pub(super) fn stalled_line(stall: Duration) -> String {
+    format!("gate: STALLED: no output or remote CPU for {} s", whole_seconds(stall))
+}
+
+/// The line a transfer after the run call, cut at its transfer `ceiling` while `doing` what it did, such as `fetching
+/// the outputs`, is killed under: the ceiling in whole seconds, rounded up.
+pub(super) fn transfer_line(ceiling: Duration, doing: &str) -> String {
+    format!("gate: TRANSFER TIMED OUT after {} s {doing}", whole_seconds(ceiling))
 }
 
 /// How long the watchdog waits between two looks at a call under the `stall` window: a quarter of it, at most 1 s and
@@ -216,8 +228,8 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        BYTES_KEPT, Cut, Kept, Kill, LINE_CAP, LINES_KEPT, LOG_CAP, complete, kill, kill_line, size, stall_window, tick, too_long, truncated,
-        whole_seconds, whole_size,
+        BYTES_KEPT, Cut, Kept, Kill, LINE_CAP, LINES_KEPT, LOG_CAP, complete, kill, kill_line, size, stall_window, tick, too_long, transfer_line,
+        truncated, whole_seconds, whole_size,
     };
 
     const SECOND: Duration = Duration::from_secs(1);
@@ -284,8 +296,37 @@ mod tests {
     }
 
     #[test]
-    fn a_call_cut_at_the_run_s_ceiling_did_not_finish_within_it() {
-        assert_eq!(Cut::Ceiling.reason("git fetch"), "git fetch did not finish within the run's ceiling");
+    fn a_call_cut_at_its_transfer_ceiling_outlived_it_and_names_it() {
+        assert_eq!(
+            Cut::Ceiling(1800 * SECOND).reason("the push"),
+            "the push outlived its transfer ceiling of 1800 s"
+        );
+        assert_eq!(
+            Cut::Ceiling(1800 * SECOND).reason("the preflight"),
+            "the preflight outlived its transfer ceiling of 1800 s"
+        );
+        assert_eq!(
+            Cut::Ceiling(Duration::from_millis(300)).reason("the push"),
+            "the push outlived its transfer ceiling of 300 ms",
+            "a seam's ceiling"
+        );
+    }
+
+    #[test]
+    fn a_transfer_cut_at_its_ceiling_says_transfer_timed_out_and_what_it_was_doing() {
+        assert_eq!(
+            transfer_line(1800 * SECOND, "fetching the outputs"),
+            "gate: TRANSFER TIMED OUT after 1800 s fetching the outputs"
+        );
+        assert_eq!(
+            transfer_line(1800 * SECOND, "fetching the sync-back"),
+            "gate: TRANSFER TIMED OUT after 1800 s fetching the sync-back"
+        );
+        assert_eq!(
+            transfer_line(Duration::from_millis(300), "fetching the outputs"),
+            "gate: TRANSFER TIMED OUT after 1 s fetching the outputs",
+            "a seam's ceiling, rounded up"
+        );
     }
 
     #[test]
@@ -297,7 +338,6 @@ mod tests {
         );
         assert_eq!(Cut::TooLong.reason("git ls-remote"), "git ls-remote sent a line longer than 64 KiB");
         assert_eq!(Cut::Watchdog(Kill::Stalled).reason("git push"), "git push stalled");
-        assert_eq!(Cut::Watchdog(Kill::TimedOut).reason("git push"), "git push outlived the run's ceiling");
     }
 
     #[test]

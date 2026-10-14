@@ -609,7 +609,13 @@ fn a_routed_run_goes_to_the_client_and_passes_its_output_and_status_through() {
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert_in_order(
         &outcome.stdout,
-        &["ran there", "gate: passed in ", " s on builder (wall clock, ceiling 3600 s)."],
+        &[
+            "ran there",
+            "gate: passed in ",
+            " s on builder (command ",
+            " s of ceiling 3600 s; push ",
+            " s). Full output: ",
+        ],
     );
     assert!(!outcome.stdout.contains("ran here"), "the command never ran here: {outcome:?}");
     let log = fs::read_to_string(case.folder().join("out.log")).expect("the log was written");
@@ -674,7 +680,7 @@ fn a_failing_client_status_is_the_gates_and_the_log_is_scanned() {
     assert_eq!((failed.code, passed.code), (Some(1), Some(0)), "{failed:?} {passed:?}");
     assert!(failed.stdout.contains(":error CS1002: x"), "the marker line is said: {failed:?}");
     assert!(failed.stderr.contains("gate: FAILED (status 1)"), "{failed:?}");
-    assert!(passed.stdout.contains(" s on builder (wall clock"), "{passed:?}");
+    assert!(passed.stdout.contains(" s on builder (command "), "{passed:?}");
     let releases: Vec<Value> = events(&case).into_iter().filter(|event| event["event"] == "release").collect();
     assert_eq!((&releases[0]["verdict"], &releases[1]["verdict"]), (&json!("failed"), &json!("passed")));
 }

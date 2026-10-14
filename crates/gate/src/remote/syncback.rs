@@ -142,7 +142,8 @@ const FETCH_WORDS: [&str; 10] = [
 /// it sends checked, and no tag or submodule. It says its progress, which a live fetch keeps sending on standard error,
 /// so only a fetch that went quiet stalls. Its job may write at most the attempt's fetch cap: past it the fetch is
 /// stopped, and the run of the command that ended `status` ends with the line saying the changes stay on the builder, a
-/// passing run as 1. That end; `None` when the fetch went through.
+/// passing run as 1. One still running at its transfer ceiling is stopped with the TRANSFER TIMED OUT line: a passing
+/// run ends killed, and a failing one keeps its command's status. That end; `None` when the fetch went through.
 fn fetch(attempt: &mut Attempt<'_, '_>, git: &Git, remote: &Remote<'_>, quarantine: &Quarantine, status: i64) -> Result<Option<End>, End> {
     let set = quarantine.env();
     let fetch = Network {
@@ -151,11 +152,21 @@ fn fetch(attempt: &mut Attempt<'_, '_>, git: &Git, remote: &Remote<'_>, quaranti
         set: &set,
     };
     let args = remote.args(&FETCH_WORDS);
+    let begun = Instant::now();
     let called = reached(attempt, git, remote, &fetch, &args)?;
-    if let Some(Cut::TooBig(cap)) = called.cut {
-        attempt.noted(&called);
-        attempt.say(stopped_line(cap, remote.reference));
-        return Ok(Some(End::Status(not_passing(status))));
+    attempt.split.sync_back = Some(begun.elapsed());
+    match called.cut {
+        Some(Cut::TooBig(cap)) => {
+            attempt.noted(&called);
+            attempt.say(stopped_line(cap, remote.reference));
+            return Ok(Some(End::Status(not_passing(status))));
+        }
+        Some(Cut::Ceiling(ceiling)) => {
+            attempt.say(watchdog::transfer_line(ceiling, "fetching the sync-back"));
+            attempt.noted(&called);
+            return if status == 0 { Err(End::Killed) } else { Ok(Some(End::Status(status))) };
+        }
+        _ => {}
     }
     checked(attempt, &fetch, &args, called).map(|_| None)
 }
@@ -510,8 +521,8 @@ fn stopped_line(cap: u64, reference: &str) -> String {
 }
 
 /// One git call of the sync-back that reaches the builder: its verb, and how it is watched. `ls-remote` gets the git
-/// limit; `fetch`, which may take long, ends once nothing came from it for the run's stall window, or at the run's
-/// ceiling.
+/// limit; `fetch`, which may take long, ends once nothing came from it for the run's stall window, or at its transfer
+/// ceiling, counted from its own start.
 struct Network<'a> {
     verb: &'static str,
     watch: Watch,

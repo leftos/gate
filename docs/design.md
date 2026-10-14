@@ -228,7 +228,7 @@ Further modes arrive as subcommands of the same binary, each designed with its i
 | `N` | The command's own non-zero status, passed through whole: the gate exits with the command's 32-bit exit code (300 stays 300; 0xFFFFFFFF reads as -1 where a caller reads it signed), and the FAILED line and the journal show it signed (a routed run whose connection was lost reports 255, RC7). |
 | 1 | The command exited 0 but its log holds a failure marker (never with `--no-markers`, V2); or the gate itself failed after the command started (X4); or it failed before queueing (the working directory, the command's environment, the log's folder or an earlier log that cannot be removed); or a routed run passed but its changes or outputs could not be brought back (RC9, D1). |
 | 2 | Usage: a missing, unknown or invalid input; a `.cmd` or `.bat` word the gate refuses (C5); a `--log` inside the state root; a critical gate under a heavy or light slot marker (K7). Nothing is queued. `gate box` also uses 2 for a refused payload and for a refused subfolder or batch word ([The box side](#the-box-side)). |
-| 124 | The watchdog killed the command: STALLED, TIMED OUT or BACKSTOP (X2). |
+| 124 | The watchdog killed the command: STALLED, TIMED OUT or BACKSTOP (X2); or a routed run's fetch outlived its transfer ceiling: TRANSFER TIMED OUT. |
 | 127 | The command could not be started (C7); the slot is released at once. `gate box run` uses it for the same failure. |
 | 75 | A builder refused a routed run (`gate box`): busy (`gate box run` finding its work folder's lock held), unreachable, parity, rebooted, tools, version. The PC side reads the refusal and falls back to a local run, so a caller sees 75 only as a command's own status, or as a refusal that carried no reason (T5). |
 
@@ -241,6 +241,7 @@ Every line the gate says is written and flushed as it is said, never held until 
 | Line | Where | Meaning |
 |---|---|---|
 | `gate: STALLED: ...`, `gate: TIMED OUT ...`, `gate: BACKSTOP: ...` | at line start in the log and on stderr | The watchdog killed the command; the exit is 124. Match `^gate: (STALLED\|TIMED OUT\|BACKSTOP)`. A gate wrapping a gate reports the inner kill through its own marker scan (V2). |
+| `gate: TRANSFER TIMED OUT after <n> s fetching the outputs` (or `fetching the sync-back`) | at line start in the log and on stderr | A routed run's fetch after the command outlived its transfer ceiling of 1800 s, counted from the fetch's own start; the exit is 124 and the release verdict `transfer-timed-out`. It is a failure marker of the log scan; it does not match the `TIMED OUT` of the command's ceiling. |
 | `gate: waiting for the machine (critical)` | stderr | A critical gate is queued and waiting for the machine (K5); the stable part is the prefix, and the status after it is prose. A critical gate that takes the machine at once says nothing. |
 | `Full output: <path>` | the end of the verdict line: `gate: passed in ... Full output: <path>` on stdout, `gate: FAILED (status <n>). Full output: <path>` on stderr | Where the whole log is (V3). |
 
@@ -280,7 +281,9 @@ The lines of a run that starts its command:
 
   A Ctrl+C while the client waits to start ends the gate the same way with no slot to release, and journals an `abandon` after the `queue` line, not a `release`.
 
-  A routed run that passed says `gate: passed in <w> s on <host> (wall clock, ceiling <n> s). Full output: <log>`, with no load-adjusted time. The client's status is the gate's own, passed through as `N`.
+  A routed run that passed says `gate: passed in <w> s on <host> (command <c> s of ceiling <n> s; push <p> s[, sync-back <s> s][, outputs <o> s]). Full output: <log>`, with no load-adjusted time.
+
+  In it `<w>` is the attempt's whole wall time; `<c>` is the run call's own time, which `--timeout` bounds; the push is always named, the sync-back and the outputs fetch only when they ran, in the order they ran, each in whole seconds rounded half to even. The client's status is the gate's own, passed through as `N`.
 - A critical gate, on stderr and in the log: the `waiting for the machine (critical)`, `still waiting for the machine (critical)`, `holds the machine (critical)` and `interrupted while waiting for the machine` lines, in [Critical drain and nesting](#critical-drain-and-nesting).
 - Nesting, on stderr and in the log, from the slot marker in the gate's environment: the `running under` (including the lend's `while a critical request drains`), `ignored GATE_SLOT_HELD`, `could not judge GATE_SLOT_HELD` and `does not cover` lines, the barrier's `waiting for a heavy slot behind the critical request` and `waiting for a light slot beside the critical request` lines, and the refusal of a critical gate, all in [Critical drain and nesting](#critical-drain-and-nesting).
 
@@ -592,7 +595,9 @@ Fields beyond J1's:
 - `release`: `avgCores`, `peakCores`, `freeCores`, optional numbers of one decimal after `adjustedSeconds` and before `verdict` ([Cores hint](#cores-hint)). They are omitted when there is no unpaused sample, the sampler failed, the read of the command's CPU at its end failed, a gate under the run took a slot of its own (or the machine), the journal could not be read to tell, or the run was routed.
 
   Covered and lent runs write no `release`, except a covered run that took a slot late, which writes one when it lets that slot go: its `slots` the one it took, its `heldSeconds` counted from that take.
-- `release`: `wallSeconds` (the command's wall time less the seconds paused behind a critical request; a routed run's whole remote wall time), `adjustedSeconds` (load-adjusted seconds, 3 decimals, a number for every run that started; null for a routed run and for a run whose sampler failed) and `verdict`, one of `passed`, `failed`, `log-failure`, `stalled`, `timed-out`, `backstop`, `unknown` (kept, J5).
+- `release`: `wallSeconds` (the command's wall time less the seconds paused behind a critical request; a routed run's whole remote wall time), `adjustedSeconds` (load-adjusted seconds, 3 decimals, a number for every run that started; null for a routed run and for a run whose sampler failed) and `verdict`, one of `passed`, `failed`, `log-failure`, `stalled`, `timed-out`, `backstop`, `transfer-timed-out`, `unknown` (kept, J5).
+
+  `transfer-timed-out` is a routed run's fetch after the command cut at its transfer ceiling.
 
   A routed run is a kill only when the gate killed it; a command that exits 124 on its own is `failed`.
 - `fallback`: `reason`, one of `full` (no remote slot within the 60 s wait), `busy`, `unreachable`, `parity`, `rebooted`, `tools` (T5), `version` ([The box side](#the-box-side)) and `client` (the remote client could not start, as when it finds no usable ssh).
@@ -600,7 +605,7 @@ Fields beyond J1's:
   The `take` after it is the run's local one, untagged, its `waitedSeconds` counted from the `fallback`, except after `full`, where it counts from the run's `queue` line; a Ctrl+C that ends that local wait writes the same figure on its `abandon`.
 - a routed run's `take`, `release` and `abandon` carry the tag; its `release` has `adjustedSeconds` null and a `wallSeconds` of the whole remote call.
 
-The verdict comes from the run's end: a kill line matching `^gate: (STALLED|TIMED OUT|BACKSTOP)\b` gives `stalled`, `timed-out` or `backstop`; otherwise a command status of 0 with a non-zero gate status is `log-failure`, a status of 0 is `passed`, anything else `failed`; `unknown` when there are no run facts.
+The verdict comes from the run's end: a kill line matching `^gate: (STALLED|TIMED OUT|BACKSTOP|TRANSFER TIMED OUT)\b` gives `stalled`, `timed-out`, `backstop` or `transfer-timed-out`; otherwise a command status of 0 with a non-zero gate status is `log-failure`, a status of 0 is `passed`, anything else `failed`; `unknown` when there are no run facts.
 
 The reader starts a run from a lone `parent` line that names a parent: state `parent` and `parentPid`, no queued or started time, and the status and held time of the parent's run. A `parent` line naming no parent is skipped. A lent gate whose command's environment cannot be built writes no `parent` line: one that had queued writes a `release` with `"slots":[]` and `"status":1`, and one lent before it queued writes nothing.
 
@@ -973,7 +978,9 @@ The box heartbeat (BW9) is the box wrapper's command-time heartbeat, not the wai
 
   The gate's lines are the run's notes, gathered while it goes and appended to the end of the log. The verdict lines are appended after the tail is printed, so the log ends with them and the printed tail does not hold them. A hard-killed gate's lines are only on stderr.
 - Lines end at CR LF, LF or a lone CR, as .NET's `ReadLine` ends them, for the marker scan and the tail. Both decode the log as UTF-8 lossily: an invalid byte reads as U+FFFD. The gate writes the tail to stdout as UTF-8 (through the wide console API when stdout is a console).
-- The failure-marker regex is built in (kept, V2): `^Build FAILED\.|error CS\d+|: error |Test run summary: Failed!|^\s*failed: [1-9]|gate: (TIMED OUT|STALLED|BACKSTOP)`. It is matched case-insensitively, per line. A zero exit whose log matches becomes status 1 with `gate: command exited 0 but its log reports a failure -> <log>`; on any non-zero status up to 40 matching lines are printed to stdout as `<line number>:<line>`; a killed run is not scanned. `--no-markers` turns the scan off.
+- The failure-marker regex is built in (kept, V2): `^Build FAILED\.|error CS\d+|: error |Test run summary: Failed!|^\s*failed: [1-9]|gate: (TIMED OUT|STALLED|BACKSTOP|TRANSFER TIMED OUT)`.
+
+  It is matched case-insensitively, per line. A zero exit whose log matches becomes status 1 with `gate: command exited 0 but its log reports a failure -> <log>`; on any non-zero status up to 40 matching lines are printed to stdout as `<line number>:<line>`; a killed run is not scanned. `--no-markers` turns the scan off.
 - The scan reads the log streaming and never whole: at most 64 KiB of any one line, and it stops after 40 matches. The tail is read backwards from the end of the log, at most 1 MiB of it; when the last line is longer than that window, the tail shows `… ` followed by its last 4096 characters, starting on a whole character. Each printed tail or marker line is cut at 4096 characters, ending ` …`.
 - At the end the last `--tail` lines go to stdout, taken from the log without the lines of a kill's diagnostics block (dropped by position, so the command's own lines are never lost), then the verdict line ([Output lines](#output-lines)) (kept, V3).
 - A panic after the slot is taken terminates the job, appends the `.err` file and the gate's notes to the log (when completing the log fails, the notes are kept for the next write), deletes the claim and journals `release` with `status` null and `verdict` unknown.
@@ -1269,7 +1276,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
       The run says `gate: synced back <n> file(s): <names joined by ", ">`, names from `git diff-tree -r -z --name-only` with control characters escaped; it reads `0 file(s): ` with nothing after the colon when no files changed.
     - A git failure here ends the run with status 1 and `gate: the remote run failed: ...`, with no fallback.
-    - The `ls-remote` is killed after the git limit (60 s); the `fetch` after a stall window with no output, or at the run's ceiling. Either fails the run the same way, with the reason.
+    - The `ls-remote` is killed after the git limit (60 s); the `fetch` after a stall window with no output. Either fails the run the same way, with the reason. A `fetch` still running 1800 s after its own start (its transfer ceiling) is killed with `gate: TRANSFER TIMED OUT after 1800 s fetching the sync-back` and the run ends 124 after a command that passed, or with the command's own status after one that failed, with no fallback.
     - The `fetch` is also cut when its job has written more than 4 GiB: the Windows job write-transfer I/O counter (`gate_win32::Job::written_bytes`), read on each watch tick and once after the call exits. It counts every process in the job, pipe writes included, so about 3 times the pack over ssh (roughly a 1 GiB pack).
 
       The cut says on stderr and in the log `gate: remote sync-back stopped: the fetch wrote more than <size>; the run's changes stay on the builder (refs/gate-back/<key>)`. `<size>` is in the largest of B, KiB, MiB and GiB whose value rounded to one decimal is at least 1.0 (`4.0 GiB`, `256.0 KiB`).
@@ -1293,12 +1300,12 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
     The client calls `gate box outputs` over ssh with the payload's location word and `Name` `<key>-<nonce>.tar.zst`, built from this PC's own key and nonce, never from the box's line, and copies the call's stdout raw into `<worktree>\.tmp\<key>-<nonce>.tar.zst` (`.tmp` created when missing). The archive and the pending marker are kept for the install. The call's stderr goes to the log only.
 
-    - A fetch the watchdog stops says its `gate: STALLED: ...` or `gate: TIMED OUT after <n> s` line, then `gate: remote outputs not brought back: the fetch was stopped by the watchdog`, and the run ends 124.
+    - A fetch the watchdog stops says its `gate: STALLED: ...` or `gate: TRANSFER TIMED OUT after 1800 s fetching the outputs` line (the ceiling counted from the fetch's own start), then `gate: remote outputs not brought back: the fetch was stopped by the watchdog`, and the run ends 124.
     - Any other failed fetch says `gate: remote outputs not brought back: <reason>`: the box's last stderr line (escaped, its first 4 KiB), `the outputs call failed (status <n>)`, `the outputs call sent a line longer than 64 KiB` or `cannot write <path>: <error>`. A passing run becomes 1. The partial archive is removed; a removal that fails says `gate: cannot remove the partial outputs archive <path>: <error>`.
     - A Ctrl+C during the fetch, or noticed by the end of an outputs call however it ended, ends the run as an interrupt with no `stop` call, and removes the partial archive.
     - A fetch that already sent a byte is never retried as a pre-banner drop; one dropped before any byte is retried once like the other calls.
 
-    **Fetch cap** (GATE-137): the raw relay is bounded by the stall window, which any byte resets, and the run's ceiling, and also by a size cap, so a broken or hostile builder cannot make the archive grow without bound. The cap bounds the archive only; what a builder's output may write to the gate's log has a cap of its own, the log cap (see The output cap below), which counts the outputs call's standard error but not the archive.
+    **Fetch cap** (GATE-137): the raw relay is bounded by the stall window, which any byte resets, and the transfer ceiling of 1800 s counted from the fetch's own start, and also by a size cap, so a broken or hostile builder cannot make the archive grow without bound. The cap bounds the archive only; what a builder's output may write to the gate's log has a cap of its own, the log cap (see The output cap below), which counts the outputs call's standard error but not the archive.
 
     The fetch is capped at zstd's worst case for the box's outputs budget, `outputs::archive::sent_limit(outputs_budget)` (`limit + limit/64 + 1 MiB`, saturating, about 50.8 GiB for the 50 GiB budget), the one formula `read_members` also uses, so every archive the box can legitimately send fits.
 
@@ -1397,9 +1404,15 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
   Two pre-banner failures of the run call fall back `unreachable`; the sync-back's `ls-remote` and `fetch` are retried the same way, and two failures of either end the run with status 1.
 
-  **The watchdog** (`remote/watchdog.rs`, `remote/client.rs`) watches the preflight, the push, the run call, the sync-back's fetch and the outputs fetch by the run's stall window and ceiling. A `--stall` under 15 s is raised to 15 for a remote run (the box's heartbeats come every 5 s) and says `gate: --stall <n> raised to 15 for a remote run (heartbeats come every 5 s)`. It looks every quarter of the window, at most once a second.
+  **The watchdog** (`remote/watchdog.rs`, `remote/client.rs`) watches the preflight, the push, the run call, the sync-back's fetch and the outputs fetch by the run's stall window and two ceilings (the command's and the transfer ceiling) on three clocks.
 
-  A killed run call says `gate: STALLED: no output or remote CPU for <n> s` or `gate: TIMED OUT after <n> s`, stops the command on the builder and ends the run with status 124, with no fallback. A killed preflight or push never started the command, so an early stall says `gate: remote <host> unreachable: <the call> stalled` (or `outlived the run's ceiling`) and falls back `unreachable`.
+  The setup (the preflight and the push) is cut at the transfer ceiling, 1800 s whatever `--timeout` says, counted from the attempt's start. The run call is cut at `--timeout`, in wall seconds, counted from the run call's own start, so a slow push does not use the command's time. Each fetch after the run call, the sync-back's and the outputs', is cut at the transfer ceiling counted from its own start.
+
+  A `--stall` under 15 s is raised to 15 for a remote run (the box's heartbeats come every 5 s) and says `gate: --stall <n> raised to 15 for a remote run (heartbeats come every 5 s)`. It looks every quarter of the window, at most once a second.
+
+  A killed run call says `gate: STALLED: no output or remote CPU for <n> s` or `gate: TIMED OUT after <n> s`, stops the command on the builder and ends the run with status 124, with no fallback. A killed preflight or push never started the command, so an early stall says `gate: remote <host> unreachable: <the call> stalled` (or `outlived its transfer ceiling of 1800 s`) and falls back `unreachable`, with no kill line and no exit 124.
+
+  A fetch after the run call cut at its transfer ceiling says `gate: TRANSFER TIMED OUT after 1800 s fetching the outputs` (or `fetching the sync-back`), ends the run with status 124 and journals `transfer-timed-out` after a command that passed; after a command that failed, the line is said and the run keeps the command's status and the verdict `failed`.
 
   **The stop** is a `stop` call to the builder's `gate box`, made after a kill and after a Ctrl+C that ended a call that may have started the command. It is bounded to 30 s, is retried once after a pre-banner failure while 5 s of the bound would be left, and runs on a hidden console of its own (`CREATE_NO_WINDOW`), so a second Ctrl+C cannot end it.
 
@@ -1825,9 +1838,9 @@ A Rust integration suite drives the built `gate.exe` through its CLI and reads o
 
   `--test-remote-interrupt-at <preflight|run|outputs|install|sdks|stop>` makes the client raise the console interrupt itself after that call's first output byte; `install` raises it before the second file's move, so an install of one file is never interrupted, and `sdks` just before the parity check reads this PC's SDK list with `dotnet --list-sdks`; `stop` raises it at the run call's first byte and again while the stop call runs.
 
-  `--test-remote-timeout-ms <n>` (whole milliseconds above 0) replaces the run's ceiling for the client.
+  `--test-remote-timeout-ms <n>` (whole milliseconds above 0) replaces the command's ceiling for the client; it leaves the transfer ceiling of 1800 s alone unless `--test-remote-watch-call` names a call other than `run`.
 
-  `--test-remote-watch-call <preflight|push|run|ls-remote|fetch|outputs>` makes `--test-stall-ms` and `--test-remote-timeout-ms` apply to that one call alone, its ceiling counted from the call's own start, every other call keeping the run's own window and ceiling.
+  `--test-remote-watch-call <preflight|push|run|ls-remote|fetch|outputs>` makes `--test-stall-ms` and `--test-remote-timeout-ms` apply to that one call alone, its ceiling counted from the call's own start, every other call keeping the run's own window and ceilings. For `run` the ceiling is the command's; for any other call it is that call's transfer ceiling.
 
   With `ls-remote`, `--test-remote-timeout-ms` is that call's deadline and `--test-stall-ms` alone leaves it on the git limit. With `fetch`, the stall and ceiling seams apply to the fetch alone; with `outputs`, to the outputs fetch alone.
 

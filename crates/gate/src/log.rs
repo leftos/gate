@@ -13,7 +13,8 @@ use regex::Regex;
 use crate::console::Console;
 
 /// The failure markers (kept, V2), as the PowerShell gate and design.md write them.
-const MARKERS: &str = r"^Build FAILED\.|error CS\d+|: error |Test run summary: Failed!|^\s*failed: [1-9]|gate: (TIMED OUT|STALLED|BACKSTOP)";
+const MARKERS: &str =
+    r"^Build FAILED\.|error CS\d+|: error |Test run summary: Failed!|^\s*failed: [1-9]|gate: (TIMED OUT|STALLED|BACKSTOP|TRANSFER TIMED OUT)";
 
 /// [`MARKERS`] matched without regard to case, as the PowerShell gate's `Select-String` matches them.
 #[expect(clippy::expect_used, reason = "the pattern is a constant, compiled by every unit test that scans a line")]
@@ -406,6 +407,7 @@ mod tests {
             "gate: TIMED OUT after 900 s",
             "gate: STALLED: no output",
             "inner gate: BACKSTOP: 5 times the ceiling",
+            "gate: TRANSFER TIMED OUT after 1800 s fetching the outputs",
         ];
         for line in lines {
             assert!(matched(line), "{line}");
