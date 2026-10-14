@@ -859,6 +859,10 @@ All kept, with each knob's default unchanged:
 
   The stall check and the load figures count the job's own processes and the escaped tree only: a build server that is neither in the job nor under one of its members is neither progress nor the command's own CPU in the free share, and a server in the job, or escaped from a member, is one of its processes like any other.
 
+    Each run has build servers of its own because a shared one is not the run's to end or to count: a server another run started would be neither in this run's job nor under its members, so a run's end could not wait on its whole tree, its CPU could not be told from a neighbour's, and a kill could not tell which server it may end. A server a member starts lives in the member's job, since none of the launchers (MSBuild's node launcher, Roslyn's `BuildServerConnection`) asks for breakaway and the gate's job allows none, so the run's end ends it with the job.
+
+    The approach rejected is sparing shared servers: classifying build server images and command lines, counting their CPU only while the job held a build client, lowering or raising their priority, and leaving them out of the escaped-tree kill. It needed a classifier that tracks every toolchain's server names, and it could not tell a server a run needs from one that merely runs. Node reuse stays off so MSBuild nodes end with the invocation, and the compiler server's pipe id is the run's, so it is reused within the run only.
+
   The watch hands the pure crate raw facts: the job's CPU, the escaped tree's per-process CPU and the VM's CPU as an option (`None` for a command that is not a `wsl` one, or with no VM).
 - Kill, on a STALLED, TIMED OUT or BACKSTOP alike: the diagnostics block (X3), then `TerminateJobObject(job, 124)` and the end of the processes that left the job (below), `gate: terminated the job's <n> process(es)` (with the escaped processes named, below), `gate: diagnostics written to <log>`, a 5 s wait for the command and exit 124 (X2).
 
@@ -916,6 +920,8 @@ All kept, with each knob's default unchanged:
   - A stall, ceiling or Ctrl+C kill ends these processes with what is under them and counts them in the `and <m> that left it` line; a gate failure after the command's own exit ends none. The diagnostics block lists the departed members' children and their descendants.
   - The stall check adds the CPU the escaped tree gained since the last progress to the job's CPU against the 1% floor, and a new escaped process (by pid and start) is progress; both reset on progress. So a command whose work runs there is not stalled or timed out while it is busy. The other kill sites (`gate box stop`, the remote client, `gate push`) do not end them yet (GATE-140).
   - **Every kill site ends the escaped tree** (GATE-140), planned, not built: the box's stop, the remote client's kill and `gate push`'s kill end the escaped processes the way a `gate run` kill does, so the sites agree on what is ended.
+
+    The escaped-tree kill spares no build server and no shared daemon, since each run's build servers live in its own job ([Command launching](#command-launching)); the one process it treats apart is a gate's, whose own command's job is terminated before it is ended.
 - The diagnostics block (X3) is gathered before the job is terminated and goes to the log only, between the command's output and the kill line. A command that exits during the gathering keeps its own status and writes no block. Its lines:
   - `gate: diagnostics`, then `gate:   job <pid> parent <ppid> <name>: cpu <s> s, working set <mb> MB: <command line>` for each process of the job (up to 40, then `gate:   ... and <n> more job processes`), and `gate:   outside job ...` lines for the descendants outside the job (up to 20), the recorded escaped processes and their descendants after them.
   - Up to six sample lines, `gate:   sample at <w> s (load-adjusted <a> s, free <p>%): log <n> B, err <n> B, job cpu <s> s, <n> processes, escaped cpu <s> s`, or `gate:   samples: none` when no sample was taken. `<w>` is the sample's `at` stamp.
@@ -2077,6 +2083,6 @@ What no ruling settles yet, with the issue that owns it:
 
 - **The box protocol and `remote.json`'s next format** (GATE-10): verbs, payload and transport between PC and builder, whether ssh keeps cmd.exe as the builder's shell, and the routing file's version and matcher. Sibling worktrees in a routed run leave three questions of their own (GATE-19).
 - **A prediction a run has passed** (GATE-14): what a holder past its p90 reports in wait lines, and whether the critical gate re-prices its shadow end and closes or shrinks the lent window when a blocker overruns.
-- **Which members the run's end spares** (GATE-205): the run's end spares every job member whose image is `gate.exe`, whatever gate it is; GATE-205 tracks hardening that judgement.
+- **Which members the run's end spares** (GATE-144): the run's end spares every job member whose image is `gate.exe`, whatever gate it is; GATE-144 tracks hardening that judgement.
 - **The surfaces of `gate status` and `gate drain`** (no issue yet). Install stays a script (`tools/install.ps1`) until a reason for a `gate install` subcommand appears.
 - **The Windows facilities to spike before their slice** (GATE-5): other users' command lines (B1), the desktop-app breakaway policy (X1) and nested jobs, each of which changes kill behaviour if it silently fails.
