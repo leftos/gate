@@ -6,12 +6,17 @@
 
 - [ ] GATE-46 Remote slice 5: drained remote cutover and deleting the remote.ps1 bridge — Urgent · Remote
 - [ ] GATE-19 Remote: send a repo's declared sibling worktrees with a routed run — Urgent · Remote
+- [ ] GATE-247 Siblings A: machine consent and sibling safety checks on the PC — Urgent · Remote
 - [ ] GATE-206 A per-repo toolchain manifest: check and prepare builders, and check a fresh clone — Urgent · Remote
 - [ ] GATE-211 Toolchain 4: refuse a routed run with parity when the builder lacks a declared tool — Urgent · Remote
 - [/] GATE-212 Toolchain 5: gate check, for this machine and for a builder — Urgent · Remote
-- [ ] GATE-232 A routed build that brings back less than it built leaves non-dotnet readers on stale output, unwarned — Urgent · Remote
-- [ ] GATE-237 Routed outputs and the no-build check use git's drive spelling, not the caller's subst spelling — Urgent · Remote
+- [/] GATE-232 A routed build that brings back less than it built leaves non-dotnet readers on stale output, unwarned — Urgent · Remote
 - [ ] GATE-192 Turn routing back on, on the Rust remote client — High · Remote
+- [ ] GATE-248 Siblings B: the box lays out a sibling pair (Pair payload, preflight, run) — High · Remote
+- [ ] GATE-249 Siblings C: the client snapshots, checks parity and pushes each repo — High · Remote
+- [ ] GATE-250 Siblings D: sync back every repo of a pair, all or nothing — High · Remote
+- [ ] GATE-251 Siblings E: outputs, install rewrite and stale-line wording for a pair — High · Remote
+- [ ] GATE-252 Siblings F: docs for routed sibling pairs — High · Remote
 - [ ] GATE-22 Remote: send a routed command's ignored inputs to the builder, compressed — High · Remote
 - [ ] GATE-214 Toolchain 7: roll the manifest out to the gated repos — High · Remote
 - [ ] GATE-228 Merge feat/toolchain-manifest (#252) — High · Remote
@@ -30,6 +35,9 @@
 - [ ] GATE-195 Check git and gate push's ssh against the worktree, as the remote client checks ssh and dotnet
 - [ ] GATE-235 Builder: folders above the work folder and on PATH may be writable by any local user
 - [ ] GATE-240 gate push and install.ps1: clearer failure reasons, a language-mode check, one copy of the file helper
+- [ ] GATE-253 gate check and the box's probe: judge siblings by every routing rule; a tool that exits non-zero is not present
+- [ ] GATE-256 Remote: a routed snapshot can stage a parent repository when the worktree's .git is gone
+- [ ] GATE-257 Stale-output line: walk after the verdict, skip by coverage not glob text, keep part-way brought-back globs
 
 ## Cutover sweep
 
@@ -63,3 +71,7 @@
 - [ ] GATE-242 Suite: find and cut what makes remote_client's slow cases take tens of seconds
 - [ ] GATE-243 Suite: launch nested-launcher case reads spawn-pid's file without waiting for it
 - [ ] GATE-244 Share compiled Rust dependencies across repos and worktrees (sccache on the builder and this PC)
+- [ ] GATE-245 gate check: quote the repo root and sibling paths in its lines
+- [ ] GATE-246 Share one temp-folder test helper across the gate crate's unit tests
+- [ ] GATE-254 gate check: install hints that install what it accepts; keep git's reason; build the filtered PATH once
+- [ ] GATE-255 Suite: three cases ended with exit 1 and no output mid-run, and a box-kill case failed under load
