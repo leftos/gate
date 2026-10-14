@@ -3,6 +3,7 @@
 //! under one.
 
 mod boot;
+mod ceiling;
 mod forward;
 mod heartbeat;
 mod inflight;

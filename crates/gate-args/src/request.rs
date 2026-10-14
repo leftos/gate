@@ -67,6 +67,17 @@ pub struct BoxSeams {
     /// How long `gate box preflight`'s `dotnet --list-sdks` may take, in milliseconds, in place of the built-in 30 s;
     /// `None` without the feature.
     pub dotnet_limit_ms: Option<u64>,
+    /// The period of `gate box run`'s samples of its machine, in milliseconds, in place of the built-in 5 s; `None`
+    /// without the feature.
+    pub sample_ms: Option<u64>,
+    /// Make every sample `gate box run` takes of its machine fail; `false` without the feature.
+    pub sampler_fail: bool,
+    /// The share of its machine, in whole percent from 1 to 100, that `gate box run`'s samples find free, others
+    /// holding the rest, in place of what the machine's times say; `None` without the feature.
+    pub free_percent: Option<u32>,
+    /// How many processes the ending of a job `gate box run`'s ceiling killed reports left, in place of what the job
+    /// holds after it; `None` without the feature.
+    pub kill_leaves: Option<u64>,
 }
 
 /// What `gate box` was asked to do on the builder.
@@ -174,13 +185,16 @@ pub struct TestSeams {
     /// PC's SDK list.
     pub remote_interrupt_at: Option<String>,
     /// The one call of the remote client, `preflight`, `push`, `run`, `ls-remote`, `fetch` or `outputs`, that
-    /// `--test-stall-ms` and `--test-remote-timeout-ms` apply to; every other call keeps the run's own stall window and
-    /// ceilings, and `ls-remote` its git limit unless named with a ceiling, which is then its deadline.
+    /// `--test-stall-ms` applies to, and `--test-remote-timeout-ms` too when it names a call other than `run`; every
+    /// other call keeps the run's own stall window and ceilings, and `ls-remote` its git limit unless named with a
+    /// ceiling, which is then its deadline.
     pub remote_watch_call: Option<String>,
-    /// The remote client's command ceiling in milliseconds, counted from the run call's start; with
-    /// `--test-remote-watch-call` naming a call other than `run`, that call's transfer ceiling instead, counted from its
-    /// own start, the command's ceiling left as `--timeout` gives it.
+    /// With `--test-remote-watch-call` naming a call other than `run`, that call's transfer ceiling in milliseconds,
+    /// counted from its own start.
     pub remote_timeout_ms: Option<u64>,
+    /// The remote client's backstop on the run call in milliseconds, counted from the run call's start, in place of
+    /// five ceilings and 60 s.
+    pub remote_backstop_ms: Option<u64>,
     /// This PC's SDK list as the remote client's parity check reads it, in place of `dotnet --list-sdks`: versions
     /// separated by commas, or `none`.
     pub local_sdks: Option<String>,

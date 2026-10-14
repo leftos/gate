@@ -28,8 +28,15 @@ pub(super) const LOG_CAP: u64 = 256 << 20;
 pub(super) enum Kill {
     /// Nothing came from the call for the stall window.
     Stalled,
-    /// The call passed its ceiling.
-    TimedOut,
+    /// The call ran to the limit its clock is cut at: the run call's backstop, a setup call's transfer ceiling.
+    Backstop,
+}
+
+/// The run call's backstop for a run whose ceiling is `ceiling` whole seconds: five ceilings and 60 s of wall time,
+/// counted from the run call's start, saturating. The box counts the ceiling itself, in load-adjusted time, so the
+/// client only ends a run call the box did not end.
+pub(super) fn backstop(ceiling: u64) -> Duration {
+    Duration::from_secs(ceiling.saturating_mul(5).saturating_add(60))
 }
 
 /// Why the client killed a call.
@@ -102,24 +109,28 @@ fn amount(duration: Duration) -> String {
     }
 }
 
-/// Whether a call is killed: stalled once nothing came for `stall` (`idle` since the last byte), else timed out once
-/// the call's clock (`elapsed`) reached its `ceiling`; `None` while neither holds.
-pub(super) fn kill(idle: Duration, elapsed: Duration, stall: Duration, ceiling: Duration) -> Option<Kill> {
+/// Whether a call is killed: stalled once nothing came for `stall` (`idle` since the last byte), else at its backstop
+/// once the call's clock (`elapsed`) reached its `limit`; `None` while neither holds.
+pub(super) fn kill(idle: Duration, elapsed: Duration, stall: Duration, limit: Duration) -> Option<Kill> {
     if idle >= stall {
         Some(Kill::Stalled)
-    } else if elapsed >= ceiling {
-        Some(Kill::TimedOut)
+    } else if elapsed >= limit {
+        Some(Kill::Backstop)
     } else {
         None
     }
 }
 
-/// The line a call killed for `kill` is killed under, in PowerShell's words: the stall window or the ceiling in whole
-/// seconds, rounded up.
-pub(super) fn kill_line(kill: Kill, stall: Duration, ceiling: Duration) -> String {
+/// The line the run call to `host` killed for `kill` is killed under: the stall window in PowerShell's words, or the
+/// `backstop` of the run whose ceiling is `ceiling` whole seconds, each in whole seconds, rounded up.
+pub(super) fn kill_line(kill: Kill, stall: Duration, backstop: Duration, ceiling: u64, host: &str) -> String {
     match kill {
         Kill::Stalled => stalled_line(stall),
-        Kill::TimedOut => format!("gate: TIMED OUT after {} s", whole_seconds(ceiling)),
+        Kill::Backstop => format!(
+            "gate: BACKSTOP on {host}: no end after {} s of wall time (5 x the {ceiling} s ceiling + 60 s); killed the run \
+             call and stopped the command",
+            whole_seconds(backstop)
+        ),
     }
 }
 
@@ -228,8 +239,8 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        BYTES_KEPT, Cut, Kept, Kill, LINE_CAP, LINES_KEPT, LOG_CAP, complete, kill, kill_line, size, stall_window, tick, too_long, transfer_line,
-        truncated, whole_seconds, whole_size,
+        BYTES_KEPT, Cut, Kept, Kill, LINE_CAP, LINES_KEPT, LOG_CAP, backstop, complete, kill, kill_line, size, stall_window, tick, too_long,
+        transfer_line, truncated, whole_seconds, whole_size,
     };
 
     const SECOND: Duration = Duration::from_secs(1);
@@ -341,32 +352,49 @@ mod tests {
     }
 
     #[test]
-    fn a_call_is_stalled_once_idle_for_the_window_else_timed_out_at_the_ceiling() {
-        let (stall, ceiling) = (15 * SECOND, 60 * SECOND);
-        assert_eq!(kill(14 * SECOND, 59 * SECOND, stall, ceiling), None, "neither yet");
+    fn a_call_is_stalled_once_idle_for_the_window_else_at_its_backstop_at_the_limit() {
+        let (stall, limit) = (15 * SECOND, 360 * SECOND);
+        assert_eq!(kill(14 * SECOND, 359 * SECOND, stall, limit), None, "neither yet");
         assert_eq!(
-            kill(15 * SECOND, SECOND, stall, ceiling),
+            kill(15 * SECOND, SECOND, stall, limit),
             Some(Kill::Stalled),
             "idle for exactly the window"
         );
-        assert_eq!(kill(SECOND, 60 * SECOND, stall, ceiling), Some(Kill::TimedOut), "exactly at the ceiling");
+        assert_eq!(kill(SECOND, 360 * SECOND, stall, limit), Some(Kill::Backstop), "exactly at the limit");
         assert_eq!(
-            kill(20 * SECOND, 70 * SECOND, stall, ceiling),
+            kill(20 * SECOND, 370 * SECOND, stall, limit),
             Some(Kill::Stalled),
-            "a stall wins over the ceiling"
+            "a stall wins over the limit"
         );
-        assert_eq!(kill(Duration::ZERO, Duration::ZERO, stall, ceiling), None, "a call that just started");
+        assert_eq!(kill(Duration::ZERO, Duration::ZERO, stall, limit), None, "a call that just started");
     }
 
     #[test]
-    fn the_kill_lines_keep_powershell_s_words_in_whole_seconds_rounded_up() {
+    fn the_run_call_s_backstop_is_five_ceilings_and_60_s_saturating() {
+        assert_eq!(backstop(60), 360 * SECOND);
+        assert_eq!(backstop(1), 65 * SECOND);
+        assert_eq!(backstop(u64::MAX), Duration::from_secs(u64::MAX), "saturates");
+    }
+
+    #[test]
+    fn the_kill_lines_say_the_stall_window_or_the_backstop_in_whole_seconds_rounded_up() {
         assert_eq!(
-            kill_line(Kill::Stalled, 15 * SECOND, 60 * SECOND),
+            kill_line(Kill::Stalled, 15 * SECOND, 360 * SECOND, 60, "builder"),
             "gate: STALLED: no output or remote CPU for 15 s"
         );
-        assert_eq!(kill_line(Kill::TimedOut, 15 * SECOND, 60 * SECOND), "gate: TIMED OUT after 60 s");
         assert_eq!(
-            kill_line(Kill::Stalled, Duration::from_millis(300), SECOND),
+            kill_line(Kill::Backstop, 15 * SECOND, 360 * SECOND, 60, "builder"),
+            "gate: BACKSTOP on builder: no end after 360 s of wall time (5 x the 60 s ceiling + 60 s); killed the run call and \
+             stopped the command"
+        );
+        assert_eq!(
+            kill_line(Kill::Backstop, 15 * SECOND, Duration::from_millis(300), 2, "builder"),
+            "gate: BACKSTOP on builder: no end after 1 s of wall time (5 x the 2 s ceiling + 60 s); killed the run call and \
+             stopped the command",
+            "a seam's backstop"
+        );
+        assert_eq!(
+            kill_line(Kill::Stalled, Duration::from_millis(300), SECOND, 60, "builder"),
             "gate: STALLED: no output or remote CPU for 1 s",
             "a seam's window"
         );

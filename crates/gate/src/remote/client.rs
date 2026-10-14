@@ -49,7 +49,10 @@ use super::transport::Local;
 use super::transport::ssh::Ssh;
 use super::transport::{Program, Transport, Wire};
 use super::watchdog::{self, Cut, Kept, Kill, LINE_CAP};
-use super::{FAILED, FAILED_RUN, REFUSED, Refusal, RemoteCall, RemoteClient, RemoteOutcome, Split, refused_line, started_line};
+use super::{
+    BoxKill, FAILED, FAILED_RUN, REFUSED, Refusal, RemoteCall, RemoteClient, RemoteOutcome, Split, adjusted_prefix, killed_line, refused_line,
+    started_line,
+};
 use crate::boxside::outputs::{NAMES_SKIPPED, OUTPUTS_BUDGET};
 use crate::boxside::payload::escaped;
 use crate::durations::{Usual, hang_hint};
@@ -99,10 +102,13 @@ pub(crate) struct RustClient {
     bound: Duration,
     /// `--test-stall-ms`: the stall window, given as it is, with no floor.
     stall_ms: Option<u64>,
-    /// `--test-remote-timeout-ms`: the command's ceiling, in milliseconds; with `--test-remote-watch-call` naming a call
-    /// other than `run`, that call's transfer ceiling instead, or the `ls-remote` deadline.
+    /// `--test-remote-timeout-ms`: with `--test-remote-watch-call` naming a call other than `run`, that call's transfer
+    /// ceiling, or the `ls-remote` deadline, in milliseconds.
     timeout_ms: Option<u64>,
-    /// `--test-remote-watch-call`: the one call the two seams above apply to, when they are not the whole run's.
+    /// `--test-remote-backstop-ms`: the run call's backstop, in milliseconds, in place of five ceilings and 60 s.
+    backstop_ms: Option<u64>,
+    /// `--test-remote-watch-call`: the one call `--test-stall-ms` applies to, when it is not the whole run's, and
+    /// `--test-remote-timeout-ms` too, which names a call other than `run`; the backstop seam is the run call's alone.
     watch_call: Option<String>,
     /// `--test-remote-interrupt-at`: the call after whose first output byte the client raises the console interrupt.
     interrupt_at: Option<String>,
@@ -154,6 +160,7 @@ impl RustClient {
             bound: retry::bound(seams),
             stall_ms: seams.stall_ms,
             timeout_ms: seams.remote_timeout_ms,
+            backstop_ms: seams.remote_backstop_ms,
             watch_call: seams.remote_watch_call.clone(),
             interrupt_at: seams.remote_interrupt_at.clone(),
             local_sdks: seams.local_sdks.clone(),
@@ -231,8 +238,8 @@ impl RemoteClient for RustClient {
         }
         let started = Instant::now();
         let one = self.watch_call.as_deref();
-        // With `--test-remote-watch-call`, the stall and ceiling seams are that one call's, and the run keeps its own.
-        let (stall_ms, timeout_ms) = if one.is_some() { (None, None) } else { (self.stall_ms, self.timeout_ms) };
+        // With `--test-remote-watch-call`, the stall seam is that one call's, and the run keeps its own.
+        let stall_ms = if one.is_some() { None } else { self.stall_ms };
         let (stall, raised) = watchdog::stall_window(call.stall, stall_ms);
         let mut attempt = Attempt {
             call,
@@ -242,7 +249,8 @@ impl RemoteClient for RustClient {
             limits: Limits {
                 started,
                 stall,
-                command: timeout_ms.map_or(Duration::from_secs(call.timeout), Duration::from_millis),
+                command: Duration::from_secs(call.timeout),
+                backstop: self.backstop_ms.map_or_else(|| watchdog::backstop(call.timeout), Duration::from_millis),
                 transfer: TRANSFER_CEILING,
                 bound: self.bound,
             },
@@ -264,6 +272,8 @@ impl RemoteClient for RustClient {
             lines: Vec::new(),
             problem: None,
             hang_said: false,
+            adjusted: None,
+            box_killed: None,
         };
         if let Some(line) = raised {
             attempt.say(line);
@@ -311,13 +321,15 @@ struct Prepared {
 pub(super) const TRANSFER_CEILING: Duration = Duration::from_mins(30);
 
 /// The attempt's clock, which the setup's calls count on, and the limits the client's calls are watched by: the stall window; the
-/// command's ceiling, `--timeout`, which only the run call is cut at; the transfer ceiling, which the setup's calls and
-/// each fetch after the run call are cut at; and the bound of the bounded calls, the `stop` and the `boot`.
+/// command's ceiling, `--timeout`, which the box counts in load-adjusted time and the backstop line names; the run
+/// call's backstop, which only the run call is cut at; the transfer ceiling, which the setup's calls and each fetch
+/// after the run call are cut at; and the bound of the bounded calls, the `stop` and the `boot`.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Limits {
     started: Instant,
     stall: Duration,
     command: Duration,
+    backstop: Duration,
     transfer: Duration,
     bound: Duration,
 }
@@ -330,15 +342,15 @@ impl Limits {
         let elapsed = now.saturating_duration_since(self.started);
         match watchdog::kill(idle, elapsed, self.stall, self.transfer)? {
             Kill::Stalled => Some(Cut::Watchdog(Kill::Stalled)),
-            Kill::TimedOut => Some(Cut::Ceiling(self.transfer)),
+            Kill::Backstop => Some(Cut::Ceiling(self.transfer)),
         }
     }
 }
 
 /// `--test-remote-watch-call`: the one call, `preflight`, `push`, `run`, `ls-remote`, `fetch` or `outputs`, that the
-/// stall window and the ceiling of `--test-stall-ms` and `--test-remote-timeout-ms` apply to, its ceiling counted from
-/// its own start: the command's ceiling for `run`, the transfer ceiling for any other. For `ls-remote`, which has a
-/// deadline rather than a stall window, the ceiling is that deadline.
+/// stall window of `--test-stall-ms` applies to, and the ceiling of `--test-remote-timeout-ms` for any call but `run`,
+/// counted from its own start: its transfer ceiling. For `ls-remote`, which has a deadline rather than a stall window,
+/// the ceiling is that deadline.
 #[derive(Clone, Copy)]
 struct OneCall<'c> {
     name: &'c str,
@@ -350,8 +362,8 @@ struct OneCall<'c> {
 #[derive(Clone, Copy, Debug)]
 pub(super) enum Watch {
     /// By the run's watchdog under these limits: killed once it sent nothing for the stall window, or it outlived the
-    /// command's ceiling counted from its own start, so a call made again after one that failed before the banner, and
-    /// the pause before it, count nothing against it: the run call.
+    /// run call's backstop counted from its own start, so a call made again after one that failed before the banner,
+    /// and the pause before it, count nothing against it: the run call.
     Run(Limits),
     /// Killed once it sent nothing for the stall window of these limits, or at the transfer ceiling counted from the
     /// attempt's start: the setup's calls, the preflight and the push.
@@ -381,7 +393,7 @@ impl Watch {
         match self {
             Watch::Run(limits) => {
                 let elapsed = now.saturating_duration_since(begun);
-                watchdog::kill(idle, elapsed, limits.stall, limits.command).map(Cut::Watchdog)
+                watchdog::kill(idle, elapsed, limits.stall, limits.backstop).map(Cut::Watchdog)
             }
             Watch::Setup(limits) => limits.setup_cut(now, idle),
             Watch::Fetch(limits, _) if idle >= limits.stall => Some(Cut::Silent(limits.stall)),
@@ -456,6 +468,10 @@ pub(super) struct Called {
     started: bool,
     /// The reason the box's refusal tag for the run named on standard error, the first when it said more than one.
     refused: Option<FallbackReason>,
+    /// The kill the box's kill tag for the run named on standard error, the last when it said more than one.
+    box_killed: Option<BoxKill>,
+    /// The load-adjusted seconds the box's last adjusted line on standard error said.
+    adjusted: Option<f64>,
     /// The bytes its job had written at the last look, for a call whose watch caps them; `None` for any other call, or
     /// when no look succeeded.
     written: Option<u64>,
@@ -527,6 +543,11 @@ pub(super) struct Attempt<'c, 'a> {
     problem: Option<String>,
     /// Whether the run call said its hang hint, which an attempt says once.
     hang_said: bool,
+    /// The load-adjusted seconds the box said it counted for the command, `None` until the run call that counts said
+    /// them.
+    adjusted: Option<f64>,
+    /// The kill the box's kill tag named, set only when the run call ended as the box's own kill.
+    box_killed: Option<BoxKill>,
 }
 
 /// How a run call ended ([`Attempt::run_call`]): its end, the last standard error line of the call that counts that is
@@ -552,6 +573,8 @@ impl Attempt<'_, '_> {
             snapshot: &snapshot.commit,
             outputs: sent.globs,
             full: sent.full,
+            timeout: self.call.timeout,
+            host: self.call.host,
         };
         let run_line = payload::capped("run", payload::line("run", &payload::run_word(&location, &run))).map_err(End::Failed)?;
         let prepared = self.preflight(&location)?;
@@ -778,8 +801,8 @@ impl Attempt<'_, '_> {
 
     /// The limits the call `name` is watched by: the attempt's, whose clock the setup's calls count on; the run call and
     /// the fetches count from their own start ([`Watch`]). For the one call `--test-remote-watch-call` names, the seams'
-    /// stall window and ceiling, the ceiling counted from now: the command's for `run`, the transfer ceiling for any
-    /// other.
+    /// stall window and, for any call but `run`, whose backstop has a seam of its own, its transfer ceiling, counted
+    /// from now.
     pub(super) fn limits_for(&self, name: &str) -> Limits {
         let mut limits = self.limits;
         let Some(one) = self.one_call.filter(|one| one.name == name) else {
@@ -788,11 +811,7 @@ impl Attempt<'_, '_> {
         limits.stall = one.stall.unwrap_or(limits.stall);
         if let Some(ceiling) = one.ceiling {
             limits.started = Instant::now();
-            if name == "run" {
-                limits.command = ceiling;
-            } else {
-                limits.transfer = ceiling;
-            }
+            limits.transfer = ceiling;
         }
         limits
     }
@@ -824,7 +843,8 @@ impl Attempt<'_, '_> {
         let nonce: Arc<str> = Arc::from(nonce);
         let mut heard = None;
         let mut names_skipped = false;
-        // The command's time counts from the start of the call that counts, as its ceiling does.
+        let mut adjusted = None;
+        // The command's time counts from the start of the call that counts, as its backstop does.
         let mut begun = None;
         let made = self.run_call_made(location, limits, |attempt| {
             begun = Some(Instant::now());
@@ -837,9 +857,11 @@ impl Attempt<'_, '_> {
             let called = attempt.ssh(line, Echo::Console, Watch::Run(limits), raise, run)?;
             heard.clone_from(&called.outputs_line);
             names_skipped = called.names_skipped;
+            adjusted = called.adjusted;
             Ok(called)
         });
         self.split.command = begun.map_or(Duration::ZERO, |begun| begun.elapsed());
+        self.adjusted = adjusted;
         let end = made?;
         Ok(RunEnd {
             end,
@@ -872,9 +894,21 @@ impl Attempt<'_, '_> {
         self.lines.append(&mut called.lines);
         let output = kept..self.lines.len();
         if let Some(Cut::Watchdog(kill)) = called.cut {
-            self.say(watchdog::kill_line(kill, limits.stall, limits.command));
+            self.say(watchdog::kill_line(
+                kill,
+                limits.stall,
+                limits.backstop,
+                limits.command.as_secs(),
+                self.call.host,
+            ));
             self.noted(&called);
             self.stop(location);
+            return Ok(End::Killed);
+        }
+        // The box killed the command itself and said so: its job is already ended, so nothing is stopped.
+        if let Some(kill) = called.box_killed.filter(|_| called.status == KILLED) {
+            self.noted(&called);
+            self.box_killed = Some(kill);
             return Ok(End::Killed);
         }
         if again {
@@ -1297,6 +1331,8 @@ impl Attempt<'_, '_> {
             detail: self.problem,
             brought_back: self.brought_back,
             split: self.split,
+            adjusted: self.adjusted,
+            box_killed: self.box_killed,
         }
     }
 }
@@ -1325,6 +1361,8 @@ impl<'c, 'a> Attempt<'c, 'a> {
             lines: Vec::new(),
             problem: None,
             hang_said: false,
+            adjusted: None,
+            box_killed: None,
         }
     }
 }
@@ -1337,6 +1375,7 @@ impl Limits {
             started: Instant::now(),
             stall: Duration::from_secs(3600),
             command: Duration::from_secs(3600),
+            backstop: Duration::from_secs(3600),
             transfer: Duration::from_secs(3600),
             bound: Duration::from_secs(30),
         }
@@ -1401,6 +1440,8 @@ fn called_of(ended: CallEnd, raised: Raised, mut heard: Heard) -> Result<Called,
         names_skipped: heard.names_skipped,
         started: heard.started,
         refused: heard.refused,
+        box_killed: heard.box_killed,
+        adjusted: heard.adjusted,
         written: None,
     })
 }
@@ -1708,13 +1749,16 @@ struct Heard {
     names_skipped: bool,
     started: bool,
     refused: Option<FallbackReason>,
+    box_killed: Option<BoxKill>,
+    adjusted: Option<f64>,
     problem: Option<String>,
 }
 
 impl Heard {
     /// Keeps one `line` of standard error when `error`, else of standard output, cut to the cap: a heartbeat, and the
-    /// box's start marker or refusal tag its reader read the line as, `protocol`, only mark the first error line, the
-    /// latter two also marking the run started or refused.
+    /// box's start marker, refusal tag, kill tag or adjusted line its reader read the line as, `protocol`, only mark
+    /// the first error line, the latter four also marking the run started, refused or killed by the box, or the
+    /// load-adjusted seconds it counted ([`Heard::marked`]).
     fn record(&mut self, line: &str, error: bool, protocol: Option<Protocol>) {
         let line = watchdog::truncated(line);
         if error {
@@ -1722,20 +1766,32 @@ impl Heard {
         } else {
             self.output_seen = true;
         }
-        match protocol {
-            Some(Protocol::Started) => {
-                self.started = true;
-                return;
-            }
-            Some(Protocol::Refused(reason)) => {
-                self.refused.get_or_insert(reason);
-                return;
-            }
-            None => {}
+        if let Some(protocol) = protocol {
+            self.marked(protocol);
+            return;
         }
         if error && is_heartbeat(line) {
             return;
         }
+        self.kept_line(line, error);
+    }
+
+    /// Marks what the box's line read as `protocol` says: the run started, its first refusal, its last kill tag, its last
+    /// load-adjusted seconds.
+    fn marked(&mut self, protocol: Protocol) {
+        match protocol {
+            Protocol::Started => self.started = true,
+            Protocol::Refused(reason) => {
+                self.refused.get_or_insert(reason);
+            }
+            Protocol::Killed(kill) => self.box_killed = Some(kill),
+            Protocol::Adjusted(seconds) => self.adjusted = Some(seconds),
+        }
+    }
+
+    /// Keeps `line`, already cut, of standard error when `error`: the last error line, the outputs line and the skipped
+    /// names it may be, and the line among those kept for the log.
+    fn kept_line(&mut self, line: &str, error: bool) {
         if error {
             self.last_error = Some(line.to_owned());
         }
@@ -1947,8 +2003,8 @@ struct Reading {
 }
 
 impl Reading {
-    /// The box's start marker or refusal tag for the run that `line` is, of standard error when `error`; `None` for a
-    /// line of standard output, any line of a call that is no run call, and any other line.
+    /// The box's start marker, refusal tag, kill tag or adjusted line for the run that `line` is, of standard error when
+    /// `error`; `None` for a line of standard output, any line of a call that is no run call, and any other line.
     fn protocol(&self, line: &str, error: bool) -> Option<Protocol> {
         self.lines.as_deref().filter(|_| error).and_then(|lines| lines.of(line))
     }
@@ -2227,6 +2283,18 @@ fn line_of(bytes: &[u8], echo: Echo) -> String {
     line.to_owned()
 }
 
+/// The seconds `text` spells when it is exactly what the box's adjusted line carries: one or more digits, a point and
+/// three digits, making a finite number of seconds; `None` for anything else, a whole part too long for a double
+/// included.
+fn adjusted_seconds(text: &str) -> Option<f64> {
+    let (whole, decimals) = text.split_once('.')?;
+    let digits = |text: &str| !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit());
+    if !(digits(whole) && decimals.len() == 3 && digits(decimals)) {
+        return None;
+    }
+    text.parse::<f64>().ok().filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
+}
+
 /// Whether `line` is exactly the box's heartbeat: its prefix and one or more digits.
 fn is_heartbeat(line: &str) -> bool {
     line.strip_prefix(HEARTBEAT)
@@ -2349,18 +2417,27 @@ pub(super) fn first_bytes(text: &str, most: usize) -> &str {
 }
 
 /// A line the box says on a run call's standard error for the client alone, besides its heartbeat: the start marker
-/// said just before the command starts, or a refusal tag and the fallback reason it names.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// said just before the command starts, a refusal tag and the fallback reason it names, a kill tag and the kill it
+/// names, or the adjusted line and the load-adjusted seconds it carries.
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum Protocol {
     Started,
     Refused(FallbackReason),
+    /// The box's kill tag, said just after its kill line.
+    Killed(BoxKill),
+    /// The box's adjusted line, said once the command's readers drained.
+    Adjusted(f64),
 }
 
-/// The start marker and the two refusal tags of one run, made once for its run call's readers.
+/// The start marker, the two refusal tags, the two kill tags and the adjusted line's prefix of one run, made once for
+/// its run call's readers.
 struct ProtocolLines {
     started: String,
     busy: String,
     tools: String,
+    timed_out: String,
+    backstop: String,
+    adjusted: String,
 }
 
 impl ProtocolLines {
@@ -2370,21 +2447,30 @@ impl ProtocolLines {
             started: started_line(nonce),
             busy: refused_line(nonce, Refusal::Busy),
             tools: refused_line(nonce, Refusal::Tools),
+            timed_out: killed_line(nonce, BoxKill::TimedOut),
+            backstop: killed_line(nonce, BoxKill::Backstop),
+            adjusted: adjusted_prefix(nonce),
         }
     }
 
-    /// What `line`, compared as a whole line, is of the run: its start marker or one of its refusal tags; `None` for
-    /// any other line, another run's marker or tag included, as for a command's own line.
+    /// What `line`, compared as a whole line, is of the run: its start marker, one of its refusal tags, one of its kill
+    /// tags or its adjusted line with seconds the line may carry ([`adjusted_seconds`]); `None` for any other line,
+    /// another run's marker, tag or adjusted line included, as for a command's own line.
     fn of(&self, line: &str) -> Option<Protocol> {
-        if line == self.started {
-            Some(Protocol::Started)
-        } else if line == self.busy {
-            Some(Protocol::Refused(FallbackReason::Busy))
-        } else if line == self.tools {
-            Some(Protocol::Refused(FallbackReason::Tools))
-        } else {
-            None
-        }
+        [
+            (&self.started, Protocol::Started),
+            (&self.busy, Protocol::Refused(FallbackReason::Busy)),
+            (&self.tools, Protocol::Refused(FallbackReason::Tools)),
+            (&self.timed_out, Protocol::Killed(BoxKill::TimedOut)),
+            (&self.backstop, Protocol::Killed(BoxKill::Backstop)),
+        ]
+        .into_iter()
+        .find_map(|(tag, protocol)| (line == tag.as_str()).then_some(protocol))
+        .or_else(|| {
+            line.strip_prefix(self.adjusted.as_str())
+                .and_then(adjusted_seconds)
+                .map(Protocol::Adjusted)
+        })
     }
 }
 
@@ -2444,7 +2530,7 @@ mod tests {
     use crate::remote::snapshot::Snapshot;
     use crate::remote::transport::Local;
     use crate::remote::watchdog::{self, Kill, LOG_CAP};
-    use crate::remote::{Refusal, RemoteCall, busy_line, refused_line, started_line};
+    use crate::remote::{Refusal, RemoteCall, adjusted_line, busy_line, refused_line, started_line};
     use crate::run::CONTROL_C_EXIT;
 
     /// A state root no gate uses; no test here takes its key's lock.
@@ -2583,6 +2669,8 @@ mod tests {
             lines: Vec::new(),
             problem: None,
             hang_said: false,
+            adjusted: None,
+            box_killed: None,
         }
     }
 
@@ -2630,6 +2718,8 @@ mod tests {
             names_skipped: false,
             started: false,
             refused: None,
+            box_killed: None,
+            adjusted: None,
             written: None,
         }
     }
@@ -2899,6 +2989,7 @@ mod tests {
             started,
             stall: 10 * second,
             command: 60 * second,
+            backstop: 360 * second,
             transfer: 60 * second,
             bound: 30 * second,
         };
@@ -3392,6 +3483,7 @@ mod tests {
             started,
             stall: 10 * second,
             command: 60 * second,
+            backstop: 360 * second,
             transfer: 90 * second,
             bound: 30 * second,
         };
@@ -3431,14 +3523,19 @@ mod tests {
             Some(Cut::TooLong)
         );
         assert_eq!(
-            Watch::Run(limits).cut(started + 60 * second, begun, second, Raised::default(), None),
+            Watch::Run(limits).cut(begun + 60 * second, begun, second, Raised::default(), None),
             None,
-            "the command's ceiling does not count the time before the run call"
+            "the box counts the command's ceiling, so the run call is not cut at it"
         );
         assert_eq!(
-            Watch::Run(limits).cut(begun + 60 * second, begun, second, Raised::default(), None),
-            Some(Cut::Watchdog(Kill::TimedOut)),
-            "the run call at the command's ceiling, counted from its own start"
+            Watch::Run(limits).cut(started + 360 * second, begun, second, Raised::default(), None),
+            None,
+            "the backstop does not count the time before the run call"
+        );
+        assert_eq!(
+            Watch::Run(limits).cut(begun + 360 * second, begun, second, Raised::default(), None),
+            Some(Cut::Watchdog(Kill::Backstop)),
+            "the run call at its backstop, counted from its own start"
         );
         assert_eq!(
             Watch::Setup(limits).cut(started + 60 * second, begun, second, Raised::default(), None),
@@ -3474,6 +3571,7 @@ mod tests {
             started,
             stall: 10 * second,
             command: 60 * second,
+            backstop: 360 * second,
             transfer: 60 * second,
             bound: 30 * second,
         };
@@ -3643,6 +3741,42 @@ mod tests {
         let (another, said) = run_call_said("", &format!("{other}\n"), "another-marker");
         assert!(!another.started, "another run's marker is a line like any other");
         assert_eq!(said, format!("{other}\n"), "and is passed on");
+    }
+
+    #[test]
+    fn the_adjusted_line_is_read_from_this_run_s_line_on_standard_error_alone_with_finite_seconds() {
+        let huge = format!("{}.000", "9".repeat(400));
+        let cases: [(&str, String, String, Option<f64>); 9] = [
+            ("adjusted", String::new(), format!("{}\n", adjusted_line(NONCE, 72.25)), Some(72.25)),
+            (
+                "the-last-wins",
+                String::new(),
+                format!("{}\n{}\n", adjusted_line(NONCE, 1.0), adjusted_line(NONCE, 2.5)),
+                Some(2.5),
+            ),
+            ("stdout", format!("{}\n", adjusted_line(NONCE, 1.0)), String::new(), None),
+            (
+                "other-nonce",
+                String::new(),
+                format!("{}\n", adjusted_line("fedcba9876543210fedcba9876543210", 1.0)),
+                None,
+            ),
+            ("no-nonce", String::new(), "gate-remote-adjusted: 1.000\n".to_owned(), None),
+            ("two-decimals", String::new(), format!("gate-remote-adjusted: {NONCE} 1.00\n"), None),
+            ("negative", String::new(), format!("gate-remote-adjusted: {NONCE} -1.000\n"), None),
+            ("infinite", String::new(), format!("gate-remote-adjusted: {NONCE} {huge}\n"), None),
+            ("padded", String::new(), format!("{} \n", adjusted_line(NONCE, 1.0)), None),
+        ];
+        for (name, stdout, stderr, adjusted) in cases {
+            let (called, said) = run_call_said(&stdout, &stderr, name);
+            assert_eq!(called.adjusted, adjusted, "{name}");
+            if adjusted.is_some() {
+                assert_eq!(said, "", "this run's adjusted line is not passed on: {name}");
+                assert!(called.lines.is_empty(), "nor kept: {name}");
+            } else {
+                assert_eq!(said, format!("{stdout}{stderr}"), "any other line is passed on: {name}");
+            }
+        }
     }
 
     #[test]

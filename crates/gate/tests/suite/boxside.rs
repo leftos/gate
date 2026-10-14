@@ -2723,3 +2723,228 @@ fn box_run_a_record_that_is_a_folder_fails_with_status_1() {
     assert!(!marker.exists(), "the command never ran");
     wait_until_closed(Path::new(field(&payload, "Lock")));
 }
+
+/// A command the box's ceiling cases run that never ends on its own within any case's time.
+const ENDLESS: &[&str] = &[FAKE_TOOL, "err", "started", "sleep", "600000"];
+
+/// `gate box run` of `payload` with `seams` before the verb, to its end.
+fn run_box_with_seams(case: &Case, payload: &Value, seams: &[&str]) -> Outcome {
+    let word = self::payload(payload);
+    let mut args = vec!["box"];
+    args.extend_from_slice(seams);
+    args.extend(["run", word.as_str()]);
+    finish(box_command(case, &args))
+}
+
+/// The lines of `outcome`'s stderr that start with `prefix`.
+fn lines_starting<'a>(outcome: &'a Outcome, prefix: &str) -> Vec<&'a str> {
+    outcome.stderr.lines().filter(|line| line.starts_with(prefix)).collect()
+}
+
+/// The seconds of the one `gate-remote-adjusted:` line in `outcome`'s stderr, which names the nonce of `payload` and
+/// has three decimals.
+fn adjusted_seconds(outcome: &Outcome, payload: &Value) -> f64 {
+    let adjusted = Regex::new(&format!(r"^gate-remote-adjusted: {} (\d+\.\d{{3}})$", field(payload, "Nonce"))).expect("the pattern compiles");
+    let lines = lines_starting(outcome, "gate-remote-adjusted:");
+    assert_eq!(lines.len(), 1, "one adjusted line: {outcome:?}");
+    assert!(adjusted.is_match(lines[0]), "this run's adjusted line, of three decimals: {outcome:?}");
+    let captures = adjusted.captures(lines[0]).expect("it matched");
+    captures[1].parse().expect("the seconds are a number")
+}
+
+#[test]
+fn box_run_past_its_load_adjusted_ceiling_is_killed_with_the_ruled_line_and_124() {
+    let case = Case::new("box_run_ceiling_kill");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "mark", "new.txt", "err", "started", "sleep", "600000"]);
+    payload["Timeout"] = json!(1);
+    payload["Host"] = json!("builder");
+    snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
+
+    // The whole machine free, so the clock runs with wall time however loaded the machine running the case is.
+    let outcome = run_box_with_seams(&case, &payload, &["--test-box-sample-ms", "20", "--test-box-free-percent", "100"]);
+
+    assert_eq!(outcome.code, Some(124), "{outcome:?}");
+    let kill = Regex::new(
+        r"^gate: TIMED OUT on builder after 1 s of load-adjusted time \(wall \d+ s, machine free 100% on average\); killed .+ and its children$",
+    )
+    .expect("the pattern compiles");
+    let said: Vec<&str> = outcome.stderr.lines().collect();
+    let at = said.iter().position(|line| kill.is_match(line));
+    assert!(at.is_some(), "the kill line: {outcome:?}");
+    let at = at.expect("it is there");
+    assert_eq!(
+        said.get(at + 1).copied(),
+        Some(format!("gate-remote-killed: {} timed-out", field(&payload, "Nonce")).as_str()),
+        "the kill tag right after the kill line: {outcome:?}"
+    );
+    assert!(adjusted_seconds(&outcome, &payload) >= 1.0, "the clock reached the ceiling: {outcome:?}");
+    assert!(
+        Path::new(field(&payload, "Work")).join("new.txt").exists(),
+        "the killed command changed the tree"
+    );
+    assert!(
+        !has_ref(&payload, "refs/gate-back/k"),
+        "a killed command's tree gets no back commit: {outcome:?}"
+    );
+    wait_until_closed(Path::new(field(&payload, "Lock")));
+}
+
+#[test]
+fn a_box_kill_of_a_payload_with_no_host_names_no_builder() {
+    let case = Case::new("box_run_ceiling_no_host");
+    let mut payload = box_payload(&case, "k", ENDLESS);
+    payload["Timeout"] = json!(1);
+    snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
+
+    let outcome = run_box_with_seams(&case, &payload, &["--test-box-sample-ms", "20", "--test-box-free-percent", "100"]);
+
+    assert_eq!(outcome.code, Some(124), "{outcome:?}");
+    let kill =
+        Regex::new(r"^gate: TIMED OUT after 1 s of load-adjusted time \(wall \d+ s, machine free 100% on average\); killed .+ and its children$")
+            .expect("the pattern compiles");
+    assert!(
+        outcome.stderr.lines().any(|line| kill.is_match(line)),
+        "the kill line without a host: {outcome:?}"
+    );
+    assert!(!outcome.stderr.contains("TIMED OUT on"), "{outcome:?}");
+    wait_until_closed(Path::new(field(&payload, "Lock")));
+}
+
+#[test]
+fn a_loaded_box_lets_a_command_run_past_its_wall_ceiling_while_under_its_adjusted_one() {
+    let case = Case::new("box_run_ceiling_loaded");
+    // 3.5 s of wall time past a 3 s ceiling; at 5% free the clock counts a twentieth of it.
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "sleep", "3500", "out", "done", "exit", "0"]);
+    payload["Timeout"] = json!(3);
+    payload["Host"] = json!("builder");
+    snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
+
+    let outcome = run_box_with_seams(&case, &payload, &["--test-box-sample-ms", "20", "--test-box-free-percent", "5"]);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(outcome.stdout, "done\n", "{outcome:?}");
+    assert!(lines_starting(&outcome, "gate-remote-killed:").is_empty(), "{outcome:?}");
+    assert!(adjusted_seconds(&outcome, &payload) < 3.0, "under the ceiling: {outcome:?}");
+    wait_until_closed(Path::new(field(&payload, "Lock")));
+}
+
+#[test]
+fn a_box_whose_sampler_fails_kills_only_at_the_backstop_and_says_no_adjusted_time() {
+    let case = Case::new("box_run_ceiling_sampler_failed");
+    let mut payload = box_payload(&case, "k", ENDLESS);
+    payload["Timeout"] = json!(1);
+    payload["Host"] = json!("builder");
+    snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
+
+    let outcome = run_box_with_seams(&case, &payload, &["--test-box-sample-ms", "20", "--test-box-sampler-fail", "true"]);
+
+    assert_eq!(outcome.code, Some(124), "{outcome:?}");
+    assert_eq!(
+        lines_starting(&outcome, "gate: sampler failed:"),
+        ["gate: sampler failed: --test-box-sampler-fail makes every sample fail (test seam only); watching by wall time only"],
+        "said once: {outcome:?}"
+    );
+    assert!(
+        lines_starting(&outcome, "gate: TIMED OUT").is_empty(),
+        "no wall-time ceiling: {outcome:?}"
+    );
+    let backstop = Regex::new(concat!(
+        r"^gate: BACKSTOP on builder: (\d+) s of wall time \(5 x 1 s ceiling, machine load unknown: the sampler failed\); ",
+        r"killed .+ and its children$",
+    ))
+    .expect("the pattern compiles");
+    let said: Vec<&str> = outcome.stderr.lines().collect();
+    let at = said.iter().position(|line| backstop.is_match(line));
+    assert!(at.is_some(), "the backstop line: {outcome:?}");
+    let at = at.expect("it is there");
+    let wall: u64 = backstop.captures(said[at]).expect("it matched")[1].parse().expect("whole seconds");
+    assert!(wall >= 5, "five ceilings of wall time: {outcome:?}");
+    assert_eq!(
+        said.get(at + 1).copied(),
+        Some(format!("gate-remote-killed: {} backstop", field(&payload, "Nonce")).as_str()),
+        "{outcome:?}"
+    );
+    assert!(lines_starting(&outcome, "gate-remote-adjusted:").is_empty(), "{outcome:?}");
+    wait_until_closed(Path::new(field(&payload, "Lock")));
+}
+
+#[test]
+fn a_payload_with_no_timeout_gives_the_command_no_ceiling_on_the_box() {
+    let case = Case::new("box_run_ceiling_none");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "sleep", "1500", "out", "done", "exit", "0"]);
+    snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
+
+    let outcome = run_box_with_seams(&case, &payload, &["--test-box-sample-ms", "20", "--test-box-free-percent", "100"]);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(
+        outcome.stderr,
+        format!("{}\n", started_line(&payload)),
+        "no kill and no adjusted line: {outcome:?}"
+    );
+    wait_until_closed(Path::new(field(&payload, "Lock")));
+}
+
+#[test]
+fn a_box_run_that_ends_by_itself_says_its_load_adjusted_seconds() {
+    let case = Case::new("box_run_ceiling_adjusted");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "err", "e1", "exit", "3"]);
+    payload["Timeout"] = json!(600);
+    payload["Host"] = json!("builder");
+    snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
+
+    let outcome = run_box(&case, &payload);
+
+    assert_eq!(outcome.code, Some(3), "the command's own status: {outcome:?}");
+    assert!(adjusted_seconds(&outcome, &payload) < 600.0, "{outcome:?}");
+    assert!(lines_starting(&outcome, "gate-remote-killed:").is_empty(), "{outcome:?}");
+    let said: Vec<&str> = outcome.stderr.lines().collect();
+    let output = said.iter().position(|line| *line == "e1");
+    let adjusted = said.iter().position(|line| line.starts_with("gate-remote-adjusted:"));
+    assert!(
+        output.is_some() && output < adjusted,
+        "the adjusted line comes after the command's drained output: {outcome:?}"
+    );
+}
+
+#[test]
+fn a_box_kill_that_leaves_a_process_says_a_note_then_still_the_kill_line_and_tag_and_124() {
+    let case = Case::new("box_run_ceiling_kill_leaves");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "err", "drained", "sleep", "600000"]);
+    payload["Timeout"] = json!(1);
+    payload["Host"] = json!("builder");
+    snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
+
+    let seams = [
+        "--test-box-sample-ms",
+        "20",
+        "--test-box-free-percent",
+        "100",
+        "--test-box-kill-leaves",
+        "1",
+    ];
+    let outcome = run_box_with_seams(&case, &payload, &seams);
+
+    assert_eq!(outcome.code, Some(124), "a kill whatever its ending left: {outcome:?}");
+    let note = Regex::new(r"^gate: note: the box's ceiling kill left 1 process\(es\) running in job \S+$").expect("the pattern compiles");
+    let kill = Regex::new(r"^gate: TIMED OUT on builder after 1 s of load-adjusted time ").expect("the pattern compiles");
+    let said: Vec<&str> = outcome.stderr.lines().collect();
+    let drained = said.iter().position(|line| *line == "drained");
+    let noted = said.iter().position(|line| note.is_match(line));
+    let killed = said.iter().position(|line| kill.is_match(line));
+    assert!(
+        drained.is_some() && noted.is_some() && killed.is_some(),
+        "the output, the note and the kill line: {outcome:?}"
+    );
+    assert!(
+        drained < noted && noted < killed,
+        "the drained output, then the note, then the kill line: {outcome:?}"
+    );
+    let at = killed.expect("it is there");
+    assert_eq!(
+        said.get(at + 1).copied(),
+        Some(format!("gate-remote-killed: {} timed-out", field(&payload, "Nonce")).as_str()),
+        "the kill tag right after the kill line: {outcome:?}"
+    );
+    wait_until_closed(Path::new(field(&payload, "Lock")));
+}

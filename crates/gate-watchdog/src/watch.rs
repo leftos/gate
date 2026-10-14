@@ -467,14 +467,26 @@ impl Kill {
     /// The line the gate says for this kill, with `spoken` the command's words joined by single spaces.
     #[must_use]
     pub fn line(&self, spoken: &str) -> String {
+        self.said(spoken, "")
+    }
+
+    /// The line a builder says for this kill of the command `spoken` it ran for a PC that calls it `host`: the gate's
+    /// own line with ` on {host}` after its verdict words, `TIMED OUT on {host} after …`.
+    #[must_use]
+    pub fn line_on(&self, spoken: &str, host: &str) -> String {
+        self.said(spoken, &format!(" on {host}"))
+    }
+
+    /// The line for this kill, `place` right after its verdict words.
+    fn said(&self, spoken: &str, place: &str) -> String {
         match *self {
             Kill::Stalled { quiet, free_percent } => format!(
-                "gate: STALLED: no output and no CPU for {} s (machine free {free_percent}% on average); \
+                "gate: STALLED{place}: no output and no CPU for {} s (machine free {free_percent}% on average); \
                  killed {spoken} and its children",
                 quiet.as_secs_f64().round_ties_even()
             ),
             Kill::TimedOut { timeout, wall, free_percent } => format!(
-                "gate: TIMED OUT after {timeout} s of load-adjusted time (wall {} s, machine free \
+                "gate: TIMED OUT{place} after {timeout} s of load-adjusted time (wall {} s, machine free \
                  {free_percent}% on average); killed {spoken} and its children",
                 wall.as_secs_f64().round_ties_even()
             ),
@@ -484,7 +496,7 @@ impl Kill {
                 adjusted,
                 free_percent,
             } => format!(
-                "gate: BACKSTOP: {} s of wall time (5 x {timeout} s ceiling, {}); killed {spoken} and its children",
+                "gate: BACKSTOP{place}: {} s of wall time (5 x {timeout} s ceiling, {}); killed {spoken} and its children",
                 wall.as_secs_f64().round_ties_even(),
                 machine_load(adjusted, free_percent)
             ),

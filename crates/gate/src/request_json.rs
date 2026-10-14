@@ -33,6 +33,7 @@ pub(crate) fn run(request: &RunRequest, log: &Path, root: &ResolvedRoot) -> Stri
         "remoteInterruptAt": seams.remote_interrupt_at,
         "remoteWatchCall": seams.remote_watch_call,
         "remoteTimeoutMs": seams.remote_timeout_ms,
+        "remoteBackstopMs": seams.remote_backstop_ms,
         "remoteOutputsBudgetBytes": seams.remote_outputs_budget_bytes,
         "ownStartFails": seams.own_start_fails,
         "parentJobTrusted": seams.parent_job_trusted,

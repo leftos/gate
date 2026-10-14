@@ -133,7 +133,7 @@ impl Ending {
     }
 
     /// Says why a terminate of the job `name` after the first failed, when one did.
-    fn say_late(&self, name: &str, console: &mut Console) {
+    pub(crate) fn say_late(&self, name: &str, console: &mut Console) {
         if let Some(error) = &self.late {
             console.err(&format!("gate: remote could not terminate job {name} again: {error}"));
         }

@@ -43,6 +43,7 @@ fn print_request_shows_the_new_cli_request() {
         "remoteInterruptAt": null,
         "remoteWatchCall": null,
         "remoteTimeoutMs": null,
+        "remoteBackstopMs": null,
         "remoteOutputsBudgetBytes": null,
         "ownStartFails": false,
         "parentJobTrusted": false,

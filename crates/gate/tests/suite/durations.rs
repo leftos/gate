@@ -1190,5 +1190,5 @@ fn a_routed_auto_run_without_builder_adjusted_seconds_runs_on_its_floor() {
     assert_eq!(recorded["timeout"], 900, "{recorded}");
     assert!(outcome.stderr.contains("gate: expected about 14 min"), "{outcome:?}");
     assert!(!outcome.stderr.contains("gate: ceiling"), "{outcome:?}");
-    assert!(outcome.stdout.contains(" s of ceiling 900 s; push "), "{outcome:?}");
+    assert!(outcome.stdout.contains(", ceiling 900 s; command "), "{outcome:?}");
 }

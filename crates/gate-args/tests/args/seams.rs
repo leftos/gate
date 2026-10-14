@@ -468,7 +468,16 @@ fn the_remote_watch_seams_name_one_call_and_a_ceiling() {
     );
     let words = with(
         &RUN,
-        &["--test-remote-transport", "local:b", "--test-remote-timeout-ms", "300", "--", "cmd"],
+        &[
+            "--test-remote-transport",
+            "local:b",
+            "--test-remote-watch-call",
+            "fetch",
+            "--test-remote-timeout-ms",
+            "300",
+            "--",
+            "cmd",
+        ],
     );
     assert_eq!(run_request(&refs(&words)).test_seams.remote_timeout_ms, Some(300));
     let words = with(
@@ -642,6 +651,10 @@ fn the_remote_client_seams_that_conflict_are_refused() {
             "gate: --test-remote-log-cap-bytes needs --test-remote-transport",
         ),
         (
+            &["--test-remote-backstop-ms", "300"][..],
+            "gate: --test-remote-backstop-ms needs --test-remote-transport",
+        ),
+        (
             &["--test-remote-snapshot", "--test-remote-transport", "local:b"][..],
             "gate: --test-remote-snapshot cannot be given with --test-remote-transport",
         ),
@@ -659,6 +672,141 @@ fn the_remote_client_seams_that_conflict_are_refused() {
             "gate: --test-remote-retry-pause-ms needs --test-remote-transport"
         ],
         "each seam that needs the transport is named"
+    );
+}
+
+#[cfg(feature = "test-seams")]
+#[test]
+fn the_remote_timeout_seam_needs_a_watched_call_other_than_run() {
+    use crate::support::run_request;
+
+    const NEEDS: &str = "gate: --test-remote-timeout-ms needs --test-remote-watch-call naming a call other than run";
+    let given = |words: &[&'static str]| -> Vec<String> {
+        let words: Vec<&str> = ["--test-remote-transport", "local:b"]
+            .into_iter()
+            .chain(words.iter().copied())
+            .chain(["--", "cmd"])
+            .collect();
+        with(&RUN, &words)
+    };
+    for words in [
+        &["--test-remote-timeout-ms", "300"][..],
+        &["--test-remote-watch-call", "run", "--test-remote-timeout-ms", "300"][..],
+    ] {
+        assert_eq!(problems(&refs(&given(words))), [NEEDS], "{words:?}");
+    }
+    assert_eq!(
+        problems(&refs(&given(&["--test-remote-watch-call", "stop", "--test-remote-timeout-ms", "300"]))),
+        ["gate: --test-remote-watch-call must be preflight, push, run, ls-remote, fetch or outputs, got 'stop'"],
+        "a refused watched call says its own problem alone"
+    );
+    let fetch = run_request(&refs(&given(&["--test-remote-watch-call", "fetch", "--test-remote-timeout-ms", "300"])));
+    assert_eq!(fetch.test_seams.remote_timeout_ms, Some(300), "another call takes the seam");
+    let stall = run_request(&refs(&given(&["--test-remote-watch-call", "run", "--test-stall-ms", "300"])));
+    assert_eq!(stall.test_seams.stall_ms, Some(300), "the run call still takes the stall seam");
+    let given = with(
+        &RUN,
+        &["--test-remote-transport", "local:b", "--test-remote-backstop-ms", "300", "--", "cmd"],
+    );
+    assert_eq!(
+        run_request(&refs(&given)).test_seams.remote_backstop_ms,
+        Some(300),
+        "the backstop seam is read"
+    );
+}
+
+#[cfg(feature = "test-seams")]
+#[test]
+fn box_seams_of_the_ceiling_refuse_a_bad_missing_or_repeated_value() {
+    let rows: [(&[&str], &[&str]); 14] = [
+        (
+            &["box", "--test-box-kill-leaves", "0", "run", "e30="],
+            &["gate: --test-box-kill-leaves must be a whole number above 0, got '0'"],
+        ),
+        (
+            &["box", "--test-box-kill-leaves=", "run", "e30="],
+            &["gate: --test-box-kill-leaves needs a value"],
+        ),
+        (
+            &["box", "--test-box-kill-leaves"],
+            &["gate: --test-box-kill-leaves needs a value", BOX_USAGE],
+        ),
+        (
+            &["box", "--test-box-kill-leaves", "1", "--test-box-kill-leaves=2", "run", "e30="],
+            &["gate: --test-box-kill-leaves is given twice"],
+        ),
+        (&["box", "run", "--test-box-kill-leaves", "1", "e30="], &[BOX_USAGE]),
+        (
+            &["box", "--test-box-sample-ms", "0", "run", "e30="],
+            &["gate: --test-box-sample-ms must be a whole number above 0, got '0'"],
+        ),
+        (
+            &["box", "--test-box-sample-ms=", "run", "e30="],
+            &["gate: --test-box-sample-ms needs a value"],
+        ),
+        (&["box", "--test-box-sample-ms"], &["gate: --test-box-sample-ms needs a value", BOX_USAGE]),
+        (
+            &["box", "--test-box-sample-ms", "1", "--test-box-sample-ms=2", "run", "e30="],
+            &["gate: --test-box-sample-ms is given twice"],
+        ),
+        (
+            &["box", "--test-box-sampler-fail", "maybe", "run", "e30="],
+            &["gate: --test-box-sampler-fail takes true or false, got 'maybe'"],
+        ),
+        (
+            &["box", "--test-box-free-percent", "0", "run", "e30="],
+            &["gate: --test-box-free-percent must be a whole number from 1 to 100, got '0'"],
+        ),
+        (
+            &["box", "--test-box-free-percent", "101", "run", "e30="],
+            &["gate: --test-box-free-percent must be a whole number from 1 to 100, got '101'"],
+        ),
+        (
+            &["box", "--test-box-free-percent", "5", "--test-box-free-percent=6", "run", "e30="],
+            &["gate: --test-box-free-percent is given twice"],
+        ),
+        (
+            &["box", "--test-box-free-percent=", "run", "e30="],
+            &["gate: --test-box-free-percent needs a value"],
+        ),
+    ];
+    for (words, want) in rows {
+        assert_eq!(problems(words), want, "{words:?}");
+    }
+}
+
+#[cfg(feature = "test-seams")]
+#[test]
+fn box_seams_of_the_ceiling_are_read_before_the_verb() {
+    use std::ffi::OsString;
+
+    use gate_args::{BoxRequest, BoxSeams, BoxVerb, Invocation};
+
+    use crate::support::invocation;
+
+    assert_eq!(
+        invocation(&[
+            "box",
+            "--test-box-sample-ms",
+            "20",
+            "--test-box-sampler-fail=true",
+            "--test-box-free-percent",
+            "5",
+            "--test-box-kill-leaves=3",
+            "run",
+            "e30="
+        ]),
+        Invocation::Box(BoxRequest {
+            verb: BoxVerb::Run,
+            payload: OsString::from("e30="),
+            seams: BoxSeams {
+                sample_ms: Some(20),
+                sampler_fail: true,
+                free_percent: Some(5),
+                kill_leaves: Some(3),
+                ..BoxSeams::default()
+            },
+        })
     );
 }
 
@@ -958,6 +1106,7 @@ fn box_seam_console_and_park_launch_are_read_before_the_verb() {
                 park_launch: Some(PathBuf::from(r"X:\case\park")),
                 outputs_budget_bytes: None,
                 dotnet_limit_ms: None,
+                ..BoxSeams::default()
             },
         }),
         "the seams come in any order before the verb"
@@ -1027,6 +1176,16 @@ fn box_seam_console_and_park_launch_are_unknown_words_without_the_feature() {
     assert_eq!(problems(&["box", "--test-box-console=fail-before", "run", "e30="]), [BOX_USAGE]);
     assert_eq!(problems(&["box", "--test-box-park-launch", "park", "run", "e30="]), [BOX_USAGE]);
     assert_eq!(problems(&["box", "--test-box-park-launch=park", "run", "e30="]), [BOX_USAGE]);
+    for (seam, value) in [
+        ("--test-box-sample-ms", "20"),
+        ("--test-box-sampler-fail", "true"),
+        ("--test-box-free-percent", "5"),
+        ("--test-box-kill-leaves", "1"),
+    ] {
+        assert_eq!(problems(&["box", seam, value, "run", "e30="]), [BOX_USAGE], "{seam}");
+        let joined = format!("{seam}={value}");
+        assert_eq!(problems(&["box", joined.as_str(), "run", "e30="]), [BOX_USAGE], "{joined}");
+    }
 }
 
 #[cfg(feature = "test-seams")]
@@ -1153,6 +1312,7 @@ fn seam_flags_are_unknown_without_the_feature() {
         "--test-remote-interrupt-at",
         "--test-remote-watch-call",
         "--test-remote-timeout-ms",
+        "--test-remote-backstop-ms",
         "--test-local-sdks",
         "--test-dotnet-limit-ms",
         "--test-remote-fetch-cap-bytes",

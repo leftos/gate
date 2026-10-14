@@ -83,7 +83,8 @@ pub(crate) fn bare(root: &str, repo: &str) -> String {
 /// What a run call carries beside the location: the words the builder runs, the folder below the work folder they run
 /// in, the run's outputs nonce, the snapshot the box checks out, the output globs the run brings back (none asks for no
 /// outputs), and whether every file under them counts as changed (`OutputsFull`), as after an outputs step that did not
-/// complete.
+/// complete; the run's ceiling in whole seconds, which the box counts in load-adjusted time (`Timeout`), and the PC's
+/// name for the builder, which the box's kill line names (`Host`).
 pub(crate) struct RunCall<'a> {
     pub words: &'a [String],
     pub subfolder: &'a str,
@@ -91,6 +92,8 @@ pub(crate) struct RunCall<'a> {
     pub snapshot: &'a str,
     pub outputs: &'a [String],
     pub full: bool,
+    pub timeout: u64,
+    pub host: &'a str,
 }
 
 /// The payload word of the preflight, and of every verb that reads only the location.
@@ -120,6 +123,8 @@ pub(crate) fn run_word(location: &Location, run: &RunCall<'_>) -> String {
         ("Nonce", json!(run.nonce)),
         ("OutputsFull", json!(run.full)),
         ("Snapshot", json!(run.snapshot)),
+        ("Timeout", json!(run.timeout)),
+        ("Host", json!(run.host)),
     ] {
         object.insert(name.to_owned(), value);
     }
@@ -228,6 +233,8 @@ mod tests {
             snapshot: sha,
             outputs: &[],
             full: false,
+            timeout: 300,
+            host: "builder",
         };
         let mut expected = preflight;
         let extra = json!({
@@ -243,6 +250,8 @@ mod tests {
             "Nonce": "n1",
             "OutputsFull": false,
             "Snapshot": sha,
+            "Timeout": 300,
+            "Host": "builder",
         });
         for (name, value) in extra.as_object().expect("an object") {
             expected[name] = value.clone();
@@ -261,6 +270,8 @@ mod tests {
             snapshot: "0123456789abcdef0123456789abcdef01234567",
             outputs: &globs,
             full: true,
+            timeout: 1,
+            host: "builder",
         };
 
         let sent = decoded(&run_word(&location(), &run));

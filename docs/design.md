@@ -246,7 +246,7 @@ Further modes arrive as subcommands of the same binary, each designed with its i
 | `N` | The command's own non-zero status, passed through whole: the gate exits with the command's 32-bit exit code (300 stays 300; 0xFFFFFFFF reads as -1 where a caller reads it signed), and the FAILED line and the journal show it signed (a routed run whose connection was lost reports 255, RC7). |
 | 1 | The command exited 0 but its log holds a failure marker (never with `--no-markers`, V2); or the gate itself failed after the command started (X4); or it failed before queueing (the working directory, the command's environment, the log's folder or an earlier log that cannot be removed); or a routed run passed but its changes or outputs could not be brought back (RC9, D1). |
 | 2 | Usage: a missing, unknown or invalid input; a `.cmd` or `.bat` word the gate refuses (C5); a `--log` inside the state root; a critical gate under a heavy or light slot marker (K7). Nothing is queued. `gate box` also uses 2 for a refused payload and for a refused subfolder or batch word ([The box side](#the-box-side)). |
-| 124 | The watchdog killed the command: STALLED, TIMED OUT or BACKSTOP (X2); or a routed run's fetch outlived its transfer ceiling: TRANSFER TIMED OUT. |
+| 124 | The watchdog killed the command: STALLED, TIMED OUT or BACKSTOP (X2), for a routed run by the builder (TIMED OUT, BACKSTOP) or the client (STALLED, BACKSTOP); or a routed run's fetch outlived its transfer ceiling: TRANSFER TIMED OUT. |
 | 127 | The command could not be started (C7); the slot is released at once. `gate box run` uses it for the same failure. |
 | 75 | A builder refused a routed run (`gate box`): busy (`gate box run` finding its work folder's lock held), unreachable, parity, rebooted, tools, version. The PC side reads the refusal and falls back to a local run, so a caller sees 75 only as a command's own status, or as a refusal that carried no reason (T5). |
 
@@ -258,7 +258,7 @@ Every line the gate says is written and flushed as it is said, never held until 
 
 | Line | Where | Meaning |
 |---|---|---|
-| `gate: STALLED: ...`, `gate: TIMED OUT ...`, `gate: BACKSTOP: ...` | at line start in the log and on stderr | The watchdog killed the command; the exit is 124. Match `^gate: (STALLED\|TIMED OUT\|BACKSTOP)`. A gate wrapping a gate reports the inner kill through its own marker scan (V2). |
+| `gate: STALLED: ...`, `gate: TIMED OUT ...`, `gate: BACKSTOP: ...` | at line start in the log and on stderr | The watchdog killed the command; the exit is 124. Match `^gate: (STALLED\|TIMED OUT\|BACKSTOP)`. A routed run's builder says `gate: TIMED OUT on <host> after ...` and `gate: BACKSTOP on <host>: ...` ([Routing](#routing)). A gate wrapping a gate reports the inner kill through its own marker scan (V2). |
 | `gate: TRANSFER TIMED OUT after <n> s fetching the outputs` (or `fetching the sync-back`) | at line start in the log and on stderr | A routed run's fetch after the command outlived its transfer ceiling of 1800 s, counted from the fetch's own start; the exit is 124 and the release verdict `transfer-timed-out`. It is a failure marker of the log scan; it does not match the `TIMED OUT` of the command's ceiling. |
 | `gate: waiting for the machine (critical)` | stderr | A critical gate is queued and waiting for the machine (K5); the stable part is the prefix, and the status after it is prose. A critical gate that takes the machine at once says nothing. |
 | `Full output: <path>` | the end of the verdict line: `gate: passed in ... Full output: <path>` on stdout, `gate: FAILED (status <n>). Full output: <path>` on stderr | Where the whole log is (V3). |
@@ -302,9 +302,11 @@ The lines of a run that starts its command:
 
   A Ctrl+C while the client waits to start ends the gate the same way with no slot to release, and journals an `abandon` after the `queue` line, not a `release`.
 
-  A routed run that passed says `gate: passed in <w> s on <host> (command <c> s of ceiling <n> s; push <p> s[, sync-back <s> s][, outputs <o> s]). Full output: <log>`, with no load-adjusted time.
+  A routed run that passed says `gate: passed in <w> s on <host> (load-adjusted <a> s, ceiling <n> s; command <c> s, push <p> s[, sync-back <s> s][, outputs <o> s]). Full output: <log>`, with `past its ceiling of <n> s` in place of `ceiling <n> s` as the local line has it.
 
-  In it `<w>` is the attempt's whole wall time; `<c>` is the run call's own time, which `--timeout` bounds; the push is always named, the sync-back and the outputs fetch only when they ran, in the order they ran, each in whole seconds rounded half to even. The client's status is the gate's own, passed through as `N`.
+  In it `<w>` is the attempt's whole wall time; `<a>` is the load-adjusted time the builder counted for the command, the clock `--timeout` bounds; `<c>` is the run call's own wall time; the push is always named, the sync-back and the outputs fetch only when they ran, in the order they ran, each in whole seconds rounded half to even.
+
+  With no figure from the builder (its sampler failed) the clause reads `load-adjusted unknown: the sampler failed` and the past-ceiling check uses `<c>`. The client's status is the gate's own, passed through as `N`.
 - A critical gate, on stderr and in the log: the `waiting for the machine (critical)`, `still waiting for the machine (critical)`, `holds the machine (critical)` and `interrupted while waiting for the machine` lines, in [Critical drain and nesting](#critical-drain-and-nesting).
 - Nesting, on stderr and in the log, from the slot marker in the gate's environment: the `running under` (including the lend's `while a critical request drains`), `ignored GATE_SLOT_HELD`, `could not judge GATE_SLOT_HELD` and `does not cover` lines, the barrier's `waiting for a heavy slot behind the critical request` and `waiting for a light slot beside the critical request` lines, and the refusal of a critical gate, all in [Critical drain and nesting](#critical-drain-and-nesting).
 
@@ -614,7 +616,7 @@ Fields beyond J1's:
 - `release`: `avgCores`, `peakCores`, `freeCores`, optional numbers of one decimal after `adjustedSeconds` and before `verdict` ([Cores hint](#cores-hint)). They are omitted when there is no unpaused sample, the sampler failed, the read of the command's CPU at its end failed, a gate under the run took a slot of its own (or the machine), the journal could not be read to tell, or the run was routed.
 
   Covered and lent runs write no `release`, except a covered run that took a slot late, which writes one when it lets that slot go: its `slots` the one it took, its `heldSeconds` counted from that take.
-- `release`: `wallSeconds` (the command's wall time less the seconds paused behind a critical request; a routed run's whole remote wall time), `adjustedSeconds` (load-adjusted seconds, 3 decimals, a number for every run that started; null for a routed run and for a run whose sampler failed) and `verdict`, one of `passed`, `failed`, `log-failure`, `stalled`, `timed-out`, `backstop`, `transfer-timed-out`, `unknown` (kept, J5).
+- `release`: `wallSeconds` (the command's wall time less the seconds paused behind a critical request; a routed run's whole remote wall time), `adjustedSeconds` (load-adjusted seconds, 3 decimals, a number for every run that started; for a routed run the builder's figure, null when it said none; null for a run whose sampler failed) and `verdict`, one of `passed`, `failed`, `log-failure`, `stalled`, `timed-out`, `backstop`, `transfer-timed-out`, `unknown` (kept, J5).
 
   `transfer-timed-out` is a routed run's fetch after the command cut at its transfer ceiling.
 
@@ -622,7 +624,7 @@ Fields beyond J1's:
 - `fallback`: `reason`, one of `full` (no remote slot within the 60 s wait), `busy`, `unreachable`, `parity`, `rebooted`, `tools` (T5), `version` ([The box side](#the-box-side)) and `client` (the remote client could not start, as when it finds no usable ssh).
 
   The `take` after it is the run's local one, untagged, its `waitedSeconds` counted from the `fallback`, except after `full`, where it counts from the run's `queue` line; a Ctrl+C that ends that local wait writes the same figure on its `abandon`.
-- a routed run's `take`, `release` and `abandon` carry the tag; its `release` has `adjustedSeconds` null and a `wallSeconds` of the whole remote call.
+- a routed run's `take`, `release` and `abandon` carry the tag; its `release` has the builder's `adjustedSeconds` (null when it said none) and a `wallSeconds` of the whole remote call, and the verdict `timed-out` or `backstop` after a kill by the builder or by the client's backstop.
 
 The verdict comes from the run's end: a kill line matching `^gate: (STALLED|TIMED OUT|BACKSTOP|TRANSFER TIMED OUT)\b` gives `stalled`, `timed-out`, `backstop` or `transfer-timed-out`; otherwise a command status of 0 with a non-zero gate status is `log-failure`, a status of 0 is `passed`, anything else `failed`; `unknown` when there are no run facts.
 
@@ -843,7 +845,9 @@ All kept, with each knob's default unchanged:
   A failure inside the gate while the command runs terminates the job and ends the escaped processes first (X4); one after the command's own exit ends none of them.
 - **Run end.** Once the command exits, clean or failing, and before the verdict is reached, the gate ends every process the command left in its job, with exit code 124 (`end_leftovers` in `crates/gate/src/run.rs`), so a leftover's last output is in the log the verdict's marker scan reads and a `gate: cannot end the run's job: …` line comes before the verdict line. The exit status and verdict are unchanged.
 
-  It spares every job member whose image is `gate.exe` (compared ASCII case-insensitively): a covered gate the command left running (GATE-101's late slot), a nested gate on its own slot, and any program named `gate.exe`. Each is spared with its process tree, its own job (looked up under the ender's state root, then under the default root, `Local\gate-job-<pid>`, so a nested gate on the default root is found by an ender on another `--state-dir`) and each process above it that is a member of the job (its launcher, such as `cmd` or `pwsh`, hung or not, up to the first process that is not a member, the command's own).
+  It spares every job member whose image is `gate.exe` (compared ASCII case-insensitively): a covered gate the command left running (GATE-101's late slot), a nested gate on its own slot, and any program named `gate.exe`.
+
+  Each is spared with its process tree, its own job (looked up under the ender's state root, then under the default root, `Local\gate-job-<pid>`, so a nested gate on the default root is found by an ender on another `--state-dir`) and each process above it that is a member of the job (its launcher, such as `cmd` or `pwsh`, hung or not, up to the first process that is not a member, the command's own).
 
   Each spared gate ends its own job when its own command exits, and its launcher waits on it.
 
@@ -919,6 +923,8 @@ The arithmetic (stall progress, the free share, the clock, the three kills and t
 
 `<p>` is the free share averaged over the wall time the ceiling counted (paused seconds left out), a whole number rounded half to even, 100 while nothing is counted; the seconds are rounded the same way. After a sampler failure only the backstop is read.
 
+A builder counts a routed run's ceiling with the same arithmetic ([The box side](#the-box-side)) and says the lines with the host: `gate: TIMED OUT on <host> after <timeout> s of load-adjusted time (...)` and `gate: BACKSTOP on <host>: <wall> s of wall time (...)`, the host left out (`gate: TIMED OUT after ...`) when the payload names none; its stall stays the client's.
+
 The box heartbeat (BW9) is the box wrapper's command-time heartbeat, not the wait heartbeat: a pump thread writes `gate-remote-heartbeat: <cpu ms>` every period, and while a command is watched only when the CPU used since the last beat is at least 1% of the time elapsed since it. A failed CPU read writes `gate: remote heartbeat stopped: <message>` and ends the heartbeats, never the run. `gate box run` is the crate's caller ([The box side](#the-box-side)).
 
 ## Command launching
@@ -982,7 +988,11 @@ The box heartbeat (BW9) is the box wrapper's command-time heartbeat, not the wai
 
   The start-failure message is the system message for the CreateProcessW error code, as `Win32Exception.Message` gives it, with no `(os error N)` suffix. That failure alone maps to status 127; every other start failure is the gate's own.
 - **Priority.** BelowNormal, or the gate's own class when that is already BelowNormal or Idle; High for a critical gate and any gate under a critical marker (kept, P2).
-- **Environment.** Every command gets the gate's environment with these set over it (names compared case-insensitively): `GATE_SLOT_HELD=<kind>:<pid>:<start_ms>[:<h>]` (the held slot's marker, `none` too, or the parent's for a covered gate), `SharedCompilationId` and `MSBUILDNODEHANDSHAKESALT`, both the run id, `MSBUILDUSESERVER=0` (over an inherited value), `DOTNET_CLI_USE_MSBUILD_SERVER=0` (kept, P3), `MSBUILDDISABLENODEREUSE=1` (over an inherited value), and `GATE_STATE_DIR=<root>` under a non-default root. Under the default root an inherited `GATE_STATE_DIR` is removed. The gate's own environment is never changed.
+- **Environment.**
+
+  Every command gets the gate's environment with these set over it (names compared case-insensitively): `GATE_SLOT_HELD=<kind>:<pid>:<start_ms>[:<h>]` (the held slot's marker, `none` too, or the parent's for a covered gate), `SharedCompilationId` and `MSBUILDNODEHANDSHAKESALT`, both the run id, `MSBUILDUSESERVER=0` (over an inherited value), `DOTNET_CLI_USE_MSBUILD_SERVER=0` (kept, P3), `MSBUILDDISABLENODEREUSE=1` (over an inherited value), and `GATE_STATE_DIR=<root>` under a non-default root.
+
+  Under the default root an inherited `GATE_STATE_DIR` is removed. The gate's own environment is never changed.
 
   The run id is `gate-{pid}-{start ms}`, with `-{root hash}` added under a non-default state root. Each nested gate has its own id. So each run gets its own .NET compiler server, and MSBuild's node reuse is off: with it on, the nodes idle about 15 minutes inside the command's job, so anything in the command waiting on its whole tree would hang. The gate ends what the run left at its [end](#watchdog).
 
@@ -1193,9 +1203,15 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
     The builder keeps one bare repo per repo name, `<builder root>/<repo>.git`, shared by every key of that repo; the key is only the ref's name.
 
     The size is read from git's last `Writing objects: 100%` line, ignoring `remote:` lines, and only a number with a unit (or `bytes`) counts as one, else the line says `up to date`. Failure says `gate: pushing the snapshot to <url> failed (status <n>)` and falls back `unreachable`.
-  - **Run call.** The line goes over `ssh -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=4 -o ForwardAgent=no -o ClearAllForwardings=yes -o Compression=yes -- <host> <line>`, each argument separate. The last option is the run call's alone: the preflight, stop, boot and outputs calls, git's ssh command and `gate push` ask for none. The run call's compression covers both directions of its connection: the command's output and protocol lines one way, the run line and the outputs manifest the other.
+  - **Run call.** The line goes over `ssh -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=4 -o ForwardAgent=no -o ClearAllForwardings=yes -o Compression=yes -- <host> <line>`, each argument separate.
 
-    The box's output passes through to the log and the console, except the box's heartbeats and its two machine lines, which the client hides from both and keeps out of the lines it holds: the start marker `gate-remote-started: <nonce>` and the refusal tag `gate-remote-refused: <nonce> busy|tools`, each naming this run's `Nonce` and read on stderr only, as a whole line.
+    The last option is the run call's alone: the preflight, stop, boot and outputs calls, git's ssh command and `gate push` ask for none. The run call's compression covers both directions of its connection: the command's output and protocol lines one way, the run line and the outputs manifest the other.
+
+    The box's output passes through to the log and the console, except the box's heartbeats and its machine lines, which the client hides from both and keeps out of the lines it holds: the start marker `gate-remote-started: <nonce>` and the refusal tag `gate-remote-refused: <nonce> busy|tools`, each naming this run's `Nonce` and read on stderr only, as a whole line, and the kill tag and the adjusted line below.
+
+    The kill tag `gate-remote-killed: <nonce> timed-out|backstop` is said by the box just after its own kill line, and the client counts a box kill only on this run's tag with a status 124 (a status 124 alone is also what a stopped job or the command itself may end with). The client takes the run's verdict from the tag's kind, never from the log's last kill line.
+
+    The adjusted line `gate-remote-adjusted: <nonce> <s.sss>` carries the load-adjusted seconds the box counted, said once the command's output has drained unless the sampler failed, read like the tag on stderr only and the last one winning; another run's, a malformed one or one whose seconds are not a finite number is a line like any other.
 
     A status 75 is a refusal only when this run's refusal tag came on stderr before any start marker (`busy` or `tools`, the fallback reason); a tag after the marker is ignored, so a command that prints the human busy or tools line, or a tag of its own, and exits 75 ends with status 75 and no fallback.
 
@@ -1350,7 +1366,11 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
   - **Outputs install.** In `remote/install.rs`, after a whole fetch. The archive is unpacked through `outputs::archive::unpack` into a stage `<worktree>\.tmp\<key>-<nonce>` with the box's 50 GiB `OUTPUTS_BUDGET` (one shared constant) as the decompressed limit; a stage folder that was there before the install is not removed.
 
-    The unpack also makes each copy the archive lists in the stage, from the first earlier member with that content, else from the first path of the run's manifest whose file still hashes to it (the stamp is not checked; a source whose final path lies outside the PC worktree root, through a junction for one, is passed over), so the stage holds every listed file and the checks and moves below treat a copy as any other member. Each copy's bytes count against the 50 GiB limit and the 50,000-file limit and add to the disk peak. A copy that no member and no PC file can supply refuses the install (`no PC file still holds the content of <path>, SHA-256 <hex>: tried <p1> (<why>), … and <n> more`, at most 5 paths named, each why being missing, not a plain file, outside the root, `unreadable: <OS message>` or other content), which keeps the pending marker. Ctrl+C is honoured between 64 KiB buffers of a copy, and says `the unpack was stopped while its copies were made`.
+    The unpack also makes each copy the archive lists in the stage, from the first earlier member with that content, else from the first path of the run's manifest whose file still hashes to it (the stamp is not checked; a source whose final path lies outside the PC worktree root, through a junction for one, is passed over), so the stage holds every listed file and the checks and moves below treat a copy as any other member.
+
+    Each copy's bytes count against the 50 GiB limit and the 50,000-file limit and add to the disk peak.
+
+    A copy that no member and no PC file can supply refuses the install (`no PC file still holds the content of <path>, SHA-256 <hex>: tried <p1> (<why>), … and <n> more`, at most 5 paths named, each why being missing, not a plain file, outside the root, `unreadable: <OS message>` or other content), which keeps the pending marker. Ctrl+C is honoured between 64 KiB buffers of a copy, and says `the unpack was stopped while its copies were made`.
 
     Before any move, in order, each member is checked against the run's output globs, against the manifest (the file must still have its size and last write; a file the manifest lacked that now exists counts as changed), for being writable, and against the worktree's git index (Tracked members, below).
 
@@ -1425,19 +1445,25 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
   Two pre-banner failures of the run call fall back `unreachable`; the sync-back's `ls-remote` and `fetch` are retried the same way, and two failures of either end the run with status 1.
 
-  **The watchdog** (`remote/watchdog.rs`, `remote/client.rs`) watches the preflight, the push, the run call, the sync-back's fetch and the outputs fetch by the run's stall window and two ceilings (the command's and the transfer ceiling) on three clocks.
+  **The watchdog** (`remote/watchdog.rs`, `remote/client.rs`) watches the preflight, the push, the run call, the sync-back's fetch and the outputs fetch by the run's stall window and two limits (the run call's backstop and the transfer ceiling) on three clocks.
 
-  The setup (the preflight and the push) is cut at the transfer ceiling, 1800 s whatever `--timeout` says, counted from the attempt's start. The run call is cut at `--timeout`, in wall seconds, counted from the run call's own start, so a slow push does not use the command's time. Each fetch after the run call, the sync-back's and the outputs', is cut at the transfer ceiling counted from its own start.
+  The setup (the preflight and the push) is cut at the transfer ceiling, 1800 s whatever `--timeout` says, counted from the attempt's start.
+
+  The ceiling itself is counted by the builder ([The box side](#the-box-side), `run`), in load-adjusted time from the command's start, so a slow push does not use the command's time. The run call is cut only at its backstop, 5 x `--timeout` + 60 s of wall time counted from the run call's own start, for a box that cannot end its run. Each fetch after the run call, the sync-back's and the outputs', is cut at the transfer ceiling counted from its own start.
 
   A `--stall` under 15 s is raised to 15 for a remote run (the box's heartbeats come every 5 s) and says `gate: --stall <n> raised to 15 for a remote run (heartbeats come every 5 s)`. It looks every quarter of the window, at most once a second.
 
-  A killed run call says `gate: STALLED: no output or remote CPU for <n> s` or `gate: TIMED OUT after <n> s`, stops the command on the builder and ends the run with status 124, with no fallback. A killed preflight or push never started the command, so an early stall says `gate: remote <host> unreachable: <the call> stalled` (or `outlived its transfer ceiling of 1800 s`) and falls back `unreachable`, with no kill line and no exit 124.
+  A run call killed by the client says `gate: STALLED: no output or remote CPU for <n> s` or `gate: BACKSTOP on <host>: no end after <w> s of wall time (5 x the <n> s ceiling + 60 s); killed the run call and stopped the command`, stops the command on the builder and ends the run with status 124, with no fallback.
+
+  A command the builder killed ends the run the same way as a client kill, with the verdict `timed-out` or `backstop` the kill tag names, but with no stop call (the box already ended the job), no sync-back fetch and no outputs fetch, the outputs pending marker kept; the kill line is the box's own, read from the log.
+
+  A killed preflight or push never started the command, so an early stall says `gate: remote <host> unreachable: <the call> stalled` (or `outlived its transfer ceiling of 1800 s`) and falls back `unreachable`, with no kill line and no exit 124.
 
   A fetch after the run call cut at its transfer ceiling says `gate: TRANSFER TIMED OUT after 1800 s fetching the outputs` (or `fetching the sync-back`), ends the run with status 124 and journals `transfer-timed-out` after a command that passed; after a command that failed, the line is said and the run keeps the command's status and the verdict `failed`.
 
   **The stop** is a `stop` call to the builder's `gate box`, made after a kill and after a Ctrl+C that ended a call that may have started the command. It is bounded to 30 s, is retried once after a pre-banner failure while 5 s of the bound would be left, and runs on a hidden console of its own (`CREATE_NO_WINDOW`), so a second Ctrl+C cannot end it.
 
-  After a Ctrl+C, and before the stop call, the client says once `gate: stopping the command on <host> (up to <n> s)` to stderr and the log, with `<n>` the stop's bound in whole seconds, rounded up (30 by default); a second Ctrl+C adds nothing. A stall or ceiling kill, and a Ctrl+C after a lost connection, say no such line.
+  After a Ctrl+C, and before the stop call, the client says once `gate: stopping the command on <host> (up to <n> s)` to stderr and the log, with `<n>` the stop's bound in whole seconds, rounded up (30 by default); a second Ctrl+C adds nothing. A stall or backstop kill, a kill by the builder, and a Ctrl+C after a lost connection, say no such line.
 
   The stop says `gate: stopping the command on <host> did not finish in <n> s` or `gate: stopping the command on <host> failed (status <n>)`; the run ends the same either way.
 
@@ -1496,15 +1522,17 @@ A routed run first learns the builder's gate version; when its whole version tex
 
 Builders are configured only in the local `%LOCALAPPDATA%\gate\remote.json`. The repo, its docs and its tests name no builder; the suite's remote cases run against a stub.
 
-The box keeps the PowerShell wrapper's lines for the verbs and the refusals, and adds two tagged machine lines the wrapper never emits: the start marker and the refusal tags (Run call, in [Routing](#routing)). `gate box` is what the Rust remote client calls on a builder, so it runs whenever a routed run goes through the remote client.
+The box keeps the PowerShell wrapper's lines for the verbs and the refusals, and adds tagged machine lines the wrapper never emits: the start marker, the refusal tags, the kill tag and the adjusted line (Run call, in [Routing](#routing)). `gate box` is what the Rust remote client calls on a builder, so it runs whenever a routed run goes through the remote client.
 
 Each verb is one ssh call today, and the call's cost is its connection, not its work. Measured warm, setup takes about 2.1 s (TCP about 0.2 s, key exchange and auth 1.5 s, the session 0.4 s) against 0.2 to 1.0 s of verb work, so a routed run's three verb calls spend about 6.4 s, 30 to 37% of a 17 to 26 s routed build, before its git transfers pay the same again.
 
 A routed run therefore moves to one long-lived connection carrying every verb, `gate box serve`, and the per-call client stays until that lands (GATE-70 holds the measurement, and GATE-109 the work).
 
-The payload is one base64 word (standard alphabet, padded) of UTF-8 JSON holding the wrapper's keys: `Key`, `Bare`, `Work`, `Lock`, `Index`, `OutputFolder` and `Job`, and for `run` also `Command`, `Subfolder`, `Identity`, `Outputs`, `Nonce` and `OutputsFull`, and for `outputs` also `Name`. `inflight` reads only `Root`.
+The payload is one base64 word (standard alphabet, padded) of UTF-8 JSON holding the wrapper's keys: `Key`, `Bare`, `Work`, `Lock`, `Index`, `OutputFolder` and `Job`, and for `run` also `Command`, `Subfolder`, `Identity`, `Outputs`, `Nonce`, `OutputsFull`, `Timeout` and `Host`, and for `outputs` also `Name`. `inflight` reads only `Root`.
 
 Unknown keys are ignored, and `Outputs`, `OutputsFull` and `OutputFolder`, which the outputs transport owns (GATE-44), are read only by `run` (the outputs) and `outputs` (`Name`, `OutputFolder`); `preflight`, `stop` and `boot` ignore them.
+
+`Timeout` is the run's ceiling in whole seconds, 1 to 2147483647, which the box counts in load-adjusted time; absent or null means no box ceiling and no adjusted line, and anything else is refused before the lock with `gate: box payload Timeout is not a whole number of seconds` and exit 2. `Host` is the PC's `remote.json` name for the builder, which the box's kill lines name, control characters escaped; absent leaves it out of them.
 
 For `run` the payload also needs a `Snapshot` key: exactly 40 lowercase hex characters, the commit the run checks out. Anything else is refused before the lock and the checkout with `gate: remote run payload's Snapshot '<value>' is not a 40-hex commit sha` and exit 2.
 
@@ -1512,15 +1540,27 @@ The value is empty for a missing key or JSON null, the string as given with cont
 
 Every path comes from the payload and nothing is written under the gate's state root; `gate box` takes no `--state-dir`. Test seams are `test-seams`-gated flags, never environment variables, and sit before the verb (`gate box --test-... run <payload>`) in a `BoxSeams` struct on `BoxRequest`, apart from the `gate run` seams, so `--test-print-request` is unchanged.
 
-The box seams go in any order before the verb, each also as `--<seam>=<value>`. `--test-heartbeat-ms <n>` sets the period of the command heartbeat, and `--test-box-console fail-before` makes the command's UTF-8 console fail before the command starts (the only accepted value, else `gate: --test-box-console must be fail-before, got '<value>'`). `--test-box-token refused` makes the start with the command's restricted token fail as refused, so the box falls back to its own token (the only accepted value, else `gate: --test-box-token must be refused, got '<value>'`).
+The box seams go in any order before the verb, each also as `--<seam>=<value>`. `--test-heartbeat-ms <n>` sets the period of the command heartbeat, and `--test-box-console fail-before` makes the command's UTF-8 console fail before the command starts (the only accepted value, else `gate: --test-box-console must be fail-before, got '<value>'`).
+
+`--test-box-token refused` makes the start with the command's restricted token fail as refused, so the box falls back to its own token (the only accepted value, else `gate: --test-box-token must be refused, got '<value>'`).
 
 `--test-box-park-launch <path>` parks the launch after the donor is in the job and before the output lock, writes the empty file `<path>.parked`, and goes on once `<path>` exists (at most 600 s).
 
+The box's ceiling has three seams: `--test-box-sample-ms <n>` replaces the 5 s sample period, in milliseconds, `--test-box-sampler-fail true|false` makes every sample fail (`true`), so only the backstop watches and no adjusted line is said, and `--test-box-free-percent <1-100>` makes the samples find that share of the machine free, so the load-adjusted clock runs at that share of wall time.
+
+`--test-box-kill-leaves <n>` stands in for the number of processes the last ending of a ceiling or backstop kill leaves (a whole number above 0), so the box says its note for a job that is still not ended.
+
 The other two box seams are `--test-outputs-budget-bytes <n>`, which replaces the 50 GiB outputs budget of the box's trim, in bytes, and `--test-dotnet-limit-ms <n>`, which replaces the 30 s bound of the preflight's `dotnet --list-sdks` read, in milliseconds.
 
-A seam is refused as the `gate run` seams are: no value, given twice, and for the heartbeat, the outputs budget and the dotnet limit not a whole number above 0 or above 2147483647 (`gate: --test-outputs-budget-bytes must be a whole number above 0, got '<v>'`, `... must be at most 2147483647 ...`, `... needs a value`, `... is given twice`). Without the feature each word gets the box usage line.
+A seam is refused as the `gate run` seams are: no value, given twice, and a value outside its rule (`gate: --test-outputs-budget-bytes must be a whole number above 0, got '<v>'`, `... must be at most 2147483647 ...`, `... needs a value`, `... is given twice`).
 
-The box gives each run's command its own build servers: the command's environment is the box's own with `SharedCompilationId` and `MSBUILDNODEHANDSHAKESALT` set to `gate-box-<Nonce>` (the payload's `Nonce`), `MSBUILDUSESERVER=0`, `DOTNET_CLI_USE_MSBUILD_SERVER=0` and `MSBUILDDISABLENODEREUSE=1`, each replacing any inherited value (names compared case-insensitively), so no other run's command, on the box or on the PC, uses the compiler server or the MSBuild nodes this one starts, and no node idles in the job after its build (an idle node would keep alive anything in the command that waits on its whole tree). The box's own git calls and tool restore do not get these settings.
+The rules: a whole number above 0 and at most 2147483647 for the heartbeat, the sample period, the outputs budget, the dotnet limit and the kill's leftover count, 1 to 100 for `--test-box-free-percent`, `true` or `false` for `--test-box-sampler-fail`. Without the feature each word gets the box usage line.
+
+The box gives each run's command its own build servers: the command's environment is the box's own with `SharedCompilationId` and `MSBUILDNODEHANDSHAKESALT` set to `gate-box-<Nonce>` (the payload's `Nonce`), `MSBUILDUSESERVER=0`, `DOTNET_CLI_USE_MSBUILD_SERVER=0` and `MSBUILDDISABLENODEREUSE=1`, each replacing any inherited value (names compared case-insensitively).
+
+So no other run's command, on the box or on the PC, uses the compiler server or the MSBuild nodes this one starts, and no node idles in the job after its build (an idle node would keep alive anything in the command that waits on its whole tree).
+
+The box's own git calls and tool restore do not get these settings.
 
 The servers a run starts live in its job and are ended at its end, so every routed build starts its own nodes and compiler server; none is kept warm between runs.
 
@@ -1545,7 +1585,23 @@ Built verbs:
   Past the bound the line reads `gate: remote could not read the SDK list: dotnet --list-sdks did not answer in 30 s`. The other `<message>`s are `dotnet --list-sdks wrote more than 16 MiB`, `dotnet --list-sdks exited with status <n>` and `cannot run dotnet: <why>`.
 - **`run`** runs the payload's `Command` (a list of texts) in `Work`, and exits with the command's own whole 32-bit status after a successful run. Its stdout is the command's stdout, LF-terminated; its stderr is the command's stderr plus the box's own lines.
 
-  The heartbeat: `gate box run` writes `gate-remote-heartbeat: <cpu ms>` on stderr every 5 s, on `gate-watchdog`'s `BeatClock` and `Pump`. Before the command starts (from just before the checkout) and after the command's wait ends it is not CPU-gated, so every period writes a beat, the first one period after it begins. While the command runs it writes only when the CPU of the command's job since the last beat reaches 1% of the time since it. The command's build servers are its run's own and run in the job, so a build server outside the job counts for nothing.
+  The heartbeat: `gate box run` writes `gate-remote-heartbeat: <cpu ms>` on stderr every 5 s, on `gate-watchdog`'s `BeatClock` and `Pump`. Before the command starts (from just before the checkout) and after the command's wait ends it is not CPU-gated, so every period writes a beat, the first one period after it begins.
+
+  While the command runs it writes only when the CPU of the command's job since the last beat reaches 1% of the time since it. The command's build servers are its run's own and run in the job, so a build server outside the job counts for nothing.
+
+  The ceiling: with a `Timeout` in the payload, the box watches the command from its start with the local watchdog's arithmetic (`boxside/ceiling.rs`; sampling every 5 s, demand every core at normal priority, the stall left to the client through the heartbeat).
+
+  At the load-adjusted ceiling it ends the job and says `gate: TIMED OUT on <host> after <n> s of load-adjusted time (wall <w> s, machine free <p>% on average); killed <command> and its children`; at 5 x the ceiling of wall time it says `gate: BACKSTOP on <host>: <w> s of wall time (5 x <n> s ceiling, load-adjusted <a> s, machine free <p>% on average); killed <command> and its children`, the clause reading `machine load unknown: the sampler failed` after a sampler failure.
+
+  At a kill the box ends the job and drains the command's output first, then says, in order, the kill line, `gate-remote-killed: <nonce> timed-out|backstop` and the adjusted line `gate-remote-adjusted: <nonce> <s.sss>`, and exits 124. It makes no back commit (`refs/gate-back/<key>`) and packs no outputs.
+
+  When ending the job fails or leaves processes, the box tries once more to end it. If the job is still not ended, it says first `gate: note: the box's ceiling|backstop kill left <n> process(es) running in job <job>` (or `gate: note: the box's ceiling|backstop kill could not end job <job>: <error>`), then the kill line, the tag and the adjusted line as on any kill, and exits 124: the run is still a kill.
+
+  A drain that ends with the output still held open says `gate: remote command's output is still held open by a leftover process; stopped reading`. A client gone during the kill drain gets the box's client-gone status, not a kill.
+
+  The PC journals a tagged kill with the tag's verdict whatever its log holds, applies no sync-back and fetches no outputs. A command's own exit 124 (no tag) is an ordinary status with a sync-back.
+
+  `gate-remote-adjusted: <nonce> <s.sss>` is also said as any watched command exits, once its output has drained, unless the sampler failed. A failed sample says `gate: sampler failed: <message>; watching by wall time only` and only the backstop is read from then on.
 
   The start marker: just before it launches the command, before the donor console and the launch, the box says `gate-remote-started: <nonce>` on stderr once, with the payload's `Nonce`; a launch then refused or stopped has said it too.
 
@@ -1611,11 +1667,15 @@ Built verbs:
 
   It is assigned to the payload's named job, which has no limits and no kill-on-close, and inherits exactly NUL, the two pipe write ends and a query-only handle to its job, as copies made under the spawn lock ([Command launching](#command-launching)). The box's git and dotnet calls start through `gate_win32::spawn`, under the same lock.
 
-  The command's token: it starts through `CreateProcessAsUserW` with a restricted copy of the box's token (`CreateRestrictedToken` with `LUA_TOKEN`), so it is not elevated, is lowered to Medium integrity when the box's is above it, has the user as default owner, and has a default DACL granting `GENERIC_ALL` to the user and SYSTEM. The console donor and keeper `cmd.exe` run with the same restricted token, so no elevated process shares the command's console. The box itself, its git calls and its tool restore keep the box's own token. The restriction gives a routed command the token a local run's command has; it is not a boundary against the command, whose code is trusted, since the box's elevated git and tool restore later read what the command wrote.
+  The command's token: it starts through `CreateProcessAsUserW` with a restricted copy of the box's token (`CreateRestrictedToken` with `LUA_TOKEN`), so it is not elevated, is lowered to Medium integrity when the box's is above it, has the user as default owner, and has a default DACL granting `GENERIC_ALL` to the user and SYSTEM.
+
+  The console donor and keeper `cmd.exe` run with the same restricted token, so no elevated process shares the command's console. The box itself, its git calls and its tool restore keep the box's own token. The restriction gives a routed command the token a local run's command has; it is not a boundary against the command, whose code is trusted, since the box's elevated git and tool restore later read what the command wrote.
 
   When the token cannot be made, or a start with it is refused and a start with the box's own token then works, the box prints `gate: the command runs with the builder session's own token: <error>` on stderr, after the start marker, and the command (with the donor and keeper) runs with the box's own token. A start refused with both tokens says only `could not start`.
 
-  The command's environment gains `GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_<n>=safe.directory` and `GIT_CONFIG_VALUE_<n>=*`, where n is the inherited count (0 when there is none) and the count grows by one. The inherited count is read as git reads it (leading whitespace, an optional `+`, decimal digits to the end, at most `i32::MAX`; an empty value is 0); a count git would refuse, or `i32::MAX` itself, leaves the environment unchanged. The work folders are owned by Administrators, which git refuses from a non-elevated token.
+  The command's environment gains `GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_<n>=safe.directory` and `GIT_CONFIG_VALUE_<n>=*`, where n is the inherited count (0 when there is none) and the count grows by one.
+
+  The inherited count is read as git reads it (leading whitespace, an optional `+`, decimal digits to the end, at most `i32::MAX`; an empty value is 0); a count git would refuse, or `i32::MAX` itself, leaves the environment unchanged. The work folders are owned by Administrators, which git refuses from a non-elevated token.
 
   Known cost: the first non-elevated build in each work folder starts fresh MSBuild nodes and compiler servers, since their handshake includes elevation. A command that creates symlinks needs Developer Mode on the builder, as on the PC; builder setup turns it on (`AllowDevelopmentWithoutDevLicense` = 1).
 
@@ -1627,9 +1687,13 @@ Built verbs:
 
   A job name already held prints `gate: the job <name> already exists; a run's job name must be new` and exits 1. A command that cannot start prints `gate: could not start <word>[ (<resolved>)]: <message>` and exits 127, the word and the resolved path with their control characters escaped; a failure of the gate after the start prints `gate: the gate failed while running the command: <problem>` and exits 1. If the box panics after the resume, the job is terminated with 124.
 
-  Output is forwarded from the pipes until both end. What the command left in its job is ended first (below), the console's donor excepted, so a leftover there holds no pipe open and costs no drain. A process the run's end spares, such as a live nested gate, can still hold a pipe open after the command ended: the box then stops reading after a 2 s drain and says `gate: remote command's output is still held open by a leftover process; stopped reading`. A pipe that cannot be read prints `gate: remote could not read the command's <stdout|stderr>: <error>`.
+  Output is forwarded from the pipes until both end. What the command left in its job is ended first (below), the console's donor excepted, so a leftover there holds no pipe open and costs no drain.
 
-  Once the command has exited, before the readers drain and before the outputs are listed, the box ends what the command left in its job, sparing live gates and console hosts as the local run end does, and the console's donor (a spared gate may still be using it; the box ends it itself once the wait for the command is over), with the passes the local run end uses (`end_leftovers`), under the state root a `gate run` with no `--state-dir` resolves. A failure says `gate: cannot end the run's job: <problem>` on stderr, the problem worded as the local run end words it (the pass cap's `<n> of its processes still ran after 5 passes; first: <first problem>` included); a state root that cannot be resolved says the fixed line `gate: cannot end the run's job: the box's state root cannot be resolved; ending the whole job` (no path) and the whole job is terminated. The run's status stands either way.
+  A process the run's end spares, such as a live nested gate, can still hold a pipe open after the command ended: the box then stops reading after a 2 s drain and says `gate: remote command's output is still held open by a leftover process; stopped reading`. A pipe that cannot be read prints `gate: remote could not read the command's <stdout|stderr>: <error>`.
+
+  Once the command has exited, before the readers drain and before the outputs are listed, the box ends what the command left in its job, sparing live gates and console hosts as the local run end does, and the console's donor (a spared gate may still be using it; the box ends it itself once the wait for the command is over), with the passes the local run end uses (`end_leftovers`), under the state root a `gate run` with no `--state-dir` resolves.
+
+  A failure says `gate: cannot end the run's job: <problem>` on stderr, the problem worded as the local run end words it (the pass cap's `<n> of its processes still ran after 5 passes; first: <first problem>` included); a state root that cannot be resolved says the fixed line `gate: cannot end the run's job: the box's state root cannot be resolved; ending the whole job` (no path) and the whole job is terminated. The run's status stands either way.
 
   A failed write by a forwarder to the box's stdout or stderr means the PC's ssh connection closed, and a closed connection always stops the job, whether it is noticed while the command runs or during the final drain. The box terminates the job with 124 and polls its processes every 100 ms for up to 10 s. It then drains the readers, skips the sync-back, releases the work-folder lock and exits 255.
 
@@ -1643,7 +1707,9 @@ Built verbs:
 
     An archive already gone counts as removed; one that cannot be removed, or a folder that cannot be listed, is said (`gate: remote could not remove the old outputs archive <path>`, `gate: remote could not list the old outputs archives in <folder>`) and fails nothing.
   - Just before the command, unless `OutputsFull`, it lists the files under the globs (size and last write); a listing that fails is said (`gate: remote could not list the outputs before the command: <error>`) and leaves every file counting as changed.
-  - After a command that exited 0 and its back commit, with the commit pushed, it reads the commit's paths (`git diff-tree`) and packs the files to bring back into `<OutputFolder>\<key>-<nonce>.tar.zst`, created new. It says `gate-remote-outputs: <n> <archive name>` on stderr (`<n>` counts every path the archive lists, copies included), or `gate-remote-outputs: 0` with no archive when nothing is to come back. The paths are read only after the push, so failing to read them fails the outputs and never the sync-back.
+  - After a command that exited 0 and its back commit, with the commit pushed, it reads the commit's paths (`git diff-tree`) and packs the files to bring back into `<OutputFolder>\<key>-<nonce>.tar.zst`, created new.
+
+    It says `gate-remote-outputs: <n> <archive name>` on stderr (`<n>` counts every path the archive lists, copies included), or `gate-remote-outputs: 0` with no archive when nothing is to come back. The paths are read only after the push, so failing to read them fails the outputs and never the sync-back.
   - A file the pack would take but whose name does not fit the archive (not plain, the list name or not Unicode), or that sits below a folder whose name is not plain, is skipped, and the box says `gate: remote outputs: skipped <n> file(s) with names this PC cannot take: <first path>` (`, …` after the path when n is above 1) on stderr once, just before its `gate-remote-outputs:` line; the run keeps its status, and the client echoes the line like any box line.
   - Right after a pack that wrote an archive, the box trims `OutputFolder` to at most 50 GiB of outputs archives (files named as in the first step; other files are neither counted nor removed). It removes the archives last written strictly before the run's own, oldest first (by path among equals), until the total fits; an archive written with the run's own or after it is never removed, so the folder may stay over the budget until the newer run's own trim.
   - The run's own archive is opened sharing reads only, so another run's trim cannot remove it mid-write; such a removal fails, is said as above (`gate: remote could not remove the old outputs archive <path>: <error>`) and that trim goes on to the next oldest. An entry whose metadata cannot be read is said (`gate: remote could not read the outputs archive <path>: <error>`, control characters escaped), left out of the total, and the trim goes on.
@@ -1688,9 +1754,13 @@ Built verbs:
 - Manifest: the PC's list of its matching files, sent as one line of JSON and a newline, `{"files":{"<path>":{"size":<bytes>,"modified":<file time>,"sha256":"<hex>"}}}`, paths relative to the worktree root and found without regard to case.
 
   The box's pack takes each file the manifest lacks, and each it holds that the run created or changed (the box's stat listing from just before the command lacks it or holds another size or last write) whose SHA-256 differs from the manifest's, skipping the paths of the run's back commit. Under `OutputsFull` there is no listing, so every file counts as changed and each that differs from the PC's comes back.
-- Archive: a tar stream compressed with zstd (level 3, long-distance matching, a window of log2 = clamp(ceil(log2(total bytes of the chosen files)), 20, 27), so a small archive uses a small window; the reader accepts a window up to 2^27), named `<key>-<nonce>.tar.zst`, each file read once and hashed as it is packed. The last member, `.gate-outputs.json`, is a JSON array with one item per chosen path in pack order, `{"path","size","sha256"}` for a member and `{"path","size","sha256","copy":true,"modified":<seconds since 1970>}` for a copy, and the reader checks the members against it after extraction. Both ends stream; memory does not grow with a file's size.
+- Archive: a tar stream compressed with zstd (level 3, long-distance matching, a window of log2 = clamp(ceil(log2(total bytes of the chosen files)), 20, 27), so a small archive uses a small window; the reader accepts a window up to 2^27), named `<key>-<nonce>.tar.zst`, each file read once and hashed as it is packed.
 
-  A **copy** is an item carrying `"copy":true` and having no tar member: the tar holds only the first path of each distinct content that the PC does not already hold, and every later path with that content is listed as a copy. The PC holds a content when a file of the manifest sent with the run has its SHA-256 and is outside the paths of the run's back commit; the box never uses a back-commit path as a copy source. A copy carries the box file's own last write as `modified`, not its source's, and the stage clamps it as it does a member's.
+  The last member, `.gate-outputs.json`, is a JSON array with one item per chosen path in pack order, `{"path","size","sha256"}` for a member and `{"path","size","sha256","copy":true,"modified":<seconds since 1970>}` for a copy, and the reader checks the members against it after extraction. Both ends stream; memory does not grow with a file's size.
+
+  A **copy** is an item carrying `"copy":true` and having no tar member: the tar holds only the first path of each distinct content that the PC does not already hold, and every later path with that content is listed as a copy.
+
+  The PC holds a content when a file of the manifest sent with the run has its SHA-256 and is outside the paths of the run's back commit; the box never uses a back-commit path as a copy source. A copy carries the box file's own last write as `modified`, not its source's, and the stage clamps it as it does a member's.
 
   Before the pack the box hashes only the chosen files whose size matches another chosen file's or a manifest-held file's, since only those can be copies. Copy or member is decided at the file's turn: a file hashed before the pack becomes a copy only when its size and last write still match the walk and its hash matches an earlier member's, or a manifest hash outside the back commit; otherwise it is packed as a member, with the hash from that read.
 - Payload: `Nonce` is 32 lower-case hex digits, `OutputFolder` is `<root>\outputs` for the work folder `<root>\work\<key>`, `Outputs` a list of non-empty globs holding no `[` or `]`, `OutputsFull` true or false, and `Name` an archive name of the payload's own key and nonce, so that the outputs verb reaches no file in `OutputFolder` but an archive of this work folder. A refusal is a `gate: box payload ...` line.
@@ -1711,7 +1781,9 @@ Built verbs:
 - A path listed twice, the same path ignoring case across members and copies (`the outputs archive lists '<path>' twice`).
 - A copy the list cannot support: one whose content no member before it has and no file of the caller's manifest holds (`the outputs archive lists '<path>' as a copy of <n> bytes with SHA-256 <hex>, which no member before it and no file the PC holds has`), or one named as the list itself (`the outputs archive lists a copy named as its own list, <path>`).
 
-After the members are extracted and checked, `unpack` makes each copy in the destination, from the first earlier member with that content, else from the first manifest path whose file below the caller's root still hashes to it (its stamp is not checked). A copy whose bytes differ from its item is refused (`the outputs archive copy '<path>' does not match its list: ...`), and so is one no PC file still holds (`no PC file still holds the content of <path>, SHA-256 <hex>: tried …`, as above); these two are faults of the transfer or the PC, not of the members, so a refetch may clear them. The caller's `go_on` is asked before each copy, so a Ctrl+C is honoured between a copy's 64 KiB buffers.
+After the members are extracted and checked, `unpack` makes each copy in the destination, from the first earlier member with that content, else from the first manifest path whose file below the caller's root still hashes to it (its stamp is not checked).
+
+A copy whose bytes differ from its item is refused (`the outputs archive copy '<path>' does not match its list: ...`), and so is one no PC file still holds (`no PC file still holds the content of <path>, SHA-256 <hex>: tried …`, as above); these two are faults of the transfer or the PC, not of the members, so a refetch may clear them. The caller's `go_on` is asked before each copy, so a Ctrl+C is honoured between a copy's 64 KiB buffers.
 
 `pack` fails on a link or a junction, a file last written before 1970, and a file whose size or last write changes while it is packed. On any refusal `unpack` removes the folder it made and all it extracted there; when that removal fails too, the refusal says so.
 
@@ -1848,7 +1920,9 @@ A Rust integration suite drives the built `gate.exe` through its CLI and reads o
 
   `--test-diagnostics-fail` (a switch) makes the diagnostics gathering of a kill fail, so the log carries `gate: diagnostics failed: <message>` in place of the block; `--test-print-request` shows it as `testSeams.diagnosticsFail`, after `samplerFail`.
 
-  `--test-remote-client <path>` replaces the remote client with a scripted one that runs in the gate's own process: the file's steps, one a line, are `out`, `err`, `record`, `wait`, `interrupt`, `killed`, `status`, `refuse` and `fail-start`. `--test-remote-wait-ms <n>` (whole milliseconds above 0) replaces the 60 s limit of the wait for a remote slot. `--test-print-request` shows them as `testSeams.remoteClient` and `testSeams.remoteWaitMs`.
+  `--test-remote-client <path>` replaces the remote client with a scripted one that runs in the gate's own process: the file's steps, one a line, are `out`, `err`, `record`, `wait`, `interrupt`, `killed`, `box-killed timed-out|backstop` (sets the box kill's kind, as the real client reads it from the tag), `status`, `adjusted <seconds>` (the load-adjusted seconds the builder counted), `refuse` and `fail-start`.
+
+  `--test-remote-wait-ms <n>` (whole milliseconds above 0) replaces the 60 s limit of the wait for a remote slot. `--test-print-request` shows them as `testSeams.remoteClient` and `testSeams.remoteWaitMs`.
 
   `--test-git-limit-ms <n>` (whole milliseconds above 0, on `gate run` only) replaces the 60 s limit of each git call of the routing decision; `--test-print-request` shows it as `testSeams.gitLimitMs`, after `remoteWaitMs`.
 
@@ -1870,13 +1944,15 @@ A Rust integration suite drives the built `gate.exe` through its CLI and reads o
 
   `--test-remote-interrupt-at <preflight|run|outputs|install|sdks|stop>` makes the client raise the console interrupt itself after that call's first output byte; `install` raises it before the second file's move, so an install of one file is never interrupted, and `sdks` just before the parity check reads this PC's SDK list with `dotnet --list-sdks`; `stop` raises it at the run call's first byte and again while the stop call runs.
 
-  `--test-remote-timeout-ms <n>` (whole milliseconds above 0) replaces the command's ceiling for the client; it leaves the transfer ceiling of 1800 s alone unless `--test-remote-watch-call` names a call other than `run`.
+  `--test-remote-backstop-ms <n>` (whole milliseconds above 0) replaces the run call's backstop of 5 x `--timeout` + 60 s for the client, counted from the run call's start.
 
-  `--test-remote-watch-call <preflight|push|run|ls-remote|fetch|outputs>` makes `--test-stall-ms` and `--test-remote-timeout-ms` apply to that one call alone, its ceiling counted from the call's own start, every other call keeping the run's own window and ceilings. For `run` the ceiling is the command's; for any other call it is that call's transfer ceiling.
+  `--test-remote-timeout-ms <n>` (whole milliseconds above 0) applies only under `--test-remote-watch-call` naming a call other than `run`, as that call's transfer ceiling; given with `--test-remote-transport` without such a call it is refused with `gate: --test-remote-timeout-ms needs --test-remote-watch-call naming a call other than run`.
+
+  `--test-remote-watch-call <preflight|push|run|ls-remote|fetch|outputs>` makes `--test-stall-ms` and `--test-remote-timeout-ms` apply to that one call alone, its limit counted from the call's own start, every other call keeping the run's own window and limits. For `run` only the stall seam applies (the backstop has its own seam); for any other call `--test-remote-timeout-ms` is that call's transfer ceiling.
 
   With `ls-remote`, `--test-remote-timeout-ms` is that call's deadline and `--test-stall-ms` alone leaves it on the git limit. With `fetch`, the stall and ceiling seams apply to the fetch alone; with `outputs`, to the outputs fetch alone.
 
-  A value outside a seam's calls says `gate: --test-remote-watch-call must be preflight, push, run, ls-remote, fetch or outputs, got '<v>'`, and `--test-remote-interrupt-at` says `must be preflight, run, outputs, install, sdks or stop`. The four need the transport; `--test-print-request` shows them as `testSeams.remoteBoundMs`, `remoteInterruptAt`, `remoteWatchCall` and `remoteTimeoutMs`, after `remoteRetryPauseMs`.
+  A value outside a seam's calls says `gate: --test-remote-watch-call must be preflight, push, run, ls-remote, fetch or outputs, got '<v>'`, and `--test-remote-interrupt-at` says `must be preflight, run, outputs, install, sdks or stop`. The five (with `--test-remote-backstop-ms`) need the transport; `--test-print-request` shows them as `testSeams.remoteBoundMs`, `remoteInterruptAt`, `remoteWatchCall`, `remoteTimeoutMs` and `remoteBackstopMs`, after `remoteRetryPauseMs`.
 
   `--test-remote-fetch-cap-bytes <n>` (a whole number of bytes above 0, default 4 GiB) replaces the cap on what the sync-back fetch's job may write. Refused without the transport with `gate: --test-remote-fetch-cap-bytes needs --test-remote-transport`, and a value that is not a whole number above 0 with `gate: --test-remote-fetch-cap-bytes must be a whole number above 0, got '<v>'`. `--test-print-request` does not show it.
 
@@ -1922,7 +1998,7 @@ A Rust integration suite drives the built `gate.exe` through its CLI and reads o
 
   It is copied under the names the gate classifies (`VBCSCompiler.exe`, `dotnet.exe`, `MSBuild.exe`).
 
-  A second helper, `fake-ssh`, stands in for ssh in the remote client's cases (`--test-remote-ssh`).
+  A second helper, `fake-ssh`, stands in for ssh in the remote client's cases (`--test-remote-ssh`). Its `ok` step puts the words of the variable `GATE_FAKE_SSH_BOX_SEAMS` before the verb of a `gate box run` call, so a case gives the box its seams.
 
   Its steps are `ok`, `hold`, `version`, `boot <time>` (as `version`, for the box's boot line), `no-boot` (drops the box's boot line), `drop` (exits 255 at once, writing nothing), `exit`, `fail-banner`, `fail-other`, `out-then-drop`.
 

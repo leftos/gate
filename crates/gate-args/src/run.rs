@@ -60,6 +60,8 @@ pub(crate) enum ValueOption {
     #[cfg(feature = "test-seams")]
     RemoteTimeoutMs,
     #[cfg(feature = "test-seams")]
+    RemoteBackstopMs,
+    #[cfg(feature = "test-seams")]
     LocalSdks,
     #[cfg(feature = "test-seams")]
     RemoteFetchCapBytes,
@@ -254,6 +256,8 @@ impl RunBuilder {
             #[cfg(feature = "test-seams")]
             ValueOption::RemoteTimeoutMs => self.test_seams.remote_timeout_ms = Some(values::above_zero(spelled, value)?),
             #[cfg(feature = "test-seams")]
+            ValueOption::RemoteBackstopMs => self.test_seams.remote_backstop_ms = Some(values::above_zero(spelled, value)?),
+            #[cfg(feature = "test-seams")]
             ValueOption::LocalSdks => self.test_seams.local_sdks = Some(value.to_owned()),
             #[cfg(feature = "test-seams")]
             ValueOption::RemoteFetchCapBytes => self.test_seams.remote_fetch_cap_bytes = Some(values::above_zero(spelled, value)?),
@@ -344,10 +348,12 @@ impl RunBuilder {
 
     /// Refuses the remote client's seams that cannot work together: `--test-remote-ssh`,
     /// `--test-remote-retry-pause-ms`, `--test-remote-bound-ms`, `--test-remote-interrupt-at`,
-    /// `--test-remote-watch-call`, `--test-remote-timeout-ms`, `--test-local-sdks`, `--test-remote-fetch-cap-bytes`,
+    /// `--test-remote-watch-call`, `--test-remote-timeout-ms`, `--test-remote-backstop-ms`, `--test-local-sdks`,
+    /// `--test-remote-fetch-cap-bytes`,
     /// `--test-remote-apply-cap-bytes`, `--test-remote-outputs-budget-bytes` and `--test-remote-log-cap-bytes` without
     /// `--test-remote-transport`,
-    /// whose client alone reads them, and `--test-remote-snapshot` with it, as each chooses the client.
+    /// whose client alone reads them, `--test-remote-timeout-ms` with it unless `--test-remote-watch-call` names a call
+    /// other than `run`, and `--test-remote-snapshot` with it, as each chooses the client.
     #[cfg(feature = "test-seams")]
     fn check_remote_seams(&mut self) {
         const TRANSPORT: &str = "--test-remote-transport";
@@ -360,6 +366,7 @@ impl RunBuilder {
             (self.test_seams.remote_interrupt_at.is_some(), "--test-remote-interrupt-at"),
             (self.test_seams.remote_watch_call.is_some(), "--test-remote-watch-call"),
             (self.test_seams.remote_timeout_ms.is_some(), "--test-remote-timeout-ms"),
+            (self.test_seams.remote_backstop_ms.is_some(), "--test-remote-backstop-ms"),
             (self.test_seams.local_sdks.is_some(), "--test-local-sdks"),
             (self.test_seams.remote_fetch_cap_bytes.is_some(), "--test-remote-fetch-cap-bytes"),
             (self.test_seams.remote_apply_cap_bytes.is_some(), "--test-remote-apply-cap-bytes"),
@@ -376,10 +383,32 @@ impl RunBuilder {
                 });
             }
         }
+        if transport {
+            self.check_remote_timeout();
+        }
         if transport && self.test_seams.remote_snapshot {
             self.problems.push(Problem::SeamsConflict {
                 option: "--test-remote-snapshot",
                 other: TRANSPORT,
+            });
+        }
+    }
+
+    /// Refuses `--test-remote-timeout-ms` unless `--test-remote-watch-call` names a call other than `run`: the seam is a
+    /// transfer ceiling, and the run call is the one call it must not apply to, since the run call's backstop has a seam
+    /// of its own, `--test-remote-backstop-ms`. A `--test-remote-watch-call` whose value was refused already said its
+    /// problem, so none is added for it here.
+    #[cfg(feature = "test-seams")]
+    fn check_remote_timeout(&mut self) {
+        let watch_call_given = self.given.contains(&RunOption::Value(ValueOption::RemoteWatchCall));
+        if watch_call_given && self.test_seams.remote_watch_call.is_none() {
+            return;
+        }
+        let other_call = self.test_seams.remote_watch_call.as_deref().is_some_and(|call| call != "run");
+        if self.test_seams.remote_timeout_ms.is_some() && !other_call {
+            self.problems.push(Problem::SeamNeeds {
+                option: "--test-remote-timeout-ms",
+                needs: "--test-remote-watch-call naming a call other than run",
             });
         }
     }

@@ -792,7 +792,7 @@ fn members(ids: impl IntoIterator<Item = u32>, since: u64, times: impl Fn(u32) -
 
 /// The machine a command of `slot` runs on: a critical command is High priority, a light one is measured against the
 /// light pool's threads where the machine has them, and a no-slot one against a single core.
-fn machine(slot: Slot, processors: usize) -> Machine {
+pub(crate) fn machine(slot: Slot, processors: usize) -> Machine {
     let cores = u32::try_from(processors).unwrap_or(u32::MAX);
     let demand = match Takes::of(slot) {
         Takes::Pool(pool @ Pool::Local(SlotKind::Light)) => processors.min(pool.threads()),
@@ -803,7 +803,7 @@ fn machine(slot: Slot, processors: usize) -> Machine {
 }
 
 /// The system's CPU times, as the watchdog takes them.
-fn system_times() -> io::Result<SystemTimes> {
+pub(crate) fn system_times() -> io::Result<SystemTimes> {
     let times = gate_win32::system_times()?;
     Ok(SystemTimes {
         idle: times.idle,

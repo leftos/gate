@@ -25,10 +25,11 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
 use gate_args::BoxSeams;
-use gate_watchdog::Pump;
+use gate_watchdog::{Kill, Pump};
 use gate_win32::{Donor, Job, LaunchError, NamedEvent, PipedConsole, PipedLaunch, PipedSuspended, RestrictedToken, Running, Utf8Console};
 
 use crate::answer::USAGE_STATUS;
+use crate::boxside::ceiling::{Ceiling, KILLED, Spec};
 use crate::boxside::forward::{DRAIN, Forwarders, OutputLock};
 use crate::boxside::heartbeat;
 use crate::boxside::outputs::{self, Asked};
@@ -95,6 +96,10 @@ pub(super) struct Request<'a> {
     outputs: Option<Asked<'a>>,
     /// The run's `Nonce`, which its start marker and its refusal tags name.
     pub(super) nonce: &'a str,
+    /// The run's ceiling in whole seconds of load-adjusted time, `None` for a run the box gives none.
+    timeout: Option<u64>,
+    /// The PC's name for the builder, which the box's kill line names, empty when the payload gives none.
+    host: &'a str,
 }
 
 impl Request<'_> {
@@ -108,6 +113,8 @@ impl Request<'_> {
         Ok(Request {
             outputs,
             nonce,
+            timeout: payload.timeout()?,
+            host: payload.optional_text("Host")?,
             key,
             snapshot,
             bare: payload.path("Bare")?,
@@ -370,8 +377,9 @@ fn in_work_folder(request: &Request<'_>, stop: &NamedEvent, seams: &BoxSeams, co
 }
 
 /// The run once the heartbeat beats: the snapshot checked out, the repo's dotnet tools restored, the outputs listed,
-/// the command seen to its end in the place, the tree it left committed back, and, after a passed command, its outputs
-/// packed; the status as [`in_work_folder`] gives it, 1 for a passed command whose outputs are not brought back.
+/// the command seen to its end in the place, the tree it left committed back unless the box's ceiling killed it, and,
+/// after a passed command, its outputs packed; the status as [`in_work_folder`] gives it, 1 for a passed command whose
+/// outputs are not brought back, [`KILLED`] for a killed one.
 fn checked_out(
     request: &Request<'_>,
     git: &WorkGit,
@@ -392,7 +400,11 @@ fn checked_out(
     if let Some(outputs) = outputs.as_deref_mut() {
         outputs.list(folders.work, beat, console);
     }
-    let status = command(request, folders.place, beat, console)?;
+    let status = match command(request, folders.place, beat, console)? {
+        Ran::Exited(status) => status,
+        // The PC applies nothing of a run the box killed, and a process its kill could not end may still be writing.
+        Ran::Killed => return Ok(KILLED),
+    };
     let commit = match git.back_commit(request, console) {
         Ok(commit) => commit,
         Err(failed) => {
@@ -496,7 +508,7 @@ pub(super) fn full_path(path: &Path) -> Option<PathBuf> {
 /// the PC, uses the servers this one starts, and the `MSBuild` server and node reuse are off. Git's `safe.directory` is
 /// set to `*` over that ([`with_safe_directory`]). The command runs with a restricted copy of the box's token
 /// ([`restricted_token`]).
-fn command(request: &Request<'_>, place: &Path, beat: &Beat<'_>, console: &mut Console) -> Result<u32, u32> {
+fn command(request: &Request<'_>, place: &Path, beat: &Beat<'_>, console: &mut Console) -> Result<Ran, u32> {
     let run = format!("gate-box-{}", request.nonce);
     let variables = with_safe_directory(Variables::from_process().with_build_servers(&run));
     let environment = variables
@@ -508,14 +520,14 @@ fn command(request: &Request<'_>, place: &Path, beat: &Beat<'_>, console: &mut C
     let rest: Vec<OsString> = rest.iter().map(OsString::from).collect();
     let program = match find_program(word, &variables, place) {
         Ok(program) => program,
-        Err(message) => return Ok(not_started(console, word, None, &message)),
+        Err(message) => return Ok(Ran::Exited(not_started(console, word, None, &message))),
     };
     let launch = match written(&program, &rest, &variables) {
         Written::Refused(line) => {
             console.err(&line);
             return Err(u32::from(USAGE_STATUS));
         }
-        Written::NoShell(message) => return Ok(not_started(console, word, Some(&program), &message)),
+        Written::NoShell(message) => return Ok(Ran::Exited(not_started(console, word, Some(&program), &message))),
         Written::Line(application, command_line) => PipedLaunch {
             application,
             command_line,
@@ -543,11 +555,25 @@ fn command(request: &Request<'_>, place: &Path, beat: &Beat<'_>, console: &mut C
     };
     let launched = match start_command(&mut start, donor.as_ref().map_err(String::as_str), beat, console) {
         Ok(launched) => launched,
-        Err(answer) => return answer,
+        Err(answer) => return answer.map(Ran::Exited),
     };
     let mut stopper = Stopper { job: &job, armed: true };
     let keep: Vec<u32> = donor.as_ref().map(Donor::pid).into_iter().collect();
-    let watched = watch(&job, launched, &keep, beat, console);
+    let spec = Spec {
+        timeout: request.timeout,
+        host: escaped(request.host),
+        spoken: escaped(&request.command.join(" ")),
+        nonce: request.nonce,
+    };
+    let ceiling = Ceiling::begin(spec, &job, beat.lock, beat.seams, console);
+    let started = Started {
+        job: &job,
+        launched,
+        keep: &keep,
+        beat,
+        ceiling,
+    };
+    let watched = watch(started, console);
     stopper.armed = false;
     // Ended only now, so the command's console stays up for as long as the command may use it.
     drop(donor);
@@ -953,8 +979,18 @@ struct Pipes {
 /// CPU read runs while the command's output is left unread, and stops watching it once the wait ends, however it ends.
 /// Once the command has exited, what it left in its job but the processes of `keep` is ended ([`end_what_it_left`])
 /// before the readers drain, so a leftover holding its output open costs no drain time, and before the outputs are
-/// listed.
-fn watch(job: &Arc<Job>, launched: Launched, keep: &[u32], beat: &Beat<'_>, console: &mut Console) -> Result<u32, u32> {
+/// listed. Under the box's ceiling, a command that passes it has its job ended, the readers drain, then the ceiling
+/// says the kill, and the run goes on as [`Ran::Killed`]; the ceiling's clock stops as the wait ends, and its adjusted
+/// line is said once the readers drained, but for a client gone or a wait that failed. The look that finds a kill
+/// hands over the ceiling with it, so a kill is always said by the ceiling that found it.
+fn watch(started: Started<'_, '_>, console: &mut Console) -> Result<Ran, u32> {
+    let Started {
+        job,
+        launched,
+        keep,
+        beat,
+        mut ceiling,
+    } = started;
     let Launched { running, pipes } = launched;
     let forwarders = match Forwarders::start(pipes.stdout, pipes.stderr, beat.lock) {
         Ok(forwarders) => forwarders,
@@ -972,16 +1008,67 @@ fn watch(job: &Arc<Job>, launched: Launched, keep: &[u32], beat: &Beat<'_>, cons
     };
     beat.watch(job);
     // No stop is looked for: a stop ends the command through its job, and the status it ends with passes.
-    let waited = watched.wait(None, console);
+    let waited = watched.wait(
+        None,
+        |console| {
+            let kill = ceiling.as_mut()?.look(console)?;
+            ceiling.take().map(|ceiling| (kill, ceiling))
+        },
+        console,
+    );
     beat.unwatch();
     match waited {
         WaitEnd::Exited { code, .. } => {
+            let ceiling = ceiling.map(Ceiling::closed);
             end_what_it_left(job, keep, console);
-            watched.drained(console).map(|()| code)
+            watched.drained(console)?;
+            if let Some(ceiling) = &ceiling {
+                ceiling.ended(console);
+            }
+            Ok(Ran::Exited(code))
         }
+        WaitEnd::Killed((kill, ceiling)) => killed(watched, kill, &ceiling.closed(), beat.seams, console),
         WaitEnd::ClientGone => Err(watched.client_gone(console)),
         WaitEnd::Failed(status) => Err(status),
     }
+}
+
+/// How a command the box started came to its end: it exited with its status, or the box's ceiling killed it.
+pub(super) enum Ran {
+    Exited(u32),
+    Killed,
+}
+
+/// The box's ceiling found the command of `watched` past a limit for `kill`: its job is ended and the readers drain
+/// ([`Watched::killed`]), a client gone meanwhile answered as such, with no back ref and no outputs; a job that still
+/// holds processes, or could not be ended, is ended once more; then the ceiling says the kill, a note first when the
+/// job was still not ended, and the run goes on as [`Ran::Killed`], a kill whatever the ending left.
+/// `--test-box-kill-leaves` stands in for what that last ending leaves.
+fn killed(watched: Watched<'_>, kill: Kill, ceiling: &Ceiling<'_>, seams: &BoxSeams, console: &mut Console) -> Result<Ran, u32> {
+    let job = watched.job;
+    let ending = match watched.killed(console)? {
+        Ok(ending) if ending.left == 0 && seams.kill_leaves.is_none() => Ok(ending),
+        _ => terminate_and_wait(job),
+    };
+    let ending = match seams.kill_leaves {
+        Some(left) => Ok(Ending {
+            left: usize::try_from(left).unwrap_or(usize::MAX),
+            late: None,
+        }),
+        None => ending,
+    };
+    ceiling.killed(kill, &ending, console);
+    Ok(Ran::Killed)
+}
+
+/// A command just started that [`watch`] sees to its end: its job, its main process and pipes, the processes of its
+/// job that outlive it by design, the run's output lock and heartbeat, and the box's ceiling on it, `None` for none.
+struct Started<'s, 'b> {
+    job: &'s Arc<Job>,
+    launched: Launched,
+    keep: &'s [u32],
+    beat: &'s Beat<'b>,
+    ceiling: Option<Ceiling<'s>>,
 }
 
 /// Ends what the command that exited left in its `job` as a local run does ([`end_leftovers`]), its gates spared,
@@ -1040,10 +1127,12 @@ pub(super) struct Watched<'a> {
     pub(super) watching: Watching,
 }
 
-/// How the wait for a watched process's main process ended.
-pub(super) enum WaitEnd {
+/// How the wait for a watched process's main process ended, a look for a kill finding a `K`.
+pub(super) enum WaitEnd<K> {
     /// It exited with `code`; `stopped` when a stop set the run's signal, looked at only when a signal was given.
     Exited { code: u32, stopped: bool },
+    /// The look for a kill found this one first; the process still runs.
+    Killed(K),
     /// A write to the box's own output failed first: the client closed the connection.
     ClientGone,
     /// The box could not wait for it: the status 1, its line said and its job terminated.
@@ -1053,28 +1142,53 @@ pub(super) enum WaitEnd {
 impl Watched<'_> {
     /// Waits for the main process to exit, looking every [`WAIT_STEP`] whether the client is still there and, when
     /// `stop` is given, whether a stop came: a stop terminates the job, so the main process exits and the wait sees it,
-    /// and is looked at once more as it exits, so a stop that ended the job before the box looked counts too.
-    pub(super) fn wait(&self, stop: Option<&StopSignal<'_>>, console: &mut Console) -> WaitEnd {
+    /// and is looked at once more as it exits, so a stop that ended the job before the box looked counts too. Each look
+    /// while the process runs also asks `look` for a kill, which ends the wait.
+    pub(super) fn wait<K>(
+        &self,
+        stop: Option<&StopSignal<'_>>,
+        mut look: impl FnMut(&mut Console) -> Option<K>,
+        console: &mut Console,
+    ) -> WaitEnd<K> {
         let mut stopped = false;
         loop {
-            match self.running.wait(WAIT_STEP) {
-                Ok(Some(code)) => {
-                    let stopped = stopped || stop.is_some_and(|stop| stop.seen(self.watching.while_waiting(), console));
-                    return WaitEnd::Exited { code, stopped };
-                }
-                Ok(None) if self.forwarders.pipe_closed() => return WaitEnd::ClientGone,
-                Ok(None) => {}
-                Err(error) => {
-                    let status = failed(console, &format!("cannot wait for {}: {error}", self.watching.what()));
-                    end_job(self.job, console);
-                    return WaitEnd::Failed(status);
-                }
+            if let Some(end) = self.step(stopped, stop, &mut look, console) {
+                return end;
             }
-            if !stopped && stop.is_some_and(|stop| stop.seen(self.watching.while_waiting(), console)) {
+            if !stopped && self.stop_seen(stop, console) {
                 stopped = true;
                 end_job(self.job, console);
             }
         }
+    }
+
+    /// One step of [`Watched::wait`]: its end when the main process exited, the client went, `look` found a kill or the
+    /// wait failed; `None` while the process runs on. `stopped` is whether a stop was already seen.
+    fn step<K>(
+        &self,
+        stopped: bool,
+        stop: Option<&StopSignal<'_>>,
+        look: &mut impl FnMut(&mut Console) -> Option<K>,
+        console: &mut Console,
+    ) -> Option<WaitEnd<K>> {
+        match self.running.wait(WAIT_STEP) {
+            Ok(Some(code)) => Some(WaitEnd::Exited {
+                code,
+                stopped: stopped || self.stop_seen(stop, console),
+            }),
+            Ok(None) if self.forwarders.pipe_closed() => Some(WaitEnd::ClientGone),
+            Ok(None) => look(console).map(WaitEnd::Killed),
+            Err(error) => {
+                let status = failed(console, &format!("cannot wait for {}: {error}", self.watching.what()));
+                end_job(self.job, console);
+                Some(WaitEnd::Failed(status))
+            }
+        }
+    }
+
+    /// Whether `stop`, when given, says a stop came, the line saying it cannot be read said the first time.
+    fn stop_seen(&self, stop: Option<&StopSignal<'_>>, console: &mut Console) -> bool {
+        stop.is_some_and(|stop| stop.seen(self.watching.while_waiting(), console))
     }
 
     /// Once the main process exited: lets the readers drain for at most [`DRAIN`]. A write to the box's own output
@@ -1089,6 +1203,22 @@ impl Watched<'_> {
             console.err(self.watching.leftover());
         }
         Ok(())
+    }
+
+    /// The box's ceiling found the process past a limit: its job is ended first, then the readers drain for at most
+    /// [`DRAIN`]; how the ending went, which the ceiling says. A write to the box's own output that failed meanwhile
+    /// answers [`CLOSED_STATUS`], and a leftover process still holding the output open is said, as
+    /// [`Watched::drained`] does.
+    pub(super) fn killed(self, console: &mut Console) -> Result<io::Result<Ending>, u32> {
+        let ending = terminate_and_wait(self.job);
+        let drained = self.forwarders.drain(DRAIN);
+        if drained.pipe_closed {
+            return Err(closed_connection(self.job, ending, console));
+        }
+        if !drained.all_ended {
+            console.err(self.watching.leftover());
+        }
+        Ok(ending)
     }
 
     /// The client closed the connection: the job is stopped first, then the readers drain for at most [`DRAIN`];

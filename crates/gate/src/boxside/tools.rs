@@ -7,6 +7,7 @@
 //! restore that fails refuses the run with status 75, as the PowerShell wrapper's `Update-ToolRestore` does, so the
 //! gate falls back to a local run.
 
+use std::convert::Infallible;
 use std::ffi::OsString;
 use std::fs;
 use std::fs::OpenOptions;
@@ -214,7 +215,8 @@ fn restore(request: &Request<'_>, place: &Path, beat: &Beat<'_>, console: &mut C
         forwarders,
         watching: Watching::Restore,
     };
-    Ok(match watched.wait(Some(&beat.stop), console) {
+    // No ceiling watches the restore, so no kill ends its wait.
+    Ok(match watched.wait(Some(&beat.stop), |_| None::<Infallible>, console) {
         WaitEnd::Failed(status) => Restored::Ended(status),
         WaitEnd::ClientGone => Restored::Ended(watched.client_gone(console)),
         WaitEnd::Exited { stopped: true, .. } => Restored::Ended(stopped(watched, console)),

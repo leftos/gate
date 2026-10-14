@@ -601,7 +601,7 @@ fn a_bare_first_word_stays_bare_unless_it_names_a_file_of_the_folder() {
 #[test]
 fn a_routed_run_goes_to_the_client_and_passes_its_output_and_status_through() {
     let case = routed_case("routing-through");
-    let steps = shown(&stub(&case, &["out ran there", "status 0"]));
+    let steps = shown(&stub(&case, &["out ran there", "adjusted 1.25", "status 0"]));
     let outcome = finish(case.gate(&routed_words("out.log", &steps, &[], &[r".\tool.exe", "out", "ran here"])));
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
@@ -610,8 +610,8 @@ fn a_routed_run_goes_to_the_client_and_passes_its_output_and_status_through() {
         &[
             "ran there",
             "gate: passed in ",
-            " s on builder (command ",
-            " s of ceiling 3600 s; push ",
+            " s on builder (load-adjusted 1 s, ceiling 3600 s; command ",
+            " s, push ",
             " s). Full output: ",
         ],
     );
@@ -623,7 +623,7 @@ fn a_routed_run_goes_to_the_client_and_passes_its_output_and_status_through() {
     assert!(events.iter().all(has_remote_tag), "{events:#?}");
     let slot = events[1]["slots"][0].as_str().expect("the take names its slot");
     assert!(slot.ends_with("remote-slot-0"), "{slot}");
-    assert_eq!((&events[2]["verdict"], &events[2]["adjustedSeconds"]), (&json!("passed"), &Value::Null));
+    assert_eq!((&events[2]["verdict"], &events[2]["adjustedSeconds"]), (&json!("passed"), &json!(1.25)));
     assert!(!remote_claim(&case).exists(), "the remote claim is gone after the release");
 }
 
@@ -678,7 +678,12 @@ fn a_failing_client_status_is_the_gates_and_the_log_is_scanned() {
     assert_eq!((failed.code, passed.code), (Some(1), Some(0)), "{failed:?} {passed:?}");
     assert!(failed.stdout.contains(":error CS1002: x"), "the marker line is said: {failed:?}");
     assert!(failed.stderr.contains("gate: FAILED (status 1)"), "{failed:?}");
-    assert!(passed.stdout.contains(" s on builder (command "), "{passed:?}");
+    assert!(
+        passed
+            .stdout
+            .contains(" s on builder (load-adjusted unknown: the sampler failed, ceiling 3600 s; command "),
+        "a client that says no load-adjusted time: {passed:?}"
+    );
     let releases: Vec<Value> = events(&case).into_iter().filter(|event| event["event"] == "release").collect();
     assert_eq!((&releases[0]["verdict"], &releases[1]["verdict"]), (&json!("failed"), &json!("passed")));
 }
@@ -708,6 +713,24 @@ fn a_killed_client_run_is_a_kill_and_a_124_of_its_own_is_not() {
     assert_eq!((&releases[0]["verdict"], &releases[1]["verdict"]), (&json!("stalled"), &json!("failed")));
 }
 
+/// The box's kill tag names the kill: the verdict is its kind, whatever kill line the log holds last, or none at all, as
+/// when the log passed its cap before the box's kill line or a nested gate's kill line came after it.
+#[test]
+fn a_box_kill_s_verdict_is_its_tag_s_kind_not_the_log_s_last_kill_line() {
+    let case = routed_case("routing-box-killed");
+    let silent = shown(&stub(&case, &["box-killed timed-out", "status 124"]));
+    let misleading = shown(&stub(&case, &["box-killed backstop", "err gate: TIMED OUT after 5 s", "status 124"]));
+    let first = finish(case.gate(&routed_words("silent.log", &silent, &[], &[r".\tool.exe", "out", "hi"])));
+    let second = finish(case.gate(&routed_words("misleading.log", &misleading, &[], &[r".\tool.exe", "out", "hi"])));
+
+    assert_eq!((first.code, second.code), (Some(124), Some(124)), "{first:?} {second:?}");
+    let releases: Vec<Value> = events(&case).into_iter().filter(|event| event["event"] == "release").collect();
+    assert_eq!(
+        (&releases[0]["verdict"], &releases[1]["verdict"]),
+        (&json!("timed-out"), &json!("backstop"))
+    );
+}
+
 #[test]
 fn a_fallback_that_never_starts_the_command_keeps_the_attempts_lines_once() {
     let case = routed_case("routing-fallback-no-start");
@@ -725,7 +748,15 @@ fn a_fallback_that_never_starts_the_command_keeps_the_attempts_lines_once() {
 #[test]
 fn a_kill_line_after_a_lone_cr_progress_line_still_reads_as_the_kill() {
     let case = routed_case("routing-kill-after-cr");
-    let steps = shown(&stub(&case, &["killed", "err 50%\rgate: TIMED OUT after 5 s", "status 124"]));
+    let steps = shown(&stub(
+        &case,
+        &[
+            "killed",
+            "err 50%\rgate: TIMED OUT on builder after 5 s of load-adjusted time (wall 9 s, machine free 50% on average); killed \
+             tool and its children",
+            "status 124",
+        ],
+    ));
     let outcome = finish(case.gate(&routed_words("out.log", &steps, &[], &[r".\tool.exe", "out", "hi"])));
 
     assert_eq!(outcome.code, Some(124), "{outcome:?}");

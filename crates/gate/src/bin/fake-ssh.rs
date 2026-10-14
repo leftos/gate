@@ -9,7 +9,8 @@
 //! with no step taken. Started with `--version` alone, as a push case starts a copy of it standing in for a builder's
 //! old gate, it says `gate 0.0.0-old` and exits 0.
 //!
-//! `ok` runs `<gate> box <verb> <payload>` with the gate the variable `GATE_FAKE_SSH_GATE` names, or `git
+//! `ok` runs `<gate> box <verb> <payload>` with the gate the variable `GATE_FAKE_SSH_GATE` names, a `run` call given
+//! the words of the variable `GATE_FAKE_SSH_BOX_SEAMS`, when set, before its verb as box seams, or `git
 //! upload-pack <path>` or `git receive-pack <path>`, or a push call's words with this PC's `pwsh`, its `LOCALAPPDATA`
 //! the folder named as the host, the word before the line, in the folder the variable `GATE_FAKE_SSH_BUILDERS` names,
 //! made when missing, fed this process's standard input, which it reads whole first and keeps as `<steps file>.input`;
@@ -242,6 +243,15 @@ fn variable(name: &str) -> Result<String, String> {
     std::env::var(name).map_err(|error| format!("{name}: {error}"))
 }
 
+/// The box seams a `run` call's gate is given before its verb: the words of the variable `GATE_FAKE_SSH_BOX_SEAMS`,
+/// none when it is unset.
+fn box_seams() -> Result<String, String> {
+    match std::env::var("GATE_FAKE_SSH_BOX_SEAMS") {
+        Err(std::env::VarError::NotPresent) => Ok(String::new()),
+        read => read.map_err(|error| format!("GATE_FAKE_SSH_BOX_SEAMS: {error}")),
+    }
+}
+
 /// The step of this call: the one after as many steps as the log holds calls, the call's `verb` appended to the log,
 /// and the verb and the call's ssh `options` appended as one line to `<steps file>.words`.
 fn next_step(steps: &Path, verb: &str, options: &[String]) -> Result<String, String> {
@@ -354,7 +364,11 @@ impl<'a> BoxCall<'a> {
             return Ok(command);
         }
         let mut command = Command::new(variable("GATE_FAKE_SSH_GATE")?);
-        command.args(["box", self.verb, self.payload]);
+        command.arg("box");
+        if self.verb == "run" {
+            command.args(box_seams()?.split_whitespace());
+        }
+        command.args([self.verb, self.payload]);
         Ok(command)
     }
 

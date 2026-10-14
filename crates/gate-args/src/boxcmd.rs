@@ -1,7 +1,9 @@
 //! The hidden `gate box <verb> <payload>`: the builder side of a routed run. Only the words are read here; the payload
 //! word is passed on unread, since decoding it is the binary's. A `test-seams` build also reads the hidden
 //! `--test-heartbeat-ms <n>`, `--test-box-console fail-before`, `--test-box-token refused`, `--test-box-park-launch <path>`,
-//! `--test-outputs-budget-bytes <n>` and `--test-dotnet-limit-ms <n>` (each also as `--<seam>=<value>`) before the verb;
+//! `--test-outputs-budget-bytes <n>`, `--test-dotnet-limit-ms <n>`, `--test-box-sample-ms <n>`, `--test-box-sampler-fail
+//! true|false`, `--test-box-free-percent <1-100>` and `--test-box-kill-leaves <n>` (each also as `--<seam>=<value>`) before
+//! the verb;
 //! without the feature each is no verb, and so the box usage.
 
 use std::ffi::{OsStr, OsString};
@@ -57,6 +59,14 @@ enum Seam {
     OutputsBudgetBytes,
     /// `--test-dotnet-limit-ms <n>`: how long the preflight's `dotnet --list-sdks` may take.
     DotnetLimitMs,
+    /// `--test-box-sample-ms <n>`: the period of the run's samples of its machine.
+    SampleMs,
+    /// `--test-box-sampler-fail true|false`: every sample of the machine fails.
+    SamplerFail,
+    /// `--test-box-free-percent <1-100>`: the share of the machine the samples find free.
+    FreePercent,
+    /// `--test-box-kill-leaves <n>`: how many processes the ending of a job the ceiling killed reports left.
+    KillLeaves,
 }
 
 #[cfg(feature = "test-seams")]
@@ -71,6 +81,10 @@ impl Seam {
             "--test-box-park-launch" => Some(Seam::ParkLaunch),
             "--test-outputs-budget-bytes" => Some(Seam::OutputsBudgetBytes),
             "--test-dotnet-limit-ms" => Some(Seam::DotnetLimitMs),
+            "--test-box-sample-ms" => Some(Seam::SampleMs),
+            "--test-box-sampler-fail" => Some(Seam::SamplerFail),
+            "--test-box-free-percent" => Some(Seam::FreePercent),
+            "--test-box-kill-leaves" => Some(Seam::KillLeaves),
             _ => None,
         }
     }
@@ -84,6 +98,10 @@ impl Seam {
             Seam::ParkLaunch => "--test-box-park-launch",
             Seam::OutputsBudgetBytes => "--test-outputs-budget-bytes",
             Seam::DotnetLimitMs => "--test-dotnet-limit-ms",
+            Seam::SampleMs => "--test-box-sample-ms",
+            Seam::SamplerFail => "--test-box-sampler-fail",
+            Seam::FreePercent => "--test-box-free-percent",
+            Seam::KillLeaves => "--test-box-kill-leaves",
         }
     }
 }
@@ -116,8 +134,10 @@ fn seams(words: &mut Peekable<impl Iterator<Item = OsString>>, problems: &mut Ve
     seams
 }
 
-/// Sets `seam` from `value`: whole milliseconds above 0 for the heartbeat and the dotnet limit, `fail-before` for the
-/// console, `refused` for the token, any path for the park, whole bytes above 0 for the outputs budget. An empty or
+/// Sets `seam` from `value`: whole milliseconds above 0 for the heartbeat, the dotnet limit and the sample period,
+/// `fail-before` for the console, `refused` for the token, any path for the park, whole bytes above 0 for the outputs
+/// budget, `true` or `false` for the sampler's failure, a whole percent from 1 to 100 for the free share, a whole count
+/// above 0 for the processes a kill leaves. An empty or
 /// missing value is no value.
 #[cfg(feature = "test-seams")]
 fn set_seam(seams: &mut BoxSeams, seam: Seam, value: Result<Option<String>, Problem>) -> Result<(), Problem> {
@@ -130,6 +150,10 @@ fn set_seam(seams: &mut BoxSeams, seam: Seam, value: Result<Option<String>, Prob
         Seam::HeartbeatMs => seams.heartbeat_ms = Some(crate::values::above_zero(name, &value)?),
         Seam::OutputsBudgetBytes => seams.outputs_budget_bytes = Some(crate::values::above_zero(name, &value)?),
         Seam::DotnetLimitMs => seams.dotnet_limit_ms = Some(crate::values::above_zero(name, &value)?),
+        Seam::SampleMs => seams.sample_ms = Some(crate::values::above_zero(name, &value)?),
+        Seam::SamplerFail => seams.sampler_fail = crate::values::true_or_false(name, &value)?,
+        Seam::FreePercent => seams.free_percent = Some(crate::values::in_range(name, &value, 1, 100)?),
+        Seam::KillLeaves => seams.kill_leaves = Some(crate::values::above_zero(name, &value)?),
         Seam::Console => seams.fail_console = the_word(name, value, "fail-before", |option, value| Problem::BadConsoleFailure { option, value })?,
         Seam::Token => seams.refuse_token = the_word(name, value, "refused", |option, value| Problem::BadTokenRefusal { option, value })?,
         Seam::ParkLaunch => seams.park_launch = Some(std::path::PathBuf::from(value)),

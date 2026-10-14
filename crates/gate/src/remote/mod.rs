@@ -15,7 +15,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use gate_args::RunRequest;
-use gate_state::{FallbackReason, StateRoot};
+use gate_state::{FallbackReason, StateRoot, Verdict};
 use gate_win32::{Interrupt, OwnedMutexGuard};
 
 use crate::durations::Usual;
@@ -81,6 +81,53 @@ pub(crate) fn started_line(nonce: &str) -> String {
 /// because the box's start marker came before anything the command says.
 pub(crate) fn refused_line(nonce: &str, refusal: Refusal) -> String {
     format!("gate-remote-refused: {nonce} {}", refusal.word())
+}
+
+/// Why the box killed the command of a run itself: its load-adjusted ceiling, or the backstop of five ceilings of wall
+/// time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BoxKill {
+    /// The command's load-adjusted clock reached its ceiling.
+    TimedOut,
+    /// The command ran five ceilings of wall time, its clock not having reached the ceiling, or its sampler failed.
+    Backstop,
+}
+
+impl BoxKill {
+    /// The verdict a run the box killed for this is journalled with.
+    pub(crate) fn verdict(self) -> Verdict {
+        match self {
+            BoxKill::TimedOut => Verdict::TimedOut,
+            BoxKill::Backstop => Verdict::Backstop,
+        }
+    }
+
+    /// The word the kill tag names it by, the verdict it gives the run.
+    pub(crate) fn word(self) -> &'static str {
+        match self {
+            BoxKill::TimedOut => "timed-out",
+            BoxKill::Backstop => "backstop",
+        }
+    }
+}
+
+/// The kill tag the box says on stderr just after its kill line, when it killed the command of the run whose payload
+/// carries `nonce` itself: `gate-remote-killed: <nonce> timed-out|backstop`. The client reads the box's kill from this
+/// line alone, as a status 124 is also what a stopped job or the command itself may end with.
+pub(crate) fn killed_line(nonce: &str, kill: BoxKill) -> String {
+    format!("gate-remote-killed: {nonce} {}", kill.word())
+}
+
+/// The line the box says on stderr once its watch of the command of the run whose payload carries `nonce` ended and its
+/// readers drained: the load-adjusted seconds it counted, to three decimals, as the journal keeps them,
+/// `gate-remote-adjusted: <nonce> <s.sss>`. Never said once its sampler failed.
+pub(crate) fn adjusted_line(nonce: &str, seconds: f64) -> String {
+    format!("gate-remote-adjusted: {nonce} {seconds:.3}")
+}
+
+/// The prefix of the adjusted line ([`adjusted_line`]) of the run whose payload carries `nonce`, its seconds after it.
+pub(crate) fn adjusted_prefix(nonce: &str) -> String {
+    format!("gate-remote-adjusted: {nonce} ")
 }
 
 /// What runs a routed command on the builder.
@@ -160,6 +207,11 @@ pub(crate) struct RemoteOutcome {
     pub brought_back: Option<bool>,
     /// How long the run's parts took, which a passed line says.
     pub split: Split,
+    /// The load-adjusted seconds the box counted for the command, `None` when it said none.
+    pub adjusted: Option<f64>,
+    /// The kill the box's kill tag named, when the box killed the command itself; the run's verdict comes from it,
+    /// never from the log. `None` for any other end, a kill of the client's own included.
+    pub box_killed: Option<BoxKill>,
 }
 
 /// How long a routed run's parts took: the run call, the command's own time, which its ceiling counts; the push; and the
@@ -405,7 +457,7 @@ mod scripted {
     use gate_win32::Interrupt;
     use serde_json::json;
 
-    use super::{REFUSED, RemoteCall, RemoteClient, RemoteOutcome};
+    use super::{BoxKill, REFUSED, RemoteCall, RemoteClient, RemoteOutcome};
     use crate::run::CONTROL_C_EXIT;
 
     /// How often `wait` looks for its path and the interrupt.
@@ -433,6 +485,8 @@ mod scripted {
         Status(i64),
         Refuse(FallbackReason),
         FailStart(String),
+        Adjusted(f64),
+        BoxKilled(BoxKill),
     }
 
     pub(crate) struct ScriptedClient {
@@ -497,6 +551,15 @@ mod scripted {
                 .parse()
                 .map(Step::Status)
                 .map_err(|_| format!("status takes a whole number, got '{operand}'")),
+            "adjusted" => operand
+                .parse()
+                .map(Step::Adjusted)
+                .map_err(|_| format!("adjusted takes seconds, got '{operand}'")),
+            "box-killed" => [BoxKill::TimedOut, BoxKill::Backstop]
+                .into_iter()
+                .find(|kill| kill.word() == operand)
+                .map(Step::BoxKilled)
+                .ok_or_else(|| format!("box-killed takes timed-out or backstop, got '{operand}'")),
             "refuse" => REASONS
                 .into_iter()
                 .find(|reason| reason.as_str() == operand)
@@ -529,6 +592,11 @@ mod scripted {
             Step::Interrupt => call.interrupt.into_iter().for_each(Interrupt::raise),
             Step::Killed => outcome.killed = true,
             Step::Status(status) => outcome.status = *status,
+            Step::Adjusted(seconds) => outcome.adjusted = Some(*seconds),
+            Step::BoxKilled(kill) => {
+                outcome.killed = true;
+                outcome.box_killed = Some(*kill);
+            }
             Step::Refuse(reason) => {
                 outcome.status = REFUSED;
                 outcome.reason = Some(*reason);

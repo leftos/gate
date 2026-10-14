@@ -225,6 +225,7 @@ fn seam_option(name: &str) -> Option<RunOption> {
         "test-remote-interrupt-at" => Some(RunOption::Value(ValueOption::RemoteInterruptAt)),
         "test-remote-watch-call" => Some(RunOption::Value(ValueOption::RemoteWatchCall)),
         "test-remote-timeout-ms" => Some(RunOption::Value(ValueOption::RemoteTimeoutMs)),
+        "test-remote-backstop-ms" => Some(RunOption::Value(ValueOption::RemoteBackstopMs)),
         "test-local-sdks" => Some(RunOption::Value(ValueOption::LocalSdks)),
         "test-remote-fetch-cap-bytes" => Some(RunOption::Value(ValueOption::RemoteFetchCapBytes)),
         "test-remote-apply-cap-bytes" => Some(RunOption::Value(ValueOption::RemoteApplyCapBytes)),

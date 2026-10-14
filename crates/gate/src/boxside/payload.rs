@@ -5,6 +5,7 @@ use std::ffi::OsStr;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
+use gate_args::MAX_WHOLE_NUMBER;
 use serde_json::{Map, Value};
 
 use crate::outputs::archive::SUFFIX;
@@ -115,6 +116,19 @@ impl Payload {
             Ok(nonce)
         } else {
             Err(format!("gate: box payload Nonce is not 32 lower-case hex digits: {}", escaped(nonce)))
+        }
+    }
+
+    /// The run's ceiling, `Timeout`: whole seconds from 1 to 2147483647, the load-adjusted time the box gives the
+    /// command; `None` when the key is absent or null, a run with no ceiling on the box. Else the usage line.
+    pub(crate) fn timeout(&self) -> Result<Option<u64>, String> {
+        match self.0.get("Timeout") {
+            None | Some(Value::Null) => Ok(None),
+            Some(value) => value
+                .as_u64()
+                .filter(|seconds| (1..=MAX_WHOLE_NUMBER).contains(seconds))
+                .map(Some)
+                .ok_or_else(|| "gate: box payload Timeout is not a whole number of seconds".to_owned()),
         }
     }
 

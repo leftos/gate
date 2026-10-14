@@ -699,11 +699,12 @@ enum Remotely {
 }
 
 /// What a passed line says of how long the command ran: here, by the wall clock and load-adjusted, or on a builder,
-/// by the wall clock, the whole routed run's and its parts'.
+/// by the wall clock, the whole routed run's and its parts', and load-adjusted as the builder counted it, `None` when
+/// it said no figure.
 #[derive(Clone, Copy)]
 enum Pass<'h> {
     Here(Timing),
-    On(&'h str, Duration, Split),
+    On(&'h str, Duration, Split, Option<f64>),
 }
 
 /// A run whose verdict may pass: how long it ran, as its passed line says, and the ceiling it ran under in whole
@@ -1326,8 +1327,9 @@ impl Run<'_> {
     }
 
     /// Ends a run the client ran to its end: the verdict with the passed line on `host`, its markers not scanned when
-    /// the client killed the run or the console was interrupted, and the facts its release carries, with no adjusted
-    /// seconds. It is a kill only when the client killed it, by the kill line in the log.
+    /// the client killed the run or the console was interrupted, and the facts its release carries, with the adjusted
+    /// seconds the box said. It is a kill only when the box's kill tag named one, whose kind is the verdict, or when the
+    /// client killed it, by the kill line in the log.
     fn remote_ended(&mut self, host: &str, outcome: &RemoteOutcome, started: Instant, ceiling: u64, console: &mut Console) -> Ended {
         let interrupted = self.host.interrupt.is_some_and(Interrupt::is_raised);
         let wall = started.elapsed();
@@ -1337,21 +1339,26 @@ impl Run<'_> {
             return self.gate_failed(&problem, None, console);
         }
         let passing = Passing {
-            pass: Pass::On(host, wall, outcome.split),
+            pass: Pass::On(host, wall, outcome.split, outcome.adjusted),
             ceiling,
         };
         match self.verdict(outcome.status, Some(passing), outcome.killed || interrupted, &[], console) {
             Ok(status) => {
-                let kill = if outcome.killed { self.kill_line(console) } else { None };
+                let verdict = if let Some(kill) = outcome.box_killed {
+                    kill.verdict()
+                } else {
+                    let kill = if outcome.killed { self.kill_line(console) } else { None };
+                    Verdict::of(kill.as_deref(), outcome.status, status)
+                };
                 Ended {
                     status,
                     facts: Some(RunFacts {
                         wall_seconds: wall.as_secs_f64(),
-                        adjusted_seconds: None,
+                        adjusted_seconds: outcome.adjusted,
                         avg_cores: None,
                         peak_cores: None,
                         free_cores: None,
-                        verdict: Verdict::of(kill.as_deref(), outcome.status, status),
+                        verdict,
                     }),
                 }
             }
@@ -2404,44 +2411,51 @@ fn last_run(lines: &[String], block: &[String]) -> Option<usize> {
 ///
 /// A run here whose clock has reached its ceiling says so, naming the ceiling it ran past: the load-adjusted clock the
 /// ceiling kill is enforced on, or the wall time the watch falls back to once the sampler has failed. The comparison is
-/// the kill's own, so the line says it ran past exactly when the kill would have fired.
-#[expect(
-    clippy::cast_precision_loss,
-    reason = "the ceiling is read as the double the clock counts in, as the ceiling kill reads it"
-)]
+/// the kill's own, so the line says it ran past exactly when the kill would have fired. A run on a builder says the
+/// same of the clock the builder counted, then its parts.
 fn passed_line(pass: Pass<'_>, ceiling: u64, shown: &str) -> String {
     match pass {
-        Pass::Here(timing) => {
-            let (adjusted, over) = match timing.adjusted {
-                Some(adjusted) => (format!("{} s", whole_seconds(adjusted)), adjusted >= ceiling as f64),
-                None => ("unknown: the sampler failed".to_owned(), timing.wall.as_secs_f64() >= ceiling as f64),
-            };
-            let ceiling = if over {
-                format!("past its ceiling of {ceiling} s")
-            } else {
-                format!("ceiling {ceiling} s")
-            };
-            format!(
-                "gate: passed in {} s (load-adjusted {adjusted}, {ceiling}). Full output: {shown}",
-                whole_seconds(timing.wall.as_secs_f64()),
-            )
-        }
-        Pass::On(host, wall, split) => format!(
-            "gate: passed in {} s on {host} ({}). Full output: {shown}",
+        Pass::Here(timing) => format!(
+            "gate: passed in {} s ({}). Full output: {shown}",
+            whole_seconds(timing.wall.as_secs_f64()),
+            against_ceiling(timing.adjusted, timing.wall, ceiling)
+        ),
+        Pass::On(host, wall, split, adjusted) => format!(
+            "gate: passed in {} s on {host} ({}; {}). Full output: {shown}",
             whole_seconds(wall.as_secs_f64()),
-            split_said(split, ceiling)
+            against_ceiling(adjusted, split.command, ceiling),
+            split_said(split)
         ),
     }
 }
 
-/// What a routed run's passed line says of its parts, `split`: the command's own time against its ceiling of `ceiling`
-/// whole seconds, then each transfer the run made, the push always, in the order they ran, each in whole seconds.
-fn split_said(split: Split, ceiling: u64) -> String {
+/// What a passed line says of the command's clock against its ceiling of `ceiling` whole seconds: its `adjusted`
+/// seconds, or that they are unknown as the sampler failed, and the ceiling, or that the clock ran past it: the
+/// load-adjusted clock, or the command's `wall` time once the sampler failed.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "the ceiling is read as the double the clock counts in, as the ceiling kill reads it"
+)]
+fn against_ceiling(adjusted: Option<f64>, wall: Duration, ceiling: u64) -> String {
+    let (adjusted, over) = match adjusted {
+        Some(adjusted) => (format!("{} s", whole_seconds(adjusted)), adjusted >= ceiling as f64),
+        None => ("unknown: the sampler failed".to_owned(), wall.as_secs_f64() >= ceiling as f64),
+    };
+    if over {
+        format!("load-adjusted {adjusted}, past its ceiling of {ceiling} s")
+    } else {
+        format!("load-adjusted {adjusted}, ceiling {ceiling} s")
+    }
+}
+
+/// What a routed run's passed line says of its parts, `split`: the command's own time, then each transfer the run made,
+/// the push always, in the order they ran, each in whole seconds.
+fn split_said(split: Split) -> String {
     let seconds = |part: Duration| whole_seconds(part.as_secs_f64());
-    let mut transfers = vec![format!("push {} s", seconds(split.push))];
-    transfers.extend(split.sync_back.map(|part| format!("sync-back {} s", seconds(part))));
-    transfers.extend(split.outputs.map(|part| format!("outputs {} s", seconds(part))));
-    format!("command {} s of ceiling {ceiling} s; {}", seconds(split.command), transfers.join(", "))
+    let mut parts = vec![format!("command {} s", seconds(split.command)), format!("push {} s", seconds(split.push))];
+    parts.extend(split.sync_back.map(|part| format!("sync-back {} s", seconds(part))));
+    parts.extend(split.outputs.map(|part| format!("outputs {} s", seconds(part))));
+    parts.join(", ")
 }
 
 /// `seconds` in whole seconds, rounded half to even as the PowerShell gate's `[math]::Round` rounds.
@@ -2929,7 +2943,8 @@ mod tests {
             (
                 "the push alone",
                 pushed,
-                "gate: passed in 301 s on builder (command 76 s of ceiling 300 s; push 224 s). Full output: out.log",
+                Some(70.4),
+                "gate: passed in 301 s on builder (load-adjusted 70 s, ceiling 300 s; command 76 s, push 224 s). Full output: out.log",
             ),
             (
                 "the outputs fetched",
@@ -2937,7 +2952,8 @@ mod tests {
                     outputs: Some(Duration::from_millis(1_600)),
                     ..pushed
                 },
-                "gate: passed in 301 s on builder (command 76 s of ceiling 300 s; push 224 s, outputs 2 s). Full output: out.log",
+                Some(70.4),
+                "gate: passed in 301 s on builder (load-adjusted 70 s, ceiling 300 s; command 76 s, push 224 s, outputs 2 s). Full output: out.log",
             ),
             (
                 "the sync-back and the outputs fetched, in the order they ran",
@@ -2946,11 +2962,40 @@ mod tests {
                     outputs: Some(Duration::ZERO),
                     ..pushed
                 },
-                "gate: passed in 301 s on builder (command 76 s of ceiling 300 s; push 224 s, sync-back 3 s, outputs 0 s). Full output: out.log",
+                Some(70.4),
+                "gate: passed in 301 s on builder (load-adjusted 70 s, ceiling 300 s; command 76 s, push 224 s, sync-back 3 s, outputs 0 s). \
+                 Full output: out.log",
+            ),
+            (
+                "the box's clock at the ceiling",
+                pushed,
+                Some(300.0),
+                "gate: passed in 301 s on builder (load-adjusted 300 s, past its ceiling of 300 s; command 76 s, push 224 s). Full output: out.log",
+            ),
+            (
+                "no figure from the box, the command's wall time under the ceiling",
+                pushed,
+                None,
+                "gate: passed in 301 s on builder (load-adjusted unknown: the sampler failed, ceiling 300 s; command 76 s, push 224 s). \
+                 Full output: out.log",
+            ),
+            (
+                "no figure from the box, the command's wall time past the ceiling",
+                Split {
+                    command: 300 * second,
+                    ..pushed
+                },
+                None,
+                "gate: passed in 301 s on builder (load-adjusted unknown: the sampler failed, past its ceiling of 300 s; command 300 s, push \
+                 224 s). Full output: out.log",
             ),
         ];
-        for (name, split, want) in rows {
-            assert_eq!(passed_line(Pass::On("builder", 301 * second, split), 300, "out.log"), want, "{name}");
+        for (name, split, adjusted, want) in rows {
+            assert_eq!(
+                passed_line(Pass::On("builder", 301 * second, split, adjusted), 300, "out.log"),
+                want,
+                "{name}"
+            );
         }
     }
 

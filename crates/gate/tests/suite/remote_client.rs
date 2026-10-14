@@ -617,7 +617,7 @@ fn a_routed_pass_splits_its_time() {
     assert_eq!(calls(&steps), ["preflight", "run", "outputs"]);
     let line = Regex::new(concat!(
         r"(?m)^gate: passed in \d+ s on builder ",
-        r"\(command \d+ s of ceiling 3600 s; push \d+ s, sync-back \d+ s, outputs \d+ s\)\. ",
+        r"\(load-adjusted \d+ s, ceiling 3600 s; command \d+ s, push \d+ s, sync-back \d+ s, outputs \d+ s\)\. ",
         r"Full output: .*out\.log\r?$",
     ))
     .expect("the pattern is valid");
@@ -2322,26 +2322,167 @@ fn a_stalled_run_call_is_killed_and_the_command_stopped() {
 }
 
 #[test]
-fn a_run_past_its_ceiling_is_killed_with_a_timed_out_line() {
-    let case = client_case("client-timed-out");
+fn a_run_call_past_its_backstop_is_killed_with_the_backstop_line() {
+    let case = client_case("client-backstop");
     let steps = ssh_steps(&case, "ssh", &["ok", &format!("hold {}", never(&case)), "ok"]);
     let tuned = Tuned {
-        extra: &["--test-remote-watch-call", "run", "--test-remote-timeout-ms", WATCHED_MS],
+        extra: &["--test-remote-backstop-ms", WATCHED_MS],
         ..Tuned::default()
     };
 
     let outcome = finish(client_gate_tuned(&case, "out.log", &steps, &tuned, &[r".\tool.exe", "out", "ran there"]));
 
     assert_eq!(outcome.code, Some(124), "{outcome:?}");
-    assert!(outcome.stderr.contains("gate: TIMED OUT after 1 s"), "{outcome:?}");
+    let backstop = Regex::new(
+        r"(?m)^gate: BACKSTOP on \S+: no end after 1 s of wall time \(5 x the 3600 s ceiling \+ 60 s\); killed the run call and stopped the command$",
+    )
+    .expect("the pattern compiles");
+    assert!(backstop.is_match(&outcome.stderr), "{outcome:?}");
     assert!(
         !outcome.stderr.contains(STOPPING),
-        "a ceiling's stop says only its kill line: {outcome:?}"
+        "a backstop's stop says only its kill line: {outcome:?}"
     );
     assert!(!out_log(&case).contains(STOPPING), "{outcome:?}");
-    assert_eq!(verdict(&case), "timed-out");
+    assert_eq!(verdict(&case), "backstop");
     let made = calls(&steps);
     assert!(made_but_maybe(&made, &["preflight", "run", "stop"], "run"), "{made:?}");
+}
+
+/// The real box, given a ceiling of 1 s, kills a command that would run for ten minutes: by its backstop of 5 s of wall
+/// time at the latest, or at its ceiling first when its machine is free enough. The client ends the run as killed on
+/// the box's kill tag, with no stop and no sync-back.
+#[test]
+fn a_command_the_box_kills_at_its_ceiling_ends_the_run_killed_with_no_stop_or_sync_back() {
+    let case = client_case("client-box-killed");
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok", "ok", "ok"]);
+    let tuned = Tuned {
+        timeout: "1",
+        ..Tuned::default()
+    };
+
+    let command = [r".\tool.exe", "mark", "made-on-box.txt", "sleep", "600000"];
+
+    let outcome = finish(client_gate_tuned(&case, "out.log", &steps, &tuned, &command));
+
+    assert_eq!(outcome.code, Some(124), "{outcome:?}");
+    let verdict = verdict(&case);
+    assert!(verdict == "timed-out" || verdict == "backstop", "{verdict}: {outcome:?}");
+    let log = out_log(&case);
+    let kill = Regex::new(r"(?m)^gate: (TIMED OUT|BACKSTOP) on \S+").expect("the pattern compiles");
+    assert!(kill.is_match(&log), "the box's kill line is in the log: {log}");
+    assert!(!log.contains("gate-remote-killed:") && !log.contains("gate-remote-adjusted:"), "{log}");
+    assert_eq!(calls(&steps), ["preflight", "run"], "no stop");
+    assert!(
+        work_folder(&case).join("made-on-box.txt").exists(),
+        "the killed command wrote its file on the builder: {outcome:?}"
+    );
+    assert!(
+        !case.folder().join("made-on-box.txt").exists(),
+        "the file the killed command wrote is not synced back: {outcome:?}"
+    );
+    assert!(!outcome.stderr.contains("gate: synced back"), "{outcome:?}");
+}
+
+/// The builder's work folder of the case's first run.
+fn work_folder(case: &Case) -> PathBuf {
+    case.folder().join("builder").join("work").join(key_of(&events(case)))
+}
+
+/// The box seams a box-kill case gives the box's `run` through the stand-in: a sample every 20 ms of a machine all
+/// free, so the box's clock runs with wall time however loaded the machine running the case is.
+const FREE_BOX: &str = "--test-box-sample-ms 20 --test-box-free-percent 100";
+
+/// The variable whose words the stand-in gives the box's `run` before its verb.
+const BOX_SEAMS_VARIABLE: &str = "GATE_FAKE_SSH_BOX_SEAMS";
+
+/// A box kill whose job the box could not end of every process is still a kill: the box says its note, then its kill
+/// line and tag, so the client journals the kill's verdict and syncs nothing back of what the command wrote.
+#[test]
+fn a_box_kill_that_leaves_a_process_is_still_timed_out_with_no_sync_back() {
+    let case = client_case("client-box-kill-leaves");
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok", "ok", "ok"]);
+    let tuned = Tuned {
+        timeout: "1",
+        ..Tuned::default()
+    };
+    let mut gate = client_gate_tuned(
+        &case,
+        "out.log",
+        &steps,
+        &tuned,
+        &[r".\tool.exe", "mark", "made-on-box.txt", "sleep", "600000"],
+    );
+    gate.env(BOX_SEAMS_VARIABLE, format!("{FREE_BOX} --test-box-kill-leaves 1"));
+
+    let outcome = finish(gate);
+
+    assert_eq!(outcome.code, Some(124), "{outcome:?}");
+    assert_eq!(verdict(&case), "timed-out", "{outcome:?}");
+    let log = out_log(&case);
+    let note = Regex::new(r"(?m)^gate: note: the box's ceiling kill left 1 process\(es\) running in job \S+\r?$").expect("the pattern compiles");
+    assert!(note.is_match(&log), "the box's note is in the log: {log}");
+    assert_eq!(calls(&steps), ["preflight", "run"], "no stop");
+    assert!(
+        work_folder(&case).join("made-on-box.txt").exists(),
+        "the killed command wrote its file on the builder: {outcome:?}"
+    );
+    assert!(
+        !case.folder().join("made-on-box.txt").exists(),
+        "the file the killed command wrote is not synced back: {outcome:?}"
+    );
+    assert!(!outcome.stderr.contains("gate: synced back"), "{outcome:?}");
+}
+
+/// The run call's output floods the log past its cap before the box kills the command, so the box's kill line is not
+/// in the log: the verdict comes from the box's kill tag all the same.
+#[test]
+fn a_box_kill_whose_kill_line_passed_the_log_cap_is_still_timed_out() {
+    let case = client_case("client-box-kill-capped");
+    let steps = ssh_steps(&case, "ssh", &["ok", "lines 200 1000", "ok", "ok"]);
+    let tuned = Tuned {
+        timeout: "1",
+        extra: &["--test-remote-log-cap-bytes", LOG_CAP],
+        ..Tuned::default()
+    };
+    let mut gate = client_gate_tuned(&case, "out.log", &steps, &tuned, &[r".\tool.exe", "sleep", "600000"]);
+    gate.env(BOX_SEAMS_VARIABLE, FREE_BOX);
+
+    let outcome = finish(gate);
+
+    assert_eq!(outcome.code, Some(124), "{outcome:?}");
+    let log = out_log(&case);
+    assert_eq!(cuts(&log), 1, "the run call's output passed the cap: {log}");
+    assert!(!log.contains("TIMED OUT"), "the box's kill line is past the cap: {log}");
+    assert_eq!(verdict(&case), "timed-out", "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "run"], "no stop");
+}
+
+/// The real box runs a command that writes a file, says a kill line of its own and exits 124 with no kill tag: an
+/// ordinary status, so the run is no kill and its file is synced back.
+#[test]
+fn a_124_of_the_command_s_own_with_no_kill_tag_is_no_kill() {
+    let case = client_case("client-own-124");
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok", "ok", "ok"]);
+    let command = [
+        r".\tool.exe",
+        "mark",
+        "made-on-box.txt",
+        "err",
+        "gate: TIMED OUT on builder after 1 s of load-adjusted time",
+        "exit",
+        "124",
+    ];
+
+    let outcome = finish(client_gate_tuned(&case, "out.log", &steps, &Tuned::default(), &command));
+
+    assert_eq!(outcome.code, Some(124), "{outcome:?}");
+    assert_eq!(verdict(&case), "failed");
+    assert_eq!(calls(&steps), ["preflight", "run"], "nothing stopped");
+    assert!(
+        case.folder().join("made-on-box.txt").exists(),
+        "the file the command wrote is synced back: {outcome:?}"
+    );
+    assert!(outcome.stderr.contains("gate: synced back 1 file(s): made-on-box.txt"), "{outcome:?}");
 }
 
 /// The `--timeout` of a case whose push is held past it, in seconds: the command's ceiling, which the push must not
@@ -2361,7 +2502,7 @@ fn held_past_the_ceiling(gate: Command, steps: &Path, go: &Go) -> (Running, Inst
     (running, begun)
 }
 
-/// The run call is given a ceiling of its own far past any wait, so only the push could pass [`SHORT_CEILING`].
+/// The run call is given a backstop of its own far past any wait, so only the push could pass [`SHORT_CEILING`].
 #[test]
 fn a_push_slower_than_the_command_s_ceiling_is_not_cut_by_it() {
     let case = client_case("client-slow-push");
@@ -2370,7 +2511,7 @@ fn a_push_slower_than_the_command_s_ceiling_is_not_cut_by_it() {
     let tuned = Tuned {
         kind: "local-ssh",
         timeout: SHORT_CEILING,
-        extra: &["--test-remote-watch-call", "run", "--test-remote-timeout-ms", "600000"],
+        extra: &["--test-remote-backstop-ms", "600000"],
         ..Tuned::default()
     };
     let gate = client_gate_tuned(&case, "out.log", &steps, &tuned, &[r".\tool.exe", "out", "ran there"]);
@@ -2386,10 +2527,10 @@ fn a_push_slower_than_the_command_s_ceiling_is_not_cut_by_it() {
     assert_eq!(&calls(&steps)[..3], ["preflight", "git-receive-pack", "run"]);
 }
 
-/// The push is held past the ceiling, then the run call is held until the client kills it: the ceiling counts from the
-/// run call's start, so the run ends no sooner than the held push and the whole ceiling after it.
+/// The push is held past the ceiling, then the run call is held until the client's backstop kills it: the backstop
+/// counts from the run call's start, so the run ends no sooner than the held push and the whole backstop after it.
 #[test]
-fn a_command_past_its_ceiling_is_still_timed_out_after_the_ceiling() {
+fn a_run_call_past_its_backstop_is_cut_only_after_the_whole_backstop_from_its_own_start() {
     let case = client_case("client-command-ceiling");
     let go = Go(case.folder().join("ssh").join("go"));
     let held = format!("hold {}", shown(go.path()));
@@ -2397,6 +2538,7 @@ fn a_command_past_its_ceiling_is_still_timed_out_after_the_ceiling() {
     let tuned = Tuned {
         kind: "local-ssh",
         timeout: SHORT_CEILING,
+        extra: &["--test-remote-backstop-ms", "2000"],
         ..Tuned::default()
     };
     let gate = client_gate_tuned(&case, "out.log", &steps, &tuned, &[r".\tool.exe", "out", "ran there"]);
@@ -2406,10 +2548,15 @@ fn a_command_past_its_ceiling_is_still_timed_out_after_the_ceiling() {
     let took = begun.elapsed();
 
     assert_eq!(outcome.code, Some(124), "{outcome:?}");
-    assert!(outcome.stderr.contains("gate: TIMED OUT after 2 s"), "{outcome:?}");
+    assert!(
+        outcome
+            .stderr
+            .contains("no end after 2 s of wall time (5 x the 2 s ceiling + 60 s); killed the run call and stopped the command"),
+        "{outcome:?}"
+    );
     assert!(!outcome.stderr.contains("unreachable"), "the push was not cut: {outcome:?}");
-    assert_eq!(verdict(&case), "timed-out");
-    assert!(took >= Duration::from_millis(4500), "the held push, then the whole ceiling: {took:?}");
+    assert_eq!(verdict(&case), "backstop");
+    assert!(took >= Duration::from_millis(4500), "the held push, then the whole backstop: {took:?}");
     let made = calls(&steps);
     assert!(
         made_but_maybe(&made, &["preflight", "git-receive-pack", "run", "stop"], "run"),
