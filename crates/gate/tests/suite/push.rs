@@ -18,7 +18,7 @@ use flate2::read::GzDecoder;
 use serde_json::{Value, json};
 
 use crate::install::unix;
-use crate::support::{Case, FAKE_TOOL, GATE, Outcome, beside, finish, shown, start, version_of, write_remote_json};
+use crate::support::{Case, FAKE_TOOL, GATE, Outcome, beside, finish, names, shown, start, version_of, write_remote_json};
 
 /// The suite's stand-in for ssh, which `--test-push-ssh` names.
 const FAKE_SSH: &str = env!("CARGO_BIN_EXE_fake-ssh");
@@ -164,16 +164,6 @@ static VERSION: LazyLock<String> = LazyLock::new(|| version_of(Path::new(GATE)))
 /// [`VERSION`].
 fn version() -> &'static str {
     &VERSION
-}
-
-/// The names of the entries in `folder`, in name order.
-fn names(folder: &Path) -> Vec<String> {
-    let mut names: Vec<String> = fs::read_dir(folder)
-        .expect("the folder can be listed")
-        .map(|entry| entry.expect("an entry can be read").file_name().to_string_lossy().into_owned())
-        .collect();
-    names.sort();
-    names
 }
 
 /// Asserts the file at `path` holds `bytes`, without printing either.
@@ -338,6 +328,36 @@ fn a_push_replaces_an_older_gate() {
 }
 
 #[test]
+fn a_verified_install_deletes_older_aside_copies_but_keeps_its_own() {
+    let case = push_case("a_verified_install_deletes_older_aside_copies_but_keeps_its_own");
+    let old = old_gate();
+    builder_file(&case, HOST, "gate.exe", &old);
+    builder_file(&case, HOST, ASIDE, b"an old gate no process runs");
+    let steps = steps(&case, &["ok"]);
+
+    let outcome = push(&case, &steps);
+
+    let version = version();
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(
+        unix(&outcome.stdout),
+        format!("push: {HOST}: sending gate {version}\npush: {HOST}: replaced gate {OLD_VERSION}\npush: {HOST}: installed gate {version}\n"),
+        "{outcome:?}"
+    );
+    assert_eq!(outcome.stderr, "", "{outcome:?}");
+    let bin = builder_bin(&case, HOST);
+    let names = names(&bin);
+    assert_eq!(names.len(), 3, "the gate, its own aside copy and the lock: {names:?}");
+    assert_eq!((names[0].as_str(), names[2].as_str()), ("gate.exe", "push.lock"), "{names:?}");
+    let own = &names[1];
+    assert!(
+        own != ASIDE && is_aside_name(own),
+        "the older aside copy was deleted, the push's own kept: {names:?}"
+    );
+    assert_holds(&bin.join(own), &old);
+}
+
+#[test]
 fn a_push_tries_every_builder_and_fails_if_one_did() {
     let case = Case::new("a_push_tries_every_builder_and_fails_if_one_did");
     install_gate(&case);
@@ -392,8 +412,8 @@ fn a_held_aside_copy_is_left_silently() {
 }
 
 #[test]
-fn an_unheld_aside_copy_is_cleaned_up_first() {
-    let case = push_case("an_unheld_aside_copy_is_cleaned_up_first");
+fn an_unheld_aside_copy_is_cleaned_up_after_a_verified_install() {
+    let case = push_case("an_unheld_aside_copy_is_cleaned_up_after_a_verified_install");
     builder_file(&case, HOST, ASIDE, b"an old gate no process runs");
     let steps = steps(&case, &["ok"]);
 
@@ -468,6 +488,93 @@ fn a_push_while_another_holds_the_builder_lock_touches_nothing() {
     let bin = builder_bin(&case, HOST);
     assert_eq!(names(&bin), ["gate.exe", ASIDE, "push.lock"], "nothing was cleaned up or replaced");
     assert_holds(&bin.join("gate.exe"), &old);
+}
+
+/// A push that finds this PC's lock held, as `tools/install.ps1` holds it while it replaces and checks the installed
+/// gate, reads nothing and calls no builder.
+#[test]
+fn a_push_while_an_install_holds_the_local_lock_sends_nothing() {
+    let case = push_case("a_push_while_an_install_holds_the_local_lock_sends_nothing");
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .share_mode(0)
+        .open(installed_gate(&case).with_file_name("push.lock"))
+        .expect("the lock can be held");
+    let steps = steps(&case, &["ok"]);
+
+    let outcome = push(&case, &steps);
+
+    drop(lock);
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert_eq!(outcome.stdout, "", "{outcome:?}");
+    assert_eq!(
+        unix(&outcome.stderr),
+        "push: an install is in progress on this PC; nothing was sent\n",
+        "{outcome:?}"
+    );
+    assert_eq!(calls(&steps), Vec::<String>::new(), "no builder was called");
+}
+
+/// A `push.lock` on this PC that is a second name of another file is refused as a link is, and nothing is sent.
+#[test]
+fn a_push_lock_that_is_a_hard_link_is_refused() {
+    let case = push_case("a_push_lock_that_is_a_hard_link_is_refused");
+    let other = case.folder().join("other.txt");
+    fs::write(&other, b"another file").expect("the other file is written");
+    let lock = installed_gate(&case).with_file_name("push.lock");
+    fs::hard_link(&other, &lock).expect("push.lock is made a second name of the other file");
+    let steps = steps(&case, &["ok"]);
+
+    let outcome = push(&case, &steps);
+
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert_eq!(outcome.stdout, "", "{outcome:?}");
+    assert_eq!(
+        unix(&outcome.stderr),
+        format!("push: {} is a link; nothing was sent\n", lock.display()),
+        "{outcome:?}"
+    );
+    assert_eq!(calls(&steps), Vec::<String>::new(), "no builder was called");
+    assert_eq!(
+        fs::read(&other).expect("the other file is read"),
+        b"another file",
+        "the other file is untouched"
+    );
+}
+
+/// A `push.lock` on this PC that is a junction, which cannot be opened as a file, is refused as a link is, and nothing
+/// is sent.
+#[test]
+fn a_push_lock_that_is_a_junction_is_refused() {
+    let case = push_case("a_push_lock_that_is_a_junction_is_refused");
+    let elsewhere = case.folder().join("elsewhere");
+    fs::create_dir_all(&elsewhere).expect("the link's target can be made");
+    let lock = installed_gate(&case).with_file_name("push.lock");
+    let linked = Command::new("cmd")
+        .args(["/c", "mklink", "/J"])
+        .arg(&lock)
+        .arg(&elsewhere)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .status()
+        .expect("cmd starts");
+    assert!(linked.success(), "the junction is made");
+    let steps = steps(&case, &["ok"]);
+
+    let outcome = push(&case, &steps);
+
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert_eq!(outcome.stdout, "", "{outcome:?}");
+    assert_eq!(
+        unix(&outcome.stderr),
+        format!("push: {} is a link; nothing was sent\n", lock.display()),
+        "{outcome:?}"
+    );
+    assert_eq!(calls(&steps), Vec::<String>::new(), "no builder was called");
+    assert!(names(&elsewhere).is_empty(), "nothing was written through the link");
 }
 
 #[test]

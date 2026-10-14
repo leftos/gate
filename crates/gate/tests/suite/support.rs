@@ -866,6 +866,16 @@ pub fn shown(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
+/// The names of the entries in `folder`, in name order.
+pub(crate) fn names(folder: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(folder)
+        .expect("the folder can be listed")
+        .map(|entry| entry.expect("an entry can be read").file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
 /// The path of `path` with `suffix` after its name, as fake-ssh names the files it keeps beside its steps file.
 pub fn beside(path: &Path, suffix: &str) -> PathBuf {
     let mut beside = path.as_os_str().to_owned();

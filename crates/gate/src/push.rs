@@ -11,6 +11,7 @@ use std::fmt::Write as _;
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::windows::ffi::OsStrExt;
+use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
 use std::sync::LazyLock;
 use std::thread;
@@ -24,6 +25,7 @@ use gate_args::PushRequest;
 use gate_win32::{EnvironmentBlock, Job, LaunchError, PipedConsole, PipedFed, PipedLaunch, Running};
 use regex::Regex;
 use sha2::{Digest, Sha256};
+use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT};
 
 use crate::answer::FAILED_STATUS;
 use crate::boxside::payload::escaped;
@@ -40,12 +42,17 @@ const BOUND: Duration = Duration::from_secs(300);
 const VERSION_BOUND: Duration = Duration::from_secs(30);
 /// What starts each of the builder script's lines this side reads.
 const MARK: &str = "gate-push: ";
-/// The most `gate-push: ` lines kept of one call; a later one takes the last place, so the call's last is kept.
+/// What starts a builder script's `note` line.
+const NOTE_MARK: &str = "gate-push: note ";
+/// The most `gate-push: ` lines kept of one call; once they are full, a later note takes the last note's place and any
+/// other line the last note's, else the last place, so the facts and the call's last line are kept ([`Kept::mark`]).
 const MARKED_CAP: usize = 16;
 /// The most bytes kept of one line of a call's output; the rest of a longer line is skipped.
 const LINE_CAP: u64 = 64 * 1024;
 /// What the builder's cmd runs: pwsh with [`BOOTSTRAP`], as UTF-16LE base64, its one other word.
 const PWSH: &str = "pwsh -NoProfile -NonInteractive -OutputFormat Text -EncodedCommand ";
+/// The Win32 error of an open refused because another handle shares nothing.
+const ERROR_SHARING_VIOLATION: i32 = 32;
 /// The stand-in for the exe's SHA-256, as upper-case hex, in [`SCRIPT`].
 const SHA_SLOT: &str = "@SHA@";
 
@@ -54,58 +61,110 @@ const SHA_SLOT: &str = "@SHA@";
 /// through `[Console]::In`, one buffered reader, so the script reads on from where the bootstrap's line ended.
 const BOOTSTRAP: &str = "$l=[Console]::In.ReadLine();. ([ScriptBlock]::Create([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($l))))";
 
-/// The builder script, run by [`BOOTSTRAP`], as `tools/install.ps1` installs: it reads the rest of stdin, the exe as
+/// The builder script, run by [`BOOTSTRAP`], as `tools/install.ps1` installs: on a pwsh older than 7.2, whose .NET
+/// lacks what its file checks call, it says `failed` and touches nothing. It reads the rest of stdin, the exe as
 /// base64 of its gzip, decompresses it, and refuses bytes whose SHA-256 is not the one this side put in for
-/// [`SHA_SLOT`]. In `%LOCALAPPDATA%\gate\bin`, made when missing and refused when it is a link, it first holds
-/// `push.lock` open, unshared, to its end, so a second push to the builder at once says `failed` and touches nothing;
-/// a `push.lock` that is a link is refused, and the plain file is left in place, since the open handle is the lock. It
-/// deletes each `gate.exe.*.old`, and each `gate.exe.<pid>.tmp` of another pid, that no process holds, saying `note`
-/// and why for one it cannot delete. With a `gate.exe` of the same SHA-256 it says `same` and its version; else it
-/// writes `gate.exe.<pid>.tmp` afresh, moves the old exe aside to `gate.exe.<yyyyMMddHHmmss>.<pid>.old` and the temp
-/// into place, checks the installed copy's SHA-256, and on a failure, the check's own included, moves the aside copy
-/// back, or removes the installed copy when there was no old exe; then it says `replaced` and the old version when it
-/// read one, and `installed` and the new one. A failure says `failed` and why, and exits 1. Each version read is
-/// bounded at 30 s.
+/// [`SHA_SLOT`]. It then adds its file checks, a small C# type, and fails before anything is touched when that cannot
+/// be done. In `%LOCALAPPDATA%\gate\bin`, made when missing and refused when it is a link, it first holds `push.lock`
+/// open, unshared, to its end, so a second push to the builder at once says `failed` and touches nothing. `push.lock` is
+/// opened without following a link and refused as a link when it is one, a second name of another file, a folder or a
+/// junction; the plain file is left in place, since the open handle is the lock. It deletes each `gate.exe.<pid>.tmp`
+/// of another pid that no process holds, saying `note` and why for one it cannot delete. With a `gate.exe` of the same
+/// SHA-256 it says `same` and its version; else it writes `gate.exe.<pid>.tmp` afresh and reads its file id, the volume
+/// serial number and the 128-bit id within the volume, from the handle that wrote it; the rename into place keeps the
+/// id. It moves the old exe aside to `gate.exe.<yyyyMMddHHmmss>.<pid>.old` and the temp into place, never by force,
+/// checks the installed copy's SHA-256 and that it answers `--version` with `gate <version>`, and on a failure, the
+/// check's own included, moves the aside copy back, or removes the installed copy when there was no old exe, but only
+/// while `gate.exe` is missing or still the push's own file, the one with the temp copy's file id. An id it cannot
+/// read is tried three times, 300 ms apart, and a file gone at any try or 300 ms after the last counts as missing. Over
+/// a missing one it moves never by force: one another process placed is left as it is. Then it says `replaced` and
+/// the old version when it read one, and `installed` and the new one. Only an installed gate that answers lets it
+/// delete the `gate.exe.*.old` copies no process holds, its own aside copy kept, with the same `note` for one it cannot
+/// delete or a folder it cannot list; a push that ends with no such gate, a failed one included, keeps every aside
+/// copy, and says `kept` and their number when there are any and it ends with `gate.exe` missing or one it could not
+/// verify in place. A failure says `failed` and why, and exits 1. Each version read is bounded at 30 s, and a version
+/// read that is killed at its bound is waited for up to 10 s more; one that cannot be stopped says `note` and why.
 const SCRIPT: &str = r#"$ErrorActionPreference='Stop';$ProgressPreference='SilentlyContinue'
 function Say($k,$t){[Console]::Out.WriteLine("gate-push: $k $t")}
-function Fail($t){Say failed $t;exit 1}
+function Tally{try{$n=@(Get-ChildItem -LiteralPath $dir -File|?{$_.Name -like 'gate.exe.*.old'}).Count;if($n){Say kept $n}}
+catch{Say note "could not list ${dir}: $($_.Exception.Message)"}}
+function Fail($t){if($locked -and ($st.u -or !(Test-Path -LiteralPath $g))){Tally};Say failed $t;exit 1}
 function Ver($p){try{$x=[Diagnostics.Process]::Start([Diagnostics.ProcessStartInfo]@{FileName=$p;Arguments='--version';RedirectStandardOutput=1;RedirectStandardError=1;UseShellExecute=0})}catch{return ''}
 $o=$x.StandardOutput.ReadToEndAsync();$e=$x.StandardError.ReadToEndAsync()
-if(!$x.WaitForExit(30000)){$x.Kill($true);return ''}
+if(!$x.WaitForExit(30000)){try{$x.Kill($true)}catch{Say note "could not stop the version read of ${p}: $($_.Exception.Message)"}
+[void]$x.WaitForExit(10000);return ''}
 if(($o.Result -split '\r?\n')[0] -notmatch '^gate\s+(.+?)\s*$'){return ''};$Matches[1]}
 function Held($p){try{[IO.File]::Open($p,'Open','ReadWrite','None').Dispose();$false}catch{$_.Exception.GetBaseException().HResult -eq -2147024864}}
 function Drop($p){Remove-Item -LiteralPath $p -Force -EA Ignore}
-function Back($m){if(!$a){if(Test-Path -LiteralPath $g){
+function Purge($p){try{Remove-Item -LiteralPath $p -Force}catch{if(!(Held $p)){Say note "could not delete ${p}: $($_.Exception.Message)"}}}
+function Clean{try{$fs=@(Get-ChildItem -LiteralPath $dir -File|?{$_.Name -like 'gate.exe.*.old' -and (Join-Path $dir $_.Name) -ne $a})}
+catch{Say note "could not delete the aside copies in ${dir}: $($_.Exception.Message)";return}
+foreach($f in $fs){Purge $f.FullName}}
+function Mine{foreach($i in 1..3){if(!(Test-Path -LiteralPath $g)){return 'missing'}
+try{if([GateFile]::Of($g) -eq $st.i){return 'mine'};return 'foreign'}
+catch{if($_.Exception.GetBaseException() -is [IO.FileNotFoundException]){return 'missing'};Start-Sleep -Milliseconds 300}}
+if(Test-Path -LiteralPath $g){'foreign'}else{'missing'}}
+function Placed($m){$st.u=1;$t="$m; another gate.exe was placed meanwhile and was left as it is"
+if($a){$t+=", the previous gate.exe is at $a"};Fail $t}
+function Back($m){$w=Mine;if($w -eq 'foreign'){Placed $m}
+if(!$a){if($w -eq 'mine'){
 try{Remove-Item -LiteralPath $g -Force}catch{Fail "$m; the copy at $g could not be removed: $($_.Exception.Message)"}}
 Fail "$m; the copy was removed and no earlier gate.exe existed"}
-try{Move-Item -LiteralPath $a -Destination $g -Force}catch{Fail "$m; the previous gate.exe is at $a"}
-Fail "$m; the previous gate.exe is back in place"}
+try{if($w -eq 'mine'){Move-Item -LiteralPath $a -Destination $g -Force}else{Move-Item -LiteralPath $a -Destination $g}}
+catch{if($w -eq 'missing' -and (Test-Path -LiteralPath $g)){Placed $m};Fail "$m; the previous gate.exe is at $a"}
+$st.u=0;Fail "$m; the previous gate.exe is back in place"}
+$pv=$PSVersionTable.PSVersion;if([version]"$($pv.Major).$($pv.Minor)" -lt [version]'7.2'){Fail "the builder needs pwsh 7.2 or later (it has $pv)"}
 if(!$env:LOCALAPPDATA){Fail 'LOCALAPPDATA is not set'}
-$dir=Join-Path $env:LOCALAPPDATA 'gate\bin';$g=Join-Path $dir 'gate.exe';$a=$null;$ci="could not install ${g}:"
+$dir=Join-Path $env:LOCALAPPDATA 'gate\bin';$g=Join-Path $dir 'gate.exe';$a=$null;$ci="could not install ${g}:";$st=@{u=0;i=''}
 try{$u=[IO.MemoryStream]::new()
 $z=[IO.MemoryStream]::new([Convert]::FromBase64String([Console]::In.ReadToEnd()))
 [IO.Compression.GZipStream]::new($z,[IO.Compression.CompressionMode]::Decompress).CopyTo($u)
 $b=$u.ToArray()}catch{Fail "the copy could not be read: $($_.Exception.Message)"}
 if([Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($b)) -ne '@SHA@'){Fail 'the copy arrived damaged'}
+try{Add-Type -TypeDefinition 'using System;using System.ComponentModel;using System.IO;using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+public static class GateFile{const uint ReadWrite=0xC0000000,OpenAlways=4,NoFollow=0x200080,Folder=0x10,Link=0x400;
+const int Busy=-2147024864,FileIdInfo=18;
+[DllImport("kernel32.dll",SetLastError=true,CharSet=CharSet.Unicode)]
+static extern SafeFileHandle CreateFileW(string n,uint a,uint s,IntPtr p,uint d,uint f,IntPtr t);
+[DllImport("kernel32.dll",SetLastError=true,CharSet=CharSet.Unicode)]static extern uint GetFileAttributesW(string n);
+[DllImport("kernel32.dll",SetLastError=true)]static extern bool GetFileInformationByHandle(SafeFileHandle h,[Out] uint[] i);
+[DllImport("kernel32.dll",SetLastError=true)]static extern bool GetFileInformationByHandleEx(SafeFileHandle h,int c,[Out] byte[] i,uint n);
+static IOException Error(string t){int e=Marshal.GetLastPInvokeError();
+return new IOException(t+new Win32Exception(e).Message,unchecked((int)0x80070000)|e);}
+public static string Id(SafeFileHandle h){var i=new byte[24];
+if(!GetFileInformationByHandleEx(h,FileIdInfo,i,24)){throw Error("the file id could not be read: ");}return Convert.ToHexString(i);}
+public static string Of(string p){using(var h=File.OpenHandle(p,FileMode.Open,FileAccess.Read,FileShare.ReadWrite|FileShare.Delete)){return Id(h);}}
+public static FileStream OpenLock(string p){var h=CreateFileW(p,ReadWrite,0,IntPtr.Zero,OpenAlways,NoFollow,IntPtr.Zero);
+if(h.IsInvalid){var x=Error("");h.Dispose();var a=GetFileAttributesW(p);
+if(x.HResult!=Busy&&a!=uint.MaxValue&&(a&(Folder|Link))!=0){return null;}throw x;}
+var i=new uint[13];if(!GetFileInformationByHandle(h,i)){var x=Error("");h.Dispose();throw x;}
+if((i[0]&Link)!=0||i[10]!=1){h.Dispose();return null;}
+return new FileStream(h,FileAccess.ReadWrite);}}'}catch{Fail "could not prepare the install: $($_.Exception.Message)"}
 try{New-Item -ItemType Directory -Path $dir -Force|Out-Null}catch{Fail "could not create ${dir}: $($_.Exception.Message)"}
 if((Get-Item -LiteralPath $dir).LinkType){Fail "$dir is a link"}
-$pl=Join-Path $dir 'push.lock';if((Get-Item -LiteralPath $pl -Force -EA Ignore).LinkType){Fail "$pl is a link"}
-try{$lock=[IO.File]::Open($pl,'OpenOrCreate','ReadWrite','None')}catch{$x=$_.Exception.GetBaseException()
+$pl=Join-Path $dir 'push.lock'
+try{$lock=[GateFile]::OpenLock($pl)}catch{$x=$_.Exception.GetBaseException()
 if($x.HResult -eq -2147024864){Fail 'another gate push is installing on this builder'};Fail "could not lock ${dir}: $($x.Message)"}
-foreach($f in Get-ChildItem -LiteralPath $dir -File|?{$_.Name -like 'gate.exe.*.old' -or ($_.Name -match '^gate\.exe\.(\d+)\.tmp$' -and $Matches[1] -ne $PID)}){
-try{Remove-Item -LiteralPath $f.FullName -Force}catch{if(!(Held $f.FullName)){Say note "could not delete $($f.FullName): $($_.Exception.Message)"}}}
-if((Test-Path -LiteralPath $g) -and (Get-FileHash -LiteralPath $g).Hash -eq '@SHA@'){Say same (Ver $g);exit 0}
+if($null -eq $lock){Fail "$pl is a link"}
+$locked=1
+foreach($f in Get-ChildItem -LiteralPath $dir -File|?{$_.Name -match '^gate\.exe\.(\d+)\.tmp$' -and $Matches[1] -ne $PID}){Purge $f.FullName}
+if((Test-Path -LiteralPath $g) -and (Get-FileHash -LiteralPath $g).Hash -eq '@SHA@'){$v=Ver $g;if($v){Clean}else{Tally};Say same $v;exit 0}
 $tmp="$g.$PID.tmp";Drop $tmp
-try{$s=[IO.File]::Open($tmp,'CreateNew','Write','None');try{$s.Write($b,0,$b.Length)}finally{$s.Dispose()}}catch{Drop $tmp;Fail "$ci $($_.Exception.Message)"}
+try{$s=[IO.File]::Open($tmp,'CreateNew','Write','None');try{$s.Write($b,0,$b.Length);$st.i=[GateFile]::Id($s.SafeFileHandle)}finally{$s.Dispose()}}
+catch{Drop $tmp;Fail "$ci $($_.Exception.Message)"}
 $old=''
 if(Test-Path -LiteralPath $g){$old=Ver $g;$a="$g.$(Get-Date -Format yyyyMMddHHmmss).$PID.old"
 try{Move-Item -LiteralPath $g -Destination $a -Force}catch{Drop $tmp;Fail "$ci $($_.Exception.Message)"}}
-try{Move-Item -LiteralPath $tmp -Destination $g -Force}catch{$m=$_.Exception.Message;Drop $tmp
+try{Move-Item -LiteralPath $tmp -Destination $g}catch{$m=$_.Exception.Message;Drop $tmp
 if(!$a){Fail "$ci $m; nothing was installed and no earlier gate.exe existed"};Back "$ci $m"}
+$st.u=1
 try{$h=(Get-FileHash -LiteralPath $g).Hash}catch{Back "$ci $($_.Exception.Message)"}
 if($h -ne '@SHA@'){Back 'the installed copy does not match'}
+$v=Ver $g;if(!$v){Back 'the installed gate.exe does not run'}
+Clean
 if($old){Say replaced $old}
-Say installed (Ver $g)
+Say installed $v
 "#;
 
 /// `gate --version`'s line, matched in any letter case as PowerShell's `-match` does: the version is what follows
@@ -185,9 +244,14 @@ fn prepared(environment: &Environment, variables: &[(OsString, OsString)]) -> Re
         .ok_or_else(|| "push: no remote.json: LOCALAPPDATA is not an absolute folder".to_owned())?;
     let gate = folder.join("gate");
     let builders = builders(&gate.join("remote.json"))?;
-    let exe = gate.join("bin").join("gate.exe");
+    let bin = gate.join("bin");
+    let exe = bin.join("gate.exe");
+    // The lock tools/install.ps1 holds while it replaces and checks the exe, held for the read and the version only;
+    // with no bin folder there is no exe, which the read says.
+    let lock = if bin.is_dir() { Some(local_lock(&bin)?) } else { None };
     let bytes = installed(&exe)?;
     let version = shown(&local_version(&exe, variables)?);
+    drop(lock);
     let line = push_line();
     let input = pushed_input(&sha256_hex(&bytes), &bytes);
     Ok(Prepared {
@@ -227,6 +291,45 @@ fn builders(path: &Path) -> Result<Vec<String>, String> {
         Err(problem) => Err(ignored(&problem.reason)),
         Ok(Some(config)) => config.builders().map(<[String]>::to_vec).map_err(ignored),
     }
+}
+
+/// `bin`'s `push.lock`, held open unshared until the file is dropped, as the builder script and `tools/install.ps1`
+/// hold it; else the line saying an install holds it, it is a link, or why it could not be taken. It is opened without
+/// following a link there and kept only when the opened handle is a plain file with one name, so a link, a hard link
+/// included, is refused, and nothing can swap the file between the check and the open. One that cannot be opened is
+/// looked at without following a link: a link or a folder there, which no file open takes, is refused as a link too.
+fn local_lock(bin: &Path) -> Result<File, String> {
+    let path = bin.join("push.lock");
+    let linked = || format!("push: {} is a link; nothing was sent", path.display());
+    let unlocked = |error: &io::Error| format!("push: could not lock {}: {error}; nothing was sent", bin.display());
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .share_mode(0)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(&path)
+        .map_err(|error| {
+            if error.raw_os_error() == Some(ERROR_SHARING_VIOLATION) {
+                "push: an install is in progress on this PC; nothing was sent".to_owned()
+            } else if is_link_or_folder(&path) {
+                linked()
+            } else {
+                unlocked(&error)
+            }
+        })?;
+    match gate_win32::check_plain_file(&file) {
+        Ok(()) => Ok(file),
+        // A refusal carries no system error code; a handle that could not be inspected carries the system's.
+        Err(error) if error.raw_os_error().is_none() => Err(linked()),
+        Err(error) => Err(unlocked(&error)),
+    }
+}
+
+/// Whether `path`, looked at without following a link, is a link or a folder; `false` when it cannot be looked at.
+fn is_link_or_folder(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_attributes() & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT) != 0)
 }
 
 /// The installed exe's bytes; else the line saying there is none or it cannot be read.
@@ -306,8 +409,8 @@ enum End {
     Failed(String),
 }
 
-/// What a call said: how it ended, the first line of its standard output, its first [`MARKED_CAP`] `gate-push: `
-/// lines, the last in the last place, its last standard error line that is not blank, and the first problem feeding or
+/// What a call said: how it ended, the first line of its standard output, up to [`MARKED_CAP`] of its `gate-push: `
+/// lines as [`Kept::mark`] keeps them, its last standard error line that is not blank, and the first problem feeding or
 /// reading it. Every line is cut to [`LINE_CAP`] bytes.
 #[derive(Debug)]
 struct Heard {
@@ -404,8 +507,8 @@ fn fed(mut stdin: File, input: &[u8]) -> Result<(), String> {
         .map_err(|error| format!("cannot feed the call: {error}"))
 }
 
-/// What one stream of a call kept: its first line, its `gate-push: ` lines up to [`MARKED_CAP`], its last line that is
-/// not blank, and the problem that ended the reading early.
+/// What one stream of a call kept: its first line, its `gate-push: ` lines up to [`MARKED_CAP`] as [`Kept::mark`]
+/// keeps them, its last line that is not blank, and the problem that ended the reading early.
 #[derive(Debug, Default)]
 struct Kept {
     first: Option<String>,
@@ -420,14 +523,30 @@ impl Kept {
             self.first = Some(line.clone());
         }
         if line.starts_with(MARK) {
-            if self.marked.len() >= MARKED_CAP {
-                self.marked.pop();
-            }
-            self.marked.push(line.clone());
+            self.mark(line.clone());
         }
         if !line.trim().is_empty() {
             self.last = Some(line);
         }
+    }
+
+    /// Keeps the `gate-push: ` line `line` within [`MARKED_CAP`] lines: once they are full, a note takes the last note's
+    /// place and is dropped when none is kept, and any other line takes the last note's place, else the last place, so
+    /// notes never push out a fact.
+    fn mark(&mut self, line: String) {
+        if self.marked.len() >= MARKED_CAP {
+            let last_note = self.marked.iter().rposition(|kept| kept.starts_with(NOTE_MARK));
+            match last_note {
+                Some(at) => {
+                    self.marked.remove(at);
+                }
+                None if line.starts_with(NOTE_MARK) => return,
+                None => {
+                    self.marked.pop();
+                }
+            }
+        }
+        self.marked.push(line);
     }
 }
 
@@ -472,6 +591,8 @@ fn joined(read: thread::Result<Kept>) -> Kept {
 #[derive(Debug, PartialEq, Eq)]
 enum Fact {
     Note(String),
+    /// The number of aside copies a push that ended with no verified gate kept.
+    Kept(String),
     Same(String),
     Replaced(String),
     Installed(String),
@@ -485,6 +606,7 @@ fn fact(line: &str) -> Option<Fact> {
     let text = text.trim().to_owned();
     match kind {
         "note" => Some(Fact::Note(text)),
+        "kept" => Some(Fact::Kept(text)),
         "same" => Some(Fact::Same(text)),
         "replaced" => Some(Fact::Replaced(text)),
         "installed" => Some(Fact::Installed(text)),
@@ -503,7 +625,8 @@ struct Said {
 }
 
 /// What the push to `host` of the gate `version` says after its call was `heard`, limited by `bound`: each note the
-/// builder gave, whatever the push's end, and the end.
+/// builder gave, whatever the push's end, the end, and after its stdout lines the aside copies it kept, whatever the
+/// push's end.
 fn said(host: &str, version: &str, heard: &Heard, bound: Duration) -> Said {
     let facts: Vec<Fact> = heard.marked.iter().filter_map(|line| fact(line)).collect();
     let notes = facts
@@ -513,10 +636,15 @@ fn said(host: &str, version: &str, heard: &Heard, bound: Duration) -> Said {
             _ => None,
         })
         .collect();
-    let (out, failure) = match ended(host, version, heard, &facts, bound) {
+    let kept = facts.iter().filter_map(|fact| match fact {
+        Fact::Kept(count) => Some(format!("push: {host}: kept {} aside copies: gate.exe is not verified", shown(count))),
+        _ => None,
+    });
+    let (mut out, failure) = match ended(host, version, heard, &facts, bound) {
         Ok(out) => (out, None),
         Err(reason) => (Vec::new(), Some(format!("push: {host} failed: {reason}"))),
     };
+    out.extend(kept);
     Said { notes, out, failure }
 }
 
@@ -893,9 +1021,9 @@ mod tests {
     fn the_script_installs_from_stdin() {
         let local_app_data = scratch("installs");
         let exe = stand_in();
-        let heard = run_script(&exe, &local_app_data);
+        let heard = run_script_answering("", &exe, &exe, &local_app_data);
         assert_eq!(heard.end, End::Exited(0), "{heard:?}");
-        assert!(heard.marked.iter().any(|line| line.starts_with("gate-push: installed")), "{heard:?}");
+        assert_eq!(heard.marked, [format!("gate-push: installed {ANSWERED}")], "{heard:?}");
         let installed = fs::read(local_app_data.join(r"gate\bin\gate.exe")).expect("the exe is installed");
         assert_eq!(sha256_hex(&installed), sha256_hex(&exe));
         let _ = fs::remove_dir_all(&local_app_data);
@@ -914,8 +1042,68 @@ mod tests {
     /// The push line run here as [`run_script`] runs it, with `prelude` put before the script on its line, so a case can
     /// stand in for one of the commands it calls: a function takes precedence over a cmdlet of the same name.
     fn run_script_after(prelude: &str, exe: &[u8], local_app_data: &Path) -> Heard {
-        let script = format!("{prelude}\n{}", SCRIPT.replace("@SHA@", &sha256_hex(exe)));
+        run_lines(prelude, &SCRIPT.replace("@SHA@", &sha256_hex(exe)), exe, local_app_data)
+    }
+
+    /// [`run_script_after`] with [`answering`]'s script, so a gate.exe holding `answers`'s bytes answers its version.
+    fn run_script_answering(prelude: &str, answers: &[u8], exe: &[u8], local_app_data: &Path) -> Heard {
+        run_lines(prelude, &answering(&sha256_hex(exe), answers), exe, local_app_data)
+    }
+
+    /// `script` after `prelude` on the script's line, run as the push line runs it, fed `exe`.
+    fn run_lines(prelude: &str, script: &str, exe: &[u8], local_app_data: &Path) -> Heard {
+        let script = format!("{prelude}\n{script}");
         run_script_fed(&format!("{}\n{}", STANDARD.encode(script), gzipped(exe)), local_app_data)
+    }
+
+    /// What the script's version read starts with.
+    const VER: &str = "function Ver($p){";
+    /// The version [`answering`]'s stand-in says.
+    const ANSWERED: &str = "0.0.0-stand-in";
+
+    /// [`SCRIPT`] with `sha` put in and its version read standing in for a gate's: a file holding `answers`'s bytes says
+    /// `gate` [`ANSWERED`], as a gate would, since no exe the system has answers `--version` so; any other file is run.
+    fn answering(sha: &str, answers: &[u8]) -> String {
+        let script = SCRIPT.replace("@SHA@", sha);
+        assert!(script.contains(VER), "the script reads versions with Ver");
+        let stand_in = format!(
+            "{VER}$h=[Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([IO.File]::ReadAllBytes($p)))\n\
+             if($h -eq '{}'){{return '{ANSWERED}'}}\n",
+            sha256_hex(answers)
+        );
+        script.replacen(VER, &stand_in, 1)
+    }
+
+    /// An older gate a case's builder holds.
+    const OLDER: &[u8] = b"an older gate";
+    /// An aside copy an earlier push left, named as the script names one, and its bytes.
+    const ASIDE: &str = "gate.exe.20200101000000.4.old";
+    const ASIDE_BYTES: &[u8] = b"an older aside copy";
+    /// A second aside copy an earlier push left.
+    const OTHER_ASIDE: &str = "gate.exe.20200102000000.5.old";
+    /// What another process writes over gate.exe.
+    const FOREIGN: &[u8] = &[1, 2, 3];
+    /// What another process does to gate.exe, `$Destination` in [`around_the_move_in`]: it puts a new file of its own,
+    /// [`FOREIGN`], in the copy's place.
+    const REPLACES: &str = "[IO.File]::Delete($Destination);[IO.File]::WriteAllBytes($Destination,[byte[]](1,2,3))";
+
+    /// A scratch LOCALAPPDATA for `test` whose install folder holds `files`, each a name and its bytes.
+    fn builder_with(test: &str, files: &[(&str, &[u8])]) -> PathBuf {
+        let local_app_data = scratch(test);
+        let bin = local_app_data.join(r"gate\bin");
+        fs::create_dir_all(&bin).expect("the bin folder is made");
+        for (name, bytes) in files {
+            fs::write(bin.join(name), bytes).expect("a builder file is written");
+        }
+        local_app_data
+    }
+
+    /// The aside copies in `bin`, in name order.
+    fn asides(bin: &Path) -> Vec<String> {
+        listed(bin)
+            .into_iter()
+            .filter(|name| Path::new(name).extension().is_some_and(|extension| extension.eq_ignore_ascii_case("old")))
+            .collect()
     }
 
     #[test]
@@ -965,7 +1153,7 @@ mod tests {
         let prelude = "function Get-FileHash($LiteralPath){[GC]::Collect();[GC]::WaitForPendingFinalizers()\n\
                        Say note \"lock held: $(Held (Join-Path $dir 'push.lock'))\"\n\
                        Microsoft.PowerShell.Utility\\Get-FileHash -LiteralPath $LiteralPath}";
-        let heard = run_script_after(prelude, &stand_in(), &local_app_data);
+        let heard = run_script_answering(prelude, &stand_in(), &stand_in(), &local_app_data);
         assert_eq!(heard.end, End::Exited(0), "{heard:?}");
         assert_eq!(
             heard.marked.first().map(String::as_str),
@@ -1042,5 +1230,516 @@ mod tests {
         assert!(heard.marked.iter().any(|line| line.starts_with("gate-push: same")), "{heard:?}");
         assert_eq!(listed(&bin), ["gate.exe", "push.lock"], "nothing was replaced");
         let _ = fs::remove_dir_all(&local_app_data);
+    }
+
+    /// A prelude whose `Move-Item` throws `denied` when `condition` holds, and else moves as itself.
+    fn move_denied_when(condition: &str) -> String {
+        format!(
+            "function Move-Item($LiteralPath,$Destination,[switch]$Force){{if({condition}){{throw [IO.IOException]::new('denied')}}\n\
+             Microsoft.PowerShell.Management\\Move-Item -LiteralPath $LiteralPath -Destination $Destination -Force:$Force}}"
+        )
+    }
+
+    /// A prelude whose `Get-FileHash` runs `body` on its `nth` call, and else hashes as itself.
+    fn nth_hash(nth: u32, body: &str) -> String {
+        format!(
+            "$global:hashes=0;function Get-FileHash($LiteralPath){{$global:hashes++\n\
+             if($global:hashes -eq {nth}){{{body}}}\n\
+             Microsoft.PowerShell.Utility\\Get-FileHash -LiteralPath $LiteralPath}}"
+        )
+    }
+
+    #[test]
+    fn a_push_that_installs_nothing_keeps_the_aside_copies() {
+        let local_app_data = builder_with("installs-nothing", &[("gate.exe", OLDER), (ASIDE, ASIDE_BYTES)]);
+        let bin = local_app_data.join(r"gate\bin");
+        // Only the temp copy's move into place fails; the old gate's moves aside and back run as themselves.
+        let heard = run_script_after(&move_denied_when("$LiteralPath -eq $tmp"), &stand_in(), &local_app_data);
+        assert_eq!(heard.end, End::Exited(1), "{heard:?}");
+        assert_eq!(
+            heard.marked,
+            [format!(
+                "gate-push: failed could not install {}: denied; the previous gate.exe is back in place",
+                bin.join("gate.exe").display()
+            )],
+            "the older gate is back, so the aside copy is kept silently: {heard:?}"
+        );
+        assert_eq!(listed(&bin), ["gate.exe", ASIDE, "push.lock"], "the older aside copy is kept");
+        assert_eq!(
+            fs::read(bin.join("gate.exe")).expect("a gate is installed"),
+            OLDER,
+            "the older gate is back"
+        );
+        let _ = fs::remove_dir_all(&local_app_data);
+    }
+
+    #[test]
+    fn an_install_whose_version_cannot_be_read_fails_and_puts_the_old_gate_back() {
+        let local_app_data = builder_with("unrunnable-over-old", &[("gate.exe", OLDER), (ASIDE, ASIDE_BYTES)]);
+        let bin = local_app_data.join(r"gate\bin");
+        // The older gate answers its version; the stand-in pushed over it does not.
+        let heard = run_script_answering("", OLDER, &stand_in(), &local_app_data);
+        assert_eq!(heard.end, End::Exited(1), "{heard:?}");
+        assert_eq!(
+            heard.marked,
+            ["gate-push: failed the installed gate.exe does not run; the previous gate.exe is back in place"],
+            "the older gate is back, so the aside copy is kept silently: {heard:?}"
+        );
+        assert_eq!(
+            fs::read(bin.join("gate.exe")).expect("a gate is installed"),
+            OLDER,
+            "the older gate is back"
+        );
+        assert_eq!(listed(&bin), ["gate.exe", ASIDE, "push.lock"], "the aside copies are kept");
+        let _ = fs::remove_dir_all(&local_app_data);
+    }
+
+    #[test]
+    fn an_install_whose_version_cannot_be_read_keeps_every_aside_copy() {
+        let local_app_data = builder_with("unrunnable-asides", &[(ASIDE, ASIDE_BYTES), (OTHER_ASIDE, ASIDE_BYTES)]);
+        let bin = local_app_data.join(r"gate\bin");
+        let heard = run_script(&stand_in(), &local_app_data);
+        assert_eq!(heard.end, End::Exited(1), "{heard:?}");
+        assert_eq!(
+            heard.marked,
+            [
+                "gate-push: kept 2",
+                "gate-push: failed the installed gate.exe does not run; the copy was removed and no earlier gate.exe existed"
+            ],
+            "{heard:?}"
+        );
+        assert_eq!(listed(&bin), [ASIDE, OTHER_ASIDE, "push.lock"], "every aside copy is kept");
+        let _ = fs::remove_dir_all(&local_app_data);
+    }
+
+    #[test]
+    fn a_same_exe_that_does_not_run_keeps_the_aside_copies() {
+        let exe = stand_in();
+        let local_app_data = builder_with("same-unrunnable", &[("gate.exe", exe.as_slice()), (ASIDE, ASIDE_BYTES)]);
+        let bin = local_app_data.join(r"gate\bin");
+        let heard = run_script(&exe, &local_app_data);
+        assert_eq!(heard.end, End::Exited(0), "{heard:?}");
+        assert_eq!(heard.marked, ["gate-push: kept 1", "gate-push: same "], "{heard:?}");
+        assert_eq!(listed(&bin), ["gate.exe", ASIDE, "push.lock"], "the aside copy is kept");
+        let _ = fs::remove_dir_all(&local_app_data);
+    }
+
+    #[test]
+    fn a_missing_gate_exe_keeps_the_aside_copy() {
+        let local_app_data = builder_with("missing-gate", &[(ASIDE, OLDER)]);
+        let bin = local_app_data.join(r"gate\bin");
+        let heard = run_script_after(&move_denied_when("$true"), &stand_in(), &local_app_data);
+        assert_eq!(heard.end, End::Exited(1), "{heard:?}");
+        assert_eq!(
+            heard.marked,
+            [
+                "gate-push: kept 1".to_owned(),
+                format!(
+                    "gate-push: failed could not install {}: denied; nothing was installed and no earlier gate.exe existed",
+                    bin.join("gate.exe").display()
+                )
+            ],
+            "{heard:?}"
+        );
+        assert_eq!(listed(&bin), [ASIDE, "push.lock"], "the aside copy, the only gate left, is kept");
+        let _ = fs::remove_dir_all(&local_app_data);
+    }
+
+    #[test]
+    fn a_failed_move_back_leaves_the_aside_copy_for_the_next_push() {
+        let local_app_data = builder_with("failed-move-back", &[("gate.exe", OLDER)]);
+        let bin = local_app_data.join(r"gate\bin");
+        // The check after the move fails, and so does the move of the aside copy back.
+        let prelude = format!(
+            "{}\n{}",
+            nth_hash(2, "return @{Hash='MISMATCH'}"),
+            move_denied_when("$LiteralPath -like '*.old'")
+        );
+        let first = run_script_after(&prelude, &stand_in(), &local_app_data);
+        let kept = asides(&bin);
+        assert_eq!(kept.len(), 1, "{first:?}");
+        assert_eq!(
+            first.marked,
+            [
+                "gate-push: kept 1".to_owned(),
+                format!(
+                    "gate-push: failed the installed copy does not match; the previous gate.exe is at {}",
+                    bin.join(&kept[0]).display()
+                )
+            ],
+            "{first:?}"
+        );
+
+        let mut other = stand_in();
+        other.push(0);
+        let second = run_script(&other, &local_app_data);
+
+        assert_eq!(second.end, End::Exited(1), "the second push cannot verify its install: {second:?}");
+        assert_eq!(asides(&bin), kept, "the first push's aside copy is kept: {second:?}");
+        assert_eq!(fs::read(bin.join(&kept[0])).expect("the aside copy is read"), OLDER);
+        let _ = fs::remove_dir_all(&local_app_data);
+    }
+
+    #[test]
+    fn back_does_not_remove_a_gate_another_process_placed() {
+        let local_app_data = scratch("back-first-foreign");
+        let bin = local_app_data.join(r"gate\bin");
+        // Another process puts its own gate.exe in place just after the move in, so the check reads its bytes.
+        let heard = run_script_after(&around_the_move_in("", REPLACES), &stand_in(), &local_app_data);
+        assert_eq!(heard.end, End::Exited(1), "{heard:?}");
+        assert_eq!(
+            heard.marked,
+            ["gate-push: failed the installed copy does not match; another gate.exe was placed meanwhile and was left as it is"],
+            "{heard:?}"
+        );
+        assert_eq!(
+            fs::read(bin.join("gate.exe")).expect("a gate is there"),
+            FOREIGN,
+            "the other gate is left"
+        );
+        assert_eq!(listed(&bin), ["gate.exe", "push.lock"]);
+        let _ = fs::remove_dir_all(&local_app_data);
+    }
+
+    #[test]
+    fn back_does_not_overwrite_a_gate_another_process_placed_over_the_old_one() {
+        let local_app_data = builder_with("back-old-foreign", &[("gate.exe", OLDER)]);
+        let bin = local_app_data.join(r"gate\bin");
+        // Another process puts its own gate.exe in place just after the move in, so the check reads its bytes.
+        let heard = run_script_after(&around_the_move_in("", REPLACES), &stand_in(), &local_app_data);
+        let kept = asides(&bin);
+        assert_eq!(kept.len(), 1, "{heard:?}");
+        assert_eq!(heard.end, End::Exited(1), "{heard:?}");
+        assert_eq!(
+            heard.marked,
+            [
+                "gate-push: kept 1".to_owned(),
+                format!(
+                    "gate-push: failed the installed copy does not match; another gate.exe was placed meanwhile and was left as it is, \
+                     the previous gate.exe is at {}",
+                    bin.join(&kept[0]).display()
+                )
+            ],
+            "{heard:?}"
+        );
+        assert_eq!(
+            fs::read(bin.join("gate.exe")).expect("a gate is there"),
+            FOREIGN,
+            "the other gate is left"
+        );
+        assert_eq!(
+            fs::read(bin.join(&kept[0])).expect("the aside copy is read"),
+            OLDER,
+            "the older gate is kept aside"
+        );
+        let _ = fs::remove_dir_all(&local_app_data);
+    }
+
+    #[test]
+    fn a_first_install_whose_move_fails_leaves_a_gate_placed_meanwhile() {
+        let local_app_data = scratch("first-move-foreign");
+        let bin = local_app_data.join(r"gate\bin");
+        // Another process takes the name gate.exe, so the move of the temp copy into place fails.
+        let prelude = "function Move-Item($LiteralPath,$Destination,[switch]$Force){[IO.File]::WriteAllBytes($Destination,[byte[]](1,2,3))\n\
+                       throw [IO.IOException]::new('the name is taken')}";
+        let heard = run_script_after(prelude, &stand_in(), &local_app_data);
+        assert_eq!(heard.end, End::Exited(1), "{heard:?}");
+        assert_eq!(
+            heard.marked,
+            [format!(
+                "gate-push: failed could not install {}: the name is taken; nothing was installed and no earlier gate.exe existed",
+                bin.join("gate.exe").display()
+            )],
+            "{heard:?}"
+        );
+        assert_eq!(
+            fs::read(bin.join("gate.exe")).expect("a gate is there"),
+            FOREIGN,
+            "the other gate is left"
+        );
+        let _ = fs::remove_dir_all(&local_app_data);
+    }
+
+    #[test]
+    fn a_move_back_does_not_overwrite_a_gate_placed_while_gate_exe_was_missing() {
+        let local_app_data = builder_with("move-back-foreign", &[("gate.exe", OLDER)]);
+        let bin = local_app_data.join(r"gate\bin");
+        // The temp copy's move into place fails, so gate.exe is missing; another process writes one as the aside copy
+        // is moved back.
+        let prelude = "function Move-Item($LiteralPath,$Destination,[switch]$Force){\n\
+                       if($LiteralPath -eq $tmp){throw [IO.IOException]::new('denied')}\n\
+                       if($LiteralPath -like '*.old'){[IO.File]::WriteAllBytes($Destination,[byte[]](1,2,3))}\n\
+                       Microsoft.PowerShell.Management\\Move-Item -LiteralPath $LiteralPath -Destination $Destination -Force:$Force}";
+        let heard = run_script_after(prelude, &stand_in(), &local_app_data);
+        let kept = asides(&bin);
+        assert_eq!(kept.len(), 1, "{heard:?}");
+        assert_eq!(heard.end, End::Exited(1), "{heard:?}");
+        assert_eq!(
+            heard.marked,
+            [
+                "gate-push: kept 1".to_owned(),
+                format!(
+                    "gate-push: failed could not install {}: denied; another gate.exe was placed meanwhile and was left as it is, \
+                     the previous gate.exe is at {}",
+                    bin.join("gate.exe").display(),
+                    bin.join(&kept[0]).display()
+                )
+            ],
+            "{heard:?}"
+        );
+        assert_eq!(
+            fs::read(bin.join("gate.exe")).expect("a gate is there"),
+            FOREIGN,
+            "the other gate is left"
+        );
+        assert_eq!(
+            fs::read(bin.join(&kept[0])).expect("the aside copy is read"),
+            OLDER,
+            "the older gate is kept aside"
+        );
+        let _ = fs::remove_dir_all(&local_app_data);
+    }
+
+    /// A prelude whose `Move-Item` runs `before` and `after` around the temp copy's move into place, and else moves as
+    /// itself; `$Destination` is gate.exe in both.
+    fn around_the_move_in(before: &str, after: &str) -> String {
+        format!(
+            "function Move-Item($LiteralPath,$Destination,[switch]$Force){{\n\
+             if($LiteralPath -eq $tmp){{{before}}}\n\
+             Microsoft.PowerShell.Management\\Move-Item -LiteralPath $LiteralPath -Destination $Destination -Force:$Force\n\
+             if($LiteralPath -eq $tmp){{{after}}}}}"
+        )
+    }
+
+    #[test]
+    fn an_installed_copy_that_does_not_match_puts_the_old_gate_back() {
+        let local_app_data = builder_with("real-mismatch", &[("gate.exe", OLDER)]);
+        let bin = local_app_data.join(r"gate\bin");
+        // The bytes in place really differ from the pushed copy's, as a copy damaged on the disk would.
+        let prelude = around_the_move_in("", "[IO.File]::WriteAllBytes($Destination,[byte[]](9,9,9))");
+        let heard = run_script_after(&prelude, &stand_in(), &local_app_data);
+        assert_eq!(heard.end, End::Exited(1), "{heard:?}");
+        assert_eq!(
+            heard.marked,
+            ["gate-push: failed the installed copy does not match; the previous gate.exe is back in place"],
+            "{heard:?}"
+        );
+        assert_eq!(
+            fs::read(bin.join("gate.exe")).expect("a gate is installed"),
+            OLDER,
+            "the older gate is back"
+        );
+        assert_eq!(listed(&bin), ["gate.exe", "push.lock"], "no aside or temp copy is left");
+        let _ = fs::remove_dir_all(&local_app_data);
+    }
+
+    #[test]
+    fn a_gate_placed_before_the_move_in_is_left_as_it_is() {
+        let local_app_data = builder_with("placed-before-move-in", &[("gate.exe", OLDER)]);
+        let bin = local_app_data.join(r"gate\bin");
+        // Another process writes gate.exe after the old gate was moved aside and before the temp copy's move.
+        let prelude = around_the_move_in("[IO.File]::WriteAllBytes($Destination,[byte[]](1,2,3))", "");
+        let heard = run_script_after(&prelude, &stand_in(), &local_app_data);
+        let kept = asides(&bin);
+        assert_eq!(kept.len(), 1, "{heard:?}");
+        assert_eq!(heard.end, End::Exited(1), "{heard:?}");
+        assert_eq!(heard.marked.len(), 2, "{heard:?}");
+        assert_eq!(heard.marked[0], "gate-push: kept 1", "{heard:?}");
+        let failed = &heard.marked[1];
+        let start = format!("gate-push: failed could not install {}: ", bin.join("gate.exe").display());
+        let end = format!(
+            "; another gate.exe was placed meanwhile and was left as it is, the previous gate.exe is at {}",
+            bin.join(&kept[0]).display()
+        );
+        assert!(failed.starts_with(&start) && failed.ends_with(&end), "{heard:?}");
+        assert_eq!(
+            fs::read(bin.join("gate.exe")).expect("a gate is there"),
+            FOREIGN,
+            "the other gate is left"
+        );
+        assert_eq!(
+            fs::read(bin.join(&kept[0])).expect("the aside copy is read"),
+            OLDER,
+            "the older gate is kept aside"
+        );
+        let _ = fs::remove_dir_all(&local_app_data);
+    }
+
+    #[test]
+    fn a_gate_exe_that_goes_while_it_is_checked_counts_as_missing() {
+        let local_app_data = builder_with("goes-while-checked", &[("gate.exe", OLDER)]);
+        let bin = local_app_data.join(r"gate\bin");
+        // The installed copy is held unshared just after the move in, so neither its hash nor its identity can be read;
+        // between two reads of its identity the holder lets it go and deletes it.
+        let prelude = format!(
+            "{}\nfunction Start-Sleep{{if($global:held){{$global:held.Dispose();$global:held=$null;[IO.File]::Delete($g)}}}}",
+            around_the_move_in("", "$global:held=[IO.File]::Open($Destination,'Open','Read','None')")
+        );
+        let heard = run_script_after(&prelude, &stand_in(), &local_app_data);
+        assert_eq!(heard.end, End::Exited(1), "{heard:?}");
+        assert_eq!(heard.marked.len(), 1, "{heard:?}");
+        let failed = &heard.marked[0];
+        let start = format!("gate-push: failed could not install {}: ", bin.join("gate.exe").display());
+        assert!(
+            failed.starts_with(&start) && failed.ends_with("; the previous gate.exe is back in place"),
+            "{heard:?}"
+        );
+        assert_eq!(
+            fs::read(bin.join("gate.exe")).expect("a gate is installed"),
+            OLDER,
+            "the older gate is back"
+        );
+        assert_eq!(listed(&bin), ["gate.exe", "push.lock"], "no aside or temp copy is left");
+        let _ = fs::remove_dir_all(&local_app_data);
+    }
+
+    #[test]
+    fn a_gate_exe_that_goes_after_its_last_identity_read_counts_as_missing() {
+        let local_app_data = builder_with("goes-after-last-read", &[("gate.exe", OLDER)]);
+        let bin = local_app_data.join(r"gate\bin");
+        // The installed copy is held unshared just after the move in, so no read of its identity succeeds; the holder
+        // lets it go and deletes it only in the wait after the last read.
+        let prelude = format!(
+            "{}\n$global:waits=0;function Start-Sleep{{$global:waits++\n\
+             if($global:waits -eq 3){{$global:held.Dispose();[IO.File]::Delete($g)}}}}",
+            around_the_move_in("", "$global:held=[IO.File]::Open($Destination,'Open','Read','None')")
+        );
+        let heard = run_script_after(&prelude, &stand_in(), &local_app_data);
+        assert_eq!(heard.end, End::Exited(1), "{heard:?}");
+        assert_eq!(heard.marked.len(), 1, "{heard:?}");
+        let failed = &heard.marked[0];
+        let start = format!("gate-push: failed could not install {}: ", bin.join("gate.exe").display());
+        assert!(
+            failed.starts_with(&start) && failed.ends_with("; the previous gate.exe is back in place"),
+            "{heard:?}"
+        );
+        assert_eq!(
+            fs::read(bin.join("gate.exe")).expect("a gate is installed"),
+            OLDER,
+            "the older gate is back"
+        );
+        assert_eq!(listed(&bin), ["gate.exe", "push.lock"], "no aside or temp copy is left");
+        let _ = fs::remove_dir_all(&local_app_data);
+    }
+
+    #[test]
+    fn a_type_that_cannot_be_added_fails_the_push_before_gate_exe_is_touched() {
+        let local_app_data = builder_with("no-compiler", &[("gate.exe", OLDER), (ASIDE, ASIDE_BYTES)]);
+        let bin = local_app_data.join(r"gate\bin");
+        // As where pwsh runs in constrained language or finds no compiler.
+        let heard = run_script_after("function Add-Type{throw 'no compiler'}", &stand_in(), &local_app_data);
+        assert_eq!(heard.end, End::Exited(1), "{heard:?}");
+        assert_eq!(
+            heard.marked,
+            ["gate-push: failed could not prepare the install: no compiler"],
+            "{heard:?}"
+        );
+        assert_eq!(listed(&bin), ["gate.exe", ASIDE], "nothing was locked, cleaned up or replaced");
+        assert_eq!(
+            fs::read(bin.join("gate.exe")).expect("a gate is installed"),
+            OLDER,
+            "the older gate is left"
+        );
+        let _ = fs::remove_dir_all(&local_app_data);
+    }
+
+    #[test]
+    fn a_builder_push_lock_that_is_a_hard_link_is_refused() {
+        let local_app_data = builder_with("lock-hard-link", &[("gate.exe", OLDER)]);
+        let bin = local_app_data.join(r"gate\bin");
+        let other = local_app_data.join("other.txt");
+        fs::write(&other, b"another file").expect("the other file is written");
+        fs::hard_link(&other, bin.join("push.lock")).expect("push.lock is made a second name of the other file");
+        let heard = run_script(&stand_in(), &local_app_data);
+        assert_eq!(heard.end, End::Exited(1), "{heard:?}");
+        assert_eq!(
+            heard.marked,
+            [format!("gate-push: failed {} is a link", bin.join("push.lock").display())],
+            "{heard:?}"
+        );
+        assert_eq!(listed(&bin), ["gate.exe", "push.lock"], "nothing was installed");
+        assert_eq!(
+            fs::read(bin.join("gate.exe")).expect("a gate is installed"),
+            OLDER,
+            "the older gate is left"
+        );
+        assert_eq!(
+            fs::read(&other).expect("the other file is read"),
+            b"another file",
+            "the other file is untouched"
+        );
+        let _ = fs::remove_dir_all(&local_app_data);
+    }
+
+    #[test]
+    fn a_cleanup_that_cannot_list_the_folder_says_so_and_still_installs() {
+        let exe = stand_in();
+        let local_app_data = builder_with("clean-unlisted", &[(ASIDE, ASIDE_BYTES)]);
+        let bin = local_app_data.join(r"gate\bin");
+        // The first listing is the stale temp copies'; the second, the cleanup's after the verified install, fails.
+        let prelude = "$global:lists=0;function Get-ChildItem{$global:lists++\n\
+                       if($global:lists -eq 2){throw [IO.IOException]::new('the folder is busy')}\n\
+                       Microsoft.PowerShell.Management\\Get-ChildItem @args}";
+        let heard = run_script_answering(prelude, &exe, &exe, &local_app_data);
+        assert_eq!(heard.end, End::Exited(0), "{heard:?}");
+        assert_eq!(
+            heard.marked,
+            [
+                format!(
+                    "gate-push: note could not delete the aside copies in {}: the folder is busy",
+                    bin.display()
+                ),
+                format!("gate-push: installed {ANSWERED}")
+            ],
+            "{heard:?}"
+        );
+        let _ = fs::remove_dir_all(&local_app_data);
+    }
+
+    #[test]
+    fn more_notes_than_the_cap_never_push_out_the_kept_and_failed_facts() {
+        let mut lines = "gate-push: note could not delete x\n".repeat(MARKED_CAP + 4);
+        lines.push_str("gate-push: kept 2\ngate-push: failed the installed gate.exe does not run\n");
+        let marked = kept(Cursor::new(lines)).marked;
+        assert_eq!(marked.len(), MARKED_CAP, "{marked:?}");
+        assert_eq!(
+            marked.get(MARKED_CAP - 2..),
+            Some(
+                [
+                    "gate-push: kept 2".to_owned(),
+                    "gate-push: failed the installed gate.exe does not run".to_owned()
+                ]
+                .as_slice()
+            ),
+            "{marked:?}"
+        );
+        let heard = Heard {
+            marked,
+            ..heard(1, &[], None)
+        };
+        let said = said("b1", "0.2.0", &heard, BOUND);
+        assert_eq!(said.out, ["push: b1: kept 2 aside copies: gate.exe is not verified"], "{said:?}");
+        assert_eq!(said.failure.as_deref(), Some("push: b1 failed: the installed gate.exe does not run"));
+    }
+
+    #[test]
+    fn the_kept_fact_is_said_on_stdout_and_never_fails_a_push() {
+        let kept = "push: b1: kept 2 aside copies: gate.exe is not verified";
+        assert_eq!(
+            said("b1", "0.2.0", &heard(0, &["gate-push: kept 2", "gate-push: same "], None), BOUND),
+            out(&["push: b1: gate 0.2.0 already installed", kept])
+        );
+        assert_eq!(
+            said(
+                "b1",
+                "0.2.0",
+                &heard(1, &["gate-push: kept 2", "gate-push: failed the installed gate.exe does not run"], None),
+                BOUND
+            ),
+            Said {
+                out: vec![kept.to_owned()],
+                ..failure("push: b1 failed: the installed gate.exe does not run")
+            }
+        );
     }
 }

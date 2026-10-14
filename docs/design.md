@@ -136,22 +136,38 @@ With nothing to push or nowhere to push it, `gate push` tries no builder, prints
 - `push: no installed gate at <path>; run tools/install.ps1`;
 - `push: no remote.json: LOCALAPPDATA is not an absolute folder`, for an unset, empty or relative `LOCALAPPDATA`;
 - `push: could not read the version of <path>`, when the installed exe's `--version` gives no `gate <version>` line or takes over 30 s;
-- `push: cannot read <path>: <error>`, when the installed exe cannot be read.
+- `push: cannot read <path>: <error>`, when the installed exe cannot be read;
+- `push: an install is in progress on this PC; nothing was sent`, when `tools/install.ps1` holds this PC's `push.lock`;
+- `push: <bin>\push.lock is a link; nothing was sent`, and `push: could not lock <bin>: <error>; nothing was sent` for any other refusal of the lock. The link text is also said for a `push.lock` that is a folder, a junction or a second name of another file (a hard link); the open never follows a link.
+
+`gate push` holds `%LOCALAPPDATA%\gate\bin\push.lock` on this PC, open and unshared, while it reads the installed exe's bytes and runs its `--version`, and lets go before the first builder, so it never reads a gate.exe that `tools/install.ps1` is replacing.
 
 `<v>`, `<old>` and `<new>` are the whole text after `gate ` in `gate.exe --version`, build id included, as `tools/install.ps1` reads it; the local one is read once, before the first builder. Per builder, on stdout:
 
 1. `push: <host>: sending gate <v>`, before the transfer.
 2. Then one of `push: <host>: gate <v> already installed` (an identical SHA-256: nothing was replaced), or `push: <host>: replaced gate <old>` followed by `push: <host>: installed gate <new>` (`replaced` only when a gate was there before), or on stderr `push: <host> failed: <reason>`.
 
-`push: <host>: could not delete <path>: <message>` on stderr names an aside or stale temporary copy the builder could not delete; it never fails the push.
+A note on stderr never fails the push: `push: <host>: could not delete <path>: <message>` names an aside or stale temporary copy the builder could not delete, `push: <host>: could not delete the aside copies in <dir>: <message>` says the folder could not be listed after a verified install, and `push: <host>: could not list <dir>: <message>` says the same of the count of kept aside copies.
+
+`push: <host>: could not stop the version read of <path>: <message>` says a version read past its bound could not be killed (the read still gives no version).
+
+After the builder's other stdout lines, a push that ends with `gate.exe` missing or one it could not verify left in place, and with aside copies in the folder, says `push: <host>: kept <n> aside copies: gate.exe is not verified` on stdout, `<n>` counting every `gate.exe.*.old` present, this push's own included. It is never a failure by itself: an exe identical to the installed one that does not answer `--version` still says `already installed` and exits 0, with this line after it.
 
 A failure reason is one of: `timed out after <n> s`, `no answer`, ssh's last stderr line, `cannot feed the call: <error>`, or the builder script's own.
 
-The builder script's own reasons are `the copy could not be read: <exception message>`, for bytes that do not decompress; `the copy arrived damaged`; `<dir> is a link`; `<dir>\push.lock is a link`; `another gate push is installing on this builder`; `could not lock <dir>: <message>`; and the failing step's message.
+The builder script's own reasons are `the copy could not be read: <exception message>`, for bytes that do not decompress; `the copy arrived damaged`; `<dir> is a link`; `<dir>\push.lock is a link` (also for a folder, a junction or a hard link there); `another gate push is installing on this builder`; `could not lock <dir>: <message>`; `the builder needs pwsh 7.2 or later (it has <version>)`.
 
-`the installed copy does not match`, or `could not install <path>: <message>` when the installed copy cannot be read after the move, ends with `; the previous gate.exe is back in place` or `; the previous gate.exe is at <aside>`.
+`could not prepare the install: <message>` says the script's small C# type for its file checks could not be added (constrained language, no compiler), before anything is touched. Any other failure says the failing step's message.
 
-On a first install it ends instead with `; the copy was removed and no earlier gate.exe existed` or `; the copy at <path> could not be removed: <message>`. A first install whose move of the temporary copy into place fails says `could not install <path>: <message>; nothing was installed and no earlier gate.exe existed`.
+`the installed copy does not match`, `the installed gate.exe does not run` (the installed copy hashes right but gives no `gate <version>` line within 30 s), or `could not install <path>: <message>` when the installed copy cannot be read after the move or the move into place fails, ends with `; the previous gate.exe is back in place` or `; the previous gate.exe is at <aside>`.
+
+On a first install it ends instead with `; the copy was removed and no earlier gate.exe existed` or `; the copy at <path> could not be removed: <message>`. A first install whose move of the temporary copy into place fails with no gate.exe there says `could not install <path>: <message>; nothing was installed and no earlier gate.exe existed`.
+
+The move back acts only while `gate.exe` is missing or still this push's own file, the one with the temp copy's NTFS file id (`FILE_ID_INFO`: the volume serial number and the 128-bit id), which the script reads from the handle that wrote the temp copy and which the rename into place keeps; the hash does not decide it.
+
+An id that cannot be read is tried three times, 300 ms apart, and a file gone at any try or after the last counts as missing, never as another's. The script reads the id through a small C# type it adds with `Add-Type`, which costs about 0.3-0.5 s on a push that installs; the same-exe path never adds it. The move back never overwrites a `gate.exe` that is missing.
+
+A `gate.exe` another process placed meanwhile, a by-hand install say, is left as it is and the reason ends with `; another gate.exe was placed meanwhile and was left as it is`, followed on a push that moved an old gate aside by `, the previous gate.exe is at <aside>`.
 
 Builder text is escaped as the remote client escapes it and cut to 4096 bytes.
 
@@ -163,15 +179,19 @@ The call is `pwsh -NoProfile -NonInteractive -OutputFormat Text -EncodedCommand 
 
 Stdin is line 1, the install script as base64 of its UTF-8 with this PC's SHA-256 put in, then the exe as base64 text of its gzip (flate2's best level). The push call is not asked for ssh compression: the bytes are already compressed.
 
-The builder needs pwsh 7.1 or later. The script decompresses the copy with .NET `GZipStream`, carries this PC's SHA-256 of the exe and refuses decompressed bytes that differ, reports on `gate-push: ` lines that this side maps to the `push:` lines, and exits 1 after a failure.
+The builder needs pwsh 7.2 or later, whose .NET the file checks need; an older one fails the push with `the builder needs pwsh 7.2 or later (it has <version>)` before anything is touched. The script decompresses the copy with .NET `GZipStream`, carries this PC's SHA-256 of the exe and refuses decompressed bytes that differ, reports on `gate-push: ` lines that this side maps to the `push:` lines, and exits 1 after a failure.
 
 Two pushes to one builder at once are refused: the script holds `push.lock` in the builder's `%LOCALAPPDATA%\gate\bin` open, unshared, for the whole install, so the second push fails at once with `another gate push is installing on this builder`, touching nothing, the cleanup of aside copies included.
 
-The open handle is the lock: `push.lock` stays as a plain file after a push and never blocks a later one, and a `push.lock` that is a link is refused with `<dir>\push.lock is a link`.
+The open handle is the lock: `push.lock` stays as a plain file after a push and never blocks a later one, and a `push.lock` that is a link, a folder, a junction or a second name of another file is refused with `<dir>\push.lock is a link`: the lock is opened without following a link and the opened handle is checked.
 
-On the builder the script installs as `tools/install.ps1` does ([Install](#install)), in its own `%LOCALAPPDATA%\gate\bin`, which it creates when missing and refuses when it is a link: it deletes the aside copies (`gate.exe.*.old`) and the stale `gate.exe.<pid>.tmp` copies no process holds.
+`tools/install.ps1` and the PC side of `gate push` take the same `push.lock` in their own bin folder with the same open, so an install, a push's read of the exe and a push to a builder never change or read one folder's gate.exe at once ([Install](#install)).
 
-It says the same version when `gate.exe` already has the same SHA-256; else it writes the exe to `gate.exe.<pid>.tmp` (created new), moves the old one aside to `gate.exe.<stamp>.<pid>.old`, moves the temporary file into place, checks the SHA-256 of the installed copy and moves the aside copy back when anything failed, the check's own read included; with no old exe to move back, it removes the installed copy.
+On the builder the script installs as `tools/install.ps1` does ([Install](#install)), in its own `%LOCALAPPDATA%\gate\bin`, which it creates when missing and refuses when it is a link: it first deletes the stale `gate.exe.<pid>.tmp` copies of other pids that no process holds, and the aside copies (`gate.exe.*.old`) only after the installed gate is verified.
+
+It says the same version when `gate.exe` already has the same SHA-256; else it writes the exe to `gate.exe.<pid>.tmp` (created new), moves the old one aside to `gate.exe.<stamp>.<pid>.old`, moves the temporary file into place without force, checks the SHA-256 of the installed copy and that it answers `--version` with `gate <version>`, and puts the aside copy back when anything failed, the check's own read included; with no old exe to move back, it removes the installed copy.
+
+An installed gate is verified when its SHA-256 matches and `--version` answers, and only then does the cleanup run: it deletes every aside copy no process holds but this push's own, which stays as the last good gate. A push that ends with `gate.exe` missing or unverified, a failed one and an identical exe that does not answer included, deletes no aside copy.
 
 Each version read on the builder is bounded at 30 s.
 
@@ -1808,9 +1828,20 @@ The rest of the protocol, the transport of snapshots and outputs, is the remote 
 - Otherwise the new exe is first copied to a temporary name in the folder; then a copy already there, running or not, is moved aside to `gate.exe.<stamp>.<pid>.old` (which works while gates run it), and the temporary file is renamed into place, so `gate.exe` is missing only between two renames.
 
   A failed copy leaves the installed exe untouched; a failed final rename moves the old exe back, and the failure line says whether that worked. The script prints the version it replaced and the version it installed.
-- Aside copies that no process holds any more are deleted; one a running gate still holds stays until a later install.
+- The script holds `push.lock` in the install folder, open and unshared, from the confirmed Install step to its end, the same lock `gate push` takes on a builder and on this PC ([`gate push`](#gate-push)). While a push holds it the script stops with `install: another gate push is installing; nothing was changed` and exit 1.
+
+  The script needs pwsh 7.2 or later (`#Requires -Version 7.2`); `install: could not prepare the install: <message>` says its small C# type for the file checks could not be added.
+
+  A `push.lock` that is a link, a folder, a junction or a second name of another file gives `install: <dir>\push.lock is a link; nothing was changed`, a folder it cannot make `install: could not create <dir>: <message>`, and any other refusal `install: could not lock <dir>: <message>`. Declined (`-Confirm` "No") and `-WhatIf` create no folder and no lock.
+- The installed copy is verified when it answers `--version` with `gate <version>` (the script's version reads are bounded at 30 s).
+
+  A copy that does not answer is taken out and the previous gate.exe put back: the script fails with `install: the installed gate.exe does not run; the previous gate.exe is back in place` (`; the previous gate.exe is at <aside>` when the move back fails, `; the copy was removed and no earlier gate.exe existed` on a first install, `; the copy at <path> could not be removed: <message>` when that fails).
+- The move into place and the move back run without force over a missing gate.exe and act only while gate.exe is missing or the install's own file (the temp copy's file id, read from the handle that wrote it; a file gone after the last id read counts as missing); one another process placed is left as it is, with `; another gate.exe was placed meanwhile and was left as it is` and, on a replacing install, `, the previous gate.exe is at <aside>`.
+- Aside copies no process holds are deleted only once the installed gate is verified (also when the exe is already installed and answers), but this install's own, which stays as the last good gate; one a running gate still holds stays until a later install. Every aside copy is kept, silently, when the install ends unverified. One that cannot be deleted prints `install: could not delete <path>: <message>` on stderr.
 - It adds `%LOCALAPPDATA%\gate\bin` to the user's PATH when missing, so callers run `gate`: the raw registry value of the user environment is read and written, keeping its kind and its unexpanded `%NAME%` entries; the change is broadcast (`WM_SETTINGCHANGE`, as `setx` does) so programs started from then on see it, and the script says to open a new terminal. It never touches the state root's files.
-- `-WhatIf` lists every step without taking it. `-Exe` (install a prebuilt exe, skipping the build) and `-EnvironmentKey` (the registry key the PATH entry lives in) exist for the suite, which runs the script against a temporary `LOCALAPPDATA` and registry key.
+- `-WhatIf` lists every step a real run would take without taking it, the aside deletes included.
+
+  For the exe already in place it prints `install: gate <version> already installed at <path>` and a Delete line for each aside copy a real run would delete, when the installed gate answers `--version`. `-Exe` (install a prebuilt exe, skipping the build) and `-EnvironmentKey` (the registry key the PATH entry lives in) exist for the suite, which runs the script against a temporary `LOCALAPPDATA` and registry key.
 - Every install deletes a leftover `remote-bridge.ps1` file in the install folder, which no gate starts. When it cannot, it prints `install: cannot remove the old remote-bridge.ps1 (<reason>); it is unused` on stderr and carries on with exit 0; a folder at that name is left alone.
 - The script installs locally only. `gate push` copies the installed exe to each builder in `remote.json` (`host`, then `hosts`), with the same rename-aside on the builder, so a machine with builders runs `pwsh tools/install.ps1` and then `gate push` ([`gate push`](#gate-push)). It pushes the installed exe, never one from `target/`, and never installs here.
 - Install is a script, not a `gate install` subcommand.
