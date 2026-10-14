@@ -1,6 +1,6 @@
 //! The hidden `gate box <verb> <payload>`: the builder side of a routed run. Only the words are read here; the payload
 //! word is passed on unread, since decoding it is the binary's. A `test-seams` build also reads the hidden
-//! `--test-heartbeat-ms <n>`, `--test-box-console fail-before`, `--test-box-park-launch <path>`,
+//! `--test-heartbeat-ms <n>`, `--test-box-console fail-before`, `--test-box-token refused`, `--test-box-park-launch <path>`,
 //! `--test-outputs-budget-bytes <n>` and `--test-dotnet-limit-ms <n>` (each also as `--<seam>=<value>`) before the verb;
 //! without the feature each is no verb, and so the box usage.
 
@@ -49,6 +49,8 @@ enum Seam {
     HeartbeatMs,
     /// `--test-box-console fail-before`: the command's UTF-8 console fails before the command starts.
     Console,
+    /// `--test-box-token refused`: the command's start with the restricted token is refused as access denied.
+    Token,
     /// `--test-box-park-launch <path>`: the command's launch waits until the path exists.
     ParkLaunch,
     /// `--test-outputs-budget-bytes <n>`: the output folder's outputs size budget, in bytes.
@@ -65,6 +67,7 @@ impl Seam {
         match text.split_once('=').map_or(text, |(name, _)| name) {
             "--test-heartbeat-ms" => Some(Seam::HeartbeatMs),
             "--test-box-console" => Some(Seam::Console),
+            "--test-box-token" => Some(Seam::Token),
             "--test-box-park-launch" => Some(Seam::ParkLaunch),
             "--test-outputs-budget-bytes" => Some(Seam::OutputsBudgetBytes),
             "--test-dotnet-limit-ms" => Some(Seam::DotnetLimitMs),
@@ -77,6 +80,7 @@ impl Seam {
         match self {
             Seam::HeartbeatMs => "--test-heartbeat-ms",
             Seam::Console => "--test-box-console",
+            Seam::Token => "--test-box-token",
             Seam::ParkLaunch => "--test-box-park-launch",
             Seam::OutputsBudgetBytes => "--test-outputs-budget-bytes",
             Seam::DotnetLimitMs => "--test-dotnet-limit-ms",
@@ -113,7 +117,8 @@ fn seams(words: &mut Peekable<impl Iterator<Item = OsString>>, problems: &mut Ve
 }
 
 /// Sets `seam` from `value`: whole milliseconds above 0 for the heartbeat and the dotnet limit, `fail-before` for the
-/// console, any path for the park, whole bytes above 0 for the outputs budget. An empty or missing value is no value.
+/// console, `refused` for the token, any path for the park, whole bytes above 0 for the outputs budget. An empty or
+/// missing value is no value.
 #[cfg(feature = "test-seams")]
 fn set_seam(seams: &mut BoxSeams, seam: Seam, value: Result<Option<String>, Problem>) -> Result<(), Problem> {
     let name = seam.name();
@@ -125,16 +130,18 @@ fn set_seam(seams: &mut BoxSeams, seam: Seam, value: Result<Option<String>, Prob
         Seam::HeartbeatMs => seams.heartbeat_ms = Some(crate::values::above_zero(name, &value)?),
         Seam::OutputsBudgetBytes => seams.outputs_budget_bytes = Some(crate::values::above_zero(name, &value)?),
         Seam::DotnetLimitMs => seams.dotnet_limit_ms = Some(crate::values::above_zero(name, &value)?),
-        Seam::Console if value == "fail-before" => seams.fail_console = true,
-        Seam::Console => {
-            return Err(Problem::BadConsoleFailure {
-                option: name.to_owned(),
-                value,
-            });
-        }
+        Seam::Console => seams.fail_console = the_word(name, value, "fail-before", |option, value| Problem::BadConsoleFailure { option, value })?,
+        Seam::Token => seams.refuse_token = the_word(name, value, "refused", |option, value| Problem::BadTokenRefusal { option, value })?,
         Seam::ParkLaunch => seams.park_launch = Some(std::path::PathBuf::from(value)),
     }
     Ok(())
+}
+
+/// `true` when `value`, given to the seam `name`, is `word`, the one value it takes; else the problem `bad` makes of
+/// the seam's name and the value.
+#[cfg(feature = "test-seams")]
+fn the_word(name: &str, value: String, word: &str, bad: impl FnOnce(String, String) -> Problem) -> Result<bool, Problem> {
+    if value == word { Ok(true) } else { Err(bad(name.to_owned(), value)) }
 }
 
 /// No seams without the `test-seams` feature: a `--test-*` word is read as the verb, and refused as one.

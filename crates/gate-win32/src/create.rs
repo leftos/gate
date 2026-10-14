@@ -1,6 +1,7 @@
 //! The one way [`crate::Launch`] and [`crate::PipedLaunch`] create a command: the checks before the call, the
 //! inheritable copies of the handles it inherits, the startup information naming its standard handles, and the
-//! `CreateProcessW` call itself, under the spawn lock that [`spawn`] takes too.
+//! `CreateProcessW` call itself, or `CreateProcessAsUserW` for a command given a [`crate::RestrictedToken`], under the
+//! spawn lock that [`spawn`] takes too.
 
 use std::ffi::c_void;
 use std::io;
@@ -13,13 +14,14 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use proc_table::win32::OwnedHandle;
 use windows_sys::Win32::Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle, GetLastError, HANDLE};
 use windows_sys::Win32::System::Threading::{
-    CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess,
-    InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST, PROC_THREAD_ATTRIBUTE_DESKTOP_APP_POLICY, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-    PROCESS_CREATION_FLAGS, PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW, UpdateProcThreadAttribute,
+    CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW, CreateProcessW, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT,
+    GetCurrentProcess, InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST, PROC_THREAD_ATTRIBUTE_DESKTOP_APP_POLICY,
+    PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_CREATION_FLAGS, PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW,
+    UpdateProcThreadAttribute,
 };
 
 use crate::launch::{end_unstarted, end_unstarted_by_id, is_batch, refused, setup, struct_size, wide_os};
-use crate::{EnvironmentBlock, LaunchError, Suspended, own_handle, win32_message};
+use crate::{EnvironmentBlock, LaunchError, RestrictedToken, Suspended, own_handle, win32_message};
 
 /// Held while this crate starts a process: across making the inheritable copies of a launch's handles, its
 /// `CreateProcessW` call and closing the copies, and across each [`spawn`]. No inheritable handle of a launch is open
@@ -159,6 +161,8 @@ pub(crate) struct Creation<'a> {
     pub(crate) directory: &'a Path,
     /// The command's whole environment.
     pub(crate) environment: &'a EnvironmentBlock,
+    /// The token the command runs with, or `None` for this process's own.
+    pub(crate) token: Option<&'a RestrictedToken>,
 }
 
 /// Refuses a launch `CreateProcessW` would read otherwise than as written: a NUL cuts a string short, a relative
@@ -283,33 +287,52 @@ fn startup_info<'a>(attributes: &'a mut AttributeList<'_>) -> Startup<'a> {
     Startup { info, borrowed: PhantomData }
 }
 
-/// Calls `CreateProcessW` for `creation` with `startup`, whose list and handles stay open for the whole call. The
-/// command is created suspended, reading its environment as UTF-16 and `startup` as a `STARTUPINFOEXW`; `flags` are
-/// the caller's own creation flags on top of those.
+/// Calls `CreateProcessW` for `creation` with `startup`, whose list and handles stay open for the whole call, or
+/// `CreateProcessAsUserW` with its token when it has one. The command is created suspended, reading its environment as
+/// UTF-16 and `startup` as a `STARTUPINFOEXW`; `flags` are the caller's own creation flags on top of those.
 fn create_process(creation: &Creation<'_>, flags: PROCESS_CREATION_FLAGS, startup: &Startup<'_>) -> Result<Suspended, LaunchError> {
     let application = wide_os(creation.application.as_os_str());
     let mut line: Vec<u16> = creation.command_line.iter().copied().chain(Some(0)).collect();
     let directory = wide_os(creation.directory.as_os_str());
     let flags = CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT | flags;
+    let environment = creation.environment.0.as_ptr().cast();
+    let info = std::ptr::from_ref(&startup.info).cast::<STARTUPINFOW>();
     let mut created = PROCESS_INFORMATION::default();
     // SAFETY: `application` and `directory` are NUL-terminated, `line` is a writable NUL-terminated buffer the call
     // may change, the environment is a block `EnvironmentBlock` built (ended by two NULs) and
     // `CREATE_UNICODE_ENVIRONMENT` says it is UTF-16; `startup` is a whole `STARTUPINFOEXW` whose `cb` says so and
     // `EXTENDED_STARTUPINFO_PRESENT` says so too, and it borrows its attribute list, which borrows the handles it
-    // names; every buffer outlives the call and `created` is writable.
+    // names; every buffer outlives the call and `created` is writable. A token is borrowed by `creation` for its whole
+    // life, so it stays open across the call, with the access `RestrictedToken` opened it with: primary assignment,
+    // duplication, query and default adjustment.
     let ok = unsafe {
-        CreateProcessW(
-            application.as_ptr(),
-            line.as_mut_ptr(),
-            std::ptr::null(),
-            std::ptr::null(),
-            1,
-            flags,
-            creation.environment.0.as_ptr().cast(),
-            directory.as_ptr(),
-            std::ptr::from_ref(&startup.info).cast::<STARTUPINFOW>(),
-            &raw mut created,
-        )
+        match creation.token {
+            None => CreateProcessW(
+                application.as_ptr(),
+                line.as_mut_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                1,
+                flags,
+                environment,
+                directory.as_ptr(),
+                info,
+                &raw mut created,
+            ),
+            Some(token) => CreateProcessAsUserW(
+                token.handle().raw(),
+                application.as_ptr(),
+                line.as_mut_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                1,
+                flags,
+                environment,
+                directory.as_ptr(),
+                info,
+                &raw mut created,
+            ),
+        }
     };
     if ok == 0 {
         // SAFETY: `GetLastError` takes no pointers; it is read before anything else can set it.
@@ -444,6 +467,7 @@ mod tests {
             directory: system,
             environment: environment(),
             console: PipedConsole::Hidden,
+            token: None,
         };
 
         // `CreateProcessW` refuses the command when this process's job refuses breakaway; the window comes before the

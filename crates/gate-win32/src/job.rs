@@ -390,8 +390,8 @@ impl Job {
 
     /// Puts the process behind `process` in the job, and with it every process it starts from then on.
     pub(crate) fn assign(&self, process: &OwnedHandle) -> io::Result<()> {
-        // SAFETY: both handles are open for the whole call; the process handle `CreateProcessW` returned has the
-        // `PROCESS_SET_QUOTA` and `PROCESS_TERMINATE` access the call asks for.
+        // SAFETY: both handles are open for the whole call; the process handle `CreateProcessW` or
+        // `CreateProcessAsUserW` returned has the `PROCESS_SET_QUOTA` and `PROCESS_TERMINATE` access the call asks for.
         let assigned = unsafe { AssignProcessToJobObject(self.handle.raw(), process.raw()) };
         if assigned == 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
     }

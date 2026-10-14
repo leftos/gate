@@ -1368,6 +1368,135 @@ fn box_run_gives_the_command_a_utf8_console() {
     assert_eq!(outcome.stderr, format!("{}\n", started_line(&bytes)), "{outcome:?}");
 }
 
+/// The lines `fake-tool token` prints when `gate box run` starts it, in a case of its own named `name`: the run passes
+/// and the box says nothing but its start marker, so the command was given the restricted token rather than the box's.
+fn the_commands_token(name: &str) -> Vec<String> {
+    let case = Case::new(name);
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "token"]);
+    snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
+
+    let outcome = run_box(&case, &payload);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(
+        outcome.stderr,
+        format!("{}\n", started_line(&payload)),
+        "the marker, no line saying the command keeps the box's token: {outcome:?}"
+    );
+    outcome.stdout.lines().map(str::to_owned).collect()
+}
+
+/// The `dacl` line of a command whose default DACL grants `GENERIC_ALL` (0x10000000, stored as given) to this suite's
+/// user and to SYSTEM alone, in that order: the restricted token's, which no token Windows gives a process has.
+fn restricted_dacl_line() -> String {
+    let user = gate_win32::token_facts().expect("this process's token can be read").user;
+    format!("dacl {user}:0x10000000 S-1-5-18:0x10000000")
+}
+
+#[test]
+fn box_run_starts_the_command_non_elevated_owning_its_objects() {
+    let lines = the_commands_token("box_run_token");
+
+    assert!(lines.iter().any(|line| line == "not-elevated"), "{lines:?}");
+    assert!(lines.iter().any(|line| line == "owner user"), "{lines:?}");
+    let dacl = restricted_dacl_line();
+    assert!(lines.contains(&dacl), "the restricted token's default DACL, {dacl:?}: {lines:?}");
+}
+
+#[test]
+fn box_run_falls_back_to_its_own_token_when_the_restricted_start_is_refused() {
+    let case = Case::new("box_run_token_refused");
+    let count = case.folder().join("count");
+    let count_word = shown(&count);
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "mark", &count_word, "out", "ran"]);
+    snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
+
+    let outcome = finish(box_command(
+        &case,
+        &["box", "--test-box-token", "refused", "run", &self::payload(&payload)],
+    ));
+
+    assert_eq!(outcome.code, Some(0), "the refusal never fails the run: {outcome:?}");
+    assert_eq!(outcome.stdout, "ran\n", "{outcome:?}");
+    let fallback = format!(
+        "gate: the command runs with the builder session's own token: {}",
+        gate_win32::win32_message(5)
+    );
+    assert_eq!(
+        outcome.stderr,
+        format!("{}\n{fallback}\n", started_line(&payload)),
+        "the marker, then the line saying the command keeps the box's token: {outcome:?}"
+    );
+    assert_eq!(marks(&count), "run\n", "the command ran once");
+}
+
+#[test]
+#[ignore = "needs an elevated session: run on a builder"]
+fn box_run_starts_an_elevated_session_s_command_non_elevated() {
+    let lines = the_commands_token("box_run_token_elevated");
+
+    assert!(lines.iter().any(|line| line == "not-elevated"), "{lines:?}");
+    assert!(lines.iter().any(|line| line == "owner user"), "{lines:?}");
+    let integrity = lines
+        .iter()
+        .find_map(|line| line.strip_prefix("integrity 0x"))
+        .and_then(|hex| u32::from_str_radix(hex, 16).ok());
+    assert!(integrity.is_some_and(|rid| rid <= 0x2000), "medium integrity or lower: {lines:?}");
+    let dacl = restricted_dacl_line();
+    assert!(lines.contains(&dacl), "the restricted token's default DACL, {dacl:?}: {lines:?}");
+}
+
+#[test]
+fn box_run_gives_the_command_safe_directory_for_git() {
+    let case = Case::new("box_run_safe_directory");
+    let mut payload = box_payload(
+        &case,
+        "k",
+        &[
+            FAKE_TOOL,
+            "env",
+            "GIT_CONFIG_COUNT",
+            "env",
+            "GIT_CONFIG_KEY_0",
+            "env",
+            "GIT_CONFIG_VALUE_0",
+        ],
+    );
+    snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
+    // The box inherits no config entries, whatever the environment this suite runs in holds.
+    let mut command = box_command(&case, &["box", "run", &self::payload(&payload)]);
+    command.env_remove("GIT_CONFIG_COUNT");
+
+    let outcome = finish(command);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(outcome.stdout, "1\nsafe.directory\n*\n", "{outcome:?}");
+}
+
+#[test]
+fn box_run_appends_safe_directory_after_the_callers_git_config_entries() {
+    let case = Case::new("box_run_safe_directory_appended");
+    let mut payload = box_payload(
+        &case,
+        "k",
+        &[
+            FAKE_TOOL,
+            "env",
+            "GIT_CONFIG_COUNT",
+            "env",
+            "GIT_CONFIG_KEY_2",
+            "env",
+            "GIT_CONFIG_VALUE_2",
+        ],
+    );
+    snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
+
+    let outcome = run_box_with_env(&case, &payload, "GIT_CONFIG_COUNT", "2");
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(outcome.stdout, "3\nsafe.directory\n*\n", "the entry takes the next index: {outcome:?}");
+}
+
 #[test]
 fn box_run_falls_back_before_the_start_and_runs_the_command() {
     let case = Case::new("box_run_console_fails_before");

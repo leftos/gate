@@ -32,7 +32,7 @@ use windows_sys::Win32::System::Threading::{
 use crate::create::{Creation, DesktopPolicy, Inherited, create_inheriting};
 use crate::event::signalled;
 use crate::launch::{LaunchError, open_shared};
-use crate::{EnvironmentBlock, Job, Running, Suspended, own_handle, system_directory};
+use crate::{EnvironmentBlock, Job, RestrictedToken, Running, Suspended, own_handle, system_directory};
 
 /// The UTF-8 code page.
 const UTF8: u32 = 65001;
@@ -74,7 +74,9 @@ impl<G> Utf8Console<G> {
     /// Why the console could not be had: a keeper that cannot start or exits first, a hold not had in time (`the box's
     /// output is blocked`), a donor that exits first, a wait that times out or fails, or a call that fails. This
     /// process is home again by then, its handles put back and the hold let go; the donor is the caller's still.
-    pub fn enter(donor: &Donor, hold: impl FnMut() -> Option<G>) -> Result<Utf8Console<G>, String> {
+    ///
+    /// The keeper runs with `token` when given, as the command does, else with this process's own token.
+    pub fn enter(donor: &Donor, token: Option<&RestrictedToken>, hold: impl FnMut() -> Option<G>) -> Result<Utf8Console<G>, String> {
         let mut console = Utf8Console {
             saved: save_std_handles(),
             keeper: None,
@@ -84,7 +86,7 @@ impl<G> Utf8Console<G> {
             away: false,
             left: false,
         };
-        match console.go_to_donor(donor, hold) {
+        match console.go_to_donor(donor, token, hold) {
             Ok(()) => Ok(console),
             Err(reason) => Err(match console.go_home() {
                 Ok(()) => reason,
@@ -104,9 +106,9 @@ impl<G> Utf8Console<G> {
     }
 
     /// The home process when this process has a console, then the attach and the code pages ([`Utf8Console::attach`]).
-    fn go_to_donor(&mut self, donor: &Donor, hold: impl FnMut() -> Option<G>) -> Result<(), String> {
+    fn go_to_donor(&mut self, donor: &Donor, token: Option<&RestrictedToken>, hold: impl FnMut() -> Option<G>) -> Result<(), String> {
         if !console_processes().is_empty() {
-            self.home = Some(self.find_home(&donor.feed)?);
+            self.home = Some(self.find_home(&donor.feed, token)?);
         }
         self.attach(&donor.helper, hold)
     }
@@ -144,11 +146,11 @@ impl<G> Utf8Console<G> {
         Ok(())
     }
 
-    /// A keeper started on this process's own console, reading `feed`, held open once it shows on the console. No
-    /// process already on the console is taken: it may exit while this process is away, and another `gate box` there
-    /// may be away on a donor's console of its own.
-    fn find_home(&mut self, feed: &Feed) -> Result<Home, String> {
-        let keeper = start_helper(feed, 0, None, "keeper")?;
+    /// A keeper started on this process's own console with `token` when given, reading `feed`, held open once it shows
+    /// on the console. No process already on the console is taken: it may exit while this process is away, and another
+    /// `gate box` there may be away on a donor's console of its own.
+    fn find_home(&mut self, feed: &Feed, token: Option<&RestrictedToken>) -> Result<Home, String> {
+        let keeper = start_helper(feed, 0, None, token, "keeper")?;
         let pid = keeper.pid;
         if !await_listed(pid, console_processes, || keeper.exited(), "the console keeper", CONSOLE_WAIT)? {
             return Err("the console keeper exited before it attached to this process's console".to_owned());
@@ -358,14 +360,15 @@ pub struct Donor {
 }
 
 impl Donor {
-    /// Starts the donor, hidden and outside this process's job, and puts it in `job` before it runs.
+    /// Starts the donor, hidden and outside this process's job, with `token` when given, as the command it lends its
+    /// console to, else with this process's own token, and puts it in `job` before it runs.
     ///
     /// # Errors
     ///
     /// Why it could not start, as `cannot ...`.
-    pub fn start(job: &Job) -> Result<Donor, String> {
+    pub fn start(job: &Job, token: Option<&RestrictedToken>) -> Result<Donor, String> {
         let feed = Feed::open()?;
-        let helper = start_helper(&feed, CREATE_BREAKAWAY_FROM_JOB | CREATE_NO_WINDOW, Some(job), "donor")?;
+        let helper = start_helper(&feed, CREATE_BREAKAWAY_FROM_JOB | CREATE_NO_WINDOW, Some(job), token, "donor")?;
         Ok(Donor { helper, feed })
     }
 
@@ -420,8 +423,14 @@ impl Home {
 }
 
 /// Starts `cmd.exe /d /q /k` from the system folder, in that folder, reading `feed` and writing `NUL`, created with
-/// `flags`, then puts it in `job` when given and resumes it. `what` names it in a failure.
-fn start_helper(feed: &Feed, flags: PROCESS_CREATION_FLAGS, job: Option<&Job>, what: &str) -> Result<Helper, String> {
+/// `flags` and with `token` when given, then puts it in `job` when given and resumes it. `what` names it in a failure.
+fn start_helper(
+    feed: &Feed,
+    flags: PROCESS_CREATION_FLAGS,
+    job: Option<&Job>,
+    token: Option<&RestrictedToken>,
+    what: &str,
+) -> Result<Helper, String> {
     let cannot = |error: &dyn std::fmt::Display| format!("cannot start the console {what}: {error}");
     let system = system_directory().map_err(|error| cannot(&error))?;
     let shell = system.join("cmd.exe");
@@ -434,6 +443,7 @@ fn start_helper(feed: &Feed, flags: PROCESS_CREATION_FLAGS, job: Option<&Job>, w
         command_line: &line,
         directory: &system,
         environment: &environment,
+        token,
     };
     let inherited = Inherited {
         stdio: [&feed.read, &feed.nul, &feed.nul],

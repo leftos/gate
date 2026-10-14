@@ -175,6 +175,7 @@ fn restore_launch(place: &Path) -> Result<PipedLaunch, String> {
             directory: place.to_owned(),
             environment,
             console: PipedConsole::Hidden,
+            token: None,
         }),
         Written::Refused(line) | Written::NoShell(line) => Err(line),
     }

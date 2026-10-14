@@ -23,11 +23,12 @@ use windows_sys::Win32::System::WindowsProgramming::PROCESS_CREATION_DESKTOP_APP
 
 use crate::create::{Creation, DesktopPolicy, Inherited, check_launch, create_inheriting};
 use crate::launch::{open_shared, setup, struct_size};
-use crate::{EnvironmentBlock, Job, LaunchError, Suspended, own_handle, wide};
+use crate::{EnvironmentBlock, Job, LaunchError, RestrictedToken, Suspended, own_handle, wide};
 
 /// How to start a command whose output the caller reads: the caller decides every part of it.
 pub struct PipedLaunch {
-    /// The program file, as an absolute path: `CreateProcessW` runs it as named and searches no folder for it. A
+    /// The program file, as an absolute path: `CreateProcessW` (or `CreateProcessAsUserW`, given a token) runs it as
+    /// named and searches no folder for it. A
     /// `.cmd` or `.bat` file is refused; the caller runs one through cmd.exe itself.
     pub application: PathBuf,
     /// The command line, as the program reads it, without a terminating NUL.
@@ -38,6 +39,9 @@ pub struct PipedLaunch {
     pub environment: EnvironmentBlock,
     /// The console the command is created on.
     pub console: PipedConsole,
+    /// The token the command runs with, through `CreateProcessAsUserW`; `None` runs it with this process's own token,
+    /// through `CreateProcessW`.
+    pub token: Option<RestrictedToken>,
 }
 
 /// The console a [`PipedLaunch`] creates its command on.
@@ -76,7 +80,8 @@ impl PipedLaunch {
     ///
     /// # Errors
     ///
-    /// [`LaunchError::CreateProcess`] when `CreateProcessW` fails; [`LaunchError::Setup`] when the launch is refused
+    /// [`LaunchError::CreateProcess`] when `CreateProcessW` (or `CreateProcessAsUserW`, for a command given a token)
+    /// fails; [`LaunchError::Setup`] when the launch is refused
     /// (an application that is relative or a batch file, or a NUL in the application, command line or working folder)
     /// or a handle, a pipe or the attribute list cannot be made.
     pub fn start_suspended(&self, job: &Job) -> Result<PipedSuspended, LaunchError> {
@@ -130,6 +135,7 @@ impl PipedLaunch {
             command_line: &self.command_line,
             directory: &self.directory,
             environment: &self.environment,
+            token: self.token.as_ref(),
         };
         let inherited = Inherited {
             stdio: [&input, &output, &errors],

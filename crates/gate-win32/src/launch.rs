@@ -194,7 +194,8 @@ impl PriorityClass {
 /// Why a command was not started, or not put in its job and resumed.
 #[derive(Debug, thiserror::Error)]
 pub enum LaunchError {
-    /// `CreateProcessW` refused the command: the program is missing or cannot run. Its text is the system's message
+    /// `CreateProcessW`, or `CreateProcessAsUserW` for a command given a [`crate::RestrictedToken`], refused the
+    /// command: the program is missing or cannot run, or the token is refused. Its text is the system's message
     /// alone, as the gate's `could not start` line prints it.
     #[error("{message}")]
     CreateProcess {
@@ -280,6 +281,7 @@ impl Launch {
             command_line: &self.command_line,
             directory: &self.directory,
             environment: &self.environment,
+            token: None,
         };
         let inherited = Inherited {
             stdio: [&input, &output, &errors],

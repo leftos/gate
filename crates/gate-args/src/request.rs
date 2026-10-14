@@ -55,6 +55,9 @@ pub struct BoxSeams {
     /// Make `gate box run` fail to give its command a UTF-8 console before the command starts, so it starts on the
     /// plain hidden console; `false` without the feature.
     pub fail_console: bool,
+    /// Make `gate box run`'s start of its command with the restricted token fail as access denied, so it starts the
+    /// command with its own token; `false` without the feature.
+    pub refuse_token: bool,
     /// Make `gate box run` wait, just before it starts the command, until this path exists; `None` without the
     /// feature.
     pub park_launch: Option<PathBuf>,

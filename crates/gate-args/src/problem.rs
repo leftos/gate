@@ -74,6 +74,11 @@ pub enum Problem {
         option: String,
         value: String,
     },
+    /// A `--test-box-token` value other than `refused`.
+    BadTokenRefusal {
+        option: String,
+        value: String,
+    },
     NeedsValue(String),
     /// A bare `--timeout auto`, which carries no floor.
     AutoNeedsFloor(String),
@@ -117,6 +122,7 @@ impl fmt::Display for Problem {
             }
             Problem::NotTrueOrFalse { option, value } => write!(f, "gate: {option} takes true or false, got '{value}'"),
             Problem::BadConsoleFailure { option, value } => write!(f, "gate: {option} must be fail-before, got '{value}'"),
+            Problem::BadTokenRefusal { option, value } => write!(f, "gate: {option} must be refused, got '{value}'"),
             Problem::NeedsValue(option) => write!(f, "gate: {option} needs a value"),
             Problem::AutoNeedsFloor(option) => write!(f, "gate: {option} auto needs a floor in seconds: auto:<n>"),
             Problem::GivenTwice(option) => write!(f, "gate: {option} is given twice"),

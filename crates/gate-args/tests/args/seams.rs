@@ -1043,6 +1043,7 @@ fn box_seam_console_and_park_launch_are_read_before_the_verb() {
             seams: BoxSeams {
                 heartbeat_ms: Some(30),
                 fail_console: true,
+                refuse_token: false,
                 park_launch: Some(PathBuf::from(r"X:\case\park")),
                 outputs_budget_bytes: None,
                 dotnet_limit_ms: None,
@@ -1115,6 +1116,75 @@ fn box_seam_console_and_park_launch_are_unknown_words_without_the_feature() {
     assert_eq!(problems(&["box", "--test-box-console=fail-before", "run", "e30="]), [BOX_USAGE]);
     assert_eq!(problems(&["box", "--test-box-park-launch", "park", "run", "e30="]), [BOX_USAGE]);
     assert_eq!(problems(&["box", "--test-box-park-launch=park", "run", "e30="]), [BOX_USAGE]);
+}
+
+#[cfg(feature = "test-seams")]
+#[test]
+fn box_seam_token_is_read_before_the_verb() {
+    use std::ffi::OsString;
+
+    use gate_args::{BoxRequest, BoxSeams, BoxVerb, Invocation};
+
+    use crate::support::invocation;
+
+    let refused = Invocation::Box(BoxRequest {
+        verb: BoxVerb::Run,
+        payload: OsString::from("e30="),
+        seams: BoxSeams {
+            refuse_token: true,
+            ..BoxSeams::default()
+        },
+    });
+    assert_eq!(invocation(&["box", "--test-box-token", "refused", "run", "e30="]), refused);
+    assert_eq!(invocation(&["box", "--test-box-token=refused", "run", "e30="]), refused);
+    assert_eq!(
+        invocation(&["box", "--test-box-console", "fail-before", "--test-box-token", "refused", "run", "e30="]),
+        Invocation::Box(BoxRequest {
+            verb: BoxVerb::Run,
+            payload: OsString::from("e30="),
+            seams: BoxSeams {
+                fail_console: true,
+                refuse_token: true,
+                ..BoxSeams::default()
+            },
+        }),
+        "the token seam comes with the others, in any order"
+    );
+}
+
+#[cfg(feature = "test-seams")]
+#[test]
+fn box_seam_token_refuses_a_bad_missing_or_repeated_value() {
+    let rows: [(&[&str], &[&str]); 6] = [
+        (
+            &["box", "--test-box-token", "accepted", "run", "e30="],
+            &["gate: --test-box-token must be refused, got 'accepted'"],
+        ),
+        (
+            &["box", "--test-box-token", "REFUSED", "run", "e30="],
+            &["gate: --test-box-token must be refused, got 'REFUSED'"],
+        ),
+        (&["box", "--test-box-token=", "run", "e30="], &["gate: --test-box-token needs a value"]),
+        (
+            &["box", "--test-box-token", "--test-box-console", "fail-before", "run", "e30="],
+            &["gate: --test-box-token needs a value"],
+        ),
+        (
+            &["box", "--test-box-token", "refused", "--test-box-token=refused", "run", "e30="],
+            &["gate: --test-box-token is given twice"],
+        ),
+        (&["box", "run", "--test-box-token", "refused", "e30="], &[BOX_USAGE]),
+    ];
+    for (words, want) in rows {
+        assert_eq!(problems(words), want, "{words:?}");
+    }
+}
+
+#[cfg(not(feature = "test-seams"))]
+#[test]
+fn box_seam_token_is_an_unknown_word_without_the_feature() {
+    assert_eq!(problems(&["box", "--test-box-token", "refused", "run", "e30="]), [BOX_USAGE]);
+    assert_eq!(problems(&["box", "--test-box-token=refused", "run", "e30="]), [BOX_USAGE]);
 }
 
 #[cfg(feature = "test-seams")]

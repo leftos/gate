@@ -31,6 +31,10 @@
 //! (`CREATE_BREAKAWAY_FROM_JOB`, which the job must allow) with no standard handles, writes the line
 //! `<its pid> <its start>` to the file at the pid path, the start in 100 ns ticks since 1601, prints `spawned <its pid>` and goes on without
 //! waiting for it, so a case can stand it in for a packaged app the command's descendant starts;
+//! `token` prints what this process's token says of itself, one line each: `elevated` or `not-elevated`, its integrity
+//! level's relative ID as `integrity 0x<hex>`, `owner user` when the objects it creates are owned by its user, else
+//! `owner other`, and its default DACL as `dacl <sid>:0x<mask> …`, each entry's SID in its string form and the access
+//! mask it allows in hex, in the DACL's order (`dacl null` for a null DACL);
 //! `argv` prints every word after it, each on its own line, and ends, so it is always the last step.
 //! With no `exit` step it exits 0. For example `fake-tool out hi err oops exit 3`.
 
@@ -170,6 +174,7 @@ fn run(args: &[OsString]) -> Result<i32, String> {
                 }
             }
             "spawn-away" => spawn_away(&mut steps, &mut stdout)?,
+            "token" => token(&mut stdout)?,
             other => return Err(format!("unknown step '{other}'")),
         }
     }
@@ -315,6 +320,23 @@ fn spawn_away<'a>(steps: &mut impl Iterator<Item = &'a OsString>, stdout: &mut i
     write_file(&pid_path, &format!("{pid} {}\n", times.created))?;
     writeln!(stdout, "spawned {pid}").map_err(|error| write_failed(&error))?;
     stdout.flush().map_err(|error| write_failed(&error))
+}
+
+/// The `token` step: prints whether this process's token is elevated, its integrity level, whether the objects it
+/// creates are owned by its user and its default DACL, one line each.
+fn token(stdout: &mut impl Write) -> Result<(), String> {
+    let facts = gate_win32::token_facts().map_err(|error| format!("cannot read this process's token: {error}"))?;
+    let elevation = if facts.elevated { "elevated" } else { "not-elevated" };
+    let owner = if facts.owner_is_user { "user" } else { "other" };
+    let dacl = match &facts.default_dacl {
+        None => "null".to_owned(),
+        Some(grants) => grants
+            .iter()
+            .map(|grant| format!("{}:0x{:x}", grant.sid, grant.mask))
+            .collect::<Vec<String>>()
+            .join(" "),
+    };
+    writeln!(stdout, "{elevation}\nintegrity 0x{:x}\nowner {owner}\ndacl {dacl}", facts.integrity).map_err(|error| write_failed(&error))
 }
 
 /// Prints a numbered line about every [`CHATTER_STEP`], flushing each, until the file at `path` exists: the log a case's

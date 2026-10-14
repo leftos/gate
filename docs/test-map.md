@@ -82,7 +82,8 @@ Suite = `crates/gate/tests/suite/` (binary `suite`, needs `--all-features`; test
 | gate-watchdog diagnostics.rs | `diagnostics`, `stall`, `ceiling`, `build_servers` (`--test-diagnostics-budget-ms` cuts every block) | unit | no |
 | gate-watchdog heartbeat.rs | `boxside`, `boxside::outputs`, `remote_client`, `critical`/`slots`/`pause` only via `--test-heartbeat-ms` flag (the wait heartbeat is gate/src/wait.rs, not this) | unit | no |
 | gate-win32 job.rs / create.rs / launch.rs / lib.rs / mutex.rs | all (started command, job, slot mutexes): CENTRAL | `gate-win32` tests (launch, mutex, event, interrupt, `io` for `Job::written_bytes`...; unit tests of the completion port: `Job::remember` and its thread, `departed`, `forget`, among them `a_member_that_ended_before_any_look_keeps_its_exact_window_and_no_handle`, `a_member_found_gone_takes_no_one`, `a_member_put_in_the_job_after_its_start_can_have_started_a_process_only_since_the_job_was_created`, `an_exit_message_closes_the_handle_of_that_member_alone`, `the_members_a_memory_could_not_read_are_named_up_to_a_few_and_counted_after` and `dropping_a_remembering_job_ends_its_drain_thread_and_releases_what_it_shares`; in `crates/gate/src/escaped.rs`, `a_look_whose_snapshot_listed_nothing_forgets_no_member` and `a_child_whose_start_is_unknown_of_a_stranger_holding_a_remembered_member_s_pid_is_not_counted`) | CENTRAL |
-| gate-win32 piped.rs / console.rs | `boxside` (`--test-box-console`, `--test-box-park-launch`), `remote_client` | win32 `launch` | no |
+| gate-win32 piped.rs / console.rs | `boxside` (`--test-box-console`, `--test-box-park-launch`, `--test-box-token`), `remote_client` | win32 `launch` | no |
+| gate-win32 token.rs | `boxside` (`box_run_starts_the_command_non_elevated_owning_its_objects`, `box_run_gives_the_command_safe_directory_for_git`, `box_run_appends_safe_directory_after_the_callers_git_config_entries`; `box_run_starts_an_elevated_session_s_command_non_elevated` is `#[ignore]`: needs an elevated session, run by hand on a builder) | win32 `token::tests::*`, `piped` (`a_process_started_with_a_restricted_token_runs_and_exits_with_its_status`) | no: boxside |
 | gate-win32 priority.rs | `priority`, `critical`, `build_servers` | win32 `priority` | no |
 | gate-win32 tree.rs | `stop_tree`, `stall` (escaped processes), `interrupt`, `boxside` (stop), `burn` (`WaitableProcess`), `nesting` (`OpenedJob::holds`) | win32 `membership` | no |
 | gate-win32 interrupt.rs / event.rs | `interrupt`, `critical`, `cutover`, `routing`, `remote_client`, `boxside` (stop event), `slots` (wake) | win32 `interrupt`, `event` | no |
@@ -156,6 +157,7 @@ Always add `checkout` to any change that touches a suite file or adds a seam.
 | gate-watchdog heartbeat | `-E 'package(gate-watchdog) or (binary(suite) and test(/^(boxside\|remote_client)::/))'` |
 | gate-win32 job/create/launch/lib/mutex | `-E 'rdeps(gate-win32)'` |
 | gate-win32 piped/console | `-E 'package(gate-win32) or (binary(suite) and test(/^(boxside\|remote_client)::/))'` |
+| gate-win32 token | `-E 'package(gate-win32) or (binary(suite) and test(/^boxside::/))'` |
 | gate-win32 priority | `-E 'package(gate-win32) or (binary(suite) and test(/^(priority\|critical\|build_servers)::/))'` |
 | gate-win32 tree | `-E 'package(gate-win32) or (binary(suite) and test(/^(stop_tree\|stall\|interrupt\|boxside\|burn\|nesting)::/))'` |
 | gate-win32 interrupt/event | `-E 'package(gate-win32) or (binary(suite) and test(/^(interrupt\|critical\|cutover\|routing\|remote_client\|boxside\|slots)::/))'` |

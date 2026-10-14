@@ -1,6 +1,6 @@
 //! The gate's Win32 layer: named mutexes and events, job objects and their accounting, commands created suspended and
-//! the UTF-8 console a command can be created on, the start time of the gate process or of another, the system's, a
-//! process's and the WSL VM's CPU times, the console interrupt, the
+//! the UTF-8 console a command can be created on, the restricted token a command can be created with, the start time
+//! of the gate process or of another, the system's, a process's and the WSL VM's CPU times, the console interrupt, the
 //! system's boot time, what a drive letter stands for, a rename that never replaces its target, and the Windows message
 //! of an error code. It holds no policy:
 //! the names, the waits, the command's environment and priority, and what an abandoned mutex means to the gate are the
@@ -21,6 +21,7 @@ mod mutex;
 mod piped;
 mod priority;
 mod times;
+mod token;
 mod tree;
 
 pub use console::{Donor, Utf8Console};
@@ -34,6 +35,7 @@ pub use memory::working_set;
 pub use mutex::{AcquireError, MutexGuard, NamedMutex, OwnedMutexGuard, mutex_exists};
 pub use piped::{PipedConsole, PipedFed, PipedLaunch, PipedSuspended, breakaway_refused};
 pub use times::{ProcessTimes, SystemTimes, file_time_now, process_times, system_times, wsl_vm_cpu};
+pub use token::{Grant, RestrictedToken, TokenFacts, token_facts};
 
 /// Refuses an open file that is not a plain disk file: one that is not on a disk, is a reparse point (a link or a
 /// junction, when opened with `FILE_FLAG_OPEN_REPARSE_POINT`), or has more than one name.

@@ -13,7 +13,7 @@ use std::sync::{Once, mpsc};
 use std::thread;
 use std::time::Duration;
 
-use gate_win32::{EnvironmentBlock, Job, OpenedJob, PipedConsole, PipedFed, PipedLaunch, PipedSuspended, Running};
+use gate_win32::{EnvironmentBlock, Job, OpenedJob, PipedConsole, PipedFed, PipedLaunch, PipedSuspended, RestrictedToken, Running};
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_BREAKAWAY_OK, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
     JobObjectExtendedLimitInformation, SetInformationJobObject,
@@ -60,6 +60,7 @@ fn cmd(line: &str) -> PipedLaunch {
         directory: system,
         environment: EnvironmentBlock::new(std::env::vars_os()).expect("the block is built"),
         console: PipedConsole::Hidden,
+        token: None,
     }
 }
 
@@ -96,6 +97,19 @@ impl Drop for EndJob {
             let _ = job.terminate(1);
         }
     }
+}
+
+#[test]
+fn a_process_started_with_a_restricted_token_runs_and_exits_with_its_status() {
+    let name = unique_name("restricted");
+    let _end = EndJob(name.clone());
+    let job = Job::create(&name).expect("the job is created");
+    let mut launch = cmd("exit 7");
+    launch.token = Some(RestrictedToken::of_this_process().expect("the restricted token is made"));
+
+    let (running, _stdout, _stderr) = start(&launch, &job);
+
+    assert_eq!(running.wait(HANG_GUARD).expect("the wait answers"), Some(7));
 }
 
 #[test]

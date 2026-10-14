@@ -321,6 +321,7 @@ fn sdk_launch(dotnet: &Path, folder: &Path, variables: &Variables) -> io::Result
         directory: folder.to_owned(),
         environment: variables.block()?,
         console: PipedConsole::Attached,
+        token: None,
     })
 }
 

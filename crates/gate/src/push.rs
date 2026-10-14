@@ -338,6 +338,7 @@ fn launch(call: &Call<'_>) -> io::Result<PipedLaunch> {
         directory: std::env::current_dir()?,
         environment: EnvironmentBlock::new(call.variables.iter().cloned())?,
         console: PipedConsole::Hidden,
+        token: None,
     })
 }
 

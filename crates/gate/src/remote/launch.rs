@@ -48,6 +48,7 @@ pub(super) fn piped_launch(command: &Command, console: PipedConsole) -> io::Resu
         directory,
         environment: EnvironmentBlock::new(environment_of(command))?,
         console,
+        token: None,
     })
 }
 

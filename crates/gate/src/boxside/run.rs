@@ -14,7 +14,7 @@
 //! that a repository's own hooks or monitor, such as one a build installed, do not run in it.
 
 use std::cell::Cell;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::os::windows::fs::OpenOptionsExt;
@@ -26,7 +26,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use gate_args::BoxSeams;
 use gate_watchdog::Pump;
-use gate_win32::{Donor, Job, LaunchError, NamedEvent, PipedConsole, PipedLaunch, PipedSuspended, Running, Utf8Console};
+use gate_win32::{Donor, Job, LaunchError, NamedEvent, PipedConsole, PipedLaunch, PipedSuspended, RestrictedToken, Running, Utf8Console};
 
 use crate::answer::USAGE_STATUS;
 use crate::boxside::forward::{DRAIN, Forwarders, OutputLock};
@@ -491,9 +491,10 @@ pub(super) fn full_path(path: &Path) -> Option<PathBuf> {
 /// donor lives until the wait for the command is over, however it ends. The heartbeat watches the job while [`watch`]
 /// waits for it. The command's environment is the box's own with `MSBUILDNODEHANDSHAKESALT` set to the work folder's
 /// key, replacing any value the box inherited, so `MSBuild`'s worker nodes stay warm within one work folder and are
-/// never reused across work folders ([`Variables::with`]).
+/// never reused across work folders ([`Variables::with`]), and with git's `safe.directory` set to `*`
+/// ([`with_safe_directory`]). The command runs with a restricted copy of the box's token ([`restricted_token`]).
 fn command(request: &Request<'_>, place: &Path, beat: &Beat<'_>, console: &mut Console) -> Result<u32, u32> {
-    let variables = Variables::from_process().with("MSBUILDNODEHANDSHAKESALT", request.key);
+    let variables = with_safe_directory(Variables::from_process().with("MSBUILDNODEHANDSHAKESALT", request.key));
     let environment = variables
         .block()
         .map_err(|error| failed(console, &format!("cannot build the command's environment: {error}")))?;
@@ -517,12 +518,13 @@ fn command(request: &Request<'_>, place: &Path, beat: &Beat<'_>, console: &mut C
             directory: place.to_owned(),
             environment,
             console: PipedConsole::Hidden,
+            token: restricted_token(console),
         },
     };
     before_the_job(beat.stop.look(STARTING_COMMAND), request.job, console)?;
     let job = create_job(request.job, console)?;
     // Started right after the job and kept until the command's wait is over, so its console outlives the command.
-    let donor = console_donor(&job, beat.seams);
+    let donor = console_donor(&job, launch.token.as_ref(), beat.seams);
     if let Some(park) = beat.seams.park_launch.as_deref() {
         wait_for_path(park, console);
     }
@@ -533,6 +535,7 @@ fn command(request: &Request<'_>, place: &Path, beat: &Beat<'_>, console: &mut C
         word,
         program: &program,
         nonce: request.nonce,
+        refuse_token: beat.seams.refuse_token,
     };
     let launched = match start_command(&mut start, donor.as_ref().map_err(String::as_str), beat, console) {
         Ok(launched) => launched,
@@ -546,8 +549,69 @@ fn command(request: &Request<'_>, place: &Path, beat: &Beat<'_>, console: &mut C
     watched
 }
 
-/// The command to start: its launch, its job and the job's stop signal, the word and program a start failure names, and
-/// the run's nonce its start marker names.
+/// The variable that counts the config entries git reads from the environment.
+const GIT_CONFIG_COUNT: &str = "GIT_CONFIG_COUNT";
+
+/// `variables` with one more config entry for git, `safe.directory` set to `*`, so a git the command runs trusts the
+/// work folder whoever owns it: the restricted token's user owns none of the folders the box made. The entry takes the
+/// index `GIT_CONFIG_COUNT` holds, 0 when it is unset, and the count grows by one. A count git refuses
+/// ([`git_config_count`]), or one at `i32::MAX` that one more entry would take past what git accepts, leaves
+/// `variables` as they are.
+fn with_safe_directory(variables: Variables) -> Variables {
+    let index = match variables.get(GIT_CONFIG_COUNT) {
+        None => 0,
+        Some(count) => match git_config_count(count) {
+            Some(index) if index < i32::MAX.cast_unsigned() => index,
+            _ => return variables,
+        },
+    };
+    variables
+        .with(GIT_CONFIG_COUNT, &(index + 1).to_string())
+        .with(&format!("GIT_CONFIG_KEY_{index}"), "safe.directory")
+        .with(&format!("GIT_CONFIG_VALUE_{index}"), "*")
+}
+
+/// The count `GIT_CONFIG_COUNT` holds, read as git reads it, with `strtoul` taking the whole value: an empty value is
+/// 0; else leading whitespace is skipped, then an optional `+` and decimal digits to the end of the value, at most
+/// `i32::MAX`. `None` for anything else, which git refuses, a value of whitespace alone included, as `strtoul` then
+/// converts nothing and leaves the whole value unread.
+fn git_config_count(count: &OsStr) -> Option<u32> {
+    let text = count.to_str()?;
+    if text.is_empty() {
+        return Some(0);
+    }
+    let text = text.trim_start_matches([' ', '\t', '\n', '\x0B', '\x0C', '\r']);
+    let digits = text.strip_prefix('+').unwrap_or(text);
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse::<u32>().ok().filter(|&count| count <= i32::MAX.cast_unsigned())
+}
+
+/// A restricted copy of the box's token for the command ([`RestrictedToken::of_this_process`]): not elevated, at
+/// medium integrity at most, owning the objects it creates as the user. `None` when it cannot be made, said on the
+/// console: the command then runs with the box's own token.
+fn restricted_token(console: &mut Console) -> Option<RestrictedToken> {
+    match RestrictedToken::of_this_process() {
+        Ok(token) => Some(token),
+        Err(error) => {
+            console.err(&own_token_line(&error));
+            None
+        }
+    }
+}
+
+/// The line saying the command runs with the box's own token, as its restricted one could not be made or started
+/// with, for `error`.
+fn own_token_line(error: &dyn std::fmt::Display) -> String {
+    format!("gate: the command runs with the builder session's own token: {error}")
+}
+
+/// Win32's `ERROR_ACCESS_DENIED`, the refusal the token seam stands in for.
+const ACCESS_DENIED: u32 = 5;
+
+/// The command to start: its launch, its job and the job's stop signal, the word and program a start failure names,
+/// the run's nonce its start marker names, and whether the token seam refuses its start with the restricted token.
 struct Start<'a> {
     launch: PipedLaunch,
     job: &'a Job,
@@ -555,6 +619,7 @@ struct Start<'a> {
     word: &'a str,
     program: &'a Path,
     nonce: &'a str,
+    refuse_token: bool,
 }
 
 /// A command started in its job, and the read ends of its pipes.
@@ -563,12 +628,13 @@ struct Launched {
     pipes: Pipes,
 }
 
-/// The console's donor, put in `job`, or why there is none: the console seam forces that before any donor starts.
-fn console_donor(job: &Job, seams: &BoxSeams) -> Result<Donor, String> {
+/// The console's donor, put in `job` and run with the command's `token` when it has one, or why there is none: the
+/// console seam forces that before any donor starts.
+fn console_donor(job: &Job, token: Option<&RestrictedToken>, seams: &BoxSeams) -> Result<Donor, String> {
     if seams.fail_console {
         return Err(FORCED.to_owned());
     }
-    Donor::start(job)
+    Donor::start(job, token)
 }
 
 /// Starts the command on `donor`'s UTF-8 console, or, when the console cannot be had (`donor` may say why none
@@ -599,7 +665,8 @@ fn start_command(start: &mut Start<'_>, donor: Result<&Donor, &str>, beat: &Beat
 /// The launch on `donor`'s UTF-8 console, the box's own output held from just before the box leaves its console until
 /// it is home again, since its standard handles may point at the donor's console meanwhile; on the plain hidden
 /// console when the UTF-8 one cannot be had, as when the output's lock is not free within the console's wait. How the
-/// launch ended, with why the UTF-8 console could not be had, for the caller to say.
+/// launch ended, with why the UTF-8 console could not be had, for the caller to say. The console's keeper runs with the
+/// command's token when it has one, as the donor does.
 fn on_utf8_console(start: &mut Start<'_>, donor: &Donor, beat: &Beat<'_>, console: &mut Console) -> Ended {
     let lock = beat.lock;
     let hold = || match lock.try_lock() {
@@ -607,7 +674,7 @@ fn on_utf8_console(start: &mut Start<'_>, donor: &Donor, beat: &Beat<'_>, consol
         Err(TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
         Err(TryLockError::WouldBlock) => None,
     };
-    match Utf8Console::enter(donor, hold) {
+    match Utf8Console::enter(donor, start.launch.token.as_ref(), hold) {
         Ok(utf8) => {
             let ended = launch(start, PipedConsole::Attached);
             if let Err(problem) = utf8.leave() {
@@ -628,16 +695,22 @@ struct Ended {
     how: LaunchEnd,
     /// Why the command could not have a UTF-8 console, when it was launched on the plain hidden one.
     fallback: Option<String>,
+    /// The line saying the command runs with the box's own token, when its start with the restricted one was refused.
+    own_token: Option<String>,
     /// The line saying the job's stop signal could not be read, when it could not.
     unread: Option<String>,
 }
 
 impl Ended {
-    /// Says the fallback, unless the launch was stopped, so no fallback line comes before a stop line; then that the
-    /// stop signal could not be read.
+    /// Says the fallback, then that the command runs with the box's own token, unless the launch was stopped, so
+    /// neither line comes before a stop line; then that the stop signal could not be read.
     fn say(&self, console: &mut Console) {
-        if let Some(reason) = self.fallback.as_deref().filter(|_| !matches!(self.how, LaunchEnd::Stopped)) {
+        let not_stopped = !matches!(self.how, LaunchEnd::Stopped);
+        if let Some(reason) = self.fallback.as_deref().filter(|_| not_stopped) {
             say_fallback(console, reason);
+        }
+        if let Some(line) = self.own_token.as_deref().filter(|_| not_stopped) {
+            console.err(line);
         }
         if let Some(line) = &self.unread {
             console.err(line);
@@ -661,8 +734,14 @@ enum LaunchEnd {
 /// [`Ended`], for the caller to say once the box is home.
 fn launch(start: &mut Start<'_>, on: PipedConsole) -> Ended {
     start.launch.console = on;
-    let ended = |how, unread| Ended { how, fallback: None, unread };
-    let PipedSuspended { suspended, stdout, stderr } = match start.launch.start_suspended(start.job) {
+    let (created, own_token) = create_suspended(start);
+    let ended = |how, unread| Ended {
+        how,
+        fallback: None,
+        own_token,
+        unread,
+    };
+    let PipedSuspended { suspended, stdout, stderr } = match created {
         Ok(created) => created,
         Err(error) => return ended(LaunchEnd::Refused(error), None),
     };
@@ -680,6 +759,35 @@ fn launch(start: &mut Start<'_>, on: PipedConsole) -> Ended {
         Err(error) => LaunchEnd::Refused(error),
     };
     ended(how, unread)
+}
+
+/// Creates the command suspended: with its restricted token when it has one, and when `CreateProcessAsUserW` refuses
+/// that, or the token seam says it does, once more with the box's own token, which it keeps from then on. Only a
+/// failure of that second start is the launch's. The command created, or why not, and the line saying it runs with the
+/// box's own token when the restricted start was refused and the second one created it.
+fn create_suspended(start: &mut Start<'_>) -> (Result<PipedSuspended, LaunchError>, Option<String>) {
+    if start.launch.token.is_none() {
+        return (start.launch.start_suspended(start.job), None);
+    }
+    let restricted = if start.refuse_token {
+        Err(LaunchError::CreateProcess {
+            code: ACCESS_DENIED,
+            message: gate_win32::win32_message(ACCESS_DENIED),
+        })
+    } else {
+        start.launch.start_suspended(start.job)
+    };
+    match restricted {
+        Err(error @ LaunchError::CreateProcess { .. }) => {
+            start.launch.token = None;
+            let created = start.launch.start_suspended(start.job);
+            // A second start refused too was not refused for the token, as of a program that is missing: only its
+            // own failure is said.
+            let line = created.is_ok().then(|| own_token_line(&error));
+            (created, line)
+        }
+        created => (created, None),
+    }
 }
 
 /// What a look at a job's stop signal found.
@@ -1271,10 +1379,52 @@ impl BackGit<'_> {
 mod tests {
     use std::io;
 
-    use super::{Look, STARTING_COMMAND, before_the_job, look};
+    use super::{GIT_CONFIG_COUNT, Look, STARTING_COMMAND, before_the_job, look, with_safe_directory};
     use crate::console::Console;
+    use crate::environment::Variables;
 
     const JOB: &str = r"Local\gate-job-k-0001";
+
+    /// The box's environment with `GIT_CONFIG_COUNT` set to `count`.
+    fn counted(count: &str) -> Variables {
+        Variables::from_process().with(GIT_CONFIG_COUNT, count)
+    }
+
+    /// The count, key and value `with_safe_directory` leaves at `index` over a `GIT_CONFIG_COUNT` of `count`.
+    fn entry_over(count: &str, index: u32) -> [Option<String>; 3] {
+        let variables = with_safe_directory(counted(count));
+        let read = |name: &str| variables.get(name).map(|value| value.to_string_lossy().into_owned());
+        [
+            read(GIT_CONFIG_COUNT),
+            read(&format!("GIT_CONFIG_KEY_{index}")),
+            read(&format!("GIT_CONFIG_VALUE_{index}")),
+        ]
+    }
+
+    /// The entry `with_safe_directory` adds at `index`, the count then being `count`.
+    fn safe_directory_at(count: &str) -> [Option<String>; 3] {
+        [Some(count.to_owned()), Some("safe.directory".to_owned()), Some("*".to_owned())]
+    }
+
+    #[test]
+    fn safe_directory_takes_index_0_over_an_empty_count() {
+        assert_eq!(entry_over("", 0), safe_directory_at("1"));
+    }
+
+    #[test]
+    fn safe_directory_takes_the_index_a_count_after_leading_whitespace_holds() {
+        assert_eq!(entry_over(" 2", 2), safe_directory_at("3"));
+    }
+
+    #[test]
+    #[expect(clippy::expect_used, reason = "an environment whose block cannot be built must fail the case loudly")]
+    fn safe_directory_leaves_the_environment_unchanged_over_a_count_git_refuses() {
+        for count in [" ", "x", "2x", "2147483648"] {
+            let unchanged = format!("{:?}", counted(count).block().expect("the block is built"));
+            let after = format!("{:?}", with_safe_directory(counted(count)).block().expect("the block is built"));
+            assert_eq!(after, unchanged, "{count:?}");
+        }
+    }
 
     /// The line for a stop signal of [`JOB`] whose wait failed with `the wait failed`.
     fn unread() -> String {
