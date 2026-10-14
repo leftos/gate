@@ -46,7 +46,9 @@ Not verified: whether `vstest`/`testhost` processes outlive a `dotnet test` (non
 
 ### Priority of an in-job server
 
-Roslyn creates VBCSCompiler with `NORMAL_PRIORITY_CLASS` (quote above). Measured under an ordinary heavy gate (BelowNormal command), the per-run server ran at **BelowNormal** (probe: `server pid 76640 priority BelowNormal`). The gate's priority pass then left an ordinary gate's in-job servers alone, so the class did not come from the gate's lowering; why the explicit Normal flag did not hold is not resolved (the SDK 10.0.401 compiler may differ from roslyn `main`). Under a critical gate the command is High and its children start at Normal (`docs/research/2026-10-09-powershell-gate-inventory.md:99`, K4; not measured in this repo).
+Roslyn creates VBCSCompiler with `NORMAL_PRIORITY_CLASS` (quote above). Measured under an ordinary heavy gate (BelowNormal command), the per-run server ran at **BelowNormal** (probe: `server pid 76640 priority BelowNormal`).
+
+The gate's priority pass then left an ordinary gate's in-job servers alone, so the class did not come from the gate's lowering; why the explicit Normal flag did not hold is not resolved (the SDK 10.0.401 compiler may differ from roslyn `main`). Under a critical gate the command is High and its children start at Normal (`docs/research/2026-10-09-powershell-gate-inventory.md:99`, K4; not measured in this repo).
 
 ## 2. Cold-start cost on this PC
 
@@ -77,4 +79,10 @@ Reading:
 - On a full rebuild the cold server costs about 14 s load-adjusted (+38%) and roughly doubles the CPU; no server at all costs about 21 s (+55%). Reuse within the run is worth about 7 s on a 24-project rebuild.
 - Nested runs multiply it: delve's test-all runs two nested gated builds (Debug then Release, tools/test-all.ps1:156,164); with a server per nested gate each pays the cold start.
 
-**The builder (not measured).** Measuring there would take: a work folder of a .NET repo on the builder (the box's `Work` folders under its output root), an ssh session with the builder's own `gate.exe`, and the same interleaved script run locally on the builder with `gate run --local`, comparing a work-folder salt (no `MSBUILDDISABLENODEREUSE`, `MSBUILDNODEHANDSHAKESALT=<work-folder key>`, shared compiler server) against `MSBUILDNODEHANDSHAKESALT=<run id>` (or node reuse off) plus `SharedCompilationId=<run id>`, three runs each of noop, touch and rebuild, with the builder idle of other routed runs. The builder loses more than this PC does: under a work-folder salt its MSBuild nodes are warm across runs in one work folder, so a per-run run pays a cold node start as well as a cold compiler.
+**The builder (not measured).**
+
+Measuring there would take a work folder of a .NET repo on the builder (the box's `Work` folders under its output root), an ssh session with the builder's own `gate.exe`, and the same interleaved script run locally on the builder with `gate run --local`.
+
+That run compares a work-folder salt (no `MSBUILDDISABLENODEREUSE`, `MSBUILDNODEHANDSHAKESALT=<work-folder key>`, shared compiler server) against `MSBUILDNODEHANDSHAKESALT=<run id>` (or node reuse off) plus `SharedCompilationId=<run id>`, three runs each of noop, touch and rebuild, with the builder idle of other routed runs.
+
+The builder loses more than this PC does: under a work-folder salt its MSBuild nodes are warm across runs in one work folder, so a per-run run pays a cold node start as well as a cold compiler.
