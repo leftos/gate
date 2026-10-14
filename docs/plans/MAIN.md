@@ -10,13 +10,8 @@
 
 - [ ] GATE-10 Port the remote client and box wrapper, then the remote cutover
   - [ ] GATE-109 Remote: carry every verb of a routed run over one ssh connection (gate box serve)
-  - [ ] GATE-192 Turn routing back on, on the Rust remote client
-  - [ ] GATE-215 Routed outputs install refuses UTF-16 files (coverage mapping) and fails a passing build
-  - [ ] GATE-216 A refused outputs install leaves the pending marker, failing every later routed run
-  - [ ] GATE-217 Routed outputs too large for the ceiling: per-repo output globs or a transfer outside the ceiling
-  - [ ] GATE-218 A new worktree's first routed push sends the whole repo again
+  - [!] GATE-192 Turn routing back on, on the Rust remote client
   - [ ] GATE-219 Routed commands run elevated on the builder, so a pipe-owner test fails there
-  - [ ] GATE-220 A routed cargo build brings nothing back: default outputs miss target/
   - [ ] GATE-18 Remote preflight: refuse with `parity` when the builder lacks a .NET workload the repo needs
   - [ ] GATE-19 Remote: send a repo's declared sibling worktrees with a routed run
   - [ ] GATE-22 Remote: send a routed command's ignored inputs to the builder, compressed
@@ -34,6 +29,7 @@
   - [ ] GATE-212 Toolchain 5: gate check, for this machine and for a builder
   - [ ] GATE-213 Toolchain 6: siblings declared under .gate/
   - [ ] GATE-214 Toolchain 7: roll the manifest out to the gated repos
+- [ ] GATE-224 Compress and deduplicate every routed transfer (outputs, the command's output stream, gate push)
 
 ## Cutover sweep
 
@@ -48,9 +44,8 @@
 - [ ] GATE-17 Durations part 5: backfill guests during a critical drain
 - [ ] GATE-8 `--slot auto` picks heavy or light from the command's history
 - [/] GATE-190 Run each gate's build servers inside its own job, never shared between runs
-  - [ ] GATE-198 Per-run servers C: remove build-server recognition, the priority pass over outside servers, and their seams
-- [ ] GATE-199 Merge feat/per-run-servers (#203)
-- [ ] GATE-207 Per-run servers: fix the run end's review findings before the branch merges
+  - [/] GATE-198 Per-run servers C: remove build-server recognition, the priority pass over outside servers, and their seams
+- [ ] GATE-199 Merge feat/per-run-servers (#226)
 
 ## Backlog
 
@@ -64,5 +59,7 @@
 - [ ] GATE-188 A freed slot sits idle up to one watch slice while a late ticket heads the queue
 - [ ] GATE-193 Test whether a gate under a stand-in or a late take ever lends its slot
 - [ ] GATE-203 Retire gate cutover, cutover.flag and the PowerShell-layout readers
-- [ ] GATE-205 Run-end sparing judges a live gate by its image name and the ender's own state root
 - [ ] GATE-185 A nested critical gate whose parent gate ends runs on uncounted
+- [ ] GATE-222 Run end misses a nested gate's job under a state root of its own when the ender is on the default root
+- [ ] GATE-223 Suite: journal rollover case fails when the durations store prints its expected-time line
+- [ ] GATE-225 Suite: covered-gate slot wait case fails under load (the slot frees before the wait)
