@@ -524,6 +524,25 @@ fn failures_are_counted_not_timed() {
 }
 
 #[test]
+fn a_transfer_that_timed_out_leaves_the_history_unchanged() {
+    let key = local_key("cargo build");
+    let mut store = DurationStore::new();
+    record_walls(&mut store, &key, &[10.0; 5]);
+    let before = store.history(&key.exact).expect("the key has a history").clone();
+
+    store.record(
+        &key,
+        ts(NOW),
+        &RunFacts {
+            verdict: Verdict::TransferTimedOut,
+            ..passed(999.0)
+        },
+    );
+
+    assert_eq!(store.history(&key.exact), Some(&before));
+}
+
+#[test]
 fn a_family_estimate_says_it_is_one() {
     let filtered = |filter: &str| local_key(&format!("cargo nextest run -E test({filter})"));
     let mut store = DurationStore::new();
