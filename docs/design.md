@@ -1070,6 +1070,8 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
   The check is skipped, and the word kept, when the worktree root's `Directory.Build.props` or `Directory.Build.targets` names `UseArtifactsOutput`, `ArtifactsPath`, `BaseIntermediateOutputPath` or `MSBuildProjectExtensionsPath`. Solution entries that are not plain names inside the worktree are skipped.
 
+  Inside is judged by canonical path, both sides resolved: another spelling of the worktree (a `subst` drive, a junction) counts as inside, and a project folder inside the worktree that is a junction leading outside counts as outside.
+
   Props and solution files are read only as regular files up to 1 MiB; otherwise the gate says `gate: cannot read <path>: it is a link, a junction or not a file` or `gate: cannot read <path>: it is larger than 1 MiB`, and the word is kept. Printed paths escape control characters. When git fails the gate says `gate: cannot find the command's git worktree: <error>` or `gate: cannot list the worktree's projects: <error>` and keeps the word.
 
   The git calls of the drop and the clear run with `LC_ALL=C`. The clear prints nothing when git is missing or the folder is outside a repository.

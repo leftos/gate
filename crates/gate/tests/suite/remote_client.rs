@@ -23,8 +23,8 @@ use sha2::{Digest, Sha256};
 
 use crate::durations::seed;
 use crate::support::{
-    Case, FAKE_TOOL, GATE, GIT_REDIRECTS, Go, Outcome, Running, allow_breakaway, beside, build_version, copy_tool, events, finish, git, git_init,
-    heavy_words, nothing_back, release, shown, start, wait_for_journal_line, wait_until, wait_until_closed, write_remote_json,
+    Case, FAKE_TOOL, GATE, GIT_REDIRECTS, Go, Junction, Outcome, Running, allow_breakaway, beside, build_version, copy_tool, events, finish, git,
+    git_init, heavy_words, nothing_back, release, shown, start, wait_for_journal_line, wait_until, wait_until_closed, write_remote_json,
 };
 
 const HOST: &str = "builder";
@@ -1406,40 +1406,6 @@ fn a_junction_on_path_into_the_worktree_is_not_run_for_the_sdk_list() {
         1,
         "the dotnet.cmd behind the junction ran for the builder alone: {ran:?}"
     );
-}
-
-/// A junction beside the case folder, outside its worktree, made with `mklink /J`; removed, and not what it leads to,
-/// when it drops.
-struct Junction(PathBuf);
-
-impl Junction {
-    /// A junction that leads to `target`.
-    fn to(case: &Case, target: &Path) -> Junction {
-        let mut link = case.folder().into_os_string();
-        link.push("-junction");
-        let link = PathBuf::from(link);
-        // A junction an earlier run of the case left would make `mklink` refuse.
-        drop(fs::remove_dir(&link));
-        let made = Command::new("cmd")
-            .args(["/c", "mklink", "/J"])
-            .arg(&link)
-            .arg(target)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .status()
-            .expect("cmd starts");
-        assert!(made.success(), "the junction is made");
-        Junction(link)
-    }
-}
-
-impl Drop for Junction {
-    fn drop(&mut self) {
-        if let Err(error) = fs::remove_dir(&self.0) {
-            // A junction left beside the case harms no later case, which removes it first, and a panic in drop aborts.
-            let _ = writeln!(io::stderr(), "could not remove the junction {}: {error}", self.0.display());
-        }
-    }
 }
 
 /// A `PATH` with an unmatched quote reads every folder after it as one, so the `dotnet` there would not be found and
@@ -4896,7 +4862,32 @@ fn an_installed_test_host_manifest_names_the_worktree() {
     let outcome = finish(client_gate(&case, "second.log", &second, &command));
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
-    let root = std::path::absolute(case.folder()).expect("the case folder has a full path");
+    let root = std::path::absolute(git_out(&case, &[], &["rev-parse", "--show-toplevel"])).expect("git names the worktree by a full path");
+    let expected = format!(r"Root_{}\src\App", root.display());
+    assert_eq!(worktree_text(&case, r"bin\MvcTestingAppManifest.json"), expected, "{outcome:?}");
+}
+
+/// A gate whose folder is spelled through a junction to the case folder, as it is through a `subst` drive, still names
+/// the worktree by git's real spelling in the manifest it installs.
+#[test]
+fn an_installed_test_host_manifest_names_the_worktree_from_a_junction() {
+    let case = outputs_case("client-outputs-install-rewrite-junction", &BIN);
+    let first = ssh_steps(&case, "first", &["ok", "ok"]);
+    let cleared = finish(client_gate(&case, "first.log", &first, &[r".\tool.exe", "out", "ran there"]));
+    assert_eq!(cleared.code, Some(0), "{cleared:?}");
+    let builder = std::path::absolute(case.folder().join("builder")).expect("the builder root has a full path");
+    let work = format!(r"{}\work\{}", builder.display(), key_of(&events(&case)));
+    let recorded = format!(r"Root_{}\src\App", work.to_uppercase());
+    let second = ssh_steps(&case, "second", &["ok", "ok", "ok"]);
+    let command = [r".\tool.exe", "write", r"bin\MvcTestingAppManifest.json", &recorded];
+    let junction = Junction::to(&case, &case.folder());
+    let mut gate = client_gate(&case, "second.log", &second, &command);
+    gate.current_dir(&junction.0);
+
+    let outcome = finish(gate);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let root = std::path::absolute(git_out(&case, &[], &["rev-parse", "--show-toplevel"])).expect("git names the worktree by a full path");
     let expected = format!(r"Root_{}\src\App", root.display());
     assert_eq!(worktree_text(&case, r"bin\MvcTestingAppManifest.json"), expected, "{outcome:?}");
 }
@@ -4917,7 +4908,7 @@ fn an_installed_utf16_coverage_mapping_names_the_worktree() {
     let outcome = finish(client_gate(&case, "second.log", &second, &[r".\tool.exe", "out", "ran there"]));
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
-    let root = std::path::absolute(case.folder()).expect("the case folder has a full path");
+    let root = std::path::absolute(git_out(&case, &[], &["rev-parse", "--show-toplevel"])).expect("git names the worktree by a full path");
     let expected = utf16_le(&format!(r"Root_{}\src\App", root.display()));
     let installed = fs::read(case.folder().join("bin").join(".msCoverageSourceRootsMapping_App")).expect("the file is installed");
     assert_eq!(installed, expected, "UTF-16 LE, its BOM kept, the worktree named: {outcome:?}");

@@ -883,6 +883,40 @@ pub fn beside(path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(beside)
 }
 
+/// A junction beside the case folder, outside its worktree, made with `mklink /J`; removed, and not what it leads to,
+/// when it drops.
+pub struct Junction(pub PathBuf);
+
+impl Junction {
+    /// A junction that leads to `target`.
+    pub fn to(case: &Case, target: &Path) -> Junction {
+        let mut link = case.folder().into_os_string();
+        link.push("-junction");
+        let link = PathBuf::from(link);
+        // A junction an earlier run of the case left would make `mklink` refuse.
+        drop(fs::remove_dir(&link));
+        let made = Command::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .arg(&link)
+            .arg(target)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .status()
+            .expect("cmd starts");
+        assert!(made.success(), "the junction is made");
+        Junction(link)
+    }
+}
+
+impl Drop for Junction {
+    fn drop(&mut self) {
+        if let Err(error) = fs::remove_dir(&self.0) {
+            // A junction left beside the case harms no later case, which removes it first, and a panic in drop aborts.
+            let _ = writeln!(io::stderr(), "could not remove the junction {}: {error}", self.0.display());
+        }
+    }
+}
+
 /// The words of a light run logging to `log`, `extra` before `--` and `command` after it. Gates that run at once each
 /// need a log of their own, since a gate refuses a log another gate is writing. The ceiling is far above the hang
 /// guard, so a run a case holds is never ended by it.

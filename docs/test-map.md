@@ -90,7 +90,7 @@ Suite = `crates/gate/tests/suite/` (binary `suite`, needs `--all-features`; test
 | proc-table | `stop_tree`, `stall` (`parent_pid_of`) (imports `Win32ProcessTable`), `cutover` (`command_line_of`), `diagnostics`, `stall`/`cores` (`ProcessTree::children` through the escaped walk) | proc-table unit | no |
 | tools/gate.ps1 | `launcher` (runs the checked-in launcher), `cutover` (hand-over), `checkout` (`repo_file`) | - | no |
 | tools/install.ps1 | `install`, `checkout` | - | no |
-| suite support.rs / harness.rs / main.rs / fake tools | all suite (support.rs is `Case`): CENTRAL for suite; `harness` self-tests | - | CENTRAL |
+| suite support.rs / harness.rs / main.rs / fake tools | all suite (support.rs is `Case`, and the shared `Junction` helper that `routing` and `remote_client` use for another spelling of a path): CENTRAL for suite; `harness` self-tests | - | CENTRAL |
 | suite module file `X.rs` | its own module only (`test(/^X::/)`), plus `boxside/outputs.rs` -> `boxside::` | - | no |
 | Cargo.toml (workspace), Cargo.lock, crates/gate/Cargo.toml, rust-toolchain, .cargo/, clippy config | whole workspace | - | CENTRAL |
 | docs/, README | none | - | none (no tests) |

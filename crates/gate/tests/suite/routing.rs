@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 use crate::nesting::{LOOK_OFTEN, end_parent, first_event, marked, orphaned_as, spawned, test_marker};
 
 use crate::support::{
-    Case, FAKE_TOOL, GATE, Outcome, Running, assert_in_order, beside, copy_tool, events, finish, git, git_init, heavy_words, nothing_back,
+    Case, FAKE_TOOL, GATE, Junction, Outcome, Running, assert_in_order, beside, copy_tool, events, finish, git, git_init, heavy_words, nothing_back,
     powershell_folder, record_path, release, run_words, shown, wait_for_journal_line, wait_until, write_counts, write_remote_json,
 };
 
@@ -1393,6 +1393,27 @@ fn a_named_project_or_solution_alone_is_checked_for_its_assets_file() {
     assert!(named.stderr.contains(line), "{named:?}");
     assert_eq!(command_lines(&named.stdout), ["test app/App.csproj"], "{named:?}");
     assert!(whole.stderr.contains(line), "{whole:?}");
+}
+
+/// A gate whose folder is spelled through a junction to the worktree, as it is through a `subst` drive, while git names
+/// the worktree by its real path, still counts a named solution's projects inside the worktree.
+#[test]
+fn a_solution_named_from_another_spelling_of_the_worktree_is_checked_for_its_assets_file() {
+    let case = Case::new("routing-no-build-spelled");
+    git_init(&case);
+    dotnet_cmd(&case);
+    tracked_project(&case, "app/App.csproj", false);
+    let app_sln = "Project(\"{FAE04EC0}\") = \"App\", \"app\\App.csproj\", \"{2}\"\r\nEndProject\r\n";
+    fs::write(case.folder().join("App.sln"), app_sln).expect("the solution can be written");
+    let link = Junction::to(&case, &case.folder());
+    let mut gate = case.gate(&run_words("spelled.log", &[], &[r".\dotnet.cmd", "test", "App.sln", "--no-build"]));
+    gate.current_dir(&link.0);
+
+    let spelled = finish(gate);
+
+    let line = r"gate: dropped --no-build: app/App.csproj has no obj\project.assets.json here; building on a heavy slot";
+    assert!(spelled.stderr.contains(line), "{spelled:?}");
+    assert_eq!(command_lines(&spelled.stdout), ["test App.sln"], "{spelled:?}");
 }
 
 #[test]
