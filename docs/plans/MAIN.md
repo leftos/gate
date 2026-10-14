@@ -10,8 +10,7 @@
 
 - [ ] GATE-10 Port the remote client and box wrapper, then the remote cutover
   - [ ] GATE-109 Remote: carry every verb of a routed run over one ssh connection (gate box serve)
-  - [!] GATE-192 Turn routing back on, on the Rust remote client
-  - [ ] GATE-219 Routed commands run elevated on the builder, so a pipe-owner test fails there
+  - [ ] GATE-192 Turn routing back on, on the Rust remote client
   - [ ] GATE-18 Remote preflight: refuse with `parity` when the builder lacks a .NET workload the repo needs
   - [ ] GATE-19 Remote: send a repo's declared sibling worktrees with a routed run
   - [ ] GATE-22 Remote: send a routed command's ignored inputs to the builder, compressed
@@ -29,7 +28,7 @@
   - [ ] GATE-212 Toolchain 5: gate check, for this machine and for a builder
   - [ ] GATE-213 Toolchain 6: siblings declared under .gate/
   - [ ] GATE-214 Toolchain 7: roll the manifest out to the gated repos
-- [ ] GATE-224 Compress and deduplicate every routed transfer (outputs, the command's output stream, gate push)
+- [ ] GATE-227 gate push can leave a builder's gate that failed its check in place
 
 ## Cutover sweep
 
@@ -44,7 +43,6 @@
 - [ ] GATE-17 Durations part 5: backfill guests during a critical drain
 - [ ] GATE-8 `--slot auto` picks heavy or light from the command's history
 - [/] GATE-190 Run each gate's build servers inside its own job, never shared between runs
-  - [/] GATE-198 Per-run servers C: remove build-server recognition, the priority pass over outside servers, and their seams
 - [ ] GATE-199 Merge feat/per-run-servers (#226)
 
 ## Backlog
