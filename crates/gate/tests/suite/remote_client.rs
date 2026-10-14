@@ -467,11 +467,18 @@ fn client_gate_through(case: &Case, kind: &str, log: &str, steps: &Path, command
     client_gate_tuned(case, log, steps, &tuned, command)
 }
 
-/// What a case changes in the words of a client run: the transport's form, the ceiling, and more options before the
-/// command.
+/// The `--stall` of a client run: a hang guard, so a call no seam watches, such as the preflight, is never cut for a
+/// silence a busy machine gives it. The default 120 s is a bound a starved gate and its stand-in can cross before the
+/// first call has said anything.
+const CLIENT_STALL: &str = "600";
+
+/// What a case changes in the words of a client run: the transport's form, the ceiling, the stall window, and more
+/// options before the command.
 struct Tuned<'a> {
     kind: &'a str,
     timeout: &'a str,
+    /// The run's `--stall`, [`CLIENT_STALL`] unless the case is about the window itself.
+    stall: &'a str,
     extra: &'a [&'a str],
     /// The stand-in `--test-remote-ssh` names, [`FAKE_SSH`] when none.
     ssh: Option<&'a str>,
@@ -482,6 +489,7 @@ impl Default for Tuned<'_> {
         Tuned {
             kind: "local",
             timeout: "3600",
+            stall: CLIENT_STALL,
             extra: &[],
             ssh: None,
         }
@@ -501,6 +509,8 @@ fn client_gate_tuned(case: &Case, log: &str, steps: &Path, tuned: &Tuned<'_>, co
         "1",
         "--test-git-limit-ms",
         "3600000",
+        "--stall",
+        tuned.stall,
     ];
     seams.extend(tuned.extra);
     let mut words = heavy_words(log, &seams, command);
@@ -2638,8 +2648,11 @@ fn a_preflight_line_longer_than_64_kib_falls_back_unreachable_and_runs_here() {
 fn a_stall_window_under_15_s_is_raised_to_15() {
     let case = client_case("client-stall-floor");
     let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+    // The raised window is the run call's; the preflight gets a hang guard of its own, so only the call under the floor
+    // can be cut.
     let tuned = Tuned {
-        extra: &["--stall", "3"],
+        stall: "3",
+        extra: &["--test-remote-watch-call", "preflight", "--test-stall-ms", "600000"],
         ..Tuned::default()
     };
 
