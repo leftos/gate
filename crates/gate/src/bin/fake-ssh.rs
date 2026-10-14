@@ -3,7 +3,8 @@
 //! the `local-ssh:` transport, with the line `git-upload-pack '<path>'` or `git-receive-pack '<path>'`, whose verb is
 //! the service's name. `gate push` starts it with a line that starts with `pwsh ` and holds `-EncodedCommand <script>`,
 //! a push call, whose verb is `push`. It reads the steps file the variable `GATE_FAKE_SSH_STEPS` names, one step a line,
-//! appends the verb it was called with to `<steps file>.log`, and acts on the step of its call, counted by that log: the
+//! appends the verb it was called with to `<steps file>.log`, and the verb and ssh's options, the words before the
+//! host with a last `--` left out, as one line to `<steps file>.words`, and acts on the step of its call, counted by that log: the
 //! first call takes the first step. A line that holds none of these, as git's `-G` probe of which ssh it runs, fails
 //! with no step taken. Started with `--version` alone, as a push case starts a copy of it standing in for a builder's
 //! old gate, it says `gate 0.0.0-old` and exits 0.
@@ -11,7 +12,8 @@
 //! `ok` runs `<gate> box <verb> <payload>` with the gate the variable `GATE_FAKE_SSH_GATE` names, or `git
 //! upload-pack <path>` or `git receive-pack <path>`, or a push call's words with this PC's `pwsh`, its `LOCALAPPDATA`
 //! the folder named as the host, the word before the line, in the folder the variable `GATE_FAKE_SSH_BUILDERS` names,
-//! made when missing; its standard streams are this process's, and it exits with its status;
+//! made when missing, fed this process's standard input, which it reads whole first and keeps as `<steps file>.input`;
+//! its standard streams are otherwise this process's, and it exits with its status;
 //! `hold <path>` waits until the path exists, then does as `ok`; `version <v>` does as `ok` with the gate's standard
 //! output read, its `gate: remote version` line said as `gate: remote version <v>`; `boot <time>` does the same with
 //! its `gate: remote boot` line, said as `gate: remote boot <time>`, and `no-boot` with that line dropped;
@@ -86,9 +88,14 @@ fn run() -> Result<i32, String> {
         [line] => ("", line.as_str()),
         [.., host, line] => (host.as_str(), line.as_str()),
     };
-    let call = BoxCall::of(line, host)?;
     let steps = PathBuf::from(variable("GATE_FAKE_SSH_STEPS")?);
-    let step = next_step(&steps, call.verb)?;
+    let call = BoxCall::of(line, host, &steps)?;
+    let before_host = words.get(..words.len().saturating_sub(2)).unwrap_or_default();
+    let options = match before_host.split_last() {
+        Some((last, options)) if last == "--" => options,
+        _ => before_host,
+    };
+    let step = next_step(&steps, call.verb, options)?;
     match step.split_once(' ') {
         None => bare_step(&step, &call),
         Some(("hold", path)) => {
@@ -235,24 +242,58 @@ fn variable(name: &str) -> Result<String, String> {
     std::env::var(name).map_err(|error| format!("{name}: {error}"))
 }
 
-/// The step of this call: the one after as many steps as the log holds calls, the call's `verb` appended to the log.
-fn next_step(steps: &Path, verb: &str) -> Result<String, String> {
+/// The step of this call: the one after as many steps as the log holds calls, the call's `verb` appended to the log,
+/// and the verb and the call's ssh `options` appended as one line to `<steps file>.words`.
+fn next_step(steps: &Path, verb: &str, options: &[String]) -> Result<String, String> {
     let text = fs::read_to_string(steps).map_err(|error| format!("cannot read {}: {error}", steps.display()))?;
-    let mut log = steps.as_os_str().to_owned();
-    log.push(".log");
-    let log = PathBuf::from(log);
+    let log = beside(steps, ".log");
     let made = fs::read_to_string(&log).map_or(0, |calls| calls.lines().count());
-    OpenOptions::new()
-        .append(true)
-        .create(true)
-        .open(&log)
-        .and_then(|mut file| writeln!(file, "{verb}"))
-        .map_err(|error| format!("cannot write {}: {error}", log.display()))?;
+    appended(&log, verb)?;
+    let said = std::iter::once(verb)
+        .chain(options.iter().map(String::as_str))
+        .collect::<Vec<_>>()
+        .join(" ");
+    appended(&beside(steps, ".words"), &said)?;
     text.lines()
         .filter(|line| !line.trim().is_empty())
         .nth(made)
         .map(|step| step.trim().to_owned())
         .ok_or_else(|| format!("no step left for call {} ({verb})", made + 1))
+}
+
+/// The path of `steps` with `suffix` after its name.
+fn beside(steps: &Path, suffix: &str) -> PathBuf {
+    let mut path = steps.as_os_str().to_owned();
+    path.push(suffix);
+    PathBuf::from(path)
+}
+
+/// Appends `line` and a line end to the file at `path`, made when missing.
+fn appended(path: &Path, line: &str) -> Result<(), String> {
+    OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(path)
+        .and_then(|mut file| writeln!(file, "{line}"))
+        .map_err(|error| format!("cannot write {}: {error}", path.display()))
+}
+
+/// Runs the push call `command` fed this process's standard input, read whole first and kept beside the steps file
+/// `steps` as `<steps file>.input`, so a case can tell what the push sent; its status.
+fn fed_push(mut command: Command, steps: &Path) -> Result<i32, String> {
+    let mut input = Vec::new();
+    io::stdin()
+        .lock()
+        .read_to_end(&mut input)
+        .map_err(|error| format!("cannot read the push's input: {error}"))?;
+    let kept = beside(steps, ".input");
+    fs::write(&kept, &input).map_err(|error| format!("cannot write {}: {error}", kept.display()))?;
+    let mut child = command.stdin(Stdio::piped()).spawn().map_err(|error| cannot_run(&command, &error))?;
+    let mut stdin = child.stdin.take().ok_or("the push call has no input pipe")?;
+    stdin.write_all(&input).map_err(|error| format!("cannot feed the push call: {error}"))?;
+    drop(stdin);
+    let status = child.wait().map_err(|error| format!("cannot wait for the push call: {error}"))?;
+    status.code().ok_or_else(|| "the push call ended with no status".to_owned())
 }
 
 fn hold(path: &Path) -> Result<(), String> {
@@ -267,22 +308,24 @@ fn hold(path: &Path) -> Result<(), String> {
 }
 
 /// The call the line carries: `gate box`'s verb and payload, a git service's name and the repository's path, or
-/// [`PUSH`] and the push call's whole line; and the host it was made to.
+/// [`PUSH`] and the push call's whole line; the host it was made to, and the steps file it acts on.
 struct BoxCall<'a> {
     verb: &'a str,
     payload: &'a str,
     host: &'a str,
+    steps: &'a Path,
 }
 
 impl<'a> BoxCall<'a> {
-    /// The call `line`, made to `host`, carries: a git service and its path, unquoted, a push call, or the last three
-    /// words, `box <verb> <payload>`.
-    fn of(line: &'a str, host: &'a str) -> Result<BoxCall<'a>, String> {
+    /// The call `line`, made to `host` and acting on the steps file `steps`, carries: a git service and its path,
+    /// unquoted, a push call, or the last three words, `box <verb> <payload>`.
+    fn of(line: &'a str, host: &'a str, steps: &'a Path) -> Result<BoxCall<'a>, String> {
         if let Some((verb, path)) = line.split_once(' ').filter(|(verb, _)| GIT_SERVICES.contains(verb)) {
             return Ok(BoxCall {
                 verb,
                 payload: path.trim_matches('\''),
                 host,
+                steps,
             });
         }
         let words: Vec<&'a str> = line.split(' ').collect();
@@ -292,10 +335,11 @@ impl<'a> BoxCall<'a> {
                 verb: PUSH,
                 payload: line,
                 host,
+                steps,
             });
         }
         match words[..] {
-            [.., "box", verb, payload] => Ok(BoxCall { verb, payload, host }),
+            [.., "box", verb, payload] => Ok(BoxCall { verb, payload, host, steps }),
             _ => Err(format!("the line holds no box call: {line}")),
         }
     }
@@ -327,9 +371,13 @@ impl<'a> BoxCall<'a> {
         Ok(command)
     }
 
-    /// Runs the call with this process's streams; its status.
+    /// Runs the call with this process's streams; its status. A push call is fed its standard input as [`fed_push`]
+    /// feeds it.
     fn ok(&self) -> Result<i32, String> {
         let mut command = self.command()?;
+        if self.verb == PUSH {
+            return fed_push(command, self.steps);
+        }
         let status = command.status().map_err(|error| cannot_run(&command, &error))?;
         status.code().ok_or_else(|| "the gate ended with no status".to_owned())
     }

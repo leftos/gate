@@ -13,6 +13,7 @@ test-seams = ["gate-args/test-seams"]
 
 [dependencies]
 base64 = "0.23.1"
+flate2 = "1.1.10"
 gate-args = { path = "../gate-args" }
 gate-router = { path = "../gate-router" }
 gate-state = { path = "../gate-state" }
@@ -29,7 +30,6 @@ windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem", "Win
 zstd = "0.14.2"
 
 [dev-dependencies]
-flate2 = "1.1.10"
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_JobObjects", "Win32_System_Threading"] }
 
 [[bin]]

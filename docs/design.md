@@ -143,13 +143,13 @@ With nothing to push or nowhere to push it, `gate push` tries no builder, prints
 
 `push: <host>: could not delete <path>: <message>` on stderr names an aside or stale temporary copy the builder could not delete; it never fails the push.
 
-A failure reason is one of: `timed out after <n> s`, `no answer`, ssh's last stderr line, `cannot feed the call: <error>`, the builder script's own (`the copy arrived damaged`; `the installed copy does not match` with `; the previous gate.exe is back in place` or `; the previous gate.exe is at <aside>`; `<dir> is a link`; the failing step's message). Builder text is escaped as the remote client escapes it and cut to 4096 bytes.
+A failure reason is one of: `timed out after <n> s`, `no answer`, ssh's last stderr line, `cannot feed the call: <error>`, the builder script's own (`the copy could not be read: <exception message>`, for bytes that do not decompress; `the copy arrived damaged`; `the installed copy does not match` with `; the previous gate.exe is back in place` or `; the previous gate.exe is at <aside>`; `<dir> is a link`; the failing step's message). Builder text is escaped as the remote client escapes it and cut to 4096 bytes.
 
 Each builder is one ssh call, run in a kill-on-close job with stdin piped and bounded at 300 s.
 
-A timeout stops only the local ssh, so the builder's install may still finish. The call is `pwsh -NoProfile -NonInteractive -OutputFormat Text -EncodedCommand <script>` through the transport's ssh words ([Routing](#routing)), and the exe goes on stdin as base64 text.
+A timeout stops only the local ssh, so the builder's install may still finish. The call is `pwsh -NoProfile -NonInteractive -OutputFormat Text -EncodedCommand <script>` through the transport's ssh words ([Routing](#routing)), and the exe goes on stdin as base64 text of its gzip (flate2's best level). The push call is not asked for ssh compression: the bytes are already compressed. The encoded script line must stay within the 8127 characters cmd takes ([Routing](#routing)), which a unit test checks.
 
-The builder needs pwsh 7.1 or later. The script carries this PC's SHA-256 of the exe and refuses bytes that differ, reports on `gate-push: ` lines that this side maps to the `push:` lines, and exits 1 after a failure. Concurrent pushes to one builder are not locked.
+The builder needs pwsh 7.1 or later. The script decompresses the copy with .NET `GZipStream`, carries this PC's SHA-256 of the exe and refuses decompressed bytes that differ, reports on `gate-push: ` lines that this side maps to the `push:` lines, and exits 1 after a failure. Concurrent pushes to one builder are not locked.
 
 On the builder the script installs as `tools/install.ps1` does ([Install](#install)), in its own `%LOCALAPPDATA%\gate\bin`, which it creates when missing and refuses when it is a link: it deletes the aside copies (`gate.exe.*.old`) and the stale `gate.exe.<pid>.tmp` copies no process holds.
 
@@ -1174,7 +1174,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
     The builder keeps one bare repo per repo name, `<builder root>/<repo>.git`, shared by every key of that repo; the key is only the ref's name.
 
     The size is read from git's last `Writing objects: 100%` line, ignoring `remote:` lines, and only a number with a unit (or `bytes`) counts as one, else the line says `up to date`. Failure says `gate: pushing the snapshot to <url> failed (status <n>)` and falls back `unreachable`.
-  - **Run call.** The line goes over `ssh -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=4 -o ForwardAgent=no -o ClearAllForwardings=yes -- <host> <line>`, each argument separate.
+  - **Run call.** The line goes over `ssh -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=4 -o ForwardAgent=no -o ClearAllForwardings=yes -o Compression=yes -- <host> <line>`, each argument separate. The last option is the run call's alone: the preflight, stop, boot and outputs calls, git's ssh command and `gate push` ask for none. The run call's compression covers both directions of its connection: the command's output and protocol lines one way, the run line and the outputs manifest the other.
 
     The box's output passes through to the log and the console, except the box's heartbeats and its two machine lines, which the client hides from both and keeps out of the lines it holds: the start marker `gate-remote-started: <nonce>` and the refusal tag `gate-remote-refused: <nonce> busy|tools`, each naming this run's `Nonce` and read on stderr only, as a whole line.
 
@@ -1918,6 +1918,8 @@ A Rust integration suite drives the built `gate.exe` through its CLI and reads o
   They also include `flood <n>`, `say-hold <word> <path>` `progress-ok <n>`, `truncate <n>` (passes `<n>` stdout bytes, writes `Connection timed out during banner exchange` on stderr and exits 255), `garbage <n>` and `bytes-hold <n> <path>`.
 
   A line that starts `pwsh ` and holds `-EncodedCommand` is a `gate push` call (`push` in its call log): `ok` runs it with the local `pwsh`, `LOCALAPPDATA` set to `<GATE_FAKE_SSH_BUILDERS>\<host>`, so each builder is a folder the case owns. Started with `--version` alone, `fake-ssh` answers `gate 0.0.0-old`, the stand-in for an older gate on a builder.
+
+  Beside the `.log` it writes `<steps file>.words`, one line a call (the verb, then the words before the host, ssh's options), and `<steps file>.input`, the stdin of the last push call.
 
   It spawns children, burns CPU, prints its argv, writes output or sleeps on command, so build-server, orphan and kill-tree cases need no real toolchain.
 - **No fixture from the checkout path.** No routing pattern, expected path or assertion is derived from where the repo is checked out; a case builds its own repository and routing file in its root. `checkout::repo_file` is the one route to a checked-in file (the install script), never for a path or pattern a case asserts on.

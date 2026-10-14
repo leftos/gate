@@ -866,6 +866,13 @@ pub fn shown(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
+/// The path of `path` with `suffix` after its name, as fake-ssh names the files it keeps beside its steps file.
+pub fn beside(path: &Path, suffix: &str) -> PathBuf {
+    let mut beside = path.as_os_str().to_owned();
+    beside.push(suffix);
+    PathBuf::from(beside)
+}
+
 /// The words of a light run logging to `log`, `extra` before `--` and `command` after it. Gates that run at once each
 /// need a log of their own, since a gate refuses a log another gate is writing. The ceiling is far above the hang
 /// guard, so a run a case holds is never ended by it. The server scan is confined to the case's folder, the gate's

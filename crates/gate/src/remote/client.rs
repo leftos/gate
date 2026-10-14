@@ -47,7 +47,7 @@ use super::syncback;
 #[cfg(feature = "test-seams")]
 use super::transport::Local;
 use super::transport::ssh::Ssh;
-use super::transport::{Program, Transport};
+use super::transport::{Program, Transport, Wire};
 use super::watchdog::{self, Cut, Kept, Kill, LINE_CAP};
 use super::{FAILED, FAILED_RUN, REFUSED, Refusal, RemoteCall, RemoteClient, RemoteOutcome, Split, refused_line, started_line};
 use crate::boxside::outputs::{NAMES_SKIPPED, OUTPUTS_BUDGET};
@@ -832,6 +832,7 @@ impl Attempt<'_, '_> {
                 input: input.cloned(),
                 nonce: Some(Arc::clone(&nonce)),
                 sink: None,
+                wire: Wire::Compressed,
             };
             let called = attempt.ssh(line, Echo::Console, Watch::Run(limits), raise, run)?;
             heard.clone_from(&called.outputs_line);
@@ -1045,7 +1046,7 @@ impl Attempt<'_, '_> {
     /// after its first output byte when `raise`; what only this call gives it, `only`.
     fn ssh(&mut self, line: &str, echo: Echo, watch: Watch, raise: bool, only: CallOnly) -> Result<Called, End> {
         let system = gate_win32::system_directory().map_err(|error| End::Failed(format!("cannot read the system folder: {error}")))?;
-        let command = call_command(self.transport.call(self.call.host, line), &system);
+        let command = call_command(self.transport.call(self.call.host, line, only.wire), &system);
         let starts = Starts {
             breakaway: self.transport.box_runs_here(),
             raise,
@@ -1583,13 +1584,15 @@ struct Starts {
     sink: Option<RawSink>,
 }
 
-/// What one call of `gate box` alone gives it: the run call what is fed on its standard input and the run's nonce, the
-/// outputs call the sink its standard output is copied to raw; none of them for any other call.
+/// What one call of `gate box` alone gives it: the run call what is fed on its standard input, the run's nonce and a
+/// compressed connection, the outputs call the sink its standard output is copied to raw; none of them, and a plain
+/// connection, for any other call.
 #[derive(Default)]
 struct CallOnly {
     input: Option<Arc<str>>,
     nonce: Option<Arc<str>>,
     sink: Option<RawSink>,
+    wire: Wire,
 }
 
 /// Where a call's standard output is copied raw, byte for byte, rather than read as lines: the outputs call's archive

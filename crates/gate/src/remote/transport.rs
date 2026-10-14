@@ -29,6 +29,18 @@ pub(crate) const SSH_OPTIONS: [&str; 12] = [
     "ClearAllForwardings=yes",
 ];
 
+/// The options a call adds after [`SSH_OPTIONS`] for a connection ssh compresses.
+const COMPRESSION: [&str; 2] = ["-o", "Compression=yes"];
+
+/// How a call's ssh connection carries its streams: compressed, as the run call's, which carries the command's output,
+/// or plain, as every other call's and git's.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum Wire {
+    Compressed,
+    #[default]
+    Plain,
+}
+
 /// A program and the words it is started with.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Program {
@@ -49,8 +61,8 @@ pub(crate) struct PushTarget {
 pub(crate) trait Transport {
     /// The builder's root, which every work folder and bare repository lives under.
     fn root(&self) -> &str;
-    /// The program that runs `line` on the builder `host`.
-    fn call(&self, host: &str, line: &str) -> Program;
+    /// The program that runs `line` on the builder `host`, over a connection `wire` says how to carry.
+    fn call(&self, host: &str, line: &str, wire: Wire) -> Program;
     /// Where the snapshot of `repo` is pushed on the builder `host`; else why the repo's name cannot be sent there.
     fn push_target(&self, host: &str, repo: &str) -> Result<PushTarget, String>;
     /// The command git runs on the builder to serve the sync-back's fetch, the upload-pack counterpart of the push's
@@ -77,9 +89,20 @@ fn sent_repo(repo: &str) -> Result<&str, String> {
     }
 }
 
-/// ssh's words for running `line` on `host`: the options, `--`, the host and the line, each a word of its own.
-pub(crate) fn ssh_words(host: &str, line: &str) -> Vec<OsString> {
-    SSH_OPTIONS.iter().copied().chain(["--", host, line]).map(OsString::from).collect()
+/// ssh's words for running `line` on `host` over a connection `wire` says how to carry: the options, the compression
+/// option for a compressed one, `--`, the host and the line, each a word of its own.
+pub(crate) fn ssh_words(host: &str, line: &str, wire: Wire) -> Vec<OsString> {
+    let compression: &[&str] = match wire {
+        Wire::Compressed => &COMPRESSION,
+        Wire::Plain => &[],
+    };
+    SSH_OPTIONS
+        .iter()
+        .chain(compression)
+        .copied()
+        .chain(["--", host, line])
+        .map(OsString::from)
+        .collect()
 }
 
 /// The local transport of `--test-remote-transport local:<folder>`: the builder's root `<folder>`, every call this
@@ -131,11 +154,12 @@ impl Transport for Local {
         &self.root
     }
 
-    fn call(&self, host: &str, line: &str) -> Program {
+    /// The stand-in is given ssh's words, `wire`'s among them; this gate's own `box` runs with no connection to carry.
+    fn call(&self, host: &str, line: &str, wire: Wire) -> Program {
         match &self.stub {
             Some(stub) => Program {
                 program: stub.clone(),
-                args: ssh_words(host, line),
+                args: ssh_words(host, line, wire),
             },
             None => Program {
                 program: self.gate.clone(),
@@ -186,7 +210,7 @@ fn box_words(line: &str) -> Vec<OsString> {
 pub(crate) mod ssh {
     use std::path::{Path, PathBuf};
 
-    use super::{Program, PushTarget, SSH_OPTIONS, Transport, sent_repo, ssh_words};
+    use super::{Program, PushTarget, SSH_OPTIONS, Transport, Wire, sent_repo, ssh_words};
     use crate::environment::Variables;
     use crate::remote::git::judged;
     use crate::run::find_program;
@@ -222,10 +246,10 @@ pub(crate) mod ssh {
             BUILDER_ROOT
         }
 
-        fn call(&self, host: &str, line: &str) -> Program {
+        fn call(&self, host: &str, line: &str, wire: Wire) -> Program {
             Program {
                 program: self.program.clone(),
-                args: ssh_words(host, line),
+                args: ssh_words(host, line, wire),
             }
         }
 
@@ -271,7 +295,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::ssh::{Ssh, git_ssh_command};
-    use super::{Local, Program, PushTarget, Transport, box_words, ssh_words};
+    use super::{Local, Program, PushTarget, Transport, Wire, box_words, ssh_words};
     use crate::environment::Variables;
 
     fn words(texts: &[&str]) -> Vec<OsString> {
@@ -281,7 +305,7 @@ mod tests {
     #[test]
     fn ssh_s_words_are_the_options_then_dash_dash_then_the_host_then_the_line() {
         assert_eq!(
-            ssh_words("builder", r#""%LOCALAPPDATA%\gate\bin\gate.exe" box run e30="#),
+            ssh_words("builder", r#""%LOCALAPPDATA%\gate\bin\gate.exe" box run e30="#, Wire::Plain),
             words(&[
                 "-o",
                 "BatchMode=yes",
@@ -303,6 +327,45 @@ mod tests {
     }
 
     #[test]
+    fn the_run_call_s_ssh_words_ask_for_compression_and_others_do_not() {
+        let line = r#""%LOCALAPPDATA%\gate\bin\gate.exe" box run e30="#;
+        let compressed = ssh_words("builder", line, Wire::Compressed);
+        let plain = ssh_words("builder", line, Wire::Plain);
+        assert_eq!(compressed.get(..12), plain.get(..12), "every call's own options come first");
+        assert_eq!(
+            compressed.get(12..),
+            Some(words(&["-o", "Compression=yes", "--", "builder", line]).as_slice())
+        );
+        assert_eq!(
+            plain.get(12..),
+            Some(words(&["--", "builder", line]).as_slice()),
+            "a plain call asks for nothing more"
+        );
+        assert!(!plain.iter().any(|word| word.to_string_lossy().contains("Compression")), "{plain:?}");
+
+        let ssh = Ssh {
+            program: PathBuf::from(r"C:\Program Files\OpenSSH\ssh.exe"),
+        };
+        assert_eq!(ssh.call("builder", line, Wire::Compressed).args, compressed);
+        assert_eq!(ssh.call("builder", line, Wire::Plain).args, plain);
+        let git = git_ssh_command(&ssh.program);
+        assert!(!git.contains("Compression"), "git's ssh is never compressed: {git}");
+
+        let stubbed = Local::new(r"local:C:\builder", Some(PathBuf::from("fake-ssh.exe").as_path())).expect("a local transport");
+        assert_eq!(
+            stubbed.call("builder", line, Wire::Compressed).args,
+            compressed,
+            "the stand-in is given ssh's words"
+        );
+        let local = Local::new(r"local:C:\builder", None).expect("a local transport");
+        assert_eq!(
+            local.call("builder", line, Wire::Compressed).args,
+            words(&["box", "run", "e30="]),
+            "the local box is run with no ssh between"
+        );
+    }
+
+    #[test]
     fn the_ssh_transport_calls_ssh_and_pushes_through_pwsh_s_receive_pack() {
         let ssh = Ssh {
             program: PathBuf::from(r"C:\Program Files\Open'SSH\ssh.exe"),
@@ -315,10 +378,10 @@ mod tests {
             "the local box runs here, and starts its command outside the call's job"
         );
         assert_eq!(
-            ssh.call("builder", "line"),
+            ssh.call("builder", "line", Wire::Plain),
             Program {
                 program: PathBuf::from(r"C:\Program Files\Open'SSH\ssh.exe"),
-                args: ssh_words("builder", "line"),
+                args: ssh_words("builder", "line", Wire::Plain),
             }
         );
         assert_eq!(
@@ -349,15 +412,15 @@ mod tests {
         assert_eq!(box_words(line), words(&["box", "preflight", "e30="]));
         let local = Local::new(r"local:C:\builder", None).expect("a local transport");
         assert_eq!(local.root(), r"C:\builder");
-        assert_eq!(local.call("builder", line).args, words(&["box", "preflight", "e30="]));
+        assert_eq!(local.call("builder", line, Wire::Plain).args, words(&["box", "preflight", "e30="]));
         assert_eq!(local.push_target("builder", "app").expect("a push target").url, r"C:\builder\app.git");
         assert_eq!(local.upload_pack(), None, "a bare repository here names no pack command");
         let stubbed = Local::new(r"local:C:\builder", Some(PathBuf::from("fake-ssh.exe").as_path())).expect("a local transport");
         assert_eq!(
-            stubbed.call("builder", line),
+            stubbed.call("builder", line, Wire::Plain),
             Program {
                 program: PathBuf::from("fake-ssh.exe"),
-                args: ssh_words("builder", line),
+                args: ssh_words("builder", line, Wire::Plain),
             }
         );
         assert_eq!(

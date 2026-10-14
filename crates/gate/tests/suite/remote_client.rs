@@ -23,7 +23,7 @@ use sha2::{Digest, Sha256};
 
 use crate::durations::seed;
 use crate::support::{
-    Case, FAKE_TOOL, GATE, GIT_REDIRECTS, Go, Outcome, Running, allow_breakaway, build_version, copy_tool, events, finish, git, git_init,
+    Case, FAKE_TOOL, GATE, GIT_REDIRECTS, Go, Outcome, Running, allow_breakaway, beside, build_version, copy_tool, events, finish, git, git_init,
     heavy_words, nothing_back, release, shown, start, wait_for_journal_line, wait_until, wait_until_closed, write_remote_json,
 };
 
@@ -445,9 +445,13 @@ fn ssh_steps(case: &Case, name: &str, steps: &[&str]) -> PathBuf {
 
 /// The verbs the stand-in of the steps file `steps` was called with, in order; none before its first call.
 fn calls(steps: &Path) -> Vec<String> {
-    let mut log = steps.as_os_str().to_owned();
-    log.push(".log");
-    fs::read_to_string(PathBuf::from(log)).map_or_else(|_| Vec::new(), |text| text.lines().map(str::to_owned).collect())
+    fs::read_to_string(beside(steps, ".log")).map_or_else(|_| Vec::new(), |text| text.lines().map(str::to_owned).collect())
+}
+
+/// Each call the stand-in of the steps file `steps` was given, in order: its verb, then the words before the host,
+/// one line a call; none before its first call.
+fn call_words(steps: &Path) -> Vec<String> {
+    fs::read_to_string(beside(steps, ".words")).map_or_else(|_| Vec::new(), |text| text.lines().map(str::to_owned).collect())
 }
 
 /// The gate of a routed run logging to `log` through the Rust client: the builder root `builder` in the case folder,
@@ -2997,6 +3001,29 @@ fn a_transport_s_form_is_refused_before_the_stand_in_is_looked_for() {
     assert_eq!(outcome.code, Some(1), "{outcome:?}");
     assert!(outcome.stderr.contains(&line), "{outcome:?}");
     assert_eq!(calls(&steps), Vec::<String>::new(), "no ssh call is made");
+}
+
+/// The run call alone asks ssh to compress its connection, which carries the command's output; the preflight and the
+/// outputs call, whose archive is compressed already, carry the options every call carries and no more.
+#[test]
+fn only_the_run_call_asks_ssh_for_compression() {
+    let case = outputs_case("client-run-compressed", &BIN);
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok", "ok"]);
+    let command = [r".\tool.exe", "write", r"bin\made.txt", "box"];
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &command));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "run", "outputs"]);
+    let words = call_words(&steps);
+    let verbs: Vec<&str> = words.iter().filter_map(|line| line.split(' ').next()).collect();
+    assert_eq!(verbs, ["preflight", "run", "outputs"], "{words:?}");
+    let compressed: Vec<bool> = words.iter().map(|line| line.split(' ').any(|word| word == "Compression=yes")).collect();
+    assert_eq!(compressed, [false, true, false], "{words:?}");
+    assert!(
+        words.iter().all(|line| line.contains("BatchMode=yes")),
+        "every call carries ssh's options: {words:?}"
+    );
 }
 
 /// The PC holds `bin/same.txt` as the command writes it on the builder and `bin/differs.txt` otherwise: only the second

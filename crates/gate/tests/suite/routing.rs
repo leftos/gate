@@ -15,8 +15,8 @@ use serde_json::{Value, json};
 use crate::nesting::{LOOK_OFTEN, end_parent, first_event, marked, orphaned_as, spawned, test_marker};
 
 use crate::support::{
-    Case, FAKE_TOOL, GATE, Outcome, Running, assert_in_order, copy_tool, events, finish, git, git_init, heavy_words, nothing_back, powershell_folder,
-    record_path, release, run_words, shown, wait_for_journal_line, wait_until, write_counts, write_remote_json,
+    Case, FAKE_TOOL, GATE, Outcome, Running, assert_in_order, beside, copy_tool, events, finish, git, git_init, heavy_words, nothing_back,
+    powershell_folder, record_path, release, run_words, shown, wait_for_journal_line, wait_until, write_counts, write_remote_json,
 };
 
 pub(crate) const HOST: &str = "builder";
@@ -243,9 +243,7 @@ fn ssh_gate(case: &Case, path: &OsStr, steps: &Path) -> Command {
 
 /// The verbs the stand-in reading `steps` was called with, in order; none before its first call.
 fn ssh_calls(steps: &Path) -> Vec<String> {
-    let mut log = steps.as_os_str().to_owned();
-    log.push(".log");
-    fs::read_to_string(PathBuf::from(log)).map_or_else(|_| Vec::new(), |text| text.lines().map(str::to_owned).collect())
+    fs::read_to_string(beside(steps, ".log")).map_or_else(|_| Vec::new(), |text| text.lines().map(str::to_owned).collect())
 }
 
 /// Runs a routed run of an [`ssh_case`] named `name` through the stand-in ssh, its state root first holding `left`

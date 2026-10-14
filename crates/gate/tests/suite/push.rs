@@ -4,16 +4,20 @@
 //! version, [`OLD_VERSION`].
 
 use std::fs::{self, File};
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::LazyLock;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
+use flate2::read::GzDecoder;
 use serde_json::{Value, json};
 
 use crate::install::unix;
-use crate::support::{Case, FAKE_TOOL, GATE, Outcome, finish, shown, start, version_of, write_remote_json};
+use crate::support::{Case, FAKE_TOOL, GATE, Outcome, beside, finish, shown, start, version_of, write_remote_json};
 
 /// The suite's stand-in for ssh, which `--test-push-ssh` names.
 const FAKE_SSH: &str = env!("CARGO_BIN_EXE_fake-ssh");
@@ -104,9 +108,12 @@ fn steps(case: &Case, steps: &[&str]) -> PathBuf {
 
 /// The verbs the stand-in of the steps file `steps` was called with, in order; none before its first call.
 fn calls(steps: &Path) -> Vec<String> {
-    let mut log = steps.as_os_str().to_owned();
-    log.push(".log");
-    fs::read_to_string(PathBuf::from(log)).map_or_else(|_| Vec::new(), |text| text.lines().map(str::to_owned).collect())
+    fs::read_to_string(beside(steps, ".log")).map_or_else(|_| Vec::new(), |text| text.lines().map(str::to_owned).collect())
+}
+
+/// What the stand-in of the steps file `steps` was fed on its standard input by its last push call that ran the script.
+fn pushed_input(steps: &Path) -> Vec<u8> {
+    fs::read(beside(steps, ".input")).expect("the stand-in kept the push's input")
 }
 
 /// `gate push` for `case`, each builder's call made through `ssh` acting on the steps file `steps`, `extra` after.
@@ -216,6 +223,31 @@ fn a_push_installs_on_a_builder_with_no_gate() {
         "nothing else is left in the builder's install folder"
     );
     assert_eq!(calls(&steps), ["push"]);
+}
+
+/// The exe crosses ssh compressed: what the builder's call is fed is smaller than the uncompressed exe's base64, and
+/// the script decompresses it to the exe whole before its check and install.
+#[test]
+fn a_push_sends_the_exe_compressed_and_installs_it_whole() {
+    let case = push_case("a_push_sends_the_exe_compressed_and_installs_it_whole");
+    let steps = steps(&case, &["ok"]);
+
+    let outcome = push(&case, &steps);
+
+    assert_installed(&case, &outcome);
+    let exe = fs::read(installed_gate(&case)).expect("the installed gate can be read");
+    let sent = pushed_input(&steps);
+    let uncompressed = exe.len().div_ceil(3) * 4;
+    assert!(
+        sent.len() < uncompressed,
+        "the push fed {} bytes, no fewer than the {uncompressed} of the exe's base64",
+        sent.len()
+    );
+    let text = String::from_utf8(sent).expect("the push fed text");
+    let gzip = STANDARD.decode(text.trim_end()).expect("the push fed base64");
+    let mut unpacked = Vec::new();
+    GzDecoder::new(gzip.as_slice()).read_to_end(&mut unpacked).expect("the push fed gzip");
+    assert!(unpacked == exe, "what the push fed decompresses to the installed exe");
 }
 
 #[test]
