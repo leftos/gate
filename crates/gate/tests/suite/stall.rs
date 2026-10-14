@@ -4,6 +4,7 @@
 use std::fs;
 use std::os::windows::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::Duration;
 
 use gate_win32::{EnvironmentBlock, Job, Launch, LaunchOutput, StoppableProcess};
@@ -11,7 +12,7 @@ use regex::Regex;
 use serde_json::Value;
 
 use crate::support::{
-    CORE_SECOND, Case, Escapee, FAKE_TOOL, UNTIL_KILLED, assert_in_order, cpu_ticks, release, run_words, said_pid, shown, wait_until,
+    CORE_SECOND, Case, Escapee, FAKE_TOOL, UNTIL_KILLED, assert_in_order, cpu_ticks, release, run_words, said_pid, shown, start, tool, wait_until,
     wait_until_closed,
 };
 
@@ -96,6 +97,36 @@ fn a_command_whose_child_outside_its_job_idles_is_still_stalled() {
 
     let outcome = case.run(&run_words("out.log", &AWAY_SEAMS, &words));
 
+    assert_eq!(outcome.code, Some(124), "{outcome:?}");
+    assert!(outcome.stderr.contains("gate: STALLED: "), "{outcome:?}");
+    assert_eq!(release(&case)["verdict"], "stalled", "{outcome:?}");
+}
+
+#[test]
+fn a_quiet_command_is_stalled_beside_a_busy_compiler_server_outside_its_job() {
+    let case = Case::new("a_quiet_command_is_stalled_beside_a_busy_compiler_server_outside_its_job");
+    let msbuild = tool(&case, "MSBuild.exe");
+    let compiler = tool(&case, "VBCSCompiler.exe");
+    let stop = case.folder().join("stop-compiler");
+    // The case starts the compiler server itself, so it runs outside the gate's job, and it burns a core for the whole
+    // run. It is no process of the run, so its CPU is no progress for the quiet build: only the stall kill ends the
+    // command, which sleeps until killed, so a watch that counted the server would hold the stall off until the hang
+    // guard and the case would fail.
+    let mut command = Command::new(&compiler);
+    case.prepare_without_state_dir(&mut command, &["burn", &shown(&stop), "sleep", UNTIL_KILLED]);
+    let server = start(command);
+    server.wait_for_stdout("burning");
+    let burned_before = cpu_ticks(server.id());
+    let seams = ["--test-stall-ms", "2000", "--test-sample-ms", "100"];
+
+    let outcome = case.run(&run_words("out.log", &seams, &[&msbuild, "out", "building", "sleep", UNTIL_KILLED]));
+    let burned_by_the_kill = cpu_ticks(server.id());
+    fs::write(&stop, "").expect("the server's stop file can be written");
+
+    assert!(
+        burned_by_the_kill > burned_before,
+        "the server burned while the gate ran ({burned_before} then {burned_by_the_kill} ticks): {outcome:?}"
+    );
     assert_eq!(outcome.code, Some(124), "{outcome:?}");
     assert!(outcome.stderr.contains("gate: STALLED: "), "{outcome:?}");
     assert_eq!(release(&case)["verdict"], "stalled", "{outcome:?}");

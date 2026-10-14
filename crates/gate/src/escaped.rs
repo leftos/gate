@@ -467,8 +467,7 @@ impl Recorded {
     /// The CPU time of each recorded process, in 100 ns ticks, by its pid and its start as `times` reads it (100 ns
     /// ticks since 1601). One whose CPU `times` cannot read now as the process recorded (it has exited since the
     /// snapshot, cannot be read, or another process has taken its pid) keeps the CPU its last read found, so a read
-    /// that fails once neither drops it nor has the next read count it anew; one no read has found yet is left out, as
-    /// the watch leaves out a build server it cannot read.
+    /// that fails once neither drops it nor has the next read count it anew; one no read has found yet is left out.
     pub(crate) fn cpu(&mut self, times: impl Fn(u32) -> io::Result<Option<ProcessTimes>>) -> BTreeMap<(u32, u64), u64> {
         let mut cpu = BTreeMap::new();
         for process in &self.escaped {
@@ -1262,7 +1261,6 @@ mod tests {
         let members = BTreeSet::from([1]);
         let scope = Scope {
             members: &members,
-            since: filetime(0),
             under: None,
         };
         let mut servers = Servers::new(None);

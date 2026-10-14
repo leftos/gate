@@ -23,10 +23,10 @@ use windows_sys::Win32::System::Threading::{
     PROCESS_SET_INFORMATION, PROCESS_SET_QUOTA, PROCESS_TERMINATE, SetPriorityClass,
 };
 
-use crate::build_servers::tool;
 use crate::nesting::{LOOK_OFTEN, end_parent, let_go, line_with, marked, orphaned_as, spawned, test_marker};
 use crate::support::{
-    Case, FAKE_TOOL, GATE, critical_words, events_of, heavy_words, run_words, said_pid, shown, start, wait_for_journal_line, wait_until, write_counts,
+    Case, FAKE_TOOL, GATE, critical_words, events_of, heavy_words, run_words, said_pid, shown, start, tool, wait_for_journal_line, wait_until,
+    write_counts,
 };
 
 /// The status Windows reports for a process Ctrl+C ended, `STATUS_CONTROL_C_EXIT`, as a signed exit code: how a case's
@@ -253,9 +253,17 @@ struct Waiter {
 impl Waiter {
     /// Starts the case folder's copy at `exe`, waiting for a file no case writes.
     fn start(case: &Case, exe: &str) -> Waiter {
+        Waiter::start_naming(case, exe, &[])
+    }
+
+    /// Starts the case folder's copy at `exe` as [`Waiter::start`] does, each of `identity` printed by its own `out`
+    /// step first, so it stands in the copy's live command line.
+    fn start_naming(case: &Case, exe: &str, identity: &[&str]) -> Waiter {
         let never = shown(&case.folder().join("never"));
+        let mut words: Vec<&str> = identity.iter().flat_map(|word| ["out", *word]).collect();
+        words.extend(["wait", never.as_str()]);
         let mut command = Command::new(exe);
-        case.prepare_without_state_dir(&mut command, &["wait", never.as_str()]);
+        case.prepare_without_state_dir(&mut command, &words);
         Waiter {
             server: command.spawn().expect("the server starts"),
         }
@@ -294,6 +302,37 @@ fn an_ordinary_gate_lowers_a_build_server_outside_its_job() {
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert_eq!(class_of(server.pid()), BELOW_NORMAL_PRIORITY_CLASS, "and nothing raises it again");
+}
+
+#[test]
+fn an_ordinary_gate_tells_a_dotnet_server_by_its_live_command_line() {
+    let case = Case::new("an_ordinary_gate_tells_a_dotnet_server_by_its_live_command_line");
+    let dotnet = tool(&case, "dotnet.exe");
+    let command = quiet(&case);
+    let command: Vec<&str> = command.iter().map(String::as_str).collect();
+    let seams = seams(None);
+    let seams: Vec<&str> = seams.iter().map(String::as_str).collect();
+    // Two copies of the same `dotnet` host, both started before the gate: the live command line of one names
+    // `VBCSCompiler.dll`, so the gate reads a compiler server out of it, and the other's names no server.
+    let plain = Waiter::start(&case, &dotnet);
+    let named = Waiter::start_naming(&case, &dotnet, &["VBCSCompiler.dll"]);
+    set_class(plain.pid(), NORMAL_PRIORITY_CLASS);
+    set_class(named.pid(), NORMAL_PRIORITY_CLASS);
+
+    let running = case.start(&run_words("out.log", &seams, &command));
+    wait_until("the dotnet server outside the job to be lowered", || {
+        class_of(named.pid()) == BELOW_NORMAL_PRIORITY_CLASS
+    });
+    // The pass that lowered the named host read the plain one in the same snapshot.
+    let plain_class = class_of(plain.pid());
+    fs::write(go_path(&case), "").expect("the go file can be written");
+    let outcome = running.finish();
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(
+        plain_class, NORMAL_PRIORITY_CLASS,
+        "a dotnet host whose command line names no server is no server, so its class is left"
+    );
 }
 
 #[test]

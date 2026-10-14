@@ -1028,6 +1028,13 @@ pub fn copy_tool(case: &Case, name: &str) {
     fs::copy(FAKE_TOOL, case.folder().join(name)).expect("fake-tool can be copied into the case folder");
 }
 
+/// Copies fake-tool into the case folder as `name` and returns its absolute path, so a command or a process the case
+/// starts itself names it inside the case's working directory.
+pub fn tool(case: &Case, name: &str) -> String {
+    copy_tool(case, name);
+    shown(&case.folder().join(name))
+}
+
 /// The go file of a case that parks a stand-in or a stub until it exists: writing it when it drops releases what waits
 /// for it even when the case panics before its own write, and writing one the case already made is harmless. A write
 /// that fails is said unless the file is there after all.

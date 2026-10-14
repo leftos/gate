@@ -1,6 +1,5 @@
-//! The classifiers that tell which of a sample's processes are build servers, which are compiler servers, which in a
-//! job is a build client, and which command is a WSL one, from their names and command lines alone: the port of the
-//! PowerShell gate's `Test-BuildServer`, `Test-CompilerServer`, `Test-BuildClient` and its WSL test. Here too is the
+//! The classifiers that tell which of a sample's processes are build servers and which command is a WSL one, from their
+//! names and command lines alone: the port of the PowerShell gate's `Test-BuildServer` and its WSL test. Here too is the
 //! rule a watch moves a build server's priority class by, the port of its `Get-ServerTarget` and `Test-ServerLeft`.
 //! Every comparison ignores case, as PowerShell's `-eq` and `-match` do.
 
@@ -16,11 +15,9 @@ pub fn is_build_server(name: &str, command_line: &str, test_image: Option<&str>)
 }
 
 /// Whether a process named `name`, whose command line is `command_line`, is a compiler server: `VBCSCompiler.exe`, or one
-/// running `VBCSCompiler.dll`. Only one of these counts when it was created before the command, and an `MSBuild` node is
-/// never one of them. A caller asks it only of a process [`is_build_server`] already accepted, as the PowerShell gate's
-/// `Test-CompilerServer` runs after its `Test-BuildServer`. `test_image` is read as [`is_build_server`] reads it.
-#[must_use]
-pub fn is_compiler_server(name: &str, command_line: &str, test_image: Option<&str>) -> bool {
+/// running `VBCSCompiler.dll`. An `MSBuild` node is never one of them. `test_image` is read as [`is_build_server`] reads
+/// it.
+fn is_compiler_server(name: &str, command_line: &str, test_image: Option<&str>) -> bool {
     is_compiler_image(name, test_image) || holds(command_line, "vbcscompiler.dll")
 }
 
@@ -29,17 +26,6 @@ pub fn is_compiler_server(name: &str, command_line: &str, test_image: Option<&st
 #[must_use]
 pub fn is_compiler_image(name: &str, test_image: Option<&str>) -> bool {
     name.eq_ignore_ascii_case("VBCSCompiler.exe") || test_image.is_some_and(|image| name.eq_ignore_ascii_case(image))
-}
-
-/// Whether a process named `name`, whose command line is `command_line`, is a build client, one that may hand its
-/// compile to a compiler server outside the job: `MSBuild.exe`, or a `dotnet.exe` whose command line lacks
-/// `--no-build`, since a `dotnet test --no-build` compiles nothing.
-#[must_use]
-pub fn is_build_client(name: &str, command_line: &str) -> bool {
-    if name.eq_ignore_ascii_case("MSBuild.exe") {
-        return true;
-    }
-    name.eq_ignore_ascii_case("dotnet.exe") && !holds(command_line, "--no-build")
 }
 
 /// A process's priority class, as the Windows calls read and set it and as no one of them names it here: what a
@@ -157,9 +143,9 @@ mod tests {
         );
     }
 
-    /// An `MSBuild` node that was already running is shared CPU, never a compiler server (B1).
+    /// An `MSBuild` node is never a compiler server (B1).
     #[test]
-    fn compiler_servers_exclude_an_old_msbuild_node() {
+    fn compiler_servers_are_told_from_an_msbuild_node() {
         let rows: [(&str, &str, bool); 5] = [
             ("VBCSCompiler.exe", "cmd.exe /d /c spin", true),
             ("dotnet.exe", r"dotnet C:\sdk\Roslyn\VBCSCompiler.dll /shared", true),
@@ -169,22 +155,6 @@ mod tests {
         ];
         for (name, command_line, want) in rows {
             assert_eq!(is_compiler_server(name, command_line, None), want, "{name}: {command_line}");
-        }
-    }
-
-    /// Test-NoBuildClient: a `dotnet test --no-build` compiles nothing, so it is no client; a line that could not be
-    /// read holds no `--no-build` either, as the PowerShell gate reads the empty string it gets then.
-    #[test]
-    fn build_clients_are_msbuild_or_dotnet_without_no_build() {
-        let rows: [(&str, &str, bool); 5] = [
-            ("MSBuild.exe", "MSBuild.exe My.sln", true),
-            ("dotnet.exe", "dotnet build", true),
-            ("dotnet.exe", "dotnet test tests/ --no-build", false),
-            ("dotnet.exe", "", true),
-            ("cargo.exe", "cargo build", false),
-        ];
-        for (name, command_line, want) in rows {
-            assert_eq!(is_build_client(name, command_line), want, "{name}: {command_line}");
         }
     }
 

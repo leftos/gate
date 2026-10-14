@@ -13,8 +13,8 @@ use std::time::{Duration, Instant};
 use gate_args::{RunRequest, Slot};
 use gate_state::SlotKind;
 use gate_watchdog::{
-    Config, Cores, JOB_LINES, Machine, OUTSIDE_LINES, ProcessFacts, Report, Sample, SampleFacts, SampleHistory, ServerFacts, SystemTimes, Ticks,
-    Watch, WslVm, failed_block, is_wsl_command, lines, wsl_unavailable_line,
+    Config, Cores, JOB_LINES, Machine, OUTSIDE_LINES, ProcessFacts, Report, Sample, SampleFacts, SampleHistory, SystemTimes, Ticks, Watch, WslVm,
+    failed_block, is_wsl_command, lines, wsl_unavailable_line,
 };
 use gate_win32::{Interrupt, Job, Priority, ProcessTimes, Running, Waited};
 use jiff::Timestamp;
@@ -29,7 +29,7 @@ use crate::nesting::Parent;
 use crate::pause::PauseReader;
 use crate::priority::{OtherGates, Prioritizer};
 use crate::resolve::ResolvedRoot;
-use crate::servers::{Classified, Found, Scope, Servers, counted};
+use crate::servers::{Classified, Scope, Servers};
 use crate::slots::{Pool, Survey, Takes, ThisGate, epoch_ms};
 
 /// How long the watch waits for the command between two samples.
@@ -74,13 +74,11 @@ pub(crate) struct Watcher<'a> {
     watch: Watch,
     /// The samples taken, as the diagnostics block lists them, oldest first.
     history: SampleHistory,
-    /// The build servers outside the job, and the command lines read for them so far.
+    /// The build servers' classifier, and the command lines read for it so far.
     servers: Servers,
     /// The folder a build server's program must lie under, `None` when the scan is machine-wide
     /// (`--test-servers-under`).
     under: Option<PathBuf>,
-    /// The build servers the last sample counted, each with whether it started after the command.
-    counted: Vec<(u32, bool)>,
     /// The processes outside the job the last sample counted, by pid and start.
     counted_escaped: Vec<(u32, u64)>,
     /// The processes outside the job the samples have recorded, which the run's kill ends.
@@ -130,9 +128,6 @@ struct HangHint {
     usual: Usual,
     said: bool,
 }
-
-/// Build servers' CPU time in 100 ns ticks, by pid, as a sample carries them.
-type ServerCpu = BTreeMap<u32, u64>;
 
 /// The CPU time in 100 ns ticks of the processes outside the job under its members, by pid and start, as a sample
 /// carries them.
@@ -273,7 +268,6 @@ impl<'a> Watcher<'a> {
             history: SampleHistory::default(),
             servers: Servers::new(request.test_seams.server_image.clone()),
             under: request.test_seams.servers_under.as_deref().map(absolute),
-            counted: Vec::new(),
             counted_escaped: Vec::new(),
             recorded,
             sampler_works: true,
@@ -401,15 +395,15 @@ impl<'a> Watcher<'a> {
         self.watch.cores()
     }
 
-    /// Brings the watch to the command's end: the job's accounting and the CPU of the build servers and of the processes
-    /// outside the job the last sample counted are read once more, so the CPU since the last sample counts toward the
-    /// cores, and the stretch since that sample is counted at the share it found. A job accounting read that fails
-    /// leaves the cores unknown and is noted in the log only, since the run's verdict does not depend on it.
+    /// Brings the watch to the command's end: the job's accounting and the CPU of the processes outside the job the last
+    /// sample counted are read once more, so the CPU since the last sample counts toward the cores, and the stretch
+    /// since that sample is counted at the share it found. A job accounting read that fails leaves the cores unknown and
+    /// is noted in the log only, since the run's verdict does not depend on it.
     fn end(&mut self, console: &mut Console) {
         if self.sampler_works {
             match self.final_read() {
-                Ok((job_cpu, (new_servers, shared_servers), escaped)) => {
-                    self.watch.final_cpu(job_cpu, &new_servers, &shared_servers, &escaped);
+                Ok((job_cpu, escaped)) => {
+                    self.watch.final_cpu(job_cpu, &escaped);
                 }
                 Err(error) => {
                     self.watch.cores_unread();
@@ -420,14 +414,12 @@ impl<'a> Watcher<'a> {
         self.watch.exited(self.started.elapsed());
     }
 
-    /// The job's total CPU now, the CPU of the build servers the last sample counted that can still be read
-    /// ([`server_cpu`]), and that of the processes outside the job it counted that still run ([`escaped_cpu`]); only the
-    /// job's accounting failing fails the read.
-    fn final_read(&self) -> io::Result<(Ticks, (ServerCpu, ServerCpu), EscapedCpu)> {
+    /// The job's total CPU now, and that of the processes outside the job the last sample counted that still run
+    /// ([`escaped_cpu`]); only the job's accounting failing fails the read.
+    fn final_read(&self) -> io::Result<(Ticks, EscapedCpu)> {
         let job_cpu = Ticks(self.job.accounting()?.cpu);
-        let servers = server_cpu(&self.counted, gate_win32::process_times);
         let escaped = escaped_cpu(&self.counted_escaped, gate_win32::process_times);
-        Ok((job_cpu, servers, escaped))
+        Ok((job_cpu, escaped))
     }
 
     /// Waits at most `timeout` for the command's exit, or for the interrupt when it was installed.
@@ -458,9 +450,8 @@ impl<'a> Watcher<'a> {
                 err_bytes,
                 vm_failed,
             }) => {
-                // Only a sample that came back whole becomes the one a kill's block lists the servers of; one that
-                // failed part way leaves the last good sample's servers in place.
-                self.counted = counted(&sample.new_servers, &sample.shared_servers);
+                // Only a sample that came back whole becomes the one the command's end reads again; one that failed
+                // part way leaves the last good sample's processes in place.
                 self.counted_escaped = sample.escaped.keys().copied().collect();
                 self.watch.sample(&sample);
                 self.record(&sample, log_bytes, err_bytes, vm_failed);
@@ -476,8 +467,7 @@ impl<'a> Watcher<'a> {
     }
 
     /// Keeps one sample for the diagnostics block a kill writes: the sample's own figures, the WSL VM's CPU the watch
-    /// found for a wsl command (`vm_failed` when this sample could not read it), the CPU its build servers have used
-    /// and whether the job held a build client with them.
+    /// found for a wsl command (`vm_failed` when this sample could not read it).
     fn record(&mut self, sample: &Sample, log_bytes: u64, err_bytes: u64, vm_failed: bool) {
         let wsl_vm = match (self.watch.last_vm_percent(), vm_failed) {
             (None, _) => WslVm::NotWatched,
@@ -557,7 +547,6 @@ impl<'a> Watcher<'a> {
             job_unread,
             outside,
             outside_unread,
-            servers: self.server_facts(&tree),
             samples: self.history.to_vec(),
             cut_at_ms: if cut { Some(cut_at(started)) } else { None },
         })
@@ -604,20 +593,6 @@ impl<'a> Watcher<'a> {
         start_instant(self.since).is_some_and(|since| info.created.is_some_and(|created| created >= since))
     }
 
-    /// The build servers the last sample counted, read again now for the block: the name from the gathering's
-    /// snapshot, `(exited)` for one that no longer holds its pid, and its CPU time read again.
-    fn server_facts(&self, tree: &ProcessTree) -> Vec<ServerFacts> {
-        self.counted
-            .iter()
-            .map(|&(pid, after)| ServerFacts {
-                pid,
-                name: tree.get(pid).map_or_else(|| "(exited)".to_owned(), |info| info.name.clone()),
-                cpu: gate_win32::process_times(pid).ok().flatten().map(|times| Ticks(times.cpu)),
-                started_after_command: after,
-            })
-            .collect()
-    }
-
     /// Whether a gate under this one waits behind a critical request now ([`PauseReader::sample`]); a read that fails
     /// counts as not paused, and the first of the watch is said, as the WSL VM's unreadable line is.
     fn paused(&mut self, console: &mut Console) -> bool {
@@ -630,10 +605,10 @@ impl<'a> Watcher<'a> {
     }
 
     /// The facts of one sample that began at `began`: the size of the log and its `.err` file, the two kept apart for
-    /// the diagnostics block, the job's processes created since the command started, the build servers outside the job
-    /// and the build client inside it, the processes outside the job under its members and their CPU, the WSL VM's CPU
-    /// for a wsl command (its unreadable line said once, when it first fails), and last the system's times and the
-    /// job's accounting, stamped with the watch's end time: the interval the watch counts them over is exactly the
+    /// the diagnostics block, the job's processes created since the command started, the build servers in the job and
+    /// outside it whose priority the watch moves, the processes outside the job under its members and their CPU, the WSL
+    /// VM's CPU for a wsl command (its unreadable line said once, when it first fails), and last the system's times and
+    /// the job's accounting, stamped with the watch's end time: the interval the watch counts them over is exactly the
     /// stretch the end stamp closes. Under `--test-sampler-fail` every sample fails.
     fn sample(&mut self, console: &mut Console, began: Duration, paused: bool) -> io::Result<Gathered> {
         if self.sampler_fail {
@@ -653,19 +628,11 @@ impl<'a> Watcher<'a> {
         }
         let scope = Scope {
             members: &pids,
-            since: self.since,
             under: self.under.as_deref(),
         };
-        let found = self
+        self.classified = self
             .servers
             .read(&processes, &scope, gate_win32::process_times, proc_table::command_line_of);
-        let Found {
-            servers,
-            new_servers,
-            shared_servers,
-            build_client,
-        } = found;
-        self.classified = servers;
         let tree = ProcessTree::new(processes);
         let look = Look {
             before,
@@ -674,7 +641,7 @@ impl<'a> Watcher<'a> {
             tree: &tree,
             departed: departed.clone(),
         };
-        let (escaped, escaped_client) = outside_the_job(
+        let escaped = outside_the_job(
             &mut self.recorded.borrow_mut(),
             &self.servers,
             look,
@@ -684,8 +651,6 @@ impl<'a> Watcher<'a> {
         // What the members that had ended before the look began started is recorded now, and they start nothing more;
         // a snapshot that failed recorded nothing under them, so they are kept.
         escaped::forget(self.job, &departed, looked, &tree);
-        // An escaped build client hands its compile to the build servers as one in the job does.
-        let build_client = build_client || escaped_client;
         let (vm, line) = self.vm.sample();
         if let Some(line) = line {
             console.err(&line);
@@ -701,9 +666,6 @@ impl<'a> Watcher<'a> {
             output_size: log_bytes + err_bytes,
             pids,
             paused,
-            new_servers,
-            shared_servers,
-            build_client,
             escaped,
             vm_cpu: vm.as_ref().ok().copied().flatten(),
         };
@@ -717,24 +679,20 @@ impl<'a> Watcher<'a> {
 }
 
 /// What one sample finds outside the job at `look` and records in `recorded` ([`Recorded::record`]), each process
-/// `servers` spares left out with everything under it: the CPU of each recorded process as `times` reads it, and
-/// whether one is a build client ([`Servers::holds_client`]). The walk and the build client's judgement take the same
-/// command line of a process, `read` at most once in the sample.
+/// `servers` spares left out with everything under it: the CPU of each recorded process as `times` reads it. The walk
+/// takes the command line of a process, `read` at most once in the sample.
 fn outside_the_job(
     recorded: &mut Recorded,
     servers: &Servers,
     look: Look<'_>,
     times: impl Fn(u32) -> io::Result<Option<ProcessTimes>>,
     read: impl Fn(u32) -> Option<String>,
-) -> (BTreeMap<(u32, u64), u64>, bool) {
-    let tree = look.tree;
+) -> EscapedCpu {
     let lines: RefCell<HashMap<u32, Option<String>>> = RefCell::new(HashMap::new());
     // The snapshot lists one process for each pid, so within the sample a pid names one process and its start.
     let line = |pid: u32| lines.borrow_mut().entry(pid).or_insert_with(|| read(pid)).clone();
     recorded.record(look, |process| servers.spares(process, line));
-    let cpu = recorded.cpu(times);
-    let client = servers.holds_client(&recorded.processes(tree), line);
-    (cpu, client)
+    recorded.cpu(times)
 }
 
 /// The facts the diagnostics block keeps of `sample`: its own figures, the watch's load-adjusted seconds and the free
@@ -750,10 +708,7 @@ fn sample_facts(sample: &Sample, figures: (f64, u32), sizes: (u64, u64), wsl_vm:
         job_cpu: sample.job_cpu,
         wsl_vm,
         processes: u32::try_from(sample.pids.len()).unwrap_or(u32::MAX),
-        new_servers_cpu: Ticks(sample.new_servers.values().copied().sum()),
-        shared_servers_cpu: Ticks(sample.shared_servers.values().copied().sum()),
         escaped_cpu: Ticks(sample.escaped.values().copied().sum()),
-        build_client_in_job: sample.build_client,
     }
 }
 
@@ -769,22 +724,6 @@ fn escaped_cpu(counted: &[(u32, u64)], times: impl Fn(u32) -> io::Result<Option<
         }
     }
     escaped
-}
-
-/// The CPU `times` reads now for each of the `counted` build servers, by pid, the ones the command started (`true`)
-/// apart from the shared ones. A server that exited, or whose times cannot be read, is skipped, as a sample skips one
-/// it cannot open ([`Servers::read`]).
-fn server_cpu(counted: &[(u32, bool)], times: impl Fn(u32) -> io::Result<Option<ProcessTimes>>) -> (ServerCpu, ServerCpu) {
-    let mut new_servers = BTreeMap::new();
-    let mut shared_servers = BTreeMap::new();
-    for &(pid, started_after) in counted {
-        let Ok(Some(read)) = times(pid) else {
-            continue;
-        };
-        let servers = if started_after { &mut new_servers } else { &mut shared_servers };
-        servers.insert(pid, read.cpu);
-    }
-    (new_servers, shared_servers)
 }
 
 /// What a run of `request` is watched for: its `ceiling` in whole seconds as its take resolved it, its stall window, and
@@ -957,54 +896,7 @@ mod tests {
 
     use gate_win32::Priority;
 
-    use super::{
-        ACCESS_DENIED, VmReader, config, lowered, machine, members, outside_the_job, own_kind_after_take, sample_due, sample_facts, server_cpu, slice,
-    };
-    use crate::escaped::{Look, Recorded};
-    use crate::servers::Servers;
-
-    /// The test moment `second` seconds into the run.
-    fn at(second: i64) -> jiff::Timestamp {
-        jiff::Timestamp::from_second(1_790_000_000 + second).expect("a test moment is a timestamp")
-    }
-
-    #[test]
-    fn an_escaped_build_client_makes_the_sample_hold_one_on_a_single_read_of_its_line() {
-        // Member 1 started a dotnet build (2) outside the job.
-        let process = |pid: u32, parent_pid: u32, name: &str| proc_table::ProcessInfo {
-            pid,
-            parent_pid,
-            name: name.to_owned(),
-            command_line: None,
-            created: Some(at(i64::from(pid))),
-        };
-        let tree = proc_table::ProcessTree::new(vec![process(1, 0, "cmd.exe"), process(2, 1, "dotnet.exe")]);
-        let reads = std::cell::Cell::new(0);
-        let read = |pid: u32| {
-            reads.set(reads.get() + 1);
-            (pid == 2).then(|| "dotnet build".to_owned())
-        };
-        let times = |pid: u32| -> io::Result<Option<ProcessTimes>> {
-            let created = at(i64::from(pid)).as_microsecond() * 10 + 116_444_736_000_000_000;
-            Ok(Some(ProcessTimes {
-                created: u64::try_from(created).expect("a test moment is after 1601"),
-                cpu: 1_000,
-            }))
-        };
-        let look = Look {
-            before: vec![1],
-            after: vec![1],
-            since: at(0),
-            tree: &tree,
-            departed: Vec::new(),
-        };
-
-        let (cpu, client) = outside_the_job(&mut Recorded::default(), &Servers::new(None), look, times, read);
-
-        assert!(client, "the escaped dotnet builds, so the job holds a build client");
-        assert_eq!(cpu.values().copied().collect::<Vec<_>>(), [1_000], "its CPU is counted");
-        assert_eq!(reads.get(), 1, "the walk and the build client's judgement take one read of its line");
-    }
+    use super::{ACCESS_DENIED, VmReader, config, lowered, machine, members, own_kind_after_take, sample_due, sample_facts, slice};
 
     #[test]
     fn a_sample_s_escaped_cpu_reaches_its_diagnostics_facts() {
@@ -1016,9 +908,6 @@ mod tests {
             output_size: 0,
             pids: BTreeSet::from([1]),
             paused: false,
-            new_servers: std::collections::BTreeMap::new(),
-            shared_servers: std::collections::BTreeMap::new(),
-            build_client: false,
             escaped: std::collections::BTreeMap::from([((2, 10), 15_000_000), ((3, 20), 10_000_000)]),
             vm_cpu: None,
         };
@@ -1026,25 +915,6 @@ mod tests {
         let facts = sample_facts(&sample, (4.0, 50), (0, 0), gate_watchdog::WslVm::NotWatched);
 
         assert_eq!(facts.escaped_cpu, gate_watchdog::Ticks(25_000_000), "both escapees' CPU");
-    }
-
-    #[test]
-    fn an_end_read_skips_a_server_that_exited_or_cannot_be_read() {
-        // 10 and 20 the command started, 30 and 40 shared: 20 has exited and 40 cannot be opened.
-        let counted = [(10, true), (20, true), (30, false), (40, false)];
-        let times = |pid: u32| match pid {
-            20 => Ok(None),
-            40 => Err(io::Error::from_raw_os_error(ACCESS_DENIED)),
-            _ => Ok(Some(ProcessTimes {
-                created: 0,
-                cpu: u64::from(pid) * 100,
-            })),
-        };
-
-        let (new_servers, shared_servers) = server_cpu(&counted, times);
-
-        assert_eq!(new_servers.into_iter().collect::<Vec<_>>(), [(10, 1000)]);
-        assert_eq!(shared_servers.into_iter().collect::<Vec<_>>(), [(30, 3000)]);
     }
 
     /// A heavy run of `command`.

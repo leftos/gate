@@ -791,7 +791,7 @@ All kept, with each knob's default unchanged:
 - The sampler (W1): every 5 s while the command runs, it reads, in order, the pause state, the log and `.err` sizes, the job's pids, one process snapshot and the build servers, then the WSL VM, the system times and the job's accounting; nothing goes through WMI.
 
   Each sample carries two stamps: `began`, taken before its reads, and `at`, taken after them, next to the system times and the job's accounting. The `interval`, the load-adjusted clock, the paused time, the free share and the exit use `at`; the PowerShell gate stamps once, before its reads.
-- Stall (W2): no output, no CPU (at least 1% of one core over the window), no new process in the job, no build-server progress, no WSL VM CPU and no nested gate paused behind a critical request, for `--stall` seconds: `gate: STALLED: ...`.
+- Stall (W2): no output, no CPU (at least 1% of one core over the window), no new process in the job, no WSL VM CPU and no nested gate paused behind a critical request, for `--stall` seconds: `gate: STALLED: ...`.
 
   The quiet time runs from the last progress sample's `at` to the latest sample's `began`, not to the moment the watcher checks: a watcher starved of CPU wakes late, and the time it spends in its reads, and after them up to the check, is not the command's quiet time, so the next sample decides.
 
@@ -799,7 +799,9 @@ All kept, with each knob's default unchanged:
 
   Progress as the watchdog crate counts it resets the stall clock when the sum of the log and `.err` sizes changed (grew or shrank), the CPU of the job and of the processes outside it under its members (the escaped tree, below) since the last progress reached 1% of one core over the stall window together, a pid appeared in the job that the last sample did not have, a process outside it appeared that the last sample did not have (by pid and start), or a nested gate is paused.
 
-  The stall clock also resets when a build server's CPU counts as progress (see Build servers below), or, for a `wsl` command, the WSL VM's CPU counts as progress (see WSL below).
+  The stall clock also resets, for a `wsl` command, when the WSL VM's CPU counts as progress (see WSL below).
+
+  A build server outside the command's job is not progress: only the job's own processes count, a per-run server inside the job included.
 - The load-adjusted clock and the ceiling (W3): each sample adds `interval * free`, the interval running between the samples' `at` stamps, to the clock `--timeout` runs on (for `auto:<n>`, the ceiling the take resolved; the backstop below uses it too); a sample taken while a nested gate is paused adds to the paused time instead; `gate: TIMED OUT after ...`.
 
   The free share is 1 for a High-priority command; otherwise `busy` is the share of the interval's system time that was not idle, the cores others held are `max(0, busy * cores - own cores)` with `own cores` the CPU gained over the interval by the job and by the escaped tree (below), and `free = clamp((cores - others) / demand, 0.05, 1)`. `demand` is every core, `min(cores, 2)` for a light gate, or 1 for a gate on no slot, so its ceiling stays near wall time on a loaded PC.
@@ -817,13 +819,11 @@ All kept, with each knob's default unchanged:
 - A command that exits on its own before the kill keeps its status (W7).
 - Build servers: classification (B1), their priority (B2), and the per-run server settings of [Command launching](#command-launching) (the run id as `SharedCompilationId` and `MSBUILDNODEHANDSHAKESALT`, `MSBUILDUSESERVER=0`, `DOTNET_CLI_USE_MSBUILD_SERVER=0`, `MSBUILDDISABLENODEREUSE=1`), so each run has its own compiler server and MSBuild nodes (B3).
 
-  Every sample reads the build servers outside the command's job: `VBCSCompiler.exe`, `dotnet.exe` whose command line names `VBCSCompiler.dll`, and `MSBuild.dll` with `nodemode`. It takes one ToolHelp snapshot, which carries no command lines, and each process's times; a command line is read once per (pid, start) through `proc_table::command_line_of(pid)` (OpenProcess and ReadProcessMemory), never through a child process. A process the gate cannot read is skipped.
+  Every sample reads the build servers, in the command's job and outside it, so Priority (B2) below can move them: `VBCSCompiler.exe`, `dotnet.exe` whose command line names `VBCSCompiler.dll`, and `MSBuild.dll` with `nodemode`. It takes one ToolHelp snapshot, which carries no command lines, and each process's times; a command line is read once per (pid, start) through `proc_table::command_line_of(pid)` (OpenProcess and ReadProcessMemory), never through a child process. A process the gate cannot read is skipped.
 
-  A server started at or after the command is new. One started before it counts only when it is a compiler server, and then it is shared. The job holds a build client when it has an `MSBuild.exe` or a `dotnet.exe` without `--no-build`.
+  The stall check and the load figures count the job's own processes and the escaped tree only: a build server outside the job is neither progress nor the command's own CPU in the free share, and a server inside the job is one of its processes like any other.
 
-  With a build client in the job, a rising new or shared server is progress, and its CPU counts as the gate's own in the free share. A real gate therefore counts another session's compiler server as shared progress while its job holds a build client, as the PowerShell gate does.
-
-  The watch hands the pure crate raw facts: the per-pid cumulative CPU of the new and the shared servers, the build-client flag and the VM's CPU as an option (`None` for a command that is not a `wsl` one, or with no VM). The classifiers are in `gate-watchdog`'s `servers.rs`; the reader is the binary's `servers.rs`.
+  The watch hands the pure crate raw facts: the job's CPU, the escaped tree's per-process CPU and the VM's CPU as an option (`None` for a command that is not a `wsl` one, or with no VM). The classifiers are in `gate-watchdog`'s `servers.rs`; the reader is the binary's `servers.rs`.
 
   Priority (B2): after every sample, the watch moves the priority class of the build servers that sample classified, with the same classification as above. An ordinary gate lowers each classified server outside its job from Normal, AboveNormal, High or RealTime to BelowNormal; there is no restore after the run. Every classified server outside the job is lowered, not only those that count as progress, so a warm `MSBuild` node already running is lowered too.
 
@@ -868,7 +868,7 @@ All kept, with each knob's default unchanged:
 
     A recorded process the snapshot still lists as itself (by pid and start) stays recorded and the walk goes on below it after the launcher in the job has ended; one whose start, or whose parent's, is unknown is dropped. Each one's CPU is read by pid and start (`Recorded::cpu`); a read that fails once keeps the last read, so the process is neither dropped nor counted anew.
 
-    That CPU counts as the command's own, unconditionally: in the journal's `avgCores`, `peakCores` and `freeCores`, the cores line, the no-slot hint and the load-adjusted clock, which no longer takes it for other processes' load. An escaped process that lives under one sample is seen only when its launcher, a member of the job, had ended before the sample (the job's memory of its members, below). An escaped build client (Build servers above) counts as a build client in the job.
+    That CPU counts as the command's own, unconditionally: in the journal's `avgCores`, `peakCores` and `freeCores`, the cores line, the no-slot hint and the load-adjusted clock, which no longer takes it for other processes' load. An escaped process that lives under one sample is seen only when its launcher, a member of the job, had ended before the sample (the job's memory of its members, below).
   - The run's job (only it: the box run, box tools, push and remote launch jobs have none) remembers the members that ended before a sample could list their children, through an I/O completion port associated with the job before the first process is assigned (`Job::remember`, `Job::departed` and `Job::forget` in `crates/gate-win32/src/job.rs`).
 
     `Job::remember` starts a thread (`job-memory`) that waits on the port 100 ms at a time and reads each new member's start the moment its `JOB_OBJECT_MSG_NEW_PROCESS` message arrives, keeping its handle open while it runs. The handle is closed, the exit time kept, when the member's `JOB_OBJECT_MSG_EXIT_PROCESS` or `JOB_OBJECT_MSG_ABNORMAL_EXIT_PROCESS` message arrives, or after a wait that came back empty. Samples and the kill's look only read the memory.
@@ -892,11 +892,10 @@ All kept, with each knob's default unchanged:
   - **Every kill site ends the escaped tree** (GATE-140), planned, not built: the box's stop, the remote client's kill and `gate push`'s kill end the escaped processes the way a `gate run` kill does, sparing build servers (and an unreadable `dotnet` host) with everything under them, so the sites agree on what is ended and what is spared.
 - The diagnostics block (X3) is gathered before the job is terminated and goes to the log only, between the command's output and the kill line. A command that exits during the gathering keeps its own status and writes no block. Its lines:
   - `gate: diagnostics`, then `gate:   job <pid> parent <ppid> <name>: cpu <s> s, working set <mb> MB: <command line>` for each process of the job (up to 40, then `gate:   ... and <n> more job processes`), and `gate:   outside job ...` lines for the descendants outside the job (up to 20), the recorded escaped processes and their descendants after them.
-  - The build servers the last sample counted, one line each: `gate:   build server <pid> <name>: cpu <s> s (started after the command)` or `(already running; counts while the job holds a build client)`; a server gone by the time of the block shows `(exited)` in place of its name and `?` for its CPU. `gate:   build servers: none` when none was counted.
-  - Up to six sample lines, `gate:   sample at <w> s (load-adjusted <a> s, free <p>%): log <n> B, err <n> B, job cpu <s> s, <n> processes, new servers cpu <s> s, shared servers cpu <s> s, escaped cpu <s> s, build client in job: yes|no`, or `gate:   samples: none` when no sample was taken. `<w>` is the sample's `at` stamp.
+  - Up to six sample lines, `gate:   sample at <w> s (load-adjusted <a> s, free <p>%): log <n> B, err <n> B, job cpu <s> s, <n> processes, escaped cpu <s> s`, or `gate:   samples: none` when no sample was taken. `<w>` is the sample's `at` stamp.
 
-    A `wsl` command's sample line also carries `wsl vm cpu <p>%` after the process count: the VM's CPU in percent of one core since the previous reading (`Watch::last_vm_percent`), `wsl vm cpu unavailable` when that sample's read failed, and 0% with no VM. Any other command shows nothing there.
-  - `gate:   ... diagnostics cut at <n> ms` when the 2000 ms gather budget ran out. A cut block still lists the build servers: their facts are a lookup in the snapshot already taken, so only the job and outside process lines are left unread, and a starved gate on a busy PC keeps the server lines it needs most. A gathering that failed writes `gate: diagnostics` then `gate: diagnostics failed: <message>` in its place.
+    A `wsl` command's sample line also carries `wsl vm cpu <p>%` before the process count: the VM's CPU in percent of one core since the previous reading (`Watch::last_vm_percent`), `wsl vm cpu unavailable` when that sample's read failed, and 0% with no VM. Any other command shows nothing there.
+  - `gate:   ... diagnostics cut at <n> ms` when the 2000 ms gather budget ran out. A gathering that failed writes `gate: diagnostics` then `gate: diagnostics failed: <message>` in its place.
   - The working set comes from `gate_win32::working_set` (`None` for a gone or exited process). stderr gets one line, `gate: diagnostics written to <log>` (also in the log), after the terminated line; the block's lines are not on stderr.
 - A command still running 5 s after its job was terminated is reported: `gate: the command was still running 5 s after its job was terminated`. A job that cannot be terminated says `gate: could not terminate the command's job: <error>`. A killed run is not scanned for markers, and its release verdict is `stalled`, `timed-out` or `backstop` by the kill line that ended it.
 - What a sample reads: the job's CPU by accounting (exited members included), the job's pids created at or after the command's start (a pid that answers access denied is not a member), the log's and `.err`'s sizes, and the system times.
@@ -1820,7 +1819,7 @@ Rules:
 A Rust integration suite drives the built `gate.exe` through its CLI and reads only what it writes: exit codes, stdout, stderr, the log, the journal, claims and tickets.
 
 - **Own state root per case.** Every case creates a fresh folder under the target directory's temporary folder. The folder is the case's working folder, holding its logs and its `LOCALAPPDATA`, and its `state` subfolder is the `--state-dir`, so cases never touch the machine's real slots, journal or counts, or each other's. Cases run side by side.
-- **Load.** Watchdog-timing cases depend on the scheduler. The gate under test runs at Normal priority, and its command and the build servers it watches run at BelowNormal. Under an all-core load, the gate was measured runnable but not running for up to 13.7 s, and a BelowNormal command for up to 31.8 s with no CPU.
+- **Load.** Watchdog-timing cases depend on the scheduler. The gate under test runs at Normal priority, and its command runs at BelowNormal. Under an all-core load, the gate was measured runnable but not running for up to 13.7 s, and a BelowNormal command for up to 31.8 s with no CPU.
 
   So a case never races a fixed sleep against the watcher: its command sleeps past the 600 s hang guard, and only the behaviour under test ends it. A stall window a case relies on is far past those gaps, or the case is ignored and run with `--ignored` on a critical slot (the repo's nextup profile lists them).
 
@@ -1955,7 +1954,7 @@ A Rust integration suite drives the built `gate.exe` through its CLI and reads o
 When a run that passed did not fit its slot, the gate says how many cores the command kept busy, so the caller learns whether heavy or light was right (GATE-6). For example: `gate: used 7.4 cores on average (peak 15, 0.6 free) on a light slot; work that keeps more than 2 busy belongs on heavy`.
 
 - The line is said on stdout, just before the passed line, only for a passed run that took its own light or heavy slot or ran on no slot, ran 10 s or more of unpaused wall time, and had no gate under it take a slot of its own. A critical run is never judged, and a covered or lent run takes no slot.
-- `avg` is the job's CPU (user plus kernel time of every process ever in the job, exited ones included, with a final read at exit) plus the CPU of the escaped tree under the job's members ([Watchdog](#watchdog); read per sample, the final stretch counted with the last sample's processes that still run) plus the CPU of the build servers the watchdog counts while the job holds a build client (the final stretch counted with the last sample's servers), over the run's unpaused wall time.
+- `avg` is the job's CPU (user plus kernel time of every process ever in the job, exited ones included, with a final read at exit) plus the CPU of the escaped tree under the job's members ([Watchdog](#watchdog); read per sample, the final stretch counted with the last sample's processes that still run), over the run's unpaused wall time.
 
   The CPU of paused samples is left out.
 

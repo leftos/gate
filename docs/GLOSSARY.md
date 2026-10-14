@@ -19,7 +19,6 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Box**: a builder; the word the gate's prose and its hidden `gate box` subcommand use.
 - **Box job**: the named job `Local\gate-remote-<key>-<12 hex>` that a `gate box run` puts its command in, named by the payload and stopped by `gate box stop`; it has no limits and no kill-on-close.
 - **Bridge commit**: a commit with a snapshot's tree whose parent is the previous snapshot, which the Rust remote client builds so a push can send only what changed; none when there is no previous snapshot.
-- **Build client**: a process in the command's job that drives a build (`MSBuild.exe`, or `dotnet` without `--no-build`); only while one runs does a build server's CPU count as the command's progress.
 - **Build id**: the text after `+` in the gate's version (`gate --version` prints `gate <package version>+<build id>`): the 12-hex head commit of the build, `<12-hex>-dirty.<8-hex>` for a build of changed tracked files (the 8 hex are the first 8 of the SHA-256 of `git diff HEAD --binary`), or `dev` for a build `tools/install.ps1` did not make with a commit. The client compares the whole version text, so another build of one package version is another version.
 - **Build server**: a long-lived compiler or MSBuild node process (`VBCSCompiler`, a `dotnet` running `VBCSCompiler.dll` or an MSBuild node) that builds share.
 - **Builder**: a remote Windows machine, named in a PC's own `remote.json`, that runs routed heavy commands with its own copy of `gate.exe`.
@@ -44,7 +43,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Cutover sweep**: the later change of every calling repo from the PowerShell launcher to `gate` on PATH, after which the PowerShell gate is deleted.
 - **Delete pending**: a file marked for deletion when its last handle closes (the classic delete, not the POSIX one `fs::remove_file` takes); until then its name stays listed and every open or delete of it is refused with access denied, so the gate passes it over as going away.
 - **Departed member**: a process the run's job held that has ended, as the job's completion port remembered it (pid, start, read while its process object lived, and exit time; one found gone, its start never read, is not remembered); a process that names its pid as parent and started within its lifetime, from the job's creation at the earliest, counts as escaped, so a kill reaches it though no sample saw it under a live member.
-- **Diagnostics block**: the record of what was running that a kill writes to the log before it terminates the job: the job's processes, the descendants outside the job, the build servers and the last samples.
+- **Diagnostics block**: the record of what was running that a kill writes to the log before it terminates the job: the job's processes, the descendants outside the job and the last samples.
 - **Drain**: see critical drain.
 - **Drained cutover**: a cutover in which every gate of the old generation finishes before the switch completes, while the two generations share the slot mutexes and take turns on them.
 - **Durations key**: the name a run's durations are filed and estimated under, `{place}:{class}:{repo[/sub]} | {normalised command}`, the repo being the main checkout's folder name, so every worktree of a repo shares it; it is made by `gate_state::duration_key` and differs from the history key, which is the normalised command alone, with no place, class or repo.
@@ -128,7 +127,6 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Script word**: a command word holding a line break or one of `, ; " ' ) | & < >`, such as a script's text or a list; in it a path ends at white space, where in any other word a path runs through its spaces.
 - **SDK pin**: the `sdk` member of a snapshot's `global.json` (version, `rollForward` policy, `allowPrerelease`) that the parity check resolves against the builder's SDKs; one that cannot be read leaves only the SDK major to check.
 - **Shadow end**: the expected end of the slowest gate a critical drain waits on, which closes the lent window.
-- **Shared compiler server**: a compiler server (`VBCSCompiler`) already running when the command started; its CPU counts as the command's progress only while the job holds a build client.
 - **Shim**: an extensionless script on PATH, such as the bash shims a plugin puts ahead of `uv` and `python`, which program resolution skips since Windows cannot start it.
 - **Slot**: a named mutex in the session's `Local\` namespace that a gate holds for its command's whole run; the number of slots per pool caps how many commands run at once.
 - **Slot marker**: the environment variable `GATE_SLOT_HELD`, `<kind>:<pid>:<start>` (plus the root hash under a non-default root), which a gate sets for its command so a nested gate knows its parent.
@@ -136,7 +134,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Spawn lock**: the `gate-win32` lock held while the gate starts any process, so only the launched command inherits the copies of its handles.
 - **Stable line**: one of the three published `gate:` line forms callers may parse (STALLED, TIMED OUT, TRANSFER TIMED OUT or BACKSTOP; `waiting for the machine (critical)`; `Full output:`); every other `gate:` line is prose.
 - **Stage**: the install's folder `<worktree>\.tmp\<key>-<nonce>` (the outputs stage), where a fetched outputs archive is unpacked, its copies made and its members checked before any file is moved into the worktree.
-- **Stall**: a kill for no progress (no output, CPU, new process or build-server work) for the stall window, `--stall` seconds.
+- **Stall**: a kill for no progress (no output, CPU or new process) for the stall window, `--stall` seconds.
 - **Stand-in**: a live covered gate whose command holds a nested gate and whose own slot kind covers it, which that gate runs under in place of its ended parent gate, so one build tree holds one slot; only a covered marker with `kind` `heavy` or `light` is one.
 - **Start marker**: the stderr line `gate-remote-started: <nonce>` that `gate box run` says just before it launches the command; a run call that carried it is never retried and is not a pre-banner failure.
 - **State root**: the folder holding every file the gate writes, `%LOCALAPPDATA%\gate\v1\` by default, overridden by `--state-dir` or `GATE_STATE_DIR`.

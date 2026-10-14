@@ -113,9 +113,9 @@ The rule that shapes it: every file and kernel object another process sees is de
   `win32.rs`'s `Win32MutexProbe` counts a mutex closed only when no process holds the name.
 
   `counts.rs` also writes the counts files for ops-tower's Gates tab (`apply_slot_count`, `write_slot_counts`): the PowerShell layout's file, then `gate.exe`'s `v1\slot-counts.json` beside it. `apply_slot_count` keeps the other pool's valid count, replaces a missing, blank, invalid or non-object file, and fails with `ApplyError::Read` on a file that exists but cannot be read, leaving it untouched.
-- **`gate-watchdog`** (`crates/gate-watchdog/`, pure): owns the free-share, load-adjusted clock, stall, ceiling and backstop arithmetic over samples (`share.rs`, `watch.rs`, including `measure_cpu` and the progress that build servers and the WSL VM add).
+- **`gate-watchdog`** (`crates/gate-watchdog/`, pure): owns the free-share, load-adjusted clock, stall, ceiling and backstop arithmetic over samples (`share.rs`, `watch.rs`, including `measure_cpu` and the progress the WSL VM adds).
 
-  It also owns the classifiers of build servers, build clients and `wsl` commands over names and command lines (`servers.rs`: `is_build_server`, `is_compiler_server` and `is_compiler_image`, which takes the test seam's image name; with the build servers' priority rule `server_target` and `server_left` over an `Option<PriorityClass>`, `None` being an unreadable class), and the kill lines.
+  It also owns the classifiers of build servers and `wsl` commands over names and command lines (`servers.rs`: `is_build_server` and `is_compiler_image`, which takes the test seam's image name; with the build servers' priority rule `server_target` and `server_left` over an `Option<PriorityClass>`, `None` being an unreadable class), and the kill lines.
 
   It also owns the pure formatting of the diagnostics block a kill writes (`diagnostics.rs`: `lines`, `failed_block`, `failed_line` and the caps `JOB_LINES` and `OUTSIDE_LINES`).
 
@@ -215,7 +215,7 @@ The rule that shapes it: every file and kernel object another process sees is de
 
   `nesting/binding.rs` judges whether the marker binds to the parent gate's job: the walk from this gate up a process snapshot, pure over an injected job, snapshot and `holds`.
 
-  And `watch.rs` (the watch of a running command: the sampler, the pause read, the load-adjusted clock, the stall kill and the Ctrl+C stop), `servers.rs` (the build servers outside the job and the build client inside it, read once per sample) and `priority.rs` (the per-watch `Prioritizer` that lowers or raises the classified build servers, and `OtherGates`, the guard it reads, at most once a pass and only when a server to move asks, from the tickets, claims and other gates' jobs).
+  And `watch.rs` (the watch of a running command: the sampler, the pause read, the load-adjusted clock, the stall kill and the Ctrl+C stop), `servers.rs` (the build servers in the job and outside it, read once per sample, for the priority pass and the escaped-tree spare) and `priority.rs` (the per-watch `Prioritizer` that lowers or raises the classified build servers, and `OtherGates`, the guard it reads, at most once a pass and only when a server to move asks, from the tickets, claims and other gates' jobs).
 
 `boxside/` is `gate box`: `mod.rs` (the verbs and their exits), `payload.rs` (the base64 JSON payload), `preflight.rs` (the bare repo, the work folder and the report lines), `boot.rs` (the boot-time line).
 

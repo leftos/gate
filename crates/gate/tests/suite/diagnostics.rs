@@ -58,8 +58,6 @@ fn assert_block(log: &str, kill: &str, lines: &[&str]) {
 #[test]
 fn a_kill_writes_its_diagnostics_to_the_log_before_the_kill_line() {
     let case = Case::new("a_kill_writes_its_diagnostics_to_the_log_before_the_kill_line");
-    // The server scan is the run words' own, confined to this case's folder, which holds none, so a build server
-    // another case started can never take the `build servers: none` line this case pins.
     let seams = ["--test-stall-ms", "1500", "--test-sample-ms", "100"];
     let log_path = case.folder().join("out.log");
 
@@ -75,7 +73,11 @@ fn a_kill_writes_its_diagnostics_to_the_log_before_the_kill_line() {
     let terminated = "gate: terminated the job's 1 process(es)";
 
     assert_in_order(&log, &["hi\n", "gate: diagnostics\n"]);
-    assert_block(&log, kill, &[&job, "gate:   build servers: none\n", "gate:   sample at "]);
+    assert_block(&log, kill, &[&job, "gate:   sample at "]);
+    assert!(
+        block_lines(&log).iter().all(|line| !line.contains("build server")),
+        "the block lists no build server:\n{log}"
+    );
     assert_in_order(&log, &[kill, &format!("{terminated}\n"), &pointer]);
 
     assert_in_order(&outcome.stderr, &[kill, terminated, &pointer]);
