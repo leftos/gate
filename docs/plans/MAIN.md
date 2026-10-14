@@ -5,6 +5,11 @@
 ## Do first
 
 - [ ] GATE-46 Remote slice 5: drained remote cutover and deleting the remote.ps1 bridge — Urgent · Remote
+- [ ] GATE-19 Remote: send a repo's declared sibling worktrees with a routed run — Urgent · Remote
+- [ ] GATE-206 A per-repo toolchain manifest: check and prepare builders, and check a fresh clone — Urgent · Remote
+- [ ] GATE-210 Toolchain 3: the box probes the needs the PC sends — Urgent · Remote
+- [ ] GATE-211 Toolchain 4: refuse a routed run with parity when the builder lacks a declared tool — Urgent · Remote
+- [ ] GATE-213 Toolchain 6: siblings declared under .gate/ — Urgent · Remote
 
 ## Remote
 
@@ -12,29 +17,22 @@
   - [ ] GATE-109 Remote: carry every verb of a routed run over one ssh connection (gate box serve)
   - [ ] GATE-192 Turn routing back on, on the Rust remote client
   - [ ] GATE-18 Remote preflight: refuse with `parity` when the builder lacks a .NET workload the repo needs
-  - [ ] GATE-19 Remote: send a repo's declared sibling worktrees with a routed run
   - [ ] GATE-22 Remote: send a routed command's ignored inputs to the builder, compressed
   - [ ] GATE-27 Remote: remember a builder's failures per host (short backoff, loss counter)
   - [ ] GATE-21 Remote: a critical pool on the builder for timing-sensitive gates (decide after measuring)
   - [ ] GATE-29 Sync-back: narrow the 'worktree changed during the run' refusal to changes that could matter
 - [ ] GATE-159 Box: choose the dotnet tool restore cap from its logged times
-- [!] GATE-187 Count a routed run's ceiling in load-adjusted time on the builder
+- [/] GATE-187 Count a routed run's ceiling in load-adjusted time on the builder
 - [ ] GATE-195 Check git and gate push's ssh against the worktree, as the remote client checks ssh and dotnet
-- [ ] GATE-206 A per-repo toolchain manifest: check and prepare builders, and check a fresh clone
-  - [ ] GATE-208 Toolchain 1: parity checks a list of needs, one mismatch line each
-  - [ ] GATE-209 Toolchain 2: the .gate/toolchain.toml format and its reader
-  - [ ] GATE-210 Toolchain 3: the box probes the needs the PC sends
-  - [ ] GATE-211 Toolchain 4: refuse a routed run with parity when the builder lacks a declared tool
-  - [ ] GATE-212 Toolchain 5: gate check, for this machine and for a builder
-  - [ ] GATE-213 Toolchain 6: siblings declared under .gate/
-  - [ ] GATE-214 Toolchain 7: roll the manifest out to the gated repos
-- [ ] GATE-227 gate push can leave a builder's gate that failed its check in place
+- [ ] GATE-212 Toolchain 5: gate check, for this machine and for a builder
+- [ ] GATE-214 Toolchain 7: roll the manifest out to the gated repos
+- [ ] GATE-228 Merge feat/toolchain-manifest (#234)
+- [ ] GATE-230 gate push's cleanup can delete a builder's last known-good gate.exe.old
 
 ## Cutover sweep
 
 - [ ] GATE-11 Caller sweep to gate on PATH; delete the PowerShell gate
-  - [ ] GATE-200 Sweep part 1: claude-config hooks recognise the gate run spelling
-  - [ ] GATE-201 Sweep part 2: each caller repo moves to gate run and deletes its launcher
+  - [/] GATE-201 Sweep part 2: each caller repo moves to gate run and deletes its launcher
   - [ ] GATE-202 Sweep part 3: claude-config's tools and skills move to gate run; delete the PowerShell gate
   - [ ] GATE-204 Sweep part 4: drop the compatibility layer and the launcher from the gate repo
 
@@ -42,8 +40,6 @@
 
 - [ ] GATE-17 Durations part 5: backfill guests during a critical drain
 - [ ] GATE-8 `--slot auto` picks heavy or light from the command's history
-- [/] GATE-190 Run each gate's build servers inside its own job, never shared between runs
-- [ ] GATE-199 Merge feat/per-run-servers (#226)
 
 ## Backlog
 
@@ -59,5 +55,4 @@
 - [ ] GATE-203 Retire gate cutover, cutover.flag and the PowerShell-layout readers
 - [ ] GATE-185 A nested critical gate whose parent gate ends runs on uncounted
 - [ ] GATE-222 Run end misses a nested gate's job under a state root of its own when the ender is on the default root
-- [ ] GATE-223 Suite: journal rollover case fails when the durations store prints its expected-time line
 - [ ] GATE-225 Suite: covered-gate slot wait case fails under load (the slot frees before the wait)
