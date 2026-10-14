@@ -1724,9 +1724,19 @@ Built verbs:
 
   The inherited count is read as git reads it (leading whitespace, an optional `+`, decimal digits to the end, at most `i32::MAX`; an empty value is 0); a count git would refuse, or `i32::MAX` itself, leaves the environment unchanged. The work folders are owned by Administrators, which git refuses from a non-elevated token.
 
+  The command's environment also sets `Logging__EventLog__LogLevel__Default=None`, replacing any inherited value, so a .NET host with default logging writes nothing to the Windows Event Log; its console output is unchanged. Of the groups the Application log's default access lets write, a restricted copy of the box's token could hold only Administrators, INTERACTIVE, SERVICE, BATCH and WRITE_RESTRICTED, and the command's token holds none of them.
+
+  On a builder without the setup grant below (a fresh or reimaged one), the host's default EventLog provider would throw `Access is denied` on its first Warning; the variable keeps such a host working wherever the grant is missing.
+
   Known cost: deny entries naming NETWORK still apply to the command, but allow entries naming NETWORK no longer grant, so a resource whose DACL grants NETWORK alone is open to a command run directly over ssh and closed to the same command routed.
 
   Known cost: the first non-elevated build in each work folder starts fresh MSBuild nodes and compiler servers, since their handshake includes elevation. A command that creates symlinks needs Developer Mode on the builder, as on the PC; builder setup turns it on (`AllowDevelopmentWithoutDevLicense` = 1).
+
+  Known cost: the variable does not cover a command that writes to the Event Log by another route (`EventLog.WriteEntry`, a logging library's own sink). Nor does it cover a host whose own configuration sets the EventLog provider's level: a category rule (`Logging:EventLog:LogLevel:Microsoft`), which wins over the default, or a configuration source added after environment variables, or a bare `HostBuilder` that never reads them.
+
+  Builder setup therefore grants the builder user write access to the Application log: one allow entry for the user's SID, write access 0x2, added to the channel's access SDDL with `wevtutil sl Application /ca:` from an elevated session. That covers every writer to that log under a registered source.
+
+  Any routed command, and anything else run as the builder user, can then write entries under any registered source, so the builder's Application log is not evidence of what the system did. Registering a new event source and writing to any other log still need Administrators, so they fail on a routed run.
 
   The stop event `<job>-stopped` ([Kernel object names](#kernel-object-names)) is a manual-reset event the run creates, unset, right after it takes the work-folder lock, before the fetch and checkout; one that cannot be created prints `gate: the gate failed while running the command: cannot create the event <job>-stopped: <error>` and exits 1.
 

@@ -506,11 +506,12 @@ pub(super) fn full_path(path: &Path) -> Option<PathBuf> {
 /// ([`Variables::with_build_servers`]), replacing any value the box inherited: the compiler server's pipe and
 /// `MSBuild`'s node handshake are named by the run id `gate-box-<Nonce>`, so no other run's command, on the box or on
 /// the PC, uses the servers this one starts, and the `MSBuild` server and node reuse are off. Git's `safe.directory` is
-/// set to `*` over that ([`with_safe_directory`]). The command runs with a restricted copy of the box's token
+/// set to `*` over that ([`with_safe_directory`]), and the Event Log logging provider of a .NET host the command starts
+/// is turned off over that ([`with_event_log_off`]). The command runs with a restricted copy of the box's token
 /// ([`restricted_token`]).
 fn command(request: &Request<'_>, place: &Path, beat: &Beat<'_>, console: &mut Console) -> Result<Ran, u32> {
     let run = format!("gate-box-{}", request.nonce);
-    let variables = with_safe_directory(Variables::from_process().with_build_servers(&run));
+    let variables = with_event_log_off(with_safe_directory(Variables::from_process().with_build_servers(&run)));
     let environment = variables
         .block()
         .map_err(|error| failed(console, &format!("cannot build the command's environment: {error}")))?;
@@ -600,6 +601,24 @@ fn with_safe_directory(variables: Variables) -> Variables {
         .with(GIT_CONFIG_COUNT, &(index + 1).to_string())
         .with(&format!("GIT_CONFIG_KEY_{index}"), "safe.directory")
         .with(&format!("GIT_CONFIG_VALUE_{index}"), "*")
+}
+
+/// `variables` with the Event Log logging provider of a .NET host turned off: `Logging__EventLog__LogLevel__Default`
+/// and the colon spelling `Logging:EventLog:LogLevel:Default`, which .NET reads as the same key, both set to `None`,
+/// replacing every value the box inherited for each name, names compared as Windows compares them. A colon is a legal
+/// character in a Windows variable name, so the two names are different ones to [`Variables::with`] and an inherited
+/// colon form would otherwise survive beside the `None` under the underscore form, whichever of them .NET reads first.
+///
+/// The command runs with a restricted copy of the box's token ([`restricted_token`]), which holds neither
+/// Administrators nor INTERACTIVE, the only groups the Windows Application log lets write that a restricted copy of
+/// that token could hold. The variable keeps a default .NET host, whose logging turns the provider on, working on a
+/// builder that lacks the grant a builder's setup gives its user to that log (a fresh or reimaged one); there, its
+/// first Warning would fail with `Win32Exception 5` and take the host down. Off, the host writes nothing to the Event
+/// Log, and its console output, which the gate captures, is unchanged.
+fn with_event_log_off(variables: Variables) -> Variables {
+    variables
+        .with("Logging__EventLog__LogLevel__Default", "None")
+        .with("Logging:EventLog:LogLevel:Default", "None")
 }
 
 /// The count `GIT_CONFIG_COUNT` holds, read as git reads it, with `strtoul` taking the whole value: an empty value is

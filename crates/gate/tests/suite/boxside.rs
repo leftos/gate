@@ -841,6 +841,42 @@ fn box_run_gives_the_command_its_run_s_compiler_server_id() {
 }
 
 #[test]
+fn box_run_turns_the_event_log_provider_off_for_the_command() {
+    let case = Case::new("box_run_event_log_off");
+    let mut payload = box_payload(&case, "k", &[r".\eventlog.cmd"]);
+    snapshot(
+        &case,
+        &mut payload,
+        &[("eventlog.cmd", "@echo %Logging__EventLog__LogLevel__Default%\r\n")],
+    );
+
+    // Inherited at another level, so the case sees the box set its own value rather than pass one through.
+    let outcome = run_box_with_env(&case, &payload, "Logging__EventLog__LogLevel__Default", "Warning");
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(
+        outcome.stdout, "None\n",
+        "a .NET host the command starts logs nothing to the Event Log, which the command's token cannot write: {outcome:?}"
+    );
+}
+
+#[test]
+fn box_run_turns_the_event_log_provider_off_under_the_colon_spelling_too() {
+    let case = Case::new("box_run_event_log_off_colon");
+    let mut payload = box_payload(&case, "k", &[r".\colon.cmd"]);
+    snapshot(&case, &mut payload, &[("colon.cmd", "@set \"Logging:EventLog:LogLevel:Default\"\r\n")]);
+
+    // The colon spelling .NET reads as the same key, inherited, so one spelling left behind cannot outvote the other.
+    let outcome = run_box_with_env(&case, &payload, "Logging:EventLog:LogLevel:Default", "Warning");
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(
+        outcome.stdout, "Logging:EventLog:LogLevel:Default=None\n",
+        "both spellings of the key say None, whichever .NET reads first: {outcome:?}"
+    );
+}
+
+#[test]
 fn box_run_replaces_an_inherited_compiler_server_id() {
     let case = Case::new("box_run_compiler_server_id_inherited");
     let mut payload = box_payload(&case, "k", &[r".\servers.cmd"]);
