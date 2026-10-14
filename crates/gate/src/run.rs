@@ -16,8 +16,8 @@ use std::{fs, io};
 
 use gate_args::{Ceiling, ProgramSearch, RunRequest, Slot, batch_command_line, batch_refusal, command_line, is_batch_target, resolve_program};
 use gate_router::{
-    BuildSettings, BuildTarget, Place, RemoteRun, Route, build_settings, dotnet_builds, dotnet_target, sdk_build_target, without_no_build,
-    work_folder_key,
+    BuildSettings, BuildTarget, DEFAULT_OUTPUTS, Place, RemoteRun, Route, build_settings, dotnet_builds, dotnet_target, sdk_build_target,
+    without_no_build, work_folder_key,
 };
 use gate_state::{Estimate, FallbackReason, JournalEvent, KernelObject, RebuildOwner, RemoteTag, RunFacts, StateRoot, Verdict, log_hash, v1};
 use gate_watchdog::{Cores, Hint, SlotKind, hint};
@@ -43,6 +43,7 @@ use crate::log::Log;
 use crate::machine::{self, Machine, MachineWait, MachineWaited};
 use crate::nesting::{Nesting, Parent, enclosing_of};
 use crate::no_build::{self, NothingBack, Unfound, Worktree};
+use crate::outputs::{stale, walk::walk};
 use crate::remote::{self, RemoteCall, RemoteClient, RemoteOutcome, Split, git};
 use crate::resolve::{Environment, ResolvedRoot};
 use crate::route::{self, Placed};
@@ -707,12 +708,13 @@ enum Pass<'h> {
     On(&'h str, Duration, Split, Option<f64>),
 }
 
-/// A run whose verdict may pass: how long it ran, as its passed line says, and the ceiling it ran under in whole
-/// seconds.
+/// A run whose verdict may pass: how long it ran, as its passed line says, the ceiling it ran under in whole seconds,
+/// and the line a passing routed build says of the folders it left stale ([`stale_line`]).
 #[derive(Clone, Copy)]
 struct Passing<'h> {
     pass: Pass<'h>,
     ceiling: u64,
+    stale: Option<&'h str>,
 }
 
 /// How long a command ran: by the wall clock, in load-adjusted seconds, `None` once the sampler failed and they are
@@ -1014,8 +1016,16 @@ impl Run<'_> {
         if let Some(reason) = fallback {
             return self.fell_back(reason, &outcome, hold.taken.take(), console);
         }
-        self.leave_nothing_back(remote, &outcome, console);
-        Remotely::Ended(self.remote_ended(&remote.host, &outcome, started, figures.ceiling, console))
+        let wall = started.elapsed();
+        let words = unicode_words(&self.request.command);
+        self.leave_nothing_back(remote, &outcome, words.as_deref(), console);
+        let stale = stale_line(remote, &outcome, words.as_deref());
+        let passing = Passing {
+            pass: Pass::On(&remote.host, wall, outcome.split, outcome.adjusted),
+            ceiling: figures.ceiling,
+            stale: stale.as_deref(),
+        };
+        Remotely::Ended(self.remote_ended(&outcome, passing, wall, console))
     }
 
     /// Updates the worktree's nothing-back record after a routed run that ended on the builder, killed, interrupted or
@@ -1024,9 +1034,11 @@ impl Run<'_> {
     /// that passed with its outputs brought back ([`brought_everything_back`]) clears the record, as a passing build here
     /// of its words would ([`Run::clear_nothing_back`]); any other dotnet build writes it, an unknown counting as not
     /// brought back. The record names the builder and the configuration, framework and runtime the words set
-    /// ([`build_settings`]); one that cannot be written, or whose presence cannot be read, is said.
-    fn leave_nothing_back(&self, remote: &RemoteRun, outcome: &RemoteOutcome, console: &mut Console) {
-        let Some(words) = unicode_words(&self.request.command) else {
+    /// ([`build_settings`]); one that cannot be written, or whose presence cannot be read, is said. The command's
+    /// `words`, `None` when one is not valid Unicode ([`unicode_words`]), are the caller's, so one reading of them serves
+    /// this record and the stale line.
+    fn leave_nothing_back(&self, remote: &RemoteRun, outcome: &RemoteOutcome, words: Option<&[String]>, console: &mut Console) {
+        let Some(words) = words else {
             return;
         };
         let path = v1::nothing_back_path(&self.root.path, &remote.key);
@@ -1039,13 +1051,13 @@ impl Run<'_> {
                     return;
                 }
             }
-        } else if !dotnet_builds(&words) {
+        } else if !dotnet_builds(words) {
             return;
         } else if brought_everything_back(outcome) {
-            self.clear_nothing_back(HereWords::routed(remote, words), console);
+            self.clear_nothing_back(HereWords::routed(remote, words.to_vec()), console);
             return;
         }
-        let settings = build_settings(&words);
+        let settings = build_settings(words);
         let record = v1::NothingBackRecord {
             host: remote.host.clone(),
             configuration: settings.configuration,
@@ -1326,22 +1338,18 @@ impl Run<'_> {
         })
     }
 
-    /// Ends a run the client ran to its end: the verdict with the passed line on `host`, its markers not scanned when
-    /// the client killed the run or the console was interrupted, and the facts its release carries, with the adjusted
+    /// Ends a run the client ran to its end: the verdict with the passed line on the run's host and, when the verdict
+    /// passes, the line naming the folders the run left stale ([`stale_line`]); its markers not scanned when the
+    /// client killed the run or the console was interrupted, and the facts its release carries, with the adjusted
     /// seconds the box said. It is a kill only when the box's kill tag named one, whose kind is the verdict, or when the
     /// client killed it, by the kill line in the log.
-    fn remote_ended(&mut self, host: &str, outcome: &RemoteOutcome, started: Instant, ceiling: u64, console: &mut Console) -> Ended {
+    fn remote_ended(&mut self, outcome: &RemoteOutcome, passing: Passing<'_>, wall: Duration, console: &mut Console) -> Ended {
         let interrupted = self.host.interrupt.is_some_and(Interrupt::is_raised);
-        let wall = started.elapsed();
         // A client that wrote nothing left no log; the verdict reads one.
         if let Err(error) = OpenOptions::new().append(true).create(true).open(self.log.path()) {
             let problem = format!("cannot create the log {}: {error}", self.log.path().display());
             return self.gate_failed(&problem, None, console);
         }
-        let passing = Passing {
-            pass: Pass::On(host, wall, outcome.split, outcome.adjusted),
-            ceiling,
-        };
         match self.verdict(outcome.status, Some(passing), outcome.killed || interrupted, &[], console) {
             Ok(status) => {
                 let verdict = if let Some(kill) = outcome.box_killed {
@@ -1793,6 +1801,7 @@ impl Run<'_> {
         let passing = Passing {
             pass: Pass::Here(timing),
             ceiling: started.figures.ceiling,
+            stale: None,
         };
         match self.verdict(outcome.exited, Some(passing), unscanned, diagnostics, console) {
             Ok(status) => Ended {
@@ -1880,15 +1889,23 @@ impl Run<'_> {
             console.out(line);
         }
         match passing {
-            Some(Passing { pass, ceiling }) if status == 0 => {
-                if let Some(line) = self.cores_hint(pass) {
-                    console.note_out(&line);
-                }
-                console.note_out(&passed_line(pass, ceiling, &shown));
-            }
+            Some(passed) if status == 0 => self.say_passed(passed, &shown, console),
             _ => console.err(&format!("gate: FAILED (status {status}). Full output: {shown}")),
         }
         Ok(status)
+    }
+
+    /// Says what a passed run says: the line naming the folders it left stale when it has one, the cores hint, and the
+    /// passed line.
+    fn say_passed(&self, passing: Passing<'_>, shown: &str, console: &mut Console) {
+        let Passing { pass, ceiling, stale } = passing;
+        if let Some(line) = stale {
+            console.err(line);
+        }
+        if let Some(line) = self.cores_hint(pass) {
+            console.note_out(&line);
+        }
+        console.note_out(&passed_line(pass, ceiling, shown));
     }
 
     /// The cores line of a passed run that ran as `pass` says, when its slot did not fit ([`cores_hint_for`]).
@@ -2567,6 +2584,36 @@ impl HereWords {
 /// clear it, and its outputs are known to be brought back.
 fn brought_everything_back(outcome: &RemoteOutcome) -> bool {
     outcome.status == 0 && outcome.brought_back == Some(true)
+}
+
+/// The line a passing routed build says of the folders it left stale, `None` when it says none: the folders in the
+/// worktree the run's judging globs stop at that the run did not bring back. Only a dotnet build the gate treats as one
+/// ([`dotnet_builds`]) that ended on the builder has any, and the run's verdict decides whether it is said
+/// ([`Run::verdict`]), so a failed build, one whose log reports a failure among them, and a fallback (whose build ran
+/// here) say nothing. The judging globs are the run's own, the defaults beside them, even in a repo whose `outputs` list
+/// is empty ([`DEFAULT_OUTPUTS`]); a file the run brought back is no stale folder's. A tree that cannot be listed says
+/// why it could not.
+fn stale_line(remote: &RemoteRun, outcome: &RemoteOutcome, words: Option<&[String]>) -> Option<String> {
+    let words = words?;
+    if outcome.status != 0 || !dotnet_builds(words) {
+        return None;
+    }
+    let mut judging = remote.outputs.clone();
+    judging.extend(DEFAULT_OUTPUTS.iter().map(|glob| (*glob).to_owned()));
+    let brought_back = if brought_everything_back(outcome) {
+        remote.outputs.clone()
+    } else {
+        Vec::new()
+    };
+    let root = Path::new(&remote.root);
+    match stale::stale_folders(
+        |globs| walk(root, globs).map(|found| found.into_iter().map(|file| file.path).collect()),
+        &judging,
+        &brought_back,
+    ) {
+        Ok(folders) => stale::stale_line(&folders),
+        Err(reason) => Some(stale::could_not_list(&reason)),
+    }
 }
 
 /// The command's words as text, `None` when one of them is not valid Unicode.

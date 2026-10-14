@@ -4557,6 +4557,16 @@ fn build_case(name: &str) -> Case {
     case
 }
 
+/// A [`build_case`] whose routing file gives its repo no output globs, as the repo of the stale-output ticket has none:
+/// a routed build brings nothing back, and the defaults beside its own empty list are what judge what it left.
+fn no_globs_case(name: &str) -> Case {
+    let case = build_case(name);
+    let repo = repo_name(&case.folder().file_name().expect("the case folder has a name").to_string_lossy());
+    let routing = json!({ "host": HOST, "slots": 2, "repos": { &repo: ["*tool*", "*dotnet*"] }, "outputs": { &repo: [] } });
+    write_remote_json(&case, &routing.to_string());
+    case
+}
+
 /// A [`build_case`] with `record` planted as its worktree's nothing-back record.
 fn planted_case(name: &str, record: &str) -> Case {
     let case = build_case(name);
@@ -4820,6 +4830,101 @@ fn a_routed_build_after_a_withheld_run_sends_a_full_manifest_and_keeps_the_recor
     assert_eq!(worktree_text(&case, r"bin\app.txt"), "stale", "nothing comes back: {outcome:?}");
     assert!(pending_marker(&case).exists(), "the next run asks for every output again: {outcome:?}");
     assert_eq!(nothing_back(&case).as_deref(), Some(RELEASE_RECORD), "{outcome:?}");
+}
+
+/// A routed dotnet build of a repo with no output globs brings nothing back, so the PC's own stale `bin` folder is
+/// named; the nothing-back record is written as it was before the line.
+#[test]
+fn a_passing_routed_build_with_no_output_globs_names_the_folders_it_left_stale() {
+    let case = no_globs_case("client-stale-no-globs");
+    write(&case, r"bin\app.txt", "stale");
+
+    let outcome = passing_build(&case, &["ok", "ok"], &wrapped_build(&[], &RELEASE));
+
+    assert!(
+        outcome.stderr.lines().any(|line| line == "gate: routed build left stale: bin"),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        nothing_back(&case).as_deref(),
+        Some(RELEASE_RECORD),
+        "the record is written as before: {outcome:?}"
+    );
+}
+
+/// Everything the run built came back under its one glob, so the only judging glob left is the Godot default, which no
+/// file of this PC matches.
+#[test]
+fn a_routed_build_that_brought_everything_back_says_nothing_stale() {
+    let case = build_case("client-stale-all-back");
+    write(&case, r"bin\same.txt", "same");
+
+    let outcome = passing_build(&case, &["ok", "ok", "ok"], &wrapped_build(&WRITE_NEW, &RELEASE));
+
+    assert_eq!(worktree_text(&case, r"bin\new.txt"), "built", "the output came back: {outcome:?}");
+    assert!(!outcome.stderr.contains("gate: routed build left stale"), "{outcome:?}");
+}
+
+/// A routed build that failed says nothing of what it left stale: its failure is the news.
+#[test]
+fn a_failed_routed_build_prints_no_stale_line() {
+    let case = no_globs_case("client-stale-failed");
+    write(&case, r"bin\app.txt", "stale");
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &wrapped_build(&["exit", "1"], &RELEASE)));
+
+    assert_eq!(outcome.code, Some(1), "the build failed: {outcome:?}");
+    assert!(!outcome.stderr.contains("gate: routed build left stale"), "{outcome:?}");
+}
+
+/// The command exited 0 but wrote a failure marker in its log, so the gate's verdict is FAILED: the stale line is said
+/// of a run whose verdict passed, and this one's did not.
+#[test]
+fn a_routed_build_whose_log_reports_a_failure_prints_no_stale_line() {
+    let case = no_globs_case("client-stale-marker");
+    write(&case, r"bin\app.txt", "stale");
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+
+    let outcome = finish(client_gate(
+        &case,
+        "out.log",
+        &steps,
+        &wrapped_build(&["err", "error CS0001: boom"], &RELEASE),
+    ));
+
+    assert_eq!(outcome.code, Some(1), "the marker fails the run: {outcome:?}");
+    assert!(
+        outcome.stderr.contains("gate: command exited 0 but its log reports a failure"),
+        "{outcome:?}"
+    );
+    assert!(!outcome.stderr.contains("gate: routed build left stale"), "{outcome:?}");
+}
+
+/// A routed command that is no build writes no output a glob of a build's shape names, so nothing is called stale.
+#[test]
+fn a_routed_command_that_is_not_a_build_prints_no_stale_line() {
+    let case = no_globs_case("client-stale-not-a-build");
+    write(&case, r"bin\app.txt", "stale");
+
+    let outcome = passing_build(&case, &["ok", "ok"], &[r".\tool.exe", "out", "ran there"]);
+
+    assert!(!outcome.stderr.contains("gate: routed build left stale"), "{outcome:?}");
+}
+
+/// A build the builder turned away ran here and passed, so the run's own status would let the line print: nothing on the
+/// builder is stale of it, and the fallback's own path returns before the line is even computed.
+#[test]
+fn a_routed_build_that_fell_back_prints_no_stale_line() {
+    let case = no_globs_case("client-stale-fallback");
+    write(&case, r"bin\app.txt", "stale");
+    let steps = ssh_steps(&case, "ssh", &["fail-other"]);
+
+    let (pid, outcome) = finish_with_pid(client_gate(&case, "out.log", &steps, &wrapped_build(&[], &RELEASE)));
+
+    assert_eq!(outcome.code, Some(0), "the run here passed: {outcome:?}");
+    assert_eq!(fallbacks(&own(&case, pid)), ["unreachable"], "the build ran here: {outcome:?}");
+    assert!(!outcome.stderr.contains("gate: routed build left stale"), "{outcome:?}");
 }
 
 #[test]

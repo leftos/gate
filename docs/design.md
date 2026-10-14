@@ -327,6 +327,13 @@ The lines of a run that starts its command:
   In it `<w>` is the attempt's whole wall time; `<a>` is the load-adjusted time the builder counted for the command, the clock `--timeout` bounds; `<c>` is the run call's own wall time; the push is always named, the sync-back and the outputs fetch only when they ran, in the order they ran, each in whole seconds rounded half to even.
 
   With no figure from the builder (its sampler failed) the clause reads `load-adjusted unknown: the sampler failed` and the past-ceiling check uses `<c>`. The client's status is the gate's own, passed through as `N`.
+- The stale line, on stderr and in the log, before the passed line, when a routed dotnet build (verb `build`, `test`, `publish`, `pack`, `run` or `msbuild`, with no `--no-build` of its own) passed and did not bring everything back: `gate: routed build left stale: <folders>`.
+
+  The folders are every PC-side folder (no cap) that a judging glob matches and no brought-back glob covers, judged per file: a folder whose every matching file came back is not named. The judging globs are the run's `outputs`, or the default globs when the repo's entry is absent or `[]`, plus the defaults `**/bin/**` and `**/.godot/mono/temp/bin/**`. The folders are sorted, relative to the worktree root, `/`-separated, escaped and joined with `, `.
+
+  A glob names the folder where its last plain folder part ends, at the first place from the left where its plain parts match whole path components: `**/bin/**` and `**/bin/**/*.dll` name each `src/App/bin`, `out/**/App.dll` names `out`, `publish/App.exe` names `publish`; a glob with no plain folder part (`**`, `*.dll`, `**/*.dll`) names nothing. The line may name a folder this build did not touch.
+
+  It is not said after a failed build (an exit 0 whose log reports a failure included), a fallback or a command that is not a build, and it neither writes nor clears the nothing-back record. A walk of the worktree that fails says `gate: routed build may have left stale output; could not list it: <reason>` instead.
 - A critical gate, on stderr and in the log: the `waiting for the machine (critical)`, `still waiting for the machine (critical)`, `holds the machine (critical)` and `interrupted while waiting for the machine` lines, in [Critical drain and nesting](#critical-drain-and-nesting).
 - Nesting, on stderr and in the log, from the slot marker in the gate's environment: the `running under` (including the lend's `while a critical request drains`), `ignored GATE_SLOT_HELD`, `could not judge GATE_SLOT_HELD` and `does not cover` lines, the barrier's `waiting for a heavy slot behind the critical request` and `waiting for a light slot beside the critical request` lines, and the refusal of a critical gate, all in [Critical drain and nesting](#critical-drain-and-nesting).
 
@@ -1080,6 +1087,8 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
   The Rust remote client says `yes` only when the outputs archive installed complete (skipping at most files it cannot rewrite), or when the box packed nothing for a PC whose sent manifest held files, and no name was skipped (the box's `gate: remote outputs: skipped ` line); every other end of the outputs step is `no`, and an end that never reaches the outputs step is `unknown`. No and unknown count alike: the record is written.
 
   A routed dotnet build that passed (status 0) with its outputs all brought back removes the record instead, as a passing build here would: only when its words are whole (they name a solution, or nothing at the worktree root), its verb is not `msbuild`, and its `-c`, `-f` and `-r` match the record's; otherwise the record is left as it was, not rewritten. A record that cannot be removed says `gate: cannot remove <path>: <error>`, as the clear here does.
+
+  A passing routed dotnet build that did not bring everything back also says which folders it left stale ([Output lines](#output-lines)); that line reads the outputs outcome and never changes the record.
 
   A routed dotnet `--no-build` command whose word the builder dropped (the builder built, and nothing comes back) writes the record when none stands, whichever client ran it and whether or not the repo has output globs, with the builder and the `-c`, `-f` and `-r` its words set; it never rewrites or clears a record that stands.
 

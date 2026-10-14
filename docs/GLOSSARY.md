@@ -19,6 +19,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Box**: a builder; the word the gate's prose and its hidden `gate box` subcommand use.
 - **Box job**: the named job `Local\gate-remote-<key>-<12 hex>` that a `gate box run` puts its command in, named by the payload and stopped by `gate box stop`; it has no limits and no kill-on-close.
 - **Bridge commit**: a commit with a snapshot's tree whose parent is the previous snapshot, which the Rust remote client builds so a push can send only what changed; none when there is no previous snapshot.
+- **Brought-back glob**: an output glob of a routed run that brought everything back; a file one matches is never a stale folder's.
 - **Build id**: the text after `+` in the gate's version (`gate --version` prints `gate <package version>+<build id>`): the 12-hex head commit of the build, `<12-hex>-dirty.<8-hex>` for a build of changed tracked files (the 8 hex are the first 8 of the SHA-256 of `git diff HEAD --binary`), or `dev` for a build `tools/install.ps1` did not make with a commit. The client compares the whole version text, so another build of one package version is another version.
 - **Build server**: a long-lived compiler or MSBuild node process (`VBCSCompiler`, a `dotnet` running `VBCSCompiler.dll` or an MSBuild node) that builds share.
 - **Builder**: a remote Windows machine, named in a PC's own `remote.json`, that runs routed heavy commands with its own copy of `gate.exe`.
@@ -72,6 +73,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Interrupt**: a Ctrl+C or Ctrl+Break at the gate's console, which stops a queued gate or a running command (exit 0xC000013A unless the command exits on its own first).
 - **Journal**: the append-only `events.jsonl` in the state root, one JSON line per gate event (`queue`, `take`, `release` and others), with its rolled file and gzip archive.
 - **Journal mutex**: the named mutex `Local\gate-journal` (with the root hash under a non-default root) that every gate holds, waiting up to 2 s, while it appends to the journal, rolls it and archives.
+- **Judging glob**: an output glob that decides which folders the stale line may name: the run's `outputs` (the defaults when the repo's entry is absent or `[]`) and the defaults `**/bin/**` and `**/.godot/mono/temp/bin/**`.
 - **Keeper**: the `cmd.exe` `gate box run` starts on its own console while it is away on the donor's console, so its own console stays alive for it to return to.
 - **Key version**: `keyVersion` in the durations store, naming the rule set that made its keys; a store written under another one is rebuilt.
 - **Late arrival**: a PowerShell gate whose earliest claim or ticket `since` is later than the cutover flag's write time, because its caller bypassed the launcher; the cutover's drain names it.
@@ -136,6 +138,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Spawn lock**: the `gate-win32` lock held while the gate starts any process, so only the launched command inherits the copies of its handles.
 - **Stable line**: one of the three published `gate:` line forms callers may parse (STALLED, TIMED OUT, TRANSFER TIMED OUT or BACKSTOP; `waiting for the machine (critical)`; `Full output:`); every other `gate:` line is prose.
 - **Stage**: the install's folder `<worktree>\.tmp\<key>-<nonce>` (the outputs stage), where a fetched outputs archive is unpacked, its copies made and its members checked before any file is moved into the worktree.
+- **Stale folder**: a PC-side folder that a judging glob of a passing routed dotnet build stops at and whose matching files the run did not bring back; the `gate: routed build left stale: ...` line names them.
 - **Stall**: a kill for no progress (no output, CPU or new process) for the stall window, `--stall` seconds.
 - **Stand-in**: a live covered gate whose command holds a nested gate and whose own slot kind covers it, which that gate runs under in place of its ended parent gate, so one build tree holds one slot; only a covered marker with `kind` `heavy` or `light` is one.
 - **Start marker**: the stderr line `gate-remote-started: <nonce>` that `gate box run` says just before it launches the command; a run call that carried it is never retried and is not a pre-banner failure.
