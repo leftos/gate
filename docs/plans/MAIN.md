@@ -7,9 +7,8 @@
 - [ ] GATE-46 Remote slice 5: drained remote cutover and deleting the remote.ps1 bridge — Urgent · Remote
 - [ ] GATE-19 Remote: send a repo's declared sibling worktrees with a routed run — Urgent · Remote
 - [ ] GATE-206 A per-repo toolchain manifest: check and prepare builders, and check a fresh clone — Urgent · Remote
-- [ ] GATE-210 Toolchain 3: the box probes the needs the PC sends — Urgent · Remote
 - [ ] GATE-211 Toolchain 4: refuse a routed run with parity when the builder lacks a declared tool — Urgent · Remote
-- [ ] GATE-213 Toolchain 6: siblings declared under .gate/ — Urgent · Remote
+- [/] GATE-213 Toolchain 6: siblings declared under .gate/ — Urgent · Remote
 
 ## Remote
 
@@ -22,12 +21,17 @@
   - [ ] GATE-21 Remote: a critical pool on the builder for timing-sensitive gates (decide after measuring)
   - [ ] GATE-29 Sync-back: narrow the 'worktree changed during the run' refusal to changes that could matter
 - [ ] GATE-159 Box: choose the dotnet tool restore cap from its logged times
-- [/] GATE-187 Count a routed run's ceiling in load-adjusted time on the builder
 - [ ] GATE-195 Check git and gate push's ssh against the worktree, as the remote client checks ssh and dotnet
 - [ ] GATE-212 Toolchain 5: gate check, for this machine and for a builder
 - [ ] GATE-214 Toolchain 7: roll the manifest out to the gated repos
 - [ ] GATE-228 Merge feat/toolchain-manifest (#234)
 - [ ] GATE-230 gate push's cleanup can delete a builder's last known-good gate.exe.old
+- [ ] GATE-231 Run a routed command that needs a desktop in the builder's logged-on session
+- [ ] GATE-232 A routed build that brings back less than it built leaves non-dotnet readers on stale output, unwarned
+- [ ] GATE-233 Routed rustling-tulip tests fail on the builder only: process-tree kills and taskkill
+- [ ] GATE-234 Router: a drive-relative word and a climb inside a drive-path word are not seen as outside the worktree
+- [ ] GATE-235 Builder: folders above the work folder and on PATH may be writable by any local user
+- [ ] GATE-237 Routed outputs and the no-build check use git's drive spelling, not the caller's subst spelling
 
 ## Cutover sweep
 
@@ -56,3 +60,4 @@
 - [ ] GATE-185 A nested critical gate whose parent gate ends runs on uncounted
 - [ ] GATE-222 Run end misses a nested gate's job under a state root of its own when the ender is on the default root
 - [ ] GATE-225 Suite: covered-gate slot wait case fails under load (the slot frees before the wait)
+- [ ] GATE-236 gate.exe can exit non-zero after writing a passed verdict (seen once)
