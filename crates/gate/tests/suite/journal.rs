@@ -13,6 +13,7 @@ use flate2::read::GzDecoder;
 use gate_args::command_text;
 use gate_state::{JOURNAL_CAP_BYTES, KernelObject, StateRoot};
 use gate_win32::NamedMutex;
+use regex::Regex;
 use serde_json::Value;
 
 use crate::support::{Case, FAKE_TOOL, Outcome, assert_in_order, finish, none_words, run_words, shown, wait_for_file, wait_for_journal_line};
@@ -112,7 +113,21 @@ fn seed_near_cap(case: &Case) -> Vec<String> {
 }
 
 fn assert_quiet(outcome: &Outcome, code: i32) {
-    assert_eq!((outcome.code, outcome.stderr.as_str()), (Some(code), ""), "{outcome:?}");
+    assert_eq!(outcome.code, Some(code), "{outcome:?}");
+    let unexpected: Vec<&str> = outcome.stderr.lines().filter(|line| !is_expected_line(line)).collect();
+    assert!(
+        unexpected.is_empty(),
+        "stderr holds nothing but expected-time lines, yet it says {unexpected:?} in {outcome:?}"
+    );
+}
+
+/// Whether `line` is the expected-time line a gate says as it takes its slot for a key with history: `gate: expected
+/// about {mean} (usual {p50}, p90 {p90}, {runs} runs)`, every figure whole seconds or whole minutes, the estimate of a
+/// family key ending `runs of similar commands)`. A case that fills a key's history makes a later run say one.
+fn is_expected_line(line: &str) -> bool {
+    let pattern = Regex::new(r"^gate: expected about \d+ (?:s|min) \(usual \d+ (?:s|min), p90 \d+ (?:s|min), \d+ runs(?: of similar commands)?\)$")
+        .expect("the expected-time pattern is valid");
+    pattern.is_match(line)
 }
 
 #[test]
@@ -346,4 +361,22 @@ fn archive_is_written_on_roll() {
     assert!(archived.lines().all(|line| parsed(line)["event"] == "release"), "release lines only");
     assert_eq!(archived, text(&release_lines(&seed)));
     assert_eq!(lines_of(&case.root().join("events.jsonl")).len(), 2, "the take and the release");
+}
+
+#[test]
+fn a_quiet_run_may_say_its_expected_time() {
+    let case = Case::new("a_quiet_run_may_say_its_expected_time");
+    let command = exiting("out.log", "0");
+    let mut said = 0;
+
+    // The sixth run's key holds five runs, so it says its expected time as it takes its slot; the five before it, with
+    // four runs behind them at most, say nothing. A case that fills a key's history this way must not read the line as
+    // a problem.
+    for _ in 0..6 {
+        let outcome = case.run(&command);
+        said += outcome.stderr.matches("gate: expected about ").count();
+        assert_quiet(&outcome, 0);
+    }
+
+    assert_eq!(said, 1, "only the run with five runs behind it says its expected time");
 }
