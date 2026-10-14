@@ -1048,6 +1048,82 @@ fn box_seam_dotnet_limit_ms_is_an_unknown_word_without_the_feature() {
 
 #[cfg(feature = "test-seams")]
 #[test]
+fn box_seam_probe_limit_ms_is_read_before_the_verb() {
+    use std::ffi::OsString;
+
+    use gate_args::{BoxRequest, BoxSeams, BoxVerb, Invocation};
+
+    use crate::support::invocation;
+
+    let limited = |probe_limit_ms| {
+        Invocation::Box(BoxRequest {
+            verb: BoxVerb::Preflight,
+            payload: OsString::from("e30="),
+            seams: BoxSeams {
+                probe_limit_ms,
+                ..BoxSeams::default()
+            },
+        })
+    };
+    assert_eq!(
+        invocation(&["box", "--test-probe-limit-ms", "200", "preflight", "e30="]),
+        limited(Some(200))
+    );
+    assert_eq!(
+        invocation(&["box", "--test-probe-limit-ms=1500", "preflight", "e30="]),
+        limited(Some(1500))
+    );
+    assert_eq!(invocation(&["box", "preflight", "e30="]), limited(None), "no seam given, none set");
+}
+
+#[cfg(feature = "test-seams")]
+#[test]
+fn box_seam_probe_limit_ms_refuses_what_the_dotnet_limit_refuses() {
+    let rows: [(&[&str], &[&str]); 5] = [
+        (
+            &["box", "--test-probe-limit-ms", "1", "--test-probe-limit-ms=2", "preflight", "e30="],
+            &["gate: --test-probe-limit-ms is given twice"],
+        ),
+        (
+            &["box", "--test-probe-limit-ms", "0", "preflight", "e30="],
+            &["gate: --test-probe-limit-ms must be a whole number above 0, got '0'"],
+        ),
+        (
+            &["box", "--test-probe-limit-ms", "fast", "preflight", "e30="],
+            &["gate: --test-probe-limit-ms must be a whole number above 0, got 'fast'"],
+        ),
+        (
+            &["box", "--test-probe-limit-ms=", "preflight", "e30="],
+            &["gate: --test-probe-limit-ms needs a value"],
+        ),
+        (
+            &["box", "--test-probe-limit-ms"],
+            &["gate: --test-probe-limit-ms needs a value", BOX_USAGE],
+        ),
+    ];
+    for (words, want) in rows {
+        assert_eq!(problems(words), want, "{words:?}");
+    }
+}
+
+#[cfg(feature = "test-seams")]
+#[test]
+fn the_probe_limit_seam_is_refused_outside_gate_box() {
+    assert_eq!(
+        problems(&refs(&with(&RUN, &["--test-probe-limit-ms", "5", "--", "cmd"]))),
+        ["gate: unknown option --test-probe-limit-ms", "gate: unexpected argument 5"]
+    );
+}
+
+#[cfg(not(feature = "test-seams"))]
+#[test]
+fn box_seam_probe_limit_ms_is_an_unknown_word_without_the_feature() {
+    assert_eq!(problems(&["box", "--test-probe-limit-ms", "1000", "preflight", "e30="]), [BOX_USAGE]);
+    assert_eq!(problems(&["box", "--test-probe-limit-ms=1000", "preflight", "e30="]), [BOX_USAGE]);
+}
+
+#[cfg(feature = "test-seams")]
+#[test]
 fn box_seam_console_and_park_launch_are_read_before_the_verb() {
     use std::ffi::OsString;
     use std::path::PathBuf;
@@ -1106,6 +1182,7 @@ fn box_seam_console_and_park_launch_are_read_before_the_verb() {
                 park_launch: Some(PathBuf::from(r"X:\case\park")),
                 outputs_budget_bytes: None,
                 dotnet_limit_ms: None,
+                probe_limit_ms: None,
                 ..BoxSeams::default()
             },
         }),

@@ -101,6 +101,22 @@ pub(crate) fn location_word(location: &Location) -> String {
     word(&location.object())
 }
 
+/// The payload word of a preflight that asks the builder to probe tools: the location and `Needs`, an object of each
+/// tool's name and the minimum version the run needs of it (empty for any version), in the order of `needs`. With no
+/// needs there is no `Needs`, and the word is [`location_word`]'s.
+#[cfg_attr(not(test), expect(dead_code, reason = "the client sends no needs; unit tests exercise it"))]
+pub(crate) fn preflight_word(location: &Location, needs: &[(String, String)]) -> String {
+    let mut object = location.object();
+    if !needs.is_empty() {
+        let needs: Map<String, Value> = needs
+            .iter()
+            .map(|(name, minimum)| (name.clone(), Value::String(minimum.clone())))
+            .collect();
+        object.insert("Needs".to_owned(), Value::Object(needs));
+    }
+    word(&object)
+}
+
 /// The payload word of the outputs call: the location and the outputs archive's `Name`, `name`.
 pub(crate) fn outputs_word(location: &Location, name: &str) -> String {
     let mut object = location.object();
@@ -182,7 +198,7 @@ mod tests {
     use base64::engine::general_purpose::STANDARD;
     use serde_json::{Value, json};
 
-    use super::{BOX_EXE, LINE_LIMIT, Location, RunCall, capped, job_nonce, line, location_word, run_nonce, run_word};
+    use super::{BOX_EXE, LINE_LIMIT, Location, RunCall, capped, job_nonce, line, location_word, preflight_word, run_nonce, run_word};
 
     fn decoded(word: &str) -> Value {
         let bytes = STANDARD.decode(word).expect("the word is base64");
@@ -207,6 +223,26 @@ mod tests {
                 job: r"Local\gate-remote-app-1a2b3c4d-0123456789ab".to_owned(),
             }
         );
+    }
+
+    #[test]
+    fn a_preflight_with_needs_carries_them_in_order_and_one_without_is_the_location_alone() {
+        assert_eq!(
+            preflight_word(&location(), &[]),
+            location_word(&location()),
+            "no needs: the word is byte for byte the location's"
+        );
+        let needs = [
+            ("node".to_owned(), "24.0.0".to_owned()),
+            ("cargo-nextest".to_owned(), String::new()),
+            ("ffmpeg".to_owned(), "7".to_owned()),
+        ];
+        let with_needs = decoded(&preflight_word(&location(), &needs));
+        let mut expected = decoded(&location_word(&location()));
+        expected["Needs"] = json!({"node": "24.0.0", "cargo-nextest": "", "ffmpeg": "7"});
+        assert_eq!(with_needs, expected);
+        let order: Vec<&String> = with_needs["Needs"].as_object().expect("Needs is an object").keys().collect();
+        assert_eq!(order, ["node", "cargo-nextest", "ffmpeg"], "the needs keep their order");
     }
 
     #[test]

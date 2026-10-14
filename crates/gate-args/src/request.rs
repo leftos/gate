@@ -78,6 +78,9 @@ pub struct BoxSeams {
     /// How many processes the ending of a job `gate box run`'s ceiling killed reports left, in place of what the job
     /// holds after it; `None` without the feature.
     pub kill_leaves: Option<u64>,
+    /// How long `gate box preflight`'s tool probes may take together, in milliseconds, in place of the built-in 10 s;
+    /// `None` without the feature.
+    pub probe_limit_ms: Option<u64>,
 }
 
 /// What `gate box` was asked to do on the builder.

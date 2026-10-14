@@ -1,10 +1,12 @@
 //! `gate box preflight`, the first call of every routed run: readies the work folder and its bare repository as the
-//! PowerShell wrapper's `Initialize-WorkFolder` does, then says the version, boot and SDK lines.
+//! PowerShell wrapper's `Initialize-WorkFolder` does, then says the version, boot and SDK lines, and a line for each
+//! tool the payload's `Needs` names.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::sync::PoisonError;
+use std::thread;
 use std::time::Duration;
 
 use gate_args::BoxSeams;
@@ -13,6 +15,7 @@ use crate::answer::USAGE_STATUS;
 use crate::boxside::boot;
 use crate::boxside::forward::{ChildPipes, DRAIN, Drained, OutputLock};
 use crate::boxside::payload::Payload;
+use crate::boxside::probe;
 use crate::console::Console;
 use crate::environment::Variables;
 use crate::remote::git;
@@ -56,7 +59,8 @@ pub(crate) fn git_failed(step: &str, code: i32) -> Failed {
 }
 
 /// Readies the folders the payload's `Bare` and `Work` name, then says the three trailing lines, the SDK list read
-/// within `--test-dotnet-limit-ms` when `seams` gives it, else [`git::DOTNET_LIMIT`]; returns the status.
+/// within `--test-dotnet-limit-ms` when `seams` gives it, else [`git::DOTNET_LIMIT`], and the tool lines, probed within
+/// `--test-probe-limit-ms` when `seams` gives it, else [`probe::PROBE_LIMIT`]; returns the status.
 pub(crate) fn preflight(payload: &Payload, seams: &BoxSeams, console: &mut Console) -> u32 {
     let (bare, work) = match payload.path("Bare").and_then(|bare| Ok((bare, payload.work_folder()?.1))) {
         Ok(folders) => folders,
@@ -71,8 +75,42 @@ pub(crate) fn preflight(payload: &Payload, seams: &BoxSeams, console: &mut Conso
     }
     console.out(&format!("gate: remote version {}", build_version()));
     boot::say(console);
-    say_sdks(seams.dotnet_limit_ms.map_or(git::DOTNET_LIMIT, Duration::from_millis), console);
+    say_sdks_and_tools(payload, seams, console);
     0
+}
+
+/// Says the SDK line, the list read within `--test-dotnet-limit-ms` when `seams` gives it, else
+/// [`git::DOTNET_LIMIT`], then one line on stdout for each tool the payload's `Needs` names, in its order. The tools are
+/// probed within `--test-probe-limit-ms` when `seams` gives it, else [`probe::PROBE_LIMIT`], while dotnet lists the
+/// SDKs. A `Needs` that is not an object of texts is said on stderr, probes nothing, and fails nothing. The minimum each
+/// need carries is not read: the box reports, the client compares.
+fn say_sdks_and_tools(payload: &Payload, seams: &BoxSeams, console: &mut Console) {
+    let names: Result<Vec<String>, String> = payload
+        .pairs("Needs")
+        .map(|needs| needs.into_iter().map(|(name, _)| name).collect())
+        .map_err(|line| format!("{line}; probing nothing"));
+    let probe_limit = seams.probe_limit_ms.map_or(probe::PROBE_LIMIT, Duration::from_millis);
+    thread::scope(|scope| {
+        let probes = names
+            .as_ref()
+            .ok()
+            .filter(|names| !names.is_empty())
+            .map(|names| (names, scope.spawn(move || probe::probe(names, probe_limit))));
+        say_sdks(seams.dotnet_limit_ms.map_or(git::DOTNET_LIMIT, Duration::from_millis), console);
+        if let Err(line) = &names {
+            console.err(line);
+        }
+        let Some((names, probes)) = probes else {
+            return;
+        };
+        let found = probes.join().unwrap_or_else(|panic| {
+            let why = probe::panic_reason(&*panic);
+            names.iter().map(|name| (name.clone(), probe::Probed::Skipped(why.clone()))).collect()
+        });
+        for (name, probed) in found {
+            console.out(&probe::tool_line(&name, &probed));
+        }
+    });
 }
 
 /// The folder above `work`; the bare repository, said as created; the work folder's repository; its `origin`; its

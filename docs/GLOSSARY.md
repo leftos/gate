@@ -85,7 +85,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Lost connection**: a remote run call that ended with ssh's status 255 after the banner (or whose command itself exited 255); nothing is synced back, the client sends the stop, and a boot-time check tells a restarted builder from a dropped link.
 - **Manifest**: the PC's list of its files under a routed run's output globs (path, size, last write, SHA-256), sent to the box so it packs only the files the PC lacks or that differ.
 - **Marker**: a failure marker, a log line the built-in regex reads as a failure (such as `Build FAILED.` or `error CS1234`), which turns a zero exit into status 1.
-- **Need**: what a snapshot needs that the builder lacks, in the parity check: one `Need` of a kind (so far the .NET SDK), each said on its own mismatch line.
+- **Need**: in the parity check, what a snapshot needs that the builder lacks: one `Need` of a kind (so far the .NET SDK), each said on its own mismatch line. The preflight payload's `Needs` key is wider: every tool the PC wants probed with its minimum version, whether the builder has it or not.
 - **Nesting**: a gate started inside another gate's command (a build hook under a gated `git commit`), which reads its parent from the slot marker.
 - **No slot**: the slot kind `none` (`--slot none`), for a command that only dispatches or watches remote work: it takes no slot, mutex, ticket or claim, never waits, and still has its job, log, ceiling and watchdog.
 - **Notes**: the gate's own lines gathered while a run goes and appended to the end of its log.
@@ -105,7 +105,8 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Plain part**: a name of a path's part that Windows creates under that very name and git does not own: not empty, no trailing dot or space, none of `\ : < > " | ? *`, no control character or bidirectional mark, no `~` before a digit, not `.git` and not a device name. A plain path has at most 64 parts, each plain; a routed run brings back only plain paths.
 - **Pool**: the set of slots of one kind (heavy, light, remote); pools never wait on each other.
 - **Pre-banner failure**: an ssh call, or a git call over ssh, that ended before the builder's sshd sent its banner (status 255, or 128 for git, with empty stdout, no start marker and a first stderr line naming the banner exchange); the remote client retries it once after 2 s.
-- **Preflight**: the box's first call of a routed run (`gate box preflight`): it creates the bare repo and the work folder and reports the gate version, the boot time and the SDKs.
+- **Preflight**: the box's first call of a routed run (`gate box preflight`): it creates the bare repo and the work folder and reports the gate version, the boot time, the SDKs and the tools its payload's `Needs` name.
+- **Probe**: the box preflight's run of a tool's own version command (`node --version`) to learn whether the builder has the tool and which version, said as a `gate: remote tool` line; not a Probe by open.
 - **Probe by open**: reading whether a slot is held by opening its mutex's name: it is held while any handle to that name exists.
 - **Progress**: what resets the stall clock in a sample: the output size changed, the job's CPU reached 1% of one core over the stall window since the last progress, a new pid appeared, or a nested gate is paused.
 - **Pure crate**: a crate with no Windows types in its API that builds and unit-tests on Linux as well (`gate-state`, `gate-watchdog`, `gate-args`, `gate-router`).

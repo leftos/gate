@@ -441,6 +441,320 @@ fn preflight_does_not_run_a_dotnet_in_its_working_folder() {
     assert!(!marker.exists(), "the dotnet.cmd in the working folder ran");
 }
 
+/// A folder `stub` under the case folder holding each `(name, body)` of `tools` as `<name>.cmd`.
+fn tool_stubs(case: &Case, tools: &[(&str, &str)]) -> PathBuf {
+    let stub = case.folder().join("stub");
+    fs::create_dir_all(&stub).expect("the stub folder can be made");
+    for (name, body) in tools {
+        fs::write(stub.join(format!("{name}.cmd")), body).expect("a tool stub can be written");
+    }
+    stub
+}
+
+/// The preflight payload of `folders` with `Needs` set to `needs`, as the remote client sends a manifest's tools.
+fn needing(folders: &Folders, needs: &Value) -> String {
+    payload(&json!({
+        "Key": "k",
+        "Bare": folders.bare,
+        "Work": folders.work,
+        "Lock": format!("{}.lock", folders.work),
+        "Job": "unused",
+        "Needs": needs,
+    }))
+}
+
+/// `gate box preflight` of a payload needing `needs`, its `PATH` the stubs of `tools` then git's folder, so no dotnet is
+/// found and the sdks line says `none`.
+fn probed(case: &Case, needs: &Value, tools: &[(&str, &str)]) -> Outcome {
+    let folders = Folders::new(case);
+    let stub = tool_stubs(case, tools);
+    let mut command = box_command(
+        case,
+        &[
+            "box",
+            "--test-probe-limit-ms",
+            UNREACHED_PROBE_LIMIT_MS,
+            "preflight",
+            &needing(&folders, needs),
+        ],
+    );
+    command.env("PATH", path_with_git(&[stub]));
+    finish(command)
+}
+
+/// The probe bound every probe case passes but the one about the bound: long enough that no probe of a case reaches it
+/// however slow a loaded machine makes the run, so only that one case depends on a deadline.
+const UNREACHED_PROBE_LIMIT_MS: &str = "120000";
+
+/// The stdout lines of a passed preflight after its sdks line.
+fn after_sdks(outcome: &Outcome) -> Vec<&str> {
+    let printed = passed(outcome);
+    let sdks = printed.iter().position(|line| *line == "gate: remote sdks none");
+    assert!(sdks.is_some(), "the preflight says its sdks line: {outcome:?}");
+    printed[sdks.map_or(printed.len(), |sdks| sdks + 1)..].to_vec()
+}
+
+#[test]
+fn preflight_probes_a_need_after_the_sdks_line() {
+    let case = Case::new("preflight_probes_a_need_after_the_sdks_line");
+
+    let outcome = probed(&case, &json!({"node": "24"}), &[("node", "@echo v24.19.0\r\n")]);
+
+    assert_eq!(after_sdks(&outcome), ["gate: remote tool node 24.19.0"], "{outcome:?}");
+}
+
+#[test]
+fn preflight_says_one_line_per_need_in_the_payload_s_order() {
+    let case = Case::new("preflight_one_line_per_need");
+    let plugin = "@echo off\r\nif \"%1\"==\"nextest\" echo cargo-nextest 0.9.100 (abc 2026-01-01)\r\n";
+
+    let outcome = probed(
+        &case,
+        &json!({"rust": "1.89", "node": "", "cargo-nextest": "0.9.100", "pwsh": ""}),
+        &[
+            ("rustc", "@echo rustc 1.99.0 (b940084d7 2026-09-28)\r\n"),
+            ("node", "@echo v24.19.0\r\n"),
+            ("cargo-nextest", plugin),
+            ("pwsh", "@echo PowerShell 7.6.6\r\n"),
+        ],
+    );
+
+    assert_eq!(
+        after_sdks(&outcome),
+        [
+            "gate: remote tool rust 1.99.0",
+            "gate: remote tool node 24.19.0",
+            "gate: remote tool cargo-nextest 0.9.100",
+            "gate: remote tool pwsh 7.6.6",
+        ],
+        "{outcome:?}"
+    );
+}
+
+#[test]
+fn preflight_says_a_tool_it_does_not_find_is_missing() {
+    let case = Case::new("preflight_tool_missing");
+
+    let outcome = probed(&case, &json!({"pnpm": "10"}), &[]);
+
+    assert_eq!(after_sdks(&outcome), ["gate: remote tool pnpm missing"], "{outcome:?}");
+}
+
+#[test]
+fn preflight_a_tool_with_no_readable_version_is_present() {
+    let case = Case::new("preflight_tool_present");
+
+    let outcome = probed(
+        &case,
+        &json!({"ffmpeg": ""}),
+        &[(
+            "ffmpeg",
+            "@echo off\r\necho ffmpeg version N-117456-gabc Copyright (c) 2000-2026\r\necho built with gcc 14.2.0\r\n",
+        )],
+    );
+
+    assert_eq!(after_sdks(&outcome), ["gate: remote tool ffmpeg present"], "{outcome:?}");
+}
+
+/// The version is read from the first line alone: ffmpeg's second line names the compiler's version, not its own.
+#[test]
+fn preflight_reads_a_tool_s_version_from_its_first_line() {
+    let case = Case::new("preflight_tool_first_line");
+    let ffmpeg = "@echo off\r\necho ffmpeg version 9.0.2-full_build-www.gyan.dev Copyright (c) 2000-2026\r\necho built with gcc 14.2.0\r\n";
+
+    let outcome = probed(&case, &json!({"ffmpeg": "9"}), &[("ffmpeg", ffmpeg)]);
+
+    assert_eq!(after_sdks(&outcome), ["gate: remote tool ffmpeg 9.0.2"], "{outcome:?}");
+}
+
+/// The tool probes run while dotnet lists the SDKs: the dotnet stub answers only once the node stub has run, which a
+/// preflight that probed after the SDK read would never let it do. Neither stub's wait ends on a clock but fake-tool's
+/// own wait limit, which only the serial order reaches.
+#[test]
+fn preflight_probes_the_tools_while_dotnet_lists_the_sdks() {
+    let case = Case::new("preflight_probes_beside_dotnet");
+    let folders = Folders::new(&case);
+    let go = case.folder().join("node-ran");
+    let dotnet = format!("@echo off\r\n\"{FAKE_TOOL}\" wait \"{}\"\r\necho 8.0.404 [C:\\stub]\r\n", go.display());
+    let node = format!("@echo off\r\ntype nul >\"{}\"\r\necho v24.19.0\r\n", go.display());
+    let stub = tool_stubs(&case, &[("dotnet", &dotnet), ("node", &node)]);
+    let mut command = box_command(
+        &case,
+        &[
+            "box",
+            "--test-dotnet-limit-ms",
+            UNREACHED_PROBE_LIMIT_MS,
+            "--test-probe-limit-ms",
+            UNREACHED_PROBE_LIMIT_MS,
+            "preflight",
+            &needing(&folders, &json!({"node": ""})),
+        ],
+    );
+    command.env("PATH", path_with_git(&[stub]));
+
+    let outcome = finish(command);
+
+    let printed = passed(&outcome);
+    assert_eq!(
+        printed[printed.len().saturating_sub(2)..],
+        ["gate: remote sdks 8.0.404", "gate: remote tool node 24.19.0"],
+        "{outcome:?}"
+    );
+}
+
+/// A `cargo` on `PATH` that marks `marker` when it runs and answers as cargo-nextest would through it.
+fn cargo_decoy(marker: &Path) -> String {
+    format!(
+        "@echo off\r\n>\"{}\" echo ran\r\necho cargo-nextest 0.9.1 (decoy 2026-01-01)\r\n",
+        marker.display()
+    )
+}
+
+/// cargo-nextest is probed by running the plugin itself, never through cargo, which would read a `.cargo\config.toml`
+/// above its working folder and run the alias one defines: a cargo on `PATH` is never run.
+#[test]
+fn preflight_probes_cargo_nextest_as_the_plugin_and_never_through_cargo() {
+    let lacking = Case::new("preflight_cargo_without_nextest");
+    let marker = lacking.folder().join("cargo-ran");
+
+    let outcome = probed(&lacking, &json!({"cargo-nextest": ""}), &[("cargo", &cargo_decoy(&marker))]);
+
+    assert_eq!(after_sdks(&outcome), ["gate: remote tool cargo-nextest missing"], "{outcome:?}");
+    assert!(!marker.exists(), "cargo ran for the probe");
+
+    let having = Case::new("preflight_cargo_with_nextest");
+    let marker = having.folder().join("cargo-ran");
+    let plugin = "@echo off\r\nif \"%1\"==\"nextest\" if \"%2\"==\"--version\" echo cargo-nextest 0.9.148 (cd1d6d546 2026-10-07)\r\n";
+
+    let outcome = probed(
+        &having,
+        &json!({"cargo-nextest": "0.9.100"}),
+        &[("cargo", &cargo_decoy(&marker)), ("cargo-nextest", plugin)],
+    );
+
+    assert_eq!(after_sdks(&outcome), ["gate: remote tool cargo-nextest 0.9.148"], "{outcome:?}");
+    assert!(!marker.exists(), "cargo ran for the probe");
+}
+
+/// A tool that never answers is ended with its job at the bound `--test-probe-limit-ms` sets, and said skipped; the
+/// preflight still passes. Only the bound ends the probe, so no load changes what the preflight says.
+#[test]
+fn preflight_a_tool_that_does_not_answer_is_skipped_with_a_line() {
+    let case = Case::new("preflight_tool_hangs");
+    let folders = Folders::new(&case);
+    let go = Go(case.folder().join("node-go"));
+    let held = case.folder().join("node-held");
+    let hang = format!(
+        "@echo off\r\n\"{FAKE_TOOL}\" wait \"{}\" >\"{}\"\r\n",
+        go.path().display(),
+        held.display()
+    );
+    let stub = tool_stubs(&case, &[("node", &hang)]);
+    let needs = json!({"node": "24"});
+    let mut command = box_command(&case, &["box", "--test-probe-limit-ms", "1000", "preflight", &needing(&folders, &needs)]);
+    command.env("PATH", path_with_git(&[stub]));
+
+    let outcome = finish(command);
+
+    // A stub that started holds its output file open until its job's kill ends it; one the kill came first never made it.
+    if held.exists() {
+        wait_until_closed(&held);
+    }
+    assert_eq!(after_sdks(&outcome), ["gate: remote tool node skipped: no answer in 1 s"], "{outcome:?}");
+}
+
+/// A tool runs in the system folder, not the folder `gate box` was started in: the stub writes the folder it runs in,
+/// and a `pnpm.cmd` in the working folder, which no `PATH` folder names, is not run.
+#[test]
+fn preflight_runs_a_tool_in_the_system_folder_and_not_the_working_folder() {
+    let case = Case::new("preflight_tool_folder");
+    let ran_in = case.folder().join("node-folder");
+    let node = format!("@echo off\r\n>\"{}\" echo %CD%\r\necho v24.19.0\r\n", ran_in.display());
+    let marker = case.folder().join("pnpm-ran");
+    let decoy = format!("@echo off\r\n>\"{}\" echo ran\r\necho 10.0.0\r\n", marker.display());
+    fs::write(case.folder().join("pnpm.cmd"), decoy).expect("the pnpm in the working folder can be written");
+
+    let outcome = probed(&case, &json!({"node": "", "pnpm": ""}), &[("node", &node)]);
+
+    assert_eq!(
+        after_sdks(&outcome),
+        ["gate: remote tool node 24.19.0", "gate: remote tool pnpm missing"],
+        "{outcome:?}"
+    );
+    let ran_in = fs::read_to_string(&ran_in).expect("the stub wrote the folder it ran in");
+    let system = gate_win32::system_directory().expect("the system folder can be read");
+    let system = system.to_string_lossy();
+    assert!(
+        ran_in.trim_end().eq_ignore_ascii_case(system.trim_end_matches('\\')),
+        "{system}: {ran_in:?}"
+    );
+    assert!(!marker.exists(), "the pnpm.cmd in the working folder ran");
+}
+
+#[test]
+fn preflight_a_need_that_is_not_an_object_of_texts_is_said_and_the_preflight_passes() {
+    for (name, needs) in [("list", json!(["node"])), ("number", json!({"node": 24})), ("text", json!("node"))] {
+        let case = Case::new(&format!("preflight_bad_needs_{name}"));
+
+        let outcome = probed(&case, &needs, &[("node", "@echo v24.19.0\r\n")]);
+
+        assert_eq!(outcome.code, Some(0), "{name}: {outcome:?}");
+        assert_eq!(
+            lines(&outcome.stdout).last(),
+            Some(&"gate: remote sdks none"),
+            "{name}: nothing is probed: {outcome:?}"
+        );
+        let said = "gate: box payload Needs is not an object of texts; probing nothing";
+        assert!(outcome.stderr.lines().any(|line| line == said), "{name}: {outcome:?}");
+    }
+}
+
+#[test]
+fn preflight_a_tool_name_it_does_not_know_is_skipped() {
+    let case = Case::new("preflight_unknown_tool");
+    let marker = case.folder().join("nodejs-ran");
+    let nodejs = format!("@echo off\r\n>\"{}\" echo ran\r\necho v24.19.0\r\n", marker.display());
+
+    let outcome = probed(&case, &json!({"nodejs": "24"}), &[("nodejs", &nodejs)]);
+
+    assert_eq!(after_sdks(&outcome), ["gate: remote tool nodejs skipped: unknown tool"], "{outcome:?}");
+    assert!(!marker.exists(), "a program the payload names is never run");
+}
+
+#[test]
+fn preflight_godot_is_skipped_with_no_probe() {
+    let case = Case::new("preflight_godot_skipped");
+    let marker = case.folder().join("godot-ran");
+    let godot = format!("@echo off\r\n>\"{}\" echo ran\r\necho 4.7.2.stable\r\n", marker.display());
+
+    let outcome = probed(&case, &json!({"godot": "4.7.2"}), &[("godot", &godot)]);
+
+    assert_eq!(
+        after_sdks(&outcome),
+        ["gate: remote tool godot skipped: no probe for godot"],
+        "{outcome:?}"
+    );
+    assert!(!marker.exists(), "godot is not run");
+}
+
+#[test]
+fn preflight_without_needs_says_nothing_after_the_sdks_line() {
+    for (name, needs) in [("empty", json!({})), ("null", Value::Null)] {
+        let case = Case::new(&format!("preflight_no_needs_{name}"));
+
+        let outcome = probed(&case, &needs, &[("node", "@echo v24.19.0\r\n")]);
+
+        assert_eq!(after_sdks(&outcome), Vec::<&str>::new(), "{name}: {outcome:?}");
+    }
+    let case = Case::new("preflight_no_needs_absent");
+    let folders = Folders::new(&case);
+    let stub = tool_stubs(&case, &[("node", "@echo v24.19.0\r\n")]);
+
+    let outcome = gate_box(&case, "preflight", &folders.payload(), Some(&path_with_git(&[stub])));
+
+    assert_eq!(after_sdks(&outcome), Vec::<&str>::new(), "absent: {outcome:?}");
+}
+
 #[test]
 fn preflight_version_line_is_the_build_version() {
     let case = Case::new("preflight_version_line_is_the_build_version");

@@ -1544,6 +1544,8 @@ A routed run therefore moves to one long-lived connection carrying every verb, `
 
 The payload is one base64 word (standard alphabet, padded) of UTF-8 JSON holding the wrapper's keys: `Key`, `Bare`, `Work`, `Lock`, `Index`, `OutputFolder` and `Job`, and for `run` also `Command`, `Subfolder`, `Identity`, `Outputs`, `Nonce`, `OutputsFull`, `Timeout` and `Host`, and for `outputs` also `Name`. `inflight` reads only `Root`.
 
+`preflight` also reads an optional `Needs`, an object of tool name to minimum version text (`""` for any version), which the PC builds with `remote::payload::preflight_word` from the tools it wants probed; it is omitted when there are none, so a payload without needs is the same bytes as before.
+
 Unknown keys are ignored, and `Outputs`, `OutputsFull` and `OutputFolder`, which the outputs transport owns (GATE-44), are read only by `run` (the outputs) and `outputs` (`Name`, `OutputFolder`); `preflight`, `stop` and `boot` ignore them.
 
 `Timeout` is the run's ceiling in whole seconds, 1 to 2147483647, which the box counts in load-adjusted time; absent or null means no box ceiling and no adjusted line, and anything else is refused before the lock with `gate: box payload Timeout is not a whole number of seconds` and exit 2. `Host` is the PC's `remote.json` name for the builder, which the box's kill lines name, control characters escaped; absent leaves it out of them.
@@ -1564,11 +1566,11 @@ The box's ceiling has three seams: `--test-box-sample-ms <n>` replaces the 5 s s
 
 `--test-box-kill-leaves <n>` stands in for the number of processes the last ending of a ceiling or backstop kill leaves (a whole number above 0), so the box says its note for a job that is still not ended.
 
-The other two box seams are `--test-outputs-budget-bytes <n>`, which replaces the 50 GiB outputs budget of the box's trim, in bytes, and `--test-dotnet-limit-ms <n>`, which replaces the 30 s bound of the preflight's `dotnet --list-sdks` read, in milliseconds.
+The other three box seams are `--test-outputs-budget-bytes <n>`, which replaces the 50 GiB outputs budget of the box's trim, in bytes, `--test-dotnet-limit-ms <n>`, which replaces the 30 s bound of the preflight's `dotnet --list-sdks` read, in milliseconds, and `--test-probe-limit-ms <n>`, which replaces the 10 s shared bound of the preflight's tool probes, in milliseconds.
 
 A seam is refused as the `gate run` seams are: no value, given twice, and a value outside its rule (`gate: --test-outputs-budget-bytes must be a whole number above 0, got '<v>'`, `... must be at most 2147483647 ...`, `... needs a value`, `... is given twice`).
 
-The rules: a whole number above 0 and at most 2147483647 for the heartbeat, the sample period, the outputs budget, the dotnet limit and the kill's leftover count, 1 to 100 for `--test-box-free-percent`, `true` or `false` for `--test-box-sampler-fail`. Without the feature each word gets the box usage line.
+The rules: a whole number above 0 and at most 2147483647 for the heartbeat, the sample period, the outputs budget, the dotnet limit, the probe limit and the kill's leftover count, 1 to 100 for `--test-box-free-percent`, `true` or `false` for `--test-box-sampler-fail`. Without the feature each word gets the box usage line.
 
 The box gives each run's command its own build servers: the command's environment is the box's own with `SharedCompilationId` and `MSBUILDNODEHANDSHAKESALT` set to `gate-box-<Nonce>` (the payload's `Nonce`), `MSBUILDUSESERVER=0`, `DOTNET_CLI_USE_MSBUILD_SERVER=0` and `MSBUILDDISABLENODEREUSE=1`, each replacing any inherited value (names compared case-insensitively).
 
@@ -1587,7 +1589,7 @@ Built verbs:
   When the time cannot be read it prints `gate: remote could not read the boot time: <message>` on stderr and exits 1, so the client's boot query after a lost connection says the call failed rather than taking a status 0 with no time. The preflight says the same line and goes on: an unreadable boot time fails no preflight, and the client then makes no boot query.
 - **`preflight`** creates the bare repo at `Bare` when missing and the work folder at `Work` with `.git`, `origin` set to `Bare`, `core.autocrlf false` and `core.eol lf`, and writes `.git\objects\info\alternates` as `<Bare with />/objects` and a line feed, without a byte order mark, only when the file is missing or empty.
 
-  It prints on stdout, in order: `gate: remote created <Bare>` (only when it created the bare repo), `gate: remote version <gate version>` (the same text as `gate --version` after `gate `, build id included), the boot line, and `gate: remote sdks <v1,v2|none>`; git's own output passes through. A payload without `Bare` or `Work` prints `gate: box payload lacks <key>` and exits 2.
+  It prints on stdout, in order: `gate: remote created <Bare>` (only when it created the bare repo), `gate: remote version <gate version>` (the same text as `gate --version` after `gate `, build id included), the boot line, `gate: remote sdks <v1,v2|none>`, and one `gate: remote tool <tool> ...` line for each tool of the payload's `Needs` (Tool probes, below); git's own output passes through. A payload without `Bare` or `Work` prints `gate: box payload lacks <key>` and exits 2.
 - A failing git step prints `gate: remote <step> failed (status <n>)` and exits with that status; a git that cannot start prints `gate: remote <step> failed: <OS message>` and exits 1. The steps are `git init --bare`, `git init`, `git remote add`, `git config core.autocrlf` and `git config core.eol`.
 
   A folder or file that cannot be made prints `gate: remote could not create the folder <path>: <error>` or `gate: remote could not write <path>: <error>` and exits 1. An SDK list that cannot be read prints `gate: remote could not read the SDK list: <message>`, omits the sdks line and still exits 0; the client then skips the parity check.
@@ -1597,6 +1599,18 @@ Built verbs:
   The box has no interrupt; the job is killed at a 30 s bound (`--test-dotnet-limit-ms` lowers it).
 
   Past the bound the line reads `gate: remote could not read the SDK list: dotnet --list-sdks did not answer in 30 s`. The other `<message>`s are `dotnet --list-sdks wrote more than 16 MiB`, `dotnet --list-sdks exited with status <n>` and `cannot run dotnet: <why>`.
+
+  Tool probes (`boxside/probe.rs`): for each tool of the payload's `Needs`, in payload order, the box runs a probe and says one line on stdout after the sdks line, all once every probe has ended: `gate: remote tool <tool> <version>`, `gate: remote tool <tool> present` or `gate: remote tool <tool> missing`, or `gate: remote tool <tool> skipped: <why>`. The box only reports; the PC compares the minimums.
+
+  The probes are `rustc --version` for `rust`, `cargo-nextest nextest --version` for `cargo-nextest` (the plugin directly, never through `cargo`, so no `.cargo\config.toml` above the folder can alias it), `<name> --version` for `node`, `pnpm` and `pwsh`, and `ffmpeg -version`. `godot` has no probe.
+
+  Each program is found through `PATH` and `PATHEXT` as `dotnet` is (a `.cmd` shim runs through the system folder's cmd.exe; a `.ps1` is not run) and runs in the system folder on a hidden console, in the bounded runner of `remote/git.rs` (`program_output`). The probes run in parallel, started at the same time as `dotnet --list-sdks`, under one shared 10 s deadline (`--test-probe-limit-ms` lowers it); one still running at the deadline is killed with its process tree, and one with no time left is skipped without being launched.
+
+  The version is read from the first non-blank line of stdout, else of stderr: the first run of two or more dot-separated numbers after an optional `v`, its first three kept. A line with no such run, a number longer than 10 digits or a non-zero exit gives `present`; a program that cannot be found gives `missing`.
+
+  The `<why>` of a skip is `unknown tool`, `no probe for godot`, `no answer in <n> s` (or `<n> ms` when the limit is not whole seconds), `no answer in <limit>, and could not be stopped: <error>`, `the probe failed` (followed by `: <panic text>` when the probe panicked), or the runner's failure text: `cannot run <program>: <why>`, `<program> <args> wrote more than 16 MiB` or `cannot run <program>: cannot read the system folder: <error>`.
+
+  A payload whose `Needs` is not an object of texts prints `gate: box payload Needs is not an object of texts; probing nothing` on stderr, probes nothing and still exits 0.
 - **`run`** runs the payload's `Command` (a list of texts) in `Work`, and exits with the command's own whole 32-bit status after a successful run. Its stdout is the command's stdout, LF-terminated; its stderr is the command's stderr plus the box's own lines.
 
   The heartbeat: `gate box run` writes `gate-remote-heartbeat: <cpu ms>` on stderr every 5 s, on `gate-watchdog`'s `BeatClock` and `Pump`. Before the command starts (from just before the checkout) and after the command's wait ends it is not CPU-gated, so every period writes a beat, the first one period after it begins.
