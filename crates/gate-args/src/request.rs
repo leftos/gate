@@ -157,12 +157,6 @@ pub struct TestSeams {
     /// How long the remote client's `dotnet --list-sdks` of this PC may take before it is killed and the SDK list
     /// counts as unreadable, in place of 30 s.
     pub dotnet_limit_ms: Option<u64>,
-    /// The folder the watched command's build servers must live under, `None` for every process on the machine: in a
-    /// suite whose cases run at once, it keeps one case's build server out of another's watch.
-    pub servers_under: Option<PathBuf>,
-    /// One more image file name the watch reads as a compiler server's, as it reads `VBCSCompiler.exe`: a case's server
-    /// that no PowerShell gate elsewhere on the machine classifies, and so none moves. Only with `servers_under`.
-    pub server_image: Option<String>,
     /// Make a routed run stop once its client has made the snapshot and bridge commits and said them, with status 0
     /// and nothing pushed.
     pub remote_snapshot: bool,

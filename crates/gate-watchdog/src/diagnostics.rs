@@ -78,7 +78,7 @@ pub struct SampleFacts {
     pub wsl_vm: WslVm,
     /// The processes in the job.
     pub processes: u32,
-    /// The CPU time of the processes outside the job under its members, the build servers left out.
+    /// The CPU time of the processes outside the job under its members.
     pub escaped_cpu: Ticks,
 }
 

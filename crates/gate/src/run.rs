@@ -1370,16 +1370,10 @@ impl Run<'_> {
             .flatten()
     }
 
-    /// What a take of the run's slot is journalled and claimed with, naming `parent_pid` ([`Taker`]), with the parts the
-    /// caller borrows beside it: the survey the run reads the other gates with, where it keeps the slot it takes once
-    /// a covering parent ends ([`Run::late`]), and its covered marker ([`Run::covered`]). The claim carries `expected`
-    /// and the run's `ceiling`.
-    fn taker<'t>(
-        &'t mut self,
-        parent_pid: Option<u32>,
-        expected: Option<&'t Map<String, Value>>,
-        ceiling: u64,
-    ) -> (Taker<'t>, &'t mut Survey, &'t mut Option<LateSlot>, &'t mut Option<Covered>) {
+    /// What a take of the run's slot is journalled and claimed with, naming `parent_pid` ([`Taker`]), with the survey
+    /// the run reads the other gates with, which the caller borrows beside it. The claim carries `expected` and the
+    /// run's `ceiling`.
+    fn taker<'t>(&'t mut self, parent_pid: Option<u32>, expected: Option<&'t Map<String, Value>>, ceiling: u64) -> (Taker<'t>, &'t mut Survey) {
         let taker = Taker {
             root: self.root,
             gate: &self.gate,
@@ -1391,7 +1385,26 @@ impl Run<'_> {
             parent_pid,
             expected,
         };
-        (taker, &mut self.survey, &mut self.late, &mut self.covered)
+        (taker, &mut self.survey)
+    }
+
+    /// The [`Taker`] of a run whose watch may take a slot once a covering parent ends, naming `parent_pid`, with the
+    /// parts the caller borrows beside it: where the run keeps that slot ([`Run::late`]), and its covered marker
+    /// ([`Run::covered`]). A run a parent's slot covers has no durations, so its late take's claim expects nothing; the
+    /// claim carries the run's `ceiling`.
+    fn late_taker(&mut self, parent_pid: Option<u32>, ceiling: u64) -> (Taker<'_>, &mut Option<LateSlot>, &mut Option<Covered>) {
+        let taker = Taker {
+            root: self.root,
+            gate: &self.gate,
+            request: self.request,
+            ceiling,
+            log: &self.log,
+            tag: self.tag.as_ref(),
+            journal: &mut self.journal,
+            parent_pid,
+            expected: None,
+        };
+        (taker, &mut self.late, &mut self.covered)
     }
 
     /// Waits its turn for a slot of `pool` and takes it into `held` the moment it has it, then journals the take, with
@@ -1457,7 +1470,7 @@ impl Run<'_> {
         let took = Instant::now();
         let parent_pid = self.nesting.uncovering().map(|parent| parent.pid);
         let (figures, resolved) = Figures::resolved(self.request.timeout, estimate.as_ref());
-        let (mut taker, survey, _, _) = self.taker(parent_pid, expected.as_ref(), figures.ceiling);
+        let (mut taker, survey) = self.taker(parent_pid, expected.as_ref(), figures.ceiling);
         taker.took(taken, pool, waited, survey, console);
         say_expected(estimate.as_ref(), resolved, console);
         Taking::Took(took, figures)
@@ -1633,8 +1646,8 @@ impl Run<'_> {
     /// Watches the started command to its exit, a kill or a Ctrl+C, then reaches the verdict. Should the gate fail
     /// or panic first, the job is terminated, so the command does not outlive the run. The command runs under `figures`.
     fn watched(&mut self, job: &Job, running: &Running, start: &Start, figures: Figures, console: &mut Console) -> Ended {
-        // Copies of the run's own references, so the stopper holds no borrow of the run while it is watched.
-        let (request, root) = (self.request, self.root);
+        // A copy of the run's own reference, so the stopper holds no borrow of the run while it is watched.
+        let root = self.root;
         let recorded = RefCell::new(Recorded::default());
         let started = Started {
             job,
@@ -1644,11 +1657,7 @@ impl Run<'_> {
         };
         let mut stopper = Stopper {
             ends: Ender {
-                reach: Reach {
-                    job,
-                    server_image: request.test_seams.server_image.as_deref(),
-                    root: &root.root,
-                },
+                reach: Reach { job, root: &root.root },
                 running,
             },
             recorded: &recorded,
@@ -1676,8 +1685,7 @@ impl Run<'_> {
         let (nesting, host, arrived, lent) = (self.nesting, self.host, self.arrived, self.lent);
         let Figures { ceiling, usual } = started.figures;
         let covering = nesting.covering();
-        // A run a parent's slot covers has no durations, so its late take's claim expects nothing.
-        let (taker, survey, held, covered) = self.taker(covering.map(|parent| parent.pid), None, ceiling);
+        let (taker, held, covered) = self.late_taker(covering.map(|parent| parent.pid), ceiling);
         let (root, gate, request, log) = (taker.root, taker.gate, taker.request, taker.log);
         let late = match (covering, Takes::of(request.slot), covered) {
             (Some(parent), Takes::Pool(pool), Some(covered)) => {
@@ -1705,7 +1713,6 @@ impl Run<'_> {
             root,
             gate,
             hands_on: nesting.handed_on(lent),
-            survey,
             recorded,
             late,
         };
@@ -1903,14 +1910,9 @@ impl Run<'_> {
         Ok((found, tail_without_block(self.log.tail(wanted)?, diagnostics, self.request.tail)))
     }
 
-    /// What a kill of the command in `job` reaches: the job, the one more compiler server image it leaves running
-    /// (`--test-server-image`), as the watch reads it, and the state root that names a gate's job.
+    /// What a kill of the command in `job` reaches: the job, and the state root that names a gate's job.
     fn reach<'s>(&'s self, job: &'s Job) -> Reach<'s> {
-        Reach {
-            job,
-            server_image: self.request.test_seams.server_image.as_deref(),
-            root: &self.root.root,
-        }
+        Reach { job, root: &self.root.root }
     }
 
     /// What ends the command `running` in `job`: the job with what its kill reaches outside it, and the command.
@@ -2019,7 +2021,7 @@ fn earlier(recorded: Option<&RefCell<Recorded>>) -> Found {
 }
 
 /// Terminates the job `ends` names after a failure of the gate's own, ends the processes that left it, those the watch
-/// `recorded` with them, but the build servers, and gives the command a moment to end.
+/// `recorded` with them, and gives the command a moment to end.
 fn stop(ends: &impl Ends, recorded: Option<&RefCell<Recorded>>, console: &mut Console) {
     match ends.terminate(STOPPED, STOP_WAIT, earlier(recorded)) {
         Ok(reached) => say_problems(&reached, console),
@@ -2032,7 +2034,7 @@ fn stop(ends: &impl Ends, recorded: Option<&RefCell<Recorded>>, console: &mut Co
 }
 
 /// Terminates the job `ends` names of a killed command, which held `processes` processes, ends the processes that left
-/// it, those the watch `recorded` with them, but the build servers, and gives the command a moment to end.
+/// it, those the watch `recorded` with them, and gives the command a moment to end.
 fn kill(ends: &impl Ends, recorded: Option<&RefCell<Recorded>>, processes: u32, console: &mut Console) {
     match ends.terminate(STOPPED, STOP_WAIT, earlier(recorded)) {
         Ok(reached) => {
@@ -2052,7 +2054,7 @@ fn kill(ends: &impl Ends, recorded: Option<&RefCell<Recorded>>, processes: u32, 
 /// own; its own status, with whatever it left in its job terminated and the processes that left it ended: those that
 /// first look found and those a second look at the terminate finds. One still running then has its job terminated and
 /// those processes ended the same way, and the status is `STATUS_CONTROL_C_EXIT`. The processes the watch `recorded`
-/// outside the job are ended with those the first look found. The build servers outside the job are left running.
+/// outside the job are ended with those the first look found.
 fn interrupted(ends: &impl Ends, recorded: Option<&RefCell<Recorded>>, console: &mut Console) -> i64 {
     console.err("gate: interrupted; stopping the command");
     let early = ends.look(earlier(recorded));
@@ -2728,7 +2730,7 @@ mod tests {
             departed: Vec::new(),
         };
         let recorded = RefCell::new(Recorded::default());
-        recorded.borrow_mut().record(look, |_| false);
+        recorded.borrow_mut().record(look);
         recorded
     }
 

@@ -1,4 +1,4 @@
-//! A process's priority class read and set: what the build servers' rule moves a server between.
+//! A process's priority class read and set: what a watch lowers the command's processes still at High with.
 
 #![cfg(windows)]
 #![expect(clippy::expect_used, reason = "a test that cannot start or wait for its child must fail loudly")]
@@ -11,7 +11,7 @@ use std::process::{Child, Command, Stdio};
 
 use gate_win32::{Priority, priority_of, set_priority};
 
-/// A child of this test that lives until it is killed: `ping` is nobody's build server and touches nothing. It is
+/// A child of this test that lives until it is killed: `ping` touches nothing. It is
 /// started directly, so killing the child ends `ping` itself.
 fn child() -> Child {
     Command::new("ping")

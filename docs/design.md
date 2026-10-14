@@ -325,8 +325,6 @@ A `none` run is in no pool: it takes no slot, mutex, ticket, claim or covered ma
 
 It still has its job, so `gate stop-tree` reaches it, and it runs at BelowNormal. A critical drain does not wait for it, it is not in the take's `otherClaims`, and the barrier never holds it.
 
-A critical gate moves a `none` run's build servers as it moves an ungated build's, since the run holds no claim: a build belongs under a nested gate with a slot, whose claim protects its servers.
-
 ### Counts
 
 The default count of a pool is `max(1, floor((logical processors - 1) / threads))`, with threads 4 for heavy and 2 for light (kept, S2). `slot-counts.json` in the state root overrides either count with a whole number from 1 to 64. It is re-read on every pass of the wait loop, so a count changed while gates wait applies to them, and a gate holding a slot the new count leaves out keeps it.
@@ -788,7 +786,7 @@ What `gate.exe` does of it today is part A, nesting under the slot marker (N1, K
 
 All kept, with each knob's default unchanged:
 
-- The sampler (W1): every 5 s while the command runs, it reads, in order, the pause state, the log and `.err` sizes, the job's pids, one process snapshot and the build servers, then the WSL VM, the system times and the job's accounting; nothing goes through WMI.
+- The sampler (W1): every 5 s while the command runs, it reads, in order, the pause state, the log and `.err` sizes, the job's pids, one process snapshot, then the WSL VM, the system times and the job's accounting; nothing goes through WMI.
 
   Each sample carries two stamps: `began`, taken before its reads, and `at`, taken after them, next to the system times and the job's accounting. The `interval`, the load-adjusted clock, the paused time, the free share and the exit use `at`; the PowerShell gate stamps once, before its reads.
 - Stall (W2): no output, no CPU (at least 1% of one core over the window), no new process in the job, no WSL VM CPU and no nested gate paused behind a critical request, for `--stall` seconds: `gate: STALLED: ...`.
@@ -801,7 +799,7 @@ All kept, with each knob's default unchanged:
 
   The stall clock also resets, for a `wsl` command, when the WSL VM's CPU counts as progress (see WSL below).
 
-  A build server outside the command's job is not progress: only the job's own processes count, a per-run server inside the job included.
+  A build server outside the command's job and its escaped tree is not progress: only the job's own processes and the escaped tree count, a per-run server inside the job or under a member included.
 - The load-adjusted clock and the ceiling (W3): each sample adds `interval * free`, the interval running between the samples' `at` stamps, to the clock `--timeout` runs on (for `auto:<n>`, the ceiling the take resolved; the backstop below uses it too); a sample taken while a nested gate is paused adds to the paused time instead; `gate: TIMED OUT after ...`.
 
   The free share is 1 for a High-priority command; otherwise `busy` is the share of the interval's system time that was not idle, the cores others held are `max(0, busy * cores - own cores)` with `own cores` the CPU gained over the interval by the job and by the escaped tree (below), and `free = clamp((cores - others) / demand, 0.05, 1)`. `demand` is every core, `min(cores, 2)` for a light gate, or 1 for a gate on no slot, so its ceiling stays near wall time on a loaded PC.
@@ -817,25 +815,11 @@ All kept, with each knob's default unchanged:
 
   A read that fails is said once per run, by the first sample whose read fails, on stderr and in the log: `gate: WSL VM CPU unavailable (<message>); retrying each sample, and until a read succeeds this wsl command counts only output and job CPU as progress`. A failed read at the watch's start alone says nothing, and every sample retries.
 - A command that exits on its own before the kill keeps its status (W7).
-- Build servers: classification (B1), their priority (B2), and the per-run server settings of [Command launching](#command-launching) (the run id as `SharedCompilationId` and `MSBUILDNODEHANDSHAKESALT`, `MSBUILDUSESERVER=0`, `DOTNET_CLI_USE_MSBUILD_SERVER=0`, `MSBUILDDISABLENODEREUSE=1`), so each run has its own compiler server and MSBuild nodes (B3).
+- Build servers: the per-run server settings of [Command launching](#command-launching) (the run id as `SharedCompilationId` and `MSBUILDNODEHANDSHAKESALT`, `MSBUILDUSESERVER=0`, `DOTNET_CLI_USE_MSBUILD_SERVER=0`, `MSBUILDDISABLENODEREUSE=1`), so each run has its own compiler server and MSBuild nodes. No gate classifies, lowers or raises a build server.
 
-  Every sample reads the build servers, in the command's job and outside it, so Priority (B2) below can move them: `VBCSCompiler.exe`, `dotnet.exe` whose command line names `VBCSCompiler.dll`, and `MSBuild.dll` with `nodemode`. It takes one ToolHelp snapshot, which carries no command lines, and each process's times; a command line is read once per (pid, start) through `proc_table::command_line_of(pid)` (OpenProcess and ReadProcessMemory), never through a child process. A process the gate cannot read is skipped.
+  The stall check and the load figures count the job's own processes and the escaped tree only: a build server that is neither in the job nor under one of its members is neither progress nor the command's own CPU in the free share, and a server in the job, or escaped from a member, is one of its processes like any other.
 
-  The stall check and the load figures count the job's own processes and the escaped tree only: a build server outside the job is neither progress nor the command's own CPU in the free share, and a server inside the job is one of its processes like any other.
-
-  The watch hands the pure crate raw facts: the job's CPU, the escaped tree's per-process CPU and the VM's CPU as an option (`None` for a command that is not a `wsl` one, or with no VM). The classifiers are in `gate-watchdog`'s `servers.rs`; the reader is the binary's `servers.rs`.
-
-  Priority (B2): after every sample, the watch moves the priority class of the build servers that sample classified, with the same classification as above. An ordinary gate lowers each classified server outside its job from Normal, AboveNormal, High or RealTime to BelowNormal; there is no restore after the run. Every classified server outside the job is lowered, not only those that count as progress, so a warm `MSBuild` node already running is lowered too.
-
-  A High gate (a critical gate, or one under a critical parent) instead raises the servers outside other live gates' jobs, and the servers of its own job, to High. An ordinary gate leaves its own job's servers as they started. A High gate's guard does not count the critical claim (`gate-critical.json`) or the remote-slot claims as other gates, so a gate covered by a critical parent raises its own job's build servers to High.
-
-  A server whose priority class cannot be read (the gate opens it with `PROCESS_QUERY_INFORMATION`, as .NET does) is an unknown class: an ordinary gate leaves it alone silently, and a High gate still tries the raise.
-
-  An ordinary gate also leaves alone a server in the job of a live critical gate whose ticket holds, and any server already at High while a critical ticket holds, since that gate's watch raised it. The rule is `gate-watchdog`'s `server_target` and `server_left` over `PriorityClass`; the calls are `gate_win32::priority_of` and `set_priority`; the per-watch pass is the binary's `priority.rs`.
-
-  The guard (the tickets, the claims and the other gates' jobs, opened by name) is read at most once a pass, and only when a server the gate would move asks; a pass with no server to move reads no state files. Tickets are read without deleting dead ones. A priority failure never fails a sample, and its two lines go to stderr and the log:
-  - `gate: could not lower|raise <name> <pid>: <message>`, once per (pid, start), which is never tried again; it comes only from a failed set, with the plain Windows message; a server that has exited since the sample is passed over silently.
-  - `gate: could not list the job of gate <id> (<message>); its build servers may be lowered|raised`, once per watch and gate, and that job is left out of the guard.
+  The watch hands the pure crate raw facts: the job's CPU, the escaped tree's per-process CPU and the VM's CPU as an option (`None` for a command that is not a `wsl` one, or with no VM).
 - Kill, on a STALLED, TIMED OUT or BACKSTOP alike: the diagnostics block (X3), then `TerminateJobObject(job, 124)` and the end of the processes that left the job (below), `gate: terminated the job's <n> process(es)` (with the escaped processes named, below), `gate: diagnostics written to <log>`, a 5 s wait for the command and exit 124 (X2).
 
   A failure inside the gate while the command runs terminates the job and ends the escaped processes first (X4); one after the command's own exit ends none of them.
@@ -855,7 +839,7 @@ All kept, with each knob's default unchanged:
 - The processes that left the job: a packaged desktop app started by a process of the job without package identity runs in a job of its own, outside the command's ([Command launching](#command-launching)), and so does what it starts. Every kill of a `gate run` command (a stall, the ceiling, the backstop, Ctrl+C and the stopper after a gate failure) also ends them, in `crates/gate/src/escaped.rs`:
 
   - Before the job is terminated, while the process that started them still runs, one snapshot and the job's members read before and after it give the processes that are not members and are descendants of a member, parents first. A descendant counts only when its start is at or after its parent's, so a recycled pid adopts no one. A job with no members takes no snapshot.
-  - A build server (the classifiers of Build servers above) is spared with everything under it, and so is a `dotnet` host whose command line cannot be read. A process whose start, or whose parent's, cannot be read is not judged and is left running.
+  - An escaped `VBCSCompiler.exe`, MSBuild-node `dotnet.exe` or `dotnet.exe` whose command line cannot be read is ended like any other, with everything under it; a server that descends from no member is not found. A process whose start, or whose parent's, cannot be read is not judged and is left running.
   - After the job is terminated each is opened, checked through its own handle to be the process the snapshot saw and to be outside the job, terminated and waited for, parents first; one more pass ends the children they started meanwhile. One 5 s deadline covers both passes, and the second waits only for what is left.
   - A gate among them is ended through its own named job first ([Kernel object names](#kernel-object-names), under the resolved state root), then as a process.
   - `gate: terminated the job's <n> process(es) and <m> that left it (<image> <pid>, ...)` names at most 5, then `, and <k> more`; `<m>` counts only the processes that ended, and the images are escaped. Without any it is the plain `gate: terminated the job's <n> process(es)`.
@@ -864,7 +848,7 @@ All kept, with each knob's default unchanged:
   - On Ctrl+C the look happens as the interrupt arrives, and the terminate adds what a second look finds.
   - The watch records the escaped tree (below), and every kill of a running command also ends the recorded processes with what is under them, though the process of the job that started them has ended, and the children started after the last sample.
   - These passes wait only while a process that left the job has not ended, at most 5 s for both together. So a stall, ceiling or backstop kill takes at most about 5 s for them plus the 5 s wait for the command, and a Ctrl+C whose command still runs about 15 s in all (the 5 s it gives the command, these passes, then the 5 s wait).
-  - The watch counts the tree while the command runs. Each sample takes the processes outside the job under its members the way the kill's look does (members read before and after the snapshot, build servers and an unreadable `dotnet` host spared with everything under them), and records them in `escaped::Recorded`, in place of the last sample's record: each one's pid, creation time and the parent it was seen under.
+  - The watch counts the tree while the command runs. Each sample takes the processes outside the job under its members the way the kill's look does (members read before and after the snapshot), and records them in `escaped::Recorded`, in place of the last sample's record: each one's pid, creation time and the parent it was seen under.
 
     A recorded process the snapshot still lists as itself (by pid and start) stays recorded and the walk goes on below it after the launcher in the job has ended; one whose start, or whose parent's, is unknown is dropped. Each one's CPU is read by pid and start (`Recorded::cpu`); a read that fails once keeps the last read, so the process is neither dropped nor counted anew.
 
@@ -884,12 +868,12 @@ All kept, with each knob's default unchanged:
 
     It happens on ordinary runs, to a command or member that ended at once, so saying it would print the memory-failed line where nothing failed. A pid whose holder cannot be told is treated the same way.
 
-    A process whose parent pid is a departed member counts as escaped only when it started from that member's first moment to its exit, both included, and before any new holder of the pid started, unless the holder is the member itself (a start equal to the member's). Server sparing is unchanged. A child whose start is unknown is counted in `could not judge` only when no process holds the departed member's pid now, or the holder is the member itself.
+    A process whose parent pid is a departed member counts as escaped only when it started from that member's first moment to its exit, both included, and before any new holder of the pid started, unless the holder is the member itself (a start equal to the member's). A child whose start is unknown is counted in `could not judge` only when no process holds the departed member's pid now, or the holder is the member itself.
 
     A departed entry is forgotten once a sample or the kill's look that began after it ended has walked it (`Job::forget`, by pid, start and exit), unless that look's snapshot listed nothing, as a failed one does. Nothing of a forgotten member is kept, so the memory stays bounded.
   - A stall, ceiling or Ctrl+C kill ends these processes with what is under them and counts them in the `and <m> that left it` line; a gate failure after the command's own exit ends none. The diagnostics block lists the departed members' children and their descendants.
   - The stall check adds the CPU the escaped tree gained since the last progress to the job's CPU against the 1% floor, and a new escaped process (by pid and start) is progress; both reset on progress. So a command whose work runs there is not stalled or timed out while it is busy. The other kill sites (`gate box stop`, the remote client, `gate push`) do not end them yet (GATE-140).
-  - **Every kill site ends the escaped tree** (GATE-140), planned, not built: the box's stop, the remote client's kill and `gate push`'s kill end the escaped processes the way a `gate run` kill does, sparing build servers (and an unreadable `dotnet` host) with everything under them, so the sites agree on what is ended and what is spared.
+  - **Every kill site ends the escaped tree** (GATE-140), planned, not built: the box's stop, the remote client's kill and `gate push`'s kill end the escaped processes the way a `gate run` kill does, so the sites agree on what is ended.
 - The diagnostics block (X3) is gathered before the job is terminated and goes to the log only, between the command's output and the kill line. A command that exits during the gathering keeps its own status and writes no block. Its lines:
   - `gate: diagnostics`, then `gate:   job <pid> parent <ppid> <name>: cpu <s> s, working set <mb> MB: <command line>` for each process of the job (up to 40, then `gate:   ... and <n> more job processes`), and `gate:   outside job ...` lines for the descendants outside the job (up to 20), the recorded escaped processes and their descendants after them.
   - Up to six sample lines, `gate:   sample at <w> s (load-adjusted <a> s, free <p>%): log <n> B, err <n> B, job cpu <s> s, <n> processes, escaped cpu <s> s`, or `gate:   samples: none` when no sample was taken. `<w>` is the sample's `at` stamp.
@@ -900,7 +884,7 @@ All kept, with each knob's default unchanged:
 - A command still running 5 s after its job was terminated is reported: `gate: the command was still running 5 s after its job was terminated`. A job that cannot be terminated says `gate: could not terminate the command's job: <error>`. A killed run is not scanned for markers, and its release verdict is `stalled`, `timed-out` or `backstop` by the kill line that ended it.
 - What a sample reads: the job's CPU by accounting (exited members included), the job's pids created at or after the command's start (a pid that answers access denied is not a member), the log's and `.err`'s sizes, and the system times.
 
-  It also takes one process snapshot with the job's members read before and after it, reads the build servers (Build servers above), and reads the CPU of the escaped tree under the members (`crates/gate/src/watch.rs`).
+  It also takes one process snapshot with the job's members read before and after it, and reads the CPU of the escaped tree under the members (`crates/gate/src/watch.rs`).
 
   A critical run counts as High priority for the free share, and a light gate's demand is `min(cores, light threads)`.
 - Ctrl+C and Ctrl+Break (X5): the gate handles them itself and prints `gate: interrupted; stopping the command` during a run. The command got the same Ctrl+C through the shared console, so the gate waits up to 5 s for it to exit on its own and exits with its status, then terminates whatever is left in the job and the processes that left it.
@@ -979,8 +963,8 @@ The box heartbeat (BW9) is the box wrapper's command-time heartbeat, not the wai
   A nested gate is told from the slot marker in its environment, honoured only when the marker binds to the parent's job ([Critical drain and nesting](#critical-drain-and-nesting)), not from its own job alone: its job nests inside its parent's when the nested gate is in the parent's job, but under a `cmd` and then a packaged pwsh, or a git hook's pwsh, it is in no job of the parent's, and the kill reaches it as one of the processes that left the job.
 
   The start-failure message is the system message for the CreateProcessW error code, as `Win32Exception.Message` gives it, with no `(os error N)` suffix. That failure alone maps to status 127; every other start failure is the gate's own.
-- **Priority.** BelowNormal, or the gate's own class when that is already BelowNormal or Idle; High for a critical gate and any gate under a critical marker (kept, P2). The classes of the build servers outside the job are moved while the command runs ([Watchdog](#watchdog), B2).
-- **Environment.** Every command gets the gate's environment with these set over it (names compared case-insensitively): `GATE_SLOT_HELD=<kind>:<pid>:<start_ms>[:<h>]` (the held slot's marker, `none` too, or the parent's for a covered gate), `SharedCompilationId` and `MSBUILDNODEHANDSHAKESALT`, both the run id, `MSBUILDUSESERVER=0` (over an inherited value), `DOTNET_CLI_USE_MSBUILD_SERVER=0` (kept, P3, B3), `MSBUILDDISABLENODEREUSE=1` (over an inherited value), and `GATE_STATE_DIR=<root>` under a non-default root. Under the default root an inherited `GATE_STATE_DIR` is removed. The gate's own environment is never changed.
+- **Priority.** BelowNormal, or the gate's own class when that is already BelowNormal or Idle; High for a critical gate and any gate under a critical marker (kept, P2).
+- **Environment.** Every command gets the gate's environment with these set over it (names compared case-insensitively): `GATE_SLOT_HELD=<kind>:<pid>:<start_ms>[:<h>]` (the held slot's marker, `none` too, or the parent's for a covered gate), `SharedCompilationId` and `MSBUILDNODEHANDSHAKESALT`, both the run id, `MSBUILDUSESERVER=0` (over an inherited value), `DOTNET_CLI_USE_MSBUILD_SERVER=0` (kept, P3), `MSBUILDDISABLENODEREUSE=1` (over an inherited value), and `GATE_STATE_DIR=<root>` under a non-default root. Under the default root an inherited `GATE_STATE_DIR` is removed. The gate's own environment is never changed.
 
   The run id is `gate-{pid}-{start ms}`, with `-{root hash}` added under a non-default state root. Each nested gate has its own id. So each run gets its own .NET compiler server, and MSBuild's node reuse is off: with it on, the nodes idle about 15 minutes inside the command's job, so anything in the command waiting on its whole tree would hang. The gate ends what the run left at its [end](#watchdog).
 
@@ -1852,13 +1836,7 @@ A Rust integration suite drives the built `gate.exe` through its CLI and reads o
 
   `--test-git-drain-ms <n>` (whole milliseconds above 0, on `gate run` only) replaces the 2 s the readers of each git call of the routing decision get to end once git has exited; `--test-print-request` shows it as `testSeams.gitDrainMs`, after `gitLimitMs`. The suite's routing cases pass it with a very long drain, so a starved gate does not fail a call that a loaded machine only delays.
 
-  `--test-servers-under <folder>` (on `gate run` only; refused empty or given twice) makes a build server outside the job count only when its program path lies under the folder (whole path components, case-insensitive, the folder made absolute), so a case never counts the machine's real servers; `--test-print-request` shows it as `testSeams.serversUnder`, after `gitLimitMs`.
-
-  `--test-server-image <file name>` (on `gate run` only; needs `--test-servers-under`, else `gate: --test-server-image needs --test-servers-under`; refused empty or given twice) makes the watch treat processes with that exact image name (case-insensitive) as a compiler server, like `VBCSCompiler.exe`; `--test-print-request` shows it as `testSeams.serverImage`, after `serversUnder`.
-
-  The suite's priority cases use fake-tool copies named `gate-test-server.exe` with it, so another gate on the machine, which lowers every `VBCSCompiler.exe` outside its own job, cannot disturb them.
-
-  `--test-remote-snapshot` (a switch, on `gate run` only) sends the run to the Rust remote client's snapshot alone ([The remote client](#routing)); `--test-print-request` shows it as `testSeams.remoteSnapshot`, after `serverImage`.
+  `--test-remote-snapshot` (a switch, on `gate run` only) sends the run to the Rust remote client's snapshot alone ([The remote client](#routing)); `--test-print-request` shows it as `testSeams.remoteSnapshot`, after `gitDrainMs`.
 
   `--test-remote-transport local:<folder>` (on `gate run` only) sends the run to the Rust remote client with a local folder standing in for the builder; `local-ssh:<folder>` does the same but pushes and fetches to `<host>:<folder>/<repo>.git` with the `--test-remote-ssh` program as git's ssh (which it needs), so git's own ssh calls reach the stand-in.
 

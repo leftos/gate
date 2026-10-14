@@ -35,8 +35,6 @@ fn print_request_shows_the_new_cli_request() {
         "remoteWaitMs": null,
         "gitLimitMs": null,
         "gitDrainMs": null,
-        "serversUnder": null,
-        "serverImage": null,
         "remoteSnapshot": false,
         "remoteTransport": null,
         "remoteSsh": null,
@@ -105,10 +103,6 @@ fn the_seams_given_are_printed(case: &Case) {
             "7",
             "--test-git-drain-ms",
             "8",
-            "--test-servers-under",
-            r"target\case",
-            "--test-server-image",
-            "gate-test-server.exe",
             "--test-remote-snapshot",
             "--test-job-breakaway",
         ],
@@ -119,13 +113,11 @@ fn the_seams_given_are_printed(case: &Case) {
             &request["testSeams"]["remoteClient"],
             &request["testSeams"]["remoteWaitMs"],
             &request["testSeams"]["gitLimitMs"],
-            &request["testSeams"]["serversUnder"],
             &request["testSeams"]["remoteSnapshot"],
         ),
-        (&json!(r"steps\client.txt"), &json!(5), &json!(7), &json!(r"target\case"), &json!(true))
+        (&json!(r"steps\client.txt"), &json!(5), &json!(7), &json!(true))
     );
     assert_eq!(request["testSeams"]["gitDrainMs"], json!(8));
-    assert_eq!(request["testSeams"]["serverImage"], json!("gate-test-server.exe"));
     assert_eq!(request["testSeams"]["jobBreakaway"], json!(true));
     // The snapshot-only client and the Rust client's transport are refused together, so the transport's seams are
     // printed by a run of their own.

@@ -1,4 +1,5 @@
-//! A process's priority class, read and set: what the build servers' rule moves a server between, and nothing else.
+//! A process's priority class, read and set: what a watch reads and lowers the command's processes still at High
+//! with, once a late take has the command run as its own kind.
 
 use std::io;
 

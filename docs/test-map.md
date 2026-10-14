@@ -18,25 +18,23 @@ Suite = `crates/gate/tests/suite/` (binary `suite`, needs `--all-features`; test
 |---|---|---|
 | main.rs | all (entry; `answer::answer`, exit-status cast) | CENTRAL |
 | answer.rs | all; dispatch per subcommand, usage errors (`cli`), `--test-print-request` branch (`request`, `compat`, `cutover`, `harness`, `launcher`) | CENTRAL |
-| run.rs | all runs (the run end: `launch` leftovers (`launch::a_spared_gate_whose_job_cannot_be_listed_is_said_before_the_verdict`, `launch::a_leftover_s_failure_output_fails_a_passing_command`, `launch::a_nested_gate_s_launcher_is_not_ended_by_the_run_end`) and run-id cases, `nesting::a_parent_s_run_end_ends_its_plain_child_and_spares_its_covered_gate`, the unit `end_tests`): launch, hold, stall, ceiling, cores, journal, slots, critical, nesting, routing (the local `--no-build` drop, its lines and kinds, the nothing-back record's write and clear), remote_client, interrupt, diagnostics, priority, build_servers, pause | CENTRAL |
+| run.rs | all runs (the run end: `launch` leftovers (`launch::a_spared_gate_whose_job_cannot_be_listed_is_said_before_the_verdict`, `launch::a_leftover_s_failure_output_fails_a_passing_command`, `launch::a_nested_gate_s_launcher_is_not_ended_by_the_run_end`) and run-id cases, `nesting::a_parent_s_run_end_ends_its_plain_child_and_spares_its_covered_gate`, the unit `end_tests`): launch, hold, stall, ceiling, cores, journal, slots, critical, nesting, routing (the local `--no-build` drop, its lines and kinds, the nothing-back record's write and clear), remote_client, interrupt, diagnostics, pause | CENTRAL |
 | no_build.rs | `routing` (the drop reasons, the obj check, the record's write, clear and unreadable cases); the unit tests inside (record read, solution readers, `Directory.Build.*` skip, listing parse) | no: routing |
 | resolve.rs | `request` (state root from `--state-dir`/`GATE_STATE_DIR`, log path), `compat`, `harness`, `launch` (log inside state root); used by every run | CENTRAL (resolve.rs:`root`/`log` on every run) |
 | console.rs | every case reads stdout/stderr lines; `launch`, `hold`, `cli` | CENTRAL |
 | log.rs | `launch` (log, `.err`, marker scan, tail, verdict line), `diagnostics` (block before kill, tail), `stall`/`ceiling` (kill lines in log), `hold` | no: launch, diagnostics, stall, ceiling, hold, cli, interrupt, boxside (shares log rules? no, box has own) |
 | environment.rs | `launch` (command environment, `two_runs_give_their_commands_different_compiler_server_ids`), the unit `environment::tests::the_command_gets_its_run_s_compiler_server_id_over_an_inherited_one`, `environment::tests::with_build_servers_replaces_inherited_values_under_any_case` (the box's variables),  `nesting` (`GATE_SLOT_HELD` marker set/inherited), `harness` (cleared gate env), `request` | no: launch, nesting, harness, request, slots |
-| slots.rs | `slots` (claim, counts, hashed names, takeover GATE-30), `critical`, `nesting`, `pause`, `priority`, `routing` (remote pool), `journal`, `hold`, `interrupt` (ticket delete); `ThisGate` identity feeds every run | CENTRAL (ThisGate/take are on every run) |
+| slots.rs | `slots` (claim, counts, hashed names, takeover GATE-30), `critical`, `nesting`, `pause`, `routing` (remote pool), `journal`, `hold`, `interrupt` (ticket delete); `ThisGate` identity feeds every run | CENTRAL (ThisGate/take are on every run) |
 | acquire.rs | `slots` (take, abandoned-take line), `critical`, `interrupt` (queued abandon), `routing` | no: slots, critical, interrupt, routing, nesting, pause |
 | wait.rs | `slots` (wait lines, ticket order), `durations` (the ETA in the wait lines; the ticket's `expected`), `critical` (barrier, reserved light), `nesting` (lend of a light parent's slot), `pause` (pause marker writer), `hold`, `routing` (remote pool wait; `--test-interrupt-queued-after-fallback`), `interrupt` | CENTRAL (every queued/taking run passes `Wait`) |
-| machine.rs | `critical` (critical mutex, drain, take all, snapshot, release), `priority` (critical raises servers), `interrupt`(`--test-interrupt-queued` on critical via critical.rs) | no: critical, priority, nesting (critical refused), interrupt |
+| machine.rs | `critical` (critical mutex, drain, take all, snapshot, release), `interrupt`(`--test-interrupt-queued` on critical via critical.rs) | no: critical, nesting (critical refused), interrupt |
 | covered.rs | `nesting` (`covered` journal line, covered marker), `journal` | no: nesting, journal |
-| late.rs | `nesting` (a covered gate takes a slot when its parent gate ends, light and heavy, waits without pausing, the stand-in cases, a critical gate refused under one), `priority` (a covered gate under a critical parent that ended lowers its command and moves servers as its own kind), `routing` (a light `--no-build` dropped under a light stand-in), `journal`; the unit tests inside (the open of the parent, the late wait) | no: nesting, priority, routing, journal |
+| late.rs | `nesting` (a covered gate takes a slot when its parent gate ends, light and heavy, waits without pausing, the stand-in cases, a covered gate whose critical parent ended lowers its command, a critical gate refused under one), `routing` (a light `--no-build` dropped under a light stand-in), `journal`; the unit tests inside (the open of the parent, the late wait) | no: nesting, routing, journal |
 | nesting/binding.rs | `nesting` (marker bound to the parent's job: `a_gate_under_cmd_and_pwsh_in_its_parents_command_is_covered`, unbound and unjudged lines) | no: nesting, critical, pause, slots, journal |
 | nesting.rs | `nesting` (marker parse, liveness, covered/refused/own), `critical` (refusal under marker), `pause`, `slots` | no, but run.rs calls it on every run (`admitted`, run.rs:154): nesting, critical, pause, slots, journal |
 | pause.rs | `pause` (marker rewritten each pass), `stall`/`ceiling` (paused time via `watch.rs` PauseReader), `nesting` | no: pause, nesting, stall, ceiling, cores |
 | journal.rs | `journal` (v1 lines, verdict, quoted command, rollover), plus any case asserting a journal line: `slots`, `critical`, `nesting`, `cores`, `routing`, `interrupt`, `cutover`?, `stall` (load-adjusted s) | CENTRAL-ish (writes every run; run `journal`, `cores`, `nesting`, `slots`, `critical`, `routing`, `stall`, `interrupt`, `launch`, `hold`) |
-| watch.rs | `stall`, `ceiling` (`--test-sampler-fail`, backstop), `durations` (the local hang hint), `cores`, `diagnostics`, `priority`, `pause`, `interrupt` (`--test-interrupt-after-samples`), `hold`, `launch` (every command is watched); unit tests inside (the sample's `escaped cpu`, the departed members' children in the diagnostics) | CENTRAL (every launched command is watched) |
-| servers.rs | `priority` (`--test-server-image`, `--test-servers-under`), `ceiling`, `diagnostics`, `launch`/`cli`/`install` pass `--test-servers-under` only to confine the scan | no: priority, diagnostics, ceiling, stall, pause (sampling) |
-| priority.rs | `priority` (lower/raise servers, OtherGates guard), `critical` (raise to High) | no: priority, critical |
+| watch.rs | `stall`, `ceiling` (`--test-sampler-fail`, backstop), `durations` (the local hang hint), `cores`, `diagnostics`, `pause`, `interrupt` (`--test-interrupt-after-samples`), `hold`, `launch` (every command is watched); unit tests inside (the sample's `escaped cpu`, the departed members' children in the diagnostics) | CENTRAL (every launched command is watched) |
 | cutover.rs | `cutover` (`gate cutover`, flag, counts copy, drain, Ctrl+C, resume), `launcher` (hand-over after flag) | no: cutover, launcher |
 | push.rs | `push` (`gate push`, `--test-push-ssh`, `--test-push-bound-ms`, fake-ssh) | no: push |
 | stop_tree.rs | `stop_tree` (`gate stop-tree`) | no: stop_tree |
@@ -69,28 +67,27 @@ Suite = `crates/gate/tests/suite/` (binary `suite`, needs `--all-features`; test
 | gate-args boxcmd.rs | `boxside`, `boxside::outputs`, `remote_client` | args `boxcmd` | no |
 | gate-args cmdline.rs / batch.rs / program.rs | `launch` (quoting, refused batch word, `.cmd`), `journal` (`command_text`), `boxside`, `remote_client` | args `quoting`, `batch`, `program` | no |
 | gate-router (decide, rewrite, key, like, config) | `routing` (imports `DROPPED_NO_BUILD_LINE`, `NO_OUTPUTS_LINE`; `decide.rs`'s dotnet readers also drive the local drop and the record), `remote_client` (`repo_name`), `request` | `gate-router::router` (`decide`: the wrapped form, the drop verbs, the targets and settings) | no |
-| gate-state v1.rs / root.rs / model.rs / lib.rs | everything (claim/ticket/counts/root hash/kernel names): CENTRAL. Suite itself reads `v1` in `critical, interrupt, journal, launch, nesting, pause, priority, slots`; `v1.rs`'s nothing-back record (path, write, strict read) is also read in `routing`, and its outputs cap record (`remote/outputs.rs`) in `remote_client` and the `remote::client` unit tests | `gate-state::state` (`v1`: the record's shape and strict read) | CENTRAL |
+| gate-state v1.rs / root.rs / model.rs / lib.rs | everything (claim/ticket/counts/root hash/kernel names): CENTRAL. Suite itself reads `v1` in `critical, interrupt, journal, launch, nesting, pause, slots`; `v1.rs`'s nothing-back record (path, write, strict read) is also read in `routing`, and its outputs cap record (`remote/outputs.rs`) in `remote_client` and the `remote::client` unit tests | `gate-state::state` (`v1`: the record's shape and strict read) | CENTRAL |
 | gate-state journal_writer.rs / verdict.rs | `journal` + any journal assertion: `cores, nesting, routing, slots, critical, stall, launch, interrupt` | state `journal_write`, `verdict` | no, but wide (writes on every run) |
 | gate-state archive.rs | `journal` (rollover and archive with concurrent appenders) | state `archive` | no |
 | gate-state durations.rs | `durations` (the `gate` crate's `durations.rs` calls it), `hold`, `journal` | state `durations` (incl. the adjusted p99, not raised to the wall p50, and needing 5 adjusted samples) | no |
 | gate-state cutover.rs / drain.rs / counts.rs | `cutover`, `launcher` (gate/src/cutover.rs imports `copy_slot_counts_to_v1, powershell_gates, write_cutover_flag`); `counts.rs`'s `write_replacing` (the temp names) also writes the v1 files, so a change there adds `routing` | state `cutover`, `counts`; a unit test inside `counts.rs` for the temp names | no |
 | gate-state tests/state/fixtures/ (captured files, `capture-*.ps1`; the `v1-*-expected.json` pair is hand-written) and tests/state/fixtures.rs | none (the fixtures are captured from `gate.exe` and the PowerShell gate by script and only read by the state tests) | state `fixtures` (incl. `remote_run_journal_from_gate_exe_is_read_into_runs_and_a_split_summary`) | no |
 | gate-state claims.rs / remote.rs / state.rs / win32.rs / journal.rs (reader) | NOT imported by gate src (ops-tower-only, ARCHITECTURE.md Layers; except `normalize_command` from journal.rs, used by `slots.rs`:642 and journal.rs's command text -> `journal`, `slots`) | state tests | no (journal.rs: `journal`, `slots`) |
-| gate-watchdog share.rs / watch.rs | `stall`, `ceiling`, `cores`, `pause`, `diagnostics`, `interrupt`, `priority` | unit | no (wide) |
+| gate-watchdog share.rs / watch.rs | `stall`, `ceiling`, `cores`, `pause`, `diagnostics`, `interrupt` | unit | no (wide) |
 | gate-watchdog cores.rs | `cores`, `journal` (cores fields) | unit | no |
-| gate-watchdog servers.rs | `priority`, `diagnostics`, `ceiling` | unit | no |
 | gate-watchdog diagnostics.rs | `diagnostics`, `stall`, `ceiling` (`--test-diagnostics-budget-ms` cuts every block) | unit | no |
 | gate-watchdog heartbeat.rs | `boxside`, `boxside::outputs`, `remote_client`, `critical`/`slots`/`pause` only via `--test-heartbeat-ms` flag (the wait heartbeat is gate/src/wait.rs, not this) | unit | no |
 | gate-win32 job.rs / create.rs / launch.rs / lib.rs / mutex.rs | all (started command, job, slot mutexes): CENTRAL | `gate-win32` tests (launch, mutex, event, interrupt, `io` for `Job::written_bytes`...; unit tests of the completion port: `Job::remember` and its thread, `departed`, `forget`, among them `a_member_that_ended_before_any_look_keeps_its_exact_window_and_no_handle`, `a_member_found_gone_takes_no_one`, `a_member_put_in_the_job_after_its_start_can_have_started_a_process_only_since_the_job_was_created`, `an_exit_message_closes_the_handle_of_that_member_alone`, `the_members_a_memory_could_not_read_are_named_up_to_a_few_and_counted_after` and `dropping_a_remembering_job_ends_its_drain_thread_and_releases_what_it_shares`; in `crates/gate/src/escaped.rs`, `a_look_whose_snapshot_listed_nothing_forgets_no_member` and `a_child_whose_start_is_unknown_of_a_stranger_holding_a_remembered_member_s_pid_is_not_counted`) | CENTRAL |
 | gate-win32 piped.rs / console.rs | `boxside` (`--test-box-console`, `--test-box-park-launch`, `--test-box-token`), `remote_client` | win32 `launch` | no |
 | gate-win32 token.rs | `boxside` (`box_run_starts_the_command_non_elevated_owning_its_objects`, `box_run_gives_the_command_safe_directory_for_git`, `box_run_appends_safe_directory_after_the_callers_git_config_entries`; `box_run_starts_an_elevated_session_s_command_non_elevated` is `#[ignore]`: needs an elevated session, run by hand on a builder) | win32 `token::tests::*`, `piped` (`a_process_started_with_a_restricted_token_runs_and_exits_with_its_status`) | no: boxside |
-| gate-win32 priority.rs | `priority`, `critical` | win32 `priority` | no |
+| gate-win32 priority.rs | `nesting`, `critical` | win32 `priority` | no |
 | gate-win32 tree.rs | `stop_tree`, `stall` (escaped processes), `interrupt`, `boxside` (stop), `burn` (`WaitableProcess`), `nesting` (`OpenedJob::holds`) | win32 `membership` | no |
 | gate-win32 interrupt.rs / event.rs | `interrupt`, `critical`, `cutover`, `routing`, `remote_client`, `boxside` (stop event), `slots` (wake) | win32 `interrupt`, `event` | no |
 | gate-win32 file.rs | `syncback_quarantine`, `syncback_conversions`, `remote_client` (`move_no_replace` moves a sync-back's fetched objects) | win32 `file` | no |
 | gate-win32 device.rs | `routing` (subst drives in route facts) | - | no |
 | gate-win32 times.rs / memory.rs | `stall`, `ceiling`, `cores`, `pause` (samples) | - | no |
-| proc-table | `stop_tree`, `stall` (`parent_pid_of`) (imports `Win32ProcessTable`), `cutover` (`command_line_of`), `diagnostics`, `priority` (via servers/OtherGates), `stall`/`cores` (`ProcessTree::children` through the escaped walk) | proc-table unit | no |
+| proc-table | `stop_tree`, `stall` (`parent_pid_of`) (imports `Win32ProcessTable`), `cutover` (`command_line_of`), `diagnostics`, `stall`/`cores` (`ProcessTree::children` through the escaped walk) | proc-table unit | no |
 | tools/gate.ps1 | `launcher` (runs the checked-in launcher), `cutover` (hand-over), `checkout` (`repo_file`) | - | no |
 | tools/install.ps1 | `install`, `checkout` | - | no |
 | suite support.rs / harness.rs / main.rs / fake tools | all suite (support.rs is `Case`): CENTRAL for suite; `harness` self-tests | - | CENTRAL |
@@ -112,13 +109,11 @@ Always add `checkout` to any change that touches a suite file or adds a seam.
 | log.rs | `-E 'binary(suite) and test(/^(launch\|diagnostics\|stall\|ceiling\|hold\|cli\|interrupt)::/) or (U and test(/^log::/))'` |
 | environment.rs (if not treated central) | `-E 'binary(suite) and test(/^(launch\|nesting\|harness\|request\|slots)::/) or (U and test(/^environment::/))'` |
 | acquire.rs | `-E 'binary(suite) and test(/^(slots\|critical\|interrupt\|routing\|nesting\|pause)::/)'` |
-| machine.rs | `-E 'binary(suite) and test(/^(critical\|priority\|nesting\|interrupt)::/) or (U and test(/^machine::/))'` |
+| machine.rs | `-E 'binary(suite) and test(/^(critical\|nesting\|interrupt)::/) or (U and test(/^machine::/))'` |
 | covered.rs | `-E 'binary(suite) and test(/^(nesting\|journal)::/) or (U and test(/^covered::/))'` |
-| late.rs | `-E 'binary(suite) and test(/^(nesting\|priority\|routing\|journal)::/) or (U and test(/^(late\|nesting)::/))'` |
+| late.rs | `-E 'binary(suite) and test(/^(nesting\|routing\|journal)::/) or (U and test(/^(late\|nesting)::/))'` |
 | nesting.rs, nesting/binding.rs | `-E 'binary(suite) and test(/^(nesting\|critical\|pause\|slots\|journal)::/) or (U and test(/^nesting::/))'` |
 | pause.rs | `-E 'binary(suite) and test(/^(pause\|nesting\|stall\|ceiling\|cores)::/) or (U and test(/^pause::/))'` |
-| servers.rs | `-E 'binary(suite) and test(/^(priority\|diagnostics\|ceiling\|stall)::/) or (U and test(/^servers::/))'` |
-| priority.rs | `-E 'binary(suite) and test(/^(priority\|critical)::/) or (U and test(/^priority::/))'` |
 | cutover.rs | `-E 'binary(suite) and test(/^(cutover\|launcher)::/) or (U and test(/^cutover::/))'` |
 | push.rs, bin/fake-ssh.rs (push side) | `-E 'binary(suite) and test(/^(push\|remote_client)::/)'` (fake-ssh also serves remote_client) |
 | stop_tree.rs | `-E 'binary(suite) and test(/^stop_tree::/)'` |
@@ -150,21 +145,20 @@ Always add `checkout` to any change that touches a suite file or adds a seam.
 | gate-state claims/remote/state/win32 (ops-tower-only readers) | `-E 'package(gate-state)'` (no gate suite module reads them; gate src does not import them) |
 | gate-state journal.rs (reader, `normalize_command`) | `-E 'package(gate-state) or (binary(suite) and test(/^(journal\|slots)::/))'` |
 | gate-state v1/root/model/lib | full: `-E 'rdeps(gate-state)'` (includes whole gate suite; accurate, the binary uses v1 on every run) |
-| gate-watchdog share/watch | `-E 'package(gate-watchdog) or (binary(suite) and test(/^(stall\|ceiling\|cores\|pause\|diagnostics\|interrupt\|priority)::/))'` |
+| gate-watchdog share/watch | `-E 'package(gate-watchdog) or (binary(suite) and test(/^(stall\|ceiling\|cores\|pause\|diagnostics\|interrupt)::/))'` |
 | gate-watchdog cores | `-E 'package(gate-watchdog) or (binary(suite) and test(/^(cores\|journal)::/))'` |
-| gate-watchdog servers | `-E 'package(gate-watchdog) or (binary(suite) and test(/^(priority\|diagnostics\|ceiling)::/))'` |
 | gate-watchdog diagnostics | `-E 'package(gate-watchdog) or (binary(suite) and test(/^(diagnostics\|stall\|ceiling)::/))'` |
 | gate-watchdog heartbeat | `-E 'package(gate-watchdog) or (binary(suite) and test(/^(boxside\|remote_client)::/))'` |
 | gate-win32 job/create/launch/lib/mutex | `-E 'rdeps(gate-win32)'` |
 | gate-win32 piped/console | `-E 'package(gate-win32) or (binary(suite) and test(/^(boxside\|remote_client)::/))'` |
 | gate-win32 token | `-E 'package(gate-win32) or (binary(suite) and test(/^boxside::/))'` |
-| gate-win32 priority | `-E 'package(gate-win32) or (binary(suite) and test(/^(priority\|critical)::/))'` |
+| gate-win32 priority | `-E 'package(gate-win32) or (binary(suite) and test(/^(nesting\|critical)::/))'` |
 | gate-win32 tree | `-E 'package(gate-win32) or (binary(suite) and test(/^(stop_tree\|stall\|interrupt\|boxside\|burn\|nesting)::/))'` |
 | gate-win32 interrupt/event | `-E 'package(gate-win32) or (binary(suite) and test(/^(interrupt\|critical\|cutover\|routing\|remote_client\|boxside\|slots)::/))'` |
 | gate-win32 file | `-E 'package(gate-win32) or (binary(suite) and test(/^(syncback_quarantine\|syncback_conversions\|remote_client)::/))'` |
 | gate-win32 device | `-E 'package(gate-win32) or (binary(suite) and test(/^routing::/))'` |
 | gate-win32 times/memory | `-E 'package(gate-win32) or (binary(suite) and test(/^(stall\|ceiling\|cores\|pause)::/))'` |
-| proc-table | `-E 'package(proc-table) or (binary(suite) and test(/^(stop_tree\|stall\|cutover\|diagnostics\|priority)::/))'` (`rdeps(proc-table)` would pull gate-state and all of gate) |
+| proc-table | `-E 'package(proc-table) or (binary(suite) and test(/^(stop_tree\|stall\|cutover\|diagnostics)::/))'` (`rdeps(proc-table)` would pull gate-state and all of gate) |
 | docs only | no tests |
 
 (In a real `-E`, the pipe inside a regex is a plain `|`; the backslashes above only keep the Markdown table intact. Nextest regexes use `/.../`. Precedence: `and` binds tighter than `or`, add parentheses as written.)

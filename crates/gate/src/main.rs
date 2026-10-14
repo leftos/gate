@@ -33,14 +33,12 @@ mod no_build;
 )]
 mod outputs;
 mod pause;
-mod priority;
 mod push;
 mod remote;
 mod request_json;
 mod resolve;
 mod route;
 mod run;
-mod servers;
 mod slots;
 mod stop_tree;
 mod stopping;

@@ -97,8 +97,6 @@ fn valid_run_runs_its_command_and_exits_with_its_status() {
         "5",
         "--log",
         "out.log",
-        "--test-servers-under",
-        ".",
         "--",
         FAKE_TOOL,
         "exit",

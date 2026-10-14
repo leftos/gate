@@ -217,8 +217,6 @@ fn seam_option(name: &str) -> Option<RunOption> {
         "test-git-limit-ms" => Some(RunOption::Value(ValueOption::GitLimitMs)),
         "test-git-drain-ms" => Some(RunOption::Value(ValueOption::GitDrainMs)),
         "test-dotnet-limit-ms" => Some(RunOption::Value(ValueOption::DotnetLimitMs)),
-        "test-servers-under" => Some(RunOption::Value(ValueOption::ServersUnder)),
-        "test-server-image" => Some(RunOption::Value(ValueOption::ServerImage)),
         "test-remote-snapshot" => Some(RunOption::Switch(SwitchOption::RemoteSnapshot)),
         "test-remote-transport" => Some(RunOption::Value(ValueOption::RemoteTransport)),
         "test-remote-ssh" => Some(RunOption::Value(ValueOption::RemoteSsh)),

@@ -4,10 +4,10 @@
 //! or past the backstop, or a Ctrl+C.
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use gate_args::{RunRequest, Slot};
@@ -27,10 +27,8 @@ use crate::late::Late;
 use crate::log::Log;
 use crate::nesting::Parent;
 use crate::pause::PauseReader;
-use crate::priority::{OtherGates, Prioritizer};
 use crate::resolve::ResolvedRoot;
-use crate::servers::{Classified, Scope, Servers};
-use crate::slots::{Pool, Survey, Takes, ThisGate, epoch_ms};
+use crate::slots::{Pool, Takes, ThisGate, epoch_ms};
 
 /// How long the watch waits for the command between two samples.
 const SAMPLE_PERIOD: Duration = Duration::from_secs(5);
@@ -74,11 +72,6 @@ pub(crate) struct Watcher<'a> {
     watch: Watch,
     /// The samples taken, as the diagnostics block lists them, oldest first.
     history: SampleHistory,
-    /// The build servers' classifier, and the command lines read for it so far.
-    servers: Servers,
-    /// The folder a build server's program must lie under, `None` when the scan is machine-wide
-    /// (`--test-servers-under`).
-    under: Option<PathBuf>,
     /// The processes outside the job the last sample counted, by pid and start.
     counted_escaped: Vec<(u32, u64)>,
     /// The processes outside the job the samples have recorded, which the run's kill ends.
@@ -101,12 +94,6 @@ pub(crate) struct Watcher<'a> {
     /// The pause markers of the gates under this one: a gate under it waiting behind a critical request is the run's
     /// progress.
     pause: PauseReader<'a>,
-    /// The build servers the last sample classified, whose priority classes the pass below moves.
-    classified: Vec<Classified>,
-    /// The other gates' facts the build servers' guard reads, at most once a pass and only when a server the pass would move asks.
-    others: OtherGates<'a>,
-    /// The classes this watch moves the sample's build servers to.
-    priority: Prioritizer<'a>,
     /// The watch of the parent gate whose slot covers this one, and the slot it takes once that parent ends ([`Late`]);
     /// `None` for any other run.
     late: Option<Late<'a>>,
@@ -205,8 +192,6 @@ pub(crate) struct Watching<'a> {
     /// The parent whose marker this gate hands its command, when that parent's slot covers it or is lent to it: the
     /// gates under that command name their pause markers after the parent.
     pub hands_on: Option<&'a Parent>,
-    /// The state root's tickets, claims and jobs, as the build servers' guard reads them.
-    pub survey: &'a mut Survey,
     /// Where the samples record the processes outside the job, which the run's kill reads.
     pub recorded: &'a RefCell<Recorded>,
     /// The watch of the parent gate whose slot covers a heavy or light run, which takes a slot of the run's kind once
@@ -242,7 +227,6 @@ impl<'a> Watcher<'a> {
             root,
             gate,
             hands_on,
-            survey,
             recorded,
             late,
         } = run;
@@ -254,7 +238,6 @@ impl<'a> Watcher<'a> {
         let mut vm = VmReader::new(read);
         let vm_cpu = vm.baseline();
         let spoken: Vec<String> = request.command.iter().map(|word| word.to_string_lossy().into_owned()).collect();
-        let high = runs_as == Slot::Critical;
         Ok(Watcher {
             job,
             running,
@@ -266,8 +249,6 @@ impl<'a> Watcher<'a> {
             spoken: spoken.join(" "),
             watch: Watch::new(config, machine(runs_as, processors), system, job_cpu, vm_cpu),
             history: SampleHistory::default(),
-            servers: Servers::new(request.test_seams.server_image.clone()),
-            under: request.test_seams.servers_under.as_deref().map(absolute),
             counted_escaped: Vec::new(),
             recorded,
             sampler_works: true,
@@ -279,9 +260,6 @@ impl<'a> Watcher<'a> {
             interrupt_after: request.test_seams.interrupt_after_samples,
             vm,
             pause: PauseReader::new(root, gate, hands_on),
-            classified: Vec::new(),
-            others: OtherGates::new(high, gate, root, survey),
-            priority: Prioritizer::new(high),
             late,
             sampled: Instant::now(),
             runs_as,
@@ -343,17 +321,14 @@ impl<'a> Watcher<'a> {
 
     /// Runs the command as the gate's own kind once a late take gave it a slot of that kind, or a heavy or light gate
     /// stands in for its ended parent, when a critical parent's slot had it run as critical ([`own_kind_after_take`]):
-    /// the watch measures it on the machine of its own kind from
-    /// the next sample on, its build servers are no longer raised to High, and its processes still at High are lowered to
-    /// below normal, as a command of its kind starts. A process that cannot be lowered is said.
+    /// the watch measures it on the machine of its own kind from the next sample on, and its processes still at High
+    /// are lowered to below normal, as a command of its kind starts. A process that cannot be lowered is said.
     fn after_late_take(&mut self, console: &mut Console) {
         let Some(kind) = own_kind_after_take(self.runs_as, self.kind) else {
             return;
         };
         self.runs_as = kind;
         self.watch.run_on(machine(kind, self.processors));
-        self.priority.set_high(false);
-        self.others.set_high(false);
         let pids = match self.job.process_ids() {
             Ok(pids) => pids,
             Err(error) => {
@@ -455,7 +430,6 @@ impl<'a> Watcher<'a> {
                 self.counted_escaped = sample.escaped.keys().copied().collect();
                 self.watch.sample(&sample);
                 self.record(&sample, log_bytes, err_bytes, vm_failed);
-                self.prioritize(console);
             }
             Err(error) => {
                 self.sampler_works = false;
@@ -478,13 +452,6 @@ impl<'a> Watcher<'a> {
         // been counted.
         let figures = (self.watch.adjusted_seconds(), self.watch.last_free_percent().unwrap_or(100));
         self.history.push(sample_facts(sample, figures, (log_bytes, err_bytes), wsl_vm));
-    }
-
-    /// Moves the build servers this sample classified ([`Prioritizer`]): the other gates' guard is read at most once,
-    /// and only when a server the pass would move asks.
-    fn prioritize(&mut self, console: &mut Console) {
-        let servers = std::mem::take(&mut self.classified);
-        self.priority.run(&servers, &mut self.others, console);
     }
 
     /// The kill due now, as stalled, timed out or past the backstop, or `None`; a command that exited as the kill was
@@ -605,11 +572,11 @@ impl<'a> Watcher<'a> {
     }
 
     /// The facts of one sample that began at `began`: the size of the log and its `.err` file, the two kept apart for
-    /// the diagnostics block, the job's processes created since the command started, the build servers in the job and
-    /// outside it whose priority the watch moves, the processes outside the job under its members and their CPU, the WSL
-    /// VM's CPU for a wsl command (its unreadable line said once, when it first fails), and last the system's times and
-    /// the job's accounting, stamped with the watch's end time: the interval the watch counts them over is exactly the
-    /// stretch the end stamp closes. Under `--test-sampler-fail` every sample fails.
+    /// the diagnostics block, the job's processes created since the command started, the processes outside the job
+    /// under its members and their CPU, the WSL VM's CPU for a wsl command (its unreadable line said once, when it
+    /// first fails), and last the system's times and the job's accounting, stamped with the watch's end time: the
+    /// interval the watch counts them over is exactly the stretch the end stamp closes. Under `--test-sampler-fail`
+    /// every sample fails.
     fn sample(&mut self, console: &mut Console, began: Duration, paused: bool) -> io::Result<Gathered> {
         if self.sampler_fail {
             return Err(io::Error::other(SAMPLER_FAIL));
@@ -626,13 +593,6 @@ impl<'a> Watcher<'a> {
         if let Some(line) = escaped::memory_line(&mut self.memory_said, trouble.as_deref()) {
             console.err(&line);
         }
-        let scope = Scope {
-            members: &pids,
-            under: self.under.as_deref(),
-        };
-        self.classified = self
-            .servers
-            .read(&processes, &scope, gate_win32::process_times, proc_table::command_line_of);
         let tree = ProcessTree::new(processes);
         let look = Look {
             before,
@@ -641,13 +601,7 @@ impl<'a> Watcher<'a> {
             tree: &tree,
             departed: departed.clone(),
         };
-        let escaped = outside_the_job(
-            &mut self.recorded.borrow_mut(),
-            &self.servers,
-            look,
-            gate_win32::process_times,
-            proc_table::command_line_of,
-        );
+        let escaped = outside_the_job(&mut self.recorded.borrow_mut(), look, gate_win32::process_times);
         // What the members that had ended before the look began started is recorded now, and they start nothing more;
         // a snapshot that failed recorded nothing under them, so they are kept.
         escaped::forget(self.job, &departed, looked, &tree);
@@ -678,20 +632,10 @@ impl<'a> Watcher<'a> {
     }
 }
 
-/// What one sample finds outside the job at `look` and records in `recorded` ([`Recorded::record`]), each process
-/// `servers` spares left out with everything under it: the CPU of each recorded process as `times` reads it. The walk
-/// takes the command line of a process, `read` at most once in the sample.
-fn outside_the_job(
-    recorded: &mut Recorded,
-    servers: &Servers,
-    look: Look<'_>,
-    times: impl Fn(u32) -> io::Result<Option<ProcessTimes>>,
-    read: impl Fn(u32) -> Option<String>,
-) -> EscapedCpu {
-    let lines: RefCell<HashMap<u32, Option<String>>> = RefCell::new(HashMap::new());
-    // The snapshot lists one process for each pid, so within the sample a pid names one process and its start.
-    let line = |pid: u32| lines.borrow_mut().entry(pid).or_insert_with(|| read(pid)).clone();
-    recorded.record(look, |process| servers.spares(process, line));
+/// What one sample finds outside the job at `look` and records in `recorded` ([`Recorded::record`]): the CPU of each
+/// recorded process as `times` reads it.
+fn outside_the_job(recorded: &mut Recorded, look: Look<'_>, times: impl Fn(u32) -> io::Result<Option<ProcessTimes>>) -> EscapedCpu {
+    recorded.record(look);
     recorded.cpu(times)
 }
 
@@ -795,12 +739,6 @@ fn cut_at(started: Instant) -> u64 {
 /// The command's start as a process's start time reads it, or `None` when it is outside a [`Timestamp`]'s range.
 fn start_instant(since: u64) -> Option<Timestamp> {
     i64::try_from(since).ok().and_then(filetime_to_timestamp)
-}
-
-/// `path` made absolute against the gate's working directory, so a relative `--test-servers-under` still matches the
-/// program a command line names; a path that cannot be made absolute is left as it was given.
-fn absolute(path: &Path) -> PathBuf {
-    std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// The job's processes of `ids` read in pid order, and the number the cap or the budget left unread: only the ones the

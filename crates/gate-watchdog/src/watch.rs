@@ -47,9 +47,9 @@ pub struct Sample {
     pub pids: BTreeSet<u32>,
     /// Whether a gate under this one waits behind a critical request.
     pub paused: bool,
-    /// The processes outside the job under the processes it holds, the build servers and everything under them left
-    /// out, by pid and start (in 100 ns ticks since 1601), with the CPU time each has used in 100 ns ticks: a packaged
-    /// app a process of the job starts runs in a job of its own, and its CPU is the command's own.
+    /// The processes outside the job under the processes it holds, by pid and start (in 100 ns ticks since 1601), with
+    /// the CPU time each has used in 100 ns ticks: a packaged app a process of the job starts runs in a job of its own,
+    /// and its CPU is the command's own.
     pub escaped: BTreeMap<(u32, u64), u64>,
     /// The WSL VM's cumulative CPU time in 100 ns ticks, or `None` when it is not read, or could not be.
     pub vm_cpu: Option<u64>,
@@ -518,9 +518,44 @@ pub fn wsl_unavailable_line(message: &str) -> String {
     )
 }
 
+/// Whether the command's first word `first_word` names `wsl`: its file name with a trailing `.exe` stripped is `wsl`,
+/// ignoring case. A path is allowed, and a file name starts after a drive's `:`, as `Path.GetFileName` reads it.
+#[must_use]
+pub fn is_wsl_command(first_word: &str) -> bool {
+    let file = first_word.rsplit(['\\', '/', ':']).next().unwrap_or_default();
+    strip_exe(file).eq_ignore_ascii_case("wsl")
+}
+
+/// `file` without a trailing `.exe`, ignoring case.
+fn strip_exe(file: &str) -> &str {
+    if file.len() >= 4 && file.as_bytes()[file.len() - 4..].eq_ignore_ascii_case(b".exe") {
+        return &file[..file.len() - 4];
+    }
+    file
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The command's first word names `wsl` by its file name with a trailing `.exe` stripped, a path allowed.
+    #[test]
+    fn wsl_commands_are_read_from_the_file_name() {
+        let rows: [(&str, bool); 9] = [
+            ("wsl", true),
+            ("wsl.exe", true),
+            ("WSL.EXE", true),
+            (r"C:\Windows\System32\wsl.exe", true),
+            ("C:wsl.exe", true),
+            ("/usr/bin/wsl", true),
+            ("wslconfig", false),
+            ("bash.exe", false),
+            ("", false),
+        ];
+        for (word, want) in rows {
+            assert_eq!(is_wsl_command(word), want, "{word}");
+        }
+    }
 
     /// The system times of a machine that has been idle: a sample that reads them again sees a full share.
     const IDLE: SystemTimes = SystemTimes { idle: 0, kernel: 0, user: 0 };

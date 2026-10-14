@@ -140,7 +140,7 @@ function Start-Gate {
     $info.UseShellExecute = $false
     $info.WorkingDirectory = $repo
     $words = @('run', '--slot', 'heavy', '--timeout', '600', '--log', ".tmp\$Name.log", '--state-dir', $state,
-        '--test-servers-under', '.', '--test-poll-ms', '50', '--test-git-limit-ms', '3600000') + $Seams + @('--') + $Command
+        '--test-poll-ms', '50', '--test-git-limit-ms', '3600000') + $Seams + @('--') + $Command
     foreach ($word in $words) { $info.ArgumentList.Add($word) }
     foreach ($name in $inherited) { [void]$info.Environment.Remove($name) }
     $info.Environment['LOCALAPPDATA'] = $lad

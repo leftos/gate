@@ -29,7 +29,7 @@ The watchdog kills a stalled command, one past its ceiling and one past the back
 
   `none` is for a command that only dispatches or watches remote work, such as `gh run watch`, a deploy script polling a server or a remote image build. A remote-only watcher uses `none`: it takes no slot, never waits, starts at once even while a critical gate holds the machine, and keeps the log, the ceiling, the stall window and the kill.
 
-  A critical gate does not wait for a `none` run and does not protect it. It also moves the build servers of a `none` run as it moves an ungated build's, since a `none` run holds no claim, so a build belongs under a nested gate with a slot, whose claim protects its servers.
+  A critical gate does not wait for a `none` run and does not protect it.
 - **Slots.** The number of slots per kind comes from the machine's core count and can be changed in `%LOCALAPPDATA%\gate\v1\slot-counts.json`.
 - **Remote builders (optional).** A machine can send allowlisted heavy commands to other Windows machines it names in its own `%LOCALAPPDATA%\gate\v1\remote.json`. Builders are configured only there, on your machine; nothing about them lives in this repo. With no such file, gate runs everything locally.
 

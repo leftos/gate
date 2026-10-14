@@ -26,7 +26,6 @@ mod launch;
 mod launcher;
 mod nesting;
 mod pause;
-mod priority;
 mod push;
 mod remote_client;
 mod request;

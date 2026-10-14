@@ -203,8 +203,8 @@ fn wait_for(path: &str) -> Result<bool, String> {
     }
 }
 
-/// Spins on the CPU until the file at `path` exists, looking about every [`BURN_STEP`], so a case can stand a copy of
-/// this program in for a build server that is busy until its stop file appears. The arithmetic between two looks is
+/// Spins on the CPU until the file at `path` exists, looking about every [`BURN_STEP`], so a case has a process that
+/// keeps a core busy until its stop file appears. The arithmetic between two looks is
 /// kept by [`std::hint::black_box`], so an optimised build does not drop the burn.
 fn burn_until(path: &str) -> Result<(), String> {
     let mut state: u64 = 1;

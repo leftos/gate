@@ -29,8 +29,6 @@ fn seam_flags_parse_with_the_feature() {
             "--test-remote-wait-ms=90",
             "--test-git-limit-ms",
             "95",
-            "--test-servers-under",
-            r"target\case",
             "--test-print-request",
             "--",
             "cmd",
@@ -51,7 +49,6 @@ fn seam_flags_parse_with_the_feature() {
             remote_client: Some(std::path::PathBuf::from(r"steps\client.txt")),
             remote_wait_ms: Some(90),
             git_limit_ms: Some(95),
-            servers_under: Some(std::path::PathBuf::from(r"target\case")),
             ..TestSeams::default()
         }
     );
@@ -257,92 +254,6 @@ fn the_dotnet_limit_seam_is_read_once_and_refuses_zero() {
             "cmd"
         ]),
         ["gate: unknown option --test-dotnet-limit-ms", "gate: unexpected argument 5"]
-    );
-}
-
-#[cfg(feature = "test-seams")]
-#[test]
-fn the_servers_under_seam_needs_a_value_once() {
-    assert_eq!(
-        problems(&refs(&with(&RUN, &["--test-servers-under=", "--", "cmd"]))),
-        ["gate: --test-servers-under needs a value"]
-    );
-    assert_eq!(
-        problems(&refs(&with(&RUN, &["--test-servers-under", "--", "cmd"]))),
-        ["gate: --test-servers-under needs a value"]
-    );
-    assert_eq!(
-        problems(&refs(&with(
-            &RUN,
-            &["--test-servers-under", "a", "--test-servers-under", "b", "--", "cmd"]
-        ))),
-        ["gate: --test-servers-under is given twice"]
-    );
-    assert_eq!(
-        problems(&["stop-tree", "--test-servers-under", "5", "1"]),
-        ["gate: unknown option --test-servers-under", "gate: unexpected argument 1"]
-    );
-    assert_eq!(
-        problems(&[
-            "-Log",
-            "x",
-            "-TimeoutSeconds",
-            "5",
-            "-Slot",
-            "heavy",
-            "-TestServersUnder",
-            "5",
-            "--",
-            "cmd"
-        ]),
-        ["gate: unknown option -TestServersUnder", "gate: unexpected argument 5"]
-    );
-}
-
-#[cfg(feature = "test-seams")]
-#[test]
-fn the_server_image_seam_needs_the_servers_under_seam_and_a_value_once() {
-    use crate::support::run_request;
-
-    let given = ["--test-servers-under", ".", "--test-server-image", "gate-test-server.exe", "--", "cmd"];
-    assert_eq!(
-        run_request(&refs(&with(&RUN, &given))).test_seams.server_image,
-        Some("gate-test-server.exe".to_owned())
-    );
-    assert_eq!(
-        run_request(&refs(&with(&RUN, &["--test-servers-under", ".", "--", "cmd"])))
-            .test_seams
-            .server_image,
-        None,
-        "none unless given"
-    );
-    assert_eq!(
-        problems(&refs(&with(&RUN, &["--test-server-image", "gate-test-server.exe", "--", "cmd"]))),
-        ["gate: --test-server-image needs --test-servers-under"]
-    );
-    assert_eq!(
-        problems(&refs(&with(
-            &RUN,
-            &[
-                "--test-servers-under",
-                ".",
-                "--test-server-image",
-                "a.exe",
-                "--test-server-image",
-                "b.exe",
-                "--",
-                "cmd"
-            ]
-        ))),
-        ["gate: --test-server-image is given twice"]
-    );
-    assert_eq!(
-        problems(&refs(&with(&RUN, &["--test-servers-under", ".", "--test-server-image=", "--", "cmd"]))),
-        ["gate: --test-server-image needs a value"]
-    );
-    assert_eq!(
-        problems(&["stop-tree", "--test-server-image", "5", "1"]),
-        ["gate: unknown option --test-server-image", "gate: unexpected argument 1"]
     );
 }
 
@@ -1249,6 +1160,7 @@ fn seam_flags_are_unknown_without_the_feature() {
         "--test-remote-outputs-budget-bytes",
         "--test-remote-log-cap-bytes",
         "--test-server-image",
+        "--test-servers-under",
         "--test-diagnostics-budget-ms",
     ] {
         assert_eq!(

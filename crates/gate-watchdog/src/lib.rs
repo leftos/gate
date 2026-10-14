@@ -8,13 +8,11 @@
 mod cores;
 mod diagnostics;
 mod heartbeat;
-mod servers;
 mod share;
 mod watch;
 
 pub use cores::{Cores, Hint, SlotKind, hint};
 pub use diagnostics::{JOB_LINES, OUTSIDE_LINES, ProcessFacts, Report, SampleFacts, SampleHistory, WslVm, failed_block, failed_line, lines};
 pub use heartbeat::{BeatClock, CpuSource, Pump, Ticker};
-pub use servers::{PriorityClass, is_build_server, is_compiler_image, is_wsl_command, server_left, server_target};
 pub use share::{Machine, SystemTimes, Ticks};
-pub use watch::{Config, CpuMove, Kill, Sample, Watch, measure_cpu, sampler_failed_line, wsl_unavailable_line};
+pub use watch::{Config, CpuMove, Kill, Sample, Watch, is_wsl_command, measure_cpu, sampler_failed_line, wsl_unavailable_line};

@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use gate_state::v1::{self, CoveredMarker};
 use gate_state::{KernelObject, StateRoot};
-use gate_win32::{Job, StoppableProcess};
+use gate_win32::{Job, Priority, StoppableProcess, priority_of};
 use jiff::Timestamp;
 use serde_json::Value;
 
@@ -698,7 +698,7 @@ fn takers_but(case: &Case, but: u32) -> Vec<u64> {
 }
 
 /// Waits until the file at `path` holds a line containing `needle`, and returns that line.
-pub(crate) fn line_with(path: &Path, needle: &str) -> String {
+fn line_with(path: &Path, needle: &str) -> String {
     let found = || {
         fs::read_to_string(path)
             .ok()
@@ -1247,4 +1247,73 @@ fn a_heavy_gate_under_a_light_parent_takes_a_heavy_slot() {
     );
     assert_in_order(&outcome.stderr, &[&line, "gate: waiting for a heavy slot ("]);
     assert_eq!(events_besides(&case, holder_pid), ["queue", "take", "release"]);
+}
+
+/// The priority class of the process `pid`, read by the case itself: what its waits and assertions are ordered on.
+/// `None` once the process has ended.
+fn class_of(pid: u32) -> Option<Priority> {
+    priority_of(pid).expect("a process's class can be read")
+}
+
+/// The pid of the command that wrote `pid <n>` to the log at `log`, once it has.
+fn command_pid(log: &Path) -> u32 {
+    wait_until("the command to say its pid", || {
+        fs::read_to_string(log).is_ok_and(|text| text.lines().any(|line| line.starts_with("pid ")))
+    });
+    said_pid(&fs::read_to_string(log).expect("the log can be read"), "pid ")
+}
+
+#[test]
+fn a_covered_gate_whose_critical_parent_ended_lowers_its_command() {
+    let case = Case::new("a_covered_gate_whose_critical_parent_ended_lowers_its_command");
+    let go = shown(&case.folder().join("go"));
+    let release = case.folder().join("outer.release");
+    let inner = heavy_words("inner.log", &LOOK_OFTEN, &[FAKE_TOOL, "pid", "wait", &go]);
+    // The heavy gate runs under the critical outer gate's slot, as critical: its command at High.
+    let (outer, orphan) = orphaned_as(&case, "critical", &inner, &release);
+    let command = command_pid(&case.folder().join("inner.log"));
+    assert_eq!(class_of(command), Some(Priority::High), "the command runs as critical");
+
+    end_parent(outer, &release);
+    wait_for_journal_line(&case.root(), &format!(r#""event":"take","pid":{},"#, orphan.pid));
+    wait_until("the command lowered from High at the take", || {
+        class_of(command) == Some(Priority::BelowNormal)
+    });
+
+    fs::write(&go, "").expect("the go file can be written");
+    assert_eq!(orphan.ended(), 0);
+}
+
+#[test]
+fn a_light_gate_under_a_critical_parent_that_ends_runs_as_light_under_a_heavy_stand_in() {
+    let case = Case::new("a_light_gate_under_a_critical_parent_that_ends_runs_as_light_under_a_heavy_stand_in");
+    let paths = ["c.pid", "c.release", "c-go", "outer.release"].map(|name| case.folder().join(name));
+    let [c_pid, c_release, c_go, release] = &paths;
+    let texts = paths.each_ref().map(|path| shown(path));
+    let mut a_command = vec![FAKE_TOOL, "spawn-pid", &texts[0], &texts[1], GATE];
+    a_command.extend(run_words("c.log", &LOOK_OFTEN, &[FAKE_TOOL, "pid", "wait", &texts[2]]));
+    let a_words = heavy_words("a.log", &LOOK_OFTEN, &a_command);
+
+    // O (critical) > A (heavy) > C (light): both run as critical, C's command at High.
+    let (outer, a) = orphaned_as(&case, "critical", &a_words, release);
+    let c = spawned(&case, c_pid);
+    let command = command_pid(&case.folder().join("c.log"));
+    assert_eq!(class_of(command), Some(Priority::High), "C's command runs as critical");
+
+    let outer_pid = end_parent(outer, release);
+    let c_line = line_with(&case.folder().join("a.log.err"), &format!("gate: the parent gate {outer_pid} ended;"));
+    assert_eq!(
+        c_line,
+        format!("gate: the parent gate {outer_pid} ended; running under the heavy slot of gate {}", a.pid),
+        "A stands in with the heavy slot it takes, not the critical one O held"
+    );
+    wait_until("C's command lowered from High as a light gate's runs", || {
+        class_of(command) == Some(Priority::BelowNormal)
+    });
+
+    let_go(c_go);
+    assert_eq!(c.ended(), 0);
+    let_go(c_release);
+    assert_eq!(a.ended(), 0);
+    assert_eq!(events_of(&case, c.pid), ["covered"]);
 }

@@ -12,10 +12,8 @@ use crate::support::{Case, FAKE_TOOL, UNTIL_KILLED, assert_in_order, release, ru
 const DIAGNOSTICS_FAIL: &str = "--test-diagnostics-fail makes the diagnostics fail (test seam only)";
 
 /// The words of a run in `slot` with a 1 s ceiling, logging to `out.log`, `seams` before `--` and `command` after it.
-/// The server scan is confined to the case's folder, as the run words' own is, so the run moves no build server of the
-/// machine it did not start itself.
 fn ceiling_words<'a>(slot: &'a str, seams: &[&'a str], command: &[&'a str]) -> Vec<&'a str> {
-    let mut words = vec!["run", "--slot", slot, "--timeout", "1", "--log", "out.log", "--test-servers-under", "."];
+    let mut words = vec!["run", "--slot", slot, "--timeout", "1", "--log", "out.log"];
     words.extend(seams);
     words.push("--");
     words.extend(command);
