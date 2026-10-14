@@ -158,18 +158,20 @@ pub(crate) fn raised_ceiling_line(resolved: u64, p99: f64, floor: u64, family: b
     )
 }
 
-/// The hint a take says when its `resolved` ceiling is below the p90 of its `estimate`: `gate: the ceiling {resolved}
-/// is below this command's usual p90 of {p90}`, each a span by [`span_text`], and "similar commands'" for a family
-/// key's estimate; `None` at or above the p90, and for an estimate too wide to judge by ([`too_wide`]).
+/// The hint a take says when its `resolved` ceiling is below the load-adjusted p90 of its `estimate`: `gate: the
+/// ceiling {resolved} is below this command's load-adjusted p90 of {p90}`, each a span by [`span_text`], and "similar
+/// commands'" for a family key's estimate; `None` at or above the p90, when the estimate has no adjusted p90, and for
+/// an estimate too wide to judge by ([`too_wide`]).
 #[expect(clippy::cast_precision_loss, reason = "the CLI bounds a ceiling to 2^31 - 1, which an f64 holds exactly")]
 pub(crate) fn ceiling_hint(resolved: u64, estimate: &Estimate) -> Option<String> {
     let ceiling = resolved as f64;
-    (ceiling < estimate.p90 && !too_wide(estimate)).then(|| {
+    let p90 = estimate.adjusted_p90?;
+    (ceiling < p90 && !too_wide(estimate)).then(|| {
         format!(
-            "gate: the ceiling {} is below {} usual p90 of {}",
+            "gate: the ceiling {} is below {} load-adjusted p90 of {}",
             span_text(ceiling),
             whose(estimate.family),
-            span_text(estimate.p90)
+            span_text(p90)
         )
     })
 }
@@ -536,6 +538,7 @@ mod tests {
             p50,
             p90,
             p99: p90,
+            adjusted_p90: None,
             adjusted_p99: None,
             mean,
             runs,
@@ -727,17 +730,20 @@ mod tests {
 
     #[test]
     fn the_ceiling_hint_says_the_owner_s_line() {
-        let usual = |p90: f64| estimate(p90, p90, p90, 5, false);
+        let usual = |p90: f64| Estimate {
+            adjusted_p90: Some(p90),
+            ..estimate(p90, p90, p90, 5, false)
+        };
         assert_eq!(
             ceiling_hint(600, &usual(840.0)).as_deref(),
-            Some("gate: the ceiling 10 min is below this command's usual p90 of 14 min")
+            Some("gate: the ceiling 10 min is below this command's load-adjusted p90 of 14 min")
         );
         assert_eq!(
             ceiling_hint(5, &usual(60.0)).as_deref(),
-            Some("gate: the ceiling 5 s is below this command's usual p90 of 60 s")
+            Some("gate: the ceiling 5 s is below this command's load-adjusted p90 of 60 s")
         );
-        assert_eq!(ceiling_hint(840, &usual(840.0)), None, "at the p90");
-        assert_eq!(ceiling_hint(900, &usual(840.0)), None, "above the p90");
+        assert_eq!(ceiling_hint(840, &usual(840.0)), None, "at the load-adjusted p90");
+        assert_eq!(ceiling_hint(900, &usual(840.0)), None, "above the load-adjusted p90");
     }
 
     /// This command's usual p90 of `p90` seconds.
@@ -780,10 +786,13 @@ mod tests {
             raised_ceiling_line(2520, 840.0, 900, true),
             "gate: ceiling 42 min (3x similar commands' p99 of 14 min, above the given 15 min)"
         );
-        let family = estimate(840.0, 840.0, 840.0, 5, true);
+        let family = Estimate {
+            adjusted_p90: Some(840.0),
+            ..estimate(840.0, 840.0, 840.0, 5, true)
+        };
         assert_eq!(
             ceiling_hint(600, &family).as_deref(),
-            Some("gate: the ceiling 10 min is below similar commands' usual p90 of 14 min")
+            Some("gate: the ceiling 10 min is below similar commands' load-adjusted p90 of 14 min")
         );
         assert_eq!(
             hang_hint(2520.0, Usual { p90: 840.0, family: true }).as_deref(),
@@ -794,25 +803,59 @@ mod tests {
     #[test]
     fn a_wide_family_estimate_gives_no_hints() {
         // A family key's p90 above 2x its p50 raises no auto ceiling, and says neither hint.
-        let wide = estimate(840.0, 400.0, 840.0, 5, true);
+        let wide = Estimate {
+            adjusted_p90: Some(840.0),
+            ..estimate(840.0, 400.0, 840.0, 5, true)
+        };
         assert_eq!(ceiling_hint(600, &wide), None, "no ceiling hint");
         assert_eq!(Usual::of(&wide), None, "no p90 for the hang hint");
 
-        let at_twice = estimate(840.0, 420.0, 840.0, 5, true);
+        let at_twice = Estimate {
+            adjusted_p90: Some(840.0),
+            ..estimate(840.0, 420.0, 840.0, 5, true)
+        };
         assert_eq!(
             ceiling_hint(600, &at_twice).as_deref(),
-            Some("gate: the ceiling 10 min is below similar commands' usual p90 of 14 min"),
+            Some("gate: the ceiling 10 min is below similar commands' load-adjusted p90 of 14 min"),
             "a family p90 of exactly 2x its p50 still hints"
         );
         assert_eq!(Usual::of(&at_twice), Some(Usual { p90: 840.0, family: true }));
 
-        let own = estimate(840.0, 400.0, 840.0, 5, false);
+        let own = Estimate {
+            adjusted_p90: Some(840.0),
+            ..estimate(840.0, 400.0, 840.0, 5, false)
+        };
         assert_eq!(
             ceiling_hint(600, &own).as_deref(),
-            Some("gate: the ceiling 10 min is below this command's usual p90 of 14 min"),
+            Some("gate: the ceiling 10 min is below this command's load-adjusted p90 of 14 min"),
             "the rule is a family key's only"
         );
         assert_eq!(Usual::of(&own), Some(Usual { p90: 840.0, family: false }));
+    }
+
+    #[test]
+    fn a_wall_p90_above_the_ceiling_says_nothing_when_the_load_adjusted_p90_is_at_or_below_it() {
+        let at = Estimate {
+            adjusted_p90: Some(600.0),
+            ..estimate(840.0, 840.0, 840.0, 5, false)
+        };
+        let below = Estimate {
+            adjusted_p90: Some(60.0),
+            ..estimate(840.0, 840.0, 840.0, 5, false)
+        };
+        assert_eq!(ceiling_hint(600, &at), None, "at the load-adjusted p90");
+        assert_eq!(ceiling_hint(600, &below), None, "below the load-adjusted p90");
+    }
+
+    #[test]
+    fn an_estimate_without_a_load_adjusted_p90_says_no_ceiling_hint() {
+        let high_wall = estimate(840.0, 840.0, 840.0, 5, false);
+        assert_eq!(high_wall.p90, 840.0, "a wall p90 well above the ceiling");
+        assert_eq!(
+            ceiling_hint(600, &high_wall),
+            None,
+            "no load-adjusted p90 to compare, however high the wall p90"
+        );
     }
 
     /// A journal lock no other gate holds.

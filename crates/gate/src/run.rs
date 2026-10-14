@@ -564,7 +564,7 @@ impl Taker<'_> {
 
 /// Says the lines of the slot just taken, for its `estimate`: the expected-time line, then the raised-ceiling line when
 /// history raised the run's auto ceiling above its floor to `resolved`, then the ceiling hint when `resolved` is below
-/// the usual p90; nothing for a key without history.
+/// the load-adjusted p90; nothing for a key without history.
 fn say_expected(estimate: Option<&Estimate>, resolved: Resolved, console: &mut Console) {
     let Some(estimate) = estimate else {
         return;
@@ -574,7 +574,7 @@ fn say_expected(estimate: Option<&Estimate>, resolved: Resolved, console: &mut C
 }
 
 /// Says the ceiling lines of a take for its `estimate`: the raised-ceiling line when history raised the run's auto
-/// ceiling above its floor to `resolved`, then the ceiling hint when `resolved` is below the usual p90.
+/// ceiling above its floor to `resolved`, then the ceiling hint when `resolved` is below the load-adjusted p90.
 fn say_ceiling(estimate: &Estimate, resolved: Resolved, console: &mut Console) {
     if let Some((p99, floor)) = resolved.raised {
         console.err(&raised_ceiling_line(resolved.seconds, p99, floor, estimate.family));
