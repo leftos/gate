@@ -6,8 +6,8 @@ use std::path::PathBuf;
 
 use crate::problem::{Problem, Required, Spelling};
 use crate::request::{
-    BurnRequest, Ceiling, CutoverRequest, CutoverSeams, DEFAULT_STALL_SECONDS, DEFAULT_TAIL_LINES, ExpectRequest, PushRequest, PushSeams, RunRequest,
-    Slot, StopRequest, TestSeams,
+    BurnRequest, Ceiling, CheckRequest, CheckSeams, CutoverRequest, CutoverSeams, DEFAULT_STALL_SECONDS, DEFAULT_TAIL_LINES, ExpectRequest,
+    PushRequest, PushSeams, RunRequest, Slot, StopRequest, TestSeams,
 };
 use crate::values;
 
@@ -77,6 +77,8 @@ pub(crate) enum ValueOption {
     PushSsh,
     #[cfg(feature = "test-seams")]
     PushBoundMs,
+    #[cfg(feature = "test-seams")]
+    ProbeLimitMs,
 }
 
 /// An option that is on or off.
@@ -133,6 +135,8 @@ pub(crate) struct RunBuilder {
     cutover_seams: CutoverSeams,
     /// `gate push`'s own seams, `--test-push-ssh` and `--test-push-bound-ms`.
     push_seams: PushSeams,
+    /// `gate check`'s own seam, `--test-probe-limit-ms`.
+    check_seams: CheckSeams,
     given: Vec<RunOption>,
     pub(crate) problems: Vec<Problem>,
     /// The form the command line is read in: the CLI's unless [`RunBuilder::compat`] made the builder.
@@ -273,6 +277,8 @@ impl RunBuilder {
             ValueOption::PushSsh => self.push_seams.ssh = Some(PathBuf::from(value)),
             #[cfg(feature = "test-seams")]
             ValueOption::PushBoundMs => self.push_seams.bound_ms = Some(values::above_zero(spelled, value)?),
+            #[cfg(feature = "test-seams")]
+            ValueOption::ProbeLimitMs => self.check_seams.probe_limit_ms = Some(values::above_zero(spelled, value)?),
         }
         Ok(())
     }
@@ -452,6 +458,14 @@ impl RunBuilder {
             return Err(self.problems);
         }
         Ok(PushRequest { seams: self.push_seams })
+    }
+
+    /// The check request, its seam the probe limit read, or every problem found.
+    pub(crate) fn finish_check(self) -> Result<CheckRequest, Vec<Problem>> {
+        if !self.problems.is_empty() {
+            return Err(self.problems);
+        }
+        Ok(CheckRequest { seams: self.check_seams })
     }
 
     /// The burn request, its cores and seconds, or every problem: those found while reading, then a missing

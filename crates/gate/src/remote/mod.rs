@@ -20,12 +20,14 @@ use gate_win32::{Interrupt, OwnedMutexGuard};
 
 use crate::durations::Usual;
 
+pub(crate) use client::{local_sdk_listing, outside_worktree};
+
 mod client;
 pub(crate) mod git;
 mod install;
 mod launch;
 mod outputs;
-mod parity;
+pub(crate) mod parity;
 mod payload;
 mod retry;
 pub(crate) mod siblings;
@@ -35,10 +37,11 @@ mod syncback;
     not(test),
     expect(
         dead_code,
-        reason = "the manifest reader serves only its tests until the routed preflight reads the manifest"
+        reason = "gate check reads the manifest; nothing outside the tests reads the dotnet tool and Godot SDK pins \
+                  read beside it"
     )
 )]
-mod toolchain;
+pub(crate) mod toolchain;
 pub(crate) mod transport;
 mod watchdog;
 

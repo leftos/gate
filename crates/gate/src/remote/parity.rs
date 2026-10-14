@@ -248,7 +248,8 @@ pub(crate) struct Pin {
 }
 
 impl Pin {
-    /// A `global.json` the client could not read whole: it holds no readable pin, so the major rule applies.
+    /// A `global.json` that holds no readable pin, one the client could not read whole or one that names no
+    /// `sdk.version`, so the major rule applies.
     pub(crate) fn unreadable() -> Pin {
         Pin {
             found: true,
@@ -264,49 +265,90 @@ impl Pin {
 /// is skipped, only its first JSON value is read, as dotnet reads it, and any text after it is ignored; a
 /// `global.json` dotnet would ignore holds no readable pin.
 pub(crate) fn pin_of(global_json: Option<&str>) -> Pin {
-    let mut pin = Pin {
-        found: global_json.is_some(),
-        version: None,
-        roll_forward: None,
-        allow_prerelease: true,
-    };
     let Some(text) = global_json else {
-        return pin;
+        return Pin {
+            found: false,
+            version: None,
+            roll_forward: None,
+            allow_prerelease: true,
+        };
     };
-    // A text that is not the file's own bytes — a lossy read of one that is not UTF-8 holds U+FFFD — is no pin.
-    if text.contains('\u{fffd}') {
-        return pin;
+    match pin_in_text(text) {
+        PinRead::Pinned(pin) => pin,
+        PinRead::NoPin | PinRead::Unreadable(_) => Pin::unreadable(),
     }
-    let stripped = without_comments(text.trim_start_matches('\u{feff}'));
-    let mut values = serde_json::Deserializer::from_str(&stripped).into_iter::<Value>();
-    let Some(Ok(parsed)) = values.next() else {
-        return pin;
+}
+
+/// What the `global.json` whose text is `text` holds of an SDK pin.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum PinRead {
+    /// It names no `sdk.version` at all, as a file that only lists `msbuild-sdks` does: it pins no SDK, so a check
+    /// says and counts nothing of it.
+    NoPin,
+    /// It names a pin that cannot be read, and why.
+    Unreadable(String),
+    /// Its pin reads.
+    Pinned(Pin),
+}
+
+/// The pin the `global.json` whose text is `text` holds, read as [`pin_of`] reads it.
+pub(crate) fn pin_in_text(text: &str) -> PinRead {
+    let Some(parsed) = parsed(text) else {
+        return PinRead::Unreadable("does not parse as JSON".to_owned());
     };
     let Some(sdk) = member(&parsed, "sdk") else {
-        return pin;
+        return PinRead::NoPin;
     };
-    let Some(version) = member(sdk, "version")
-        .and_then(Value::as_str)
-        .filter(|version| SdkVersion::parse(version).is_some())
-    else {
-        return pin;
+    let Some(sdk) = sdk.as_object() else {
+        return PinRead::Unreadable("its sdk is not an object".to_owned());
     };
-    let roll_forward = match member(sdk, "rollForward") {
+    let Some(version) = sdk.get("version") else {
+        return PinRead::NoPin;
+    };
+    let Some(version) = version.as_str().filter(|version| SdkVersion::parse(version).is_some()) else {
+        return PinRead::Unreadable("its sdk.version is not a version dotnet reads".to_owned());
+    };
+    match sdk_options(sdk) {
+        Ok((roll_forward, allow_prerelease)) => PinRead::Pinned(Pin {
+            found: true,
+            version: Some(version.to_owned()),
+            roll_forward,
+            allow_prerelease,
+        }),
+        Err(why) => PinRead::Unreadable(why),
+    }
+}
+
+/// The `sdk.rollForward` and `sdk.allowPrerelease` of the `sdk` object; else why one of them is not what dotnet
+/// reads.
+fn sdk_options(sdk: &serde_json::Map<String, Value>) -> Result<(Option<String>, bool), String> {
+    let roll_forward = match sdk.get("rollForward") {
         None => None,
-        Some(value) => match value.as_str().filter(|policy| Roll::named(policy).is_some()) {
-            Some(policy) => Some(policy.to_owned()),
-            None => return pin,
-        },
+        Some(value) => Some(
+            value
+                .as_str()
+                .filter(|policy| Roll::named(policy).is_some())
+                .ok_or_else(|| "its sdk.rollForward is not a policy gate knows".to_owned())?
+                .to_owned(),
+        ),
     };
-    let allow_prerelease = match member(sdk, "allowPrerelease") {
+    let allow_prerelease = match sdk.get("allowPrerelease") {
         None => true,
         Some(Value::Bool(allow)) => *allow,
-        Some(_) => return pin,
+        Some(_) => return Err("its sdk.allowPrerelease is not true or false".to_owned()),
     };
-    pin.version = Some(version.to_owned());
-    pin.roll_forward = roll_forward;
-    pin.allow_prerelease = allow_prerelease;
-    pin
+    Ok((roll_forward, allow_prerelease))
+}
+
+/// The first JSON value of the `global.json` whose text is `text`, read as [`pin_of`] reads it; `None` when it does
+/// not parse. A text that is not the file's own bytes, as a lossy read of one that is not UTF-8 holding U+FFFD is,
+/// does not parse.
+fn parsed(text: &str) -> Option<Value> {
+    if text.contains('\u{fffd}') {
+        return None;
+    }
+    let stripped = without_comments(text.trim_start_matches('\u{feff}'));
+    serde_json::Deserializer::from_str(&stripped).into_iter::<Value>().next()?.ok()
 }
 
 /// The text `text` with the JSON comments dotnet reads dropped: `//` to the end of its line, its line end kept, and
@@ -391,6 +433,12 @@ pub(crate) fn newest_major<'v>(versions: impl IntoIterator<Item = &'v str>) -> u
         .map(|version| version.major)
         .max()
         .unwrap_or(0)
+}
+
+/// The version each non-empty line of a `dotnet --list-sdks` listing starts with, in listing order: the line's first
+/// word, before the `[<folder>]` dotnet writes after it.
+pub(crate) fn sdk_versions(listing: &str) -> Vec<&str> {
+    listing.lines().filter_map(|line| line.split_whitespace().next()).collect()
 }
 
 /// What a toolchain need is of.

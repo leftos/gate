@@ -739,7 +739,7 @@ impl Attempt<'_, '_> {
         }
         let worktree = Path::new(self.call.root);
         match local_sdk_listing(Variables::from_process(), worktree, self.dotnet_limit, self.call.interrupt) {
-            Ok(listing) => parity::newest_major(listing.lines().filter_map(|line| line.split_whitespace().next())),
+            Ok(listing) => parity::newest_major(parity::sdk_versions(&listing)),
             Err(_) if self.call.interrupt.is_some_and(Interrupt::is_raised) => 0,
             Err(error) => {
                 let why = String::from(error);
@@ -2328,9 +2328,17 @@ fn dotnet_limit(seams: &TestSeams) -> Duration {
 /// What `dotnet --list-sdks` lists on this PC, as [`git::sdk_listing`] reads it, with the folders inside `worktree`
 /// dropped from the `PATH` of `variables`, each compared by its canonical path so a junction does not get around it,
 /// and a dotnet found that still lies inside it refused. A `PATH` that cannot be read that way cannot be read at all.
-fn local_sdk_listing(variables: Variables, worktree: &Path, limit: Duration, interrupt: Option<Interrupt>) -> Result<String, GitError> {
-    let path = path_outside(&variables, worktree).map_err(GitError::Failed)?;
-    git::sdk_listing(variables.with("PATH", &path), limit, interrupt, Some(worktree))
+pub(crate) fn local_sdk_listing(variables: Variables, worktree: &Path, limit: Duration, interrupt: Option<Interrupt>) -> Result<String, GitError> {
+    let variables = outside_worktree(variables, worktree).map_err(GitError::Failed)?;
+    git::sdk_listing(variables, limit, interrupt, Some(worktree))
+}
+
+/// `variables` with the folders inside `worktree` dropped from their `PATH`, as [`path_outside`] rebuilds it, so a
+/// program of the repo's own is never found along it; else why the `PATH` cannot be rebuilt. This PC's SDK list and
+/// `gate check`'s tool probes look for their programs along it.
+pub(crate) fn outside_worktree(variables: Variables, worktree: &Path) -> Result<Variables, String> {
+    let path = path_outside(&variables, worktree)?;
+    Ok(variables.with("PATH", &path))
 }
 
 /// The `PATH` of `variables` without the folders inside `worktree`, each compared by its canonical path: an `npm run`

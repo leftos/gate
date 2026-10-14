@@ -588,9 +588,9 @@ fn matched<'a>(config: &'a Config, words: &[String], facts: &dyn Facts) -> Resul
     let place = facts.place().map_err(|reason| Some(failed(&reason)))?.ok_or(None)?;
     let repo = repo_name(&place.checkout);
     let patterns = config.patterns(&repo).ok_or(None)?;
-    let (parent, separator, leaf) = split_root(&place.root);
+    let (_, _, leaf) = split_root(&place.root);
     let (siblings, problem) = match facts.siblings(&place) {
-        Ok(names) => (sibling_roots(parent, separator, names), None),
+        Ok(names) => (sibling_roots(&place.root, names), None),
         Err(problem) => (Vec::new(), Some(problem)),
     };
     let drives = subst_drives(&place.root, words, facts);
@@ -625,16 +625,25 @@ fn first_match(patterns: &[Pattern], words: &[String]) -> Option<String> {
         .map(|pattern| pattern.as_str().to_owned())
 }
 
-/// The roots of the siblings `names`, each the worktree root's `parent` and the name joined by `separator`, in
-/// declared order.
-fn sibling_roots(parent: &str, separator: char, names: Vec<String>) -> Vec<SiblingRoot> {
+/// The roots of the siblings `names` of the worktree root `root`, each as [`sibling_root`] spells it, in declared
+/// order.
+fn sibling_roots(root: &str, names: Vec<String>) -> Vec<SiblingRoot> {
     names
         .into_iter()
         .map(|name| SiblingRoot {
-            root: format!("{parent}{separator}{name}"),
+            root: sibling_root(root, &name),
             name,
         })
         .collect()
+}
+
+/// Where the sibling `name` of the worktree root `root` lies: beside the root, its parent and `name` joined by the
+/// separator before the root's last segment, trailing separators aside. A root with no separator has the sibling
+/// `/name`.
+#[must_use]
+pub fn sibling_root(root: &str, name: &str) -> String {
+    let (parent, separator, _) = split_root(root);
+    format!("{parent}{separator}{name}")
 }
 
 /// Keeps a matched command here, saying why, for its siblings, checked in this order: the siblings file's `problem`;

@@ -60,6 +60,19 @@ impl Version {
     }
 }
 
+/// The version as `major.minor.patch`, every part written.
+impl std::fmt::Display for Version {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}.{}.{}", self.major, self.minor, self.patch)
+    }
+}
+
+/// Whether a tool found at the version `found` spells is at or past the minimum `min`; `None` when `found` is no
+/// version [`Version::parse`] reads, so it cannot be compared.
+pub(crate) fn meets(min: Version, found: &str) -> Option<bool> {
+    Version::parse(found).map(|found| found >= min)
+}
+
 /// The dot-separated numbers `text` spells, each one or more ASCII digits; `None` when a part is not one.
 fn numbers(text: &str) -> Option<Vec<u64>> {
     text.split('.').map(number).collect()
@@ -123,8 +136,9 @@ fn without_bom(text: &str) -> &str {
     text.strip_prefix('\u{feff}').unwrap_or(text)
 }
 
-/// The key `key` as TOML spells it: bare when it is one or more ASCII letters, digits, `_` and `-`, else quoted.
-fn spelled(key: &str) -> String {
+/// The key `key` as TOML spells it: bare when it is one or more ASCII letters, digits, `_` and `-`, else quoted, its
+/// line ends and other control characters escaped, so it is always one line.
+pub(crate) fn spelled(key: &str) -> String {
     let bare = !key.is_empty() && key.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-');
     if bare { key.to_owned() } else { format!("{key:?}") }
 }
@@ -352,10 +366,36 @@ fn attributes(text: &str) -> Vec<(&str, &str)> {
 #[cfg(test)]
 #[expect(clippy::expect_used, reason = "a fixture that does not read must fail loudly")]
 mod tests {
-    use super::{Manifest, ToolNeed, Version, dotnet_tools, godot_sdk_pins, read, read_bytes, unreadable_line};
+    use super::{Manifest, ToolNeed, Version, dotnet_tools, godot_sdk_pins, meets, read, read_bytes, unreadable_line};
 
     fn version(major: u64, minor: u64, patch: u64) -> Version {
         Version { major, minor, patch }
+    }
+
+    #[test]
+    fn meets_is_true_at_or_past_the_minimum_and_false_below_it() {
+        let min = version(1, 89, 0);
+        assert_eq!(meets(min, "1.89.0"), Some(true), "at the minimum");
+        assert_eq!(meets(min, "1.89"), Some(true), "missing parts are 0");
+        assert_eq!(meets(min, "1.99.0"), Some(true), "past it");
+        assert_eq!(meets(min, "2.0.0"), Some(true), "a later major");
+        assert_eq!(meets(min, "1.88.9"), Some(false), "below it");
+        assert_eq!(meets(min, "0.100.0"), Some(false), "an earlier major whatever its minor");
+        assert_eq!(meets(version(0, 9, 100), "0.9.99"), Some(false), "parts compare as numbers, not text");
+    }
+
+    #[test]
+    fn meets_cannot_compare_a_found_text_that_is_no_version() {
+        let min = version(24, 0, 0);
+        for found in ["", "v24.1.0", "24.1.0-beta", "1.2.3.4", "present"] {
+            assert_eq!(meets(min, found), None, "{found:?}");
+        }
+    }
+
+    #[test]
+    fn a_version_is_written_with_every_part() {
+        assert_eq!(version(1, 89, 0).to_string(), "1.89.0");
+        assert_eq!(Version::parse("24").map(|found| found.to_string()).as_deref(), Some("24.0.0"));
     }
 
     fn manifest(text: &str) -> Manifest {

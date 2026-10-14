@@ -29,6 +29,8 @@ pub enum Invocation {
     Cutover(CutoverRequest),
     /// `gate push`.
     Push(PushRequest),
+    /// `gate check`.
+    Check(CheckRequest),
     /// `gate burn`.
     Burn(BurnRequest),
     /// `gate expect`.
@@ -303,6 +305,22 @@ pub struct CutoverSeams {
 pub struct PushRequest {
     /// The hidden `--test-*` flags that set the push's ssh and bound.
     pub seams: PushSeams,
+}
+
+/// A valid `gate check`, which takes no words: only the hidden seams the black-box suite gives it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CheckRequest {
+    /// The hidden `--test-*` flags that set the check's probe limit.
+    pub seams: CheckSeams,
+}
+
+/// What the black-box suite sets on `gate check` through its hidden `--test-*` flags; each field keeps its default,
+/// `None`, in a gate built without the `test-seams` feature.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CheckSeams {
+    /// How long the check's tool probes may take together, in milliseconds, in place of the built-in 10 s
+    /// (`--test-probe-limit-ms`).
+    pub probe_limit_ms: Option<u64>,
 }
 
 /// A valid `gate burn`: the threads to spin, `None` for the machine's logical processors, and how many seconds to spin

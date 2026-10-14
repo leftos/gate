@@ -10,9 +10,11 @@ gate run --slot heavy --timeout 900 --log .tmp/test.log -- cargo test --workspac
 
 Pre-release. Nothing here is ready to use yet, and gate is not yet a replacement for anything. The design is written ([docs/design.md](docs/design.md)); the code is being built slice by slice.
 
-So far `gate` reads its command line (`--version`, `--help`, and the argument checks for `run`, `stop-tree`, `cutover`, `push`, `burn` and `expect`), and `gate run` starts a command under a slot, logs its output, prints the tail and a verdict line, and exits with the command's status.
+So far `gate` reads its command line (`--version`, `--help`, and the argument checks for `run`, `stop-tree`, `cutover`, `push`, `check`, `burn` and `expect`), and `gate run` starts a command under a slot, logs its output, prints the tail and a verdict line, and exits with the command's status.
 
 The watchdog kills a stalled command, one past its ceiling and one past the backstop, and Ctrl+C stops a run; routing is not built yet. `gate stop-tree <pid>` stops a process tree and the gate jobs inside it. `gate push` copies the installed `gate.exe` to the builders.
+
+`gate check` says what this PC lacks for the repo in the current folder (the tools its `.gate/toolchain.toml` names, the SDK its `global.json` pins, the sibling worktrees `.gate/siblings.toml` declares) and the command that installs each; it installs nothing, and exits 1 when something is missing or the check could not run (not in a git repository, or a `.gate/toolchain.toml`, `.gate/siblings.toml` or `global.json` it cannot read).
 
 `gate burn [--cores <n>] --seconds <s>` spins the CPU on `n` threads for up to 180 s, for the load-burn tool, and ends early if the process that started it ends. `gate expect -- <command>` prints the expected time of a command in the current folder, here and on each builder, from the durations store, or `no history`; the launcher maps no `-Expect`, so callers run `gate.exe expect -- <command>` directly.
 

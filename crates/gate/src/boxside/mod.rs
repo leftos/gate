@@ -10,7 +10,7 @@ mod inflight;
 pub(crate) mod outputs;
 pub(crate) mod payload;
 mod preflight;
-mod probe;
+pub(crate) mod probe;
 mod run;
 mod stop;
 mod tools;

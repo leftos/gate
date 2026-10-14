@@ -21,10 +21,10 @@ use crate::resolve::Environment;
 
 /// The `notRouted` value of a heavy gate its caller kept here with `--local`.
 const LOCAL_FLAG: &str = "--local";
-/// The largest `.gate/siblings.toml` the decision reads: 64 KiB.
-const SIBLINGS_MOST_BYTES: usize = 64 * 1024;
-/// The problem of a `.gate/siblings.toml` that is a link, a junction or a folder.
-const SIBLINGS_NOT_A_FILE: &str = "is a link, a junction or not a file";
+/// The largest file of `.gate` the gate reads: 64 KiB.
+const GATE_FILE_MOST_BYTES: usize = 64 * 1024;
+/// The problem of a file of `.gate` that is a link, a junction or a folder.
+const GATE_FILE_NOT_A_FILE: &str = "is a link, a junction or not a file";
 /// Why a command that would route runs here when one of its words is not valid Unicode.
 const NOT_UNICODE: &str = "a word of the command is not valid Unicode";
 
@@ -227,14 +227,33 @@ impl Facts for Machine<'_> {
     }
 
     fn sibling_present(&self, root: &str) -> Result<bool, String> {
-        let git = Path::new(root).join(".git");
-        git.try_exists()
-            .map_err(|error| format!("cannot tell whether {} exists: {error}", git.display()))
+        sibling_present(root)
     }
 }
 
-/// The siblings `<root>\.gate\siblings.toml` declares as it stands on disk: no file declares none, and a file that
-/// cannot be read, does not parse or has any problem gives its first problem.
+/// Whether the sibling whose root is `root` is there: it has a `.git`, a folder or a linked worktree's file; else why
+/// that cannot be told. Routing and `gate check` look for a sibling by this rule.
+pub(crate) fn sibling_present(root: &str) -> Result<bool, String> {
+    let git = Path::new(root).join(".git");
+    git.try_exists()
+        .map_err(|error| format!("cannot tell whether {} exists: {error}", git.display()))
+}
+
+/// The siblings `<root>\.gate\siblings.toml` declares as it stands on disk, read by [`read_gate_file`]: no file
+/// declares none, and a file that cannot be read, does not parse or has any problem gives its first problem.
+fn read_siblings(root: &Path) -> Result<Vec<String>, String> {
+    let Some(bytes) = read_gate_file(root, "siblings.toml")? else {
+        return Ok(Vec::new());
+    };
+    let declared = siblings::read_bytes(&bytes)?;
+    match declared.problems.into_iter().next() {
+        Some(problem) => Err(problem),
+        None => Ok(declared.names),
+    }
+}
+
+/// The bytes of the file `name` of `<root>\.gate` as it stands on disk; `None` when there is no such file. Routing reads
+/// `siblings.toml` and `gate check` reads `toolchain.toml` and `siblings.toml` through this.
 ///
 /// `.gate` is opened as itself, not following a link, and held open until the file is read, sharing reading, writing
 /// and deletion so it never blocks a checkout. A `.gate` that is a link or a junction (any name-surrogate reparse
@@ -243,38 +262,56 @@ impl Facts for Machine<'_> {
 /// it is that folder's file whatever the path to `.gate` names by then, matched in any letter case unless the folder
 /// is case-sensitive. It is opened as itself too, sharing the same, so a checkout or an editor's save is never blocked
 /// by it, and read from that handle. A file that is a link, a junction or a folder is a problem, and so is one larger
-/// than [`SIBLINGS_MOST_BYTES`]. A file that is any other reparse point, such as a deduplicated one, is read through
+/// than [`GATE_FILE_MOST_BYTES`]. A file that is any other reparse point, such as a deduplicated one, is read through
 /// its filter, from a handle opened again that must be of the same file ([`gate_win32::same_file`]); one of any other
 /// is the not-a-file problem.
-fn read_siblings(root: &Path) -> Result<Vec<String>, String> {
+pub(crate) fn read_gate_file(root: &Path, name: &str) -> Result<Option<Vec<u8>>, String> {
     let gate = root.join(".gate");
     let held = open_as_itself(&gate).map_err(|error| format!(".gate: cannot read it: {error}"))?;
     let Some((gate_folder, gate_metadata)) = held else {
-        return Ok(Vec::new());
+        return Ok(None);
     };
     if gate_metadata.file_type().is_symlink() {
         return Err(".gate is a link or a junction".to_owned());
     }
     if !gate_metadata.is_dir() {
-        return Ok(Vec::new());
+        return Ok(None);
     }
-    let opened = with_metadata(gate_win32::open_beneath(&gate_folder, "siblings.toml")).map_err(|error| format!("cannot read it: {error}"))?;
+    let opened = with_metadata(gate_win32::open_beneath(&gate_folder, name)).map_err(|error| format!("cannot read it: {error}"))?;
     let Some((file, metadata)) = opened else {
-        return Ok(Vec::new());
+        return Ok(None);
     };
-    if !metadata.is_file() {
-        return Err(SIBLINGS_NOT_A_FILE.to_owned());
-    }
-    let bytes = read_capped(file, &metadata)?;
+    let bytes = read_whole(file, &metadata);
     drop(gate_folder);
-    if bytes.len() > SIBLINGS_MOST_BYTES {
+    bytes.map(Some)
+}
+
+/// Whether `<root>\.gate` is there as something other than a folder, so no file of it can be read; `false` when it is
+/// absent or is a folder. A link or a junction is refused by [`read_gate_file`] by name before this is asked.
+pub(crate) fn gate_is_not_a_folder(root: &Path) -> bool {
+    fs::symlink_metadata(root.join(".gate")).is_ok_and(|metadata| !metadata.is_dir())
+}
+
+/// The bytes of the file at `path`, opened as itself so a link or a junction there is not followed, and read as
+/// [`read_gate_file`] reads a file of `.gate`: a link, a junction or a folder is the not-a-file problem, and a file
+/// larger than [`GATE_FILE_MOST_BYTES`] is a problem too; `None` when nothing is there. `gate check` reads the root
+/// `global.json` through this.
+pub(crate) fn read_unfollowed(path: &Path) -> Result<Option<Vec<u8>>, String> {
+    let opened = open_as_itself(path).map_err(|error| format!("cannot read it: {error}"))?;
+    opened.map(|(file, metadata)| read_whole(file, &metadata)).transpose()
+}
+
+/// All of `file`, whose handle says `metadata`, when it is a file of at most [`GATE_FILE_MOST_BYTES`]; else its
+/// problem.
+fn read_whole(file: fs::File, metadata: &fs::Metadata) -> Result<Vec<u8>, String> {
+    if !metadata.is_file() {
+        return Err(GATE_FILE_NOT_A_FILE.to_owned());
+    }
+    let bytes = read_capped(file, metadata)?;
+    if bytes.len() > GATE_FILE_MOST_BYTES {
         return Err("is larger than 64 KiB".to_owned());
     }
-    let declared = siblings::read_bytes(&bytes)?;
-    match declared.problems.into_iter().next() {
-        Some(problem) => Err(problem),
-        None => Ok(declared.names),
-    }
+    Ok(bytes)
 }
 
 /// The file or folder at `path` opened for reading as itself, a link or a junction not followed, sharing reading,
@@ -299,7 +336,7 @@ fn with_metadata(opened: io::Result<fs::File>) -> io::Result<Option<(fs::File, f
     Ok(Some((file, metadata)))
 }
 
-/// At most [`SIBLINGS_MOST_BYTES`] and one more of `file`, whose handle says `metadata`: read from that handle for a
+/// At most [`GATE_FILE_MOST_BYTES`] and one more of `file`, whose handle says `metadata`: read from that handle for a
 /// plain file, and through the filter for a reparse point, which [`gate_win32::open_beneath`] opened as the point
 /// itself: a handle opened again that is not of the same file is the not-a-file problem, and an error is the
 /// unreadable one.
@@ -310,12 +347,12 @@ fn read_capped(file: fs::File, metadata: &fs::Metadata) -> Result<Vec<u8>, Strin
     } else {
         let filtered = gate_win32::reopen_through_filter(&file).map_err(unreadable)?;
         if !gate_win32::same_file(&file, &filtered).map_err(unreadable)? {
-            return Err(SIBLINGS_NOT_A_FILE.to_owned());
+            return Err(GATE_FILE_NOT_A_FILE.to_owned());
         }
         filtered
     };
     let mut bytes = Vec::new();
-    file.take((SIBLINGS_MOST_BYTES + 1) as u64).read_to_end(&mut bytes).map_err(unreadable)?;
+    file.take((GATE_FILE_MOST_BYTES + 1) as u64).read_to_end(&mut bytes).map_err(unreadable)?;
     Ok(bytes)
 }
 
@@ -385,7 +422,7 @@ mod tests {
     use gate_router::{LocalReason, Place, Route};
     use windows_sys::Win32::Storage::FileSystem::{DELETE, FILE_GENERIC_READ, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE};
 
-    use super::{SIBLINGS_NOT_A_FILE, holds_existing_path, not_routed, parse_head, parse_place, read_siblings};
+    use super::{GATE_FILE_NOT_A_FILE, holds_existing_path, not_routed, parse_head, parse_place, read_siblings};
     use crate::test_support::junction;
 
     /// The folder the place cases are asked of, spelled on a subst drive as a gate started there spells it.
@@ -485,7 +522,7 @@ mod tests {
         assert_eq!(read_siblings(&root), Ok(Vec::new()), "a .gate folder that holds no siblings file");
 
         fs::create_dir_all(&file).expect("a folder named like the file can be made");
-        let not_a_file = Err(SIBLINGS_NOT_A_FILE.to_owned());
+        let not_a_file = Err(GATE_FILE_NOT_A_FILE.to_owned());
         assert_eq!(read_siblings(&root), not_a_file, "a folder");
         fs::remove_dir(&file).expect("the folder can be removed");
 

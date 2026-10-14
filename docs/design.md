@@ -27,7 +27,7 @@ Non-goals:
 
 The CLI is subcommands with GNU-style flags: `--name value` or `--name=value`, and `--` ends the gate's options. The first word picks the parser. `--version`, `--help`, `-h` and `help` are matched first; then a subcommand name selects the CLI below, and any other first word starting with `-` selects the [compatibility layer](#compatibility-layer). No arguments at all print the usage on stderr and exit 2.
 
-A `--help` or `-h` before the `--` of a `run`, `stop-tree`, `cutover`, `push`, `burn` or `expect` line also prints the usage on stdout and exits 0, whatever else the line holds; after the `--` it belongs to the command (`gate run --slot light --timeout 5 --log x.log -- tool --help` runs `tool --help`).
+A `--help` or `-h` before the `--` of a `run`, `stop-tree`, `cutover`, `push`, `check`, `burn` or `expect` line also prints the usage on stdout and exits 0, whatever else the line holds; after the `--` it belongs to the command (`gate run --slot light --timeout 5 --log x.log -- tool --help` runs `tool --help`).
 
 | Subcommand | Purpose |
 |---|---|
@@ -35,6 +35,7 @@ A `--help` or `-h` before the `--` of a `run`, `stop-tree`, `cutover`, `push`, `
 | `gate stop-tree` | Stop a process tree, reaching the gate jobs inside it. |
 | `gate cutover` | Switch this machine from the PowerShell gate to `gate.exe`, draining it first. |
 | `gate push` | Copy the installed `gate.exe` to every builder `remote.json` names. |
+| `gate check` | Say what this PC lacks for the repo in the current folder, and how to install it. |
 | `gate burn` | Spin the CPU for a set time, for the load-burn tool. |
 | `gate expect` | Print the expected time of a command here and on each builder, from the durations store. |
 | `gate box` | Hidden: the builder side of a routed run. |
@@ -177,6 +178,65 @@ Each version read on the builder is bounded at 30 s.
 
 The ssh a push runs is `ssh.exe` found along `PATH`, never `ssh.cmd` or `ssh.bat`. Test-seams builds accept hidden options on `push`: `--test-push-ssh <path>` (the program each builder's call runs in place of the ssh found along `PATH`) and `--test-push-bound-ms <n>` (the 300 s bound, in milliseconds above 0). `gate push` has no `--test-print-request`.
 
+### `gate check`
+
+`gate check` takes no words; its usage line is `       gate check`, after `gate push`. A word prints `gate: unexpected argument <word>` and any option, `--state-dir` included, prints `gate: unknown option <opt>`, each followed by the usage, exit 2. It says what this PC lacks for the repo the working folder is in, and how to install it; it installs nothing and runs only version commands (each tool's own, and `dotnet --list-sdks`).
+
+The repo is the git worktree root of the working folder, as routing finds it.
+
+Outside a git worktree it prints `check: not in a git repository` on stderr and exits 1; a working folder or git that cannot be read prints `check: <why>` on stderr and exits 1. The repo's `.gate/toolchain.toml`, `.gate/siblings.toml` and root `global.json` are read from the worktree on disk, so an uncommitted edit counts.
+
+The two `.gate` files are read as routing reads `.gate/siblings.toml`: a `.gate` folder or file that is a link or junction, or a file over 64 KiB, is refused. `global.json` is read the same way, a link refused and 64 KiB the most.
+
+A file that cannot be read whole (not one that reads with problems) fails the check: the summary says it and the exit is 1, however the items came out.
+
+On stdout, each line prefixed `check: here: `, `here` being this PC, in this order:
+
+1. The header `check: here: <repo> at <root>`, `<repo>` being the name routing gives the repo and `<root>` the worktree root as git spells it. With no `.gate/toolchain.toml` the line `check: here: <repo> declares no toolchain` follows; the SDK pin and the siblings are still checked.
+2. One line per item, every item printed, the ones that are fine included: the manifest's tools in manifest order, then the .NET SDK, then the workloads, then the siblings.
+3. One `install: here: <subject>: <command>` hint line per missing or too-old item, in item order.
+4. The summary: `check: here: nothing missing` or `check: here: <n> missing, <n> too old`, with `, <n> skipped` added when any item was skipped; with nothing missing and some skipped it is `check: here: nothing missing (<n> skipped)`. When a file could not be read it is `check: here: could not read <files>; <n> missing, <n> too old`, `, <n> skipped` added as above, the files comma separated in the order `.gate/toolchain.toml`, `.gate/siblings.toml`, `global.json`.
+
+The problems of the files go to stderr, one per line, before the item lines: `check: .gate/<file>: <problem>`, `<file>` being `toolchain.toml` or `siblings.toml` and `<problem>` the text the file's reader gives ([Toolchain manifest](#routing), [Sibling worktrees](#routing)), or why the file could not be read at all (`.gate is not a folder`, for the manifest, when `.gate` is a file). A file with problems is still used for what reads, and the rest is still checked.
+
+The `global.json` ones are `check: global.json: <reason>`, `<reason>` being `is larger than 64 KiB`, `cannot read it: <error>`, `is a link, a junction or not a file`, `is not UTF-8`, `does not parse as JSON`, `its sdk is not an object`, `its sdk.version is not a version dotnet reads`, `its sdk.rollForward is not a policy gate knows` or `its sdk.allowPrerelease is not true or false`.
+
+The tool lines, for each tool of the manifest, probed as the box probes the tools of a preflight ([The box side](#the-box-side), Tool probes), all together within one 10 s bound, on this PC's own `PATH` with the worktree's own folders dropped, a program found that still lies inside the worktree refused:
+
+- `<tool> <found> ok (needs <min> or later)`, `<min>` written as `major.minor.patch`, when the found version is the minimum or later, and `<tool> <found> too old (needs <min> or later)` when it is below it;
+- `<tool> missing (needs <min> or later)`, or `(needs it present)` for a tool declared with `""`;
+- `<tool> <found> ok` for a tool declared present at any version, and `<tool> ok (version not readable)` for a present one whose version the probe could not read;
+- `<tool> skipped: found, version not readable (needs <min> or later)` when a minimum is declared and the tool answered with no version;
+- `<tool> skipped: <why>` when the probe gave no answer, `<why>` being the probe's own reason (`no answer in 10 s`, `no probe for godot`, `cannot run <program>: <error>`);
+- `tools.<name> skipped: not a tool gate knows` for a name the manifest declares that gate has no probe for, which runs nothing.
+
+The SDK line comes only when the root has a `global.json` with an `sdk.version`; one with no `sdk` key, or an `sdk` with no `version`, pins nothing and prints none.
+
+With a pin that names a version it is `.NET SDK <version> (rollForward <policy>) ok` when one of this PC's SDKs serves the pin by the rules of the parity check ([Parity](#routing)), else `.NET SDK <version> (rollForward <policy>) missing (this PC has <list>)`, the list being the SDKs `dotnet --list-sdks` gives or `none`; the words are the parity check's, so the PC's and a builder's lines agree.
+
+The SDK list is read with the folders inside the worktree dropped from `PATH`. A `global.json` whose pin cannot be read (a reason above) says `.NET SDK skipped: global.json has no readable sdk pin`, which counts as skipped, and the file counts as unreadable; a list that cannot be read `.NET SDK skipped: cannot read this PC's SDK list: <why>`.
+
+A manifest that lists workloads gets one line, `workloads <ids, comma separated> not checked yet`, which counts as neither skipped nor missing. The tools in `.config/dotnet-tools.json` and a `Godot.NET.Sdk` pin are not checked and say nothing.
+
+Each sibling the repo declares gets `sibling <name> ok (<path>)` when its folder, `../<name>` of the worktree root as routing spells it, has a `.git` (a folder, or the file of a linked worktree), or `sibling <name> missing (no git worktree at <path>)`; one whose `.git` cannot be looked for is `sibling <name> skipped: <why>`.
+
+The install hints, for the items that have one:
+
+| Item | Hint |
+|---|---|
+| `rust` | `winget install Rustlang.Rustup`; with a minimum, `rustup default <min>` when rust is too old, and `winget install Rustlang.Rustup, then rustup default <min>` when it is missing |
+| `cargo-nextest` | `cargo install cargo-nextest --locked` |
+| `node` | `winget install OpenJS.NodeJS` |
+| `pnpm` | `corepack enable pnpm` |
+| `pwsh` | `winget install Microsoft.PowerShell` |
+| `ffmpeg` | `winget install Gyan.FFmpeg` |
+| the .NET SDK | `.NET SDK: winget install Microsoft.DotNet.SDK.<major>`, the pin's major |
+| a missing sibling | `sibling <name>: clone it to <path>` |
+
+A tool not in the table (`godot`) gets no hint line.
+
+The exit is 0 when nothing is missing or too old and every file read, whatever was skipped; 1 when anything is missing or too old, or the check could not run (not in a git repository, an unreadable `.gate/toolchain.toml`, `.gate/siblings.toml` or `global.json`, `.gate` not a folder); 2 for a usage error. Test-seams builds accept the hidden `--test-probe-limit-ms <n>` (the 10 s probe bound, in milliseconds above 0).
+
 ### `gate burn`
 
 `gate burn [--cores <n>] --seconds <s>` is the CPU burn of `~/.claude/tools/load-burn/load-burn.ps1`, which runs it inside a critical gate and applies the owner's 120 s burn cap itself. One process spins `n` threads on a busy loop at the priority it inherited, for `s` seconds. It takes no slot and writes no claim, journal line or log; `GATE_STATE_DIR` and `--state-dir` do not apply.
@@ -242,9 +302,9 @@ Further modes arrive as subcommands of the same binary, each designed with its i
 
 | Code | Meaning |
 |---|---|
-| 0 | The command exited 0 and its log holds no failure marker. |
+| 0 | The command exited 0 and its log holds no failure marker. `gate check` found nothing missing or too old. |
 | `N` | The command's own non-zero status, passed through whole: the gate exits with the command's 32-bit exit code (300 stays 300; 0xFFFFFFFF reads as -1 where a caller reads it signed), and the FAILED line and the journal show it signed (a routed run whose connection was lost reports 255, RC7). |
-| 1 | The command exited 0 but its log holds a failure marker (never with `--no-markers`, V2); or the gate itself failed after the command started (X4); or it failed before queueing (the working directory, the command's environment, the log's folder or an earlier log that cannot be removed); or a routed run passed but its changes or outputs could not be brought back (RC9, D1). |
+| 1 | The command exited 0 but its log holds a failure marker (never with `--no-markers`, V2); or the gate itself failed after the command started (X4); or it failed before queueing (the working directory, the command's environment, the log's folder or an earlier log that cannot be removed); or a routed run passed but its changes or outputs could not be brought back (RC9, D1); or `gate check` found something missing or too old, or could not run (outside a git worktree). |
 | 2 | Usage: a missing, unknown or invalid input; a `.cmd` or `.bat` word the gate refuses (C5); a `--log` inside the state root; a critical gate under a heavy or light slot marker (K7). Nothing is queued. `gate box` also uses 2 for a refused payload and for a refused subfolder or batch word ([The box side](#the-box-side)). |
 | 124 | The watchdog killed the command: STALLED, TIMED OUT or BACKSTOP (X2), for a routed run by the builder (TIMED OUT, BACKSTOP) or the client (STALLED, BACKSTOP); or a routed run's fetch outlived its transfer ceiling: TRANSFER TIMED OUT. |
 | 127 | The command could not be started (C7); the slot is released at once. `gate box run` uses it for the same failure. |
@@ -1229,7 +1289,9 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
     The source of what a repo needs is either this PC's own workload list or a scan of the snapshot's project files; the choice is made after measuring what `dotnet workload list` costs per preflight.
 
-    **Toolchain manifest** (GATE-206, GATE-209): a repo's `.gate/toolchain.toml` declares what a routed run's builder must have beyond the .NET SDK, and `remote/toolchain.rs` reads it as data from text the caller hands over. No routed run reads it yet: the preflight's check against it is not built, so a manifest changes nothing a run does. A repo's sibling worktrees are not declared here but in `.gate/siblings.toml` ([Sibling worktrees](#routing)), whose problems keep a run local.
+    **Toolchain manifest** (GATE-206, GATE-209): a repo's `.gate/toolchain.toml` declares what a routed run's builder must have beyond the .NET SDK, and `remote/toolchain.rs` reads it as data from text the caller hands over. [`gate check`](#gate-check) reads it from the worktree on disk and says what this PC lacks; no routed run reads it yet: the preflight's check against it is not built, so a manifest changes nothing a run does.
+
+    `toolchain::meets` compares a found version with a minimum. A repo's sibling worktrees are not declared here but in `.gate/siblings.toml` ([Sibling worktrees](#routing)), whose problems keep a run local.
 
     The file has a `[tools]` table of `name = "version"` and a top-level `workloads` array of .NET workload ids. A version is a minimum, "this or later", written `major[.minor[.patch]]` with the missing parts 0 (`"24"` is 24.0.0), and `""` means the tool is present at any version. The known names are `rust`, `cargo-nextest`, `node`, `pnpm`, `pwsh`, `godot` and `ffmpeg`; an unknown name is kept and flagged unknown, for the consumer to skip with a line. A leading byte order mark is skipped.
 
@@ -1545,7 +1607,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
   A name is one or more ASCII letters, digits, `.`, `_` and `-`, not starting or ending with a dot, not a reserved device name (`CON`, `PRN`, `AUX`, `NUL`, `COM1` to `COM9`, `LPT1` to `LPT9`, whatever follows the first dot), not repeated in another letter case, and not the root's own folder name; at most 8 names. The same rule decides whether a root's own folder name can be laid out. A leading byte order mark is skipped.
 
-  Unlike the toolchain manifest, any problem keeps a matched run here: a sibling left out would build something different with no error.
+  Unlike the toolchain manifest, any problem keeps a matched run here: a sibling left out would build something different with no error. [`gate check`](#gate-check) lists every problem of the file and each declared sibling's presence beside the worktree root.
 
   The reader's problems are `<key> is not a key (siblings)`, `declares no siblings`, `siblings is not an array (TOML <type>)`, `siblings[<i>] is not a string (TOML <type>)`, `siblings[<i>] is empty`.
 
@@ -1984,7 +2046,7 @@ A Rust integration suite drives the built `gate.exe` through its CLI and reads o
 
   On `cutover` the seams are `--test-poll-ms`, `--test-heartbeat-ms`, `--test-confirm-ms` (the confirmation window) and the switch `--test-cutover-interrupt-after-list`; `--test-print-request` shows them as `testSeams.pollMs`, `heartbeatMs`, `confirmMs` and `interruptAfterList` ([`gate cutover`](#gate-cutover)).
 
-  On `push` the seams are `--test-push-ssh <path>` (the ssh program to run instead of the one found along `PATH`, the suite's `fake-ssh`) and `--test-push-bound-ms <n>` (each builder's bound); `push` has no `--test-print-request` ([`gate push`](#gate-push)).
+  On `push` the seams are `--test-push-ssh <path>` (the ssh program to run instead of the one found along `PATH`, the suite's `fake-ssh`) and `--test-push-bound-ms <n>` (each builder's bound); `push` has no `--test-print-request` ([`gate push`](#gate-push)). On `check` the one seam is `--test-probe-limit-ms <n>` ([`gate check`](#gate-check)).
 
   `--test-print-request`, on `run`, `stop-tree`, `cutover` and the compatibility form, prints the parsed request as one JSON line on stdout and exits 0, so the suite sees what a command line asked for; it is the one hidden switch the compatibility layer accepts. On `run`, `"timeout"` is the number given, or the floor of `auto:<n>`, and `"timeoutAuto": true|false` follows it, always present.
 

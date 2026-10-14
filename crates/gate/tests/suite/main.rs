@@ -9,6 +9,7 @@
 mod boxside;
 mod burn;
 mod ceiling;
+mod check;
 mod checkout;
 mod cli;
 mod compat;

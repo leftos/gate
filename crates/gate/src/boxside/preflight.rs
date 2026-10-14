@@ -91,11 +91,12 @@ fn say_sdks_and_tools(payload: &Payload, seams: &BoxSeams, console: &mut Console
         .map_err(|line| format!("{line}; probing nothing"));
     let probe_limit = seams.probe_limit_ms.map_or(probe::PROBE_LIMIT, Duration::from_millis);
     thread::scope(|scope| {
-        let probes = names
-            .as_ref()
-            .ok()
-            .filter(|names| !names.is_empty())
-            .map(|names| (names, scope.spawn(move || probe::probe(names, probe_limit))));
+        let probes = names.as_ref().ok().filter(|names| !names.is_empty()).map(|names| {
+            (
+                names,
+                scope.spawn(move || probe::probe(names, probe_limit, Ok(Variables::from_process()), None)),
+            )
+        });
         say_sdks(seams.dotnet_limit_ms.map_or(git::DOTNET_LIMIT, Duration::from_millis), console);
         if let Err(line) = &names {
             console.err(line);
@@ -277,11 +278,7 @@ fn sdks(limit: Duration) -> Result<String, String> {
 
 /// The first space-separated word of each non-empty line of `listing`, joined by `,`; `none` when there is none.
 fn sdk_list(listing: &str) -> String {
-    let versions: Vec<&str> = listing
-        .lines()
-        .filter_map(|line| line.trim().split(' ').next())
-        .filter(|version| !version.is_empty())
-        .collect();
+    let versions = crate::remote::parity::sdk_versions(listing);
     if versions.is_empty() { "none".to_owned() } else { versions.join(",") }
 }
 

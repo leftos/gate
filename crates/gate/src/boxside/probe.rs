@@ -5,6 +5,7 @@
 //! writes to the console or reads a payload: the caller hands over the names and says the lines.
 
 use std::any::Any;
+use std::path::Path;
 use std::thread::{self, Scope, ScopedJoinHandle};
 use std::time::{Duration, Instant};
 
@@ -66,12 +67,14 @@ enum Pending<'scope> {
 
 /// Probes each tool of `names`, all within `limit` from now, and gives back each name with what its probe found, in
 /// the order of `names`. The probes that run a program run at once, each on a thread of its own, sharing the system
-/// folder and the environment read once for the batch.
-pub(crate) fn probe(names: &[String], limit: Duration) -> Vec<(String, Probed)> {
+/// folder and the environment `variables` for the batch, whose programs are looked for along its `PATH`; with a
+/// `worktree`, a program found that lies inside it is refused ([`git::judged`]). Environment `variables` that could
+/// not be made, for the reason given, skip every probe that runs a program.
+pub(crate) fn probe(names: &[String], limit: Duration, variables: Result<Variables, String>, worktree: Option<&Path>) -> Vec<(String, Probed)> {
     let deadline = Instant::now() + limit;
-    let place = ProgramPlace::new(Variables::from_process());
+    let place = variables.and_then(ProgramPlace::new);
     thread::scope(|scope| {
-        let pending: Vec<Pending<'_>> = names.iter().map(|name| started(scope, name, &place, deadline, limit)).collect();
+        let pending: Vec<Pending<'_>> = names.iter().map(|name| started(scope, name, &place, worktree, deadline, limit)).collect();
         names
             .iter()
             .zip(pending)
@@ -87,11 +90,12 @@ pub(crate) fn probe(names: &[String], limit: Duration) -> Vec<(String, Probed)> 
 }
 
 /// The probe of the tool `name`: what is found without running anything, or the thread on `scope` that runs its
-/// program in `place` by `deadline`, the end of the batch's `limit`.
+/// program in `place`, never one inside `worktree`, by `deadline`, the end of the batch's `limit`.
 fn started<'scope, 'env>(
     scope: &'scope Scope<'scope, 'env>,
     name: &str,
     place: &'env Result<ProgramPlace, String>,
+    worktree: Option<&'env Path>,
     deadline: Instant,
     limit: Duration,
 ) -> Pending<'scope> {
@@ -100,14 +104,22 @@ fn started<'scope, 'env>(
         Some(ToolProbe::Unprobed) => Pending::Found(Probed::Skipped(format!("no probe for {name}"))),
         Some(ToolProbe::Runs { program, args }) => match place {
             Err(why) => Pending::Found(Probed::Skipped(format!("cannot run {program}: {why}"))),
-            Ok(place) => Pending::Running(scope.spawn(move || ran(program, args, place, deadline, limit))),
+            Ok(place) => Pending::Running(scope.spawn(move || ran(&Run { program, args, worktree }, place, deadline, limit))),
         },
     }
 }
 
-/// What running `program` with `args` in `place` finds by `deadline`, the end of the batch's `limit`; nothing is run
-/// once the deadline has passed.
-fn ran(program: &str, args: &[&str], place: &ProgramPlace, deadline: Instant, limit: Duration) -> Probed {
+/// A probe's program, its arguments, and the worktree it must not be found inside.
+struct Run<'a> {
+    program: &'a str,
+    args: &'a [&'a str],
+    worktree: Option<&'a Path>,
+}
+
+/// What running `run`'s program in `place` finds by `deadline`, the end of the batch's `limit`; nothing is run once
+/// the deadline has passed.
+fn ran(run: &Run<'_>, place: &ProgramPlace, deadline: Instant, limit: Duration) -> Probed {
+    let Run { program, args, worktree } = *run;
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
         return Probed::Skipped(format!("no answer in {}", git::spelled_limit(limit)));
@@ -117,7 +129,7 @@ fn ran(program: &str, args: &[&str], place: &ProgramPlace, deadline: Instant, li
         args,
         limit: remaining,
         interrupt: None,
-        worktree: None,
+        worktree,
         console: PipedConsole::Hidden,
     };
     match git::program_output(&call, place) {
@@ -214,6 +226,7 @@ mod tests {
     use std::time::Duration;
 
     use super::{Probed, first_version, late_reason, panic_reason, probe, tool_line, version_of};
+    use crate::environment::Variables;
 
     #[test]
     fn the_version_is_the_first_dotted_number_after_an_optional_v() {
@@ -326,7 +339,7 @@ mod tests {
     fn a_name_the_table_does_not_know_or_cannot_probe_runs_nothing() {
         let names = ["nodejs".to_owned(), "godot".to_owned(), "Node".to_owned()];
         assert_eq!(
-            probe(&names, Duration::from_secs(1)),
+            probe(&names, Duration::from_secs(1), Ok(Variables::from_process()), None),
             [
                 ("nodejs".to_owned(), Probed::Skipped("unknown tool".to_owned())),
                 ("godot".to_owned(), Probed::Skipped("no probe for godot".to_owned())),
@@ -339,7 +352,7 @@ mod tests {
     fn a_batch_with_no_time_left_runs_nothing_and_says_so() {
         let names = ["node".to_owned(), "rust".to_owned()];
         assert_eq!(
-            probe(&names, Duration::ZERO),
+            probe(&names, Duration::ZERO, Ok(Variables::from_process()), None),
             [
                 ("node".to_owned(), Probed::Skipped("no answer in 0 s".to_owned())),
                 ("rust".to_owned(), Probed::Skipped("no answer in 0 s".to_owned())),
