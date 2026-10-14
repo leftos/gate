@@ -27,12 +27,12 @@ fn version_names_the_package_version_and_the_build() {
 #[test]
 fn help_and_help_subcommand_print_usage_on_stdout_exit_0() {
     let case = Case::new("help_and_help_subcommand");
-    for word in ["--help", "help"] {
-        let outcome = case.run(&[word]);
+    for words in [&["--help"][..], &["help"][..], &["-h"][..], &["run", "--help"][..], &["run", "-h"][..]] {
+        let outcome = case.run(words);
 
-        assert_eq!(outcome.code, Some(0), "{word}");
-        assert_eq!(outcome.stdout, USAGE, "{word}");
-        assert_eq!(outcome.stderr, "", "{word}");
+        assert_eq!(outcome.code, Some(0), "{words:?}");
+        assert_eq!(outcome.stdout, USAGE, "{words:?}");
+        assert_eq!(outcome.stderr, "", "{words:?}");
     }
 }
 

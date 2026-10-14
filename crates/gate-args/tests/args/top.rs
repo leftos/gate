@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use gate_args::{Invocation, StopRequest, parse};
 
-use crate::support::{invocation, os, problems, problems_of, stop_request, unreadable_word};
+use crate::support::{invocation, os, problems, problems_of, run_request, stop_request, unreadable_word};
 
 #[test]
 fn version_and_help_are_matched_before_the_compat_layer() {
@@ -25,6 +25,27 @@ fn version_and_help_are_matched_before_the_compat_layer() {
         );
     }
     assert_eq!(problems(&["--version", "now"]), ["gate: unexpected argument now"]);
+}
+
+#[test]
+fn a_help_word_before_the_separator_asks_for_the_usage() {
+    for words in [
+        &["run", "--help"][..],
+        &["run", "--slot", "light", "--help"][..],
+        &["push", "-h"][..],
+        &["stop-tree", "-h"][..],
+        &["cutover", "--help"][..],
+        &["burn", "-h"][..],
+        &["expect", "--help"][..],
+        &["-h"][..],
+    ] {
+        assert_eq!(invocation(words), Invocation::Help, "{words:?}");
+    }
+    assert_eq!(
+        run_request(&["run", "--slot", "light", "--timeout", "5", "--log", "x.log", "--", "tool", "--help"]).command,
+        os(&["tool", "--help"]),
+        "a --help after the separator belongs to the command the gate runs"
+    );
 }
 
 #[test]

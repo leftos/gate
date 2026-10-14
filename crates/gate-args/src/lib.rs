@@ -1,5 +1,5 @@
 //! The gate's own argv: the subcommand CLI (`gate run`, `gate burn`, `gate expect`, `gate stop-tree`, `gate cutover`,
-//! `gate push`, the hidden `gate box`, `--version`, `--help`) and the compatibility layer that reads the PowerShell
+//! `gate push`, the hidden `gate box`, `--version`, `--help`/`-h`) and the compatibility layer that reads the PowerShell
 //! gate's `-Log <path> -TimeoutSeconds <n> -Slot <kind> -- <command>` form. Parsing is pure: it reads the words it is
 //! given, opens no file and reads no environment, so it builds and tests everywhere. A usage error is a list of
 //! [`Problem`]s, each printed on its own `gate: ` line before the [`USAGE`]; a malformed `gate box` is the one
@@ -36,9 +36,13 @@ pub use usage::USAGE;
 
 /// Reads the gate's arguments, without the program name.
 ///
-/// The first word picks the parser: `--version`, `--help` and `help` first, then a subcommand name (`run`, `burn`,
-/// `expect`, `stop-tree`, `cutover`, `push`, the hidden `box`) selects the CLI and a first word starting with `-` selects the
-/// compatibility layer.
+/// The first word picks the parser: `--version`, `--help`, `-h` and `help` first, then a subcommand name (`run`,
+/// `burn`, `expect`, `stop-tree`, `cutover`, `push`, the hidden `box`) selects the CLI and a first word starting with
+/// `-` selects the compatibility layer.
+///
+/// A `--help` or `-h` word before the first `--` separator of a `run`, `stop-tree`, `cutover`, `push`, `burn` or
+/// `expect` line is the usage too, whatever else the line holds. The words after `--` belong to the command the gate
+/// runs, so `gate run --slot light -- tool --help` runs `tool --help`.
 ///
 /// # Errors
 ///
@@ -53,19 +57,37 @@ pub fn parse(args: Vec<OsString>) -> Result<Invocation, Vec<Problem>> {
     let Some(text) = first.to_str() else {
         return Err(vec![Problem::Unreadable(first.to_string_lossy().into_owned())]);
     };
+    let rest: Vec<OsString> = words.collect();
     match text {
-        "--version" => alone(words, Invocation::Version),
-        "--help" | "help" => alone(words, Invocation::Help),
-        "run" => cli::parse_run(words).map(Invocation::Run),
-        "stop-tree" => cli::parse_stop_tree(words).map(Invocation::StopTree),
-        "cutover" => cli::parse_cutover(words).map(Invocation::Cutover),
-        "push" => cli::parse_push(words).map(Invocation::Push),
-        "burn" => cli::parse_burn(words).map(Invocation::Burn),
-        "expect" => cli::parse_expect(words).map(Invocation::Expect),
-        "box" => boxcmd::parse(words).map(Invocation::Box),
-        _ if text.starts_with('-') => compat::parse(std::iter::once(first).chain(words)),
+        "--version" => alone(rest.into_iter(), Invocation::Version),
+        "--help" | "-h" | "help" => alone(rest.into_iter(), Invocation::Help),
+        "run" | "stop-tree" | "cutover" | "push" | "burn" | "expect" if help_before_separator(&rest) => Ok(Invocation::Help),
+        "run" => cli::parse_run(rest.into_iter()).map(Invocation::Run),
+        "stop-tree" => cli::parse_stop_tree(rest.into_iter()).map(Invocation::StopTree),
+        "cutover" => cli::parse_cutover(rest.into_iter()).map(Invocation::Cutover),
+        "push" => cli::parse_push(rest.into_iter()).map(Invocation::Push),
+        "burn" => cli::parse_burn(rest.into_iter()).map(Invocation::Burn),
+        "expect" => cli::parse_expect(rest.into_iter()).map(Invocation::Expect),
+        "box" => boxcmd::parse(rest.into_iter()).map(Invocation::Box),
+        _ if text.starts_with('-') => compat::parse(std::iter::once(first).chain(rest)),
         _ => Err(vec![Problem::UnknownSubcommand(text.to_owned())]),
     }
+}
+
+/// Whether a word before the first `--` separator is exactly `--help` or `-h`.
+///
+/// The words after `--` belong to the command the gate runs, so `gate run --slot light -- tool --help` runs
+/// `tool --help` rather than asking for the usage.
+fn help_before_separator(words: &[OsString]) -> bool {
+    for word in words {
+        if word.to_str() == Some("--") {
+            return false;
+        }
+        if matches!(word.to_str(), Some("--help" | "-h")) {
+            return true;
+        }
+    }
+    false
 }
 
 fn alone(rest: impl Iterator<Item = OsString>, invocation: Invocation) -> Result<Invocation, Vec<Problem>> {

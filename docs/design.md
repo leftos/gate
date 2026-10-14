@@ -25,7 +25,9 @@ Non-goals:
 
 ## CLI
 
-The CLI is subcommands with GNU-style flags: `--name value` or `--name=value`, and `--` ends the gate's options. The first word picks the parser. `--version`, `--help` and `help` are matched first; then a subcommand name selects the CLI below, and any other first word starting with `-` selects the [compatibility layer](#compatibility-layer). No arguments at all print the usage on stderr and exit 2.
+The CLI is subcommands with GNU-style flags: `--name value` or `--name=value`, and `--` ends the gate's options. The first word picks the parser. `--version`, `--help`, `-h` and `help` are matched first; then a subcommand name selects the CLI below, and any other first word starting with `-` selects the [compatibility layer](#compatibility-layer). No arguments at all print the usage on stderr and exit 2.
+
+A `--help` or `-h` before the `--` of a `run`, `stop-tree`, `cutover`, `push`, `burn` or `expect` line also prints the usage on stdout and exits 0, whatever else the line holds; after the `--` it belongs to the command (`gate run --slot light --timeout 5 --log x.log -- tool --help` runs `tool --help`).
 
 | Subcommand | Purpose |
 |---|---|
@@ -37,7 +39,7 @@ The CLI is subcommands with GNU-style flags: `--name value` or `--name=value`, a
 | `gate expect` | Print the expected time of a command here and on each builder, from the durations store. |
 | `gate box` | Hidden: the builder side of a routed run. |
 | `gate --version` | Print `gate <package version>+<build id>` and exit 0 ([Build id](#build-id)). |
-| `gate --help`, `gate help` | Print the usage on stdout and exit 0. |
+| `gate --help`, `gate -h`, `gate help`, `gate <subcommand> --help` | Print the usage on stdout and exit 0. |
 
 An unknown subcommand, an unknown flag or a missing value prints what is wrong on its own `gate: ` line, then the usage, and exits 2 before any slot is queued (kept, C1). Every problem found is printed, one per line: invalid values in the order the words came, then the missing inputs in the order slot, timeout, log, command. A state-root failure ([State root](#state-root)) exits 2 with its one line and no usage.
 
