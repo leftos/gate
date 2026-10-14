@@ -411,6 +411,52 @@ fn a_folder_that_holds_nothing_the_snapshot_sends_runs_here_saying_so() {
     assert_local(&events(&case), None);
 }
 
+/// Declares in the case's `.gate/siblings.toml` one sibling, named for the case folder so no other case shares it; its
+/// name and the folder it would be, beside the case folder.
+fn declare_sibling(case: &Case) -> (String, PathBuf) {
+    let folder = case.folder();
+    let leaf = folder.file_name().expect("the case folder has a name").to_string_lossy();
+    let name = format!("{leaf}-sibling");
+    fs::create_dir_all(folder.join(".gate")).expect("the .gate folder can be made");
+    fs::write(folder.join(".gate").join("siblings.toml"), format!("siblings = [\"{name}\"]\n")).expect("the declaration can be written");
+    let beside = folder.parent().expect("the case folder has a parent").join(&name);
+    if beside.exists() {
+        fs::remove_dir_all(&beside).expect("a sibling left by an earlier run can be removed");
+    }
+    (name, beside)
+}
+
+#[test]
+fn a_declared_sibling_missing_beside_the_worktree_runs_a_matched_heavy_gate_here_saying_so() {
+    let case = routed_case("routing-sibling-missing");
+    let (name, _) = declare_sibling(&case);
+    let outcome = finish(case.gate(&heavy_words_with_limit("out.log", &[], &[r".\tool.exe", "out", "ran here"])));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(
+        outcome
+            .stderr
+            .contains(&format!("gate: not routed: sibling {name} not found beside the worktree\n")),
+        "{outcome:?}"
+    );
+    assert_local(&events(&case), None);
+}
+
+#[test]
+fn a_declared_sibling_with_a_git_beside_the_worktree_lets_the_run_route() {
+    let case = routed_case("routing-sibling-present");
+    let (_, beside) = declare_sibling(&case);
+    fs::create_dir_all(beside.join(".git")).expect("the sibling's .git can be made");
+    let steps = shown(&stub(&case, &["refuse busy"]));
+    let outcome = finish(case.gate(&routed_words("out.log", &steps, &[], &[r".\tool.exe", "out", "ran here"])));
+    fs::remove_dir_all(&beside).expect("the sibling can be removed");
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(!outcome.stderr.contains("not routed"), "{outcome:?}");
+    assert!(outcome.stderr.contains(BUSY_LINE), "the run was routed: {outcome:?}");
+    assert_refused(&events(&case), "busy");
+}
+
 #[test]
 fn a_folder_named_with_spaces_and_brackets_holding_a_file_routes() {
     let case = routed_case("routing-brackets");

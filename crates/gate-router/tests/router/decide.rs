@@ -10,7 +10,7 @@ use gate_router::{
     without_no_build, work_folder_key,
 };
 
-use crate::support::{FakeFacts, HEAD, ROOT, heavy, words};
+use crate::support::{FakeFacts, HEAD, ROOT, heavy, place_at, sibling, sibling_root, words};
 
 const SILENT: Route = Route::Local { reason: None };
 
@@ -31,9 +31,8 @@ fn local_line(route: &Route) -> Option<String> {
 
 fn place(prefix: &str, checkout: &str) -> Place {
     Place {
-        root: ROOT.to_owned(),
-        prefix: prefix.to_owned(),
         checkout: checkout.to_owned(),
+        ..place_at(prefix)
     }
 }
 
@@ -69,6 +68,8 @@ fn the_control_command_routes_from_the_root() {
             host: "builder-1".to_owned(),
             slots: 2,
             root: ROOT.to_owned(),
+            leaf: "a".to_owned(),
+            siblings: Vec::new(),
             repo: "yaat".to_owned(),
             key: work_folder_key(ROOT),
             subfolder: String::new(),
@@ -1023,4 +1024,239 @@ fn a_dotnet_program_outside_the_worktree_runs_here_with_no_word() {
         Some(r"gate: not routed: C:\Program Files\dotnet\dotnet.exe is outside the worktree")
     );
     assert!(!asked_head(&facts), "no word is made for a command that runs here");
+}
+
+#[test]
+fn a_missing_sibling_keeps_the_run_local_saying_so() {
+    let command = words(&["dotnet", "test"]);
+    let facts = FakeFacts::with_siblings("", &["b", "yaat-server", "c"], &["b"]);
+    let route = decide(&heavy(&command), &facts);
+    assert_eq!(
+        local_line(&route).as_deref(),
+        Some("gate: not routed: sibling yaat-server not found beside the worktree")
+    );
+    assert_eq!(*facts.presence_asked.borrow(), [sibling_root("b"), sibling_root("yaat-server")]);
+    assert!(!asked_head(&facts), "no word is made for a command that runs here");
+}
+
+#[test]
+fn a_bad_siblings_file_keeps_the_run_local_saying_so() {
+    let command = words(&["dotnet", "test"]);
+    for (problem, line) in [
+        ("siblings[0] is empty", "gate: not routed: .gate/siblings.toml: siblings[0] is empty"),
+        (
+            "line 1, column 13: invalid array\nexpected `]`",
+            "gate: not routed: .gate/siblings.toml: line 1, column 13: invalid array expected `]`",
+        ),
+    ] {
+        let facts = FakeFacts {
+            siblings: Err(problem.to_owned()),
+            ..FakeFacts::at_root()
+        };
+        let route = decide(&heavy(&command), &facts);
+        assert_eq!(local_line(&route).as_deref(), Some(line), "{problem:?}");
+        assert!(facts.presence_asked.borrow().is_empty(), "no sibling is looked for");
+    }
+}
+
+#[test]
+fn a_leaf_that_cannot_be_laid_out_keeps_a_run_with_siblings_local() {
+    let command = words(&["dotnet", "test"]);
+    let in_wt = |root: &str, names: &[&str]| FakeFacts {
+        place: Ok(Some(Place {
+            root: root.to_owned(),
+            prefix: String::new(),
+            checkout: "yaat".to_owned(),
+            folder: root.to_owned(),
+        })),
+        siblings: Ok(words(names)),
+        present: vec!["X:/dev/yaat.wt/b".to_owned()],
+        ..FakeFacts::at_root()
+    };
+    for (root, leaf) in [
+        ("X:/dev/yaat.wt/my wt", "my wt"),
+        ("X:/dev/yaat.wt/ü", "ü"),
+        ("X:/", "X:"),
+        ("X:/dev/yaat.wt/a.", "a."),
+        ("X:/dev/yaat.wt/Nul.x", "Nul.x"),
+    ] {
+        let route = decide(&heavy(&command), &in_wt(root, &["b"]));
+        assert_eq!(
+            local_line(&route),
+            Some(format!(
+                "gate: not routed: the worktree folder name {leaf} cannot be laid out on the builder"
+            )),
+            "{root}"
+        );
+    }
+    let run = routed(decide(&heavy(&command), &in_wt("X:/dev/yaat.wt/my wt", &[])));
+    assert_eq!(run.leaf, "my wt", "a repo with no siblings is unaffected by the leaf rule");
+}
+
+#[test]
+fn no_siblings_changes_nothing() {
+    let command = words(&["dotnet", "test", "../yaat-server/S.csproj"]);
+    let facts = FakeFacts::at_root();
+    let route = decide(&heavy(&command), &facts);
+    assert_eq!(
+        local_line(&route).as_deref(),
+        Some("gate: not routed: ../yaat-server/S.csproj is outside the worktree")
+    );
+    assert_eq!(facts.siblings_read.get(), 1);
+    assert!(facts.presence_asked.borrow().is_empty());
+    let run = routed(decide(&heavy(&words(&["dotnet", "test"])), &FakeFacts::at_root()));
+    assert_eq!((run.leaf.as_str(), run.siblings), ("a", Vec::new()));
+}
+
+#[test]
+fn an_unlisted_repo_never_reads_the_siblings_file() {
+    let command = words(&["dotnet", "test"]);
+    let declaring = || FakeFacts::with_siblings("", &["yaat-server"], &["yaat-server"]);
+    let other_repo = FakeFacts {
+        place: Ok(Some(place("", "other"))),
+        ..declaring()
+    };
+    assert_eq!(decide(&heavy(&command), &other_repo), SILENT);
+    assert_eq!(other_repo.siblings_read.get(), 0);
+    for (case, inputs) in [
+        (
+            "light",
+            Inputs {
+                slot: Slot::Light,
+                ..heavy(&command)
+            },
+        ),
+        (
+            "local",
+            Inputs {
+                local: true,
+                ..heavy(&command)
+            },
+        ),
+        (
+            "hooked",
+            Inputs {
+                git_hook: true,
+                ..heavy(&command)
+            },
+        ),
+        (
+            "covered",
+            Inputs {
+                covering_parent: true,
+                ..heavy(&command)
+            },
+        ),
+    ] {
+        let facts = declaring();
+        assert!(matches!(decide(&inputs, &facts), Route::Local { .. }), "{case}");
+        assert_eq!(facts.siblings_read.get(), 0, "{case}");
+    }
+    let listed = declaring();
+    assert_eq!(decide(&heavy(&words(&["node", "x"])), &listed), SILENT, "no pattern matches");
+    assert_eq!(
+        listed.siblings_read.get(),
+        1,
+        "a listed repo reads it once, before the rewrite and the match"
+    );
+    let facts = declaring();
+    routed(decide(&heavy(&command), &facts));
+    assert_eq!(facts.siblings_read.get(), 1, "a matched command reads it once");
+}
+
+#[test]
+fn an_unmatched_command_says_nothing_of_the_siblings() {
+    let broken = || FakeFacts {
+        siblings: Err("line 1, column 13: invalid array".to_owned()),
+        ..FakeFacts::at_root()
+    };
+    let unmatched = words(&["node", "x"]);
+    let missing = FakeFacts::with_siblings("", &["yaat-server"], &[]);
+    assert_eq!(decide(&heavy(&unmatched), &missing), SILENT, "a missing sibling");
+    assert!(missing.presence_asked.borrow().is_empty(), "no sibling is looked for");
+    let unreadable = broken();
+    assert_eq!(decide(&heavy(&unmatched), &unreadable), SILENT, "a broken file");
+    assert_eq!(unreadable.siblings_read.get(), 1, "the file is read once all the same");
+
+    let matched = words(&["dotnet", "test"]);
+    let missing = FakeFacts::with_siblings("", &["yaat-server"], &[]);
+    assert_eq!(
+        local_line(&decide(&heavy(&matched), &missing)).as_deref(),
+        Some("gate: not routed: sibling yaat-server not found beside the worktree")
+    );
+    assert_eq!(
+        local_line(&decide(&heavy(&matched), &broken())).as_deref(),
+        Some("gate: not routed: .gate/siblings.toml: line 1, column 13: invalid array")
+    );
+}
+
+#[test]
+fn a_sibling_named_like_the_worktree_keeps_the_run_local_saying_so() {
+    let facts = FakeFacts::with_siblings("", &["b", "A"], &["b", "A"]);
+    let route = decide(&heavy(&words(&["dotnet", "test"])), &facts);
+    assert_eq!(
+        local_line(&route).as_deref(),
+        Some("gate: not routed: .gate/siblings.toml: siblings[1] is the worktree's own folder: \"A\"")
+    );
+    assert!(facts.presence_asked.borrow().is_empty(), "no sibling is looked for");
+}
+
+#[test]
+fn a_relative_climb_past_the_subst_drive_root_the_gate_is_spelled_on_is_outside() {
+    // A gate at `prefix`, its folder spelled `folder` on S:, which stands for `target`, declaring yaat-server beside
+    // the root.
+    let on_s = |prefix: &str, folder: &str, target: &str| FakeFacts {
+        place: Ok(Some(Place {
+            folder: folder.to_owned(),
+            ..place_at(prefix)
+        })),
+        devices: vec![('S', format!(r"\??\{target}"))],
+        ..FakeFacts::with_siblings(prefix, &["yaat-server"], &["yaat-server"])
+    };
+    let root = r"X:\dev\yaat.wt\a";
+    for (prefix, folder, target, word) in [
+        ("", r"S:\", root, r"..\yaat-server\src\x.csproj"),
+        ("crates/", r"S:\crates", root, r"..\..\yaat-server\x"),
+        ("crates/", r"S:\", r"X:\dev\yaat.wt\a\crates", r"..\src\x"),
+    ] {
+        let facts = on_s(prefix, folder, target);
+        let route = decide(&heavy(&words(&["dotnet", "test", word])), &facts);
+        assert_eq!(
+            local_line(&route),
+            Some(format!("gate: not routed: {word} is outside the worktree")),
+            "{word:?} from {folder:?}: Windows stops `..` at the drive's root"
+        );
+        assert!(
+            !facts.asked().contains(&"subst_target S".to_owned()),
+            "the folder's spelling needs no lookup"
+        );
+    }
+    let inside = routed(decide(
+        &heavy(&words(&["dotnet", "test", r"..\src\x"])),
+        &on_s("crates/", r"S:\crates", root),
+    ));
+    assert_eq!(inside.words, stamped(&["dotnet", "test", r"..\src\x"]), "a climb that stays on the drive");
+    let real = routed(decide(
+        &heavy(&words(&["dotnet", "test", r"..\..\yaat-server\x"])),
+        &FakeFacts::with_siblings("crates/", &["yaat-server"], &["yaat-server"]),
+    ));
+    assert_eq!(
+        real.words,
+        stamped(&["dotnet", "test", r"..\..\yaat-server\x"]),
+        "a folder on the root's real spelling climbs into the sibling"
+    );
+}
+
+#[test]
+fn remote_run_carries_the_leaf_and_each_sibling_root() {
+    let command = words(&["dotnet", "test", "X:/dev/yaat.wt/yaat-server/S.csproj", "-p:Other=../../b/x"]);
+    let facts = FakeFacts::with_siblings("src/", &["yaat-server", "b"], &["yaat-server", "b"]);
+    let run = routed(decide(&heavy(&command), &facts));
+    assert_eq!(run.leaf, "a");
+    assert_eq!(run.siblings, [sibling("yaat-server"), sibling("b")]);
+    assert_eq!(
+        run.words,
+        stamped(&["dotnet", "test", "../../yaat-server/S.csproj", "-p:Other=../../b/x"])
+    );
+    assert_eq!(run.fallback, command);
 }

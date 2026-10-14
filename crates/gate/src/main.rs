@@ -42,6 +42,8 @@ mod run;
 mod slots;
 mod stop_tree;
 mod stopping;
+#[cfg(test)]
+mod test_support;
 mod version;
 mod wait;
 mod watch;

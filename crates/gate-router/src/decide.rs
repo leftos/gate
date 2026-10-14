@@ -7,9 +7,9 @@ use std::ops::Range;
 use std::path::PathBuf;
 
 use crate::config::{CARGO_OUTPUTS, Config, ConfigProblem, ignored_line};
-use crate::key::{repo_name, work_folder_key};
-use crate::like::eq_ignoring_case;
-use crate::rewrite::{drive_letters, rewrite_words};
+use crate::key::{is_layout_name, repo_name, work_folder_key};
+use crate::like::{Pattern, eq_ignoring_case};
+use crate::rewrite::{RewritePlace, SiblingRoot, drive_letters, rewrite_words, split_root};
 
 /// The line said when `--no-build` was dropped from the builder's words.
 pub const DROPPED_NO_BUILD_LINE: &str = "gate: dropped --no-build: the last build may have run on the other machine";
@@ -149,6 +149,9 @@ pub struct Place {
     pub prefix: String,
     /// The main checkout's folder name, the parent of the common git folder, as written.
     pub checkout: String,
+    /// The gate's folder as the gate spells it, which may be on a subst drive where git gives the root by its real
+    /// spelling (`D:\gate` for the root `X:/dev/gate`).
+    pub folder: String,
 }
 
 /// The facts the decision asks the caller for, each only when a rule needs it.
@@ -194,6 +197,22 @@ pub trait Facts {
     /// What the drive `letter` (upper case) stands for, as `QueryDosDevice` gives it (`\??\X:\dev` for a subst drive);
     /// `None` when there is no such device.
     fn subst_target(&self, letter: char) -> Option<String>;
+
+    /// The folder names the worktree root's `.gate/siblings.toml` declares, read from disk as it stands; none when
+    /// there is no such file. Asked only once the routing file lists the repo, before the words are rewritten.
+    ///
+    /// # Errors
+    ///
+    /// The file's first problem, when it cannot be read, does not parse or has any problem; the gate then runs here,
+    /// saying so.
+    fn siblings(&self, place: &Place) -> Result<Vec<String>, String>;
+
+    /// Whether a git worktree is at `root`: its `.git` exists, a file or a folder. Asked for each declared sibling.
+    ///
+    /// # Errors
+    ///
+    /// Why it could not be told; the gate then runs here, saying so.
+    fn sibling_present(&self, root: &str) -> Result<bool, String>;
 }
 
 /// Where the command runs.
@@ -218,6 +237,12 @@ pub enum LocalReason {
     NothingSent { subfolder: String },
     /// A fact could not be read; `reason` is on one line.
     Failed { reason: String },
+    /// `.gate/siblings.toml` cannot be read or has a problem; `problem` is its first, on one line.
+    SiblingsFile { problem: String },
+    /// The declared sibling `name` has no git worktree beside the worktree root.
+    SiblingMissing { name: String },
+    /// The worktree root, which declares siblings, has a folder name `leaf` the builder cannot lay out.
+    LeafNotLaidOut { leaf: String },
 }
 
 impl LocalReason {
@@ -230,6 +255,9 @@ impl LocalReason {
             Self::Outside { word } => format!("gate: not routed: {word} is outside the worktree"),
             Self::NothingSent { subfolder } => format!("gate: not routed: {subfolder} holds nothing the snapshot sends"),
             Self::Failed { reason } => format!("gate: not routed: {reason}"),
+            Self::SiblingsFile { problem } => format!("gate: not routed: .gate/siblings.toml: {problem}"),
+            Self::SiblingMissing { name } => format!("gate: not routed: sibling {name} not found beside the worktree"),
+            Self::LeafNotLaidOut { leaf } => format!("gate: not routed: the worktree folder name {leaf} cannot be laid out on the builder"),
         }
     }
 }
@@ -243,6 +271,10 @@ pub struct RemoteRun {
     pub slots: u32,
     /// The worktree root as git gives it.
     pub root: String,
+    /// The worktree root's folder name: its last segment.
+    pub leaf: String,
+    /// The declared siblings' roots, in declared order; none for a repo that declares none.
+    pub siblings: Vec<SiblingRoot>,
     /// The repo name the routing file listed.
     pub repo: String,
     /// The builder's work folder ([`work_folder_key`]).
@@ -286,7 +318,9 @@ impl RemoteRun {
 /// ignored; a git hook, no non-empty word, or a first word whose file name without extension is `git` or `prek` keep it
 /// here; so does a folder in no git worktree, a repo the routing file does not list, and words (paths rewritten, joined
 /// by single spaces) none of the repo's patterns match, the first that matches winning. A matched command still runs
-/// here, saying why, when a word names a path outside the worktree or the gate's folder holds nothing the snapshot
+/// here, saying why, when the worktree's `.gate/siblings.toml` has a problem or declares siblings from a root folder
+/// name the builder cannot lay out, a sibling named like that folder or one with no git worktree beside the root; when
+/// a word names a path outside the worktree and its siblings; or when the gate's folder holds nothing the snapshot
 /// sends; and so does one whose facts cannot be read.
 #[must_use]
 pub fn decide(inputs: &Inputs<'_>, facts: &dyn Facts) -> Route {
@@ -307,6 +341,8 @@ struct Matched<'a> {
     pattern: String,
     words: Vec<String>,
     outside: Option<String>,
+    leaf: String,
+    siblings: Vec<SiblingRoot>,
 }
 
 fn route(inputs: &Inputs<'_>, facts: &dyn Facts) -> Result<RemoteRun, Here> {
@@ -545,26 +581,92 @@ fn file_stem(path: &str) -> &str {
     name.rfind('.').map_or(name, |dot| &name[..dot])
 }
 
-/// The place, repo and rewritten words of a command one of its repo's patterns matches.
+/// The place, repo, siblings and rewritten words of a command one of its repo's patterns matches. The siblings file is
+/// read once the routing file lists the repo, and the words are rewritten with the siblings it declares, or with none
+/// when it has a problem, then matched; only a matched command is kept here for a sibling ([`check_siblings`]).
 fn matched<'a>(config: &'a Config, words: &[String], facts: &dyn Facts) -> Result<Matched<'a>, Here> {
     let place = facts.place().map_err(|reason| Some(failed(&reason)))?.ok_or(None)?;
     let repo = repo_name(&place.checkout);
     let patterns = config.patterns(&repo).ok_or(None)?;
+    let (parent, separator, leaf) = split_root(&place.root);
+    let (siblings, problem) = match facts.siblings(&place) {
+        Ok(names) => (sibling_roots(parent, separator, names), None),
+        Err(problem) => (Vec::new(), Some(problem)),
+    };
     let drives = subst_drives(&place.root, words, facts);
-    let sent = rewrite_words(&place.root, &place.prefix, words, &drives);
-    let command = sent.words.join(" ");
-    let pattern = patterns.iter().find(|pattern| pattern.is_match(&command)).ok_or(None)?;
+    let rewrite_place = RewritePlace {
+        root: &place.root,
+        prefix: &place.prefix,
+        folder: &place.folder,
+        leaf,
+    };
+    let sent = rewrite_words(&rewrite_place, words, &drives, &siblings);
+    let leaf = leaf.to_owned();
+    let pattern = first_match(patterns, &sent.words).ok_or(None)?;
+    check_siblings(problem, &leaf, &siblings, facts)?;
     Ok(Matched {
         config,
         repo,
-        pattern: pattern.as_str().to_owned(),
+        pattern,
         words: sent.words,
         outside: sent.outside,
+        leaf,
+        siblings,
         place,
     })
 }
 
-/// The subst table for the drive letters the words use other than the root's: each letter whose device target names
+/// The first of `patterns` that matches `words` joined by single spaces.
+fn first_match(patterns: &[Pattern], words: &[String]) -> Option<String> {
+    let command = words.join(" ");
+    patterns
+        .iter()
+        .find(|pattern| pattern.is_match(&command))
+        .map(|pattern| pattern.as_str().to_owned())
+}
+
+/// The roots of the siblings `names`, each the worktree root's `parent` and the name joined by `separator`, in
+/// declared order.
+fn sibling_roots(parent: &str, separator: char, names: Vec<String>) -> Vec<SiblingRoot> {
+    names
+        .into_iter()
+        .map(|name| SiblingRoot {
+            root: format!("{parent}{separator}{name}"),
+            name,
+        })
+        .collect()
+}
+
+/// Keeps a matched command here, saying why, for its siblings, checked in this order: the siblings file's `problem`;
+/// a root folder name `leaf` the builder cannot lay out, when the file declares siblings; a sibling named like that
+/// folder (ASCII letter case aside); a sibling with no git worktree. No sibling is looked for until every name is
+/// known to be another folder's.
+fn check_siblings(problem: Option<String>, leaf: &str, siblings: &[SiblingRoot], facts: &dyn Facts) -> Result<(), Here> {
+    if let Some(problem) = problem {
+        return Err(Some(LocalReason::SiblingsFile {
+            problem: fold_lines(&problem),
+        }));
+    }
+    if siblings.is_empty() {
+        return Ok(());
+    }
+    if !is_layout_name(leaf) {
+        return Err(Some(LocalReason::LeafNotLaidOut { leaf: leaf.to_owned() }));
+    }
+    if let Some((index, sibling)) = siblings.iter().enumerate().find(|(_, sibling)| sibling.name.eq_ignore_ascii_case(leaf)) {
+        return Err(Some(LocalReason::SiblingsFile {
+            problem: format!("siblings[{index}] is the worktree's own folder: {:?}", sibling.name),
+        }));
+    }
+    for sibling in siblings {
+        if !facts.sibling_present(&sibling.root).map_err(|reason| Some(failed(&reason)))? {
+            return Err(Some(LocalReason::SiblingMissing { name: sibling.name.clone() }));
+        }
+    }
+    Ok(())
+}
+
+/// The subst table for the drive letters the words use, other than the `root`'s: each letter whose device target names
 /// a path (`\??\X:\dev`), mapped to that path. A volume or a missing device adds nothing.
 fn subst_drives(root: &str, words: &[String], facts: &dyn Facts) -> Vec<(char, String)> {
     drive_letters(root, words)
@@ -597,7 +699,9 @@ fn remote_run(matched: Matched<'_>, subfolder: String, given: &[String], facts: 
         host: matched.config.host().to_owned(),
         slots: matched.config.slots(),
         key: work_folder_key(&matched.place.root),
+        leaf: matched.leaf,
         root: matched.place.root,
+        siblings: matched.siblings,
         repo: matched.repo,
         subfolder,
         pattern: matched.pattern,

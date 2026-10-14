@@ -288,7 +288,11 @@ The lines of a run that starts its command:
 - A log in use, exit 1, before queueing and with no journal line: `gate: the log <path> is in use by another gate`, when another gate holds the log's mutex ([Kernel object names](#kernel-object-names)). A mutex a killed gate left is taken silently. `gate: cannot take the mutex <name> of the log <path>: <error>`, exit 1, when the mutex cannot be opened or tried.
 - Routing, on stderr and in the log, with the command running here: `gate: ignored <path>: <reason>; running locally` when `remote.json` is there but unusable (not a file, unreadable or refused), and `gate: not routed: <reason>` when a heavy gate that would route stays local.
 
-  The second line is said for `--local` (`gate: not routed: --local`), a word outside the worktree (`gate: not routed: <word> is outside the worktree`), a folder that holds nothing the snapshot sends (`gate: not routed: <sub> holds nothing the snapshot sends`), a word of the command that is not valid Unicode (`gate: not routed: a word of the command is not valid Unicode`), or a fact that could not be read (`gate: not routed: cannot run git: <error>`, or the working directory or git's output).
+  The second line is said for `--local` (`gate: not routed: --local`), a word outside the worktree and its declared siblings (`gate: not routed: <word> is outside the worktree`), a folder that holds nothing the snapshot sends (`gate: not routed: <sub> holds nothing the snapshot sends`).
+
+  It is also said for a word of the command that is not valid Unicode (`gate: not routed: a word of the command is not valid Unicode`), or a fact that could not be read (`gate: not routed: cannot run git: <error>`, or the working directory or git's output).
+
+  Three lines keep a matched command here for siblings: a problem with the repo's `.gate/siblings.toml` (`gate: not routed: .gate/siblings.toml: <problem>`), a declared sibling with no worktree beside the root (`gate: not routed: sibling <name> not found beside the worktree`), a root folder name the builder cannot lay out (`gate: not routed: the worktree folder name <leaf> cannot be laid out on the builder`).
 
   A gate that is not heavy, has a covering parent, matches no pattern or has no `remote.json` says nothing.
 - A local run that drops its dotnet `--no-build`, on stderr and in the log, before it takes a slot: `gate: dropped --no-build: <reason>; building on a heavy slot`, or `gate: dropped --no-build: <reason>; building on the parent gate's <heavy|critical|light> slot` for a gate covered or lent a slot ([Routing](#routing)).
@@ -1074,6 +1078,18 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
   Git is asked only then: a folder in no worktree (any non-zero `git rev-parse` exit), a repo the file does not list (the main checkout's folder name as a repo name, in any letter case) and words no pattern of the repo matches stay local silently, the first matching pattern winning. A fact that cannot be read stays local saying `gate: not routed: <reason>`. A machine with no `remote.json` costs no git call.
 
+  The repo's `.gate/siblings.toml` is read once the file lists the repo, before the words are rewritten, so the rewrite knows the siblings; a gate that stays local before that point never reads it.
+
+  A command no pattern matches stays local silently whatever the file holds.
+
+  Only a matched command acts on what the file says, in this order, each keeping the run here with its line.
+
+  First a problem with the file (`gate: not routed: .gate/siblings.toml: <problem>`, the first problem, on one line).
+
+  Then a root folder name the builder cannot lay out when siblings are declared (`gate: not routed: the worktree folder name <leaf> cannot be laid out on the builder`), a sibling named like the root's own folder (`gate: not routed: .gate/siblings.toml: siblings[<i>] is the worktree's own folder: "<name>"`), and the first declared sibling with no worktree beside the root (`gate: not routed: sibling <name> not found beside the worktree`).
+
+  A sibling is present when `<parent of the root>\<name>\.git` exists, a file or a folder; a failure to tell says `gate: not routed: cannot tell whether <path> exists: <error>`. A repo with no file declares no siblings and nothing changes.
+
   git is found along the gate's own `PATH` (absolute entries only) and run by its full path from the gate's folder, with the `GIT_*` variables that point it at another repository, index or config removed and `core.fsmonitor` off, so a gate in a hook that exports `GIT_DIR` still routes.
 
   Each call gets 60 s, after which git is killed and the gate runs here saying `gate: not routed: git did not answer within 60 s` (in whole milliseconds, `1 ms`, when `--test-git-limit-ms` sets a limit that is not a whole number of seconds).
@@ -1102,6 +1118,16 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
   A path runs to the first of `, ; " ' ) | & < >`. In a word that holds one of those or a line break (a script word: a script's text or a list) white space ends a path too; in any other word, one argument, a path runs through its spaces. A drive other than the root's is followed through `subst` mappings.
 
   A bare first word (no separator, drive or `.`/`..`) becomes `./name` only when that file exists in the gate's folder; otherwise it stays bare, for the builder's `PATH`.
+
+  With siblings declared, a path inside a sibling's root (every spelling the root can have, `subst` drives included) is sent as `..` once for each level of the gate's folder below the worktree root and once more, then `/<name>` as declared and the rest, with the separator the in-worktree edit uses.
+
+  A relative path is inside a sibling when its `..` climb exactly to the root's parent and then enters a declared sibling (names compare in ASCII letter case only; `yaat-server2` is not `yaat-server`). Any other climb above the root, a word naming the parent itself, and leaving a sibling again (`../yaat-server/../x`) are outside, and keep the run here with `gate: not routed: <word> is outside the worktree`.
+
+  An absolute path whose `..` leaves the root it starts below and lands in the worktree or in a declared sibling is sent as where it lands; landing anywhere else is outside.
+
+  Windows stops `..` at the root of a drive or share, so a `..` past that root is outside, never a climb to the root's parent. The floor comes from the spelling of the gate's folder: a folder spelled on a drive, a `\\?\X:` path or a UNC share whose root is the worktree root or a folder below it sits fewer folders below that root than it sits below the worktree root, and a relative climb past the difference is outside.
+
+  A path on a bare `subst` drive that stands for a root (`S:\..`) never leaves that root either.
 - **The work folder** on the builder is named `<repo name>-<key>`, the worktree root's last segment cut to letters, digits, `-` and `_` and 8 hex digits of the SHA-256 of the lower-cased root ([Glossary](GLOSSARY.md), work-folder key).
 - **The routed run's life** is kept (T5) and built in `remote/mod.rs` and `run.rs`: its ticket is heavy with `remote: true` and queues apart from the local waiters, which never count it ahead of them, nor it them; it waits up to 60 s for a remote slot (`--test-remote-wait-ms` in a test build); it takes one with a claim of kind `remote` of its own and calls the remote client with the route, the log and the limits (`--stall` as given, the interrupt).
 
@@ -1203,7 +1229,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
     The source of what a repo needs is either this PC's own workload list or a scan of the snapshot's project files; the choice is made after measuring what `dotnet workload list` costs per preflight.
 
-    **Toolchain manifest** (GATE-206, GATE-209): a repo's `.gate/toolchain.toml` declares what a routed run's builder must have beyond the .NET SDK, and `remote/toolchain.rs` reads it as data from text the caller hands over. No routed run reads it yet: the preflight's check against it is not built, so a manifest changes nothing a run does.
+    **Toolchain manifest** (GATE-206, GATE-209): a repo's `.gate/toolchain.toml` declares what a routed run's builder must have beyond the .NET SDK, and `remote/toolchain.rs` reads it as data from text the caller hands over. No routed run reads it yet: the preflight's check against it is not built, so a manifest changes nothing a run does. A repo's sibling worktrees are not declared here but in `.gate/siblings.toml` ([Sibling worktrees](#routing)), whose problems keep a run local.
 
     The file has a `[tools]` table of `name = "version"` and a top-level `workloads` array of .NET workload ids. A version is a minimum, "this or later", written `major[.minor[.patch]]` with the missing parts 0 (`"24"` is 24.0.0), and `""` means the tool is present at any version. The known names are `rust`, `cargo-nextest`, `node`, `pnpm`, `pwsh`, `godot` and `ffmpeg`; an unknown name is kept and flagged unknown, for the consumer to skip with a line. A leading byte order mark is skipped.
 
@@ -1513,13 +1539,31 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
   **Escaping.** Every text a builder supplies that a `gate:` line quotes is escaped: control characters, U+061C, U+200E, U+200F, U+202A-U+202E, U+2066-U+2069, U+2028 and U+2029 are written `\u{..}`. That covers the preflight's last line, the builder's version in the version refusal, and every `git ... failed` line of the snapshot, the saved ref and the sync-back. A failed git line lists git's stdout first and its stderr last, keeping the last 10 lines and 4 KiB so git's `fatal:` line survives.
 
   The client's git calls also drop `GIT_CONFIG_COUNT`, `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM` and every `GIT_CONFIG_KEY_n` and `GIT_CONFIG_VALUE_n`, so the caller's git configuration never reaches the builder's repo, and `GIT_SSH_VARIANT` and `GIT_EXTERNAL_DIFF`, so neither the ssh option syntax nor the diff a sync-back applies can be changed from outside.
-- **Sibling worktrees** (GATE-19, GATE-213), planned, not built: some repos' builds reach into a sibling repo by relative path, and a routed run that sends one worktree's snapshot would compile something different on the builder without any error.
+- **Sibling worktrees** (GATE-19, GATE-213), the declaration, the decision and the rewrite built, the snapshot, layout and sync-back planned: some repos' builds reach into a sibling repo by relative path, and a routed run that sends one worktree's snapshot would compile something different on the builder without any error.
 
-  `remote.json` has no `siblings` field and the code reads none; a repo's siblings will be declared under `.gate/` in the repo (GATE-213), beside the [toolchain manifest](#routing) `.gate/toolchain.toml`. A routed gate in a repo with siblings will snapshot each sibling's worktree beside its own (`../{name}`, as the pair folder lays them out, or beside the main checkout), and the box will lay the work folders out the same way, so relative paths between them resolve.
+  `remote.json` has no `siblings` field. A repo declares its siblings in a tracked file of its own, `.gate/siblings.toml`, beside the [toolchain manifest](#routing) and apart from it, so a fault in one never changes what the other means. The file has one key, `siblings`, an array of folder names, each a sibling worktree at `../<name>` of the worktree root: `siblings = ["yaat-server"]`. `siblings = []` declares none; a file without the key, or with any other key, is a problem.
 
-  A word naming a path inside a declared sibling's worktree is rewritten as an in-worktree path is.
+  A name is one or more ASCII letters, digits, `.`, `_` and `-`, not starting or ending with a dot, not a reserved device name (`CON`, `PRN`, `AUX`, `NUL`, `COM1` to `COM9`, `LPT1` to `LPT9`, whatever follows the first dot), not repeated in another letter case, and not the root's own folder name; at most 8 names. The same rule decides whether a root's own folder name can be laid out. A leading byte order mark is skipped.
 
-  This lands before a repo with siblings is enabled for routing; a repo without siblings is enabled without it. What happens when a declared sibling is missing, whether the work-folder key is per pair or per repo, and how sync-back covers a sibling's changed files are open ([Open questions](#open-questions)).
+  Unlike the toolchain manifest, any problem keeps a matched run here: a sibling left out would build something different with no error.
+
+  The reader's problems are `<key> is not a key (siblings)`, `declares no siblings`, `siblings is not an array (TOML <type>)`, `siblings[<i>] is not a string (TOML <type>)`, `siblings[<i>] is empty`.
+
+  Name faults: `siblings[<i>] is not a folder name of letters, digits, '.', '_' and '-' not starting or ending with a dot, not a device name: "<name>"`, `siblings[<i>] repeats an earlier name: "<name>"`, and `siblings names more than 8 folders` (at the ninth name, reading no further), `line <l>, column <c>: <toml message>` and `not valid UTF-8 (...)`.
+
+  The file is read from disk as it stands, never from a snapshot, and only once a routed command matched. `.gate` is opened as itself and held, and `siblings.toml` is opened by its name inside that folder object (`gate_win32::open_beneath`, an `NtCreateFile` relative to the held handle), never following a link, so nothing swapped in for `.gate` after the open is read. Both are opened sharing reading, writing and deletion, so a checkout or an editor's save is never blocked.
+
+  A `.gate` that is a link or a junction says `.gate is a link or a junction`, and one that cannot be opened `.gate: cannot read it: <error>`; a `.gate` that is a file, or no `.gate`, holds no siblings.
+
+  A `siblings.toml` that is a link, a junction or a folder says `is a link, a junction or not a file`, one over 64 KiB `is larger than 64 KiB`, and one that cannot be read `cannot read it: <error>`, each after `gate: not routed: .gate/siblings.toml: `.
+
+  A file that is another kind of reparse point (a deduplicated one) is read through its filter from a handle opened again (`gate_win32::reopen_through_filter`), which must be the same file (`gate_win32::same_file`), else it is the not-a-file problem.
+
+  A declared sibling with no worktree beside the root keeps a matched run here, and a present one lets the decision go on. The route records the root's folder name and each sibling's root, `RemoteRun.leaf` and `RemoteRun.siblings`, and nothing sends a sibling yet. How a word naming a sibling is rewritten is under Routing (The in-worktree path rewrite).
+
+  Still planned: a routed gate in a repo with siblings will snapshot each sibling's worktree beside its own (`../{name}`, as the pair folder lays them out, or beside the main checkout), and the box will lay the work folders out the same way, so relative paths between them resolve.
+
+  Sibling support lands before a repo with siblings is enabled for routing; a repo without siblings is enabled without it. Whether the work-folder key is per pair or per repo, and how sync-back covers a sibling's changed files (all or nothing across the repos), are open ([Open questions](#open-questions)).
 - **Inputs** (GATE-22), planned, not built: a routed command can need ignored files only the PC has, and the snapshot sends only tracked and untracked-not-ignored files. A repo's optional `inputs` list of ignored-file globs, beside `outputs` in the routing file, is packed with the outputs' transport and hash-diffed against the builder's work folder, so an unchanged input costs nothing.
 - **The per-host failure record** (GATE-27), planned, not built: a record in the state root holds a builder's failure reason and an expiry. A routed gate that finds an unexpired record says `gate: not routed: <host> <reason> <n> s ago`, runs here and journals `fallback` with the reason, rather than paying the snapshot, preflight and push again for the same reason.
 
@@ -2072,7 +2116,7 @@ When a run that passed did not fit its slot, the gate says how many cores the co
 
 What no ruling settles yet, with the issue that owns it:
 
-- **The box protocol and `remote.json`'s next format** (GATE-10): verbs, payload and transport between PC and builder, whether ssh keeps cmd.exe as the builder's shell, and the routing file's version and matcher. Sibling worktrees in a routed run leave three questions of their own (GATE-19).
+- **The box protocol and `remote.json`'s next format** (GATE-10): verbs, payload and transport between PC and builder, whether ssh keeps cmd.exe as the builder's shell, and the routing file's version and matcher. Sibling worktrees in a routed run leave two questions of their own (GATE-19).
 - **A prediction a run has passed** (GATE-14): what a holder past its p90 reports in wait lines, and whether the critical gate re-prices its shadow end and closes or shrinks the lent window when a blocker overruns.
 - **Which members the run's end spares** (GATE-205): the run's end spares every job member whose image is `gate.exe`, whatever gate it is; GATE-205 tracks hardening that judgement.
 - **The surfaces of `gate status` and `gate drain`** (no issue yet). Install stays a script (`tools/install.ps1`) until a reason for a `gate install` subcommand appears.

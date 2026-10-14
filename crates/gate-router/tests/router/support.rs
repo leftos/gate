@@ -1,11 +1,37 @@
 //! A [`Facts`] of fixed answers that records every question asked, and small builders for the decision's inputs.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
-use gate_router::{Config, ConfigProblem, Facts, Inputs, Place, Slot};
+use gate_router::{Config, ConfigProblem, Facts, Inputs, Place, SiblingRoot, Slot};
 
 /// The worktree root the fixtures use.
 pub const ROOT: &str = "X:/dev/yaat.wt/a";
+
+/// The folder [`ROOT`] is in, where its siblings are.
+pub const PARENT: &str = "X:/dev/yaat.wt";
+
+/// The root of [`ROOT`]'s sibling `name`.
+pub fn sibling_root(name: &str) -> String {
+    format!("{PARENT}/{name}")
+}
+
+/// The place of a gate at `prefix` below [`ROOT`] in a worktree of `yaat`, its folder spelled as git spells the root.
+pub fn place_at(prefix: &str) -> Place {
+    Place {
+        root: ROOT.to_owned(),
+        prefix: prefix.to_owned(),
+        checkout: "yaat".to_owned(),
+        folder: format!("{ROOT}/{prefix}").trim_end_matches('/').to_owned(),
+    }
+}
+
+/// The sibling `name` of [`ROOT`] as the decision hands it to the rewrite.
+pub fn sibling(name: &str) -> SiblingRoot {
+    SiblingRoot {
+        name: name.to_owned(),
+        root: sibling_root(name),
+    }
+}
 
 /// The sha of [`ROOT`]'s worktree in the fixtures.
 pub const HEAD: &str = "0123456789abcdef0123456789abcdef01234567";
@@ -42,7 +68,15 @@ pub struct FakeFacts {
     pub head: Result<Option<String>, String>,
     pub files: Vec<String>,
     pub devices: Vec<(char, String)>,
+    /// What `.gate/siblings.toml` gives.
+    pub siblings: Result<Vec<String>, String>,
+    /// The roots that hold a git worktree.
+    pub present: Vec<String>,
     pub asked: RefCell<Vec<String>>,
+    /// How many times the siblings file was read, kept apart from [`FakeFacts::asked`].
+    pub siblings_read: Cell<u32>,
+    /// Each root asked whether a git worktree is there, in order, kept apart from [`FakeFacts::asked`].
+    pub presence_asked: RefCell<Vec<String>>,
 }
 
 impl FakeFacts {
@@ -56,16 +90,25 @@ impl FakeFacts {
     pub fn at(prefix: &str) -> Self {
         Self {
             config: Ok(Some(config())),
-            place: Ok(Some(Place {
-                root: ROOT.to_owned(),
-                prefix: prefix.to_owned(),
-                checkout: "yaat".to_owned(),
-            })),
+            place: Ok(Some(place_at(prefix))),
             has_files: Ok(true),
             head: Ok(Some(HEAD.to_owned())),
             files: Vec::new(),
             devices: Vec::new(),
+            siblings: Ok(Vec::new()),
+            present: Vec::new(),
             asked: RefCell::new(Vec::new()),
+            siblings_read: Cell::new(0),
+            presence_asked: RefCell::new(Vec::new()),
+        }
+    }
+
+    /// A gate at `prefix` below the root declaring `names` as siblings, the ones in `present` beside the root.
+    pub fn with_siblings(prefix: &str, names: &[&str], present: &[&str]) -> Self {
+        Self {
+            siblings: Ok(words(names)),
+            present: present.iter().map(|name| sibling_root(name)).collect(),
+            ..Self::at(prefix)
         }
     }
 
@@ -118,5 +161,15 @@ impl Facts for FakeFacts {
             .iter()
             .find(|(device, _)| *device == letter)
             .map(|(_, target)| target.clone())
+    }
+
+    fn siblings(&self, _place: &Place) -> Result<Vec<String>, String> {
+        self.siblings_read.set(self.siblings_read.get() + 1);
+        self.siblings.clone()
+    }
+
+    fn sibling_present(&self, root: &str) -> Result<bool, String> {
+        self.presence_asked.borrow_mut().push(root.to_owned());
+        Ok(self.present.iter().any(|present| present == root))
     }
 }

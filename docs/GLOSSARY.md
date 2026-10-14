@@ -76,6 +76,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Key version**: `keyVersion` in the durations store, naming the rule set that made its keys; a store written under another one is rebuilt.
 - **Late arrival**: a PowerShell gate whose earliest claim or ticket `since` is later than the cutover flag's write time, because its caller bypassed the launcher; the cutover's drain names it.
 - **Late take**: the slot of its own kind that a covered gate takes, beside its running command, when its parent gate ends first; its `take` names the ended parent in `parentPid`.
+- **Layout name**: a folder name the builder can lay out beside another (`gate_router::is_layout_name`): ASCII letters, digits, `.`, `_` and `-`, not starting or ending with a dot, not a reserved device name; a sibling's name and a root's folder name that declares siblings must be one.
 - **Lending**: a light parent gate letting a nested heavy gate, which its slot does not cover, run on that slot while a critical request drains and before one holds the machine, instead of queueing behind it; the gate is the lent gate. A parent on a reserved light slot lends nothing.
 - **Lent window**: the span during a critical drain in which the critical gate lends one slot to backfill guests, ending at the shadow end.
 - **Light**: the slot kind for work that keeps one or two cores busy; its pool's thread budget is 2.
@@ -131,6 +132,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **SDK pin**: the `sdk` member of a snapshot's `global.json` (version, `rollForward` policy, `allowPrerelease`) that the parity check resolves against the builder's SDKs; one that cannot be read leaves only the SDK major to check.
 - **Shadow end**: the expected end of the slowest gate a critical drain waits on, which closes the lent window.
 - **Shim**: an extensionless script on PATH, such as the bash shims a plugin puts ahead of `uv` and `python`, which program resolution skips since Windows cannot start it.
+- **Sibling**: a worktree beside the repo's root (`../<name>`) that its `.gate/siblings.toml` declares because the build reaches into it by relative path; a routed run needs it present, and a word naming a path inside it is rewritten for the builder's layout.
 - **Slot**: a named mutex in the session's `Local\` namespace that a gate holds for its command's whole run; the number of slots per pool caps how many commands run at once.
 - **Slot marker**: the environment variable `GATE_SLOT_HELD`, `<kind>:<pid>:<start>` (plus the root hash under a non-default root), which a gate sets for its command so a nested gate knows its parent.
 - **Snapshot**: either the parentless commit of a worktree as it stands, which a routed run sends to its builder; or the critical gate's record, at take, of the counts and the other gates' claims.

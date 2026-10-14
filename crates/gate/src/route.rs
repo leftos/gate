@@ -5,18 +5,26 @@ use std::cell::RefCell;
 use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read};
+use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use gate_args::{RunRequest, Slot};
 use gate_router::{Config, ConfigProblem, Facts, Inputs, LocalReason, Place, Route, decide};
+use windows_sys::Win32::Storage::FileSystem::{
+    FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+};
 
 use crate::console::Console;
-use crate::remote::git;
+use crate::remote::{git, siblings};
 use crate::resolve::Environment;
 
 /// The `notRouted` value of a heavy gate its caller kept here with `--local`.
 const LOCAL_FLAG: &str = "--local";
+/// The largest `.gate/siblings.toml` the decision reads: 64 KiB.
+const SIBLINGS_MOST_BYTES: usize = 64 * 1024;
+/// The problem of a `.gate/siblings.toml` that is a link, a junction or a folder.
+const SIBLINGS_NOT_A_FILE: &str = "is a link, a junction or not a file";
 /// Why a command that would route runs here when one of its words is not valid Unicode.
 const NOT_UNICODE: &str = "a word of the command is not valid Unicode";
 
@@ -213,6 +221,102 @@ impl Facts for Machine<'_> {
         // is judged as written.
         gate_win32::device_target(letter).ok().flatten()
     }
+
+    fn siblings(&self, place: &Place) -> Result<Vec<String>, String> {
+        read_siblings(Path::new(&place.root))
+    }
+
+    fn sibling_present(&self, root: &str) -> Result<bool, String> {
+        let git = Path::new(root).join(".git");
+        git.try_exists()
+            .map_err(|error| format!("cannot tell whether {} exists: {error}", git.display()))
+    }
+}
+
+/// The siblings `<root>\.gate\siblings.toml` declares as it stands on disk: no file declares none, and a file that
+/// cannot be read, does not parse or has any problem gives its first problem.
+///
+/// `.gate` is opened as itself, not following a link, and held open until the file is read, sharing reading, writing
+/// and deletion so it never blocks a checkout. A `.gate` that is a link or a junction (any name-surrogate reparse
+/// point) is a problem naming `.gate`, and so is one that cannot be opened; a `.gate` that is not a folder holds no
+/// file. The file is opened by its name inside the folder object that handle holds ([`gate_win32::open_beneath`]), so
+/// it is that folder's file whatever the path to `.gate` names by then, matched in any letter case unless the folder
+/// is case-sensitive. It is opened as itself too, sharing the same, so a checkout or an editor's save is never blocked
+/// by it, and read from that handle. A file that is a link, a junction or a folder is a problem, and so is one larger
+/// than [`SIBLINGS_MOST_BYTES`]. A file that is any other reparse point, such as a deduplicated one, is read through
+/// its filter, from a handle opened again that must be of the same file ([`gate_win32::same_file`]); one of any other
+/// is the not-a-file problem.
+fn read_siblings(root: &Path) -> Result<Vec<String>, String> {
+    let gate = root.join(".gate");
+    let held = open_as_itself(&gate).map_err(|error| format!(".gate: cannot read it: {error}"))?;
+    let Some((gate_folder, gate_metadata)) = held else {
+        return Ok(Vec::new());
+    };
+    if gate_metadata.file_type().is_symlink() {
+        return Err(".gate is a link or a junction".to_owned());
+    }
+    if !gate_metadata.is_dir() {
+        return Ok(Vec::new());
+    }
+    let opened = with_metadata(gate_win32::open_beneath(&gate_folder, "siblings.toml")).map_err(|error| format!("cannot read it: {error}"))?;
+    let Some((file, metadata)) = opened else {
+        return Ok(Vec::new());
+    };
+    if !metadata.is_file() {
+        return Err(SIBLINGS_NOT_A_FILE.to_owned());
+    }
+    let bytes = read_capped(file, &metadata)?;
+    drop(gate_folder);
+    if bytes.len() > SIBLINGS_MOST_BYTES {
+        return Err("is larger than 64 KiB".to_owned());
+    }
+    let declared = siblings::read_bytes(&bytes)?;
+    match declared.problems.into_iter().next() {
+        Some(problem) => Err(problem),
+        None => Ok(declared.names),
+    }
+}
+
+/// The file or folder at `path` opened for reading as itself, a link or a junction not followed, sharing reading,
+/// writing and deletion, and what the handle says it is; `None` when nothing is there.
+fn open_as_itself(path: &Path) -> io::Result<Option<(fs::File, fs::Metadata)>> {
+    with_metadata(
+        fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path),
+    )
+}
+
+/// The file `opened` and what its handle says it is; `None` when nothing was there to open.
+fn with_metadata(opened: io::Result<fs::File>) -> io::Result<Option<(fs::File, fs::Metadata)>> {
+    let file = match opened {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        opened => opened?,
+    };
+    let metadata = file.metadata()?;
+    Ok(Some((file, metadata)))
+}
+
+/// At most [`SIBLINGS_MOST_BYTES`] and one more of `file`, whose handle says `metadata`: read from that handle for a
+/// plain file, and through the filter for a reparse point, which [`gate_win32::open_beneath`] opened as the point
+/// itself: a handle opened again that is not of the same file is the not-a-file problem, and an error is the
+/// unreadable one.
+fn read_capped(file: fs::File, metadata: &fs::Metadata) -> Result<Vec<u8>, String> {
+    let unreadable = |error: io::Error| format!("cannot read it: {error}");
+    let file = if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0 {
+        file
+    } else {
+        let filtered = gate_win32::reopen_through_filter(&file).map_err(unreadable)?;
+        if !gate_win32::same_file(&file, &filtered).map_err(unreadable)? {
+            return Err(SIBLINGS_NOT_A_FILE.to_owned());
+        }
+        filtered
+    };
+    let mut bytes = Vec::new();
+    file.take((SIBLINGS_MOST_BYTES + 1) as u64).read_to_end(&mut bytes).map_err(unreadable)?;
+    Ok(bytes)
 }
 
 /// Runs `call`, git asked [`PLACE_ARGS`] in a folder, and reads the place it printed: `Ok(None)` for any non-zero exit
@@ -227,13 +331,13 @@ pub(crate) fn read_place(git: &git::Git, call: &git::Call<'_>) -> Result<Option<
         .read_to_end(&mut bytes)
         .map_err(|error| format!("cannot read git rev-parse's output: {error}"))?;
     let text = String::from_utf8(bytes).map_err(|_| "git rev-parse's output is not valid UTF-8".to_owned())?;
-    parse_place(&text).map(Some)
+    parse_place(&text, call.folder).map(Some)
 }
 
-/// The place `git rev-parse --show-toplevel --show-prefix --path-format=absolute --git-common-dir` printed, in exactly
-/// three lines: the root, the prefix (empty at the root) and the common git folder, whose parent's name is the
-/// checkout's.
-fn parse_place(text: &str) -> Result<Place, String> {
+/// The place of `folder`, as the gate spells it, that `git rev-parse --show-toplevel --show-prefix
+/// --path-format=absolute --git-common-dir` printed, in exactly three lines: the root, the prefix (empty at the root)
+/// and the common git folder, whose parent's name is the checkout's.
+fn parse_place(text: &str, folder: &Path) -> Result<Place, String> {
     let lines: Vec<&str> = text.lines().collect();
     let [root, prefix, common] = lines.as_slice() else {
         return Err(format!(
@@ -249,6 +353,7 @@ fn parse_place(text: &str) -> Result<Place, String> {
         root: (*root).to_owned(),
         prefix: (*prefix).to_owned(),
         checkout: checkout.to_string_lossy().into_owned(),
+        folder: folder.to_string_lossy().into_owned(),
     })
 }
 
@@ -274,38 +379,46 @@ fn holds_existing_path(listing: impl BufRead, root: &Path) -> io::Result<bool> {
 #[expect(clippy::expect_used, reason = "a test that cannot make its folders must fail loudly")]
 mod tests {
     use std::fs;
-    use std::path::PathBuf;
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::path::{Path, PathBuf};
 
     use gate_router::{LocalReason, Place, Route};
+    use windows_sys::Win32::Storage::FileSystem::{DELETE, FILE_GENERIC_READ, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE};
 
-    use super::{holds_existing_path, not_routed, parse_head, parse_place};
+    use super::{SIBLINGS_NOT_A_FILE, holds_existing_path, not_routed, parse_head, parse_place, read_siblings};
+    use crate::test_support::junction;
+
+    /// The folder the place cases are asked of, spelled on a subst drive as a gate started there spells it.
+    const FOLDER: &str = r"S:\src";
 
     fn place(root: &str, prefix: &str, checkout: &str) -> Place {
         Place {
             root: root.to_owned(),
             prefix: prefix.to_owned(),
             checkout: checkout.to_owned(),
+            folder: FOLDER.to_owned(),
         }
     }
 
     #[test]
     fn rev_parse_output_gives_the_root_the_prefix_and_the_checkout() {
+        let parse = |text: &str| parse_place(text, Path::new(FOLDER));
         assert_eq!(
-            parse_place("C:/work/app\n\nC:/work/app/.git\n"),
+            parse("C:/work/app\n\nC:/work/app/.git\n"),
             Ok(place("C:/work/app", "", "app")),
             "at the root the prefix is empty"
         );
         assert_eq!(
-            parse_place("C:/work/app-wt\r\nsrc/my dir/\r\nC:/work/app/.git\r\n"),
+            parse("C:/work/app-wt\r\nsrc/my dir/\r\nC:/work/app/.git\r\n"),
             Ok(place("C:/work/app-wt", "src/my dir/", "app")),
             "a worktree below a folder names the main checkout"
         );
-        assert!(parse_place("C:/work/app\n\n").is_err(), "a missing common folder");
+        assert!(parse("C:/work/app\n\n").is_err(), "a missing common folder");
         assert!(
-            parse_place("C:/work/app\n\n--path-format=absolute\nC:/work/app/.git\n").is_err(),
+            parse("C:/work/app\n\n--path-format=absolute\nC:/work/app/.git\n").is_err(),
             "a git too old for --path-format prints a fourth line"
         );
-        assert!(parse_place("C:/work/app\n\n/\n").is_err(), "a common folder with no parent");
+        assert!(parse("C:/work/app\n\n/\n").is_err(), "a common folder with no parent");
     }
 
     #[test]
@@ -331,6 +444,71 @@ mod tests {
         assert!(!found(b"sub/gone.txt\0"), "an unstaged delete");
         assert!(!found(b""), "nothing listed");
         fs::remove_dir_all(&root).expect("the test folder can be removed");
+    }
+
+    /// Folders a test made, removed when it ends, failed or not: a junction inside one is removed as the link, its
+    /// target left to its own entry.
+    struct Removed(Vec<PathBuf>);
+
+    impl Drop for Removed {
+        #[expect(clippy::print_stderr, reason = "a case that cannot clean up says so without failing the test it ends")]
+        fn drop(&mut self) {
+            for folder in &self.0 {
+                match fs::remove_dir_all(folder) {
+                    Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                        eprintln!("cannot remove the test folder {}: {error}", folder.display());
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_siblings_file_is_read_only_as_a_small_regular_file_under_a_real_folder() {
+        let root: PathBuf = std::env::temp_dir().join(format!("gate-route-siblings-{}", std::process::id()));
+        let elsewhere = root.with_extension("elsewhere");
+        for folder in [&root, &elsewhere] {
+            if folder.exists() {
+                fs::remove_dir_all(folder).expect("a folder left by an earlier run can be removed");
+            }
+        }
+        let _removed = Removed(vec![root.clone(), elsewhere.clone()]);
+        let gate = root.join(".gate");
+        let file = gate.join("siblings.toml");
+        assert_eq!(read_siblings(&root), Ok(Vec::new()), "no .gate folder");
+        fs::create_dir_all(&root).expect("the test folder can be made");
+        fs::write(&gate, "").expect("a file named .gate can be written");
+        assert_eq!(read_siblings(&root), Ok(Vec::new()), "a .gate that is a file holds no siblings file");
+        fs::remove_file(&gate).expect("the .gate file can be removed");
+        fs::create_dir_all(&gate).expect("the .gate folder can be made");
+        assert_eq!(read_siblings(&root), Ok(Vec::new()), "a .gate folder that holds no siblings file");
+
+        fs::create_dir_all(&file).expect("a folder named like the file can be made");
+        let not_a_file = Err(SIBLINGS_NOT_A_FILE.to_owned());
+        assert_eq!(read_siblings(&root), not_a_file, "a folder");
+        fs::remove_dir(&file).expect("the folder can be removed");
+
+        fs::write(&file, format!("siblings = ['b']\n#{}\n", "x".repeat(64 * 1024 - 19))).expect("the file can be written");
+        assert_eq!(fs::metadata(&file).expect("the file is there").len(), 64 * 1024);
+        assert_eq!(read_siblings(&root), Ok(vec!["b".to_owned()]), "64 KiB reads");
+        fs::write(&file, format!("siblings = ['b']\n#{}\n", "x".repeat(64 * 1024 - 18))).expect("the file can be written");
+        assert_eq!(read_siblings(&root), Err("is larger than 64 KiB".to_owned()));
+
+        fs::write(&file, "siblings = ['b']\n").expect("the file can be written");
+        let held = fs::OpenOptions::new()
+            .access_mode(FILE_GENERIC_READ | DELETE)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .open(&file)
+            .expect("the file can be held open for deletion, as an editor's atomic save does");
+        assert_eq!(read_siblings(&root), Ok(vec!["b".to_owned()]), "a file held open for deletion reads");
+        drop(held);
+
+        fs::create_dir_all(elsewhere.join(".gate")).expect("the junction's target can be made");
+        fs::write(elsewhere.join(".gate").join("siblings.toml"), "siblings = ['b']\n").expect("the target file can be written");
+        fs::remove_dir_all(&gate).expect("the real .gate can be removed");
+        junction(&gate, &elsewhere.join(".gate"));
+        assert_eq!(read_siblings(&root), Err(".gate is a link or a junction".to_owned()), "a junction");
     }
 
     #[test]
