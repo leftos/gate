@@ -665,9 +665,9 @@ impl Attempt<'_, '_> {
     /// The toolchain parity check, made after the preflight and before the push, so a refusal costs no transfer: a
     /// builder whose preflight listed the SDKs `sdks` must have what the snapshot needs, as [`parity::need`] reads it
     /// from the snapshot's root `global.json`, whatever the letter case of its name, and, with no pin, this PC's newest
-    /// SDK major. One that lacks it is refused `parity`, with the mismatch line. A builder that listed no SDK line, a
-    /// snapshot that is no .NET tree, or one whose listing or `global.json` cannot be read whole is not checked, the
-    /// listing with a line.
+    /// SDK major. One that lacks any of it says one mismatch line per need, in order, and is refused `parity` once. A
+    /// builder that listed no SDK line, a snapshot that is no .NET tree, or one whose listing or `global.json` cannot be
+    /// read whole is not checked, the listing with a line.
     fn parity(&mut self, snapshot: &Snapshot, sdks: Option<&[String]>) -> Result<(), End> {
         let Some(sdks) = sdks else {
             return Ok(());
@@ -704,13 +704,15 @@ impl Attempt<'_, '_> {
         if pin.found && pin.version.is_none() {
             self.say(parity::NO_READABLE_PIN.to_owned());
         }
-        let need = parity::need(&pin, sdks, || self.local_major());
+        let needs = parity::need(&pin, sdks, || self.local_major());
         // A Ctrl+C while this PC's SDK list was read ends the run here, as an interrupt, before the push.
         self.go_on()?;
-        let Some(need) = need else {
+        if needs.is_empty() {
             return Ok(());
-        };
-        self.say(parity::mismatch_line(self.call.repo, &need, self.call.host, sdks));
+        }
+        for line in parity::lines(self.call.repo, &needs, self.call.host, sdks) {
+            self.say(line);
+        }
         Err(End::Refused(FallbackReason::Parity))
     }
 
@@ -2218,7 +2220,7 @@ fn relayed_raw(
     })
 }
 
-/// Copies `stream` into `sink`, shown as `shown`, byte for byte until it ends, in chunks of at most [`RAW_CHUNK`]: no/// Copies `stream` into `sink`, shown as `shown`, byte for byte until it ends, in chunks of at most [`RAW_CHUNK`]: no
+/// Copies `stream` into `sink`, shown as `shown`, byte for byte until it ends, in chunks of at most [`RAW_CHUNK`]: no
 /// line is read, so no length cuts it. Each chunk marks the call's progress, and marks that the call wrote on standard
 /// output, so a call that sent a byte is past the banner. A read or a write that fails is the call's problem, and ends
 /// the copy. No write is made under the lock the watcher could take.

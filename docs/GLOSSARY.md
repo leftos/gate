@@ -85,6 +85,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Lost connection**: a remote run call that ended with ssh's status 255 after the banner (or whose command itself exited 255); nothing is synced back, the client sends the stop, and a boot-time check tells a restarted builder from a dropped link.
 - **Manifest**: the PC's list of its files under a routed run's output globs (path, size, last write, SHA-256), sent to the box so it packs only the files the PC lacks or that differ.
 - **Marker**: a failure marker, a log line the built-in regex reads as a failure (such as `Build FAILED.` or `error CS1234`), which turns a zero exit into status 1.
+- **Need**: what a snapshot needs that the builder lacks, in the parity check: one `Need` of a kind (so far the .NET SDK), each said on its own mismatch line.
 - **Nesting**: a gate started inside another gate's command (a build hook under a gated `git commit`), which reads its parent from the slot marker.
 - **No slot**: the slot kind `none` (`--slot none`), for a command that only dispatches or watches remote work: it takes no slot, mutex, ticket or claim, never waits, and still has its job, log, ceiling and watchdog.
 - **Notes**: the gate's own lines gathered while a run goes and appended to the end of its log.
@@ -149,6 +150,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Test mode**: the `gate-nextup` profile's `test mode: unstable|stable` line; `unstable` runs each item's reached tests and the full suite before a push or reinstall, `stable` runs the full suite for every item.
 - **Test seam**: a hidden `--test-*` flag, compiled only with the `test-seams` cargo feature, by which the suite sets a timing knob or prints the parsed request.
 - **Ticket**: the JSON file `waiting\<pid>-<start>.json` a gate writes when it queues for a slot, holding its kind and `arrived` time; waiters of one kind take slots in ticket order.
+- **Toolchain manifest**: a repo's `.gate/toolchain.toml`, naming the tools (each with a minimum version, or present at any) and the .NET workloads a routed run's builder must have; read by `remote/toolchain.rs`, with no routed run reading it yet.
 - **Tracked member**: a member of a routed run's fetched outputs archive whose path the worktree's git index holds, or that sits under a submodule or a nested repository; the install skips it (`... is tracked by git`) unless a `--bring-tracked` glob of the call matches it.
 - **Transfer ceiling**: the fixed 1800 s limit on a routed run's transfers, whatever `--timeout` says: the setup (preflight and push) counted from the attempt's start, each fetch after the run call counted from its own start; a fetch past it ends TRANSFER TIMED OUT (exit 124, verdict `transfer-timed-out`), a setup call past it falls back `unreachable`.
 - **Unbound marker**: a `GATE_SLOT_HELD` marker naming a live gate whose job does not hold this gate or the first ancestor of it that any job holds; the gate ignores it and runs as one under no parent. A marker whose binding cannot be judged is honoured, not unbound.

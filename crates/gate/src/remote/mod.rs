@@ -30,6 +30,14 @@ mod payload;
 mod retry;
 mod snapshot;
 mod syncback;
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the manifest reader serves only its tests until the routed preflight reads the manifest"
+    )
+)]
+mod toolchain;
 pub(crate) mod transport;
 mod watchdog;
 

@@ -694,6 +694,8 @@ The push order is `host`, then `hosts` in file order, an entry equal to an earli
 
 ops-tower reads only `slots`.
 
+A repo's own `.gate/toolchain.toml`, which declares the tools and workloads a routed run's builder needs, is a separate file in the snapshot, not part of `remote.json`: [Routing](#routing) (Toolchain manifest) describes its format.
+
  It carries no `v`; its format moves with the remote port (GATE-10).
 
 ## Critical drain and nesting
@@ -1159,7 +1161,9 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
     Any other non-zero status says `gate: preparing <builder root> on <host> failed (status <n>)` and ends the run with that status. A reported version text other than this PC's whole one, build id included, says `gate: not routed: <host> runs gate <theirs|unknown>, this PC <ours>; run gate push` and falls back `version`; the builder's version is its first 4 KiB, escaped.
   - **Parity.** After the preflight and before the push, `remote/parity.rs` checks that the builder's `gate: remote sdks` line (from the preflight) has what the snapshot needs. A builder with no sdks line, or a tree that is not .NET (no `global.json`, `.sln`, `.slnx` or `.csproj` anywhere in the snapshot), skips the check.
 
-    A lacking builder says `gate: remote toolchain mismatch: <repo> needs <need>; <host> has <sdks>` then `gate: remote <host> parity; running here`, and falls back `parity` (status 75).
+    A lacking builder says `gate: remote toolchain mismatch: <repo> needs <need>; <host> has <sdks>` once for each need, in the order the needs are listed, then a single `gate: remote <host> parity; running here`, and falls back `parity` (status 75).
+
+    The only kind of need so far is the SDK, so there is one line; each kind words the builder's side of its own line (for an SDK, its SDKs, or `none`).
 
     `<need>` is `.NET SDK <version> (rollForward <policy>)` for a pin, the policy defaulting to `patch`, or `a .NET <major> SDK` without one, where the major is that of this PC's newest SDK (none listed: no check). A pin is met by dotnet's own rule for the nine rollForward policies and `allowPrerelease`, versions read as `x.y.znn` (feature band and patch).
 
@@ -1198,6 +1202,16 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
     The builder's preflight reports its installed workloads beside the SDK line (`gate: remote workloads {ids}`), and the PC refuses with status 75 `parity` and falls back to a local run when the snapshot's projects need a workload the builder lacks.
 
     The source of what a repo needs is either this PC's own workload list or a scan of the snapshot's project files; the choice is made after measuring what `dotnet workload list` costs per preflight.
+
+    **Toolchain manifest** (GATE-206, GATE-209): a repo's `.gate/toolchain.toml` declares what a routed run's builder must have beyond the .NET SDK, and `remote/toolchain.rs` reads it as data from text the caller hands over. No routed run reads it yet: the preflight's check against it is not built, so a manifest changes nothing a run does.
+
+    The file has a `[tools]` table of `name = "version"` and a top-level `workloads` array of .NET workload ids. A version is a minimum, "this or later", written `major[.minor[.patch]]` with the missing parts 0 (`"24"` is 24.0.0), and `""` means the tool is present at any version. The known names are `rust`, `cargo-nextest`, `node`, `pnpm`, `pwsh`, `godot` and `ffmpeg`; an unknown name is kept and flagged unknown, for the consumer to skip with a line. A leading byte order mark is skipped.
+
+    A file that is not UTF-8 or does not parse is unreadable whole, and the line for it is `gate: cannot read .gate/toolchain.toml: <why>; skipping the manifest's checks`, `<why>` being `line <l>, column <c>: <toml message>` or `not valid UTF-8 (...)`.
+
+    A bad entry is skipped alone and named in the reader's problems: `tools.<name> is not a version: "<text>"`, `tools.<name> is not a string (TOML <type>)`, `tools is not a table (TOML <type>)`, `workloads is not an array (TOML <type>)`, `workloads[<i>] is not a string (TOML <type>)`, `workloads[<i>] is empty` and `<key> is not a key of the manifest (tools, workloads)`.
+
+    Two pins a repo already declares are read beside it, also as minimums: each tool's version in `.config/dotnet-tools.json` (the release part, so `1.0.0-beta.1` is 1.0.0; read as strict JSON, as dotnet reads it, so a comment or a trailing comma makes the file unreadable, and a tool id given twice counts once, with its last version) and the `Godot.NET.Sdk/<version>` a project file names, on its root `<Project Sdk=...>` or an `<Sdk Name="Godot.NET.Sdk" Version=...>` element directly inside it (an `<Import Sdk=...>`, a deeper `<Sdk>` element and a `min=` version are not read). `global.json` stays the SDK pin, read by `parity.rs` as above.
   - **Push.** `git push --no-verify --no-recurse-submodules --progress [--receive-pack=…] -- <host>:<builder root>/<repo>.git +<snapshot>:refs/gate/<key> [+<bridge>:refs/gate-bridge/<key>]`, with `GIT_SSH_COMMAND` carrying the ssh options. Success says `gate: pushed snapshot <8 hex> in <s> s (<size>|up to date)` and moves the local `refs/gate-remote/<key>`.
 
     The builder keeps one bare repo per repo name, `<builder root>/<repo>.git`, shared by every key of that repo; the key is only the ref's name.
@@ -1501,7 +1515,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
   The client's git calls also drop `GIT_CONFIG_COUNT`, `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM` and every `GIT_CONFIG_KEY_n` and `GIT_CONFIG_VALUE_n`, so the caller's git configuration never reaches the builder's repo, and `GIT_SSH_VARIANT` and `GIT_EXTERNAL_DIFF`, so neither the ssh option syntax nor the diff a sync-back applies can be changed from outside.
 - **Sibling worktrees** (GATE-19, GATE-213), planned, not built: some repos' builds reach into a sibling repo by relative path, and a routed run that sends one worktree's snapshot would compile something different on the builder without any error.
 
-  `remote.json` has no `siblings` field and the code reads none; a repo's siblings will be declared under `.gate/` in the repo (GATE-213). A routed gate in a repo with siblings will snapshot each sibling's worktree beside its own (`../{name}`, as the pair folder lays them out, or beside the main checkout), and the box will lay the work folders out the same way, so relative paths between them resolve.
+  `remote.json` has no `siblings` field and the code reads none; a repo's siblings will be declared under `.gate/` in the repo (GATE-213), beside the [toolchain manifest](#routing) `.gate/toolchain.toml`. A routed gate in a repo with siblings will snapshot each sibling's worktree beside its own (`../{name}`, as the pair folder lays them out, or beside the main checkout), and the box will lay the work folders out the same way, so relative paths between them resolve.
 
   A word naming a path inside a declared sibling's worktree is rewritten as an in-worktree path is.
 

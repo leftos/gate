@@ -229,7 +229,7 @@ pub enum FallbackReason {
     Busy,
     /// The builder could not be reached.
     Unreachable,
-    /// The builder's snapshot did not match the caller's tree.
+    /// The builder's toolchain lacks what the caller's tree needs.
     Parity,
     /// The builder rebooted during the run.
     Rebooted,
