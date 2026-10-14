@@ -51,6 +51,8 @@ The tests, by test mode:
 
 - **unstable** (now): each item's last gate runs its reached tests, the tests its change reaches, from [docs/test-map.md](../../../docs/test-map.md): `-Slot heavy -TimeoutSeconds 900 -- cargo nextest run --workspace --all-features --cargo-profile test-release -E '<the union of the filtersets of every row the diff touches>'`; a diff that touches a central file, or a file the map does not list, runs the full suite.
 
+  The brief writes that union from exactly the rows its diff touches, with no module added for safety, and each step's proving command runs the step's named tests alone: on a PC whose heavy slots other gates share, every extra module in a reached set costs minutes of wall time.
+
   The full suite, `-Slot heavy -TimeoutSeconds 1800 -- cargo nextest run --workspace --all-features --cargo-profile test-release --no-fail-fast` (`--all-features` builds the black-box suite, which needs the `test-seams` feature), runs before every reinstall (the release step), before every push (an unstable repo pushes at the /nextup checkpoint only), and before a cutover or a feature-branch merge; a red full run holds them and becomes the next item, Urgent.
 - **stable**: each item runs the full suite as its last gate. A step's proving loop still narrows to the test map.
 
