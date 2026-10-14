@@ -27,6 +27,10 @@ pub(crate) struct Held {
     pub sha256: String,
 }
 
+/// Each SHA-256 a manifest holds, with every path holding it, in the order of the paths' simple uppercase, and what the
+/// PC holds there.
+pub(crate) type HeldBy<'m> = HashMap<&'m str, Vec<(&'m str, &'m Held)>>;
+
 /// The PC's outputs manifest: each of its files under the run's globs, by `/`-separated path relative to the worktree
 /// root, with its stamp and SHA-256. Paths are found without regard to case, as Windows finds files. Sent as one line
 /// of JSON and a newline: `{"files":{"<path>":{"size":<bytes>,"modified":<file time>,"sha256":"<hex>"}}}`.
@@ -84,6 +88,18 @@ impl Manifest {
     /// What the PC holds at `path`, found without regard to case.
     pub(crate) fn get(&self, path: &str) -> Option<&Held> {
         self.files.get(&ordinal_upper(path)).map(|(_, held)| held)
+    }
+
+    /// The manifest's files by their SHA-256 ([`HeldBy`]), each path of `skip` left out, found without regard to case.
+    pub(crate) fn by_hash(&self, skip: &[String]) -> HeldBy<'_> {
+        let skip: HashSet<String> = skip.iter().map(|path| ordinal_upper(path)).collect();
+        let mut index = HeldBy::new();
+        for (key, (path, held)) in &self.files {
+            if !skip.contains(key) {
+                index.entry(held.sha256.as_str()).or_default().push((path.as_str(), held));
+            }
+        }
+        index
     }
 
     /// The manifest as it is sent: one line of JSON, and a newline.
@@ -169,10 +185,24 @@ impl Listing {
     }
 }
 
+/// A file [`select`] chose to pack, with its SHA-256 when it was hashed before the pack.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Chosen<'found> {
+    pub file: &'found Found,
+    pub sha256: Option<String>,
+}
+
+impl<'found> From<&'found Found> for Chosen<'found> {
+    /// The file `file`, not hashed.
+    fn from(file: &'found Found) -> Chosen<'found> {
+        Chosen { file, sha256: None }
+    }
+}
+
 /// The files of `found`, the box's walk after the command, to pack, in their order: each outside `skip` (the paths of
 /// the run's back commit, which the sync-back carries) that the PC's `manifest` lacks, and each it holds that the run
 /// created or changed (`listing` lacks it or holds another stamp) whose SHA-256 (`hash`) differs from the manifest's.
-/// Only a file the manifest holds and the run changed is hashed.
+/// Only a file the manifest holds and the run changed is hashed, and a chosen one keeps its hash.
 ///
 /// `listing` is `None` under `OutputsFull` (the PC's last outputs step did not complete): every file then counts as
 /// changed, so each that differs from the PC's comes back. Paths compare without regard to case. Else the error of the
@@ -183,7 +213,7 @@ pub(crate) fn select<'found>(
     listing: Option<&Listing>,
     skip: &[String],
     mut hash: impl FnMut(&Found) -> io::Result<String>,
-) -> io::Result<Vec<&'found Found>> {
+) -> io::Result<Vec<Chosen<'found>>> {
     let skip: HashSet<String> = skip.iter().map(|path| ordinal_upper(path)).collect();
     let mut chosen = Vec::new();
     for file in found {
@@ -191,15 +221,41 @@ pub(crate) fn select<'found>(
             continue;
         }
         let Some(held) = manifest.get(&file.path) else {
-            chosen.push(file);
+            chosen.push(Chosen::from(file));
             continue;
         };
         let changed = listing.is_none_or(|listing| listing.get(&file.path) != Some(file.stamp));
-        if changed && hash(file)? != held.sha256 {
-            chosen.push(file);
+        if !changed {
+            continue;
+        }
+        let sha256 = hash(file)?;
+        if sha256 != held.sha256 {
+            chosen.push(Chosen { file, sha256: Some(sha256) });
         }
     }
     Ok(chosen)
+}
+
+/// Hashes each of `chosen` not hashed yet whose size, as the walk found it, another of `chosen` or a file of `manifest`
+/// has: only such a file can be a copy of another, which the pack then lists without packing its bytes. Every other file
+/// is hashed by the pack's own read. Else the error of the first hash that fails.
+pub(crate) fn hash_possible_copies(
+    chosen: &mut [Chosen<'_>],
+    manifest: &Manifest,
+    mut hash: impl FnMut(&Found) -> io::Result<String>,
+) -> io::Result<()> {
+    let mut sizes: HashMap<u64, usize> = HashMap::new();
+    for item in chosen.iter() {
+        *sizes.entry(item.file.stamp.size).or_default() += 1;
+    }
+    let held: HashSet<u64> = manifest.files.values().map(|(_, held)| held.stamp.size).collect();
+    for item in chosen.iter_mut().filter(|item| item.sha256.is_none()) {
+        let size = item.file.stamp.size;
+        if held.contains(&size) || sizes.get(&size).is_some_and(|count| *count > 1) {
+            item.sha256 = Some(hash(item.file)?);
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -211,7 +267,7 @@ mod tests {
     use std::io;
     use std::path::PathBuf;
 
-    use super::{Held, Listing, Manifest, select};
+    use super::{Held, Listing, Manifest, hash_possible_copies, select};
     use crate::outputs::glob::Globs;
     use crate::outputs::walk::{Found, Stamp, walk};
 
@@ -256,8 +312,56 @@ mod tests {
             Ok(hashes.get(file.path.as_str()).cloned().expect("every hashed file has a hash"))
         })
         .expect("every hash succeeds");
-        let picked = picked.iter().map(|file| file.path.clone()).collect();
+        let picked = picked.iter().map(|chosen| chosen.file.path.clone()).collect();
         (picked, hashed.into_inner())
+    }
+
+    #[test]
+    fn only_files_whose_size_matches_another_are_hashed_before_the_pack() {
+        let files = [
+            found("bin/a.dll", stamp(5, 10)),
+            found("bin/b.dll", stamp(5, 10)),
+            found("bin/c.dll", stamp(7, 10)),
+            found("bin/d.dll", stamp(9, 10)),
+            found("bin/e.dll", stamp(3, 10)),
+        ];
+        let pc = manifest(&[("bin/e.dll", stamp(3, 1), 'e'), ("lib/x.dll", stamp(9, 1), 'x')]);
+        let hashes: HashMap<&str, String> = [
+            ("bin/a.dll", 'a'),
+            ("bin/b.dll", 'b'),
+            ("bin/c.dll", 'c'),
+            ("bin/d.dll", 'd'),
+            ("bin/e.dll", 'f'),
+        ]
+        .into_iter()
+        .map(|(path, digit)| (path, sha(digit)))
+        .collect();
+        let hashed = RefCell::new(Vec::new());
+        let hash = |file: &Found| {
+            hashed.borrow_mut().push(file.path.clone());
+            Ok(hashes.get(file.path.as_str()).cloned().expect("every hashed file has a hash"))
+        };
+        let mut chosen = select(&files, &pc, None, &[], hash).expect("every hash succeeds");
+        assert_eq!(hashed.take(), ["bin/e.dll"], "the selection hashes only the file the PC holds");
+
+        hash_possible_copies(&mut chosen, &pc, hash).expect("every hash succeeds");
+
+        assert_eq!(
+            hashed.take(),
+            ["bin/a.dll", "bin/b.dll", "bin/d.dll"],
+            "two of one size, and one of a size the PC holds; not one of a size no other file has, nor one hashed already"
+        );
+        let kept: Vec<(&str, Option<String>)> = chosen.iter().map(|item| (item.file.path.as_str(), item.sha256.clone())).collect();
+        assert_eq!(
+            kept,
+            [
+                ("bin/a.dll", Some(sha('a'))),
+                ("bin/b.dll", Some(sha('b'))),
+                ("bin/c.dll", None),
+                ("bin/d.dll", Some(sha('d'))),
+                ("bin/e.dll", Some(sha('f')))
+            ]
+        );
     }
 
     #[test]

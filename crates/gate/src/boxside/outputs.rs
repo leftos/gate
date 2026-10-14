@@ -22,7 +22,7 @@ use crate::console::Console;
 use crate::outputs::archive::pack;
 use crate::outputs::glob::Globs;
 use crate::outputs::hash::file_sha256;
-use crate::outputs::manifest::{Listing, Manifest, select};
+use crate::outputs::manifest::{Listing, Manifest, hash_possible_copies, select};
 use crate::outputs::walk::{Found, in_context, walk, walk_with_refused};
 
 /// How long an outputs archive is kept in the output folder before a run with output globs removes it, as the wrapper's
@@ -318,7 +318,8 @@ pub(super) fn listing(asked: &Asked<'_>, work: &Path) -> (Option<Listing>, Optio
 }
 
 /// Packs the files under `asked`'s globs in `work` to bring back after a passing command ([`select`]), leaving out
-/// `skip`, the paths of the run's back commit: the line saying how many were packed and the archive's name, or
+/// `skip`, the paths of the run's back commit, which the sync-back replaces on the PC, so no copy is made from the PC's
+/// file at one of them either: the line saying how many were packed and the archive's name, or
 /// `gate-remote-outputs: 0` with no archive written when none were, and before it the line saying the files [`select`]
 /// would have packed but for a name this PC cannot take ([`skipped_line`]), when there were any. Else why the outputs
 /// are not brought back; an archive left half written is removed. The archive is made anew: a file or a link already
@@ -335,11 +336,13 @@ pub(super) fn bring_back(
     let manifest = manifest.as_ref().map_err(Clone::clone)?;
     let walked = walk_with_refused(work, &asked.globs).map_err(|error| format!("the outputs could not be listed: {error}"))?;
     let hash = |file: &Found| file_sha256(&file.full);
-    let skipped = skipped_line(&select(&walked.refused, manifest, listing, skip, hash).map_err(|error| error.to_string())?);
-    let chosen = select(&walked.found, manifest, listing, skip, hash).map_err(|error| error.to_string())?;
+    let refused = select(&walked.refused, manifest, listing, skip, hash).map_err(|error| error.to_string())?;
+    let skipped = skipped_line(&refused.iter().map(|chosen| chosen.file).collect::<Vec<_>>());
+    let mut chosen = select(&walked.found, manifest, listing, skip, hash).map_err(|error| error.to_string())?;
     if chosen.is_empty() {
         return Ok((skipped, NOTHING_PACKED.to_owned()));
     }
+    hash_possible_copies(&mut chosen, manifest, hash).map_err(|error| error.to_string())?;
     fs::create_dir_all(asked.folder).map_err(|error| format!("cannot make the output folder {}: {error}", asked.folder))?;
     let path = Path::new(asked.folder).join(&asked.archive);
     let file = OpenOptions::new()
@@ -348,7 +351,7 @@ pub(super) fn bring_back(
         .share_mode(FILE_SHARE_READ)
         .open(&path)
         .map_err(|error| format!("cannot create {}: {error}", path.display()))?;
-    match pack(BufWriter::new(file), work, &chosen) {
+    match pack(BufWriter::new(file), work, &chosen, &manifest.by_hash(skip)) {
         Ok(packed) => Ok((skipped, format!("gate-remote-outputs: {} {}", packed.entries.len(), asked.archive))),
         Err(error) => match fs::remove_file(&path) {
             Ok(()) => Err(error.to_string()),

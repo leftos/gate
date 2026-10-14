@@ -1,5 +1,6 @@
 //! A routed run's fetched outputs archive put into the worktree: unpacked into a stage folder beside it, which checks
-//! every member's path and hash; each member then checked against the run's output globs, against the PC's manifest
+//! every member's path and hash and makes each copy the archive lists from its member, or from a PC file holding its bytes,
+//! checked by hashing them as they are copied; each member then checked against the run's output globs, against the PC's manifest
 //! (a file it held must still have its size and last write, one it lacked must still be missing), and one that counts as
 //! tracked (its git index, a submodule or a nested repository holds it) unless a `--bring-tracked` glob matches it, or
 //! whose PC file is in use or read-only, or that records the box's work folder but is not text the install can rewrite,
@@ -25,7 +26,7 @@ use super::client::{Attempt, End};
 use super::git::{Git, GitError};
 use super::outputs::{self, Archive, Polled};
 use crate::boxside::payload::{escaped, ordinal_upper};
-use crate::outputs::archive::{Entry, UnpackError, check_folder, unpack};
+use crate::outputs::archive::{Entry, PcFiles, UnpackError, below, check_folder, unpack};
 use crate::outputs::cache::{HashCache, file_time_now};
 use crate::outputs::glob::Globs;
 use crate::outputs::manifest::Manifest;
@@ -272,8 +273,14 @@ fn install(attempt: &Attempt<'_, '_>, fetched: &Fetched<'_>, staged: &Cell<bool>
     let unopened = |error: &UnpackError| unpack_refused(format!("the outputs archive {name} cannot be opened: {error}"), error.members());
     let file = File::open(path).map_err(|error| unopened(&error.into()))?;
     let compressed = file.metadata().map_err(|error| unopened(&error.into()))?.len();
+    let root = std::path::absolute(attempt.call.root).map_err(|error| transient(in_context(Path::new(attempt.call.root), &error).to_string()))?;
     let stopped = Cell::new(false);
-    let unpacking = unpacked(file, &fetched.stage, attempt.outputs_budget, &|| attempt.go_on().is_ok(), &stopped);
+    let pc = PcFiles {
+        root: &root,
+        manifest: fetched.manifest,
+        go_on: &|| attempt.go_on().is_ok(),
+    };
+    let unpacking = unpacked(file, &fetched.stage, attempt.outputs_budget, &pc, &stopped);
     staged.set(stage_made(&unpacking));
     let entries = unpacking.map_err(|error| {
         if stopped.get() {
@@ -282,7 +289,6 @@ fn install(attempt: &Attempt<'_, '_>, fetched: &Fetched<'_>, staged: &Cell<bool>
             unopened(&error)
         }
     })?;
-    let root = std::path::absolute(attempt.call.root).map_err(|error| transient(in_context(Path::new(attempt.call.root), &error).to_string()))?;
     let globs = Globs::new(fetched.globs).map_err(transient)?;
     let in_use = checked(&root, &entries, &globs, fetched.manifest).map_err(Unmet::Refused)?;
     let mut skipped = skips(attempt, &root, &entries, &in_use)?;
@@ -520,23 +526,32 @@ fn stage_made(unpacking: &Result<Vec<Entry>, UnpackError>) -> bool {
     !matches!(unpacking, Err(error) if error.is_fault(io::ErrorKind::AlreadyExists))
 }
 
-/// Unpacks the archive `source` into the folder `stage`, which must not exist yet, asking `go_on` before each read
-/// and marking `stopped` once it says no, to at most `limit` bytes; the entries, else why not.
-fn unpacked(source: impl Read, stage: &Path, limit: u64, go_on: &dyn Fn() -> bool, stopped: &Cell<bool>) -> Result<Vec<Entry>, UnpackError> {
+/// Unpacks the archive `source` into the folder `stage`, which must not exist yet, to at most `limit` bytes, each copy
+/// it lists made from its member or from a file of `pc` whose bytes still hash to it, asking `pc`'s `go_on` before each
+/// read of the archive, before each copy and after each buffer a copy writes, and marking `stopped` once it says no.
+/// The entries of every path, else why not.
+fn unpacked(source: impl Read, stage: &Path, limit: u64, pc: &PcFiles<'_>, stopped: &Cell<bool>) -> Result<Vec<Entry>, UnpackError> {
+    let go_on = || {
+        let on = (pc.go_on)();
+        if !on {
+            stopped.set(true);
+        }
+        on
+    };
     unpack(
         Polled {
             inner: source,
-            go_on,
+            go_on: pc.go_on,
             stopped,
         },
         stage,
         limit,
+        &PcFiles {
+            root: pc.root,
+            manifest: pc.manifest,
+            go_on: &go_on,
+        },
     )
-}
-
-/// The full path of the `/`-separated `path` below `root`.
-fn below(root: &Path, path: &str) -> PathBuf {
-    path.split('/').fold(root.to_path_buf(), |full, part| full.join(part))
 }
 
 /// Whether each of `entries`, to be installed below the worktree `root`, may be: every one under `globs`, then every
@@ -869,10 +884,11 @@ mod tests {
         success_line, tracked, unmet_of, unpacked,
     };
     use crate::boxside::outputs::OUTPUTS_BUDGET;
-    use crate::outputs::archive::{Entry, pack};
+    use crate::outputs::archive::{Entry, PcFiles, UnpackError, pack};
     use crate::outputs::cache::{HashCache, file_time_now};
     use crate::outputs::glob::Globs;
-    use crate::outputs::manifest::{Held, Manifest};
+    use crate::outputs::hash::{file_sha256, sha256_of};
+    use crate::outputs::manifest::{Chosen, Held, HeldBy, Manifest};
     use crate::outputs::walk::{Stamp, walk};
     use crate::remote::client::End;
     use crate::remote::git::GitError;
@@ -1658,13 +1674,13 @@ mod tests {
         let source = folder.join("source");
         put(&source, "bin/a.txt", b"a");
         let found = walk(&source, &Globs::new(&["**".to_owned()]).expect("a glob")).expect("the walk");
-        let chosen: Vec<_> = found.iter().collect();
+        let chosen: Vec<Chosen<'_>> = found.iter().map(Chosen::from).collect();
         let mut archive = Vec::new();
-        pack(&mut archive, &source, &chosen).expect("the file packs");
+        pack(&mut archive, &source, &chosen, &HeldBy::new()).expect("the file packs");
         let stage = folder.join("stage");
         put(&stage, "kept.txt", b"another run's");
 
-        let refused = unpacked(&archive[..], &stage, OUTPUTS_BUDGET, &|| true, &Cell::new(false));
+        let refused = unpacked_from(&archive[..], &stage, &folder, &Manifest::default());
 
         assert!(
             refused.as_ref().is_err_and(|error| error.is_fault(io::ErrorKind::AlreadyExists)),
@@ -1672,15 +1688,9 @@ mod tests {
         );
         assert!(!stage_made(&refused), "a folder there before is not the install's to remove");
         assert_eq!(fs::read_to_string(stage.join("kept.txt")).expect("its file survives"), "another run's");
-        let fresh = unpacked(&archive[..], &folder.join("fresh"), OUTPUTS_BUDGET, &|| true, &Cell::new(false));
+        let fresh = unpacked_from(&archive[..], &folder.join("fresh"), &folder, &Manifest::default());
         assert!(fresh.is_ok() && stage_made(&fresh), "{fresh:?}");
-        let garbage = unpacked(
-            &b"not an archive"[..],
-            &folder.join("garbage"),
-            OUTPUTS_BUDGET,
-            &|| true,
-            &Cell::new(false),
-        );
+        let garbage = unpacked_from(&b"not an archive"[..], &folder.join("garbage"), &folder, &Manifest::default());
         assert!(garbage.is_err() && stage_made(&garbage), "{garbage:?}");
     }
 
@@ -1725,8 +1735,8 @@ mod tests {
 
     /// The size of the member the streaming case unpacks.
     const LARGE: u64 = 64 * 1024 * 1024;
-    /// The most the unpack may hold back between the archive it reads and the file it writes: a quarter of [`LARGE`],
-    /// twice the 8 MiB zstd window the reader takes. One that held the member whole would hold back all of it.
+    /// The most the unpack may hold back between the archive it reads and the file it writes: a quarter of [`LARGE`].
+    /// One that held the member whole would hold back all of it.
     const HELD_BACK: u64 = 16 * 1024 * 1024;
 
     /// The archive file `inner`, read while noting, at each read, how far the bytes read so far run ahead of what the
@@ -1782,8 +1792,8 @@ mod tests {
         random_file(&source.join("bin").join("large.bin"), LARGE);
         let found = walk(&source, &Globs::new(&["**".to_owned()]).expect("a glob")).expect("the walk");
         let archive = folder.join("archive.tar.zst");
-        let chosen: Vec<_> = found.iter().collect();
-        pack(File::create(&archive).expect("the archive can be made"), &source, &chosen).expect("the file packs");
+        let chosen: Vec<Chosen<'_>> = found.iter().map(Chosen::from).collect();
+        pack(File::create(&archive).expect("the archive can be made"), &source, &chosen, &HeldBy::new()).expect("the file packs");
         let stage = folder.join("stage");
         let target = stage.join("bin").join("large.bin");
         let widest = Cell::new(0);
@@ -1794,7 +1804,7 @@ mod tests {
             widest: &widest,
         };
 
-        let entries = unpacked(watched, &stage, OUTPUTS_BUDGET, &|| true, &Cell::new(false)).expect("the archive unpacks");
+        let entries = unpacked_from(watched, &stage, &folder, &Manifest::default()).expect("the archive unpacks");
 
         assert_eq!(entries.iter().map(|entry| entry.size).collect::<Vec<_>>(), [LARGE]);
         assert!(widest.get() <= HELD_BACK, "the unpack held back {} bytes", widest.get());
@@ -1806,14 +1816,174 @@ mod tests {
         let source = folder.join("source");
         put(&source, "bin/a.txt", b"a");
         let found = walk(&source, &Globs::new(&["**".to_owned()]).expect("a glob")).expect("the walk");
-        let chosen: Vec<_> = found.iter().collect();
+        let chosen: Vec<Chosen<'_>> = found.iter().map(Chosen::from).collect();
         let mut archive = Vec::new();
-        pack(&mut archive, &source, &chosen).expect("the file packs");
+        pack(&mut archive, &source, &chosen, &HeldBy::new()).expect("the file packs");
         let stopped = Cell::new(false);
 
-        let unpacked = unpacked(&archive[..], &folder.join("stage"), OUTPUTS_BUDGET, &|| false, &stopped);
+        let manifest = Manifest::default();
+        let pc = PcFiles {
+            root: &folder,
+            manifest: &manifest,
+            go_on: &|| false,
+        };
+
+        let unpacked = unpacked(&archive[..], &folder.join("stage"), OUTPUTS_BUDGET, &pc, &stopped);
 
         assert!(unpacked.is_err() && stopped.get(), "{unpacked:?}");
         assert!(!folder.join("stage").exists(), "the stage is removed");
+    }
+
+    /// `unpacked` of `source` into `stage` under the box's budget, never stopped, each copy from its member or from
+    /// the file below `root` that `manifest` holds with its bytes.
+    fn unpacked_from(source: impl Read, stage: &Path, root: &Path, manifest: &Manifest) -> Result<Vec<Entry>, UnpackError> {
+        let pc = PcFiles {
+            root,
+            manifest,
+            go_on: &|| true,
+        };
+        unpacked(source, stage, OUTPUTS_BUDGET, &pc, &Cell::new(false))
+    }
+
+    /// A manifest holding each of `paths` below `root` with its stamp and its SHA-256 now.
+    fn manifest_hashed(root: &Path, paths: &[&str]) -> Manifest {
+        let mut manifest = Manifest::default();
+        for path in paths {
+            let full = super::below(root, path);
+            let held = Held {
+                stamp: stamp(&full),
+                sha256: file_sha256(&full).expect("the file hashes"),
+            };
+            manifest.insert((*path).to_owned(), held);
+        }
+        manifest
+    }
+
+    /// The archive the box packs of every file below `source` against the PC's `manifest`, each file hashed before the
+    /// pack: a content an earlier file or the manifest holds is listed as a copy.
+    fn deduplicated(source: &Path, manifest: &Manifest) -> Vec<u8> {
+        let found = walk(source, &Globs::new(&["**".to_owned()]).expect("a glob")).expect("the walk");
+        let chosen: Vec<Chosen<'_>> = found
+            .iter()
+            .map(|file| Chosen {
+                file,
+                sha256: Some(file_sha256(&file.full).expect("the file hashes")),
+            })
+            .collect();
+        let mut archive = Vec::new();
+        pack(&mut archive, source, &chosen, &manifest.by_hash(&[])).expect("the files pack");
+        archive
+    }
+
+    #[test]
+    fn a_copy_from_a_pc_file_installs_with_that_content() {
+        let folder = scratch("copy-from-pc");
+        let root = folder.join("pc");
+        put(&root, "bin/held.dll", b"kept");
+        let manifest = manifest_hashed(&root, &["bin/held.dll"]);
+        let source = folder.join("box");
+        put(&source, "bin/new.dll", b"kept");
+        put(&source, "bin/other.dll", b"fresh");
+        let archive = deduplicated(&source, &manifest);
+        let stage = folder.join("stage");
+
+        let entries = unpacked_from(&archive[..], &stage, &root, &manifest).expect("the archive unpacks");
+
+        let paths: Vec<&str> = entries.iter().map(|entry| entry.path.as_str()).collect();
+        assert_eq!(paths, ["bin/new.dll", "bin/other.dll"], "the copy is listed with the member");
+        moved(&stage, &root, &entries, &manifest, |_| true).expect("the files move");
+        assert_eq!(fs::read(root.join("bin").join("new.dll")).expect("the copy is installed"), b"kept");
+        assert_eq!(fs::read(root.join("bin").join("other.dll")).expect("the member is installed"), b"fresh");
+        assert_eq!(fs::read(root.join("bin").join("held.dll")).expect("the source stays"), b"kept");
+    }
+
+    #[test]
+    fn a_copy_whose_pc_source_changed_content_is_refused_when_no_other_holds_it() {
+        let folder = scratch("copy-source-changed");
+        let root = folder.join("pc");
+        put(&root, "bin/held.dll", b"kept");
+        let manifest = manifest_hashed(&root, &["bin/held.dll"]);
+        let source = folder.join("box");
+        put(&source, "bin/new.dll", b"kept");
+        let archive = deduplicated(&source, &manifest);
+        put(&root, "bin/held.dll", b"knot");
+        let stage = folder.join("stage");
+
+        let error = unpacked_from(&archive[..], &stage, &root, &manifest).expect_err("the copy is refused");
+
+        assert!(!error.members(), "a refetch may clear it: {error}");
+        let (sha256, _) = sha256_of(&b"kept"[..]).expect("bytes hash");
+        assert_eq!(
+            error.to_string(),
+            format!("no PC file still holds the content of bin/new.dll, SHA-256 {sha256}: tried bin/held.dll (other content)")
+        );
+        assert!(!stage.exists(), "the stage is removed");
+    }
+
+    #[test]
+    fn a_copy_falls_back_to_another_pc_path_holding_the_same_content() {
+        let folder = scratch("copy-source-fallback");
+        let root = folder.join("pc");
+        put(&root, "bin/a.dll", b"kept");
+        put(&root, "bin/b.dll", b"kept");
+        let manifest = manifest_hashed(&root, &["bin/a.dll", "bin/b.dll"]);
+        let source = folder.join("box");
+        put(&source, "bin/new.dll", b"kept");
+        let archive = deduplicated(&source, &manifest);
+        put(&root, "bin/a.dll", b"knot");
+        let stage = folder.join("stage");
+
+        let entries = unpacked_from(&archive[..], &stage, &root, &manifest).expect("the second path holds the content");
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(fs::read(stage.join("bin").join("new.dll")).expect("the copy was made"), b"kept");
+    }
+
+    #[test]
+    fn a_copy_whose_pc_source_was_touched_with_the_same_bytes_installs() {
+        let folder = scratch("copy-source-touched");
+        let root = folder.join("pc");
+        let held = put(&root, "bin/held.dll", b"kept");
+        let manifest = manifest_hashed(&root, &["bin/held.dll"]);
+        let source = folder.join("box");
+        put(&source, "bin/new.dll", b"kept");
+        let archive = deduplicated(&source, &manifest);
+        File::options()
+            .write(true)
+            .open(&held)
+            .and_then(|file| file.set_modified(SystemTime::now() - Duration::from_hours(1)))
+            .expect("the last write can be set");
+        assert_ne!(stamp(&held), manifest.get("bin/held.dll").expect("held").stamp, "the source was touched");
+        let stage = folder.join("stage");
+
+        let entries = unpacked_from(&archive[..], &stage, &root, &manifest).expect("the same bytes are a source");
+
+        moved(&stage, &root, &entries, &manifest, |_| true).expect("the copy moves");
+        assert_eq!(fs::read(root.join("bin").join("new.dll")).expect("the copy is installed"), b"kept");
+    }
+
+    #[test]
+    fn a_copy_that_records_the_box_root_is_rewritten_on_its_own() {
+        let folder = scratch("copy-rewritten");
+        let source = folder.join("box");
+        let recorded = |root: &str| format!(r#"{{"ContentRoot":"{}\\src"}}"#, root.replace('\\', r"\\"));
+        put(&source, "a/bin/MvcTestingAppManifest.json", recorded(BOX_WORK).as_bytes());
+        put(&source, "b/bin/MvcTestingAppManifest.json", recorded(BOX_WORK).as_bytes());
+        let archive = deduplicated(&source, &Manifest::default());
+        let stage = folder.join("stage");
+        let entries = unpacked_from(&archive[..], &stage, &folder, &Manifest::default()).expect("the archive unpacks");
+        let read = |path: &str| fs::read_to_string(super::below(&stage, path)).expect("the staged file is there");
+
+        let skipped = rewritten(&stage, &entries[1..], BOX_WORK, PC_ROOT);
+
+        assert_eq!(skipped, Ok(Vec::new()));
+        assert_eq!(read("b/bin/MvcTestingAppManifest.json"), recorded(PC_ROOT), "the copy is rewritten");
+        assert_eq!(
+            read("a/bin/MvcTestingAppManifest.json"),
+            recorded(BOX_WORK),
+            "the member it was copied from is a file of its own"
+        );
+        assert_eq!(rewritten(&stage, &entries[..1], BOX_WORK, PC_ROOT), Ok(Vec::new()));
+        assert_eq!(read("a/bin/MvcTestingAppManifest.json"), recorded(PC_ROOT));
     }
 }

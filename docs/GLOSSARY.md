@@ -32,6 +32,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Compatibility layer**: `gate.exe`'s acceptance of the PowerShell gate's argument form (`-Log`, `-TimeoutSeconds`, `-Slot` and the rest), kept until no caller uses it.
 - **Confirmation window**: the 5 s across which every scan of the cutover's drain must find no PowerShell gate before it ends, because the PowerShell gate deletes its ticket when it takes a slot and writes its claim up to about 2 s later; a scan that finds a gate resets it.
 - **Console donor**: the hidden system `cmd.exe /d /q /k` that `gate box run` puts in the command's job, whose console the box sets to UTF-8 and the command inherits; it lives until the wait for the command is over.
+- **Copy**: an item of an outputs archive's list marked `"copy":true`, a path whose bytes the archive does not hold because an earlier member or a file the PC holds (by the manifest, outside the run's back commit) has the same SHA-256; it carries `modified`, the box file's last write, and the install makes it in the stage from that member or file.
 - **Cores hint**: the line before the passed line saying how many cores a command kept busy when its slot kind did not fit: a light run over 2 cores, a heavy run under 1.5 with cores to spare, or a no-slot run at 1.5 or more.
 - **Covered**: said of a nested gate whose parent's slot kind covers its own (heavy covers heavy, light and none, light covers light and none, critical covers all), so it takes no slot.
 - **Covered marker**: the file `covered\<pid>-<start>.json` a covered gate keeps while it runs, so ops-tower sees a gate that writes no claim or ticket.
@@ -90,7 +91,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 
   A passing local build of the whole worktree with the same configuration, framework and runtime removes it, and so does a passing routed build of that kind that brought all its outputs back; a routed `--no-build` command never clears it.
 - **Output cap**: the remote client's limit of 64 KiB on one line of a call's output (a `\r` resets the line, so git's progress counts per update), which kills a capped call that sends a longer one.
-- **Outputs archive**: the `<key>-<nonce>.tar.zst` a routed run's changed output files travel in, its last member `.gate-outputs.json` listing the files before it.
+- **Outputs archive**: the `<key>-<nonce>.tar.zst` a routed run's changed output files travel in, its last member `.gate-outputs.json` listing every path it brings back, in pack order, the files before it and the copies that have no member.
 - **Outputs cap record**: the file `remote\<key>.outputs-capped` in the state root, `{"v":1,"hits":<n>}`, counting a worktree's routed runs in a row whose outputs fetch passed the fetch cap; the first hit keeps the pass, a second in a row fails the run, and any other end of its outputs fetch but a Ctrl+C during it, or a box that packed nothing, removes it.
 - **Outputs manifest**: the Manifest of the PC's files under a routed run's output globs, as the Rust client builds it before the run call and writes it as one line on that call's stdin, for the box to read.
 - **Outputs stage**: the folder `<worktree>\.tmp\<key>-<nonce>` a fetched outputs archive is unpacked and checked in before any file is moved into the worktree.
@@ -131,6 +132,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Snapshot**: either the parentless commit of a worktree as it stands, which a routed run sends to its builder; or the critical gate's record, at take, of the counts and the other gates' claims.
 - **Spawn lock**: the `gate-win32` lock held while the gate starts any process, so only the launched command inherits the copies of its handles.
 - **Stable line**: one of the three published `gate:` line forms callers may parse (STALLED, TIMED OUT, TRANSFER TIMED OUT or BACKSTOP; `waiting for the machine (critical)`; `Full output:`); every other `gate:` line is prose.
+- **Stage**: the install's folder `<worktree>\.tmp\<key>-<nonce>` (the outputs stage), where a fetched outputs archive is unpacked, its copies made and its members checked before any file is moved into the worktree.
 - **Stall**: a kill for no progress (no output, CPU, new process or build-server work) for the stall window, `--stall` seconds.
 - **Stand-in**: a live covered gate whose command holds a nested gate and whose own slot kind covers it, which that gate runs under in place of its ended parent gate, so one build tree holds one slot; only a covered marker with `kind` `heavy` or `light` is one.
 - **Start marker**: the stderr line `gate-remote-started: <nonce>` that `gate box run` says just before it launches the command; a run call that carried it is never retried and is not a pre-banner failure.

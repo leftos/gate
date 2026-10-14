@@ -87,19 +87,75 @@ fn has_line(text: &str, line: &str) -> bool {
     text.lines().any(|said| said == line)
 }
 
-/// The files in the outputs archive at `path`, by member path, with their bytes; the archive's own list left out.
-fn archive_files(path: &Path) -> BTreeMap<String, Vec<u8>> {
+/// One item of an outputs archive's list: a path it brings back, its size and SHA-256, and whether it is a copy, whose
+/// bytes the archive does not hold.
+#[derive(Debug, PartialEq, Eq)]
+struct Listed {
+    path: String,
+    size: u64,
+    sha256: String,
+    copy: bool,
+}
+
+/// The item a list holds for `path` of `text`, a copy or not.
+fn listed(path: &str, text: &str, copy: bool) -> Listed {
+    Listed {
+        path: path.to_owned(),
+        size: text.len() as u64,
+        sha256: sha256(text.as_bytes()),
+        copy,
+    }
+}
+
+/// Reads the outputs archive at `path`, handing each member but the list to `member` with its path and its header's
+/// size; the archive's list.
+fn read_archive(path: &Path, mut member: impl FnMut(String, u64, &mut dyn Read)) -> Vec<Listed> {
     let file = File::open(path).expect("the archive can be opened");
     let decoder = zstd::stream::read::Decoder::new(file).expect("the archive is zstd");
     let mut archive = tar::Archive::new(decoder);
-    let mut files = BTreeMap::new();
+    let mut list = Vec::new();
     for entry in archive.entries().expect("the archive is a tar stream") {
         let mut entry = entry.expect("a member can be read");
         let name = entry.path().expect("a member has a path").to_string_lossy().replace('\\', "/");
+        let size = entry.header().size().expect("a member has a size");
+        if name == ".gate-outputs.json" {
+            entry.read_to_end(&mut list).expect("the list can be read");
+        } else {
+            member(name, size, &mut entry);
+        }
+    }
+    let items: Vec<Value> = serde_json::from_slice(&list).expect("the list is a JSON array");
+    items
+        .iter()
+        .map(|item| Listed {
+            path: item["path"].as_str().expect("an item has a path").to_owned(),
+            size: item["size"].as_u64().expect("an item has a size"),
+            sha256: item["sha256"].as_str().expect("an item has a SHA-256").to_owned(),
+            copy: item.get("copy") == Some(&Value::Bool(true)),
+        })
+        .collect()
+}
+
+/// The paths of the members of the outputs archive at `path`, in order, the archive's own list left out.
+fn archive_members(path: &Path) -> Vec<String> {
+    let mut members = Vec::new();
+    read_archive(path, |name, _, _| members.push(name));
+    members
+}
+
+/// The files the outputs archive at `path` brings back from its own bytes, by path, with their bytes: each member, and
+/// each copy of a member; the archive's own list left out, and so is a copy of a file the PC holds.
+fn archive_files(path: &Path) -> BTreeMap<String, Vec<u8>> {
+    let mut files = BTreeMap::new();
+    let listed = read_archive(path, |name, _, data| {
         let mut bytes = Vec::new();
-        entry.read_to_end(&mut bytes).expect("a member's bytes can be read");
-        if name != ".gate-outputs.json" {
-            files.insert(name, bytes);
+        data.read_to_end(&mut bytes).expect("a member's bytes can be read");
+        files.insert(name, bytes);
+    });
+    for item in listed.into_iter().filter(|item| item.copy) {
+        let member = files.values().find(|bytes| sha256(bytes) == item.sha256).cloned();
+        if let Some(bytes) = member {
+            files.insert(item.path, bytes);
         }
     }
     files
@@ -110,19 +166,15 @@ fn expected(files: &[(&str, &str)]) -> BTreeMap<String, Vec<u8>> {
     files.iter().map(|(path, text)| ((*path).to_owned(), text.as_bytes().to_vec())).collect()
 }
 
-/// The size each file member of the outputs archive at `path` has in its header, by member path, the archive's own list
-/// left out; the members' bytes are passed over, never held.
+/// The size of each path the outputs archive at `path` brings back, by path: a member's from its header, a copy's from
+/// the list; the archive's own list left out, and the members' bytes passed over, never held.
 fn archive_sizes(path: &Path) -> BTreeMap<String, u64> {
-    let file = File::open(path).expect("the archive can be opened");
-    let decoder = zstd::stream::read::Decoder::new(file).expect("the archive is zstd");
-    let mut archive = tar::Archive::new(decoder);
     let mut sizes = BTreeMap::new();
-    for entry in archive.entries().expect("the archive is a tar stream") {
-        let entry = entry.expect("a member can be read");
-        let name = entry.path().expect("a member has a path").to_string_lossy().replace('\\', "/");
-        if name != ".gate-outputs.json" {
-            sizes.insert(name, entry.header().size().expect("a member has a size"));
-        }
+    let listed = read_archive(path, |name, size, _| {
+        sizes.insert(name, size);
+    });
+    for item in listed.into_iter().filter(|item| item.copy) {
+        sizes.insert(item.path, item.size);
     }
     sizes
 }
@@ -162,10 +214,10 @@ fn limit_memory(pid: u32, bytes: usize) {
 }
 
 /// The memory each process of the box may commit in [`a_large_output_is_packed_in_flat_memory`]: a quarter of the file
-/// it packs.
-const BOX_MEMORY: usize = 128 * 1024 * 1024;
+/// it packs, room for the 128 MiB window the archive is compressed with.
+const BOX_MEMORY: usize = 256 * 1024 * 1024;
 /// The size of the file that case packs.
-const LARGE_OUTPUT: u64 = 512 * 1024 * 1024;
+const LARGE_OUTPUT: u64 = 1024 * 1024 * 1024;
 
 #[test]
 fn a_large_output_is_packed_in_flat_memory() {
@@ -328,6 +380,64 @@ fn box_run_packs_the_files_the_pc_lacks_or_holds_otherwise() {
 }
 
 #[test]
+fn box_run_packs_identical_files_once_and_lists_every_path() {
+    let case = Case::new("box_outputs_identical");
+    let command = [
+        FAKE_TOOL,
+        "write",
+        r"bin\a.txt",
+        "same",
+        "write",
+        r"bin\b.txt",
+        "same",
+        "write",
+        r"bin\c.txt",
+        "other",
+    ];
+    let mut payload = outputs_payload(&case, &command, &["bin/**"]);
+    snapshot(&case, &mut payload, &[IGNORE_BIN]);
+
+    let outcome = run_with_manifest(&case, &payload, &manifest(&[]));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(has_line(&outcome.stderr, &packed_line(&payload, 3)), "every path counts: {outcome:?}");
+    let archive = archive_path(&payload);
+    assert_eq!(archive_members(&archive), ["bin/a.txt", "bin/c.txt"], "the content is packed once");
+    assert_eq!(
+        read_archive(&archive, |_, _, _| {}),
+        [
+            listed("bin/a.txt", "same", false),
+            listed("bin/b.txt", "same", true),
+            listed("bin/c.txt", "other", false)
+        ],
+        "the list holds every path, in order"
+    );
+    assert_eq!(
+        archive_files(&archive),
+        expected(&[("bin/a.txt", "same"), ("bin/b.txt", "same"), ("bin/c.txt", "other")])
+    );
+}
+
+#[test]
+fn box_run_does_not_send_a_content_the_pc_holds_under_another_path() {
+    let case = Case::new("box_outputs_pc_holds");
+    let command = [FAKE_TOOL, "write", r"bin\new.txt", "kept", "write", r"bin\other.txt", "fresh"];
+    let mut payload = outputs_payload(&case, &command, &["bin/**"]);
+    snapshot(&case, &mut payload, &[IGNORE_BIN]);
+
+    let outcome = run_with_manifest(&case, &payload, &manifest(&[("bin/old.txt", "kept")]));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(has_line(&outcome.stderr, &packed_line(&payload, 2)), "{outcome:?}");
+    let archive = archive_path(&payload);
+    assert_eq!(archive_members(&archive), ["bin/other.txt"], "the PC's content is not sent");
+    assert_eq!(
+        read_archive(&archive, |_, _, _| {}),
+        [listed("bin/new.txt", "kept", true), listed("bin/other.txt", "fresh", false)]
+    );
+}
+
+#[test]
 fn box_run_never_packs_an_excluded_path_or_a_path_through_a_junction() {
     let case = Case::new("box_outputs_exclusions");
     let script = [
@@ -387,6 +497,25 @@ fn box_run_leaves_a_file_of_the_back_commit_out_of_the_archive() {
         expected(&[("bin/a.txt", "a")]),
         "the archive leaves out what the back commit carries"
     );
+}
+
+#[test]
+fn a_back_commit_path_is_never_a_copy_source() {
+    let case = Case::new("box_outputs_back_commit_source");
+    let command = [FAKE_TOOL, "write", r"bin\a.txt", "n", "write", "new.txt", "n"];
+    let mut payload = outputs_payload(&case, &command, &["**/*.txt"]);
+    snapshot(&case, &mut payload, &[IGNORE_BIN]);
+
+    let outcome = run_with_manifest(&case, &payload, &manifest(&[("new.txt", "n")]));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let archive = archive_path(&payload);
+    assert_eq!(
+        archive_members(&archive),
+        ["bin/a.txt"],
+        "the sync-back replaces the PC's new.txt, so its content is sent"
+    );
+    assert_eq!(read_archive(&archive, |_, _, _| {}), [listed("bin/a.txt", "n", false)]);
 }
 
 #[test]

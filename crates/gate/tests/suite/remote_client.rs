@@ -4851,6 +4851,34 @@ fn an_installed_file_is_cached_at_its_installed_stamp() {
     );
 }
 
+/// The builder's outputs hold one content twice and another the PC already holds under another path: the archive packs
+/// the first once and the second not at all, and the install makes every path, the copies from the staged member and
+/// from the PC's own file.
+#[test]
+fn a_routed_run_installs_a_deduplicated_archive_with_every_path() {
+    let case = outputs_case("client-outputs-deduplicated", &BIN);
+    first_run(&case);
+    let held = case.folder().join("bin").join("held.txt");
+    fs::create_dir_all(held.parent().expect("a file has a folder")).expect("the PC's folder can be made");
+    fs::write(&held, "kept").expect("the PC's file can be written");
+    install_from_the_box(&case, "bin/a.txt", "same");
+    install_from_the_box(&case, "bin/b.txt", "same");
+    install_from_the_box(&case, "bin/new.txt", "kept");
+    let second = ssh_steps(&case, "second", &["ok", "ok", "ok"]);
+
+    let outcome = finish(client_gate(&case, "second.log", &second, &[r".\tool.exe", "out", "ran there"]));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(outcome.stderr.contains("gate-remote-outputs: 3 "), "every path is listed: {outcome:?}");
+    for (path, text) in [("a.txt", "same"), ("b.txt", "same"), ("new.txt", "kept"), ("held.txt", "kept")] {
+        let installed = fs::read_to_string(case.folder().join("bin").join(path)).expect("every path is installed");
+        assert_eq!(installed, text, "{path}: {outcome:?}");
+    }
+    let line = regex::Regex::new(r"(?m)^gate: outputs: 3 file\(s\), ").expect("the line's pattern");
+    assert!(line.is_match(&outcome.stderr), "{outcome:?}");
+    assert_eq!(outputs_leftovers(&case), Vec::<PathBuf>::new(), "the archive and the stage are removed");
+}
+
 /// The run after an install takes the hash the cache holds at the installed file's stamp, not the file's: a hash
 /// planted in the cache changes what the box brings back, where reading the file again would bring nothing.
 #[test]
