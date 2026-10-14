@@ -17,4 +17,4 @@ The builders' old PowerShell wrappers and claude-config's remote scripts are GAT
 
 Patterns taken out of `remote.json` because of how the bridge behaved; runbook step 2 puts them back. The file's backup from before each change sits beside it as `remote.json.bak-{date}`.
 
-- godot-mcp, at its request: the `scratch` itest group (the `--filter-class GodotMcp.IntegrationTests.ScratchRunnerTests` pattern) and the `csharp` itest group (the five `run.ps1 itest-csharp` patterns). Reasons: a passing run failed because an output DLL was in use here, and a wall-clock ceiling killed a healthy run on a busy builder (the second is GATE-187).
+None stands: godot-mcp's `scratch` and `csharp` itest groups are back, and godot-mcp has its note.
