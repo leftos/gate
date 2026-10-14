@@ -620,7 +620,9 @@ fn git_config_count(count: &OsStr) -> Option<u32> {
 }
 
 /// A restricted copy of the box's token for the command ([`RestrictedToken::of_this_process`]): not elevated, at
-/// medium integrity at most, owning the objects it creates as the user. `None` when it cannot be made, said on the
+/// medium integrity at most, owning the objects it creates as the user, and with the ssh logon's NETWORK group
+/// deny-only, so a check for that group, as WMI's check for a remote caller is, no longer finds it, while deny entries
+/// naming NETWORK still apply. `None` when it cannot be made, said on the
 /// console: the command then runs with the box's own token.
 fn restricted_token(console: &mut Console) -> Option<RestrictedToken> {
     match RestrictedToken::of_this_process() {

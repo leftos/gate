@@ -15,17 +15,21 @@ use windows_sys::Win32::Security::{
     ACCESS_ALLOWED_ACE, ACL, ACL_REVISION, AddAccessAllowedAce, CreateRestrictedToken, CreateWellKnownSid, EqualSid, GetAce, GetLengthSid,
     GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, InitializeAcl, LUA_TOKEN, PSID, SECURITY_MAX_SID_SIZE, SID_AND_ATTRIBUTES,
     SetTokenInformation, TOKEN_ACCESS_MASK, TOKEN_ADJUST_DEFAULT, TOKEN_ASSIGN_PRIMARY, TOKEN_DEFAULT_DACL, TOKEN_DUPLICATE, TOKEN_ELEVATION,
-    TOKEN_INFORMATION_CLASS, TOKEN_MANDATORY_LABEL, TOKEN_OWNER, TOKEN_QUERY, TOKEN_USER, TokenDefaultDacl, TokenElevation, TokenIntegrityLevel,
-    TokenOwner, TokenUser, WELL_KNOWN_SID_TYPE, WinLocalSystemSid, WinMediumLabelSid,
+    TOKEN_GROUPS, TOKEN_INFORMATION_CLASS, TOKEN_MANDATORY_LABEL, TOKEN_OWNER, TOKEN_QUERY, TOKEN_USER, TokenDefaultDacl, TokenElevation,
+    TokenGroups, TokenIntegrityLevel, TokenOwner, TokenUser, WELL_KNOWN_SID_TYPE, WinLocalSystemSid, WinMediumLabelSid, WinNetworkSid,
 };
-use windows_sys::Win32::System::SystemServices::{ACCESS_ALLOWED_ACE_TYPE, SE_GROUP_INTEGRITY, SECURITY_MANDATORY_MEDIUM_RID};
+use windows_sys::Win32::System::SystemServices::{
+    ACCESS_ALLOWED_ACE_TYPE, SE_GROUP_ENABLED, SE_GROUP_INTEGRITY, SE_GROUP_USE_FOR_DENY_ONLY, SECURITY_MANDATORY_MEDIUM_RID,
+};
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 use windows_sys::core::PWSTR;
 
 use crate::own_handle;
 
 /// A primary token restricted from this process's own: `CreateRestrictedToken` with `LUA_TOKEN`, which leaves it
-/// unelevated, its Administrators group deny-only and its privileges cut to a standard user's; at medium integrity, or
+/// unelevated, its Administrators group deny-only and its privileges cut to a standard user's, and with the NETWORK
+/// group a network logon's token holds deny-only too, so a check for that group, as WMI's check for a remote caller
+/// is, no longer finds it, while deny entries naming NETWORK still apply; at medium integrity, or
 /// lower when this process's token already was; owning the objects it creates as its user; and with a default DACL
 /// granting `GENERIC_ALL` to that user and to SYSTEM, so a process it starts can open its own process, threads and
 /// console. Being a restricted copy of this process's token, it starts a process without `SeAssignPrimaryTokenPrivilege`.
@@ -39,15 +43,21 @@ impl RestrictedToken {
     /// The system's error when this process's token cannot be opened, restricted, read or changed.
     pub fn of_this_process() -> io::Result<RestrictedToken> {
         let own = this_process_token(TOKEN_ASSIGN_PRIMARY | TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_ADJUST_DEFAULT)?;
+        let network = WellKnownSid::of(WinNetworkSid)?;
+        let disabled = [SID_AND_ATTRIBUTES {
+            Sid: network.as_psid(),
+            Attributes: 0,
+        }];
         let mut restricted: HANDLE = std::ptr::null_mut();
-        // SAFETY: `own` is open with `TOKEN_DUPLICATE`; no SID to disable, privilege to delete or restricting SID is
-        // passed, each a count of 0 with a null array, and `restricted` is writable.
+        // SAFETY: `own` is open with `TOKEN_DUPLICATE`; the one SID to disable is NETWORK's, made above and valid for
+        // the whole call, a count of 1 for the one-entry `disabled`; no privilege to delete or restricting SID is
+        // passed, each a count of 0 with a null array; and `restricted` is writable.
         let made = unsafe {
             CreateRestrictedToken(
                 own.raw(),
                 LUA_TOKEN,
-                0,
-                std::ptr::null(),
+                1,
+                disabled.as_ptr(),
                 0,
                 std::ptr::null(),
                 0,
@@ -74,8 +84,21 @@ impl RestrictedToken {
     }
 }
 
+/// How a token holds the NETWORK group (S-1-5-2), which a network logon's token holds enabled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NetworkGroup {
+    /// The token does not hold the group: an interactive logon's token.
+    Absent,
+    /// The group is enabled, so access checks find it.
+    Enabled,
+    /// The group is deny-only: access checks apply only the entries that deny it.
+    DenyOnly,
+    /// The group is held, neither enabled nor deny-only.
+    Disabled,
+}
+
 /// What a token says of itself: whether it is elevated, its integrity level, whether the objects it creates are owned
-/// by its user, that user and its default DACL.
+/// by its user, that user, its default DACL and how it holds the NETWORK group.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TokenFacts {
     /// Whether the token is elevated (`TokenElevation`).
@@ -89,6 +112,8 @@ pub struct TokenFacts {
     /// The entries of its default DACL, the one the objects it creates without a security descriptor get, in their
     /// order; `None` for a null default DACL, which grants everyone everything.
     pub default_dacl: Option<Vec<Grant>>,
+    /// How it holds the NETWORK group.
+    pub network: NetworkGroup,
 }
 
 /// An access-allowed entry of a DACL: the SID it names, in its string form, and the access mask it allows, as stored.
@@ -123,7 +148,37 @@ fn facts_of(token: &OwnedHandle) -> io::Result<TokenFacts> {
         // SAFETY: the SID points into the buffer the system wrote it in, which lives across the call.
         user: unsafe { sid_string(user.get().User.Sid) }?,
         default_dacl: default_dacl_of(token)?,
+        network: network_group_of(token)?,
     })
+}
+
+/// How `token`, open with `TOKEN_QUERY`, holds the NETWORK group.
+fn network_group_of(token: &OwnedHandle) -> io::Result<NetworkGroup> {
+    let network = WellKnownSid::of(WinNetworkSid)?;
+    let Some(attributes) = group_attributes(token, &network)? else {
+        return Ok(NetworkGroup::Absent);
+    };
+    Ok(if attributes & SE_GROUP_ENABLED.cast_unsigned() != 0 {
+        NetworkGroup::Enabled
+    } else if attributes & SE_GROUP_USE_FOR_DENY_ONLY.cast_unsigned() != 0 {
+        NetworkGroup::DenyOnly
+    } else {
+        NetworkGroup::Disabled
+    })
+}
+
+/// The attributes `token`, open with `TOKEN_QUERY`, holds the group `sid` with; `None` when it does not hold it.
+fn group_attributes(token: &OwnedHandle, sid: &WellKnownSid) -> io::Result<Option<u32>> {
+    let groups = Information::<TOKEN_GROUPS>::read(token, TokenGroups)?;
+    let base = groups.buffer.as_ptr().cast::<TOKEN_GROUPS>();
+    // SAFETY: the system wrote a whole `TOKEN_GROUPS` at the buffer's start, followed by its `GroupCount` entries from
+    // `Groups` on, all within the buffer, which outlives the slice.
+    let groups = unsafe { std::slice::from_raw_parts((&raw const (*base).Groups).cast::<SID_AND_ATTRIBUTES>(), (*base).GroupCount as usize) };
+    let found = groups
+        .iter()
+        // SAFETY: both SIDs are valid: the group's points into the buffer, and `sid` is a well-known SID made whole.
+        .find(|group| unsafe { EqualSid(group.Sid, sid.as_psid()) } != 0);
+    Ok(found.map(|group| group.Attributes))
 }
 
 /// The entries of `token`'s default DACL, in their order; `None` for a null default DACL.
@@ -357,14 +412,14 @@ fn set_default_dacl(token: &OwnedHandle, user: PSID) -> io::Result<()> {
 mod tests {
     use windows_sys::Win32::Foundation::{GENERIC_ALL, LUID};
     use windows_sys::Win32::Security::{
-        ACCESS_ALLOWED_ACE, EqualSid, GetAce, LUID_AND_ATTRIBUTES, LookupPrivilegeNameW, SID_AND_ATTRIBUTES, TOKEN_DEFAULT_DACL, TOKEN_GROUPS,
-        TOKEN_PRIVILEGES, TOKEN_USER, TokenDefaultDacl, TokenGroups, TokenPrivileges, TokenUser, WinBuiltinAdministratorsSid, WinLocalSystemSid,
+        ACCESS_ALLOWED_ACE, EqualSid, GetAce, LUID_AND_ATTRIBUTES, LookupPrivilegeNameW, TOKEN_DEFAULT_DACL, TOKEN_PRIVILEGES, TOKEN_QUERY,
+        TOKEN_USER, TokenDefaultDacl, TokenPrivileges, TokenUser, WinBuiltinAdministratorsSid, WinLocalSystemSid,
     };
     use windows_sys::Win32::System::SystemServices::{
         ACCESS_ALLOWED_ACE_TYPE, SE_GROUP_ENABLED, SE_GROUP_USE_FOR_DENY_ONLY, SECURITY_MANDATORY_MEDIUM_RID,
     };
 
-    use super::{Information, RestrictedToken, WellKnownSid, facts_of};
+    use super::{Information, NetworkGroup, RestrictedToken, WellKnownSid, facts_of, group_attributes, network_group_of, this_process_token};
 
     /// This process's token, restricted.
     fn restricted() -> RestrictedToken {
@@ -438,21 +493,10 @@ mod tests {
         let token = restricted();
         let administrators = WellKnownSid::of(WinBuiltinAdministratorsSid).expect("the Administrators SID is made");
 
-        let groups = Information::<TOKEN_GROUPS>::read(token.handle(), TokenGroups).expect("the groups are read");
-        let base = groups.buffer.as_ptr().cast::<TOKEN_GROUPS>();
-        // SAFETY: the system wrote a whole `TOKEN_GROUPS` at the buffer's start, followed by its `GroupCount` entries
-        // from `Groups` on, all within the buffer, which outlives the slice.
-        let groups = unsafe { std::slice::from_raw_parts((&raw const (*base).Groups).cast::<SID_AND_ATTRIBUTES>(), (*base).GroupCount as usize) };
-        for group in groups {
-            // SAFETY: both SIDs are valid: the group's points into the buffer, and the Administrators SID was made above.
-            if unsafe { EqualSid(group.Sid, administrators.as_psid()) } != 0 {
-                assert_ne!(
-                    group.Attributes & SE_GROUP_USE_FOR_DENY_ONLY.cast_unsigned(),
-                    0,
-                    "Administrators is deny-only"
-                );
-                assert_eq!(group.Attributes & SE_GROUP_ENABLED.cast_unsigned(), 0, "Administrators is not enabled");
-            }
+        let held = group_attributes(token.handle(), &administrators).expect("the groups are read");
+        if let Some(attributes) = held {
+            assert_ne!(attributes & SE_GROUP_USE_FOR_DENY_ONLY.cast_unsigned(), 0, "Administrators is deny-only");
+            assert_eq!(attributes & SE_GROUP_ENABLED.cast_unsigned(), 0, "Administrators is not enabled");
         }
 
         let privileges = Information::<TOKEN_PRIVILEGES>::read(token.handle(), TokenPrivileges).expect("the privileges are read");
@@ -474,5 +518,20 @@ mod tests {
         ];
         let others: Vec<&String> = names.iter().filter(|name| !standard.contains(&name.as_str())).collect();
         assert!(others.is_empty(), "privileges beyond a standard user's: {others:?} of {names:?}");
+    }
+
+    #[test]
+    #[ignore = "needs a network logon with NETWORK enabled (a direct ssh session, not a routed run): run on a builder"]
+    fn a_restricted_token_has_the_network_group_deny_only() {
+        let own = this_process_token(TOKEN_QUERY).expect("this process's token opens");
+        assert_eq!(
+            network_group_of(&own).expect("this process's groups are read"),
+            NetworkGroup::Enabled,
+            "this test needs a token with NETWORK enabled (a direct ssh session)"
+        );
+
+        let network = network_group_of(restricted().handle()).expect("the restricted token's groups are read");
+
+        assert_eq!(network, NetworkGroup::DenyOnly, "NETWORK is held deny-only, not enabled");
     }
 }

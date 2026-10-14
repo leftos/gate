@@ -1530,6 +1530,10 @@ fn box_run_starts_an_elevated_session_s_command_non_elevated() {
     assert!(integrity.is_some_and(|rid| rid <= 0x2000), "medium integrity or lower: {lines:?}");
     let dacl = restricted_dacl_line();
     assert!(lines.contains(&dacl), "the restricted token's default DACL, {dacl:?}: {lines:?}");
+    assert!(
+        lines.iter().any(|line| line == "network absent" || line == "network deny-only"),
+        "NETWORK absent or deny-only, never enabled: {lines:?}"
+    );
 }
 
 #[test]

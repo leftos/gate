@@ -35,7 +35,7 @@ pub use memory::working_set;
 pub use mutex::{AcquireError, MutexGuard, NamedMutex, OwnedMutexGuard, mutex_exists};
 pub use piped::{PipedConsole, PipedFed, PipedLaunch, PipedSuspended, breakaway_refused};
 pub use times::{ProcessTimes, SystemTimes, file_time_now, process_times, system_times, wsl_vm_cpu};
-pub use token::{Grant, RestrictedToken, TokenFacts, token_facts};
+pub use token::{Grant, NetworkGroup, RestrictedToken, TokenFacts, token_facts};
 
 /// Refuses an open file that is not a plain disk file: one that is not on a disk, is a reparse point (a link or a
 /// junction, when opened with `FILE_FLAG_OPEN_REPARSE_POINT`), or has more than one name.

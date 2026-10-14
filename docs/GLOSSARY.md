@@ -42,6 +42,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Cutover flag**: the file `%LOCALAPPDATA%\gate\cutover.flag`, whose existence tells the PowerShell launcher to hand every call to `gate.exe`, and ops-tower's state to read `gate.exe`'s files.
 - **Cutover sweep**: the later change of every calling repo from the PowerShell launcher to `gate` on PATH, after which the PowerShell gate is deleted.
 - **Delete pending**: a file marked for deletion when its last handle closes (the classic delete, not the POSIX one `fs::remove_file` takes); until then its name stays listed and every open or delete of it is refused with access denied, so the gate passes it over as going away.
+- **Deny-only**: the state of a token group that still matches deny entries in an access check but no longer matches allow entries; a routed command's token holds the ssh logon's NETWORK group so.
 - **Departed member**: a process the run's job held that has ended, as the job's completion port remembered it (pid, start, read while its process object lived, and exit time; one found gone, its start never read, is not remembered); a process that names its pid as parent and started within its lifetime, from the job's creation at the earliest, counts as escaped, so a kill reaches it though no sample saw it under a live member.
 - **Diagnostics block**: the record of what was running that a kill writes to the log before it terminates the job: the job's processes, the descendants outside the job and the last samples.
 - **Drain**: see critical drain.

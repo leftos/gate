@@ -34,7 +34,8 @@
 //! `token` prints what this process's token says of itself, one line each: `elevated` or `not-elevated`, its integrity
 //! level's relative ID as `integrity 0x<hex>`, `owner user` when the objects it creates are owned by its user, else
 //! `owner other`, and its default DACL as `dacl <sid>:0x<mask> …`, each entry's SID in its string form and the access
-//! mask it allows in hex, in the DACL's order (`dacl null` for a null DACL);
+//! mask it allows in hex, in the DACL's order (`dacl null` for a null DACL), and how it holds the NETWORK group as
+//! `network absent`, `network enabled`, `network deny-only` or `network disabled`;
 //! `argv` prints every word after it, each on its own line, and ends, so it is always the last step.
 //! With no `exit` step it exits 0. For example `fake-tool out hi err oops exit 3`.
 
@@ -323,7 +324,7 @@ fn spawn_away<'a>(steps: &mut impl Iterator<Item = &'a OsString>, stdout: &mut i
 }
 
 /// The `token` step: prints whether this process's token is elevated, its integrity level, whether the objects it
-/// creates are owned by its user and its default DACL, one line each.
+/// creates are owned by its user, its default DACL and how it holds the NETWORK group, one line each.
 fn token(stdout: &mut impl Write) -> Result<(), String> {
     let facts = gate_win32::token_facts().map_err(|error| format!("cannot read this process's token: {error}"))?;
     let elevation = if facts.elevated { "elevated" } else { "not-elevated" };
@@ -336,7 +337,18 @@ fn token(stdout: &mut impl Write) -> Result<(), String> {
             .collect::<Vec<String>>()
             .join(" "),
     };
-    writeln!(stdout, "{elevation}\nintegrity 0x{:x}\nowner {owner}\ndacl {dacl}", facts.integrity).map_err(|error| write_failed(&error))
+    let network = match facts.network {
+        gate_win32::NetworkGroup::Absent => "absent",
+        gate_win32::NetworkGroup::Enabled => "enabled",
+        gate_win32::NetworkGroup::DenyOnly => "deny-only",
+        gate_win32::NetworkGroup::Disabled => "disabled",
+    };
+    writeln!(
+        stdout,
+        "{elevation}\nintegrity 0x{:x}\nowner {owner}\ndacl {dacl}\nnetwork {network}",
+        facts.integrity
+    )
+    .map_err(|error| write_failed(&error))
 }
 
 /// Prints a numbered line about every [`CHATTER_STEP`], flushing each, until the file at `path` exists: the log a case's

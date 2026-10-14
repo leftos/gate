@@ -1667,15 +1667,17 @@ Built verbs:
 
   It is assigned to the payload's named job, which has no limits and no kill-on-close, and inherits exactly NUL, the two pipe write ends and a query-only handle to its job, as copies made under the spawn lock ([Command launching](#command-launching)). The box's git and dotnet calls start through `gate_win32::spawn`, under the same lock.
 
-  The command's token: it starts through `CreateProcessAsUserW` with a restricted copy of the box's token (`CreateRestrictedToken` with `LUA_TOKEN`), so it is not elevated, is lowered to Medium integrity when the box's is above it, has the user as default owner, and has a default DACL granting `GENERIC_ALL` to the user and SYSTEM.
+  The command's token: it starts through `CreateProcessAsUserW` with a restricted copy of the box's token (`CreateRestrictedToken` with `LUA_TOKEN`), so it is not elevated, is lowered to Medium integrity when the box's is above it, has the user as default owner, and has a default DACL granting `GENERIC_ALL` to the user and SYSTEM. The ssh logon's NETWORK group (S-1-5-2) is made deny-only in it, so WMI does not treat the command's calls as remote and `taskkill`, `tasklist` and `Get-CimInstance` work from the command (with NETWORK enabled they fail with `ERROR: Access denied`). `gate_win32::NetworkGroup` (`Absent`, `Enabled`, `DenyOnly`, `Disabled`) and `TokenFacts::network` report the group's state.
 
-  The console donor and keeper `cmd.exe` run with the same restricted token, so no elevated process shares the command's console. The box itself, its git calls and its tool restore keep the box's own token. The restriction gives a routed command the token a local run's command has; it is not a boundary against the command, whose code is trusted, since the box's elevated git and tool restore later read what the command wrote.
+  The console donor and keeper `cmd.exe` run with the same restricted token, so no elevated process shares the command's console. The box itself, its git calls and its tool restore keep the box's own token. The restriction makes the command's token non-elevated with NETWORK deny-only, but it is still a network logon's token and lacks INTERACTIVE, so it is not the token a local run's command has; it is not a boundary against the command, whose code is trusted, since the box's elevated git and tool restore later read what the command wrote.
 
   When the token cannot be made, or a start with it is refused and a start with the box's own token then works, the box prints `gate: the command runs with the builder session's own token: <error>` on stderr, after the start marker, and the command (with the donor and keeper) runs with the box's own token. A start refused with both tokens says only `could not start`.
 
   The command's environment gains `GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_<n>=safe.directory` and `GIT_CONFIG_VALUE_<n>=*`, where n is the inherited count (0 when there is none) and the count grows by one.
 
   The inherited count is read as git reads it (leading whitespace, an optional `+`, decimal digits to the end, at most `i32::MAX`; an empty value is 0); a count git would refuse, or `i32::MAX` itself, leaves the environment unchanged. The work folders are owned by Administrators, which git refuses from a non-elevated token.
+
+  Known cost: deny entries naming NETWORK still apply to the command, but allow entries naming NETWORK no longer grant, so a resource whose DACL grants NETWORK alone is open to a command run directly over ssh and closed to the same command routed.
 
   Known cost: the first non-elevated build in each work folder starts fresh MSBuild nodes and compiler servers, since their handshake includes elevation. A command that creates symlinks needs Developer Mode on the builder, as on the PC; builder setup turns it on (`AllowDevelopmentWithoutDevLicense` = 1).
 

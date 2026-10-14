@@ -13,7 +13,7 @@ use std::sync::{Once, mpsc};
 use std::thread;
 use std::time::Duration;
 
-use gate_win32::{EnvironmentBlock, Job, OpenedJob, PipedConsole, PipedFed, PipedLaunch, PipedSuspended, RestrictedToken, Running};
+use gate_win32::{EnvironmentBlock, Job, NetworkGroup, OpenedJob, PipedConsole, PipedFed, PipedLaunch, PipedSuspended, RestrictedToken, Running};
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_BREAKAWAY_OK, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
     JobObjectExtendedLimitInformation, SetInformationJobObject,
@@ -110,6 +110,58 @@ fn a_process_started_with_a_restricted_token_runs_and_exits_with_its_status() {
     let (running, _stdout, _stderr) = start(&launch, &job);
 
     assert_eq!(running.wait(HANG_GUARD).expect("the wait answers"), Some(7));
+}
+
+/// Fails the test unless this process's token holds NETWORK enabled, as a direct ssh session's does: under any other
+/// token the restricted copy has no enabled NETWORK to make deny-only, and the test would check nothing.
+fn require_network_enabled() {
+    let facts = gate_win32::token_facts().expect("this process's token is read");
+    assert_eq!(
+        facts.network,
+        NetworkGroup::Enabled,
+        "this test needs a token with NETWORK enabled (a direct ssh session)"
+    );
+}
+
+/// [`cmd`] with this process's token, restricted.
+fn restricted_cmd(line: &str) -> PipedLaunch {
+    let mut launch = cmd(line);
+    launch.token = Some(RestrictedToken::of_this_process().expect("the restricted token is made"));
+    launch
+}
+
+#[test]
+#[ignore = "needs a network logon with NETWORK enabled (a direct ssh session, not a routed run): run on a builder"]
+fn a_process_started_with_a_restricted_token_in_a_network_logon_can_list_processes() {
+    require_network_enabled();
+    let name = unique_name("network-logon");
+    let _end = EndJob(name.clone());
+    let job = Job::create(&name).expect("the job is created");
+
+    let (running, _stdout, stderr) = start(&restricted_cmd("tasklist /NH /FO CSV >NUL"), &job);
+    let stderr = read_all(stderr);
+
+    assert_eq!(running.wait(HANG_GUARD).expect("the wait answers"), Some(0), "tasklist: {stderr}");
+}
+
+#[test]
+#[ignore = "needs a network logon with NETWORK enabled (a direct ssh session, not a routed run): run on a builder"]
+fn a_process_started_with_a_restricted_token_in_a_network_logon_can_end_a_process_with_taskkill() {
+    require_network_enabled();
+    let name = unique_name("network-taskkill");
+    let _end = EndJob(name.clone());
+    let job = Job::create(&name).expect("the job is created");
+    // Pings for about an hour, far past the hang guard, so only the kill can end it within the guard.
+    let (target, _target_stdout, _target_stderr) = start(&restricted_cmd("ping -n 3600 127.0.0.1 >NUL"), &job);
+
+    let (killer, _killer_stdout, stderr) = start(&restricted_cmd(&format!("taskkill /F /PID {}", target.pid())), &job);
+    let stderr = read_all(stderr);
+
+    assert_eq!(killer.wait(HANG_GUARD).expect("the wait answers"), Some(0), "taskkill: {stderr}");
+    assert!(
+        target.wait(HANG_GUARD).expect("the wait answers").is_some(),
+        "the process taskkill ended has exited"
+    );
 }
 
 #[test]
