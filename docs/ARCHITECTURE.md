@@ -207,7 +207,7 @@ The rule that shapes it: every file and kernel object another process sees is de
 
   `expect.rs` is `gate expect`: a lock-free reader of `durations.json` that keys the command here and for each builder and prints the expected-time line of each place with an estimate, or `no history`; it queues for nothing and writes nothing.
 
-  `push.rs` is `gate push`: it reads the builders from the routing file (`read_remote_json`, `Config::builders`) and the installed exe, then makes one ssh call per builder through `transport.rs`'s `ssh_words` and `Ssh::find`, feeding the exe, gzipped, as base64 on stdin to an embedded PowerShell script, and maps the script's `gate-push: ` lines to the `push: ` lines.
+  `push.rs` is `gate push`: it reads the builders from the routing file (`read_remote_json`, `Config::builders`) and the installed exe, then makes one ssh call per builder through `transport.rs`'s `ssh_words` and `Ssh::find`, feeding stdin the embedded PowerShell install script as one base64 line, then the exe, gzipped, as base64, with a short bootstrap on the ssh line that runs the script, and maps the script's `gate-push: ` lines to the `push: ` lines.
 
   Also `run.rs` (the run lifecycle: program, batch refusal, queue, take, launch, wait, run end, verdict, release; `end_leftovers` ends what the command left in its job, before the verdict), `log.rs` (the log, its tail and the failure markers), `environment.rs` (the command's environment, run id and slot marker) and `nesting.rs` (the slot marker a gate was started under: its parse, the parent's liveness, and the covered, refused or own-slot decision, and the search for a stand-in when the parent has ended).
 

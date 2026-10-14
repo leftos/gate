@@ -143,17 +143,33 @@ With nothing to push or nowhere to push it, `gate push` tries no builder, prints
 
 `push: <host>: could not delete <path>: <message>` on stderr names an aside or stale temporary copy the builder could not delete; it never fails the push.
 
-A failure reason is one of: `timed out after <n> s`, `no answer`, ssh's last stderr line, `cannot feed the call: <error>`, the builder script's own (`the copy could not be read: <exception message>`, for bytes that do not decompress; `the copy arrived damaged`; `the installed copy does not match` with `; the previous gate.exe is back in place` or `; the previous gate.exe is at <aside>`; `<dir> is a link`; the failing step's message). Builder text is escaped as the remote client escapes it and cut to 4096 bytes.
+A failure reason is one of: `timed out after <n> s`, `no answer`, ssh's last stderr line, `cannot feed the call: <error>`, or the builder script's own.
+
+The builder script's own reasons are `the copy could not be read: <exception message>`, for bytes that do not decompress; `the copy arrived damaged`; `<dir> is a link`; `<dir>\push.lock is a link`; `another gate push is installing on this builder`; `could not lock <dir>: <message>`; and the failing step's message.
+
+`the installed copy does not match`, or `could not install <path>: <message>` when the installed copy cannot be read after the move, ends with `; the previous gate.exe is back in place` or `; the previous gate.exe is at <aside>`.
+
+On a first install it ends instead with `; the copy was removed and no earlier gate.exe existed` or `; the copy at <path> could not be removed: <message>`. A first install whose move of the temporary copy into place fails says `could not install <path>: <message>; nothing was installed and no earlier gate.exe existed`.
+
+Builder text is escaped as the remote client escapes it and cut to 4096 bytes.
 
 Each builder is one ssh call, run in a kill-on-close job with stdin piped and bounded at 300 s.
 
-A timeout stops only the local ssh, so the builder's install may still finish. The call is `pwsh -NoProfile -NonInteractive -OutputFormat Text -EncodedCommand <script>` through the transport's ssh words ([Routing](#routing)), and the exe goes on stdin as base64 text of its gzip (flate2's best level). The push call is not asked for ssh compression: the bytes are already compressed. The encoded script line must stay within the 8127 characters cmd takes ([Routing](#routing)), which a unit test checks.
+A timeout stops only the local ssh, so the builder's install may still finish.
 
-The builder needs pwsh 7.1 or later. The script decompresses the copy with .NET `GZipStream`, carries this PC's SHA-256 of the exe and refuses decompressed bytes that differ, reports on `gate-push: ` lines that this side maps to the `push:` lines, and exits 1 after a failure. Concurrent pushes to one builder are not locked.
+The call is `pwsh -NoProfile -NonInteractive -OutputFormat Text -EncodedCommand <bootstrap>` through the transport's ssh words ([Routing](#routing)), with `-o RequestTTY=no` ahead of them so stdin never passes through a pseudo-terminal. The bootstrap is a short fixed PowerShell line that reads stdin's first line and runs it as the install script, so the call stays within the 8127 characters cmd takes ([Routing](#routing)) however long the script grows, which a unit test checks.
+
+Stdin is line 1, the install script as base64 of its UTF-8 with this PC's SHA-256 put in, then the exe as base64 text of its gzip (flate2's best level). The push call is not asked for ssh compression: the bytes are already compressed.
+
+The builder needs pwsh 7.1 or later. The script decompresses the copy with .NET `GZipStream`, carries this PC's SHA-256 of the exe and refuses decompressed bytes that differ, reports on `gate-push: ` lines that this side maps to the `push:` lines, and exits 1 after a failure.
+
+Two pushes to one builder at once are refused: the script holds `push.lock` in the builder's `%LOCALAPPDATA%\gate\bin` open, unshared, for the whole install, so the second push fails at once with `another gate push is installing on this builder`, touching nothing, the cleanup of aside copies included.
+
+The open handle is the lock: `push.lock` stays as a plain file after a push and never blocks a later one, and a `push.lock` that is a link is refused with `<dir>\push.lock is a link`.
 
 On the builder the script installs as `tools/install.ps1` does ([Install](#install)), in its own `%LOCALAPPDATA%\gate\bin`, which it creates when missing and refuses when it is a link: it deletes the aside copies (`gate.exe.*.old`) and the stale `gate.exe.<pid>.tmp` copies no process holds.
 
-It says the same version when `gate.exe` already has the same SHA-256; else it writes the exe to `gate.exe.<pid>.tmp` (created new), moves the old one aside to `gate.exe.<stamp>.<pid>.old`, moves the temporary file into place, checks the SHA-256 of the installed copy and moves the aside copy back when anything failed.
+It says the same version when `gate.exe` already has the same SHA-256; else it writes the exe to `gate.exe.<pid>.tmp` (created new), moves the old one aside to `gate.exe.<stamp>.<pid>.old`, moves the temporary file into place, checks the SHA-256 of the installed copy and moves the aside copy back when anything failed, the check's own read included; with no old exe to move back, it removes the installed copy.
 
 Each version read on the builder is bounded at 30 s.
 

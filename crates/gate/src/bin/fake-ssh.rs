@@ -1,7 +1,7 @@
 //! The black-box suite's stand-in for ssh, which `gate run --test-remote-ssh` starts with ssh's own words: the options,
 //! `--`, the host and the line, whose last three words are `box <verb> <payload>`. git's own ssh starts it too, through
 //! the `local-ssh:` transport, with the line `git-upload-pack '<path>'` or `git-receive-pack '<path>'`, whose verb is
-//! the service's name. `gate push` starts it with a line that starts with `pwsh ` and holds `-EncodedCommand <script>`,
+//! the service's name. `gate push` starts it with a line that starts with `pwsh ` and holds `-EncodedCommand <bootstrap>`,
 //! a push call, whose verb is `push`. It reads the steps file the variable `GATE_FAKE_SSH_STEPS` names, one step a line,
 //! appends the verb it was called with to `<steps file>.log`, and the verb and ssh's options, the words before the
 //! host with a last `--` left out, as one line to `<steps file>.words`, and acts on the step of its call, counted by that log: the

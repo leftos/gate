@@ -1,9 +1,10 @@
 //! `gate push`: copies the installed `%LOCALAPPDATA%\gate\bin\gate.exe` to every builder `remote.json` names, one
-//! after another. Each builder gets one ssh call whose line is a PowerShell script, [`SCRIPT`], sent encoded, and the
-//! exe compressed with gzip, as base64 text, on ssh's stdin; the script decompresses it, checks the copy's SHA-256 and
-//! installs it on the builder as `tools/install.ps1` installs here, with the old exe set aside, and says what it did
-//! on `gate-push: ` lines, which this side reads into the `push: ` lines. Every builder is tried; one that failed makes
-//! the exit 1.
+//! after another. Each builder gets one ssh call whose line is a short PowerShell bootstrap, [`BOOTSTRAP`], sent
+//! encoded; ssh's stdin carries the install script, [`SCRIPT`], as one line of base64, then the exe compressed with gzip,
+//! as base64 text. The bootstrap reads the script's line and runs it in the bootstrap's scope; the script reads the
+//! rest, decompresses it, checks the copy's SHA-256 and installs it on the builder as `tools/install.ps1` installs
+//! here, with the old exe set aside, and says what it did on `gate-push: ` lines, which this side reads into the
+//! `push: ` lines. Every builder is tried; one that failed makes the exit 1.
 
 use std::ffi::OsString;
 use std::fmt::Write as _;
@@ -43,19 +44,28 @@ const MARK: &str = "gate-push: ";
 const MARKED_CAP: usize = 16;
 /// The most bytes kept of one line of a call's output; the rest of a longer line is skipped.
 const LINE_CAP: u64 = 64 * 1024;
-/// What the builder's cmd runs: pwsh with the script, as UTF-16LE base64, its one other word.
+/// What the builder's cmd runs: pwsh with [`BOOTSTRAP`], as UTF-16LE base64, its one other word.
 const PWSH: &str = "pwsh -NoProfile -NonInteractive -OutputFormat Text -EncodedCommand ";
 /// The stand-in for the exe's SHA-256, as upper-case hex, in [`SCRIPT`].
 const SHA_SLOT: &str = "@SHA@";
 
-/// The builder script, as `tools/install.ps1` installs: it reads the exe from stdin as base64 of its gzip, decompresses
-/// it, and refuses bytes whose SHA-256 is not the one this side put in for [`SHA_SLOT`]. In `%LOCALAPPDATA%\gate\bin`,
-/// made when missing and refused when it is a link, it deletes each `gate.exe.*.old`, and each `gate.exe.<pid>.tmp` of
-/// another pid, that no process holds, saying `note` and why for one it cannot delete. With a `gate.exe` of the same
-/// SHA-256 it says `same` and its version; else it writes `gate.exe.<pid>.tmp` afresh, moves the old exe aside to
-/// `gate.exe.<yyyyMMddHHmmss>.<pid>.old` and the temp into place, checks the installed copy's SHA-256, and on a
-/// failure moves the aside copy back; then it says `replaced` and the old version when it read one, and `installed`
-/// and the new one. A failure says `failed` and why, and exits 1. Each version read is bounded at 30 s.
+/// What the push line runs: it reads stdin's first line, [`SCRIPT`] as base64 of its UTF-8, and runs it dot-sourced,
+/// so the script's variables, `$lock` among them, and its functions live in one scope, the bootstrap's. Both read
+/// through `[Console]::In`, one buffered reader, so the script reads on from where the bootstrap's line ended.
+const BOOTSTRAP: &str = "$l=[Console]::In.ReadLine();. ([ScriptBlock]::Create([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($l))))";
+
+/// The builder script, run by [`BOOTSTRAP`], as `tools/install.ps1` installs: it reads the rest of stdin, the exe as
+/// base64 of its gzip, decompresses it, and refuses bytes whose SHA-256 is not the one this side put in for
+/// [`SHA_SLOT`]. In `%LOCALAPPDATA%\gate\bin`, made when missing and refused when it is a link, it first holds
+/// `push.lock` open, unshared, to its end, so a second push to the builder at once says `failed` and touches nothing;
+/// a `push.lock` that is a link is refused, and the plain file is left in place, since the open handle is the lock. It
+/// deletes each `gate.exe.*.old`, and each `gate.exe.<pid>.tmp` of another pid, that no process holds, saying `note`
+/// and why for one it cannot delete. With a `gate.exe` of the same SHA-256 it says `same` and its version; else it
+/// writes `gate.exe.<pid>.tmp` afresh, moves the old exe aside to `gate.exe.<yyyyMMddHHmmss>.<pid>.old` and the temp
+/// into place, checks the installed copy's SHA-256, and on a failure, the check's own included, moves the aside copy
+/// back, or removes the installed copy when there was no old exe; then it says `replaced` and the old version when it
+/// read one, and `installed` and the new one. A failure says `failed` and why, and exits 1. Each version read is
+/// bounded at 30 s.
 const SCRIPT: &str = r#"$ErrorActionPreference='Stop';$ProgressPreference='SilentlyContinue'
 function Say($k,$t){[Console]::Out.WriteLine("gate-push: $k $t")}
 function Fail($t){Say failed $t;exit 1}
@@ -65,7 +75,9 @@ if(!$x.WaitForExit(30000)){$x.Kill($true);return ''}
 if(($o.Result -split '\r?\n')[0] -notmatch '^gate\s+(.+?)\s*$'){return ''};$Matches[1]}
 function Held($p){try{[IO.File]::Open($p,'Open','ReadWrite','None').Dispose();$false}catch{$_.Exception.GetBaseException().HResult -eq -2147024864}}
 function Drop($p){Remove-Item -LiteralPath $p -Force -EA Ignore}
-function Back($m){if(!$a){Fail $m}
+function Back($m){if(!$a){if(Test-Path -LiteralPath $g){
+try{Remove-Item -LiteralPath $g -Force}catch{Fail "$m; the copy at $g could not be removed: $($_.Exception.Message)"}}
+Fail "$m; the copy was removed and no earlier gate.exe existed"}
 try{Move-Item -LiteralPath $a -Destination $g -Force}catch{Fail "$m; the previous gate.exe is at $a"}
 Fail "$m; the previous gate.exe is back in place"}
 if(!$env:LOCALAPPDATA){Fail 'LOCALAPPDATA is not set'}
@@ -77,6 +89,9 @@ $b=$u.ToArray()}catch{Fail "the copy could not be read: $($_.Exception.Message)"
 if([Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($b)) -ne '@SHA@'){Fail 'the copy arrived damaged'}
 try{New-Item -ItemType Directory -Path $dir -Force|Out-Null}catch{Fail "could not create ${dir}: $($_.Exception.Message)"}
 if((Get-Item -LiteralPath $dir).LinkType){Fail "$dir is a link"}
+$pl=Join-Path $dir 'push.lock';if((Get-Item -LiteralPath $pl -Force -EA Ignore).LinkType){Fail "$pl is a link"}
+try{$lock=[IO.File]::Open($pl,'OpenOrCreate','ReadWrite','None')}catch{$x=$_.Exception.GetBaseException()
+if($x.HResult -eq -2147024864){Fail 'another gate push is installing on this builder'};Fail "could not lock ${dir}: $($x.Message)"}
 foreach($f in Get-ChildItem -LiteralPath $dir -File|?{$_.Name -like 'gate.exe.*.old' -or ($_.Name -match '^gate\.exe\.(\d+)\.tmp$' -and $Matches[1] -ne $PID)}){
 try{Remove-Item -LiteralPath $f.FullName -Force}catch{if(!(Held $f.FullName)){Say note "could not delete $($f.FullName): $($_.Exception.Message)"}}}
 if((Test-Path -LiteralPath $g) -and (Get-FileHash -LiteralPath $g).Hash -eq '@SHA@'){Say same (Ver $g);exit 0}
@@ -85,8 +100,10 @@ try{$s=[IO.File]::Open($tmp,'CreateNew','Write','None');try{$s.Write($b,0,$b.Len
 $old=''
 if(Test-Path -LiteralPath $g){$old=Ver $g;$a="$g.$(Get-Date -Format yyyyMMddHHmmss).$PID.old"
 try{Move-Item -LiteralPath $g -Destination $a -Force}catch{Drop $tmp;Fail "$ci $($_.Exception.Message)"}}
-try{Move-Item -LiteralPath $tmp -Destination $g -Force}catch{$m=$_.Exception.Message;Drop $tmp;Back "$ci $m"}
-if((Get-FileHash -LiteralPath $g).Hash -ne '@SHA@'){Back 'the installed copy does not match'}
+try{Move-Item -LiteralPath $tmp -Destination $g -Force}catch{$m=$_.Exception.Message;Drop $tmp
+if(!$a){Fail "$ci $m; nothing was installed and no earlier gate.exe existed"};Back "$ci $m"}
+try{$h=(Get-FileHash -LiteralPath $g).Hash}catch{Back "$ci $($_.Exception.Message)"}
+if($h -ne '@SHA@'){Back 'the installed copy does not match'}
 if($old){Say replaced $old}
 Say installed (Ver $g)
 "#;
@@ -116,7 +133,7 @@ pub(crate) fn push(request: &PushRequest, environment: &Environment, console: &m
         let heard = match &ssh {
             Ok(program) => called(&Call {
                 program,
-                args: ssh_words(host, &prepared.line, Wire::Plain),
+                args: push_words(host, &prepared.line),
                 input: prepared.input.as_bytes(),
                 variables: &variables,
                 bound,
@@ -136,6 +153,16 @@ pub(crate) fn push(request: &PushRequest, environment: &Environment, console: &m
         }
     }
     status
+}
+
+/// ssh's words for the push call that runs `line` on `host`: no terminal asked for, so stdin reaches the bootstrap
+/// through no pty, then the transport's words.
+fn push_words(host: &str, line: &str) -> Vec<OsString> {
+    ["-o", "RequestTTY=no"]
+        .into_iter()
+        .map(OsString::from)
+        .chain(ssh_words(host, line, Wire::Plain))
+        .collect()
 }
 
 /// What every builder is sent: the builders, the exe as its call is fed it, [`pushed_input`], the exe's version as
@@ -161,8 +188,8 @@ fn prepared(environment: &Environment, variables: &[(OsString, OsString)]) -> Re
     let exe = gate.join("bin").join("gate.exe");
     let bytes = installed(&exe)?;
     let version = shown(&local_version(&exe, variables)?);
-    let line = push_line(&sha256_hex(&bytes));
-    let input = pushed_input(&bytes);
+    let line = push_line();
+    let input = pushed_input(&sha256_hex(&bytes), &bytes);
     Ok(Prepared {
         builders,
         input,
@@ -171,9 +198,20 @@ fn prepared(environment: &Environment, variables: &[(OsString, OsString)]) -> Re
     })
 }
 
-/// What a builder's call is fed for `exe`: its gzip at the best level, as base64 text.
+/// What a builder's call is fed for `exe`, whose SHA-256 is `sha`: [`script_line`] and a line break, then
+/// [`gzipped`].
+fn pushed_input(sha: &str, exe: &[u8]) -> String {
+    format!("{}\n{}", script_line(sha), gzipped(exe))
+}
+
+/// [`SCRIPT`] with `sha` put in, as base64 of its UTF-8: one line, as [`BOOTSTRAP`] reads it.
+fn script_line(sha: &str) -> String {
+    STANDARD.encode(SCRIPT.replace(SHA_SLOT, sha))
+}
+
+/// `exe`'s gzip at the best level, as base64 text.
 #[expect(clippy::expect_used, reason = "gzip written into a Vec has no write that can fail")]
-fn pushed_input(exe: &[u8]) -> String {
+fn gzipped(exe: &[u8]) -> String {
     let mut encoder = GzEncoder::new(Vec::new(), Compression::best());
     encoder.write_all(exe).expect("writing into a Vec cannot fail");
     let gzip = encoder.finish().expect("finishing into a Vec cannot fail");
@@ -236,10 +274,10 @@ fn sha256_hex(bytes: &[u8]) -> String {
     })
 }
 
-/// The line each builder's cmd runs: pwsh with [`SCRIPT`], `sha` put in, encoded as UTF-16LE base64, a form cmd passes
-/// on with no quoting.
-fn push_line(sha: &str) -> String {
-    encoded_line(&SCRIPT.replace(SHA_SLOT, sha))
+/// The line each builder's cmd runs: pwsh with [`BOOTSTRAP`] encoded as UTF-16LE base64, a form cmd passes on with no
+/// quoting.
+fn push_line() -> String {
+    encoded_line(BOOTSTRAP)
 }
 
 /// The line that runs `script` through pwsh, encoded as UTF-16LE base64.
@@ -554,7 +592,8 @@ mod tests {
     use flate2::read::GzDecoder;
 
     use super::{
-        Call, End, Heard, LINE_CAP, MARKED_CAP, PWSH, SCRIPT, Said, called, encoded_line, kept, push_line, pushed_input, said, sha256_hex, version_of,
+        BOOTSTRAP, Call, End, Heard, LINE_CAP, MARKED_CAP, PWSH, SCRIPT, Said, called, encoded_line, gzipped, kept, push_line, pushed_input, said,
+        script_line, sha256_hex, version_of,
     };
     use crate::environment::Variables;
     use crate::run::find_program;
@@ -564,7 +603,7 @@ mod tests {
 
     #[test]
     fn the_push_line_fits_the_cap() {
-        let line = push_line(SHA);
+        let line = push_line();
         assert!(line.starts_with(PWSH), "{line}");
         assert!(
             line.len() <= 8127,
@@ -574,15 +613,20 @@ mod tests {
     }
 
     #[test]
-    fn the_push_line_decodes_to_the_script() {
-        let line = push_line(SHA);
+    fn the_push_line_decodes_to_the_bootstrap_and_the_input_to_the_script() {
+        let line = push_line();
         let encoded = line.strip_prefix(PWSH).expect("the line starts with pwsh's words");
-        assert!(!encoded.contains(' '), "the script is one word");
-        let bytes = STANDARD.decode(encoded).expect("the script is base64");
+        assert!(!encoded.contains(' '), "the bootstrap is one word");
+        let bytes = STANDARD.decode(encoded).expect("the bootstrap is base64");
         let (pairs, rest) = bytes.as_chunks::<2>();
         assert!(rest.is_empty(), "UTF-16 is whole pairs of bytes");
         let wide: Vec<u16> = pairs.iter().map(|pair| u16::from_le_bytes(*pair)).collect();
-        let script = String::from_utf16(&wide).expect("the script is UTF-16");
+        assert_eq!(String::from_utf16(&wide).expect("the bootstrap is UTF-16"), BOOTSTRAP);
+
+        let input = pushed_input(SHA, b"an exe");
+        let (first, exe) = input.split_once('\n').expect("the script's line ends with a line break");
+        assert_eq!(exe, gzipped(b"an exe"), "the exe follows the script's line");
+        let script = String::from_utf8(STANDARD.decode(first).expect("the script's line is base64")).expect("the script is UTF-8");
         assert_eq!(script, SCRIPT.replace("@SHA@", SHA));
         assert_eq!(
             script.matches(SHA).count(),
@@ -787,15 +831,15 @@ mod tests {
     /// The script run here through local pwsh with `exe` fed, `LOCALAPPDATA` set to `local_app_data`: the
     /// `gate-push: ` lines it said and its end.
     fn run_script(exe: &[u8], local_app_data: &Path) -> Heard {
-        run_script_fed(&sha256_hex(exe), &pushed_input(exe), local_app_data)
+        run_script_fed(&pushed_input(&sha256_hex(exe), exe), local_app_data)
     }
 
-    /// The script run here through local pwsh expecting the SHA-256 `sha`, fed `input`, `LOCALAPPDATA` set to
-    /// `local_app_data`: the `gate-push: ` lines it said and its end.
-    fn run_script_fed(sha: &str, input: &str, local_app_data: &Path) -> Heard {
+    /// The push line run here through local pwsh, fed `input`, `LOCALAPPDATA` set to `local_app_data`: the
+    /// `gate-push: ` lines it said and its end.
+    fn run_script_fed(input: &str, local_app_data: &Path) -> Heard {
         let folder = std::env::current_dir().expect("the working folder is read");
         let pwsh = find_program("pwsh", &Variables::from_process(), &folder).expect("pwsh is on PATH");
-        let line = push_line(sha);
+        let line = push_line();
         let args: Vec<OsString> = line.split(' ').skip(1).map(OsString::from).collect();
         let mut variables: Vec<(OsString, OsString)> = std::env::vars_os()
             .filter(|(name, _)| !name.eq_ignore_ascii_case("LOCALAPPDATA"))
@@ -813,8 +857,9 @@ mod tests {
     #[test]
     fn the_pushed_input_is_the_gzip_of_the_exe_in_base64() {
         let exe = stand_in();
-        let input = pushed_input(&exe);
-        let gzip = STANDARD.decode(&input).expect("the input is base64");
+        let input = pushed_input(&sha256_hex(&exe), &exe);
+        let (_, input) = input.split_once('\n').expect("the exe follows the script's line");
+        let gzip = STANDARD.decode(input).expect("the input is base64");
         let mut unpacked = Vec::new();
         GzDecoder::new(gzip.as_slice()).read_to_end(&mut unpacked).expect("the input is gzip");
         assert!(unpacked == exe, "the input decompresses to the exe's own bytes");
@@ -856,6 +901,106 @@ mod tests {
         let _ = fs::remove_dir_all(&local_app_data);
     }
 
+    /// The names in `folder`, in name order.
+    fn listed(folder: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(folder)
+            .expect("the folder is listed")
+            .map(|entry| entry.expect("an entry").file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// The push line run here as [`run_script`] runs it, with `prelude` put before the script on its line, so a case can
+    /// stand in for one of the commands it calls: a function takes precedence over a cmdlet of the same name.
+    fn run_script_after(prelude: &str, exe: &[u8], local_app_data: &Path) -> Heard {
+        let script = format!("{prelude}\n{}", SCRIPT.replace("@SHA@", &sha256_hex(exe)));
+        run_script_fed(&format!("{}\n{}", STANDARD.encode(script), gzipped(exe)), local_app_data)
+    }
+
+    #[test]
+    fn a_first_install_whose_copy_fails_its_check_leaves_no_gate() {
+        let local_app_data = scratch("first-mismatch");
+        let heard = run_script_after("function Get-FileHash{@{Hash='MISMATCH'}}", &stand_in(), &local_app_data);
+        assert_eq!(heard.end, End::Exited(1), "{heard:?}");
+        assert_eq!(
+            heard.marked,
+            ["gate-push: failed the installed copy does not match; the copy was removed and no earlier gate.exe existed"],
+            "{heard:?}"
+        );
+        assert_eq!(
+            listed(&local_app_data.join(r"gate\bin")),
+            ["push.lock"],
+            "the copy that failed its check was removed"
+        );
+        let _ = fs::remove_dir_all(&local_app_data);
+    }
+
+    #[test]
+    fn a_first_install_whose_failed_copy_cannot_be_removed_says_where_it_is() {
+        let local_app_data = scratch("first-unremovable");
+        let gate = local_app_data.join(r"gate\bin\gate.exe");
+        // Only the removal of the installed copy fails; every other Remove-Item runs as itself.
+        let prelude = "function Get-FileHash{@{Hash='MISMATCH'}}\n\
+                       function Remove-Item{if($args -contains $g){throw [IO.IOException]::new('the copy is held')}\n\
+                       Microsoft.PowerShell.Management\\Remove-Item @args}";
+        let heard = run_script_after(prelude, &stand_in(), &local_app_data);
+        assert_eq!(heard.end, End::Exited(1), "{heard:?}");
+        assert_eq!(
+            heard.marked,
+            [format!(
+                "gate-push: failed the installed copy does not match; the copy at {} could not be removed: the copy is held",
+                gate.display()
+            )],
+            "{heard:?}"
+        );
+        assert!(gate.exists(), "the copy that could not be removed is where the line says");
+        let _ = fs::remove_dir_all(&local_app_data);
+    }
+
+    #[test]
+    fn the_lock_is_held_until_the_install_is_checked() {
+        let local_app_data = scratch("lock-held");
+        // The check after the move is the install's last step; a collection first ends a lock stream no variable keeps.
+        let prelude = "function Get-FileHash($LiteralPath){[GC]::Collect();[GC]::WaitForPendingFinalizers()\n\
+                       Say note \"lock held: $(Held (Join-Path $dir 'push.lock'))\"\n\
+                       Microsoft.PowerShell.Utility\\Get-FileHash -LiteralPath $LiteralPath}";
+        let heard = run_script_after(prelude, &stand_in(), &local_app_data);
+        assert_eq!(heard.end, End::Exited(0), "{heard:?}");
+        assert_eq!(
+            heard.marked.first().map(String::as_str),
+            Some("gate-push: note lock held: True"),
+            "{heard:?}"
+        );
+        let _ = fs::remove_dir_all(&local_app_data);
+    }
+
+    #[test]
+    fn a_check_that_cannot_read_the_installed_copy_puts_the_old_gate_back() {
+        let local_app_data = scratch("check-throws");
+        let bin = local_app_data.join(r"gate\bin");
+        fs::create_dir_all(&bin).expect("the bin folder is made");
+        let gate = bin.join("gate.exe");
+        fs::write(&gate, b"an older gate").expect("an older gate is installed");
+        // The first hash is the same-exe check on the older gate; the second, after the move, fails as a held file does.
+        let prelude = "$global:hashes=0;function Get-FileHash($LiteralPath){$global:hashes++\n\
+                       if($global:hashes -eq 2){throw [IO.IOException]::new('the file is held')}\n\
+                       Microsoft.PowerShell.Utility\\Get-FileHash -LiteralPath $LiteralPath}";
+        let heard = run_script_after(prelude, &stand_in(), &local_app_data);
+        assert_eq!(heard.end, End::Exited(1), "{heard:?}");
+        assert_eq!(
+            heard.marked,
+            [format!(
+                "gate-push: failed could not install {}: the file is held; the previous gate.exe is back in place",
+                gate.display()
+            )],
+            "{heard:?}"
+        );
+        assert_eq!(fs::read(&gate).expect("a gate is installed"), b"an older gate", "the older gate is back");
+        assert_eq!(listed(&bin), ["gate.exe", "push.lock"], "no aside or temp copy is left");
+        let _ = fs::remove_dir_all(&local_app_data);
+    }
+
     /// The `failed` line the script said, and that it exited 1 with nothing installed.
     fn failed_line(heard: &Heard, local_app_data: &Path) -> String {
         assert_eq!(heard.end, End::Exited(1), "{heard:?}");
@@ -869,7 +1014,8 @@ mod tests {
     fn a_copy_that_is_not_gzip_fails_as_could_not_be_read() {
         let local_app_data = scratch("not-gzip");
         let exe = stand_in();
-        let heard = run_script_fed(&sha256_hex(&exe), &STANDARD.encode(&exe), &local_app_data);
+        let input = format!("{}\n{}", script_line(&sha256_hex(&exe)), STANDARD.encode(&exe));
+        let heard = run_script_fed(&input, &local_app_data);
         let line = failed_line(&heard, &local_app_data);
         assert!(line.starts_with("gate-push: failed the copy could not be read: "), "{line}");
         let _ = fs::remove_dir_all(&local_app_data);
@@ -879,7 +1025,7 @@ mod tests {
     fn a_gzip_of_other_bytes_fails_as_damaged() {
         let local_app_data = scratch("other-gzip");
         let exe = stand_in();
-        let heard = run_script_fed(&sha256_hex(&exe), &pushed_input(b"other bytes"), &local_app_data);
+        let heard = run_script_fed(&pushed_input(&sha256_hex(&exe), b"other bytes"), &local_app_data);
         assert_eq!(failed_line(&heard, &local_app_data), "gate-push: failed the copy arrived damaged");
         let _ = fs::remove_dir_all(&local_app_data);
     }
@@ -894,11 +1040,7 @@ mod tests {
         let heard = run_script(&exe, &local_app_data);
         assert_eq!(heard.end, End::Exited(0), "{heard:?}");
         assert!(heard.marked.iter().any(|line| line.starts_with("gate-push: same")), "{heard:?}");
-        let names: Vec<OsString> = fs::read_dir(&bin)
-            .expect("the bin folder is listed")
-            .map(|entry| entry.expect("an entry").file_name())
-            .collect();
-        assert_eq!(names, ["gate.exe"], "nothing was replaced");
+        assert_eq!(listed(&bin), ["gate.exe", "push.lock"], "nothing was replaced");
         let _ = fs::remove_dir_all(&local_app_data);
     }
 }

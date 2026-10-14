@@ -5,6 +5,7 @@
 
 use std::fs::{self, File};
 use std::io::Read as _;
+use std::os::windows::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::LazyLock;
@@ -219,10 +220,12 @@ fn a_push_installs_on_a_builder_with_no_gate() {
     assert_installed(&case, &outcome);
     assert_eq!(
         names(&builder_bin(&case, HOST)),
-        ["gate.exe"],
-        "nothing else is left in the builder's install folder"
+        ["gate.exe", "push.lock"],
+        "nothing else is left in the builder's install folder, the lock's plain file aside"
     );
     assert_eq!(calls(&steps), ["push"]);
+    let words = fs::read_to_string(beside(&steps, ".words")).expect("the stand-in kept the call's words");
+    assert!(words.starts_with("push -o RequestTTY=no "), "the push asks for no terminal: {words}");
 }
 
 /// The exe crosses ssh compressed: what the builder's call is fed is smaller than the uncompressed exe's base64, and
@@ -244,7 +247,8 @@ fn a_push_sends_the_exe_compressed_and_installs_it_whole() {
         sent.len()
     );
     let text = String::from_utf8(sent).expect("the push fed text");
-    let gzip = STANDARD.decode(text.trim_end()).expect("the push fed base64");
+    let (_, exe_text) = text.split_once('\n').expect("the push fed the script's line, then the exe");
+    let gzip = STANDARD.decode(exe_text.trim_end()).expect("the push fed base64");
     let mut unpacked = Vec::new();
     GzDecoder::new(gzip.as_slice()).read_to_end(&mut unpacked).expect("the push fed gzip");
     assert!(unpacked == exe, "what the push fed decompresses to the installed exe");
@@ -273,7 +277,7 @@ fn a_push_to_an_identical_gate_says_already_installed() {
     );
     assert_eq!(outcome.stderr, "", "{outcome:?}");
     assert_eq!(modified(&theirs), before, "the builder's gate was not written");
-    assert_eq!(names(&builder_bin(&case, HOST)), ["gate.exe"], "nothing was replaced");
+    assert_eq!(names(&builder_bin(&case, HOST)), ["gate.exe", "push.lock"], "nothing was replaced");
 }
 
 #[test]
@@ -326,7 +330,8 @@ fn a_push_replaces_an_older_gate() {
         &fs::read(installed_gate(&case)).expect("the installed gate can be read"),
     );
     let names = names(&bin);
-    assert_eq!(names.len(), 2, "the gate and one aside copy, no temp copy: {names:?}");
+    assert_eq!(names.len(), 3, "the gate, one aside copy and the lock, no temp copy: {names:?}");
+    assert_eq!(names[2], "push.lock", "{names:?}");
     let aside = &names[1];
     assert!(is_aside_name(aside), "the old gate is left aside for a later push to delete: {names:?}");
     assert_holds(&bin.join(aside), &old);
@@ -381,7 +386,7 @@ fn a_held_aside_copy_is_left_silently() {
     assert_eq!(ran.code, Some(0), "the process running the aside copy ran to its end: {ran:?}");
     assert_eq!(
         names(&builder_bin(&case, HOST)),
-        ["gate.exe", ASIDE],
+        ["gate.exe", ASIDE, "push.lock"],
         "an aside copy a process runs is left, and left silently, as install leaves it"
     );
 }
@@ -395,7 +400,7 @@ fn an_unheld_aside_copy_is_cleaned_up_first() {
     let outcome = push(&case, &steps);
 
     assert_installed(&case, &outcome);
-    assert_eq!(names(&builder_bin(&case, HOST)), ["gate.exe"], "the aside copy was deleted");
+    assert_eq!(names(&builder_bin(&case, HOST)), ["gate.exe", "push.lock"], "the aside copy was deleted");
 }
 
 #[test]
@@ -407,7 +412,11 @@ fn a_stale_temp_copy_does_not_stop_a_push() {
     let outcome = push(&case, &steps);
 
     assert_installed(&case, &outcome);
-    assert_eq!(names(&builder_bin(&case, HOST)), ["gate.exe"], "the stale temp copy was deleted");
+    assert_eq!(
+        names(&builder_bin(&case, HOST)),
+        ["gate.exe", "push.lock"],
+        "the stale temp copy was deleted"
+    );
 }
 
 #[test]
@@ -432,6 +441,33 @@ fn a_linked_bin_folder_is_refused() {
 
     assert_failed(&outcome, &format!("{} is a link", shown(&bin)));
     assert!(names(&elsewhere).is_empty(), "nothing was written through the link");
+}
+
+/// A push that finds the builder's lock held, as another push installing there holds it, fails and touches nothing:
+/// the old gate and an aside copy the cleanup would delete are both left.
+#[test]
+fn a_push_while_another_holds_the_builder_lock_touches_nothing() {
+    let case = push_case("a_push_while_another_holds_the_builder_lock_touches_nothing");
+    let old = old_gate();
+    builder_file(&case, HOST, "gate.exe", &old);
+    builder_file(&case, HOST, ASIDE, b"an old gate no process runs");
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .share_mode(0)
+        .open(builder_bin(&case, HOST).join("push.lock"))
+        .expect("the lock can be held");
+    let steps = steps(&case, &["ok"]);
+
+    let outcome = push(&case, &steps);
+
+    drop(lock);
+    assert_failed(&outcome, "another gate push is installing on this builder");
+    let bin = builder_bin(&case, HOST);
+    assert_eq!(names(&bin), ["gate.exe", ASIDE, "push.lock"], "nothing was cleaned up or replaced");
+    assert_holds(&bin.join("gate.exe"), &old);
 }
 
 #[test]
