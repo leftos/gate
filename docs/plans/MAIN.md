@@ -7,6 +7,7 @@
 - [ ] GATE-46 Remote slice 5: drained remote cutover and deleting the remote.ps1 bridge — Urgent · Remote
 - [ ] GATE-19 Remote: send a repo's declared sibling worktrees with a routed run — Urgent · Remote
 - [ ] GATE-206 A per-repo toolchain manifest: check and prepare builders, and check a fresh clone — Urgent · Remote
+- [ ] GATE-281 Suite: an outputs case hung 600 s in the full suite on feat b903f50, holding its push — Urgent · Remote
 - [ ] GATE-192 Turn routing back on, on the Rust remote client — High · Remote
 - [ ] GATE-249 Siblings C: the client snapshots, checks parity and pushes each repo — High · Remote
 - [ ] GATE-250 Siblings D: sync back every repo of a pair, all or nothing — High · Remote
