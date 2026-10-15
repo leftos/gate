@@ -799,6 +799,19 @@ pub fn wait_until(what: &str, mut check: impl FnMut() -> bool) {
     }
 }
 
+/// Makes a junction at `link` that leads to `target`, with `mklink /J`.
+pub fn junction(link: &Path, target: &Path) {
+    let made = Command::new("cmd")
+        .args(["/c", "mklink", "/J"])
+        .arg(link)
+        .arg(target)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .status()
+        .expect("cmd starts");
+    assert!(made.success(), "the junction {} is made", link.display());
+}
+
 /// Returns once `path` exists.
 pub fn wait_for_file(path: &Path) {
     wait_until(&format!("{} appearing", path.display()), || path.exists());

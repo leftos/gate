@@ -3,6 +3,8 @@
 //! tool the payload's `Needs` names.
 
 use std::fs;
+use std::io;
+use std::os::windows::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::sync::PoisonError;
@@ -14,8 +16,10 @@ use gate_args::BoxSeams;
 use crate::answer::USAGE_STATUS;
 use crate::boxside::boot;
 use crate::boxside::forward::{ChildPipes, DRAIN, Drained, OutputLock};
-use crate::boxside::payload::Payload;
+use crate::boxside::payload::{Pair, Payload};
 use crate::boxside::probe;
+use crate::boxside::run::LAYOUT_SINGLE;
+use crate::boxside::tools;
 use crate::console::Console;
 use crate::environment::Variables;
 use crate::remote::git;
@@ -62,14 +66,21 @@ pub(crate) fn git_failed(step: &str, code: i32) -> Failed {
 /// within `--test-dotnet-limit-ms` when `seams` gives it, else [`git::DOTNET_LIMIT`], and the tool lines, probed within
 /// `--test-probe-limit-ms` when `seams` gives it, else [`probe::PROBE_LIMIT`]; returns the status.
 pub(crate) fn preflight(payload: &Payload, seams: &BoxSeams, console: &mut Console) -> u32 {
-    let (bare, work) = match payload.path("Bare").and_then(|bare| Ok((bare, payload.work_folder()?.1))) {
+    let read = payload
+        .path("Bare")
+        .and_then(|bare| Ok((bare, payload.work_folder()?.1, payload.pair()?)));
+    let (bare, work, pair) = match read {
         Ok(folders) => folders,
         Err(line) => {
             console.err(&line);
             return u32::from(USAGE_STATUS);
         }
     };
-    if let Err(failed) = ready(bare, work, console) {
+    let readied = match &pair {
+        None => ready(bare, work, console),
+        Some(pair) => ready_bares(bare, work, pair, console),
+    };
+    if let Err(failed) = readied {
         console.err(&failed.line);
         return failed.status;
     }
@@ -114,45 +125,290 @@ fn say_sdks_and_tools(payload: &Payload, seams: &BoxSeams, console: &mut Console
     });
 }
 
-/// The folder above `work`; the bare repository, said as created; the work folder's repository; its `origin`; its
-/// line-ending config; and its alternates file pointing at the bare repository's objects.
+/// The folder above `work`; the bare repository, said as created; and the work folder's repository ([`ready_tree`],
+/// which readies nothing through a link at its `.git`), unless the work folder is laid out for another layout
+/// ([`laid_out_for_one_repo`]): a run of the key changes it under its lock, which the preflight does not take.
 fn ready(bare: &str, work: &str, console: &mut Console) -> Result<(), Failed> {
     let git = Git::find();
-    if let Some(parent) = Path::new(work).parent().filter(|parent| !parent.as_os_str().is_empty()) {
-        fs::create_dir_all(parent)
-            .map_err(|error| Failed::without_status(format!("gate: remote could not create the folder {}: {error}", parent.display())))?;
-    }
-    if !Path::new(bare).exists() {
-        git.step("git init --bare", &["init", "--bare", "-q", "--", bare])?;
-        console.out(&format!("gate: remote created {bare}"));
-    }
-    if !Path::new(work).join(".git").exists() {
-        git.step("git init", &["init", "-q", "--", work])?;
-    }
-    // Checked apart from .git, so a preflight cut short between the two steps is finished by the next one. A git that
-    // cannot be started here fails the next step, which names it.
-    if git.code(&["-C", work, "config", "--get", "remote.origin.url"], Stdio::null(), Stdio::inherit()) != Ok(0) {
-        git.step("git remote add", &["-C", work, "remote", "add", "--", "origin", bare])?;
-    }
-    // The work folder's own config, so the checkout and the sync-back keep the snapshot's bytes whatever the builder's
-    // system and global git config say.
-    git.step("git config core.autocrlf", &["-C", work, "config", "core.autocrlf", "false"])?;
-    git.step("git config core.eol", &["-C", work, "config", "core.eol", "lf"])?;
-    write_alternates(bare, work)
-}
-
-/// Writes `<bare with / separators>/objects` and LF, UTF-8 without a BOM, as the work folder's alternates file when
-/// that file is missing or empty.
-fn write_alternates(bare: &str, work: &str) -> Result<(), Failed> {
-    let info = Path::new(work).join(".git").join("objects").join("info");
-    let alternates = info.join("alternates");
-    if fs::metadata(&alternates).is_ok_and(|file| file.len() > 0) {
+    create_parent(work)?;
+    create_bare(&git, bare, None, console)?;
+    if !laid_out_for_one_repo(work) {
         return Ok(());
     }
+    ready_tree(&git, bare, work, None, console).map_err(|unready| match unready {
+        Unready::Git(failed) => failed,
+        Unready::Folder(why) => Failed::without_status(format!("gate: remote {why}")),
+    })
+}
+
+/// Whether the layout record of the work folder `work`, `{work}.layout`, read without following a link, says the
+/// layout of a run of one repo or is missing; a record that says a pair's layout or a clear in progress, or that cannot
+/// be read, is not.
+fn laid_out_for_one_repo(work: &str) -> bool {
+    match tools::read_record(&format!("{work}.layout")) {
+        Ok(None) => true,
+        Ok(Some(text)) => text.eq_ignore_ascii_case(LAYOUT_SINGLE),
+        Err(_) => false,
+    }
+}
+
+/// For a run of the sibling pair `pair`: the folder above `work`, and the bare repository of the main checkout,
+/// `bare`, and of each sibling, each said as created, a failure naming its repo. Nothing inside `work`, which only a
+/// run holding its lock changes.
+fn ready_bares(bare: &str, work: &str, pair: &Pair, console: &mut Console) -> Result<(), Failed> {
+    let git = Git::find();
+    create_parent(work)?;
+    create_bare(&git, bare, Some(pair.leaf()), console)?;
+    for sibling in pair.siblings() {
+        create_bare(&git, sibling.bare(), Some(sibling.name()), console)?;
+    }
+    Ok(())
+}
+
+/// Creates the folder above `path` when it has one.
+fn create_parent(path: &str) -> Result<(), Failed> {
+    match Path::new(path).parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        Some(parent) => create_folder(parent),
+        None => Ok(()),
+    }
+}
+
+/// Creates `folder` and the folders above it; else the line saying it could not.
+fn create_folder(folder: &Path) -> Result<(), Failed> {
+    fs::create_dir_all(folder)
+        .map_err(|error| Failed::without_status(format!("gate: remote could not create the folder {}: {error}", folder.display())))
+}
+
+/// Creates the bare repository `bare` when it is missing, said as created; a failure's line names the repo `name` on a
+/// pair run ([`failed_for`]).
+fn create_bare(git: &Git, bare: &str, name: Option<&str>, console: &mut Console) -> Result<(), Failed> {
+    if !Path::new(bare).exists() {
+        let step = "git init --bare";
+        git.step(&for_repo(step, name), &["init", "--bare", "-q", "--", bare])
+            .map_err(|failed| failed_for(failed, step, name))?;
+        console.out(&format!("gate: remote created {bare}"));
+    }
+    Ok(())
+}
+
+/// How [`ready_tree`] runs git: the preflight's [`Git`], or the run's, with its safety options and its output forwarded
+/// under the box's output lock.
+pub(super) trait TreeGit {
+    /// Runs git with `args`; a non-zero status, or a git that cannot be started, fails `step`.
+    fn run_step(&self, step: &str, args: &[&str], console: &mut Console) -> Result<(), Failed>;
+    /// git's exit code for `args`, its stdout discarded; else why it could not be started.
+    fn run_code(&self, args: &[&str]) -> Result<i32, String>;
+    /// Whether the caller holds the work folder's lock, so a link where a folder should be may be removed and the
+    /// folder made again ([`write_alternates`]).
+    fn holds_the_lock(&self) -> bool;
+}
+
+impl TreeGit for Git {
+    fn run_step(&self, step: &str, args: &[&str], _console: &mut Console) -> Result<(), Failed> {
+        self.step(step, args)
+    }
+
+    fn run_code(&self, args: &[&str]) -> Result<i32, String> {
+        self.code(args, Stdio::null(), Stdio::inherit())
+    }
+
+    /// The preflight takes no lock.
+    fn holds_the_lock(&self) -> bool {
+        false
+    }
+}
+
+/// Readies the repository of the tree `tree`: created when nothing has the name `.git` there, read without following a
+/// link, its `origin` the bare repository `bare`, its line-ending config, and its alternates file pointing at `bare`'s
+/// objects ([`write_alternates`]). Without the lock, a link, a junction or a file at the tree's `.git`, `.git\objects`
+/// or `.git\objects\info`, or anything but a file at its `.git\config` ([`has_a_link_in_its_git`]), readies nothing:
+/// no git step runs and nothing is written, and the run repairs it under the lock. When `git` holds the work folder's
+/// lock, those are repaired before the first git step ([`repair_git`]). So each git call goes through `git` and names
+/// the tree's own `.git` folder, config and the tree, and no other repository's config, objects or work tree is
+/// reached. A step's line names the repo `name` when given, as a pair run's lines do ([`tree_step`]).
+pub(super) fn ready_tree(git: &impl TreeGit, bare: &str, tree: &str, name: Option<&str>, console: &mut Console) -> Result<(), Unready> {
+    if git.holds_the_lock() {
+        repair_git(tree).map_err(Unready::Folder)?;
+    } else if has_a_link_in_its_git(Path::new(tree)) {
+        return Ok(());
+    }
+    // A run removes a link, a junction or a file named `.git` before it readies a tree (`plain_tree` in the run).
+    if fs::symlink_metadata(Path::new(tree).join(".git")).is_err() {
+        tree_step(git, "git init", name, &["init", "-q", "--", tree], console)?;
+    }
+    let git_dir = format!(r"--git-dir={tree}\.git");
+    let work_tree = format!("--work-tree={tree}");
+    let (git_dir, work_tree) = (git_dir.as_str(), work_tree.as_str());
+    // Checked apart from .git, so a preflight cut short between the two steps is finished by the next one. A git that
+    // cannot be started here fails the next step, which names it.
+    if git.run_code(&[git_dir, work_tree, "config", "--get", "remote.origin.url"]) != Ok(0) {
+        let args = [git_dir, work_tree, "remote", "add", "--", "origin", bare];
+        tree_step(git, "git remote add", name, &args, console)?;
+    }
+    // The tree's own config, so the checkout and the sync-back keep the snapshot's bytes whatever the builder's system
+    // and global git config say.
+    for (setting, value) in [("core.autocrlf", "false"), ("core.eol", "lf")] {
+        let args = [git_dir, work_tree, "config", setting, value];
+        tree_step(git, &format!("git config {setting}"), name, &args, console)?;
+    }
+    write_alternates(bare, tree, git.holds_the_lock()).map_err(Unready::Folder)
+}
+
+/// Runs the git step `step` with `args` through `git`, named for the repo `name` on a pair run ([`for_repo`]), its
+/// failure's line as [`failed_for`] gives it.
+fn tree_step(git: &impl TreeGit, step: &str, name: Option<&str>, args: &[&str], console: &mut Console) -> Result<(), Unready> {
+    git.run_step(&for_repo(step, name), args, console)
+        .map_err(|failed| Unready::Git(failed_for(failed, step, name)))
+}
+
+/// The step `step` as a pair run's git step naming the repo `name` is said: `{step} for {name}`, which cannot be read
+/// as one of the step's own words; `step` as it is on a run of one repo.
+fn for_repo(step: &str, name: Option<&str>) -> String {
+    match name {
+        Some(name) => format!("{step} for {name}"),
+        None => step.to_owned(),
+    }
+}
+
+/// The failure `failed` of the git step `step`, run as [`for_repo`] names it: its line says `{step} failed for {name}`
+/// on a pair run, and is as it is on a run of one repo.
+fn failed_for(failed: Failed, step: &str, name: Option<&str>) -> Failed {
+    let Some(name) = name else {
+        return failed;
+    };
+    let line = failed
+        .line
+        .replacen(&format!("{step} for {name} failed"), &format!("{step} failed for {name}"), 1);
+    Failed { line, ..failed }
+}
+
+/// The step `step` as its lines name it: followed by the repo's name `name` on a pair run, as it is on a run of one
+/// repo.
+pub(super) fn named_step(step: &str, name: Option<&str>) -> String {
+    match name {
+        Some(name) => format!("{step} {name}"),
+        None => step.to_owned(),
+    }
+}
+
+/// Why a tree could not be readied ([`ready_tree`]).
+pub(super) enum Unready {
+    /// A git step failed.
+    Git(Failed),
+    /// A step on the file system failed, for this reason, which says what could not be done.
+    Folder(String),
+}
+
+/// The tree `tree`'s `.git`, `.git\objects` and `.git\objects\info`.
+fn git_folders(tree: &Path) -> [PathBuf; 3] {
+    let git = tree.join(".git");
+    let objects = git.join("objects");
+    let info = objects.join("info");
+    [git, objects, info]
+}
+
+/// Whether the config file `config` is missing or a file itself, read without following a link: a link there would
+/// lead git's config writes, which replace the file through its lock file, into another repository's config.
+fn config_is_plain(config: &Path) -> bool {
+    !fs::symlink_metadata(config).is_ok_and(|metadata| !metadata.is_file())
+}
+
+/// Whether any of the tree `tree`'s `.git`, `.git\objects` and `.git\objects\info` is there and is not a folder itself,
+/// or its `.git\config` is there and is not a file itself, read without following a link: a link, a junction or a
+/// file, through which git or the alternates file would reach another repository.
+fn has_a_link_in_its_git(tree: &Path) -> bool {
+    let [git, objects, info] = git_folders(tree);
+    let not_a_folder = |folder: &PathBuf| fs::symlink_metadata(folder).is_ok_and(|metadata| !metadata.is_dir());
+    [&git, &objects, &info].into_iter().any(not_a_folder) || !config_is_plain(&git.join("config"))
+}
+
+/// Whether the tree `tree`'s `.git`, `.git\objects` and `.git\objects\info` are each a folder itself
+/// ([`is_real_folder`]) and its `.git\config` is missing or a file itself ([`config_is_plain`]).
+pub(super) fn git_is_plain(tree: &Path) -> bool {
+    let folders = git_folders(tree);
+    folders.iter().all(|folder| is_real_folder(folder)) && config_is_plain(&folders[0].join("config"))
+}
+
+/// Under the work folder's lock, before any git step: a `.git\config` that is not a file itself removed as itself,
+/// for git to write afresh, and `.git\objects` and `.git\objects\info` made folders of their own ([`made_folder`]), so
+/// no git step reads or writes through a link there. Nothing when the tree has no `.git` folder, which `git init` then
+/// makes. Else why not.
+fn repair_git(tree: &str) -> Result<(), String> {
+    let [git, objects, info] = git_folders(Path::new(tree));
+    if !is_real_folder(&git) {
+        return Ok(());
+    }
+    let config = git.join("config");
+    if !config_is_plain(&config) {
+        remove_entry(&config).map_err(|error| format!("cannot remove {}: {error}", config.display()))?;
+    }
+    let alternates = info.join("alternates");
+    for folder in [&objects, &info] {
+        made_folder(folder, true).map_err(|why| format!("could not write {}: {why}", alternates.display()))?;
+    }
+    Ok(())
+}
+
+/// Writes `<bare with / separators>/objects` and LF, UTF-8 without a BOM, as the tree's alternates file unless it
+/// already holds exactly that, every name read without following a link. The folders `.git\objects` and
+/// `.git\objects\info` are made when missing ([`made_folder`]), and the file written ([`written`]). Else why not:
+/// `could not write {file}: ` and the reason.
+fn write_alternates(bare: &str, tree: &str, repair: bool) -> Result<(), String> {
+    let objects = Path::new(tree).join(".git").join("objects");
+    let info = objects.join("info");
+    let alternates = info.join("alternates");
+    let cannot = |why: String| format!("could not write {}: {why}", alternates.display());
+    for folder in [&objects, &info] {
+        made_folder(folder, repair).map_err(cannot)?;
+    }
     let text = format!("{}/objects\n", bare.replace('\\', "/"));
-    fs::create_dir_all(&info)
-        .and_then(|()| fs::write(&alternates, text))
-        .map_err(|error| Failed::without_status(format!("gate: remote could not write {}: {error}", alternates.display())))
+    written(&alternates, &text).map_err(cannot)
+}
+
+/// Makes the folder `folder` when nothing has its name, read without following a link; one that is a link, a junction
+/// or a file is removed as itself and made again when `repair`, else refused. Else why not.
+fn made_folder(folder: &Path, repair: bool) -> Result<(), String> {
+    match fs::symlink_metadata(folder) {
+        Ok(metadata) if metadata.is_dir() => return Ok(()),
+        Ok(_) if !repair => return Err(format!("{} is a link, a junction or a file", folder.display())),
+        Ok(_) => remove_entry(folder).map_err(|error| format!("cannot remove {}: {error}", folder.display()))?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.to_string()),
+    }
+    fs::create_dir(folder).map_err(|error| format!("cannot create {}: {error}", folder.display()))
+}
+
+/// Writes `text` as the file `file` unless it already holds exactly that, read without following a link; anything
+/// else at its name is removed as itself first. Else why not.
+fn written(file: &Path, text: &str) -> Result<(), String> {
+    match fs::symlink_metadata(file) {
+        Ok(found) if found.is_file() && fs::read(file).is_ok_and(|held| held == text.as_bytes()) => return Ok(()),
+        Ok(_) => remove_entry(file).map_err(|error| error.to_string())?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.to_string()),
+    }
+    fs::write(file, text).map_err(|error| error.to_string())
+}
+
+/// Removes the entry `path` as itself, never what a link or a junction there leads to: a folder, or a link or a
+/// junction to one, with std's `remove_dir_all`, which removes a link it meets rather than following it; anything else
+/// with `remove_file`. Nothing when nothing has the name.
+pub(super) fn remove_entry(path: &Path) -> io::Result<()> {
+    let kind = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata.file_type(),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if kind.is_dir() || kind.is_symlink_dir() {
+        fs::remove_dir_all(path)
+    } else {
+        fs::remove_file(path)
+    }
+}
+
+/// Whether `path` is a folder itself, read without following a link: a link or a junction there is none.
+pub(super) fn is_real_folder(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir())
 }
 
 /// git, found once along the gate's own `PATH` and `PATHEXT`.

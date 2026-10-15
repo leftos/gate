@@ -7,10 +7,12 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use gate_args::MAX_WHOLE_NUMBER;
 pub(crate) use gate_router::{escaped, is_reordering_mark};
+use gate_router::{is_layout_name, repo_name};
 use serde_json::{Map, Value};
 
 use crate::outputs::archive::SUFFIX;
 use crate::outputs::hash::is_lower_hex;
+use crate::remote::siblings::MOST_SIBLINGS;
 
 /// The decoded JSON object.
 pub(crate) struct Payload(Map<String, Value>);
@@ -138,12 +140,189 @@ impl Payload {
     /// trailing newline. A missing key and a JSON null are shown as the empty string, any other non-string value as its
     /// compact JSON text, each with its control characters escaped, so a value cannot break or forge the line.
     pub(crate) fn snapshot(&self) -> Result<&str, String> {
-        match self.0.get("Snapshot") {
-            Some(Value::String(text)) if is_lower_hex(text, COMMIT_SHA_DIGITS) => Ok(text),
-            Some(Value::String(text)) => Err(not_a_snapshot(text)),
-            Some(Value::Null) | None => Err(not_a_snapshot("")),
-            Some(other) => Err(not_a_snapshot(&other.to_string())),
+        commit(self.0.get("Snapshot")).map_err(|shown| not_a_snapshot("Snapshot", &shown))
+    }
+}
+
+/// A sibling pair as the box lays it out: the main checkout's folder name, `Leaf`, and each sibling with the bare
+/// repository its snapshot is pushed to.
+pub(crate) struct Pair {
+    leaf: String,
+    siblings: Vec<PairSibling>,
+}
+
+impl Pair {
+    /// The main checkout's folder name.
+    pub(crate) fn leaf(&self) -> &str {
+        &self.leaf
+    }
+
+    /// The siblings, in the payload's order.
+    pub(crate) fn siblings(&self) -> &[PairSibling] {
+        &self.siblings
+    }
+}
+
+/// One sibling of a [`Pair`]: its folder name and its bare repository, `{root}\{repo_name(name)}.git` beside the main's,
+/// derived on the box and never read from the payload.
+pub(crate) struct PairSibling {
+    name: String,
+    bare: String,
+}
+
+impl PairSibling {
+    pub(crate) fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub(crate) fn bare(&self) -> &str {
+        &self.bare
+    }
+}
+
+/// The sibling pair checks: the names the box lays out, the key they share and the bare repositories beside `Work`.
+impl Payload {
+    /// The run's sibling `Pair`, `{"Leaf": "<name>", "Siblings": ["<name>", …]}`; `None` when the key is absent or null,
+    /// a run of one repo. Else the usage line: a name the box cannot lay out ([`is_layout_name`]), no sibling or more
+    /// than [`MOST_SIBLINGS`], two names (the leaf included) equal ignoring ASCII case, a `Key` that is not the leaf's
+    /// (`<repo_name(leaf)>-<8 hex>`), a `Bare` that is not `<root>\<name>.git` for the work folder `<root>\work\<key>`,
+    /// or two bare repositories (the main's and each sibling's `<repo_name(name)>.git`) equal ignoring ASCII case.
+    pub(crate) fn pair(&self) -> Result<Option<Pair>, String> {
+        let (leaf, names) = match self.0.get("Pair") {
+            None | Some(Value::Null) => return Ok(None),
+            Some(value) => pair_names(value)?,
+        };
+        check_pair_names(&leaf, &names)?;
+        let (key, work) = self.work_folder()?;
+        if !is_key_of(key, &leaf) {
+            return Err(format!(
+                "gate: box payload Key {key} is not the work-folder key of the Pair's Leaf {leaf}"
+            ));
         }
+        let bare = self.path("Bare")?;
+        let Some(root) = grandparent(work) else {
+            return Err(format!(
+                r"gate: box payload Work must be <root>\work\<key> with a Pair: {}",
+                escaped(work)
+            ));
+        };
+        let Some(main_stem) = bare_stem(bare, root) else {
+            return Err(format!(
+                r"gate: box payload Bare must be {root}\<name>.git with a Pair: {}",
+                escaped(bare)
+            ));
+        };
+        let mut stems = vec![main_stem.to_owned()];
+        let mut siblings = Vec::with_capacity(names.len());
+        for name in names {
+            let stem = repo_name(&name);
+            if stems.iter().any(|taken| taken.eq_ignore_ascii_case(&stem)) {
+                return Err(format!(
+                    "gate: box payload Pair sibling {name} would share the bare repository {stem}.git"
+                ));
+            }
+            siblings.push(PairSibling {
+                bare: format!(r"{root}\{stem}.git"),
+                name,
+            });
+            stems.push(stem);
+        }
+        Ok(Some(Pair { leaf, siblings }))
+    }
+
+    /// The commit of each sibling of `pair`, in its order, from the run's `SiblingSnapshots`, an object whose names are
+    /// exactly the siblings' and whose values are each 40 lowercase hex digits, as [`Payload::snapshot`] reads them;
+    /// else the line saying why.
+    pub(crate) fn sibling_snapshots(&self, pair: &Pair) -> Result<Vec<&str>, String> {
+        let object = match self.0.get("SiblingSnapshots") {
+            None | Some(Value::Null) => None,
+            Some(Value::Object(object)) => Some(object),
+            Some(_) => return Err("gate: box payload SiblingSnapshots is not an object".to_owned()),
+        };
+        // A pair has a sibling, so no SiblingSnapshots never names them all.
+        let named =
+            object.filter(|object| object.len() == pair.siblings.len() && pair.siblings.iter().all(|sibling| object.contains_key(&sibling.name)));
+        let Some(object) = named else {
+            let names: Vec<&str> = pair.siblings.iter().map(PairSibling::name).collect();
+            return Err(format!(
+                "gate: box payload SiblingSnapshots must name exactly the Pair's siblings: {}",
+                names.join(", ")
+            ));
+        };
+        pair.siblings
+            .iter()
+            .map(|sibling| commit(object.get(&sibling.name)).map_err(|shown| not_a_snapshot(&format!("SiblingSnapshots {}", sibling.name), &shown)))
+            .collect()
+    }
+}
+
+/// The leaf and the sibling names of the `Pair` value `value`; else the usage line saying it is not one.
+fn pair_names(value: &Value) -> Result<(String, Vec<String>), String> {
+    let not_a_pair = || "gate: box payload Pair is not an object of a Leaf text and a Siblings list of texts".to_owned();
+    let object = value.as_object().ok_or_else(not_a_pair)?;
+    let leaf = object.get("Leaf").and_then(Value::as_str).ok_or_else(not_a_pair)?;
+    let names = object.get("Siblings").and_then(Value::as_array).ok_or_else(not_a_pair)?;
+    let names = names
+        .iter()
+        .map(|name| name.as_str().map(str::to_owned).ok_or_else(not_a_pair))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((leaf.to_owned(), names))
+}
+
+/// Checks the pair's names: each one the box can lay out, 1 to [`MOST_SIBLINGS`] siblings, and no two, the leaf
+/// included, equal ignoring ASCII case; else the usage line.
+fn check_pair_names(leaf: &str, names: &[String]) -> Result<(), String> {
+    if let Some(name) = std::iter::once(leaf)
+        .chain(names.iter().map(String::as_str))
+        .find(|name| !is_layout_name(name))
+    {
+        return Err(format!(
+            "gate: box payload Pair name '{}' is not a folder name of letters, digits, '.', '_' and '-' not starting or ending \
+             with a dot, not a device name",
+            escaped(name)
+        ));
+    }
+    if names.is_empty() {
+        return Err("gate: box payload Pair names no sibling".to_owned());
+    }
+    if names.len() > MOST_SIBLINGS {
+        return Err(format!("gate: box payload Pair names more than {MOST_SIBLINGS} siblings"));
+    }
+    for (index, name) in names.iter().enumerate() {
+        let mut earlier = std::iter::once(leaf).chain(names[..index].iter().map(String::as_str));
+        if let Some(earlier) = earlier.find(|earlier| earlier.eq_ignore_ascii_case(name)) {
+            return Err(format!("gate: box payload Pair names {name} and {earlier}, equal ignoring case"));
+        }
+    }
+    Ok(())
+}
+
+/// Whether `key` is the work-folder key of a root whose folder name is `leaf`: `<repo_name(leaf)>-<8 lower-case hex>`.
+fn is_key_of(key: &str, leaf: &str) -> bool {
+    let name = repo_name(leaf);
+    key.strip_prefix(name.as_str())
+        .and_then(|rest| rest.strip_prefix('-'))
+        .is_some_and(|digits| is_lower_hex(digits, KEY_HASH_DIGITS))
+}
+
+/// The stem of the bare repository `bare` when it is `<root>\<stem>.git`, `<stem>` one or more ASCII letters, digits,
+/// `-` and `_`, its folder compared with `root` as full paths without regard to case; else `None`.
+pub(super) fn bare_stem<'a>(bare: &'a str, root: &str) -> Option<&'a str> {
+    let split = bare.rfind(['\\', '/'])?;
+    let (folder, file) = (&bare[..split], &bare[split + 1..]);
+    let dot = file.len().checked_sub(".git".len())?;
+    let (stem, suffix) = (file.get(..dot)?, file.get(dot..)?);
+    (suffix.eq_ignore_ascii_case(".git") && is_key(stem) && same_path(folder, root)).then_some(stem)
+}
+
+/// The commit `value` names: exactly 40 lowercase hex digits; else the value as a refusal line shows it, a missing key
+/// and a JSON null as the empty string and any other non-string value as its compact JSON text.
+fn commit(value: Option<&Value>) -> Result<&str, String> {
+    match value {
+        Some(Value::String(text)) if is_lower_hex(text, COMMIT_SHA_DIGITS) => Ok(text),
+        Some(Value::String(text)) => Err(text.clone()),
+        Some(Value::Null) | None => Err(String::new()),
+        Some(other) => Err(other.to_string()),
     }
 }
 
@@ -241,6 +420,8 @@ const NONCE_DIGITS: usize = 12;
 const OUTPUTS_NONCE_DIGITS: usize = 32;
 /// The hex digits of a commit's sha.
 const COMMIT_SHA_DIGITS: usize = 40;
+/// The hex digits that end a work-folder key, after the repo name and a `-`.
+const KEY_HASH_DIGITS: usize = 8;
 
 /// Whether `text` is a work-folder key: one or more ASCII letters, digits, `-` and `_`.
 fn is_key(text: &str) -> bool {
@@ -290,9 +471,9 @@ fn not_a_key(key: &str) -> String {
     format!("gate: box payload Key is not a work-folder key: {}", escaped(key))
 }
 
-/// The line refusing a run whose payload named no 40-hex commit as its snapshot, showing `value` as it is.
-fn not_a_snapshot(value: &str) -> String {
-    format!("gate: remote run payload's Snapshot '{}' is not a 40-hex commit sha", escaped(value))
+/// The line refusing a run whose payload named no 40-hex commit as the snapshot `what`, showing `value` as it is.
+fn not_a_snapshot(what: &str, value: &str) -> String {
+    format!("gate: remote run payload's {what} '{}' is not a 40-hex commit sha", escaped(value))
 }
 
 /// `text` with each character mapped to its simple uppercase, as .NET's `OrdinalIgnoreCase` compares: a character
@@ -657,5 +838,245 @@ mod tests {
             );
         }
         assert_eq!(archive_name(""), Err("gate: box payload lacks Name".to_owned()));
+    }
+
+    const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    /// A run payload of the work folder `app-1a2b3c4d` under `D:\gate-remote`, its bare repository `app.git`, with
+    /// `pair` as its `Pair`.
+    fn with_pair(pair: serde_json::Value) -> serde_json::Value {
+        let mut payload = json!({
+            "Key": "app-1a2b3c4d",
+            "Work": WORK,
+            "Bare": r"D:\gate-remote\app.git",
+        });
+        payload["Pair"] = pair;
+        payload
+    }
+
+    /// A pair's leaf, and each sibling's name and bare repository.
+    type LaidOut = (String, Vec<(String, String)>);
+
+    /// The leaf and each sibling's name and bare repository the payload `json` lays out, `None` for no pair; else the
+    /// line refusing it.
+    fn laid_out(json: &serde_json::Value) -> Result<Option<LaidOut>, String> {
+        let pair = decoded(&json.to_string())?.pair()?;
+        Ok(pair.map(|pair| {
+            let siblings = pair
+                .siblings()
+                .iter()
+                .map(|sibling| (sibling.name().to_owned(), sibling.bare().to_owned()))
+                .collect();
+            (pair.leaf().to_owned(), siblings)
+        }))
+    }
+
+    /// The refusal line of the payload `json`'s pair.
+    fn refused_pair(json: &serde_json::Value) -> String {
+        laid_out(json).err().unwrap_or_else(|| format!("not refused: {json}"))
+    }
+
+    #[test]
+    fn a_pair_absent_or_null_is_a_run_of_one_repo() {
+        let mut payload = with_pair(json!(null));
+        assert_eq!(laid_out(&payload), Ok(None), "null");
+        if let Some(object) = payload.as_object_mut() {
+            object.remove("Pair");
+        }
+        assert_eq!(laid_out(&payload), Ok(None), "absent");
+    }
+
+    #[test]
+    fn a_pair_puts_each_siblings_bare_repository_beside_the_main_ones() {
+        let payload = with_pair(json!({"Leaf": "app", "Siblings": ["yaat-server", "a.b", "Lib_2"]}));
+        let siblings = [
+            ("yaat-server", r"D:\gate-remote\yaat-server.git"),
+            ("a.b", r"D:\gate-remote\a-b.git"),
+            ("Lib_2", r"D:\gate-remote\Lib_2.git"),
+        ]
+        .map(|(name, bare)| (name.to_owned(), bare.to_owned()));
+        assert_eq!(laid_out(&payload), Ok(Some(("app".to_owned(), siblings.to_vec()))));
+    }
+
+    #[test]
+    fn a_pair_that_is_not_an_object_of_a_leaf_and_a_list_of_siblings_is_refused() {
+        let refused = "gate: box payload Pair is not an object of a Leaf text and a Siblings list of texts";
+        for bad in [
+            json!("app"),
+            json!(["app"]),
+            json!({"Siblings": ["lib"]}),
+            json!({"Leaf": 1, "Siblings": ["lib"]}),
+            json!({"Leaf": "app"}),
+            json!({"Leaf": "app", "Siblings": "lib"}),
+            json!({"Leaf": "app", "Siblings": ["lib", 1]}),
+        ] {
+            assert_eq!(refused_pair(&with_pair(bad.clone())), refused, "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_pair_refuses_a_name_the_box_cannot_lay_out() {
+        for bad in ["..", r"a\b", "nul.txt", ".x", "x.", ""] {
+            let line = format!(
+                "gate: box payload Pair name '{}' is not a folder name of letters, digits, '.', '_' and '-' not starting or \
+                 ending with a dot, not a device name",
+                escaped(bad)
+            );
+            assert_eq!(
+                refused_pair(&with_pair(json!({"Leaf": "app", "Siblings": ["lib", bad]}))),
+                line,
+                "sibling {bad:?}"
+            );
+            assert_eq!(refused_pair(&with_pair(json!({"Leaf": bad, "Siblings": ["lib"]}))), line, "leaf {bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_pair_names_one_to_eight_siblings() {
+        let names = |count: usize| (1..=count).map(|number| format!("s{number}")).collect::<Vec<_>>();
+        assert_eq!(
+            refused_pair(&with_pair(json!({"Leaf": "app", "Siblings": []}))),
+            "gate: box payload Pair names no sibling"
+        );
+        assert!(
+            laid_out(&with_pair(json!({"Leaf": "app", "Siblings": names(8)}))).is_ok_and(|pair| pair.is_some()),
+            "eight"
+        );
+        assert_eq!(
+            refused_pair(&with_pair(json!({"Leaf": "app", "Siblings": names(9)}))),
+            "gate: box payload Pair names more than 8 siblings"
+        );
+    }
+
+    #[test]
+    fn a_pair_refuses_names_equal_ignoring_case() {
+        assert_eq!(
+            refused_pair(&with_pair(json!({"Leaf": "main", "Siblings": ["App", "app"]}))),
+            "gate: box payload Pair names app and App, equal ignoring case"
+        );
+        assert_eq!(
+            refused_pair(&with_pair(json!({"Leaf": "app", "Siblings": ["lib", "APP"]}))),
+            "gate: box payload Pair names APP and app, equal ignoring case",
+            "a sibling named as the leaf"
+        );
+    }
+
+    #[test]
+    fn a_pair_refuses_siblings_sharing_a_bare_repository() {
+        assert_eq!(
+            refused_pair(&with_pair(json!({"Leaf": "app", "Siblings": ["a.b", "a-b"]}))),
+            "gate: box payload Pair sibling a-b would share the bare repository a-b.git"
+        );
+        let mut worktree = with_pair(json!({"Leaf": "app-wt", "Siblings": ["App"]}));
+        worktree["Key"] = json!("app-wt-1a2b3c4d");
+        worktree["Work"] = json!(r"D:\gate-remote\work\app-wt-1a2b3c4d");
+        assert_eq!(
+            refused_pair(&worktree),
+            "gate: box payload Pair sibling App would share the bare repository App.git",
+            "a sibling named as the main checkout, whose bare is app.git"
+        );
+    }
+
+    #[test]
+    fn a_pair_needs_the_key_of_its_leaf() {
+        assert!(laid_out(&with_pair(json!({"Leaf": "app", "Siblings": ["lib"]}))).is_ok_and(|pair| pair.is_some()));
+        let refusing = |key: &str, leaf: &str| format!("gate: box payload Key {key} is not the work-folder key of the Pair's Leaf {leaf}");
+        assert_eq!(
+            refused_pair(&with_pair(json!({"Leaf": "other", "Siblings": ["lib"]}))),
+            refusing("app-1a2b3c4d", "other")
+        );
+        assert_eq!(
+            refused_pair(&with_pair(json!({"Leaf": "App", "Siblings": ["lib"]}))),
+            refusing("app-1a2b3c4d", "App"),
+            "the key keeps the leaf's case"
+        );
+        for key in ["app-1A2B3C4D", "app-1a2b3c4", "app-1a2b3c4d0", "app1a2b3c4d"] {
+            let mut payload = with_pair(json!({"Leaf": "app", "Siblings": ["lib"]}));
+            payload["Key"] = json!(key);
+            payload["Work"] = json!(format!(r"D:\gate-remote\work\{key}"));
+            assert_eq!(refused_pair(&payload), refusing(key, "app"), "{key}");
+        }
+    }
+
+    #[test]
+    fn a_pair_needs_a_bare_repository_beside_the_work_folders() {
+        assert!(
+            laid_out(&json!({"Key": "app-1a2b3c4d", "Work": WORK, "Bare": "d:/GATE-REMOTE/App.GIT", "Pair": {"Leaf": "app", "Siblings": ["lib"]}}))
+                .is_ok_and(|pair| pair.is_some()),
+            "compared without regard to case"
+        );
+        for bad in [
+            r"D:\other\app.git",
+            r"D:\gate-remote\app",
+            r"D:\gate-remote\a b.git",
+            r"D:\gate-remote\work\app.git",
+            r"D:\gate-remote\.git",
+            r"D:\gate-remote\a.b.git",
+        ] {
+            let mut payload = with_pair(json!({"Leaf": "app", "Siblings": ["lib"]}));
+            payload["Bare"] = json!(bad);
+            assert_eq!(
+                refused_pair(&payload),
+                format!(r"gate: box payload Bare must be D:\gate-remote\<name>.git with a Pair: {bad}"),
+                "{bad}"
+            );
+        }
+        let mut outside = with_pair(json!({"Leaf": "app", "Siblings": ["lib"]}));
+        outside["Work"] = json!(r"D:\gate-remote\app-1a2b3c4d");
+        assert_eq!(
+            refused_pair(&outside),
+            r"gate: box payload Work must be <root>\work\<key> with a Pair: D:\gate-remote\app-1a2b3c4d"
+        );
+    }
+
+    /// The sibling commits of `snapshots` for a pair of `lib` and `tools`; else the line refusing them.
+    fn sibling_snapshots(snapshots: &serde_json::Value) -> Result<Vec<String>, String> {
+        let mut json = with_pair(json!({"Leaf": "app", "Siblings": ["lib", "tools"]}));
+        json["SiblingSnapshots"] = snapshots.clone();
+        let payload = decoded(&json.to_string())?;
+        let pair = payload.pair()?.ok_or("a pair is given")?;
+        payload
+            .sibling_snapshots(&pair)
+            .map(|commits| commits.into_iter().map(str::to_owned).collect())
+    }
+
+    #[test]
+    fn sibling_snapshots_name_exactly_the_pairs_siblings() {
+        let other = "fedcba9876543210fedcba9876543210fedcba98";
+        assert_eq!(
+            sibling_snapshots(&json!({"tools": other, "lib": SHA})),
+            Ok(vec![SHA.to_owned(), other.to_owned()]),
+            "in the pair's order"
+        );
+        let refused = Err("gate: box payload SiblingSnapshots must name exactly the Pair's siblings: lib, tools".to_owned());
+        for bad in [
+            json!(null),
+            json!({}),
+            json!({"lib": SHA}),
+            json!({"lib": SHA, "tools": SHA, "app": SHA}),
+            json!({"lib": SHA, "Tools": SHA}),
+            json!({"lib": SHA, "other": SHA}),
+        ] {
+            assert_eq!(sibling_snapshots(&bad), refused, "{bad}");
+        }
+        assert_eq!(
+            sibling_snapshots(&json!([SHA, SHA])),
+            Err("gate: box payload SiblingSnapshots is not an object".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_sibling_snapshot_is_exactly_40_lowercase_hex_digits() {
+        let refusing = |value: &str| {
+            Err(format!(
+                "gate: remote run payload's SiblingSnapshots tools '{value}' is not a 40-hex commit sha"
+            ))
+        };
+        let upper = SHA.to_uppercase();
+        assert_eq!(sibling_snapshots(&json!({"lib": SHA, "tools": &upper})), refusing(&upper));
+        assert_eq!(sibling_snapshots(&json!({"lib": SHA, "tools": &SHA[1..]})), refusing(&SHA[1..]));
+        assert_eq!(sibling_snapshots(&json!({"lib": SHA, "tools": null})), refusing(""));
+        assert_eq!(sibling_snapshots(&json!({"lib": SHA, "tools": 3})), refusing("3"));
+        assert_eq!(sibling_snapshots(&json!({"lib": SHA, "tools": "\u{1b}"})), refusing(r"\u{1b}"));
     }
 }

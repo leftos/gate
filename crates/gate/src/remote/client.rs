@@ -698,6 +698,7 @@ impl Attempt<'_, '_> {
             full: sent.full,
             timeout: self.call.timeout,
             host: self.call.host,
+            sibling_snapshots: &[],
         };
         let run_line = payload::capped("run", payload::line("run", &payload::run_word(&location, &run))).map_err(End::Failed)?;
         let tree = self.tree(&snapshot)?;
@@ -2669,12 +2670,13 @@ enum Protocol {
     Adjusted(f64),
 }
 
-/// The start marker, the two refusal tags, the two kill tags and the adjusted line's prefix of one run, made once for
+/// The start marker, the three refusal tags, the two kill tags and the adjusted line's prefix of one run, made once for
 /// its run call's readers.
 struct ProtocolLines {
     started: String,
     busy: String,
     tools: String,
+    layout: String,
     timed_out: String,
     backstop: String,
     adjusted: String,
@@ -2687,6 +2689,7 @@ impl ProtocolLines {
             started: started_line(nonce),
             busy: refused_line(nonce, Refusal::Busy),
             tools: refused_line(nonce, Refusal::Tools),
+            layout: refused_line(nonce, Refusal::Layout),
             timed_out: killed_line(nonce, BoxKill::TimedOut),
             backstop: killed_line(nonce, BoxKill::Backstop),
             adjusted: adjusted_prefix(nonce),
@@ -2701,6 +2704,7 @@ impl ProtocolLines {
             (&self.started, Protocol::Started),
             (&self.busy, Protocol::Refused(FallbackReason::Busy)),
             (&self.tools, Protocol::Refused(FallbackReason::Tools)),
+            (&self.layout, Protocol::Refused(FallbackReason::Layout)),
             (&self.timed_out, Protocol::Killed(BoxKill::TimedOut)),
             (&self.backstop, Protocol::Killed(BoxKill::Backstop)),
         ]

@@ -94,7 +94,8 @@ pub struct HistoryRun {
     pub host: Option<String>,
     /// Why the run, routed to the remote pool, was sent back to the local queue: `full` (the pool stayed full for
     /// 60 s), `busy` (the box's work folder is locked by another run), `unreachable`, `rebooted`, `parity`, `tools`
-    /// (the box could not restore the repo's dotnet local tools), `version` (the box's gate is of another version) or
+    /// (the box could not restore the repo's dotnet local tools), `layout` (the box could not clear or lay out the
+    /// work folder for the run's repos), `version` (the box's gate is of another version) or
     /// `client` (the remote client could not start); `unknown` when the line names none. `None` when it was not.
     pub fallback: Option<String>,
     /// The run's own gate's pid, from its run key.

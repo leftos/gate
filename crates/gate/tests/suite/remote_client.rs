@@ -24,8 +24,8 @@ use sha2::{Digest, Sha256};
 use crate::durations::seed;
 use crate::support::{
     ANSWERING, Case, FAKE_SSH, FAKE_TOOL, GATE, GATE_VARIABLE, GIT_REDIRECTS, Go, Outcome, PREFLIGHT_SEAMS_VARIABLE, Running, STEPS_VARIABLE,
-    allow_breakaway, beside, build_version, calls, copy_tool, events, finish, git, git_init, heavy_words, nothing_back, release, shown, ssh_steps,
-    start, wait_for_journal_line, wait_until, wait_until_closed, write_remote_json,
+    allow_breakaway, beside, build_version, calls, copy_tool, events, finish, git, git_init, heavy_words, junction, nothing_back, release, shown,
+    ssh_steps, start, wait_for_journal_line, wait_until, wait_until_closed, write_remote_json,
 };
 
 const HOST: &str = "builder";
@@ -999,6 +999,42 @@ fn a_tools_refusal_of_the_box_falls_back_and_runs_the_command_here_once() {
     assert_eq!(calls(&steps), ["preflight", "run"]);
 }
 
+/// The box cannot clear the work folder, whose record says another layout, for a file held open in it, so it refuses
+/// the run `layout`.
+#[test]
+fn a_layout_refusal_of_the_box_falls_back_with_its_line_and_runs_the_command_here_once() {
+    let case = client_case("client-layout-refused");
+    let first = ssh_steps(&case, "first", &["ok", "ok"]);
+    let named = finish(client_gate(&case, "first.log", &first, &[r".\tool.exe", "out", "ran there"]));
+    assert_eq!(named.code, Some(0), "{named:?}");
+    let work = case.folder().join("builder").join("work").join(key_of(&events(&case)));
+    fs::write(format!("{}.layout", shown(&work)), "pair app lib").expect("the record can be written");
+    let held = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .share_mode(0)
+        .open(work.join("held.txt"))
+        .expect("a file in the work folder can be held");
+    let second = ssh_steps(&case, "second", &["ok", "ok"]);
+
+    let (pid, outcome) = finish_with_pid(client_gate(&case, "second.log", &second, &[r".\tool.exe", "mark", RAN, "out", "ran"]));
+    drop(held);
+
+    assert_eq!(outcome.code, Some(0), "the run here passed: {outcome:?}");
+    assert_eq!(fallbacks(&own(&case, pid)), ["layout"], "{outcome:?}");
+    let repo = repo_name(&case.folder().file_name().expect("the case folder has a name").to_string_lossy());
+    let line = format!("gate: not routed: the builder could not clear {repo}'s work folder: ");
+    assert!(
+        outcome.stderr.lines().any(|said| said.starts_with(&line) && said.contains("held.txt")),
+        "the box's line is passed on: {outcome:?}"
+    );
+    assert!(outcome.stderr.contains("gate: remote builder layout; running here"), "{outcome:?}");
+    assert_eq!(runs(&case), (1, 0), "the command ran once, here: {outcome:?}");
+    assert_eq!(calls(&second), ["preflight", "run"]);
+}
+
 #[test]
 fn a_run_call_longer_than_the_cap_fails_before_anything_is_sent() {
     let case = client_case("client-cap");
@@ -1393,15 +1429,7 @@ impl Junction {
         let link = PathBuf::from(link);
         // A junction an earlier run of the case left would make `mklink` refuse.
         drop(fs::remove_dir(&link));
-        let made = Command::new("cmd")
-            .args(["/c", "mklink", "/J"])
-            .arg(&link)
-            .arg(target)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .status()
-            .expect("cmd starts");
-        assert!(made.success(), "the junction is made");
+        junction(&link, target);
         Junction(link)
     }
 }

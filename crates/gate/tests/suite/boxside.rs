@@ -17,8 +17,8 @@ use regex::Regex;
 use serde_json::{Value, json};
 
 use crate::support::{
-    Case, Closed, Escapee, FAKE_TOOL, GIT_REDIRECTS, Go, Outcome, Running, allow_breakaway, box_payload, build_version, copy_tool, finish, shown,
-    start, start_with_closed, wait_until, wait_until_closed,
+    Case, Closed, Escapee, FAKE_TOOL, GIT_REDIRECTS, Go, Outcome, Running, allow_breakaway, box_payload, build_version, copy_tool, finish, junction,
+    shown, start, start_with_closed, wait_until, wait_until_closed,
 };
 
 mod outputs;
@@ -194,14 +194,18 @@ fn preflight_creates_the_bare_repo_and_work_folder() {
 }
 
 #[test]
-fn preflight_keeps_alternates_with_other_content_and_rewrites_an_empty_one() {
-    let case = Case::new("preflight_keeps_alternates_with_other_content");
+fn preflight_rewrites_alternates_with_other_content_and_an_empty_one() {
+    let case = Case::new("preflight_rewrites_alternates_with_other_content");
     let folders = Folders::new(&case);
     passed(&gate_box(&case, "preflight", &folders.payload(), None));
 
     fs::write(folders.alternates_path(), "C:/other/objects\n").expect("the alternates file can be written");
     passed(&gate_box(&case, "preflight", &folders.payload(), None));
-    assert_eq!(folders.alternates(), b"C:/other/objects\n", "other content is kept");
+    assert_eq!(
+        folders.alternates(),
+        folders.written_alternates(),
+        "other content names the tree's own bare again"
+    );
 
     fs::write(folders.alternates_path(), "").expect("the alternates file can be emptied");
     passed(&gate_box(&case, "preflight", &folders.payload(), None));
@@ -212,8 +216,8 @@ fn preflight_keeps_alternates_with_other_content_and_rewrites_an_empty_one() {
 fn preflight_a_failing_git_step_exits_with_its_status() {
     let case = Case::new("preflight_a_failing_git_step");
     let folders = Folders::new(&case);
-    fs::create_dir_all(&folders.work).expect("the work folder can be made");
-    fs::write(Path::new(&folders.work).join(".git"), "junk").expect("a junk .git file can be written");
+    // An empty `.git` folder is no repository, so its first git step fails; a `.git` that is not a folder is skipped.
+    fs::create_dir_all(Path::new(&folders.work).join(".git")).expect("an empty .git folder can be made");
     let shape = Regex::new(r"(?m)^gate: remote git [a-z .-]+ failed \(status (-?\d+)\)$").expect("the pattern compiles");
 
     let outcome = gate_box(&case, "preflight", &folders.payload(), None);
@@ -840,7 +844,13 @@ fn snapshot(case: &Case, payload: &mut Value, files: &[(&str, &str)]) -> String 
 /// repository, as the client sends a snapshot, leaving the payload's `Snapshot` as it is; the commit. The payload's
 /// work folder must have had a preflight, which makes the bare repository; this makes the source repository.
 fn push_snapshot(case: &Case, payload: &Value, files: &[(&str, &str)]) -> String {
-    let source = case.folder().join("source");
+    push_repo_snapshot(case, "source", field(payload, "Bare"), field(payload, "Key"), files)
+}
+
+/// Commits `files` in the case's source repository `source`, made when missing, and pushes the commit to
+/// `refs/gate/<key>` in the bare repository `bare`, as the client sends a snapshot of one repo; the commit.
+fn push_repo_snapshot(case: &Case, source: &str, bare: &str, key: &str, files: &[(&str, &str)]) -> String {
+    let source = case.folder().join(source);
     let source_text = source.to_str().expect("the case folder is Unicode").to_owned();
     if !source.exists() {
         git(&["init", "-q", &source_text]);
@@ -865,18 +875,64 @@ fn push_snapshot(case: &Case, payload: &Value, files: &[(&str, &str)]) -> String
         "-m",
         "snapshot",
     ]);
-    let target = format!("HEAD:refs/gate/{}", field(payload, "Key"));
-    git(&["-C", &source_text, "push", "-q", "--force", field(payload, "Bare"), &target]);
+    let target = format!("HEAD:refs/gate/{key}");
+    git(&["-C", &source_text, "push", "-q", "--force", bare, &target]);
     git(&["-C", &source_text, "rev-parse", "HEAD"])
+}
+
+/// The work-folder key of the leaf `app`, as the client makes it, which a pair payload's `Key` must be.
+const PAIR_KEY: &str = "app-1a2b3c4d";
+
+/// The payload of a `gate box run` of `command` for the sibling pair of the main checkout `app` and `siblings`, laid
+/// out as [`box_payload`] lays out a run of one repo, under the key [`PAIR_KEY`].
+fn pair_payload(case: &Case, siblings: &[&str], command: &[&str]) -> Value {
+    let mut payload = box_payload(case, PAIR_KEY, command);
+    payload["Pair"] = json!({"Leaf": "app", "Siblings": siblings});
+    payload
+}
+
+/// The bare repository of the sibling `name` of `payload`, beside the main repo's, as the box derives it.
+fn sibling_bare(payload: &Value, name: &str) -> String {
+    let bare = Path::new(field(payload, "Bare")).with_file_name(format!("{name}.git"));
+    bare.to_str().expect("the case folder is Unicode").to_owned()
+}
+
+/// The tree of the repo `name`, the leaf or a sibling, in the work folder of the pair payload `payload`.
+fn pair_tree(payload: &Value, name: &str) -> String {
+    let tree = Path::new(field(payload, "Work")).join(name);
+    tree.to_str().expect("the case folder is Unicode").to_owned()
+}
+
+/// Readies the pair payload's bare repositories with a preflight, then commits `main` in the case's source repository
+/// and each sibling's files in a source repository of its own, pushes each commit to `refs/gate/<key>` in its repo's
+/// bare repository, and records them as the payload's `Snapshot` and `SiblingSnapshots`; the commits, the main first.
+fn pair_snapshot(case: &Case, payload: &mut Value, main: &[(&str, &str)], siblings: &[(&str, &[(&str, &str)])]) -> Vec<String> {
+    allow_breakaway();
+    passed(&gate_box(case, "preflight", &self::payload(payload), None));
+    let mut commits = vec![push_snapshot(case, payload, main)];
+    let mut snapshots = serde_json::Map::new();
+    for (name, files) in siblings {
+        let commit = push_repo_snapshot(case, &format!("source-{name}"), &sibling_bare(payload, name), PAIR_KEY, files);
+        snapshots.insert((*name).to_owned(), json!(commit));
+        commits.push(commit);
+    }
+    payload["Snapshot"] = json!(commits[0]);
+    payload["SiblingSnapshots"] = Value::Object(snapshots);
+    commits
 }
 
 /// Whether the bare repository of `payload` has the ref `name`.
 fn has_ref(payload: &Value, name: &str) -> bool {
+    has_ref_in(field(payload, "Bare"), name)
+}
+
+/// Whether the bare repository `bare` has the ref `name`.
+fn has_ref_in(bare: &str, name: &str) -> bool {
     let mut command = Command::new("git");
     for variable in GIT_REDIRECTS {
         command.env_remove(variable);
     }
-    let bare = format!("--git-dir={}", field(payload, "Bare"));
+    let bare = format!("--git-dir={bare}");
     let output = command
         .args([bare.as_str(), "rev-parse", "--verify", "-q", name])
         .output()
@@ -2387,6 +2443,855 @@ fn box_run_says_a_snapshot_missing_after_the_fetch() {
     assert_eq!(git(&["-C", field(&payload, "Work"), "rev-parse", "HEAD"]), head, "HEAD stands");
     assert!(work.join("untracked.txt").exists(), "the untracked file stands");
     assert!(has_ref(&payload, "refs/gate-back/k"), "the back ref stands");
+}
+
+#[test]
+fn preflight_with_a_pair_creates_each_bare_and_nothing_in_the_work_folder() {
+    let case = Case::new("preflight_with_a_pair_creates_each_bare");
+    let payload = pair_payload(&case, &["lib", "tools"], &[]);
+    let work = PathBuf::from(field(&payload, "Work"));
+    let folder = work.parent().expect("the work folder has a parent");
+    fs::create_dir_all(folder).expect("the work folder's parent can be made");
+    // Held as a run of the key holds it: the preflight takes no lock, so it must change nothing inside the work folder.
+    let _lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .share_mode(0)
+        .open(field(&payload, "Lock"))
+        .expect("the lock can be taken");
+
+    let outcome = gate_box(&case, "preflight", &self::payload(&payload), None);
+
+    let printed = passed(&outcome);
+    let bares = [
+        field(&payload, "Bare").to_owned(),
+        sibling_bare(&payload, "lib"),
+        sibling_bare(&payload, "tools"),
+    ];
+    let created: Vec<String> = printed.iter().take(3).map(|line| (*line).to_owned()).collect();
+    assert_eq!(
+        created,
+        bares.iter().map(|bare| format!("gate: remote created {bare}")).collect::<Vec<_>>(),
+        "{outcome:?}"
+    );
+    assert_eq!(printed.len(), 6, "the created lines, then the version, boot and sdks lines: {outcome:?}");
+    for bare in &bares {
+        assert_eq!(
+            git(&[&format!("--git-dir={bare}"), "rev-parse", "--is-bare-repository"]),
+            "true",
+            "{bare}"
+        );
+    }
+    assert!(!work.exists(), "nothing is made at or in the work folder: {outcome:?}");
+    let beside: Vec<String> = fs::read_dir(folder)
+        .expect("the work folder's parent can be listed")
+        .map(|entry| entry.expect("an entry can be read").file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(beside, [format!("{PAIR_KEY}.lock")], "only the held lock is beside it");
+}
+
+#[test]
+fn box_run_with_a_pair_checks_out_each_repo_in_its_own_folder() {
+    let case = Case::new("box_run_pair_checks_out_each_repo");
+    let mut payload = pair_payload(&case, &["lib", "tools"], &[r".\show.cmd"]);
+    let show = "@type a.txt\r\n@type ..\\lib\\b.txt\r\n@type ..\\tools\\c.txt\r\n";
+    let commits = pair_snapshot(
+        &case,
+        &mut payload,
+        &[("show.cmd", show), ("a.txt", "main\n")],
+        &[("lib", &[("b.txt", "lib\n")]), ("tools", &[("c.txt", "tools\n")])],
+    );
+
+    let outcome = run_box(&case, &payload);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(
+        outcome.stdout, "main\nlib\ntools\n",
+        "the command runs in the main tree and finds each sibling beside it"
+    );
+    for (name, commit) in ["app", "lib", "tools"].iter().zip(&commits) {
+        assert_eq!(
+            &git(&["-C", &pair_tree(&payload, name), "rev-parse", "HEAD"]),
+            commit,
+            "{name} is at its own snapshot"
+        );
+    }
+    let alternates = Path::new(&pair_tree(&payload, "lib")).join(r".git\objects\info\alternates");
+    assert_eq!(
+        fs::read(alternates).expect("the sibling's alternates file can be read"),
+        format!("{}/objects\n", sibling_bare(&payload, "lib").replace('\\', "/")).into_bytes(),
+        "a sibling's tree borrows its own bare repository's objects"
+    );
+    let mut entries = work_entries(&payload);
+    entries.sort();
+    assert_eq!(
+        entries,
+        ["app", "lib", "tools"],
+        "the work folder holds the trees and no repository of its own"
+    );
+}
+
+#[test]
+fn box_run_with_a_pair_names_the_repo_in_a_failed_step() {
+    let case = Case::new("box_run_pair_names_the_repo");
+    let mut payload = pair_payload(&case, &["lib"], &[FAKE_TOOL, "out", "ran"]);
+    allow_breakaway();
+    passed(&gate_box(&case, "preflight", &self::payload(&payload), None));
+    let main = push_snapshot(&case, &payload, &[("a.txt", "a\n")]);
+    payload["Snapshot"] = json!(main);
+    payload["SiblingSnapshots"] = json!({"lib": main});
+    let fetch = Regex::new(r"(?m)^gate: remote fetch lib failed \(status (-?\d+)\)$").expect("the pattern compiles");
+
+    // Nothing pushed to the sibling's bare repository yet: its fetch fails.
+    let outcome = run_box(&case, &payload);
+
+    let captures = fetch.captures(&outcome.stderr).expect("the fetch's line names the sibling");
+    let status: i32 = captures[1].parse().expect("the status is a number");
+    assert_ne!(status, 0, "{outcome:?}");
+    assert_eq!(outcome.code, Some(status), "{outcome:?}");
+    assert_eq!(outcome.stdout, "", "the command never ran");
+    assert_eq!(
+        git(&["-C", &pair_tree(&payload, "app"), "rev-parse", "HEAD"]),
+        main,
+        "the main repo, first, was checked out"
+    );
+
+    // The sibling's ref pushed, but the payload names a commit only the main repo has.
+    push_repo_snapshot(&case, "source-lib", &sibling_bare(&payload, "lib"), PAIR_KEY, &[("b.txt", "b\n")]);
+    let outcome = run_box(&case, &renamed(&payload, 1));
+
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert_eq!(outcome.stdout, "", "the command never ran");
+    assert!(
+        outcome
+            .stderr
+            .lines()
+            .any(|line| line == format!("gate: remote snapshot {main} is not in the repository of lib after the fetch")),
+        "the missing snapshot's line names the sibling: {outcome:?}"
+    );
+}
+
+#[test]
+fn box_run_git_in_a_tree_ignores_a_core_worktree_pointing_elsewhere() {
+    let case = Case::new("box_run_ignores_core_worktree");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "exit", "0"]);
+    snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
+    let canary = case.folder().join("canary");
+    fs::create_dir_all(&canary).expect("the canary folder can be made");
+    fs::write(canary.join("untracked.txt"), "keep").expect("the canary's file can be written");
+    let canary_text = canary.to_str().expect("the case folder is Unicode");
+    git(&["-C", field(&payload, "Work"), "config", "core.worktree", canary_text]);
+
+    let outcome = run_box(&case, &payload);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(
+        canary.join("untracked.txt").exists(),
+        "the clean never reaches the folder core.worktree names"
+    );
+    assert!(!canary.join("a.txt").exists(), "nor does the checkout");
+    assert!(
+        Path::new(field(&payload, "Work")).join("a.txt").is_file(),
+        "the snapshot is checked out in the tree"
+    );
+}
+
+#[test]
+fn box_run_with_a_pair_writes_a_back_commit_per_changed_repo() {
+    let case = Case::new("box_run_pair_back_commit_per_repo");
+    let mut payload = pair_payload(&case, &["lib", "tools"], &[r".\change.cmd"]);
+    let change = "@echo changed> a.txt\r\n@echo changed> ..\\lib\\b.txt\r\n";
+    let commits = pair_snapshot(
+        &case,
+        &mut payload,
+        &[("change.cmd", change), ("a.txt", "main\n")],
+        &[("lib", &[("b.txt", "lib\n")]), ("tools", &[("c.txt", "tools\n")])],
+    );
+
+    let outcome = run_box(&case, &payload);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let back = format!("refs/gate-back/{PAIR_KEY}");
+    let main_bare = field(&payload, "Bare").to_owned();
+    for (bare, commit, file) in [(main_bare, &commits[0], "a.txt"), (sibling_bare(&payload, "lib"), &commits[1], "b.txt")] {
+        let git_dir = format!("--git-dir={bare}");
+        assert!(has_ref_in(&bare, &back), "{bare} has its own back commit: {outcome:?}");
+        assert_eq!(&git(&[&git_dir, "rev-parse", &format!("{back}^")]), commit, "{bare}: on its own snapshot");
+        assert_eq!(
+            git(&[&git_dir, "show", &format!("{back}:{file}")]),
+            "changed",
+            "{bare}: with its own change"
+        );
+    }
+    assert!(
+        !has_ref_in(&sibling_bare(&payload, "tools"), &back),
+        "an unchanged repo gets no back commit"
+    );
+}
+
+/// A canary folder beside the case folder, so outside every folder the box lays out, holding only `keep.txt`; made
+/// afresh, an earlier run's removed first.
+fn canary(case: &Case, name: &str) -> PathBuf {
+    let mut folder = case.folder().into_os_string();
+    folder.push(format!("-{name}"));
+    let folder = PathBuf::from(folder);
+    if folder.exists() {
+        fs::remove_dir_all(&folder).expect("an earlier run's canary can be removed");
+    }
+    fs::create_dir_all(&folder).expect("the canary folder can be made");
+    fs::write(folder.join("keep.txt"), "keep").expect("the canary's file can be written");
+    folder
+}
+
+/// The names in `folder`.
+fn entries_of(folder: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(folder)
+        .expect("the folder can be listed")
+        .map(|entry| entry.expect("an entry can be read").file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+/// Whether nothing, not even a link, has the name `path`.
+fn is_gone(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_err()
+}
+
+/// Whether `path` is a folder itself, not a link or a junction.
+fn is_real_folder(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir())
+}
+
+/// The text of the work folder's layout record, `{Work}.layout`, empty when there is none.
+fn layout_record(payload: &Value) -> String {
+    fs::read_to_string(format!("{}.layout", field(payload, "Work"))).unwrap_or_default()
+}
+
+/// The pair payload of `app` and `lib` whose command, `.\change.cmd`, changes the main tree's `a.txt`, its snapshots
+/// pushed; the commits, the main first.
+fn changing_pair(case: &Case) -> (Value, Vec<String>) {
+    let mut payload = pair_payload(case, &["lib"], &[r".\change.cmd"]);
+    let commits = pair_snapshot(
+        case,
+        &mut payload,
+        &[("change.cmd", "@echo changed> a.txt\r\n"), ("a.txt", "main\n")],
+        &[("lib", &[("b.txt", "lib\n")])],
+    );
+    (payload, commits)
+}
+
+#[test]
+fn preflight_skips_a_junction_at_the_objects_info_folder_and_the_run_repairs_it() {
+    let case = Case::new("preflight_skips_info_junction");
+    let mut json = box_payload(&case, "k", &[FAKE_TOOL, "exit", "0"]);
+    let commit = snapshot(&case, &mut json, &[("a.txt", "a\n")]);
+    assert_eq!(run_box(&case, &json).code, Some(0), "the first run passes");
+    let work = PathBuf::from(field(&json, "Work"));
+    let info = work.join(r".git\objects\info");
+    fs::remove_dir_all(&info).expect("the info folder can be removed");
+    let target = canary(&case, "canary");
+    junction(&info, &target);
+
+    passed(&gate_box(&case, "preflight", &payload(&json), None));
+    assert_eq!(entries_of(&target), ["keep.txt"], "the preflight leaves the junction's target alone");
+
+    let outcome = run_box(&case, &renamed(&json, 1));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(entries_of(&target), ["keep.txt"], "the run leaves the junction's target alone");
+    assert!(is_real_folder(&info), "the info folder is a folder again");
+    assert_eq!(git(&["-C", &shown(&work), "rev-parse", "HEAD"]), commit, "at the snapshot");
+    passed(&gate_box(&case, "preflight", &payload(&json), None));
+}
+
+/// A key folder of one repo, its first run passed, whose `Work\.git` `link` makes lead to a canary repository: a
+/// preflight passes and leaves the canary's config and alternates file byte-identical, and the next run checks out the
+/// snapshot in a `.git` folder of the tree's own.
+fn preflight_leaves_the_repository_a_linked_git_leads_to_alone(name: &str, link: fn(&Path, &Path)) {
+    let case = Case::new(name);
+    let mut json = box_payload(&case, "k", &[FAKE_TOOL, "exit", "0"]);
+    let commit = snapshot(&case, &mut json, &[("a.txt", "a\n")]);
+    assert_eq!(run_box(&case, &json).code, Some(0), "the first run passes");
+    let target = canary(&case, "canary-repo");
+    git(&["init", "-q", &shown(&target)]);
+    let canary_git = target.join(".git");
+    let looked = || {
+        let config = fs::read(canary_git.join("config")).expect("the canary's config can be read");
+        (config, fs::read(canary_git.join(r"objects\info\alternates")).ok())
+    };
+    let before = looked();
+    let work_git = Path::new(field(&json, "Work")).join(".git");
+    fs::remove_dir_all(&work_git).expect("the work folder's .git can be removed");
+    link(&work_git, &canary_git);
+
+    passed(&gate_box(&case, "preflight", &payload(&json), None));
+    assert_eq!(looked(), before, "the preflight leaves the canary's config, remotes and alternates alone");
+
+    let outcome = run_box(&case, &renamed(&json, 1));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(looked(), before, "the run leaves the canary's config, remotes and alternates alone");
+    assert!(is_real_folder(&work_git), "the work folder's .git is a folder again");
+    assert_eq!(git(&["-C", field(&json, "Work"), "rev-parse", "HEAD"]), commit, "at the snapshot");
+}
+
+#[test]
+fn preflight_of_one_repo_leaves_the_repository_a_junction_at_its_git_leads_to_alone() {
+    preflight_leaves_the_repository_a_linked_git_leads_to_alone("preflight_git_junction_canary", junction);
+}
+
+#[test]
+fn preflight_of_one_repo_leaves_the_repository_a_gitdir_file_at_its_git_names_alone() {
+    preflight_leaves_the_repository_a_linked_git_leads_to_alone("preflight_gitdir_file_canary", |link, target| {
+        fs::write(link, format!("gitdir: {}\n", shown(target))).expect("the gitdir file can be written");
+    });
+}
+
+#[test]
+fn preflight_of_one_repo_leaves_the_config_a_link_at_its_git_config_leads_to_alone() {
+    let case = Case::new("preflight_git_config_link_canary");
+    let mut json = box_payload(&case, "k", &[FAKE_TOOL, "exit", "0"]);
+    let commit = snapshot(&case, &mut json, &[("a.txt", "a\n")]);
+    assert_eq!(run_box(&case, &json).code, Some(0), "the first run passes");
+    let target = canary(&case, "canary-repo");
+    git(&["init", "-q", &shown(&target)]);
+    let canary_config = target.join(r".git\config");
+    let before = fs::read(&canary_config).expect("the canary's config can be read");
+    let config = Path::new(field(&json, "Work")).join(r".git\config");
+    fs::remove_file(&config).expect("the work folder's config can be removed");
+    std::os::windows::fs::symlink_file(&canary_config, &config).expect("this machine lets a test make a symbolic link");
+
+    passed(&gate_box(&case, "preflight", &payload(&json), None));
+    assert_eq!(
+        fs::read(&canary_config).expect("the canary's config can be read"),
+        before,
+        "the preflight leaves the canary's config alone"
+    );
+
+    let outcome = run_box(&case, &renamed(&json, 1));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(
+        fs::read(&canary_config).expect("the canary's config can be read"),
+        before,
+        "the run leaves the canary's config alone"
+    );
+    assert!(
+        fs::symlink_metadata(&config).is_ok_and(|metadata| metadata.is_file()),
+        "the work folder's config is a file of its own again"
+    );
+    assert_eq!(git(&["-C", field(&json, "Work"), "rev-parse", "HEAD"]), commit, "at the snapshot");
+}
+
+#[test]
+fn box_run_of_one_repo_replaces_a_dangling_junction_at_its_objects_folder() {
+    let case = Case::new("box_run_dangling_objects_junction");
+    let mut json = box_payload(&case, "k", &[FAKE_TOOL, "exit", "0"]);
+    let commit = snapshot(&case, &mut json, &[("a.txt", "a\n")]);
+    assert_eq!(run_box(&case, &json).code, Some(0), "the first run passes");
+    let work = PathBuf::from(field(&json, "Work"));
+    let objects = work.join(r".git\objects");
+    fs::remove_dir_all(&objects).expect("the objects folder can be removed");
+    let target = canary(&case, "canary");
+    junction(&objects, &target);
+    fs::remove_dir_all(&target).expect("the junction's target can be removed");
+
+    passed(&gate_box(&case, "preflight", &payload(&json), None));
+    assert!(is_gone(&target), "the preflight makes nothing at the junction's target");
+    assert!(
+        !is_gone(&objects) && !is_real_folder(&objects),
+        "the preflight leaves the junction in place"
+    );
+
+    let outcome = run_box(&case, &renamed(&json, 1));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(is_real_folder(&objects), "the objects folder is a folder again");
+    assert!(is_gone(&target), "the run makes nothing at the junction's target");
+    assert_eq!(git(&["-C", &shown(&work), "rev-parse", "HEAD"]), commit, "at the snapshot");
+    let again = run_box(&case, &renamed(&json, 2));
+    assert_eq!(again.code, Some(0), "a second run passes: {again:?}");
+}
+
+#[test]
+fn box_run_with_a_pair_names_the_repo_after_its_failing_tree_step() {
+    let case = Case::new("box_run_pair_names_failing_tree_step");
+    let (json, _) = changing_pair(&case);
+    assert_eq!(run_box(&case, &json).code, Some(0), "the first run lays out the pair");
+    let lib_git = Path::new(&pair_tree(&json, "lib")).join(".git");
+    fs::remove_dir_all(&lib_git).expect("lib's .git can be removed");
+    fs::create_dir(&lib_git).expect("an empty .git folder can be made");
+
+    let outcome = run_box(&case, &renamed(&json, 1));
+
+    assert_ne!(outcome.code, Some(0), "{outcome:?}");
+    assert!(
+        outcome.stderr.contains("gate: remote git remote add failed for lib (status "),
+        "{outcome:?}"
+    );
+}
+
+#[test]
+fn preflight_with_a_pair_names_the_repo_whose_bare_repository_it_cannot_create() {
+    let case = Case::new("preflight_pair_names_failing_bare");
+    let json = pair_payload(&case, &["lib"], &[FAKE_TOOL, "exit", "0"]);
+    let stub = case.folder().join("stub-git");
+    fs::create_dir_all(&stub).expect("the stub folder can be made");
+    fs::write(
+        stub.join("git.cmd"),
+        format!(
+            concat!(
+                "@echo off\r\n",
+                "echo %*| findstr /c:\"init --bare\" >nul || goto real\r\n",
+                "echo %*| findstr /i /c:\"lib.git\" >nul || goto real\r\n",
+                "exit /b 3\r\n:real\r\n\"{}\" %*\r\n",
+            ),
+            shown(&git_folder().join("git.exe"))
+        ),
+    )
+    .expect("the git stub can be written");
+
+    let outcome = gate_box(&case, "preflight", &payload(&json), Some(&path_for_run(&[stub])));
+
+    assert_eq!(outcome.code, Some(3), "{outcome:?}");
+    assert_eq!(outcome.stderr.trim_end(), "gate: remote git init --bare failed for lib (status 3)");
+}
+
+#[test]
+fn box_run_of_one_repo_replaces_a_junction_at_its_git_folder_and_leaves_its_target_alone() {
+    let case = Case::new("box_run_replaces_work_git_junction");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "exit", "0"]);
+    let commit = snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
+    assert_eq!(run_box(&case, &payload).code, Some(0), "the first run passes");
+    let target = canary(&case, "canary-repo");
+    let target_text = shown(&target);
+    git(&["init", "-q", &target_text]);
+    let looked = || {
+        let config = fs::read(target.join(r".git\config")).expect("the canary's config can be read");
+        let head = fs::read(target.join(r".git\HEAD")).expect("the canary's HEAD can be read");
+        (config, head, git(&["-C", &target_text, "for-each-ref"]))
+    };
+    let before = looked();
+    let work_git = Path::new(field(&payload, "Work")).join(".git");
+    fs::remove_dir_all(&work_git).expect("the work folder's .git can be removed");
+    junction(&work_git, &target.join(".git"));
+
+    let outcome = run_box(&case, &renamed(&payload, 1));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(looked(), before, "the canary repository's config, HEAD and refs are untouched");
+    assert!(is_real_folder(&work_git), "the work folder's .git is a folder again");
+    assert_eq!(git(&["-C", field(&payload, "Work"), "rev-parse", "HEAD"]), commit, "at the snapshot");
+}
+
+#[test]
+fn box_run_clearing_a_layout_removes_a_junction_without_following_it() {
+    let case = Case::new("box_run_clearing_removes_a_junction");
+    let (payload, _) = changing_pair(&case);
+    let (first, second) = (canary(&case, "canary"), canary(&case, "canary2"));
+    let work = PathBuf::from(field(&payload, "Work"));
+    fs::create_dir_all(work.join(r"old2\node_modules")).expect("the stale folders can be made");
+    junction(&work.join("old"), &first);
+    junction(&work.join(r"old2\node_modules\x"), &second);
+
+    // No record is a run of one repo's layout, so the pair's first run clears the work folder.
+    let outcome = run_box(&case, &payload);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    for canary in [&first, &second] {
+        assert_eq!(entries_of(canary), ["keep.txt"], "{} keeps its file: {outcome:?}", canary.display());
+    }
+    assert!(is_gone(&work.join("old")), "the junction is gone");
+    assert!(is_gone(&work.join("old2")), "the folder holding a junction is gone");
+    assert_eq!(entries_of(&work), ["app", "lib"], "only the pair's trees");
+    assert!(
+        layout_record(&payload).eq_ignore_ascii_case("pair app lib"),
+        "the record names the pair: {:?}",
+        layout_record(&payload)
+    );
+}
+
+#[test]
+fn box_run_that_cannot_clear_a_held_file_refuses_before_the_command() {
+    let case = Case::new("box_run_cannot_clear_a_held_file");
+    let marker = case.folder().join("marker");
+    let mut payload = pair_payload(&case, &["lib"], &[FAKE_TOOL, "mark", &shown(&marker)]);
+    pair_snapshot(&case, &mut payload, &[("a.txt", "a\n")], &[("lib", &[("b.txt", "b\n")])]);
+    let old = PathBuf::from(field(&payload, "Work")).join("old");
+    fs::create_dir_all(&old).expect("the stale folder can be made");
+    let held = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .share_mode(0)
+        .open(old.join("held.txt"))
+        .expect("the stale file can be held");
+
+    let outcome = run_box(&case, &payload);
+
+    assert_eq!(outcome.code, Some(75), "{outcome:?}");
+    let said = lines(&outcome.stderr);
+    let tag = format!("gate-remote-refused: {} layout", field(&payload, "Nonce"));
+    let refused = said.iter().position(|line| *line == tag).expect("the box says the layout tag");
+    let line = format!("gate: not routed: the builder could not clear {PAIR_KEY}'s work folder: ");
+    let why = said
+        .get(refused + 1)
+        .and_then(|next| next.strip_prefix(line.as_str()))
+        .expect("the owner's line follows the tag");
+    assert!(why.contains(&shown(&old)), "the line names what could not be removed: {why}");
+    assert!(!outcome.stderr.contains("gate-remote-started:"), "refused before the start marker");
+    assert!(!marker.exists(), "the command never ran");
+    assert_eq!(layout_record(&payload), "changing", "the record says the clear did not finish");
+
+    drop(held);
+    let again = run_box(&case, &renamed(&payload, 1));
+
+    assert_eq!(again.code, Some(0), "a clear that did not finish clears again: {again:?}");
+    assert!(is_gone(&old), "the stale folder is gone");
+    assert!(marker.exists(), "the command ran");
+}
+
+#[test]
+fn box_run_replaces_a_junction_where_a_tree_or_its_git_folder_should_be() {
+    let case = Case::new("box_run_replaces_a_junction_tree");
+    let (payload, commits) = changing_pair(&case);
+    assert_eq!(run_box(&case, &payload).code, Some(0), "the first run lays out the pair");
+    let lib = PathBuf::from(pair_tree(&payload, "lib"));
+    let lib_git = lib.join(".git");
+    let first = canary(&case, "canary");
+    fs::remove_dir_all(&lib).expect("the sibling's tree can be removed");
+    junction(&lib, &first);
+
+    let outcome = run_box(&case, &renamed(&payload, 1));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(entries_of(&first), ["keep.txt"], "the canary is untouched");
+    assert!(is_real_folder(&lib), "the tree is a folder again");
+    assert_eq!(git(&["-C", &shown(&lib), "rev-parse", "HEAD"]), commits[1], "at its snapshot");
+
+    let second = canary(&case, "canary2");
+    fs::remove_dir_all(&lib_git).expect("the sibling's .git can be removed");
+    junction(&lib_git, &second);
+
+    let outcome = run_box(&case, &renamed(&payload, 2));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(entries_of(&second), ["keep.txt"], "the canary is untouched");
+    assert!(is_real_folder(&lib_git), "the .git is a folder again");
+    assert_eq!(git(&["-C", &shown(&lib), "rev-parse", "HEAD"]), commits[1], "at its snapshot");
+}
+
+#[test]
+fn box_run_pair_then_single_leaves_no_gitlink_and_no_leaf_folder() {
+    let case = Case::new("box_run_pair_then_single");
+    let (pair, commits) = changing_pair(&case);
+    assert_eq!(run_box(&case, &pair).code, Some(0), "the pair run passes");
+    let mut single = renamed(&pair, 1);
+    let object = single.as_object_mut().expect("the payload is an object");
+    object.remove("Pair");
+    object.remove("SiblingSnapshots");
+    passed(&gate_box(&case, "preflight", &self::payload(&single), None));
+
+    let outcome = run_box(&case, &single);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let mut entries = work_entries(&single);
+    entries.sort();
+    assert_eq!(entries, [".git", "a.txt", "change.cmd"], "the main repo's tree alone, in the work folder");
+    let bare = format!("--git-dir={}", field(&single, "Bare"));
+    let back = format!("refs/gate-back/{PAIR_KEY}");
+    assert_eq!(
+        git(&[&bare, "rev-parse", &format!("{back}^")]),
+        commits[0],
+        "the back commit is on the snapshot"
+    );
+    let listed = git(&[&bare, "ls-tree", "-r", &back]);
+    assert!(!listed.lines().any(|line| line.starts_with("160000")), "no gitlink: {listed}");
+    assert!(layout_record(&single).eq_ignore_ascii_case("single"), "{:?}", layout_record(&single));
+}
+
+#[test]
+fn box_run_single_then_pair_leaves_no_work_git_folder() {
+    let case = Case::new("box_run_single_then_pair");
+    let mut single = box_payload(&case, PAIR_KEY, &[r".\change.cmd"]);
+    snapshot(&case, &mut single, &[("change.cmd", "@echo changed> a.txt\r\n"), ("a.txt", "main\n")]);
+    assert_eq!(run_box(&case, &single).code, Some(0), "the run of one repo passes");
+    let mut pair = renamed(&single, 1);
+    pair["Pair"] = json!({"Leaf": "app", "Siblings": ["lib"]});
+    let commits = pair_snapshot(&case, &mut pair, &[("a.txt", "main again\n")], &[("lib", &[("b.txt", "lib\n")])]);
+
+    let outcome = run_box(&case, &pair);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let mut entries = work_entries(&pair);
+    entries.sort();
+    assert_eq!(entries, ["app", "lib"], "no .git and no file of the old tree in the work folder");
+    assert_eq!(git(&["-C", &pair_tree(&pair, "app"), "rev-parse", "HEAD"]), commits[0]);
+}
+
+/// The pair payload of `app`, `lib` and `tools` whose command, `.\change.cmd`, changes `a.txt` in the main tree and
+/// `b.txt` in `lib`'s, leaving `tools` unchanged, its snapshots pushed.
+fn changing_two_of_three(case: &Case) -> Value {
+    let mut payload = pair_payload(case, &["lib", "tools"], &[r".\change.cmd"]);
+    let change = "@echo changed> a.txt\r\n@echo changed> ..\\lib\\b.txt\r\n";
+    pair_snapshot(
+        case,
+        &mut payload,
+        &[("change.cmd", change), ("a.txt", "main\n")],
+        &[("lib", &[("b.txt", "lib\n")]), ("tools", &[("c.txt", "tools\n")])],
+    );
+    payload
+}
+
+#[test]
+fn box_run_clears_a_stale_sibling_back_ref_when_the_fetch_fails() {
+    let case = Case::new("box_run_clears_stale_sibling_back_ref");
+    let (payload, commits) = changing_pair(&case);
+    assert_eq!(run_box(&case, &payload).code, Some(0), "the first run passes");
+    let back = format!("refs/gate-back/{PAIR_KEY}");
+    let lib_bare = sibling_bare(&payload, "lib");
+    let lib_git = format!("--git-dir={lib_bare}");
+    git(&[&lib_git, "update-ref", &back, &commits[1]]);
+    git(&[&lib_git, "update-ref", "-d", &format!("refs/gate/{PAIR_KEY}")]);
+    assert!(has_ref(&payload, &back), "the first run left the main repo's back commit");
+
+    let outcome = run_box(&case, &renamed(&payload, 1));
+
+    assert_ne!(outcome.code, Some(0), "the sibling's fetch fails: {outcome:?}");
+    assert!(outcome.stderr.contains("gate: remote fetch lib failed"), "{outcome:?}");
+    assert!(!has_ref_in(&lib_bare, &back), "the sibling's stale back ref is gone");
+    assert!(!has_ref(&payload, &back), "and the main repo's");
+}
+
+#[test]
+fn box_run_that_fails_a_sibling_s_push_leaves_no_back_ref_in_either_bare() {
+    let case = Case::new("box_run_sibling_push_fails");
+    let payload = changing_two_of_three(&case);
+    let stub = case.folder().join("stub-git");
+    fs::create_dir_all(&stub).expect("the stub folder can be made");
+    fs::write(
+        stub.join("git.cmd"),
+        format!(
+            concat!(
+                "@echo off\r\n",
+                "echo %*| findstr /c:\" push \" >nul || goto real\r\n",
+                "echo %*| findstr /i /c:\"lib.git\" >nul || goto real\r\n",
+                "exit /b 1\r\n:real\r\n\"{}\" %*\r\n",
+            ),
+            shown(&git_folder().join("git.exe"))
+        ),
+    )
+    .expect("the git stub can be written");
+
+    let outcome = run_box_with_path(&case, &payload, Some(&path_for_run(&[stub])));
+
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert!(
+        outcome.stderr.contains("gate: remote sync-back failed: push lib failed (status 1)"),
+        "{outcome:?}"
+    );
+    let back = format!("refs/gate-back/{PAIR_KEY}");
+    assert!(!has_ref(&payload, &back), "the main repo's pushed back ref is deleted");
+    assert!(!has_ref_in(&sibling_bare(&payload, "lib"), &back), "the sibling has none");
+}
+
+#[test]
+fn box_run_with_a_pair_names_each_repo_s_back_commit() {
+    let case = Case::new("box_run_pair_names_back_commits");
+    let payload = changing_two_of_three(&case);
+
+    let outcome = run_box(&case, &payload);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let back = format!("refs/gate-back/{PAIR_KEY}");
+    let main = git(&[&format!("--git-dir={}", field(&payload, "Bare")), "rev-parse", &back]);
+    let lib = git(&[&format!("--git-dir={}", sibling_bare(&payload, "lib")), "rev-parse", &back]);
+    let line = format!("gate: remote back commits: app {main}, lib {lib}, tools none");
+    assert_eq!(
+        lines(&outcome.stderr).iter().filter(|said| **said == line).count(),
+        1,
+        "one line names each repo's back commit: {outcome:?}"
+    );
+}
+
+#[test]
+fn box_run_with_the_same_siblings_in_another_order_keeps_the_work_folder() {
+    let case = Case::new("box_run_same_siblings_other_order");
+    let mut payload = pair_payload(&case, &["lib", "tools"], &[FAKE_TOOL, "exit", "0"]);
+    pair_snapshot(
+        &case,
+        &mut payload,
+        &[("a.txt", "main\n")],
+        &[
+            ("lib", &[("b.txt", "lib\n"), (".gitignore", "out/\n")]),
+            ("tools", &[("c.txt", "tools\n")]),
+        ],
+    );
+    assert_eq!(run_box(&case, &payload).code, Some(0), "the first run lays out the pair");
+    let marker = Path::new(&pair_tree(&payload, "lib")).join(r"out\marker.txt");
+    fs::create_dir_all(marker.parent().expect("the marker has a folder")).expect("the build output folder can be made");
+    fs::write(&marker, "built").expect("the marker can be written");
+    let mut reordered = renamed(&payload, 1);
+    reordered["Pair"] = json!({"Leaf": "app", "Siblings": ["tools", "lib"]});
+
+    let outcome = run_box(&case, &reordered);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(marker.exists(), "the same siblings in another order clear nothing");
+}
+
+#[test]
+fn preflight_of_one_repo_leaves_a_work_folder_laid_out_for_a_pair_alone() {
+    let case = Case::new("preflight_one_repo_on_a_pair_folder");
+    let (pair, _) = changing_pair(&case);
+    assert_eq!(run_box(&case, &pair).code, Some(0), "the pair run lays out the work folder");
+    let mut single = renamed(&pair, 1);
+    let object = single.as_object_mut().expect("the payload is an object");
+    object.remove("Pair");
+    object.remove("SiblingSnapshots");
+    let work = PathBuf::from(field(&single, "Work"));
+
+    for record in ["pair app lib", "changing"] {
+        fs::write(format!("{}.layout", shown(&work)), record).expect("the layout record can be written");
+        let outcome = gate_box(&case, "preflight", &self::payload(&single), None);
+
+        passed(&outcome);
+        assert_eq!(
+            entries_of(&work),
+            ["app", "lib"],
+            "a record saying {record:?}: the preflight, holding no lock, makes nothing in the work folder: {outcome:?}"
+        );
+    }
+}
+
+#[test]
+fn box_run_with_a_pair_never_touches_a_planted_work_git_folder() {
+    let case = Case::new("box_run_pair_planted_work_git");
+    let (payload, commits) = changing_pair(&case);
+    assert_eq!(run_box(&case, &payload).code, Some(0), "the first run lays out the pair");
+    let work = PathBuf::from(field(&payload, "Work"));
+    let work_text = shown(&work);
+    git(&["init", "-q", &work_text]);
+    fs::write(work.join(r".git\canary.txt"), "keep").expect("the canary file can be written");
+    let looked = || {
+        let config = fs::read(work.join(r".git\config")).expect("the planted config can be read");
+        let head = fs::read(work.join(r".git\HEAD")).expect("the planted HEAD can be read");
+        (config, head, git(&["-C", &work_text, "for-each-ref"]))
+    };
+    let before = looked();
+
+    let outcome = run_box(&case, &renamed(&payload, 1));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(fs::read_to_string(work.join(r".git\canary.txt")).expect("the canary file stands"), "keep");
+    assert_eq!(looked(), before, "the planted repository's config, HEAD and refs are untouched");
+    assert!(
+        !work.join(r".git\index").exists(),
+        "no git call staged anything in the planted repository"
+    );
+    assert_eq!(
+        git(&["-C", &pair_tree(&payload, "app"), "rev-parse", "HEAD"]),
+        commits[0],
+        "the main tree is at its snapshot"
+    );
+}
+
+#[test]
+fn box_run_with_a_pair_refuses_a_subfolder_into_a_sibling() {
+    let case = Case::new("box_run_pair_subfolder_into_sibling");
+    let marker = case.folder().join("marker");
+    let mut payload = pair_payload(&case, &["lib"], &[FAKE_TOOL, "mark", &shown(&marker)]);
+    payload["Subfolder"] = json!(r"..\lib");
+    pair_snapshot(&case, &mut payload, &[("a.txt", "a\n")], &[("lib", &[("b.txt", "b\n")])]);
+
+    let outcome = run_box(&case, &payload);
+
+    assert_eq!(outcome.code, Some(2), "{outcome:?}");
+    assert!(
+        outcome
+            .stderr
+            .contains(r"gate: remote subfolder ..\lib is not a folder inside the work folder"),
+        "{outcome:?}"
+    );
+    assert!(!marker.exists(), "the command never ran");
+}
+
+#[test]
+fn box_run_of_one_repo_on_a_fresh_key_folder_writes_no_layout_record() {
+    let case = Case::new("box_run_one_repo_no_layout_record");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "exit", "0"]);
+    snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
+
+    let outcome = run_box(&case, &payload);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let record = format!("{}.layout", field(&payload, "Work"));
+    assert!(is_gone(Path::new(&record)), "no record: a run of one repo's layout needs none");
+}
+
+/// Why the run of `payload` was refused `layout`: what follows the owner's line, which follows the refusal tag; the
+/// outcome refused before the start marker with 75.
+fn layout_why(outcome: &Outcome, payload: &Value) -> String {
+    assert_eq!(outcome.code, Some(75), "{outcome:?}");
+    assert!(!outcome.stderr.contains("gate-remote-started:"), "refused before the start marker");
+    let said = lines(&outcome.stderr);
+    let tag = format!("gate-remote-refused: {} layout", field(payload, "Nonce"));
+    let refused = said.iter().position(|line| *line == tag).expect("the box says the layout tag");
+    let line = format!("gate: not routed: the builder could not clear {PAIR_KEY}'s work folder: ");
+    said.get(refused + 1)
+        .and_then(|next| next.strip_prefix(line.as_str()))
+        .expect("the owner's line follows the tag")
+        .to_owned()
+}
+
+#[test]
+fn box_run_with_a_folder_for_its_layout_record_refuses_with_layout() {
+    let case = Case::new("box_run_layout_record_is_a_folder");
+    let marker = case.folder().join("marker");
+    let mut payload = pair_payload(&case, &["lib"], &[FAKE_TOOL, "mark", &shown(&marker)]);
+    pair_snapshot(&case, &mut payload, &[("a.txt", "a\n")], &[("lib", &[("b.txt", "b\n")])]);
+    let record = PathBuf::from(format!("{}.layout", field(&payload, "Work")));
+    fs::create_dir_all(&record).expect("a folder can take the record's name");
+
+    let outcome = run_box(&case, &payload);
+
+    let why = layout_why(&outcome, &payload);
+    assert!(why.contains(&shown(&record)), "the line names the record it could not write: {why}");
+    assert!(!marker.exists(), "the command never ran");
+    assert!(is_real_folder(&record), "the folder at the record's name stands");
+}
+
+#[test]
+fn box_run_that_cannot_write_a_tree_s_alternates_refuses_with_layout() {
+    let case = Case::new("box_run_cannot_write_alternates");
+    let marker = case.folder().join("marker");
+    let mut payload = pair_payload(&case, &["lib"], &[FAKE_TOOL, "mark", &shown(&marker)]);
+    pair_snapshot(&case, &mut payload, &[("a.txt", "a\n")], &[("lib", &[("b.txt", "b\n")])]);
+    assert_eq!(run_box(&case, &payload).code, Some(0), "the first run lays out the pair");
+    fs::remove_file(&marker).expect("the first run's marker can be removed");
+    let alternates = Path::new(&pair_tree(&payload, "lib")).join(r".git\objects\info\alternates");
+    fs::remove_file(&alternates).expect("the alternates file can be removed");
+    fs::create_dir(&alternates).expect("a folder can take the alternates file's name");
+    let held = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .share_mode(0)
+        .open(alternates.join("held.txt"))
+        .expect("a file in it can be held");
+    let again = renamed(&payload, 1);
+
+    let outcome = run_box(&case, &again);
+
+    let why = layout_why(&outcome, &again);
+    assert!(why.contains(&shown(&alternates)), "the line names the alternates file: {why}");
+    assert!(!marker.exists(), "the command never ran");
+    drop(held);
 }
 
 #[test]

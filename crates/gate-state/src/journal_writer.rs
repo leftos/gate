@@ -235,6 +235,8 @@ pub enum FallbackReason {
     Rebooted,
     /// The builder lacks a tool the command needs.
     Tools,
+    /// The builder could not clear or lay out the work folder for the run's repos.
+    Layout,
     /// The builder's gate is of another version.
     Version,
     /// The remote client could not start.
@@ -252,6 +254,7 @@ impl FallbackReason {
             FallbackReason::Parity => "parity",
             FallbackReason::Rebooted => "rebooted",
             FallbackReason::Tools => "tools",
+            FallbackReason::Layout => "layout",
             FallbackReason::Version => "version",
             FallbackReason::Client => "client",
         }

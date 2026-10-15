@@ -70,6 +70,8 @@ pub(crate) enum Refusal {
     Busy,
     /// The work folder's dotnet tools could not be restored.
     Tools,
+    /// The work folder could not be cleared or laid out for the run's repos.
+    Layout,
 }
 
 impl Refusal {
@@ -78,8 +80,15 @@ impl Refusal {
         match self {
             Refusal::Busy => "busy",
             Refusal::Tools => "tools",
+            Refusal::Layout => "layout",
         }
     }
+}
+
+/// The line the box says when it could not clear or lay out the work folder of the repo `repo` for `why`, just after
+/// its refusal tag; the PC passes it on as it runs the command itself.
+pub(crate) fn layout_line(repo: &str, why: &str) -> String {
+    format!("gate: not routed: the builder could not clear {repo}'s work folder: {why}")
 }
 
 /// The start marker the box says on stderr just before it starts the command of the run whose payload carries `nonce`:
@@ -93,7 +102,7 @@ pub(crate) fn started_line(nonce: &str) -> String {
 }
 
 /// The refusal tag the box says on stderr just before the human line of a refusal of the run whose payload carries
-/// `nonce`: `gate-remote-refused: <nonce> busy|tools`. The client reads a refusal from this line alone.
+/// `nonce`: `gate-remote-refused: <nonce> busy|tools|layout`. The client reads a refusal from this line alone.
 ///
 /// The nonce is no secret, as [`started_line`] says: a command can say this line too, and the client ignores it
 /// because the box's start marker came before anything the command says.
@@ -487,13 +496,14 @@ mod scripted {
     /// How often `wait` looks for its path and the interrupt.
     const WAIT_STEP: Duration = Duration::from_millis(20);
     /// Every reason a `refuse` step may give.
-    const REASONS: [FallbackReason; 8] = [
+    const REASONS: [FallbackReason; 9] = [
         FallbackReason::Full,
         FallbackReason::Busy,
         FallbackReason::Unreachable,
         FallbackReason::Parity,
         FallbackReason::Rebooted,
         FallbackReason::Tools,
+        FallbackReason::Layout,
         FallbackReason::Version,
         FallbackReason::Client,
     ];
