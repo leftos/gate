@@ -80,20 +80,23 @@ pub(super) fn held(
     worktrees: &[Folder<'_>],
     limit: Duration,
     interrupt: Option<Interrupt>,
-    mut say: impl FnMut(String),
+    say: impl FnMut(String),
 ) -> Result<Vec<Locked>, End> {
-    let deadline = Instant::now() + limit;
+    held_or(state, worktrees, &Wait::until(limit, interrupt, held_too_long), say)
+}
+
+/// The locks of `worktrees` as [`held`] takes them, a wait past `wait`'s limit ending as `wait` says.
+pub(super) fn held_or(state: &StateRoot, worktrees: &[Folder<'_>], wait: &Wait, mut say: impl FnMut(String)) -> Result<Vec<Locked>, End> {
     let mut locks = Vec::with_capacity(worktrees.len());
     for worktree in worktrees {
         locks.push((lock_of(state, worktree.root, worktree.id)?, worktree.name));
     }
     locks.sort_by_key(|(opened, _)| opened.id);
     locks.dedup_by_key(|(opened, _)| opened.id);
-    let wait = Wait { deadline, limit, interrupt };
     locks
         .into_iter()
         .map(|(opened, name)| {
-            let guard = taken(&opened.lock, name, &wait, &mut say)?;
+            let guard = taken(&opened.lock, name, wait, &mut say)?;
             Ok(Locked {
                 guard,
                 _folder: opened.folder,
@@ -102,11 +105,30 @@ pub(super) fn held(
         .collect()
 }
 
-/// How long a wait for a lock may last, and the interrupt that ends it.
-struct Wait {
+/// How long a wait for a lock may last, the interrupt that ends it, and the end of a wait past it, given the worktree's
+/// name and the limit.
+pub(super) struct Wait {
     deadline: Instant,
     limit: Duration,
     interrupt: Option<Interrupt>,
+    busy: fn(&str, Duration) -> End,
+}
+
+impl Wait {
+    /// A wait of at most `limit` from now, ended by `interrupt`, whose end past the limit is `busy`'s.
+    pub(super) fn until(limit: Duration, interrupt: Option<Interrupt>, busy: fn(&str, Duration) -> End) -> Wait {
+        Wait {
+            deadline: Instant::now() + limit,
+            limit,
+            interrupt,
+            busy,
+        }
+    }
+}
+
+/// A wait for the worktree `name`'s lock past `limit` as the run's failure.
+fn held_too_long(name: &str, limit: Duration) -> End {
+    End::Failed(format!("another run held the worktree {name} for more than {} s", limit.as_secs()))
 }
 
 /// The mutex `lock` of the worktree `name`, taken at once when it is free, else after the wait [`held`] makes.
@@ -127,10 +149,7 @@ fn taken(lock: &str, name: &str, wait: &Wait, say: &mut impl FnMut(String)) -> R
         }
         let left = wait.deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
-            return Err(End::Failed(format!(
-                "another run held the worktree {name} for more than {} s",
-                wait.limit.as_secs()
-            )));
+            return Err((wait.busy)(name, wait.limit));
         }
         step = left.min(WAIT_STEP);
     }

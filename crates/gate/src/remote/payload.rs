@@ -60,7 +60,6 @@ impl Location {
     }
 
     /// This location with the sibling pair of the main checkout's folder `leaf` and the folders `siblings`.
-    #[cfg_attr(not(test), expect(dead_code, reason = "the client sends no Pair; the tests build one"))]
     pub(crate) fn with_pair(self, leaf: &str, siblings: &[String]) -> Location {
         Location {
             pair: Some(Pair {

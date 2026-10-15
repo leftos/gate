@@ -1114,48 +1114,152 @@ fn a_box_of_another_version_is_not_routed() {
     assert_eq!(builder_ref(&case, &format!("refs/gate/{}", key_of(&events))), "", "nothing was pushed");
 }
 
-/// A run whose repo declares a sibling the routing file allows, a repository beside the case folder, stays here until
-/// the client takes sibling pairs: it says so naming the sibling, calls no builder, creates no bare there and leaves the
-/// sibling no snapshot ref.
-#[test]
-fn a_run_carrying_a_sibling_stays_local_until_pairs_are_on() {
-    let case = client_case("client-sibling-off");
+/// A [`client_case`] whose repo declares one sibling the routing file allows, the folder `make` makes beside the case
+/// folder, named after it: the case, its folder name, the sibling's name and its folder. A sibling an earlier run left
+/// is removed first.
+fn pair_case(name: &str, make: impl FnOnce(&Case, &Path)) -> (Case, String, String, PathBuf) {
+    let case = client_case(name);
     let leaf = case
         .folder()
         .file_name()
         .expect("the case folder has a name")
         .to_string_lossy()
         .into_owned();
-    let (repo, name) = (repo_name(&leaf), format!("{leaf}-sibling"));
-    let sibling = case.folder().parent().expect("the case folder has a parent").join(&name);
+    let (repo, sibling_name) = (repo_name(&leaf), format!("{leaf}-sibling"));
+    let sibling = case.folder().parent().expect("the case folder has a parent").join(&sibling_name);
     if sibling.exists() {
         fs::remove_dir_all(&sibling).expect("a sibling left by an earlier run can be removed");
     }
-    fs::create_dir_all(&sibling).expect("the sibling can be made");
-    git_out(&case, &[], &["-C", &shown(&sibling), "init", "--quiet"]);
-    write(&case, ".gate/siblings.toml", &format!("siblings = [\"{name}\"]\n"));
+    make(&case, &sibling);
+    write(&case, ".gate/siblings.toml", &format!("siblings = [\"{sibling_name}\"]\n"));
     let routing = json!({
         "host": HOST,
         "slots": 2,
         "repos": { &repo: ["*tool*"] },
         "outputs": { &repo: [] },
-        "siblings": { &repo: [&name] },
+        "siblings": { &repo: [&sibling_name] },
     });
     write_remote_json(&case, &routing.to_string());
-    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+    (case, leaf, sibling_name, sibling)
+}
 
-    let outcome = finish(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "out", "ran here"]));
+/// Makes `sibling` a repository of its own holding `lib.txt`.
+fn sibling_repository(case: &Case, sibling: &Path) {
+    fs::create_dir_all(sibling).expect("the sibling can be made");
+    git_out(case, &[], &["-C", &shown(sibling), "init", "--quiet"]);
+    fs::write(sibling.join("lib.txt"), "lib\n").expect("the sibling's file can be written");
+}
+
+/// The commit `name` names in the builder's bare repository of the sibling `sibling`, empty when it names none.
+fn sibling_builder_ref(case: &Case, sibling: &str, name: &str) -> String {
+    let bare = shown(&case.folder().join("builder").join(format!("{}.git", repo_name(sibling))));
+    git_out(case, &[], &["--git-dir", &bare, "for-each-ref", "--format=%(objectname)", name])
+}
+
+/// The lines of `said` that say a pair's push.
+fn pair_pushes(said: &str) -> Vec<&str> {
+    said.lines().filter(|line| line.starts_with("gate: remote pushed snapshot ")).collect()
+}
+
+/// A run whose repo declares a sibling is sent as a pair: the main repository and the sibling are each snapshotted and
+/// pushed to a bare of their own, the main one first, each push said; the run call carries the `Pair` and the sibling's
+/// snapshot; and the command's changes in both worktrees come back.
+#[test]
+fn a_pair_run_pushes_each_repo_main_first_and_syncs_both_back() {
+    let (case, leaf, name, sibling) = pair_case("client-pair", sibling_repository);
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+    let on_sibling = format!(r"..\{name}\made-on-sibling.txt");
+
+    let outcome = finish(client_gate(
+        &case,
+        "out.log",
+        &steps,
+        &[r".\tool.exe", "mark", "made-on-box.txt", "mark", &on_sibling],
+    ));
+    let key = key_of(&events(&case));
+    let saved = git_out(&case, &[], &["-C", &shown(&sibling), "rev-parse", &format!("refs/gate-remote/{key}")]);
+    let synced = sibling.join("made-on-sibling.txt").exists();
+    fs::remove_dir_all(&sibling).expect("the sibling can be removed");
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let said = &outcome.stderr;
+    let pushes = pair_pushes(said);
+    assert_eq!(pushes.len(), 2, "one push line a repo: {outcome:?}");
+    assert!(pushes[0].starts_with(&format!("gate: remote pushed snapshot {leaf} ")), "{pushes:?}");
+    assert!(pushes[1].starts_with(&format!("gate: remote pushed snapshot {name} ")), "{pushes:?}");
+    assert_eq!(calls(&steps), ["preflight", "run"]);
+    let pushed = sibling_builder_ref(&case, &name, &format!("refs/gate/{key}"));
+    assert_eq!(pushed, saved, "the sibling's saved ref is the snapshot its bare holds");
+    // The box lays out a pair's work folder, each repository checked out at its snapshot, only from the run's `Pair`
+    // and `SiblingSnapshots`.
+    let laid_out = case.folder().join("builder").join("work").join(&key);
+    assert!(
+        laid_out.join(&name).join("lib.txt").exists(),
+        "the sibling was checked out beside the main repository"
+    );
+    assert!(
+        case.folder().join("made-on-box.txt").exists(),
+        "the main repository's change came back: {outcome:?}"
+    );
+    assert!(synced, "the sibling's change came back: {outcome:?}");
+    assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new(), "no fallback");
+}
+
+/// A sibling whose push fails, through `local-ssh` after the main one's went through, keeps the run here as
+/// `unreachable` with no run call: the main repository's ref is saved, the sibling's is not.
+#[test]
+fn a_pair_run_whose_sibling_push_fails_falls_back_with_no_run_call() {
+    let (case, _, name, sibling) = pair_case("client-pair-push-fails", sibling_repository);
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok", "fail-other"]);
+
+    let outcome = finish(client_gate_through(
+        &case,
+        "local-ssh",
+        "out.log",
+        &steps,
+        &[r".\tool.exe", "out", "ran here"],
+    ));
     let sibling_refs = git_out(&case, &[], &["-C", &shown(&sibling), "for-each-ref", "refs/gate-remote/"]);
     fs::remove_dir_all(&sibling).expect("the sibling can be removed");
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
-    let line = format!("gate: not routed: sibling {name} the builder does not take sibling pairs yet");
-    assert_eq!(outcome.stderr.lines().filter(|said| *said == line).count(), 1, "said once: {outcome:?}");
+    let said = &outcome.stderr;
+    assert!(
+        said.contains(&format!("gate: pushing the snapshot of {name} to ")),
+        "the failed push names the sibling: {outcome:?}"
+    );
+    assert_eq!(pair_pushes(said).len(), 1, "only the main repository's push is said: {outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "git-receive-pack", "git-receive-pack"], "no run call");
+    let events = events(&case);
+    assert_eq!(fallbacks(&events), ["unreachable"]);
+    let main_saved = git_out(&case, &[], &["for-each-ref", "--format=%(refname)", "refs/gate-remote/"]);
+    assert_eq!(
+        main_saved,
+        format!("refs/gate-remote/{}", key_of(&events)),
+        "the main repository's ref is saved"
+    );
+    assert_eq!(sibling_refs, "", "the sibling's ref is not saved");
+}
+
+/// A sibling that is a worktree of the main repository's own repository shares its refs, so the run stays here naming
+/// it, before anything reaches the builder.
+#[test]
+fn a_pair_whose_sibling_shares_the_main_repository_stays_here() {
+    let (case, leaf, name, sibling) = pair_case("client-pair-shared", |case, sibling| {
+        git(case, &["commit", "--quiet", "--allow-empty", "-m", "base"]);
+        git(case, &["worktree", "add", "--quiet", "--detach", &shown(sibling)]);
+    });
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "out", "ran here"]));
+    git(&case, &["worktree", "remove", "--force", &shown(&sibling)]);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert!(outcome.stdout.contains("ran here"), "{outcome:?}");
+    let line = format!("gate: not routed: sibling {name} shares its git repository with {leaf}");
+    assert_eq!(outcome.stderr.lines().filter(|said| *said == line).count(), 1, "said once: {outcome:?}");
     assert_eq!(calls(&steps), Vec::<String>::new(), "no call reached the builder");
     assert_eq!(fallbacks(&events(&case)), ["client"]);
-    assert!(!case.folder().join("builder").exists(), "no bare was created on the builder");
-    assert_eq!(sibling_refs, "", "the sibling has no snapshot ref");
 }
 
 #[test]

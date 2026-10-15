@@ -31,10 +31,6 @@ pub(crate) use carried::{Sibling, carried};
 mod carried;
 mod client;
 pub(crate) mod git;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the client does not hold a sibling pair's folders until pairs are on")
-)]
 mod held;
 mod install;
 mod launch;

@@ -43,16 +43,63 @@ pub(crate) fn take(roots: &[PathBuf], key: &str, limit: Duration, interrupt: Opt
         return Ok(Vec::new());
     };
     let git = Git::find(first).map_err(GitError::Failed)?;
-    roots.iter().map(|root| take_one(&git, root, key, limit, interrupt)).collect()
+    roots.iter().map(|root| take_one(&git, root, None, key, limit, interrupt)).collect()
+}
+
+/// A repository of a sibling pair as its git calls ask about it: its worktree's folder, and the folder git's search for
+/// a repository stops at, `GIT_CEILING_DIRECTORIES`, the pair's parent folder, so git never reaches a repository above.
+#[derive(Clone, Copy)]
+pub(crate) struct Bounded<'a> {
+    pub root: &'a Path,
+    pub ceiling: &'a Path,
+}
+
+/// The variable naming the folder git's search for a repository stops at, which every git call about a pair's
+/// repository is given.
+pub(crate) const CEILING: &str = "GIT_CEILING_DIRECTORIES";
+
+/// The snapshot of the pair's repository `repo`, as [`take`] takes one, under the work-folder `key`.
+pub(crate) fn take_bounded(repo: Bounded<'_>, key: &str, limit: Duration, interrupt: Option<Interrupt>) -> Result<Snapshot, GitError> {
+    let git = Git::find(repo.root).map_err(GitError::Failed)?;
+    take_one(&git, repo.root, Some(repo.ceiling), key, limit, interrupt)
+}
+
+/// Where git finds the pair's repository `repo`: the top folder of its worktree and its common git folder, as one
+/// `git rev-parse --show-toplevel --path-format=absolute --git-common-dir` prints them.
+pub(crate) fn place_of(repo: Bounded<'_>, limit: Duration, interrupt: Option<Interrupt>) -> Result<(String, String), GitError> {
+    let git = Git::find(repo.root).map_err(GitError::Failed)?;
+    let calls = Calls {
+        git: &git,
+        root: repo.root,
+        ceiling: Some(repo.ceiling),
+        limit,
+        interrupt,
+    };
+    let args = ["rev-parse", "--show-toplevel", "--path-format=absolute", "--git-common-dir"];
+    let printed = calls.output(&args, &[], &[])?;
+    let mut lines = printed.lines().map(str::trim_end);
+    match (lines.next(), lines.next(), lines.next()) {
+        (Some(top), Some(common), None) => Ok((top.to_owned(), common.to_owned())),
+        _ => Err(GitError::Failed(format!(
+            "git {} did not print two paths: {}",
+            args.join(" "),
+            printed.trim()
+        ))),
+    }
 }
 
 /// Points `refs/gate-remote/<key>` at `commit` in the repository of `root`, once the builder has the snapshot, so the
-/// next bridge commit builds on it. git holds the ref's lock while it runs, so it is a [`git::Call::locked`] call,
-/// which no Ctrl+C ends: it ends on its own or after `limit`.
-pub(crate) fn save(root: &Path, key: &str, commit: &str, limit: Duration) -> Result<(), GitError> {
+/// next bridge commit builds on it, git's search bounded at `ceiling` for a pair's repository. git holds the ref's lock
+/// while it runs, so it is a [`git::Call::locked`] call, which no Ctrl+C ends: it ends on its own or after `limit`.
+pub(crate) fn save(root: &Path, ceiling: Option<&Path>, key: &str, commit: &str, limit: Duration) -> Result<(), GitError> {
     let git = Git::find(root).map_err(GitError::Failed)?;
     let args = ["update-ref", &format!("{REFS}{key}"), commit];
-    git.output(&git::Call::locked(root, &args, limit)).map(drop)
+    let set: Vec<(&str, &OsStr)> = ceiling.map(|ceiling| (CEILING, ceiling.as_os_str())).into_iter().collect();
+    git.output(&git::Call {
+        set: &set,
+        ..git::Call::locked(root, &args, limit)
+    })
+    .map(drop)
 }
 
 /// The tree of the worktree at `root` as `git add -A` and `git write-tree` write it through a copy of its index: what
@@ -63,13 +110,20 @@ pub(super) fn worktree(root: &Path, limit: Duration, interrupt: Option<Interrupt
     worktree_tree(&Calls {
         git: &git,
         root,
+        ceiling: None,
         limit,
         interrupt,
     })
 }
 
-fn take_one(git: &Git, root: &Path, key: &str, limit: Duration, interrupt: Option<Interrupt>) -> Result<Snapshot, GitError> {
-    let calls = Calls { git, root, limit, interrupt };
+fn take_one(git: &Git, root: &Path, ceiling: Option<&Path>, key: &str, limit: Duration, interrupt: Option<Interrupt>) -> Result<Snapshot, GitError> {
+    let calls = Calls {
+        git,
+        root,
+        ceiling,
+        limit,
+        interrupt,
+    };
     let listing = calls.output(
         &["for-each-ref", "--sort=-committerdate", "--format=%(refname) %(objectname)", REFS],
         &[],
@@ -96,18 +150,22 @@ fn previous(listing: &str, key: &str) -> Option<String> {
         .map(|(_, sha)| (*sha).to_owned())
 }
 
-/// git asked about one worktree, with the limit and the interrupt every call of one snapshot shares.
+/// git asked about one worktree, with the ceiling of a pair's repository, the limit and the interrupt every call of one
+/// snapshot shares.
 struct Calls<'a> {
     git: &'a Git,
     root: &'a Path,
+    ceiling: Option<&'a Path>,
     limit: Duration,
     interrupt: Option<Interrupt>,
 }
 
 impl Calls<'_> {
-    /// What git wrote on stdout for `args`, with `set` given and `unset` removed.
+    /// What git wrote on stdout for `args`, with `set` and the ceiling given and `unset` removed.
     fn output(&self, args: &[&str], set: &[(&str, &OsStr)], unset: &[&str]) -> Result<String, GitError> {
-        self.git.output(&self.call(args, set, unset))
+        let mut given = set.to_vec();
+        given.extend(self.ceiling.map(|ceiling| (CEILING, ceiling.as_os_str())));
+        self.git.output(&self.call(args, &given, unset))
     }
 
     /// The first line of what git wrote on stdout for `args`, with `set` given and `unset` removed.
@@ -310,7 +368,7 @@ mod tests {
         let first = take(roots, OWN, GIT_LIMIT, None).expect("the first snapshot is made");
         assert_eq!(first.len(), 1, "one snapshot for one root");
         assert_eq!(first[0].bridge, None, "no snapshot before the first");
-        save(&root, OWN, &first[0].commit, GIT_LIMIT).expect("the ref is saved");
+        save(&root, None, OWN, &first[0].commit, GIT_LIMIT).expect("the ref is saved");
         fs::write(root.join("a.txt"), "b\n").expect("a file can be changed");
 
         let second = take(roots, OWN, GIT_LIMIT, None).expect("the second snapshot is made");
