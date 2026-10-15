@@ -279,7 +279,7 @@ fn normalized(path: &Path) -> Option<String> {
 
 #[cfg(test)]
 #[expect(clippy::expect_used, reason = "a test whose folders cannot be made must fail loudly")]
-mod tests {
+pub(super) mod tests {
     use std::ffi::OsString;
     use std::fs;
     use std::os::windows::ffi::OsStringExt;
@@ -297,15 +297,16 @@ mod tests {
     use crate::route::open_followed;
 
     /// The folders of a pair under a new temporary folder `top`: `dev\app`, the worktree root, and beside it each
-    /// sibling, each a folder holding a `.git` folder. Dropping it removes `top`, also when a test failed.
-    struct Pair {
-        top: PathBuf,
+    /// sibling, each a folder holding a `.git` folder. Dropping it removes `top`, also when a test failed. The client's
+    /// tests make their pairs with it too.
+    pub(in crate::remote) struct Pair {
+        pub(in crate::remote) top: PathBuf,
         /// The worktree root as the route spells it.
-        root: String,
+        pub(in crate::remote) root: String,
     }
 
     impl Pair {
-        fn new(test: &str, names: &[&str]) -> Pair {
+        pub(in crate::remote) fn new(test: &str, names: &[&str]) -> Pair {
             let top = crate::test_support::temp_dir().join(format!("gate-held-{test}-{}", std::process::id()));
             if top.exists() {
                 fs::remove_dir_all(&top).expect("an earlier run's folder is removed");
@@ -321,12 +322,12 @@ mod tests {
             }
         }
 
-        fn folder(&self, name: &str) -> PathBuf {
+        pub(in crate::remote) fn folder(&self, name: &str) -> PathBuf {
             self.top.join("dev").join(name)
         }
 
         /// A routed run from the root `root` carrying the siblings `names`, each with its folder's id as it is now.
-        fn run(&self, root: &str, names: &[&str]) -> RemoteRun {
+        pub(in crate::remote) fn run(&self, root: &str, names: &[&str]) -> RemoteRun {
             RemoteRun {
                 host: "builder".to_owned(),
                 slots: 1,
@@ -398,7 +399,7 @@ mod tests {
     }
 
     /// Makes a junction at `link` that leads to `target`, with `mklink /J`.
-    fn junction(link: &Path, target: &Path) {
+    pub(in crate::remote) fn junction(link: &Path, target: &Path) {
         let made = ran(
             "cmd",
             &[

@@ -256,7 +256,7 @@ pub(super) fn sdk_listed(pin: Option<&parity::Pin>, sdks: impl FnOnce() -> Resul
 /// The SDKs this PC's `dotnet --list-sdks` lists, run with the folders inside the worktree `root` dropped from
 /// `PATH`; none when no dotnet is found; else why the list cannot be read.
 fn sdk_list(root: &Path) -> Result<Vec<String>, String> {
-    let listing = local_sdk_listing(Variables::from_process(), root, git::DOTNET_LIMIT, None)?;
+    let listing = local_sdk_listing(Variables::from_process(), &[root], git::DOTNET_LIMIT, None)?;
     Ok(parity::sdk_versions(&listing).into_iter().map(str::to_owned).collect())
 }
 

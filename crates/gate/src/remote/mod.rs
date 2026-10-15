@@ -325,8 +325,9 @@ pub(crate) fn chosen(request: &RunRequest) -> Result<Box<dyn RemoteClient>, Stri
     Ok(Box::new(client::RustClient::ssh(&request.test_seams)))
 }
 
-/// The client of `--test-remote-snapshot`: makes the snapshot and bridge commits of the call's worktree and says each
-/// as `gate: remote snapshot <commit> bridge <commit or none>`, on stderr and in the log; the run ends with status 0,
+/// The client of `--test-remote-snapshot`: makes the snapshot and bridge commits of each of the call's worktrees, the
+/// main one first, then a pair's siblings in declared order, and says each as `gate: remote snapshot <commit> bridge
+/// <commit or none>`, one line a worktree, on stderr and in the log; the run ends with status 0,
 /// nothing pushed. A git failure ends it with status 1 and `gate: the remote run failed: <why>`, with no fallback; a
 /// Ctrl+C ends it as an interrupt, as the scripted client's `wait` does; and a run whose lines cannot be said ends with
 /// status 1, since its commits are already made.
@@ -348,7 +349,10 @@ mod snapshot_only {
 
     impl RemoteClient for SnapshotOnly {
         fn run(&mut self, call: &RemoteCall<'_>) -> RemoteOutcome {
-            let roots = vec![PathBuf::from(call.root)];
+            let roots: Vec<PathBuf> = std::iter::once(call.root)
+                .chain(call.siblings.iter().map(super::Sibling::root))
+                .map(PathBuf::from)
+                .collect();
             let (status, lines) = match snapshot::take(&roots, call.key, self.limit, call.interrupt) {
                 Ok(snapshots) => (0, snapshots.iter().map(said).collect()),
                 // An interrupt is no failure, so it says no line: the run is the interrupt, as the client's `wait`.

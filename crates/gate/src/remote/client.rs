@@ -293,6 +293,7 @@ impl RemoteClient for RustClient {
             box_killed: None,
             pair: None,
             ceiling: None,
+            local_major: None,
         };
         if let Some(line) = raised {
             attempt.say(line);
@@ -772,6 +773,9 @@ pub(super) struct Attempt<'c, 'a> {
     /// The folder every git call about a pair's repository stops its search at, the pair's parent folder; `None` for a
     /// run of one repository.
     ceiling: Option<PathBuf>,
+    /// This PC's newest .NET SDK major once [`Attempt::local_major`] has read it, so one run lists the SDKs once
+    /// however many of its repositories need it; `None` before.
+    local_major: Option<u64>,
 }
 
 /// How a run call ended ([`Attempt::run_call`]): its end, the last standard error lines of the call that counts that
@@ -1259,19 +1263,34 @@ impl Attempt<'_, '_> {
         git.output_bytes(&call)
     }
 
-    /// This PC's newest .NET SDK major, from `--test-local-sdks` when given, else from `dotnet --list-sdks`; 0 when no
-    /// dotnet is found or it lists no SDK. A list that cannot be read is said, and checks no major; one whose read
-    /// failed while the console interrupt is raised says nothing and checks no major, and [`Attempt::parity`] then ends
-    /// the run as an interrupt. `--test-remote-interrupt-at sdks` raises the interrupt just before the read.
+    /// This PC's newest .NET SDK major, from `--test-local-sdks` when given, else from `dotnet --list-sdks`, read once
+    /// a run with the folders of every worktree it sends, a pair's siblings' among them, kept from dotnet's search
+    /// ([`local_sdk_listing`]); 0 when no dotnet is found or it lists no SDK. A list that cannot be read is said, and
+    /// checks no major; one whose read failed while the console interrupt is raised says nothing and checks no major,
+    /// and [`Attempt::parity`] then ends the run as an interrupt. `--test-remote-interrupt-at sdks` raises the interrupt
+    /// just before the read.
     fn local_major(&mut self) -> u64 {
+        if let Some(major) = self.local_major {
+            return major;
+        }
+        let major = self.read_local_major();
+        self.local_major = Some(major);
+        major
+    }
+
+    /// This PC's newest .NET SDK major as [`Attempt::local_major`] reads it, read now.
+    fn read_local_major(&mut self) -> u64 {
         if let Some(listing) = self.local_sdks {
             return parity::newest_major(parity::listed(listing).iter().map(String::as_str));
         }
         if let Some(interrupt) = self.call.interrupt.filter(|_| self.raises_at("sdks")) {
             interrupt.raise();
         }
-        let worktree = Path::new(self.call.root);
-        match local_sdk_listing(Variables::from_process(), worktree, self.dotnet_limit, self.call.interrupt) {
+        let call = self.call;
+        let worktrees: Vec<&Path> = std::iter::once(Path::new(call.root))
+            .chain(call.siblings.iter().map(|sibling| Path::new(sibling.root())))
+            .collect();
+        match local_sdk_listing(Variables::from_process(), &worktrees, self.dotnet_limit, call.interrupt) {
             Ok(listing) => parity::newest_major(parity::sdk_versions(&listing)),
             Err(_) if self.call.interrupt.is_some_and(Interrupt::is_raised) => 0,
             Err(error) => {
@@ -1987,6 +2006,7 @@ impl<'c, 'a> Attempt<'c, 'a> {
             box_killed: None,
             pair: None,
             ceiling: None,
+            local_major: None,
         }
     }
 }
@@ -2968,12 +2988,21 @@ fn dotnet_limit(seams: &TestSeams) -> Duration {
     seams.dotnet_limit_ms.map_or(git::DOTNET_LIMIT, Duration::from_millis)
 }
 
-/// What `dotnet --list-sdks` lists on this PC, as [`git::sdk_listing`] reads it, with the folders inside `worktree`
-/// dropped from the `PATH` of `variables`, each compared by its canonical path so a junction does not get around it,
-/// and a dotnet found that still lies inside it refused. A `PATH` that cannot be read that way cannot be read at all.
-pub(crate) fn local_sdk_listing(variables: Variables, worktree: &Path, limit: Duration, interrupt: Option<Interrupt>) -> Result<String, GitError> {
-    let variables = outside_worktree(variables, worktree).map_err(GitError::Failed)?;
-    git::sdk_listing(variables, limit, interrupt, Some(worktree))
+/// What `dotnet --list-sdks` lists on this PC, as [`git::sdk_listing`] reads it, with the folders inside each of
+/// `worktrees` dropped from the `PATH` of `variables`, each compared by its canonical path so a junction does not get
+/// around it, and a dotnet found that still lies inside any of them refused. A `PATH` that cannot be read that way
+/// cannot be read at all.
+pub(crate) fn local_sdk_listing(
+    variables: Variables,
+    worktrees: &[&Path],
+    limit: Duration,
+    interrupt: Option<Interrupt>,
+) -> Result<String, GitError> {
+    let variables = worktrees
+        .iter()
+        .try_fold(variables, |variables, worktree| outside_worktree(variables, worktree))
+        .map_err(GitError::Failed)?;
+    git::sdk_listing(variables, limit, interrupt, worktrees)
 }
 
 /// `variables` with the folders inside `worktree` dropped from their `PATH`, as [`path_outside`] rebuilds it, so a
@@ -3176,13 +3205,15 @@ mod tests {
     use super::{Entry, entries_of, gate_folders, manifest_candidates, manifest_entry};
     use crate::environment::Variables;
     use crate::remote::git::{DOTNET_LIMIT, GIT_LIMIT, GitError};
+    use crate::remote::held::tests::{Pair, junction};
     use crate::remote::outputs;
     use crate::remote::payload;
     use crate::remote::payload::Location;
     use crate::remote::snapshot::Snapshot;
     use crate::remote::transport::Local;
     use crate::remote::watchdog::{self, Kill, LOG_CAP};
-    use crate::remote::{Refusal, RemoteCall, adjusted_line, busy_line, refused_line, started_line};
+    use crate::remote::worktree_lock::tests::{held_elsewhere, lock_name};
+    use crate::remote::{Refusal, RemoteCall, Sibling, adjusted_line, busy_line, carried, refused_line, started_line};
     use crate::run::CONTROL_C_EXIT;
 
     /// A state root no gate uses; no test here takes its key's lock.
@@ -3209,7 +3240,7 @@ mod tests {
         let variables = Variables::from_process().with("PATH", &folder.to_string_lossy());
         let worktree = Path::new(env!("CARGO_MANIFEST_DIR"));
 
-        let read = local_sdk_listing(variables, worktree, DOTNET_LIMIT, Some(raised()));
+        let read = local_sdk_listing(variables, &[worktree], DOTNET_LIMIT, Some(raised()));
 
         let ran = marker.exists();
         fs::remove_dir_all(&folder).expect("the stub's folder can be removed");
@@ -3329,7 +3360,65 @@ mod tests {
             box_killed: None,
             pair: None,
             ceiling: None,
+            local_major: None,
         }
+    }
+
+    /// The call of the routed pair run `run`, carrying `siblings` and logging to `log`, its interrupt not raised, so a
+    /// lock it waits for is waited out.
+    fn pair_call<'a>(run: &'a gate_router::RemoteRun, siblings: Vec<Sibling<'a>>, log: &'a Path) -> RemoteCall<'a> {
+        RemoteCall {
+            root: &run.root,
+            root_id: run.root_id,
+            siblings,
+            interrupt: None,
+            ..call(log)
+        }
+    }
+
+    /// A pair run holds its folders before anything else ([`super::Held::hold`]): a sibling made a junction after
+    /// routing keeps the run here naming it, before any snapshot or call to the builder.
+    #[test]
+    fn a_pair_run_holds_its_folders_first_and_a_sibling_made_a_junction_stays_here() {
+        let pair = Pair::new("client-junction", &["lib"]);
+        let run = pair.run(&pair.root, &["lib"]);
+        let moved = pair.folder("lib-moved");
+        fs::rename(pair.folder("lib"), &moved).expect("the sibling can be moved");
+        junction(&pair.folder("lib"), &moved);
+        let log = pair.top.join("out.log");
+        let call = pair_call(&run, carried(&run).expect("the run's siblings check"), &log);
+        let transport = nowhere();
+        let mut attempt = attempt(&call, &transport);
+
+        let ended = attempt.phases();
+
+        drop(attempt);
+        fs::remove_dir(pair.folder("lib")).expect("the junction can be removed");
+        assert!(
+            matches!(&ended, Err(End::NotRouted(line)) if line.starts_with("gate: not routed: sibling lib ")),
+            "{ended:?}"
+        );
+    }
+
+    /// A sibling whose worktree lock another run's sync-back holds past the lock wait keeps the run here naming it.
+    #[test]
+    fn a_pair_run_whose_sibling_lock_is_held_past_the_wait_stays_here() {
+        let pair = Pair::new("client-busy", &["lib"]);
+        let run = pair.run(&pair.root, &["lib"]);
+        let log = pair.top.join("out.log");
+        let call = pair_call(&run, carried(&run).expect("the run's siblings check"), &log);
+        let (release, holder) = held_elsewhere(&lock_name(&STATE, &run.siblings[0].root));
+        let transport = nowhere();
+        let mut attempt = attempt(&call, &transport);
+        attempt.lock_wait = Duration::ZERO;
+
+        let ended = attempt.hold_pair();
+
+        release.send(()).expect("the other run is still there");
+        holder.join().expect("the other run ends");
+        drop(attempt);
+        let busy = "gate: not routed: sibling lib is busy with another run's sync-back";
+        assert!(matches!(&ended, Err(End::NotRouted(line)) if line == busy), "{ended:?}");
     }
 
     #[test]

@@ -189,7 +189,7 @@ fn called(program: &Program, bound: Duration, input: &[u8]) -> Result<Heard, Fai
         args: &args,
         limit: bound,
         interrupt: None,
-        worktree: None,
+        worktrees: &[],
         console: PipedConsole::Attached,
         stdin: Some(input),
     };

@@ -528,7 +528,7 @@ fn say_sdks(limit: Duration, console: &mut Console) {
 /// not be read. dotnet is run as [`git::sdk_listing`] runs it, with no console interrupt and no worktree to keep it out
 /// of, ended with its job past `limit`.
 fn sdks(limit: Duration) -> Result<String, String> {
-    let listing = git::sdk_listing(Variables::from_process(), limit, None, None)?;
+    let listing = git::sdk_listing(Variables::from_process(), limit, None, &[])?;
     Ok(sdk_list(&listing))
 }
 

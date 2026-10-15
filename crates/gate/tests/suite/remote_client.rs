@@ -1223,6 +1223,10 @@ fn a_pair_run_whose_sibling_push_fails_falls_back_with_no_run_call() {
     fs::remove_dir_all(&sibling).expect("the sibling can be removed");
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    // The attempt's lines, the main push's progress among them, are noted after the command's output, so the log's
+    // 20-line tail on stdout may not reach it: the log shows the command ran.
+    let log = fs::read_to_string(case.folder().join("out.log")).expect("the log was written");
+    assert!(log.lines().any(|line| line == "ran here"), "the command ran here: {log}");
     let said = &outcome.stderr;
     assert!(
         said.contains(&format!("gate: pushing the snapshot of {name} to ")),
@@ -1239,6 +1243,121 @@ fn a_pair_run_whose_sibling_push_fails_falls_back_with_no_run_call() {
         "the main repository's ref is saved"
     );
     assert_eq!(sibling_refs, "", "the sibling's ref is not saved");
+}
+
+/// A pair run whose sibling's bare repository is new while the main one's is there: the preflight creates the
+/// sibling's alone, so each push goes by its own bare's `created` flag: the sibling's sends no bridge, the main one's
+/// does.
+#[test]
+fn a_pair_s_new_sibling_bare_takes_no_bridge_while_the_main_one_does() {
+    let (case, _, name, sibling) = pair_case("client-pair-new-bare", sibling_repository);
+    let first_steps = ssh_steps(&case, "first", &["ok", "ok"]);
+    let first = finish(client_gate(&case, "first.log", &first_steps, &[r".\tool.exe", "out", "first"]));
+    assert_eq!(first.code, Some(0), "{first:?}");
+    // The builder keeps the main repository's bare and loses the sibling's; its work folder, whose checkouts came from
+    // the bare that is gone, goes too, as a builder laying the pair out anew has none.
+    let key = key_of(&events(&case));
+    let builder = case.folder().join("builder");
+    fs::remove_dir_all(builder.join(format!("{}.git", repo_name(&name)))).expect("the sibling's bare can be removed");
+    fs::remove_dir_all(builder.join("work").join(&key)).expect("the work folder can be removed");
+    let steps = ssh_steps(&case, "second", &["ok", "ok"]);
+
+    let outcome = finish(client_gate(&case, "second.log", &steps, &[r".\tool.exe", "out", "second"]));
+    let sibling_pushed = sibling_builder_ref(&case, &name, &format!("refs/gate/{key}"));
+    let sibling_bridge = sibling_builder_ref(&case, &name, &format!("refs/gate-bridge/{key}"));
+    fs::remove_dir_all(&sibling).expect("the sibling can be removed");
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let log = fs::read_to_string(case.folder().join("second.log")).expect("the log was written");
+    let created: Vec<&str> = log.lines().filter(|line| line.starts_with("gate: remote created ")).collect();
+    assert_eq!(created.len(), 1, "the sibling's bare alone is created: {log}");
+    assert!(created[0].ends_with(&format!("{}.git", repo_name(&name))), "{created:?}");
+    assert_ne!(sibling_pushed, "", "the sibling's snapshot was pushed: {outcome:?}");
+    assert_eq!(sibling_bridge, "", "no bridge to the new bare: {outcome:?}");
+    assert_ne!(
+        builder_ref(&case, &format!("refs/gate-bridge/{key}")),
+        "",
+        "the main one's bridge: {outcome:?}"
+    );
+}
+
+/// `--test-remote-snapshot` snapshots every repository of a pair, the main one first: one line a repository, each
+/// commit made in its own repository.
+#[test]
+fn the_snapshot_seam_snapshots_every_repo_of_a_pair() {
+    let (case, _, _, sibling) = pair_case("snapshot-pair", sibling_repository);
+
+    let outcome = finish(case.gate(&snapshot_words("out.log", &[])));
+    let commits: Vec<String> = outcome
+        .stderr
+        .lines()
+        .filter_map(|line| line.strip_prefix(SAID))
+        .map(|line| line.split_once(" bridge ").expect("the line names the bridge").0.to_owned())
+        .collect();
+    let in_sibling = commits
+        .get(1)
+        .map(|commit| git_out(&case, &[], &["-C", &shown(&sibling), "cat-file", "-t", commit]));
+    fs::remove_dir_all(&sibling).expect("the sibling can be removed");
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(commits.len(), 2, "one snapshot line a repository: {outcome:?}");
+    assert_eq!(git_out(&case, &[], &["cat-file", "-t", &commits[0]]), "commit", "the main one's first");
+    assert_eq!(in_sibling.as_deref(), Some("commit"), "the sibling's second, in its own repository");
+}
+
+/// A pair whose sibling alone pins an SDK the builder lacks is refused `parity` before any push, the mismatch line
+/// naming the sibling's repository: each repository's own `global.json` is checked.
+#[test]
+fn a_pair_whose_sibling_pins_an_sdk_the_builder_lacks_is_refused_parity() {
+    let (case, _, name, sibling) = pair_case("client-pair-parity", |case, sibling| {
+        sibling_repository(case, sibling);
+        fs::write(sibling.join("global.json"), r#"{"sdk": {"version": "999.0.0"}}"#).expect("the sibling's global.json can be written");
+    });
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+    let mut gate = client_gate(&case, "out.log", &steps, &[r".\tool.exe", "out", "ran here"]);
+    gate.env("PATH", box_path_with_dotnet(&case, &[BUILDER_SDK]));
+
+    let (pid, outcome) = finish_with_pid(gate);
+    fs::remove_dir_all(&sibling).expect("the sibling can be removed");
+
+    assert_eq!(outcome.code, Some(0), "the run here passed: {outcome:?}");
+    assert_eq!(fallbacks(&own(&case, pid)), ["parity"], "{outcome:?}");
+    let mismatch = format!(
+        "gate: remote toolchain mismatch: {} needs .NET SDK 999.0.0 (rollForward patch); builder has {BUILDER_SDK}",
+        repo_name(&name)
+    );
+    assert!(outcome.stderr.lines().any(|said| said == mismatch), "{mismatch}: {outcome:?}");
+    assert_eq!(calls(&steps), ["preflight"], "the preflight alone reached the builder");
+    let key = key_of(&events(&case));
+    assert_eq!(
+        builder_ref(&case, &format!("refs/gate/{key}")),
+        "",
+        "nothing was pushed, the main repository first"
+    );
+}
+
+/// A run of one repository whose push fails, through `local-ssh`, keeps the run here as `unreachable` with no run call,
+/// and the command runs here, its output on standard output.
+#[test]
+fn a_run_whose_push_fails_falls_back_and_runs_here() {
+    let case = client_case("client-push-fails");
+    let steps = ssh_steps(&case, "ssh", &["ok", "fail-other"]);
+
+    let outcome = finish(client_gate_through(
+        &case,
+        "local-ssh",
+        "out.log",
+        &steps,
+        &[r".\tool.exe", "out", "ran here"],
+    ));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(outcome.stdout.contains("ran here"), "the command ran here: {outcome:?}");
+    let log = fs::read_to_string(case.folder().join("out.log")).expect("the log was written");
+    assert!(log.lines().any(|line| line == "ran here"), "the command ran here: {log}");
+    assert!(outcome.stderr.contains("gate: pushing the snapshot to "), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "git-receive-pack"], "no run call");
+    assert_eq!(fallbacks(&events(&case)), ["unreachable"]);
 }
 
 /// A sibling that is a worktree of the main repository's own repository shares its refs, so the run stays here naming
