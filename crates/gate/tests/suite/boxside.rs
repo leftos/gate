@@ -3,9 +3,12 @@
 
 use std::ffi::OsString;
 use std::fs;
+use std::io::Write;
+use std::ops::{Deref, DerefMut};
 use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{ChildStdin, Command};
+use std::thread;
 use std::time::Duration;
 
 use base64::Engine;
@@ -17,15 +20,15 @@ use regex::Regex;
 use serde_json::{Value, json};
 
 use crate::support::{
-    Case, Closed, Escapee, FAKE_TOOL, GIT_REDIRECTS, Go, Outcome, Running, allow_breakaway, box_payload, build_version, copy_tool, finish, shown,
-    start, start_with_closed, wait_until, wait_until_closed,
+    Case, Closed, Escapee, FAKE_TOOL, GIT_REDIRECTS, Go, Outcome, Running, allow_breakaway, box_payload, build_version, copy_tool, finish, junction,
+    shown, start_with_closed, start_with_stdin, wait_until, wait_until_closed,
 };
 
 mod outputs;
 
-const BOX_USAGE: &str = "usage: gate box preflight|run|stop|boot|outputs|inflight <base64 JSON payload>\n";
+const BOX_USAGE: &str = "usage: gate box preflight|run|stop|boot|outputs|inflight --stdin (the base64 JSON request as stdin's first line)\n";
 
-/// The payload word for `json`, as the remote client encodes it.
+/// The request line for `json`, as the remote client encodes it: base64 of the JSON, without its newline.
 fn payload(json: &Value) -> String {
     STANDARD.encode(json.to_string())
 }
@@ -34,12 +37,78 @@ fn payload(json: &Value) -> String {
 /// a case's output however slow a loaded machine makes the run.
 const QUIET_HEARTBEAT_MS: &str = "2147483647";
 
-/// `gate box` with `args` after `box`, its heartbeat period [`QUIET_HEARTBEAT_MS`], without the git variables the
-/// suite may have inherited.
-fn box_command(case: &Case, args: &[&str]) -> Command {
+/// A `gate box … --stdin` not yet started and the request it reads as stdin's first line, which each start writes. It
+/// derefs to its command, so a case sets the box's environment as on any command.
+struct BoxCall {
+    command: Command,
+    request: String,
+}
+
+impl BoxCall {
+    /// Starts the box with its request line written and its stdin left open, for the case to write more or to drop.
+    fn start_with_stdin(self) -> (Running, ChildStdin) {
+        let (running, mut stdin) = start_with_stdin(self.command);
+        send_request(&mut stdin, &self.request);
+        (running, stdin)
+    }
+
+    /// Starts the box with its request line written and its stdin then closed.
+    fn start(self) -> Running {
+        let (running, stdin) = self.start_with_stdin();
+        drop(stdin);
+        running
+    }
+
+    /// Runs the box to its end, its request line written and its stdin then closed.
+    fn finish(self) -> Outcome {
+        self.start().finish()
+    }
+
+    /// Starts the box as [`start_with_closed`] does, its request line written and its stdin then closed.
+    fn start_with_closed(self, closed: Closed) -> Running {
+        let (running, mut stdin) = start_with_closed(closed, self.command);
+        send_request(&mut stdin, &self.request);
+        drop(stdin);
+        running
+    }
+}
+
+impl Deref for BoxCall {
+    type Target = Command;
+
+    fn deref(&self) -> &Command {
+        &self.command
+    }
+}
+
+impl DerefMut for BoxCall {
+    fn deref_mut(&mut self) -> &mut Command {
+        &mut self.command
+    }
+}
+
+/// Writes `request` and its newline to the box's stdin. A write that fails because the box has already gone is left to
+/// the case's assertions on what the box said, since a box that never read its request says so.
+fn send_request(stdin: &mut ChildStdin, request: &str) {
+    drop(stdin.write_all(format!("{request}\n").as_bytes()));
+}
+
+/// `gate box` with `args` after `box` (the seams, then the verb) and `--stdin`, its heartbeat period
+/// [`QUIET_HEARTBEAT_MS`], without the git variables the suite may have inherited; `request` is its stdin's first line.
+fn box_call(case: &Case, args: &[&str], request: &str) -> BoxCall {
     let mut words = vec!["box", "--test-heartbeat-ms", QUIET_HEARTBEAT_MS];
     words.extend_from_slice(args.strip_prefix(&["box"][..]).unwrap_or(args));
-    bare_box_command(case, &words)
+    bare_box_call(case, &words, request)
+}
+
+/// [`box_call`] with `args` as they are, no seam added.
+fn bare_box_call(case: &Case, args: &[&str], request: &str) -> BoxCall {
+    let mut words = args.to_vec();
+    words.push("--stdin");
+    BoxCall {
+        command: bare_box_command(case, &words),
+        request: request.to_owned(),
+    }
 }
 
 /// The gate with `args` as they are, no seam added, without the git variables the suite may have inherited.
@@ -51,13 +120,13 @@ fn bare_box_command(case: &Case, args: &[&str]) -> Command {
     command
 }
 
-/// `gate box <verb> <payload>` with `PATH` set to `path` when given.
-fn gate_box(case: &Case, verb: &str, payload: &str, path: Option<&OsString>) -> Outcome {
-    let mut command = box_command(case, &["box", verb, payload]);
+/// `gate box <verb> --stdin` of the request line `request`, with `PATH` set to `path` when given, to its end.
+fn gate_box(case: &Case, verb: &str, request: &str, path: Option<&OsString>) -> Outcome {
+    let mut call = box_call(case, &["box", verb], request);
     if let Some(path) = path {
-        command.env("PATH", path);
+        call.env("PATH", path);
     }
-    finish(command)
+    call.finish()
 }
 
 /// A preflight's two folders under the case folder, the bare repository's parent not yet made.
@@ -194,14 +263,18 @@ fn preflight_creates_the_bare_repo_and_work_folder() {
 }
 
 #[test]
-fn preflight_keeps_alternates_with_other_content_and_rewrites_an_empty_one() {
-    let case = Case::new("preflight_keeps_alternates_with_other_content");
+fn preflight_rewrites_alternates_with_other_content_and_an_empty_one() {
+    let case = Case::new("preflight_rewrites_alternates_with_other_content");
     let folders = Folders::new(&case);
     passed(&gate_box(&case, "preflight", &folders.payload(), None));
 
     fs::write(folders.alternates_path(), "C:/other/objects\n").expect("the alternates file can be written");
     passed(&gate_box(&case, "preflight", &folders.payload(), None));
-    assert_eq!(folders.alternates(), b"C:/other/objects\n", "other content is kept");
+    assert_eq!(
+        folders.alternates(),
+        folders.written_alternates(),
+        "other content names the tree's own bare again"
+    );
 
     fs::write(folders.alternates_path(), "").expect("the alternates file can be emptied");
     passed(&gate_box(&case, "preflight", &folders.payload(), None));
@@ -212,8 +285,8 @@ fn preflight_keeps_alternates_with_other_content_and_rewrites_an_empty_one() {
 fn preflight_a_failing_git_step_exits_with_its_status() {
     let case = Case::new("preflight_a_failing_git_step");
     let folders = Folders::new(&case);
-    fs::create_dir_all(&folders.work).expect("the work folder can be made");
-    fs::write(Path::new(&folders.work).join(".git"), "junk").expect("a junk .git file can be written");
+    // An empty `.git` folder is no repository, so its first git step fails; a `.git` that is not a folder is skipped.
+    fs::create_dir_all(Path::new(&folders.work).join(".git")).expect("an empty .git folder can be made");
     let shape = Regex::new(r"(?m)^gate: remote git [a-z .-]+ failed \(status (-?\d+)\)$").expect("the pattern compiles");
 
     let outcome = gate_box(&case, "preflight", &folders.payload(), None);
@@ -386,10 +459,10 @@ fn preflight_a_dotnet_that_does_not_answer_is_an_unreadable_sdk_list() {
         held.display()
     );
     fs::write(stub.join("dotnet.cmd"), hang).expect("the dotnet stub can be written");
-    let mut command = box_command(&case, &["box", "--test-dotnet-limit-ms", "1000", "preflight", &folders.payload()]);
+    let mut command = box_call(&case, &["box", "--test-dotnet-limit-ms", "1000", "preflight"], &folders.payload());
     command.env("PATH", path_with_git(&[stub]));
 
-    let outcome = finish(command);
+    let outcome = command.finish();
 
     // A stub that started holds its output file open until its job's kill ends it; one the kill came first never made it.
     if held.exists() {
@@ -441,6 +514,315 @@ fn preflight_does_not_run_a_dotnet_in_its_working_folder() {
     assert!(!marker.exists(), "the dotnet.cmd in the working folder ran");
 }
 
+/// A folder `stub` under the case folder holding each `(name, body)` of `tools` as `<name>.cmd`.
+fn tool_stubs(case: &Case, tools: &[(&str, &str)]) -> PathBuf {
+    let stub = case.folder().join("stub");
+    fs::create_dir_all(&stub).expect("the stub folder can be made");
+    for (name, body) in tools {
+        fs::write(stub.join(format!("{name}.cmd")), body).expect("a tool stub can be written");
+    }
+    stub
+}
+
+/// The preflight payload of `folders` with `Needs` set to `needs`, as the remote client sends a manifest's tools.
+fn needing(folders: &Folders, needs: &Value) -> String {
+    payload(&json!({
+        "Key": "k",
+        "Bare": folders.bare,
+        "Work": folders.work,
+        "Lock": format!("{}.lock", folders.work),
+        "Job": "unused",
+        "Needs": needs,
+    }))
+}
+
+/// `gate box preflight` of a payload needing `needs`, its `PATH` the stubs of `tools` then git's folder, so no dotnet is
+/// found and the sdks line says `none`.
+fn probed(case: &Case, needs: &Value, tools: &[(&str, &str)]) -> Outcome {
+    let folders = Folders::new(case);
+    let stub = tool_stubs(case, tools);
+    let mut command = box_call(
+        case,
+        &["box", "--test-probe-limit-ms", UNREACHED_PROBE_LIMIT_MS, "preflight"],
+        &needing(&folders, needs),
+    );
+    command.env("PATH", path_with_git(&[stub]));
+    command.finish()
+}
+
+/// The probe bound every probe case passes but the one about the bound: long enough that no probe of a case reaches it
+/// however slow a loaded machine makes the run, so only that one case depends on a deadline.
+const UNREACHED_PROBE_LIMIT_MS: &str = "120000";
+
+/// The stdout lines of a passed preflight after its sdks line.
+fn after_sdks(outcome: &Outcome) -> Vec<&str> {
+    let printed = passed(outcome);
+    let sdks = printed.iter().position(|line| *line == "gate: remote sdks none");
+    assert!(sdks.is_some(), "the preflight says its sdks line: {outcome:?}");
+    printed[sdks.map_or(printed.len(), |sdks| sdks + 1)..].to_vec()
+}
+
+#[test]
+fn preflight_probes_a_need_after_the_sdks_line() {
+    let case = Case::new("preflight_probes_a_need_after_the_sdks_line");
+
+    let outcome = probed(&case, &json!({"node": "24"}), &[("node", "@echo v24.19.0\r\n")]);
+
+    assert_eq!(after_sdks(&outcome), ["gate: remote tool node 24.19.0"], "{outcome:?}");
+}
+
+#[test]
+fn preflight_says_one_line_per_need_in_the_payload_s_order() {
+    let case = Case::new("preflight_one_line_per_need");
+    let plugin = "@echo off\r\nif \"%1\"==\"nextest\" echo cargo-nextest 0.9.100 (abc 2026-01-01)\r\n";
+
+    let outcome = probed(
+        &case,
+        &json!({"rust": "1.89", "node": "", "cargo-nextest": "0.9.100", "pwsh": ""}),
+        &[
+            ("rustc", "@echo rustc 1.99.0 (b940084d7 2026-09-28)\r\n"),
+            ("node", "@echo v24.19.0\r\n"),
+            ("cargo-nextest", plugin),
+            ("pwsh", "@echo PowerShell 7.6.6\r\n"),
+        ],
+    );
+
+    assert_eq!(
+        after_sdks(&outcome),
+        [
+            "gate: remote tool rust 1.99.0",
+            "gate: remote tool node 24.19.0",
+            "gate: remote tool cargo-nextest 0.9.100",
+            "gate: remote tool pwsh 7.6.6",
+        ],
+        "{outcome:?}"
+    );
+}
+
+#[test]
+fn preflight_says_a_tool_it_does_not_find_is_missing() {
+    let case = Case::new("preflight_tool_missing");
+
+    let outcome = probed(&case, &json!({"pnpm": "10"}), &[]);
+
+    assert_eq!(after_sdks(&outcome), ["gate: remote tool pnpm missing"], "{outcome:?}");
+}
+
+#[test]
+fn preflight_a_tool_with_no_readable_version_is_present() {
+    let case = Case::new("preflight_tool_present");
+
+    let outcome = probed(
+        &case,
+        &json!({"ffmpeg": ""}),
+        &[(
+            "ffmpeg",
+            "@echo off\r\necho ffmpeg version N-117456-gabc Copyright (c) 2000-2026\r\necho built with gcc 14.2.0\r\n",
+        )],
+    );
+
+    assert_eq!(after_sdks(&outcome), ["gate: remote tool ffmpeg present"], "{outcome:?}");
+}
+
+/// The version is read from the first line alone: ffmpeg's second line names the compiler's version, not its own.
+#[test]
+fn preflight_reads_a_tool_s_version_from_its_first_line() {
+    let case = Case::new("preflight_tool_first_line");
+    let ffmpeg = "@echo off\r\necho ffmpeg version 9.0.2-full_build-www.gyan.dev Copyright (c) 2000-2026\r\necho built with gcc 14.2.0\r\n";
+
+    let outcome = probed(&case, &json!({"ffmpeg": "9"}), &[("ffmpeg", ffmpeg)]);
+
+    assert_eq!(after_sdks(&outcome), ["gate: remote tool ffmpeg 9.0.2"], "{outcome:?}");
+}
+
+/// The tool probes run while dotnet lists the SDKs: the dotnet stub answers only once the node stub has run, which a
+/// preflight that probed after the SDK read would never let it do. Neither stub's wait ends on a clock but fake-tool's
+/// own wait limit, which only the serial order reaches.
+#[test]
+fn preflight_probes_the_tools_while_dotnet_lists_the_sdks() {
+    let case = Case::new("preflight_probes_beside_dotnet");
+    let folders = Folders::new(&case);
+    let go = case.folder().join("node-ran");
+    let dotnet = format!("@echo off\r\n\"{FAKE_TOOL}\" wait \"{}\"\r\necho 8.0.404 [C:\\stub]\r\n", go.display());
+    let node = format!("@echo off\r\ntype nul >\"{}\"\r\necho v24.19.0\r\n", go.display());
+    let stub = tool_stubs(&case, &[("dotnet", &dotnet), ("node", &node)]);
+    let mut command = box_call(
+        &case,
+        &[
+            "box",
+            "--test-dotnet-limit-ms",
+            UNREACHED_PROBE_LIMIT_MS,
+            "--test-probe-limit-ms",
+            UNREACHED_PROBE_LIMIT_MS,
+            "preflight",
+        ],
+        &needing(&folders, &json!({"node": ""})),
+    );
+    command.env("PATH", path_with_git(&[stub]));
+
+    let outcome = command.finish();
+
+    let printed = passed(&outcome);
+    assert_eq!(
+        printed[printed.len().saturating_sub(2)..],
+        ["gate: remote sdks 8.0.404", "gate: remote tool node 24.19.0"],
+        "{outcome:?}"
+    );
+}
+
+/// A `cargo` on `PATH` that marks `marker` when it runs and answers as cargo-nextest would through it.
+fn cargo_decoy(marker: &Path) -> String {
+    format!(
+        "@echo off\r\n>\"{}\" echo ran\r\necho cargo-nextest 0.9.1 (decoy 2026-01-01)\r\n",
+        marker.display()
+    )
+}
+
+/// cargo-nextest is probed by running the plugin itself, never through cargo, which would read a `.cargo\config.toml`
+/// above its working folder and run the alias one defines: a cargo on `PATH` is never run.
+#[test]
+fn preflight_probes_cargo_nextest_as_the_plugin_and_never_through_cargo() {
+    let lacking = Case::new("preflight_cargo_without_nextest");
+    let marker = lacking.folder().join("cargo-ran");
+
+    let outcome = probed(&lacking, &json!({"cargo-nextest": ""}), &[("cargo", &cargo_decoy(&marker))]);
+
+    assert_eq!(after_sdks(&outcome), ["gate: remote tool cargo-nextest missing"], "{outcome:?}");
+    assert!(!marker.exists(), "cargo ran for the probe");
+
+    let having = Case::new("preflight_cargo_with_nextest");
+    let marker = having.folder().join("cargo-ran");
+    let plugin = "@echo off\r\nif \"%1\"==\"nextest\" if \"%2\"==\"--version\" echo cargo-nextest 0.9.148 (cd1d6d546 2026-10-07)\r\n";
+
+    let outcome = probed(
+        &having,
+        &json!({"cargo-nextest": "0.9.100"}),
+        &[("cargo", &cargo_decoy(&marker)), ("cargo-nextest", plugin)],
+    );
+
+    assert_eq!(after_sdks(&outcome), ["gate: remote tool cargo-nextest 0.9.148"], "{outcome:?}");
+    assert!(!marker.exists(), "cargo ran for the probe");
+}
+
+/// A tool that never answers is ended with its job at the bound `--test-probe-limit-ms` sets, and said skipped; the
+/// preflight still passes. Only the bound ends the probe, so no load changes what the preflight says.
+#[test]
+fn preflight_a_tool_that_does_not_answer_is_skipped_with_a_line() {
+    let case = Case::new("preflight_tool_hangs");
+    let folders = Folders::new(&case);
+    let go = Go(case.folder().join("node-go"));
+    let held = case.folder().join("node-held");
+    let hang = format!(
+        "@echo off\r\n\"{FAKE_TOOL}\" wait \"{}\" >\"{}\"\r\n",
+        go.path().display(),
+        held.display()
+    );
+    let stub = tool_stubs(&case, &[("node", &hang)]);
+    let needs = json!({"node": "24"});
+    let mut command = box_call(&case, &["box", "--test-probe-limit-ms", "1000", "preflight"], &needing(&folders, &needs));
+    command.env("PATH", path_with_git(&[stub]));
+
+    let outcome = command.finish();
+
+    // A stub that started holds its output file open until its job's kill ends it; one the kill came first never made it.
+    if held.exists() {
+        wait_until_closed(&held);
+    }
+    assert_eq!(after_sdks(&outcome), ["gate: remote tool node skipped: no answer in 1 s"], "{outcome:?}");
+}
+
+/// A tool runs in the system folder, not the folder `gate box` was started in: the stub writes the folder it runs in,
+/// and a `pnpm.cmd` in the working folder, which no `PATH` folder names, is not run.
+#[test]
+fn preflight_runs_a_tool_in_the_system_folder_and_not_the_working_folder() {
+    let case = Case::new("preflight_tool_folder");
+    let ran_in = case.folder().join("node-folder");
+    let node = format!("@echo off\r\n>\"{}\" echo %CD%\r\necho v24.19.0\r\n", ran_in.display());
+    let marker = case.folder().join("pnpm-ran");
+    let decoy = format!("@echo off\r\n>\"{}\" echo ran\r\necho 10.0.0\r\n", marker.display());
+    fs::write(case.folder().join("pnpm.cmd"), decoy).expect("the pnpm in the working folder can be written");
+
+    let outcome = probed(&case, &json!({"node": "", "pnpm": ""}), &[("node", &node)]);
+
+    assert_eq!(
+        after_sdks(&outcome),
+        ["gate: remote tool node 24.19.0", "gate: remote tool pnpm missing"],
+        "{outcome:?}"
+    );
+    let ran_in = fs::read_to_string(&ran_in).expect("the stub wrote the folder it ran in");
+    let system = gate_win32::system_directory().expect("the system folder can be read");
+    let system = system.to_string_lossy();
+    assert!(
+        ran_in.trim_end().eq_ignore_ascii_case(system.trim_end_matches('\\')),
+        "{system}: {ran_in:?}"
+    );
+    assert!(!marker.exists(), "the pnpm.cmd in the working folder ran");
+}
+
+#[test]
+fn preflight_a_need_that_is_not_an_object_of_texts_is_said_and_the_preflight_passes() {
+    for (name, needs) in [("list", json!(["node"])), ("number", json!({"node": 24})), ("text", json!("node"))] {
+        let case = Case::new(&format!("preflight_bad_needs_{name}"));
+
+        let outcome = probed(&case, &needs, &[("node", "@echo v24.19.0\r\n")]);
+
+        assert_eq!(outcome.code, Some(0), "{name}: {outcome:?}");
+        assert_eq!(
+            lines(&outcome.stdout).last(),
+            Some(&"gate: remote sdks none"),
+            "{name}: nothing is probed: {outcome:?}"
+        );
+        let said = "gate: box payload Needs is not an object of texts; probing nothing";
+        assert!(outcome.stderr.lines().any(|line| line == said), "{name}: {outcome:?}");
+    }
+}
+
+#[test]
+fn preflight_a_tool_name_it_does_not_know_is_skipped() {
+    let case = Case::new("preflight_unknown_tool");
+    let marker = case.folder().join("nodejs-ran");
+    let nodejs = format!("@echo off\r\n>\"{}\" echo ran\r\necho v24.19.0\r\n", marker.display());
+
+    let outcome = probed(&case, &json!({"nodejs": "24"}), &[("nodejs", &nodejs)]);
+
+    assert_eq!(after_sdks(&outcome), ["gate: remote tool nodejs skipped: unknown tool"], "{outcome:?}");
+    assert!(!marker.exists(), "a program the payload names is never run");
+}
+
+#[test]
+fn preflight_godot_is_skipped_with_no_probe() {
+    let case = Case::new("preflight_godot_skipped");
+    let marker = case.folder().join("godot-ran");
+    let godot = format!("@echo off\r\n>\"{}\" echo ran\r\necho 4.7.2.stable\r\n", marker.display());
+
+    let outcome = probed(&case, &json!({"godot": "4.7.2"}), &[("godot", &godot)]);
+
+    assert_eq!(
+        after_sdks(&outcome),
+        ["gate: remote tool godot skipped: no probe for godot"],
+        "{outcome:?}"
+    );
+    assert!(!marker.exists(), "godot is not run");
+}
+
+#[test]
+fn preflight_without_needs_says_nothing_after_the_sdks_line() {
+    for (name, needs) in [("empty", json!({})), ("null", Value::Null)] {
+        let case = Case::new(&format!("preflight_no_needs_{name}"));
+
+        let outcome = probed(&case, &needs, &[("node", "@echo v24.19.0\r\n")]);
+
+        assert_eq!(after_sdks(&outcome), Vec::<&str>::new(), "{name}: {outcome:?}");
+    }
+    let case = Case::new("preflight_no_needs_absent");
+    let folders = Folders::new(&case);
+    let stub = tool_stubs(&case, &[("node", "@echo v24.19.0\r\n")]);
+
+    let outcome = gate_box(&case, "preflight", &folders.payload(), Some(&path_with_git(&[stub])));
+
+    assert_eq!(after_sdks(&outcome), Vec::<&str>::new(), "absent: {outcome:?}");
+}
+
 #[test]
 fn preflight_version_line_is_the_build_version() {
     let case = Case::new("preflight_version_line_is_the_build_version");
@@ -459,7 +841,13 @@ fn preflight_version_line_is_the_build_version() {
 fn box_usage_and_payload_errors_exit_2() {
     let case = Case::new("box_usage_and_payload_errors_exit_2");
     let folders = Folders::new(&case);
-    for args in [&["box"][..], &["box", "launch", "e30="]] {
+    let shapes: [&[&str]; 4] = [
+        &["box"],
+        &["box", "launch", "--stdin"],
+        &["box", "preflight"],
+        &["box", "preflight", "e30="],
+    ];
+    for args in shapes {
         let outcome = finish(bare_box_command(&case, args));
 
         assert_eq!(outcome.code, Some(2), "{args:?}");
@@ -467,24 +855,102 @@ fn box_usage_and_payload_errors_exit_2() {
         assert_eq!(outcome.stderr, BOX_USAGE, "{args:?}: the box usage alone");
     }
 
-    let not_base64 = finish(bare_box_command(&case, &["box", "preflight", "not-base64!"]));
-    assert_eq!(not_base64.code, Some(2));
-    assert_eq!(not_base64.stdout, "");
-    assert!(not_base64.stderr.starts_with("gate: box payload is not base64 JSON: "), "{not_base64:?}");
-    assert_eq!(lines(&not_base64.stderr).len(), 1, "{not_base64:?}");
-
-    let not_an_object = finish(bare_box_command(&case, &["box", "preflight", &payload(&json!(["Bare", "Work"]))]));
+    let not_an_object = bare_box_call(&case, &["box", "preflight"], &payload(&json!(["Bare", "Work"]))).finish();
     assert_eq!(not_an_object.code, Some(2));
     assert_eq!(not_an_object.stdout, "");
     assert_eq!(not_an_object.stderr, "gate: box payload is not base64 JSON: the JSON is not an object\n");
 
-    let lacking = finish(bare_box_command(&case, &["box", "preflight", &payload(&json!({"Bare": folders.bare}))]));
+    let lacking = bare_box_call(&case, &["box", "preflight"], &payload(&json!({"Bare": folders.bare}))).finish();
     assert_eq!(lacking.code, Some(2));
     assert_eq!(lacking.stdout, "");
     assert_eq!(lacking.stderr, "gate: box payload lacks Work\n");
     assert!(!Path::new(&folders.bare).exists(), "nothing is made for a payload the box refuses");
 
     assert!(!case.run(&["--help"]).stdout.contains("box"), "gate box is hidden from the usage");
+}
+
+#[test]
+fn a_box_call_without_a_request_on_stdin_is_a_usage_error() {
+    let case = Case::new("box_request_missing");
+    let folders = Folders::new(&case);
+
+    let (running, stdin) = start_with_stdin(bare_box_command(&case, &["box", "preflight", "--stdin"]));
+    drop(stdin);
+    let outcome = running.finish();
+
+    assert_eq!(outcome.code, Some(2), "{outcome:?}");
+    assert_eq!(outcome.stdout, "", "{outcome:?}");
+    assert_eq!(outcome.stderr, "gate: the box request is missing on standard input\n");
+    assert!(!Path::new(&folders.bare).exists(), "nothing is made without a request");
+}
+
+/// The most bytes the box reads of its request line: 16 MiB.
+const REQUEST_LIMIT: usize = 16 * 1024 * 1024;
+
+#[test]
+fn a_box_request_over_the_cap_is_a_usage_error() {
+    let case = Case::new("box_request_over_cap");
+
+    let (running, mut stdin) = start_with_stdin(bare_box_command(&case, &["box", "preflight", "--stdin"]));
+    // The box stops reading at the cap and exits, so the write is a thread's: the case waits on the box, not the write,
+    // which fails once the box has gone or ends in the pipe and the box's own buffer; either way the box said its line.
+    let writer = thread::spawn(move || drop(stdin.write_all(&vec![b'A'; REQUEST_LIMIT + 1])));
+    let outcome = running.finish();
+    writer.join().expect("the writer thread ends");
+
+    assert_eq!(outcome.code, Some(2), "{outcome:?}");
+    assert_eq!(outcome.stdout, "", "{outcome:?}");
+    assert_eq!(
+        outcome.stderr,
+        "gate: the box request on standard input reaches 16 MiB without a newline\n"
+    );
+}
+
+#[test]
+fn a_box_request_that_is_not_base64_json_is_a_usage_error() {
+    let case = Case::new("box_request_not_base64");
+
+    for request in ["not-base64!", ""] {
+        let outcome = bare_box_call(&case, &["box", "preflight"], request).finish();
+
+        assert_eq!(outcome.code, Some(2), "{request:?}: {outcome:?}");
+        assert_eq!(outcome.stdout, "", "{request:?}: {outcome:?}");
+        assert!(
+            outcome.stderr.starts_with("gate: box payload is not base64 JSON: "),
+            "{request:?}: {outcome:?}"
+        );
+        assert_eq!(lines(&outcome.stderr).len(), 1, "{request:?}: {outcome:?}");
+    }
+}
+
+#[test]
+fn every_box_verb_reads_its_request_from_stdin() {
+    let case = Case::new("box_request_every_verb");
+    let folders = Folders::new(&case);
+    let request = folders.payload();
+
+    let preflight = box_call(&case, &["box", "preflight"], &request).finish();
+    assert_eq!(preflight.code, Some(0), "{preflight:?}");
+    assert!(Path::new(&folders.bare).exists(), "the preflight made the bare repository: {preflight:?}");
+
+    let run = payload(&box_payload(&case, "k", &[]));
+    let stop = box_call(&case, &["box", "stop"], &run).finish();
+    assert_eq!(stop.code, Some(0), "no job to stop is no failure: {stop:?}");
+    assert_eq!((stop.stdout.as_str(), stop.stderr.as_str()), ("", ""), "{stop:?}");
+
+    let boot = box_call(&case, &["box", "boot"], &payload(&json!({}))).finish();
+    assert_eq!(boot.code, Some(0), "{boot:?}");
+    assert!(boot.stdout.starts_with("gate: remote boot "), "{boot:?}");
+
+    let outputs = box_call(&case, &["box", "outputs"], &run).finish();
+    assert_eq!(outputs.code, Some(2), "the request reached the verb, which wants a Name: {outputs:?}");
+    assert_eq!(outputs.stderr, "gate: box payload lacks Name\n");
+
+    let root = case.folder().join("remote");
+    fs::create_dir_all(root.join("work")).expect("the work folder can be made");
+    let inflight = box_call(&case, &["box", "inflight"], &inflight_payload(&root)).finish();
+    assert_eq!(inflight.code, Some(0), "{inflight:?}");
+    assert_eq!(inflight.stdout, "gate: remote in flight 0\n", "{inflight:?}");
 }
 
 /// The payload's text at `key`.
@@ -526,7 +992,13 @@ fn snapshot(case: &Case, payload: &mut Value, files: &[(&str, &str)]) -> String 
 /// repository, as the client sends a snapshot, leaving the payload's `Snapshot` as it is; the commit. The payload's
 /// work folder must have had a preflight, which makes the bare repository; this makes the source repository.
 fn push_snapshot(case: &Case, payload: &Value, files: &[(&str, &str)]) -> String {
-    let source = case.folder().join("source");
+    push_repo_snapshot(case, "source", field(payload, "Bare"), field(payload, "Key"), files)
+}
+
+/// Commits `files` in the case's source repository `source`, made when missing, and pushes the commit to
+/// `refs/gate/<key>` in the bare repository `bare`, as the client sends a snapshot of one repo; the commit.
+fn push_repo_snapshot(case: &Case, source: &str, bare: &str, key: &str, files: &[(&str, &str)]) -> String {
+    let source = case.folder().join(source);
     let source_text = source.to_str().expect("the case folder is Unicode").to_owned();
     if !source.exists() {
         git(&["init", "-q", &source_text]);
@@ -551,18 +1023,64 @@ fn push_snapshot(case: &Case, payload: &Value, files: &[(&str, &str)]) -> String
         "-m",
         "snapshot",
     ]);
-    let target = format!("HEAD:refs/gate/{}", field(payload, "Key"));
-    git(&["-C", &source_text, "push", "-q", "--force", field(payload, "Bare"), &target]);
+    let target = format!("HEAD:refs/gate/{key}");
+    git(&["-C", &source_text, "push", "-q", "--force", bare, &target]);
     git(&["-C", &source_text, "rev-parse", "HEAD"])
+}
+
+/// The work-folder key of the leaf `app`, as the client makes it, which a pair payload's `Key` must be.
+const PAIR_KEY: &str = "app-1a2b3c4d";
+
+/// The payload of a `gate box run` of `command` for the sibling pair of the main checkout `app` and `siblings`, laid
+/// out as [`box_payload`] lays out a run of one repo, under the key [`PAIR_KEY`].
+fn pair_payload(case: &Case, siblings: &[&str], command: &[&str]) -> Value {
+    let mut payload = box_payload(case, PAIR_KEY, command);
+    payload["Pair"] = json!({"Leaf": "app", "Siblings": siblings});
+    payload
+}
+
+/// The bare repository of the sibling `name` of `payload`, beside the main repo's, as the box derives it.
+fn sibling_bare(payload: &Value, name: &str) -> String {
+    let bare = Path::new(field(payload, "Bare")).with_file_name(format!("{name}.git"));
+    bare.to_str().expect("the case folder is Unicode").to_owned()
+}
+
+/// The tree of the repo `name`, the leaf or a sibling, in the work folder of the pair payload `payload`.
+fn pair_tree(payload: &Value, name: &str) -> String {
+    let tree = Path::new(field(payload, "Work")).join(name);
+    tree.to_str().expect("the case folder is Unicode").to_owned()
+}
+
+/// Readies the pair payload's bare repositories with a preflight, then commits `main` in the case's source repository
+/// and each sibling's files in a source repository of its own, pushes each commit to `refs/gate/<key>` in its repo's
+/// bare repository, and records them as the payload's `Snapshot` and `SiblingSnapshots`; the commits, the main first.
+fn pair_snapshot(case: &Case, payload: &mut Value, main: &[(&str, &str)], siblings: &[(&str, &[(&str, &str)])]) -> Vec<String> {
+    allow_breakaway();
+    passed(&gate_box(case, "preflight", &self::payload(payload), None));
+    let mut commits = vec![push_snapshot(case, payload, main)];
+    let mut snapshots = serde_json::Map::new();
+    for (name, files) in siblings {
+        let commit = push_repo_snapshot(case, &format!("source-{name}"), &sibling_bare(payload, name), PAIR_KEY, files);
+        snapshots.insert((*name).to_owned(), json!(commit));
+        commits.push(commit);
+    }
+    payload["Snapshot"] = json!(commits[0]);
+    payload["SiblingSnapshots"] = Value::Object(snapshots);
+    commits
 }
 
 /// Whether the bare repository of `payload` has the ref `name`.
 fn has_ref(payload: &Value, name: &str) -> bool {
+    has_ref_in(field(payload, "Bare"), name)
+}
+
+/// Whether the bare repository `bare` has the ref `name`.
+fn has_ref_in(bare: &str, name: &str) -> bool {
     let mut command = Command::new("git");
     for variable in GIT_REDIRECTS {
         command.env_remove(variable);
     }
-    let bare = format!("--git-dir={}", field(payload, "Bare"));
+    let bare = format!("--git-dir={bare}");
     let output = command
         .args([bare.as_str(), "rev-parse", "--verify", "-q", name])
         .output()
@@ -578,9 +1096,9 @@ fn run_box(case: &Case, payload: &Value) -> Outcome {
 /// `gate box run` of `payload` with `name` set to `value` in the box's own environment, as a case about a variable the
 /// box inherits needs it.
 fn run_box_with_env(case: &Case, payload: &Value, name: &str, value: &str) -> Outcome {
-    let mut command = box_command(case, &["box", "run", &self::payload(payload)]);
+    let mut command = box_call(case, &["box", "run"], &self::payload(payload));
     command.env(name, value);
-    finish(command)
+    command.finish()
 }
 
 /// `gate box run` of `payload` with `PATH` set to `path` when given, as a case about dotnet runs it.
@@ -590,11 +1108,11 @@ fn run_box_with_path(case: &Case, payload: &Value, path: Option<&OsString>) -> O
 
 /// `gate box run` of `payload` with `PATH` set to `path`, started, as a case that stops it mid-run needs it.
 fn start_box_with_path(case: &Case, payload: &Value, path: Option<&OsString>) -> Running {
-    let mut command = box_command(case, &["box", "run", &self::payload(payload)]);
+    let mut command = box_call(case, &["box", "run"], &self::payload(payload));
     if let Some(path) = path {
         command.env("PATH", path);
     }
-    start(command)
+    command.start()
 }
 
 /// The tool manifest a restore case's snapshot holds; its bytes are what the work folder's record hashes.
@@ -659,7 +1177,7 @@ fn stub_git(stub: &Path, parked: &Path, go: &Path) {
 
 /// `gate box run` of `payload`, started.
 fn start_box(case: &Case, payload: &Value) -> Running {
-    start(box_command(case, &["box", "run", &self::payload(payload)]))
+    box_call(case, &["box", "run"], &self::payload(payload)).start()
 }
 
 fn let_go(go: &Path) {
@@ -1188,10 +1706,7 @@ fn box_run_beats_while_a_busy_command_runs() {
     let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "err", "started", "burn", &go_word, "exit", "7"]);
     snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
 
-    let running = start(bare_box_command(
-        &case,
-        &["box", "--test-heartbeat-ms", "30", "run", &self::payload(&payload)],
-    ));
+    let running = bare_box_call(&case, &["box", "--test-heartbeat-ms", "30", "run"], &self::payload(&payload)).start();
     // Beats come before the command too, and one may slip in between its first line and the watch; of two after that
     // line, the second came a period after the watch began, while the command burned.
     let beats_after_started = |stderr: &str| {
@@ -1224,10 +1739,7 @@ fn a_git_warning_is_never_split_by_a_heartbeat() {
     let write = format!("@for /L %%i in (1,1,{WARNED_FILES}) do @echo line>w%%i.txt\r\n");
     snapshot(&case, &mut payload, &[(".gitattributes", "*.txt text eol=lf\n"), ("write.cmd", &write)]);
 
-    let outcome = finish(bare_box_command(
-        &case,
-        &["box", "--test-heartbeat-ms", "1", "run", &self::payload(&payload)],
-    ));
+    let outcome = bare_box_call(&case, &["box", "--test-heartbeat-ms", "1", "run"], &self::payload(&payload)).finish();
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     let beat = Regex::new(r"^gate-remote-heartbeat: \d+$").expect("the pattern compiles");
@@ -1285,11 +1797,11 @@ fn run_box_leaving_a_child(case: &Case, with: Option<(&str, &str)>) -> (Outcome,
     let command = [FAKE_TOOL, "spawn-wait", &go_word, "wait", &proceed_word, "exit", "0"];
     let mut payload = box_payload(case, "k", &command);
     snapshot(case, &mut payload, &[("a.txt", "a\n")]);
-    let mut box_run = box_command(case, &["box", "run", &self::payload(&payload)]);
+    let mut box_run = box_call(case, &["box", "run"], &self::payload(&payload));
     if let Some((name, value)) = with {
         box_run.env(name, value);
     }
-    let running = start(box_run);
+    let running = box_run.start();
     let pid = spawned_pid(&running.wait_for_stdout("\n"));
     let child = StoppableProcess::open(pid)
         .expect("the child is opened")
@@ -1346,7 +1858,7 @@ fn box_run_a_closed_stdout_pipe_stops_the_job_and_exits_255() {
     let mut payload = box_payload(&case, "k", &[r".\run.cmd"]);
     snapshot(&case, &mut payload, &[("a.txt", "a\n"), ("run.cmd", &script)]);
 
-    let running = start_with_closed(Closed::Stdout, box_command(&case, &["box", "run", &self::payload(&payload)]));
+    let running = box_call(&case, &["box", "run"], &self::payload(&payload)).start_with_closed(Closed::Stdout);
     running.wait_for_stderr("started");
     let_go(&go);
 
@@ -1379,7 +1891,7 @@ fn box_run_a_closed_stderr_pipe_stops_the_job_and_exits_255() {
     let mut payload = box_payload(&case, "k", &[r".\run.cmd"]);
     snapshot(&case, &mut payload, &[("a.txt", "a\n"), ("run.cmd", &script)]);
 
-    let running = start_with_closed(Closed::Stderr, box_command(&case, &["box", "run", &self::payload(&payload)]));
+    let running = box_call(&case, &["box", "run"], &self::payload(&payload)).start_with_closed(Closed::Stderr);
     running.wait_for_stdout("started");
     let_go(&go);
 
@@ -1533,10 +2045,7 @@ fn box_run_falls_back_to_its_own_token_when_the_restricted_start_is_refused() {
     let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "mark", &count_word, "out", "ran"]);
     snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
 
-    let outcome = finish(box_command(
-        &case,
-        &["box", "--test-box-token", "refused", "run", &self::payload(&payload)],
-    ));
+    let outcome = box_call(&case, &["box", "--test-box-token", "refused", "run"], &self::payload(&payload)).finish();
 
     assert_eq!(outcome.code, Some(0), "the refusal never fails the run: {outcome:?}");
     assert_eq!(outcome.stdout, "ran\n", "{outcome:?}");
@@ -1590,10 +2099,10 @@ fn box_run_gives_the_command_safe_directory_for_git() {
     );
     snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
     // The box inherits no config entries, whatever the environment this suite runs in holds.
-    let mut command = box_command(&case, &["box", "run", &self::payload(&payload)]);
+    let mut command = box_call(&case, &["box", "run"], &self::payload(&payload));
     command.env_remove("GIT_CONFIG_COUNT");
 
-    let outcome = finish(command);
+    let outcome = command.finish();
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert_eq!(outcome.stdout, "1\nsafe.directory\n*\n", "{outcome:?}");
@@ -1672,10 +2181,7 @@ fn box_run_falls_back_before_the_start_and_runs_the_command() {
     let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "mark", &count_word, "out", "ran"]);
     snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
 
-    let outcome = finish(box_command(
-        &case,
-        &["box", "--test-box-console", "fail-before", "run", &self::payload(&payload)],
-    ));
+    let outcome = box_call(&case, &["box", "--test-box-console", "fail-before", "run"], &self::payload(&payload)).finish();
 
     assert_eq!(outcome.code, Some(0), "the fallback never fails the run: {outcome:?}");
     assert_eq!(outcome.stdout, "ran\n", "{outcome:?}");
@@ -1728,8 +2234,8 @@ fn stop_before_the_launch(name: &str, seams: &[&str]) {
     let payload_word = self::payload(&payload);
     let mut args = vec!["box"];
     args.extend_from_slice(seams);
-    args.extend_from_slice(&["--test-box-park-launch", &park_word, "run", &payload_word]);
-    let running = start(box_command(&case, &args));
+    args.extend_from_slice(&["--test-box-park-launch", &park_word, "run"]);
+    let running = box_call(&case, &args, &payload_word).start();
     wait_until("the box parked before the launch", || parked.exists());
 
     let stopped = gate_box(&case, "stop", &payload_word, None);
@@ -1807,7 +2313,7 @@ fn box_stop_with_an_earlier_runs_job_spares_the_next_run() {
     assert_eq!(running.finish().code, Some(0));
 }
 
-/// A `gate box inflight` payload word for the builder's root `root`.
+/// A `gate box inflight --stdin` request line for the builder's root `root`.
 fn inflight_payload(root: &Path) -> String {
     payload(&json!({ "Root": shown(root) }))
 }
@@ -2109,6 +2615,933 @@ fn box_run_says_a_snapshot_missing_after_the_fetch() {
     assert_eq!(git(&["-C", field(&payload, "Work"), "rev-parse", "HEAD"]), head, "HEAD stands");
     assert!(work.join("untracked.txt").exists(), "the untracked file stands");
     assert!(has_ref(&payload, "refs/gate-back/k"), "the back ref stands");
+}
+
+#[test]
+fn preflight_with_a_pair_creates_each_bare_and_nothing_in_the_work_folder() {
+    let case = Case::new("preflight_with_a_pair_creates_each_bare");
+    let payload = pair_payload(&case, &["lib", "tools"], &[]);
+    let work = PathBuf::from(field(&payload, "Work"));
+    let folder = work.parent().expect("the work folder has a parent");
+    fs::create_dir_all(folder).expect("the work folder's parent can be made");
+    // Held as a run of the key holds it: the preflight takes no lock, so it must change nothing inside the work folder.
+    let _lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .share_mode(0)
+        .open(field(&payload, "Lock"))
+        .expect("the lock can be taken");
+
+    let outcome = gate_box(&case, "preflight", &self::payload(&payload), None);
+
+    let printed = passed(&outcome);
+    let bares = [
+        field(&payload, "Bare").to_owned(),
+        sibling_bare(&payload, "lib"),
+        sibling_bare(&payload, "tools"),
+    ];
+    let created: Vec<String> = printed.iter().take(3).map(|line| (*line).to_owned()).collect();
+    assert_eq!(
+        created,
+        bares.iter().map(|bare| format!("gate: remote created {bare}")).collect::<Vec<_>>(),
+        "{outcome:?}"
+    );
+    assert_eq!(printed.len(), 6, "the created lines, then the version, boot and sdks lines: {outcome:?}");
+    for bare in &bares {
+        assert_eq!(
+            git(&[&format!("--git-dir={bare}"), "rev-parse", "--is-bare-repository"]),
+            "true",
+            "{bare}"
+        );
+    }
+    assert!(!work.exists(), "nothing is made at or in the work folder: {outcome:?}");
+    let beside: Vec<String> = fs::read_dir(folder)
+        .expect("the work folder's parent can be listed")
+        .map(|entry| entry.expect("an entry can be read").file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(beside, [format!("{PAIR_KEY}.lock")], "only the held lock is beside it");
+}
+
+#[test]
+fn box_run_with_a_pair_checks_out_each_repo_in_its_own_folder() {
+    let case = Case::new("box_run_pair_checks_out_each_repo");
+    let mut payload = pair_payload(&case, &["lib", "tools"], &[r".\show.cmd"]);
+    let show = "@type a.txt\r\n@type ..\\lib\\b.txt\r\n@type ..\\tools\\c.txt\r\n";
+    let commits = pair_snapshot(
+        &case,
+        &mut payload,
+        &[("show.cmd", show), ("a.txt", "main\n")],
+        &[("lib", &[("b.txt", "lib\n")]), ("tools", &[("c.txt", "tools\n")])],
+    );
+
+    let outcome = run_box(&case, &payload);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(
+        outcome.stdout, "main\nlib\ntools\n",
+        "the command runs in the main tree and finds each sibling beside it"
+    );
+    for (name, commit) in ["app", "lib", "tools"].iter().zip(&commits) {
+        assert_eq!(
+            &git(&["-C", &pair_tree(&payload, name), "rev-parse", "HEAD"]),
+            commit,
+            "{name} is at its own snapshot"
+        );
+    }
+    let alternates = Path::new(&pair_tree(&payload, "lib")).join(r".git\objects\info\alternates");
+    assert_eq!(
+        fs::read(alternates).expect("the sibling's alternates file can be read"),
+        format!("{}/objects\n", sibling_bare(&payload, "lib").replace('\\', "/")).into_bytes(),
+        "a sibling's tree borrows its own bare repository's objects"
+    );
+    let mut entries = work_entries(&payload);
+    entries.sort();
+    assert_eq!(
+        entries,
+        ["app", "lib", "tools"],
+        "the work folder holds the trees and no repository of its own"
+    );
+}
+
+#[test]
+fn box_run_with_a_pair_names_the_repo_in_a_failed_step() {
+    let case = Case::new("box_run_pair_names_the_repo");
+    let mut payload = pair_payload(&case, &["lib"], &[FAKE_TOOL, "out", "ran"]);
+    allow_breakaway();
+    passed(&gate_box(&case, "preflight", &self::payload(&payload), None));
+    let main = push_snapshot(&case, &payload, &[("a.txt", "a\n")]);
+    payload["Snapshot"] = json!(main);
+    payload["SiblingSnapshots"] = json!({"lib": main});
+    let fetch = Regex::new(r"(?m)^gate: remote fetch lib failed \(status (-?\d+)\)$").expect("the pattern compiles");
+
+    // Nothing pushed to the sibling's bare repository yet: its fetch fails.
+    let outcome = run_box(&case, &payload);
+
+    let captures = fetch.captures(&outcome.stderr).expect("the fetch's line names the sibling");
+    let status: i32 = captures[1].parse().expect("the status is a number");
+    assert_ne!(status, 0, "{outcome:?}");
+    assert_eq!(outcome.code, Some(status), "{outcome:?}");
+    assert_eq!(outcome.stdout, "", "the command never ran");
+    assert_eq!(
+        git(&["-C", &pair_tree(&payload, "app"), "rev-parse", "HEAD"]),
+        main,
+        "the main repo, first, was checked out"
+    );
+
+    // The sibling's ref pushed, but the payload names a commit only the main repo has.
+    push_repo_snapshot(&case, "source-lib", &sibling_bare(&payload, "lib"), PAIR_KEY, &[("b.txt", "b\n")]);
+    let outcome = run_box(&case, &renamed(&payload, 1));
+
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert_eq!(outcome.stdout, "", "the command never ran");
+    assert!(
+        outcome
+            .stderr
+            .lines()
+            .any(|line| line == format!("gate: remote snapshot {main} is not in the repository of lib after the fetch")),
+        "the missing snapshot's line names the sibling: {outcome:?}"
+    );
+}
+
+#[test]
+fn box_run_git_in_a_tree_ignores_a_core_worktree_pointing_elsewhere() {
+    let case = Case::new("box_run_ignores_core_worktree");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "exit", "0"]);
+    snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
+    let canary = case.folder().join("canary");
+    fs::create_dir_all(&canary).expect("the canary folder can be made");
+    fs::write(canary.join("untracked.txt"), "keep").expect("the canary's file can be written");
+    let canary_text = canary.to_str().expect("the case folder is Unicode");
+    git(&["-C", field(&payload, "Work"), "config", "core.worktree", canary_text]);
+
+    let outcome = run_box(&case, &payload);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(
+        canary.join("untracked.txt").exists(),
+        "the clean never reaches the folder core.worktree names"
+    );
+    assert!(!canary.join("a.txt").exists(), "nor does the checkout");
+    assert!(
+        Path::new(field(&payload, "Work")).join("a.txt").is_file(),
+        "the snapshot is checked out in the tree"
+    );
+}
+
+#[test]
+fn box_run_with_a_pair_writes_a_back_commit_per_changed_repo() {
+    let case = Case::new("box_run_pair_back_commit_per_repo");
+    let mut payload = pair_payload(&case, &["lib", "tools"], &[r".\change.cmd"]);
+    let change = "@echo changed> a.txt\r\n@echo changed> ..\\lib\\b.txt\r\n";
+    let commits = pair_snapshot(
+        &case,
+        &mut payload,
+        &[("change.cmd", change), ("a.txt", "main\n")],
+        &[("lib", &[("b.txt", "lib\n")]), ("tools", &[("c.txt", "tools\n")])],
+    );
+
+    let outcome = run_box(&case, &payload);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let back = format!("refs/gate-back/{PAIR_KEY}");
+    let main_bare = field(&payload, "Bare").to_owned();
+    for (bare, commit, file) in [(main_bare, &commits[0], "a.txt"), (sibling_bare(&payload, "lib"), &commits[1], "b.txt")] {
+        let git_dir = format!("--git-dir={bare}");
+        assert!(has_ref_in(&bare, &back), "{bare} has its own back commit: {outcome:?}");
+        assert_eq!(&git(&[&git_dir, "rev-parse", &format!("{back}^")]), commit, "{bare}: on its own snapshot");
+        assert_eq!(
+            git(&[&git_dir, "show", &format!("{back}:{file}")]),
+            "changed",
+            "{bare}: with its own change"
+        );
+    }
+    assert!(
+        !has_ref_in(&sibling_bare(&payload, "tools"), &back),
+        "an unchanged repo gets no back commit"
+    );
+}
+
+/// A canary folder beside the case folder, so outside every folder the box lays out, holding only `keep.txt`; made
+/// afresh, an earlier run's removed first.
+fn canary(case: &Case, name: &str) -> PathBuf {
+    let mut folder = case.folder().into_os_string();
+    folder.push(format!("-{name}"));
+    let folder = PathBuf::from(folder);
+    if folder.exists() {
+        fs::remove_dir_all(&folder).expect("an earlier run's canary can be removed");
+    }
+    fs::create_dir_all(&folder).expect("the canary folder can be made");
+    fs::write(folder.join("keep.txt"), "keep").expect("the canary's file can be written");
+    folder
+}
+
+/// The names in `folder`.
+fn entries_of(folder: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(folder)
+        .expect("the folder can be listed")
+        .map(|entry| entry.expect("an entry can be read").file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+/// Whether nothing, not even a link, has the name `path`.
+fn is_gone(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_err()
+}
+
+/// Whether `path` is a folder itself, not a link or a junction.
+fn is_real_folder(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir())
+}
+
+/// The text of the work folder's layout record, `{Work}.layout`, empty when there is none.
+fn layout_record(payload: &Value) -> String {
+    fs::read_to_string(format!("{}.layout", field(payload, "Work"))).unwrap_or_default()
+}
+
+/// The pair payload of `app` and `lib` whose command, `.\change.cmd`, changes the main tree's `a.txt`, its snapshots
+/// pushed; the commits, the main first.
+fn changing_pair(case: &Case) -> (Value, Vec<String>) {
+    let mut payload = pair_payload(case, &["lib"], &[r".\change.cmd"]);
+    let commits = pair_snapshot(
+        case,
+        &mut payload,
+        &[("change.cmd", "@echo changed> a.txt\r\n"), ("a.txt", "main\n")],
+        &[("lib", &[("b.txt", "lib\n")])],
+    );
+    (payload, commits)
+}
+
+#[test]
+fn preflight_skips_a_junction_at_the_objects_info_folder_and_the_run_repairs_it() {
+    let case = Case::new("preflight_skips_info_junction");
+    let mut json = box_payload(&case, "k", &[FAKE_TOOL, "exit", "0"]);
+    let commit = snapshot(&case, &mut json, &[("a.txt", "a\n")]);
+    assert_eq!(run_box(&case, &json).code, Some(0), "the first run passes");
+    let work = PathBuf::from(field(&json, "Work"));
+    let info = work.join(r".git\objects\info");
+    fs::remove_dir_all(&info).expect("the info folder can be removed");
+    let target = canary(&case, "canary");
+    junction(&info, &target);
+
+    passed(&gate_box(&case, "preflight", &payload(&json), None));
+    assert_eq!(entries_of(&target), ["keep.txt"], "the preflight leaves the junction's target alone");
+
+    let outcome = run_box(&case, &renamed(&json, 1));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(entries_of(&target), ["keep.txt"], "the run leaves the junction's target alone");
+    assert!(is_real_folder(&info), "the info folder is a folder again");
+    assert_eq!(git(&["-C", &shown(&work), "rev-parse", "HEAD"]), commit, "at the snapshot");
+    passed(&gate_box(&case, "preflight", &payload(&json), None));
+}
+
+/// A key folder of one repo, its first run passed, whose `Work\.git` `link` makes lead to a canary repository: a
+/// preflight passes and leaves the canary's config and alternates file byte-identical, and the next run checks out the
+/// snapshot in a `.git` folder of the tree's own.
+fn preflight_leaves_the_repository_a_linked_git_leads_to_alone(name: &str, link: fn(&Path, &Path)) {
+    let case = Case::new(name);
+    let mut json = box_payload(&case, "k", &[FAKE_TOOL, "exit", "0"]);
+    let commit = snapshot(&case, &mut json, &[("a.txt", "a\n")]);
+    assert_eq!(run_box(&case, &json).code, Some(0), "the first run passes");
+    let target = canary(&case, "canary-repo");
+    git(&["init", "-q", &shown(&target)]);
+    let canary_git = target.join(".git");
+    let looked = || {
+        let config = fs::read(canary_git.join("config")).expect("the canary's config can be read");
+        (config, fs::read(canary_git.join(r"objects\info\alternates")).ok())
+    };
+    let before = looked();
+    let work_git = Path::new(field(&json, "Work")).join(".git");
+    fs::remove_dir_all(&work_git).expect("the work folder's .git can be removed");
+    link(&work_git, &canary_git);
+
+    passed(&gate_box(&case, "preflight", &payload(&json), None));
+    assert_eq!(looked(), before, "the preflight leaves the canary's config, remotes and alternates alone");
+
+    let outcome = run_box(&case, &renamed(&json, 1));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(looked(), before, "the run leaves the canary's config, remotes and alternates alone");
+    assert!(is_real_folder(&work_git), "the work folder's .git is a folder again");
+    assert_eq!(git(&["-C", field(&json, "Work"), "rev-parse", "HEAD"]), commit, "at the snapshot");
+}
+
+#[test]
+fn preflight_of_one_repo_leaves_the_repository_a_junction_at_its_git_leads_to_alone() {
+    preflight_leaves_the_repository_a_linked_git_leads_to_alone("preflight_git_junction_canary", junction);
+}
+
+#[test]
+fn preflight_of_one_repo_leaves_the_repository_a_gitdir_file_at_its_git_names_alone() {
+    preflight_leaves_the_repository_a_linked_git_leads_to_alone("preflight_gitdir_file_canary", |link, target| {
+        fs::write(link, format!("gitdir: {}\n", shown(target))).expect("the gitdir file can be written");
+    });
+}
+
+#[test]
+fn preflight_of_one_repo_leaves_the_config_a_link_at_its_git_config_leads_to_alone() {
+    let case = Case::new("preflight_git_config_link_canary");
+    let mut json = box_payload(&case, "k", &[FAKE_TOOL, "exit", "0"]);
+    let commit = snapshot(&case, &mut json, &[("a.txt", "a\n")]);
+    assert_eq!(run_box(&case, &json).code, Some(0), "the first run passes");
+    let target = canary(&case, "canary-repo");
+    git(&["init", "-q", &shown(&target)]);
+    let canary_config = target.join(r".git\config");
+    let before = fs::read(&canary_config).expect("the canary's config can be read");
+    let config = Path::new(field(&json, "Work")).join(r".git\config");
+    fs::remove_file(&config).expect("the work folder's config can be removed");
+    std::os::windows::fs::symlink_file(&canary_config, &config).expect("this machine lets a test make a symbolic link");
+
+    passed(&gate_box(&case, "preflight", &payload(&json), None));
+    assert_eq!(
+        fs::read(&canary_config).expect("the canary's config can be read"),
+        before,
+        "the preflight leaves the canary's config alone"
+    );
+
+    let outcome = run_box(&case, &renamed(&json, 1));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(
+        fs::read(&canary_config).expect("the canary's config can be read"),
+        before,
+        "the run leaves the canary's config alone"
+    );
+    assert!(
+        fs::symlink_metadata(&config).is_ok_and(|metadata| metadata.is_file()),
+        "the work folder's config is a file of its own again"
+    );
+    assert_eq!(git(&["-C", field(&json, "Work"), "rev-parse", "HEAD"]), commit, "at the snapshot");
+}
+
+#[test]
+fn box_run_of_one_repo_replaces_a_dangling_junction_at_its_objects_folder() {
+    let case = Case::new("box_run_dangling_objects_junction");
+    let mut json = box_payload(&case, "k", &[FAKE_TOOL, "exit", "0"]);
+    let commit = snapshot(&case, &mut json, &[("a.txt", "a\n")]);
+    assert_eq!(run_box(&case, &json).code, Some(0), "the first run passes");
+    let work = PathBuf::from(field(&json, "Work"));
+    let objects = work.join(r".git\objects");
+    fs::remove_dir_all(&objects).expect("the objects folder can be removed");
+    let target = canary(&case, "canary");
+    junction(&objects, &target);
+    fs::remove_dir_all(&target).expect("the junction's target can be removed");
+
+    passed(&gate_box(&case, "preflight", &payload(&json), None));
+    assert!(is_gone(&target), "the preflight makes nothing at the junction's target");
+    assert!(
+        !is_gone(&objects) && !is_real_folder(&objects),
+        "the preflight leaves the junction in place"
+    );
+
+    let outcome = run_box(&case, &renamed(&json, 1));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(is_real_folder(&objects), "the objects folder is a folder again");
+    assert!(is_gone(&target), "the run makes nothing at the junction's target");
+    assert_eq!(git(&["-C", &shown(&work), "rev-parse", "HEAD"]), commit, "at the snapshot");
+    let again = run_box(&case, &renamed(&json, 2));
+    assert_eq!(again.code, Some(0), "a second run passes: {again:?}");
+}
+
+#[test]
+fn box_run_with_a_pair_names_the_repo_after_its_failing_tree_step() {
+    let case = Case::new("box_run_pair_names_failing_tree_step");
+    let (json, _) = changing_pair(&case);
+    assert_eq!(run_box(&case, &json).code, Some(0), "the first run lays out the pair");
+    let lib_git = Path::new(&pair_tree(&json, "lib")).join(".git");
+    fs::remove_dir_all(&lib_git).expect("lib's .git can be removed");
+    fs::create_dir(&lib_git).expect("an empty .git folder can be made");
+
+    let outcome = run_box(&case, &renamed(&json, 1));
+
+    assert_ne!(outcome.code, Some(0), "{outcome:?}");
+    assert!(
+        outcome.stderr.contains("gate: remote git remote add failed for lib (status "),
+        "{outcome:?}"
+    );
+}
+
+#[test]
+fn preflight_with_a_pair_names_the_repo_whose_bare_repository_it_cannot_create() {
+    let case = Case::new("preflight_pair_names_failing_bare");
+    let json = pair_payload(&case, &["lib"], &[FAKE_TOOL, "exit", "0"]);
+    let stub = case.folder().join("stub-git");
+    fs::create_dir_all(&stub).expect("the stub folder can be made");
+    fs::write(
+        stub.join("git.cmd"),
+        format!(
+            concat!(
+                "@echo off\r\n",
+                "echo %*| findstr /c:\"init --bare\" >nul || goto real\r\n",
+                "echo %*| findstr /i /c:\"lib.git\" >nul || goto real\r\n",
+                "exit /b 3\r\n:real\r\n\"{}\" %*\r\n",
+            ),
+            shown(&git_folder().join("git.exe"))
+        ),
+    )
+    .expect("the git stub can be written");
+
+    let outcome = gate_box(&case, "preflight", &payload(&json), Some(&path_for_run(&[stub])));
+
+    assert_eq!(outcome.code, Some(3), "{outcome:?}");
+    assert_eq!(outcome.stderr.trim_end(), "gate: remote git init --bare failed for lib (status 3)");
+}
+
+#[test]
+fn box_run_of_one_repo_replaces_a_junction_at_its_git_folder_and_leaves_its_target_alone() {
+    let case = Case::new("box_run_replaces_work_git_junction");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "exit", "0"]);
+    let commit = snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
+    assert_eq!(run_box(&case, &payload).code, Some(0), "the first run passes");
+    let target = canary(&case, "canary-repo");
+    let target_text = shown(&target);
+    git(&["init", "-q", &target_text]);
+    let looked = || {
+        let config = fs::read(target.join(r".git\config")).expect("the canary's config can be read");
+        let head = fs::read(target.join(r".git\HEAD")).expect("the canary's HEAD can be read");
+        (config, head, git(&["-C", &target_text, "for-each-ref"]))
+    };
+    let before = looked();
+    let work_git = Path::new(field(&payload, "Work")).join(".git");
+    fs::remove_dir_all(&work_git).expect("the work folder's .git can be removed");
+    junction(&work_git, &target.join(".git"));
+
+    let outcome = run_box(&case, &renamed(&payload, 1));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(looked(), before, "the canary repository's config, HEAD and refs are untouched");
+    assert!(is_real_folder(&work_git), "the work folder's .git is a folder again");
+    assert_eq!(git(&["-C", field(&payload, "Work"), "rev-parse", "HEAD"]), commit, "at the snapshot");
+}
+
+#[test]
+fn box_run_clearing_a_layout_removes_a_junction_without_following_it() {
+    let case = Case::new("box_run_clearing_removes_a_junction");
+    let (payload, _) = changing_pair(&case);
+    let (first, second) = (canary(&case, "canary"), canary(&case, "canary2"));
+    let work = PathBuf::from(field(&payload, "Work"));
+    fs::create_dir_all(work.join(r"old2\node_modules")).expect("the stale folders can be made");
+    junction(&work.join("old"), &first);
+    junction(&work.join(r"old2\node_modules\x"), &second);
+
+    // No record is a run of one repo's layout, so the pair's first run clears the work folder.
+    let outcome = run_box(&case, &payload);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    for canary in [&first, &second] {
+        assert_eq!(entries_of(canary), ["keep.txt"], "{} keeps its file: {outcome:?}", canary.display());
+    }
+    assert!(is_gone(&work.join("old")), "the junction is gone");
+    assert!(is_gone(&work.join("old2")), "the folder holding a junction is gone");
+    assert_eq!(entries_of(&work), ["app", "lib"], "only the pair's trees");
+    assert!(
+        layout_record(&payload).eq_ignore_ascii_case("pair app lib"),
+        "the record names the pair: {:?}",
+        layout_record(&payload)
+    );
+}
+
+#[test]
+fn box_run_that_cannot_clear_a_held_file_refuses_before_the_command() {
+    let case = Case::new("box_run_cannot_clear_a_held_file");
+    let marker = case.folder().join("marker");
+    let mut payload = pair_payload(&case, &["lib"], &[FAKE_TOOL, "mark", &shown(&marker)]);
+    pair_snapshot(&case, &mut payload, &[("a.txt", "a\n")], &[("lib", &[("b.txt", "b\n")])]);
+    let old = PathBuf::from(field(&payload, "Work")).join("old");
+    fs::create_dir_all(&old).expect("the stale folder can be made");
+    let held = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .share_mode(0)
+        .open(old.join("held.txt"))
+        .expect("the stale file can be held");
+
+    let outcome = run_box(&case, &payload);
+
+    assert_eq!(outcome.code, Some(75), "{outcome:?}");
+    let said = lines(&outcome.stderr);
+    let tag = format!("gate-remote-refused: {} layout", field(&payload, "Nonce"));
+    let refused = said.iter().position(|line| *line == tag).expect("the box says the layout tag");
+    let line = format!("gate: not routed: the builder could not clear {PAIR_KEY}'s work folder: ");
+    let why = said
+        .get(refused + 1)
+        .and_then(|next| next.strip_prefix(line.as_str()))
+        .expect("the owner's line follows the tag");
+    assert!(why.contains(&shown(&old)), "the line names what could not be removed: {why}");
+    assert!(!outcome.stderr.contains("gate-remote-started:"), "refused before the start marker");
+    assert!(!marker.exists(), "the command never ran");
+    assert_eq!(layout_record(&payload), "changing", "the record says the clear did not finish");
+
+    drop(held);
+    let again = run_box(&case, &renamed(&payload, 1));
+
+    assert_eq!(again.code, Some(0), "a clear that did not finish clears again: {again:?}");
+    assert!(is_gone(&old), "the stale folder is gone");
+    assert!(marker.exists(), "the command ran");
+}
+
+#[test]
+fn box_run_replaces_a_junction_where_a_tree_or_its_git_folder_should_be() {
+    let case = Case::new("box_run_replaces_a_junction_tree");
+    let (payload, commits) = changing_pair(&case);
+    assert_eq!(run_box(&case, &payload).code, Some(0), "the first run lays out the pair");
+    let lib = PathBuf::from(pair_tree(&payload, "lib"));
+    let lib_git = lib.join(".git");
+    let first = canary(&case, "canary");
+    fs::remove_dir_all(&lib).expect("the sibling's tree can be removed");
+    junction(&lib, &first);
+
+    let outcome = run_box(&case, &renamed(&payload, 1));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(entries_of(&first), ["keep.txt"], "the canary is untouched");
+    assert!(is_real_folder(&lib), "the tree is a folder again");
+    assert_eq!(git(&["-C", &shown(&lib), "rev-parse", "HEAD"]), commits[1], "at its snapshot");
+
+    let second = canary(&case, "canary2");
+    fs::remove_dir_all(&lib_git).expect("the sibling's .git can be removed");
+    junction(&lib_git, &second);
+
+    let outcome = run_box(&case, &renamed(&payload, 2));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(entries_of(&second), ["keep.txt"], "the canary is untouched");
+    assert!(is_real_folder(&lib_git), "the .git is a folder again");
+    assert_eq!(git(&["-C", &shown(&lib), "rev-parse", "HEAD"]), commits[1], "at its snapshot");
+}
+
+#[test]
+fn box_run_pair_then_single_leaves_no_gitlink_and_no_leaf_folder() {
+    let case = Case::new("box_run_pair_then_single");
+    let (pair, commits) = changing_pair(&case);
+    assert_eq!(run_box(&case, &pair).code, Some(0), "the pair run passes");
+    let mut single = renamed(&pair, 1);
+    let object = single.as_object_mut().expect("the payload is an object");
+    object.remove("Pair");
+    object.remove("SiblingSnapshots");
+    passed(&gate_box(&case, "preflight", &self::payload(&single), None));
+
+    let outcome = run_box(&case, &single);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let mut entries = work_entries(&single);
+    entries.sort();
+    assert_eq!(entries, [".git", "a.txt", "change.cmd"], "the main repo's tree alone, in the work folder");
+    let bare = format!("--git-dir={}", field(&single, "Bare"));
+    let back = format!("refs/gate-back/{PAIR_KEY}");
+    assert_eq!(
+        git(&[&bare, "rev-parse", &format!("{back}^")]),
+        commits[0],
+        "the back commit is on the snapshot"
+    );
+    let listed = git(&[&bare, "ls-tree", "-r", &back]);
+    assert!(!listed.lines().any(|line| line.starts_with("160000")), "no gitlink: {listed}");
+    assert!(layout_record(&single).eq_ignore_ascii_case("single"), "{:?}", layout_record(&single));
+}
+
+#[test]
+fn box_run_single_then_pair_leaves_no_work_git_folder() {
+    let case = Case::new("box_run_single_then_pair");
+    let mut single = box_payload(&case, PAIR_KEY, &[r".\change.cmd"]);
+    snapshot(&case, &mut single, &[("change.cmd", "@echo changed> a.txt\r\n"), ("a.txt", "main\n")]);
+    assert_eq!(run_box(&case, &single).code, Some(0), "the run of one repo passes");
+    let mut pair = renamed(&single, 1);
+    pair["Pair"] = json!({"Leaf": "app", "Siblings": ["lib"]});
+    let commits = pair_snapshot(&case, &mut pair, &[("a.txt", "main again\n")], &[("lib", &[("b.txt", "lib\n")])]);
+
+    let outcome = run_box(&case, &pair);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let mut entries = work_entries(&pair);
+    entries.sort();
+    assert_eq!(entries, ["app", "lib"], "no .git and no file of the old tree in the work folder");
+    assert_eq!(git(&["-C", &pair_tree(&pair, "app"), "rev-parse", "HEAD"]), commits[0]);
+}
+
+/// The pair payload of `app`, `lib` and `tools` whose command, `.\change.cmd`, changes `a.txt` in the main tree and
+/// `b.txt` in `lib`'s, leaving `tools` unchanged, its snapshots pushed.
+fn changing_two_of_three(case: &Case) -> Value {
+    changing_two_of_three_after(case, "")
+}
+
+/// [`changing_two_of_three`], its command running the cmd lines `first` before it changes anything.
+fn changing_two_of_three_after(case: &Case, first: &str) -> Value {
+    let mut payload = pair_payload(case, &["lib", "tools"], &[r".\change.cmd"]);
+    let change = format!("{first}@echo changed> a.txt\r\n@echo changed> ..\\lib\\b.txt\r\n");
+    let change = change.as_str();
+    pair_snapshot(
+        case,
+        &mut payload,
+        &[("change.cmd", change), ("a.txt", "main\n")],
+        &[("lib", &[("b.txt", "lib\n")]), ("tools", &[("c.txt", "tools\n")])],
+    );
+    payload
+}
+
+#[test]
+fn box_run_clears_a_stale_sibling_back_ref_when_the_fetch_fails() {
+    let case = Case::new("box_run_clears_stale_sibling_back_ref");
+    let (payload, commits) = changing_pair(&case);
+    assert_eq!(run_box(&case, &payload).code, Some(0), "the first run passes");
+    let back = format!("refs/gate-back/{PAIR_KEY}");
+    let lib_bare = sibling_bare(&payload, "lib");
+    let lib_git = format!("--git-dir={lib_bare}");
+    git(&[&lib_git, "update-ref", &back, &commits[1]]);
+    git(&[&lib_git, "update-ref", "-d", &format!("refs/gate/{PAIR_KEY}")]);
+    assert!(has_ref(&payload, &back), "the first run left the main repo's back commit");
+
+    let outcome = run_box(&case, &renamed(&payload, 1));
+
+    assert_ne!(outcome.code, Some(0), "the sibling's fetch fails: {outcome:?}");
+    assert!(outcome.stderr.contains("gate: remote fetch lib failed"), "{outcome:?}");
+    assert!(!has_ref_in(&lib_bare, &back), "the sibling's stale back ref is gone");
+    assert!(!has_ref(&payload, &back), "and the main repo's");
+}
+
+#[test]
+fn box_run_that_fails_a_sibling_s_push_leaves_no_back_ref_in_either_bare() {
+    let case = Case::new("box_run_sibling_push_fails");
+    // The command first prints a line that looks like the box's own back commits line.
+    let payload = changing_two_of_three_after(&case, &format!("@>&2 echo {}\r\n", forged_back_commits()));
+    let stub = case.folder().join("stub-git");
+    fs::create_dir_all(&stub).expect("the stub folder can be made");
+    fs::write(
+        stub.join("git.cmd"),
+        format!(
+            concat!(
+                "@echo off\r\n",
+                "echo %*| findstr /c:\" push \" >nul || goto real\r\n",
+                "echo %*| findstr /i /c:\"lib.git\" >nul || goto real\r\n",
+                "exit /b 1\r\n:real\r\n\"{}\" %*\r\n",
+            ),
+            shown(&git_folder().join("git.exe"))
+        ),
+    )
+    .expect("the git stub can be written");
+
+    let outcome = run_box_with_path(&case, &payload, Some(&path_for_run(&[stub])));
+
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert!(
+        outcome.stderr.contains("gate: remote sync-back failed: push lib failed (status 1)"),
+        "{outcome:?}"
+    );
+    let back = format!("refs/gate-back/{PAIR_KEY}");
+    assert!(!has_ref(&payload, &back), "the main repo's pushed back ref is deleted");
+    assert!(!has_ref_in(&sibling_bare(&payload, "lib"), &back), "the sibling has none");
+    let said = lines_starting(&outcome, BACK_COMMITS);
+    assert_eq!(
+        said.first().copied(),
+        Some(forged_back_commits().as_str()),
+        "the command's line came: {outcome:?}"
+    );
+    assert_eq!(
+        said.last().copied(),
+        Some(BACK_COMMITS_FAILED),
+        "the box's failed line is the last: {outcome:?}"
+    );
+    let lines: Vec<&str> = outcome.stderr.lines().collect();
+    let failed_at = lines.iter().rposition(|line| *line == BACK_COMMITS_FAILED);
+    let push_at = lines
+        .iter()
+        .position(|line| *line == "gate: remote sync-back failed: push lib failed (status 1)");
+    assert!(failed_at < push_at, "the box says failed before its failure line: {outcome:?}");
+}
+
+/// What every back commits line starts with.
+const BACK_COMMITS: &str = "gate: remote back commits: ";
+/// The box's back commits line for a pair run whose back commits failed or were never made.
+const BACK_COMMITS_FAILED: &str = "gate: remote back commits: failed";
+
+/// A back commits line a command prints to pass for the box's, naming the pair `app`, `lib` and `tools`.
+fn forged_back_commits() -> String {
+    format!("{BACK_COMMITS}app {}, lib {}, tools none", "a".repeat(40), "b".repeat(40))
+}
+
+#[test]
+fn box_pair_run_that_ends_before_its_command_says_its_back_commits_failed() {
+    let case = Case::new("box_pair_run_subfolder_missing");
+    let mut payload = changing_two_of_three(&case);
+    payload["Subfolder"] = json!("nope");
+
+    let outcome = run_box(&case, &payload);
+
+    assert_eq!(outcome.code, Some(2), "{outcome:?}");
+    assert_eq!(
+        outcome.stderr,
+        format!("gate: remote subfolder nope does not exist in the snapshot\n{BACK_COMMITS_FAILED}\n"),
+        "{outcome:?}"
+    );
+}
+
+#[test]
+fn box_pair_run_whose_command_the_ceiling_kills_says_its_back_commits_failed() {
+    let case = Case::new("box_pair_run_ceiling_kill");
+    let forged = forged_back_commits();
+    let mut payload = pair_payload(&case, &["lib", "tools"], &[FAKE_TOOL, "err", &forged, "sleep", "600000"]);
+    payload["Timeout"] = json!(1);
+    payload["Host"] = json!("builder");
+    pair_snapshot(
+        &case,
+        &mut payload,
+        &[("a.txt", "main\n")],
+        &[("lib", &[("b.txt", "lib\n")]), ("tools", &[("c.txt", "tools\n")])],
+    );
+
+    // The whole machine free, so the clock runs with wall time however loaded the machine running the case is.
+    let outcome = run_box_with_seams(&case, &payload, &["--test-box-sample-ms", "20", "--test-box-free-percent", "100"]);
+
+    assert_eq!(outcome.code, Some(124), "{outcome:?}");
+    let said = lines_starting(&outcome, BACK_COMMITS);
+    assert_eq!(said.first().copied(), Some(forged.as_str()), "the command's line came: {outcome:?}");
+    assert_eq!(
+        said.last().copied(),
+        Some(BACK_COMMITS_FAILED),
+        "the box's failed line is the last: {outcome:?}"
+    );
+    wait_until_closed(Path::new(field(&payload, "Lock")));
+}
+
+#[test]
+fn box_run_with_a_pair_names_each_repo_s_back_commit() {
+    let case = Case::new("box_run_pair_names_back_commits");
+    let payload = changing_two_of_three(&case);
+
+    let outcome = run_box(&case, &payload);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let back = format!("refs/gate-back/{PAIR_KEY}");
+    let main = git(&[&format!("--git-dir={}", field(&payload, "Bare")), "rev-parse", &back]);
+    let lib = git(&[&format!("--git-dir={}", sibling_bare(&payload, "lib")), "rev-parse", &back]);
+    let line = format!("gate: remote back commits: app {main}, lib {lib}, tools none");
+    assert_eq!(
+        lines(&outcome.stderr).iter().filter(|said| **said == line).count(),
+        1,
+        "one line names each repo's back commit: {outcome:?}"
+    );
+}
+
+#[test]
+fn box_run_with_the_same_siblings_in_another_order_keeps_the_work_folder() {
+    let case = Case::new("box_run_same_siblings_other_order");
+    let mut payload = pair_payload(&case, &["lib", "tools"], &[FAKE_TOOL, "exit", "0"]);
+    pair_snapshot(
+        &case,
+        &mut payload,
+        &[("a.txt", "main\n")],
+        &[
+            ("lib", &[("b.txt", "lib\n"), (".gitignore", "out/\n")]),
+            ("tools", &[("c.txt", "tools\n")]),
+        ],
+    );
+    assert_eq!(run_box(&case, &payload).code, Some(0), "the first run lays out the pair");
+    let marker = Path::new(&pair_tree(&payload, "lib")).join(r"out\marker.txt");
+    fs::create_dir_all(marker.parent().expect("the marker has a folder")).expect("the build output folder can be made");
+    fs::write(&marker, "built").expect("the marker can be written");
+    let mut reordered = renamed(&payload, 1);
+    reordered["Pair"] = json!({"Leaf": "app", "Siblings": ["tools", "lib"]});
+
+    let outcome = run_box(&case, &reordered);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(marker.exists(), "the same siblings in another order clear nothing");
+}
+
+#[test]
+fn preflight_of_one_repo_leaves_a_work_folder_laid_out_for_a_pair_alone() {
+    let case = Case::new("preflight_one_repo_on_a_pair_folder");
+    let (pair, _) = changing_pair(&case);
+    assert_eq!(run_box(&case, &pair).code, Some(0), "the pair run lays out the work folder");
+    let mut single = renamed(&pair, 1);
+    let object = single.as_object_mut().expect("the payload is an object");
+    object.remove("Pair");
+    object.remove("SiblingSnapshots");
+    let work = PathBuf::from(field(&single, "Work"));
+
+    for record in ["pair app lib", "changing"] {
+        fs::write(format!("{}.layout", shown(&work)), record).expect("the layout record can be written");
+        let outcome = gate_box(&case, "preflight", &self::payload(&single), None);
+
+        passed(&outcome);
+        assert_eq!(
+            entries_of(&work),
+            ["app", "lib"],
+            "a record saying {record:?}: the preflight, holding no lock, makes nothing in the work folder: {outcome:?}"
+        );
+    }
+}
+
+#[test]
+fn box_run_with_a_pair_never_touches_a_planted_work_git_folder() {
+    let case = Case::new("box_run_pair_planted_work_git");
+    let (payload, commits) = changing_pair(&case);
+    assert_eq!(run_box(&case, &payload).code, Some(0), "the first run lays out the pair");
+    let work = PathBuf::from(field(&payload, "Work"));
+    let work_text = shown(&work);
+    git(&["init", "-q", &work_text]);
+    fs::write(work.join(r".git\canary.txt"), "keep").expect("the canary file can be written");
+    let looked = || {
+        let config = fs::read(work.join(r".git\config")).expect("the planted config can be read");
+        let head = fs::read(work.join(r".git\HEAD")).expect("the planted HEAD can be read");
+        (config, head, git(&["-C", &work_text, "for-each-ref"]))
+    };
+    let before = looked();
+
+    let outcome = run_box(&case, &renamed(&payload, 1));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(fs::read_to_string(work.join(r".git\canary.txt")).expect("the canary file stands"), "keep");
+    assert_eq!(looked(), before, "the planted repository's config, HEAD and refs are untouched");
+    assert!(
+        !work.join(r".git\index").exists(),
+        "no git call staged anything in the planted repository"
+    );
+    assert_eq!(
+        git(&["-C", &pair_tree(&payload, "app"), "rev-parse", "HEAD"]),
+        commits[0],
+        "the main tree is at its snapshot"
+    );
+}
+
+#[test]
+fn box_run_with_a_pair_refuses_a_subfolder_into_a_sibling() {
+    let case = Case::new("box_run_pair_subfolder_into_sibling");
+    let marker = case.folder().join("marker");
+    let mut payload = pair_payload(&case, &["lib"], &[FAKE_TOOL, "mark", &shown(&marker)]);
+    payload["Subfolder"] = json!(r"..\lib");
+    pair_snapshot(&case, &mut payload, &[("a.txt", "a\n")], &[("lib", &[("b.txt", "b\n")])]);
+
+    let outcome = run_box(&case, &payload);
+
+    assert_eq!(outcome.code, Some(2), "{outcome:?}");
+    assert!(
+        outcome
+            .stderr
+            .contains(r"gate: remote subfolder ..\lib is not a folder inside the work folder"),
+        "{outcome:?}"
+    );
+    assert!(!marker.exists(), "the command never ran");
+}
+
+#[test]
+fn box_run_of_one_repo_on_a_fresh_key_folder_writes_no_layout_record() {
+    let case = Case::new("box_run_one_repo_no_layout_record");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "exit", "0"]);
+    snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
+
+    let outcome = run_box(&case, &payload);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let record = format!("{}.layout", field(&payload, "Work"));
+    assert!(is_gone(Path::new(&record)), "no record: a run of one repo's layout needs none");
+}
+
+/// Why the run of `payload` was refused `layout`: what follows the owner's line, which follows the refusal tag; the
+/// outcome refused before the start marker with 75.
+fn layout_why(outcome: &Outcome, payload: &Value) -> String {
+    assert_eq!(outcome.code, Some(75), "{outcome:?}");
+    assert!(!outcome.stderr.contains("gate-remote-started:"), "refused before the start marker");
+    let said = lines(&outcome.stderr);
+    let tag = format!("gate-remote-refused: {} layout", field(payload, "Nonce"));
+    let refused = said.iter().position(|line| *line == tag).expect("the box says the layout tag");
+    let line = format!("gate: not routed: the builder could not clear {PAIR_KEY}'s work folder: ");
+    said.get(refused + 1)
+        .and_then(|next| next.strip_prefix(line.as_str()))
+        .expect("the owner's line follows the tag")
+        .to_owned()
+}
+
+#[test]
+fn box_run_with_a_folder_for_its_layout_record_refuses_with_layout() {
+    let case = Case::new("box_run_layout_record_is_a_folder");
+    let marker = case.folder().join("marker");
+    let mut payload = pair_payload(&case, &["lib"], &[FAKE_TOOL, "mark", &shown(&marker)]);
+    pair_snapshot(&case, &mut payload, &[("a.txt", "a\n")], &[("lib", &[("b.txt", "b\n")])]);
+    let record = PathBuf::from(format!("{}.layout", field(&payload, "Work")));
+    fs::create_dir_all(&record).expect("a folder can take the record's name");
+
+    let outcome = run_box(&case, &payload);
+
+    let why = layout_why(&outcome, &payload);
+    assert!(why.contains(&shown(&record)), "the line names the record it could not write: {why}");
+    assert!(!marker.exists(), "the command never ran");
+    assert!(is_real_folder(&record), "the folder at the record's name stands");
+}
+
+#[test]
+fn box_run_that_cannot_write_a_tree_s_alternates_refuses_with_layout() {
+    let case = Case::new("box_run_cannot_write_alternates");
+    let marker = case.folder().join("marker");
+    let mut payload = pair_payload(&case, &["lib"], &[FAKE_TOOL, "mark", &shown(&marker)]);
+    pair_snapshot(&case, &mut payload, &[("a.txt", "a\n")], &[("lib", &[("b.txt", "b\n")])]);
+    assert_eq!(run_box(&case, &payload).code, Some(0), "the first run lays out the pair");
+    fs::remove_file(&marker).expect("the first run's marker can be removed");
+    let alternates = Path::new(&pair_tree(&payload, "lib")).join(r".git\objects\info\alternates");
+    fs::remove_file(&alternates).expect("the alternates file can be removed");
+    fs::create_dir(&alternates).expect("a folder can take the alternates file's name");
+    let held = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .share_mode(0)
+        .open(alternates.join("held.txt"))
+        .expect("a file in it can be held");
+    let again = renamed(&payload, 1);
+
+    let outcome = run_box(&case, &again);
+
+    let why = layout_why(&outcome, &again);
+    assert!(why.contains(&shown(&alternates)), "the line names the alternates file: {why}");
+    assert!(!marker.exists(), "the command never ran");
+    drop(held);
 }
 
 #[test]
@@ -2769,11 +4202,10 @@ const ENDLESS: &[&str] = &[FAKE_TOOL, "err", "started", "sleep", "600000"];
 
 /// `gate box run` of `payload` with `seams` before the verb, to its end.
 fn run_box_with_seams(case: &Case, payload: &Value, seams: &[&str]) -> Outcome {
-    let word = self::payload(payload);
     let mut args = vec!["box"];
     args.extend_from_slice(seams);
-    args.extend(["run", word.as_str()]);
-    finish(box_command(case, &args))
+    args.push("run");
+    box_call(case, &args, &self::payload(payload)).finish()
 }
 
 /// The lines of `outcome`'s stderr that start with `prefix`.

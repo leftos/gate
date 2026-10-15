@@ -28,6 +28,7 @@ use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use gate_args::BoxVerb;
 #[cfg(feature = "test-seams")]
 use gate_args::RunRequest;
 use gate_args::TestSeams;
@@ -45,6 +46,7 @@ use super::payload::{self, Location, RunCall};
 use super::retry::{self, Ended, GIT_SSH_FAILED, SSH_FAILED};
 use super::snapshot::{self, Snapshot};
 use super::syncback;
+use super::toolchain::{self, Manifest, Reported};
 #[cfg(feature = "test-seams")]
 use super::transport::Local;
 use super::transport::ssh::Ssh;
@@ -65,8 +67,8 @@ use crate::run::{CONTROL_C_EXIT, is_within, resolved};
 
 /// The statuses of a preflight whose builder has no `gate box` that takes the run: cmd's for a program it cannot find,
 /// and a gate's usage error for a payload it does not read.
-const NOT_RECOGNIZED: i32 = 9009;
-const USAGE: i32 = 2;
+pub(crate) const NOT_RECOGNIZED: i32 = 9009;
+pub(crate) const USAGE: i32 = 2;
 /// The most bytes a call's job may have written and still be made once more after a failure before the banner: ssh's
 /// own failure writes one line, and a second fetch from a builder would start a fresh count against its cap.
 const RETRY_WRITTEN: u64 = 1 << 20;
@@ -76,7 +78,7 @@ const PAUSE_STEP: Duration = Duration::from_millis(20);
 const HEARTBEAT: &str = "gate-remote-heartbeat: ";
 /// The preflight's lines the client reads.
 const VERSION: &str = "gate: remote version ";
-const CREATED: &str = "gate: remote created ";
+pub(crate) const CREATED: &str = "gate: remote created ";
 /// The builder's boot time, which the preflight and the `boot` call say.
 const BOOT: &str = "gate: remote boot ";
 /// The builder's SDK list, which the preflight says: `gate: remote sdks <v1,v2|none>`.
@@ -142,11 +144,7 @@ impl RustClient {
     #[cfg(feature = "test-seams")]
     pub(crate) fn local(request: &RunRequest, transport: &str) -> Result<RustClient, String> {
         let seams = &request.test_seams;
-        // The transport's form is refused first, so `--test-remote-transport remote:x` reports the form and not a
-        // stand-in it cannot find; the stand-in is then looked for, and the transport built with it.
-        Local::new(transport, seams.remote_ssh.as_deref())?;
-        let stub = seams.remote_ssh.as_deref().map(|word| stand_in(transport, word)).transpose()?;
-        let local = Local::new(transport, stub.as_deref())?;
+        let local = local_transport(transport, seams.remote_ssh.as_deref())?;
         Ok(RustClient::over(Some(Box::new(local)), seams))
     }
 
@@ -172,6 +170,17 @@ impl RustClient {
             own_start_fails: seams.own_start_fails,
         }
     }
+}
+
+/// The local transport `transport` names, its calls made through the stand-in `ssh` names when one is given; else the
+/// line saying why the transport cannot be used, or why the stand-in cannot be found.
+#[cfg(feature = "test-seams")]
+pub(crate) fn local_transport(transport: &str, ssh: Option<&Path>) -> Result<Local, String> {
+    // The transport's form is refused first, so `--test-remote-transport remote:x` reports the form and not a stand-in
+    // it cannot find; the stand-in is then looked for, and the transport built with it.
+    Local::new(transport, ssh)?;
+    let stub = ssh.map(|word| stand_in(transport, word)).transpose()?;
+    Local::new(transport, stub.as_deref())
 }
 
 /// The stand-in `--test-remote-ssh` names, resolved as the gate resolves its own programs: a name with a folder part
@@ -228,6 +237,9 @@ impl RemoteClient for RustClient {
     }
 
     fn run(&mut self, call: &RemoteCall<'_>) -> RemoteOutcome {
+        if let Some(sibling) = call.siblings.first() {
+            return pairs_off(call, sibling.name());
+        }
         let transport = match found(&mut self.transport) {
             Ok(transport) => transport,
             Err(why) => return RemoteOutcome::not_started(why),
@@ -245,6 +257,7 @@ impl RemoteClient for RustClient {
             call,
             transport: &*transport,
             limit: self.limit,
+            lock_wait: self.limit,
             pause: self.pause,
             limits: Limits {
                 started,
@@ -288,6 +301,24 @@ impl RemoteClient for RustClient {
     }
 }
 
+/// What the fallback line of a call carrying siblings says the client could not start for.
+const PAIRS_OFF: &str = "sibling pairs are off";
+
+/// The outcome of the call `call`, which carries the sibling `name` first, while the builder takes no sibling pairs: it
+/// falls back `client` before any folder read, ssh call or push, saying `gate: not routed: sibling {name} the builder
+/// does not take sibling pairs yet`.
+fn pairs_off(call: &RemoteCall<'_>, name: &str) -> RemoteOutcome {
+    let line = format!("gate: not routed: sibling {name} the builder does not take sibling pairs yet");
+    let detail = match super::say(call.log, &[&line], io::stderr().lock()) {
+        Ok(()) => PAIRS_OFF.to_owned(),
+        Err(why) => why,
+    };
+    RemoteOutcome {
+        lines: vec![line],
+        ..RemoteOutcome::not_started(detail)
+    }
+}
+
 /// How the attempt ended.
 #[derive(Debug)]
 pub(super) enum End {
@@ -309,11 +340,126 @@ pub(super) enum End {
 }
 
 /// What the preflight found: whether it created the bare repository just now, the builder's boot time, `None` when it
-/// said none, and the SDKs it lists, `None` when it said no SDK line.
+/// said none, the SDKs it lists, `None` when it said no SDK line, the tools its `Needs` named, and what the builder
+/// said of each of them, in that order, a tool it said nothing of left out.
 struct Prepared {
     created: bool,
     boot: Option<String>,
     sdks: Option<Vec<String>>,
+    sent: Vec<String>,
+    tools: Vec<(String, Reported)>,
+}
+
+/// What the snapshot's tree gives the parity check, read before the preflight: the git that listed it, the names of
+/// its files and submodules, and its `.gate/toolchain.toml`, `None` when it has none, `Err` with why when it cannot be
+/// read or is no regular file.
+struct Tree {
+    git: Git,
+    names: Vec<String>,
+    manifest: Option<Result<Manifest, String>>,
+}
+
+/// The repo's toolchain manifest, as its path at the repo root is spelled.
+const MANIFEST_PATH: &str = ".gate/toolchain.toml";
+/// The folder at the repo root that holds the manifest, matched ignoring ASCII case.
+const GATE_FOLDER: &str = ".gate";
+/// The manifest's name inside [`GATE_FOLDER`], matched ignoring ASCII case.
+const MANIFEST_NAME: &str = "toolchain.toml";
+
+/// One entry of the snapshot's tree as `git ls-tree -z` lists one: the mode, the object type (`blob`, `tree` or
+/// `commit`), the object id and the path.
+#[derive(Debug, PartialEq, Eq)]
+struct Entry {
+    mode: String,
+    kind: String,
+    oid: String,
+    path: String,
+}
+
+/// The entries of a `git ls-tree -z` listing, each `<mode> <type> <oid>\t<path>` ended by a NUL; `None` when an entry
+/// is not of that form.
+fn entries_of(listing: &str) -> Option<Vec<Entry>> {
+    listing
+        .split('\0')
+        .filter(|record| !record.is_empty())
+        .map(|record| {
+            let (meta, path) = record.split_once('\t')?;
+            let mut parts = meta.split(' ');
+            let (mode, kind, oid) = (parts.next()?, parts.next()?, parts.next()?);
+            parts.next().is_none().then(|| Entry {
+                mode: mode.to_owned(),
+                kind: kind.to_owned(),
+                oid: oid.to_owned(),
+                path: path.to_owned(),
+            })
+        })
+        .collect()
+}
+
+/// The repo's `.gate` folder among the root listing `root`: the entries named `.gate` ignoring ASCII case whose type is
+/// a tree, so one that is no folder names no manifest at all.
+fn gate_folders(root: &[Entry]) -> Vec<&Entry> {
+    root.iter()
+        .filter(|entry| entry.path.eq_ignore_ascii_case(GATE_FOLDER) && entry.kind == "tree")
+        .collect()
+}
+
+/// The entries of one `.gate` folder's listing `inside` that can be the repo's manifest: each named `toolchain.toml`
+/// ignoring ASCII case, its path the folder's path as `gate` spells it joined to its own name, so [`manifest_entry`]
+/// weighs it as the file that folder holds at the repo root, whatever the letter case of either.
+fn manifest_candidates(gate: &Entry, inside: &[Entry]) -> Vec<Entry> {
+    inside
+        .iter()
+        .filter(|entry| entry.path.eq_ignore_ascii_case(MANIFEST_NAME))
+        .map(|entry| Entry {
+            mode: entry.mode.clone(),
+            kind: entry.kind.clone(),
+            oid: entry.oid.clone(),
+            path: format!("{}/{}", gate.path, entry.path),
+        })
+        .collect()
+}
+
+/// The entry among `entries` that is the repo's manifest, its path matched ignoring ASCII case: the one spelled exactly
+/// when it is a regular file, else the only match when it is one. `Err` with why for a match that is a submodule, a
+/// symbolic link, a folder or another kind of entry, and for two matches that differ only in letter case. `None`
+/// when nothing matches.
+fn manifest_entry(entries: &[Entry]) -> Option<Result<&Entry, String>> {
+    let matches: Vec<&Entry> = entries.iter().filter(|entry| entry.path.eq_ignore_ascii_case(MANIFEST_PATH)).collect();
+    if let Some(exact) = matches
+        .iter()
+        .copied()
+        .find(|entry| entry.path == MANIFEST_PATH && regular(entry).is_ok())
+    {
+        return Some(Ok(exact));
+    }
+    match matches.as_slice() {
+        [] => None,
+        [only] => Some(regular(only)),
+        [first, second, ..] => Some(Err(format!("{} and {} differ only in letter case", first.path, second.path))),
+    }
+}
+
+/// `entry` when it is a regular file, a blob of mode 100644 or 100755; else `Err` with what it is.
+fn regular(entry: &Entry) -> Result<&Entry, String> {
+    let path = &entry.path;
+    match (entry.mode.as_str(), entry.kind.as_str()) {
+        ("100644" | "100755", "blob") => Ok(entry),
+        ("160000", _) => Err(format!("{path} is a submodule, not a file")),
+        ("120000", _) => Err(format!("{path} is a symbolic link, not a file")),
+        (_, "tree") => Err(format!("{path} is a folder, not a file")),
+        (mode, _) => Err(format!("{path} is not a regular file (mode {mode})")),
+    }
+}
+
+impl Tree {
+    /// The `Needs` the preflight sends for the tree's manifest; none when it has no manifest that reads.
+    fn needs(&self) -> Vec<(String, String)> {
+        match &self.manifest {
+            Some(Ok(manifest)) => toolchain::needs_of(manifest),
+            _ => Vec::new(),
+        }
+    }
 }
 
 /// The ceiling of each transfer, whatever `--timeout` says: the setup up to the end of the push, counted from the
@@ -462,6 +608,8 @@ pub(super) struct Called {
     pub(super) lines: Vec<String>,
     /// Its last standard error line that is the box's outputs line, however many lines came after it.
     outputs_line: Option<String>,
+    /// Its last standard error line that is the box's back commits line, however many lines came after it.
+    back_commits: Option<String>,
     /// Whether it said on standard error that the box skipped outputs for names this PC cannot take.
     names_skipped: bool,
     /// Whether the box said the run's start marker on standard error.
@@ -511,14 +659,18 @@ pub(super) struct Attempt<'c, 'a> {
     pub(super) call: &'c RemoteCall<'a>,
     pub(super) transport: &'c dyn Transport,
     pub(super) limit: Duration,
+    /// How long the sync-back waits for a worktree's lock another run holds: the git limit, which the sync-back's tests
+    /// shorten without shortening its git calls.
+    pub(super) lock_wait: Duration,
     pause: Duration,
     pub(super) limits: Limits,
     one_call: Option<OneCall<'c>>,
     /// The call, `preflight`, `run` or `outputs`, after whose first output byte the console interrupt is raised, as a
     /// Ctrl+C would; or `install`, once the install has moved its first file and before it moves a second, so its line
     /// reads `1 of {m}`: an install of a single file ends before the seam is reached; or `stop`, as `run` and then once
-    /// more while the stop call that Ctrl+C leads to runs.
-    interrupt_at: Option<&'c str>,
+    /// more while the stop call that Ctrl+C leads to runs; or `apply`, once a pair's sync-back has checked every patch
+    /// and before it applies the first.
+    pub(super) interrupt_at: Option<&'c str>,
     /// `--test-local-sdks`: this PC's SDK list, read in place of `dotnet --list-sdks`.
     local_sdks: Option<&'c str>,
     /// How long this PC's `dotnet --list-sdks` may take before it is killed and its list counts as unreadable.
@@ -550,12 +702,13 @@ pub(super) struct Attempt<'c, 'a> {
     box_killed: Option<BoxKill>,
 }
 
-/// How a run call ended ([`Attempt::run_call`]): its end, the last standard error line of the call that counts that is
-/// the box's outputs line, and whether that call said on standard error that the box skipped outputs for names this PC
-/// cannot take.
+/// How a run call ended ([`Attempt::run_call`]): its end, the last standard error lines of the call that counts that
+/// are the box's outputs line and its back commits line, and whether that call said on standard error that the box
+/// skipped outputs for names this PC cannot take.
 struct RunEnd {
     end: End,
     outputs_line: Option<String>,
+    back_commits: Option<String>,
     names_skipped: bool,
 }
 
@@ -575,20 +728,29 @@ impl Attempt<'_, '_> {
             full: sent.full,
             timeout: self.call.timeout,
             host: self.call.host,
+            sibling_snapshots: &[],
         };
-        let run_line = payload::capped("run", payload::line("run", &payload::run_word(&location, &run))).map_err(End::Failed)?;
-        let prepared = self.preflight(&location)?;
-        self.parity(&snapshot, prepared.sdks.as_deref())?;
+        let run_input = payload::input(&payload::run_word(&location, &run), sent.manifest.as_deref());
+        let tree = self.tree(&snapshot)?;
+        let needs = tree.as_ref().map(Tree::needs).unwrap_or_default();
+        let prepared = self.preflight(&location, &needs)?;
+        self.parity(&snapshot, tree.as_ref(), &prepared)?;
         self.push(&snapshot, prepared.created)?;
         // After the push: a run refused before it, at the preflight or by the parity check, leaves no marker.
         outputs::marked(&sent)?;
-        let called = self.run_call(&run_line, &location, sent.manifest.as_ref(), &nonce)?;
+        let called = self.run_call(&location, &run_input, &nonce)?;
         // The sync-back runs after a run call that ended with the command's own status; a refusal, an interrupt, a
         // kill, a lost connection or a failed call ended the attempt before it, so a box refusal's 75 never syncs back.
         // The pending marker stays on every end but a passing run whose box packed nothing.
         match called.end {
             End::Status(status) => {
-                let synced = syncback::sync_back(self, &snapshot, status)?;
+                let back_commits = called.back_commits.as_deref().and_then(syncback::back_commits);
+                // The run sends no sibling snapshots, as `sibling_snapshots` above says: a run carrying siblings applies
+                // nothing, and one carrying none syncs back its main repository.
+                let synced = match syncback::targets(self.call, &snapshot, &[]) {
+                    Some(targets) => syncback::sync_back(self, &targets, back_commits.as_deref(), status)?,
+                    None => syncback::unmatched(self, status),
+                };
                 let brought = outputs::accepted(called.outputs_line.as_deref(), self.call.key, &nonce);
                 let ran = outputs::Ran {
                     location: &location,
@@ -620,19 +782,24 @@ impl Attempt<'_, '_> {
             .ok_or_else(|| End::Failed("the snapshot made no commit".to_owned()))
     }
 
-    /// The preflight: readies the work folder, and checks the builder runs this gate's version. Whether it created the
-    /// bare repository just now, and the builder's boot time. A builder with no `gate box` that takes the run is not
-    /// routed, as one of another version is not.
-    fn preflight(&mut self, location: &Location) -> Result<Prepared, End> {
+    /// The preflight: readies the work folder, asks the builder to probe the tools of `needs`, and checks the builder
+    /// runs this gate's version. Whether it created the bare repository just now, the builder's boot time, its SDKs and
+    /// what it said of each tool sent. A builder with no `gate box` that takes the run is not routed, as one of another
+    /// version is not.
+    fn preflight(&mut self, location: &Location, needs: &[(String, String)]) -> Result<Prepared, End> {
         self.go_on()?;
-        let line = payload::capped("preflight", payload::line("preflight", &payload::location_word(location))).map_err(End::Failed)?;
+        let input = payload::input(&payload::preflight_word(location, needs), None);
+        let sent: Vec<String> = needs.iter().map(|(name, _)| name.clone()).collect();
         let watch = Watch::Setup(self.limits_for("preflight"));
         let raise = self.raises_at("preflight");
-        let (mut called, _) = self.with_retry(SSH_FAILED, |attempt| attempt.ssh(&line, Echo::LogOnly, watch, raise, CallOnly::default()))?;
+        let (mut called, _) = self.with_retry(SSH_FAILED, |attempt| {
+            attempt.ssh(BoxVerb::Preflight, Echo::LogOnly, watch, raise, CallOnly::plain(Arc::clone(&input)))
+        })?;
         let theirs = their_version(&called.lines).map(str::to_owned);
         let created = called.lines.iter().any(|line| line.starts_with(CREATED));
         let boot = boot_time(&called.lines).map(str::to_owned);
         let sdks = sdks_of(&called.lines);
+        let tools = toolchain::reported(&called.lines, &sent);
         self.lines.append(&mut called.lines);
         self.not_started_if_killed("the preflight", &called)?;
         let host = self.call.host;
@@ -659,41 +826,145 @@ impl Attempt<'_, '_> {
             self.say(line);
             return Err(End::Refused(FallbackReason::Version));
         }
-        Ok(Prepared { created, boot, sdks })
+        Ok(Prepared {
+            created,
+            boot,
+            sdks,
+            sent,
+            tools,
+        })
     }
 
-    /// The toolchain parity check, made after the preflight and before the push, so a refusal costs no transfer: a
-    /// builder whose preflight listed the SDKs `sdks` must have what the snapshot needs, as [`parity::need`] reads it
-    /// from the snapshot's root `global.json`, whatever the letter case of its name, and, with no pin, this PC's newest
-    /// SDK major. One that lacks it is refused `parity`, with the mismatch line. A builder that listed no SDK line, a
-    /// snapshot that is no .NET tree, or one whose listing or `global.json` cannot be read whole is not checked, the
-    /// listing with a line.
-    fn parity(&mut self, snapshot: &Snapshot, sdks: Option<&[String]>) -> Result<(), End> {
-        let Some(sdks) = sdks else {
-            return Ok(());
-        };
+    /// The snapshot's tree as the parity check reads it, listed before the preflight: the names of its files and
+    /// submodules ([`Attempt::file_names`]) and its `.gate/toolchain.toml` ([`Attempt::manifest`]), the manifest found
+    /// in a listing of the root and one of each `.gate` folder it names ([`manifest_candidates`]), so the names
+    /// listing stays as small as one of names alone. A listing past the git output cap, or one that is not UTF-8 or not of
+    /// `ls-tree`'s form, is said and gives `None`, which skips the whole check.
+    fn tree(&mut self, snapshot: &Snapshot) -> Result<Option<Tree>, End> {
         self.go_on()?;
         let git = Git::find(Path::new(self.call.root)).map_err(End::Failed)?;
-        let listing = match self.git_bytes(&git, &["ls-tree", "-r", "-z", "--name-only", &snapshot.commit]) {
+        let Some(names) = self.file_names(&git, &snapshot.commit)? else {
+            return Ok(None);
+        };
+        let Some(root) = self.tree_entries(&git, &snapshot.commit)? else {
+            return Ok(None);
+        };
+        let mut candidates = Vec::new();
+        for gate in gate_folders(&root) {
+            let Some(inside) = self.tree_entries(&git, &gate.oid)? else {
+                return Ok(None);
+            };
+            candidates.extend(manifest_candidates(gate, &inside));
+        }
+        let manifest = self.manifest(&git, &candidates)?;
+        Ok(Some(Tree { git, names, manifest }))
+    }
+
+    /// The names of the files and submodules of the snapshot's tree `treeish`, as its listing spells them, one per NUL;
+    /// `None`, with a line, when that listing is past the git output cap or is not UTF-8.
+    fn file_names(&mut self, git: &Git, treeish: &str) -> Result<Option<Vec<String>>, End> {
+        let Some(listing) = self.listed(git, &["ls-tree", "-r", "-z", "--name-only", treeish])? else {
+            return Ok(None);
+        };
+        Ok(Some(listing.split('\0').filter(|name| !name.is_empty()).map(str::to_owned).collect()))
+    }
+
+    /// The entries of `git ls-tree -z` over the tree `treeish` ([`entries_of`]), each with its mode, type, object id
+    /// and path; `None`, with a line, when that listing is past the git output cap, is not UTF-8 or is not of that form.
+    fn tree_entries(&mut self, git: &Git, treeish: &str) -> Result<Option<Vec<Entry>>, End> {
+        let Some(listing) = self.listed(git, &["ls-tree", "-z", treeish])? else {
+            return Ok(None);
+        };
+        let Some(entries) = entries_of(&listing) else {
+            self.say("gate: cannot list the snapshot's files: an entry is not of git ls-tree's form; skipping the toolchain check".to_owned());
+            return Ok(None);
+        };
+        Ok(Some(entries))
+    }
+
+    /// What one listing of `args` answered as text; `None`, with a line, when it is past the git output cap or is not
+    /// UTF-8, either of which skips the whole toolchain check. Any other git failure ends the run.
+    fn listed(&mut self, git: &Git, args: &[&str]) -> Result<Option<String>, End> {
+        self.go_on()?;
+        let listing = match self.git_bytes(git, args) {
             Ok(listing) => listing,
             Err(GitError::OverCap(why)) => {
                 self.say(format!("gate: cannot list the snapshot's files: {why}; skipping the toolchain check"));
-                return Ok(());
+                return Ok(None);
             }
             Err(error) => return Err(git_end(error)),
         };
         let Ok(listing) = String::from_utf8(listing) else {
             self.say("gate: cannot list the snapshot's files: a path is not valid UTF-8; skipping the toolchain check".to_owned());
+            return Ok(None);
+        };
+        Ok(Some(listing))
+    }
+
+    /// The snapshot's `.gate/toolchain.toml` among the candidate `entries` ([`manifest_entry`]), read by its object id;
+    /// `None` when it has none, `Err` with why when it is no regular file, is past the git output cap or does not read.
+    /// Any other git failure ends the run. `--test-remote-interrupt-at manifest` raises the console interrupt just
+    /// before the read.
+    fn manifest(&mut self, git: &Git, entries: &[Entry]) -> Result<Option<Result<Manifest, String>>, End> {
+        let entry = match manifest_entry(entries) {
+            None => return Ok(None),
+            Some(Err(why)) => return Ok(Some(Err(why))),
+            Some(Ok(entry)) => entry,
+        };
+        if let Some(interrupt) = self.call.interrupt.filter(|_| self.raises_at("manifest")) {
+            interrupt.raise();
+        }
+        self.go_on()?;
+        let read = match self.git_bytes(git, &["cat-file", "blob", &entry.oid]) {
+            Ok(bytes) => toolchain::read_bytes(&bytes),
+            Err(GitError::OverCap(why)) => Err(why),
+            Err(error) => return Err(git_end(error)),
+        };
+        self.go_on()?;
+        Ok(Some(read))
+    }
+
+    /// The toolchain parity check, made after the preflight and before the push, so a refusal costs no transfer, over
+    /// the snapshot's `tree`, which `None` skips: the builder must have the SDK [`Attempt::sdk_needs`] reads and the
+    /// tools the manifest declares, as [`toolchain::judge`] weighs what the `prepared` preflight said of them. The SDK
+    /// step's own lines come first, its "cannot read this PC's SDK list" among them; then each manifest problem and
+    /// tool not checked, in order; then a builder that lacks any of it says one mismatch line per need, the SDK's
+    /// before the tools', and is refused `parity` once.
+    fn parity(&mut self, snapshot: &Snapshot, tree: Option<&Tree>, prepared: &Prepared) -> Result<(), End> {
+        let Some(tree) = tree else {
             return Ok(());
         };
-        let names: Vec<&str> = listing.split('\0').filter(|name| !name.is_empty()).collect();
-        if !parity::is_dotnet_tree(names.iter().copied()) {
+        self.go_on()?;
+        let mut needs = self.sdk_needs(snapshot, tree, prepared.sdks.as_deref())?;
+        let judged = toolchain::judge(tree.manifest.as_ref(), &prepared.sent, &prepared.tools, self.call.host);
+        for line in judged.skips {
+            self.say(line);
+        }
+        needs.extend(judged.needs);
+        if needs.is_empty() {
             return Ok(());
         }
+        let sdks = prepared.sdks.as_deref().unwrap_or_default();
+        for line in parity::lines(self.call.repo, &needs, self.call.host, sdks) {
+            self.say(line);
+        }
+        Err(End::Refused(FallbackReason::Parity))
+    }
+
+    /// The SDK needs of the snapshot whose `tree` the builder whose preflight listed the SDKs `sdks` lacks, as
+    /// [`parity::need`] reads them from the snapshot's root `global.json`, whatever the letter case of its name, and,
+    /// with no pin, this PC's newest SDK major. None when the builder listed no SDK line or the tree is no .NET tree.
+    fn sdk_needs(&mut self, snapshot: &Snapshot, tree: &Tree, sdks: Option<&[String]>) -> Result<Vec<parity::Need>, End> {
+        let Some(sdks) = sdks else {
+            return Ok(Vec::new());
+        };
+        if !parity::is_dotnet_tree(tree.names.iter().map(String::as_str)) {
+            return Ok(Vec::new());
+        }
         // dotnet reads a root `global.json` whatever the letter case of its name, as Windows opens it.
-        let global_json = names.iter().find(|name| name.eq_ignore_ascii_case("global.json")).copied();
+        let global_json = tree.names.iter().find(|name| name.eq_ignore_ascii_case("global.json"));
         let pin = match global_json {
-            Some(name) => match self.git_bytes(&git, &["show", &format!("{}:{name}", snapshot.commit)]) {
+            Some(name) => match self.git_bytes(&tree.git, &["show", &format!("{}:{name}", snapshot.commit)]) {
                 Ok(bytes) => parity::pin_of(Some(&String::from_utf8_lossy(&bytes))),
                 // A `global.json` past the cap could not be read whole, so it holds no readable pin.
                 Err(GitError::OverCap(_)) => parity::Pin::unreadable(),
@@ -704,14 +975,10 @@ impl Attempt<'_, '_> {
         if pin.found && pin.version.is_none() {
             self.say(parity::NO_READABLE_PIN.to_owned());
         }
-        let need = parity::need(&pin, sdks, || self.local_major());
+        let needs = parity::need(&pin, sdks, || self.local_major());
         // A Ctrl+C while this PC's SDK list was read ends the run here, as an interrupt, before the push.
         self.go_on()?;
-        let Some(need) = need else {
-            return Ok(());
-        };
-        self.say(parity::mismatch_line(self.call.repo, &need, self.call.host, sdks));
-        Err(End::Refused(FallbackReason::Parity))
+        Ok(needs)
     }
 
     /// What git writes on standard output for `args` in the worktree, as the bytes it wrote, a call the console
@@ -737,7 +1004,7 @@ impl Attempt<'_, '_> {
         }
         let worktree = Path::new(self.call.root);
         match local_sdk_listing(Variables::from_process(), worktree, self.dotnet_limit, self.call.interrupt) {
-            Ok(listing) => parity::newest_major(listing.lines().filter_map(|line| line.split_whitespace().next())),
+            Ok(listing) => parity::newest_major(parity::sdk_versions(&listing)),
             Err(_) if self.call.interrupt.is_some_and(Interrupt::is_raised) => 0,
             Err(error) => {
                 let why = String::from(error);
@@ -833,15 +1100,16 @@ impl Attempt<'_, '_> {
     /// banner twice, as the command never started; a refusal when its 75 comes with the box's refusal tag for the run
     /// whose nonce is `nonce` and no start marker; a lost connection when it exited 255 otherwise. A watchdog kill says
     /// its line, stops the command and ends the run killed; a Ctrl+C stops the command too. Each call made is fed
-    /// `input` on its standard input, when given. With the end, what the call that counts said of the outputs
+    /// `input` on its standard input ([`payload::input`]). With the end, what the call that counts said of the outputs
     /// ([`RunEnd`]).
-    fn run_call(&mut self, line: &str, location: &Location, input: Option<&Arc<str>>, nonce: &str) -> Result<RunEnd, End> {
+    fn run_call(&mut self, location: &Location, input: &Arc<str>, nonce: &str) -> Result<RunEnd, End> {
         self.go_on()?;
         let limits = self.limits_for("run");
         // `stop` raises the interrupt during the run call too, so the stop it leads to can be interrupted again.
         let raise = self.raises_at("run") || self.raises_at("stop");
         let nonce: Arc<str> = Arc::from(nonce);
         let mut heard = None;
+        let mut back_commits = None;
         let mut names_skipped = false;
         let mut adjusted = None;
         // The command's time counts from the start of the call that counts, as its backstop does.
@@ -849,13 +1117,14 @@ impl Attempt<'_, '_> {
         let made = self.run_call_made(location, limits, |attempt| {
             begun = Some(Instant::now());
             let run = CallOnly {
-                input: input.cloned(),
+                input: Arc::clone(input),
                 nonce: Some(Arc::clone(&nonce)),
                 sink: None,
                 wire: Wire::Compressed,
             };
-            let called = attempt.ssh(line, Echo::Console, Watch::Run(limits), raise, run)?;
+            let called = attempt.ssh(BoxVerb::Run, Echo::Console, Watch::Run(limits), raise, run)?;
             heard.clone_from(&called.outputs_line);
+            back_commits.clone_from(&called.back_commits);
             names_skipped = called.names_skipped;
             adjusted = called.adjusted;
             Ok(called)
@@ -866,6 +1135,7 @@ impl Attempt<'_, '_> {
         Ok(RunEnd {
             end,
             outputs_line: heard,
+            back_commits,
             names_skipped,
         })
     }
@@ -967,7 +1237,7 @@ impl Attempt<'_, '_> {
                 if self.go_on().is_err() { End::Interrupted } else { End::Lost(output) }
             }
             Loss::Restarted(booted) => {
-                let shown = escaped(first_bytes(booted, git::FAILURE_BYTES));
+                let shown = escaped(git::first_bytes(booted, git::FAILURE_BYTES));
                 let line = format!("gate: {host} restarted during the run (booted {shown}); the run did not finish there");
                 self.falls_back_after_loss(output, line, FallbackReason::Rebooted)
             }
@@ -990,7 +1260,7 @@ impl Attempt<'_, '_> {
     /// did not finish or said none.
     fn boot_now(&mut self, location: &Location) -> Option<String> {
         let what = format!("asking {} for its boot time", self.call.host);
-        let called = self.bounded("boot", location, &what)?;
+        let called = self.bounded(BoxVerb::Boot, location, &what)?;
         (called.status == 0 && called.cut.is_none())
             .then(|| boot_time(&called.lines).map(str::to_owned))
             .flatten()
@@ -1000,7 +1270,7 @@ impl Attempt<'_, '_> {
     /// run's end is the caller's however it went.
     fn stop(&mut self, location: &Location) {
         let what = format!("stopping the command on {}", self.call.host);
-        self.bounded("stop", location, &what);
+        self.bounded(BoxVerb::Stop, location, &what);
     }
 
     /// [`Attempt::stop`] after a Ctrl+C, saying first how long the stop may take, its bound in whole seconds, so the
@@ -1016,18 +1286,12 @@ impl Attempt<'_, '_> {
     /// call that counts, says when it did not finish or failed, `what` it does named, and gives it back; `None` when it
     /// could not be made. With `--test-remote-interrupt-at` naming `verb`, its first call raises the console interrupt
     /// as soon as it runs.
-    fn bounded(&mut self, verb: &str, location: &Location, what: &str) -> Option<Called> {
-        let line = match payload::capped(verb, payload::line(verb, &payload::location_word(location))) {
-            Ok(line) => line,
-            Err(why) => {
-                self.say(format!("gate: {what} failed: {why}"));
-                return None;
-            }
-        };
+    fn bounded(&mut self, verb: BoxVerb, location: &Location, what: &str) -> Option<Called> {
+        let input = payload::input(&payload::location_word(location), None);
         let bound = self.limits.bound;
         let begun = Instant::now();
-        let raise = self.raises_at(verb);
-        let mut made = self.ssh(&line, Echo::LogOnly, Watch::Bounded(bound), raise, CallOnly::default());
+        let raise = self.raises_at(verb.as_str());
+        let mut made = self.ssh(verb, Echo::LogOnly, Watch::Bounded(bound), raise, CallOnly::plain(Arc::clone(&input)));
         let again = matches!(&made, Ok(first) if first.before_the_banner(SSH_FAILED)) && retry::retry_allowed(bound, begun.elapsed(), self.pause);
         if again {
             if let Ok(first) = &mut made {
@@ -1036,11 +1300,11 @@ impl Attempt<'_, '_> {
             self.say(retry::retry_line(self.call.host));
             thread::sleep(self.pause);
             made = self.ssh(
-                &line,
+                verb,
                 Echo::LogOnly,
                 Watch::Bounded(bound.saturating_sub(begun.elapsed())),
                 false,
-                CallOnly::default(),
+                CallOnly::plain(input),
             );
         }
         match made {
@@ -1076,15 +1340,16 @@ impl Attempt<'_, '_> {
         }
     }
 
-    /// One call of `gate box` on the builder carrying `line`, watched as `watch` says; the console interrupt raised
-    /// after its first output byte when `raise`; what only this call gives it, `only`.
-    fn ssh(&mut self, line: &str, echo: Echo, watch: Watch, raise: bool, only: CallOnly) -> Result<Called, End> {
+    /// One call of `gate box` on the builder for `verb`, its line [`payload::line`], fed its request on its standard
+    /// input; watched as `watch` says; the console interrupt raised after its first output byte when `raise`; what only
+    /// this call gives it, `only`.
+    fn ssh(&mut self, verb: BoxVerb, echo: Echo, watch: Watch, raise: bool, only: CallOnly) -> Result<Called, End> {
         let system = gate_win32::system_directory().map_err(|error| End::Failed(format!("cannot read the system folder: {error}")))?;
-        let command = call_command(self.transport.call(self.call.host, line, only.wire), &system);
+        let command = call_command(self.transport.call(self.call.host, &payload::line(verb), only.wire), &system);
         let starts = Starts {
             breakaway: self.transport.box_runs_here(),
             raise,
-            input: only.input,
+            input: Some(Fed { verb, input: only.input }),
             nonce: only.nonce,
             sink: only.sink,
         };
@@ -1098,15 +1363,15 @@ impl Attempt<'_, '_> {
     /// why the file or the call could not be made, or the interrupt.
     pub(super) fn outputs_call(&mut self, location: &Location, name: &str, archive: &mut outputs::Archive, limits: Limits) -> Result<Called, End> {
         self.go_on()?;
-        let line = payload::capped("outputs", payload::line("outputs", &payload::outputs_word(location, name))).map_err(End::Failed)?;
+        let input = payload::input(&payload::outputs_word(location, name), None);
         let raise = self.raises_at("outputs");
         let (mut called, _) = self.with_retry(SSH_FAILED, |attempt| {
             let cap = sent_limit(attempt.outputs_budget);
             let only = CallOnly {
                 sink: Some(archive.create(cap).map_err(End::Failed)?),
-                ..CallOnly::default()
+                ..CallOnly::plain(Arc::clone(&input))
             };
-            attempt.ssh(&line, Echo::LogOnly, Watch::Fetch(limits, None), raise, only)
+            attempt.ssh(BoxVerb::Outputs, Echo::LogOnly, Watch::Fetch(limits, None), raise, only)
         })?;
         self.lines.append(&mut called.lines);
         Ok(called)
@@ -1115,7 +1380,32 @@ impl Attempt<'_, '_> {
     /// git with `args` in the worktree, given the variables `set` beside the ones every call is given, among them the ssh
     /// it runs as `GIT_SSH_COMMAND` when there is one, its lines going where `echo` says, watched as `watch` says.
     pub(super) fn git(&mut self, git: &Git, args: &[String], set: &[(&str, &std::ffi::OsStr)], echo: Echo, watch: Watch) -> Result<Called, End> {
-        let mut command = git.command(Path::new(self.call.root));
+        let command = git.command(Path::new(self.call.root));
+        self.git_started(command, args, set, echo, watch)
+    }
+
+    /// git with `args` in the worktree at `folder`, a pair's sibling's among them, made as [`Attempt::git`] makes its
+    /// call, its lines kept out of the log.
+    pub(super) fn git_in(
+        &mut self,
+        folder: &Path,
+        git: &Git,
+        args: &[String],
+        set: &[(&str, &std::ffi::OsStr)],
+        watch: Watch,
+    ) -> Result<Called, End> {
+        self.git_started(git.command(folder), args, set, Echo::Unlogged, watch)
+    }
+
+    /// The git `command` with `args` and the variables `set` started as [`Attempt::git`] starts it.
+    fn git_started(
+        &mut self,
+        mut command: Command,
+        args: &[String],
+        set: &[(&str, &std::ffi::OsStr)],
+        echo: Echo,
+        watch: Watch,
+    ) -> Result<Called, End> {
         command.args(args).envs(set.iter().copied());
         let starts = Starts {
             breakaway: false,
@@ -1147,15 +1437,9 @@ impl Attempt<'_, '_> {
         let job = call_job(starts.breakaway).map_err(|error| End::Failed(format!("cannot make a job for {shown}: {error}")))?;
         let cannot_start = |error: String| End::Failed(format!("cannot start {shown}: {error}"));
         let launch = piped_launch(command, console_of(watch)).map_err(|error| cannot_start(error.to_string()))?;
-        let feed_log = match (&starts.input, &err_log) {
-            (Some(_), Some(log)) => Some(log.try_clone().map_err(cannot_log)?),
-            _ => None,
-        };
         let (suspended, stdout, stderr, stdin) = launched(&launch, &job, starts.input.is_some()).map_err(|error| cannot_start(error.to_string()))?;
         let running = suspended.assign_and_resume(&job).map_err(|error| cannot_start(error.to_string()))?;
-        if let (Some(stdin), Some(input)) = (stdin, starts.input) {
-            fed(stdin, input, feed_log);
-        }
+        let feeder = stdin.zip(starts.input).map(|(stdin, input)| fed(stdin, input));
         let shared = Arc::new(Shared::new());
         // Only the run call carries the run's nonce, and only it says the hang hint.
         let run_call = starts.nonce.is_some();
@@ -1213,10 +1497,15 @@ impl Attempt<'_, '_> {
         }
         let heard = std::mem::take(&mut *held(&shared.heard));
         match called_of(ended, shared.progress.raised(), heard) {
-            Ok(called) => Ok(Called {
-                written: looks.written,
-                ..called
-            }),
+            Ok(called) => {
+                if let Some(feeder) = feeder {
+                    self.fed_out(feeder, &called);
+                }
+                Ok(Called {
+                    written: looks.written,
+                    ..called
+                })
+            }
             Err(Unfinished::Failed(why)) => Err(End::Failed(why)),
             Err(Unfinished::Interrupted(note)) => {
                 // The interrupt stays the run's end, whose caller stops a command the call may have started.
@@ -1245,6 +1534,36 @@ impl Attempt<'_, '_> {
             None => {}
         }
         ended
+    }
+
+    /// For a call that ended as `called` having reached the box's banner, not refused and not with ssh's 255, joins its
+    /// `feeder`, given at most [`DRAIN`] to end, and notes in the log a write of its input that failed, naming the call's
+    /// verb. A call that ended any of the other ways says why on its own lines, and its unread input is no news, so its
+    /// feeder, whose write ends with the call's input pipe, is let go unread. A failed write never fails the call, whose
+    /// own end stands; the note is a logged line, so a log it cannot be appended to fails the call as any logged line does.
+    fn fed_out(&mut self, feeder: Feeder, called: &Called) {
+        // A call that ended before the banner ended with ssh's 255, so the status alone rules it out.
+        let reached = called.status != SSH_FAILED && called.refusal().is_none();
+        if !reached {
+            return;
+        }
+        let deadline = Instant::now() + DRAIN;
+        while !feeder.thread.is_finished() && Instant::now() < deadline {
+            thread::sleep(PAUSE_STEP);
+        }
+        let verb = feeder.verb.as_str();
+        if !feeder.thread.is_finished() {
+            self.logged(&format!(
+                "gate: the {verb} call's input was still being sent {} s after the call ended",
+                DRAIN.as_secs()
+            ));
+            return;
+        }
+        match feeder.thread.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => self.logged(&format!("gate: the {verb} call's input was not sent: {error}")),
+            Err(_) => self.logged(&format!("gate: the {verb} call's input feeder panicked")),
+        }
     }
 
     /// Gives the raw copy's reader `raw` the rest of its [`DRAIN`] to end, when the call's own end did not already
@@ -1345,6 +1664,7 @@ impl<'c, 'a> Attempt<'c, 'a> {
             call,
             transport,
             limit: git::GIT_LIMIT,
+            lock_wait: git::GIT_LIMIT,
             pause: Duration::ZERO,
             limits: Limits::for_tests(),
             one_call: None,
@@ -1437,6 +1757,7 @@ fn called_of(ended: CallEnd, raised: Raised, mut heard: Heard) -> Result<Called,
         last_error: heard.last_error,
         lines: heard.kept.into_lines(),
         outputs_line: heard.outputs_line,
+        back_commits: heard.back_commits,
         names_skipped: heard.names_skipped,
         started: heard.started,
         refused: heard.refused,
@@ -1614,26 +1935,50 @@ fn cannot_wait(shown: &str, error: &io::Error) -> End {
 
 /// How a call starts: whether its job lets a process in it start one outside it, which only the ssh of a transport
 /// whose `gate box` runs on this machine needs; and whether the console interrupt is raised after its first output
-/// byte; and what is fed on its standard input, `None` for none; and the run's nonce its readers match the box's start
-/// marker and refusal tags by, `None` for every call but the run call; and the sink its standard output is copied to
-/// raw, `None` for every call but the outputs call.
+/// byte; and what is fed on its standard input, `None` for none, as git's calls are; and the run's nonce its readers
+/// match the box's start marker and refusal tags by, `None` for every call but the run call; and the sink its standard
+/// output is copied to raw, `None` for every call but the outputs call.
 struct Starts {
     breakaway: bool,
     raise: bool,
-    input: Option<Arc<str>>,
+    input: Option<Fed>,
     nonce: Option<Arc<str>>,
     sink: Option<RawSink>,
 }
 
-/// What one call of `gate box` alone gives it: the run call what is fed on its standard input, the run's nonce and a
-/// compressed connection, the outputs call the sink its standard output is copied to raw; none of them, and a plain
-/// connection, for any other call.
-#[derive(Default)]
+/// What a call of `gate box` is fed on its standard input, `input`, and the `verb` of the call, which the line saying
+/// it could not be sent names.
+struct Fed {
+    verb: BoxVerb,
+    input: Arc<str>,
+}
+
+/// The thread feeding a call of `gate box` the `verb` its input, which gives back how the write went.
+struct Feeder {
+    verb: BoxVerb,
+    thread: thread::JoinHandle<io::Result<()>>,
+}
+
+/// What one call of `gate box` alone gives it: what is fed on its standard input, the request ([`payload::input`])
+/// every call carries; the run call the run's nonce and a compressed connection, the outputs call the sink its
+/// standard output is copied to raw; neither of them, and a plain connection, for any other call.
 struct CallOnly {
-    input: Option<Arc<str>>,
+    input: Arc<str>,
     nonce: Option<Arc<str>>,
     sink: Option<RawSink>,
     wire: Wire,
+}
+
+impl CallOnly {
+    /// A call fed `input` alone, over a plain connection.
+    fn plain(input: Arc<str>) -> CallOnly {
+        CallOnly {
+            input,
+            nonce: None,
+            sink: None,
+            wire: Wire::Plain,
+        }
+    }
 }
 
 /// Where a call's standard output is copied raw, byte for byte, rather than read as lines: the outputs call's archive
@@ -1676,19 +2021,12 @@ impl<W: Write> Write for Capped<W> {
     }
 }
 
-/// Writes `input` to a call's `stdin` on a thread of its own, then closes it. A write that fails, as one to a call that
-/// ended without reading its input does, is noted in the call's `log` and never fails the call, whose own end stands.
-fn fed(mut stdin: File, input: Arc<str>, log: Option<File>) {
-    thread::spawn(move || {
-        let Err(error) = stdin.write_all(input.as_bytes()) else {
-            return;
-        };
-        drop(stdin);
-        if let Some(mut log) = log {
-            // A note that cannot be written has nowhere else to go: the call's readers own its console streams.
-            let _ = writeln!(log, "gate: the run call's input was not sent: {error}");
-        }
-    });
+/// Writes what `fed` gives to a call's `stdin` on a thread of its own, then closes it; the thread gives back how the
+/// write went, which [`Attempt::fed_out`] reads once the call has ended.
+fn fed(mut stdin: File, fed: Fed) -> Feeder {
+    let Fed { verb, input } = fed;
+    let thread = thread::spawn(move || stdin.write_all(input.as_bytes()));
+    Feeder { verb, thread }
 }
 
 /// The console a call watched as `watch` is created on: this process's, whose Ctrl+C reaches it too, for every call a
@@ -1736,9 +2074,10 @@ fn git_end(error: GitError) -> End {
 }
 
 /// What one call's two streams said so far, kept for the call's end, each line cut to the cap: whether it wrote on
-/// standard output, its first and last standard error lines, its last standard error line that is the box's outputs
-/// line, whether a standard error line said the box skipped outputs for names ([`NAMES_SKIPPED`]), whether the box
-/// said the run's start marker and the refusal its first tag named, its last lines, and the first problem reading them.
+/// standard output, its first and last standard error lines, its last standard error lines that are the box's outputs
+/// line and its back commits line, whether a standard error line said the box skipped outputs for names
+/// ([`NAMES_SKIPPED`]), whether the box said the run's start marker and the refusal its first tag named, its last
+/// lines, and the first problem reading them.
 #[derive(Default)]
 struct Heard {
     kept: Kept,
@@ -1746,6 +2085,7 @@ struct Heard {
     first_error: Option<String>,
     last_error: Option<String>,
     outputs_line: Option<String>,
+    back_commits: Option<String>,
     names_skipped: bool,
     started: bool,
     refused: Option<FallbackReason>,
@@ -1789,13 +2129,14 @@ impl Heard {
         }
     }
 
-    /// Keeps `line`, already cut, of standard error when `error`: the last error line, the outputs line and the skipped
-    /// names it may be, and the line among those kept for the log.
+    /// Keeps `line`, already cut, of standard error when `error`: the last error line, the outputs line, the back
+    /// commits line and the skipped names it may be, and the line among those kept for the log.
     fn kept_line(&mut self, line: &str, error: bool) {
         if error {
             self.last_error = Some(line.to_owned());
         }
         outputs::keep_outputs_line(&mut self.outputs_line, line, error);
+        syncback::keep_back_commits_line(&mut self.back_commits, line, error);
         self.names_skipped |= error && line.starts_with(NAMES_SKIPPED);
         self.kept.push(line);
     }
@@ -2218,7 +2559,7 @@ fn relayed_raw(
     })
 }
 
-/// Copies `stream` into `sink`, shown as `shown`, byte for byte until it ends, in chunks of at most [`RAW_CHUNK`]: no/// Copies `stream` into `sink`, shown as `shown`, byte for byte until it ends, in chunks of at most [`RAW_CHUNK`]: no
+/// Copies `stream` into `sink`, shown as `shown`, byte for byte until it ends, in chunks of at most [`RAW_CHUNK`]: no
 /// line is read, so no length cuts it. Each chunk marks the call's progress, and marks that the call wrote on standard
 /// output, so a call that sent a byte is past the banner. A read or a write that fails is the call's problem, and ends
 /// the copy. No write is made under the lock the watcher could take.
@@ -2302,13 +2643,13 @@ fn is_heartbeat(line: &str) -> bool {
 }
 
 /// The builder's version, from the last `gate: remote version <v>` line of its preflight; `None` when it said none.
-fn their_version(lines: &[String]) -> Option<&str> {
+pub(crate) fn their_version(lines: &[String]) -> Option<&str> {
     lines.iter().rev().find_map(|line| line.strip_prefix(VERSION)).map(str::trim)
 }
 
 /// The SDKs the builder lists, from the last `gate: remote sdks <v1,v2|none>` line of its preflight, without `none`;
 /// `None` when it said no such line, or one with no list, which skips the parity check.
-fn sdks_of(lines: &[String]) -> Option<Vec<String>> {
+pub(crate) fn sdks_of(lines: &[String]) -> Option<Vec<String>> {
     lines
         .iter()
         .rev()
@@ -2326,9 +2667,17 @@ fn dotnet_limit(seams: &TestSeams) -> Duration {
 /// What `dotnet --list-sdks` lists on this PC, as [`git::sdk_listing`] reads it, with the folders inside `worktree`
 /// dropped from the `PATH` of `variables`, each compared by its canonical path so a junction does not get around it,
 /// and a dotnet found that still lies inside it refused. A `PATH` that cannot be read that way cannot be read at all.
-fn local_sdk_listing(variables: Variables, worktree: &Path, limit: Duration, interrupt: Option<Interrupt>) -> Result<String, GitError> {
-    let path = path_outside(&variables, worktree).map_err(GitError::Failed)?;
-    git::sdk_listing(variables.with("PATH", &path), limit, interrupt, Some(worktree))
+pub(crate) fn local_sdk_listing(variables: Variables, worktree: &Path, limit: Duration, interrupt: Option<Interrupt>) -> Result<String, GitError> {
+    let variables = outside_worktree(variables, worktree).map_err(GitError::Failed)?;
+    git::sdk_listing(variables, limit, interrupt, Some(worktree))
+}
+
+/// `variables` with the folders inside `worktree` dropped from their `PATH`, as [`path_outside`] rebuilds it, so a
+/// program of the repo's own is never found along it; else why the `PATH` cannot be rebuilt. This PC's SDK list and
+/// `gate check`'s tool probes look for their programs along it.
+pub(crate) fn outside_worktree(variables: Variables, worktree: &Path) -> Result<Variables, String> {
+    let path = path_outside(&variables, worktree)?;
+    Ok(variables.with("PATH", &path))
 }
 
 /// The `PATH` of `variables` without the folders inside `worktree`, each compared by its canonical path: an `npm run`
@@ -2390,10 +2739,13 @@ fn after_loss<'n>(before: Option<&str>, now: Option<&'n str>) -> Loss<'n> {
 /// The line refusing a builder `host` whose version, `theirs`, is not `ours`; `None` when they are the same. A
 /// builder that said no version runs one unknown; one that did is shown by its first 4 KiB, escaped.
 fn version_refusal(host: &str, theirs: Option<&str>, ours: &str) -> Option<String> {
-    (theirs != Some(ours)).then(|| {
-        let shown = theirs.map_or_else(|| "unknown".to_owned(), |theirs| escaped(first_bytes(theirs, git::FAILURE_BYTES)));
-        format!("gate: not routed: {host} runs gate {shown}, this PC {ours}; run gate push")
-    })
+    other_build(theirs, ours).map(|shown| format!("gate: not routed: {host} runs gate {shown}, this PC {ours}; run gate push"))
+}
+
+/// The builder's version, `theirs`, as a line shows it when it is not `ours`; `None` when they are the same. A builder
+/// that said no version runs one unknown; one that did is shown by its first 4 KiB, escaped.
+pub(crate) fn other_build(theirs: Option<&str>, ours: &str) -> Option<String> {
+    (theirs != Some(ours)).then(|| theirs.map_or_else(|| "unknown".to_owned(), |theirs| escaped(git::first_bytes(theirs, git::FAILURE_BYTES))))
 }
 
 /// The watchdog's line for a call watched as a fetch, `doing` what it was cut for `cut` doing: STALLED for one that sent
@@ -2405,15 +2757,6 @@ pub(super) fn watchdog_line(cut: Cut, doing: &str) -> Option<String> {
         Cut::Ceiling(ceiling) => Some(watchdog::transfer_line(ceiling, doing)),
         Cut::Watchdog(_) | Cut::Late(_) | Cut::TooLong | Cut::TooBig(_) | Cut::ArchiveTooBig(_) => None,
     }
-}
-
-/// `text` cut to its first `most` bytes, at a character's boundary.
-pub(super) fn first_bytes(text: &str, most: usize) -> &str {
-    let mut end = text.len().min(most);
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    text.get(..end).unwrap_or_default()
 }
 
 /// A line the box says on a run call's standard error for the client alone, besides its heartbeat: the start marker
@@ -2429,12 +2772,13 @@ enum Protocol {
     Adjusted(f64),
 }
 
-/// The start marker, the two refusal tags, the two kill tags and the adjusted line's prefix of one run, made once for
+/// The start marker, the three refusal tags, the two kill tags and the adjusted line's prefix of one run, made once for
 /// its run call's readers.
 struct ProtocolLines {
     started: String,
     busy: String,
     tools: String,
+    layout: String,
     timed_out: String,
     backstop: String,
     adjusted: String,
@@ -2447,6 +2791,7 @@ impl ProtocolLines {
             started: started_line(nonce),
             busy: refused_line(nonce, Refusal::Busy),
             tools: refused_line(nonce, Refusal::Tools),
+            layout: refused_line(nonce, Refusal::Layout),
             timed_out: killed_line(nonce, BoxKill::TimedOut),
             backstop: killed_line(nonce, BoxKill::Backstop),
             adjusted: adjusted_prefix(nonce),
@@ -2461,6 +2806,7 @@ impl ProtocolLines {
             (&self.started, Protocol::Started),
             (&self.busy, Protocol::Refused(FallbackReason::Busy)),
             (&self.tools, Protocol::Refused(FallbackReason::Tools)),
+            (&self.layout, Protocol::Refused(FallbackReason::Layout)),
             (&self.timed_out, Protocol::Killed(BoxKill::TimedOut)),
             (&self.backstop, Protocol::Killed(BoxKill::Backstop)),
         ]
@@ -2523,9 +2869,11 @@ mod tests {
         console_of, held, is_heartbeat, last_update, local_sdk_listing, path_outside, paused, push_size, relay, relay_raw, relayed_raw, sdks_of,
         seconds, their_version, version_refusal,
     };
+    use super::{Entry, entries_of, gate_folders, manifest_candidates, manifest_entry};
     use crate::environment::Variables;
     use crate::remote::git::{DOTNET_LIMIT, GIT_LIMIT, GitError};
     use crate::remote::outputs;
+    use crate::remote::payload;
     use crate::remote::payload::Location;
     use crate::remote::snapshot::Snapshot;
     use crate::remote::transport::Local;
@@ -2630,6 +2978,8 @@ mod tests {
             host: "builder",
             key: "app-1a2b3c4d",
             root: r"C:\no-such-worktree",
+            leaf: "app",
+            siblings: Vec::new(),
             repo: "app",
             subfolder: "",
             words: &[],
@@ -2653,6 +3003,7 @@ mod tests {
             call,
             transport,
             limit: GIT_LIMIT,
+            lock_wait: GIT_LIMIT,
             pause: LONG,
             limits: Limits::for_tests(),
             one_call: None,
@@ -2715,6 +3066,7 @@ mod tests {
             last_error: Some(first_error.to_owned()),
             lines: vec![first_error.to_owned()],
             outputs_line: None,
+            back_commits: None,
             names_skipped: false,
             started: false,
             refused: None,
@@ -3245,7 +3597,11 @@ mod tests {
             status: step.status,
             names_skipped: step.names_skipped,
         };
-        outputs::ended(&mut attempt, &sent, &ran, End::Status(step.synced), step.brought.as_ref());
+        let synced = crate::remote::syncback::Synced {
+            end: End::Status(step.synced),
+            reason: None,
+        };
+        outputs::ended(&mut attempt, &sent, &ran, synced, step.brought.as_ref());
         attempt.brought_back
     }
 
@@ -3368,6 +3724,24 @@ mod tests {
 
         assert!(!called.lines.iter().any(|kept| kept == line), "the window no longer holds the line");
         assert_eq!(called.outputs_line.as_deref(), Some(line), "the last standard error outputs line is kept");
+    }
+
+    #[test]
+    fn the_last_standard_error_back_commits_line_alone_is_kept() {
+        let mut heard = Heard::default();
+        let said = |sha: char| format!("gate: remote back commits: app {}, lib none", sha.to_string().repeat(40));
+        heard.record(&said('a'), true, None);
+        heard.record(&said('b'), true, None);
+        heard.record(&said('c'), false, None);
+        heard.record("gate: remote said something else", true, None);
+
+        let called = called_of(CallEnd::Exited(0), Raised::default(), heard).expect("a call that ended");
+
+        assert_eq!(
+            called.back_commits.as_deref(),
+            Some(said('b').as_str()),
+            "the last standard error back commits line is kept, and a standard output one is not"
+        );
     }
 
     #[test]
@@ -3867,10 +4241,10 @@ mod tests {
         };
         let location = Location::under(r"C:\builder", "app", "app-1a2b3c4d", "0123456789ab");
 
-        assert!(matches!(attempt.preflight(&location), Err(End::Interrupted)), "the preflight");
+        assert!(matches!(attempt.preflight(&location, &[]), Err(End::Interrupted)), "the preflight");
         assert!(matches!(attempt.push(&snapshot, false), Err(End::Interrupted)), "the push");
         assert!(
-            matches!(attempt.run_call("line", &location, None, NONCE), Err(End::Interrupted)),
+            matches!(attempt.run_call(&location, &payload::input("e30=", None), NONCE), Err(End::Interrupted)),
             "the run call"
         );
         let outcome = attempt.outcome(End::Interrupted);
@@ -4003,6 +4377,126 @@ mod tests {
             "the box could not read it"
         );
         assert_eq!(sdks_of(&lines(&["gate: remote sdks  "])), None, "an SDK line with no list");
+    }
+
+    fn entry(mode: &str, kind: &str, path: &str) -> Entry {
+        Entry {
+            mode: mode.to_owned(),
+            kind: kind.to_owned(),
+            oid: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+            path: path.to_owned(),
+        }
+    }
+
+    #[test]
+    fn a_listing_reads_each_entry_s_mode_type_object_and_path() {
+        let listing = "100644 blob 0123456789abcdef0123456789abcdef01234567\t.gate/toolchain.toml\0\
+                       040000 tree 0123456789abcdef0123456789abcdef01234567\tsrc dir\0";
+        assert_eq!(
+            entries_of(listing),
+            Some(vec![entry("100644", "blob", ".gate/toolchain.toml"), entry("040000", "tree", "src dir")])
+        );
+        assert_eq!(entries_of(""), Some(Vec::new()));
+        assert_eq!(entries_of("100644 blob\0"), None, "no tab");
+        assert_eq!(entries_of("100644 blob x y\ta\0"), None, "four words");
+    }
+
+    /// The manifest's candidates are built from one listing of the root and one of each `.gate` folder it names: the
+    /// exact spelling at the repo root is read, a case variant alone is, two at once differ only in letter case, and a
+    /// `.gate` that is no folder holds no manifest at all.
+    #[test]
+    fn the_manifest_s_entries_are_built_from_a_root_listing_and_a_gate_listing() {
+        let oid = "0123456789abcdef0123456789abcdef01234567";
+        let record = |mode: &str, kind: &str, name: &str| format!("{mode} {kind} {oid}\t{name}\0");
+        let candidates = |root: &str, inside: &str| -> Vec<Entry> {
+            let root = entries_of(root).expect("the root listing reads");
+            let inside = entries_of(inside).expect("the .gate listing reads");
+            gate_folders(&root)
+                .into_iter()
+                .flat_map(|gate| manifest_candidates(gate, &inside))
+                .collect()
+        };
+
+        let exact = candidates(&record("040000", "tree", ".gate"), &record("100644", "blob", "toolchain.toml"));
+        assert_eq!(
+            exact,
+            vec![entry("100644", "blob", ".gate/toolchain.toml")],
+            "the folder and the name as spelled"
+        );
+        assert_eq!(manifest_entry(&exact), Some(Ok(&exact[0])), "and that is the one read");
+
+        let variant = candidates(&record("040000", "tree", ".Gate"), &record("100644", "blob", "Toolchain.TOML"));
+        assert_eq!(variant, vec![entry("100644", "blob", ".Gate/Toolchain.TOML")], "each part as spelled");
+        assert_eq!(manifest_entry(&variant), Some(Ok(&variant[0])), "a case variant alone is read too");
+
+        let both = format!(
+            "{}{}",
+            record("100644", "blob", "toolchain.toml"),
+            record("100644", "blob", "Toolchain.TOML")
+        );
+        assert_eq!(
+            manifest_entry(&candidates(&record("040000", "tree", ".Gate"), &both)),
+            Some(Err(".Gate/toolchain.toml and .Gate/Toolchain.TOML differ only in letter case".to_owned()))
+        );
+
+        assert_eq!(
+            candidates(&record("100644", "blob", ".gate"), &record("100644", "blob", "toolchain.toml")),
+            Vec::new(),
+            "a .gate that is no folder holds no manifest"
+        );
+    }
+
+    #[test]
+    fn the_manifest_is_a_regular_file_at_the_root_whatever_its_letter_case() {
+        let file = [entry("100644", "blob", "a.txt"), entry("100644", "blob", ".gate/toolchain.toml")];
+        assert_eq!(manifest_entry(&file), Some(Ok(&file[1])));
+        let executable = [entry("100755", "blob", ".Gate/Toolchain.TOML")];
+        assert_eq!(manifest_entry(&executable), Some(Ok(&executable[0])));
+        assert_eq!(
+            manifest_entry(&[entry("100644", "blob", "x/.gate/toolchain.toml")]),
+            None,
+            "not at the root"
+        );
+        assert_eq!(manifest_entry(&[]), None);
+    }
+
+    #[test]
+    fn a_manifest_that_is_a_submodule_a_symlink_or_a_folder_is_not_read() {
+        for (mode, kind, why) in [
+            ("160000", "commit", ".gate/toolchain.toml is a submodule, not a file"),
+            ("120000", "blob", ".gate/toolchain.toml is a symbolic link, not a file"),
+            ("040000", "tree", ".gate/toolchain.toml is a folder, not a file"),
+            ("100664", "blob", ".gate/toolchain.toml is not a regular file (mode 100664)"),
+        ] {
+            let entries = [entry(mode, kind, ".gate/toolchain.toml")];
+            assert_eq!(manifest_entry(&entries), Some(Err(why.to_owned())), "{mode} {kind}");
+        }
+    }
+
+    #[test]
+    fn two_manifests_that_differ_only_in_case_are_not_read_unless_one_is_spelled_exactly() {
+        let two = [
+            entry("100644", "blob", ".Gate/toolchain.toml"),
+            entry("100644", "blob", ".gate/Toolchain.toml"),
+        ];
+        assert_eq!(
+            manifest_entry(&two),
+            Some(Err(".Gate/toolchain.toml and .gate/Toolchain.toml differ only in letter case".to_owned()))
+        );
+        let exact = [
+            entry("100644", "blob", ".GATE/toolchain.toml"),
+            entry("100644", "blob", ".gate/toolchain.toml"),
+        ];
+        assert_eq!(manifest_entry(&exact), Some(Ok(&exact[1])), "the exact spelling wins");
+        let exact_link = [
+            entry("100644", "blob", ".GATE/toolchain.toml"),
+            entry("120000", "blob", ".gate/toolchain.toml"),
+        ];
+        assert_eq!(
+            manifest_entry(&exact_link),
+            Some(Err(".GATE/toolchain.toml and .gate/toolchain.toml differ only in letter case".to_owned())),
+            "an exact spelling that is no regular file wins nothing"
+        );
     }
 
     #[test]

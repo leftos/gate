@@ -26,6 +26,8 @@ regex = "1.13.1"
 serde_json = { version = "1.0.151", features = ["preserve_order"] }
 sha2 = "0.11.0"
 tar = "0.4.46"
+# Reads `.gate/toolchain.toml` into a `toml::Table`, its keys in file order; no writer, no derive.
+toml = { version = "1.1.8", default-features = false, features = ["std", "parse", "serde", "preserve_order"] }
 # `Win32_Storage_FileSystem` for the outputs walk and pack; `Win32_System_Console` for `fake-tool`, a `test-seams` bin.
 windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem", "Win32_System_Console"] }
 zstd = "0.14.2"

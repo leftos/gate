@@ -1,0 +1,4 @@
+[tools]
+rust = "1.89"
+cargo-nextest = "0.9.100"
+pwsh = "7.4"

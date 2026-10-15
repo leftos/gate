@@ -108,10 +108,10 @@ fn hash(paths: &[PathBuf], work: &Path) -> Result<String, String> {
     Ok(hex)
 }
 
-/// The text of the record `<Work>.tools`, `Ok(None)` when there is none: opened without following a link there and
-/// checked a plain file, as the work folder's lock is opened, so a record that is a link, a folder or a file with more
-/// than one name is not read.
-fn read_record(record: &str) -> io::Result<Option<String>> {
+/// The text of the record `record` beside the work folder, `<Work>.tools` or `<Work>.layout`, `Ok(None)` when there is
+/// none: opened without following a link there and checked a plain file, as the work folder's lock is opened, so a
+/// record that is a link, a folder or a file with more than one name is not read.
+pub(super) fn read_record(record: &str) -> io::Result<Option<String>> {
     let mut file = match OpenOptions::new()
         .read(true)
         .share_mode(0)
@@ -137,10 +137,10 @@ fn write_record(record: &str, digest: &str, console: &mut Console) -> Result<(),
     Ok(())
 }
 
-/// Writes `digest` as the whole of `record`, without following a link there and only into a plain file, as the work
+/// Writes `text` as the whole of `record`, without following a link there and only into a plain file, as the work
 /// folder's lock is opened. The file is opened without truncating it and emptied only once it is checked, so a record
 /// that is another file's second name is refused with that file's bytes untouched.
-fn write_record_file(record: &str, digest: &str) -> io::Result<()> {
+pub(super) fn write_record_file(record: &str, text: &str) -> io::Result<()> {
     let mut file = OpenOptions::new()
         .write(true)
         .create(true)
@@ -150,7 +150,7 @@ fn write_record_file(record: &str, digest: &str) -> io::Result<()> {
         .open(record)?;
     gate_win32::check_plain_file(&file)?;
     file.set_len(0)?;
-    file.write_all(digest.as_bytes())
+    file.write_all(text.as_bytes())
 }
 
 /// How running the restore ended.

@@ -19,7 +19,7 @@ const HOST: &str = "builder";
 const FAKE_SSH: &str = env!("CARGO_BIN_EXE_fake-ssh");
 /// The variable naming the stand-in's steps file; the stand-in logs each call's verb to `<steps>.log`.
 const STEPS_VARIABLE: &str = "GATE_FAKE_SSH_STEPS";
-/// The variable naming the gate the stand-in runs `box <verb> <payload>` with.
+/// The variable naming the gate the stand-in runs `box <verb> --stdin` with, feeding it the request on standard input.
 const GATE_VARIABLE: &str = "GATE_FAKE_SSH_GATE";
 /// What a sync-back case's snapshot leaves out: the gate's state root, LOCALAPPDATA and logs, the builder root and the
 /// stand-in's files, and `.tmp/`, which the client writes in. `tool.exe` is sent, so the builder runs it.

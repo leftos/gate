@@ -29,6 +29,10 @@ pub(crate) const SSH_OPTIONS: [&str; 12] = [
     "ClearAllForwardings=yes",
 ];
 
+/// The option every call of `gate box`, and `gate push`'s, puts ahead of [`SSH_OPTIONS`]: no terminal asked for, so
+/// standard input reaches the builder through no pty.
+const REQUEST_TTY: [&str; 2] = ["-o", "RequestTTY=no"];
+
 /// The options a call adds after [`SSH_OPTIONS`] for a connection ssh compresses.
 const COMPRESSION: [&str; 2] = ["-o", "Compression=yes"];
 
@@ -89,15 +93,16 @@ fn sent_repo(repo: &str) -> Result<&str, String> {
     }
 }
 
-/// ssh's words for running `line` on `host` over a connection `wire` says how to carry: the options, the compression
-/// option for a compressed one, `--`, the host and the line, each a word of its own.
+/// ssh's words for running `line` on `host` over a connection `wire` says how to carry: no terminal asked for, the
+/// options, the compression option for a compressed one, `--`, the host and the line, each a word of its own.
 pub(crate) fn ssh_words(host: &str, line: &str, wire: Wire) -> Vec<OsString> {
     let compression: &[&str] = match wire {
         Wire::Compressed => &COMPRESSION,
         Wire::Plain => &[],
     };
-    SSH_OPTIONS
+    REQUEST_TTY
         .iter()
+        .chain(&SSH_OPTIONS)
         .chain(compression)
         .copied()
         .chain(["--", host, line])
@@ -193,7 +198,7 @@ impl Transport for Local {
     }
 }
 
-/// The words `line` carries after the builder's gate: `box`, the verb and the payload word.
+/// The words `line` carries after the builder's gate: `box`, the verb and `--stdin`.
 #[cfg(feature = "test-seams")]
 fn box_words(line: &str) -> Vec<OsString> {
     line.strip_prefix(BOX_EXE)
@@ -302,11 +307,15 @@ mod tests {
         texts.iter().map(OsString::from).collect()
     }
 
+    const RUN_LINE: &str = r#""%LOCALAPPDATA%\gate\bin\gate.exe" box run --stdin"#;
+
     #[test]
     fn ssh_s_words_are_the_options_then_dash_dash_then_the_host_then_the_line() {
         assert_eq!(
-            ssh_words("builder", r#""%LOCALAPPDATA%\gate\bin\gate.exe" box run e30="#, Wire::Plain),
+            ssh_words("builder", RUN_LINE, Wire::Plain),
             words(&[
+                "-o",
+                "RequestTTY=no",
                 "-o",
                 "BatchMode=yes",
                 "-o",
@@ -321,23 +330,38 @@ mod tests {
                 "ClearAllForwardings=yes",
                 "--",
                 "builder",
-                r#""%LOCALAPPDATA%\gate\bin\gate.exe" box run e30="#,
+                RUN_LINE,
             ])
         );
     }
 
     #[test]
+    fn every_box_call_s_ssh_words_ask_for_no_tty() {
+        let preflight = r#""%LOCALAPPDATA%\gate\bin\gate.exe" box preflight --stdin"#;
+        for (line, wire) in [(RUN_LINE, Wire::Compressed), (preflight, Wire::Plain)] {
+            let said = ssh_words("builder", line, wire);
+            let tty = said.iter().position(|word| word == "RequestTTY=no").expect("no terminal is asked for");
+            let dashes = said.iter().position(|word| word == "--").expect("the options end with --");
+            assert!(
+                tty > 0 && said.get(tty - 1).is_some_and(|word| word == "-o"),
+                "an option of its own: {said:?}"
+            );
+            assert!(tty < dashes, "an option, before the host: {said:?}");
+        }
+    }
+
+    #[test]
     fn the_run_call_s_ssh_words_ask_for_compression_and_others_do_not() {
-        let line = r#""%LOCALAPPDATA%\gate\bin\gate.exe" box run e30="#;
+        let line = RUN_LINE;
         let compressed = ssh_words("builder", line, Wire::Compressed);
         let plain = ssh_words("builder", line, Wire::Plain);
-        assert_eq!(compressed.get(..12), plain.get(..12), "every call's own options come first");
+        assert_eq!(compressed.get(..14), plain.get(..14), "every call's own options come first");
         assert_eq!(
-            compressed.get(12..),
+            compressed.get(14..),
             Some(words(&["-o", "Compression=yes", "--", "builder", line]).as_slice())
         );
         assert_eq!(
-            plain.get(12..),
+            plain.get(14..),
             Some(words(&["--", "builder", line]).as_slice()),
             "a plain call asks for nothing more"
         );
@@ -360,7 +384,7 @@ mod tests {
         let local = Local::new(r"local:C:\builder", None).expect("a local transport");
         assert_eq!(
             local.call("builder", line, Wire::Compressed).args,
-            words(&["box", "run", "e30="]),
+            words(&["box", "run", "--stdin"]),
             "the local box is run with no ssh between"
         );
     }
@@ -408,11 +432,11 @@ mod tests {
 
     #[test]
     fn the_local_transport_runs_the_words_after_the_builder_s_gate() {
-        let line = r#""%LOCALAPPDATA%\gate\bin\gate.exe" box preflight e30="#;
-        assert_eq!(box_words(line), words(&["box", "preflight", "e30="]));
+        let line = r#""%LOCALAPPDATA%\gate\bin\gate.exe" box preflight --stdin"#;
+        assert_eq!(box_words(line), words(&["box", "preflight", "--stdin"]));
         let local = Local::new(r"local:C:\builder", None).expect("a local transport");
         assert_eq!(local.root(), r"C:\builder");
-        assert_eq!(local.call("builder", line, Wire::Plain).args, words(&["box", "preflight", "e30="]));
+        assert_eq!(local.call("builder", line, Wire::Plain).args, words(&["box", "preflight", "--stdin"]));
         assert_eq!(local.push_target("builder", "app").expect("a push target").url, r"C:\builder\app.git");
         assert_eq!(local.upload_pack(), None, "a bare repository here names no pack command");
         let stubbed = Local::new(r"local:C:\builder", Some(PathBuf::from("fake-ssh.exe").as_path())).expect("a local transport");

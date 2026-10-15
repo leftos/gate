@@ -29,20 +29,21 @@ pub enum Invocation {
     Cutover(CutoverRequest),
     /// `gate push`.
     Push(PushRequest),
+    /// `gate check`.
+    Check(CheckRequest),
     /// `gate burn`.
     Burn(BurnRequest),
     /// `gate expect`.
     Expect(ExpectRequest),
-    /// The hidden `gate box <verb> <payload>`.
+    /// The hidden `gate box <verb> --stdin`.
     Box(BoxRequest),
 }
 
-/// A valid `gate box`: the verb, the payload word as given, base64 of UTF-8 JSON that the binary decodes, and the
-/// hidden seams given before the verb.
+/// A valid `gate box`: the verb and the hidden seams given before it. The request itself, base64 of UTF-8 JSON, is
+/// stdin's first line, which the binary reads and decodes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BoxRequest {
     pub verb: BoxVerb,
-    pub payload: OsString,
     pub seams: BoxSeams,
 }
 
@@ -78,6 +79,9 @@ pub struct BoxSeams {
     /// How many processes the ending of a job `gate box run`'s ceiling killed reports left, in place of what the job
     /// holds after it; `None` without the feature.
     pub kill_leaves: Option<u64>,
+    /// How long `gate box preflight`'s tool probes may take together, in milliseconds, in place of the built-in 10 s;
+    /// `None` without the feature.
+    pub probe_limit_ms: Option<u64>,
 }
 
 /// What `gate box` was asked to do on the builder.
@@ -180,9 +184,10 @@ pub struct TestSeams {
     pub remote_retry_pause_ms: Option<u64>,
     /// How long the remote client's `stop` call may take before its ssh is killed, in milliseconds.
     pub remote_bound_ms: Option<u64>,
-    /// The call of the remote client, `preflight`, `run`, `outputs` or `install`, after whose first output byte (for
-    /// `install`, its first moved file) the client raises the console interrupt itself; or `sdks`, before it reads this
-    /// PC's SDK list.
+    /// Where the remote client raises the console interrupt itself: `preflight`, `run`, `outputs` or `install`, after
+    /// that call's first output byte (for `install`, its first moved file); `stop`, during the run call, so the stop it
+    /// leads to can be interrupted again; `sdks`, before it reads this PC's SDK list; or `manifest`, before it reads the
+    /// snapshot's `.gate/toolchain.toml`.
     pub remote_interrupt_at: Option<String>,
     /// The one call of the remote client, `preflight`, `push`, `run`, `ls-remote`, `fetch` or `outputs`, that
     /// `--test-stall-ms` applies to, and `--test-remote-timeout-ms` too when it names a call other than `run`; every
@@ -300,6 +305,32 @@ pub struct CutoverSeams {
 pub struct PushRequest {
     /// The hidden `--test-*` flags that set the push's ssh and bound.
     pub seams: PushSeams,
+}
+
+/// A valid `gate check`, which takes no words: the builder to check in place of this PC, and the hidden seams the
+/// black-box suite gives it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CheckRequest {
+    /// `--builder <host>` as given: the builder to check; `None` checks this PC.
+    pub builder: Option<String>,
+    /// The hidden `--test-*` flags that set the check's probe limit and the builder check's transport and bound.
+    pub seams: CheckSeams,
+}
+
+/// What the black-box suite sets on `gate check` through its hidden `--test-*` flags; each field keeps its default,
+/// `None`, in a gate built without the `test-seams` feature.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CheckSeams {
+    /// How long the check's tool probes may take together, in milliseconds, in place of the built-in 10 s
+    /// (`--test-probe-limit-ms`).
+    pub probe_limit_ms: Option<u64>,
+    /// The builder check's local transport, `local:<folder>` or `local-ssh:<folder>`, as a routed run's
+    /// (`--test-remote-transport`).
+    pub remote_transport: Option<String>,
+    /// The program the local transport's call starts with ssh's own words (`--test-remote-ssh`).
+    pub remote_ssh: Option<PathBuf>,
+    /// How long the builder check's call may take, in milliseconds, in place of 120 s (`--test-remote-timeout-ms`).
+    pub remote_timeout_ms: Option<u64>,
 }
 
 /// A valid `gate burn`: the threads to spin, `None` for the machine's logical processors, and how many seconds to spin

@@ -1,34 +1,27 @@
 //! What the client sends `gate box`: the work folder's place on the builder, the payload word of each verb (base64,
-//! standard alphabet and padded, of compact UTF-8 JSON, as `gate box` reads it), and the line ssh carries, which must
-//! fit the most cmd takes.
+//! standard alphabet and padded, of compact UTF-8 JSON, as `gate box` reads it), the fixed line ssh carries, and the
+//! call's standard input, which carries the word.
 
 use std::hash::{BuildHasher, RandomState};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
+use gate_args::BoxVerb;
 use serde_json::{Map, Value, json};
 
 use crate::remote::snapshot::IDENTITY;
 
-/// The longest command line cmd runs, and the part of it kept for the `cmd.exe /c` sshd puts before the line.
-const CMD_LIMIT: usize = 8191;
-const CMD_MARGIN: usize = 64;
-/// The longest line a call may carry, once cmd has expanded it.
-pub(crate) const LINE_LIMIT: usize = CMD_LIMIT - CMD_MARGIN;
 /// The gate a builder runs, from its own `%LOCALAPPDATA%\gate\bin`, as cmd expands it.
 pub(crate) const BOX_EXE: &str = r#""%LOCALAPPDATA%\gate\bin\gate.exe""#;
-/// The variable the line names the builder's gate by, which cmd expands before its limit applies.
-const LOCAL_APP_DATA: &str = "%LOCALAPPDATA%";
-/// The characters `%LOCALAPPDATA%` is counted as: the builder's profile path is unknown here, so a line within the cap
-/// stays within cmd's limit for any profile path up to this long.
-const LOCAL_APP_DATA_EXPANDED: usize = 100;
 /// The hex digits of a run's job nonce, as the box checks them, and of its outputs nonce.
 const JOB_NONCE_DIGITS: usize = 12;
 const RUN_NONCE_DIGITS: usize = 32;
 
 /// Where one work folder's state lives on the builder: the bare repository, the work folder, its lock and sync-back
-/// index files, the folder outputs wait in, and the job of this run, named with a nonce new to it.
+/// index files, the folder outputs wait in, the job of this run, named with a nonce new to it, and the sibling pair the
+/// box lays out in the work folder, `None` for a run of one repo.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Location {
     pub key: String,
@@ -38,10 +31,18 @@ pub(crate) struct Location {
     pub index: String,
     pub output_folder: String,
     pub job: String,
+    pub pair: Option<Pair>,
+}
+
+/// A sibling pair as the payload's `Pair` carries it: the main checkout's folder name and each sibling's, in order.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Pair {
+    pub leaf: String,
+    pub siblings: Vec<String>,
 }
 
 impl Location {
-    /// The work folder `key` of `repo` under the builder's `root`, its job named with `job_nonce`.
+    /// The work folder `key` of `repo` under the builder's `root`, its job named with `job_nonce`, with no pair.
     pub(crate) fn under(root: &str, repo: &str, key: &str, job_nonce: &str) -> Location {
         let bare = bare(root, repo);
         let root = root.trim_end_matches(['\\', '/']);
@@ -54,10 +55,23 @@ impl Location {
             work,
             output_folder: format!(r"{root}\outputs"),
             job: format!(r"Local\gate-remote-{key}-{job_nonce}"),
+            pair: None,
         }
     }
 
-    /// The payload keys every verb reads.
+    /// This location with the sibling pair of the main checkout's folder `leaf` and the folders `siblings`.
+    #[cfg_attr(not(test), expect(dead_code, reason = "the client sends no Pair; the tests build one"))]
+    pub(crate) fn with_pair(self, leaf: &str, siblings: &[String]) -> Location {
+        Location {
+            pair: Some(Pair {
+                leaf: leaf.to_owned(),
+                siblings: siblings.to_vec(),
+            }),
+            ..self
+        }
+    }
+
+    /// The payload keys every verb reads, `Pair` only when there is one.
     fn object(&self) -> Map<String, Value> {
         let mut object = Map::new();
         for (name, value) in [
@@ -70,6 +84,9 @@ impl Location {
             ("Job", &self.job),
         ] {
             object.insert(name.to_owned(), Value::String(value.clone()));
+        }
+        if let Some(pair) = &self.pair {
+            object.insert("Pair".to_owned(), json!({"Leaf": pair.leaf, "Siblings": pair.siblings}));
         }
         object
     }
@@ -84,7 +101,8 @@ pub(crate) fn bare(root: &str, repo: &str) -> String {
 /// in, the run's outputs nonce, the snapshot the box checks out, the output globs the run brings back (none asks for no
 /// outputs), and whether every file under them counts as changed (`OutputsFull`), as after an outputs step that did not
 /// complete; the run's ceiling in whole seconds, which the box counts in load-adjusted time (`Timeout`), and the PC's
-/// name for the builder, which the box's kill line names (`Host`).
+/// name for the builder, which the box's kill line names (`Host`); and each sibling's name and the commit its snapshot
+/// is (`SiblingSnapshots`, sent only when there is one).
 pub(crate) struct RunCall<'a> {
     pub words: &'a [String],
     pub subfolder: &'a str,
@@ -94,11 +112,27 @@ pub(crate) struct RunCall<'a> {
     pub full: bool,
     pub timeout: u64,
     pub host: &'a str,
+    pub sibling_snapshots: &'a [(String, String)],
 }
 
 /// The payload word of the preflight, and of every verb that reads only the location.
 pub(crate) fn location_word(location: &Location) -> String {
     word(&location.object())
+}
+
+/// The payload word of a preflight that asks the builder to probe tools: the location and `Needs`, an object of each
+/// tool's name and the minimum version the run needs of it (empty for any version), in the order of `needs`. With no
+/// needs there is no `Needs`, and the word is [`location_word`]'s.
+pub(crate) fn preflight_word(location: &Location, needs: &[(String, String)]) -> String {
+    let mut object = location.object();
+    if !needs.is_empty() {
+        let needs: Map<String, Value> = needs
+            .iter()
+            .map(|(name, minimum)| (name.clone(), Value::String(minimum.clone())))
+            .collect();
+        object.insert("Needs".to_owned(), Value::Object(needs));
+    }
+    word(&object)
 }
 
 /// The payload word of the outputs call: the location and the outputs archive's `Name`, `name`.
@@ -128,6 +162,14 @@ pub(crate) fn run_word(location: &Location, run: &RunCall<'_>) -> String {
     ] {
         object.insert(name.to_owned(), value);
     }
+    if !run.sibling_snapshots.is_empty() {
+        let snapshots: Map<String, Value> = run
+            .sibling_snapshots
+            .iter()
+            .map(|(name, commit)| (name.clone(), Value::String(commit.clone())))
+            .collect();
+        object.insert("SiblingSnapshots".to_owned(), Value::Object(snapshots));
+    }
     word(&object)
 }
 
@@ -136,23 +178,16 @@ fn word(object: &Map<String, Value>) -> String {
     STANDARD.encode(Value::Object(object.clone()).to_string())
 }
 
-/// The line ssh carries for `verb`: the builder's gate, `box`, the verb and the payload word.
-pub(crate) fn line(verb: &str, word: &str) -> String {
-    format!("{BOX_EXE} box {verb} {word}")
+/// The line ssh carries for `verb`, the same whatever the call sends: the builder's gate, `box`, the verb and
+/// `--stdin`, as the request comes on the call's standard input ([`input`]).
+pub(crate) fn line(verb: BoxVerb) -> String {
+    format!("{BOX_EXE} box {} --stdin", verb.as_str())
 }
 
-/// `line` of the call `verb` when cmd takes it, each `%LOCALAPPDATA%` counted as the path it expands to; else why not,
-/// in the PowerShell client's words.
-pub(crate) fn capped(verb: &str, line: String) -> Result<String, String> {
-    let expansions = line.matches(LOCAL_APP_DATA).count();
-    let length = line.chars().count() - expansions * LOCAL_APP_DATA.len() + expansions * LOCAL_APP_DATA_EXPANDED;
-    if length > LINE_LIMIT {
-        return Err(format!(
-            "the {verb} call is {length} characters, longer than the {LINE_LIMIT} cmd takes ({CMD_LIMIT} less {CMD_MARGIN} \
-             for sshd's own cmd.exe /c); shorten the command"
-        ));
-    }
-    Ok(line)
+/// What a call writes on the box's standard input: the payload `word` as a line, then the run call's outputs
+/// `manifest` line, which ends with its own newline, when it sends one.
+pub(crate) fn input(word: &str, manifest: Option<&str>) -> Arc<str> {
+    Arc::from(format!("{word}\n{}", manifest.unwrap_or_default()))
 }
 
 /// A job nonce new to the run: 12 lower-case hex digits.
@@ -180,9 +215,11 @@ fn nonce(digits: usize) -> String {
 mod tests {
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD;
+    use gate_args::BoxVerb;
     use serde_json::{Value, json};
 
-    use super::{BOX_EXE, LINE_LIMIT, Location, RunCall, capped, job_nonce, line, location_word, run_nonce, run_word};
+    use super::{Location, Pair, RunCall, input, job_nonce, line, location_word, preflight_word, run_nonce, run_word};
+    use crate::boxside::payload::Payload;
 
     fn decoded(word: &str) -> Value {
         let bytes = STANDARD.decode(word).expect("the word is base64");
@@ -205,8 +242,114 @@ mod tests {
                 index: r"D:\gate-remote\work\app-1a2b3c4d.index".to_owned(),
                 output_folder: r"D:\gate-remote\outputs".to_owned(),
                 job: r"Local\gate-remote-app-1a2b3c4d-0123456789ab".to_owned(),
+                pair: None,
             }
         );
+    }
+
+    const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    /// The run call of `./tool.exe` with `sibling_snapshots`.
+    fn run_call(sibling_snapshots: &[(String, String)]) -> String {
+        let words = ["./tool.exe".to_owned()];
+        let run = RunCall {
+            words: &words,
+            subfolder: "",
+            nonce: "0123456789abcdef0123456789abcdef",
+            snapshot: SHA,
+            outputs: &[],
+            full: false,
+            timeout: 1,
+            host: "builder",
+            sibling_snapshots,
+        };
+        run_word(&location().with_pair("app", &["lib".to_owned(), "tools".to_owned()]), &run)
+    }
+
+    /// The box's reading of the payload word `word`.
+    fn on_the_box(word: &str) -> Payload {
+        Payload::decode(word).expect("the box decodes the client's word")
+    }
+
+    #[test]
+    fn a_location_with_a_pair_sends_it_and_the_box_reads_it_back() {
+        let siblings = ["yaat-server".to_owned(), "a.b".to_owned()];
+        let paired = location().with_pair("app", &siblings);
+        assert_eq!(
+            paired.pair,
+            Some(Pair {
+                leaf: "app".to_owned(),
+                siblings: siblings.to_vec()
+            })
+        );
+        let sent = decoded(&location_word(&paired));
+        let mut expected = decoded(&location_word(&location()));
+        expected["Pair"] = json!({"Leaf": "app", "Siblings": ["yaat-server", "a.b"]});
+        assert_eq!(sent, expected, "the location with the Pair added");
+
+        let pair = on_the_box(&location_word(&paired))
+            .pair()
+            .expect("the box takes the pair")
+            .expect("the box finds a pair");
+        assert_eq!(pair.leaf(), "app");
+        let read: Vec<(&str, &str)> = pair.siblings().iter().map(|sibling| (sibling.name(), sibling.bare())).collect();
+        assert_eq!(
+            read,
+            [("yaat-server", r"D:\gate-remote\yaat-server.git"), ("a.b", r"D:\gate-remote\a-b.git")]
+        );
+    }
+
+    #[test]
+    fn a_location_without_a_pair_sends_none_and_the_box_reads_none() {
+        assert!(decoded(&location_word(&location())).get("Pair").is_none(), "no Pair key");
+        assert!(
+            on_the_box(&location_word(&location())).pair().expect("no pair is no refusal").is_none(),
+            "a run of one repo"
+        );
+    }
+
+    #[test]
+    fn a_run_with_sibling_snapshots_sends_them_and_the_box_reads_them_back() {
+        let other = "fedcba9876543210fedcba9876543210fedcba98";
+        let snapshots = [("tools".to_owned(), other.to_owned()), ("lib".to_owned(), SHA.to_owned())];
+        let word = run_call(&snapshots);
+        assert_eq!(decoded(&word)["SiblingSnapshots"], json!({"lib": SHA, "tools": other}));
+        let payload = on_the_box(&word);
+        let pair = payload.pair().expect("the box takes the pair").expect("the box finds a pair");
+        assert_eq!(payload.sibling_snapshots(&pair), Ok(vec![SHA, other]), "in the pair's order");
+    }
+
+    #[test]
+    fn a_run_without_sibling_snapshots_sends_none() {
+        let word = run_call(&[]);
+        assert!(decoded(&word).get("SiblingSnapshots").is_none(), "no SiblingSnapshots key");
+        let payload = on_the_box(&word);
+        let pair = payload.pair().expect("the box takes the pair").expect("the box finds a pair");
+        assert_eq!(
+            payload.sibling_snapshots(&pair),
+            Err("gate: box payload SiblingSnapshots must name exactly the Pair's siblings: lib, tools".to_owned()),
+            "the box refuses a pair run without them"
+        );
+    }
+
+    #[test]
+    fn a_preflight_with_needs_carries_them_in_order_and_one_without_is_the_location_alone() {
+        assert_eq!(
+            preflight_word(&location(), &[]),
+            location_word(&location()),
+            "no needs: the word is byte for byte the location's"
+        );
+        let needs = [
+            ("node".to_owned(), "24.0.0".to_owned()),
+            ("cargo-nextest".to_owned(), String::new()),
+            ("ffmpeg".to_owned(), "7".to_owned()),
+        ];
+        let with_needs = decoded(&preflight_word(&location(), &needs));
+        let mut expected = decoded(&location_word(&location()));
+        expected["Needs"] = json!({"node": "24.0.0", "cargo-nextest": "", "ffmpeg": "7"});
+        assert_eq!(with_needs, expected);
+        let order: Vec<&String> = with_needs["Needs"].as_object().expect("Needs is an object").keys().collect();
+        assert_eq!(order, ["node", "cargo-nextest", "ffmpeg"], "the needs keep their order");
     }
 
     #[test]
@@ -235,6 +378,7 @@ mod tests {
             full: false,
             timeout: 300,
             host: "builder",
+            sibling_snapshots: &[],
         };
         let mut expected = preflight;
         let extra = json!({
@@ -272,6 +416,7 @@ mod tests {
             full: true,
             timeout: 1,
             host: "builder",
+            sibling_snapshots: &[],
         };
 
         let sent = decoded(&run_word(&location(), &run));
@@ -282,39 +427,18 @@ mod tests {
     }
 
     #[test]
-    fn the_line_runs_the_builder_s_gate_with_the_verb_and_the_word() {
-        assert_eq!(line("run", "e30="), r#""%LOCALAPPDATA%\gate\bin\gate.exe" box run e30="#);
+    fn the_line_is_the_fixed_box_line_for_the_verb() {
+        assert_eq!(line(BoxVerb::Run), r#""%LOCALAPPDATA%\gate\bin\gate.exe" box run --stdin"#);
+        assert_eq!(line(BoxVerb::Preflight), r#""%LOCALAPPDATA%\gate\bin\gate.exe" box preflight --stdin"#);
     }
 
     #[test]
-    fn the_cap_counts_localappdata_as_100_characters() {
-        // The builder's gate is 34 characters as sent, of them the 14 of `%LOCALAPPDATA%`, which cmd expands to a
-        // profile path of up to 100: 120 counted, so a run line's other 8007 characters fit and 8008 do not.
-        let sent = |rest: usize| format!("{BOX_EXE}{}", "x".repeat(rest));
-        assert_eq!(BOX_EXE.chars().count(), 34);
-        assert_eq!(capped("run", sent(8007)), Ok(sent(8007)), "8127 characters once expanded fit");
+    fn the_input_is_the_request_line_then_the_manifest() {
+        assert_eq!(&*input("e30=", None), "e30=\n", "no manifest: the request line alone");
         assert_eq!(
-            capped("run", sent(8008)),
-            Err(
-                "the run call is 8128 characters, longer than the 8127 cmd takes (8191 less 64 for sshd's own cmd.exe /c); \
-                 shorten the command"
-                    .to_owned()
-            )
-        );
-    }
-
-    #[test]
-    fn a_line_longer_than_8127_characters_is_refused() {
-        let at = |length: usize| "x".repeat(length);
-        assert_eq!(LINE_LIMIT, 8127);
-        assert_eq!(capped("run", at(8127)), Ok(at(8127)), "8127 characters fit");
-        assert_eq!(
-            capped("run", at(8128)),
-            Err(
-                "the run call is 8128 characters, longer than the 8127 cmd takes (8191 less 64 for sshd's own cmd.exe /c); \
-                 shorten the command"
-                    .to_owned()
-            )
+            &*input("e30=", Some("{\"files\":[]}\n")),
+            "e30=\n{\"files\":[]}\n",
+            "the manifest line follows the request line, and the input ends with its newline"
         );
     }
 

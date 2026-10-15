@@ -1,9 +1,9 @@
-//! The hidden `gate box <verb> <payload>`: the builder side of a routed run. Only the words are read here; the payload
-//! word is passed on unread, since decoding it is the binary's. A `test-seams` build also reads the hidden
+//! The hidden `gate box <verb> --stdin`: the builder side of a routed run. Only the words are read here; the request
+//! is stdin's first line, which the binary reads and decodes. A `test-seams` build also reads the hidden
 //! `--test-heartbeat-ms <n>`, `--test-box-console fail-before`, `--test-box-token refused`, `--test-box-park-launch <path>`,
 //! `--test-outputs-budget-bytes <n>`, `--test-dotnet-limit-ms <n>`, `--test-box-sample-ms <n>`, `--test-box-sampler-fail
-//! true|false`, `--test-box-free-percent <1-100>` and `--test-box-kill-leaves <n>` (each also as `--<seam>=<value>`) before
-//! the verb;
+//! true|false`, `--test-box-free-percent <1-100>`, `--test-box-kill-leaves <n>` and `--test-probe-limit-ms <n>` (each also
+//! as `--<seam>=<value>`) before the verb;
 //! without the feature each is no verb, and so the box usage.
 
 use std::ffi::{OsStr, OsString};
@@ -12,18 +12,20 @@ use std::iter::Peekable;
 use crate::problem::Problem;
 use crate::request::{BoxRequest, BoxSeams, BoxVerb};
 
-/// Reads the words after `gate box`: the seams, then a verb, then one non-empty payload word, and nothing after it. A
-/// seam refused is its own problem, as `gate run` reports it; any other shape is the one box usage problem, after
-/// those.
+/// The one word after the verb: the request is stdin's first line, never a word.
+const STDIN: &str = "--stdin";
+
+/// Reads the words after `gate box`: the seams, then a verb, then exactly `--stdin`, and nothing after it. A seam
+/// refused is its own problem, as `gate run` reports it; any other shape is the one box usage problem, after those.
 pub(crate) fn parse(words: impl Iterator<Item = OsString>) -> Result<BoxRequest, Vec<Problem>> {
     let mut words = words.peekable();
     let mut problems = Vec::new();
     let seams = seams(&mut words, &mut problems);
     let verb = words.next().as_deref().and_then(OsStr::to_str).and_then(verb);
-    let payload = words.next().filter(|payload| !payload.is_empty());
-    match (verb, payload, words.next()) {
-        (Some(verb), Some(payload), None) if problems.is_empty() => Ok(BoxRequest { verb, payload, seams }),
-        (Some(_), Some(_), None) => Err(problems),
+    let stdin = words.next().is_some_and(|word| word == STDIN);
+    match (verb, stdin, words.next()) {
+        (Some(verb), true, None) if problems.is_empty() => Ok(BoxRequest { verb, seams }),
+        (Some(_), true, None) => Err(problems),
         _ => {
             problems.push(Problem::BoxUsage);
             Err(problems)
@@ -67,6 +69,8 @@ enum Seam {
     FreePercent,
     /// `--test-box-kill-leaves <n>`: how many processes the ending of a job the ceiling killed reports left.
     KillLeaves,
+    /// `--test-probe-limit-ms <n>`: how long the preflight's tool probes may take together.
+    ProbeLimitMs,
 }
 
 #[cfg(feature = "test-seams")]
@@ -85,6 +89,7 @@ impl Seam {
             "--test-box-sampler-fail" => Some(Seam::SamplerFail),
             "--test-box-free-percent" => Some(Seam::FreePercent),
             "--test-box-kill-leaves" => Some(Seam::KillLeaves),
+            "--test-probe-limit-ms" => Some(Seam::ProbeLimitMs),
             _ => None,
         }
     }
@@ -102,6 +107,7 @@ impl Seam {
             Seam::SamplerFail => "--test-box-sampler-fail",
             Seam::FreePercent => "--test-box-free-percent",
             Seam::KillLeaves => "--test-box-kill-leaves",
+            Seam::ProbeLimitMs => "--test-probe-limit-ms",
         }
     }
 }
@@ -134,10 +140,10 @@ fn seams(words: &mut Peekable<impl Iterator<Item = OsString>>, problems: &mut Ve
     seams
 }
 
-/// Sets `seam` from `value`: whole milliseconds above 0 for the heartbeat, the dotnet limit and the sample period,
-/// `fail-before` for the console, `refused` for the token, any path for the park, whole bytes above 0 for the outputs
-/// budget, `true` or `false` for the sampler's failure, a whole percent from 1 to 100 for the free share, a whole count
-/// above 0 for the processes a kill leaves. An empty or
+/// Sets `seam` from `value`: whole milliseconds above 0 for the heartbeat, the dotnet limit, the sample period and the
+/// probe limit, `fail-before` for the console, `refused` for the token, any path for the park, whole bytes above 0 for the
+/// outputs budget, `true` or `false` for the sampler's failure, a whole percent from 1 to 100 for the free share, a whole
+/// count above 0 for the processes a kill leaves. An empty or
 /// missing value is no value.
 #[cfg(feature = "test-seams")]
 fn set_seam(seams: &mut BoxSeams, seam: Seam, value: Result<Option<String>, Problem>) -> Result<(), Problem> {
@@ -154,6 +160,7 @@ fn set_seam(seams: &mut BoxSeams, seam: Seam, value: Result<Option<String>, Prob
         Seam::SamplerFail => seams.sampler_fail = crate::values::true_or_false(name, &value)?,
         Seam::FreePercent => seams.free_percent = Some(crate::values::in_range(name, &value, 1, 100)?),
         Seam::KillLeaves => seams.kill_leaves = Some(crate::values::above_zero(name, &value)?),
+        Seam::ProbeLimitMs => seams.probe_limit_ms = Some(crate::values::above_zero(name, &value)?),
         Seam::Console => seams.fail_console = the_word(name, value, "fail-before", |option, value| Problem::BadConsoleFailure { option, value })?,
         Seam::Token => seams.refuse_token = the_word(name, value, "refused", |option, value| Problem::BadTokenRefusal { option, value })?,
         Seam::ParkLaunch => seams.park_launch = Some(std::path::PathBuf::from(value)),

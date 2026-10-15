@@ -8,7 +8,6 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::{Duration, SystemTime};
 
 use serde_json::{Map, Value, json};
@@ -16,9 +15,9 @@ use sha2::{Digest, Sha256};
 use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
 
 use super::{
-    bare_box_command, box_command, field, gate_box, git, git_folder, has_ref, path_for_run, payload, renamed, run_box, run_box_with_path, snapshot,
+    BoxCall, bare_box_call, box_call, field, gate_box, git, git_folder, has_ref, path_for_run, payload, renamed, run_box, run_box_with_path, snapshot,
 };
-use crate::support::{Case, FAKE_TOOL, Outcome, box_payload, shown, start_with_stdin};
+use crate::support::{Case, FAKE_TOOL, Outcome, box_payload, shown};
 
 /// The ignore file of an outputs case's snapshot: `bin/` is build output, so no back commit carries it.
 const IGNORE_BIN: (&str, &str) = (".gitignore", "bin/\n");
@@ -53,14 +52,15 @@ fn manifest(files: &[(&str, &str)]) -> String {
     format!("{}\n", json!({ "files": files }))
 }
 
-/// `gate box run` of `payload` with `line` written to its stdin, which stays open until the run has ended.
+/// `gate box run` of `payload` with its request line and then `line` written to its stdin, which stays open until the
+/// run has ended.
 fn run_with_manifest(case: &Case, payload: &Value, line: &str) -> Outcome {
-    finish_with_manifest(box_command(case, &["box", "run", &self::payload(payload)]), line)
+    finish_with_manifest(box_call(case, &["box", "run"], &self::payload(payload)), line)
 }
 
-/// `command` started with `line` written to its stdin, which stays open until it has ended.
-fn finish_with_manifest(command: Command, line: &str) -> Outcome {
-    let (running, mut stdin) = start_with_stdin(command);
+/// `call` started with its request line and then `line` written to its stdin, which stays open until it has ended.
+fn finish_with_manifest(call: BoxCall, line: &str) -> Outcome {
+    let (running, mut stdin) = call.start_with_stdin();
     stdin.write_all(line.as_bytes()).expect("the manifest can be written");
     let outcome = running.finish();
     drop(stdin);
@@ -227,7 +227,7 @@ fn a_large_output_is_packed_in_flat_memory() {
     snapshot(&case, &mut payload, &[IGNORE_BIN]);
 
     // The box waits for the manifest before it checks anything out, so the limit is on before it runs a step.
-    let (running, mut stdin) = start_with_stdin(box_command(&case, &["box", "run", &self::payload(&payload)]));
+    let (running, mut stdin) = box_call(&case, &["box", "run"], &self::payload(&payload)).start_with_stdin();
     limit_memory(running.id(), BOX_MEMORY);
     stdin.write_all(manifest(&[]).as_bytes()).expect("the manifest can be written");
     let outcome = running.finish();
@@ -247,10 +247,8 @@ fn box_run_beats_before_it_reads_the_outputs_manifest() {
     let mut payload = outputs_payload(&case, &[FAKE_TOOL, "err", "ran", "write", r"bin\a.txt", "a"], &["bin/**"]);
     snapshot(&case, &mut payload, &[IGNORE_BIN]);
 
-    let (running, mut stdin) = start_with_stdin(bare_box_command(
-        &case,
-        &["box", "--test-heartbeat-ms", "30", "run", &self::payload(&payload)],
-    ));
+    // The request line goes first, at the start; the manifest is the second line, written only after the beats.
+    let (running, mut stdin) = bare_box_call(&case, &["box", "--test-heartbeat-ms", "30", "run"], &self::payload(&payload)).start_with_stdin();
     let beats = |stderr: &str| stderr.lines().filter(|line| line.starts_with("gate-remote-heartbeat: ")).count();
     let before = running.wait_for_stderr_where("two heartbeats before the manifest is written", |stderr| beats(stderr) >= 2);
     assert!(!has_line(&before, "ran"), "the command waits for the manifest: {before}");
@@ -296,19 +294,19 @@ fn a_passing_runs_last_stderr_line_is_its_outputs_line() {
 }
 
 #[test]
-fn box_run_without_output_globs_never_reads_stdin() {
+fn box_run_without_output_globs_reads_only_its_request_line() {
     let case = Case::new("box_outputs_no_globs");
     let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "out", "ran"]);
     snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
 
-    let (running, stdin) = start_with_stdin(box_command(&case, &["box", "run", &self::payload(&payload)]));
+    let (running, stdin) = box_call(&case, &["box", "run"], &self::payload(&payload)).start_with_stdin();
     let outcome = running.finish();
     drop(stdin);
 
     assert_eq!(
         outcome.code,
         Some(0),
-        "a run with no globs ends with its stdin open and unwritten: {outcome:?}"
+        "a run with no globs ends with its stdin open and nothing written after its request line: {outcome:?}"
     );
     assert_eq!(outcome.stdout, "ran\n");
     assert!(!outcome.stderr.contains("gate-remote-outputs"), "{outcome:?}");
@@ -738,7 +736,7 @@ fn a_back_commit_whose_paths_cannot_be_read_is_pushed_and_its_outputs_not_brough
     let mut payload = outputs_payload(&case, &command, &["bin/**"]);
     snapshot(&case, &mut payload, &[IGNORE_BIN]);
     let (stub, _) = git_failing_diff_tree(&case);
-    let mut run = box_command(&case, &["box", "run", &self::payload(&payload)]);
+    let mut run = box_call(&case, &["box", "run"], &self::payload(&payload));
     run.env("PATH", path_for_run(&[stub]));
 
     let outcome = finish_with_manifest(run, &manifest(&[]));
@@ -840,7 +838,7 @@ fn a_pack_past_the_budget_removes_the_oldest_archives() {
     file_sized_aged(&newer, 1, Duration::from_secs(1));
 
     let outcome = finish_with_manifest(
-        box_command(&case, &["box", "--test-outputs-budget-bytes", "1000000", "run", &self::payload(&payload)]),
+        box_call(&case, &["box", "--test-outputs-budget-bytes", "1000000", "run"], &self::payload(&payload)),
         &manifest(&[]),
     );
 
@@ -866,7 +864,7 @@ fn an_archive_larger_than_the_budget_is_not_brought_back() {
     file_sized_aged(&other, 1, Duration::from_secs(60));
 
     let outcome = finish_with_manifest(
-        box_command(&case, &["box", "--test-outputs-budget-bytes", "1", "run", &self::payload(&payload)]),
+        box_call(&case, &["box", "--test-outputs-budget-bytes", "1", "run"], &self::payload(&payload)),
         &manifest(&[]),
     );
 

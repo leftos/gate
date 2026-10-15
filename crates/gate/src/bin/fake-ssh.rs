@@ -1,5 +1,6 @@
 //! The black-box suite's stand-in for ssh, which `gate run --test-remote-ssh` starts with ssh's own words: the options,
-//! `--`, the host and the line, whose last three words are `box <verb> <payload>`. git's own ssh starts it too, through
+//! `--`, the host and the line, whose last three words are `box <verb> --stdin`, the call's request coming on its
+//! standard input, which the box it runs reads as its own. git's own ssh starts it too, through
 //! the `local-ssh:` transport, with the line `git-upload-pack '<path>'` or `git-receive-pack '<path>'`, whose verb is
 //! the service's name. `gate push` starts it with a line that starts with `pwsh ` and holds `-EncodedCommand <bootstrap>`,
 //! a push call, whose verb is `push`. It reads the steps file the variable `GATE_FAKE_SSH_STEPS` names, one step a line,
@@ -9,8 +10,9 @@
 //! with no step taken. Started with `--version` alone, as a push case starts a copy of it standing in for a builder's
 //! old gate, it says `gate 0.0.0-old` and exits 0.
 //!
-//! `ok` runs `<gate> box <verb> <payload>` with the gate the variable `GATE_FAKE_SSH_GATE` names, a `run` call given
-//! the words of the variable `GATE_FAKE_SSH_BOX_SEAMS`, when set, before its verb as box seams, or `git
+//! `ok` runs `<gate> box <verb> --stdin` with the gate the variable `GATE_FAKE_SSH_GATE` names, a `run` call given
+//! the words of the variable `GATE_FAKE_SSH_BOX_SEAMS`, when set, before its verb as box seams, and a `preflight` call
+//! those of `GATE_FAKE_SSH_PREFLIGHT_SEAMS` the same way, or `git
 //! upload-pack <path>` or `git receive-pack <path>`, or a push call's words with this PC's `pwsh`, its `LOCALAPPDATA`
 //! the folder named as the host, the word before the line, in the folder the variable `GATE_FAKE_SSH_BUILDERS` names,
 //! made when missing, fed this process's standard input, which it reads whole first and keeps as `<steps file>.input`;
@@ -243,12 +245,12 @@ fn variable(name: &str) -> Result<String, String> {
     std::env::var(name).map_err(|error| format!("{name}: {error}"))
 }
 
-/// The box seams a `run` call's gate is given before its verb: the words of the variable `GATE_FAKE_SSH_BOX_SEAMS`,
-/// none when it is unset.
-fn box_seams() -> Result<String, String> {
-    match std::env::var("GATE_FAKE_SSH_BOX_SEAMS") {
+/// The box seams a call's gate is given before its verb: the words of the variable `name`, `GATE_FAKE_SSH_BOX_SEAMS`
+/// for a `run` call and `GATE_FAKE_SSH_PREFLIGHT_SEAMS` for a preflight, none when it is unset.
+fn seams_of(name: &str) -> Result<String, String> {
+    match std::env::var(name) {
         Err(std::env::VarError::NotPresent) => Ok(String::new()),
-        read => read.map_err(|error| format!("GATE_FAKE_SSH_BOX_SEAMS: {error}")),
+        read => read.map_err(|error| format!("{name}: {error}")),
     }
 }
 
@@ -317,23 +319,25 @@ fn hold(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// The call the line carries: `gate box`'s verb and payload, a git service's name and the repository's path, or
-/// [`PUSH`] and the push call's whole line; the host it was made to, and the steps file it acts on.
+/// The call the line carries: `gate box`'s verb and the word after it, `--stdin`, a git service's name and the
+/// repository's path, or [`PUSH`] and the push call's whole line, as `rest`; the host it was made to, and the steps
+/// file it acts on.
 struct BoxCall<'a> {
     verb: &'a str,
-    payload: &'a str,
+    rest: &'a str,
     host: &'a str,
     steps: &'a Path,
 }
 
 impl<'a> BoxCall<'a> {
     /// The call `line`, made to `host` and acting on the steps file `steps`, carries: a git service and its path,
-    /// unquoted, a push call, or the last three words, `box <verb> <payload>`.
+    /// unquoted, a push call, or the last three words, `box <verb> --stdin`; a box call whose last word is not
+    /// `--stdin` is refused, so a client that stops sending its request on standard input fails here by name.
     fn of(line: &'a str, host: &'a str, steps: &'a Path) -> Result<BoxCall<'a>, String> {
         if let Some((verb, path)) = line.split_once(' ').filter(|(verb, _)| GIT_SERVICES.contains(verb)) {
             return Ok(BoxCall {
                 verb,
-                payload: path.trim_matches('\''),
+                rest: path.trim_matches('\''),
                 host,
                 steps,
             });
@@ -343,13 +347,14 @@ impl<'a> BoxCall<'a> {
         if words.first() == Some(&"pwsh") && script.is_some_and(|script| !script.is_empty()) {
             return Ok(BoxCall {
                 verb: PUSH,
-                payload: line,
+                rest: line,
                 host,
                 steps,
             });
         }
         match words[..] {
-            [.., "box", verb, payload] => Ok(BoxCall { verb, payload, host, steps }),
+            [.., "box", verb, rest @ "--stdin"] => Ok(BoxCall { verb, rest, host, steps }),
+            [.., "box", _, _] | [.., "box", _] => Err(format!("box call without --stdin: {line}")),
             _ => Err(format!("the line holds no box call: {line}")),
         }
     }
@@ -360,15 +365,20 @@ impl<'a> BoxCall<'a> {
         }
         if let Some(service) = self.verb.strip_prefix("git-") {
             let mut command = Command::new("git");
-            command.args([service, self.payload]);
+            command.args([service, self.rest]);
             return Ok(command);
         }
         let mut command = Command::new(variable("GATE_FAKE_SSH_GATE")?);
         command.arg("box");
-        if self.verb == "run" {
-            command.args(box_seams()?.split_whitespace());
+        let seams = match self.verb {
+            "run" => Some("GATE_FAKE_SSH_BOX_SEAMS"),
+            "preflight" => Some("GATE_FAKE_SSH_PREFLIGHT_SEAMS"),
+            _ => None,
+        };
+        if let Some(name) = seams {
+            command.args(seams_of(name)?.split_whitespace());
         }
-        command.args([self.verb, self.payload]);
+        command.args([self.verb, self.rest]);
         Ok(command)
     }
 
@@ -381,7 +391,7 @@ impl<'a> BoxCall<'a> {
         let folder = PathBuf::from(variable("GATE_FAKE_SSH_BUILDERS")?).join(self.host);
         fs::create_dir_all(&folder).map_err(|error| format!("cannot make {}: {error}", folder.display()))?;
         let mut command = Command::new("pwsh");
-        command.args(self.payload.split(' ').skip(1)).env("LOCALAPPDATA", folder);
+        command.args(self.rest.split(' ').skip(1)).env("LOCALAPPDATA", folder);
         Ok(command)
     }
 

@@ -82,6 +82,9 @@ pub enum KernelObject {
     /// The mutex a routed run holds from before its preflight to its end, by its work-folder key's [`key_hash`], so a
     /// second routed run of one worktree finds it taken and runs here.
     Routed { hash: u64 },
+    /// The mutex a routed run holds around what its sync-back writes in a worktree, the main one's or a sibling's, by
+    /// the worktree folder's id: its volume's serial number and its file id, so two spellings of one folder share it.
+    Worktree { volume: u64, file: [u8; 16] },
 }
 
 impl KernelObject {
@@ -96,6 +99,7 @@ impl KernelObject {
             KernelObject::Job { gate_pid } => format!("job-{gate_pid}"),
             KernelObject::Log { hash } => format!("log-{hash:016x}"),
             KernelObject::Routed { hash } => format!("routed-{hash:016x}"),
+            KernelObject::Worktree { volume, file } => format!("worktree-{volume:016x}-{:032x}", u128::from_be_bytes(file)),
         }
     }
 
@@ -112,7 +116,8 @@ impl KernelObject {
             | KernelObject::WakeEvent { .. }
             | KernelObject::Job { .. }
             | KernelObject::Log { .. }
-            | KernelObject::Routed { .. } => None,
+            | KernelObject::Routed { .. }
+            | KernelObject::Worktree { .. } => None,
         }
     }
 }

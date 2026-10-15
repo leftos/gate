@@ -14,6 +14,11 @@
 //! reads beside the store; they are moved into the store only when the back commit is kept or applied, and the folder
 //! is removed at the sync-back's end, unless a move that failed keeps it. The quarantines gates that ended left are
 //! swept at the start of the next sync-back; a kept one stays for a week.
+//! A pair's sync-back is all or nothing: only the back commits the box's back commits line names are fetched, each
+//! repository's into a quarantine of its own in its own store; every repository is checked, each refusal said with
+//! the repository's name, and every patch checked with `git apply --check` before any is applied. Any refusal or
+//! failed check applies nothing anywhere and keeps every back commit; an apply that fails after them all says which
+//! repositories were applied and which not.
 //! The two git calls that reach the builder take the pre-banner retry and keep their lines out of the log; any other
 //! git failure is the run's, status 1 and `gate: the remote run failed: ...`, with no fallback. Every name and git line
 //! said here has its control characters escaped.
@@ -26,13 +31,17 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
-use super::client::{Attempt, Called, Echo, End, Watch};
+use gate_router::repo_name;
+
+use super::RemoteCall;
+use super::client::{Attempt, Called, End, Watch};
 use super::git::{self, Git, GitError};
 use super::launch::KILL_WAIT;
 use super::payload;
 use super::retry::GIT_SSH_FAILED;
 use super::snapshot::{self, BACK, REFS, Snapshot};
 use super::watchdog::{self, Cut};
+use super::worktree_lock;
 use crate::boxside::payload::escaped;
 use crate::outputs::names::{is_git_s, is_lfs_config};
 use crate::slots::{self, Liveness};
@@ -46,36 +55,160 @@ const LINK_MODES: [&str; 2] = ["120000", "160000"];
 /// What the mode of a regular or executable file starts with.
 const REGULAR_MODE: &str = "100";
 
-/// Fetches and applies the builder's changes for `snapshot`, or ends the run as `status` when there is nothing to do,
-/// the run's own when the changes were ignored, and 1 when a passing run's changes could not be applied.
-pub(super) fn sync_back(attempt: &mut Attempt<'_, '_>, snapshot: &Snapshot, status: i64) -> Result<End, End> {
+/// One repository a sync-back brings changes back to: its name in the pair, its worktree's root, the name of its
+/// repository on the builder, the snapshot the run was made from, and the refs of the run's key its back commit lives
+/// at, on the builder and, when it is kept rather than applied, in the worktree.
+pub(super) struct Target<'a> {
+    /// The name the box's back commits line gives the repository, and every pair line says.
+    name: &'a str,
+    root: &'a str,
+    /// The name the transport's push target is asked for.
+    repo: String,
+    snapshot: &'a Snapshot,
+    /// `refs/gate-back/<key>`, on the builder.
+    reference: String,
+    /// `refs/gate-remote/<key>-back`, in the worktree.
+    kept: String,
+}
+
+impl<'a> Target<'a> {
+    /// The repository `name` whose worktree is at `root`, named `repo` on the builder, synced back for `snapshot` in the
+    /// run of the key `key`.
+    pub(super) fn new(name: &'a str, root: &'a str, repo: &str, snapshot: &'a Snapshot, key: &str) -> Target<'a> {
+        Target {
+            name,
+            root,
+            repo: repo.to_owned(),
+            snapshot,
+            reference: format!("refs/gate-back/{key}"),
+            kept: format!("{REFS}{key}{BACK}"),
+        }
+    }
+}
+
+/// The repositories `call`'s sync-back brings changes back to, the main one first for `snapshot`, then each sibling the
+/// call carries for its snapshot in `sibling_snapshots`, in order, named on the builder as [`repo_name`] makes its
+/// folder name; the main one alone for a call that carries no siblings. `None` when there is not a snapshot for each
+/// sibling: such a pair applies nothing ([`unmatched`]).
+pub(super) fn targets<'a>(call: &RemoteCall<'a>, snapshot: &'a Snapshot, sibling_snapshots: &'a [Snapshot]) -> Option<Vec<Target<'a>>> {
+    let main = Target::new(call.leaf, call.root, call.repo, snapshot, call.key);
+    if call.siblings.is_empty() {
+        return Some(vec![main]);
+    }
+    if sibling_snapshots.len() != call.siblings.len() {
+        return None;
+    }
+    let siblings = call
+        .siblings
+        .iter()
+        .zip(sibling_snapshots)
+        .map(|(sibling, snapshot)| Target::new(sibling.name(), sibling.root(), &repo_name(sibling.name()), snapshot, call.key));
+    Some(std::iter::once(main).chain(siblings).collect())
+}
+
+/// How the sync-back of a pair whose sibling snapshots do not match its siblings ends: nothing applied, its line said,
+/// and a passing run as 1.
+pub(super) fn unmatched(attempt: &mut Attempt<'_, '_>, status: i64) -> Synced {
+    attempt.say(format!("{NOT_APPLIED}the run's sibling snapshots do not match its siblings"));
+    not_applied(status)
+}
+
+/// How a pair's run whose changes were not applied ends: a passing run as 1, for [`PAIR_NOT_APPLIED`].
+fn not_applied(status: i64) -> Synced {
+    Synced {
+        end: End::Status(not_passing(status)),
+        reason: Some(PAIR_NOT_APPLIED),
+    }
+}
+
+/// How a sync-back ended: the run's end, and, for a pair whose changes were not applied, why, which the outputs step
+/// says in place of a worktree that changed during the run.
+#[derive(Debug)]
+pub(super) struct Synced {
+    pub(super) end: End,
+    pub(super) reason: Option<&'static str>,
+}
+
+/// Why a pair's passing run whose changes were not applied ends 1, as the outputs step says it.
+pub(super) const PAIR_NOT_APPLIED: &str = "the pair's remote changes were not applied";
+
+/// A target as the sync-back works in it: the target, git found against its worktree, and whether it is a pair's,
+/// whose lines name it.
+struct Worktree<'t> {
+    target: &'t Target<'t>,
+    git: Git,
+    pair: bool,
+}
+
+impl Worktree<'_> {
+    /// The line `line` as the sync-back says it for this worktree: naming its repository in a pair ([`in_repo`]).
+    fn said(&self, line: String) -> String {
+        if self.pair { in_repo(&line, self.target.name) } else { line }
+    }
+
+    /// The worktree's root.
+    fn root(&self) -> &Path {
+        Path::new(self.target.root)
+    }
+
+    /// The commit of the target's snapshot.
+    fn snapshot(&self) -> &str {
+        &self.target.snapshot.commit
+    }
+}
+
+/// Fetches and applies the builder's changes for `targets`, the main repository first, or ends the run as `status`
+/// when there is nothing to do, the run's own when the changes were ignored, and 1 when a passing run's changes could
+/// not be applied. A single repository's back commit is the one the builder's ref advertises, and `back_commits` is
+/// not read; a pair's are only those the box's line, `back_commits`, names ([`pair`]).
+pub(super) fn sync_back(
+    attempt: &mut Attempt<'_, '_>,
+    targets: &[Target<'_>],
+    back_commits: Option<&[BackCommit]>,
+    status: i64,
+) -> Result<Synced, End> {
+    match targets {
+        [target] => one(attempt, target, status).map(|end| Synced { end, reason: None }),
+        _ => pair(attempt, targets, back_commits, status),
+    }
+}
+
+/// The sync-back of a single repository, `target`, as [`sync_back`] ends it.
+fn one(attempt: &mut Attempt<'_, '_>, target: &Target<'_>, status: i64) -> Result<End, End> {
     attempt.go_on()?;
-    let target = attempt.transport.push_target(attempt.call.host, attempt.call.repo).map_err(End::Failed)?;
+    let pushed = attempt.transport.push_target(attempt.call.host, &target.repo).map_err(End::Failed)?;
     let pack = attempt.transport.upload_pack();
-    let reference = format!("refs/gate-back/{}", attempt.call.key);
     let remote = Remote {
-        url: &target.url,
+        url: &pushed.url,
         pack: pack.as_deref(),
-        ssh: target.ssh_command.as_deref(),
-        reference: &reference,
+        ssh: pushed.ssh_command.as_deref(),
+        reference: &target.reference,
     };
-    let git = Git::find(Path::new(attempt.call.root)).map_err(End::Failed)?;
-    let objects = objects_folder(attempt, &git)?;
+    let worktree = Worktree {
+        target,
+        git: Git::find(Path::new(target.root)).map_err(End::Failed)?,
+        pair: false,
+    };
+    let objects = objects_folder(attempt, &worktree)?;
     for line in swept(&objects, SystemTime::now(), slots::gate_liveness) {
         attempt.say(line);
     }
-    let Some(advertised) = has_back(attempt, &git, &remote)? else {
+    let Some(advertised) = has_back(attempt, &worktree, &remote)? else {
         return Ok(End::Status(status));
     };
+    let call = attempt.call;
+    let _lock = worktree_lock::held(call.state, &[(target.name, target.root)], attempt.lock_wait, call.interrupt, |line| {
+        attempt.say(line);
+    })?;
     let name = incoming_name(std::process::id(), own_start(attempt.own_start_fails)?, &payload::job_nonce());
     let quarantine = Quarantine::made(&objects, &name).map_err(End::Failed)?;
     let back = Back {
         commit: &advertised,
         quarantine: &quarantine,
     };
-    let end = fetch(attempt, &git, &remote, &quarantine, status).and_then(|stopped| match stopped {
+    let end = fetch(attempt, &worktree, &remote, &quarantine, status).and_then(|stopped| match stopped {
         Some(stopped) => Ok(stopped),
-        None => taken(attempt, &git, snapshot, &back, status),
+        None => taken(attempt, &worktree, &back, status),
     });
     // However the sync-back ended, the quarantine goes, unless a move that failed kept it; the end stands as it would
     // without the removal, and its lines come before the removal's.
@@ -93,15 +226,383 @@ fn own_start(seam: bool) -> Result<u64, End> {
         .map_err(|error| End::Failed(format!("cannot read this gate's start: {error}")))
 }
 
+/// What every line refusing a back commit starts with; a pair's names the repository right after it.
+const NOT_APPLIED: &str = "gate: remote changes not applied: ";
+
+/// One repository of a pair with a back commit the box's line names: where it stands in the pair, its target, and the
+/// commit.
+struct Repo<'t, 'c> {
+    at: usize,
+    target: &'t Target<'t>,
+    commit: &'c str,
+}
+
+/// How far a pair's repository got with its back commit: fetched into its quarantine; taken, as the commit the line
+/// named and made from its snapshot; moved into its store; or lost, its objects kept in the quarantine by a move that
+/// failed.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Held {
+    Fetched,
+    Taken,
+    Moved,
+    Lost,
+}
+
+/// A pair's repository whose back commit was fetched: its worktree, the commit, its quarantine, how far it got, whether
+/// it may be applied, and, once written, the names its patch changes and the patch.
+struct Fetched<'t> {
+    worktree: Worktree<'t>,
+    commit: String,
+    quarantine: Quarantine,
+    held: Held,
+    ready: bool,
+    names: Vec<String>,
+    patch: Option<PathBuf>,
+}
+
+impl Fetched<'_> {
+    /// The repository's name in the pair.
+    fn name(&self) -> &str {
+        self.worktree.target.name
+    }
+}
+
+/// The sync-back of a pair, all or nothing: only the back commits the box's line `back_commits` names are fetched, and
+/// only when it names the pair's repositories in order; else nothing is applied anywhere, the line saying so said, and
+/// a passing run ends 1. The box's `failed` line, its failure said already, and a line naming no back commit apply
+/// nothing and end the run as `status`.
+/// In the first phase, in pair order, each repository with a back commit is fetched, checked as a single one is, and
+/// its objects moved in; every repository refused or ignored is said, and then any refusal applies nothing, keeps every
+/// back commit, and ends a passing run as 1. Otherwise every worktree is checked again, every patch is written and
+/// checked, and only then, the interrupt looked at once, each is applied in pair order. The locks of the worktrees with
+/// a back commit ([`worktree_lock::held`]) are held throughout, and each quarantine and any patch left goes at the end.
+fn pair(attempt: &mut Attempt<'_, '_>, targets: &[Target<'_>], back_commits: Option<&[BackCommit]>, status: i64) -> Result<Synced, End> {
+    attempt.go_on()?;
+    let unchanged = Synced {
+        end: End::Status(status),
+        reason: None,
+    };
+    if back_commits.is_some_and(<[BackCommit]>::is_empty) {
+        return Ok(unchanged);
+    }
+    let Some(commits) = back_commits.and_then(|named| named_commits(targets, named)) else {
+        attempt.say(format!("{NOT_APPLIED}the builder did not say which commits it made"));
+        return Ok(not_applied(status));
+    };
+    let backed: Vec<Repo<'_, '_>> = targets
+        .iter()
+        .zip(&commits)
+        .enumerate()
+        .filter_map(|(at, (target, commit))| commit.map(|commit| Repo { at, target, commit }))
+        .collect();
+    if backed.is_empty() {
+        return Ok(unchanged);
+    }
+    let call = attempt.call;
+    let worktrees: Vec<(&str, &str)> = backed.iter().map(|repo| (repo.target.name, repo.target.root)).collect();
+    let _locks = worktree_lock::held(call.state, &worktrees, attempt.lock_wait, call.interrupt, |line| attempt.say(line))?;
+    let mut fetched = Vec::with_capacity(backed.len());
+    let end = pair_phases(attempt, &backed, &mut fetched, status);
+    for repo in &mut fetched {
+        if let Some(patch) = repo.patch.take() {
+            // The end stands; a patch that cannot be removed after it is the lesser problem.
+            drop(remove(&patch));
+        }
+        if let Some(line) = repo.quarantine.removed(KILL_WAIT, || {}) {
+            attempt.say(line);
+        }
+    }
+    end
+}
+
+/// The commit the box's line `named` gives each of `targets`, in order, `None` for one it calls `none`; `None` when it
+/// does not name exactly the pair's repositories in their order.
+fn named_commits<'c>(targets: &[Target<'_>], named: &'c [BackCommit]) -> Option<Vec<Option<&'c str>>> {
+    let same = named.len() == targets.len() && named.iter().zip(targets).all(|((name, _), target)| name == target.name);
+    same.then(|| named.iter().map(|(_, commit)| commit.as_deref()).collect())
+}
+
+/// The two phases of a pair's sync-back for the repositories `backed`, each fetched one pushed onto `fetched`: a step
+/// that fails or is interrupted keeps every back commit taken so far ([`kept_all_after`]).
+fn pair_phases<'t>(attempt: &mut Attempt<'_, '_>, backed: &[Repo<'t, '_>], fetched: &mut Vec<Fetched<'t>>, status: i64) -> Result<Synced, End> {
+    let mut ready = true;
+    for repo in backed {
+        match first_phase(attempt, repo, fetched, status) {
+            Ok(fine) => ready &= fine,
+            Err(failed) => return Err(kept_all_after(attempt, fetched, failed)),
+        }
+    }
+    if !ready {
+        return refused_pair(attempt, fetched, status);
+    }
+    match unchanged_since(attempt, fetched) {
+        Ok(true) => {}
+        Ok(false) => return refused_pair(attempt, fetched, status),
+        Err(failed) => return Err(kept_all_after(attempt, fetched, failed)),
+    }
+    match applied_pair(attempt, fetched) {
+        Ok(()) => Ok(Synced {
+            end: End::Status(status),
+            reason: None,
+        }),
+        Err(failed) => Err(kept_all_after(attempt, fetched, failed)),
+    }
+}
+
+/// The first phase for one repository `repo` of a pair: whether its back commit may be applied. One the builder does
+/// not advertise as the line's commit is ignored; else it is fetched into a quarantine of its own, named for its place
+/// in the pair, and pushed onto `fetched` however its checks end.
+fn first_phase<'t>(attempt: &mut Attempt<'_, '_>, repo: &Repo<'t, '_>, fetched: &mut Vec<Fetched<'t>>, status: i64) -> Result<bool, End> {
+    let target = repo.target;
+    let pushed = attempt.transport.push_target(attempt.call.host, &target.repo).map_err(End::Failed)?;
+    let pack = attempt.transport.upload_pack();
+    let remote = Remote {
+        url: &pushed.url,
+        pack: pack.as_deref(),
+        ssh: pushed.ssh_command.as_deref(),
+        reference: &target.reference,
+    };
+    let worktree = Worktree {
+        target,
+        git: Git::find(Path::new(target.root)).map_err(End::Failed)?,
+        pair: true,
+    };
+    let objects = objects_folder(attempt, &worktree)?;
+    for line in swept(&objects, SystemTime::now(), slots::gate_liveness) {
+        attempt.say(line);
+    }
+    if has_back(attempt, &worktree, &remote)?.as_deref() != Some(repo.commit) {
+        attempt.say(worktree.said(unadvertised_line(repo.commit)));
+        return Ok(false);
+    }
+    let name = incoming_name(std::process::id(), own_start(attempt.own_start_fails)?, &payload::job_nonce());
+    let quarantine = Quarantine::made(&objects, &format!("{name}-{}", repo.at)).map_err(End::Failed)?;
+    let mut repo = Fetched {
+        worktree,
+        commit: repo.commit.to_owned(),
+        quarantine,
+        held: Held::Fetched,
+        ready: false,
+        names: Vec::new(),
+        patch: None,
+    };
+    let judged = judged(attempt, &mut repo, &remote, status);
+    fetched.push(repo);
+    judged
+}
+
+/// Whether the back commit `repo` holds may be applied: fetched, taken, not refused, and its objects moved in. A fetch
+/// that was stopped, a commit that is not the named one or not made from the snapshot, a refusal, and objects that
+/// cannot be moved in each say their line, the refusals naming the repository.
+fn judged(attempt: &mut Attempt<'_, '_>, repo: &mut Fetched<'_>, remote: &Remote<'_>, status: i64) -> Result<bool, End> {
+    if fetch(attempt, &repo.worktree, remote, &repo.quarantine, status)?.is_some() {
+        return Ok(false);
+    }
+    let back = Back {
+        commit: &repo.commit,
+        quarantine: &repo.quarantine,
+    };
+    let head = line(attempt, &repo.worktree, &["rev-parse", "FETCH_HEAD"], &[])?;
+    if head != repo.commit || !made_from(attempt, &repo.worktree, &back)? {
+        attempt.say(repo.worktree.said(ignored_line(&head, repo.worktree.snapshot())));
+        return Ok(false);
+    }
+    repo.held = Held::Taken;
+    let refused = refusal(attempt, &repo.worktree, &back)?;
+    let name = repo.worktree.target.name;
+    if let Err(unmoved) = repo.quarantine.moved_in(repo.quarantine.wait, || {}) {
+        repo.held = Held::Lost;
+        attempt.say(in_repo(&unmoved_line(&unmoved), name));
+        return Ok(false);
+    }
+    repo.held = Held::Moved;
+    if let Some(said) = refused {
+        attempt.say(in_repo(&said, name));
+        return Ok(false);
+    }
+    repo.ready = true;
+    Ok(true)
+}
+
+/// The line `line`, `gate: <what>: <why>`, with the repository `name` right after the colon that ends `<what>`.
+fn in_repo(line: &str, name: &str) -> String {
+    let named = line
+        .strip_prefix("gate: ")
+        .and_then(|rest| rest.split_once(": "))
+        .map(|(what, why)| format!("gate: {what}: {}: {why}", escaped(name)));
+    named.unwrap_or_else(|| line.to_owned())
+}
+
+/// The line said for a back commit `back` the box's line named but the builder does not advertise.
+fn unadvertised_line(back: &str) -> String {
+    format!("{NOT_APPLIED}the builder does not have the commit it named ({})", short(back))
+}
+
+/// Whether every worktree of `fetched` still matches its snapshot, checked again after every fetch and just before
+/// any write; each that changed is refused, said as in the first phase.
+fn unchanged_since(attempt: &mut Attempt<'_, '_>, fetched: &mut [Fetched<'_>]) -> Result<bool, End> {
+    let mut unchanged = true;
+    for repo in fetched.iter_mut() {
+        if changed(attempt, &repo.worktree)? {
+            let line = repo.worktree.said(not_applied_line(repo.worktree.snapshot(), &repo.commit));
+            attempt.say(line);
+            repo.ready = false;
+            unchanged = false;
+        }
+    }
+    Ok(unchanged)
+}
+
+/// How a pair whose first phase refused or ignored a back commit ends: every taken back commit kept, the repositories
+/// that could have been applied said, and a passing run as 1. A keep that fails is the run's failure.
+fn refused_pair(attempt: &mut Attempt<'_, '_>, fetched: &mut [Fetched<'_>], status: i64) -> Result<Synced, End> {
+    keep_all(attempt, fetched).map_err(End::Failed)?;
+    let untouched: Vec<&str> = fetched.iter().filter(|repo| repo.ready).map(Fetched::name).collect();
+    if !untouched.is_empty() {
+        attempt.say(untouched_line(&untouched));
+    }
+    Ok(not_applied(status))
+}
+
+/// Removes the patch `patch` once every patch applied; one that cannot be removed is said, and the run's end stands.
+fn removed_or_said(attempt: &mut Attempt<'_, '_>, patch: &Path) {
+    if let Err(End::Failed(why)) = remove(patch) {
+        attempt.say(format!("gate: {why}"));
+    }
+}
+
+/// Writes and checks every repository's patch, and only then, the interrupt looked at once, applies each in pair
+/// order, and says each repository's synced line. A failure names the repository, and a failed apply also the ones
+/// applied and not.
+fn applied_pair(attempt: &mut Attempt<'_, '_>, fetched: &mut [Fetched<'_>]) -> Result<(), End> {
+    for repo in fetched.iter_mut() {
+        let back = Back {
+            commit: &repo.commit,
+            quarantine: &repo.quarantine,
+        };
+        let (names, patch) = written_patch(attempt, &repo.worktree, &back)?;
+        repo.names = names;
+        let patch = repo.patch.insert(patch);
+        apply_checked(attempt, &repo.worktree, patch)?;
+    }
+    if let Some(interrupt) = attempt.call.interrupt.filter(|_| attempt.raises_at("apply")) {
+        interrupt.raise();
+    }
+    attempt.go_on()?;
+    for (at, repo) in fetched.iter().enumerate() {
+        if let Some(patch) = &repo.patch {
+            applied(attempt, &repo.worktree, patch).map_err(|failed| write_failed(failed, fetched, at))?;
+        }
+    }
+    for repo in fetched.iter() {
+        attempt.say(pair_synced_line(&repo.names, repo.name()));
+    }
+    for repo in fetched.iter_mut() {
+        if let Some(patch) = repo.patch.take() {
+            removed_or_said(attempt, &patch);
+        }
+    }
+    Ok(())
+}
+
+/// Checks that the patch `patch` applies to the worktree, as [`applied`] would apply it, writing nothing; a failure
+/// names the repository and says nothing was applied.
+fn apply_checked(attempt: &Attempt<'_, '_>, worktree: &Worktree<'_>, patch: &Path) -> Result<(), End> {
+    let shown = patch.display().to_string();
+    let check = ["-c", "core.protectNTFS=true", "apply", "--check", "--whitespace=nowarn", "--", &shown];
+    git_call(attempt, worktree, &check, &[]).map(drop).map_err(|failed| match failed {
+        End::Failed(why) => End::Failed(format!(
+            "git apply --check failed in {} ({why}); nothing was applied",
+            escaped(worktree.target.name)
+        )),
+        other => other,
+    })
+}
+
+/// The failure of the apply of `fetched`'s repository at `at`, `failed`, naming it, the repositories applied before it
+/// and the ones not applied, it among them.
+fn write_failed(failed: End, fetched: &[Fetched<'_>], at: usize) -> End {
+    let End::Failed(why) = failed else {
+        return failed;
+    };
+    let (before, after) = fetched.split_at(at);
+    let names = |repos: &[Fetched<'_>]| repos.iter().map(|repo| escaped(repo.name())).collect::<Vec<_>>().join(", ");
+    let applied = if before.is_empty() { "none".to_owned() } else { names(before) };
+    let failing = after.first().map(Fetched::name).unwrap_or_default();
+    End::Failed(format!(
+        "git apply failed in {} ({why}); applied: {applied}; not applied: {}",
+        escaped(failing),
+        names(after)
+    ))
+}
+
+/// How a pair's sync-back that a step ended at `failed` ends once every back commit taken is kept, as [`after_keep`]
+/// decides, its line said; `failed` as it is when none was taken.
+fn kept_all_after(attempt: &mut Attempt<'_, '_>, fetched: &mut [Fetched<'_>], failed: End) -> End {
+    if !fetched.iter().any(|repo| matches!(repo.held, Held::Taken | Held::Moved)) {
+        return failed;
+    }
+    let kept = keep_all(attempt, fetched);
+    let see = fetched
+        .first()
+        .map(|repo| format!("see git diff in each repo at {}", repo.worktree.target.kept))
+        .unwrap_or_default();
+    let (end, said) = after_keep(failed, kept, &see);
+    if let Some(line) = said {
+        attempt.say(line);
+    }
+    end
+}
+
+/// Keeps every taken back commit of `fetched` at its worktree's `refs/gate-remote/<key>-back`, its objects moved in
+/// first where they are not yet; objects that cannot be moved in are said, named, and not kept. Why the first that could
+/// not be kept was not.
+fn keep_all(attempt: &mut Attempt<'_, '_>, fetched: &mut [Fetched<'_>]) -> Result<(), String> {
+    let mut first = None;
+    for repo in fetched.iter_mut() {
+        if repo.held == Held::Taken {
+            match repo.quarantine.moved_in(repo.quarantine.wait, || {}) {
+                Ok(()) => repo.held = Held::Moved,
+                Err(unmoved) => {
+                    repo.held = Held::Lost;
+                    attempt.say(in_repo(&unmoved_line(&unmoved), repo.worktree.target.name));
+                    first.get_or_insert_with(|| SEE_ABOVE.to_owned());
+                }
+            }
+        }
+        if repo.held == Held::Moved
+            && let Err(why) = keep(attempt, &repo.worktree, &repo.commit)
+        {
+            first.get_or_insert(why);
+        }
+    }
+    first.map_or(Ok(()), Err)
+}
+
+/// The line said for the repositories `untouched` of a pair, which could have been applied but were not.
+fn untouched_line(untouched: &[&str]) -> String {
+    let shown: Vec<String> = untouched.iter().map(|name| escaped(name)).collect();
+    format!(
+        "gate: remote changes not applied to {} either: a sync-back of a pair is all or nothing",
+        shown.join(", ")
+    )
+}
+
+/// The line said for the changes applied to the pair's repository `name`, as [`synced_line`] says them.
+fn pair_synced_line(names: &[String], name: &str) -> String {
+    let shown: Vec<String> = names.iter().map(|name| escaped(name)).collect();
+    format!("gate: synced back {} file(s) in {}: {}", names.len(), escaped(name), shown.join(", "))
+}
+
 /// The back commit the fetch brought, applied or kept when it is the one the builder advertised, `back`, and was made
-/// from the snapshot; else it is ignored, and the run ends as `status`.
-fn taken(attempt: &mut Attempt<'_, '_>, git: &Git, snapshot: &Snapshot, back: &Back<'_>, status: i64) -> Result<End, End> {
-    let fetched = line(attempt, git, &["rev-parse", "FETCH_HEAD"], &[])?;
-    if fetched != back.commit || !made_from(attempt, git, back, &snapshot.commit)? {
-        attempt.say(ignored_line(&fetched, &snapshot.commit));
+/// from the worktree's snapshot; else it is ignored, and the run ends as `status`.
+fn taken(attempt: &mut Attempt<'_, '_>, worktree: &Worktree<'_>, back: &Back<'_>, status: i64) -> Result<End, End> {
+    let fetched = line(attempt, worktree, &["rev-parse", "FETCH_HEAD"], &[])?;
+    if fetched != back.commit || !made_from(attempt, worktree, back)? {
+        attempt.say(ignored_line(&fetched, worktree.snapshot()));
         return Ok(End::Status(status));
     }
-    receive(attempt, git, snapshot, back, status)
+    receive(attempt, worktree, back, status)
 }
 
 /// The back commit the builder advertised, and the quarantine its fetched objects are read from.
@@ -111,13 +612,13 @@ struct Back<'a> {
 }
 
 /// The back commit the builder advertises for this run, from `ls-remote` of its ref; `None` when it holds none.
-fn has_back(attempt: &mut Attempt<'_, '_>, git: &Git, remote: &Remote<'_>) -> Result<Option<String>, End> {
+fn has_back(attempt: &mut Attempt<'_, '_>, worktree: &Worktree<'_>, remote: &Remote<'_>) -> Result<Option<String>, End> {
     let ls_remote = Network {
         verb: "ls-remote",
         watch: Watch::Deadline(attempt.deadline_for("ls-remote", attempt.limit)),
         set: &[],
     };
-    let called = to_the_builder(attempt, git, remote, &ls_remote, &remote.args(&["ls-remote"]))?;
+    let called = to_the_builder(attempt, worktree, remote, &ls_remote, &remote.args(&["ls-remote"]))?;
     Ok(advertised(&called.lines, remote.reference))
 }
 
@@ -144,7 +645,13 @@ const FETCH_WORDS: [&str; 10] = [
 /// stopped, and the run of the command that ended `status` ends with the line saying the changes stay on the builder, a
 /// passing run as 1. One still running at its transfer ceiling is stopped with the TRANSFER TIMED OUT line: a passing
 /// run ends killed, and a failing one keeps its command's status. That end; `None` when the fetch went through.
-fn fetch(attempt: &mut Attempt<'_, '_>, git: &Git, remote: &Remote<'_>, quarantine: &Quarantine, status: i64) -> Result<Option<End>, End> {
+fn fetch(
+    attempt: &mut Attempt<'_, '_>,
+    worktree: &Worktree<'_>,
+    remote: &Remote<'_>,
+    quarantine: &Quarantine,
+    status: i64,
+) -> Result<Option<End>, End> {
     let set = quarantine.env();
     let fetch = Network {
         verb: "fetch",
@@ -153,12 +660,13 @@ fn fetch(attempt: &mut Attempt<'_, '_>, git: &Git, remote: &Remote<'_>, quaranti
     };
     let args = remote.args(&FETCH_WORDS);
     let begun = Instant::now();
-    let called = reached(attempt, git, remote, &fetch, &args)?;
-    attempt.split.sync_back = Some(begun.elapsed());
+    let called = reached(attempt, worktree, remote, &fetch, &args)?;
+    // A pair's sync-back fetches once per repository, and its part of the run's split is their sum.
+    attempt.split.sync_back = Some(attempt.split.sync_back.unwrap_or_default() + begun.elapsed());
     match called.cut {
         Some(Cut::TooBig(cap)) => {
             attempt.noted(&called);
-            attempt.say(stopped_line(cap, remote.reference));
+            attempt.say(worktree.said(stopped_line(cap, remote.reference)));
             return Ok(Some(End::Status(not_passing(status))));
         }
         Some(Cut::Ceiling(ceiling)) => {
@@ -168,7 +676,7 @@ fn fetch(attempt: &mut Attempt<'_, '_>, git: &Git, remote: &Remote<'_>, quaranti
         }
         _ => {}
     }
-    checked(attempt, &fetch, &args, called).map(|_| None)
+    checked(attempt, worktree, &fetch, &args, called).map(|_| None)
 }
 
 /// `status`, but 1 for a passing run: how a run whose changes were not applied ends.
@@ -178,10 +686,11 @@ fn not_passing(status: i64) -> i64 {
 
 /// The object store of the worktree's repository, as `git rev-parse --git-path objects` names it, asked with no
 /// interrupt: a Ctrl+C meanwhile is left to the call that follows, which ends as the run's interrupt.
-fn objects_folder(attempt: &Attempt<'_, '_>, git: &Git) -> Result<PathBuf, End> {
+fn objects_folder(attempt: &Attempt<'_, '_>, worktree: &Worktree<'_>) -> Result<PathBuf, End> {
     let args = ["rev-parse", "--git-path", "objects"];
-    let printed = git
-        .output(&git::Call::plain(Path::new(attempt.call.root), &args, attempt.limit))
+    let printed = worktree
+        .git
+        .output(&git::Call::plain(worktree.root(), &args, attempt.limit))
         .map_err(escaped_end)?;
     let folder = printed
         .lines()
@@ -189,7 +698,7 @@ fn objects_folder(attempt: &Attempt<'_, '_>, git: &Git) -> Result<PathBuf, End> 
         .map(str::trim_end)
         .filter(|folder| !folder.is_empty())
         .ok_or_else(|| End::Failed(format!("git {} printed nothing", args.join(" "))))?;
-    Ok(Path::new(attempt.call.root).join(folder))
+    Ok(worktree.root().join(folder))
 }
 
 /// The real object store `objects` as `GIT_ALTERNATE_OBJECT_DIRECTORIES` names it: as it is, or C-quoted, its `\` and
@@ -533,39 +1042,59 @@ struct Network<'a> {
 /// git with `args`, the call `network` that reaches the builder: retried once when it failed before the banner, its
 /// lines kept out of the log, and killed as its watch says or at a line longer than the cap. A failure is the run's,
 /// or its interrupt when the console interrupt was raised during the call.
-fn to_the_builder(attempt: &mut Attempt<'_, '_>, git: &Git, remote: &Remote<'_>, network: &Network<'_>, args: &[String]) -> Result<Called, End> {
-    let called = reached(attempt, git, remote, network, args)?;
-    checked(attempt, network, args, called)
+fn to_the_builder(
+    attempt: &mut Attempt<'_, '_>,
+    worktree: &Worktree<'_>,
+    remote: &Remote<'_>,
+    network: &Network<'_>,
+    args: &[String],
+) -> Result<Called, End> {
+    let called = reached(attempt, worktree, remote, network, args)?;
+    checked(attempt, worktree, network, args, called)
 }
 
-/// git with `args`, the call `network` that reaches the builder, made as [`to_the_builder`] makes it: the call that
-/// counts, however it ended. A retried call is given the same variables, so a retried fetch writes into the same
-/// quarantine.
-fn reached(attempt: &mut Attempt<'_, '_>, git: &Git, remote: &Remote<'_>, network: &Network<'_>, args: &[String]) -> Result<Called, End> {
+/// git with `args` in `worktree`, the call `network` that reaches the builder, made as [`to_the_builder`] makes it: the
+/// call that counts, however it ended. A retried call is given the same variables, so a retried fetch writes into the
+/// same quarantine.
+fn reached(
+    attempt: &mut Attempt<'_, '_>,
+    worktree: &Worktree<'_>,
+    remote: &Remote<'_>,
+    network: &Network<'_>,
+    args: &[String],
+) -> Result<Called, End> {
     let mut set = network.set.to_vec();
     set.extend(remote.ssh.map(|ssh| ("GIT_SSH_COMMAND", OsStr::new(ssh))));
-    let (called, _) = attempt.with_retry(GIT_SSH_FAILED, |attempt| attempt.git(git, args, &set, Echo::Unlogged, network.watch))?;
+    let (called, _) = attempt.with_retry(GIT_SSH_FAILED, |attempt| {
+        attempt.git_in(worktree.root(), &worktree.git, args, &set, network.watch)
+    })?;
     Ok(called)
 }
 
 /// The call `network` with `args` that [`reached`] made, as [`to_the_builder`] ends it: a cut or a failure is the run's,
 /// or its interrupt when the console interrupt was raised during the call.
-fn checked(attempt: &mut Attempt<'_, '_>, network: &Network<'_>, args: &[String], called: Called) -> Result<Called, End> {
+fn checked(attempt: &mut Attempt<'_, '_>, worktree: &Worktree<'_>, network: &Network<'_>, args: &[String], called: Called) -> Result<Called, End> {
     if let Some(cut) = called.cut {
         attempt.noted(&called);
         return Err(End::Failed(escaped(&cut.reason(&format!("git {}", network.verb)))));
     }
     if called.status != 0 {
         attempt.go_on()?;
-        return Err(git_failure(attempt.call.root, args, &called));
+        return Err(git_failure(worktree.target.root, args, &called));
     }
     Ok(called)
 }
 
-/// Whether `back` was made from `snapshot`, as its `rev-list --parents` line says, read through its quarantine.
-fn made_from(attempt: &Attempt<'_, '_>, git: &Git, back: &Back<'_>, snapshot: &str) -> Result<bool, End> {
-    let parents = line(attempt, git, &["rev-list", "--parents", "-n", "1", back.commit], &back.quarantine.env())?;
-    Ok(from_snapshot(&parents, snapshot))
+/// Whether `back` was made from the worktree's snapshot, as its `rev-list --parents` line says, read through its
+/// quarantine.
+fn made_from(attempt: &Attempt<'_, '_>, worktree: &Worktree<'_>, back: &Back<'_>) -> Result<bool, End> {
+    let parents = line(
+        attempt,
+        worktree,
+        &["rev-list", "--parents", "-n", "1", back.commit],
+        &back.quarantine.env(),
+    )?;
+    Ok(from_snapshot(&parents, worktree.snapshot()))
 }
 
 /// Applies the back commit `back`, or keeps it when it touches what a sync-back never writes, its files would write
@@ -573,19 +1102,18 @@ fn made_from(attempt: &Attempt<'_, '_>, git: &Git, back: &Back<'_>, snapshot: &s
 /// interrupted before the patch applied keeps it as well, so its changes are not lost; a patch that applied but cannot
 /// be removed then fails the run with nothing kept. Its fetched objects are moved into the store before it is kept or
 /// applied; when they cannot be, nothing is kept or applied, the line says where they are kept, and a passing run is 1.
-fn receive(attempt: &mut Attempt<'_, '_>, git: &Git, snapshot: &Snapshot, back: &Back<'_>, status: i64) -> Result<End, End> {
-    let commit = snapshot.commit.as_str();
-    let refused = refusal(attempt, git, snapshot, back).map_err(|failed| kept_after(attempt, git, commit, back, failed))?;
+fn receive(attempt: &mut Attempt<'_, '_>, worktree: &Worktree<'_>, back: &Back<'_>, status: i64) -> Result<End, End> {
+    let refused = refusal(attempt, worktree, back).map_err(|failed| kept_after(attempt, worktree, back, failed))?;
     if let Some(said) = refused {
-        return refused_end(attempt, git, back, said, status);
+        return refused_end(attempt, worktree, back, said, status);
     }
-    let (names, patch) = written_patch(attempt, git, snapshot, back).map_err(|failed| kept_after(attempt, git, commit, back, failed))?;
+    let (names, patch) = written_patch(attempt, worktree, back).map_err(|failed| kept_after(attempt, worktree, back, failed))?;
     if let Err(unmoved) = back.quarantine.moved_in(back.quarantine.wait, || {}) {
         attempt.say(unmoved_line(&unmoved));
         remove(&patch)?;
         return Ok(End::Status(not_passing(status)));
     }
-    applied(attempt, git, &patch).map_err(|failed| kept_after(attempt, git, commit, back, failed))?;
+    applied(attempt, worktree, &patch).map_err(|failed| kept_after(attempt, worktree, back, failed))?;
     remove(&patch)?;
     attempt.say(synced_line(&names));
     Ok(End::Status(status))
@@ -594,12 +1122,12 @@ fn receive(attempt: &mut Attempt<'_, '_>, git: &Git, snapshot: &Snapshot, back: 
 /// How the run of the command that ended `status` ends once its back commit `back` is refused for the line `said`: its
 /// objects moved in, the commit kept and the line said, a passing run as 1. Objects that cannot be moved in keep
 /// nothing, and the line saying where they are kept is said instead.
-fn refused_end(attempt: &mut Attempt<'_, '_>, git: &Git, back: &Back<'_>, said: String, status: i64) -> Result<End, End> {
+fn refused_end(attempt: &mut Attempt<'_, '_>, worktree: &Worktree<'_>, back: &Back<'_>, said: String, status: i64) -> Result<End, End> {
     if let Err(unmoved) = back.quarantine.moved_in(back.quarantine.wait, || {}) {
         attempt.say(unmoved_line(&unmoved));
         return Ok(End::Status(not_passing(status)));
     }
-    keep(attempt, git, back.commit).map_err(End::Failed)?;
+    keep(attempt, worktree, back.commit).map_err(End::Failed)?;
     attempt.say(said);
     Ok(End::Status(not_passing(status)))
 }
@@ -608,35 +1136,42 @@ fn refused_end(attempt: &mut Attempt<'_, '_>, git: &Git, back: &Back<'_>, said: 
 /// for one that writes, or deletes, a path through a checkout filter or `ident`, for one whose files would write more
 /// than the apply cap into the worktree, or for one the worktree changed under during the run; `None` when it may be
 /// applied.
-fn refusal(attempt: &Attempt<'_, '_>, git: &Git, snapshot: &Snapshot, back: &Back<'_>) -> Result<Option<String>, End> {
+fn refusal(attempt: &Attempt<'_, '_>, worktree: &Worktree<'_>, back: &Back<'_>) -> Result<Option<String>, End> {
+    let snapshot = worktree.snapshot();
     let set = back.quarantine.env();
-    let listing = git_call(attempt, git, &["diff-tree", "-r", "-z", "--raw", &snapshot.commit, back.commit], &set)?;
+    let listing = git_call(attempt, worktree, &["diff-tree", "-r", "-z", "--raw", snapshot, back.commit], &set)?;
     if let Some(path) = forbidden(&listing) {
-        return Ok(Some(touched_line(&path, &snapshot.commit, back.commit)));
+        return Ok(Some(touched_line(&path, snapshot, back.commit)));
     }
     let paths = listed_paths(&listing);
-    let attributes = attributes(attempt, git, &paths)?;
+    let attributes = attributes(attempt, worktree, &paths)?;
     let config = if paths.is_empty() {
         String::new()
     } else {
-        git_call(attempt, git, &["config", "-z", "--list"], &[])?
+        git_call(attempt, worktree, &["config", "-z", "--list"], &[])?
     };
     if let Some((path, attribute)) = filtered(&paths, &attributes, names_odd_driver(&config)) {
-        return Ok(Some(filtered_line(path, &attribute, &snapshot.commit, back.commit)));
+        return Ok(Some(filtered_line(path, &attribute, snapshot, back.commit)));
     }
     let written = written_blobs(&listing);
     let weights = weights(&written, &attributes, LineEnds::of(&config));
-    let size = written_size(attempt, git, &written, &weights, &set)?;
-    if let Some(line) = written_line(size, attempt.apply_cap, &snapshot.commit, back.commit) {
+    let size = written_size(attempt, worktree, &written, &weights, &set)?;
+    if let Some(line) = written_line(size, attempt.apply_cap, snapshot, back.commit) {
         return Ok(Some(line));
     }
-    Ok(changed(attempt, git, snapshot)?.then(|| not_applied_line(&snapshot.commit, back.commit)))
+    Ok(changed(attempt, worktree)?.then(|| not_applied_line(snapshot, back.commit)))
 }
 
 /// The bytes the files `written` write into the worktree total, each path counted: the sizes of their blobs, asked of
 /// one `git cat-file --batch-check=%(objectsize)` given the variables `set` and fed their ids, each times its weight in
 /// `weights`. An answer that is not a size for each of them is the run's failure.
-fn written_size(attempt: &Attempt<'_, '_>, git: &Git, written: &[Written<'_>], weights: &[u64], set: &[(&str, &OsStr)]) -> Result<u64, End> {
+fn written_size(
+    attempt: &Attempt<'_, '_>,
+    worktree: &Worktree<'_>,
+    written: &[Written<'_>],
+    weights: &[u64],
+    set: &[(&str, &OsStr)],
+) -> Result<u64, End> {
     if written.is_empty() {
         return Ok(0);
     }
@@ -647,15 +1182,15 @@ fn written_size(attempt: &Attempt<'_, '_>, git: &Git, written: &[Written<'_>], w
         interrupt: attempt.call.interrupt,
         stdin: Some(ids.as_bytes()),
         set,
-        ..git::Call::plain(Path::new(attempt.call.root), &args, attempt.limit)
+        ..git::Call::plain(worktree.root(), &args, attempt.limit)
     };
-    let answer = git.output(&call).map_err(escaped_end)?;
-    total(&answer, &blobs, weights).map_err(|why| unreadable(attempt, &args, &why))
+    let answer = worktree.git.output(&call).map_err(escaped_end)?;
+    total(&answer, &blobs, weights).map_err(|why| unreadable(worktree.target, &args, &why))
 }
 
-/// The run's failure for git with `args`, whose answer could not be read for `why`.
-fn unreadable(attempt: &Attempt<'_, '_>, args: &[&str], why: &str) -> End {
-    escaped_end(GitError::Failed(format!("git {} failed in {}: {why}", args.join(" "), attempt.call.root)))
+/// The run's failure for git with `args` in `target`'s worktree, whose answer could not be read for `why`.
+fn unreadable(target: &Target<'_>, args: &[&str], why: &str) -> End {
+    escaped_end(GitError::Failed(format!("git {} failed in {}: {why}", args.join(" "), target.root)))
 }
 
 /// One file a back commit writes: the id of the blob written there, and where its path stands among every path the
@@ -728,7 +1263,7 @@ struct Attributes {
 /// The worktree's attributes of each of `paths`, in its order, read by `git check-attr -z --stdin` in the worktree, so
 /// its own `.git/info/attributes` counts as the apply would read it, fed the paths in slices whose answers stay under
 /// the runner's cap. An answer that does not give each attribute of each path is the run's failure.
-fn attributes(attempt: &Attempt<'_, '_>, git: &Git, paths: &[&str]) -> Result<Vec<Attributes>, End> {
+fn attributes(attempt: &Attempt<'_, '_>, worktree: &Worktree<'_>, paths: &[&str]) -> Result<Vec<Attributes>, End> {
     let args = [
         "check-attr",
         "-z",
@@ -746,10 +1281,10 @@ fn attributes(attempt: &Attempt<'_, '_>, git: &Git, paths: &[&str]) -> Result<Ve
         let call = git::Call {
             interrupt: attempt.call.interrupt,
             stdin: Some(fed.as_bytes()),
-            ..git::Call::plain(Path::new(attempt.call.root), &args, attempt.limit)
+            ..git::Call::plain(worktree.root(), &args, attempt.limit)
         };
-        let answer = git.output(&call).map_err(escaped_end)?;
-        read.extend(read_attributes(&answer, slice).map_err(|why| unreadable(attempt, &args, &why))?);
+        let answer = worktree.git.output(&call).map_err(escaped_end)?;
+        read.extend(read_attributes(&answer, slice).map_err(|why| unreadable(worktree.target, &args, &why))?);
     }
     Ok(read)
 }
@@ -1026,15 +1561,15 @@ const SEE_ABOVE: &str = "see the line above";
 /// How the run ends once `back`, which a step before its apply could not take past `failed`, has its objects moved in
 /// and is kept; what [`after_keep`] decides, and its line said. Objects that cannot be moved in are not kept: the line
 /// saying where they are kept is said first, and the run's ending says the changes could not be kept, see above.
-fn kept_after(attempt: &mut Attempt<'_, '_>, git: &Git, snapshot: &str, back: &Back<'_>, failed: End) -> End {
+fn kept_after(attempt: &mut Attempt<'_, '_>, worktree: &Worktree<'_>, back: &Back<'_>, failed: End) -> End {
     let kept = match back.quarantine.moved_in(back.quarantine.wait, || {}) {
-        Ok(()) => keep(attempt, git, back.commit),
+        Ok(()) => keep(attempt, worktree, back.commit),
         Err(unmoved) => {
             attempt.say(unmoved_line(&unmoved));
             Err(SEE_ABOVE.to_owned())
         }
     };
-    let (end, said) = after_keep(failed, kept, &see_diff(snapshot, back.commit));
+    let (end, said) = after_keep(failed, kept, &see_diff(worktree.snapshot(), back.commit));
     if let Some(line) = said {
         attempt.say(line);
     }
@@ -1070,28 +1605,27 @@ fn see_diff(snapshot: &str, back: &str) -> String {
 
 /// Whether the worktree no longer matches the snapshot: the tree `git add -A` would write for it now is not the
 /// snapshot's own.
-fn changed(attempt: &Attempt<'_, '_>, git: &Git, snapshot: &Snapshot) -> Result<bool, End> {
-    let now = snapshot::worktree(Path::new(attempt.call.root), attempt.limit, attempt.call.interrupt).map_err(escaped_end)?;
-    let then = line(attempt, git, &["rev-parse", &format!("{}^{{tree}}", snapshot.commit)], &[])?;
+fn changed(attempt: &Attempt<'_, '_>, worktree: &Worktree<'_>) -> Result<bool, End> {
+    let now = snapshot::worktree(worktree.root(), attempt.limit, attempt.call.interrupt).map_err(escaped_end)?;
+    let then = line(attempt, worktree, &["rev-parse", &format!("{}^{{tree}}", worktree.snapshot())], &[])?;
     Ok(now != then)
 }
 
 /// Keeps `back` at the worktree's `refs/gate-remote/<key>-back`, for the changes a run could not apply; else why not,
 /// escaped.
-fn keep(attempt: &Attempt<'_, '_>, git: &Git, back: &str) -> Result<(), String> {
-    let name = format!("{REFS}{}{BACK}", attempt.call.key);
-    let args = ["update-ref", name.as_str(), back];
-    let call = git::Call::locked(Path::new(attempt.call.root), &args, attempt.limit);
-    git.output(&call).map(drop).map_err(|error| escaped(&String::from(error)))
+fn keep(attempt: &Attempt<'_, '_>, worktree: &Worktree<'_>, back: &str) -> Result<(), String> {
+    let args = ["update-ref", worktree.target.kept.as_str(), back];
+    let call = git::Call::locked(worktree.root(), &args, attempt.limit);
+    worktree.git.output(&call).map(drop).map_err(|error| escaped(&String::from(error)))
 }
 
 /// Writes the back commit's changes as a patch into the git folder, read through its quarantine: the names of the
 /// files it changes, and the patch, which the caller applies and removes. A patch that could not be written is removed
 /// here, and the diff's failure is the one the run ends with.
-fn written_patch(attempt: &Attempt<'_, '_>, git: &Git, snapshot: &Snapshot, back: &Back<'_>) -> Result<(Vec<String>, PathBuf), End> {
+fn written_patch(attempt: &Attempt<'_, '_>, worktree: &Worktree<'_>, back: &Back<'_>) -> Result<(Vec<String>, PathBuf), End> {
     let set = back.quarantine.env();
-    let names = names(attempt, git, snapshot, back)?;
-    let patch = patch_file(attempt, git)?;
+    let names = names(attempt, worktree, back)?;
+    let patch = patch_file(attempt, worktree)?;
     let output = format!("--output={}", patch.display());
     let diff = [
         "diff-tree",
@@ -1100,10 +1634,10 @@ fn written_patch(attempt: &Attempt<'_, '_>, git: &Git, snapshot: &Snapshot, back
         "--full-index",
         "-r",
         &output,
-        &snapshot.commit,
+        worktree.snapshot(),
         back.commit,
     ];
-    if let Err(failed) = git_call(attempt, git, &diff, &set) {
+    if let Err(failed) = git_call(attempt, worktree, &diff, &set) {
         // The diff's failure is the run's; a patch that cannot be removed after it is the lesser problem.
         drop(remove(&patch));
         return Err(failed);
@@ -1113,30 +1647,31 @@ fn written_patch(attempt: &Attempt<'_, '_>, git: &Git, snapshot: &Snapshot, back
 
 /// Applies the patch `patch` to the worktree. A patch that did not apply is removed here, and the apply's failure is
 /// the one the run ends with.
-fn applied(attempt: &Attempt<'_, '_>, git: &Git, patch: &Path) -> Result<(), End> {
+fn applied(attempt: &Attempt<'_, '_>, worktree: &Worktree<'_>, patch: &Path) -> Result<(), End> {
     let shown = patch.display().to_string();
     // NTFS protection refuses a path that names `.git` by its 8.3 short name or an alternate stream, whatever the
     // repository's own setting.
     let apply = ["-c", "core.protectNTFS=true", "apply", "--whitespace=nowarn", "--", &shown];
-    locked_call(attempt, git, &apply).map(drop).inspect_err(|_| {
+    locked_call(attempt, worktree, &apply).map(drop).inspect_err(|_| {
         // The apply's failure is the run's; a patch that cannot be removed after it is the lesser problem.
         drop(remove(patch));
     })
 }
 
-/// The names of the files the back commit `back` changes, against the snapshot, as git's plumbing lists them.
-fn names(attempt: &Attempt<'_, '_>, git: &Git, snapshot: &Snapshot, back: &Back<'_>) -> Result<Vec<String>, End> {
-    let args = ["diff-tree", "-r", "-z", "--name-only", &snapshot.commit, back.commit];
-    let listed = git_call(attempt, git, &args, &back.quarantine.env())?;
+/// The names of the files the back commit `back` changes, against the worktree's snapshot, as git's plumbing lists
+/// them.
+fn names(attempt: &Attempt<'_, '_>, worktree: &Worktree<'_>, back: &Back<'_>) -> Result<Vec<String>, End> {
+    let args = ["diff-tree", "-r", "-z", "--name-only", worktree.snapshot(), back.commit];
+    let listed = git_call(attempt, worktree, &args, &back.quarantine.env())?;
     Ok(listed.split('\0').filter(|name| !name.is_empty()).map(str::to_owned).collect())
 }
 
 /// A new, empty file in the git folder for this run's patch, named for the process and a nonce so no other process
 /// can name it beforehand; one already there fails the run.
-fn patch_file(attempt: &Attempt<'_, '_>, git: &Git) -> Result<PathBuf, End> {
+fn patch_file(attempt: &Attempt<'_, '_>, worktree: &Worktree<'_>) -> Result<PathBuf, End> {
     let name = format!("{PATCH}{}-{}{PATCH_SUFFIX}", std::process::id(), payload::job_nonce());
-    let printed = line(attempt, git, &["rev-parse", "--git-path", &name], &[])?;
-    let path = Path::new(attempt.call.root).join(printed);
+    let printed = line(attempt, worktree, &["rev-parse", "--git-path", &name], &[])?;
+    let path = worktree.root().join(printed);
     OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -1155,20 +1690,20 @@ fn remove(patch: &Path) -> Result<(), End> {
 
 /// Runs git with `args` in the worktree, given the variables `set`, and returns what it wrote on standard output; a
 /// failure is the run's.
-fn git_call(attempt: &Attempt<'_, '_>, git: &Git, args: &[&str], set: &[(&str, &OsStr)]) -> Result<String, End> {
+fn git_call(attempt: &Attempt<'_, '_>, worktree: &Worktree<'_>, args: &[&str], set: &[(&str, &OsStr)]) -> Result<String, End> {
     let call = git::Call {
         interrupt: attempt.call.interrupt,
         set,
-        ..git::Call::plain(Path::new(attempt.call.root), args, attempt.limit)
+        ..git::Call::plain(worktree.root(), args, attempt.limit)
     };
-    git.output(&call).map_err(escaped_end)
+    worktree.git.output(&call).map_err(escaped_end)
 }
 
 /// Runs git with `args` in the worktree as [`git_call`] does, but as a [`git::Call::locked`] call, which no Ctrl+C
 /// ends while it holds a lock in the git folder.
-fn locked_call(attempt: &Attempt<'_, '_>, git: &Git, args: &[&str]) -> Result<String, End> {
-    let call = git::Call::locked(Path::new(attempt.call.root), args, attempt.limit);
-    git.output(&call).map_err(escaped_end)
+fn locked_call(attempt: &Attempt<'_, '_>, worktree: &Worktree<'_>, args: &[&str]) -> Result<String, End> {
+    let call = git::Call::locked(worktree.root(), args, attempt.limit);
+    worktree.git.output(&call).map_err(escaped_end)
 }
 
 /// A git failure as the attempt's end, its text escaped: an interrupt is the run's interrupt, any other a failure.
@@ -1181,8 +1716,8 @@ fn escaped_end(error: GitError) -> End {
 
 /// The first line of what git with `args`, given the variables `set`, wrote on standard output: what every call that
 /// asks git for one value reads.
-fn line(attempt: &Attempt<'_, '_>, git: &Git, args: &[&str], set: &[(&str, &OsStr)]) -> Result<String, End> {
-    git_call(attempt, git, args, set)?
+fn line(attempt: &Attempt<'_, '_>, worktree: &Worktree<'_>, args: &[&str], set: &[(&str, &OsStr)]) -> Result<String, End> {
+    git_call(attempt, worktree, args, set)?
         .lines()
         .next()
         .map(|line| line.trim_end().to_owned())
@@ -1278,6 +1813,56 @@ pub(super) fn synced_line(names: &[String]) -> String {
 /// The first eight hex digits of a commit sha, or the whole sha when it is shorter.
 fn short(sha: &str) -> &str {
     sha.get(..8).unwrap_or(sha)
+}
+
+/// What the line a pair run's box says on standard error once every back commit is pushed starts with.
+const BACK_COMMITS: &str = "gate: remote back commits: ";
+
+/// One entry of the box's back commits line: a repository's name and its back commit, `None` for a repository whose
+/// tree the run left unchanged.
+pub(super) type BackCommit = (String, Option<String>);
+
+/// Keeps `line` as `kept`, a call's last back commits line, when it came on standard error (`stderr`) and starts
+/// `gate: remote back commits: `: a line on standard output never counts, and a later line replaces an earlier one.
+pub(super) fn keep_back_commits_line(kept: &mut Option<String>, line: &str, stderr: bool) {
+    if stderr && line.starts_with(BACK_COMMITS) {
+        *kept = Some(line.to_owned());
+    }
+}
+
+/// What the back commits line `line` names: after `gate: remote back commits: `, `<name> <commit>` for each repository,
+/// comma-separated, its commit 40 lowercase hex digits or `none`. `None` for a line that does not read so, whole: a
+/// line with one entry that is not a name and a commit names nothing.
+pub(super) fn back_commits(line: &str) -> Option<Vec<BackCommit>> {
+    let named = line.strip_prefix(BACK_COMMITS)?;
+    if named == BACK_COMMITS_FAILED {
+        return Some(Vec::new());
+    }
+    named.split(", ").map(back_commit).collect()
+}
+
+/// What the box's back commits line says in place of the commits when a pair run's back commits failed or were never
+/// made after its command ended: [`back_commits`] reads it as naming none, so nothing is applied.
+const BACK_COMMITS_FAILED: &str = "failed";
+
+/// One entry of the back commits line, `<name> <commit>`, as [`back_commits`] reads it; `None` for one with no name, or
+/// whose commit is neither a sha nor `none`.
+fn back_commit(entry: &str) -> Option<BackCommit> {
+    let (name, commit) = entry.rsplit_once(' ')?;
+    if name.is_empty() {
+        return None;
+    }
+    let commit = match commit {
+        "none" => None,
+        sha if is_sha(sha) => Some(sha.to_owned()),
+        _ => return None,
+    };
+    Some((name.to_owned(), commit))
+}
+
+/// Whether `word` is a commit sha as git prints it: 40 lowercase hex digits.
+fn is_sha(word: &str) -> bool {
+    word.len() == 40 && word.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 /// Where the sync-back's two calls that reach the builder go: the push's URL and ssh, the fetch's own pack command,
@@ -1392,6 +1977,52 @@ mod output_cap_slices {
     }
 }
 
+/// The box's `back commits` line as the client reads it, run by a test build with or without the `test-seams` feature.
+#[cfg(test)]
+mod back_commits_lines {
+    use super::back_commits;
+
+    const APP: &str = "8e8777a0e71c530018dc15bdebd7288f4f432aa4";
+    const LIB: &str = "b8a4812193314ab4b2404479b93f2338078c69eb";
+
+    #[test]
+    fn back_commits_line_parses_every_repo_in_order() {
+        let line = format!("gate: remote back commits: app {APP}, lib {LIB}, tools none");
+
+        let read = back_commits(&line);
+
+        let named = vec![
+            ("app".to_owned(), Some(APP.to_owned())),
+            ("lib".to_owned(), Some(LIB.to_owned())),
+            ("tools".to_owned(), None),
+        ];
+        assert_eq!(read, Some(named));
+    }
+
+    #[test]
+    fn back_commits_line_with_a_bad_sha_is_rejected() {
+        let bad = [
+            APP[..39].to_owned(),
+            format!("{APP}0"),
+            APP.to_uppercase(),
+            format!("{}g", &APP[..39]),
+            String::new(),
+        ];
+        for sha in bad {
+            let line = format!("gate: remote back commits: app {APP}, lib {sha}, tools none");
+
+            assert_eq!(back_commits(&line), None, "a line naming lib's commit as '{sha}' is rejected whole");
+        }
+    }
+
+    #[test]
+    fn back_commits_line_names_none_as_no_commit() {
+        let read = back_commits("gate: remote back commits: app none, lib none");
+
+        assert_eq!(read, Some(vec![("app".to_owned(), None), ("lib".to_owned(), None)]));
+    }
+}
+
 #[cfg(all(test, feature = "test-seams"))]
 #[expect(clippy::expect_used, reason = "a test whose interrupt, transport or git cannot be had must fail loudly")]
 mod tests {
@@ -1406,18 +2037,19 @@ mod tests {
     use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_READ, FILE_WRITE_ATTRIBUTES};
 
     use super::{
-        ATTRIBUTE_ROOM, ATTRIBUTES, Attributes, AutoCrlf, Back, FETCH_WORDS, LineEnds, Quarantine, Remote, advertised, after_keep, alternates,
-        attribute_slices, auto_crlf, converts_to_crlf, entries, fetch, filtered, forbidden, from_snapshot, has_back, ignored_line, incoming_name,
-        incoming_owner, listed_paths, move_plan, names_odd_driver, not_applied_line, read_attributes, receive, refused_end, see_diff, swept,
-        synced_line, total, touched_line, unmoved_line, weight, written_blobs, written_line,
+        ATTRIBUTE_ROOM, ATTRIBUTES, Attributes, AutoCrlf, Back, BackCommit, FETCH_WORDS, LineEnds, Quarantine, Remote, Synced, Target, Worktree,
+        advertised, after_keep, alternates, attribute_slices, auto_crlf, converts_to_crlf, entries, fetch, filtered, forbidden, from_snapshot,
+        has_back, ignored_line, incoming_name, incoming_owner, listed_paths, move_plan, names_odd_driver, not_applied_line, read_attributes, receive,
+        refused_end, see_diff, swept, sync_back, synced_line, total, touched_line, unmoved_line, weight, written_blobs, written_line,
     };
     use crate::boxside::payload::escaped;
     use crate::remote::RemoteCall;
     use crate::remote::client::{Attempt, End};
     use crate::remote::git::{self, Git};
     use crate::remote::snapshot::{Snapshot, repository};
-    use crate::remote::transport::Local;
+    use crate::remote::transport::{Local, Program, PushTarget, Transport, Wire};
     use crate::slots;
+    use gate_router::{CarriedSibling, FolderId, RemoteRun, sibling_root};
 
     const BACK: &str = "8e8777a0e71c530018dc15bdebd7288f4f432aa4";
     const SNAPSHOT: &str = "b8a4812193314ab4b2404479b93f2338078c69eb";
@@ -1491,6 +2123,8 @@ mod tests {
             host: "builder",
             key: "app-1a2b3c4d",
             root: &root,
+            leaf: "app",
+            siblings: Vec::new(),
             repo: "app",
             subfolder: "",
             words: &[],
@@ -1521,9 +2155,20 @@ mod tests {
             reference: "refs/gate-back/app-1a2b3c4d",
         };
 
-        let listed = has_back(&mut attempt, &git, &remote);
+        let snapshot = Snapshot {
+            commit: SNAPSHOT.to_owned(),
+            bridge: None,
+        };
+        let target = Target::new("app", &root, "app", &snapshot, "app-1a2b3c4d");
+        let worktree = Worktree {
+            target: &target,
+            git,
+            pair: false,
+        };
+
+        let listed = has_back(&mut attempt, &worktree, &remote);
         std::fs::remove_file(&log).expect("the ls-remote's call opened the log");
-        let fetched = fetch(&mut attempt, &git, &remote, &quarantine, 0);
+        let fetched = fetch(&mut attempt, &worktree, &remote, &quarantine, 0);
 
         assert!(matches!(listed, Err(End::Interrupted)), "the ls-remote: {listed:?}");
         assert!(matches!(fetched, Err(End::Interrupted)), "the fetch: {fetched:?}");
@@ -2283,6 +2928,8 @@ mod tests {
             host: "builder",
             key: KEY,
             root,
+            leaf: "app",
+            siblings: Vec::new(),
             repo: "app",
             subfolder: "",
             words: &[],
@@ -2360,14 +3007,19 @@ mod tests {
         let call = call_in(&shown, &log, &state);
         let transport = Local::new(r"local:C:\gate-sync-back-tests", None).expect("a local transport");
         let mut attempt = Attempt::for_tests(&call, &transport);
-        let git = Git::find(&root).expect("git is found");
+        let target = Target::new("app", &shown, "app", &snapshot, KEY);
+        let worktree = Worktree {
+            target: &target,
+            git: Git::find(&root).expect("git is found"),
+            pair: false,
+        };
         let handle = held_open(&loose_object(&quarantine.folder, &back));
 
         let back_of = Back {
             commit: &back,
             quarantine: &quarantine,
         };
-        let ended = receive(&mut attempt, &git, &snapshot, &back_of, 0);
+        let ended = receive(&mut attempt, &worktree, &back_of, 0);
 
         drop(handle);
         assert_unmoved(&ended, &root, &quarantine, &log);
@@ -2383,21 +3035,26 @@ mod tests {
     /// refusal's own line is not said.
     #[test]
     fn a_refused_back_commit_whose_objects_cannot_be_moved_in_is_not_kept() {
-        let (root, _, back, quarantine) = backed("unmoved-refused");
+        let (root, snapshot, back, quarantine) = backed("unmoved-refused");
         let shown = root.to_string_lossy().into_owned();
         let log = test_log("unmoved-refused");
         let state = StateRoot::new(r"C:\gate-sync-back-tests", None);
         let call = call_in(&shown, &log, &state);
         let transport = Local::new(r"local:C:\gate-sync-back-tests", None).expect("a local transport");
         let mut attempt = Attempt::for_tests(&call, &transport);
-        let git = Git::find(&root).expect("git is found");
+        let target = Target::new("app", &shown, "app", &snapshot, KEY);
+        let worktree = Worktree {
+            target: &target,
+            git: Git::find(&root).expect("git is found"),
+            pair: false,
+        };
         let handle = held_open(&loose_object(&quarantine.folder, &back));
 
         let back_of = Back {
             commit: &back,
             quarantine: &quarantine,
         };
-        let ended = refused_end(&mut attempt, &git, &back_of, "gate: the refusal's own line".to_owned(), 0);
+        let ended = refused_end(&mut attempt, &worktree, &back_of, "gate: the refusal's own line".to_owned(), 0);
 
         drop(handle);
         assert_unmoved(&ended, &root, &quarantine, &log);
@@ -2442,9 +3099,18 @@ mod tests {
         let call = call_in(&shown, &log, &state);
         let transport = Local::new(r"local:C:\gate-sync-back-tests", None).expect("a local transport");
         let mut attempt = Attempt::for_tests(&call, &transport);
-        let git = Git::find(&client).expect("git is found");
+        let snapshot = Snapshot {
+            commit: SNAPSHOT.to_owned(),
+            bridge: None,
+        };
+        let target = Target::new("app", &shown, "app", &snapshot, KEY);
+        let worktree = Worktree {
+            target: &target,
+            git: Git::find(&client).expect("git is found"),
+            pair: false,
+        };
 
-        let fetched = fetch(&mut attempt, &git, &remote, &quarantine, 0);
+        let fetched = fetch(&mut attempt, &worktree, &remote, &quarantine, 0);
 
         assert!(matches!(fetched, Ok(None)), "{fetched:?}");
         let said = std::fs::read_to_string(&log).expect("the log was written");
@@ -2469,6 +3135,796 @@ mod tests {
         std::fs::remove_dir_all(&client).expect("the client can be removed");
         std::fs::remove_file(&marker).expect("the marker can be removed");
         std::fs::remove_file(&log).expect("the log can be removed");
+    }
+
+    /// The repositories of every pair test, the main one first.
+    const PAIR: [&str; 2] = ["app", "lib"];
+    /// The ref every pair test's kept back commits live at.
+    const KEPT: &str = "refs/gate-remote/app-1a2b3c4d-back";
+    /// How a pair test's back commits are said to be kept.
+    const KEPT_PAIR: &str = "; the changes are kept: see git diff in each repo at refs/gate-remote/app-1a2b3c4d-back";
+
+    /// A pair of the test's own: a folder holding the worktrees `app` and `lib`, each with one commit, its snapshot,
+    /// that holds `a.txt` and a `.gitignore` naming `d.txt`, and the folder `builder` holding a bare repository of each,
+    /// which the local transport's push targets name; and the test's log.
+    struct PairCase {
+        folder: PathBuf,
+        roots: [String; 2],
+        snapshots: [Snapshot; 2],
+        log: PathBuf,
+    }
+
+    impl PairCase {
+        fn new(name: &str) -> PairCase {
+            let folder = std::env::temp_dir().join(format!("gate-pair-{name}-{}", std::process::id()));
+            if folder.exists() {
+                std::fs::remove_dir_all(&folder).expect("an earlier run's pair is removed");
+            }
+            std::fs::create_dir_all(folder.join("builder")).expect("the builder folder can be made");
+            let made = PAIR.map(|repo| {
+                let root = folder.join(repo);
+                std::fs::create_dir_all(&root).expect("the worktree can be made");
+                asked(&root, &[], &["init", "--quiet"]).expect("the worktree is made a repository");
+                put(&root.join("a.txt"), "a\n");
+                put(&root.join(".gitignore"), "d.txt\n");
+                asked(&root, &[], &["add", "-A"]).expect("the files are added");
+                asked(&root, &[], &[&COMMITTER[..], &["commit", "--quiet", "-m", "snapshot"]].concat()).expect("the snapshot is committed");
+                let commit = asked(&root, &[], &["rev-parse", "HEAD"]).expect("HEAD is read").trim_end().to_owned();
+                let bare = folder.join("builder").join(format!("{repo}.git"));
+                asked(&folder, &[], &["init", "--bare", "--quiet", &bare.to_string_lossy()]).expect("the bare repository is made");
+                (root.to_string_lossy().into_owned(), Snapshot { commit, bridge: None })
+            });
+            let [(app, app_snapshot), (lib, lib_snapshot)] = made;
+            PairCase {
+                log: test_log(&format!("pair-{name}")),
+                folder,
+                roots: [app, lib],
+                snapshots: [app_snapshot, lib_snapshot],
+            }
+        }
+
+        /// The worktree of the repository at `at` in the pair.
+        fn root(&self, at: usize) -> &Path {
+            Path::new(&self.roots[at])
+        }
+
+        /// Plants a back commit of the repository at `at`, its snapshot with `files` written, at the builder's
+        /// `refs/gate-back/<key>`, made in a clone so the worktree's own store lacks it: the commit.
+        fn plant(&self, at: usize, files: &[(&str, &str)]) -> String {
+            let scratch = self.folder.join(format!("scratch-{}", PAIR[at]));
+            asked(&self.folder, &[], &["clone", "--quiet", &self.roots[at], &scratch.to_string_lossy()]).expect("the worktree is cloned");
+            for (path, text) in files {
+                put(&scratch.join(path), text);
+            }
+            asked(&scratch, &[], &["add", "-A", "-f"]).expect("the back files are added");
+            asked(&scratch, &[], &[&COMMITTER[..], &["commit", "--quiet", "-m", "back"]].concat()).expect("the back commit is made");
+            let back = asked(&scratch, &[], &["rev-parse", "HEAD"]).expect("HEAD is read").trim_end().to_owned();
+            let bare = self.folder.join("builder").join(format!("{}.git", PAIR[at]));
+            let target = format!("HEAD:refs/gate-back/{KEY}");
+            asked(&scratch, &[], &["push", "--quiet", &bare.to_string_lossy(), &target]).expect("the back commit is pushed");
+            back
+        }
+
+        /// The local transport whose builder is the pair's `builder` folder.
+        fn local(&self) -> Local {
+            Local::new(&format!("local:{}", self.folder.join("builder").display()), None).expect("a local transport")
+        }
+
+        /// What `act` makes of an attempt of the pair's call through `transport`, given the console interrupt
+        /// `interrupt`.
+        fn with_attempt<R>(&self, transport: &dyn Transport, interrupt: Option<Interrupt>, act: impl FnOnce(&mut Attempt<'_, '_>) -> R) -> R {
+            let state = StateRoot::new(r"C:\gate-sync-back-tests", None);
+            let mut call = call_in(&self.roots[0], &self.log, &state);
+            call.interrupt = interrupt;
+            let mut attempt = Attempt::for_tests(&call, transport);
+            act(&mut attempt)
+        }
+
+        /// The pair's sync-back of a passing run through `transport`, the box's line naming `line`, once `tweak` has
+        /// set the attempt up.
+        fn synced_with(
+            &self,
+            line: Option<&[BackCommit]>,
+            transport: &dyn Transport,
+            tweak: impl FnOnce(&mut Attempt<'_, '_>),
+        ) -> Result<Synced, End> {
+            let targets = [0, 1].map(|at| Target::new(PAIR[at], &self.roots[at], PAIR[at], &self.snapshots[at], KEY));
+            self.with_attempt(transport, None, |attempt| {
+                tweak(attempt);
+                sync_back(attempt, &targets, line, 0)
+            })
+        }
+
+        /// The pair's sync-back of a passing run, the box's line naming `line`.
+        fn synced(&self, line: Option<&[BackCommit]>) -> Result<Synced, End> {
+            self.synced_with(line, &self.local(), |_| {})
+        }
+
+        /// The lines the sync-back said.
+        fn said(&self) -> Vec<String> {
+            std::fs::read_to_string(&self.log)
+                .map(|said| said.lines().map(str::to_owned).collect())
+                .unwrap_or_default()
+        }
+
+        /// The commit the repository at `at` keeps at the key's `-back` ref; `None` when it keeps none.
+        fn kept(&self, at: usize) -> Option<String> {
+            asked(self.root(at), &[], &["rev-parse", "--verify", "--quiet", KEPT])
+                .ok()
+                .map(|kept| kept.trim_end().to_owned())
+        }
+
+        /// The quarantine folders left in the store of the repository at `at`.
+        fn quarantines(&self, at: usize) -> usize {
+            std::fs::read_dir(self.root(at).join(".git").join("objects"))
+                .expect("the store can be listed")
+                .filter(|entry| {
+                    let entry = entry.as_ref().expect("an entry can be read");
+                    entry.file_name().to_string_lossy().starts_with("incoming-gate-")
+                })
+                .count()
+        }
+
+        fn remove(self) {
+            std::fs::remove_dir_all(&self.folder).expect("the pair can be removed");
+            if self.log.exists() {
+                std::fs::remove_file(&self.log).expect("the log can be removed");
+            }
+        }
+    }
+
+    /// The box's back commits line naming each of the pair's repositories with `commits`, in order.
+    fn line_of(commits: [Option<&str>; 2]) -> Vec<BackCommit> {
+        PAIR.iter()
+            .zip(commits)
+            .map(|(name, commit)| ((*name).to_owned(), commit.map(str::to_owned)))
+            .collect()
+    }
+
+    /// The refusal line of `case`'s repository at `at` for its back commit `back` touching `.gitmodules`.
+    fn touched_in(case: &PairCase, at: usize, back: &str) -> String {
+        format!(
+            "gate: remote changes not applied: {}: they touch .gitmodules, which a sync-back never writes; see git diff {} {}",
+            PAIR[at],
+            &case.snapshots[at].commit[..8],
+            &back[..8]
+        )
+    }
+
+    #[test]
+    fn a_pair_syncs_back_every_changed_repo_main_first() {
+        let case = PairCase::new("synced");
+        let app = case.plant(0, &[("b.txt", "b\n")]);
+        let lib = case.plant(1, &[("c.txt", "c\n"), ("e.txt", "e\n")]);
+
+        let ended = case.synced(Some(&line_of([Some(&app), Some(&lib)])));
+
+        assert!(
+            matches!(
+                &ended,
+                Ok(Synced {
+                    end: End::Status(0),
+                    reason: None
+                })
+            ),
+            "{ended:?}"
+        );
+        assert!(case.root(0).join("b.txt").exists(), "app's change is applied");
+        assert!(case.root(1).join("c.txt").exists() && case.root(1).join("e.txt").exists(), "lib's are");
+        assert_eq!(
+            case.said(),
+            [
+                "gate: synced back 1 file(s) in app: b.txt",
+                "gate: synced back 2 file(s) in lib: c.txt, e.txt"
+            ]
+        );
+        case.remove();
+    }
+
+    #[test]
+    fn a_pair_refusal_names_the_repo_and_applies_nothing() {
+        let case = PairCase::new("refused");
+        let app = case.plant(0, &[("b.txt", "b\n")]);
+        let lib = case.plant(1, &[(".gitmodules", "x\n")]);
+
+        let ended = case.synced(Some(&line_of([Some(&app), Some(&lib)])));
+
+        let not_applied = Some(super::PAIR_NOT_APPLIED);
+        assert!(
+            matches!(&ended, Ok(Synced { end: End::Status(1), reason }) if *reason == not_applied),
+            "{ended:?}"
+        );
+        assert!(!case.root(0).join("b.txt").exists(), "nothing is applied to app");
+        assert!(!case.root(1).join(".gitmodules").exists(), "nor to lib");
+        assert_eq!(
+            case.said(),
+            [
+                touched_in(&case, 1, &lib),
+                "gate: remote changes not applied to app either: a sync-back of a pair is all or nothing".to_owned()
+            ]
+        );
+        assert_eq!(case.kept(0), Some(app), "app's back commit is kept");
+        assert_eq!(case.kept(1), Some(lib), "lib's is");
+        case.remove();
+    }
+
+    #[test]
+    fn every_refused_repo_of_a_pair_is_said() {
+        let case = PairCase::new("both-refused");
+        let app = case.plant(0, &[(".gitmodules", "x\n")]);
+        let lib = case.plant(1, &[(".gitmodules", "y\n")]);
+
+        let ended = case.synced(Some(&line_of([Some(&app), Some(&lib)])));
+
+        assert!(matches!(&ended, Ok(Synced { end: End::Status(1), .. })), "{ended:?}");
+        assert_eq!(
+            case.said(),
+            [touched_in(&case, 0, &app), touched_in(&case, 1, &lib)],
+            "no repo is left untouched"
+        );
+        case.remove();
+    }
+
+    /// lib's back commit adds `d.txt`, which the worktree holds untracked and ignored: the worktree still matches its
+    /// snapshot, but the patch cannot apply.
+    #[test]
+    fn a_failed_apply_check_applies_nothing_and_keeps_every_back_commit() {
+        let case = PairCase::new("check");
+        let app = case.plant(0, &[("b.txt", "b\n")]);
+        let lib = case.plant(1, &[("d.txt", "builder\n")]);
+        put(&case.root(1).join("d.txt"), "local\n");
+
+        let ended = case.synced(Some(&line_of([Some(&app), Some(&lib)])));
+
+        let ending = format!("); nothing was applied{KEPT_PAIR}");
+        assert!(
+            matches!(&ended, Err(End::Failed(why)) if why.starts_with("git apply --check failed in lib (") && why.ends_with(&ending)),
+            "{ended:?}"
+        );
+        assert!(!case.root(0).join("b.txt").exists(), "nothing is applied to app");
+        let local = std::fs::read_to_string(case.root(1).join("d.txt")).expect("d.txt is there");
+        assert_eq!(local, "local\n", "nor to lib");
+        assert_eq!(case.kept(0), Some(app), "app's back commit is kept");
+        assert_eq!(case.kept(1), Some(lib), "lib's is");
+        case.remove();
+    }
+
+    #[test]
+    fn a_pair_without_a_back_commits_line_applies_nothing() {
+        let case = PairCase::new("no-line");
+        case.plant(0, &[("b.txt", "b\n")]);
+        case.plant(1, &[("c.txt", "c\n")]);
+
+        let ended = case.synced(None);
+
+        assert!(
+            matches!(
+                &ended,
+                Ok(Synced {
+                    end: End::Status(1),
+                    reason: Some(_)
+                })
+            ),
+            "{ended:?}"
+        );
+        assert!(
+            !case.root(0).join("b.txt").exists() && !case.root(1).join("c.txt").exists(),
+            "nothing is applied"
+        );
+        assert_eq!((case.kept(0), case.kept(1)), (None, None), "nothing is kept");
+        assert_eq!((case.quarantines(0), case.quarantines(1)), (0, 0), "nothing is fetched");
+        assert_eq!(case.said(), [UNSAID]);
+        case.remove();
+    }
+
+    #[test]
+    fn a_back_commits_line_naming_other_repos_applies_nothing() {
+        let case = PairCase::new("other-names");
+        let app = case.plant(0, &[("b.txt", "b\n")]);
+        let lib = case.plant(1, &[("c.txt", "c\n")]);
+        let entry = |name: &str, commit: &str| (name.to_owned(), Some(commit.to_owned()));
+        let lines = [
+            vec![entry("app", &app), entry("tools", &lib)],
+            vec![entry("lib", &lib), entry("app", &app)],
+            vec![entry("app", &app)],
+            vec![entry("app", &app), entry("lib", &lib), ("tools".to_owned(), None)],
+        ];
+
+        for line in lines {
+            let ended = case.synced(Some(&line));
+
+            assert!(
+                matches!(
+                    &ended,
+                    Ok(Synced {
+                        end: End::Status(1),
+                        reason: Some(_)
+                    })
+                ),
+                "{line:?}: {ended:?}"
+            );
+        }
+        assert!(
+            !case.root(0).join("b.txt").exists() && !case.root(1).join("c.txt").exists(),
+            "nothing is applied"
+        );
+        assert_eq!((case.kept(0), case.kept(1)), (None, None), "nothing is kept");
+        assert_eq!(case.said(), [UNSAID; 4]);
+        case.remove();
+    }
+
+    /// What a pair run with no usable back commits line says.
+    const UNSAID: &str = "gate: remote changes not applied: the builder did not say which commits it made";
+
+    /// The local transport, its upload-pack `pack` when there is one, the console interrupt `interrupt` raised as the
+    /// second repository's fetch is readied.
+    struct Through {
+        local: Local,
+        pack: Option<String>,
+        interrupt: Option<Interrupt>,
+        readied: std::cell::Cell<u32>,
+    }
+
+    impl Transport for Through {
+        fn root(&self) -> &str {
+            self.local.root()
+        }
+
+        fn call(&self, host: &str, line: &str, wire: Wire) -> Program {
+            self.local.call(host, line, wire)
+        }
+
+        fn push_target(&self, host: &str, repo: &str) -> Result<PushTarget, String> {
+            self.local.push_target(host, repo)
+        }
+
+        fn upload_pack(&self) -> Option<String> {
+            self.readied.set(self.readied.get() + 1);
+            if self.readied.get() == 2
+                && let Some(interrupt) = self.interrupt
+            {
+                interrupt.raise();
+            }
+            self.pack.clone()
+        }
+
+        fn box_runs_here(&self) -> bool {
+            self.local.box_runs_here()
+        }
+    }
+
+    #[test]
+    fn a_forged_back_commits_line_is_not_applied_when_the_box_fails_after_the_command() {
+        let case = PairCase::new("forged");
+        let app = case.plant(0, &[("b.txt", "b\n")]);
+        let lib = case.plant(1, &[("c.txt", "c\n")]);
+        let forged = format!("gate: remote back commits: app {app}, lib {lib}");
+        let mut kept = None;
+        // The command prints a line that looks like the box's; the box's back commits then fail, and it says so after.
+        for line in [forged.as_str(), "gate: remote back commits: failed"] {
+            super::keep_back_commits_line(&mut kept, line, true);
+        }
+        let named = kept.as_deref().and_then(super::back_commits);
+
+        let ended = case.synced(named.as_deref());
+
+        assert_eq!(named, Some(Vec::new()), "the box's failed line names no commit");
+        assert!(
+            matches!(
+                &ended,
+                Ok(Synced {
+                    end: End::Status(0),
+                    reason: None
+                })
+            ),
+            "{ended:?}"
+        );
+        assert!(
+            !case.root(0).join("b.txt").exists() && !case.root(1).join("c.txt").exists(),
+            "nothing is applied"
+        );
+        assert_eq!((case.quarantines(0), case.quarantines(1)), (0, 0), "nothing is fetched");
+        assert_eq!(case.said(), Vec::<String>::new(), "the box's own failure line says why");
+        case.remove();
+    }
+
+    /// The upload-pack the builder runs changes app's `a.txt` from its third call on, lib's `ls-remote`: after app was
+    /// fetched and checked, before any write.
+    #[test]
+    fn a_worktree_changed_after_its_first_check_is_refused_before_any_write() {
+        let case = PairCase::new("rechecked");
+        let app = case.plant(0, &[("b.txt", "b\n")]);
+        let lib = case.plant(1, &[("c.txt", "c\n")]);
+        let count = case.folder.join("calls").to_string_lossy().replace('\\', "/");
+        let changed = case.root(0).join("a.txt").to_string_lossy().replace('\\', "/");
+        let pack = format!(
+            "f() {{ echo x >> '{count}'; if [ $(wc -l < '{count}') -ge 3 ]; then echo changed > '{changed}'; fi; git-upload-pack \"$@\"; }}; f"
+        );
+        let through = Through {
+            local: case.local(),
+            pack: Some(pack),
+            interrupt: None,
+            readied: std::cell::Cell::new(0),
+        };
+
+        let ended = case.synced_with(Some(&line_of([Some(&app), Some(&lib)])), &through, |_| {});
+
+        assert!(
+            matches!(
+                &ended,
+                Ok(Synced {
+                    end: End::Status(1),
+                    reason: Some(_)
+                })
+            ),
+            "{ended:?}"
+        );
+        assert!(
+            !case.root(0).join("b.txt").exists() && !case.root(1).join("c.txt").exists(),
+            "nothing is written"
+        );
+        let refused = format!(
+            "gate: remote changes not applied: app: the worktree changed during the run; see git diff {} {}",
+            &case.snapshots[0].commit[..8],
+            &app[..8]
+        );
+        assert_eq!(
+            case.said(),
+            [
+                refused,
+                "gate: remote changes not applied to lib either: a sync-back of a pair is all or nothing".to_owned()
+            ]
+        );
+        assert_eq!((case.kept(0), case.kept(1)), (Some(app), Some(lib)), "both back commits are kept");
+        case.remove();
+    }
+
+    /// A patch held open, as a scanner holds a file it reads, cannot be removed: that is said, and nothing else.
+    #[test]
+    fn a_patch_left_after_a_successful_pair_apply_is_only_said() {
+        let case = PairCase::new("patch-left");
+        let patch = case.folder.join("gate-remote-1-0123.patch");
+        put(&patch, "applied\n");
+        let handle = held_open(&patch);
+
+        case.with_attempt(&case.local(), None, |attempt| super::removed_or_said(attempt, &patch));
+
+        drop(handle);
+        let said = case.said();
+        assert!(said.len() == 1 && said[0].starts_with("gate: cannot remove "), "{said:?}");
+        assert!(patch.exists(), "the patch is still there");
+        case.remove();
+    }
+
+    #[test]
+    fn a_pair_missing_a_sibling_snapshot_applies_nothing() {
+        let case = PairCase::new("unmatched");
+        let root = case.roots[0].clone();
+        let run = RemoteRun {
+            host: "builder".to_owned(),
+            slots: 1,
+            root: root.clone(),
+            leaf: "app".to_owned(),
+            siblings: vec![CarriedSibling {
+                name: "lib".to_owned(),
+                root: sibling_root(&root, "lib"),
+                id: FolderId { volume: 1, file: [2; 16] },
+            }],
+            repo: "app".to_owned(),
+            key: KEY.to_owned(),
+            subfolder: String::new(),
+            pattern: "*".to_owned(),
+            words: Vec::new(),
+            fallback: Vec::new(),
+            outputs: Vec::new(),
+            dropped_no_build: false,
+            outputs_withheld: false,
+        };
+        let state = StateRoot::new(r"C:\gate-sync-back-tests", None);
+        let mut call = call_in(&root, &case.log, &state);
+        call.siblings = crate::remote::carried(&run).expect("the sibling is carried");
+        let transport = case.local();
+        let mut attempt = Attempt::for_tests(&call, &transport);
+
+        let targets = super::targets(&call, &case.snapshots[0], &[]);
+        let ended = super::unmatched(&mut attempt, 0);
+
+        assert!(targets.is_none(), "no target is made of a pair missing a sibling's snapshot");
+        assert!(
+            matches!(
+                &ended,
+                Synced {
+                    end: End::Status(1),
+                    reason: Some(_)
+                }
+            ),
+            "{ended:?}"
+        );
+        assert_eq!(
+            case.said(),
+            ["gate: remote changes not applied: the run's sibling snapshots do not match its siblings"]
+        );
+        case.remove();
+    }
+
+    #[test]
+    fn an_unadvertised_back_commit_names_its_repo_and_reason() {
+        let case = PairCase::new("unadvertised");
+        let app = case.plant(0, &[("b.txt", "b\n")]);
+
+        // lib's bare repository holds no back ref, whatever the line names.
+        let ended = case.synced(Some(&line_of([Some(&app), Some(&app)])));
+
+        assert!(matches!(&ended, Ok(Synced { end: End::Status(1), .. })), "{ended:?}");
+        assert!(!case.root(0).join("b.txt").exists(), "nothing is applied to app");
+        assert_eq!(
+            case.said(),
+            [
+                format!(
+                    "gate: remote changes not applied: lib: the builder does not have the commit it named ({})",
+                    &app[..8]
+                ),
+                "gate: remote changes not applied to app either: a sync-back of a pair is all or nothing".to_owned()
+            ]
+        );
+        case.remove();
+    }
+
+    #[test]
+    fn a_pair_fetch_stopped_at_its_cap_names_its_repo() {
+        let case = PairCase::new("fetch-cap");
+        let app = case.plant(0, &[("b.txt", "b\n")]);
+        let lib = case.plant(1, &[("c.txt", "c\n")]);
+
+        let ended = case.synced_with(Some(&line_of([Some(&app), Some(&lib)])), &case.local(), |attempt| attempt.fetch_cap = 1);
+
+        assert!(matches!(&ended, Ok(Synced { end: End::Status(1), .. })), "{ended:?}");
+        let said = case.said();
+        for (at, repo) in PAIR.iter().enumerate() {
+            let named = format!("gate: remote sync-back stopped: {repo}: the fetch wrote more than ");
+            assert!(said.get(at).is_some_and(|line| line.starts_with(&named)), "{said:?}");
+        }
+        assert!(
+            !case.root(0).join("b.txt").exists() && !case.root(1).join("c.txt").exists(),
+            "nothing is applied"
+        );
+        case.remove();
+    }
+
+    /// `--test-remote-interrupt-at apply` raises the interrupt once both patches were written and checked, just before
+    /// the first apply: the check before the writes is all that stops them.
+    #[test]
+    fn an_interrupt_before_the_writes_applies_nothing() {
+        let case = PairCase::new("interrupt-apply");
+        let app = case.plant(0, &[("b.txt", "b\n")]);
+        let lib = case.plant(1, &[("c.txt", "c\n")]);
+        let interrupt = Interrupt::install().expect("the console handler is installed");
+        let targets = [0, 1].map(|at| Target::new(PAIR[at], &case.roots[at], PAIR[at], &case.snapshots[at], KEY));
+        let line = line_of([Some(&app), Some(&lib)]);
+        let transport = case.local();
+
+        let ended = case.with_attempt(&transport, Some(interrupt), |attempt| {
+            attempt.interrupt_at = Some("apply");
+            sync_back(attempt, &targets, Some(&line), 0)
+        });
+
+        assert!(matches!(&ended, Err(End::Interrupted)), "{ended:?}");
+        assert!(
+            !case.root(0).join("b.txt").exists() && !case.root(1).join("c.txt").exists(),
+            "nothing is applied in either repo"
+        );
+        assert_eq!((case.kept(0), case.kept(1)), (Some(app), Some(lib)), "both back commits are kept");
+        assert_eq!(
+            case.said(),
+            [format!(
+                "gate: the run was interrupted; the changes are kept: see git diff in each repo at {KEPT}"
+            )]
+        );
+        case.remove();
+    }
+
+    /// The interrupt is raised as lib's fetch is readied, after app's back commit was taken and before any write.
+    #[test]
+    fn an_interrupt_in_the_first_phase_keeps_what_was_taken_and_applies_nothing() {
+        let case = PairCase::new("interrupt");
+        let app = case.plant(0, &[("b.txt", "b\n")]);
+        let lib = case.plant(1, &[("c.txt", "c\n")]);
+        let interrupt = Interrupt::install().expect("the console handler is installed");
+        let through = Through {
+            local: case.local(),
+            pack: None,
+            interrupt: Some(interrupt),
+            readied: std::cell::Cell::new(0),
+        };
+        let targets = [0, 1].map(|at| Target::new(PAIR[at], &case.roots[at], PAIR[at], &case.snapshots[at], KEY));
+        let line = line_of([Some(&app), Some(&lib)]);
+
+        let ended = case.with_attempt(&through, Some(interrupt), |attempt| sync_back(attempt, &targets, Some(&line), 0));
+
+        assert!(matches!(&ended, Err(End::Interrupted)), "{ended:?}");
+        assert!(
+            !case.root(0).join("b.txt").exists() && !case.root(1).join("c.txt").exists(),
+            "nothing is applied"
+        );
+        assert_eq!(case.kept(0), Some(app), "app's taken back commit is kept");
+        assert_eq!(
+            case.said(),
+            [format!(
+                "gate: the run was interrupted; the changes are kept: see git diff in each repo at {KEPT}"
+            )]
+        );
+        case.remove();
+    }
+
+    /// The lock of the worktree at `at` in `case`'s pair, held by another run until the sender it hands back is sent to.
+    fn locked_elsewhere(case: &PairCase, at: usize) -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>) {
+        let state = StateRoot::new(r"C:\gate-sync-back-tests", None);
+        let (_, lock) = crate::remote::worktree_lock::lock_of(&state, &case.roots[at]).expect("the worktree's id is read");
+        crate::remote::worktree_lock::tests::held_elsewhere(&lock)
+    }
+
+    /// What a sync-back whose worktree `app`'s lock another run holds says before it gives up.
+    const APP_WAITED: &str = "gate: remote waiting for the worktree app: another run holds it";
+
+    #[test]
+    fn a_single_sync_back_whose_worktree_lock_is_held_elsewhere_fetches_nothing() {
+        let case = PairCase::new("single-locked");
+        let app = case.plant(0, &[("b.txt", "b\n")]);
+        let target = Target::new(PAIR[0], &case.roots[0], PAIR[0], &case.snapshots[0], KEY);
+        let transport = case.local();
+        let (release, holder) = locked_elsewhere(&case, 0);
+
+        let ended = case.with_attempt(&transport, None, |attempt| {
+            attempt.lock_wait = Duration::ZERO;
+            sync_back(attempt, &[target], None, 0)
+        });
+
+        release.send(()).expect("the other run is still there");
+        holder.join().expect("the other run ends");
+        assert!(
+            matches!(&ended, Err(End::Failed(why)) if why == "another run held the worktree app for more than 0 s"),
+            "{ended:?}"
+        );
+        assert!(!case.root(0).join("b.txt").exists(), "nothing is applied");
+        assert!(
+            asked(case.root(0), &[], &["cat-file", "-e", &app]).is_err(),
+            "nothing is fetched: the worktree's store lacks the back commit"
+        );
+        // A fetch writes FETCH_HEAD even when its objects go only into a quarantine that is then removed.
+        assert!(!case.root(0).join(".git").join("FETCH_HEAD").exists(), "no fetch ran");
+        assert_eq!(case.said(), [APP_WAITED]);
+        case.remove();
+    }
+
+    #[test]
+    fn a_pair_waits_only_for_the_locks_of_repos_with_a_back_commit() {
+        let case = PairCase::new("pair-locked");
+        let app = case.plant(0, &[("b.txt", "b\n")]);
+        case.plant(1, &[("c.txt", "c\n")]);
+        let line = line_of([Some(&app), None]);
+        let no_wait = |attempt: &mut Attempt<'_, '_>| attempt.lock_wait = Duration::ZERO;
+
+        let (release, holder) = locked_elsewhere(&case, 0);
+        let app_held = case.synced_with(Some(&line), &case.local(), no_wait);
+        release.send(()).expect("the other run is still there");
+        holder.join().expect("the other run ends");
+        let (release, holder) = locked_elsewhere(&case, 1);
+        let lib_held = case.synced_with(Some(&line), &case.local(), no_wait);
+        release.send(()).expect("the other run is still there");
+        holder.join().expect("the other run ends");
+
+        assert!(
+            matches!(&app_held, Err(End::Failed(why)) if why == "another run held the worktree app for more than 0 s"),
+            "{app_held:?}"
+        );
+        assert!(
+            matches!(
+                &lib_held,
+                Ok(Synced {
+                    end: End::Status(0),
+                    reason: None
+                })
+            ),
+            "lib's back commit is none, so its held lock is not waited for: {lib_held:?}"
+        );
+        assert!(case.root(0).join("b.txt").exists(), "app's change is applied once its lock is free");
+        assert!(!case.root(1).join("c.txt").exists(), "lib's advertised ref is not fetched");
+        assert_eq!(case.quarantines(1), 0);
+        assert_eq!(case.said(), [APP_WAITED, "gate: synced back 1 file(s) in app: b.txt"]);
+        case.remove();
+    }
+
+    #[test]
+    fn a_ref_the_line_calls_none_is_ignored() {
+        let case = PairCase::new("none");
+        let app = case.plant(0, &[("b.txt", "b\n")]);
+        case.plant(1, &[("c.txt", "c\n")]);
+
+        let ended = case.synced(Some(&line_of([Some(&app), None])));
+
+        assert!(
+            matches!(
+                &ended,
+                Ok(Synced {
+                    end: End::Status(0),
+                    reason: None
+                })
+            ),
+            "{ended:?}"
+        );
+        assert!(case.root(0).join("b.txt").exists(), "app's change is applied");
+        assert!(!case.root(1).join("c.txt").exists(), "lib's advertised ref is not fetched");
+        assert_eq!(case.quarantines(1), 0);
+        assert_eq!(case.said(), ["gate: synced back 1 file(s) in app: b.txt"]);
+        case.remove();
+    }
+
+    /// lib's `a.txt` is held open without delete sharing, as a scanner holds it: reading it, as the check does, works,
+    /// but the apply cannot replace it.
+    #[test]
+    fn a_write_failing_after_the_check_names_applied_and_not_applied() {
+        let case = PairCase::new("write");
+        let app = case.plant(0, &[("b.txt", "b\n")]);
+        let lib = case.plant(1, &[("a.txt", "changed\n")]);
+        let handle = held_open(&case.root(1).join("a.txt"));
+
+        let ended = case.synced(Some(&line_of([Some(&app), Some(&lib)])));
+
+        drop(handle);
+        let ending = format!("); applied: app; not applied: lib{KEPT_PAIR}");
+        assert!(
+            matches!(&ended, Err(End::Failed(why)) if why.starts_with("git apply failed in lib (") && why.ends_with(&ending)),
+            "{ended:?}"
+        );
+        assert!(case.root(0).join("b.txt").exists(), "app's change was applied");
+        let unchanged = std::fs::read_to_string(case.root(1).join("a.txt")).expect("a.txt is there");
+        assert_eq!(unchanged, "a\n", "lib's was not");
+        assert_eq!(case.kept(0), Some(app), "app's back commit is kept");
+        assert_eq!(case.kept(1), Some(lib), "lib's is");
+        assert!(!case.said().iter().any(|line| line.contains("synced back")), "{:?}", case.said());
+        case.remove();
+    }
+
+    /// Each repository's fetch writes into a quarantine of its own in its own store: each back commit is in its own
+    /// repository's store once applied, and no quarantine is left in either.
+    #[test]
+    fn each_repo_of_a_pair_gets_its_own_quarantine_and_all_are_removed() {
+        let case = PairCase::new("quarantines");
+        let app = case.plant(0, &[("b.txt", "b\n")]);
+        let lib = case.plant(1, &[("c.txt", "c\n")]);
+
+        let ended = case.synced(Some(&line_of([Some(&app), Some(&lib)])));
+
+        assert!(matches!(&ended, Ok(Synced { end: End::Status(0), .. })), "{ended:?}");
+        for (at, back) in [(0, &app), (1, &lib)] {
+            assert_eq!(
+                asked(case.root(at), &[], &["cat-file", "-e", back]),
+                Ok(String::new()),
+                "{}'s store holds {back}",
+                PAIR[at]
+            );
+            assert_eq!(case.quarantines(at), 0, "no quarantine is left in {}", PAIR[at]);
+        }
+        assert!(
+            asked(case.root(0), &[], &["cat-file", "-e", &lib]).is_err(),
+            "lib's commit never reached app's store"
+        );
+        case.remove();
+    }
+
+    #[test]
+    fn the_sweep_reads_a_quarantine_with_a_repo_suffix() {
+        let suffixed = format!("incoming-gate-4242-1760000000123-{NONCE}-1");
+        assert_eq!(incoming_owner(&suffixed), Some((4242, 1_760_000_000_123)));
+        let objects = store("suffix");
+        let folder = objects.join(&suffixed);
+        std::fs::create_dir(&folder).expect("the leftover can be made");
+
+        let said = swept(&objects, SystemTime::now(), |_, _| slots::Liveness::Gone);
+
+        assert_eq!(said, Vec::<String>::new());
+        assert!(!folder.exists(), "the leftover of a gate that ended is swept");
+        std::fs::remove_dir_all(&objects).expect("the test's store can be removed");
     }
 
     /// Every attribute of a path not given: what `git check-attr` says of a path no attribute file names.

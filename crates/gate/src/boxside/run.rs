@@ -33,8 +33,8 @@ use crate::boxside::ceiling::{Ceiling, KILLED, Spec};
 use crate::boxside::forward::{DRAIN, Forwarders, OutputLock};
 use crate::boxside::heartbeat;
 use crate::boxside::outputs::{self, Asked};
-use crate::boxside::payload::{Payload, escaped, ordinal_upper};
-use crate::boxside::preflight::{Failed, GIT_REDIRECTS, Git, GitFailure, exit_code, git_failed};
+use crate::boxside::payload::{Payload, bare_stem, escaped, ordinal_upper};
+use crate::boxside::preflight::{self, Failed, GIT_REDIRECTS, Git, GitFailure, Unready, exit_code, git_failed};
 use crate::boxside::stop::{Ending, STOPPED, stop_event_name, terminate_and_wait};
 use crate::boxside::tools;
 use crate::console::Console;
@@ -53,6 +53,9 @@ pub(super) const FAILED_STATUS: u32 = 1;
 const NOT_STARTED: u32 = 127;
 /// The status of a run whose client closed the connection: the box stopped the job and exits as a lost connection does.
 const CLOSED_STATUS: u32 = 255;
+
+/// The git step that deletes a repo's back ref ([`WorkGit::clear_back_ref`]).
+const BACK_REF_RESET: &str = "back ref reset";
 /// How long one wait for a watched process's exit lasts before the box looks again whether the client is still there
 /// and, for the restore, whether a stop came.
 const WAIT_STEP: Duration = Duration::from_millis(100);
@@ -70,6 +73,17 @@ pub(super) const LOCK_VIOLATION: i32 = 33;
 const ERROR_ACCESS_DENIED: u32 = 5;
 /// `FILE_FLAG_OPEN_REPARSE_POINT`: opens a link or junction itself, never its target.
 pub(super) const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+/// `FILE_FLAG_BACKUP_SEMANTICS`: lets a folder be opened.
+const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+/// `FILE_SHARE_READ | FILE_SHARE_WRITE`: the work folder is held sharing everything but deletion, so it cannot be
+/// removed, renamed or replaced while held.
+const SHARE_READ_WRITE: u32 = 0x1 | 0x2;
+/// What the work folder's layout record, `{Work}.layout`, says while its children are being cleared: a record that
+/// still says it when a run reads it is of a clear that did not finish, which clears again.
+const LAYOUT_CHANGING: &str = "changing";
+/// What the layout record says of a run of one repo's layout, checked out in the work folder itself; no record says the
+/// same.
+pub(super) const LAYOUT_SINGLE: &str = "single";
 /// The identity variables the payload may set for the back commit.
 const IDENTITY_NAMES: [&str; 6] = [
     "GIT_AUTHOR_NAME",
@@ -80,11 +94,14 @@ const IDENTITY_NAMES: [&str; 6] = [
     "GIT_COMMITTER_DATE",
 ];
 
-/// What a run reads of its payload.
+/// What a run reads of its payload. `work` is the work folder, which the lock, the index and the tools record sit beside;
+/// it is the main repo's tree on a run of one repo, and holds the tree of each repo of a sibling pair.
 pub(super) struct Request<'a> {
     pub(super) key: &'a str,
-    snapshot: &'a str,
-    bare: &'a str,
+    /// The main repo, checked out in the work folder, or in `{work}\{leaf}` on a pair run.
+    main: Repo<'a>,
+    /// Each sibling of a pair run, in the payload's order, checked out in `{work}\{name}`; none on a run of one repo.
+    siblings: Vec<Repo<'a>>,
     pub(super) work: &'a str,
     lock: &'a str,
     index: &'a str,
@@ -110,22 +127,115 @@ impl Request<'_> {
         let (globs, full) = (payload.output_globs()?, payload.outputs_full()?);
         let nonce = payload.nonce()?;
         let outputs = Asked::new(&globs, full, key, nonce, payload.output_folder(work)?)?;
+        let (timeout, host) = (payload.timeout()?, payload.optional_text("Host")?);
+        let bare = payload.path("Bare")?;
+        let lock = payload.beside_work("Lock", work, "lock")?;
+        let index = payload.beside_work("Index", work, "index")?;
+        let job = payload.job(key)?;
+        let command = payload.words("Command")?;
+        let subfolder = payload.optional_text("Subfolder")?;
+        let identity = identity(payload)?;
+        // Last, so a payload a run of one repo refuses is refused with the same line whatever its Pair says.
+        let (main, siblings) = repos(payload, work, bare, snapshot)?;
         Ok(Request {
+            key,
+            main,
+            siblings,
+            work,
+            lock,
+            index,
+            job,
+            command,
+            subfolder,
+            identity,
             outputs,
             nonce,
-            timeout: payload.timeout()?,
-            host: payload.optional_text("Host")?,
-            key,
-            snapshot,
-            bare: payload.path("Bare")?,
-            work,
-            lock: payload.beside_work("Lock", work, "lock")?,
-            index: payload.beside_work("Index", work, "index")?,
-            job: payload.job(key)?,
-            command: payload.words("Command")?,
-            subfolder: payload.optional_text("Subfolder")?,
-            identity: identity(payload)?,
+            timeout,
+            host,
         })
+    }
+
+    /// The main repo's tree, which the command's subfolder, the tool manifests and the outputs are read in.
+    pub(super) fn tree(&self) -> &str {
+        &self.main.tree
+    }
+
+    /// Every repo of the run, the main one first.
+    fn repos(&self) -> impl Iterator<Item = &Repo<'_>> {
+        std::iter::once(&self.main).chain(&self.siblings)
+    }
+
+    /// The layout the run lays the work folder out in, as its record says it: [`LAYOUT_SINGLE`] for a run of one repo,
+    /// else `pair` followed by the leaf, then each sibling's name sorted without regard to ASCII case, one space before
+    /// each, so the same siblings named in another order are the same layout.
+    fn layout(&self) -> String {
+        let Some(leaf) = self.main.name.as_deref() else {
+            return LAYOUT_SINGLE.to_owned();
+        };
+        let mut siblings: Vec<&str> = self.siblings.iter().filter_map(|repo| repo.name.as_deref()).collect();
+        siblings.sort_by_key(|name| name.to_ascii_lowercase());
+        format!("pair {leaf} {}", siblings.join(" "))
+    }
+
+    /// The main repo's name as routing names it: the stem of its bare repository, `{name}.git` ([`bare_stem`]), or the
+    /// bare repository's whole file name when it is not of that form.
+    fn repo_name(&self) -> &str {
+        let bare = self.main.bare.as_str();
+        let (folder, file) = bare.rsplit_once(['\\', '/']).unwrap_or(("", bare));
+        bare_stem(bare, folder).unwrap_or(file)
+    }
+}
+
+/// The main repo and the siblings of a run in the work folder `work`: with no `Pair`, the one repo of `bare` checked out
+/// at `snapshot` in `work` itself; with one, the main repo in `{work}\{leaf}` and each sibling in `{work}\{name}` with
+/// its own bare repository and its commit from `SiblingSnapshots`. Else the usage line.
+fn repos<'a>(payload: &'a Payload, work: &str, bare: &str, snapshot: &'a str) -> Result<(Repo<'a>, Vec<Repo<'a>>), String> {
+    let Some(pair) = payload.pair()? else {
+        return Ok((Repo::new(None, work.to_owned(), bare, snapshot), Vec::new()));
+    };
+    let commits = payload.sibling_snapshots(&pair)?;
+    let main = Repo::new(Some(pair.leaf()), format!(r"{work}\{}", pair.leaf()), bare, snapshot);
+    let siblings = pair
+        .siblings()
+        .iter()
+        .zip(commits)
+        .map(|(sibling, commit)| Repo::new(Some(sibling.name()), format!(r"{work}\{}", sibling.name()), sibling.bare(), commit))
+        .collect();
+    Ok((main, siblings))
+}
+
+/// One repo of a run, made once as the payload is read: its name on a pair run, its tree, the bare repository its
+/// snapshot is fetched from and its back commit pushed to, and the commit checked out. Every git call in its tree names
+/// the tree's own `.git` and the tree ([`Repo::at`]), so no `core.worktree` and no repository above it is followed.
+struct Repo<'a> {
+    name: Option<String>,
+    tree: String,
+    bare: String,
+    snapshot: &'a str,
+    git_dir: String,
+    work_tree: String,
+}
+
+impl<'a> Repo<'a> {
+    fn new(name: Option<&str>, tree: String, bare: &str, snapshot: &'a str) -> Repo<'a> {
+        Repo {
+            name: name.map(str::to_owned),
+            git_dir: format!(r"--git-dir={tree}\.git"),
+            work_tree: format!("--work-tree={tree}"),
+            tree,
+            bare: bare.to_owned(),
+            snapshot,
+        }
+    }
+
+    /// The options that point git at this repo's tree.
+    fn at(&self) -> [&str; 2] {
+        [&self.git_dir, &self.work_tree]
+    }
+
+    /// The step `step` as its lines name it ([`preflight::named_step`]).
+    fn step(&self, step: &str) -> String {
+        preflight::named_step(step, self.name.as_deref())
     }
 }
 
@@ -147,10 +257,10 @@ fn identity(payload: &Payload) -> Result<Vec<(String, String)>, String> {
 }
 
 /// Runs the payload's command in its work folder and returns the status: the command's own whole 32-bit code, 127
-/// when it could not be started, 75 when another run holds the work folder or its dotnet tools could not be restored,
-/// 2 for a payload or a word refused, a failing git step's status, 1 when the box failed, the tree of a passed command
-/// could not be committed back or a passed command's outputs are not brought back, or 255 when the client closed the
-/// connection and the box stopped the job.
+/// when it could not be started, 75 when another run holds the work folder, it could not be laid out for the run's
+/// repos or its dotnet tools could not be restored, 2 for a payload or a word refused, a failing git step's status, 1
+/// when the box failed, the tree of a passed command could not be committed back or a passed command's outputs are not
+/// brought back, or 255 when the client closed the connection and the box stopped the job.
 /// Once the subfolder is checked, a heartbeat goes to stderr every period, 5 s unless `seams` set it, until the run
 /// ends; `seams` may also make the command's console fail, or park its launch.
 pub(crate) fn run(payload: &Payload, seams: &BoxSeams, console: &mut Console) -> u32 {
@@ -172,6 +282,7 @@ pub(crate) fn run(payload: &Payload, seams: &BoxSeams, console: &mut Console) ->
         }
         Err(line) => {
             console.err(&line);
+            no_back_commits(&request, console);
             return FAILED_STATUS;
         }
     };
@@ -179,7 +290,10 @@ pub(crate) fn run(payload: &Payload, seams: &BoxSeams, console: &mut Console) ->
     // checkout, is kept for the look just before the job is created.
     let stop = match create_stop_event(request.job, console) {
         Ok(stop) => stop,
-        Err(status) => return status,
+        Err(status) => {
+            no_back_commits(&request, console);
+            return status;
+        }
     };
     match in_work_folder(&request, &stop, seams, console) {
         Ok(status) | Err(status) => status,
@@ -343,14 +457,23 @@ impl<'a> RunOutputs<'a> {
 fn in_work_folder(request: &Request<'_>, stop: &NamedEvent, seams: &BoxSeams, console: &mut Console) -> Result<u32, u32> {
     let lock = OutputLock::default();
     let git = WorkGit::ready(request, &lock);
+    git.clear_back_refs(request, console).map_err(|failed| {
+        let status = said(console, &failed);
+        no_back_commits(request, console);
+        status
+    })?;
     // Refused before the checkout, so a payload naming a folder outside the work folder changes nothing there; the
     // earlier run's back ref goes, as the checkout's would, so the client finds none to fetch.
-    let Some((work, place)) = work_and_place(request.work, request.subfolder) else {
+    let Some((work, place)) = work_and_place(request.tree(), request.subfolder) else {
         console.err(&format!(
             "gate: remote subfolder {} is not a folder inside the work folder",
             escaped(request.subfolder)
         ));
-        git.clear_back_ref(request, console).map_err(|failed| said(console, &failed))?;
+        if request.siblings.is_empty() {
+            git.clear_back_ref(request, &request.main, console)
+                .map_err(|failed| said(console, &failed))?;
+        }
+        no_back_commits(request, console);
         return Err(u32::from(USAGE_STATUS));
     };
     // A heartbeat that cannot start ends the heartbeats, never the run.
@@ -388,26 +511,23 @@ fn checked_out(
     mut outputs: Option<&mut RunOutputs<'_>>,
     console: &mut Console,
 ) -> Result<u32, u32> {
-    git.checkout(request, console).map_err(|failed| said(console, &failed))?;
-    if !folders.place.is_dir() {
-        console.err(&format!(
-            "gate: remote subfolder {} does not exist in the snapshot",
-            escaped(request.subfolder)
-        ));
-        return Err(u32::from(USAGE_STATUS));
-    }
-    tools::update(request, folders.work, folders.place, beat, console)?;
+    ready(request, git, folders, beat, console)?;
     if let Some(outputs) = outputs.as_deref_mut() {
         outputs.list(folders.work, beat, console);
     }
-    let status = match command(request, folders.place, beat, console)? {
+    let ran = command(request, folders.place, beat, console).inspect_err(|_| back_commits_failed(request, beat, console))?;
+    let status = match ran {
         Ran::Exited(status) => status,
         // The PC applies nothing of a run the box killed, and a process its kill could not end may still be writing.
-        Ran::Killed => return Ok(KILLED),
+        Ran::Killed => {
+            back_commits_failed(request, beat, console);
+            return Ok(KILLED);
+        }
     };
     let commit = match git.back_commit(request, console) {
         Ok(commit) => commit,
         Err(failed) => {
+            back_commits_failed(request, beat, console);
             let message = failed.or_end(console)?;
             console.err(&format!("gate: remote sync-back failed: {message}"));
             return Ok(if status == 0 { FAILED_STATUS } else { status });
@@ -423,6 +543,43 @@ fn checked_out(
     }
 }
 
+/// The run up to its command: the snapshot laid out and checked out, the subfolder found and the repo's dotnet tools
+/// restored; else `Err` with the status the run ends on, its lines said. A refusal is said as such; any other end is
+/// followed, on a pair run, by the box's `gate: remote back commits: failed` line ([`ended_before`]).
+fn ready(request: &Request<'_>, git: &WorkGit, folders: &Folders<'_>, beat: &Beat<'_>, console: &mut Console) -> Result<(), u32> {
+    let held = match git.lay_out(request, console) {
+        Ok(held) => held,
+        Err(NotLaidOut::Failed(failed)) => return Err(ended_before(said(console, &failed), request, beat, console)),
+        Err(NotLaidOut::Refused(why)) => return Err(layout_refused(request, &why, beat, console)),
+    };
+    if let Err(failed) = git.checkout(request, console) {
+        return Err(ended_before(said(console, &failed), request, beat, console));
+    }
+    // Released before the command, which may change the work folder as it likes.
+    drop(held);
+    if !folders.place.is_dir() {
+        console.err(&format!(
+            "gate: remote subfolder {} does not exist in the snapshot",
+            escaped(request.subfolder)
+        ));
+        return Err(ended_before(u32::from(USAGE_STATUS), request, beat, console));
+    }
+    match tools::update(request, folders.work, folders.place, beat, console) {
+        // The tools' refusal, its tag said: the PC runs the command itself and syncs nothing back.
+        Err(REFUSED_STATUS) => Err(REFUSED_STATUS),
+        Err(status) => Err(ended_before(status, request, beat, console)),
+        Ok(()) => Ok(()),
+    }
+}
+
+/// A run that ended before its command with `status`, its lines said: on a pair run, the box's back commits `failed`
+/// line follows them ([`back_commits_failed`]), so a pair run the box did not refuse never ends without a back commits
+/// line. `status`.
+fn ended_before(status: u32, request: &Request<'_>, beat: &Beat<'_>, console: &mut Console) -> u32 {
+    back_commits_failed(request, beat, console);
+    status
+}
+
 /// The paths the back commit `commit` changes, which the outputs leave out, none without a commit, or why they could
 /// not be read; `Err` with the status the run ends on when the client closed the connection meanwhile, its line said.
 fn back_skip(request: &Request<'_>, git: &WorkGit, commit: Option<&str>, console: &mut Console) -> Result<Result<Vec<String>, String>, u32> {
@@ -435,10 +592,128 @@ fn back_skip(request: &Request<'_>, git: &WorkGit, commit: Option<&str>, console
     }
 }
 
+/// On a pair run, says `gate: remote back commits: failed` under the box's output lock, for a run whose back commits
+/// were not all pushed: the PC applies nothing, and a back commits line the command printed itself is no longer the
+/// last.
+fn back_commits_failed(request: &Request<'_>, beat: &Beat<'_>, console: &mut Console) {
+    let _held = beat.lock.lock().unwrap_or_else(PoisonError::into_inner);
+    no_back_commits(request, console);
+}
+
+/// On a pair run, says `gate: remote back commits: failed`, for a run that ended before its command without a refusal;
+/// the caller holds the box's output lock, or nothing else writes to the box's output yet.
+fn no_back_commits(request: &Request<'_>, console: &mut Console) {
+    if !request.siblings.is_empty() {
+        console.err("gate: remote back commits: failed");
+    }
+}
+
 /// Says the failed step's line; its status.
 fn said(console: &mut Console, failed: &Failed) -> u32 {
     console.err(&failed.line);
     failed.status
+}
+
+/// Refuses the run `layout` for `why`: its refusal tag, then the line naming the main repo and why
+/// ([`crate::remote::layout_line`]), said together under the box's output lock, so the PC runs the command itself; 75.
+fn layout_refused(request: &Request<'_>, why: &str, beat: &Beat<'_>, console: &mut Console) -> u32 {
+    let _held = beat.lock.lock().unwrap_or_else(PoisonError::into_inner);
+    console.err(&refused_line(request.nonce, Refusal::Layout));
+    console.err(&crate::remote::layout_line(request.repo_name(), &escaped(why)));
+    REFUSED_STATUS
+}
+
+/// The line a pair run says once every back commit is pushed: `gate: remote back commits: ` and, for each repo, the
+/// main one first, its name and its back commit, or `none` for a repo whose tree is unchanged, comma-separated.
+fn back_commits_line(request: &Request<'_>, commits: &[Option<String>]) -> String {
+    let named: Vec<String> = request
+        .repos()
+        .zip(commits)
+        .map(|(repo, commit)| format!("{} {}", repo.name.as_deref().unwrap_or_default(), commit.as_deref().unwrap_or("none")))
+        .collect();
+    format!("gate: remote back commits: {}", named.join(", "))
+}
+
+/// Why the work folder could not be laid out for a run ([`WorkGit::lay_out`]).
+enum NotLaidOut {
+    /// A removal or a layout step failed, for this reason: the run is refused `layout`.
+    Refused(String),
+    /// A git step readying a tree failed.
+    Failed(Failed),
+}
+
+impl From<Unready> for NotLaidOut {
+    /// A git step's failure keeps its line and status; any other step's refuses the run `layout`.
+    fn from(unready: Unready) -> NotLaidOut {
+        match unready {
+            Unready::Git(failed) => NotLaidOut::Failed(failed),
+            Unready::Folder(why) => NotLaidOut::Refused(why),
+        }
+    }
+}
+
+/// The work folder `work` opened as itself and held, sharing reading and writing but not deletion; else why it could
+/// not be: a link, a junction or anything not a folder there is refused, never followed.
+fn hold_folder(work: &str) -> Result<File, String> {
+    let folder = OpenOptions::new()
+        .read(true)
+        .share_mode(SHARE_READ_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(work)
+        .map_err(|error| format!("cannot open {work}: {error}"))?;
+    let metadata = folder.metadata().map_err(|error| format!("cannot read {work}: {error}"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(format!("{work} is a link, a junction or not a folder"));
+    }
+    Ok(folder)
+}
+
+/// Removes every child of the work folder `work`, each as itself ([`preflight::remove_entry`]); else why one could not
+/// be removed or the folder not listed.
+fn clear_work(work: &Path) -> Result<(), NotLaidOut> {
+    let unlisted = |error: io::Error| NotLaidOut::Refused(format!("cannot list {}: {error}", work.display()));
+    for entry in fs::read_dir(work).map_err(unlisted)? {
+        removed(&entry.map_err(unlisted)?.path())?;
+    }
+    Ok(())
+}
+
+/// Makes `tree` a folder of its own and its `.git`, when it has one, a folder of its own: a link, a junction or a file
+/// at either is removed as itself, never what it leads to, and the tree made again.
+fn plain_tree(tree: &str) -> Result<(), NotLaidOut> {
+    let tree = Path::new(tree);
+    if !preflight::is_real_folder(tree) {
+        removed(tree)?;
+        fs::create_dir(tree).map_err(|error| NotLaidOut::Refused(format!("cannot create {}: {error}", tree.display())))?;
+    }
+    let git_folder = tree.join(".git");
+    if !preflight::is_real_folder(&git_folder) {
+        removed(&git_folder)?;
+    }
+    Ok(())
+}
+
+/// Whether the layout record `record` names another layout than `layout`, no record naming a run of one repo's.
+fn layout_changed(record: &str, layout: &str) -> bool {
+    match tools::read_record(record) {
+        Ok(None) => layout != LAYOUT_SINGLE,
+        Ok(Some(text)) => !text.eq_ignore_ascii_case(layout),
+        // Counted as changed, so the run writes the record before any clear: one that is not a plain file cannot be
+        // written either, and refuses the run `layout` there with nothing cleared; one that can, such as one that is
+        // not UTF-8, is cleared as after a clear that did not finish.
+        Err(_) => true,
+    }
+}
+
+/// Removes `path` as itself ([`preflight::remove_entry`]); else why it could not be.
+fn removed(path: &Path) -> Result<(), NotLaidOut> {
+    preflight::remove_entry(path).map_err(|error| NotLaidOut::Refused(format!("cannot remove {}: {error}", path.display())))
+}
+
+/// Writes `layout` as the whole of the layout record `record`, as the tools record is written
+/// ([`tools::write_record_file`]); else why it could not be.
+fn write_layout(record: &str, layout: &str) -> Result<(), NotLaidOut> {
+    tools::write_record_file(record, layout).map_err(|error| NotLaidOut::Refused(format!("cannot write {record}: {error}")))
 }
 
 /// The work folder's lock: `path` opened for reading and writing, created when missing, shared with no one, never
@@ -1050,7 +1325,7 @@ fn watch(started: Started<'_, '_>, console: &mut Console) -> Result<Ran, u32> {
         }
         WaitEnd::Killed((kill, ceiling)) => killed(watched, kill, &ceiling.closed(), beat.seams, console),
         WaitEnd::ClientGone => Err(watched.client_gone(console)),
-        WaitEnd::Failed(status) => Err(status),
+        WaitEnd::Failed(status) => Err(watched.wait_failed(status, console)),
     }
 }
 
@@ -1249,6 +1524,19 @@ impl Watched<'_> {
         self.forwarders.drain(DRAIN);
         closed_connection(self.job, ending, console)
     }
+
+    /// The wait for the main process failed, its line said: the job is ended and waited for, then the readers drain
+    /// for at most [`DRAIN`], so no line of the process is forwarded after the box's next line; then what the ending
+    /// left is said. `status`, the wait's own.
+    pub(super) fn wait_failed(self, status: u32, console: &mut Console) -> u32 {
+        let ending = terminate_and_wait(self.job);
+        self.forwarders.drain(DRAIN);
+        match ending {
+            Ok(ending) => ending.say(self.job.name(), console),
+            Err(error) => console.err(&format!("gate: remote could not stop job {}: {error}", self.job.name())),
+        }
+        status
+    }
 }
 
 /// The answer to a run whose client closed the connection, its job's `ending` already decided and its readers already
@@ -1292,18 +1580,22 @@ fn not_started(console: &mut Console, word: &str, resolved: Option<&Path>, messa
     NOT_STARTED
 }
 
-/// The failure of a fetch that left the payload's snapshot out of the work folder's repository: the wrapper's line,
-/// its status 1.
-fn missing_snapshot(sha: &str) -> Failed {
-    Failed {
-        line: format!("gate: remote snapshot {sha} is not in the work folder's repository after the fetch"),
-        status: FAILED_STATUS,
-    }
+/// The failure of a fetch that left the snapshot of `repo` out of its repository: the wrapper's line on a run of one
+/// repo, and one naming the repo on a pair run; its status 1.
+fn missing_snapshot(repo: &Repo<'_>) -> Failed {
+    let sha = repo.snapshot;
+    let line = match &repo.name {
+        None => format!("gate: remote snapshot {sha} is not in the work folder's repository after the fetch"),
+        Some(name) => format!("gate: remote snapshot {sha} is not in the repository of {name} after the fetch"),
+    };
+    Failed { line, status: FAILED_STATUS }
 }
 
 /// The failure of git `step` whose forwarded output found the client gone: the run ends as it ends when the command's
-/// forwarded output finds it gone, with [`CLOSED_STATUS`], git having already ended.
+/// forwarded output finds it gone, with [`CLOSED_STATUS`], git having already ended. The line names git once, though a
+/// tree-readying step's name starts with it.
 fn client_gone(step: &str) -> Failed {
+    let step = step.strip_prefix("git ").unwrap_or(step);
     Failed {
         line: format!("gate: remote the client closed the connection during git {step}"),
         status: CLOSED_STATUS,
@@ -1325,6 +1617,23 @@ impl BackFailed {
             BackFailed::Step(message) => Ok(message),
             BackFailed::ClientGone(failed) => Err(said(console, &failed)),
         }
+    }
+}
+
+/// The run readies a tree with git as it runs every other step, under the lock it holds.
+impl preflight::TreeGit for WorkGit {
+    fn run_step(&self, step: &str, args: &[&str], console: &mut Console) -> Result<(), Failed> {
+        self.git_step(step, args, console)
+    }
+
+    /// Both of git's streams discarded, so nothing it says lands outside the box's output lock.
+    fn run_code(&self, args: &[&str]) -> Result<i32, String> {
+        self.git.code(&self.args(args), Stdio::null(), Stdio::null())
+    }
+
+    /// A [`WorkGit`] is made only once the run holds the lock ([`WorkGit::ready`]).
+    fn holds_the_lock(&self) -> bool {
+        true
     }
 }
 
@@ -1376,58 +1685,162 @@ impl WorkGit {
         all
     }
 
-    /// Runs `step` in the work folder with `args`, its output forwarded.
-    fn step(&self, step: &str, request: &Request<'_>, args: &[&str], console: &mut Console) -> Result<(), Failed> {
-        let mut all = vec!["-C", request.work];
+    /// Runs `step` in the tree of `repo` with `args`, its output forwarded, its line naming the repo on a pair run.
+    fn step(&self, step: &str, repo: &Repo<'_>, args: &[&str], console: &mut Console) -> Result<(), Failed> {
+        let mut all = repo.at().to_vec();
         all.extend_from_slice(args);
-        self.git_step(step, &all, console)
+        self.git_step(&repo.step(step), &all, console)
     }
 
-    /// The snapshot the payload names, fetched from the bare repository at `refs/gate/<key>` and checked out by that
-    /// commit over whatever the last run left, untracked files removed and ignored ones (build output) kept, and no
-    /// back commit of an earlier run left behind. The commit, never the ref's tip, is what is checked out, so a later
-    /// push of the key changes nothing this run runs. A commit the work folder's repository lacks after the fetch ends
-    /// the run with the box's own line.
+    /// Lays out the work folder for the run, before any checkout: the folder made when missing, opened as itself and
+    /// held ([`hold_folder`]); its children all removed when its layout record names another layout than the run's
+    /// ([`layout_changed`]), the record saying [`LAYOUT_CHANGING`] first ([`clear_work`]); then each repo's tree
+    /// readied ([`WorkGit::ready_trees`]) on a pair run, after a clear, or when the main tree's `.git`, `.git\objects`
+    /// or `.git\objects\info` is missing or not a folder of its own, or its `.git\config` is there and not a file of
+    /// its own, a link there leading git or the alternates file into another repository ([`preflight::git_is_plain`]);
+    /// and the run's layout recorded after a clear. A run of one repo in a work folder of that layout whose `.git` is
+    /// plain readies nothing here: the preflight readied its tree. The held folder, which the caller keeps through the
+    /// checkouts.
+    fn lay_out(&self, request: &Request<'_>, console: &mut Console) -> Result<File, NotLaidOut> {
+        let work = Path::new(request.work);
+        fs::create_dir_all(work).map_err(|error| NotLaidOut::Refused(format!("cannot create {}: {error}", request.work)))?;
+        let held = hold_folder(request.work).map_err(NotLaidOut::Refused)?;
+        let record = format!("{}.layout", request.work);
+        let layout = request.layout();
+        let changed = layout_changed(&record, &layout);
+        if changed {
+            write_layout(&record, LAYOUT_CHANGING)?;
+            clear_work(work)?;
+        }
+        if changed || !request.siblings.is_empty() || !preflight::git_is_plain(Path::new(&request.main.tree)) {
+            self.ready_trees(request, console)?;
+        }
+        if changed {
+            write_layout(&record, &layout)?;
+        }
+        Ok(held)
+    }
+
+    /// Each repo's tree and its `.git` made folders of their own ([`plain_tree`]) and readied as the preflight readies
+    /// a run of one repo's ([`preflight::ready_tree`]), under the lock, so a link at `.git\objects` or
+    /// `.git\objects\info` is replaced by a folder too.
+    fn ready_trees(&self, request: &Request<'_>, console: &mut Console) -> Result<(), NotLaidOut> {
+        for repo in request.repos() {
+            plain_tree(&repo.tree)?;
+            preflight::ready_tree(self, &repo.bare, &repo.tree, repo.name.as_deref(), console).map_err(NotLaidOut::from)?;
+        }
+        Ok(())
+    }
+
+    /// Each repo's snapshot, one repo after another, the main one first ([`WorkGit::checkout_repo`]).
     fn checkout(&self, request: &Request<'_>, console: &mut Console) -> Result<(), Failed> {
+        request.repos().try_for_each(|repo| self.checkout_repo(request, repo, console))
+    }
+
+    /// The snapshot of `repo`, fetched from its bare repository at `refs/gate/<key>` and checked out by its commit over
+    /// whatever the last run left, untracked files removed and ignored ones (build output) kept, and no back commit of
+    /// an earlier run left behind. The commit, never the ref's tip, is what is checked out, so a later push of the key
+    /// changes nothing this run runs. A commit the repo's repository lacks after the fetch ends the run with the box's
+    /// own line.
+    fn checkout_repo(&self, request: &Request<'_>, repo: &Repo<'_>, console: &mut Console) -> Result<(), Failed> {
         let refname = format!("refs/gate/{}", request.key);
-        self.step("fetch", request, &["fetch", "-q", request.bare, &refname], console)?;
-        let commit = format!("{}^{{commit}}", request.snapshot);
-        match self.quiet(request, &["cat-file", "-e", &commit]) {
+        self.step("fetch", repo, &["fetch", "-q", &repo.bare, &refname], console)?;
+        let commit = format!("{}^{{commit}}", repo.snapshot);
+        match self.quiet(repo, &["cat-file", "-e", &commit]) {
             Ok(0) => {}
-            Ok(_) => return Err(missing_snapshot(request.snapshot)),
+            Ok(_) => return Err(missing_snapshot(repo)),
             Err(message) => {
                 return Err(Failed {
-                    line: format!("gate: remote cat-file failed: {message}"),
+                    line: format!("gate: remote {} failed: {message}", repo.step("cat-file")),
                     status: FAILED_STATUS,
                 });
             }
         }
-        self.step("checkout", request, &["checkout", "-q", "--force", "--detach", request.snapshot], console)?;
-        self.step("clean", request, &["clean", "-fdq"], console)?;
-        self.clear_back_ref(request, console)
+        self.step("checkout", repo, &["checkout", "-q", "--force", "--detach", repo.snapshot], console)?;
+        self.step("clean", repo, &["clean", "-fdq"], console)?;
+        // A pair run cleared every repo's back ref as soon as it held the lock ([`WorkGit::clear_back_refs`]).
+        if request.siblings.is_empty() {
+            self.clear_back_ref(request, repo, console)?;
+        }
+        Ok(())
     }
 
-    /// git's exit code for `args` in the work folder, both of its streams discarded, as the wrapper discards
+    /// On a pair run, every repo's back ref deleted ([`WorkGit::clear_back_ref`]), so no repo keeps an earlier run's
+    /// back commit whatever step of this run fails. Nothing on a run of one repo, whose checkout deletes it.
+    fn clear_back_refs(&self, request: &Request<'_>, console: &mut Console) -> Result<(), Failed> {
+        if request.siblings.is_empty() {
+            return Ok(());
+        }
+        request.repos().try_for_each(|repo| self.clear_back_ref(request, repo, console))
+    }
+
+    /// git's exit code for `args` in the tree of `repo`, both of its streams discarded, as the wrapper discards
     /// `cat-file`'s own; else why git could not be started.
-    fn quiet(&self, request: &Request<'_>, args: &[&str]) -> Result<i32, String> {
-        let mut all = vec!["-C", request.work];
+    fn quiet(&self, repo: &Repo<'_>, args: &[&str]) -> Result<i32, String> {
+        let mut all = repo.at().to_vec();
         all.extend_from_slice(args);
         self.git.code(&self.args(&all), Stdio::null(), Stdio::null())
     }
 
-    /// Deletes `refs/gate-back/<key>` in the bare repository, an earlier run's back commit, so the client finds none
-    /// to fetch after a run that makes none.
-    fn clear_back_ref(&self, request: &Request<'_>, console: &mut Console) -> Result<(), Failed> {
-        let bare = format!("--git-dir={}", request.bare);
+    /// Deletes `refs/gate-back/<key>` in the bare repository of `repo`, an earlier run's back commit, so the client
+    /// finds none to fetch after a run that makes none.
+    fn clear_back_ref(&self, request: &Request<'_>, repo: &Repo<'_>, console: &mut Console) -> Result<(), Failed> {
+        let bare = format!("--git-dir={}", repo.bare);
         let back = format!("refs/gate-back/{}", request.key);
-        self.git_step("back ref reset", &[&bare, "update-ref", "-d", &back], console)
+        self.git_step(&repo.step(BACK_REF_RESET), &[&bare, "update-ref", "-d", &back], console)
     }
 
-    /// The tree the command left, committed on `HEAD` and pushed to `refs/gate-back/<key>` in the bare repository;
-    /// nothing when the tree is unchanged. It starts from a copy of the work folder's index, which the checkout just
-    /// refreshed, so `add -A` skips every unchanged file; a copy that cannot be removed afterwards is said and fails
-    /// nothing. The commit pushed, `None` when the tree is unchanged; else why it failed.
+    /// After a failed push, the back ref of each repo of `pushed` deleted ([`WorkGit::clear_back_ref`]), every one
+    /// tried: a failure is said under the output lock, and the first client gone during one is given back once every
+    /// ref has been tried, so the run ends on it as on any client gone ([`client_gone`]).
+    fn undo_pushes(&self, request: &Request<'_>, pushed: &[&Repo<'_>], console: &mut Console) -> Option<Failed> {
+        let mut gone = None;
+        for repo in pushed {
+            let Err(undone) = self.clear_back_ref(request, repo, console) else {
+                continue;
+            };
+            if undone.line == client_gone(&repo.step(BACK_REF_RESET)).line {
+                gone.get_or_insert(undone);
+            } else {
+                let _held = self.output.lock().unwrap_or_else(PoisonError::into_inner);
+                console.err(&undone.line);
+            }
+        }
+        gone
+    }
+
+    /// The back commit of each repo, all or none: every repo's commit made first, the main one first
+    /// ([`WorkGit::repo_back_commit`]), then each pushed ([`WorkGit::push_back`]), and a failed push deleting every
+    /// back ref this run pushed and, on a pair run, the failing repo's own ([`WorkGit::undo_pushes`]), so the PC finds
+    /// a back commit of every changed repo or of none. A pair run then says each repo's commit, or none, on one line
+    /// ([`back_commits_line`]). The main repo's commit, `None` when its tree is unchanged; else why one failed.
     fn back_commit(&self, request: &Request<'_>, console: &mut Console) -> Result<Option<String>, BackFailed> {
+        let mut commits = Vec::with_capacity(1 + request.siblings.len());
+        for repo in request.repos() {
+            commits.push(self.repo_back_commit(request, repo, console)?);
+        }
+        let mut pushed = Vec::with_capacity(commits.len());
+        for (repo, commit) in request.repos().zip(&commits) {
+            let Some(commit) = commit else { continue };
+            if let Err(failed) = self.push_back(request, repo, commit, console) {
+                // On a pair run, the failing repo's own ref too: a push that failed after its ref was updated leaves
+                // it behind. A run of one repo takes no step it did not take before.
+                if !request.siblings.is_empty() {
+                    pushed.push(repo);
+                }
+                return Err(self.undo_pushes(request, &pushed, console).map_or(failed, BackFailed::ClientGone));
+            }
+            pushed.push(repo);
+        }
+        if !request.siblings.is_empty() {
+            let _held = self.output.lock().unwrap_or_else(PoisonError::into_inner);
+            console.err(&back_commits_line(request, &commits));
+        }
+        Ok(commits.into_iter().next().flatten())
+    }
+
+    /// Pushes the back commit `commit` of `repo` to `refs/gate-back/<key>` in its bare repository; else why it failed.
+    fn push_back(&self, request: &Request<'_>, repo: &Repo<'_>, commit: &str, console: &mut Console) -> Result<(), BackFailed> {
         let program = self
             .git
             .program
@@ -1436,9 +1849,30 @@ impl WorkGit {
         let back = BackGit {
             program,
             request,
+            repo,
             work: self,
         };
-        let index = Path::new(request.work).join(".git").join("index");
+        let target = format!("{commit}:refs/gate-back/{}", request.key);
+        back.status("push", &["push", "-q", &repo.bare, &target], false, console)
+    }
+
+    /// The tree the command left in `repo`, committed on `HEAD`, unpushed; nothing when the tree is unchanged. It
+    /// starts from a copy of the repo's index, which the checkout just refreshed, so `add -A` skips every unchanged
+    /// file; a copy that cannot be removed afterwards is said and fails nothing. The run's one `Index` file is used by
+    /// each repo in turn. The commit, `None` when the tree is unchanged; else why it failed.
+    fn repo_back_commit(&self, request: &Request<'_>, repo: &Repo<'_>, console: &mut Console) -> Result<Option<String>, BackFailed> {
+        let program = self
+            .git
+            .program
+            .as_ref()
+            .map_err(|message| BackFailed::Step(format!("git cannot be started: {message}")))?;
+        let back = BackGit {
+            program,
+            request,
+            repo,
+            work: self,
+        };
+        let index = Path::new(&repo.tree).join(".git").join("index");
         fs::copy(&index, request.index)
             .map_err(|error| BackFailed::Step(format!("cannot copy {} to {}: {error}", index.display(), request.index)))?;
         let tree = back
@@ -1460,12 +1894,11 @@ impl WorkGit {
             false,
             console,
         )?;
-        let target = format!("{commit}:refs/gate-back/{}", request.key);
-        back.status("push", &["push", "-q", request.bare, &target], false, console)?;
         Ok(Some(commit))
     }
 
-    /// The `/`-separated paths the back commit `commit` changes against `HEAD`; else why they could not be read.
+    /// The `/`-separated paths the main repo's back commit `commit` changes against `HEAD`; else why they could not be
+    /// read.
     fn back_paths(&self, request: &Request<'_>, commit: &str, console: &mut Console) -> Result<Vec<String>, BackFailed> {
         let program = self
             .git
@@ -1475,16 +1908,19 @@ impl WorkGit {
         BackGit {
             program,
             request,
+            repo: &request.main,
             work: self,
         }
         .changed(commit, console)
     }
 }
 
-/// git as the back commit runs it: in the work folder as [`WorkGit`] runs it, with the payload's identity.
+/// git as the back commit runs it: in the tree of `repo` as [`WorkGit`] runs it, with the payload's identity, its
+/// steps named with the repo's name on a pair run.
 struct BackGit<'a> {
     program: &'a Path,
     request: &'a Request<'a>,
+    repo: &'a Repo<'a>,
     work: &'a WorkGit,
 }
 
@@ -1500,16 +1936,19 @@ impl BackGit<'_> {
         if copied_index {
             command.env("GIT_INDEX_FILE", self.request.index);
         }
-        command.args(self.work.args(args)).current_dir(self.request.work).stdin(Stdio::null());
+        let mut all = self.repo.at().to_vec();
+        all.extend_from_slice(args);
+        command.args(self.work.args(&all)).stdin(Stdio::null());
         command
     }
 
     /// Runs `step` to its end, its stderr, and its stdout unless `read_stdout`, forwarded ([`Git::forwarded`]); its
     /// output, else why it could not run or that the client is gone.
     fn run(&self, step: &str, args: &[&str], copied_index: bool, read_stdout: bool, console: &mut Console) -> Result<Output, BackFailed> {
+        let step = self.repo.step(step);
         Git::forwarded(self.command(args, copied_index), read_stdout, &self.work.output, console).map_err(|failure| match failure {
             GitFailure::Failed(error) => BackFailed::Step(format!("{step} failed: {error}")),
-            GitFailure::ClientGone => BackFailed::ClientGone(client_gone(step)),
+            GitFailure::ClientGone => BackFailed::ClientGone(client_gone(&step)),
         })
     }
 
@@ -1518,7 +1957,7 @@ impl BackGit<'_> {
         let output = self.run(step, args, copied_index, false, console)?;
         match exit_code(output.status) {
             0 => Ok(()),
-            code => Err(BackFailed::Step(format!("{step} failed (status {code})"))),
+            code => Err(BackFailed::Step(format!("{} failed (status {code})", self.repo.step(step)))),
         }
     }
 
@@ -1527,7 +1966,7 @@ impl BackGit<'_> {
         let output = self.run(step, args, copied_index, true, console)?;
         match exit_code(output.status) {
             0 => Ok(output.stdout),
-            code => Err(BackFailed::Step(format!("{step} failed (status {code})"))),
+            code => Err(BackFailed::Step(format!("{} failed (status {code})", self.repo.step(step)))),
         }
     }
 
@@ -1538,7 +1977,7 @@ impl BackGit<'_> {
             .lines()
             .next()
             .map(str::to_owned)
-            .ok_or_else(|| BackFailed::Step(format!("{step} printed nothing")))
+            .ok_or_else(|| BackFailed::Step(format!("{} printed nothing", self.repo.step(step))))
     }
 
     /// The `/`-separated paths `commit` changes against `HEAD`; else why they could not be read.
@@ -1556,11 +1995,23 @@ impl BackGit<'_> {
 mod tests {
     use std::io;
 
-    use super::{GIT_CONFIG_COUNT, Look, STARTING_COMMAND, before_the_job, look, with_safe_directory};
+    use super::{CLOSED_STATUS, GIT_CONFIG_COUNT, Look, STARTING_COMMAND, before_the_job, client_gone, look, with_safe_directory};
     use crate::console::Console;
     use crate::environment::Variables;
 
     const JOB: &str = r"Local\gate-job-k-0001";
+
+    #[test]
+    fn a_client_gone_line_names_its_git_step_once() {
+        let gone = |step: &str| client_gone(step).line;
+        assert_eq!(gone("git init"), "gate: remote the client closed the connection during git init");
+        assert_eq!(
+            gone("git config core.autocrlf for lib"),
+            "gate: remote the client closed the connection during git config core.autocrlf for lib"
+        );
+        assert_eq!(gone("fetch lib"), "gate: remote the client closed the connection during git fetch lib");
+        assert_eq!(client_gone("git init").status, CLOSED_STATUS);
+    }
 
     /// The box's environment with `GIT_CONFIG_COUNT` set to `count`.
     fn counted(count: &str) -> Variables {

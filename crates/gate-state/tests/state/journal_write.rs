@@ -379,6 +379,7 @@ fn a_fallback_line_names_each_reason_by_its_word() {
         (FallbackReason::Parity, "parity"),
         (FallbackReason::Rebooted, "rebooted"),
         (FallbackReason::Tools, "tools"),
+        (FallbackReason::Layout, "layout"),
         (FallbackReason::Version, "version"),
         (FallbackReason::Client, "client"),
     ];

@@ -6,6 +6,7 @@
 mod batch;
 mod boxcmd;
 mod burn;
+mod check;
 mod compat;
 mod cutover;
 mod expect;

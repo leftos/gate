@@ -4,7 +4,7 @@ use std::ffi::OsString;
 use std::iter::Peekable;
 
 use crate::problem::Problem;
-use crate::request::{BurnRequest, CutoverRequest, ExpectRequest, PushRequest, RunRequest, StopRequest};
+use crate::request::{BurnRequest, CheckRequest, CutoverRequest, ExpectRequest, PushRequest, RunRequest, StopRequest};
 use crate::run::{RunBuilder, RunOption, SwitchOption, ValueOption, next_text};
 use crate::values;
 
@@ -88,6 +88,21 @@ pub(crate) fn parse_push(words: impl Iterator<Item = OsString>) -> Result<PushRe
         }
     }
     builder.finish_push()
+}
+
+/// Reads the words after `gate check`, which takes none: every word is a problem, `--` included, save `--builder
+/// <host>` and the hidden seams of a build with the `test-seams` feature.
+pub(crate) fn parse_check(words: impl Iterator<Item = OsString>) -> Result<CheckRequest, Vec<Problem>> {
+    let mut words = words.peekable();
+    let mut builder = RunBuilder::default();
+    while let Some(text) = next_text(&mut words, &mut builder.problems) {
+        if text.starts_with('-') && text != "--" {
+            read_option(&mut builder, &mut words, &text, check_option);
+        } else {
+            builder.problems.push(Problem::UnexpectedArgument(text));
+        }
+    }
+    builder.finish_check()
 }
 
 /// Reads the words after `gate burn`: the optional `--cores <n>` and the required `--seconds <s>`.
@@ -192,6 +207,29 @@ fn push_option(name: &str) -> Option<RunOption> {
 
 #[cfg(not(feature = "test-seams"))]
 fn push_option(_name: &str) -> Option<RunOption> {
+    None
+}
+
+fn check_option(name: &str) -> Option<RunOption> {
+    match name {
+        "builder" => Some(RunOption::Value(ValueOption::Builder)),
+        _ => check_seam_option(name),
+    }
+}
+
+#[cfg(feature = "test-seams")]
+fn check_seam_option(name: &str) -> Option<RunOption> {
+    match name {
+        "test-probe-limit-ms" => Some(RunOption::Value(ValueOption::ProbeLimitMs)),
+        "test-remote-transport" => Some(RunOption::Value(ValueOption::RemoteTransport)),
+        "test-remote-ssh" => Some(RunOption::Value(ValueOption::RemoteSsh)),
+        "test-remote-timeout-ms" => Some(RunOption::Value(ValueOption::RemoteTimeoutMs)),
+        _ => None,
+    }
+}
+
+#[cfg(not(feature = "test-seams"))]
+fn check_seam_option(_name: &str) -> Option<RunOption> {
     None
 }
 

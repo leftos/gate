@@ -18,7 +18,7 @@ use flate2::read::GzDecoder;
 use serde_json::{Value, json};
 
 use crate::install::unix;
-use crate::support::{Case, FAKE_TOOL, GATE, Outcome, beside, finish, names, shown, start, version_of, write_remote_json};
+use crate::support::{Case, FAKE_TOOL, GATE, Outcome, beside, finish, junction, names, shown, start, version_of, write_remote_json};
 
 /// The suite's stand-in for ssh, which `--test-push-ssh` names.
 const FAKE_SSH: &str = env!("CARGO_BIN_EXE_fake-ssh");
@@ -446,15 +446,7 @@ fn a_linked_bin_folder_is_refused() {
     fs::create_dir_all(&elsewhere).expect("the link's target can be made");
     let bin = builder_bin(&case, HOST);
     fs::create_dir_all(bin.parent().expect("the install folder has a parent")).expect("the builder's gate folder can be made");
-    let linked = Command::new("cmd")
-        .args(["/c", "mklink", "/J"])
-        .arg(&bin)
-        .arg(&elsewhere)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .status()
-        .expect("cmd starts");
-    assert!(linked.success(), "the junction is made");
+    junction(&bin, &elsewhere);
     let steps = steps(&case, &["ok"]);
 
     let outcome = push(&case, &steps);
@@ -553,15 +545,7 @@ fn a_push_lock_that_is_a_junction_is_refused() {
     let elsewhere = case.folder().join("elsewhere");
     fs::create_dir_all(&elsewhere).expect("the link's target can be made");
     let lock = installed_gate(&case).with_file_name("push.lock");
-    let linked = Command::new("cmd")
-        .args(["/c", "mklink", "/J"])
-        .arg(&lock)
-        .arg(&elsewhere)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .status()
-        .expect("cmd starts");
-    assert!(linked.success(), "the junction is made");
+    junction(&lock, &elsewhere);
     let steps = steps(&case, &["ok"]);
 
     let outcome = push(&case, &steps);

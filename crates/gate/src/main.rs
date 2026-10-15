@@ -3,13 +3,15 @@
 //! to a builder, and runs a command under a slot in a job of its own, watched for a stall, its ceiling and the
 //! backstop, saying each line as it goes. A routed command runs on the builder through the remote client, and falls back
 //! to running here when the builder turns it away. It stops a process tree with the gates in it, moves the machine from
-//! the PowerShell gate to itself (`gate cutover`), and copies the installed exe to the builders (`gate push`). On a
+//! the PowerShell gate to itself (`gate cutover`), copies the installed exe to the builders (`gate push`), and checks
+//! what this machine lacks for the repo it is run in (`gate check`). On a
 //! builder, the hidden `gate box` answers `boot`, `preflight`, `run`, `stop`, `outputs` and `inflight`.
 
 mod acquire;
 mod answer;
 mod boxside;
 mod burn;
+mod check;
 mod console;
 mod covered;
 mod cutover;
@@ -42,6 +44,8 @@ mod run;
 mod slots;
 mod stop_tree;
 mod stopping;
+#[cfg(test)]
+mod test_support;
 mod wait;
 mod watch;
 

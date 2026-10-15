@@ -2,8 +2,10 @@
 //! whether the builder has the .NET SDK the snapshot's `global.json` pin resolves to under its rollForward policy, or,
 //! for a .NET tree with no pin, an SDK of this PC's newest major. Nothing here runs a process or reads a file: the
 //! client lists the snapshot's tree, reads its `global.json`, the builder's SDK line and this PC's SDKs, and [`need`]
-//! says what the tree needs that the builder lacks, which [`mismatch_line`] words. A further toolchain need, such as a
-//! workload, is one more need checked beside the SDK's.
+//! lists what the tree needs that the builder lacks, each a [`Need`] of its [`NeedKind`], which [`lines`] words one
+//! mismatch line each, in order. A tool the repo's `.gate/toolchain.toml` declares and the builder lacks is a need of
+//! its own kind, which [`crate::remote::toolchain::judge`] lists; a further toolchain need, such as a workload, is one
+//! more kind in that list.
 
 use std::cmp::Ordering;
 
@@ -61,7 +63,7 @@ fn is_label(label: &str) -> bool {
 }
 
 /// The number `text` spells in one or more ASCII digits; `None` when it is not one, or too large.
-fn number(text: &str) -> Option<u64> {
+pub(super) fn number(text: &str) -> Option<u64> {
     if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
         return None;
     }
@@ -248,7 +250,8 @@ pub(crate) struct Pin {
 }
 
 impl Pin {
-    /// A `global.json` the client could not read whole: it holds no readable pin, so the major rule applies.
+    /// A `global.json` that holds no readable pin, one the client could not read whole or one that names no
+    /// `sdk.version`, so the major rule applies.
     pub(crate) fn unreadable() -> Pin {
         Pin {
             found: true,
@@ -264,49 +267,90 @@ impl Pin {
 /// is skipped, only its first JSON value is read, as dotnet reads it, and any text after it is ignored; a
 /// `global.json` dotnet would ignore holds no readable pin.
 pub(crate) fn pin_of(global_json: Option<&str>) -> Pin {
-    let mut pin = Pin {
-        found: global_json.is_some(),
-        version: None,
-        roll_forward: None,
-        allow_prerelease: true,
-    };
     let Some(text) = global_json else {
-        return pin;
+        return Pin {
+            found: false,
+            version: None,
+            roll_forward: None,
+            allow_prerelease: true,
+        };
     };
-    // A text that is not the file's own bytes — a lossy read of one that is not UTF-8 holds U+FFFD — is no pin.
-    if text.contains('\u{fffd}') {
-        return pin;
+    match pin_in_text(text) {
+        PinRead::Pinned(pin) => pin,
+        PinRead::NoPin | PinRead::Unreadable(_) => Pin::unreadable(),
     }
-    let stripped = without_comments(text.trim_start_matches('\u{feff}'));
-    let mut values = serde_json::Deserializer::from_str(&stripped).into_iter::<Value>();
-    let Some(Ok(parsed)) = values.next() else {
-        return pin;
+}
+
+/// What the `global.json` whose text is `text` holds of an SDK pin.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum PinRead {
+    /// It names no `sdk.version` at all, as a file that only lists `msbuild-sdks` does: it pins no SDK, so a check
+    /// says and counts nothing of it.
+    NoPin,
+    /// It names a pin that cannot be read, and why.
+    Unreadable(String),
+    /// Its pin reads.
+    Pinned(Pin),
+}
+
+/// The pin the `global.json` whose text is `text` holds, read as [`pin_of`] reads it.
+pub(crate) fn pin_in_text(text: &str) -> PinRead {
+    let Some(parsed) = parsed(text) else {
+        return PinRead::Unreadable("does not parse as JSON".to_owned());
     };
     let Some(sdk) = member(&parsed, "sdk") else {
-        return pin;
+        return PinRead::NoPin;
     };
-    let Some(version) = member(sdk, "version")
-        .and_then(Value::as_str)
-        .filter(|version| SdkVersion::parse(version).is_some())
-    else {
-        return pin;
+    let Some(sdk) = sdk.as_object() else {
+        return PinRead::Unreadable("its sdk is not an object".to_owned());
     };
-    let roll_forward = match member(sdk, "rollForward") {
+    let Some(version) = sdk.get("version") else {
+        return PinRead::NoPin;
+    };
+    let Some(version) = version.as_str().filter(|version| SdkVersion::parse(version).is_some()) else {
+        return PinRead::Unreadable("its sdk.version is not a version dotnet reads".to_owned());
+    };
+    match sdk_options(sdk) {
+        Ok((roll_forward, allow_prerelease)) => PinRead::Pinned(Pin {
+            found: true,
+            version: Some(version.to_owned()),
+            roll_forward,
+            allow_prerelease,
+        }),
+        Err(why) => PinRead::Unreadable(why),
+    }
+}
+
+/// The `sdk.rollForward` and `sdk.allowPrerelease` of the `sdk` object; else why one of them is not what dotnet
+/// reads.
+fn sdk_options(sdk: &serde_json::Map<String, Value>) -> Result<(Option<String>, bool), String> {
+    let roll_forward = match sdk.get("rollForward") {
         None => None,
-        Some(value) => match value.as_str().filter(|policy| Roll::named(policy).is_some()) {
-            Some(policy) => Some(policy.to_owned()),
-            None => return pin,
-        },
+        Some(value) => Some(
+            value
+                .as_str()
+                .filter(|policy| Roll::named(policy).is_some())
+                .ok_or_else(|| "its sdk.rollForward is not a policy gate knows".to_owned())?
+                .to_owned(),
+        ),
     };
-    let allow_prerelease = match member(sdk, "allowPrerelease") {
+    let allow_prerelease = match sdk.get("allowPrerelease") {
         None => true,
         Some(Value::Bool(allow)) => *allow,
-        Some(_) => return pin,
+        Some(_) => return Err("its sdk.allowPrerelease is not true or false".to_owned()),
     };
-    pin.version = Some(version.to_owned());
-    pin.roll_forward = roll_forward;
-    pin.allow_prerelease = allow_prerelease;
-    pin
+    Ok((roll_forward, allow_prerelease))
+}
+
+/// The first JSON value of the `global.json` whose text is `text`, read as [`pin_of`] reads it; `None` when it does
+/// not parse. A text that is not the file's own bytes, as a lossy read of one that is not UTF-8 holding U+FFFD is,
+/// does not parse.
+fn parsed(text: &str) -> Option<Value> {
+    if text.contains('\u{fffd}') {
+        return None;
+    }
+    let stripped = without_comments(text.trim_start_matches('\u{feff}'));
+    serde_json::Deserializer::from_str(&stripped).into_iter::<Value>().next()?.ok()
 }
 
 /// The text `text` with the JSON comments dotnet reads dropped: `//` to the end of its line, its line end kept, and
@@ -393,10 +437,45 @@ pub(crate) fn newest_major<'v>(versions: impl IntoIterator<Item = &'v str>) -> u
         .unwrap_or(0)
 }
 
-/// What a snapshot with `pin` needs that a builder whose SDKs are `available` does not give; `None` when they serve it.
-/// A pin needs the SDK it resolves to: `.NET SDK <version> (rollForward <policy>)`. With no pin, the tree needs an SDK of
-/// this PC's newest major, which `local_major` reads only then: `a .NET <major> SDK`; a PC with none (0) needs nothing.
-pub(crate) fn need(pin: &Pin, available: &[String], local_major: impl FnOnce() -> u64) -> Option<String> {
+/// The version each non-empty line of a `dotnet --list-sdks` listing starts with, in listing order: the line's first
+/// word, before the `[<folder>]` dotnet writes after it.
+pub(crate) fn sdk_versions(listing: &str) -> Vec<&str> {
+    listing.lines().filter_map(|line| line.split_whitespace().next()).collect()
+}
+
+/// What a toolchain need is of.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum NeedKind {
+    /// A .NET SDK, which the builder's SDK list serves.
+    Sdk,
+    /// A tool the repo's `.gate/toolchain.toml` declares, which the builder's probe of it serves; `found` is what that
+    /// probe found: the version text it read, or `none` when it found no such tool.
+    Tool { found: String },
+}
+
+/// One thing a snapshot needs that the builder lacks.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Need {
+    /// What it is of, which decides what the builder's side of its mismatch line says.
+    pub kind: NeedKind,
+    /// The need in words, as its mismatch line says it after `needs`.
+    pub text: String,
+}
+
+/// What a snapshot with `pin` needs that a builder whose SDKs are `available` does not give, in the order the mismatch
+/// lines say them; empty when it serves them all. The SDK need is the one [`sdk_need`] words.
+pub(crate) fn need(pin: &Pin, available: &[String], local_major: impl FnOnce() -> u64) -> Vec<Need> {
+    sdk_need(pin, available, local_major)
+        .map(|text| Need { kind: NeedKind::Sdk, text })
+        .into_iter()
+        .collect()
+}
+
+/// The SDK a snapshot with `pin` needs that a builder whose SDKs are `available` does not give; `None` when they serve
+/// it. A pin needs the SDK it resolves to: `.NET SDK <version> (rollForward <policy>)`. With no pin, the tree needs an
+/// SDK of this PC's newest major, which `local_major` reads only then: `a .NET <major> SDK`; a PC with none (0) needs
+/// nothing.
+fn sdk_need(pin: &Pin, available: &[String], local_major: impl FnOnce() -> u64) -> Option<String> {
     if let Some(version) = &pin.version {
         let policy = pin.roll_forward.as_deref().unwrap_or(DEFAULT_ROLL);
         return match resolve(version, policy, pin.allow_prerelease, available) {
@@ -412,11 +491,29 @@ pub(crate) fn need(pin: &Pin, available: &[String], local_major: impl FnOnce() -
     (major != 0 && !served).then(|| format!("a .NET {major} SDK"))
 }
 
-/// The line said when the builder `host`, whose SDKs are `available`, lacks what `repo` needs: `need`, as [`need`]
-/// words it; `none` when the builder listed none.
-pub(crate) fn mismatch_line(repo: &str, need: &str, host: &str, available: &[String]) -> String {
-    let have = if available.is_empty() { "none".to_owned() } else { available.join(", ") };
-    format!("gate: remote toolchain mismatch: {repo} needs {need}; {host} has {have}")
+/// The mismatch lines said when the builder `host`, whose SDKs are `available`, lacks the `needs` of `repo`: one per
+/// need, in their order, each ending in what the builder has of that need's kind.
+pub(crate) fn lines(repo: &str, needs: &[Need], host: &str, available: &[String]) -> Vec<String> {
+    needs
+        .iter()
+        .map(|need| mismatch_line(repo, need, host, &have(&need.kind, available)))
+        .collect()
+}
+
+/// What a builder whose SDKs are `available` has of `kind`, as a mismatch line ends in it: for an SDK, its SDKs
+/// comma-separated, `none` when it listed none; for a tool, what its probe found.
+fn have(kind: &NeedKind, available: &[String]) -> String {
+    match kind {
+        NeedKind::Sdk if available.is_empty() => "none".to_owned(),
+        NeedKind::Sdk => available.join(", "),
+        NeedKind::Tool { found } => found.clone(),
+    }
+}
+
+/// The line said when the builder `host`, which has `have` of the need's kind, lacks `need` of `repo`. Before any
+/// tool's, the client says each SDK need's; the tool needs follow in the manifest's order.
+fn mismatch_line(repo: &str, need: &Need, host: &str, have: &str) -> String {
+    format!("gate: remote toolchain mismatch: {repo} needs {}; {host} has {have}", need.text)
 }
 
 #[cfg(test)]
@@ -425,10 +522,27 @@ mod tests {
     use std::cell::Cell;
     use std::cmp::Ordering;
 
-    use super::{Pin, SdkVersion, compare, is_dotnet_tree, listed, mismatch_line, need, newest_major, pin_of, resolve};
+    use super::{Need, NeedKind, Pin, SdkVersion, compare, have, is_dotnet_tree, lines, listed, mismatch_line, need, newest_major, pin_of, resolve};
 
     fn owned(texts: &[&str]) -> Vec<String> {
         texts.iter().map(|text| (*text).to_owned()).collect()
+    }
+
+    /// The text of the one SDK need in `needs`, `None` when it holds none; more than one need, or one of another kind,
+    /// fails the case.
+    fn the_sdk_need(needs: Vec<Need>) -> Option<String> {
+        assert!(
+            needs.len() <= 1 && needs.iter().all(|need| need.kind == NeedKind::Sdk),
+            "at most one SDK need: {needs:?}"
+        );
+        needs.into_iter().next().map(|need| need.text)
+    }
+
+    fn sdk(text: &str) -> Need {
+        Need {
+            kind: NeedKind::Sdk,
+            text: text.to_owned(),
+        }
     }
 
     /// The rollForward table of <https://learn.microsoft.com/dotnet/core/tools/global-json>, ported from the PowerShell
@@ -680,26 +794,47 @@ mod tests {
             10
         };
         assert_eq!(
-            need(&pinned, &owned(&["10.0.100"]), local).as_deref(),
+            the_sdk_need(need(&pinned, &owned(&["10.0.100"]), local)).as_deref(),
             Some(".NET SDK 999.0.0 (rollForward patch)"),
             "the policy defaults to patch"
         );
         assert!(!read.get(), "a pin decides alone");
         let served = pin_of(Some(r#"{ "sdk": { "version": "10.0.100", "rollForward": "latestMajor" } }"#));
-        assert_eq!(need(&served, &owned(&["10.0.100", "11.0.100"]), || 10), None);
+        assert_eq!(the_sdk_need(need(&served, &owned(&["10.0.100", "11.0.100"]), || 10)), None);
         let disabled = pin_of(Some(r#"{ "sdk": { "version": "99.0.100", "rollForward": "disable" } }"#));
-        assert_eq!(need(&disabled, &[], || 10).as_deref(), Some(".NET SDK 99.0.100 (rollForward disable)"));
+        assert_eq!(
+            the_sdk_need(need(&disabled, &[], || 10)).as_deref(),
+            Some(".NET SDK 99.0.100 (rollForward disable)")
+        );
     }
 
     #[test]
     fn a_tree_with_no_pin_needs_an_sdk_of_the_pc_s_newest_major() {
         let unpinned = pin_of(None);
-        assert_eq!(need(&unpinned, &owned(&["8.0.425", "10.0.100"]), || 10), None, "the major is there");
-        assert_eq!(need(&unpinned, &owned(&["8.0.425"]), || 10).as_deref(), Some("a .NET 10 SDK"));
-        assert_eq!(need(&unpinned, &[], || 10).as_deref(), Some("a .NET 10 SDK"), "a builder with none");
-        assert_eq!(need(&unpinned, &owned(&["8.0.425"]), || 0), None, "a PC with no SDK checks nothing");
+        assert_eq!(
+            the_sdk_need(need(&unpinned, &owned(&["8.0.425", "10.0.100"]), || 10)),
+            None,
+            "the major is there"
+        );
+        assert_eq!(
+            the_sdk_need(need(&unpinned, &owned(&["8.0.425"]), || 10)).as_deref(),
+            Some("a .NET 10 SDK")
+        );
+        assert_eq!(
+            the_sdk_need(need(&unpinned, &[], || 10)).as_deref(),
+            Some("a .NET 10 SDK"),
+            "a builder with none"
+        );
+        assert_eq!(
+            the_sdk_need(need(&unpinned, &owned(&["8.0.425"]), || 0)),
+            None,
+            "a PC with no SDK checks nothing"
+        );
         let unreadable = pin_of(Some("{ not json"));
-        assert_eq!(need(&unreadable, &owned(&["8.0.425"]), || 999).as_deref(), Some("a .NET 999 SDK"));
+        assert_eq!(
+            the_sdk_need(need(&unreadable, &owned(&["8.0.425"]), || 999)).as_deref(),
+            Some("a .NET 999 SDK")
+        );
     }
 
     #[test]
@@ -712,12 +847,59 @@ mod tests {
     #[test]
     fn the_mismatch_line_names_the_repo_its_need_the_host_and_its_sdks() {
         assert_eq!(
-            mismatch_line("app", ".NET SDK 999.0.0 (rollForward patch)", "builder", &owned(&["8.0.425", "10.0.100"])),
+            mismatch_line(
+                "app",
+                &sdk(".NET SDK 999.0.0 (rollForward patch)"),
+                "builder",
+                &have(&NeedKind::Sdk, &owned(&["8.0.425", "10.0.100"]))
+            ),
             "gate: remote toolchain mismatch: app needs .NET SDK 999.0.0 (rollForward patch); builder has 8.0.425, 10.0.100"
         );
         assert_eq!(
-            mismatch_line("app", "a .NET 10 SDK", "builder", &listed("none")),
+            mismatch_line("app", &sdk("a .NET 10 SDK"), "builder", &have(&NeedKind::Sdk, &listed("none"))),
             "gate: remote toolchain mismatch: app needs a .NET 10 SDK; builder has none"
+        );
+    }
+
+    #[test]
+    fn each_need_says_its_own_mismatch_line_in_the_order_of_the_needs() {
+        let needs = [sdk("a .NET 10 SDK"), sdk(".NET SDK 999.0.0 (rollForward patch)")];
+        assert_eq!(
+            lines("app", &needs, "builder", &owned(&["8.0.425"])),
+            [
+                "gate: remote toolchain mismatch: app needs a .NET 10 SDK; builder has 8.0.425",
+                "gate: remote toolchain mismatch: app needs .NET SDK 999.0.0 (rollForward patch); builder has 8.0.425",
+            ]
+        );
+        assert_eq!(lines("app", &[], "builder", &[]), Vec::<String>::new(), "no need says no line");
+    }
+
+    fn tool(text: &str, found: &str) -> Need {
+        Need {
+            kind: NeedKind::Tool { found: found.to_owned() },
+            text: text.to_owned(),
+        }
+    }
+
+    #[test]
+    fn a_tool_need_ends_in_what_the_builder_found_of_it_and_follows_the_sdk_needs() {
+        let needs = [
+            sdk("a .NET 10 SDK"),
+            tool("cargo-nextest 0.9.100 or later", "0.9.80"),
+            tool("node", "none"),
+        ];
+        assert_eq!(
+            lines("app", &needs, "builder", &owned(&["8.0.425"])),
+            [
+                "gate: remote toolchain mismatch: app needs a .NET 10 SDK; builder has 8.0.425",
+                "gate: remote toolchain mismatch: app needs cargo-nextest 0.9.100 or later; builder has 0.9.80",
+                "gate: remote toolchain mismatch: app needs node; builder has none",
+            ]
+        );
+        assert_eq!(
+            lines("app", &[tool("pwsh 7.5.0 or later", "7.4.1")], "builder", &[]),
+            ["gate: remote toolchain mismatch: app needs pwsh 7.5.0 or later; builder has 7.4.1"],
+            "a tool need does not read the SDK list"
         );
     }
 

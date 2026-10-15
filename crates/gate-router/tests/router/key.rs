@@ -1,7 +1,21 @@
 //! The work-folder key and the repo name. Every expected value was produced by dot-sourcing `remote.ps1` in
 //! `pwsh -NoProfile` and calling `Get-RemoteKey -Root <root>` or `Get-RemoteName <name>`.
 
-use gate_router::{repo_name, work_folder_key};
+use gate_router::{repo_name, sibling_root, work_folder_key};
+
+#[test]
+fn a_sibling_lies_beside_the_worktree_root_with_the_root_s_separator() {
+    let cases = [
+        ("X:/dev/gate.wt/gate-66", "yaat-server", "X:/dev/gate.wt/yaat-server"),
+        ("C:\\Work\\Gate", "b", "C:\\Work\\b"),
+        ("X:/dev/app/", "b", "X:/dev/b"),
+        ("X:/dev/app\\\\", "b", "X:/dev/b"),
+        ("app", "b", "/b"),
+    ];
+    for (root, name, expected) in cases {
+        assert_eq!(sibling_root(root, name), expected, "{root} {name}");
+    }
+}
 
 #[test]
 fn the_key_is_the_one_powershell_computes() {

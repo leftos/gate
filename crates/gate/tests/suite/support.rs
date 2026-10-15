@@ -30,6 +30,7 @@ usage: gate run --slot heavy|light|critical|none --timeout <seconds>|auto:<secon
        gate stop-tree <pid>
        gate cutover
        gate push
+       gate check [--builder <host>]
        gate burn [--cores <n>] --seconds <s>
        gate expect [--state-dir <path>] [--slot heavy|light|critical] -- <command> [args...]
        gate --version | --help
@@ -283,12 +284,14 @@ pub enum Closed {
     Stderr,
 }
 
-/// Starts `command` with stdin null and both output streams piped, dropping this process's read end of `closed` at
-/// once, so the program's next write to that stream fails; the other stream is gathered as [`start`] gathers it.
-pub fn start_with_closed(closed: Closed, mut command: Command) -> Running {
-    command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+/// Starts `command` with its stdin a pipe, whose write end it returns as [`start_with_stdin`] does, and both output
+/// streams piped, dropping this process's read end of `closed` at once, so the program's next write to that stream
+/// fails; the other stream is gathered as [`start`] gathers it.
+pub fn start_with_closed(closed: Closed, mut command: Command) -> (Running, ChildStdin) {
+    command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
     let stop_tree = stop_tree_of(&command);
     let mut child = command.spawn().expect("the program starts");
+    let stdin = child.stdin.take().expect("stdin is piped");
     let out_pipe = child.stdout.take().expect("stdout is piped");
     let err_pipe = child.stderr.take().expect("stderr is piped");
     let (stdout, stderr, reader) = match closed {
@@ -303,13 +306,14 @@ pub fn start_with_closed(closed: Closed, mut command: Command) -> Running {
             (stdout, Buffer::default(), reader)
         }
     };
-    Running {
+    let running = Running {
         child,
         stdout,
         stderr,
         readers: vec![reader],
         stop_tree,
-    }
+    };
+    (running, stdin)
 }
 
 /// A stream's bytes so far, shared with the thread that reads it.
@@ -396,6 +400,38 @@ impl Running {
                 "{} did not appear on {stream}; {stream} so far:\n{}",
                 wanted.what,
                 said.of(wanted.stream)
+            );
+            thread::sleep(LOOK_AGAIN);
+        }
+    }
+
+    /// Returns once `check` holds. Each look reads the program's exit status before it runs `check`, so a check that
+    /// still fails after the program was seen exited never will: the wait then fails at once, naming `what`, with the
+    /// exit status and the output so far, after the readers have had [`READER_GRACE`] to drain what it wrote. Fails
+    /// after the hang guard, with stderr so far, while the program still runs.
+    #[expect(
+        clippy::panic,
+        reason = "a program that exited before its case's check held fails the case with its status and output"
+    )]
+    pub fn wait_until(&self, what: &str, mut check: impl FnMut() -> bool) {
+        let deadline = Instant::now() + HANG_GUARD;
+        loop {
+            let ended = self.exit_status();
+            if check() {
+                return;
+            }
+            if let Some(status) = ended {
+                self.wait_for_readers();
+                let said = self.said();
+                panic!(
+                    "{what} did not happen before the program exited with {status}; stdout so far:\n{}\nstderr so far:\n{}",
+                    said.stdout, said.stderr
+                );
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{what} did not happen within the hang guard; stderr so far:\n{}",
+                text(&self.stderr)
             );
             thread::sleep(LOOK_AGAIN);
         }
@@ -763,6 +799,16 @@ fn a_wait_for_output_fails_at_once_when_the_program_exits_without_it() {
     running.wait_for_stdout("started");
 }
 
+#[test]
+#[should_panic(expected = "the third call did not happen before the program exited with exit code: 3")]
+fn a_wait_until_fails_at_once_when_the_program_exits_before_its_check_holds() {
+    let mut command = Command::new(FAKE_TOOL);
+    command.args(["exit", "3"]);
+    let running = start(command);
+
+    running.wait_until("the third call", || false);
+}
+
 fn text(buffer: &Buffer) -> String {
     String::from_utf8_lossy(&bytes(buffer)).into_owned()
 }
@@ -796,6 +842,19 @@ pub fn wait_until(what: &str, mut check: impl FnMut() -> bool) {
         assert!(Instant::now() < deadline, "{what} did not happen within the hang guard");
         thread::sleep(LOOK_AGAIN);
     }
+}
+
+/// Makes a junction at `link` that leads to `target`, with `mklink /J`.
+pub fn junction(link: &Path, target: &Path) {
+    let made = Command::new("cmd")
+        .args(["/c", "mklink", "/J"])
+        .arg(link)
+        .arg(target)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .status()
+        .expect("cmd starts");
+    assert!(made.success(), "the junction {} is made", link.display());
 }
 
 /// Returns once `path` exists.
@@ -895,15 +954,7 @@ impl Junction {
         let link = PathBuf::from(link);
         // A junction an earlier run of the case left would make `mklink` refuse.
         drop(fs::remove_dir(&link));
-        let made = Command::new("cmd")
-            .args(["/c", "mklink", "/J"])
-            .arg(&link)
-            .arg(target)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .status()
-            .expect("cmd starts");
-        assert!(made.success(), "the junction is made");
+        junction(&link, target);
         Junction(link)
     }
 }
@@ -973,6 +1024,31 @@ pub fn git(case: &Case, args: &[&str]) -> String {
         .expect("git starts");
     assert!(output.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&output.stderr));
     String::from_utf8(output.stdout).expect("git's stdout is UTF-8").trim_end().to_owned()
+}
+
+/// The suite's stand-in for ssh, which `--test-remote-ssh` names.
+pub const FAKE_SSH: &str = env!("CARGO_BIN_EXE_fake-ssh");
+/// The variable naming the stand-in's steps file; the stand-in logs each call's verb to `<steps>.log`.
+pub const STEPS_VARIABLE: &str = "GATE_FAKE_SSH_STEPS";
+/// The variable naming the gate the stand-in runs `box <verb> --stdin` with, feeding it the request on standard input.
+pub const GATE_VARIABLE: &str = "GATE_FAKE_SSH_GATE";
+/// The variable whose words the stand-in gives the box's `preflight` before its verb.
+pub const PREFLIGHT_SEAMS_VARIABLE: &str = "GATE_FAKE_SSH_PREFLIGHT_SEAMS";
+/// The preflight seams of a tool case whose probes and SDK list must answer: bounds no run reaches, so only an answer
+/// ends them and no load changes what the run says.
+pub const ANSWERING: &str = "--test-probe-limit-ms 3600000 --test-dotnet-limit-ms 3600000";
+
+/// Writes `steps`, one a line, as the stand-in's steps file `name` in the case's `ssh` folder, which must exist; its
+/// path.
+pub fn ssh_steps(case: &Case, name: &str, steps: &[&str]) -> PathBuf {
+    let path = case.folder().join("ssh").join(format!("{name}.steps"));
+    fs::write(&path, steps.join("\n")).expect("the steps file can be written");
+    path
+}
+
+/// The verbs the stand-in of the steps file `steps` was called with, in order; none before its first call.
+pub fn calls(steps: &Path) -> Vec<String> {
+    fs::read_to_string(beside(steps, ".log")).map_or_else(|_| Vec::new(), |text| text.lines().map(str::to_owned).collect())
 }
 
 /// Writes `json` as the routing file the case's gates read, `<LOCALAPPDATA>\gate\remote.json`; its path.

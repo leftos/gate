@@ -20,18 +20,42 @@ use gate_win32::{Interrupt, OwnedMutexGuard};
 
 use crate::durations::Usual;
 
+#[cfg(feature = "test-seams")]
+pub(crate) use client::local_transport;
+pub(crate) use client::{CREATED, NOT_RECOGNIZED, USAGE as BOX_USAGE, local_sdk_listing, other_build, outside_worktree, sdks_of, their_version};
+pub(crate) use retry::SSH_FAILED;
+
+pub(crate) use carried::{Sibling, carried};
+
+mod carried;
 mod client;
 pub(crate) mod git;
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the client does not hold a sibling pair's folders until pairs are on")
+)]
+mod held;
 mod install;
 mod launch;
 mod outputs;
-mod parity;
-mod payload;
+pub(crate) mod parity;
+pub(crate) mod payload;
 mod retry;
+pub(crate) mod siblings;
 mod snapshot;
 mod syncback;
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "gate check reads the manifest; nothing outside the tests reads the dotnet tool and Godot SDK pins \
+                  read beside it"
+    )
+)]
+pub(crate) mod toolchain;
 pub(crate) mod transport;
 mod watchdog;
+mod worktree_lock;
 
 /// The status a client hands back with a refusal's reason.
 pub(crate) const REFUSED: i64 = 75;
@@ -52,6 +76,8 @@ pub(crate) enum Refusal {
     Busy,
     /// The work folder's dotnet tools could not be restored.
     Tools,
+    /// The work folder could not be cleared or laid out for the run's repos.
+    Layout,
 }
 
 impl Refusal {
@@ -60,8 +86,15 @@ impl Refusal {
         match self {
             Refusal::Busy => "busy",
             Refusal::Tools => "tools",
+            Refusal::Layout => "layout",
         }
     }
+}
+
+/// The line the box says when it could not clear or lay out the work folder of the repo `repo` for `why`, just after
+/// its refusal tag; the PC passes it on as it runs the command itself.
+pub(crate) fn layout_line(repo: &str, why: &str) -> String {
+    format!("gate: not routed: the builder could not clear {repo}'s work folder: {why}")
 }
 
 /// The start marker the box says on stderr just before it starts the command of the run whose payload carries `nonce`:
@@ -75,7 +108,7 @@ pub(crate) fn started_line(nonce: &str) -> String {
 }
 
 /// The refusal tag the box says on stderr just before the human line of a refusal of the run whose payload carries
-/// `nonce`: `gate-remote-refused: <nonce> busy|tools`. The client reads a refusal from this line alone.
+/// `nonce`: `gate-remote-refused: <nonce> busy|tools|layout`. The client reads a refusal from this line alone.
 ///
 /// The nonce is no secret, as [`started_line`] says: a command can say this line too, and the client ignores it
 /// because the box's start marker came before anything the command says.
@@ -162,6 +195,10 @@ pub(crate) struct RemoteCall<'a> {
     pub host: &'a str,
     pub key: &'a str,
     pub root: &'a str,
+    /// The worktree root's folder name.
+    pub leaf: &'a str,
+    /// The siblings the run carries, as the route's decision allowed and checked them, in declared order ([`carried`]).
+    pub siblings: Vec<Sibling<'a>>,
     pub repo: &'a str,
     pub subfolder: &'a str,
     /// The words the builder runs.
@@ -366,6 +403,8 @@ mod snapshot_only {
                 host: "builder",
                 key: "app-1a2b3c4d",
                 root,
+                leaf: "app",
+                siblings: Vec::new(),
                 repo: "app",
                 subfolder: "",
                 words: &[],
@@ -455,21 +494,22 @@ mod scripted {
 
     use gate_state::FallbackReason;
     use gate_win32::Interrupt;
-    use serde_json::json;
+    use serde_json::{Value, json};
 
-    use super::{BoxKill, REFUSED, RemoteCall, RemoteClient, RemoteOutcome};
+    use super::{BoxKill, REFUSED, RemoteCall, RemoteClient, RemoteOutcome, Sibling};
     use crate::run::CONTROL_C_EXIT;
 
     /// How often `wait` looks for its path and the interrupt.
     const WAIT_STEP: Duration = Duration::from_millis(20);
     /// Every reason a `refuse` step may give.
-    const REASONS: [FallbackReason; 8] = [
+    const REASONS: [FallbackReason; 9] = [
         FallbackReason::Full,
         FallbackReason::Busy,
         FallbackReason::Unreachable,
         FallbackReason::Parity,
         FallbackReason::Rebooted,
         FallbackReason::Tools,
+        FallbackReason::Layout,
         FallbackReason::Version,
         FallbackReason::Client,
     ];
@@ -623,6 +663,8 @@ mod scripted {
             "host": call.host,
             "key": call.key,
             "root": call.root,
+            "leaf": call.leaf,
+            "siblings": call.siblings.iter().map(recorded_sibling).collect::<Vec<Value>>(),
             "repo": call.repo,
             "subfolder": call.subfolder,
             "words": call.words,
@@ -635,6 +677,17 @@ mod scripted {
         });
         fs::write(path, recorded.to_string()).map_err(|error| format!("cannot record the call to {}: {error}", path.display()))?;
         Ok(true)
+    }
+
+    /// A carried sibling as the record writes it: its name, its root, and its folder's id as the volume serial's 16 hex
+    /// digits, `-`, and the file id's 32.
+    fn recorded_sibling(sibling: &Sibling<'_>) -> Value {
+        let id = sibling.id();
+        json!({
+            "name": sibling.name(),
+            "root": sibling.root(),
+            "id": format!("{:016x}-{:032x}", id.volume, u128::from_be_bytes(id.file)),
+        })
     }
 
     /// Sleeps until `path` exists, true, or the interrupt is raised, false.

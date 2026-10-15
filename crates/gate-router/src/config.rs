@@ -1,7 +1,8 @@
 //! The routing file, `remote.json`, read from its text: the builder's `host`, the optional `hosts` (further builders,
 //! which `gate push` reaches and routing neither reads nor refuses), the remote pool's `slots` (a whole
 //! number 1 to 16, 1 when missing), `repos` (each repo name's list of `-like` patterns for the commands that route) and
-//! the optional `outputs` (each repo name's globs for the files a routed run brings back). Keys match in any letter
+//! the optional `outputs` (each repo name's globs for the files a routed run brings back) and the optional `siblings`
+//! (each repo name's list of the sibling folder names a routed run of it may carry). Keys match in any letter
 //! case and unknown keys are ignored. The text may hold `//` and `/* */` comments and trailing commas, as the
 //! PowerShell gate's JSON reader allows; single-quoted strings are refused. A file that breaks a rule is unusable as a
 //! whole, for the reason the PowerShell gate gives (or, for a host ssh or git would misread, a reason of its own),
@@ -11,6 +12,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value};
 
+use crate::key::is_layout_name;
 use crate::like::{Pattern, eq_ignoring_case};
 
 /// The output globs of a repo the `outputs` key does not name.
@@ -33,6 +35,8 @@ pub struct Config {
     slots: u32,
     repos: Vec<(String, Vec<Pattern>)>,
     outputs: Vec<(String, Vec<Pattern>)>,
+    /// Each repo name's allowed sibling names, or why `siblings` cannot be used, which allows none.
+    siblings: Result<Vec<(String, Vec<String>)>, String>,
 }
 
 /// A routing file that is there but cannot be used: not a file, unreadable, or refused by [`Config::parse`].
@@ -66,7 +70,8 @@ impl Config {
     ///
     /// A `host` that is not an ssh alias or `user@host` of letters, digits, `.`, `_` and `-` is refused with a reason of
     /// the gate's own, since the PowerShell gate accepts it. A bad `hosts` leaves the file usable for routing, and
-    /// [`Config::builders`] gives its reason.
+    /// [`Config::builders`] gives its reason. A bad `siblings` leaves it usable too, allowing no sibling, and
+    /// [`Config::allowed_siblings`] gives its reason.
     pub fn parse(text: &str) -> Result<Self, String> {
         let text = strict_json(text.strip_prefix('\u{feff}').unwrap_or(text));
         // PowerShell's JSON reader gives no value at all for blank text, which is then no JSON object.
@@ -92,7 +97,22 @@ impl Config {
             slots,
             repos,
             outputs,
+            siblings: read_siblings(&data),
         })
+    }
+
+    /// The sibling names `siblings` allows `repo` to carry, its repo name matched in any letter case: none when it does
+    /// not name the repo.
+    ///
+    /// # Errors
+    ///
+    /// Why `siblings` cannot be used: not an object of arrays of folder names the builder can lay out
+    /// ([`is_layout_name`]). Such a value allows no sibling, and the rest of the file is read whatever it holds.
+    pub fn allowed_siblings(&self, repo: &str) -> Result<&[String], &str> {
+        match &self.siblings {
+            Err(problem) => Err(problem),
+            Ok(table) => Ok(find(table, repo).unwrap_or(&[])),
+        }
     }
 
     /// The builder's host alias, the one a routed run goes to.
@@ -216,11 +236,12 @@ fn drop_trailing_commas(text: &str) -> String {
         .collect()
 }
 
-fn find<'a>(table: &'a RepoTable, repo: &str) -> Option<&'a [Pattern]> {
+/// The list `table` holds for `repo`, its name matched in any letter case.
+fn find<'a, T>(table: &'a [(String, Vec<T>)], repo: &str) -> Option<&'a [T]> {
     table
         .iter()
         .find(|(name, _)| eq_ignoring_case(name, repo))
-        .map(|(_, patterns)| patterns.as_slice())
+        .map(|(_, items)| items.as_slice())
 }
 
 /// Refuses an object anywhere in the file holding two keys that differ only in letter case, as PowerShell's
@@ -368,6 +389,38 @@ fn read_table(data: &Map<String, Value>, key: &str, required: bool) -> Result<Re
         return Err(format!("{key} must be a JSON object"));
     };
     table.iter().map(|(name, list)| Ok((name.clone(), read_list(key, name, list)?))).collect()
+}
+
+/// The `siblings` table: each repo name's allowed sibling names, in file order, each a folder name the builder can lay
+/// out ([`is_layout_name`]); an empty table when the key is missing. A problem writes the repo name quoted and escaped,
+/// so no control character in it reaches the console.
+fn read_siblings(data: &Map<String, Value>) -> Result<Vec<(String, Vec<String>)>, String> {
+    let Some(value) = property(data, "siblings") else {
+        return Ok(Vec::new());
+    };
+    let Value::Object(table) = value else {
+        return Err("siblings must be a JSON object".to_owned());
+    };
+    table
+        .iter()
+        .map(|(repo, list)| {
+            let Value::Array(items) = list else {
+                return Err(format!("siblings.{repo:?} is not an array of strings"));
+            };
+            let names = items
+                .iter()
+                .enumerate()
+                .map(|(index, item)| match item {
+                    Value::String(name) if is_layout_name(name) => Ok(name.clone()),
+                    Value::String(name) if !name.is_empty() => {
+                        Err(format!("siblings.{repo:?}[{index}] is not a folder name the builder can lay out"))
+                    }
+                    _ => Err(format!("siblings.{repo:?}[{index}] is not a non-empty string")),
+                })
+                .collect::<Result<Vec<String>, String>>()?;
+            Ok((repo.clone(), names))
+        })
+        .collect()
 }
 
 fn read_list(key: &str, name: &str, list: &Value) -> Result<Vec<Pattern>, String> {

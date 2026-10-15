@@ -1066,7 +1066,6 @@ mod tests {
     use std::io::{self, Read, Write};
     use std::os::windows::fs::OpenOptionsExt;
     use std::path::{Path, PathBuf};
-    use std::process::Command;
     use std::rc::Rc;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -1083,6 +1082,7 @@ mod tests {
     use crate::outputs::manifest::{Chosen, Held, HeldBy, Manifest};
     use crate::outputs::names::is_device;
     use crate::outputs::walk::{Found, Stamp, walk};
+    use crate::test_support::junction;
 
     /// The byte limit the cases unpack under, far above what any of them holds.
     const LIMIT: u64 = 1 << 30;
@@ -2117,18 +2117,6 @@ mod tests {
                 format!("the output '{}' has a name the outputs archive's reader refuses", escaped(name))
             );
         }
-    }
-
-    /// Makes `link` a junction to the folder `target`.
-    #[expect(clippy::disallowed_methods, reason = "a test's one mklink takes no spawn lock")]
-    fn junction(link: &Path, target: &Path) {
-        let made = Command::new("cmd")
-            .args(["/d", "/c", "mklink", "/J"])
-            .arg(link)
-            .arg(target)
-            .output()
-            .expect("cmd.exe runs");
-        assert!(made.status.success(), "a junction needs no privilege: {made:?}");
     }
 
     #[test]

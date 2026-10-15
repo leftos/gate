@@ -1,13 +1,15 @@
 //! The gate's Win32 layer: named mutexes and events, job objects and their accounting, commands created suspended and
 //! the UTF-8 console a command can be created on, the restricted token a command can be created with, the start time
 //! of the gate process or of another, the system's, a process's and the WSL VM's CPU times, the console interrupt, the
-//! system's boot time, what a drive letter stands for, a rename that never replaces its target, and the Windows message
-//! of an error code. And what a run on the interactive desktop needs: a named pipe for one user's local client, handles
-//! copied into and out of another process and the checks on a process taken that way, a command created on the
-//! interactive desktop, and the console session's state. It holds no policy but one: a [`DesktopLaunch`] always
-//! creates its command in the normal priority class on `WinSta0\Default`. The names, the waits, the environment and
-//! priority of any other command, and what an abandoned mutex means to the gate are the caller's. Windows only;
-//! elsewhere the crate is empty.
+//! system's boot time, what a drive letter stands for, a rename that never replaces its target, a name opened inside an
+//! open folder, a file opened again through its reparse point's filter, an open file's volume serial and file id
+//! ([`file_id`]), whether two open files are one, whether an open file is on a network volume ([`on_network_volume`]),
+//! and the Windows message of an error code. And what a run on the interactive desktop needs: a named pipe for one
+//! user's local client, handles copied into and out of another process and the checks on a process taken that way, a
+//! command created on the interactive desktop, and the console session's state. It holds no policy but one: a
+//! [`DesktopLaunch`] always creates its command in the normal priority class on `WinSta0\Default`. The names, the
+//! waits, the environment and priority of any other command, and what an abandoned mutex means to the gate are the
+//! caller's. Windows only; elsewhere the crate is empty.
 
 #![cfg(windows)]
 
@@ -64,7 +66,7 @@ pub fn check_plain_file(file: &std::fs::File) -> io::Result<()> {
 
     launch::check_plain_file(file.as_raw_handle())
 }
-pub use file::move_no_replace;
+pub use file::{Share, file_id, move_no_replace, on_network_volume, open_beneath, reopen_through_filter, same_file};
 pub use tree::{Membership, OpenedJob, StoppableProcess, WaitableProcess};
 
 pub use priority::{Priority, priority_of, set_priority};

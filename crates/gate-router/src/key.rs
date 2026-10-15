@@ -34,6 +34,29 @@ pub fn work_folder_key(root: &str) -> String {
     key
 }
 
+/// The device names Windows reserves in every folder, in upper case.
+const DEVICE_NAMES: [&str; 22] = [
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5",
+    "LPT6", "LPT7", "LPT8", "LPT9",
+];
+
+/// Whether the builder can lay out a folder named `name` beside another: one or more ASCII letters, digits, `.`, `_`
+/// and `-`, neither starting nor ending with a dot (so never `.` or `..`, and never a name Windows would cut), and not
+/// a reserved device name (`CON`, `PRN`, `AUX`, `NUL`, `COM1`-`COM9`, `LPT1`-`LPT9`) in any ASCII case, whatever
+/// follows its first dot (`nul.txt`).
+#[must_use]
+pub fn is_layout_name(name: &str) -> bool {
+    let characters = !name.is_empty()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'));
+    let device = name
+        .split('.')
+        .next()
+        .is_some_and(|stem| DEVICE_NAMES.iter().any(|device| device.eq_ignore_ascii_case(stem)));
+    characters && !name.starts_with('.') && !name.ends_with('.') && !device
+}
+
 /// The last segment of a path, as `Split-Path -Leaf` gives it: separators at the end are ignored, and a drive root
 /// (`X:/`) is its own leaf, written `X:\`.
 fn leaf(path: &str) -> String {

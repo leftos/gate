@@ -1,12 +1,14 @@
 //! git as the routing decision and the remote client run it: the executable found once along the gate's own `PATH`,
 //! asked about one folder alone, started suspended in an anonymous kill-on-close job of its own on this process's
 //! console or a hidden one of its own, its output read from pipes by a thread per stream, and ended with its whole job
-//! after a time limit or by the console interrupt. One other program, `dotnet --list-sdks`, which this PC's parity
-//! check and the builder's preflight read, is started, bounded and ended the same way ([`sdk_listing`]).
+//! after a time limit or by the console interrupt. Other programs are started, bounded and ended the same way
+//! ([`program_output`]): `dotnet --list-sdks`, which this PC's parity check and the builder's preflight read
+//! ([`sdk_listing`]), and the builder's tool probes.
 
 use std::ffi::{OsStr, OsString};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::os::windows::ffi::OsStrExt;
 use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::process::ExitStatusExt;
 use std::path::{Component, Path, PathBuf, Prefix};
@@ -17,7 +19,7 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use gate_args::TestSeams;
+use gate_args::{TestSeams, command_line, is_batch_target};
 use gate_win32::{Interrupt, Job, PipedConsole, PipedLaunch, Running};
 
 use super::launch::{DRAIN, KILL_WAIT, KILLED, call_job, launched, piped_launch};
@@ -224,40 +226,125 @@ struct Spawn<'a> {
     launch: io::Result<PipedLaunch>,
 }
 
-/// What `dotnet --list-sdks` lists, empty when no dotnet is found along the `PATH` of `variables`; the search never
-/// looks in the working folder, and when `worktree` is given a dotnet found is followed through links, refused when
-/// that leads inside it and else launched as the file it leads to. dotnet
-/// runs in the system folder with `variables` as its environment and `NoDefaultCurrentDirectoryInExePath=1`, as the
-/// client's git calls run: in a kill-on-close job of its own, on this process's console, ended past `limit` or by the
-/// console `interrupt`, its standard output read up to [`OUTPUT_CAP`] and the end of its standard error kept, whose
-/// last lines a failed read's reason carries. This PC's parity check and the builder's preflight both read the list
-/// this way. Else why the list cannot be read, or [`GitError::Interrupted`].
-pub(crate) fn sdk_listing(variables: Variables, limit: Duration, interrupt: Option<Interrupt>, worktree: Option<&Path>) -> Result<String, GitError> {
-    let cannot_run = |why: String| GitError::Failed(format!("cannot run dotnet: {why}"));
-    let folder = gate_win32::system_directory().map_err(|error| cannot_run(format!("cannot read the system folder: {error}")))?;
-    let variables = variables.with(NO_CURRENT_FOLDER, "1");
-    let dotnet = match find_program("dotnet", &variables, &folder) {
-        Ok(dotnet) => dotnet,
+/// A program other than git started, bounded and ended as the client's git calls are ([`program_output`]): its name,
+/// looked for along a `PATH`, its arguments, how long it may take, the console interrupt that ends it, the worktree it
+/// must not be found inside, the console it is created on: this process's, or a hidden one of its own; and the bytes
+/// fed on its standard input, which is then closed, `None` for none.
+pub(crate) struct ProgramCall<'a> {
+    pub program: &'a str,
+    pub args: &'a [&'a str],
+    pub limit: Duration,
+    pub interrupt: Option<Interrupt>,
+    pub worktree: Option<&'a Path>,
+    pub console: PipedConsole,
+    pub stdin: Option<&'a [u8]>,
+}
+
+/// Where [`program_output`] runs a program: the system folder, and an environment with
+/// `NoDefaultCurrentDirectoryInExePath=1` set, so no program is found by name in the working folder. Read once, it
+/// serves every program of a batch.
+pub(crate) struct ProgramPlace {
+    folder: PathBuf,
+    variables: Variables,
+}
+
+impl ProgramPlace {
+    /// The system folder and `variables` with `NoDefaultCurrentDirectoryInExePath=1`; else why the system folder
+    /// cannot be read.
+    pub(crate) fn new(variables: Variables) -> Result<ProgramPlace, String> {
+        let folder = gate_win32::system_directory().map_err(|error| format!("cannot read the system folder: {error}"))?;
+        Ok(ProgramPlace {
+            folder,
+            variables: variables.with(NO_CURRENT_FOLDER, "1"),
+        })
+    }
+}
+
+impl ProgramCall<'_> {
+    /// `<program> <args>`, as the call's failure lines name it.
+    fn named(&self) -> String {
+        std::iter::once(self.program)
+            .chain(self.args.iter().copied())
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// The line the call fails with once it outlives its limit, the limit as [`spelled_limit`] says it:
+    /// `<program> <args> did not answer in <limit>`.
+    pub(crate) fn late_line(&self) -> String {
+        format!("{} did not answer in {}", self.named(), spelled_limit(self.limit))
+    }
+}
+
+/// How a program that ran to its exit ended: its exit status, what it wrote on standard output, and the end of what it
+/// wrote on standard error.
+pub(crate) struct ProgramOutput {
+    pub status: ExitStatus,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+}
+
+/// Runs `call`'s program, `None` when it is not found along the `PATH` of `place`'s environment; the search never looks
+/// in the working folder, and when the call gives a worktree a program found is followed through links, refused when
+/// that leads inside it and else launched as the file it leads to, its command line's first word still the name found
+/// along `PATH`. The program runs in `place`'s system folder with its environment, a batch file through the system
+/// folder's cmd.exe, as the client's git calls run: in a kill-on-close job of its own, on the call's console, ended past
+/// the call's limit (failing with [`ProgramCall::late_line`], followed by why it could not be stopped when it could not)
+/// or by its console interrupt, its standard output read up to [`OUTPUT_CAP`] and the last [`ERRORS_KEPT`] bytes of its
+/// standard error kept. Else why it could not be run (`cannot run <program>: <why>`), or [`GitError::Interrupted`].
+pub(crate) fn program_output(call: &ProgramCall<'_>, place: &ProgramPlace) -> Result<Option<ProgramOutput>, GitError> {
+    let program = call.program;
+    let cannot_run = |why: String| GitError::Failed(format!("cannot run {program}: {why}"));
+    let (folder, variables) = (&place.folder, &place.variables);
+    let found = match find_program(program, variables, folder) {
+        Ok(found) => found,
         // `find_program` says a word it does not find with this message, and every other failure with another.
-        Err(message) if message == gate_win32::win32_message(ERROR_FILE_NOT_FOUND) => return Ok(String::new()),
+        Err(message) if message == gate_win32::win32_message(ERROR_FILE_NOT_FOUND) => return Ok(None),
         Err(message) => return Err(cannot_run(message)),
     };
-    let dotnet = match worktree {
-        Some(worktree) => judged(&dotnet, worktree).map_err(cannot_run)?,
-        None => dotnet,
+    let target = match call.worktree {
+        Some(worktree) => judged(&found, worktree).map_err(cannot_run)?,
+        None => found.clone(),
     };
-    let args = ["--list-sdks"];
-    let call = Call {
-        interrupt,
-        ..Call::plain(&folder, &args, limit)
+    let bounds = Call {
+        interrupt: call.interrupt,
+        console: call.console,
+        stdin: call.stdin,
+        ..Call::plain(folder, call.args, call.limit)
     };
     let spawn = Spawn {
-        name: "dotnet",
-        late: format!("dotnet --list-sdks did not answer in {}", spelled_limit(limit)),
-        launch: sdk_launch(&dotnet, &folder, &variables),
+        name: program,
+        late: call.late_line(),
+        launch: program_launch(&found, &target, call, place),
     };
-    let over = format!("dotnet --list-sdks wrote more than {} MiB", OUTPUT_CAP / (1024 * 1024));
-    let (status, output, errors) = output_of(&spawn, &call, over)?;
+    let over = format!("{} wrote more than {} MiB", call.named(), OUTPUT_CAP / (1024 * 1024));
+    let (status, stdout, stderr) = output_of(&spawn, &bounds, over)?;
+    Ok(Some(ProgramOutput { status, stdout, stderr }))
+}
+
+/// What `dotnet --list-sdks` lists, empty when no dotnet is found; dotnet is run as [`program_output`] runs a program,
+/// with `variables`, `limit`, `interrupt` and `worktree`, and a failed read's reason carries the last lines of its
+/// standard error. This PC's parity check and the builder's preflight both read the list this way. Else why the list
+/// cannot be read, or [`GitError::Interrupted`].
+pub(crate) fn sdk_listing(variables: Variables, limit: Duration, interrupt: Option<Interrupt>, worktree: Option<&Path>) -> Result<String, GitError> {
+    let call = ProgramCall {
+        program: "dotnet",
+        args: &["--list-sdks"],
+        limit,
+        interrupt,
+        worktree,
+        console: PipedConsole::Attached,
+        stdin: None,
+    };
+    let place = ProgramPlace::new(variables).map_err(|why| GitError::Failed(format!("cannot run dotnet: {why}")))?;
+    let Some(ProgramOutput {
+        status,
+        stdout: output,
+        stderr: errors,
+    }) = program_output(&call, &place)?
+    else {
+        return Ok(String::new());
+    };
     if !status.success() {
         let status = status.code().map_or_else(|| "unknown".to_owned(), |code| code.to_string());
         let errors = String::from_utf8_lossy(&errors);
@@ -275,7 +362,8 @@ pub(crate) fn sdk_listing(variables: Variables, limit: Duration, interrupt: Opti
 /// The file `program`, found along a `PATH`, leads to, followed through links, which is what is then launched, so a
 /// link retargeted after the check cannot change what runs; else why it is refused, when that file lies inside
 /// `worktree`: a folder outside the worktree may still hold a link that leads into it. dotnet and the client's ssh are
-/// judged so.
+/// judged so. The refusal covers only the file launched: a program it starts in turn (a multi-call proxy such as
+/// rustup's, a shim) is not judged.
 pub(crate) fn judged(program: &Path, worktree: &Path) -> Result<PathBuf, String> {
     let target = resolved(program);
     if is_within(&target, &resolved(worktree)) {
@@ -286,7 +374,7 @@ pub(crate) fn judged(program: &Path, worktree: &Path) -> Result<PathBuf, String>
 
 /// `path` without the `\\?\` prefix a canonical path carries, which cmd.exe does not take: `\\?\C:\a` as `C:\a`, and
 /// `\\?\UNC\server\share\a` as `\\server\share\a`. Any other path is kept as it is.
-fn without_verbatim(path: &Path) -> PathBuf {
+pub(crate) fn without_verbatim(path: &Path) -> PathBuf {
     let mut parts = path.components();
     let Some(Component::Prefix(prefix)) = parts.next() else {
         return path.to_owned();
@@ -308,19 +396,30 @@ fn without_verbatim(path: &Path) -> PathBuf {
         .fold(PathBuf::from(root), |joined, part| joined.join(part))
 }
 
-/// The launch of `dotnet --list-sdks` with the program `dotnet` found, in `folder`, on this process's console, with
-/// `variables` as its environment: a batch file runs through the system folder's cmd.exe, as `gate run` starts one.
-fn sdk_launch(dotnet: &Path, folder: &Path, variables: &Variables) -> io::Result<PipedLaunch> {
-    let (application, command_line) = match written(dotnet, &[OsString::from("--list-sdks")], variables) {
-        Written::Line(application, command_line) => (application, command_line),
-        Written::Refused(why) | Written::NoShell(why) => return Err(io::Error::other(why)),
+/// The launch of `target`, the file the program found along `PATH` at `found` leads to, with `call`'s arguments, in
+/// `place`'s folder, on `call`'s console, with `place`'s variables as its environment. The image started is `target`
+/// and its command line's first word is `found`, the name the program was found by, since a multi-call program such as
+/// rustup's proxies picks what to be from that word; a batch target runs through the system folder's cmd.exe given
+/// `target`, as `gate run` starts one.
+fn program_launch(found: &Path, target: &Path, call: &ProgramCall<'_>, place: &ProgramPlace) -> io::Result<PipedLaunch> {
+    let (folder, variables) = (&place.folder, &place.variables);
+    let args: Vec<OsString> = call.args.iter().map(OsString::from).collect();
+    let (application, command_line) = if is_batch_target(&target.to_string_lossy()) {
+        match written(target, &args, variables) {
+            Written::Line(application, command_line) => (application, command_line),
+            Written::Refused(why) | Written::NoShell(why) => return Err(io::Error::other(why)),
+        }
+    } else {
+        let mut words: Vec<Vec<u16>> = vec![found.as_os_str().encode_wide().collect()];
+        words.extend(args.iter().map(|word| word.encode_wide().collect()));
+        (target.to_owned(), command_line(&words))
     };
     Ok(PipedLaunch {
         application,
         command_line,
-        directory: folder.to_owned(),
+        directory: folder.clone(),
         environment: variables.block()?,
-        console: PipedConsole::Attached,
+        console: call.console,
         token: None,
     })
 }
@@ -703,6 +802,15 @@ fn failed_line(call: &Call<'_>, status: Option<i32>, errors: &[u8], output: &[u8
 const FAILURE_LINES: usize = 10;
 pub(crate) const FAILURE_BYTES: usize = 4096;
 
+/// `text` cut to its first `most` bytes, at a character's boundary.
+pub(crate) fn first_bytes(text: &str, most: usize) -> &str {
+    let mut end = text.len().min(most);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.get(..end).unwrap_or_default()
+}
+
 /// The last [`FAILURE_LINES`] of a failed call's `lines`, each as its last carriage-return update leaves it, joined by
 /// ` | `, escaped and cut to their last [`FAILURE_BYTES`]: what a failure line carries of them. The characters are
 /// counted from the end by the width of their escapes and only those that fit are escaped, so the escaped text stays
@@ -757,12 +865,12 @@ mod tests {
     use std::thread::{self, ScopedJoinHandle};
     use std::time::{Duration, Instant};
 
-    use gate_win32::Interrupt;
+    use gate_win32::{Interrupt, PipedConsole};
     use jiff::Timestamp;
 
     use super::{
-        Call, ERRORS_KEPT, FAILURE_BYTES, GIT_LIMIT, Git, GitError, NO_CURRENT_FOLDER, OUTPUT_CAP, capped, failed_line, failure_text,
-        is_indexed_config, late_git_line, sdk_listing, tail, without_verbatim,
+        Call, ERRORS_KEPT, FAILURE_BYTES, GIT_LIMIT, Git, GitError, NO_CURRENT_FOLDER, OUTPUT_CAP, ProgramCall, ProgramPlace, capped, failed_line,
+        failure_text, is_indexed_config, late_git_line, program_output, sdk_listing, tail, without_verbatim,
     };
     use crate::boxside::payload::escaped;
     use crate::environment::Variables;
@@ -1309,6 +1417,66 @@ mod tests {
             failed_line(&call, None, b"fatal: x\n", b""),
             r"git write-tree failed in C:\work\app (status unknown): fatal: x",
             "no exit code"
+        );
+    }
+
+    /// What Windows PowerShell says its command line is when it is run as `tool`, found along a `PATH` holding only a
+    /// link named `link` that leads to it, in a folder of its own named after `tag`.
+    fn command_line_through_link(link: &str, tag: &str) -> String {
+        let folder = std::env::temp_dir().join(format!("gate-link-{tag}-{}", std::process::id()));
+        drop(fs::remove_dir_all(&folder));
+        fs::create_dir_all(&folder).expect("the link's folder can be made");
+        let _removed = Removed(folder.clone());
+        let system_root = std::env::var_os("SystemRoot").expect("SystemRoot is set");
+        let powershell = Path::new(&system_root).join(r"System32\WindowsPowerShell\v1.0\powershell.exe");
+        std::os::windows::fs::symlink_file(&powershell, folder.join(link)).expect("this machine lets a test make a symbolic link");
+        let place = ProgramPlace::new(Variables::from_process().with("PATH", &folder.to_string_lossy())).expect("the system folder can be read");
+        let call = ProgramCall {
+            program: "tool",
+            args: &["-NoProfile", "-NonInteractive", "-Command", "[Environment]::CommandLine"],
+            limit: HANG_GUARD,
+            interrupt: None,
+            worktree: Some(Path::new(env!("CARGO_MANIFEST_DIR"))),
+            console: PipedConsole::Hidden,
+            stdin: None,
+        };
+
+        let output = program_output(&call, &place).expect("the link runs").expect("the link is found");
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    /// Whether the first word of the command line `line`, quoted or not, names a file called `name`.
+    fn first_word_names(line: &str, name: &str) -> bool {
+        let line_start = line.trim_start();
+        let first_word = match line_start.strip_prefix('"') {
+            Some(quoted) => quoted.split('"').next(),
+            None => line_start.split_whitespace().next(),
+        }
+        .unwrap_or_default();
+        Path::new(first_word).file_name().is_some_and(|file| file.eq_ignore_ascii_case(name))
+    }
+
+    #[test]
+    fn a_program_found_through_a_link_is_started_by_the_name_it_was_found_by() {
+        let line = command_line_through_link("tool.exe", "name");
+
+        assert!(
+            first_word_names(&line, "tool.exe"),
+            "a multi-call program such as rustup's proxies must see the name it was found by: {line}"
+        );
+    }
+
+    #[test]
+    fn a_batch_named_link_to_a_program_is_started_as_the_program_it_leads_to() {
+        let line = command_line_through_link("tool.cmd", "batch-name");
+
+        assert!(
+            line.contains("[Environment]::CommandLine"),
+            "the link's target, not cmd.exe, must run and print its command line: {line}"
+        );
+        assert!(
+            first_word_names(&line, "tool.cmd"),
+            "the target must see the name it was found by: {line}"
         );
     }
 }

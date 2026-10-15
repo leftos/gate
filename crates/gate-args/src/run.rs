@@ -6,8 +6,8 @@ use std::path::PathBuf;
 
 use crate::problem::{Problem, Required, Spelling};
 use crate::request::{
-    BurnRequest, Ceiling, CutoverRequest, CutoverSeams, DEFAULT_STALL_SECONDS, DEFAULT_TAIL_LINES, ExpectRequest, PushRequest, PushSeams, RunRequest,
-    Slot, StopRequest, TestSeams,
+    BurnRequest, Ceiling, CheckRequest, CheckSeams, CutoverRequest, CutoverSeams, DEFAULT_STALL_SECONDS, DEFAULT_TAIL_LINES, ExpectRequest,
+    PushRequest, PushSeams, RunRequest, Slot, StopRequest, TestSeams,
 };
 use crate::values;
 
@@ -23,6 +23,7 @@ pub(crate) enum ValueOption {
     Cores,
     Seconds,
     BringTracked,
+    Builder,
     #[cfg(feature = "test-seams")]
     SampleMs,
     #[cfg(feature = "test-seams")]
@@ -77,6 +78,8 @@ pub(crate) enum ValueOption {
     PushSsh,
     #[cfg(feature = "test-seams")]
     PushBoundMs,
+    #[cfg(feature = "test-seams")]
+    ProbeLimitMs,
 }
 
 /// An option that is on or off.
@@ -133,6 +136,10 @@ pub(crate) struct RunBuilder {
     cutover_seams: CutoverSeams,
     /// `gate push`'s own seams, `--test-push-ssh` and `--test-push-bound-ms`.
     push_seams: PushSeams,
+    /// `gate check`'s `--builder <host>`.
+    builder: Option<String>,
+    /// `gate check`'s own seam, `--test-probe-limit-ms`; its builder seams are read into `test_seams`, as a run's are.
+    check_seams: CheckSeams,
     given: Vec<RunOption>,
     pub(crate) problems: Vec<Problem>,
     /// The form the command line is read in: the CLI's unless [`RunBuilder::compat`] made the builder.
@@ -213,6 +220,7 @@ impl RunBuilder {
             ValueOption::Cores => self.cores = Some(values::above_zero_u32(spelled, value)?),
             ValueOption::Seconds => self.seconds = Some(values::in_range(spelled, value, 1, values::MAX_BURN_SECONDS)?),
             ValueOption::BringTracked => self.bring_tracked.push(value.to_owned()),
+            ValueOption::Builder => self.builder = Some(value.to_owned()),
             #[cfg(feature = "test-seams")]
             ValueOption::SampleMs => self.test_seams.sample_ms = Some(values::above_zero(spelled, value)?),
             #[cfg(feature = "test-seams")]
@@ -273,6 +281,8 @@ impl RunBuilder {
             ValueOption::PushSsh => self.push_seams.ssh = Some(PathBuf::from(value)),
             #[cfg(feature = "test-seams")]
             ValueOption::PushBoundMs => self.push_seams.bound_ms = Some(values::above_zero(spelled, value)?),
+            #[cfg(feature = "test-seams")]
+            ValueOption::ProbeLimitMs => self.check_seams.probe_limit_ms = Some(values::above_zero(spelled, value)?),
         }
         Ok(())
     }
@@ -452,6 +462,62 @@ impl RunBuilder {
             return Err(self.problems);
         }
         Ok(PushRequest { seams: self.push_seams })
+    }
+
+    /// The check request, its builder and its seams the probe limit, transport, ssh and bound read, or every problem
+    /// found: those found while reading, then the builder seams that cannot work together.
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        expect(unused_mut, reason = "only the test-seams build reads seams that can conflict")
+    )]
+    pub(crate) fn finish_check(mut self) -> Result<CheckRequest, Vec<Problem>> {
+        #[cfg(feature = "test-seams")]
+        self.check_builder_seams();
+        if !self.problems.is_empty() {
+            return Err(self.problems);
+        }
+        Ok(CheckRequest {
+            builder: self.builder,
+            seams: CheckSeams {
+                remote_transport: self.test_seams.remote_transport,
+                remote_ssh: self.test_seams.remote_ssh,
+                remote_timeout_ms: self.test_seams.remote_timeout_ms,
+                ..self.check_seams
+            },
+        })
+    }
+
+    /// Refuses the builder check's seams without `--builder`, which alone reads them, `--test-remote-ssh` without
+    /// `--test-remote-transport`, whose local transport alone starts it, and `--test-probe-limit-ms` with `--builder`,
+    /// whose probes run under the box's own limit. A seam whose value was refused is already a problem of its own.
+    #[cfg(feature = "test-seams")]
+    fn check_builder_seams(&mut self) {
+        const BUILDER: &str = "--builder";
+        let builder = self.builder.is_some();
+        if builder && self.check_seams.probe_limit_ms.is_some() {
+            self.problems.push(Problem::SeamNotUsedWith {
+                option: "--test-probe-limit-ms",
+                with: BUILDER,
+            });
+        }
+        for (read, spelled) in [
+            (self.test_seams.remote_transport.is_some(), "--test-remote-transport"),
+            (self.test_seams.remote_ssh.is_some(), "--test-remote-ssh"),
+            (self.test_seams.remote_timeout_ms.is_some(), "--test-remote-timeout-ms"),
+        ] {
+            if read && !builder {
+                self.problems.push(Problem::SeamNeeds {
+                    option: spelled,
+                    needs: BUILDER,
+                });
+            }
+        }
+        if builder && self.test_seams.remote_ssh.is_some() && self.test_seams.remote_transport.is_none() {
+            self.problems.push(Problem::SeamNeeds {
+                option: "--test-remote-ssh",
+                needs: "--test-remote-transport",
+            });
+        }
     }
 
     /// The burn request, its cores and seconds, or every problem: those found while reading, then a missing

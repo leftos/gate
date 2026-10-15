@@ -23,8 +23,9 @@ use sha2::{Digest, Sha256};
 
 use crate::durations::seed;
 use crate::support::{
-    Case, FAKE_TOOL, GATE, GIT_REDIRECTS, Go, Junction, Outcome, Running, allow_breakaway, beside, build_version, copy_tool, events, finish, git,
-    git_init, heavy_words, nothing_back, release, shown, start, wait_for_journal_line, wait_until, wait_until_closed, write_remote_json,
+    ANSWERING, Case, FAKE_SSH, FAKE_TOOL, GATE, GATE_VARIABLE, GIT_REDIRECTS, Go, Junction, Outcome, PREFLIGHT_SEAMS_VARIABLE, Running,
+    STEPS_VARIABLE, allow_breakaway, beside, build_version, calls, copy_tool, events, finish, git, git_init, heavy_words, nothing_back, release,
+    shown, ssh_steps, start, wait_for_journal_line, wait_until, wait_until_closed, write_remote_json,
 };
 
 const HOST: &str = "builder";
@@ -333,12 +334,6 @@ fn a_snapshot_ignores_commit_signing() {
     assert!(!object.contains("gpgsig"), "the commit carries no signature: {object}");
 }
 
-/// The suite's stand-in for ssh, which `--test-remote-ssh` names.
-const FAKE_SSH: &str = env!("CARGO_BIN_EXE_fake-ssh");
-/// The variable naming the stand-in's steps file; the stand-in logs each call's verb to `<steps>.log`.
-const STEPS_VARIABLE: &str = "GATE_FAKE_SSH_STEPS";
-/// The variable naming the gate the stand-in runs `box <verb> <payload>` with.
-const GATE_VARIABLE: &str = "GATE_FAKE_SSH_GATE";
 /// What a client case's snapshot leaves out: the gate's state root, LOCALAPPDATA and logs, the builder root and the
 /// stand-in's files, and `.tmp/`, which the client writes in. `tool.exe` is sent, so the builder runs it.
 const CLIENT_IGNORED: &str = "state/\nappdata/\n*.log\nbuilder/\nssh/\n.tmp/\n";
@@ -434,18 +429,6 @@ fn sha256_hex(text: &str) -> String {
         let _ = write!(said, "{byte:02x}");
         said
     })
-}
-
-/// Writes `steps`, one a line, as the stand-in's steps file `name` in the case's `ssh` folder; its path.
-fn ssh_steps(case: &Case, name: &str, steps: &[&str]) -> PathBuf {
-    let path = case.folder().join("ssh").join(format!("{name}.steps"));
-    fs::write(&path, steps.join("\n")).expect("the steps file can be written");
-    path
-}
-
-/// The verbs the stand-in of the steps file `steps` was called with, in order; none before its first call.
-fn calls(steps: &Path) -> Vec<String> {
-    fs::read_to_string(beside(steps, ".log")).map_or_else(|_| Vec::new(), |text| text.lines().map(str::to_owned).collect())
 }
 
 /// Each call the stand-in of the steps file `steps` was given, in order: its verb, then the words before the host,
@@ -771,7 +754,7 @@ fn a_second_routed_run_of_one_worktree_falls_back_busy_at_once() {
     let go = Go(case.folder().join("ssh").join("go"));
     let first_steps = ssh_steps(&case, "first", &["ok", &format!("hold {}", shown(go.path()))]);
     let first = start(client_gate(&case, "first.log", &first_steps, &[r".\tool.exe", "out", "ran there"]));
-    wait_until("the first run's run call", || calls(&first_steps).len() == 2);
+    first.wait_until("the first run's run call", || calls(&first_steps).len() == 2);
     let second_steps = ssh_steps(&case, "second", &["ok", "ok"]);
 
     let (pid, second) = finish_with_pid(client_gate(&case, "second.log", &second_steps, &[r".\tool.exe", "out", "ran here"]));
@@ -812,7 +795,7 @@ fn gate_stop_tree_reaches_the_ssh_client() {
     let go = Go(case.folder().join("ssh").join("go"));
     let steps = ssh_steps(&case, "ssh", &["ok", &format!("hold {}", shown(go.path()))]);
     let running = start(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "out", "ran here"]));
-    wait_until("the run call", || calls(&steps).len() == 2);
+    running.wait_until("the run call", || calls(&steps).len() == 2);
     let gate_pid = running.id();
     let (ssh, at) = ssh_child_of(gate_pid);
 
@@ -851,6 +834,19 @@ fn a_connection_dropped_before_the_banner_is_retried_once() {
     assert!(outcome.stdout.contains("ran there"), "{outcome:?}");
     assert_eq!(calls(&steps), ["preflight", "preflight", "run"]);
     assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new());
+}
+
+#[test]
+fn a_dropped_preflight_logs_no_line_saying_its_input_was_not_sent() {
+    let case = client_case("client-preflight-drop-fed");
+    let steps = ssh_steps(&case, "ssh", &["drop"]);
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "out", "ran here"]));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight"]);
+    let log = fs::read_to_string(case.folder().join("out.log")).expect("the log was written");
+    assert!(!log.contains("input was not sent"), "the call's own end says why: {log}");
 }
 
 #[test]
@@ -1026,25 +1022,60 @@ fn a_tools_refusal_of_the_box_falls_back_and_runs_the_command_here_once() {
     assert_eq!(calls(&steps), ["preflight", "run"]);
 }
 
+/// The box cannot clear the work folder, whose record says another layout, for a file held open in it, so it refuses
+/// the run `layout`.
 #[test]
-fn a_run_call_longer_than_the_cap_fails_before_anything_is_sent() {
-    let case = client_case("client-cap");
-    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
-    let long = "x".repeat(6200);
+fn a_layout_refusal_of_the_box_falls_back_with_its_line_and_runs_the_command_here_once() {
+    let case = client_case("client-layout-refused");
+    let first = ssh_steps(&case, "first", &["ok", "ok"]);
+    let named = finish(client_gate(&case, "first.log", &first, &[r".\tool.exe", "out", "ran there"]));
+    assert_eq!(named.code, Some(0), "{named:?}");
+    let work = case.folder().join("builder").join("work").join(key_of(&events(&case)));
+    fs::write(format!("{}.layout", shown(&work)), "pair app lib").expect("the record can be written");
+    let held = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .share_mode(0)
+        .open(work.join("held.txt"))
+        .expect("a file in the work folder can be held");
+    let second = ssh_steps(&case, "second", &["ok", "ok"]);
 
-    let outcome = finish(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "out", &long]));
+    let (pid, outcome) = finish_with_pid(client_gate(&case, "second.log", &second, &[r".\tool.exe", "mark", RAN, "out", "ran"]));
+    drop(held);
 
-    assert_eq!(outcome.code, Some(1), "{outcome:?}");
-    assert!(outcome.stderr.contains("gate: the remote run failed: the run call is "), "{outcome:?}");
+    assert_eq!(outcome.code, Some(0), "the run here passed: {outcome:?}");
+    assert_eq!(fallbacks(&own(&case, pid)), ["layout"], "{outcome:?}");
+    let repo = repo_name(&case.folder().file_name().expect("the case folder has a name").to_string_lossy());
+    let line = format!("gate: not routed: the builder could not clear {repo}'s work folder: ");
     assert!(
-        outcome
-            .stderr
-            .contains(" characters, longer than the 8127 cmd takes (8191 less 64 for sshd's own cmd.exe /c); shorten the command"),
-        "{outcome:?}"
+        outcome.stderr.lines().any(|said| said.starts_with(&line) && said.contains("held.txt")),
+        "the box's line is passed on: {outcome:?}"
     );
-    assert!(!outcome.stdout.contains(&long), "the command ran nowhere: {outcome:?}");
-    assert_eq!(calls(&steps), Vec::<String>::new(), "nothing was sent");
-    assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new());
+    assert!(outcome.stderr.contains("gate: remote builder layout; running here"), "{outcome:?}");
+    assert_eq!(runs(&case), (1, 0), "the command ran once, here: {outcome:?}");
+    assert_eq!(calls(&second), ["preflight", "run"]);
+}
+
+#[test]
+fn a_routed_run_whose_command_is_longer_than_cmd_s_line_runs_on_the_box() {
+    let case = client_case("client-long-command");
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+    let long = "x".repeat(9000);
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "out", &long, "out", "end"]));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(
+        outcome.stdout.contains(&format!("{long}\n")),
+        "the word reached the tool whole: {outcome:?}"
+    );
+    assert!(outcome.stdout.contains("end"), "the word after it too: {outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "run"], "the command ran on the box");
+    let events = events(&case);
+    assert_eq!(fallbacks(&events), Vec::<&str>::new(), "{events:#?}");
+    assert!(events.iter().all(|event| event["remote"] == true), "a remote run: {events:#?}");
 }
 
 #[test]
@@ -1080,6 +1111,50 @@ fn a_box_of_another_version_is_not_routed() {
     let events = events(&case);
     assert_eq!(fallbacks(&events), ["version"]);
     assert_eq!(builder_ref(&case, &format!("refs/gate/{}", key_of(&events))), "", "nothing was pushed");
+}
+
+/// A run whose repo declares a sibling the routing file allows, a repository beside the case folder, stays here until
+/// the client takes sibling pairs: it says so naming the sibling, calls no builder, creates no bare there and leaves the
+/// sibling no snapshot ref.
+#[test]
+fn a_run_carrying_a_sibling_stays_local_until_pairs_are_on() {
+    let case = client_case("client-sibling-off");
+    let leaf = case
+        .folder()
+        .file_name()
+        .expect("the case folder has a name")
+        .to_string_lossy()
+        .into_owned();
+    let (repo, name) = (repo_name(&leaf), format!("{leaf}-sibling"));
+    let sibling = case.folder().parent().expect("the case folder has a parent").join(&name);
+    if sibling.exists() {
+        fs::remove_dir_all(&sibling).expect("a sibling left by an earlier run can be removed");
+    }
+    fs::create_dir_all(&sibling).expect("the sibling can be made");
+    git_out(&case, &[], &["-C", &shown(&sibling), "init", "--quiet"]);
+    write(&case, ".gate/siblings.toml", &format!("siblings = [\"{name}\"]\n"));
+    let routing = json!({
+        "host": HOST,
+        "slots": 2,
+        "repos": { &repo: ["*tool*"] },
+        "outputs": { &repo: [] },
+        "siblings": { &repo: [&name] },
+    });
+    write_remote_json(&case, &routing.to_string());
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "out", "ran here"]));
+    let sibling_refs = git_out(&case, &[], &["-C", &shown(&sibling), "for-each-ref", "refs/gate-remote/"]);
+    fs::remove_dir_all(&sibling).expect("the sibling can be removed");
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let line = format!("gate: not routed: sibling {name} the builder does not take sibling pairs yet");
+    assert_eq!(outcome.stderr.lines().filter(|said| *said == line).count(), 1, "said once: {outcome:?}");
+    assert!(outcome.stdout.contains("ran here"), "{outcome:?}");
+    assert_eq!(calls(&steps), Vec::<String>::new(), "no call reached the builder");
+    assert_eq!(fallbacks(&events(&case)), ["client"]);
+    assert!(!case.folder().join("builder").exists(), "no bare was created on the builder");
+    assert_eq!(sibling_refs, "", "the sibling has no snapshot ref");
 }
 
 #[test]
@@ -1664,6 +1739,287 @@ fn a_tree_that_is_not_dotnet_skips_the_parity_check() {
     assert_eq!(runs(&case), (0, 1), "the command ran once, on the builder: {outcome:?}");
 }
 
+/// The repo's toolchain manifest, as a tool case writes it.
+const MANIFEST: &str = ".gate/toolchain.toml";
+
+/// Whether `folder` holds the program `program` under any of the extensions a `PATHEXT` search tries.
+fn holds(folder: &Path, program: &str) -> bool {
+    ["exe", "cmd", "bat", "com"]
+        .iter()
+        .any(|extension| folder.join(format!("{program}.{extension}")).is_file())
+}
+
+/// The `PATH` of a tool case's builder: a folder in the case's `ssh` folder first, holding a `dotnet.cmd` that runs
+/// `dotnet` and a `<program>.cmd` for each `(program, body)` of `tools`, each after `@echo off`; then this PC's own
+/// `PATH` without the folders holding a `dotnet` or a program of `missing`, so the builder finds none of those. A
+/// folder it would drop for a missing tool that also holds a `git`, a `pwsh` or an `ssh` the run itself needs fails the
+/// case with why, since taking the tool off the builder's `PATH` would take those too.
+fn box_path_with_tools(case: &Case, dotnet: &str, tools: &[(&str, &str)], missing: &[&str]) -> OsString {
+    let stub = case.folder().join("ssh").join("stub-tools");
+    fs::create_dir_all(&stub).expect("the stub folder can be made");
+    fs::write(stub.join("dotnet.cmd"), format!("@echo off\r\n{dotnet}")).expect("the stub dotnet can be written");
+    for (program, body) in tools {
+        fs::write(stub.join(format!("{program}.cmd")), format!("@echo off\r\n{body}")).expect("a tool stub can be written");
+    }
+    let own = std::env::var_os("PATH").expect("PATH is set");
+    #[expect(
+        clippy::panic,
+        reason = "a folder that would take a git, a pwsh or an ssh off the builder's PATH fails the case saying so"
+    )]
+    let kept = std::env::split_paths(&own).filter(|folder| {
+        if holds_dotnet(folder) {
+            return false;
+        }
+        let Some(program) = missing.iter().find(|program| holds(folder, program)) else {
+            return true;
+        };
+        if let Some(other) = ["git", "pwsh", "ssh"].into_iter().find(|other| holds(folder, other)) {
+            panic!(
+                "{} holds both {program} and {other}: the case cannot take {program} off the builder's PATH without taking {other}",
+                folder.display()
+            );
+        }
+        false
+    });
+    std::env::join_paths(std::iter::once(stub).chain(kept)).expect("the folders join into a PATH")
+}
+
+/// The mismatch line of a case whose builder lacks `need` and has `has` of it.
+fn mismatch_of(case: &Case, need: &str, has: &str) -> String {
+    let repo = repo_name(&case.folder().file_name().expect("the case folder has a name").to_string_lossy());
+    format!("gate: remote toolchain mismatch: {repo} needs {need}; builder has {has}")
+}
+
+/// Whether `line` is a mismatch line or the parity line.
+fn is_parity_line(line: &str) -> bool {
+    line.starts_with("gate: remote toolchain mismatch: ") || line == PARITY_LINE
+}
+
+/// A routed run of a case whose builder, given the `PATH` `box_path`, lacks what the case's tree needs: it falls back
+/// `parity` after the preflight alone, so nothing is pushed, says the mismatch lines `said` and no other, in their order,
+/// then the one parity line, on the console and, but the parity line, in the log, and runs the command here once.
+fn a_toolchain_refusal(case: &Case, box_path: &OsString, said: &[String]) -> Outcome {
+    let steps = ssh_steps(case, "ssh", &["ok", "ok"]);
+    let mut gate = client_gate(case, "out.log", &steps, &[r".\tool.exe", "mark", RAN, "out", "ran"]);
+    gate.env("PATH", box_path).env(PREFLIGHT_SEAMS_VARIABLE, ANSWERING);
+
+    let (pid, outcome) = finish_with_pid(gate);
+
+    assert_eq!(outcome.code, Some(0), "the run here passed: {outcome:?}");
+    let events = own(case, pid);
+    assert_eq!(fallbacks(&events), ["parity"], "{outcome:?}");
+    let want: Vec<&str> = said.iter().map(String::as_str).chain([PARITY_LINE]).collect();
+    let console: Vec<&str> = outcome.stderr.lines().filter(|line| is_parity_line(line)).collect();
+    assert_eq!(console, want, "{outcome:?}");
+    let log = fs::read_to_string(case.folder().join("out.log")).expect("the log was written");
+    let logged: Vec<&str> = log.lines().filter(|line| line.starts_with("gate: remote toolchain mismatch: ")).collect();
+    assert_eq!(logged, said, "{log}");
+    assert_eq!(calls(&steps), ["preflight"], "the preflight alone reached the builder");
+    assert_eq!(builder_ref(case, &format!("refs/gate/{}", key_of(&events))), "", "nothing was pushed");
+    assert_eq!(runs(case), (1, 0), "the command ran once, here: {outcome:?}");
+    outcome
+}
+
+/// A routed run of a case whose builder, given the `PATH` `box_path` and the preflight seams `seams`, serves what the
+/// case's tree needs: it goes remote with no mismatch line, and runs the command once, on the builder.
+fn a_toolchain_served(case: &Case, box_path: &OsString, seams: &str) -> Outcome {
+    let steps = ssh_steps(case, "ssh", &["ok", "ok"]);
+    let mut gate = client_gate(case, "out.log", &steps, &[r".\tool.exe", "mark", RAN, "out", "ran there"]);
+    gate.env("PATH", box_path).env(PREFLIGHT_SEAMS_VARIABLE, seams);
+
+    let (pid, outcome) = finish_with_pid(gate);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(!outcome.stderr.lines().any(is_parity_line), "{outcome:?}");
+    assert_eq!(fallbacks(&own(case, pid)), Vec::<&str>::new(), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "run"]);
+    assert_eq!(runs(case), (0, 1), "the command ran once, on the builder: {outcome:?}");
+    outcome
+}
+
+/// A builder that finds no tool the manifest declares is refused `parity`, though the tree is no .NET tree, which the
+/// SDK check skips.
+#[test]
+fn a_tool_the_builder_lacks_is_refused_parity_in_a_tree_that_is_not_dotnet() {
+    let case = client_case("client-tool-missing");
+    write(&case, MANIFEST, "[tools]\npnpm = \"10\"\n");
+    let box_path = box_path_with_tools(&case, &listing(&[BUILDER_SDK]), &[], &["pnpm"]);
+
+    a_toolchain_refusal(&case, &box_path, &[mismatch_of(&case, "pnpm 10.0.0 or later", "none")]);
+}
+
+#[test]
+fn a_tool_older_than_the_manifest_s_minimum_is_refused_parity() {
+    let case = client_case("client-tool-too-old");
+    write(&case, MANIFEST, "[tools]\ncargo-nextest = \"0.9.100\"\n");
+    let nextest = "echo cargo-nextest 0.9.80 (abc 2026-01-01)\r\n";
+    let box_path = box_path_with_tools(&case, &listing(&[BUILDER_SDK]), &[("cargo-nextest", nextest)], &[]);
+
+    a_toolchain_refusal(&case, &box_path, &[mismatch_of(&case, "cargo-nextest 0.9.100 or later", "0.9.80")]);
+}
+
+/// The SDK's mismatch line comes first, then each tool's in the manifest's order, not the names', then one parity line.
+#[test]
+fn the_sdk_s_mismatch_line_comes_before_the_tools_in_the_manifest_s_order() {
+    let case = client_case("client-tool-order");
+    write(&case, "global.json", r#"{"sdk": {"version": "999.0.0"}}"#);
+    write(&case, "src/App/App.csproj", "<Project />\n");
+    write(&case, MANIFEST, "[tools]\npnpm = \"10\"\ncargo-nextest = \"0.9.100\"\n");
+    let nextest = "echo cargo-nextest 0.9.80 (abc 2026-01-01)\r\n";
+    let box_path = box_path_with_tools(&case, &listing(&[BUILDER_SDK]), &[("cargo-nextest", nextest)], &["pnpm"]);
+
+    a_toolchain_refusal(
+        &case,
+        &box_path,
+        &[
+            mismatch_of(&case, ".NET SDK 999.0.0 (rollForward patch)", BUILDER_SDK),
+            mismatch_of(&case, "pnpm 10.0.0 or later", "none"),
+            mismatch_of(&case, "cargo-nextest 0.9.100 or later", "0.9.80"),
+        ],
+    );
+}
+
+#[test]
+fn a_tool_the_builder_serves_goes_remote() {
+    let case = client_case("client-tool-served");
+    write(&case, MANIFEST, "[tools]\ncargo-nextest = \"0.9.100\"\npnpm = \"\"\n");
+    let nextest = "echo cargo-nextest 0.9.148 (abc 2026-10-07)\r\n";
+    let tools = [("cargo-nextest", nextest), ("pnpm", "echo 10.0.0\r\n")];
+    let box_path = box_path_with_tools(&case, &listing(&[BUILDER_SDK]), &tools, &[]);
+
+    let outcome = a_toolchain_served(&case, &box_path, ANSWERING);
+
+    assert!(!outcome.stderr.contains("did not probe"), "{outcome:?}");
+}
+
+/// A tool the builder found but whose version it could not read is not checked against its minimum: it is skipped with
+/// its line, and the run goes remote.
+#[test]
+fn a_tool_found_with_no_readable_version_is_skipped_with_its_line() {
+    let case = client_case("client-tool-present");
+    write(&case, MANIFEST, "[tools]\npnpm = \"10\"\n");
+    let box_path = box_path_with_tools(&case, &listing(&[BUILDER_SDK]), &[("pnpm", "echo pnpm, no version here\r\n")], &[]);
+
+    let outcome = a_toolchain_served(&case, &box_path, ANSWERING);
+
+    let skipped = "gate: builder did not probe pnpm: found, version not readable; not checking it";
+    assert!(outcome.stderr.lines().any(|line| line == skipped), "{skipped}: {outcome:?}");
+}
+
+/// A builder whose SDK list cannot be read says no sdks line, which skips the SDK check; its tools are still checked.
+#[test]
+fn a_builder_with_no_sdks_line_still_has_its_tools_checked() {
+    let case = client_case("client-tool-no-sdks");
+    write(&case, "src/App/App.csproj", "<Project />\n");
+    write(&case, MANIFEST, "[tools]\npnpm = \"10\"\n");
+    let box_path = box_path_with_tools(&case, "exit /b 3\r\n", &[], &["pnpm"]);
+
+    a_toolchain_refusal(&case, &box_path, &[mismatch_of(&case, "pnpm 10.0.0 or later", "none")]);
+}
+
+/// Each tool the run cannot check is skipped with its line, and the run goes remote: a bad entry, a tool the builder's
+/// probe does not answer for in its 1 s bound, `godot`, which no probe reads, an unknown name, and a name that is no
+/// tool name at all. Only the probe's bound ends the hanging one, and no other line waits on a probe, so no load
+/// changes what the run says.
+#[test]
+fn each_tool_the_run_cannot_check_is_skipped_with_its_line_and_the_run_goes_remote() {
+    let case = client_case("client-tool-skipped");
+    write(
+        &case,
+        MANIFEST,
+        "[tools]\nffmpeg = \"x\"\nnode = \"24\"\ngodot = \"4.7\"\nnodejs = \"24\"\n\"No de\" = \"1\"\n",
+    );
+    let go = Go(case.folder().join("ssh").join("node-go"));
+    let held = case.folder().join("ssh").join("node-held");
+    let hang = format!("\"{FAKE_TOOL}\" wait \"{}\" >\"{}\"\r\n", go.path().display(), held.display());
+    let box_path = box_path_with_tools(&case, &listing(&[BUILDER_SDK]), &[("node", hang.as_str())], &[]);
+
+    let outcome = a_toolchain_served(&case, &box_path, "--test-probe-limit-ms 1000 --test-dotnet-limit-ms 3600000");
+
+    let skipped = [
+        "gate: .gate/toolchain.toml: tools.ffmpeg is not a version: \"x\"; skipping it",
+        "gate: builder did not probe node: no answer in 1 s; not checking it",
+        "gate: builder did not probe godot: no probe for godot; not checking it",
+        "gate: .gate/toolchain.toml names unknown tool nodejs; skipping it",
+        "gate: .gate/toolchain.toml names unknown tool \"No de\"; skipping it",
+    ];
+    let said: Vec<&str> = outcome
+        .stderr
+        .lines()
+        .filter(|line| line.starts_with("gate: .gate/toolchain.toml") || line.starts_with("gate: builder did not probe "))
+        .collect();
+    assert_eq!(said, skipped, "{outcome:?}");
+    // A stub that started holds its output file open until its job's kill ends it; one the kill came first never made it.
+    if held.exists() {
+        wait_until_closed(&held);
+    }
+}
+
+/// A manifest that is not TOML is skipped whole with its line, and the run goes remote.
+#[test]
+fn an_unreadable_manifest_is_skipped_with_its_line_and_the_run_goes_remote() {
+    let case = client_case("client-tool-unreadable");
+    write(&case, MANIFEST, "[tools\npnpm = \"10\"\n");
+    let box_path = box_path_with_tools(&case, &listing(&[BUILDER_SDK]), &[], &[]);
+
+    let outcome = a_toolchain_served(&case, &box_path, ANSWERING);
+
+    let said: Vec<&str> = outcome
+        .stderr
+        .lines()
+        .filter(|line| line.starts_with("gate: .gate/toolchain.toml"))
+        .collect();
+    assert!(
+        said.len() == 1 && said[0].starts_with("gate: .gate/toolchain.toml: line 1, column ") && said[0].ends_with("; skipping it"),
+        "{outcome:?}"
+    );
+}
+
+/// The manifest is found at the repo root whatever the letter case of its folder and file names.
+#[test]
+fn a_manifest_named_in_another_case_is_read() {
+    let case = client_case("client-tool-manifest-case");
+    write(&case, ".Gate/Toolchain.TOML", "[tools]\npnpm = \"10\"\n");
+    let box_path = box_path_with_tools(&case, &listing(&[BUILDER_SDK]), &[], &["pnpm"]);
+
+    a_toolchain_refusal(&case, &box_path, &[mismatch_of(&case, "pnpm 10.0.0 or later", "none")]);
+}
+
+/// The manifest is read from the snapshot, which carries the worktree's uncommitted edits: the committed manifest
+/// declares nothing, the edit a tool the builder lacks.
+#[test]
+fn an_uncommitted_manifest_edit_is_read() {
+    let case = client_case("client-tool-uncommitted");
+    write(&case, MANIFEST, "[tools]\n");
+    git(&case, &["add", "-A"]);
+    git(&case, &["commit", "--quiet", "-m", "no tools"]);
+    write(&case, MANIFEST, "[tools]\npnpm = \"10\"\n");
+    let box_path = box_path_with_tools(&case, &listing(&[BUILDER_SDK]), &[], &["pnpm"]);
+
+    a_toolchain_refusal(&case, &box_path, &[mismatch_of(&case, "pnpm 10.0.0 or later", "none")]);
+}
+
+/// A Ctrl+C raised just before the manifest is read ends the run as an interrupt before the preflight: nothing reaches
+/// the builder, and the command runs nowhere.
+#[test]
+fn a_ctrl_c_at_the_manifest_read_ends_the_run_before_the_preflight() {
+    let case = client_case("client-tool-ctrl-c");
+    write(&case, MANIFEST, "[tools]\npnpm = \"10\"\n");
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+    let tuned = Tuned {
+        extra: &["--test-remote-interrupt-at", "manifest"],
+        ..Tuned::default()
+    };
+    let gate = client_gate_tuned(&case, "out.log", &steps, &tuned, &[r".\tool.exe", "mark", RAN, "out", "ran"]);
+
+    let outcome = finish(gate);
+
+    assert_eq!(outcome.code, Some(CONTROL_C_EXIT), "{outcome:?}");
+    assert_eq!(calls(&steps), Vec::<String>::new(), "nothing reached the builder, so nothing was pushed");
+    assert!(!outcome.stderr.contains("gate: .gate/toolchain.toml"), "{outcome:?}");
+    assert_eq!(runs(&case), (0, 0), "the command ran nowhere: {outcome:?}");
+}
+
 #[test]
 fn a_builder_version_holding_escapes_is_refused_in_an_escaped_line() {
     let case = client_case("client-version-escaped");
@@ -1948,7 +2304,7 @@ fn a_worktree_changed_during_the_run_keeps_the_changes_and_fails_a_passing_run()
     let go = Go(case.folder().join("ssh").join("go"));
     let steps = ssh_steps(&case, "ssh", &["ok", &format!("hold {}", shown(go.path()))]);
     let run = start(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "mark", "made-on-box.txt"]));
-    wait_until("the run call", || calls(&steps).len() == 2);
+    run.wait_until("the run call", || calls(&steps).len() == 2);
     write(&case, "a.txt", "after\n");
     fs::write(go.path(), "").expect("the go file can be made");
 
@@ -1989,7 +2345,7 @@ fn a_failing_run_keeps_its_status_when_the_worktree_changed_during_it() {
         &steps,
         &[r".\tool.exe", "mark", "made-on-box.txt", "exit", "3"],
     ));
-    wait_until("the run call", || calls(&steps).len() == 2);
+    run.wait_until("the run call", || calls(&steps).len() == 2);
     write(&case, "a.txt", "after\n");
     fs::write(go.path(), "").expect("the go file can be made");
 
@@ -2094,7 +2450,7 @@ fn a_back_commit_whose_worktree_check_fails_is_kept_and_fails_the_run() {
     let go = Go(case.folder().join("ssh").join("go"));
     let steps = ssh_steps(&case, "ssh", &["ok", &format!("hold {}", shown(go.path()))]);
     let run = start(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "mark", "made-on-box.txt"]));
-    wait_until("the run call", || calls(&steps).len() == 2);
+    run.wait_until("the run call", || calls(&steps).len() == 2);
     fs::write(&broken, "").expect("the broken file can be made");
     fs::write(go.path(), "").expect("the go file can be made");
 
@@ -2932,6 +3288,40 @@ fn a_builder_that_restarted_is_a_rebooted_fallback() {
     assert_eq!(fallbacks(&events(&case)), ["rebooted"]);
 }
 
+/// A command argument long enough that the run request overruns the input pipe's buffer, so a call that ends without
+/// reading its input always fails the feeder's write.
+fn long_argument() -> String {
+    "x".repeat(16 * 1024)
+}
+
+#[test]
+fn a_dropped_run_call_logs_no_line_saying_its_long_input_was_not_sent() {
+    let case = client_case("client-rebooted-long");
+    let steps = ssh_steps(&case, "ssh", &[&format!("boot {BOOTED}"), "drop", "ok", &format!("boot {REBOOTED}")]);
+    let long = long_argument();
+
+    let outcome = finish(lost_gate(&case, "local", &steps, &[r".\tool.exe", "out", &long]));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "run", "stop", "boot"], "the command is stopped first");
+    assert_eq!(fallbacks(&events(&case)), ["rebooted"]);
+    let log = fs::read_to_string(case.folder().join("out.log")).expect("the log was written");
+    let note = log.lines().find(|line| line.contains("input was not sent"));
+    assert_eq!(note, None, "the call's own end says why");
+}
+
+#[test]
+fn a_run_call_that_failed_after_the_banner_unread_logs_that_its_input_was_not_sent() {
+    let case = client_case("client-run-unread");
+    let steps = ssh_steps(&case, "ssh", &[&format!("boot {BOOTED}"), "say-exit 1 gate: the box failed"]);
+    let long = long_argument();
+
+    let outcome = finish(lost_gate(&case, "local", &steps, &[r".\tool.exe", "out", &long]));
+
+    let log = fs::read_to_string(case.folder().join("out.log")).expect("the log was written");
+    assert!(log.contains("gate: the run call's input was not sent"), "{outcome:?}\n{log}");
+}
+
 #[test]
 fn a_boot_time_within_the_slack_is_the_same_boot() {
     let case = client_case("client-same-boot");
@@ -3180,7 +3570,7 @@ fn outputs_zero_clears_the_pending_marker() {
     let go = Go(case.folder().join("ssh").join("go"));
     let steps = ssh_steps(&case, "ssh", &["ok", &format!("hold {}", shown(go.path()))]);
     let run = start(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "out", "ran there"]));
-    wait_until("the run call", || calls(&steps).len() == 2);
+    run.wait_until("the run call", || calls(&steps).len() == 2);
     let marker = pending_marker(&case);
     assert!(marker.exists(), "the marker is written before the run call");
     fs::write(go.path(), "").expect("the go file can be made");
@@ -3581,7 +3971,7 @@ fn a_run_whose_worktree_changed_says_outputs_were_not_brought_back() {
     let go = Go(case.folder().join("ssh").join("go"));
     let steps = ssh_steps(&case, "ssh", &["ok", &format!("hold {}", shown(go.path()))]);
     let run = start(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "mark", "made-on-box.txt"]));
-    wait_until("the run call", || calls(&steps).len() == 2);
+    run.wait_until("the run call", || calls(&steps).len() == 2);
     write(&case, "a.txt", "after\n");
     fs::write(go.path(), "").expect("the go file can be made");
 
@@ -4271,7 +4661,7 @@ fn an_archive_member_that_is_an_lfsconfig_is_refused_by_the_install() {
     let go = Go(case.folder().join("ssh").join("go"));
     let steps = ssh_steps(&case, "ssh", &["ok", "ok", &format!("hold {}", shown(go.path()))]);
     let run = start(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "write", r"bin\a.txt", "built"]));
-    wait_until("the outputs call", || calls(&steps).len() == 3);
+    run.wait_until("the outputs call", || calls(&steps).len() == 3);
     // The box's own archive is swapped for one carrying the `.lfsconfig`, before the call reads it.
     fs::write(box_output_archive(&case), crafted_archive(".lfsconfig", "lfs")).expect("the archive can be replaced");
     fs::write(go.path(), "").expect("the go file can be made");
@@ -4299,7 +4689,7 @@ fn a_refused_install_of_a_member_outside_the_globs_clears_the_pending_marker() {
     let go = Go(case.folder().join("ssh").join("go"));
     let steps = ssh_steps(&case, "ssh", &["ok", "ok", &format!("hold {}", shown(go.path()))]);
     let run = start(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "write", r"bin\a.txt", "built"]));
-    wait_until("the outputs call", || calls(&steps).len() == 3);
+    run.wait_until("the outputs call", || calls(&steps).len() == 3);
     fs::write(box_output_archive(&case), crafted_archive(".lfsconfig", "lfs")).expect("the archive can be replaced");
     fs::write(go.path(), "").expect("the go file can be made");
 
@@ -4340,7 +4730,7 @@ fn an_archive_with_a_link_member_is_refused_and_the_pending_marker_cleared() {
     let go = Go(case.folder().join("ssh").join("go"));
     let steps = ssh_steps(&case, "ssh", &["ok", "ok", &format!("hold {}", shown(go.path()))]);
     let run = start(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "write", r"bin\a.txt", "built"]));
-    wait_until("the outputs call", || calls(&steps).len() == 3);
+    run.wait_until("the outputs call", || calls(&steps).len() == 3);
     fs::write(box_output_archive(&case), crafted_link_archive("bin/link")).expect("the archive can be replaced");
     fs::write(go.path(), "").expect("the go file can be made");
 
@@ -4368,7 +4758,7 @@ fn a_truncated_archive_keeps_the_pending_marker() {
     let go = Go(case.folder().join("ssh").join("go"));
     let steps = ssh_steps(&case, "ssh", &["ok", "ok", &format!("hold {}", shown(go.path()))]);
     let run = start(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "write", r"bin\a.txt", "built"]));
-    wait_until("the outputs call", || calls(&steps).len() == 3);
+    run.wait_until("the outputs call", || calls(&steps).len() == 3);
     let whole = crafted_archive("bin/a.txt", "box");
     fs::write(box_output_archive(&case), &whole[..whole.len() / 2]).expect("the archive can be cut short");
     fs::write(go.path(), "").expect("the go file can be made");
@@ -4412,7 +4802,7 @@ fn swapped_archive_run(case: &Case, extra: &[&str], member: &str) -> Outcome {
         &tuned,
         &[r".\tool.exe", "write", r"bin\new.txt", "built"],
     ));
-    wait_until("the outputs call", || calls(&steps).len() == 3);
+    run.wait_until("the outputs call", || calls(&steps).len() == 3);
     fs::write(box_output_archive(case), crafted_archive(member, "box")).expect("the archive can be replaced");
     fs::write(go.path(), "").expect("the go file can be made");
     run.finish()
@@ -4497,7 +4887,7 @@ fn a_pc_output_edited_during_the_run_is_not_overwritten() {
     let go = Go(case.folder().join("ssh").join("go"));
     let steps = ssh_steps(&case, "ssh", &["ok", &format!("hold {}", shown(go.path())), "ok"]);
     let run = start(client_gate(&case, "out.log", &steps, &BOTH_AND_NEW));
-    wait_until("the run call", || calls(&steps).len() == 2);
+    run.wait_until("the run call", || calls(&steps).len() == 2);
     write(&case, r"bin\both.txt", "edited during the run");
     fs::write(go.path(), "").expect("the go file can be made");
 
@@ -4515,7 +4905,7 @@ fn a_pc_output_held_open_is_skipped_and_the_rest_installed() {
     let go = Go(case.folder().join("ssh").join("go"));
     let steps = ssh_steps(&case, "ssh", &["ok", &format!("hold {}", shown(go.path())), "ok"]);
     let run = start(client_gate(&case, "out.log", &steps, &BOTH_AND_NEW));
-    wait_until("the run call", || calls(&steps).len() == 2);
+    run.wait_until("the run call", || calls(&steps).len() == 2);
     let held = fs::OpenOptions::new()
         .read(true)
         .share_mode(0)
@@ -4673,7 +5063,7 @@ fn a_routed_build_with_an_output_in_use_leaves_the_nothing_back_record() {
     let steps = ssh_steps(&case, "ssh", &["ok", &format!("hold {}", shown(go.path())), "ok"]);
     let command = wrapped_build(&BOTH_AND_NEW[1..], &RELEASE);
     let run = start(client_gate(&case, "out.log", &steps, &command));
-    wait_until("the run call", || calls(&steps).len() == 2);
+    run.wait_until("the run call", || calls(&steps).len() == 2);
     let held = fs::OpenOptions::new()
         .read(true)
         .share_mode(0)

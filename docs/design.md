@@ -27,7 +27,7 @@ Non-goals:
 
 The CLI is subcommands with GNU-style flags: `--name value` or `--name=value`, and `--` ends the gate's options. The first word picks the parser. `--version`, `--help`, `-h` and `help` are matched first; then a subcommand name selects the CLI below, and any other first word starting with `-` selects the [compatibility layer](#compatibility-layer). No arguments at all print the usage on stderr and exit 2.
 
-A `--help` or `-h` before the `--` of a `run`, `stop-tree`, `cutover`, `push`, `burn` or `expect` line also prints the usage on stdout and exits 0, whatever else the line holds; after the `--` it belongs to the command (`gate run --slot light --timeout 5 --log x.log -- tool --help` runs `tool --help`).
+A `--help` or `-h` before the `--` of a `run`, `stop-tree`, `cutover`, `push`, `check`, `burn` or `expect` line also prints the usage on stdout and exits 0, whatever else the line holds; after the `--` it belongs to the command (`gate run --slot light --timeout 5 --log x.log -- tool --help` runs `tool --help`).
 
 | Subcommand | Purpose |
 |---|---|
@@ -35,6 +35,7 @@ A `--help` or `-h` before the `--` of a `run`, `stop-tree`, `cutover`, `push`, `
 | `gate stop-tree` | Stop a process tree, reaching the gate jobs inside it. |
 | `gate cutover` | Switch this machine from the PowerShell gate to `gate.exe`, draining it first. |
 | `gate push` | Copy the installed `gate.exe` to every builder `remote.json` names. |
+| `gate check` | Say what this PC lacks for the repo in the current folder, and how to install it. |
 | `gate burn` | Spin the CPU for a set time, for the load-burn tool. |
 | `gate expect` | Print the expected time of a command here and on each builder, from the durations store. |
 | `gate box` | Hidden: the builder side of a routed run. |
@@ -175,7 +176,9 @@ Each builder is one ssh call, run in a kill-on-close job with stdin piped and bo
 
 A timeout stops only the local ssh, so the builder's install may still finish.
 
-The call is `pwsh -NoProfile -NonInteractive -OutputFormat Text -EncodedCommand <bootstrap>` through the transport's ssh words ([Routing](#routing)), with `-o RequestTTY=no` ahead of them so stdin never passes through a pseudo-terminal. The bootstrap is a short fixed PowerShell line that reads stdin's first line and runs it as the install script, so the call stays within the 8127 characters cmd takes ([Routing](#routing)) however long the script grows, which a unit test checks.
+The call is `pwsh -NoProfile -NonInteractive -OutputFormat Text -EncodedCommand <bootstrap>` through the transport's ssh words ([Routing](#routing)), with `-o RequestTTY=no` ahead of them so stdin never passes through a pseudo-terminal.
+
+The bootstrap is a short fixed PowerShell line that reads stdin's first line and runs it as the install script, so the call stays within the 8127 characters cmd takes (8191, less 64 for sshd's own `cmd.exe /c`, `%LOCALAPPDATA%` counted as 100) however long the script grows, which a unit test checks.
 
 Stdin is line 1, the install script as base64 of its UTF-8 with this PC's SHA-256 put in, then the exe as base64 text of its gzip (flate2's best level). The push call is not asked for ssh compression: the bytes are already compressed.
 
@@ -196,6 +199,106 @@ An installed gate is verified when its SHA-256 matches and `--version` answers, 
 Each version read on the builder is bounded at 30 s.
 
 The ssh a push runs is `ssh.exe` found along `PATH`, never `ssh.cmd` or `ssh.bat`. Test-seams builds accept hidden options on `push`: `--test-push-ssh <path>` (the program each builder's call runs in place of the ssh found along `PATH`) and `--test-push-bound-ms <n>` (the 300 s bound, in milliseconds above 0). `gate push` has no `--test-print-request`.
+
+### `gate check`
+
+`gate check` takes no words but `--builder <host>`; its usage line is `       gate check [--builder <host>]`, after `gate push`. With `--builder` it checks one builder instead of this PC ([With `--builder`](#with---builder)).
+
+A word prints `gate: unexpected argument <word>` and any option, `--state-dir` included, prints `gate: unknown option <opt>`, each followed by the usage, exit 2. It says what this PC lacks for the repo the working folder is in, and how to install it; it installs nothing and runs only version commands (each tool's own, and `dotnet --list-sdks`).
+
+The repo is the git worktree root of the working folder, as routing finds it.
+
+Outside a git worktree it prints `check: not in a git repository` on stderr and exits 1; a working folder or git that cannot be read prints `check: <why>` on stderr and exits 1. The repo's `.gate/toolchain.toml`, `.gate/siblings.toml` and root `global.json` are read from the worktree on disk, so an uncommitted edit counts.
+
+The two `.gate` files are read as routing reads `.gate/siblings.toml`: a `.gate` folder or file that is a link or junction, or a file over 64 KiB, is refused. `global.json` is read the same way, a link refused and 64 KiB the most.
+
+A file that cannot be read whole (not one that reads with problems) fails the check: the summary says it and the exit is 1, however the items came out.
+
+On stdout, each line prefixed `check: here: `, `here` being this PC, in this order:
+
+1. The header `check: here: <repo> at <root>`, `<repo>` being the name routing gives the repo and `<root>` the worktree root as git spells it. With no `.gate/toolchain.toml` the line `check: here: <repo> declares no toolchain` follows; the SDK pin and the siblings are still checked.
+2. One line per item, every item printed, the ones that are fine included: the manifest's tools in manifest order, then the .NET SDK, then the workloads, then the `remote.json` item when it applies, then the siblings.
+3. One `install: here: <subject>: <command>` hint line per missing or too-old item, in item order.
+4. The summary: `check: here: nothing missing` or `check: here: <n> missing, <n> too old`, with `, <n> skipped` added when any item was skipped; with nothing missing and some skipped it is `check: here: nothing missing (<n> skipped)`. When a file could not be read it is `check: here: could not read <files>; <n> missing, <n> too old`, `, <n> skipped` added as above, the files comma separated in the order `.gate/toolchain.toml`, `.gate/siblings.toml`, `global.json`.
+
+The problems of the files go to stderr, one per line, before the item lines: `check: .gate/<file>: <problem>`, `<file>` being `toolchain.toml` or `siblings.toml` and `<problem>` the text the file's reader gives ([Toolchain manifest](#routing), [Sibling worktrees](#routing)), or why the file could not be read at all (`.gate is not a folder`, for the manifest, when `.gate` is a file). A file with problems is still used for what reads, and the rest is still checked.
+
+The `global.json` ones are `check: global.json: <reason>`, `<reason>` being `is larger than 64 KiB`, `cannot read it: <error>`, `is a link, a junction or not a file`, `is not UTF-8`, `does not parse as JSON`, `its sdk is not an object`, `its sdk.version is not a version dotnet reads`, `its sdk.rollForward is not a policy gate knows` or `its sdk.allowPrerelease is not true or false`.
+
+The tool lines, for each tool of the manifest, probed as the box probes the tools of a preflight ([The box side](#the-box-side), Tool probes), all together within one 10 s bound, on this PC's own `PATH` with the worktree's own folders dropped, a program found that still lies inside the worktree refused:
+
+- `<tool> <found> ok (needs <min> or later)`, `<min>` written as `major.minor.patch`, when the found version is the minimum or later, and `<tool> <found> too old (needs <min> or later)` when it is below it;
+- `<tool> missing (needs <min> or later)`, or `(needs it present)` for a tool declared with `""`;
+- `<tool> <found> ok` for a tool declared present at any version, and `<tool> ok (version not readable)` for a present one whose version the probe could not read;
+- `<tool> skipped: found, version not readable (needs <min> or later)` when a minimum is declared and the tool answered with no version;
+- `<tool> skipped: <why>` when the probe gave no answer, `<why>` being the probe's own reason (`no answer in 10 s`, `no probe for godot`, `cannot run <program>: <error>`);
+- `tools.<name> skipped: not a tool gate knows` for a name the manifest declares that gate has no probe for, which runs nothing.
+
+The SDK line comes only when the root has a `global.json` with an `sdk.version`; one with no `sdk` key, or an `sdk` with no `version`, pins nothing and prints none.
+
+With a pin that names a version it is `.NET SDK <version> (rollForward <policy>) ok` when one of this PC's SDKs serves the pin by the rules of the parity check ([Parity](#routing)), else `.NET SDK <version> (rollForward <policy>) missing (this PC has <list>)`, the list being the SDKs `dotnet --list-sdks` gives or `none`; the words are the parity check's, so the PC's and a builder's lines agree.
+
+The SDK list is read with the folders inside the worktree dropped from `PATH`. A `global.json` whose pin cannot be read (a reason above) says `.NET SDK skipped: global.json has no readable sdk pin`, which counts as skipped, and the file counts as unreadable; a list that cannot be read `.NET SDK skipped: cannot read this PC's SDK list: <why>`.
+
+A manifest that lists workloads gets one line, `workloads <ids, comma separated> not checked yet`, which counts as neither skipped nor missing. The tools in `.config/dotnet-tools.json` and a `Godot.NET.Sdk` pin are not checked and say nothing.
+
+Each sibling the repo declares is checked as routing checks it, and gets one line:
+
+- `sibling <name> not allowed in remote.json`, counted missing, when this PC's `remote.json` does not allow the repo that sibling (`siblings`, [remote.json](#remotejson)); its folder is not looked at. Consent is asked only when `remote.json` is usable and lists the repo; with no usable file, or one that does not list the repo, routing would never carry a sibling and every sibling is checked for its folder alone.
+- `sibling <name> ok (<path>)` when its folder, `../<name>` of the worktree root as routing spells it, is a real folder with a `.git` (a folder, or the file of a linked worktree) that is no link or junction.
+- `sibling <name> missing (no git worktree at <path>)` when nothing is there or it holds no `.git`.
+- `sibling <name> <reason>`, counted missing, for a refused folder, worded as routing words it: `is a link or a junction`, `is not a folder`, `has a .git that is a link or a junction`, or `is the worktree's own folder` for a name that is the root's folder name in any ASCII letter case.
+- `sibling <name> skipped: <why>` when its folder cannot be read.
+
+When the repo declares siblings and `remote.json` lists the repo but its `siblings` value cannot be used, the line `check: here: remote.json: <problem>` (control characters escaped, counted missing) comes before the sibling lines, and every sibling is not allowed. A repo that declares none says nothing of it.
+
+The install hints, for the items that have one:
+
+| Item | Hint |
+|---|---|
+| `rust` | `winget install Rustlang.Rustup`; with a minimum, `rustup default <min>` when rust is too old, and `winget install Rustlang.Rustup, then rustup default <min>` when it is missing |
+| `cargo-nextest` | `cargo install cargo-nextest --locked` |
+| `node` | `winget install OpenJS.NodeJS` |
+| `pnpm` | `corepack enable pnpm` |
+| `pwsh` | `winget install Microsoft.PowerShell` |
+| `ffmpeg` | `winget install Gyan.FFmpeg` |
+| the .NET SDK | `.NET SDK: winget install Microsoft.DotNet.SDK.<major>`, the pin's major |
+| a missing sibling | `sibling <name>: clone it to <path>` |
+
+A tool not in the table (`godot`) gets no hint line, nor does a sibling that is not allowed or refused, nor the `remote.json` item.
+
+The exit is 0 when nothing is missing or too old and every file read, whatever was skipped; 1 when anything is missing or too old, or the check could not run (not in a git repository, an unreadable `.gate/toolchain.toml`, `.gate/siblings.toml` or `global.json`, `.gate` not a folder); 2 for a usage error. Test-seams builds accept the hidden `--test-probe-limit-ms <n>` (the 10 s probe bound, in milliseconds above 0), which `--builder` refuses.
+
+#### With `--builder`
+
+`gate check --builder <host>` says what one builder lacks for the repo in the current folder. It needs one host (`gate: --builder needs a value`; given twice, `gate: --builder is given twice`), which must be a builder `remote.json` lists (`host` or `hosts`), matched ignoring ASCII case and printed in `remote.json`'s spelling. Any other host prints `gate check: <host> is not a builder remote.json lists` and exits 2.
+
+The repo is found as for the local check (outside a git worktree is `check: not in a git repository`, exit 1). A `remote.json` that is missing, ignored or cannot be found is a stderr line with exit 1: `check: <host>: remote.json not found at <path>`, `check: <host>: remote.json is ignored: <reason>` or `check: <host>: remote.json cannot be found: LOCALAPPDATA is not an absolute folder`.
+
+It runs the box's preflight once over ssh with this repo's real work-folder key and the manifest's tools, bounded at 120 s, with no retry and no PC-side lock. A routed run of the same worktree running at the same time may collide with it (GATE-270). The preflight creates the same folders a routed run's preflight would.
+
+On stdout, each line prefixed `check: <host>: `, in this order:
+
+1. The header `check: <host>: <repo> (work folder <key>)`.
+2. `check: <host>: created <folder>` for each folder the preflight made, at most 20, then `check: <host>: and <n> more created folders`.
+3. The items, worded as on this PC with `<host>` for `here`: the SDK reads `.NET SDK <version> (rollForward <policy>) missing (<host> has <list>)`, the list cut at 20 entries and then `, and <n> more`; `.NET SDK skipped: <host> sent no SDK list`, with `: <last stderr line>` when there is one; a tool that did not answer is `check: <host>: <tool> skipped: the builder gave no answer`; the workloads are `not checked yet`.
+4. The install hints `install: <host>: <tool>: <command>`: `cargo install cargo-nextest --locked`, `npm install -g pnpm@<min>` (`npm install -g pnpm` with no minimum), `rustup toolchain install <min> && rustup default <min>`, `dotnet-install.ps1 -Version <v>`, and `run the build-box toolchain script on <host>` for node, pwsh, ffmpeg and a rust with no minimum.
+5. The summary.
+
+When the repo's `.gate/siblings.toml` names a sibling or cannot be read, one line `check: <host>: siblings skipped: a routed run lays them out` comes instead of the sibling lines and counts as skipped.
+
+A failure is one stderr line, exit 1, and nothing else on stdout:
+
+- `check: <host>: unreachable: <ssh's last error line>` for ssh status 255, and on the timeout `check: <host>: unreachable: no answer in <limit>`;
+- `check: <host>: no answer in <limit>, and ssh could not be stopped: <error>`;
+- `check: <host>: runs gate <theirs>, this PC runs <ours>; run gate push`, a version mismatch printing only this line;
+- `check: <host>: has no gate box that takes this call (status <n>); run gate push`;
+- `check: <host>: preparing <root> failed (status <n>): <line>`, `<root>` being the builder's work root;
+- `check: <host>: cannot run ssh: <error>`, and `check: <host>: <why>` for any other failure of the call.
+
+Text from the builder is cut to 4 KiB and escaped. The exit is 0 when nothing is missing, 1 when something is missing or the check could not run (not in a git repository, unreachable, a different build, no box, `remote.json` missing or unusable), 2 for a usage error.
+
+Test-seams builds accept, with `--builder` only, `--test-remote-transport`, `--test-remote-ssh` (which also needs `--test-remote-transport`) and `--test-remote-timeout-ms`, as the routed client reads them ([Black-box suite harness](#black-box-suite-harness)).
 
 ### `gate burn`
 
@@ -236,7 +339,7 @@ The launcher maps no `-Expect`: the compatibility layer refuses it, and callers 
 
 Hidden from the usage and from `--help`. It is the builder side of a routed run, run over ssh on the builder ([The box side](#the-box-side)).
 
-`gate box preflight|run|stop|boot|outputs|inflight <payload>` takes exactly one verb and one non-empty payload word, and no `--state-dir`: every path comes from the payload. Any other shape (no verb, no payload, an empty payload, an unknown verb, an extra word) prints `usage: gate box preflight|run|stop|boot|outputs|inflight <base64 JSON payload>` alone on stderr and exits 2.
+`gate box preflight|run|stop|boot|outputs|inflight --stdin` takes exactly one verb and the word `--stdin`, and no `--state-dir`: the request is the first line of stdin, and every path comes from it. Any other shape (no verb, no `--stdin`, any other word in its place, an unknown verb, an extra word) prints `usage: gate box preflight|run|stop|boot|outputs|inflight --stdin (the base64 JSON request as stdin's first line)` alone on stderr and exits 2.
 
 ### Later subcommands
 
@@ -262,13 +365,13 @@ Further modes arrive as subcommands of the same binary, each designed with its i
 
 | Code | Meaning |
 |---|---|
-| 0 | The command exited 0 and its log holds no failure marker. |
+| 0 | The command exited 0 and its log holds no failure marker. `gate check` found nothing missing or too old (with `--builder`, nothing missing). |
 | `N` | The command's own non-zero status, passed through whole: the gate exits with the command's 32-bit exit code (300 stays 300; 0xFFFFFFFF reads as -1 where a caller reads it signed), and the FAILED line and the journal show it signed (a routed run whose connection was lost reports 255, RC7). |
-| 1 | The command exited 0 but its log holds a failure marker (never with `--no-markers`, V2); or the gate itself failed after the command started (X4); or it failed before queueing (the working directory, the command's environment, the log's folder or an earlier log that cannot be removed); or a routed run passed but its changes or outputs could not be brought back (RC9, D1). |
+| 1 | The command exited 0 but its log holds a failure marker (never with `--no-markers`, V2); or the gate itself failed after the command started (X4); or it failed before queueing (the working directory, the command's environment, the log's folder or an earlier log that cannot be removed); or a routed run passed but its changes or outputs could not be brought back (RC9, D1); or `gate check` found something missing or too old, or could not run (outside a git worktree; with `--builder`, also an unreachable builder, a different build, no box, or a `remote.json` missing or unusable). |
 | 2 | Usage: a missing, unknown or invalid input; a `.cmd` or `.bat` word the gate refuses (C5); a `--log` inside the state root; a critical gate under a heavy or light slot marker (K7). Nothing is queued. `gate box` also uses 2 for a refused payload and for a refused subfolder or batch word ([The box side](#the-box-side)). |
 | 124 | The watchdog killed the command: STALLED, TIMED OUT or BACKSTOP (X2), for a routed run by the builder (TIMED OUT, BACKSTOP) or the client (STALLED, BACKSTOP); or a routed run's fetch outlived its transfer ceiling: TRANSFER TIMED OUT. |
 | 127 | The command could not be started (C7); the slot is released at once. `gate box run` uses it for the same failure. |
-| 75 | A builder refused a routed run (`gate box`): busy (`gate box run` finding its work folder's lock held), unreachable, parity, rebooted, tools, version. The PC side reads the refusal and falls back to a local run, so a caller sees 75 only as a command's own status, or as a refusal that carried no reason (T5). |
+| 75 | A builder refused a routed run (`gate box`): busy (`gate box run` finding its work folder's lock held), unreachable, parity, rebooted, tools, layout (the box could not clear or lay out its work folder), version. The PC side reads the refusal and falls back to a local run, so a caller sees 75 only as a command's own status, or as a refusal that carried no reason (T5). |
 
 The codes are kept (V4), with 75 added for refusals. 124 is the status coreutils `timeout` uses, so no caller mistakes a kill for the command's own status; a command that itself exits 124 is told apart in the journal's `verdict`.
 
@@ -308,13 +411,23 @@ The lines of a run that starts its command:
 - A log in use, exit 1, before queueing and with no journal line: `gate: the log <path> is in use by another gate`, when another gate holds the log's mutex ([Kernel object names](#kernel-object-names)). A mutex a killed gate left is taken silently. `gate: cannot take the mutex <name> of the log <path>: <error>`, exit 1, when the mutex cannot be opened or tried.
 - Routing, on stderr and in the log, with the command running here: `gate: ignored <path>: <reason>; running locally` when `remote.json` is there but unusable (not a file, unreadable or refused), and `gate: not routed: <reason>` when a heavy gate that would route stays local.
 
-  The second line is said for `--local` (`gate: not routed: --local`), a word outside the worktree (`gate: not routed: <word> is outside the worktree`), a folder that holds nothing the snapshot sends (`gate: not routed: <sub> holds nothing the snapshot sends`), a word of the command that is not valid Unicode (`gate: not routed: a word of the command is not valid Unicode`), or a fact that could not be read (`gate: not routed: cannot run git: <error>`, or the working directory or git's output).
+  The second line is said for `--local` (`gate: not routed: --local`), a word outside the worktree and its declared siblings (`gate: not routed: <word> is outside the worktree`), a folder that holds nothing the snapshot sends (`gate: not routed: <sub> holds nothing the snapshot sends`).
+
+  It is also said for a word of the command that is not valid Unicode (`gate: not routed: a word of the command is not valid Unicode`), or a fact that could not be read (`gate: not routed: cannot run git: <error>`, or the working directory or git's output).
+
+  These lines keep a matched command here for siblings: a problem with the repo's `.gate/siblings.toml` (`gate: not routed: .gate/siblings.toml: <problem>`, control characters and reordering marks escaped), a declared sibling with no worktree beside the root (`gate: not routed: sibling <name> not found beside the worktree`), a root folder name the builder cannot lay out (`gate: not routed: the worktree folder name <leaf> cannot be laid out on the builder`).
+
+  Also a declared sibling `remote.json` does not allow: `gate: not routed: sibling <name> is not allowed in remote.json`, or `siblings <a>, <b> are not allowed in remote.json` for more, with `: <problem>` added when the `siblings` value cannot be used.
+
+  A sibling folder that cannot be carried says `gate: not routed: sibling <name> <reason>`, `<reason>` being `is a link or a junction`, `is not a folder`, `has a .git that is a link or a junction`, `is the worktree's own folder` or `is the same folder as sibling <other>`.
 
   A gate that is not heavy, has a covering parent, matches no pattern or has no `remote.json` says nothing.
 - A local run that drops its dotnet `--no-build`, on stderr and in the log, before it takes a slot: `gate: dropped --no-build: <reason>; building on a heavy slot`, or `gate: dropped --no-build: <reason>; building on the parent gate's <heavy|critical|light> slot` for a gate covered or lent a slot ([Routing](#routing)).
-- A routed run, on stderr and in the log, after any `gate: dropped --no-build: the last build may have run on the other machine` and `gate: outputs: none brought back for a --no-build command` lines. While it waits for a remote slot: `gate: waiting for a remote slot on <host> (<n> busy)` and `gate: still waiting for a remote slot on <host> (<s> s)`, as a local wait says them, ETA included.
+- A routed run, on stderr and in the log, after any `gate: dropped --no-build: the last build may have run on the other machine` and `gate: outputs: none brought back for a --no-build command` lines, says `gate: routed with siblings: <name> (<path>), ...` when the repo declares siblings.
 
-  A run the builder does not take says why and goes on here: `gate: remote <host> <reason>; running here`, with `<reason>` one of `full` (no remote slot within 60 s), `busy`, `unreachable`, `parity`, `rebooted`, `tools` or `version`, and `gate: remote <host> client could not start: <detail>; running here` when the remote client cannot start.
+  The line names each sibling in declared order with its root as routing spells it. While it waits for a remote slot: `gate: waiting for a remote slot on <host> (<n> busy)` and `gate: still waiting for a remote slot on <host> (<s> s)`, as a local wait says them, ETA included.
+
+  A run the builder does not take says why and goes on here: `gate: remote <host> <reason>; running here`, with `<reason>` one of `full` (no remote slot within 60 s), `busy`, `unreachable`, `parity`, `rebooted`, `tools`, `layout` or `version`, and `gate: remote <host> client could not start: <detail>; running here` when the remote client cannot start.
 
   A remote part the gate cannot start says the second line before it takes a remote slot when ssh is missing, else after it ([Routing](#routing), The remote client's run).
 
@@ -329,7 +442,7 @@ The lines of a run that starts its command:
   With no figure from the builder (its sampler failed) the clause reads `load-adjusted unknown: the sampler failed` and the past-ceiling check uses `<c>`. The client's status is the gate's own, passed through as `N`.
 - The stale line, on stderr and in the log, before the passed line, when a routed dotnet build (verb `build`, `test`, `publish`, `pack`, `run` or `msbuild`, with no `--no-build` of its own) passed and did not bring everything back: `gate: routed build left stale: <folders>`.
 
-  The folders are every PC-side folder (no cap) that a judging glob matches and no brought-back glob covers, judged per file: a folder whose every matching file came back is not named. The judging globs are the run's `outputs`, or the default globs when the repo's entry is absent or `[]`, plus the defaults `**/bin/**` and `**/.godot/mono/temp/bin/**`. The folders are sorted, relative to the worktree root, `/`-separated, escaped and joined with `, `.
+  The folders are every PC-side folder (no cap) that a judging glob matches and no brought-back glob covers, judged per file: a folder whose every matching file came back is not named. The judging globs are the run's `outputs`, or the default globs when the repo's entry is absent or `[]`, plus the defaults `**/bin/**` and `**/.godot/mono/temp/bin/**`. The folders are sorted, relative to the worktree root, `/`-separated, escaped and joined with `, `. A run with siblings names a sibling's output folders the same way, relative to the main worktree (`../<sibling>/src/App/bin`).
 
   A glob names the folder where its last plain folder part ends, at the first place from the left where its plain parts match whole path components: `**/bin/**` and `**/bin/**/*.dll` name each `src/App/bin`, `out/**/App.dll` names `out`, `publish/App.exe` names `publish`; a glob with no plain folder part (`**`, `*.dll`, `**/*.dll`) names nothing. The line may name a folder this build did not touch.
 
@@ -490,6 +603,7 @@ The temporary sibling is made new, a link or junction at its name opened as itse
 | box command's stop event | `Local\gate-remote-<key>-<nonce>-stopped` | the same; the name is not root-dependent |
 | log's mutex | `Local\gate-log-<l>` | `Local\gate-<h>-log-<l>` |
 | routed lock | `Local\gate-routed-<k>` | `Local\gate-<h>-routed-<k>` |
+| worktree lock | `Local\gate-worktree-<v>-<f>` | `Local\gate-<h>-worktree-<v>-<f>` |
 
 The critical mutex is taken by a critical gate once no earlier live critical ticket exists, and held for its whole run. An abandoned one counts as taken ([Abandoned slots](#abandoned-slots)).
 
@@ -498,6 +612,8 @@ The box command's job name comes from the payload's `Job` (`<key>` is the payloa
 `<l>` is the log hash: 16 lower-case hex digits, the first 8 bytes of the SHA-256 of the lower-cased, normalised absolute log path. Each run takes its log's mutex without waiting, before it readies the log, and holds it until after the slot release and the final append to the log, so two gates never write one log; a second gate fails at once ([Output lines](#output-lines)).
 
 `<k>` is the key hash: 16 lower-case hex digits, the first 8 bytes of the SHA-256 of the lower-cased work-folder key. The Rust remote client takes the routed lock without waiting, before the remote slot, and holds it for the whole remote attempt ([Routing](#routing)).
+
+`<v>` and `<f>` are the worktree lock's folder id: the volume serial number as 16 lower-case hex digits and the 128-bit file id as 32, read from the worktree root opened following links, so two spellings of one folder share one lock. A sync-back takes it for each worktree it has a back commit for, waiting for another run's hold ([Routing](#routing), Sync-back).
 
 The environment carries one more name: `GATE_SLOT_HELD`, the slot marker ([Critical drain and nesting](#critical-drain-and-nesting)).
 
@@ -650,7 +766,7 @@ Fields beyond J1's:
   `transfer-timed-out` is a routed run's fetch after the command cut at its transfer ceiling.
 
   A routed run is a kill only when the gate killed it; a command that exits 124 on its own is `failed`.
-- `fallback`: `reason`, one of `full` (no remote slot within the 60 s wait), `busy`, `unreachable`, `parity`, `rebooted`, `tools` (T5), `version` ([The box side](#the-box-side)) and `client` (the remote client could not start, as when it finds no usable ssh).
+- `fallback`: `reason`, one of `full` (no remote slot within the 60 s wait), `busy`, `unreachable`, `parity`, `rebooted`, `tools` (T5), `layout` (the box could not clear or lay out its work folder), `version` ([The box side](#the-box-side)) and `client` (the remote client could not start, as when it finds no usable ssh).
 
   The `take` after it is the run's local one, untagged, its `waitedSeconds` counted from the `fallback`, except after `full`, where it counts from the run's `queue` line; a Ctrl+C that ends that local wait writes the same figure on its `abandon`.
 - a routed run's `take`, `release` and `abandon` carry the tag; its `release` has the builder's `adjustedSeconds` (null when it said none) and a `wallSeconds` of the whole remote call, and the verdict `timed-out` or `backstop` after a kill by the builder or by the client's backstop.
@@ -715,13 +831,15 @@ Two rolls within one second collide on the archive name: the second archive fail
 
 ### remote.json
 
-`remote.json` keeps the PowerShell gate's format (T1), read by `gate-router` as [Routing](#routing) describes: `host`, `slots`, `repos` and the optional per-repo `outputs`, read afresh by each routed gate and ignored as a whole with one line when unusable. A host of one letter is refused (`host must not be a single letter, which a git host:path URL reads as a drive`).
+`remote.json` keeps the PowerShell gate's format (T1), read by `gate-router` as [Routing](#routing) describes: `host`, `slots`, `repos` and the optional per-repo `outputs` and `siblings`, read afresh by each routed gate and ignored as a whole with one line when unusable. A host of one letter is refused (`host must not be a single letter, which a git host:path URL reads as a drive`).
 
 The optional `hosts` is an array of strings naming further builders, which only `gate push` reaches; a routed run goes to `host` alone. Each entry passes the checks `host` does, with the same reasons worded `hosts entries ...`.
 
 The push order is `host`, then `hosts` in file order, an entry equal to an earlier one in any letter case skipped. A `hosts` that is not an array of strings, or holds a bad entry, never affects routing: `gate push` alone refuses the file with `push: ignored <path>: <reason>`.
 
 ops-tower reads only `slots`.
+
+A repo's own `.gate/toolchain.toml`, which declares the tools and workloads a routed run's builder needs, is a separate file in the snapshot, not part of `remote.json`: [Routing](#routing) (Toolchain manifest) describes its format.
 
  It carries no `v`; its format moves with the remote port (GATE-10).
 
@@ -997,6 +1115,10 @@ The box heartbeat (BW9) is the box wrapper's command-time heartbeat, not the wai
   A name found nowhere is a start failure. Unlike the PowerShell gate, which lets CreateProcess search for the program (the current folder among others), the gate never passes an unfound name on. This is deliberate, for security: a repo cannot plant a `git.exe` at its root. The `gate-win32` layer passes the path as `lpApplicationName`, so CreateProcessW searches no folder (not the gate's, the current one, System32 or PATH).
 
   A start failure prints `gate: could not start <word> (<resolved>): <message>` and exits 127, releasing the slot (C7); the lines are in [Output lines](#output-lines).
+
+  A program the gate's own tool probes and SDK read find along `PATH` (`program_output` in `remote/git.rs`) and judge against the worktree is followed through links, and the file the link leads to is the image started. Its command line's first word stays the name it was found by, not the target's, because a multi-call program picks what to be from argv[0] alone: rustup's `rustc.exe` and `cargo.exe` are links to `rustup.exe`, and started by the target's name they would answer as rustup. A batch target still runs through the system folder's cmd.exe, given the target.
+
+  The worktree refusal covers only the file launched: a program it starts in turn (a multi-call proxy, a shim) is not judged.
 - **Process creation.** The `gate-win32` layer is the contract the run uses (`Launch` → `Suspended` → `Running`). The command is created suspended with an explicit environment block, assigned to the gate's job `Local\gate-job-<gate pid>`, then resumed (kept, X1, P1). Creation flags are `CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT` plus the priority class, with no new console and no new process group.
 
   The job has no limits: no breakaway, no kill-on-close. (This is `gate run`; the box's command is created with `CREATE_BREAKAWAY_FROM_JOB` and a restricted non-elevated token, [The box side](#the-box-side).) (A `test-seams` build's `--test-job-breakaway` makes the job allow breakaway, `JOB_OBJECT_LIMIT_BREAKAWAY_OK`, still without kill-on-close: `Job::create_breakaway`.)
@@ -1059,7 +1181,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
 - **What routes** is kept (T2): a heavy gate, not `--local`, under no covering or lending parent, outside a git hook (`GIT_INDEX_FILE` set to a non-empty value), whose first word is not `git` or `prek`, in a git worktree of a repo `remote.json` lists, whose words with in-worktree paths rewritten (T3) match one of that repo's patterns.
 
-  A matched command still runs here, saying why, when a word names a path outside the worktree or the gate's folder holds nothing the snapshot sends.
+  A matched command still runs here, saying why, when a word names a path outside the worktree (a drive-relative, root-relative, share, device or climbing form included, see [the path rewrite](#routing)) or the gate's folder holds nothing the snapshot sends.
 
   `--no-build` is dropped from the builder's words of a dotnet `test` or `run` command, saying so (T4); `build`, `msbuild`, `pack` and `publish` keep it everywhere. The fallback here drops the same words after every refusal, rebuilding locally as the builder would have, because an earlier routed step (a repo's test-all build) may have built only on the builder, so a later `dotnet test --no-build` that falls back here would find no build output.
 
@@ -1115,6 +1237,30 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
   Git is asked only then: a folder in no worktree (any non-zero `git rev-parse` exit), a repo the file does not list (the main checkout's folder name as a repo name, in any letter case) and words no pattern of the repo matches stay local silently, the first matching pattern winning. A fact that cannot be read stays local saying `gate: not routed: <reason>`. A machine with no `remote.json` costs no git call.
 
+  The repo's `.gate/siblings.toml` is read once the file lists the repo, before the words are rewritten, so the rewrite knows the siblings; a gate that stays local before that point never reads it.
+
+  A command no pattern matches stays local silently whatever the file holds.
+
+  Only a matched command acts on what the file says, in this order, each keeping the run here with its line.
+
+  First a problem with the file (`gate: not routed: .gate/siblings.toml: <problem>`, the first problem, on one line, control characters and reordering marks escaped).
+
+  Then, for declared siblings: a name the builder cannot lay out (the same `.gate/siblings.toml:` line, checked again whatever the reader checked, before consent).
+
+  Then a declared sibling `remote.json` does not allow (`gate: not routed: sibling <name> is not allowed in remote.json`; every sibling is not allowed when the `siblings` value cannot be used, the line then ending `: <problem>`).
+
+  Then a root folder name the builder cannot lay out (`gate: not routed: the worktree folder name <leaf> cannot be laid out on the builder`); a sibling named like the root's own folder (`gate: not routed: .gate/siblings.toml: siblings[<i>] is the worktree's own folder: "<name>"`).
+
+  Then each sibling's folder, in declared order, the first fault stopping the look: no worktree beside the root (`gate: not routed: sibling <name> not found beside the worktree`), or a refusal (`gate: not routed: sibling <name> <reason>`, [Output lines](#output-lines)).
+
+  Last, by folder id: a sibling whose folder is the worktree's own (`is the worktree's own folder`) or an earlier sibling's (`is the same folder as sibling <other>`), reached under two names.
+
+  A sibling's folder is present when it is a real folder that is a direct child of the root's parent, `<parent of the root>\<name>`, opened by its name inside the parent without following a link (a link or junction is refused as `is a link or a junction`, a file as `is not a folder`), holding a `.git` that is a folder or a linked worktree's file and not a link or junction (`has a .git that is a link or a junction`); with no `.git`, or nothing there, it is missing.
+
+  A failure to read says `gate: not routed: cannot read the sibling folder <path>: <error>`.
+
+  The folder ids are the volume serial and 128-bit file id of each open folder. A repo with no file declares no siblings and nothing changes, except that the root's own folder id is read for every matched command, siblings or none, once the declared siblings are found: a root whose id cannot be read keeps the run here with `gate: not routed: cannot read the id of the worktree folder <root>: <error>`, since the sync-back's worktree lock is named by it.
+
   git is found along the gate's own `PATH` (absolute entries only) and run by its full path from the gate's folder, with the `GIT_*` variables that point it at another repository, index or config removed and `core.fsmonitor` off, so a gate in a hook that exports `GIT_DIR` still routes.
 
   Each call gets 60 s, after which git is killed and the gate runs here saying `gate: not routed: git did not answer within 60 s` (in whole milliseconds, `1 ms`, when `--test-git-limit-ms` sets a limit that is not a whole number of seconds).
@@ -1137,12 +1283,36 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
   `slots` is a whole number 1 to 16 (1 when missing), `repos` an object whose values are arrays of non-empty `-like` patterns, and `outputs` an optional object of the same shape whose globs may not hold `[` or `]`; a repo with no `outputs` entry brings back `**/bin/**` and `**/.godot/mono/temp/bin/**`.
 
   A cargo command instead (its first word's file stem is `cargo` in any case; one a `pwsh` script is handed after `--` is not) brings back `target/*/*.exe`, `target/*/*.dll` and `target/*/*.pdb`: each profile folder's own files, never `deps/`, `build/` or `incremental/`. A repo's own `outputs` list replaces either default.
+
+  `siblings` is an optional object of the same shape as `outputs`, but each value an array of folder names the builder can lay out (`is_layout_name`): the sibling worktrees the machine lets that repo carry, its repo name matched in any letter case and each sibling name exactly. A repo with no entry is allowed none.
+
+  A `siblings` that is not an object, or holds a value that is not an array of such names, never refuses the file: it allows no sibling, and the rest of the file is read as usual ([Sibling worktrees](#routing)).
 - **The `-like` matcher** is PowerShell's wildcard match, case-insensitive, over the words joined by single spaces. It folds case by simple case folding. Inside a `[...]` set, a non-ASCII member whose .NET case-insensitive equivalents differ (the Kelvin sign and `k`) can match in PowerShell and not here.
 - **The in-worktree path rewrite** (T3) finds a path wherever a drive letter, a colon and a separator start one inside a word (`--flag=X:\a`, `-p:Name=X:\a`, a script's text), each start judged on its own.
 
-  A path runs to the first of `, ; " ' ) | & < >`. In a word that holds one of those or a line break (a script word: a script's text or a list) white space ends a path too; in any other word, one argument, a path runs through its spaces. A drive other than the root's is followed through `subst` mappings.
+  A path runs to the first of `, ; " ' ) | & < >`. In a word that holds one of those or a line break (a script word: a script's text or a list) white space ends a path too; in any other word, one argument, a path runs through its spaces.
+
+  The router keeps this `subst` model for anyone who routes from a subst drive; its tests use a made-up drive letter, never a mapping of the machine they run on.
+
+  A drive other than the root's is followed through `subst` mappings as a chain, at most 26 hops with a visited set, and the root's own letter is never asked; a cycle, an unreadable device or a target that is not a `\??\` path gives no spelling, and the run stays local.
 
   A bare first word (no separator, drive or `.`/`..`) becomes `./name` only when that file exists in the gate's folder; otherwise it stays bare, for the builder's `PATH`.
+
+  With siblings declared, a path inside a sibling's root (every spelling the root can have, `subst` drives included) is sent as `..` once for each level of the gate's folder below the worktree root and once more, then `/<name>` as declared and the rest, with the separator the in-worktree edit uses.
+
+  A relative path is inside a sibling when its `..` climb exactly to the root's parent and then enters a declared sibling (names compare in ASCII letter case only; `yaat-server2` is not `yaat-server`). Any other climb above the root, a word naming the parent itself, and leaving a sibling again (`../yaat-server/../x`) are outside, and keep the run here with `gate: not routed: <word> is outside the worktree`.
+
+  An absolute path whose `..` leaves the root it starts below and lands in the worktree or in a declared sibling is sent as where it lands; landing anywhere else is outside.
+
+  Windows stops `..` at the root of a drive or share, so a `..` past that root is outside, never a climb to the root's parent. The floor comes from the spelling of the gate's folder: a folder spelled on a drive, a `\\?\X:` path or a UNC share whose root is the worktree root or a folder below it sits fewer folders below that root than it sits below the worktree root, and a relative climb past the difference is outside.
+
+  A path on a bare `subst` drive that stands for a root (`S:\..`) never leaves that root either.
+
+  Every word is judged for outside at each path start: the start of the word, after white space or a line break, after `, ; " ' ) | & < > ( =`, after a leading `@` (and an `@` right after any path start), and after the colon of a switch that starts its white-space token or follows a `"`, `'` or `,` (`-bl:`, `/p:`). The forms below keep the run here with the same `is outside the worktree` line.
+
+  Drive-relative text is a letter and `:` not followed by `\`, `/` or `:`, anywhere in a word or at any path start (`C:..\..\secret`, `-bl:C:..\x.binlog`); `-c:Release`, `/t:Build`, `$env:PATH` and `crate::mod` are not. Root-relative text is a single `\` at a path start, or a single `/` only where a value begins (after `=`, a switch colon or `@`); `/p:...`, `/c` and nextest's `test(/^run::/)` stay switches or text.
+
+  A share or device path at any path start is outside: two separators, or a drive right after `\\?\`, `\\.\`, `//?/` or `//./`. Relative text that climbs out of the worktree (or past the drive-root floor above) is outside at every path start, not only at the word's.
 - **The work folder** on the builder is named `<repo name>-<key>`, the worktree root's last segment cut to letters, digits, `-` and `_` and 8 hex digits of the SHA-256 of the lower-cased root ([Glossary](GLOSSARY.md), work-folder key).
 - **The routed run's life** is kept (T5) and built in `remote/mod.rs` and `run.rs`: its ticket is heavy with `remote: true` and queues apart from the local waiters, which never count it ahead of them, nor it them; it waits up to 60 s for a remote slot (`--test-remote-wait-ms` in a test build); it takes one with a claim of kind `remote` of its own and calls the remote client with the route, the log and the limits (`--stall` as given, the interrupt).
 
@@ -1196,13 +1366,15 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
     A lock held elsewhere says `gate: remote <host> busy; running here` and falls back `busy` before any queueing, so two routed runs of one worktree give a deterministic `busy`, not a race. A lock that cannot be opened or taken says `gate: cannot open the mutex <name>: <error>` or `gate: cannot take the mutex <name>: <error>`, then the busy line.
   - **Snapshot.** Part A's snapshot and bridge commit.
-  - **Run line.** The run call is one cmd line, `"%LOCALAPPDATA%\gate\bin\gate.exe" box run <base64 JSON>`, built before anything is sent. It may be at most 8127 characters, counting `%LOCALAPPDATA%` as 100 (8191, cmd's limit, less 64 for sshd's own `cmd.exe /c`). A longer one says `gate: the remote run failed: the run call is <n> characters, longer than the 8127 cmd takes (8191 less 64 for sshd's own cmd.exe /c); shorten the command` and sends nothing.
+  - **Run line.** The run call's cmd line is the fixed `"%LOCALAPPDATA%\gate\bin\gate.exe" box run --stdin`, the same whatever the run holds; every other `gate box` call's line differs only in its verb. The request, base64 of compact UTF-8 JSON, is the first line of the call's stdin, followed for the run call by the outputs manifest line, so no request size is capped by a command line. The box reads the request line with a cap of 16 MiB, newline included ([The box side](#the-box-side)).
   - **Preflight.** `gate box preflight` over ssh. Status 255, ssh's own status for a lost connection, says `gate: remote <host> unreachable: <last stderr line>` and falls back `unreachable`; the line is the last `\r` update of the last stderr line, its first 4 KiB, escaped (Escaping, below). Status 9009 or 2 (no `gate box` verb there) says `gate: not routed: <host> has no gate box that takes this run (preflight status <n>)` and falls back `version`.
 
     Any other non-zero status says `gate: preparing <builder root> on <host> failed (status <n>)` and ends the run with that status. A reported version text other than this PC's whole one, build id included, says `gate: not routed: <host> runs gate <theirs|unknown>, this PC <ours>; run gate push` and falls back `version`; the builder's version is its first 4 KiB, escaped.
-  - **Parity.** After the preflight and before the push, `remote/parity.rs` checks that the builder's `gate: remote sdks` line (from the preflight) has what the snapshot needs. A builder with no sdks line, or a tree that is not .NET (no `global.json`, `.sln`, `.slnx` or `.csproj` anywhere in the snapshot), skips the check.
+  - **Parity.** After the preflight and before the push, `remote/parity.rs` checks that the builder's `gate: remote sdks` line (from the preflight) has what the snapshot needs. A builder with no sdks line, or a tree that is not .NET (no `global.json`, `.sln`, `.slnx` or `.csproj` anywhere in the snapshot), skips the SDK part of the check; the tools of the repo's `.gate/toolchain.toml` are judged either way (Toolchain manifest, below).
 
-    A lacking builder says `gate: remote toolchain mismatch: <repo> needs <need>; <host> has <sdks>` then `gate: remote <host> parity; running here`, and falls back `parity` (status 75).
+    A lacking builder says `gate: remote toolchain mismatch: <repo> needs <need>; <host> has <sdks>` once for each need, in the order the needs are listed, then a single `gate: remote <host> parity; running here`, and falls back `parity` (status 75).
+
+    A need is an SDK or a tool the manifest declares; each kind words the builder's side of its own line (for an SDK, its SDKs, or `none`; for a tool, the version the builder found, or `none`). The SDK needs come first, then the tools' in the manifest's order.
 
     `<need>` is `.NET SDK <version> (rollForward <policy>)` for a pin, the policy defaulting to `patch`, or `a .NET <major> SDK` without one, where the major is that of this PC's newest SDK (none listed: no check). A pin is met by dotnet's own rule for the nine rollForward policies and `allowPrerelease`, versions read as `x.y.znn` (feature band and patch).
 
@@ -1241,24 +1413,50 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
     The builder's preflight reports its installed workloads beside the SDK line (`gate: remote workloads {ids}`), and the PC refuses with status 75 `parity` and falls back to a local run when the snapshot's projects need a workload the builder lacks.
 
     The source of what a repo needs is either this PC's own workload list or a scan of the snapshot's project files; the choice is made after measuring what `dotnet workload list` costs per preflight.
+
+    **Toolchain manifest** (GATE-206, GATE-209): a repo's `.gate/toolchain.toml` declares what a routed run's builder must have beyond the .NET SDK, and `remote/toolchain.rs` reads it as data from text the caller hands over. [`gate check`](#gate-check) reads it from the worktree on disk and says what this PC lacks; a routed run with parity reads it from the snapshot's git tree and refuses the route when the builder lacks a tool it declares (below).
+
+    `toolchain::meets` compares a found version with a minimum. A repo's sibling worktrees are not declared here but in `.gate/siblings.toml` ([Sibling worktrees](#routing)), whose problems keep a run local.
+
+    The file has a `[tools]` table of `name = "version"` and a top-level `workloads` array of .NET workload ids. A version is a minimum, "this or later", written `major[.minor[.patch]]` with the missing parts 0 (`"24"` is 24.0.0), and `""` means the tool is present at any version. The known names are `rust`, `cargo-nextest`, `node`, `pnpm`, `pwsh`, `godot` and `ffmpeg`; an unknown name is kept and flagged unknown, for the consumer to skip with a line. A leading byte order mark is skipped.
+
+    A file that is not UTF-8 or does not parse is unreadable whole, and the line for it is `gate: cannot read .gate/toolchain.toml: <why>; skipping the manifest's checks`, `<why>` being `line <l>, column <c>: <toml message>` or `not valid UTF-8 (...)`. A routed run words a manifest problem its own way, `gate: .gate/toolchain.toml: <problem>; skipping it`, for a whole file that cannot be read as for a bad entry, `<problem>` escaped.
+
+    A bad entry is skipped alone and named in the reader's problems: `tools.<name> is not a version: "<text>"`, `tools.<name> is not a string (TOML <type>)`, `tools is not a table (TOML <type>)`, `workloads is not an array (TOML <type>)`, `workloads[<i>] is not a string (TOML <type>)`, `workloads[<i>] is empty` and `<key> is not a key of the manifest (tools, workloads)`.
+
+    **On a routed run**, the client lists the snapshot's tree before the preflight: `git ls-tree -r -z --name-only` for the file names parity needs, and a root listing and a `.gate` listing for the manifest. The `.gate` folder and `toolchain.toml` are found ignoring letter case, and the exact-case regular file wins.
+
+    The file is used only when it is a regular blob, read by its object id; a submodule, a symbolic link, a folder, or several spellings of it with none in exact case gets a skip line saying why. A repo with no manifest says nothing.
+
+    The preflight's `Needs` carry the tools the manifest declares whose names the box knows how to probe (the known names above), each with its minimum, or empty for any version. A name outside them is skipped with `gate: .gate/toolchain.toml names unknown tool <name>; skipping it` and not sent.
+
+    The builder answers each tool with a `gate: remote tool <name> <version|present|missing|skipped: <why>>` line. A tool it found missing, or older than the minimum, is a need, and the route is refused as under Parity: one `gate: remote toolchain mismatch: <repo> needs <name> <min> or later; <host> has <version|none>` line per need (`<name>` alone when the manifest sets no minimum), then the parity fallback line, and the run goes local.
+
+    A tool the builder did not probe, gave no answer for, or found at a version that cannot be read against a minimum gets `gate: <host> did not probe <name>: <why>; not checking it` and is not a need. The lines come in this order: the SDK step's own, then the manifest's problem lines, then the per-tool skip lines in the manifest's order, then the mismatch lines.
+
+    A text from the manifest or the builder is escaped, and the builder's cut to 4096 bytes, so neither can forge a line. `toolchain::standing` judges a tool against what its probe found (met, too old, missing, not readable, skipped) in one place, which `gate check`'s report shares; `gate check`'s output is unchanged. `--test-remote-interrupt-at manifest` raises the interrupt just before the manifest is read.
+
+    Two pins a repo already declares are read beside it, also as minimums: each tool's version in `.config/dotnet-tools.json` (the release part, so `1.0.0-beta.1` is 1.0.0; read as strict JSON, as dotnet reads it, so a comment or a trailing comma makes the file unreadable, and a tool id given twice counts once, with its last version) and the `Godot.NET.Sdk/<version>` a project file names, on its root `<Project Sdk=...>` or an `<Sdk Name="Godot.NET.Sdk" Version=...>` element directly inside it (an `<Import Sdk=...>`, a deeper `<Sdk>` element and a `min=` version are not read).
+
+    `global.json` stays the SDK pin, read by `parity.rs` as above.
   - **Push.** `git push --no-verify --no-recurse-submodules --progress [--receive-pack=…] -- <host>:<builder root>/<repo>.git +<snapshot>:refs/gate/<key> [+<bridge>:refs/gate-bridge/<key>]`, with `GIT_SSH_COMMAND` carrying the ssh options. Success says `gate: pushed snapshot <8 hex> in <s> s (<size>|up to date)` and moves the local `refs/gate-remote/<key>`.
 
     The builder keeps one bare repo per repo name, `<builder root>/<repo>.git`, shared by every key of that repo; the key is only the ref's name.
 
     The size is read from git's last `Writing objects: 100%` line, ignoring `remote:` lines, and only a number with a unit (or `bytes`) counts as one, else the line says `up to date`. Failure says `gate: pushing the snapshot to <url> failed (status <n>)` and falls back `unreachable`.
-  - **Run call.** The line goes over `ssh -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=4 -o ForwardAgent=no -o ClearAllForwardings=yes -o Compression=yes -- <host> <line>`, each argument separate.
+  - **Run call.** The line goes over `ssh -o RequestTTY=no -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=4 -o ForwardAgent=no -o ClearAllForwardings=yes -o Compression=yes -- <host> <line>`, each argument separate.
 
-    The last option is the run call's alone: the preflight, stop, boot and outputs calls, git's ssh command and `gate push` ask for none. The run call's compression covers both directions of its connection: the command's output and protocol lines one way, the run line and the outputs manifest the other.
+    `-o RequestTTY=no` leads the options of every `gate box` call and `gate push`'s, so stdin never passes through a pseudo-terminal. The last option, `-o Compression=yes`, is the run call's alone: the preflight, stop, boot and outputs calls, git's ssh command and `gate push` ask for none. The run call's compression covers both directions of its connection: the command's output and protocol lines one way, the request and the outputs manifest the other.
 
-    The box's output passes through to the log and the console, except the box's heartbeats and its machine lines, which the client hides from both and keeps out of the lines it holds: the start marker `gate-remote-started: <nonce>` and the refusal tag `gate-remote-refused: <nonce> busy|tools`, each naming this run's `Nonce` and read on stderr only, as a whole line, and the kill tag and the adjusted line below.
+    The box's output passes through to the log and the console, except the box's heartbeats and its machine lines, which the client hides from both and keeps out of the lines it holds: the start marker `gate-remote-started: <nonce>` and the refusal tag `gate-remote-refused: <nonce> busy|tools|layout`, each naming this run's `Nonce` and read on stderr only, as a whole line, and the kill tag and the adjusted line below.
 
     The kill tag `gate-remote-killed: <nonce> timed-out|backstop` is said by the box just after its own kill line, and the client counts a box kill only on this run's tag with a status 124 (a status 124 alone is also what a stopped job or the command itself may end with). The client takes the run's verdict from the tag's kind, never from the log's last kill line.
 
     The adjusted line `gate-remote-adjusted: <nonce> <s.sss>` carries the load-adjusted seconds the box counted, said once the command's output has drained unless the sampler failed, read like the tag on stderr only and the last one winning; another run's, a malformed one or one whose seconds are not a finite number is a line like any other.
 
-    A status 75 is a refusal only when this run's refusal tag came on stderr before any start marker (`busy` or `tools`, the fallback reason); a tag after the marker is ignored, so a command that prints the human busy or tools line, or a tag of its own, and exits 75 ends with status 75 and no fallback.
+    A status 75 is a refusal only when this run's refusal tag came on stderr before any start marker (`busy`, `tools` or `layout`, the fallback reason); a tag after the marker is ignored, so a command that prints the human busy, tools or layout line, or a tag of its own, and exits 75 ends with status 75 and no fallback.
 
-    Safety rests on order, not on the nonce being secret (it is on the box's and ssh's command lines): the box says the marker before it creates the command's process, and the client ignores every tag once it has heard the marker.
+    Safety rests on order, not on the nonce being secret (the request is on no command line, but the nonce still appears in the run id, the pipe names and the archive name): the box says the marker before it creates the command's process, and the client ignores every tag once it has heard the marker.
   - **Outputs.** In `remote/outputs.rs`, for a run with output globs; a run without them sends `Outputs` `[]` and `OutputsFull` false, no manifest, and says nothing here, and writes no marker unless the route withheld its outputs (a dotnet `--no-build` command the builder built): that run writes the pending marker after the push, as below, and no end of it clears the marker. The client builds the manifest ([The outputs module](#the-box-side)) before the run call, hashing every matching file.
 
     **Manifest time** (GATE-23): SHA-256 streams, with no whole-file read into memory, and only the PC hashes every file (the box hashes changed files only; `obj` is not under the default globs). No timing line is added to routed runs.
@@ -1293,7 +1491,9 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
     Once the push succeeds, and before the run call, it writes the pending marker `<state root>\remote\<key>.outputs-pending` (an empty file; a marker whose existence cannot be read counts as present), so a run refused at the preflight or by the parity check leaves none.
 
-    The payload carries the globs as `Outputs` and `OutputsFull` (true when the marker was there), and the manifest goes as one line on the run call's stdin, which is then closed; a pre-banner retry feeds it again. A marker that cannot be written says `gate: the remote run failed: cannot write the outputs pending marker <path>: <error>`; a run call whose input could not be sent logs only `gate: the run call's input was not sent: <error>`.
+    The payload carries the globs as `Outputs` and `OutputsFull` (true when the marker was there), and the manifest goes as the line after the request on the run call's stdin, which is then closed; a pre-banner retry feeds both again. A marker that cannot be written says `gate: the remote run failed: cannot write the outputs pending marker <path>: <error>`.
+
+    A call whose input could not be sent logs `gate: the <verb> call's input was not sent: <error>`, only when the call reached the box's banner and ended neither refused nor with ssh's 255, since any other end says why on its own lines. An input still being sent 2 s after the call ended logs `gate: the <verb> call's input was still being sent 2 s after the call ended`, and a feeder thread that panicked `gate: the <verb> call's input feeder panicked`.
 
     The client accepts only the last stderr line starting `gate-remote-outputs: `, kept as it is heard so a stdout flood cannot push it out, and echoes it like any box line. It must be `gate-remote-outputs: 0` or `gate-remote-outputs: <n> <key>-<this run's nonce>.tar.zst` with n above 0.
 
@@ -1373,6 +1573,21 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
       The log alone gets `gate: cannot read the bytes <program> wrote: <error>` (the first failed counter read of a call), `gate: the processes of <program> did not end within 30 s`, `gate: cannot read the processes of <program>: <error>` and `gate: cannot end <program>: <error>`.
     - A `fetch` that fails before the banner is not retried when its job wrote more than 1 MiB.
+    - **The worktree lock.** A sync-back with a back commit takes the mutex of each worktree it will write ([Kernel object names](#kernel-object-names)), the main one's alone for a single repository, before its fetch and holds it until the sync-back ends, the quarantine and any patch removed, so two runs that write one folder, under one spelling of its path or two, never write it at once.
+
+      The locks are taken in the order of the folders' ids, one per folder. One another run holds is waited for, up to the attempt's lock wait (the 60 s git limit, counted from the first lock asked for), saying once `gate: remote waiting for the worktree <name>: another run holds it`; a wait past it fails the run with `another run held the worktree <name> for more than <n> s`, and a Ctrl+C ends the wait as an interrupt. A lock left by a holder that ended is taken.
+    - **A pair's sync-back** (a run that carries siblings, built in `remote/syncback.rs` and the box, not yet reached by a routed run while the client stays local for siblings) is all or nothing across its repos. It applies only the back commits of the box's last stderr line `gate: remote back commits: <name> <sha|none>, ...` (a standard output line never counts), which must name exactly the pair's repos, the main one first, in order.
+
+      A line that is missing, malformed or names other repos says `gate: remote changes not applied: the builder did not say which commits it made`; a pair whose sibling snapshots do not match its siblings says `gate: remote changes not applied: the run's sibling snapshots do not match its siblings`. Either applies nothing and a passing run becomes 1; its outputs are then not brought back, `gate: remote outputs not brought back: the pair's remote changes were not applied`.
+
+      The box says `gate: remote back commits: failed` instead of the commits on every pair exit past its refusal checks that did not push every back commit: a failed lock, stop event, back ref clear, layout step, checkout, subfolder check or tools restore, a command killed by the ceiling, a failed commit or push, and a failed wait for the command only once its job has ended and its output drained.
+
+      A busy, layout or tools refusal says no back commits line. `failed` and a line of only `none` apply nothing and leave the run's status.
+    - In a pair, each repo with a back commit is fetched into a quarantine of its own in its own object store and checked as above, with the repo's name right after the first colon of each refusal (`gate: remote changes not applied: <repo>: <why>`). A back commit the builder does not advertise as the line's says `gate: remote changes not applied: <repo>: the builder does not have the commit it named (<back 8 hex>)`.
+
+      Any refusal, ignored commit or failed move applies nothing in any repo and keeps every back commit it took at its worktree's `refs/gate-remote/<key>-back`; a repo that could have been applied is named in `gate: remote changes not applied to <repos> either: a sync-back of a pair is all or nothing`, and a passing run becomes 1.
+    - Otherwise the PC checks each worktree against its snapshot again (it does so after every fetch and just before it writes), writes every repo's patch and checks it with `git apply --check` (a failure says `git apply --check failed in <repo> (<why>); nothing was applied` and fails the run), looks at the interrupt once (`--test-remote-interrupt-at apply` raises it there), and applies the patches in pair order, saying `gate: synced back <n> file(s) in <repo>: <names>` for each.
+    - An apply that fails after the first fails the run with `git apply failed in <repo> (<why>); applied: <repos or none>; not applied: <repos>`. Any step that fails or is interrupted keeps every taken back commit and ends `; the changes are kept: see git diff in each repo at refs/gate-remote/<key>-back` (an interrupt says it as the single repository's does).
 
   - **Outputs fetch.** In `remote/outputs.rs` and `remote/client.rs`, after a passing run whose box said an accepted outputs line naming an archive and a passing sync-back.
 
@@ -1542,13 +1757,45 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
   **Escaping.** Every text a builder supplies that a `gate:` line quotes is escaped: control characters, U+061C, U+200E, U+200F, U+202A-U+202E, U+2066-U+2069, U+2028 and U+2029 are written `\u{..}`. That covers the preflight's last line, the builder's version in the version refusal, and every `git ... failed` line of the snapshot, the saved ref and the sync-back. A failed git line lists git's stdout first and its stderr last, keeping the last 10 lines and 4 KiB so git's `fatal:` line survives.
 
   The client's git calls also drop `GIT_CONFIG_COUNT`, `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM` and every `GIT_CONFIG_KEY_n` and `GIT_CONFIG_VALUE_n`, so the caller's git configuration never reaches the builder's repo, and `GIT_SSH_VARIANT` and `GIT_EXTERNAL_DIFF`, so neither the ssh option syntax nor the diff a sync-back applies can be changed from outside.
-- **Sibling worktrees** (GATE-19, GATE-213), planned, not built: some repos' builds reach into a sibling repo by relative path, and a routed run that sends one worktree's snapshot would compile something different on the builder without any error.
+- **Sibling worktrees** (GATE-19, GATE-213), the declaration, the machine's consent, the decision, the rewrite and the PC's sync-back built, the snapshot send planned: some repos' builds reach into a sibling repo by relative path, and a routed run that sends one worktree's snapshot would compile something different on the builder without any error.
 
-  `remote.json` has no `siblings` field and the code reads none; a repo's siblings will be declared under `.gate/` in the repo (GATE-213). A routed gate in a repo with siblings will snapshot each sibling's worktree beside its own (`../{name}`, as the pair folder lays them out, or beside the main checkout), and the box will lay the work folders out the same way, so relative paths between them resolve.
+  A repo declares its siblings in a tracked file of its own, `.gate/siblings.toml`, beside the [toolchain manifest](#routing) and apart from it, so a fault in one never changes what the other means.
 
-  A word naming a path inside a declared sibling's worktree is rewritten as an in-worktree path is.
+  A declaration alone carries nothing: the machine consents per repo in `remote.json`'s `siblings`, `{"siblings": {"<repo>": ["yaat-server"]}}` ([remote.json](#remotejson)), so a tracked file cannot make this PC send a folder it was never told it may. The file has one key, `siblings`, an array of folder names, each a sibling worktree at `../<name>` of the worktree root: `siblings = ["yaat-server"]`. `siblings = []` declares none; a file without the key, or with any other key, is a problem.
 
-  This lands before a repo with siblings is enabled for routing; a repo without siblings is enabled without it. What happens when a declared sibling is missing, whether the work-folder key is per pair or per repo, and how sync-back covers a sibling's changed files are open ([Open questions](#open-questions)).
+  A name is one or more ASCII letters, digits, `.`, `_` and `-`, not starting or ending with a dot, not a reserved device name (`CON`, `PRN`, `AUX`, `NUL`, `COM1` to `COM9`, `LPT1` to `LPT9`, whatever follows the first dot), not repeated in another letter case, and not the root's own folder name; at most 8 names. The same rule decides whether a root's own folder name can be laid out. A leading byte order mark is skipped.
+
+  Unlike the toolchain manifest, any problem keeps a matched run here: a sibling left out would build something different with no error. [`gate check`](#gate-check) lists every problem of the file and each declared sibling's consent and folder beside the worktree root.
+
+  The reader's problems are `<key> is not a key (siblings)`, `declares no siblings`, `siblings is not an array (TOML <type>)`, `siblings[<i>] is not a string (TOML <type>)`, `siblings[<i>] is empty`.
+
+  Name faults: `siblings[<i>] is not a folder name of letters, digits, '.', '_' and '-' not starting or ending with a dot, not a device name: "<name>"`, `siblings[<i>] repeats an earlier name: "<name>"`, and `siblings names more than 8 folders` (at the ninth name, reading no further), `line <l>, column <c>: <toml message>` and `not valid UTF-8 (...)`.
+
+  The file is read from disk as it stands, never from a snapshot, and only once a routed command matched. `.gate` is opened as itself and held, and `siblings.toml` is opened by its name inside that folder object (`gate_win32::open_beneath`, an `NtCreateFile` relative to the held handle), never following a link, so nothing swapped in for `.gate` after the open is read. Both are opened sharing reading, writing and deletion, so a checkout or an editor's save is never blocked.
+
+  A `.gate` that is a link or a junction says `.gate is a link or a junction`, and one that cannot be opened `.gate: cannot read it: <error>`; a `.gate` that is a file, or no `.gate`, holds no siblings.
+
+  A `siblings.toml` that is a link, a junction or a folder says `is a link, a junction or not a file`, one over 64 KiB `is larger than 64 KiB`, and one that cannot be read `cannot read it: <error>`, each after `gate: not routed: .gate/siblings.toml: `.
+
+  A file that is another kind of reparse point (a deduplicated one) is read through its filter from a handle opened again (`gate_win32::reopen_through_filter`), which must be the same file (`gate_win32::same_file`), else it is the not-a-file problem.
+
+  A declared sibling is checked in this order, the first fault keeping a matched run here with its line ([Routing](#routing), the decision): its name, the machine's consent, the root's folder name, then each folder, then the folder ids.
+
+  A sibling that passes all is carried: the route records the root's folder name and each carried sibling, `RemoteRun.leaf` and `RemoteRun.siblings` (its name, its root and its folder's id), and the run says `gate: routed with siblings: <name> (<path>), ...`. Nothing is sent to the builder yet.
+
+  Before the run takes its slot, the client re-checks each carried sibling's name and root as text and reads no folder (`remote/carried.rs`); one that fails falls the run back here with the client fallback reason, so no sibling is dropped from a run that is sent.
+
+  While the builder takes no sibling pairs, the Rust client stays local for any call carrying a sibling, before any ssh call or push: it says `gate: not routed: sibling <first sibling's name> the builder does not take sibling pairs yet`, then `gate: remote <host> client could not start: sibling pairs are off; running here`, and journals a `fallback` with reason `client`. A call with no siblings is unaffected.
+
+  How a word naming a sibling is rewritten is under Routing (The in-worktree path rewrite).
+
+  The box side of a sibling pair is built ([The box side](#the-box-side)): the payload's `Pair` and `SiblingSnapshots`, a bare repository per repo, the work folder laid out as `Work\{leaf}` and `Work\{sibling}` under the layout record, and back commits all or nothing across the repos, so relative paths between the trees resolve.
+
+  The PC's sync-back of a pair is built too, all or nothing across the repos (Sync-back, under [Routing](#routing)), but the client sends no `Pair` yet, so no routed run reaches it; still planned: a routed gate in a repo with siblings will snapshot each sibling's worktree and send it with the run.
+
+  `remote/held.rs` is the holder of a pair's folders for that send: the root's parent is opened once, the root and each sibling are opened beneath it without following a link, their ids, final paths, case, reparse points and `.git` are checked, a network volume is refused, the handles are held without delete sharing, and a recheck opens each path as git would. Nothing calls it yet, so its refusals (`gate: not routed: sibling <name> <why>`) are not said by any run.
+
+  Sibling support lands before a repo with siblings is enabled for routing; a repo without siblings is enabled without it.
 - **Inputs** (GATE-22), planned, not built: a routed command can need ignored files only the PC has, and the snapshot sends only tracked and untracked-not-ignored files. A repo's optional `inputs` list of ignored-file globs, beside `outputs` in the routing file, is packed with the outputs' transport and hash-diffed against the builder's work folder, so an unchanged input costs nothing.
 - **The per-host failure record** (GATE-27), planned, not built: a record in the state root holds a builder's failure reason and an expiry. A routed gate that finds an unexpired record says `gate: not routed: <host> <reason> <n> s ago`, runs here and journals `fallback` with the reason, rather than paying the snapshot, preflight and push again for the same reason.
 
@@ -1571,7 +1818,9 @@ Each verb is one ssh call today, and the call's cost is its connection, not its 
 
 A routed run therefore moves to one long-lived connection carrying every verb, `gate box serve`, and the per-call client stays until that lands (GATE-70 holds the measurement, and GATE-109 the work).
 
-The payload is one base64 word (standard alphabet, padded) of UTF-8 JSON holding the wrapper's keys: `Key`, `Bare`, `Work`, `Lock`, `Index`, `OutputFolder` and `Job`, and for `run` also `Command`, `Subfolder`, `Identity`, `Outputs`, `Nonce`, `OutputsFull`, `Timeout` and `Host`, and for `outputs` also `Name`. `inflight` reads only `Root`.
+The payload is one base64 word (standard alphabet, padded) of UTF-8 JSON, sent as the first line of the call's stdin (never on a command line), holding the wrapper's keys: `Key`, `Bare`, `Work`, `Lock`, `Index`, `OutputFolder` and `Job`, and for `run` also `Command`, `Subfolder`, `Identity`, `Outputs`, `Nonce`, `OutputsFull`, `Timeout` and `Host`, and for `outputs` also `Name`. `inflight` reads only `Root`.
+
+`preflight` also reads an optional `Needs`, an object of tool name to minimum version text (`""` for any version), which the PC builds with `remote::payload::preflight_word` from the tools it wants probed; it is omitted when there are none, so a payload without needs is the same bytes as before.
 
 Unknown keys are ignored, and `Outputs`, `OutputsFull` and `OutputFolder`, which the outputs transport owns (GATE-44), are read only by `run` (the outputs) and `outputs` (`Name`, `OutputFolder`); `preflight`, `stop` and `boot` ignore them.
 
@@ -1581,7 +1830,7 @@ For `run` the payload also needs a `Snapshot` key: exactly 40 lowercase hex char
 
 The value is empty for a missing key or JSON null, the string as given with control characters escaped, and compact JSON for any other non-string. Two differences from the wrapper are deliberate: the echoed value has its control characters escaped, and the check is stricter than the wrapper's .NET `$`, which accepts a trailing newline.
 
-Every path comes from the payload and nothing is written under the gate's state root; `gate box` takes no `--state-dir`. Test seams are `test-seams`-gated flags, never environment variables, and sit before the verb (`gate box --test-... run <payload>`) in a `BoxSeams` struct on `BoxRequest`, apart from the `gate run` seams, so `--test-print-request` is unchanged.
+Every path comes from the payload and nothing is written under the gate's state root; `gate box` takes no `--state-dir`. Test seams are `test-seams`-gated flags, never environment variables, and sit before the verb (`gate box --test-... run --stdin`) in a `BoxSeams` struct on `BoxRequest`, apart from the `gate run` seams, so `--test-print-request` is unchanged.
 
 The box seams go in any order before the verb, each also as `--<seam>=<value>`. `--test-heartbeat-ms <n>` sets the period of the command heartbeat, and `--test-box-console fail-before` makes the command's UTF-8 console fail before the command starts (the only accepted value, else `gate: --test-box-console must be fail-before, got '<value>'`).
 
@@ -1593,11 +1842,11 @@ The box's ceiling has three seams: `--test-box-sample-ms <n>` replaces the 5 s s
 
 `--test-box-kill-leaves <n>` stands in for the number of processes the last ending of a ceiling or backstop kill leaves (a whole number above 0), so the box says its note for a job that is still not ended.
 
-The other two box seams are `--test-outputs-budget-bytes <n>`, which replaces the 50 GiB outputs budget of the box's trim, in bytes, and `--test-dotnet-limit-ms <n>`, which replaces the 30 s bound of the preflight's `dotnet --list-sdks` read, in milliseconds.
+The other three box seams are `--test-outputs-budget-bytes <n>`, which replaces the 50 GiB outputs budget of the box's trim, in bytes, `--test-dotnet-limit-ms <n>`, which replaces the 30 s bound of the preflight's `dotnet --list-sdks` read, in milliseconds, and `--test-probe-limit-ms <n>`, which replaces the 10 s shared bound of the preflight's tool probes, in milliseconds.
 
 A seam is refused as the `gate run` seams are: no value, given twice, and a value outside its rule (`gate: --test-outputs-budget-bytes must be a whole number above 0, got '<v>'`, `... must be at most 2147483647 ...`, `... needs a value`, `... is given twice`).
 
-The rules: a whole number above 0 and at most 2147483647 for the heartbeat, the sample period, the outputs budget, the dotnet limit and the kill's leftover count, 1 to 100 for `--test-box-free-percent`, `true` or `false` for `--test-box-sampler-fail`. Without the feature each word gets the box usage line.
+The rules: a whole number above 0 and at most 2147483647 for the heartbeat, the sample period, the outputs budget, the dotnet limit, the probe limit and the kill's leftover count, 1 to 100 for `--test-box-free-percent`, `true` or `false` for `--test-box-sampler-fail`. Without the feature each word gets the box usage line.
 
 The box gives each run's command its own build servers: the command's environment is the box's own with `SharedCompilationId` and `MSBUILDNODEHANDSHAKESALT` set to `gate-box-<Nonce>` (the payload's `Nonce`), `MSBUILDUSESERVER=0`, `DOTNET_CLI_USE_MSBUILD_SERVER=0` and `MSBUILDDISABLENODEREUSE=1`, each replacing any inherited value (names compared case-insensitively).
 
@@ -1607,17 +1856,25 @@ The box's own git calls and tool restore do not get these settings.
 
 The servers a run starts live in its job and are ended at its end, so every routed build starts its own nodes and compiler server; none is kept warm between runs.
 
-`git` and `dotnet` are found with the gate's own program resolution, which never searches the current folder. A payload that is not base64 JSON prints `gate: box payload is not base64 JSON: <reason>` on stderr and exits 2.
+`git` and `dotnet` are found with the gate's own program resolution, which never searches the current folder.
+
+The box reads the request, before the verb and before any lock, as the first line of stdin, ended by its newline or the end of input (one newline, and a carriage return before it, is not part of it), reading at most 16 MiB and never waiting past the newline; it has no deadline, as a client that stops sending is ended by its own watchdog. All of these print one line on stderr and exit 2: no request, `gate: the box request is missing on standard input`; 16 MiB without a newline, `gate: the box request on standard input reaches 16 MiB without a newline`; stdin failing, `gate: the box request on standard input could not be read: <error>`; a line that is not UTF-8 or a payload that is not base64 JSON, `gate: box payload is not base64 JSON: <reason>`.
 
 Built verbs:
 
 - **`boot`** prints `gate: remote boot <UTC time>` on stdout (ISO 8601, 7 fractional digits, `Z`; the system time less the tick count since boot) and exits 0.
 
   When the time cannot be read it prints `gate: remote could not read the boot time: <message>` on stderr and exits 1, so the client's boot query after a lost connection says the call failed rather than taking a status 0 with no time. The preflight says the same line and goes on: an unreadable boot time fails no preflight, and the client then makes no boot query.
-- **`preflight`** creates the bare repo at `Bare` when missing and the work folder at `Work` with `.git`, `origin` set to `Bare`, `core.autocrlf false` and `core.eol lf`, and writes `.git\objects\info\alternates` as `<Bare with />/objects` and a line feed, without a byte order mark, only when the file is missing or empty.
+- **`preflight`** creates the bare repo at `Bare` when missing and the work folder at `Work` with `.git`, `origin` set to `Bare`, `core.autocrlf false` and `core.eol lf`, and writes `.git\objects\info\alternates` as `<Bare with />/objects` and a line feed, without a byte order mark, unless the file already holds exactly that.
 
-  It prints on stdout, in order: `gate: remote created <Bare>` (only when it created the bare repo), `gate: remote version <gate version>` (the same text as `gate --version` after `gate `, build id included), the boot line, and `gate: remote sdks <v1,v2|none>`; git's own output passes through. A payload without `Bare` or `Work` prints `gate: box payload lacks <key>` and exits 2.
+  The preflight takes no lock, so a link, a junction or a file at the tree's `.git`, `.git\objects` or `.git\objects\info`, or anything but a file at `.git\config`, is never followed: it readies nothing there (no git step, nothing written) and the run repairs it under the lock. It readies the work folder's repository only when the folder's layout record says a run of one repo or is missing; a record that says a pair, `changing`, or cannot be read leaves the folder to the run.
+
+  With a `Pair` in the payload the preflight makes the folder above `Work` and one bare repo per repo, `Bare` for the main checkout and `{root}\{stem}.git` for each sibling (`{root}` is `Bare`'s folder, `{stem}` the sibling's name with every character but an ASCII letter, digit, `-` and `_` made `-`), and touches nothing inside `Work`.
+
+  It prints on stdout, in order: `gate: remote created <Bare>` (only when it created the bare repo), `gate: remote version <gate version>` (the same text as `gate --version` after `gate `, build id included), the boot line, `gate: remote sdks <v1,v2|none>`, and one `gate: remote tool <tool> ...` line for each tool of the payload's `Needs` (Tool probes, below); git's own output passes through. A payload without `Bare` or `Work` prints `gate: box payload lacks <key>` and exits 2.
 - A failing git step prints `gate: remote <step> failed (status <n>)` and exits with that status; a git that cannot start prints `gate: remote <step> failed: <OS message>` and exits 1. The steps are `git init --bare`, `git init`, `git remote add`, `git config core.autocrlf` and `git config core.eol`.
+
+  On a pair run a step's line names its repo after the step: `gate: remote git init --bare failed for <leaf|sibling>` (status `n` and message forms as above), `gate: remote git init failed for <name>`, `gate: remote git remote add failed for <name>`, `gate: remote git config core.autocrlf failed for <name> (status <n>)`; a run of one repo says them as above.
 
   A folder or file that cannot be made prints `gate: remote could not create the folder <path>: <error>` or `gate: remote could not write <path>: <error>` and exits 1. An SDK list that cannot be read prints `gate: remote could not read the SDK list: <message>`, omits the sdks line and still exits 0; the client then skips the parity check.
 
@@ -1626,7 +1883,21 @@ Built verbs:
   The box has no interrupt; the job is killed at a 30 s bound (`--test-dotnet-limit-ms` lowers it).
 
   Past the bound the line reads `gate: remote could not read the SDK list: dotnet --list-sdks did not answer in 30 s`. The other `<message>`s are `dotnet --list-sdks wrote more than 16 MiB`, `dotnet --list-sdks exited with status <n>` and `cannot run dotnet: <why>`.
-- **`run`** runs the payload's `Command` (a list of texts) in `Work`, and exits with the command's own whole 32-bit status after a successful run. Its stdout is the command's stdout, LF-terminated; its stderr is the command's stderr plus the box's own lines.
+
+  Tool probes (`boxside/probe.rs`): for each tool of the payload's `Needs`, in payload order, the box runs a probe and says one line on stdout after the sdks line, all once every probe has ended: `gate: remote tool <tool> <version>`, `gate: remote tool <tool> present` or `gate: remote tool <tool> missing`, or `gate: remote tool <tool> skipped: <why>`. The box only reports; the PC compares the minimums.
+
+  The probes are `rustc --version` for `rust`, `cargo-nextest nextest --version` for `cargo-nextest` (the plugin directly, never through `cargo`, so no `.cargo\config.toml` above the folder can alias it), `<name> --version` for `node`, `pnpm` and `pwsh`, and `ffmpeg -version`. `godot` has no probe.
+
+  Each program is found through `PATH` and `PATHEXT` as `dotnet` is (a `.cmd` shim runs through the system folder's cmd.exe; a `.ps1` is not run) and runs in the system folder on a hidden console, in the bounded runner of `remote/git.rs` (`program_output`).
+
+  The probes run in parallel, started at the same time as `dotnet --list-sdks`, under one shared 10 s deadline (`--test-probe-limit-ms` lowers it); one still running at the deadline is killed with its process tree, and one with no time left is skipped without being launched.
+
+  The version is read from the first non-blank line of stdout, else of stderr: the first run of two or more dot-separated numbers after an optional `v`, its first three kept. A line with no such run, a number longer than 10 digits or a non-zero exit gives `present`; a program that cannot be found gives `missing`.
+
+  The `<why>` of a skip is `unknown tool`, `no probe for godot`, `no answer in <n> s` (or `<n> ms` when the limit is not whole seconds), `no answer in <limit>, and could not be stopped: <error>`, `the probe failed` (followed by `: <panic text>` when the probe panicked), or the runner's failure text: `cannot run <program>: <why>`, `<program> <args> wrote more than 16 MiB` or `cannot run <program>: cannot read the system folder: <error>`.
+
+  A payload whose `Needs` is not an object of texts prints `gate: box payload Needs is not an object of texts; probing nothing` on stderr, probes nothing and still exits 0.
+- **`run`** runs the payload's `Command` (a list of texts) in `Work` (in `Work\{Leaf}` for a sibling pair), and exits with the command's own whole 32-bit status after a successful run. Its stdout is the command's stdout, LF-terminated; its stderr is the command's stderr plus the box's own lines.
 
   The heartbeat: `gate box run` writes `gate-remote-heartbeat: <cpu ms>` on stderr every 5 s, on `gate-watchdog`'s `BeatClock` and `Pump`. Before the command starts (from just before the checkout) and after the command's wait ends it is not CPU-gated, so every period writes a beat, the first one period after it begins.
 
@@ -1652,7 +1923,9 @@ Built verbs:
 
   A heartbeat line never splits a forwarded line: the pump writes under the output lock the forwarders take. The run's git children (fetch, checkout, clean, the back ref reset, the back commit's add, write-tree, rev-parse, commit-tree and push, and diff-tree) have their output forwarded the same way, line by line; the box's own lines are written whole under std's stream lock, which the pump's writes take too. A line still waiting for the lock when the readers stop is dropped.
 
-  After git exits, the box waits at most 2 s for its pipes to close. A pipe a leftover process still holds says `gate: remote git's output is still held open by a leftover process; stopped reading` and the run goes on. A client that closed the connection while git's output was forwarded ends the run with 255 and `gate: remote the client closed the connection during git <step>`. A pipe that cannot be read says `gate: remote could not read git's stderr: <error>` (or `stdout`).
+  After git exits, the box waits at most 2 s for its pipes to close. A pipe a leftover process still holds says `gate: remote git's output is still held open by a leftover process; stopped reading` and the run goes on.
+
+  A client that closed the connection while git's output was forwarded ends the run with 255 and `gate: remote the client closed the connection during git <step>`, the step's name saying git once (`during git init`, not `during git git init`). A pipe that cannot be read says `gate: remote could not read git's stderr: <error>` (or `stdout`).
 
   A failed CPU read writes `gate: remote heartbeat stopped: cannot read the CPU of job <name>: <error>` (or `... cannot list the processes of job <name>: <error>`) and a thread that cannot start writes `gate: remote heartbeat stopped: cannot start the heartbeat: <error>`; the heartbeats end and the run does not.
 
@@ -1662,23 +1935,53 @@ Built verbs:
 
   The work folder's: `gate: box payload Lock must be <Work>.lock`, `gate: box payload Index must be <Work>.index`, `gate: box payload Key is not a work-folder key: <key>` and `gate: box payload Job is not this work folder's job name: <job>`.
 
+  The sibling pair's, when the payload has a `Pair` (`{"Leaf": "<name>", "Siblings": ["<name>", ...]}`, the main checkout's folder name and one to 8 sibling folder names).
+
+  Its names: `gate: box payload Pair is not an object of a Leaf text and a Siblings list of texts`, `gate: box payload Pair name '<name>' is not a folder name of letters, digits, '.', '_' and '-' not starting or ending with a dot, not a device name`, `gate: box payload Pair names no sibling`, `gate: box payload Pair names more than 8 siblings` and `gate: box payload Pair names <a> and <b>, equal ignoring case` (the leaf counts as a name).
+
+  Its work folder and bare repositories: `gate: box payload Key <key> is not the work-folder key of the Pair's Leaf <leaf>` (the key is `<repo name of Leaf>-<8 lower-case hex digits>`), `gate: box payload Work must be <root>\work\<key> with a Pair: <work>`, `gate: box payload Bare must be <root>\<name>.git with a Pair: <bare>` and `gate: box payload Pair sibling <name> would share the bare repository <stem>.git` (two repos whose bare repositories are equal ignoring case).
+
+  `SiblingSnapshots`, an object of exactly the pair's sibling names, each a 40 lower-case hex digit commit, is read by `run` alone: `gate: box payload SiblingSnapshots is not an object`, `gate: box payload SiblingSnapshots must name exactly the Pair's siblings: <names>` and `gate: remote run payload's SiblingSnapshots <name> '<value>' is not a 40-hex commit sha`.
+
   `Identity` may hold only `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL`, `GIT_AUTHOR_DATE`, `GIT_COMMITTER_NAME`, `GIT_COMMITTER_EMAIL` and `GIT_COMMITTER_DATE`.
 
   `Key` is `[A-Za-z0-9_-]+` and is the last name of `Work`; `Job` is `Local\gate-remote-<Key>-<12 hex digits>`. `run`, `stop` and `preflight` check the key; `run` and `stop` check the job.
 
   The lock `<Work>.lock` is opened with no sharing and without following links, must be a plain disk file, and is held for the run's life; a held lock prints `gate-remote-refused: <nonce> busy` then `gate: remote work folder <key> is busy` and exits 75. A lock that cannot be opened prints `gate: remote could not open the work folder lock <path>: <error>` and exits 1.
 
-  `Work` must not end with a separator (`gate: box payload Work must not end with a separator: <work>`, exit 2). Every git call in `Work` passes `-c core.hooksPath=<Lock>\hooks -c core.fsmonitor=false`, a hooks path that cannot exist while the box holds the lock, so a repository's own hooks (one a build installed) never run in the box's git; fetch and push name `Bare` by its path, never `origin`.
+  `Work` must not end with a separator (`gate: box payload Work must not end with a separator: <work>`, exit 2). Every git call in a tree passes `-c core.hooksPath=<Lock>\hooks -c core.fsmonitor=false`, a hooks path that cannot exist while the box holds the lock, so a repository's own hooks (one a build installed) never run in the box's git; fetch and push name the repo's bare repository by its path, never `origin`.
+
+  Every git call in a tree also passes `--git-dir=<tree>\.git --work-tree=<tree>`, so neither a `core.worktree` nor a repository above the tree is followed.
 
   The payload is data, refused unless well formed; the command, and whatever it writes into `Work`, is the user's own code running as the user, and is trusted. It runs non-elevated, with a restricted copy of the box's token (the command's token, below).
 
-  The steps are fetch, the commit probe, checkout, clean and the back ref reset, the dotnet tool restore, then the command, then the sync-back. A failing step prints `gate: remote <fetch|checkout|clean|back ref reset> failed (status <n>)` and exits `n`.
+  The layout of the work folder: a run of one repo's tree is `Work` itself; a pair's are `Work\{Leaf}` for the main repo and `Work\{sibling}` for each sibling, each with its own bare repository and its own commit (`Snapshot` for the main repo, `SiblingSnapshots` for the others).
 
-  After the fetch of `refs/gate/<key>` from `Bare`, the probe runs `git cat-file -e <sha>^{commit}` in `Work`. A non-zero exit prints `gate: remote snapshot <sha> is not in the work folder's repository after the fetch` and exits 1, and a git that cannot start prints `gate: remote cat-file failed: <message>` and exits 1.
+  The layout record `<Work>.layout`, beside the lock, says which layout `Work` holds: `single`, `pair {Leaf} {siblings}` (the siblings sorted without regard to ASCII case, one space before each, so the same siblings in another order are one layout) or `changing` while the folder is being cleared. A missing record says `single`. It is read and written as the tools record is, through a handle that refuses a link, a folder or a file with more than one name.
+
+  Under the lock, before any checkout, the run makes `Work` when missing, opens it as itself and holds it (a link, a junction or a file there is refused, never followed), and, when the record names another layout than the run's, writes `changing`, removes every child of `Work` (each as itself, a link never followed), readies each tree and writes the run's layout.
+
+  A `changing` record left by a clear that did not finish clears again. A run of one repo in a folder already of that layout whose `.git`, `.git\objects` and `.git\objects\info` are each a folder of its own, and whose `.git\config` is a file when there is one, readies nothing here: the preflight readied the tree. A pair run readies its trees every time.
+
+  Readying a tree makes the tree and its `.git` folders of their own (a link, a junction or a file at either is removed as itself and the folder made again), then does what the preflight does for `Work`: `git init`, `origin` set to the repo's bare repository, `core.autocrlf false`, `core.eol lf`, and the alternates file naming that repo's own bare repository's objects, rewritten when it holds anything else.
+
+  Before its first git step, a run holding the lock replaces a link at `.git\objects` or `.git\objects\info` with a folder and removes a `.git\config` that is not a file, as itself; git then writes a fresh config. A config that cannot be removed refuses the run with `layout`.
+
+  A folder the box cannot clear or lay out refuses the run: `gate-remote-refused: <nonce> layout` then `gate: not routed: the builder could not clear <repo>'s work folder: <why>`, said together under the output lock, with the command never started, and exit 75. `<repo>` is the main repo's bare repository's name without `.git`.
+
+  The PC reads the 75 plus the tag as fallback reason `layout`, says `gate: remote <host> layout; running here`, runs the command here and passes the box's line on as it came. A git step that fails while a tree is readied keeps its own line and status instead.
+
+  The steps are the layout, fetch, the commit probe, checkout, clean and the back ref reset (each of the three git steps once per repo on a pair run, the main repo first), the dotnet tool restore, then the command, then the sync-back. A failing step prints `gate: remote <fetch|checkout|clean|back ref reset> failed (status <n>)` and exits `n`.
+
+  On a pair run the step is followed by the repo's name (`gate: remote fetch <name> failed (status <n>)`), while the steps that ready a tree say `failed for <name>` as the preflight's do.
+
+  After the fetch of `refs/gate/<key>` from the repo's bare repository, the probe runs `git cat-file -e <sha>^{commit}` in its tree. A non-zero exit prints `gate: remote snapshot <sha> is not in the work folder's repository after the fetch` (on a pair run `gate: remote snapshot <sha> is not in the repository of <name> after the fetch`) and exits 1, and a git that cannot start prints `gate: remote cat-file failed: <message>` (`cat-file <name> failed` on a pair run) and exits 1.
+
+  On a pair run every repo's back ref `refs/gate-back/<key>` is deleted before any checkout, so no repo keeps an earlier run's back commit whatever step of this run fails; a run of one repo deletes it in its checkout step.
 
   The checkout is `checkout -q --force --detach <sha>`, the payload's commit and not `FETCH_HEAD`, so a later push of the key changes nothing a running run runs. The box's git calls for preflight and the probe share one start path (`preflight::Git::code`).
 
-  The tool restore (`boxside/tools.rs`) runs `dotnet tool restore` in `{Work}\{Subfolder}` on a hidden console, in a job of its own named `{job}-tools`, created kill-on-close and never handed to dotnet, so the box's own handle keeps it: a box that dies or is killed takes the restore and everything it started with it, and a process the restore leaves running is terminated before the command starts.
+  The tool restore (`boxside/tools.rs`) runs `dotnet tool restore` in `{Work}\{Subfolder}` (`{Work}\{Leaf}\{Subfolder}` on a pair run) on a hidden console, in a job of its own named `{job}-tools`, created kill-on-close and never handed to dotnet, so the box's own handle keeps it: a box that dies or is killed takes the restore and everything it started with it, and a process the restore leaves running is terminated before the command starts.
 
   Its stdout and stderr are forwarded into the run's output line by line under the box's output lock, as the command's are, so they never split a heartbeat line. It has no time limit: a hung restore holds the work-folder lock, so every routed run of that worktree falls back `busy` meanwhile, and the run's stall watch does not see it, since the box heartbeat goes on outside the command (whether to cap it is GATE-105).
 
@@ -1686,7 +1989,7 @@ Built verbs:
 
   A client that closes the connection during it ends the job and the run exits 255 with `gate: remote the client closed the connection; stopping job {job}-tools`. None of these writes the record or starts the command.
 
-  The manifests are found by walking from the place folder up to the work root, never above the work folder, `.config\dotnet-tools.json` before `dotnet-tools.json` in each folder; a walk that finds none looks for nothing and writes no record.
+  The manifests are found by walking from the place folder up to the work root, never above the main repo's tree (the work folder on a run of one repo, `Work\{Leaf}` on a pair run), `.config\dotnet-tools.json` before `dotnet-tools.json` in each folder; a walk that finds none looks for nothing and writes no record.
 
   The record `<Work>.tools`, beside the lock, is 64 lower-case hex digits (SHA-256 over, per manifest in walk order, the UTF-8 path relative to the work folder, a NUL, the file bytes, a NUL), UTF-8, no BOM, no newline; the restore is skipped while the record equals the hash of the manifests.
 
@@ -1702,7 +2005,7 @@ Built verbs:
 
   Known limit, as in PowerShell: after the builder's NuGet cache is cleared, the `*.tools` records must be deleted by hand.
 
-  A `Subfolder` is compared against the snapshot with per-character simple uppercase (the wrapper's OrdinalIgnoreCase): one that is not a folder inside `Work` prints `gate: remote subfolder <sub> is not a folder inside the work folder`, deletes the back ref and exits 2, and one missing from the snapshot prints `gate: remote subfolder <sub> does not exist in the snapshot` and exits 2, `<sub>` with its control characters escaped in both.
+  A `Subfolder` is a folder of the main repo's tree, compared against its snapshot with per-character simple uppercase (the wrapper's OrdinalIgnoreCase): one that is not a folder inside `Work` prints `gate: remote subfolder <sub> is not a folder inside the work folder`, deletes the back ref and exits 2, and one missing from the snapshot prints `gate: remote subfolder <sub> does not exist in the snapshot` and exits 2, `<sub>` with its control characters escaped in both.
 
   The shared batch refusal (a `.cmd` or `.bat` word, [Command launching](#command-launching)) exits 2.
 
@@ -1760,9 +2063,17 @@ Built verbs:
 
   After the command, the sync-back commits the tree when it changed: a copy of the index at `<Work>.index` is staged, and the commit (message `gate-remote back`, parent HEAD) is written to `refs/gate-back/<key>` in `Bare`. A sync-back that fails prints `gate: remote sync-back failed: <message>` and turns a 0 status into 1; an index copy that cannot be removed prints `gate: remote could not remove <index>: <error>` and changes no status.
 
+  On a pair run the back refs are all or nothing across the repos: every repo's tree is committed first, the main repo's first (the one `Index` file serves each in turn), then every changed repo's commit is pushed to `refs/gate-back/<key>` in its own bare repository. A push that fails deletes the back ref of every repo pushed so far and the failing repo's own, each deletion tried and a failed one said, and the run fails as a sync-back failure.
+
+  A client that closed the connection during that undo ends the run with 255 instead. After all pushes, a pair run says under the output lock `gate: remote back commits: <name> <sha|none>, ...`, the main repo first and `none` for a repo whose tree is unchanged. The outputs step packs the main repo's tree only.
+
+  A pair run that does not push every back commit says `gate: remote back commits: failed` instead, under the output lock so it is the last such line and a line the command printed itself never stands for it: after a failed lock, stop event, back ref clear, layout step, checkout, subfolder check or tools restore, a command that cannot be waited for or that the ceiling killed, and a failed commit or push (after the undo above).
+
+  A failed wait ends the job and drains its output first, so no line of the command follows. A refusal (`busy`, `layout`, `tools`) says no such line, and a run of one repo never does. The PC applies nothing of a `failed` pair.
+
   A payload with `Outputs` globs adds these steps (GATE-44):
 
-  - Once the heartbeat beats and before the checkout, `run` reads the PC's manifest from stdin up to its first newline (at most 64 MiB; a manifest that cannot be read is said only once the command has passed), then removes the old archives from `OutputFolder`: each file named `<key>-<32 lower-case hex digits>.tar.zst`, whatever the key, last written more than a day ago, and no other file.
+  - Once the heartbeat beats and before the checkout, `run` reads the PC's manifest from stdin, the line after the request, up to its newline (at most 64 MiB; a manifest that cannot be read is said only once the command has passed), then removes the old archives from `OutputFolder`: each file named `<key>-<32 lower-case hex digits>.tar.zst`, whatever the key, last written more than a day ago, and no other file.
 
     An archive already gone counts as removed; one that cannot be removed, or a folder that cannot be listed, is said (`gate: remote could not remove the old outputs archive <path>`, `gate: remote could not list the old outputs archives in <folder>`) and fails nothing.
   - Just before the command, unless `OutputsFull`, it lists the files under the globs (size and last write); a listing that fails is said (`gate: remote could not list the outputs before the command: <error>`) and leaves every file counting as changed.
@@ -1934,6 +2245,8 @@ During the drain a PowerShell gate neither reads `gate.exe`'s tickets nor signal
 
 ops-tower follows the flag: it reads the PowerShell gate's files until the flag exists and then `v1\`, plus the PowerShell claims of a slot whose mutex is open, and its waiters come from `gate.exe`'s tickets ([Common rules](#common-rules)). The hooks and scripts that read gate command lines or output (inventory section 4) change in the same drain.
 
+The caller sweep deletes each repo's `tools/gate.ps1` in the same change that switches that repo's docs and scripts to `gate run`; no hand-over shim is kept. Callers write `gate run --log <path> --timeout <s> --slot <kind> -- <command>` (`--stall`, `--tail`, `--no-markers`, `--local`; `gate stop-tree <pid>`), never `gate.exe` or a path. `tools/install.ps1` builds with a plain `cargo build`, not through a gate, so a broken installed gate can always be replaced.
+
 After the caller sweep there is no fallback: callers run `gate ...` on PATH, a machine without it gets "command not found", and each repo's docs name the install script. Before the sweep, the PowerShell launcher's own fallback for a machine without the gate (H2) is the launcher's, not `gate.exe`'s.
 
 The compatibility layer is deleted once no caller uses `-Log`, `-TimeoutSeconds` or `-Slot`. The guard launcher stays: `sync-launchers.ps1` publishes both launchers.
@@ -1983,6 +2296,8 @@ A Rust integration suite drives the built `gate.exe` through its CLI and reads o
 
   On `push` the seams are `--test-push-ssh <path>` (the ssh program to run instead of the one found along `PATH`, the suite's `fake-ssh`) and `--test-push-bound-ms <n>` (each builder's bound); `push` has no `--test-print-request` ([`gate push`](#gate-push)).
 
+  On `check` the seams are `--test-probe-limit-ms <n>` (refused with `--builder`) and, each needing `--builder`, `--test-remote-transport`, `--test-remote-ssh` (which also needs `--test-remote-transport`) and `--test-remote-timeout-ms` ([`gate check`](#gate-check)).
+
   `--test-print-request`, on `run`, `stop-tree`, `cutover` and the compatibility form, prints the parsed request as one JSON line on stdout and exits 0, so the suite sees what a command line asked for; it is the one hidden switch the compatibility layer accepts. On `run`, `"timeout"` is the number given, or the floor of `auto:<n>`, and `"timeoutAuto": true|false` follows it, always present.
 
   `--test-sampler-fail` (a switch) makes every sample fail with `--test-sampler-fail makes every sample fail (test seam only)`, so the run says `gate: sampler failed: ...; watching by wall time only` and only the backstop watches; `--test-print-request` shows it as `testSeams.samplerFail`, after `interruptAfterFallback`.
@@ -2013,7 +2328,7 @@ A Rust integration suite drives the built `gate.exe` through its CLI and reads o
 
   `--test-remote-bound-ms <n>` (whole milliseconds above 0) replaces the 30 s bound of the client's `stop` and `boot` calls.
 
-  `--test-remote-interrupt-at <preflight|run|outputs|install|sdks|stop>` makes the client raise the console interrupt itself after that call's first output byte; `install` raises it before the second file's move, so an install of one file is never interrupted, and `sdks` just before the parity check reads this PC's SDK list with `dotnet --list-sdks`; `stop` raises it at the run call's first byte and again while the stop call runs.
+  `--test-remote-interrupt-at <preflight|run|outputs|install|sdks|stop|manifest|apply>` makes the client raise the console interrupt itself after that call's first output byte; `install` raises it before the second file's move, so an install of one file is never interrupted, and `sdks` just before the parity check reads this PC's SDK list with `dotnet --list-sdks`; `manifest` just before it reads the snapshot's `.gate/toolchain.toml`; `apply` once a pair's sync-back has checked every patch and before it applies the first (no output byte is waited for); `stop` raises it at the run call's first byte and again while the stop call runs.
 
   `--test-remote-backstop-ms <n>` (whole milliseconds above 0) replaces the run call's backstop of 5 x `--timeout` + 60 s for the client, counted from the run call's start.
 
@@ -2023,7 +2338,7 @@ A Rust integration suite drives the built `gate.exe` through its CLI and reads o
 
   With `ls-remote`, `--test-remote-timeout-ms` is that call's deadline and `--test-stall-ms` alone leaves it on the git limit. With `fetch`, the stall and ceiling seams apply to the fetch alone; with `outputs`, to the outputs fetch alone.
 
-  A value outside a seam's calls says `gate: --test-remote-watch-call must be preflight, push, run, ls-remote, fetch or outputs, got '<v>'`, and `--test-remote-interrupt-at` says `must be preflight, run, outputs, install, sdks or stop`. The five (with `--test-remote-backstop-ms`) need the transport; `--test-print-request` shows them as `testSeams.remoteBoundMs`, `remoteInterruptAt`, `remoteWatchCall`, `remoteTimeoutMs` and `remoteBackstopMs`, after `remoteRetryPauseMs`.
+  A value outside a seam's calls says `gate: --test-remote-watch-call must be preflight, push, run, ls-remote, fetch or outputs, got '<v>'`, and `--test-remote-interrupt-at` says `must be preflight, run, outputs, install, sdks, stop, manifest or apply`. The five (with `--test-remote-backstop-ms`) need the transport; `--test-print-request` shows them as `testSeams.remoteBoundMs`, `remoteInterruptAt`, `remoteWatchCall`, `remoteTimeoutMs` and `remoteBackstopMs`, after `remoteRetryPauseMs`.
 
   `--test-remote-fetch-cap-bytes <n>` (a whole number of bytes above 0, default 4 GiB) replaces the cap on what the sync-back fetch's job may write. Refused without the transport with `gate: --test-remote-fetch-cap-bytes needs --test-remote-transport`, and a value that is not a whole number above 0 with `gate: --test-remote-fetch-cap-bytes must be a whole number above 0, got '<v>'`. `--test-print-request` does not show it.
 
@@ -2069,11 +2384,13 @@ A Rust integration suite drives the built `gate.exe` through its CLI and reads o
 
   It is copied under the names the gate classifies (`VBCSCompiler.exe`, `dotnet.exe`, `MSBuild.exe`).
 
-  A second helper, `fake-ssh`, stands in for ssh in the remote client's cases (`--test-remote-ssh`). Its `ok` step puts the words of the variable `GATE_FAKE_SSH_BOX_SEAMS` before the verb of a `gate box run` call, so a case gives the box its seams.
+  A second helper, `fake-ssh`, stands in for ssh in the remote client's cases (`--test-remote-ssh`). Its `ok` step puts the words of the variable `GATE_FAKE_SSH_BOX_SEAMS` before the verb of a `gate box run` call, so a case gives the box its seams; the variable `GATE_FAKE_SSH_PREFLIGHT_SEAMS` does the same for a `gate box preflight` call.
+
+  It reads a box call from the last three words of the line, `box <verb> --stdin`, and the box it runs inherits its stdin, so the request the client feeds reaches the box; a box call whose last word is not `--stdin` is refused by name.
 
   Its steps are `ok`, `hold`, `version`, `boot <time>` (as `version`, for the box's boot line), `no-boot` (drops the box's boot line), `drop` (exits 255 at once, writing nothing), `exit`, `fail-banner`, `fail-other`, `out-then-drop`.
 
-  They also include `ok-then-out <line>` (as `ok`, then writes the line on stderr, as the box says its outputs line), `say-exit <n> <line>` (writes the line on stderr and exits `<n>`, as a call that fails with a line of its own does).
+  They also include `ok-then-out <line>` (as `ok`, then writes the line on stdout), `say-exit <n> <line>` (writes the line on stderr and exits `<n>`, as a call that fails with a line of its own does).
 
   They also include `flood <n>`, `say-hold <word> <path>` `progress-ok <n>`, `truncate <n>` (passes `<n>` stdout bytes, writes `Connection timed out during banner exchange` on stderr and exits 255), `garbage <n>` and `bytes-hold <n> <path>`.
 
@@ -2113,7 +2430,7 @@ When a run that passed did not fit its slot, the gate says how many cores the co
 
 What no ruling settles yet, with the issue that owns it:
 
-- **The box protocol and `remote.json`'s next format** (GATE-10): verbs, payload and transport between PC and builder, whether ssh keeps cmd.exe as the builder's shell, and the routing file's version and matcher. Sibling worktrees in a routed run leave three questions of their own (GATE-19).
+- **The box protocol and `remote.json`'s next format** (GATE-10): verbs, payload and transport between PC and builder, whether ssh keeps cmd.exe as the builder's shell, and the routing file's version and matcher.
 - **A prediction a run has passed** (GATE-14): what a holder past its p90 reports in wait lines, and whether the critical gate re-prices its shadow end and closes or shrinks the lent window when a blocker overruns.
 - **Which members the run's end spares** (GATE-144): the run's end spares every job member whose image is `gate.exe`, whatever gate it is; GATE-144 tracks hardening that judgement.
 - **The surfaces of `gate status` and `gate drain`** (no issue yet). Install stays a script (`tools/install.ps1`) until a reason for a `gate install` subcommand appears.
