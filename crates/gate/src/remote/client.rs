@@ -1539,9 +1539,11 @@ impl Attempt<'_, '_> {
     /// For a call that ended as `called` having reached the box's banner, not refused and not with ssh's 255, joins its
     /// `feeder`, given at most [`DRAIN`] to end, and notes in the log a write of its input that failed, naming the call's
     /// verb. A call that ended any of the other ways says why on its own lines, and its unread input is no news, so its
-    /// feeder, whose write ends with the call's input pipe, is let go unread. The note never fails the call.
+    /// feeder, whose write ends with the call's input pipe, is let go unread. A failed write never fails the call, whose
+    /// own end stands; the note is a logged line, so a log it cannot be appended to fails the call as any logged line does.
     fn fed_out(&mut self, feeder: Feeder, called: &Called) {
-        let reached = !called.before_the_banner(SSH_FAILED) && called.status != SSH_FAILED && called.refused.is_none();
+        // A call that ended before the banner ended with ssh's 255, so the status alone rules it out.
+        let reached = called.status != SSH_FAILED && called.refusal().is_none();
         if !reached {
             return;
         }

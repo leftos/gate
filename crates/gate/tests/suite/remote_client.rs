@@ -3301,6 +3301,40 @@ fn a_builder_that_restarted_is_a_rebooted_fallback() {
     assert_eq!(fallbacks(&events(&case)), ["rebooted"]);
 }
 
+/// A command argument long enough that the run request overruns the input pipe's buffer, so a call that ends without
+/// reading its input always fails the feeder's write.
+fn long_argument() -> String {
+    "x".repeat(16 * 1024)
+}
+
+#[test]
+fn a_dropped_run_call_logs_no_line_saying_its_long_input_was_not_sent() {
+    let case = client_case("client-rebooted-long");
+    let steps = ssh_steps(&case, "ssh", &[&format!("boot {BOOTED}"), "drop", "ok", &format!("boot {REBOOTED}")]);
+    let long = long_argument();
+
+    let outcome = finish(lost_gate(&case, "local", &steps, &[r".\tool.exe", "out", &long]));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "run", "stop", "boot"], "the command is stopped first");
+    assert_eq!(fallbacks(&events(&case)), ["rebooted"]);
+    let log = fs::read_to_string(case.folder().join("out.log")).expect("the log was written");
+    let note = log.lines().find(|line| line.contains("input was not sent"));
+    assert_eq!(note, None, "the call's own end says why");
+}
+
+#[test]
+fn a_run_call_that_failed_after_the_banner_unread_logs_that_its_input_was_not_sent() {
+    let case = client_case("client-run-unread");
+    let steps = ssh_steps(&case, "ssh", &[&format!("boot {BOOTED}"), "say-exit 1 gate: the box failed"]);
+    let long = long_argument();
+
+    let outcome = finish(lost_gate(&case, "local", &steps, &[r".\tool.exe", "out", &long]));
+
+    let log = fs::read_to_string(case.folder().join("out.log")).expect("the log was written");
+    assert!(log.contains("gate: the run call's input was not sent"), "{outcome:?}\n{log}");
+}
+
 #[test]
 fn a_boot_time_within_the_slack_is_the_same_boot() {
     let case = client_case("client-same-boot");

@@ -354,7 +354,7 @@ impl<'a> BoxCall<'a> {
         }
         match words[..] {
             [.., "box", verb, rest @ "--stdin"] => Ok(BoxCall { verb, rest, host, steps }),
-            [.., "box", _, _] => Err(format!("box call without --stdin: {line}")),
+            [.., "box", _, _] | [.., "box", _] => Err(format!("box call without --stdin: {line}")),
             _ => Err(format!("the line holds no box call: {line}")),
         }
     }
