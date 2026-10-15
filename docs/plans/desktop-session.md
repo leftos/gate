@@ -300,6 +300,10 @@ Worst case: compile time, and a second Windows API crate in the Layers rule (ARC
 10. Console-fallback line, stop look, resume, watch, drain.
 11. Release the mutex, session note, back commit.
 
+The helper ends the child it started only when its control pipe reads closed or fails before `DONE` has been read: the box is gone and nothing will resume the child. It never ends the child on a timeout alone, since the box may have pulled the child and be about to resume it; the box bounds the helper instead (step 8) and ends the child itself through the handles it pulled. `adopt::process_of_child` proves only who a pid is, never whether the box took it.
+
+A received stdout or stderr value is used only when it passes `adopt::is_handle_value`, names a pipe, and is not the helper's own control-pipe handle (`adopt::check_received_output`).
+
 ---
 
 ## 5. Tests: what the PC can and cannot cover
