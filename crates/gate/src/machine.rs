@@ -1,13 +1,14 @@
 //! A critical gate's wait for the machine and its hold of it: the passes that take the critical mutex in arrival order,
-//! wait for the earlier heavy and light gates to drain and take every heavy and unreserved light slot, the lines it
-//! says while it waits and once it holds the machine, the snapshot its `take` journals, and the release of all it took.
-//! Its wake event, ticket, sleep and heartbeat are a slot waiter's ([`Waiter`]).
+//! wait for the earlier heavy and light gates to drain, and for the light gates running to number no more than may run
+//! beside it, then take every heavy slot and every free light slot but those left for light gates beside it, the lines
+//! it says while it waits and once it holds the machine, the snapshot its `take` journals, and the release of all it
+//! took. Its wake event, ticket, sleep and heartbeat are a slot waiter's ([`Waiter`]).
 
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-use gate_state::v1::{self, ClaimKind, Ticket, TicketKind};
-use gate_state::{HeavyLight, KernelObject, MachineSnapshot, OtherClaim, reserved_light};
+use gate_state::v1::{self, Claim, ClaimKind, Ticket, TicketKind};
+use gate_state::{HeavyLight, KernelObject, MachineSnapshot, OtherClaim, beside_allowance};
 use gate_win32::mutex_exists;
 use jiff::Timestamp;
 
@@ -17,7 +18,7 @@ use crate::resolve::ResolvedRoot;
 use crate::slots::{self, ClaimOf, Held, Survey, Taken};
 use crate::wait::{self, Arrival, Host, Waiter, Which};
 
-/// The kinds of earlier gate the waiting line counts and a drain with an unreserved light slot waits for.
+/// The kinds of earlier gate the waiting line counts and a drain with a light slot to take waits for.
 const LOCAL_KINDS: [TicketKind; 2] = [TicketKind::Heavy, TicketKind::Light];
 
 /// The pid and start, in epoch milliseconds, of the gates that hold a slot by a live claim.
@@ -27,18 +28,20 @@ type Holders = HashSet<(u32, u64)>;
 /// probed.
 type SlotProbe = (ClaimKind, u32, Option<bool>);
 
-/// What a critical gate holds of the machine: the critical mutex, the heavy and unreserved light slots, and its ticket,
+/// What a critical gate holds of the machine: the critical mutex, the heavy and light slots it took, and its ticket,
 /// which it keeps until it ends.
 pub(crate) struct Machine {
     critical: Option<Held>,
     slots: Vec<Held>,
+    /// How many of `slots` are light slots.
+    light: u32,
     ticket: PathBuf,
     /// The mutexes taken from a gate that died holding them, in the order they were taken.
     abandoned: Vec<String>,
 }
 
 impl Machine {
-    /// The names of the heavy and unreserved light slots held, in the order they were taken.
+    /// The names of the heavy and light slots held, in the order they were taken.
     pub(crate) fn names(&self) -> Vec<String> {
         self.slots.iter().map(|slot| slot.name().to_owned()).collect()
     }
@@ -136,6 +139,7 @@ impl<'a> MachineWait<'a> {
             machine: Machine {
                 critical: None,
                 slots: Vec::new(),
+                light: 0,
                 ticket: waiter.ticket().to_path_buf(),
                 abandoned: Vec::new(),
             },
@@ -179,9 +183,10 @@ impl<'a> MachineWait<'a> {
 
     /// One pass; whether the gate now holds the machine. It takes the critical mutex once no critical request that
     /// arrived before it is live, so critical requests run in arrival order; then, until it holds its first slot,
-    /// waits until no earlier heavy gate, nor light one while it takes an unreserved light slot, still waits, a remote
-    /// one or one whose gate already holds a slot left out; then takes every heavy and unreserved light slot of the
-    /// counts as they stand. A pass that deleted a dead gate's ticket wakes the other waiters.
+    /// waits until no earlier heavy gate, nor light one while it has a light slot to take, still waits, a remote one or
+    /// one whose gate already holds a slot left out; then takes every heavy slot of the counts as they stand and, on
+    /// every pass, its light slots ([`MachineWait::take_light`]). A pass that deleted a dead gate's ticket wakes the
+    /// other waiters.
     fn pass(&mut self, survey: &mut Survey, console: &mut Console) -> bool {
         self.counts = self.read_counts(console);
         let (others, deleted) = survey.others(&self.root.path, console);
@@ -221,26 +226,73 @@ impl<'a> MachineWait<'a> {
         true
     }
 
-    /// Takes every heavy and unreserved light slot of the counts it does not hold yet; whether it holds them all. A slot
-    /// taken from a gate that died holding it has that gate's claim deleted, since the critical gate writes none to
-    /// replace it, so the next gate to take the slot does not count the takeover again.
+    /// Takes every heavy slot of the counts it does not hold yet, then its light slots ([`MachineWait::take_light`]);
+    /// whether it holds them all.
     fn take_slots(&mut self, survey: &mut Survey, console: &mut Console) -> bool {
         let mut all = true;
-        for (object, index) in machine_slots(self.counts) {
-            if self.machine.holds(&self.root.root.object_name(object)) {
-                continue;
-            }
-            let Some(taken) = slots::try_object(self.root, object, index, survey, console) else {
-                all = false;
-                continue;
-            };
-            if taken.abandoned {
-                slots::delete_claim(&taken.held, console);
-            }
-            let held = self.machine.keep(taken, console);
-            self.machine.slots.push(held);
+        for index in 0..self.counts.heavy {
+            let object = KernelObject::HeavySlot(index);
+            all &= self.machine.holds(&self.root.root.object_name(object)) || self.take(object, index, survey, console);
         }
-        all
+        self.take_light(survey, console) && all
+    }
+
+    /// Takes the slot `index` of `object`; whether it took it. A slot taken from a gate that died holding it has that
+    /// gate's claim deleted, since the critical gate writes none to replace it, so the next gate to take the slot does
+    /// not count the takeover again.
+    fn take(&mut self, object: KernelObject, index: u32, survey: &mut Survey, console: &mut Console) -> bool {
+        let Some(taken) = slots::try_object(self.root, object, index, survey, console) else {
+            return false;
+        };
+        if taken.abandoned {
+            slots::delete_claim(&taken.held, console);
+        }
+        let held = self.machine.keep(taken, console);
+        self.machine.slots.push(held);
+        true
+    }
+
+    /// Takes free light slots, lowest first, until it holds all but the allowance of the light count
+    /// ([`light_target`]), on a pass where no more light gates than the allowance run beside it, whichever slots they
+    /// hold ([`MachineWait::running_light`]); whether it holds that many. It counts and takes holding the beside mutex
+    /// ([`slots::hold_beside`]), as a light gate behind it counts, takes and claims, so a light gate between its take
+    /// and its claim is counted, and the slots left free are the beside slots of this drain.
+    fn take_light(&mut self, survey: &mut Survey, console: &mut Console) -> bool {
+        let target = light_target(self.counts.light);
+        if self.machine.light >= target {
+            return true;
+        }
+        let Some(_beside) = slots::hold_beside(self.root, survey, console) else {
+            return false;
+        };
+        let allowance = usize::try_from(beside_allowance(self.counts.light)).unwrap_or(usize::MAX);
+        if self.running_light(survey, console) > allowance {
+            return false;
+        }
+        for index in 0..self.counts.light {
+            if self.machine.light >= target {
+                break;
+            }
+            let object = KernelObject::LightSlot(index);
+            if !self.machine.holds(&self.root.root.object_name(object)) && self.take(object, index, survey, console) {
+                self.machine.light += 1;
+            }
+        }
+        self.machine.light >= target
+    }
+
+    /// How many other light gates run: the light slots of the count some gate has open that this gate does not hold, so
+    /// a gate between its take and its claim counts, and the other gates' live light claims past the count, where a
+    /// count lowered since they took their slots left them ([`running_light`]).
+    fn running_light(&self, survey: &mut Survey, console: &mut Console) -> usize {
+        let probe = self.probe_slots(survey, console);
+        let light = self.counts.light;
+        let past = survey
+            .light_claims(&self.root.path, console)
+            .into_iter()
+            .filter(|(_, index)| *index >= light)
+            .count();
+        running_light(&probe, past)
     }
 
     /// The heavy and light counts from the counts file as it stands, each ignored line said once a wait.
@@ -287,11 +339,16 @@ impl<'a> MachineWait<'a> {
         if eta_blockers(&self.others, &self.holders, order) > 0 {
             return status;
         }
-        let Some(busy) = waited_for(&probe, self.counts.light).filter(|busy| !busy.is_empty()) else {
+        let Some(busy) = waited_for(&probe).filter(|busy| !busy.is_empty()) else {
             return status;
         };
         let claims = survey.live_claims(&self.root.path, console);
-        match wait::holder_eta(&claims, &busy, Which::Last, Timestamp::now()) {
+        let now = Timestamp::now();
+        let allowance = usize::try_from(beside_allowance(self.counts.light)).unwrap_or(usize::MAX);
+        let Some(busy) = drained_by(&claims, busy, allowance, now).filter(|busy| !busy.is_empty()) else {
+            return status;
+        };
+        match wait::holder_eta(&claims, &busy, Which::Last, now) {
             Some(eta) => format!("{status}, {eta}"),
             None => status,
         }
@@ -357,14 +414,10 @@ fn still_waits(ticket: &Ticket, holders: &Holders) -> bool {
 }
 
 /// How many of the other gates' tickets `others` the drain of a critical gate at `order` waits for: the earlier local
-/// heavy waiters, and the light ones while a light count of `light` leaves it an unreserved light slot to take, a gate
-/// of `holders` left out.
+/// heavy waiters, and the light ones while a light count of `light` leaves it a light slot to take beyond the allowance
+/// of light gates beside it, a gate of `holders` left out.
 fn drain_waits_for(others: &[Ticket], holders: &Holders, order: (u64, u32), light: u32) -> usize {
-    let kinds: &[TicketKind] = if light > reserved_light(light) {
-        &LOCAL_KINDS
-    } else {
-        &[TicketKind::Heavy]
-    };
+    let kinds: &[TicketKind] = if light_target(light) > 0 { &LOCAL_KINDS } else { &[TicketKind::Heavy] };
     others
         .iter()
         .filter(|ticket| is_earlier(ticket, order, kinds) && still_waits(ticket, holders))
@@ -380,29 +433,38 @@ fn earlier_waiters(others: &[Ticket], holders: &Holders, order: (u64, u32)) -> u
         .count()
 }
 
-/// The slots a critical gate takes for `counts`, each with its index: every heavy slot and every light slot below the
-/// reserved ones, which are the highest `min(2, light count)`.
-fn machine_slots(counts: HeavyLight) -> Vec<(KernelObject, u32)> {
-    let light = counts.light.saturating_sub(reserved_light(counts.light));
-    let heavy = (0..counts.heavy).map(|index| (KernelObject::HeavySlot(index), index));
-    heavy.chain((0..light).map(|index| (KernelObject::LightSlot(index), index))).collect()
+/// How many light slots a critical gate holds for a light count of `light`: every one but the allowance of light gates
+/// beside it, whichever slots those hold.
+fn light_target(light: u32) -> u32 {
+    light - beside_allowance(light)
 }
 
-/// How many light slots of a count of `light` are reserved for light gates beside a critical gate, as its lines say it.
-fn reserved_phrase(light: u32) -> String {
-    let reserved = reserved_light(light);
-    let noun = if reserved == 1 { "light slot" } else { "light slots" };
-    format!("{reserved} {noun} reserved for light gates beside it")
+/// How many other light gates run by `probe`, a probe of the slots this gate does not hold: its light slots some gate
+/// has open, a slot that cannot be probed counted as running so a drain never overtakes one, and `past` light gates on
+/// slots past the count.
+fn running_light(probe: &[SlotProbe], past: usize) -> usize {
+    probe
+        .iter()
+        .filter(|(kind, _, open)| *kind == ClaimKind::Light && *open != Some(false))
+        .count()
+        + past
 }
 
-/// The waiting lines' status: the slots other gates hold, the reserved light slots of a count of `light`, and the
+/// How many light gates may run beside a critical gate for a light count of `light`, as its lines say it.
+fn beside_phrase(light: u32) -> String {
+    let allowance = beside_allowance(light);
+    let noun = if allowance == 1 { "light slot" } else { "light slots" };
+    format!("{allowance} {noun} beside it")
+}
+
+/// The waiting lines' status: the slots other gates hold, the light slots beside it of a count of `light`, and the
 /// earlier waiters.
 fn status_text(held: HeavyLight, light: u32, earlier: usize) -> String {
     format!(
         "{} heavy and {} light slots held ({}), {earlier} earlier waiters",
         held.heavy,
         held.light,
-        reserved_phrase(light)
+        beside_phrase(light)
     )
 }
 
@@ -426,15 +488,11 @@ fn held_of(probe: &[SlotProbe]) -> HeavyLight {
     }
 }
 
-/// The slots of `probe` a critical gate takes, every heavy slot and the light slots below the reserved ones of a count
-/// of `light`, that some gate holds, each as a claim kind and slot index; `None` when one of them could not be probed.
-fn waited_for(probe: &[SlotProbe], light: u32) -> Option<Vec<(ClaimKind, u32)>> {
-    let unreserved = light.saturating_sub(reserved_light(light));
+/// The slots of `probe` some gate holds, each as a claim kind and slot index; `None` when one of them could not be
+/// probed.
+fn waited_for(probe: &[SlotProbe]) -> Option<Vec<(ClaimKind, u32)>> {
     let mut busy = Vec::new();
     for &(kind, index, open) in probe {
-        if kind == ClaimKind::Light && index >= unreserved {
-            continue;
-        }
         match open {
             Some(true) => busy.push((kind, index)),
             Some(false) => {}
@@ -442,6 +500,27 @@ fn waited_for(probe: &[SlotProbe], light: u32) -> Option<Vec<(ClaimKind, u32)>> 
         }
     }
     Some(busy)
+}
+
+/// Of the busy slots `busy`, those whose holders a critical gate's drain waits for: every heavy one, and while more
+/// light slots are busy than the `allowance` of light gates beside it, the light ones whose holders' usual ends come
+/// soonest, all but `allowance` of them, by their live claims `claims` at `now`. `None` when such a light holder has no
+/// live claim carrying a usual.
+fn drained_by(claims: &[Claim], busy: Vec<(ClaimKind, u32)>, allowance: usize, now: Timestamp) -> Option<Vec<(ClaimKind, u32)>> {
+    let (light, mut waited): (Vec<_>, Vec<_>) = busy.into_iter().partition(|(kind, _)| *kind == ClaimKind::Light);
+    let over = light.len().saturating_sub(allowance);
+    if over == 0 {
+        return Some(waited);
+    }
+    let mut left = Vec::with_capacity(light.len());
+    for slot in light {
+        let claim = claims.iter().find(|claim| (claim.kind, claim.index) == slot)?;
+        let p50 = claim.expected.as_ref()?.get("p50")?.as_f64()?;
+        left.push((p50 - now.duration_since(claim.started).as_secs_f64(), slot));
+    }
+    left.sort_by(|one, other| one.0.total_cmp(&other.0));
+    waited.extend(left.into_iter().take(over).map(|(_, slot)| slot));
+    Some(waited)
 }
 
 /// The line a critical gate says as it takes the machine `at`, after waiting `waited` seconds, with what it found.
@@ -465,7 +544,7 @@ pub(crate) fn holds_line(at: Timestamp, waited: f64, snapshot: &MachineSnapshot)
         counts.light,
         other_held.heavy,
         other_held.light,
-        reserved_phrase(counts.light)
+        beside_phrase(counts.light)
     )
 }
 
@@ -473,12 +552,15 @@ pub(crate) fn holds_line(at: Timestamp, waited: f64, snapshot: &MachineSnapshot)
 #[expect(clippy::expect_used, reason = "a test whose fixed time cannot be read must fail loudly")]
 mod tests {
     use gate_state::v1::{Ticket, TicketKind};
-    use gate_state::{HeavyLight, KernelObject, MachineSnapshot, OtherClaim};
+    use gate_state::{HeavyLight, MachineSnapshot, OtherClaim};
 
     use gate_state::v1::ClaimKind;
     use jiff::{SignedDuration, Timestamp};
 
-    use super::{Holders, drain_waits_for, earlier_waiters, eta_blockers, held_of, holds_line, is_earlier, machine_slots, status_text, waited_for};
+    use super::{
+        Holders, drain_waits_for, drained_by, earlier_waiters, eta_blockers, held_of, holds_line, is_earlier, light_target, running_light,
+        status_text, waited_for,
+    };
     use crate::slots;
     use crate::wait::scratch::holding;
     use crate::wait::{Which, holder_eta};
@@ -540,16 +622,44 @@ mod tests {
 
         assert_eq!(held_of(&probe), HeavyLight { heavy: 1, light: 2 }, "an unprobed slot is not held");
         assert_eq!(
-            waited_for(&probe[..4], 3),
-            Some(vec![(ClaimKind::Heavy, 0), (ClaimKind::Light, 0)]),
-            "of 3 light slots the highest 2 are reserved and not waited for"
+            waited_for(&probe[..4]),
+            Some(vec![(ClaimKind::Heavy, 0), (ClaimKind::Light, 0), (ClaimKind::Light, 1)]),
+            "every busy slot, whatever its index"
         );
-        assert_eq!(waited_for(&probe, 5), None, "a slot it waits for could not be probed");
+        assert_eq!(waited_for(&probe), None, "a slot could not be probed");
+        assert_eq!(running_light(&probe, 0), 3, "an unprobed light slot counts as running");
+        assert_eq!(running_light(&probe[..2], 1), 1, "a light claim past the count");
+    }
+
+    #[test]
+    fn the_drain_waits_for_the_light_holders_that_end_soonest_beyond_the_allowance() {
+        let now: Timestamp = "2026-10-13T12:00:00Z".parse().expect("a fixed time");
+        let ago = now.checked_sub(SignedDuration::from_secs(100)).expect("a moment after the epoch");
+        let claims = [
+            holding(ClaimKind::Light, 0, ago, Some(600.0)),
+            holding(ClaimKind::Light, 1, now, Some(60.0)),
+            holding(ClaimKind::Light, 2, now, Some(300.0)),
+            holding(ClaimKind::Heavy, 0, now, Some(900.0)),
+        ];
+        let heavy = (ClaimKind::Heavy, 0);
+        let lights = [(ClaimKind::Light, 0), (ClaimKind::Light, 1), (ClaimKind::Light, 2)];
+        let busy = |light: &[(ClaimKind, u32)]| [&[heavy], light].concat();
+
         assert_eq!(
-            waited_for(&probe, 3),
-            Some(vec![(ClaimKind::Heavy, 0), (ClaimKind::Light, 0)]),
-            "a reserved slot's probe does not matter"
+            drained_by(&claims, busy(&lights), 2, now),
+            Some(vec![heavy, (ClaimKind::Light, 1)]),
+            "three light gates, two allowed beside it: the one that ends soonest"
         );
+        assert_eq!(
+            drained_by(&claims, busy(&lights[..2]), 2, now),
+            Some(vec![heavy]),
+            "two light gates run beside it"
+        );
+        assert_eq!(
+            drained_by(&claims, busy(&lights), 1, now),
+            Some(vec![heavy, (ClaimKind::Light, 1), (ClaimKind::Light, 2)])
+        );
+        assert_eq!(drained_by(&claims[1..], busy(&lights), 2, now), None, "a light holder with no claim");
     }
 
     /// A ticket of the gate `pid`, started at `pid * 10` ms, of `kind`, arrived at `arrived`.
@@ -570,33 +680,24 @@ mod tests {
         let held = HeavyLight { heavy: 2, light: 1 };
         assert_eq!(
             status_text(held, 1, 3),
-            "2 heavy and 1 light slots held (1 light slot reserved for light gates beside it), 3 earlier waiters"
+            "2 heavy and 1 light slots held (1 light slot beside it), 3 earlier waiters"
         );
         assert_eq!(
             status_text(held, 2, 0),
-            "2 heavy and 1 light slots held (2 light slots reserved for light gates beside it), 0 earlier waiters"
+            "2 heavy and 1 light slots held (2 light slots beside it), 0 earlier waiters"
         );
         assert_eq!(
             status_text(held, 8, 0),
-            "2 heavy and 1 light slots held (2 light slots reserved for light gates beside it), 0 earlier waiters"
+            "2 heavy and 1 light slots held (2 light slots beside it), 0 earlier waiters"
         );
     }
 
     #[test]
-    fn a_critical_drain_takes_every_heavy_slot_and_the_light_slots_below_the_reserved_ones() {
-        let slots = |heavy, light| machine_slots(HeavyLight { heavy, light });
-        assert_eq!(slots(1, 1), [(KernelObject::HeavySlot(0), 0)]);
-        assert_eq!(slots(2, 2), [(KernelObject::HeavySlot(0), 0), (KernelObject::HeavySlot(1), 1)]);
-        assert_eq!(slots(1, 3), [(KernelObject::HeavySlot(0), 0), (KernelObject::LightSlot(0), 0)]);
-        assert_eq!(
-            slots(1, 5),
-            [
-                (KernelObject::HeavySlot(0), 0),
-                (KernelObject::LightSlot(0), 0),
-                (KernelObject::LightSlot(1), 1),
-                (KernelObject::LightSlot(2), 2)
-            ]
-        );
+    fn a_critical_gate_holds_every_light_slot_but_the_allowance_beside_it() {
+        assert_eq!(light_target(1), 0, "a count of 1 allows its one light gate beside it");
+        assert_eq!(light_target(2), 0);
+        assert_eq!(light_target(3), 1);
+        assert_eq!(light_target(5), 3);
     }
 
     #[test]
@@ -626,7 +727,7 @@ mod tests {
         assert_eq!(
             drain_waits_for(&others, &none, order, 2),
             1,
-            "every light slot reserved: the heavy waiter alone"
+            "no light slot to take beyond the two beside it: the heavy waiter alone"
         );
         assert_eq!(earlier_waiters(&others, &none, order), 2);
         let critical: Vec<u32> = others
@@ -667,7 +768,7 @@ mod tests {
             other_claims,
         };
         let head = "gate: holds the machine (critical) at 2026-10-10T12:00:00.1234567Z after 2.0 s: counts heavy 4, light 1; \
-                    other gates hold 0 heavy and 1 light slots (1 light slot reserved for light gates beside it); other live claims: ";
+                    other gates hold 0 heavy and 1 light slots (1 light slot beside it); other live claims: ";
         let claim = |pid, command: &str| OtherClaim {
             pid,
             kind: "light".to_owned(),

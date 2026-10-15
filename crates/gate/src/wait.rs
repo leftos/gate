@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 
 use gate_args::RunRequest;
 use gate_state::v1::{self, Claim, ClaimKind, Counts, Ticket, TicketKind};
-use gate_state::{KernelObject, SlotKind, reserved_light};
-use gate_win32::{Interrupt, NamedEvent, mutex_exists};
+use gate_state::{KernelObject, SlotKind, beside_allowance};
+use gate_win32::{Interrupt, NamedEvent, OwnedMutexGuard, mutex_exists};
 use jiff::Timestamp;
 use serde_json::{Map, Value};
 
@@ -207,12 +207,10 @@ pub(crate) struct Wait<'a> {
     said_ignored: bool,
 }
 
-/// The earliest critical request ahead of a waiting gate, which holds it back: its gate's pid, and whether a critical
-/// request ahead of the gate holds the machine.
+/// The earliest critical request ahead of a waiting gate, which holds it back: its gate's pid.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Barrier {
     pid: u32,
-    holding: bool,
 }
 
 /// What a run reads of its host once: the machine's logical processors and the console interrupt, `None` when its
@@ -328,19 +326,22 @@ impl<'a> Wait<'a> {
         if self.waiter.interrupted() {
             return Some(Waited::Interrupted);
         }
-        let (count, light) = self.counts(console);
+        let count = self.counts(console);
         let others = live_others(self.root, survey, console);
-        if self.lent(&others, light, survey, console) {
+        if self.lent(&others, survey, console) {
             return Some(Waited::Lent);
         }
         self.barrier = self.barrier_in(&others);
         self.pause.refresh(self.barrier.is_some(), console);
-        let (range, probe) = self.range(count, survey, console);
+        let beside = self.beside_held(survey, console);
+        let range = self.range(count, beside.is_some(), survey, console);
         self.range = range.clone();
-        let (may_try, probe) = self.may_try(&others, range.clone(), probe, survey, console);
-        if may_try && let Some(taken) = slots::try_pool(self.root, self.pool, range.clone(), survey, console) {
+        let (may_try, probe) = self.may_try(&others, range.clone(), survey, console);
+        if may_try && let Some(mut taken) = slots::try_pool(self.root, self.pool, range.clone(), survey, console) {
+            taken.beside = beside;
             return Some(Waited::Taken(taken));
         }
+        drop(beside);
         if !self.said_waiting {
             self.say_waiting(probe, range, survey, console);
         }
@@ -369,12 +370,11 @@ impl<'a> Wait<'a> {
         self.waiter.end(console);
     }
 
-    /// The pool's count and the light count: the remote pool's own size, or a local pool's from the counts file as it
-    /// stands, its ignored line said once a wait; the light count from the same read, or 0 for the remote pool, whose
-    /// wait no parent lends.
-    fn counts(&mut self, console: &mut Console) -> (u32, u32) {
+    /// The pool's count: the remote pool's own size, or a local pool's from the counts file as it stands, its ignored
+    /// line said once a wait.
+    fn counts(&mut self, console: &mut Console) -> u32 {
         let kind = match self.pool {
-            Pool::Remote(slots) => return (slots, 0),
+            Pool::Remote(slots) => return slots,
             Pool::Local(kind) => kind,
         };
         let counts = read_counts(self.root, self.processors);
@@ -385,23 +385,14 @@ impl<'a> Wait<'a> {
             self.said_ignored = true;
             console.err(line);
         }
-        (setting.count, counts.light.count)
+        setting.count
     }
 
     /// Whether the gate's light parent lends it its slot on a pass that read the other gates' live tickets `others`
-    /// and a light count of `light` ([`lends`]); never for a gate under no such parent, nor under a parent that holds no
-    /// slot.
-    fn lent(&self, others: &[Ticket], light: u32, survey: &mut Survey, console: &mut Console) -> bool {
+    /// ([`lends`]); never for a gate under no such parent, nor under a parent that holds no slot.
+    fn lent(&self, others: &[Ticket], survey: &mut Survey, console: &mut Console) -> bool {
         let root = self.root;
-        self.under.filter(|parent| parent.lends).is_some_and(|parent| {
-            let mut facts = Probed {
-                root,
-                parent: parent.pid,
-                survey,
-                console,
-            };
-            lends(others, light, &mut facts)
-        })
+        self.under.is_some_and(|parent| parent.lends) && lends(others, &mut Probed { root, survey, console })
     }
 
     /// The critical request of the other gates' live tickets `others` that holds the gate back ([`barrier`]); none for
@@ -413,59 +404,43 @@ impl<'a> Wait<'a> {
         }
     }
 
-    /// The slots of a count of `count` the gate tries on this pass: every one, unless a critical request ahead holds
-    /// it back ([`slot_range`]). With them, this pass's probe of those slots when it made one: a light gate behind a
-    /// critical request probes the reserved slots as it counts the light gates beside it, so the pass need not again.
-    fn range(&self, count: u32, survey: &mut Survey, console: &mut Console) -> (Range<u32>, Option<Probe>) {
-        let (Pool::Local(kind), Some(barrier)) = (self.pool, self.barrier) else {
-            return (0..count, None);
-        };
-        if kind == SlotKind::Heavy {
-            return (slot_range(kind, count, 0), None);
+    /// The beside mutex, for a light gate a critical request holds back, which holds it from its count of the light
+    /// gates beside the request to its claim ([`slots::hold_beside`]); `None` for any other gate, and when it is not
+    /// taken this pass.
+    fn beside_held(&self, survey: &mut Survey, console: &mut Console) -> Option<OwnedMutexGuard> {
+        match (self.pool, self.barrier) {
+            (Pool::Local(SlotKind::Light), Some(_)) => slots::hold_beside(self.root, survey, console),
+            _ => None,
         }
-        let reserved = count - reserved_light(count)..count;
-        let probe = self.probe(reserved.clone(), survey, console);
-        let beside = self.beside(count, barrier.holding, slots_where(&probe, true), survey, console);
-        let range = slot_range(kind, count, beside);
-        let probe = (range == reserved).then_some(probe);
-        (range, probe)
     }
 
-    /// How many light gates run beside the critical request ahead, out of `count` light slots, as it is `holding` the
-    /// machine or not, with `reserved_open` reserved slots some gate has open ([`slots::light_beside`]).
-    fn beside(&self, count: u32, holding: bool, reserved_open: usize, survey: &mut Survey, console: &mut Console) -> usize {
-        let claims: Vec<u32> = if holding {
-            survey
-                .light_claims(&self.root.path, console)
-                .into_iter()
-                .map(|(_, index)| index)
-                .collect()
-        } else {
-            Vec::new()
+    /// The slots of a count of `count` the gate tries on this pass: every one, unless a critical request ahead holds
+    /// it back ([`slot_range`]). A light gate held back counts the light gates beside the request, the other gates'
+    /// live light claims whatever their slots, only while it holds the beside mutex (`beside_held`), and tries none
+    /// without it.
+    fn range(&self, count: u32, beside_held: bool, survey: &mut Survey, console: &mut Console) -> Range<u32> {
+        let (Pool::Local(kind), Some(_)) = (self.pool, self.barrier) else {
+            return 0..count;
         };
-        slots::light_beside(count, holding, reserved_open, &claims)
+        if kind == SlotKind::Heavy || !beside_held {
+            return slot_range(kind, count, usize::MAX);
+        }
+        let beside = survey.light_claims(&self.root.path, console).len();
+        slot_range(kind, count, beside)
     }
 
     /// Whether the gate may try the slots `range`: some are left it, and fewer live tickets of its kind of `others`
-    /// are ahead of it than those slots are free, so a try never takes the slot an earlier waiter would get. `probe` is
-    /// this pass's probe of `range` when it made one already, else the slots are probed now if the decision needs it.
-    /// The pass's probe comes with it, `None` when it made none.
-    fn may_try(
-        &self,
-        others: &[Ticket],
-        range: Range<u32>,
-        probe: Option<Probe>,
-        survey: &mut Survey,
-        console: &mut Console,
-    ) -> (bool, Option<Probe>) {
+    /// are ahead of it than those slots are free, so a try never takes the slot an earlier waiter would get. The slots
+    /// are probed only when the decision needs it; the pass's probe comes with it, `None` when it made none.
+    fn may_try(&self, others: &[Ticket], range: Range<u32>, survey: &mut Survey, console: &mut Console) -> (bool, Option<Probe>) {
         if range.is_empty() {
-            return (false, probe);
+            return (false, None);
         }
         let ahead = self.ahead(others, survey, console);
         if ahead == 0 {
-            return (true, probe);
+            return (true, None);
         }
-        let probe = probe.unwrap_or_else(|| self.probe(range, survey, console));
+        let probe = self.probe(range, survey, console);
         (ahead < slots_where(&probe, false), Some(probe))
     }
 
@@ -658,24 +633,17 @@ fn eta_text(holder: Usual, which: Which) -> String {
     )
 }
 
-/// What a light gate kept to the reserved light slots by the critical request of gate `pid` waits for.
+/// What a light gate the critical request of gate `pid` holds back waits for.
 fn beside_place(pid: u32) -> String {
     format!("light slot beside the critical request of gate {pid}")
 }
 
-/// Whether the gate under the light parent gate `parent` is lent that parent's slot before it queues, by the same rule
-/// and reads as each pass of a wait ([`lends`]): the light count of the counts file under `root` and the other gates'
-/// live tickets, then the critical mutex and the parent's claim only as the rule needs them.
-pub(crate) fn lent_before_queue(root: &ResolvedRoot, parent: u32, processors: usize, survey: &mut Survey, console: &mut Console) -> bool {
-    let light = read_counts(root, processors).light.count;
+/// Whether the gate under a light parent gate is lent that parent's slot before it queues, by the same rule and reads
+/// as each pass of a wait ([`lends`]): the other gates' live tickets under `root`, then the critical mutex only as the
+/// rule needs it.
+pub(crate) fn lent_before_queue(root: &ResolvedRoot, survey: &mut Survey, console: &mut Console) -> bool {
     let others = live_others(root, survey, console);
-    let mut facts = Probed {
-        root,
-        parent,
-        survey,
-        console,
-    };
-    lends(&others, light, &mut facts)
+    lends(&others, &mut Probed { root, survey, console })
 }
 
 /// The counts file under `root` as it stands, a missing or unreadable one giving the defaults for `processors`.
@@ -693,19 +661,15 @@ fn live_others(root: &ResolvedRoot, survey: &mut Survey, console: &mut Console) 
     others
 }
 
-/// What a lend turns on besides the tickets and the light count, each read only when the tickets leave it open.
+/// What a lend turns on besides the tickets, read only when the tickets leave it open.
 trait LendFacts {
     /// Whether some gate has the critical mutex open.
     fn critical_open(&mut self) -> bool;
-    /// The slot index of the parent gate's live light claim, `None` when it has none that can be read.
-    fn parent_index(&mut self) -> Option<u32>;
 }
 
-/// The lend facts as the machine has them: the critical mutex under `root`, and the live light claim of the parent gate
-/// `parent` among the other gates' claims.
+/// The lend facts as the machine has them: the critical mutex under `root`.
 struct Probed<'p> {
     root: &'p ResolvedRoot,
-    parent: u32,
     survey: &'p mut Survey,
     console: &'p mut Console,
 }
@@ -714,50 +678,33 @@ impl LendFacts for Probed<'_> {
     fn critical_open(&mut self) -> bool {
         slots::critical_open(self.root, self.survey, self.console)
     }
-
-    fn parent_index(&mut self) -> Option<u32> {
-        let parent = self.parent;
-        self.survey
-            .light_claims(&self.root.path, self.console)
-            .into_iter()
-            .find(|(pid, _)| *pid == parent)
-            .map(|(_, index)| index)
-    }
 }
 
 /// Whether a light parent lends its slot to the gate under it: while a critical request is pending, by a ticket of
-/// the other gates' live tickets `others` or else the critical mutex open, and none of them holds the machine, unless
-/// the parent's light claim is on a slot of a count of `light` the drain never takes. A parent claim that cannot be
-/// read lends. The tickets are read first: `facts` probes the critical mutex only when no critical ticket is pending,
-/// and reads the parent's claim only while a critical request is pending and none holds the machine.
-fn lends(others: &[Ticket], light: u32, facts: &mut impl LendFacts) -> bool {
-    !slots::critical_holding(others)
-        && slots::critical_pending(others, || facts.critical_open())
-        && !facts.parent_index().is_some_and(|index| slots::on_reserved_light(index, light))
+/// the other gates' live tickets `others` or else the critical mutex open, and none of them holds the machine, whatever
+/// light slot the parent holds. The tickets are read first: `facts` probes the critical mutex only when no critical
+/// ticket is pending.
+fn lends(others: &[Ticket], facts: &mut impl LendFacts) -> bool {
+    !slots::critical_holding(others) && slots::critical_pending(others, || facts.critical_open())
 }
 
 /// The barrier of a gate at the place `order`: the earliest of the other gates' live critical tickets `others` ahead
-/// of it, by arrival and then pid, and whether any of those holds the machine; `None` when none is ahead.
+/// of it, by arrival and then pid; `None` when none is ahead.
 fn barrier(others: &[Ticket], order: (u64, u32)) -> Option<Barrier> {
-    let ahead: Vec<&Ticket> = others
+    others
         .iter()
         .filter(|ticket| ticket.kind == TicketKind::Critical && ticket.queue_order() < order)
-        .collect();
-    let earliest = ahead.iter().min_by_key(|ticket| ticket.queue_order())?;
-    Some(Barrier {
-        pid: earliest.pid,
-        holding: ahead.iter().any(|ticket| ticket.holds),
-    })
+        .min_by_key(|ticket| ticket.queue_order())
+        .map(|earliest| Barrier { pid: earliest.pid })
 }
 
 /// The slots of a local pool of `kind` and `count` a gate behind a critical request tries: none for a heavy gate; for a
-/// light gate the reserved slots, the highest `min(2, count)`, unless `beside` light gates, as many as are reserved,
-/// already run beside it.
+/// light gate every one while fewer than the allowance of light gates, `min(2, count)`, run `beside` the request, a
+/// number whichever slots they hold, and none once that many do.
 fn slot_range(kind: SlotKind, count: u32, beside: usize) -> Range<u32> {
-    let reserved = reserved_light(count);
-    let room = usize::try_from(reserved).is_ok_and(|reserved| beside < reserved);
+    let room = usize::try_from(beside_allowance(count)).is_ok_and(|allowance| beside < allowance);
     match kind {
-        SlotKind::Light if room => count - reserved..count,
+        SlotKind::Light if room => 0..count,
         SlotKind::Light | SlotKind::Heavy => count..count,
     }
 }
@@ -1078,7 +1025,7 @@ mod tests {
             "a slot free, as for a gate that defers to earlier tickets"
         );
         let held_again = Holder::take(scratch.name(KernelObject::LightSlot(0)));
-        wait.barrier = Some(Barrier { pid: 9, holding: false });
+        wait.barrier = Some(Barrier { pid: 9 });
         assert_eq!(
             heartbeat(&mut wait, &mut survey, &mut console),
             ["gate: still waiting for a light slot beside the critical request of gate 9 (N s)"],
@@ -1183,7 +1130,7 @@ mod tests {
         assert!(others.iter().all(|ticket| ticket.pid != own.pid), "{others:?}");
         assert_eq!(
             barrier(&others, order),
-            Some(Barrier { pid: 12, holding: true }),
+            Some(Barrier { pid: 12 }),
             "the earliest critical request ahead, which holds the machine"
         );
         let later = [ticket(TicketKind::Critical, 100, 8), ticket(TicketKind::Critical, 200, 13)];
@@ -1195,62 +1142,54 @@ mod tests {
         let tie = [ticket(TicketKind::Critical, 100, 6), ticket(TicketKind::Heavy, 50, 5)];
         assert_eq!(
             barrier(&tie, order),
-            Some(Barrier { pid: 6, holding: false }),
+            Some(Barrier { pid: 6 }),
             "a request arrived with it, of a lower pid, still waiting"
         );
         assert_eq!(barrier(&[], order), None);
     }
 
     #[test]
-    fn behind_a_barrier_a_heavy_gate_tries_no_slot_and_a_light_one_only_the_reserved_slots_while_any_is_left() {
+    fn behind_a_barrier_a_heavy_gate_tries_no_slot_and_a_light_one_any_slot_while_fewer_than_the_allowance_run_beside_it() {
         assert_eq!(slot_range(SlotKind::Heavy, 3, 0), 3..3, "a heavy gate tries none");
-        assert_eq!(slot_range(SlotKind::Light, 5, 0), 3..5, "the two highest light slots are reserved");
-        assert_eq!(slot_range(SlotKind::Light, 5, 1), 3..5);
-        assert_eq!(slot_range(SlotKind::Light, 5, 2), 5..5, "as many light gates beside it as are reserved");
-        assert_eq!(slot_range(SlotKind::Light, 1, 0), 0..1, "a count of 1 reserves its one slot");
+        assert_eq!(slot_range(SlotKind::Light, 5, 0), 0..5, "any light slot, the lowest included");
+        assert_eq!(slot_range(SlotKind::Light, 5, 1), 0..5);
+        assert_eq!(slot_range(SlotKind::Light, 5, 2), 5..5, "two light gates beside it already");
+        assert_eq!(slot_range(SlotKind::Light, 1, 0), 0..1, "a count of 1 allows one light gate");
         assert_eq!(slot_range(SlotKind::Light, 1, 1), 1..1);
+        assert_eq!(slot_range(SlotKind::Light, 5, usize::MAX), 5..5, "no beside count, no slot");
     }
 
-    /// One row of the lend table: the other gates' tickets, whether the critical mutex is open, the parent's light slot,
-    /// the light count, whether the parent lends, and why.
-    type Row<'t> = (&'t [Ticket], bool, Option<u32>, u32, bool, &'t str);
+    /// One row of the lend table: the other gates' tickets, whether the critical mutex is open, whether the parent
+    /// lends, and why.
+    type Row<'t> = (&'t [Ticket], bool, bool, &'t str);
 
     #[test]
-    fn a_parent_lends_its_slot_only_while_a_critical_request_drains_and_its_slot_is_one_the_drain_takes() {
+    fn a_parent_lends_its_slot_whatever_its_index_only_while_a_critical_request_drains() {
         let waiting = [ticket(TicketKind::Critical, 50, 9)];
         let mut holds = ticket(TicketKind::Critical, 50, 9);
         holds.holds = true;
         let holding = [holds];
         let heavy = [ticket(TicketKind::Heavy, 50, 10)];
-        let table: [Row<'_>; 9] = [
-            (&waiting, false, Some(0), 4, true, "a waiting request, the parent on an unreserved slot"),
-            (&waiting, false, None, 4, true, "a parent claim that cannot be read"),
-            (&heavy, true, Some(1), 4, true, "the critical mutex open with no critical ticket"),
-            (&heavy, false, Some(0), 4, false, "no critical request"),
-            (&[], false, None, 4, false, "no ticket at all"),
-            (&holding, true, Some(0), 4, false, "a request that holds the machine"),
-            (&waiting, false, Some(2), 4, false, "the parent on a reserved slot"),
-            (&waiting, false, Some(4), 4, false, "the parent past the light count"),
-            (&waiting, false, Some(0), 1, false, "a count of 1, whose one slot is reserved"),
+        let table: [Row<'_>; 5] = [
+            (&waiting, false, true, "a waiting request"),
+            (&heavy, true, true, "the critical mutex open with no critical ticket"),
+            (&heavy, false, false, "no critical request"),
+            (&[], false, false, "no ticket at all"),
+            (&holding, true, false, "a request that holds the machine"),
         ];
-        for (others, open, index, light, expected, why) in table {
-            assert_eq!(lends(others, light, &mut Known { open, index }), expected, "{why}");
+        for (others, open, expected, why) in table {
+            assert_eq!(lends(others, &mut Known { open }), expected, "{why}");
         }
     }
 
-    /// Lend facts known up front: whether the critical mutex is open, and the parent's light slot.
+    /// Lend facts known up front: whether the critical mutex is open.
     struct Known {
         open: bool,
-        index: Option<u32>,
     }
 
     impl LendFacts for Known {
         fn critical_open(&mut self) -> bool {
             self.open
-        }
-
-        fn parent_index(&mut self) -> Option<u32> {
-            self.index
         }
     }
 }

@@ -169,6 +169,9 @@ pub struct TestSeams {
     /// How long the readers of a routing-decision git call that has exited may take to reach their pipes' ends before
     /// the call fails, in place of 2 s.
     pub git_drain_ms: Option<u64>,
+    /// How long a light gate behind a critical request waits, holding the beside mutex, between journalling its take
+    /// and writing its claim.
+    pub beside_claim_pause_ms: Option<u64>,
     /// How long the remote client's `dotnet --list-sdks` of this PC may take before it is killed and the SDK list
     /// counts as unreadable, in place of 30 s.
     pub dotnet_limit_ms: Option<u64>,

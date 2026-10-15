@@ -113,6 +113,7 @@ fn claim_files_drop_local_and_the_root_hash() {
     }
 
     for object in [
+        KernelObject::CriticalBeside,
         KernelObject::Journal,
         KernelObject::WakeEvent { pid: 4242, start_ms: 1 },
         KernelObject::Job { gate_pid: 4242 },
@@ -169,6 +170,11 @@ fn object_names_match_the_design_table() {
             KernelObject::Job { gate_pid: 4242 },
             r"Local\gate-job-4242",
             r"Local\gate-7ef6faae-job-4242",
+        ),
+        (
+            KernelObject::CriticalBeside,
+            r"Local\gate-critical-beside",
+            r"Local\gate-7ef6faae-critical-beside",
         ),
         (
             KernelObject::Routed { hash: 0xab },

@@ -541,8 +541,9 @@ pub(crate) struct Taker<'t> {
 
 impl Taker<'_> {
     /// Journals the take of `taken`, a slot of `pool` the run waited `waited` seconds for, says and names it when a
-    /// killed gate had left it held, writes its claim and wakes the waiters. The gate's ticket is already deleted.
-    pub(crate) fn took(&mut self, taken: &Taken, pool: Pool, waited: f64, survey: &mut Survey, console: &mut Console) {
+    /// killed gate had left it held, writes its claim, lets go of the beside mutex a light gate behind a critical
+    /// request took the slot under, and wakes the waiters. The gate's ticket is already deleted.
+    pub(crate) fn took(&mut self, taken: &mut Taken, pool: Pool, waited: f64, survey: &mut Survey, console: &mut Console) {
         let name = taken.held.name().to_owned();
         let mut abandoned = Vec::new();
         if taken.abandoned {
@@ -558,7 +559,13 @@ impl Taker<'_> {
             remote: self.tag,
             expected: self.expected,
         };
+        if taken.beside.is_some()
+            && let Some(pause) = self.request.test_seams.beside_claim_pause_ms
+        {
+            std::thread::sleep(Duration::from_millis(pause));
+        }
         slots::write_claim(&taken.held, pool.claim_kind(), &of, console);
+        taken.beside = None;
         slots::wake_waiters(self.root, survey, console);
     }
 }
@@ -757,9 +764,7 @@ impl Run<'_> {
     /// is not routed ([`Run::on_parent`]). The route, and what the decision learnt of the gate's place in its worktree.
     fn route(&mut self, environment: &Environment, console: &mut Console) -> (Route, Placed) {
         let nesting = self.nesting;
-        if let Nesting::Under(parent) = nesting
-            && wait::lent_before_queue(self.root, parent.pid, self.host.processors, &mut self.survey, console)
-        {
+        if matches!(nesting, Nesting::Under(_)) && wait::lent_before_queue(self.root, &mut self.survey, console) {
             self.lent = true;
             return (Route::Local { reason: None }, Placed::NotAsked);
         }
@@ -838,10 +843,8 @@ impl Run<'_> {
     /// slot, whether it lends that slot before the run queues, as [`Run::route`] asked of the nesting the run was read
     /// with; a run already lent its parent's slot keeps it.
     fn lend_again(&mut self, console: &mut Console) {
-        if let Nesting::Under(parent) = self.nesting
-            && !self.lent
-        {
-            self.lent = wait::lent_before_queue(self.root, parent.pid, self.host.processors, &mut self.survey, console);
+        if matches!(self.nesting, Nesting::Under(_)) && !self.lent {
+            self.lent = wait::lent_before_queue(self.root, &mut self.survey, console);
         }
     }
 
@@ -1511,7 +1514,7 @@ impl Run<'_> {
         Taking::Took(took, figures)
     }
 
-    /// Waits for the machine as a critical gate and takes it into `held` once it holds every heavy and unreserved light
+    /// Waits for the machine as a critical gate and takes it into `held` once it holds every heavy slot and its light
     /// slot, then journals the take with what it found, says the holds line, writes the critical claim and wakes the
     /// waiters. When the machine was taken; else a Ctrl+C ended the wait, which says so, journals the abandon, then
     /// releases what it took so far, deletes the ticket and wakes the waiters.

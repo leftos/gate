@@ -46,6 +46,8 @@ pub(crate) enum ValueOption {
     #[cfg(feature = "test-seams")]
     GitDrainMs,
     #[cfg(feature = "test-seams")]
+    BesideClaimPauseMs,
+    #[cfg(feature = "test-seams")]
     DotnetLimitMs,
     #[cfg(feature = "test-seams")]
     RemoteTransport,
@@ -248,6 +250,8 @@ impl RunBuilder {
             ValueOption::GitLimitMs => self.test_seams.git_limit_ms = Some(values::above_zero(spelled, value)?),
             #[cfg(feature = "test-seams")]
             ValueOption::GitDrainMs => self.test_seams.git_drain_ms = Some(values::above_zero(spelled, value)?),
+            #[cfg(feature = "test-seams")]
+            ValueOption::BesideClaimPauseMs => self.test_seams.beside_claim_pause_ms = Some(values::above_zero(spelled, value)?),
             #[cfg(feature = "test-seams")]
             ValueOption::DotnetLimitMs => self.test_seams.dotnet_limit_ms = Some(values::above_zero(spelled, value)?),
             #[cfg(feature = "test-seams")]
