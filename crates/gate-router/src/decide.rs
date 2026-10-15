@@ -10,7 +10,7 @@ use crate::config::{CARGO_OUTPUTS, Config, ConfigProblem, ignored_line};
 use crate::escape::escaped;
 use crate::key::{is_layout_name, repo_name, work_folder_key};
 use crate::like::{Pattern, eq_ignoring_case};
-use crate::rewrite::{RewritePlace, SiblingRoot, drive_letters, rewrite_words, split_root};
+use crate::rewrite::{RewritePlace, SiblingRoot, drive_letters, rewrite_words, root_letter, split_root};
 
 /// The line said when `--no-build` was dropped from the builder's words.
 pub const DROPPED_NO_BUILD_LINE: &str = "gate: dropped --no-build: the last build may have run on the other machine";
@@ -851,15 +851,52 @@ fn check_consent(siblings: &[SiblingRoot], allowed: Result<&[String], &str>) -> 
 }
 
 /// The subst table for the drive letters the words use, other than the `root`'s: each letter whose device target names
-/// a path (`\??\X:\dev`), mapped to that path. A volume or a missing device adds nothing.
+/// a path (`\??\X:\dev`), mapped to that path followed through the subst drives it names ([`subst_path`]). Each letter
+/// is asked once.
 fn subst_drives(root: &str, words: &[String], facts: &dyn Facts) -> Vec<(char, String)> {
+    let own = root_letter(root);
+    let mut answers = Vec::new();
     drive_letters(root, words)
         .into_iter()
-        .filter_map(|letter| {
-            let target = facts.subst_target(letter)?;
-            target.strip_prefix(r"\??\").map(|path| (letter, path.to_owned()))
-        })
+        .filter_map(|letter| subst_path(letter, own, facts, &mut answers).map(|path| (letter, path)))
         .collect()
+}
+
+/// The most subst drives a chain is followed through.
+const SUBST_HOPS: usize = 26;
+
+/// The path the subst drive `letter` stands for, its target followed while it starts on another drive than the root's
+/// (`own`): `S:` standing for `T:\a` and `T:` for `X:\dev` gives `X:\dev\a`. `None` when a drive on the way is a volume
+/// or no device, when the chain comes back to a drive it passed or runs past [`SUBST_HOPS`] drives. `answers` holds
+/// each letter asked and its path, so no letter is asked twice.
+fn subst_path(letter: char, own: Option<char>, facts: &dyn Facts, answers: &mut Vec<(char, Option<String>)>) -> Option<String> {
+    let mut passed = vec![letter];
+    let mut path = device_path(letter, facts, answers)?;
+    for _ in 0..SUBST_HOPS {
+        let Some(next) = root_letter(&path).filter(|next| Some(*next) != own) else {
+            return Some(path);
+        };
+        if passed.contains(&next) {
+            return None;
+        }
+        passed.push(next);
+        let target = device_path(next, facts, answers)?;
+        path = format!("{}{}", target.trim_end_matches(['\\', '/']), &path[2..]);
+    }
+    None
+}
+
+/// The path the device of the drive `letter` names (`\??\X:\dev` gives `X:\dev`), asked once and kept in `answers`;
+/// `None` for a volume or no device.
+fn device_path(letter: char, facts: &dyn Facts, answers: &mut Vec<(char, Option<String>)>) -> Option<String> {
+    if let Some((_, path)) = answers.iter().find(|(asked, _)| *asked == letter) {
+        return path.clone();
+    }
+    let path = facts
+        .subst_target(letter)
+        .and_then(|target| target.strip_prefix(r"\??\").map(str::to_owned));
+    answers.push((letter, path.clone()));
+    path
 }
 
 fn remote_run(matched: Matched<'_>, subfolder: String, given: &[String], facts: &dyn Facts) -> RemoteRun {

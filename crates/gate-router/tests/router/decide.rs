@@ -878,6 +878,65 @@ fn subst_each_letter_is_asked_once_and_the_roots_own_never() {
     assert_eq!(facts.asked(), ["config", "place", "subst_target D", "subst_target Q"]);
 }
 
+/// A gate at the root with S: standing for `T:\a` and T: for `t_target`, when given.
+fn on_chain(t_target: Option<&str>) -> FakeFacts {
+    let mut devices = vec![('S', r"\??\T:\a".to_owned())];
+    devices.extend(t_target.map(|target| ('T', target.to_owned())));
+    FakeFacts {
+        devices,
+        ..FakeFacts::at_root()
+    }
+}
+
+#[test]
+fn subst_a_chain_of_drives_standing_for_the_root_is_followed() {
+    let facts = on_chain(Some(r"\??\X:\dev\yaat.wt"));
+    let command = words(&["dotnet", "test", r"S:\src\x.csproj"]);
+    assert_eq!(
+        routed(decide(&heavy(&command), &facts)).words,
+        stamped(&["dotnet", "test", r"src\x.csproj"])
+    );
+    assert_eq!(
+        facts.asked(),
+        ["config", "place", "subst_target S", "subst_target T", "file_in_folder dotnet", "head_sha"]
+    );
+    let climb = words(&["dotnet", "test", r"S:\..\x"]);
+    let climb_facts = on_chain(Some(r"\??\X:\dev\yaat.wt"));
+    assert_eq!(
+        local_line(&decide(&heavy(&climb), &climb_facts)).as_deref(),
+        Some(r"gate: not routed: S:\..\x is outside the worktree")
+    );
+    assert_eq!(climb_facts.asked(), ["config", "place", "subst_target S", "subst_target T"]);
+}
+
+#[test]
+fn subst_a_drive_a_chain_passed_through_is_asked_once() {
+    let facts = on_chain(Some(r"\??\X:\dev\yaat.wt"));
+    let command = words(&["dotnet", "test", r"S:\src\x.csproj", r"T:\a\y"]);
+    assert_eq!(
+        routed(decide(&heavy(&command), &facts)).words,
+        stamped(&["dotnet", "test", r"src\x.csproj", "y"])
+    );
+    assert_eq!(
+        facts.asked(),
+        ["config", "place", "subst_target S", "subst_target T", "file_in_folder dotnet", "head_sha"]
+    );
+}
+
+#[test]
+fn subst_a_chain_that_loops_or_reaches_no_subst_drive_adds_no_spelling() {
+    let command = words(&["dotnet", "test", r"S:\src\x.csproj"]);
+    for target in [Some(r"\??\S:\b"), None, Some(r"\Device\HarddiskVolume3")] {
+        let facts = on_chain(target);
+        assert_eq!(
+            local_line(&decide(&heavy(&command), &facts)).as_deref(),
+            Some(r"gate: not routed: S:\src\x.csproj is outside the worktree"),
+            "{target:?}"
+        );
+        assert_eq!(facts.asked(), ["config", "place", "subst_target S", "subst_target T"], "{target:?}");
+    }
+}
+
 #[test]
 fn a_dotnet_build_carries_the_worktree_head_as_its_source_revision() {
     let command = words(&["dotnet", "build"]);

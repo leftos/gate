@@ -1,12 +1,16 @@
 //! The in-worktree path rewrite: a routed command's words as the builder runs them in the gate's folder there.
-//! Every path in a word that lies inside the worktree or a declared sibling beside it is made relative to the gate's
-//! folder; any other path, a UNC path or a relative path climbing above the root other than into a sibling marks the
-//! word as outside the worktree.
+//! Every drive path in a word that lies inside the worktree or a declared sibling beside it is made relative to the
+//! gate's folder; any other drive path marks the word as outside the worktree.
 //!
-//! A path starts at a drive letter, a colon and a separator not preceded by a letter, digit, `_` or `-`, anywhere in
-//! the word (`--flag=X:\a`, `-p:Name=X:\a`, `"X:\a;X:\b"`, a script's text), each such start a path of its own, judged
-//! on its own. It runs to the first of `, ; " ' ) | & < >`. In a word that holds one of those or a line break (a
-//! script's text or a list) white space ends it too; in any other word, one argument, a path runs through its spaces.
+//! A drive path starts at a drive letter, a colon and a separator not preceded by a letter, digit, `_` or `-`,
+//! anywhere in the word (`--flag=X:\a`, `-p:Name=X:\a`, `"X:\a;X:\b"`, a script's text), each such start a path of its
+//! own, judged on its own. It runs to the first of `, ; " ' ) | & < >`. In a word that holds one of those or a line
+//! break (a script's text or a list) white space ends it too; in any other word, one argument, a path runs through its
+//! spaces.
+//!
+//! A word is outside too when it holds a drive-relative path (`C:..\x`), a drive path right after a device prefix
+//! (`\\?\`, `\\.\`), or, at any place a path may start in it, a root-relative, share or device path or relative text
+//! whose `..` climb out of the worktree.
 
 use crate::like::{eq_ignoring_case, lower_char};
 
@@ -66,6 +70,14 @@ pub struct RewritePlace<'a> {
 /// folder is spelled on, when that root is the worktree root or a folder below it: the folder's spelling sits no more
 /// folders below its drive or share root than the folder sits below the worktree root, as many included. From `S:\` standing for the
 /// worktree root, `..\b` names `S:\b`, no sibling.
+///
+/// A word is outside, whatever its drive paths, when it holds a drive-relative path (`C:..\x`, `--x=C:y`), whose
+/// meaning depends on the folder current on that drive; a drive path right after `\\?\`, `\\.\`, `//?/` or `//./`; or,
+/// at any place a path may start in it (the word's start, after white space, after any of
+/// `, ; " ' ) | & < > ( =`, after the colon of a switch starting the word, a white-space token or following `"`, `'` or `,`, after an `@` right at
+/// any of these), a drive-relative path, a root-relative path (`\src`, and in a value position `/src`), a share or
+/// device path (two separators) or relative text that climbs out as above, read both to the end of the word and to the
+/// end of the path there. A word's rewritten text is the same either way.
 #[must_use]
 pub fn rewrite_words(place: &RewritePlace<'_>, words: &[String], drives: &[(char, String)], siblings: &[SiblingRoot]) -> Rewritten {
     let cwd: Vec<&str> = place.prefix.split(['\\', '/']).filter(|segment| !segment.is_empty()).collect();
@@ -108,7 +120,8 @@ pub(crate) fn drive_letters(root: &str, words: &[String]) -> Vec<char> {
     letters
 }
 
-fn root_letter(root: &str) -> Option<char> {
+/// The drive letter, upper-cased, that `root` starts with (`X:`); `None` when it starts with none.
+pub(crate) fn root_letter(root: &str) -> Option<char> {
     let mut characters = root.chars();
     let letter = characters.next()?;
     (letter.is_ascii_alphabetic() && characters.next() == Some(':')).then(|| letter.to_ascii_uppercase())
@@ -232,13 +245,14 @@ fn rewrite_word(bases: &Bases<'_>, cwd: &[&str], word: &str) -> (String, bool) {
     if word.starts_with(r"\\") || word.starts_with("//") {
         return (word.to_owned(), true);
     }
+    let judged = judged_outside(cwd, bases, word);
     let starts = drive_starts(word);
     if starts.is_empty() {
-        return (word.to_owned(), relative_escape(cwd, bases, word));
+        return (word.to_owned(), judged);
     }
     let script = word.contains(PATH_ENDS) || word.contains(['\n', '\r']);
     let mut text = String::with_capacity(word.len());
-    let mut outside = false;
+    let mut outside = judged || starts.iter().any(|&index| after_device_prefix(word, index));
     let mut at = 0;
     for index in starts {
         match path_edit(bases, cwd, word, index, script) {
@@ -262,8 +276,7 @@ fn drive_starts(word: &str) -> Vec<usize> {
     let mut starts = Vec::new();
     let mut index = 0;
     while index + 2 < bytes.len() {
-        let drive = bytes[index].is_ascii_alphabetic() && bytes[index + 1] == b':' && matches!(bytes[index + 2], b'\\' | b'/');
-        if drive && !follows_word_character(word, index) {
+        if drive_at(bytes, index) && !follows_word_character(word, index) {
             starts.push(index);
             index += 3;
         } else {
@@ -271,6 +284,19 @@ fn drive_starts(word: &str) -> Vec<usize> {
         }
     }
     starts
+}
+
+/// Whether an ASCII letter, `:` and `\` or `/` stand at `index` in `bytes`.
+fn drive_at(bytes: &[u8], index: usize) -> bool {
+    bytes.len() > index + 2 && bytes[index].is_ascii_alphabetic() && bytes[index + 1] == b':' && matches!(bytes[index + 2], b'\\' | b'/')
+}
+
+/// Whether the drive path at `index` in `word` follows a device prefix, `\\?\` or `\\.\`, with either separator.
+fn after_device_prefix(word: &str, index: usize) -> bool {
+    let separator = |byte: u8| matches!(byte, b'\\' | b'/');
+    index.checked_sub(4).is_some_and(
+        |from| matches!(word.as_bytes()[from..index], [first, second, b'?' | b'.', last] if separator(first) && separator(second) && separator(last)),
+    )
 }
 
 fn follows_word_character(word: &str, index: usize) -> bool {
@@ -481,19 +507,92 @@ fn resolve<'a>(base: &[&'a str], path: &'a str) -> Option<Vec<&'a str>> {
     Some(segments)
 }
 
-/// Whether a word holding no drive path names a folder above the worktree root outside the siblings: the word itself,
-/// the text after its last `=` (`--project=../x`) or the text after a leading switch prefix (`-p:../x`, `/p:../x`).
-fn relative_escape(cwd: &[&str], bases: &Bases<'_>, word: &str) -> bool {
-    let after_equals = word.rfind('=').map(|at| &word[at + 1..]);
-    [Some(word), after_equals, switch_value(word)]
-        .into_iter()
-        .flatten()
-        .any(|text| climbs(cwd, bases, text))
+/// Whether `word` names a place outside the worktree by a path's form rather than its spelling: it holds a
+/// drive-relative path ([`drive_relative`]), or at one of its path starts ([`path_starts`]) a rooted path ([`rooted`]),
+/// a drive-relative one ([`drive_relative_at`]) or relative text that [`climbs`] out, read both to the end of the word and to the end of the path there. A drive
+/// path at a start is left to the rewrite, which judges it by its spelling.
+fn judged_outside(cwd: &[&str], bases: &Bases<'_>, word: &str) -> bool {
+    drive_relative(word)
+        || path_starts(word).into_iter().any(|start| {
+            let text = &word[start.index..];
+            if rooted(text, start.value) || drive_relative_at(text.as_bytes()) {
+                return true;
+            }
+            !drive_at(text.as_bytes(), 0) && (climbs(cwd, bases, text) || climbs(cwd, bases, &text[..path_end(text, 0, true)]))
+        })
 }
 
-/// The value of a `-x:value`, `--x:value` or `/x:value` word: a switch name of a letter then letters, digits, `_`,
-/// `.` or `-`, a colon, and a value of one line.
-fn switch_value(word: &str) -> Option<&str> {
+/// Whether `word` holds a drive-relative path: an ASCII letter and `:` not followed by `\`, `/` or `:` (or ending the
+/// word), the letter following none of a letter, digit, `_`, `-`, `.`, `/`, `\` or `:`. So `C:..\x`, `C:` and
+/// `--x=C:y` are drive-relative, and `-c:Release`, `/t:Build`, `$env:PATH`, `https://h`, `crate::mod`, `10:30` and
+/// `a/C:x` are not.
+fn drive_relative(word: &str) -> bool {
+    let bytes = word.as_bytes();
+    (0..bytes.len().saturating_sub(1)).any(|index| {
+        let drive = bytes[index].is_ascii_alphabetic() && bytes[index + 1] == b':';
+        let relative = || !matches!(bytes.get(index + 2), Some(b'\\' | b'/' | b':'));
+        let free = || {
+            !word[..index]
+                .chars()
+                .next_back()
+                .is_some_and(|before| before.is_alphanumeric() || matches!(before, '_' | '-' | '.' | '/' | '\\' | ':'))
+        };
+        drive && relative() && free()
+    })
+}
+
+/// A place in a word where a path may start: its byte index, and whether it is a value position, where a single `/`
+/// roots a path.
+#[derive(Clone, Copy)]
+struct PathStart {
+    index: usize,
+    value: bool,
+}
+
+/// Whether `text`, at a path start, begins with a drive-relative path: an ASCII letter and `:` not followed by `\`,
+/// `/` or `:` (`C:..\x`, `C:`; not `crate::mod`).
+fn drive_relative_at(text: &[u8]) -> bool {
+    matches!(text, [letter, b':', ..] if letter.is_ascii_alphabetic()) && !matches!(text.get(2), Some(b'\\' | b'/' | b':'))
+}
+
+/// Where paths may start in `word`: its start; after white space, a line break or any of `, ; " ' ) | & < > (`; and,
+/// as value positions, after `=`, after the colon of a switch (`-x:`, `--x:`, `/x:`) that starts the word, a white-space
+/// token or follows `"`, `'` or `,` (an argument's start), and after an `@` right at any of these.
+fn path_starts(word: &str) -> Vec<PathStart> {
+    let mut starts = Vec::new();
+    push_start(&mut starts, word, PathStart { index: 0, value: false }, true);
+    for (at, character) in word.char_indices() {
+        let index = at + character.len_utf8();
+        let value = character == '=';
+        if value || character.is_whitespace() || character == '(' || PATH_ENDS.contains(&character) {
+            let token = character.is_whitespace() || matches!(character, '"' | '\'' | ',');
+            push_start(&mut starts, word, PathStart { index, value }, token);
+        }
+    }
+    starts
+}
+
+/// Adds `start` in `word` to `starts`, then, when it begins an argument (`token`), the value of a switch there, and
+/// after either the value following an `@` right at it.
+fn push_start(starts: &mut Vec<PathStart>, word: &str, start: PathStart, token: bool) {
+    let switch = switch_value_start(&word[start.index..]).filter(|_| token).map(|offset| PathStart {
+        index: start.index + offset,
+        value: true,
+    });
+    for found in std::iter::once(start).chain(switch) {
+        starts.push(found);
+        if word[found.index..].starts_with('@') {
+            starts.push(PathStart {
+                index: found.index + 1,
+                value: true,
+            });
+        }
+    }
+}
+
+/// The byte index just past the colon of a leading `-x:`, `--x:` or `/x:` switch: a switch name of a letter then
+/// letters, digits, `_`, `.` or `-`, and a colon.
+fn switch_value_start(word: &str) -> Option<usize> {
     let rest = word
         .strip_prefix("--")
         .or_else(|| word.strip_prefix('-'))
@@ -504,18 +603,25 @@ fn switch_value(word: &str) -> Option<&str> {
     let (colon, mark) = rest
         .char_indices()
         .find(|(_, character)| !(character.is_alphanumeric() || matches!(character, '_' | '.' | '-')))?;
-    if mark != ':' {
-        return None;
+    (mark == ':').then(|| word.len() - rest.len() + colon + 1)
+}
+
+/// Whether `text`, at a path start, begins a rooted path: a `\` (root-relative, or with another separator a share or
+/// device path), two separators, or, in a `value` position, a single `/`. At any other start a single `/` is a switch
+/// (`/p:`, `/c`) or text (`test(/^run::/)`).
+fn rooted(text: &str, value: bool) -> bool {
+    let mut characters = text.chars();
+    match characters.next() {
+        Some('\\') => true,
+        Some('/') => value || matches!(characters.next(), Some('\\' | '/')),
+        _ => false,
     }
-    let value = &rest[colon + 1..];
-    let value = value.strip_suffix('\n').unwrap_or(value);
-    (!value.is_empty() && !value.contains('\n')).then_some(value)
 }
 
 /// Whether `text`, read as a path relative to the gate's folder, climbs above the root to anywhere but into one of the
 /// siblings, or climbs past the root of the drive the gate's folder is spelled on ([`drive_floor`]), where Windows
 /// stops `..`. Only text starting with `..` or holding a separator is read as a path, and never text starting with a
-/// separator: that is a switch (`/p:`, `/c`) or a path on the current drive, none of the worktree's.
+/// separator: [`rooted`] judges that.
 fn climbs(cwd: &[&str], bases: &Bases<'_>, text: &str) -> bool {
     if text.starts_with(['\\', '/']) || (!text.contains(['\\', '/']) && !text.starts_with("..")) {
         return false;

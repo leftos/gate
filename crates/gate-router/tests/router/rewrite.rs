@@ -70,9 +70,12 @@ const POWERSHELL_TABLE: &[Row] = &[
     sent("", &[r"Set-Location 'X:\dev\yaat.wt\a'; dotnet test"], &["Set-Location '.'; dotnet test"]),
     sent("", &[r"(X:\dev\yaat.wt\a)"], &["(.)"]),
     sent("", &[r"X:\dev\yaat.wt\a|x"], &[".|x"]),
-    sent(
-        "",
-        &["Set-Location X:\\dev\\yaat.wt\\a\\x\n..\\..\\..\\y"],
+    with_expect(
+        outside(
+            "",
+            &["Set-Location X:\\dev\\yaat.wt\\a\\x\n..\\..\\..\\y"],
+            "Set-Location X:\\dev\\yaat.wt\\a\\x\n..\\..\\..\\y",
+        ),
         &["Set-Location x\n..\\..\\..\\y"],
     ),
     outside("", &[r"X:\dev\yaat.wt\a.old\x"], r"X:\dev\yaat.wt\a.old\x"),
@@ -86,10 +89,12 @@ const POWERSHELL_TABLE: &[Row] = &[
     sent("src/c/", &["X:/dev/yaat.wt/a/src/c"], &["."]),
     sent("src/c/", &[r"X:\dev\yaat.wt\a\tests\X"], &[r"..\..\tests\X"]),
     sent("src/c/", &[r"..\..\tests\X", "a/b"], &[r"..\..\tests\X", "a/b"]),
-    sent(
+    sent("", &["/p:Configuration=Release", "/c", "a/b"], &["/p:Configuration=Release", "/c", "a/b"]),
+    outside("", &["dotnet", r"\foo"], r"\foo"),
+    outside(
         "",
-        &["/p:Configuration=Release", "/c", r"\foo", "a/b"],
-        &["/p:Configuration=Release", "/c", r"\foo", "a/b"],
+        &[r"Copy-Item X:\dev\yaat.wt\a\x ..\..\secret"],
+        r"Copy-Item X:\dev\yaat.wt\a\x ..\..\secret",
     ),
     outside("", &["dotnet", "X:/dev/yaat.wt/ab/tests"], "X:/dev/yaat.wt/ab/tests"),
     outside("", &["dotnet", "X:/dev/yaat/tests"], "X:/dev/yaat/tests"),
@@ -438,6 +443,113 @@ fn a_relative_climb_past_the_root_of_the_drive_or_share_the_folder_is_spelled_on
     }
 }
 
+/// Asserts each word at the root is sent as written, none outside.
+fn assert_unchanged(list: &[&str]) {
+    for word in list {
+        assert_sent("", &[(word, word)], &[]);
+    }
+}
+
+#[test]
+fn a_drive_relative_path_is_outside() {
+    assert_outside("", &[r"C:..\..\secret", "C:", r"--x=C:..\y", r#""C:x""#]);
+    assert_unchanged(&["-c:Release", "/t:Build", "$env:PATH", "https://h/p", "crate::mod", "10:30", "a/C:x"]);
+}
+
+#[test]
+fn a_root_relative_path_is_outside() {
+    assert_outside("", &[r"\src\x", r"-p:OutDir=\out\", r"\??\X:\x", "--x=/y", "@/x.rsp", r"type \x"]);
+    assert_unchanged(&["/p:Configuration=Release", "/c", "test(/^run::/)", "a/b", "/nologo"]);
+}
+
+#[test]
+fn a_share_or_device_path_is_outside_at_every_path_start() {
+    assert_outside(
+        "",
+        &[
+            r"--x=\\srv\s\x",
+            r"-p:A=\\?\X:\dev\yaat.wt\a\src",
+            "a;//srv/s",
+            r"\/srv/s",
+            r"/\srv\s",
+            r"x\\?\X:\dev\yaat.wt\a\src",
+            "x//./X:/dev/yaat.wt/a",
+        ],
+    );
+    assert_unchanged(&["--uri=https://h/p"]);
+}
+
+#[test]
+fn a_drive_relative_path_at_a_switch_colon_is_outside() {
+    assert_outside("", &[r"-bl:C:..\x.binlog", r"--output:C:..\..\out", "-o:C:x", r"--x:C:..\y"]);
+    assert_unchanged(&[
+        "-c:Release",
+        "-p:Configuration=Release",
+        "/t:Build",
+        "/p:X=1",
+        "crate::mod",
+        "$env:PATH",
+        "-o:C",
+    ]);
+}
+
+#[test]
+fn a_switch_colon_starts_a_path_in_every_token() {
+    assert_outside("", &[r"dotnet build -bl:..\x.binlog", r"Get-Content -Path:\secret", r"gc -Path:C:..\x"]);
+    assert_unchanged(&["dotnet build -c:Release /t:Build"]);
+}
+
+#[test]
+fn a_switch_colon_starts_a_path_after_a_quote_or_comma() {
+    assert_outside(
+        "",
+        &[
+            r#"dotnet build "-bl:C:..\x""#,
+            r#"dotnet build "-bl:..\..\x""#,
+            r"dotnet build '-o:..\..\out'",
+            r"dotnet build a,-o:..\..\out",
+        ],
+    );
+    assert_unchanged(&[r#"dotnet build "-c:Release""#]);
+}
+
+#[test]
+fn an_at_sign_after_any_path_start_begins_a_value() {
+    assert_outside("", &[r"dotnet build @..\..\x.rsp", r"type '@..\..\x.rsp'", "dotnet build @/x.rsp"]);
+    assert_sent("src/", &[(r"dotnet build @..\x.rsp", r"dotnet build @..\x.rsp")], &[]);
+    assert_unchanged(&["dotnet build @x.rsp", r"@..\b\x.rsp"]);
+}
+
+#[test]
+fn each_kind_of_path_start_is_judged() {
+    assert_outside(
+        "",
+        &[r"-p:\out", r"(..\..\x)", r"x,\y", r"x\\.\X:\dev\yaat.wt\a", "x//?/X:/dev/yaat.wt/a"],
+    );
+}
+
+#[test]
+fn a_climb_at_any_path_start_is_outside() {
+    assert_outside(
+        "",
+        &[
+            r"dotnet test X:\dev\yaat.wt\a\x.sln && type ..\..\secret",
+            r"Get-Content ..\..\secret",
+            r"@..\..\x.rsp",
+            "Set-Location X:\\dev\\yaat.wt\\a\\x\n..\\..\\..\\y",
+            r"a;..\..\x",
+        ],
+    );
+    let script = with_siblings("", &["pwsh", "-c", r"Get-Content ..\..\secret"], &[]);
+    assert_eq!(script.outside.as_deref(), Some(r"Get-Content ..\..\secret"));
+    assert_sent(
+        "",
+        &[(r"dotnet test X:\dev\yaat.wt\a\x.sln && type ..\b\y", r"dotnet test x.sln && type ..\b\y")],
+        &[],
+    );
+    assert_unchanged(&["@x.rsp", r"@..\b\x.rsp", r"type src\..\x"]);
+}
+
 #[test]
 fn a_climb_compares_sibling_names_in_ascii_case_only() {
     let kelvin = rewrite(&place_at(""), &words(&["../\u{212a}/x"]), &[], &[sibling("k")]);
@@ -463,7 +575,10 @@ fn resolve(base: &[String], path: &str) -> Vec<String> {
 
 /// A folder or file name, spaces and dots included, never `.` or `..`.
 fn segment() -> impl Strategy<Value = String> {
-    "[a-z0-9][a-z0-9 ._-]{0,7}"
+    // Win32 strips a name's trailing space or dot, and a token `..` after a space is a climb from a path start.
+    "[a-z0-9][a-z0-9 ._-]{0,7}".prop_filter("no trailing space or dot token, no `..` token", |segment| {
+        !segment.ends_with(' ') && !segment.ends_with(" .") && !segment.split(' ').any(|token| token == "..")
+    })
 }
 
 proptest! {

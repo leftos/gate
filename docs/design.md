@@ -1137,7 +1137,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
 - **What routes** is kept (T2): a heavy gate, not `--local`, under no covering or lending parent, outside a git hook (`GIT_INDEX_FILE` set to a non-empty value), whose first word is not `git` or `prek`, in a git worktree of a repo `remote.json` lists, whose words with in-worktree paths rewritten (T3) match one of that repo's patterns.
 
-  A matched command still runs here, saying why, when a word names a path outside the worktree or the gate's folder holds nothing the snapshot sends.
+  A matched command still runs here, saying why, when a word names a path outside the worktree (a drive-relative, root-relative, share, device or climbing form included, see [the path rewrite](#routing)) or the gate's folder holds nothing the snapshot sends.
 
   `--no-build` is dropped from the builder's words of a dotnet `test` or `run` command, saying so (T4); `build`, `msbuild`, `pack` and `publish` keep it everywhere. The fallback here drops the same words after every refusal, rebuilding locally as the builder would have, because an earlier routed step (a repo's test-all build) may have built only on the builder, so a later `dotnet test --no-build` that falls back here would find no build output.
 
@@ -1242,7 +1242,9 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 - **The `-like` matcher** is PowerShell's wildcard match, case-insensitive, over the words joined by single spaces. It folds case by simple case folding. Inside a `[...]` set, a non-ASCII member whose .NET case-insensitive equivalents differ (the Kelvin sign and `k`) can match in PowerShell and not here.
 - **The in-worktree path rewrite** (T3) finds a path wherever a drive letter, a colon and a separator start one inside a word (`--flag=X:\a`, `-p:Name=X:\a`, a script's text), each start judged on its own.
 
-  A path runs to the first of `, ; " ' ) | & < >`. In a word that holds one of those or a line break (a script word: a script's text or a list) white space ends a path too; in any other word, one argument, a path runs through its spaces. A drive other than the root's is followed through `subst` mappings.
+  A path runs to the first of `, ; " ' ) | & < >`. In a word that holds one of those or a line break (a script word: a script's text or a list) white space ends a path too; in any other word, one argument, a path runs through its spaces.
+
+  A drive other than the root's is followed through `subst` mappings as a chain, at most 26 hops with a visited set, and the root's own letter is never asked; a cycle, an unreadable device or a target that is not a `\??\` path gives no spelling, and the run stays local.
 
   A bare first word (no separator, drive or `.`/`..`) becomes `./name` only when that file exists in the gate's folder; otherwise it stays bare, for the builder's `PATH`.
 
@@ -1255,6 +1257,12 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
   Windows stops `..` at the root of a drive or share, so a `..` past that root is outside, never a climb to the root's parent. The floor comes from the spelling of the gate's folder: a folder spelled on a drive, a `\\?\X:` path or a UNC share whose root is the worktree root or a folder below it sits fewer folders below that root than it sits below the worktree root, and a relative climb past the difference is outside.
 
   A path on a bare `subst` drive that stands for a root (`S:\..`) never leaves that root either.
+
+  Every word is judged for outside at each path start: the start of the word, after white space or a line break, after `, ; " ' ) | & < > ( =`, after a leading `@` (and an `@` right after any path start), and after the colon of a switch that starts its white-space token or follows a `"`, `'` or `,` (`-bl:`, `/p:`). The forms below keep the run here with the same `is outside the worktree` line.
+
+  Drive-relative text is a letter and `:` not followed by `\`, `/` or `:`, anywhere in a word or at any path start (`C:..\..\secret`, `-bl:C:..\x.binlog`); `-c:Release`, `/t:Build`, `$env:PATH` and `crate::mod` are not. Root-relative text is a single `\` at a path start, or a single `/` only where a value begins (after `=`, a switch colon or `@`); `/p:...`, `/c` and nextest's `test(/^run::/)` stay switches or text.
+
+  A share or device path at any path start is outside: two separators, or a drive right after `\\?\`, `\\.\`, `//?/` or `//./`. Relative text that climbs out of the worktree (or past the drive-root floor above) is outside at every path start, not only at the word's.
 - **The work folder** on the builder is named `<repo name>-<key>`, the worktree root's last segment cut to letters, digits, `-` and `_` and 8 hex digits of the SHA-256 of the lower-cased root ([Glossary](GLOSSARY.md), work-folder key).
 - **The routed run's life** is kept (T5) and built in `remote/mod.rs` and `run.rs`: its ticket is heavy with `remote: true` and queues apart from the local waiters, which never count it ahead of them, nor it them; it waits up to 60 s for a remote slot (`--test-remote-wait-ms` in a test build); it takes one with a claim of kind `remote` of its own and calls the remote client with the route, the log and the limits (`--stall` as given, the interrupt).
 
