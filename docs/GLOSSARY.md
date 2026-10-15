@@ -46,6 +46,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Delete pending**: a file marked for deletion when its last handle closes (the classic delete, not the POSIX one `fs::remove_file` takes); until then its name stays listed and every open or delete of it is refused with access denied, so the gate passes it over as going away.
 - **Deny-only**: the state of a token group that still matches deny entries in an access check but no longer matches allow entries; a routed command's token holds the ssh logon's NETWORK group so.
 - **Departed member**: a process the run's job held that has ended, as the job's completion port remembered it (pid, start, read while its process object lived, and exit time; one found gone, its start never read, is not remembered); a process that names its pid as parent and started within its lifetime, from the job's creation at the earliest, counts as escaped, so a kill reaches it though no sample saw it under a live member.
+- **Desktop helper**: `gate-desktop-helper`, the Windows-subsystem exe a scheduled task starts in the builder's logged-on session at the box's request, which connects to the box's control pipe, creates a routed command suspended on the interactive desktop (`DesktopLaunch`) with the box's output pipes, and reports it for the box to adopt.
 - **Diagnostics block**: the record of what was running that a kill writes to the log before it terminates the job: the job's processes, the descendants outside the job and the last samples.
 - **Drain**: see critical drain.
 - **Drained cutover**: a cutover in which every gate of the old generation finishes before the switch completes, while the two generations share the slot mutexes and take turns on them.
@@ -69,7 +70,6 @@ Terms the gate's docs use in a project sense, in alphabetical order.
   The next build takes the hash of each file whose size and last write, as the open file's handle reads them, still match from it instead of reading the file, except while the pending marker stands.
 - **Heartbeat**: a line printed so a gate around the printer does not read quiet as a stall; the wait heartbeat is a waiting gate's `still waiting` line every 30 s, and the box heartbeat is the `gate-remote-heartbeat: <cpu ms>` line the box wrapper writes while its command's CPU use earns one.
 - **Heavy**: the slot kind for work that keeps several cores busy; its pool's thread budget is 4.
-- **Helper**: the Windows-subsystem exe the scheduled task starts in the builder's logged-on session, which creates a routed command on the interactive desktop (`DesktopLaunch`) for the box to adopt.
 - **History key**: a journal run's `command` after `gate_state::normalize_command`: split with the C runtime's argument rules, tree flags and their paths dropped, `.tmp` and worktree paths shortened, each word re-quoted; runs with the same key count together.
 - **Holds the machine**: said of a critical gate once it has taken every heavy and unreserved light slot.
 - **Interrupt**: a Ctrl+C or Ctrl+Break at the gate's console, which stops a queued gate or a running command (exit 0xC000013A unless the command exits on its own first).

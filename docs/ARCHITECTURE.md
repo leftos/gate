@@ -150,12 +150,12 @@ The rule that shapes it: every file and kernel object another process sees is de
 
   `PipedLaunch::start_suspended_within_fed` (in `piped.rs`) is the same suspended start in a job with stdin piped as well, a `PipedFed` holding the write end, which `gate push` feeds the exe through.
 
-  What a run on the builder's interactive desktop needs (nothing calls it yet):
-  - `pipe.rs`: `PipeServer` and `PipeClient`, a one-instance named pipe under a random name for one user's local client, the client refusing a pipe whose owner, DACL or label is not the server's.
-  - `adopt.rs`: `RemoteProcess` (push and pull handles into and out of another process) and the reads that say what a handed-over process or thread is (parent, creation time, session, image, `user_of`, `thread_is_suspended`).
-  - `session.rs`: the console session's id, connect state, user, domain and lock state.
+  What a run on the builder's interactive desktop needs (`gate-desktop`'s helper calls it; `gate box` does not yet):
+  - `pipe.rs`: `PipeServer` and `PipeClient`, a one-instance named pipe under a random name for one user's local client, the client refusing a pipe whose owner, DACL or label is not the server's; `read` and `write_all` on either end are overlapped and bounded by a deadline and wake handles (`PipeRead`, `PipeWrite`).
+  - `adopt.rs`: `RemoteProcess` (push and pull handles into and out of another process) and the reads that say what a handed-over process or thread is (parent, creation time, session, image, `user_of`, `thread_is_suspended`); `process_of_child` (a child found by pid, parent and creation time), `end_process`, `same_object`, `is_handle_value` and `check_received_output` (a received handle must be a pipe other than the control pipe).
+  - `session.rs`: the console session's id, connect state, user, domain and lock state, and `input_desktop_name`; `token.rs`: `current_user_sid`.
   - `piped.rs`: `DesktopLaunch`, a suspended child on `WinSta0\Default` at normal priority with an explicit handle list.
-  - `launch.rs`: `Suspended::adopt` (with `AdoptError`), which takes such a child by handle; `job.rs`: `Job::holds_process`.
+  - `launch.rs`: `Suspended::adopt` (with `AdoptError`), which takes such a child by handle, and `Suspended::release` (gives the child up without ending it, as `Released`); `EnvironmentBlock::from_wide`, which checks a received block; `job.rs`: `Job::holds_process`.
 
   `console.rs` is the box's UTF-8 console: a `Donor` (a `cmd.exe` put in the command's job) and `Utf8Console`, which attaches the process to the donor's console, sets the code pages, and returns through a keeper. `event.rs`'s `NamedEvent` also gives the named manual-reset event of a job's stop signal (`create_new_manual` by the run, `open_to_set` by `stop`).
 
@@ -168,13 +168,16 @@ The rule that shapes it: every file and kernel object another process sees is de
   Also the samples in `times.rs` (`system_times`, `process_times`, `file_time_now`) and the Ctrl+C handler in `interrupt.rs` (`Interrupt`: install, is_raised, raise; `Running::wait_or_interrupt` and `NamedEvent::wait_or_interrupt` end a wait early).
 
   Owns job objects, process creation, named mutexes and events, priority, console handling and taking samples. References `proc-table` and `windows-sys`. Never holds policy: what to kill and when is `gate-watchdog`'s.
+- **`gate-desktop`** (`crates/gate-desktop/`, Windows only): owns the desktop helper, the exe `gate-desktop-helper` (`helper.rs`, `bin/gate-desktop-helper.rs`), and the pipe protocol the box speaks with it (`protocol.rs`: `Hello`, `Spawn`, `Child`, `Failed`, `Done`, framed, a message the box reads from the helper capped at `HELPER_FRAME_LIMIT` of 64 KiB and one the helper reads at `FRAME_LIMIT` of 4 MiB), its `Arg0` and its exit codes (`HelperExit`).
+
+  Also `version.rs`: `build_version`, the text `gate --version`, the preflight's `gate: remote version` line and the client's version refusal print and compare. References `gate-win32`. Never depends on the `gate` crate, since the helper is a separate exe the box starts in another session.
 - **`gate`** (`crates/gate/`, Windows only): the binary.
 
   Owns the subcommands, the wait loop, the run, the journal writes, the remote pool and client call of a routed run, and `gate box`. The client of a routed run is the Rust client over ssh, chosen in `remote/mod.rs`.
 
   The Rust client in `remote/{client,install,outputs,parity,payload,retry,syncback,transport,watchdog}.rs`, with the snapshot beside it, is in every build; the local transport, the scripted client and the seams that pick a client are in test-seams builds only. `gate push` uses the transport's ssh words and `Ssh::find`. The git runner `remote/git.rs` is in every build, for `route.rs`, the client and the box preflight's SDK read.
 
-  References every crate above. Nothing depends on it.
+  References every crate above (`gate-desktop` for `build_version` alone). Nothing depends on it.
 
   Its modules so far: `route.rs` (the routing facts read from the routing file, git and the drive table, and the lines of the decision), `remote/`, in which `mod.rs` holds the `RemoteClient` a routed run calls, its call and outcome, and the scripted client of the `test-seams` build, and a client that cannot start makes a routed run fall back with reason `client`.
 
@@ -258,6 +261,7 @@ The box packs and sends with it (`boxside/outputs.rs`, GATE-44 part B); the PC's
 - **Change how a kill reaches a command's tree** → the escaped-tree kill in `crates/gate/src/escaped.rs` (a `gate run` kill) and the other kill sites (the box's stop, the remote client, `gate push`: GATE-140) must agree on what is ended. The escaped-tree kill spares no build server or shared daemon, since each run's build servers live in its own job (GATE-190).
 
   The stall check, the cores and the clock already count the escaped tree under the job's members (`escaped::outside_the_job` in each sample), and every kill of a running `gate run` command ends the recorded escaped processes too, whose launcher may have exited.
+- **Build the gate or the desktop helper** → the gate's version text comes from `gate-desktop` (`version::build_version`, the package version from `[workspace.package]` plus `GATE_BUILD_ID`), and the helper's `Hello` carries it, for the box to compare with its own. Build the helper with the same `GATE_BUILD_ID` as `gate.exe` (`tools/install.ps1` sets it for the gate's build); a helper built without it is `+dev` and matches only another `+dev` build.
 - **Change `gate-state` or `proc-table`'s public API** → ops-tower builds against them by git rev; a breaking change needs its matching change there, by inbox request.
 
 ## Test locations
