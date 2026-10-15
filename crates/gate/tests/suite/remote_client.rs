@@ -744,7 +744,7 @@ fn a_second_routed_run_of_one_worktree_falls_back_busy_at_once() {
     let go = Go(case.folder().join("ssh").join("go"));
     let first_steps = ssh_steps(&case, "first", &["ok", &format!("hold {}", shown(go.path()))]);
     let first = start(client_gate(&case, "first.log", &first_steps, &[r".\tool.exe", "out", "ran there"]));
-    wait_until("the first run's run call", || calls(&first_steps).len() == 2);
+    first.wait_until("the first run's run call", || calls(&first_steps).len() == 2);
     let second_steps = ssh_steps(&case, "second", &["ok", "ok"]);
 
     let (pid, second) = finish_with_pid(client_gate(&case, "second.log", &second_steps, &[r".\tool.exe", "out", "ran here"]));
@@ -785,7 +785,7 @@ fn gate_stop_tree_reaches_the_ssh_client() {
     let go = Go(case.folder().join("ssh").join("go"));
     let steps = ssh_steps(&case, "ssh", &["ok", &format!("hold {}", shown(go.path()))]);
     let running = start(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "out", "ran here"]));
-    wait_until("the run call", || calls(&steps).len() == 2);
+    running.wait_until("the run call", || calls(&steps).len() == 2);
     let gate_pid = running.id();
     let (ssh, at) = ssh_child_of(gate_pid);
 
@@ -2264,7 +2264,7 @@ fn a_worktree_changed_during_the_run_keeps_the_changes_and_fails_a_passing_run()
     let go = Go(case.folder().join("ssh").join("go"));
     let steps = ssh_steps(&case, "ssh", &["ok", &format!("hold {}", shown(go.path()))]);
     let run = start(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "mark", "made-on-box.txt"]));
-    wait_until("the run call", || calls(&steps).len() == 2);
+    run.wait_until("the run call", || calls(&steps).len() == 2);
     write(&case, "a.txt", "after\n");
     fs::write(go.path(), "").expect("the go file can be made");
 
@@ -2305,7 +2305,7 @@ fn a_failing_run_keeps_its_status_when_the_worktree_changed_during_it() {
         &steps,
         &[r".\tool.exe", "mark", "made-on-box.txt", "exit", "3"],
     ));
-    wait_until("the run call", || calls(&steps).len() == 2);
+    run.wait_until("the run call", || calls(&steps).len() == 2);
     write(&case, "a.txt", "after\n");
     fs::write(go.path(), "").expect("the go file can be made");
 
@@ -2410,7 +2410,7 @@ fn a_back_commit_whose_worktree_check_fails_is_kept_and_fails_the_run() {
     let go = Go(case.folder().join("ssh").join("go"));
     let steps = ssh_steps(&case, "ssh", &["ok", &format!("hold {}", shown(go.path()))]);
     let run = start(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "mark", "made-on-box.txt"]));
-    wait_until("the run call", || calls(&steps).len() == 2);
+    run.wait_until("the run call", || calls(&steps).len() == 2);
     fs::write(&broken, "").expect("the broken file can be made");
     fs::write(go.path(), "").expect("the go file can be made");
 
@@ -3493,7 +3493,7 @@ fn outputs_zero_clears_the_pending_marker() {
     let go = Go(case.folder().join("ssh").join("go"));
     let steps = ssh_steps(&case, "ssh", &["ok", &format!("hold {}", shown(go.path()))]);
     let run = start(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "out", "ran there"]));
-    wait_until("the run call", || calls(&steps).len() == 2);
+    run.wait_until("the run call", || calls(&steps).len() == 2);
     let marker = pending_marker(&case);
     assert!(marker.exists(), "the marker is written before the run call");
     fs::write(go.path(), "").expect("the go file can be made");
@@ -3894,7 +3894,7 @@ fn a_run_whose_worktree_changed_says_outputs_were_not_brought_back() {
     let go = Go(case.folder().join("ssh").join("go"));
     let steps = ssh_steps(&case, "ssh", &["ok", &format!("hold {}", shown(go.path()))]);
     let run = start(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "mark", "made-on-box.txt"]));
-    wait_until("the run call", || calls(&steps).len() == 2);
+    run.wait_until("the run call", || calls(&steps).len() == 2);
     write(&case, "a.txt", "after\n");
     fs::write(go.path(), "").expect("the go file can be made");
 
@@ -4584,7 +4584,7 @@ fn an_archive_member_that_is_an_lfsconfig_is_refused_by_the_install() {
     let go = Go(case.folder().join("ssh").join("go"));
     let steps = ssh_steps(&case, "ssh", &["ok", "ok", &format!("hold {}", shown(go.path()))]);
     let run = start(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "write", r"bin\a.txt", "built"]));
-    wait_until("the outputs call", || calls(&steps).len() == 3);
+    run.wait_until("the outputs call", || calls(&steps).len() == 3);
     // The box's own archive is swapped for one carrying the `.lfsconfig`, before the call reads it.
     fs::write(box_output_archive(&case), crafted_archive(".lfsconfig", "lfs")).expect("the archive can be replaced");
     fs::write(go.path(), "").expect("the go file can be made");
@@ -4612,7 +4612,7 @@ fn a_refused_install_of_a_member_outside_the_globs_clears_the_pending_marker() {
     let go = Go(case.folder().join("ssh").join("go"));
     let steps = ssh_steps(&case, "ssh", &["ok", "ok", &format!("hold {}", shown(go.path()))]);
     let run = start(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "write", r"bin\a.txt", "built"]));
-    wait_until("the outputs call", || calls(&steps).len() == 3);
+    run.wait_until("the outputs call", || calls(&steps).len() == 3);
     fs::write(box_output_archive(&case), crafted_archive(".lfsconfig", "lfs")).expect("the archive can be replaced");
     fs::write(go.path(), "").expect("the go file can be made");
 
@@ -4653,7 +4653,7 @@ fn an_archive_with_a_link_member_is_refused_and_the_pending_marker_cleared() {
     let go = Go(case.folder().join("ssh").join("go"));
     let steps = ssh_steps(&case, "ssh", &["ok", "ok", &format!("hold {}", shown(go.path()))]);
     let run = start(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "write", r"bin\a.txt", "built"]));
-    wait_until("the outputs call", || calls(&steps).len() == 3);
+    run.wait_until("the outputs call", || calls(&steps).len() == 3);
     fs::write(box_output_archive(&case), crafted_link_archive("bin/link")).expect("the archive can be replaced");
     fs::write(go.path(), "").expect("the go file can be made");
 
@@ -4681,7 +4681,7 @@ fn a_truncated_archive_keeps_the_pending_marker() {
     let go = Go(case.folder().join("ssh").join("go"));
     let steps = ssh_steps(&case, "ssh", &["ok", "ok", &format!("hold {}", shown(go.path()))]);
     let run = start(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "write", r"bin\a.txt", "built"]));
-    wait_until("the outputs call", || calls(&steps).len() == 3);
+    run.wait_until("the outputs call", || calls(&steps).len() == 3);
     let whole = crafted_archive("bin/a.txt", "box");
     fs::write(box_output_archive(&case), &whole[..whole.len() / 2]).expect("the archive can be cut short");
     fs::write(go.path(), "").expect("the go file can be made");
@@ -4725,7 +4725,7 @@ fn swapped_archive_run(case: &Case, extra: &[&str], member: &str) -> Outcome {
         &tuned,
         &[r".\tool.exe", "write", r"bin\new.txt", "built"],
     ));
-    wait_until("the outputs call", || calls(&steps).len() == 3);
+    run.wait_until("the outputs call", || calls(&steps).len() == 3);
     fs::write(box_output_archive(case), crafted_archive(member, "box")).expect("the archive can be replaced");
     fs::write(go.path(), "").expect("the go file can be made");
     run.finish()
@@ -4810,7 +4810,7 @@ fn a_pc_output_edited_during_the_run_is_not_overwritten() {
     let go = Go(case.folder().join("ssh").join("go"));
     let steps = ssh_steps(&case, "ssh", &["ok", &format!("hold {}", shown(go.path())), "ok"]);
     let run = start(client_gate(&case, "out.log", &steps, &BOTH_AND_NEW));
-    wait_until("the run call", || calls(&steps).len() == 2);
+    run.wait_until("the run call", || calls(&steps).len() == 2);
     write(&case, r"bin\both.txt", "edited during the run");
     fs::write(go.path(), "").expect("the go file can be made");
 
@@ -4828,7 +4828,7 @@ fn a_pc_output_held_open_is_skipped_and_the_rest_installed() {
     let go = Go(case.folder().join("ssh").join("go"));
     let steps = ssh_steps(&case, "ssh", &["ok", &format!("hold {}", shown(go.path())), "ok"]);
     let run = start(client_gate(&case, "out.log", &steps, &BOTH_AND_NEW));
-    wait_until("the run call", || calls(&steps).len() == 2);
+    run.wait_until("the run call", || calls(&steps).len() == 2);
     let held = fs::OpenOptions::new()
         .read(true)
         .share_mode(0)
@@ -4976,7 +4976,7 @@ fn a_routed_build_with_an_output_in_use_leaves_the_nothing_back_record() {
     let steps = ssh_steps(&case, "ssh", &["ok", &format!("hold {}", shown(go.path())), "ok"]);
     let command = wrapped_build(&BOTH_AND_NEW[1..], &RELEASE);
     let run = start(client_gate(&case, "out.log", &steps, &command));
-    wait_until("the run call", || calls(&steps).len() == 2);
+    run.wait_until("the run call", || calls(&steps).len() == 2);
     let held = fs::OpenOptions::new()
         .read(true)
         .share_mode(0)

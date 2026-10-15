@@ -402,6 +402,38 @@ impl Running {
         }
     }
 
+    /// Returns once `check` holds. Each look reads the program's exit status before it runs `check`, so a check that
+    /// still fails after the program was seen exited never will: the wait then fails at once, naming `what`, with the
+    /// exit status and the output so far, after the readers have had [`READER_GRACE`] to drain what it wrote. Fails
+    /// after the hang guard, with stderr so far, while the program still runs.
+    #[expect(
+        clippy::panic,
+        reason = "a program that exited before its case's check held fails the case with its status and output"
+    )]
+    pub fn wait_until(&self, what: &str, mut check: impl FnMut() -> bool) {
+        let deadline = Instant::now() + HANG_GUARD;
+        loop {
+            let ended = self.exit_status();
+            if check() {
+                return;
+            }
+            if let Some(status) = ended {
+                self.wait_for_readers();
+                let said = self.said();
+                panic!(
+                    "{what} did not happen before the program exited with {status}; stdout so far:\n{}\nstderr so far:\n{}",
+                    said.stdout, said.stderr
+                );
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{what} did not happen within the hang guard; stderr so far:\n{}",
+                text(&self.stderr)
+            );
+            thread::sleep(LOOK_AGAIN);
+        }
+    }
+
     /// The program's exit status once it has exited, read through its handle so a wait that only borrows it can ask.
     fn exit_status(&self) -> Option<ExitStatus> {
         let process = self.child.as_raw_handle();
@@ -762,6 +794,16 @@ fn a_wait_for_output_fails_at_once_when_the_program_exits_without_it() {
     let running = start(command);
 
     running.wait_for_stdout("started");
+}
+
+#[test]
+#[should_panic(expected = "the third call did not happen before the program exited with exit code: 3")]
+fn a_wait_until_fails_at_once_when_the_program_exits_before_its_check_holds() {
+    let mut command = Command::new(FAKE_TOOL);
+    command.args(["exit", "3"]);
+    let running = start(command);
+
+    running.wait_until("the third call", || false);
 }
 
 fn text(buffer: &Buffer) -> String {
