@@ -39,9 +39,9 @@ use super::git::{self, Git, GitError};
 use super::launch::KILL_WAIT;
 use super::payload;
 use super::retry::GIT_SSH_FAILED;
-use super::sibling_lock;
 use super::snapshot::{self, BACK, REFS, Snapshot};
 use super::watchdog::{self, Cut};
+use super::worktree_lock;
 use crate::boxside::payload::escaped;
 use crate::outputs::names::{is_git_s, is_lfs_config};
 use crate::slots::{self, Liveness};
@@ -88,18 +88,37 @@ impl<'a> Target<'a> {
 
 /// The repositories `call`'s sync-back brings changes back to, the main one first for `snapshot`, then each sibling the
 /// call carries for its snapshot in `sibling_snapshots`, in order, named on the builder as [`repo_name`] makes its
-/// folder name; the main one alone when there is not a snapshot for each sibling, as for a run that sent no pair.
-pub(super) fn targets<'a>(call: &RemoteCall<'a>, snapshot: &'a Snapshot, sibling_snapshots: &'a [Snapshot]) -> Vec<Target<'a>> {
+/// folder name; the main one alone for a call that carries no siblings. `None` when there is not a snapshot for each
+/// sibling: such a pair applies nothing ([`unmatched`]).
+pub(super) fn targets<'a>(call: &RemoteCall<'a>, snapshot: &'a Snapshot, sibling_snapshots: &'a [Snapshot]) -> Option<Vec<Target<'a>>> {
     let main = Target::new(call.leaf, call.root, call.repo, snapshot, call.key);
-    if call.siblings.is_empty() || sibling_snapshots.len() != call.siblings.len() {
-        return vec![main];
+    if call.siblings.is_empty() {
+        return Some(vec![main]);
+    }
+    if sibling_snapshots.len() != call.siblings.len() {
+        return None;
     }
     let siblings = call
         .siblings
         .iter()
         .zip(sibling_snapshots)
         .map(|(sibling, snapshot)| Target::new(sibling.name(), sibling.root(), &repo_name(sibling.name()), snapshot, call.key));
-    std::iter::once(main).chain(siblings).collect()
+    Some(std::iter::once(main).chain(siblings).collect())
+}
+
+/// How the sync-back of a pair whose sibling snapshots do not match its siblings ends: nothing applied, its line said,
+/// and a passing run as 1.
+pub(super) fn unmatched(attempt: &mut Attempt<'_, '_>, status: i64) -> Synced {
+    attempt.say(format!("{NOT_APPLIED}the run's sibling snapshots do not match its siblings"));
+    not_applied(status)
+}
+
+/// How a pair's run whose changes were not applied ends: a passing run as 1, for [`PAIR_NOT_APPLIED`].
+fn not_applied(status: i64) -> Synced {
+    Synced {
+        end: End::Status(not_passing(status)),
+        reason: Some(PAIR_NOT_APPLIED),
+    }
 }
 
 /// How a sync-back ended: the run's end, and, for a pair whose changes were not applied, why, which the outputs step
@@ -113,13 +132,20 @@ pub(super) struct Synced {
 /// Why a pair's passing run whose changes were not applied ends 1, as the outputs step says it.
 pub(super) const PAIR_NOT_APPLIED: &str = "the pair's remote changes were not applied";
 
-/// A target as the sync-back works in it: the target, and git found against its worktree.
+/// A target as the sync-back works in it: the target, git found against its worktree, and whether it is a pair's,
+/// whose lines name it.
 struct Worktree<'t> {
     target: &'t Target<'t>,
     git: Git,
+    pair: bool,
 }
 
 impl Worktree<'_> {
+    /// The line `line` as the sync-back says it for this worktree: naming its repository in a pair ([`in_repo`]).
+    fn said(&self, line: String) -> String {
+        if self.pair { in_repo(&line, self.target.name) } else { line }
+    }
+
     /// The worktree's root.
     fn root(&self) -> &Path {
         Path::new(self.target.root)
@@ -161,6 +187,7 @@ fn one(attempt: &mut Attempt<'_, '_>, target: &Target<'_>, status: i64) -> Resul
     let worktree = Worktree {
         target,
         git: Git::find(Path::new(target.root)).map_err(End::Failed)?,
+        pair: false,
     };
     let objects = objects_folder(attempt, &worktree)?;
     for line in swept(&objects, SystemTime::now(), slots::gate_liveness) {
@@ -169,6 +196,10 @@ fn one(attempt: &mut Attempt<'_, '_>, target: &Target<'_>, status: i64) -> Resul
     let Some(advertised) = has_back(attempt, &worktree, &remote)? else {
         return Ok(End::Status(status));
     };
+    let call = attempt.call;
+    let _lock = worktree_lock::held(call.state, &[(target.name, target.root)], attempt.limit, call.interrupt, |line| {
+        attempt.say(line);
+    })?;
     let name = incoming_name(std::process::id(), own_start(attempt.own_start_fails)?, &payload::job_nonce());
     let quarantine = Quarantine::made(&objects, &name).map_err(End::Failed)?;
     let back = Back {
@@ -237,20 +268,26 @@ impl Fetched<'_> {
 }
 
 /// The sync-back of a pair, all or nothing: only the back commits the box's line `back_commits` names are fetched, and
-/// only when it names the pair's repositories in order; else nothing is applied anywhere and the run ends as `status`.
+/// only when it names the pair's repositories in order; else nothing is applied anywhere, the line saying so said, and
+/// a passing run ends 1. The box's `failed` line, its failure said already, and a line naming no back commit apply
+/// nothing and end the run as `status`.
 /// In the first phase, in pair order, each repository with a back commit is fetched, checked as a single one is, and
 /// its objects moved in; every repository refused or ignored is said, and then any refusal applies nothing, keeps every
-/// back commit, and ends a passing run as 1. Otherwise every patch is written and checked, and only then, the interrupt
-/// looked at once, each is applied in pair order. The siblings' locks ([`sibling_lock::held`]) are held throughout, and
-/// each quarantine and any patch left goes at the end.
+/// back commit, and ends a passing run as 1. Otherwise every worktree is checked again, every patch is written and
+/// checked, and only then, the interrupt looked at once, each is applied in pair order. The locks of the worktrees with
+/// a back commit ([`worktree_lock::held`]) are held throughout, and each quarantine and any patch left goes at the end.
 fn pair(attempt: &mut Attempt<'_, '_>, targets: &[Target<'_>], back_commits: Option<&[BackCommit]>, status: i64) -> Result<Synced, End> {
     attempt.go_on()?;
     let unchanged = Synced {
         end: End::Status(status),
         reason: None,
     };
-    let Some(commits) = back_commits.and_then(|named| named_commits(targets, named)) else {
+    if back_commits.is_some_and(<[BackCommit]>::is_empty) {
         return Ok(unchanged);
+    }
+    let Some(commits) = back_commits.and_then(|named| named_commits(targets, named)) else {
+        attempt.say(format!("{NOT_APPLIED}the builder did not say which commits it made"));
+        return Ok(not_applied(status));
     };
     let backed: Vec<Repo<'_, '_>> = targets
         .iter()
@@ -262,8 +299,8 @@ fn pair(attempt: &mut Attempt<'_, '_>, targets: &[Target<'_>], back_commits: Opt
         return Ok(unchanged);
     }
     let call = attempt.call;
-    let siblings: Vec<(&str, &str)> = targets.iter().skip(1).map(|target| (target.name, target.root)).collect();
-    let _locks = sibling_lock::held(call.state, &siblings, call.interrupt, |line| attempt.say(line))?;
+    let worktrees: Vec<(&str, &str)> = backed.iter().map(|repo| (repo.target.name, repo.target.root)).collect();
+    let _locks = worktree_lock::held(call.state, &worktrees, attempt.limit, call.interrupt, |line| attempt.say(line))?;
     let mut fetched = Vec::with_capacity(backed.len());
     let end = pair_phases(attempt, &backed, &mut fetched, status);
     for repo in &mut fetched {
@@ -298,6 +335,11 @@ fn pair_phases<'t>(attempt: &mut Attempt<'_, '_>, backed: &[Repo<'t, '_>], fetch
     if !ready {
         return refused_pair(attempt, fetched, status);
     }
+    match unchanged_since(attempt, fetched) {
+        Ok(true) => {}
+        Ok(false) => return refused_pair(attempt, fetched, status),
+        Err(failed) => return Err(kept_all_after(attempt, fetched, failed)),
+    }
     match applied_pair(attempt, fetched) {
         Ok(()) => Ok(Synced {
             end: End::Status(status),
@@ -323,13 +365,14 @@ fn first_phase<'t>(attempt: &mut Attempt<'_, '_>, repo: &Repo<'t, '_>, fetched: 
     let worktree = Worktree {
         target,
         git: Git::find(Path::new(target.root)).map_err(End::Failed)?,
+        pair: true,
     };
     let objects = objects_folder(attempt, &worktree)?;
     for line in swept(&objects, SystemTime::now(), slots::gate_liveness) {
         attempt.say(line);
     }
     if has_back(attempt, &worktree, &remote)?.as_deref() != Some(repo.commit) {
-        attempt.say(ignored_line(repo.commit, worktree.snapshot()));
+        attempt.say(worktree.said(unadvertised_line(repo.commit)));
         return Ok(false);
     }
     let name = incoming_name(std::process::id(), own_start(attempt.own_start_fails)?, &payload::job_nonce());
@@ -361,7 +404,7 @@ fn judged(attempt: &mut Attempt<'_, '_>, repo: &mut Fetched<'_>, remote: &Remote
     };
     let head = line(attempt, &repo.worktree, &["rev-parse", "FETCH_HEAD"], &[])?;
     if head != repo.commit || !made_from(attempt, &repo.worktree, &back)? {
-        attempt.say(ignored_line(&head, repo.worktree.snapshot()));
+        attempt.say(repo.worktree.said(ignored_line(&head, repo.worktree.snapshot())));
         return Ok(false);
     }
     repo.held = Held::Taken;
@@ -381,12 +424,33 @@ fn judged(attempt: &mut Attempt<'_, '_>, repo: &mut Fetched<'_>, remote: &Remote
     Ok(true)
 }
 
-/// The refusal line `line` with the repository `name` right after its colon.
+/// The line `line`, `gate: <what>: <why>`, with the repository `name` right after the colon that ends `<what>`.
 fn in_repo(line: &str, name: &str) -> String {
-    match line.strip_prefix(NOT_APPLIED) {
-        Some(reason) => format!("{NOT_APPLIED}{}: {reason}", escaped(name)),
-        None => line.to_owned(),
+    let named = line
+        .strip_prefix("gate: ")
+        .and_then(|rest| rest.split_once(": "))
+        .map(|(what, why)| format!("gate: {what}: {}: {why}", escaped(name)));
+    named.unwrap_or_else(|| line.to_owned())
+}
+
+/// The line said for a back commit `back` the box's line named but the builder does not advertise.
+fn unadvertised_line(back: &str) -> String {
+    format!("{NOT_APPLIED}the builder does not have the commit it named ({})", short(back))
+}
+
+/// Whether every worktree of `fetched` still matches its snapshot, checked again after every fetch and just before
+/// any write; each that changed is refused, said as in the first phase.
+fn unchanged_since(attempt: &mut Attempt<'_, '_>, fetched: &mut [Fetched<'_>]) -> Result<bool, End> {
+    let mut unchanged = true;
+    for repo in fetched.iter_mut() {
+        if changed(attempt, &repo.worktree)? {
+            let line = repo.worktree.said(not_applied_line(repo.worktree.snapshot(), &repo.commit));
+            attempt.say(line);
+            repo.ready = false;
+            unchanged = false;
+        }
     }
+    Ok(unchanged)
 }
 
 /// How a pair whose first phase refused or ignored a back commit ends: every taken back commit kept, the repositories
@@ -397,10 +461,14 @@ fn refused_pair(attempt: &mut Attempt<'_, '_>, fetched: &mut [Fetched<'_>], stat
     if !untouched.is_empty() {
         attempt.say(untouched_line(&untouched));
     }
-    Ok(Synced {
-        end: End::Status(not_passing(status)),
-        reason: Some(PAIR_NOT_APPLIED),
-    })
+    Ok(not_applied(status))
+}
+
+/// Removes the patch `patch` once every patch applied; one that cannot be removed is said, and the run's end stands.
+fn removed_or_said(attempt: &mut Attempt<'_, '_>, patch: &Path) {
+    if let Err(End::Failed(why)) = remove(patch) {
+        attempt.say(format!("gate: {why}"));
+    }
 }
 
 /// Writes and checks every repository's patch, and only then, the interrupt looked at once, applies each in pair
@@ -423,13 +491,13 @@ fn applied_pair(attempt: &mut Attempt<'_, '_>, fetched: &mut [Fetched<'_>]) -> R
             applied(attempt, &repo.worktree, patch).map_err(|failed| write_failed(failed, fetched, at))?;
         }
     }
-    for repo in fetched.iter_mut() {
-        if let Some(patch) = repo.patch.take() {
-            remove(&patch)?;
-        }
-    }
     for repo in fetched.iter() {
         attempt.say(pair_synced_line(&repo.names, repo.name()));
+    }
+    for repo in fetched.iter_mut() {
+        if let Some(patch) = repo.patch.take() {
+            removed_or_said(attempt, &patch);
+        }
     }
     Ok(())
 }
@@ -595,7 +663,7 @@ fn fetch(
     match called.cut {
         Some(Cut::TooBig(cap)) => {
             attempt.noted(&called);
-            attempt.say(stopped_line(cap, remote.reference));
+            attempt.say(worktree.said(stopped_line(cap, remote.reference)));
             return Ok(Some(End::Status(not_passing(status))));
         }
         Some(Cut::Ceiling(ceiling)) => {
@@ -1763,8 +1831,16 @@ pub(super) fn keep_back_commits_line(kept: &mut Option<String>, line: &str, stde
 /// comma-separated, its commit 40 lowercase hex digits or `none`. `None` for a line that does not read so, whole: a
 /// line with one entry that is not a name and a commit names nothing.
 pub(super) fn back_commits(line: &str) -> Option<Vec<BackCommit>> {
-    line.strip_prefix(BACK_COMMITS)?.split(", ").map(back_commit).collect()
+    let named = line.strip_prefix(BACK_COMMITS)?;
+    if named == BACK_COMMITS_FAILED {
+        return Some(Vec::new());
+    }
+    named.split(", ").map(back_commit).collect()
 }
+
+/// What the box's back commits line says in place of the commits when a pair run's back commits failed or were never
+/// made after its command ended: [`back_commits`] reads it as naming none, so nothing is applied.
+const BACK_COMMITS_FAILED: &str = "failed";
 
 /// One entry of the back commits line, `<name> <commit>`, as [`back_commits`] reads it; `None` for one with no name, or
 /// whose commit is neither a sha nor `none`.
@@ -1968,8 +2044,9 @@ mod tests {
     use crate::remote::client::{Attempt, End};
     use crate::remote::git::{self, Git};
     use crate::remote::snapshot::{Snapshot, repository};
-    use crate::remote::transport::Local;
+    use crate::remote::transport::{Local, Program, PushTarget, Transport, Wire};
     use crate::slots;
+    use gate_router::{CarriedSibling, FolderId, RemoteRun, sibling_root};
 
     const BACK: &str = "8e8777a0e71c530018dc15bdebd7288f4f432aa4";
     const SNAPSHOT: &str = "b8a4812193314ab4b2404479b93f2338078c69eb";
@@ -2080,7 +2157,11 @@ mod tests {
             bridge: None,
         };
         let target = Target::new("app", &root, "app", &snapshot, "app-1a2b3c4d");
-        let worktree = Worktree { target: &target, git };
+        let worktree = Worktree {
+            target: &target,
+            git,
+            pair: false,
+        };
 
         let listed = has_back(&mut attempt, &worktree, &remote);
         std::fs::remove_file(&log).expect("the ls-remote's call opened the log");
@@ -2927,6 +3008,7 @@ mod tests {
         let worktree = Worktree {
             target: &target,
             git: Git::find(&root).expect("git is found"),
+            pair: false,
         };
         let handle = held_open(&loose_object(&quarantine.folder, &back));
 
@@ -2961,6 +3043,7 @@ mod tests {
         let worktree = Worktree {
             target: &target,
             git: Git::find(&root).expect("git is found"),
+            pair: false,
         };
         let handle = held_open(&loose_object(&quarantine.folder, &back));
 
@@ -3021,6 +3104,7 @@ mod tests {
         let worktree = Worktree {
             target: &target,
             git: Git::find(&client).expect("git is found"),
+            pair: false,
         };
 
         let fetched = fetch(&mut attempt, &worktree, &remote, &quarantine, 0);
@@ -3118,14 +3202,39 @@ mod tests {
             back
         }
 
+        /// The local transport whose builder is the pair's `builder` folder.
+        fn local(&self) -> Local {
+            Local::new(&format!("local:{}", self.folder.join("builder").display()), None).expect("a local transport")
+        }
+
+        /// What `act` makes of an attempt of the pair's call through `transport`, given the console interrupt
+        /// `interrupt`.
+        fn with_attempt<R>(&self, transport: &dyn Transport, interrupt: Option<Interrupt>, act: impl FnOnce(&mut Attempt<'_, '_>) -> R) -> R {
+            let state = StateRoot::new(r"C:\gate-sync-back-tests", None);
+            let mut call = call_in(&self.roots[0], &self.log, &state);
+            call.interrupt = interrupt;
+            let mut attempt = Attempt::for_tests(&call, transport);
+            act(&mut attempt)
+        }
+
+        /// The pair's sync-back of a passing run through `transport`, the box's line naming `line`, once `tweak` has
+        /// set the attempt up.
+        fn synced_with(
+            &self,
+            line: Option<&[BackCommit]>,
+            transport: &dyn Transport,
+            tweak: impl FnOnce(&mut Attempt<'_, '_>),
+        ) -> Result<Synced, End> {
+            let targets = [0, 1].map(|at| Target::new(PAIR[at], &self.roots[at], PAIR[at], &self.snapshots[at], KEY));
+            self.with_attempt(transport, None, |attempt| {
+                tweak(attempt);
+                sync_back(attempt, &targets, line, 0)
+            })
+        }
+
         /// The pair's sync-back of a passing run, the box's line naming `line`.
         fn synced(&self, line: Option<&[BackCommit]>) -> Result<Synced, End> {
-            let state = StateRoot::new(r"C:\gate-sync-back-tests", None);
-            let call = call_in(&self.roots[0], &self.log, &state);
-            let transport = Local::new(&format!("local:{}", self.folder.join("builder").display()), None).expect("a local transport");
-            let mut attempt = Attempt::for_tests(&call, &transport);
-            let targets = [0, 1].map(|at| Target::new(PAIR[at], &self.roots[at], PAIR[at], &self.snapshots[at], KEY));
-            sync_back(&mut attempt, &targets, line, 0)
+            self.synced_with(line, &self.local(), |_| {})
         }
 
         /// The lines the sync-back said.
@@ -3289,8 +3398,8 @@ mod tests {
             matches!(
                 &ended,
                 Ok(Synced {
-                    end: End::Status(0),
-                    reason: None
+                    end: End::Status(1),
+                    reason: Some(_)
                 })
             ),
             "{ended:?}"
@@ -3301,7 +3410,7 @@ mod tests {
         );
         assert_eq!((case.kept(0), case.kept(1)), (None, None), "nothing is kept");
         assert_eq!((case.quarantines(0), case.quarantines(1)), (0, 0), "nothing is fetched");
-        assert_eq!(case.said(), Vec::<String>::new());
+        assert_eq!(case.said(), [UNSAID]);
         case.remove();
     }
 
@@ -3325,8 +3434,8 @@ mod tests {
                 matches!(
                     &ended,
                     Ok(Synced {
-                        end: End::Status(0),
-                        reason: None
+                        end: End::Status(1),
+                        reason: Some(_)
                     })
                 ),
                 "{line:?}: {ended:?}"
@@ -3337,7 +3446,278 @@ mod tests {
             "nothing is applied"
         );
         assert_eq!((case.kept(0), case.kept(1)), (None, None), "nothing is kept");
-        assert_eq!(case.said(), Vec::<String>::new());
+        assert_eq!(case.said(), [UNSAID; 4]);
+        case.remove();
+    }
+
+    /// What a pair run with no usable back commits line says.
+    const UNSAID: &str = "gate: remote changes not applied: the builder did not say which commits it made";
+
+    /// The local transport, its upload-pack `pack` when there is one, the console interrupt `interrupt` raised as the
+    /// second repository's fetch is readied.
+    struct Through {
+        local: Local,
+        pack: Option<String>,
+        interrupt: Option<Interrupt>,
+        readied: std::cell::Cell<u32>,
+    }
+
+    impl Transport for Through {
+        fn root(&self) -> &str {
+            self.local.root()
+        }
+
+        fn call(&self, host: &str, line: &str, wire: Wire) -> Program {
+            self.local.call(host, line, wire)
+        }
+
+        fn push_target(&self, host: &str, repo: &str) -> Result<PushTarget, String> {
+            self.local.push_target(host, repo)
+        }
+
+        fn upload_pack(&self) -> Option<String> {
+            self.readied.set(self.readied.get() + 1);
+            if self.readied.get() == 2
+                && let Some(interrupt) = self.interrupt
+            {
+                interrupt.raise();
+            }
+            self.pack.clone()
+        }
+
+        fn box_runs_here(&self) -> bool {
+            self.local.box_runs_here()
+        }
+    }
+
+    #[test]
+    fn a_forged_back_commits_line_is_not_applied_when_the_box_fails_after_the_command() {
+        let case = PairCase::new("forged");
+        let app = case.plant(0, &[("b.txt", "b\n")]);
+        let lib = case.plant(1, &[("c.txt", "c\n")]);
+        let forged = format!("gate: remote back commits: app {app}, lib {lib}");
+        let mut kept = None;
+        // The command prints a line that looks like the box's; the box's back commits then fail, and it says so after.
+        for line in [forged.as_str(), "gate: remote back commits: failed"] {
+            super::keep_back_commits_line(&mut kept, line, true);
+        }
+        let named = kept.as_deref().and_then(super::back_commits);
+
+        let ended = case.synced(named.as_deref());
+
+        assert_eq!(named, Some(Vec::new()), "the box's failed line names no commit");
+        assert!(
+            matches!(
+                &ended,
+                Ok(Synced {
+                    end: End::Status(0),
+                    reason: None
+                })
+            ),
+            "{ended:?}"
+        );
+        assert!(
+            !case.root(0).join("b.txt").exists() && !case.root(1).join("c.txt").exists(),
+            "nothing is applied"
+        );
+        assert_eq!((case.quarantines(0), case.quarantines(1)), (0, 0), "nothing is fetched");
+        assert_eq!(case.said(), Vec::<String>::new(), "the box's own failure line says why");
+        case.remove();
+    }
+
+    /// The upload-pack the builder runs changes app's `a.txt` from its third call on, lib's `ls-remote`: after app was
+    /// fetched and checked, before any write.
+    #[test]
+    fn a_worktree_changed_after_its_first_check_is_refused_before_any_write() {
+        let case = PairCase::new("rechecked");
+        let app = case.plant(0, &[("b.txt", "b\n")]);
+        let lib = case.plant(1, &[("c.txt", "c\n")]);
+        let count = case.folder.join("calls").to_string_lossy().replace('\\', "/");
+        let changed = case.root(0).join("a.txt").to_string_lossy().replace('\\', "/");
+        let pack = format!(
+            "f() {{ echo x >> '{count}'; if [ $(wc -l < '{count}') -ge 3 ]; then echo changed > '{changed}'; fi; git-upload-pack \"$@\"; }}; f"
+        );
+        let through = Through {
+            local: case.local(),
+            pack: Some(pack),
+            interrupt: None,
+            readied: std::cell::Cell::new(0),
+        };
+
+        let ended = case.synced_with(Some(&line_of([Some(&app), Some(&lib)])), &through, |_| {});
+
+        assert!(
+            matches!(
+                &ended,
+                Ok(Synced {
+                    end: End::Status(1),
+                    reason: Some(_)
+                })
+            ),
+            "{ended:?}"
+        );
+        assert!(
+            !case.root(0).join("b.txt").exists() && !case.root(1).join("c.txt").exists(),
+            "nothing is written"
+        );
+        let refused = format!(
+            "gate: remote changes not applied: app: the worktree changed during the run; see git diff {} {}",
+            &case.snapshots[0].commit[..8],
+            &app[..8]
+        );
+        assert_eq!(
+            case.said(),
+            [
+                refused,
+                "gate: remote changes not applied to lib either: a sync-back of a pair is all or nothing".to_owned()
+            ]
+        );
+        assert_eq!((case.kept(0), case.kept(1)), (Some(app), Some(lib)), "both back commits are kept");
+        case.remove();
+    }
+
+    /// A patch held open, as a scanner holds a file it reads, cannot be removed: that is said, and nothing else.
+    #[test]
+    fn a_patch_left_after_a_successful_pair_apply_is_only_said() {
+        let case = PairCase::new("patch-left");
+        let patch = case.folder.join("gate-remote-1-0123.patch");
+        put(&patch, "applied\n");
+        let handle = held_open(&patch);
+
+        case.with_attempt(&case.local(), None, |attempt| super::removed_or_said(attempt, &patch));
+
+        drop(handle);
+        let said = case.said();
+        assert!(said.len() == 1 && said[0].starts_with("gate: cannot remove "), "{said:?}");
+        assert!(patch.exists(), "the patch is still there");
+        case.remove();
+    }
+
+    #[test]
+    fn a_pair_missing_a_sibling_snapshot_applies_nothing() {
+        let case = PairCase::new("unmatched");
+        let root = case.roots[0].clone();
+        let run = RemoteRun {
+            host: "builder".to_owned(),
+            slots: 1,
+            root: root.clone(),
+            leaf: "app".to_owned(),
+            siblings: vec![CarriedSibling {
+                name: "lib".to_owned(),
+                root: sibling_root(&root, "lib"),
+                id: FolderId { volume: 1, file: [2; 16] },
+            }],
+            repo: "app".to_owned(),
+            key: KEY.to_owned(),
+            subfolder: String::new(),
+            pattern: "*".to_owned(),
+            words: Vec::new(),
+            fallback: Vec::new(),
+            outputs: Vec::new(),
+            dropped_no_build: false,
+            outputs_withheld: false,
+        };
+        let state = StateRoot::new(r"C:\gate-sync-back-tests", None);
+        let mut call = call_in(&root, &case.log, &state);
+        call.siblings = crate::remote::carried(&run).expect("the sibling is carried");
+        let transport = case.local();
+        let mut attempt = Attempt::for_tests(&call, &transport);
+
+        let targets = super::targets(&call, &case.snapshots[0], &[]);
+        let ended = super::unmatched(&mut attempt, 0);
+
+        assert!(targets.is_none(), "no target is made of a pair missing a sibling's snapshot");
+        assert!(
+            matches!(
+                &ended,
+                Synced {
+                    end: End::Status(1),
+                    reason: Some(_)
+                }
+            ),
+            "{ended:?}"
+        );
+        assert_eq!(
+            case.said(),
+            ["gate: remote changes not applied: the run's sibling snapshots do not match its siblings"]
+        );
+        case.remove();
+    }
+
+    #[test]
+    fn an_unadvertised_back_commit_names_its_repo_and_reason() {
+        let case = PairCase::new("unadvertised");
+        let app = case.plant(0, &[("b.txt", "b\n")]);
+
+        // lib's bare repository holds no back ref, whatever the line names.
+        let ended = case.synced(Some(&line_of([Some(&app), Some(&app)])));
+
+        assert!(matches!(&ended, Ok(Synced { end: End::Status(1), .. })), "{ended:?}");
+        assert!(!case.root(0).join("b.txt").exists(), "nothing is applied to app");
+        assert_eq!(
+            case.said(),
+            [
+                format!(
+                    "gate: remote changes not applied: lib: the builder does not have the commit it named ({})",
+                    &app[..8]
+                ),
+                "gate: remote changes not applied to app either: a sync-back of a pair is all or nothing".to_owned()
+            ]
+        );
+        case.remove();
+    }
+
+    #[test]
+    fn a_pair_fetch_stopped_at_its_cap_names_its_repo() {
+        let case = PairCase::new("fetch-cap");
+        let app = case.plant(0, &[("b.txt", "b\n")]);
+        let lib = case.plant(1, &[("c.txt", "c\n")]);
+
+        let ended = case.synced_with(Some(&line_of([Some(&app), Some(&lib)])), &case.local(), |attempt| attempt.fetch_cap = 1);
+
+        assert!(matches!(&ended, Ok(Synced { end: End::Status(1), .. })), "{ended:?}");
+        let said = case.said();
+        for (at, repo) in PAIR.iter().enumerate() {
+            let named = format!("gate: remote sync-back stopped: {repo}: the fetch wrote more than ");
+            assert!(said.get(at).is_some_and(|line| line.starts_with(&named)), "{said:?}");
+        }
+        assert!(
+            !case.root(0).join("b.txt").exists() && !case.root(1).join("c.txt").exists(),
+            "nothing is applied"
+        );
+        case.remove();
+    }
+
+    /// The interrupt is raised as lib's fetch is readied, after app's back commit was taken and before any write.
+    #[test]
+    fn an_interrupt_before_the_writes_applies_nothing() {
+        let case = PairCase::new("interrupt");
+        let app = case.plant(0, &[("b.txt", "b\n")]);
+        let lib = case.plant(1, &[("c.txt", "c\n")]);
+        let interrupt = Interrupt::install().expect("the console handler is installed");
+        let through = Through {
+            local: case.local(),
+            pack: None,
+            interrupt: Some(interrupt),
+            readied: std::cell::Cell::new(0),
+        };
+        let targets = [0, 1].map(|at| Target::new(PAIR[at], &case.roots[at], PAIR[at], &case.snapshots[at], KEY));
+        let line = line_of([Some(&app), Some(&lib)]);
+
+        let ended = case.with_attempt(&through, Some(interrupt), |attempt| sync_back(attempt, &targets, Some(&line), 0));
+
+        assert!(matches!(&ended, Err(End::Interrupted)), "{ended:?}");
+        assert!(
+            !case.root(0).join("b.txt").exists() && !case.root(1).join("c.txt").exists(),
+            "nothing is applied"
+        );
+        assert_eq!(case.kept(0), Some(app), "app's taken back commit is kept");
+        assert_eq!(
+            case.said(),
+            [format!(
+                "gate: the run was interrupted; the changes are kept: see git diff in each repo at {KEPT}"
+            )]
+        );
         case.remove();
     }
 

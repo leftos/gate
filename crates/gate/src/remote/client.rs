@@ -739,10 +739,12 @@ impl Attempt<'_, '_> {
         match called.end {
             End::Status(status) => {
                 let back_commits = called.back_commits.as_deref().and_then(syncback::back_commits);
-                // The run sends no sibling snapshots, as `sibling_snapshots` above says, so its main repository alone
-                // syncs back.
-                let targets = syncback::targets(self.call, &snapshot, &[]);
-                let synced = syncback::sync_back(self, &targets, back_commits.as_deref(), status)?;
+                // The run sends no sibling snapshots, as `sibling_snapshots` above says: a run carrying siblings applies
+                // nothing, and one carrying none syncs back its main repository.
+                let synced = match syncback::targets(self.call, &snapshot, &[]) {
+                    Some(targets) => syncback::sync_back(self, &targets, back_commits.as_deref(), status)?,
+                    None => syncback::unmatched(self, status),
+                };
                 let brought = outputs::accepted(called.outputs_line.as_deref(), self.call.key, &nonce);
                 let ran = outputs::Ran {
                     location: &location,

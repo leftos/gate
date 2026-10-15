@@ -41,7 +41,6 @@ mod outputs;
 pub(crate) mod parity;
 pub(crate) mod payload;
 mod retry;
-mod sibling_lock;
 pub(crate) mod siblings;
 mod snapshot;
 mod syncback;
@@ -56,6 +55,7 @@ mod syncback;
 pub(crate) mod toolchain;
 pub(crate) mod transport;
 mod watchdog;
+mod worktree_lock;
 
 /// The status a client hands back with a refusal's reason.
 pub(crate) const REFUSED: i64 = 75;

@@ -521,14 +521,19 @@ fn checked_out(
     if let Some(outputs) = outputs.as_deref_mut() {
         outputs.list(folders.work, beat, console);
     }
-    let status = match command(request, folders.place, beat, console)? {
+    let ran = command(request, folders.place, beat, console).inspect_err(|_| back_commits_failed(request, beat, console))?;
+    let status = match ran {
         Ran::Exited(status) => status,
         // The PC applies nothing of a run the box killed, and a process its kill could not end may still be writing.
-        Ran::Killed => return Ok(KILLED),
+        Ran::Killed => {
+            back_commits_failed(request, beat, console);
+            return Ok(KILLED);
+        }
     };
     let commit = match git.back_commit(request, console) {
         Ok(commit) => commit,
         Err(failed) => {
+            back_commits_failed(request, beat, console);
             let message = failed.or_end(console)?;
             console.err(&format!("gate: remote sync-back failed: {message}"));
             return Ok(if status == 0 { FAILED_STATUS } else { status });
@@ -554,6 +559,17 @@ fn back_skip(request: &Request<'_>, git: &WorkGit, commit: Option<&str>, console
         Ok(paths) => Ok(Ok(paths)),
         Err(failed) => failed.or_end(console).map(Err),
     }
+}
+
+/// On a pair run, says `gate: remote back commits: failed` under the box's output lock, for a run whose back commits
+/// were not all pushed after its command ended: the PC applies nothing, and a back commits line the command printed
+/// itself is no longer the last.
+fn back_commits_failed(request: &Request<'_>, beat: &Beat<'_>, console: &mut Console) {
+    if request.siblings.is_empty() {
+        return;
+    }
+    let _held = beat.lock.lock().unwrap_or_else(PoisonError::into_inner);
+    console.err("gate: remote back commits: failed");
 }
 
 /// Says the failed step's line; its status.
