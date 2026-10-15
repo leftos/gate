@@ -627,7 +627,12 @@ struct CallParts<'r> {
 
 /// The client's call for `remote`, with the run's log, limits and interrupt, made of the run's `parts` so the run's
 /// client can be borrowed apart from them.
-fn call_of<'r>(parts: CallParts<'r>, remote: &'r RemoteRun) -> RemoteCall<'r> {
+///
+/// # Errors
+///
+/// Why a sibling the route carries fails its check again ([`remote::carried`]); no call is made then.
+fn call_of<'r>(parts: CallParts<'r>, remote: &'r RemoteRun) -> Result<RemoteCall<'r>, String> {
+    let siblings = remote::carried(remote)?;
     let CallParts {
         request,
         figures: Figures { ceiling, usual },
@@ -635,10 +640,12 @@ fn call_of<'r>(parts: CallParts<'r>, remote: &'r RemoteRun) -> RemoteCall<'r> {
         host,
         root,
     } = parts;
-    RemoteCall {
+    Ok(RemoteCall {
         host: &remote.host,
         key: &remote.key,
         root: &remote.root,
+        leaf: &remote.leaf,
+        siblings,
         repo: &remote.repo,
         subfolder: &remote.subfolder,
         words: &remote.words,
@@ -654,7 +661,7 @@ fn call_of<'r>(parts: CallParts<'r>, remote: &'r RemoteRun) -> RemoteCall<'r> {
         interrupt: host.interrupt,
         state: &root.root,
         state_dir: &root.path,
-    }
+    })
 }
 
 /// The slot a run holds, or the machine a critical run holds, once it has taken it, and when it took it.
@@ -1004,7 +1011,10 @@ impl Run<'_> {
             host: &self.host,
             root: self.root,
         };
-        let call = call_of(parts, remote);
+        let call = match call_of(parts, remote) {
+            Ok(call) => call,
+            Err(why) => return self.fell_back(FallbackReason::Client, &RemoteOutcome::not_started(why), hold.taken.take(), console),
+        };
         let outcome = self.client.run(&call);
         let fallback = outcome.fallback();
         // A Ctrl+C during the call wins over a refusal: the command never runs here.
@@ -1062,8 +1072,13 @@ impl Run<'_> {
     /// `busy`, when the lock is held elsewhere or cannot be opened or taken, which says why; here, `full`, when the pool
     /// stayed full; or interrupted during the wait.
     fn hold_remote(&mut self, remote: &RemoteRun, hold: &mut Hold, console: &mut Console) -> Result<(Option<OwnedMutexGuard>, Figures), Remotely> {
-        // The key lock reads neither figure of the call; no take has resolved them yet.
-        let held = self.client.hold_key(&self.call(remote, Figures::floor(self.request.timeout)));
+        // The key lock reads neither figure of the call; no take has resolved them yet. A sibling that fails its check
+        // again sends nothing: the run falls back here before it takes the lock or a slot.
+        let call = match self.call(remote, Figures::floor(self.request.timeout)) {
+            Ok(call) => call,
+            Err(why) => return Err(self.fell_back(FallbackReason::Client, &RemoteOutcome::not_started(why), None, console)),
+        };
+        let held = self.client.hold_key(&call);
         let key = match held {
             Ok(key) => key,
             Err(why) => {
@@ -1086,7 +1101,11 @@ impl Run<'_> {
     }
 
     /// The client's call for `remote` under `figures`, with the run's log, limits and interrupt.
-    fn call<'r>(&'r self, remote: &'r RemoteRun, figures: Figures) -> RemoteCall<'r> {
+    ///
+    /// # Errors
+    ///
+    /// Why a sibling the route carries fails its check again ([`remote::carried`]).
+    fn call<'r>(&'r self, remote: &'r RemoteRun, figures: Figures) -> Result<RemoteCall<'r>, String> {
         let parts = CallParts {
             request: self.request,
             figures,

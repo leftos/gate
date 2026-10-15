@@ -6,11 +6,11 @@ use std::path::PathBuf;
 
 use gate_router::{
     BuildSettings, BuildTarget, Config, ConfigProblem, DROPPED_NO_BUILD_LINE, DotnetTarget, Inputs, LocalReason, NO_OUTPUTS_LINE, PROJECT_EXTENSIONS,
-    Place, RemoteRun, Route, Slot, build_settings, decide, dotnet_builds, dotnet_target, is_cargo, is_dotnet, is_usable_host, sdk_build_target,
-    without_no_build, work_folder_key,
+    Place, RemoteRun, Route, SiblingFolder, Slot, build_settings, decide, dotnet_builds, dotnet_target, is_cargo, is_dotnet, is_usable_host,
+    sdk_build_target, without_no_build, work_folder_key,
 };
 
-use crate::support::{FakeFacts, HEAD, ROOT, heavy, place_at, sibling, sibling_root, words};
+use crate::support::{FakeFacts, HEAD, ROOT, carried, fake_id, heavy, place_at, sibling_root, words};
 
 const SILENT: Route = Route::Local { reason: None };
 
@@ -1105,7 +1105,129 @@ fn no_siblings_changes_nothing() {
     assert_eq!(facts.siblings_read.get(), 1);
     assert!(facts.presence_asked.borrow().is_empty());
     let run = routed(decide(&heavy(&words(&["dotnet", "test"])), &FakeFacts::at_root()));
+    assert_eq!(run.lines(), Vec::<String>::new(), "no line names siblings");
     assert_eq!((run.leaf.as_str(), run.siblings), ("a", Vec::new()));
+    let unallowed = FakeFacts::with_config(Config::parse(r#"{"host": "builder-1", "repos": {"yaat": ["*"]}, "siblings": 5}"#).expect("usable"));
+    let run = routed(decide(&heavy(&words(&["dotnet", "test", "--no-build"])), &unallowed));
+    assert_eq!(
+        run.lines(),
+        [DROPPED_NO_BUILD_LINE, NO_OUTPUTS_LINE],
+        "a bad siblings value changes nothing for a repo declaring none"
+    );
+}
+
+/// A gate at the root declaring `declared`, all beside the root, under a routing file whose `siblings` value is
+/// `siblings` (no key at all for `None`).
+fn consenting(siblings: Option<&str>, declared: &[&str]) -> FakeFacts {
+    let key = siblings.map_or_else(String::new, |value| format!(r#", "siblings": {value}"#));
+    let config = Config::parse(&format!(r#"{{"host": "builder-1", "repos": {{"yaat": ["*"]}}{key}}}"#)).expect("usable");
+    FakeFacts {
+        config: Ok(Some(config)),
+        ..FakeFacts::with_siblings("", declared, declared)
+    }
+}
+
+#[test]
+fn only_the_siblings_the_routing_file_allows_are_carried() {
+    let command = words(&["dotnet", "test"]);
+    for (case, siblings, declared, line) in [
+        ("no key", None, &["b"][..], "gate: not routed: sibling b is not allowed in remote.json"),
+        (
+            "no entry",
+            Some(r#"{"other": ["b"]}"#),
+            &["b"],
+            "gate: not routed: sibling b is not allowed in remote.json",
+        ),
+        (
+            "an empty list",
+            Some(r#"{"yaat": []}"#),
+            &["b"],
+            "gate: not routed: sibling b is not allowed in remote.json",
+        ),
+        (
+            "another name",
+            Some(r#"{"yaat": ["c"]}"#),
+            &["b"],
+            "gate: not routed: sibling b is not allowed in remote.json",
+        ),
+        (
+            "another case",
+            Some(r#"{"yaat": ["B"]}"#),
+            &["b"],
+            "gate: not routed: sibling b is not allowed in remote.json",
+        ),
+        (
+            "several refused",
+            Some(r#"{"yaat": ["c"]}"#),
+            &["b", "c", "yaat-server"],
+            "gate: not routed: siblings b, yaat-server are not allowed in remote.json",
+        ),
+        (
+            "not an object",
+            Some(r#"["b"]"#),
+            &["b"],
+            "gate: not routed: sibling b is not allowed in remote.json: siblings must be a JSON object",
+        ),
+        (
+            "a bad entry",
+            Some(r#"{"yaat": ["b", 3]}"#),
+            &["b", "c"],
+            "gate: not routed: siblings b, c are not allowed in remote.json: siblings.\"yaat\"[1] is not a non-empty string",
+        ),
+        (
+            "refused before the root's own name",
+            Some(r#"{"yaat": ["b"]}"#),
+            &["b", "A"],
+            "gate: not routed: sibling A is not allowed in remote.json",
+        ),
+    ] {
+        let facts = consenting(siblings, declared);
+        assert_eq!(local_line(&decide(&heavy(&command), &facts)).as_deref(), Some(line), "{case}");
+        assert!(facts.presence_asked.borrow().is_empty(), "{case}: no sibling is looked for");
+        assert_eq!(facts.siblings_read.get(), 1, "{case}");
+    }
+    let facts = consenting(Some(r#"{"YAAT": ["yaat-server", "b", "c"]}"#), &["b"]);
+    let run = routed(decide(&heavy(&command), &facts));
+    assert_eq!(run.siblings, [carried("b")], "only the declared sibling is carried");
+    assert_eq!(*facts.presence_asked.borrow(), [sibling_root("b")]);
+}
+
+#[test]
+fn a_declared_name_that_is_no_folder_name_never_reaches_the_folder_check() {
+    let command = words(&["dotnet", "test"]);
+    for name in [r"x\y", "x/y", "..", "c:"] {
+        let allowed = format!(r#"{{"yaat": ["b", "{}"]}}"#, name.replace('\\', r"\\"));
+        let facts = consenting(Some(&allowed), &["b", name]);
+        assert_eq!(
+            local_line(&decide(&heavy(&command), &facts)),
+            Some(format!(
+                "gate: not routed: .gate/siblings.toml: siblings[1] is not a folder name the builder can lay out: {name:?}"
+            )),
+            "{name:?} keeps the run here, saying why, whatever remote.json allows"
+        );
+        assert!(facts.presence_asked.borrow().is_empty(), "{name:?}: no folder is looked for");
+    }
+}
+
+#[test]
+fn a_siblings_file_problem_is_shown_with_its_marks_escaped() {
+    let facts = FakeFacts {
+        siblings: Err("line 1:\r\n  bad\u{1b}[31m \u{202e}key".to_owned()),
+        ..consenting(Some(r#"{"yaat": ["b"]}"#), &["b"])
+    };
+    assert_eq!(
+        local_line(&decide(&heavy(&words(&["dotnet", "test"])), &facts)).as_deref(),
+        Some(r"gate: not routed: .gate/siblings.toml: line 1: bad\u{1b}[31m \u{202e}key"),
+        "line breaks folded, then every control character and reordering mark escaped"
+    );
+}
+
+#[test]
+fn a_word_into_an_allowed_sibling_that_is_not_declared_is_outside() {
+    let facts = consenting(Some(r#"{"yaat": ["yaat-server", "b"]}"#), &["yaat-server"]);
+    let route = decide(&heavy(&words(&["dotnet", "test", r"..\b\x"])), &facts);
+    assert_eq!(local_line(&route).as_deref(), Some(r"gate: not routed: ..\b\x is outside the worktree"));
+    assert_eq!(facts.siblings_read.get(), 1, "the declaration is read once");
 }
 
 #[test]
@@ -1253,10 +1375,78 @@ fn remote_run_carries_the_leaf_and_each_sibling_root() {
     let facts = FakeFacts::with_siblings("src/", &["yaat-server", "b"], &["yaat-server", "b"]);
     let run = routed(decide(&heavy(&command), &facts));
     assert_eq!(run.leaf, "a");
-    assert_eq!(run.siblings, [sibling("yaat-server"), sibling("b")]);
+    assert_eq!(run.siblings, [carried("yaat-server"), carried("b")]);
+    assert_eq!(
+        run.lines(),
+        ["gate: routed with siblings: yaat-server (X:/dev/yaat.wt/yaat-server), b (X:/dev/yaat.wt/b)"]
+    );
     assert_eq!(
         run.words,
         stamped(&["dotnet", "test", "../../yaat-server/S.csproj", "-p:Other=../../b/x"])
     );
     assert_eq!(run.fallback, command);
+}
+
+/// A gate at the root declaring `b`, `c` and `yaat-server`, all present, with the folder check giving `folders` for
+/// some of their roots.
+fn checked(folders: Vec<(String, Result<SiblingFolder, String>)>) -> FakeFacts {
+    FakeFacts {
+        folders,
+        ..FakeFacts::with_siblings("", &["b", "c", "yaat-server"], &["b", "c", "yaat-server"])
+    }
+}
+
+#[test]
+fn a_refused_sibling_folder_keeps_the_run_local_and_asks_no_later_one() {
+    let refused = checked(vec![(
+        sibling_root("c"),
+        Ok(SiblingFolder::Refused("is a link or a junction".to_owned())),
+    )]);
+    let route = decide(&heavy(&words(&["dotnet", "test"])), &refused);
+    assert_eq!(local_line(&route).as_deref(), Some("gate: not routed: sibling c is a link or a junction"));
+    assert_eq!(*refused.presence_asked.borrow(), [sibling_root("b"), sibling_root("c")]);
+}
+
+#[test]
+fn a_sibling_folder_that_cannot_be_read_keeps_the_run_local_saying_what() {
+    let unreadable = checked(vec![(
+        sibling_root("c"),
+        Err("cannot read the sibling folder X:/dev/yaat.wt/c: access denied\n(os error 5)".to_owned()),
+    )]);
+    let route = decide(&heavy(&words(&["dotnet", "test"])), &unreadable);
+    assert_eq!(
+        local_line(&route).as_deref(),
+        Some("gate: not routed: cannot read the sibling folder X:/dev/yaat.wt/c: access denied (os error 5)"),
+        "never routed with the second sibling dropped"
+    );
+    assert_eq!(*unreadable.presence_asked.borrow(), [sibling_root("b"), sibling_root("c")]);
+    let no_root = FakeFacts {
+        root_id: Err("cannot read the worktree folder's id: access denied".to_owned()),
+        ..checked(Vec::new())
+    };
+    assert_eq!(
+        local_line(&decide(&heavy(&words(&["dotnet", "test"])), &no_root)).as_deref(),
+        Some("gate: not routed: cannot read the worktree folder's id: access denied")
+    );
+}
+
+#[test]
+fn a_sibling_folder_that_is_the_root_or_another_sibling_keeps_the_run_local() {
+    let command = words(&["dotnet", "test"]);
+    let same_as_root = checked(vec![(sibling_root("c"), Ok(SiblingFolder::Present(fake_id(ROOT))))]);
+    assert_eq!(
+        local_line(&decide(&heavy(&command), &same_as_root)).as_deref(),
+        Some("gate: not routed: sibling c is the worktree's own folder")
+    );
+    let same_as_b = checked(vec![(
+        sibling_root("yaat-server"),
+        Ok(SiblingFolder::Present(fake_id(&sibling_root("b")))),
+    )]);
+    assert_eq!(
+        local_line(&decide(&heavy(&command), &same_as_b)).as_deref(),
+        Some("gate: not routed: sibling yaat-server is the same folder as sibling b")
+    );
+    let distinct = checked(Vec::new());
+    let run = routed(decide(&heavy(&command), &distinct));
+    assert_eq!(run.siblings, [carried("b"), carried("c"), carried("yaat-server")]);
 }

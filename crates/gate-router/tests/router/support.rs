@@ -2,7 +2,7 @@
 
 use std::cell::{Cell, RefCell};
 
-use gate_router::{Config, ConfigProblem, Facts, Inputs, Place, SiblingRoot, Slot};
+use gate_router::{CarriedSibling, Config, ConfigProblem, Facts, FolderId, Inputs, Place, SiblingFolder, SiblingRoot, Slot};
 
 /// The worktree root the fixtures use.
 pub const ROOT: &str = "X:/dev/yaat.wt/a";
@@ -33,15 +33,26 @@ pub fn sibling(name: &str) -> SiblingRoot {
     }
 }
 
+/// The sibling `name` of [`ROOT`] as a routed run carries it, present with its [`fake_id`].
+pub fn carried(name: &str) -> CarriedSibling {
+    let root = sibling_root(name);
+    CarriedSibling {
+        name: name.to_owned(),
+        id: fake_id(&root),
+        root,
+    }
+}
+
 /// The sha of [`ROOT`]'s worktree in the fixtures.
 pub const HEAD: &str = "0123456789abcdef0123456789abcdef01234567";
 
-/// A routing file listing the repo `yaat`.
+/// A routing file listing the repo `yaat`, which may carry the siblings `b`, `c`, `yaat-server` and `A`.
 pub fn config() -> Config {
     Config::parse(
         r#"{"host": "builder-1", "slots": 2,
             "repos": {"yaat": ["dotnet *", "cargo test*", "build.cmd*", "tool *", "./tool *", "* --x"], "empty": []},
-            "outputs": {"other": ["out/**"]}}"#,
+            "outputs": {"other": ["out/**"]},
+            "siblings": {"yaat": ["b", "c", "yaat-server", "A"]}}"#,
     )
     .expect("the fixture is usable")
 }
@@ -70,8 +81,12 @@ pub struct FakeFacts {
     pub devices: Vec<(char, String)>,
     /// What `.gate/siblings.toml` gives.
     pub siblings: Result<Vec<String>, String>,
-    /// The roots that hold a git worktree.
+    /// The roots that hold a git worktree, each present with its [`fake_id`].
     pub present: Vec<String>,
+    /// What the folder check gives for these roots, in place of what [`FakeFacts::present`] says.
+    pub folders: Vec<(String, Result<SiblingFolder, String>)>,
+    /// The worktree root's folder id.
+    pub root_id: Result<FolderId, String>,
     pub asked: RefCell<Vec<String>>,
     /// How many times the siblings file was read, kept apart from [`FakeFacts::asked`].
     pub siblings_read: Cell<u32>,
@@ -97,6 +112,8 @@ impl FakeFacts {
             devices: Vec::new(),
             siblings: Ok(Vec::new()),
             present: Vec::new(),
+            folders: Vec::new(),
+            root_id: Ok(fake_id(ROOT)),
             asked: RefCell::new(Vec::new()),
             siblings_read: Cell::new(0),
             presence_asked: RefCell::new(Vec::new()),
@@ -168,8 +185,28 @@ impl Facts for FakeFacts {
         self.siblings.clone()
     }
 
-    fn sibling_present(&self, root: &str) -> Result<bool, String> {
+    fn sibling_folder(&self, root: &str) -> Result<SiblingFolder, String> {
         self.presence_asked.borrow_mut().push(root.to_owned());
-        Ok(self.present.iter().any(|present| present == root))
+        if let Some((_, folder)) = self.folders.iter().find(|(folder_root, _)| folder_root == root) {
+            return folder.clone();
+        }
+        Ok(if self.present.iter().any(|present| present == root) {
+            SiblingFolder::Present(fake_id(root))
+        } else {
+            SiblingFolder::Missing
+        })
     }
+
+    fn root_id(&self, _root: &str) -> Result<FolderId, String> {
+        self.root_id.clone()
+    }
+}
+
+/// A folder id of the folder at `root` that differs from every other root's: its text's bytes, the last 16 of them.
+pub fn fake_id(root: &str) -> FolderId {
+    let mut file = [0; 16];
+    for (slot, byte) in file.iter_mut().rev().zip(root.bytes().rev()) {
+        *slot = byte;
+    }
+    FolderId { volume: 7, file }
 }

@@ -1,6 +1,6 @@
 //! File calls the standard library does not make: a rename that never replaces the file its target names, an open of
-//! a name inside an open folder, an open that reads an open file through its reparse point's filter, and whether two
-//! open files are one.
+//! a name inside an open folder, an open that reads an open file through its reparse point's filter, an open file's id
+//! and whether two open files are one.
 
 use std::ffi::OsStr;
 use std::fs::File;
@@ -117,8 +117,13 @@ pub fn same_file(first: &File, second: &File) -> io::Result<bool> {
     Ok(file_id(first)? == file_id(second)?)
 }
 
-/// The volume serial number and the 128-bit file id of the open file `file`.
-fn file_id(file: &File) -> io::Result<(u64, [u8; 16])> {
+/// The volume serial number and the 128-bit file id of the open file or folder `file`: two handles give the same pair
+/// only when they are of one file.
+///
+/// # Errors
+///
+/// The system's error when the id cannot be read, as on a file system that keeps none.
+pub fn file_id(file: &File) -> io::Result<(u64, [u8; 16])> {
     let mut information = FILE_ID_INFO::default();
     let size = u32::try_from(size_of::<FILE_ID_INFO>()).map_err(io::Error::other)?;
     // SAFETY: the handle `file` owns is open for the whole call, and `information` is a writable `FILE_ID_INFO` of

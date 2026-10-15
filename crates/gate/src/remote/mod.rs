@@ -22,6 +22,9 @@ use crate::durations::Usual;
 
 pub(crate) use client::{local_sdk_listing, outside_worktree};
 
+pub(crate) use carried::{Sibling, carried};
+
+mod carried;
 mod client;
 pub(crate) mod git;
 mod install;
@@ -174,6 +177,10 @@ pub(crate) struct RemoteCall<'a> {
     pub host: &'a str,
     pub key: &'a str,
     pub root: &'a str,
+    /// The worktree root's folder name.
+    pub leaf: &'a str,
+    /// The siblings the run carries, as the route's decision allowed and checked them, in declared order ([`carried`]).
+    pub siblings: Vec<Sibling<'a>>,
     pub repo: &'a str,
     pub subfolder: &'a str,
     /// The words the builder runs.
@@ -378,6 +385,8 @@ mod snapshot_only {
                 host: "builder",
                 key: "app-1a2b3c4d",
                 root,
+                leaf: "app",
+                siblings: Vec::new(),
                 repo: "app",
                 subfolder: "",
                 words: &[],
@@ -467,9 +476,9 @@ mod scripted {
 
     use gate_state::FallbackReason;
     use gate_win32::Interrupt;
-    use serde_json::json;
+    use serde_json::{Value, json};
 
-    use super::{BoxKill, REFUSED, RemoteCall, RemoteClient, RemoteOutcome};
+    use super::{BoxKill, REFUSED, RemoteCall, RemoteClient, RemoteOutcome, Sibling};
     use crate::run::CONTROL_C_EXIT;
 
     /// How often `wait` looks for its path and the interrupt.
@@ -635,6 +644,8 @@ mod scripted {
             "host": call.host,
             "key": call.key,
             "root": call.root,
+            "leaf": call.leaf,
+            "siblings": call.siblings.iter().map(recorded_sibling).collect::<Vec<Value>>(),
             "repo": call.repo,
             "subfolder": call.subfolder,
             "words": call.words,
@@ -647,6 +658,17 @@ mod scripted {
         });
         fs::write(path, recorded.to_string()).map_err(|error| format!("cannot record the call to {}: {error}", path.display()))?;
         Ok(true)
+    }
+
+    /// A carried sibling as the record writes it: its name, its root, and its folder's id as the volume serial's 16 hex
+    /// digits, `-`, and the file id's 32.
+    fn recorded_sibling(sibling: &Sibling<'_>) -> Value {
+        let id = sibling.id();
+        json!({
+            "name": sibling.name(),
+            "root": sibling.root(),
+            "id": format!("{:016x}-{:032x}", id.volume, u128::from_be_bytes(id.file)),
+        })
     }
 
     /// Sleeps until `path` exists, true, or the interrupt is raised, false.

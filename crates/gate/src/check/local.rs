@@ -9,11 +9,11 @@ use std::thread;
 use std::time::Duration;
 
 use gate_args::{CheckRequest, CheckSeams};
-use gate_router::{Place, repo_name, sibling_root};
+use gate_router::{Place, SiblingFolder, repo_name, sibling_root};
 
 use crate::answer::FAILED_STATUS;
 use crate::boxside::probe;
-use crate::check::report::{self, Checked, Line, Problem, Sdk, Sibling, Tool};
+use crate::check::report::{self, Checked, Found, Line, Problem, Sdk, Sibling, Tool};
 use crate::console::Console;
 use crate::environment::Variables;
 use crate::remote::toolchain::{self, Manifest, ToolNeed};
@@ -28,6 +28,8 @@ const SIBLINGS: &str = "siblings.toml";
 const NO_READABLE_PIN: &str = "global.json has no readable sdk pin";
 /// Why a `.gate` that is not a folder leaves the manifest unreadable.
 const GATE_NOT_A_FOLDER: &str = ".gate is not a folder";
+/// Why a sibling named like the worktree's own folder is refused, as routing words it.
+const OWN_FOLDER: &str = "is the worktree's own folder";
 
 /// Checks this PC for the repo the working folder is in and says what it found through `console`; returns the exit
 /// status: 0 when nothing is missing, 1 when something is or the check could not run.
@@ -109,7 +111,13 @@ fn checked(place: &Place, limit: Duration) -> Checked {
             .unwrap_or_else(|panic| Some(Sdk::Skipped(format!("cannot read this PC's SDK list: {}", probe::panic_reason(&*panic)))));
         (tools, sdk)
     });
-    let (siblings, siblings_unreadable) = read_siblings(&place.root, &mut problems);
+    let (allowed, consent_problem) = match allowed_siblings(&repo_name(&place.checkout)) {
+        None => (None, None),
+        Some(Ok(names)) => (Some(names), None),
+        Some(Err(problem)) => (Some(Vec::new()), Some(problem)),
+    };
+    let (siblings, siblings_unreadable) = read_siblings(&place.root, allowed.as_deref(), &mut problems);
+    let consent_problem = consent_problem.filter(|_| !siblings.is_empty());
     let unreadable = [
         toolchain_unreadable.then_some(report::TOOLCHAIN),
         siblings_unreadable.then_some(report::SIBLINGS),
@@ -127,6 +135,7 @@ fn checked(place: &Place, limit: Duration) -> Checked {
         tools,
         sdk,
         workloads,
+        consent_problem,
         siblings,
     }
 }
@@ -198,10 +207,11 @@ fn sdk_list(root: &Path) -> Result<Vec<String>, String> {
     Ok(parity::sdk_versions(&listing).into_iter().map(str::to_owned).collect())
 }
 
-/// Each sibling `<root>\.gate\siblings.toml` declares, looked for beside the worktree root `root`, and whether that
-/// file is there but cannot be read whole; every problem of the file is added to `problems`, and the names that read
-/// are still looked for.
-fn read_siblings(root: &str, problems: &mut Vec<Problem>) -> (Vec<Sibling>, bool) {
+/// Each sibling `<root>\.gate\siblings.toml` declares, checked in routing's order: one `allowed` does not name is not
+/// allowed (all are when `allowed` is `None`), one named like the root's folder (ASCII letter case aside) is refused,
+/// and only the rest are looked for beside the worktree root `root`; and whether that file is there but cannot be read
+/// whole. Every problem of the file is added to `problems`, and the names that read are still checked.
+fn read_siblings(root: &str, allowed: Option<&[String]>, problems: &mut Vec<Problem>) -> (Vec<Sibling>, bool) {
     let declared = route::read_gate_file(Path::new(root), SIBLINGS).and_then(|bytes| bytes.map(|bytes| siblings::read_bytes(&bytes)).transpose());
     let names = match declared {
         Ok(None) => return (Vec::new(), false),
@@ -220,14 +230,57 @@ fn read_siblings(root: &str, problems: &mut Vec<Problem>) -> (Vec<Sibling>, bool
             declared.names
         }
     };
-    (names.into_iter().map(|name| sibling(root, name)).collect(), false)
+    let leaf = root_leaf(root);
+    let siblings = names
+        .into_iter()
+        .map(|name| {
+            if !allowed.is_none_or(|allowed| allowed.contains(&name)) {
+                Sibling {
+                    path: sibling_root(root, &name),
+                    name,
+                    found: Found::NotAllowed,
+                }
+            } else if name.eq_ignore_ascii_case(leaf) {
+                Sibling {
+                    path: sibling_root(root, &name),
+                    name,
+                    found: Found::Folder(Ok(SiblingFolder::Refused(OWN_FOLDER.to_owned()))),
+                }
+            } else {
+                sibling(root, name)
+            }
+        })
+        .collect();
+    (siblings, false)
 }
 
-/// The sibling `name` of the worktree root `root`: where it must be, and whether a git worktree is there.
+/// The worktree root `root`'s folder name: its last segment, separators at its end ignored.
+fn root_leaf(root: &str) -> &str {
+    let trimmed = root.trim_end_matches(['\\', '/']);
+    trimmed.rsplit(['\\', '/']).next().unwrap_or(trimmed)
+}
+
+/// The sibling `name` of the worktree root `root`: where it must be, and what the folder check routing makes found
+/// there ([`route::sibling_folder`]).
 fn sibling(root: &str, name: String) -> Sibling {
     let path = sibling_root(root, &name);
-    let present = route::sibling_present(&path);
-    Sibling { name, path, present }
+    let folder = route::sibling_folder(&path);
+    Sibling {
+        name,
+        path,
+        found: Found::Folder(folder),
+    }
+}
+
+/// The sibling names this PC's routing file allows the repo `repo`, as routing reads them
+/// ([`gate_router::Config::allowed_siblings`], an exact match), or why its `siblings` value cannot be used, which
+/// allows none. `None` when routing would never route the repo, so asks no consent: no routing file, one routing
+/// ignores, or one whose `repos` does not list it.
+fn allowed_siblings(repo: &str) -> Option<Result<Vec<String>, String>> {
+    let path = route::remote_json_path(std::env::var_os("LOCALAPPDATA").as_deref())?;
+    let config = route::read_remote_json(&path).ok().flatten()?;
+    config.patterns(repo)?;
+    Some(config.allowed_siblings(repo).map(<[String]>::to_vec).map_err(str::to_owned))
 }
 
 #[cfg(test)]
@@ -236,8 +289,10 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
 
+    use gate_router::SiblingFolder;
+
     use super::{read_manifest, read_pin, read_siblings, sdk_of, sibling};
-    use crate::check::report::Sdk;
+    use crate::check::report::{Found, Sdk, Sibling};
     use crate::remote::parity::{Pin, pin_of};
     use crate::remote::toolchain::{ToolNeed, Version};
     use crate::test_support::junction;
@@ -453,11 +508,12 @@ mod tests {
         fs::create_dir_all(parent.path().join("gone")).expect("a folder with no git can be made");
 
         let mut problems = Vec::new();
-        let (found, unreadable) = read_siblings(&root.to_string_lossy(), &mut problems);
+        let (found, unreadable) = read_siblings(&root.to_string_lossy(), None, &mut problems);
         assert!(!unreadable, "the siblings file reads");
 
-        let seen: Vec<(&str, Result<bool, String>)> = found.iter().map(|sibling| (sibling.name.as_str(), sibling.present.clone())).collect();
-        assert_eq!(seen, [("here", Ok(true)), ("gone", Ok(false))]);
+        let seen: Vec<(&str, bool)> = found.iter().map(|sibling| (sibling.name.as_str(), present(sibling))).collect();
+        assert_eq!(seen, [("here", true), ("gone", false)]);
+        assert_eq!(found[1].found, Found::Folder(Ok(SiblingFolder::Missing)));
         assert_eq!(found[0].path, format!("{}\\here", parent.text()));
         let texts: Vec<&str> = problems.iter().map(|problem| problem.text.as_str()).collect();
         assert_eq!(texts.len(), 1, "the bad name is a problem and the rest are looked for: {texts:?}");
@@ -475,8 +531,77 @@ mod tests {
         let beside = sibling(&worktree.to_string_lossy().replace('\\', "/"), "b".to_owned());
 
         assert_eq!(beside.path, format!("{}/app.wt/b", dev.text().replace('\\', "/")));
-        assert_eq!(beside.present, Ok(false), "the sibling beside the main checkout is not the worktree's");
+        assert_eq!(
+            beside.found,
+            Found::Folder(Ok(SiblingFolder::Missing)),
+            "the sibling beside the main checkout is not the worktree's"
+        );
         fs::create_dir_all(dev.path().join("app.wt").join("b").join(".git")).expect("a sibling beside the worktree can be made");
-        assert_eq!(sibling(&worktree.to_string_lossy(), "b".to_owned()).present, Ok(true));
+        assert!(present(&sibling(&worktree.to_string_lossy(), "b".to_owned())));
+    }
+
+    #[test]
+    fn only_a_sibling_the_routing_file_names_exactly_is_allowed() {
+        let parent = Folder::new("sibling-allowed");
+        let root = parent.path().join("app");
+        fs::create_dir_all(root.join(".gate")).expect("the root can be made");
+        write(&root.join(".gate").join("siblings.toml"), "siblings = ['here', 'Other', 'gone']\n");
+        let root = root.to_string_lossy();
+        let allowed = |list: Option<&[String]>| -> Vec<bool> {
+            read_siblings(&root, list, &mut Vec::new())
+                .0
+                .iter()
+                .map(|sibling| sibling.found != Found::NotAllowed)
+                .collect()
+        };
+
+        assert_eq!(
+            allowed(Some(&["here".to_owned(), "other".to_owned()])),
+            [true, false, false],
+            "an exact match"
+        );
+        assert_eq!(allowed(Some(&[])), [false, false, false], "an empty list");
+        assert_eq!(allowed(None), [true, true, true], "no consent asked");
+    }
+
+    /// Whether the folder check found `sibling` present.
+    fn present(sibling: &Sibling) -> bool {
+        matches!(sibling.found, Found::Folder(Ok(SiblingFolder::Present(_))))
+    }
+
+    #[test]
+    fn a_sibling_named_like_the_root_is_refused_without_a_look() {
+        let parent = Folder::new("sibling-like-root");
+        let root = parent.path().join("app");
+        fs::create_dir_all(root.join(".gate")).expect("the root can be made");
+        write(&root.join(".gate").join("siblings.toml"), "siblings = ['APP', 'here']\n");
+        fs::create_dir_all(parent.path().join("here").join(".git")).expect("the sibling's git can be made");
+
+        let (found, _) = read_siblings(&root.to_string_lossy(), None, &mut Vec::new());
+
+        assert_eq!(
+            found[0].found,
+            Found::Folder(Ok(SiblingFolder::Refused("is the worktree's own folder".to_owned())))
+        );
+        assert!(present(&found[1]), "the other sibling is still looked for");
+        let (trailing, _) = read_siblings(&format!("{}\\", root.to_string_lossy()), None, &mut Vec::new());
+        assert_eq!(trailing[0].found, found[0].found, "a separator at the root's end changes nothing");
+    }
+
+    #[test]
+    fn a_sibling_that_is_a_junction_is_refused_by_the_check() {
+        let parent = Folder::new("sibling-junction");
+        let root = parent.path().join("app");
+        fs::create_dir_all(root.join(".gate")).expect("the root can be made");
+        write(&root.join(".gate").join("siblings.toml"), "siblings = ['linked']\n");
+        fs::create_dir_all(parent.path().join("real").join(".git")).expect("the junction's target can be made");
+        junction(&parent.path().join("linked"), &parent.path().join("real"));
+
+        let (found, _) = read_siblings(&root.to_string_lossy(), None, &mut Vec::new());
+
+        assert_eq!(
+            found[0].found,
+            Found::Folder(Ok(SiblingFolder::Refused("is a link or a junction".to_owned())))
+        );
     }
 }

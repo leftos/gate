@@ -315,6 +315,57 @@ fn no_hosts_means_host_alone() {
     assert_eq!(config.builders(), alone, "an empty hosts adds none");
 }
 
+/// The routing file listing `g` with `siblings` holding `value`.
+fn siblings_file(value: &str) -> Config {
+    Config::parse(&format!(
+        r#"{{"host": "builder-1", "slots": 2, "repos": {{"g": ["x"]}}, "siblings": {value}}}"#
+    ))
+    .expect("routing reads the file whatever siblings holds")
+}
+
+#[test]
+fn siblings_gives_each_repo_s_allowed_names_as_written() {
+    let config = siblings_file(r#"{"Gate": ["yaat-server", "B.x"], "other": []}"#);
+    let allowed = |repo: &str| config.allowed_siblings(repo).map(<[String]>::to_vec);
+    assert_eq!(
+        allowed("gate"),
+        Ok(vec!["yaat-server".to_owned(), "B.x".to_owned()]),
+        "the repo name in any case"
+    );
+    assert_eq!(allowed("other"), Ok(Vec::new()), "an empty list");
+    assert_eq!(allowed("missing"), Ok(Vec::new()), "a repo it does not name");
+    let none = Config::parse(r#"{"host": "builder-1", "repos": {}}"#).expect("usable");
+    assert_eq!(none.allowed_siblings("gate"), Ok(&[][..]), "no siblings key allows none");
+    let keyed = Config::parse(r#"{"host": "builder-1", "repos": {}, "SIBLINGS": {"gate": ["b"]}}"#).expect("usable");
+    assert_eq!(keyed.allowed_siblings("gate"), Ok(&["b".to_owned()][..]), "the key in any case");
+}
+
+#[test]
+fn a_bad_siblings_value_allows_none_and_leaves_routing_alone() {
+    for (value, problem) in [
+        (r#"["b"]"#, "siblings must be a JSON object"),
+        ("null", "siblings must be a JSON object"),
+        (r#""b""#, "siblings must be a JSON object"),
+        (r#"{"g": "b"}"#, r#"siblings."g" is not an array of strings"#),
+        (r#"{"g": {}}"#, r#"siblings."g" is not an array of strings"#),
+        (r#"{"g": ["b", ""]}"#, r#"siblings."g"[1] is not a non-empty string"#),
+        (r#"{"g": [3]}"#, r#"siblings."g"[0] is not a non-empty string"#),
+        (r#"{"other": [null], "g": ["b"]}"#, r#"siblings."other"[0] is not a non-empty string"#),
+        (
+            r#"{"g": ["b", "x\\y"]}"#,
+            r#"siblings."g"[1] is not a folder name the builder can lay out"#,
+        ),
+        (r#"{"g": [".."]}"#, r#"siblings."g"[0] is not a folder name the builder can lay out"#),
+        (r#"{"\u001b[2J": 5}"#, r#"siblings."\u{1b}[2J" is not an array of strings"#),
+    ] {
+        let config = siblings_file(value);
+        assert_eq!(config.allowed_siblings("g"), Err(problem), "{value}");
+        assert_eq!(config.host(), "builder-1", "{value}");
+        assert_eq!(config.slots(), 2, "{value}");
+        assert_eq!(pattern_texts(&config, "g"), ["x"], "{value}");
+    }
+}
+
 #[test]
 fn an_ssh_alias_or_user_at_host_of_allowed_characters_is_accepted() {
     for host in ["builder", "build-box.lan", "user@build-box", "10.0.0.5", "b_1"] {

@@ -1,8 +1,11 @@
 //! What `gate check` says, as a pure function of what it found ([`Checked`]): a header, each item's line in the order
-//! manifest tools, the .NET SDK, workloads, siblings, an install hint per missing or too-old item, then a summary, all
-//! prefixed `check: <where>: ` (`install: <where>: ` for a hint), and the problems of the `.gate` files on stderr as
+//! manifest tools, the .NET SDK, workloads, the routing file's `siblings` problem, siblings, an install hint per
+//! missing or too-old item, then a summary, all prefixed `check: <where>: ` (`install: <where>: ` for a hint), and the
+//! problems of the `.gate` files on stderr as
 //! `check: .gate/<file>: <problem>`. The exit status is 0 only when nothing is missing or too old: a skipped item never
 //! fails the check.
+
+use gate_router::SiblingFolder;
 
 use crate::answer::FAILED_STATUS;
 use crate::boxside::payload::escaped;
@@ -34,13 +37,22 @@ pub(crate) enum Sdk {
     Skipped(String),
 }
 
-/// A sibling the repo declares: its name, where it must be, and whether a git worktree is there, or why that cannot
-/// be told.
+/// A sibling the repo declares: its name, where it must be, and what the check found of it.
 #[derive(Debug)]
 pub(crate) struct Sibling {
     pub name: String,
     pub path: String,
-    pub present: Result<bool, String>,
+    pub found: Found,
+}
+
+/// What the check found of a declared sibling, asked in routing's order: consent, then the name, then the folder.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Found {
+    /// This PC's routing file does not allow the repo to carry it, as routing asks; its folder is not looked for.
+    NotAllowed,
+    /// What the folder check found ([`route::sibling_folder`](crate::route::sibling_folder)), or why that cannot be
+    /// told; a sibling named like the worktree's own folder is refused without a look.
+    Folder(Result<SiblingFolder, String>),
 }
 
 /// How the lines name the manifest.
@@ -77,6 +89,8 @@ pub(crate) struct Checked {
     pub sdk: Option<Sdk>,
     /// The manifest's workload ids, which the check lists without checking them.
     pub workloads: Vec<String>,
+    /// Why this PC's routing file's `siblings` value cannot be used, when the repo declares siblings and it cannot.
+    pub consent_problem: Option<String>,
     /// The declared siblings, in declared order.
     pub siblings: Vec<Sibling>,
 }
@@ -164,6 +178,9 @@ fn items(checked: &Checked) -> Vec<Item> {
         let ids: Vec<String> = checked.workloads.iter().map(|id| one_line(id)).collect();
         let text = format!("workloads {} not checked yet", ids.join(", "));
         items.push(Item::new(text, Kind::Unchecked));
+    }
+    if let Some(problem) = &checked.consent_problem {
+        items.push(Item::new(format!("remote.json: {}", escaped(problem)), Kind::Missing));
     }
     items.extend(checked.siblings.iter().map(sibling_item));
     items
@@ -254,12 +271,17 @@ fn sdk_item(sdk: &Sdk) -> Item {
     }
 }
 
-/// The line of a declared sibling.
+/// The line of a declared sibling; a refused one worded as routing words it, `sibling {name} {reason}`.
 fn sibling_item(sibling: &Sibling) -> Item {
-    let Sibling { name, path, present } = sibling;
-    match present {
-        Ok(true) => Item::new(format!("sibling {name} ok ({path})"), Kind::Ok),
-        Ok(false) => Item::hinted(
+    let Sibling { name, path, found } = sibling;
+    let folder = match found {
+        Found::NotAllowed => return Item::new(format!("sibling {name} not allowed in remote.json"), Kind::Missing),
+        Found::Folder(folder) => folder,
+    };
+    match folder {
+        Ok(SiblingFolder::Present(_)) => Item::new(format!("sibling {name} ok ({path})"), Kind::Ok),
+        Ok(SiblingFolder::Refused(reason)) => Item::new(format!("sibling {name} {reason}"), Kind::Missing),
+        Ok(SiblingFolder::Missing) => Item::hinted(
             format!("sibling {name} missing (no git worktree at {path})"),
             Kind::Missing,
             Some((format!("sibling {name}"), format!("clone it to {path}"))),
@@ -270,7 +292,9 @@ fn sibling_item(sibling: &Sibling) -> Item {
 
 #[cfg(test)]
 mod tests {
-    use super::{Checked, GLOBAL_JSON, HERE, Line, Problem, SIBLINGS, Said, Sdk, Sibling, TOOLCHAIN, Tool, said};
+    use super::{Checked, Found, GLOBAL_JSON, HERE, Line, Problem, SIBLINGS, Said, Sdk, Sibling, TOOLCHAIN, Tool, said};
+    use gate_router::{FolderId, SiblingFolder};
+
     use crate::boxside::probe::Probed;
     use crate::remote::toolchain::{ToolNeed, Version};
 
@@ -303,6 +327,7 @@ mod tests {
             tools,
             sdk: None,
             workloads: Vec::new(),
+            consent_problem: None,
             siblings: Vec::new(),
         }
     }
@@ -437,7 +462,7 @@ mod tests {
             siblings: vec![Sibling {
                 name: "b".to_owned(),
                 path: "X:/dev/b".to_owned(),
-                present: Ok(false),
+                found: Found::Folder(Ok(SiblingFolder::Missing)),
             }],
             ..checked(Vec::new())
         };
@@ -544,7 +569,7 @@ mod tests {
             siblings: vec![Sibling {
                 name: "b".to_owned(),
                 path: "X:/dev/b".to_owned(),
-                present: Ok(false),
+                found: Found::Folder(Ok(SiblingFolder::Missing)),
             }],
             ..checked(Vec::new())
         };
@@ -575,17 +600,27 @@ mod tests {
                 Sibling {
                     name: "yaat-server".to_owned(),
                     path: "X:/dev/yaat-server".to_owned(),
-                    present: Ok(true),
+                    found: Found::Folder(Ok(SiblingFolder::Present(FolderId { volume: 1, file: [2; 16] }))),
                 },
                 Sibling {
                     name: "b".to_owned(),
                     path: "X:/dev/b".to_owned(),
-                    present: Ok(false),
+                    found: Found::Folder(Ok(SiblingFolder::Missing)),
                 },
                 Sibling {
                     name: "c".to_owned(),
                     path: "X:/dev/c".to_owned(),
-                    present: Err("cannot tell whether X:/dev/c\\.git exists: access denied".to_owned()),
+                    found: Found::Folder(Err("cannot read the sibling folder X:/dev/c: access denied".to_owned())),
+                },
+                Sibling {
+                    name: "d".to_owned(),
+                    path: "X:/dev/d".to_owned(),
+                    found: Found::Folder(Ok(SiblingFolder::Refused("is a link or a junction".to_owned()))),
+                },
+                Sibling {
+                    name: "e".to_owned(),
+                    path: "X:/dev/e".to_owned(),
+                    found: Found::NotAllowed,
                 },
             ],
             ..checked(vec![tool("pwsh", None, found("7.6.6")), tool("node", None, Probed::Missing)])
@@ -599,13 +634,51 @@ mod tests {
                 "check: here: workloads wasm-tools, maui not checked yet",
                 "check: here: sibling yaat-server ok (X:/dev/yaat-server)",
                 "check: here: sibling b missing (no git worktree at X:/dev/b)",
-                "check: here: sibling c skipped: cannot tell whether X:/dev/c\\.git exists: access denied",
+                "check: here: sibling c skipped: cannot read the sibling folder X:/dev/c: access denied",
+                "check: here: sibling d is a link or a junction",
+                "check: here: sibling e not allowed in remote.json",
                 "install: here: node: winget install OpenJS.NodeJS",
                 "install: here: .NET SDK: winget install Microsoft.DotNet.SDK.10",
                 "install: here: sibling b: clone it to X:/dev/b",
             ]
         );
-        assert_eq!(summary(&checked), "check: here: 3 missing, 0 too old, 1 skipped");
+        assert_eq!(summary(&checked), "check: here: 5 missing, 0 too old, 1 skipped");
+    }
+
+    #[test]
+    fn a_siblings_value_that_cannot_be_used_is_an_escaped_missing_line_before_the_siblings() {
+        let checked = Checked {
+            consent_problem: Some("siblings.\"app\"[1] is not a non-empty string\u{1b}[2J\u{202e}".to_owned()),
+            siblings: vec![Sibling {
+                name: "b".to_owned(),
+                path: "X:/dev/b".to_owned(),
+                found: Found::NotAllowed,
+            }],
+            ..checked(Vec::new())
+        };
+        assert_eq!(
+            body(&checked),
+            [
+                r#"check: here: remote.json: siblings."app"[1] is not a non-empty string\u{1b}[2J\u{202e}"#,
+                "check: here: sibling b not allowed in remote.json",
+            ]
+        );
+        assert_eq!(summary(&checked), "check: here: 2 missing, 0 too old");
+        assert_eq!(said(HERE, &checked).status, 1);
+    }
+
+    #[test]
+    fn a_refused_sibling_reads_as_routing_words_it_with_no_hint() {
+        let checked = Checked {
+            siblings: vec![Sibling {
+                name: "app".to_owned(),
+                path: "X:/dev/app".to_owned(),
+                found: Found::Folder(Ok(SiblingFolder::Refused("is the worktree's own folder".to_owned()))),
+            }],
+            ..checked(Vec::new())
+        };
+        assert_eq!(body(&checked), ["check: here: sibling app is the worktree's own folder"]);
+        assert_eq!(summary(&checked), "check: here: 1 missing, 0 too old");
     }
 
     #[test]

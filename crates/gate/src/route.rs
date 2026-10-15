@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use gate_args::{RunRequest, Slot};
-use gate_router::{Config, ConfigProblem, Facts, Inputs, LocalReason, Place, Route, decide};
+use gate_router::{Config, ConfigProblem, Facts, FolderId, Inputs, LocalReason, Place, Route, SiblingFolder, decide};
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
 };
@@ -25,6 +25,12 @@ const LOCAL_FLAG: &str = "--local";
 const GATE_FILE_MOST_BYTES: usize = 64 * 1024;
 /// The problem of a file of `.gate` that is a link, a junction or a folder.
 const GATE_FILE_NOT_A_FILE: &str = "is a link, a junction or not a file";
+/// Why a sibling folder that is a link or a junction is refused, read after its name.
+pub(crate) const SIBLING_LINK: &str = "is a link or a junction";
+/// Why a sibling that is a file is refused, read after its name.
+pub(crate) const SIBLING_NOT_A_FOLDER: &str = "is not a folder";
+/// Why a sibling whose `.git` is a link or a junction is refused, read after its name.
+pub(crate) const SIBLING_GIT_LINK: &str = "has a .git that is a link or a junction";
 /// Why a command that would route runs here when one of its words is not valid Unicode.
 const NOT_UNICODE: &str = "a word of the command is not valid Unicode";
 
@@ -88,7 +94,7 @@ pub(crate) fn route(request: &RunRequest, environment: &Environment, covering_pa
     match &route {
         Route::Local { reason: Some(reason) } => console.err(&reason.line()),
         Route::Local { reason: None } => {}
-        Route::Routed(run) => run.lines().into_iter().for_each(|line| console.err(line)),
+        Route::Routed(run) => run.lines().iter().for_each(|line| console.err(line)),
     }
     (route, machine.found.into_inner())
 }
@@ -130,6 +136,13 @@ pub(crate) fn read_remote_json(path: &Path) -> Result<Option<Config>, ConfigProb
     Config::parse(&String::from_utf8_lossy(&bytes)).map(Some).map_err(problem)
 }
 
+/// Where the routing file is: `<local_app_data>\gate\remote.json`; `None`, no routing file, when LOCALAPPDATA is unset,
+/// empty or relative. Routing and `gate check` look for it here.
+pub(crate) fn remote_json_path(local_app_data: Option<&OsStr>) -> Option<PathBuf> {
+    let folder = local_app_data.map(Path::new).filter(|folder| folder.is_absolute())?;
+    Some(folder.join("gate").join("remote.json"))
+}
+
 /// This machine's facts: the gate's working folder, or why it cannot be read, the LOCALAPPDATA folder that holds the
 /// routing file, how long each of the decision's git calls may take, how long its readers get once git has exited, and
 /// what git said of the gate's place when the decision asked.
@@ -154,10 +167,7 @@ impl Machine<'_> {
 impl Facts for Machine<'_> {
     /// `<LOCALAPPDATA>\gate\remote.json`; with LOCALAPPDATA unset, empty or relative there is no routing file.
     fn config(&self) -> Result<Option<Config>, ConfigProblem> {
-        let Some(folder) = self.local_app_data.map(Path::new).filter(|folder| folder.is_absolute()) else {
-            return Ok(None);
-        };
-        read_remote_json(&folder.join("gate").join("remote.json"))
+        remote_json_path(self.local_app_data).map_or(Ok(None), |path| read_remote_json(&path))
     }
 
     fn place(&self) -> Result<Option<Place>, String> {
@@ -226,17 +236,65 @@ impl Facts for Machine<'_> {
         read_siblings(Path::new(&place.root))
     }
 
-    fn sibling_present(&self, root: &str) -> Result<bool, String> {
-        sibling_present(root)
+    fn sibling_folder(&self, root: &str) -> Result<SiblingFolder, String> {
+        sibling_folder(root)
+    }
+
+    fn root_id(&self, root: &str) -> Result<FolderId, String> {
+        let unreadable = |error: io::Error| format!("cannot read the id of the worktree folder {root}: {error}");
+        let folder = open_followed(Path::new(root)).map_err(unreadable)?;
+        let (volume, file) = gate_win32::file_id(&folder).map_err(unreadable)?;
+        Ok(FolderId { volume, file })
     }
 }
 
-/// Whether the sibling whose root is `root` is there: it has a `.git`, a folder or a linked worktree's file; else why
-/// that cannot be told. Routing and `gate check` look for a sibling by this rule.
-pub(crate) fn sibling_present(root: &str) -> Result<bool, String> {
-    let git = Path::new(root).join(".git");
-    git.try_exists()
-        .map_err(|error| format!("cannot tell whether {} exists: {error}", git.display()))
+/// The folder of the sibling whose root is `root`, the worktree root's parent and the sibling's name: the parent opened
+/// following links, then the name opened inside the folder that handle holds without following a link
+/// ([`gate_win32::open_beneath`]), so it is a direct child of that folder. Missing when nothing has the name or it
+/// holds no `.git`; refused when it is a link or a junction (a name-surrogate reparse point), not a folder, or its
+/// `.git`, a folder or a linked worktree's file, is a link or a junction; else present with its id. Routing and `gate
+/// check` look for a sibling by this rule.
+///
+/// # Errors
+///
+/// What could not be read, naming the folder.
+pub(crate) fn sibling_folder(root: &str) -> Result<SiblingFolder, String> {
+    let unreadable = |error: io::Error| format!("cannot read the sibling folder {root}: {error}");
+    let path = Path::new(root);
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name().and_then(OsStr::to_str)) else {
+        return Err(format!("cannot read the sibling folder {root}: it names no folder inside another"));
+    };
+    let parent = match open_followed(parent) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(SiblingFolder::Missing),
+        parent => parent.map_err(unreadable)?,
+    };
+    let Some((folder, metadata)) = with_metadata(gate_win32::open_beneath(&parent, name)).map_err(unreadable)? else {
+        return Ok(SiblingFolder::Missing);
+    };
+    if metadata.file_type().is_symlink() {
+        return Ok(SiblingFolder::Refused(SIBLING_LINK.to_owned()));
+    }
+    if !metadata.is_dir() {
+        return Ok(SiblingFolder::Refused(SIBLING_NOT_A_FOLDER.to_owned()));
+    }
+    let Some((_git, git_metadata)) = with_metadata(gate_win32::open_beneath(&folder, ".git")).map_err(unreadable)? else {
+        return Ok(SiblingFolder::Missing);
+    };
+    if git_metadata.file_type().is_symlink() {
+        return Ok(SiblingFolder::Refused(SIBLING_GIT_LINK.to_owned()));
+    }
+    let (volume, file) = gate_win32::file_id(&folder).map_err(unreadable)?;
+    Ok(SiblingFolder::Present(FolderId { volume, file }))
+}
+
+/// The folder at `path` opened for reading, a link or a junction on the way followed, sharing reading, writing and
+/// deletion.
+fn open_followed(path: &Path) -> io::Result<fs::File> {
+    fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
 }
 
 /// The siblings `<root>\.gate\siblings.toml` declares as it stands on disk, read by [`read_gate_file`]: no file
@@ -413,16 +471,23 @@ fn holds_existing_path(listing: impl BufRead, root: &Path) -> io::Result<bool> {
 }
 
 #[cfg(test)]
-#[expect(clippy::expect_used, reason = "a test that cannot make its folders must fail loudly")]
+#[expect(
+    clippy::expect_used,
+    clippy::panic,
+    reason = "a test that cannot make its folders, or whose folder is not present, must fail loudly"
+)]
 mod tests {
     use std::fs;
     use std::os::windows::fs::OpenOptionsExt;
     use std::path::{Path, PathBuf};
 
-    use gate_router::{LocalReason, Place, Route};
+    use gate_router::{LocalReason, Place, Route, SiblingFolder};
     use windows_sys::Win32::Storage::FileSystem::{DELETE, FILE_GENERIC_READ, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE};
 
-    use super::{GATE_FILE_NOT_A_FILE, holds_existing_path, not_routed, parse_head, parse_place, read_siblings};
+    use super::{
+        GATE_FILE_NOT_A_FILE, SIBLING_GIT_LINK, SIBLING_LINK, SIBLING_NOT_A_FOLDER, holds_existing_path, not_routed, parse_head, parse_place,
+        read_siblings, sibling_folder,
+    };
     use crate::test_support::junction;
 
     /// The folder the place cases are asked of, spelled on a subst drive as a gate started there spells it.
@@ -546,6 +611,46 @@ mod tests {
         fs::remove_dir_all(&gate).expect("the real .gate can be removed");
         junction(&gate, &elsewhere.join(".gate"));
         assert_eq!(read_siblings(&root), Err(".gate is a link or a junction".to_owned()), "a junction");
+    }
+
+    #[test]
+    fn a_sibling_folder_is_only_a_real_folder_holding_a_real_git() {
+        let parent: PathBuf = std::env::temp_dir().join(format!("gate-route-sibling-folder-{}", std::process::id()));
+        if parent.exists() {
+            fs::remove_dir_all(&parent).expect("a folder left by an earlier run can be removed");
+        }
+        let _removed = Removed(vec![parent.clone()]);
+        fs::create_dir_all(parent.join("real").join(".git")).expect("a real sibling can be made");
+        fs::create_dir_all(parent.join("other").join(".git")).expect("a second real sibling can be made");
+        fs::create_dir_all(parent.join("bare")).expect("a folder with no .git can be made");
+        fs::create_dir_all(parent.join("git-linked")).expect("a sibling whose .git is a junction can be made");
+        junction(&parent.join("git-linked").join(".git"), &parent.join("real").join(".git"));
+        junction(&parent.join("linked"), &parent.join("real"));
+        fs::write(parent.join("file"), "x").expect("a file named like a sibling can be written");
+        let check = |name: &str| sibling_folder(&parent.join(name).to_string_lossy());
+        let id = |name: &str| match check(name) {
+            Ok(SiblingFolder::Present(id)) => id,
+            other => panic!("{name} is not present: {other:?}"),
+        };
+
+        assert_eq!(id("real"), id("real"), "one folder has one id");
+        assert_ne!(id("real"), id("other"), "two folders have two ids");
+        assert_eq!(
+            sibling_folder(&format!("{}/real", parent.to_string_lossy().replace('\\', "/"))).map(|_| ()),
+            Ok(()),
+            "a root spelled with forward slashes, as git spells it"
+        );
+        let refused = |reason: &str| Ok(SiblingFolder::Refused(reason.to_owned()));
+        assert_eq!(check("linked"), refused(SIBLING_LINK), "a junction to a real sibling");
+        assert_eq!(check("file"), refused(SIBLING_NOT_A_FOLDER), "a file");
+        assert_eq!(check("git-linked"), refused(SIBLING_GIT_LINK), "a .git that is a junction");
+        assert_eq!(check("bare"), Ok(SiblingFolder::Missing), "a folder with no .git");
+        assert_eq!(check("gone"), Ok(SiblingFolder::Missing), "nothing");
+        assert_eq!(
+            sibling_folder(&parent.join("gone").join("b").to_string_lossy()),
+            Ok(SiblingFolder::Missing),
+            "a parent that is not there"
+        );
     }
 
     #[test]

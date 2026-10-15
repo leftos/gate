@@ -2640,6 +2640,8 @@ mod tests {
             host: "builder",
             key: "app-1a2b3c4d",
             root: r"C:\no-such-worktree",
+            leaf: "app",
+            siblings: Vec::new(),
             repo: "app",
             subfolder: "",
             words: &[],

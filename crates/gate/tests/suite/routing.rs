@@ -411,14 +411,19 @@ fn a_folder_that_holds_nothing_the_snapshot_sends_runs_here_saying_so() {
     assert_local(&events(&case), None);
 }
 
-/// Declares in the case's `.gate/siblings.toml` one sibling, named for the case folder so no other case shares it; its
-/// name and the folder it would be, beside the case folder.
+/// Declares in the case's `.gate/siblings.toml` one sibling, named for the case folder so no other case shares it, and
+/// allows it in the routing file; its name and the folder it would be, beside the case folder.
 fn declare_sibling(case: &Case) -> (String, PathBuf) {
     let folder = case.folder();
     let leaf = folder.file_name().expect("the case folder has a name").to_string_lossy();
     let name = format!("{leaf}-sibling");
     fs::create_dir_all(folder.join(".gate")).expect("the .gate folder can be made");
     fs::write(folder.join(".gate").join("siblings.toml"), format!("siblings = [\"{name}\"]\n")).expect("the declaration can be written");
+    let path = case.local_app_data().join("gate").join("remote.json");
+    let mut routing: Value =
+        serde_json::from_str(&fs::read_to_string(&path).expect("the case has a routing file")).expect("the routing file is JSON");
+    routing["siblings"] = json!({ repo(case): [&name] });
+    write_remote_json(case, &routing.to_string());
     let beside = folder.parent().expect("the case folder has a parent").join(&name);
     if beside.exists() {
         fs::remove_dir_all(&beside).expect("a sibling left by an earlier run can be removed");
@@ -455,6 +460,74 @@ fn a_declared_sibling_with_a_git_beside_the_worktree_lets_the_run_route() {
     assert!(!outcome.stderr.contains("not routed"), "{outcome:?}");
     assert!(outcome.stderr.contains(BUSY_LINE), "the run was routed: {outcome:?}");
     assert_refused(&events(&case), "busy");
+}
+
+#[test]
+fn a_declared_sibling_the_routing_file_does_not_allow_runs_here_saying_so() {
+    let case = routed_case("routing-sibling-not-allowed");
+    let (name, beside) = declare_sibling(&case);
+    fs::create_dir_all(beside.join(".git")).expect("the sibling's .git can be made");
+    let routing = json!({ "host": HOST, "repos": { repo(&case): ["*tool*"] }, "siblings": { repo(&case): [name.to_uppercase()] } });
+    write_remote_json(&case, &routing.to_string());
+    let outcome = finish(case.gate(&heavy_words_with_limit("out.log", &[], &[r".\tool.exe", "out", "ran here"])));
+    fs::remove_dir_all(&beside).expect("the sibling can be removed");
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(
+        outcome
+            .stderr
+            .contains(&format!("gate: not routed: sibling {name} is not allowed in remote.json\n")),
+        "a name allowed in another letter case is not allowed: {outcome:?}"
+    );
+    assert_local(&events(&case), None);
+}
+
+#[test]
+fn the_routed_call_carries_the_leaf_and_the_allowed_siblings() {
+    let case = routed_case("routing-sibling-call");
+    let leaf = case
+        .folder()
+        .file_name()
+        .expect("the case folder has a name")
+        .to_string_lossy()
+        .into_owned();
+    let (alone_call, call) = (case.folder().join("alone.json"), case.folder().join("call.json"));
+    let alone_steps = shown(&stub(
+        &case,
+        &[&format!("record {}", shown(&alone_call)), "err from the client", "status 0"],
+    ));
+    let alone = finish(case.gate(&routed_words("alone.log", &alone_steps, &[], &[r".\tool.exe", "out", "hi"])));
+    let (name, beside) = declare_sibling(&case);
+    fs::create_dir_all(beside.join(".git")).expect("the sibling's .git can be made");
+    let steps = shown(&stub(&case, &[&format!("record {}", shown(&call)), "err from the client", "status 0"]));
+    let carrying = finish(case.gate(&routed_words("out.log", &steps, &[], &[r".\tool.exe", "out", "hi"])));
+    fs::remove_dir_all(&beside).expect("the sibling can be removed");
+
+    assert_eq!((alone.code, carrying.code), (Some(0), Some(0)), "{alone:?} {carrying:?}");
+    assert!(
+        !alone.stderr.lines().any(|line| line.starts_with("gate: routed")),
+        "a run carrying none says no routed line of any wording: {alone:?}"
+    );
+    let alone_call = recorded(&alone_call);
+    assert_eq!((&alone_call["leaf"], &alone_call["siblings"]), (&json!(leaf), &json!([])), "{alone_call}");
+
+    let call = recorded(&call);
+    assert_eq!(call["leaf"], json!(leaf), "{call}");
+    let root = call["root"].as_str().expect("the call has a root");
+    let sibling_root = format!("{}/{name}", root.rsplit_once('/').expect("the root has a parent").0);
+    let siblings = call["siblings"].as_array().expect("the call has siblings");
+    assert_eq!(siblings.len(), 1, "{call}");
+    assert_eq!(
+        (&siblings[0]["name"], &siblings[0]["root"]),
+        (&json!(name), &json!(sibling_root)),
+        "{call}"
+    );
+    let id = siblings[0]["id"].as_str().expect("the sibling has an id");
+    assert_eq!(id.len(), 16 + 1 + 32, "the volume serial and the file id: {id}");
+
+    let line = format!("gate: routed with siblings: {name} ({sibling_root})");
+    assert_eq!(carrying.stderr.lines().filter(|said| *said == line).count(), 1, "said once: {carrying:?}");
+    assert_in_order(&carrying.stderr, &[&line, "from the client"]);
 }
 
 #[test]

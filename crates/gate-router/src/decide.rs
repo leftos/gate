@@ -7,6 +7,7 @@ use std::ops::Range;
 use std::path::PathBuf;
 
 use crate::config::{CARGO_OUTPUTS, Config, ConfigProblem, ignored_line};
+use crate::escape::escaped;
 use crate::key::{is_layout_name, repo_name, work_folder_key};
 use crate::like::{Pattern, eq_ignoring_case};
 use crate::rewrite::{RewritePlace, SiblingRoot, drive_letters, rewrite_words, split_root};
@@ -207,12 +208,52 @@ pub trait Facts {
     /// saying so.
     fn siblings(&self, place: &Place) -> Result<Vec<String>, String>;
 
-    /// Whether a git worktree is at `root`: its `.git` exists, a file or a folder. Asked for each declared sibling.
+    /// The folder of the sibling whose root is `root`, which the decision builds as the worktree root's parent and the
+    /// sibling's name: its parent opened following links, then the name opened beneath it without following one.
+    /// Missing when nothing is there or it holds no `.git`; refused, with the reason, when it is a link or a junction,
+    /// not a folder, or its `.git` is a link or a junction; else present, with its id. Asked for each declared sibling,
+    /// in declared order, once every name is allowed.
     ///
     /// # Errors
     ///
-    /// Why it could not be told; the gate then runs here, saying so.
-    fn sibling_present(&self, root: &str) -> Result<bool, String>;
+    /// What could not be read; the gate then runs here, saying so.
+    fn sibling_folder(&self, root: &str) -> Result<SiblingFolder, String>;
+
+    /// The id of the worktree root's folder, opened following links. Asked only once every declared sibling is present.
+    ///
+    /// # Errors
+    ///
+    /// What could not be read; the gate then runs here, saying so.
+    fn root_id(&self, root: &str) -> Result<FolderId, String>;
+}
+
+/// The id of an open folder: its volume's serial number and its 128-bit file id. Two handles give one id only when they
+/// are of one folder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FolderId {
+    pub volume: u64,
+    pub file: [u8; 16],
+}
+
+/// A sibling a routed run carries: its folder name as declared, its root as [`sibling_root`] spells it, and the id
+/// [`Facts::sibling_folder`] gave its folder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CarriedSibling {
+    pub name: String,
+    pub root: String,
+    pub id: FolderId,
+}
+
+/// A declared sibling's folder as [`Facts::sibling_folder`] found it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SiblingFolder {
+    /// Nothing is there, or it holds no `.git`.
+    Missing,
+    /// Something is there that is not a sibling to carry; the reason reads after the sibling's name
+    /// (`is a link or a junction`).
+    Refused(String),
+    /// A folder, not a link or a junction, holding a `.git` that is not one either.
+    Present(FolderId),
 }
 
 /// Where the command runs.
@@ -241,6 +282,11 @@ pub enum LocalReason {
     SiblingsFile { problem: String },
     /// The declared sibling `name` has no git worktree beside the worktree root.
     SiblingMissing { name: String },
+    /// The declared sibling `name` is there but cannot be carried, for `reason`, which reads after its name.
+    SiblingRefused { name: String, reason: String },
+    /// The declared siblings `names`, in declared order, are not among those `remote.json`'s `siblings` allows the
+    /// repo; `problem` is why that value cannot be used, when it cannot.
+    SiblingsNotAllowed { names: Vec<String>, problem: Option<String> },
     /// The worktree root, which declares siblings, has a folder name `leaf` the builder cannot lay out.
     LeafNotLaidOut { leaf: String },
 }
@@ -257,9 +303,24 @@ impl LocalReason {
             Self::Failed { reason } => format!("gate: not routed: {reason}"),
             Self::SiblingsFile { problem } => format!("gate: not routed: .gate/siblings.toml: {problem}"),
             Self::SiblingMissing { name } => format!("gate: not routed: sibling {name} not found beside the worktree"),
+            Self::SiblingRefused { name, reason } => format!("gate: not routed: sibling {name} {reason}"),
+            Self::SiblingsNotAllowed { names, problem } => not_allowed_line(names, problem.as_deref()),
             Self::LeafNotLaidOut { leaf } => format!("gate: not routed: the worktree folder name {leaf} cannot be laid out on the builder"),
         }
     }
+}
+
+/// The line of declared siblings `remote.json` does not allow: `sibling b is` for one, `siblings b, c are` for more,
+/// then `not allowed in remote.json`, and the reason its `siblings` value cannot be used after a colon when it cannot.
+/// Each name is shown [`escaped`].
+fn not_allowed_line(names: &[String], problem: Option<&str>) -> String {
+    let names: Vec<String> = names.iter().map(|name| escaped(name)).collect();
+    let refused = match names.as_slice() {
+        [name] => format!("sibling {name} is"),
+        _ => format!("siblings {} are", names.join(", ")),
+    };
+    let problem = problem.map_or_else(String::new, |problem| format!(": {problem}"));
+    format!("gate: not routed: {refused} not allowed in remote.json{problem}")
 }
 
 /// A command routed to the builder.
@@ -273,8 +334,9 @@ pub struct RemoteRun {
     pub root: String,
     /// The worktree root's folder name: its last segment.
     pub leaf: String,
-    /// The declared siblings' roots, in declared order; none for a repo that declares none.
-    pub siblings: Vec<SiblingRoot>,
+    /// The siblings the run carries: those declared, each allowed and checked, in declared order; none for a repo that
+    /// declares none.
+    pub siblings: Vec<CarriedSibling>,
     /// The repo name the routing file listed.
     pub repo: String,
     /// The builder's work folder ([`work_folder_key`]).
@@ -299,15 +361,24 @@ pub struct RemoteRun {
 }
 
 impl RemoteRun {
-    /// The lines the gate says for this route, in order.
+    /// The lines the gate says for this route, in order: [`DROPPED_NO_BUILD_LINE`], [`NO_OUTPUTS_LINE`], then, for a run
+    /// carrying siblings, `gate: routed with siblings: {name} ({root}), ...` naming each in declared order.
     #[must_use]
-    pub fn lines(&self) -> Vec<&'static str> {
+    pub fn lines(&self) -> Vec<String> {
         let mut lines = Vec::new();
         if self.dropped_no_build {
-            lines.push(DROPPED_NO_BUILD_LINE);
+            lines.push(DROPPED_NO_BUILD_LINE.to_owned());
         }
         if self.outputs_withheld {
-            lines.push(NO_OUTPUTS_LINE);
+            lines.push(NO_OUTPUTS_LINE.to_owned());
+        }
+        if !self.siblings.is_empty() {
+            let named: Vec<String> = self
+                .siblings
+                .iter()
+                .map(|sibling| format!("{} ({})", sibling.name, sibling.root))
+                .collect();
+            lines.push(format!("gate: routed with siblings: {}", named.join(", ")));
         }
         lines
     }
@@ -318,8 +389,9 @@ impl RemoteRun {
 /// ignored; a git hook, no non-empty word, or a first word whose file name without extension is `git` or `prek` keep it
 /// here; so does a folder in no git worktree, a repo the routing file does not list, and words (paths rewritten, joined
 /// by single spaces) none of the repo's patterns match, the first that matches winning. A matched command still runs
-/// here, saying why, when the worktree's `.gate/siblings.toml` has a problem or declares siblings from a root folder
-/// name the builder cannot lay out, a sibling named like that folder or one with no git worktree beside the root; when
+/// here, saying why, when the worktree's `.gate/siblings.toml` has a problem or declares a sibling the routing file's
+/// `siblings` does not allow the repo, or declares siblings from a root folder name the builder cannot lay out, a
+/// sibling named like that folder or one with no git worktree beside the root; when
 /// a word names a path outside the worktree and its siblings; or when the gate's folder holds nothing the snapshot
 /// sends; and so does one whose facts cannot be read.
 #[must_use]
@@ -342,7 +414,7 @@ struct Matched<'a> {
     words: Vec<String>,
     outside: Option<String>,
     leaf: String,
-    siblings: Vec<SiblingRoot>,
+    siblings: Vec<CarriedSibling>,
 }
 
 fn route(inputs: &Inputs<'_>, facts: &dyn Facts) -> Result<RemoteRun, Here> {
@@ -603,7 +675,18 @@ fn matched<'a>(config: &'a Config, words: &[String], facts: &dyn Facts) -> Resul
     let sent = rewrite_words(&rewrite_place, words, &drives, &siblings);
     let leaf = leaf.to_owned();
     let pattern = first_match(patterns, &sent.words).ok_or(None)?;
-    check_siblings(problem, &leaf, &siblings, facts)?;
+    let declared = Declared {
+        problem,
+        root: &place.root,
+        leaf: &leaf,
+        siblings: &siblings,
+    };
+    let ids = check_siblings(&declared, config.allowed_siblings(&repo), facts)?;
+    let siblings = siblings
+        .into_iter()
+        .zip(ids)
+        .map(|(SiblingRoot { name, root }, id)| CarriedSibling { name, root, id })
+        .collect();
     Ok(Matched {
         config,
         repo,
@@ -646,19 +729,64 @@ pub fn sibling_root(root: &str, name: &str) -> String {
     format!("{parent}{separator}{name}")
 }
 
-/// Keeps a matched command here, saying why, for its siblings, checked in this order: the siblings file's `problem`;
-/// a root folder name `leaf` the builder cannot lay out, when the file declares siblings; a sibling named like that
-/// folder (ASCII letter case aside); a sibling with no git worktree. No sibling is looked for until every name is
-/// known to be another folder's.
-fn check_siblings(problem: Option<String>, leaf: &str, siblings: &[SiblingRoot], facts: &dyn Facts) -> Result<(), Here> {
+/// What a matched command's `.gate/siblings.toml` declared, with what the checks of its siblings need.
+struct Declared<'a> {
+    /// The file's first problem, when it has one; it then declares none.
+    problem: Option<String>,
+    /// The worktree root as git gives it.
+    root: &'a str,
+    /// The worktree root's folder name.
+    leaf: &'a str,
+    /// The declared siblings, in declared order.
+    siblings: &'a [SiblingRoot],
+}
+
+/// Keeps a matched command here, saying why, for its siblings, checked in this order: the siblings file's problem,
+/// shown [`escaped`]; a sibling name the builder cannot lay out; a declared sibling `allowed` does not name exactly
+/// (letter case included), or every one when `allowed` is the reason `remote.json`'s `siblings` cannot be used; a root
+/// folder name the builder cannot lay out; a sibling named like that folder (ASCII letter case aside); a sibling with
+/// no git worktree or one refused ([`Facts::sibling_folder`]); a sibling whose folder is the root's or an earlier
+/// sibling's. No sibling is looked for until every name is allowed
+/// and known to be another folder's. With each sibling's folder id, in declared order.
+fn check_siblings(declared: &Declared<'_>, allowed: Result<&[String], &str>, facts: &dyn Facts) -> Result<Vec<FolderId>, Here> {
+    let &Declared {
+        ref problem,
+        root,
+        leaf,
+        siblings,
+    } = declared;
     if let Some(problem) = problem {
         return Err(Some(LocalReason::SiblingsFile {
-            problem: fold_lines(&problem),
+            problem: escaped(&fold_lines(problem)),
         }));
     }
     if siblings.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
+    check_layout_names(siblings)?;
+    check_consent(siblings, allowed)?;
+    check_leaf(siblings, leaf)?;
+    let ids = folder_ids(siblings, facts)?;
+    let root_id = facts.root_id(root).map_err(|reason| Some(failed(&reason)))?;
+    check_distinct(siblings, &ids, root_id)?;
+    Ok(ids)
+}
+
+/// Keeps the run here for a sibling's name the builder cannot lay out, checked again here whatever the siblings file's
+/// reader checked, so no sibling's root, the root's parent and its name joined, holds a separator or `..`. It reads no
+/// folder and comes before consent, so a bad name is refused as such whatever `remote.json` allows.
+fn check_layout_names(siblings: &[SiblingRoot]) -> Result<(), Here> {
+    if let Some((index, sibling)) = siblings.iter().enumerate().find(|(_, sibling)| !is_layout_name(&sibling.name)) {
+        return Err(Some(LocalReason::SiblingsFile {
+            problem: format!("siblings[{index}] is not a folder name the builder can lay out: {:?}", sibling.name),
+        }));
+    }
+    Ok(())
+}
+
+/// Keeps the run here when the root's folder name `leaf` is no name the builder can lay out, then for a sibling named
+/// like that folder (ASCII letter case aside).
+fn check_leaf(siblings: &[SiblingRoot], leaf: &str) -> Result<(), Here> {
     if !is_layout_name(leaf) {
         return Err(Some(LocalReason::LeafNotLaidOut { leaf: leaf.to_owned() }));
     }
@@ -667,12 +795,59 @@ fn check_siblings(problem: Option<String>, leaf: &str, siblings: &[SiblingRoot],
             problem: format!("siblings[{index}] is the worktree's own folder: {:?}", sibling.name),
         }));
     }
+    Ok(())
+}
+
+/// Each sibling's folder id, in declared order, asked one after another; the first sibling that is missing or refused,
+/// or whose folder cannot be read, keeps the run here, saying so, and no later one is asked.
+fn folder_ids(siblings: &[SiblingRoot], facts: &dyn Facts) -> Result<Vec<FolderId>, Here> {
+    let mut ids = Vec::with_capacity(siblings.len());
     for sibling in siblings {
-        if !facts.sibling_present(&sibling.root).map_err(|reason| Some(failed(&reason)))? {
-            return Err(Some(LocalReason::SiblingMissing { name: sibling.name.clone() }));
+        let name = sibling.name.clone();
+        match facts.sibling_folder(&sibling.root).map_err(|reason| Some(failed(&reason)))? {
+            SiblingFolder::Missing => return Err(Some(LocalReason::SiblingMissing { name })),
+            SiblingFolder::Refused(reason) => return Err(Some(LocalReason::SiblingRefused { name, reason })),
+            SiblingFolder::Present(id) => ids.push(id),
         }
     }
+    Ok(ids)
+}
+
+/// Keeps the run here when a sibling's folder id `ids` holds, in declared order, is the worktree root's `root_id` or an
+/// earlier sibling's: one folder reached by two names.
+fn check_distinct(siblings: &[SiblingRoot], ids: &[FolderId], root_id: FolderId) -> Result<(), Here> {
+    for (index, (sibling, id)) in siblings.iter().zip(ids).enumerate() {
+        let reason = if *id == root_id {
+            "is the worktree's own folder".to_owned()
+        } else if let Some(earlier) = ids[..index].iter().position(|other| other == id) {
+            format!("is the same folder as sibling {}", siblings[earlier].name)
+        } else {
+            continue;
+        };
+        return Err(Some(LocalReason::SiblingRefused {
+            name: sibling.name.clone(),
+            reason,
+        }));
+    }
     Ok(())
+}
+
+/// Keeps the run here, naming each declared sibling `allowed` does not name exactly, in declared order; every one when
+/// `allowed` is why `remote.json`'s `siblings` cannot be used, which then allows none.
+fn check_consent(siblings: &[SiblingRoot], allowed: Result<&[String], &str>) -> Result<(), Here> {
+    let (allowed, problem) = match allowed {
+        Ok(names) => (names, None),
+        Err(problem) => (&[][..], Some(fold_lines(problem))),
+    };
+    let names: Vec<String> = siblings
+        .iter()
+        .filter(|sibling| !allowed.contains(&sibling.name))
+        .map(|sibling| sibling.name.clone())
+        .collect();
+    if names.is_empty() {
+        return Ok(());
+    }
+    Err(Some(LocalReason::SiblingsNotAllowed { names, problem }))
 }
 
 /// The subst table for the drive letters the words use, other than the `root`'s: each letter whose device target names

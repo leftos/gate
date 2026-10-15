@@ -6,7 +6,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::support::{Case, FAKE_TOOL, Go, Outcome, finish, git, wait_until_closed};
+use crate::support::{Case, FAKE_TOOL, Go, Outcome, finish, git, wait_until_closed, write_remote_json};
 
 /// The repo's folder in the case folder.
 const REPO: &str = "app";
@@ -322,6 +322,52 @@ fn check_lists_a_missing_sibling() {
             format!("check: here: sibling docs missing (no git worktree at {parent}/docs)"),
             format!("install: here: sibling docs: clone it to {parent}/docs"),
             "check: here: 1 missing, 0 too old".to_owned(),
+        ],
+        "{outcome:?}"
+    );
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+}
+
+/// A routing file whose `siblings` value cannot be used says why on a line of its own, counted missing, and allows no
+/// sibling.
+#[test]
+fn check_a_bad_siblings_value_in_the_routing_file_says_why() {
+    let case = repo_case("check_bad_siblings_value");
+    write(&case, ".gate/siblings.toml", "siblings = ['b']\n");
+    write_remote_json(&case, r#"{"host": "builder-1", "repos": {"app": ["*"]}, "siblings": {"app": ["b", 3]}}"#);
+    let stub = stubs(&case, &[]);
+
+    let outcome = check(&case, &[stub], &[]);
+
+    assert_eq!(
+        lines(&outcome.stdout)[1..],
+        [
+            "check: here: app declares no toolchain",
+            r#"check: here: remote.json: siblings."app"[1] is not a non-empty string"#,
+            "check: here: sibling b not allowed in remote.json",
+            "check: here: 2 missing, 0 too old",
+        ],
+        "{outcome:?}"
+    );
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+}
+
+/// A sibling named like the worktree's own folder, letter case aside, is refused as routing refuses it, and its folder
+/// is not looked for.
+#[test]
+fn check_refuses_a_sibling_named_like_the_worktree() {
+    let case = repo_case("check_sibling_like_root");
+    write(&case, ".gate/siblings.toml", "siblings = ['APP']\n");
+    let stub = stubs(&case, &[]);
+
+    let outcome = check(&case, &[stub], &[]);
+
+    assert_eq!(
+        lines(&outcome.stdout)[1..],
+        [
+            "check: here: app declares no toolchain",
+            "check: here: sibling APP is the worktree's own folder",
+            "check: here: 1 missing, 0 too old",
         ],
         "{outcome:?}"
     );
