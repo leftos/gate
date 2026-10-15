@@ -155,7 +155,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Stop event**: the manual-reset event `<box job name>-stopped` that `gate box run` creates before its job and `gate box stop` sets before it terminates the job, so a launch that finds it set ends the command unstarted.
 - **Stop-tree**: `gate stop-tree <pid>`, which terminates the gate jobs and then the processes of a pid's tree, deepest first, so a kill reaches processes that no longer have a parent.
 - **Subst chain**: the drives a `subst` drive leads to when its target is itself on a `subst` drive, followed at most 26 hops with a visited set; a cycle, an unreadable device or a target that is not a `\??\` path gives no spelling, and the run stays local.
-- **Sync-back**: applying the files a routed command changed on the builder to the PC's worktree, refused when the worktree changed during the run.
+- **Sync-back**: applying the files a routed command changed on the builder to the PC's worktree, refused when the worktree changed during the run; a pair's is all or nothing across its repos, applying only the back commits the box's back commits line names.
 - **Tagged line**: a `gate-remote-<tag>: ...` line the box writes on stderr for the client: `started`, `refused`, `heartbeat`, `outputs`, `killed` (the box killed the command, naming the run's nonce and `timed-out` or `backstop`) and `adjusted` (naming the run's nonce and the load-adjusted seconds the box counted).
 - **Take**: a gate acquiring its slot, journalled as `take`; **release** is letting it go, journalled as `release` before the slot is freed.
 - **Take-back**: returning a machine to the PowerShell gate by deleting the cutover flag by hand, which works even when `gate.exe` is what is broken.
@@ -176,3 +176,4 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Work folder**: the builder's checkout of one PC worktree, reused across routed runs so builds stay incremental.
 - **Work-folder key**: the name of a work folder: the worktree folder's name plus 8 hex digits of the SHA-256 of its lower-cased path.
 - **Work-folder lock**: the file `<Work>.lock` that `gate box run` opens with no sharing and holds for the run's life, so one run at a time uses a work folder; a held lock is the `busy` refusal.
+- **Worktree lock**: the mutex `Local\gate-[<root hash>-]worktree-<volume>-<file id>`, named for a worktree folder's id, that a sync-back takes for each worktree it has a back commit for, in id order, from before its fetch to its end, so two runs never write one folder at once; another run's hold is waited for up to the git limit.
