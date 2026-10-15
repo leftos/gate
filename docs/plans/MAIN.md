@@ -8,16 +8,14 @@
 - [ ] GATE-19 Remote: send a repo's declared sibling worktrees with a routed run — Urgent · Remote
 - [ ] GATE-206 A per-repo toolchain manifest: check and prepare builders, and check a fresh clone — Urgent · Remote
 - [ ] GATE-192 Turn routing back on, on the Rust remote client — High · Remote
-- [/] GATE-248 Siblings B: the box lays out a sibling pair (Pair payload, preflight, run) — High · Remote
 - [ ] GATE-249 Siblings C: the client snapshots, checks parity and pushes each repo — High · Remote
 - [ ] GATE-250 Siblings D: sync back every repo of a pair, all or nothing — High · Remote
 - [ ] GATE-251 Siblings E: outputs, install rewrite and stale-line wording for a pair — High · Remote
 - [ ] GATE-252 Siblings F: docs for routed sibling pairs — High · Remote
 - [ ] GATE-22 Remote: send a routed command's ignored inputs to the builder, compressed — High · Remote
-- [ ] GATE-214 Toolchain 7: roll the manifest out to the gated repos — High · Remote
+- [!] GATE-214 Toolchain 7: roll the manifest out to the gated repos — High · Remote
 - [ ] GATE-228 Merge feat/toolchain-manifest (#252) — High · Remote
 - [ ] GATE-231 Run a routed command that needs a desktop in the builder's logged-on session — High · Remote
-- [ ] GATE-234 Router: a drive-relative word and a climb inside a drive-path word are not seen as outside the worktree — High · Remote
 
 ## Remote
 
@@ -29,6 +27,8 @@
   - [ ] GATE-29 Sync-back: narrow the 'worktree changed during the run' refusal to changes that could matter
 - [ ] GATE-159 Box: choose the dotnet tool restore cap from its logged times
 - [ ] GATE-195 Check git and gate push's ssh against the worktree, as the remote client checks ssh and dotnet
+- [ ] GATE-273 Read a dotnet tools manifest at the repo root as a toolchain pin
+- [ ] GATE-279 Spike: a session-1 process the box can own (job, handles, pipe DACL, D3D)
 - [ ] GATE-235 Builder: folders above the work folder and on PATH may be writable by any local user
 - [ ] GATE-240 gate push and install.ps1: clearer failure reasons, a language-mode check, one copy of the file helper
 - [ ] GATE-253 gate check and the box's probe: judge siblings by every routing rule; a tool that exits non-zero is not present
@@ -40,6 +40,11 @@
 - [ ] GATE-270 gate check --builder: hold the worktree's lock, and bound the box preflight's git steps
 - [ ] GATE-271 Box: harden the work folder against an earlier run's leftovers (back ref, commondir, index copy, final path, origin)
 - [ ] GATE-272 gate check --builder: a silent ssh 255, and the siblings file's problems
+- [ ] GATE-275 Router: judge MSBuild property values from each project's folder, not only the gate's
+- [ ] GATE-276 Router: spelling edges of the outside check (an outward link, case folding, a separate /-rooted argument)
+- [ ] GATE-277 Router: a gate folder reached through a junction is judged by its spelling
+- [ ] GATE-278 Router: a policy for words whose paths the router cannot read (encoded commands, variables, glued options)
+- [ ] GATE-280 Router: words GATE-234's path starts now keep local that name worktree paths
 
 ## Cutover sweep
 
