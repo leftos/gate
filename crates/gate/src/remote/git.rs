@@ -8,6 +8,7 @@
 use std::ffi::{OsStr, OsString};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::os::windows::ffi::OsStrExt;
 use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::process::ExitStatusExt;
 use std::path::{Component, Path, PathBuf, Prefix};
@@ -18,7 +19,7 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use gate_args::TestSeams;
+use gate_args::{TestSeams, command_line, is_batch_target};
 use gate_win32::{Interrupt, Job, PipedConsole, PipedLaunch, Running};
 
 use super::launch::{DRAIN, KILL_WAIT, KILLED, call_job, launched, piped_launch};
@@ -283,12 +284,12 @@ pub(crate) struct ProgramOutput {
 
 /// Runs `call`'s program, `None` when it is not found along the `PATH` of `place`'s environment; the search never looks
 /// in the working folder, and when the call gives a worktree a program found is followed through links, refused when
-/// that leads inside it and else launched as the file it leads to. The program runs in `place`'s system folder with its
-/// environment, a batch file through the system folder's cmd.exe, as the client's git calls run: in a kill-on-close job
-/// of its own, on the call's console, ended past the call's limit (failing with [`ProgramCall::late_line`], followed
-/// by why it could not be stopped when it could not) or by its console interrupt, its standard output read up to
-/// [`OUTPUT_CAP`] and the last [`ERRORS_KEPT`] bytes of its standard error kept. Else why it could not be run (`cannot
-/// run <program>: <why>`), or [`GitError::Interrupted`].
+/// that leads inside it and else launched as the file it leads to, its command line's first word still the name found
+/// along `PATH`. The program runs in `place`'s system folder with its environment, a batch file through the system
+/// folder's cmd.exe, as the client's git calls run: in a kill-on-close job of its own, on the call's console, ended past
+/// the call's limit (failing with [`ProgramCall::late_line`], followed by why it could not be stopped when it could not)
+/// or by its console interrupt, its standard output read up to [`OUTPUT_CAP`] and the last [`ERRORS_KEPT`] bytes of its
+/// standard error kept. Else why it could not be run (`cannot run <program>: <why>`), or [`GitError::Interrupted`].
 pub(crate) fn program_output(call: &ProgramCall<'_>, place: &ProgramPlace) -> Result<Option<ProgramOutput>, GitError> {
     let program = call.program;
     let cannot_run = |why: String| GitError::Failed(format!("cannot run {program}: {why}"));
@@ -299,9 +300,9 @@ pub(crate) fn program_output(call: &ProgramCall<'_>, place: &ProgramPlace) -> Re
         Err(message) if message == gate_win32::win32_message(ERROR_FILE_NOT_FOUND) => return Ok(None),
         Err(message) => return Err(cannot_run(message)),
     };
-    let found = match call.worktree {
+    let target = match call.worktree {
         Some(worktree) => judged(&found, worktree).map_err(cannot_run)?,
-        None => found,
+        None => found.clone(),
     };
     let bounds = Call {
         interrupt: call.interrupt,
@@ -311,7 +312,7 @@ pub(crate) fn program_output(call: &ProgramCall<'_>, place: &ProgramPlace) -> Re
     let spawn = Spawn {
         name: program,
         late: call.late_line(),
-        launch: program_launch(&found, call, folder, variables),
+        launch: program_launch(&found, &target, call, place),
     };
     let over = format!("{} wrote more than {} MiB", call.named(), OUTPUT_CAP / (1024 * 1024));
     let (status, stdout, stderr) = output_of(&spawn, &bounds, over)?;
@@ -357,7 +358,8 @@ pub(crate) fn sdk_listing(variables: Variables, limit: Duration, interrupt: Opti
 /// The file `program`, found along a `PATH`, leads to, followed through links, which is what is then launched, so a
 /// link retargeted after the check cannot change what runs; else why it is refused, when that file lies inside
 /// `worktree`: a folder outside the worktree may still hold a link that leads into it. dotnet and the client's ssh are
-/// judged so.
+/// judged so. The refusal covers only the file launched: a program it starts in turn (a multi-call proxy such as
+/// rustup's, a shim) is not judged.
 pub(crate) fn judged(program: &Path, worktree: &Path) -> Result<PathBuf, String> {
     let target = resolved(program);
     if is_within(&target, &resolved(worktree)) {
@@ -390,18 +392,28 @@ fn without_verbatim(path: &Path) -> PathBuf {
         .fold(PathBuf::from(root), |joined, part| joined.join(part))
 }
 
-/// The launch of the program found at `program` with `call`'s arguments, in `folder`, on `call`'s console, with
-/// `variables` as its environment: a batch file runs through the system folder's cmd.exe, as `gate run` starts one.
-fn program_launch(program: &Path, call: &ProgramCall<'_>, folder: &Path, variables: &Variables) -> io::Result<PipedLaunch> {
+/// The launch of `target`, the file the program found along `PATH` at `found` leads to, with `call`'s arguments, in
+/// `place`'s folder, on `call`'s console, with `place`'s variables as its environment. The image started is `target`
+/// and its command line's first word is `found`, the name the program was found by, since a multi-call program such as
+/// rustup's proxies picks what to be from that word; a batch target runs through the system folder's cmd.exe given
+/// `target`, as `gate run` starts one.
+fn program_launch(found: &Path, target: &Path, call: &ProgramCall<'_>, place: &ProgramPlace) -> io::Result<PipedLaunch> {
+    let (folder, variables) = (&place.folder, &place.variables);
     let args: Vec<OsString> = call.args.iter().map(OsString::from).collect();
-    let (application, command_line) = match written(program, &args, variables) {
-        Written::Line(application, command_line) => (application, command_line),
-        Written::Refused(why) | Written::NoShell(why) => return Err(io::Error::other(why)),
+    let (application, command_line) = if is_batch_target(&target.to_string_lossy()) {
+        match written(target, &args, variables) {
+            Written::Line(application, command_line) => (application, command_line),
+            Written::Refused(why) | Written::NoShell(why) => return Err(io::Error::other(why)),
+        }
+    } else {
+        let mut words: Vec<Vec<u16>> = vec![found.as_os_str().encode_wide().collect()];
+        words.extend(args.iter().map(|word| word.encode_wide().collect()));
+        (target.to_owned(), command_line(&words))
     };
     Ok(PipedLaunch {
         application,
         command_line,
-        directory: folder.to_owned(),
+        directory: folder.clone(),
         environment: variables.block()?,
         console: call.console,
         token: None,
@@ -849,12 +861,12 @@ mod tests {
     use std::thread::{self, ScopedJoinHandle};
     use std::time::{Duration, Instant};
 
-    use gate_win32::Interrupt;
+    use gate_win32::{Interrupt, PipedConsole};
     use jiff::Timestamp;
 
     use super::{
-        Call, ERRORS_KEPT, FAILURE_BYTES, GIT_LIMIT, Git, GitError, NO_CURRENT_FOLDER, OUTPUT_CAP, capped, failed_line, failure_text,
-        is_indexed_config, late_git_line, sdk_listing, tail, without_verbatim,
+        Call, ERRORS_KEPT, FAILURE_BYTES, GIT_LIMIT, Git, GitError, NO_CURRENT_FOLDER, OUTPUT_CAP, ProgramCall, ProgramPlace, capped, failed_line,
+        failure_text, is_indexed_config, late_git_line, program_output, sdk_listing, tail, without_verbatim,
     };
     use crate::boxside::payload::escaped;
     use crate::environment::Variables;
@@ -1401,6 +1413,65 @@ mod tests {
             failed_line(&call, None, b"fatal: x\n", b""),
             r"git write-tree failed in C:\work\app (status unknown): fatal: x",
             "no exit code"
+        );
+    }
+
+    /// What Windows PowerShell says its command line is when it is run as `tool`, found along a `PATH` holding only a
+    /// link named `link` that leads to it, in a folder of its own named after `tag`.
+    fn command_line_through_link(link: &str, tag: &str) -> String {
+        let folder = std::env::temp_dir().join(format!("gate-link-{tag}-{}", std::process::id()));
+        drop(fs::remove_dir_all(&folder));
+        fs::create_dir_all(&folder).expect("the link's folder can be made");
+        let _removed = Removed(folder.clone());
+        let system_root = std::env::var_os("SystemRoot").expect("SystemRoot is set");
+        let powershell = Path::new(&system_root).join(r"System32\WindowsPowerShell\v1.0\powershell.exe");
+        std::os::windows::fs::symlink_file(&powershell, folder.join(link)).expect("this machine lets a test make a symbolic link");
+        let place = ProgramPlace::new(Variables::from_process().with("PATH", &folder.to_string_lossy())).expect("the system folder can be read");
+        let call = ProgramCall {
+            program: "tool",
+            args: &["-NoProfile", "-NonInteractive", "-Command", "[Environment]::CommandLine"],
+            limit: HANG_GUARD,
+            interrupt: None,
+            worktree: Some(Path::new(env!("CARGO_MANIFEST_DIR"))),
+            console: PipedConsole::Hidden,
+        };
+
+        let output = program_output(&call, &place).expect("the link runs").expect("the link is found");
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    /// Whether the first word of the command line `line`, quoted or not, names a file called `name`.
+    fn first_word_names(line: &str, name: &str) -> bool {
+        let line_start = line.trim_start();
+        let first_word = match line_start.strip_prefix('"') {
+            Some(quoted) => quoted.split('"').next(),
+            None => line_start.split_whitespace().next(),
+        }
+        .unwrap_or_default();
+        Path::new(first_word).file_name().is_some_and(|file| file.eq_ignore_ascii_case(name))
+    }
+
+    #[test]
+    fn a_program_found_through_a_link_is_started_by_the_name_it_was_found_by() {
+        let line = command_line_through_link("tool.exe", "name");
+
+        assert!(
+            first_word_names(&line, "tool.exe"),
+            "a multi-call program such as rustup's proxies must see the name it was found by: {line}"
+        );
+    }
+
+    #[test]
+    fn a_batch_named_link_to_a_program_is_started_as_the_program_it_leads_to() {
+        let line = command_line_through_link("tool.cmd", "batch-name");
+
+        assert!(
+            line.contains("[Environment]::CommandLine"),
+            "the link's target, not cmd.exe, must run and print its command line: {line}"
+        );
+        assert!(
+            first_word_names(&line, "tool.cmd"),
+            "the target must see the name it was found by: {line}"
         );
     }
 }
