@@ -645,6 +645,7 @@ fn call_of<'r>(parts: CallParts<'r>, remote: &'r RemoteRun) -> Result<RemoteCall
         host: &remote.host,
         key: &remote.key,
         root: &remote.root,
+        root_id: remote.root_id,
         leaf: &remote.leaf,
         siblings,
         repo: &remote.repo,

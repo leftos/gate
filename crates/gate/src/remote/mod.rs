@@ -15,6 +15,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use gate_args::RunRequest;
+use gate_router::FolderId;
 use gate_state::{FallbackReason, StateRoot, Verdict};
 use gate_win32::{Interrupt, OwnedMutexGuard};
 
@@ -195,6 +196,9 @@ pub(crate) struct RemoteCall<'a> {
     pub host: &'a str,
     pub key: &'a str,
     pub root: &'a str,
+    /// The id the route's decision read for the worktree root's folder, following links: the worktree lock refuses a
+    /// root whose folder has another id at use.
+    pub root_id: FolderId,
     /// The worktree root's folder name.
     pub leaf: &'a str,
     /// The siblings the run carries, as the route's decision allowed and checked them, in declared order ([`carried`]).
@@ -403,6 +407,7 @@ mod snapshot_only {
                 host: "builder",
                 key: "app-1a2b3c4d",
                 root,
+                root_id: gate_router::FolderId { volume: 0, file: [0; 16] },
                 leaf: "app",
                 siblings: Vec::new(),
                 repo: "app",
@@ -496,7 +501,7 @@ mod scripted {
     use gate_win32::Interrupt;
     use serde_json::{Value, json};
 
-    use super::{BoxKill, REFUSED, RemoteCall, RemoteClient, RemoteOutcome, Sibling};
+    use super::{BoxKill, FolderId, REFUSED, RemoteCall, RemoteClient, RemoteOutcome, Sibling};
     use crate::run::CONTROL_C_EXIT;
 
     /// How often `wait` looks for its path and the interrupt.
@@ -663,6 +668,7 @@ mod scripted {
             "host": call.host,
             "key": call.key,
             "root": call.root,
+            "rootId": recorded_id(call.root_id),
             "leaf": call.leaf,
             "siblings": call.siblings.iter().map(recorded_sibling).collect::<Vec<Value>>(),
             "repo": call.repo,
@@ -679,15 +685,18 @@ mod scripted {
         Ok(true)
     }
 
-    /// A carried sibling as the record writes it: its name, its root, and its folder's id as the volume serial's 16 hex
-    /// digits, `-`, and the file id's 32.
+    /// A carried sibling as the record writes it: its name, its root, and its folder's id ([`recorded_id`]).
     fn recorded_sibling(sibling: &Sibling<'_>) -> Value {
-        let id = sibling.id();
         json!({
             "name": sibling.name(),
             "root": sibling.root(),
-            "id": format!("{:016x}-{:032x}", id.volume, u128::from_be_bytes(id.file)),
+            "id": recorded_id(sibling.id()),
         })
+    }
+
+    /// A folder's id as the record writes it: the volume serial's 16 hex digits, `-`, and the file id's 32.
+    fn recorded_id(id: FolderId) -> String {
+        format!("{:016x}-{:032x}", id.volume, u128::from_be_bytes(id.file))
     }
 
     /// Sleeps until `path` exists, true, or the interrupt is raised, false.

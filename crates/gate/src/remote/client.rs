@@ -2978,6 +2978,7 @@ mod tests {
             host: "builder",
             key: "app-1a2b3c4d",
             root: r"C:\no-such-worktree",
+            root_id: gate_router::FolderId { volume: 0, file: [0; 16] },
             leaf: "app",
             siblings: Vec::new(),
             repo: "app",

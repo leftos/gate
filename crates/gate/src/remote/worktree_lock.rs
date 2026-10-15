@@ -1,52 +1,105 @@
 //! The lock of a worktree a sync-back writes, the main one's or a pair's sibling's: a kernel mutex named for the
-//! worktree folder's id ([`KernelObject::Worktree`]), read by opening its root at lock time, so two runs that write one
-//! folder, under one spelling of its path or two, never write it at once. A run takes its worktrees' locks in the order
-//! of their ids, so two runs never each hold one the other waits for, and waits for one another run holds, saying so
-//! once, until the attempt's lock wait has passed.
+//! worktree folder's id ([`KernelObject::Worktree`]), read by opening its root at lock time as the route read it,
+//! following links, and refused when it is not the id the route was decided for. The folder stays open, shared for
+//! reading and writing but not deletion, as long as its lock is held, so it cannot be renamed or swapped while the run
+//! writes it, and two runs that write one folder, under one spelling of its path or two, never write it at once. A run
+//! takes its worktrees' locks in the order of their ids, so two runs never each hold one the other waits for, and waits
+//! for one another run holds, saying so once, until the attempt's lock wait has passed.
 
+use std::fs::File;
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use gate_router::FolderId;
 use gate_state::{KernelObject, StateRoot};
-use gate_win32::{AcquireError, Interrupt, NamedMutex, OwnedMutexGuard};
+use gate_win32::{AcquireError, Interrupt, NamedMutex, OwnedMutexGuard, Share};
 
 use super::client::End;
-use crate::route;
+use crate::route::open_followed;
 
 /// How long each wait for a worktree's lock another run holds lasts before the interrupt and the deadline are looked at
 /// again.
 const WAIT_STEP: Duration = Duration::from_millis(100);
 
-/// The id of the worktree folder at `root` ([`route::root_id`]) and the name of its lock under the state root `state`;
-/// else why its id cannot be read.
-pub(super) fn lock_of(state: &StateRoot, root: &str) -> Result<((u64, [u8; 16]), String), End> {
-    let FolderId { volume, file } = route::root_id(root).map_err(End::Failed)?;
-    Ok(((volume, file), state.object_name(KernelObject::Worktree { volume, file })))
+/// A worktree a run locks: its name in the run, its root, and the id the route read for its folder.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Folder<'a> {
+    pub(super) name: &'a str,
+    pub(super) root: &'a str,
+    pub(super) id: FolderId,
 }
 
-/// The locks of `worktrees`, each its name and its root, under the state root `state`, taken in the order of their
-/// folders' ids, one per folder however many spellings name it, and held until the guards are dropped. A lock another
-/// run holds is waited for, `say` given `gate: remote waiting for the worktree <name>: another run holds it` once, until
-/// `limit` has passed since the first lock was asked for; a lock left by a holder that ended is taken. The interrupt
-/// `interrupt` ends a wait as the run's interrupt; a folder whose id cannot be read, a mutex that cannot be opened or
-/// taken, and a wait past `limit` are the run's failure.
+/// A worktree's folder opened for its lock: its id, the name of its lock, and the open folder.
+pub(super) struct Opened {
+    id: (u64, [u8; 16]),
+    pub(super) lock: String,
+    folder: File,
+}
+
+/// A worktree's lock held: the mutex's guard and the worktree's folder, held open without delete sharing until both
+/// are dropped.
+pub(super) struct Locked {
+    #[cfg_attr(not(test), expect(dead_code, reason = "held for its drop; only the tests read the lock's name"))]
+    guard: OwnedMutexGuard,
+    _folder: File,
+}
+
+impl Locked {
+    /// The name of the mutex held.
+    #[cfg(test)]
+    pub(super) fn name(&self) -> &str {
+        self.guard.name()
+    }
+}
+
+/// The worktree folder at `root`, opened following links, as the route read its id, without delete sharing; its id and
+/// the name of its lock under the state root `state`. Else why its id cannot be read, or, when its id is not
+/// `expected`, the one the route was decided for, that it is another folder.
+pub(super) fn lock_of(state: &StateRoot, root: &str, expected: FolderId) -> Result<Opened, End> {
+    let cannot = |error: std::io::Error| End::Failed(format!("cannot read the id of the worktree {root}: {error}"));
+    let folder = open_followed(Path::new(root), Share::NoDelete).map_err(cannot)?;
+    let (volume, file) = gate_win32::file_id(&folder).map_err(cannot)?;
+    if (FolderId { volume, file }) != expected {
+        return Err(End::Failed(format!("the worktree {root} is not the folder the route was decided for")));
+    }
+    Ok(Opened {
+        id: (volume, file),
+        lock: state.object_name(KernelObject::Worktree { volume, file }),
+        folder,
+    })
+}
+
+/// The locks of `worktrees` under the state root `state`, each folder opened and checked ([`lock_of`]), taken in the
+/// order of their folders' ids, one per folder however many spellings name it, and held with the folders until dropped.
+/// A lock another run holds is waited for, `say` given `gate: remote waiting for the worktree <name>: another run holds
+/// it` once, until `limit` has passed since the first lock was asked for; a lock left by a holder that ended is taken.
+/// The interrupt `interrupt` ends a wait as the run's interrupt; a folder whose id cannot be read or is not the route's,
+/// a mutex that cannot be opened or taken, and a wait past `limit` are the run's failure.
 pub(super) fn held(
     state: &StateRoot,
-    worktrees: &[(&str, &str)],
+    worktrees: &[Folder<'_>],
     limit: Duration,
     interrupt: Option<Interrupt>,
     mut say: impl FnMut(String),
-) -> Result<Vec<OwnedMutexGuard>, End> {
+) -> Result<Vec<Locked>, End> {
     let deadline = Instant::now() + limit;
     let mut locks = Vec::with_capacity(worktrees.len());
-    for (name, root) in worktrees {
-        let (id, lock) = lock_of(state, root)?;
-        locks.push((id, lock, *name));
+    for worktree in worktrees {
+        locks.push((lock_of(state, worktree.root, worktree.id)?, worktree.name));
     }
-    locks.sort_by_key(|(id, _, _)| *id);
-    locks.dedup_by_key(|(id, _, _)| *id);
+    locks.sort_by_key(|(opened, _)| opened.id);
+    locks.dedup_by_key(|(opened, _)| opened.id);
     let wait = Wait { deadline, limit, interrupt };
-    locks.iter().map(|(_, lock, name)| taken(lock, name, &wait, &mut say)).collect()
+    locks
+        .into_iter()
+        .map(|(opened, name)| {
+            let guard = taken(&opened.lock, name, &wait, &mut say)?;
+            Ok(Locked {
+                guard,
+                _folder: opened.folder,
+            })
+        })
+        .collect()
 }
 
 /// How long a wait for a lock may last, and the interrupt that ends it.
@@ -92,10 +145,11 @@ pub(super) mod tests {
     use std::thread;
     use std::time::Duration;
 
+    use gate_router::FolderId;
     use gate_state::StateRoot;
-    use gate_win32::{NamedMutex, OwnedMutexGuard};
+    use gate_win32::NamedMutex;
 
-    use super::{held, lock_of};
+    use super::{Folder, Locked, held, lock_of};
     use crate::remote::client::End;
 
     /// The state root of the test `name`'s own, so no other test's lock is its.
@@ -111,6 +165,20 @@ pub(super) mod tests {
         }
         std::fs::create_dir_all(&folder).expect("the folder can be made");
         folder
+    }
+
+    /// The worktree `name` at `root`, with the id the route reads for its folder now.
+    pub(in crate::remote) fn routed<'a>(name: &'a str, root: &'a str) -> Folder<'a> {
+        Folder {
+            name,
+            root,
+            id: crate::route::root_id(root).expect("the folder's id is read"),
+        }
+    }
+
+    /// The name of the lock of the folder at `root`, as the route reads its id now.
+    pub(in crate::remote) fn lock_name(state: &StateRoot, root: &str) -> String {
+        lock_of(state, root, routed("", root).id).expect("the folder's id is read").lock
     }
 
     /// The lock `lock` held by another run, a thread of its own, until the sender it hands back is sent to; the
@@ -136,14 +204,14 @@ pub(super) mod tests {
         let shared = folder("main-shared");
         let other = folder("main-other");
         let (shared_root, other_root) = (shared.to_string_lossy().into_owned(), other.to_string_lossy().into_owned());
-        let (_, lock) = lock_of(&state, &shared_root).expect("the folder's id is read");
+        let lock = lock_name(&state, &shared_root);
         let (release, holder) = held_elsewhere(&lock);
         let mut said = Vec::new();
 
         // This run's main worktree is the folder the other run carries as a sibling, spelled in upper case.
-        let worktrees = [("app", shared_root.to_uppercase()), ("tools", other_root.clone())];
-        let named: Vec<(&str, &str)> = worktrees.iter().map(|(name, root)| (*name, root.as_str())).collect();
-        let guards = held(&state, &named, Duration::from_secs(3600), None, |line| {
+        let upper = shared_root.to_uppercase();
+        let worktrees = [routed("app", &upper), routed("tools", &other_root)];
+        let guards = held(&state, &worktrees, Duration::from_secs(3600), None, |line| {
             said.push(line);
             // The other run lets go once the wait is said, so the wait ends on its release and not on a clock.
             release.send(()).expect("the other run is still there");
@@ -152,8 +220,9 @@ pub(super) mod tests {
 
         holder.join().expect("the other run ends");
         assert_eq!(said, ["gate: remote waiting for the worktree app: another run holds it"]);
-        let names: Vec<&str> = guards.iter().map(OwnedMutexGuard::name).collect();
+        let names: Vec<&str> = guards.iter().map(Locked::name).collect();
         assert!(names.contains(&lock.as_str()) && names.len() == 2, "{names:?}");
+        drop(guards);
         std::fs::remove_dir_all(&shared).expect("the folder can be removed");
         std::fs::remove_dir_all(&other).expect("the folder can be removed");
     }
@@ -177,9 +246,10 @@ pub(super) mod tests {
         let real_root = real.to_string_lossy().into_owned();
         let link_root = link.to_string_lossy().into_owned();
 
-        let (_, lock) = lock_of(&state, &real_root).expect("the folder's id is read");
-        let (_, through) = lock_of(&state, &link_root).expect("the junction's folder's id is read");
-        let guards = held(&state, &[("app", &real_root), ("app-link", &link_root)], Duration::ZERO, None, |_| {}).expect("the lock is taken");
+        let lock = lock_name(&state, &real_root);
+        let through = lock_name(&state, &link_root);
+        let worktrees = [routed("app", &real_root), routed("app-link", &link_root)];
+        let guards = held(&state, &worktrees, Duration::ZERO, None, |_| {}).expect("the lock is taken");
 
         assert_eq!(through, lock, "the junction names the same folder");
         assert_eq!(guards.len(), 1, "one folder, one lock");
@@ -189,15 +259,39 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn a_worktree_whose_folder_is_not_the_routes_is_refused_before_its_lock() {
+        let state = state("other-id");
+        let shared = folder("other-id");
+        let root = shared.to_string_lossy().into_owned();
+        let mut worktree = routed("app", &root);
+        worktree.id = FolderId {
+            volume: worktree.id.volume ^ 1,
+            ..worktree.id
+        };
+        let mut said = Vec::new();
+
+        let ended = held(&state, &[worktree], Duration::ZERO, None, |line| said.push(line));
+
+        let refused = format!("the worktree {root} is not the folder the route was decided for");
+        assert!(
+            matches!(&ended, Err(End::Failed(why)) if *why == refused),
+            "{:?}",
+            ended.as_ref().map(Vec::len)
+        );
+        assert!(said.is_empty(), "no lock is waited for: {said:?}");
+        std::fs::remove_dir_all(&shared).expect("the folder can be removed");
+    }
+
+    #[test]
     fn a_worktree_lock_wait_ends_at_the_attempts_deadline() {
         let state = state("deadline");
         let shared = folder("deadline");
         let root = shared.to_string_lossy().into_owned();
-        let (_, lock) = lock_of(&state, &root).expect("the folder's id is read");
+        let lock = lock_name(&state, &root);
         let (release, holder) = held_elsewhere(&lock);
         let mut said = Vec::new();
 
-        let ended = held(&state, &[("lib", &root)], Duration::ZERO, None, |line| said.push(line));
+        let ended = held(&state, &[routed("lib", &root)], Duration::ZERO, None, |line| said.push(line));
 
         release.send(()).expect("the other run is still there");
         holder.join().expect("the other run ends");
@@ -207,6 +301,7 @@ pub(super) mod tests {
             ended.as_ref().map(Vec::len)
         );
         assert_eq!(said, ["gate: remote waiting for the worktree lib: another run holds it"]);
+        drop(ended);
         std::fs::remove_dir_all(&shared).expect("the folder can be removed");
     }
 }

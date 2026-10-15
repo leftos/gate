@@ -331,6 +331,7 @@ mod tests {
                 host: "builder".to_owned(),
                 slots: 1,
                 root: root.to_owned(),
+                root_id: id_of(&self.folder("app")),
                 leaf: "app".to_owned(),
                 siblings: names
                     .iter()
