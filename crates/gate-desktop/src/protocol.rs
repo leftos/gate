@@ -12,6 +12,7 @@ use std::ffi::OsString;
 use std::fmt;
 use std::io;
 use std::os::windows::ffi::OsStringExt;
+use std::os::windows::io::BorrowedHandle;
 use std::path::Path;
 use std::time::Instant;
 
@@ -380,38 +381,40 @@ fn take_wide(fields: &mut Map<String, Value>, name: &'static str) -> Result<Vec<
 /// A byte stream frames are read from and written to: the control pipe's client or server end, or a test's own.
 pub trait FramePipe {
     /// Reads into the start of `buf` what has arrived, at least one byte, as [`PipeClient::read`] does, giving up at
-    /// `deadline`.
+    /// `deadline` or when a handle of `wake` is signalled, which must stay signalled once set (a manual-reset event or
+    /// a process handle).
     ///
     /// # Errors
     ///
     /// The system's error when the read fails.
-    fn read(&self, buf: &mut [u8], deadline: Instant) -> io::Result<PipeRead>;
+    fn read(&self, buf: &mut [u8], deadline: Instant, wake: &[BorrowedHandle<'_>]) -> io::Result<PipeRead>;
 
-    /// Writes every byte of `bytes`, as [`PipeClient::write_all`] does, giving up at `deadline`.
+    /// Writes every byte of `bytes`, as [`PipeClient::write_all`] does, giving up at `deadline` or when a handle of
+    /// `wake` is signalled, as for [`FramePipe::read`].
     ///
     /// # Errors
     ///
     /// The system's error when the write fails.
-    fn write_all(&self, bytes: &[u8], deadline: Instant) -> io::Result<PipeWrite>;
+    fn write_all(&self, bytes: &[u8], deadline: Instant, wake: &[BorrowedHandle<'_>]) -> io::Result<PipeWrite>;
 }
 
 impl FramePipe for PipeClient {
-    fn read(&self, buf: &mut [u8], deadline: Instant) -> io::Result<PipeRead> {
-        PipeClient::read(self, buf, deadline, &[])
+    fn read(&self, buf: &mut [u8], deadline: Instant, wake: &[BorrowedHandle<'_>]) -> io::Result<PipeRead> {
+        PipeClient::read(self, buf, deadline, wake)
     }
 
-    fn write_all(&self, bytes: &[u8], deadline: Instant) -> io::Result<PipeWrite> {
-        PipeClient::write_all(self, bytes, deadline, &[])
+    fn write_all(&self, bytes: &[u8], deadline: Instant, wake: &[BorrowedHandle<'_>]) -> io::Result<PipeWrite> {
+        PipeClient::write_all(self, bytes, deadline, wake)
     }
 }
 
 impl FramePipe for PipeServer {
-    fn read(&self, buf: &mut [u8], deadline: Instant) -> io::Result<PipeRead> {
-        PipeServer::read(self, buf, deadline, &[])
+    fn read(&self, buf: &mut [u8], deadline: Instant, wake: &[BorrowedHandle<'_>]) -> io::Result<PipeRead> {
+        PipeServer::read(self, buf, deadline, wake)
     }
 
-    fn write_all(&self, bytes: &[u8], deadline: Instant) -> io::Result<PipeWrite> {
-        PipeServer::write_all(self, bytes, deadline, &[])
+    fn write_all(&self, bytes: &[u8], deadline: Instant, wake: &[BorrowedHandle<'_>]) -> io::Result<PipeWrite> {
+        PipeServer::write_all(self, bytes, deadline, wake)
     }
 }
 
@@ -494,36 +497,38 @@ impl std::error::Error for WriteError {
     }
 }
 
-/// Reads one whole frame from `pipe` and decodes it, the length and the body together under the one `deadline`. A
-/// length above `limit` is refused before anything is allocated: the box reads the helper's messages under
-/// [`HELPER_FRAME_LIMIT`], and the helper reads `Spawn` under [`FRAME_LIMIT`].
+/// Reads one whole frame from `pipe` and decodes it, the length and the body together under the one `deadline`, and
+/// ended as soon as a handle of `wake` is signalled. A length above `limit` is refused before anything is allocated:
+/// the box reads the helper's messages under [`HELPER_FRAME_LIMIT`], and the helper reads `Spawn` under
+/// [`FRAME_LIMIT`].
 ///
 /// # Errors
 ///
-/// A [`ReadError`] saying why no message was read.
-pub fn read_message(pipe: &impl FramePipe, deadline: Instant, limit: u32) -> Result<Message, ReadError> {
+/// A [`ReadError`] saying why no message was read: [`ReadError::Woken`] for a wake handle signalled first, which a
+/// caller tells from [`ReadError::TimedOut`].
+pub fn read_message(pipe: &impl FramePipe, deadline: Instant, limit: u32, wake: &[BorrowedHandle<'_>]) -> Result<Message, ReadError> {
     let mut prefix = [0_u8; 4];
-    read_exact(pipe, &mut prefix, deadline)?;
+    read_exact(pipe, &mut prefix, deadline, wake)?;
     let length = u32::from_le_bytes(prefix);
     if length == 0 {
         return Err(ReadError::Empty);
     }
     let length = usize::try_from(length).ok().filter(|_| length <= limit).ok_or(ReadError::TooLong)?;
     let mut body = vec![0_u8; length];
-    read_exact(pipe, &mut body, deadline)?;
+    read_exact(pipe, &mut body, deadline, wake)?;
     decode(&body).map_err(ReadError::Decode)
 }
 
 /// Fills `buf` from `pipe`, read after read, until `deadline`, which is checked before each read: a peer that keeps
-/// the pipe full is not read past it.
-fn read_exact(pipe: &impl FramePipe, buf: &mut [u8], deadline: Instant) -> Result<(), ReadError> {
+/// the pipe full is not read past it. Each read is ended by a handle of `wake` signalled.
+fn read_exact(pipe: &impl FramePipe, buf: &mut [u8], deadline: Instant, wake: &[BorrowedHandle<'_>]) -> Result<(), ReadError> {
     let mut filled = 0;
     while let Some(rest) = buf.get_mut(filled..).filter(|rest| !rest.is_empty()) {
         if Instant::now() >= deadline {
             return Err(ReadError::TimedOut);
         }
         let room = rest.len();
-        match pipe.read(rest, deadline).map_err(ReadError::Io)? {
+        match pipe.read(rest, deadline, wake).map_err(ReadError::Io)? {
             PipeRead::Read(count) if (1..=room).contains(&count) => filled += count,
             PipeRead::Read(count) => {
                 return Err(ReadError::Io(io::Error::other(format!(
@@ -538,12 +543,14 @@ fn read_exact(pipe: &impl FramePipe, buf: &mut [u8], deadline: Instant) -> Resul
     Ok(())
 }
 
-/// Writes `message` to `pipe` as one frame, in one write under `deadline`.
+/// Writes `message` to `pipe` as one frame, in one write under `deadline`, ended as soon as a handle of `wake` is
+/// signalled.
 ///
 /// # Errors
 ///
-/// A [`WriteError`] saying why the frame was not written whole.
-pub fn write_message(pipe: &impl FramePipe, message: &Message, deadline: Instant) -> Result<(), WriteError> {
+/// A [`WriteError`] saying why the frame was not written whole: [`WriteError::Woken`] for a wake handle signalled
+/// first, which a caller tells from [`WriteError::TimedOut`].
+pub fn write_message(pipe: &impl FramePipe, message: &Message, deadline: Instant, wake: &[BorrowedHandle<'_>]) -> Result<(), WriteError> {
     let body = encode(message);
     if body.len() > FRAME_LIMIT as usize {
         return Err(WriteError::TooLong);
@@ -552,7 +559,7 @@ pub fn write_message(pipe: &impl FramePipe, message: &Message, deadline: Instant
     let mut frame = Vec::with_capacity(body.len() + 4);
     frame.extend_from_slice(&length.to_le_bytes());
     frame.extend_from_slice(&body);
-    match pipe.write_all(&frame, deadline).map_err(WriteError::Io)? {
+    match pipe.write_all(&frame, deadline, wake).map_err(WriteError::Io)? {
         PipeWrite::Written => Ok(()),
         PipeWrite::Closed => Err(WriteError::Closed),
         PipeWrite::TimedOut => Err(WriteError::TimedOut),

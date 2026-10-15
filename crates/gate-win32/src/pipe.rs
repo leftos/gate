@@ -729,8 +729,11 @@ impl PipeClient {
     /// `ERROR_ACCESS_DENIED` when its DACL refuses this process's user, `ERROR_PIPE_BUSY` when another client holds it;
     /// the system's error when its security cannot be read; an error of kind [`io::ErrorKind::PermissionDenied`],
     /// with no system error code, naming what differs when its owner, DACL or label is not the expected one. A refused pipe
-    /// is closed.
+    /// is closed. An error of kind [`io::ErrorKind::InvalidInput`], with no system error code, before anything is opened,
+    /// for a name that is not this machine's pipe: `\\.\pipe\` in any letter case, then one name that is not empty, `.`
+    /// or `..` and holds no `\`, `/` or NUL.
     pub fn open(name: &str, owner_sid: &str) -> io::Result<PipeClient> {
+        check_local_pipe_name(name)?;
         let client = PipeClient::open_unchecked(name)?;
         client.check_security(owner_sid)?;
         Ok(client)
@@ -824,6 +827,25 @@ impl PipeClient {
         }
         check_label(security.sacl)
     }
+}
+
+/// Refuses a name that is not a pipe of this machine's: it must be `\\.\pipe\` (in any letter case) and then one
+/// name, not empty, not `.` or `..`, and holding no `\`, `/` or NUL, since the system's path rules would carry such a
+/// name out of the pipe namespace, to another machine's pipe (`\\host\pipe\…`) or to a file (`\\.\pipe\..\C:\…`).
+fn check_local_pipe_name(name: &str) -> io::Result<()> {
+    const LOCAL: &str = r"\\.\pipe\";
+    let rest = name
+        .get(..LOCAL.len())
+        .filter(|prefix| prefix.eq_ignore_ascii_case(LOCAL))
+        .and_then(|_| name.get(LOCAL.len()..));
+    let local = rest.is_some_and(|rest| !rest.is_empty() && rest != "." && rest != ".." && !rest.contains(['\\', '/', '\0']));
+    if local {
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!("{name:?} is not the name of a pipe of this machine, \\\\.\\pipe\\ and one name"),
+    ))
 }
 
 /// Refuses a pipe whose SACL `sacl` is not the server's: one mandatory label entry, medium, [`LABEL_POLICY`], no flags.
@@ -1059,6 +1081,26 @@ mod tests {
         assert_eq!(written, PipeWrite::Written);
         let after = read_exactly(5, |buf| server.read(buf, Instant::now() + HANG_GUARD, &[]));
         assert_eq!(after, b"after", "the cancelled read took nothing");
+    }
+
+    #[test]
+    fn a_client_open_refuses_a_name_outside_the_local_pipe_namespace() {
+        let names = [
+            r"\\gate-no-such-host\pipe\gate-x",
+            r"\\?\pipe\gate-x",
+            r"\\.\C:\gate-x",
+            "gate-x",
+            r"\\.\pipe\",
+            r"\\.\pipe\..",
+            r"\\.\pipe\..\..\C:\gate-x",
+            r"\\.\pipe\a/b",
+        ];
+        for name in names {
+            let refused = PipeClient::open(name, &own_sid()).err().expect("the name is refused");
+
+            assert_eq!(refused.kind(), std::io::ErrorKind::InvalidInput, "{name}: {refused}");
+            assert_eq!(refused.raw_os_error(), None, "{name} is refused before any open: {refused}");
+        }
     }
 
     #[test]

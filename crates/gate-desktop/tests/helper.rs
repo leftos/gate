@@ -102,7 +102,7 @@ impl Session {
         let waited = server.wait_for_client(guard(), &[helper.as_handle()]).expect("the connect is waited on");
         assert_eq!(waited, ConnectWait::Connected, "the helper connects");
         assert_eq!(server.client_pid().expect("the client is read"), helper.id(), "the client is the helper");
-        let hello = read_message(&server, guard(), HELPER_FRAME_LIMIT).expect("the hello is read");
+        let hello = read_message(&server, guard(), HELPER_FRAME_LIMIT, &[]).expect("the hello is read");
         let (version, desktop, ok) = match hello {
             Message::Hello { version, desktop, ok } => Some((version, desktop, ok)),
             _ => None,
@@ -121,12 +121,12 @@ impl Session {
 
     /// Sends `message` to the helper.
     fn send(&self, message: &Message) {
-        write_message(&self.server, message, guard()).expect("the message is sent");
+        write_message(&self.server, message, guard(), &[]).expect("the message is sent");
     }
 
     /// The helper's next message.
     fn receive(&self) -> Message {
-        read_message(&self.server, guard(), HELPER_FRAME_LIMIT).expect("the helper's message is read")
+        read_message(&self.server, guard(), HELPER_FRAME_LIMIT, &[]).expect("the helper's message is read")
     }
 
     /// The pids of the processes the helper started.
@@ -427,7 +427,7 @@ fn a_launch_that_fails_before_create_process_exits_setup_failed_without_failed()
     session.send(&Message::Spawn(spawn));
 
     assert_eq!(exit_of(&mut session.helper), code(HelperExit::SetupFailed));
-    let after = read_message(&session.server, guard(), HELPER_FRAME_LIMIT).expect_err("nothing follows the spawn");
+    let after = read_message(&session.server, guard(), HELPER_FRAME_LIMIT, &[]).expect_err("nothing follows the spawn");
     assert!(matches!(after, gate_desktop::protocol::ReadError::Closed), "no Failed was sent: {after}");
     assert_eq!(session.children(), Vec::<u32>::new(), "the helper started nothing");
 }
@@ -520,7 +520,7 @@ fn the_helper_runs_only_at_medium_integrity_or_below() {
         let waited = server.wait_for_client(guard(), &[helper.as_handle()]).expect("the connect is waited on");
         assert_eq!(waited, ConnectWait::Connected, "a medium helper goes on to the pipe");
         // Past its hello, the helper waits for `Spawn`, so the drop is read as the pipe closed.
-        let hello = read_message(&server, guard(), HELPER_FRAME_LIMIT).expect("the hello is read");
+        let hello = read_message(&server, guard(), HELPER_FRAME_LIMIT, &[]).expect("the hello is read");
         assert!(matches!(hello, Message::Hello { .. }), "the helper's first message is a hello: {hello:?}");
         drop(server);
         assert_eq!(exit_of(&mut helper), code(HelperExit::BoxGone));

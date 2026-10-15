@@ -6,15 +6,16 @@
 use std::io;
 use std::mem::ManuallyDrop;
 use std::os::windows::ffi::OsStringExt;
-use std::os::windows::io::{AsHandle, AsRawHandle, BorrowedHandle, FromRawHandle};
+use std::os::windows::io::{AsRawHandle, BorrowedHandle, FromRawHandle};
 use std::path::PathBuf;
 use std::time::Duration;
 
 use jiff::Timestamp;
 use proc_table::win32::OwnedHandle;
+use windows_sys::Wdk::Foundation::{NtQueryObject, ObjectBasicInformation};
 use windows_sys::Win32::Foundation::{
-    CompareObjectHandles, DUPLICATE_CLOSE_SOURCE, DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_ACCESS_DENIED, ERROR_INSUFFICIENT_BUFFER,
-    ERROR_INVALID_PARAMETER, GetHandleInformation, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    CompareObjectHandles, DUPLICATE_CLOSE_SOURCE, DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_INSUFFICIENT_BUFFER, GetHandleInformation, HANDLE,
+    RtlNtStatusToDosError, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::TOKEN_QUERY;
 use windows_sys::Win32::Storage::FileSystem::{FILE_TYPE_PIPE, FileNameInfo, GetFileInformationByHandleEx, GetFileType};
@@ -22,9 +23,10 @@ use windows_sys::Win32::System::Pipes::{GetNamedPipeInfo, PIPE_SERVER_END};
 use windows_sys::Win32::System::RemoteDesktop::ProcessIdToSessionId;
 use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, GetProcessId, GetProcessIdOfThread, OpenProcess, OpenProcessToken, PROCESS_DUP_HANDLE, PROCESS_NAME_WIN32,
-    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, QueryFullProcessImageNameW, ResumeThread, SuspendThread,
-    TerminateProcess, WaitForSingleObject,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, QueryFullProcessImageNameW, ResumeThread, SuspendThread, TerminateProcess,
+    WaitForSingleObject,
 };
+use windows_sys::Win32::System::WindowsProgramming::PUBLIC_OBJECT_BASIC_INFORMATION;
 
 use crate::{own_handle, start_of, wait_millis};
 
@@ -235,92 +237,9 @@ pub fn same_object(first: BorrowedHandle<'_>, second: BorrowedHandle<'_>) -> boo
     unsafe { CompareObjectHandles(first.as_raw_handle(), second.as_raw_handle()) != 0 }
 }
 
-/// The process `pid`, opened to end it and wait for its end (`PROCESS_TERMINATE`, `PROCESS_QUERY_LIMITED_INFORMATION`
-/// and `SYNCHRONIZE`), when it is the child of `parent` created at `created`: its parent pid, as its own record holds
-/// it ([`parent_pid_of`]), is `parent`, and its creation time, as [`creation_time_of`] reads it, is `created`. A pid
-/// reused since that child was made names a process created later, so it never passes. `None` when no process has the
-/// pid, or when the one that has it is another, whose handle is closed and which is left alone. A process that cannot
-/// be opened to end it (`ERROR_ACCESS_DENIED`: another process holds the pid, or a process of the same user denied
-/// this one `PROCESS_TERMINATE` on the child) is looked at again with `PROCESS_QUERY_LIMITED_INFORMATION` alone: `None`
-/// when it is another, or the child and ended; an error when it is the child and still runs.
-///
-/// It proves only who a pid is, never whether another process (the box) has taken that child: the helper ends its
-/// child only when its control pipe reads closed or fails before `DONE`, since the box may have taken the child.
-///
-/// # Errors
-///
-/// The system's error when the process cannot be opened, for any reason but there being no process of that pid or
-/// access being denied, or when its parent or creation time cannot be read. When access to end it is denied: an error
-/// of kind [`io::ErrorKind::PermissionDenied`] when it is the child and still runs, and the system's error when it
-/// cannot be looked at, or its parent, creation time or exit code cannot be read.
-pub fn process_of_child(pid: u32, parent: u32, created: Timestamp) -> io::Result<Option<std::os::windows::io::OwnedHandle>> {
-    find_child(pid, parent, created, || {
-        let access = PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE;
-        // SAFETY: `OpenProcess` takes no pointers.
-        let opened = unsafe { OpenProcess(access, 0, pid) };
-        if opened.is_null() {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: a success is a fresh handle nothing else owns.
-        Ok(unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(opened) })
-    })
-}
-
-/// [`process_of_child`] with the open to end the process `pid` given as `open_to_end`.
-fn find_child(
-    pid: u32,
-    parent: u32,
-    created: Timestamp,
-    open_to_end: impl FnOnce() -> io::Result<std::os::windows::io::OwnedHandle>,
-) -> io::Result<Option<std::os::windows::io::OwnedHandle>> {
-    match open_to_end() {
-        Ok(process) => Ok(is_child_of(process.as_handle(), parent, created)?.then_some(process)),
-        // `OpenProcess` reports a pid no process has as `ERROR_INVALID_PARAMETER`.
-        Err(error) if crate::tree::is_error(&error, ERROR_INVALID_PARAMETER) => Ok(None),
-        Err(error) if crate::tree::is_error(&error, ERROR_ACCESS_DENIED) => refused_child(pid, parent, created, &error).map(|()| None),
-        Err(error) => Err(error),
-    }
-}
-
-/// What a refused open to end the process `pid` says, looked at again with `PROCESS_QUERY_LIMITED_INFORMATION` alone:
-/// `Ok` when no process has the pid now, when the one that has it is not the child of `parent` created at `created`,
-/// or when that child has ended; an error of the kind of `denied` when it is the child and still runs.
-///
-/// # Errors
-///
-/// As above, and the system's error when the process cannot be looked at, or its parent, creation time or exit code
-/// cannot be read: a process that cannot be told apart from the child is never taken for ended.
-fn refused_child(pid: u32, parent: u32, created: Timestamp, denied: &io::Error) -> io::Result<()> {
-    // SAFETY: `OpenProcess` takes no pointers; `own_handle` refuses a null result with the system's error, read first.
-    let process = match unsafe { own_handle(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid)) } {
-        Ok(process) => process,
-        Err(error) if crate::tree::is_error(&error, ERROR_INVALID_PARAMETER) => return Ok(()),
-        Err(error) => {
-            return Err(io::Error::new(
-                error.kind(),
-                format!("process {pid} could not be opened to end it ({denied}) nor to look at it: {error}"),
-            ));
-        }
-    };
-    // SAFETY: the guard keeps the handle open for as long as the borrow lives.
-    let borrowed = unsafe { BorrowedHandle::borrow_raw(process.raw()) };
-    if !is_child_of(borrowed, parent, created)? || crate::exit_code_says_exited(&process)? {
-        return Ok(());
-    }
-    Err(io::Error::new(
-        denied.kind(),
-        format!("the child {pid} still runs, and this process may not open it to end it: {denied}"),
-    ))
-}
-
-/// Whether the process behind `process` is the child of `parent` created at `created`.
-fn is_child_of(process: BorrowedHandle<'_>, parent: u32, created: Timestamp) -> io::Result<bool> {
-    Ok(parent_pid_of(process)? == parent && creation_time_of(process)? == created)
-}
-
 /// Ends the process behind `process` with `exit_code` (`TerminateProcess`), then waits at most `bound` for its end:
 /// true once it has ended, false when it still had not by then. A process that had ended already is no error. It needs
-/// `PROCESS_TERMINATE` and `SYNCHRONIZE` access, as [`process_of_child`] opens a process with.
+/// `PROCESS_TERMINATE` and `SYNCHRONIZE` access, as the handle `CreateProcessW` returns has.
 ///
 /// # Errors
 ///
@@ -335,6 +254,34 @@ pub fn end_process(process: BorrowedHandle<'_>, exit_code: u32, bound: Duration)
         WAIT_TIMEOUT => refused.map_or(Ok(false), Err),
         _ => Err(io::Error::last_os_error()),
     }
+}
+
+/// The access rights `handle` was granted when it was opened or copied (`NtQueryObject` with
+/// `ObjectBasicInformation`).
+///
+/// # Errors
+///
+/// The system's error, from the call's status, when the rights cannot be read.
+pub(crate) fn granted_access(handle: BorrowedHandle<'_>) -> io::Result<u32> {
+    let mut info = PUBLIC_OBJECT_BASIC_INFORMATION::default();
+    let size = u32::try_from(size_of::<PUBLIC_OBJECT_BASIC_INFORMATION>()).map_err(io::Error::other)?;
+    // SAFETY: the handle is borrowed open for the whole call, `info` is writable for `size` bytes, and the return
+    // length, which is optional, is not asked for.
+    let status = unsafe {
+        NtQueryObject(
+            handle.as_raw_handle(),
+            ObjectBasicInformation,
+            (&raw mut info).cast(),
+            size,
+            std::ptr::null_mut(),
+        )
+    };
+    if status < 0 {
+        // SAFETY: the call reads nothing but the status it is given.
+        let code = unsafe { RtlNtStatusToDosError(status) };
+        return Err(io::Error::from_raw_os_error(code.cast_signed()));
+    }
+    Ok(info.GrantedAccess)
 }
 
 /// The id of the process behind `process` (`GetProcessId`), which needs `PROCESS_QUERY_LIMITED_INFORMATION` access.
@@ -478,20 +425,20 @@ mod tests {
     use std::io;
     use std::os::windows::io::{AsHandle, AsRawHandle, BorrowedHandle, FromRawHandle};
     use std::sync::{MutexGuard, PoisonError};
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
-    use windows_sys::Win32::Foundation::{
-        CompareObjectHandles, ERROR_ACCESS_DENIED, ERROR_INVALID_HANDLE, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
-    };
+    use windows_sys::Win32::Foundation::DuplicateHandle;
+    use windows_sys::Win32::Foundation::{CompareObjectHandles, ERROR_INVALID_HANDLE, HANDLE, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::Storage::FileSystem::{CreateFileW, FILE_GENERIC_READ, FILE_GENERIC_WRITE, OPEN_EXISTING, PIPE_ACCESS_DUPLEX};
     use windows_sys::Win32::System::Pipes::{CreateNamedPipeW, CreatePipe, PIPE_TYPE_BYTE};
     use windows_sys::Win32::System::Threading::{
-        CreateEventW, GetCurrentProcess, OpenProcess, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, ResumeThread, SuspendThread, WaitForSingleObject,
+        CreateEventW, GetCurrentProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, ResumeThread,
+        SuspendThread, THREAD_QUERY_LIMITED_INFORMATION,
     };
 
     use super::{
-        RemoteProcess, check_received_output, creation_time_of, end_process, find_child, image_path_of, is_handle_value, parent_pid_of,
-        pid_of_process, pid_of_thread, process_of_child, session_of, thread_is_suspended, user_of,
+        RemoteProcess, check_received_output, creation_time_of, end_process, image_path_of, is_handle_value, parent_pid_of, pid_of_process,
+        pid_of_thread, session_of, thread_is_suspended, user_of,
     };
     use crate::{EnvironmentBlock, Job, Launch, LaunchError, LaunchOutput, StoppableProcess, Suspended, system_directory};
 
@@ -753,6 +700,51 @@ mod tests {
         drop(Suspended::adopt(other_process.process, refused.thread, second_pid).expect("the second child is adopted"));
     }
 
+    /// A copy of `handle` with `access` alone.
+    fn narrowed(handle: BorrowedHandle<'_>, access: u32) -> std::os::windows::io::OwnedHandle {
+        let mut copy: HANDLE = std::ptr::null_mut();
+        // SAFETY: this process's pseudo-handle is always open, `handle` is borrowed open for the whole call, and `copy`
+        // is writable.
+        let copied = unsafe {
+            DuplicateHandle(
+                GetCurrentProcess(),
+                handle.as_raw_handle(),
+                GetCurrentProcess(),
+                &raw mut copy,
+                access,
+                0,
+                0,
+            )
+        };
+        assert_ne!(copied, 0, "the handle is copied: {}", io::Error::last_os_error());
+        // SAFETY: a success is a fresh handle nothing else owns.
+        unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(copy) }
+    }
+
+    #[test]
+    fn adopt_refuses_a_handle_without_the_access_it_needs() {
+        let _alone = one_at_a_time();
+        let child = suspended("exit 0");
+        let pid = child.pid();
+        let (process, thread) = handles_of(child);
+        let query_process = narrowed(process.as_handle(), PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE);
+        let query_thread = narrowed(thread.as_handle(), THREAD_QUERY_LIMITED_INFORMATION);
+
+        let no_terminate = Suspended::adopt(query_process, thread, pid)
+            .err()
+            .expect("a process handle that cannot end the process is refused");
+        let no_resume = Suspended::adopt(process, query_thread, pid)
+            .err()
+            .expect("a thread handle that cannot resume the thread is refused");
+
+        assert_eq!(no_terminate.why.kind(), io::ErrorKind::InvalidInput, "{no_terminate}");
+        assert!(no_terminate.why.to_string().contains("process handle"), "{no_terminate}");
+        assert_eq!(no_resume.why.kind(), io::ErrorKind::InvalidInput, "{no_resume}");
+        assert!(no_resume.why.to_string().contains("thread handle"), "{no_resume}");
+        // The full handles are adopted as they are, so dropping them ends the child.
+        drop(Suspended::adopt(no_resume.process, no_terminate.thread, pid).expect("the child is adopted with full handles"));
+    }
+
     #[test]
     fn a_refused_adopt_gives_back_its_handles_and_ends_nothing() {
         let _alone = one_at_a_time();
@@ -939,90 +931,6 @@ mod tests {
             "the terminate went through before the wait failed"
         );
         drop(child);
-    }
-
-    /// An open to end a process refused as a process of the same user that denied this one would refuse it.
-    fn denied() -> io::Result<std::os::windows::io::OwnedHandle> {
-        Err(io::Error::from_raw_os_error(ERROR_ACCESS_DENIED.cast_signed()))
-    }
-
-    #[test]
-    fn a_child_that_cannot_be_opened_to_end_it_is_not_taken_for_ended() {
-        let _alone = one_at_a_time();
-        let child = suspended("exit 0");
-        let pid = child.pid();
-        let created = creation_time_of(borrow(child.process.as_ref().expect("the process is held"))).expect("the start is read");
-        let watch = StoppableProcess::open(pid).expect("the child opens").expect("the child exists");
-
-        let alive = find_child(pid, std::process::id(), created, denied).expect_err("a live child that cannot be opened is not ended");
-        let other = find_child(pid, std::process::id() + 4, created, denied).expect("another process is looked at");
-        drop(child);
-        assert!(watch.wait(HANG_GUARD).expect("the wait succeeds"), "the child ended");
-        // `watch` keeps the ended child's object, so its pid still names it.
-        let ended = find_child(pid, std::process::id(), created, denied).expect("the ended child is looked at");
-
-        assert_eq!(alive.kind(), io::ErrorKind::PermissionDenied, "{alive}");
-        assert!(other.is_none(), "a process that is not the child is no child to end");
-        assert!(ended.is_none(), "a child that has ended is known ended");
-        drop(watch);
-    }
-
-    #[test]
-    fn process_of_child_returns_no_process_for_a_pid_no_process_has_or_one_it_cannot_open() {
-        // SAFETY: this process's pseudo-handle is always open.
-        let this_process = unsafe { BorrowedHandle::borrow_raw(GetCurrentProcess()) };
-        let created = creation_time_of(this_process).expect("this process's start is read");
-
-        // `OpenProcess` refuses pid 0, the idle process, with `ERROR_INVALID_PARAMETER`. Pid 4, System, a test
-        // without the debug privilege cannot open to end (`ERROR_ACCESS_DENIED`), and it is never this process's child:
-        // it is found another where it can be looked at, and an error where it cannot be told from the child.
-        let idle = process_of_child(0, std::process::id(), created).expect("pid 0 is looked up");
-        let system = process_of_child(4, std::process::id(), created);
-
-        assert!(idle.is_none(), "no process of pid 0 is returned");
-        assert!(matches!(system, Ok(None) | Err(_)), "the System process is not returned: {system:?}");
-    }
-
-    #[test]
-    fn process_of_child_returns_none_for_a_child_that_has_ended() {
-        let _alone = one_at_a_time();
-        let child = suspended("exit 0");
-        let pid = child.pid();
-        let created = creation_time_of(borrow(child.process.as_ref().expect("the process is held"))).expect("the start is read");
-        let watch = StoppableProcess::open(pid).expect("the child opens").expect("the child exists");
-        drop(child);
-        assert!(watch.wait(HANG_GUARD).expect("the wait succeeds"), "the child ended");
-        drop(watch);
-
-        // The system may hold the ended child's object a moment after the last handle here is closed; a process found
-        // meanwhile must be that ended child, never a live one.
-        let guard = Instant::now() + HANG_GUARD;
-        while let Some(found) = process_of_child(pid, std::process::id(), created).expect("the pid is looked up") {
-            // SAFETY: the handle is open with `SYNCHRONIZE` for the whole call.
-            let ended = unsafe { WaitForSingleObject(found.as_raw_handle(), 0) } == WAIT_OBJECT_0;
-            assert!(ended, "a process found by the ended child's pid, parent and time is that ended child");
-            assert!(Instant::now() < guard, "the ended child's object is released");
-            std::thread::sleep(Duration::from_millis(10));
-        }
-    }
-
-    #[test]
-    fn process_of_child_returns_only_a_child_of_the_named_parent_and_time() {
-        let _alone = one_at_a_time();
-        let child = suspended("exit 0");
-        let pid = child.pid();
-        let held = borrow(child.process.as_ref().expect("the process is held"));
-        let created = creation_time_of(held).expect("the start is read");
-        let later = created.checked_add(jiff::SignedDuration::from_micros(1)).expect("the time is in range");
-
-        let found = process_of_child(pid, std::process::id(), created).expect("the child is looked up");
-        let other_parent = process_of_child(pid, std::process::id() + 4, created).expect("the child is looked up");
-        let other_time = process_of_child(pid, std::process::id(), later).expect("the child is looked up");
-
-        let found = found.expect("the child of this process, created then, is found");
-        assert!(same_object(found.as_handle(), held), "the handle found is the child's");
-        assert!(other_parent.is_none(), "a process whose parent is another is not returned");
-        assert!(other_time.is_none(), "a process created at another time is not returned");
     }
 
     #[test]

@@ -106,7 +106,7 @@ fn serve(box_pid: u32, name: &str, limits: Limits) -> Result<HelperExit, HelperE
         process: released.process.addr() as u64,
         thread: released.thread.addr() as u64,
     };
-    match write_message(&pipe, &report, Instant::now() + limits.message) {
+    match write_message(&pipe, &report, Instant::now() + limits.message, &[]) {
         Ok(()) => Ok(await_done(&pipe, &released, limits)),
         Err(WriteError::Closed) => Err(box_gone(&released, limits.message)),
         Err(WriteError::Io(error)) if is_pipe_gone(&error) => Err(box_gone(&released, limits.message)),
@@ -162,7 +162,7 @@ fn hello() -> Message {
 
 /// Writes `message` within `limit`, before any child exists; a failure ends the run as [`send_exit`] says.
 fn send(pipe: &PipeClient, message: &Message, limit: Duration) -> Result<(), HelperExit> {
-    write_message(pipe, message, Instant::now() + limit).map_err(send_exit)
+    write_message(pipe, message, Instant::now() + limit, &[]).map_err(send_exit)
 }
 
 /// The exit for a write that failed before any child exists: the box gone when the pipe is closed or disconnected,
@@ -177,7 +177,7 @@ fn send_exit(error: WriteError) -> HelperExit {
 
 /// The box's `Spawn`, read within `limit`.
 fn receive_spawn(pipe: &PipeClient, limit: Duration) -> Result<Spawn, HelperExit> {
-    match read_message(pipe, Instant::now() + limit, FRAME_LIMIT) {
+    match read_message(pipe, Instant::now() + limit, FRAME_LIMIT, &[]) {
         Ok(Message::Spawn(spawn)) => Ok(spawn),
         Ok(_) | Err(ReadError::Empty | ReadError::TooLong | ReadError::Decode(_)) => Err(HelperExit::BadSpawn),
         Err(ReadError::Closed) => Err(HelperExit::BoxGone),
@@ -244,7 +244,7 @@ fn received_output<'a>(value: u64, control: BorrowedHandle<'_>) -> Result<Borrow
 /// an error that says its other end is gone: nothing will resume the child. On a deadline passed, any other error, or
 /// anything else read, it is left as it is, since the box may have taken it.
 fn await_done(pipe: &PipeClient, released: &Released, limits: Limits) -> HelperExit {
-    match read_message(pipe, Instant::now() + limits.done, FRAME_LIMIT) {
+    match read_message(pipe, Instant::now() + limits.done, FRAME_LIMIT, &[]) {
         Ok(Message::Done) => HelperExit::Done,
         Err(ReadError::Closed) => box_gone(released, limits.message),
         Err(ReadError::Io(error)) if is_pipe_gone(&error) => box_gone(released, limits.message),
@@ -269,16 +269,14 @@ fn box_gone(released: &Released, bound: Duration) -> HelperExit {
     }
 }
 
-/// Ends the child this helper created and released, found again by its pid, this process as its parent and its
-/// creation time, and waits up to `bound` for its end. True when it is known ended: no process of that pid, parent
-/// and time is left (it ended already), or it ended within `bound`; false when it could not be opened (a live child
-/// that refuses the open to end it included), ended or waited on, or still ran.
+/// Ends the child this helper created and released, through the copy of its process handle the release kept, which
+/// the box's take of the handed-on handle never closes, and waits up to `bound` for its end. True when it is known
+/// ended: it had ended already, or it ended within `bound`; false when it could not be ended or waited on, or still ran.
 fn end_child(released: &Released, bound: Duration) -> bool {
-    match gate_win32::process_of_child(released.pid, std::process::id(), released.created) {
-        Ok(None) => true,
-        Ok(Some(process)) => matches!(gate_win32::end_process(process.as_handle(), ENDED_UNSTARTED, bound), Ok(true)),
-        Err(_) => false,
-    }
+    matches!(
+        gate_win32::end_process(released.kept_process.as_handle(), ENDED_UNSTARTED, bound),
+        Ok(true)
+    )
 }
 
 #[cfg(test)]
@@ -291,9 +289,49 @@ mod tests {
         SECURITY_MANDATORY_SYSTEM_RID,
     };
 
-    use super::{integrity_refused, send_exit};
+    use std::os::windows::io::{FromRawHandle, OwnedHandle};
+    use std::time::Duration;
+
+    use gate_win32::{EnvironmentBlock, Launch, LaunchOutput, StoppableProcess};
+
+    use super::{ENDED_UNSTARTED, end_child, integrity_refused, send_exit};
     use crate::HelperExit;
     use crate::protocol::WriteError;
+
+    /// The longest the test waits for the child to end: it never runs out unless the code is broken.
+    const HANG_GUARD: Duration = Duration::from_secs(600);
+
+    #[test]
+    #[expect(clippy::expect_used, reason = "a test whose child cannot be made must fail loudly")]
+    fn a_child_is_ended_through_the_kept_handle_after_the_box_took_the_handed_one() {
+        let system = gate_win32::system_directory().expect("the system folder is read");
+        let child = Launch {
+            application: system.join("cmd.exe"),
+            command_line: "cmd /d /c exit 0".encode_utf16().collect(),
+            directory: system,
+            environment: EnvironmentBlock::new(std::env::vars_os()).expect("the block is built"),
+            output: LaunchOutput::Piped,
+            priority: None,
+        }
+        .start_suspended()
+        .expect("the command is created");
+        let watch = StoppableProcess::open(child.pid()).expect("the child opens").expect("the child exists");
+        let released = child.release().expect("the child is released");
+        // The box takes the handed-on handles with `DUPLICATE_CLOSE_SOURCE`, which closes them here.
+        // SAFETY: `release` gave up both handles, open, and nothing else owns them.
+        drop(unsafe {
+            (
+                OwnedHandle::from_raw_handle(released.process),
+                OwnedHandle::from_raw_handle(released.thread),
+            )
+        });
+
+        let ended = end_child(&released, HANG_GUARD);
+
+        assert!(ended, "the child is known ended");
+        assert!(watch.wait(HANG_GUARD).expect("the wait succeeds"), "the child ended");
+        assert_eq!(watch.exit_code().expect("the exit code is read"), ENDED_UNSTARTED, "ended by the helper");
+    }
 
     #[test]
     fn only_a_token_not_elevated_and_at_medium_or_below_is_taken() {

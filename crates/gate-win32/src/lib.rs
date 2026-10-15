@@ -6,7 +6,9 @@
 //! ([`file_id`]), whether two open files are one, whether an open file is on a network volume ([`on_network_volume`]),
 //! and the Windows message of an error code. And what a run on the interactive desktop needs: a named pipe for one
 //! user's local client, handles copied into and out of another process and the checks on a process taken that way, a
-//! command created on the interactive desktop, and the console session's state. It holds no policy but one: a
+//! command created on the interactive desktop, the console session's state, and a registered scheduled task started in
+//! a given session once its definition is checked ([`run_task`]). It holds no policy but two: [`run_task`] starts only
+//! a task defined as the desktop helper's must be, and a
 //! [`DesktopLaunch`] always creates its command in the normal priority class on `WinSta0\Default`. The names, the
 //! waits, the environment and priority of any other command, and what an abandoned mutex means to the gate are the
 //! caller's. Windows only; elsewhere the crate is empty.
@@ -28,13 +30,14 @@ mod pipe;
 mod piped;
 mod priority;
 mod session;
+mod task;
 mod times;
 mod token;
 mod tree;
 
 pub use adopt::{
     RemoteProcess, check_received_output, creation_time_of, end_process, image_path_of, is_handle_value, parent_pid_of, pid_of_process,
-    pid_of_thread, process_of_child, same_object, session_of, thread_is_suspended, user_of,
+    pid_of_thread, same_object, session_of, thread_is_suspended, user_of,
 };
 pub use console::{Donor, Utf8Console};
 pub use create::spawn;
@@ -49,8 +52,9 @@ pub use launch::{
 pub use memory::working_set;
 pub use mutex::{AcquireError, MutexGuard, NamedMutex, OwnedMutexGuard, mutex_exists};
 pub use pipe::{ConnectWait, PipeClient, PipeRead, PipeServer, PipeWrite};
-pub use piped::{DesktopLaunch, PipedConsole, PipedFed, PipedLaunch, PipedSuspended, breakaway_refused};
+pub use piped::{DesktopLaunch, OutputPipes, PipedConsole, PipedFed, PipedLaunch, PipedSuspended, breakaway_refused, output_pipes};
 pub use session::{ConnectState, LockState, SessionState, active_console_session, input_desktop_name, session_state};
+pub use task::{StartedTask, TaskError, run_task};
 pub use times::{ProcessTimes, SystemTimes, file_time_now, process_times, system_times, wsl_vm_cpu};
 pub use token::{Grant, NetworkGroup, RestrictedToken, TokenFacts, current_user_sid, token_facts};
 

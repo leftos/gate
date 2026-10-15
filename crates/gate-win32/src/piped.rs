@@ -294,6 +294,51 @@ pub(crate) fn pipe_from_child(stream: &str) -> Result<(File, OwnedHandle), Launc
     Ok((reader, writer))
 }
 
+/// The two anonymous pipes a command's stdout and stderr go into when another process creates it with them, as the
+/// desktop helper does: the read ends, as files this process reads, and the write ends, for the other process to be
+/// given. No end is inheritable.
+#[derive(Debug)]
+pub struct OutputPipes {
+    /// The stdout pipe's read end.
+    pub stdout_read: File,
+    /// The stdout pipe's write end.
+    pub stdout_write: std::os::windows::io::OwnedHandle,
+    /// The stderr pipe's read end.
+    pub stderr_read: File,
+    /// The stderr pipe's write end.
+    pub stderr_write: std::os::windows::io::OwnedHandle,
+}
+
+/// Two new anonymous pipes, one for a command's stdout and one for its stderr, as [`OutputPipes`] holds them.
+///
+/// # Errors
+///
+/// [`LaunchError::Setup`] naming the pipe that could not be made, with the system's error.
+pub fn output_pipes() -> Result<OutputPipes, LaunchError> {
+    let (stdout_read, stdout_write) = output_pipe("stdout")?;
+    let (stderr_read, stderr_write) = output_pipe("stderr")?;
+    Ok(OutputPipes {
+        stdout_read,
+        stdout_write,
+        stderr_read,
+        stderr_write,
+    })
+}
+
+/// A new pipe for the `stream` of a command another process creates, neither end inheritable: the read end, as a file
+/// this process reads, and the write end.
+fn output_pipe(stream: &str) -> Result<(File, std::os::windows::io::OwnedHandle), LaunchError> {
+    let (read, write) = new_pipe(&format!("create the {stream} pipe"))?;
+    // SAFETY: a success returns two fresh handles nothing else owns; each gets exactly one owner here.
+    let ends = unsafe {
+        (
+            File::from(std::os::windows::io::OwnedHandle::from_raw_handle(read)),
+            std::os::windows::io::OwnedHandle::from_raw_handle(write),
+        )
+    };
+    Ok(ends)
+}
+
 /// A new pipe the command reads its `stream` from, neither end inheritable: the read end, for the command, and the
 /// write end, as a file this process writes.
 pub(crate) fn pipe_to_child(stream: &str) -> Result<(OwnedHandle, File), LaunchError> {
@@ -317,4 +362,46 @@ fn new_pipe(operation: &str) -> Result<(HANDLE, HANDLE), LaunchError> {
         return Err(setup(io::Error::last_os_error(), operation));
     }
     Ok((read, write))
+}
+
+#[cfg(test)]
+#[expect(clippy::expect_used, reason = "a test whose pipe cannot be made must fail loudly")]
+mod tests {
+    use std::fs::File;
+    use std::io::{Read, Write};
+    use std::os::windows::io::{AsHandle, AsRawHandle, BorrowedHandle};
+
+    use windows_sys::Win32::Foundation::{GetHandleInformation, HANDLE_FLAG_INHERIT};
+
+    use super::output_pipes;
+
+    /// Whether `handle` is inheritable.
+    fn inheritable(handle: BorrowedHandle<'_>) -> bool {
+        let mut flags = 0;
+        // SAFETY: the handle is borrowed open for the whole call and `flags` is writable.
+        let read = unsafe { GetHandleInformation(handle.as_raw_handle(), &raw mut flags) };
+        assert_ne!(read, 0, "the handle's flags are read: {}", std::io::Error::last_os_error());
+        flags & HANDLE_FLAG_INHERIT != 0
+    }
+
+    #[test]
+    fn output_pipes_carry_what_is_written_to_each_write_end_to_its_read_end_and_none_is_inheritable() {
+        let mut pipes = output_pipes().expect("the pipes are made");
+        for handle in [
+            pipes.stdout_read.as_handle(),
+            pipes.stdout_write.as_handle(),
+            pipes.stderr_read.as_handle(),
+            pipes.stderr_write.as_handle(),
+        ] {
+            assert!(!inheritable(handle), "no end is inheritable");
+        }
+
+        File::from(pipes.stdout_write).write_all(b"out").expect("stdout is written");
+        File::from(pipes.stderr_write).write_all(b"err").expect("stderr is written");
+
+        let (mut out, mut err) = (String::new(), String::new());
+        pipes.stdout_read.read_to_string(&mut out).expect("stdout is read to its end");
+        pipes.stderr_read.read_to_string(&mut err).expect("stderr is read to its end");
+        assert_eq!((out.as_str(), err.as_str()), ("out", "err"), "each pipe carries its own stream");
+    }
 }

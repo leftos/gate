@@ -24,8 +24,9 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 use windows_sys::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE};
 use windows_sys::Win32::System::Threading::{
-    BELOW_NORMAL_PRIORITY_CLASS, GetCurrentProcess, GetExitCodeProcess, HIGH_PRIORITY_CLASS, OpenProcess, PROCESS_CREATION_FLAGS, PROCESS_TERMINATE,
-    ResumeThread, TerminateProcess, WaitForSingleObject,
+    BELOW_NORMAL_PRIORITY_CLASS, GetCurrentProcess, GetExitCodeProcess, HIGH_PRIORITY_CLASS, OpenProcess, PROCESS_CREATION_FLAGS,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_QUOTA, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, ResumeThread, THREAD_QUERY_LIMITED_INFORMATION,
+    THREAD_SUSPEND_RESUME, TerminateProcess, WaitForSingleObject,
 };
 use windows_sys::Win32::System::WindowsProgramming::PROCESS_CREATION_DESKTOP_APP_BREAKAWAY_DISABLE_PROCESS_TREE;
 
@@ -94,26 +95,37 @@ impl EnvironmentBlock {
     /// `=` after its first character, so no entry is empty and none ends the block early, and each entry's name (the
     /// part before that `=`) sorts strictly after the one before it, as Windows orders names, ordinally without regard
     /// to case, so no name is there twice in any letter case. An entry that starts with `=`, as `=C:=C:\` does, is
-    /// kept. This is the only way to build a block from bytes another process sent.
+    /// kept. The block of no entries, two NULs alone, is the one [`EnvironmentBlock::new`] makes for an empty list, so
+    /// every block `new` makes passes. This is the only way to build a block from bytes another process sent.
     ///
     /// # Errors
     ///
-    /// An error of kind [`io::ErrorKind::InvalidInput`] naming why, by entry position alone, for a block that is empty
-    /// or holds no entry, does not end in two NULs, holds an empty entry or an entry with no `=` after its first
-    /// character before its end, or holds a name again or out of order.
+    /// An error of kind [`io::ErrorKind::InvalidInput`] naming why, by entry position alone, for a block that holds no
+    /// units, does not end in two NULs, holds an empty entry or an entry with no `=` after its first character before
+    /// its end, or holds a name again or out of order.
     pub fn from_wide(block: Vec<u16>) -> io::Result<EnvironmentBlock> {
         match block_problem(&block) {
             Some(problem) => Err(io::Error::new(io::ErrorKind::InvalidInput, format!("the environment block {problem}"))),
             None => Ok(EnvironmentBlock(block)),
         }
     }
+
+    /// The block as UTF-16 units, its two closing NULs included: what [`EnvironmentBlock::from_wide`] reads back.
+    #[must_use]
+    pub fn as_wide(&self) -> &[u16] {
+        &self.0
+    }
 }
 
 /// What makes `block` a block `CreateProcessW` would not read whole, or `None` when nothing does. An entry is named by
 /// its position alone, since its text may be a secret.
 fn block_problem(block: &[u16]) -> Option<String> {
-    if block.is_empty() || block == [0, 0] {
-        return Some("is empty: it holds no entry".to_owned());
+    if block.is_empty() {
+        return Some("is empty: it holds no units".to_owned());
+    }
+    // The block of no entries, as `new` writes it for an empty list.
+    if block == [0, 0] {
+        return None;
     }
     let Some(entries) = block.strip_suffix(&[0, 0]) else {
         return Some("does not end in two NULs".to_owned());
@@ -516,17 +528,19 @@ pub struct Suspended {
 
 impl Suspended {
     /// Takes a suspended process another process created, from its process handle and the handle of its first thread,
-    /// as [`crate::RemoteProcess::pull`] copies them out, once both are checked to stand for the process `pid`: the
-    /// process's id (`GetProcessId`) and its thread's (`GetProcessIdOfThread`) must both be `pid`. The caller has
-    /// checked the rest it expects. From here it is as a command this crate created: dropped before
-    /// [`Suspended::assign_and_resume`], it is terminated with exit code 1. The process handle needs
-    /// `PROCESS_TERMINATE`, `PROCESS_SET_QUOTA` and query access, and the thread handle `THREAD_SUSPEND_RESUME` and
-    /// `THREAD_QUERY_LIMITED_INFORMATION`, as the handles `CreateProcessW` returns have.
+    /// as [`crate::RemoteProcess::pull`] copies them out, once both are checked to carry the access it needs and to
+    /// stand for the process `pid`: the process's id (`GetProcessId`) and its thread's (`GetProcessIdOfThread`) must
+    /// both be `pid`. The caller has checked the rest it expects. From here it is as a command this crate created:
+    /// dropped before [`Suspended::assign_and_resume`], it is terminated with exit code 1. The process handle needs
+    /// `PROCESS_TERMINATE`, `PROCESS_SET_QUOTA`, `PROCESS_QUERY_LIMITED_INFORMATION` and `SYNCHRONIZE`, and the thread
+    /// handle `THREAD_SUSPEND_RESUME` and `THREAD_QUERY_LIMITED_INFORMATION`, as the handles `CreateProcessW` returns
+    /// have; the access each was granted is read with `NtQueryObject`.
     ///
     /// # Errors
     ///
-    /// An [`AdoptError`] holding both handles, unchanged, when either id cannot be read or is not `pid`: nothing is
-    /// ended, and the caller decides what becomes of the process.
+    /// An [`AdoptError`] holding both handles, unchanged, when either lacks an access it needs, when either id or
+    /// either handle's access cannot be read, or when an id is not `pid`: nothing is ended, and the caller decides what
+    /// becomes of the process. A missing access or a wrong id is of kind [`io::ErrorKind::InvalidInput`].
     pub fn adopt(process: std::os::windows::io::OwnedHandle, thread: std::os::windows::io::OwnedHandle, pid: u32) -> Result<Suspended, AdoptError> {
         use std::os::windows::io::{AsHandle, FromRawHandle, IntoRawHandle};
 
@@ -637,29 +651,31 @@ impl Suspended {
             u32::MAX => io::Error::last_os_error(),
             count => io::Error::other(format!("the command's thread had a suspend count of {count}, not 1")),
         };
-        end_unstarted(&process);
-        Err(setup(error, "resume the command"))
+        let ended = end_unstarted(&process);
+        Err(setup(with_end(error, ended), "resume the command"))
     }
 
-    /// Gives up the command without ending it or closing its process and thread handles, and returns its pid, the raw
-    /// values of those two handles and its creation time, read from the process handle first, for a process that hands
-    /// them to another: the desktop helper, whose copies the box takes with `DUPLICATE_CLOSE_SOURCE`. The command stays
-    /// suspended. This process's ends of its pipes, when not taken, are closed, as a resume closes them.
+    /// Gives up the command without ending it or closing its process and thread handles, and returns its pid and the
+    /// raw values of those two handles, for a process that hands them to another: the desktop helper, whose copies the
+    /// box takes with `DUPLICATE_CLOSE_SOURCE`. It also returns a copy of the process handle, with the same access and
+    /// never inheritable, which this process keeps: the other process's take does not close it, so it still names the
+    /// command when this process must end it. The command stays suspended. This process's ends of its pipes, when not
+    /// taken, are closed, as a resume closes them.
     ///
-    /// The caller owns both handles from here. Once it has handed them on, it must never use the values again, not even
-    /// to close them: after the other process closes them, they may name other objects of this process.
+    /// The caller owns both raw handles from here. Once it has handed them on, it must never use the values again, not
+    /// even to close them: after the other process closes them, they may name other objects of this process.
     ///
     /// # Errors
     ///
-    /// An error when the process was already taken, which ends nothing; or the system's error when its creation time
-    /// cannot be read, the command then ended with exit code 1, as a drop ends it. Nothing is given up either way.
+    /// An error when the process was already taken, which ends nothing; or the system's error when the process handle
+    /// cannot be copied, the command then ended with exit code 1, as a drop ends it. Nothing is given up either way.
     pub fn release(mut self) -> io::Result<Released> {
         let Some(process) = self.process.take() else {
             return Err(io::Error::other("the process was already taken"));
         };
-        // SAFETY: the process handle is open for the whole call, with the query access a created process's handle has.
-        let created = match unsafe { crate::start_of(process.raw()) } {
-            Ok(created) => created,
+        // SAFETY: the guard keeps the handle open for as long as the borrow lives, which ends in this statement.
+        let kept_process = match unsafe { std::os::windows::io::BorrowedHandle::borrow_raw(process.raw()) }.try_clone_to_owned() {
+            Ok(kept_process) => kept_process,
             Err(error) => {
                 // Held again, so the drop of `self` ends the command.
                 self.process = Some(process);
@@ -674,7 +690,7 @@ impl Suspended {
             pid: released.pid,
             process,
             thread: released.thread.raw(),
-            created,
+            kept_process,
         })
     }
 }
@@ -685,12 +701,13 @@ impl Suspended {
 pub struct Released {
     /// The command's process id.
     pub pid: u32,
-    /// The raw value of the command's process handle, which the caller owns.
+    /// The raw value of the command's process handle, which the caller owns and hands on.
     pub process: RawHandle,
-    /// The raw value of the handle of the command's first thread, which the caller owns.
+    /// The raw value of the handle of the command's first thread, which the caller owns and hands on.
     pub thread: RawHandle,
-    /// When the command's process was created, as [`crate::creation_time_of`] reads it.
-    pub created: jiff::Timestamp,
+    /// A copy of the command's process handle, with the same access, that this process keeps whatever becomes of
+    /// `process`: the handle to end the command through when the process it was handed to never takes it.
+    pub kept_process: std::os::windows::io::OwnedHandle,
 }
 
 /// A refused [`Suspended::adopt`]: the two handles it was given, open and unchanged, and why they were refused.
@@ -720,6 +737,8 @@ impl std::error::Error for AdoptError {
 /// Refuses a process handle and a thread handle that do not both stand for the process `pid`: the process's id
 /// (`GetProcessId`) and the id of the thread's process (`GetProcessIdOfThread`) must both be `pid`.
 fn check_adopted(process: std::os::windows::io::BorrowedHandle<'_>, thread: std::os::windows::io::BorrowedHandle<'_>, pid: u32) -> io::Result<()> {
+    check_access(process, ADOPTED_PROCESS_ACCESS, "process")?;
+    check_access(thread, ADOPTED_THREAD_ACCESS, "thread")?;
     let of_process = crate::pid_of_process(process)?;
     let of_thread = crate::pid_of_thread(thread)?;
     if of_process != pid || of_thread != pid {
@@ -731,28 +750,78 @@ fn check_adopted(process: std::os::windows::io::BorrowedHandle<'_>, thread: std:
     Ok(())
 }
 
+/// The access an adopted process handle needs: to end the process, put it in a job, query it and wait for it.
+const ADOPTED_PROCESS_ACCESS: u32 = PROCESS_TERMINATE | PROCESS_SET_QUOTA | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE;
+
+/// The access an adopted thread handle needs: to resume the thread and read its process's id.
+const ADOPTED_THREAD_ACCESS: u32 = THREAD_SUSPEND_RESUME | THREAD_QUERY_LIMITED_INFORMATION;
+
+/// Refuses the `what` handle `handle` unless it was granted every right of `needed`, as `NtQueryObject` reads them.
+fn check_access(handle: std::os::windows::io::BorrowedHandle<'_>, needed: u32, what: &str) -> io::Result<()> {
+    let missing = needed & !crate::adopt::granted_access(handle)?;
+    if missing != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("the {what} handle lacks the access 0x{missing:x} of the 0x{needed:x} an adopted command needs"),
+        ));
+    }
+    Ok(())
+}
+
 impl Drop for Suspended {
+    #[expect(
+        clippy::print_stderr,
+        reason = "a drop has no caller to give the failure to, and a command left suspended must not go unsaid"
+    )]
     fn drop(&mut self) {
-        if let Some(process) = &self.process {
-            end_unstarted(process);
+        if let Some(process) = &self.process
+            && let Err(error) = end_unstarted(process)
+        {
+            eprintln!("gate: the suspended command {} could not be ended: {error}", self.pid);
         }
     }
 }
 
-/// Ends a command that never ran with exit code 1. Its own failure is not reported: it runs on a path that is already
-/// failing or dropping, which reports its own error; a command it could not end stays suspended, never having run.
-pub(crate) fn end_unstarted(process: &OwnedHandle) {
-    // SAFETY: the process handle is open for the whole call, with the `PROCESS_TERMINATE` access a created process's
-    // handle has.
-    unsafe { TerminateProcess(process.raw(), 1) };
+/// Ends a command that never ran with exit code 1. A command that has ended already is no failure.
+///
+/// # Errors
+///
+/// The system's error, its code kept, when the terminate is refused and the command has not ended: it stays suspended,
+/// never having run.
+pub(crate) fn end_unstarted(process: &OwnedHandle) -> io::Result<()> {
+    // SAFETY: the process handle is open for the whole call; one without `PROCESS_TERMINATE` only makes the call fail.
+    if unsafe { TerminateProcess(process.raw(), 1) } != 0 {
+        return Ok(());
+    }
+    let refused = io::Error::last_os_error();
+    // `TerminateProcess` refuses a process that has ended already, which is ended all the same.
+    match crate::event::signalled(process) {
+        Ok(true) => Ok(()),
+        Ok(false) | Err(_) => Err(refused),
+    }
 }
 
 /// Ends the never-run command `pid` when the handle `CreateProcessW` returned for it could not be owned. The caller
 /// keeps the command's thread handle open meanwhile, so the pid cannot name another process.
-pub(crate) fn end_unstarted_by_id(pid: u32) {
+///
+/// # Errors
+///
+/// The system's error when the command cannot be opened to end it, or as [`end_unstarted`] fails.
+pub(crate) fn end_unstarted_by_id(pid: u32) -> io::Result<()> {
     // SAFETY: `OpenProcess` takes no pointers. A success is a fresh handle nothing else owns.
-    if let Ok(process) = unsafe { own_handle(OpenProcess(PROCESS_TERMINATE, 0, pid)) } {
-        end_unstarted(&process);
+    let process = unsafe { own_handle(OpenProcess(PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, 0, pid)) }?;
+    end_unstarted(&process)
+}
+
+/// `error`, with the failure to end the never-run command, `ended`, added to its text when there was one; its kind is
+/// kept.
+pub(crate) fn with_end(error: io::Error, ended: io::Result<()>) -> io::Error {
+    match ended {
+        Ok(()) => error,
+        Err(end) => io::Error::new(
+            error.kind(),
+            format!("{error}; and the command, created suspended, could not be ended: {end}"),
+        ),
     }
 }
 
@@ -832,7 +901,10 @@ mod tests {
     use std::sync::PoisonError;
     use std::time::Duration;
 
-    use windows_sys::Win32::System::Threading::TerminateProcess;
+    use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, TerminateProcess, WaitForSingleObject,
+    };
 
     use super::{EnvironmentBlock, Launch, LaunchOutput};
     use crate::{StoppableProcess, creation_time_of, pid_of_process, pid_of_thread, system_directory};
@@ -860,9 +932,38 @@ mod tests {
     }
 
     #[test]
-    fn an_environment_block_from_wide_refuses_an_empty_block() {
+    fn an_environment_block_from_wide_refuses_a_block_with_no_units() {
         assert_refused("", "empty");
-        assert_refused("\0\0", "empty");
+    }
+
+    #[test]
+    fn an_environment_block_from_wide_accepts_the_empty_block_new_makes() {
+        let empty = EnvironmentBlock::from_wide(units("\0\0")).expect("the block of no entries is valid");
+
+        assert_eq!(empty.as_wide(), [0, 0], "the block is kept as it is");
+    }
+
+    #[test]
+    fn every_block_new_makes_reads_back_through_from_wide() {
+        let lists: [&[(&str, &str)]; 6] = [
+            &[],
+            &[("A", "1")],
+            &[("=C:", "C:\\")],
+            &[("b", "2"), ("A", "1"), ("a", "3")],
+            &[("Path", "C:\\x;C:\\y"), ("EMPTY", ""), ("é", "ü"), ("Z", "=")],
+            &[("A", "1"), ("A", "2"), ("a", "3")],
+        ];
+        for list in lists {
+            let vars = list.iter().map(|&(name, value)| (name.into(), value.into()));
+            let made = EnvironmentBlock::new(vars).expect("the block is built");
+
+            let read = EnvironmentBlock::from_wide(made.as_wide().to_vec());
+
+            assert!(
+                read.as_ref().is_ok_and(|read| read.as_wide() == made.as_wide()),
+                "the block of {list:?} reads back as it is: {read:?}"
+            );
+        }
     }
 
     #[test]
@@ -928,6 +1029,34 @@ mod tests {
     }
 
     #[test]
+    fn end_unstarted_reports_a_refused_terminate_of_a_live_process_and_takes_an_ended_one() {
+        let _alone = crate::create::tests::ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner);
+        let system = system_directory().expect("the system folder is read");
+        let child = Launch {
+            application: system.join("cmd.exe"),
+            command_line: units("cmd /d /c exit 0"),
+            directory: system,
+            environment: EnvironmentBlock::new(std::env::vars_os()).expect("the block is built"),
+            output: LaunchOutput::Piped,
+            priority: None,
+        }
+        .start_suspended()
+        .expect("the command is created");
+        // SAFETY: `OpenProcess` takes no pointers. A success is a fresh handle nothing else owns.
+        let wait_only = unsafe { crate::own_handle(OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, 0, child.pid())) }
+            .expect("the child opens");
+
+        let refused = super::end_unstarted(&wait_only).expect_err("a handle without PROCESS_TERMINATE cannot end it");
+
+        assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied, "{refused}");
+        drop(child);
+        // SAFETY: the handle is open, with `SYNCHRONIZE`; the wait is bounded.
+        let waited = unsafe { WaitForSingleObject(wait_only.raw(), crate::wait_millis(HANG_GUARD)) };
+        assert_eq!(waited, WAIT_OBJECT_0, "the dropped child ended");
+        super::end_unstarted(&wait_only).expect("a process that has ended already is no failure to end it");
+    }
+
+    #[test]
     fn release_gives_up_the_child_without_ending_it() {
         let _alone = crate::create::tests::ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner);
         let system = system_directory().expect("the system folder is read");
@@ -961,9 +1090,14 @@ mod tests {
             "the thread handle is still open, on the child's thread"
         );
         assert_eq!(
+            pid_of_process(released.kept_process.as_handle()).expect("the kept process handle is read"),
+            released.pid,
+            "the kept handle is the child's"
+        );
+        assert_eq!(
             creation_time_of(process.0.as_handle()).expect("the start is read"),
-            released.created,
-            "the creation time is the child's"
+            creation_time_of(released.kept_process.as_handle()).expect("the kept start is read"),
+            "the kept handle is the child's own, not another process of its pid"
         );
         assert!(
             !watch.wait(Duration::ZERO).expect("the wait succeeds"),

@@ -1,11 +1,12 @@
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::io;
+use std::os::windows::io::BorrowedHandle;
 use std::time::{Duration, Instant};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
-use gate_win32::{PipeRead, PipeWrite};
+use gate_win32::{NamedEvent, PipeClient, PipeRead, PipeServer, PipeWrite};
 
 use super::{
     DecodeError, FRAME_LIMIT, FramePipe, HELLO_TEXT_LIMIT, HELPER_FRAME_LIMIT, Message, ReadError, Spawn, WriteError, decode, encode, read_message,
@@ -42,7 +43,7 @@ impl Memory {
 }
 
 impl FramePipe for Memory {
-    fn read(&self, buf: &mut [u8], deadline: Instant) -> io::Result<PipeRead> {
+    fn read(&self, buf: &mut [u8], deadline: Instant, _wake: &[BorrowedHandle<'_>]) -> io::Result<PipeRead> {
         self.deadlines.borrow_mut().push(deadline);
         let Some(mut chunk) = self.incoming.borrow_mut().pop_front() else {
             return Ok(PipeRead::Closed);
@@ -56,7 +57,7 @@ impl FramePipe for Memory {
         Ok(PipeRead::Read(count))
     }
 
-    fn write_all(&self, bytes: &[u8], _deadline: Instant) -> io::Result<PipeWrite> {
+    fn write_all(&self, bytes: &[u8], _deadline: Instant, _wake: &[BorrowedHandle<'_>]) -> io::Result<PipeWrite> {
         self.written.borrow_mut().extend_from_slice(bytes);
         Ok(PipeWrite::Written)
     }
@@ -145,10 +146,10 @@ fn every_message_round_trips_through_a_frame() {
 
     for message in messages {
         let pipe = Memory::default();
-        write_message(&pipe, &message, far()).expect("the message is written");
+        write_message(&pipe, &message, far(), &[]).expect("the message is written");
         let reader = Memory::of([pipe.written.take()]);
 
-        let read = read_message(&reader, far(), FRAME_LIMIT).expect("the message is read back");
+        let read = read_message(&reader, far(), FRAME_LIMIT, &[]).expect("the message is read back");
 
         assert_eq!(read, message);
     }
@@ -295,19 +296,19 @@ fn a_frame_longer_than_the_limit_is_refused_before_its_body_is_read() {
     let too_long = FRAME_LIMIT + 1;
     let pipe = Memory::of([too_long.to_le_bytes().to_vec(), vec![b'{'; 64]]);
 
-    let refused = read_message(&pipe, far(), FRAME_LIMIT).expect_err("the frame is refused");
+    let refused = read_message(&pipe, far(), FRAME_LIMIT, &[]).expect_err("the frame is refused");
 
     assert!(matches!(refused, ReadError::TooLong), "{refused}");
     assert_eq!(pipe.reads(), 1, "only the length was read");
     let largest = Memory::of([u32::MAX.to_le_bytes().to_vec()]);
-    assert!(matches!(read_message(&largest, far(), FRAME_LIMIT), Err(ReadError::TooLong)));
+    assert!(matches!(read_message(&largest, far(), FRAME_LIMIT, &[]), Err(ReadError::TooLong)));
 }
 
 #[test]
 fn a_helper_frame_longer_than_the_helper_limit_is_refused_before_its_body_is_read() {
     let pipe = Memory::of([(HELPER_FRAME_LIMIT + 1).to_le_bytes().to_vec(), vec![b'{'; 64]]);
 
-    let refused = read_message(&pipe, far(), HELPER_FRAME_LIMIT).expect_err("the frame is refused");
+    let refused = read_message(&pipe, far(), HELPER_FRAME_LIMIT, &[]).expect_err("the frame is refused");
 
     assert!(matches!(refused, ReadError::TooLong), "{refused}");
     assert_eq!(pipe.reads(), 1, "only the length was read");
@@ -317,7 +318,10 @@ fn a_helper_frame_longer_than_the_helper_limit_is_refused_before_its_body_is_rea
         ok: true,
     });
     let small = Memory::of([frame(&hello)]);
-    assert!(read_message(&small, far(), HELPER_FRAME_LIMIT).is_ok(), "a hello fits the helper limit");
+    assert!(
+        read_message(&small, far(), HELPER_FRAME_LIMIT, &[]).is_ok(),
+        "a hello fits the helper limit"
+    );
 }
 
 #[test]
@@ -385,7 +389,7 @@ fn a_spawn_directory_that_is_not_absolute_is_refused() {
 fn a_frame_of_length_zero_is_refused() {
     let pipe = Memory::of([0_u32.to_le_bytes().to_vec()]);
 
-    assert!(matches!(read_message(&pipe, far(), FRAME_LIMIT), Err(ReadError::Empty)));
+    assert!(matches!(read_message(&pipe, far(), FRAME_LIMIT, &[]), Err(ReadError::Empty)));
 }
 
 #[test]
@@ -394,7 +398,7 @@ fn a_frame_split_across_many_reads_is_read_under_one_deadline() {
     let pipe = Memory::of(bytes.iter().map(|&byte| vec![byte]));
     let deadline = far();
 
-    let read = read_message(&pipe, deadline, FRAME_LIMIT).expect("the frame is read");
+    let read = read_message(&pipe, deadline, FRAME_LIMIT, &[]).expect("the frame is read");
 
     assert_eq!(read, Message::Spawn(spawn()));
     assert_eq!(pipe.reads(), bytes.len(), "one read per byte");
@@ -409,17 +413,42 @@ fn a_frame_cut_short_is_closed() {
     let bytes = frame(&encode(&Message::Done));
     let pipe = Memory::of([bytes[..bytes.len() - 1].to_vec()]);
 
-    assert!(matches!(read_message(&pipe, far(), FRAME_LIMIT), Err(ReadError::Closed)));
+    assert!(matches!(read_message(&pipe, far(), FRAME_LIMIT, &[]), Err(ReadError::Closed)));
 }
 
 #[test]
 fn a_deadline_already_passed_reads_nothing() {
     let pipe = Memory::of([frame(&encode(&Message::Done))]);
 
-    let refused = read_message(&pipe, Instant::now(), FRAME_LIMIT).expect_err("the deadline has passed");
+    let refused = read_message(&pipe, Instant::now(), FRAME_LIMIT, &[]).expect_err("the deadline has passed");
 
     assert!(matches!(refused, ReadError::TimedOut), "{refused}");
     assert_eq!(pipe.reads(), 0);
+}
+
+#[test]
+fn a_read_woken_by_a_set_manual_reset_event_returns_at_once_as_woken() {
+    let sid = gate_win32::current_user_sid().expect("the user is read");
+    let server = PipeServer::create("gate-desktop-protocol-test", &sid).expect("the pipe is made");
+    let client = PipeClient::open(server.name(), &sid).expect("the client opens the pipe");
+    let name = format!(r"Local\gate-desktop-protocol-test-{}", std::process::id());
+    let stop = NamedEvent::create_new_manual(&name).expect("the event is made");
+    stop.set().expect("the event is set");
+    let started = Instant::now();
+
+    let woken = read_message(&client, far(), HELPER_FRAME_LIMIT, &[stop.as_handle()]).expect_err("nothing was written");
+
+    assert!(matches!(woken, ReadError::Woken(0)), "{woken}");
+    assert!(
+        started.elapsed() < Duration::from_secs(600),
+        "the read returned on the wake, not at its deadline"
+    );
+    let timed_out = read_message(&client, Instant::now() + Duration::from_millis(1), HELPER_FRAME_LIMIT, &[]).expect_err("nothing was written");
+    assert!(
+        matches!(timed_out, ReadError::TimedOut),
+        "without the wake the read times out: {timed_out}"
+    );
+    drop(server);
 }
 
 #[test]
@@ -428,7 +457,7 @@ fn a_message_longer_than_the_limit_is_not_written() {
     huge.environment = vec![u16::from(b'A'); FRAME_LIMIT as usize];
     let pipe = Memory::default();
 
-    let refused = write_message(&pipe, &Message::Spawn(huge), far()).expect_err("the message is too long");
+    let refused = write_message(&pipe, &Message::Spawn(huge), far(), &[]).expect_err("the message is too long");
 
     assert!(matches!(refused, WriteError::TooLong), "{refused}");
     assert!(pipe.written.borrow().is_empty(), "nothing was written");

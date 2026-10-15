@@ -16,6 +16,10 @@ pub use helper::run;
 /// `gate_win32::PipeServer::create`.
 pub const PIPE_PREFIX: &str = "gate-desktop";
 
+/// The Task Scheduler path of the desktop helper's task, which the box runs to start the helper in the logged-on
+/// user's session.
+pub const TASK_PATH: &str = "\\gate\\desktop-helper";
+
 /// The longest the helper tries to reach the control pipe.
 pub const CONNECT_LIMIT: Duration = Duration::from_secs(10);
 
@@ -62,8 +66,9 @@ pub enum HelperExit {
     /// The launch failed before `CreateProcessW` was called (a refused application or folder, or a handle or attribute
     /// list that could not be made); no `Failed` was sent, since this is no failure of the command itself.
     SetupFailed = 20,
-    /// The box closed the pipe after the child was created, and the child could not be shown ended: opening it, ending
-    /// it or waiting for its end failed, or it had not ended within the message limit.
+    /// The box's pipe closed or failed after the child was created (it read closed, or a read or write of it failed
+    /// with `ERROR_BROKEN_PIPE`, `ERROR_PIPE_NOT_CONNECTED` or `ERROR_NO_DATA`), and the helper could not show the
+    /// child ended: ending it or waiting for its end failed, or it had not ended within the message limit.
     ChildNotEnded = 21,
     /// The helper runs above medium integrity or elevated, which a helper the Task Scheduler starts with the user's
     /// least-privileged token never does; it touched no pipe.

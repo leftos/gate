@@ -20,7 +20,7 @@ use windows_sys::Win32::System::Threading::{
     UpdateProcThreadAttribute,
 };
 
-use crate::launch::{end_unstarted, end_unstarted_by_id, is_batch, refused, setup, struct_size, wide_os};
+use crate::launch::{end_unstarted, end_unstarted_by_id, is_batch, refused, setup, struct_size, wide_os, with_end};
 use crate::{EnvironmentBlock, LaunchError, RestrictedToken, Suspended, own_handle, win32_message};
 
 /// Held while this crate starts a process: across making the inheritable copies of a launch's handles, its
@@ -356,15 +356,15 @@ fn create_process(creation: &Creation<'_>, flags: PROCESS_CREATION_FLAGS, startu
     let process = match unsafe { own_handle(created.hProcess) } {
         Ok(process) => process,
         Err(error) => {
-            end_unstarted_by_id(created.dwProcessId);
-            return Err(setup(error, "own the command's process"));
+            let ended = end_unstarted_by_id(created.dwProcessId);
+            return Err(setup(with_end(error, ended), "own the command's process"));
         }
     };
     let thread = match thread {
         Ok(thread) => thread,
         Err(error) => {
-            end_unstarted(&process);
-            return Err(setup(error, "own the command's thread"));
+            let ended = end_unstarted(&process);
+            return Err(setup(with_end(error, ended), "own the command's thread"));
         }
     };
     Ok(Suspended {

@@ -3,6 +3,7 @@
 //! however late, sees it.
 
 use std::io;
+use std::os::windows::io::BorrowedHandle;
 use std::time::Duration;
 
 use proc_table::win32::OwnedHandle;
@@ -126,6 +127,14 @@ impl NamedEvent {
         &self.name
     }
 
+    /// The event's handle, borrowed, for a wait on it among other handles, as the wake handles of a pipe's read or
+    /// write are.
+    #[must_use]
+    pub fn as_handle(&self) -> BorrowedHandle<'_> {
+        // SAFETY: the handle is open for as long as `self` lives, which the borrow cannot outlive.
+        unsafe { BorrowedHandle::borrow_raw(self.handle.raw()) }
+    }
+
     /// Signals the event. An auto-reset event wakes its waiter, and keeps a set that arrives before the wait, so a
     /// waiter that has not reached its wait yet still wakes; a manual-reset event stays set.
     ///
@@ -186,5 +195,32 @@ pub(crate) fn signalled(handle: &OwnedHandle) -> io::Result<bool> {
         WAIT_OBJECT_0 => Ok(true),
         WAIT_TIMEOUT => Ok(false),
         _ => Err(io::Error::last_os_error()),
+    }
+}
+
+#[cfg(test)]
+#[expect(clippy::expect_used, reason = "a test whose event cannot be made or set must fail loudly")]
+mod tests {
+    use std::os::windows::io::AsRawHandle;
+
+    use windows_sys::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
+    use windows_sys::Win32::System::Threading::WaitForSingleObject;
+
+    use super::NamedEvent;
+
+    #[test]
+    fn the_borrowed_handle_is_the_event_s_own() {
+        let name = format!(r"Local\gate-win32-event-handle-{}", std::process::id());
+        let event = NamedEvent::create_new_manual(&name).expect("the event is made");
+        let handle = event.as_handle();
+        // SAFETY: the borrowed handle is open for the whole call, and the wait takes no time.
+        let before = unsafe { WaitForSingleObject(handle.as_raw_handle(), 0) };
+
+        event.set().expect("the event is set");
+
+        // SAFETY: as above.
+        let after = unsafe { WaitForSingleObject(handle.as_raw_handle(), 0) };
+        assert_eq!(before, WAIT_TIMEOUT, "the new event is unset");
+        assert_eq!(after, WAIT_OBJECT_0, "the set is seen through the borrowed handle");
     }
 }
