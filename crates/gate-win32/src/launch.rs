@@ -8,6 +8,7 @@ use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io;
 use std::os::windows::ffi::OsStrExt;
+use std::os::windows::io::RawHandle;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -76,6 +77,42 @@ impl EnvironmentBlock {
         block.push(0);
         Ok(EnvironmentBlock(block))
     }
+
+    /// The block `block` holds as it is, entries and order untouched, once it is checked to be one `CreateProcessW`
+    /// reads whole: it ends in two NULs, and every entry before them holds a `=` after its first character, so no entry
+    /// is empty and none ends the block early. An entry that starts with `=`, as `=C:=C:\` does, is kept. This is the
+    /// only way to build a block from bytes another process sent.
+    ///
+    /// # Errors
+    ///
+    /// An error of kind [`io::ErrorKind::InvalidInput`] naming why, for a block that is empty or holds no entry, does
+    /// not end in two NULs, or holds an empty entry or an entry with no `=` after its first character before its end.
+    pub fn from_wide(block: Vec<u16>) -> io::Result<EnvironmentBlock> {
+        match block_problem(&block) {
+            Some(problem) => Err(io::Error::new(io::ErrorKind::InvalidInput, format!("the environment block {problem}"))),
+            None => Ok(EnvironmentBlock(block)),
+        }
+    }
+}
+
+/// What makes `block` a block `CreateProcessW` would not read whole, or `None` when nothing does. An entry is named by
+/// its position alone, since its text may be a secret.
+fn block_problem(block: &[u16]) -> Option<String> {
+    if block.is_empty() || block == [0, 0] {
+        return Some("is empty: it holds no entry".to_owned());
+    }
+    let Some(entries) = block.strip_suffix(&[0, 0]) else {
+        return Some("does not end in two NULs".to_owned());
+    };
+    let equals = u16::from(b'=');
+    entries
+        .split(|&unit| unit == 0)
+        .enumerate()
+        .find_map(|(index, entry)| match entry.split_first() {
+            None => Some(format!("holds an empty entry at position {index}, before its end")),
+            Some((_, rest)) if !rest.contains(&equals) => Some(format!("holds an entry at position {index} with no `=` after its first character")),
+            Some(_) => None,
+        })
 }
 
 /// Refuses a `(name, value)` pair a block cannot carry.
@@ -560,6 +597,26 @@ impl Suspended {
         end_unstarted(&process);
         Err(setup(error, "resume the command"))
     }
+
+    /// Gives up the command without ending it or closing its process and thread handles, and returns its pid and the
+    /// raw values of those two handles, for a process that hands them to another: the desktop helper, whose copies the
+    /// box takes with `DUPLICATE_CLOSE_SOURCE`. The command stays suspended. This process's ends of its pipes, when not
+    /// taken, are closed, as a resume closes them. The process value is null only for a command whose process was
+    /// already taken, which no caller outside this crate can make.
+    ///
+    /// The caller owns both handles from here. Once it has handed them on, it must never use the values again, not even
+    /// to close them: after the other process closes them, they may name other objects of this process.
+    #[must_use]
+    pub fn release(mut self) -> (u32, RawHandle, RawHandle) {
+        let process = self
+            .process
+            .take()
+            .map_or(std::ptr::null_mut(), |process| std::mem::ManuallyDrop::new(process).raw());
+        let mut released = std::mem::ManuallyDrop::new(self);
+        released.pipes = None;
+        released.note = None;
+        (released.pid, process, released.thread.raw())
+    }
 }
 
 /// A refused [`Suspended::adopt`]: the two handles it was given, open and unchanged, and why they were refused.
@@ -691,4 +748,106 @@ pub enum Waited {
     Interrupted,
     /// The command still runs.
     Running,
+}
+
+#[cfg(test)]
+#[expect(clippy::expect_used, reason = "a test whose block or command cannot be made must fail loudly")]
+mod tests {
+    use std::io;
+    use std::os::windows::io::{AsHandle, AsRawHandle, FromRawHandle, OwnedHandle};
+    use std::sync::PoisonError;
+    use std::time::Duration;
+
+    use windows_sys::Win32::System::Threading::TerminateProcess;
+
+    use super::{EnvironmentBlock, Launch, LaunchOutput};
+    use crate::{StoppableProcess, pid_of_process, system_directory};
+
+    /// The longest a test waits for a process to end: it never runs out unless the code is broken.
+    const HANG_GUARD: Duration = Duration::from_secs(600);
+
+    /// `text` as UTF-16 units, its NULs kept and none added.
+    fn units(text: &str) -> Vec<u16> {
+        text.encode_utf16().collect()
+    }
+
+    /// Asserts that `from_wide` refuses `block` for a reason that says `why`.
+    fn assert_refused(block: &str, why: &str) {
+        let refused = EnvironmentBlock::from_wide(units(block)).expect_err("the block is refused");
+        assert_eq!(refused.kind(), io::ErrorKind::InvalidInput, "{block:?}: {refused}");
+        assert!(refused.to_string().contains(why), "{block:?} is refused for {why:?}: {refused}");
+    }
+
+    #[test]
+    fn an_environment_block_from_wide_refuses_a_block_without_a_double_nul() {
+        for block in ["A=1", "A=1\0", "A=1\0B=2\0", "\0"] {
+            assert_refused(block, "two NULs");
+        }
+    }
+
+    #[test]
+    fn an_environment_block_from_wide_refuses_an_empty_block() {
+        assert_refused("", "empty");
+        assert_refused("\0\0", "empty");
+    }
+
+    #[test]
+    fn an_environment_block_from_wide_refuses_an_empty_entry() {
+        assert_refused("A=1\0\0B=2\0\0", "empty entry at position 1");
+        assert_refused("\0A=1\0\0", "empty entry at position 0");
+    }
+
+    #[test]
+    fn an_environment_block_from_wide_refuses_an_entry_without_an_equals_sign() {
+        assert_refused("A=1\0SECRET\0\0", "position 1 with no `=`");
+        assert_refused("=\0\0", "position 0 with no `=`");
+        let refused = EnvironmentBlock::from_wide(units("SECRET\0\0")).expect_err("the block is refused");
+        assert!(!refused.to_string().contains("SECRET"), "an entry's text is not repeated: {refused}");
+    }
+
+    #[test]
+    fn an_environment_block_from_wide_accepts_a_drive_entry() {
+        let block = units("=C:=C:\\\0A=1\0\0");
+
+        let accepted = EnvironmentBlock::from_wide(block.clone()).expect("a drive entry is valid");
+
+        assert_eq!(accepted.0, block, "the block is kept as it is");
+    }
+
+    #[test]
+    fn release_gives_up_the_child_without_ending_it() {
+        let _alone = crate::create::tests::ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner);
+        let system = system_directory().expect("the system folder is read");
+        let child = Launch {
+            application: system.join("cmd.exe"),
+            command_line: units("cmd /d /c exit 0"),
+            directory: system,
+            environment: EnvironmentBlock::new(std::env::vars_os()).expect("the block is built"),
+            output: LaunchOutput::Piped,
+            priority: None,
+        }
+        .start_suspended()
+        .expect("the command is created");
+        let watch = StoppableProcess::open(child.pid()).expect("the child opens").expect("the child exists");
+        let expected_pid = child.pid();
+
+        let (pid, process, thread) = child.release();
+
+        // SAFETY: `release` gave up both handles, open, and nothing else owns them now.
+        let (process, _thread) = unsafe { (OwnedHandle::from_raw_handle(process), OwnedHandle::from_raw_handle(thread)) };
+        assert_eq!(pid, expected_pid);
+        assert_eq!(pid_of_process(process.as_handle()).expect("the released process is read"), pid);
+        assert!(
+            !watch.wait(Duration::ZERO).expect("the wait succeeds"),
+            "the released child was not ended"
+        );
+        // SAFETY: the process handle is open, with the `PROCESS_TERMINATE` access a created process's handle has.
+        assert_ne!(unsafe { TerminateProcess(process.as_raw_handle(), 7) }, 0, "the test ends the child");
+        assert!(watch.wait(HANG_GUARD).expect("the wait succeeds"), "the child ended");
+        assert_eq!(
+            watch.exit_code().expect("the exit code is read"),
+            7,
+            "ended by the test, not by the release"
+        );
+    }
 }

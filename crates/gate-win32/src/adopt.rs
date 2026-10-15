@@ -6,17 +6,19 @@
 use std::io;
 use std::mem::ManuallyDrop;
 use std::os::windows::ffi::OsStringExt;
-use std::os::windows::io::{AsRawHandle, BorrowedHandle, FromRawHandle};
+use std::os::windows::io::{AsHandle, AsRawHandle, BorrowedHandle, FromRawHandle};
 use std::path::PathBuf;
 
 use jiff::Timestamp;
 use proc_table::win32::OwnedHandle;
-use windows_sys::Win32::Foundation::{DUPLICATE_CLOSE_SOURCE, DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_INSUFFICIENT_BUFFER, HANDLE};
+use windows_sys::Win32::Foundation::{
+    DUPLICATE_CLOSE_SOURCE, DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_PARAMETER, HANDLE,
+};
 use windows_sys::Win32::Security::TOKEN_QUERY;
 use windows_sys::Win32::System::RemoteDesktop::ProcessIdToSessionId;
 use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, GetProcessId, GetProcessIdOfThread, OpenProcess, OpenProcessToken, PROCESS_DUP_HANDLE, PROCESS_NAME_WIN32,
-    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, QueryFullProcessImageNameW, ResumeThread, SuspendThread,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, QueryFullProcessImageNameW, ResumeThread, SuspendThread,
 };
 
 use crate::{own_handle, start_of};
@@ -83,7 +85,7 @@ impl RemoteProcess {
     /// An error of kind [`io::ErrorKind::InvalidInput`] naming a value refused as above; the system's error when the
     /// copy cannot be made: `ERROR_INVALID_HANDLE` when the process holds no handle of that value.
     pub fn pull(&self, value: usize) -> io::Result<std::os::windows::io::OwnedHandle> {
-        if value == 0 || !value.is_multiple_of(4) || value > usize::MAX - 8 {
+        if !is_handle_value(value) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("0x{value:x} is not a handle value another process's table can hold"),
@@ -117,6 +119,42 @@ impl RemoteProcess {
         // SAFETY: the handle is open for as long as `self` lives, which the borrow cannot outlive.
         unsafe { BorrowedHandle::borrow_raw(self.handle.raw()) }
     }
+}
+
+/// Whether `value` is one a process's handle table entry can have, as [`RemoteProcess::pull`] requires: not 0, a
+/// multiple of 4 (the system ignores a value's two low bits, so another value would name another handle), and not one
+/// of the top eight values, among them the pseudo-handles of a process itself, its thread and its tokens.
+#[must_use]
+pub fn is_handle_value(value: usize) -> bool {
+    value != 0 && value.is_multiple_of(4) && value <= usize::MAX - 8
+}
+
+/// The process `pid`, opened to end it (`PROCESS_TERMINATE` and `PROCESS_QUERY_LIMITED_INFORMATION`), when it is the
+/// child of `parent` created at `created`: its parent pid, as its own record holds it ([`parent_pid_of`]), is `parent`,
+/// and its creation time, as [`creation_time_of`] reads it, is `created`. A pid reused since that child was made names
+/// a process created later, so it never passes. `None` when no process has the pid, or when the one that has it is
+/// another, whose handle is closed and which is left alone.
+///
+/// # Errors
+///
+/// The system's error when the process cannot be opened, for any reason but there being no process of that pid, or
+/// when its parent or creation time cannot be read.
+pub fn process_of_child(pid: u32, parent: u32, created: Timestamp) -> io::Result<Option<std::os::windows::io::OwnedHandle>> {
+    // SAFETY: `OpenProcess` takes no pointers.
+    let opened = unsafe { OpenProcess(PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if opened.is_null() {
+        let error = io::Error::last_os_error();
+        // `OpenProcess` reports a pid no process has as `ERROR_INVALID_PARAMETER`.
+        return if crate::tree::is_error(&error, ERROR_INVALID_PARAMETER) {
+            Ok(None)
+        } else {
+            Err(error)
+        };
+    }
+    // SAFETY: a success is a fresh handle nothing else owns.
+    let process = unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(opened) };
+    let is_child = parent_pid_of(process.as_handle())? == parent && creation_time_of(process.as_handle())? == created;
+    Ok(is_child.then_some(process))
 }
 
 /// The id of the process behind `process` (`GetProcessId`), which needs `PROCESS_QUERY_LIMITED_INFORMATION` access.
@@ -266,7 +304,8 @@ mod tests {
     use windows_sys::Win32::System::Threading::{CreateEventW, GetCurrentProcess, ResumeThread, SuspendThread};
 
     use super::{
-        RemoteProcess, creation_time_of, image_path_of, parent_pid_of, pid_of_process, pid_of_thread, session_of, thread_is_suspended, user_of,
+        RemoteProcess, creation_time_of, image_path_of, is_handle_value, parent_pid_of, pid_of_process, pid_of_thread, process_of_child, session_of,
+        thread_is_suspended, user_of,
     };
     use crate::{EnvironmentBlock, Job, Launch, LaunchError, LaunchOutput, StoppableProcess, Suspended, system_directory};
 
@@ -548,6 +587,35 @@ mod tests {
         );
         drop(Suspended::adopt(refused.process, refused.thread, pid).expect("the child is adopted after all"));
         assert!(watch.wait(HANG_GUARD).expect("the wait succeeds"), "the adopted child ended once dropped");
+    }
+
+    #[test]
+    fn is_handle_value_accepts_only_values_a_handle_table_can_hold() {
+        for value in [4, 8, 0x1000, usize::MAX - 11] {
+            assert!(is_handle_value(value), "0x{value:x} is a handle value");
+        }
+        for value in [0, 1, 2, 3, 5, 6, 7, usize::MAX - 7, usize::MAX - 3, usize::MAX] {
+            assert!(!is_handle_value(value), "0x{value:x} is not a handle value");
+        }
+    }
+
+    #[test]
+    fn process_of_child_returns_only_a_child_of_the_named_parent_and_time() {
+        let _alone = one_at_a_time();
+        let child = suspended("exit 0");
+        let pid = child.pid();
+        let held = borrow(child.process.as_ref().expect("the process is held"));
+        let created = creation_time_of(held).expect("the start is read");
+        let later = created.checked_add(jiff::SignedDuration::from_micros(1)).expect("the time is in range");
+
+        let found = process_of_child(pid, std::process::id(), created).expect("the child is looked up");
+        let other_parent = process_of_child(pid, std::process::id() + 4, created).expect("the child is looked up");
+        let other_time = process_of_child(pid, std::process::id(), later).expect("the child is looked up");
+
+        let found = found.expect("the child of this process, created then, is found");
+        assert!(same_object(found.as_handle(), held), "the handle found is the child's");
+        assert!(other_parent.is_none(), "a process whose parent is another is not returned");
+        assert!(other_time.is_none(), "a process created at another time is not returned");
     }
 
     #[test]

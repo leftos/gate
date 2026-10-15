@@ -152,6 +152,15 @@ fn facts_of(token: &OwnedHandle) -> io::Result<TokenFacts> {
     })
 }
 
+/// The user of this process's token, as a SID's string form (`S-1-5-21-…`).
+///
+/// # Errors
+///
+/// The system's error when the token cannot be opened or read.
+pub fn current_user_sid() -> io::Result<String> {
+    user_sid_of(&this_process_token(TOKEN_QUERY)?)
+}
+
 /// The string form of the SID of `token`'s user (`TokenUser`), `token` open with `TOKEN_QUERY`.
 pub(crate) fn user_sid_of(token: &OwnedHandle) -> io::Result<String> {
     let user = Information::<TOKEN_USER>::read(token, TokenUser)?;
@@ -426,7 +435,31 @@ mod tests {
         ACCESS_ALLOWED_ACE_TYPE, SE_GROUP_ENABLED, SE_GROUP_USE_FOR_DENY_ONLY, SECURITY_MANDATORY_MEDIUM_RID,
     };
 
-    use super::{Information, NetworkGroup, RestrictedToken, WellKnownSid, facts_of, group_attributes, network_group_of, this_process_token};
+    use super::{
+        Information, NetworkGroup, RestrictedToken, WellKnownSid, current_user_sid, facts_of, group_attributes, network_group_of, this_process_token,
+    };
+
+    #[test]
+    fn current_user_sid_is_the_process_s_user() {
+        let _alone = crate::create::tests::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let whoami = crate::system_directory().expect("the system folder is read").join("whoami.exe");
+        let mut command = std::process::Command::new(whoami);
+        command.args(["/user", "/fo", "csv", "/nh"]).stdout(std::process::Stdio::piped());
+        let output = crate::spawn(&mut command)
+            .expect("whoami starts")
+            .wait_with_output()
+            .expect("whoami's output is read");
+        assert!(output.status.success(), "whoami succeeds: {output:?}");
+        // One line, `"<domain>\<user>","<SID>"`: the SID is the last column.
+        let listed = String::from_utf8_lossy(&output.stdout);
+        let listed = listed.trim().rsplit(',').next().unwrap_or_default().trim_matches('"');
+
+        let sid = current_user_sid().expect("this process's user is read");
+
+        assert_eq!(sid, listed, "whoami lists this process's user");
+    }
 
     /// This process's token, restricted.
     fn restricted() -> RestrictedToken {

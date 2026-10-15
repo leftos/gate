@@ -1,7 +1,8 @@
 //! A named pipe for a hand-off between two local processes of one user: a server that admits only that user's local
 //! clients at medium integrity or above, one at a time, under a name with a fresh random part, and a client that lends
 //! the server no identity and opens only a pipe that user owns with the server's own DACL and label. Each side can read the
-//! other's process id, for the caller to check against the process it expects.
+//! other's process id, for the caller to check against the process it expects, and reads and writes bytes with a
+//! deadline and handles that end the wait early.
 
 use std::io;
 use std::os::windows::io::{AsRawHandle, BorrowedHandle};
@@ -9,8 +10,8 @@ use std::time::Instant;
 
 use proc_table::win32::OwnedHandle;
 use windows_sys::Win32::Foundation::{
-    ERROR_IO_PENDING, ERROR_NO_DATA, ERROR_NOT_FOUND, ERROR_OPERATION_ABORTED, ERROR_PIPE_CONNECTED, GetLastError, HANDLE, INVALID_HANDLE_VALUE,
-    LocalFree, WAIT_ABANDONED_0, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    ERROR_BROKEN_PIPE, ERROR_IO_PENDING, ERROR_NO_DATA, ERROR_NOT_FOUND, ERROR_OPERATION_ABORTED, ERROR_PIPE_CONNECTED, GetLastError, HANDLE,
+    INVALID_HANDLE_VALUE, LocalFree, WAIT_ABANDONED_0, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::Authorization::{
     ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo, SDDL_REVISION_1, SE_KERNEL_OBJECT,
@@ -22,7 +23,7 @@ use windows_sys::Win32::Security::{
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_CREATE_PIPE_INSTANCE, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
-    OPEN_EXISTING, PIPE_ACCESS_DUPLEX, READ_CONTROL, SECURITY_ANONYMOUS, SECURITY_SQOS_PRESENT,
+    OPEN_EXISTING, PIPE_ACCESS_DUPLEX, READ_CONTROL, ReadFile, SECURITY_ANONYMOUS, SECURITY_SQOS_PRESENT, WriteFile,
 };
 use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 use windows_sys::Win32::System::Pipes::{
@@ -35,6 +36,7 @@ use windows_sys::Win32::System::SystemServices::{
 };
 use windows_sys::Win32::System::Threading::{CreateEventW, WaitForMultipleObjects};
 
+use crate::tree::is_error;
 use crate::{own_handle, wait_millis, wide};
 
 /// The access the pipe's first entry grants its user, and all a [`PipeClient`] asks for: reading and writing data and
@@ -72,6 +74,78 @@ pub enum ConnectWait {
     Woken(usize),
     /// The deadline passed with no client connected.
     TimedOut,
+}
+
+/// How a [`PipeServer::read`] or a [`PipeClient::read`] ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PipeRead {
+    /// This many bytes, at least one, were read into the start of the buffer.
+    Read(usize),
+    /// The other end closed its handle: the pipe carries nothing more.
+    Closed,
+    /// The deadline passed with nothing read.
+    TimedOut,
+    /// The handle at this index of the wake list was signalled first, and nothing was read.
+    Woken(usize),
+}
+
+/// How a [`PipeServer::write_all`] or a [`PipeClient::write_all`] ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PipeWrite {
+    /// Every byte was written.
+    Written,
+    /// The other end closed its handle before every byte was written.
+    Closed,
+    /// The deadline passed before every byte was written; some may have been.
+    TimedOut,
+    /// The handle at this index of the wake list was signalled before every byte was written; some may have been.
+    Woken(usize),
+}
+
+/// What ended a wait on an overlapped operation's event and the wake handles.
+enum Signalled {
+    /// The operation's event: the operation has ended.
+    Event,
+    /// The wait ended before the operation did.
+    Early(Early),
+}
+
+/// Why a wait ended before its operation did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Early {
+    /// The deadline passed.
+    TimedOut,
+    /// The handle at this index of the wake list was signalled.
+    Woken(usize),
+}
+
+/// How an overlapped operation on a pipe ended.
+#[derive(Debug)]
+enum Outcome {
+    /// It completed, moving this many bytes (none for a connect).
+    Completed(u32),
+    /// It failed with this error.
+    Failed(io::Error),
+    /// The wait ended first, and the operation was cancelled.
+    Stopped(Early),
+}
+
+/// One overlapped read into, or write from, a buffer lent for the whole operation.
+enum Transfer<'a> {
+    /// A read into the buffer.
+    Read(&'a mut [u8]),
+    /// A write of the buffer.
+    Write(&'a [u8]),
+}
+
+/// How a read or a write started.
+enum Begun {
+    /// It completed at once.
+    Completed,
+    /// It runs on, its end signalled through its `OVERLAPPED`'s event.
+    Pending,
+    /// It failed at once.
+    Failed(io::Error),
 }
 
 /// How a connect started.
@@ -166,15 +240,8 @@ impl PipeServer {
     /// for an abandoned mutex in `wake`; an error naming both failures when a wait that ended without a client could
     /// not cancel its connect.
     pub fn wait_for_client(&self, deadline: Instant, wake: &[BorrowedHandle<'_>]) -> io::Result<ConnectWait> {
-        if wake.len() >= MAXIMUM_WAIT_OBJECTS as usize {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("a connect wait wakes on at most {} handles, not {}", MAXIMUM_WAIT_OBJECTS - 1, wake.len()),
-            ));
-        }
-        // SAFETY: null security attributes and a null name are allowed; the 1 and 0 make the event manual-reset and
-        // unset, as an overlapped call wants it. A success is a fresh handle nothing else owns.
-        let event = unsafe { own_handle(CreateEventW(std::ptr::null(), 1, 0, std::ptr::null())) }?;
+        check_wake(wake, "connect")?;
+        let event = new_event()?;
         let mut overlapped = OVERLAPPED {
             hEvent: event.raw(),
             ..OVERLAPPED::default()
@@ -188,11 +255,42 @@ impl PipeServer {
                 Started::ClientGone => self.disconnect()?,
             }
         }
-        let mut handles = vec![event.raw()];
-        handles.extend(wake.iter().map(AsRawHandle::as_raw_handle));
-        let waited = wait_any(&handles, deadline);
+        let waited = wait_any(&wait_list(&event, wake), deadline);
         // SAFETY: `overlapped` is the one the pending connect was given, still alive and unmoved.
-        unsafe { self.finish_connect(&overlapped, waited) }
+        match unsafe { finish(self.handle.raw(), &overlapped, waited, "connect") }? {
+            Outcome::Completed(_) => Ok(ConnectWait::Connected),
+            Outcome::Failed(error) => Err(error),
+            Outcome::Stopped(Early::TimedOut) => Ok(ConnectWait::TimedOut),
+            Outcome::Stopped(Early::Woken(index)) => Ok(ConnectWait::Woken(index)),
+        }
+    }
+
+    /// Reads what the client has written into the start of `buf`, returning as soon as at least one byte has arrived,
+    /// so a caller that wants an exact count loops. The read ends early when `deadline` passes or one of `wake` is
+    /// signalled, whichever comes first; bytes that arrive at the same moment win, and a read that ends early has read
+    /// nothing. The handles of `wake` must not be mutexes.
+    ///
+    /// # Errors
+    ///
+    /// An error of kind [`io::ErrorKind::InvalidInput`] for an empty `buf` or more than 63 handles in `wake`; the
+    /// system's error, its code kept, when the read or the wait fails; an error naming the handle for an abandoned mutex
+    /// in `wake`; an error naming both failures when a read that ended early could not be cancelled.
+    pub fn read(&self, buf: &mut [u8], deadline: Instant, wake: &[BorrowedHandle<'_>]) -> io::Result<PipeRead> {
+        read_pipe(self.handle.raw(), buf, deadline, wake)
+    }
+
+    /// Writes every byte of `bytes` to the client, waiting while the pipe's buffer is full until the client reads. The
+    /// write ends early when `deadline` passes or one of `wake` is signalled, whichever comes first, having written
+    /// some of the bytes or none; a write that completes at the same moment wins. Nothing at all is written for an
+    /// empty `bytes`. The handles of `wake` must not be mutexes.
+    ///
+    /// # Errors
+    ///
+    /// An error of kind [`io::ErrorKind::InvalidInput`] for more than 63 handles in `wake`; the system's error, its
+    /// code kept, when a write or the wait fails; an error naming the handle for an abandoned mutex in `wake`; an error
+    /// naming both failures when a write that ended early could not be cancelled.
+    pub fn write_all(&self, bytes: &[u8], deadline: Instant, wake: &[BorrowedHandle<'_>]) -> io::Result<PipeWrite> {
+        write_pipe(self.handle.raw(), bytes, deadline, wake)
     }
 
     /// Starts a connect (`ConnectNamedPipe`) with `overlapped`, and says how it started.
@@ -230,59 +328,6 @@ impl PipeServer {
         Ok(())
     }
 
-    /// Ends the connect that `overlapped` belongs to as the wait `waited` found it: completed when its event was
-    /// signalled, else cancelled and then waited for, so the operation never outlives `overlapped`. A connect that
-    /// completed despite the cancel is [`ConnectWait::Connected`]; a cancel that failed makes the result an error.
-    ///
-    /// # Safety
-    ///
-    /// `overlapped` is the one a pending `ConnectNamedPipe` on this pipe was given, alive and unmoved until this returns.
-    unsafe fn finish_connect(&self, overlapped: &OVERLAPPED, waited: io::Result<ConnectWait>) -> io::Result<ConnectWait> {
-        let failed_cancel = if matches!(waited, Ok(ConnectWait::Connected)) {
-            None
-        } else {
-            // SAFETY: the caller guarantees `overlapped`.
-            unsafe { self.cancel(overlapped) }
-        };
-        let mut transferred = 0;
-        // SAFETY: the caller guarantees `overlapped` belongs to an operation on this open pipe; `transferred` is
-        // writable, and the call waits for the operation's end.
-        let completed = unsafe { GetOverlappedResult(self.handle.raw(), overlapped, &raw mut transferred, 1) } != 0;
-        let ended = if completed {
-            Ok(ConnectWait::Connected)
-        } else {
-            let error = io::Error::last_os_error();
-            match waited {
-                Ok(ConnectWait::Connected) => Err(error),
-                Ok(ended) if error.raw_os_error() == Some(ERROR_OPERATION_ABORTED.cast_signed()) => Ok(ended),
-                Ok(_) => Err(error),
-                Err(failed) => Err(failed),
-            }
-        };
-        match failed_cancel {
-            None => ended,
-            Some(cancel) => Err(io::Error::new(
-                cancel.kind(),
-                format!("the pending connect could not be cancelled ({cancel}), and then ended as {ended:?}"),
-            )),
-        }
-    }
-
-    /// Cancels the connect `overlapped` belongs to (`CancelIoEx`); the error when the cancel failed, except for
-    /// `ERROR_NOT_FOUND`, which says the connect had already ended.
-    ///
-    /// # Safety
-    ///
-    /// `overlapped` is the one a `ConnectNamedPipe` on this pipe was given, alive and unmoved for the whole call.
-    unsafe fn cancel(&self, overlapped: &OVERLAPPED) -> Option<io::Error> {
-        // SAFETY: the caller guarantees `overlapped` belongs to an operation on this open pipe.
-        if unsafe { CancelIoEx(self.handle.raw(), overlapped) } != 0 {
-            return None;
-        }
-        let error = io::Error::last_os_error();
-        (error.raw_os_error() != Some(ERROR_NOT_FOUND.cast_signed())).then_some(error)
-    }
-
     /// The id of the process at the client end of the connected pipe (`GetNamedPipeClientProcessId`).
     ///
     /// # Errors
@@ -298,26 +343,207 @@ impl PipeServer {
     }
 }
 
-/// Waits until `deadline` for any of `handles`, the connect's event first: [`ConnectWait::Connected`] for the event,
-/// [`ConnectWait::Woken`] with the index into the wake list for another, [`ConnectWait::TimedOut`] past the deadline.
-fn wait_any(handles: &[HANDLE], deadline: Instant) -> io::Result<ConnectWait> {
+/// Refuses a wake list longer than a wait on an operation's event can watch, naming the operation, `what`.
+fn check_wake(wake: &[BorrowedHandle<'_>], what: &str) -> io::Result<()> {
+    if wake.len() >= MAXIMUM_WAIT_OBJECTS as usize {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("a {what} wait wakes on at most {} handles, not {}", MAXIMUM_WAIT_OBJECTS - 1, wake.len()),
+        ));
+    }
+    Ok(())
+}
+
+/// A fresh event for one overlapped operation: manual-reset and unset, as an overlapped call wants it.
+fn new_event() -> io::Result<OwnedHandle> {
+    // SAFETY: null security attributes and a null name are allowed; the 1 and 0 make the event manual-reset and unset.
+    // A success is a fresh handle nothing else owns.
+    unsafe { own_handle(CreateEventW(std::ptr::null(), 1, 0, std::ptr::null())) }
+}
+
+/// The handles a wait on an operation watches: its event first, then `wake` in its order.
+fn wait_list(event: &OwnedHandle, wake: &[BorrowedHandle<'_>]) -> Vec<HANDLE> {
+    let mut handles = vec![event.raw()];
+    handles.extend(wake.iter().map(AsRawHandle::as_raw_handle));
+    handles
+}
+
+/// Waits until `deadline` for any of `handles`, the operation's event first: [`Signalled::Event`] for the event, an
+/// [`Early::Woken`] with the index into the wake list for another, an [`Early::TimedOut`] past the deadline. The event
+/// wins over a wake handle signalled at the same moment.
+fn wait_any(handles: &[HANDLE], deadline: Instant) -> io::Result<Signalled> {
     let count = u32::try_from(handles.len()).map_err(io::Error::other)?;
     let timeout = wait_millis(deadline.saturating_duration_since(Instant::now()));
     // SAFETY: `handles` holds `count` handles, each open for the whole call: the event this module made, and the wake
     // handles the caller borrows to it.
     let result = unsafe { WaitForMultipleObjects(count, handles.as_ptr(), 0, timeout) };
     match result {
-        WAIT_OBJECT_0 => Ok(ConnectWait::Connected),
-        WAIT_TIMEOUT => Ok(ConnectWait::TimedOut),
+        WAIT_OBJECT_0 => Ok(Signalled::Event),
+        WAIT_TIMEOUT => Ok(Signalled::Early(Early::TimedOut)),
         WAIT_FAILED => Err(io::Error::last_os_error()),
-        _ if result > WAIT_OBJECT_0 && result < WAIT_OBJECT_0 + count => Ok(ConnectWait::Woken((result - WAIT_OBJECT_0 - 1) as usize)),
+        _ if result > WAIT_OBJECT_0 && result < WAIT_OBJECT_0 + count => Ok(Signalled::Early(Early::Woken((result - WAIT_OBJECT_0 - 1) as usize))),
         _ if result > WAIT_ABANDONED_0 && result < WAIT_ABANDONED_0 + count => Err(io::Error::other(format!(
-            "the wake handle at index {} is a mutex its owner abandoned; a wait for a pipe client wakes on no mutex",
+            "the wake handle at index {} is a mutex its owner abandoned; a wait on a pipe wakes on no mutex",
             result - WAIT_ABANDONED_0 - 1
         ))),
         _ => Err(io::Error::other(format!(
-            "the wait for a pipe client ended with the unexpected result 0x{result:x}"
+            "the wait on a pipe ended with the unexpected result 0x{result:x}"
         ))),
+    }
+}
+
+/// Ends the operation `overlapped` belongs to, on the pipe `handle`, as the wait `waited` found it: completed when its
+/// event was signalled, else cancelled and then waited for, so the operation never outlives `overlapped` or its buffer.
+/// An operation that completed despite the cancel is [`Outcome::Completed`]; a cancel that failed makes the result an
+/// error naming the operation, `what`.
+///
+/// # Safety
+///
+/// `overlapped` is the one a started operation on the open pipe `handle` was given, alive and unmoved until this
+/// returns.
+unsafe fn finish(handle: HANDLE, overlapped: &OVERLAPPED, waited: io::Result<Signalled>, what: &str) -> io::Result<Outcome> {
+    let failed_cancel = if matches!(waited, Ok(Signalled::Event)) {
+        None
+    } else {
+        // SAFETY: the caller guarantees `overlapped`.
+        unsafe { cancel(handle, overlapped) }
+    };
+    let mut transferred = 0;
+    // SAFETY: the caller guarantees `overlapped` belongs to an operation on this open pipe; `transferred` is writable,
+    // and the call waits for the operation's end.
+    let completed = unsafe { GetOverlappedResult(handle, overlapped, &raw mut transferred, 1) } != 0;
+    let ended = if completed {
+        Ok(Outcome::Completed(transferred))
+    } else {
+        let error = io::Error::last_os_error();
+        match waited {
+            Ok(Signalled::Early(early)) if is_error(&error, ERROR_OPERATION_ABORTED) => Ok(Outcome::Stopped(early)),
+            Ok(_) => Ok(Outcome::Failed(error)),
+            Err(failed) => Err(failed),
+        }
+    };
+    match failed_cancel {
+        None => ended,
+        Some(cancel) => Err(io::Error::new(
+            cancel.kind(),
+            format!("the pending {what} could not be cancelled ({cancel}), and then ended as {ended:?}"),
+        )),
+    }
+}
+
+/// Cancels the operation `overlapped` belongs to (`CancelIoEx`); the error when the cancel failed, except for
+/// `ERROR_NOT_FOUND`, which says the operation had already ended.
+///
+/// # Safety
+///
+/// `overlapped` is the one an operation on the open pipe `handle` was given, alive and unmoved for the whole call.
+unsafe fn cancel(handle: HANDLE, overlapped: &OVERLAPPED) -> Option<io::Error> {
+    // SAFETY: the caller guarantees `overlapped` belongs to an operation on this open pipe.
+    if unsafe { CancelIoEx(handle, overlapped) } != 0 {
+        return None;
+    }
+    let error = io::Error::last_os_error();
+    (!is_error(&error, ERROR_NOT_FOUND)).then_some(error)
+}
+
+/// Reads into `buf` from the pipe `handle`, as [`PipeServer::read`] says.
+fn read_pipe(handle: HANDLE, buf: &mut [u8], deadline: Instant, wake: &[BorrowedHandle<'_>]) -> io::Result<PipeRead> {
+    if buf.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "a pipe read needs room for at least one byte",
+        ));
+    }
+    Ok(match transfer(handle, Transfer::Read(buf), deadline, wake)? {
+        Outcome::Completed(0) => PipeRead::Closed,
+        Outcome::Completed(read) => PipeRead::Read(read as usize),
+        Outcome::Failed(error) if is_error(&error, ERROR_BROKEN_PIPE) => PipeRead::Closed,
+        Outcome::Failed(error) => return Err(error),
+        Outcome::Stopped(Early::TimedOut) => PipeRead::TimedOut,
+        Outcome::Stopped(Early::Woken(index)) => PipeRead::Woken(index),
+    })
+}
+
+/// Writes all of `bytes` to the pipe `handle`, as [`PipeServer::write_all`] says, one write after another until every
+/// byte is written.
+fn write_pipe(handle: HANDLE, bytes: &[u8], deadline: Instant, wake: &[BorrowedHandle<'_>]) -> io::Result<PipeWrite> {
+    let mut rest = bytes;
+    while !rest.is_empty() {
+        match written(transfer(handle, Transfer::Write(rest), deadline, wake)?)? {
+            Ok(count) => rest = &rest[count..],
+            Err(ended) => return Ok(ended),
+        }
+    }
+    Ok(PipeWrite::Written)
+}
+
+/// The count of bytes one write moved, or how [`write_pipe`] ends without writing the rest.
+fn written(outcome: Outcome) -> io::Result<Result<usize, PipeWrite>> {
+    match outcome {
+        Outcome::Completed(0) => Err(io::Error::other("a pipe write completed without writing a byte")),
+        Outcome::Completed(count) => Ok(Ok(count as usize)),
+        Outcome::Failed(error) if is_error(&error, ERROR_BROKEN_PIPE) || is_error(&error, ERROR_NO_DATA) => Ok(Err(PipeWrite::Closed)),
+        Outcome::Failed(error) => Err(error),
+        Outcome::Stopped(Early::TimedOut) => Ok(Err(PipeWrite::TimedOut)),
+        Outcome::Stopped(Early::Woken(index)) => Ok(Err(PipeWrite::Woken(index))),
+    }
+}
+
+/// Runs one overlapped read or write, `op`, on the pipe `handle`, which is open for overlapped I/O, until it ends,
+/// `deadline` passes or one of `wake` is signalled. An operation the wait leaves pending is cancelled and waited for,
+/// so it never outlives its `OVERLAPPED` or its buffer.
+fn transfer(handle: HANDLE, mut op: Transfer<'_>, deadline: Instant, wake: &[BorrowedHandle<'_>]) -> io::Result<Outcome> {
+    let what = match op {
+        Transfer::Read(_) => "read",
+        Transfer::Write(_) => "write",
+    };
+    check_wake(wake, what)?;
+    let event = new_event()?;
+    let mut overlapped = OVERLAPPED {
+        hEvent: event.raw(),
+        ..OVERLAPPED::default()
+    };
+    // SAFETY: `handle` is open for overlapped I/O; `overlapped` has its own event, and it and the buffer `op` borrows
+    // stay where they are, alive and untouched, until the operation has ended: a started operation always reaches
+    // `finish`, which waits for its end.
+    let waited = match unsafe { start_transfer(handle, &mut op, &raw mut overlapped) } {
+        Begun::Completed => Ok(Signalled::Event),
+        Begun::Pending => wait_any(&wait_list(&event, wake), deadline),
+        Begun::Failed(error) => return Ok(Outcome::Failed(error)),
+    };
+    // SAFETY: `overlapped` is the one the started operation was given, still alive and unmoved.
+    unsafe { finish(handle, &overlapped, waited, what) }
+}
+
+/// Starts `op` (`ReadFile` or `WriteFile`) on the pipe `handle` with `overlapped`, for at most `u32::MAX` bytes, and
+/// says how it started.
+///
+/// # Safety
+///
+/// `handle` is a pipe open for overlapped I/O; `overlapped` points to a whole `OVERLAPPED` with its own event, used by
+/// no other operation; it and the buffer `op` borrows stay alive and unmoved, and the buffer untouched, until a started
+/// operation has ended.
+unsafe fn start_transfer(handle: HANDLE, op: &mut Transfer<'_>, overlapped: *mut OVERLAPPED) -> Begun {
+    let started = match op {
+        Transfer::Read(buf) => {
+            let room = u32::try_from(buf.len()).unwrap_or(u32::MAX);
+            // SAFETY: the caller guarantees `handle` and `overlapped`; `buf` is writable for `room` bytes, and no count
+            // is asked for, as an overlapped read reports it through `overlapped`.
+            unsafe { ReadFile(handle, buf.as_mut_ptr(), room, std::ptr::null_mut(), overlapped) }
+        }
+        Transfer::Write(bytes) => {
+            let length = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
+            // SAFETY: as for the read; `bytes` is readable for `length` bytes.
+            unsafe { WriteFile(handle, bytes.as_ptr(), length, std::ptr::null_mut(), overlapped) }
+        }
+    };
+    if started != 0 {
+        return Begun::Completed;
+    }
+    // SAFETY: `GetLastError` takes no pointers; it is read before anything else can set it.
+    match unsafe { GetLastError() } {
+        ERROR_IO_PENDING => Begun::Pending,
+        code => Begun::Failed(io::Error::from_raw_os_error(code.cast_signed())),
     }
 }
 
@@ -457,6 +683,24 @@ impl PipeClient {
         Ok(pid)
     }
 
+    /// Reads what the server has written into the start of `buf`, as [`PipeServer::read`] reads what its client wrote.
+    ///
+    /// # Errors
+    ///
+    /// As for [`PipeServer::read`].
+    pub fn read(&self, buf: &mut [u8], deadline: Instant, wake: &[BorrowedHandle<'_>]) -> io::Result<PipeRead> {
+        read_pipe(self.handle.raw(), buf, deadline, wake)
+    }
+
+    /// Writes every byte of `bytes` to the server, as [`PipeServer::write_all`] writes to its client.
+    ///
+    /// # Errors
+    ///
+    /// As for [`PipeServer::write_all`].
+    pub fn write_all(&self, bytes: &[u8], deadline: Instant, wake: &[BorrowedHandle<'_>]) -> io::Result<PipeWrite> {
+        write_pipe(self.handle.raw(), bytes, deadline, wake)
+    }
+
     /// Refuses the pipe unless its owner is `owner_sid`, its DACL is the one a [`PipeServer`] for `owner_sid` writes
     /// (an entry allowing it [`CLIENT_ACCESS`], then one allowing OWNER RIGHTS `READ_CONTROL`, neither with flags), and
     /// its SACL holds the server's label alone: medium, [`LABEL_POLICY`], no flags.
@@ -482,7 +726,8 @@ impl PipeClient {
 }
 
 /// Refuses a pipe whose SACL `sacl` is not the server's: one mandatory label entry, medium, [`LABEL_POLICY`], no flags.
-/// A pipe with no label, made by a process below medium integrity or with a SACL of its own, is refused.
+/// A pipe with no label, one labelled below medium (as a below-medium creator's is), or a SACL other than the server's
+/// label is refused.
 fn check_label(sacl: *const ACL) -> io::Result<()> {
     if sacl.is_null() {
         return Err(refusal("the pipe has no mandatory label, not the server's medium one".to_owned()));
@@ -631,10 +876,149 @@ mod tests {
     use windows_sys::Win32::System::SystemServices::SE_GROUP_INTEGRITY;
     use windows_sys::Win32::System::Threading::{CreateEventW, GetCurrentProcess, OpenProcessToken, SetThreadToken};
 
-    use super::{CLIENT_ACCESS, ConnectWait, OWNER_RIGHTS, PipeClient, PipeServer, random_hex, server_sddl};
+    use super::{CLIENT_ACCESS, ConnectWait, OWNER_RIGHTS, PipeClient, PipeRead, PipeServer, PipeWrite, random_hex, server_sddl};
 
     /// The longest a test waits for something that must happen: it never runs out unless the code is broken.
     const HANG_GUARD: Duration = Duration::from_secs(600);
+
+    /// A fresh pipe's server and a client connected to it.
+    fn connected() -> (PipeServer, PipeClient) {
+        let server = PipeServer::create(&prefix(), &own_sid()).expect("the pipe is made");
+        let client = PipeClient::open(server.name(), &own_sid()).expect("the client opens the pipe");
+        let waited = server.wait_for_client(Instant::now() + HANG_GUARD, &[]).expect("the wait succeeds");
+        assert_eq!(waited, ConnectWait::Connected);
+        (server, client)
+    }
+
+    /// Exactly `count` bytes, read through `read`, which reads once into the buffer it is given.
+    fn read_exactly(count: usize, mut read: impl FnMut(&mut [u8]) -> std::io::Result<PipeRead>) -> Vec<u8> {
+        let mut bytes = vec![0_u8; count];
+        let mut filled = 0;
+        while filled < count {
+            let ended = read(&mut bytes[filled..]).expect("the read succeeds");
+            let read = if let PipeRead::Read(read) = ended { read } else { 0 };
+            assert_ne!(read, 0, "the read ended as {ended:?} after {filled} of {count} bytes");
+            filled += read;
+        }
+        bytes
+    }
+
+    #[test]
+    fn a_message_written_by_the_client_is_read_by_the_server() {
+        let (server, client) = connected();
+        let message = b"a message from the client";
+
+        let written = client.write_all(message, Instant::now() + HANG_GUARD, &[]).expect("the write succeeds");
+
+        assert_eq!(written, PipeWrite::Written);
+        let read = read_exactly(message.len(), |buf| server.read(buf, Instant::now() + HANG_GUARD, &[]));
+        assert_eq!(read, message);
+    }
+
+    #[test]
+    fn a_message_written_by_the_server_is_read_by_the_client() {
+        let (server, client) = connected();
+        let message = b"a message from the server";
+
+        let written = server.write_all(message, Instant::now() + HANG_GUARD, &[]).expect("the write succeeds");
+
+        assert_eq!(written, PipeWrite::Written);
+        let read = read_exactly(message.len(), |buf| client.read(buf, Instant::now() + HANG_GUARD, &[]));
+        assert_eq!(read, message);
+    }
+
+    #[test]
+    fn a_read_returns_closed_when_the_other_end_closes() {
+        let (server, client) = connected();
+        let written = client.write_all(b"last", Instant::now() + HANG_GUARD, &[]).expect("the write succeeds");
+        assert_eq!(written, PipeWrite::Written);
+        drop(client);
+
+        let before = read_exactly(4, |buf| server.read(buf, Instant::now() + HANG_GUARD, &[]));
+        let mut buf = [0_u8; 16];
+        let at_end = server.read(&mut buf, Instant::now() + HANG_GUARD, &[]).expect("the read succeeds");
+
+        assert_eq!(before, b"last", "what was written before the close is read first");
+        assert_eq!(at_end, PipeRead::Closed);
+        let (server, client) = connected();
+        drop(server);
+        let at_client = client.read(&mut buf, Instant::now() + HANG_GUARD, &[]).expect("the read succeeds");
+        assert_eq!(at_client, PipeRead::Closed);
+    }
+
+    #[test]
+    fn a_read_times_out_at_its_deadline() {
+        let (server, client) = connected();
+        let mut buf = [0_u8; 16];
+
+        let read = server.read(&mut buf, Instant::now(), &[]).expect("the read succeeds");
+
+        assert_eq!(read, PipeRead::TimedOut);
+        let written = client.write_all(b"after", Instant::now() + HANG_GUARD, &[]).expect("the write succeeds");
+        assert_eq!(written, PipeWrite::Written);
+        let after = read_exactly(5, |buf| server.read(buf, Instant::now() + HANG_GUARD, &[]));
+        assert_eq!(after, b"after", "the cancelled read took nothing");
+    }
+
+    #[test]
+    fn a_read_wakes_on_a_wake_handle() {
+        let (_server, client) = connected();
+        let unset = event(false);
+        let set = event(true);
+        let mut buf = [0_u8; 16];
+
+        let read = client
+            .read(&mut buf, Instant::now() + HANG_GUARD, &[unset.as_handle(), set.as_handle()])
+            .expect("the read succeeds");
+
+        assert_eq!(read, PipeRead::Woken(1));
+    }
+
+    #[test]
+    fn a_write_larger_than_the_pipe_buffer_completes_while_the_other_end_reads() {
+        let server = PipeServer::create(&prefix(), &own_sid()).expect("the pipe is made");
+        let message: Vec<u8> = (0..=250_u8).cycle().take(1024 * 1024).collect();
+        let (name, sid, size) = (server.name().to_owned(), own_sid(), message.len());
+        let reader = std::thread::spawn(move || {
+            let client = PipeClient::open(&name, &sid)?;
+            Ok::<_, std::io::Error>(read_exactly(size, |buf| client.read(buf, Instant::now() + HANG_GUARD, &[])))
+        });
+        let waited = server.wait_for_client(Instant::now() + HANG_GUARD, &[]).expect("the wait succeeds");
+        assert_eq!(waited, ConnectWait::Connected);
+
+        let written = server.write_all(&message, Instant::now() + HANG_GUARD, &[]).expect("the write succeeds");
+
+        let read = reader.join().expect("the reader's thread ends").expect("the reader opens the pipe");
+        assert_eq!(written, PipeWrite::Written);
+        assert!(read == message, "the {} bytes read are the {size} bytes written", read.len());
+    }
+
+    #[test]
+    fn a_client_refuses_a_pipe_a_low_integrity_creator_made_with_the_server_s_descriptor() {
+        let sid = own_sid();
+        let sddl = server_sddl(&sid).expect("the descriptor string is built");
+
+        let made = std::thread::spawn(move || {
+            let server = {
+                let _low = LowIntegrity::impersonate();
+                PipeServer::create_with(test_name(), &sddl)
+            };
+            server.map(|server| PipeClient::open(server.name(), &sid).err())
+        })
+        .join()
+        .expect("the thread ends");
+
+        match made {
+            Err(creation) => {
+                assert!(creation.raw_os_error().is_some(), "the system refused the creation: {creation}");
+            }
+            Ok(opened) => {
+                let refused = opened.expect("a pipe a low-integrity creator made is refused");
+                assert_eq!(refused.kind(), std::io::ErrorKind::PermissionDenied, "{refused}");
+                assert!(refused.to_string().contains("mandatory label"), "refused for its label: {refused}");
+            }
+        }
+    }
 
     /// The prefix of every test pipe, with this process's id, so two test runs never share a name.
     fn prefix() -> String {
