@@ -8,10 +8,7 @@ use windows_sys::Win32::System::RemoteDesktop::{
     WTSDisconnected, WTSDown, WTSFreeMemory, WTSGetActiveConsoleSessionId, WTSINFOEXW, WTSIdle, WTSInit, WTSListen, WTSQuerySessionInformationW,
     WTSReset, WTSSessionInfoEx, WTSShadow,
 };
-use windows_sys::Win32::System::SystemInformation::{GetVersionExW, OSVERSIONINFOW};
 use windows_sys::core::PWSTR;
-
-use crate::launch::struct_size;
 
 /// The id `WTSGetActiveConsoleSessionId` gives when no session is attached to the console, as while one is being
 /// attached or detached.
@@ -60,7 +57,8 @@ pub enum LockState {
     Locked,
     /// The session is unlocked.
     Unlocked,
-    /// The system does not say (`WTS_SESSIONSTATE_UNKNOWN`), or gave a value this crate does not know.
+    /// The system does not say (`WTS_SESSIONSTATE_UNKNOWN`), or gave a value this crate does not know. A caller must
+    /// treat it as locked: nothing says the desktop is not the lock screen.
     Unknown,
 }
 
@@ -71,8 +69,10 @@ pub struct SessionState {
     pub id: u32,
     /// Its connection state.
     pub connect: ConnectState,
-    /// The name of the user logged on to it, without a domain; empty when nobody is.
+    /// The name of the user logged on to it, without its domain; empty when nobody is.
     pub user: String,
+    /// The domain of that user, the machine's own name for a local account; empty when nobody is logged on.
+    pub domain: String,
     /// Whether it is locked.
     pub lock: LockState,
 }
@@ -82,8 +82,8 @@ pub struct SessionState {
 ///
 /// # Errors
 ///
-/// The system's error when the session cannot be read, as for an id no session has, or when this system's version
-/// cannot be read; an error when the system answers in a form other than the level-1 information asked for.
+/// The system's error when the session cannot be read, as for an id no session has; an error when the system answers
+/// in a form other than the level-1 information asked for.
 pub fn session_state(id: u32) -> io::Result<SessionState> {
     let mut buffer: PWSTR = std::ptr::null_mut();
     let mut bytes = 0;
@@ -112,7 +112,8 @@ pub fn session_state(id: u32) -> io::Result<SessionState> {
         id,
         connect: connect_state(level1.SessionState),
         user: until_nul(&level1.UserName),
-        lock: lock_state(level1.SessionFlags, is_windows_7()?),
+        domain: until_nul(&level1.DomainName),
+        lock: lock_state(level1.SessionFlags),
     })
 }
 
@@ -149,28 +150,14 @@ fn connect_state(class: WTS_CONNECTSTATE_CLASS) -> ConnectState {
 }
 
 /// The lock state a session's `SessionFlags` say: `WTS_SESSIONSTATE_LOCK` (0) is locked and `WTS_SESSIONSTATE_UNLOCK`
-/// (1) unlocked, except on Windows 7 and Windows Server 2008 R2, which give the two the other way round
-/// (`WTSINFOEX_LEVEL1_W`); any other value, `WTS_SESSIONSTATE_UNKNOWN` among them, is unknown.
-fn lock_state(flags: i32, windows_7: bool) -> LockState {
-    match (flags.cast_unsigned(), windows_7) {
-        (WTS_SESSIONSTATE_LOCK, false) | (WTS_SESSIONSTATE_UNLOCK, true) => LockState::Locked,
-        (WTS_SESSIONSTATE_UNLOCK, false) | (WTS_SESSIONSTATE_LOCK, true) => LockState::Unlocked,
+/// (1) unlocked; any other value, `WTS_SESSIONSTATE_UNKNOWN` among them, is unknown. (Windows 7 and Windows Server
+/// 2008 R2 give the two the other way round, per `WTSINFOEX_LEVEL1_W`; the gate runs only on Windows 10 and later.)
+fn lock_state(flags: i32) -> LockState {
+    match flags.cast_unsigned() {
+        WTS_SESSIONSTATE_LOCK => LockState::Locked,
+        WTS_SESSIONSTATE_UNLOCK => LockState::Unlocked,
         _ => LockState::Unknown,
     }
-}
-
-/// Whether this system is Windows 7 or Windows Server 2008 R2: version 6.1 as `GetVersionExW` gives it. A process
-/// without a manifest sees 6.2 on every later system, never 6.1, so the answer holds without one.
-fn is_windows_7() -> io::Result<bool> {
-    let mut version = OSVERSIONINFOW {
-        dwOSVersionInfoSize: struct_size::<OSVERSIONINFOW>(),
-        ..OSVERSIONINFOW::default()
-    };
-    // SAFETY: `version` is a whole, writable `OSVERSIONINFOW` whose size field says so.
-    if unsafe { GetVersionExW(&raw mut version) } == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(version.dwMajorVersion == 6 && version.dwMinorVersion == 1)
 }
 
 /// The text of a fixed UTF-16 field, up to its first NUL.
@@ -218,17 +205,14 @@ mod tests {
     }
 
     #[test]
-    fn the_lock_flag_reads_unlocked_as_one_except_on_windows_7() {
-        assert_eq!(lock_state(1, false), LockState::Unlocked);
-        assert_eq!(lock_state(0, false), LockState::Locked);
-        assert_eq!(lock_state(1, true), LockState::Locked);
-        assert_eq!(lock_state(0, true), LockState::Unlocked);
+    fn the_lock_flag_reads_unlocked_as_one_and_locked_as_zero() {
+        assert_eq!(lock_state(1), LockState::Unlocked);
+        assert_eq!(lock_state(0), LockState::Locked);
     }
 
     #[test]
     fn an_unknown_lock_flag_is_unknown() {
-        assert_eq!(lock_state(-1, false), LockState::Unknown, "WTS_SESSIONSTATE_UNKNOWN");
-        assert_eq!(lock_state(-1, true), LockState::Unknown, "WTS_SESSIONSTATE_UNKNOWN on Windows 7");
-        assert_eq!(lock_state(2, false), LockState::Unknown);
+        assert_eq!(lock_state(-1), LockState::Unknown, "WTS_SESSIONSTATE_UNKNOWN");
+        assert_eq!(lock_state(2), LockState::Unknown);
     }
 }

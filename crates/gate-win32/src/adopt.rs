@@ -12,10 +12,11 @@ use std::path::PathBuf;
 use jiff::Timestamp;
 use proc_table::win32::OwnedHandle;
 use windows_sys::Win32::Foundation::{DUPLICATE_CLOSE_SOURCE, DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_INSUFFICIENT_BUFFER, HANDLE};
+use windows_sys::Win32::Security::TOKEN_QUERY;
 use windows_sys::Win32::System::RemoteDesktop::ProcessIdToSessionId;
 use windows_sys::Win32::System::Threading::{
-    GetCurrentProcess, GetProcessId, GetProcessIdOfThread, OpenProcess, PROCESS_DUP_HANDLE, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
-    PROCESS_SYNCHRONIZE, QueryFullProcessImageNameW, ResumeThread, SuspendThread,
+    GetCurrentProcess, GetProcessId, GetProcessIdOfThread, OpenProcess, OpenProcessToken, PROCESS_DUP_HANDLE, PROCESS_NAME_WIN32,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, QueryFullProcessImageNameW, ResumeThread, SuspendThread,
 };
 
 use crate::{own_handle, start_of};
@@ -42,13 +43,13 @@ impl RemoteProcess {
         Ok(RemoteProcess { handle })
     }
 
-    /// Copies `handle` into the process, with the same access, inheritable when `inheritable` says so, and returns the
-    /// copy's value in the process's handle table. The copy is the process's own: this process never closes it.
+    /// Copies `handle` into the process, with the same access and never inheritable, and returns the copy's value in the
+    /// process's handle table. The copy is the process's own: this process never closes it.
     ///
     /// # Errors
     ///
     /// The system's error when the handle cannot be copied.
-    pub fn push(&self, handle: BorrowedHandle<'_>, inheritable: bool) -> io::Result<usize> {
+    pub fn push(&self, handle: BorrowedHandle<'_>) -> io::Result<usize> {
         let mut copy: HANDLE = std::ptr::null_mut();
         // SAFETY: this process's pseudo-handle is always open, `handle` is borrowed open for the whole call, the
         // target is open with `PROCESS_DUP_HANDLE`, and `copy` is writable. The copy's value names a handle in the
@@ -60,7 +61,7 @@ impl RemoteProcess {
                 self.handle.raw(),
                 &raw mut copy,
                 0,
-                i32::from(inheritable),
+                0,
                 DUPLICATE_SAME_ACCESS,
             )
         };
@@ -72,13 +73,22 @@ impl RemoteProcess {
 
     /// Takes the handle `value` out of the process: a copy with the same access becomes this process's, and the
     /// process's own handle is closed (`DUPLICATE_SAME_ACCESS | DUPLICATE_CLOSE_SOURCE`), whether or not the copy is
-    /// made. The copy is not inheritable.
+    /// made. The copy is not inheritable. A value no handle table entry can have is refused before any copy is tried:
+    /// 0, one that is not a multiple of 4 (the system ignores a value's two low bits, so it would name another
+    /// handle), and the top eight values, among them the pseudo-handles of the process itself, its thread and its
+    /// tokens.
     ///
     /// # Errors
     ///
-    /// The system's error when the copy cannot be made: `ERROR_INVALID_HANDLE` when the process holds no handle of
-    /// that value.
+    /// An error of kind [`io::ErrorKind::InvalidInput`] naming a value refused as above; the system's error when the
+    /// copy cannot be made: `ERROR_INVALID_HANDLE` when the process holds no handle of that value.
     pub fn pull(&self, value: usize) -> io::Result<std::os::windows::io::OwnedHandle> {
+        if value == 0 || !value.is_multiple_of(4) || value > usize::MAX - 8 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("0x{value:x} is not a handle value another process's table can hold"),
+            ));
+        }
         let mut copy: HANDLE = std::ptr::null_mut();
         let options = DUPLICATE_SAME_ACCESS | DUPLICATE_CLOSE_SOURCE;
         // SAFETY: the source is open with `PROCESS_DUP_HANDLE`, the value is only looked up in its table (a value it
@@ -200,9 +210,28 @@ pub fn image_path_of(process: BorrowedHandle<'_>) -> io::Result<PathBuf> {
     }
 }
 
-/// Whether the thread behind `thread` is suspended: it is suspended once more (`SuspendThread`), which says how many
-/// times it was before, and that suspension is undone at once (`ResumeThread`). It needs `THREAD_SUSPEND_RESUME`
-/// access.
+/// The user of the process behind `process`, as its token names it (`OpenProcessToken` with `TOKEN_QUERY`, then
+/// `TokenUser`): the SID's string form (`S-1-5-21-…`). It needs `PROCESS_QUERY_LIMITED_INFORMATION` access.
+///
+/// # Errors
+///
+/// The system's error when the process's token cannot be opened or read.
+pub fn user_of(process: BorrowedHandle<'_>) -> io::Result<String> {
+    let mut token: HANDLE = std::ptr::null_mut();
+    // SAFETY: the handle is borrowed open for the whole call, and `token` is writable; a handle without the access
+    // only makes the call fail.
+    if unsafe { OpenProcessToken(process.as_raw_handle(), TOKEN_QUERY, &raw mut token) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: a success returns a fresh token handle nothing else owns.
+    let token = unsafe { own_handle(token) }?;
+    crate::token::user_sid_of(&token)
+}
+
+/// Whether the thread behind `thread` is suspended exactly once, as a thread created suspended and not touched since
+/// is: it is suspended once more (`SuspendThread`), which says how many times it was before, and that suspension is
+/// undone at once (`ResumeThread`). A thread suspended twice or more is not: one resume would leave it suspended. It
+/// needs `THREAD_SUSPEND_RESUME` access.
 ///
 /// # Errors
 ///
@@ -222,23 +251,41 @@ pub fn thread_is_suspended(thread: BorrowedHandle<'_>) -> io::Result<bool> {
             format!("the thread was suspended to look and not resumed: {error}"),
         ));
     }
-    Ok(before >= 1)
+    Ok(before == 1)
 }
 
 #[cfg(test)]
 #[expect(clippy::expect_used, reason = "a test whose process cannot be made or read must fail loudly")]
 mod tests {
+    use std::io;
     use std::os::windows::io::{AsHandle, AsRawHandle, BorrowedHandle, FromRawHandle};
+    use std::sync::{MutexGuard, PoisonError};
     use std::time::Duration;
 
     use windows_sys::Win32::Foundation::{CompareObjectHandles, ERROR_INVALID_HANDLE};
-    use windows_sys::Win32::System::Threading::{CreateEventW, GetCurrentProcess, ResumeThread};
+    use windows_sys::Win32::System::Threading::{CreateEventW, GetCurrentProcess, ResumeThread, SuspendThread};
 
-    use super::{RemoteProcess, creation_time_of, image_path_of, parent_pid_of, pid_of_process, pid_of_thread, session_of, thread_is_suspended};
-    use crate::{EnvironmentBlock, Job, Launch, LaunchOutput, StoppableProcess, Suspended, system_directory};
+    use super::{
+        RemoteProcess, creation_time_of, image_path_of, parent_pid_of, pid_of_process, pid_of_thread, session_of, thread_is_suspended, user_of,
+    };
+    use crate::{EnvironmentBlock, Job, Launch, LaunchError, LaunchOutput, StoppableProcess, Suspended, system_directory};
 
     /// The longest a test waits for a process to end: it never runs out unless the code is broken.
     const HANG_GUARD: Duration = Duration::from_secs(600);
+
+    /// The lock every test of this crate that starts a process holds for its whole run (see `create.rs`).
+    fn one_at_a_time() -> MutexGuard<'static, ()> {
+        crate::create::tests::ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// A fresh unset manual-reset event.
+    fn event() -> std::os::windows::io::OwnedHandle {
+        // SAFETY: null security attributes and a null name are allowed. A success is a fresh handle nothing else owns.
+        let event = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
+        assert!(!event.is_null(), "the event is made: {}", io::Error::last_os_error());
+        // SAFETY: as above.
+        unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(event) }
+    }
 
     /// cmd running `command`, created suspended, its stdin and stdout pipes held by the [`Suspended`].
     fn suspended(command: &str) -> Suspended {
@@ -280,15 +327,12 @@ mod tests {
 
     #[test]
     fn handles_pulled_from_another_process_are_closed_there() {
+        let _alone = one_at_a_time();
         let holder = suspended("exit 0");
         let remote = RemoteProcess::open(holder.pid()).expect("the holder opens");
-        // SAFETY: null security attributes and a null name are allowed. A success is a fresh handle nothing else owns.
-        let event = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
-        assert!(!event.is_null(), "the event is made");
-        // SAFETY: as above.
-        let event = unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(event) };
+        let event = event();
 
-        let value = remote.push(event.as_handle(), false).expect("the event is pushed");
+        let value = remote.push(event.as_handle()).expect("the event is pushed");
         let pulled = remote.pull(value).expect("the event is pulled back");
 
         assert!(same_object(event.as_handle(), pulled.as_handle()), "the pulled handle is the event");
@@ -297,14 +341,44 @@ mod tests {
     }
 
     #[test]
+    fn pull_refuses_pseudo_and_misaligned_handle_values() {
+        let _alone = one_at_a_time();
+        let holder = suspended("exit 0");
+        let remote = RemoteProcess::open(holder.pid()).expect("the holder opens");
+        let event = event();
+        let value = remote.push(event.as_handle()).expect("the event is pushed");
+        // The system ignores a value's two low bits, so `value + 1` would name the event; the top values are the
+        // pseudo-handles of the holder itself, its thread and its tokens.
+        let impossible = [
+            0,
+            value + 1,
+            value + 2,
+            value + 3,
+            usize::MAX,
+            usize::MAX - 1,
+            usize::MAX - 3,
+            usize::MAX - 7,
+        ];
+
+        for candidate in impossible {
+            let refused = remote.pull(candidate).expect_err("an impossible handle value is refused");
+            assert_eq!(refused.kind(), io::ErrorKind::InvalidInput, "0x{candidate:x}: {refused}");
+        }
+
+        let pulled = remote.pull(value).expect("the holder's copy was left alone by the refusals");
+        assert!(same_object(event.as_handle(), pulled.as_handle()), "the pulled handle is the event");
+    }
+
+    #[test]
     fn an_adopted_suspended_child_passes_its_checks() {
+        let _alone = one_at_a_time();
         let holder = suspended("exit 0");
         let remote = RemoteProcess::open(holder.pid()).expect("the holder opens");
         let child = suspended("exit 0");
         let pid = child.pid();
         let (process, thread) = handles_of(child);
-        let process_value = remote.push(process.as_handle(), false).expect("the process is pushed");
-        let thread_value = remote.push(thread.as_handle(), false).expect("the thread is pushed");
+        let process_value = remote.push(process.as_handle()).expect("the process is pushed");
+        let thread_value = remote.push(thread.as_handle()).expect("the thread is pushed");
         drop((process, thread));
 
         let process = remote.pull(process_value).expect("the process is pulled");
@@ -335,7 +409,7 @@ mod tests {
         let job = Job::anonymous_kill_on_close().expect("the job is made");
         assert!(!job.holds_process(process.as_handle()).expect("the membership is read"));
 
-        let adopted = Suspended::adopt(process, thread).expect("the child is adopted");
+        let adopted = Suspended::adopt(process, thread, pid).expect("the child is adopted");
         adopted.assign(&job).expect("the adopted child is put in the job");
 
         assert_eq!(adopted.pid(), pid);
@@ -344,6 +418,7 @@ mod tests {
 
     #[test]
     fn a_child_that_is_not_suspended_fails_the_suspended_check() {
+        let _alone = one_at_a_time();
         // `set /p` waits on stdin, whose write end the `Suspended` keeps open, so the child runs until it is ended.
         let child = suspended("set /p line=");
         // SAFETY: the thread handle is open, with the `THREAD_SUSPEND_RESUME` access a created thread's handle has.
@@ -357,7 +432,34 @@ mod tests {
     }
 
     #[test]
+    fn a_child_suspended_twice_is_refused() {
+        let _alone = one_at_a_time();
+        let child = suspended("exit 0");
+        let watch = StoppableProcess::open(child.pid()).expect("the child opens").expect("the child exists");
+        // SAFETY: the thread handle is open, with the `THREAD_SUSPEND_RESUME` access a created thread's handle has.
+        assert_ne!(
+            unsafe { SuspendThread(child.thread.raw()) },
+            u32::MAX,
+            "the child is suspended a second time"
+        );
+
+        assert!(
+            !thread_is_suspended(borrow(&child.thread)).expect("the thread is read"),
+            "a thread suspended twice is not suspended exactly once"
+        );
+        let resumed = child.resume();
+
+        assert!(
+            matches!(resumed, Err(LaunchError::Setup { .. })),
+            "a resume that leaves the thread suspended fails"
+        );
+        assert!(watch.wait(HANG_GUARD).expect("the wait succeeds"), "the child ended");
+        assert_eq!(watch.exit_code().expect("the exit code is read"), 1, "ended unstarted");
+    }
+
+    #[test]
     fn a_job_reports_only_its_own_members() {
+        let _alone = one_at_a_time();
         let child = suspended("exit 0");
         let own = Job::anonymous_kill_on_close().expect("the job is made");
         let other = Job::anonymous_kill_on_close().expect("the other job is made");
@@ -373,6 +475,7 @@ mod tests {
 
     #[test]
     fn an_empty_job_takes_a_process_from_a_job_that_refuses_breakaway() {
+        let _alone = one_at_a_time();
         let child = suspended("exit 0");
         let refusing = Job::anonymous_kill_on_close().expect("the job is made");
         child.assign(&refusing).expect("the child is put in the job that refuses breakaway");
@@ -386,10 +489,12 @@ mod tests {
 
     #[test]
     fn a_dropped_adopted_suspended_child_is_ended_unstarted() {
+        let _alone = one_at_a_time();
         let child = suspended("exit 0");
-        let watch = StoppableProcess::open(child.pid()).expect("the child opens").expect("the child exists");
+        let pid = child.pid();
+        let watch = StoppableProcess::open(pid).expect("the child opens").expect("the child exists");
         let (process, thread) = handles_of(child);
-        let adopted = Suspended::adopt(process, thread).expect("the child is adopted");
+        let adopted = Suspended::adopt(process, thread, pid).expect("the child is adopted");
 
         drop(adopted);
 
@@ -399,5 +504,55 @@ mod tests {
             1,
             "ended unstarted, not by its own exit 0"
         );
+    }
+
+    #[test]
+    fn adopt_refuses_a_thread_of_another_process() {
+        let _alone = one_at_a_time();
+        let (first, second) = (suspended("exit 0"), suspended("exit 0"));
+        let (first_pid, second_pid) = (first.pid(), second.pid());
+        let (first_process, first_thread) = handles_of(first);
+        let (second_process, second_thread) = handles_of(second);
+
+        let refused = Suspended::adopt(first_process, second_thread, first_pid)
+            .err()
+            .expect("a thread of another process is refused");
+
+        assert_eq!(refused.why.kind(), io::ErrorKind::InvalidInput, "{refused}");
+        // Both children are adopted as they are, so dropping them ends them.
+        drop(Suspended::adopt(refused.process, first_thread, first_pid).expect("the first child is adopted"));
+        drop(Suspended::adopt(second_process, refused.thread, second_pid).expect("the second child is adopted"));
+    }
+
+    #[test]
+    fn a_refused_adopt_gives_back_its_handles_and_ends_nothing() {
+        let _alone = one_at_a_time();
+        let child = suspended("exit 0");
+        let pid = child.pid();
+        let watch = StoppableProcess::open(pid).expect("the child opens").expect("the child exists");
+        let (process, thread) = handles_of(child);
+
+        let refused = Suspended::adopt(process, thread, pid + 4)
+            .err()
+            .expect("a pid the handles are not of is refused");
+
+        assert!(!watch.wait(Duration::ZERO).expect("the wait succeeds"), "the refused child was not ended");
+        assert_eq!(pid_of_process(refused.process.as_handle()).expect("the given-back process is read"), pid);
+        assert!(
+            thread_is_suspended(refused.thread.as_handle()).expect("the given-back thread is read"),
+            "the given-back thread is still suspended once"
+        );
+        drop(Suspended::adopt(refused.process, refused.thread, pid).expect("the child is adopted after all"));
+        assert!(watch.wait(HANG_GUARD).expect("the wait succeeds"), "the adopted child ended once dropped");
+    }
+
+    #[test]
+    fn user_of_a_child_is_the_test_s_own_user() {
+        let _alone = one_at_a_time();
+        let child = suspended("exit 0");
+
+        let user = user_of(borrow(child.process.as_ref().expect("the process is held"))).expect("the child's user is read");
+
+        assert_eq!(user, crate::token_facts().expect("this process's token is read").user);
     }
 }

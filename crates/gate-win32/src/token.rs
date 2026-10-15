@@ -152,6 +152,13 @@ fn facts_of(token: &OwnedHandle) -> io::Result<TokenFacts> {
     })
 }
 
+/// The string form of the SID of `token`'s user (`TokenUser`), `token` open with `TOKEN_QUERY`.
+pub(crate) fn user_sid_of(token: &OwnedHandle) -> io::Result<String> {
+    let user = Information::<TOKEN_USER>::read(token, TokenUser)?;
+    // SAFETY: the SID points into the buffer the system wrote it in, which lives across the call.
+    unsafe { sid_string(user.get().User.Sid) }
+}
+
 /// How `token`, open with `TOKEN_QUERY`, holds the NETWORK group.
 fn network_group_of(token: &OwnedHandle) -> io::Result<NetworkGroup> {
     let network = WellKnownSid::of(WinNetworkSid)?;
@@ -232,7 +239,7 @@ unsafe fn grant_at(acl: *const ACL, index: u32) -> io::Result<Grant> {
 /// # Safety
 ///
 /// `sid` points to a valid SID for the whole call.
-unsafe fn sid_string(sid: PSID) -> io::Result<String> {
+pub(crate) unsafe fn sid_string(sid: PSID) -> io::Result<String> {
     let mut text: PWSTR = std::ptr::null_mut();
     // SAFETY: the caller guarantees `sid`, and `text` is writable.
     if unsafe { ConvertSidToStringSidW(sid, &raw mut text) } == 0 {

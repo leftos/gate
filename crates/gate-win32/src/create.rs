@@ -76,20 +76,10 @@ pub(crate) enum DesktopPolicy {
 }
 
 /// Creates the command of `creation` as [`create_process`] does, inheriting the handles of `inherited` and no other,
-/// with `desktop_policy` as its `PROC_THREAD_ATTRIBUTE_DESKTOP_APP_POLICY`. Under the spawn lock it makes an
-/// inheritable copy of each handle, creates the command with the copies and closes them, so a copy is open only while
-/// the lock is held. The command is created on this process's own window station and desktop.
-pub(crate) fn create_inheriting(
-    creation: &Creation<'_>,
-    flags: PROCESS_CREATION_FLAGS,
-    inherited: &Inherited<'_>,
-    desktop_policy: DesktopPolicy,
-) -> Result<Suspended, LaunchError> {
-    create_inheriting_on(creation, flags, inherited, desktop_policy, None)
-}
-
-/// Creates the command as [`create_inheriting`] does, on the window station and desktop `desktop`
-/// (`STARTUPINFO.lpDesktop`, such as `WinSta0\Default`), or on this process's own for `None`.
+/// with `desktop_policy` as its `PROC_THREAD_ATTRIBUTE_DESKTOP_APP_POLICY`, on the window station and desktop `desktop`
+/// (`STARTUPINFO.lpDesktop`, such as `WinSta0\Default`), or on this process's own for `None`. Under the spawn lock it
+/// makes an inheritable copy of each handle, creates the command with the copies and closes them, so a copy is open
+/// only while the lock is held.
 pub(crate) fn create_inheriting_on(
     creation: &Creation<'_>,
     flags: PROCESS_CREATION_FLAGS,
@@ -319,9 +309,9 @@ fn create_process(creation: &Creation<'_>, flags: PROCESS_CREATION_FLAGS, startu
     // may change, the environment is a block `EnvironmentBlock` built (ended by two NULs) and
     // `CREATE_UNICODE_ENVIRONMENT` says it is UTF-16; `startup` is a whole `STARTUPINFOEXW` whose `cb` says so and
     // `EXTENDED_STARTUPINFO_PRESENT` says so too, and it borrows its attribute list, which borrows the handles it
-    // names, and its desktop name, NUL-terminated, when it has one; every buffer outlives the call and `created` is writable. A token is borrowed by `creation` for its whole
-    // life, so it stays open across the call, with the access `RestrictedToken` opened it with: primary assignment,
-    // duplication, query and default adjustment.
+    // names, and its desktop name, NUL-terminated, when it has one; every buffer outlives the call and `created` is
+    // writable. A token is borrowed by `creation` for its whole life, so it stays open across the call, with the access
+    // `RestrictedToken` opened it with: primary assignment, duplication, query and default adjustment.
     let ok = unsafe {
         match creation.token {
             None => CreateProcessW(
@@ -388,7 +378,7 @@ fn create_process(creation: &Creation<'_>, flags: PROCESS_CREATION_FLAGS, startu
 
 #[cfg(test)]
 #[expect(clippy::expect_used, reason = "a test that cannot start its command must fail loudly")]
-mod tests {
+pub(crate) mod tests {
     use std::cell::Cell;
     use std::path::PathBuf;
     use std::sync::{Mutex, PoisonError, TryLockError};
@@ -409,7 +399,7 @@ mod tests {
     /// Keeps these tests from running at once, so that one's launch never holds the spawn lock while the other checks
     /// that it is free. Every unit test of this crate that starts a process takes it for its whole run, or that check
     /// races.
-    static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
+    pub(crate) static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
 
     thread_local! {
         /// How many handles the last spawn window of this thread checked, until a test takes it.
@@ -532,7 +522,11 @@ mod tests {
         class
     }
 
-    /// This process lowered to the below-normal class, put back to the class it had when dropped.
+    /// This process lowered to the below-normal class, put back to the class it had when dropped. A stated exception to
+    /// the rule that a test never lowers its own priority: the condition under test is a below-normal parent, and the
+    /// verdict is one state read, the child's class, with no wait or clock a starved run could miss. The class covers
+    /// the whole process, so this is safe only because nextest runs each test in a process of its own: under
+    /// `cargo test` every sibling test's children created meanwhile would inherit the lowered class.
     struct Lowered(u32);
 
     impl Lowered {
@@ -551,10 +545,21 @@ mod tests {
 
     impl Drop for Lowered {
         fn drop(&mut self) {
-            // SAFETY: as in `Lowered::set`. A restore that fails leaves the class lowered for the rest of this test's
-            // own process alone.
-            unsafe { SetPriorityClass(GetCurrentProcess(), self.0) };
+            // SAFETY: as in `Lowered::set`.
+            let restored = unsafe { SetPriorityClass(GetCurrentProcess(), self.0) } != 0;
+            let error = std::io::Error::last_os_error();
+            if !restored && std::thread::panicking() {
+                report_unrestored(&error);
+            }
+            assert!(restored || std::thread::panicking(), "the priority class is restored: {error}");
         }
+    }
+
+    /// Says on stderr that the priority class was not restored, while the test is already failing: a second panic
+    /// would abort the run and lose the first one's message.
+    #[expect(clippy::print_stderr, reason = "a drop during a panic can only report its own failure on stderr")]
+    fn report_unrestored(error: &std::io::Error) {
+        eprintln!("the priority class was not restored: {error}");
     }
 
     #[test]

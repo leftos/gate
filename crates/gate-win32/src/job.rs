@@ -419,13 +419,10 @@ impl Job {
     /// The system's error when that cannot be read.
     pub fn holds_process(&self, process: std::os::windows::io::BorrowedHandle<'_>) -> io::Result<bool> {
         let process = std::os::windows::io::AsRawHandle::as_raw_handle(&process);
-        let mut inside = 0;
-        // SAFETY: the job's handle is open for as long as `self` lives, the process handle is borrowed open for the
-        // whole call, and one without the access the call asks for only makes it fail; `inside` is writable.
-        if unsafe { IsProcessInJob(process, self.handle.raw(), &raw mut inside) } == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(inside != 0)
+        // SAFETY: the handle is borrowed open for the whole call, and the guard made from it is never dropped, so it
+        // never closes a handle it does not own.
+        let guard = std::mem::ManuallyDrop::new(unsafe { own_handle(process) }?);
+        self.holds(&guard)
     }
 
     /// The CPU time the job has used, every process ever in it counted, and the processes it holds now.

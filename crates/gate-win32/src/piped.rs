@@ -23,7 +23,7 @@ use windows_sys::Win32::System::Threading::{
 };
 use windows_sys::Win32::System::WindowsProgramming::PROCESS_CREATION_DESKTOP_APP_BREAKAWAY_DISABLE_PROCESS_TREE;
 
-use crate::create::{Creation, DesktopPolicy, Inherited, check_launch, create_inheriting, create_inheriting_on};
+use crate::create::{Creation, DesktopPolicy, Inherited, check_launch, create_inheriting_on};
 use crate::launch::{open_shared, setup, struct_size};
 use crate::{EnvironmentBlock, Job, LaunchError, RestrictedToken, Suspended, own_handle, wide};
 
@@ -148,7 +148,7 @@ impl PipedLaunch {
             PipedConsole::Attached => breakaway,
         };
         let policy = DesktopPolicy::Wanted(PROCESS_CREATION_DESKTOP_APP_BREAKAWAY_DISABLE_PROCESS_TREE);
-        let suspended = create_inheriting(&creation, flags, &inherited, policy)?;
+        let suspended = create_inheriting_on(&creation, flags, &inherited, policy, None)?;
         // The command holds its own copies now; with these closed, each read end ends when the command's copies do.
         drop((input, output, errors, job_handle));
         Ok(PipedSuspended { suspended, stdout, stderr })

@@ -4,9 +4,10 @@
 //! system's boot time, what a drive letter stands for, a rename that never replaces its target, and the Windows message
 //! of an error code. And what a run on the interactive desktop needs: a named pipe for one user's local client, handles
 //! copied into and out of another process and the checks on a process taken that way, a command created on the
-//! interactive desktop, and the console session's state. It holds no policy:
-//! the names, the waits, the command's environment and priority, and what an abandoned mutex means to the gate are the
-//! caller's. Windows only; elsewhere the crate is empty.
+//! interactive desktop, and the console session's state. It holds no policy but one: a [`DesktopLaunch`] always
+//! creates its command in the normal priority class on `WinSta0\Default`. The names, the waits, the environment and
+//! priority of any other command, and what an abandoned mutex means to the gate are the caller's. Windows only;
+//! elsewhere the crate is empty.
 
 #![cfg(windows)]
 
@@ -29,14 +30,18 @@ mod times;
 mod token;
 mod tree;
 
-pub use adopt::{RemoteProcess, creation_time_of, image_path_of, parent_pid_of, pid_of_process, pid_of_thread, session_of, thread_is_suspended};
+pub use adopt::{
+    RemoteProcess, creation_time_of, image_path_of, parent_pid_of, pid_of_process, pid_of_thread, session_of, thread_is_suspended, user_of,
+};
 pub use console::{Donor, Utf8Console};
 pub use create::spawn;
 pub use device::device_target;
 pub use event::{EventWait, NamedEvent};
 pub use interrupt::Interrupt;
 pub use job::{Accounting, Job};
-pub use launch::{EnvironmentBlock, Launch, LaunchError, LaunchOutput, PriorityClass, Running, StdioPipes, Suspended, Waited, same_variable_name};
+pub use launch::{
+    AdoptError, EnvironmentBlock, Launch, LaunchError, LaunchOutput, PriorityClass, Running, StdioPipes, Suspended, Waited, same_variable_name,
+};
 pub use memory::working_set;
 pub use mutex::{AcquireError, MutexGuard, NamedMutex, OwnedMutexGuard, mutex_exists};
 pub use pipe::{ConnectWait, PipeClient, PipeServer};

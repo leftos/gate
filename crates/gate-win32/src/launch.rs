@@ -28,7 +28,7 @@ use windows_sys::Win32::System::Threading::{
 };
 use windows_sys::Win32::System::WindowsProgramming::PROCESS_CREATION_DESKTOP_APP_BREAKAWAY_DISABLE_PROCESS_TREE;
 
-use crate::create::{Creation, DesktopPolicy, Inherited, check_launch, create_inheriting};
+use crate::create::{Creation, DesktopPolicy, Inherited, check_launch, create_inheriting_on};
 use crate::interrupt::{Woken, wait_with};
 use crate::piped::{pipe_from_child, pipe_to_child};
 use crate::{Interrupt, Job, own_handle, wait_millis, win32_message};
@@ -288,11 +288,12 @@ impl Launch {
             others: &[],
         };
         let policy = PROCESS_CREATION_DESKTOP_APP_BREAKAWAY_DISABLE_PROCESS_TREE;
-        let mut suspended = create_inheriting(
+        let mut suspended = create_inheriting_on(
             &creation,
             self.priority.map_or(0, PriorityClass::flag),
             &inherited,
             DesktopPolicy::Required(policy),
+            None,
         )?;
         // The command holds its own copies of its ends now; with these closed, each pipe ends when the command's does.
         drop((input, output, errors));
@@ -435,37 +436,49 @@ pub struct Suspended {
 
 impl Suspended {
     /// Takes a suspended process another process created, from its process handle and the handle of its first thread,
-    /// as [`crate::RemoteProcess::pull`] copies them out: the caller has checked both are what it expects. From here it
-    /// is as a command this crate created: dropped before [`Suspended::assign_and_resume`], it is terminated with exit
-    /// code 1. The process handle needs `PROCESS_TERMINATE`, `PROCESS_SET_QUOTA` and query access, and the thread
-    /// handle `THREAD_SUSPEND_RESUME`, as the handles `CreateProcessW` returns have.
+    /// as [`crate::RemoteProcess::pull`] copies them out, once both are checked to stand for the process `pid`: the
+    /// process's id (`GetProcessId`) and its thread's (`GetProcessIdOfThread`) must both be `pid`. The caller has
+    /// checked the rest it expects. From here it is as a command this crate created: dropped before
+    /// [`Suspended::assign_and_resume`], it is terminated with exit code 1. The process handle needs
+    /// `PROCESS_TERMINATE`, `PROCESS_SET_QUOTA` and query access, and the thread handle `THREAD_SUSPEND_RESUME` and
+    /// `THREAD_QUERY_LIMITED_INFORMATION`, as the handles `CreateProcessW` returns have.
     ///
     /// # Errors
     ///
-    /// The system's error when the process's id cannot be read; both handles are then closed, and the process is not
-    /// ended.
-    pub fn adopt(process: std::os::windows::io::OwnedHandle, thread: std::os::windows::io::OwnedHandle) -> io::Result<Suspended> {
-        use std::os::windows::io::{AsHandle, IntoRawHandle};
+    /// An [`AdoptError`] holding both handles, unchanged, when either id cannot be read or is not `pid`: nothing is
+    /// ended, and the caller decides what becomes of the process.
+    pub fn adopt(process: std::os::windows::io::OwnedHandle, thread: std::os::windows::io::OwnedHandle, pid: u32) -> Result<Suspended, AdoptError> {
+        use std::os::windows::io::{AsHandle, FromRawHandle, IntoRawHandle};
 
-        let pid = crate::pid_of_process(process.as_handle())?;
-        // SAFETY: `into_raw_handle` gives up the std guard's ownership, so the new guard alone owns each open handle.
-        let process = unsafe { own_handle(process.into_raw_handle()) }?;
-        // SAFETY: as above.
-        let thread = match unsafe { own_handle(thread.into_raw_handle()) } {
-            Ok(thread) => thread,
-            Err(error) => {
-                // The thread handle was null, so the process's own handle is closed without ending it.
-                drop(process);
-                return Err(error);
+        if let Err(why) = check_adopted(process.as_handle(), thread.as_handle(), pid) {
+            return Err(AdoptError { process, thread, why });
+        }
+        let (process, thread) = (process.into_raw_handle(), thread.into_raw_handle());
+        // SAFETY: `into_raw_handle` gave up the std guards' ownership, so each new guard alone owns its open handle; a
+        // guard refused gives its handle back to a std guard below, unclosed.
+        let owned = unsafe { (own_handle(process), own_handle(thread)) };
+        match owned {
+            (Ok(process), Ok(thread)) => Ok(Suspended {
+                process: Some(process),
+                thread,
+                pid,
+                pipes: None,
+                note: None,
+            }),
+            (process_guard, thread_guard) => {
+                // A guard that was made is never dropped, so both handles go back to the caller unclosed.
+                let _unclosed = std::mem::ManuallyDrop::new((process_guard, thread_guard));
+                let why = io::Error::other("a handle that passed the checks was refused as a guard's");
+                // SAFETY: both handles are as the caller gave them, and no guard owns them any more.
+                let (process, thread) = unsafe {
+                    (
+                        std::os::windows::io::OwnedHandle::from_raw_handle(process),
+                        std::os::windows::io::OwnedHandle::from_raw_handle(thread),
+                    )
+                };
+                Err(AdoptError { process, thread, why })
             }
-        };
-        Ok(Suspended {
-            process: Some(process),
-            thread,
-            pid,
-            pipes: None,
-            note: None,
-        })
+        }
     }
 
     /// Whether the command is in `job`, or in a job nested inside it (`IsProcessInJob` on that job alone, not any job).
@@ -531,20 +544,60 @@ impl Suspended {
     ///
     /// # Errors
     ///
-    /// [`LaunchError::Setup`] when the command cannot be resumed; it is terminated with exit code 1 first.
+    /// [`LaunchError::Setup`] when the command cannot be resumed, or when its thread was not suspended exactly once,
+    /// so the resume did not let it run (or it ran already); it is terminated with exit code 1 first.
     pub fn resume(mut self) -> Result<Running, LaunchError> {
         let Some(process) = self.process.take() else {
             return Err(setup(io::Error::other("the process was already taken"), "resume the command"));
         };
         // SAFETY: the thread handle is open for the whole call, with the `THREAD_SUSPEND_RESUME` access a created
         // thread's handle has.
-        if unsafe { ResumeThread(self.thread.raw()) } == u32::MAX {
-            let error = io::Error::last_os_error();
-            end_unstarted(&process);
-            return Err(setup(error, "resume the command"));
-        }
-        Ok(Running { process, pid: self.pid })
+        let error = match unsafe { ResumeThread(self.thread.raw()) } {
+            1 => return Ok(Running { process, pid: self.pid }),
+            u32::MAX => io::Error::last_os_error(),
+            count => io::Error::other(format!("the command's thread had a suspend count of {count}, not 1")),
+        };
+        end_unstarted(&process);
+        Err(setup(error, "resume the command"))
     }
+}
+
+/// A refused [`Suspended::adopt`]: the two handles it was given, open and unchanged, and why they were refused.
+/// Nothing was ended.
+#[derive(Debug)]
+pub struct AdoptError {
+    /// The process handle, as it was given.
+    pub process: std::os::windows::io::OwnedHandle,
+    /// The thread handle, as it was given.
+    pub thread: std::os::windows::io::OwnedHandle,
+    /// Why the handles were refused.
+    pub why: io::Error,
+}
+
+impl std::fmt::Display for AdoptError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "the suspended process was not adopted: {}", self.why)
+    }
+}
+
+impl std::error::Error for AdoptError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.why)
+    }
+}
+
+/// Refuses a process handle and a thread handle that do not both stand for the process `pid`: the process's id
+/// (`GetProcessId`) and the id of the thread's process (`GetProcessIdOfThread`) must both be `pid`.
+fn check_adopted(process: std::os::windows::io::BorrowedHandle<'_>, thread: std::os::windows::io::BorrowedHandle<'_>, pid: u32) -> io::Result<()> {
+    let of_process = crate::pid_of_process(process)?;
+    let of_thread = crate::pid_of_thread(thread)?;
+    if of_process != pid || of_thread != pid {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("the process handle is of pid {of_process} and the thread handle of a thread of pid {of_thread}, not both of pid {pid}"),
+        ));
+    }
+    Ok(())
 }
 
 impl Drop for Suspended {
