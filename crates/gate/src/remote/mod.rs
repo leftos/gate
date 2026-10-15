@@ -208,6 +208,8 @@ pub(crate) struct RemoteCall<'a> {
     /// Whether the route withheld the run's outputs, its command a dotnet `--no-build` one whose word the builder
     /// dropped: the builder builds, and nothing comes back.
     pub outputs_withheld: bool,
+    /// The input globs the run sends: the repo's `inputs` list, none when it has no entry.
+    pub inputs: &'a [String],
     /// The `--bring-tracked` globs: a fetched output git tracks is installed only when one matches it.
     pub bring_tracked: &'a [String],
     /// The log the client writes the run's output to.
@@ -410,6 +412,7 @@ mod snapshot_only {
                 words: &[],
                 outputs: &[],
                 outputs_withheld: false,
+                inputs: &[],
                 log,
                 timeout: 3600,
                 usual: None,
@@ -669,6 +672,7 @@ mod scripted {
             "subfolder": call.subfolder,
             "words": call.words,
             "outputs": call.outputs,
+            "inputs": call.inputs,
             "log": call.log.to_string_lossy(),
             "timeout": call.timeout,
             "stall": call.stall,

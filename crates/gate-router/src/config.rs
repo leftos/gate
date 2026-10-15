@@ -1,8 +1,8 @@
 //! The routing file, `remote.json`, read from its text: the builder's `host`, the optional `hosts` (further builders,
 //! which `gate push` reaches and routing neither reads nor refuses), the remote pool's `slots` (a whole
 //! number 1 to 16, 1 when missing), `repos` (each repo name's list of `-like` patterns for the commands that route) and
-//! the optional `outputs` (each repo name's globs for the files a routed run brings back) and the optional `siblings`
-//! (each repo name's list of the sibling folder names a routed run of it may carry). Keys match in any letter
+//! the optional `outputs` (each repo name's globs for the files a routed run brings back), the optional `inputs` (each
+//! repo name's globs for the ignored files a routed run sends) and the optional `siblings` (each repo name's list of the sibling folder names a routed run of it may carry). Keys match in any letter
 //! case and unknown keys are ignored. The text may hold `//` and `/* */` comments and trailing commas, as the
 //! PowerShell gate's JSON reader allows; single-quoted strings are refused. A file that breaks a rule is unusable as a
 //! whole, for the reason the PowerShell gate gives (or, for a host ssh or git would misread, a reason of its own),
@@ -35,6 +35,7 @@ pub struct Config {
     slots: u32,
     repos: Vec<(String, Vec<Pattern>)>,
     outputs: Vec<(String, Vec<Pattern>)>,
+    inputs: Vec<(String, Vec<Pattern>)>,
     /// Each repo name's allowed sibling names, or why `siblings` cannot be used, which allows none.
     siblings: Result<Vec<(String, Vec<String>)>, String>,
 }
@@ -65,8 +66,8 @@ impl Config {
     ///
     /// The reason the file is unusable, worded as the PowerShell gate words it: text that is not JSON, two keys of one
     /// object differing only in letter case, a value that is not a JSON object, a missing or empty `host`, a `slots`
-    /// that is not a whole number 1 to 16, a missing `repos`, a `repos` or `outputs` that is not an object of arrays
-    /// of non-empty valid patterns, or an output glob holding `[` or `]`.
+    /// that is not a whole number 1 to 16, a missing `repos`, a `repos`, `outputs` or `inputs` that is not an object of
+    /// arrays of non-empty valid patterns, or an output or input glob holding `[` or `]`.
     ///
     /// A `host` that is not an ssh alias or `user@host` of letters, digits, `.`, `_` and `-` is refused with a reason of
     /// the gate's own, since the PowerShell gate accepts it. A bad `hosts` leaves the file usable for routing, and
@@ -87,6 +88,7 @@ impl Config {
         let slots = read_slots(&data)?;
         let repos = read_table(&data, "repos", true)?;
         let outputs = read_table(&data, "outputs", false)?;
+        let inputs = read_table(&data, "inputs", false)?;
         let (builders, hosts_problem) = match read_builders(&data, &host) {
             Ok(builders) => (builders, None),
             Err(problem) => (vec![host], Some(problem)),
@@ -97,6 +99,7 @@ impl Config {
             slots,
             repos,
             outputs,
+            inputs,
             siblings: read_siblings(&data),
         })
     }
@@ -158,6 +161,12 @@ impl Config {
     pub fn outputs(&self, repo: &str) -> Vec<String> {
         self.own_outputs(repo)
             .unwrap_or_else(|| DEFAULT_OUTPUTS.iter().map(|glob| (*glob).to_owned()).collect())
+    }
+
+    /// The input globs `inputs` lists for `repo`, matched in any letter case: none when it does not name it.
+    #[must_use]
+    pub fn inputs(&self, repo: &str) -> Vec<String> {
+        find(&self.inputs, repo).map_or_else(Vec::new, |globs| globs.iter().map(|glob| glob.as_str().to_owned()).collect())
     }
 }
 
@@ -379,7 +388,7 @@ fn read_slots(data: &Map<String, Value>) -> Result<u32, String> {
         .ok_or_else(|| format!("slots must be a whole number 1 to {MAX_SLOTS}"))
 }
 
-/// The `repos` or `outputs` table: each repo name's pattern list, in file order; an empty table when the key is
+/// The `repos`, `outputs` or `inputs` table: each repo name's pattern list, in file order; an empty table when the key is
 /// missing and not `required`.
 fn read_table(data: &Map<String, Value>, key: &str, required: bool) -> Result<RepoTable, String> {
     let Some(value) = property(data, key) else {
@@ -435,14 +444,19 @@ fn read_list(key: &str, name: &str, list: &Value) -> Result<Vec<Pattern>, String
 }
 
 /// One item of a pattern list, or what is wrong with it: not a non-empty string, not a valid wildcard pattern, or, as
-/// an output glob, holding `[` or `]`, which `-like` reads as a set and the outputs step as the character itself.
+/// an output or input glob, holding `[` or `]`, which `-like` reads as a set and the glob matcher as the character
+/// itself.
 fn read_pattern(key: &str, item: &Value) -> Result<Pattern, &'static str> {
     let Some(text) = item.as_str().filter(|text| !text.is_empty()) else {
         return Err("is not a non-empty string");
     };
     let pattern = Pattern::parse(text).map_err(|_| "is not a valid wildcard pattern")?;
-    if key == "outputs" && text.contains(['[', ']']) {
-        return Err("is not a valid output glob: '[' and ']' are not allowed");
+    if text.contains(['[', ']']) {
+        match key {
+            "outputs" => return Err("is not a valid output glob: '[' and ']' are not allowed"),
+            "inputs" => return Err("is not a valid input glob: '[' and ']' are not allowed"),
+            _ => {}
+        }
     }
     Ok(pattern)
 }

@@ -347,6 +347,7 @@ mod tests {
                 words: Vec::new(),
                 fallback: Vec::new(),
                 outputs: Vec::new(),
+                inputs: Vec::new(),
                 dropped_no_build: false,
                 outputs_withheld: false,
             }

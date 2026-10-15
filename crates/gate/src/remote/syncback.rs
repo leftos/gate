@@ -2130,6 +2130,7 @@ mod tests {
             words: &[],
             outputs: &[],
             outputs_withheld: false,
+            inputs: &[],
             log: &log,
             timeout: 60,
             usual: None,
@@ -2935,6 +2936,7 @@ mod tests {
             words: &[],
             outputs: &[],
             outputs_withheld: false,
+            inputs: &[],
             log,
             timeout: 60,
             usual: None,
@@ -3617,6 +3619,7 @@ mod tests {
             words: Vec::new(),
             fallback: Vec::new(),
             outputs: Vec::new(),
+            inputs: Vec::new(),
             dropped_no_build: false,
             outputs_withheld: false,
         };

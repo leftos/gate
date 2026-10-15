@@ -2985,6 +2985,7 @@ mod tests {
             words: &[],
             outputs: &[],
             outputs_withheld: false,
+            inputs: &[],
             log,
             timeout: 60,
             usual: None,

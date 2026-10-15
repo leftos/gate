@@ -787,6 +787,24 @@ fn the_client_is_called_with_the_rewritten_words_and_the_route() {
 }
 
 #[test]
+fn the_client_is_called_with_the_repo_s_inputs() {
+    let case = routed_case("routing-call-inputs");
+    let routing = json!({
+        "host": HOST,
+        "repos": { repo(&case): ["*tool*"] },
+        "inputs": { repo(&case): [".tmp/helper/**", "keys.json"] },
+    });
+    write_remote_json(&case, &routing.to_string());
+    let call = case.folder().join("call.json");
+    let steps = shown(&stub(&case, &[&format!("record {}", shown(&call)), "status 0"]));
+    let outcome = finish(case.gate(&routed_words("out.log", &steps, &[], &[r".\tool.exe", "argv", "a"])));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let call = recorded(&call);
+    assert_eq!(call["inputs"], json!([".tmp/helper/**", "keys.json"]), "{call}");
+}
+
+#[test]
 fn a_failing_client_status_is_the_gates_and_the_log_is_scanned() {
     let case = routed_case("routing-failing");
     let failing = shown(&stub(&case, &["err error CS1002: x", "status 1"]));

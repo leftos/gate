@@ -29,6 +29,56 @@ fn a_good_file_gives_host_slots_patterns_and_outputs() {
 }
 
 #[test]
+fn an_inputs_entry_is_read_and_a_repo_it_does_not_name_has_none() {
+    let config = Config::parse(
+        r#"{"host": "builder-1", "repos": {"gate": [], "other": []},
+            "inputs": {"Gate": [".tmp/helper/**", "secrets.json"]}}"#,
+    )
+    .expect("usable");
+    assert_eq!(config.inputs("gate"), [".tmp/helper/**", "secrets.json"]);
+    assert_eq!(config.inputs("other"), Vec::<String>::new());
+    assert_eq!(
+        Config::parse(r#"{"host": "builder-1", "repos": {}}"#).expect("usable").inputs("gate"),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn an_unusable_inputs_entry_is_refused_as_an_outputs_entry_is() {
+    let cases = [
+        (r#"{"host": "bx", "repos": {"g": ["x"]}, "inputs": []}"#, "inputs must be a JSON object"),
+        (
+            r#"{"host": "bx", "repos": {"g": ["x"]}, "inputs": {"g": "x"}}"#,
+            "inputs.g is not an array of strings",
+        ),
+        (
+            r#"{"host": "bx", "repos": {"g": ["x"]}, "inputs": {"g": ["x", ""]}}"#,
+            "inputs.g[1] is not a non-empty string",
+        ),
+        (
+            r#"{"host": "bx", "repos": {"g": ["x"]}, "inputs": {"g": ["x", 3]}}"#,
+            "inputs.g[1] is not a non-empty string",
+        ),
+        (
+            r#"{"host": "bx", "repos": {"g": ["x"]}, "inputs": {"g": ["[x]"]}}"#,
+            "inputs.g[0] is not a valid input glob: '[' and ']' are not allowed",
+        ),
+        (
+            r#"{"host": "bx", "repos": {"g": ["x"]}, "inputs": {"g": ["a", "x]"]}}"#,
+            "inputs.g[1] is not a valid input glob: '[' and ']' are not allowed",
+        ),
+    ];
+    let failures: Vec<String> = cases
+        .iter()
+        .filter_map(|(text, expected)| {
+            let got = Config::parse(text).map(|_| ());
+            (got != Err((*expected).to_owned())).then(|| format!("{text}: expected {expected:?}, got {got:?}"))
+        })
+        .collect();
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+#[test]
 fn keys_and_repo_names_match_in_any_letter_case() {
     let config = Config::parse(r#"{"HOST": "builder-1", "Slots": 2, "Repos": {"Gate": ["x"]}}"#).expect("usable");
     assert_eq!(config.host(), "builder-1");
@@ -39,7 +89,7 @@ fn keys_and_repo_names_match_in_any_letter_case() {
 
 #[test]
 fn unknown_keys_are_ignored() {
-    let config = Config::parse(r#"{"host": "builder-1", "repos": {"gate": []}, "inputs": {"gate": 5}, "other": [1]}"#).expect("usable");
+    let config = Config::parse(r#"{"host": "builder-1", "repos": {"gate": []}, "extras": {"gate": 5}, "other": [1]}"#).expect("usable");
     assert_eq!(config.host(), "builder-1");
 }
 

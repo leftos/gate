@@ -77,6 +77,7 @@ fn the_control_command_routes_from_the_root() {
             words: stamped(&["dotnet", "test", "tests/T.csproj"]),
             fallback: command.clone(),
             outputs: words(&["**/bin/**", "**/.godot/mono/temp/bin/**"]),
+            inputs: Vec::new(),
             dropped_no_build: false,
             outputs_withheld: false,
         }
@@ -733,6 +734,30 @@ fn a_repo_with_its_own_outputs_gets_them() {
     let config = Config::parse(r#"{"host": "builder-1", "repos": {"yaat": ["*"]}, "outputs": {"Yaat": ["target/**"]}}"#).expect("usable");
     let command = words(&["cargo", "build"]);
     assert_eq!(routed(decide(&heavy(&command), &FakeFacts::with_config(config))).outputs, ["target/**"]);
+}
+
+#[test]
+fn a_repo_s_inputs_reach_the_run_and_a_repo_without_an_entry_has_none() {
+    let config =
+        Config::parse(r#"{"host": "builder-1", "repos": {"yaat": ["*"], "other": ["*"]}, "inputs": {"Yaat": [".tmp/helper/**", "keys.json"]}}"#)
+            .expect("usable");
+    let command = words(&["cargo", "build"]);
+    let run = routed(decide(&heavy(&command), &FakeFacts::with_config(config)));
+    assert_eq!(run.inputs, [".tmp/helper/**", "keys.json"]);
+
+    let config = Config::parse(r#"{"host": "builder-1", "repos": {"yaat": ["*"]}, "inputs": {"other": ["keys.json"]}}"#).expect("usable");
+    let run = routed(decide(&heavy(&command), &FakeFacts::with_config(config)));
+    assert_eq!(run.inputs, Vec::<String>::new());
+}
+
+#[test]
+fn a_dotnet_no_build_command_keeps_its_inputs_while_its_outputs_are_withheld() {
+    let config = Config::parse(r#"{"host": "builder-1", "repos": {"yaat": ["dotnet *"]}, "inputs": {"yaat": [".tmp/helper/**"]}}"#).expect("usable");
+    let command = words(&["dotnet", "test", "--no-build"]);
+    let run = routed(decide(&heavy(&command), &FakeFacts::with_config(config)));
+    assert!(run.outputs_withheld);
+    assert_eq!(run.outputs, Vec::<String>::new());
+    assert_eq!(run.inputs, [".tmp/helper/**"], "the drop withholds outputs, not inputs");
 }
 
 #[test]

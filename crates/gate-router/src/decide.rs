@@ -355,6 +355,9 @@ pub struct RemoteRun {
     pub fallback: Vec<String>,
     /// The output globs the run brings back; none for a dotnet `--no-build` command.
     pub outputs: Vec<String>,
+    /// The input globs the run sends: the repo's `inputs` list, none when it has no entry; kept for a dotnet
+    /// `--no-build` command, whose outputs alone are withheld.
+    pub inputs: Vec<String>,
     /// Whether `--no-build` was dropped from the builder's words.
     pub dropped_no_build: bool,
     /// Whether outputs were withheld from a `--no-build` command.
@@ -919,6 +922,7 @@ fn remote_run(matched: Matched<'_>, subfolder: String, given: &[String], facts: 
     if outputs_withheld {
         outputs.clear();
     }
+    let inputs = matched.config.inputs(&matched.repo);
     mark_bare_first_word(&mut words, facts);
     stamp_source_revision(&mut words, &matched.place, facts);
     RemoteRun {
@@ -934,6 +938,7 @@ fn remote_run(matched: Matched<'_>, subfolder: String, given: &[String], facts: 
         words,
         fallback,
         outputs,
+        inputs,
         dropped_no_build,
         outputs_withheld,
     }
