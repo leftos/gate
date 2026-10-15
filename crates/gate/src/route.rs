@@ -243,7 +243,7 @@ impl Facts for Machine<'_> {
 
     fn root_id(&self, root: &str) -> Result<FolderId, String> {
         let unreadable = |error: io::Error| format!("cannot read the id of the worktree folder {root}: {error}");
-        let folder = open_followed(Path::new(root)).map_err(unreadable)?;
+        let folder = open_followed(Path::new(root), Share::All).map_err(unreadable)?;
         let (volume, file) = gate_win32::file_id(&folder).map_err(unreadable)?;
         Ok(FolderId { volume, file })
     }
@@ -265,7 +265,7 @@ pub(crate) fn sibling_folder(root: &str) -> Result<SiblingFolder, String> {
     let (Some(parent), Some(name)) = (path.parent(), path.file_name().and_then(OsStr::to_str)) else {
         return Err(format!("cannot read the sibling folder {root}: it names no folder inside another"));
     };
-    let parent = match open_followed(parent) {
+    let parent = match open_followed(parent, Share::All) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(SiblingFolder::Missing),
         parent => parent.map_err(unreadable)?,
     };
@@ -288,12 +288,11 @@ pub(crate) fn sibling_folder(root: &str) -> Result<SiblingFolder, String> {
     Ok(SiblingFolder::Present(FolderId { volume, file }))
 }
 
-/// The folder at `path` opened for reading, a link or a junction on the way followed, sharing reading, writing and
-/// deletion.
-fn open_followed(path: &Path) -> io::Result<fs::File> {
+/// The folder at `path` opened for reading, a link or a junction on the way followed, sharing what `share` says.
+pub(crate) fn open_followed(path: &Path, share: Share) -> io::Result<fs::File> {
     fs::OpenOptions::new()
         .read(true)
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .share_mode(share.mode())
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
         .open(path)
 }

@@ -14,8 +14,8 @@ use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
 use windows_sys::Wdk::Storage::FileSystem::{FILE_OPEN, FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT, NtCreateFile};
 use windows_sys::Win32::Foundation::{GENERIC_READ, INVALID_HANDLE_VALUE, OBJ_CASE_INSENSITIVE, RtlNtStatusToDosError, UNICODE_STRING};
 use windows_sys::Win32::Storage::FileSystem::{
-    FILE_GENERIC_READ, FILE_ID_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileIdInfo, GetFileInformationByHandleEx, MoveFileExW,
-    ReOpenFile,
+    FILE_GENERIC_READ, FILE_ID_INFO, FILE_REMOTE_PROTOCOL_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileIdInfo,
+    FileRemoteProtocolInfo, GetFileInformationByHandleEx, MoveFileExW, ReOpenFile,
 };
 use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
@@ -75,7 +75,7 @@ pub fn open_beneath(folder: &File, name: &str, share: Share) -> io::Result<File>
     Ok(unsafe { File::from_raw_handle(handle) })
 }
 
-/// What others may do with a file or folder while [`open_beneath`] holds it open.
+/// What others may do with a file or folder while a handle holds it open, [`open_beneath`]'s or another open's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Share {
     /// Read, write and delete it, a rename included.
@@ -85,8 +85,9 @@ pub enum Share {
 }
 
 impl Share {
-    /// The share mode of an open that lets others do this.
-    fn mode(self) -> u32 {
+    /// The share mode of an open that lets others do this, as `CreateFileW` and `OpenOptions::share_mode` take it.
+    #[must_use]
+    pub fn mode(self) -> u32 {
         match self {
             Share::All => FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             Share::NoDelete => FILE_SHARE_READ | FILE_SHARE_WRITE,
@@ -151,6 +152,22 @@ pub fn file_id(file: &File) -> io::Result<(u64, [u8; 16])> {
         return Err(io::Error::last_os_error());
     }
     Ok((information.VolumeSerialNumber, information.FileId.Identifier))
+}
+
+/// Whether the open file or folder `file` is on a network volume: whether the system gives its remote protocol
+/// information (`FileRemoteProtocolInfo`), which it gives only for a file a network redirector serves; a local file
+/// system fails the call.
+///
+/// # Errors
+///
+/// Only when the information's size cannot be passed, which never happens on a supported target.
+pub fn on_network_volume(file: &File) -> io::Result<bool> {
+    let mut information = FILE_REMOTE_PROTOCOL_INFO::default();
+    let size = u32::try_from(size_of::<FILE_REMOTE_PROTOCOL_INFO>()).map_err(io::Error::other)?;
+    // SAFETY: the handle `file` owns is open for the whole call, and `information` is a writable
+    // `FILE_REMOTE_PROTOCOL_INFO` of `size` bytes, the buffer the `FileRemoteProtocolInfo` class fills.
+    let read = unsafe { GetFileInformationByHandleEx(file.as_raw_handle(), FileRemoteProtocolInfo, (&raw mut information).cast(), size) };
+    Ok(read != 0)
 }
 
 /// Renames the file `source` to `target` on the same volume, never replacing a file `target` already names. Both are
