@@ -873,3 +873,45 @@ fn an_inputs_request_missing_bare_or_with_another_step_and_a_run_with_a_bad_dige
     assert_eq!(run.code, Some(2), "{run:?}");
     assert!(run.stderr.contains("InputsDigest"), "{run:?}");
 }
+
+/// Makes the file `path` read-only.
+fn read_only(path: &Path) {
+    let mut permissions = fs::metadata(path).expect("the file is there").permissions();
+    permissions.set_readonly(true);
+    fs::set_permissions(path, permissions).expect("the file can be made read-only");
+}
+
+#[test]
+fn a_read_only_input_is_replaced_and_a_read_only_stale_copy_is_deleted() {
+    let case = Case::new("box_inputs_read_only");
+    let payload = inputs_payload(&case, "put");
+    put_all(&case, &payload, &[HELPER, DATA]);
+    read_only(&work(&payload).join(r"data\b.txt"));
+    let other: (&str, &[u8]) = ("data/b.txt", b"other bytes\n");
+
+    put_all(&case, &payload, &[HELPER, other]);
+    assert_eq!(fs::read(work(&payload).join(r"data\b.txt")).expect("the input is there"), other.1);
+
+    read_only(&work(&payload).join(r"data\b.txt"));
+    let outcome = put_with(&case, &payload, &[], &[HELPER], &[]);
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(
+        !work(&payload).join(r"data\b.txt").exists(),
+        "the read-only stale copy is deleted: {outcome:?}"
+    );
+}
+
+#[test]
+fn a_record_naming_a_git_file_reads_as_not_a_record() {
+    let case = Case::new("box_inputs_record_git_name");
+    let payload = inputs_payload(&case, "put");
+    put_all(&case, &payload, &[DATA]);
+    let entry = json!({"size": 5, "sha256": sha256(DATA.1), "modified": 1, "id": "0-0"});
+    let text = json!({"digest": sha256(manifest_line(&[DATA]).as_bytes()), "files": {".gitignore": entry}}).to_string();
+    fs::write(format!("{}.inputs", field(&payload, "Work")), text).expect("the record can be written");
+
+    let outcome = diff(&case, &payload, &[DATA]);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(outcome.stderr.contains("is not an inputs record; every copy is hashed"), "{outcome:?}");
+}

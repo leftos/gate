@@ -103,7 +103,7 @@ fn changed_copy(work: &File, record: &Record) -> Option<String> {
     record
         .files
         .values()
-        .find_map(|copy| match opened_copy(work, &copy.path, FILE_GENERIC_READ) {
+        .find_map(|copy| match opened_copy(work, &copy.path, FILE_GENERIC_READ, Share::All) {
             Ok(Some((_, stamp))) if stamp == copy.stamp => None,
             Ok(Some(_)) => Some(format!("the input {} is not the copy installed", copy.path)),
             Ok(None) => Some(format!("the input {} is missing", copy.path)),
@@ -304,7 +304,9 @@ impl Record {
             files: BTreeMap::new(),
         };
         for (path, file) in files {
-            let copy = recorded_copy(path, file).filter(|_| is_plain_path(path)).ok_or_else(not_a_record)?;
+            let copy = recorded_copy(path, file)
+                .filter(|_| refused_path(path).is_none())
+                .ok_or_else(not_a_record)?;
             record.files.insert(ordinal_upper(path), copy);
         }
         Ok(record)
@@ -442,13 +444,13 @@ fn plain_copy(file: &File) -> io::Result<()> {
 /// The copy at the `/`-separated `path` below the held work folder `work`, opened with `access` as itself through the
 /// handles of its folders ([`walk`]): a plain disk file of one name ([`plain_copy`]); with its stamp. `None` when
 /// nothing is at its path; else why it is no such file.
-fn opened_copy(work: &File, path: &str, access: u32) -> io::Result<Option<(File, Stamp)>> {
+fn opened_copy(work: &File, path: &str, access: u32, share: Share) -> io::Result<Option<(File, Stamp)>> {
     let (folder, leaf) = match walk(work, path)? {
         Walked::Missing => return Ok(None),
         Walked::Blocked(prefix, _) => return Err(not_a_folder(prefix)),
         Walked::Reached(folder, leaf) => (folder, leaf),
     };
-    let file = match gate_win32::open_beneath_as(&folder, leaf, access, Share::All, Make::Open) {
+    let file = match gate_win32::open_beneath_as(&folder, leaf, access, share, Make::Open) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
@@ -463,7 +465,7 @@ fn opened_copy(work: &File, path: &str, access: u32) -> io::Result<Option<(File,
 /// copy's hash and stamp read now. `None` for a copy missing, that is no plain file, that cannot be read, or that holds
 /// anything else.
 fn matched_copy(work: &File, path: &str, held: &Held, record: &Record) -> Option<Copy> {
-    let (file, stamp) = opened_copy(work, path, FILE_GENERIC_READ).ok().flatten()?;
+    let (file, stamp) = opened_copy(work, path, FILE_GENERIC_READ, Share::All).ok().flatten()?;
     if stamp.size != held.stamp.size {
         return None;
     }
@@ -602,10 +604,20 @@ fn pruned(stages: &Path, now: SystemTime) -> Vec<String> {
             Ok(entry) => entry,
             Err(error) => return unlisted(error),
         };
-        let old = entry
-            .metadata()
-            .and_then(|metadata| metadata.modified())
-            .is_ok_and(|written| now.duration_since(written).is_ok_and(|age| age > STAGE_AGE));
+        if !entry.file_name().to_str().is_some_and(is_stage_name) {
+            continue;
+        }
+        let old = match entry.metadata().and_then(|metadata| metadata.modified()) {
+            Ok(written) => now.duration_since(written).is_ok_and(|age| age > STAGE_AGE),
+            Err(error) => {
+                let kept = format!(
+                    "gate: remote kept the stage {}: its last write cannot be read: {error}",
+                    entry.path().display()
+                );
+                lines.push(escaped(&kept));
+                continue;
+            }
+        };
         if old
             && entry.file_name().to_str().is_some_and(is_stage_name)
             && let Err(error) = preflight::remove_entry(&entry.path())
@@ -681,7 +693,10 @@ fn finished(work_path: &str, work: &File, sent: &Sent, record: &Record, mut now:
                 files,
             },
         )?;
-        return Err(format!("{path} is missing after the install"));
+        return Err(match opened_copy(work, path, FILE_GENERIC_READ, Share::All) {
+            Err(error) => format!("{path} cannot be opened: {error}"),
+            Ok(_) => format!("{path} is missing after the install"),
+        });
     }
     write_exclude(work, work_path, &now)?;
     now.digest.clone_from(&sent.digest);
@@ -712,8 +727,11 @@ fn free_target(work: &File, path: &str, record: &Record, manifest: &Manifest) ->
     let refused = |why: String| format!("cannot install '{}': {why}", escaped(path));
     match walk(work, path).map_err(|error| refused(error.to_string()))? {
         Walked::Missing => Ok(()),
-        Walked::Blocked(prefix, blocker) if is_stale_unchanged(&blocker, prefix, record, manifest) => Ok(()),
-        Walked::Blocked(prefix, _) => Err(refused(not_a_folder(prefix).to_string())),
+        Walked::Blocked(prefix, blocker) => match is_stale_unchanged(&blocker, prefix, record, manifest) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(refused(not_a_folder(prefix).to_string())),
+            Err(why) => Err(refused(why)),
+        },
         Walked::Reached(folder, leaf) => match gate_win32::open_beneath(&folder, leaf, Share::All) {
             Ok(file) => plain_copy(&file).map_err(|error| refused(error.to_string())),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -723,12 +741,16 @@ fn free_target(work: &File, path: &str, record: &Record, manifest: &Manifest) ->
 }
 
 /// Whether `file`, opened at `path`, is a plain file `record` holds that left `manifest` and still hashes to what was
-/// installed.
-fn is_stale_unchanged(file: &File, path: &str, record: &Record, manifest: &Manifest) -> bool {
-    manifest.get(path).is_none()
-        && record
-            .get(path)
-            .is_some_and(|copy| plain_copy(file).is_ok() && sha256_of(file).is_ok_and(|(sha256, _)| sha256 == copy.sha256))
+/// installed; else why it could not be hashed.
+fn is_stale_unchanged(file: &File, path: &str, record: &Record, manifest: &Manifest) -> Result<bool, String> {
+    let Some(copy) = record.get(path).filter(|_| manifest.get(path).is_none()) else {
+        return Ok(false);
+    };
+    if plain_copy(file).is_err() {
+        return Ok(false);
+    }
+    let (sha256, _) = sha256_of(file).map_err(|error| format!("'{}' cannot be hashed: {error}", escaped(path)))?;
+    Ok(sha256 == copy.sha256)
 }
 
 /// Moves the staged file `path` below the held folder `files` to the same path below the held work folder `work`,
@@ -749,8 +771,9 @@ fn moved_in(files: &File, work: &File, path: &str) -> Result<Stamp, String> {
     let source =
         gate_win32::open_beneath_as(&staged_folder, staged_leaf, STAGED_ACCESS, Share::All, Make::Open).map_err(|error| failed(error.to_string()))?;
     gate_win32::rename_beneath(&source, &folder, leaf).map_err(|error| failed(error.to_string()))?;
+    let stamp = stamp_of(&source).map_err(|error| failed(error.to_string()))?;
     gate_win32::inherit_security(&source).map_err(|error| failed(error.to_string()))?;
-    stamp_of(&source).map_err(|error| failed(error.to_string()))
+    Ok(stamp)
 }
 
 /// Deletes each copy `record` holds whose path left `manifest`, by the handle it was checked through, only while it is
@@ -759,7 +782,8 @@ fn moved_in(files: &File, work: &File, path: &str) -> Result<Stamp, String> {
 fn swept(work: &File, record: &Record, manifest: &Manifest, console: &mut Console) {
     for copy in record.files.values().filter(|copy| manifest.get(&copy.path).is_none()) {
         let kept = |why: String| format!("gate: remote kept the stale input {}: {}", escaped(&copy.path), escaped(&why));
-        let file = match opened_copy(work, &copy.path, FILE_GENERIC_READ | DELETE) {
+        // No writer may share it, so the copy hashed is the copy deleted.
+        let file = match opened_copy(work, &copy.path, FILE_GENERIC_READ | DELETE, Share::NoWrite) {
             Ok(Some((file, _))) => file,
             Ok(None) => continue,
             Err(error) => {

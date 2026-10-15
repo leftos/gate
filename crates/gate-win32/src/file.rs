@@ -139,7 +139,7 @@ pub fn rename_beneath(file: &File, folder: &File, name: &str) -> io::Result<()> 
     // SAFETY: `buffer` is zeroed, aligned for `FILE_RENAME_INFORMATION` and holds `size` bytes, the structure and the name's
     // units after its `FileName` start; the copy writes `wide.len()` units from there, inside the buffer.
     unsafe {
-        (*info).Anonymous.Flags = RENAME_REPLACE_IF_EXISTS | RENAME_POSIX_SEMANTICS;
+        (*info).Anonymous.Flags = RENAME_REPLACE_IF_EXISTS | RENAME_POSIX_SEMANTICS | RENAME_IGNORE_READONLY_ATTRIBUTE;
         (*info).RootDirectory = folder.as_raw_handle();
         (*info).FileNameLength = length;
         ptr::copy_nonoverlapping(wide.as_ptr(), (&raw mut (*info).FileName).cast::<u16>(), wide.len());
@@ -168,18 +168,22 @@ pub fn rename_beneath(file: &File, folder: &File, name: &str) -> io::Result<()> 
 const RENAME_REPLACE_IF_EXISTS: u32 = 0x1;
 /// `FILE_RENAME_FLAG_POSIX_SEMANTICS`: a replaced file's name is free at once, even while it is held open.
 const RENAME_POSIX_SEMANTICS: u32 = 0x2;
+/// `FILE_RENAME_FLAG_IGNORE_READONLY_ATTRIBUTE`: a read-only file at the name is replaced as any other.
+const RENAME_IGNORE_READONLY_ATTRIBUTE: u32 = 0x40;
+/// `FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE`: a read-only file is deleted as any other.
+const DISPOSITION_IGNORE_READONLY_ATTRIBUTE: u32 = 0x10;
 
 /// Deletes the open file or empty folder `file`, opened with `DELETE` access, as itself, by handle:
 /// `SetFileInformationByHandle` with `FileDispositionInfoEx` and POSIX semantics, so its name is free at once even while
-/// another handle holds it open sharing deletion. A link so opened is deleted, not what it leads to.
+/// another handle holds it open sharing deletion, a read-only file as any other. A link so opened is deleted, not what
+/// it leads to.
 ///
 /// # Errors
 ///
-/// The system's error, such as access denied for a handle without `DELETE` access or for a read-only file, or the
-/// folder-not-empty error.
+/// The system's error, such as access denied for a handle without `DELETE` access, or the folder-not-empty error.
 pub fn delete_opened(file: &File) -> io::Result<()> {
     let info = FILE_DISPOSITION_INFO_EX {
-        Flags: FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
+        Flags: FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS | DISPOSITION_IGNORE_READONLY_ATTRIBUTE,
     };
     let size = u32::try_from(size_of::<FILE_DISPOSITION_INFO_EX>()).map_err(io::Error::other)?;
     // SAFETY: the handle is open for the whole call, and `info` is a filled-in structure of `size` bytes.
@@ -197,6 +201,8 @@ pub enum Share {
     All,
     /// Read and write it, but neither delete nor rename it, a folder's own name included, until the handle is closed.
     NoDelete,
+    /// Read and delete it, but not write it, so what a reader hashed stays what the handle holds.
+    NoWrite,
 }
 
 impl Share {
@@ -206,6 +212,7 @@ impl Share {
         match self {
             Share::All => FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             Share::NoDelete => FILE_SHARE_READ | FILE_SHARE_WRITE,
+            Share::NoWrite => FILE_SHARE_READ | FILE_SHARE_DELETE,
         }
     }
 }
@@ -683,6 +690,29 @@ mod tests {
             assert!(!link.file_type().is_symlink(), "the link itself is replaced");
             assert_eq!(std::fs::read_to_string(folder.join("target.txt")).expect("the target is there"), "target");
         }
+        drop(held);
+        std::fs::remove_dir_all(&folder).expect("the folder can be removed");
+    }
+
+    #[test]
+    fn a_read_only_file_is_replaced_by_a_rename_beneath_and_deleted_by_handle() {
+        let folder = folder("read-only");
+        let held = held(&folder);
+        let read_only = |path: &Path| {
+            let mut permissions = std::fs::metadata(path).expect("the file is there").permissions();
+            permissions.set_readonly(true);
+            std::fs::set_permissions(path, permissions).expect("the file can be made read-only");
+        };
+        std::fs::write(folder.join("a.txt"), "a").expect("the file can be written");
+        std::fs::write(folder.join("b.txt"), "b").expect("the file can be written");
+        read_only(&folder.join("b.txt"));
+
+        rename_beneath(&deletable(&folder.join("a.txt")), &held, "b.txt").expect("a read-only target is replaced");
+        assert_eq!(std::fs::read_to_string(folder.join("b.txt")).expect("the file is there"), "a");
+
+        read_only(&folder.join("b.txt"));
+        delete_opened(&deletable(&folder.join("b.txt"))).expect("a read-only file is deleted");
+        assert!(!folder.join("b.txt").exists(), "the read-only file is gone");
         drop(held);
         std::fs::remove_dir_all(&folder).expect("the folder can be removed");
     }
