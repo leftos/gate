@@ -180,7 +180,9 @@ The ssh a push runs is `ssh.exe` found along `PATH`, never `ssh.cmd` or `ssh.bat
 
 ### `gate check`
 
-`gate check` takes no words; its usage line is `       gate check`, after `gate push`. A word prints `gate: unexpected argument <word>` and any option, `--state-dir` included, prints `gate: unknown option <opt>`, each followed by the usage, exit 2. It says what this PC lacks for the repo the working folder is in, and how to install it; it installs nothing and runs only version commands (each tool's own, and `dotnet --list-sdks`).
+`gate check` takes no words but `--builder <host>`; its usage line is `       gate check [--builder <host>]`, after `gate push`. With `--builder` it checks one builder instead of this PC ([With `--builder`](#with---builder)).
+
+A word prints `gate: unexpected argument <word>` and any option, `--state-dir` included, prints `gate: unknown option <opt>`, each followed by the usage, exit 2. It says what this PC lacks for the repo the working folder is in, and how to install it; it installs nothing and runs only version commands (each tool's own, and `dotnet --list-sdks`).
 
 The repo is the git worktree root of the working folder, as routing finds it.
 
@@ -243,7 +245,38 @@ The install hints, for the items that have one:
 
 A tool not in the table (`godot`) gets no hint line, nor does a sibling that is not allowed or refused, nor the `remote.json` item.
 
-The exit is 0 when nothing is missing or too old and every file read, whatever was skipped; 1 when anything is missing or too old, or the check could not run (not in a git repository, an unreadable `.gate/toolchain.toml`, `.gate/siblings.toml` or `global.json`, `.gate` not a folder); 2 for a usage error. Test-seams builds accept the hidden `--test-probe-limit-ms <n>` (the 10 s probe bound, in milliseconds above 0).
+The exit is 0 when nothing is missing or too old and every file read, whatever was skipped; 1 when anything is missing or too old, or the check could not run (not in a git repository, an unreadable `.gate/toolchain.toml`, `.gate/siblings.toml` or `global.json`, `.gate` not a folder); 2 for a usage error. Test-seams builds accept the hidden `--test-probe-limit-ms <n>` (the 10 s probe bound, in milliseconds above 0), which `--builder` refuses.
+
+#### With `--builder`
+
+`gate check --builder <host>` says what one builder lacks for the repo in the current folder. It needs one host (`gate: --builder needs a value`; given twice, `gate: --builder is given twice`), which must be a builder `remote.json` lists (`host` or `hosts`), matched ignoring ASCII case and printed in `remote.json`'s spelling. Any other host prints `gate check: <host> is not a builder remote.json lists` and exits 2.
+
+The repo is found as for the local check (outside a git worktree is `check: not in a git repository`, exit 1). A `remote.json` that is missing, ignored or cannot be found is a stderr line with exit 1: `check: <host>: remote.json not found at <path>`, `check: <host>: remote.json is ignored: <reason>` or `check: <host>: remote.json cannot be found: LOCALAPPDATA is not an absolute folder`.
+
+It runs the box's preflight once over ssh with this repo's real work-folder key and the manifest's tools, bounded at 120 s, with no retry and no PC-side lock. A routed run of the same worktree running at the same time may collide with it (GATE-270). The preflight creates the same folders a routed run's preflight would.
+
+On stdout, each line prefixed `check: <host>: `, in this order:
+
+1. The header `check: <host>: <repo> (work folder <key>)`.
+2. `check: <host>: created <folder>` for each folder the preflight made, at most 20, then `check: <host>: and <n> more created folders`.
+3. The items, worded as on this PC with `<host>` for `here`: the SDK reads `.NET SDK <version> (rollForward <policy>) missing (<host> has <list>)`, the list cut at 20 entries and then `, and <n> more`; `.NET SDK skipped: <host> sent no SDK list`, with `: <last stderr line>` when there is one; a tool that did not answer is `check: <host>: <tool> skipped: the builder gave no answer`; the workloads are `not checked yet`.
+4. The install hints `install: <host>: <tool>: <command>`: `cargo install cargo-nextest --locked`, `npm install -g pnpm@<min>` (`npm install -g pnpm` with no minimum), `rustup toolchain install <min> && rustup default <min>`, `dotnet-install.ps1 -Version <v>`, and `run the build-box toolchain script on <host>` for node, pwsh, ffmpeg and a rust with no minimum.
+5. The summary.
+
+When the manifest's tools would make the preflight call longer than cmd takes (8127 characters), they are dropped: that line goes to stderr first, and each tool then reads `check: <host>: <tool> skipped: not sent, as the tools make the preflight call too long for cmd`. When the repo's `.gate/siblings.toml` names a sibling or cannot be read, one line `check: <host>: siblings skipped: a routed run lays them out` comes instead of the sibling lines and counts as skipped.
+
+A failure is one stderr line, exit 1, and nothing else on stdout:
+
+- `check: <host>: unreachable: <ssh's last error line>` for ssh status 255, and on the timeout `check: <host>: unreachable: no answer in <limit>`;
+- `check: <host>: no answer in <limit>, and ssh could not be stopped: <error>`;
+- `check: <host>: runs gate <theirs>, this PC runs <ours>; run gate push`, a version mismatch printing only this line;
+- `check: <host>: has no gate box that takes this call (status <n>); run gate push`;
+- `check: <host>: preparing <root> failed (status <n>): <line>`, `<root>` being the builder's work root;
+- `check: <host>: cannot run ssh: <error>`, and `check: <host>: <why>` for any other failure of the call.
+
+Text from the builder is cut to 4 KiB and escaped. The exit is 0 when nothing is missing, 1 when something is missing or the check could not run (not in a git repository, unreachable, a different build, no box, `remote.json` missing or unusable), 2 for a usage error.
+
+Test-seams builds accept, with `--builder` only, `--test-remote-transport`, `--test-remote-ssh` (which also needs `--test-remote-transport`) and `--test-remote-timeout-ms`, as the routed client reads them ([Black-box suite harness](#black-box-suite-harness)).
 
 ### `gate burn`
 
@@ -310,9 +343,9 @@ Further modes arrive as subcommands of the same binary, each designed with its i
 
 | Code | Meaning |
 |---|---|
-| 0 | The command exited 0 and its log holds no failure marker. `gate check` found nothing missing or too old. |
+| 0 | The command exited 0 and its log holds no failure marker. `gate check` found nothing missing or too old (with `--builder`, nothing missing). |
 | `N` | The command's own non-zero status, passed through whole: the gate exits with the command's 32-bit exit code (300 stays 300; 0xFFFFFFFF reads as -1 where a caller reads it signed), and the FAILED line and the journal show it signed (a routed run whose connection was lost reports 255, RC7). |
-| 1 | The command exited 0 but its log holds a failure marker (never with `--no-markers`, V2); or the gate itself failed after the command started (X4); or it failed before queueing (the working directory, the command's environment, the log's folder or an earlier log that cannot be removed); or a routed run passed but its changes or outputs could not be brought back (RC9, D1); or `gate check` found something missing or too old, or could not run (outside a git worktree). |
+| 1 | The command exited 0 but its log holds a failure marker (never with `--no-markers`, V2); or the gate itself failed after the command started (X4); or it failed before queueing (the working directory, the command's environment, the log's folder or an earlier log that cannot be removed); or a routed run passed but its changes or outputs could not be brought back (RC9, D1); or `gate check` found something missing or too old, or could not run (outside a git worktree; with `--builder`, also an unreachable builder, a different build, no box, or a `remote.json` missing or unusable). |
 | 2 | Usage: a missing, unknown or invalid input; a `.cmd` or `.bat` word the gate refuses (C5); a `--log` inside the state root; a critical gate under a heavy or light slot marker (K7). Nothing is queued. `gate box` also uses 2 for a refused payload and for a refused subfolder or batch word ([The box side](#the-box-side)). |
 | 124 | The watchdog killed the command: STALLED, TIMED OUT or BACKSTOP (X2), for a routed run by the builder (TIMED OUT, BACKSTOP) or the client (STALLED, BACKSTOP); or a routed run's fetch outlived its transfer ceiling: TRANSFER TIMED OUT. |
 | 127 | The command could not be started (C7); the slot is released at once. `gate box run` uses it for the same failure. |
@@ -1329,9 +1362,13 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
     A bad entry is skipped alone and named in the reader's problems: `tools.<name> is not a version: "<text>"`, `tools.<name> is not a string (TOML <type>)`, `tools is not a table (TOML <type>)`, `workloads is not an array (TOML <type>)`, `workloads[<i>] is not a string (TOML <type>)`, `workloads[<i>] is empty` and `<key> is not a key of the manifest (tools, workloads)`.
 
-    **On a routed run**, the client lists the snapshot's tree before the preflight: `git ls-tree -r -z --name-only` for the file names parity needs, and a root listing and a `.gate` listing for the manifest. The `.gate` folder and `toolchain.toml` are found ignoring letter case, and the exact-case regular file wins. The file is used only when it is a regular blob, read by its object id; a submodule, a symbolic link, a folder, or several spellings of it with none in exact case gets a skip line saying why. A repo with no manifest says nothing.
+    **On a routed run**, the client lists the snapshot's tree before the preflight: `git ls-tree -r -z --name-only` for the file names parity needs, and a root listing and a `.gate` listing for the manifest. The `.gate` folder and `toolchain.toml` are found ignoring letter case, and the exact-case regular file wins.
 
-    The preflight's `Needs` carry the tools the manifest declares whose names the box knows how to probe (the known names above), each with its minimum, or empty for any version. A name outside them is skipped with `gate: .gate/toolchain.toml names unknown tool <name>; skipping it` and not sent. When the tools would make the preflight call longer than cmd's 8127 characters, it goes without them, after `gate: .gate/toolchain.toml: its tools make the preflight call longer than the 8127 characters cmd takes; skipping it`.
+    The file is used only when it is a regular blob, read by its object id; a submodule, a symbolic link, a folder, or several spellings of it with none in exact case gets a skip line saying why. A repo with no manifest says nothing.
+
+    The preflight's `Needs` carry the tools the manifest declares whose names the box knows how to probe (the known names above), each with its minimum, or empty for any version. A name outside them is skipped with `gate: .gate/toolchain.toml names unknown tool <name>; skipping it` and not sent.
+
+    When the tools would make the preflight call longer than cmd's 8127 characters, it goes without them, after `gate: .gate/toolchain.toml: its tools make the preflight call longer than the 8127 characters cmd takes; skipping it`.
 
     The builder answers each tool with a `gate: remote tool <name> <version|present|missing|skipped: <why>>` line. A tool it found missing, or older than the minimum, is a need, and the route is refused as under Parity: one `gate: remote toolchain mismatch: <repo> needs <name> <min> or later; <host> has <version|none>` line per need (`<name>` alone when the manifest sets no minimum), then the parity fallback line, and the run goes local.
 
@@ -1339,7 +1376,9 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
     A text from the manifest or the builder is escaped, and the builder's cut to 4096 bytes, so neither can forge a line. `toolchain::standing` judges a tool against what its probe found (met, too old, missing, not readable, skipped) in one place, which `gate check`'s report shares; `gate check`'s output is unchanged. `--test-remote-interrupt-at manifest` raises the interrupt just before the manifest is read.
 
-    Two pins a repo already declares are read beside it, also as minimums: each tool's version in `.config/dotnet-tools.json` (the release part, so `1.0.0-beta.1` is 1.0.0; read as strict JSON, as dotnet reads it, so a comment or a trailing comma makes the file unreadable, and a tool id given twice counts once, with its last version) and the `Godot.NET.Sdk/<version>` a project file names, on its root `<Project Sdk=...>` or an `<Sdk Name="Godot.NET.Sdk" Version=...>` element directly inside it (an `<Import Sdk=...>`, a deeper `<Sdk>` element and a `min=` version are not read). `global.json` stays the SDK pin, read by `parity.rs` as above.
+    Two pins a repo already declares are read beside it, also as minimums: each tool's version in `.config/dotnet-tools.json` (the release part, so `1.0.0-beta.1` is 1.0.0; read as strict JSON, as dotnet reads it, so a comment or a trailing comma makes the file unreadable, and a tool id given twice counts once, with its last version) and the `Godot.NET.Sdk/<version>` a project file names, on its root `<Project Sdk=...>` or an `<Sdk Name="Godot.NET.Sdk" Version=...>` element directly inside it (an `<Import Sdk=...>`, a deeper `<Sdk>` element and a `min=` version are not read).
+
+    `global.json` stays the SDK pin, read by `parity.rs` as above.
   - **Push.** `git push --no-verify --no-recurse-submodules --progress [--receive-pack=…] -- <host>:<builder root>/<repo>.git +<snapshot>:refs/gate/<key> [+<bridge>:refs/gate-bridge/<key>]`, with `GIT_SSH_COMMAND` carrying the ssh options. Success says `gate: pushed snapshot <8 hex> in <s> s (<size>|up to date)` and moves the local `refs/gate-remote/<key>`.
 
     The builder keeps one bare repo per repo name, `<builder root>/<repo>.git`, shared by every key of that repo; the key is only the ref's name.
@@ -1756,7 +1795,9 @@ Built verbs:
 
   The probes are `rustc --version` for `rust`, `cargo-nextest nextest --version` for `cargo-nextest` (the plugin directly, never through `cargo`, so no `.cargo\config.toml` above the folder can alias it), `<name> --version` for `node`, `pnpm` and `pwsh`, and `ffmpeg -version`. `godot` has no probe.
 
-  Each program is found through `PATH` and `PATHEXT` as `dotnet` is (a `.cmd` shim runs through the system folder's cmd.exe; a `.ps1` is not run) and runs in the system folder on a hidden console, in the bounded runner of `remote/git.rs` (`program_output`). The probes run in parallel, started at the same time as `dotnet --list-sdks`, under one shared 10 s deadline (`--test-probe-limit-ms` lowers it); one still running at the deadline is killed with its process tree, and one with no time left is skipped without being launched.
+  Each program is found through `PATH` and `PATHEXT` as `dotnet` is (a `.cmd` shim runs through the system folder's cmd.exe; a `.ps1` is not run) and runs in the system folder on a hidden console, in the bounded runner of `remote/git.rs` (`program_output`).
+
+  The probes run in parallel, started at the same time as `dotnet --list-sdks`, under one shared 10 s deadline (`--test-probe-limit-ms` lowers it); one still running at the deadline is killed with its process tree, and one with no time left is skipped without being launched.
 
   The version is read from the first non-blank line of stdout, else of stderr: the first run of two or more dot-separated numbers after an optional `v`, its first three kept. A line with no such run, a number longer than 10 digits or a non-zero exit gives `present`; a program that cannot be found gives `missing`.
 
@@ -1847,9 +1888,13 @@ Built verbs:
 
   It is assigned to the payload's named job, which has no limits and no kill-on-close, and inherits exactly NUL, the two pipe write ends and a query-only handle to its job, as copies made under the spawn lock ([Command launching](#command-launching)). The box's git and dotnet calls start through `gate_win32::spawn`, under the same lock.
 
-  The command's token: it starts through `CreateProcessAsUserW` with a restricted copy of the box's token (`CreateRestrictedToken` with `LUA_TOKEN`), so it is not elevated, is lowered to Medium integrity when the box's is above it, has the user as default owner, and has a default DACL granting `GENERIC_ALL` to the user and SYSTEM. The ssh logon's NETWORK group (S-1-5-2) is made deny-only in it, so WMI does not treat the command's calls as remote and `taskkill`, `tasklist` and `Get-CimInstance` work from the command (with NETWORK enabled they fail with `ERROR: Access denied`). `gate_win32::NetworkGroup` (`Absent`, `Enabled`, `DenyOnly`, `Disabled`) and `TokenFacts::network` report the group's state.
+  The command's token: it starts through `CreateProcessAsUserW` with a restricted copy of the box's token (`CreateRestrictedToken` with `LUA_TOKEN`), so it is not elevated, is lowered to Medium integrity when the box's is above it, has the user as default owner, and has a default DACL granting `GENERIC_ALL` to the user and SYSTEM.
 
-  The console donor and keeper `cmd.exe` run with the same restricted token, so no elevated process shares the command's console. The box itself, its git calls and its tool restore keep the box's own token. The restriction makes the command's token non-elevated with NETWORK deny-only, but it is still a network logon's token and lacks INTERACTIVE, so it is not the token a local run's command has; it is not a boundary against the command, whose code is trusted, since the box's elevated git and tool restore later read what the command wrote.
+  The ssh logon's NETWORK group (S-1-5-2) is made deny-only in it, so WMI does not treat the command's calls as remote and `taskkill`, `tasklist` and `Get-CimInstance` work from the command (with NETWORK enabled they fail with `ERROR: Access denied`). `gate_win32::NetworkGroup` (`Absent`, `Enabled`, `DenyOnly`, `Disabled`) and `TokenFacts::network` report the group's state.
+
+  The console donor and keeper `cmd.exe` run with the same restricted token, so no elevated process shares the command's console. The box itself, its git calls and its tool restore keep the box's own token.
+
+  The restriction makes the command's token non-elevated with NETWORK deny-only, but it is still a network logon's token and lacks INTERACTIVE, so it is not the token a local run's command has; it is not a boundary against the command, whose code is trusted, since the box's elevated git and tool restore later read what the command wrote.
 
   When the token cannot be made, or a start with it is refused and a start with the box's own token then works, the box prints `gate: the command runs with the builder session's own token: <error>` on stderr, after the start marker, and the command (with the donor and keeper) runs with the box's own token. A start refused with both tokens says only `could not start`.
 
@@ -2092,7 +2137,9 @@ A Rust integration suite drives the built `gate.exe` through its CLI and reads o
 
   On `cutover` the seams are `--test-poll-ms`, `--test-heartbeat-ms`, `--test-confirm-ms` (the confirmation window) and the switch `--test-cutover-interrupt-after-list`; `--test-print-request` shows them as `testSeams.pollMs`, `heartbeatMs`, `confirmMs` and `interruptAfterList` ([`gate cutover`](#gate-cutover)).
 
-  On `push` the seams are `--test-push-ssh <path>` (the ssh program to run instead of the one found along `PATH`, the suite's `fake-ssh`) and `--test-push-bound-ms <n>` (each builder's bound); `push` has no `--test-print-request` ([`gate push`](#gate-push)). On `check` the one seam is `--test-probe-limit-ms <n>` ([`gate check`](#gate-check)).
+  On `push` the seams are `--test-push-ssh <path>` (the ssh program to run instead of the one found along `PATH`, the suite's `fake-ssh`) and `--test-push-bound-ms <n>` (each builder's bound); `push` has no `--test-print-request` ([`gate push`](#gate-push)).
+
+  On `check` the seams are `--test-probe-limit-ms <n>` (refused with `--builder`) and, each needing `--builder`, `--test-remote-transport`, `--test-remote-ssh` (which also needs `--test-remote-transport`) and `--test-remote-timeout-ms` ([`gate check`](#gate-check)).
 
   `--test-print-request`, on `run`, `stop-tree`, `cutover` and the compatibility form, prints the parsed request as one JSON line on stdout and exits 0, so the suite sees what a command line asked for; it is the one hidden switch the compatibility layer accepts. On `run`, `"timeout"` is the number given, or the floor of `auto:<n>`, and `"timeoutAuto": true|false` follows it, always present.
 

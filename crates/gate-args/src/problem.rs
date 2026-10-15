@@ -104,6 +104,12 @@ pub enum Problem {
         option: &'static str,
         other: &'static str,
     },
+    /// A test seam the form `with` chooses does not read, given with it.
+    #[cfg(feature = "test-seams")]
+    SeamNotUsedWith {
+        option: &'static str,
+        with: &'static str,
+    },
 }
 
 impl fmt::Display for Problem {
@@ -136,6 +142,8 @@ impl fmt::Display for Problem {
             Problem::BoxUsage => f.write_str("usage: gate box preflight|run|stop|boot|outputs|inflight <base64 JSON payload>"),
             Problem::SeamNeeds { option, needs } => write!(f, "gate: {option} needs {needs}"),
             Problem::SeamsConflict { option, other } => write!(f, "gate: {option} cannot be given with {other}"),
+            #[cfg(feature = "test-seams")]
+            Problem::SeamNotUsedWith { option, with } => write!(f, "gate: {option} is not used with {with}"),
         }
     }
 }

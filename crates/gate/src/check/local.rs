@@ -13,10 +13,10 @@ use gate_router::{Place, SiblingFolder, repo_name, sibling_root};
 
 use crate::answer::FAILED_STATUS;
 use crate::boxside::probe;
-use crate::check::report::{self, Checked, Found, Line, Problem, Sdk, Sibling, Tool};
+use crate::check::report::{self, Checked, Found, Problem, Sdk, Sibling, Tool};
 use crate::console::Console;
 use crate::environment::Variables;
-use crate::remote::toolchain::{self, Manifest, ToolNeed};
+use crate::remote::toolchain::{self, Manifest, Reported, ToolNeed};
 use crate::remote::{git, local_sdk_listing, outside_worktree, parity, siblings};
 use crate::route::{self, PLACE_ARGS, read_place};
 
@@ -28,6 +28,8 @@ const SIBLINGS: &str = "siblings.toml";
 const NO_READABLE_PIN: &str = "global.json has no readable sdk pin";
 /// Why a `.gate` that is not a folder leaves the manifest unreadable.
 const GATE_NOT_A_FOLDER: &str = ".gate is not a folder";
+/// How the siblings file's reader starts the problem of one entry of its array: `siblings[<index>] ...`.
+const ENTRY_PROBLEM: &str = "siblings[";
 /// Why a sibling named like the worktree's own folder is refused, as routing words it.
 const OWN_FOLDER: &str = "is the worktree's own folder";
 
@@ -45,14 +47,7 @@ pub(crate) fn check(request: &CheckRequest, console: &mut Console) -> u32 {
             return u32::from(FAILED_STATUS);
         }
     };
-    let said = report::said(report::HERE, &checked(&place, probe_limit(&request.seams)));
-    for line in &said.lines {
-        match line {
-            Line::Out(text) => console.out(text),
-            Line::Err(text) => console.err(text),
-        }
-    }
-    said.status
+    super::say(&report::said(report::HERE, &checked(&place, probe_limit(&request.seams))), console)
 }
 
 /// How long the tool probes may take together: `--test-probe-limit-ms` when given, else [`probe::PROBE_LIMIT`].
@@ -62,24 +57,49 @@ fn probe_limit(seams: &CheckSeams) -> Duration {
 
 /// The place in its git worktree of the gate's working folder; `None` when it is in none; else why git could not
 /// tell.
-fn placed() -> Result<Option<Place>, String> {
+pub(super) fn placed() -> Result<Option<Place>, String> {
     let folder = std::env::current_dir().map_err(|error| format!("cannot read the working directory: {error}"))?;
     let git = git::Git::find(&folder)?;
     read_place(&git, &git::Call::plain(&folder, &PLACE_ARGS, git::GIT_LIMIT))
 }
 
-/// What this PC has of what the repo at `place` needs, its tools probed within `limit`.
-fn checked(place: &Place, limit: Duration) -> Checked {
-    let root = Path::new(&place.root);
+/// What the repo's own files in its worktree root declare, as both checks read them from disk: the manifest, its
+/// tools and workloads, the root `global.json`'s SDK pin, and the problems of those files, in the order found.
+pub(super) struct Declared {
+    /// Whether the repo has a `.gate/toolchain.toml`, readable or not.
+    pub declares_toolchain: bool,
+    /// The manifest as it reads, empty when there is none or it cannot be read; its problems are in `problems`.
+    pub manifest: Manifest,
+    pub pin: Option<parity::Pin>,
+    pub problems: Vec<Problem>,
+    /// Whether the manifest is there but cannot be read whole.
+    pub toolchain_unreadable: bool,
+    /// Whether the `global.json` is there but its pin cannot be read.
+    pub pin_unreadable: bool,
+}
+
+impl Declared {
+    /// The files that are there but cannot be read whole, in the order the summary names them: the manifest, its
+    /// siblings when `siblings_unreadable`, the root `global.json`.
+    pub(super) fn unreadable(&self, siblings_unreadable: bool) -> Vec<&'static str> {
+        [
+            self.toolchain_unreadable.then_some(report::TOOLCHAIN),
+            siblings_unreadable.then_some(report::SIBLINGS),
+            self.pin_unreadable.then_some(report::GLOBAL_JSON),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
+    }
+}
+
+/// What the manifest and the `global.json` of the worktree `root` declare ([`read_manifest`], [`read_pin`]).
+pub(super) fn declared(root: &Path) -> Declared {
     let mut problems = Vec::new();
     let manifest = read_manifest(root);
     let declares_toolchain = !matches!(manifest, Ok(None));
     let toolchain_unreadable = manifest.is_err();
-    let Manifest {
-        tools,
-        workloads,
-        problems: skipped,
-    } = match manifest {
+    let mut manifest = match manifest {
         Ok(Some(manifest)) => manifest,
         Ok(None) => Manifest::default(),
         Err(why) => {
@@ -90,7 +110,7 @@ fn checked(place: &Place, limit: Duration) -> Checked {
             Manifest::default()
         }
     };
-    problems.extend(skipped.into_iter().map(|text| Problem {
+    problems.extend(std::mem::take(&mut manifest.problems).into_iter().map(|text| Problem {
         file: report::TOOLCHAIN,
         text,
     }));
@@ -102,10 +122,39 @@ fn checked(place: &Place, limit: Duration) -> Checked {
             text,
         });
     }
+    Declared {
+        declares_toolchain,
+        manifest,
+        pin,
+        problems,
+        toolchain_unreadable,
+        pin_unreadable,
+    }
+}
+
+/// Whether the worktree `root`'s `.gate/siblings.toml` declares a sibling: an entry of its `siblings` array names one,
+/// as it reads or as one it skips as bad, or the file is there but cannot be read, so it may. A problem of the file
+/// that is no entry's, such as a stray key or a `siblings` that is not an array, declares none.
+pub(super) fn declares_siblings(root: &Path) -> bool {
+    match route::read_gate_file(root, SIBLINGS) {
+        Ok(None) => false,
+        Ok(Some(bytes)) => match siblings::read_bytes(&bytes) {
+            Ok(declared) => !declared.names.is_empty() || declared.problems.iter().any(|problem| problem.starts_with(ENTRY_PROBLEM)),
+            Err(_) => true,
+        },
+        Err(_) => true,
+    }
+}
+
+/// What this PC has of what the repo at `place` needs, its tools probed within `limit`.
+fn checked(place: &Place, limit: Duration) -> Checked {
+    let root = Path::new(&place.root);
+    let mut declared = declared(root);
+    let needs = std::mem::take(&mut declared.manifest.tools);
     // The SDK list is read while the tools are probed, so the check waits for the longer of the two bounds.
     let (tools, sdk) = thread::scope(|scope| {
-        let sdk = scope.spawn(|| sdk_of(pin.as_ref(), || sdk_list(root)));
-        let tools = probed(tools, limit, root);
+        let sdk = scope.spawn(|| sdk_of(declared.pin.as_ref(), || sdk_list(root)));
+        let tools = probed(needs, limit, root);
         let sdk = sdk
             .join()
             .unwrap_or_else(|panic| Some(Sdk::Skipped(format!("cannot read this PC's SDK list: {}", probe::panic_reason(&*panic)))));
@@ -116,27 +165,21 @@ fn checked(place: &Place, limit: Duration) -> Checked {
         Some(Ok(names)) => (Some(names), None),
         Some(Err(problem)) => (Some(Vec::new()), Some(problem)),
     };
-    let (siblings, siblings_unreadable) = read_siblings(&place.root, allowed.as_deref(), &mut problems);
+    let (siblings, siblings_unreadable) = read_siblings(&place.root, allowed.as_deref(), &mut declared.problems);
     let consent_problem = consent_problem.filter(|_| !siblings.is_empty());
-    let unreadable = [
-        toolchain_unreadable.then_some(report::TOOLCHAIN),
-        siblings_unreadable.then_some(report::SIBLINGS),
-        pin_unreadable.then_some(report::GLOBAL_JSON),
-    ]
-    .into_iter()
-    .flatten()
-    .collect();
     Checked {
         repo: repo_name(&place.checkout),
         root: place.root.clone(),
-        declares_toolchain,
-        unreadable,
-        problems,
+        declares_toolchain: declared.declares_toolchain,
+        unreadable: declared.unreadable(siblings_unreadable),
+        problems: declared.problems,
         tools,
         sdk,
-        workloads,
+        workloads: declared.manifest.workloads,
         consent_problem,
         siblings,
+        created: Vec::new(),
+        siblings_skipped: false,
     }
 }
 
@@ -161,7 +204,10 @@ fn probed(needs: Vec<ToolNeed>, limit: Duration, root: &Path) -> Vec<Tool> {
     probe::probe(&names, limit, outside_worktree(Variables::from_process(), root), Some(root))
         .into_iter()
         .zip(needs)
-        .map(|((_, probed), need)| Tool { need, probed })
+        .map(|((_, probed), need)| Tool {
+            need,
+            reported: Reported::from(&probed),
+        })
         .collect()
 }
 
@@ -184,15 +230,22 @@ fn read_pin(root: &Path) -> (Option<parity::Pin>, Option<String>) {
     }
 }
 
-/// The check of `pin` against the SDKs `sdks` lists, read only for a pin that names a version; `None` with no pin.
+/// The check of `pin` against the SDKs this PC's list `sdks` gives ([`sdk_listed`]), one that cannot be read skipped
+/// as `cannot read this PC's SDK list: <why>`.
 fn sdk_of(pin: Option<&parity::Pin>, sdks: impl FnOnce() -> Result<Vec<String>, String>) -> Option<Sdk> {
+    sdk_listed(pin, || sdks().map_err(|why| format!("cannot read this PC's SDK list: {why}")))
+}
+
+/// The check of `pin` against the SDKs `sdks` lists, read only for a pin that names a version, a list that cannot be
+/// read skipped with the reason `sdks` gives; `None` with no pin.
+pub(super) fn sdk_listed(pin: Option<&parity::Pin>, sdks: impl FnOnce() -> Result<Vec<String>, String>) -> Option<Sdk> {
     let pin = pin?;
     let Some(version) = pin.version.clone() else {
         return Some(Sdk::Skipped(NO_READABLE_PIN.to_owned()));
     };
     let have = match sdks() {
         Ok(have) => have,
-        Err(why) => return Some(Sdk::Skipped(format!("cannot read this PC's SDK list: {why}"))),
+        Err(why) => return Some(Sdk::Skipped(why)),
     };
     // With no SDK to choose from, a pin that names a version always needs it: its words are parity's need text.
     let need = parity::need(pin, &[], || 0).into_iter().next().map_or_else(String::new, |need| need.text);
@@ -291,7 +344,7 @@ mod tests {
 
     use gate_router::SiblingFolder;
 
-    use super::{read_manifest, read_pin, read_siblings, sdk_of, sibling};
+    use super::{declares_siblings, read_manifest, read_pin, read_siblings, sdk_of, sibling};
     use crate::check::report::{Found, Sdk, Sibling};
     use crate::remote::parity::{Pin, pin_of};
     use crate::remote::toolchain::{ToolNeed, Version};
@@ -382,6 +435,27 @@ mod tests {
         junction(&root.path().join(".gate"), elsewhere.path());
         assert_eq!(read_manifest(root.path()), Err(".gate is a link or a junction".to_owned()));
         fs::remove_dir(root.path().join(".gate")).expect("the junction can be removed");
+    }
+
+    #[test]
+    fn only_a_siblings_file_that_names_one_or_cannot_be_read_declares_siblings() {
+        let root = Folder::new("declares-siblings");
+        let file = root.path().join(".gate").join("siblings.toml");
+        assert!(!declares_siblings(root.path()), "no file");
+        write(&file, "siblings = []\n");
+        assert!(!declares_siblings(root.path()), "an empty list");
+        write(&file, "siblings = ['docs']\n");
+        assert!(declares_siblings(root.path()), "a name");
+        write(&file, "siblings = ['..']\n");
+        assert!(declares_siblings(root.path()), "a name skipped as bad");
+        write(&file, "siblings = []\nstray = 1\n");
+        assert!(!declares_siblings(root.path()), "an empty list beside a stray key");
+        write(&file, "other = ['docs']\n");
+        assert!(!declares_siblings(root.path()), "no siblings key");
+        write(&file, "siblings = 'docs'\n");
+        assert!(!declares_siblings(root.path()), "a siblings that is not an array");
+        write(&file, "siblings = [\n");
+        assert!(declares_siblings(root.path()), "a file that cannot be read may name one");
     }
 
     #[test]

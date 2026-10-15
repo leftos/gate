@@ -66,8 +66,8 @@ use crate::version::build_version;
 
 /// The statuses of a preflight whose builder has no `gate box` that takes the run: cmd's for a program it cannot find,
 /// and a gate's usage error for a payload it does not read.
-const NOT_RECOGNIZED: i32 = 9009;
-const USAGE: i32 = 2;
+pub(crate) const NOT_RECOGNIZED: i32 = 9009;
+pub(crate) const USAGE: i32 = 2;
 /// The most bytes a call's job may have written and still be made once more after a failure before the banner: ssh's
 /// own failure writes one line, and a second fetch from a builder would start a fresh count against its cap.
 const RETRY_WRITTEN: u64 = 1 << 20;
@@ -77,7 +77,7 @@ const PAUSE_STEP: Duration = Duration::from_millis(20);
 const HEARTBEAT: &str = "gate-remote-heartbeat: ";
 /// The preflight's lines the client reads.
 const VERSION: &str = "gate: remote version ";
-const CREATED: &str = "gate: remote created ";
+pub(crate) const CREATED: &str = "gate: remote created ";
 /// The builder's boot time, which the preflight and the `boot` call say.
 const BOOT: &str = "gate: remote boot ";
 /// The builder's SDK list, which the preflight says: `gate: remote sdks <v1,v2|none>`.
@@ -143,11 +143,7 @@ impl RustClient {
     #[cfg(feature = "test-seams")]
     pub(crate) fn local(request: &RunRequest, transport: &str) -> Result<RustClient, String> {
         let seams = &request.test_seams;
-        // The transport's form is refused first, so `--test-remote-transport remote:x` reports the form and not a
-        // stand-in it cannot find; the stand-in is then looked for, and the transport built with it.
-        Local::new(transport, seams.remote_ssh.as_deref())?;
-        let stub = seams.remote_ssh.as_deref().map(|word| stand_in(transport, word)).transpose()?;
-        let local = Local::new(transport, stub.as_deref())?;
+        let local = local_transport(transport, seams.remote_ssh.as_deref())?;
         Ok(RustClient::over(Some(Box::new(local)), seams))
     }
 
@@ -173,6 +169,17 @@ impl RustClient {
             own_start_fails: seams.own_start_fails,
         }
     }
+}
+
+/// The local transport `transport` names, its calls made through the stand-in `ssh` names when one is given; else the
+/// line saying why the transport cannot be used, or why the stand-in cannot be found.
+#[cfg(feature = "test-seams")]
+pub(crate) fn local_transport(transport: &str, ssh: Option<&Path>) -> Result<Local, String> {
+    // The transport's form is refused first, so `--test-remote-transport remote:x` reports the form and not a stand-in
+    // it cannot find; the stand-in is then looked for, and the transport built with it.
+    Local::new(transport, ssh)?;
+    let stub = ssh.map(|word| stand_in(transport, word)).transpose()?;
+    Local::new(transport, stub.as_deref())
 }
 
 /// The stand-in `--test-remote-ssh` names, resolved as the gate resolves its own programs: a name with a folder part
@@ -2533,13 +2540,13 @@ fn is_heartbeat(line: &str) -> bool {
 }
 
 /// The builder's version, from the last `gate: remote version <v>` line of its preflight; `None` when it said none.
-fn their_version(lines: &[String]) -> Option<&str> {
+pub(crate) fn their_version(lines: &[String]) -> Option<&str> {
     lines.iter().rev().find_map(|line| line.strip_prefix(VERSION)).map(str::trim)
 }
 
 /// The SDKs the builder lists, from the last `gate: remote sdks <v1,v2|none>` line of its preflight, without `none`;
 /// `None` when it said no such line, or one with no list, which skips the parity check.
-fn sdks_of(lines: &[String]) -> Option<Vec<String>> {
+pub(crate) fn sdks_of(lines: &[String]) -> Option<Vec<String>> {
     lines
         .iter()
         .rev()
@@ -2629,10 +2636,13 @@ fn after_loss<'n>(before: Option<&str>, now: Option<&'n str>) -> Loss<'n> {
 /// The line refusing a builder `host` whose version, `theirs`, is not `ours`; `None` when they are the same. A
 /// builder that said no version runs one unknown; one that did is shown by its first 4 KiB, escaped.
 fn version_refusal(host: &str, theirs: Option<&str>, ours: &str) -> Option<String> {
-    (theirs != Some(ours)).then(|| {
-        let shown = theirs.map_or_else(|| "unknown".to_owned(), |theirs| escaped(git::first_bytes(theirs, git::FAILURE_BYTES)));
-        format!("gate: not routed: {host} runs gate {shown}, this PC {ours}; run gate push")
-    })
+    other_build(theirs, ours).map(|shown| format!("gate: not routed: {host} runs gate {shown}, this PC {ours}; run gate push"))
+}
+
+/// The builder's version, `theirs`, as a line shows it when it is not `ours`; `None` when they are the same. A builder
+/// that said no version runs one unknown; one that did is shown by its first 4 KiB, escaped.
+pub(crate) fn other_build(theirs: Option<&str>, ours: &str) -> Option<String> {
+    (theirs != Some(ours)).then(|| theirs.map_or_else(|| "unknown".to_owned(), |theirs| escaped(git::first_bytes(theirs, git::FAILURE_BYTES))))
 }
 
 /// The watchdog's line for a call watched as a fetch, `doing` what it was cut for `cut` doing: STALLED for one that sent

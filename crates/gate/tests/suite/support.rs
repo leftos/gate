@@ -30,7 +30,7 @@ usage: gate run --slot heavy|light|critical|none --timeout <seconds>|auto:<secon
        gate stop-tree <pid>
        gate cutover
        gate push
-       gate check
+       gate check [--builder <host>]
        gate burn [--cores <n>] --seconds <s>
        gate expect [--state-dir <path>] [--slot heavy|light|critical] -- <command> [args...]
        gate --version | --help
@@ -930,6 +930,31 @@ pub fn git(case: &Case, args: &[&str]) -> String {
         .expect("git starts");
     assert!(output.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&output.stderr));
     String::from_utf8(output.stdout).expect("git's stdout is UTF-8").trim_end().to_owned()
+}
+
+/// The suite's stand-in for ssh, which `--test-remote-ssh` names.
+pub const FAKE_SSH: &str = env!("CARGO_BIN_EXE_fake-ssh");
+/// The variable naming the stand-in's steps file; the stand-in logs each call's verb to `<steps>.log`.
+pub const STEPS_VARIABLE: &str = "GATE_FAKE_SSH_STEPS";
+/// The variable naming the gate the stand-in runs `box <verb> <payload>` with.
+pub const GATE_VARIABLE: &str = "GATE_FAKE_SSH_GATE";
+/// The variable whose words the stand-in gives the box's `preflight` before its verb.
+pub const PREFLIGHT_SEAMS_VARIABLE: &str = "GATE_FAKE_SSH_PREFLIGHT_SEAMS";
+/// The preflight seams of a tool case whose probes and SDK list must answer: bounds no run reaches, so only an answer
+/// ends them and no load changes what the run says.
+pub const ANSWERING: &str = "--test-probe-limit-ms 3600000 --test-dotnet-limit-ms 3600000";
+
+/// Writes `steps`, one a line, as the stand-in's steps file `name` in the case's `ssh` folder, which must exist; its
+/// path.
+pub fn ssh_steps(case: &Case, name: &str, steps: &[&str]) -> PathBuf {
+    let path = case.folder().join("ssh").join(format!("{name}.steps"));
+    fs::write(&path, steps.join("\n")).expect("the steps file can be written");
+    path
+}
+
+/// The verbs the stand-in of the steps file `steps` was called with, in order; none before its first call.
+pub fn calls(steps: &Path) -> Vec<String> {
+    fs::read_to_string(beside(steps, ".log")).map_or_else(|_| Vec::new(), |text| text.lines().map(str::to_owned).collect())
 }
 
 /// Writes `json` as the routing file the case's gates read, `<LOCALAPPDATA>\gate\remote.json`; its path.

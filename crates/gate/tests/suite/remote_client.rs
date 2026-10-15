@@ -23,8 +23,9 @@ use sha2::{Digest, Sha256};
 
 use crate::durations::seed;
 use crate::support::{
-    Case, FAKE_TOOL, GATE, GIT_REDIRECTS, Go, Outcome, Running, allow_breakaway, beside, build_version, copy_tool, events, finish, git, git_init,
-    heavy_words, nothing_back, release, shown, start, wait_for_journal_line, wait_until, wait_until_closed, write_remote_json,
+    ANSWERING, Case, FAKE_SSH, FAKE_TOOL, GATE, GATE_VARIABLE, GIT_REDIRECTS, Go, Outcome, PREFLIGHT_SEAMS_VARIABLE, Running, STEPS_VARIABLE,
+    allow_breakaway, beside, build_version, calls, copy_tool, events, finish, git, git_init, heavy_words, nothing_back, release, shown, ssh_steps,
+    start, wait_for_journal_line, wait_until, wait_until_closed, write_remote_json,
 };
 
 const HOST: &str = "builder";
@@ -333,12 +334,6 @@ fn a_snapshot_ignores_commit_signing() {
     assert!(!object.contains("gpgsig"), "the commit carries no signature: {object}");
 }
 
-/// The suite's stand-in for ssh, which `--test-remote-ssh` names.
-const FAKE_SSH: &str = env!("CARGO_BIN_EXE_fake-ssh");
-/// The variable naming the stand-in's steps file; the stand-in logs each call's verb to `<steps>.log`.
-const STEPS_VARIABLE: &str = "GATE_FAKE_SSH_STEPS";
-/// The variable naming the gate the stand-in runs `box <verb> <payload>` with.
-const GATE_VARIABLE: &str = "GATE_FAKE_SSH_GATE";
 /// What a client case's snapshot leaves out: the gate's state root, LOCALAPPDATA and logs, the builder root and the
 /// stand-in's files, and `.tmp/`, which the client writes in. `tool.exe` is sent, so the builder runs it.
 const CLIENT_IGNORED: &str = "state/\nappdata/\n*.log\nbuilder/\nssh/\n.tmp/\n";
@@ -434,18 +429,6 @@ fn sha256_hex(text: &str) -> String {
         let _ = write!(said, "{byte:02x}");
         said
     })
-}
-
-/// Writes `steps`, one a line, as the stand-in's steps file `name` in the case's `ssh` folder; its path.
-fn ssh_steps(case: &Case, name: &str, steps: &[&str]) -> PathBuf {
-    let path = case.folder().join("ssh").join(format!("{name}.steps"));
-    fs::write(&path, steps.join("\n")).expect("the steps file can be written");
-    path
-}
-
-/// The verbs the stand-in of the steps file `steps` was called with, in order; none before its first call.
-fn calls(steps: &Path) -> Vec<String> {
-    fs::read_to_string(beside(steps, ".log")).map_or_else(|_| Vec::new(), |text| text.lines().map(str::to_owned).collect())
 }
 
 /// Each call the stand-in of the steps file `steps` was given, in order: its verb, then the words before the host,
@@ -1690,11 +1673,6 @@ fn a_tree_that_is_not_dotnet_skips_the_parity_check() {
 
 /// The repo's toolchain manifest, as a tool case writes it.
 const MANIFEST: &str = ".gate/toolchain.toml";
-/// The variable whose words the stand-in gives the box's `preflight` before its verb.
-const PREFLIGHT_SEAMS_VARIABLE: &str = "GATE_FAKE_SSH_PREFLIGHT_SEAMS";
-/// The preflight seams of a tool case whose probes and SDK list must answer: bounds no run reaches, so only an answer
-/// ends them and no load changes what the run says.
-const ANSWERING: &str = "--test-probe-limit-ms 3600000 --test-dotnet-limit-ms 3600000";
 
 /// Whether `folder` holds the program `program` under any of the extensions a `PATHEXT` search tries.
 fn holds(folder: &Path, program: &str) -> bool {

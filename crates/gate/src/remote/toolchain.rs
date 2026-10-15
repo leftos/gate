@@ -118,7 +118,10 @@ const SENT_NAME_MAX: usize = 32;
 const NOT_READABLE: &str = "found, version not readable";
 
 /// The why of a tool the preflight asked about and the builder said nothing of.
-const NO_ANSWER: &str = "the builder gave no answer";
+pub(crate) const NO_ANSWER: &str = "the builder gave no answer";
+
+/// Why `gate check --builder` skips a tool when the tools make the preflight call too long for cmd, so none is sent.
+pub(crate) const NOT_SENT: &str = "not sent, as the tools make the preflight call too long for cmd";
 
 /// What a probe of one tool found, as a builder's tool line words it or as `gate check`'s probe found it.
 #[derive(Clone, Debug, PartialEq, Eq)]

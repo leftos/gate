@@ -20,7 +20,10 @@ use gate_win32::{Interrupt, OwnedMutexGuard};
 
 use crate::durations::Usual;
 
-pub(crate) use client::{local_sdk_listing, outside_worktree};
+#[cfg(feature = "test-seams")]
+pub(crate) use client::local_transport;
+pub(crate) use client::{CREATED, NOT_RECOGNIZED, USAGE as BOX_USAGE, local_sdk_listing, other_build, outside_worktree, sdks_of, their_version};
+pub(crate) use retry::SSH_FAILED;
 
 pub(crate) use carried::{Sibling, carried};
 
@@ -31,7 +34,7 @@ mod install;
 mod launch;
 mod outputs;
 pub(crate) mod parity;
-mod payload;
+pub(crate) mod payload;
 mod retry;
 pub(crate) mod siblings;
 mod snapshot;

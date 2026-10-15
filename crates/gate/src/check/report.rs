@@ -1,25 +1,46 @@
-//! What `gate check` says, as a pure function of what it found ([`Checked`]): a header, each item's line in the order
-//! manifest tools, the .NET SDK, workloads, the routing file's `siblings` problem, siblings, an install hint per
-//! missing or too-old item, then a summary, all prefixed `check: <where>: ` (`install: <where>: ` for a hint), and the
-//! problems of the `.gate` files on stderr as
-//! `check: .gate/<file>: <problem>`. The exit status is 0 only when nothing is missing or too old: a skipped item never
-//! fails the check.
+//! What `gate check` says, as a pure function of where it looked ([`At`]) and what it found ([`Checked`]): a header, a
+//! builder's created folders, each item's line in the order manifest tools, the .NET SDK, workloads, the routing file's
+//! `siblings` problem, siblings, an install hint per missing or too-old item, then a summary, all prefixed
+//! `check: <where>: ` (`install: <where>: ` for a hint), `<where>` being `here` for this PC and the host for a builder,
+//! and the problems of the `.gate` files on stderr as `check: .gate/<file>: <problem>`. A builder's hints are commands
+//! that work over ssh, and its SDK line names the builder. The exit status is 0 only when nothing is missing or too old:
+//! a skipped item never fails the check.
 
 use gate_router::SiblingFolder;
 
 use crate::answer::FAILED_STATUS;
 use crate::boxside::payload::escaped;
-use crate::boxside::probe::Probed;
 use crate::remote::toolchain::{Reported, Standing, ToolNeed, Version, spelled, standing};
 
-/// The `<where>` of this PC's lines.
-pub(crate) const HERE: &str = "here";
+/// Where the check looked: this PC, or the builder `host`, whose work folder for the repo is `key`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum At<'a> {
+    Here,
+    Builder { host: &'a str, key: &'a str },
+}
 
-/// A manifest tool and what its probe found; an unknown tool's probe is never read.
+impl At<'_> {
+    /// The `<where>` of the lines: `here`, or the builder's host.
+    fn name(&self) -> &str {
+        match self {
+            At::Here => "here",
+            At::Builder { host, .. } => host,
+        }
+    }
+}
+
+/// This PC, where the check looks without `--builder`.
+pub(crate) const HERE: At<'static> = At::Here;
+
+/// The most created folders, and the most SDKs of a list, a builder's lines show: the rest are counted, so a builder
+/// cannot flood the console with them.
+const BUILDER_SHOWN: usize = 20;
+
+/// A manifest tool and what its probe found; an unknown tool's is never read.
 #[derive(Debug)]
 pub(crate) struct Tool {
     pub need: ToolNeed,
-    pub probed: Probed,
+    pub reported: Reported,
 }
 
 /// The .NET SDK the root `global.json` pins, as checked against this machine's SDKs.
@@ -93,6 +114,11 @@ pub(crate) struct Checked {
     pub consent_problem: Option<String>,
     /// The declared siblings, in declared order.
     pub siblings: Vec<Sibling>,
+    /// The folders a builder's preflight said it created, in its order; none for this PC.
+    pub created: Vec<String>,
+    /// Whether the repo declares siblings a builder is not checked for, as a routed run lays them out; never for this
+    /// PC, which checks each in `siblings`.
+    pub siblings_skipped: bool,
 }
 
 /// One line the check says.
@@ -137,9 +163,25 @@ impl Item {
     }
 }
 
-/// What the check says of `checked` at `at`, `here` for this PC.
-pub(crate) fn said(at: &str, checked: &Checked) -> Said {
-    let mut lines = vec![Line::Out(format!("check: {at}: {} at {}", checked.repo, checked.root))];
+/// What the check says of `checked`, found `at` this PC or a builder.
+pub(crate) fn said(place: At<'_>, checked: &Checked) -> Said {
+    let at = place.name();
+    let header = match place {
+        At::Here => format!("{} at {}", checked.repo, checked.root),
+        At::Builder { key, .. } => format!("{} (work folder {key})", checked.repo),
+    };
+    let mut lines = vec![Line::Out(format!("check: {at}: {header}"))];
+    lines.extend(
+        checked
+            .created
+            .iter()
+            .take(BUILDER_SHOWN)
+            .map(|folder| Line::Out(format!("check: {at}: created {}", escaped(folder)))),
+    );
+    let more = checked.created.len().saturating_sub(BUILDER_SHOWN);
+    if more > 0 {
+        lines.push(Line::Out(format!("check: {at}: and {more} more created folders")));
+    }
     if !checked.declares_toolchain {
         lines.push(Line::Out(format!("check: {at}: {} declares no toolchain", checked.repo)));
     }
@@ -149,7 +191,7 @@ pub(crate) fn said(at: &str, checked: &Checked) -> Said {
             .iter()
             .map(|problem| Line::Err(format!("check: {}: {}", problem.file, escaped(&problem.text)))),
     );
-    let items = items(checked);
+    let items = items(place, checked);
     lines.extend(items.iter().map(|item| Line::Out(format!("check: {at}: {}", item.text))));
     lines.extend(
         items
@@ -170,10 +212,10 @@ pub(crate) fn said(at: &str, checked: &Checked) -> Said {
     Said { lines, status }
 }
 
-/// Every item of `checked`, in the order the lines say them.
-fn items(checked: &Checked) -> Vec<Item> {
-    let mut items: Vec<Item> = checked.tools.iter().map(tool_item).collect();
-    items.extend(checked.sdk.as_ref().map(sdk_item));
+/// Every item of `checked`, found `at` this PC or a builder, in the order the lines say them.
+fn items(at: At<'_>, checked: &Checked) -> Vec<Item> {
+    let mut items: Vec<Item> = checked.tools.iter().map(|tool| tool_item(at, tool)).collect();
+    items.extend(checked.sdk.as_ref().map(|sdk| sdk_item(at, sdk)));
     if !checked.workloads.is_empty() {
         let ids: Vec<String> = checked.workloads.iter().map(|id| one_line(id)).collect();
         let text = format!("workloads {} not checked yet", ids.join(", "));
@@ -183,6 +225,9 @@ fn items(checked: &Checked) -> Vec<Item> {
         items.push(Item::new(format!("remote.json: {}", escaped(problem)), Kind::Missing));
     }
     items.extend(checked.siblings.iter().map(sibling_item));
+    if checked.siblings_skipped {
+        items.push(Item::new("siblings skipped: a routed run lays them out".to_owned(), Kind::Skipped));
+    }
     items
 }
 
@@ -211,17 +256,23 @@ fn counts(missing: usize, too_old: usize, skipped: usize) -> String {
     }
 }
 
-/// The line of a manifest tool as its probe found it, against its minimum.
-fn tool_item(tool: &Tool) -> Item {
+/// The line of a manifest tool as its probe found it `at` this PC or a builder, against its minimum.
+fn tool_item(at: At<'_>, tool: &Tool) -> Item {
     let name = one_line(&tool.need.name);
     if !tool.need.known {
         return Item::new(format!("tools.{name} skipped: not a tool gate knows"), Kind::Skipped);
     }
     let min = tool.need.min;
     let needs = min.map_or_else(|| "needs it present".to_owned(), |min| format!("needs {min} or later"));
-    let hint = |kind| install_hint(&name, min, kind).map(|command| (name.clone(), command));
-    let reported = Reported::from(&tool.probed);
-    match (standing(min, &reported), &reported) {
+    let hint = |kind| {
+        let command = match at {
+            At::Here => install_hint(&name, min, kind),
+            At::Builder { host, .. } => builder_hint(host, &name, min),
+        };
+        command.map(|command| (name.clone(), command))
+    };
+    let reported = &tool.reported;
+    match (standing(min, reported), reported) {
         (Standing::Met, Reported::Version(found)) if min.is_some() => Item::new(format!("{name} {} ok ({needs})", escaped(found)), Kind::Ok),
         (Standing::Met, Reported::Version(found)) => Item::new(format!("{name} {} ok", escaped(found)), Kind::Ok),
         (Standing::Met, _) => Item::new(format!("{name} ok (version not readable)"), Kind::Ok),
@@ -255,17 +306,50 @@ fn install_hint(name: &str, min: Option<Version>, kind: Kind) -> Option<String> 
     Some(command.to_owned())
 }
 
-/// The line of the SDK pin's check.
-fn sdk_item(sdk: &Sdk) -> Item {
+/// The command that installs the tool `name` on the builder `host` over ssh, missing or too old alike, its minimum
+/// `min` where the command takes one; the builder's toolchain script for a tool no such command installs, and for a
+/// rust with no minimum to name; `None` for a tool with no hint.
+fn builder_hint(host: &str, name: &str, min: Option<Version>) -> Option<String> {
+    let script = || format!("run the build-box toolchain script on {host}");
+    Some(match (name, min) {
+        ("cargo-nextest", _) => "cargo install cargo-nextest --locked".to_owned(),
+        ("pnpm", Some(min)) => format!("npm install -g pnpm@{min}"),
+        ("pnpm", None) => "npm install -g pnpm".to_owned(),
+        ("rust", Some(min)) => format!("rustup toolchain install {min} && rustup default {min}"),
+        ("rust" | "node" | "pwsh" | "ffmpeg", _) => script(),
+        _ => return None,
+    })
+}
+
+/// The line of the SDK pin's check `at` this PC or a builder.
+fn sdk_item(at: At<'_>, sdk: &Sdk) -> Item {
     match sdk {
         Sdk::Checked { need, served: true, .. } => Item::new(format!("{need} ok"), Kind::Ok),
         Sdk::Checked { version, need, have, .. } => {
-            let have = if have.is_empty() { "none".to_owned() } else { have.join(", ") };
-            let major = version.split('.').next().unwrap_or(version);
-            let hint = (".NET SDK".to_owned(), format!("winget install Microsoft.DotNet.SDK.{major}"));
-            Item::hinted(format!("{need} missing (this PC has {have})"), Kind::Missing, Some(hint))
+            let (whose, command, have) = match at {
+                At::Here => {
+                    let major = version.split('.').next().unwrap_or(version);
+                    let have = if have.is_empty() { "none".to_owned() } else { have.join(", ") };
+                    ("this PC".to_owned(), format!("winget install Microsoft.DotNet.SDK.{major}"), have)
+                }
+                At::Builder { host, .. } => (host.to_owned(), format!("dotnet-install.ps1 -Version {version}"), builder_sdks(have)),
+            };
+            let hint = (".NET SDK".to_owned(), command);
+            Item::hinted(format!("{need} missing ({whose} has {have})"), Kind::Missing, Some(hint))
         }
         Sdk::Skipped(why) => Item::new(format!(".NET SDK skipped: {}", escaped(why)), Kind::Skipped),
+    }
+}
+
+/// A builder's SDK list `have` as its line says it: `none`, or its first [`BUILDER_SHOWN`] entries and how many more.
+fn builder_sdks(have: &[String]) -> String {
+    if have.is_empty() {
+        return "none".to_owned();
+    }
+    let shown = have.get(..BUILDER_SHOWN).unwrap_or(have).join(", ");
+    match have.len().saturating_sub(BUILDER_SHOWN) {
+        0 => shown,
+        more => format!("{shown}, and {more} more"),
     }
 }
 
@@ -290,11 +374,11 @@ fn sibling_item(sibling: &Sibling) -> Item {
 
 #[cfg(test)]
 mod tests {
-    use super::{Checked, Found, GLOBAL_JSON, HERE, Line, Problem, SIBLINGS, Said, Sdk, Sibling, TOOLCHAIN, Tool, said};
+    use super::{At, Checked, Found, GLOBAL_JSON, HERE, Line, Problem, SIBLINGS, Said, Sdk, Sibling, TOOLCHAIN, Tool, said};
     use gate_router::{FolderId, SiblingFolder};
 
     use crate::boxside::probe::Probed;
-    use crate::remote::toolchain::{ToolNeed, Version};
+    use crate::remote::toolchain::{Reported, ToolNeed, Version};
 
     fn need(name: &str, min: Option<&str>) -> ToolNeed {
         ToolNeed {
@@ -304,10 +388,14 @@ mod tests {
         }
     }
 
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "each case builds its probe in place, as the check's probe hands it over"
+    )]
     fn tool(name: &str, min: Option<&str>, probed: Probed) -> Tool {
         Tool {
             need: need(name, min),
-            probed,
+            reported: Reported::from(&probed),
         }
     }
 
@@ -327,6 +415,8 @@ mod tests {
             workloads: Vec::new(),
             consent_problem: None,
             siblings: Vec::new(),
+            created: Vec::new(),
+            siblings_skipped: false,
         }
     }
 
@@ -787,6 +877,195 @@ mod tests {
                 out("check: here: pwsh 7.6.6 ok"),
                 out("check: here: nothing missing"),
             ]
+        );
+    }
+
+    /// The builder of the builder cases, and the key of its work folder.
+    const BUILDER: At<'static> = At::Builder {
+        host: "box-1",
+        key: "app-1a2b3c4d",
+    };
+
+    /// The stdout lines of a builder's check between its header and its summary, the hints among them.
+    fn builder_body(checked: &Checked) -> Vec<String> {
+        let said = said(BUILDER, checked);
+        let outs: Vec<String> = said
+            .lines
+            .iter()
+            .filter_map(|line| match line {
+                Line::Out(text) => Some(text.clone()),
+                Line::Err(_) => None,
+            })
+            .collect();
+        outs[1..outs.len() - 1].to_vec()
+    }
+
+    #[test]
+    fn a_builder_check_says_its_work_folder_the_folders_it_created_and_skips_the_siblings() {
+        let checked = Checked {
+            created: vec![r"D:\gate-remote\app.git".to_owned()],
+            siblings_skipped: true,
+            ..checked(vec![tool("pwsh", None, found("7.6.6"))])
+        };
+        assert_eq!(
+            said(BUILDER, &checked),
+            Said {
+                lines: vec![
+                    out("check: box-1: app (work folder app-1a2b3c4d)"),
+                    out(r"check: box-1: created D:\gate-remote\app.git"),
+                    out("check: box-1: pwsh 7.6.6 ok"),
+                    out("check: box-1: siblings skipped: a routed run lays them out"),
+                    out("check: box-1: nothing missing (1 skipped)"),
+                ],
+                status: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn a_builder_says_at_most_20_created_folders_then_how_many_more() {
+        let many = Checked {
+            created: (1..=23).map(|n| format!(r"D:\gate-remote\r{n}.git")).collect(),
+            ..checked(Vec::new())
+        };
+        let lines = said(BUILDER, &many).lines;
+        let created: Vec<&Line> = lines
+            .iter()
+            .filter(|line| matches!(line, Line::Out(text) if text.contains(" created ")))
+            .collect();
+        assert_eq!(created.len(), 21, "{lines:?}");
+        assert_eq!(created[19], &out(r"check: box-1: created D:\gate-remote\r20.git"));
+        assert_eq!(created[20], &out("check: box-1: and 3 more created folders"));
+        let twenty = Checked {
+            created: (1..=20).map(|n| format!("r{n}")).collect(),
+            ..checked(Vec::new())
+        };
+        assert!(
+            !said(BUILDER, &twenty)
+                .lines
+                .iter()
+                .any(|line| matches!(line, Line::Out(text) if text.contains("more created"))),
+            "20 are all said"
+        );
+    }
+
+    #[test]
+    fn a_builder_s_sdk_list_says_at_most_20_entries_then_how_many_more() {
+        let missing = |count: usize| Checked {
+            sdk: Some(Sdk::Checked {
+                version: "10.0.401".to_owned(),
+                need: ".NET SDK 10.0.401 (rollForward patch)".to_owned(),
+                have: (1..=count).map(|n| format!("8.0.{n}")).collect(),
+                served: false,
+            }),
+            ..checked(Vec::new())
+        };
+        let twenty: Vec<String> = (1..=20).map(|n| format!("8.0.{n}")).collect();
+        assert_eq!(
+            builder_body(&missing(25))[0],
+            format!(
+                "check: box-1: .NET SDK 10.0.401 (rollForward patch) missing (box-1 has {}, and 5 more)",
+                twenty.join(", ")
+            )
+        );
+        assert_eq!(
+            builder_body(&missing(20))[0],
+            format!(
+                "check: box-1: .NET SDK 10.0.401 (rollForward patch) missing (box-1 has {})",
+                twenty.join(", ")
+            )
+        );
+        let here = said(HERE, &missing(25)).lines;
+        assert!(
+            here.iter().any(|line| matches!(line, Line::Out(text) if text.ends_with(", 8.0.25)"))),
+            "this PC's list is said whole: {here:?}"
+        );
+    }
+
+    #[test]
+    fn a_created_folder_the_builder_names_stays_one_line() {
+        let checked = Checked {
+            created: vec!["D:\\x\ninstall: box-1: node: y\u{202e}".to_owned()],
+            ..checked(Vec::new())
+        };
+        assert_eq!(
+            said(BUILDER, &checked).lines[1],
+            out(r"check: box-1: created D:\x\ninstall: box-1: node: y\u{202e}")
+        );
+    }
+
+    #[test]
+    fn a_missing_tool_on_a_builder_says_a_hint_that_works_over_ssh() {
+        let checked = checked(vec![
+            tool("cargo-nextest", Some("0.9.100"), Probed::Missing),
+            tool("pnpm", Some("10"), Probed::Missing),
+            tool("pnpm", None, Probed::Missing),
+            tool("rust", Some("1.89"), Probed::Missing),
+            tool("rust", None, Probed::Missing),
+            tool("node", None, Probed::Missing),
+            tool("pwsh", None, Probed::Missing),
+            tool("ffmpeg", None, Probed::Missing),
+            tool("godot", None, Probed::Missing),
+        ]);
+        let hints: Vec<String> = builder_body(&checked).into_iter().filter(|line| line.starts_with("install: ")).collect();
+        assert_eq!(
+            hints,
+            [
+                "install: box-1: cargo-nextest: cargo install cargo-nextest --locked",
+                "install: box-1: pnpm: npm install -g pnpm@10.0.0",
+                "install: box-1: pnpm: npm install -g pnpm",
+                "install: box-1: rust: rustup toolchain install 1.89.0 && rustup default 1.89.0",
+                "install: box-1: rust: run the build-box toolchain script on box-1",
+                "install: box-1: node: run the build-box toolchain script on box-1",
+                "install: box-1: pwsh: run the build-box toolchain script on box-1",
+                "install: box-1: ffmpeg: run the build-box toolchain script on box-1",
+            ],
+            "godot has no hint"
+        );
+        assert_eq!(said(BUILDER, &checked).status, 1);
+    }
+
+    #[test]
+    fn a_tool_too_old_on_a_builder_says_the_same_hint() {
+        let checked = checked(vec![
+            tool("rust", Some("1.89"), found("1.88.0")),
+            tool("pnpm", Some("10"), found("9.1.0")),
+            tool("node", Some("24"), found("22.1.0")),
+        ]);
+        assert_eq!(
+            builder_body(&checked),
+            [
+                "check: box-1: rust 1.88.0 too old (needs 1.89.0 or later)",
+                "check: box-1: pnpm 9.1.0 too old (needs 10.0.0 or later)",
+                "check: box-1: node 22.1.0 too old (needs 24.0.0 or later)",
+                "install: box-1: rust: rustup toolchain install 1.89.0 && rustup default 1.89.0",
+                "install: box-1: pnpm: npm install -g pnpm@10.0.0",
+                "install: box-1: node: run the build-box toolchain script on box-1",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_builder_s_sdk_line_names_the_builder() {
+        let missing = |have: Vec<String>| Checked {
+            sdk: Some(Sdk::Checked {
+                version: "10.0.401".to_owned(),
+                need: ".NET SDK 10.0.401 (rollForward patch)".to_owned(),
+                have,
+                served: false,
+            }),
+            ..checked(Vec::new())
+        };
+        assert_eq!(
+            builder_body(&missing(vec!["8.0.404".to_owned(), "10.0.300".to_owned()])),
+            [
+                "check: box-1: .NET SDK 10.0.401 (rollForward patch) missing (box-1 has 8.0.404, 10.0.300)",
+                "install: box-1: .NET SDK: dotnet-install.ps1 -Version 10.0.401",
+            ]
+        );
+        assert_eq!(
+            builder_body(&missing(Vec::new()))[0],
+            "check: box-1: .NET SDK 10.0.401 (rollForward patch) missing (box-1 has none)"
         );
     }
 

@@ -6,7 +6,12 @@ use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::support::{Case, FAKE_TOOL, Go, Outcome, finish, git, wait_until_closed, write_remote_json};
+use gate_router::work_folder_key;
+
+use crate::support::{
+    ANSWERING, Case, FAKE_SSH, FAKE_TOOL, GATE, GATE_VARIABLE, Go, Outcome, PREFLIGHT_SEAMS_VARIABLE, STEPS_VARIABLE, build_version, calls, finish,
+    git, ssh_steps, wait_until_closed, write_remote_json,
+};
 
 /// The repo's folder in the case folder.
 const REPO: &str = "app";
@@ -596,4 +601,346 @@ fn check_a_global_json_naming_no_sdk_prints_no_sdk_line() {
     );
     assert_eq!(outcome.stderr, "", "{outcome:?}");
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
+}
+
+/// The routing file of a builder case: `builder-1` the host a routed run goes to, `builder-2` one `gate push` reaches.
+const ROUTING: &str = r#"{"host": "builder-1", "hosts": ["builder-2"], "repos": {"app": ["*"]}}"#;
+
+/// A [`repo_case`] whose routing file lists the builders `builder-1` and `builder-2`, with a folder for the stand-in's
+/// files.
+fn builder_case(name: &str) -> Case {
+    let case = repo_case(name);
+    write_remote_json(&case, ROUTING);
+    fs::create_dir_all(case.folder().join("ssh")).expect("the stand-in's folder can be made");
+    case
+}
+
+/// The builder root of a builder case, a folder of the case's.
+fn builder_root(case: &Case) -> PathBuf {
+    case.folder().join("builder")
+}
+
+/// The work-folder key a routed run of the case's repo uses.
+fn key(case: &Case) -> String {
+    work_folder_key(&root(case))
+}
+
+/// `gate check --builder <host>` in the repo over the local transport, its one call made through the stand-in of the
+/// steps file `steps`, whose `gate box preflight` runs with probe and SDK bounds no case reaches; the check's `PATH`,
+/// which the builder's probes look along too, the `folders` then git's folder.
+fn check_builder(case: &Case, host: &str, folders: &[PathBuf], steps: &Path) -> Outcome {
+    let transport = format!("local:{}", builder_root(case).display());
+    let args = [
+        "check",
+        "--builder",
+        host,
+        "--test-remote-transport",
+        &transport,
+        "--test-remote-ssh",
+        FAKE_SSH,
+    ];
+    let mut command = case.gate_in(REPO, &args);
+    command
+        .env("PATH", path_with_git(folders))
+        .env(STEPS_VARIABLE, steps)
+        .env(GATE_VARIABLE, GATE)
+        .env(PREFLIGHT_SEAMS_VARIABLE, ANSWERING);
+    finish(command)
+}
+
+/// The header and the created line of a builder case's first check of `host`.
+fn first_lines(case: &Case, host: &str) -> [String; 2] {
+    [
+        format!("check: {host}: app (work folder {})", key(case)),
+        format!("check: {host}: created {}\\app.git", builder_root(case).display()),
+    ]
+}
+
+#[test]
+fn check_builder_lists_every_item_and_exits_0_when_nothing_is_missing() {
+    let case = builder_case("check_builder_every_tool");
+    write(
+        &case,
+        ".gate/toolchain.toml",
+        "[tools]\nrust = \"1.89\"\ncargo-nextest = \"0.9.100\"\nnode = \"24\"\npnpm = \"\"\npwsh = \"7.4\"\nffmpeg = \"\"\n",
+    );
+    let stub = stubs(&case, &EVERY_TOOL);
+    let steps = ssh_steps(&case, "ssh", &["ok"]);
+
+    let outcome = check_builder(&case, "builder-1", &[stub], &steps);
+
+    let [header, created] = first_lines(&case, "builder-1");
+    assert_eq!(
+        lines(&outcome.stdout),
+        [
+            header.as_str(),
+            created.as_str(),
+            "check: builder-1: rust 1.99.0 ok (needs 1.89.0 or later)",
+            "check: builder-1: cargo-nextest 0.9.148 ok (needs 0.9.100 or later)",
+            "check: builder-1: node 24.19.0 ok (needs 24.0.0 or later)",
+            "check: builder-1: pnpm 10.0.0 ok",
+            "check: builder-1: pwsh 7.6.6 ok (needs 7.4.0 or later)",
+            "check: builder-1: ffmpeg 9.0.2 ok",
+            "check: builder-1: nothing missing",
+        ],
+        "{outcome:?}"
+    );
+    assert_eq!(outcome.stderr, "", "{outcome:?}");
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight"], "one call reached the builder");
+}
+
+#[test]
+fn check_builder_says_a_missing_tool_with_its_builder_hint_and_exits_1() {
+    let case = builder_case("check_builder_missing_tool");
+    write(
+        &case,
+        ".gate/toolchain.toml",
+        "[tools]\nnode = \"24\"\ncargo-nextest = \"\"\npnpm = \"10\"\nrust = \"1.89\"\npwsh = \"\"\n",
+    );
+    let stub = stubs(&case, &[("node", "@echo v24.19.0\r\n")]);
+    let steps = ssh_steps(&case, "ssh", &["ok"]);
+
+    let outcome = check_builder(&case, "builder-1", &[stub], &steps);
+
+    assert_eq!(
+        lines(&outcome.stdout)[2..],
+        [
+            "check: builder-1: node 24.19.0 ok (needs 24.0.0 or later)",
+            "check: builder-1: cargo-nextest missing (needs it present)",
+            "check: builder-1: pnpm missing (needs 10.0.0 or later)",
+            "check: builder-1: rust missing (needs 1.89.0 or later)",
+            "check: builder-1: pwsh missing (needs it present)",
+            "install: builder-1: cargo-nextest: cargo install cargo-nextest --locked",
+            "install: builder-1: pnpm: npm install -g pnpm@10.0.0",
+            "install: builder-1: rust: rustup toolchain install 1.89.0 && rustup default 1.89.0",
+            "install: builder-1: pwsh: run the build-box toolchain script on builder-1",
+            "check: builder-1: 4 missing, 0 too old",
+        ],
+        "{outcome:?}"
+    );
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+}
+
+#[test]
+fn check_builder_refuses_a_host_remote_json_does_not_list() {
+    let case = builder_case("check_builder_unlisted_host");
+    let steps = ssh_steps(&case, "ssh", &["ok"]);
+
+    let outcome = check_builder(&case, "builder-3", &[], &steps);
+
+    assert_eq!(outcome.stdout, "", "{outcome:?}");
+    assert_eq!(
+        outcome.stderr, "gate check: builder-3 is not a builder remote.json lists\n",
+        "{outcome:?}"
+    );
+    assert_eq!(outcome.code, Some(2), "{outcome:?}");
+    assert_eq!(calls(&steps), Vec::<String>::new(), "no call was made");
+}
+
+#[test]
+fn check_builder_without_remote_json_cannot_run() {
+    let case = repo_case("check_builder_no_routing_file");
+    fs::create_dir_all(case.folder().join("ssh")).expect("the stand-in's folder can be made");
+    let steps = ssh_steps(&case, "ssh", &["ok"]);
+
+    let outcome = check_builder(&case, "builder-1", &[], &steps);
+
+    let path = case.local_app_data().join("gate").join("remote.json");
+    assert_eq!(outcome.stdout, "", "{outcome:?}");
+    assert_eq!(
+        outcome.stderr,
+        format!("check: builder-1: remote.json not found at {}\n", path.display()),
+        "{outcome:?}"
+    );
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert_eq!(calls(&steps), Vec::<String>::new(), "no call was made");
+}
+
+#[test]
+fn check_builder_says_an_unreachable_builder_and_exits_1() {
+    let case = builder_case("check_builder_unreachable");
+    let steps = ssh_steps(&case, "ssh", &["fail-other", "ok"]);
+
+    let outcome = check_builder(&case, "builder-1", &[], &steps);
+
+    assert_eq!(outcome.stdout, "", "{outcome:?}");
+    assert_eq!(
+        outcome.stderr, "check: builder-1: unreachable: ssh: connect to host builder port 22: Connection refused\n",
+        "{outcome:?}"
+    );
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight"], "the call is made once, with no retry");
+}
+
+#[test]
+fn check_builder_says_a_different_gate_build_and_nothing_else() {
+    let case = builder_case("check_builder_other_build");
+    write(&case, ".gate/toolchain.toml", "[tools]\nnode = \"24\"\n");
+    let stub = stubs(&case, &[("node", "@echo v24.19.0\r\n")]);
+    let steps = ssh_steps(&case, "ssh", &["version 0.0.0-old"]);
+
+    let outcome = check_builder(&case, "builder-1", &[stub], &steps);
+
+    assert_eq!(outcome.stdout, "", "no tool line is said: {outcome:?}");
+    assert_eq!(
+        outcome.stderr,
+        format!(
+            "check: builder-1: runs gate 0.0.0-old, this PC runs {}; run gate push\n",
+            build_version(&case)
+        ),
+        "{outcome:?}"
+    );
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+}
+
+/// A builder that does not answer within the call's bound is ended at it and said unreachable. The stand-in holds on a
+/// file no one makes, so only the bound ends the call, and nothing here asserts how long it took.
+#[test]
+fn check_builder_says_a_builder_that_does_not_answer_in_time() {
+    let case = builder_case("check_builder_no_answer");
+    let never = case.folder().join("never-made");
+    let steps = ssh_steps(&case, "ssh", &[&format!("hold {}", never.display())]);
+    let transport = format!("local:{}", builder_root(&case).display());
+    let args = [
+        "check",
+        "--builder",
+        "builder-1",
+        "--test-remote-transport",
+        &transport,
+        "--test-remote-ssh",
+        FAKE_SSH,
+        "--test-remote-timeout-ms",
+        "500",
+    ];
+    let mut command = case.gate_in(REPO, &args);
+    command
+        .env("PATH", path_with_git(&[]))
+        .env(STEPS_VARIABLE, &steps)
+        .env(GATE_VARIABLE, GATE);
+
+    let outcome = finish(command);
+
+    assert_eq!(outcome.stdout, "", "{outcome:?}");
+    assert_eq!(outcome.stderr, "check: builder-1: unreachable: no answer in 500 ms\n", "{outcome:?}");
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+}
+
+/// `--builder` names a builder in any letter case, and the lines spell it as `remote.json` does.
+#[test]
+fn check_builder_matches_the_host_in_any_letter_case() {
+    let case = builder_case("check_builder_host_case");
+    let steps = ssh_steps(&case, "ssh", &["ok"]);
+
+    let outcome = check_builder(&case, "BUILDER-1", &[], &steps);
+
+    let [header, _] = first_lines(&case, "builder-1");
+    assert_eq!(lines(&outcome.stdout).first(), Some(&header.as_str()), "{outcome:?}");
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+}
+
+#[test]
+fn check_builder_says_a_builder_with_no_gate_box() {
+    let case = builder_case("check_builder_no_gate_box");
+    let steps = ssh_steps(&case, "ssh", &["exit 9009"]);
+
+    let outcome = check_builder(&case, "builder-1", &[], &steps);
+
+    assert_eq!(outcome.stdout, "", "{outcome:?}");
+    assert_eq!(
+        outcome.stderr, "check: builder-1: has no gate box that takes this call (status 9009); run gate push\n",
+        "{outcome:?}"
+    );
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+}
+
+/// The first check readies the work folder a routed run of the repo would, and says the bare repository it created; a
+/// second creates nothing and says nothing of it. The builder root holds only what a routed run's preflight makes.
+#[test]
+fn check_builder_says_the_folders_its_preflight_created() {
+    let case = builder_case("check_builder_created");
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+
+    let first = check_builder(&case, "builder-1", &[], &steps);
+    let second = check_builder(&case, "builder-1", &[], &steps);
+
+    let [header, created] = first_lines(&case, "builder-1");
+    assert_eq!(
+        lines(&first.stdout),
+        [
+            header.as_str(),
+            created.as_str(),
+            "check: builder-1: app declares no toolchain",
+            "check: builder-1: nothing missing",
+        ],
+        "{first:?}"
+    );
+    assert_eq!(
+        lines(&second.stdout),
+        [
+            header.as_str(),
+            "check: builder-1: app declares no toolchain",
+            "check: builder-1: nothing missing",
+        ],
+        "{second:?}"
+    );
+    let entries = |folder: &Path| -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(folder)
+            .expect("the folder can be listed")
+            .map(|entry| entry.expect("an entry reads").file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    };
+    assert_eq!(entries(&builder_root(&case)), ["app.git", "work"]);
+    assert_eq!(
+        entries(&builder_root(&case).join("work")),
+        [key(&case)],
+        "the work folder of the run's key alone"
+    );
+}
+
+#[test]
+fn check_builder_skips_declared_siblings() {
+    let case = builder_case("check_builder_siblings");
+    write(&case, ".gate/siblings.toml", "siblings = ['docs']\n");
+    let steps = ssh_steps(&case, "ssh", &["ok"]);
+
+    let outcome = check_builder(&case, "builder-1", &[], &steps);
+
+    assert_eq!(
+        lines(&outcome.stdout)[2..],
+        [
+            "check: builder-1: app declares no toolchain",
+            "check: builder-1: siblings skipped: a routed run lays them out",
+            "check: builder-1: nothing missing (1 skipped)",
+        ],
+        "{outcome:?}"
+    );
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+}
+
+/// The builder's SDK list is the one its preflight says, read there with its own `dotnet`; a builder `hosts` lists is
+/// checked as the one `host` names is.
+#[test]
+fn check_builder_says_the_sdk_the_builder_has() {
+    let case = builder_case("check_builder_sdk");
+    write(&case, "global.json", "{\"sdk\": {\"version\": \"10.0.401\"}}\n");
+    let dotnet = "@echo off\r\necho 8.0.404 [C:\\stub]\r\necho 10.0.300 [C:\\stub]\r\n";
+    let stub = stubs(&case, &[("dotnet", dotnet)]);
+    let steps = ssh_steps(&case, "ssh", &["ok"]);
+
+    let outcome = check_builder(&case, "builder-2", &[stub], &steps);
+
+    assert_eq!(
+        lines(&outcome.stdout)[2..],
+        [
+            "check: builder-2: app declares no toolchain",
+            "check: builder-2: .NET SDK 10.0.401 (rollForward patch) missing (builder-2 has 8.0.404, 10.0.300)",
+            "install: builder-2: .NET SDK: dotnet-install.ps1 -Version 10.0.401",
+            "check: builder-2: 1 missing, 0 too old",
+        ],
+        "{outcome:?}"
+    );
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
 }

@@ -308,10 +308,13 @@ pub struct PushRequest {
     pub seams: PushSeams,
 }
 
-/// A valid `gate check`, which takes no words: only the hidden seams the black-box suite gives it.
+/// A valid `gate check`, which takes no words: the builder to check in place of this PC, and the hidden seams the
+/// black-box suite gives it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CheckRequest {
-    /// The hidden `--test-*` flags that set the check's probe limit.
+    /// `--builder <host>` as given: the builder to check; `None` checks this PC.
+    pub builder: Option<String>,
+    /// The hidden `--test-*` flags that set the check's probe limit and the builder check's transport and bound.
     pub seams: CheckSeams,
 }
 
@@ -322,6 +325,13 @@ pub struct CheckSeams {
     /// How long the check's tool probes may take together, in milliseconds, in place of the built-in 10 s
     /// (`--test-probe-limit-ms`).
     pub probe_limit_ms: Option<u64>,
+    /// The builder check's local transport, `local:<folder>` or `local-ssh:<folder>`, as a routed run's
+    /// (`--test-remote-transport`).
+    pub remote_transport: Option<String>,
+    /// The program the local transport's call starts with ssh's own words (`--test-remote-ssh`).
+    pub remote_ssh: Option<PathBuf>,
+    /// How long the builder check's call may take, in milliseconds, in place of 120 s (`--test-remote-timeout-ms`).
+    pub remote_timeout_ms: Option<u64>,
 }
 
 /// A valid `gate burn`: the threads to spin, `None` for the machine's logical processors, and how many seconds to spin

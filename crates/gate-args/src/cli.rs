@@ -90,8 +90,8 @@ pub(crate) fn parse_push(words: impl Iterator<Item = OsString>) -> Result<PushRe
     builder.finish_push()
 }
 
-/// Reads the words after `gate check`, which takes none: every word is a problem, `--` included, save the hidden seam
-/// of a build with the `test-seams` feature.
+/// Reads the words after `gate check`, which takes none: every word is a problem, `--` included, save `--builder
+/// <host>` and the hidden seams of a build with the `test-seams` feature.
 pub(crate) fn parse_check(words: impl Iterator<Item = OsString>) -> Result<CheckRequest, Vec<Problem>> {
     let mut words = words.peekable();
     let mut builder = RunBuilder::default();
@@ -210,16 +210,26 @@ fn push_option(_name: &str) -> Option<RunOption> {
     None
 }
 
-#[cfg(feature = "test-seams")]
 fn check_option(name: &str) -> Option<RunOption> {
     match name {
+        "builder" => Some(RunOption::Value(ValueOption::Builder)),
+        _ => check_seam_option(name),
+    }
+}
+
+#[cfg(feature = "test-seams")]
+fn check_seam_option(name: &str) -> Option<RunOption> {
+    match name {
         "test-probe-limit-ms" => Some(RunOption::Value(ValueOption::ProbeLimitMs)),
+        "test-remote-transport" => Some(RunOption::Value(ValueOption::RemoteTransport)),
+        "test-remote-ssh" => Some(RunOption::Value(ValueOption::RemoteSsh)),
+        "test-remote-timeout-ms" => Some(RunOption::Value(ValueOption::RemoteTimeoutMs)),
         _ => None,
     }
 }
 
 #[cfg(not(feature = "test-seams"))]
-fn check_option(_name: &str) -> Option<RunOption> {
+fn check_seam_option(_name: &str) -> Option<RunOption> {
     None
 }
 
