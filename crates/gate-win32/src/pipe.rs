@@ -1,6 +1,6 @@
 //! A named pipe for a hand-off between two local processes of one user: a server that admits only that user's local
 //! clients at medium integrity or above, one at a time, under a name with a fresh random part, and a client that lends
-//! the server no identity and opens only a pipe that user owns with the server's own DACL. Each side can read the
+//! the server no identity and opens only a pipe that user owns with the server's own DACL and label. Each side can read the
 //! other's process id, for the caller to check against the process it expects.
 
 use std::io;
@@ -17,7 +17,8 @@ use windows_sys::Win32::Security::Authorization::{
 };
 use windows_sys::Win32::Security::Cryptography::{BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom};
 use windows_sys::Win32::Security::{
-    ACCESS_ALLOWED_ACE, ACL, DACL_SECURITY_INFORMATION, GetAce, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES,
+    ACCESS_ALLOWED_ACE, ACL, DACL_SECURITY_INFORMATION, GetAce, LABEL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+    SECURITY_ATTRIBUTES,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_CREATE_PIPE_INSTANCE, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
@@ -28,7 +29,10 @@ use windows_sys::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientProcessId, GetNamedPipeServerProcessId, PIPE_READMODE_BYTE,
     PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
 };
-use windows_sys::Win32::System::SystemServices::{ACCESS_ALLOWED_ACE_TYPE, MAXIMUM_WAIT_OBJECTS};
+use windows_sys::Win32::System::SystemServices::{
+    ACCESS_ALLOWED_ACE_TYPE, MAXIMUM_WAIT_OBJECTS, SYSTEM_MANDATORY_LABEL_ACE_TYPE, SYSTEM_MANDATORY_LABEL_NO_EXECUTE_UP,
+    SYSTEM_MANDATORY_LABEL_NO_READ_UP, SYSTEM_MANDATORY_LABEL_NO_WRITE_UP,
+};
 use windows_sys::Win32::System::Threading::{CreateEventW, WaitForMultipleObjects};
 
 use crate::{own_handle, wait_millis, wide};
@@ -40,6 +44,12 @@ const CLIENT_ACCESS: u32 = (FILE_GENERIC_READ | FILE_GENERIC_WRITE) & !FILE_CREA
 
 /// The OWNER RIGHTS SID: an entry for it replaces the rights an object's owner has without one.
 const OWNER_RIGHTS: &str = "S-1-3-4";
+
+/// The medium mandatory label's SID, the integrity level of the pipe's label.
+const MEDIUM_LABEL: &str = "S-1-16-8192";
+
+/// The policy of the pipe's label: a client below medium integrity can neither write, read nor execute it.
+const LABEL_POLICY: u32 = SYSTEM_MANDATORY_LABEL_NO_WRITE_UP | SYSTEM_MANDATORY_LABEL_NO_READ_UP | SYSTEM_MANDATORY_LABEL_NO_EXECUTE_UP;
 
 /// The digits of a pipe name's random part, lowercase hex.
 const DIGITS: &[u8; 16] = b"0123456789abcdef";
@@ -85,7 +95,8 @@ impl PipeServer {
     /// its own user. Its DACL is protected and holds two entries, in this order: one for `user_sid`, granting reading
     /// and writing and nothing that changes the pipe's security or makes another instance, and one for OWNER RIGHTS
     /// granting only `READ_CONTROL`, so the owner keeps no implicit right to change the DACL. Its mandatory label is
-    /// medium, refusing a client below medium integrity both reading and writing (`NO_READ_UP`, `NO_WRITE_UP`).
+    /// medium, refusing a client below medium integrity reading, writing and executing (`NO_READ_UP`, `NO_WRITE_UP`,
+    /// `NO_EXECUTE_UP`).
     ///
     /// # Errors
     ///
@@ -314,7 +325,8 @@ fn wait_any(handles: &[HANDLE], deadline: Instant) -> io::Result<ConnectWait> {
 struct SecurityDescriptor(PSECURITY_DESCRIPTOR);
 
 /// The descriptor string of a [`PipeServer`]'s pipe for `user_sid`: owned by it, a protected DACL allowing it
-/// [`CLIENT_ACCESS`] and OWNER RIGHTS `READ_CONTROL` alone, and a medium label refusing reads and writes from below.
+/// [`CLIENT_ACCESS`] and OWNER RIGHTS `READ_CONTROL` alone, and a medium label refusing reads, writes and execution
+/// from below.
 fn server_sddl(user_sid: &str) -> io::Result<String> {
     if !is_sid_string(user_sid) {
         return Err(io::Error::new(
@@ -323,7 +335,7 @@ fn server_sddl(user_sid: &str) -> io::Result<String> {
         ));
     }
     Ok(format!(
-        "O:{user_sid}D:P(A;;0x{CLIENT_ACCESS:x};;;{user_sid})(A;;0x{READ_CONTROL:x};;;{OWNER_RIGHTS})S:(ML;;NWNR;;;ME)"
+        "O:{user_sid}D:P(A;;0x{CLIENT_ACCESS:x};;;{user_sid})(A;;0x{READ_CONTROL:x};;;{OWNER_RIGHTS})S:(ML;;NWNRNX;;;ME)"
     ))
 }
 
@@ -387,16 +399,17 @@ pub struct PipeClient {
 impl PipeClient {
     /// Opens the pipe `name` with the access its server grants, for overlapped I/O, at the anonymous impersonation
     /// level (`SECURITY_SQOS_PRESENT | SECURITY_ANONYMOUS`): whatever process made the pipe cannot act as this one.
-    /// It then reads the pipe's owner and DACL and keeps the pipe only when the owner is `owner_sid` (a SID in its
-    /// string form) and the DACL is the one a [`PipeServer`] for `owner_sid` writes, entry for entry: a pipe of the name
-    /// made by another identity, after the expected one's has closed, is refused before anything is sent.
+    /// It then reads the pipe's owner, DACL and mandatory label and keeps the pipe only when the owner is `owner_sid` (a
+    /// SID in its string form) and the DACL and label are the ones a [`PipeServer`] for `owner_sid` writes, entry for
+    /// entry: a pipe of the name made by another identity, or by `owner_sid` below medium integrity, after the expected
+    /// one's has closed, is refused before anything is sent.
     ///
     /// # Errors
     ///
     /// The system's error when the pipe cannot be opened: `ERROR_FILE_NOT_FOUND` when no pipe has the name,
     /// `ERROR_ACCESS_DENIED` when its DACL refuses this process's user, `ERROR_PIPE_BUSY` when another client holds it;
     /// the system's error when its security cannot be read; an error of kind [`io::ErrorKind::PermissionDenied`],
-    /// with no system error code, naming what differs when its owner or DACL is not the expected one. A refused pipe
+    /// with no system error code, naming what differs when its owner, DACL or label is not the expected one. A refused pipe
     /// is closed.
     pub fn open(name: &str, owner_sid: &str) -> io::Result<PipeClient> {
         let client = PipeClient::open_unchecked(name)?;
@@ -444,9 +457,9 @@ impl PipeClient {
         Ok(pid)
     }
 
-    /// Refuses the pipe unless its owner is `owner_sid` and its DACL is the one a [`PipeServer`] for `owner_sid`
-    /// writes: an entry allowing it [`CLIENT_ACCESS`], then one allowing OWNER RIGHTS `READ_CONTROL`, neither with
-    /// flags.
+    /// Refuses the pipe unless its owner is `owner_sid`, its DACL is the one a [`PipeServer`] for `owner_sid` writes
+    /// (an entry allowing it [`CLIENT_ACCESS`], then one allowing OWNER RIGHTS `READ_CONTROL`, neither with flags), and
+    /// its SACL holds the server's label alone: medium, [`LABEL_POLICY`], no flags.
     fn check_security(&self, owner_sid: &str) -> io::Result<()> {
         let security = ObjectSecurity::of(self.handle.raw())?;
         // SAFETY: the owner points into the descriptor `security` holds, alive for the whole call.
@@ -464,8 +477,24 @@ impl PipeClient {
         if !same {
             return Err(refusal(format!("the pipe's DACL is {entries:?}, not the server's {expected:x?}")));
         }
-        Ok(())
+        check_label(security.sacl)
     }
+}
+
+/// Refuses a pipe whose SACL `sacl` is not the server's: one mandatory label entry, medium, [`LABEL_POLICY`], no flags.
+/// A pipe with no label, made by a process below medium integrity or with a SACL of its own, is refused.
+fn check_label(sacl: *const ACL) -> io::Result<()> {
+    if sacl.is_null() {
+        return Err(refusal("the pipe has no mandatory label, not the server's medium one".to_owned()));
+    }
+    // SAFETY: the SACL is not null and points into the descriptor the caller holds, alive for the whole call.
+    let entries = unsafe { entries_of(sacl) }?;
+    if !matches!(entries.as_slice(), [only] if only.labels_only(MEDIUM_LABEL, LABEL_POLICY)) {
+        return Err(refusal(format!(
+            "the pipe's mandatory label is {entries:?}, not the server's {MEDIUM_LABEL} with policy 0x{LABEL_POLICY:x}"
+        )));
+    }
+    Ok(())
 }
 
 /// A refusal of a pipe whose security is not its server's, saying why.
@@ -473,31 +502,34 @@ fn refusal(why: String) -> io::Error {
     io::Error::new(io::ErrorKind::PermissionDenied, why)
 }
 
-/// The owner and DACL of an object, pointing into the security descriptor that holds them.
+/// The owner, DACL and SACL of an object, pointing into the security descriptor that holds them.
 struct ObjectSecurity {
     owner: PSID,
     dacl: *mut ACL,
+    /// The SACL as far as `LABEL_SECURITY_INFORMATION` reads it: the mandatory label alone, null when there is none.
+    sacl: *mut ACL,
     _descriptor: SecurityDescriptor,
 }
 
 impl ObjectSecurity {
-    /// The owner and DACL of the kernel object behind `handle`, which is open with `READ_CONTROL`
+    /// The owner, DACL and mandatory label of the kernel object behind `handle`, which is open with `READ_CONTROL`
     /// (`GetSecurityInfo`).
     fn of(handle: HANDLE) -> io::Result<ObjectSecurity> {
         let mut owner: PSID = std::ptr::null_mut();
         let mut dacl: *mut ACL = std::ptr::null_mut();
+        let mut sacl: *mut ACL = std::ptr::null_mut();
         let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
-        // SAFETY: the caller keeps the handle open for the whole call; the owner, DACL and descriptor pointers are
-        // writable, and the group and SACL are not asked for.
+        // SAFETY: the caller keeps the handle open for the whole call; the owner, DACL, SACL and descriptor pointers are
+        // writable, and the group is not asked for.
         let code = unsafe {
             GetSecurityInfo(
                 handle,
                 SE_KERNEL_OBJECT,
-                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION | LABEL_SECURITY_INFORMATION,
                 &raw mut owner,
                 std::ptr::null_mut(),
                 &raw mut dacl,
-                std::ptr::null_mut(),
+                &raw mut sacl,
                 &raw mut descriptor,
             )
         };
@@ -507,16 +539,19 @@ impl ObjectSecurity {
         Ok(ObjectSecurity {
             owner,
             dacl,
+            sacl,
             _descriptor: SecurityDescriptor(descriptor),
         })
     }
 }
 
-/// An entry of a DACL, as far as a pipe's check needs it.
+/// An entry of a DACL or SACL, as far as a pipe's check needs it.
 #[derive(Debug)]
 enum Entry {
     /// An access-allowed entry: its flags, its mask and its SID's string form.
     Allowed { flags: u8, mask: u32, sid: String },
+    /// A mandatory label entry: its flags, its policy and its label SID's string form.
+    Label { flags: u8, policy: u32, sid: String },
     /// An entry of any other type.
     Other {
         #[expect(dead_code, reason = "read only through `Debug`, in a refusal's message")]
@@ -528,6 +563,11 @@ impl Entry {
     /// Whether the entry allows `sid` exactly `mask`, with no flags.
     fn allows_only(&self, sid: &str, mask: u32) -> bool {
         matches!(self, Entry::Allowed { flags: 0, mask: allowed, sid: named } if *allowed == mask && named.eq_ignore_ascii_case(sid))
+    }
+
+    /// Whether the entry is the mandatory label `sid` with exactly `policy`, with no flags.
+    fn labels_only(&self, sid: &str, policy: u32) -> bool {
+        matches!(self, Entry::Label { flags: 0, policy: held, sid: named } if *held == policy && named.eq_ignore_ascii_case(sid))
     }
 }
 
@@ -554,17 +594,21 @@ unsafe fn entry_at(acl: *const ACL, index: u32) -> io::Result<Entry> {
     if unsafe { GetAce(acl, index, &raw mut ace) } == 0 {
         return Err(io::Error::last_os_error());
     }
+    // An access-allowed entry and a mandatory label entry share one layout: header, mask, then the SID from `SidStart`.
     let ace: *const ACCESS_ALLOWED_ACE = ace.cast_const().cast();
     // SAFETY: every entry starts with its header, within the ACL.
     let (kind, flags) = unsafe { ((*ace).Header.AceType, (*ace).Header.AceFlags) };
-    if u32::from(kind) != ACCESS_ALLOWED_ACE_TYPE {
+    if u32::from(kind) != ACCESS_ALLOWED_ACE_TYPE && u32::from(kind) != SYSTEM_MANDATORY_LABEL_ACE_TYPE {
         return Ok(Entry::Other { kind });
     }
-    // SAFETY: an access-allowed entry, which the system checked whole when the ACL was set, holds its mask and, from
+    // SAFETY: an entry of either type, which the system checked whole when the ACL was set, holds its mask and, from
     // `SidStart`, its SID, both within the entry.
     let (mask, sid) = unsafe { ((*ace).Mask, (&raw const (*ace).SidStart).cast_mut().cast()) };
     // SAFETY: `sid` is the entry's SID, valid as the ACL is.
     let sid = unsafe { crate::token::sid_string(sid) }?;
+    if u32::from(kind) == SYSTEM_MANDATORY_LABEL_ACE_TYPE {
+        return Ok(Entry::Label { flags, policy: mask, sid });
+    }
     Ok(Entry::Allowed { flags, mask, sid })
 }
 
@@ -574,18 +618,20 @@ mod tests {
     use std::os::windows::io::{AsHandle, AsRawHandle, FromRawHandle, OwnedHandle};
     use std::time::{Duration, Instant};
 
-    use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, HANDLE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_PIPE_NOT_CONNECTED, HANDLE, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::Security::{
         CreateWellKnownSid, DuplicateTokenEx, RevertToSelf, SECURITY_MAX_SID_SIZE, SID_AND_ATTRIBUTES, SecurityImpersonation, SetTokenInformation,
         TOKEN_ADJUST_DEFAULT, TOKEN_DUPLICATE, TOKEN_IMPERSONATE, TOKEN_MANDATORY_LABEL, TOKEN_QUERY, TokenImpersonation, TokenIntegrityLevel,
         WinLowLabelSid,
     };
-    use windows_sys::Win32::Storage::FileSystem::{CreateFileW, FILE_GENERIC_READ, OPEN_EXISTING, SECURITY_ANONYMOUS, SECURITY_SQOS_PRESENT};
-    use windows_sys::Win32::System::Pipes::WaitNamedPipeW;
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_GENERIC_READ, FILE_READ_ATTRIBUTES, OPEN_EXISTING, READ_CONTROL, SECURITY_ANONYMOUS, SECURITY_SQOS_PRESENT, SYNCHRONIZE,
+    };
+    use windows_sys::Win32::System::Pipes::{PeekNamedPipe, WaitNamedPipeW};
     use windows_sys::Win32::System::SystemServices::SE_GROUP_INTEGRITY;
     use windows_sys::Win32::System::Threading::{CreateEventW, GetCurrentProcess, OpenProcessToken, SetThreadToken};
 
-    use super::{CLIENT_ACCESS, ConnectWait, PipeClient, PipeServer, random_hex};
+    use super::{CLIENT_ACCESS, ConnectWait, OWNER_RIGHTS, PipeClient, PipeServer, random_hex, server_sddl};
 
     /// The longest a test waits for something that must happen: it never runs out unless the code is broken.
     const HANG_GUARD: Duration = Duration::from_secs(600);
@@ -641,7 +687,21 @@ mod tests {
         assert_eq!(first, ConnectWait::Connected);
 
         server.disconnect().expect("the first client is dropped");
-        drop(wrong);
+
+        // SAFETY: `wrong`'s handle is open for the whole call, and no buffer or count is asked for.
+        let peeked = unsafe {
+            PeekNamedPipe(
+                wrong.handle.raw(),
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        let cut_off = std::io::Error::last_os_error();
+        assert_eq!(peeked, 0, "the dropped client no longer reaches the pipe");
+        assert_eq!(cut_off.raw_os_error(), Some(ERROR_PIPE_NOT_CONNECTED.cast_signed()), "{cut_off}");
 
         // The next client waits until the pipe listens again, as a client that finds it busy does, then opens it.
         let (name, sid) = (server.name().to_owned(), own_sid());
@@ -662,6 +722,7 @@ mod tests {
             .expect("the next client's thread ends")
             .expect("the next client opens the pipe");
         assert_eq!(second, ConnectWait::Connected);
+        drop(wrong);
     }
 
     #[test]
@@ -679,7 +740,8 @@ mod tests {
     #[test]
     fn a_client_refuses_a_pipe_whose_dacl_differs() {
         let sid = own_sid();
-        // The pipe as it was made before the OWNER RIGHTS entry: its owner keeps the right to change the DACL.
+        // A DACL without the OWNER RIGHTS entry, as a pipe made by another server might have: its owner keeps the right
+        // to change the DACL.
         let sddl = format!("O:{sid}D:P(A;;0x{CLIENT_ACCESS:x};;;{sid})");
         let server = PipeServer::create_with(test_name(), &sddl).expect("the pipe is made");
 
@@ -689,6 +751,62 @@ mod tests {
 
         assert_eq!(refused.kind(), std::io::ErrorKind::PermissionDenied, "{refused}");
         assert_eq!(refused.raw_os_error(), None, "a refusal of the pipe, not of the open: {refused}");
+    }
+
+    #[test]
+    fn a_client_refuses_a_pipe_whose_dacl_entry_has_a_flag() {
+        let sid = own_sid();
+        let sddl = server_sddl(&sid).expect("the descriptor string is built").replacen("(A;;", "(A;CI;", 1);
+        let server = PipeServer::create_with(test_name(), &sddl).expect("the pipe is made");
+
+        let refused = PipeClient::open(server.name(), &sid).err().expect("a DACL entry with a flag is refused");
+
+        assert_eq!(refused.kind(), std::io::ErrorKind::PermissionDenied, "{refused}");
+        assert!(refused.to_string().contains("DACL is"), "refused for its DACL: {refused}");
+    }
+
+    #[test]
+    fn a_client_refuses_a_pipe_with_a_null_dacl() {
+        let sid = own_sid();
+        let sddl = format!("O:{sid}D:NO_ACCESS_CONTROLS:(ML;;NWNRNX;;;ME)");
+        let server = PipeServer::create_with(test_name(), &sddl).expect("the pipe is made");
+
+        let refused = PipeClient::open(server.name(), &sid).err().expect("a null DACL is refused");
+
+        assert_eq!(refused.kind(), std::io::ErrorKind::PermissionDenied, "{refused}");
+        assert!(refused.to_string().contains("null DACL"), "refused for its null DACL: {refused}");
+    }
+
+    #[test]
+    fn a_client_refuses_a_medium_pipe_without_a_label() {
+        let sid = own_sid();
+        let sddl = format!("O:{sid}D:P(A;;0x{CLIENT_ACCESS:x};;;{sid})(A;;0x{READ_CONTROL:x};;;{OWNER_RIGHTS})");
+        let server = PipeServer::create_with(test_name(), &sddl).expect("the pipe is made");
+
+        let refused = PipeClient::open(server.name(), &sid).err().expect("a pipe with no label is refused");
+
+        assert_eq!(refused.kind(), std::io::ErrorKind::PermissionDenied, "{refused}");
+        assert!(refused.to_string().contains("mandatory label"), "refused for its label: {refused}");
+    }
+
+    #[test]
+    fn a_client_refuses_a_pipe_made_at_low_integrity() {
+        let sid = own_sid();
+        let sddl = format!("O:{sid}D:P(A;;0x{CLIENT_ACCESS:x};;;{sid})(A;;0x{READ_CONTROL:x};;;{OWNER_RIGHTS})");
+
+        let refused = std::thread::spawn(move || {
+            let server = {
+                let _low = LowIntegrity::impersonate();
+                PipeServer::create_with(test_name(), &sddl).expect("a low-integrity thread makes the pipe")
+            };
+            PipeClient::open(server.name(), &sid).err()
+        })
+        .join()
+        .expect("the thread ends")
+        .expect("a pipe made at low integrity is refused");
+
+        assert_eq!(refused.kind(), std::io::ErrorKind::PermissionDenied, "{refused}");
+        assert!(refused.to_string().contains("mandatory label"), "refused for its label: {refused}");
     }
 
     #[test]
@@ -760,25 +878,34 @@ mod tests {
         let server = PipeServer::create(&prefix(), &own_sid()).expect("the pipe is made");
         let name = server.name().to_owned();
 
+        let accesses = [
+            ("reading", FILE_GENERIC_READ),
+            ("attributes", FILE_READ_ATTRIBUTES),
+            ("synchronize", SYNCHRONIZE),
+            ("no access", 0),
+        ];
+
         let opened = std::thread::spawn(move || {
             let _low = LowIntegrity::impersonate();
-            open_read_only(&name)
+            accesses.map(|(what, access)| (what, open_with(&name, access)))
         })
         .join()
         .expect("the low-integrity thread ends");
 
-        let refused = opened.expect_err("a low-integrity client is refused even reading");
-        assert_eq!(refused.raw_os_error(), Some(ERROR_ACCESS_DENIED.cast_signed()), "{refused}");
+        for (what, result) in opened {
+            let refused = result.expect_err(what);
+            assert_eq!(refused.raw_os_error(), Some(ERROR_ACCESS_DENIED.cast_signed()), "{what}: {refused}");
+        }
     }
 
-    /// Opens the pipe `name` for reading alone, as a client that wants only to take the pipe's one instance would.
-    fn open_read_only(name: &str) -> std::io::Result<OwnedHandle> {
+    /// Opens the pipe `name` with `access` alone, as a client that wants only to take the pipe's one instance would.
+    fn open_with(name: &str, access: u32) -> std::io::Result<OwnedHandle> {
         let wide_name = crate::wide(name);
         // SAFETY: `wide_name` is NUL-terminated and outlives the call; no security attributes or template are passed.
         let handle = unsafe {
             CreateFileW(
                 wide_name.as_ptr(),
-                FILE_GENERIC_READ,
+                access,
                 0,
                 std::ptr::null(),
                 OPEN_EXISTING,

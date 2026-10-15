@@ -519,9 +519,13 @@ mod tests {
             .expect("a thread of another process is refused");
 
         assert_eq!(refused.why.kind(), io::ErrorKind::InvalidInput, "{refused}");
+        let other_process = Suspended::adopt(second_process, first_thread, first_pid)
+            .err()
+            .expect("a process of another pid is refused");
+        assert_eq!(other_process.why.kind(), io::ErrorKind::InvalidInput, "{other_process}");
         // Both children are adopted as they are, so dropping them ends them.
-        drop(Suspended::adopt(refused.process, first_thread, first_pid).expect("the first child is adopted"));
-        drop(Suspended::adopt(second_process, refused.thread, second_pid).expect("the second child is adopted"));
+        drop(Suspended::adopt(refused.process, other_process.thread, first_pid).expect("the first child is adopted"));
+        drop(Suspended::adopt(other_process.process, refused.thread, second_pid).expect("the second child is adopted"));
     }
 
     #[test]
