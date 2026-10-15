@@ -43,6 +43,7 @@ The rule that shapes it: every file and kernel object another process sees is de
 | Change how a command is quoted, resolved or refused | [design.md, Command launching](design.md#command-launching) → `crates/gate-args/src/{cmdline,batch,program}.rs` → `crates/gate-args/tests/args/{quoting,batch,program}.rs` → `crates/gate/src/` and `gate box` (they share the rules) | [design.md](design.md#command-launching) |
 | Change how a command is started | [design.md, Command launching](design.md#command-launching) → `crates/gate-args/src/{program,cmdline,batch}.rs` → `crates/gate-win32/src/{job,launch,piped,create}.rs` → `crates/gate/src/{environment,run}.rs` → `crates/gate/tests/suite/launch.rs` | [design.md](design.md#command-launching) |
 | Change how processes are created or what handles a started command inherits (a new std spawn in the gate goes through `gate_win32::spawn`, in `create.rs`) | [design.md, Command launching](design.md#command-launching) → `crates/gate-win32/src/{create,launch,piped}.rs` → `crates/gate-win32/tests/{launch,piped}.rs` → `crates/gate/src/{run.rs,boxside/run.rs,boxside/preflight.rs}` → `crates/gate/tests/suite/{launch,boxside}.rs` | [design.md](design.md#command-launching) |
+| Change how a routed command reaches the builder's desktop session (the pipe, adoption, session reads) | `docs/plans/desktop-session.md` → `crates/gate-win32/src/{pipe,adopt,session,launch,piped}.rs` | - |
 | Change the token or elevation a command starts with | [design.md, The box side](design.md#the-box-side) and Process creation → `crates/gate/src/boxside/run.rs` (`command`, `launch`, `restricted_token`, `with_safe_directory`) → `crates/gate-win32/src/token.rs` → `crates/gate-win32/src/piped.rs` (`PipedLaunch`) → `crates/gate-win32/src/create.rs` → `crates/gate/src/bin/fake-tool.rs` (`token` step) → `crates/gate/tests/suite/boxside.rs` and `crates/gate-win32/tests/piped.rs` | [design.md](design.md#the-box-side) |
 | Change the log, the tail, the failure markers or the verdict line | [design.md, Log and tail](design.md#log-and-tail) and [Output lines](design.md#output-lines) → `crates/gate/src/{log,console,run}.rs` → `crates/gate-state/src/verdict.rs` → `crates/gate/tests/suite/launch.rs` | [design.md](design.md#log-and-tail) |
 | Change the command text the journal and claim carry | [design.md, Claim](design.md#claim) and [Journal](design.md#journal) → `crates/gate/src/slots.rs` (`ThisGate`) → `crates/gate-args/src/cmdline.rs` (`command_text`) → `crates/gate-state/src/journal.rs` (`normalize_command`) | [design.md](design.md#journal) |
@@ -149,11 +150,18 @@ The rule that shapes it: every file and kernel object another process sees is de
 
   `PipedLaunch::start_suspended_within_fed` (in `piped.rs`) is the same suspended start in a job with stdin piped as well, a `PipedFed` holding the write end, which `gate push` feeds the exe through.
 
+  What a run on the builder's interactive desktop needs (nothing calls it yet):
+  - `pipe.rs`: `PipeServer` and `PipeClient`, a one-instance named pipe under a random name for one user's local client, the client refusing a pipe whose owner, DACL or label is not the server's.
+  - `adopt.rs`: `RemoteProcess` (push and pull handles into and out of another process) and the reads that say what a handed-over process or thread is (parent, creation time, session, image, `user_of`, `thread_is_suspended`).
+  - `session.rs`: the console session's id, connect state, user, domain and lock state.
+  - `piped.rs`: `DesktopLaunch`, a suspended child on `WinSta0\Default` at normal priority with an explicit handle list.
+  - `launch.rs`: `Suspended::adopt` (with `AdoptError`), which takes such a child by handle; `job.rs`: `Job::holds_process`.
+
   `console.rs` is the box's UTF-8 console: a `Donor` (a `cmd.exe` put in the command's job) and `Utf8Console`, which attaches the process to the donor's console, sets the code pages, and returns through a keeper. `event.rs`'s `NamedEvent` also gives the named manual-reset event of a job's stop signal (`create_new_manual` by the run, `open_to_set` by `stop`).
 
-  Both launches create the process through the shared `create.rs` (`check_launch`, `startup_info`, `AttributeList`, `create_process`, `create_inheriting`), so the refusals before the call and the startup information are one code path.
+  Both launches create the process through the shared `create.rs` (`check_launch`, `startup_info`, `AttributeList`, `create_process`, `create_inheriting_on`, the one spawn path), so the refusals before the call and the startup information are one code path.
 
-  The spawn lock (in `create.rs`) is held while the layer starts any process: `create_inheriting` makes inheritable copies of a launch's handles under it, so the gate's own handles are never inheritable, and `spawn(&mut Command)` starts a std `Command` under the same lock. A std spawn anywhere in the gate goes through `gate_win32::spawn`.
+  The spawn lock (in `create.rs`) is held while the layer starts any process: `create_inheriting_on` makes inheritable copies of a launch's handles under it, so the gate's own handles are never inheritable, and `spawn(&mut Command)` starts a std `Command` under the same lock. A std spawn anywhere in the gate goes through `gate_win32::spawn`.
 
   `priority.rs` is another process's priority class: `Priority`, `priority_of(pid)` and `set_priority(pid, priority)`, `None` for a pid that is gone and an error for a class that cannot be read (`priority_of` asks for `PROCESS_QUERY_INFORMATION`); the gate takes that error as an unknown class.
 

@@ -4,6 +4,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 
 - **Abandon**: the journal event a gate writes when Ctrl+C ends it while still queued, with the seconds it waited.
 - **Abandoned slot**: a slot taken from a gate that died holding it, seen as an abandoned mutex or, when the take is clean, a claim whose pid and start are no longer alive; the next gate takes it as its own and journals the takeover.
+- **Adoption**: the box taking the helper's suspended child by handle (`Suspended::adopt`), after checks on its pid, parent, creation time, session, image and suspended thread.
 - **Archive**: the gzipped `release` lines of a rolled journal, kept in `<state root>\archive\events-<stamp>.jsonl.gz` for 180 days; the gate whose append rolled the journal writes it before releasing the journal mutex.
 - **Aside copy**: the old `gate.exe` an install moves to `gate.exe.<stamp>.<pid>.old` beside the new one; the install deletes older ones once the new gate.exe is verified (hashes right and answers `--version`) and no process holds them, and keeps its own as the last good gate.
 - **Auto ceiling**: a `--timeout auto:<n>` ceiling, which treats `n` as a floor and resolves at each take to `max(n, ceil(3 x the command's adjusted p99))`, capped at 2147483647; with no adjusted p99 it is `n`.
@@ -68,6 +69,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
   The next build takes the hash of each file whose size and last write, as the open file's handle reads them, still match from it instead of reading the file, except while the pending marker stands.
 - **Heartbeat**: a line printed so a gate around the printer does not read quiet as a stall; the wait heartbeat is a waiting gate's `still waiting` line every 30 s, and the box heartbeat is the `gate-remote-heartbeat: <cpu ms>` line the box wrapper writes while its command's CPU use earns one.
 - **Heavy**: the slot kind for work that keeps several cores busy; its pool's thread budget is 4.
+- **Helper**: the Windows-subsystem exe the scheduled task starts in the builder's logged-on session, which creates a routed command on the interactive desktop (`DesktopLaunch`) for the box to adopt.
 - **History key**: a journal run's `command` after `gate_state::normalize_command`: split with the C runtime's argument rules, tree flags and their paths dropped, `.tmp` and worktree paths shortened, each word re-quoted; runs with the same key count together.
 - **Holds the machine**: said of a critical gate once it has taken every heavy and unreserved light slot.
 - **Interrupt**: a Ctrl+C or Ctrl+Break at the gate's console, which stops a queued gate or a running command (exit 0xC000013A unless the command exits on its own first).
