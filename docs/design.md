@@ -1718,9 +1718,15 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
   A sibling that passes all is carried: the route records the root's folder name and each carried sibling, `RemoteRun.leaf` and `RemoteRun.siblings` (its name, its root and its folder's id), and the run says `gate: routed with siblings: <name> (<path>), ...`. Nothing is sent to the builder yet.
 
-  Before the run takes its slot, the client re-checks each carried sibling's name and root as text and reads no folder (`remote/carried.rs`); one that fails falls the run back here with the client fallback reason, so no sibling is dropped from a run that is sent. How a word naming a sibling is rewritten is under Routing (The in-worktree path rewrite).
+  Before the run takes its slot, the client re-checks each carried sibling's name and root as text and reads no folder (`remote/carried.rs`); one that fails falls the run back here with the client fallback reason, so no sibling is dropped from a run that is sent.
+
+  While the builder takes no sibling pairs, the Rust client stays local for any call carrying a sibling, before any ssh call or push: it says `gate: not routed: sibling <first sibling's name> the builder does not take sibling pairs yet`, then `gate: remote <host> client could not start: sibling pairs are off; running here`, and journals a `fallback` with reason `client`. A call with no siblings is unaffected.
+
+  How a word naming a sibling is rewritten is under Routing (The in-worktree path rewrite).
 
   The box side of a sibling pair is built ([The box side](#the-box-side)): the payload's `Pair` and `SiblingSnapshots`, a bare repository per repo, the work folder laid out as `Work\{leaf}` and `Work\{sibling}` under the layout record, and back commits all or nothing across the repos, so relative paths between the trees resolve. The client sends no `Pair` yet; still planned: a routed gate in a repo with siblings will snapshot each sibling's worktree and send it with the run.
+
+  `remote/held.rs` is the holder of a pair's folders for that send: the root's parent is opened once, the root and each sibling are opened beneath it without following a link, their ids, final paths, case, reparse points and `.git` are checked, a network volume is refused, the handles are held without delete sharing, and a recheck opens each path as git would. Nothing calls it yet, so its refusals (`gate: not routed: sibling <name> <why>`) are not said by any run.
 
   Sibling support lands before a repo with siblings is enabled for routing; a repo without siblings is enabled without it. How the PC's sync-back covers a sibling's changed files is open ([Open questions](#open-questions)).
 - **Inputs** (GATE-22), planned, not built: a routed command can need ignored files only the PC has, and the snapshot sends only tracked and untracked-not-ignored files. A repo's optional `inputs` list of ignored-file globs, beside `outputs` in the routing file, is packed with the outputs' transport and hash-diffed against the builder's work folder, so an unchanged input costs nothing.
