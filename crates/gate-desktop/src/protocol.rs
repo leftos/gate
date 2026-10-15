@@ -1,23 +1,39 @@
 //! The messages the box and the desktop helper exchange on the control pipe, and their framing: a frame is a `u32`
 //! little-endian length, then that many bytes of UTF-8 JSON, one object whose `"type"` names the message. A length of
-//! 0 or above [`FRAME_LIMIT`] is refused before anything is allocated for it. Every field is untrusted: decoding
+//! 0 or above the reader's limit ([`FRAME_LIMIT`] for the box's messages, [`HELPER_FRAME_LIMIT`] for the helper's) is
+//! refused before anything is allocated for it. Every field is untrusted: decoding
 //! refuses anything but the exact fields of the message, each of its JSON type and range, and an error names the field
 //! alone, never what it held.
 //!
 //! The four strings of [`Spawn`] travel as base64 (standard alphabet, padded) of UTF-16LE, so any UTF-16, unpaired
 //! surrogates included, arrives as it was sent.
 
+use std::ffi::OsString;
 use std::fmt;
 use std::io;
+use std::os::windows::ffi::OsStringExt;
+use std::path::Path;
 use std::time::Instant;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use gate_win32::{PipeClient, PipeRead, PipeServer, PipeWrite};
+use serde::de::{Deserialize, Deserializer, MapAccess, Visitor};
 use serde_json::{Map, Value};
 
-/// The longest frame body, in bytes.
-pub const FRAME_LIMIT: usize = 4 * 1024 * 1024;
+/// The longest frame body, in bytes, of a message the helper reads from the box: a `Spawn` carries a whole
+/// environment block.
+pub const FRAME_LIMIT: u32 = 4 * 1024 * 1024;
+
+/// The longest frame body, in bytes, of a message the box reads from the helper: `Hello`, `Child` and `Failed` are
+/// small.
+pub const HELPER_FRAME_LIMIT: u32 = 64 * 1024;
+
+/// The most characters a `Hello`'s `version` or `desktop` may hold.
+pub const HELLO_TEXT_LIMIT: usize = 256;
+
+/// The input desktop's name when it is the user's own.
+pub const DEFAULT_DESKTOP: &str = "Default";
 
 /// One message on the control pipe.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -97,6 +113,8 @@ pub enum DecodeError {
     Missing(&'static str),
     /// The object holds a field the message does not have.
     UnexpectedField,
+    /// The object holds one key twice.
+    DuplicateField,
     /// This field is of another JSON type than the message's.
     WrongType(&'static str),
     /// This number field is negative, fractional or too large.
@@ -109,6 +127,14 @@ pub enum DecodeError {
     HoldsNul(&'static str),
     /// This field is empty.
     Empty(&'static str),
+    /// This text field holds more than [`HELLO_TEXT_LIMIT`] characters.
+    Overlong(&'static str),
+    /// This text field holds a control character (C0, DEL or C1).
+    HoldsControl(&'static str),
+    /// This field contradicts another of the message's fields.
+    Contradicts(&'static str),
+    /// This path field is not an absolute path.
+    NotAbsolute(&'static str),
 }
 
 impl fmt::Display for DecodeError {
@@ -125,6 +151,11 @@ impl fmt::Display for DecodeError {
             DecodeError::OddLength(field) => write!(formatter, "the message's {field} is not whole UTF-16 units"),
             DecodeError::HoldsNul(field) => write!(formatter, "the message's {field} holds a NUL"),
             DecodeError::Empty(field) => write!(formatter, "the message's {field} is empty"),
+            DecodeError::DuplicateField => write!(formatter, "the message holds one field twice"),
+            DecodeError::Overlong(field) => write!(formatter, "the message's {field} is longer than {HELLO_TEXT_LIMIT} characters"),
+            DecodeError::HoldsControl(field) => write!(formatter, "the message's {field} holds a control character"),
+            DecodeError::Contradicts(field) => write!(formatter, "the message's {field} contradicts its other fields"),
+            DecodeError::NotAbsolute(field) => write!(formatter, "the message's {field} is not an absolute path"),
         }
     }
 }
@@ -135,12 +166,12 @@ impl std::error::Error for DecodeError {}
 #[must_use]
 pub fn encode(message: &Message) -> Vec<u8> {
     let mut fields = Map::new();
-    let kind = match message {
+    fields.insert("type".to_owned(), Value::from(kind_of(message)));
+    match message {
         Message::Hello { version, desktop, ok } => {
             fields.insert("version".to_owned(), Value::from(version.as_str()));
             fields.insert("desktop".to_owned(), Value::from(desktop.as_str()));
             fields.insert("ok".to_owned(), Value::from(*ok));
-            "hello"
         }
         Message::Spawn(spawn) => {
             fields.insert("application".to_owned(), wide_field(&spawn.application));
@@ -149,24 +180,64 @@ pub fn encode(message: &Message) -> Vec<u8> {
             fields.insert("environment".to_owned(), wide_field(&spawn.environment));
             fields.insert("stdout".to_owned(), Value::from(spawn.stdout));
             fields.insert("stderr".to_owned(), Value::from(spawn.stderr));
-            "spawn"
         }
         Message::Child { pid, process, thread } => {
             fields.insert("pid".to_owned(), Value::from(*pid));
             fields.insert("process".to_owned(), Value::from(*process));
             fields.insert("thread".to_owned(), Value::from(*thread));
-            "child"
         }
         Message::Failed { code } => {
             fields.insert("code".to_owned(), Value::from(*code));
-            "failed"
         }
+        Message::Done => {}
+    }
+    Value::Object(fields).to_string().into_bytes()
+}
+
+/// The `type` the wire names `message` by.
+fn kind_of(message: &Message) -> &'static str {
+    match message {
+        Message::Hello { .. } => "hello",
+        Message::Spawn(_) => "spawn",
+        Message::Child { .. } => "child",
+        Message::Failed { .. } => "failed",
         Message::Done => "done",
-    };
-    let mut object = Map::new();
-    object.insert("type".to_owned(), Value::from(kind));
-    object.extend(fields);
-    Value::Object(object).to_string().into_bytes()
+    }
+}
+
+/// A JSON object read with every key it holds, and whether a key came twice: `serde_json`'s own map keeps the last of
+/// a repeated key without a word.
+struct StrictObject {
+    fields: Map<String, Value>,
+    repeated: bool,
+}
+
+impl<'de> Deserialize<'de> for StrictObject {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<StrictObject, D::Error> {
+        deserializer.deserialize_map(StrictObjectVisitor)
+    }
+}
+
+/// Reads a [`StrictObject`], key by key.
+struct StrictObjectVisitor;
+
+impl<'de> Visitor<'de> for StrictObjectVisitor {
+    type Value = StrictObject;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a JSON object")
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut access: A) -> Result<StrictObject, A::Error> {
+        let mut object = StrictObject {
+            fields: Map::new(),
+            repeated: false,
+        };
+        while let Some((key, value)) = access.next_entry::<String, Value>()? {
+            object.repeated |= object.fields.insert(key, value).is_some();
+        }
+        Ok(object)
+    }
 }
 
 /// `units` as the wire carries it: base64 of its UTF-16LE bytes.
@@ -181,20 +252,19 @@ fn wide_field(units: &[u16]) -> Value {
 ///
 /// A [`DecodeError`] naming the first thing refused.
 pub fn decode(body: &[u8]) -> Result<Message, DecodeError> {
-    let Ok(Value::Object(mut fields)) = serde_json::from_slice::<Value>(body) else {
+    let Ok(StrictObject { mut fields, repeated }) = serde_json::from_slice::<StrictObject>(body) else {
         return Err(DecodeError::NotAnObject);
     };
+    if repeated {
+        return Err(DecodeError::DuplicateField);
+    }
     let kind = match fields.remove("type") {
         None => return Err(DecodeError::MissingType),
         Some(Value::String(kind)) => kind,
         Some(_) => return Err(DecodeError::WrongType("type")),
     };
     let message = match kind.as_str() {
-        "hello" => Message::Hello {
-            version: take_string(&mut fields, "version")?,
-            desktop: take_string(&mut fields, "desktop")?,
-            ok: take_bool(&mut fields, "ok")?,
-        },
+        "hello" => take_hello(&mut fields)?,
         "spawn" => Message::Spawn(take_spawn(&mut fields)?),
         "child" => Message::Child {
             pid: take_u32(&mut fields, "pid")?,
@@ -237,7 +307,30 @@ fn take_spawn(fields: &mut Map<String, Value>) -> Result<Spawn, DecodeError> {
             return Err(DecodeError::Empty(field));
         }
     }
+    if !Path::new(&OsString::from_wide(&spawn.directory)).is_absolute() {
+        return Err(DecodeError::NotAbsolute("directory"));
+    }
     Ok(spawn)
+}
+
+/// The fields of a `Hello`, taken out of `fields` and checked: `version` and `desktop` short and free of control
+/// characters, and `ok` saying exactly whether `desktop` is [`DEFAULT_DESKTOP`].
+fn take_hello(fields: &mut Map<String, Value>) -> Result<Message, DecodeError> {
+    let version = take_string(fields, "version")?;
+    let desktop = take_string(fields, "desktop")?;
+    let ok = take_bool(fields, "ok")?;
+    for (field, text) in [("version", &version), ("desktop", &desktop)] {
+        if text.chars().count() > HELLO_TEXT_LIMIT {
+            return Err(DecodeError::Overlong(field));
+        }
+        if text.chars().any(char::is_control) {
+            return Err(DecodeError::HoldsControl(field));
+        }
+    }
+    if ok != (desktop == DEFAULT_DESKTOP) {
+        return Err(DecodeError::Contradicts("ok"));
+    }
+    Ok(Message::Hello { version, desktop, ok })
 }
 
 /// The field `name`, taken out of `fields`.
@@ -333,7 +426,7 @@ pub enum ReadError {
     Woken(usize),
     /// The frame's length is 0.
     Empty,
-    /// The frame's length is above [`FRAME_LIMIT`].
+    /// The frame's length is above the reader's limit.
     TooLong,
     /// The frame's body is no message.
     Decode(DecodeError),
@@ -348,7 +441,7 @@ impl fmt::Display for ReadError {
             ReadError::TimedOut => write!(formatter, "no whole message arrived in time"),
             ReadError::Woken(index) => write!(formatter, "the wait was ended by wake handle {index}"),
             ReadError::Empty => write!(formatter, "the message's frame is empty"),
-            ReadError::TooLong => write!(formatter, "the message's frame is longer than {FRAME_LIMIT} bytes"),
+            ReadError::TooLong => write!(formatter, "the message's frame is longer than the reader takes"),
             ReadError::Decode(error) => error.fmt(formatter),
             ReadError::Io(error) => write!(formatter, "the pipe could not be read: {error}"),
         }
@@ -401,22 +494,21 @@ impl std::error::Error for WriteError {
     }
 }
 
-/// Reads one whole frame from `pipe` and decodes it, the length and the body together under the one `deadline`.
+/// Reads one whole frame from `pipe` and decodes it, the length and the body together under the one `deadline`. A
+/// length above `limit` is refused before anything is allocated: the box reads the helper's messages under
+/// [`HELPER_FRAME_LIMIT`], and the helper reads `Spawn` under [`FRAME_LIMIT`].
 ///
 /// # Errors
 ///
 /// A [`ReadError`] saying why no message was read.
-pub fn read_message(pipe: &impl FramePipe, deadline: Instant) -> Result<Message, ReadError> {
+pub fn read_message(pipe: &impl FramePipe, deadline: Instant, limit: u32) -> Result<Message, ReadError> {
     let mut prefix = [0_u8; 4];
     read_exact(pipe, &mut prefix, deadline)?;
     let length = u32::from_le_bytes(prefix);
     if length == 0 {
         return Err(ReadError::Empty);
     }
-    let length = usize::try_from(length)
-        .ok()
-        .filter(|&length| length <= FRAME_LIMIT)
-        .ok_or(ReadError::TooLong)?;
+    let length = usize::try_from(length).ok().filter(|_| length <= limit).ok_or(ReadError::TooLong)?;
     let mut body = vec![0_u8; length];
     read_exact(pipe, &mut body, deadline)?;
     decode(&body).map_err(ReadError::Decode)
@@ -453,7 +545,7 @@ fn read_exact(pipe: &impl FramePipe, buf: &mut [u8], deadline: Instant) -> Resul
 /// A [`WriteError`] saying why the frame was not written whole.
 pub fn write_message(pipe: &impl FramePipe, message: &Message, deadline: Instant) -> Result<(), WriteError> {
     let body = encode(message);
-    if body.len() > FRAME_LIMIT {
+    if body.len() > FRAME_LIMIT as usize {
         return Err(WriteError::TooLong);
     }
     let length = u32::try_from(body.len()).map_err(|_| WriteError::TooLong)?;

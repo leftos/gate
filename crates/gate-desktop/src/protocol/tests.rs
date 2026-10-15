@@ -7,7 +7,10 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use gate_win32::{PipeRead, PipeWrite};
 
-use super::{DecodeError, FRAME_LIMIT, FramePipe, Message, ReadError, Spawn, WriteError, decode, encode, read_message, write_message};
+use super::{
+    DecodeError, FRAME_LIMIT, FramePipe, HELLO_TEXT_LIMIT, HELPER_FRAME_LIMIT, Message, ReadError, Spawn, WriteError, decode, encode, read_message,
+    write_message,
+};
 
 /// A deadline no test reaches.
 fn far() -> Instant {
@@ -83,7 +86,7 @@ fn spawn() -> Spawn {
         application: wide(r"C:\Windows\System32\cmd.exe"),
         command_line: wide("cmd /d /c echo é"),
         // An unpaired surrogate travels as it is.
-        directory: vec![u16::from(b'C'), u16::from(b':'), 0xD800],
+        directory: vec![u16::from(b'C'), u16::from(b':'), u16::from(b'\\'), 0xD800],
         environment: wide("A=1\0B=2\0\0"),
         stdout: 0x1F4,
         stderr: 0x7FFF_FFFC,
@@ -145,7 +148,7 @@ fn every_message_round_trips_through_a_frame() {
         write_message(&pipe, &message, far()).expect("the message is written");
         let reader = Memory::of([pipe.written.take()]);
 
-        let read = read_message(&reader, far()).expect("the message is read back");
+        let read = read_message(&reader, far(), FRAME_LIMIT).expect("the message is read back");
 
         assert_eq!(read, message);
     }
@@ -158,7 +161,10 @@ fn a_spawn_s_strings_travel_as_base64_of_utf16le() {
 
     assert_eq!(json["type"], "spawn");
     assert_eq!(json["application"], b64(&spawn().application));
-    assert_eq!(json["directory"], "QwA6AADY", "C, :, then the unpaired surrogate 0xD800, little-endian");
+    assert_eq!(
+        json["directory"], "QwA6AFwAANg=",
+        "C, :, \\, then the unpaired surrogate 0xD800, little-endian"
+    );
 }
 
 #[test]
@@ -286,22 +292,100 @@ fn a_refusal_never_shows_what_the_field_held() {
 
 #[test]
 fn a_frame_longer_than_the_limit_is_refused_before_its_body_is_read() {
-    let too_long = u32::try_from(FRAME_LIMIT + 1).expect("the limit fits a u32");
+    let too_long = FRAME_LIMIT + 1;
     let pipe = Memory::of([too_long.to_le_bytes().to_vec(), vec![b'{'; 64]]);
 
-    let refused = read_message(&pipe, far()).expect_err("the frame is refused");
+    let refused = read_message(&pipe, far(), FRAME_LIMIT).expect_err("the frame is refused");
 
     assert!(matches!(refused, ReadError::TooLong), "{refused}");
     assert_eq!(pipe.reads(), 1, "only the length was read");
     let largest = Memory::of([u32::MAX.to_le_bytes().to_vec()]);
-    assert!(matches!(read_message(&largest, far()), Err(ReadError::TooLong)));
+    assert!(matches!(read_message(&largest, far(), FRAME_LIMIT), Err(ReadError::TooLong)));
+}
+
+#[test]
+fn a_helper_frame_longer_than_the_helper_limit_is_refused_before_its_body_is_read() {
+    let pipe = Memory::of([(HELPER_FRAME_LIMIT + 1).to_le_bytes().to_vec(), vec![b'{'; 64]]);
+
+    let refused = read_message(&pipe, far(), HELPER_FRAME_LIMIT).expect_err("the frame is refused");
+
+    assert!(matches!(refused, ReadError::TooLong), "{refused}");
+    assert_eq!(pipe.reads(), 1, "only the length was read");
+    let hello = encode(&Message::Hello {
+        version: "v".to_owned(),
+        desktop: "Default".to_owned(),
+        ok: true,
+    });
+    let small = Memory::of([frame(&hello)]);
+    assert!(read_message(&small, far(), HELPER_FRAME_LIMIT).is_ok(), "a hello fits the helper limit");
+}
+
+#[test]
+fn a_repeated_key_is_refused() {
+    assert_eq!(decoded(r#"{"type":"done","type":"done"}"#), Err(DecodeError::DuplicateField));
+    assert_eq!(decoded(r#"{"type":"done","type":"failed","code":2}"#), Err(DecodeError::DuplicateField));
+    let spawn = spawn_json_with("stdout", Some(r#"4,"stdout":12"#));
+    assert_eq!(decoded(&spawn), Err(DecodeError::DuplicateField));
+}
+
+/// A hello's JSON with these fields.
+fn hello_json(version: &str, desktop: &str, ok: bool) -> String {
+    serde_json::json!({"type": "hello", "version": version, "desktop": desktop, "ok": ok}).to_string()
+}
+
+#[test]
+fn a_hello_text_that_is_too_long_or_holds_a_control_character_is_refused_by_name() {
+    let longest = "v".repeat(HELLO_TEXT_LIMIT);
+    let too_long = "é".repeat(HELLO_TEXT_LIMIT + 1);
+
+    assert!(
+        decoded(&hello_json(&longest, "Default", true)).is_ok(),
+        "{HELLO_TEXT_LIMIT} characters are allowed"
+    );
+    assert_eq!(decoded(&hello_json(&too_long, "Default", true)), Err(DecodeError::Overlong("version")));
+    assert_eq!(decoded(&hello_json("v", &too_long, false)), Err(DecodeError::Overlong("desktop")));
+    for control in ["\u{0}", "\u{1b}", "\n", "\u{7f}", "\u{85}", "\u{9b}"] {
+        let text = format!("a{control}b");
+        assert_eq!(
+            decoded(&hello_json(&text, "Default", true)),
+            Err(DecodeError::HoldsControl("version")),
+            "{control:?}"
+        );
+        assert_eq!(
+            decoded(&hello_json("v", &text, false)),
+            Err(DecodeError::HoldsControl("desktop")),
+            "{control:?}"
+        );
+    }
+}
+
+#[test]
+fn a_hello_whose_ok_contradicts_its_desktop_is_refused() {
+    assert_eq!(decoded(&hello_json("v", "Winlogon", true)), Err(DecodeError::Contradicts("ok")));
+    assert_eq!(decoded(&hello_json("v", "Default", false)), Err(DecodeError::Contradicts("ok")));
+    assert_eq!(decoded(&hello_json("v", "", true)), Err(DecodeError::Contradicts("ok")));
+    assert!(decoded(&hello_json("v", "Winlogon", false)).is_ok());
+}
+
+#[test]
+fn a_spawn_directory_that_is_not_absolute_is_refused() {
+    for relative in [r"work", r"C:work", r"\work", r"..\work"] {
+        let field = format!("\"{}\"", b64(&wide(relative)));
+        assert_eq!(
+            decoded(&spawn_json_with("directory", Some(&field))),
+            Err(DecodeError::NotAbsolute("directory")),
+            "{relative}"
+        );
+    }
+    let unc = format!("\"{}\"", b64(&wide(r"\\server\share\work")));
+    assert!(decoded(&spawn_json_with("directory", Some(&unc))).is_ok(), "a UNC path is absolute");
 }
 
 #[test]
 fn a_frame_of_length_zero_is_refused() {
     let pipe = Memory::of([0_u32.to_le_bytes().to_vec()]);
 
-    assert!(matches!(read_message(&pipe, far()), Err(ReadError::Empty)));
+    assert!(matches!(read_message(&pipe, far(), FRAME_LIMIT), Err(ReadError::Empty)));
 }
 
 #[test]
@@ -310,7 +394,7 @@ fn a_frame_split_across_many_reads_is_read_under_one_deadline() {
     let pipe = Memory::of(bytes.iter().map(|&byte| vec![byte]));
     let deadline = far();
 
-    let read = read_message(&pipe, deadline).expect("the frame is read");
+    let read = read_message(&pipe, deadline, FRAME_LIMIT).expect("the frame is read");
 
     assert_eq!(read, Message::Spawn(spawn()));
     assert_eq!(pipe.reads(), bytes.len(), "one read per byte");
@@ -325,14 +409,14 @@ fn a_frame_cut_short_is_closed() {
     let bytes = frame(&encode(&Message::Done));
     let pipe = Memory::of([bytes[..bytes.len() - 1].to_vec()]);
 
-    assert!(matches!(read_message(&pipe, far()), Err(ReadError::Closed)));
+    assert!(matches!(read_message(&pipe, far(), FRAME_LIMIT), Err(ReadError::Closed)));
 }
 
 #[test]
 fn a_deadline_already_passed_reads_nothing() {
     let pipe = Memory::of([frame(&encode(&Message::Done))]);
 
-    let refused = read_message(&pipe, Instant::now()).expect_err("the deadline has passed");
+    let refused = read_message(&pipe, Instant::now(), FRAME_LIMIT).expect_err("the deadline has passed");
 
     assert!(matches!(refused, ReadError::TimedOut), "{refused}");
     assert_eq!(pipe.reads(), 0);
@@ -341,7 +425,7 @@ fn a_deadline_already_passed_reads_nothing() {
 #[test]
 fn a_message_longer_than_the_limit_is_not_written() {
     let mut huge = spawn();
-    huge.environment = vec![u16::from(b'A'); FRAME_LIMIT];
+    huge.environment = vec![u16::from(b'A'); FRAME_LIMIT as usize];
     let pipe = Memory::default();
 
     let refused = write_message(&pipe, &Message::Spawn(huge), far()).expect_err("the message is too long");

@@ -359,6 +359,12 @@ impl PipeServer {
         Ok(())
     }
 
+    /// The server end's raw handle, for a test that hands it where a client end is expected.
+    #[cfg(test)]
+    pub(crate) fn raw_for_tests(&self) -> HANDLE {
+        self.handle.raw()
+    }
+
     /// The id of the process at the client end of the connected pipe (`GetNamedPipeClientProcessId`).
     ///
     /// # Errors

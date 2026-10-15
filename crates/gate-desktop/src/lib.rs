@@ -38,22 +38,34 @@ pub enum HelperExit {
     BadArgument = 10,
     /// No pipe of the name appeared before the connect limit.
     NoPipe = 11,
-    /// The pipe could not be opened, its owner, DACL or label was not the box's, or its server was not the box's pid.
+    /// The pipe could not be opened, its owner, DACL or label was not the box's, or its server's pid was not the box's
+    /// or could not be read.
     ServerRefused = 12,
-    /// The box closed the pipe, or a write to it failed.
+    /// The box closed the pipe: a read before `Spawn` or before `Done` found it closed or disconnected, or a write
+    /// found it so. A child already created was ended.
     BoxGone = 13,
-    /// The box's `Spawn` was malformed, or one of its values failed a check.
+    /// The box's `Spawn` was malformed, another message came in its place, or one of its values failed a check.
     BadSpawn = 14,
-    /// The command could not be created; the box was sent `Failed` with the system's code.
+    /// `CreateProcessW` refused the command; the box was sent `Failed` with the system's code.
     SpawnFailed = 15,
     /// The box never said `Done`; the child was left as it was.
     NoDone = 16,
     /// The box sent something other than `Done` after the child; the child was left as it was.
     BadMessage = 17,
-    /// The box sent no `Spawn` before the message limit.
+    /// The box sent no `Spawn` before the message limit, or did not take the child's report within it; a child already
+    /// created was left as it was.
     TimedOut = 18,
-    /// Any other failure of the system.
+    /// Any other failure of the system; a child already created was left as it was.
     Internal = 19,
+    /// The launch failed before `CreateProcessW` was called (a refused application or folder, or a handle or attribute
+    /// list that could not be made); no `Failed` was sent, since this is no failure of the command itself.
+    SetupFailed = 20,
+    /// The box closed the pipe after the child was created, and the child could not be shown ended: opening it, ending
+    /// it or waiting for its end failed, or it had not ended within the message limit.
+    ChildNotEnded = 21,
+    /// The helper runs above medium integrity or elevated, which a helper the Task Scheduler starts with the user's
+    /// least-privileged token never does; it touched no pipe.
+    WrongIntegrity = 22,
 }
 
 impl HelperExit {
@@ -79,11 +91,12 @@ pub fn arg0(box_pid: u32, pipe: &str) -> Option<String> {
     (box_pid != 0 && is_pipe_hex(hex)).then(|| format!("{box_pid}:{hex}"))
 }
 
-/// The box's pid and the pipe's full name from `Arg0`; `None` unless it is `<pid>:<hex>`, the pid all ASCII digits
-/// and not 0, and the hex exactly 32 lowercase hex digits. The name is always built here, never taken from `Arg0`.
+/// The box's pid and the pipe's full name from `Arg0`; `None` unless it is `<pid>:<hex>`, the pid all ASCII digits,
+/// with no leading 0, and not 0, and the hex exactly 32 lowercase hex digits: the form [`arg0`] writes. The name is
+/// always built here, never taken from `Arg0`.
 fn parse_arg0(text: &str) -> Option<(u32, String)> {
     let (pid, hex) = text.split_once(':')?;
-    if pid.is_empty() || !pid.bytes().all(|byte| byte.is_ascii_digit()) || !is_pipe_hex(hex) {
+    if pid.is_empty() || pid.starts_with('0') || !pid.bytes().all(|byte| byte.is_ascii_digit()) || !is_pipe_hex(hex) {
         return None;
     }
     let pid = pid.parse::<u32>().ok().filter(|&pid| pid != 0)?;

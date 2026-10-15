@@ -17,6 +17,7 @@ test-seams = []
 [dependencies]
 base64 = "0.23.1"
 gate-win32 = { path = "../gate-win32" }
+serde = "1.0.229"
 serde_json = { version = "1.0.151", features = ["preserve_order"] }
 
 [dev-dependencies]

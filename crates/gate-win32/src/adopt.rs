@@ -17,7 +17,8 @@ use windows_sys::Win32::Foundation::{
     ERROR_INVALID_PARAMETER, GetHandleInformation, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::TOKEN_QUERY;
-use windows_sys::Win32::Storage::FileSystem::{FILE_TYPE_PIPE, GetFileType};
+use windows_sys::Win32::Storage::FileSystem::{FILE_TYPE_PIPE, FileNameInfo, GetFileInformationByHandleEx, GetFileType};
+use windows_sys::Win32::System::Pipes::{GetNamedPipeInfo, PIPE_SERVER_END};
 use windows_sys::Win32::System::RemoteDesktop::ProcessIdToSessionId;
 use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, GetProcessId, GetProcessIdOfThread, OpenProcess, OpenProcessToken, PROCESS_DUP_HANDLE, PROCESS_NAME_WIN32,
@@ -139,9 +140,12 @@ pub fn is_handle_value(value: usize) -> bool {
 }
 
 /// The stdout or stderr handle another process placed in this process's handle table and sent as the number `value`,
-/// borrowed once it passes three checks, in this order: it is a handle value ([`is_handle_value`]), it names a pipe
-/// (`GetFileType` is `FILE_TYPE_PIPE`), and it is not the same kernel object as `control`, this process's own control
-/// pipe (`CompareObjectHandles`), so a lying sender cannot make the command write into the control channel.
+/// borrowed once it passes six checks, in this order: it is a handle value ([`is_handle_value`]); it names an open
+/// handle (`GetHandleInformation`); it names a pipe (`GetFileType` is `FILE_TYPE_PIPE`); it is a pipe's writing end, not
+/// its server or reading end (`GetNamedPipeInfo` without `PIPE_SERVER_END`; an anonymous pipe's read end is its server
+/// end); it is not the same kernel object as `control`, this process's own control pipe (`CompareObjectHandles`); and
+/// its pipe's name (`GetFileInformationByHandleEx` with `FileNameInfo`) is not the control pipe's. So a lying sender
+/// cannot make the command write into the control channel, or hold a reading end.
 ///
 /// # Safety
 ///
@@ -152,7 +156,9 @@ pub fn is_handle_value(value: usize) -> bool {
 /// # Errors
 ///
 /// An error of kind [`io::ErrorKind::InvalidInput`] naming the check `value` failed: not a handle value, naming no open
-/// handle, not naming a pipe, or naming the control pipe. The error never describes the object the value names.
+/// handle, not naming a pipe, being a pipe's reading end, naming the control pipe, or naming a pipe whose name cannot be
+/// read; the system's error when the control pipe's own name cannot be read. The error never describes the object the
+/// value names.
 pub unsafe fn check_received_output<'a>(value: usize, control: BorrowedHandle<'_>) -> io::Result<BorrowedHandle<'a>> {
     let refused = |why: &str| io::Error::new(io::ErrorKind::InvalidInput, format!("the received output handle 0x{value:x} {why}"));
     if !is_handle_value(value) {
@@ -165,18 +171,68 @@ pub unsafe fn check_received_output<'a>(value: usize, control: BorrowedHandle<'_
     if unsafe { GetHandleInformation(raw, &raw mut flags) } == 0 {
         return Err(refused("names no open handle"));
     }
-    // SAFETY: `GetFileType` only looks the value up in this process's table; it names an open handle, as found above.
-    if unsafe { GetFileType(raw) } != FILE_TYPE_PIPE {
-        return Err(refused("does not name a pipe"));
-    }
-    // SAFETY: the value names an open handle of this table, as `GetFileType` found, and `control` is borrowed open for
-    // the whole call; the call only compares the objects behind them.
-    if unsafe { CompareObjectHandles(raw, control.as_raw_handle()) } != 0 {
-        return Err(refused("names this process's control pipe"));
+    // SAFETY: the value names an open handle of this process, as `GetHandleInformation` found, which stays open for
+    // the call: the caller guarantees nothing closes it meanwhile.
+    let borrowed = unsafe { BorrowedHandle::borrow_raw(raw) };
+    if let Some(why) = pipe_problem(borrowed, control)? {
+        return Err(refused(why));
     }
     // SAFETY: the value names an open pipe handle of this process, and the caller guarantees that it stays open and
     // unowned while the borrow is used.
     Ok(unsafe { BorrowedHandle::borrow_raw(raw) })
+}
+
+/// What makes the open handle `handle` no output pipe for a command, against the control pipe `control`, or `None`.
+fn pipe_problem(handle: BorrowedHandle<'_>, control: BorrowedHandle<'_>) -> io::Result<Option<&'static str>> {
+    let raw = handle.as_raw_handle();
+    // SAFETY: the handle is borrowed open for the whole call.
+    if unsafe { GetFileType(raw) } != FILE_TYPE_PIPE {
+        return Ok(Some("does not name a pipe"));
+    }
+    let mut flags = 0;
+    // SAFETY: the handle is borrowed open for the whole call, `flags` is writable and the other outputs are not asked for.
+    let read = unsafe { GetNamedPipeInfo(raw, &raw mut flags, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut()) };
+    if read == 0 {
+        return Ok(Some("does not name a pipe"));
+    }
+    if flags & PIPE_SERVER_END != 0 {
+        return Ok(Some("is a pipe's reading end"));
+    }
+    if same_object(handle, control) {
+        return Ok(Some("names this process's control pipe"));
+    }
+    let control_name = pipe_name(control)?;
+    Ok(match pipe_name(handle) {
+        Ok(name) if name == control_name => Some("names this process's control pipe"),
+        Ok(_) => None,
+        Err(_) => Some("names a pipe whose name cannot be read"),
+    })
+}
+
+/// The name of the pipe behind `handle`, as `GetFileInformationByHandleEx` with `FileNameInfo` gives it.
+fn pipe_name(handle: BorrowedHandle<'_>) -> io::Result<Vec<u16>> {
+    // A `FILE_NAME_INFO`: a `u32` byte count, then the name; `u32` units keep it aligned. A pipe name is at most 256
+    // characters, so 1024 units hold any with room to spare.
+    let mut buffer = vec![0_u32; 1 + 1024 / 2];
+    let size = u32::try_from(buffer.len() * 4).map_err(io::Error::other)?;
+    // SAFETY: the handle is borrowed open for the whole call, and `buffer` is writable and aligned for `size` bytes.
+    if unsafe { GetFileInformationByHandleEx(handle.as_raw_handle(), FileNameInfo, buffer.as_mut_ptr().cast(), size) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let bytes = buffer.first().copied().unwrap_or(0) as usize;
+    let name_bytes: Vec<u8> = buffer.iter().skip(1).flat_map(|word| word.to_ne_bytes()).collect();
+    let units: Vec<u16> = name_bytes.as_chunks::<2>().0.iter().map(|&pair| u16::from_ne_bytes(pair)).collect();
+    units
+        .get(..bytes / 2)
+        .map(<[u16]>::to_vec)
+        .ok_or_else(|| io::Error::other("the system reported a pipe name longer than its buffer"))
+}
+
+/// Whether `first` and `second` stand for one kernel object (`CompareObjectHandles`), whatever their values.
+#[must_use]
+pub fn same_object(first: BorrowedHandle<'_>, second: BorrowedHandle<'_>) -> bool {
+    // SAFETY: both handles are borrowed open for the whole call; the call only compares the objects behind them.
+    unsafe { CompareObjectHandles(first.as_raw_handle(), second.as_raw_handle()) != 0 }
 }
 
 /// The process `pid`, opened to end it and wait for its end (`PROCESS_TERMINATE`, `PROCESS_QUERY_LIMITED_INFORMATION`
@@ -380,11 +436,13 @@ mod tests {
 
     use windows_sys::Win32::Foundation::{CompareObjectHandles, ERROR_INVALID_HANDLE, HANDLE, WAIT_OBJECT_0};
     use windows_sys::Win32::System::Pipes::CreatePipe;
-    use windows_sys::Win32::System::Threading::{CreateEventW, GetCurrentProcess, ResumeThread, SuspendThread, WaitForSingleObject};
+    use windows_sys::Win32::System::Threading::{
+        CreateEventW, GetCurrentProcess, OpenProcess, PROCESS_SYNCHRONIZE, ResumeThread, SuspendThread, WaitForSingleObject,
+    };
 
     use super::{
-        RemoteProcess, check_received_output, creation_time_of, image_path_of, is_handle_value, parent_pid_of, pid_of_process, pid_of_thread,
-        process_of_child, session_of, thread_is_suspended, user_of,
+        RemoteProcess, check_received_output, creation_time_of, end_process, image_path_of, is_handle_value, parent_pid_of, pid_of_process,
+        pid_of_thread, process_of_child, session_of, thread_is_suspended, user_of,
     };
     use crate::{EnvironmentBlock, Job, Launch, LaunchError, LaunchOutput, StoppableProcess, Suspended, system_directory};
 
@@ -716,8 +774,12 @@ mod tests {
 
     #[test]
     fn check_received_output_takes_only_a_pipe_other_than_the_control_pipe() {
-        let (control, _control_write) = pipe();
-        let (_read, write) = pipe();
+        // The helper's control pipe is the client end of a named pipe, as here.
+        let sid = crate::current_user_sid().expect("the user is read");
+        let server = crate::PipeServer::create("gate-win32-adopt-test", &sid).expect("the control pipe is made");
+        let client = crate::PipeClient::open(server.name(), &sid).expect("the control pipe opens");
+        let control = client.handle();
+        let (read, write) = pipe();
 
         // SAFETY: `write` owns the value and outlives the borrow, closing nothing meanwhile.
         let taken = unsafe { check_received_output(write.as_raw_handle().addr(), control.as_handle()) }.expect("a pipe's write end is taken");
@@ -728,13 +790,45 @@ mod tests {
         let event = event();
         assert_output_refused(event.as_raw_handle().addr(), control.as_handle(), "does not name a pipe");
         assert_output_refused(control.as_raw_handle().addr(), control.as_handle(), "control pipe");
-        let copy = control.try_clone().expect("the control handle is copied");
+        let copy = control.try_clone_to_owned().expect("the control handle is copied");
         assert_output_refused(copy.as_raw_handle().addr(), control.as_handle(), "control pipe");
+        assert_output_refused(server.raw_for_tests().addr(), control.as_handle(), "is a pipe's reading end");
+        assert_output_refused(read.as_raw_handle().addr(), control.as_handle(), "is a pipe's reading end");
         assert_output_refused(3, control.as_handle(), "is not a value");
         let (closed_read, closed_write) = pipe();
         let closed = closed_write.as_raw_handle().addr();
         drop((closed_read, closed_write));
         assert_output_refused(closed, control.as_handle(), "names no open handle");
+    }
+
+    #[test]
+    fn end_process_ends_a_process_and_finds_an_ended_one_ended() {
+        let _alone = one_at_a_time();
+        let child = suspended("exit 0");
+        let (process, thread) = handles_of(child);
+
+        let first = end_process(process.as_handle(), 1, HANG_GUARD).expect("the process is ended");
+        let again = end_process(process.as_handle(), 1, HANG_GUARD).expect("an ended process is no error");
+
+        assert!(first, "the process ended");
+        assert!(again, "the ended process is found ended");
+        drop(thread);
+    }
+
+    #[test]
+    fn end_process_fails_when_the_terminate_is_refused_and_the_process_lives() {
+        let _alone = one_at_a_time();
+        let child = suspended("exit 0");
+        // SAFETY: `OpenProcess` takes no pointers. A success is a fresh handle nothing else owns.
+        let opened = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, child.pid()) };
+        assert!(!opened.is_null(), "the child opens: {}", io::Error::last_os_error());
+        // SAFETY: as above.
+        let wait_only = unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(opened) };
+
+        let refused = end_process(wait_only.as_handle(), 1, Duration::ZERO).expect_err("a handle without PROCESS_TERMINATE cannot end it");
+
+        assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied, "{refused}");
+        drop(child);
     }
 
     #[test]

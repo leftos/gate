@@ -2,6 +2,7 @@
 //! for the box to say it is done. Each step is bounded, and each way it ends is a [`HelperExit`].
 
 use std::ffi::OsString;
+use std::io;
 use std::os::windows::ffi::OsStringExt;
 use std::os::windows::io::{AsHandle, BorrowedHandle};
 use std::path::PathBuf;
@@ -9,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use gate_win32::{DesktopLaunch, EnvironmentBlock, LaunchError, PipeClient, Released, Suspended};
 
-use crate::protocol::{Message, ReadError, Spawn, read_message, write_message};
+use crate::protocol::{DEFAULT_DESKTOP, FRAME_LIMIT, Message, ReadError, Spawn, WriteError, read_message, write_message};
 use crate::version::build_version;
 use crate::{CONNECT_LIMIT, DONE_LIMIT, HelperExit, MESSAGE_LIMIT, parse_arg0};
 
@@ -19,14 +20,15 @@ const ERROR_FILE_NOT_FOUND: i32 = 2;
 /// `ERROR_PIPE_BUSY`: the pipe's one instance is held, maybe by a client the box is about to drop.
 const ERROR_PIPE_BUSY: i32 = 231;
 
-/// `ERROR_INVALID_PARAMETER`: the code `Failed` carries for a launch refused without a system error.
-const ERROR_INVALID_PARAMETER: u32 = 87;
+/// The errors that say the other end of the pipe is gone: `ERROR_BROKEN_PIPE`, `ERROR_NO_DATA` and
+/// `ERROR_PIPE_NOT_CONNECTED`.
+const PIPE_GONE: [i32; 3] = [109, 232, 233];
+
+/// The relative ID of the medium integrity level, the highest the helper runs at.
+const MEDIUM_INTEGRITY: u32 = 0x2000;
 
 /// The pause between two tries to reach a pipe that is not there yet or busy.
 const RETRY_PAUSE: Duration = Duration::from_millis(20);
-
-/// The input desktop's name when it is the user's own.
-const DEFAULT_DESKTOP: &str = "Default";
 
 /// The exit code a child the helper ends is given: a command that never ran, as `gate_win32` ends one.
 const ENDED_UNSTARTED: u32 = 1;
@@ -60,9 +62,9 @@ impl Limits {
         };
         let cap = Duration::from_millis(cap.to_str()?.parse::<u64>().ok()?);
         Some(Limits {
-            connect: CONNECT_LIMIT.min(cap),
-            message: MESSAGE_LIMIT.min(cap),
-            done: DONE_LIMIT.min(cap),
+            connect: Limits::BUILT.connect.min(cap),
+            message: Limits::BUILT.message.min(cap),
+            done: Limits::BUILT.done.min(cap),
         })
     }
 }
@@ -91,11 +93,11 @@ pub fn run(args: impl IntoIterator<Item = OsString>) -> HelperExit {
 
 /// The run once `Arg0` is read: every step in order, the first that ends the run giving its exit.
 fn serve(box_pid: u32, name: &str, limits: Limits) -> Result<HelperExit, HelperExit> {
+    check_integrity()?;
     let pipe = connect(name, limits.connect)?;
     match pipe.server_pid() {
         Ok(pid) if pid == box_pid => {}
-        Ok(_) => return Err(HelperExit::ServerRefused),
-        Err(_) => return Err(HelperExit::Internal),
+        Ok(_) | Err(_) => return Err(HelperExit::ServerRefused),
     }
     send(&pipe, &hello(), limits.message)?;
     let spawn = receive_spawn(&pipe, limits.message)?;
@@ -106,11 +108,23 @@ fn serve(box_pid: u32, name: &str, limits: Limits) -> Result<HelperExit, HelperE
         process: released.process.addr() as u64,
         thread: released.thread.addr() as u64,
     };
-    if send(&pipe, &report, limits.message).is_err() {
-        end_child(&released, limits.message);
-        return Err(HelperExit::BoxGone);
+    match write_message(&pipe, &report, Instant::now() + limits.message) {
+        Ok(()) => Ok(await_done(&pipe, &released, limits)),
+        Err(WriteError::Closed) => Err(box_gone(&released, limits.message)),
+        Err(WriteError::Io(error)) if is_pipe_gone(&error) => Err(box_gone(&released, limits.message)),
+        Err(WriteError::TimedOut) => Err(HelperExit::TimedOut),
+        Err(WriteError::Io(_) | WriteError::Woken(_) | WriteError::TooLong) => Err(HelperExit::Internal),
     }
-    Ok(await_done(&pipe, &released, limits))
+}
+
+/// Refuses to go on above medium integrity or elevated: a helper the Task Scheduler starts with the user's
+/// least-privileged token runs at medium, and a higher one must not start commands for the box.
+fn check_integrity() -> Result<(), HelperExit> {
+    let facts = gate_win32::token_facts().map_err(|_| HelperExit::Internal)?;
+    if facts.elevated || facts.integrity > MEDIUM_INTEGRITY {
+        return Err(HelperExit::WrongIntegrity);
+    }
+    Ok(())
 }
 
 /// The control pipe `name`, opened as its owner, this process's user, made it, tried again while it is not there yet
@@ -149,7 +163,7 @@ fn send(pipe: &PipeClient, message: &Message, limit: Duration) -> Result<(), Hel
 
 /// The box's `Spawn`, read within `limit`.
 fn receive_spawn(pipe: &PipeClient, limit: Duration) -> Result<Spawn, HelperExit> {
-    match read_message(pipe, Instant::now() + limit) {
+    match read_message(pipe, Instant::now() + limit, FRAME_LIMIT) {
         Ok(Message::Spawn(spawn)) => Ok(spawn),
         Ok(_) | Err(ReadError::Empty | ReadError::TooLong | ReadError::Decode(_)) => Err(HelperExit::BadSpawn),
         Err(ReadError::Closed) => Err(HelperExit::BoxGone),
@@ -159,8 +173,8 @@ fn receive_spawn(pipe: &PipeClient, limit: Duration) -> Result<Spawn, HelperExit
 }
 
 /// The command `spawn` asks for, created suspended on the desktop with the two output handles the box placed in this
-/// process, once they and the environment pass their checks. A command that cannot be created is reported to the box
-/// as `Failed`, written within `limit`.
+/// process, once they and the environment pass their checks. A command `CreateProcessW` refuses is reported to the
+/// box as `Failed`, written within `limit`; a launch that fails before that call is not.
 fn start(pipe: &PipeClient, spawn: Spawn, limit: Duration) -> Result<Suspended, HelperExit> {
     let Spawn {
         application,
@@ -175,6 +189,9 @@ fn start(pipe: &PipeClient, spawn: Spawn, limit: Duration) -> Result<Suspended, 
     }
     let stdout = received_output(stdout, pipe.handle())?;
     let stderr = received_output(stderr, pipe.handle())?;
+    if gate_win32::same_object(stdout, stderr) {
+        return Err(HelperExit::BadSpawn);
+    }
     let environment = EnvironmentBlock::from_wide(environment).map_err(|_| HelperExit::BadSpawn)?;
     let launch = DesktopLaunch {
         application: PathBuf::from(OsString::from_wide(&application)),
@@ -182,14 +199,13 @@ fn start(pipe: &PipeClient, spawn: Spawn, limit: Duration) -> Result<Suspended, 
         directory: PathBuf::from(OsString::from_wide(&directory)),
         environment,
     };
-    launch.start_suspended(stdout, stderr).map_err(|error| {
-        let code = match error {
-            LaunchError::CreateProcess { code, .. } => code,
-            LaunchError::Setup { error, .. } => error.raw_os_error().map_or(ERROR_INVALID_PARAMETER, i32::cast_unsigned),
-        };
-        // The exit says the spawn failed whether or not the box reads why.
-        let _reported = send(pipe, &Message::Failed { code }, limit);
-        HelperExit::SpawnFailed
+    launch.start_suspended(stdout, stderr).map_err(|error| match error {
+        LaunchError::CreateProcess { code, .. } => {
+            // The exit says the spawn failed whether or not the box reads why.
+            let _reported = send(pipe, &Message::Failed { code }, limit);
+            HelperExit::SpawnFailed
+        }
+        LaunchError::Setup { .. } => HelperExit::SetupFailed,
     })
 }
 
@@ -202,25 +218,43 @@ fn received_output<'a>(value: u64, control: BorrowedHandle<'_>) -> Result<Borrow
     unsafe { gate_win32::check_received_output(value, control) }.map_err(|_| HelperExit::BadSpawn)
 }
 
-/// Waits up to the done limit for the box's `Done`. The child is ended only when the pipe reads closed or fails first: the
-/// box is gone and nothing will resume it. On a deadline passed, or anything else read, it is left as it is, since the
-/// box may have taken it.
+/// Waits up to the done limit for the box's `Done`. The child is ended only when the pipe reads closed, or fails with
+/// an error that says its other end is gone: nothing will resume the child. On a deadline passed, any other error, or
+/// anything else read, it is left as it is, since the box may have taken it.
 fn await_done(pipe: &PipeClient, released: &Released, limits: Limits) -> HelperExit {
-    match read_message(pipe, Instant::now() + limits.done) {
+    match read_message(pipe, Instant::now() + limits.done, FRAME_LIMIT) {
         Ok(Message::Done) => HelperExit::Done,
-        Err(ReadError::Closed | ReadError::Io(_)) => {
-            end_child(released, limits.message);
-            HelperExit::BoxGone
-        }
+        Err(ReadError::Closed) => box_gone(released, limits.message),
+        Err(ReadError::Io(error)) if is_pipe_gone(&error) => box_gone(released, limits.message),
+        Err(ReadError::Io(_)) => HelperExit::Internal,
         Err(ReadError::TimedOut) => HelperExit::NoDone,
         Ok(_) | Err(ReadError::Woken(_) | ReadError::Empty | ReadError::TooLong | ReadError::Decode(_)) => HelperExit::BadMessage,
     }
 }
 
+/// Whether `error` says the pipe's other end is gone.
+fn is_pipe_gone(error: &io::Error) -> bool {
+    error.raw_os_error().is_some_and(|code| PIPE_GONE.contains(&code))
+}
+
+/// The exit once the box is found gone after the child was created: the child is ended within `bound`, and the exit
+/// is `BoxGone` when it is known ended, else `ChildNotEnded`.
+fn box_gone(released: &Released, bound: Duration) -> HelperExit {
+    if end_child(released, bound) {
+        HelperExit::BoxGone
+    } else {
+        HelperExit::ChildNotEnded
+    }
+}
+
 /// Ends the child this helper created and released, found again by its pid, this process as its parent and its
-/// creation time, and waits up to `bound` for its end. Nothing is reported: the helper exits `BoxGone` either way.
-fn end_child(released: &Released, bound: Duration) {
-    if let Ok(Some(process)) = gate_win32::process_of_child(released.pid, std::process::id(), released.created) {
-        let _ended = gate_win32::end_process(process.as_handle(), ENDED_UNSTARTED, bound);
+/// creation time, and waits up to `bound` for its end. True when it is known ended: no process of that pid, parent
+/// and time is left (it ended already), or it ended within `bound`; false when it could not be opened, ended or
+/// waited on, or still ran.
+fn end_child(released: &Released, bound: Duration) -> bool {
+    match gate_win32::process_of_child(released.pid, std::process::id(), released.created) {
+        Ok(None) => true,
+        Ok(Some(process)) => matches!(gate_win32::end_process(process.as_handle(), ENDED_UNSTARTED, bound), Ok(true)),
+        Err(_) => false,
     }
 }

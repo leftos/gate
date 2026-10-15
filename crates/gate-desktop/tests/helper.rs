@@ -13,7 +13,7 @@ use std::os::windows::io::{AsHandle, AsRawHandle, OwnedHandle};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use gate_desktop::protocol::{Message, Spawn, read_message, write_message};
+use gate_desktop::protocol::{HELPER_FRAME_LIMIT, Message, Spawn, read_message, write_message};
 use gate_desktop::{HelperExit, PIPE_PREFIX, arg0};
 use gate_win32::{
     ConnectWait, Job, PipeServer, RemoteProcess, StoppableProcess, Suspended, creation_time_of, current_user_sid, system_directory,
@@ -33,6 +33,10 @@ const LIMIT_VARIABLE: &str = "GATE_DESKTOP_TEST_LIMIT_MS";
 
 /// The variable the command echoes, set only in the block the box sends.
 const PROBE: &str = "GATE_DESKTOP_PROBE";
+
+/// The seam the helper cases run under: far above any stall of a busy machine between two steps, and below the
+/// built 30 s wait for `Done`, so a box that never says it still ends the helper's run.
+const ROOMY_LIMIT_MS: u64 = 20_000;
 
 /// `ERROR_FILE_NOT_FOUND`.
 const ERROR_FILE_NOT_FOUND: u32 = 2;
@@ -97,7 +101,7 @@ impl Session {
         let waited = server.wait_for_client(guard(), &[helper.as_handle()]).expect("the connect is waited on");
         assert_eq!(waited, ConnectWait::Connected, "the helper connects");
         assert_eq!(server.client_pid().expect("the client is read"), helper.id(), "the client is the helper");
-        let hello = read_message(&server, guard()).expect("the hello is read");
+        let hello = read_message(&server, guard(), HELPER_FRAME_LIMIT).expect("the hello is read");
         let (version, desktop, ok) = match hello {
             Message::Hello { version, desktop, ok } => Some((version, desktop, ok)),
             _ => None,
@@ -121,7 +125,7 @@ impl Session {
 
     /// The helper's next message.
     fn receive(&self) -> Message {
-        read_message(&self.server, guard()).expect("the helper's message is read")
+        read_message(&self.server, guard(), HELPER_FRAME_LIMIT).expect("the helper's message is read")
     }
 
     /// The pids of the processes the helper started.
@@ -170,7 +174,7 @@ fn child_of(message: &Message) -> (u32, usize, usize) {
 
 #[test]
 fn a_spawned_command_runs_with_its_environment_and_output() {
-    let mut session = Session::start(None);
+    let mut session = Session::start(Some(ROOMY_LIMIT_MS));
     let (mut out_read, out_write) = std::io::pipe().expect("the stdout pipe is made");
     let (_err_read, err_write) = std::io::pipe().expect("the stderr pipe is made");
     let stdout = session.push(&out_write);
@@ -203,6 +207,7 @@ fn the_helper_refuses_a_malformed_arg0() {
     let mut shapes = vec![
         String::new(),
         format!("0:{hex}"),
+        format!("0{pid}:{hex}"),
         format!("-{pid}:{hex}"),
         format!("+{pid}:{hex}"),
         format!("{pid}a:{hex}"),
@@ -249,6 +254,8 @@ fn the_helper_refuses_a_server_whose_pid_is_not_the_box() {
 
     let mut helper = start_helper(&[&other], None);
 
+    let waited = server.wait_for_client(guard(), &[helper.as_handle()]).expect("the connect is waited on");
+    assert_eq!(waited, ConnectWait::Connected, "the helper reached the pipe before its server check");
     assert_eq!(exit_of(&mut helper), code(HelperExit::ServerRefused));
 }
 
@@ -304,34 +311,39 @@ fn spawn_json(stdout: u64, stderr: u64, field: &str, raw: &str) -> String {
     json.to_string()
 }
 
-/// Sends a bad spawn, given the helper's control pipe value and the values of the two pipes placed in it.
-type SendBad = fn(&Session, u64, u64, u64);
+/// Sends a bad spawn, given the helper's control pipe value, the values of the two pipes placed in it, and a second
+/// value of the stdout pipe.
+type SendBad = fn(&Session, u64, u64, u64, u64);
 
 #[test]
 fn a_spawn_with_a_bad_field_is_refused() {
-    let cases: [(&str, SendBad); 4] = [
-        ("bad base64", |session, _, stdout, stderr| {
+    let cases: [(&str, SendBad); 5] = [
+        ("bad base64", |session, _, stdout, stderr, _| {
             send_raw(session, &spawn_json(stdout, stderr, "command_line", "\"!!!!\""));
         }),
-        ("an odd byte count", |session, _, stdout, stderr| {
+        ("an odd byte count", |session, _, stdout, stderr, _| {
             send_raw(session, &spawn_json(stdout, stderr, "application", "\"QUJD\""));
         }),
-        ("the control pipe as stdout", |session, control, _, stderr| {
+        ("the control pipe as stdout", |session, control, _, stderr, _| {
             session.send(&Message::Spawn(cmd_spawn("exit 0", "x", control, stderr)));
         }),
-        ("one value twice", |session, _, stdout, _| {
+        ("one value twice", |session, _, stdout, _, _| {
             session.send(&Message::Spawn(cmd_spawn("exit 0", "x", stdout, stdout)));
+        }),
+        ("two values of one pipe", |session, _, stdout, _, again| {
+            session.send(&Message::Spawn(cmd_spawn("exit 0", "x", stdout, again)));
         }),
     ];
 
     for (case, send) in cases {
-        let mut session = Session::start(None);
+        let mut session = Session::start(Some(ROOMY_LIMIT_MS));
         let control = control_value(&session);
         let (_out_read, out_write) = std::io::pipe().expect("the stdout pipe is made");
         let (_err_read, err_write) = std::io::pipe().expect("the stderr pipe is made");
         let (stdout, stderr) = (session.push(&out_write), session.push(&err_write));
+        let again = session.push(&out_write);
 
-        send(&session, control, stdout, stderr);
+        send(&session, control, stdout, stderr, again);
 
         assert_eq!(exit_of(&mut session.helper), code(HelperExit::BadSpawn), "{case}");
         assert_eq!(session.children(), Vec::<u32>::new(), "{case}: the helper started nothing");
@@ -340,7 +352,7 @@ fn a_spawn_with_a_bad_field_is_refused() {
 
 #[test]
 fn a_spawn_whose_program_cannot_start_reports_failed() {
-    let mut session = Session::start(None);
+    let mut session = Session::start(Some(ROOMY_LIMIT_MS));
     let (_out_read, out_write) = std::io::pipe().expect("the stdout pipe is made");
     let (_err_read, err_write) = std::io::pipe().expect("the stderr pipe is made");
     let (stdout, stderr) = (session.push(&out_write), session.push(&err_write));
@@ -370,7 +382,7 @@ fn reported_child(limit_ms: Option<u64>) -> (Session, u32, usize, usize) {
 
 #[test]
 fn a_box_that_closes_before_done_has_its_child_ended() {
-    let (session, pid, _, _) = reported_child(None);
+    let (session, pid, _, _) = reported_child(Some(ROOMY_LIMIT_MS));
     let watch = StoppableProcess::open(pid).expect("the child opens").expect("the child exists");
     let Session { server, mut helper, remote } = session;
 
@@ -384,7 +396,7 @@ fn a_box_that_closes_before_done_has_its_child_ended() {
 
 #[test]
 fn a_box_that_never_says_done_leaves_the_child() {
-    let (mut session, pid, process, thread) = reported_child(Some(5_000));
+    let (mut session, pid, process, thread) = reported_child(Some(ROOMY_LIMIT_MS));
     let watch = StoppableProcess::open(pid).expect("the child opens").expect("the child exists");
     let process: OwnedHandle = session.remote.pull(process).expect("the process is taken");
     let thread: OwnedHandle = session.remote.pull(thread).expect("the thread is taken");
@@ -399,4 +411,98 @@ fn a_box_that_never_says_done_leaves_the_child() {
     );
     drop(Suspended::adopt(process, thread, pid).expect("the child is adopted"));
     assert!(watch.wait(HANG_GUARD).expect("the child is waited on"), "the test ended the child");
+}
+
+#[test]
+fn a_launch_that_fails_before_create_process_exits_setup_failed_without_failed() {
+    let mut session = Session::start(Some(ROOMY_LIMIT_MS));
+    let (_out_read, out_write) = std::io::pipe().expect("the stdout pipe is made");
+    let (_err_read, err_write) = std::io::pipe().expect("the stderr pipe is made");
+    let (stdout, stderr) = (session.push(&out_write), session.push(&err_write));
+    let mut spawn = cmd_spawn("exit 0", "x", stdout, stderr);
+    // A relative application is refused before `CreateProcessW` is called.
+    spawn.application = wide("cmd.exe");
+
+    session.send(&Message::Spawn(spawn));
+
+    assert_eq!(exit_of(&mut session.helper), code(HelperExit::SetupFailed));
+    let after = read_message(&session.server, guard(), HELPER_FRAME_LIMIT).expect_err("nothing follows the spawn");
+    assert!(matches!(after, gate_desktop::protocol::ReadError::Closed), "no Failed was sent: {after}");
+    assert_eq!(session.children(), Vec::<u32>::new(), "the helper started nothing");
+}
+
+#[test]
+fn a_box_that_sends_another_message_after_the_child_leaves_it() {
+    let (mut session, pid, process, thread) = reported_child(Some(ROOMY_LIMIT_MS));
+    let watch = StoppableProcess::open(pid).expect("the child opens").expect("the child exists");
+    let process: OwnedHandle = session.remote.pull(process).expect("the process is taken");
+    let thread: OwnedHandle = session.remote.pull(thread).expect("the thread is taken");
+
+    session.send(&Message::Hello {
+        version: "stray".to_owned(),
+        desktop: "Default".to_owned(),
+        ok: true,
+    });
+
+    assert_eq!(exit_of(&mut session.helper), code(HelperExit::BadMessage));
+    assert!(!watch.wait(Duration::ZERO).expect("the child is looked at"), "the child still lives");
+    assert!(
+        thread_is_suspended(thread.as_handle()).expect("the thread is read"),
+        "the child is still suspended"
+    );
+    drop(Suspended::adopt(process, thread, pid).expect("the child is adopted"));
+    assert!(watch.wait(HANG_GUARD).expect("the child is waited on"), "the test ended the child");
+}
+
+#[test]
+fn a_box_that_sends_no_spawn_times_the_helper_out() {
+    // Only the wait for `Spawn` runs out: the helper's connect and hello are done before the test reads the hello.
+    let mut session = Session::start(Some(1_000));
+
+    assert_eq!(exit_of(&mut session.helper), code(HelperExit::TimedOut));
+}
+
+#[test]
+fn a_box_that_closes_before_spawn_is_gone() {
+    let Session { server, mut helper, remote } = Session::start(Some(ROOMY_LIMIT_MS));
+
+    drop(server);
+
+    assert_eq!(exit_of(&mut helper), code(HelperExit::BoxGone));
+    drop(remote);
+}
+
+#[test]
+fn a_box_that_sends_another_message_in_place_of_spawn_is_refused() {
+    let mut session = Session::start(Some(ROOMY_LIMIT_MS));
+
+    session.send(&Message::Done);
+
+    assert_eq!(exit_of(&mut session.helper), code(HelperExit::BadSpawn));
+    assert_eq!(session.children(), Vec::<u32>::new(), "the helper started nothing");
+}
+
+#[test]
+fn the_helper_runs_only_at_medium_integrity_or_below() {
+    let facts = gate_win32::token_facts().expect("the test's token is read");
+    let above_medium = facts.elevated || facts.integrity > 0x2000;
+    let server = serve();
+    let arg = arg0(std::process::id(), server.name()).expect("the pipe's name makes an Arg0");
+
+    let mut helper = start_helper(&[&arg], Some(ROOMY_LIMIT_MS));
+
+    if above_medium {
+        assert_eq!(
+            exit_of(&mut helper),
+            code(HelperExit::WrongIntegrity),
+            "an elevated helper refuses to run"
+        );
+        let waited = server.wait_for_client(Instant::now(), &[]).expect("the pipe is looked at");
+        assert_eq!(waited, ConnectWait::TimedOut, "the refusing helper touched no pipe");
+    } else {
+        let waited = server.wait_for_client(guard(), &[helper.as_handle()]).expect("the connect is waited on");
+        assert_eq!(waited, ConnectWait::Connected, "a medium helper goes on to the pipe");
+        drop(server);
+        assert_eq!(exit_of(&mut helper), code(HelperExit::BoxGone));
+    }
 }
