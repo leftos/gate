@@ -49,7 +49,13 @@ pub fn input_desktop_name() -> io::Result<String> {
 
 /// The name of the open desktop `desktop`.
 fn desktop_name(desktop: HDESK) -> io::Result<String> {
-    let mut buffer = vec![0_u16; 64];
+    desktop_name_from(desktop, 64)
+}
+
+/// The name of the open desktop `desktop`, read into a buffer of `units` UTF-16 units at first, grown to the size the
+/// system asks for while it is too small.
+fn desktop_name_from(desktop: HDESK, units: usize) -> io::Result<String> {
+    let mut buffer = vec![0_u16; units];
     loop {
         let size = u32::try_from(buffer.len() * 2).map_err(io::Error::other)?;
         let mut needed = 0;
@@ -218,7 +224,23 @@ mod tests {
         WTSActive, WTSConnectQuery, WTSConnected, WTSDisconnected, WTSDown, WTSIdle, WTSInit, WTSListen, WTSReset, WTSShadow,
     };
 
-    use super::{ConnectState, LockState, active_console_session, connect_state, lock_state, session_state};
+    use windows_sys::Win32::System::StationsAndDesktops::GetThreadDesktop;
+    use windows_sys::Win32::System::Threading::GetCurrentThreadId;
+
+    use super::{ConnectState, LockState, active_console_session, connect_state, desktop_name_from, lock_state, session_state};
+
+    #[test]
+    fn a_desktop_name_longer_than_the_first_buffer_is_read_whole() {
+        // SAFETY: the call takes no pointers; the thread's desktop is never closed (it needs no close).
+        let desktop = unsafe { GetThreadDesktop(GetCurrentThreadId()) };
+        assert!(!desktop.is_null(), "the thread's desktop is read: {}", std::io::Error::last_os_error());
+
+        let roomy = desktop_name_from(desktop, 64).expect("the name is read into a roomy buffer");
+        let grown = desktop_name_from(desktop, 1).expect("the name is read after the buffer grows");
+
+        assert!(!roomy.is_empty(), "the desktop has a name");
+        assert_eq!(grown, roomy, "the grown buffer holds the whole name");
+    }
 
     #[test]
     fn the_console_session_of_this_pc_is_read() {

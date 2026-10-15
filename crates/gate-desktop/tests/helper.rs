@@ -23,6 +23,7 @@ use proc_table::win32::Win32ProcessTable;
 use windows_sys::Win32::Foundation::{CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE};
 use windows_sys::Win32::Storage::FileSystem::{FILE_TYPE_PIPE, GetFileType};
 use windows_sys::Win32::System::Pipes::GetNamedPipeServerProcessId;
+use windows_sys::Win32::System::SystemServices::SECURITY_MANDATORY_MEDIUM_RID;
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
 /// The longest any wait of these tests may take: a guard against a hang, never a timing bound.
@@ -456,10 +457,17 @@ fn a_box_that_sends_another_message_after_the_child_leaves_it() {
 
 #[test]
 fn a_box_that_sends_no_spawn_times_the_helper_out() {
-    // Only the wait for `Spawn` runs out: the helper's connect and hello are done before the test reads the hello.
-    let mut session = Session::start(Some(1_000));
+    // The test takes no step of its own between the helper's start and its exit, so no stall of the test can race the
+    // seam's 1 s. The pipe exists before the helper starts, so the helper's first try to connect succeeds without the
+    // box waiting for it, and its hello fits in the pipe's buffer; the seam then bounds only its wait for `Spawn`. Exit
+    // 18 says it got that far: no child is ever made, and a hello that failed would exit 13 or 19.
+    let server = serve();
+    let arg = arg0(std::process::id(), server.name()).expect("the pipe's name makes an Arg0");
 
-    assert_eq!(exit_of(&mut session.helper), code(HelperExit::TimedOut));
+    let mut helper = start_helper(&[&arg], Some(1_000));
+
+    assert_eq!(exit_of(&mut helper), code(HelperExit::TimedOut));
+    drop(server);
 }
 
 #[test]
@@ -470,6 +478,15 @@ fn a_box_that_closes_before_spawn_is_gone() {
 
     assert_eq!(exit_of(&mut helper), code(HelperExit::BoxGone));
     drop(remote);
+}
+
+#[test]
+fn a_box_that_disconnects_before_spawn_is_gone() {
+    let mut session = Session::start(Some(ROOMY_LIMIT_MS));
+
+    session.server.disconnect().expect("the helper is disconnected");
+
+    assert_eq!(exit_of(&mut session.helper), code(HelperExit::BoxGone));
 }
 
 #[test]
@@ -485,7 +502,7 @@ fn a_box_that_sends_another_message_in_place_of_spawn_is_refused() {
 #[test]
 fn the_helper_runs_only_at_medium_integrity_or_below() {
     let facts = gate_win32::token_facts().expect("the test's token is read");
-    let above_medium = facts.elevated || facts.integrity > 0x2000;
+    let above_medium = facts.elevated || facts.integrity > SECURITY_MANDATORY_MEDIUM_RID.cast_unsigned();
     let server = serve();
     let arg = arg0(std::process::id(), server.name()).expect("the pipe's name makes an Arg0");
 
@@ -502,6 +519,9 @@ fn the_helper_runs_only_at_medium_integrity_or_below() {
     } else {
         let waited = server.wait_for_client(guard(), &[helper.as_handle()]).expect("the connect is waited on");
         assert_eq!(waited, ConnectWait::Connected, "a medium helper goes on to the pipe");
+        // Past its hello, the helper waits for `Spawn`, so the drop is read as the pipe closed.
+        let hello = read_message(&server, guard(), HELPER_FRAME_LIMIT).expect("the hello is read");
+        assert!(matches!(hello, Message::Hello { .. }), "the helper's first message is a hello: {hello:?}");
         drop(server);
         assert_eq!(exit_of(&mut helper), code(HelperExit::BoxGone));
     }

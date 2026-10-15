@@ -41,8 +41,9 @@ pub enum HelperExit {
     /// The pipe could not be opened, its owner, DACL or label was not the box's, or its server's pid was not the box's
     /// or could not be read.
     ServerRefused = 12,
-    /// The box closed the pipe: a read before `Spawn` or before `Done` found it closed or disconnected, or a write
-    /// found it so. A child already created was ended.
+    /// The box closed or disconnected the pipe: the write of `Hello` or `Child`, or the read of `Spawn` or `Done`,
+    /// found it closed, or failed with `ERROR_BROKEN_PIPE`, `ERROR_PIPE_NOT_CONNECTED` or `ERROR_NO_DATA`. A child
+    /// already created was ended.
     BoxGone = 13,
     /// The box's `Spawn` was malformed, another message came in its place, or one of its values failed a check.
     BadSpawn = 14,
@@ -55,7 +56,8 @@ pub enum HelperExit {
     /// The box sent no `Spawn` before the message limit, or did not take the child's report within it; a child already
     /// created was left as it was.
     TimedOut = 18,
-    /// Any other failure of the system; a child already created was left as it was.
+    /// Any other failure of the system, a `Hello` the box did not take within the message limit among them; a child
+    /// already created was left as it was.
     Internal = 19,
     /// The launch failed before `CreateProcessW` was called (a refused application or folder, or a handle or attribute
     /// list that could not be made); no `Failed` was sent, since this is no failure of the command itself.

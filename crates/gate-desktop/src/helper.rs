@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use gate_win32::{DesktopLaunch, EnvironmentBlock, LaunchError, PipeClient, Released, Suspended};
+use windows_sys::Win32::System::SystemServices::SECURITY_MANDATORY_MEDIUM_RID;
 
 use crate::protocol::{DEFAULT_DESKTOP, FRAME_LIMIT, Message, ReadError, Spawn, WriteError, read_message, write_message};
 use crate::version::build_version;
@@ -23,9 +24,6 @@ const ERROR_PIPE_BUSY: i32 = 231;
 /// The errors that say the other end of the pipe is gone: `ERROR_BROKEN_PIPE`, `ERROR_NO_DATA` and
 /// `ERROR_PIPE_NOT_CONNECTED`.
 const PIPE_GONE: [i32; 3] = [109, 232, 233];
-
-/// The relative ID of the medium integrity level, the highest the helper runs at.
-const MEDIUM_INTEGRITY: u32 = 0x2000;
 
 /// The pause between two tries to reach a pipe that is not there yet or busy.
 const RETRY_PAUSE: Duration = Duration::from_millis(20);
@@ -121,10 +119,16 @@ fn serve(box_pid: u32, name: &str, limits: Limits) -> Result<HelperExit, HelperE
 /// least-privileged token runs at medium, and a higher one must not start commands for the box.
 fn check_integrity() -> Result<(), HelperExit> {
     let facts = gate_win32::token_facts().map_err(|_| HelperExit::Internal)?;
-    if facts.elevated || facts.integrity > MEDIUM_INTEGRITY {
+    if integrity_refused(facts.elevated, facts.integrity) {
         return Err(HelperExit::WrongIntegrity);
     }
     Ok(())
+}
+
+/// Whether a token `elevated` or not, at the integrity level whose relative ID is `integrity`, is refused: an elevated
+/// one, or one above medium.
+fn integrity_refused(elevated: bool, integrity: u32) -> bool {
+    elevated || integrity > SECURITY_MANDATORY_MEDIUM_RID.cast_unsigned()
 }
 
 /// The control pipe `name`, opened as its owner, this process's user, made it, tried again while it is not there yet
@@ -156,9 +160,19 @@ fn hello() -> Message {
     }
 }
 
-/// Writes `message` within `limit`; any failure is the box gone, the stream being out of step.
+/// Writes `message` within `limit`, before any child exists; a failure ends the run as [`send_exit`] says.
 fn send(pipe: &PipeClient, message: &Message, limit: Duration) -> Result<(), HelperExit> {
-    write_message(pipe, message, Instant::now() + limit).map_err(|_| HelperExit::BoxGone)
+    write_message(pipe, message, Instant::now() + limit).map_err(send_exit)
+}
+
+/// The exit for a write that failed before any child exists: the box gone when the pipe is closed or disconnected,
+/// else `Internal`, a write the box did not take within the limit among them.
+fn send_exit(error: WriteError) -> HelperExit {
+    match error {
+        WriteError::Closed => HelperExit::BoxGone,
+        WriteError::Io(error) if is_pipe_gone(&error) => HelperExit::BoxGone,
+        WriteError::TimedOut | WriteError::Io(_) | WriteError::Woken(_) | WriteError::TooLong => HelperExit::Internal,
+    }
 }
 
 /// The box's `Spawn`, read within `limit`.
@@ -167,6 +181,7 @@ fn receive_spawn(pipe: &PipeClient, limit: Duration) -> Result<Spawn, HelperExit
         Ok(Message::Spawn(spawn)) => Ok(spawn),
         Ok(_) | Err(ReadError::Empty | ReadError::TooLong | ReadError::Decode(_)) => Err(HelperExit::BadSpawn),
         Err(ReadError::Closed) => Err(HelperExit::BoxGone),
+        Err(ReadError::Io(error)) if is_pipe_gone(&error) => Err(HelperExit::BoxGone),
         Err(ReadError::TimedOut) => Err(HelperExit::TimedOut),
         Err(ReadError::Woken(_) | ReadError::Io(_)) => Err(HelperExit::Internal),
     }
@@ -210,12 +225,19 @@ fn start(pipe: &PipeClient, spawn: Spawn, limit: Duration) -> Result<Suspended, 
 }
 
 /// The output handle the box placed in this process as `value`, once it passes
-/// [`gate_win32::check_received_output`] against the control pipe.
+/// [`gate_win32::check_received_output`] against the control pipe. A value it refuses is the box's `BadSpawn`; a
+/// failure of the system, as reading the control pipe's own name, is `Internal`.
 fn received_output<'a>(value: u64, control: BorrowedHandle<'_>) -> Result<BorrowedHandle<'a>, HelperExit> {
     let value = usize::try_from(value).map_err(|_| HelperExit::BadSpawn)?;
     // SAFETY: the box placed the handle in this process and closes it only once it has read the child's report, after
     // the last use of the borrow, which ends when the command holds its own copy.
-    unsafe { gate_win32::check_received_output(value, control) }.map_err(|_| HelperExit::BadSpawn)
+    unsafe { gate_win32::check_received_output(value, control) }.map_err(|error| {
+        if error.kind() == io::ErrorKind::InvalidInput && error.raw_os_error().is_none() {
+            HelperExit::BadSpawn
+        } else {
+            HelperExit::Internal
+        }
+    })
 }
 
 /// Waits up to the done limit for the box's `Done`. The child is ended only when the pipe reads closed, or fails with
@@ -249,12 +271,55 @@ fn box_gone(released: &Released, bound: Duration) -> HelperExit {
 
 /// Ends the child this helper created and released, found again by its pid, this process as its parent and its
 /// creation time, and waits up to `bound` for its end. True when it is known ended: no process of that pid, parent
-/// and time is left (it ended already), or it ended within `bound`; false when it could not be opened, ended or
-/// waited on, or still ran.
+/// and time is left (it ended already), or it ended within `bound`; false when it could not be opened (a live child
+/// that refuses the open to end it included), ended or waited on, or still ran.
 fn end_child(released: &Released, bound: Duration) -> bool {
     match gate_win32::process_of_child(released.pid, std::process::id(), released.created) {
         Ok(None) => true,
         Ok(Some(process)) => matches!(gate_win32::end_process(process.as_handle(), ENDED_UNSTARTED, bound), Ok(true)),
         Err(_) => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+
+    use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_BROKEN_PIPE, ERROR_NO_DATA, ERROR_PIPE_NOT_CONNECTED};
+    use windows_sys::Win32::System::SystemServices::{
+        SECURITY_MANDATORY_HIGH_RID, SECURITY_MANDATORY_LOW_RID, SECURITY_MANDATORY_MEDIUM_PLUS_RID, SECURITY_MANDATORY_MEDIUM_RID,
+        SECURITY_MANDATORY_SYSTEM_RID,
+    };
+
+    use super::{integrity_refused, send_exit};
+    use crate::HelperExit;
+    use crate::protocol::WriteError;
+
+    #[test]
+    fn only_a_token_not_elevated_and_at_medium_or_below_is_taken() {
+        let (low, medium) = (SECURITY_MANDATORY_LOW_RID.cast_unsigned(), SECURITY_MANDATORY_MEDIUM_RID.cast_unsigned());
+        let (high, system) = (SECURITY_MANDATORY_HIGH_RID.cast_unsigned(), SECURITY_MANDATORY_SYSTEM_RID.cast_unsigned());
+
+        assert!(!integrity_refused(false, low), "low");
+        assert!(!integrity_refused(false, medium), "medium");
+        assert!(integrity_refused(false, SECURITY_MANDATORY_MEDIUM_PLUS_RID), "medium plus");
+        assert!(integrity_refused(false, high), "high");
+        assert!(integrity_refused(false, system), "system");
+        assert!(integrity_refused(true, medium), "elevated at medium");
+    }
+
+    #[test]
+    fn a_failed_write_before_the_child_is_the_box_gone_only_when_the_pipe_is() {
+        for code in [ERROR_BROKEN_PIPE, ERROR_NO_DATA, ERROR_PIPE_NOT_CONNECTED] {
+            let error = WriteError::Io(io::Error::from_raw_os_error(code.cast_signed()));
+            assert_eq!(send_exit(error), HelperExit::BoxGone, "error {code}");
+        }
+        assert_eq!(send_exit(WriteError::Closed), HelperExit::BoxGone, "closed");
+
+        assert_eq!(send_exit(WriteError::TimedOut), HelperExit::Internal, "timed out");
+        let denied = WriteError::Io(io::Error::from_raw_os_error(ERROR_ACCESS_DENIED.cast_signed()));
+        assert_eq!(send_exit(denied), HelperExit::Internal, "another error");
+        assert_eq!(send_exit(WriteError::Woken(0)), HelperExit::Internal, "woken");
+        assert_eq!(send_exit(WriteError::TooLong), HelperExit::Internal, "too long");
     }
 }

@@ -141,11 +141,11 @@ pub fn is_handle_value(value: usize) -> bool {
 
 /// The stdout or stderr handle another process placed in this process's handle table and sent as the number `value`,
 /// borrowed once it passes six checks, in this order: it is a handle value ([`is_handle_value`]); it names an open
-/// handle (`GetHandleInformation`); it names a pipe (`GetFileType` is `FILE_TYPE_PIPE`); it is a pipe's writing end, not
-/// its server or reading end (`GetNamedPipeInfo` without `PIPE_SERVER_END`; an anonymous pipe's read end is its server
-/// end); it is not the same kernel object as `control`, this process's own control pipe (`CompareObjectHandles`); and
-/// its pipe's name (`GetFileInformationByHandleEx` with `FileNameInfo`) is not the control pipe's. So a lying sender
-/// cannot make the command write into the control channel, or hold a reading end.
+/// handle (`GetHandleInformation`); it names a pipe (`GetFileType` is `FILE_TYPE_PIPE`); it is not a pipe's server end
+/// (`GetNamedPipeInfo` without `PIPE_SERVER_END`; an anonymous pipe's reading end is its server end); it is not the
+/// same kernel object as `control`, this process's own control pipe (`CompareObjectHandles`); and its pipe's name
+/// (`GetFileInformationByHandleEx` with `FileNameInfo`) is not the control pipe's. So a lying sender cannot make the
+/// command write into the control channel, or hold an anonymous pipe's reading end or a named pipe's server end.
 ///
 /// # Safety
 ///
@@ -156,7 +156,7 @@ pub fn is_handle_value(value: usize) -> bool {
 /// # Errors
 ///
 /// An error of kind [`io::ErrorKind::InvalidInput`] naming the check `value` failed: not a handle value, naming no open
-/// handle, not naming a pipe, being a pipe's reading end, naming the control pipe, or naming a pipe whose name cannot be
+/// handle, not naming a pipe, being a pipe's server end, naming the control pipe, or naming a pipe whose name cannot be
 /// read; the system's error when the control pipe's own name cannot be read. The error never describes the object the
 /// value names.
 pub unsafe fn check_received_output<'a>(value: usize, control: BorrowedHandle<'_>) -> io::Result<BorrowedHandle<'a>> {
@@ -196,7 +196,7 @@ fn pipe_problem(handle: BorrowedHandle<'_>, control: BorrowedHandle<'_>) -> io::
         return Ok(Some("does not name a pipe"));
     }
     if flags & PIPE_SERVER_END != 0 {
-        return Ok(Some("is a pipe's reading end"));
+        return Ok(Some("is a pipe's server end"));
     }
     if same_object(handle, control) {
         return Ok(Some("names this process's control pipe"));
@@ -239,9 +239,10 @@ pub fn same_object(first: BorrowedHandle<'_>, second: BorrowedHandle<'_>) -> boo
 /// and `SYNCHRONIZE`), when it is the child of `parent` created at `created`: its parent pid, as its own record holds
 /// it ([`parent_pid_of`]), is `parent`, and its creation time, as [`creation_time_of`] reads it, is `created`. A pid
 /// reused since that child was made names a process created later, so it never passes. `None` when no process has the
-/// pid, when the one that has it cannot be opened to end it (another process holds the pid, or a process of the same
-/// user denied this one `PROCESS_TERMINATE` on the child), or when it is another, whose handle is closed and which is
-/// left alone.
+/// pid, or when the one that has it is another, whose handle is closed and which is left alone. A process that cannot
+/// be opened to end it (`ERROR_ACCESS_DENIED`: another process holds the pid, or a process of the same user denied
+/// this one `PROCESS_TERMINATE` on the child) is looked at again with `PROCESS_QUERY_LIMITED_INFORMATION` alone: `None`
+/// when it is another, or the child and ended; an error when it is the child and still runs.
 ///
 /// It proves only who a pid is, never whether another process (the box) has taken that child: the helper ends its
 /// child only when its control pipe reads closed or fails before `DONE`, since the box may have taken the child.
@@ -249,27 +250,72 @@ pub fn same_object(first: BorrowedHandle<'_>, second: BorrowedHandle<'_>) -> boo
 /// # Errors
 ///
 /// The system's error when the process cannot be opened, for any reason but there being no process of that pid or
-/// access being denied, or when its parent or creation time cannot be read.
+/// access being denied, or when its parent or creation time cannot be read. When access to end it is denied: an error
+/// of kind [`io::ErrorKind::PermissionDenied`] when it is the child and still runs, and the system's error when it
+/// cannot be looked at, or its parent, creation time or exit code cannot be read.
 pub fn process_of_child(pid: u32, parent: u32, created: Timestamp) -> io::Result<Option<std::os::windows::io::OwnedHandle>> {
-    let access = PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE;
-    // SAFETY: `OpenProcess` takes no pointers.
-    let opened = unsafe { OpenProcess(access, 0, pid) };
-    if opened.is_null() {
-        let error = io::Error::last_os_error();
-        // `OpenProcess` reports a pid no process has as `ERROR_INVALID_PARAMETER`, and a process this one may not open
-        // as `ERROR_ACCESS_DENIED`: either another process holds the pid now, or a process of the same user has denied
-        // this one `PROCESS_TERMINATE` on the child. Either way there is nothing this function can end; the box's
-        // kill-on-close job ends a child it was assigned to.
-        return if crate::tree::is_error(&error, ERROR_INVALID_PARAMETER) || crate::tree::is_error(&error, ERROR_ACCESS_DENIED) {
-            Ok(None)
-        } else {
-            Err(error)
-        };
+    find_child(pid, parent, created, || {
+        let access = PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE;
+        // SAFETY: `OpenProcess` takes no pointers.
+        let opened = unsafe { OpenProcess(access, 0, pid) };
+        if opened.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: a success is a fresh handle nothing else owns.
+        Ok(unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(opened) })
+    })
+}
+
+/// [`process_of_child`] with the open to end the process `pid` given as `open_to_end`.
+fn find_child(
+    pid: u32,
+    parent: u32,
+    created: Timestamp,
+    open_to_end: impl FnOnce() -> io::Result<std::os::windows::io::OwnedHandle>,
+) -> io::Result<Option<std::os::windows::io::OwnedHandle>> {
+    match open_to_end() {
+        Ok(process) => Ok(is_child_of(process.as_handle(), parent, created)?.then_some(process)),
+        // `OpenProcess` reports a pid no process has as `ERROR_INVALID_PARAMETER`.
+        Err(error) if crate::tree::is_error(&error, ERROR_INVALID_PARAMETER) => Ok(None),
+        Err(error) if crate::tree::is_error(&error, ERROR_ACCESS_DENIED) => refused_child(pid, parent, created, &error).map(|()| None),
+        Err(error) => Err(error),
     }
-    // SAFETY: a success is a fresh handle nothing else owns.
-    let process = unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(opened) };
-    let is_child = parent_pid_of(process.as_handle())? == parent && creation_time_of(process.as_handle())? == created;
-    Ok(is_child.then_some(process))
+}
+
+/// What a refused open to end the process `pid` says, looked at again with `PROCESS_QUERY_LIMITED_INFORMATION` alone:
+/// `Ok` when no process has the pid now, when the one that has it is not the child of `parent` created at `created`,
+/// or when that child has ended; an error of the kind of `denied` when it is the child and still runs.
+///
+/// # Errors
+///
+/// As above, and the system's error when the process cannot be looked at, or its parent, creation time or exit code
+/// cannot be read: a process that cannot be told apart from the child is never taken for ended.
+fn refused_child(pid: u32, parent: u32, created: Timestamp, denied: &io::Error) -> io::Result<()> {
+    // SAFETY: `OpenProcess` takes no pointers; `own_handle` refuses a null result with the system's error, read first.
+    let process = match unsafe { own_handle(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid)) } {
+        Ok(process) => process,
+        Err(error) if crate::tree::is_error(&error, ERROR_INVALID_PARAMETER) => return Ok(()),
+        Err(error) => {
+            return Err(io::Error::new(
+                error.kind(),
+                format!("process {pid} could not be opened to end it ({denied}) nor to look at it: {error}"),
+            ));
+        }
+    };
+    // SAFETY: the guard keeps the handle open for as long as the borrow lives.
+    let borrowed = unsafe { BorrowedHandle::borrow_raw(process.raw()) };
+    if !is_child_of(borrowed, parent, created)? || crate::exit_code_says_exited(&process)? {
+        return Ok(());
+    }
+    Err(io::Error::new(
+        denied.kind(),
+        format!("the child {pid} still runs, and this process may not open it to end it: {denied}"),
+    ))
+}
+
+/// Whether the process behind `process` is the child of `parent` created at `created`.
+fn is_child_of(process: BorrowedHandle<'_>, parent: u32, created: Timestamp) -> io::Result<bool> {
+    Ok(parent_pid_of(process)? == parent && creation_time_of(process)? == created)
 }
 
 /// Ends the process behind `process` with `exit_code` (`TerminateProcess`), then waits at most `bound` for its end:
@@ -434,15 +480,18 @@ mod tests {
     use std::sync::{MutexGuard, PoisonError};
     use std::time::{Duration, Instant};
 
-    use windows_sys::Win32::Foundation::{CompareObjectHandles, ERROR_INVALID_HANDLE, HANDLE, WAIT_OBJECT_0};
-    use windows_sys::Win32::System::Pipes::CreatePipe;
+    use windows_sys::Win32::Foundation::{
+        CompareObjectHandles, ERROR_ACCESS_DENIED, ERROR_INVALID_HANDLE, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{CreateFileW, FILE_GENERIC_READ, FILE_GENERIC_WRITE, OPEN_EXISTING, PIPE_ACCESS_DUPLEX};
+    use windows_sys::Win32::System::Pipes::{CreateNamedPipeW, CreatePipe, PIPE_TYPE_BYTE};
     use windows_sys::Win32::System::Threading::{
-        CreateEventW, GetCurrentProcess, OpenProcess, PROCESS_SYNCHRONIZE, ResumeThread, SuspendThread, WaitForSingleObject,
+        CreateEventW, GetCurrentProcess, OpenProcess, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, ResumeThread, SuspendThread, WaitForSingleObject,
     };
 
     use super::{
-        RemoteProcess, check_received_output, creation_time_of, end_process, image_path_of, is_handle_value, parent_pid_of, pid_of_process,
-        pid_of_thread, process_of_child, session_of, thread_is_suspended, user_of,
+        RemoteProcess, check_received_output, creation_time_of, end_process, find_child, image_path_of, is_handle_value, parent_pid_of,
+        pid_of_process, pid_of_thread, process_of_child, session_of, thread_is_suspended, user_of,
     };
     use crate::{EnvironmentBlock, Job, Launch, LaunchError, LaunchOutput, StoppableProcess, Suspended, system_directory};
 
@@ -792,13 +841,53 @@ mod tests {
         assert_output_refused(control.as_raw_handle().addr(), control.as_handle(), "control pipe");
         let copy = control.try_clone_to_owned().expect("the control handle is copied");
         assert_output_refused(copy.as_raw_handle().addr(), control.as_handle(), "control pipe");
-        assert_output_refused(server.raw_for_tests().addr(), control.as_handle(), "is a pipe's reading end");
-        assert_output_refused(read.as_raw_handle().addr(), control.as_handle(), "is a pipe's reading end");
+        assert_output_refused(server.raw_for_tests().addr(), control.as_handle(), "is a pipe's server end");
+        assert_output_refused(read.as_raw_handle().addr(), control.as_handle(), "is a pipe's server end");
         assert_output_refused(3, control.as_handle(), "is not a value");
         let (closed_read, closed_write) = pipe();
         let closed = closed_write.as_raw_handle().addr();
         drop((closed_read, closed_write));
         assert_output_refused(closed, control.as_handle(), "names no open handle");
+    }
+
+    #[test]
+    fn check_received_output_refuses_another_client_of_the_control_pipe_s_name() {
+        // A pipe with two instances takes two clients: two objects of one name, which only the name check tells apart.
+        let name: Vec<u16> = format!(r"\\.\pipe\gate-win32-adopt-twin-{}", std::process::id())
+            .encode_utf16()
+            .chain([0])
+            .collect();
+        let instance = || {
+            // SAFETY: `name` is NUL-terminated and outlives the call; no security attributes are passed. A failure
+            // returns `INVALID_HANDLE_VALUE`, checked before the handle is owned.
+            let made = unsafe { CreateNamedPipeW(name.as_ptr(), PIPE_ACCESS_DUPLEX, PIPE_TYPE_BYTE, 2, 4096, 4096, 0, std::ptr::null()) };
+            assert_ne!(made, INVALID_HANDLE_VALUE, "an instance is made: {}", io::Error::last_os_error());
+            // SAFETY: as above.
+            unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(made) }
+        };
+        let client = || {
+            // SAFETY: `name` is NUL-terminated and outlives the call; no security attributes or template are passed. A
+            // failure returns `INVALID_HANDLE_VALUE`, checked before the handle is owned.
+            let opened = unsafe {
+                CreateFileW(
+                    name.as_ptr(),
+                    FILE_GENERIC_READ | FILE_GENERIC_WRITE,
+                    0,
+                    std::ptr::null(),
+                    OPEN_EXISTING,
+                    0,
+                    std::ptr::null_mut(),
+                )
+            };
+            assert_ne!(opened, INVALID_HANDLE_VALUE, "a client opens: {}", io::Error::last_os_error());
+            // SAFETY: as above.
+            unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(opened) }
+        };
+        let _instances = (instance(), instance());
+        let (control, other) = (client(), client());
+
+        assert!(!same_object(control.as_handle(), other.as_handle()), "the two clients are two objects");
+        assert_output_refused(other.as_raw_handle().addr(), control.as_handle(), "names this process's control pipe");
     }
 
     #[test]
@@ -832,18 +921,66 @@ mod tests {
     }
 
     #[test]
-    fn process_of_child_returns_none_for_a_pid_no_process_has_or_one_it_cannot_open() {
+    fn end_process_fails_when_the_wait_fails() {
+        let _alone = one_at_a_time();
+        let child = suspended("exit 0");
+        let watch = StoppableProcess::open(child.pid()).expect("the child opens").expect("the child exists");
+        // SAFETY: `OpenProcess` takes no pointers. A success is a fresh handle nothing else owns.
+        let opened = unsafe { OpenProcess(PROCESS_TERMINATE, 0, child.pid()) };
+        assert!(!opened.is_null(), "the child opens: {}", io::Error::last_os_error());
+        // SAFETY: as above.
+        let terminate_only = unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(opened) };
+
+        let failed = end_process(terminate_only.as_handle(), 1, HANG_GUARD).expect_err("a handle without SYNCHRONIZE cannot be waited on");
+
+        assert_eq!(failed.kind(), io::ErrorKind::PermissionDenied, "{failed}");
+        assert!(
+            watch.wait(HANG_GUARD).expect("the wait succeeds"),
+            "the terminate went through before the wait failed"
+        );
+        drop(child);
+    }
+
+    /// An open to end a process refused as a process of the same user that denied this one would refuse it.
+    fn denied() -> io::Result<std::os::windows::io::OwnedHandle> {
+        Err(io::Error::from_raw_os_error(ERROR_ACCESS_DENIED.cast_signed()))
+    }
+
+    #[test]
+    fn a_child_that_cannot_be_opened_to_end_it_is_not_taken_for_ended() {
+        let _alone = one_at_a_time();
+        let child = suspended("exit 0");
+        let pid = child.pid();
+        let created = creation_time_of(borrow(child.process.as_ref().expect("the process is held"))).expect("the start is read");
+        let watch = StoppableProcess::open(pid).expect("the child opens").expect("the child exists");
+
+        let alive = find_child(pid, std::process::id(), created, denied).expect_err("a live child that cannot be opened is not ended");
+        let other = find_child(pid, std::process::id() + 4, created, denied).expect("another process is looked at");
+        drop(child);
+        assert!(watch.wait(HANG_GUARD).expect("the wait succeeds"), "the child ended");
+        // `watch` keeps the ended child's object, so its pid still names it.
+        let ended = find_child(pid, std::process::id(), created, denied).expect("the ended child is looked at");
+
+        assert_eq!(alive.kind(), io::ErrorKind::PermissionDenied, "{alive}");
+        assert!(other.is_none(), "a process that is not the child is no child to end");
+        assert!(ended.is_none(), "a child that has ended is known ended");
+        drop(watch);
+    }
+
+    #[test]
+    fn process_of_child_returns_no_process_for_a_pid_no_process_has_or_one_it_cannot_open() {
         // SAFETY: this process's pseudo-handle is always open.
         let this_process = unsafe { BorrowedHandle::borrow_raw(GetCurrentProcess()) };
         let created = creation_time_of(this_process).expect("this process's start is read");
 
         // `OpenProcess` refuses pid 0, the idle process, with `ERROR_INVALID_PARAMETER`. Pid 4, System, a test
-        // without the debug privilege cannot open to end (`ERROR_ACCESS_DENIED`), and it is never this process's child.
+        // without the debug privilege cannot open to end (`ERROR_ACCESS_DENIED`), and it is never this process's child:
+        // it is found another where it can be looked at, and an error where it cannot be told from the child.
         let idle = process_of_child(0, std::process::id(), created).expect("pid 0 is looked up");
-        let system = process_of_child(4, std::process::id(), created).expect("pid 4 is looked up");
+        let system = process_of_child(4, std::process::id(), created);
 
         assert!(idle.is_none(), "no process of pid 0 is returned");
-        assert!(system.is_none(), "the System process is not returned");
+        assert!(matches!(system, Ok(None) | Err(_)), "the System process is not returned: {system:?}");
     }
 
     #[test]
