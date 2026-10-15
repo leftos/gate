@@ -606,6 +606,8 @@ pub(super) struct Called {
     pub(super) lines: Vec<String>,
     /// Its last standard error line that is the box's outputs line, however many lines came after it.
     outputs_line: Option<String>,
+    /// Its last standard error line that is the box's back commits line, however many lines came after it.
+    back_commits: Option<String>,
     /// Whether it said on standard error that the box skipped outputs for names this PC cannot take.
     names_skipped: bool,
     /// Whether the box said the run's start marker on standard error.
@@ -694,12 +696,13 @@ pub(super) struct Attempt<'c, 'a> {
     box_killed: Option<BoxKill>,
 }
 
-/// How a run call ended ([`Attempt::run_call`]): its end, the last standard error line of the call that counts that is
-/// the box's outputs line, and whether that call said on standard error that the box skipped outputs for names this PC
-/// cannot take.
+/// How a run call ended ([`Attempt::run_call`]): its end, the last standard error lines of the call that counts that
+/// are the box's outputs line and its back commits line, and whether that call said on standard error that the box
+/// skipped outputs for names this PC cannot take.
 struct RunEnd {
     end: End,
     outputs_line: Option<String>,
+    back_commits: Option<String>,
     names_skipped: bool,
 }
 
@@ -735,7 +738,9 @@ impl Attempt<'_, '_> {
         // The pending marker stays on every end but a passing run whose box packed nothing.
         match called.end {
             End::Status(status) => {
-                let synced = syncback::sync_back(self, &snapshot, status)?;
+                let back_commits = called.back_commits.as_deref().and_then(syncback::back_commits);
+                let target = syncback::Target::new(self.call.root, self.call.repo, &snapshot, self.call.key);
+                let synced = syncback::sync_back(self, &target, back_commits.as_deref(), status)?;
                 let brought = outputs::accepted(called.outputs_line.as_deref(), self.call.key, &nonce);
                 let ran = outputs::Ran {
                     location: &location,
@@ -1102,6 +1107,7 @@ impl Attempt<'_, '_> {
         let raise = self.raises_at("run") || self.raises_at("stop");
         let nonce: Arc<str> = Arc::from(nonce);
         let mut heard = None;
+        let mut back_commits = None;
         let mut names_skipped = false;
         let mut adjusted = None;
         // The command's time counts from the start of the call that counts, as its backstop does.
@@ -1116,6 +1122,7 @@ impl Attempt<'_, '_> {
             };
             let called = attempt.ssh(line, Echo::Console, Watch::Run(limits), raise, run)?;
             heard.clone_from(&called.outputs_line);
+            back_commits.clone_from(&called.back_commits);
             names_skipped = called.names_skipped;
             adjusted = called.adjusted;
             Ok(called)
@@ -1126,6 +1133,7 @@ impl Attempt<'_, '_> {
         Ok(RunEnd {
             end,
             outputs_line: heard,
+            back_commits,
             names_skipped,
         })
     }
@@ -1697,6 +1705,7 @@ fn called_of(ended: CallEnd, raised: Raised, mut heard: Heard) -> Result<Called,
         last_error: heard.last_error,
         lines: heard.kept.into_lines(),
         outputs_line: heard.outputs_line,
+        back_commits: heard.back_commits,
         names_skipped: heard.names_skipped,
         started: heard.started,
         refused: heard.refused,
@@ -1996,9 +2005,10 @@ fn git_end(error: GitError) -> End {
 }
 
 /// What one call's two streams said so far, kept for the call's end, each line cut to the cap: whether it wrote on
-/// standard output, its first and last standard error lines, its last standard error line that is the box's outputs
-/// line, whether a standard error line said the box skipped outputs for names ([`NAMES_SKIPPED`]), whether the box
-/// said the run's start marker and the refusal its first tag named, its last lines, and the first problem reading them.
+/// standard output, its first and last standard error lines, its last standard error lines that are the box's outputs
+/// line and its back commits line, whether a standard error line said the box skipped outputs for names
+/// ([`NAMES_SKIPPED`]), whether the box said the run's start marker and the refusal its first tag named, its last
+/// lines, and the first problem reading them.
 #[derive(Default)]
 struct Heard {
     kept: Kept,
@@ -2006,6 +2016,7 @@ struct Heard {
     first_error: Option<String>,
     last_error: Option<String>,
     outputs_line: Option<String>,
+    back_commits: Option<String>,
     names_skipped: bool,
     started: bool,
     refused: Option<FallbackReason>,
@@ -2049,13 +2060,14 @@ impl Heard {
         }
     }
 
-    /// Keeps `line`, already cut, of standard error when `error`: the last error line, the outputs line and the skipped
-    /// names it may be, and the line among those kept for the log.
+    /// Keeps `line`, already cut, of standard error when `error`: the last error line, the outputs line, the back
+    /// commits line and the skipped names it may be, and the line among those kept for the log.
     fn kept_line(&mut self, line: &str, error: bool) {
         if error {
             self.last_error = Some(line.to_owned());
         }
         outputs::keep_outputs_line(&mut self.outputs_line, line, error);
+        syncback::keep_back_commits_line(&mut self.back_commits, line, error);
         self.names_skipped |= error && line.starts_with(NAMES_SKIPPED);
         self.kept.push(line);
     }
@@ -2984,6 +2996,7 @@ mod tests {
             last_error: Some(first_error.to_owned()),
             lines: vec![first_error.to_owned()],
             outputs_line: None,
+            back_commits: None,
             names_skipped: false,
             started: false,
             refused: None,
@@ -3637,6 +3650,24 @@ mod tests {
 
         assert!(!called.lines.iter().any(|kept| kept == line), "the window no longer holds the line");
         assert_eq!(called.outputs_line.as_deref(), Some(line), "the last standard error outputs line is kept");
+    }
+
+    #[test]
+    fn the_last_standard_error_back_commits_line_alone_is_kept() {
+        let mut heard = Heard::default();
+        let said = |sha: char| format!("gate: remote back commits: app {}, lib none", sha.to_string().repeat(40));
+        heard.record(&said('a'), true, None);
+        heard.record(&said('b'), true, None);
+        heard.record(&said('c'), false, None);
+        heard.record("gate: remote said something else", true, None);
+
+        let called = called_of(CallEnd::Exited(0), Raised::default(), heard).expect("a call that ended");
+
+        assert_eq!(
+            called.back_commits.as_deref(),
+            Some(said('b').as_str()),
+            "the last standard error back commits line is kept, and a standard output one is not"
+        );
     }
 
     #[test]
