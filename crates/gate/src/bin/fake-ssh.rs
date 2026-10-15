@@ -1,5 +1,6 @@
 //! The black-box suite's stand-in for ssh, which `gate run --test-remote-ssh` starts with ssh's own words: the options,
-//! `--`, the host and the line, whose last three words are `box <verb> <payload>`. git's own ssh starts it too, through
+//! `--`, the host and the line, whose last three words are `box <verb> --stdin`, the call's request coming on its
+//! standard input, which the box it runs reads as its own. git's own ssh starts it too, through
 //! the `local-ssh:` transport, with the line `git-upload-pack '<path>'` or `git-receive-pack '<path>'`, whose verb is
 //! the service's name. `gate push` starts it with a line that starts with `pwsh ` and holds `-EncodedCommand <bootstrap>`,
 //! a push call, whose verb is `push`. It reads the steps file the variable `GATE_FAKE_SSH_STEPS` names, one step a line,
@@ -9,7 +10,7 @@
 //! with no step taken. Started with `--version` alone, as a push case starts a copy of it standing in for a builder's
 //! old gate, it says `gate 0.0.0-old` and exits 0.
 //!
-//! `ok` runs `<gate> box <verb> <payload>` with the gate the variable `GATE_FAKE_SSH_GATE` names, a `run` call given
+//! `ok` runs `<gate> box <verb> --stdin` with the gate the variable `GATE_FAKE_SSH_GATE` names, a `run` call given
 //! the words of the variable `GATE_FAKE_SSH_BOX_SEAMS`, when set, before its verb as box seams, and a `preflight` call
 //! those of `GATE_FAKE_SSH_PREFLIGHT_SEAMS` the same way, or `git
 //! upload-pack <path>` or `git receive-pack <path>`, or a push call's words with this PC's `pwsh`, its `LOCALAPPDATA`
@@ -318,7 +319,8 @@ fn hold(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// The call the line carries: `gate box`'s verb and payload, a git service's name and the repository's path, or
+/// The call the line carries: `gate box`'s verb and the word after it, `--stdin`, a git service's name and the
+/// repository's path, or
 /// [`PUSH`] and the push call's whole line; the host it was made to, and the steps file it acts on.
 struct BoxCall<'a> {
     verb: &'a str,
@@ -329,7 +331,7 @@ struct BoxCall<'a> {
 
 impl<'a> BoxCall<'a> {
     /// The call `line`, made to `host` and acting on the steps file `steps`, carries: a git service and its path,
-    /// unquoted, a push call, or the last three words, `box <verb> <payload>`.
+    /// unquoted, a push call, or the last three words, `box <verb> --stdin`.
     fn of(line: &'a str, host: &'a str, steps: &'a Path) -> Result<BoxCall<'a>, String> {
         if let Some((verb, path)) = line.split_once(' ').filter(|(verb, _)| GIT_SERVICES.contains(verb)) {
             return Ok(BoxCall {

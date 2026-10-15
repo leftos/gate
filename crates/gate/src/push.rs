@@ -133,7 +133,7 @@ pub(crate) fn push(request: &PushRequest, environment: &Environment, console: &m
         let heard = match &ssh {
             Ok(program) => called(&Call {
                 program,
-                args: push_words(host, &prepared.line),
+                args: ssh_words(host, &prepared.line, Wire::Plain),
                 input: prepared.input.as_bytes(),
                 variables: &variables,
                 bound,
@@ -153,16 +153,6 @@ pub(crate) fn push(request: &PushRequest, environment: &Environment, console: &m
         }
     }
     status
-}
-
-/// ssh's words for the push call that runs `line` on `host`: no terminal asked for, so stdin reaches the bootstrap
-/// through no pty, then the transport's words.
-fn push_words(host: &str, line: &str) -> Vec<OsString> {
-    ["-o", "RequestTTY=no"]
-        .into_iter()
-        .map(OsString::from)
-        .chain(ssh_words(host, line, Wire::Plain))
-        .collect()
 }
 
 /// What every builder is sent: the builders, the exe as its call is fed it, [`pushed_input`], the exe's version as

@@ -1036,24 +1036,23 @@ fn a_layout_refusal_of_the_box_falls_back_with_its_line_and_runs_the_command_her
 }
 
 #[test]
-fn a_run_call_longer_than_the_cap_fails_before_anything_is_sent() {
-    let case = client_case("client-cap");
+fn a_routed_run_whose_command_is_longer_than_cmd_s_line_runs_on_the_box() {
+    let case = client_case("client-long-command");
     let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
-    let long = "x".repeat(6200);
+    let long = "x".repeat(9000);
 
-    let outcome = finish(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "out", &long]));
+    let outcome = finish(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "out", &long, "out", "end"]));
 
-    assert_eq!(outcome.code, Some(1), "{outcome:?}");
-    assert!(outcome.stderr.contains("gate: the remote run failed: the run call is "), "{outcome:?}");
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert!(
-        outcome
-            .stderr
-            .contains(" characters, longer than the 8127 cmd takes (8191 less 64 for sshd's own cmd.exe /c); shorten the command"),
-        "{outcome:?}"
+        outcome.stdout.contains(&format!("{long}\n")),
+        "the word reached the tool whole: {outcome:?}"
     );
-    assert!(!outcome.stdout.contains(&long), "the command ran nowhere: {outcome:?}");
-    assert_eq!(calls(&steps), Vec::<String>::new(), "nothing was sent");
-    assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new());
+    assert!(outcome.stdout.contains("end"), "the word after it too: {outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "run"], "the command ran on the box");
+    let events = events(&case);
+    assert_eq!(fallbacks(&events), Vec::<&str>::new(), "{events:#?}");
+    assert!(events.iter().all(|event| event["remote"] == true), "a remote run: {events:#?}");
 }
 
 #[test]

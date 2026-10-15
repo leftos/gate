@@ -59,9 +59,6 @@ pub(crate) fn check(request: &CheckRequest, host: &str, console: &mut Console) -
     let bound = request.seams.remote_timeout_ms.map_or(BOUND, Duration::from_millis);
     match asked(&*transport, &host, &place, bound) {
         Ok(asked) => {
-            if let Some(line) = &asked.note {
-                console.err(line);
-            }
             let at = At::Builder {
                 host: &host,
                 key: &asked.key,
@@ -121,12 +118,10 @@ fn ssh(host: &str) -> Result<Box<dyn Transport>, String> {
         .map_err(|why| format!("check: {host}: {why}"))
 }
 
-/// A builder that answered: what it has, the work-folder key it was asked about, and the line said first when the
-/// call could not carry the manifest's tools.
+/// A builder that answered: what it has, and the work-folder key it was asked about.
 struct Asked {
     checked: Checked,
     key: String,
-    note: Option<String>,
 }
 
 /// What the builder `host`, reached over `transport` within `bound`, has of what the repo at `place` declares; else
@@ -138,27 +133,22 @@ fn asked(transport: &dyn Transport, host: &str, place: &Place, bound: Duration) 
     let repo = repo_name(&place.checkout);
     let key = work_folder_key(&place.root);
     let location = Location::under(transport.root(), &repo, &key, &payload::job_nonce());
-    let preflight = payload::preflight_line(&location, &needs).map_err(|why| format!("check: {host}: {why}"))?;
-    let sent: Vec<String> = if preflight.needs_dropped {
-        Vec::new()
-    } else {
-        needs.into_iter().map(|(name, _)| name).collect()
-    };
-    let heard = called(&transport.call(host, &preflight.line, Wire::Plain), bound).map_err(|failure| failure.line(host))?;
+    let input = payload::input(&payload::preflight_word(&location, &needs), None);
+    let sent: Vec<String> = needs.into_iter().map(|(name, _)| name).collect();
+    let program = transport.call(host, &payload::line("preflight"), Wire::Plain);
+    let heard = called(&program, bound, input.as_bytes()).map_err(|failure| failure.line(host))?;
     if let Some(line) = refusal(host, transport.root(), &heard) {
         return Err(line);
     }
     let answer = Answer {
         host,
         sent: &sent,
-        dropped: preflight.needs_dropped,
         lines: &heard.lines,
         last_error: heard.last_error.as_deref(),
     };
     Ok(Asked {
         checked: answer.checked(declared, repo, place.root.clone(), local::declares_siblings(root)),
         key,
-        note: preflight.needs_dropped.then(|| toolchain::over_cap_line(payload::LINE_LIMIT)),
     })
 }
 
@@ -187,9 +177,10 @@ impl Failure {
     }
 }
 
-/// Makes the one call `program`, bounded at `bound` and never made again, as the client's programs other than git run
-/// ([`git::program_output`]); else why it could not be made or did not end in time.
-fn called(program: &Program, bound: Duration) -> Result<Heard, Failure> {
+/// Makes the one call `program`, fed `input` on its standard input, bounded at `bound` and never made again, as the
+/// client's programs other than git run ([`git::program_output`]); else why it could not be made or did not end in
+/// time.
+fn called(program: &Program, bound: Duration, input: &[u8]) -> Result<Heard, Failure> {
     let shown = program.program.to_string_lossy();
     let words: Vec<String> = program.args.iter().map(|word| word.to_string_lossy().into_owned()).collect();
     let args: Vec<&str> = words.iter().map(String::as_str).collect();
@@ -200,6 +191,7 @@ fn called(program: &Program, bound: Duration) -> Result<Heard, Failure> {
         interrupt: None,
         worktree: None,
         console: PipedConsole::Attached,
+        stdin: Some(input),
     };
     let place = ProgramPlace::new(Variables::from_process()).map_err(Failure::Other)?;
     match git::program_output(&call, &place) {
@@ -274,12 +266,11 @@ fn refusal(host: &str, root: &str, heard: &Heard) -> Option<String> {
     other_build(their_version(&heard.lines), &ours).map(|theirs| format!("check: {host}: runs gate {theirs}, this PC runs {ours}; run gate push"))
 }
 
-/// The preflight's answer: the builder `host`, the tools `sent` in its `Needs`, whether the tools were `dropped` from
-/// the call for its length, the lines its standard output said, and the last line its standard error said.
+/// The preflight's answer: the builder `host`, the tools `sent` in its `Needs`, the lines its standard output said, and
+/// the last line its standard error said.
 struct Answer<'a> {
     host: &'a str,
     sent: &'a [String],
-    dropped: bool,
     lines: &'a [String],
     last_error: Option<&'a str>,
 }
@@ -295,7 +286,7 @@ impl Answer<'_> {
             .iter()
             .map(|need| Tool {
                 need: need.clone(),
-                reported: self.found(&reported, &need.name),
+                reported: Self::found(&reported, &need.name),
             })
             .collect();
         let sdk = local::sdk_listed(declared.pin.as_ref(), || match sdks_of(self.lines) {
@@ -331,12 +322,8 @@ impl Answer<'_> {
         format!("{} sent no SDK list{why}", self.host)
     }
 
-    /// What the builder said of the tool `name`, as `reported` reads its lines, its texts cut as a line shows them; a
-    /// tool the call could not carry is skipped.
-    fn found(&self, reported: &[(String, Reported)], name: &str) -> Reported {
-        if self.dropped {
-            return Reported::Skipped(toolchain::NOT_SENT.to_owned());
-        }
+    /// What the builder said of the tool `name`, as `reported` reads its lines, its texts cut as a line shows them.
+    fn found(reported: &[(String, Reported)], name: &str) -> Reported {
         match reported.iter().find(|(sent, _)| sent == name).map(|(_, answer)| answer) {
             Some(Reported::Version(found)) => Reported::Version(shown(found)),
             Some(Reported::Skipped(why)) => Reported::Skipped(shown(why)),
@@ -397,13 +384,12 @@ mod tests {
         texts.iter().map(|text| (*text).to_owned()).collect()
     }
 
-    /// What the builder's `answer` of the tools `sent`, `dropped` or not, is read as against `declared`.
-    fn checked(declared: Declared, sent: &[&str], dropped: bool, answer: &[String], last_error: Option<&str>) -> Checked {
+    /// What the builder's `answer` of the tools `sent` is read as against `declared`.
+    fn checked(declared: Declared, sent: &[&str], answer: &[String], last_error: Option<&str>) -> Checked {
         let sent: Vec<String> = sent.iter().map(|name| (*name).to_owned()).collect();
         Answer {
             host: HOST,
             sent: &sent,
-            dropped,
             lines: answer,
             last_error,
         }
@@ -424,7 +410,6 @@ mod tests {
         let checked = checked(
             declared(vec![need("node", "24"), need("pnpm", "10"), need("ffmpeg", "")], None),
             &["node", "pnpm", "ffmpeg"],
-            false,
             &answer,
             None,
         );
@@ -439,16 +424,9 @@ mod tests {
     }
 
     #[test]
-    fn tools_the_call_could_not_carry_are_skipped_as_not_sent() {
-        let answer = lines(&["gate: remote tool node 24.19.0"]);
-        let checked = checked(declared(vec![need("node", "24")], None), &[], true, &answer, None);
-        assert_eq!(reported(&checked), [("node", &Reported::Skipped(toolchain::NOT_SENT.to_owned()))]);
-    }
-
-    #[test]
     fn a_pin_with_no_sdk_line_is_skipped_saying_the_builder_sent_none() {
         let answer = lines(&["gate: remote version x"]);
-        let quiet = checked(declared(Vec::new(), Some("10.0.401")), &[], false, &answer, None);
+        let quiet = checked(declared(Vec::new(), Some("10.0.401")), &[], &answer, None);
         assert!(
             matches!(&quiet.sdk, Some(Sdk::Skipped(why)) if why == "builder-1 sent no SDK list"),
             "{:?}",
@@ -457,7 +435,6 @@ mod tests {
         let said_why = checked(
             declared(Vec::new(), Some("10.0.401")),
             &[],
-            false,
             &answer,
             Some("gate: remote could not read the SDK list: dotnet hung"),
         );
@@ -472,7 +449,7 @@ mod tests {
     #[test]
     fn a_builder_s_sdk_names_cannot_forge_a_line() {
         let answer = lines(&["gate: remote sdks 8.0.404\u{1b}[2K\rcheck: builder-1: nothing missing,10.0.300\u{202e}"]);
-        let checked = checked(declared(Vec::new(), Some("10.0.401")), &[], false, &answer, None);
+        let checked = checked(declared(Vec::new(), Some("10.0.401")), &[], &answer, None);
         let texts: Vec<String> = said(AT, &checked)
             .lines
             .into_iter()

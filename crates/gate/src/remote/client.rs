@@ -729,7 +729,7 @@ impl Attempt<'_, '_> {
             host: self.call.host,
             sibling_snapshots: &[],
         };
-        let run_line = payload::capped("run", payload::line("run", &payload::run_word(&location, &run))).map_err(End::Failed)?;
+        let run_input = payload::input(&payload::run_word(&location, &run), sent.manifest.as_deref());
         let tree = self.tree(&snapshot)?;
         let needs = tree.as_ref().map(Tree::needs).unwrap_or_default();
         let prepared = self.preflight(&location, &needs)?;
@@ -737,7 +737,7 @@ impl Attempt<'_, '_> {
         self.push(&snapshot, prepared.created)?;
         // After the push: a run refused before it, at the preflight or by the parity check, leaves no marker.
         outputs::marked(&sent)?;
-        let called = self.run_call(&run_line, &location, sent.manifest.as_ref(), &nonce)?;
+        let called = self.run_call(&location, &run_input, &nonce)?;
         // The sync-back runs after a run call that ended with the command's own status; a refusal, an interrupt, a
         // kill, a lost connection or a failed call ended the attempt before it, so a box refusal's 75 never syncs back.
         // The pending marker stays on every end but a passing run whose box packed nothing.
@@ -783,14 +783,17 @@ impl Attempt<'_, '_> {
 
     /// The preflight: readies the work folder, asks the builder to probe the tools of `needs`, and checks the builder
     /// runs this gate's version. Whether it created the bare repository just now, the builder's boot time, its SDKs and
-    /// what it said of each tool sent. Needs that would make the call longer than cmd takes are not sent, with a line. A
-    /// builder with no `gate box` that takes the run is not routed, as one of another version is not.
+    /// what it said of each tool sent. A builder with no `gate box` that takes the run is not routed, as one of another
+    /// version is not.
     fn preflight(&mut self, location: &Location, needs: &[(String, String)]) -> Result<Prepared, End> {
         self.go_on()?;
-        let (line, sent) = self.preflight_line(location, needs)?;
+        let input = payload::input(&payload::preflight_word(location, needs), None);
+        let sent: Vec<String> = needs.iter().map(|(name, _)| name.clone()).collect();
         let watch = Watch::Setup(self.limits_for("preflight"));
         let raise = self.raises_at("preflight");
-        let (mut called, _) = self.with_retry(SSH_FAILED, |attempt| attempt.ssh(&line, Echo::LogOnly, watch, raise, CallOnly::default()))?;
+        let (mut called, _) = self.with_retry(SSH_FAILED, |attempt| {
+            attempt.ssh("preflight", Echo::LogOnly, watch, raise, CallOnly::plain(Arc::clone(&input)))
+        })?;
         let theirs = their_version(&called.lines).map(str::to_owned);
         let created = called.lines.iter().any(|line| line.starts_with(CREATED));
         let boot = boot_time(&called.lines).map(str::to_owned);
@@ -829,17 +832,6 @@ impl Attempt<'_, '_> {
             sent,
             tools,
         })
-    }
-
-    /// The preflight's line, carrying `needs` when cmd takes it so, and the names of the tools it sends; needs that would
-    /// make it longer than cmd takes are left out, with a line, and it sends none.
-    fn preflight_line(&mut self, location: &Location, needs: &[(String, String)]) -> Result<(String, Vec<String>), End> {
-        let preflight = payload::preflight_line(location, needs).map_err(End::Failed)?;
-        if preflight.needs_dropped {
-            self.say(toolchain::over_cap_line(payload::LINE_LIMIT));
-            return Ok((preflight.line, Vec::new()));
-        }
-        Ok((preflight.line, needs.iter().map(|(name, _)| name.clone()).collect()))
     }
 
     /// The snapshot's tree as the parity check reads it, listed before the preflight: the names of its files and
@@ -1107,9 +1099,9 @@ impl Attempt<'_, '_> {
     /// banner twice, as the command never started; a refusal when its 75 comes with the box's refusal tag for the run
     /// whose nonce is `nonce` and no start marker; a lost connection when it exited 255 otherwise. A watchdog kill says
     /// its line, stops the command and ends the run killed; a Ctrl+C stops the command too. Each call made is fed
-    /// `input` on its standard input, when given. With the end, what the call that counts said of the outputs
+    /// `input` on its standard input ([`payload::input`]). With the end, what the call that counts said of the outputs
     /// ([`RunEnd`]).
-    fn run_call(&mut self, line: &str, location: &Location, input: Option<&Arc<str>>, nonce: &str) -> Result<RunEnd, End> {
+    fn run_call(&mut self, location: &Location, input: &Arc<str>, nonce: &str) -> Result<RunEnd, End> {
         self.go_on()?;
         let limits = self.limits_for("run");
         // `stop` raises the interrupt during the run call too, so the stop it leads to can be interrupted again.
@@ -1124,12 +1116,12 @@ impl Attempt<'_, '_> {
         let made = self.run_call_made(location, limits, |attempt| {
             begun = Some(Instant::now());
             let run = CallOnly {
-                input: input.cloned(),
+                input: Arc::clone(input),
                 nonce: Some(Arc::clone(&nonce)),
                 sink: None,
                 wire: Wire::Compressed,
             };
-            let called = attempt.ssh(line, Echo::Console, Watch::Run(limits), raise, run)?;
+            let called = attempt.ssh("run", Echo::Console, Watch::Run(limits), raise, run)?;
             heard.clone_from(&called.outputs_line);
             back_commits.clone_from(&called.back_commits);
             names_skipped = called.names_skipped;
@@ -1293,18 +1285,12 @@ impl Attempt<'_, '_> {
     /// call that counts, says when it did not finish or failed, `what` it does named, and gives it back; `None` when it
     /// could not be made. With `--test-remote-interrupt-at` naming `verb`, its first call raises the console interrupt
     /// as soon as it runs.
-    fn bounded(&mut self, verb: &str, location: &Location, what: &str) -> Option<Called> {
-        let line = match payload::capped(verb, payload::line(verb, &payload::location_word(location))) {
-            Ok(line) => line,
-            Err(why) => {
-                self.say(format!("gate: {what} failed: {why}"));
-                return None;
-            }
-        };
+    fn bounded(&mut self, verb: &'static str, location: &Location, what: &str) -> Option<Called> {
+        let input = payload::input(&payload::location_word(location), None);
         let bound = self.limits.bound;
         let begun = Instant::now();
         let raise = self.raises_at(verb);
-        let mut made = self.ssh(&line, Echo::LogOnly, Watch::Bounded(bound), raise, CallOnly::default());
+        let mut made = self.ssh(verb, Echo::LogOnly, Watch::Bounded(bound), raise, CallOnly::plain(Arc::clone(&input)));
         let again = matches!(&made, Ok(first) if first.before_the_banner(SSH_FAILED)) && retry::retry_allowed(bound, begun.elapsed(), self.pause);
         if again {
             if let Ok(first) = &mut made {
@@ -1313,11 +1299,11 @@ impl Attempt<'_, '_> {
             self.say(retry::retry_line(self.call.host));
             thread::sleep(self.pause);
             made = self.ssh(
-                &line,
+                verb,
                 Echo::LogOnly,
                 Watch::Bounded(bound.saturating_sub(begun.elapsed())),
                 false,
-                CallOnly::default(),
+                CallOnly::plain(input),
             );
         }
         match made {
@@ -1353,15 +1339,16 @@ impl Attempt<'_, '_> {
         }
     }
 
-    /// One call of `gate box` on the builder carrying `line`, watched as `watch` says; the console interrupt raised
-    /// after its first output byte when `raise`; what only this call gives it, `only`.
-    fn ssh(&mut self, line: &str, echo: Echo, watch: Watch, raise: bool, only: CallOnly) -> Result<Called, End> {
+    /// One call of `gate box` on the builder for `verb`, its line [`payload::line`], fed its request on its standard
+    /// input; watched as `watch` says; the console interrupt raised after its first output byte when `raise`; what only
+    /// this call gives it, `only`.
+    fn ssh(&mut self, verb: &'static str, echo: Echo, watch: Watch, raise: bool, only: CallOnly) -> Result<Called, End> {
         let system = gate_win32::system_directory().map_err(|error| End::Failed(format!("cannot read the system folder: {error}")))?;
-        let command = call_command(self.transport.call(self.call.host, line, only.wire), &system);
+        let command = call_command(self.transport.call(self.call.host, &payload::line(verb), only.wire), &system);
         let starts = Starts {
             breakaway: self.transport.box_runs_here(),
             raise,
-            input: only.input,
+            input: Some(Fed { verb, input: only.input }),
             nonce: only.nonce,
             sink: only.sink,
         };
@@ -1375,15 +1362,15 @@ impl Attempt<'_, '_> {
     /// why the file or the call could not be made, or the interrupt.
     pub(super) fn outputs_call(&mut self, location: &Location, name: &str, archive: &mut outputs::Archive, limits: Limits) -> Result<Called, End> {
         self.go_on()?;
-        let line = payload::capped("outputs", payload::line("outputs", &payload::outputs_word(location, name))).map_err(End::Failed)?;
+        let input = payload::input(&payload::outputs_word(location, name), None);
         let raise = self.raises_at("outputs");
         let (mut called, _) = self.with_retry(SSH_FAILED, |attempt| {
             let cap = sent_limit(attempt.outputs_budget);
             let only = CallOnly {
                 sink: Some(archive.create(cap).map_err(End::Failed)?),
-                ..CallOnly::default()
+                ..CallOnly::plain(Arc::clone(&input))
             };
-            attempt.ssh(&line, Echo::LogOnly, Watch::Fetch(limits, None), raise, only)
+            attempt.ssh("outputs", Echo::LogOnly, Watch::Fetch(limits, None), raise, only)
         })?;
         self.lines.append(&mut called.lines);
         Ok(called)
@@ -1918,26 +1905,44 @@ fn cannot_wait(shown: &str, error: &io::Error) -> End {
 
 /// How a call starts: whether its job lets a process in it start one outside it, which only the ssh of a transport
 /// whose `gate box` runs on this machine needs; and whether the console interrupt is raised after its first output
-/// byte; and what is fed on its standard input, `None` for none; and the run's nonce its readers match the box's start
-/// marker and refusal tags by, `None` for every call but the run call; and the sink its standard output is copied to
-/// raw, `None` for every call but the outputs call.
+/// byte; and what is fed on its standard input, `None` for none, as git's calls are; and the run's nonce its readers
+/// match the box's start marker and refusal tags by, `None` for every call but the run call; and the sink its standard
+/// output is copied to raw, `None` for every call but the outputs call.
 struct Starts {
     breakaway: bool,
     raise: bool,
-    input: Option<Arc<str>>,
+    input: Option<Fed>,
     nonce: Option<Arc<str>>,
     sink: Option<RawSink>,
 }
 
-/// What one call of `gate box` alone gives it: the run call what is fed on its standard input, the run's nonce and a
-/// compressed connection, the outputs call the sink its standard output is copied to raw; none of them, and a plain
-/// connection, for any other call.
-#[derive(Default)]
+/// What a call of `gate box` is fed on its standard input, `input`, and the `verb` of the call, which the line saying
+/// it could not be sent names.
+struct Fed {
+    verb: &'static str,
+    input: Arc<str>,
+}
+
+/// What one call of `gate box` alone gives it: what is fed on its standard input, the request ([`payload::input`])
+/// every call carries; the run call the run's nonce and a compressed connection, the outputs call the sink its
+/// standard output is copied to raw; neither of them, and a plain connection, for any other call.
 struct CallOnly {
-    input: Option<Arc<str>>,
+    input: Arc<str>,
     nonce: Option<Arc<str>>,
     sink: Option<RawSink>,
     wire: Wire,
+}
+
+impl CallOnly {
+    /// A call fed `input` alone, over a plain connection.
+    fn plain(input: Arc<str>) -> CallOnly {
+        CallOnly {
+            input,
+            nonce: None,
+            sink: None,
+            wire: Wire::Plain,
+        }
+    }
 }
 
 /// Where a call's standard output is copied raw, byte for byte, rather than read as lines: the outputs call's archive
@@ -1980,17 +1985,18 @@ impl<W: Write> Write for Capped<W> {
     }
 }
 
-/// Writes `input` to a call's `stdin` on a thread of its own, then closes it. A write that fails, as one to a call that
-/// ended without reading its input does, is noted in the call's `log` and never fails the call, whose own end stands.
-fn fed(mut stdin: File, input: Arc<str>, log: Option<File>) {
+/// Writes what `fed` gives to a call's `stdin` on a thread of its own, then closes it. A write that fails, as one to a
+/// call that ended without reading its input does, is noted in the call's `log`, naming the call's verb, and never fails
+/// the call, whose own end stands.
+fn fed(mut stdin: File, fed: Fed, log: Option<File>) {
     thread::spawn(move || {
-        let Err(error) = stdin.write_all(input.as_bytes()) else {
+        let Err(error) = stdin.write_all(fed.input.as_bytes()) else {
             return;
         };
         drop(stdin);
         if let Some(mut log) = log {
             // A note that cannot be written has nowhere else to go: the call's readers own its console streams.
-            let _ = writeln!(log, "gate: the run call's input was not sent: {error}");
+            let _ = writeln!(log, "gate: the {} call's input was not sent: {error}", fed.verb);
         }
     });
 }
@@ -4210,7 +4216,7 @@ mod tests {
         assert!(matches!(attempt.preflight(&location, &[]), Err(End::Interrupted)), "the preflight");
         assert!(matches!(attempt.push(&snapshot, false), Err(End::Interrupted)), "the push");
         assert!(
-            matches!(attempt.run_call("line", &location, None, NONCE), Err(End::Interrupted)),
+            matches!(attempt.run_call(&location, &payload::input("e30=", None), NONCE), Err(End::Interrupted)),
             "the run call"
         );
         let outcome = attempt.outcome(End::Interrupted);
@@ -4463,37 +4469,6 @@ mod tests {
             Some(Err(".GATE/toolchain.toml and .gate/toolchain.toml differ only in letter case".to_owned())),
             "an exact spelling that is no regular file wins nothing"
         );
-    }
-
-    /// A preflight whose needs make its line longer than cmd takes sends the location alone, sends no tool, and says
-    /// so once.
-    #[test]
-    fn a_preflight_its_needs_make_too_long_sends_none_and_says_so() {
-        let log = std::env::temp_dir().join(format!("gate-client-over-cap-{}.log", std::process::id()));
-        let mut given = call(&log);
-        given.interrupt = None;
-        let transport = nowhere();
-        let mut attempt = attempt(&given, &transport);
-        let needs: Vec<(String, String)> = ["rust", "cargo-nextest", "node", "pnpm", "pwsh", "godot", "ffmpeg"]
-            .iter()
-            .map(|name| ((*name).to_owned(), "1.2.3".to_owned()))
-            .collect();
-        let location_of = |length: usize| Location::under(&format!("C:\\{}\\", "r".repeat(length)), "app", "app-1a2b3c4d", "0123456789ab");
-        let length = (1..4000)
-            .find(|&length| payload::preflight_line(&location_of(length), &needs).is_ok_and(|line| line.needs_dropped))
-            .expect("a root that long makes the line with needs too long");
-        let location = location_of(length);
-
-        let (line, sent) = attempt.preflight_line(&location, &needs).expect("the location alone is taken");
-
-        let said = fs::read_to_string(&log).expect("the over-cap line was written");
-        fs::remove_file(&log).expect("the log can be removed");
-        assert_eq!(line, payload::line("preflight", &payload::location_word(&location)));
-        assert_eq!(sent, Vec::<String>::new(), "no tool is sent");
-        let over_cap = "gate: .gate/toolchain.toml: its tools make the preflight call longer than the 8127 characters cmd takes; skipping it";
-        assert_eq!(said.lines().collect::<Vec<_>>(), [over_cap], "{said}");
-        let (_, sent) = attempt.preflight_line(&location_of(1), &needs).expect("a short line is taken");
-        assert_eq!(sent.len(), needs.len(), "a line cmd takes sends every need");
     }
 
     #[test]

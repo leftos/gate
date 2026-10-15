@@ -15,7 +15,6 @@ mod run;
 mod stop;
 mod tools;
 
-use std::ffi::OsStr;
 use std::io::{self, BufRead, Read};
 
 use gate_args::{BoxRequest, BoxVerb};
@@ -65,8 +64,8 @@ fn read_request(input: impl BufRead) -> Result<Payload, String> {
             line.pop();
         }
     }
-    // Bytes that are not UTF-8 are never base64, so their replacement characters are refused as base64 is.
-    Payload::decode(OsStr::new(String::from_utf8_lossy(&line).as_ref()))
+    let word = std::str::from_utf8(&line).map_err(|error| format!("gate: box payload is not base64 JSON: the line is not UTF-8: {error}"))?;
+    Payload::decode(word)
 }
 
 /// Why a line could not be read.

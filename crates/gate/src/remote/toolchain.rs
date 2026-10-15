@@ -120,9 +120,6 @@ const NOT_READABLE: &str = "found, version not readable";
 /// The why of a tool the preflight asked about and the builder said nothing of.
 pub(crate) const NO_ANSWER: &str = "the builder gave no answer";
 
-/// Why `gate check --builder` skips a tool when the tools make the preflight call too long for cmd, so none is sent.
-pub(crate) const NOT_SENT: &str = "not sent, as the tools make the preflight call too long for cmd";
-
 /// What a probe of one tool found, as a builder's tool line words it or as `gate check`'s probe found it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Reported {
@@ -202,12 +199,6 @@ fn shown(text: &str) -> String {
 /// one line.
 fn one_line(name: &str) -> String {
     escaped(&spelled(name))
-}
-
-/// The line said, on a routed run, when the manifest's tools would make the preflight call longer than cmd takes, so it
-/// is sent without them.
-pub(crate) fn over_cap_line(limit: usize) -> String {
-    skip_line(&format!("its tools make the preflight call longer than the {limit} characters cmd takes"))
 }
 
 /// Whether a preflight sends `tool` to the builder: a known tool, whose name is 1 to 32 lower-case ASCII letters,
@@ -588,8 +579,8 @@ fn attributes(text: &str) -> Vec<(&str, &str)> {
 #[expect(clippy::expect_used, reason = "a fixture that does not read must fail loudly")]
 mod tests {
     use super::{
-        Judged, Manifest, Reported, Standing, ToolNeed, Version, dotnet_tools, godot_sdk_pins, is_sent, judge, meets, needs_of, over_cap_line, read,
-        read_bytes, reported, reported_as, skip_line, standing, unreadable_line,
+        Judged, Manifest, Reported, Standing, ToolNeed, Version, dotnet_tools, godot_sdk_pins, is_sent, judge, meets, needs_of, read, read_bytes,
+        reported, reported_as, skip_line, standing, unreadable_line,
     };
     use crate::remote::git::FAILURE_BYTES;
     use crate::remote::parity::{Need, NeedKind};
@@ -1088,10 +1079,6 @@ mod tests {
         assert_eq!(
             skip_line("line 2, column 8: invalid string"),
             "gate: .gate/toolchain.toml: line 2, column 8: invalid string; skipping it"
-        );
-        assert_eq!(
-            over_cap_line(8127),
-            "gate: .gate/toolchain.toml: its tools make the preflight call longer than the 8127 characters cmd takes; skipping it"
         );
     }
 

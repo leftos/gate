@@ -1,7 +1,6 @@
 //! The payload of a `gate box` call: one base64 word (standard alphabet, padded) of UTF-8 JSON holding an object, as
-//! the remote client sends it. Keys are read by their exact name; keys no verb reads are ignored.
-
-use std::ffi::OsStr;
+//! the remote client sends it as the first line of the call's standard input. Keys are read by their exact name; keys
+//! no verb reads are ignored.
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
@@ -19,7 +18,7 @@ pub(crate) struct Payload(Map<String, Value>);
 
 impl Payload {
     /// Decodes the payload word; else the usage line saying why it cannot be read.
-    pub(crate) fn decode(word: &OsStr) -> Result<Payload, String> {
+    pub(crate) fn decode(word: &str) -> Result<Payload, String> {
         object(word)
             .map(Payload)
             .map_err(|reason| format!("gate: box payload is not base64 JSON: {reason}"))
@@ -495,9 +494,8 @@ fn is_drive_path(value: &str) -> bool {
     rooted && !value.chars().any(|character| character < ' ')
 }
 
-fn object(word: &OsStr) -> Result<Map<String, Value>, String> {
-    let text = word.to_str().ok_or_else(|| "the word is not valid Unicode".to_owned())?;
-    let bytes = STANDARD.decode(text).map_err(|error| error.to_string())?;
+fn object(word: &str) -> Result<Map<String, Value>, String> {
+    let bytes = STANDARD.decode(word).map_err(|error| error.to_string())?;
     let json = String::from_utf8(bytes).map_err(|error| format!("the decoded bytes are not UTF-8: {error}"))?;
     match serde_json::from_str(&json).map_err(|error| error.to_string())? {
         Value::Object(map) => Ok(map),
@@ -507,8 +505,6 @@ fn object(word: &OsStr) -> Result<Map<String, Value>, String> {
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::OsStr;
-
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD;
     use serde_json::json;
@@ -516,7 +512,7 @@ mod tests {
     use super::{Payload, escaped};
 
     fn decoded(json: &str) -> Result<Payload, String> {
-        Payload::decode(OsStr::new(&STANDARD.encode(json)))
+        Payload::decode(&STANDARD.encode(json))
     }
 
     fn text(json: &str, key: &str) -> Result<String, String> {
@@ -538,11 +534,11 @@ mod tests {
 
     #[test]
     fn a_word_that_is_not_base64_json_names_why() {
-        assert_names_a_reason(Payload::decode(OsStr::new("not base64")), "not base64");
-        assert_names_a_reason(Payload::decode(OsStr::new(&STANDARD.encode([0xFF, 0xFE]))), "not UTF-8");
+        assert_names_a_reason(Payload::decode("not base64"), "not base64");
+        assert_names_a_reason(Payload::decode(&STANDARD.encode([0xFF, 0xFE])), "not UTF-8");
         assert_names_a_reason(decoded("{\"Work\":"), "not JSON");
         let unpadded = STANDARD.encode("{}").trim_end_matches('=').to_owned();
-        assert_names_a_reason(Payload::decode(OsStr::new(&unpadded)), "the standard engine wants the padding");
+        assert_names_a_reason(Payload::decode(&unpadded), "the standard engine wants the padding");
         assert_eq!(
             decoded("[\"Work\"]").err(),
             Some("gate: box payload is not base64 JSON: the JSON is not an object".to_owned())

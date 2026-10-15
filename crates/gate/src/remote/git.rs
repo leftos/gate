@@ -228,7 +228,8 @@ struct Spawn<'a> {
 
 /// A program other than git started, bounded and ended as the client's git calls are ([`program_output`]): its name,
 /// looked for along a `PATH`, its arguments, how long it may take, the console interrupt that ends it, the worktree it
-/// must not be found inside, and the console it is created on: this process's, or a hidden one of its own.
+/// must not be found inside, the console it is created on: this process's, or a hidden one of its own; and the bytes
+/// fed on its standard input, which is then closed, `None` for none.
 pub(crate) struct ProgramCall<'a> {
     pub program: &'a str,
     pub args: &'a [&'a str],
@@ -236,6 +237,7 @@ pub(crate) struct ProgramCall<'a> {
     pub interrupt: Option<Interrupt>,
     pub worktree: Option<&'a Path>,
     pub console: PipedConsole,
+    pub stdin: Option<&'a [u8]>,
 }
 
 /// Where [`program_output`] runs a program: the system folder, and an environment with
@@ -307,6 +309,7 @@ pub(crate) fn program_output(call: &ProgramCall<'_>, place: &ProgramPlace) -> Re
     let bounds = Call {
         interrupt: call.interrupt,
         console: call.console,
+        stdin: call.stdin,
         ..Call::plain(folder, call.args, call.limit)
     };
     let spawn = Spawn {
@@ -331,6 +334,7 @@ pub(crate) fn sdk_listing(variables: Variables, limit: Duration, interrupt: Opti
         interrupt,
         worktree,
         console: PipedConsole::Attached,
+        stdin: None,
     };
     let place = ProgramPlace::new(variables).map_err(|why| GitError::Failed(format!("cannot run dotnet: {why}")))?;
     let Some(ProgramOutput {
@@ -1434,6 +1438,7 @@ mod tests {
             interrupt: None,
             worktree: Some(Path::new(env!("CARGO_MANIFEST_DIR"))),
             console: PipedConsole::Hidden,
+            stdin: None,
         };
 
         let output = program_output(&call, &place).expect("the link runs").expect("the link is found");

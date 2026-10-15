@@ -131,6 +131,7 @@ fn ran(run: &Run<'_>, place: &ProgramPlace, deadline: Instant, limit: Duration) 
         interrupt: None,
         worktree,
         console: PipedConsole::Hidden,
+        stdin: None,
     };
     match git::program_output(&call, place) {
         Ok(None) => Probed::Missing,

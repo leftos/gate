@@ -1,8 +1,9 @@
 //! What the client sends `gate box`: the work folder's place on the builder, the payload word of each verb (base64,
-//! standard alphabet and padded, of compact UTF-8 JSON, as `gate box` reads it), and the line ssh carries, which must
-//! fit the most cmd takes.
+//! standard alphabet and padded, of compact UTF-8 JSON, as `gate box` reads it), the fixed line ssh carries, and the
+//! call's standard input, which carries the word.
 
 use std::hash::{BuildHasher, RandomState};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
@@ -11,18 +12,8 @@ use serde_json::{Map, Value, json};
 
 use crate::remote::snapshot::IDENTITY;
 
-/// The longest command line cmd runs, and the part of it kept for the `cmd.exe /c` sshd puts before the line.
-const CMD_LIMIT: usize = 8191;
-const CMD_MARGIN: usize = 64;
-/// The longest line a call may carry, once cmd has expanded it.
-pub(crate) const LINE_LIMIT: usize = CMD_LIMIT - CMD_MARGIN;
 /// The gate a builder runs, from its own `%LOCALAPPDATA%\gate\bin`, as cmd expands it.
 pub(crate) const BOX_EXE: &str = r#""%LOCALAPPDATA%\gate\bin\gate.exe""#;
-/// The variable the line names the builder's gate by, which cmd expands before its limit applies.
-const LOCAL_APP_DATA: &str = "%LOCALAPPDATA%";
-/// The characters `%LOCALAPPDATA%` is counted as: the builder's profile path is unknown here, so a line within the cap
-/// stays within cmd's limit for any profile path up to this long.
-const LOCAL_APP_DATA_EXPANDED: usize = 100;
 /// The hex digits of a run's job nonce, as the box checks them, and of its outputs nonce.
 const JOB_NONCE_DIGITS: usize = 12;
 const RUN_NONCE_DIGITS: usize = 32;
@@ -143,26 +134,6 @@ pub(crate) fn preflight_word(location: &Location, needs: &[(String, String)]) ->
     word(&object)
 }
 
-/// The preflight's line, as [`capped`] lets it through, and whether it left the needs out.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) struct PreflightLine {
-    pub line: String,
-    /// Whether the needs made the line longer than cmd takes, so it carries the location alone.
-    pub needs_dropped: bool,
-}
-
-/// The preflight's line for `location`, carrying `needs` ([`preflight_word`]) when cmd takes it so, else the location
-/// alone ([`location_word`]); `Err` with [`capped`]'s reason when cmd takes neither.
-pub(crate) fn preflight_line(location: &Location, needs: &[(String, String)]) -> Result<PreflightLine, String> {
-    match capped("preflight", line("preflight", &preflight_word(location, needs))) {
-        Ok(line) => Ok(PreflightLine { line, needs_dropped: false }),
-        Err(_) if !needs.is_empty() => {
-            capped("preflight", line("preflight", &location_word(location))).map(|line| PreflightLine { line, needs_dropped: true })
-        }
-        Err(why) => Err(why),
-    }
-}
-
 /// The payload word of the outputs call: the location and the outputs archive's `Name`, `name`.
 pub(crate) fn outputs_word(location: &Location, name: &str) -> String {
     let mut object = location.object();
@@ -206,23 +177,16 @@ fn word(object: &Map<String, Value>) -> String {
     STANDARD.encode(Value::Object(object.clone()).to_string())
 }
 
-/// The line ssh carries for `verb`: the builder's gate, `box`, the verb and the payload word.
-pub(crate) fn line(verb: &str, word: &str) -> String {
-    format!("{BOX_EXE} box {verb} {word}")
+/// The line ssh carries for `verb`, the same whatever the call sends: the builder's gate, `box`, the verb and
+/// `--stdin`, as the request comes on the call's standard input ([`input`]).
+pub(crate) fn line(verb: &str) -> String {
+    format!("{BOX_EXE} box {verb} --stdin")
 }
 
-/// `line` of the call `verb` when cmd takes it, each `%LOCALAPPDATA%` counted as the path it expands to; else why not,
-/// in the PowerShell client's words.
-pub(crate) fn capped(verb: &str, line: String) -> Result<String, String> {
-    let expansions = line.matches(LOCAL_APP_DATA).count();
-    let length = line.chars().count() - expansions * LOCAL_APP_DATA.len() + expansions * LOCAL_APP_DATA_EXPANDED;
-    if length > LINE_LIMIT {
-        return Err(format!(
-            "the {verb} call is {length} characters, longer than the {LINE_LIMIT} cmd takes ({CMD_LIMIT} less {CMD_MARGIN} \
-             for sshd's own cmd.exe /c); shorten the command"
-        ));
-    }
-    Ok(line)
+/// What a call writes on the box's standard input: the payload `word` as a line, then the run call's outputs
+/// `manifest` line, which ends with its own newline, when it sends one.
+pub(crate) fn input(word: &str, manifest: Option<&str>) -> Arc<str> {
+    Arc::from(format!("{word}\n{}", manifest.unwrap_or_default()))
 }
 
 /// A job nonce new to the run: 12 lower-case hex digits.
@@ -248,16 +212,11 @@ fn nonce(digits: usize) -> String {
 #[cfg(test)]
 #[expect(clippy::expect_used, reason = "a test whose payload cannot be decoded must fail loudly")]
 mod tests {
-    use std::ffi::OsStr;
-
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD;
     use serde_json::{Value, json};
 
-    use super::{
-        BOX_EXE, LINE_LIMIT, Location, Pair, PreflightLine, RunCall, capped, job_nonce, line, location_word, preflight_line, preflight_word,
-        run_nonce, run_word,
-    };
+    use super::{Location, Pair, RunCall, input, job_nonce, line, location_word, preflight_word, run_nonce, run_word};
     use crate::boxside::payload::Payload;
 
     fn decoded(word: &str) -> Value {
@@ -307,7 +266,7 @@ mod tests {
 
     /// The box's reading of the payload word `word`.
     fn on_the_box(word: &str) -> Payload {
-        Payload::decode(OsStr::new(word)).expect("the box decodes the client's word")
+        Payload::decode(word).expect("the box decodes the client's word")
     }
 
     #[test]
@@ -391,59 +350,6 @@ mod tests {
         assert_eq!(order, ["node", "cargo-nextest", "ffmpeg"], "the needs keep their order");
     }
 
-    fn needs() -> Vec<(String, String)> {
-        ["rust", "cargo-nextest", "node", "pnpm", "pwsh", "godot", "ffmpeg"]
-            .iter()
-            .map(|name| ((*name).to_owned(), "1.2.3".to_owned()))
-            .collect()
-    }
-
-    /// A location under a root of `length` letters.
-    fn location_of(length: usize) -> Location {
-        Location::under(&format!("D:\\{}\\", "r".repeat(length)), "app", "app-1a2b3c4d", "0123456789ab")
-    }
-
-    #[test]
-    fn a_preflight_line_carries_its_needs_when_cmd_takes_it_so() {
-        let preflight = preflight_line(&location(), &needs()).expect("a short line is taken");
-        assert_eq!(
-            preflight,
-            PreflightLine {
-                line: line("preflight", &preflight_word(&location(), &needs())),
-                needs_dropped: false,
-            }
-        );
-    }
-
-    #[test]
-    fn a_preflight_line_its_needs_make_too_long_carries_the_location_alone() {
-        let length = (1..4000)
-            .find(|&length| capped("preflight", line("preflight", &preflight_word(&location_of(length), &needs()))).is_err())
-            .expect("a root that long makes the line with needs too long");
-        let location = location_of(length);
-        assert_eq!(
-            preflight_line(&location, &needs()).expect("the location alone is taken"),
-            PreflightLine {
-                line: line("preflight", &location_word(&location)),
-                needs_dropped: true,
-            }
-        );
-        assert!(
-            !preflight_line(&location_of(length - 1), &needs())
-                .expect("a root one shorter is taken")
-                .needs_dropped,
-            "the needs are dropped only past the cap"
-        );
-    }
-
-    #[test]
-    fn a_preflight_line_too_long_without_its_needs_is_err() {
-        let location = location_of(LINE_LIMIT);
-        let why = preflight_line(&location, &needs()).expect_err("the location alone is too long");
-        assert!(why.starts_with("the preflight call is "), "{why}");
-        assert_eq!(preflight_line(&location, &[]).expect_err("no needs to drop"), why);
-    }
-
     #[test]
     fn the_payloads_are_base64_json_with_the_box_s_keys() {
         let preflight = decoded(&location_word(&location()));
@@ -519,39 +425,18 @@ mod tests {
     }
 
     #[test]
-    fn the_line_runs_the_builder_s_gate_with_the_verb_and_the_word() {
-        assert_eq!(line("run", "e30="), r#""%LOCALAPPDATA%\gate\bin\gate.exe" box run e30="#);
+    fn the_line_is_the_fixed_box_line_for_the_verb() {
+        assert_eq!(line("run"), r#""%LOCALAPPDATA%\gate\bin\gate.exe" box run --stdin"#);
+        assert_eq!(line("preflight"), r#""%LOCALAPPDATA%\gate\bin\gate.exe" box preflight --stdin"#);
     }
 
     #[test]
-    fn the_cap_counts_localappdata_as_100_characters() {
-        // The builder's gate is 34 characters as sent, of them the 14 of `%LOCALAPPDATA%`, which cmd expands to a
-        // profile path of up to 100: 120 counted, so a run line's other 8007 characters fit and 8008 do not.
-        let sent = |rest: usize| format!("{BOX_EXE}{}", "x".repeat(rest));
-        assert_eq!(BOX_EXE.chars().count(), 34);
-        assert_eq!(capped("run", sent(8007)), Ok(sent(8007)), "8127 characters once expanded fit");
+    fn the_input_is_the_request_line_then_the_manifest() {
+        assert_eq!(&*input("e30=", None), "e30=\n", "no manifest: the request line alone");
         assert_eq!(
-            capped("run", sent(8008)),
-            Err(
-                "the run call is 8128 characters, longer than the 8127 cmd takes (8191 less 64 for sshd's own cmd.exe /c); \
-                 shorten the command"
-                    .to_owned()
-            )
-        );
-    }
-
-    #[test]
-    fn a_line_longer_than_8127_characters_is_refused() {
-        let at = |length: usize| "x".repeat(length);
-        assert_eq!(LINE_LIMIT, 8127);
-        assert_eq!(capped("run", at(8127)), Ok(at(8127)), "8127 characters fit");
-        assert_eq!(
-            capped("run", at(8128)),
-            Err(
-                "the run call is 8128 characters, longer than the 8127 cmd takes (8191 less 64 for sshd's own cmd.exe /c); \
-                 shorten the command"
-                    .to_owned()
-            )
+            &*input("e30=", Some("{\"files\":[]}\n")),
+            "e30=\n{\"files\":[]}\n",
+            "the manifest line follows the request line, and the input ends with its newline"
         );
     }
 
