@@ -3,11 +3,11 @@
 use std::ffi::OsString;
 
 use gate_args::{ExpectRequest, Invocation, Problem, RunRequest, StopRequest, USAGE, parse};
+use gate_desktop::version::build_version;
 
 use crate::console::Console;
 use crate::request_json;
 use crate::resolve::{self, Environment};
-use crate::version::build_version;
 
 /// The status of a step that failed with no status of its own.
 pub(crate) const FAILED_STATUS: u8 = 1;

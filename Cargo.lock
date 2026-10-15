@@ -193,6 +193,7 @@ dependencies = [
  "base64",
  "flate2",
  "gate-args",
+ "gate-desktop",
  "gate-router",
  "gate-state",
  "gate-watchdog",
@@ -212,6 +213,17 @@ name = "gate-args"
 version = "0.1.0"
 dependencies = [
  "proptest",
+]
+
+[[package]]
+name = "gate-desktop"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "gate-win32",
+ "proc-table",
+ "serde_json",
+ "windows-sys",
 ]
 
 [[package]]

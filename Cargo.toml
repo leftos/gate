@@ -3,12 +3,16 @@ resolver = "3"
 members = [
     "crates/gate",
     "crates/gate-args",
+    "crates/gate-desktop",
     "crates/gate-router",
     "crates/gate-state",
     "crates/gate-watchdog",
     "crates/gate-win32",
     "crates/proc-table",
 ]
+
+[workspace.package]
+version = "0.1.0"
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }

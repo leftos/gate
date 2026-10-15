@@ -8,6 +8,7 @@ use std::sync::PoisonError;
 use std::time::Duration;
 
 use gate_args::BoxSeams;
+use gate_desktop::version::build_version;
 
 use crate::answer::USAGE_STATUS;
 use crate::boxside::boot;
@@ -17,7 +18,6 @@ use crate::console::Console;
 use crate::environment::Variables;
 use crate::remote::git;
 use crate::run::{ERROR_FILE_NOT_FOUND, find_program};
-use crate::version::build_version;
 
 /// The status of a step that failed with no status of its own: git or a folder that could not be made or written.
 const FAILED_STATUS: u32 = 1;

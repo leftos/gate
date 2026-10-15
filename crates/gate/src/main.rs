@@ -42,7 +42,6 @@ mod run;
 mod slots;
 mod stop_tree;
 mod stopping;
-mod version;
 mod wait;
 mod watch;
 

@@ -651,8 +651,8 @@ impl Suspended {
     ///
     /// # Errors
     ///
-    /// An error when the process was already taken, or the system's error when its creation time cannot be read; the
-    /// command is then ended with exit code 1, as a drop ends it, and nothing is given up.
+    /// An error when the process was already taken, which ends nothing; or the system's error when its creation time
+    /// cannot be read, the command then ended with exit code 1, as a drop ends it. Nothing is given up either way.
     pub fn release(mut self) -> io::Result<Released> {
         let Some(process) = self.process.take() else {
             return Err(io::Error::other("the process was already taken"));
@@ -681,6 +681,7 @@ impl Suspended {
 
 /// A command [`Suspended::release`] gave up, suspended and unended: what the process that hands it on needs.
 #[derive(Debug)]
+#[must_use = "dropping it leaks the command's handles and leaves the command suspended for good"]
 pub struct Released {
     /// The command's process id.
     pub pid: u32,

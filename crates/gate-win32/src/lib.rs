@@ -31,8 +31,8 @@ mod token;
 mod tree;
 
 pub use adopt::{
-    RemoteProcess, check_received_output, creation_time_of, image_path_of, is_handle_value, parent_pid_of, pid_of_process, pid_of_thread,
-    process_of_child, session_of, thread_is_suspended, user_of,
+    RemoteProcess, check_received_output, creation_time_of, end_process, image_path_of, is_handle_value, parent_pid_of, pid_of_process,
+    pid_of_thread, process_of_child, session_of, thread_is_suspended, user_of,
 };
 pub use console::{Donor, Utf8Console};
 pub use create::spawn;
@@ -48,7 +48,7 @@ pub use memory::working_set;
 pub use mutex::{AcquireError, MutexGuard, NamedMutex, OwnedMutexGuard, mutex_exists};
 pub use pipe::{ConnectWait, PipeClient, PipeRead, PipeServer, PipeWrite};
 pub use piped::{DesktopLaunch, PipedConsole, PipedFed, PipedLaunch, PipedSuspended, breakaway_refused};
-pub use session::{ConnectState, LockState, SessionState, active_console_session, session_state};
+pub use session::{ConnectState, LockState, SessionState, active_console_session, input_desktop_name, session_state};
 pub use times::{ProcessTimes, SystemTimes, file_time_now, process_times, system_times, wsl_vm_cpu};
 pub use token::{Grant, NetworkGroup, RestrictedToken, TokenFacts, current_user_sid, token_facts};
 

@@ -3,10 +3,14 @@
 
 use std::io;
 
+use windows_sys::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER;
 use windows_sys::Win32::System::RemoteDesktop::{
     WTS_CONNECTSTATE_CLASS, WTS_CURRENT_SERVER_HANDLE, WTS_SESSIONSTATE_LOCK, WTS_SESSIONSTATE_UNLOCK, WTSActive, WTSConnectQuery, WTSConnected,
     WTSDisconnected, WTSDown, WTSFreeMemory, WTSGetActiveConsoleSessionId, WTSINFOEXW, WTSIdle, WTSInit, WTSListen, WTSQuerySessionInformationW,
     WTSReset, WTSSessionInfoEx, WTSShadow,
+};
+use windows_sys::Win32::System::StationsAndDesktops::{
+    CloseDesktop, DESKTOP_READOBJECTS, GetUserObjectInformationW, HDESK, OpenInputDesktop, UOI_NAME,
 };
 use windows_sys::core::PWSTR;
 
@@ -21,6 +25,47 @@ pub fn active_console_session() -> Option<u32> {
     // SAFETY: the call takes no argument and cannot fail.
     let session = unsafe { WTSGetActiveConsoleSessionId() };
     (session != NO_SESSION).then_some(session)
+}
+
+/// The name of the desktop that takes this session's input now (`OpenInputDesktop` with `DESKTOP_READOBJECTS`, then
+/// `GetUserObjectInformationW` with `UOI_NAME`): `Default` for the user's desktop. A secure desktop, as the lock screen
+/// or a UAC prompt shows, either has another name or cannot be opened at all.
+///
+/// # Errors
+///
+/// The system's error when the input desktop cannot be opened or its name cannot be read.
+pub fn input_desktop_name() -> io::Result<String> {
+    // SAFETY: `OpenInputDesktop` takes no pointers; a null result is a failure, read before anything else runs.
+    let desktop = unsafe { OpenInputDesktop(0, 0, DESKTOP_READOBJECTS) };
+    if desktop.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    let name = desktop_name(desktop);
+    // SAFETY: the handle was opened above, is used by nothing else and is closed once; a failed close loses nothing
+    // the name needs.
+    unsafe { CloseDesktop(desktop) };
+    name
+}
+
+/// The name of the open desktop `desktop`.
+fn desktop_name(desktop: HDESK) -> io::Result<String> {
+    let mut buffer = vec![0_u16; 64];
+    loop {
+        let size = u32::try_from(buffer.len() * 2).map_err(io::Error::other)?;
+        let mut needed = 0;
+        // SAFETY: the desktop is open for the whole call, `buffer` is writable for `size` bytes and `needed` is writable.
+        let read = unsafe { GetUserObjectInformationW(desktop, UOI_NAME, buffer.as_mut_ptr().cast(), size, &raw mut needed) };
+        if read != 0 {
+            let units = buffer.iter().position(|&unit| unit == 0).unwrap_or(buffer.len());
+            return Ok(String::from_utf16_lossy(&buffer[..units]));
+        }
+        let error = io::Error::last_os_error();
+        let wanted = (needed as usize).div_ceil(2);
+        if error.raw_os_error() != Some(ERROR_INSUFFICIENT_BUFFER.cast_signed()) || wanted <= buffer.len() {
+            return Err(error);
+        }
+        buffer.resize(wanted, 0);
+    }
 }
 
 /// A session's connection state (`WTS_CONNECTSTATE_CLASS`).

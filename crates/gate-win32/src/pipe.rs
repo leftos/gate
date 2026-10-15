@@ -770,6 +770,14 @@ impl PipeClient {
         Ok(pid)
     }
 
+    /// The client end's own handle, to tell it apart from a handle another process sent, as
+    /// [`crate::check_received_output`] does.
+    #[must_use]
+    pub fn handle(&self) -> BorrowedHandle<'_> {
+        // SAFETY: the handle is open for as long as `self` lives, which the borrow cannot outlive.
+        unsafe { BorrowedHandle::borrow_raw(self.handle.raw()) }
+    }
+
     /// Reads what the server has written into the start of `buf`, as [`PipeServer::read`] reads what its client wrote.
     ///
     /// # Errors
@@ -1081,7 +1089,7 @@ mod tests {
     }
 
     #[test]
-    fn a_client_refuses_a_pipe_a_low_integrity_creator_made_with_the_server_s_descriptor() {
+    fn a_low_integrity_creator_cannot_make_a_pipe_with_the_server_s_medium_label() {
         let sid = own_sid();
         let sddl = server_sddl(&sid).expect("the descriptor string is built");
 

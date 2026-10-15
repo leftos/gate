@@ -1,6 +1,6 @@
 [package]
 name = "gate"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
 publish = false
 
@@ -15,6 +15,7 @@ test-seams = ["gate-args/test-seams"]
 base64 = "0.23.1"
 flate2 = "1.1.10"
 gate-args = { path = "../gate-args" }
+gate-desktop = { path = "../gate-desktop" }
 gate-router = { path = "../gate-router" }
 gate-state = { path = "../gate-state" }
 gate-watchdog = { path = "../gate-watchdog" }

@@ -1,0 +1,39 @@
+[package]
+name = "gate-desktop"
+version.workspace = true
+edition = "2024"
+publish = false
+
+[lib]
+doctest = false
+
+[lints]
+workspace = true
+
+[features]
+# `GATE_DESKTOP_TEST_LIMIT_MS`, read by the helper to cap each of its waits; an installed helper is built without.
+test-seams = []
+
+[dependencies]
+base64 = "0.23.1"
+gate-win32 = { path = "../gate-win32" }
+serde_json = { version = "1.0.151", features = ["preserve_order"] }
+
+[dev-dependencies]
+proc-table = { path = "../proc-table" }
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+] }
+
+[[bin]]
+name = "gate-desktop-helper"
+path = "src/bin/gate-desktop-helper.rs"
+
+# Without the `test-seams` feature (`--all-features` or `--features test-seams`) cargo skips this suite silently.
+[[test]]
+name = "helper"
+path = "tests/helper.rs"
+required-features = ["test-seams"]

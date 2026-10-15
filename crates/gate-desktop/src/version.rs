@@ -1,13 +1,15 @@
-//! The version this gate names itself by: the package version and the build's own id.
+//! The version a gate build names itself by: the package version and the build's own id. The gate and the desktop
+//! helper share it, so a helper of another build tells the box so in its `Hello`.
 
 /// The commit this build was made from, from `GATE_BUILD_ID` at compile time; `None` for a build made without one, or
 /// with an empty one.
 const BUILD_ID: Option<&str> = option_env!("GATE_BUILD_ID");
 
-/// The version this gate names itself by: `<package version>+<build id>` for a build `tools/install.ps1` made, else
+/// The version this build names itself by: `<package version>+<build id>` for a build `tools/install.ps1` made, else
 /// `<package version>+dev`. Two builds of one package version are told apart by the id, so a builder running another
 /// build of it is refused as one running another version, and a hand-built `+dev` compares equal only to another `+dev`.
-pub(crate) fn build_version() -> String {
+#[must_use]
+pub fn build_version() -> String {
     version_text(BUILD_ID)
 }
 

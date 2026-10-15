@@ -8,22 +8,24 @@ use std::mem::ManuallyDrop;
 use std::os::windows::ffi::OsStringExt;
 use std::os::windows::io::{AsHandle, AsRawHandle, BorrowedHandle, FromRawHandle};
 use std::path::PathBuf;
+use std::time::Duration;
 
 use jiff::Timestamp;
 use proc_table::win32::OwnedHandle;
 use windows_sys::Win32::Foundation::{
     CompareObjectHandles, DUPLICATE_CLOSE_SOURCE, DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_ACCESS_DENIED, ERROR_INSUFFICIENT_BUFFER,
-    ERROR_INVALID_PARAMETER, HANDLE,
+    ERROR_INVALID_PARAMETER, GetHandleInformation, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::TOKEN_QUERY;
-use windows_sys::Win32::Storage::FileSystem::{FILE_TYPE_PIPE, FILE_TYPE_UNKNOWN, GetFileType};
+use windows_sys::Win32::Storage::FileSystem::{FILE_TYPE_PIPE, GetFileType};
 use windows_sys::Win32::System::RemoteDesktop::ProcessIdToSessionId;
 use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, GetProcessId, GetProcessIdOfThread, OpenProcess, OpenProcessToken, PROCESS_DUP_HANDLE, PROCESS_NAME_WIN32,
     PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, QueryFullProcessImageNameW, ResumeThread, SuspendThread,
+    TerminateProcess, WaitForSingleObject,
 };
 
-use crate::{own_handle, start_of};
+use crate::{own_handle, start_of, wait_millis};
 
 /// The longest image path read, in UTF-16 units: the longest path Windows has.
 const LONGEST_PATH: usize = 32_768;
@@ -157,12 +159,15 @@ pub unsafe fn check_received_output<'a>(value: usize, control: BorrowedHandle<'_
         return Err(refused("is not a value a handle table can hold"));
     }
     let raw: HANDLE = std::ptr::without_provenance_mut(value);
-    // SAFETY: `GetFileType` only looks the value up in this process's table; a value naming no handle makes it fail.
-    let kind = unsafe { GetFileType(raw) };
-    if kind != FILE_TYPE_PIPE {
-        // `GetFileType` reports a value naming no open handle as `FILE_TYPE_UNKNOWN` with an error set.
-        let unopened = kind == FILE_TYPE_UNKNOWN && io::Error::last_os_error().raw_os_error() != Some(0);
-        return Err(refused(if unopened { "names no open handle" } else { "does not name a pipe" }));
+    let mut flags = 0;
+    // SAFETY: `GetHandleInformation` only looks the value up in this process's table, failing for a value naming no
+    // open handle, and writes only to `flags`, which is writable.
+    if unsafe { GetHandleInformation(raw, &raw mut flags) } == 0 {
+        return Err(refused("names no open handle"));
+    }
+    // SAFETY: `GetFileType` only looks the value up in this process's table; it names an open handle, as found above.
+    if unsafe { GetFileType(raw) } != FILE_TYPE_PIPE {
+        return Err(refused("does not name a pipe"));
     }
     // SAFETY: the value names an open handle of this table, as `GetFileType` found, and `control` is borrowed open for
     // the whole call; the call only compares the objects behind them.
@@ -178,11 +183,12 @@ pub unsafe fn check_received_output<'a>(value: usize, control: BorrowedHandle<'_
 /// and `SYNCHRONIZE`), when it is the child of `parent` created at `created`: its parent pid, as its own record holds
 /// it ([`parent_pid_of`]), is `parent`, and its creation time, as [`creation_time_of`] reads it, is `created`. A pid
 /// reused since that child was made names a process created later, so it never passes. `None` when no process has the
-/// pid, when the one that has it cannot be opened (a child this process made under its own token always can, so that
-/// one is another), or when it is another, whose handle is closed and which is left alone.
+/// pid, when the one that has it cannot be opened to end it (another process holds the pid, or a process of the same
+/// user denied this one `PROCESS_TERMINATE` on the child), or when it is another, whose handle is closed and which is
+/// left alone.
 ///
-/// It proves only who a pid is, never whether another process (the box) has taken that child: when the helper ends
-/// its child is the design's rule after D8 (`docs/plans/desktop-session.md`).
+/// It proves only who a pid is, never whether another process (the box) has taken that child: the helper ends its
+/// child only when its control pipe reads closed or fails before `DONE`, since the box may have taken the child.
 ///
 /// # Errors
 ///
@@ -195,8 +201,9 @@ pub fn process_of_child(pid: u32, parent: u32, created: Timestamp) -> io::Result
     if opened.is_null() {
         let error = io::Error::last_os_error();
         // `OpenProcess` reports a pid no process has as `ERROR_INVALID_PARAMETER`, and a process this one may not open
-        // as `ERROR_ACCESS_DENIED`: the child this process made under its own token and default DACL it can always
-        // open, so a process it cannot open is another that holds the pid now.
+        // as `ERROR_ACCESS_DENIED`: either another process holds the pid now, or a process of the same user has denied
+        // this one `PROCESS_TERMINATE` on the child. Either way there is nothing this function can end; the box's
+        // kill-on-close job ends a child it was assigned to.
         return if crate::tree::is_error(&error, ERROR_INVALID_PARAMETER) || crate::tree::is_error(&error, ERROR_ACCESS_DENIED) {
             Ok(None)
         } else {
@@ -207,6 +214,25 @@ pub fn process_of_child(pid: u32, parent: u32, created: Timestamp) -> io::Result
     let process = unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(opened) };
     let is_child = parent_pid_of(process.as_handle())? == parent && creation_time_of(process.as_handle())? == created;
     Ok(is_child.then_some(process))
+}
+
+/// Ends the process behind `process` with `exit_code` (`TerminateProcess`), then waits at most `bound` for its end:
+/// true once it has ended, false when it still had not by then. A process that had ended already is no error. It needs
+/// `PROCESS_TERMINATE` and `SYNCHRONIZE` access, as [`process_of_child`] opens a process with.
+///
+/// # Errors
+///
+/// The system's error when the wait fails, or when the process could not be terminated and has not ended.
+pub fn end_process(process: BorrowedHandle<'_>, exit_code: u32, bound: Duration) -> io::Result<bool> {
+    // SAFETY: the handle is borrowed open for the whole call; one without the access only makes the call fail.
+    let terminated = unsafe { TerminateProcess(process.as_raw_handle(), exit_code) } != 0;
+    let refused = (!terminated).then(io::Error::last_os_error);
+    // SAFETY: as above; the wait is bounded below `INFINITE`.
+    match unsafe { WaitForSingleObject(process.as_raw_handle(), wait_millis(bound)) } {
+        WAIT_OBJECT_0 => Ok(true),
+        WAIT_TIMEOUT => refused.map_or(Ok(false), Err),
+        _ => Err(io::Error::last_os_error()),
+    }
 }
 
 /// The id of the process behind `process` (`GetProcessId`), which needs `PROCESS_QUERY_LIMITED_INFORMATION` access.
@@ -699,6 +725,8 @@ mod tests {
         assert!(same_object(taken, write.as_handle()), "the borrow is the pipe's write end");
         let file = std::fs::File::open(std::env::current_exe().expect("the test's path is read")).expect("the test's file opens");
         assert_output_refused(file.as_raw_handle().addr(), control.as_handle(), "does not name a pipe");
+        let event = event();
+        assert_output_refused(event.as_raw_handle().addr(), control.as_handle(), "does not name a pipe");
         assert_output_refused(control.as_raw_handle().addr(), control.as_handle(), "control pipe");
         let copy = control.try_clone().expect("the control handle is copied");
         assert_output_refused(copy.as_raw_handle().addr(), control.as_handle(), "control pipe");

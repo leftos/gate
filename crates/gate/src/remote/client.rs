@@ -31,6 +31,7 @@ use std::time::{Duration, Instant};
 #[cfg(feature = "test-seams")]
 use gate_args::RunRequest;
 use gate_args::TestSeams;
+use gate_desktop::version::build_version;
 use gate_state::{FallbackReason, KernelObject, key_hash};
 use gate_win32::{AcquireError, Interrupt, Job, NamedMutex, OwnedMutexGuard, PipedConsole, Running};
 use jiff::{SignedDuration, Timestamp};
@@ -61,7 +62,6 @@ use crate::outputs::archive::sent_limit;
 #[cfg(feature = "test-seams")]
 use crate::run::find_program;
 use crate::run::{CONTROL_C_EXIT, is_within, resolved};
-use crate::version::build_version;
 
 /// The statuses of a preflight whose builder has no `gate box` that takes the run: cmd's for a program it cannot find,
 /// and a gate's usage error for a payload it does not read.
