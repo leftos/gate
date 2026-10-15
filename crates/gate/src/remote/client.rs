@@ -739,8 +739,10 @@ impl Attempt<'_, '_> {
         match called.end {
             End::Status(status) => {
                 let back_commits = called.back_commits.as_deref().and_then(syncback::back_commits);
-                let target = syncback::Target::new(self.call.root, self.call.repo, &snapshot, self.call.key);
-                let synced = syncback::sync_back(self, &target, back_commits.as_deref(), status)?;
+                // The run sends no sibling snapshots, as `sibling_snapshots` above says, so its main repository alone
+                // syncs back.
+                let targets = syncback::targets(self.call, &snapshot, &[]);
+                let synced = syncback::sync_back(self, &targets, back_commits.as_deref(), status)?;
                 let brought = outputs::accepted(called.outputs_line.as_deref(), self.call.key, &nonce);
                 let ran = outputs::Ran {
                     location: &location,
@@ -1383,7 +1385,32 @@ impl Attempt<'_, '_> {
     /// git with `args` in the worktree, given the variables `set` beside the ones every call is given, among them the ssh
     /// it runs as `GIT_SSH_COMMAND` when there is one, its lines going where `echo` says, watched as `watch` says.
     pub(super) fn git(&mut self, git: &Git, args: &[String], set: &[(&str, &std::ffi::OsStr)], echo: Echo, watch: Watch) -> Result<Called, End> {
-        let mut command = git.command(Path::new(self.call.root));
+        let command = git.command(Path::new(self.call.root));
+        self.git_started(command, args, set, echo, watch)
+    }
+
+    /// git with `args` in the worktree at `folder`, a pair's sibling's among them, made as [`Attempt::git`] makes its
+    /// call, its lines kept out of the log.
+    pub(super) fn git_in(
+        &mut self,
+        folder: &Path,
+        git: &Git,
+        args: &[String],
+        set: &[(&str, &std::ffi::OsStr)],
+        watch: Watch,
+    ) -> Result<Called, End> {
+        self.git_started(git.command(folder), args, set, Echo::Unlogged, watch)
+    }
+
+    /// The git `command` with `args` and the variables `set` started as [`Attempt::git`] starts it.
+    fn git_started(
+        &mut self,
+        mut command: Command,
+        args: &[String],
+        set: &[(&str, &std::ffi::OsStr)],
+        echo: Echo,
+        watch: Watch,
+    ) -> Result<Called, End> {
         command.args(args).envs(set.iter().copied());
         let starts = Starts {
             breakaway: false,
@@ -3527,7 +3554,11 @@ mod tests {
             status: step.status,
             names_skipped: step.names_skipped,
         };
-        outputs::ended(&mut attempt, &sent, &ran, End::Status(step.synced), step.brought.as_ref());
+        let synced = crate::remote::syncback::Synced {
+            end: End::Status(step.synced),
+            reason: None,
+        };
+        outputs::ended(&mut attempt, &sent, &ran, synced, step.brought.as_ref());
         attempt.brought_back
     }
 

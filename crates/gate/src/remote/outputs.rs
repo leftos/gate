@@ -27,6 +27,7 @@ use super::client::{self, Attempt, Called, End, RawSink};
 use super::git::{FAILURE_BYTES, first_bytes};
 use super::install::{self, Fetched};
 use super::payload::Location;
+use super::syncback::Synced;
 use super::watchdog::Cut;
 use crate::boxside::payload::{archive_file_name, escaped};
 use crate::outputs::archive::final_path;
@@ -295,8 +296,8 @@ pub(super) fn marked(sent: &Sent<'_>) -> Result<(), End> {
 
 /// The end of `attempt`'s run once its sync-back ended it `synced`, its run call having ended as `ran` says, and the
 /// box having said it `brought` its outputs or not, for a run that carried `sent`: the outputs step of a run with
-/// output globs. A run whose passing status the sync-back turned to 1 says its outputs were not brought back, the
-/// worktree having changed. A passing run whose manifest was not built, or whose box said no outputs line the client
+/// output globs. A run whose passing status the sync-back turned to 1 says its outputs were not brought back, for the
+/// sync-back's reason ([`turned_reason`]). A passing run whose manifest was not built, or whose box said no outputs line the client
 /// accepts, says why and ends 1. A passing run whose box packed an archive fetches it, as [`fetched`] says. A passing
 /// run whose box packed nothing removes the pending marker and the outputs cap record ([`uncapped`]); one that cannot be
 /// removed is said, and the run's status stands. The other ends that do not reach [`fetched`] leave both.
@@ -304,20 +305,32 @@ pub(super) fn marked(sent: &Sent<'_>) -> Result<(), End> {
 /// The attempt's outputs are marked brought back only when the install ends complete, as [`install::installed`] says,
 /// or when the box packed nothing for a manifest that held files; never when the box said it skipped outputs for names
 /// this PC cannot take. Every other end marks them not brought back.
-pub(super) fn ended(attempt: &mut Attempt<'_, '_>, sent: &Sent<'_>, ran: &Ran<'_>, synced: End, brought: Option<&Brought>) -> End {
+pub(super) fn ended(attempt: &mut Attempt<'_, '_>, sent: &Sent<'_>, ran: &Ran<'_>, synced: Synced, brought: Option<&Brought>) -> End {
     let (end, complete) = step_end(attempt, sent, ran, synced, brought);
     attempt.brought_back = Some(complete && !ran.names_skipped);
     end
 }
 
+/// Why the outputs of a run whose command ended `status` were not brought back once its sync-back ended as `synced`:
+/// for a passing run the sync-back turned to 1, the sync-back's own reason, and for a single repository's, whose
+/// sync-back gives none, the worktree that changed during the run. `None` for any other end.
+fn turned_reason(status: i64, synced: &Synced) -> Option<&'static str> {
+    (status == 0 && matches!(synced.end, End::Status(1))).then(|| synced.reason.unwrap_or(WORKTREE_CHANGED))
+}
+
+/// Why a single repository's passing run that its sync-back turned to 1 brings no outputs back.
+const WORKTREE_CHANGED: &str = "the worktree changed during the run";
+
 /// The end of the outputs step [`ended`] says, and whether it left the PC every output the box packed or found the PC
 /// holding them all, the box's names skip aside.
-fn step_end(attempt: &mut Attempt<'_, '_>, sent: &Sent<'_>, ran: &Ran<'_>, synced: End, brought: Option<&Brought>) -> (End, bool) {
+fn step_end(attempt: &mut Attempt<'_, '_>, sent: &Sent<'_>, ran: &Ran<'_>, synced: Synced, brought: Option<&Brought>) -> (End, bool) {
+    let reason = turned_reason(ran.status, &synced);
+    let synced = synced.end;
     let (Some(marker), End::Status(now)) = (&sent.marker, &synced) else {
         return (synced, false);
     };
-    if ran.status == 0 && *now == 1 {
-        attempt.say(not_brought_back("the worktree changed during the run"));
+    if let Some(reason) = reason {
+        attempt.say(not_brought_back(reason));
         return (synced, false);
     }
     if *now != 0 {
@@ -701,12 +714,14 @@ mod tests {
 
     use super::{
         Archive, Brought, MANIFEST_LIMIT, NonZeroU64, PARTIAL, PAST_THE_CAP, Unbuilt, accepted, hashed, keep_outputs_line, manifest_line, pending,
-        sha256_for, within_cap,
+        sha256_for, turned_reason, within_cap,
     };
     use crate::outputs::cache::{HashCache, file_time_now};
     use crate::outputs::glob::Globs;
     use crate::outputs::hash::file_sha256;
     use crate::outputs::walk::{Found, Stamp, walk};
+    use crate::remote::client::End;
+    use crate::remote::syncback::{PAIR_NOT_APPLIED, Synced};
 
     const KEY: &str = "app-1a2b3c4d";
     const NONCE: &str = "0123456789abcdef0123456789abcdef";
@@ -734,6 +749,32 @@ mod tests {
             count,
             name: format!("{KEY}-{NONCE}.tar.zst"),
         }
+    }
+
+    #[test]
+    fn a_pair_sync_back_s_refusal_is_said_as_its_own_reason_and_a_single_repo_s_as_a_changed_worktree() {
+        let synced = |status: i64, reason: Option<&'static str>| Synced {
+            end: End::Status(status),
+            reason,
+        };
+
+        assert_eq!(
+            turned_reason(0, &synced(1, Some(PAIR_NOT_APPLIED))),
+            Some("the pair's remote changes were not applied"),
+            "a pair's refusal is not a changed worktree"
+        );
+        assert_eq!(turned_reason(0, &synced(1, None)), Some("the worktree changed during the run"));
+        assert_eq!(turned_reason(0, &synced(0, None)), None, "a passing run that synced back");
+        assert_eq!(
+            turned_reason(3, &synced(3, Some(PAIR_NOT_APPLIED))),
+            None,
+            "a failing run keeps its own status"
+        );
+        let failed = Synced {
+            end: End::Failed("git apply failed in lib".to_owned()),
+            reason: None,
+        };
+        assert_eq!(turned_reason(0, &failed), None, "a partial apply fails the run and says so itself");
     }
 
     /// A scratch folder for one test, emptied first.

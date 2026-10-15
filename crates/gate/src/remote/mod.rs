@@ -41,6 +41,7 @@ mod outputs;
 pub(crate) mod parity;
 pub(crate) mod payload;
 mod retry;
+mod sibling_lock;
 pub(crate) mod siblings;
 mod snapshot;
 mod syncback;
