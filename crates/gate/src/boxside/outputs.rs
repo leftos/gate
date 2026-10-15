@@ -7,7 +7,7 @@
 //! or after it, and removes its own when that alone is over the budget, ending the run's outputs as not brought back.
 
 use std::fs::{self, OpenOptions};
-use std::io::{self, BufRead, BufWriter, Read, Write};
+use std::io::{self, BufRead, BufWriter, Write};
 use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -70,16 +70,11 @@ impl<'a> Asked<'a> {
 /// reading more than [`MANIFEST_LIMIT`] bytes; else why it cannot be read, which the run says once its command has
 /// passed. A line that reaches the limit without its newline cannot be read. The read has no deadline: a client that
 /// stops sending is ended by its own watchdog, which closes the connection and so ends the input.
-pub(super) fn read_manifest(mut input: impl BufRead) -> Result<Manifest, String> {
-    let mut line = Vec::new();
-    input
-        .by_ref()
-        .take(MANIFEST_LIMIT)
-        .read_until(b'\n', &mut line)
-        .map_err(|error| format!("the outputs manifest could not be read: {error}"))?;
-    if !line.ends_with(b"\n") && line.len() as u64 >= MANIFEST_LIMIT {
-        return Err("the outputs manifest reaches 64 MiB without a newline".to_owned());
-    }
+pub(super) fn read_manifest(input: impl BufRead) -> Result<Manifest, String> {
+    let line = super::bounded_line(input, MANIFEST_LIMIT).map_err(|unread| match unread {
+        super::Unread::OverLimit => "the outputs manifest reaches 64 MiB without a newline".to_owned(),
+        super::Unread::Failed(error) => format!("the outputs manifest could not be read: {error}"),
+    })?;
     let line = String::from_utf8(line).map_err(|_| "the outputs manifest is not UTF-8".to_owned())?;
     Manifest::parse(&line)
 }

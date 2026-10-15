@@ -284,12 +284,14 @@ pub enum Closed {
     Stderr,
 }
 
-/// Starts `command` with stdin null and both output streams piped, dropping this process's read end of `closed` at
-/// once, so the program's next write to that stream fails; the other stream is gathered as [`start`] gathers it.
-pub fn start_with_closed(closed: Closed, mut command: Command) -> Running {
-    command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+/// Starts `command` with its stdin a pipe, whose write end it returns as [`start_with_stdin`] does, and both output
+/// streams piped, dropping this process's read end of `closed` at once, so the program's next write to that stream
+/// fails; the other stream is gathered as [`start`] gathers it.
+pub fn start_with_closed(closed: Closed, mut command: Command) -> (Running, ChildStdin) {
+    command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
     let stop_tree = stop_tree_of(&command);
     let mut child = command.spawn().expect("the program starts");
+    let stdin = child.stdin.take().expect("stdin is piped");
     let out_pipe = child.stdout.take().expect("stdout is piped");
     let err_pipe = child.stderr.take().expect("stderr is piped");
     let (stdout, stderr, reader) = match closed {
@@ -304,13 +306,14 @@ pub fn start_with_closed(closed: Closed, mut command: Command) -> Running {
             (stdout, Buffer::default(), reader)
         }
     };
-    Running {
+    let running = Running {
         child,
         stdout,
         stderr,
         readers: vec![reader],
         stop_tree,
-    }
+    };
+    (running, stdin)
 }
 
 /// A stream's bytes so far, shared with the thread that reads it.

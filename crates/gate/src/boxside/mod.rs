@@ -15,17 +15,24 @@ mod run;
 mod stop;
 mod tools;
 
+use std::ffi::OsStr;
+use std::io::{self, BufRead, Read};
+
 use gate_args::{BoxRequest, BoxVerb};
 
 use crate::answer::{FAILED_STATUS, USAGE_STATUS};
 use crate::boxside::payload::Payload;
 use crate::console::Console;
 
-/// Decodes the payload, then answers the verb through `console` and returns the exit status. The payload is decoded
-/// before the verb is read, in the wrapper's order, so a payload that is not base64 JSON fails every verb; here it is
-/// a usage error (exit 2), where the wrapper, stopping on the error, exits 1.
+/// The most bytes the request line on stdin may take, its newline included.
+const REQUEST_LIMIT: u64 = 16 * 1024 * 1024;
+
+/// Reads the request from stdin's first line and decodes it, then answers the verb through `console` and returns the
+/// exit status. The request is read before the verb is, and before any lock is taken, so a client that stalls holds
+/// nothing, and one missing or not base64 JSON fails every verb; here it is a usage error (exit 2), where the wrapper,
+/// stopping on the error, exits 1. `run` reads its outputs manifest from the same stdin, as its next line.
 pub(crate) fn answer(request: &BoxRequest, console: &mut Console) -> u32 {
-    let payload = match Payload::decode(&request.payload) {
+    let payload = match read_request(io::stdin().lock()) {
         Ok(payload) => payload,
         Err(line) => {
             console.err(&line);
@@ -40,6 +47,47 @@ pub(crate) fn answer(request: &BoxRequest, console: &mut Console) -> u32 {
         BoxVerb::Outputs => outputs::outputs(&payload, console),
         BoxVerb::Inflight => inflight::inflight(&payload, console),
     }
+}
+
+/// The request on `input`'s first line, decoded; else the usage line saying why it cannot be read. The line ends at its
+/// newline or at the end of the input, and one newline (and a carriage return before it) is not part of it. The read
+/// has no deadline: a client that stops sending is ended by its own watchdog, which closes the connection.
+fn read_request(input: impl BufRead) -> Result<Payload, String> {
+    let mut line = match bounded_line(input, REQUEST_LIMIT) {
+        Ok(line) if line.is_empty() => return Err("gate: the box request is missing on standard input".to_owned()),
+        Ok(line) => line,
+        Err(Unread::OverLimit) => return Err("gate: the box request on standard input reaches 16 MiB without a newline".to_owned()),
+        Err(Unread::Failed(error)) => return Err(format!("gate: the box request on standard input could not be read: {error}")),
+    };
+    if line.ends_with(b"\n") {
+        line.pop();
+        if line.ends_with(b"\r") {
+            line.pop();
+        }
+    }
+    // Bytes that are not UTF-8 are never base64, so their replacement characters are refused as base64 is.
+    Payload::decode(OsStr::new(String::from_utf8_lossy(&line).as_ref()))
+}
+
+/// Why a line could not be read.
+#[derive(Debug)]
+enum Unread {
+    /// The line reached its limit without a newline.
+    OverLimit,
+    /// The input failed.
+    Failed(io::Error),
+}
+
+/// The next line of `input`, up to and with its newline, or to the end of the input; empty at the end of the input. It
+/// never waits past the newline and never reads more than `limit` bytes: a line that reaches `limit` without its
+/// newline cannot be read.
+fn bounded_line(mut input: impl BufRead, limit: u64) -> Result<Vec<u8>, Unread> {
+    let mut line = Vec::new();
+    input.by_ref().take(limit).read_until(b'\n', &mut line).map_err(Unread::Failed)?;
+    if !line.ends_with(b"\n") && line.len() as u64 >= limit {
+        return Err(Unread::OverLimit);
+    }
+    Ok(line)
 }
 
 /// The status of `gate box boot`: 0 when the boot time was read, `FAILED_STATUS` when it was not, so a boot query the

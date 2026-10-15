@@ -720,11 +720,11 @@ fn the_remote_timeout_seam_needs_a_watched_call_other_than_run() {
 fn box_seams_of_the_ceiling_refuse_a_bad_missing_or_repeated_value() {
     let rows: [(&[&str], &[&str]); 14] = [
         (
-            &["box", "--test-box-kill-leaves", "0", "run", "e30="],
+            &["box", "--test-box-kill-leaves", "0", "run", "--stdin"],
             &["gate: --test-box-kill-leaves must be a whole number above 0, got '0'"],
         ),
         (
-            &["box", "--test-box-kill-leaves=", "run", "e30="],
+            &["box", "--test-box-kill-leaves=", "run", "--stdin"],
             &["gate: --test-box-kill-leaves needs a value"],
         ),
         (
@@ -732,41 +732,41 @@ fn box_seams_of_the_ceiling_refuse_a_bad_missing_or_repeated_value() {
             &["gate: --test-box-kill-leaves needs a value", BOX_USAGE],
         ),
         (
-            &["box", "--test-box-kill-leaves", "1", "--test-box-kill-leaves=2", "run", "e30="],
+            &["box", "--test-box-kill-leaves", "1", "--test-box-kill-leaves=2", "run", "--stdin"],
             &["gate: --test-box-kill-leaves is given twice"],
         ),
-        (&["box", "run", "--test-box-kill-leaves", "1", "e30="], &[BOX_USAGE]),
+        (&["box", "run", "--test-box-kill-leaves", "1", "--stdin"], &[BOX_USAGE]),
         (
-            &["box", "--test-box-sample-ms", "0", "run", "e30="],
+            &["box", "--test-box-sample-ms", "0", "run", "--stdin"],
             &["gate: --test-box-sample-ms must be a whole number above 0, got '0'"],
         ),
         (
-            &["box", "--test-box-sample-ms=", "run", "e30="],
+            &["box", "--test-box-sample-ms=", "run", "--stdin"],
             &["gate: --test-box-sample-ms needs a value"],
         ),
         (&["box", "--test-box-sample-ms"], &["gate: --test-box-sample-ms needs a value", BOX_USAGE]),
         (
-            &["box", "--test-box-sample-ms", "1", "--test-box-sample-ms=2", "run", "e30="],
+            &["box", "--test-box-sample-ms", "1", "--test-box-sample-ms=2", "run", "--stdin"],
             &["gate: --test-box-sample-ms is given twice"],
         ),
         (
-            &["box", "--test-box-sampler-fail", "maybe", "run", "e30="],
+            &["box", "--test-box-sampler-fail", "maybe", "run", "--stdin"],
             &["gate: --test-box-sampler-fail takes true or false, got 'maybe'"],
         ),
         (
-            &["box", "--test-box-free-percent", "0", "run", "e30="],
+            &["box", "--test-box-free-percent", "0", "run", "--stdin"],
             &["gate: --test-box-free-percent must be a whole number from 1 to 100, got '0'"],
         ),
         (
-            &["box", "--test-box-free-percent", "101", "run", "e30="],
+            &["box", "--test-box-free-percent", "101", "run", "--stdin"],
             &["gate: --test-box-free-percent must be a whole number from 1 to 100, got '101'"],
         ),
         (
-            &["box", "--test-box-free-percent", "5", "--test-box-free-percent=6", "run", "e30="],
+            &["box", "--test-box-free-percent", "5", "--test-box-free-percent=6", "run", "--stdin"],
             &["gate: --test-box-free-percent is given twice"],
         ),
         (
-            &["box", "--test-box-free-percent=", "run", "e30="],
+            &["box", "--test-box-free-percent=", "run", "--stdin"],
             &["gate: --test-box-free-percent needs a value"],
         ),
     ];
@@ -778,8 +778,6 @@ fn box_seams_of_the_ceiling_refuse_a_bad_missing_or_repeated_value() {
 #[cfg(feature = "test-seams")]
 #[test]
 fn box_seams_of_the_ceiling_are_read_before_the_verb() {
-    use std::ffi::OsString;
-
     use gate_args::{BoxRequest, BoxSeams, BoxVerb, Invocation};
 
     use crate::support::invocation;
@@ -794,11 +792,10 @@ fn box_seams_of_the_ceiling_are_read_before_the_verb() {
             "5",
             "--test-box-kill-leaves=3",
             "run",
-            "e30="
+            "--stdin"
         ]),
         Invocation::Box(BoxRequest {
             verb: BoxVerb::Run,
-            payload: OsString::from("e30="),
             seams: BoxSeams {
                 sample_ms: Some(20),
                 sampler_fail: true,
@@ -822,13 +819,11 @@ fn the_bridge_seams_are_unknown_options() {
 }
 
 /// The one line a malformed `gate box` prints.
-const BOX_USAGE: &str = "usage: gate box preflight|run|stop|boot|outputs|inflight <base64 JSON payload>";
+const BOX_USAGE: &str = "usage: gate box preflight|run|stop|boot|outputs|inflight --stdin (the base64 JSON request as stdin's first line)";
 
 #[cfg(feature = "test-seams")]
 #[test]
 fn box_seam_heartbeat_ms_is_read_before_the_verb() {
-    use std::ffi::OsString;
-
     use gate_args::{BoxRequest, BoxSeams, BoxVerb, Invocation};
 
     use crate::support::invocation;
@@ -836,18 +831,17 @@ fn box_seam_heartbeat_ms_is_read_before_the_verb() {
     let beating = |heartbeat_ms| {
         Invocation::Box(BoxRequest {
             verb: BoxVerb::Run,
-            payload: OsString::from("e30="),
             seams: BoxSeams {
                 heartbeat_ms,
                 ..BoxSeams::default()
             },
         })
     };
-    assert_eq!(invocation(&["box", "--test-heartbeat-ms", "30", "run", "e30="]), beating(Some(30)));
-    assert_eq!(invocation(&["box", "--test-heartbeat-ms=45", "run", "e30="]), beating(Some(45)));
-    assert_eq!(invocation(&["box", "run", "e30="]), beating(None), "no seam given, none set");
+    assert_eq!(invocation(&["box", "--test-heartbeat-ms", "30", "run", "--stdin"]), beating(Some(30)));
+    assert_eq!(invocation(&["box", "--test-heartbeat-ms=45", "run", "--stdin"]), beating(Some(45)));
+    assert_eq!(invocation(&["box", "run", "--stdin"]), beating(None), "no seam given, none set");
     assert_eq!(
-        invocation(&["box", "--test-heartbeat-ms", "2147483647", "run", "e30="]),
+        invocation(&["box", "--test-heartbeat-ms", "2147483647", "run", "--stdin"]),
         beating(Some(2_147_483_647))
     );
 }
@@ -857,33 +851,33 @@ fn box_seam_heartbeat_ms_is_read_before_the_verb() {
 fn box_seam_heartbeat_ms_refuses_what_the_run_seams_refuse() {
     let rows: [(&[&str], &[&str]); 10] = [
         (
-            &["box", "--test-heartbeat-ms", "--test-heartbeat-ms=2", "run", "e30="],
+            &["box", "--test-heartbeat-ms", "--test-heartbeat-ms=2", "run", "--stdin"],
             &["gate: --test-heartbeat-ms needs a value", "gate: --test-heartbeat-ms is given twice"],
         ),
         (
-            &["box", "--test-heartbeat-ms=", "run", "e30="],
+            &["box", "--test-heartbeat-ms=", "run", "--stdin"],
             &["gate: --test-heartbeat-ms needs a value"],
         ),
         (
-            &["box", "--test-heartbeat-ms", "0", "run", "e30="],
+            &["box", "--test-heartbeat-ms", "0", "run", "--stdin"],
             &["gate: --test-heartbeat-ms must be a whole number above 0, got '0'"],
         ),
         (
-            &["box", "--test-heartbeat-ms", "fast", "run", "e30="],
+            &["box", "--test-heartbeat-ms", "fast", "run", "--stdin"],
             &["gate: --test-heartbeat-ms must be a whole number above 0, got 'fast'"],
         ),
         (
-            &["box", "--test-heartbeat-ms", "2147483648", "run", "e30="],
+            &["box", "--test-heartbeat-ms", "2147483648", "run", "--stdin"],
             &["gate: --test-heartbeat-ms must be at most 2147483647, got '2147483648'"],
         ),
         (
-            &["box", "--test-heartbeat-ms", "1", "--test-heartbeat-ms=2", "run", "e30="],
+            &["box", "--test-heartbeat-ms", "1", "--test-heartbeat-ms=2", "run", "--stdin"],
             &["gate: --test-heartbeat-ms is given twice"],
         ),
         (&["box", "--test-heartbeat-ms"], &["gate: --test-heartbeat-ms needs a value", BOX_USAGE]),
-        (&["box", "run", "--test-heartbeat-ms", "30", "e30="], &[BOX_USAGE]),
-        (&["box", "--test-heartbeat-msx", "30", "run", "e30="], &[BOX_USAGE]),
-        (&["box", "--test-sample-ms", "30", "run", "e30="], &[BOX_USAGE]),
+        (&["box", "run", "--test-heartbeat-ms", "30", "--stdin"], &[BOX_USAGE]),
+        (&["box", "--test-heartbeat-msx", "30", "run", "--stdin"], &[BOX_USAGE]),
+        (&["box", "--test-sample-ms", "30", "run", "--stdin"], &[BOX_USAGE]),
     ];
     for (words, want) in rows {
         assert_eq!(problems(words), want, "{words:?}");
@@ -893,15 +887,13 @@ fn box_seam_heartbeat_ms_refuses_what_the_run_seams_refuse() {
 #[cfg(not(feature = "test-seams"))]
 #[test]
 fn box_seam_heartbeat_ms_is_an_unknown_word_without_the_feature() {
-    assert_eq!(problems(&["box", "--test-heartbeat-ms", "30", "run", "e30="]), [BOX_USAGE]);
-    assert_eq!(problems(&["box", "--test-heartbeat-ms=30", "run", "e30="]), [BOX_USAGE]);
+    assert_eq!(problems(&["box", "--test-heartbeat-ms", "30", "run", "--stdin"]), [BOX_USAGE]);
+    assert_eq!(problems(&["box", "--test-heartbeat-ms=30", "run", "--stdin"]), [BOX_USAGE]);
 }
 
 #[cfg(feature = "test-seams")]
 #[test]
 fn box_seam_outputs_budget_bytes_is_read_before_the_verb() {
-    use std::ffi::OsString;
-
     use gate_args::{BoxRequest, BoxSeams, BoxVerb, Invocation};
 
     use crate::support::invocation;
@@ -909,7 +901,6 @@ fn box_seam_outputs_budget_bytes_is_read_before_the_verb() {
     let budgeted = |outputs_budget_bytes| {
         Invocation::Box(BoxRequest {
             verb: BoxVerb::Run,
-            payload: OsString::from("e30="),
             seams: BoxSeams {
                 outputs_budget_bytes,
                 ..BoxSeams::default()
@@ -917,16 +908,16 @@ fn box_seam_outputs_budget_bytes_is_read_before_the_verb() {
         })
     };
     assert_eq!(
-        invocation(&["box", "--test-outputs-budget-bytes", "1024", "run", "e30="]),
+        invocation(&["box", "--test-outputs-budget-bytes", "1024", "run", "--stdin"]),
         budgeted(Some(1024))
     );
     assert_eq!(
-        invocation(&["box", "--test-outputs-budget-bytes=1024", "run", "e30="]),
+        invocation(&["box", "--test-outputs-budget-bytes=1024", "run", "--stdin"]),
         budgeted(Some(1024))
     );
-    assert_eq!(invocation(&["box", "run", "e30="]), budgeted(None), "no seam given, none set");
+    assert_eq!(invocation(&["box", "run", "--stdin"]), budgeted(None), "no seam given, none set");
     assert_eq!(
-        invocation(&["box", "--test-outputs-budget-bytes", "2147483647", "run", "e30="]),
+        invocation(&["box", "--test-outputs-budget-bytes", "2147483647", "run", "--stdin"]),
         budgeted(Some(2_147_483_647))
     );
 }
@@ -936,30 +927,37 @@ fn box_seam_outputs_budget_bytes_is_read_before_the_verb() {
 fn box_seam_outputs_budget_bytes_refuses_what_the_run_seams_refuse() {
     let rows: [(&[&str], &[&str]); 7] = [
         (
-            &["box", "--test-outputs-budget-bytes", "--test-outputs-budget-bytes=2", "run", "e30="],
+            &["box", "--test-outputs-budget-bytes", "--test-outputs-budget-bytes=2", "run", "--stdin"],
             &[
                 "gate: --test-outputs-budget-bytes needs a value",
                 "gate: --test-outputs-budget-bytes is given twice",
             ],
         ),
         (
-            &["box", "--test-outputs-budget-bytes=", "run", "e30="],
+            &["box", "--test-outputs-budget-bytes=", "run", "--stdin"],
             &["gate: --test-outputs-budget-bytes needs a value"],
         ),
         (
-            &["box", "--test-outputs-budget-bytes", "0", "run", "e30="],
+            &["box", "--test-outputs-budget-bytes", "0", "run", "--stdin"],
             &["gate: --test-outputs-budget-bytes must be a whole number above 0, got '0'"],
         ),
         (
-            &["box", "--test-outputs-budget-bytes", "fast", "run", "e30="],
+            &["box", "--test-outputs-budget-bytes", "fast", "run", "--stdin"],
             &["gate: --test-outputs-budget-bytes must be a whole number above 0, got 'fast'"],
         ),
         (
-            &["box", "--test-outputs-budget-bytes", "2147483648", "run", "e30="],
+            &["box", "--test-outputs-budget-bytes", "2147483648", "run", "--stdin"],
             &["gate: --test-outputs-budget-bytes must be at most 2147483647, got '2147483648'"],
         ),
         (
-            &["box", "--test-outputs-budget-bytes", "1", "--test-outputs-budget-bytes=2", "run", "e30="],
+            &[
+                "box",
+                "--test-outputs-budget-bytes",
+                "1",
+                "--test-outputs-budget-bytes=2",
+                "run",
+                "--stdin",
+            ],
             &["gate: --test-outputs-budget-bytes is given twice"],
         ),
         (
@@ -975,15 +973,13 @@ fn box_seam_outputs_budget_bytes_refuses_what_the_run_seams_refuse() {
 #[cfg(not(feature = "test-seams"))]
 #[test]
 fn box_seam_outputs_budget_bytes_is_an_unknown_word_without_the_feature() {
-    assert_eq!(problems(&["box", "--test-outputs-budget-bytes", "30", "run", "e30="]), [BOX_USAGE]);
-    assert_eq!(problems(&["box", "--test-outputs-budget-bytes=30", "run", "e30="]), [BOX_USAGE]);
+    assert_eq!(problems(&["box", "--test-outputs-budget-bytes", "30", "run", "--stdin"]), [BOX_USAGE]);
+    assert_eq!(problems(&["box", "--test-outputs-budget-bytes=30", "run", "--stdin"]), [BOX_USAGE]);
 }
 
 #[cfg(feature = "test-seams")]
 #[test]
 fn box_seam_dotnet_limit_ms_is_read_before_the_verb() {
-    use std::ffi::OsString;
-
     use gate_args::{BoxRequest, BoxSeams, BoxVerb, Invocation};
 
     use crate::support::invocation;
@@ -991,7 +987,6 @@ fn box_seam_dotnet_limit_ms_is_read_before_the_verb() {
     let limited = |dotnet_limit_ms| {
         Invocation::Box(BoxRequest {
             verb: BoxVerb::Preflight,
-            payload: OsString::from("e30="),
             seams: BoxSeams {
                 dotnet_limit_ms,
                 ..BoxSeams::default()
@@ -999,14 +994,14 @@ fn box_seam_dotnet_limit_ms_is_read_before_the_verb() {
         })
     };
     assert_eq!(
-        invocation(&["box", "--test-dotnet-limit-ms", "1000", "preflight", "e30="]),
+        invocation(&["box", "--test-dotnet-limit-ms", "1000", "preflight", "--stdin"]),
         limited(Some(1000))
     );
     assert_eq!(
-        invocation(&["box", "--test-dotnet-limit-ms=1500", "preflight", "e30="]),
+        invocation(&["box", "--test-dotnet-limit-ms=1500", "preflight", "--stdin"]),
         limited(Some(1500))
     );
-    assert_eq!(invocation(&["box", "preflight", "e30="]), limited(None), "no seam given, none set");
+    assert_eq!(invocation(&["box", "preflight", "--stdin"]), limited(None), "no seam given, none set");
 }
 
 #[cfg(feature = "test-seams")]
@@ -1014,19 +1009,19 @@ fn box_seam_dotnet_limit_ms_is_read_before_the_verb() {
 fn box_seam_dotnet_limit_ms_refuses_what_the_run_seams_refuse() {
     let rows: [(&[&str], &[&str]); 5] = [
         (
-            &["box", "--test-dotnet-limit-ms", "1", "--test-dotnet-limit-ms=2", "preflight", "e30="],
+            &["box", "--test-dotnet-limit-ms", "1", "--test-dotnet-limit-ms=2", "preflight", "--stdin"],
             &["gate: --test-dotnet-limit-ms is given twice"],
         ),
         (
-            &["box", "--test-dotnet-limit-ms", "0", "preflight", "e30="],
+            &["box", "--test-dotnet-limit-ms", "0", "preflight", "--stdin"],
             &["gate: --test-dotnet-limit-ms must be a whole number above 0, got '0'"],
         ),
         (
-            &["box", "--test-dotnet-limit-ms", "fast", "preflight", "e30="],
+            &["box", "--test-dotnet-limit-ms", "fast", "preflight", "--stdin"],
             &["gate: --test-dotnet-limit-ms must be a whole number above 0, got 'fast'"],
         ),
         (
-            &["box", "--test-dotnet-limit-ms=", "preflight", "e30="],
+            &["box", "--test-dotnet-limit-ms=", "preflight", "--stdin"],
             &["gate: --test-dotnet-limit-ms needs a value"],
         ),
         (
@@ -1042,15 +1037,13 @@ fn box_seam_dotnet_limit_ms_refuses_what_the_run_seams_refuse() {
 #[cfg(not(feature = "test-seams"))]
 #[test]
 fn box_seam_dotnet_limit_ms_is_an_unknown_word_without_the_feature() {
-    assert_eq!(problems(&["box", "--test-dotnet-limit-ms", "1000", "preflight", "e30="]), [BOX_USAGE]);
-    assert_eq!(problems(&["box", "--test-dotnet-limit-ms=1000", "preflight", "e30="]), [BOX_USAGE]);
+    assert_eq!(problems(&["box", "--test-dotnet-limit-ms", "1000", "preflight", "--stdin"]), [BOX_USAGE]);
+    assert_eq!(problems(&["box", "--test-dotnet-limit-ms=1000", "preflight", "--stdin"]), [BOX_USAGE]);
 }
 
 #[cfg(feature = "test-seams")]
 #[test]
 fn box_seam_probe_limit_ms_is_read_before_the_verb() {
-    use std::ffi::OsString;
-
     use gate_args::{BoxRequest, BoxSeams, BoxVerb, Invocation};
 
     use crate::support::invocation;
@@ -1058,7 +1051,6 @@ fn box_seam_probe_limit_ms_is_read_before_the_verb() {
     let limited = |probe_limit_ms| {
         Invocation::Box(BoxRequest {
             verb: BoxVerb::Preflight,
-            payload: OsString::from("e30="),
             seams: BoxSeams {
                 probe_limit_ms,
                 ..BoxSeams::default()
@@ -1066,14 +1058,14 @@ fn box_seam_probe_limit_ms_is_read_before_the_verb() {
         })
     };
     assert_eq!(
-        invocation(&["box", "--test-probe-limit-ms", "200", "preflight", "e30="]),
+        invocation(&["box", "--test-probe-limit-ms", "200", "preflight", "--stdin"]),
         limited(Some(200))
     );
     assert_eq!(
-        invocation(&["box", "--test-probe-limit-ms=1500", "preflight", "e30="]),
+        invocation(&["box", "--test-probe-limit-ms=1500", "preflight", "--stdin"]),
         limited(Some(1500))
     );
-    assert_eq!(invocation(&["box", "preflight", "e30="]), limited(None), "no seam given, none set");
+    assert_eq!(invocation(&["box", "preflight", "--stdin"]), limited(None), "no seam given, none set");
 }
 
 #[cfg(feature = "test-seams")]
@@ -1081,19 +1073,19 @@ fn box_seam_probe_limit_ms_is_read_before_the_verb() {
 fn box_seam_probe_limit_ms_refuses_what_the_dotnet_limit_refuses() {
     let rows: [(&[&str], &[&str]); 5] = [
         (
-            &["box", "--test-probe-limit-ms", "1", "--test-probe-limit-ms=2", "preflight", "e30="],
+            &["box", "--test-probe-limit-ms", "1", "--test-probe-limit-ms=2", "preflight", "--stdin"],
             &["gate: --test-probe-limit-ms is given twice"],
         ),
         (
-            &["box", "--test-probe-limit-ms", "0", "preflight", "e30="],
+            &["box", "--test-probe-limit-ms", "0", "preflight", "--stdin"],
             &["gate: --test-probe-limit-ms must be a whole number above 0, got '0'"],
         ),
         (
-            &["box", "--test-probe-limit-ms", "fast", "preflight", "e30="],
+            &["box", "--test-probe-limit-ms", "fast", "preflight", "--stdin"],
             &["gate: --test-probe-limit-ms must be a whole number above 0, got 'fast'"],
         ),
         (
-            &["box", "--test-probe-limit-ms=", "preflight", "e30="],
+            &["box", "--test-probe-limit-ms=", "preflight", "--stdin"],
             &["gate: --test-probe-limit-ms needs a value"],
         ),
         (
@@ -1118,27 +1110,20 @@ fn the_probe_limit_seam_is_refused_outside_gate_box() {
 #[cfg(not(feature = "test-seams"))]
 #[test]
 fn box_seam_probe_limit_ms_is_an_unknown_word_without_the_feature() {
-    assert_eq!(problems(&["box", "--test-probe-limit-ms", "1000", "preflight", "e30="]), [BOX_USAGE]);
-    assert_eq!(problems(&["box", "--test-probe-limit-ms=1000", "preflight", "e30="]), [BOX_USAGE]);
+    assert_eq!(problems(&["box", "--test-probe-limit-ms", "1000", "preflight", "--stdin"]), [BOX_USAGE]);
+    assert_eq!(problems(&["box", "--test-probe-limit-ms=1000", "preflight", "--stdin"]), [BOX_USAGE]);
 }
 
 #[cfg(feature = "test-seams")]
 #[test]
 fn box_seam_console_and_park_launch_are_read_before_the_verb() {
-    use std::ffi::OsString;
     use std::path::PathBuf;
 
     use gate_args::{BoxRequest, BoxSeams, BoxVerb, Invocation};
 
     use crate::support::invocation;
 
-    let running = |seams| {
-        Invocation::Box(BoxRequest {
-            verb: BoxVerb::Run,
-            payload: OsString::from("e30="),
-            seams,
-        })
-    };
+    let running = |seams| Invocation::Box(BoxRequest { verb: BoxVerb::Run, seams });
     let failing = || BoxSeams {
         fail_console: true,
         ..BoxSeams::default()
@@ -1148,16 +1133,19 @@ fn box_seam_console_and_park_launch_are_read_before_the_verb() {
         ..BoxSeams::default()
     };
     assert_eq!(
-        invocation(&["box", "--test-box-console", "fail-before", "run", "e30="]),
+        invocation(&["box", "--test-box-console", "fail-before", "run", "--stdin"]),
         running(failing())
     );
-    assert_eq!(invocation(&["box", "--test-box-console=fail-before", "run", "e30="]), running(failing()));
     assert_eq!(
-        invocation(&["box", "--test-box-park-launch", r"X:\case\park", "run", "e30="]),
+        invocation(&["box", "--test-box-console=fail-before", "run", "--stdin"]),
+        running(failing())
+    );
+    assert_eq!(
+        invocation(&["box", "--test-box-park-launch", r"X:\case\park", "run", "--stdin"]),
         running(parked())
     );
     assert_eq!(
-        invocation(&["box", "--test-box-park-launch=X:\\case\\park", "run", "e30="]),
+        invocation(&["box", "--test-box-park-launch=X:\\case\\park", "run", "--stdin"]),
         running(parked())
     );
     assert_eq!(
@@ -1170,11 +1158,10 @@ fn box_seam_console_and_park_launch_are_read_before_the_verb() {
             "--test-box-console",
             "fail-before",
             "stop",
-            "e30="
+            "--stdin"
         ]),
         Invocation::Box(BoxRequest {
             verb: BoxVerb::Stop,
-            payload: OsString::from("e30="),
             seams: BoxSeams {
                 heartbeat_ms: Some(30),
                 fail_console: true,
@@ -1195,23 +1182,23 @@ fn box_seam_console_and_park_launch_are_read_before_the_verb() {
 fn box_seam_console_and_park_launch_refuse_a_bad_missing_or_repeated_value() {
     let rows: [(&[&str], &[&str]); 12] = [
         (
-            &["box", "--test-box-console", "fail-sideways", "run", "e30="],
+            &["box", "--test-box-console", "fail-sideways", "run", "--stdin"],
             &["gate: --test-box-console must be fail-before, got 'fail-sideways'"],
         ),
         (
-            &["box", "--test-box-console", "fail-after", "run", "e30="],
+            &["box", "--test-box-console", "fail-after", "run", "--stdin"],
             &["gate: --test-box-console must be fail-before, got 'fail-after'"],
         ),
         (
-            &["box", "--test-box-console", "FAIL-BEFORE", "run", "e30="],
+            &["box", "--test-box-console", "FAIL-BEFORE", "run", "--stdin"],
             &["gate: --test-box-console must be fail-before, got 'FAIL-BEFORE'"],
         ),
         (
-            &["box", "--test-box-console=", "run", "e30="],
+            &["box", "--test-box-console=", "run", "--stdin"],
             &["gate: --test-box-console needs a value"],
         ),
         (
-            &["box", "--test-box-console", "--test-box-park-launch", "p", "run", "e30="],
+            &["box", "--test-box-console", "--test-box-park-launch", "p", "run", "--stdin"],
             &["gate: --test-box-console needs a value"],
         ),
         (
@@ -1221,25 +1208,25 @@ fn box_seam_console_and_park_launch_refuse_a_bad_missing_or_repeated_value() {
                 "fail-before",
                 "--test-box-console=fail-before",
                 "run",
-                "e30=",
+                "--stdin",
             ],
             &["gate: --test-box-console is given twice"],
         ),
         (
-            &["box", "--test-box-park-launch=", "run", "e30="],
+            &["box", "--test-box-park-launch=", "run", "--stdin"],
             &["gate: --test-box-park-launch needs a value"],
         ),
         (
-            &["box", "--test-box-park-launch", "--test-heartbeat-ms", "30", "run", "e30="],
+            &["box", "--test-box-park-launch", "--test-heartbeat-ms", "30", "run", "--stdin"],
             &["gate: --test-box-park-launch needs a value"],
         ),
         (
-            &["box", "--test-box-park-launch", "a", "--test-box-park-launch=b", "run", "e30="],
+            &["box", "--test-box-park-launch", "a", "--test-box-park-launch=b", "run", "--stdin"],
             &["gate: --test-box-park-launch is given twice"],
         ),
-        (&["box", "--test-box-park-restart", "p", "run", "e30="], &[BOX_USAGE]),
-        (&["box", "run", "--test-box-console", "fail-before", "e30="], &[BOX_USAGE]),
-        (&["box", "--test-box-consolex", "fail-before", "run", "e30="], &[BOX_USAGE]),
+        (&["box", "--test-box-park-restart", "p", "run", "--stdin"], &[BOX_USAGE]),
+        (&["box", "run", "--test-box-console", "fail-before", "--stdin"], &[BOX_USAGE]),
+        (&["box", "--test-box-consolex", "fail-before", "run", "--stdin"], &[BOX_USAGE]),
     ];
     for (words, want) in rows {
         assert_eq!(problems(words), want, "{words:?}");
@@ -1249,46 +1236,50 @@ fn box_seam_console_and_park_launch_refuse_a_bad_missing_or_repeated_value() {
 #[cfg(not(feature = "test-seams"))]
 #[test]
 fn box_seam_console_and_park_launch_are_unknown_words_without_the_feature() {
-    assert_eq!(problems(&["box", "--test-box-console", "fail-before", "run", "e30="]), [BOX_USAGE]);
-    assert_eq!(problems(&["box", "--test-box-console=fail-before", "run", "e30="]), [BOX_USAGE]);
-    assert_eq!(problems(&["box", "--test-box-park-launch", "park", "run", "e30="]), [BOX_USAGE]);
-    assert_eq!(problems(&["box", "--test-box-park-launch=park", "run", "e30="]), [BOX_USAGE]);
+    assert_eq!(problems(&["box", "--test-box-console", "fail-before", "run", "--stdin"]), [BOX_USAGE]);
+    assert_eq!(problems(&["box", "--test-box-console=fail-before", "run", "--stdin"]), [BOX_USAGE]);
+    assert_eq!(problems(&["box", "--test-box-park-launch", "park", "run", "--stdin"]), [BOX_USAGE]);
+    assert_eq!(problems(&["box", "--test-box-park-launch=park", "run", "--stdin"]), [BOX_USAGE]);
     for (seam, value) in [
         ("--test-box-sample-ms", "20"),
         ("--test-box-sampler-fail", "true"),
         ("--test-box-free-percent", "5"),
         ("--test-box-kill-leaves", "1"),
     ] {
-        assert_eq!(problems(&["box", seam, value, "run", "e30="]), [BOX_USAGE], "{seam}");
+        assert_eq!(problems(&["box", seam, value, "run", "--stdin"]), [BOX_USAGE], "{seam}");
         let joined = format!("{seam}={value}");
-        assert_eq!(problems(&["box", joined.as_str(), "run", "e30="]), [BOX_USAGE], "{joined}");
+        assert_eq!(problems(&["box", joined.as_str(), "run", "--stdin"]), [BOX_USAGE], "{joined}");
     }
 }
 
 #[cfg(feature = "test-seams")]
 #[test]
 fn box_seam_token_is_read_before_the_verb() {
-    use std::ffi::OsString;
-
     use gate_args::{BoxRequest, BoxSeams, BoxVerb, Invocation};
 
     use crate::support::invocation;
 
     let refused = Invocation::Box(BoxRequest {
         verb: BoxVerb::Run,
-        payload: OsString::from("e30="),
         seams: BoxSeams {
             refuse_token: true,
             ..BoxSeams::default()
         },
     });
-    assert_eq!(invocation(&["box", "--test-box-token", "refused", "run", "e30="]), refused);
-    assert_eq!(invocation(&["box", "--test-box-token=refused", "run", "e30="]), refused);
+    assert_eq!(invocation(&["box", "--test-box-token", "refused", "run", "--stdin"]), refused);
+    assert_eq!(invocation(&["box", "--test-box-token=refused", "run", "--stdin"]), refused);
     assert_eq!(
-        invocation(&["box", "--test-box-console", "fail-before", "--test-box-token", "refused", "run", "e30="]),
+        invocation(&[
+            "box",
+            "--test-box-console",
+            "fail-before",
+            "--test-box-token",
+            "refused",
+            "run",
+            "--stdin"
+        ]),
         Invocation::Box(BoxRequest {
             verb: BoxVerb::Run,
-            payload: OsString::from("e30="),
             seams: BoxSeams {
                 fail_console: true,
                 refuse_token: true,
@@ -1304,23 +1295,23 @@ fn box_seam_token_is_read_before_the_verb() {
 fn box_seam_token_refuses_a_bad_missing_or_repeated_value() {
     let rows: [(&[&str], &[&str]); 6] = [
         (
-            &["box", "--test-box-token", "accepted", "run", "e30="],
+            &["box", "--test-box-token", "accepted", "run", "--stdin"],
             &["gate: --test-box-token must be refused, got 'accepted'"],
         ),
         (
-            &["box", "--test-box-token", "REFUSED", "run", "e30="],
+            &["box", "--test-box-token", "REFUSED", "run", "--stdin"],
             &["gate: --test-box-token must be refused, got 'REFUSED'"],
         ),
-        (&["box", "--test-box-token=", "run", "e30="], &["gate: --test-box-token needs a value"]),
+        (&["box", "--test-box-token=", "run", "--stdin"], &["gate: --test-box-token needs a value"]),
         (
-            &["box", "--test-box-token", "--test-box-console", "fail-before", "run", "e30="],
+            &["box", "--test-box-token", "--test-box-console", "fail-before", "run", "--stdin"],
             &["gate: --test-box-token needs a value"],
         ),
         (
-            &["box", "--test-box-token", "refused", "--test-box-token=refused", "run", "e30="],
+            &["box", "--test-box-token", "refused", "--test-box-token=refused", "run", "--stdin"],
             &["gate: --test-box-token is given twice"],
         ),
-        (&["box", "run", "--test-box-token", "refused", "e30="], &[BOX_USAGE]),
+        (&["box", "run", "--test-box-token", "refused", "--stdin"], &[BOX_USAGE]),
     ];
     for (words, want) in rows {
         assert_eq!(problems(words), want, "{words:?}");
@@ -1330,8 +1321,8 @@ fn box_seam_token_refuses_a_bad_missing_or_repeated_value() {
 #[cfg(not(feature = "test-seams"))]
 #[test]
 fn box_seam_token_is_an_unknown_word_without_the_feature() {
-    assert_eq!(problems(&["box", "--test-box-token", "refused", "run", "e30="]), [BOX_USAGE]);
-    assert_eq!(problems(&["box", "--test-box-token=refused", "run", "e30="]), [BOX_USAGE]);
+    assert_eq!(problems(&["box", "--test-box-token", "refused", "run", "--stdin"]), [BOX_USAGE]);
+    assert_eq!(problems(&["box", "--test-box-token=refused", "run", "--stdin"]), [BOX_USAGE]);
 }
 
 #[cfg(feature = "test-seams")]

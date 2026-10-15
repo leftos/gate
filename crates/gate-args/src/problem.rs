@@ -92,7 +92,7 @@ pub enum Problem {
     BadPid(String),
     /// A gate word that is not valid Unicode, shown lossily.
     Unreadable(String),
-    /// A `gate box` with no verb or payload, an unknown verb, or an extra word: the box's own usage line, said alone.
+    /// A `gate box` with no verb, an unknown verb, any word but `--stdin` after it, or an extra word: the box's own usage line, said alone.
     BoxUsage,
     /// A test seam given without the seam it works through.
     SeamNeeds {
@@ -139,7 +139,9 @@ impl fmt::Display for Problem {
             Problem::MissingPid => f.write_str("gate: missing the process id"),
             Problem::BadPid(value) => write!(f, "gate: the process id must be a whole number above 0, got '{value}'"),
             Problem::Unreadable(lossy) => write!(f, "gate: cannot read the argument {lossy}"),
-            Problem::BoxUsage => f.write_str("usage: gate box preflight|run|stop|boot|outputs|inflight <base64 JSON payload>"),
+            Problem::BoxUsage => {
+                f.write_str("usage: gate box preflight|run|stop|boot|outputs|inflight --stdin (the base64 JSON request as stdin's first line)")
+            }
             Problem::SeamNeeds { option, needs } => write!(f, "gate: {option} needs {needs}"),
             Problem::SeamsConflict { option, other } => write!(f, "gate: {option} cannot be given with {other}"),
             #[cfg(feature = "test-seams")]

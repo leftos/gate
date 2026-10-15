@@ -3,9 +3,12 @@
 
 use std::ffi::OsString;
 use std::fs;
+use std::io::Write;
+use std::ops::{Deref, DerefMut};
 use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{ChildStdin, Command};
+use std::thread;
 use std::time::Duration;
 
 use base64::Engine;
@@ -18,14 +21,14 @@ use serde_json::{Value, json};
 
 use crate::support::{
     Case, Closed, Escapee, FAKE_TOOL, GIT_REDIRECTS, Go, Outcome, Running, allow_breakaway, box_payload, build_version, copy_tool, finish, junction,
-    shown, start, start_with_closed, wait_until, wait_until_closed,
+    shown, start_with_closed, start_with_stdin, wait_until, wait_until_closed,
 };
 
 mod outputs;
 
-const BOX_USAGE: &str = "usage: gate box preflight|run|stop|boot|outputs|inflight <base64 JSON payload>\n";
+const BOX_USAGE: &str = "usage: gate box preflight|run|stop|boot|outputs|inflight --stdin (the base64 JSON request as stdin's first line)\n";
 
-/// The payload word for `json`, as the remote client encodes it.
+/// The request line for `json`, as the remote client encodes it: base64 of the JSON, without its newline.
 fn payload(json: &Value) -> String {
     STANDARD.encode(json.to_string())
 }
@@ -34,12 +37,78 @@ fn payload(json: &Value) -> String {
 /// a case's output however slow a loaded machine makes the run.
 const QUIET_HEARTBEAT_MS: &str = "2147483647";
 
-/// `gate box` with `args` after `box`, its heartbeat period [`QUIET_HEARTBEAT_MS`], without the git variables the
-/// suite may have inherited.
-fn box_command(case: &Case, args: &[&str]) -> Command {
+/// A `gate box … --stdin` not yet started and the request it reads as stdin's first line, which each start writes. It
+/// derefs to its command, so a case sets the box's environment as on any command.
+struct BoxCall {
+    command: Command,
+    request: String,
+}
+
+impl BoxCall {
+    /// Starts the box with its request line written and its stdin left open, for the case to write more or to drop.
+    fn start_with_stdin(self) -> (Running, ChildStdin) {
+        let (running, mut stdin) = start_with_stdin(self.command);
+        send_request(&mut stdin, &self.request);
+        (running, stdin)
+    }
+
+    /// Starts the box with its request line written and its stdin then closed.
+    fn start(self) -> Running {
+        let (running, stdin) = self.start_with_stdin();
+        drop(stdin);
+        running
+    }
+
+    /// Runs the box to its end, its request line written and its stdin then closed.
+    fn finish(self) -> Outcome {
+        self.start().finish()
+    }
+
+    /// Starts the box as [`start_with_closed`] does, its request line written and its stdin then closed.
+    fn start_with_closed(self, closed: Closed) -> Running {
+        let (running, mut stdin) = start_with_closed(closed, self.command);
+        send_request(&mut stdin, &self.request);
+        drop(stdin);
+        running
+    }
+}
+
+impl Deref for BoxCall {
+    type Target = Command;
+
+    fn deref(&self) -> &Command {
+        &self.command
+    }
+}
+
+impl DerefMut for BoxCall {
+    fn deref_mut(&mut self) -> &mut Command {
+        &mut self.command
+    }
+}
+
+/// Writes `request` and its newline to the box's stdin. A write that fails because the box has already gone is left to
+/// the case's assertions on what the box said, since a box that never read its request says so.
+fn send_request(stdin: &mut ChildStdin, request: &str) {
+    drop(stdin.write_all(format!("{request}\n").as_bytes()));
+}
+
+/// `gate box` with `args` after `box` (the seams, then the verb) and `--stdin`, its heartbeat period
+/// [`QUIET_HEARTBEAT_MS`], without the git variables the suite may have inherited; `request` is its stdin's first line.
+fn box_call(case: &Case, args: &[&str], request: &str) -> BoxCall {
     let mut words = vec!["box", "--test-heartbeat-ms", QUIET_HEARTBEAT_MS];
     words.extend_from_slice(args.strip_prefix(&["box"][..]).unwrap_or(args));
-    bare_box_command(case, &words)
+    bare_box_call(case, &words, request)
+}
+
+/// [`box_call`] with `args` as they are, no seam added.
+fn bare_box_call(case: &Case, args: &[&str], request: &str) -> BoxCall {
+    let mut words = args.to_vec();
+    words.push("--stdin");
+    BoxCall {
+        command: bare_box_command(case, &words),
+        request: request.to_owned(),
+    }
 }
 
 /// The gate with `args` as they are, no seam added, without the git variables the suite may have inherited.
@@ -51,13 +120,13 @@ fn bare_box_command(case: &Case, args: &[&str]) -> Command {
     command
 }
 
-/// `gate box <verb> <payload>` with `PATH` set to `path` when given.
-fn gate_box(case: &Case, verb: &str, payload: &str, path: Option<&OsString>) -> Outcome {
-    let mut command = box_command(case, &["box", verb, payload]);
+/// `gate box <verb> --stdin` of the request line `request`, with `PATH` set to `path` when given, to its end.
+fn gate_box(case: &Case, verb: &str, request: &str, path: Option<&OsString>) -> Outcome {
+    let mut call = box_call(case, &["box", verb], request);
     if let Some(path) = path {
-        command.env("PATH", path);
+        call.env("PATH", path);
     }
-    finish(command)
+    call.finish()
 }
 
 /// A preflight's two folders under the case folder, the bare repository's parent not yet made.
@@ -390,10 +459,10 @@ fn preflight_a_dotnet_that_does_not_answer_is_an_unreadable_sdk_list() {
         held.display()
     );
     fs::write(stub.join("dotnet.cmd"), hang).expect("the dotnet stub can be written");
-    let mut command = box_command(&case, &["box", "--test-dotnet-limit-ms", "1000", "preflight", &folders.payload()]);
+    let mut command = box_call(&case, &["box", "--test-dotnet-limit-ms", "1000", "preflight"], &folders.payload());
     command.env("PATH", path_with_git(&[stub]));
 
-    let outcome = finish(command);
+    let outcome = command.finish();
 
     // A stub that started holds its output file open until its job's kill ends it; one the kill came first never made it.
     if held.exists() {
@@ -472,18 +541,13 @@ fn needing(folders: &Folders, needs: &Value) -> String {
 fn probed(case: &Case, needs: &Value, tools: &[(&str, &str)]) -> Outcome {
     let folders = Folders::new(case);
     let stub = tool_stubs(case, tools);
-    let mut command = box_command(
+    let mut command = box_call(
         case,
-        &[
-            "box",
-            "--test-probe-limit-ms",
-            UNREACHED_PROBE_LIMIT_MS,
-            "preflight",
-            &needing(&folders, needs),
-        ],
+        &["box", "--test-probe-limit-ms", UNREACHED_PROBE_LIMIT_MS, "preflight"],
+        &needing(&folders, needs),
     );
     command.env("PATH", path_with_git(&[stub]));
-    finish(command)
+    command.finish()
 }
 
 /// The probe bound every probe case passes but the one about the bound: long enough that no probe of a case reaches it
@@ -582,7 +646,7 @@ fn preflight_probes_the_tools_while_dotnet_lists_the_sdks() {
     let dotnet = format!("@echo off\r\n\"{FAKE_TOOL}\" wait \"{}\"\r\necho 8.0.404 [C:\\stub]\r\n", go.display());
     let node = format!("@echo off\r\ntype nul >\"{}\"\r\necho v24.19.0\r\n", go.display());
     let stub = tool_stubs(&case, &[("dotnet", &dotnet), ("node", &node)]);
-    let mut command = box_command(
+    let mut command = box_call(
         &case,
         &[
             "box",
@@ -591,12 +655,12 @@ fn preflight_probes_the_tools_while_dotnet_lists_the_sdks() {
             "--test-probe-limit-ms",
             UNREACHED_PROBE_LIMIT_MS,
             "preflight",
-            &needing(&folders, &json!({"node": ""})),
         ],
+        &needing(&folders, &json!({"node": ""})),
     );
     command.env("PATH", path_with_git(&[stub]));
 
-    let outcome = finish(command);
+    let outcome = command.finish();
 
     let printed = passed(&outcome);
     assert_eq!(
@@ -655,10 +719,10 @@ fn preflight_a_tool_that_does_not_answer_is_skipped_with_a_line() {
     );
     let stub = tool_stubs(&case, &[("node", &hang)]);
     let needs = json!({"node": "24"});
-    let mut command = box_command(&case, &["box", "--test-probe-limit-ms", "1000", "preflight", &needing(&folders, &needs)]);
+    let mut command = box_call(&case, &["box", "--test-probe-limit-ms", "1000", "preflight"], &needing(&folders, &needs));
     command.env("PATH", path_with_git(&[stub]));
 
-    let outcome = finish(command);
+    let outcome = command.finish();
 
     // A stub that started holds its output file open until its job's kill ends it; one the kill came first never made it.
     if held.exists() {
@@ -777,7 +841,13 @@ fn preflight_version_line_is_the_build_version() {
 fn box_usage_and_payload_errors_exit_2() {
     let case = Case::new("box_usage_and_payload_errors_exit_2");
     let folders = Folders::new(&case);
-    for args in [&["box"][..], &["box", "launch", "e30="]] {
+    let shapes: [&[&str]; 4] = [
+        &["box"],
+        &["box", "launch", "--stdin"],
+        &["box", "preflight"],
+        &["box", "preflight", "e30="],
+    ];
+    for args in shapes {
         let outcome = finish(bare_box_command(&case, args));
 
         assert_eq!(outcome.code, Some(2), "{args:?}");
@@ -785,24 +855,102 @@ fn box_usage_and_payload_errors_exit_2() {
         assert_eq!(outcome.stderr, BOX_USAGE, "{args:?}: the box usage alone");
     }
 
-    let not_base64 = finish(bare_box_command(&case, &["box", "preflight", "not-base64!"]));
-    assert_eq!(not_base64.code, Some(2));
-    assert_eq!(not_base64.stdout, "");
-    assert!(not_base64.stderr.starts_with("gate: box payload is not base64 JSON: "), "{not_base64:?}");
-    assert_eq!(lines(&not_base64.stderr).len(), 1, "{not_base64:?}");
-
-    let not_an_object = finish(bare_box_command(&case, &["box", "preflight", &payload(&json!(["Bare", "Work"]))]));
+    let not_an_object = bare_box_call(&case, &["box", "preflight"], &payload(&json!(["Bare", "Work"]))).finish();
     assert_eq!(not_an_object.code, Some(2));
     assert_eq!(not_an_object.stdout, "");
     assert_eq!(not_an_object.stderr, "gate: box payload is not base64 JSON: the JSON is not an object\n");
 
-    let lacking = finish(bare_box_command(&case, &["box", "preflight", &payload(&json!({"Bare": folders.bare}))]));
+    let lacking = bare_box_call(&case, &["box", "preflight"], &payload(&json!({"Bare": folders.bare}))).finish();
     assert_eq!(lacking.code, Some(2));
     assert_eq!(lacking.stdout, "");
     assert_eq!(lacking.stderr, "gate: box payload lacks Work\n");
     assert!(!Path::new(&folders.bare).exists(), "nothing is made for a payload the box refuses");
 
     assert!(!case.run(&["--help"]).stdout.contains("box"), "gate box is hidden from the usage");
+}
+
+#[test]
+fn a_box_call_without_a_request_on_stdin_is_a_usage_error() {
+    let case = Case::new("box_request_missing");
+    let folders = Folders::new(&case);
+
+    let (running, stdin) = start_with_stdin(bare_box_command(&case, &["box", "preflight", "--stdin"]));
+    drop(stdin);
+    let outcome = running.finish();
+
+    assert_eq!(outcome.code, Some(2), "{outcome:?}");
+    assert_eq!(outcome.stdout, "", "{outcome:?}");
+    assert_eq!(outcome.stderr, "gate: the box request is missing on standard input\n");
+    assert!(!Path::new(&folders.bare).exists(), "nothing is made without a request");
+}
+
+/// The most bytes the box reads of its request line: 16 MiB.
+const REQUEST_LIMIT: usize = 16 * 1024 * 1024;
+
+#[test]
+fn a_box_request_over_the_cap_is_a_usage_error() {
+    let case = Case::new("box_request_over_cap");
+
+    let (running, mut stdin) = start_with_stdin(bare_box_command(&case, &["box", "preflight", "--stdin"]));
+    // The box stops reading at the cap and exits, so the write is a thread's: the case waits on the box, not the write,
+    // which fails once the box has gone or ends in the pipe and the box's own buffer; either way the box said its line.
+    let writer = thread::spawn(move || drop(stdin.write_all(&vec![b'A'; REQUEST_LIMIT + 1])));
+    let outcome = running.finish();
+    writer.join().expect("the writer thread ends");
+
+    assert_eq!(outcome.code, Some(2), "{outcome:?}");
+    assert_eq!(outcome.stdout, "", "{outcome:?}");
+    assert_eq!(
+        outcome.stderr,
+        "gate: the box request on standard input reaches 16 MiB without a newline\n"
+    );
+}
+
+#[test]
+fn a_box_request_that_is_not_base64_json_is_a_usage_error() {
+    let case = Case::new("box_request_not_base64");
+
+    for request in ["not-base64!", ""] {
+        let outcome = bare_box_call(&case, &["box", "preflight"], request).finish();
+
+        assert_eq!(outcome.code, Some(2), "{request:?}: {outcome:?}");
+        assert_eq!(outcome.stdout, "", "{request:?}: {outcome:?}");
+        assert!(
+            outcome.stderr.starts_with("gate: box payload is not base64 JSON: "),
+            "{request:?}: {outcome:?}"
+        );
+        assert_eq!(lines(&outcome.stderr).len(), 1, "{request:?}: {outcome:?}");
+    }
+}
+
+#[test]
+fn every_box_verb_reads_its_request_from_stdin() {
+    let case = Case::new("box_request_every_verb");
+    let folders = Folders::new(&case);
+    let request = folders.payload();
+
+    let preflight = box_call(&case, &["box", "preflight"], &request).finish();
+    assert_eq!(preflight.code, Some(0), "{preflight:?}");
+    assert!(Path::new(&folders.bare).exists(), "the preflight made the bare repository: {preflight:?}");
+
+    let run = payload(&box_payload(&case, "k", &[]));
+    let stop = box_call(&case, &["box", "stop"], &run).finish();
+    assert_eq!(stop.code, Some(0), "no job to stop is no failure: {stop:?}");
+    assert_eq!((stop.stdout.as_str(), stop.stderr.as_str()), ("", ""), "{stop:?}");
+
+    let boot = box_call(&case, &["box", "boot"], &payload(&json!({}))).finish();
+    assert_eq!(boot.code, Some(0), "{boot:?}");
+    assert!(boot.stdout.starts_with("gate: remote boot "), "{boot:?}");
+
+    let outputs = box_call(&case, &["box", "outputs"], &run).finish();
+    assert_eq!(outputs.code, Some(2), "the request reached the verb, which wants a Name: {outputs:?}");
+    assert_eq!(outputs.stderr, "gate: box payload lacks Name\n");
+
+    let root = case.folder().join("remote");
+    fs::create_dir_all(root.join("work")).expect("the work folder can be made");
+    let inflight = box_call(&case, &["box", "inflight"], &inflight_payload(&root)).finish();
+    assert_eq!(inflight.code, Some(0), "{inflight:?}");
+    assert_eq!(inflight.stdout, "gate: remote in flight 0\n", "{inflight:?}");
 }
 
 /// The payload's text at `key`.
@@ -948,9 +1096,9 @@ fn run_box(case: &Case, payload: &Value) -> Outcome {
 /// `gate box run` of `payload` with `name` set to `value` in the box's own environment, as a case about a variable the
 /// box inherits needs it.
 fn run_box_with_env(case: &Case, payload: &Value, name: &str, value: &str) -> Outcome {
-    let mut command = box_command(case, &["box", "run", &self::payload(payload)]);
+    let mut command = box_call(case, &["box", "run"], &self::payload(payload));
     command.env(name, value);
-    finish(command)
+    command.finish()
 }
 
 /// `gate box run` of `payload` with `PATH` set to `path` when given, as a case about dotnet runs it.
@@ -960,11 +1108,11 @@ fn run_box_with_path(case: &Case, payload: &Value, path: Option<&OsString>) -> O
 
 /// `gate box run` of `payload` with `PATH` set to `path`, started, as a case that stops it mid-run needs it.
 fn start_box_with_path(case: &Case, payload: &Value, path: Option<&OsString>) -> Running {
-    let mut command = box_command(case, &["box", "run", &self::payload(payload)]);
+    let mut command = box_call(case, &["box", "run"], &self::payload(payload));
     if let Some(path) = path {
         command.env("PATH", path);
     }
-    start(command)
+    command.start()
 }
 
 /// The tool manifest a restore case's snapshot holds; its bytes are what the work folder's record hashes.
@@ -1029,7 +1177,7 @@ fn stub_git(stub: &Path, parked: &Path, go: &Path) {
 
 /// `gate box run` of `payload`, started.
 fn start_box(case: &Case, payload: &Value) -> Running {
-    start(box_command(case, &["box", "run", &self::payload(payload)]))
+    box_call(case, &["box", "run"], &self::payload(payload)).start()
 }
 
 fn let_go(go: &Path) {
@@ -1522,10 +1670,7 @@ fn box_run_beats_while_a_busy_command_runs() {
     let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "err", "started", "burn", &go_word, "exit", "7"]);
     snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
 
-    let running = start(bare_box_command(
-        &case,
-        &["box", "--test-heartbeat-ms", "30", "run", &self::payload(&payload)],
-    ));
+    let running = bare_box_call(&case, &["box", "--test-heartbeat-ms", "30", "run"], &self::payload(&payload)).start();
     // Beats come before the command too, and one may slip in between its first line and the watch; of two after that
     // line, the second came a period after the watch began, while the command burned.
     let beats_after_started = |stderr: &str| {
@@ -1558,10 +1703,7 @@ fn a_git_warning_is_never_split_by_a_heartbeat() {
     let write = format!("@for /L %%i in (1,1,{WARNED_FILES}) do @echo line>w%%i.txt\r\n");
     snapshot(&case, &mut payload, &[(".gitattributes", "*.txt text eol=lf\n"), ("write.cmd", &write)]);
 
-    let outcome = finish(bare_box_command(
-        &case,
-        &["box", "--test-heartbeat-ms", "1", "run", &self::payload(&payload)],
-    ));
+    let outcome = bare_box_call(&case, &["box", "--test-heartbeat-ms", "1", "run"], &self::payload(&payload)).finish();
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     let beat = Regex::new(r"^gate-remote-heartbeat: \d+$").expect("the pattern compiles");
@@ -1619,11 +1761,11 @@ fn run_box_leaving_a_child(case: &Case, with: Option<(&str, &str)>) -> (Outcome,
     let command = [FAKE_TOOL, "spawn-wait", &go_word, "wait", &proceed_word, "exit", "0"];
     let mut payload = box_payload(case, "k", &command);
     snapshot(case, &mut payload, &[("a.txt", "a\n")]);
-    let mut box_run = box_command(case, &["box", "run", &self::payload(&payload)]);
+    let mut box_run = box_call(case, &["box", "run"], &self::payload(&payload));
     if let Some((name, value)) = with {
         box_run.env(name, value);
     }
-    let running = start(box_run);
+    let running = box_run.start();
     let pid = spawned_pid(&running.wait_for_stdout("\n"));
     let child = StoppableProcess::open(pid)
         .expect("the child is opened")
@@ -1680,7 +1822,7 @@ fn box_run_a_closed_stdout_pipe_stops_the_job_and_exits_255() {
     let mut payload = box_payload(&case, "k", &[r".\run.cmd"]);
     snapshot(&case, &mut payload, &[("a.txt", "a\n"), ("run.cmd", &script)]);
 
-    let running = start_with_closed(Closed::Stdout, box_command(&case, &["box", "run", &self::payload(&payload)]));
+    let running = box_call(&case, &["box", "run"], &self::payload(&payload)).start_with_closed(Closed::Stdout);
     running.wait_for_stderr("started");
     let_go(&go);
 
@@ -1713,7 +1855,7 @@ fn box_run_a_closed_stderr_pipe_stops_the_job_and_exits_255() {
     let mut payload = box_payload(&case, "k", &[r".\run.cmd"]);
     snapshot(&case, &mut payload, &[("a.txt", "a\n"), ("run.cmd", &script)]);
 
-    let running = start_with_closed(Closed::Stderr, box_command(&case, &["box", "run", &self::payload(&payload)]));
+    let running = box_call(&case, &["box", "run"], &self::payload(&payload)).start_with_closed(Closed::Stderr);
     running.wait_for_stdout("started");
     let_go(&go);
 
@@ -1867,10 +2009,7 @@ fn box_run_falls_back_to_its_own_token_when_the_restricted_start_is_refused() {
     let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "mark", &count_word, "out", "ran"]);
     snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
 
-    let outcome = finish(box_command(
-        &case,
-        &["box", "--test-box-token", "refused", "run", &self::payload(&payload)],
-    ));
+    let outcome = box_call(&case, &["box", "--test-box-token", "refused", "run"], &self::payload(&payload)).finish();
 
     assert_eq!(outcome.code, Some(0), "the refusal never fails the run: {outcome:?}");
     assert_eq!(outcome.stdout, "ran\n", "{outcome:?}");
@@ -1924,10 +2063,10 @@ fn box_run_gives_the_command_safe_directory_for_git() {
     );
     snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
     // The box inherits no config entries, whatever the environment this suite runs in holds.
-    let mut command = box_command(&case, &["box", "run", &self::payload(&payload)]);
+    let mut command = box_call(&case, &["box", "run"], &self::payload(&payload));
     command.env_remove("GIT_CONFIG_COUNT");
 
-    let outcome = finish(command);
+    let outcome = command.finish();
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert_eq!(outcome.stdout, "1\nsafe.directory\n*\n", "{outcome:?}");
@@ -2006,10 +2145,7 @@ fn box_run_falls_back_before_the_start_and_runs_the_command() {
     let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "mark", &count_word, "out", "ran"]);
     snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
 
-    let outcome = finish(box_command(
-        &case,
-        &["box", "--test-box-console", "fail-before", "run", &self::payload(&payload)],
-    ));
+    let outcome = box_call(&case, &["box", "--test-box-console", "fail-before", "run"], &self::payload(&payload)).finish();
 
     assert_eq!(outcome.code, Some(0), "the fallback never fails the run: {outcome:?}");
     assert_eq!(outcome.stdout, "ran\n", "{outcome:?}");
@@ -2062,8 +2198,8 @@ fn stop_before_the_launch(name: &str, seams: &[&str]) {
     let payload_word = self::payload(&payload);
     let mut args = vec!["box"];
     args.extend_from_slice(seams);
-    args.extend_from_slice(&["--test-box-park-launch", &park_word, "run", &payload_word]);
-    let running = start(box_command(&case, &args));
+    args.extend_from_slice(&["--test-box-park-launch", &park_word, "run"]);
+    let running = box_call(&case, &args, &payload_word).start();
     wait_until("the box parked before the launch", || parked.exists());
 
     let stopped = gate_box(&case, "stop", &payload_word, None);
@@ -4030,11 +4166,10 @@ const ENDLESS: &[&str] = &[FAKE_TOOL, "err", "started", "sleep", "600000"];
 
 /// `gate box run` of `payload` with `seams` before the verb, to its end.
 fn run_box_with_seams(case: &Case, payload: &Value, seams: &[&str]) -> Outcome {
-    let word = self::payload(payload);
     let mut args = vec!["box"];
     args.extend_from_slice(seams);
-    args.extend(["run", word.as_str()]);
-    finish(box_command(case, &args))
+    args.push("run");
+    box_call(case, &args, &self::payload(payload)).finish()
 }
 
 /// The lines of `outcome`'s stderr that start with `prefix`.

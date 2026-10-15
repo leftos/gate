@@ -35,16 +35,15 @@ pub enum Invocation {
     Burn(BurnRequest),
     /// `gate expect`.
     Expect(ExpectRequest),
-    /// The hidden `gate box <verb> <payload>`.
+    /// The hidden `gate box <verb> --stdin`.
     Box(BoxRequest),
 }
 
-/// A valid `gate box`: the verb, the payload word as given, base64 of UTF-8 JSON that the binary decodes, and the
-/// hidden seams given before the verb.
+/// A valid `gate box`: the verb and the hidden seams given before it. The request itself, base64 of UTF-8 JSON, is
+/// stdin's first line, which the binary reads and decodes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BoxRequest {
     pub verb: BoxVerb,
-    pub payload: OsString,
     pub seams: BoxSeams,
 }
 
