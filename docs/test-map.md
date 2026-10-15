@@ -36,7 +36,7 @@ Suite = `crates/gate/tests/suite/` (binary `suite`, needs `--all-features`; test
 | journal.rs | `journal` (v1 lines, verdict, quoted command, rollover), plus any case asserting a journal line: `slots`, `critical`, `nesting`, `cores`, `routing`, `interrupt`, `cutover`?, `stall` (load-adjusted s) | CENTRAL-ish (writes every run; run `journal`, `cores`, `nesting`, `slots`, `critical`, `routing`, `stall`, `interrupt`, `launch`, `hold`) |
 | watch.rs | `stall`, `ceiling` (`--test-sampler-fail`, backstop), `durations` (the local hang hint), `cores`, `diagnostics`, `pause`, `interrupt` (`--test-interrupt-after-samples`), `hold`, `launch` (every command is watched), `boxside` (`machine` and `system_times` are shared with the box's ceiling watch); unit tests inside (the sample's `escaped cpu`, the departed members' children in the diagnostics) | CENTRAL (every launched command is watched) |
 | cutover.rs | `cutover` (`gate cutover`, flag, counts copy, drain, Ctrl+C, resume), `launcher` (hand-over after flag) | no: cutover, launcher |
-| push.rs | `push` (`gate push`, `--test-push-ssh`, `--test-push-bound-ms`, fake-ssh) | no: push |
+| push.rs | `push` (`gate push`, `--test-push-ssh`, `--test-push-bound-ms`, fake-ssh, the PC's `push.lock`); the unit tests inside (the builder `SCRIPT` run by `run_script_after`, the line mapping) | no: push |
 | stop_tree.rs | `stop_tree` (`gate stop-tree`) | no: stop_tree |
 | stopping.rs | `stop_tree` (the checked open `gate stop-tree` shares), `stall` (the kill's escaped processes) | no: stop_tree, stall |
 | escaped.rs | `stall` (`a_stall_kill_ends_a_packaged_app_the_command_started`, machine-dependent; `a_stall_kill_ends_a_child_outside_the_job_whose_launcher_has_ended`, machine-alone `#[ignore]`, with `stall::a_stall_kill_ends_a_child_outside_the_job_whose_launcher_exited_at_once` (machine-alone `#[ignore]`: the launcher ends before the first sample, so only the job's memory of it reaches the escapee), `ceiling::a_ceiling_kill_ends_a_child_outside_the_job_whose_launcher_has_ended` and `interrupt::a_ctrl_c_ends_a_child_outside_the_job_whose_launcher_has_ended`; the escapee cases that start it with `fake-tool spawn-away` under `--test-job-breakaway`; the unit tests inside), `cores` (`a_command_whose_child_left_its_job_counts_that_child_s_cores`), `interrupt` and `ceiling` (the other kills run it too) | no: stall, cores, interrupt, ceiling |
@@ -58,7 +58,7 @@ Suite = `crates/gate/tests/suite/` (binary `suite`, needs `--all-features`; test
 | boxside/heartbeat.rs, forward.rs | `boxside` (`--test-heartbeat-ms`), `remote_client` | no: boxside, remote_client |
 | boxside/tools.rs | `boxside` (dotnet tool restore and its elapsed line, `boxside::box_run_*restore*` cases) | no: boxside |
 | boxside/outputs.rs | `boxside` sub-module `boxside::outputs` (manifest, pack, prune, `outputs` verb, `--test-outputs-budget-bytes`), `remote_client` | no: boxside, remote_client |
-| outputs/ (glob, walk, hash, manifest, cache, archive, names) | `boxside::outputs` (pack), `remote_client` (manifest the client sends, the hash cache it saves and reuses, the fetched archive's install, the hashes a complete install keeps in that cache), `syncback_quarantine` and `syncback_conversions` (names, through the sync-back's forbidden paths); unit tests inside | no: boxside, remote_client, syncback_quarantine, syncback_conversions |
+| outputs/ (glob, walk, hash, manifest, cache, archive, names, stale) | `boxside::outputs` (pack), `remote_client` (the stale line of a passing routed build, manifest the client sends, the hash cache it saves and reuses, the fetched archive's install, the hashes a complete install keeps in that cache), `syncback_quarantine` and `syncback_conversions` (names, through the sync-back's forbidden paths); unit tests inside | no: boxside, remote_client, syncback_quarantine, syncback_conversions |
 
 ## 2. Table: other crates and files
 
@@ -76,7 +76,7 @@ Suite = `crates/gate/tests/suite/` (binary `suite`, needs `--all-features`; test
 | gate-state v1.rs / root.rs / model.rs / lib.rs | everything (claim/ticket/counts/root hash/kernel names): CENTRAL. Suite itself reads `v1` in `critical, interrupt, journal, launch, nesting, pause, slots`; `v1.rs`'s nothing-back record (path, write, strict read) is also read in `routing`, and its outputs cap record (`remote/outputs.rs`) in `remote_client` and the `remote::client` unit tests | `gate-state::state` (`v1`: the record's shape and strict read) | CENTRAL |
 | gate-state journal_writer.rs / verdict.rs | `journal` + any journal assertion: `cores, nesting, routing, slots, critical, stall, launch, interrupt` | state `journal_write` (the fallback reasons' texts, `layout` among them), `verdict` | no, but wide (writes on every run) |
 | gate-state archive.rs | `journal` (rollover and archive with concurrent appenders) | state `archive` | no |
-| gate-state durations.rs | `durations` (the `gate` crate's `durations.rs` calls it), `hold`, `journal` | state `durations` (incl. the adjusted p99, not raised to the wall p50, and needing 5 adjusted samples) | no |
+| gate-state durations.rs | `durations` (the `gate` crate's `durations.rs` calls it), `hold`, `journal` | state `durations` (incl. the adjusted p90 and p99, not raised to the wall p50, and needing 5 adjusted samples) | no |
 | gate-state cutover.rs / drain.rs / counts.rs | `cutover`, `launcher` (gate/src/cutover.rs imports `copy_slot_counts_to_v1, powershell_gates, write_cutover_flag`); `counts.rs`'s `write_replacing` (the temp names) also writes the v1 files, so a change there adds `routing` | state `cutover`, `counts`; a unit test inside `counts.rs` for the temp names | no |
 | gate-state tests/state/fixtures/ (captured files, `capture-*.ps1`; the `v1-*-expected.json` pair is hand-written) and tests/state/fixtures.rs | none (the fixtures are captured from `gate.exe` and the PowerShell gate by script and only read by the state tests) | state `fixtures` (incl. `remote_run_journal_from_gate_exe_is_read_into_runs_and_a_split_summary`) | no |
 | gate-state claims.rs / remote.rs / state.rs / win32.rs / journal.rs (reader) | NOT imported by gate src (ops-tower-only, ARCHITECTURE.md Layers; except `normalize_command` from journal.rs, used by `slots.rs`:642 and journal.rs's command text -> `journal`, `slots`) | state tests | no (journal.rs: `journal`, `slots`) |
@@ -96,7 +96,7 @@ Suite = `crates/gate/tests/suite/` (binary `suite`, needs `--all-features`; test
 | proc-table | `stop_tree`, `stall` (`parent_pid_of`) (imports `Win32ProcessTable`), `cutover` (`command_line_of`), `diagnostics`, `stall`/`cores` (`ProcessTree::children` through the escaped walk) | proc-table unit | no |
 | tools/gate.ps1 | `launcher` (runs the checked-in launcher), `cutover` (hand-over), `checkout` (`repo_file`) | - | no |
 | tools/install.ps1 | `install`, `checkout` | - | no |
-| suite support.rs / harness.rs / main.rs / fake tools | all suite (support.rs is `Case`, and the suite's `junction` helper): CENTRAL for suite; `harness` self-tests | - | CENTRAL |
+| suite support.rs / harness.rs / main.rs / fake tools | all suite (support.rs is `Case`, the suite's `junction` helper, and the shared `Junction` helper that `routing` and `remote_client` use for another spelling of a path): CENTRAL for suite; `harness` self-tests | - | CENTRAL |
 | suite module file `X.rs` | its own module only (`test(/^X::/)`), plus `boxside/outputs.rs` -> `boxside::` | - | no |
 | Cargo.toml (workspace), Cargo.lock, crates/gate/Cargo.toml, rust-toolchain, .cargo/, clippy config | whole workspace | - | CENTRAL |
 | docs/, README | none | - | none (no tests) |
@@ -121,7 +121,7 @@ Always add `checkout` to any change that touches a suite file or adds a seam.
 | nesting.rs, nesting/binding.rs | `-E 'binary(suite) and test(/^(nesting\|critical\|pause\|slots\|journal)::/) or (U and test(/^nesting::/))'` |
 | pause.rs | `-E 'binary(suite) and test(/^(pause\|nesting\|stall\|ceiling\|cores)::/) or (U and test(/^pause::/))'` |
 | cutover.rs | `-E 'binary(suite) and test(/^(cutover\|launcher)::/) or (U and test(/^cutover::/))'` |
-| push.rs, bin/fake-ssh.rs (push side) | `-E 'binary(suite) and test(/^(push\|remote_client)::/)'` (fake-ssh also serves remote_client) |
+| push.rs, bin/fake-ssh.rs (push side) | `-E 'binary(suite) and test(/^(push\|remote_client)::/) or (U and test(/^push::/))'` (fake-ssh also serves remote_client) |
 | stop_tree.rs | `-E 'binary(suite) and test(/^stop_tree::/)'` |
 | stopping.rs | `-E 'binary(suite) and test(/^(stop_tree\|stall)::/) or (U and test(/^stopping::/))'` |
 | escaped.rs | `-E 'binary(suite) and test(/^(stall\|cores\|interrupt\|ceiling)::/) or (U and test(/^escaped::/))'` |

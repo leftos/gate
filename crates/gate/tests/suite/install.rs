@@ -3,10 +3,11 @@
 //! touches the real user environment or the real install folder.
 
 use std::fs;
+use std::os::windows::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use crate::support::{Case, FAKE_TOOL, Outcome, finish, shown, start, version_of, wait_for_journal_line, wait_until_closed};
+use crate::support::{Case, FAKE_TOOL, Outcome, finish, names, shown, start, version_of, wait_for_journal_line, wait_until_closed};
 
 /// `tools/install.ps1`, the script under test: a checked-in file a case runs.
 fn script() -> PathBuf {
@@ -371,6 +372,226 @@ fn install_over_a_running_gate_moves_it_aside() {
     );
 }
 
+/// An aside copy an earlier install left, named as the script names one.
+const ASIDE: &str = "gate.exe.20200101000000.4.old";
+
+/// Installs a copy of the built gate for `case` and leaves an aside copy no process holds beside it, as an earlier
+/// install would: the installed copy and the aside copy's path.
+fn installed_with_an_aside(case: &Case, key: &EnvironmentKey) -> (PathBuf, PathBuf) {
+    let exe = copy_gate(case, "gate-a.exe");
+    let first = install(case, key, &["-Exe", &shown(&exe)]);
+    assert_eq!(first.code, Some(0), "{first:?}");
+    let aside = install_dir(case).join(ASIDE);
+    fs::write(&aside, b"an old gate no process runs").expect("the aside copy can be written");
+    (exe, aside)
+}
+
+#[test]
+fn an_install_while_a_push_holds_the_lock_changes_nothing() {
+    let case = Case::new("an_install_while_a_push_holds_the_lock_changes_nothing");
+    let key = EnvironmentKey::new("an_install_while_a_push_holds_the_lock_changes_nothing");
+    let (exe, aside) = installed_with_an_aside(&case, &key);
+    // The entry is taken away, so an install that went on would add it back.
+    delete_path_value(&key);
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .share_mode(0)
+        .open(install_dir(&case).join("push.lock"))
+        .expect("the lock can be held");
+    let other = copy_gate_with_a_byte(&case, "gate-b.exe");
+
+    let outcome = install(&case, &key, &["-Exe", &shown(&other)]);
+
+    drop(lock);
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert_eq!(outcome.stdout, "", "{outcome:?}");
+    assert_eq!(
+        unix(&outcome.stderr),
+        "install: another gate push is installing; nothing was changed\n",
+        "{outcome:?}"
+    );
+    assert_same_bytes(&installed_gate(&case), &exe);
+    assert!(aside.exists(), "the aside copy is left: {outcome:?}");
+    assert_eq!(
+        names(&install_dir(&case)),
+        ["gate.exe", ASIDE, "push.lock"],
+        "nothing was added or deleted"
+    );
+    assert_eq!(path_value(&key), None, "the PATH step did not run: {outcome:?}");
+}
+
+/// A `push.lock` that is a second name of another file is refused as a link is, and nothing is changed.
+#[test]
+fn an_install_refuses_a_push_lock_that_is_a_hard_link() {
+    let case = Case::new("an_install_refuses_a_push_lock_that_is_a_hard_link");
+    let key = EnvironmentKey::new("an_install_refuses_a_push_lock_that_is_a_hard_link");
+    let (exe, aside) = installed_with_an_aside(&case, &key);
+    // The entry is taken away, so an install that went on would add it back.
+    delete_path_value(&key);
+    let other = case.folder().join("other.txt");
+    fs::write(&other, b"another file").expect("the other file is written");
+    let lock = install_dir(&case).join("push.lock");
+    fs::remove_file(&lock).expect("the first install's push.lock is removed");
+    fs::hard_link(&other, &lock).expect("push.lock is made a second name of the other file");
+    let newer = copy_gate_with_a_byte(&case, "gate-b.exe");
+
+    let outcome = install(&case, &key, &["-Exe", &shown(&newer)]);
+
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert_eq!(outcome.stdout, "", "{outcome:?}");
+    assert_eq!(
+        unix(&outcome.stderr),
+        format!("install: {} is a link; nothing was changed\n", shown(&lock)),
+        "{outcome:?}"
+    );
+    assert_same_bytes(&installed_gate(&case), &exe);
+    assert!(aside.exists(), "the aside copy is left: {outcome:?}");
+    assert_eq!(
+        names(&install_dir(&case)),
+        ["gate.exe", ASIDE, "push.lock"],
+        "nothing was added or deleted"
+    );
+    assert_eq!(path_value(&key), None, "the PATH step did not run: {outcome:?}");
+    assert_eq!(
+        fs::read(&other).expect("the other file is read"),
+        b"another file",
+        "the other file is untouched"
+    );
+}
+
+#[test]
+fn an_install_keeps_the_aside_copy_when_it_installs_nothing() {
+    let case = Case::new("an_install_keeps_the_aside_copy_when_it_installs_nothing");
+    let key = EnvironmentKey::new("an_install_keeps_the_aside_copy_when_it_installs_nothing");
+    let (exe, aside) = installed_with_an_aside(&case, &key);
+    let not_a_gate = case.folder().join("not-a-gate.exe");
+    fs::write(&not_a_gate, b"no program").expect("the file can be written");
+
+    let outcome = install(&case, &key, &["-Exe", &shown(&not_a_gate)]);
+
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert!(
+        unix(&outcome.stderr).starts_with("install: could not read the version of "),
+        "{outcome:?}"
+    );
+    assert_same_bytes(&installed_gate(&case), &exe);
+    assert!(aside.exists(), "an install that installed nothing keeps the aside copy: {outcome:?}");
+}
+
+/// An entry in a folder's access list that denies this user running any file put in the folder, existing or new, so an
+/// exe there cannot start while it can still be read, moved and deleted; dropping the guard takes the entry away.
+struct NoRunningIn(PathBuf);
+
+impl NoRunningIn {
+    fn new(folder: &Path) -> NoRunningIn {
+        let denied = NoRunningIn(folder.to_path_buf());
+        let status = Command::new("icacls")
+            .arg(folder)
+            .args(["/deny", &format!("{}:(OI)(IO)(X)", this_user())])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .status()
+            .expect("icacls starts");
+        assert!(status.success(), "the deny entry is added");
+        denied
+    }
+}
+
+/// This user, as `whoami` names one and icacls takes it.
+fn this_user() -> String {
+    let said = Command::new("whoami").stdin(Stdio::null()).output().expect("whoami starts");
+    assert!(said.status.success(), "whoami names this user: {said:?}");
+    String::from_utf8_lossy(&said.stdout).trim().to_owned()
+}
+
+impl Drop for NoRunningIn {
+    /// Takes the deny entry away; one that stays is said on stderr with its folder, since the test cannot fail here.
+    #[expect(clippy::print_stderr, reason = "a deny entry that cannot be taken away is said without failing the case")]
+    fn drop(&mut self) {
+        let removed = Command::new("icacls")
+            .arg(&self.0)
+            .args(["/remove:d", &this_user()])
+            .stdin(Stdio::null())
+            .output();
+        match removed {
+            Ok(output) if output.status.success() => {}
+            Ok(output) => eprintln!(
+                "the deny entry on {} is left: icacls said {}{}",
+                shown(&self.0),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ),
+            Err(error) => eprintln!("the deny entry on {} is left: icacls cannot start: {error}", shown(&self.0)),
+        }
+    }
+}
+
+#[test]
+fn an_install_whose_copy_does_not_run_puts_the_previous_gate_back() {
+    let case = Case::new("an_install_whose_copy_does_not_run_puts_the_previous_gate_back");
+    let key = EnvironmentKey::new("an_install_whose_copy_does_not_run_puts_the_previous_gate_back");
+    let (exe, aside) = installed_with_an_aside(&case, &key);
+    // The new exe answers its version where it is built; the copy the install puts in the folder cannot start.
+    let denied = NoRunningIn::new(&install_dir(&case));
+    let other = copy_gate_with_a_byte(&case, "gate-b.exe");
+
+    let outcome = install(&case, &key, &["-Exe", &shown(&other)]);
+
+    drop(denied);
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert_eq!(outcome.stdout, "", "{outcome:?}");
+    assert_eq!(
+        unix(&outcome.stderr),
+        "install: the installed gate.exe does not run; the previous gate.exe is back in place\n",
+        "{outcome:?}"
+    );
+    assert_same_bytes(&installed_gate(&case), &exe);
+    assert_eq!(aside_copies(&case), [aside], "the aside copies are kept, the previous gate back in place");
+}
+
+#[test]
+fn install_whatif_of_the_installed_exe_says_already_installed() {
+    let case = Case::new("install_whatif_of_the_installed_exe_says_already_installed");
+    let key = EnvironmentKey::new("install_whatif_of_the_installed_exe_says_already_installed");
+    let (exe, aside) = installed_with_an_aside(&case, &key);
+
+    let outcome = install(&case, &key, &["-Exe", &shown(&exe), "-WhatIf"]);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(
+        unix(&outcome.stdout),
+        format!(
+            "install: gate {} already installed at {}\nWhat if: Performing the operation \"Delete\" on target \"{}\".\n",
+            version_of(&exe),
+            shown(&installed_gate(&case)),
+            shown(&aside)
+        ),
+        "what a real run says and the aside delete it takes, and no install step: {outcome:?}"
+    );
+    assert!(aside.exists(), "nothing was deleted: {outcome:?}");
+}
+
+#[test]
+fn install_whatif_lists_the_aside_deletes_it_would_take() {
+    let case = Case::new("install_whatif_lists_the_aside_deletes_it_would_take");
+    let key = EnvironmentKey::new("install_whatif_lists_the_aside_deletes_it_would_take");
+    let (exe, aside) = installed_with_an_aside(&case, &key);
+    let other = copy_gate_with_a_byte(&case, "gate-b.exe");
+
+    let outcome = install(&case, &key, &["-Exe", &shown(&other), "-WhatIf"]);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(
+        outcome.stdout.contains(&shown(&aside)),
+        "the aside copy a verified install would delete is listed: {outcome:?}"
+    );
+    assert!(aside.exists(), "nothing was deleted: {outcome:?}");
+    assert_same_bytes(&installed_gate(&case), &exe);
+}
+
 #[test]
 fn an_existing_path_value_keeps_its_kind_and_entries() {
     let case = Case::new("an_existing_path_value_keeps_its_kind_and_entries");
@@ -447,5 +668,6 @@ fn install_whatif_changes_nothing() {
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert!(!installed_gate(&case).exists(), "nothing was installed: {outcome:?}");
+    assert!(!install_dir(&case).exists(), "no folder and no push.lock was made: {outcome:?}");
     assert_eq!(path_value(&key), None, "no Path value was written: {outcome:?}");
 }

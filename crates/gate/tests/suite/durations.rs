@@ -1078,13 +1078,15 @@ fn an_auto_floor_never_lowers_the_ceiling() {
 }
 
 #[test]
-fn a_ceiling_below_the_usual_p90_is_hinted_once_after_the_expected_line() {
+fn a_ceiling_below_the_load_adjusted_p90_is_hinted_once_after_the_expected_line() {
     let case = Case::new("durations-ceiling-hint");
 
-    let hint = "gate: the ceiling 5 min is below this command's usual p90 of 10 min\n";
+    let hint = "gate: the ceiling 5 min is below this command's load-adjusted p90 of 10 min\n";
 
     // The command writes nothing until the go file comes, so the hint said while it waits came before its output.
-    let (claim, outcome) = held_run(&case, "300", Some((600.0, None)), &[], |stderr| stderr.contains(hint));
+    let (claim, outcome) = held_run(&case, "300", Some((600.0, Some(600.0))), &[], |stderr| {
+        stderr.contains("gate: the ceiling")
+    });
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert_eq!(claim["timeoutSeconds"], 300.0, "a given ceiling is never resolved: {claim}");
@@ -1099,10 +1101,26 @@ fn a_ceiling_below_the_usual_p90_is_hinted_once_after_the_expected_line() {
 }
 
 #[test]
-fn no_ceiling_hint_at_or_above_the_p90_or_without_history_or_without_a_slot() {
+fn a_ceiling_below_a_wall_p90_is_not_hinted_when_the_load_adjusted_p90_is_below_it() {
+    let case = Case::new("durations-ceiling-hint-adjusted");
+
+    // The reported bug: a wall p90 of 10 min under load, whose load-adjusted p90 is 1 min, flags a 5 min ceiling.
+    let (_claim, outcome) = held_run(&case, "300", Some((600.0, Some(60.0))), &[], |_| true);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(
+        outcome.stderr.contains("gate: expected about 10 min (usual 10 min, p90 10 min, 5 runs)"),
+        "{outcome:?}"
+    );
+    assert!(!outcome.stderr.contains("gate: the ceiling"), "{outcome:?}");
+    assert!(!log(&case).contains("gate: the ceiling"), "{}", log(&case));
+}
+
+#[test]
+fn no_ceiling_hint_at_or_above_the_load_adjusted_p90_or_without_history_or_without_a_slot() {
     let case = Case::new("durations-no-ceiling-hint");
     quick_runs(&case, 5);
-    seed(&case, QUICK_KEY, 600.0, None);
+    seed(&case, QUICK_KEY, 600.0, Some(600.0));
     let with_timeout = |words: Vec<&'static str>, timeout: &'static str| {
         let mut words = words;
         words[4] = timeout;

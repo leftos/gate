@@ -23,9 +23,9 @@ use sha2::{Digest, Sha256};
 
 use crate::durations::seed;
 use crate::support::{
-    ANSWERING, Case, FAKE_SSH, FAKE_TOOL, GATE, GATE_VARIABLE, GIT_REDIRECTS, Go, Outcome, PREFLIGHT_SEAMS_VARIABLE, Running, STEPS_VARIABLE,
-    allow_breakaway, beside, build_version, calls, copy_tool, events, finish, git, git_init, heavy_words, junction, nothing_back, release, shown,
-    ssh_steps, start, wait_for_journal_line, wait_until, wait_until_closed, write_remote_json,
+    ANSWERING, Case, FAKE_SSH, FAKE_TOOL, GATE, GATE_VARIABLE, GIT_REDIRECTS, Go, Junction, Outcome, PREFLIGHT_SEAMS_VARIABLE, Running,
+    STEPS_VARIABLE, allow_breakaway, beside, build_version, calls, copy_tool, events, finish, git, git_init, heavy_words, nothing_back, release,
+    shown, ssh_steps, start, wait_for_journal_line, wait_until, wait_until_closed, write_remote_json,
 };
 
 const HOST: &str = "builder";
@@ -450,11 +450,18 @@ fn client_gate_through(case: &Case, kind: &str, log: &str, steps: &Path, command
     client_gate_tuned(case, log, steps, &tuned, command)
 }
 
-/// What a case changes in the words of a client run: the transport's form, the ceiling, and more options before the
-/// command.
+/// The `--stall` of a client run: a hang guard, so a call no seam watches, such as the preflight, is never cut for a
+/// silence a busy machine gives it. The default 120 s is a bound a starved gate and its stand-in can cross before the
+/// first call has said anything.
+const CLIENT_STALL: &str = "600";
+
+/// What a case changes in the words of a client run: the transport's form, the ceiling, the stall window, and more
+/// options before the command.
 struct Tuned<'a> {
     kind: &'a str,
     timeout: &'a str,
+    /// The run's `--stall`, [`CLIENT_STALL`] unless the case is about the window itself.
+    stall: &'a str,
     extra: &'a [&'a str],
     /// The stand-in `--test-remote-ssh` names, [`FAKE_SSH`] when none.
     ssh: Option<&'a str>,
@@ -465,6 +472,7 @@ impl Default for Tuned<'_> {
         Tuned {
             kind: "local",
             timeout: "3600",
+            stall: CLIENT_STALL,
             extra: &[],
             ssh: None,
         }
@@ -484,6 +492,8 @@ fn client_gate_tuned(case: &Case, log: &str, steps: &Path, tuned: &Tuned<'_>, co
         "1",
         "--test-git-limit-ms",
         "3600000",
+        "--stall",
+        tuned.stall,
     ];
     seams.extend(tuned.extra);
     let mut words = heavy_words(log, &seams, command);
@@ -1471,32 +1481,6 @@ fn a_junction_on_path_into_the_worktree_is_not_run_for_the_sdk_list() {
         1,
         "the dotnet.cmd behind the junction ran for the builder alone: {ran:?}"
     );
-}
-
-/// A junction beside the case folder, outside its worktree, made with `mklink /J`; removed, and not what it leads to,
-/// when it drops.
-struct Junction(PathBuf);
-
-impl Junction {
-    /// A junction that leads to `target`.
-    fn to(case: &Case, target: &Path) -> Junction {
-        let mut link = case.folder().into_os_string();
-        link.push("-junction");
-        let link = PathBuf::from(link);
-        // A junction an earlier run of the case left would make `mklink` refuse.
-        drop(fs::remove_dir(&link));
-        junction(&link, target);
-        Junction(link)
-    }
-}
-
-impl Drop for Junction {
-    fn drop(&mut self) {
-        if let Err(error) = fs::remove_dir(&self.0) {
-            // A junction left beside the case harms no later case, which removes it first, and a panic in drop aborts.
-            let _ = writeln!(io::stderr(), "could not remove the junction {}: {error}", self.0.display());
-        }
-    }
 }
 
 /// A `PATH` with an unmatched quote reads every folder after it as one, so the `dotnet` there would not be found and
@@ -2986,8 +2970,11 @@ fn a_preflight_line_longer_than_64_kib_falls_back_unreachable_and_runs_here() {
 fn a_stall_window_under_15_s_is_raised_to_15() {
     let case = client_case("client-stall-floor");
     let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+    // The raised window is the run call's; the preflight gets a hang guard of its own, so only the call under the floor
+    // can be cut.
     let tuned = Tuned {
-        extra: &["--stall", "3"],
+        stall: "3",
+        extra: &["--test-remote-watch-call", "preflight", "--test-stall-ms", "600000"],
         ..Tuned::default()
     };
 
@@ -4960,6 +4947,16 @@ fn build_case(name: &str) -> Case {
     case
 }
 
+/// A [`build_case`] whose routing file gives its repo no output globs, as the repo of the stale-output ticket has none:
+/// a routed build brings nothing back, and the defaults beside its own empty list are what judge what it left.
+fn no_globs_case(name: &str) -> Case {
+    let case = build_case(name);
+    let repo = repo_name(&case.folder().file_name().expect("the case folder has a name").to_string_lossy());
+    let routing = json!({ "host": HOST, "slots": 2, "repos": { &repo: ["*tool*", "*dotnet*"] }, "outputs": { &repo: [] } });
+    write_remote_json(&case, &routing.to_string());
+    case
+}
+
 /// A [`build_case`] with `record` planted as its worktree's nothing-back record.
 fn planted_case(name: &str, record: &str) -> Case {
     let case = build_case(name);
@@ -5225,6 +5222,101 @@ fn a_routed_build_after_a_withheld_run_sends_a_full_manifest_and_keeps_the_recor
     assert_eq!(nothing_back(&case).as_deref(), Some(RELEASE_RECORD), "{outcome:?}");
 }
 
+/// A routed dotnet build of a repo with no output globs brings nothing back, so the PC's own stale `bin` folder is
+/// named; the nothing-back record is written as it was before the line.
+#[test]
+fn a_passing_routed_build_with_no_output_globs_names_the_folders_it_left_stale() {
+    let case = no_globs_case("client-stale-no-globs");
+    write(&case, r"bin\app.txt", "stale");
+
+    let outcome = passing_build(&case, &["ok", "ok"], &wrapped_build(&[], &RELEASE));
+
+    assert!(
+        outcome.stderr.lines().any(|line| line == "gate: routed build left stale: bin"),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        nothing_back(&case).as_deref(),
+        Some(RELEASE_RECORD),
+        "the record is written as before: {outcome:?}"
+    );
+}
+
+/// Everything the run built came back under its one glob, so the only judging glob left is the Godot default, which no
+/// file of this PC matches.
+#[test]
+fn a_routed_build_that_brought_everything_back_says_nothing_stale() {
+    let case = build_case("client-stale-all-back");
+    write(&case, r"bin\same.txt", "same");
+
+    let outcome = passing_build(&case, &["ok", "ok", "ok"], &wrapped_build(&WRITE_NEW, &RELEASE));
+
+    assert_eq!(worktree_text(&case, r"bin\new.txt"), "built", "the output came back: {outcome:?}");
+    assert!(!outcome.stderr.contains("gate: routed build left stale"), "{outcome:?}");
+}
+
+/// A routed build that failed says nothing of what it left stale: its failure is the news.
+#[test]
+fn a_failed_routed_build_prints_no_stale_line() {
+    let case = no_globs_case("client-stale-failed");
+    write(&case, r"bin\app.txt", "stale");
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &wrapped_build(&["exit", "1"], &RELEASE)));
+
+    assert_eq!(outcome.code, Some(1), "the build failed: {outcome:?}");
+    assert!(!outcome.stderr.contains("gate: routed build left stale"), "{outcome:?}");
+}
+
+/// The command exited 0 but wrote a failure marker in its log, so the gate's verdict is FAILED: the stale line is said
+/// of a run whose verdict passed, and this one's did not.
+#[test]
+fn a_routed_build_whose_log_reports_a_failure_prints_no_stale_line() {
+    let case = no_globs_case("client-stale-marker");
+    write(&case, r"bin\app.txt", "stale");
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+
+    let outcome = finish(client_gate(
+        &case,
+        "out.log",
+        &steps,
+        &wrapped_build(&["err", "error CS0001: boom"], &RELEASE),
+    ));
+
+    assert_eq!(outcome.code, Some(1), "the marker fails the run: {outcome:?}");
+    assert!(
+        outcome.stderr.contains("gate: command exited 0 but its log reports a failure"),
+        "{outcome:?}"
+    );
+    assert!(!outcome.stderr.contains("gate: routed build left stale"), "{outcome:?}");
+}
+
+/// A routed command that is no build writes no output a glob of a build's shape names, so nothing is called stale.
+#[test]
+fn a_routed_command_that_is_not_a_build_prints_no_stale_line() {
+    let case = no_globs_case("client-stale-not-a-build");
+    write(&case, r"bin\app.txt", "stale");
+
+    let outcome = passing_build(&case, &["ok", "ok"], &[r".\tool.exe", "out", "ran there"]);
+
+    assert!(!outcome.stderr.contains("gate: routed build left stale"), "{outcome:?}");
+}
+
+/// A build the builder turned away ran here and passed, so the run's own status would let the line print: nothing on the
+/// builder is stale of it, and the fallback's own path returns before the line is even computed.
+#[test]
+fn a_routed_build_that_fell_back_prints_no_stale_line() {
+    let case = no_globs_case("client-stale-fallback");
+    write(&case, r"bin\app.txt", "stale");
+    let steps = ssh_steps(&case, "ssh", &["fail-other"]);
+
+    let (pid, outcome) = finish_with_pid(client_gate(&case, "out.log", &steps, &wrapped_build(&[], &RELEASE)));
+
+    assert_eq!(outcome.code, Some(0), "the run here passed: {outcome:?}");
+    assert_eq!(fallbacks(&own(&case, pid)), ["unreachable"], "the build ran here: {outcome:?}");
+    assert!(!outcome.stderr.contains("gate: routed build left stale"), "{outcome:?}");
+}
+
 #[test]
 fn ctrl_c_during_the_install_says_how_many_files_were_installed() {
     let case = outputs_case("client-outputs-install-ctrl-c", &BIN);
@@ -5265,7 +5357,32 @@ fn an_installed_test_host_manifest_names_the_worktree() {
     let outcome = finish(client_gate(&case, "second.log", &second, &command));
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
-    let root = std::path::absolute(case.folder()).expect("the case folder has a full path");
+    let root = std::path::absolute(git_out(&case, &[], &["rev-parse", "--show-toplevel"])).expect("git names the worktree by a full path");
+    let expected = format!(r"Root_{}\src\App", root.display());
+    assert_eq!(worktree_text(&case, r"bin\MvcTestingAppManifest.json"), expected, "{outcome:?}");
+}
+
+/// A gate whose folder is spelled through a junction to the case folder, as it is through a `subst` drive, still names
+/// the worktree by git's real spelling in the manifest it installs.
+#[test]
+fn an_installed_test_host_manifest_names_the_worktree_from_a_junction() {
+    let case = outputs_case("client-outputs-install-rewrite-junction", &BIN);
+    let first = ssh_steps(&case, "first", &["ok", "ok"]);
+    let cleared = finish(client_gate(&case, "first.log", &first, &[r".\tool.exe", "out", "ran there"]));
+    assert_eq!(cleared.code, Some(0), "{cleared:?}");
+    let builder = std::path::absolute(case.folder().join("builder")).expect("the builder root has a full path");
+    let work = format!(r"{}\work\{}", builder.display(), key_of(&events(&case)));
+    let recorded = format!(r"Root_{}\src\App", work.to_uppercase());
+    let second = ssh_steps(&case, "second", &["ok", "ok", "ok"]);
+    let command = [r".\tool.exe", "write", r"bin\MvcTestingAppManifest.json", &recorded];
+    let junction = Junction::to(&case, &case.folder());
+    let mut gate = client_gate(&case, "second.log", &second, &command);
+    gate.current_dir(&junction.0);
+
+    let outcome = finish(gate);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let root = std::path::absolute(git_out(&case, &[], &["rev-parse", "--show-toplevel"])).expect("git names the worktree by a full path");
     let expected = format!(r"Root_{}\src\App", root.display());
     assert_eq!(worktree_text(&case, r"bin\MvcTestingAppManifest.json"), expected, "{outcome:?}");
 }
@@ -5286,7 +5403,7 @@ fn an_installed_utf16_coverage_mapping_names_the_worktree() {
     let outcome = finish(client_gate(&case, "second.log", &second, &[r".\tool.exe", "out", "ran there"]));
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
-    let root = std::path::absolute(case.folder()).expect("the case folder has a full path");
+    let root = std::path::absolute(git_out(&case, &[], &["rev-parse", "--show-toplevel"])).expect("git names the worktree by a full path");
     let expected = utf16_le(&format!(r"Root_{}\src\App", root.display()));
     let installed = fs::read(case.folder().join("bin").join(".msCoverageSourceRootsMapping_App")).expect("the file is installed");
     assert_eq!(installed, expected, "UTF-16 LE, its BOM kept, the worktree named: {outcome:?}");

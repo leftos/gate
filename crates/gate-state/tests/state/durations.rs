@@ -414,9 +414,9 @@ fn adjusted_p99_is_not_raised_to_the_wall_p50() {
     let estimate = store.estimate(&key, ts(NOW)).expect("five passing runs give an estimate");
 
     assert_eq!(
-        (estimate.p50, estimate.adjusted_p99),
-        (10.0, Some(1.0)),
-        "the wall p50 counts wall seconds, the adjusted p99 load-adjusted ones"
+        (estimate.p50, estimate.adjusted_p90, estimate.adjusted_p99),
+        (10.0, Some(1.0), Some(1.0)),
+        "the wall p50 counts wall seconds, the adjusted percentiles load-adjusted ones"
     );
 }
 
@@ -428,10 +428,36 @@ fn adjusted_p99_needs_five_adjusted_samples() {
     let mut five = DurationStore::new();
     record_adjusted(&mut five, &key, 5);
 
-    let of = |store: &DurationStore| store.estimate(&key, ts(NOW)).expect("five passing runs give an estimate").adjusted_p99;
+    let of = |store: &DurationStore| {
+        let estimate = store.estimate(&key, ts(NOW)).expect("five passing runs give an estimate");
+        (estimate.adjusted_p90, estimate.adjusted_p99)
+    };
 
-    assert_eq!(of(&four), None, "four runs with adjusted seconds are too few");
-    assert_eq!(of(&five), Some(1.0));
+    assert_eq!(of(&four), (None, None), "four runs with adjusted seconds are too few");
+    assert_eq!(of(&five), (Some(1.0), Some(1.0)));
+}
+
+#[test]
+fn adjusted_p90_and_p99_differ_over_a_wide_window() {
+    let key = local_key("cargo build");
+    let mut store = DurationStore::new();
+    let mut adjusteds = vec![1.0; 18];
+    adjusteds.extend([2.0, 9.0]);
+    for (index, adjusted) in adjusteds.into_iter().enumerate() {
+        let facts = RunFacts {
+            adjusted_seconds: Some(adjusted),
+            ..passed(10.0)
+        };
+        store.record(&key, minutes_before_now(20 - index), &facts);
+    }
+
+    let estimate = store.estimate(&key, ts(NOW)).expect("twenty passing runs give an estimate");
+
+    assert_eq!(
+        (estimate.adjusted_p90, estimate.adjusted_p99),
+        (Some(1.0), Some(9.0)),
+        "the 90th and 99th percentiles of the adjusted seconds differ"
+    );
 }
 
 #[test]

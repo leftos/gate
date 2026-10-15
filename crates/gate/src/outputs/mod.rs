@@ -12,4 +12,5 @@ pub(crate) mod glob;
 pub(crate) mod hash;
 pub(crate) mod manifest;
 pub(crate) mod names;
+pub(crate) mod stale;
 pub(crate) mod walk;

@@ -10,8 +10,8 @@
 //! `spawn-orphan <path>` runs `fake-tool spawn-wait <path>` with this process's handles and waits for it to end, so the
 //! helper that one starts is left with no parent and only the job this process runs in still reaches it;
 //! `spawn-pid <path> <release> <program> [words]` starts the program with those words and this process's handles,
-//! writes its pid to the file at the path, prints `spawned <its pid>`, and goes on holding the program's handle until
-//! the file at the release path comes, so the program's parent outlives the case's own opening of it; `exit <n>`
+//! writes its pid to the file at the path, whole, through a file beside it moved over it, prints `spawned <its pid>`,
+//! and goes on holding the program's handle until the file at the release path comes, so the program's parent outlives the case's own opening of it; `exit <n>`
 //! exits with status n, any 32-bit code, negative ones as Windows reads them back;
 //! `env <name>` prints the variable's value, or `fake-tool: <name> is not set`, on its own line; `bytes <hex>` writes the
 //! bytes the hex digits spell to stdout as they are, with no line feed added; `lines <n> <text>` prints n lines on
@@ -392,7 +392,7 @@ fn spawn_pid<'a>(steps: &mut impl Iterator<Item = &'a OsString>, stdout: &mut im
         .spawn()
         .map_err(|error| format!("cannot start {program}: {error}"))?;
     let pid = child.id();
-    write_file(&pid_path, &pid.to_string())?;
+    write_whole(&pid_path, &pid.to_string())?;
     writeln!(stdout, "spawned {pid}").map_err(|error| write_failed(&error))?;
     stdout.flush().map_err(|error| write_failed(&error))?;
     if !wait_for(&release)? {
@@ -441,6 +441,14 @@ fn make_folders(path: &str) -> Result<(), String> {
 fn write_file(path: &str, text: &str) -> Result<(), String> {
     make_folders(path)?;
     std::fs::write(path, text).map_err(|error| format!("cannot write {path}: {error}"))
+}
+
+/// Writes `text` to the file at `path`, replacing it, its folders made when missing, through a file beside it moved over
+/// it, so a case that waits for the path to exist never reads it empty or half written.
+fn write_whole(path: &str, text: &str) -> Result<(), String> {
+    let staged = format!("{path}.staged");
+    write_file(&staged, text)?;
+    std::fs::rename(&staged, path).map_err(|error| format!("cannot move {staged} over {path}: {error}"))
 }
 
 /// Writes a file of `size` bytes, each `x`, at `path`, its folders made when missing, copied through a fixed buffer so

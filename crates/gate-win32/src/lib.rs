@@ -44,7 +44,8 @@ pub use token::{Grant, NetworkGroup, RestrictedToken, TokenFacts, token_facts};
 ///
 /// # Errors
 ///
-/// An error saying which of those it is, or the system's error when the file cannot be inspected.
+/// A refusal, an error with no system error code ([`io::Error::raw_os_error`] is `None`) saying which of those it is;
+/// else the system's error, its code kept, when the file cannot be inspected.
 pub fn check_plain_file(file: &std::fs::File) -> io::Result<()> {
     use std::os::windows::io::AsRawHandle;
 
@@ -325,9 +326,9 @@ fn timestamp_of(ticks: u64) -> Option<Timestamp> {
 #[expect(clippy::expect_used, reason = "a test whose open result is not the one it gave must fail loudly")]
 mod tests {
     use std::cell::Cell;
-    use std::io;
+    use std::{fs, io};
 
-    use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, ERROR_NOT_ENOUGH_MEMORY};
+    use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_INVALID_HANDLE, ERROR_INVALID_PARAMETER, ERROR_NOT_ENOUGH_MEMORY};
 
     use super::{Judge, choose_handle};
 
@@ -385,6 +386,31 @@ mod tests {
             choose_handle::<&str>(Err(refused(ERROR_ACCESS_DENIED)), || Err(refused(ERROR_ACCESS_DENIED))).expect_err("both opens were refused");
 
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error}");
+    }
+
+    #[test]
+    fn a_handle_that_cannot_be_inspected_is_the_systems_error_with_its_code() {
+        let error = crate::launch::check_plain_file(std::ptr::null_mut()).expect_err("a null handle is no open file");
+
+        assert_eq!(error.raw_os_error(), refused(ERROR_INVALID_HANDLE).raw_os_error(), "{error}");
+    }
+
+    #[test]
+    fn a_file_with_two_names_is_refused_with_no_system_error_code() {
+        let folder = std::env::temp_dir().join(format!("gate-win32-plain-{}", std::process::id()));
+        // A folder left by an earlier run of the same pid is cleared first.
+        let _ = fs::remove_dir_all(&folder);
+        fs::create_dir_all(&folder).expect("the scratch folder is made");
+        let first = folder.join("first");
+        fs::write(&first, b"one file").expect("the file is written");
+        fs::hard_link(&first, folder.join("second")).expect("the file gets a second name");
+        let file = fs::File::open(&first).expect("the file opens");
+
+        let error = super::check_plain_file(&file).expect_err("a file with two names is refused");
+
+        drop(file);
+        let _ = fs::remove_dir_all(&folder);
+        assert_eq!(error.raw_os_error(), None, "{error}");
     }
 
     #[test]

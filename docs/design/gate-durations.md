@@ -40,7 +40,7 @@ Each part is a sub-issue of CC-178 and lands on `feat/gate-durations`. Part 1 co
   The normalise table in `crates/gate-state/tests/state/durations.rs` is the fixture for these rules. `keyVersion` in the summary names the rule set; a mismatch rebuilds the summary from the archive and the live journal.
 - **Estimate.** p90 and p99 (nearest rank) of `wallSeconds` (and of `adjustedSeconds` for ceilings) over the last 30 passing runs or 14 days, whichever holds fewer runs. p50 is the median of the 5 most recent of those runs, so it follows a real change within three runs while one outlier cannot move it (Tsafrir et al. find recent runs predict better than a long history); p90 and p99 are raised to p50 when a slower recent stretch puts it above them.
 
-  The adjusted p99 is not: p50 is a wall figure and the adjusted seconds are load-adjusted, so the two do not compare. It is none unless at least 5 of the window's runs carry adjusted seconds. A key needs 5 passing runs.
+  The adjusted p90 and p99 are not: p50 is a wall figure and the adjusted seconds are load-adjusted, so the two do not compare. Each is none unless at least 5 of the window's runs carry adjusted seconds. A key needs 5 passing runs.
 
   The mean of the window's `wallSeconds` is the expected time the line names.
 
@@ -69,7 +69,9 @@ Each part is a sub-issue of CC-178 and lands on `feat/gate-durations`. Part 1 co
 
   Why not a learned kill time: Tsafrir, Etsion and Feitelson keep the user's estimate as the kill time and use predictions for scheduling only, since about 20% of jobs are underpredicted and would be killed early, and a p99 over at most 30 runs sits close to the sample maximum (`docs/research/2026-10-09-gate-prior-art-local.md`, section 4).
 - A line after the expected-time line when history raised the floor: `gate: ceiling <resolved> (3x this command's p99 of <p99>, above the given <n>)`.
-- A hint after it when the resolved ceiling is below the command's p90: `gate: the ceiling <resolved> is below this command's usual p90 of <p90>`. Figures are the expected-time line's: `<n> s` below 90 s, whole minutes from 90 s. A family key's lines read `similar commands'` in place of `this command's`.
+- A hint after it when the resolved ceiling is below the command's adjusted p90: `gate: the ceiling <resolved> is below this command's load-adjusted p90 of <p90>`.
+
+  Callers give a ceiling for a quiet machine and the kill runs on the load-adjusted clock, so the wall p90, which grows under load, never triggers it; a command with no adjusted p90 gets no hint. Figures are the expected-time line's: `<n> s` below 90 s, whole minutes from 90 s. A family key's lines read `similar commands'` in place of `this command's`.
 - A one-time hint while running, once the run passes 3x its p90: `gate: still running after <running>, <k>x its usual p90 of <p90>`, `k` rounded down. A local run counts its wall time less paused time, checked at each watch sample; a routed run counts the wall time since the builder's start marker reached the client, said live. It is never said for a p90 under 1 s, and it kills nothing.
 - The claim's `timeoutSeconds`, the TIMED OUT kill and the 5x backstop, the remote call's timeout and the passed line's `ceiling <n> s` all use the resolved ceiling.
 

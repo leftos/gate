@@ -211,7 +211,7 @@ pub(crate) fn in_context(path: &Path, error: &io::Error) -> io::Error {
 
 #[cfg(test)]
 #[expect(clippy::expect_used, reason = "a test that cannot make its folders or files must fail loudly")]
-mod tests {
+pub(crate) mod tests {
     use std::ffi::{OsStr, OsString};
     use std::fs;
     use std::os::windows::ffi::OsStringExt;
@@ -224,8 +224,8 @@ mod tests {
     use crate::outputs::glob::Globs;
 
     /// A scratch folder for one test, emptied first, holding a file at each `/`-separated path of `files`, its text
-    /// the path.
-    fn tree(test: &str, files: &[&str]) -> PathBuf {
+    /// the path; the output modules' own tests share it.
+    pub(crate) fn tree(test: &str, files: &[&str]) -> PathBuf {
         let root = std::env::temp_dir().join(format!("gate-walk-{}-{test}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         for file in files {

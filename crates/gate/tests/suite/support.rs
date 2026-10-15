@@ -925,11 +925,47 @@ pub fn shown(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
+/// The names of the entries in `folder`, in name order.
+pub(crate) fn names(folder: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(folder)
+        .expect("the folder can be listed")
+        .map(|entry| entry.expect("an entry can be read").file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
 /// The path of `path` with `suffix` after its name, as fake-ssh names the files it keeps beside its steps file.
 pub fn beside(path: &Path, suffix: &str) -> PathBuf {
     let mut beside = path.as_os_str().to_owned();
     beside.push(suffix);
     PathBuf::from(beside)
+}
+
+/// A junction beside the case folder, outside its worktree, made with `mklink /J`; removed, and not what it leads to,
+/// when it drops.
+pub struct Junction(pub PathBuf);
+
+impl Junction {
+    /// A junction that leads to `target`.
+    pub fn to(case: &Case, target: &Path) -> Junction {
+        let mut link = case.folder().into_os_string();
+        link.push("-junction");
+        let link = PathBuf::from(link);
+        // A junction an earlier run of the case left would make `mklink` refuse.
+        drop(fs::remove_dir(&link));
+        junction(&link, target);
+        Junction(link)
+    }
+}
+
+impl Drop for Junction {
+    fn drop(&mut self) {
+        if let Err(error) = fs::remove_dir(&self.0) {
+            // A junction left beside the case harms no later case, which removes it first, and a panic in drop aborts.
+            let _ = writeln!(io::stderr(), "could not remove the junction {}: {error}", self.0.display());
+        }
+    }
 }
 
 /// The words of a light run logging to `log`, `extra` before `--` and `command` after it. Gates that run at once each

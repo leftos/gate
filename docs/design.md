@@ -137,22 +137,38 @@ With nothing to push or nowhere to push it, `gate push` tries no builder, prints
 - `push: no installed gate at <path>; run tools/install.ps1`;
 - `push: no remote.json: LOCALAPPDATA is not an absolute folder`, for an unset, empty or relative `LOCALAPPDATA`;
 - `push: could not read the version of <path>`, when the installed exe's `--version` gives no `gate <version>` line or takes over 30 s;
-- `push: cannot read <path>: <error>`, when the installed exe cannot be read.
+- `push: cannot read <path>: <error>`, when the installed exe cannot be read;
+- `push: an install is in progress on this PC; nothing was sent`, when `tools/install.ps1` holds this PC's `push.lock`;
+- `push: <bin>\push.lock is a link; nothing was sent`, and `push: could not lock <bin>: <error>; nothing was sent` for any other refusal of the lock. The link text is also said for a `push.lock` that is a folder, a junction or a second name of another file (a hard link); the open never follows a link.
+
+`gate push` holds `%LOCALAPPDATA%\gate\bin\push.lock` on this PC, open and unshared, while it reads the installed exe's bytes and runs its `--version`, and lets go before the first builder, so it never reads a gate.exe that `tools/install.ps1` is replacing.
 
 `<v>`, `<old>` and `<new>` are the whole text after `gate ` in `gate.exe --version`, build id included, as `tools/install.ps1` reads it; the local one is read once, before the first builder. Per builder, on stdout:
 
 1. `push: <host>: sending gate <v>`, before the transfer.
 2. Then one of `push: <host>: gate <v> already installed` (an identical SHA-256: nothing was replaced), or `push: <host>: replaced gate <old>` followed by `push: <host>: installed gate <new>` (`replaced` only when a gate was there before), or on stderr `push: <host> failed: <reason>`.
 
-`push: <host>: could not delete <path>: <message>` on stderr names an aside or stale temporary copy the builder could not delete; it never fails the push.
+A note on stderr never fails the push: `push: <host>: could not delete <path>: <message>` names an aside or stale temporary copy the builder could not delete, `push: <host>: could not delete the aside copies in <dir>: <message>` says the folder could not be listed after a verified install, and `push: <host>: could not list <dir>: <message>` says the same of the count of kept aside copies.
+
+`push: <host>: could not stop the version read of <path>: <message>` says a version read past its bound could not be killed (the read still gives no version).
+
+After the builder's other stdout lines, a push that ends with `gate.exe` missing or one it could not verify left in place, and with aside copies in the folder, says `push: <host>: kept <n> aside copies: gate.exe is not verified` on stdout, `<n>` counting every `gate.exe.*.old` present, this push's own included. It is never a failure by itself: an exe identical to the installed one that does not answer `--version` still says `already installed` and exits 0, with this line after it.
 
 A failure reason is one of: `timed out after <n> s`, `no answer`, ssh's last stderr line, `cannot feed the call: <error>`, or the builder script's own.
 
-The builder script's own reasons are `the copy could not be read: <exception message>`, for bytes that do not decompress; `the copy arrived damaged`; `<dir> is a link`; `<dir>\push.lock is a link`; `another gate push is installing on this builder`; `could not lock <dir>: <message>`; and the failing step's message.
+The builder script's own reasons are `the copy could not be read: <exception message>`, for bytes that do not decompress; `the copy arrived damaged`; `<dir> is a link`; `<dir>\push.lock is a link` (also for a folder, a junction or a hard link there); `another gate push is installing on this builder`; `could not lock <dir>: <message>`; `the builder needs pwsh 7.2 or later (it has <version>)`.
 
-`the installed copy does not match`, or `could not install <path>: <message>` when the installed copy cannot be read after the move, ends with `; the previous gate.exe is back in place` or `; the previous gate.exe is at <aside>`.
+`could not prepare the install: <message>` says the script's small C# type for its file checks could not be added (constrained language, no compiler), before anything is touched. Any other failure says the failing step's message.
 
-On a first install it ends instead with `; the copy was removed and no earlier gate.exe existed` or `; the copy at <path> could not be removed: <message>`. A first install whose move of the temporary copy into place fails says `could not install <path>: <message>; nothing was installed and no earlier gate.exe existed`.
+`the installed copy does not match`, `the installed gate.exe does not run` (the installed copy hashes right but gives no `gate <version>` line within 30 s), or `could not install <path>: <message>` when the installed copy cannot be read after the move or the move into place fails, ends with `; the previous gate.exe is back in place` or `; the previous gate.exe is at <aside>`.
+
+On a first install it ends instead with `; the copy was removed and no earlier gate.exe existed` or `; the copy at <path> could not be removed: <message>`. A first install whose move of the temporary copy into place fails with no gate.exe there says `could not install <path>: <message>; nothing was installed and no earlier gate.exe existed`.
+
+The move back acts only while `gate.exe` is missing or still this push's own file, the one with the temp copy's NTFS file id (`FILE_ID_INFO`: the volume serial number and the 128-bit id), which the script reads from the handle that wrote the temp copy and which the rename into place keeps; the hash does not decide it.
+
+An id that cannot be read is tried three times, 300 ms apart, and a file gone at any try or after the last counts as missing, never as another's. The script reads the id through a small C# type it adds with `Add-Type`, which costs about 0.3-0.5 s on a push that installs; the same-exe path never adds it. The move back never overwrites a `gate.exe` that is missing.
+
+A `gate.exe` another process placed meanwhile, a by-hand install say, is left as it is and the reason ends with `; another gate.exe was placed meanwhile and was left as it is`, followed on a push that moved an old gate aside by `, the previous gate.exe is at <aside>`.
 
 Builder text is escaped as the remote client escapes it and cut to 4096 bytes.
 
@@ -166,15 +182,19 @@ The bootstrap is a short fixed PowerShell line that reads stdin's first line and
 
 Stdin is line 1, the install script as base64 of its UTF-8 with this PC's SHA-256 put in, then the exe as base64 text of its gzip (flate2's best level). The push call is not asked for ssh compression: the bytes are already compressed.
 
-The builder needs pwsh 7.1 or later. The script decompresses the copy with .NET `GZipStream`, carries this PC's SHA-256 of the exe and refuses decompressed bytes that differ, reports on `gate-push: ` lines that this side maps to the `push:` lines, and exits 1 after a failure.
+The builder needs pwsh 7.2 or later, whose .NET the file checks need; an older one fails the push with `the builder needs pwsh 7.2 or later (it has <version>)` before anything is touched. The script decompresses the copy with .NET `GZipStream`, carries this PC's SHA-256 of the exe and refuses decompressed bytes that differ, reports on `gate-push: ` lines that this side maps to the `push:` lines, and exits 1 after a failure.
 
 Two pushes to one builder at once are refused: the script holds `push.lock` in the builder's `%LOCALAPPDATA%\gate\bin` open, unshared, for the whole install, so the second push fails at once with `another gate push is installing on this builder`, touching nothing, the cleanup of aside copies included.
 
-The open handle is the lock: `push.lock` stays as a plain file after a push and never blocks a later one, and a `push.lock` that is a link is refused with `<dir>\push.lock is a link`.
+The open handle is the lock: `push.lock` stays as a plain file after a push and never blocks a later one, and a `push.lock` that is a link, a folder, a junction or a second name of another file is refused with `<dir>\push.lock is a link`: the lock is opened without following a link and the opened handle is checked.
 
-On the builder the script installs as `tools/install.ps1` does ([Install](#install)), in its own `%LOCALAPPDATA%\gate\bin`, which it creates when missing and refuses when it is a link: it deletes the aside copies (`gate.exe.*.old`) and the stale `gate.exe.<pid>.tmp` copies no process holds.
+`tools/install.ps1` and the PC side of `gate push` take the same `push.lock` in their own bin folder with the same open, so an install, a push's read of the exe and a push to a builder never change or read one folder's gate.exe at once ([Install](#install)).
 
-It says the same version when `gate.exe` already has the same SHA-256; else it writes the exe to `gate.exe.<pid>.tmp` (created new), moves the old one aside to `gate.exe.<stamp>.<pid>.old`, moves the temporary file into place, checks the SHA-256 of the installed copy and moves the aside copy back when anything failed, the check's own read included; with no old exe to move back, it removes the installed copy.
+On the builder the script installs as `tools/install.ps1` does ([Install](#install)), in its own `%LOCALAPPDATA%\gate\bin`, which it creates when missing and refuses when it is a link: it first deletes the stale `gate.exe.<pid>.tmp` copies of other pids that no process holds, and the aside copies (`gate.exe.*.old`) only after the installed gate is verified.
+
+It says the same version when `gate.exe` already has the same SHA-256; else it writes the exe to `gate.exe.<pid>.tmp` (created new), moves the old one aside to `gate.exe.<stamp>.<pid>.old`, moves the temporary file into place without force, checks the SHA-256 of the installed copy and that it answers `--version` with `gate <version>`, and puts the aside copy back when anything failed, the check's own read included; with no old exe to move back, it removes the installed copy.
+
+An installed gate is verified when its SHA-256 matches and `--version` answers, and only then does the cleanup run: it deletes every aside copy no process holds but this push's own, which stays as the last good gate. A push that ends with `gate.exe` missing or unverified, a failed one and an identical exe that does not answer included, deletes no aside copy.
 
 Each version read on the builder is bounded at 30 s.
 
@@ -420,6 +440,13 @@ The lines of a run that starts its command:
   In it `<w>` is the attempt's whole wall time; `<a>` is the load-adjusted time the builder counted for the command, the clock `--timeout` bounds; `<c>` is the run call's own wall time; the push is always named, the sync-back and the outputs fetch only when they ran, in the order they ran, each in whole seconds rounded half to even.
 
   With no figure from the builder (its sampler failed) the clause reads `load-adjusted unknown: the sampler failed` and the past-ceiling check uses `<c>`. The client's status is the gate's own, passed through as `N`.
+- The stale line, on stderr and in the log, before the passed line, when a routed dotnet build (verb `build`, `test`, `publish`, `pack`, `run` or `msbuild`, with no `--no-build` of its own) passed and did not bring everything back: `gate: routed build left stale: <folders>`.
+
+  The folders are every PC-side folder (no cap) that a judging glob matches and no brought-back glob covers, judged per file: a folder whose every matching file came back is not named. The judging globs are the run's `outputs`, or the default globs when the repo's entry is absent or `[]`, plus the defaults `**/bin/**` and `**/.godot/mono/temp/bin/**`. The folders are sorted, relative to the worktree root, `/`-separated, escaped and joined with `, `.
+
+  A glob names the folder where its last plain folder part ends, at the first place from the left where its plain parts match whole path components: `**/bin/**` and `**/bin/**/*.dll` name each `src/App/bin`, `out/**/App.dll` names `out`, `publish/App.exe` names `publish`; a glob with no plain folder part (`**`, `*.dll`, `**/*.dll`) names nothing. The line may name a folder this build did not touch.
+
+  It is not said after a failed build (an exit 0 whose log reports a failure included), a fallback or a command that is not a build, and it neither writes nor clears the nothing-back record. A walk of the worktree that fails says `gate: routed build may have left stale output; could not list it: <reason>` instead.
 - A critical gate, on stderr and in the log: the `waiting for the machine (critical)`, `still waiting for the machine (critical)`, `holds the machine (critical)` and `interrupted while waiting for the machine` lines, in [Critical drain and nesting](#critical-drain-and-nesting).
 - Nesting, on stderr and in the log, from the slot marker in the gate's environment: the `running under` (including the lend's `while a critical request drains`), `ignored GATE_SLOT_HELD`, `could not judge GATE_SLOT_HELD` and `does not cover` lines, the barrier's `waiting for a heavy slot behind the critical request` and `waiting for a light slot beside the critical request` lines, and the refusal of a critical gate, all in [Critical drain and nesting](#critical-drain-and-nesting).
 
@@ -428,7 +455,9 @@ The lines of a run that starts its command:
 - The expected-time line, on stderr and in the log, once a run that takes a slot has written its claim and woken the waiters and before the command's output: `gate: expected about <n> s (usual <n> s, p90 <n> s, <runs> runs)`, or in whole minutes from 90 s: `gate: expected about <n> min (usual <n> min, p90 <n> min, <runs> runs)`. A local light or heavy take says it, a critical gate after its holds line, a routed run at its remote take, and a fallback a second one at its local take.
 
   `about` is the mean wall time over the estimate's window (the last 30 passing runs or those within 14 days, whichever holds fewer), `usual` the median of the 5 newest, and every figure is rounded and floored at 1 s (or 1 min). An estimate from the family key ends `<runs> runs of similar commands)`. A key with fewer than 5 passing runs, a `--slot none` run, and a run a parent's slot covers or lends say nothing ([design/gate-durations.md](design/gate-durations.md), Estimate).
-- The ceiling lines, on stderr and in the log, right after the expected-time line (at each take, a lent take included): `gate: ceiling 42 min (3x this command's p99 of 14 min, above the given 15 min)` only when history raised an auto ceiling above its floor, then `gate: the ceiling 10 min is below this command's usual p90 of 14 min` when the resolved ceiling, given or auto, is below the estimate's p90.
+- The ceiling lines, on stderr and in the log, right after the expected-time line (at each take, a lent take included): `gate: ceiling 42 min (3x this command's p99 of 14 min, above the given 15 min)` only when history raised an auto ceiling above its floor, then `gate: the ceiling 10 min is below this command's load-adjusted p90 of 14 min` when the resolved ceiling, given or auto, is below the estimate's adjusted p90.
+
+  The ceiling is in load-adjusted seconds, so the hint compares it with the adjusted p90 alone: an estimate without one says no hint, however long its wall p90.
 
   Their figures are the expected-time line's: `<n> s` below 90 s, whole minutes from 90 s. An estimate from the family key reads `similar commands'` in place of `this command's`, and a family key whose p90 is above 2x its p50 does not raise the ceiling.
 - The hang hint, once a run, on stderr and in the log: `gate: still running after 42 min, 3x its usual p90 of 14 min` (`similar commands' usual p90` for a family key), `k` rounded down, from the run's passing 3x the p90 of its take's estimate. A local run counts wall time less paused time, checked at each watch sample; a routed run counts the wall time since the builder's start marker reached the client, said live. It is never said for a usual p90 under 1 s and kills nothing.
@@ -957,6 +986,14 @@ All kept, with each knob's default unchanged:
 
   The stall check and the load figures count the job's own processes and the escaped tree only: a build server that is neither in the job nor under one of its members is neither progress nor the command's own CPU in the free share, and a server in the job, or escaped from a member, is one of its processes like any other.
 
+    Each run has build servers of its own because a shared one is not the run's to end or to count: a server another run started would be neither in this run's job nor under its members, so a run's end could not wait on its whole tree, its CPU could not be told from a neighbour's, and a kill could not tell which server it may end.
+
+    A server a member starts lives in the member's job, since none of the launchers (MSBuild's node launcher, Roslyn's `BuildServerConnection`) asks for breakaway and the gate's job allows none, so the run's end ends it with the job.
+
+    The approach rejected is sparing shared servers: classifying build server images and command lines, counting their CPU only while the job held a build client, lowering or raising their priority, and leaving them out of the escaped-tree kill.
+
+    It needed a classifier that tracks every toolchain's server names, and it could not tell a server a run needs from one that merely runs. Node reuse stays off so MSBuild nodes end with the invocation, and the compiler server's pipe id is the run's, so it is reused within the run only.
+
   The watch hands the pure crate raw facts: the job's CPU, the escaped tree's per-process CPU and the VM's CPU as an option (`None` for a command that is not a `wsl` one, or with no VM).
 - Kill, on a STALLED, TIMED OUT or BACKSTOP alike: the diagnostics block (X3), then `TerminateJobObject(job, 124)` and the end of the processes that left the job (below), `gate: terminated the job's <n> process(es)` (with the escaped processes named, below), `gate: diagnostics written to <log>`, a 5 s wait for the command and exit 124 (X2).
 
@@ -1014,6 +1051,8 @@ All kept, with each knob's default unchanged:
   - A stall, ceiling or Ctrl+C kill ends these processes with what is under them and counts them in the `and <m> that left it` line; a gate failure after the command's own exit ends none. The diagnostics block lists the departed members' children and their descendants.
   - The stall check adds the CPU the escaped tree gained since the last progress to the job's CPU against the 1% floor, and a new escaped process (by pid and start) is progress; both reset on progress. So a command whose work runs there is not stalled or timed out while it is busy. The other kill sites (`gate box stop`, the remote client, `gate push`) do not end them yet (GATE-140).
   - **Every kill site ends the escaped tree** (GATE-140), planned, not built: the box's stop, the remote client's kill and `gate push`'s kill end the escaped processes the way a `gate run` kill does, so the sites agree on what is ended.
+
+    The escaped-tree kill spares no build server and no shared daemon, since each run's build servers live in its own job ([Command launching](#command-launching)); whether `mspdbsrv` or a .NET Framework MSBuild node can leave the job is unmeasured (GATE-143). The one process it treats apart is a gate's, whose own command's job is terminated before it is ended.
 - The diagnostics block (X3) is gathered before the job is terminated and goes to the log only, between the command's output and the kill line. A command that exits during the gathering keeps its own status and writes no block. Its lines:
   - `gate: diagnostics`, then `gate:   job <pid> parent <ppid> <name>: cpu <s> s, working set <mb> MB: <command line>` for each process of the job (up to 40, then `gate:   ... and <n> more job processes`), and `gate:   outside job ...` lines for the descendants outside the job (up to 20), the recorded escaped processes and their descendants after them.
   - Up to six sample lines, `gate:   sample at <w> s (load-adjusted <a> s, free <p>%): log <n> B, err <n> B, job cpu <s> s, <n> processes, escaped cpu <s> s`, or `gate:   samples: none` when no sample was taken. `<w>` is the sample's `at` stamp.
@@ -1162,6 +1201,8 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
   The check is skipped, and the word kept, when the worktree root's `Directory.Build.props` or `Directory.Build.targets` names `UseArtifactsOutput`, `ArtifactsPath`, `BaseIntermediateOutputPath` or `MSBuildProjectExtensionsPath`. Solution entries that are not plain names inside the worktree are skipped.
 
+  Inside is judged by canonical path, both sides resolved: another spelling of the worktree (a `subst` drive, a junction) counts as inside, and a project folder inside the worktree that is a junction leading outside counts as outside.
+
   Props and solution files are read only as regular files up to 1 MiB; otherwise the gate says `gate: cannot read <path>: it is a link, a junction or not a file` or `gate: cannot read <path>: it is larger than 1 MiB`, and the word is kept. Printed paths escape control characters. When git fails the gate says `gate: cannot find the command's git worktree: <error>` or `gate: cannot list the worktree's projects: <error>` and keeps the word.
 
   The git calls of the drop and the clear run with `LC_ALL=C`. The clear prints nothing when git is missing or the folder is outside a repository.
@@ -1170,6 +1211,8 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
   The Rust remote client says `yes` only when the outputs archive installed complete (skipping at most files it cannot rewrite), or when the box packed nothing for a PC whose sent manifest held files, and no name was skipped (the box's `gate: remote outputs: skipped ` line); every other end of the outputs step is `no`, and an end that never reaches the outputs step is `unknown`. No and unknown count alike: the record is written.
 
   A routed dotnet build that passed (status 0) with its outputs all brought back removes the record instead, as a passing build here would: only when its words are whole (they name a solution, or nothing at the worktree root), its verb is not `msbuild`, and its `-c`, `-f` and `-r` match the record's; otherwise the record is left as it was, not rewritten. A record that cannot be removed says `gate: cannot remove <path>: <error>`, as the clear here does.
+
+  A passing routed dotnet build that did not bring everything back also says which folders it left stale ([Output lines](#output-lines)); that line reads the outputs outcome and never changes the record.
 
   A routed dotnet `--no-build` command whose word the builder dropped (the builder built, and nothing comes back) writes the record when none stands, whichever client ran it and whether or not the repo has output globs, with the builder and the `-c`, `-f` and `-r` its words set; it never rewrites or clears a record that stands.
 
@@ -1982,9 +2025,19 @@ Built verbs:
 
   The inherited count is read as git reads it (leading whitespace, an optional `+`, decimal digits to the end, at most `i32::MAX`; an empty value is 0); a count git would refuse, or `i32::MAX` itself, leaves the environment unchanged. The work folders are owned by Administrators, which git refuses from a non-elevated token.
 
+  The command's environment also sets `Logging__EventLog__LogLevel__Default=None`, replacing any inherited value, so a .NET host with default logging writes nothing to the Windows Event Log; its console output is unchanged. Of the groups the Application log's default access lets write, a restricted copy of the box's token could hold only Administrators, INTERACTIVE, SERVICE, BATCH and WRITE_RESTRICTED, and the command's token holds none of them.
+
+  On a builder without the setup grant below (a fresh or reimaged one), the host's default EventLog provider would throw `Access is denied` on its first Warning; the variable keeps such a host working wherever the grant is missing.
+
   Known cost: deny entries naming NETWORK still apply to the command, but allow entries naming NETWORK no longer grant, so a resource whose DACL grants NETWORK alone is open to a command run directly over ssh and closed to the same command routed.
 
   Known cost: the first non-elevated build in each work folder starts fresh MSBuild nodes and compiler servers, since their handshake includes elevation. A command that creates symlinks needs Developer Mode on the builder, as on the PC; builder setup turns it on (`AllowDevelopmentWithoutDevLicense` = 1).
+
+  Known cost: the variable does not cover a command that writes to the Event Log by another route (`EventLog.WriteEntry`, a logging library's own sink). Nor does it cover a host whose own configuration sets the EventLog provider's level: a category rule (`Logging:EventLog:LogLevel:Microsoft`), which wins over the default, or a configuration source added after environment variables, or a bare `HostBuilder` that never reads them.
+
+  Builder setup therefore grants the builder user write access to the Application log: one allow entry for the user's SID, write access 0x2, added to the channel's access SDDL with `wevtutil sl Application /ca:` from an elevated session. That covers every writer to that log under a registered source.
+
+  Any routed command, and anything else run as the builder user, can then write entries under any registered source, so the builder's Application log is not evidence of what the system did. Registering a new event source and writing to any other log still need Administrators, so they fail on a routed run.
 
   The stop event `<job>-stopped` ([Kernel object names](#kernel-object-names)) is a manual-reset event the run creates, unset, right after it takes the work-folder lock, before the fetch and checkout; one that cannot be created prints `gate: the gate failed while running the command: cannot create the event <job>-stopped: <error>` and exits 1.
 
@@ -2121,9 +2174,20 @@ The rest of the protocol, the transport of snapshots and outputs, is the remote 
 - Otherwise the new exe is first copied to a temporary name in the folder; then a copy already there, running or not, is moved aside to `gate.exe.<stamp>.<pid>.old` (which works while gates run it), and the temporary file is renamed into place, so `gate.exe` is missing only between two renames.
 
   A failed copy leaves the installed exe untouched; a failed final rename moves the old exe back, and the failure line says whether that worked. The script prints the version it replaced and the version it installed.
-- Aside copies that no process holds any more are deleted; one a running gate still holds stays until a later install.
+- The script holds `push.lock` in the install folder, open and unshared, from the confirmed Install step to its end, the same lock `gate push` takes on a builder and on this PC ([`gate push`](#gate-push)). While a push holds it the script stops with `install: another gate push is installing; nothing was changed` and exit 1.
+
+  The script needs pwsh 7.2 or later (`#Requires -Version 7.2`); `install: could not prepare the install: <message>` says its small C# type for the file checks could not be added.
+
+  A `push.lock` that is a link, a folder, a junction or a second name of another file gives `install: <dir>\push.lock is a link; nothing was changed`, a folder it cannot make `install: could not create <dir>: <message>`, and any other refusal `install: could not lock <dir>: <message>`. Declined (`-Confirm` "No") and `-WhatIf` create no folder and no lock.
+- The installed copy is verified when it answers `--version` with `gate <version>` (the script's version reads are bounded at 30 s).
+
+  A copy that does not answer is taken out and the previous gate.exe put back: the script fails with `install: the installed gate.exe does not run; the previous gate.exe is back in place` (`; the previous gate.exe is at <aside>` when the move back fails, `; the copy was removed and no earlier gate.exe existed` on a first install, `; the copy at <path> could not be removed: <message>` when that fails).
+- The move into place and the move back run without force over a missing gate.exe and act only while gate.exe is missing or the install's own file (the temp copy's file id, read from the handle that wrote it; a file gone after the last id read counts as missing); one another process placed is left as it is, with `; another gate.exe was placed meanwhile and was left as it is` and, on a replacing install, `, the previous gate.exe is at <aside>`.
+- Aside copies no process holds are deleted only once the installed gate is verified (also when the exe is already installed and answers), but this install's own, which stays as the last good gate; one a running gate still holds stays until a later install. Every aside copy is kept, silently, when the install ends unverified. One that cannot be deleted prints `install: could not delete <path>: <message>` on stderr.
 - It adds `%LOCALAPPDATA%\gate\bin` to the user's PATH when missing, so callers run `gate`: the raw registry value of the user environment is read and written, keeping its kind and its unexpanded `%NAME%` entries; the change is broadcast (`WM_SETTINGCHANGE`, as `setx` does) so programs started from then on see it, and the script says to open a new terminal. It never touches the state root's files.
-- `-WhatIf` lists every step without taking it. `-Exe` (install a prebuilt exe, skipping the build) and `-EnvironmentKey` (the registry key the PATH entry lives in) exist for the suite, which runs the script against a temporary `LOCALAPPDATA` and registry key.
+- `-WhatIf` lists every step a real run would take without taking it, the aside deletes included.
+
+  For the exe already in place it prints `install: gate <version> already installed at <path>` and a Delete line for each aside copy a real run would delete, when the installed gate answers `--version`. `-Exe` (install a prebuilt exe, skipping the build) and `-EnvironmentKey` (the registry key the PATH entry lives in) exist for the suite, which runs the script against a temporary `LOCALAPPDATA` and registry key.
 - Every install deletes a leftover `remote-bridge.ps1` file in the install folder, which no gate starts. When it cannot, it prints `install: cannot remove the old remote-bridge.ps1 (<reason>); it is unused` on stderr and carries on with exit 0; a folder at that name is left alone.
 - The script installs locally only. `gate push` copies the installed exe to each builder in `remote.json` (`host`, then `hosts`), with the same rename-aside on the builder, so a machine with builders runs `pwsh tools/install.ps1` and then `gate push` ([`gate push`](#gate-push)). It pushes the installed exe, never one from `target/`, and never installs here.
 - Install is a script, not a `gate install` subcommand.
@@ -2363,6 +2427,6 @@ What no ruling settles yet, with the issue that owns it:
 
 - **The box protocol and `remote.json`'s next format** (GATE-10): verbs, payload and transport between PC and builder, whether ssh keeps cmd.exe as the builder's shell, and the routing file's version and matcher.
 - **A prediction a run has passed** (GATE-14): what a holder past its p90 reports in wait lines, and whether the critical gate re-prices its shadow end and closes or shrinks the lent window when a blocker overruns.
-- **Which members the run's end spares** (GATE-205): the run's end spares every job member whose image is `gate.exe`, whatever gate it is; GATE-205 tracks hardening that judgement.
+- **Which members the run's end spares** (GATE-144): the run's end spares every job member whose image is `gate.exe`, whatever gate it is; GATE-144 tracks hardening that judgement.
 - **The surfaces of `gate status` and `gate drain`** (no issue yet). Install stays a script (`tools/install.ps1`) until a reason for a `gate install` subcommand appears.
 - **The Windows facilities to spike before their slice** (GATE-5): other users' command lines (B1), the desktop-app breakaway policy (X1) and nested jobs, each of which changes kill behaviour if it silently fails.

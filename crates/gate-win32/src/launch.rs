@@ -18,7 +18,7 @@ use windows_sys::Win32::Foundation::{
 use windows_sys::Win32::Globalization::{CSTR_EQUAL, CSTR_GREATER_THAN, CSTR_LESS_THAN, CompareStringOrdinal};
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, CREATE_NEW, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_CREATION_DISPOSITION,
-    FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TYPE_DISK,
+    FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TYPE_DISK, FILE_TYPE_UNKNOWN,
     GetFileInformationByHandle, GetFileType, OPEN_EXISTING, SECURITY_ANONYMOUS, SECURITY_SQOS_PRESENT,
 };
 use windows_sys::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE};
@@ -388,11 +388,20 @@ fn create_output(path: &Path) -> Result<OwnedHandle, LaunchError> {
     Ok(handle)
 }
 
-/// Refuses a handle that is not to a disk file, is to a reparse point, or is to a file with more than one name. The
-/// caller keeps `handle` open for the whole call.
+/// Refuses a handle that is not to a disk file, is to a reparse point, or is to a file with more than one name, with an
+/// error that carries no system error code; a handle whose file cannot be inspected is the system's error, its code
+/// kept. The caller keeps `handle` open for the whole call.
 pub(crate) fn check_plain_file(handle: HANDLE) -> io::Result<()> {
-    // SAFETY: the handle is open for the whole call.
+    // SAFETY: the call reads no memory through the handle; one that is not open makes it fail.
     let kind = unsafe { GetFileType(handle) };
+    if kind == FILE_TYPE_UNKNOWN {
+        // A type the system does not know and a call that failed both read as unknown; only the failure leaves an
+        // error other than NO_ERROR behind.
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() != Some(0) {
+            return Err(error);
+        }
+    }
     if kind != FILE_TYPE_DISK {
         return Err(io::Error::other(format!("not a disk file (file type {kind})")));
     }

@@ -42,7 +42,7 @@ impl Globs {
     fn named(globs: &[String], noun: &str) -> Result<Globs, String> {
         let patterns = globs
             .iter()
-            .map(|glob| Regex::new(&regex_of(glob)).map_err(|error| format!("the {noun} '{}' cannot be matched: {error}", escaped(glob))))
+            .map(|glob| Regex::new(&regex_of(glob, false)).map_err(|error| format!("the {noun} '{}' cannot be matched: {error}", escaped(glob))))
             .collect::<Result<_, _>>()?;
         let excluded = Regex::new(EXCLUDED).map_err(|error| format!("the output exclusions cannot be matched: {error}"))?;
         Ok(Globs { patterns, excluded })
@@ -91,13 +91,28 @@ fn fits(path: &str) -> bool {
     is_plain_path(path) && !path.eq_ignore_ascii_case(LIST_NAME)
 }
 
-/// `glob` as an anchored, case-insensitive regex.
-fn regex_of(glob: &str) -> String {
-    let mut text = String::from("(?i)^");
+/// `glob` as an anchored, case-insensitive regex naming the first place a path spells its own parts as whole components:
+/// its leading `**/` matches as few folders as it can, and the one capture group holds the folders themselves, its end
+/// standing at a component boundary. What a caller names the `/`-separated prefix a glob's folders end at with
+/// ([`crate::outputs::stale`]).
+pub(crate) fn regex_upto(glob: &str) -> String {
+    regex_of(glob, true)
+}
+
+/// `glob` as an anchored, case-insensitive regex; `upto` puts its whole match in one capture group ending at a component
+/// boundary and lets a leading `**/` match as few folders as it can ([`regex_upto`]), else it ends at the path's end and
+/// `**/` takes as many as it can.
+fn regex_of(glob: &str, upto: bool) -> String {
+    let (open, any_folders, close) = if upto {
+        ("(?i)^(", "(?:.*?/)?", ")(?:/|$)")
+    } else {
+        ("(?i)^", "(?:.*/)?", "$")
+    };
+    let mut text = String::from(open);
     let mut rest = glob;
     while let Some(character) = rest.chars().next() {
         if let Some(after) = rest.strip_prefix("**/") {
-            text.push_str("(?:.*/)?");
+            text.push_str(any_folders);
             rest = after;
         } else if let Some(after) = rest.strip_prefix("**") {
             text.push_str(".*");
@@ -111,7 +126,7 @@ fn regex_of(glob: &str) -> String {
             rest = &rest[character.len_utf8()..];
         }
     }
-    text.push('$');
+    text.push_str(close);
     text
 }
 

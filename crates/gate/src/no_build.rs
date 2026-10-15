@@ -15,7 +15,7 @@ use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_REPARSE_POINT, FILE
 
 use crate::boxside::payload::escaped;
 use crate::remote::git;
-use crate::run::is_within;
+use crate::run::{is_within, resolved};
 
 /// The builder a drop line names when the nothing-back record names none that can be read and used.
 const UNKNOWN_HOST: &str = "the builder";
@@ -176,9 +176,10 @@ pub(crate) fn named_without_assets(target: &DotnetTarget, root: &Path) -> Result
         DotnetTarget::Solution(solution) => {
             let bytes = read_regular(Path::new(solution)).map_err(|error| format!("cannot read {}: {error}", escaped(solution)))?;
             let folder = std::env::current_dir().map_err(|error| format!("cannot read the working directory: {error}"))?;
+            let resolved_root = resolved(root);
             solution_projects(Path::new(solution), &String::from_utf8_lossy(&bytes))
                 .into_iter()
-                .filter(|project| is_within(&lexical(&folder.join(project)), root))
+                .filter(|project| is_within(&resolved(&lexical(&folder.join(project))), &resolved_root))
                 .collect()
         }
     };
@@ -666,6 +667,27 @@ mod tests {
         let large = named_without_assets(&DotnetTarget::Solution(at("Large.sln")), &root).expect_err("a solution over 1 MiB");
         assert!(large.ends_with("it is larger than 1 MiB"), "{large}");
         fs::remove_dir_all(&root).expect("the folder can be removed");
+    }
+
+    #[test]
+    fn a_solution_named_through_another_spelling_of_the_worktree_is_checked() {
+        let root = scratch("spelled");
+        project(&root, "app/App.csproj", false);
+        let sln = "Project(\"{FAE04EC0}\") = \"App\", \"app\\App.csproj\", \"{1}\"\r\nEndProject\r\n";
+        fs::write(root.join("App.sln"), sln).expect("the solution can be written");
+        let spelled = scratch("spelled-link");
+        fs::remove_dir(&spelled).expect("the link's place can be cleared");
+        junction(&spelled, &root);
+
+        let found = named_without_assets(&DotnetTarget::Solution(shown(&spelled.join("App.sln"))), &root);
+
+        fs::remove_dir(&spelled).expect("the junction can be removed");
+        fs::remove_dir_all(&root).expect("the folder can be removed");
+        assert_eq!(
+            found,
+            Ok(Some(slashed_at(&spelled, "app/App.csproj"))),
+            "the worktree as git names it, the solution named through a link to it"
+        );
     }
 
     #[test]

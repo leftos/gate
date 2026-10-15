@@ -15,6 +15,9 @@ linear: gate
 - The plan lives in Linear: every task is an issue in team GATE, per `~/.claude/docs/plan-operations.md`; `docs/plans/MAIN.md` is its generated snapshot, never edited by hand.
 
   Project order, which is the order the queue is worked: `Design`, `gate-state move`, `Local gate`, `Remote`, `Cutover sweep`, `After cutover`, `Backlog` (claude-config's `docs/plans/gate-rust-port.md`, "Steps"). `After cutover` holds the Rust gate's new features (cores hint, learned durations, `--slot auto`), built once GATE-9 has landed.
+- **Focus fence: remote routing for every caller repo.** Until each repo GATE-192 names (delve-the-dungeon, godot-mcp, yaat, yaat-server, opening-hand, in-the-sky, rustling-tulip, towercab-3d) routes, or has its trial failure booked as GATE-192's ruling says, the queue holds only the items on that path, as a release fence does: the Urgent issues (each repo's next step) and the High ones (the tier after).
+
+  Everything else waits, however high it sits in the project order; a finding off the path gets an **add**, not a fix. The path is kept in Linear's priorities: a step that lands moves the next one up.
 - The port is the owner's top priority. claude-config's CC-212 is its umbrella; the PowerShell gate in `~/.claude/tools/gate/` is frozen to bug fixes, which stay claude-config's.
 - A steer or a finding the item does not fix gets an **add**, in the project whose files it shares, else in `Backlog`. A change another repo needs (claude-config's launcher, docs or skills; ops-tower's use of `gate-state`) goes as a repo inbox request.
 - Tracker: **triage** as plan-operations says.
@@ -23,7 +26,9 @@ linear: gate
 
 The owner wants this project worked as autonomously as possible and holds no strong views on technical choices. The decision round settles every technical decision itself: formats, APIs, crate layout, Win32 mechanics, seams and test shape. It picks the option with the best worst case, quotes the reasoning into the brief, and **settle**s it into the issue.
 
-The owner is asked only about what they know as a user and a developer: how they and the agents in the repos that use the gate experience it. That covers output a person or agent reads, waits and their feedback, failure messages, defaults that change how a caller's run behaves, and workflows in those repos. A feature branch counts as technical: the round decides it and says so.
+Output text the gate prints for the agents that invoke it (its lines, refusals and failure messages) is designed by the round too, as well as the round can: the owner does not review its wording. The owner is asked only about what they know as a user and a developer and the round cannot settle from the code: a default that changes how a caller repo's runs behave, a change to a workflow in those repos, or anything that touches their machines beyond the builders' gate setup. A feature branch counts as technical: the round decides it and says so.
+
+The primary goal is remote gates working for every caller repo under `X:\dev` as soon as possible. When ordering, splitting or merging work, prefer whatever routes the next repo soonest, and say the choice in one line.
 
 Merging is the agents' call too. Once every item under a feature marker has landed and its gates are green, the session runs `ship` on the branch and merges the feature PR without asking.
 
@@ -50,6 +55,8 @@ Every command runs through the launcher: `pwsh -NoProfile -File tools/gate.ps1 -
 The tests, by test mode:
 
 - **unstable** (now): each item's last gate runs its reached tests, the tests its change reaches, from [docs/test-map.md](../../../docs/test-map.md): `-Slot heavy -TimeoutSeconds 900 -- cargo nextest run --workspace --all-features --cargo-profile test-release -E '<the union of the filtersets of every row the diff touches>'`; a diff that touches a central file, or a file the map does not list, runs the full suite.
+
+  The brief writes that union from exactly the rows its diff touches, with no module added for safety, and each step's proving command runs the step's named tests alone: on a PC whose heavy slots other gates share, every extra module in a reached set costs minutes of wall time.
 
   The full suite, `-Slot heavy -TimeoutSeconds 1800 -- cargo nextest run --workspace --all-features --cargo-profile test-release --no-fail-fast` (`--all-features` builds the black-box suite, which needs the `test-seams` feature), runs before every reinstall (the release step), before every push (an unstable repo pushes at the /nextup checkpoint only), and before a cutover or a feature-branch merge; a red full run holds them and becomes the next item, Urgent.
 - **stable**: each item runs the full suite as its last gate. A step's proving loop still narrows to the test map.
