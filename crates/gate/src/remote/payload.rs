@@ -8,6 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
+use gate_args::BoxVerb;
 use serde_json::{Map, Value, json};
 
 use crate::remote::snapshot::IDENTITY;
@@ -179,8 +180,8 @@ fn word(object: &Map<String, Value>) -> String {
 
 /// The line ssh carries for `verb`, the same whatever the call sends: the builder's gate, `box`, the verb and
 /// `--stdin`, as the request comes on the call's standard input ([`input`]).
-pub(crate) fn line(verb: &str) -> String {
-    format!("{BOX_EXE} box {verb} --stdin")
+pub(crate) fn line(verb: BoxVerb) -> String {
+    format!("{BOX_EXE} box {} --stdin", verb.as_str())
 }
 
 /// What a call writes on the box's standard input: the payload `word` as a line, then the run call's outputs
@@ -214,6 +215,7 @@ fn nonce(digits: usize) -> String {
 mod tests {
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD;
+    use gate_args::BoxVerb;
     use serde_json::{Value, json};
 
     use super::{Location, Pair, RunCall, input, job_nonce, line, location_word, preflight_word, run_nonce, run_word};
@@ -426,8 +428,8 @@ mod tests {
 
     #[test]
     fn the_line_is_the_fixed_box_line_for_the_verb() {
-        assert_eq!(line("run"), r#""%LOCALAPPDATA%\gate\bin\gate.exe" box run --stdin"#);
-        assert_eq!(line("preflight"), r#""%LOCALAPPDATA%\gate\bin\gate.exe" box preflight --stdin"#);
+        assert_eq!(line(BoxVerb::Run), r#""%LOCALAPPDATA%\gate\bin\gate.exe" box run --stdin"#);
+        assert_eq!(line(BoxVerb::Preflight), r#""%LOCALAPPDATA%\gate\bin\gate.exe" box preflight --stdin"#);
     }
 
     #[test]

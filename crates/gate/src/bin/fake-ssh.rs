@@ -320,23 +320,24 @@ fn hold(path: &Path) -> Result<(), String> {
 }
 
 /// The call the line carries: `gate box`'s verb and the word after it, `--stdin`, a git service's name and the
-/// repository's path, or
-/// [`PUSH`] and the push call's whole line; the host it was made to, and the steps file it acts on.
+/// repository's path, or [`PUSH`] and the push call's whole line, as `rest`; the host it was made to, and the steps
+/// file it acts on.
 struct BoxCall<'a> {
     verb: &'a str,
-    payload: &'a str,
+    rest: &'a str,
     host: &'a str,
     steps: &'a Path,
 }
 
 impl<'a> BoxCall<'a> {
     /// The call `line`, made to `host` and acting on the steps file `steps`, carries: a git service and its path,
-    /// unquoted, a push call, or the last three words, `box <verb> --stdin`.
+    /// unquoted, a push call, or the last three words, `box <verb> --stdin`; a box call whose last word is not
+    /// `--stdin` is refused, so a client that stops sending its request on standard input fails here by name.
     fn of(line: &'a str, host: &'a str, steps: &'a Path) -> Result<BoxCall<'a>, String> {
         if let Some((verb, path)) = line.split_once(' ').filter(|(verb, _)| GIT_SERVICES.contains(verb)) {
             return Ok(BoxCall {
                 verb,
-                payload: path.trim_matches('\''),
+                rest: path.trim_matches('\''),
                 host,
                 steps,
             });
@@ -346,13 +347,14 @@ impl<'a> BoxCall<'a> {
         if words.first() == Some(&"pwsh") && script.is_some_and(|script| !script.is_empty()) {
             return Ok(BoxCall {
                 verb: PUSH,
-                payload: line,
+                rest: line,
                 host,
                 steps,
             });
         }
         match words[..] {
-            [.., "box", verb, payload] => Ok(BoxCall { verb, payload, host, steps }),
+            [.., "box", verb, rest @ "--stdin"] => Ok(BoxCall { verb, rest, host, steps }),
+            [.., "box", _, _] => Err(format!("box call without --stdin: {line}")),
             _ => Err(format!("the line holds no box call: {line}")),
         }
     }
@@ -363,7 +365,7 @@ impl<'a> BoxCall<'a> {
         }
         if let Some(service) = self.verb.strip_prefix("git-") {
             let mut command = Command::new("git");
-            command.args([service, self.payload]);
+            command.args([service, self.rest]);
             return Ok(command);
         }
         let mut command = Command::new(variable("GATE_FAKE_SSH_GATE")?);
@@ -376,7 +378,7 @@ impl<'a> BoxCall<'a> {
         if let Some(name) = seams {
             command.args(seams_of(name)?.split_whitespace());
         }
-        command.args([self.verb, self.payload]);
+        command.args([self.verb, self.rest]);
         Ok(command)
     }
 
@@ -389,7 +391,7 @@ impl<'a> BoxCall<'a> {
         let folder = PathBuf::from(variable("GATE_FAKE_SSH_BUILDERS")?).join(self.host);
         fs::create_dir_all(&folder).map_err(|error| format!("cannot make {}: {error}", folder.display()))?;
         let mut command = Command::new("pwsh");
-        command.args(self.payload.split(' ').skip(1)).env("LOCALAPPDATA", folder);
+        command.args(self.rest.split(' ').skip(1)).env("LOCALAPPDATA", folder);
         Ok(command)
     }
 

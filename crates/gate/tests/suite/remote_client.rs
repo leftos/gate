@@ -827,6 +827,19 @@ fn a_connection_dropped_before_the_banner_is_retried_once() {
 }
 
 #[test]
+fn a_dropped_preflight_logs_no_line_saying_its_input_was_not_sent() {
+    let case = client_case("client-preflight-drop-fed");
+    let steps = ssh_steps(&case, "ssh", &["drop"]);
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "out", "ran here"]));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight"]);
+    let log = fs::read_to_string(case.folder().join("out.log")).expect("the log was written");
+    assert!(!log.contains("input was not sent"), "the call's own end says why: {log}");
+}
+
+#[test]
 fn two_banner_drops_of_the_preflight_fall_back_unreachable() {
     let case = client_case("client-preflight-drops");
     let steps = ssh_steps(&case, "ssh", &["fail-banner", "fail-banner"]);

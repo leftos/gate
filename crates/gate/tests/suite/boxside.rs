@@ -2277,7 +2277,7 @@ fn box_stop_with_an_earlier_runs_job_spares_the_next_run() {
     assert_eq!(running.finish().code, Some(0));
 }
 
-/// A `gate box inflight` payload word for the builder's root `root`.
+/// A `gate box inflight --stdin` request line for the builder's root `root`.
 fn inflight_payload(root: &Path) -> String {
     payload(&json!({ "Root": shown(root) }))
 }

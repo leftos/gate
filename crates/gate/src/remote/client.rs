@@ -28,6 +28,7 @@ use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use gate_args::BoxVerb;
 #[cfg(feature = "test-seams")]
 use gate_args::RunRequest;
 use gate_args::TestSeams;
@@ -792,7 +793,7 @@ impl Attempt<'_, '_> {
         let watch = Watch::Setup(self.limits_for("preflight"));
         let raise = self.raises_at("preflight");
         let (mut called, _) = self.with_retry(SSH_FAILED, |attempt| {
-            attempt.ssh("preflight", Echo::LogOnly, watch, raise, CallOnly::plain(Arc::clone(&input)))
+            attempt.ssh(BoxVerb::Preflight, Echo::LogOnly, watch, raise, CallOnly::plain(Arc::clone(&input)))
         })?;
         let theirs = their_version(&called.lines).map(str::to_owned);
         let created = called.lines.iter().any(|line| line.starts_with(CREATED));
@@ -1121,7 +1122,7 @@ impl Attempt<'_, '_> {
                 sink: None,
                 wire: Wire::Compressed,
             };
-            let called = attempt.ssh("run", Echo::Console, Watch::Run(limits), raise, run)?;
+            let called = attempt.ssh(BoxVerb::Run, Echo::Console, Watch::Run(limits), raise, run)?;
             heard.clone_from(&called.outputs_line);
             back_commits.clone_from(&called.back_commits);
             names_skipped = called.names_skipped;
@@ -1259,7 +1260,7 @@ impl Attempt<'_, '_> {
     /// did not finish or said none.
     fn boot_now(&mut self, location: &Location) -> Option<String> {
         let what = format!("asking {} for its boot time", self.call.host);
-        let called = self.bounded("boot", location, &what)?;
+        let called = self.bounded(BoxVerb::Boot, location, &what)?;
         (called.status == 0 && called.cut.is_none())
             .then(|| boot_time(&called.lines).map(str::to_owned))
             .flatten()
@@ -1269,7 +1270,7 @@ impl Attempt<'_, '_> {
     /// run's end is the caller's however it went.
     fn stop(&mut self, location: &Location) {
         let what = format!("stopping the command on {}", self.call.host);
-        self.bounded("stop", location, &what);
+        self.bounded(BoxVerb::Stop, location, &what);
     }
 
     /// [`Attempt::stop`] after a Ctrl+C, saying first how long the stop may take, its bound in whole seconds, so the
@@ -1285,11 +1286,11 @@ impl Attempt<'_, '_> {
     /// call that counts, says when it did not finish or failed, `what` it does named, and gives it back; `None` when it
     /// could not be made. With `--test-remote-interrupt-at` naming `verb`, its first call raises the console interrupt
     /// as soon as it runs.
-    fn bounded(&mut self, verb: &'static str, location: &Location, what: &str) -> Option<Called> {
+    fn bounded(&mut self, verb: BoxVerb, location: &Location, what: &str) -> Option<Called> {
         let input = payload::input(&payload::location_word(location), None);
         let bound = self.limits.bound;
         let begun = Instant::now();
-        let raise = self.raises_at(verb);
+        let raise = self.raises_at(verb.as_str());
         let mut made = self.ssh(verb, Echo::LogOnly, Watch::Bounded(bound), raise, CallOnly::plain(Arc::clone(&input)));
         let again = matches!(&made, Ok(first) if first.before_the_banner(SSH_FAILED)) && retry::retry_allowed(bound, begun.elapsed(), self.pause);
         if again {
@@ -1342,7 +1343,7 @@ impl Attempt<'_, '_> {
     /// One call of `gate box` on the builder for `verb`, its line [`payload::line`], fed its request on its standard
     /// input; watched as `watch` says; the console interrupt raised after its first output byte when `raise`; what only
     /// this call gives it, `only`.
-    fn ssh(&mut self, verb: &'static str, echo: Echo, watch: Watch, raise: bool, only: CallOnly) -> Result<Called, End> {
+    fn ssh(&mut self, verb: BoxVerb, echo: Echo, watch: Watch, raise: bool, only: CallOnly) -> Result<Called, End> {
         let system = gate_win32::system_directory().map_err(|error| End::Failed(format!("cannot read the system folder: {error}")))?;
         let command = call_command(self.transport.call(self.call.host, &payload::line(verb), only.wire), &system);
         let starts = Starts {
@@ -1370,7 +1371,7 @@ impl Attempt<'_, '_> {
                 sink: Some(archive.create(cap).map_err(End::Failed)?),
                 ..CallOnly::plain(Arc::clone(&input))
             };
-            attempt.ssh("outputs", Echo::LogOnly, Watch::Fetch(limits, None), raise, only)
+            attempt.ssh(BoxVerb::Outputs, Echo::LogOnly, Watch::Fetch(limits, None), raise, only)
         })?;
         self.lines.append(&mut called.lines);
         Ok(called)
@@ -1436,15 +1437,9 @@ impl Attempt<'_, '_> {
         let job = call_job(starts.breakaway).map_err(|error| End::Failed(format!("cannot make a job for {shown}: {error}")))?;
         let cannot_start = |error: String| End::Failed(format!("cannot start {shown}: {error}"));
         let launch = piped_launch(command, console_of(watch)).map_err(|error| cannot_start(error.to_string()))?;
-        let feed_log = match (&starts.input, &err_log) {
-            (Some(_), Some(log)) => Some(log.try_clone().map_err(cannot_log)?),
-            _ => None,
-        };
         let (suspended, stdout, stderr, stdin) = launched(&launch, &job, starts.input.is_some()).map_err(|error| cannot_start(error.to_string()))?;
         let running = suspended.assign_and_resume(&job).map_err(|error| cannot_start(error.to_string()))?;
-        if let (Some(stdin), Some(input)) = (stdin, starts.input) {
-            fed(stdin, input, feed_log);
-        }
+        let feeder = stdin.zip(starts.input).map(|(stdin, input)| fed(stdin, input));
         let shared = Arc::new(Shared::new());
         // Only the run call carries the run's nonce, and only it says the hang hint.
         let run_call = starts.nonce.is_some();
@@ -1502,10 +1497,15 @@ impl Attempt<'_, '_> {
         }
         let heard = std::mem::take(&mut *held(&shared.heard));
         match called_of(ended, shared.progress.raised(), heard) {
-            Ok(called) => Ok(Called {
-                written: looks.written,
-                ..called
-            }),
+            Ok(called) => {
+                if let Some(feeder) = feeder {
+                    self.fed_out(feeder, &called);
+                }
+                Ok(Called {
+                    written: looks.written,
+                    ..called
+                })
+            }
             Err(Unfinished::Failed(why)) => Err(End::Failed(why)),
             Err(Unfinished::Interrupted(note)) => {
                 // The interrupt stays the run's end, whose caller stops a command the call may have started.
@@ -1534,6 +1534,34 @@ impl Attempt<'_, '_> {
             None => {}
         }
         ended
+    }
+
+    /// For a call that ended as `called` having reached the box's banner, not refused and not with ssh's 255, joins its
+    /// `feeder`, given at most [`DRAIN`] to end, and notes in the log a write of its input that failed, naming the call's
+    /// verb. A call that ended any of the other ways says why on its own lines, and its unread input is no news, so its
+    /// feeder, whose write ends with the call's input pipe, is let go unread. The note never fails the call.
+    fn fed_out(&mut self, feeder: Feeder, called: &Called) {
+        let reached = !called.before_the_banner(SSH_FAILED) && called.status != SSH_FAILED && called.refused.is_none();
+        if !reached {
+            return;
+        }
+        let deadline = Instant::now() + DRAIN;
+        while !feeder.thread.is_finished() && Instant::now() < deadline {
+            thread::sleep(PAUSE_STEP);
+        }
+        let verb = feeder.verb.as_str();
+        if !feeder.thread.is_finished() {
+            self.logged(&format!(
+                "gate: the {verb} call's input was still being sent {} s after the call ended",
+                DRAIN.as_secs()
+            ));
+            return;
+        }
+        match feeder.thread.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => self.logged(&format!("gate: the {verb} call's input was not sent: {error}")),
+            Err(_) => self.logged(&format!("gate: the {verb} call's input feeder panicked")),
+        }
     }
 
     /// Gives the raw copy's reader `raw` the rest of its [`DRAIN`] to end, when the call's own end did not already
@@ -1919,8 +1947,14 @@ struct Starts {
 /// What a call of `gate box` is fed on its standard input, `input`, and the `verb` of the call, which the line saying
 /// it could not be sent names.
 struct Fed {
-    verb: &'static str,
+    verb: BoxVerb,
     input: Arc<str>,
+}
+
+/// The thread feeding a call of `gate box` the `verb` its input, which gives back how the write went.
+struct Feeder {
+    verb: BoxVerb,
+    thread: thread::JoinHandle<io::Result<()>>,
 }
 
 /// What one call of `gate box` alone gives it: what is fed on its standard input, the request ([`payload::input`])
@@ -1985,20 +2019,12 @@ impl<W: Write> Write for Capped<W> {
     }
 }
 
-/// Writes what `fed` gives to a call's `stdin` on a thread of its own, then closes it. A write that fails, as one to a
-/// call that ended without reading its input does, is noted in the call's `log`, naming the call's verb, and never fails
-/// the call, whose own end stands.
-fn fed(mut stdin: File, fed: Fed, log: Option<File>) {
-    thread::spawn(move || {
-        let Err(error) = stdin.write_all(fed.input.as_bytes()) else {
-            return;
-        };
-        drop(stdin);
-        if let Some(mut log) = log {
-            // A note that cannot be written has nowhere else to go: the call's readers own its console streams.
-            let _ = writeln!(log, "gate: the {} call's input was not sent: {error}", fed.verb);
-        }
-    });
+/// Writes what `fed` gives to a call's `stdin` on a thread of its own, then closes it; the thread gives back how the
+/// write went, which [`Attempt::fed_out`] reads once the call has ended.
+fn fed(mut stdin: File, fed: Fed) -> Feeder {
+    let Fed { verb, input } = fed;
+    let thread = thread::spawn(move || stdin.write_all(input.as_bytes()));
+    Feeder { verb, thread }
 }
 
 /// The console a call watched as `watch` is created on: this process's, whose Ctrl+C reaches it too, for every call a

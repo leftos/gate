@@ -994,7 +994,7 @@ pub fn git(case: &Case, args: &[&str]) -> String {
 pub const FAKE_SSH: &str = env!("CARGO_BIN_EXE_fake-ssh");
 /// The variable naming the stand-in's steps file; the stand-in logs each call's verb to `<steps>.log`.
 pub const STEPS_VARIABLE: &str = "GATE_FAKE_SSH_STEPS";
-/// The variable naming the gate the stand-in runs `box <verb> <payload>` with.
+/// The variable naming the gate the stand-in runs `box <verb> --stdin` with, feeding it the request on standard input.
 pub const GATE_VARIABLE: &str = "GATE_FAKE_SSH_GATE";
 /// The variable whose words the stand-in gives the box's `preflight` before its verb.
 pub const PREFLIGHT_SEAMS_VARIABLE: &str = "GATE_FAKE_SSH_PREFLIGHT_SEAMS";

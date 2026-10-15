@@ -96,10 +96,93 @@ fn boot_status(read: bool) -> u32 {
 }
 
 #[cfg(test)]
+#[expect(clippy::expect_used, reason = "a request read the wrong way must fail the test loudly")]
 mod tests {
-    use crate::answer::FAILED_STATUS;
+    use std::io::{Cursor, Read};
 
-    use super::boot_status;
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD;
+
+    use crate::answer::FAILED_STATUS;
+    use crate::boxside::payload::Payload;
+
+    use super::{REQUEST_LIMIT, Unread, boot_status, bounded_line, read_request};
+
+    /// The request `{"Name":"x"}` as its base64 word.
+    fn word() -> String {
+        STANDARD.encode(r#"{"Name":"x"}"#)
+    }
+
+    /// The request read from `input`, which must decode.
+    fn read(input: &mut Cursor<Vec<u8>>) -> Payload {
+        read_request(input).expect("the request is read")
+    }
+
+    /// The usage line `input` is refused with.
+    fn refused(input: Vec<u8>) -> String {
+        read_request(Cursor::new(input)).err().expect("the request is refused")
+    }
+
+    #[test]
+    fn a_carriage_return_before_the_newline_is_stripped_once() {
+        let payload = read(&mut Cursor::new(format!("{}\r\n", word()).into_bytes()));
+        assert_eq!(payload.text("Name"), Ok("x"));
+
+        let line = refused(format!("{}\r\r\n", word()).into_bytes());
+        assert!(
+            line.starts_with("gate: box payload is not base64 JSON"),
+            "a second carriage return stays in the word: {line}"
+        );
+    }
+
+    #[test]
+    fn a_request_with_no_newline_at_the_end_of_the_input_is_read_whole() {
+        let payload = read(&mut Cursor::new(word().into_bytes()));
+        assert_eq!(payload.text("Name"), Ok("x"));
+    }
+
+    #[test]
+    fn a_line_one_byte_under_the_limit_with_its_newline_is_read_and_one_more_is_over() {
+        let mut fits = vec![b'a'; 7];
+        fits.push(b'\n');
+        assert_eq!(
+            bounded_line(Cursor::new(fits.clone()), 8).ok(),
+            Some(fits),
+            "limit - 1 bytes and the newline"
+        );
+
+        let mut over = vec![b'a'; 8];
+        over.push(b'\n');
+        assert!(
+            matches!(bounded_line(Cursor::new(over), 8), Err(Unread::OverLimit)),
+            "limit bytes before the newline"
+        );
+    }
+
+    #[test]
+    fn a_request_line_past_the_request_limit_is_the_over_cap_line() {
+        let mut over = vec![b'a'; usize::try_from(REQUEST_LIMIT).expect("the limit fits a usize")];
+        over.push(b'\n');
+        assert_eq!(refused(over), "gate: the box request on standard input reaches 16 MiB without a newline");
+    }
+
+    #[test]
+    fn the_bytes_after_the_request_s_newline_are_left_for_the_next_read() {
+        let mut input = Cursor::new(format!("{}\r\n{{\"files\":[]}}\n", word()).into_bytes());
+
+        let payload = read(&mut input);
+        let mut rest = String::new();
+        input.read_to_string(&mut rest).expect("the rest reads");
+
+        assert_eq!(payload.text("Name"), Ok("x"));
+        assert_eq!(rest, "{\"files\":[]}\n", "the manifest in the same chunk is the next read's");
+    }
+
+    #[test]
+    fn a_request_line_that_is_not_utf_8_is_the_not_base64_line() {
+        let line = refused(vec![0xff, 0xfe, b'\n']);
+        assert!(line.starts_with("gate: box payload is not base64 JSON: the line is not UTF-8"), "{line}");
+    }
 
     #[test]
     fn a_boot_time_that_cannot_be_read_is_status_1() {

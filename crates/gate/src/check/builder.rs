@@ -7,7 +7,7 @@
 use std::path::Path;
 use std::time::Duration;
 
-use gate_args::{CheckRequest, CheckSeams};
+use gate_args::{BoxVerb, CheckRequest, CheckSeams};
 use gate_router::{Place, repo_name, work_folder_key};
 use gate_win32::PipedConsole;
 
@@ -135,7 +135,7 @@ fn asked(transport: &dyn Transport, host: &str, place: &Place, bound: Duration) 
     let location = Location::under(transport.root(), &repo, &key, &payload::job_nonce());
     let input = payload::input(&payload::preflight_word(&location, &needs), None);
     let sent: Vec<String> = needs.into_iter().map(|(name, _)| name).collect();
-    let program = transport.call(host, &payload::line("preflight"), Wire::Plain);
+    let program = transport.call(host, &payload::line(BoxVerb::Preflight), Wire::Plain);
     let heard = called(&program, bound, input.as_bytes()).map_err(|failure| failure.line(host))?;
     if let Some(line) = refusal(host, transport.root(), &heard) {
         return Err(line);
@@ -203,7 +203,7 @@ fn called(program: &Program, bound: Duration, input: &[u8]) -> Result<Heard, Fai
 
 /// Why a call ended in `error` gave no answer, its program shown as `shown`: an unreachable builder for the line it is
 /// ended with past its `bound`, `late`, alone; any other failure as it is, the whole call's words, which `late` starts
-/// with, shown as the program alone, so no line carries the preflight's payload. A late call whose job could not be
+/// with, shown as the program alone, so no line carries ssh's options. A late call whose job could not be
 /// ended says why, read from what follows `late` alone, in either form git's calls say it: `, and could not be
 /// stopped: <why>` or `, and <program> could not be stopped: <why>`.
 fn failure(error: GitError, late: &str, shown: &str, bound: Duration) -> Failure {
