@@ -6,12 +6,9 @@
 
 - [ ] GATE-46 Remote slice 5: drained remote cutover and deleting the remote.ps1 bridge — Urgent · Remote
 - [ ] GATE-19 Remote: send a repo's declared sibling worktrees with a routed run — Urgent · Remote
-- [/] GATE-247 Siblings A: machine consent and sibling safety checks on the PC — Urgent · Remote
 - [ ] GATE-206 A per-repo toolchain manifest: check and prepare builders, and check a fresh clone — Urgent · Remote
-- [/] GATE-211 Toolchain 4: refuse a routed run with parity when the builder lacks a declared tool — Urgent · Remote
-- [/] GATE-212 Toolchain 5: gate check, for this machine and for a builder — Urgent · Remote
 - [ ] GATE-192 Turn routing back on, on the Rust remote client — High · Remote
-- [ ] GATE-248 Siblings B: the box lays out a sibling pair (Pair payload, preflight, run) — High · Remote
+- [/] GATE-248 Siblings B: the box lays out a sibling pair (Pair payload, preflight, run) — High · Remote
 - [ ] GATE-249 Siblings C: the client snapshots, checks parity and pushes each repo — High · Remote
 - [ ] GATE-250 Siblings D: sync back every repo of a pair, all or nothing — High · Remote
 - [ ] GATE-251 Siblings E: outputs, install rewrite and stale-line wording for a pair — High · Remote
@@ -37,6 +34,12 @@
 - [ ] GATE-253 gate check and the box's probe: judge siblings by every routing rule; a tool that exits non-zero is not present
 - [ ] GATE-256 Remote: a routed snapshot can stage a parent repository when the worktree's .git is gone
 - [ ] GATE-257 Stale-output line: walk after the verdict, skip by coverage not glob text, keep part-way brought-back globs
+- [ ] GATE-264 Parity: escape and cut the builder's SDK list in the SDK mismatch line
+- [ ] GATE-265 Routing: escape the root folder name, the consent problem and the sibling roots in their lines
+- [ ] GATE-267 Box: check every payload's Bare path and read the preflight's .git without following links
+- [ ] GATE-270 gate check --builder: hold the worktree's lock, and bound the box preflight's git steps
+- [ ] GATE-271 Box: harden the work folder against an earlier run's leftovers (back ref, commondir, index copy, final path, origin)
+- [ ] GATE-272 gate check --builder: a silent ssh 255, and the siblings file's problems
 
 ## Cutover sweep
 
@@ -74,6 +77,9 @@
 - [ ] GATE-246 Share one temp-folder test helper across the gate crate's unit tests
 - [ ] GATE-254 gate check: install hints that install what it accepts; keep git's reason; build the filtered PATH once
 - [ ] GATE-255 Suite: three cases ended with exit 1 and no output mid-run, and a box-kill case failed under load
+- [ ] GATE-266 Check the builder's Git for Windows version before routing
+- [ ] GATE-268 Two PCs with the same worktree path share one key folder on a builder
+- [ ] GATE-269 Retire this PC's D: paths, and decide whether the router keeps its subst-drive model
 
 ## No project
 
