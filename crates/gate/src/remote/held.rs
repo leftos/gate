@@ -151,14 +151,14 @@ fn held_parent(root: &str, leaf: &str) -> Result<Entry, NotHeld> {
         return Err(NotHeld::new(leaf, UNDER_OTHER));
     };
     let parent = open_followed(Path::new(parent_text), Share::NoDelete).map_err(|error| cannot_hold(leaf, &error))?;
-    if gate_win32::on_network_volume(&parent).map_err(|error| cannot_hold(leaf, &error))? {
+    let found = final_path(&parent).map_err(|error| cannot_hold(leaf, &error))?;
+    if is_unc(&found) || gate_win32::on_network_volume(&parent).map_err(|error| cannot_hold(leaf, &error))? {
         return Err(NotHeld::new(leaf, NETWORK));
     }
     let metadata = parent.metadata().map_err(|error| cannot_hold(leaf, &error))?;
     if is_reparse_point(&metadata) {
         return Err(NotHeld::new(leaf, UNDER_OTHER));
     }
-    let found = final_path(&parent).map_err(|error| cannot_hold(leaf, &error))?;
     let path = compare(&found, parent_text).map_err(|mismatch| match mismatch {
         Mismatch::NotUnicode => NotHeld::new(leaf, NOT_UNICODE),
         Mismatch::Case | Mismatch::Other => NotHeld::new(leaf, UNDER_OTHER),
@@ -218,6 +218,16 @@ fn folder_beneath(parent: &File, name: &str) -> Result<File, NotHeld> {
         return Err(NotHeld::new(name, SIBLING_NOT_A_FOLDER));
     }
     Ok(folder)
+}
+
+/// Whether the final path `found` names a network share: it starts with `\\?\UNC\`, in any letter case.
+fn is_unc(found: &Path) -> bool {
+    const UNC: &[u8] = br"\\?\UNC\";
+    found
+        .as_os_str()
+        .as_encoded_bytes()
+        .get(..UNC.len())
+        .is_some_and(|start| start.eq_ignore_ascii_case(UNC))
 }
 
 /// Whether a file with `metadata` is a reparse point of any kind: a link, a junction, or one a filter serves.
@@ -282,7 +292,7 @@ mod tests {
     use gate_win32::Share;
     use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
 
-    use super::{Entry, Held, Mismatch, NotHeld, compare, normalized, still_leads};
+    use super::{Entry, Held, Mismatch, NotHeld, compare, is_unc, normalized, still_leads};
     use crate::remote::carried;
     use crate::route::open_followed;
 
@@ -422,6 +432,19 @@ mod tests {
         let lone_surrogate = OsString::from_wide(&[u16::from(b'X'), u16::from(b':'), u16::from(b'\\'), 0xD800]);
 
         assert_eq!(compare(Path::new(&lone_surrogate), "X:/a"), Err(Mismatch::NotUnicode));
+    }
+
+    #[test]
+    fn a_parent_whose_final_path_is_unc_is_refused() {
+        for (found, unc) in [
+            (r"\\?\UNC\srv\share\dev", true),
+            (r"\\?\unc\srv\share", true),
+            (r"\\?\X:\dev", false),
+            (r"\\?\UNCX:\dev", false),
+            (r"\\?\UN", false),
+        ] {
+            assert_eq!(is_unc(Path::new(found)), unc, "{found}");
+        }
     }
 
     #[test]

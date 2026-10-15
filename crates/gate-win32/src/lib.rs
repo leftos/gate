@@ -3,7 +3,8 @@
 //! of the gate process or of another, the system's, a process's and the WSL VM's CPU times, the console interrupt, the
 //! system's boot time, what a drive letter stands for, a rename that never replaces its target, a name opened inside an
 //! open folder, a file opened again through its reparse point's filter, an open file's volume serial and file id
-//! ([`file_id`]), whether two open files are one, and the Windows message of an error code. It holds no policy:
+//! ([`file_id`]), whether two open files are one, whether an open file is on a network volume ([`on_network_volume`]),
+//! and the Windows message of an error code. It holds no policy:
 //! the names, the waits, the command's environment and priority, and what an abandoned mutex means to the gate are the
 //! caller's. Windows only; elsewhere the crate is empty.
 
