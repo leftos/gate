@@ -7,10 +7,8 @@
 - [ ] GATE-46 Remote slice 5: drained remote cutover and deleting the remote.ps1 bridge — Urgent · Remote
 - [ ] GATE-19 Remote: send a repo's declared sibling worktrees with a routed run — Urgent · Remote
 - [ ] GATE-206 A per-repo toolchain manifest: check and prepare builders, and check a fresh clone — Urgent · Remote
-- [/] GATE-281 Suite: an outputs case hung 600 s in the full suite on feat b903f50, holding its push — Urgent · Remote
 - [ ] GATE-192 Turn routing back on, on the Rust remote client — High · Remote
 - [/] GATE-249 Siblings C: the client snapshots, checks parity and pushes each repo — High · Remote
-- [/] GATE-250 Siblings D: sync back every repo of a pair, all or nothing — High · Remote
 - [ ] GATE-251 Siblings E: outputs, install rewrite and stale-line wording for a pair — High · Remote
 - [ ] GATE-252 Siblings F: docs for routed sibling pairs — High · Remote
 - [ ] GATE-22 Remote: send a routed command's ignored inputs to the builder, compressed — High · Remote
@@ -48,6 +46,16 @@
 - [ ] GATE-280 Router: words GATE-234's path starts now keep local that name worktree paths
 - [ ] GATE-285 Give a single-repo sync-back refusal its own outputs reason
 - [ ] GATE-286 Roll back a sibling pair's applied repos when a later write fails
+- [ ] GATE-287 Treat a patch the single-repo sync-back cannot remove after a successful apply as a warning
+- [ ] GATE-288 Name the repo first in a pair's transfer-ceiling and ignored sync-back lines
+- [ ] GATE-289 Bind the back commits line to the box so a command's printed copy is never applied
+- [ ] GATE-290 Make the worktree lock exclude every gate that can write the worktree
+- [ ] GATE-291 Keep a routed run's changes when its sync-back cannot take the worktree lock
+- [ ] GATE-293 Harden the desktop-run pipe client and adoption: local pipe names, terminate failures, handle access
+- [ ] GATE-294 End the box's tool restore and drain its output when its wait fails
+- [ ] GATE-296 Name the box's own reason when a preflight exits 2 and the run falls back
+- [ ] GATE-297 Bound each field of a box request, now that the command line no longer does
+- [ ] GATE-298 Merge feat/desktop-session (#305)
 
 ## Cutover sweep
 
@@ -89,6 +97,9 @@
 - [ ] GATE-268 Two PCs with the same worktree path share one key folder on a builder
 - [ ] GATE-269 Retire this PC's D: paths, and decide whether the router keeps its subst-drive model
 - [ ] GATE-283 Docs: a builder setup page
+- [ ] GATE-292 Take the one-at-a-time lock in gate-win32's job test that starts a process
+- [ ] GATE-295 Give the gate's stdin feeders one rule for a failed write
+- [ ] GATE-299 Split the remote client's started() under the complexity limit and share its bounded join
 
 ## No project
 
