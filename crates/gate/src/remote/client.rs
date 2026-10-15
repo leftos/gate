@@ -256,6 +256,7 @@ impl RemoteClient for RustClient {
             call,
             transport: &*transport,
             limit: self.limit,
+            lock_wait: self.limit,
             pause: self.pause,
             limits: Limits {
                 started,
@@ -657,14 +658,18 @@ pub(super) struct Attempt<'c, 'a> {
     pub(super) call: &'c RemoteCall<'a>,
     pub(super) transport: &'c dyn Transport,
     pub(super) limit: Duration,
+    /// How long the sync-back waits for a worktree's lock another run holds: the git limit, which the sync-back's tests
+    /// shorten without shortening its git calls.
+    pub(super) lock_wait: Duration,
     pause: Duration,
     pub(super) limits: Limits,
     one_call: Option<OneCall<'c>>,
     /// The call, `preflight`, `run` or `outputs`, after whose first output byte the console interrupt is raised, as a
     /// Ctrl+C would; or `install`, once the install has moved its first file and before it moves a second, so its line
     /// reads `1 of {m}`: an install of a single file ends before the seam is reached; or `stop`, as `run` and then once
-    /// more while the stop call that Ctrl+C leads to runs.
-    interrupt_at: Option<&'c str>,
+    /// more while the stop call that Ctrl+C leads to runs; or `apply`, once a pair's sync-back has checked every patch
+    /// and before it applies the first.
+    pub(super) interrupt_at: Option<&'c str>,
     /// `--test-local-sdks`: this PC's SDK list, read in place of `dotnet --list-sdks`.
     local_sdks: Option<&'c str>,
     /// How long this PC's `dotnet --list-sdks` may take before it is killed and its list counts as unreadable.
@@ -1642,6 +1647,7 @@ impl<'c, 'a> Attempt<'c, 'a> {
             call,
             transport,
             limit: git::GIT_LIMIT,
+            lock_wait: git::GIT_LIMIT,
             pause: Duration::ZERO,
             limits: Limits::for_tests(),
             one_call: None,
@@ -2963,6 +2969,7 @@ mod tests {
             call,
             transport,
             limit: GIT_LIMIT,
+            lock_wait: GIT_LIMIT,
             pause: LONG,
             limits: Limits::for_tests(),
             one_call: None,

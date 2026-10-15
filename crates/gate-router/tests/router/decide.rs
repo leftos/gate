@@ -1490,6 +1490,19 @@ fn a_sibling_folder_that_cannot_be_read_keeps_the_run_local_saying_what() {
 }
 
 #[test]
+fn a_single_repo_root_whose_id_cannot_be_read_stays_local() {
+    let no_root = FakeFacts {
+        root_id: Err("cannot read the worktree folder's id: access denied".to_owned()),
+        ..FakeFacts::at_root()
+    };
+    assert_eq!(
+        local_line(&decide(&heavy(&words(&["dotnet", "test"])), &no_root)).as_deref(),
+        Some("gate: not routed: cannot read the worktree folder's id: access denied"),
+        "a run that declares no sibling still needs its root's id for the sync-back's lock"
+    );
+}
+
+#[test]
 fn a_sibling_folder_that_is_the_root_or_another_sibling_keeps_the_run_local() {
     let command = words(&["dotnet", "test"]);
     let same_as_root = checked(vec![(sibling_root("c"), Ok(SiblingFolder::Present(fake_id(ROOT))))]);

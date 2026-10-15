@@ -197,7 +197,7 @@ fn one(attempt: &mut Attempt<'_, '_>, target: &Target<'_>, status: i64) -> Resul
         return Ok(End::Status(status));
     };
     let call = attempt.call;
-    let _lock = worktree_lock::held(call.state, &[(target.name, target.root)], attempt.limit, call.interrupt, |line| {
+    let _lock = worktree_lock::held(call.state, &[(target.name, target.root)], attempt.lock_wait, call.interrupt, |line| {
         attempt.say(line);
     })?;
     let name = incoming_name(std::process::id(), own_start(attempt.own_start_fails)?, &payload::job_nonce());
@@ -300,7 +300,7 @@ fn pair(attempt: &mut Attempt<'_, '_>, targets: &[Target<'_>], back_commits: Opt
     }
     let call = attempt.call;
     let worktrees: Vec<(&str, &str)> = backed.iter().map(|repo| (repo.target.name, repo.target.root)).collect();
-    let _locks = worktree_lock::held(call.state, &worktrees, attempt.limit, call.interrupt, |line| attempt.say(line))?;
+    let _locks = worktree_lock::held(call.state, &worktrees, attempt.lock_wait, call.interrupt, |line| attempt.say(line))?;
     let mut fetched = Vec::with_capacity(backed.len());
     let end = pair_phases(attempt, &backed, &mut fetched, status);
     for repo in &mut fetched {
@@ -484,6 +484,9 @@ fn applied_pair(attempt: &mut Attempt<'_, '_>, fetched: &mut [Fetched<'_>]) -> R
         repo.names = names;
         let patch = repo.patch.insert(patch);
         apply_checked(attempt, &repo.worktree, patch)?;
+    }
+    if let Some(interrupt) = attempt.call.interrupt.filter(|_| attempt.raises_at("apply")) {
+        interrupt.raise();
     }
     attempt.go_on()?;
     for (at, repo) in fetched.iter().enumerate() {
@@ -3688,9 +3691,41 @@ mod tests {
         case.remove();
     }
 
-    /// The interrupt is raised as lib's fetch is readied, after app's back commit was taken and before any write.
+    /// `--test-remote-interrupt-at apply` raises the interrupt once both patches were written and checked, just before
+    /// the first apply: the check before the writes is all that stops them.
     #[test]
     fn an_interrupt_before_the_writes_applies_nothing() {
+        let case = PairCase::new("interrupt-apply");
+        let app = case.plant(0, &[("b.txt", "b\n")]);
+        let lib = case.plant(1, &[("c.txt", "c\n")]);
+        let interrupt = Interrupt::install().expect("the console handler is installed");
+        let targets = [0, 1].map(|at| Target::new(PAIR[at], &case.roots[at], PAIR[at], &case.snapshots[at], KEY));
+        let line = line_of([Some(&app), Some(&lib)]);
+        let transport = case.local();
+
+        let ended = case.with_attempt(&transport, Some(interrupt), |attempt| {
+            attempt.interrupt_at = Some("apply");
+            sync_back(attempt, &targets, Some(&line), 0)
+        });
+
+        assert!(matches!(&ended, Err(End::Interrupted)), "{ended:?}");
+        assert!(
+            !case.root(0).join("b.txt").exists() && !case.root(1).join("c.txt").exists(),
+            "nothing is applied in either repo"
+        );
+        assert_eq!((case.kept(0), case.kept(1)), (Some(app), Some(lib)), "both back commits are kept");
+        assert_eq!(
+            case.said(),
+            [format!(
+                "gate: the run was interrupted; the changes are kept: see git diff in each repo at {KEPT}"
+            )]
+        );
+        case.remove();
+    }
+
+    /// The interrupt is raised as lib's fetch is readied, after app's back commit was taken and before any write.
+    #[test]
+    fn an_interrupt_in_the_first_phase_keeps_what_was_taken_and_applies_nothing() {
         let case = PairCase::new("interrupt");
         let app = case.plant(0, &[("b.txt", "b\n")]);
         let lib = case.plant(1, &[("c.txt", "c\n")]);
@@ -3718,6 +3753,79 @@ mod tests {
                 "gate: the run was interrupted; the changes are kept: see git diff in each repo at {KEPT}"
             )]
         );
+        case.remove();
+    }
+
+    /// The lock of the worktree at `at` in `case`'s pair, held by another run until the sender it hands back is sent to.
+    fn locked_elsewhere(case: &PairCase, at: usize) -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>) {
+        let state = StateRoot::new(r"C:\gate-sync-back-tests", None);
+        let (_, lock) = crate::remote::worktree_lock::lock_of(&state, &case.roots[at]).expect("the worktree's id is read");
+        crate::remote::worktree_lock::tests::held_elsewhere(&lock)
+    }
+
+    /// What a sync-back whose worktree `app`'s lock another run holds says before it gives up.
+    const APP_WAITED: &str = "gate: remote waiting for the worktree app: another run holds it";
+
+    #[test]
+    fn a_single_sync_back_whose_worktree_lock_is_held_elsewhere_fetches_nothing() {
+        let case = PairCase::new("single-locked");
+        case.plant(0, &[("b.txt", "b\n")]);
+        let target = Target::new(PAIR[0], &case.roots[0], PAIR[0], &case.snapshots[0], KEY);
+        let transport = case.local();
+        let (release, holder) = locked_elsewhere(&case, 0);
+
+        let ended = case.with_attempt(&transport, None, |attempt| {
+            attempt.lock_wait = Duration::ZERO;
+            sync_back(attempt, &[target], None, 0)
+        });
+
+        release.send(()).expect("the other run is still there");
+        holder.join().expect("the other run ends");
+        assert!(
+            matches!(&ended, Err(End::Failed(why)) if why == "another run held the worktree app for more than 0 s"),
+            "{ended:?}"
+        );
+        assert!(!case.root(0).join("b.txt").exists(), "nothing is applied");
+        assert_eq!(case.quarantines(0), 0, "nothing is fetched");
+        assert_eq!(case.said(), [APP_WAITED]);
+        case.remove();
+    }
+
+    #[test]
+    fn a_pair_waits_only_for_the_locks_of_repos_with_a_back_commit() {
+        let case = PairCase::new("pair-locked");
+        let app = case.plant(0, &[("b.txt", "b\n")]);
+        case.plant(1, &[("c.txt", "c\n")]);
+        let line = line_of([Some(&app), None]);
+        let no_wait = |attempt: &mut Attempt<'_, '_>| attempt.lock_wait = Duration::ZERO;
+
+        let (release, holder) = locked_elsewhere(&case, 0);
+        let app_held = case.synced_with(Some(&line), &case.local(), no_wait);
+        release.send(()).expect("the other run is still there");
+        holder.join().expect("the other run ends");
+        let (release, holder) = locked_elsewhere(&case, 1);
+        let lib_held = case.synced_with(Some(&line), &case.local(), no_wait);
+        release.send(()).expect("the other run is still there");
+        holder.join().expect("the other run ends");
+
+        assert!(
+            matches!(&app_held, Err(End::Failed(why)) if why == "another run held the worktree app for more than 0 s"),
+            "{app_held:?}"
+        );
+        assert!(
+            matches!(
+                &lib_held,
+                Ok(Synced {
+                    end: End::Status(0),
+                    reason: None
+                })
+            ),
+            "lib's back commit is none, so its held lock is not waited for: {lib_held:?}"
+        );
+        assert!(case.root(0).join("b.txt").exists(), "app's change is applied once its lock is free");
+        assert!(!case.root(1).join("c.txt").exists(), "lib's advertised ref is not fetched");
+        assert_eq!(case.quarantines(1), 0);
+        assert_eq!(case.said(), [APP_WAITED, "gate: synced back 1 file(s) in app: b.txt"]);
         case.remove();
     }
 

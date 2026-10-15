@@ -282,6 +282,7 @@ pub(crate) fn run(payload: &Payload, seams: &BoxSeams, console: &mut Console) ->
         }
         Err(line) => {
             console.err(&line);
+            no_back_commits(&request, console);
             return FAILED_STATUS;
         }
     };
@@ -289,7 +290,10 @@ pub(crate) fn run(payload: &Payload, seams: &BoxSeams, console: &mut Console) ->
     // checkout, is kept for the look just before the job is created.
     let stop = match create_stop_event(request.job, console) {
         Ok(stop) => stop,
-        Err(status) => return status,
+        Err(status) => {
+            no_back_commits(&request, console);
+            return status;
+        }
     };
     match in_work_folder(&request, &stop, seams, console) {
         Ok(status) | Err(status) => status,
@@ -453,7 +457,11 @@ impl<'a> RunOutputs<'a> {
 fn in_work_folder(request: &Request<'_>, stop: &NamedEvent, seams: &BoxSeams, console: &mut Console) -> Result<u32, u32> {
     let lock = OutputLock::default();
     let git = WorkGit::ready(request, &lock);
-    git.clear_back_refs(request, console).map_err(|failed| said(console, &failed))?;
+    git.clear_back_refs(request, console).map_err(|failed| {
+        let status = said(console, &failed);
+        no_back_commits(request, console);
+        status
+    })?;
     // Refused before the checkout, so a payload naming a folder outside the work folder changes nothing there; the
     // earlier run's back ref goes, as the checkout's would, so the client finds none to fetch.
     let Some((work, place)) = work_and_place(request.tree(), request.subfolder) else {
@@ -465,6 +473,7 @@ fn in_work_folder(request: &Request<'_>, stop: &NamedEvent, seams: &BoxSeams, co
             git.clear_back_ref(request, &request.main, console)
                 .map_err(|failed| said(console, &failed))?;
         }
+        no_back_commits(request, console);
         return Err(u32::from(USAGE_STATUS));
     };
     // A heartbeat that cannot start ends the heartbeats, never the run.
@@ -502,22 +511,7 @@ fn checked_out(
     mut outputs: Option<&mut RunOutputs<'_>>,
     console: &mut Console,
 ) -> Result<u32, u32> {
-    let held = match git.lay_out(request, console) {
-        Ok(held) => held,
-        Err(NotLaidOut::Failed(failed)) => return Err(said(console, &failed)),
-        Err(NotLaidOut::Refused(why)) => return Err(layout_refused(request, &why, beat, console)),
-    };
-    git.checkout(request, console).map_err(|failed| said(console, &failed))?;
-    // Released before the command, which may change the work folder as it likes.
-    drop(held);
-    if !folders.place.is_dir() {
-        console.err(&format!(
-            "gate: remote subfolder {} does not exist in the snapshot",
-            escaped(request.subfolder)
-        ));
-        return Err(u32::from(USAGE_STATUS));
-    }
-    tools::update(request, folders.work, folders.place, beat, console)?;
+    ready(request, git, folders, beat, console)?;
     if let Some(outputs) = outputs.as_deref_mut() {
         outputs.list(folders.work, beat, console);
     }
@@ -549,6 +543,43 @@ fn checked_out(
     }
 }
 
+/// The run up to its command: the snapshot laid out and checked out, the subfolder found and the repo's dotnet tools
+/// restored; else `Err` with the status the run ends on, its lines said. A refusal is said as such; any other end is
+/// followed, on a pair run, by the box's `gate: remote back commits: failed` line ([`ended_before`]).
+fn ready(request: &Request<'_>, git: &WorkGit, folders: &Folders<'_>, beat: &Beat<'_>, console: &mut Console) -> Result<(), u32> {
+    let held = match git.lay_out(request, console) {
+        Ok(held) => held,
+        Err(NotLaidOut::Failed(failed)) => return Err(ended_before(said(console, &failed), request, beat, console)),
+        Err(NotLaidOut::Refused(why)) => return Err(layout_refused(request, &why, beat, console)),
+    };
+    if let Err(failed) = git.checkout(request, console) {
+        return Err(ended_before(said(console, &failed), request, beat, console));
+    }
+    // Released before the command, which may change the work folder as it likes.
+    drop(held);
+    if !folders.place.is_dir() {
+        console.err(&format!(
+            "gate: remote subfolder {} does not exist in the snapshot",
+            escaped(request.subfolder)
+        ));
+        return Err(ended_before(u32::from(USAGE_STATUS), request, beat, console));
+    }
+    match tools::update(request, folders.work, folders.place, beat, console) {
+        // The tools' refusal, its tag said: the PC runs the command itself and syncs nothing back.
+        Err(REFUSED_STATUS) => Err(REFUSED_STATUS),
+        Err(status) => Err(ended_before(status, request, beat, console)),
+        Ok(()) => Ok(()),
+    }
+}
+
+/// A run that ended before its command with `status`, its lines said: on a pair run, the box's back commits `failed`
+/// line follows them ([`back_commits_failed`]), so a pair run the box did not refuse never ends without a back commits
+/// line. `status`.
+fn ended_before(status: u32, request: &Request<'_>, beat: &Beat<'_>, console: &mut Console) -> u32 {
+    back_commits_failed(request, beat, console);
+    status
+}
+
 /// The paths the back commit `commit` changes, which the outputs leave out, none without a commit, or why they could
 /// not be read; `Err` with the status the run ends on when the client closed the connection meanwhile, its line said.
 fn back_skip(request: &Request<'_>, git: &WorkGit, commit: Option<&str>, console: &mut Console) -> Result<Result<Vec<String>, String>, u32> {
@@ -562,14 +593,19 @@ fn back_skip(request: &Request<'_>, git: &WorkGit, commit: Option<&str>, console
 }
 
 /// On a pair run, says `gate: remote back commits: failed` under the box's output lock, for a run whose back commits
-/// were not all pushed after its command ended: the PC applies nothing, and a back commits line the command printed
-/// itself is no longer the last.
+/// were not all pushed: the PC applies nothing, and a back commits line the command printed itself is no longer the
+/// last.
 fn back_commits_failed(request: &Request<'_>, beat: &Beat<'_>, console: &mut Console) {
-    if request.siblings.is_empty() {
-        return;
-    }
     let _held = beat.lock.lock().unwrap_or_else(PoisonError::into_inner);
-    console.err("gate: remote back commits: failed");
+    no_back_commits(request, console);
+}
+
+/// On a pair run, says `gate: remote back commits: failed`, for a run that ended before its command without a refusal;
+/// the caller holds the box's output lock, or nothing else writes to the box's output yet.
+fn no_back_commits(request: &Request<'_>, console: &mut Console) {
+    if !request.siblings.is_empty() {
+        console.err("gate: remote back commits: failed");
+    }
 }
 
 /// Says the failed step's line; its status.
@@ -1270,7 +1306,7 @@ fn watch(started: Started<'_, '_>, console: &mut Console) -> Result<Ran, u32> {
         }
         WaitEnd::Killed((kill, ceiling)) => killed(watched, kill, &ceiling.closed(), beat.seams, console),
         WaitEnd::ClientGone => Err(watched.client_gone(console)),
-        WaitEnd::Failed(status) => Err(status),
+        WaitEnd::Failed(status) => Err(watched.wait_failed(status, console)),
     }
 }
 
@@ -1468,6 +1504,19 @@ impl Watched<'_> {
         let ending = terminate_and_wait(self.job);
         self.forwarders.drain(DRAIN);
         closed_connection(self.job, ending, console)
+    }
+
+    /// The wait for the main process failed, its line said: the job is ended and waited for, then the readers drain
+    /// for at most [`DRAIN`], so no line of the process is forwarded after the box's next line; then what the ending
+    /// left is said. `status`, the wait's own.
+    pub(super) fn wait_failed(self, status: u32, console: &mut Console) -> u32 {
+        let ending = terminate_and_wait(self.job);
+        self.forwarders.drain(DRAIN);
+        match ending {
+            Ok(ending) => ending.say(self.job.name(), console),
+            Err(error) => console.err(&format!("gate: remote could not stop job {}: {error}", self.job.name())),
+        }
+        status
     }
 }
 

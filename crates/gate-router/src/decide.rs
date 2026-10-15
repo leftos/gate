@@ -219,7 +219,8 @@ pub trait Facts {
     /// What could not be read; the gate then runs here, saying so.
     fn sibling_folder(&self, root: &str) -> Result<SiblingFolder, String>;
 
-    /// The id of the worktree root's folder, opened following links. Asked only once every declared sibling is present.
+    /// The id of the worktree root's folder, opened following links. Asked for every matched command with no siblings
+    /// file problem, once every declared sibling is present.
     ///
     /// # Errors
     ///
@@ -747,7 +748,9 @@ struct Declared<'a> {
 /// folder name the builder cannot lay out; a sibling named like that folder (ASCII letter case aside); a sibling with
 /// no git worktree or one refused ([`Facts::sibling_folder`]); a sibling whose folder is the root's or an earlier
 /// sibling's. No sibling is looked for until every name is allowed
-/// and known to be another folder's. With each sibling's folder id, in declared order.
+/// and known to be another folder's. With each sibling's folder id, in declared order. The root's own id is read for
+/// every matched command, siblings or none, after the siblings are found ([`Facts::root_id`]): a root whose id cannot be
+/// read keeps the run here, as its sync-back's lock needs it.
 fn check_siblings(declared: &Declared<'_>, allowed: Result<&[String], &str>, facts: &dyn Facts) -> Result<Vec<FolderId>, Here> {
     let &Declared {
         ref problem,
@@ -760,14 +763,16 @@ fn check_siblings(declared: &Declared<'_>, allowed: Result<&[String], &str>, fac
             problem: escaped(&fold_lines(problem)),
         }));
     }
+    let root_id = || facts.root_id(root).map_err(|reason| Some(failed(&reason)));
     if siblings.is_empty() {
+        root_id()?;
         return Ok(Vec::new());
     }
     check_layout_names(siblings)?;
     check_consent(siblings, allowed)?;
     check_leaf(siblings, leaf)?;
     let ids = folder_ids(siblings, facts)?;
-    let root_id = facts.root_id(root).map_err(|reason| Some(failed(&reason)))?;
+    let root_id = root_id()?;
     check_distinct(siblings, &ids, root_id)?;
     Ok(ids)
 }

@@ -4,36 +4,23 @@
 //! of their ids, so two runs never each hold one the other waits for, and waits for one another run holds, saying so
 //! once, until the attempt's git limit has passed.
 
-use std::fs::{File, OpenOptions};
-use std::io;
-use std::os::windows::fs::OpenOptionsExt;
-use std::path::Path;
 use std::time::{Duration, Instant};
 
+use gate_router::FolderId;
 use gate_state::{KernelObject, StateRoot};
 use gate_win32::{AcquireError, Interrupt, NamedMutex, OwnedMutexGuard};
-use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE};
 
 use super::client::End;
+use crate::route;
 
 /// How long each wait for a worktree's lock another run holds lasts before the interrupt and the deadline are looked at
 /// again.
 const WAIT_STEP: Duration = Duration::from_millis(100);
 
-/// The folder at `root` opened for reading, a link or a junction on the way followed, sharing everything.
-fn opened(root: &str) -> io::Result<File> {
-    OpenOptions::new()
-        .read(true)
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-        .open(Path::new(root))
-}
-
-/// The id of the worktree folder at `root` and the name of its lock under the state root `state`; else why its id
-/// cannot be read.
-fn lock_of(state: &StateRoot, root: &str) -> Result<((u64, [u8; 16]), String), End> {
-    let unreadable = |error: io::Error| End::Failed(format!("cannot read the id of the worktree folder {root}: {error}"));
-    let (volume, file) = opened(root).and_then(|folder| gate_win32::file_id(&folder)).map_err(unreadable)?;
+/// The id of the worktree folder at `root` ([`route::root_id`]) and the name of its lock under the state root `state`;
+/// else why its id cannot be read.
+pub(super) fn lock_of(state: &StateRoot, root: &str) -> Result<((u64, [u8; 16]), String), End> {
+    let FolderId { volume, file } = route::root_id(root).map_err(End::Failed)?;
     Ok(((volume, file), state.object_name(KernelObject::Worktree { volume, file })))
 }
 
@@ -98,7 +85,7 @@ fn taken(lock: &str, name: &str, wait: &Wait, say: &mut impl FnMut(String)) -> R
 
 #[cfg(test)]
 #[expect(clippy::expect_used, reason = "a test whose folder, mutex or thread cannot be had must fail loudly")]
-mod tests {
+pub(super) mod tests {
     use std::path::PathBuf;
     use std::process::Command;
     use std::sync::mpsc;
@@ -126,8 +113,9 @@ mod tests {
         folder
     }
 
-    /// The lock `lock` held by another run, a thread of its own, until the sender it hands back is sent to.
-    fn held_elsewhere(lock: &str) -> (mpsc::Sender<()>, thread::JoinHandle<()>) {
+    /// The lock `lock` held by another run, a thread of its own, until the sender it hands back is sent to; the
+    /// sync-back's tests hold a worktree's lock through it too.
+    pub(in crate::remote) fn held_elsewhere(lock: &str) -> (mpsc::Sender<()>, thread::JoinHandle<()>) {
         let (holding, is_held) = mpsc::channel();
         let (release, released) = mpsc::channel::<()>();
         let lock = lock.to_owned();

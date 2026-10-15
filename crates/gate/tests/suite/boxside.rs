@@ -3036,8 +3036,14 @@ fn box_run_single_then_pair_leaves_no_work_git_folder() {
 /// The pair payload of `app`, `lib` and `tools` whose command, `.\change.cmd`, changes `a.txt` in the main tree and
 /// `b.txt` in `lib`'s, leaving `tools` unchanged, its snapshots pushed.
 fn changing_two_of_three(case: &Case) -> Value {
+    changing_two_of_three_after(case, "")
+}
+
+/// [`changing_two_of_three`], its command running the cmd lines `first` before it changes anything.
+fn changing_two_of_three_after(case: &Case, first: &str) -> Value {
     let mut payload = pair_payload(case, &["lib", "tools"], &[r".\change.cmd"]);
-    let change = "@echo changed> a.txt\r\n@echo changed> ..\\lib\\b.txt\r\n";
+    let change = format!("{first}@echo changed> a.txt\r\n@echo changed> ..\\lib\\b.txt\r\n");
+    let change = change.as_str();
     pair_snapshot(
         case,
         &mut payload,
@@ -3070,7 +3076,8 @@ fn box_run_clears_a_stale_sibling_back_ref_when_the_fetch_fails() {
 #[test]
 fn box_run_that_fails_a_sibling_s_push_leaves_no_back_ref_in_either_bare() {
     let case = Case::new("box_run_sibling_push_fails");
-    let payload = changing_two_of_three(&case);
+    // The command first prints a line that looks like the box's own back commits line.
+    let payload = changing_two_of_three_after(&case, &format!("@>&2 echo {}\r\n", forged_back_commits()));
     let stub = case.folder().join("stub-git");
     fs::create_dir_all(&stub).expect("the stub folder can be made");
     fs::write(
@@ -3097,6 +3104,77 @@ fn box_run_that_fails_a_sibling_s_push_leaves_no_back_ref_in_either_bare() {
     let back = format!("refs/gate-back/{PAIR_KEY}");
     assert!(!has_ref(&payload, &back), "the main repo's pushed back ref is deleted");
     assert!(!has_ref_in(&sibling_bare(&payload, "lib"), &back), "the sibling has none");
+    let said = lines_starting(&outcome, BACK_COMMITS);
+    assert_eq!(
+        said.first().copied(),
+        Some(forged_back_commits().as_str()),
+        "the command's line came: {outcome:?}"
+    );
+    assert_eq!(
+        said.last().copied(),
+        Some(BACK_COMMITS_FAILED),
+        "the box's failed line is the last: {outcome:?}"
+    );
+    let lines: Vec<&str> = outcome.stderr.lines().collect();
+    let failed_at = lines.iter().rposition(|line| *line == BACK_COMMITS_FAILED);
+    let push_at = lines
+        .iter()
+        .position(|line| *line == "gate: remote sync-back failed: push lib failed (status 1)");
+    assert!(failed_at < push_at, "the box says failed before its failure line: {outcome:?}");
+}
+
+/// What every back commits line starts with.
+const BACK_COMMITS: &str = "gate: remote back commits: ";
+/// The box's back commits line for a pair run whose back commits failed or were never made.
+const BACK_COMMITS_FAILED: &str = "gate: remote back commits: failed";
+
+/// A back commits line a command prints to pass for the box's, naming the pair `app`, `lib` and `tools`.
+fn forged_back_commits() -> String {
+    format!("{BACK_COMMITS}app {}, lib {}, tools none", "a".repeat(40), "b".repeat(40))
+}
+
+#[test]
+fn box_pair_run_that_ends_before_its_command_says_its_back_commits_failed() {
+    let case = Case::new("box_pair_run_subfolder_missing");
+    let mut payload = changing_two_of_three(&case);
+    payload["Subfolder"] = json!("nope");
+
+    let outcome = run_box(&case, &payload);
+
+    assert_eq!(outcome.code, Some(2), "{outcome:?}");
+    assert_eq!(
+        outcome.stderr,
+        format!("gate: remote subfolder nope does not exist in the snapshot\n{BACK_COMMITS_FAILED}\n"),
+        "{outcome:?}"
+    );
+}
+
+#[test]
+fn box_pair_run_whose_command_the_ceiling_kills_says_its_back_commits_failed() {
+    let case = Case::new("box_pair_run_ceiling_kill");
+    let forged = forged_back_commits();
+    let mut payload = pair_payload(&case, &["lib", "tools"], &[FAKE_TOOL, "err", &forged, "sleep", "600000"]);
+    payload["Timeout"] = json!(1);
+    payload["Host"] = json!("builder");
+    pair_snapshot(
+        &case,
+        &mut payload,
+        &[("a.txt", "main\n")],
+        &[("lib", &[("b.txt", "lib\n")]), ("tools", &[("c.txt", "tools\n")])],
+    );
+
+    // The whole machine free, so the clock runs with wall time however loaded the machine running the case is.
+    let outcome = run_box_with_seams(&case, &payload, &["--test-box-sample-ms", "20", "--test-box-free-percent", "100"]);
+
+    assert_eq!(outcome.code, Some(124), "{outcome:?}");
+    let said = lines_starting(&outcome, BACK_COMMITS);
+    assert_eq!(said.first().copied(), Some(forged.as_str()), "the command's line came: {outcome:?}");
+    assert_eq!(
+        said.last().copied(),
+        Some(BACK_COMMITS_FAILED),
+        "the box's failed line is the last: {outcome:?}"
+    );
+    wait_until_closed(Path::new(field(&payload, "Lock")));
 }
 
 #[test]

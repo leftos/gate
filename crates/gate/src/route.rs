@@ -242,11 +242,21 @@ impl Facts for Machine<'_> {
     }
 
     fn root_id(&self, root: &str) -> Result<FolderId, String> {
-        let unreadable = |error: io::Error| format!("cannot read the id of the worktree folder {root}: {error}");
-        let folder = open_followed(Path::new(root), Share::All).map_err(unreadable)?;
-        let (volume, file) = gate_win32::file_id(&folder).map_err(unreadable)?;
-        Ok(FolderId { volume, file })
+        root_id(root)
     }
+}
+
+/// The id of the worktree folder at `root`, opened following links and sharing everything: routing reads it for every
+/// routed run, and the sync-back names a worktree's lock by it.
+///
+/// # Errors
+///
+/// Why the id cannot be read, naming the folder.
+pub(crate) fn root_id(root: &str) -> Result<FolderId, String> {
+    let unreadable = |error: io::Error| format!("cannot read the id of the worktree folder {root}: {error}");
+    let folder = open_followed(Path::new(root), Share::All).map_err(unreadable)?;
+    let (volume, file) = gate_win32::file_id(&folder).map_err(unreadable)?;
+    Ok(FolderId { volume, file })
 }
 
 /// The folder of the sibling whose root is `root`, the worktree root's parent and the sibling's name: the parent opened
