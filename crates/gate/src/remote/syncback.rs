@@ -3769,7 +3769,7 @@ mod tests {
     #[test]
     fn a_single_sync_back_whose_worktree_lock_is_held_elsewhere_fetches_nothing() {
         let case = PairCase::new("single-locked");
-        case.plant(0, &[("b.txt", "b\n")]);
+        let app = case.plant(0, &[("b.txt", "b\n")]);
         let target = Target::new(PAIR[0], &case.roots[0], PAIR[0], &case.snapshots[0], KEY);
         let transport = case.local();
         let (release, holder) = locked_elsewhere(&case, 0);
@@ -3786,7 +3786,12 @@ mod tests {
             "{ended:?}"
         );
         assert!(!case.root(0).join("b.txt").exists(), "nothing is applied");
-        assert_eq!(case.quarantines(0), 0, "nothing is fetched");
+        assert!(
+            asked(case.root(0), &[], &["cat-file", "-e", &app]).is_err(),
+            "nothing is fetched: the worktree's store lacks the back commit"
+        );
+        // A fetch writes FETCH_HEAD even when its objects go only into a quarantine that is then removed.
+        assert!(!case.root(0).join(".git").join("FETCH_HEAD").exists(), "no fetch ran");
         assert_eq!(case.said(), [APP_WAITED]);
         case.remove();
     }

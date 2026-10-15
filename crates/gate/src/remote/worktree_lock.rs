@@ -2,7 +2,7 @@
 //! worktree folder's id ([`KernelObject::Worktree`]), read by opening its root at lock time, so two runs that write one
 //! folder, under one spelling of its path or two, never write it at once. A run takes its worktrees' locks in the order
 //! of their ids, so two runs never each hold one the other waits for, and waits for one another run holds, saying so
-//! once, until the attempt's git limit has passed.
+//! once, until the attempt's lock wait has passed.
 
 use std::time::{Duration, Instant};
 
