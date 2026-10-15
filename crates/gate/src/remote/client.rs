@@ -236,6 +236,9 @@ impl RemoteClient for RustClient {
     }
 
     fn run(&mut self, call: &RemoteCall<'_>) -> RemoteOutcome {
+        if let Some(sibling) = call.siblings.first() {
+            return pairs_off(call, sibling.name());
+        }
         let transport = match found(&mut self.transport) {
             Ok(transport) => transport,
             Err(why) => return RemoteOutcome::not_started(why),
@@ -293,6 +296,24 @@ impl RemoteClient for RustClient {
             Ok(end) | Err(end) => end,
         };
         attempt.outcome(end)
+    }
+}
+
+/// What the fallback line of a call carrying siblings says the client could not start for.
+const PAIRS_OFF: &str = "sibling pairs are off";
+
+/// The outcome of the call `call`, which carries the sibling `name` first, while the builder takes no sibling pairs: it
+/// falls back `client` before any folder read, ssh call or push, saying `gate: not routed: sibling {name} the builder
+/// does not take sibling pairs yet`.
+fn pairs_off(call: &RemoteCall<'_>, name: &str) -> RemoteOutcome {
+    let line = format!("gate: not routed: sibling {name} the builder does not take sibling pairs yet");
+    let detail = match super::say(call.log, &[&line], io::stderr().lock()) {
+        Ok(()) => PAIRS_OFF.to_owned(),
+        Err(why) => why,
+    };
+    RemoteOutcome {
+        lines: vec![line],
+        ..RemoteOutcome::not_started(detail)
     }
 }
 

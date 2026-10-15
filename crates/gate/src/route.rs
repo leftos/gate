@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use gate_args::{RunRequest, Slot};
 use gate_router::{Config, ConfigProblem, Facts, FolderId, Inputs, LocalReason, Place, Route, SiblingFolder, decide};
+use gate_win32::Share;
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
 };
@@ -268,7 +269,7 @@ pub(crate) fn sibling_folder(root: &str) -> Result<SiblingFolder, String> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(SiblingFolder::Missing),
         parent => parent.map_err(unreadable)?,
     };
-    let Some((folder, metadata)) = with_metadata(gate_win32::open_beneath(&parent, name)).map_err(unreadable)? else {
+    let Some((folder, metadata)) = with_metadata(gate_win32::open_beneath(&parent, name, Share::All)).map_err(unreadable)? else {
         return Ok(SiblingFolder::Missing);
     };
     if metadata.file_type().is_symlink() {
@@ -277,7 +278,7 @@ pub(crate) fn sibling_folder(root: &str) -> Result<SiblingFolder, String> {
     if !metadata.is_dir() {
         return Ok(SiblingFolder::Refused(SIBLING_NOT_A_FOLDER.to_owned()));
     }
-    let Some((_git, git_metadata)) = with_metadata(gate_win32::open_beneath(&folder, ".git")).map_err(unreadable)? else {
+    let Some((_git, git_metadata)) = with_metadata(gate_win32::open_beneath(&folder, ".git", Share::All)).map_err(unreadable)? else {
         return Ok(SiblingFolder::Missing);
     };
     if git_metadata.file_type().is_symlink() {
@@ -335,7 +336,7 @@ pub(crate) fn read_gate_file(root: &Path, name: &str) -> Result<Option<Vec<u8>>,
     if !gate_metadata.is_dir() {
         return Ok(None);
     }
-    let opened = with_metadata(gate_win32::open_beneath(&gate_folder, name)).map_err(|error| format!("cannot read it: {error}"))?;
+    let opened = with_metadata(gate_win32::open_beneath(&gate_folder, name, Share::All)).map_err(|error| format!("cannot read it: {error}"))?;
     let Some((file, metadata)) = opened else {
         return Ok(None);
     };

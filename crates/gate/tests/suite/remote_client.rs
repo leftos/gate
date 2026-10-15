@@ -1091,6 +1091,50 @@ fn a_box_of_another_version_is_not_routed() {
     assert_eq!(builder_ref(&case, &format!("refs/gate/{}", key_of(&events))), "", "nothing was pushed");
 }
 
+/// A run whose repo declares a sibling the routing file allows, a repository beside the case folder, stays here until
+/// the client takes sibling pairs: it says so naming the sibling, calls no builder, creates no bare there and leaves the
+/// sibling no snapshot ref.
+#[test]
+fn a_run_carrying_a_sibling_stays_local_until_pairs_are_on() {
+    let case = client_case("client-sibling-off");
+    let leaf = case
+        .folder()
+        .file_name()
+        .expect("the case folder has a name")
+        .to_string_lossy()
+        .into_owned();
+    let (repo, name) = (repo_name(&leaf), format!("{leaf}-sibling"));
+    let sibling = case.folder().parent().expect("the case folder has a parent").join(&name);
+    if sibling.exists() {
+        fs::remove_dir_all(&sibling).expect("a sibling left by an earlier run can be removed");
+    }
+    fs::create_dir_all(&sibling).expect("the sibling can be made");
+    git_out(&case, &[], &["-C", &shown(&sibling), "init", "--quiet"]);
+    write(&case, ".gate/siblings.toml", &format!("siblings = [\"{name}\"]\n"));
+    let routing = json!({
+        "host": HOST,
+        "slots": 2,
+        "repos": { &repo: ["*tool*"] },
+        "outputs": { &repo: [] },
+        "siblings": { &repo: [&name] },
+    });
+    write_remote_json(&case, &routing.to_string());
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "out", "ran here"]));
+    let sibling_refs = git_out(&case, &[], &["-C", &shown(&sibling), "for-each-ref", "refs/gate-remote/"]);
+    fs::remove_dir_all(&sibling).expect("the sibling can be removed");
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let line = format!("gate: not routed: sibling {name} the builder does not take sibling pairs yet");
+    assert_eq!(outcome.stderr.lines().filter(|said| *said == line).count(), 1, "said once: {outcome:?}");
+    assert!(outcome.stdout.contains("ran here"), "{outcome:?}");
+    assert_eq!(calls(&steps), Vec::<String>::new(), "no call reached the builder");
+    assert_eq!(fallbacks(&events(&case)), ["client"]);
+    assert!(!case.folder().join("builder").exists(), "no bare was created on the builder");
+    assert_eq!(sibling_refs, "", "the sibling has no snapshot ref");
+}
+
 #[test]
 fn a_builder_gate_of_the_same_version_without_this_build_falls_back_version() {
     let case = client_case("client-version-no-build");

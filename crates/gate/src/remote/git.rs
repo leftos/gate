@@ -370,7 +370,7 @@ pub(crate) fn judged(program: &Path, worktree: &Path) -> Result<PathBuf, String>
 
 /// `path` without the `\\?\` prefix a canonical path carries, which cmd.exe does not take: `\\?\C:\a` as `C:\a`, and
 /// `\\?\UNC\server\share\a` as `\\server\share\a`. Any other path is kept as it is.
-fn without_verbatim(path: &Path) -> PathBuf {
+pub(crate) fn without_verbatim(path: &Path) -> PathBuf {
     let mut parts = path.components();
     let Some(Component::Prefix(prefix)) = parts.next() else {
         return path.to_owned();

@@ -22,14 +22,14 @@ use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 /// Opens `name`, one file or folder name, inside the open folder `folder` for reading, as itself: a link or a junction
 /// so named is opened as the link, not followed. The name is looked up in the folder the handle holds, whatever its
 /// path names by now, and matched in any letter case unless that folder is case-sensitive, as a path open matches it.
-/// The new handle shares reading, writing and deletion.
+/// The new handle shares what `share` says.
 ///
 /// # Errors
 ///
 /// An error of kind [`io::ErrorKind::NotFound`] when nothing in the folder has that name, of kind
 /// [`io::ErrorKind::InvalidInput`], before any system call, for a name that is not one name ([`one_name`]) or is too
 /// long to pass, else the system's error.
-pub fn open_beneath(folder: &File, name: &str) -> io::Result<File> {
+pub fn open_beneath(folder: &File, name: &str, share: Share) -> io::Result<File> {
     one_name(name)?;
     let mut wide: Vec<u16> = OsStr::new(name).encode_wide().collect();
     let length = u16::try_from(size_of_val(wide.as_slice())).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "the name is too long"))?;
@@ -46,7 +46,6 @@ pub fn open_beneath(folder: &File, name: &str) -> io::Result<File> {
         SecurityDescriptor: ptr::null(),
         SecurityQualityOfService: ptr::null(),
     };
-    let share = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
     let mut handle = ptr::null_mut();
     let mut status_block = IO_STATUS_BLOCK::default();
     // SAFETY: the name's buffer, the attributes and the status block outlive the call, the attributes' root is the
@@ -60,7 +59,7 @@ pub fn open_beneath(folder: &File, name: &str) -> io::Result<File> {
             &raw mut status_block,
             ptr::null(),
             0,
-            share,
+            share.mode(),
             FILE_OPEN,
             FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
             ptr::null(),
@@ -74,6 +73,25 @@ pub fn open_beneath(folder: &File, name: &str) -> io::Result<File> {
     }
     // SAFETY: a success is a fresh handle nothing else owns; the returned file owns and closes it from now on.
     Ok(unsafe { File::from_raw_handle(handle) })
+}
+
+/// What others may do with a file or folder while [`open_beneath`] holds it open.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Share {
+    /// Read, write and delete it, a rename included.
+    All,
+    /// Read and write it, but neither delete nor rename it, a folder's own name included, until the handle is closed.
+    NoDelete,
+}
+
+impl Share {
+    /// The share mode of an open that lets others do this.
+    fn mode(self) -> u32 {
+        match self {
+            Share::All => FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            Share::NoDelete => FILE_SHARE_READ | FILE_SHARE_WRITE,
+        }
+    }
 }
 
 /// Refuses, as [`io::ErrorKind::InvalidInput`], a `name` that is not one file or folder name of the folder it is
@@ -212,7 +230,7 @@ mod tests {
 
     use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS};
 
-    use super::{move_no_replace, open_beneath, same_file, verbatim};
+    use super::{Share, move_no_replace, open_beneath, same_file, verbatim};
 
     /// The folder `path` held open, as a caller of [`open_beneath`] holds one.
     fn held(path: &Path) -> File {
@@ -234,7 +252,7 @@ mod tests {
         let folder = folder("case");
         std::fs::write(folder.join("siblings.toml"), "a").expect("the file can be written");
 
-        let mut opened = open_beneath(&held(&folder), "Siblings.TOML").expect("the name is found in another case");
+        let mut opened = open_beneath(&held(&folder), "Siblings.TOML", Share::All).expect("the name is found in another case");
         let mut text = String::new();
         opened.read_to_string(&mut text).expect("the file can be read");
 
@@ -247,7 +265,7 @@ mod tests {
     fn a_missing_name_is_not_found() {
         let folder = folder("missing");
 
-        let opened = open_beneath(&held(&folder), "siblings.toml");
+        let opened = open_beneath(&held(&folder), "siblings.toml", Share::All);
 
         assert_eq!(opened.map(drop).map_err(|error| error.kind()), Err(io::ErrorKind::NotFound));
         std::fs::remove_dir_all(&folder).expect("the folder can be removed");
@@ -266,7 +284,7 @@ mod tests {
             .expect("cmd.exe runs");
         assert!(made.status.success(), "a junction needs no privilege: {made:?}");
 
-        let opened = open_beneath(&held(&folder), "link").expect("the junction can be opened");
+        let opened = open_beneath(&held(&folder), "link", Share::All).expect("the junction can be opened");
 
         assert!(is_link_itself(&opened), "the junction is opened as itself, not followed");
         drop(opened);
@@ -284,7 +302,7 @@ mod tests {
             return;
         }
 
-        let opened = open_beneath(&held(&folder), "link.txt").expect("the symlink can be opened");
+        let opened = open_beneath(&held(&folder), "link.txt", Share::All).expect("the symlink can be opened");
 
         assert!(is_link_itself(&opened), "the symlink is opened as itself, not followed");
         drop(opened);
@@ -296,7 +314,7 @@ mod tests {
         let folder = folder("names");
         let held = held(&folder);
         for name in ["", ".", "..", r"a\b", "a/b", "a:b", "a\0b"] {
-            let opened = open_beneath(&held, name);
+            let opened = open_beneath(&held, name, Share::All);
             assert_eq!(
                 opened.map(drop).map_err(|error| error.kind()),
                 Err(io::ErrorKind::InvalidInput),
@@ -304,6 +322,24 @@ mod tests {
             );
         }
         drop(held);
+        std::fs::remove_dir_all(&folder).expect("the folder can be removed");
+    }
+
+    #[test]
+    fn a_folder_opened_without_delete_sharing_cannot_be_renamed() {
+        let folder = folder("no-delete");
+        std::fs::create_dir(folder.join("b")).expect("the folder can be made");
+
+        let opened = open_beneath(&held(&folder), "b", Share::NoDelete).expect("the folder can be opened");
+        let renamed = std::fs::rename(folder.join("b"), folder.join("c"));
+
+        assert_eq!(
+            renamed.map_err(|error| error.raw_os_error()),
+            Err(Some(32)),
+            "a sharing violation while held"
+        );
+        drop(opened);
+        std::fs::rename(folder.join("b"), folder.join("c")).expect("the folder can be renamed once let go");
         std::fs::remove_dir_all(&folder).expect("the folder can be removed");
     }
 
