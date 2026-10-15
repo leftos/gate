@@ -54,7 +54,8 @@ Sources: the worktree at b903f50, `docs/README.md`, `docs/ARCHITECTURE.md`, `doc
 
   Any other client is disconnected and the box keeps listening until the deadline. Nothing a wrong client sends is read.
 - **I4. The helper checks the server.**
-  - `GetNamedPipeServerProcessId` must equal the box pid in `Arg0`.
+  - The pipe's owner must be the builder SID and its DACL exactly the entries the box writes (read with `GetSecurityInfo` on the open handle); another identity cannot set either without `SeRestorePrivilege`. The box's pipe also carries a Medium mandatory label (no read or write up), so a Low-integrity process of the user cannot take its one instance.
+  - `GetNamedPipeServerProcessId` must equal the box pid in `Arg0`, as a cross-check only: once the box has exited, its pid can be reused.
   - It connects with `SECURITY_SQOS_PRESENT | SECURITY_ANONYMOUS`, the same as `crates\gate-win32\src\launch.rs:385` does for output files.
 
   Without these, another identity that squats a pipe name could impersonate the user's interactive token, and could choose what the helper starts. Your position only covers the box's side.
@@ -82,7 +83,7 @@ Sources: the worktree at b903f50, `docs/README.md`, `docs/ARCHITECTURE.md`, `doc
   - the parent pid is the helper (`parent_pid_of`, proc-table) and the child was created after the helper;
   - the child is in the target session;
   - its image is the `application` the box sent;
-  - it is still suspended (`SuspendThread` returns a count of 1 or more, then `ResumeThread` undoes it);
+  - it is still suspended exactly once (`SuspendThread` returns a count of exactly 1, then `ResumeThread` undoes it), and the final resume fails unless `ResumeThread` returns 1, so a child suspended twice is never left suspended after the marker;
   - it is not yet in the box's job.
 
   Then assign it, and check `IsProcessInJob(process, box_job)` is **true** for the box's job specifically. The spike's `injob=1` asked about "any job". The only proof the child was in the box's job was that kill-on-close ended it.
@@ -110,14 +111,14 @@ Sources: the worktree at b903f50, `docs/README.md`, `docs/ARCHITECTURE.md`, `doc
 
 - **I15. Pipe objects are not tied to a session; handles belong to processes.**
   - The box makes both anonymous pipes as today (piped.rs:220), with its own default DACL (Administrators and SYSTEM).
-  - The write ends go into the helper as inheritable copies. The helper hands exactly NUL plus those two to the child through `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`, the same rule as create.rs:82.
+  - The write ends go into the helper as non-inheritable copies, so none leaks into a process the helper itself starts. The helper's launch makes its own inheritable copies inside the spawn lock and hands exactly NUL plus those two to the child through `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`, the same rule as create.rs:82.
   - The box's copies of the write ends close once the child holds its own (piped.rs:151); the helper's are closed by I9.
   - Forwarders start only after the marker. The read ends stay in the box.
 - **I16. The helper uses the same creation rules as the box.** It goes through `check_launch` and the handle list, with the desktop-app policy `DISABLE_PROCESS_TREE` (piped.rs:148, so packaged children stay in the job), `CREATE_NO_WINDOW` and `CREATE_SUSPENDED`. `lpDesktop` is set to `WinSta0\Default` explicitly; `startup_info` at create.rs:278 sets none today. In practice the helper calls a gate-win32 function and does not re-implement any of this.
 
 ### F. Environment and working folder
 
-- **I17. The box builds the environment block and the helper passes it on unchanged.** One code path: `Variables::from_process().with_build_servers(..)` plus `with_safe_directory` (run.rs:736-739, :814). It is sent as bytes: base64 of UTF-16LE, so unpaired surrogates survive.
+- **I17. The box builds the environment block and the helper passes it on unchanged.** One code path: `Variables::from_process().with_build_servers(..)` plus `with_safe_directory` (run.rs:736-739, :814). It is sent as bytes: base64 of UTF-16LE, so unpaired surrogates survive. The helper builds its `EnvironmentBlock` from those bytes only through a constructor that refuses a block that does not end in two NULs or holds an empty or `=`-only entry, since `CreateProcessW` reads until the double NUL.
 
   `safe.directory` is still needed, because the token is non-elevated and the work folders are owned by Administrators. Session-0 variables such as `SSH_*` go along, as they do today.
 - **I18. Every path sent to the helper must exist in the interactive logon session.**
