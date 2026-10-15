@@ -1,9 +1,9 @@
 //! The hidden `gate box <verb> --stdin`: the builder side of a routed run. Only the words are read here; the request
 //! is stdin's first line, which the binary reads and decodes. A `test-seams` build also reads the hidden
 //! `--test-heartbeat-ms <n>`, `--test-box-console fail-before`, `--test-box-token refused`, `--test-box-park-launch <path>`,
-//! `--test-outputs-budget-bytes <n>`, `--test-inputs-budget-bytes <n>`, `--test-dotnet-limit-ms <n>`, `--test-box-sample-ms <n>`, `--test-box-sampler-fail
-//! true|false`, `--test-box-free-percent <1-100>`, `--test-box-kill-leaves <n>` and `--test-probe-limit-ms <n>` (each also
-//! as `--<seam>=<value>`) before the verb;
+//! `--test-outputs-budget-bytes <n>`, `--test-inputs-budget-bytes <n>`, `--test-dotnet-limit-ms <n>`,
+//! `--test-box-sample-ms <n>`, `--test-box-sampler-fail true|false`, `--test-box-free-percent <1-100>`,
+//! `--test-box-kill-leaves <n>` and `--test-probe-limit-ms <n>` (each also as `--<seam>=<value>`) before the verb;
 //! without the feature each is no verb, and so the box usage.
 
 use std::ffi::{OsStr, OsString};

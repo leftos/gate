@@ -7,11 +7,12 @@ use std::fmt::Write as _;
 use std::fs::{self, File};
 use std::io::Write;
 use std::os::windows::fs::OpenOptionsExt;
-use std::path::Path;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
+use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, READ_CONTROL};
 
 use super::{box_call, field, gate_box, git, lines, passed, payload, refused_line, run_box, snapshot};
 use crate::support::{Case, FAKE_TOOL, Outcome, box_payload, junction};
@@ -48,10 +49,15 @@ fn stepped(payload: &Value, step: &str) -> Value {
 
 /// The manifest line the PC sends for `files`, each a `/`-separated path and its bytes, without its newline.
 fn manifest_line(files: &[(&str, &[u8])]) -> String {
+    manifest_line_at(files, 1)
+}
+
+/// [`manifest_line`] with each file last written at the PC file time `modified`.
+fn manifest_line_at(files: &[(&str, &[u8])], modified: u64) -> String {
     let files: Map<String, Value> = files
         .iter()
         .map(|(path, bytes)| {
-            let file = json!({"size": bytes.len(), "modified": 1, "sha256": sha256(bytes)});
+            let file = json!({"size": bytes.len(), "modified": modified, "sha256": sha256(bytes)});
             ((*path).to_owned(), file)
         })
         .collect();
@@ -393,4 +399,477 @@ fn an_inputs_request_with_a_pair_is_refused() {
     assert_eq!(outcome.code, Some(2), "{outcome:?}");
     assert_eq!(outcome.stderr, "gate box: inputs for a sibling pair are not taken yet\n");
     assert!(!work(&payload).exists(), "nothing is laid out");
+}
+
+/// `payload` carrying the digest of the manifest line `line` as its `InputsDigest`.
+fn digested(payload: &Value, line: &str) -> Value {
+    let mut digested = payload.clone();
+    digested["InputsDigest"] = json!(sha256(line.as_bytes()));
+    digested
+}
+
+/// The payload of a put whose work folder has a snapshot of one tracked file, for a run to check out.
+fn snapshot_payload(case: &Case) -> Value {
+    let mut payload = inputs_payload(case, "put");
+    snapshot(case, &mut payload, &[("tracked.txt", "tracked\n")]);
+    payload
+}
+
+/// Says whether `outcome` is a run refused `inputs` for `payload`.
+fn assert_refused_inputs(payload: &Value, outcome: &Outcome, what: &str) {
+    assert_eq!(outcome.code, Some(75), "{what}: {outcome:?}");
+    assert_eq!(lines(&outcome.stderr)[0], refused_line(payload, "inputs"), "{what}: {outcome:?}");
+    assert_eq!(outcome.stdout, "", "{what}: the command never ran: {outcome:?}");
+}
+
+#[test]
+fn a_diff_that_needs_nothing_finishes_the_install_so_a_run_of_its_digest_runs() {
+    let case = Case::new("box_inputs_diff_finishes");
+    let payload = snapshot_payload(&case);
+    put_all(&case, &payload, &[HELPER, DATA]);
+
+    // The same bytes, rewritten on the PC, and DATA left the input set: a new manifest, nothing to send.
+    let line = manifest_line_at(&[HELPER], 2);
+    let outcome = inputs_call(&case, &stepped(&payload, "diff"), &[], &line, &[]);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(outcome.stdout, needs(&[]), "{outcome:?}");
+    assert!(
+        !work(&payload).join(r"data\b.txt").exists(),
+        "the input that left the manifest is deleted"
+    );
+    let ran = run_box(&case, &digested(&payload, &line));
+    assert_eq!(ran.code, Some(0), "{ran:?}");
+    assert_eq!(ran.stdout, "ran\n", "{ran:?}");
+}
+
+#[test]
+fn a_put_that_leaves_a_file_of_the_manifest_missing_fails_and_its_digest_is_refused() {
+    let case = Case::new("box_inputs_put_missing");
+    let payload = snapshot_payload(&case);
+
+    let outcome = put_with(&case, &payload, &[], &[HELPER, DATA], &[HELPER]);
+
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert_eq!(
+        outcome.stderr, "gate: remote inputs put failed: data/b.txt is missing after the install\n",
+        "{outcome:?}"
+    );
+    let run = run_box(&case, &digested(&payload, &manifest_line(&[HELPER, DATA])));
+    assert_refused_inputs(&payload, &run, "a put that did not finish");
+}
+
+#[test]
+fn an_exclude_file_that_cannot_be_written_leaves_no_matching_digest() {
+    let case = Case::new("box_inputs_exclude_fails");
+    let payload = snapshot_payload(&case);
+    put_all(&case, &payload, &[HELPER]);
+    // A folder at the exclude file's name that holds a file open without delete sharing cannot be removed.
+    let blocker = work(&payload).join(r".git\info\exclude");
+    fs::remove_file(&blocker).expect("the exclude file can be removed");
+    fs::create_dir(&blocker).expect("a folder can take its name");
+    let held = File::options()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .share_mode(0)
+        .open(blocker.join("held.txt"))
+        .expect("a file in it can be held");
+
+    let outcome = put_with(&case, &payload, &[], &[HELPER, DATA], &[DATA]);
+
+    drop(held);
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    let run = run_box(&case, &digested(&payload, &manifest_line(&[HELPER, DATA])));
+    assert_refused_inputs(&payload, &run, "the record is written only after the exclude file");
+}
+
+#[test]
+fn a_recorded_input_changed_between_the_put_and_the_run_refuses_the_run() {
+    let case = Case::new("box_inputs_run_changed");
+    let payload = snapshot_payload(&case);
+    put_all(&case, &payload, &[DATA]);
+    fs::write(work(&payload).join(r"data\b.txt"), "changed on the box\n").expect("the copy can be changed");
+
+    let run = run_box(&case, &digested(&payload, &manifest_line(&[DATA])));
+
+    assert_refused_inputs(&payload, &run, "a copy that is not the one installed");
+}
+
+#[test]
+fn a_run_rewrites_the_exclude_file_so_a_git_made_again_keeps_the_inputs() {
+    let case = Case::new("box_inputs_run_exclude");
+    let payload = snapshot_payload(&case);
+    let first = run_box(&case, &payload);
+    assert_eq!(first.code, Some(0), "{first:?}");
+    put_all(&case, &payload, &[HELPER]);
+    let exclude = work(&payload).join(r".git\info\exclude");
+    fs::remove_file(&exclude).expect("the exclude file can be removed, as a .git made again lacks it");
+
+    let run = run_box(&case, &digested(&payload, &manifest_line(&[HELPER])));
+
+    assert_eq!(run.code, Some(0), "{run:?}");
+    assert!(work(&payload).join(r".tmp\helper\a.dll").exists(), "the checkout's clean keeps the input");
+    assert_eq!(
+        fs::read_to_string(&exclude).expect("the exclude file is written again"),
+        "/.tmp/helper/a.dll\n"
+    );
+}
+
+#[test]
+fn a_junction_at_the_last_folder_refuses_the_put_and_nothing_is_written_through_it() {
+    let case = Case::new("box_inputs_last_folder_junction");
+    let payload = inputs_payload(&case, "put");
+    let laid = diff(&case, &payload, &[DATA]);
+    assert_eq!(laid.code, Some(0), "the diff lays the work folder out: {laid:?}");
+    let outside = case.folder().join("outside");
+    fs::create_dir_all(&outside).expect("the outside folder can be made");
+    junction(&work(&payload).join("data"), &outside);
+
+    let outcome = put_with(&case, &payload, &[], &[DATA], &[DATA]);
+
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert!(outcome.stderr.contains("data/b.txt"), "the line names the path: {outcome:?}");
+    assert_eq!(
+        fs::read_dir(&outside).expect("the outside folder can be listed").count(),
+        0,
+        "nothing is written outside"
+    );
+}
+
+#[test]
+#[expect(clippy::print_stderr, reason = "a skipped case says why it skipped")]
+fn a_file_symlink_at_the_exclude_file_is_replaced_not_followed() {
+    let case = Case::new("box_inputs_exclude_symlink");
+    let payload = inputs_payload(&case, "put");
+    put_all(&case, &payload, &[HELPER]);
+    let outside = case.folder().join("outside.txt");
+    fs::write(&outside, "keep\n").expect("the outside file can be written");
+    let exclude = work(&payload).join(r".git\info\exclude");
+    fs::remove_file(&exclude).expect("the exclude file can be removed");
+    if let Err(error) = std::os::windows::fs::symlink_file(&outside, &exclude) {
+        eprintln!("skipped: a file symlink cannot be made here (no privilege, or developer mode off): {error}");
+        return;
+    }
+
+    put_all(&case, &payload, &[HELPER, DATA]);
+
+    assert_eq!(
+        fs::read_to_string(&outside).expect("the outside file is there"),
+        "keep\n",
+        "the link is not followed"
+    );
+    let metadata = fs::symlink_metadata(&exclude).expect("the exclude file is there");
+    assert!(!metadata.file_type().is_symlink(), "the link is replaced by a file");
+    assert_eq!(
+        fs::read_to_string(&exclude).expect("the exclude file can be read"),
+        "/.tmp/helper/a.dll\n/data/b.txt\n"
+    );
+}
+
+#[test]
+fn a_stale_input_below_a_junction_is_kept_and_nothing_outside_is_deleted() {
+    let case = Case::new("box_inputs_stale_junction");
+    let payload = inputs_payload(&case, "put");
+    let below: (&str, &[u8]) = ("sub/x.txt", b"x");
+    put_all(&case, &payload, &[below]);
+    let outside = case.folder().join("outside");
+    fs::create_dir_all(&outside).expect("the outside folder can be made");
+    fs::write(outside.join("x.txt"), "x").expect("the outside file can be written");
+    fs::remove_dir_all(work(&payload).join("sub")).expect("the folder can be removed");
+    junction(&work(&payload).join("sub"), &outside);
+
+    let outcome = put_with(&case, &payload, &[], &[HELPER], &[HELPER]);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(outside.join("x.txt").exists(), "the file the junction leads to is kept: {outcome:?}");
+    assert!(outcome.stderr.contains("gate: remote kept the stale input sub/x.txt: "), "{outcome:?}");
+}
+
+/// `path`, a file or a folder, opened to read its security.
+fn security_of(path: &Path) -> String {
+    let opened = File::options()
+        .access_mode(READ_CONTROL)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+        .expect("the entry can be opened");
+    gate_win32::security_text(&opened).expect("its security can be read")
+}
+
+#[test]
+fn the_stages_folder_keeps_lower_processes_out_and_a_moved_input_takes_its_folder_s_security() {
+    let case = Case::new("box_inputs_security");
+    let payload = inputs_payload(&case, "put");
+    put_all(&case, &payload, &[DATA]);
+    let facts = gate_win32::token_facts().expect("this process's token can be read");
+
+    let stages = security_of(&work(&payload).parent().and_then(Path::parent).expect("a root").join("inputs-stage"));
+    let (dacl, label) = stages.split_once("S:").expect("the stages folder has a label");
+    assert!(dacl.starts_with("D:P"), "the DACL is protected: {stages}");
+    assert_eq!(dacl.matches("(A;").count(), 3, "three grants and no more: {stages}");
+    for grant in ["(A;OICI;FA;;;SY)", "(A;OICI;FA;;;BA)", &format!("(A;OICI;FA;;;{})", facts.user)] {
+        assert!(dacl.contains(grant), "{grant} in {stages}");
+    }
+    let level = match facts.integrity {
+        0x2000 => "ME".to_owned(),
+        0x3000 => "HI".to_owned(),
+        other => format!("S-1-16-{other}"),
+    };
+    assert_eq!(label.trim_start_matches("AI"), format!("(ML;OICI;NW;;;{level})"), "{stages}");
+
+    let fresh = work(&payload).join(r"data\fresh.txt");
+    fs::write(&fresh, "fresh").expect("a fresh file can be written");
+    assert_eq!(
+        security_of(&work(&payload).join(r"data\b.txt")),
+        security_of(&fresh),
+        "the moved input's DACL and label"
+    );
+}
+
+/// Waits, up to a bound no busy machine reaches, until the stages folder of `payload` holds a stage.
+fn await_stage(payload: &Value) {
+    let deadline = Instant::now() + Duration::from_mins(2);
+    while stages_left(payload).is_empty() {
+        assert!(Instant::now() < deadline, "the put made no stage");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn a_put_whose_archive_stalls_holds_no_lock() {
+    let case = Case::new("box_inputs_put_stall");
+    let payload = inputs_payload(&case, "put");
+    let (running, mut stdin) = box_call(&case, &["box", "inputs"], &self::payload(&stepped(&payload, "put"))).start_with_stdin();
+    stdin
+        .write_all(format!("{}\n", manifest_line(&[DATA])).as_bytes())
+        .expect("the manifest can be sent");
+    stdin.flush().expect("the manifest is sent");
+    // The stage is made before the archive is read: from then on the put waits on its stdin.
+    await_stage(&payload);
+
+    let concurrent = diff(&case, &payload, &[DATA]);
+
+    stdin.write_all(&archive(&[DATA])).expect("the archive can be sent");
+    drop(stdin);
+    let put = running.finish();
+    assert_eq!(concurrent.code, Some(0), "the diff is not refused busy: {concurrent:?}");
+    assert_eq!(put.code, Some(0), "{put:?}");
+}
+
+#[test]
+fn a_record_that_is_not_one_reads_as_empty_and_one_that_is_a_junction_is_removed() {
+    let case = Case::new("box_inputs_bad_records");
+    let payload = inputs_payload(&case, "put");
+    put_all(&case, &payload, &[DATA]);
+    let record = format!("{}.inputs", field(&payload, "Work"));
+    let digest = sha256(manifest_line(&[DATA]).as_bytes());
+    let entry = json!({"size": 5, "sha256": sha256(DATA.1), "modified": 1, "id": "0-0"});
+    let rows = [
+        ("a corrupt record", "{not json".to_owned()),
+        ("a record naming ..", json!({"digest": digest, "files": {"../b.txt": entry}}).to_string()),
+    ];
+    for (what, text) in rows {
+        fs::write(&record, text).expect("the record can be written");
+
+        let outcome = diff(&case, &payload, &[DATA]);
+
+        assert_eq!(outcome.code, Some(0), "{what}: {outcome:?}");
+        assert!(
+            outcome.stderr.contains("is not an inputs record; every copy is hashed"),
+            "{what}: {outcome:?}"
+        );
+    }
+
+    let outside = case.folder().join("outside");
+    fs::create_dir_all(&outside).expect("the outside folder can be made");
+    fs::remove_file(&record).expect("the record can be removed");
+    junction(Path::new(&record), &outside);
+    put_all(&case, &payload, &[DATA]);
+    assert!(
+        fs::symlink_metadata(&record).expect("the record is there").is_file(),
+        "the junction is replaced by a record"
+    );
+    assert_eq!(
+        fs::read_dir(&outside).expect("the outside folder can be listed").count(),
+        0,
+        "nothing is written through it"
+    );
+}
+
+#[test]
+fn a_manifest_naming_a_file_inputs_never_carry_is_refused() {
+    let case = Case::new("box_inputs_never_carried");
+    let payload = unreadied_payload(&case, "diff");
+    for name in [".lfsconfig", ".env", "config/prod.env", ".gitattributes", ".gitignore", "sub/.gitmodules"] {
+        let outcome = diff(&case, &payload, &[(name, b"x")]);
+
+        assert_eq!(outcome.code, Some(1), "{name}: {outcome:?}");
+        assert_eq!(
+            outcome.stderr,
+            format!("gate: remote inputs diff failed: the inputs manifest names '{name}', which inputs never carry\n"),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn a_manifest_naming_a_path_that_is_not_plain_is_refused_before_any_work() {
+    let case = Case::new("box_inputs_manifest_not_plain");
+    let payload = unreadied_payload(&case, "diff");
+
+    let outcome = diff(&case, &payload, &[("../x.txt", b"x")]);
+
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert_eq!(
+        outcome.stderr,
+        "gate: remote inputs diff failed: the inputs manifest names '../x.txt', which is not a plain relative path\n"
+    );
+    assert!(!work(&payload).exists(), "nothing is laid out");
+}
+
+#[test]
+fn a_manifest_that_is_not_json_is_said_to_be_the_inputs_manifest() {
+    let case = Case::new("box_inputs_manifest_not_json");
+    let payload = unreadied_payload(&case, "diff");
+
+    let outcome = inputs_call(&case, &payload, &[], "{not json", &[]);
+
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert!(
+        outcome
+            .stderr
+            .starts_with("gate: remote inputs diff failed: the inputs manifest is not JSON: "),
+        "{outcome:?}"
+    );
+}
+
+#[test]
+fn a_manifest_line_ending_in_cr_lf_has_the_digest_of_one_ending_in_lf() {
+    let case = Case::new("box_inputs_crlf");
+    let payload = snapshot_payload(&case);
+    let line = manifest_line(&[DATA]);
+
+    let outcome = inputs_call(&case, &stepped(&payload, "put"), &[], &format!("{line}\r"), &archive(&[DATA]));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let run = run_box(&case, &digested(&payload, &line));
+    assert_eq!(run.code, Some(0), "the record holds the digest of the line without its CR: {run:?}");
+}
+
+#[test]
+fn an_input_that_becomes_a_folder_replaces_its_stale_file() {
+    let case = Case::new("box_inputs_file_to_folder");
+    let payload = inputs_payload(&case, "put");
+    put_all(&case, &payload, &[("a", b"a")]);
+
+    put_all(&case, &payload, &[("a/b", b"b")]);
+
+    assert_eq!(fs::read_to_string(work(&payload).join(r"a\b")).expect("the new input is there"), "b");
+}
+
+#[test]
+fn a_layout_clear_removes_the_inputs_record() {
+    let case = Case::new("box_inputs_layout_clear");
+    let payload = snapshot_payload(&case);
+    put_all(&case, &payload, &[DATA]);
+    let record = PathBuf::from(format!("{}.inputs", field(&payload, "Work")));
+    assert!(record.exists(), "the put writes the record");
+    fs::write(format!("{}.layout", field(&payload, "Work")), "pair app lib").expect("the layout record can be changed");
+
+    let run = run_box(&case, &payload);
+
+    assert_eq!(run.code, Some(0), "{run:?}");
+    assert!(!record.exists(), "the layout clear removes the inputs record");
+}
+
+#[test]
+fn a_copy_whose_stamp_the_record_holds_is_trusted_without_hashing_by_design_and_a_replaced_one_is_not() {
+    let case = Case::new("box_inputs_trusted_stamp");
+    let payload = inputs_payload(&case, "put");
+    put_all(&case, &payload, &[DATA]);
+    let copy = work(&payload).join(r"data\b.txt");
+    let written = fs::metadata(&copy)
+        .and_then(|metadata| metadata.modified())
+        .expect("the last write can be read");
+    let mut file = File::options().write(true).open(&copy).expect("the copy can be opened");
+    file.write_all(b"DATA\n").expect("the copy can be rewritten in place, at its size");
+    file.set_modified(written).expect("the last write can be restored");
+    drop(file);
+
+    let trusted = diff(&case, &payload, &[DATA]);
+    assert_eq!(
+        trusted.stdout,
+        needs(&[]),
+        "same size, last write and file id: trusted, never hashed: {trusted:?}"
+    );
+
+    fs::remove_file(&copy).expect("the copy can be removed");
+    fs::write(&copy, "DATA\n").expect("another file can take its place");
+    File::options()
+        .write(true)
+        .open(&copy)
+        .and_then(|file| file.set_modified(written))
+        .expect("the last write can be set");
+    let replaced = diff(&case, &payload, &[DATA]);
+    assert_eq!(replaced.stdout, needs(&["data/b.txt"]), "another file id: hashed: {replaced:?}");
+}
+
+#[test]
+fn a_target_with_a_second_name_is_refused() {
+    let case = Case::new("box_inputs_hard_link");
+    let payload = inputs_payload(&case, "put");
+    put_all(&case, &payload, &[DATA]);
+    let twin = case.folder().join("twin.txt");
+    fs::hard_link(work(&payload).join(r"data\b.txt"), &twin).expect("a second name can be made");
+    let other: (&str, &[u8]) = ("data/b.txt", b"other bytes\n");
+
+    let outcome = put_with(&case, &payload, &[], &[other], &[other]);
+
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert!(outcome.stderr.contains("data/b.txt"), "the line names the path: {outcome:?}");
+    assert_eq!(fs::read(&twin).expect("the second name is there"), DATA.1, "its bytes are untouched");
+}
+
+#[test]
+fn a_put_removes_a_stage_older_than_a_day_and_keeps_a_fresh_one() {
+    let case = Case::new("box_inputs_old_stages");
+    let payload = inputs_payload(&case, "put");
+    put_all(&case, &payload, &[DATA]);
+    let stages = work(&payload).parent().and_then(Path::parent).expect("a root").join("inputs-stage");
+    let (old, fresh) = (
+        stages.join(format!("k-{}", "0".repeat(32))),
+        stages.join(format!("other-{}", "1".repeat(32))),
+    );
+    for stage in [&old, &fresh] {
+        fs::create_dir_all(stage.join("files")).expect("a stage can be made");
+    }
+    File::options()
+        .write(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(&old)
+        .and_then(|folder| folder.set_modified(SystemTime::now() - Duration::from_hours(48)))
+        .expect("the old stage's last write can be set");
+
+    put_all(&case, &payload, &[DATA, HELPER]);
+
+    assert!(!old.exists(), "the stage older than a day is removed");
+    assert!(fresh.exists(), "a fresh stage, maybe another put's, is kept");
+}
+
+#[test]
+fn an_inputs_request_missing_bare_or_with_another_step_and_a_run_with_a_bad_digest_are_usage_errors() {
+    let case = Case::new("box_inputs_usage");
+    let payload = unreadied_payload(&case, "diff");
+    let mut bare_less = payload.clone();
+    bare_less.as_object_mut().expect("an object").remove("Bare");
+    for (what, asked) in [("no Bare", bare_less), ("another step", stepped(&payload, "other"))] {
+        let outcome = inputs_call(&case, &asked, &[], &manifest_line(&[DATA]), &[]);
+        assert_eq!(outcome.code, Some(2), "{what}: {outcome:?}");
+    }
+
+    let mut bad = snapshot_payload(&case);
+    bad["InputsDigest"] = json!("not a digest");
+    let run = run_box(&case, &bad);
+    assert_eq!(run.code, Some(2), "{run:?}");
+    assert!(run.stderr.contains("InputsDigest"), "{run:?}");
 }

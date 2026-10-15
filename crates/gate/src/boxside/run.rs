@@ -241,14 +241,16 @@ pub(super) fn lay_out_alone(work: &str, bare: &str, lock: &str, nonce: &str, con
     }
 }
 
-/// Checks the run's `InputsDigest`, when it has one, against the work folder's inputs record ([`inputs::unmatched`]),
-/// once the work folder is laid out: a record missing, unreadable or of another digest refuses the run `inputs`, its
-/// tag and line said under the box's output lock, so the PC runs the command itself; 75.
-fn inputs_matched(request: &Request<'_>, beat: &Beat<'_>, console: &mut Console) -> Result<(), u32> {
+/// Checks the run's `InputsDigest`, when it has one, against the work folder `held`'s inputs record and the copies it
+/// holds, and rewrites the tree's exclude file from it ([`inputs::unmatched`]), once the work folder is laid out and
+/// before the checkout: a record missing, unreadable or of another digest, a copy changed or gone, or an exclude file
+/// that cannot be written refuses the run `inputs`, its tag and line said under the box's output lock, so the PC runs
+/// the command itself; 75.
+fn inputs_matched(request: &Request<'_>, held: &File, beat: &Beat<'_>, console: &mut Console) -> Result<(), u32> {
     let Some(sent) = request.inputs_digest else {
         return Ok(());
     };
-    let Some(why) = inputs::unmatched(request.work, sent) else {
+    let Some(why) = inputs::unmatched(request.work, held, sent) else {
         return Ok(());
     };
     let _held = beat.lock.lock().unwrap_or_else(PoisonError::into_inner);
@@ -627,7 +629,7 @@ fn ready(request: &Request<'_>, git: &WorkGit, folders: &Folders<'_>, beat: &Bea
         Err(NotLaidOut::Failed(failed)) => return Err(ended_before(said(console, &failed), request, beat, console)),
         Err(NotLaidOut::Refused(why)) => return Err(layout_refused(request, &why, beat, console)),
     };
-    inputs_matched(request, beat, console)?;
+    inputs_matched(request, &held, beat, console)?;
     if let Err(failed) = git.checkout(request, console) {
         return Err(ended_before(said(console, &failed), request, beat, console));
     }

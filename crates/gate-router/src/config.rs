@@ -2,8 +2,9 @@
 //! which `gate push` reaches and routing neither reads nor refuses), the remote pool's `slots` (a whole
 //! number 1 to 16, 1 when missing), `repos` (each repo name's list of `-like` patterns for the commands that route) and
 //! the optional `outputs` (each repo name's globs for the files a routed run brings back), the optional `inputs` (each
-//! repo name's globs for the ignored files a routed run sends) and the optional `siblings` (each repo name's list of the sibling folder names a routed run of it may carry). Keys match in any letter
-//! case and unknown keys are ignored. The text may hold `//` and `/* */` comments and trailing commas, as the
+//! repo name's globs for the ignored files a routed run sends) and the optional `siblings` (each repo name's list of
+//! the sibling folder names a routed run of it may carry). Keys match in any letter case and unknown keys are ignored.
+//! The text may hold `//` and `/* */` comments and trailing commas, as the
 //! PowerShell gate's JSON reader allows; single-quoted strings are refused. A file that breaks a rule is unusable as a
 //! whole, for the reason the PowerShell gate gives (or, for a host ssh or git would misread, a reason of its own),
 //! which the caller says in [`ignored_line`].

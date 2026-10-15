@@ -11,13 +11,17 @@ use std::path::Path;
 use std::ptr;
 
 use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
-use windows_sys::Wdk::Storage::FileSystem::{FILE_OPEN, FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT, NtCreateFile};
+use windows_sys::Wdk::Storage::FileSystem::{
+    FILE_CREATE, FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_IF, FILE_OPEN_REPARSE_POINT, FILE_RENAME_INFORMATION,
+    FILE_SYNCHRONOUS_IO_NONALERT, FileRenameInformationEx, NtCreateFile, NtSetInformationFile,
+};
 use windows_sys::Win32::Foundation::{
     ERROR_INVALID_PARAMETER, GENERIC_READ, INVALID_HANDLE_VALUE, OBJ_CASE_INSENSITIVE, RtlNtStatusToDosError, UNICODE_STRING,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    FILE_GENERIC_READ, FILE_ID_INFO, FILE_REMOTE_PROTOCOL_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileIdInfo,
-    FileRemoteProtocolInfo, GetFileInformationByHandleEx, MoveFileExW, ReOpenFile,
+    FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_POSIX_SEMANTICS, FILE_DISPOSITION_INFO_EX, FILE_GENERIC_READ, FILE_ID_INFO,
+    FILE_REMOTE_PROTOCOL_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileDispositionInfoEx, FileIdInfo, FileRemoteProtocolInfo,
+    GetFileInformationByHandleEx, MoveFileExW, ReOpenFile, SYNCHRONIZE, SetFileInformationByHandle,
 };
 use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
@@ -32,7 +36,39 @@ use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 /// [`io::ErrorKind::InvalidInput`], before any system call, for a name that is not one name ([`one_name`]) or is too
 /// long to pass, else the system's error.
 pub fn open_beneath(folder: &File, name: &str, share: Share) -> io::Result<File> {
+    open_beneath_as(folder, name, FILE_GENERIC_READ, share, Make::Open)
+}
+
+/// What [`open_beneath_as`] does with its name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Make {
+    /// Opens what has the name, a file or a folder, as itself.
+    Open,
+    /// Makes a new file of the name; anything already there, a link included, is an error of kind
+    /// [`io::ErrorKind::AlreadyExists`].
+    NewFile,
+    /// Opens the folder of the name as itself, or makes one when nothing has the name; a file there is the system's
+    /// error. A junction there is opened as itself, never followed, for the caller to refuse.
+    Folder,
+    /// Makes a new folder of the name; anything already there is an error of kind [`io::ErrorKind::AlreadyExists`].
+    NewFolder,
+}
+
+/// Opens `name`, one file or folder name, inside the open folder `folder` with the access `access` (plus
+/// `SYNCHRONIZE`) as itself, as [`open_beneath`] does, or makes it there as `make` says. The new handle shares what
+/// `share` says.
+///
+/// # Errors
+///
+/// As [`open_beneath`]'s, and the system's error when the name cannot be made or opened with that access.
+pub fn open_beneath_as(folder: &File, name: &str, access: u32, share: Share, make: Make) -> io::Result<File> {
     one_name(name)?;
+    let (disposition, options) = match make {
+        Make::Open => (FILE_OPEN, 0),
+        Make::NewFile => (FILE_CREATE, FILE_NON_DIRECTORY_FILE),
+        Make::Folder => (FILE_OPEN_IF, FILE_DIRECTORY_FILE),
+        Make::NewFolder => (FILE_CREATE, FILE_DIRECTORY_FILE),
+    };
     let mut wide: Vec<u16> = OsStr::new(name).encode_wide().collect();
     let length = u16::try_from(size_of_val(wide.as_slice())).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "the name is too long"))?;
     let object_name = UNICODE_STRING {
@@ -51,19 +87,19 @@ pub fn open_beneath(folder: &File, name: &str, share: Share) -> io::Result<File>
     let mut handle = ptr::null_mut();
     let mut status_block = IO_STATUS_BLOCK::default();
     // SAFETY: the name's buffer, the attributes and the status block outlive the call, the attributes' root is the
-    // open handle `folder` owns, and `handle` is writable; synchronous I/O and `FILE_GENERIC_READ`'s `SYNCHRONIZE`
-    // make a handle std reads from as from any other.
+    // open handle `folder` owns, and `handle` is writable; synchronous I/O and `SYNCHRONIZE` make a handle std reads
+    // from and writes to as to any other.
     let status = unsafe {
         NtCreateFile(
             &raw mut handle,
-            FILE_GENERIC_READ,
+            access | SYNCHRONIZE,
             &raw const attributes,
             &raw mut status_block,
             ptr::null(),
             0,
             share.mode(),
-            FILE_OPEN,
-            FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+            disposition,
+            options | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
             ptr::null(),
             0,
         )
@@ -75,6 +111,83 @@ pub fn open_beneath(folder: &File, name: &str, share: Share) -> io::Result<File>
     }
     // SAFETY: a success is a fresh handle nothing else owns; the returned file owns and closes it from now on.
     Ok(unsafe { File::from_raw_handle(handle) })
+}
+
+/// Renames the open file `file`, opened with `DELETE` access, to `name`, one name, inside the open folder `folder` on
+/// the same volume, by handle: `NtSetInformationFile` with `FileRenameInformationEx`, the held folder its root, so no
+/// path is looked up and no link on the way is followed. (`SetFileInformationByHandle` with `FileRenameInfoEx` and a
+/// root folder failed with `ERROR_INVALID_PARAMETER` on Windows 11, so the native call is made.) A file or a link
+/// already of that name is replaced as itself
+/// (POSIX semantics: its name is free at once, even while another handle holds it open sharing deletion); a folder
+/// there is not.
+///
+/// # Errors
+///
+/// An error of kind [`io::ErrorKind::InvalidInput`] for a name that is not one name ([`one_name`]) or too long, else
+/// the system's error, such as access denied for a folder at the name or a sharing violation for a file held open
+/// without delete sharing.
+pub fn rename_beneath(file: &File, folder: &File, name: &str) -> io::Result<()> {
+    one_name(name)?;
+    let wide: Vec<u16> = OsStr::new(name).encode_wide().collect();
+    let name_bytes = size_of_val(wide.as_slice());
+    let size = size_of::<FILE_RENAME_INFORMATION>() + name_bytes;
+    // Eight-byte units, so the buffer is aligned for the structure's handle.
+    let mut buffer = vec![0_u64; size.div_ceil(size_of::<u64>())];
+    let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
+    let length = u32::try_from(name_bytes).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "the name is too long"))?;
+    let total = u32::try_from(size).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "the name is too long"))?;
+    // SAFETY: `buffer` is zeroed, aligned for `FILE_RENAME_INFORMATION` and holds `size` bytes, the structure and the name's
+    // units after its `FileName` start; the copy writes `wide.len()` units from there, inside the buffer.
+    unsafe {
+        (*info).Anonymous.Flags = RENAME_REPLACE_IF_EXISTS | RENAME_POSIX_SEMANTICS;
+        (*info).RootDirectory = folder.as_raw_handle();
+        (*info).FileNameLength = length;
+        ptr::copy_nonoverlapping(wide.as_ptr(), (&raw mut (*info).FileName).cast::<u16>(), wide.len());
+    }
+    let mut status_block = IO_STATUS_BLOCK::default();
+    // SAFETY: both handles are open for the whole call, the buffer holds `total` bytes of a filled-in structure, and
+    // the status block is writable.
+    let status = unsafe {
+        NtSetInformationFile(
+            file.as_raw_handle(),
+            &raw mut status_block,
+            buffer.as_ptr().cast(),
+            total,
+            FileRenameInformationEx,
+        )
+    };
+    if status < 0 {
+        // SAFETY: the call reads nothing but the status it is given.
+        let code = unsafe { RtlNtStatusToDosError(status) };
+        return Err(io::Error::from_raw_os_error(code.cast_signed()));
+    }
+    Ok(())
+}
+
+/// `FILE_RENAME_FLAG_REPLACE_IF_EXISTS`: a file already of the name is replaced.
+const RENAME_REPLACE_IF_EXISTS: u32 = 0x1;
+/// `FILE_RENAME_FLAG_POSIX_SEMANTICS`: a replaced file's name is free at once, even while it is held open.
+const RENAME_POSIX_SEMANTICS: u32 = 0x2;
+
+/// Deletes the open file or empty folder `file`, opened with `DELETE` access, as itself, by handle:
+/// `SetFileInformationByHandle` with `FileDispositionInfoEx` and POSIX semantics, so its name is free at once even while
+/// another handle holds it open sharing deletion. A link so opened is deleted, not what it leads to.
+///
+/// # Errors
+///
+/// The system's error, such as access denied for a handle without `DELETE` access or for a read-only file, or the
+/// folder-not-empty error.
+pub fn delete_opened(file: &File) -> io::Result<()> {
+    let info = FILE_DISPOSITION_INFO_EX {
+        Flags: FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
+    };
+    let size = u32::try_from(size_of::<FILE_DISPOSITION_INFO_EX>()).map_err(io::Error::other)?;
+    // SAFETY: the handle is open for the whole call, and `info` is a filled-in structure of `size` bytes.
+    let deleted = unsafe { SetFileInformationByHandle(file.as_raw_handle(), FileDispositionInfoEx, (&raw const info).cast(), size) };
+    if deleted == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// What others may do with a file or folder while a handle holds it open, [`open_beneath`]'s or another open's.
@@ -253,14 +366,16 @@ fn verbatim(absolute: &[u16]) -> Vec<u16> {
 #[expect(clippy::expect_used, reason = "a test whose files cannot be made must fail loudly")]
 mod tests {
     use std::fs::{File, OpenOptions};
-    use std::io::{self, Read};
+    use std::io::{self, Read, Write};
     use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
     use std::path::{Path, PathBuf};
     use std::process::Command;
 
-    use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS};
+    use windows_sys::Win32::Storage::FileSystem::{
+        DELETE, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
+    };
 
-    use super::{Share, move_no_replace, open_beneath, same_file, verbatim};
+    use super::{Make, Share, delete_opened, move_no_replace, open_beneath, open_beneath_as, rename_beneath, same_file, verbatim};
 
     /// The folder `path` held open, as a caller of [`open_beneath`] holds one.
     fn held(path: &Path) -> File {
@@ -455,6 +570,139 @@ mod tests {
 
         assert!(!source.exists(), "the source is gone");
         assert_eq!(std::fs::read_to_string(&target).expect("the target is there"), "a");
+        std::fs::remove_dir_all(&folder).expect("the folder can be removed");
+    }
+
+    /// The file `path` opened for reading with `DELETE` access, every sharing given, as a rename or a delete by
+    /// handle needs it.
+    fn deletable(path: &Path) -> File {
+        OpenOptions::new()
+            .access_mode(FILE_GENERIC_READ | DELETE)
+            .share_mode(Share::All.mode())
+            .open(path)
+            .expect("the file can be opened for deletion")
+    }
+
+    #[test]
+    fn a_new_file_is_made_beneath_and_one_already_there_is_refused() {
+        let folder = folder("new-file");
+        let held = held(&folder);
+
+        let mut made = open_beneath_as(&held, "a.txt", FILE_GENERIC_WRITE, Share::NoDelete, Make::NewFile).expect("a free name is made");
+        made.write_all(b"a").expect("the new file can be written");
+        drop(made);
+        let again = open_beneath_as(&held, "a.txt", FILE_GENERIC_WRITE, Share::NoDelete, Make::NewFile);
+
+        assert_eq!(again.map(drop).map_err(|error| error.kind()), Err(io::ErrorKind::AlreadyExists));
+        assert_eq!(std::fs::read_to_string(folder.join("a.txt")).expect("the file is there"), "a");
+        drop(held);
+        std::fs::remove_dir_all(&folder).expect("the folder can be removed");
+    }
+
+    #[test]
+    #[expect(clippy::disallowed_methods, reason = "a test's one mklink takes no spawn lock")]
+    fn a_folder_is_made_or_opened_beneath_and_a_junction_there_is_opened_as_itself() {
+        let folder = folder("make-folder");
+        let held = held(&folder);
+        std::fs::create_dir(folder.join("target")).expect("the junction's target can be made");
+        let made = Command::new("cmd")
+            .args(["/d", "/c", "mklink", "/J"])
+            .arg(folder.join("link"))
+            .arg(folder.join("target"))
+            .output()
+            .expect("cmd.exe runs");
+        assert!(made.status.success(), "a junction needs no privilege: {made:?}");
+
+        let new = open_beneath_as(&held, "new", FILE_GENERIC_READ, Share::NoDelete, Make::Folder).expect("a folder is made");
+        let old = open_beneath_as(&held, "new", FILE_GENERIC_READ, Share::All, Make::Folder).expect("the folder is opened");
+        let link = open_beneath_as(&held, "link", FILE_GENERIC_READ, Share::All, Make::Folder).expect("the junction is opened");
+
+        let again = open_beneath_as(&held, "new", FILE_GENERIC_READ, Share::All, Make::NewFolder);
+        let fresh = open_beneath_as(&held, "fresh", FILE_GENERIC_READ, Share::All, Make::NewFolder).expect("a free name is made a folder");
+
+        assert_eq!(
+            again.map(drop).map_err(|error| error.kind()),
+            Err(io::ErrorKind::AlreadyExists),
+            "a new folder takes no used name"
+        );
+        assert!(folder.join("fresh").is_dir(), "the new folder is made");
+        drop(fresh);
+        assert!(folder.join("new").is_dir(), "the folder is made");
+        assert!(
+            same_file(&new, &old).expect("the ids can be read"),
+            "the second open finds the first's folder"
+        );
+        assert!(is_link_itself(&link), "the junction is opened as itself, not followed");
+        drop((new, old, link, held));
+        std::fs::remove_dir_all(&folder).expect("the folder can be removed");
+    }
+
+    #[test]
+    fn a_rename_beneath_lands_in_the_held_folder_whatever_its_path_names_by_now() {
+        let folder = folder("rename");
+        std::fs::create_dir(folder.join("into")).expect("the folder can be made");
+        std::fs::write(folder.join("a.txt"), "a").expect("the file can be written");
+        let into = OpenOptions::new()
+            .read(true)
+            .share_mode(Share::All.mode())
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(folder.join("into"))
+            .expect("the folder can be held");
+        std::fs::rename(folder.join("into"), folder.join("moved")).expect("the held folder, sharing deletion, can be renamed");
+        std::fs::create_dir(folder.join("into")).expect("another folder takes the old name");
+
+        rename_beneath(&deletable(&folder.join("a.txt")), &into, "b.txt").expect("the rename goes through");
+
+        assert_eq!(
+            std::fs::read_to_string(folder.join(r"moved\b.txt")).expect("the file is in the held folder"),
+            "a"
+        );
+        assert!(!folder.join(r"into\b.txt").exists(), "nothing went where the path now leads");
+        drop(into);
+        std::fs::remove_dir_all(&folder).expect("the folder can be removed");
+    }
+
+    #[test]
+    #[expect(clippy::print_stderr, reason = "a skipped case says why it skipped")]
+    fn a_rename_beneath_replaces_a_file_or_a_link_at_its_name_as_itself() {
+        let folder = folder("rename-replace");
+        std::fs::write(folder.join("a.txt"), "a").expect("the file can be written");
+        std::fs::write(folder.join("b.txt"), "b").expect("the file can be written");
+        let held = held(&folder);
+
+        rename_beneath(&deletable(&folder.join("a.txt")), &held, "b.txt").expect("the file is replaced");
+        assert_eq!(std::fs::read_to_string(folder.join("b.txt")).expect("the file is there"), "a");
+
+        std::fs::write(folder.join("c.txt"), "c").expect("the file can be written");
+        std::fs::write(folder.join("target.txt"), "target").expect("the file can be written");
+        if let Err(error) = std::os::windows::fs::symlink_file(folder.join("target.txt"), folder.join("link.txt")) {
+            eprintln!("skipped the link half: a file symlink cannot be made here (no privilege, or developer mode off): {error}");
+        } else {
+            rename_beneath(&deletable(&folder.join("c.txt")), &held, "link.txt").expect("the link is replaced");
+            let link = std::fs::symlink_metadata(folder.join("link.txt")).expect("the name is there");
+            assert!(!link.file_type().is_symlink(), "the link itself is replaced");
+            assert_eq!(std::fs::read_to_string(folder.join("target.txt")).expect("the target is there"), "target");
+        }
+        drop(held);
+        std::fs::remove_dir_all(&folder).expect("the folder can be removed");
+    }
+
+    #[test]
+    fn a_name_deleted_by_handle_is_free_at_once_while_another_handle_holds_it() {
+        let folder = folder("delete");
+        let path = folder.join("a.txt");
+        std::fs::write(&path, "a").expect("the file can be written");
+        let other = OpenOptions::new()
+            .read(true)
+            .share_mode(Share::All.mode())
+            .open(&path)
+            .expect("another handle holds the file");
+
+        delete_opened(&deletable(&path)).expect("the delete goes through");
+
+        assert!(!path.exists(), "the name is gone");
+        std::fs::write(&path, "b").expect("the name is free while the other handle is open");
+        drop(other);
         std::fs::remove_dir_all(&folder).expect("the folder can be removed");
     }
 

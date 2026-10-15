@@ -435,7 +435,7 @@ impl Payload {
 /// The hex digits of a run's nonce, as the client draws it.
 const NONCE_DIGITS: usize = 12;
 /// The hex digits of a run's outputs nonce, as the client draws it.
-const OUTPUTS_NONCE_DIGITS: usize = 32;
+pub(crate) const OUTPUTS_NONCE_DIGITS: usize = 32;
 /// The hex digits of a commit's sha.
 const COMMIT_SHA_DIGITS: usize = 40;
 /// The hex digits that end a work-folder key, after the repo name and a `-`.

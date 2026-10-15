@@ -2,9 +2,9 @@
 //! PowerShell wrapper's `Initialize-WorkFolder` does, then says the version, boot and SDK lines, and a line for each
 //! tool the payload's `Needs` names.
 
-use std::fs;
-use std::io;
-use std::os::windows::fs::FileTypeExt;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Write};
+use std::os::windows::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::sync::PoisonError;
@@ -12,13 +12,17 @@ use std::thread;
 use std::time::Duration;
 
 use gate_args::BoxSeams;
+use gate_win32::{Make, Share};
+use windows_sys::Win32::Storage::FileSystem::{
+    DELETE, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
+};
 
 use crate::answer::USAGE_STATUS;
 use crate::boxside::boot;
 use crate::boxside::forward::{ChildPipes, DRAIN, Drained, OutputLock};
 use crate::boxside::payload::{Pair, Payload};
 use crate::boxside::probe;
-use crate::boxside::run::LAYOUT_SINGLE;
+use crate::boxside::run::{FILE_FLAG_OPEN_REPARSE_POINT, LAYOUT_SINGLE};
 use crate::boxside::tools;
 use crate::console::Console;
 use crate::environment::Variables;
@@ -378,16 +382,69 @@ pub(super) fn made_folder(folder: &Path, repair: bool) -> Result<(), String> {
     fs::create_dir(folder).map_err(|error| format!("cannot create {}: {error}", folder.display()))
 }
 
-/// Writes `text` as the file `file` unless it already holds exactly that, read without following a link; anything
-/// else at its name is removed as itself first. Else why not.
+/// Writes `text` as the file `file` unless it already holds exactly that, its folder opened as itself and held, and the
+/// file read, removed and made beneath that handle ([`written_beneath`]). Else why not, a folder that is a link, a
+/// junction or not a folder refused.
 pub(super) fn written(file: &Path, text: &str) -> Result<(), String> {
-    match fs::symlink_metadata(file) {
-        Ok(found) if found.is_file() && fs::read(file).is_ok_and(|held| held == text.as_bytes()) => return Ok(()),
-        Ok(_) => remove_entry(file).map_err(|error| error.to_string())?,
+    let (Some(parent), Some(name)) = (file.parent(), file.file_name().and_then(|name| name.to_str())) else {
+        return Err(format!("{} names no file in a folder", file.display()));
+    };
+    let folder = OpenOptions::new()
+        .read(true)
+        .share_mode(Share::NoDelete.mode())
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(parent)
+        .map_err(|error| error.to_string())?;
+    if !is_folder_itself(&folder).map_err(|error| error.to_string())? {
+        return Err(format!("{} is a link, a junction or not a folder", parent.display()));
+    }
+    written_beneath(&folder, parent, name, text)
+}
+
+/// Whether the open `opened` is a folder itself: a folder, not a link or a junction.
+pub(super) fn is_folder_itself(opened: &File) -> io::Result<bool> {
+    let metadata = opened.metadata()?;
+    Ok(metadata.is_dir() && metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0)
+}
+
+/// Writes `text` as the file `name` in the held folder `folder`, whose path is `path`, unless it already holds exactly
+/// that: whatever is at the name opened as itself beneath the handle, never followed; a plain file of other bytes, a
+/// link, a junction or anything else deleted as itself (a folder of its own by std's `remove_dir_all`, which removes a
+/// link it meets rather than following it), and a new file made beneath the handle, refused when anything took the name
+/// meanwhile. Else why not.
+pub(super) fn written_beneath(folder: &File, path: &Path, name: &str, text: &str) -> Result<(), String> {
+    match gate_win32::open_beneath_as(folder, name, FILE_GENERIC_READ | DELETE, Share::All, Make::Open) {
+        Ok(found) => {
+            if holds_already(found, path, name, text)? {
+                return Ok(());
+            }
+        }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.to_string()),
     }
-    fs::write(file, text).map_err(|error| error.to_string())
+    let mut made =
+        gate_win32::open_beneath_as(folder, name, FILE_GENERIC_WRITE, Share::NoDelete, Make::NewFile).map_err(|error| error.to_string())?;
+    made.write_all(text.as_bytes()).map_err(|error| error.to_string())
+}
+
+/// Whether `found`, the entry `name` of the folder `path` opened as itself, is a plain file holding exactly `text`;
+/// anything else is deleted as itself first. Else why it could not be deleted.
+fn holds_already(mut found: File, path: &Path, name: &str, text: &str) -> Result<bool, String> {
+    let metadata = found.metadata().map_err(|error| error.to_string())?;
+    let reparse = metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+    if metadata.is_file() && !reparse {
+        let mut held = Vec::new();
+        if found.read_to_end(&mut held).is_ok() && held == text.as_bytes() {
+            return Ok(true);
+        }
+    }
+    if metadata.is_dir() && !reparse {
+        drop(found);
+        fs::remove_dir_all(path.join(name)).map_err(|error| error.to_string())?;
+    } else {
+        gate_win32::delete_opened(&found).map_err(|error| error.to_string())?;
+    }
+    Ok(false)
 }
 
 /// Removes the entry `path` as itself, never what a link or a junction there leads to: a folder, or a link or a
