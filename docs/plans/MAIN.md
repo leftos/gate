@@ -7,6 +7,7 @@
 - [ ] GATE-19 Remote: send a repo's declared sibling worktrees with a routed run — Urgent · Remote
 - [/] GATE-22 Remote: send a routed command's ignored inputs to the builder, compressed — Urgent · Remote
 - [ ] GATE-206 A per-repo toolchain manifest: check and prepare builders, and check a fresh clone — Urgent · Remote
+- [ ] GATE-242 Suite: find and cut what makes remote_client's slow cases take tens of seconds — Urgent · Remote
 - [ ] GATE-192 Turn routing back on, on the Rust remote client — High · Remote
 - [/] GATE-249 Siblings C: the client snapshots, checks parity and pushes each repo — High · Remote
 - [ ] GATE-251 Siblings E: outputs, install rewrite and stale-line wording for a pair — High · Remote
@@ -14,6 +15,7 @@
 - [!] GATE-214 Toolchain 7: roll the manifest out to the gated repos — High · Remote
 - [/] GATE-231 Run a routed command that needs a desktop in the builder's logged-on session — High · Remote
 - [ ] GATE-304 Restore a routed repo's pnpm packages on the builder before a pnpm command — High · Remote
+- [/] GATE-311 Let a critical gate drain past light runs on any slot, keeping the beside allowance by count — High · Backlog
 
 ## Remote
 
@@ -60,6 +62,10 @@
 - [ ] GATE-303 Make the box-kill note case hold on a loaded PC
 - [ ] GATE-262 Escape the outputs key and read global.json only as a regular file
 - [ ] GATE-263 Give the suite's box runs stop-event names that concurrent suite runs cannot share
+- [ ] GATE-307 Move the PC's outputs install rename onto a handle chain beneath the held worktree
+- [ ] GATE-308 Let a routed input turn from a folder back into a file on the builder
+- [ ] GATE-309 Keep a fallback's own output in the printed tail after a failed routed attempt
+- [ ] GATE-310 Recover a pair run whose sibling bare on the builder was lost
 
 ## Cutover sweep
 
@@ -73,6 +79,7 @@
 - [ ] GATE-17 Durations part 5: backfill guests during a critical drain
 - [ ] GATE-8 `--slot auto` picks heavy or light from the command's history
 - [ ] GATE-305 Re-read docs/design/gate-durations.md against the 14 commits on its named files
+- [ ] GATE-306 Cap how many of a repo's full suites run at once, per repo, queued by the gate
 
 ## Backlog
 
@@ -91,7 +98,6 @@
 - [ ] GATE-225 Suite: covered-gate slot wait case fails under load (the slot frees before the wait)
 - [ ] GATE-236 gate.exe can exit non-zero after writing a passed verdict (seen once)
 - [ ] GATE-238 A run can end with 'cannot end the run's job: number too large to fit in target type' from the job's process list
-- [ ] GATE-242 Suite: find and cut what makes remote_client's slow cases take tens of seconds
 - [ ] GATE-243 Suite: launch nested-launcher case reads spawn-pid's file without waiting for it
 - [ ] GATE-244 Share compiled Rust dependencies across repos and worktrees (sccache on the builder and this PC)
 - [ ] GATE-245 gate check: quote the repo root and sibling paths in its lines
