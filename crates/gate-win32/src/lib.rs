@@ -2,12 +2,15 @@
 //! the UTF-8 console a command can be created on, the restricted token a command can be created with, the start time
 //! of the gate process or of another, the system's, a process's and the WSL VM's CPU times, the console interrupt, the
 //! system's boot time, what a drive letter stands for, a rename that never replaces its target, and the Windows message
-//! of an error code. It holds no policy:
+//! of an error code. And what a run on the interactive desktop needs: a named pipe for one user's local client, handles
+//! copied into and out of another process and the checks on a process taken that way, a command created on the
+//! interactive desktop, and the console session's state. It holds no policy:
 //! the names, the waits, the command's environment and priority, and what an abandoned mutex means to the gate are the
 //! caller's. Windows only; elsewhere the crate is empty.
 
 #![cfg(windows)]
 
+mod adopt;
 mod console;
 mod create;
 mod device;
@@ -18,12 +21,15 @@ mod job;
 mod launch;
 mod memory;
 mod mutex;
+mod pipe;
 mod piped;
 mod priority;
+mod session;
 mod times;
 mod token;
 mod tree;
 
+pub use adopt::{RemoteProcess, creation_time_of, image_path_of, parent_pid_of, pid_of_process, pid_of_thread, session_of, thread_is_suspended};
 pub use console::{Donor, Utf8Console};
 pub use create::spawn;
 pub use device::device_target;
@@ -33,7 +39,9 @@ pub use job::{Accounting, Job};
 pub use launch::{EnvironmentBlock, Launch, LaunchError, LaunchOutput, PriorityClass, Running, StdioPipes, Suspended, Waited, same_variable_name};
 pub use memory::working_set;
 pub use mutex::{AcquireError, MutexGuard, NamedMutex, OwnedMutexGuard, mutex_exists};
-pub use piped::{PipedConsole, PipedFed, PipedLaunch, PipedSuspended, breakaway_refused};
+pub use pipe::{ConnectWait, PipeClient, PipeServer};
+pub use piped::{DesktopLaunch, PipedConsole, PipedFed, PipedLaunch, PipedSuspended, breakaway_refused};
+pub use session::{ConnectState, LockState, SessionState, active_console_session, session_state};
 pub use times::{ProcessTimes, SystemTimes, file_time_now, process_times, system_times, wsl_vm_cpu};
 pub use token::{Grant, NetworkGroup, RestrictedToken, TokenFacts, token_facts};
 

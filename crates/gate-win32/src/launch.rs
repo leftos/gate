@@ -434,6 +434,52 @@ pub struct Suspended {
 }
 
 impl Suspended {
+    /// Takes a suspended process another process created, from its process handle and the handle of its first thread,
+    /// as [`crate::RemoteProcess::pull`] copies them out: the caller has checked both are what it expects. From here it
+    /// is as a command this crate created: dropped before [`Suspended::assign_and_resume`], it is terminated with exit
+    /// code 1. The process handle needs `PROCESS_TERMINATE`, `PROCESS_SET_QUOTA` and query access, and the thread
+    /// handle `THREAD_SUSPEND_RESUME`, as the handles `CreateProcessW` returns have.
+    ///
+    /// # Errors
+    ///
+    /// The system's error when the process's id cannot be read; both handles are then closed, and the process is not
+    /// ended.
+    pub fn adopt(process: std::os::windows::io::OwnedHandle, thread: std::os::windows::io::OwnedHandle) -> io::Result<Suspended> {
+        use std::os::windows::io::{AsHandle, IntoRawHandle};
+
+        let pid = crate::pid_of_process(process.as_handle())?;
+        // SAFETY: `into_raw_handle` gives up the std guard's ownership, so the new guard alone owns each open handle.
+        let process = unsafe { own_handle(process.into_raw_handle()) }?;
+        // SAFETY: as above.
+        let thread = match unsafe { own_handle(thread.into_raw_handle()) } {
+            Ok(thread) => thread,
+            Err(error) => {
+                // The thread handle was null, so the process's own handle is closed without ending it.
+                drop(process);
+                return Err(error);
+            }
+        };
+        Ok(Suspended {
+            process: Some(process),
+            thread,
+            pid,
+            pipes: None,
+            note: None,
+        })
+    }
+
+    /// Whether the command is in `job`, or in a job nested inside it (`IsProcessInJob` on that job alone, not any job).
+    ///
+    /// # Errors
+    ///
+    /// The system's error when that cannot be read, or an error when the process was already taken.
+    pub fn in_job(&self, job: &Job) -> io::Result<bool> {
+        let Some(process) = &self.process else {
+            return Err(io::Error::other("the process was already taken"));
+        };
+        job.holds(process)
+    }
+
     /// The command's process id.
     #[must_use]
     pub fn pid(&self) -> u32 {

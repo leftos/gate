@@ -78,12 +78,24 @@ pub(crate) enum DesktopPolicy {
 /// Creates the command of `creation` as [`create_process`] does, inheriting the handles of `inherited` and no other,
 /// with `desktop_policy` as its `PROC_THREAD_ATTRIBUTE_DESKTOP_APP_POLICY`. Under the spawn lock it makes an
 /// inheritable copy of each handle, creates the command with the copies and closes them, so a copy is open only while
-/// the lock is held.
+/// the lock is held. The command is created on this process's own window station and desktop.
 pub(crate) fn create_inheriting(
     creation: &Creation<'_>,
     flags: PROCESS_CREATION_FLAGS,
     inherited: &Inherited<'_>,
     desktop_policy: DesktopPolicy,
+) -> Result<Suspended, LaunchError> {
+    create_inheriting_on(creation, flags, inherited, desktop_policy, None)
+}
+
+/// Creates the command as [`create_inheriting`] does, on the window station and desktop `desktop`
+/// (`STARTUPINFO.lpDesktop`, such as `WinSta0\Default`), or on this process's own for `None`.
+pub(crate) fn create_inheriting_on(
+    creation: &Creation<'_>,
+    flags: PROCESS_CREATION_FLAGS,
+    inherited: &Inherited<'_>,
+    desktop_policy: DesktopPolicy,
+    desktop: Option<&str>,
 ) -> Result<Suspended, LaunchError> {
     // Declared first, so it is released last, after the copies are closed.
     let _spawning = lock_spawns();
@@ -122,7 +134,8 @@ pub(crate) fn create_inheriting(
             other => other?,
         }
     }
-    let startup = startup_info(&mut attributes);
+    let mut desktop = desktop.map(crate::wide);
+    let startup = startup_info(&mut attributes, desktop.as_deref_mut());
     #[cfg(test)]
     {
         let named = inherited.others.iter().map(|&(handle, _)| handle);
@@ -268,17 +281,21 @@ impl Drop for AttributeList<'_> {
 }
 
 /// The startup information of a command, which borrows the attribute list it points to, and through it the handles
-/// the list names, so neither can be dropped while [`create_process`] may read it.
+/// the list names, and the desktop name it points to, so none can be dropped while [`create_process`] may read it.
 struct Startup<'a> {
     info: STARTUPINFOEXW,
     borrowed: PhantomData<&'a ()>,
 }
 
-/// The startup information of a command created with `attributes`, its stdin, stdout and stderr the list's `stdio`.
-fn startup_info<'a>(attributes: &'a mut AttributeList<'_>) -> Startup<'a> {
+/// The startup information of a command created with `attributes`, its stdin, stdout and stderr the list's `stdio`,
+/// on `desktop` (a NUL-terminated `station\desktop` name) or, for `None`, on this process's own.
+fn startup_info<'a>(attributes: &'a mut AttributeList<'_>, desktop: Option<&'a mut [u16]>) -> Startup<'a> {
     let [input, output, errors] = attributes.stdio;
     let mut info = STARTUPINFOEXW::default();
     info.StartupInfo.cb = struct_size::<STARTUPINFOEXW>();
+    if let Some(desktop) = desktop {
+        info.StartupInfo.lpDesktop = desktop.as_mut_ptr();
+    }
     info.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
     info.StartupInfo.hStdInput = input;
     info.StartupInfo.hStdOutput = output;
@@ -302,7 +319,7 @@ fn create_process(creation: &Creation<'_>, flags: PROCESS_CREATION_FLAGS, startu
     // may change, the environment is a block `EnvironmentBlock` built (ended by two NULs) and
     // `CREATE_UNICODE_ENVIRONMENT` says it is UTF-16; `startup` is a whole `STARTUPINFOEXW` whose `cb` says so and
     // `EXTENDED_STARTUPINFO_PRESENT` says so too, and it borrows its attribute list, which borrows the handles it
-    // names; every buffer outlives the call and `created` is writable. A token is borrowed by `creation` for its whole
+    // names, and its desktop name, NUL-terminated, when it has one; every buffer outlives the call and `created` is writable. A token is borrowed by `creation` for its whole
     // life, so it stays open across the call, with the access `RestrictedToken` opened it with: primary assignment,
     // duplication, query and default adjustment.
     let ok = unsafe {
@@ -376,10 +393,18 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::{Mutex, PoisonError, TryLockError};
 
-    use windows_sys::Win32::Foundation::{GetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT};
+    use std::os::windows::io::{AsRawHandle, BorrowedHandle};
+
+    use proc_table::win32::OwnedHandle;
+    use windows_sys::Win32::Foundation::{CompareObjectHandles, GetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT};
+    use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+    use windows_sys::Win32::System::Threading::{
+        BELOW_NORMAL_PRIORITY_CLASS, CreateEventW, GetCurrentProcess, GetPriorityClass, NORMAL_PRIORITY_CLASS, SetPriorityClass,
+    };
 
     use super::SPAWN_LOCK;
-    use crate::{EnvironmentBlock, Job, Launch, LaunchOutput, PipedConsole, PipedLaunch};
+    use crate::piped::pipe_from_child;
+    use crate::{DesktopLaunch, EnvironmentBlock, Job, Launch, LaunchOutput, PipedConsole, PipedLaunch, RemoteProcess, thread_is_suspended};
 
     /// Keeps these tests from running at once, so that one's launch never holds the spawn lock while the other checks
     /// that it is free. Every unit test of this crate that starts a process takes it for its whole run, or that check
@@ -389,6 +414,9 @@ mod tests {
     thread_local! {
         /// How many handles the last spawn window of this thread checked, until a test takes it.
         static CHECKED: Cell<Option<usize>> = const { Cell::new(None) };
+        /// The values of the inheritable copies the last spawn window of this thread checked, stdin, stdout and stderr
+        /// first, until a test takes them: the command inherits each under the same value.
+        static COPIES: Cell<Vec<usize>> = const { Cell::new(Vec::new()) };
     }
 
     /// Whether the system says `handle` is inheritable.
@@ -418,6 +446,7 @@ mod tests {
         }
         assert!(spawn_lock_held(), "the spawn lock is held in the window");
         CHECKED.set(Some(originals.len()));
+        COPIES.set(copies.iter().map(|copy| copy.addr()).collect());
     }
 
     /// The system folder, where cmd.exe is.
@@ -476,5 +505,115 @@ mod tests {
 
         assert_eq!(CHECKED.take(), Some(4), "the window checked NUL, the two pipe write ends and the job");
         assert!(!spawn_lock_held(), "the spawn lock is free once the launch returns");
+    }
+
+    /// A desktop launch of cmd that would exit at once, were it ever resumed.
+    fn desktop_launch() -> DesktopLaunch {
+        let system = system_folder();
+        DesktopLaunch {
+            application: system.join("cmd.exe"),
+            command_line: "cmd /d /c exit 0".encode_utf16().collect(),
+            directory: system,
+            environment: environment(),
+        }
+    }
+
+    /// `handle`, borrowed.
+    fn borrow(handle: &OwnedHandle) -> BorrowedHandle<'_> {
+        // SAFETY: the guard keeps the handle open for as long as the borrow lives.
+        unsafe { BorrowedHandle::borrow_raw(handle.raw()) }
+    }
+
+    /// The priority class of the process behind `process`.
+    fn class_of(process: HANDLE) -> u32 {
+        // SAFETY: the caller keeps the handle open, with query access, for the whole call.
+        let class = unsafe { GetPriorityClass(process) };
+        assert_ne!(class, 0, "the priority class is read: {}", std::io::Error::last_os_error());
+        class
+    }
+
+    /// This process lowered to the below-normal class, put back to the class it had when dropped.
+    struct Lowered(u32);
+
+    impl Lowered {
+        fn set() -> Lowered {
+            // SAFETY: this process's pseudo-handle is always open, with every access.
+            let before = class_of(unsafe { GetCurrentProcess() });
+            // SAFETY: as above.
+            assert_ne!(
+                unsafe { SetPriorityClass(GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS) },
+                0,
+                "the class is lowered"
+            );
+            Lowered(before)
+        }
+    }
+
+    impl Drop for Lowered {
+        fn drop(&mut self) {
+            // SAFETY: as in `Lowered::set`. A restore that fails leaves the class lowered for the rest of this test's
+            // own process alone.
+            unsafe { SetPriorityClass(GetCurrentProcess(), self.0) };
+        }
+    }
+
+    #[test]
+    fn a_helper_created_child_is_suspended_at_normal_priority_under_a_below_normal_parent() {
+        let _alone = ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner);
+        let (_stdout, output) = pipe_from_child("stdout").expect("the stdout pipe is made");
+        let (_stderr, errors) = pipe_from_child("stderr").expect("the stderr pipe is made");
+
+        let suspended = {
+            let _lowered = Lowered::set();
+            assert!(
+                crate::runs_below_normal().expect("this process's class is read"),
+                "the parent runs below normal"
+            );
+            desktop_launch()
+                .start_suspended(borrow(&output), borrow(&errors))
+                .expect("the command is created")
+        };
+
+        let process = suspended.process.as_ref().expect("the process is held");
+        assert_eq!(class_of(process.raw()), NORMAL_PRIORITY_CLASS);
+        assert!(thread_is_suspended(borrow(&suspended.thread)).expect("the thread is read"));
+    }
+
+    #[test]
+    fn a_helper_created_child_inherits_only_its_listed_handles() {
+        let _alone = ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner);
+        let (_stdout, output) = pipe_from_child("stdout").expect("the stdout pipe is made");
+        let (_stderr, errors) = pipe_from_child("stderr").expect("the stderr pipe is made");
+        let inheritable_attributes = SECURITY_ATTRIBUTES {
+            nLength: crate::launch::struct_size::<SECURITY_ATTRIBUTES>(),
+            lpSecurityDescriptor: std::ptr::null_mut(),
+            bInheritHandle: 1,
+        };
+        // SAFETY: the attributes are whole and outlive the call, and a null name is allowed. A success is a fresh
+        // handle nothing else owns.
+        let stray = unsafe { crate::own_handle(CreateEventW(&raw const inheritable_attributes, 1, 0, std::ptr::null())) }.expect("the event is made");
+        assert!(inheritable(stray.raw()), "a handle any child that inherits every handle would get");
+
+        let suspended = desktop_launch()
+            .start_suspended(borrow(&output), borrow(&errors))
+            .expect("the command is created");
+
+        let copies = COPIES.take();
+        assert_eq!(CHECKED.take(), Some(3), "the window checked NUL and the two write ends");
+        let child = RemoteProcess::open(suspended.pid()).expect("the child opens");
+        let held: Vec<std::os::windows::io::OwnedHandle> = copies
+            .iter()
+            .map(|&value| child.pull(value).expect("the child holds each listed handle"))
+            .collect();
+        for (pulled, original) in held[1..].iter().zip([&output, &errors]) {
+            // SAFETY: both handles are open for the whole call.
+            let same = unsafe { CompareObjectHandles(pulled.as_raw_handle(), original.raw()) } != 0;
+            assert!(same, "the child's stdout and stderr are the given write ends");
+        }
+        let not_inherited = child.pull(stray.raw().addr()).map_or(true, |pulled| {
+            // SAFETY: both handles are open for the whole call.
+            unsafe { CompareObjectHandles(pulled.as_raw_handle(), stray.raw()) == 0 }
+        });
+        assert!(not_inherited, "the child does not hold the inheritable handle it was not given");
     }
 }

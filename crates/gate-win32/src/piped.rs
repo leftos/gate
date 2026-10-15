@@ -6,7 +6,7 @@
 
 use std::fs::File;
 use std::io;
-use std::os::windows::io::FromRawHandle;
+use std::os::windows::io::{BorrowedHandle, FromRawHandle, IntoRawHandle};
 use std::path::{Path, PathBuf};
 
 use proc_table::win32::OwnedHandle;
@@ -18,10 +18,12 @@ use windows_sys::Win32::System::JobObjects::{
 };
 use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::SystemServices::JOB_OBJECT_QUERY;
-use windows_sys::Win32::System::Threading::{CREATE_BREAKAWAY_FROM_JOB, CREATE_NO_WINDOW, GetCurrentProcess, PROCESS_CREATION_FLAGS};
+use windows_sys::Win32::System::Threading::{
+    CREATE_BREAKAWAY_FROM_JOB, CREATE_NO_WINDOW, GetCurrentProcess, NORMAL_PRIORITY_CLASS, PROCESS_CREATION_FLAGS,
+};
 use windows_sys::Win32::System::WindowsProgramming::PROCESS_CREATION_DESKTOP_APP_BREAKAWAY_DISABLE_PROCESS_TREE;
 
-use crate::create::{Creation, DesktopPolicy, Inherited, check_launch, create_inheriting};
+use crate::create::{Creation, DesktopPolicy, Inherited, check_launch, create_inheriting, create_inheriting_on};
 use crate::launch::{open_shared, setup, struct_size};
 use crate::{EnvironmentBlock, Job, LaunchError, RestrictedToken, Suspended, own_handle, wide};
 
@@ -151,6 +153,71 @@ impl PipedLaunch {
         drop((input, output, errors, job_handle));
         Ok(PipedSuspended { suspended, stdout, stderr })
     }
+}
+
+/// The window station and desktop a [`DesktopLaunch`] creates its command on: the interactive one.
+const INTERACTIVE_DESKTOP: &str = r"WinSta0\Default";
+
+/// How the desktop helper starts a command on the interactive desktop of its session, its output going to two pipe
+/// write ends it was handed: the caller decides every part of it.
+pub struct DesktopLaunch {
+    /// The program file, as an absolute path: `CreateProcessW` runs it as named and searches no folder for it. A
+    /// `.cmd` or `.bat` file is refused; the caller runs one through cmd.exe itself.
+    pub application: PathBuf,
+    /// The command line, as the program reads it, without a terminating NUL.
+    pub command_line: Vec<u16>,
+    /// The working folder.
+    pub directory: PathBuf,
+    /// The command's whole environment.
+    pub environment: EnvironmentBlock,
+}
+
+impl DesktopLaunch {
+    /// Creates the command suspended, with this process's token, in its working folder with its environment, on the
+    /// interactive desktop (`lpDesktop` `WinSta0\Default`) and a hidden console of its own (`CREATE_NO_WINDOW`), in the
+    /// normal priority class (`NORMAL_PRIORITY_CLASS`) whatever this process's class is, and inside this process's job:
+    /// no breakaway is asked for. Its stdin is `NUL`, and its stdout and stderr `stdout` and `stderr`, which stay open
+    /// and this process's; it inherits exactly those three handles, through copies open only while the spawn lock is
+    /// held, as [`PipedLaunch::start_suspended`]'s command does. It is created with the desktop-app policy
+    /// `PROCESS_CREATION_DESKTOP_APP_BREAKAWAY_DISABLE_PROCESS_TREE` where the system can set it, and without it,
+    /// [`Suspended::note`] saying so, before Windows 10 1703.
+    ///
+    /// # Errors
+    ///
+    /// [`LaunchError::CreateProcess`] when `CreateProcessW` fails; [`LaunchError::Setup`] when the launch is refused
+    /// (an application that is relative or a batch file, or a NUL in the application, command line or working folder)
+    /// or a handle or the attribute list cannot be made.
+    pub fn start_suspended(&self, stdout: BorrowedHandle<'_>, stderr: BorrowedHandle<'_>) -> Result<Suspended, LaunchError> {
+        check_launch(&self.command_line, &self.application, &[("working folder", self.directory.as_path())])?;
+        let input = nul()?;
+        let output = own_copy(stdout, "stdout")?;
+        let errors = own_copy(stderr, "stderr")?;
+        let creation = Creation {
+            application: &self.application,
+            command_line: &self.command_line,
+            directory: &self.directory,
+            environment: &self.environment,
+            token: None,
+        };
+        let inherited = Inherited {
+            stdio: [&input, &output, &errors],
+            others: &[],
+        };
+        let policy = DesktopPolicy::Wanted(PROCESS_CREATION_DESKTOP_APP_BREAKAWAY_DISABLE_PROCESS_TREE);
+        let flags = CREATE_NO_WINDOW | NORMAL_PRIORITY_CLASS;
+        let suspended = create_inheriting_on(&creation, flags, &inherited, policy, Some(INTERACTIVE_DESKTOP))?;
+        // The command holds its own copies now; the caller's handles stay open.
+        drop((input, output, errors));
+        Ok(suspended)
+    }
+}
+
+/// A copy of `handle`, never inheritable, that this process owns, for the command's `stream`.
+fn own_copy(handle: BorrowedHandle<'_>, stream: &str) -> Result<OwnedHandle, LaunchError> {
+    let operation = format!("copy the {stream} handle for the command");
+    let copy = handle.try_clone_to_owned().map_err(|error| setup(error, &operation))?;
+    // SAFETY: `into_raw_handle` gives up the std guard's ownership, so the new guard alone owns the open copy.
+    unsafe { own_handle(copy.into_raw_handle()) }.map_err(|error| setup(error, &operation))
 }
 
 /// A handle to `NUL` for a command's stdin.

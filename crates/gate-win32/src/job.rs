@@ -411,6 +411,23 @@ impl Job {
         holds(&self.handle, process)
     }
 
+    /// Whether the process behind `process`, open with `PROCESS_QUERY_LIMITED_INFORMATION`, is in this job, or in a job
+    /// nested inside it (`IsProcessInJob` on this job, not on any job).
+    ///
+    /// # Errors
+    ///
+    /// The system's error when that cannot be read.
+    pub fn holds_process(&self, process: std::os::windows::io::BorrowedHandle<'_>) -> io::Result<bool> {
+        let process = std::os::windows::io::AsRawHandle::as_raw_handle(&process);
+        let mut inside = 0;
+        // SAFETY: the job's handle is open for as long as `self` lives, the process handle is borrowed open for the
+        // whole call, and one without the access the call asks for only makes it fail; `inside` is writable.
+        if unsafe { IsProcessInJob(process, self.handle.raw(), &raw mut inside) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(inside != 0)
+    }
+
     /// The CPU time the job has used, every process ever in it counted, and the processes it holds now.
     ///
     /// # Errors
