@@ -31,8 +31,8 @@ mod token;
 mod tree;
 
 pub use adopt::{
-    RemoteProcess, creation_time_of, image_path_of, is_handle_value, parent_pid_of, pid_of_process, pid_of_thread, process_of_child, session_of,
-    thread_is_suspended, user_of,
+    RemoteProcess, check_received_output, creation_time_of, image_path_of, is_handle_value, parent_pid_of, pid_of_process, pid_of_thread,
+    process_of_child, session_of, thread_is_suspended, user_of,
 };
 pub use console::{Donor, Utf8Console};
 pub use create::spawn;
@@ -41,7 +41,8 @@ pub use event::{EventWait, NamedEvent};
 pub use interrupt::Interrupt;
 pub use job::{Accounting, Job};
 pub use launch::{
-    AdoptError, EnvironmentBlock, Launch, LaunchError, LaunchOutput, PriorityClass, Running, StdioPipes, Suspended, Waited, same_variable_name,
+    AdoptError, EnvironmentBlock, Launch, LaunchError, LaunchOutput, PriorityClass, Released, Running, StdioPipes, Suspended, Waited,
+    same_variable_name,
 };
 pub use memory::working_set;
 pub use mutex::{AcquireError, MutexGuard, NamedMutex, OwnedMutexGuard, mutex_exists};

@@ -35,8 +35,19 @@ use crate::piped::{pipe_from_child, pipe_to_child};
 use crate::{Interrupt, Job, own_handle, wait_millis, win32_message};
 
 /// A Unicode environment block, its entries sorted by name as `CreateProcessW` wants them.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct EnvironmentBlock(pub(crate) Vec<u16>);
+
+impl std::fmt::Debug for EnvironmentBlock {
+    /// The count of entries alone: an entry's value may be a secret.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let entries = self.0.split(|&unit| unit == 0).filter(|entry| !entry.is_empty()).count();
+        formatter
+            .debug_struct("EnvironmentBlock")
+            .field("entries", &entries)
+            .finish_non_exhaustive()
+    }
+}
 
 impl EnvironmentBlock {
     /// The block of `vars`, `(name, value)` pairs. Names are compared as Windows compares them, ordinally and without
@@ -79,14 +90,17 @@ impl EnvironmentBlock {
     }
 
     /// The block `block` holds as it is, entries and order untouched, once it is checked to be one `CreateProcessW`
-    /// reads whole: it ends in two NULs, and every entry before them holds a `=` after its first character, so no entry
-    /// is empty and none ends the block early. An entry that starts with `=`, as `=C:=C:\` does, is kept. This is the
-    /// only way to build a block from bytes another process sent.
+    /// reads whole, in the order [`EnvironmentBlock::new`] writes: it ends in two NULs, every entry before them holds a
+    /// `=` after its first character, so no entry is empty and none ends the block early, and each entry's name (the
+    /// part before that `=`) sorts strictly after the one before it, as Windows orders names, ordinally without regard
+    /// to case, so no name is there twice in any letter case. An entry that starts with `=`, as `=C:=C:\` does, is
+    /// kept. This is the only way to build a block from bytes another process sent.
     ///
     /// # Errors
     ///
-    /// An error of kind [`io::ErrorKind::InvalidInput`] naming why, for a block that is empty or holds no entry, does
-    /// not end in two NULs, or holds an empty entry or an entry with no `=` after its first character before its end.
+    /// An error of kind [`io::ErrorKind::InvalidInput`] naming why, by entry position alone, for a block that is empty
+    /// or holds no entry, does not end in two NULs, holds an empty entry or an entry with no `=` after its first
+    /// character before its end, or holds a name again or out of order.
     pub fn from_wide(block: Vec<u16>) -> io::Result<EnvironmentBlock> {
         match block_problem(&block) {
             Some(problem) => Err(io::Error::new(io::ErrorKind::InvalidInput, format!("the environment block {problem}"))),
@@ -104,15 +118,44 @@ fn block_problem(block: &[u16]) -> Option<String> {
     let Some(entries) = block.strip_suffix(&[0, 0]) else {
         return Some("does not end in two NULs".to_owned());
     };
+    let mut previous: Option<&[u16]> = None;
+    for (index, entry) in entries.split(|&unit| unit == 0).enumerate() {
+        let name = match name_of_entry(entry, index) {
+            Ok(name) => name,
+            Err(problem) => return Some(problem),
+        };
+        if let Some(problem) = previous.and_then(|before| order_problem(before, name, index)) {
+            return Some(problem);
+        }
+        previous = Some(name);
+    }
+    None
+}
+
+/// The name of the block entry `entry`, at position `index`: the part before its first `=` after its first character;
+/// or what makes it no entry.
+fn name_of_entry(entry: &[u16], index: usize) -> Result<&[u16], String> {
     let equals = u16::from(b'=');
-    entries
-        .split(|&unit| unit == 0)
-        .enumerate()
-        .find_map(|(index, entry)| match entry.split_first() {
-            None => Some(format!("holds an empty entry at position {index}, before its end")),
-            Some((_, rest)) if !rest.contains(&equals) => Some(format!("holds an entry at position {index} with no `=` after its first character")),
-            Some(_) => None,
-        })
+    let Some((_, rest)) = entry.split_first() else {
+        return Err(format!("holds an empty entry at position {index}, before its end"));
+    };
+    match rest.iter().position(|&unit| unit == equals) {
+        Some(at) => Ok(&entry[..=at]),
+        None => Err(format!("holds an entry at position {index} with no `=` after its first character")),
+    }
+}
+
+/// What is wrong with the name at position `index` following the name `before` at the position before it: the same
+/// name again, or one that sorts before it. `None` when it sorts after.
+fn order_problem(before: &[u16], name: &[u16], index: usize) -> Option<String> {
+    let previous = index - 1;
+    match compare_names(before, name) {
+        Ordering::Less => None,
+        Ordering::Equal => Some(format!("holds the name of position {previous} again at position {index}")),
+        Ordering::Greater => Some(format!(
+            "holds the name at position {index} out of order, before the one at position {previous}"
+        )),
+    }
 }
 
 /// Refuses a `(name, value)` pair a block cannot carry.
@@ -598,25 +641,55 @@ impl Suspended {
         Err(setup(error, "resume the command"))
     }
 
-    /// Gives up the command without ending it or closing its process and thread handles, and returns its pid and the
-    /// raw values of those two handles, for a process that hands them to another: the desktop helper, whose copies the
-    /// box takes with `DUPLICATE_CLOSE_SOURCE`. The command stays suspended. This process's ends of its pipes, when not
-    /// taken, are closed, as a resume closes them. The process value is null only for a command whose process was
-    /// already taken, which no caller outside this crate can make.
+    /// Gives up the command without ending it or closing its process and thread handles, and returns its pid, the raw
+    /// values of those two handles and its creation time, read from the process handle first, for a process that hands
+    /// them to another: the desktop helper, whose copies the box takes with `DUPLICATE_CLOSE_SOURCE`. The command stays
+    /// suspended. This process's ends of its pipes, when not taken, are closed, as a resume closes them.
     ///
     /// The caller owns both handles from here. Once it has handed them on, it must never use the values again, not even
     /// to close them: after the other process closes them, they may name other objects of this process.
-    #[must_use]
-    pub fn release(mut self) -> (u32, RawHandle, RawHandle) {
-        let process = self
-            .process
-            .take()
-            .map_or(std::ptr::null_mut(), |process| std::mem::ManuallyDrop::new(process).raw());
+    ///
+    /// # Errors
+    ///
+    /// An error when the process was already taken, or the system's error when its creation time cannot be read; the
+    /// command is then ended with exit code 1, as a drop ends it, and nothing is given up.
+    pub fn release(mut self) -> io::Result<Released> {
+        let Some(process) = self.process.take() else {
+            return Err(io::Error::other("the process was already taken"));
+        };
+        // SAFETY: the process handle is open for the whole call, with the query access a created process's handle has.
+        let created = match unsafe { crate::start_of(process.raw()) } {
+            Ok(created) => created,
+            Err(error) => {
+                // Held again, so the drop of `self` ends the command.
+                self.process = Some(process);
+                return Err(error);
+            }
+        };
+        let process = std::mem::ManuallyDrop::new(process).raw();
         let mut released = std::mem::ManuallyDrop::new(self);
         released.pipes = None;
         released.note = None;
-        (released.pid, process, released.thread.raw())
+        Ok(Released {
+            pid: released.pid,
+            process,
+            thread: released.thread.raw(),
+            created,
+        })
     }
+}
+
+/// A command [`Suspended::release`] gave up, suspended and unended: what the process that hands it on needs.
+#[derive(Debug)]
+pub struct Released {
+    /// The command's process id.
+    pub pid: u32,
+    /// The raw value of the command's process handle, which the caller owns.
+    pub process: RawHandle,
+    /// The raw value of the handle of the command's first thread, which the caller owns.
+    pub thread: RawHandle,
+    /// When the command's process was created, as [`crate::creation_time_of`] reads it.
+    pub created: jiff::Timestamp,
 }
 
 /// A refused [`Suspended::adopt`]: the two handles it was given, open and unchanged, and why they were refused.
@@ -761,7 +834,7 @@ mod tests {
     use windows_sys::Win32::System::Threading::TerminateProcess;
 
     use super::{EnvironmentBlock, Launch, LaunchOutput};
-    use crate::{StoppableProcess, pid_of_process, system_directory};
+    use crate::{StoppableProcess, creation_time_of, pid_of_process, pid_of_thread, system_directory};
 
     /// The longest a test waits for a process to end: it never runs out unless the code is broken.
     const HANG_GUARD: Duration = Duration::from_secs(600);
@@ -815,6 +888,45 @@ mod tests {
     }
 
     #[test]
+    fn an_environment_block_from_wide_refuses_a_duplicate_name() {
+        assert_refused("A=1\0a=2\0\0", "name of position 0 again at position 1");
+        let refused = EnvironmentBlock::from_wide(units("SECRET=1\0secret=2\0\0")).expect_err("the block is refused");
+        assert!(
+            !refused.to_string().to_lowercase().contains("secret"),
+            "a name is not repeated: {refused}"
+        );
+    }
+
+    #[test]
+    fn an_environment_block_from_wide_refuses_names_out_of_order() {
+        assert_refused("B=1\0A=2\0\0", "position 1 out of order");
+        assert_refused("A=1\0C=2\0b=3\0\0", "position 2 out of order");
+        assert_refused("A=1\0=C:=C:\\\0\0", "position 1 out of order");
+    }
+
+    #[test]
+    fn an_environment_block_from_wide_reads_back_a_block_new_made() {
+        let vars = [("Path", "C:\\x"), ("=C:", "C:\\"), ("b", "2"), ("A", "1"), ("a", "3"), ("AB", "4")];
+        let made = EnvironmentBlock::new(vars.map(|(name, value)| (name.into(), value.into()))).expect("the block is built");
+
+        let read = EnvironmentBlock::from_wide(made.0.clone()).expect("a block new made is in order");
+
+        assert_eq!(read.0, made.0, "the block is kept as it is");
+    }
+
+    /// A process handle that ends its process with exit code 1 when dropped, so a test that fails before ending the
+    /// child it released leaves no suspended process behind.
+    struct EndOnDrop(OwnedHandle);
+
+    impl Drop for EndOnDrop {
+        fn drop(&mut self) {
+            // SAFETY: the handle is open, with the `PROCESS_TERMINATE` access a created process's handle has. A process
+            // that has ended already only makes the call fail, which changes nothing.
+            unsafe { TerminateProcess(self.0.as_raw_handle(), 1) };
+        }
+    }
+
+    #[test]
     fn release_gives_up_the_child_without_ending_it() {
         let _alone = crate::create::tests::ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner);
         let system = system_directory().expect("the system folder is read");
@@ -831,18 +943,33 @@ mod tests {
         let watch = StoppableProcess::open(child.pid()).expect("the child opens").expect("the child exists");
         let expected_pid = child.pid();
 
-        let (pid, process, thread) = child.release();
+        let released = child.release().expect("the child is released");
 
         // SAFETY: `release` gave up both handles, open, and nothing else owns them now.
-        let (process, _thread) = unsafe { (OwnedHandle::from_raw_handle(process), OwnedHandle::from_raw_handle(thread)) };
-        assert_eq!(pid, expected_pid);
-        assert_eq!(pid_of_process(process.as_handle()).expect("the released process is read"), pid);
+        let (process, thread) = unsafe {
+            (
+                EndOnDrop(OwnedHandle::from_raw_handle(released.process)),
+                OwnedHandle::from_raw_handle(released.thread),
+            )
+        };
+        assert_eq!(released.pid, expected_pid);
+        assert_eq!(pid_of_process(process.0.as_handle()).expect("the released process is read"), released.pid);
+        assert_eq!(
+            pid_of_thread(thread.as_handle()).expect("the released thread is read"),
+            released.pid,
+            "the thread handle is still open, on the child's thread"
+        );
+        assert_eq!(
+            creation_time_of(process.0.as_handle()).expect("the start is read"),
+            released.created,
+            "the creation time is the child's"
+        );
         assert!(
             !watch.wait(Duration::ZERO).expect("the wait succeeds"),
             "the released child was not ended"
         );
         // SAFETY: the process handle is open, with the `PROCESS_TERMINATE` access a created process's handle has.
-        assert_ne!(unsafe { TerminateProcess(process.as_raw_handle(), 7) }, 0, "the test ends the child");
+        assert_ne!(unsafe { TerminateProcess(process.0.as_raw_handle(), 7) }, 0, "the test ends the child");
         assert!(watch.wait(HANG_GUARD).expect("the wait succeeds"), "the child ended");
         assert_eq!(
             watch.exit_code().expect("the exit code is read"),
