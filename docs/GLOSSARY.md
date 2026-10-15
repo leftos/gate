@@ -110,6 +110,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Parity refusal**: the `parity` refusal of a routed run whose builder lacks the .NET SDK the snapshot needs (its `global.json` pin under the rollForward policy, or, with no pin, an SDK of this PC's newest major); the run goes local.
 - **Path start**: a place in a command word where the router judges a path afresh: the word's start, after white space or a line break, after `, ; " ' ) | & < > ( =`, after a leading `@`, and after the colon of a switch that starts its token or follows a `"`, `'` or `,`.
 - **Pause marker**: an empty file a gate under a parent gate's slot rewrites on every pass while it waits behind a critical request, which stops its parent's watchdog clocks for that time, the watchdog reading it on each sample; one older than 30 s is stale.
+- **Payload**: the JSON object a `gate box` verb reads its inputs from (paths, `Nonce`, `Command`, `Needs` and the like), sent base64-encoded as the request.
 - **Pipe-closed stop**: the box's stop of a job whose client's connection closed: `gate box run` terminates the job, waits for its processes and exits 255.
 - **Plain part**: a name of a path's part that Windows creates under that very name and git does not own: not empty, no trailing dot or space, none of `\ : < > " | ? *`, no control character or bidirectional mark, no `~` before a digit, not `.git` and not a device name. A plain path has at most 64 parts, each plain; a routed run brings back only plain paths.
 - **Pool**: the set of slots of one kind (heavy, light, remote); pools never wait on each other.
@@ -126,6 +127,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Refusal tag**: the stderr line `gate-remote-refused: <nonce> busy|tools|layout` that `gate box run` says just before the human line of a refusal; the remote client reads a `busy`, `tools` or `layout` fallback from it alone, and ignores it once it has heard the start marker.
 - **Release**: see take.
 - **Remote client**: what `gate run` calls to run a routed command on a builder: `RemoteClient` in the gate binary; every routed run uses the Rust client over ssh, which looks for ssh when the run routes, and a client that cannot start makes the run fall back with reason `client`.
+- **Request**: what a `gate box` call is asked, the payload as the first line of the call's stdin, never a word of the ssh command line.
 - **Reserved light slot**: one of the up to two highest light slots a critical gate never takes, so light gates run beside it.
 - **Rollover**: the move of `events.jsonl` over `events.1.jsonl` by the append that finds the journal at or above 5,242,880 bytes, followed by the archive of the rolled file.
 - **Root hash**: the first 8 hex digits of the SHA-256 of a non-default state root's path, carried in every kernel object name and slot marker of that root.

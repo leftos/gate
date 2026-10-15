@@ -160,7 +160,9 @@ Each builder is one ssh call, run in a kill-on-close job with stdin piped and bo
 
 A timeout stops only the local ssh, so the builder's install may still finish.
 
-The call is `pwsh -NoProfile -NonInteractive -OutputFormat Text -EncodedCommand <bootstrap>` through the transport's ssh words ([Routing](#routing)), with `-o RequestTTY=no` ahead of them so stdin never passes through a pseudo-terminal. The bootstrap is a short fixed PowerShell line that reads stdin's first line and runs it as the install script, so the call stays within the 8127 characters cmd takes ([Routing](#routing)) however long the script grows, which a unit test checks.
+The call is `pwsh -NoProfile -NonInteractive -OutputFormat Text -EncodedCommand <bootstrap>` through the transport's ssh words ([Routing](#routing)), with `-o RequestTTY=no` ahead of them so stdin never passes through a pseudo-terminal.
+
+The bootstrap is a short fixed PowerShell line that reads stdin's first line and runs it as the install script, so the call stays within the 8127 characters cmd takes (8191, less 64 for sshd's own `cmd.exe /c`, `%LOCALAPPDATA%` counted as 100) however long the script grows, which a unit test checks.
 
 Stdin is line 1, the install script as base64 of its UTF-8 with this PC's SHA-256 put in, then the exe as base64 text of its gzip (flate2's best level). The push call is not asked for ssh compression: the bytes are already compressed.
 
@@ -263,7 +265,7 @@ On stdout, each line prefixed `check: <host>: `, in this order:
 4. The install hints `install: <host>: <tool>: <command>`: `cargo install cargo-nextest --locked`, `npm install -g pnpm@<min>` (`npm install -g pnpm` with no minimum), `rustup toolchain install <min> && rustup default <min>`, `dotnet-install.ps1 -Version <v>`, and `run the build-box toolchain script on <host>` for node, pwsh, ffmpeg and a rust with no minimum.
 5. The summary.
 
-When the manifest's tools would make the preflight call longer than cmd takes (8127 characters), they are dropped: that line goes to stderr first, and each tool then reads `check: <host>: <tool> skipped: not sent, as the tools make the preflight call too long for cmd`. When the repo's `.gate/siblings.toml` names a sibling or cannot be read, one line `check: <host>: siblings skipped: a routed run lays them out` comes instead of the sibling lines and counts as skipped.
+When the repo's `.gate/siblings.toml` names a sibling or cannot be read, one line `check: <host>: siblings skipped: a routed run lays them out` comes instead of the sibling lines and counts as skipped.
 
 A failure is one stderr line, exit 1, and nothing else on stdout:
 
@@ -317,7 +319,7 @@ The launcher maps no `-Expect`: the compatibility layer refuses it, and callers 
 
 Hidden from the usage and from `--help`. It is the builder side of a routed run, run over ssh on the builder ([The box side](#the-box-side)).
 
-`gate box preflight|run|stop|boot|outputs|inflight <payload>` takes exactly one verb and one non-empty payload word, and no `--state-dir`: every path comes from the payload. Any other shape (no verb, no payload, an empty payload, an unknown verb, an extra word) prints `usage: gate box preflight|run|stop|boot|outputs|inflight <base64 JSON payload>` alone on stderr and exits 2.
+`gate box preflight|run|stop|boot|outputs|inflight --stdin` takes exactly one verb and the word `--stdin`, and no `--state-dir`: the request is the first line of stdin, and every path comes from it. Any other shape (no verb, no `--stdin`, any other word in its place, an unknown verb, an extra word) prints `usage: gate box preflight|run|stop|boot|outputs|inflight --stdin (the base64 JSON request as stdin's first line)` alone on stderr and exits 2.
 
 ### Later subcommands
 
@@ -1319,7 +1321,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
     A lock held elsewhere says `gate: remote <host> busy; running here` and falls back `busy` before any queueing, so two routed runs of one worktree give a deterministic `busy`, not a race. A lock that cannot be opened or taken says `gate: cannot open the mutex <name>: <error>` or `gate: cannot take the mutex <name>: <error>`, then the busy line.
   - **Snapshot.** Part A's snapshot and bridge commit.
-  - **Run line.** The run call is one cmd line, `"%LOCALAPPDATA%\gate\bin\gate.exe" box run <base64 JSON>`, built before anything is sent. It may be at most 8127 characters, counting `%LOCALAPPDATA%` as 100 (8191, cmd's limit, less 64 for sshd's own `cmd.exe /c`). A longer one says `gate: the remote run failed: the run call is <n> characters, longer than the 8127 cmd takes (8191 less 64 for sshd's own cmd.exe /c); shorten the command` and sends nothing.
+  - **Run line.** The run call's cmd line is the fixed `"%LOCALAPPDATA%\gate\bin\gate.exe" box run --stdin`, the same whatever the run holds; every other `gate box` call's line differs only in its verb. The request, base64 of compact UTF-8 JSON, is the first line of the call's stdin, followed for the run call by the outputs manifest line, so no request size is capped by a command line. The box reads the request line with a cap of 16 MiB, newline included ([The box side](#the-box-side)).
   - **Preflight.** `gate box preflight` over ssh. Status 255, ssh's own status for a lost connection, says `gate: remote <host> unreachable: <last stderr line>` and falls back `unreachable`; the line is the last `\r` update of the last stderr line, its first 4 KiB, escaped (Escaping, below). Status 9009 or 2 (no `gate box` verb there) says `gate: not routed: <host> has no gate box that takes this run (preflight status <n>)` and falls back `version`.
 
     Any other non-zero status says `gate: preparing <builder root> on <host> failed (status <n>)` and ends the run with that status. A reported version text other than this PC's whole one, build id included, says `gate: not routed: <host> runs gate <theirs|unknown>, this PC <ours>; run gate push` and falls back `version`; the builder's version is its first 4 KiB, escaped.
@@ -1383,8 +1385,6 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
     The preflight's `Needs` carry the tools the manifest declares whose names the box knows how to probe (the known names above), each with its minimum, or empty for any version. A name outside them is skipped with `gate: .gate/toolchain.toml names unknown tool <name>; skipping it` and not sent.
 
-    When the tools would make the preflight call longer than cmd's 8127 characters, it goes without them, after `gate: .gate/toolchain.toml: its tools make the preflight call longer than the 8127 characters cmd takes; skipping it`.
-
     The builder answers each tool with a `gate: remote tool <name> <version|present|missing|skipped: <why>>` line. A tool it found missing, or older than the minimum, is a need, and the route is refused as under Parity: one `gate: remote toolchain mismatch: <repo> needs <name> <min> or later; <host> has <version|none>` line per need (`<name>` alone when the manifest sets no minimum), then the parity fallback line, and the run goes local.
 
     A tool the builder did not probe, gave no answer for, or found at a version that cannot be read against a minimum gets `gate: <host> did not probe <name>: <why>; not checking it` and is not a need. The lines come in this order: the SDK step's own, then the manifest's problem lines, then the per-tool skip lines in the manifest's order, then the mismatch lines.
@@ -1399,9 +1399,9 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
     The builder keeps one bare repo per repo name, `<builder root>/<repo>.git`, shared by every key of that repo; the key is only the ref's name.
 
     The size is read from git's last `Writing objects: 100%` line, ignoring `remote:` lines, and only a number with a unit (or `bytes`) counts as one, else the line says `up to date`. Failure says `gate: pushing the snapshot to <url> failed (status <n>)` and falls back `unreachable`.
-  - **Run call.** The line goes over `ssh -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=4 -o ForwardAgent=no -o ClearAllForwardings=yes -o Compression=yes -- <host> <line>`, each argument separate.
+  - **Run call.** The line goes over `ssh -o RequestTTY=no -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=4 -o ForwardAgent=no -o ClearAllForwardings=yes -o Compression=yes -- <host> <line>`, each argument separate.
 
-    The last option is the run call's alone: the preflight, stop, boot and outputs calls, git's ssh command and `gate push` ask for none. The run call's compression covers both directions of its connection: the command's output and protocol lines one way, the run line and the outputs manifest the other.
+    `-o RequestTTY=no` leads the options of every `gate box` call and `gate push`'s, so stdin never passes through a pseudo-terminal. The last option, `-o Compression=yes`, is the run call's alone: the preflight, stop, boot and outputs calls, git's ssh command and `gate push` ask for none. The run call's compression covers both directions of its connection: the command's output and protocol lines one way, the request and the outputs manifest the other.
 
     The box's output passes through to the log and the console, except the box's heartbeats and its machine lines, which the client hides from both and keeps out of the lines it holds: the start marker `gate-remote-started: <nonce>` and the refusal tag `gate-remote-refused: <nonce> busy|tools|layout`, each naming this run's `Nonce` and read on stderr only, as a whole line, and the kill tag and the adjusted line below.
 
@@ -1411,7 +1411,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
     A status 75 is a refusal only when this run's refusal tag came on stderr before any start marker (`busy`, `tools` or `layout`, the fallback reason); a tag after the marker is ignored, so a command that prints the human busy, tools or layout line, or a tag of its own, and exits 75 ends with status 75 and no fallback.
 
-    Safety rests on order, not on the nonce being secret (it is on the box's and ssh's command lines): the box says the marker before it creates the command's process, and the client ignores every tag once it has heard the marker.
+    Safety rests on order, not on the nonce being secret (the request is on no command line, but the nonce still appears in the run id, the pipe names and the archive name): the box says the marker before it creates the command's process, and the client ignores every tag once it has heard the marker.
   - **Outputs.** In `remote/outputs.rs`, for a run with output globs; a run without them sends `Outputs` `[]` and `OutputsFull` false, no manifest, and says nothing here, and writes no marker unless the route withheld its outputs (a dotnet `--no-build` command the builder built): that run writes the pending marker after the push, as below, and no end of it clears the marker. The client builds the manifest ([The outputs module](#the-box-side)) before the run call, hashing every matching file.
 
     **Manifest time** (GATE-23): SHA-256 streams, with no whole-file read into memory, and only the PC hashes every file (the box hashes changed files only; `obj` is not under the default globs). No timing line is added to routed runs.
@@ -1446,7 +1446,9 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
     Once the push succeeds, and before the run call, it writes the pending marker `<state root>\remote\<key>.outputs-pending` (an empty file; a marker whose existence cannot be read counts as present), so a run refused at the preflight or by the parity check leaves none.
 
-    The payload carries the globs as `Outputs` and `OutputsFull` (true when the marker was there), and the manifest goes as one line on the run call's stdin, which is then closed; a pre-banner retry feeds it again. A marker that cannot be written says `gate: the remote run failed: cannot write the outputs pending marker <path>: <error>`; a run call whose input could not be sent logs only `gate: the run call's input was not sent: <error>`.
+    The payload carries the globs as `Outputs` and `OutputsFull` (true when the marker was there), and the manifest goes as the line after the request on the run call's stdin, which is then closed; a pre-banner retry feeds both again. A marker that cannot be written says `gate: the remote run failed: cannot write the outputs pending marker <path>: <error>`.
+
+    A call whose input could not be sent logs `gate: the <verb> call's input was not sent: <error>`, only when the call reached the box's banner and ended neither refused nor with ssh's 255, since any other end says why on its own lines. An input still being sent 2 s after the call ended logs `gate: the <verb> call's input was still being sent 2 s after the call ended`, and a feeder thread that panicked `gate: the <verb> call's input feeder panicked`.
 
     The client accepts only the last stderr line starting `gate-remote-outputs: `, kept as it is heard so a stdout flood cannot push it out, and echoes it like any box line. It must be `gate-remote-outputs: 0` or `gate-remote-outputs: <n> <key>-<this run's nonce>.tar.zst` with n above 0.
 
@@ -1771,7 +1773,7 @@ Each verb is one ssh call today, and the call's cost is its connection, not its 
 
 A routed run therefore moves to one long-lived connection carrying every verb, `gate box serve`, and the per-call client stays until that lands (GATE-70 holds the measurement, and GATE-109 the work).
 
-The payload is one base64 word (standard alphabet, padded) of UTF-8 JSON holding the wrapper's keys: `Key`, `Bare`, `Work`, `Lock`, `Index`, `OutputFolder` and `Job`, and for `run` also `Command`, `Subfolder`, `Identity`, `Outputs`, `Nonce`, `OutputsFull`, `Timeout` and `Host`, and for `outputs` also `Name`. `inflight` reads only `Root`.
+The payload is one base64 word (standard alphabet, padded) of UTF-8 JSON, sent as the first line of the call's stdin (never on a command line), holding the wrapper's keys: `Key`, `Bare`, `Work`, `Lock`, `Index`, `OutputFolder` and `Job`, and for `run` also `Command`, `Subfolder`, `Identity`, `Outputs`, `Nonce`, `OutputsFull`, `Timeout` and `Host`, and for `outputs` also `Name`. `inflight` reads only `Root`.
 
 `preflight` also reads an optional `Needs`, an object of tool name to minimum version text (`""` for any version), which the PC builds with `remote::payload::preflight_word` from the tools it wants probed; it is omitted when there are none, so a payload without needs is the same bytes as before.
 
@@ -1783,7 +1785,7 @@ For `run` the payload also needs a `Snapshot` key: exactly 40 lowercase hex char
 
 The value is empty for a missing key or JSON null, the string as given with control characters escaped, and compact JSON for any other non-string. Two differences from the wrapper are deliberate: the echoed value has its control characters escaped, and the check is stricter than the wrapper's .NET `$`, which accepts a trailing newline.
 
-Every path comes from the payload and nothing is written under the gate's state root; `gate box` takes no `--state-dir`. Test seams are `test-seams`-gated flags, never environment variables, and sit before the verb (`gate box --test-... run <payload>`) in a `BoxSeams` struct on `BoxRequest`, apart from the `gate run` seams, so `--test-print-request` is unchanged.
+Every path comes from the payload and nothing is written under the gate's state root; `gate box` takes no `--state-dir`. Test seams are `test-seams`-gated flags, never environment variables, and sit before the verb (`gate box --test-... run --stdin`) in a `BoxSeams` struct on `BoxRequest`, apart from the `gate run` seams, so `--test-print-request` is unchanged.
 
 The box seams go in any order before the verb, each also as `--<seam>=<value>`. `--test-heartbeat-ms <n>` sets the period of the command heartbeat, and `--test-box-console fail-before` makes the command's UTF-8 console fail before the command starts (the only accepted value, else `gate: --test-box-console must be fail-before, got '<value>'`).
 
@@ -1809,7 +1811,9 @@ The box's own git calls and tool restore do not get these settings.
 
 The servers a run starts live in its job and are ended at its end, so every routed build starts its own nodes and compiler server; none is kept warm between runs.
 
-`git` and `dotnet` are found with the gate's own program resolution, which never searches the current folder. A payload that is not base64 JSON prints `gate: box payload is not base64 JSON: <reason>` on stderr and exits 2.
+`git` and `dotnet` are found with the gate's own program resolution, which never searches the current folder.
+
+The box reads the request, before the verb and before any lock, as the first line of stdin, ended by its newline or the end of input (one newline, and a carriage return before it, is not part of it), reading at most 16 MiB and never waiting past the newline; it has no deadline, as a client that stops sending is ended by its own watchdog. All of these print one line on stderr and exit 2: no request, `gate: the box request is missing on standard input`; 16 MiB without a newline, `gate: the box request on standard input reaches 16 MiB without a newline`; stdin failing, `gate: the box request on standard input could not be read: <error>`; a line that is not UTF-8 or a payload that is not base64 JSON, `gate: box payload is not base64 JSON: <reason>`.
 
 Built verbs:
 
@@ -2014,7 +2018,7 @@ Built verbs:
 
   A payload with `Outputs` globs adds these steps (GATE-44):
 
-  - Once the heartbeat beats and before the checkout, `run` reads the PC's manifest from stdin up to its first newline (at most 64 MiB; a manifest that cannot be read is said only once the command has passed), then removes the old archives from `OutputFolder`: each file named `<key>-<32 lower-case hex digits>.tar.zst`, whatever the key, last written more than a day ago, and no other file.
+  - Once the heartbeat beats and before the checkout, `run` reads the PC's manifest from stdin, the line after the request, up to its newline (at most 64 MiB; a manifest that cannot be read is said only once the command has passed), then removes the old archives from `OutputFolder`: each file named `<key>-<32 lower-case hex digits>.tar.zst`, whatever the key, last written more than a day ago, and no other file.
 
     An archive already gone counts as removed; one that cannot be removed, or a folder that cannot be listed, is said (`gate: remote could not remove the old outputs archive <path>`, `gate: remote could not list the old outputs archives in <folder>`) and fails nothing.
   - Just before the command, unless `OutputsFull`, it lists the files under the globs (size and last write); a listing that fails is said (`gate: remote could not list the outputs before the command: <error>`) and leaves every file counting as changed.
@@ -2313,9 +2317,11 @@ A Rust integration suite drives the built `gate.exe` through its CLI and reads o
 
   A second helper, `fake-ssh`, stands in for ssh in the remote client's cases (`--test-remote-ssh`). Its `ok` step puts the words of the variable `GATE_FAKE_SSH_BOX_SEAMS` before the verb of a `gate box run` call, so a case gives the box its seams; the variable `GATE_FAKE_SSH_PREFLIGHT_SEAMS` does the same for a `gate box preflight` call.
 
+  It reads a box call from the last three words of the line, `box <verb> --stdin`, and the box it runs inherits its stdin, so the request the client feeds reaches the box; a box call whose last word is not `--stdin` is refused by name.
+
   Its steps are `ok`, `hold`, `version`, `boot <time>` (as `version`, for the box's boot line), `no-boot` (drops the box's boot line), `drop` (exits 255 at once, writing nothing), `exit`, `fail-banner`, `fail-other`, `out-then-drop`.
 
-  They also include `ok-then-out <line>` (as `ok`, then writes the line on stderr, as the box says its outputs line), `say-exit <n> <line>` (writes the line on stderr and exits `<n>`, as a call that fails with a line of its own does).
+  They also include `ok-then-out <line>` (as `ok`, then writes the line on stdout), `say-exit <n> <line>` (writes the line on stderr and exits `<n>`, as a call that fails with a line of its own does).
 
   They also include `flood <n>`, `say-hold <word> <path>` `progress-ok <n>`, `truncate <n>` (passes `<n>` stdout bytes, writes `Connection timed out during banner exchange` on stderr and exits 255), `garbage <n>` and `bytes-hold <n> <path>`.
 
@@ -2355,7 +2361,8 @@ When a run that passed did not fit its slot, the gate says how many cores the co
 
 What no ruling settles yet, with the issue that owns it:
 
-- **The box protocol and `remote.json`'s next format** (GATE-10): verbs, payload and transport between PC and builder, whether ssh keeps cmd.exe as the builder's shell, and the routing file's version and matcher.- **A prediction a run has passed** (GATE-14): what a holder past its p90 reports in wait lines, and whether the critical gate re-prices its shadow end and closes or shrinks the lent window when a blocker overruns.
+- **The box protocol and `remote.json`'s next format** (GATE-10): verbs, payload and transport between PC and builder, whether ssh keeps cmd.exe as the builder's shell, and the routing file's version and matcher.
+- **A prediction a run has passed** (GATE-14): what a holder past its p90 reports in wait lines, and whether the critical gate re-prices its shadow end and closes or shrinks the lent window when a blocker overruns.
 - **Which members the run's end spares** (GATE-205): the run's end spares every job member whose image is `gate.exe`, whatever gate it is; GATE-205 tracks hardening that judgement.
 - **The surfaces of `gate status` and `gate drain`** (no issue yet). Install stays a script (`tools/install.ps1`) until a reason for a `gate install` subcommand appears.
 - **The Windows facilities to spike before their slice** (GATE-5): other users' command lines (B1), the desktop-app breakaway policy (X1) and nested jobs, each of which changes kill behaviour if it silently fails.
