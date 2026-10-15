@@ -6,16 +6,14 @@
 
 - [ ] GATE-46 Remote slice 5: drained remote cutover and deleting the remote.ps1 bridge — Urgent · Remote
 - [ ] GATE-19 Remote: send a repo's declared sibling worktrees with a routed run — Urgent · Remote
+- [/] GATE-22 Remote: send a routed command's ignored inputs to the builder, compressed — Urgent · Remote
 - [ ] GATE-206 A per-repo toolchain manifest: check and prepare builders, and check a fresh clone — Urgent · Remote
 - [ ] GATE-192 Turn routing back on, on the Rust remote client — High · Remote
 - [/] GATE-249 Siblings C: the client snapshots, checks parity and pushes each repo — High · Remote
 - [ ] GATE-251 Siblings E: outputs, install rewrite and stale-line wording for a pair — High · Remote
 - [ ] GATE-252 Siblings F: docs for routed sibling pairs — High · Remote
-- [ ] GATE-22 Remote: send a routed command's ignored inputs to the builder, compressed — High · Remote
 - [!] GATE-214 Toolchain 7: roll the manifest out to the gated repos — High · Remote
-- [ ] GATE-228 Merge feat/toolchain-manifest (#252) — High · Remote
 - [/] GATE-231 Run a routed command that needs a desktop in the builder's logged-on session — High · Remote
-- [/] GATE-282 Send each box request on stdin instead of the ssh command line — High · Remote
 
 ## Remote
 
@@ -56,6 +54,10 @@
 - [ ] GATE-296 Name the box's own reason when a preflight exits 2 and the run falls back
 - [ ] GATE-297 Bound each field of a box request, now that the command line no longer does
 - [ ] GATE-298 Merge feat/desktop-session (#305)
+- [ ] GATE-300 Find whether a routed run call's stdin read end leaks into the client's later children
+- [ ] GATE-301 Make an empty environment block agree between EnvironmentBlock::new and from_wide
+- [ ] GATE-302 Make a_pair_fetch_stopped_at_its_cap_names_its_repo's cleanup hold on a loaded PC
+- [ ] GATE-303 Make the box-kill note case hold on a loaded PC
 
 ## Cutover sweep
 
