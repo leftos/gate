@@ -7,16 +7,17 @@
 - [ ] GATE-46 Remote slice 5: drained remote cutover and deleting the remote.ps1 bridge — Urgent · Remote
 - [ ] GATE-19 Remote: send a repo's declared sibling worktrees with a routed run — Urgent · Remote
 - [ ] GATE-206 A per-repo toolchain manifest: check and prepare builders, and check a fresh clone — Urgent · Remote
-- [ ] GATE-281 Suite: an outputs case hung 600 s in the full suite on feat b903f50, holding its push — Urgent · Remote
+- [/] GATE-281 Suite: an outputs case hung 600 s in the full suite on feat b903f50, holding its push — Urgent · Remote
 - [ ] GATE-192 Turn routing back on, on the Rust remote client — High · Remote
-- [ ] GATE-249 Siblings C: the client snapshots, checks parity and pushes each repo — High · Remote
-- [ ] GATE-250 Siblings D: sync back every repo of a pair, all or nothing — High · Remote
+- [/] GATE-249 Siblings C: the client snapshots, checks parity and pushes each repo — High · Remote
+- [/] GATE-250 Siblings D: sync back every repo of a pair, all or nothing — High · Remote
 - [ ] GATE-251 Siblings E: outputs, install rewrite and stale-line wording for a pair — High · Remote
 - [ ] GATE-252 Siblings F: docs for routed sibling pairs — High · Remote
 - [ ] GATE-22 Remote: send a routed command's ignored inputs to the builder, compressed — High · Remote
 - [!] GATE-214 Toolchain 7: roll the manifest out to the gated repos — High · Remote
 - [ ] GATE-228 Merge feat/toolchain-manifest (#252) — High · Remote
-- [ ] GATE-231 Run a routed command that needs a desktop in the builder's logged-on session — High · Remote
+- [/] GATE-231 Run a routed command that needs a desktop in the builder's logged-on session — High · Remote
+- [/] GATE-282 Send each box request on stdin instead of the ssh command line — High · Remote
 
 ## Remote
 
@@ -29,7 +30,6 @@
 - [ ] GATE-159 Box: choose the dotnet tool restore cap from its logged times
 - [ ] GATE-195 Check git and gate push's ssh against the worktree, as the remote client checks ssh and dotnet
 - [ ] GATE-273 Read a dotnet tools manifest at the repo root as a toolchain pin
-- [ ] GATE-279 Spike: a session-1 process the box can own (job, handles, pipe DACL, D3D)
 - [ ] GATE-235 Builder: folders above the work folder and on PATH may be writable by any local user
 - [ ] GATE-240 gate push and install.ps1: clearer failure reasons, a language-mode check, one copy of the file helper
 - [ ] GATE-253 gate check and the box's probe: judge siblings by every routing rule; a tool that exits non-zero is not present
@@ -46,6 +46,8 @@
 - [ ] GATE-277 Router: a gate folder reached through a junction is judged by its spelling
 - [ ] GATE-278 Router: a policy for words whose paths the router cannot read (encoded commands, variables, glued options)
 - [ ] GATE-280 Router: words GATE-234's path starts now keep local that name worktree paths
+- [ ] GATE-285 Give a single-repo sync-back refusal its own outputs reason
+- [ ] GATE-286 Roll back a sibling pair's applied repos when a later write fails
 
 ## Cutover sweep
 
@@ -86,6 +88,7 @@
 - [ ] GATE-266 Check the builder's Git for Windows version before routing
 - [ ] GATE-268 Two PCs with the same worktree path share one key folder on a builder
 - [ ] GATE-269 Retire this PC's D: paths, and decide whether the router keeps its subst-drive model
+- [ ] GATE-283 Docs: a builder setup page
 
 ## No project
 
