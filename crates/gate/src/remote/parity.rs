@@ -3,7 +3,9 @@
 //! for a .NET tree with no pin, an SDK of this PC's newest major. Nothing here runs a process or reads a file: the
 //! client lists the snapshot's tree, reads its `global.json`, the builder's SDK line and this PC's SDKs, and [`need`]
 //! lists what the tree needs that the builder lacks, each a [`Need`] of its [`NeedKind`], which [`lines`] words one
-//! mismatch line each, in order. A further toolchain need, such as a workload, is one more kind in that list.
+//! mismatch line each, in order. A tool the repo's `.gate/toolchain.toml` declares and the builder lacks is a need of
+//! its own kind, which [`crate::remote::toolchain::judge`] lists; a further toolchain need, such as a workload, is one
+//! more kind in that list.
 
 use std::cmp::Ordering;
 
@@ -442,10 +444,13 @@ pub(crate) fn sdk_versions(listing: &str) -> Vec<&str> {
 }
 
 /// What a toolchain need is of.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum NeedKind {
     /// A .NET SDK, which the builder's SDK list serves.
     Sdk,
+    /// A tool the repo's `.gate/toolchain.toml` declares, which the builder's probe of it serves; `found` is what that
+    /// probe found: the version text it read, or `none` when it found no such tool.
+    Tool { found: String },
 }
 
 /// One thing a snapshot needs that the builder lacks.
@@ -491,20 +496,22 @@ fn sdk_need(pin: &Pin, available: &[String], local_major: impl FnOnce() -> u64) 
 pub(crate) fn lines(repo: &str, needs: &[Need], host: &str, available: &[String]) -> Vec<String> {
     needs
         .iter()
-        .map(|need| mismatch_line(repo, need, host, &have(need.kind, available)))
+        .map(|need| mismatch_line(repo, need, host, &have(&need.kind, available)))
         .collect()
 }
 
 /// What a builder whose SDKs are `available` has of `kind`, as a mismatch line ends in it: for an SDK, its SDKs
-/// comma-separated, `none` when it listed none.
-fn have(kind: NeedKind, available: &[String]) -> String {
+/// comma-separated, `none` when it listed none; for a tool, what its probe found.
+fn have(kind: &NeedKind, available: &[String]) -> String {
     match kind {
         NeedKind::Sdk if available.is_empty() => "none".to_owned(),
         NeedKind::Sdk => available.join(", "),
+        NeedKind::Tool { found } => found.clone(),
     }
 }
 
-/// The line said when the builder `host`, which has `have` of the need's kind, lacks `need` of `repo`.
+/// The line said when the builder `host`, which has `have` of the need's kind, lacks `need` of `repo`. Before any
+/// tool's, the client says each SDK need's; the tool needs follow in the manifest's order.
 fn mismatch_line(repo: &str, need: &Need, host: &str, have: &str) -> String {
     format!("gate: remote toolchain mismatch: {repo} needs {}; {host} has {have}", need.text)
 }
@@ -844,12 +851,12 @@ mod tests {
                 "app",
                 &sdk(".NET SDK 999.0.0 (rollForward patch)"),
                 "builder",
-                &have(NeedKind::Sdk, &owned(&["8.0.425", "10.0.100"]))
+                &have(&NeedKind::Sdk, &owned(&["8.0.425", "10.0.100"]))
             ),
             "gate: remote toolchain mismatch: app needs .NET SDK 999.0.0 (rollForward patch); builder has 8.0.425, 10.0.100"
         );
         assert_eq!(
-            mismatch_line("app", &sdk("a .NET 10 SDK"), "builder", &have(NeedKind::Sdk, &listed("none"))),
+            mismatch_line("app", &sdk("a .NET 10 SDK"), "builder", &have(&NeedKind::Sdk, &listed("none"))),
             "gate: remote toolchain mismatch: app needs a .NET 10 SDK; builder has none"
         );
     }
@@ -865,6 +872,35 @@ mod tests {
             ]
         );
         assert_eq!(lines("app", &[], "builder", &[]), Vec::<String>::new(), "no need says no line");
+    }
+
+    fn tool(text: &str, found: &str) -> Need {
+        Need {
+            kind: NeedKind::Tool { found: found.to_owned() },
+            text: text.to_owned(),
+        }
+    }
+
+    #[test]
+    fn a_tool_need_ends_in_what_the_builder_found_of_it_and_follows_the_sdk_needs() {
+        let needs = [
+            sdk("a .NET 10 SDK"),
+            tool("cargo-nextest 0.9.100 or later", "0.9.80"),
+            tool("node", "none"),
+        ];
+        assert_eq!(
+            lines("app", &needs, "builder", &owned(&["8.0.425"])),
+            [
+                "gate: remote toolchain mismatch: app needs a .NET 10 SDK; builder has 8.0.425",
+                "gate: remote toolchain mismatch: app needs cargo-nextest 0.9.100 or later; builder has 0.9.80",
+                "gate: remote toolchain mismatch: app needs node; builder has none",
+            ]
+        );
+        assert_eq!(
+            lines("app", &[tool("pwsh 7.5.0 or later", "7.4.1")], "builder", &[]),
+            ["gate: remote toolchain mismatch: app needs pwsh 7.5.0 or later; builder has 7.4.1"],
+            "a tool need does not read the SDK list"
+        );
     }
 
     #[test]

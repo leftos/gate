@@ -1688,6 +1688,292 @@ fn a_tree_that_is_not_dotnet_skips_the_parity_check() {
     assert_eq!(runs(&case), (0, 1), "the command ran once, on the builder: {outcome:?}");
 }
 
+/// The repo's toolchain manifest, as a tool case writes it.
+const MANIFEST: &str = ".gate/toolchain.toml";
+/// The variable whose words the stand-in gives the box's `preflight` before its verb.
+const PREFLIGHT_SEAMS_VARIABLE: &str = "GATE_FAKE_SSH_PREFLIGHT_SEAMS";
+/// The preflight seams of a tool case whose probes and SDK list must answer: bounds no run reaches, so only an answer
+/// ends them and no load changes what the run says.
+const ANSWERING: &str = "--test-probe-limit-ms 3600000 --test-dotnet-limit-ms 3600000";
+
+/// Whether `folder` holds the program `program` under any of the extensions a `PATHEXT` search tries.
+fn holds(folder: &Path, program: &str) -> bool {
+    ["exe", "cmd", "bat", "com"]
+        .iter()
+        .any(|extension| folder.join(format!("{program}.{extension}")).is_file())
+}
+
+/// The `PATH` of a tool case's builder: a folder in the case's `ssh` folder first, holding a `dotnet.cmd` that runs
+/// `dotnet` and a `<program>.cmd` for each `(program, body)` of `tools`, each after `@echo off`; then this PC's own
+/// `PATH` without the folders holding a `dotnet` or a program of `missing`, so the builder finds none of those. A
+/// folder it would drop for a missing tool that also holds a `git`, a `pwsh` or an `ssh` the run itself needs fails the
+/// case with why, since taking the tool off the builder's `PATH` would take those too.
+fn box_path_with_tools(case: &Case, dotnet: &str, tools: &[(&str, &str)], missing: &[&str]) -> OsString {
+    let stub = case.folder().join("ssh").join("stub-tools");
+    fs::create_dir_all(&stub).expect("the stub folder can be made");
+    fs::write(stub.join("dotnet.cmd"), format!("@echo off\r\n{dotnet}")).expect("the stub dotnet can be written");
+    for (program, body) in tools {
+        fs::write(stub.join(format!("{program}.cmd")), format!("@echo off\r\n{body}")).expect("a tool stub can be written");
+    }
+    let own = std::env::var_os("PATH").expect("PATH is set");
+    #[expect(
+        clippy::panic,
+        reason = "a folder that would take a git, a pwsh or an ssh off the builder's PATH fails the case saying so"
+    )]
+    let kept = std::env::split_paths(&own).filter(|folder| {
+        if holds_dotnet(folder) {
+            return false;
+        }
+        let Some(program) = missing.iter().find(|program| holds(folder, program)) else {
+            return true;
+        };
+        if let Some(other) = ["git", "pwsh", "ssh"].into_iter().find(|other| holds(folder, other)) {
+            panic!(
+                "{} holds both {program} and {other}: the case cannot take {program} off the builder's PATH without taking {other}",
+                folder.display()
+            );
+        }
+        false
+    });
+    std::env::join_paths(std::iter::once(stub).chain(kept)).expect("the folders join into a PATH")
+}
+
+/// The mismatch line of a case whose builder lacks `need` and has `has` of it.
+fn mismatch_of(case: &Case, need: &str, has: &str) -> String {
+    let repo = repo_name(&case.folder().file_name().expect("the case folder has a name").to_string_lossy());
+    format!("gate: remote toolchain mismatch: {repo} needs {need}; builder has {has}")
+}
+
+/// Whether `line` is a mismatch line or the parity line.
+fn is_parity_line(line: &str) -> bool {
+    line.starts_with("gate: remote toolchain mismatch: ") || line == PARITY_LINE
+}
+
+/// A routed run of a case whose builder, given the `PATH` `box_path`, lacks what the case's tree needs: it falls back
+/// `parity` after the preflight alone, so nothing is pushed, says the mismatch lines `said` and no other, in their order,
+/// then the one parity line, on the console and, but the parity line, in the log, and runs the command here once.
+fn a_toolchain_refusal(case: &Case, box_path: &OsString, said: &[String]) -> Outcome {
+    let steps = ssh_steps(case, "ssh", &["ok", "ok"]);
+    let mut gate = client_gate(case, "out.log", &steps, &[r".\tool.exe", "mark", RAN, "out", "ran"]);
+    gate.env("PATH", box_path).env(PREFLIGHT_SEAMS_VARIABLE, ANSWERING);
+
+    let (pid, outcome) = finish_with_pid(gate);
+
+    assert_eq!(outcome.code, Some(0), "the run here passed: {outcome:?}");
+    let events = own(case, pid);
+    assert_eq!(fallbacks(&events), ["parity"], "{outcome:?}");
+    let want: Vec<&str> = said.iter().map(String::as_str).chain([PARITY_LINE]).collect();
+    let console: Vec<&str> = outcome.stderr.lines().filter(|line| is_parity_line(line)).collect();
+    assert_eq!(console, want, "{outcome:?}");
+    let log = fs::read_to_string(case.folder().join("out.log")).expect("the log was written");
+    let logged: Vec<&str> = log.lines().filter(|line| line.starts_with("gate: remote toolchain mismatch: ")).collect();
+    assert_eq!(logged, said, "{log}");
+    assert_eq!(calls(&steps), ["preflight"], "the preflight alone reached the builder");
+    assert_eq!(builder_ref(case, &format!("refs/gate/{}", key_of(&events))), "", "nothing was pushed");
+    assert_eq!(runs(case), (1, 0), "the command ran once, here: {outcome:?}");
+    outcome
+}
+
+/// A routed run of a case whose builder, given the `PATH` `box_path` and the preflight seams `seams`, serves what the
+/// case's tree needs: it goes remote with no mismatch line, and runs the command once, on the builder.
+fn a_toolchain_served(case: &Case, box_path: &OsString, seams: &str) -> Outcome {
+    let steps = ssh_steps(case, "ssh", &["ok", "ok"]);
+    let mut gate = client_gate(case, "out.log", &steps, &[r".\tool.exe", "mark", RAN, "out", "ran there"]);
+    gate.env("PATH", box_path).env(PREFLIGHT_SEAMS_VARIABLE, seams);
+
+    let (pid, outcome) = finish_with_pid(gate);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(!outcome.stderr.lines().any(is_parity_line), "{outcome:?}");
+    assert_eq!(fallbacks(&own(case, pid)), Vec::<&str>::new(), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "run"]);
+    assert_eq!(runs(case), (0, 1), "the command ran once, on the builder: {outcome:?}");
+    outcome
+}
+
+/// A builder that finds no tool the manifest declares is refused `parity`, though the tree is no .NET tree, which the
+/// SDK check skips.
+#[test]
+fn a_tool_the_builder_lacks_is_refused_parity_in_a_tree_that_is_not_dotnet() {
+    let case = client_case("client-tool-missing");
+    write(&case, MANIFEST, "[tools]\npnpm = \"10\"\n");
+    let box_path = box_path_with_tools(&case, &listing(&[BUILDER_SDK]), &[], &["pnpm"]);
+
+    a_toolchain_refusal(&case, &box_path, &[mismatch_of(&case, "pnpm 10.0.0 or later", "none")]);
+}
+
+#[test]
+fn a_tool_older_than_the_manifest_s_minimum_is_refused_parity() {
+    let case = client_case("client-tool-too-old");
+    write(&case, MANIFEST, "[tools]\ncargo-nextest = \"0.9.100\"\n");
+    let nextest = "echo cargo-nextest 0.9.80 (abc 2026-01-01)\r\n";
+    let box_path = box_path_with_tools(&case, &listing(&[BUILDER_SDK]), &[("cargo-nextest", nextest)], &[]);
+
+    a_toolchain_refusal(&case, &box_path, &[mismatch_of(&case, "cargo-nextest 0.9.100 or later", "0.9.80")]);
+}
+
+/// The SDK's mismatch line comes first, then each tool's in the manifest's order, not the names', then one parity line.
+#[test]
+fn the_sdk_s_mismatch_line_comes_before_the_tools_in_the_manifest_s_order() {
+    let case = client_case("client-tool-order");
+    write(&case, "global.json", r#"{"sdk": {"version": "999.0.0"}}"#);
+    write(&case, "src/App/App.csproj", "<Project />\n");
+    write(&case, MANIFEST, "[tools]\npnpm = \"10\"\ncargo-nextest = \"0.9.100\"\n");
+    let nextest = "echo cargo-nextest 0.9.80 (abc 2026-01-01)\r\n";
+    let box_path = box_path_with_tools(&case, &listing(&[BUILDER_SDK]), &[("cargo-nextest", nextest)], &["pnpm"]);
+
+    a_toolchain_refusal(
+        &case,
+        &box_path,
+        &[
+            mismatch_of(&case, ".NET SDK 999.0.0 (rollForward patch)", BUILDER_SDK),
+            mismatch_of(&case, "pnpm 10.0.0 or later", "none"),
+            mismatch_of(&case, "cargo-nextest 0.9.100 or later", "0.9.80"),
+        ],
+    );
+}
+
+#[test]
+fn a_tool_the_builder_serves_goes_remote() {
+    let case = client_case("client-tool-served");
+    write(&case, MANIFEST, "[tools]\ncargo-nextest = \"0.9.100\"\npnpm = \"\"\n");
+    let nextest = "echo cargo-nextest 0.9.148 (abc 2026-10-07)\r\n";
+    let tools = [("cargo-nextest", nextest), ("pnpm", "echo 10.0.0\r\n")];
+    let box_path = box_path_with_tools(&case, &listing(&[BUILDER_SDK]), &tools, &[]);
+
+    let outcome = a_toolchain_served(&case, &box_path, ANSWERING);
+
+    assert!(!outcome.stderr.contains("did not probe"), "{outcome:?}");
+}
+
+/// A tool the builder found but whose version it could not read is not checked against its minimum: it is skipped with
+/// its line, and the run goes remote.
+#[test]
+fn a_tool_found_with_no_readable_version_is_skipped_with_its_line() {
+    let case = client_case("client-tool-present");
+    write(&case, MANIFEST, "[tools]\npnpm = \"10\"\n");
+    let box_path = box_path_with_tools(&case, &listing(&[BUILDER_SDK]), &[("pnpm", "echo pnpm, no version here\r\n")], &[]);
+
+    let outcome = a_toolchain_served(&case, &box_path, ANSWERING);
+
+    let skipped = "gate: builder did not probe pnpm: found, version not readable; not checking it";
+    assert!(outcome.stderr.lines().any(|line| line == skipped), "{skipped}: {outcome:?}");
+}
+
+/// A builder whose SDK list cannot be read says no sdks line, which skips the SDK check; its tools are still checked.
+#[test]
+fn a_builder_with_no_sdks_line_still_has_its_tools_checked() {
+    let case = client_case("client-tool-no-sdks");
+    write(&case, "src/App/App.csproj", "<Project />\n");
+    write(&case, MANIFEST, "[tools]\npnpm = \"10\"\n");
+    let box_path = box_path_with_tools(&case, "exit /b 3\r\n", &[], &["pnpm"]);
+
+    a_toolchain_refusal(&case, &box_path, &[mismatch_of(&case, "pnpm 10.0.0 or later", "none")]);
+}
+
+/// Each tool the run cannot check is skipped with its line, and the run goes remote: a bad entry, a tool the builder's
+/// probe does not answer for in its 1 s bound, `godot`, which no probe reads, an unknown name, and a name that is no
+/// tool name at all. Only the probe's bound ends the hanging one, and no other line waits on a probe, so no load
+/// changes what the run says.
+#[test]
+fn each_tool_the_run_cannot_check_is_skipped_with_its_line_and_the_run_goes_remote() {
+    let case = client_case("client-tool-skipped");
+    write(
+        &case,
+        MANIFEST,
+        "[tools]\nffmpeg = \"x\"\nnode = \"24\"\ngodot = \"4.7\"\nnodejs = \"24\"\n\"No de\" = \"1\"\n",
+    );
+    let go = Go(case.folder().join("ssh").join("node-go"));
+    let held = case.folder().join("ssh").join("node-held");
+    let hang = format!("\"{FAKE_TOOL}\" wait \"{}\" >\"{}\"\r\n", go.path().display(), held.display());
+    let box_path = box_path_with_tools(&case, &listing(&[BUILDER_SDK]), &[("node", hang.as_str())], &[]);
+
+    let outcome = a_toolchain_served(&case, &box_path, "--test-probe-limit-ms 1000 --test-dotnet-limit-ms 3600000");
+
+    let skipped = [
+        "gate: .gate/toolchain.toml: tools.ffmpeg is not a version: \"x\"; skipping it",
+        "gate: builder did not probe node: no answer in 1 s; not checking it",
+        "gate: builder did not probe godot: no probe for godot; not checking it",
+        "gate: .gate/toolchain.toml names unknown tool nodejs; skipping it",
+        "gate: .gate/toolchain.toml names unknown tool \"No de\"; skipping it",
+    ];
+    let said: Vec<&str> = outcome
+        .stderr
+        .lines()
+        .filter(|line| line.starts_with("gate: .gate/toolchain.toml") || line.starts_with("gate: builder did not probe "))
+        .collect();
+    assert_eq!(said, skipped, "{outcome:?}");
+    // A stub that started holds its output file open until its job's kill ends it; one the kill came first never made it.
+    if held.exists() {
+        wait_until_closed(&held);
+    }
+}
+
+/// A manifest that is not TOML is skipped whole with its line, and the run goes remote.
+#[test]
+fn an_unreadable_manifest_is_skipped_with_its_line_and_the_run_goes_remote() {
+    let case = client_case("client-tool-unreadable");
+    write(&case, MANIFEST, "[tools\npnpm = \"10\"\n");
+    let box_path = box_path_with_tools(&case, &listing(&[BUILDER_SDK]), &[], &[]);
+
+    let outcome = a_toolchain_served(&case, &box_path, ANSWERING);
+
+    let said: Vec<&str> = outcome
+        .stderr
+        .lines()
+        .filter(|line| line.starts_with("gate: .gate/toolchain.toml"))
+        .collect();
+    assert!(
+        said.len() == 1 && said[0].starts_with("gate: .gate/toolchain.toml: line 1, column ") && said[0].ends_with("; skipping it"),
+        "{outcome:?}"
+    );
+}
+
+/// The manifest is found at the repo root whatever the letter case of its folder and file names.
+#[test]
+fn a_manifest_named_in_another_case_is_read() {
+    let case = client_case("client-tool-manifest-case");
+    write(&case, ".Gate/Toolchain.TOML", "[tools]\npnpm = \"10\"\n");
+    let box_path = box_path_with_tools(&case, &listing(&[BUILDER_SDK]), &[], &["pnpm"]);
+
+    a_toolchain_refusal(&case, &box_path, &[mismatch_of(&case, "pnpm 10.0.0 or later", "none")]);
+}
+
+/// The manifest is read from the snapshot, which carries the worktree's uncommitted edits: the committed manifest
+/// declares nothing, the edit a tool the builder lacks.
+#[test]
+fn an_uncommitted_manifest_edit_is_read() {
+    let case = client_case("client-tool-uncommitted");
+    write(&case, MANIFEST, "[tools]\n");
+    git(&case, &["add", "-A"]);
+    git(&case, &["commit", "--quiet", "-m", "no tools"]);
+    write(&case, MANIFEST, "[tools]\npnpm = \"10\"\n");
+    let box_path = box_path_with_tools(&case, &listing(&[BUILDER_SDK]), &[], &["pnpm"]);
+
+    a_toolchain_refusal(&case, &box_path, &[mismatch_of(&case, "pnpm 10.0.0 or later", "none")]);
+}
+
+/// A Ctrl+C raised just before the manifest is read ends the run as an interrupt before the preflight: nothing reaches
+/// the builder, and the command runs nowhere.
+#[test]
+fn a_ctrl_c_at_the_manifest_read_ends_the_run_before_the_preflight() {
+    let case = client_case("client-tool-ctrl-c");
+    write(&case, MANIFEST, "[tools]\npnpm = \"10\"\n");
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+    let tuned = Tuned {
+        extra: &["--test-remote-interrupt-at", "manifest"],
+        ..Tuned::default()
+    };
+    let gate = client_gate_tuned(&case, "out.log", &steps, &tuned, &[r".\tool.exe", "mark", RAN, "out", "ran"]);
+
+    let outcome = finish(gate);
+
+    assert_eq!(outcome.code, Some(CONTROL_C_EXIT), "{outcome:?}");
+    assert_eq!(calls(&steps), Vec::<String>::new(), "nothing reached the builder, so nothing was pushed");
+    assert!(!outcome.stderr.contains("gate: .gate/toolchain.toml"), "{outcome:?}");
+    assert_eq!(runs(&case), (0, 0), "the command ran nowhere: {outcome:?}");
+}
+
 #[test]
 fn a_builder_version_holding_escapes_is_refused_in_an_escaped_line() {
     let case = client_case("client-version-escaped");

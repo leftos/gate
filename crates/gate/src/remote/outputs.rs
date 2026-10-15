@@ -24,7 +24,7 @@ use windows_sys::Win32::Storage::FileSystem::{
 
 use super::RemoteCall;
 use super::client::{self, Attempt, Called, End, RawSink};
-use super::git::FAILURE_BYTES;
+use super::git::{FAILURE_BYTES, first_bytes};
 use super::install::{self, Fetched};
 use super::payload::Location;
 use super::watchdog::Cut;
@@ -437,7 +437,7 @@ pub(super) fn judged(attempt: &mut Attempt<'_, '_>, archive: &Archive, called: &
     }
     if called.status != 0 {
         let reason = match &called.last_error {
-            Some(line) => client::first_bytes(line, FAILURE_BYTES).to_owned(),
+            Some(line) => first_bytes(line, FAILURE_BYTES).to_owned(),
             None => format!("the outputs call failed (status {})", called.status),
         };
         return unfetched(attempt, archive, &reason, End::Status(1));

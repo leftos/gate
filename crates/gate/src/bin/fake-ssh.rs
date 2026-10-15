@@ -10,7 +10,8 @@
 //! old gate, it says `gate 0.0.0-old` and exits 0.
 //!
 //! `ok` runs `<gate> box <verb> <payload>` with the gate the variable `GATE_FAKE_SSH_GATE` names, a `run` call given
-//! the words of the variable `GATE_FAKE_SSH_BOX_SEAMS`, when set, before its verb as box seams, or `git
+//! the words of the variable `GATE_FAKE_SSH_BOX_SEAMS`, when set, before its verb as box seams, and a `preflight` call
+//! those of `GATE_FAKE_SSH_PREFLIGHT_SEAMS` the same way, or `git
 //! upload-pack <path>` or `git receive-pack <path>`, or a push call's words with this PC's `pwsh`, its `LOCALAPPDATA`
 //! the folder named as the host, the word before the line, in the folder the variable `GATE_FAKE_SSH_BUILDERS` names,
 //! made when missing, fed this process's standard input, which it reads whole first and keeps as `<steps file>.input`;
@@ -243,12 +244,12 @@ fn variable(name: &str) -> Result<String, String> {
     std::env::var(name).map_err(|error| format!("{name}: {error}"))
 }
 
-/// The box seams a `run` call's gate is given before its verb: the words of the variable `GATE_FAKE_SSH_BOX_SEAMS`,
-/// none when it is unset.
-fn box_seams() -> Result<String, String> {
-    match std::env::var("GATE_FAKE_SSH_BOX_SEAMS") {
+/// The box seams a call's gate is given before its verb: the words of the variable `name`, `GATE_FAKE_SSH_BOX_SEAMS`
+/// for a `run` call and `GATE_FAKE_SSH_PREFLIGHT_SEAMS` for a preflight, none when it is unset.
+fn seams_of(name: &str) -> Result<String, String> {
+    match std::env::var(name) {
         Err(std::env::VarError::NotPresent) => Ok(String::new()),
-        read => read.map_err(|error| format!("GATE_FAKE_SSH_BOX_SEAMS: {error}")),
+        read => read.map_err(|error| format!("{name}: {error}")),
     }
 }
 
@@ -365,8 +366,13 @@ impl<'a> BoxCall<'a> {
         }
         let mut command = Command::new(variable("GATE_FAKE_SSH_GATE")?);
         command.arg("box");
-        if self.verb == "run" {
-            command.args(box_seams()?.split_whitespace());
+        let seams = match self.verb {
+            "run" => Some("GATE_FAKE_SSH_BOX_SEAMS"),
+            "preflight" => Some("GATE_FAKE_SSH_PREFLIGHT_SEAMS"),
+            _ => None,
+        };
+        if let Some(name) = seams {
+            command.args(seams_of(name)?.split_whitespace());
         }
         command.args([self.verb, self.payload]);
         Ok(command)

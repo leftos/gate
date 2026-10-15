@@ -1275,11 +1275,11 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
   - **Preflight.** `gate box preflight` over ssh. Status 255, ssh's own status for a lost connection, says `gate: remote <host> unreachable: <last stderr line>` and falls back `unreachable`; the line is the last `\r` update of the last stderr line, its first 4 KiB, escaped (Escaping, below). Status 9009 or 2 (no `gate box` verb there) says `gate: not routed: <host> has no gate box that takes this run (preflight status <n>)` and falls back `version`.
 
     Any other non-zero status says `gate: preparing <builder root> on <host> failed (status <n>)` and ends the run with that status. A reported version text other than this PC's whole one, build id included, says `gate: not routed: <host> runs gate <theirs|unknown>, this PC <ours>; run gate push` and falls back `version`; the builder's version is its first 4 KiB, escaped.
-  - **Parity.** After the preflight and before the push, `remote/parity.rs` checks that the builder's `gate: remote sdks` line (from the preflight) has what the snapshot needs. A builder with no sdks line, or a tree that is not .NET (no `global.json`, `.sln`, `.slnx` or `.csproj` anywhere in the snapshot), skips the check.
+  - **Parity.** After the preflight and before the push, `remote/parity.rs` checks that the builder's `gate: remote sdks` line (from the preflight) has what the snapshot needs. A builder with no sdks line, or a tree that is not .NET (no `global.json`, `.sln`, `.slnx` or `.csproj` anywhere in the snapshot), skips the SDK part of the check; the tools of the repo's `.gate/toolchain.toml` are judged either way (Toolchain manifest, below).
 
     A lacking builder says `gate: remote toolchain mismatch: <repo> needs <need>; <host> has <sdks>` once for each need, in the order the needs are listed, then a single `gate: remote <host> parity; running here`, and falls back `parity` (status 75).
 
-    The only kind of need so far is the SDK, so there is one line; each kind words the builder's side of its own line (for an SDK, its SDKs, or `none`).
+    A need is an SDK or a tool the manifest declares; each kind words the builder's side of its own line (for an SDK, its SDKs, or `none`; for a tool, the version the builder found, or `none`). The SDK needs come first, then the tools' in the manifest's order.
 
     `<need>` is `.NET SDK <version> (rollForward <policy>)` for a pin, the policy defaulting to `patch`, or `a .NET <major> SDK` without one, where the major is that of this PC's newest SDK (none listed: no check). A pin is met by dotnet's own rule for the nine rollForward policies and `allowPrerelease`, versions read as `x.y.znn` (feature band and patch).
 
@@ -1319,15 +1319,25 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
     The source of what a repo needs is either this PC's own workload list or a scan of the snapshot's project files; the choice is made after measuring what `dotnet workload list` costs per preflight.
 
-    **Toolchain manifest** (GATE-206, GATE-209): a repo's `.gate/toolchain.toml` declares what a routed run's builder must have beyond the .NET SDK, and `remote/toolchain.rs` reads it as data from text the caller hands over. [`gate check`](#gate-check) reads it from the worktree on disk and says what this PC lacks; no routed run reads it yet: the preflight's check against it is not built, so a manifest changes nothing a run does.
+    **Toolchain manifest** (GATE-206, GATE-209): a repo's `.gate/toolchain.toml` declares what a routed run's builder must have beyond the .NET SDK, and `remote/toolchain.rs` reads it as data from text the caller hands over. [`gate check`](#gate-check) reads it from the worktree on disk and says what this PC lacks; a routed run with parity reads it from the snapshot's git tree and refuses the route when the builder lacks a tool it declares (below).
 
     `toolchain::meets` compares a found version with a minimum. A repo's sibling worktrees are not declared here but in `.gate/siblings.toml` ([Sibling worktrees](#routing)), whose problems keep a run local.
 
     The file has a `[tools]` table of `name = "version"` and a top-level `workloads` array of .NET workload ids. A version is a minimum, "this or later", written `major[.minor[.patch]]` with the missing parts 0 (`"24"` is 24.0.0), and `""` means the tool is present at any version. The known names are `rust`, `cargo-nextest`, `node`, `pnpm`, `pwsh`, `godot` and `ffmpeg`; an unknown name is kept and flagged unknown, for the consumer to skip with a line. A leading byte order mark is skipped.
 
-    A file that is not UTF-8 or does not parse is unreadable whole, and the line for it is `gate: cannot read .gate/toolchain.toml: <why>; skipping the manifest's checks`, `<why>` being `line <l>, column <c>: <toml message>` or `not valid UTF-8 (...)`.
+    A file that is not UTF-8 or does not parse is unreadable whole, and the line for it is `gate: cannot read .gate/toolchain.toml: <why>; skipping the manifest's checks`, `<why>` being `line <l>, column <c>: <toml message>` or `not valid UTF-8 (...)`. A routed run words a manifest problem its own way, `gate: .gate/toolchain.toml: <problem>; skipping it`, for a whole file that cannot be read as for a bad entry, `<problem>` escaped.
 
     A bad entry is skipped alone and named in the reader's problems: `tools.<name> is not a version: "<text>"`, `tools.<name> is not a string (TOML <type>)`, `tools is not a table (TOML <type>)`, `workloads is not an array (TOML <type>)`, `workloads[<i>] is not a string (TOML <type>)`, `workloads[<i>] is empty` and `<key> is not a key of the manifest (tools, workloads)`.
+
+    **On a routed run**, the client lists the snapshot's tree before the preflight: `git ls-tree -r -z --name-only` for the file names parity needs, and a root listing and a `.gate` listing for the manifest. The `.gate` folder and `toolchain.toml` are found ignoring letter case, and the exact-case regular file wins. The file is used only when it is a regular blob, read by its object id; a submodule, a symbolic link, a folder, or several spellings of it with none in exact case gets a skip line saying why. A repo with no manifest says nothing.
+
+    The preflight's `Needs` carry the tools the manifest declares whose names the box knows how to probe (the known names above), each with its minimum, or empty for any version. A name outside them is skipped with `gate: .gate/toolchain.toml names unknown tool <name>; skipping it` and not sent. When the tools would make the preflight call longer than cmd's 8127 characters, it goes without them, after `gate: .gate/toolchain.toml: its tools make the preflight call longer than the 8127 characters cmd takes; skipping it`.
+
+    The builder answers each tool with a `gate: remote tool <name> <version|present|missing|skipped: <why>>` line. A tool it found missing, or older than the minimum, is a need, and the route is refused as under Parity: one `gate: remote toolchain mismatch: <repo> needs <name> <min> or later; <host> has <version|none>` line per need (`<name>` alone when the manifest sets no minimum), then the parity fallback line, and the run goes local.
+
+    A tool the builder did not probe, gave no answer for, or found at a version that cannot be read against a minimum gets `gate: <host> did not probe <name>: <why>; not checking it` and is not a need. The lines come in this order: the SDK step's own, then the manifest's problem lines, then the per-tool skip lines in the manifest's order, then the mismatch lines.
+
+    A text from the manifest or the builder is escaped, and the builder's cut to 4096 bytes, so neither can forge a line. `toolchain::standing` judges a tool against what its probe found (met, too old, missing, not readable, skipped) in one place, which `gate check`'s report shares; `gate check`'s output is unchanged. `--test-remote-interrupt-at manifest` raises the interrupt just before the manifest is read.
 
     Two pins a repo already declares are read beside it, also as minimums: each tool's version in `.config/dotnet-tools.json` (the release part, so `1.0.0-beta.1` is 1.0.0; read as strict JSON, as dotnet reads it, so a comment or a trailing comma makes the file unreadable, and a tool id given twice counts once, with its last version) and the `Godot.NET.Sdk/<version>` a project file names, on its root `<Project Sdk=...>` or an `<Sdk Name="Godot.NET.Sdk" Version=...>` element directly inside it (an `<Import Sdk=...>`, a deeper `<Sdk>` element and a `min=` version are not read). `global.json` stays the SDK pin, read by `parity.rs` as above.
   - **Push.** `git push --no-verify --no-recurse-submodules --progress [--receive-pack=…] -- <host>:<builder root>/<repo>.git +<snapshot>:refs/gate/<key> [+<bridge>:refs/gate-bridge/<key>]`, with `GIT_SSH_COMMAND` carrying the ssh options. Success says `gate: pushed snapshot <8 hex> in <s> s (<size>|up to date)` and moves the local `refs/gate-remote/<key>`.
@@ -2114,7 +2124,7 @@ A Rust integration suite drives the built `gate.exe` through its CLI and reads o
 
   `--test-remote-bound-ms <n>` (whole milliseconds above 0) replaces the 30 s bound of the client's `stop` and `boot` calls.
 
-  `--test-remote-interrupt-at <preflight|run|outputs|install|sdks|stop>` makes the client raise the console interrupt itself after that call's first output byte; `install` raises it before the second file's move, so an install of one file is never interrupted, and `sdks` just before the parity check reads this PC's SDK list with `dotnet --list-sdks`; `stop` raises it at the run call's first byte and again while the stop call runs.
+  `--test-remote-interrupt-at <preflight|run|outputs|install|sdks|stop|manifest>` makes the client raise the console interrupt itself after that call's first output byte; `install` raises it before the second file's move, so an install of one file is never interrupted, and `sdks` just before the parity check reads this PC's SDK list with `dotnet --list-sdks`; `manifest` just before it reads the snapshot's `.gate/toolchain.toml`; `stop` raises it at the run call's first byte and again while the stop call runs.
 
   `--test-remote-backstop-ms <n>` (whole milliseconds above 0) replaces the run call's backstop of 5 x `--timeout` + 60 s for the client, counted from the run call's start.
 
@@ -2124,7 +2134,7 @@ A Rust integration suite drives the built `gate.exe` through its CLI and reads o
 
   With `ls-remote`, `--test-remote-timeout-ms` is that call's deadline and `--test-stall-ms` alone leaves it on the git limit. With `fetch`, the stall and ceiling seams apply to the fetch alone; with `outputs`, to the outputs fetch alone.
 
-  A value outside a seam's calls says `gate: --test-remote-watch-call must be preflight, push, run, ls-remote, fetch or outputs, got '<v>'`, and `--test-remote-interrupt-at` says `must be preflight, run, outputs, install, sdks or stop`. The five (with `--test-remote-backstop-ms`) need the transport; `--test-print-request` shows them as `testSeams.remoteBoundMs`, `remoteInterruptAt`, `remoteWatchCall`, `remoteTimeoutMs` and `remoteBackstopMs`, after `remoteRetryPauseMs`.
+  A value outside a seam's calls says `gate: --test-remote-watch-call must be preflight, push, run, ls-remote, fetch or outputs, got '<v>'`, and `--test-remote-interrupt-at` says `must be preflight, run, outputs, install, sdks, stop or manifest`. The five (with `--test-remote-backstop-ms`) need the transport; `--test-print-request` shows them as `testSeams.remoteBoundMs`, `remoteInterruptAt`, `remoteWatchCall`, `remoteTimeoutMs` and `remoteBackstopMs`, after `remoteRetryPauseMs`.
 
   `--test-remote-fetch-cap-bytes <n>` (a whole number of bytes above 0, default 4 GiB) replaces the cap on what the sync-back fetch's job may write. Refused without the transport with `gate: --test-remote-fetch-cap-bytes needs --test-remote-transport`, and a value that is not a whole number above 0 with `gate: --test-remote-fetch-cap-bytes must be a whole number above 0, got '<v>'`. `--test-print-request` does not show it.
 
@@ -2170,7 +2180,7 @@ A Rust integration suite drives the built `gate.exe` through its CLI and reads o
 
   It is copied under the names the gate classifies (`VBCSCompiler.exe`, `dotnet.exe`, `MSBuild.exe`).
 
-  A second helper, `fake-ssh`, stands in for ssh in the remote client's cases (`--test-remote-ssh`). Its `ok` step puts the words of the variable `GATE_FAKE_SSH_BOX_SEAMS` before the verb of a `gate box run` call, so a case gives the box its seams.
+  A second helper, `fake-ssh`, stands in for ssh in the remote client's cases (`--test-remote-ssh`). Its `ok` step puts the words of the variable `GATE_FAKE_SSH_BOX_SEAMS` before the verb of a `gate box run` call, so a case gives the box its seams; the variable `GATE_FAKE_SSH_PREFLIGHT_SEAMS` does the same for a `gate box preflight` call.
 
   Its steps are `ok`, `hold`, `version`, `boot <time>` (as `version`, for the box's boot line), `no-boot` (drops the box's boot line), `drop` (exits 255 at once, writing nothing), `exit`, `fail-banner`, `fail-other`, `out-then-drop`.
 

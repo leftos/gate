@@ -786,6 +786,15 @@ fn failed_line(call: &Call<'_>, status: Option<i32>, errors: &[u8], output: &[u8
 const FAILURE_LINES: usize = 10;
 pub(crate) const FAILURE_BYTES: usize = 4096;
 
+/// `text` cut to its first `most` bytes, at a character's boundary.
+pub(crate) fn first_bytes(text: &str, most: usize) -> &str {
+    let mut end = text.len().min(most);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.get(..end).unwrap_or_default()
+}
+
 /// The last [`FAILURE_LINES`] of a failed call's `lines`, each as its last carriage-return update leaves it, joined by
 /// ` | `, escaped and cut to their last [`FAILURE_BYTES`]: what a failure line carries of them. The characters are
 /// counted from the end by the width of their escapes and only those that fit are escaped, so the escaped text stays

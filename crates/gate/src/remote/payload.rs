@@ -104,7 +104,6 @@ pub(crate) fn location_word(location: &Location) -> String {
 /// The payload word of a preflight that asks the builder to probe tools: the location and `Needs`, an object of each
 /// tool's name and the minimum version the run needs of it (empty for any version), in the order of `needs`. With no
 /// needs there is no `Needs`, and the word is [`location_word`]'s.
-#[cfg_attr(not(test), expect(dead_code, reason = "the client sends no needs; unit tests exercise it"))]
 pub(crate) fn preflight_word(location: &Location, needs: &[(String, String)]) -> String {
     let mut object = location.object();
     if !needs.is_empty() {
@@ -115,6 +114,26 @@ pub(crate) fn preflight_word(location: &Location, needs: &[(String, String)]) ->
         object.insert("Needs".to_owned(), Value::Object(needs));
     }
     word(&object)
+}
+
+/// The preflight's line, as [`capped`] lets it through, and whether it left the needs out.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct PreflightLine {
+    pub line: String,
+    /// Whether the needs made the line longer than cmd takes, so it carries the location alone.
+    pub needs_dropped: bool,
+}
+
+/// The preflight's line for `location`, carrying `needs` ([`preflight_word`]) when cmd takes it so, else the location
+/// alone ([`location_word`]); `Err` with [`capped`]'s reason when cmd takes neither.
+pub(crate) fn preflight_line(location: &Location, needs: &[(String, String)]) -> Result<PreflightLine, String> {
+    match capped("preflight", line("preflight", &preflight_word(location, needs))) {
+        Ok(line) => Ok(PreflightLine { line, needs_dropped: false }),
+        Err(_) if !needs.is_empty() => {
+            capped("preflight", line("preflight", &location_word(location))).map(|line| PreflightLine { line, needs_dropped: true })
+        }
+        Err(why) => Err(why),
+    }
 }
 
 /// The payload word of the outputs call: the location and the outputs archive's `Name`, `name`.
@@ -198,7 +217,10 @@ mod tests {
     use base64::engine::general_purpose::STANDARD;
     use serde_json::{Value, json};
 
-    use super::{BOX_EXE, LINE_LIMIT, Location, RunCall, capped, job_nonce, line, location_word, preflight_word, run_nonce, run_word};
+    use super::{
+        BOX_EXE, LINE_LIMIT, Location, PreflightLine, RunCall, capped, job_nonce, line, location_word, preflight_line, preflight_word, run_nonce,
+        run_word,
+    };
 
     fn decoded(word: &str) -> Value {
         let bytes = STANDARD.decode(word).expect("the word is base64");
@@ -243,6 +265,59 @@ mod tests {
         assert_eq!(with_needs, expected);
         let order: Vec<&String> = with_needs["Needs"].as_object().expect("Needs is an object").keys().collect();
         assert_eq!(order, ["node", "cargo-nextest", "ffmpeg"], "the needs keep their order");
+    }
+
+    fn needs() -> Vec<(String, String)> {
+        ["rust", "cargo-nextest", "node", "pnpm", "pwsh", "godot", "ffmpeg"]
+            .iter()
+            .map(|name| ((*name).to_owned(), "1.2.3".to_owned()))
+            .collect()
+    }
+
+    /// A location under a root of `length` letters.
+    fn location_of(length: usize) -> Location {
+        Location::under(&format!("D:\\{}\\", "r".repeat(length)), "app", "app-1a2b3c4d", "0123456789ab")
+    }
+
+    #[test]
+    fn a_preflight_line_carries_its_needs_when_cmd_takes_it_so() {
+        let preflight = preflight_line(&location(), &needs()).expect("a short line is taken");
+        assert_eq!(
+            preflight,
+            PreflightLine {
+                line: line("preflight", &preflight_word(&location(), &needs())),
+                needs_dropped: false,
+            }
+        );
+    }
+
+    #[test]
+    fn a_preflight_line_its_needs_make_too_long_carries_the_location_alone() {
+        let length = (1..4000)
+            .find(|&length| capped("preflight", line("preflight", &preflight_word(&location_of(length), &needs()))).is_err())
+            .expect("a root that long makes the line with needs too long");
+        let location = location_of(length);
+        assert_eq!(
+            preflight_line(&location, &needs()).expect("the location alone is taken"),
+            PreflightLine {
+                line: line("preflight", &location_word(&location)),
+                needs_dropped: true,
+            }
+        );
+        assert!(
+            !preflight_line(&location_of(length - 1), &needs())
+                .expect("a root one shorter is taken")
+                .needs_dropped,
+            "the needs are dropped only past the cap"
+        );
+    }
+
+    #[test]
+    fn a_preflight_line_too_long_without_its_needs_is_err() {
+        let location = location_of(LINE_LIMIT);
+        let why = preflight_line(&location, &needs()).expect_err("the location alone is too long");
+        assert!(why.starts_with("the preflight call is "), "{why}");
+        assert_eq!(preflight_line(&location, &[]).expect_err("no needs to drop"), why);
     }
 
     #[test]

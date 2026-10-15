@@ -185,9 +185,10 @@ pub struct TestSeams {
     pub remote_retry_pause_ms: Option<u64>,
     /// How long the remote client's `stop` call may take before its ssh is killed, in milliseconds.
     pub remote_bound_ms: Option<u64>,
-    /// The call of the remote client, `preflight`, `run`, `outputs` or `install`, after whose first output byte (for
-    /// `install`, its first moved file) the client raises the console interrupt itself; or `sdks`, before it reads this
-    /// PC's SDK list.
+    /// Where the remote client raises the console interrupt itself: `preflight`, `run`, `outputs` or `install`, after
+    /// that call's first output byte (for `install`, its first moved file); `stop`, during the run call, so the stop it
+    /// leads to can be interrupted again; `sdks`, before it reads this PC's SDK list; or `manifest`, before it reads the
+    /// snapshot's `.gate/toolchain.toml`.
     pub remote_interrupt_at: Option<String>,
     /// The one call of the remote client, `preflight`, `push`, `run`, `ls-remote`, `fetch` or `outputs`, that
     /// `--test-stall-ms` applies to, and `--test-remote-timeout-ms` too when it names a call other than `run`; every

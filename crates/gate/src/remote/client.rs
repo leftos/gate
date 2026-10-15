@@ -44,6 +44,7 @@ use super::payload::{self, Location, RunCall};
 use super::retry::{self, Ended, GIT_SSH_FAILED, SSH_FAILED};
 use super::snapshot::{self, Snapshot};
 use super::syncback;
+use super::toolchain::{self, Manifest, Reported};
 #[cfg(feature = "test-seams")]
 use super::transport::Local;
 use super::transport::ssh::Ssh;
@@ -309,11 +310,126 @@ pub(super) enum End {
 }
 
 /// What the preflight found: whether it created the bare repository just now, the builder's boot time, `None` when it
-/// said none, and the SDKs it lists, `None` when it said no SDK line.
+/// said none, the SDKs it lists, `None` when it said no SDK line, the tools its `Needs` named, and what the builder
+/// said of each of them, in that order, a tool it said nothing of left out.
 struct Prepared {
     created: bool,
     boot: Option<String>,
     sdks: Option<Vec<String>>,
+    sent: Vec<String>,
+    tools: Vec<(String, Reported)>,
+}
+
+/// What the snapshot's tree gives the parity check, read before the preflight: the git that listed it, the names of
+/// its files and submodules, and its `.gate/toolchain.toml`, `None` when it has none, `Err` with why when it cannot be
+/// read or is no regular file.
+struct Tree {
+    git: Git,
+    names: Vec<String>,
+    manifest: Option<Result<Manifest, String>>,
+}
+
+/// The repo's toolchain manifest, as its path at the repo root is spelled.
+const MANIFEST_PATH: &str = ".gate/toolchain.toml";
+/// The folder at the repo root that holds the manifest, matched ignoring ASCII case.
+const GATE_FOLDER: &str = ".gate";
+/// The manifest's name inside [`GATE_FOLDER`], matched ignoring ASCII case.
+const MANIFEST_NAME: &str = "toolchain.toml";
+
+/// One entry of the snapshot's tree as `git ls-tree -z` lists one: the mode, the object type (`blob`, `tree` or
+/// `commit`), the object id and the path.
+#[derive(Debug, PartialEq, Eq)]
+struct Entry {
+    mode: String,
+    kind: String,
+    oid: String,
+    path: String,
+}
+
+/// The entries of a `git ls-tree -z` listing, each `<mode> <type> <oid>\t<path>` ended by a NUL; `None` when an entry
+/// is not of that form.
+fn entries_of(listing: &str) -> Option<Vec<Entry>> {
+    listing
+        .split('\0')
+        .filter(|record| !record.is_empty())
+        .map(|record| {
+            let (meta, path) = record.split_once('\t')?;
+            let mut parts = meta.split(' ');
+            let (mode, kind, oid) = (parts.next()?, parts.next()?, parts.next()?);
+            parts.next().is_none().then(|| Entry {
+                mode: mode.to_owned(),
+                kind: kind.to_owned(),
+                oid: oid.to_owned(),
+                path: path.to_owned(),
+            })
+        })
+        .collect()
+}
+
+/// The repo's `.gate` folder among the root listing `root`: the entries named `.gate` ignoring ASCII case whose type is
+/// a tree, so one that is no folder names no manifest at all.
+fn gate_folders(root: &[Entry]) -> Vec<&Entry> {
+    root.iter()
+        .filter(|entry| entry.path.eq_ignore_ascii_case(GATE_FOLDER) && entry.kind == "tree")
+        .collect()
+}
+
+/// The entries of one `.gate` folder's listing `inside` that can be the repo's manifest: each named `toolchain.toml`
+/// ignoring ASCII case, its path the folder's path as `gate` spells it joined to its own name, so [`manifest_entry`]
+/// weighs it as the file that folder holds at the repo root, whatever the letter case of either.
+fn manifest_candidates(gate: &Entry, inside: &[Entry]) -> Vec<Entry> {
+    inside
+        .iter()
+        .filter(|entry| entry.path.eq_ignore_ascii_case(MANIFEST_NAME))
+        .map(|entry| Entry {
+            mode: entry.mode.clone(),
+            kind: entry.kind.clone(),
+            oid: entry.oid.clone(),
+            path: format!("{}/{}", gate.path, entry.path),
+        })
+        .collect()
+}
+
+/// The entry among `entries` that is the repo's manifest, its path matched ignoring ASCII case: the one spelled exactly
+/// when it is a regular file, else the only match when it is one. `Err` with why for a match that is a submodule, a
+/// symbolic link, a folder or another kind of entry, and for two matches that differ only in letter case. `None`
+/// when nothing matches.
+fn manifest_entry(entries: &[Entry]) -> Option<Result<&Entry, String>> {
+    let matches: Vec<&Entry> = entries.iter().filter(|entry| entry.path.eq_ignore_ascii_case(MANIFEST_PATH)).collect();
+    if let Some(exact) = matches
+        .iter()
+        .copied()
+        .find(|entry| entry.path == MANIFEST_PATH && regular(entry).is_ok())
+    {
+        return Some(Ok(exact));
+    }
+    match matches.as_slice() {
+        [] => None,
+        [only] => Some(regular(only)),
+        [first, second, ..] => Some(Err(format!("{} and {} differ only in letter case", first.path, second.path))),
+    }
+}
+
+/// `entry` when it is a regular file, a blob of mode 100644 or 100755; else `Err` with what it is.
+fn regular(entry: &Entry) -> Result<&Entry, String> {
+    let path = &entry.path;
+    match (entry.mode.as_str(), entry.kind.as_str()) {
+        ("100644" | "100755", "blob") => Ok(entry),
+        ("160000", _) => Err(format!("{path} is a submodule, not a file")),
+        ("120000", _) => Err(format!("{path} is a symbolic link, not a file")),
+        (_, "tree") => Err(format!("{path} is a folder, not a file")),
+        (mode, _) => Err(format!("{path} is not a regular file (mode {mode})")),
+    }
+}
+
+impl Tree {
+    /// The `Needs` the preflight sends for the tree's manifest; none when it has no manifest that reads.
+    fn needs(&self) -> Vec<(String, String)> {
+        match &self.manifest {
+            Some(Ok(manifest)) => toolchain::needs_of(manifest),
+            _ => Vec::new(),
+        }
+    }
 }
 
 /// The ceiling of each transfer, whatever `--timeout` says: the setup up to the end of the push, counted from the
@@ -577,8 +693,10 @@ impl Attempt<'_, '_> {
             host: self.call.host,
         };
         let run_line = payload::capped("run", payload::line("run", &payload::run_word(&location, &run))).map_err(End::Failed)?;
-        let prepared = self.preflight(&location)?;
-        self.parity(&snapshot, prepared.sdks.as_deref())?;
+        let tree = self.tree(&snapshot)?;
+        let needs = tree.as_ref().map(Tree::needs).unwrap_or_default();
+        let prepared = self.preflight(&location, &needs)?;
+        self.parity(&snapshot, tree.as_ref(), &prepared)?;
         self.push(&snapshot, prepared.created)?;
         // After the push: a run refused before it, at the preflight or by the parity check, leaves no marker.
         outputs::marked(&sent)?;
@@ -620,12 +738,13 @@ impl Attempt<'_, '_> {
             .ok_or_else(|| End::Failed("the snapshot made no commit".to_owned()))
     }
 
-    /// The preflight: readies the work folder, and checks the builder runs this gate's version. Whether it created the
-    /// bare repository just now, and the builder's boot time. A builder with no `gate box` that takes the run is not
-    /// routed, as one of another version is not.
-    fn preflight(&mut self, location: &Location) -> Result<Prepared, End> {
+    /// The preflight: readies the work folder, asks the builder to probe the tools of `needs`, and checks the builder
+    /// runs this gate's version. Whether it created the bare repository just now, the builder's boot time, its SDKs and
+    /// what it said of each tool sent. Needs that would make the call longer than cmd takes are not sent, with a line. A
+    /// builder with no `gate box` that takes the run is not routed, as one of another version is not.
+    fn preflight(&mut self, location: &Location, needs: &[(String, String)]) -> Result<Prepared, End> {
         self.go_on()?;
-        let line = payload::capped("preflight", payload::line("preflight", &payload::location_word(location))).map_err(End::Failed)?;
+        let (line, sent) = self.preflight_line(location, needs)?;
         let watch = Watch::Setup(self.limits_for("preflight"));
         let raise = self.raises_at("preflight");
         let (mut called, _) = self.with_retry(SSH_FAILED, |attempt| attempt.ssh(&line, Echo::LogOnly, watch, raise, CallOnly::default()))?;
@@ -633,6 +752,7 @@ impl Attempt<'_, '_> {
         let created = called.lines.iter().any(|line| line.starts_with(CREATED));
         let boot = boot_time(&called.lines).map(str::to_owned);
         let sdks = sdks_of(&called.lines);
+        let tools = toolchain::reported(&called.lines, &sent);
         self.lines.append(&mut called.lines);
         self.not_started_if_killed("the preflight", &called)?;
         let host = self.call.host;
@@ -659,41 +779,156 @@ impl Attempt<'_, '_> {
             self.say(line);
             return Err(End::Refused(FallbackReason::Version));
         }
-        Ok(Prepared { created, boot, sdks })
+        Ok(Prepared {
+            created,
+            boot,
+            sdks,
+            sent,
+            tools,
+        })
     }
 
-    /// The toolchain parity check, made after the preflight and before the push, so a refusal costs no transfer: a
-    /// builder whose preflight listed the SDKs `sdks` must have what the snapshot needs, as [`parity::need`] reads it
-    /// from the snapshot's root `global.json`, whatever the letter case of its name, and, with no pin, this PC's newest
-    /// SDK major. One that lacks any of it says one mismatch line per need, in order, and is refused `parity` once. A
-    /// builder that listed no SDK line, a snapshot that is no .NET tree, or one whose listing or `global.json` cannot be
-    /// read whole is not checked, the listing with a line.
-    fn parity(&mut self, snapshot: &Snapshot, sdks: Option<&[String]>) -> Result<(), End> {
-        let Some(sdks) = sdks else {
-            return Ok(());
-        };
+    /// The preflight's line, carrying `needs` when cmd takes it so, and the names of the tools it sends; needs that would
+    /// make it longer than cmd takes are left out, with a line, and it sends none.
+    fn preflight_line(&mut self, location: &Location, needs: &[(String, String)]) -> Result<(String, Vec<String>), End> {
+        let preflight = payload::preflight_line(location, needs).map_err(End::Failed)?;
+        if preflight.needs_dropped {
+            self.say(toolchain::over_cap_line(payload::LINE_LIMIT));
+            return Ok((preflight.line, Vec::new()));
+        }
+        Ok((preflight.line, needs.iter().map(|(name, _)| name.clone()).collect()))
+    }
+
+    /// The snapshot's tree as the parity check reads it, listed before the preflight: the names of its files and
+    /// submodules ([`Attempt::file_names`]) and its `.gate/toolchain.toml` ([`Attempt::manifest`]), the manifest found
+    /// in a listing of the root and one of each `.gate` folder it names ([`manifest_candidates`]), so the names
+    /// listing stays as small as one of names alone. A listing past the git output cap, or one that is not UTF-8 or not of
+    /// `ls-tree`'s form, is said and gives `None`, which skips the whole check.
+    fn tree(&mut self, snapshot: &Snapshot) -> Result<Option<Tree>, End> {
         self.go_on()?;
         let git = Git::find(Path::new(self.call.root)).map_err(End::Failed)?;
-        let listing = match self.git_bytes(&git, &["ls-tree", "-r", "-z", "--name-only", &snapshot.commit]) {
+        let Some(names) = self.file_names(&git, &snapshot.commit)? else {
+            return Ok(None);
+        };
+        let Some(root) = self.tree_entries(&git, &snapshot.commit)? else {
+            return Ok(None);
+        };
+        let mut candidates = Vec::new();
+        for gate in gate_folders(&root) {
+            let Some(inside) = self.tree_entries(&git, &gate.oid)? else {
+                return Ok(None);
+            };
+            candidates.extend(manifest_candidates(gate, &inside));
+        }
+        let manifest = self.manifest(&git, &candidates)?;
+        Ok(Some(Tree { git, names, manifest }))
+    }
+
+    /// The names of the files and submodules of the snapshot's tree `treeish`, as its listing spells them, one per NUL;
+    /// `None`, with a line, when that listing is past the git output cap or is not UTF-8.
+    fn file_names(&mut self, git: &Git, treeish: &str) -> Result<Option<Vec<String>>, End> {
+        let Some(listing) = self.listed(git, &["ls-tree", "-r", "-z", "--name-only", treeish])? else {
+            return Ok(None);
+        };
+        Ok(Some(listing.split('\0').filter(|name| !name.is_empty()).map(str::to_owned).collect()))
+    }
+
+    /// The entries of `git ls-tree -z` over the tree `treeish` ([`entries_of`]), each with its mode, type, object id
+    /// and path; `None`, with a line, when that listing is past the git output cap, is not UTF-8 or is not of that form.
+    fn tree_entries(&mut self, git: &Git, treeish: &str) -> Result<Option<Vec<Entry>>, End> {
+        let Some(listing) = self.listed(git, &["ls-tree", "-z", treeish])? else {
+            return Ok(None);
+        };
+        let Some(entries) = entries_of(&listing) else {
+            self.say("gate: cannot list the snapshot's files: an entry is not of git ls-tree's form; skipping the toolchain check".to_owned());
+            return Ok(None);
+        };
+        Ok(Some(entries))
+    }
+
+    /// What one listing of `args` answered as text; `None`, with a line, when it is past the git output cap or is not
+    /// UTF-8, either of which skips the whole toolchain check. Any other git failure ends the run.
+    fn listed(&mut self, git: &Git, args: &[&str]) -> Result<Option<String>, End> {
+        self.go_on()?;
+        let listing = match self.git_bytes(git, args) {
             Ok(listing) => listing,
             Err(GitError::OverCap(why)) => {
                 self.say(format!("gate: cannot list the snapshot's files: {why}; skipping the toolchain check"));
-                return Ok(());
+                return Ok(None);
             }
             Err(error) => return Err(git_end(error)),
         };
         let Ok(listing) = String::from_utf8(listing) else {
             self.say("gate: cannot list the snapshot's files: a path is not valid UTF-8; skipping the toolchain check".to_owned());
+            return Ok(None);
+        };
+        Ok(Some(listing))
+    }
+
+    /// The snapshot's `.gate/toolchain.toml` among the candidate `entries` ([`manifest_entry`]), read by its object id;
+    /// `None` when it has none, `Err` with why when it is no regular file, is past the git output cap or does not read.
+    /// Any other git failure ends the run. `--test-remote-interrupt-at manifest` raises the console interrupt just
+    /// before the read.
+    fn manifest(&mut self, git: &Git, entries: &[Entry]) -> Result<Option<Result<Manifest, String>>, End> {
+        let entry = match manifest_entry(entries) {
+            None => return Ok(None),
+            Some(Err(why)) => return Ok(Some(Err(why))),
+            Some(Ok(entry)) => entry,
+        };
+        if let Some(interrupt) = self.call.interrupt.filter(|_| self.raises_at("manifest")) {
+            interrupt.raise();
+        }
+        self.go_on()?;
+        let read = match self.git_bytes(git, &["cat-file", "blob", &entry.oid]) {
+            Ok(bytes) => toolchain::read_bytes(&bytes),
+            Err(GitError::OverCap(why)) => Err(why),
+            Err(error) => return Err(git_end(error)),
+        };
+        self.go_on()?;
+        Ok(Some(read))
+    }
+
+    /// The toolchain parity check, made after the preflight and before the push, so a refusal costs no transfer, over
+    /// the snapshot's `tree`, which `None` skips: the builder must have the SDK [`Attempt::sdk_needs`] reads and the
+    /// tools the manifest declares, as [`toolchain::judge`] weighs what the `prepared` preflight said of them. The SDK
+    /// step's own lines come first, its "cannot read this PC's SDK list" among them; then each manifest problem and
+    /// tool not checked, in order; then a builder that lacks any of it says one mismatch line per need, the SDK's
+    /// before the tools', and is refused `parity` once.
+    fn parity(&mut self, snapshot: &Snapshot, tree: Option<&Tree>, prepared: &Prepared) -> Result<(), End> {
+        let Some(tree) = tree else {
             return Ok(());
         };
-        let names: Vec<&str> = listing.split('\0').filter(|name| !name.is_empty()).collect();
-        if !parity::is_dotnet_tree(names.iter().copied()) {
+        self.go_on()?;
+        let mut needs = self.sdk_needs(snapshot, tree, prepared.sdks.as_deref())?;
+        let judged = toolchain::judge(tree.manifest.as_ref(), &prepared.sent, &prepared.tools, self.call.host);
+        for line in judged.skips {
+            self.say(line);
+        }
+        needs.extend(judged.needs);
+        if needs.is_empty() {
             return Ok(());
         }
+        let sdks = prepared.sdks.as_deref().unwrap_or_default();
+        for line in parity::lines(self.call.repo, &needs, self.call.host, sdks) {
+            self.say(line);
+        }
+        Err(End::Refused(FallbackReason::Parity))
+    }
+
+    /// The SDK needs of the snapshot whose `tree` the builder whose preflight listed the SDKs `sdks` lacks, as
+    /// [`parity::need`] reads them from the snapshot's root `global.json`, whatever the letter case of its name, and,
+    /// with no pin, this PC's newest SDK major. None when the builder listed no SDK line or the tree is no .NET tree.
+    fn sdk_needs(&mut self, snapshot: &Snapshot, tree: &Tree, sdks: Option<&[String]>) -> Result<Vec<parity::Need>, End> {
+        let Some(sdks) = sdks else {
+            return Ok(Vec::new());
+        };
+        if !parity::is_dotnet_tree(tree.names.iter().map(String::as_str)) {
+            return Ok(Vec::new());
+        }
         // dotnet reads a root `global.json` whatever the letter case of its name, as Windows opens it.
-        let global_json = names.iter().find(|name| name.eq_ignore_ascii_case("global.json")).copied();
+        let global_json = tree.names.iter().find(|name| name.eq_ignore_ascii_case("global.json"));
         let pin = match global_json {
-            Some(name) => match self.git_bytes(&git, &["show", &format!("{}:{name}", snapshot.commit)]) {
+            Some(name) => match self.git_bytes(&tree.git, &["show", &format!("{}:{name}", snapshot.commit)]) {
                 Ok(bytes) => parity::pin_of(Some(&String::from_utf8_lossy(&bytes))),
                 // A `global.json` past the cap could not be read whole, so it holds no readable pin.
                 Err(GitError::OverCap(_)) => parity::Pin::unreadable(),
@@ -707,13 +942,7 @@ impl Attempt<'_, '_> {
         let needs = parity::need(&pin, sdks, || self.local_major());
         // A Ctrl+C while this PC's SDK list was read ends the run here, as an interrupt, before the push.
         self.go_on()?;
-        if needs.is_empty() {
-            return Ok(());
-        }
-        for line in parity::lines(self.call.repo, &needs, self.call.host, sdks) {
-            self.say(line);
-        }
-        Err(End::Refused(FallbackReason::Parity))
+        Ok(needs)
     }
 
     /// What git writes on standard output for `args` in the worktree, as the bytes it wrote, a call the console
@@ -969,7 +1198,7 @@ impl Attempt<'_, '_> {
                 if self.go_on().is_err() { End::Interrupted } else { End::Lost(output) }
             }
             Loss::Restarted(booted) => {
-                let shown = escaped(first_bytes(booted, git::FAILURE_BYTES));
+                let shown = escaped(git::first_bytes(booted, git::FAILURE_BYTES));
                 let line = format!("gate: {host} restarted during the run (booted {shown}); the run did not finish there");
                 self.falls_back_after_loss(output, line, FallbackReason::Rebooted)
             }
@@ -2401,7 +2630,7 @@ fn after_loss<'n>(before: Option<&str>, now: Option<&'n str>) -> Loss<'n> {
 /// builder that said no version runs one unknown; one that did is shown by its first 4 KiB, escaped.
 fn version_refusal(host: &str, theirs: Option<&str>, ours: &str) -> Option<String> {
     (theirs != Some(ours)).then(|| {
-        let shown = theirs.map_or_else(|| "unknown".to_owned(), |theirs| escaped(first_bytes(theirs, git::FAILURE_BYTES)));
+        let shown = theirs.map_or_else(|| "unknown".to_owned(), |theirs| escaped(git::first_bytes(theirs, git::FAILURE_BYTES)));
         format!("gate: not routed: {host} runs gate {shown}, this PC {ours}; run gate push")
     })
 }
@@ -2415,15 +2644,6 @@ pub(super) fn watchdog_line(cut: Cut, doing: &str) -> Option<String> {
         Cut::Ceiling(ceiling) => Some(watchdog::transfer_line(ceiling, doing)),
         Cut::Watchdog(_) | Cut::Late(_) | Cut::TooLong | Cut::TooBig(_) | Cut::ArchiveTooBig(_) => None,
     }
-}
-
-/// `text` cut to its first `most` bytes, at a character's boundary.
-pub(super) fn first_bytes(text: &str, most: usize) -> &str {
-    let mut end = text.len().min(most);
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    text.get(..end).unwrap_or_default()
 }
 
 /// A line the box says on a run call's standard error for the client alone, besides its heartbeat: the start marker
@@ -2533,9 +2753,11 @@ mod tests {
         console_of, held, is_heartbeat, last_update, local_sdk_listing, path_outside, paused, push_size, relay, relay_raw, relayed_raw, sdks_of,
         seconds, their_version, version_refusal,
     };
+    use super::{Entry, entries_of, gate_folders, manifest_candidates, manifest_entry};
     use crate::environment::Variables;
     use crate::remote::git::{DOTNET_LIMIT, GIT_LIMIT, GitError};
     use crate::remote::outputs;
+    use crate::remote::payload;
     use crate::remote::payload::Location;
     use crate::remote::snapshot::Snapshot;
     use crate::remote::transport::Local;
@@ -3879,7 +4101,7 @@ mod tests {
         };
         let location = Location::under(r"C:\builder", "app", "app-1a2b3c4d", "0123456789ab");
 
-        assert!(matches!(attempt.preflight(&location), Err(End::Interrupted)), "the preflight");
+        assert!(matches!(attempt.preflight(&location, &[]), Err(End::Interrupted)), "the preflight");
         assert!(matches!(attempt.push(&snapshot, false), Err(End::Interrupted)), "the push");
         assert!(
             matches!(attempt.run_call("line", &location, None, NONCE), Err(End::Interrupted)),
@@ -4015,6 +4237,157 @@ mod tests {
             "the box could not read it"
         );
         assert_eq!(sdks_of(&lines(&["gate: remote sdks  "])), None, "an SDK line with no list");
+    }
+
+    fn entry(mode: &str, kind: &str, path: &str) -> Entry {
+        Entry {
+            mode: mode.to_owned(),
+            kind: kind.to_owned(),
+            oid: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+            path: path.to_owned(),
+        }
+    }
+
+    #[test]
+    fn a_listing_reads_each_entry_s_mode_type_object_and_path() {
+        let listing = "100644 blob 0123456789abcdef0123456789abcdef01234567\t.gate/toolchain.toml\0\
+                       040000 tree 0123456789abcdef0123456789abcdef01234567\tsrc dir\0";
+        assert_eq!(
+            entries_of(listing),
+            Some(vec![entry("100644", "blob", ".gate/toolchain.toml"), entry("040000", "tree", "src dir")])
+        );
+        assert_eq!(entries_of(""), Some(Vec::new()));
+        assert_eq!(entries_of("100644 blob\0"), None, "no tab");
+        assert_eq!(entries_of("100644 blob x y\ta\0"), None, "four words");
+    }
+
+    /// The manifest's candidates are built from one listing of the root and one of each `.gate` folder it names: the
+    /// exact spelling at the repo root is read, a case variant alone is, two at once differ only in letter case, and a
+    /// `.gate` that is no folder holds no manifest at all.
+    #[test]
+    fn the_manifest_s_entries_are_built_from_a_root_listing_and_a_gate_listing() {
+        let oid = "0123456789abcdef0123456789abcdef01234567";
+        let record = |mode: &str, kind: &str, name: &str| format!("{mode} {kind} {oid}\t{name}\0");
+        let candidates = |root: &str, inside: &str| -> Vec<Entry> {
+            let root = entries_of(root).expect("the root listing reads");
+            let inside = entries_of(inside).expect("the .gate listing reads");
+            gate_folders(&root)
+                .into_iter()
+                .flat_map(|gate| manifest_candidates(gate, &inside))
+                .collect()
+        };
+
+        let exact = candidates(&record("040000", "tree", ".gate"), &record("100644", "blob", "toolchain.toml"));
+        assert_eq!(
+            exact,
+            vec![entry("100644", "blob", ".gate/toolchain.toml")],
+            "the folder and the name as spelled"
+        );
+        assert_eq!(manifest_entry(&exact), Some(Ok(&exact[0])), "and that is the one read");
+
+        let variant = candidates(&record("040000", "tree", ".Gate"), &record("100644", "blob", "Toolchain.TOML"));
+        assert_eq!(variant, vec![entry("100644", "blob", ".Gate/Toolchain.TOML")], "each part as spelled");
+        assert_eq!(manifest_entry(&variant), Some(Ok(&variant[0])), "a case variant alone is read too");
+
+        let both = format!(
+            "{}{}",
+            record("100644", "blob", "toolchain.toml"),
+            record("100644", "blob", "Toolchain.TOML")
+        );
+        assert_eq!(
+            manifest_entry(&candidates(&record("040000", "tree", ".Gate"), &both)),
+            Some(Err(".Gate/toolchain.toml and .Gate/Toolchain.TOML differ only in letter case".to_owned()))
+        );
+
+        assert_eq!(
+            candidates(&record("100644", "blob", ".gate"), &record("100644", "blob", "toolchain.toml")),
+            Vec::new(),
+            "a .gate that is no folder holds no manifest"
+        );
+    }
+
+    #[test]
+    fn the_manifest_is_a_regular_file_at_the_root_whatever_its_letter_case() {
+        let file = [entry("100644", "blob", "a.txt"), entry("100644", "blob", ".gate/toolchain.toml")];
+        assert_eq!(manifest_entry(&file), Some(Ok(&file[1])));
+        let executable = [entry("100755", "blob", ".Gate/Toolchain.TOML")];
+        assert_eq!(manifest_entry(&executable), Some(Ok(&executable[0])));
+        assert_eq!(
+            manifest_entry(&[entry("100644", "blob", "x/.gate/toolchain.toml")]),
+            None,
+            "not at the root"
+        );
+        assert_eq!(manifest_entry(&[]), None);
+    }
+
+    #[test]
+    fn a_manifest_that_is_a_submodule_a_symlink_or_a_folder_is_not_read() {
+        for (mode, kind, why) in [
+            ("160000", "commit", ".gate/toolchain.toml is a submodule, not a file"),
+            ("120000", "blob", ".gate/toolchain.toml is a symbolic link, not a file"),
+            ("040000", "tree", ".gate/toolchain.toml is a folder, not a file"),
+            ("100664", "blob", ".gate/toolchain.toml is not a regular file (mode 100664)"),
+        ] {
+            let entries = [entry(mode, kind, ".gate/toolchain.toml")];
+            assert_eq!(manifest_entry(&entries), Some(Err(why.to_owned())), "{mode} {kind}");
+        }
+    }
+
+    #[test]
+    fn two_manifests_that_differ_only_in_case_are_not_read_unless_one_is_spelled_exactly() {
+        let two = [
+            entry("100644", "blob", ".Gate/toolchain.toml"),
+            entry("100644", "blob", ".gate/Toolchain.toml"),
+        ];
+        assert_eq!(
+            manifest_entry(&two),
+            Some(Err(".Gate/toolchain.toml and .gate/Toolchain.toml differ only in letter case".to_owned()))
+        );
+        let exact = [
+            entry("100644", "blob", ".GATE/toolchain.toml"),
+            entry("100644", "blob", ".gate/toolchain.toml"),
+        ];
+        assert_eq!(manifest_entry(&exact), Some(Ok(&exact[1])), "the exact spelling wins");
+        let exact_link = [
+            entry("100644", "blob", ".GATE/toolchain.toml"),
+            entry("120000", "blob", ".gate/toolchain.toml"),
+        ];
+        assert_eq!(
+            manifest_entry(&exact_link),
+            Some(Err(".GATE/toolchain.toml and .gate/toolchain.toml differ only in letter case".to_owned())),
+            "an exact spelling that is no regular file wins nothing"
+        );
+    }
+
+    /// A preflight whose needs make its line longer than cmd takes sends the location alone, sends no tool, and says
+    /// so once.
+    #[test]
+    fn a_preflight_its_needs_make_too_long_sends_none_and_says_so() {
+        let log = std::env::temp_dir().join(format!("gate-client-over-cap-{}.log", std::process::id()));
+        let mut given = call(&log);
+        given.interrupt = None;
+        let transport = nowhere();
+        let mut attempt = attempt(&given, &transport);
+        let needs: Vec<(String, String)> = ["rust", "cargo-nextest", "node", "pnpm", "pwsh", "godot", "ffmpeg"]
+            .iter()
+            .map(|name| ((*name).to_owned(), "1.2.3".to_owned()))
+            .collect();
+        let location_of = |length: usize| Location::under(&format!("C:\\{}\\", "r".repeat(length)), "app", "app-1a2b3c4d", "0123456789ab");
+        let length = (1..4000)
+            .find(|&length| payload::preflight_line(&location_of(length), &needs).is_ok_and(|line| line.needs_dropped))
+            .expect("a root that long makes the line with needs too long");
+        let location = location_of(length);
+
+        let (line, sent) = attempt.preflight_line(&location, &needs).expect("the location alone is taken");
+
+        let said = fs::read_to_string(&log).expect("the over-cap line was written");
+        fs::remove_file(&log).expect("the log can be removed");
+        assert_eq!(line, payload::line("preflight", &payload::location_word(&location)));
+        assert_eq!(sent, Vec::<String>::new(), "no tool is sent");
+        let over_cap = "gate: .gate/toolchain.toml: its tools make the preflight call longer than the 8127 characters cmd takes; skipping it";
+        assert_eq!(said.lines().collect::<Vec<_>>(), [over_cap], "{said}");
+        let (_, sent) = attempt.preflight_line(&location_of(1), &needs).expect("a short line is taken");
+        assert_eq!(sent.len(), needs.len(), "a line cmd takes sends every need");
     }
 
     #[test]

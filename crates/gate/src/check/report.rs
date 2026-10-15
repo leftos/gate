@@ -10,7 +10,7 @@ use gate_router::SiblingFolder;
 use crate::answer::FAILED_STATUS;
 use crate::boxside::payload::escaped;
 use crate::boxside::probe::Probed;
-use crate::remote::toolchain::{ToolNeed, Version, meets, spelled};
+use crate::remote::toolchain::{Reported, Standing, ToolNeed, Version, spelled, standing};
 
 /// The `<where>` of this PC's lines.
 pub(crate) const HERE: &str = "here";
@@ -220,17 +220,15 @@ fn tool_item(tool: &Tool) -> Item {
     let min = tool.need.min;
     let needs = min.map_or_else(|| "needs it present".to_owned(), |min| format!("needs {min} or later"));
     let hint = |kind| install_hint(&name, min, kind).map(|command| (name.clone(), command));
-    match (&tool.probed, min) {
-        (Probed::Version(found), Some(min)) => match meets(min, found) {
-            Some(true) => Item::new(format!("{name} {} ok ({needs})", escaped(found)), Kind::Ok),
-            Some(false) => Item::hinted(format!("{name} {} too old ({needs})", escaped(found)), Kind::TooOld, hint(Kind::TooOld)),
-            None => Item::new(format!("{name} skipped: found, version not readable ({needs})"), Kind::Skipped),
-        },
-        (Probed::Version(found), None) => Item::new(format!("{name} {} ok", escaped(found)), Kind::Ok),
-        (Probed::Present, None) => Item::new(format!("{name} ok (version not readable)"), Kind::Ok),
-        (Probed::Present, Some(_)) => Item::new(format!("{name} skipped: found, version not readable ({needs})"), Kind::Skipped),
-        (Probed::Missing, _) => Item::hinted(format!("{name} missing ({needs})"), Kind::Missing, hint(Kind::Missing)),
-        (Probed::Skipped(why), _) => Item::new(format!("{name} skipped: {}", escaped(why)), Kind::Skipped),
+    let reported = Reported::from(&tool.probed);
+    match (standing(min, &reported), &reported) {
+        (Standing::Met, Reported::Version(found)) if min.is_some() => Item::new(format!("{name} {} ok ({needs})", escaped(found)), Kind::Ok),
+        (Standing::Met, Reported::Version(found)) => Item::new(format!("{name} {} ok", escaped(found)), Kind::Ok),
+        (Standing::Met, _) => Item::new(format!("{name} ok (version not readable)"), Kind::Ok),
+        (Standing::TooOld(found), _) => Item::hinted(format!("{name} {} too old ({needs})", escaped(&found)), Kind::TooOld, hint(Kind::TooOld)),
+        (Standing::NotReadable, _) => Item::new(format!("{name} skipped: found, version not readable ({needs})"), Kind::Skipped),
+        (Standing::Missing, _) => Item::hinted(format!("{name} missing ({needs})"), Kind::Missing, hint(Kind::Missing)),
+        (Standing::Skipped(why), _) => Item::new(format!("{name} skipped: {}", escaped(&why)), Kind::Skipped),
     }
 }
 

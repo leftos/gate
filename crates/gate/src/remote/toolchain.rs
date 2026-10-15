@@ -11,7 +11,10 @@
 use serde_json::Value as Json;
 use toml::{Table, Value};
 
-use crate::remote::parity::number;
+use crate::boxside::payload::escaped;
+use crate::boxside::probe::Probed;
+use crate::remote::git::{FAILURE_BYTES, first_bytes};
+use crate::remote::parity::{Need, NeedKind, number};
 
 /// The tool names the manifest knows, as its `[tools]` keys spell them.
 pub(crate) const KNOWN_TOOLS: [&str; 7] = ["rust", "cargo-nextest", "node", "pnpm", "pwsh", "godot", "ffmpeg"];
@@ -103,6 +106,221 @@ pub(crate) struct Manifest {
 /// The line said when the manifest cannot be read, `why` being the reason [`read`] or [`read_bytes`] gives.
 pub(crate) fn unreadable_line(why: &str) -> String {
     format!("gate: cannot read .gate/toolchain.toml: {why}; skipping the manifest's checks")
+}
+
+/// The start of the line a builder's preflight says for each tool its `Needs` named: `gate: remote tool <name> <what>`.
+const TOOL_LINE: &str = "gate: remote tool ";
+
+/// The longest tool name a preflight sends.
+const SENT_NAME_MAX: usize = 32;
+
+/// The why of a tool the builder found but whose version it could not read, or whose version text reads as none.
+const NOT_READABLE: &str = "found, version not readable";
+
+/// The why of a tool the preflight asked about and the builder said nothing of.
+const NO_ANSWER: &str = "the builder gave no answer";
+
+/// What a probe of one tool found, as a builder's tool line words it or as `gate check`'s probe found it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Reported {
+    /// Found, at the version this text spells.
+    Version(String),
+    /// Found, its version not read.
+    Present,
+    /// Not found.
+    Missing,
+    /// Not probed, for this reason.
+    Skipped(String),
+}
+
+impl From<&Probed> for Reported {
+    fn from(probed: &Probed) -> Reported {
+        match probed {
+            Probed::Version(found) => Reported::Version(found.clone()),
+            Probed::Present => Reported::Present,
+            Probed::Missing => Reported::Missing,
+            Probed::Skipped(why) => Reported::Skipped(why.clone()),
+        }
+    }
+}
+
+/// How a declared tool stands against what its probe found: the one verdict both a routed run and `gate check` give.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Standing {
+    /// It serves the need.
+    Met,
+    /// Found below the minimum, at the version this text spells.
+    TooOld(String),
+    /// Not found.
+    Missing,
+    /// Found, but with no version that can be read against the minimum.
+    NotReadable,
+    /// Not probed, for this reason.
+    Skipped(String),
+}
+
+/// How a tool whose minimum is `min` (`None` for any version) stands against `reported`, what its probe found.
+pub(crate) fn standing(min: Option<Version>, reported: &Reported) -> Standing {
+    match (reported, min) {
+        (Reported::Skipped(why), _) => Standing::Skipped(why.clone()),
+        (Reported::Missing, _) => Standing::Missing,
+        (Reported::Present | Reported::Version(_), None) => Standing::Met,
+        (Reported::Present, Some(_)) => Standing::NotReadable,
+        (Reported::Version(found), Some(min)) => match meets(min, found) {
+            Some(true) => Standing::Met,
+            Some(false) => Standing::TooOld(found.clone()),
+            None => Standing::NotReadable,
+        },
+    }
+}
+
+/// What the manifest declares that a builder lacks, and the lines that say what was not checked.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Judged {
+    /// One need per tool missing or too old, in the manifest's order.
+    pub needs: Vec<Need>,
+    /// One line per manifest problem, then one per tool skipped, in the manifest's order.
+    pub skips: Vec<String>,
+}
+
+/// The line said, on a routed run, for a manifest `problem`: an entry skipped as bad, or a whole file that cannot be
+/// read or is no regular file. The problem is escaped, as it may quote the file.
+pub(crate) fn skip_line(problem: &str) -> String {
+    format!("gate: .gate/toolchain.toml: {}; skipping it", escaped(problem))
+}
+
+/// A text the builder said, as a line shows it: its first [`FAILURE_BYTES`], escaped, so a builder can neither forge a
+/// line nor flood the console.
+fn shown(text: &str) -> String {
+    escaped(first_bytes(text, FAILURE_BYTES))
+}
+
+/// A tool name the manifest gives, as a line shows it: spelled as its key ([`spelled`]) and escaped, so it is always
+/// one line.
+fn one_line(name: &str) -> String {
+    escaped(&spelled(name))
+}
+
+/// The line said, on a routed run, when the manifest's tools would make the preflight call longer than cmd takes, so it
+/// is sent without them.
+pub(crate) fn over_cap_line(limit: usize) -> String {
+    skip_line(&format!("its tools make the preflight call longer than the {limit} characters cmd takes"))
+}
+
+/// Whether a preflight sends `tool` to the builder: a known tool, whose name is 1 to 32 lower-case ASCII letters,
+/// digits and `-`. Every name of [`KNOWN_TOOLS`] passes the charset test, so it is a belt-and-braces guard: a known
+/// name that failed it would still never reach the payload.
+fn is_sent(tool: &ToolNeed) -> bool {
+    let name = &tool.name;
+    tool.known
+        && (1..=SENT_NAME_MAX).contains(&name.len())
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+/// The `Needs` a preflight sends for `manifest`, in its order: each tool it sends ([`is_sent`]) by name, with the minimum
+/// as `major.minor.patch`, or empty for any version.
+pub(crate) fn needs_of(manifest: &Manifest) -> Vec<(String, String)> {
+    manifest
+        .tools
+        .iter()
+        .filter(|tool| is_sent(tool))
+        .map(|tool| (tool.name.clone(), tool.min.map(|min| min.to_string()).unwrap_or_default()))
+        .collect()
+}
+
+/// What the preflight `lines` say of each tool of `sent`, from the last tool line naming it exactly, in the order of
+/// `sent`; a name no line names has no entry, and a line naming no sent tool is not read.
+pub(crate) fn reported(lines: &[String], sent: &[String]) -> Vec<(String, Reported)> {
+    sent.iter()
+        .filter_map(|name| {
+            let said = lines.iter().rev().find_map(|line| {
+                let rest = line.strip_prefix(TOOL_LINE)?.strip_prefix(name.as_str())?;
+                rest.strip_prefix(' ')
+            })?;
+            Some((name.clone(), reported_as(said)))
+        })
+        .collect()
+}
+
+/// What the part of a tool line after its name, `said`, reports: `present`, `missing`, a `skipped:` and the reason it
+/// carries, which is empty when the box gave none, else the version text itself.
+fn reported_as(said: &str) -> Reported {
+    match said.trim() {
+        "present" => Reported::Present,
+        "missing" => Reported::Missing,
+        other => other
+            .strip_prefix("skipped:")
+            .map_or_else(|| Reported::Version(other.to_owned()), |why| Reported::Skipped(why.trim().to_owned())),
+    }
+}
+
+/// What the repo's manifest, as it was read (`None` when the repo has none, `Err` with why when it cannot be read or
+/// is no regular file), declares that the builder `host` lacks, given the tools `sent` in the preflight's `Needs` and
+/// what it `reported` of them: a need for each sent tool it found missing or below its minimum, and a skip line for a
+/// manifest that cannot be read, then for each problem of the manifest, then, in the manifest's order, for each tool
+/// not sent as unknown and each sent tool it did not probe, gave no answer for, or found at a version that cannot be
+/// read against a minimum. A known tool left unsent, as when the preflight could not carry the needs, says nothing.
+/// Every text from the manifest or the builder is escaped, and the builder's cut to [`FAILURE_BYTES`].
+pub(crate) fn judge(manifest: Option<&Result<Manifest, String>>, sent: &[String], reported: &[(String, Reported)], host: &str) -> Judged {
+    let manifest = match manifest {
+        None => return Judged::default(),
+        Some(Err(why)) => {
+            return Judged {
+                needs: Vec::new(),
+                skips: vec![skip_line(why)],
+            };
+        }
+        Some(Ok(manifest)) => manifest,
+    };
+    let mut judged = Judged {
+        needs: Vec::new(),
+        skips: manifest.problems.iter().map(|problem| skip_line(problem)).collect(),
+    };
+    for tool in &manifest.tools {
+        if !is_sent(tool) {
+            let name = one_line(&tool.name);
+            judged
+                .skips
+                .push(format!("gate: .gate/toolchain.toml names unknown tool {name}; skipping it"));
+            continue;
+        }
+        if !sent.contains(&tool.name) {
+            continue;
+        }
+        let answer = reported.iter().find(|(name, _)| *name == tool.name).map(|(_, answer)| answer);
+        let why = match answer.map(|answer| standing(tool.min, answer)) {
+            Some(Standing::Met) => continue,
+            Some(Standing::TooOld(found)) => {
+                judged.needs.push(lacking(tool, shown(&found)));
+                continue;
+            }
+            Some(Standing::Missing) => {
+                judged.needs.push(lacking(tool, "none".to_owned()));
+                continue;
+            }
+            None => NO_ANSWER.to_owned(),
+            Some(Standing::NotReadable) => NOT_READABLE.to_owned(),
+            Some(Standing::Skipped(why)) => shown(&why),
+        };
+        let name = one_line(&tool.name);
+        judged.skips.push(format!("gate: {host} did not probe {name}: {why}; not checking it"));
+    }
+    judged
+}
+
+/// The need of `tool`, of which the builder has `found`: its name, and `<min> or later` when it has a minimum.
+fn lacking(tool: &ToolNeed, found: String) -> Need {
+    let name = one_line(&tool.name);
+    let text = match tool.min {
+        Some(min) => format!("{name} {min} or later"),
+        None => name,
+    };
+    Need {
+        kind: NeedKind::Tool { found },
+        text,
+    }
 }
 
 /// The manifest whose file holds `bytes`; `Err` with the reason when they are not UTF-8 or do not parse.
@@ -366,7 +584,12 @@ fn attributes(text: &str) -> Vec<(&str, &str)> {
 #[cfg(test)]
 #[expect(clippy::expect_used, reason = "a fixture that does not read must fail loudly")]
 mod tests {
-    use super::{Manifest, ToolNeed, Version, dotnet_tools, godot_sdk_pins, meets, read, read_bytes, unreadable_line};
+    use super::{
+        Judged, Manifest, Reported, Standing, ToolNeed, Version, dotnet_tools, godot_sdk_pins, is_sent, judge, meets, needs_of, over_cap_line, read,
+        read_bytes, reported, reported_as, skip_line, standing, unreadable_line,
+    };
+    use crate::remote::git::FAILURE_BYTES;
+    use crate::remote::parity::{Need, NeedKind};
 
     fn version(major: u64, minor: u64, patch: u64) -> Version {
         Version { major, minor, patch }
@@ -604,6 +827,268 @@ mod tests {
         assert_eq!(
             unreadable_line("line 2, column 8: invalid string"),
             "gate: cannot read .gate/toolchain.toml: line 2, column 8: invalid string; skipping the manifest's checks"
+        );
+    }
+
+    fn lacks(text: &str, found: &str) -> Need {
+        Need {
+            kind: NeedKind::Tool { found: found.to_owned() },
+            text: text.to_owned(),
+        }
+    }
+
+    /// What `judge` makes of the manifest `text` when the builder said the lines `said` to a preflight sending its needs.
+    fn judged(text: &str, said: &[&str]) -> Judged {
+        let manifest = manifest(text);
+        let sent: Vec<String> = needs_of(&manifest).into_iter().map(|(name, _)| name).collect();
+        let said = owned(said);
+        judge(Some(&Ok(manifest)), &sent, &reported(&said, &sent), "builder")
+    }
+
+    #[test]
+    fn the_needs_sent_are_the_known_tools_in_file_order_with_their_minimums() {
+        let read = manifest("[tools]\nnodejs = \"24\"\nnode = \"24\"\n\"my tool\" = \"1\"\ncargo-nextest = \"\"\nNode = \"1\"\npwsh = \"7.5\"\n");
+        assert_eq!(
+            needs_of(&read),
+            [
+                ("node".to_owned(), "24.0.0".to_owned()),
+                ("cargo-nextest".to_owned(), String::new()),
+                ("pwsh".to_owned(), "7.5.0".to_owned()),
+            ],
+            "an unknown name, one that needs quoting and one in another case are never sent"
+        );
+        assert_eq!(needs_of(&Manifest::default()), []);
+    }
+
+    #[test]
+    fn a_tool_line_reports_a_version_present_missing_or_skipped() {
+        let sent = owned(&["node", "pnpm", "pwsh", "ffmpeg", "rust"]);
+        let said = owned(&[
+            "gate: remote version 0.1.0",
+            "gate: remote tool node 24.1.0",
+            "gate: remote tool pnpm present",
+            "gate: remote tool pwsh missing",
+            "gate: remote tool ffmpeg skipped: no answer in 10 s",
+        ]);
+        assert_eq!(
+            reported(&said, &sent),
+            [
+                ("node".to_owned(), Reported::Version("24.1.0".to_owned())),
+                ("pnpm".to_owned(), Reported::Present),
+                ("pwsh".to_owned(), Reported::Missing),
+                ("ffmpeg".to_owned(), Reported::Skipped("no answer in 10 s".to_owned())),
+            ],
+            "rust, which no line names, has no entry"
+        );
+    }
+
+    #[test]
+    fn a_tool_line_for_a_name_not_sent_is_not_read_and_the_last_line_of_a_name_wins() {
+        let sent = owned(&["node"]);
+        let said = owned(&[
+            "gate: remote tool node 20.0.0",
+            "gate: remote tool nodejs 24.0.0",
+            "gate: remote tool node24.0.0",
+            "gate: remote tool pwsh 7.5.0",
+            "gate: remote tool node 24.1.0",
+        ]);
+        assert_eq!(reported(&said, &sent), [("node".to_owned(), Reported::Version("24.1.0".to_owned()))]);
+        assert_eq!(reported(&owned(&["gate: remote tool nodejs 24.0.0"]), &sent), []);
+    }
+
+    #[test]
+    fn a_served_tool_says_nothing() {
+        let text = "[tools]\nnode = \"24\"\npwsh = \"\"\nffmpeg = \"\"\nrust = \"1.89\"\n";
+        let said = [
+            "gate: remote tool node 24.0.0",
+            "gate: remote tool pwsh present",
+            "gate: remote tool ffmpeg 7.1",
+            "gate: remote tool rust 1.90.0",
+        ];
+        assert_eq!(judged(text, &said), Judged::default());
+    }
+
+    #[test]
+    fn a_missing_or_too_old_tool_is_a_need_in_file_order() {
+        let text = "[tools]\npwsh = \"\"\ncargo-nextest = \"0.9.100\"\nnode = \"24\"\nffmpeg = \"7\"\n";
+        let said = [
+            "gate: remote tool node missing",
+            "gate: remote tool cargo-nextest 0.9.80",
+            "gate: remote tool pwsh missing",
+            "gate: remote tool ffmpeg 7.0.0",
+        ];
+        assert_eq!(
+            judged(text, &said),
+            Judged {
+                needs: vec![
+                    lacks("pwsh", "none"),
+                    lacks("cargo-nextest 0.9.100 or later", "0.9.80"),
+                    lacks("node 24.0.0 or later", "none"),
+                ],
+                skips: Vec::new(),
+            }
+        );
+    }
+
+    /// A box line whose skip carries no reason says a skip with an empty reason, never a version spelled `skipped:`.
+    #[test]
+    fn a_tool_line_skipped_with_no_reason_is_a_skip_and_not_a_version() {
+        assert_eq!(reported_as("skipped:"), Reported::Skipped(String::new()));
+        assert_eq!(reported_as("skipped:  "), Reported::Skipped(String::new()));
+        assert_eq!(
+            reported_as(" skipped: no probe for godot"),
+            Reported::Skipped("no probe for godot".to_owned())
+        );
+        assert_eq!(reported_as("0.9.80"), Reported::Version("0.9.80".to_owned()));
+    }
+
+    #[test]
+    fn each_tool_not_checked_says_its_skip_line_in_file_order_after_the_problems() {
+        let text = "[tools]\nnode = \"24\"\nnodejs = \"24\"\n\"my\\ntool\" = \"1\"\ngodot = \"4.7\"\npnpm = \"10\"\npwsh = \"7.5\"\n\
+                    rust = \"1.89\"\nffmpeg = \"x\"\n";
+        let said = [
+            "gate: remote tool node skipped: no answer in 10 s",
+            "gate: remote tool godot skipped: no probe for godot",
+            "gate: remote tool pnpm present",
+            "gate: remote tool pwsh 7.x",
+        ];
+        assert_eq!(
+            judged(text, &said),
+            Judged {
+                needs: Vec::new(),
+                skips: owned(&[
+                    "gate: .gate/toolchain.toml: tools.ffmpeg is not a version: \"x\"; skipping it",
+                    "gate: builder did not probe node: no answer in 10 s; not checking it",
+                    "gate: .gate/toolchain.toml names unknown tool nodejs; skipping it",
+                    "gate: .gate/toolchain.toml names unknown tool \"my\\ntool\"; skipping it",
+                    "gate: builder did not probe godot: no probe for godot; not checking it",
+                    "gate: builder did not probe pnpm: found, version not readable; not checking it",
+                    "gate: builder did not probe pwsh: found, version not readable; not checking it",
+                    "gate: builder did not probe rust: the builder gave no answer; not checking it",
+                ]),
+            }
+        );
+    }
+
+    #[test]
+    fn a_known_tool_left_unsent_says_nothing() {
+        let read = manifest("[tools]\nnode = \"24\"\nnodejs = \"1\"\n");
+        assert_eq!(
+            judge(Some(&Ok(read)), &[], &[], "builder"),
+            Judged {
+                needs: Vec::new(),
+                skips: owned(&["gate: .gate/toolchain.toml names unknown tool nodejs; skipping it"]),
+            },
+            "a preflight that could not carry the needs asked about none"
+        );
+    }
+
+    #[test]
+    fn a_repo_with_no_manifest_says_nothing_and_one_that_cannot_be_read_says_one_skip_line() {
+        assert_eq!(judge(None, &[], &[], "builder"), Judged::default());
+        let unreadable = Err("line 1, column 7: invalid table header".to_owned());
+        assert_eq!(
+            judge(Some(&unreadable), &[], &[], "builder"),
+            Judged {
+                needs: Vec::new(),
+                skips: owned(&["gate: .gate/toolchain.toml: line 1, column 7: invalid table header; skipping it"]),
+            }
+        );
+    }
+
+    #[test]
+    fn a_builder_s_reason_holding_control_characters_is_said_as_one_escaped_line() {
+        let said = judged("[tools]\nnode = \"24\"\n", &["gate: remote tool node skipped: a\rb\u{1b}[2J"]);
+        assert_eq!(
+            said.skips,
+            ["gate: builder did not probe node: a\\rb\\u{1b}[2J; not checking it"],
+            "{said:?}"
+        );
+    }
+
+    #[test]
+    fn a_manifest_problem_holding_a_bidi_mark_is_said_as_one_escaped_line() {
+        let problem = Manifest {
+            problems: owned(&["tools.\u{202e}x is bad"]),
+            ..Manifest::default()
+        };
+        assert_eq!(
+            judge(Some(&Ok(problem)), &[], &[], "builder").skips,
+            ["gate: .gate/toolchain.toml: tools.\\u{202e}x is bad; skipping it"]
+        );
+        let unreadable = Err("line 1\u{2028}gate: forged".to_owned());
+        assert_eq!(
+            judge(Some(&unreadable), &[], &[], "builder").skips,
+            ["gate: .gate/toolchain.toml: line 1\\u{2028}gate: forged; skipping it"]
+        );
+    }
+
+    #[test]
+    fn an_honest_builder_s_escaped_reason_is_said_unchanged() {
+        let said = judged(
+            "[tools]\nnode = \"24\"\n",
+            &["gate: remote tool node skipped: cannot run node: a\\u{1b}b"],
+        );
+        assert_eq!(
+            said.skips,
+            ["gate: builder did not probe node: cannot run node: a\\u{1b}b; not checking it"]
+        );
+    }
+
+    #[test]
+    fn a_too_old_version_with_endless_leading_zeros_is_cut() {
+        let found = format!("{}1.0.0", "0".repeat(10_000));
+        let said = judged("[tools]\nnode = \"24\"\n", &[&format!("gate: remote tool node {found}")]);
+        assert_eq!(said.needs.len(), 1, "{said:?}");
+        let shown = match &said.needs[0].kind {
+            NeedKind::Tool { found } => found.clone(),
+            NeedKind::Sdk => String::new(),
+        };
+        assert_eq!(shown.len(), FAILURE_BYTES, "cut to the failure cap: {said:?}");
+        assert!(found.starts_with(shown.as_str()));
+    }
+
+    #[test]
+    fn only_a_known_name_in_the_charset_is_sent() {
+        let named = |name: &str, known: bool| ToolNeed {
+            name: name.to_owned(),
+            min: None,
+            known,
+        };
+        assert!(is_sent(&named("cargo-nextest", true)));
+        for name in ["Node", "no de", "nöde", "node\n", "", &"n".repeat(33)] {
+            assert!(!is_sent(&named(name, true)), "{name:?} fails the charset, known or not");
+        }
+        assert!(is_sent(&named(&"n".repeat(32), true)), "32 characters is the most");
+        assert!(!is_sent(&named("nodejs", false)), "an unknown name");
+    }
+
+    #[test]
+    fn a_tool_stands_met_too_old_missing_not_readable_or_skipped() {
+        let min = Some(version(24, 0, 0));
+        let at = |text: &str| Reported::Version(text.to_owned());
+        assert_eq!(standing(min, &at("24.1.0")), Standing::Met);
+        assert_eq!(standing(min, &at("22.1.0")), Standing::TooOld("22.1.0".to_owned()));
+        assert_eq!(standing(min, &at("v24")), Standing::NotReadable);
+        assert_eq!(standing(min, &Reported::Present), Standing::NotReadable);
+        assert_eq!(standing(None, &Reported::Present), Standing::Met);
+        assert_eq!(standing(None, &at("1.0.0")), Standing::Met);
+        assert_eq!(standing(None, &Reported::Missing), Standing::Missing);
+        assert_eq!(
+            standing(min, &Reported::Skipped("no answer in 10 s".to_owned())),
+            Standing::Skipped("no answer in 10 s".to_owned())
+        );
+    }
+
+    #[test]
+    fn the_manifest_s_skip_lines_name_the_file_and_the_problem() {
+        assert_eq!(
+            skip_line("line 2, column 8: invalid string"),
+            "gate: .gate/toolchain.toml: line 2, column 8: invalid string; skipping it"
+        );
+        assert_eq!(
+            over_cap_line(8127),
+            "gate: .gate/toolchain.toml: its tools make the preflight call longer than the 8127 characters cmd takes; skipping it"
         );
     }
 

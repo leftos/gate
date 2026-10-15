@@ -431,7 +431,7 @@ fn the_remote_client_seams_need_a_value_once() {
         ))),
         ["gate: --test-remote-bound-ms must be a whole number above 0, got '0'"]
     );
-    for call in ["preflight", "run", "outputs", "install", "sdks", "stop"] {
+    for call in ["preflight", "run", "outputs", "install", "sdks", "stop", "manifest"] {
         let words = with(
             &RUN,
             &["--test-remote-transport", "local:b", "--test-remote-interrupt-at", call, "--", "cmd"],
@@ -443,7 +443,7 @@ fn the_remote_client_seams_need_a_value_once() {
             &RUN,
             &["--test-remote-transport", "local:b", "--test-remote-interrupt-at", "push", "--", "cmd"]
         ))),
-        ["gate: --test-remote-interrupt-at must be preflight, run, outputs, install, sdks or stop, got 'push'"]
+        ["gate: --test-remote-interrupt-at must be preflight, run, outputs, install, sdks, stop or manifest, got 'push'"]
     );
 }
 
