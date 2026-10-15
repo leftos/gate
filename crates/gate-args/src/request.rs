@@ -65,6 +65,9 @@ pub struct BoxSeams {
     /// The outputs folder's size budget in bytes for `gate box run`, over the built-in 50 GiB; `None` without the
     /// feature.
     pub outputs_budget_bytes: Option<u64>,
+    /// The most bytes `gate box inputs` unpacks from one put, decompressed, over the built-in 4 GiB; `None` without the
+    /// feature.
+    pub inputs_budget_bytes: Option<u64>,
     /// How long `gate box preflight`'s `dotnet --list-sdks` may take, in milliseconds, in place of the built-in 30 s;
     /// `None` without the feature.
     pub dotnet_limit_ms: Option<u64>,
@@ -94,6 +97,8 @@ pub enum BoxVerb {
     Outputs,
     /// How many of the builder's work folders a run holds.
     Inflight,
+    /// Which of a routed run's ignored inputs the work folder lacks, or their install.
+    Inputs,
 }
 
 impl BoxVerb {
@@ -107,6 +112,7 @@ impl BoxVerb {
             BoxVerb::Boot => "boot",
             BoxVerb::Outputs => "outputs",
             BoxVerb::Inflight => "inflight",
+            BoxVerb::Inputs => "inputs",
         }
     }
 }

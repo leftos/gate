@@ -24,9 +24,10 @@ use crate::support::{
     shown, start_with_closed, start_with_stdin, wait_until, wait_until_closed,
 };
 
+mod inputs;
 mod outputs;
 
-const BOX_USAGE: &str = "usage: gate box preflight|run|stop|boot|outputs|inflight --stdin (the base64 JSON request as stdin's first line)\n";
+const BOX_USAGE: &str = "usage: gate box preflight|run|stop|boot|outputs|inflight|inputs --stdin (the base64 JSON request as stdin's first line)\n";
 
 /// The request line for `json`, as the remote client encodes it: base64 of the JSON, without its newline.
 fn payload(json: &Value) -> String {

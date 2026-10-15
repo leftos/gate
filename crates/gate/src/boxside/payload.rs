@@ -10,7 +10,7 @@ use gate_router::{is_layout_name, repo_name};
 use serde_json::{Map, Value};
 
 use crate::outputs::archive::SUFFIX;
-use crate::outputs::hash::is_lower_hex;
+use crate::outputs::hash::{SHA256_DIGITS, is_lower_hex};
 use crate::remote::siblings::MOST_SIBLINGS;
 
 /// The decoded JSON object.
@@ -132,6 +132,25 @@ impl Payload {
                 .map(Some)
                 .ok_or_else(|| "gate: box payload Timeout is not a whole number of seconds".to_owned()),
         }
+    }
+
+    /// The run's `InputsDigest`, the SHA-256 of the inputs manifest line the client sent the work folder's inputs
+    /// with: 64 lower-case hex digits; `None` when the key is absent or null. Else the usage line, the value shown with
+    /// its control characters escaped.
+    pub(crate) fn inputs_digest(&self) -> Result<Option<&str>, String> {
+        match self.0.get("InputsDigest") {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::String(digest)) if is_lower_hex(digest, SHA256_DIGITS) => Ok(Some(digest)),
+            Some(other) => Err(format!(
+                "gate: box payload InputsDigest is not 64 lower-case hex digits: {}",
+                escaped(&other.as_str().map_or_else(|| other.to_string(), str::to_owned))
+            )),
+        }
+    }
+
+    /// Whether the payload sets `key` to anything but null.
+    pub(crate) fn sets(&self, key: &str) -> bool {
+        !matches!(self.0.get(key), None | Some(Value::Null))
     }
 
     /// The run's `Snapshot`: the payload's commit, exactly 40 lowercase hex digits, as the client sends it; else the
@@ -448,7 +467,7 @@ pub(crate) fn archive_key(name: &str) -> Option<&str> {
 
 /// The `<root>` of the work folder `path`, `<root>\work\<key>` with `work` in any case, without a trailing separator;
 /// `None` when `path` is not one.
-fn grandparent(path: &str) -> Option<&str> {
+pub(crate) fn grandparent(path: &str) -> Option<&str> {
     let parent = &path[..path.rfind(['\\', '/'])?];
     let split = parent.rfind(['\\', '/'])?;
     let (root, middle) = (&parent[..split], &parent[split + 1..]);

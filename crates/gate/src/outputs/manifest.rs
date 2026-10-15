@@ -90,6 +90,12 @@ impl Manifest {
         self.files.get(&ordinal_upper(path)).map(|(_, held)| held)
     }
 
+    /// Each file of the manifest, its path as given and what the PC holds there, in the order of the paths' simple
+    /// uppercase.
+    pub(crate) fn files(&self) -> impl Iterator<Item = (&str, &Held)> {
+        self.files.values().map(|(path, held)| (path.as_str(), held))
+    }
+
     /// The manifest's files by their SHA-256 ([`HeldBy`]), each path of `skip` left out, found without regard to case.
     pub(crate) fn by_hash(&self, skip: &[String]) -> HeldBy<'_> {
         let skip: HashSet<String> = skip.iter().map(|path| ordinal_upper(path)).collect();

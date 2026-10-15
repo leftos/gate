@@ -367,7 +367,7 @@ fn write_alternates(bare: &str, tree: &str, repair: bool) -> Result<(), String> 
 
 /// Makes the folder `folder` when nothing has its name, read without following a link; one that is a link, a junction
 /// or a file is removed as itself and made again when `repair`, else refused. Else why not.
-fn made_folder(folder: &Path, repair: bool) -> Result<(), String> {
+pub(super) fn made_folder(folder: &Path, repair: bool) -> Result<(), String> {
     match fs::symlink_metadata(folder) {
         Ok(metadata) if metadata.is_dir() => return Ok(()),
         Ok(_) if !repair => return Err(format!("{} is a link, a junction or a file", folder.display())),
@@ -380,7 +380,7 @@ fn made_folder(folder: &Path, repair: bool) -> Result<(), String> {
 
 /// Writes `text` as the file `file` unless it already holds exactly that, read without following a link; anything
 /// else at its name is removed as itself first. Else why not.
-fn written(file: &Path, text: &str) -> Result<(), String> {
+pub(super) fn written(file: &Path, text: &str) -> Result<(), String> {
     match fs::symlink_metadata(file) {
         Ok(found) if found.is_file() && fs::read(file).is_ok_and(|held| held == text.as_bytes()) => return Ok(()),
         Ok(_) => remove_entry(file).map_err(|error| error.to_string())?,

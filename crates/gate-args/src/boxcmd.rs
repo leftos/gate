@@ -1,7 +1,7 @@
 //! The hidden `gate box <verb> --stdin`: the builder side of a routed run. Only the words are read here; the request
 //! is stdin's first line, which the binary reads and decodes. A `test-seams` build also reads the hidden
 //! `--test-heartbeat-ms <n>`, `--test-box-console fail-before`, `--test-box-token refused`, `--test-box-park-launch <path>`,
-//! `--test-outputs-budget-bytes <n>`, `--test-dotnet-limit-ms <n>`, `--test-box-sample-ms <n>`, `--test-box-sampler-fail
+//! `--test-outputs-budget-bytes <n>`, `--test-inputs-budget-bytes <n>`, `--test-dotnet-limit-ms <n>`, `--test-box-sample-ms <n>`, `--test-box-sampler-fail
 //! true|false`, `--test-box-free-percent <1-100>`, `--test-box-kill-leaves <n>` and `--test-probe-limit-ms <n>` (each also
 //! as `--<seam>=<value>`) before the verb;
 //! without the feature each is no verb, and so the box usage.
@@ -41,6 +41,7 @@ fn verb(text: &str) -> Option<BoxVerb> {
         "boot" => Some(BoxVerb::Boot),
         "outputs" => Some(BoxVerb::Outputs),
         "inflight" => Some(BoxVerb::Inflight),
+        "inputs" => Some(BoxVerb::Inputs),
         _ => None,
     }
 }
@@ -59,6 +60,8 @@ enum Seam {
     ParkLaunch,
     /// `--test-outputs-budget-bytes <n>`: the output folder's outputs size budget, in bytes.
     OutputsBudgetBytes,
+    /// `--test-inputs-budget-bytes <n>`: the most bytes one inputs put unpacks, decompressed.
+    InputsBudgetBytes,
     /// `--test-dotnet-limit-ms <n>`: how long the preflight's `dotnet --list-sdks` may take.
     DotnetLimitMs,
     /// `--test-box-sample-ms <n>`: the period of the run's samples of its machine.
@@ -84,6 +87,7 @@ impl Seam {
             "--test-box-token" => Some(Seam::Token),
             "--test-box-park-launch" => Some(Seam::ParkLaunch),
             "--test-outputs-budget-bytes" => Some(Seam::OutputsBudgetBytes),
+            "--test-inputs-budget-bytes" => Some(Seam::InputsBudgetBytes),
             "--test-dotnet-limit-ms" => Some(Seam::DotnetLimitMs),
             "--test-box-sample-ms" => Some(Seam::SampleMs),
             "--test-box-sampler-fail" => Some(Seam::SamplerFail),
@@ -102,6 +106,7 @@ impl Seam {
             Seam::Token => "--test-box-token",
             Seam::ParkLaunch => "--test-box-park-launch",
             Seam::OutputsBudgetBytes => "--test-outputs-budget-bytes",
+            Seam::InputsBudgetBytes => "--test-inputs-budget-bytes",
             Seam::DotnetLimitMs => "--test-dotnet-limit-ms",
             Seam::SampleMs => "--test-box-sample-ms",
             Seam::SamplerFail => "--test-box-sampler-fail",
@@ -142,7 +147,7 @@ fn seams(words: &mut Peekable<impl Iterator<Item = OsString>>, problems: &mut Ve
 
 /// Sets `seam` from `value`: whole milliseconds above 0 for the heartbeat, the dotnet limit, the sample period and the
 /// probe limit, `fail-before` for the console, `refused` for the token, any path for the park, whole bytes above 0 for the
-/// outputs budget, `true` or `false` for the sampler's failure, a whole percent from 1 to 100 for the free share, a whole
+/// outputs and the inputs budgets, `true` or `false` for the sampler's failure, a whole percent from 1 to 100 for the free share, a whole
 /// count above 0 for the processes a kill leaves. An empty or
 /// missing value is no value.
 #[cfg(feature = "test-seams")]
@@ -155,6 +160,7 @@ fn set_seam(seams: &mut BoxSeams, seam: Seam, value: Result<Option<String>, Prob
     match seam {
         Seam::HeartbeatMs => seams.heartbeat_ms = Some(crate::values::above_zero(name, &value)?),
         Seam::OutputsBudgetBytes => seams.outputs_budget_bytes = Some(crate::values::above_zero(name, &value)?),
+        Seam::InputsBudgetBytes => seams.inputs_budget_bytes = Some(crate::values::above_zero(name, &value)?),
         Seam::DotnetLimitMs => seams.dotnet_limit_ms = Some(crate::values::above_zero(name, &value)?),
         Seam::SampleMs => seams.sample_ms = Some(crate::values::above_zero(name, &value)?),
         Seam::SamplerFail => seams.sampler_fail = crate::values::true_or_false(name, &value)?,

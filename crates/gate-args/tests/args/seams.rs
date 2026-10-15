@@ -819,7 +819,7 @@ fn the_bridge_seams_are_unknown_options() {
 }
 
 /// The one line a malformed `gate box` prints.
-const BOX_USAGE: &str = "usage: gate box preflight|run|stop|boot|outputs|inflight --stdin (the base64 JSON request as stdin's first line)";
+const BOX_USAGE: &str = "usage: gate box preflight|run|stop|boot|outputs|inflight|inputs --stdin (the base64 JSON request as stdin's first line)";
 
 #[cfg(feature = "test-seams")]
 #[test]
@@ -968,6 +968,92 @@ fn box_seam_outputs_budget_bytes_refuses_what_the_run_seams_refuse() {
     for (words, want) in rows {
         assert_eq!(problems(words), want, "{words:?}");
     }
+}
+
+#[cfg(feature = "test-seams")]
+#[test]
+fn box_seam_inputs_budget_bytes_is_read_before_the_verb() {
+    use gate_args::{BoxRequest, BoxSeams, BoxVerb, Invocation};
+
+    use crate::support::invocation;
+
+    let budgeted = |inputs_budget_bytes| {
+        Invocation::Box(BoxRequest {
+            verb: BoxVerb::Inputs,
+            seams: BoxSeams {
+                inputs_budget_bytes,
+                ..BoxSeams::default()
+            },
+        })
+    };
+    assert_eq!(
+        invocation(&["box", "--test-inputs-budget-bytes", "1024", "inputs", "--stdin"]),
+        budgeted(Some(1024))
+    );
+    assert_eq!(
+        invocation(&["box", "--test-inputs-budget-bytes=1024", "inputs", "--stdin"]),
+        budgeted(Some(1024))
+    );
+    assert_eq!(invocation(&["box", "inputs", "--stdin"]), budgeted(None), "no seam given, none set");
+    assert_eq!(
+        invocation(&["box", "--test-inputs-budget-bytes", "2147483647", "inputs", "--stdin"]),
+        budgeted(Some(2_147_483_647))
+    );
+}
+
+#[cfg(feature = "test-seams")]
+#[test]
+fn box_seam_inputs_budget_bytes_refuses_what_the_outputs_budget_refuses() {
+    let rows: [(&[&str], &[&str]); 7] = [
+        (
+            &["box", "--test-inputs-budget-bytes", "--test-inputs-budget-bytes=2", "inputs", "--stdin"],
+            &[
+                "gate: --test-inputs-budget-bytes needs a value",
+                "gate: --test-inputs-budget-bytes is given twice",
+            ],
+        ),
+        (
+            &["box", "--test-inputs-budget-bytes=", "inputs", "--stdin"],
+            &["gate: --test-inputs-budget-bytes needs a value"],
+        ),
+        (
+            &["box", "--test-inputs-budget-bytes", "0", "inputs", "--stdin"],
+            &["gate: --test-inputs-budget-bytes must be a whole number above 0, got '0'"],
+        ),
+        (
+            &["box", "--test-inputs-budget-bytes", "fast", "inputs", "--stdin"],
+            &["gate: --test-inputs-budget-bytes must be a whole number above 0, got 'fast'"],
+        ),
+        (
+            &["box", "--test-inputs-budget-bytes", "2147483648", "inputs", "--stdin"],
+            &["gate: --test-inputs-budget-bytes must be at most 2147483647, got '2147483648'"],
+        ),
+        (
+            &[
+                "box",
+                "--test-inputs-budget-bytes",
+                "1",
+                "--test-inputs-budget-bytes=2",
+                "inputs",
+                "--stdin",
+            ],
+            &["gate: --test-inputs-budget-bytes is given twice"],
+        ),
+        (
+            &["box", "--test-inputs-budget-bytes"],
+            &["gate: --test-inputs-budget-bytes needs a value", BOX_USAGE],
+        ),
+    ];
+    for (words, want) in rows {
+        assert_eq!(problems(words), want, "{words:?}");
+    }
+}
+
+#[cfg(not(feature = "test-seams"))]
+#[test]
+fn box_seam_inputs_budget_bytes_is_an_unknown_word_without_the_feature() {
+    assert_eq!(problems(&["box", "--test-inputs-budget-bytes", "30", "inputs", "--stdin"]), [BOX_USAGE]);
+    assert_eq!(problems(&["box", "--test-inputs-budget-bytes=30", "inputs", "--stdin"]), [BOX_USAGE]);
 }
 
 #[cfg(not(feature = "test-seams"))]
