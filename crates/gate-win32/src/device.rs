@@ -90,9 +90,15 @@ mod tests {
         assert_eq!(error.raw_os_error(), Some(ERROR_ACCESS_DENIED.cast_signed()));
     }
 
+    /// A builder's routed command runs under a token the system refuses the device namespace (access denied), which
+    /// the route reads as "not a subst drive"; anywhere else C: names its device.
     #[test]
-    fn c_names_a_device() {
-        let target = device_target('C').ok().flatten();
-        assert!(target.is_some_and(|target| target.starts_with('\\')), "C: names a device");
+    fn c_names_a_device_or_is_refused() {
+        let target = device_target('C');
+        let named = target
+            .as_ref()
+            .is_ok_and(|target| target.as_deref().is_some_and(|target| target.starts_with('\\')));
+        let refused = target.as_ref().is_err_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied);
+        assert!(named || refused, "C: names a device or its lookup is refused, got {target:?}");
     }
 }
