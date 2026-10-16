@@ -34,6 +34,7 @@ use crate::boxside::forward::{DRAIN, Forwarders, OutputLock};
 use crate::boxside::heartbeat;
 use crate::boxside::inputs;
 use crate::boxside::outputs::{self, Asked};
+use crate::boxside::packages;
 use crate::boxside::payload::{PairSibling, Payload, bare_stem, escaped, ordinal_upper, trees};
 use crate::boxside::preflight::{self, Failed, GIT_REDIRECTS, Git, GitFailure, Unready, exit_code, git_failed};
 use crate::boxside::stop::{Ending, STOPPED, stop_event_name, terminate_and_wait};
@@ -85,6 +86,12 @@ const LAYOUT_CHANGING: &str = "changing";
 /// What the layout record says of a run of one repo's layout, checked out in the work folder itself; no record says the
 /// same.
 pub(super) const LAYOUT_SINGLE: &str = "single";
+/// The warm record of the work folder `work`, `{work}.warm`: the hash of the warm-up file whose commands last passed
+/// in it, written once they all did and removed whenever the folder's state changes under it.
+pub(super) fn warm_record(work: &str) -> String {
+    format!("{work}.warm")
+}
+
 /// The identity variables the payload may set for the back commit.
 const IDENTITY_NAMES: [&str; 6] = [
     "GIT_AUTHOR_NAME",
@@ -107,7 +114,10 @@ pub(super) struct Request<'a> {
     lock: &'a str,
     index: &'a str,
     pub(super) job: &'a str,
-    command: Vec<String>,
+    /// Each command's words, its program first: the one command of a run, or each of a warm-up's in order.
+    commands: Vec<Vec<String>>,
+    /// The warm-up file's hash a warm-up records in `{Work}.warm` once every command passed; `None` for a run.
+    warm_hash: Option<&'a str>,
     subfolder: &'a str,
     identity: Vec<(String, String)>,
     /// The outputs the run brings back, `None` when it has no output globs.
@@ -151,7 +161,7 @@ impl Request<'_> {
         let lock = payload.beside_work("Lock", work, "lock")?;
         let index = payload.beside_work("Index", work, "index")?;
         let job = payload.job(key)?;
-        let command = payload.words("Command")?;
+        let commands = payload.commands()?;
         let subfolder = payload.optional_text("Subfolder")?;
         let identity = identity(payload)?;
         let inputs_digest = payload.inputs_digest()?;
@@ -165,7 +175,8 @@ impl Request<'_> {
             lock,
             index,
             job,
-            command,
+            commands: commands.words,
+            warm_hash: commands.warm_hash,
             subfolder,
             identity,
             outputs,
@@ -181,6 +192,12 @@ impl Request<'_> {
     /// The main repo's tree, which the command's subfolder, the tool manifests and the outputs are read in.
     pub(super) fn tree(&self) -> &str {
         &self.main.tree
+    }
+
+    /// Each command's words, its program first, as the payload gives them: one command for a run, each of a warm-up's
+    /// in order.
+    pub(super) fn commands(&self) -> &[Vec<String>] {
+        &self.commands
     }
 
     /// Every repo of the run, the main one first.
@@ -366,7 +383,8 @@ fn identity(payload: &Payload) -> Result<Vec<(String, String)>, String> {
 /// when it could not be started, 75 when another run holds the work folder, it could not be laid out for the run's
 /// repos or its dotnet tools could not be restored, 2 for a payload or a word refused, a failing git step's status, 1
 /// when the box failed, the tree of a passed command could not be committed back or a passed command's outputs are not
-/// brought back, or 255 when the client closed the connection and the box stopped the job.
+/// brought back, or 255 when the client closed the connection and the box stopped the job. A warm-up's payload runs
+/// its commands in order instead and brings nothing back ([`warm_up`]).
 /// Once the subfolder is checked, a heartbeat goes to stderr every period, 5 s unless `seams` set it, until the run
 /// ends; `seams` may also make the command's console fail, or park its launch.
 pub(crate) fn run(payload: &Payload, seams: &BoxSeams, console: &mut Console) -> u32 {
@@ -414,6 +432,9 @@ pub(super) struct Beat<'a> {
     pump: Option<&'a Pump>,
     seams: &'a BoxSeams,
     pub(super) stop: StopSignal<'a>,
+    /// The load-adjusted seconds the box's ceiling counted for the last command it watched, set as that ceiling ends;
+    /// `None` before any, for a command under no ceiling, and once the sampler failed.
+    adjusted: Cell<Option<f64>>,
 }
 
 /// The run's stop signal as the box looks at it ([`look`]): set is a stop, unset none, and one that cannot be read is
@@ -480,9 +501,9 @@ impl Beat<'_> {
 }
 
 /// The work folder and the folder below it the command runs in, both full paths.
-struct Folders<'a> {
-    work: &'a Path,
-    place: &'a Path,
+pub(super) struct Folders<'a> {
+    pub(super) work: &'a Path,
+    pub(super) place: &'a Path,
 }
 
 /// A run's outputs step as it goes: what the run asks for, the PC's manifest or why it could not be read, and the
@@ -591,6 +612,7 @@ fn in_work_folder(request: &Request<'_>, stop: &NamedEvent, seams: &BoxSeams, co
         pump: pump.as_ref(),
         seams,
         stop: StopSignal::new(stop, request.job),
+        adjusted: Cell::new(None),
     };
     // Read while the heartbeat beats and before the checkout, so the client can take its time hashing the PC's files.
     let mut outputs = request.outputs.as_ref().map(|asked| RunOutputs::read(asked, &beat, console));
@@ -605,10 +627,10 @@ fn in_work_folder(request: &Request<'_>, stop: &NamedEvent, seams: &BoxSeams, co
     ran
 }
 
-/// The run once the heartbeat beats: the snapshot checked out, the repo's dotnet tools restored, the outputs listed,
-/// the command seen to its end in the place, the tree it left committed back unless the box's ceiling killed it, and,
-/// after a passed command, its outputs packed; the status as [`in_work_folder`] gives it, 1 for a passed command whose
-/// outputs are not brought back, [`KILLED`] for a killed one.
+/// The run once the heartbeat beats: the snapshot checked out, the repo's dotnet tools restored, a pnpm command's pnpm
+/// packages installed, the outputs listed, the command seen to its end in the place, the tree it left committed back
+/// unless the box's ceiling killed it, and, after a passed command, its outputs packed; the status as
+/// [`in_work_folder`] gives it, 1 for a passed command whose outputs are not brought back, [`KILLED`] for a killed one.
 fn checked_out(
     request: &Request<'_>,
     git: &WorkGit,
@@ -618,10 +640,18 @@ fn checked_out(
     console: &mut Console,
 ) -> Result<u32, u32> {
     ready(request, git, folders, beat, console)?;
+    if let Some(hash) = request.warm_hash {
+        return warm_up(request, hash, folders.place, beat, console);
+    }
     if let Some(outputs) = outputs.as_deref_mut() {
         outputs.list(folders.work, beat, console);
     }
-    let ran = command(request, folders.place, beat, console).inspect_err(|_| back_commits_failed(request, beat, console))?;
+    let one = One {
+        words: request.commands.first().map_or(&[][..], Vec::as_slice),
+        timeout: request.timeout,
+        of: Of::Run,
+    };
+    let ran = command(request, &one, folders.place, beat, console).inspect_err(|_| back_commits_failed(request, beat, console))?;
     let status = match ran {
         Ran::Exited(status) => status,
         // The PC applies nothing of a run the box killed, and a process its kill could not end may still be writing.
@@ -649,9 +679,200 @@ fn checked_out(
     }
 }
 
-/// The run up to its command: the snapshot laid out and checked out, the subfolder found and the repo's dotnet tools
-/// restored; else `Err` with the status the run ends on, its lines said. A refusal is said as such; any other end is
-/// followed, on a pair run, by the box's `gate: remote back commits: failed` line ([`ended_before`]).
+/// A warm-up once its work folder is ready, its tools and every pnpm lockfile its commands need restored: the warm
+/// record `{Work}.warm` removed, the start marker said once, then each command run in `place` in order, as a run's
+/// command is ([`command`]), with the stop signal looked at before each. The warm-up's `Timeout` is one budget: each
+/// command's ceiling is what the earlier ones left of it ([`remaining_budget`]). The first command that ends non-zero,
+/// is killed or finds no budget left ends the warm-up, said, with its status ([`KILLED`] for the last two). Once every
+/// command passed, the record is written holding `hash` and `gate: remote warm <hash>` is said, last; 0. Nothing is
+/// committed back and no outputs are packed. `Err` with the status of a warm-up that ended otherwise, its line said: 1
+/// when the record could not be removed or written, or for a stop that came before a command started. A warm-up that
+/// did not pass removes the record once more, so none a command wrote itself outlives it.
+fn warm_up(request: &Request<'_>, hash: &str, place: &Path, beat: &Beat<'_>, console: &mut Console) -> Result<u32, u32> {
+    let record = warm_record(request.work);
+    record_step(preflight::remove_entry(Path::new(&record)), "remove", &record, beat, console)?;
+    beat.say(console, &started_line(request.nonce));
+    let ended = match warm_commands(request, place, beat, console) {
+        Ok(0) => {
+            let written = written_retrying(&record, hash, || thread::sleep(WARM_WRITE_WAIT));
+            record_step(written, "write", &record, beat, console).map(|()| 0)
+        }
+        other => other,
+    };
+    if ended == Ok(0) {
+        beat.say(console, &format!("gate: remote warm {hash}"));
+    } else {
+        // Said when it fails; the warm-up's own status stands.
+        let _ = record_step(preflight::remove_entry(Path::new(&record)), "remove", &record, beat, console);
+    }
+    ended
+}
+
+/// How long the warm record's write waits before it tries again while another process has the record open, and how
+/// many times it waits.
+const WARM_WRITE_WAIT: Duration = Duration::from_millis(100);
+const WARM_WRITE_WAITS: u32 = 10;
+
+/// Each of a warm-up's commands run in `place` in order ([`warm_up`]): 0 once all passed, else the status of the first
+/// that did not, or of a budget spent before a command, said; `Err` as [`command`] gives it.
+fn warm_commands(request: &Request<'_>, place: &Path, beat: &Beat<'_>, console: &mut Console) -> Result<u32, u32> {
+    let count = request.commands.len();
+    let mut spent = 0.0;
+    for (index, words) in request.commands.iter().enumerate() {
+        let at = index + 1;
+        let budget = request.timeout.map(|budget| (budget, remaining_budget(budget, spent)));
+        if let Some((budget, None)) = budget {
+            beat.say(
+                console,
+                &format!("gate: remote warm-up ran out of its {budget} s budget before command {at} of {count}"),
+            );
+            return Ok(KILLED);
+        }
+        let timeout = budget.and_then(|(_, left)| left);
+        beat.adjusted.set(None);
+        let began = Instant::now();
+        let one = One {
+            words,
+            timeout,
+            of: Of::WarmUp,
+        };
+        let ran = command(request, &one, place, beat, console)?;
+        spent += command_spent(beat.adjusted.get(), began.elapsed());
+        let status = match ran {
+            Ran::Exited(status) => status,
+            Ran::Killed => KILLED,
+        };
+        if status != 0 {
+            beat.say(console, &format!("gate: remote warm-up stopped at command {at} of {count}"));
+            return Ok(status);
+        }
+        let left = request.timeout.and_then(|budget| remaining_budget(budget, spent));
+        if let (true, Some(left)) = (at < count, left) {
+            let waited = Instant::now();
+            job_name_freed(request.job, beat, Duration::from_secs(left.saturating_mul(BACKSTOP_TIMES)), console);
+            spent += gap_spent(waited.elapsed());
+        }
+    }
+    Ok(0)
+}
+
+/// How often a warm-up looks for the name of a command's job to be free before the next.
+const JOB_GONE_STEP: Duration = Duration::from_millis(20);
+/// How many times the budget left a warm-up waits for a job's name at most, in wall time: the backstop a command's
+/// ceiling has.
+const BACKSTOP_TIMES: u64 = 5;
+
+/// Returns once no job has the name `job`, a stop came (`beat`'s stop signal, its unread line said the first time
+/// under the box's output lock), or `limit` of
+/// wall time passed: a process its command left and the box ended ([`ended_whole`]) leaves its job's count before its
+/// handles close, an inherited handle to the job among them, so the job can outlive its last process for as long as
+/// the machine takes to tear those down. A stop is then the next command's stop outcome ([`before_the_job`]); a job
+/// still there, or one that cannot be looked for, is left to the next command's job creation, which refuses its name
+/// with its own line. A client gone meanwhile is not seen here: no output of the box's is being forwarded between
+/// commands.
+fn job_name_freed(job: &str, beat: &Beat<'_>, limit: Duration, console: &mut Console) {
+    let started = Instant::now();
+    while matches!(gate_win32::OpenedJob::open(job), Ok(Some(_))) && started.elapsed() < limit {
+        let stopped = {
+            // Held, so the line saying the signal cannot be read never lands inside a heartbeat line.
+            let _held = beat.lock.lock().unwrap_or_else(PoisonError::into_inner);
+            beat.stop.seen(STARTING_COMMAND, console)
+        };
+        if stopped {
+            return;
+        }
+        thread::sleep(JOB_GONE_STEP);
+    }
+}
+
+/// The seconds of a warm-up's budget a wait of `wall` time between two commands spends: a fifth of it, as a command
+/// is charged at least ([`command_spent`]), so the whole warm-up's wall time stays near five budgets.
+fn gap_spent(wall: Duration) -> f64 {
+    wall.as_secs_f64() / 5.0
+}
+
+/// Writes `text` as the whole of the warm record `record` ([`tools::write_record_file`], which shares it with no one),
+/// trying again after `between` while another process has it open, as a preflight reading it may, at most
+/// [`WARM_WRITE_WAITS`] times; else the last try's error.
+fn written_retrying(record: &str, text: &str, mut between: impl FnMut()) -> io::Result<()> {
+    let mut waits = 0;
+    loop {
+        match tools::write_record_file(record, text) {
+            Err(error) if error.raw_os_error() == Some(SHARING_VIOLATION) && waits < WARM_WRITE_WAITS => {
+                between();
+                waits += 1;
+            }
+            done => return done,
+        }
+    }
+}
+
+/// What a step that removes or writes (`what`) the warm record `record` did: on a failure, the line saying it could
+/// not, said under the box's output lock, and `Err` with status 1.
+fn record_step(done: io::Result<()>, what: &str, record: &str, beat: &Beat<'_>, console: &mut Console) -> Result<(), u32> {
+    done.map_err(|error| {
+        let line = format!("gate: remote could not {what} {}: {}", escaped(record), escaped(&error.to_string()));
+        beat.say(console, &line);
+        FAILED_STATUS
+    })
+}
+
+/// Ends every process a warm-up's command left in its `job` and waits until it holds none ([`terminate_and_wait`]),
+/// so the next command's job, which takes the same name, finds none of that name still alive; what the job still
+/// holds, or why it could not be ended, is said under the box's output lock.
+fn ended_whole(job: &Job, beat: &Beat<'_>, console: &mut Console) {
+    let ending = terminate_and_wait(job);
+    let _held = beat.lock.lock().unwrap_or_else(PoisonError::into_inner);
+    match ending {
+        Ok(ending) => ending.say(job.name(), console),
+        Err(error) => console.err(&format!("gate: remote could not end job {}: {error}", job.name())),
+    }
+}
+
+/// The whole seconds of a warm-up's `budget` left once its commands have spent `spent` seconds of it, rounded up and
+/// at least 1; `None` once nothing is left.
+#[expect(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "the payload bounds the budget to 2^31 - 1, which an f64 holds exactly, and what is left is positive and at most the budget"
+)]
+fn remaining_budget(budget: u64, spent: f64) -> Option<u64> {
+    let left = budget as f64 - spent;
+    // A positive amount rounded up is at least 1.
+    (left > 0.0).then(|| left.ceil() as u64)
+}
+
+/// The seconds of a warm-up's budget one command spent: the load-adjusted seconds its ceiling counted, but at least a
+/// fifth of its `wall` time, so the whole warm-up's wall time stays near five budgets as each command's backstop
+/// keeps one command's; its wall time when there are none because the sampler failed and the clock stopped.
+fn command_spent(adjusted: Option<f64>, wall: Duration) -> f64 {
+    let wall = wall.as_secs_f64();
+    adjusted.map_or(wall, |adjusted| adjusted.max(wall / 5.0))
+}
+
+/// One command as [`command`] starts it: its words, its program first; its ceiling in whole seconds of load-adjusted
+/// time, `None` for none; and what it is a command of ([`Of`]).
+struct One<'w> {
+    words: &'w [String],
+    timeout: Option<u64>,
+    of: Of,
+}
+
+/// What a command [`command`] starts is a command of.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Of {
+    /// A run: the start marker is said just before its launch.
+    Run,
+    /// A warm-up, whose start marker was said before its first command: its job is ended whole once it is over
+    /// ([`ended_whole`]), so the next command can take the job's name.
+    WarmUp,
+}
+
+/// The run up to its command: the snapshot laid out and checked out, the subfolder found, the repo's dotnet tools
+/// restored and, for a pnpm command, its pnpm packages installed ([`packages::update`]); else `Err` with the status the
+/// run ends on, its lines said. A refusal is said as such; any other end is followed, on a pair run, by the box's
+/// `gate: remote back commits: failed` line ([`ended_before`]).
 fn ready(request: &Request<'_>, git: &WorkGit, folders: &Folders<'_>, beat: &Beat<'_>, console: &mut Console) -> Result<(), u32> {
     let held = match git.lay_out(&request.laid(), console) {
         Ok(held) => held,
@@ -671,7 +892,9 @@ fn ready(request: &Request<'_>, git: &WorkGit, folders: &Folders<'_>, beat: &Bea
         ));
         return Err(ended_before(u32::from(USAGE_STATUS), request, beat, console));
     }
-    match tools::update(request, folders.work, folders.place, beat, console) {
+    let restored =
+        tools::update(request, folders.work, folders.place, beat, console).and_then(|()| packages::update(request, git, folders, beat, console));
+    match restored {
         // The tools' refusal, its tag said: the PC runs the command itself and syncs nothing back.
         Err(REFUSED_STATUS) => Err(REFUSED_STATUS),
         Err(status) => Err(ended_before(status, request, beat, console)),
@@ -710,7 +933,8 @@ fn back_commits_failed(request: &Request<'_>, beat: &Beat<'_>, console: &mut Con
 /// On a pair run, says `gate: remote back commits: failed`, for a run that ended before its command without a refusal;
 /// the caller holds the box's output lock, or nothing else writes to the box's output yet.
 fn no_back_commits(request: &Request<'_>, console: &mut Console) {
-    if !request.siblings.is_empty() {
+    // A warm-up brings nothing back, so it never says how its back commits went.
+    if !request.siblings.is_empty() && request.warm_hash.is_none() {
         console.err("gate: remote back commits: failed");
     }
 }
@@ -881,8 +1105,8 @@ pub(super) fn full_path(path: &Path) -> Option<PathBuf> {
 /// `Err` with the status of a run that ends here, its line said: 2 for a batch word refused, 1 for the box's own
 /// failure or a stop that came first, 255 for a client that closed the connection. The job's stop signal is looked at
 /// just before the job is created ([`before_the_job`]), so a stop that came while the snapshot was checked out starts
-/// nothing; the restore looks at it the same way before it runs, so such a stop runs no restore either
-/// ([`crate::boxside::tools`]). The command starts on a UTF-8 console when it can have one ([`start_command`]), whose
+/// nothing; the tool restore and the pnpm install look at it the same way before they run, so such a stop runs neither
+/// ([`crate::boxside::tools`], [`crate::boxside::packages`]). The command starts on a UTF-8 console when it can have one ([`start_command`]), whose
 /// donor lives until the wait for the command is over, however it ends. The heartbeat watches the job while [`watch`]
 /// waits for it. The command's environment is the box's own with the build-server settings of its run set over it
 /// ([`Variables::with_build_servers`]), replacing any value the box inherited: the compiler server's pipe and
@@ -891,13 +1115,13 @@ pub(super) fn full_path(path: &Path) -> Option<PathBuf> {
 /// set to `*` over that ([`with_safe_directory`]), and the Event Log logging provider of a .NET host the command starts
 /// is turned off over that ([`with_event_log_off`]). The command runs with a restricted copy of the box's token
 /// ([`restricted_token`]).
-fn command(request: &Request<'_>, place: &Path, beat: &Beat<'_>, console: &mut Console) -> Result<Ran, u32> {
+fn command(request: &Request<'_>, one: &One<'_>, place: &Path, beat: &Beat<'_>, console: &mut Console) -> Result<Ran, u32> {
     let run = format!("gate-box-{}", request.nonce);
     let variables = with_event_log_off(with_safe_directory(Variables::from_process().with_build_servers(&run)));
     let environment = variables
         .block()
         .map_err(|error| failed(console, &format!("cannot build the command's environment: {error}")))?;
-    let Some((word, rest)) = request.command.split_first() else {
+    let Some((word, rest)) = one.words.split_first() else {
         return Err(failed(console, "the run has no command"));
     };
     let rest: Vec<OsString> = rest.iter().map(OsString::from).collect();
@@ -933,7 +1157,7 @@ fn command(request: &Request<'_>, place: &Path, beat: &Beat<'_>, console: &mut C
         stop: &beat.stop,
         word,
         program: &program,
-        nonce: request.nonce,
+        marker: (one.of == Of::Run).then_some(request.nonce),
         refuse_token: beat.seams.refuse_token,
     };
     let launched = match start_command(&mut start, donor.as_ref().map_err(String::as_str), beat, console) {
@@ -943,9 +1167,9 @@ fn command(request: &Request<'_>, place: &Path, beat: &Beat<'_>, console: &mut C
     let mut stopper = Stopper { job: &job, armed: true };
     let keep: Vec<u32> = donor.as_ref().map(Donor::pid).into_iter().collect();
     let spec = Spec {
-        timeout: request.timeout,
+        timeout: one.timeout,
         host: escaped(request.host),
-        spoken: escaped(&request.command.join(" ")),
+        spoken: escaped(&one.words.join(" ")),
         nonce: request.nonce,
     };
     let ceiling = Ceiling::begin(spec, &job, beat.lock, beat.seams, console);
@@ -960,6 +1184,9 @@ fn command(request: &Request<'_>, place: &Path, beat: &Beat<'_>, console: &mut C
     stopper.armed = false;
     // Ended only now, so the command's console stays up for as long as the command may use it.
     drop(donor);
+    if one.of == Of::WarmUp {
+        ended_whole(&job, beat, console);
+    }
     watched
 }
 
@@ -971,7 +1198,7 @@ const GIT_CONFIG_COUNT: &str = "GIT_CONFIG_COUNT";
 /// index `GIT_CONFIG_COUNT` holds, 0 when it is unset, and the count grows by one. A count git refuses
 /// ([`git_config_count`]), or one at `i32::MAX` that one more entry would take past what git accepts, leaves
 /// `variables` as they are.
-fn with_safe_directory(variables: Variables) -> Variables {
+pub(super) fn with_safe_directory(variables: Variables) -> Variables {
     let index = match variables.get(GIT_CONFIG_COUNT) {
         None => 0,
         Some(count) => match git_config_count(count) {
@@ -1045,14 +1272,15 @@ fn own_token_line(error: &dyn std::fmt::Display) -> String {
 const ACCESS_DENIED: u32 = 5;
 
 /// The command to start: its launch, its job and the job's stop signal, the word and program a start failure names,
-/// the run's nonce its start marker names, and whether the token seam refuses its start with the restricted token.
+/// the run's nonce its start marker names, `None` for a warm-up's command, whose marker was said before its first
+/// command, and whether the token seam refuses its start with the restricted token.
 struct Start<'a> {
     launch: PipedLaunch,
     job: &'a Job,
     stop: &'a StopSignal<'a>,
     word: &'a str,
     program: &'a Path,
-    nonce: &'a str,
+    marker: Option<&'a str>,
     refuse_token: bool,
 }
 
@@ -1080,7 +1308,9 @@ fn console_donor(job: &Job, token: Option<&RestrictedToken>, seams: &BoxSeams) -
 /// answer: `Ok(127)` for a command that could not be started, `Err` with the status of the box's own failure, its line
 /// said.
 fn start_command(start: &mut Start<'_>, donor: Result<&Donor, &str>, beat: &Beat<'_>, console: &mut Console) -> Result<Launched, Result<u32, u32>> {
-    beat.say(console, &started_line(start.nonce));
+    if let Some(nonce) = start.marker {
+        beat.say(console, &started_line(nonce));
+    }
     let ended = match donor {
         Ok(donor) => on_utf8_console(start, donor, beat, console),
         Err(reason) => Ended {
@@ -1423,6 +1653,7 @@ fn watch(started: Started<'_, '_>, console: &mut Console) -> Result<Ran, u32> {
     match waited {
         WaitEnd::Exited { code, .. } => {
             let ceiling = ceiling.map(Ceiling::closed);
+            beat.adjusted.set(ceiling.as_ref().and_then(Ceiling::adjusted_seconds));
             end_what_it_left(job, keep, console);
             watched.drained(console)?;
             if let Some(ceiling) = &ceiling {
@@ -1430,7 +1661,11 @@ fn watch(started: Started<'_, '_>, console: &mut Console) -> Result<Ran, u32> {
             }
             Ok(Ran::Exited(code))
         }
-        WaitEnd::Killed((kill, ceiling)) => killed(watched, kill, &ceiling.closed(), beat.seams, console),
+        WaitEnd::Killed((kill, ceiling)) => {
+            let ceiling = ceiling.closed();
+            beat.adjusted.set(ceiling.adjusted_seconds());
+            killed(watched, kill, &ceiling, beat.seams, console)
+        }
         WaitEnd::ClientGone => Err(watched.client_gone(console)),
         WaitEnd::Failed(status) => Err(watched.wait_failed(status, console)),
     }
@@ -1493,6 +1728,7 @@ fn end_what_it_left(job: &Job, keep: &[u32], console: &mut Console) {
 pub(super) enum Watching {
     Command,
     Restore,
+    Packages,
 }
 
 impl Watching {
@@ -1501,6 +1737,7 @@ impl Watching {
         match self {
             Watching::Command => "the command",
             Watching::Restore => "the restore",
+            Watching::Packages => "the package restore",
         }
     }
 
@@ -1509,6 +1746,7 @@ impl Watching {
         match self {
             Watching::Command => "watching the command",
             Watching::Restore => "watching the restore",
+            Watching::Packages => "watching the package restore",
         }
     }
 
@@ -1517,6 +1755,7 @@ impl Watching {
         match self {
             Watching::Command => "gate: remote command's output is still held open by a leftover process; stopped reading",
             Watching::Restore => "gate: remote the restore's output is still held open by a leftover process; stopped reading",
+            Watching::Packages => "gate: remote the package restore's output is still held open by a leftover process; stopped reading",
         }
     }
 }
@@ -1747,8 +1986,8 @@ impl preflight::TreeGit for WorkGit {
 /// git as the box runs it in the work folder: none of the variables that would point it elsewhere, no standard input,
 /// its hooks read from a folder that cannot exist, no file-system monitor, and its output forwarded under the box's
 /// output lock.
-struct WorkGit {
-    git: Git,
+pub(super) struct WorkGit {
+    pub(super) git: Git,
     /// `core.hooksPath=<lock>\hooks`: a folder inside the lock file, which cannot exist while the run holds the lock
     /// open sharing nothing, since a file has no children and cannot be deleted, renamed or replaced meanwhile.
     hooks: String,
@@ -1787,7 +2026,7 @@ impl WorkGit {
     }
 
     /// The safety options, then `args`.
-    fn args<'a>(&'a self, args: &[&'a str]) -> Vec<&'a str> {
+    pub(super) fn args<'a>(&'a self, args: &[&'a str]) -> Vec<&'a str> {
         let mut all = vec!["-c", self.hooks.as_str(), "-c", "core.fsmonitor=false"];
         all.extend_from_slice(args);
         all
@@ -1807,21 +2046,29 @@ impl WorkGit {
     /// or `.git\objects\info` is missing or not a folder of its own, or its `.git\config` is there and not a file of
     /// its own, a link there leading git or the alternates file into another repository ([`preflight::git_is_plain`]);
     /// and the run's layout recorded after a clear. A clear removes the inputs record `{Work}.inputs` too, before the
-    /// work folder's children, so no record outlives the inputs it lists. A run of one repo in a work folder of that
+    /// work folder's children, so no record outlives the inputs it lists, and the warm record `{Work}.warm` before it
+    /// writes [`LAYOUT_CHANGING`], as it is removed too when the work folder is missing and made here, so no warm
+    /// record outlives the folder state it describes. A run of one repo in a work folder of that
     /// layout whose `.git` is plain readies nothing here: the preflight readied its tree. The held folder, which the
     /// caller keeps through the checkouts.
     fn lay_out(&self, laid: &Laid<'_>, console: &mut Console) -> Result<File, NotLaidOut> {
         let work = Path::new(laid.work);
+        let warm = warm_record(laid.work);
+        if fs::symlink_metadata(work).is_err() {
+            removed(Path::new(&warm))?;
+        }
         fs::create_dir_all(work).map_err(|error| NotLaidOut::Refused(format!("cannot create {}: {error}", laid.work)))?;
         let held = hold_folder(laid.work).map_err(NotLaidOut::Refused)?;
         let record = format!("{}.layout", laid.work);
         let layout = laid.layout();
         let changed = layout_changed(&record, &layout);
         if changed {
+            removed(Path::new(&warm))?;
             write_layout(&record, LAYOUT_CHANGING)?;
             removed(Path::new(&inputs::record_path(laid.work)))?;
             clear_work(work)?;
         }
+        // A tree readied here removes the warm record itself when its `.git` is made or repaired ([`WorkGit::ready_trees`]).
         if changed || !laid.siblings.is_empty() || !preflight::git_is_plain(Path::new(&laid.main.tree)) {
             self.ready_trees(laid, console)?;
         }
@@ -1835,9 +2082,19 @@ impl WorkGit {
     /// a run of one repo's ([`preflight::ready_tree`]), under the lock, so a link at `.git\objects` or
     /// `.git\objects\info` is replaced by a folder too.
     fn ready_trees(&self, laid: &Laid<'_>, console: &mut Console) -> Result<(), NotLaidOut> {
+        let warm = warm_record(laid.work);
+        // A tree whose `.git` is made or repaired here is no longer the one the warm record was written for.
+        if laid.repos().any(|repo| !preflight::git_is_plain(Path::new(&repo.tree))) {
+            removed(Path::new(&warm))?;
+        }
         for repo in laid.repos() {
             plain_tree(&repo.tree)?;
-            preflight::ready_tree(self, &repo.bare, &repo.tree, repo.name.as_deref(), console).map_err(NotLaidOut::from)?;
+            let at = preflight::TreeAt {
+                tree: &repo.tree,
+                bare: &repo.bare,
+                warm: &warm,
+            };
+            preflight::ready_tree(self, &at, repo.name.as_deref(), console).map_err(NotLaidOut::from)?;
         }
         Ok(())
     }
@@ -2103,15 +2360,114 @@ impl BackGit<'_> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs::{self, File, OpenOptions};
     use std::io;
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::path::{Path, PathBuf};
+    use std::time::Duration;
 
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD;
     use serde_json::json;
 
-    use super::{CLOSED_STATUS, GIT_CONFIG_COUNT, Look, Payload, Request, STARTING_COMMAND, before_the_job, client_gone, look, with_safe_directory};
+    use super::{
+        CLOSED_STATUS, GIT_CONFIG_COUNT, Look, Payload, Request, SHARING_VIOLATION, STARTING_COMMAND, before_the_job, client_gone, command_spent,
+        gap_spent, look, remaining_budget, with_safe_directory, written_retrying,
+    };
     use crate::console::Console;
     use crate::environment::Variables;
+
+    #[test]
+    fn a_warm_up_budget_left_is_rounded_up_to_whole_seconds() {
+        assert_eq!(remaining_budget(10, 0.0), Some(10), "nothing spent");
+        assert_eq!(remaining_budget(10, 2.5), Some(8), "7.5 s left round up");
+        assert_eq!(remaining_budget(10, 3.0), Some(7), "whole seconds stay as they are");
+        assert_eq!(remaining_budget(10, 9.999), Some(1), "a sliver left is at least 1 s");
+    }
+
+    #[test]
+    fn a_warm_up_budget_spent_leaves_none() {
+        assert_eq!(remaining_budget(10, 10.0), None, "spent exactly");
+        assert_eq!(remaining_budget(10, 12.25), None, "overspent by the last command's drain");
+    }
+
+    #[test]
+    fn a_command_spends_its_adjusted_seconds_or_its_wall_time_once_the_sampler_failed() {
+        let wall = Duration::from_millis(4_500);
+        assert!(
+            (command_spent(Some(1.25), wall) - 1.25).abs() < 1e-9,
+            "adjusted seconds above a fifth of the wall time"
+        );
+        assert!(
+            (command_spent(Some(0.5), wall) - 0.9).abs() < 1e-9,
+            "a fifth of the wall time above the adjusted seconds"
+        );
+        assert!((command_spent(None, wall) - 4.5).abs() < 1e-9, "the wall time once the clock stopped");
+        assert_eq!(
+            remaining_budget(5, command_spent(None, wall)),
+            Some(1),
+            "the wall time runs the budget down"
+        );
+    }
+
+    #[test]
+    fn a_wait_between_commands_spends_a_fifth_of_its_wall_time() {
+        assert!((gap_spent(Duration::from_millis(4_500)) - 0.9).abs() < 1e-9, "a fifth");
+        assert!(gap_spent(Duration::ZERO).abs() < 1e-9, "no wait spends nothing");
+    }
+
+    /// A scratch record path for the test `test`, its folder made and no record in it.
+    #[expect(clippy::expect_used, reason = "a test that cannot make its folder must fail loudly")]
+    fn scratch_record(test: &str) -> PathBuf {
+        let folder = crate::test_support::temp_dir().join(format!("gate-run-{}-{test}", std::process::id()));
+        let _ = fs::remove_dir_all(&folder);
+        fs::create_dir_all(&folder).expect("the scratch folder can be made");
+        folder.join("k.warm")
+    }
+
+    /// `path` opened as a preflight reads a warm record: sharing reading, writing and deletion.
+    #[expect(clippy::expect_used, reason = "a test that cannot make its record must fail loudly")]
+    fn held_open(path: &Path) -> File {
+        fs::write(path, "old").expect("the record can be made");
+        OpenOptions::new()
+            .read(true)
+            .share_mode(gate_win32::Share::All.mode())
+            .open(path)
+            .expect("the record can be opened")
+    }
+
+    #[test]
+    fn the_warm_record_write_waits_out_a_reader_that_holds_it() {
+        let record = scratch_record("warm-retry");
+        let mut reader = Some(held_open(&record));
+        let mut waits = 0;
+
+        let written = written_retrying(&record.to_string_lossy(), "hash", || {
+            waits += 1;
+            reader = None;
+        });
+
+        assert!(written.is_ok(), "{written:?}");
+        assert!(reader.is_none(), "the reader was let go");
+        assert_eq!(waits, 1, "one wait, then the reader is gone");
+        assert_eq!(fs::read_to_string(&record).ok().as_deref(), Some("hash"));
+    }
+
+    #[test]
+    fn the_warm_record_write_gives_up_after_ten_waits() {
+        let record = scratch_record("warm-retry-give-up");
+        let _reader = held_open(&record);
+        let mut waits = 0;
+
+        let written = written_retrying(&record.to_string_lossy(), "hash", || waits += 1);
+
+        assert_eq!(
+            written.map_err(|error| error.raw_os_error()),
+            Err(Some(SHARING_VIOLATION)),
+            "a sharing violation"
+        );
+        assert_eq!(waits, 10, "ten waits between eleven tries");
+    }
 
     const JOB: &str = r"Local\gate-job-k-0001";
 

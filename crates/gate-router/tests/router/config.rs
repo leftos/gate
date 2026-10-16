@@ -416,6 +416,52 @@ fn a_bad_siblings_value_allows_none_and_leaves_routing_alone() {
     }
 }
 
+/// The routing file listing `g` with `warmup` holding `value`.
+fn warmup_file(value: &str) -> Config {
+    Config::parse(&format!(
+        r#"{{"host": "builder-1", "slots": 2, "repos": {{"g": ["x"]}}, "siblings": {{"g": ["b"]}}, "warmup": {value}}}"#
+    ))
+    .expect("routing reads the file whatever warmup holds")
+}
+
+#[test]
+fn no_warmup_key_consents_to_no_warm_up() {
+    let config = Config::parse(r#"{"host": "builder-1", "repos": {"g": ["x"]}}"#).expect("usable");
+
+    assert_eq!(config.warmup_consented("g"), Ok(false));
+}
+
+#[test]
+fn warmup_consents_to_each_repo_it_lists_in_any_letter_case() {
+    let config = warmup_file(r#"["Yaat", "gate"]"#);
+
+    assert_eq!(config.warmup_consented("yaat"), Ok(true), "the repo name in any case");
+    assert_eq!(config.warmup_consented("GATE"), Ok(true), "the repo name in any case");
+    assert_eq!(config.warmup_consented("g"), Ok(false), "a repo it does not list");
+    assert_eq!(warmup_file("[]").warmup_consented("g"), Ok(false), "an empty list");
+    let keyed = Config::parse(r#"{"host": "builder-1", "repos": {}, "WarmUp": ["g"]}"#).expect("usable");
+    assert_eq!(keyed.warmup_consented("g"), Ok(true), "the key in any case");
+}
+
+#[test]
+fn a_bad_warmup_value_consents_to_none_and_leaves_the_rest_of_the_file_alone() {
+    for (value, problem) in [
+        (r#"{"g": true}"#, "warmup must be an array of repo names"),
+        (r#""g""#, "warmup must be an array of repo names"),
+        ("null", "warmup must be an array of repo names"),
+        (r#"["g", ""]"#, "warmup[1] is not a non-empty string"),
+        (r#"["g", 3]"#, "warmup[1] is not a non-empty string"),
+        (r#"[["g"]]"#, "warmup[0] is not a non-empty string"),
+    ] {
+        let config = warmup_file(value);
+        assert_eq!(config.warmup_consented("g"), Err(problem), "{value}");
+        assert_eq!(config.host(), "builder-1", "{value}");
+        assert_eq!(config.slots(), 2, "{value}");
+        assert_eq!(pattern_texts(&config, "g"), ["x"], "{value}");
+        assert_eq!(config.allowed_siblings("g"), Ok(&["b".to_owned()][..]), "{value}");
+    }
+}
+
 #[test]
 fn an_ssh_alias_or_user_at_host_of_allowed_characters_is_accepted() {
     for host in ["builder", "build-box.lan", "user@build-box", "10.0.0.5", "b_1"] {

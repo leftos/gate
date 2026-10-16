@@ -7,7 +7,7 @@
 //! local: a sibling left out would build something different. Whether a name is the worktree's own folder is the
 //! routing decision's to tell.
 
-use gate_router::is_layout_name;
+use gate_router::{is_layout_name, parse_failure, spelled};
 use toml::{Table, Value};
 
 /// The most siblings a repo may declare.
@@ -93,26 +93,6 @@ fn name_of(index: usize, entry: Value, earlier: &[String]) -> Result<String, Str
         return Err(format!("siblings[{index}] repeats an earlier name: {name:?}"));
     }
     Ok(name)
-}
-
-/// The key `key` as TOML spells it: bare when it is one or more ASCII letters, digits, `_` and `-`, else quoted.
-fn spelled(key: &str) -> String {
-    let bare = !key.is_empty() && key.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-');
-    if bare { key.to_owned() } else { format!("{key:?}") }
-}
-
-/// `error`, a failure to parse `text`, as the line and column it starts at and its message; a leading byte order mark
-/// takes no column.
-fn parse_failure(text: &str, error: &toml::de::Error) -> String {
-    let message = error.message().trim_end();
-    let Some(span) = error.span() else {
-        return message.to_owned();
-    };
-    let before = text.get(..span.start).unwrap_or(text);
-    let before = before.strip_prefix('\u{feff}').unwrap_or(before);
-    let line = before.matches('\n').count() + 1;
-    let column = before.rsplit('\n').next().unwrap_or(before).chars().count() + 1;
-    format!("line {line}, column {column}: {message}")
 }
 
 #[cfg(test)]

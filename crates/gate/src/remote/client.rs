@@ -34,6 +34,7 @@ use gate_args::BoxVerb;
 use gate_args::RunRequest;
 use gate_args::TestSeams;
 use gate_desktop::version::build_version;
+use gate_state::v1::WarmFailure;
 use gate_state::{FallbackReason, KernelObject, key_hash};
 use gate_win32::{AcquireError, Interrupt, Job, NamedMutex, OwnedMutexGuard, PipedConsole, Running, Share};
 use jiff::{SignedDuration, Timestamp};
@@ -47,7 +48,7 @@ use super::inputs;
 use super::launch::{DRAIN, KILL_WAIT, KILLED, call_job, launched, piped_launch};
 use super::outputs;
 use super::parity;
-use super::payload::{self, Location, RunCall};
+use super::payload::{self, Location, RunCall, WarmCall};
 use super::retry::{self, Ended, GIT_SSH_FAILED, SSH_FAILED};
 use super::snapshot::{self, Bounded, Place, Snapshot};
 use super::syncback;
@@ -61,14 +62,15 @@ use super::transport::{Program, Transport, Wire};
 use super::watchdog::{self, Cut, Kept, Kill, LINE_CAP};
 use super::worktree_lock::{self, Folder, Locked, Wait};
 use super::{
-    BoxKill, FAILED, FAILED_RUN, REFUSED, Refusal, RemoteCall, RemoteClient, RemoteOutcome, Split, adjusted_prefix, killed_line, refused_line,
-    started_line,
+    BoxKill, FAILED, FAILED_RUN, REFUSED, Refusal, RemoteCall, RemoteClient, RemoteOutcome, Split, WarmEnd, Warmth, adjusted_prefix, killed_line,
+    refused_line, started_line,
 };
 use crate::boxside::outputs::{NAMES_SKIPPED, OUTPUTS_BUDGET};
 use crate::boxside::payload::{PairRefused, Payload, escaped};
 use crate::durations::{Usual, hang_hint};
 use crate::environment::Variables;
 use crate::outputs::archive::sent_limit;
+use crate::outputs::hash::{SHA256_DIGITS, is_lower_hex};
 use crate::route::open_followed;
 #[cfg(feature = "test-seams")]
 use crate::run::find_program;
@@ -87,6 +89,9 @@ const PAUSE_STEP: Duration = Duration::from_millis(20);
 const HEARTBEAT: &str = "gate-remote-heartbeat: ";
 /// The preflight's lines the client reads.
 const VERSION: &str = "gate: remote version ";
+/// The work folder's warm-up, `gate: remote warm <hash|none>`, said right after the version line; the space keeps the
+/// box's `gate: remote warm-up …` lines from matching.
+const WARM: &str = "gate: remote warm ";
 pub(crate) const CREATED: &str = "gate: remote created ";
 /// The builder's boot time, which the preflight and the `boot` call say.
 const BOOT: &str = "gate: remote boot ";
@@ -214,12 +219,44 @@ fn stand_in(transport: &str, word: &Path) -> Result<PathBuf, String> {
 /// before it takes a remote slot until its remote attempt ends. A lock its last holder left without releasing is taken.
 /// Else `None` when another routed run holds it, or the line saying why it could not be opened or taken.
 pub(crate) fn hold_key(call: &RemoteCall<'_>) -> Result<OwnedMutexGuard, Option<String>> {
+    match hold_key_waiting(call, Duration::ZERO).map_err(Some)? {
+        KeyHold::Held(held) => Ok(held),
+        KeyHold::Busy | KeyHold::Interrupted => Err(None),
+    }
+}
+
+/// How long one slice of [`hold_key_waiting`]'s wait lasts, between two looks at the console interrupt.
+const KEY_WAIT_SLICE: Duration = Duration::from_millis(100);
+
+/// How a wait for the work-folder key's lock ended.
+pub(crate) enum KeyHold {
+    /// The lock is held.
+    Held(OwnedMutexGuard),
+    /// Another holder still had it at the end of the wait.
+    Busy,
+    /// The console interrupt was raised during the wait.
+    Interrupted,
+}
+
+/// The lock of `call`'s work-folder key, the one [`hold_key`] takes, waited for up to `wait` in slices of
+/// [`KEY_WAIT_SLICE`], the call's interrupt looked at between them; `Err` with the line saying why it could not be
+/// opened or taken.
+pub(crate) fn hold_key_waiting(call: &RemoteCall<'_>, wait: Duration) -> Result<KeyHold, String> {
     let name = call.state.object_name(KernelObject::Routed { hash: key_hash(call.key) });
-    let mutex = NamedMutex::open(&name).map_err(|error| Some(format!("gate: cannot open the mutex {name}: {error}")))?;
-    match mutex.acquire_owned(Duration::ZERO) {
-        Ok(held) => Ok(held),
-        Err(AcquireError::Timeout) => Err(None),
-        Err(AcquireError::Failed(error)) => Err(Some(format!("gate: cannot take the mutex {name}: {error}"))),
+    let begun = Instant::now();
+    loop {
+        // A wait that times out gives its handle up, so each slice waits on one of its own.
+        let mutex = NamedMutex::open(&name).map_err(|error| format!("gate: cannot open the mutex {name}: {error}"))?;
+        let left = wait.saturating_sub(begun.elapsed());
+        match mutex.acquire_owned(left.min(KEY_WAIT_SLICE)) {
+            Ok(held) => return Ok(KeyHold::Held(held)),
+            Err(AcquireError::Timeout) if left <= KEY_WAIT_SLICE => return Ok(KeyHold::Busy),
+            Err(AcquireError::Timeout) => {}
+            Err(AcquireError::Failed(error)) => return Err(format!("gate: cannot take the mutex {name}: {error}")),
+        }
+        if call.interrupt.is_some_and(Interrupt::is_raised) {
+            return Ok(KeyHold::Interrupted);
+        }
     }
 }
 
@@ -311,6 +348,8 @@ impl RemoteClient for RustClient {
             ceiling: None,
             places: Vec::new(),
             local_major: None,
+            warm: None,
+            marker_seen: false,
         };
         if let Some(line) = raised {
             attempt.say(line);
@@ -332,6 +371,25 @@ const NOT_ROUTED: &str = "gate: not routed: ";
 const BUSY: &str = "is busy with another routed run";
 /// Why a pair's repository keeps the run here when git finds it elsewhere after its save than at its check.
 const MOVED_GIT: &str = "changed its git location while it was held";
+
+/// The status of an attempt that ended `status`, the warm-up having ended as `warm`: a warm-up that failed never hands
+/// back a passing status, as one the box did not confirm ends 0.
+fn warm_status(status: i64, warm: Option<&WarmEnd>) -> i64 {
+    if status == 0 && matches!(warm, Some(WarmEnd::Failed { .. })) {
+        FAILED
+    } else {
+        status
+    }
+}
+
+/// What `attempt`'s run call carries of its outputs ([`outputs::sent`]): nothing for a warm-up, which reads, saves and
+/// marks no outputs state whatever output globs its call holds.
+fn outputs_sent<'a>(attempt: &mut Attempt<'_, 'a>) -> Result<outputs::Sent<'a>, End> {
+    match attempt.call.warmth {
+        Warmth::WarmUp { .. } => Ok(outputs::Sent::nothing()),
+        Warmth::Unasked | Warmth::Needs(_) => outputs::sent(attempt),
+    }
+}
 
 /// The end of a run that stays here for its repository said as `who`, the main one's folder name or `sibling {name}`,
 /// for `why`: `gate: not routed: {who} {why}`.
@@ -812,16 +870,24 @@ pub(super) struct Attempt<'c, 'a> {
     /// This PC's newest .NET SDK major once [`Attempt::local_major`] has read it, so one run lists the SDKs once
     /// however many of its repositories need it; `None` before.
     local_major: Option<u64>,
+    /// How a warm-up's run call ended, once it has ([`Attempt::warm_ran`]); `None` before, and for a call that is no
+    /// warm-up.
+    warm: Option<WarmEnd>,
+    /// Whether a call of the attempt said the box's start marker, however the call ended, a failure included.
+    marker_seen: bool,
 }
 
 /// How a run call ended ([`Attempt::run_call`]): its end, the last standard error lines of the call that counts that
-/// are the box's outputs line and its back commits line, and whether that call said on standard error that the box
-/// skipped outputs for names this PC cannot take.
+/// are the box's outputs line and its back commits line, whether that call said on standard error that the box
+/// skipped outputs for names this PC cannot take, whether the box said the run's start marker, and the call's last
+/// standard error line that is neither a heartbeat nor one of the box's protocol lines.
 struct RunEnd {
     end: End,
     outputs_line: Option<String>,
     back_commits: Option<String>,
     names_skipped: bool,
+    started: bool,
+    last_error: Option<String>,
 }
 
 impl Attempt<'_, '_> {
@@ -834,7 +900,7 @@ impl Attempt<'_, '_> {
         let snapshots = self.snapshots(&repos)?;
         let location = self.location(&mut repos)?;
         let nonce = payload::run_nonce();
-        let sent = outputs::sent(self)?;
+        let sent = outputs_sent(self)?;
         let inputs = inputs::sent(self)?;
         let Some((snapshot, siblings)) = snapshots.split_first() else {
             return Err(End::Failed("the snapshot made no commit".to_owned()));
@@ -857,7 +923,7 @@ impl Attempt<'_, '_> {
             sibling_snapshots: &sibling_snapshots,
             inputs_digest: inputs.as_ref().map(|built| built.digest.as_str()),
         };
-        let run_input = payload::input(&payload::run_word(&location, &run), sent.manifest.as_deref());
+        let run_input = payload::input(&self.run_word(&location, &run), sent.manifest.as_deref());
         let trees = self.trees(&repos, &snapshots)?;
         let needs = trees.first().and_then(Option::as_ref).map(Tree::needs).unwrap_or_default();
         let prepared = self.preflight(&location, &needs)?;
@@ -873,6 +939,10 @@ impl Attempt<'_, '_> {
         // After the push: a run refused before it, at the preflight or by the parity check, leaves no marker.
         outputs::marked(&sent)?;
         let called = self.run_call(&location, &run_input, &nonce)?;
+        // A warm-up brings nothing back: its end is classed, and neither the sync-back nor the outputs step follows.
+        if self.warm_ran(&called) {
+            return Ok(self.warm_ended(called.end, &location, prepared.boot.as_deref()));
+        }
         // The sync-back runs after a run call that ended with the command's own status; a refusal, an interrupt, a
         // kill, a lost connection or a failed call ended the attempt before it, so a box refusal's 75 never syncs back.
         // The pending marker stays on every end but a passing run whose box packed nothing.
@@ -895,6 +965,40 @@ impl Attempt<'_, '_> {
             End::Lost(output) => Ok(self.connection_lost(&location, prepared.boot.as_deref(), output)),
             End::Refused(FallbackReason::Inputs) => Ok(inputs::run_refused(self)),
             end => Ok(end),
+        }
+    }
+
+    /// The payload word of the run call `run` to `location`: a warm-up's for a warm-up, else a run's.
+    fn run_word(&self, location: &Location, run: &RunCall<'_>) -> String {
+        match self.call.warmth {
+            Warmth::WarmUp { commands, hash } => payload::warm_word(location, run, &WarmCall { commands, hash }),
+            Warmth::Unasked | Warmth::Needs(_) => payload::run_word(location, run),
+        }
+    }
+
+    /// Whether the call is a warm-up, whose run call ended as `called`: its end is then classed and kept for the outcome.
+    fn warm_ran(&mut self, called: &RunEnd) -> bool {
+        let Warmth::WarmUp { hash, .. } = self.call.warmth else {
+            return false;
+        };
+        self.warm = Some(warm_end(hash, called.started, &called.end, called.last_error.as_deref()));
+        true
+    }
+
+    /// The end of a warm-up whose run call ended at `end`, which never reaches the sync-back or the outputs step: a lost
+    /// connection is handled as a run's is, and an interrupt it ends on leaves no record; a refusal of its inputs is
+    /// handled as a run's is; any other end is the attempt's as it is.
+    fn warm_ended(&mut self, end: End, location: &Location, boot: Option<&str>) -> End {
+        match end {
+            End::Lost(output) => {
+                let end = self.connection_lost(location, boot, output);
+                if matches!(end, End::Interrupted) {
+                    self.warm = Some(WarmEnd::Deleted);
+                }
+                end
+            }
+            End::Refused(FallbackReason::Inputs) => inputs::run_refused(self),
+            end => end,
         }
     }
 
@@ -1154,6 +1258,7 @@ impl Attempt<'_, '_> {
             attempt.ssh(BoxVerb::Preflight, Echo::LogOnly, watch, raise, CallOnly::plain(Arc::clone(&input)))
         })?;
         let theirs = their_version(&called.lines).map(str::to_owned);
+        let warm = warm_of(&called.lines);
         let created = called
             .lines
             .iter()
@@ -1188,6 +1293,10 @@ impl Attempt<'_, '_> {
         if let Some(line) = version_refusal(host, theirs.as_deref(), &build_version()) {
             self.say(line);
             return Err(End::Refused(FallbackReason::Version));
+        }
+        // Before the parity check and the push, so a run that would meet a cold work folder sends nothing.
+        if is_cold(self.call.warmth, &warm) {
+            return Err(End::Refused(FallbackReason::Cold));
         }
         Ok(Prepared {
             created,
@@ -1604,6 +1713,8 @@ impl Attempt<'_, '_> {
         let mut back_commits = None;
         let mut names_skipped = false;
         let mut adjusted = None;
+        let mut started = false;
+        let mut last_error = None;
         // The command's time counts from the start of the call that counts, as its backstop does.
         let mut begun = None;
         let made = self.run_call_made(location, limits, |attempt| {
@@ -1619,6 +1730,8 @@ impl Attempt<'_, '_> {
             back_commits.clone_from(&called.back_commits);
             names_skipped = called.names_skipped;
             adjusted = called.adjusted;
+            started = called.started;
+            last_error.clone_from(&called.last_error);
             Ok(called)
         });
         self.split.command = begun.map_or(Duration::ZERO, |begun| begun.elapsed());
@@ -1629,6 +1742,8 @@ impl Attempt<'_, '_> {
             outputs_line: heard,
             back_commits,
             names_skipped,
+            started,
+            last_error,
         })
     }
 
@@ -1651,7 +1766,6 @@ impl Attempt<'_, '_> {
             }
             Err(end) => return Err(end),
         };
-        let reason = called.refusal();
         let kept = self.lines.len();
         self.lines.append(&mut called.lines);
         let output = kept..self.lines.len();
@@ -1680,14 +1794,7 @@ impl Attempt<'_, '_> {
             self.stop_after_ctrl_c(location);
             return Err(End::Interrupted);
         }
-        if called.status == SSH_FAILED {
-            return Ok(End::Lost(output));
-        }
-        let status = i64::from(called.status);
-        match reason {
-            Some(reason) if status == REFUSED => Ok(End::Refused(reason)),
-            _ => Ok(End::Status(status)),
-        }
+        Ok(status_end(&called, output))
     }
 
     /// Makes a call with `make` and, when it failed before the banner and its job did not write more than 1 MiB, says
@@ -2014,7 +2121,10 @@ impl Attempt<'_, '_> {
             let drained = watching.ended.as_ref().is_ok_and(|(ended, _)| ended.drained());
             self.ended_raw(raw, drained);
         }
-        let (ended, looks) = self.watched_out(watching)?;
+        let watched = self.watched_out(watching);
+        // Kept whatever the call's end, so a warm-up that fails after the marker counts its commands as run.
+        self.marker_seen |= held(&shared.heard).started;
+        let (ended, looks) = watched?;
         if let Some(line) = &looks.unread {
             self.logged(line);
         }
@@ -2159,6 +2269,7 @@ impl Attempt<'_, '_> {
     /// The outcome of an attempt that ended at `end`; a line that could not be written fails the run.
     fn outcome(mut self, end: End) -> RemoteOutcome {
         let killed = matches!(end, End::Killed);
+        let warm = self.warm_outcome(&end);
         let mut detail = None;
         let (status, reason) = match end {
             End::NotRouted(line) => {
@@ -2181,6 +2292,7 @@ impl Attempt<'_, '_> {
             (Some(_), false) => (FAILED, None, false),
             _ => (status, reason, killed),
         };
+        let status = warm_status(status, warm.as_ref());
         RemoteOutcome {
             status,
             reason,
@@ -2191,7 +2303,18 @@ impl Attempt<'_, '_> {
             split: self.split,
             adjusted: self.adjusted,
             box_killed: self.box_killed,
+            warm,
         }
+    }
+
+    /// How a warm-up that ended at `end` ended: as its run call was classed, or, its run call having ended it or never
+    /// been made, as `end` is, after the start marker when a call said it; `None` for a call that is no warm-up.
+    fn warm_outcome(&mut self, end: &End) -> Option<WarmEnd> {
+        let Warmth::WarmUp { hash, .. } = self.call.warmth else {
+            return None;
+        };
+        let started = self.marker_seen;
+        Some(self.warm.take().unwrap_or_else(|| warm_end(hash, started, end, None)))
     }
 }
 
@@ -2228,6 +2351,8 @@ impl<'c, 'a> Attempt<'c, 'a> {
             ceiling: None,
             places: Vec::new(),
             local_major: None,
+            warm: None,
+            marker_seen: false,
         }
     }
 }
@@ -3343,6 +3468,90 @@ fn is_heartbeat(line: &str) -> bool {
         .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
+/// How a run call that ended as `called`, its own lines at `output` among the attempt's, ends the run when neither a
+/// kill nor an interrupt ended it: a lost connection when it exited 255; a refusal when its 75 comes with the box's
+/// refusal tag and no start marker; else the command's own status.
+fn status_end(called: &Called, output: Range<usize>) -> End {
+    if called.status == SSH_FAILED {
+        return End::Lost(output);
+    }
+    let status = i64::from(called.status);
+    match called.refusal() {
+        Some(reason) if status == REFUSED => End::Refused(reason),
+        _ => End::Status(status),
+    }
+}
+
+/// What the builder's preflight said of the work folder's warm-up.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Warm {
+    /// Warm with the warm-up file of this hash.
+    Hash(String),
+    /// Not warm: `none`.
+    NoHash,
+    /// No warm line where one is read, or one that is neither `none` nor a hash: counted as not warm.
+    Unseen,
+}
+
+/// The work folder's warm-up, from the line right after the preflight's last `gate: remote version` line alone, when it
+/// is exactly `gate: remote warm none` or `gate: remote warm ` and 64 lower-case hex digits.
+fn warm_of(lines: &[String]) -> Warm {
+    let Some(version) = lines.iter().rposition(|line| line.starts_with(VERSION)) else {
+        return Warm::Unseen;
+    };
+    match lines.get(version + 1).and_then(|line| line.strip_prefix(WARM)) {
+        Some("none") => Warm::NoHash,
+        Some(hash) if is_lower_hex(hash, SHA256_DIGITS) => Warm::Hash(hash.to_owned()),
+        _ => Warm::Unseen,
+    }
+}
+
+/// Whether a call asking `warmth` meets a cold work folder, the preflight having said `warm`: only a run that needs a
+/// hash can, when the preflight did not say exactly that hash.
+fn is_cold(warmth: Warmth<'_>, warm: &Warm) -> bool {
+    match warmth {
+        Warmth::Needs(hash) => !matches!(warm, Warm::Hash(said) if said == hash),
+        Warmth::Unasked | Warmth::WarmUp { .. } => false,
+    }
+}
+
+/// Why a warm-up the box ran to status 0 is still not warm.
+const UNCONFIRMED: &str = "the box did not confirm the warm hash";
+
+/// How the warm-up sent `hash` ended at `end`, its run call having said the start marker when `started`, its last
+/// standard error line that is neither a heartbeat nor a protocol line being `last_error`: warm only on status 0 after
+/// the marker with that line exactly `gate: remote warm {hash}`; deleted on an interrupt; else failed, refused for a
+/// refusal or any end before the marker, as no command ran, and the commands' failure for any end after it.
+fn warm_end(hash: &str, started: bool, end: &End, last_error: Option<&str>) -> WarmEnd {
+    let failure = match end {
+        End::Interrupted => return WarmEnd::Deleted,
+        End::Status(0) if started && last_error == Some(format!("{WARM}{hash}").as_str()) => return WarmEnd::Warm,
+        End::Refused(_) | End::NotRouted(_) => WarmFailure::Refused,
+        _ if started => WarmFailure::Commands,
+        _ => WarmFailure::Refused,
+    };
+    WarmEnd::Failed {
+        failure,
+        reason: warm_reason(end, started),
+    }
+}
+
+/// Why a warm-up that ended at `end`, after the start marker when `started`, failed: built from the end alone, never
+/// from a line the builder or the commands said.
+fn warm_reason(end: &End, started: bool) -> String {
+    match end {
+        End::Status(0) if started => UNCONFIRMED.to_owned(),
+        End::Status(status) if started => format!("command stopped with status {status}"),
+        End::Status(status) => format!("the builder ended the warm-up before its commands with status {status}"),
+        End::Refused(reason) => format!("the builder refused: {}", reason.as_str()),
+        End::Killed => "the warm-up was killed: it ran out of its budget or went silent".to_owned(),
+        End::Lost(_) => "the connection to the builder was lost".to_owned(),
+        End::NotRouted(_) => "the client could not send the warm-up".to_owned(),
+        End::Failed(_) => "the client failed".to_owned(),
+        End::Interrupted => "the warm-up was interrupted".to_owned(),
+    }
+}
+
 /// The builder's version, from the last `gate: remote version <v>` line of its preflight; `None` when it said none.
 pub(crate) fn their_version(lines: &[String]) -> Option<&str> {
     lines.iter().rev().find_map(|line| line.strip_prefix(VERSION)).map(str::trim)
@@ -3583,6 +3792,7 @@ mod tests {
         sdks_of, seconds, their_version, version_refusal,
     };
     use super::{Entry, entries_of, manifest_entry};
+    use super::{KeyHold, RunEnd, Warm, hold_key, hold_key_waiting, is_cold, status_end, warm_end, warm_of};
     use crate::environment::Variables;
     use crate::remote::git::{DOTNET_LIMIT, GIT_LIMIT, Git, GitError};
     use crate::remote::held::tests::{Pair, junction};
@@ -3593,8 +3803,9 @@ mod tests {
     use crate::remote::transport::{Local, Transport};
     use crate::remote::watchdog::{self, Kill, LOG_CAP};
     use crate::remote::worktree_lock::tests::{held_elsewhere, lock_name};
-    use crate::remote::{Refusal, RemoteCall, RemoteClient, Sibling, adjusted_line, busy_line, carried, refused_line, started_line};
+    use crate::remote::{Refusal, RemoteCall, RemoteClient, Sibling, WarmEnd, Warmth, adjusted_line, busy_line, carried, refused_line, started_line};
     use crate::run::CONTROL_C_EXIT;
+    use gate_state::v1::WarmFailure;
 
     /// A state root no gate uses; no test here takes its key's lock.
     static STATE: LazyLock<StateRoot> = LazyLock::new(|| StateRoot::new(r"C:\gate-client-tests", None));
@@ -3712,6 +3923,7 @@ mod tests {
             interrupt: Some(raised()),
             state: &STATE,
             state_dir: Path::new(r"C:\gate-client-tests-state"),
+            warmth: Warmth::Unasked,
         }
     }
 
@@ -3745,6 +3957,8 @@ mod tests {
             ceiling: None,
             places: Vec::new(),
             local_major: None,
+            warm: None,
+            marker_seen: false,
         }
     }
 
@@ -5294,6 +5508,11 @@ mod tests {
     /// as the run call reads it; with what its readers wrote to the log, which a line it passes on reaches as it reaches
     /// the console.
     fn run_call_said(stdout: &str, stderr: &str, test: &str) -> (Called, String) {
+        run_call_ended(stdout, stderr, 75, test)
+    }
+
+    /// As [`run_call_said`], the call having exited `status`.
+    fn run_call_ended(stdout: &str, stderr: &str, status: i32, test: &str) -> (Called, String) {
         let log = crate::test_support::temp_dir().join(format!("gate-client-protocol-{}-{test}.log", std::process::id()));
         let shared = Shared::new();
         let reading = Reading {
@@ -5307,7 +5526,7 @@ mod tests {
         relay(stdout.as_bytes(), Reader::new(false, reading.clone(), Some(other)), &shared);
         relay(stderr.as_bytes(), Reader::new(true, reading, Some(file)), &shared);
         let heard = std::mem::take(&mut *held(&shared.heard));
-        let called = called_of(CallEnd::Exited(75), Raised::default(), heard).expect("a call that ended");
+        let called = called_of(CallEnd::Exited(status), Raised::default(), heard).expect("a call that ended");
         let said = std::fs::read_to_string(&log).expect("the log can be read");
         std::fs::remove_file(&log).expect("the log can be removed");
         (called, said)
@@ -5617,6 +5836,390 @@ mod tests {
             version_refusal("builder", None, "0.1.0"),
             Some("gate: not routed: builder runs gate unknown, this PC 0.1.0; run gate push".to_owned())
         );
+    }
+
+    /// The warm-up file hash the warm cases send, and another.
+    const WARM_HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const OTHER_HASH: &str = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+
+    #[test]
+    fn the_warm_line_is_taken_only_right_after_the_version_line() {
+        let version = "gate: remote version 0.1.0";
+        let boot = "gate: remote boot 2026-10-10T08:00:00.0000000Z";
+        let hash = format!("gate: remote warm {WARM_HASH}");
+        let upper = format!("gate: remote warm {}", WARM_HASH.to_uppercase());
+        let short = format!("gate: remote warm {}", &WARM_HASH[..63]);
+        let long = format!("{hash}0");
+        let padded = format!("{hash} ");
+        let cr = format!("{hash}\r");
+        let warm = || Warm::Hash(WARM_HASH.to_owned());
+        let cases: [(&str, Vec<String>, Warm); 15] = [
+            ("none", lines(&[version, "gate: remote warm none"]), Warm::NoHash),
+            (
+                "hash",
+                lines(&["gate: remote created D:\\gate-remote\\app.git", version, &hash, boot]),
+                warm(),
+            ),
+            ("upper-case", lines(&[version, &upper]), Warm::Unseen),
+            ("63-digits", lines(&[version, &short]), Warm::Unseen),
+            ("65-digits", lines(&[version, &long]), Warm::Unseen),
+            ("trailing-space", lines(&[version, &padded]), Warm::Unseen),
+            ("a-carriage-return-left-in-the-line", lines(&[version, &cr]), Warm::Unseen),
+            ("after-boot", lines(&[version, boot, &hash]), Warm::Unseen),
+            ("before-the-version", lines(&[&hash, version]), Warm::Unseen),
+            (
+                "two-versions-the-last-counts",
+                lines(&[version, "gate: remote warm none", version, &hash]),
+                warm(),
+            ),
+            ("two-versions-none-after-the-last", lines(&[version, &hash, version]), Warm::Unseen),
+            ("no-version", lines(&[&hash]), Warm::Unseen),
+            (
+                "a-warm-up-line",
+                lines(&[version, "gate: remote warm-up stopped after its first command"]),
+                Warm::Unseen,
+            ),
+            ("empty-after-the-prefix", lines(&[version, "gate: remote warm "]), Warm::Unseen),
+            ("none-padded", lines(&[version, "gate: remote warm none "]), Warm::Unseen),
+        ];
+        for (name, preflight, expected) in cases {
+            assert_eq!(warm_of(&preflight), expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_routed_run_needing_a_hash_is_refused_cold_unless_the_preflight_says_it() {
+        let said = Warm::Hash(WARM_HASH.to_owned());
+        assert!(!is_cold(Warmth::Needs(WARM_HASH), &said), "the hash it needs");
+        let other = Warm::Hash(OTHER_HASH.to_owned());
+        for (name, warm) in [("another-hash", &other), ("none", &Warm::NoHash), ("unseen", &Warm::Unseen)] {
+            assert!(is_cold(Warmth::Needs(WARM_HASH), warm), "{name}");
+        }
+        let commands = [vec!["./tool.exe".to_owned()]];
+        let warm_up = Warmth::WarmUp {
+            commands: &commands,
+            hash: WARM_HASH,
+        };
+        for warm in [&said, &other, &Warm::NoHash, &Warm::Unseen] {
+            assert!(!is_cold(Warmth::Unasked, warm), "a run that asks nothing: {warm:?}");
+            assert!(!is_cold(warm_up, warm), "a warm-up: {warm:?}");
+        }
+    }
+
+    /// How the warm-up of [`WARM_HASH`] ended whose run call said `stdout` and `stderr` and exited `status`, as the run
+    /// call ends one that neither a kill nor an interrupt ended.
+    fn warm_said(stdout: &str, stderr: &str, status: i32, test: &str) -> WarmEnd {
+        let (called, _) = run_call_ended(stdout, stderr, status, test);
+        warm_end(WARM_HASH, called.started, &status_end(&called, 0..0), called.last_error.as_deref())
+    }
+
+    fn failed(failure: WarmFailure, reason: &str) -> WarmEnd {
+        WarmEnd::Failed {
+            failure,
+            reason: reason.to_owned(),
+        }
+    }
+
+    const UNCONFIRMED: &str = "the box did not confirm the warm hash";
+
+    #[test]
+    fn a_warm_run_is_warm_only_on_exit_0_the_marker_and_the_exact_last_line() {
+        let marker = started_line(NONCE);
+        let line = format!("gate: remote warm {WARM_HASH}");
+        let other = format!("gate: remote warm {OTHER_HASH}");
+        let adjusted = adjusted_line(NONCE, 3.5);
+        let unconfirmed = failed(WarmFailure::Commands, UNCONFIRMED);
+        let not_begun = failed(WarmFailure::Refused, "the builder ended the warm-up before its commands with status 0");
+        let cases: [(&str, String, String, WarmEnd); 10] = [
+            ("warm", String::new(), format!("{marker}\nbuilt\n{line}\n"), WarmEnd::Warm),
+            ("warm-crlf", String::new(), format!("{marker}\r\n{line}\r\n"), WarmEnd::Warm),
+            (
+                "a-later-heartbeat",
+                String::new(),
+                format!("{marker}\n{line}\ngate-remote-heartbeat: 12\n"),
+                WarmEnd::Warm,
+            ),
+            (
+                "a-later-adjusted-line",
+                String::new(),
+                format!("{marker}\n{line}\n{adjusted}\n"),
+                WarmEnd::Warm,
+            ),
+            ("no-marker", String::new(), format!("{line}\n"), not_begun),
+            ("wrong-hash", String::new(), format!("{marker}\n{other}\n"), unconfirmed.clone()),
+            ("not-last", String::new(), format!("{marker}\n{line}\nlater\n"), unconfirmed.clone()),
+            ("on-stdout", format!("{line}\n"), format!("{marker}\n"), unconfirmed.clone()),
+            ("padded", String::new(), format!("{marker}\n{line} \n"), unconfirmed.clone()),
+            ("no-line", String::new(), format!("{marker}\n"), unconfirmed),
+        ];
+        for (name, stdout, stderr, expected) in cases {
+            assert_eq!(warm_said(&stdout, &stderr, 0, &format!("warm-{name}")), expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_warm_run_s_refusals_and_failures_are_classed_by_the_marker() {
+        let marker = started_line(NONCE);
+        let tag = refused_line(NONCE, Refusal::Busy);
+        let busy = busy_line("app-1a2b3c4d");
+        let refused = |reason: &str| failed(WarmFailure::Refused, reason);
+        let commands = |reason: &str| failed(WarmFailure::Commands, reason);
+        assert_eq!(
+            warm_said("", &format!("{tag}\n{busy}\n"), 75, "warm-refused"),
+            refused("the builder refused: busy"),
+            "a tag and 75 before the marker"
+        );
+        for status in [124, 2, 127, 75] {
+            assert_eq!(
+                warm_said("", &format!("{marker}\n{tag}\n{busy}\n"), status, &format!("warm-status-{status}")),
+                commands(&format!("command stopped with status {status}")),
+                "status {status} after the marker"
+            );
+        }
+        let lost = "the connection to the builder was lost";
+        assert_eq!(warm_said("", &format!("{marker}\n"), 255, "warm-lost-after"), commands(lost));
+        assert_eq!(warm_said("", "", 255, "warm-lost-before"), refused(lost));
+        let killed = "the warm-up was killed: it ran out of its budget or went silent";
+        assert_eq!(warm_end(WARM_HASH, true, &End::Killed, None), commands(killed));
+        assert_eq!(warm_end(WARM_HASH, false, &End::Killed, None), refused(killed));
+        for started in [false, true] {
+            assert_eq!(warm_end(WARM_HASH, started, &End::Interrupted, None), WarmEnd::Deleted, "{started}");
+        }
+        assert_eq!(
+            warm_end(WARM_HASH, false, &End::NotRouted("gate: not routed: sibling lib x".to_owned()), None),
+            refused("the client could not send the warm-up")
+        );
+
+        let log = unwritten_log();
+        let warm_up = [vec!["./tool.exe".to_owned()]];
+        let warm_call = RemoteCall {
+            warmth: Warmth::WarmUp {
+                commands: &warm_up,
+                hash: WARM_HASH,
+            },
+            ..call(&log)
+        };
+        let transport = nowhere();
+        let mut confirmed_none = attempt(&warm_call, &transport);
+        assert!(confirmed_none.warm_ran(&ran(End::Status(0), true, None)), "a warm-up's end is kept");
+        let outcome = confirmed_none.outcome(End::Status(0));
+        assert_eq!(
+            (outcome.status, outcome.warm),
+            (1, Some(commands(UNCONFIRMED))),
+            "a 0 the box did not confirm is no pass"
+        );
+        let refused_early = attempt(&warm_call, &transport).outcome(End::Refused(FallbackReason::Version));
+        assert_eq!(
+            refused_early.warm,
+            Some(refused("the builder refused: version")),
+            "a refusal before the run call"
+        );
+        let interrupted = attempt(&warm_call, &transport).outcome(End::Interrupted);
+        assert_eq!(interrupted.warm, Some(WarmEnd::Deleted));
+        let plain = call(&log);
+        assert_eq!(attempt(&plain, &transport).outcome(End::Status(0)).warm, None, "a run is no warm-up");
+    }
+
+    /// A run call's end `end`, the box having said the start marker when `started`, its last error line `last_error`.
+    fn ran(end: End, started: bool, last_error: Option<String>) -> RunEnd {
+        RunEnd {
+            end,
+            outputs_line: None,
+            back_commits: None,
+            names_skipped: false,
+            started,
+            last_error,
+        }
+    }
+
+    #[test]
+    fn a_warm_run_syncs_nothing_back() {
+        let log = unwritten_log();
+        let warm_up = [vec!["./tool.exe".to_owned()]];
+        let warm_call = RemoteCall {
+            warmth: Warmth::WarmUp {
+                commands: &warm_up,
+                hash: WARM_HASH,
+            },
+            interrupt: None,
+            ..call(&log)
+        };
+        let transport = nowhere();
+        let mut attempt_of_warm_up = attempt(&warm_call, &transport);
+        let warm = ran(End::Status(0), true, Some(format!("gate: remote warm {WARM_HASH}")));
+
+        assert!(attempt_of_warm_up.warm_ran(&warm), "a warm-up's end is kept");
+        let ended = attempt_of_warm_up.warm_ended(warm.end, &location(), None);
+
+        assert!(matches!(ended, End::Status(0)), "{ended:?}");
+        assert_eq!(attempt_of_warm_up.warm, Some(WarmEnd::Warm));
+        assert_eq!(attempt_of_warm_up.brought_back, None, "no outputs step");
+        assert_eq!(
+            (attempt_of_warm_up.split.sync_back, attempt_of_warm_up.split.outputs),
+            (None, None),
+            "no sync-back and no outputs fetch"
+        );
+        let plain = RemoteCall {
+            interrupt: None,
+            ..call(&log)
+        };
+        let mut run = attempt(&plain, &transport);
+        assert!(!run.warm_ran(&ran(End::Status(0), true, None)), "a run's end goes on to the sync-back");
+        assert_eq!(run.warm, None);
+    }
+
+    /// A call of the work-folder key under `state`, logging to `log`, whose interrupt is `interrupt`, which only the
+    /// test raises: [`call`] raises its own.
+    fn key_call<'a>(log: &'a Path, state: &'a StateRoot, interrupt: Option<Interrupt>) -> RemoteCall<'a> {
+        RemoteCall {
+            host: "builder",
+            key: "app-1a2b3c4d",
+            root: r"C:\no-such-worktree",
+            root_id: gate_router::FolderId { volume: 0, file: [0; 16] },
+            leaf: "app",
+            siblings: Vec::new(),
+            repo: "app",
+            subfolder: "",
+            words: &[],
+            outputs: &[],
+            outputs_withheld: false,
+            inputs: &[],
+            log,
+            timeout: 60,
+            usual: None,
+            stall: 60,
+            tail: 0,
+            no_markers: false,
+            bring_tracked: &[],
+            interrupt,
+            state,
+            state_dir: Path::new(r"C:\gate-client-tests-state"),
+            warmth: Warmth::Unasked,
+        }
+    }
+
+    /// How a wait for the key ended, as a word the assertions compare; the line of one that failed.
+    fn hold_of(hold: Result<KeyHold, String>) -> String {
+        match hold {
+            Ok(KeyHold::Held(_)) => "held".to_owned(),
+            Ok(KeyHold::Busy) => "busy".to_owned(),
+            Ok(KeyHold::Interrupted) => "interrupted".to_owned(),
+            Err(line) => line,
+        }
+    }
+
+    #[test]
+    fn a_second_holder_of_the_key_waits_and_takes_it_only_once_the_first_lets_go() {
+        let state = StateRoot::new(&format!(r"C:\gate-client-tests-key-wait-{}", std::process::id()), None);
+        let log = unwritten_log();
+        let quiet = key_call(&log, &state, None);
+        let interrupt = Interrupt::install().expect("the console handler is installed");
+        let interruptible = key_call(&log, &state, Some(interrupt));
+        let first = hold_key(&quiet).expect("the key is free");
+        thread::scope(|scope| {
+            let second = scope.spawn(|| hold_of(hold_key_waiting(&quiet, Duration::from_millis(250))));
+            assert_eq!(second.join().expect("the second holder ends"), "busy", "it waits out its wait, not held");
+            // The wait is far longer than any test: it ends on the interrupt, raised while it waits.
+            let stopped = scope.spawn(|| hold_of(hold_key_waiting(&interruptible, LONG)));
+            interrupt.raise();
+            assert_eq!(stopped.join().expect("the interrupted holder ends"), "interrupted");
+            let waiter = scope.spawn(|| hold_of(hold_key_waiting(&quiet, LONG)));
+            drop(first);
+            assert_eq!(waiter.join().expect("the waiter ends"), "held", "it takes the key once the first lets go");
+        });
+    }
+
+    #[test]
+    fn a_warm_up_touches_no_outputs_state() {
+        let state_dir = crate::test_support::temp_dir().join(format!("gate-client-warm-outputs-{}", std::process::id()));
+        if state_dir.exists() {
+            fs::remove_dir_all(&state_dir).expect("an earlier run's folder is removed");
+        }
+        fs::create_dir_all(&state_dir).expect("the state folder can be made");
+        let log = state_dir.join("out.log");
+        let globs = ["**/bin/**".to_owned()];
+        let warm_up = [vec!["./tool.exe".to_owned()]];
+        let warm_call = RemoteCall {
+            outputs: &globs,
+            outputs_withheld: true,
+            warmth: Warmth::WarmUp {
+                commands: &warm_up,
+                hash: WARM_HASH,
+            },
+            interrupt: None,
+            state_dir: &state_dir,
+            ..call(&log)
+        };
+        let transport = nowhere();
+        let mut attempt_of_warm_up = attempt(&warm_call, &transport);
+
+        let sent = super::outputs_sent(&mut attempt_of_warm_up).expect("a warm-up's outputs need nothing");
+        let marked = outputs::marked(&sent);
+
+        let left: Vec<String> = fs::read_dir(&state_dir)
+            .expect("the state folder can be read")
+            .map(|entry| entry.expect("an entry can be read").file_name().to_string_lossy().into_owned())
+            .collect();
+        drop(attempt_of_warm_up);
+        fs::remove_dir_all(&state_dir).expect("the state folder can be removed");
+        assert!(sent.globs.is_empty() && !sent.full, "no globs, no full send");
+        assert!(sent.manifest.is_none(), "no manifest line on the run input");
+        assert!(marked.is_ok(), "nothing to mark");
+        assert!(left.is_empty(), "no hash cache and no pending marker: {left:?}");
+    }
+
+    #[test]
+    fn a_warm_up_whose_client_failed_after_the_marker_failed_its_commands() {
+        let log = unwritten_log();
+        let warm_up = [vec!["./tool.exe".to_owned()]];
+        let warm_call = RemoteCall {
+            warmth: Warmth::WarmUp {
+                commands: &warm_up,
+                hash: WARM_HASH,
+            },
+            interrupt: None,
+            ..call(&log)
+        };
+        let transport = nowhere();
+        let failed_after = |marker_seen: bool| {
+            let mut attempt_of_warm_up = attempt(&warm_call, &transport);
+            attempt_of_warm_up.marker_seen = marker_seen;
+            attempt_of_warm_up.outcome(End::Failed("a reader failed".to_owned())).warm
+        };
+
+        assert_eq!(
+            failed_after(true),
+            Some(failed(WarmFailure::Commands, "the client failed")),
+            "commands may have run"
+        );
+        assert_eq!(
+            failed_after(false),
+            Some(failed(WarmFailure::Refused, "the client failed")),
+            "no command ran"
+        );
+    }
+
+    #[test]
+    fn a_warm_up_whose_lost_connection_ends_on_an_interrupt_is_deleted() {
+        let log = unwritten_log();
+        let warm_up = [vec!["./tool.exe".to_owned()]];
+        // The call's interrupt is raised, so the connection's loss ends on it.
+        let warm_call = RemoteCall {
+            warmth: Warmth::WarmUp {
+                commands: &warm_up,
+                hash: WARM_HASH,
+            },
+            ..call(&log)
+        };
+        let transport = nowhere();
+        let mut attempt_of_warm_up = attempt(&warm_call, &transport);
+        let lost = ran(End::Lost(0..0), true, None);
+        assert!(attempt_of_warm_up.warm_ran(&lost), "a warm-up's end is kept");
+
+        let ended = attempt_of_warm_up.warm_ended(lost.end, &location(), Some(BOOTED));
+
+        assert!(matches!(ended, End::Interrupted), "{ended:?}");
+        assert_eq!(attempt_of_warm_up.warm, Some(WarmEnd::Deleted), "an interrupt leaves no record");
     }
 
     #[test]

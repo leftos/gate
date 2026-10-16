@@ -449,7 +449,7 @@ The lines of a run that starts its command:
 
   The line names each sibling in declared order with its root as routing spells it. While it waits for a remote slot: `gate: waiting for a remote slot on <host> (<n> busy)` and `gate: still waiting for a remote slot on <host> (<s> s)`, as a local wait says them, ETA included.
 
-  A run the builder does not take says why and goes on here: `gate: remote <host> <reason>; running here`, with `<reason>` one of `full` (no remote slot within 60 s), `busy`, `unreachable`, `parity`, `rebooted`, `tools`, `layout`, `version` or `inputs` (the run's ignored inputs could not be sent, or the builder's work folder no longer held them at the run), and `gate: remote <host> client could not start: <detail>; running here` when the remote client cannot start.
+  A run the builder does not take says why and goes on here: `gate: remote <host> <reason>; running here`, with `<reason>` one of `full` (no remote slot within 60 s), `busy`, `unreachable`, `parity`, `rebooted`, `tools`, `layout`, `version`, `inputs` (the run's ignored inputs could not be sent, or the builder's work folder no longer held them at the run) or `cold` (the builder's work folder was not warm for the run's warm-up file; the client says it for a call that needs a warm folder, and no run makes such a call yet), and `gate: remote <host> client could not start: <detail>; running here` when the remote client cannot start.
 
   A routed run whose repo declares `inputs` says `gate: inputs: <n> file(s), <X.X> MB (<Y.Y> MB compressed) in <Z.Z> s` once a put has sent files.
 
@@ -616,6 +616,9 @@ For any other root, every kernel object name carries `<h>`, the first 8 lower-ca
 | `remote\<key>.inputs-hashes` | the Rust remote client | the same | The inputs' hash cache, in the outputs cache's shape and saved as it is, kept apart from it since the outputs saves drop every file the outputs walk no longer finds. Saved after an inputs manifest the client builds changes it; a file whose hash the pack finds wrong is dropped from it, and deleting the file resets the cache ([The remote client's run](#routing), Inputs). |
 | `remote\<key>.nothing-back` | the gate, after a routed dotnet build ends on the builder without its outputs known to be brought back, or, when none stands, a routed dotnet `--no-build` command whose word the builder dropped | every gate (the `--no-build` drop and the clear) | JSON `{"v":1,"host":"…","configuration":"…","framework":"…","runtime":"…"}`; the last three are optional and come from the routed build's own `-c`, `-f` and `-r` words. A passing local build of the whole worktree with the same three removes it, as does a passing routed build of that kind that brought all its outputs back ([Routing](#routing)). Written with create-new and the reparse-point flag, and read the same way, 4096 bytes at most; one that cannot be read counts as present. |
 | `remote\<key>.outputs-capped` | the Rust remote client, at an outputs fetch that passed the fetch cap | the same | The outputs cap record: JSON `{"v":1,"hits":<n>}`, the fetches in a row of that worktree that passed the cap. A second hit in a row fails the run; any other end of its outputs fetch but a Ctrl+C during it, and a box that packed nothing, removes it; one that cannot be read counts no hit ([The remote client's run](#routing), Outputs fetch). |
+| `remote\warm\<key>.json` | the warm-up of the work folder `<key>` (not wired yet; `gate-state` has the writer and reader) | the route's warm-up judge | The warm-up record: JSON `{"v":1,"host":"…","state":"…","at":"<ISO>","hash":"…","gate":"…","pid":<n>,"started":"<ISO>"}`, then `failure` and `reason` when, and only when, `state` is `failed`. `state` is `warming`, `warm` or `failed`; `failure` is `commands` (the commands failed or ran out of time) or `refused` (refused before any command ran); `hash` is the 64 lower-case hex digits of the SHA-256 of the raw bytes of the worktree's `.gate/warmup.toml`, a byte order mark included; `gate` is the build id of the PC gate that wrote it; `pid` and `started` are the warming process's, for the lines only. Written whole or not at all like the nothing-back record; a record that breaks a rule of its shape is refused on read and on write. ops-tower does not read it. |
+| `remote\warm\<key>.log`, `remote\warm\<key>.lock` | the warming process | the route's warm-up judge (the lock) | The warm-up's log, and the lock it holds for its whole life: a `warming` record counts as live only while the lock is held. Paths only so far. |
+| `remote\warm.lock` | the warming process | other warming processes | The lock that lets one warm-up at a time run on this PC. Path only so far. |
 `<start>` everywhere in a name is the process start time in Unix epoch milliseconds. Claims, tickets, counts, the nothing-back record and the outputs cap record are written to a temporary sibling (`<file>.<pid>.<n>.tmp`, where `<n>` is a per-process counter so two threads of one process never share one) and moved over the target, so a reader never sees a torn file (kept, L1, Q1).
 
 A `remote-cutover.flag` or `remote-cutover.draining` left in a state root is ignored: nothing reads or writes either file.
@@ -816,7 +819,7 @@ Fields beyond J1's:
   `transfer-timed-out` is a routed run's fetch after the command cut at its transfer ceiling.
 
   A routed run is a kill only when the gate killed it; a command that exits 124 on its own is `failed`.
-- `fallback`: `reason`, one of `full` (no remote slot within the 60 s wait), `busy`, `unreachable`, `parity`, `rebooted`, `tools` (T5), `layout` (the box could not clear or lay out its work folder), `version` ([The box side](#the-box-side)), `client` (the remote client could not start, as when it finds no usable ssh) and `inputs` (the run's ignored inputs could not be sent, a sibling pair declared inputs, or the box refused the run because its work folder no longer held the inputs sent).
+- `fallback`: `reason`, one of `full` (no remote slot within the 60 s wait), `busy`, `unreachable`, `parity`, `rebooted`, `tools` (T5), `layout` (the box could not clear or lay out its work folder), `version` ([The box side](#the-box-side)), `client` (the remote client could not start, as when it finds no usable ssh), `inputs` (the run's ignored inputs could not be sent, a sibling pair declared inputs, or the box refused the run because its work folder no longer held the inputs sent) and `cold` (the builder's work folder was not warm for the run's warm-up file; `FallbackReason::Cold` writes the word, and the client refuses a call that needs a warm folder this way, but no run makes such a call yet).
 
   The `take` after it is the run's local one, untagged, its `waitedSeconds` counted from the `fallback`, except after `full`, where it counts from the run's `queue` line; a Ctrl+C that ends that local wait writes the same figure on its `abandon`.
 - a routed run's `take`, `release` and `abandon` carry the tag; its `release` has the builder's `adjustedSeconds` (null when it said none) and a `wallSeconds` of the whole remote call, and the verdict `timed-out` or `backstop` after a kill by the builder or by the client's backstop.
@@ -881,15 +884,21 @@ Two rolls within one second collide on the archive name: the second archive fail
 
 ### remote.json
 
-`remote.json` keeps the PowerShell gate's format (T1), read by `gate-router` as [Routing](#routing) describes: `host`, `slots`, `repos` and the optional per-repo `outputs`, `inputs` and `siblings`, read afresh by each routed gate and ignored as a whole with one line when unusable. A host of one letter is refused (`host must not be a single letter, which a git host:path URL reads as a drive`).
+`remote.json` keeps the PowerShell gate's format (T1), read by `gate-router` as [Routing](#routing) describes: `host`, `slots`, `repos` and the optional per-repo `outputs`, `inputs` and `siblings` and the optional `warmup`, read afresh by each routed gate and ignored as a whole with one line when unusable. A host of one letter is refused (`host must not be a single letter, which a git host:path URL reads as a drive`).
 
 The optional `hosts` is an array of strings naming further builders, which only `gate push` reaches; a routed run goes to `host` alone. Each entry passes the checks `host` does, with the same reasons worded `hosts entries ...`.
 
 The push order is `host`, then `hosts` in file order, an entry equal to an earlier one in any letter case skipped. A `hosts` that is not an array of strings, or holds a bad entry, never affects routing: `gate push` alone refuses the file with `push: ignored <path>: <reason>`.
 
+`warmup` is an array of repo names, matched in any letter case, that consent to the repo's `.gate/warmup.toml` warming its builder work folders (`Config::warmup_consented`); a repo it does not name, or a file without the key, has no consent. A value that is not an array of non-empty strings consents to none and leaves the rest of the file usable, and `warmup_consented` gives its reason. Nothing reads the consent yet.
+
 ops-tower reads only `slots`.
 
 A repo's own `.gate/toolchain.toml`, which declares the tools and workloads a routed run's builder needs, is a separate file in the snapshot, not part of `remote.json`: [Routing](#routing) (Toolchain manifest) describes its format.
+
+A repo's `.gate/warmup.toml`, which declares the warm-up commands, is read by `gate_router::warm::read_warmup`: `commands`, an array of 1 to 8 commands, each a non-empty array of non-empty strings, and the optional `timeout`, whole seconds from 1 to 86400, 1800 when missing. A leading byte order mark is skipped, any other key is a problem, and any problem means no warm-up. Nothing in the gate binary reads the file yet.
+
+The judge, `gate_router::warm::judge`, says where a command that would otherwise route goes, given the repo's consent, the file, the work folder's record and whether its warm-up lock is held; it does not run yet. In order: no consent or no file routes; a file problem runs here saying `gate: not routed: .gate/warmup.toml: <problem>`; a held lock means a warm-up is running and the run stays here with `gate: not routed: <host> is warming the work folder for this worktree`; an unreadable record runs here with `gate: not routed: the warm-up record <path> cannot be read: <error>`; no record, a `warming` record with a free lock, or a `warm` record of another host or file starts a warm-up, the run staying here with `gate: not routed: starting a warm-up of the work folder for this worktree on <host>`; a `warm` record of this host and the file's hash routes. A `failed` record of this host, file hash and gate build keeps the run here until its backoff has passed, 30 minutes after `commands` and 60 seconds after `refused`, with `gate: not routed: the warm-up failed <n> min ago: <reason>` (`less than a minute ago` under a minute); a failure of another host, file or build, or one written in the future, has no backoff and starts a warm-up. Every `<…>` text is escaped to one line.
 
  It carries no `v`; its format moves with the remote port (GATE-10).
 
@@ -1452,6 +1461,10 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
   - **Preflight.** `gate box preflight` over ssh. Status 255, ssh's own status for a lost connection, says `gate: remote <host> unreachable: <last stderr line>` and falls back `unreachable`; the line is the last `\r` update of the last stderr line, its first 4 KiB, escaped (Escaping, below). Status 9009 or 2 (no `gate box` verb there) says `gate: not routed: <host> has no gate box that takes this run (preflight status <n>)` and falls back `version`.
 
     Any other non-zero status says `gate: preparing <builder root> on <host> failed (status <n>)` and ends the run with that status. A reported version text other than this PC's whole one, build id included, says `gate: not routed: <host> runs gate <theirs|unknown>, this PC <ours>; run gate push` and falls back `version`; the builder's version is its first 4 KiB, escaped.
+
+    The client also reads the preflight's `gate: remote warm <none|64 lower-case hex>` line, only the line right after the last `gate: remote version` line: anything else there, no such line, or a warm line elsewhere reads as no warmth.
+
+    A call that needs the work folder warm with a given hash and whose preflight does not name exactly that hash falls back `cold` here, after the version check and before parity and the push, so nothing is sent. A warm-up and a plain run do not compare the line. No run makes a call that needs warmth yet.
   - **Parity.** After the preflight and before the push, `remote/parity.rs` checks that the builder's `gate: remote sdks` line (from the preflight) has what the snapshot needs. A builder with no sdks line, or a tree that is not .NET (no `global.json`, `.sln`, `.slnx` or `.csproj` anywhere in the snapshot), skips the SDK part of the check; the tools of the repo's `.gate/toolchain.toml` are judged either way (Toolchain manifest, below).
 
     A lacking builder says `gate: remote toolchain mismatch: <repo> needs <need>; <host> has <sdks>` once for each need, in the order the needs are listed, then a single `gate: remote <host> parity; running here`, and falls back `parity` (status 75).
@@ -1570,6 +1583,15 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
     A status 75 is a refusal only when this run's refusal tag came on stderr before any start marker (`busy`, `tools` or `layout`, the fallback reason); a tag after the marker is ignored, so a command that prints the human busy, tools or layout line, or a tag of its own, and exits 75 ends with status 75 and no fallback.
 
     Safety rests on order, not on the nonce being secret (the request is on no command line, but the nonce still appears in the run id, the pipe names and the archive name): the box says the marker before it creates the command's process, and the client ignores every tag once it has heard the marker.
+  - **Warm-up call.** A call whose `warmth` is a warm-up (`Warmth::WarmUp` in `remote/mod.rs`) runs the phases above with the run call's payload built by `payload::warm_word`: the run's keys, `Timeout` always among them, with `WarmCommands` and `WarmHash` in place of `Command` and no `Outputs` or `OutputsFull` key. Its limits are a run's, from the call's `timeout`. No run, verb or route makes such a call yet.
+
+    The run call's end is classed by `warm_end` in `remote/client.rs` and handed back as `RemoteOutcome.warm`. It is warm only on status 0, after the start marker, with the call's last stderr line that is neither a heartbeat nor a protocol line exactly `gate: remote warm {H}` for the `WarmHash` sent. A Ctrl+C is deleted: it leaves no record.
+
+    Any other end is a failure: a refusal when it came before the start marker, as no command ran (the box's refusal tag with status 75, or a status, kill or lost connection before the marker, or an end of the client's own), and the commands' failure when it came after the marker (any non-zero status, the box's kill, a lost connection), and a status 0 the box did not confirm. A status 0 the box did not confirm is reported as status 1.
+
+    The failure's reason is built from the end alone, never from a line the builder or the commands said: `command stopped with status {n}`, `the builder ended the warm-up before its commands with status {n}`, `the box did not confirm the warm hash`, `the builder refused: {reason}`, `the warm-up was killed: it ran out of its budget or went silent`, `the connection to the builder was lost`, `the client could not send the warm-up` or `the client failed`.
+
+    A warm-up touches no outputs state (it reads, saves and marks none, whatever globs the call holds) and syncs nothing back; a lost connection is handled as a run's is. The key mutex a caller holds around it can be taken with a wait (`hold_key_waiting` in `remote/client.rs`): it waits in slices of 100 ms, looks at the console interrupt between them, and a Ctrl+C ends the wait.
   - **Outputs.** In `remote/outputs.rs`, for a run with output globs; a run without them sends `Outputs` `[]` and `OutputsFull` false, no manifest, and says nothing here, and writes no marker unless the route withheld its outputs (a dotnet `--no-build` command the builder built): that run writes the pending marker after the push, as below, and no end of it clears the marker. The client builds the manifest ([The outputs module](#the-box-side)) before the run call, hashing every matching file.
 
     **Manifest time** (GATE-23): SHA-256 streams, with no whole-file read into memory, and only the PC hashes every file (the box hashes changed files only; `obj` is not under the default globs). No timing line is added to routed runs.
@@ -1955,9 +1977,11 @@ Each verb is one ssh call today, and the call's cost is its connection, not its 
 
 A routed run therefore moves to one long-lived connection carrying every verb, `gate box serve`, and the per-call client stays until that lands (GATE-70 holds the measurement, and GATE-109 the work).
 
-The payload is one base64 word (standard alphabet, padded) of UTF-8 JSON, sent as the first line of the call's stdin (never on a command line), holding the wrapper's keys: `Key`, `Bare`, `Work`, `Lock`, `Index`, `OutputFolder` and `Job`, and for `run` also `Command`, `Subfolder`, `Identity`, `Outputs`, `Nonce`, `OutputsFull`, `Timeout`, `Host` and the optional `InputsDigest`, and for `outputs` also `Name`. `inflight` reads only `Root`.
+The payload is one base64 word (standard alphabet, padded) of UTF-8 JSON, sent as the first line of the call's stdin (never on a command line), holding the wrapper's keys: `Key`, `Bare`, `Work`, `Lock`, `Index`, `OutputFolder` and `Job`, and for `run` also `Command` (or, for a warm-up, `WarmCommands` and `WarmHash` in its place), `Subfolder`, `Identity`, `Outputs`, `Nonce`, `OutputsFull`, `Timeout`, `Host` and the optional `InputsDigest`, and for `outputs` also `Name`. `inflight` reads only `Root`.
 
 `inputs` reads `Key`, `Bare`, `Work`, `Lock`, `Nonce` and `Step`.
+
+A warm-up's `run` payload sets `WarmCommands` (1 to 8 commands, each a non-empty list of non-empty texts) and `WarmHash` (64 lower-case hex digits, the hash of the warm-up file the commands come from), sets no `Command`, and asks for no outputs. The PC's client can send it (The remote client's run, Warm-up call), but no verb or run does yet.
 
 `preflight` also reads an optional `Needs`, an object of tool name to minimum version text (`""` for any version), which the PC builds with `remote::payload::preflight_word` from the tools it wants probed; it is omitted when there are none, so a payload without needs is the same bytes as before.
 
@@ -1991,7 +2015,7 @@ The box gives each run's command its own build servers: the command's environmen
 
 So no other run's command, on the box or on the PC, uses the compiler server or the MSBuild nodes this one starts, and no node idles in the job after its build (an idle node would keep alive anything in the command that waits on its whole tree).
 
-The box's own git calls and tool restore do not get these settings.
+The box's own git calls, tool restore and pnpm install do not get these settings.
 
 The servers a run starts live in its job and are ended at its end, so every routed build starts its own nodes and compiler server; none is kept warm between runs.
 
@@ -2014,7 +2038,7 @@ Built verbs:
 
   With a `Pair` in the payload the preflight makes the folder above `Work` and one bare repo per repo, `Bare` for the main checkout and `{root}\{stem}.git` for each sibling (`{root}` is `Bare`'s folder, `{stem}` the sibling's name with every character but an ASCII letter, digit, `-` and `_` made `-`), and touches nothing inside `Work`.
 
-  It prints on stdout, in order: `gate: remote created <Bare>` (only when it created the bare repo), `gate: remote version <gate version>` (the same text as `gate --version` after `gate `, build id included), the boot line, `gate: remote sdks <v1,v2|none>`, and one `gate: remote tool <tool> ...` line for each tool of the payload's `Needs` (Tool probes, below); git's own output passes through. A payload without `Bare` or `Work` prints `gate: box payload lacks <key>` and exits 2.
+  It prints on stdout, in order: `gate: remote created <Bare>` (only when it created the bare repo), `gate: remote version <gate version>` (the same text as `gate --version` after `gate `, build id included), `gate: remote warm <64-hex>` or `gate: remote warm none` (the hash in the work folder's warm record `{Work}.warm`, read before the folders are readied; `none` when the main tree's `.git` or the record is missing, or the record is not a plain file holding exactly 64 lower-case hex digits, a line end included), the boot line, `gate: remote sdks <v1,v2|none>`, and one `gate: remote tool <tool> ...` line for each tool of the payload's `Needs` (Tool probes, below); git's own output passes through. A payload without `Bare` or `Work` prints `gate: box payload lacks <key>` and exits 2.
 - A failing git step prints `gate: remote <step> failed (status <n>)` and exits with that status; a git that cannot start prints `gate: remote <step> failed: <OS message>` and exits 1.
 
   The same `failed: <message>` form covers a config read or write the preflight made itself: `gate: remote git remote add failed: cannot write <config>: <why>`, `gate: remote git remote add failed: cannot open|read <path>: <why>` and `gate: remote git remote add failed: cannot write <config>: config.lock could not be removed: <why>`. The steps are `git init --bare`, `git init`, `git remote add`, `git config core.autocrlf` and `git config core.eol`.
@@ -2042,7 +2066,7 @@ Built verbs:
   The `<why>` of a skip is `unknown tool`, `no probe for godot`, `no answer in <n> s` (or `<n> ms` when the limit is not whole seconds), `no answer in <limit>, and could not be stopped: <error>`, `the probe failed` (followed by `: <panic text>` when the probe panicked), or the runner's failure text: `cannot run <program>: <why>`, `<program> <args> wrote more than 16 MiB` or `cannot run <program>: cannot read the system folder: <error>`.
 
   A payload whose `Needs` is not an object of texts prints `gate: box payload Needs is not an object of texts; probing nothing` on stderr, probes nothing and still exits 0.
-- **`run`** runs the payload's `Command` (a list of texts) in `Work` (in `Work\{Leaf}` for a sibling pair), and exits with the command's own whole 32-bit status after a successful run. Its stdout is the command's stdout, LF-terminated; its stderr is the command's stderr plus the box's own lines.
+- **`run`** runs the payload's `Command` (a list of texts), or, for a warm-up, each of its `WarmCommands` in order (Warm-up, below), in `Work` (in `Work\{Leaf}` for a sibling pair), and exits with the command's own whole 32-bit status after a successful run. Its stdout is the command's stdout, LF-terminated; its stderr is the command's stderr plus the box's own lines.
 
   The heartbeat: `gate box run` writes `gate-remote-heartbeat: <cpu ms>` on stderr every 5 s, on `gate-watchdog`'s `BeatClock` and `Pump`. Before the command starts (from just before the checkout) and after the command's wait ends it is not CPU-gated, so every period writes a beat, the first one period after it begins.
 
@@ -2062,7 +2086,11 @@ Built verbs:
 
   `gate-remote-adjusted: <nonce> <s.sss>` is also said as any watched command exits, once its output has drained, unless the sampler failed. A failed sample says `gate: sampler failed: <message>; watching by wall time only` and only the backstop is read from then on.
 
-  The start marker: just before it launches the command, before the donor console and the launch, the box says `gate-remote-started: <nonce>` on stderr once, with the payload's `Nonce`; a launch then refused or stopped has said it too.
+  The start marker: just before it launches the command, before the donor console and the launch, the box says `gate-remote-started: <nonce>` on stderr once, with the payload's `Nonce`; a launch then refused or stopped has said it too. A warm-up says it once, after every tool and pnpm restore and before its first command, and not again before the later ones.
+
+  Warm-up: a `run` with `WarmCommands` lays out and readies the work folder, restores the tools and the pnpm packages of every command, as a run does, then removes `{Work}.warm`, says the start marker and runs each command in order as a run's command is run (the stop signal looked at before each). It makes no back commit and packs no outputs, and on a pair run never says `gate: remote back commits: ...`. The payload's `Timeout` is one budget for all the commands: each command's ceiling is what the earlier ones left of it, in whole seconds rounded up, counting each one's load-adjusted seconds (its wall time once the sampler failed).
+
+  The first command that ends non-zero or is killed ends the warm-up with `gate: remote warm-up stopped at command <k> of <n>` on stderr and that command's status (124 for a kill). A budget spent before command `k` ends it with `gate: remote warm-up ran out of its <s> s budget before command <k> of <n>` and exit 124. Once every command passed, the box writes `{Work}.warm` holding exactly `WarmHash` and says `gate: remote warm <hash>` last, exit 0. A record that cannot be removed or written says `gate: remote could not remove <Work>.warm: <error>` or `gate: remote could not write <Work>.warm: <error>` and exits 1.
 
   The `CpuSource` is the job's own CPU, which only rises: the job's accounting keeps what its ended processes used. Another run's busy build on the box does not keep a silent idle command alive.
 
@@ -2077,6 +2105,8 @@ Built verbs:
   Ending the heartbeat waits at most 2 s (`Pump::stop_within`), so a pump stuck on a client that stopped reading is left behind and the work folder's lock is released.
 
   Payload refusals exit 2, each on stderr. The command's own: `gate: box payload Command is not a list of texts`, `gate: box payload lacks Command`, `gate: box payload Subfolder is not a text`, `gate: box payload Identity is not an object of texts`, `gate: box payload Identity may set only GIT_AUTHOR_* and GIT_COMMITTER_* names: <name>` and `gate: box payload Identity <name> holds a NUL`.
+
+  A warm-up payload's: `gate: box payload sets both Command and WarmCommands`, `gate: box payload lacks WarmHash`, `gate: box payload asks a warm-up for outputs` (an `Outputs` glob or `OutputsFull` true), `gate: box payload WarmCommands is not a list of 1 to 8 commands, each a non-empty list of non-empty texts` and `gate: box payload WarmHash is not 64 lower-case hex digits: <value>`. A `WarmHash` beside a `Command` is ignored, and a null `WarmCommands` is not set.
 
   The work folder's: `gate: box payload Lock must be <Work>.lock`, `gate: box payload Index must be <Work>.index`, `gate: box payload Key is not a work-folder key: <key>` and `gate: box payload Job is not this work folder's job name: <job>`.
 
@@ -2104,6 +2134,10 @@ Built verbs:
 
   The layout record `<Work>.layout`, beside the lock, says which layout `Work` holds: `single`, `pair {Leaf} {siblings}` (the siblings sorted without regard to ASCII case, one space before each, so the same siblings in another order are one layout) or `changing` while the folder is being cleared. A missing record says `single`. It is read and written as the tools record is, through a handle that refuses a link, a folder or a file with more than one name.
 
+  The records beside the lock, one file each, named `Work` plus: `.lock` (the run's lock), `.index` (the sync-back's copy of the index), `.layout` (above), `.inputs` (the copies the `inputs` verb left), `.tools` (the dotnet tool restore), `.packages` (the pnpm package restore) and `.warm` (the hash of the warm-up file whose commands last passed in the folder, 64 lower-case hex digits, no line end, written only by a warm-up). Each is described where its feature is.
+
+  The warm record is removed before a warm-up's first command, when a run finds the layout changed (before `changing` is written) and when the work folder is missing and the run makes it, so it never outlives the folder state it describes. The preflight reads it without taking the lock, sharing reading, writing and deletion.
+
   Under the lock, before any checkout, the run makes `Work` when missing, opens it as itself and holds it (a link, a junction or a file there is refused, never followed), and, when the record names another layout than the run's, writes `changing`, removes every child of `Work` (each as itself, a link never followed), readies each tree and writes the run's layout.
 
   A `changing` record left by a clear that did not finish clears again. A run of one repo in a folder already of that layout whose `.git`, `.git\objects` and `.git\objects\info` are each a folder of its own, and whose `.git\config` is a file when there is one, readies nothing here: the preflight readied the tree. A pair run readies its trees every time.
@@ -2122,7 +2156,7 @@ Built verbs:
 
   A payload without `InputsDigest` skips the check. The PC reads the `inputs` tag as fallback reason `inputs` and says `gate: remote <host> inputs; running here`, with `gate: remote inputs not sent: the builder's work folder does not hold the inputs sent` in the log.
 
-  The steps are the layout, fetch, the commit probe, checkout, clean and the back ref reset (each of the three git steps once per repo on a pair run, the main repo first), the dotnet tool restore, then the command, then the sync-back. A failing step prints `gate: remote <fetch|checkout|clean|back ref reset> failed (status <n>)` and exits `n`.
+  The steps are the layout, fetch, the commit probe, checkout, clean and the back ref reset (each of the three git steps once per repo on a pair run, the main repo first), the dotnet tool restore, the pnpm package restore, then the command, then the sync-back. A failing step prints `gate: remote <fetch|checkout|clean|back ref reset> failed (status <n>)` and exits `n`.
 
   On a pair run the step is followed by the repo's name (`gate: remote fetch <name> failed (status <n>)`), while the steps that ready a tree say `failed for <name>` as the preflight's do.
 
@@ -2134,7 +2168,7 @@ Built verbs:
 
   The tool restore (`boxside/tools.rs`) runs `dotnet tool restore` in `{Work}\{Subfolder}` (`{Work}\{Leaf}\{Subfolder}` on a pair run) on a hidden console, in a job of its own named `{job}-tools`, created kill-on-close and never handed to dotnet, so the box's own handle keeps it: a box that dies or is killed takes the restore and everything it started with it, and a process the restore leaves running is terminated before the command starts.
 
-  Its stdout and stderr are forwarded into the run's output line by line under the box's output lock, as the command's are, so they never split a heartbeat line. It has no time limit: a hung restore holds the work-folder lock, so every routed run of that worktree falls back `busy` meanwhile, and the run's stall watch does not see it, since the box heartbeat goes on outside the command (whether to cap it is GATE-105).
+  Its stdout and stderr are forwarded into the run's output line by line under the box's output lock, as the command's are, so they never split a heartbeat line. It has no time limit: a hung restore holds the work-folder lock, so every routed run of that worktree falls back `busy` meanwhile, and the run's stall watch does not see it, since the box heartbeat goes on outside the command (whether to cap it is GATE-159, which decides the package restore's cap too).
 
   A stop already set when the restore would start runs none: status 1, `gate: the gate failed while running the command: the job {job} was stopped before the command started`. A stop during the restore ends its job (dotnet and anything it started) and gives the same line naming `{job}-tools`.
 
@@ -2144,7 +2178,7 @@ Built verbs:
 
   The record `<Work>.tools`, beside the lock, is 64 lower-case hex digits (SHA-256 over, per manifest in walk order, the UTF-8 path relative to the work folder, a NUL, the file bytes, a NUL), UTF-8, no BOM, no newline; the restore is skipped while the record equals the hash of the manifests.
 
-  A restore that exits, passing or failing, first prints `gate: dotnet tool restore took <s> s` (one decimal, timed from its start to its exit; nothing caps it yet), after its own output.
+  A restore that exits, passing or failing, first prints `gate: dotnet tool restore took <s> s` (one decimal, timed from its start to its exit; nothing caps it yet, GATE-159), after its own output.
 
   A restore that cannot start prints `gate: remote could not start the dotnet tool restore: <message>`, and a non-zero one prints `gate: remote tool restore failed (status <n>)` then `gate-remote-refused: <nonce> tools` and `gate: remote work folder <key> could not restore its dotnet tools` (the tag and the line together, under the heartbeat's lock).
 
@@ -2155,6 +2189,22 @@ Built verbs:
   The record is read and written through a handle that refuses a link, a folder or a file with more than one name, as the lock's is; a read that fails for any reason but "not found" says `gate: remote could not read <record>: <error>; restoring the tools` and restores.
 
   Known limit, as in PowerShell: after the builder's NuGet cache is cleared, the `*.tools` records must be deleted by hand.
+
+  The package restore (`boxside/packages.rs`) runs for a routed command whose first word's file stem is `pnpm`, in any case, after the tool restore and before the command. A run whose commands include more than one pnpm command (a warm-up's) installs once per distinct lockfile folder, in the commands' order, before the first command, and stops at the first install that fails. It looks for the folder to install in, for each command, from `--dir` or `-C`, read only among pnpm's own options before the first non-option word, else the place folder, and walks up from it to the work root (the main tree on a pair run) for the first `pnpm-lock.yaml`; a walk that finds none does nothing.
+
+  It runs `pnpm install --frozen-lockfile` in the lockfile's folder in a job of its own named `{job}-packages`, created kill-on-close and never handed to pnpm, with the command's restricted token (the box's own is never the fallback) and the box's environment plus `CI=true` and git's `safe.directory=*`. Its output is forwarded as the tool restore's is, and it has no time limit (GATE-159).
+
+  The record `{Work}.packages`, beside `{Work}.tools`, is UTF-8 lines `{folder}\t{64 lower-case hex digits}\n`, sorted, `.` for the root and `\` between folder names. The hash is SHA-256 over each of `pnpm-lock.yaml`, `package.json`, `pnpm-workspace.yaml` and `.npmrc` that exists in the folder, in that order: its name, a NUL, its bytes, a NUL. The install is skipped while the folder's line matches and `node_modules` there is a real folder.
+
+  Before it installs, the box asks git, with its own token, `git -c core.hooksPath=<lock>\hooks -c core.fsmonitor=false --git-dir=<work>\.git --work-tree=<work> check-ignore -q <folder>/node_modules/`, and the install runs only when git ignores `node_modules` there.
+
+  An install that exits, passing or failing, first prints `gate: pnpm install took <s> s` (` in <folder>` after it when the folder is not the root of the work folder), after its own output. One that cannot start prints `gate: remote could not start the pnpm install: <message>` (`cannot make its restricted token: <error>` when the token cannot be made); a non-zero one prints `gate: remote package restore failed (status <n>)` then `gate-remote-refused: <nonce> tools` and `gate: remote work folder <key> could not restore its pnpm packages`, and exits 75 with the command never started, as the tool restore's does.
+
+  A stop already set, a stop during the install and a client that closes the connection give the tool restore's lines naming `{job}-packages`: `the job {job}-packages was stopped before the command started`, `gate: remote stopped job {job}-packages` and `gate: remote the client closed the connection; stopping job {job}-packages`. A process that keeps the install's output open after the job ended prints `gate: remote the package restore's output is still held open by a leftover process; stopped reading`.
+
+  The install is skipped, with the command still run, when the folder pnpm starts in lies outside the work root (`gate: remote pnpm install skipped: <folder> is outside the work root`), when a folder from the work root down to the lockfile's is a link or a junction (`... <folder> is reached through a link`) or when git does not ignore `node_modules` there (`gate: remote pnpm install skipped: node_modules is not ignored in <folder>`); git that cannot say prints `gate: remote could not ask git whether node_modules is ignored in <folder>: <error | status n>`.
+
+  A lockfile or package file that cannot be read prints `gate: remote could not read the lockfile <path>: <error>` or `gate: remote could not read the package file <path>: <error>`, and a record that cannot be written prints `gate: remote could not write <Work>.packages: <error>`; these exit 1. A record that cannot be read prints `gate: remote could not read <Work>.packages: <error>; installing the packages` and installs. Folders and paths in every line are escaped.
 
   A `Subfolder` is a folder of the main repo's tree, compared against its snapshot with per-character simple uppercase (the wrapper's OrdinalIgnoreCase): one that is not a folder inside `Work` prints `gate: remote subfolder <sub> is not a folder inside the work folder`, deletes the back ref and exits 2, and one missing from the snapshot prints `gate: remote subfolder <sub> does not exist in the snapshot` and exits 2, `<sub>` with its control characters escaped in both.
 
@@ -2168,7 +2218,7 @@ Built verbs:
 
   The ssh logon's NETWORK group (S-1-5-2) is made deny-only in it, so WMI does not treat the command's calls as remote and `taskkill`, `tasklist` and `Get-CimInstance` work from the command (with NETWORK enabled they fail with `ERROR: Access denied`). `gate_win32::NetworkGroup` (`Absent`, `Enabled`, `DenyOnly`, `Disabled`) and `TokenFacts::network` report the group's state.
 
-  The console donor and keeper `cmd.exe` run with the same restricted token, so no elevated process shares the command's console. The box itself, its git calls and its tool restore keep the box's own token.
+  The console donor and keeper `cmd.exe` run with the same restricted token, so no elevated process shares the command's console. The box itself, its git calls and its tool restore keep the box's own token; the pnpm install runs with the command's restricted token, with no fallback to the box's own.
 
   The restriction makes the command's token non-elevated with NETWORK deny-only, but it is still a network logon's token and lacks INTERACTIVE, so it is not the token a local run's command has; it is not a boundary against the command, whose code is trusted, since the box's elevated git and tool restore later read what the command wrote.
 
@@ -2240,7 +2290,7 @@ Built verbs:
 
   A terminate after the first that fails is not a failure of the stop: it is said once, `gate: remote could not terminate job <name> again: <error>`, after the other lines. An event that cannot be set prints `gate: remote could not signal the stop of job <name>: <error>` on stderr, and the job is terminated all the same. A stopped job prints `gate: remote stopped job <name>` on stdout and exits 0; no such job exits 0 with no output.
 
-  The stop also ends the run's tool restore job `<name>-tools` when one exists: it opens that job before it sets the event and terminates it after the payload's job, with the same lines and rules for `<name>-tools`. It exits 1 when either job is left with processes or cannot be stopped, else 0.
+  The stop also ends the run's tool restore job `<name>-tools` and its pnpm install job `<name>-packages` when they exist: it opens each before it sets the event and terminates it after the payload's job, with the same lines and rules for `<name>-tools` and `<name>-packages`. It exits 1 when any job is left with processes or cannot be stopped, else 0.
 
   Processes still alive 10 s after the termination print `gate: remote job <name> still has <n> process(es) 10 s after it was terminated` and exit 1, and a job that cannot be terminated prints `gate: remote could not stop job <name>: <error>` and exits 1.
 
@@ -2454,7 +2504,7 @@ A virtual Cargo workspace (`resolver = "3"`) with every crate under `crates/`, l
 | `gate-desktop` | The desktop helper exe and the pipe protocol the box speaks with it, its exit codes, and `build_version`, the gate's version text. | no |
 | `gate-watchdog` | Free-share, load-adjusted clock, stall, ceiling and backstop arithmetic over samples with the kill lines, and the box heartbeat, on an injected clock; the cores-hint verdict. | yes; a pure crate |
 | `gate-args` | The gate's own argv: the subcommand CLI, the compatibility layer, the C-runtime and cmd.exe quoting, the `%VAR%` refusals and the PATHEXT resolution rules over an injected environment and file lookup. | yes; a pure crate |
-| `gate-router` | The routing rules (T2-T4) over strings: what routes, the path rewrite, the `--no-build` drop (`test` and `run` only), the wrapped dotnet form. | yes; a pure crate |
+| `gate-router` | The routing rules (T2-T4) over strings: what routes, the path rewrite, the `--no-build` drop (`test` and `run` only), the wrapped dotnet form, the builder warm-up's file, hash and judge (`warm.rs`). | yes; a pure crate |
 | `gate` | The `gate` binary: the subcommands, the wait loop, the run, the journal writes, the remote client and `gate box`. | no |
 
 Rules:
@@ -2502,7 +2552,9 @@ A Rust integration suite drives the built `gate.exe` through its CLI and reads o
 
   `--test-diagnostics-fail` (a switch) makes the diagnostics gathering of a kill fail, so the log carries `gate: diagnostics failed: <message>` in place of the block; `--test-print-request` shows it as `testSeams.diagnosticsFail`, after `samplerFail`.
 
-  `--test-remote-client <path>` replaces the remote client with a scripted one that runs in the gate's own process: the file's steps, one a line, are `out`, `err`, `record`, `wait`, `interrupt`, `killed`, `box-killed timed-out|backstop` (sets the box kill's kind, as the real client reads it from the tag), `status`, `adjusted <seconds>` (the load-adjusted seconds the builder counted), `refuse` and `fail-start`.
+  `--test-remote-client <path>` replaces the remote client with a scripted one that runs in the gate's own process: the file's steps, one a line, are `out`, `err`, `record`, `wait`, `interrupt`, `killed`, `box-killed timed-out|backstop` (sets the box kill's kind, as the real client reads it from the tag), `status`, `adjusted <seconds>` (the load-adjusted seconds the builder counted), `refuse` (any fallback reason, `cold` included) and `fail-start`, and the steps that set how a warm-up ended: `warmed`, `warm-failed commands|refused <reason>` and `warm-deleted`.
+
+  The `record` step's JSON carries the call's `warmth`: `null` for a call that asks nothing of the warm-up, `{"needs": <hash>}` for one that needs the builder warm with that hash, `{"warmUp": {"commands": …, "hash": …}}` for a warm-up.
 
   `--test-remote-wait-ms <n>` (whole milliseconds above 0) replaces the 60 s limit of the wait for a remote slot. `--test-print-request` shows them as `testSeams.remoteClient` and `testSeams.remoteWaitMs`.
 

@@ -26,6 +26,7 @@ use crate::support::{
 
 mod inputs;
 mod outputs;
+mod warm;
 
 const BOX_USAGE: &str = "usage: gate box preflight|run|stop|boot|outputs|inflight|inputs --stdin (the base64 JSON request as stdin's first line)\n";
 
@@ -250,11 +251,12 @@ fn preflight_creates_the_bare_repo_and_work_folder() {
     let outcome = gate_box(&case, "preflight", &folders.payload(), None);
 
     let printed = passed(&outcome);
-    assert_eq!(printed.len(), 4, "{outcome:?}");
+    assert_eq!(printed.len(), 5, "{outcome:?}");
     assert_eq!(printed[0], format!("gate: remote created {}", folders.bare));
     assert_eq!(printed[1], format!("gate: remote version {}", build_version(&case)));
-    assert!(printed[2].starts_with("gate: remote boot "), "{outcome:?}");
-    assert!(printed[3].starts_with("gate: remote sdks "), "{outcome:?}");
+    assert_eq!(printed[2], "gate: remote warm none", "a folder made now is not warm: {outcome:?}");
+    assert!(printed[3].starts_with("gate: remote boot "), "{outcome:?}");
+    assert!(printed[4].starts_with("gate: remote sdks "), "{outcome:?}");
     assert!(Path::new(&folders.work).join(".git").is_dir());
     assert_eq!(git(&["-C", &folders.work, "config", "--get", "remote.origin.url"]), folders.bare);
     assert_eq!(git(&["-C", &folders.work, "config", "--local", "--get", "core.autocrlf"]), "false");
@@ -2651,7 +2653,12 @@ fn preflight_with_a_pair_creates_each_bare_and_nothing_in_the_work_folder() {
         bares.iter().map(|bare| format!("gate: remote created {bare}")).collect::<Vec<_>>(),
         "{outcome:?}"
     );
-    assert_eq!(printed.len(), 6, "the created lines, then the version, boot and sdks lines: {outcome:?}");
+    assert_eq!(
+        printed.len(),
+        7,
+        "the created lines, then the version, warm, boot and sdks lines: {outcome:?}"
+    );
+    assert_eq!(printed[4], "gate: remote warm none", "{outcome:?}");
     for bare in &bares {
         assert_eq!(
             git(&[&format!("--git-dir={bare}"), "rev-parse", "--is-bare-repository"]),
@@ -4198,6 +4205,625 @@ fn box_run_a_record_that_is_a_folder_fails_with_status_1() {
     assert!(outcome.stdout.contains("restore: out"), "the restore ran before the write: {outcome:?}");
     assert!(!marker.exists(), "the command never ran");
     wait_until_closed(Path::new(field(&payload, "Lock")));
+}
+
+/// The lockfile a pnpm case's snapshot holds, and its path at the work folder's root.
+const PNPM_LOCKFILE: &str = "lockfileVersion: '9.0'\n";
+const PNPM_LOCKFILE_PATH: &str = "pnpm-lock.yaml";
+/// The ignore file of a pnpm case's snapshot, ignoring `node_modules` with the folder pattern most repos use.
+const NODE_MODULES_IGNORED: (&str, &str) = (".gitignore", "node_modules/\n");
+
+/// A folder holding a `pnpm.cmd` that stands for pnpm, both the box's install and the command: each call appends
+/// `{working folder}|{arguments}|CI={%CI%}` to the case's counter file; an `install` then runs the batch script
+/// `before`, makes `node_modules` in its working folder, prints `install: out` and exits with `exit`, and any other
+/// call exits 0. A case passes it through [`path_for_pnpm`], so its `PATH` holds this pnpm and no other.
+fn stub_pnpm(case: &Case, exit: i32, before: &str) -> PathBuf {
+    let stub = case.folder().join(format!("stub-pnpm-{exit}"));
+    fs::create_dir_all(&stub).expect("the stub folder can be made");
+    fs::write(
+        stub.join("pnpm.cmd"),
+        format!(
+            concat!(
+                "@echo off\r\n>>\"{counter}\" echo %CD%^|%*^|CI=%CI%\r\nif not \"%1\"==\"install\" exit /b 0\r\n",
+                "{before}if not exist node_modules mkdir node_modules\r\necho install: out\r\nexit /b {exit}\r\n"
+            ),
+            counter = shown(&counter(case)),
+            before = before,
+            exit = exit,
+        ),
+    )
+    .expect("the pnpm stub can be written");
+    stub
+}
+
+/// Whether `folder` holds a `pnpm` named with any of the extensions a `PATHEXT` search tries.
+fn holds_pnpm(folder: &Path) -> bool {
+    ["exe", "cmd", "bat", "com"]
+        .iter()
+        .any(|extension| folder.join(format!("pnpm.{extension}")).is_file())
+}
+
+/// [`path_for_run`] less every folder holding a `pnpm` too, so the box finds the stub's pnpm or none.
+fn path_for_pnpm(folders: &[PathBuf]) -> OsString {
+    let own = path_for_run(&[]);
+    let without_pnpm = std::env::split_paths(&own).filter(|folder| !holds_pnpm(folder));
+    std::env::join_paths(folders.iter().cloned().chain(without_pnpm)).expect("the folders join into a PATH")
+}
+
+/// `gate box run` of `payload` with `PATH` set to `path` and no `CI` variable, so only the box's install sets one.
+fn pnpm_box(case: &Case, payload: &Value, path: &OsString) -> BoxCall {
+    let mut call = box_call(case, &["box", "run"], &self::payload(payload));
+    call.env("PATH", path);
+    call.env_remove("CI");
+    call
+}
+
+/// The calls the case's stub pnpm saw, each `{working folder}|{arguments}|CI={value}`, the folder in upper case.
+fn pnpm_calls(case: &Case) -> Vec<String> {
+    counter_lines(case)
+        .iter()
+        .map(|line| match line.split_once('|') {
+            Some((folder, rest)) => format!("{}|{rest}", folder.to_uppercase()),
+            None => line.clone(),
+        })
+        .collect()
+}
+
+/// The call of the box's install the stub pnpm sees in `folder`.
+fn install_call(folder: &str) -> String {
+    format!("{}|install --frozen-lockfile|CI=true", folder.to_uppercase())
+}
+
+/// The call of the command `words` the stub pnpm sees in `folder`, run without a `CI` variable.
+fn command_call(folder: &str, words: &str) -> String {
+    format!("{}|{words}|CI=", folder.to_uppercase())
+}
+
+/// How many of the stub pnpm's calls were installs.
+fn installs(case: &Case) -> usize {
+    pnpm_calls(case)
+        .iter()
+        .filter(|call| call.contains("|install --frozen-lockfile|"))
+        .count()
+}
+
+/// Whether `outcome` said the install's elapsed line, ending in `tail` after the seconds.
+fn said_install_took(outcome: &Outcome, tail: &str) -> bool {
+    let shape = Regex::new(&format!(r"^gate: pnpm install took \d+\.\d s{}$", regex::escape(tail))).expect("the pattern compiles");
+    outcome.stderr.lines().any(|line| shape.is_match(line))
+}
+
+/// The packages record of `payload`'s work folder.
+fn packages_record(payload: &Value) -> String {
+    format!("{}.packages", field(payload, "Work"))
+}
+
+#[test]
+fn box_run_installs_pnpm_packages_before_a_pnpm_command() {
+    let case = Case::new("box_run_pnpm_install");
+    let mut payload = box_payload(&case, "k", &["pnpm", "run", "x"]);
+    snapshot(
+        &case,
+        &mut payload,
+        &[NODE_MODULES_IGNORED, (PNPM_LOCKFILE_PATH, PNPM_LOCKFILE), ("package.json", "{}\n")],
+    );
+    let stub = stub_pnpm(&case, 0, "");
+
+    let outcome = pnpm_box(&case, &payload, &path_for_pnpm(&[stub])).finish();
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let work = field(&payload, "Work");
+    assert_eq!(
+        pnpm_calls(&case),
+        [install_call(work), command_call(work, "run x")],
+        "the install in the work root with CI=true, then the command: {outcome:?}"
+    );
+    assert!(
+        outcome.stdout.contains("install: out"),
+        "the install's output passes through: {outcome:?}"
+    );
+    assert!(said_install_took(&outcome, ""), "the elapsed line, no folder for the root: {outcome:?}");
+    let record = fs::read_to_string(packages_record(&payload)).expect("the record is written");
+    let shape = Regex::new(r"^\.\t[0-9a-f]{64}\n$").expect("the pattern compiles");
+    assert!(shape.is_match(&record), "the root's line: {record:?}");
+    assert!(Path::new(work).join("node_modules").is_dir(), "the install's folder stays");
+}
+
+#[test]
+fn box_run_skips_the_pnpm_install_while_the_lockfile_and_node_modules_are_unchanged() {
+    let case = Case::new("box_run_pnpm_unchanged");
+    let mut payload = box_payload(&case, "k", &["pnpm", "run", "x"]);
+    snapshot(&case, &mut payload, &[NODE_MODULES_IGNORED, (PNPM_LOCKFILE_PATH, PNPM_LOCKFILE)]);
+    let path = path_for_pnpm(&[stub_pnpm(&case, 0, "")]);
+    let first = pnpm_box(&case, &payload, &path).finish();
+    assert_eq!(first.code, Some(0), "{first:?}");
+
+    let second = pnpm_box(&case, &renamed(&payload, 1), &path).finish();
+
+    assert_eq!(second.code, Some(0), "{second:?}");
+    let work = field(&payload, "Work");
+    assert_eq!(
+        pnpm_calls(&case),
+        [install_call(work), command_call(work, "run x"), command_call(work, "run x")],
+        "one install, the command in both runs: {second:?}"
+    );
+    assert!(!second.stderr.contains("gate: pnpm install took"), "{second:?}");
+}
+
+#[test]
+fn box_run_installs_again_when_the_lockfile_changes() {
+    let case = Case::new("box_run_pnpm_lockfile_changed");
+    let mut payload = box_payload(&case, "k", &["pnpm", "run", "x"]);
+    snapshot(&case, &mut payload, &[NODE_MODULES_IGNORED, (PNPM_LOCKFILE_PATH, PNPM_LOCKFILE)]);
+    let path = path_for_pnpm(&[stub_pnpm(&case, 0, "")]);
+    assert_eq!(pnpm_box(&case, &payload, &path).finish().code, Some(0));
+    let record = fs::read_to_string(packages_record(&payload)).expect("the record is written");
+
+    let changed = push_snapshot(&case, &payload, &[(PNPM_LOCKFILE_PATH, "lockfileVersion: '9.1'\n")]);
+    payload["Snapshot"] = json!(changed);
+    let second = pnpm_box(&case, &renamed(&payload, 1), &path).finish();
+
+    assert_eq!(second.code, Some(0), "{second:?}");
+    assert_eq!(installs(&case), 2, "the changed lockfile installs again: {second:?}");
+    assert!(said_install_took(&second, ""), "{second:?}");
+    assert_ne!(
+        fs::read_to_string(packages_record(&payload)).expect("the record is read"),
+        record,
+        "the record holds the new hash"
+    );
+}
+
+#[test]
+fn box_run_installs_again_when_node_modules_is_gone() {
+    let case = Case::new("box_run_pnpm_node_modules_gone");
+    let mut payload = box_payload(&case, "k", &["pnpm", "run", "x"]);
+    snapshot(&case, &mut payload, &[NODE_MODULES_IGNORED, (PNPM_LOCKFILE_PATH, PNPM_LOCKFILE)]);
+    let path = path_for_pnpm(&[stub_pnpm(&case, 0, "")]);
+    assert_eq!(pnpm_box(&case, &payload, &path).finish().code, Some(0));
+    fs::remove_dir_all(Path::new(field(&payload, "Work")).join("node_modules")).expect("node_modules can be removed");
+
+    let second = pnpm_box(&case, &renamed(&payload, 1), &path).finish();
+
+    assert_eq!(second.code, Some(0), "{second:?}");
+    assert_eq!(installs(&case), 2, "a missing node_modules installs again: {second:?}");
+}
+
+#[test]
+fn box_run_installs_in_the_dir_folder_and_names_it() {
+    let case = Case::new("box_run_pnpm_dir");
+    let mut payload = box_payload(&case, "k", &["pnpm", "--dir", "sub", "run", "x"]);
+    snapshot(&case, &mut payload, &[NODE_MODULES_IGNORED, ("sub/pnpm-lock.yaml", PNPM_LOCKFILE)]);
+    let stub = stub_pnpm(&case, 0, "");
+
+    let outcome = pnpm_box(&case, &payload, &path_for_pnpm(&[stub])).finish();
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let work = field(&payload, "Work");
+    assert_eq!(
+        pnpm_calls(&case),
+        [install_call(&format!(r"{work}\sub")), command_call(work, "--dir sub run x")],
+        "the install in the folder `--dir` names: {outcome:?}"
+    );
+    assert!(said_install_took(&outcome, " in sub"), "the line names the folder: {outcome:?}");
+    let record = fs::read_to_string(packages_record(&payload)).expect("the record is written");
+    let shape = Regex::new(r"^sub\t[0-9a-f]{64}\n$").expect("the pattern compiles");
+    assert!(shape.is_match(&record), "the folder's line: {record:?}");
+}
+
+#[test]
+fn box_run_does_not_install_without_a_lockfile_or_for_another_program() {
+    let case = Case::new("box_run_pnpm_no_lockfile");
+    let mut payload = box_payload(&case, "k", &["pnpm", "run", "x"]);
+    snapshot(&case, &mut payload, &[NODE_MODULES_IGNORED, ("package.json", "{}\n")]);
+    let outcome = pnpm_box(&case, &payload, &path_for_pnpm(&[stub_pnpm(&case, 0, "")])).finish();
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(
+        pnpm_calls(&case),
+        [command_call(field(&payload, "Work"), "run x")],
+        "no install: {outcome:?}"
+    );
+    assert!(!outcome.stderr.contains("pnpm install"), "nothing is said: {outcome:?}");
+    assert!(!Path::new(&packages_record(&payload)).exists(), "no record");
+
+    let other = Case::new("box_run_pnpm_other_program");
+    let marker = other.folder().join("marker");
+    let mut payload = box_payload(&other, "k", &[FAKE_TOOL, "mark", &shown(&marker)]);
+    snapshot(&other, &mut payload, &[NODE_MODULES_IGNORED, (PNPM_LOCKFILE_PATH, PNPM_LOCKFILE)]);
+    let outcome = pnpm_box(&other, &payload, &path_for_pnpm(&[stub_pnpm(&other, 0, "")])).finish();
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(marker.exists(), "the command ran: {outcome:?}");
+    assert!(pnpm_calls(&other).is_empty(), "another program installs nothing: {outcome:?}");
+    assert!(!Path::new(&packages_record(&payload)).exists(), "no record");
+}
+
+#[test]
+fn box_run_refuses_tools_when_the_pnpm_install_fails() {
+    let case = Case::new("box_run_pnpm_install_fails");
+    let mut payload = box_payload(&case, "k", &["pnpm", "run", "x"]);
+    snapshot(&case, &mut payload, &[NODE_MODULES_IGNORED, (PNPM_LOCKFILE_PATH, PNPM_LOCKFILE)]);
+    assert_eq!(
+        pnpm_box(&case, &payload, &path_for_pnpm(&[stub_pnpm(&case, 0, "")])).finish().code,
+        Some(0)
+    );
+    let record = fs::read(packages_record(&payload)).expect("the record is written");
+
+    let changed = push_snapshot(&case, &payload, &[(PNPM_LOCKFILE_PATH, "lockfileVersion: '9.1'\n")]);
+    payload["Snapshot"] = json!(changed);
+    let second = renamed(&payload, 1);
+    let outcome = pnpm_box(&case, &second, &path_for_pnpm(&[stub_pnpm(&case, 3, "")])).finish();
+
+    assert_eq!(outcome.code, Some(75), "{outcome:?}");
+    let said = lines(&outcome.stderr);
+    let tag = refused_line(&second, "tools");
+    let failed = said.iter().position(|line| *line == "gate: remote package restore failed (status 3)");
+    let tagged = said.iter().position(|line| *line == tag);
+    let refused = said
+        .iter()
+        .position(|line| *line == "gate: remote work folder k could not restore its pnpm packages");
+    assert!(
+        matches!((failed, tagged, refused), (Some(failed), Some(tagged), Some(refused)) if failed < tagged && tagged + 1 == refused),
+        "the status line, then the tag just before the packages line: {outcome:?}"
+    );
+    assert!(said_install_took(&outcome, ""), "the elapsed line of a failed install: {outcome:?}");
+    assert!(
+        !said.iter().any(|line| line.starts_with("gate-remote-started: ")),
+        "the command never started: {outcome:?}"
+    );
+    let work = field(&payload, "Work");
+    assert_eq!(
+        pnpm_calls(&case).last(),
+        Some(&install_call(work)),
+        "the failed install was the last call: {outcome:?}"
+    );
+    assert_eq!(installs(&case), 2, "{outcome:?}");
+    assert_eq!(
+        fs::read(packages_record(&payload)).expect("the record is read"),
+        record,
+        "the record stands"
+    );
+    assert!(!has_ref(&payload, "refs/gate-back/k"), "the refused run made no back commit");
+    wait_until_closed(Path::new(field(&payload, "Lock")));
+}
+
+#[test]
+fn box_run_refuses_tools_when_pnpm_cannot_start() {
+    let case = Case::new("box_run_pnpm_cannot_start");
+    let mut payload = box_payload(&case, "k", &["pnpm", "run", "x"]);
+    snapshot(&case, &mut payload, &[NODE_MODULES_IGNORED, (PNPM_LOCKFILE_PATH, PNPM_LOCKFILE)]);
+
+    let outcome = pnpm_box(&case, &payload, &path_for_pnpm(&[])).finish();
+
+    assert_eq!(outcome.code, Some(75), "{outcome:?}");
+    // The win32 error `ERROR_FILE_NOT_FOUND`, as `locate` reports a word it does not find.
+    let cannot_start = format!("gate: remote could not start the pnpm install: {}", gate_win32::win32_message(2));
+    assert_eq!(
+        lines(&outcome.stderr),
+        [
+            cannot_start.as_str(),
+            "gate: remote package restore failed (status 1)",
+            refused_line(&payload, "tools").as_str(),
+            "gate: remote work folder k could not restore its pnpm packages",
+        ],
+        "{outcome:?}"
+    );
+    assert!(!Path::new(&packages_record(&payload)).exists(), "no record");
+    assert!(!has_ref(&payload, "refs/gate-back/k"), "the refused run made no back commit");
+}
+
+#[test]
+fn box_run_skips_the_install_when_node_modules_is_not_ignored() {
+    let case = Case::new("box_run_pnpm_not_ignored");
+    let mut payload = box_payload(&case, "k", &["pnpm", "run", "x"]);
+    snapshot(&case, &mut payload, &[(PNPM_LOCKFILE_PATH, PNPM_LOCKFILE)]);
+
+    let outcome = pnpm_box(&case, &payload, &path_for_pnpm(&[stub_pnpm(&case, 0, "")])).finish();
+
+    assert_eq!(outcome.code, Some(0), "the command still runs: {outcome:?}");
+    assert!(
+        lines(&outcome.stderr).contains(&"gate: remote pnpm install skipped: node_modules is not ignored in ."),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        pnpm_calls(&case),
+        [command_call(field(&payload, "Work"), "run x")],
+        "no install: {outcome:?}"
+    );
+    assert!(!Path::new(&packages_record(&payload)).exists(), "no record");
+}
+
+#[test]
+fn box_run_stops_a_pnpm_install_and_names_its_job() {
+    let case = Case::new("box_run_pnpm_stop_during_install");
+    let mut payload = box_payload(&case, "k", &["pnpm", "run", "x"]);
+    snapshot(&case, &mut payload, &[NODE_MODULES_IGNORED, (PNPM_LOCKFILE_PATH, PNPM_LOCKFILE)]);
+    let stub = stub_pnpm(&case, 0, &held_restore(&case.folder().join("never")));
+    let running = pnpm_box(&case, &payload, &path_for_pnpm(&[stub])).start();
+    let helper = spawned_pid(&running.wait_for_stdout("\n"));
+
+    let stopped = gate_box(&case, "stop", &self::payload(&payload), None);
+    let outcome = running.finish();
+
+    let job = format!("{}-packages", field(&payload, "Job"));
+    assert_eq!(stopped.code, Some(0), "{stopped:?}");
+    assert_eq!(stopped.stdout, format!("gate: remote stopped job {job}\n"), "{stopped:?}");
+    assert_eq!(stopped.stderr, "", "{stopped:?}");
+    assert_eq!(outcome.code, Some(1), "a stop during the install fails the run: {outcome:?}");
+    let said = stopped_line_for(&job);
+    assert!(outcome.stderr.lines().any(|line| line == said), "{said:?} in {outcome:?}");
+    assert_eq!(
+        pnpm_calls(&case),
+        [install_call(field(&payload, "Work"))],
+        "the command never ran: {outcome:?}"
+    );
+    assert!(!Path::new(&packages_record(&payload)).exists(), "no record is written");
+    wait_until_gone(helper);
+    wait_until_closed(Path::new(field(&payload, "Lock")));
+}
+
+/// A pnpm case's payload of `pnpm run x` with `files` snapshotted beside the ignore file and the lockfile.
+fn pnpm_payload(case: &Case, files: &[(&str, &str)]) -> Value {
+    let mut payload = box_payload(case, "k", &["pnpm", "run", "x"]);
+    let mut all = vec![NODE_MODULES_IGNORED, (PNPM_LOCKFILE_PATH, PNPM_LOCKFILE)];
+    all.extend_from_slice(files);
+    snapshot(case, &mut payload, &all);
+    payload
+}
+
+#[test]
+fn box_run_installs_again_when_npmrc_changes() {
+    let case = Case::new("box_run_pnpm_npmrc_changed");
+    let mut payload = pnpm_payload(&case, &[(".npmrc", "a=1\n")]);
+    let path = path_for_pnpm(&[stub_pnpm(&case, 0, "")]);
+    assert_eq!(pnpm_box(&case, &payload, &path).finish().code, Some(0));
+
+    let changed = push_snapshot(&case, &payload, &[(".npmrc", "a=2\n")]);
+    payload["Snapshot"] = json!(changed);
+    let second = pnpm_box(&case, &renamed(&payload, 1), &path).finish();
+
+    assert_eq!(second.code, Some(0), "{second:?}");
+    assert_eq!(installs(&case), 2, "a changed .npmrc installs again: {second:?}");
+}
+
+#[test]
+fn box_run_runs_the_pnpm_install_with_the_restricted_token() {
+    let case = Case::new("box_run_pnpm_token");
+    let payload = pnpm_payload(&case, &[]);
+    let token = case.folder().join("token.txt");
+    let stub = stub_pnpm(&case, 0, &format!("\"{FAKE_TOOL}\" token >\"{}\"\r\n", shown(&token)));
+
+    let outcome = pnpm_box(&case, &payload, &path_for_pnpm(&[stub])).finish();
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let said = fs::read_to_string(&token).expect("the install wrote its token's facts");
+    let lines: Vec<&str> = said.lines().collect();
+    assert!(lines.contains(&"not-elevated"), "{lines:?}");
+    assert!(lines.contains(&"owner user"), "{lines:?}");
+    assert!(lines.contains(&restricted_dacl_line().as_str()), "the restricted token's DACL: {lines:?}");
+}
+
+#[test]
+fn box_run_a_killed_box_takes_its_pnpm_install_with_it() {
+    let case = Case::new("box_run_pnpm_killed_box");
+    let payload = pnpm_payload(&case, &[]);
+    let stub = stub_pnpm(&case, 0, &held_restore(&case.folder().join("never")));
+    let running = pnpm_box(&case, &payload, &path_for_pnpm(&[stub])).start();
+    let helper = spawned_pid(&running.wait_for_stdout("\n"));
+    let install_job = format!("{}-packages", field(&payload, "Job"));
+    // Listed through a handle closed again at once, so the box's is once more the job's only one.
+    let install = OpenedJob::open(&install_job)
+        .expect("the install's job can be looked for")
+        .expect("the install runs in its job")
+        .process_ids()
+        .expect("the install's processes can be listed");
+    assert!(install.contains(&helper), "the helper is in the install's job: {install:?}");
+
+    let killed = running.kill();
+
+    for pid in install {
+        wait_until_gone(pid);
+    }
+    assert_eq!(
+        pnpm_calls(&case),
+        [install_call(field(&payload, "Work"))],
+        "the command never ran: {killed:?}"
+    );
+    wait_until_closed(Path::new(field(&payload, "Lock")));
+}
+
+#[test]
+fn box_run_a_packages_record_that_is_a_folder_fails_with_status_1() {
+    let case = Case::new("box_run_pnpm_record_folder");
+    let payload = pnpm_payload(&case, &[]);
+    let record = packages_record(&payload);
+    fs::create_dir_all(&record).expect("a folder can be put where the record goes");
+
+    let outcome = pnpm_box(&case, &payload, &path_for_pnpm(&[stub_pnpm(&case, 0, "")])).finish();
+
+    assert_eq!(outcome.code, Some(1), "a record that cannot be written fails the box: {outcome:?}");
+    let refused = format!("gate: remote could not write {record}: ");
+    assert!(
+        outcome.stderr.lines().any(|line| line.starts_with(&refused)),
+        "{refused:?} in {outcome:?}"
+    );
+    assert_eq!(
+        pnpm_calls(&case),
+        [install_call(field(&payload, "Work"))],
+        "the install ran before the write, the command never: {outcome:?}"
+    );
+    wait_until_closed(Path::new(field(&payload, "Lock")));
+}
+
+#[test]
+fn box_run_an_unreadable_packages_record_installs_and_says_so() {
+    let case = Case::new("box_run_pnpm_record_unreadable");
+    let payload = pnpm_payload(&case, &[]);
+    let record = packages_record(&payload);
+    // Not UTF-8, so the record opens but cannot be read as text.
+    fs::write(&record, [0xff_u8, 0xfe, b'\n']).expect("the record can be written");
+
+    let outcome = pnpm_box(&case, &payload, &path_for_pnpm(&[stub_pnpm(&case, 0, "")])).finish();
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let said = format!("gate: remote could not read {record}: ");
+    assert!(
+        outcome
+            .stderr
+            .lines()
+            .any(|line| line.starts_with(&said) && line.ends_with("; installing the packages")),
+        "{said:?} in {outcome:?}"
+    );
+    assert_eq!(installs(&case), 1, "{outcome:?}");
+    let text = fs::read_to_string(&record).expect("the record is rewritten");
+    assert!(
+        Regex::new(r"^\.\t[0-9a-f]{64}\n$").expect("the pattern compiles").is_match(&text),
+        "{text:?}"
+    );
+}
+
+#[test]
+fn box_run_an_unreadable_package_file_fails_with_status_1() {
+    let case = Case::new("box_run_pnpm_package_file_unreadable");
+    // A folder where `package.json` is expected: a file in it makes git check the folder out.
+    let payload = pnpm_payload(&case, &[("package.json/x.txt", "x\n")]);
+
+    let outcome = pnpm_box(&case, &payload, &path_for_pnpm(&[stub_pnpm(&case, 0, "")])).finish();
+
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    let said = format!(
+        "gate: remote could not read the package file {}: ",
+        Path::new(field(&payload, "Work")).join("package.json").display()
+    );
+    assert!(outcome.stderr.lines().any(|line| line.starts_with(&said)), "{said:?} in {outcome:?}");
+    assert!(pnpm_calls(&case).is_empty(), "no install, no command: {outcome:?}");
+    wait_until_closed(Path::new(field(&payload, "Lock")));
+}
+
+#[test]
+fn box_run_a_stop_set_before_the_pnpm_install_runs_none() {
+    let case = Case::new("box_run_pnpm_stop_before_install");
+    let payload = pnpm_payload(&case, &[]);
+    let stub = stub_pnpm(&case, 0, "");
+    let parked = case.folder().join("parked");
+    let go = case.folder().join("go");
+    stub_git(&stub, &parked, &go);
+    let running = pnpm_box(&case, &payload, &path_for_pnpm(&[stub])).start();
+    wait_until("the box parked in its first git step, before the install", || parked.exists());
+
+    let stopped = gate_box(&case, "stop", &self::payload(&payload), None);
+    let_go(&go);
+    let outcome = running.finish();
+
+    assert_eq!(stopped.code, Some(0), "{stopped:?}");
+    assert_eq!(outcome.code, Some(1), "a stop before the install fails the run: {outcome:?}");
+    let said = stopped_line_for(field(&payload, "Job"));
+    assert!(outcome.stderr.lines().any(|line| line == said), "{said:?} in {outcome:?}");
+    assert!(pnpm_calls(&case).is_empty(), "no install, no command: {outcome:?}");
+    wait_until_closed(Path::new(field(&payload, "Lock")));
+}
+
+#[test]
+fn box_run_a_node_modules_junction_installs_again() {
+    let case = Case::new("box_run_pnpm_node_modules_junction");
+    let payload = pnpm_payload(&case, &[]);
+    let path = path_for_pnpm(&[stub_pnpm(&case, 0, "")]);
+    assert_eq!(pnpm_box(&case, &payload, &path).finish().code, Some(0));
+    let node_modules = Path::new(field(&payload, "Work")).join("node_modules");
+    fs::remove_dir_all(&node_modules).expect("node_modules can be removed");
+    let elsewhere = case.folder().join("elsewhere");
+    fs::create_dir_all(&elsewhere).expect("the junction's target can be made");
+    junction(&node_modules, &elsewhere);
+
+    let second = pnpm_box(&case, &renamed(&payload, 1), &path).finish();
+
+    assert_eq!(second.code, Some(0), "{second:?}");
+    assert_eq!(installs(&case), 2, "a junction is no node_modules: {second:?}");
+}
+
+#[test]
+fn box_run_skips_the_install_when_the_lockfile_folder_is_reached_through_a_junction() {
+    let case = Case::new("box_run_pnpm_linked_folder");
+    let mut payload = box_payload(&case, "k", &["pnpm", "--dir", "linked", "run", "x"]);
+    snapshot(&case, &mut payload, &[(".gitignore", "node_modules/\nlinked\n")]);
+    let path = path_for_pnpm(&[stub_pnpm(&case, 0, "")]);
+    // The first run lays the work folder out; the junction made after it is ignored, so no checkout removes it.
+    assert_eq!(pnpm_box(&case, &payload, &path).finish().code, Some(0));
+    let elsewhere = case.folder().join("elsewhere");
+    fs::create_dir_all(&elsewhere).expect("the junction's target can be made");
+    fs::write(elsewhere.join("pnpm-lock.yaml"), PNPM_LOCKFILE).expect("the lockfile can be written");
+    junction(&Path::new(field(&payload, "Work")).join("linked"), &elsewhere);
+
+    let second = pnpm_box(&case, &renamed(&payload, 1), &path).finish();
+
+    assert_eq!(second.code, Some(0), "the command still runs: {second:?}");
+    assert!(
+        lines(&second.stderr).contains(&"gate: remote pnpm install skipped: linked is reached through a link"),
+        "{second:?}"
+    );
+    assert_eq!(installs(&case), 0, "{second:?}");
+    assert!(!Path::new(&packages_record(&payload)).exists(), "no record");
+}
+
+#[test]
+fn box_run_restores_dotnet_tools_before_pnpm_packages() {
+    let case = Case::new("box_run_pnpm_after_tools");
+    let payload = pnpm_payload(&case, &[(TOOLS_MANIFEST_PATH, TOOLS_MANIFEST)]);
+    let path = path_for_pnpm(&[stub_dotnet(&case, 0), stub_pnpm(&case, 0, "")]);
+
+    let outcome = pnpm_box(&case, &payload, &path).finish();
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let said = lines(&outcome.stderr);
+    let tools = said.iter().position(|line| line.starts_with("gate: dotnet tool restore took "));
+    let packages = said.iter().position(|line| line.starts_with("gate: pnpm install took "));
+    assert!(
+        matches!((tools, packages), (Some(tools), Some(packages)) if tools < packages),
+        "the tool restore, then the install: {outcome:?}"
+    );
+    let (out_tools, out_packages) = (outcome.stdout.find("restore: out"), outcome.stdout.find("install: out"));
+    assert!(
+        matches!((out_tools, out_packages), (Some(tools), Some(packages)) if tools < packages),
+        "{outcome:?}"
+    );
+}
+
+#[test]
+fn box_run_a_tools_refusal_runs_no_pnpm_install() {
+    let case = Case::new("box_run_pnpm_tools_refused");
+    let payload = pnpm_payload(&case, &[(TOOLS_MANIFEST_PATH, TOOLS_MANIFEST)]);
+    let path = path_for_pnpm(&[stub_dotnet(&case, 1), stub_pnpm(&case, 0, "")]);
+
+    let outcome = pnpm_box(&case, &payload, &path).finish();
+
+    assert_eq!(outcome.code, Some(75), "{outcome:?}");
+    assert!(
+        lines(&outcome.stderr).contains(&"gate: remote work folder k could not restore its dotnet tools"),
+        "{outcome:?}"
+    );
+    assert_eq!(installs(&case), 0, "{outcome:?}");
+    assert!(!outcome.stderr.contains("pnpm"), "nothing of pnpm is said: {outcome:?}");
+}
+
+#[test]
+fn box_run_the_pnpm_install_gets_safe_directory() {
+    let case = Case::new("box_run_pnpm_safe_directory");
+    let payload = pnpm_payload(&case, &[]);
+    let variables = case.folder().join("variables.txt");
+    let stub = stub_pnpm(&case, 0, &format!("set GIT_CONFIG >\"{}\"\r\n", shown(&variables)));
+
+    let outcome = pnpm_box(&case, &payload, &path_for_pnpm(&[stub])).finish();
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let said = fs::read_to_string(&variables).expect("the install wrote its git variables");
+    let index = said
+        .lines()
+        .find_map(|line| line.strip_prefix("GIT_CONFIG_KEY_")?.strip_suffix("=safe.directory"))
+        .expect("the install's variables hold a safe.directory entry");
+    assert!(
+        said.lines().any(|line| line == format!("GIT_CONFIG_VALUE_{index}=*")),
+        "safe.directory is `*`: {said:?}"
+    );
 }
 
 /// A command the box's ceiling cases run that never ends on its own within any case's time.

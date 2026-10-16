@@ -18,6 +18,7 @@ mod heartbeat;
 mod inflight;
 mod inputs;
 pub(crate) mod outputs;
+mod packages;
 pub(crate) mod payload;
 mod preflight;
 pub(crate) mod probe;

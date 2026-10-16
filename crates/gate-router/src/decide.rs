@@ -10,7 +10,7 @@ use crate::config::{CARGO_OUTPUTS, Config, ConfigProblem, ignored_line};
 use crate::escape::escaped;
 use crate::key::{is_layout_name, repo_name, work_folder_key};
 use crate::like::{Pattern, eq_ignoring_case};
-use crate::rewrite::{RewritePlace, SiblingRoot, drive_letters, rewrite_words, root_letter, split_root};
+use crate::rewrite::{RewritePlace, Rewritten, SiblingRoot, drive_letters, rewrite_named, root_letter, split_root};
 
 /// The line said when `--no-build` was dropped from the builder's words.
 pub const DROPPED_NO_BUILD_LINE: &str = "gate: dropped --no-build: the last build may have run on the other machine";
@@ -412,17 +412,71 @@ pub fn decide(inputs: &Inputs<'_>, facts: &dyn Facts) -> Route {
 /// A decision to run here: the reason to say, if any.
 type Here = Option<LocalReason>;
 
+/// Where a worktree's routed work runs on the builder and how its work folder is laid out: the same for every routed
+/// run of the worktree and for its warm-up.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Target {
+    /// The builder's host alias.
+    pub host: String,
+    /// The remote pool's size.
+    pub slots: u32,
+    /// The gate's place in the worktree.
+    pub place: Place,
+    /// The repo name the routing file lists.
+    pub repo: String,
+    /// The worktree root's folder name: its last segment.
+    pub leaf: String,
+    /// The id of the worktree root's folder ([`Facts::root_id`]).
+    pub root_id: FolderId,
+    /// The siblings carried: those declared, each allowed and checked, in declared order.
+    pub siblings: Vec<CarriedSibling>,
+    /// The builder's work folder ([`work_folder_key`]).
+    pub key: String,
+    /// The input globs sent: the repo's `inputs` list, none when it has no entry.
+    pub inputs: Vec<String>,
+}
+
+/// A command's words for the builder of a [`Target`] ([`builder_words`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuilderWords {
+    /// The words: paths rewritten, a bare first word naming a file of the gate's folder written `./name`, and the
+    /// worktree's `HEAD` sha pinned onto a dotnet command that builds as `SourceRevisionId`.
+    pub words: Vec<String>,
+    /// The first word, as given, that names a path outside the worktree and its siblings, when one does.
+    pub outside: Option<String>,
+}
+
+/// The target of the worktree at `place` under the routing file `config`, asked of the facts in the order a routed
+/// run asks them: the siblings file, then each sibling's folder and the root's id. A repo the routing file does not
+/// list has none, saying nothing; a siblings problem keeps the work here as it keeps a routed run ([`decide`]).
+///
+/// # Errors
+///
+/// The reason to say, if any, when the worktree has no target.
+pub fn target(config: &Config, place: Place, facts: &dyn Facts) -> Result<Target, Option<LocalReason>> {
+    let opened = open(config, place, facts)?;
+    settle(config, opened, facts)
+}
+
+/// The words the builder of `target` runs for the command `words`: `--no-build` dropped as a routed run drops it, then
+/// the paths rewritten, the bare first word marked and the worktree's `HEAD` sha stamped, as a routed run's are.
+#[must_use]
+pub fn builder_words(target: &Target, words: &[String], facts: &dyn Facts) -> BuilderWords {
+    let sent = rewritten(&target.place, &target.leaf, carried_pairs(&target.siblings), words, facts);
+    let mut words = without_no_build(sent.words);
+    mark_and_stamp(&mut words, &target.place, facts);
+    BuilderWords {
+        words,
+        outside: sent.outside,
+    }
+}
+
 /// A command a pattern matched, with what the rest of the decision needs.
-struct Matched<'a> {
-    config: &'a Config,
-    place: Place,
-    repo: String,
+struct Matched {
+    target: Target,
     pattern: String,
     words: Vec<String>,
     outside: Option<String>,
-    leaf: String,
-    root_id: FolderId,
-    siblings: Vec<CarriedSibling>,
 }
 
 fn route(inputs: &Inputs<'_>, facts: &dyn Facts) -> Result<RemoteRun, Here> {
@@ -431,11 +485,12 @@ fn route(inputs: &Inputs<'_>, facts: &dyn Facts) -> Result<RemoteRun, Here> {
     if let Some(word) = matched.outside.clone() {
         return Err(Some(LocalReason::Outside { word }));
     }
-    let subfolder = matched.place.prefix.trim_end_matches('/').to_owned();
-    if !matched.place.prefix.is_empty() && !facts.folder_has_files(&matched.place).map_err(|reason| Some(failed(&reason)))? {
+    let place = &matched.target.place;
+    let subfolder = place.prefix.trim_end_matches('/').to_owned();
+    if !place.prefix.is_empty() && !facts.folder_has_files(place).map_err(|reason| Some(failed(&reason)))? {
         return Err(Some(LocalReason::NothingSent { subfolder }));
     }
-    Ok(remote_run(matched, subfolder, inputs.words, facts))
+    Ok(remote_run(&config, matched, subfolder, inputs.words, facts))
 }
 
 /// The routing file when the gate may route at all, before any git fact is asked; the file is read only after the
@@ -661,18 +716,61 @@ fn file_stem(path: &str) -> &str {
     name.rfind('.').map_or(name, |dot| &name[..dot])
 }
 
-/// The place, repo, siblings and rewritten words of a command one of its repo's patterns matches. The siblings file is
-/// read once the routing file lists the repo, and the words are rewritten with the siblings it declares, or with none
-/// when it has a problem, then matched; only a matched command is kept here for a sibling ([`check_siblings`]).
-fn matched<'a>(config: &'a Config, words: &[String], facts: &dyn Facts) -> Result<Matched<'a>, Here> {
+/// The place, repo, siblings and rewritten words of a command one of its repo's patterns matches. The patterns and the
+/// siblings file come from [`open`], which reads them once the routing file lists the repo, and the words are rewritten
+/// with the siblings it declares, or with none when it has a problem, then matched, the first pattern that matches
+/// winning; only a matched command is kept here for a sibling ([`check_siblings`]).
+fn matched(config: &Config, words: &[String], facts: &dyn Facts) -> Result<Matched, Here> {
     let place = facts.place().map_err(|reason| Some(failed(&reason)))?.ok_or(None)?;
+    let opened = open(config, place, facts)?;
+    let sent = rewritten(&opened.place, &opened.leaf, declared_pairs(&opened.siblings), words, facts);
+    let pattern = first_match(opened.patterns, &sent.words).ok_or(None)?;
+    let target = settle(config, opened, facts)?;
+    Ok(Matched {
+        target,
+        pattern,
+        words: sent.words,
+        outside: sent.outside,
+    })
+}
+
+/// A worktree whose repo the routing file lists, with the patterns it lists and the siblings its siblings file declares,
+/// not yet checked.
+struct Opened<'a> {
+    place: Place,
+    repo: String,
+    leaf: String,
+    /// The patterns the routing file lists for the repo.
+    patterns: &'a [Pattern],
+    /// The declared siblings, in declared order; none when the file has a problem.
+    siblings: Vec<SiblingRoot>,
+    /// The siblings file's problem, when it has one.
+    problem: Option<String>,
+}
+
+/// The worktree at `place` when the routing file lists its repo, with the patterns it lists and its siblings file read;
+/// `Err(None)` when it does not list it, whose file is then not read at all.
+fn open<'a>(config: &'a Config, place: Place, facts: &dyn Facts) -> Result<Opened<'a>, Here> {
     let repo = repo_name(&place.checkout);
     let patterns = config.patterns(&repo).ok_or(None)?;
-    let (_, _, leaf) = split_root(&place.root);
+    let leaf = split_root(&place.root).2.to_owned();
     let (siblings, problem) = match facts.siblings(&place) {
         Ok(names) => (sibling_roots(&place.root, names), None),
         Err(problem) => (Vec::new(), Some(problem)),
     };
+    Ok(Opened {
+        place,
+        repo,
+        leaf,
+        patterns,
+        siblings,
+        problem,
+    })
+}
+
+/// `words` rewritten for the builder of the worktree at `place`, whose folder name is `leaf`, carrying the siblings
+/// `siblings`, each a declared name and its root.
+fn rewritten<'s>(place: &Place, leaf: &str, siblings: impl Iterator<Item = (&'s str, &'s str)>, words: &[String], facts: &dyn Facts) -> Rewritten {
     let drives = subst_drives(&place.root, words, facts);
     let rewrite_place = RewritePlace {
         root: &place.root,
@@ -680,9 +778,29 @@ fn matched<'a>(config: &'a Config, words: &[String], facts: &dyn Facts) -> Resul
         folder: &place.folder,
         leaf,
     };
-    let sent = rewrite_words(&rewrite_place, words, &drives, &siblings);
-    let leaf = leaf.to_owned();
-    let pattern = first_match(patterns, &sent.words).ok_or(None)?;
+    rewrite_named(&rewrite_place, words, &drives, siblings)
+}
+
+/// The declared siblings as the rewrite reads them: each declared name and its root, borrowed.
+fn declared_pairs(siblings: &[SiblingRoot]) -> impl Iterator<Item = (&str, &str)> {
+    siblings.iter().map(|sibling| (sibling.name.as_str(), sibling.root.as_str()))
+}
+
+/// The carried siblings as the rewrite reads them: each declared name and its root, borrowed.
+fn carried_pairs(siblings: &[CarriedSibling]) -> impl Iterator<Item = (&str, &str)> {
+    siblings.iter().map(|sibling| (sibling.name.as_str(), sibling.root.as_str()))
+}
+
+/// The target of an opened worktree once its siblings pass their checks ([`check_siblings`]).
+fn settle(config: &Config, opened: Opened<'_>, facts: &dyn Facts) -> Result<Target, Here> {
+    let Opened {
+        place,
+        repo,
+        leaf,
+        siblings,
+        problem,
+        ..
+    } = opened;
     let declared = Declared {
         problem,
         root: &place.root,
@@ -695,16 +813,16 @@ fn matched<'a>(config: &'a Config, words: &[String], facts: &dyn Facts) -> Resul
         .zip(ids)
         .map(|(SiblingRoot { name, root }, id)| CarriedSibling { name, root, id })
         .collect();
-    Ok(Matched {
-        config,
+    Ok(Target {
+        host: config.host().to_owned(),
+        slots: config.slots(),
+        key: work_folder_key(&place.root),
+        inputs: config.inputs(&repo),
+        place,
         repo,
-        pattern,
-        words: sent.words,
-        outside: sent.outside,
         leaf,
         root_id,
         siblings,
-        place,
     })
 }
 
@@ -911,42 +1029,55 @@ fn device_path(letter: char, facts: &dyn Facts, answers: &mut Vec<(char, Option<
     path
 }
 
-fn remote_run(matched: Matched<'_>, subfolder: String, given: &[String], facts: &dyn Facts) -> RemoteRun {
-    let sent_count = matched.words.len();
-    let cargo = is_cargo(&matched.words);
-    let mut words = without_no_build(matched.words);
+/// The routed run of a matched command: its target, and its rewritten words with `--no-build` dropped, then marked and
+/// stamped as [`builder_words`] marks and stamps them.
+fn remote_run(config: &Config, matched: Matched, subfolder: String, given: &[String], facts: &dyn Facts) -> RemoteRun {
+    let Matched {
+        target,
+        pattern,
+        words: sent,
+        ..
+    } = matched;
+    let sent_count = sent.len();
+    let cargo = is_cargo(&sent);
+    let mut words = without_no_build(sent);
     let dropped_no_build = words.len() != sent_count;
     let fallback = without_no_build(given.to_vec());
-    let mut outputs = match matched.config.own_outputs(&matched.repo) {
+    let mut outputs = match config.own_outputs(&target.repo) {
         Some(globs) => globs,
         None if cargo => CARGO_OUTPUTS.iter().map(|glob| (*glob).to_owned()).collect(),
-        None => matched.config.outputs(&matched.repo),
+        None => config.outputs(&target.repo),
     };
     let outputs_withheld = fallback.len() != given.len() && !outputs.is_empty();
     if outputs_withheld {
         outputs.clear();
     }
-    let inputs = matched.config.inputs(&matched.repo);
-    mark_bare_first_word(&mut words, facts);
-    stamp_source_revision(&mut words, &matched.place, facts);
+    mark_and_stamp(&mut words, &target.place, facts);
     RemoteRun {
-        host: matched.config.host().to_owned(),
-        slots: matched.config.slots(),
-        key: work_folder_key(&matched.place.root),
-        leaf: matched.leaf,
-        root_id: matched.root_id,
-        root: matched.place.root,
-        siblings: matched.siblings,
-        repo: matched.repo,
+        host: target.host,
+        slots: target.slots,
+        key: target.key,
+        leaf: target.leaf,
+        root_id: target.root_id,
+        root: target.place.root,
+        siblings: target.siblings,
+        repo: target.repo,
         subfolder,
-        pattern: matched.pattern,
+        pattern,
         words,
         fallback,
         outputs,
-        inputs,
+        inputs: target.inputs,
         dropped_no_build,
         outputs_withheld,
     }
+}
+
+/// Writes a bare first word naming a file of the gate's folder `./name`, then pins the worktree's `HEAD` sha onto a
+/// dotnet command that builds.
+fn mark_and_stamp(words: &mut Vec<String>, place: &Place, facts: &dyn Facts) {
+    mark_bare_first_word(words, facts);
+    stamp_source_revision(words, place, facts);
 }
 
 /// The words without each of the dotnet command's own words ([`is_dotnet`]) that is exactly `--no-build`, when its

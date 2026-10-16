@@ -13,6 +13,7 @@ workspace = true
 [dependencies]
 serde_json = { version = "1.0.151", features = ["preserve_order"] }
 sha2 = "0.11.0"
+toml = { version = "1.1.8", default-features = false, features = ["std", "parse", "serde", "preserve_order"] }
 
 [dev-dependencies]
 proptest = { version = "1.11.0", default-features = false, features = ["std"] }

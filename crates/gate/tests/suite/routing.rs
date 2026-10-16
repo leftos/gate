@@ -999,6 +999,23 @@ fn the_client_is_called_with_the_rewritten_words_and_the_route() {
 }
 
 #[test]
+fn a_plain_run_s_call_asks_nothing_of_the_warm_up() {
+    let case = routed_case("routing-call-warmth");
+    let call = case.folder().join("call.json");
+    let steps = shown(&stub(&case, &[&format!("record {}", shown(&call)), "status 0"]));
+    let outcome = finish(case.gate(&routed_words("out.log", &steps, &[], &[r".\tool.exe", "argv", "a"])));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let call = recorded(&call);
+    let recorded = call.as_object().expect("the record is an object");
+    assert_eq!(
+        recorded.get("warmth"),
+        Some(&Value::Null),
+        "the record names the call's warmth, none: {call}"
+    );
+}
+
+#[test]
 fn the_client_is_called_with_the_repo_s_inputs() {
     let case = routed_case("routing-call-inputs");
     let routing = json!({
@@ -1148,7 +1165,7 @@ fn a_refused_run_falls_back_to_a_local_run_with_the_attempts_lines_in_the_log() 
 #[test]
 fn every_refusal_reason_names_itself_in_the_line_and_the_journal() {
     let case = routed_case("routing-reasons");
-    let reasons = ["busy", "unreachable", "parity", "tools", "rebooted", "layout", "inputs"];
+    let reasons = ["busy", "unreachable", "parity", "tools", "rebooted", "layout", "inputs", "cold"];
     for reason in reasons {
         let steps = shown(&stub(&case, &[&format!("refuse {reason}")]));
         let log = format!("{reason}.log");

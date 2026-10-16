@@ -219,6 +219,142 @@ pub fn outputs_capped_record(bytes: &[u8]) -> Result<OutputsCappedRecord, Format
     parse_strict(text)
 }
 
+/// The folder of the warm-up files, `<root>\remote\warm`.
+#[must_use]
+pub fn warm_dir(root: &Path) -> PathBuf {
+    remote_dir(root).join("warm")
+}
+
+/// The warm-up record of the work folder `key`, `<root>\remote\warm\<key>.json` ([`WarmRecord`]).
+#[must_use]
+pub fn warm_record_path(root: &Path, key: &str) -> PathBuf {
+    warm_dir(root).join(format!("{key}.json"))
+}
+
+/// The log of the warm-up of the work folder `key`, `<root>\remote\warm\<key>.log`.
+#[must_use]
+pub fn warm_log_path(root: &Path, key: &str) -> PathBuf {
+    warm_dir(root).join(format!("{key}.log"))
+}
+
+/// The lock the warm-up of the work folder `key` holds for its whole life, `<root>\remote\warm\<key>.lock`.
+#[must_use]
+pub fn warm_lock_path(root: &Path, key: &str) -> PathBuf {
+    warm_dir(root).join(format!("{key}.lock"))
+}
+
+/// The lock that lets one warm-up at a time run on this PC, `<root>\remote\warm.lock`.
+#[must_use]
+pub fn warm_cap_lock_path(root: &Path) -> PathBuf {
+    remote_dir(root).join("warm.lock")
+}
+
+/// Where a work folder's warm-up stands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WarmState {
+    /// A warm-up is running, or was when the record was written.
+    Warming,
+    /// The warm-up's commands passed on the builder.
+    Warm,
+    /// The warm-up failed.
+    Failed,
+}
+
+/// How a warm-up failed, which sets how long until the next one may start.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WarmFailure {
+    /// The commands failed or ran out of time.
+    Commands,
+    /// The builder or the client refused the warm-up before any command ran.
+    Refused,
+}
+
+/// The warm-up record of a work folder ([`warm_record_path`]): the JSON object `{"v": 1, "host": …, "state": …, "at": …,
+/// "hash": …, "gate": …, "pid": …, "started": …}`, with `failure` and `reason` after them when, and only when, `state` is
+/// `failed`. Its times are written as a claim's are.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WarmRecord {
+    /// The builder the warm-up ran on.
+    pub host: String,
+    pub state: WarmState,
+    /// When the record was written.
+    #[serde(with = "iso_time")]
+    pub at: Timestamp,
+    /// The lower-case hex SHA-256 of the `.gate/warmup.toml` bytes the warm-up ran.
+    pub hash: String,
+    /// The build id of the PC gate that wrote the record.
+    pub gate: String,
+    /// The warming process's pid, for the lines only.
+    pub pid: u32,
+    /// The warming process's start, for the lines only.
+    #[serde(with = "iso_time")]
+    pub started: Timestamp,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure: Option<WarmFailure>,
+    /// Why the warm-up failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl WarmRecord {
+    /// Why the record breaks a rule its types cannot carry: an empty `host` or `gate`, a `hash` that is not 64 lower-case
+    /// hex digits, a `failure` or `reason` present without `state` `failed` or absent with it, or a failed record whose
+    /// `reason` is empty.
+    fn problem(&self) -> Option<String> {
+        if self.host.is_empty() {
+            return Some("host is empty".to_owned());
+        }
+        if self.gate.is_empty() {
+            return Some("gate is empty".to_owned());
+        }
+        let hex = self.hash.len() == 64 && self.hash.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+        if !hex {
+            return Some("hash is not 64 lower-case hex digits".to_owned());
+        }
+        let failed = self.state == WarmState::Failed;
+        if failed && self.reason.as_deref() == Some("") {
+            return Some("state failed with an empty reason".to_owned());
+        }
+        match (failed, self.failure.is_some(), self.reason.is_some()) {
+            (true, false, _) => Some("state failed without failure".to_owned()),
+            (true, _, false) => Some("state failed without reason".to_owned()),
+            (false, true, _) => Some("failure without state failed".to_owned()),
+            (false, _, true) => Some("reason without state failed".to_owned()),
+            _ => None,
+        }
+    }
+}
+
+/// Writes the warm-up `record` at `path` whole or not at all, as [`write_nothing_back`] writes.
+///
+/// # Errors
+///
+/// [`io::ErrorKind::InvalidInput`] for a record [`warm_record`] would refuse; else a folder, temp file or move that
+/// fails.
+pub fn write_warm_record(path: &Path, record: &WarmRecord) -> io::Result<()> {
+    if let Some(problem) = record.problem() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, problem));
+    }
+    write_versioned(path, record)
+}
+
+/// The warm-up record a file's bytes hold, read strictly as every file of this module is, and refused when it breaks a
+/// rule of its shape (see [`WarmRecord`]).
+///
+/// # Errors
+///
+/// Bytes that are not UTF-8 or not the record's format.
+pub fn warm_record(bytes: &[u8]) -> Result<WarmRecord, FormatError> {
+    let text = std::str::from_utf8(bytes).map_err(|_| FormatError::Syntax("not UTF-8".to_owned()))?;
+    let record: WarmRecord = parse_strict(text)?;
+    match record.problem() {
+        Some(problem) => Err(FormatError::Invalid(problem)),
+        None => Ok(record),
+    }
+}
+
 /// A pause marker's name read: the gate waiting under a parent's slot, and the parent gate it runs under.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PauseMarker {

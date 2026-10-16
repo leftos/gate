@@ -80,14 +80,28 @@ pub struct RewritePlace<'a> {
 /// end of the path there. A word's rewritten text is the same either way.
 #[must_use]
 pub fn rewrite_words(place: &RewritePlace<'_>, words: &[String], drives: &[(char, String)], siblings: &[SiblingRoot]) -> Rewritten {
+    rewrite_named(
+        place,
+        words,
+        drives,
+        siblings.iter().map(|sibling| (sibling.name.as_str(), sibling.root.as_str())),
+    )
+}
+
+/// [`rewrite_words`] for siblings the caller holds as a declared name and a root each, in declared order: a routed run's
+/// carried siblings need not be rebuilt as [`SiblingRoot`]s for it.
+#[must_use]
+pub(crate) fn rewrite_named<'s>(
+    place: &RewritePlace<'_>,
+    words: &[String],
+    drives: &[(char, String)],
+    siblings: impl Iterator<Item = (&'s str, &'s str)>,
+) -> Rewritten {
     let cwd: Vec<&str> = place.prefix.split(['\\', '/']).filter(|segment| !segment.is_empty()).collect();
     let bases = Bases {
         root: root_spellings(place.root, drives),
         leaf: place.leaf,
-        siblings: siblings
-            .iter()
-            .map(|sibling| (sibling.name.as_str(), root_spellings(&sibling.root, drives)))
-            .collect(),
+        siblings: siblings.map(|(name, root)| (name, root_spellings(root, drives))).collect(),
         floor: drive_floor(place.folder, cwd.len()),
     };
     let mut outside = None;
@@ -509,8 +523,8 @@ fn resolve<'a>(base: &[&'a str], path: &'a str) -> Option<Vec<&'a str>> {
 
 /// Whether `word` names a place outside the worktree by a path's form rather than its spelling: it holds a
 /// drive-relative path ([`drive_relative`]), or at one of its path starts ([`path_starts`]) a rooted path ([`rooted`]),
-/// a drive-relative one ([`drive_relative_at`]) or relative text that [`climbs`] out, read both to the end of the word and to the end of the path there. A drive
-/// path at a start is left to the rewrite, which judges it by its spelling.
+/// a drive-relative one ([`drive_relative_at`]) or relative text that [`climbs`] out, read both to the end of the word
+/// and to the end of the path there. A drive path at a start is left to the rewrite, which judges it by its spelling.
 fn judged_outside(cwd: &[&str], bases: &Bases<'_>, word: &str) -> bool {
     drive_relative(word)
         || path_starts(word).into_iter().any(|start| {

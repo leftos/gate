@@ -2151,6 +2151,7 @@ mod tests {
             interrupt: Some(interrupt),
             state: &state,
             state_dir: Path::new(r"C:\gate-sync-back-tests"),
+            warmth: crate::remote::Warmth::Unasked,
         };
         let transport = Local::new(r"local:C:\gate-sync-back-tests", None).expect("a local transport");
         let mut attempt = Attempt::for_tests(&call, &transport);
@@ -2959,6 +2960,7 @@ mod tests {
             interrupt: None,
             state,
             state_dir: Path::new(r"C:\gate-sync-back-tests"),
+            warmth: crate::remote::Warmth::Unasked,
         }
     }
 
