@@ -161,6 +161,7 @@ Sources: the worktree at b903f50, `docs/README.md`, `docs/ARCHITECTURE.md`, `doc
   - The box checks first: `WTSGetActiveConsoleSessionId`, then `WTSQuerySessionInformation(WTSSessionInfoEx)` for `WTSActive`, the user name, and `WTS_SESSIONSTATE_UNLOCK`. Those flag values are reversed only on Windows 7 ([WTSINFOEX_LEVEL1](https://learn.microsoft.com/windows/win32/api/wtsapi32/ns-wtsapi32-wtsinfoex_level1_w)).
   - The helper confirms from inside the session in HELLO: `OpenInputDesktop` succeeds and is named `Default`. A UAC prompt or the lock screen is a secure desktop.
   - `RunEx` uses `TASK_RUN_USE_SESSION_ID` with that session. Note that with no user given, the docs say the Task Scheduler runs the task "as the user who is logged on to the specified session". That is why I3's token check matters.
+  - The builder logs its user on at the console after every reboot, through Sysinternals Autologon (owner ruling on GATE-231), so a console session exists for this check to find; builder setup keeps it so.
 - **I25. A session change mid-run is a command failure, never a fallback.** Logging off ends the session's processes; the box sees the exit and the status stands. Locking, RDP takeover and disconnection let the command run on and fail as it fails. Recommendation: one WTS read after the wait, and a note line if the session ended, changed or locked, so a failure has a cause attached.
 
 ### J. The helper dies, lies, hangs or is impersonated

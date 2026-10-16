@@ -6,7 +6,7 @@ What is left is the runbook below, and this file is deleted when GATE-192 closes
 
 ## Runbook
 
-Routing is off on the PC, so every run is local. The trial (GATE-191) has run; its findings are GATE-215 to GATE-220.
+Routing is on again, repo by repo: each caller repo's entry goes into `remote.json` after one trial run on the builder, and GATE-192's comments record which repos route, what each routes and what keeps the rest local. The first trial (GATE-191) found GATE-215 to GATE-220.
 
 1. Turn routing back on for the Rust client (GATE-192). Confirm on the next ordinary routed runs: no `client` or `version` fallbacks, no nothing-back record after a build that brought its outputs back.
 2. With routing back on, remove every routing exclusion made because of the bridge, putting each pattern back in `remote.json`, and send each caller repo whose routing changed a repo inbox note: the new remote gate is released, and it should be evaluated on its own merits, not by what the bridge did. The exclusions so far are listed under "Routing exclusions" below.
