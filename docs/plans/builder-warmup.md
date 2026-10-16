@@ -68,8 +68,8 @@ Each lands on `main` and stays dormant until B5. B1, B2, B3 and B5 touch central
 2. **B2 box side** (`boxside/payload.rs`, `run.rs`, `preflight.rs`, `ceiling.rs`): warm requests, `.warm`, the preflight line, the command loop with one budget and a stop check per command. Conflicts with GATE-304 (`ready()`) and GATE-231 (`preflight.rs`).
 3. **B3 client warm mode and the `cold` refusal** (`remote/mod.rs`, `remote/payload.rs`, `remote/client.rs`). Conflicts with GATE-231 in `client.rs`.
 4. **B4 the `gate warm` verb** (`gate-args` cli, request and usage; `answer.rs`; a new `gate/src/warm.rs`), with a new suite module `warm`.
-5. **B5 the route goes live** (`route.rs`, `run.rs`, with a spawn seam `--test-warm-spawn <file>`). `run.rs` is central.
-6. **B6 the detached launch** (`gate-win32` `create.rs`, `launch.rs`, `piped.rs`, central). Sequenced after GATE-231, which rewrites `create.rs` and `launch.rs`.
+5. **B5 the route goes live** (`route.rs`, `run.rs`). `run.rs` is central. It starts no warm-up: a Start judgement runs here and says `gate warm` warms the folder.
+6. **B6 the detached launch** (`gate-win32` `create.rs`, `launch.rs`, `piped.rs`, central), and the route's start of `gate warm --background` through it, with a spawn seam `--test-warm-spawn <file>` and `starting_line`. Sequenced after GATE-231, which rewrites `create.rs` and `launch.rs`.
 7. **B7 `gate check`** (`check/local.rs`, `check/report.rs`): warm-up file problems, consent shape, record state.
 
 Each brief's docs sweep lands with it:
