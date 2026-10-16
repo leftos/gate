@@ -133,6 +133,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Preflight**: the box's first call of a routed run (`gate box preflight`): it creates the bare repo and the work folder and reports the gate version, the boot time, the SDKs and the tools its payload's `Needs` name.
 - **Probe**: the box preflight's run of a tool's own version command (`node --version`) to learn whether the builder has the tool and which version, said as a `gate: remote tool` line; not a Probe by open.
 - **Probe by open**: reading whether a slot is held by opening its mutex's name: it is held while any handle to that name exists.
+- **Program name**: what a routed command's first word becomes when it names a program by an absolute path outside the worktree: the file name with a trailing `.exe` removed, which the builder looks up on its own `PATH`; the run says `gate: routed {given} as {name}`, and a name the router refuses leaves the word outside.
 - **Progress**: what resets the stall clock in a sample: the output size changed, the job's CPU reached 1% of one core over the stall window since the last progress, a new pid appeared, or a nested gate is paused.
 - **Pure crate**: a crate with no Windows types in its API that builds and unit-tests on Linux as well (`gate-state`, `gate-watchdog`, `gate-args`, `gate-router`).
 - **Push**: `gate push`, which copies the installed `gate.exe` to every builder on the builders list over ssh and installs it there with the old exe set aside. Not the remote client's push of a snapshot to the builder's git repo.

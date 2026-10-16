@@ -350,12 +350,16 @@ pub struct RemoteRun {
     /// The pattern that matched.
     pub pattern: String,
     /// The words the builder runs: paths rewritten, `--no-build` dropped from a dotnet command, the worktree's `HEAD`
-    /// sha pinned onto a dotnet command that builds as `SourceRevisionId`, and a bare first word naming a file of the
-    /// gate's folder written `./name`.
+    /// sha pinned onto a dotnet command that builds as `SourceRevisionId`, a bare first word naming a file of the
+    /// gate's folder written `./name`, and a first word naming a program by a path outside the worktree sent as the
+    /// program's name ([`RemoteRun::program_named`]), which is never the file of the folder.
     pub words: Vec<String>,
     /// The words every fallback here runs: the command as given, each exact `--no-build` word dropped from a dotnet
     /// command.
     pub fallback: Vec<String>,
+    /// Whether the rewrite sent the command's first word as a program's name ([`Rewritten::program_named`]):
+    /// [`RemoteRun::lines`] says the word as given and the name it is sent as.
+    pub program_named: bool,
     /// The output globs the run brings back; none for a dotnet `--no-build` command.
     pub outputs: Vec<String>,
     /// The input globs the run sends: the repo's `inputs` list, none when it has no entry; kept for a dotnet
@@ -368,11 +372,15 @@ pub struct RemoteRun {
 }
 
 impl RemoteRun {
-    /// The lines the gate says for this route, in order: [`DROPPED_NO_BUILD_LINE`], [`NO_OUTPUTS_LINE`], then, for a run
-    /// carrying siblings, `gate: routed with siblings: {name} ({root}), ...` naming each in declared order.
+    /// The lines the gate says for this route, in order: [`RemoteRun::program_line`], [`DROPPED_NO_BUILD_LINE`],
+    /// [`NO_OUTPUTS_LINE`], then, for a run carrying siblings, `gate: routed with siblings: {name} ({root}), ...` naming
+    /// each in declared order.
     #[must_use]
     pub fn lines(&self) -> Vec<String> {
         let mut lines = Vec::new();
+        if let Some(line) = self.program_line() {
+            lines.push(line);
+        }
         if self.dropped_no_build {
             lines.push(DROPPED_NO_BUILD_LINE.to_owned());
         }
@@ -389,13 +397,26 @@ impl RemoteRun {
         }
         lines
     }
+
+    /// The line `gate: routed {given} as {name}`, for a run whose rewrite sent the command's first non-empty word as a
+    /// program's name ([`RemoteRun::program_named`]): the word as the caller gave it and the name the builder looks the
+    /// program up by, each escaped as the run's other lines escape words. `None` for any other run.
+    fn program_line(&self) -> Option<String> {
+        if !self.program_named {
+            return None;
+        }
+        let (_, given) = first_word(&self.fallback)?;
+        let (_, name) = first_word(&self.words)?;
+        Some(format!("gate: routed {} as {}", escaped(given), escaped(name)))
+    }
 }
 
 /// Where a gate's command runs. In order: only a heavy gate routes; a covering or lending parent keeps it here; `--local`
 /// keeps it here saying so; then the routing file is read, and no file keeps it here, an unusable one saying it was
 /// ignored; a git hook, no non-empty word, or a first word whose file name without extension is `git` or `prek` keep it
 /// here; so does a folder in no git worktree, a repo the routing file does not list, and words (paths rewritten, joined
-/// by single spaces) none of the repo's patterns match, the first that matches winning. A matched command still runs
+/// by single spaces) none of the repo's patterns match, the first that matches winning. A first word the rewrite sends
+/// as a program's name that names `git` or `prek` keeps it here too. A matched command still runs
 /// here, saying why, when the worktree's `.gate/siblings.toml` has a problem or declares a sibling the routing file's
 /// `siblings` does not allow the repo, or declares siblings from a root folder name the builder cannot lay out, a
 /// sibling named like that folder or one with no git worktree beside the root; when
@@ -439,11 +460,15 @@ pub struct Target {
 /// A command's words for the builder of a [`Target`] ([`builder_words`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BuilderWords {
-    /// The words: paths rewritten, a bare first word naming a file of the gate's folder written `./name`, and the
-    /// worktree's `HEAD` sha pinned onto a dotnet command that builds as `SourceRevisionId`.
+    /// The words: paths rewritten, a bare first word naming a file of the gate's folder written `./name` (never a first
+    /// word sent as a program's name), and the worktree's `HEAD` sha pinned onto a dotnet command that builds as
+    /// `SourceRevisionId`.
     pub words: Vec<String>,
     /// The first word, as given, that names a path outside the worktree and its siblings, when one does.
     pub outside: Option<String>,
+    /// Whether the rewrite sent the command's first word as a program's name ([`Rewritten::program_named`]), which a
+    /// caller of it this PC keeps ([`stays_local`]) holds as a problem.
+    pub program_named: bool,
 }
 
 /// The target of the worktree at `place` under the routing file `config`, asked of the facts in the order a routed
@@ -464,10 +489,11 @@ pub fn target(config: &Config, place: Place, facts: &dyn Facts) -> Result<Target
 pub fn builder_words(target: &Target, words: &[String], facts: &dyn Facts) -> BuilderWords {
     let sent = rewritten(&target.place, &target.leaf, carried_pairs(&target.siblings), words, facts);
     let mut words = without_no_build(sent.words);
-    mark_and_stamp(&mut words, &target.place, facts);
+    mark_and_stamp(&mut words, &target.place, facts, sent.program_named);
     BuilderWords {
         words,
         outside: sent.outside,
+        program_named: sent.program_named,
     }
 }
 
@@ -477,6 +503,8 @@ struct Matched {
     pattern: String,
     words: Vec<String>,
     outside: Option<String>,
+    /// Whether the rewrite sent the command's first word as a program's name ([`Rewritten::program_named`]).
+    program_named: bool,
 }
 
 fn route(inputs: &Inputs<'_>, facts: &dyn Facts) -> Result<RemoteRun, Here> {
@@ -513,7 +541,8 @@ fn eligible(inputs: &Inputs<'_>, facts: &dyn Facts) -> Result<Config, Here> {
 }
 
 /// Whether the command can never route: it has no non-empty word, or its first one is `git` or `prek`, however
-/// spelled (`git.exe`, a full path to it).
+/// spelled (`git.exe`, a full path to it). A caller holding words the rewrite has sent ([`Rewritten::words`]) asks the
+/// same of those, so a `git` the rewrite sends a name for stays here too.
 #[must_use]
 pub fn stays_local(words: &[String]) -> bool {
     first_word(words).is_none_or(|(_, word)| {
@@ -720,11 +749,16 @@ fn file_stem(path: &str) -> &str {
 /// The place, repo, siblings and rewritten words of a command one of its repo's patterns matches. The patterns and the
 /// siblings file come from [`open`], which reads them once the routing file lists the repo, and the words are rewritten
 /// with the siblings it declares, or with none when it has a problem, then matched, the first pattern that matches
-/// winning; only a matched command is kept here for a sibling ([`check_siblings`]).
+/// winning; only a matched command is kept here for a sibling ([`check_siblings`]). A command whose first word the
+/// rewrite sent as a program's name ([`Rewritten::program_named`]) that stays on this PC by that name ([`stays_local`])
+/// is no match: a `git` or `prek` under a path is read as one however the path is spelled.
 fn matched(config: &Config, words: &[String], facts: &dyn Facts) -> Result<Matched, Here> {
     let place = facts.place().map_err(|reason| Some(failed(&reason)))?.ok_or(None)?;
     let opened = open(config, place, facts)?;
     let sent = rewritten(&opened.place, &opened.leaf, declared_pairs(&opened.siblings), words, facts);
+    if sent.program_named && stays_local(&sent.words) {
+        return Err(None);
+    }
     let pattern = first_match(opened.patterns, &sent.words).ok_or(None)?;
     let target = settle(config, opened, facts)?;
     Ok(Matched {
@@ -732,6 +766,7 @@ fn matched(config: &Config, words: &[String], facts: &dyn Facts) -> Result<Match
         pattern,
         words: sent.words,
         outside: sent.outside,
+        program_named: sent.program_named,
     })
 }
 
@@ -1037,6 +1072,7 @@ fn remote_run(config: &Config, matched: Matched, subfolder: String, given: &[Str
         target,
         pattern,
         words: sent,
+        program_named,
         ..
     } = matched;
     let sent_count = sent.len();
@@ -1053,7 +1089,7 @@ fn remote_run(config: &Config, matched: Matched, subfolder: String, given: &[Str
     if outputs_withheld {
         outputs.clear();
     }
-    mark_and_stamp(&mut words, &target.place, facts);
+    mark_and_stamp(&mut words, &target.place, facts, program_named);
     RemoteRun {
         host: target.host,
         slots: target.slots,
@@ -1067,6 +1103,7 @@ fn remote_run(config: &Config, matched: Matched, subfolder: String, given: &[Str
         pattern,
         words,
         fallback,
+        program_named,
         outputs,
         inputs: target.inputs,
         dropped_no_build,
@@ -1075,9 +1112,9 @@ fn remote_run(config: &Config, matched: Matched, subfolder: String, given: &[Str
 }
 
 /// Writes a bare first word naming a file of the gate's folder `./name`, then pins the worktree's `HEAD` sha onto a
-/// dotnet command that builds.
-fn mark_and_stamp(words: &mut Vec<String>, place: &Place, facts: &dyn Facts) {
-    mark_bare_first_word(words, facts);
+/// dotnet command that builds. A word the rewrite sent as a program's name (`program_named`) is left as it stands.
+fn mark_and_stamp(words: &mut Vec<String>, place: &Place, facts: &dyn Facts, program_named: bool) {
+    mark_bare_first_word(words, facts, program_named);
     stamp_source_revision(words, place, facts);
 }
 
@@ -1099,8 +1136,13 @@ pub fn without_no_build(words: Vec<String>) -> Vec<String> {
 }
 
 /// Writes the first non-empty word `./name` when it is a bare name (no separator, drive or `.`/`..`) of a file in the
-/// gate's folder, which the builder would otherwise look for on its `PATH`.
-fn mark_bare_first_word(words: &mut [String], facts: &dyn Facts) {
+/// gate's folder, which the builder would otherwise look for on its `PATH`. A first word the rewrite sent as a
+/// program's name (`program_named`) is left as it stands: the caller asked for the program outside the worktree, not
+/// for a file of this folder.
+fn mark_bare_first_word(words: &mut [String], facts: &dyn Facts, program_named: bool) {
+    if program_named {
+        return;
+    }
     let Some((index, word)) = first_word(words) else {
         return;
     };

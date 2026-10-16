@@ -1,6 +1,7 @@
 //! The in-worktree path rewrite. [`POWERSHELL_TABLE`] is `remote.selftest.ps1`'s `Get-RoutePathTable`, row for row,
-//! with the worktree `X:/dev/yaat.wt/a`; [`SPACES_GLOBS_AND_FLAGS_TABLE`] holds the cases the PowerShell rewrite gets
-//! wrong.
+//! with the worktree `X:/dev/yaat.wt/a`, apart from the rows where a command's first word names a program by an
+//! absolute path outside the worktree: this gate sends the program's name there, where the table sends the path and
+//! refuses the run as outside. [`SPACES_GLOBS_AND_FLAGS_TABLE`] holds the cases the PowerShell rewrite gets wrong.
 
 use gate_router::{Place, RewritePlace, Rewritten, SiblingRoot, rewrite_words};
 use proptest::prelude::*;
@@ -78,7 +79,8 @@ const POWERSHELL_TABLE: &[Row] = &[
         ),
         &["Set-Location x\n..\\..\\..\\y"],
     ),
-    outside("", &[r"X:\dev\yaat.wt\a.old\x"], r"X:\dev\yaat.wt\a.old\x"),
+    outside("", &["dotnet", r"X:\dev\yaat.wt\a.old\x"], r"X:\dev\yaat.wt\a.old\x"),
+    sent("", &[r"X:\dev\yaat.wt\a.old\x"], &["x"]),
     sent("src/c/", &[r"--results-directory=..\..\r"], &[r"--results-directory=..\..\r"]),
     sent("", &["x:/DEV/Yaat.WT/A/Tests/T"], &["Tests/T"]),
     sent("", &["--results-directory=X:/dev/yaat.wt/a/out"], &["--results-directory=out"]),
@@ -104,9 +106,10 @@ const POWERSHELL_TABLE: &[Row] = &[
     outside("", &["dotnet", r"D:\yaat.wt\a\tests"], r"D:\yaat.wt\a\tests"),
     outside(
         "",
-        &[r"C:\Program Files\dotnet\dotnet.exe", "test"],
+        &["dotnet", r"C:\Program Files\dotnet\dotnet.exe"],
         r"C:\Program Files\dotnet\dotnet.exe",
     ),
+    sent("", &[r"C:\Program Files\dotnet\dotnet.exe", "test"], &["dotnet", "test"]),
     outside("", &["dotnet", r"..\other\x"], r"..\other\x"),
     outside("src/", &["dotnet", r"..\..\x"], r"..\..\x"),
     outside("", &["dotnet", "X:/dev/yaat.wt/a/../b/x"], "X:/dev/yaat.wt/a/../b/x"),
@@ -138,9 +141,12 @@ const POWERSHELL_TABLE: &[Row] = &[
     on_drives(sent("src/c/", &[r"D:\yaat.wt\a\src\c\x"], &[r"..\..\src\c\x"]), DEV),
     on_drives(sent("", &[r"D:\yaat.wt\a\tools\hidden-desktop.ps1"], &[r"tools\hidden-desktop.ps1"]), DEV),
     on_drives(sent("", &[r"D:\x"], &["x"]), &[('D', r"X:\dev\yaat.wt\a")]),
-    on_drives(outside("", &[r"D:\yaat.wt\ab\x"], r"D:\yaat.wt\ab\x"), DEV),
-    on_drives(outside("", &[r"Q:\yaat.wt\a\x"], r"Q:\yaat.wt\a\x"), DEV),
-    on_drives(outside("", &[r"D:\v\yaat.wt\a\x"], r"D:\v\yaat.wt\a\x"), &[('D', r"X:\de")]),
+    on_drives(outside("", &["dotnet", r"D:\yaat.wt\ab\x"], r"D:\yaat.wt\ab\x"), DEV),
+    on_drives(sent("", &[r"D:\yaat.wt\ab\x"], &["x"]), DEV),
+    on_drives(outside("", &["dotnet", r"Q:\yaat.wt\a\x"], r"Q:\yaat.wt\a\x"), DEV),
+    on_drives(sent("", &[r"Q:\yaat.wt\a\x"], &["x"]), DEV),
+    on_drives(outside("", &["dotnet", r"D:\v\yaat.wt\a\x"], r"D:\v\yaat.wt\a\x"), &[('D', r"X:\de")]),
+    on_drives(sent("", &[r"D:\v\yaat.wt\a\x"], &["x"]), &[('D', r"X:\de")]),
 ];
 
 /// The cases the PowerShell rewrite gets wrong: one argument holding a path with spaces runs through them, while a
@@ -151,7 +157,8 @@ const SPACES_GLOBS_AND_FLAGS_TABLE: &[Row] = &[
     sent("my dir/", &["X:/dev/yaat.wt/a/my dir"], &["."]),
     sent("", &["--project=X:/dev/yaat.wt/a/my dir/p.csproj"], &["--project=my dir/p.csproj"]),
     outside("", &[r"X:\dev\yaat.wt\a\b c\..\..\x"], r"X:\dev\yaat.wt\a\b c\..\..\x"),
-    outside("", &["X:/dev/yaat.wt/a old/x"], "X:/dev/yaat.wt/a old/x"),
+    outside("", &["dotnet", "X:/dev/yaat.wt/a old/x"], "X:/dev/yaat.wt/a old/x"),
+    sent("", &["X:/dev/yaat.wt/a old/x"], &["x"]),
     sent("", &[r"cd X:\dev\yaat.wt\a\b c; dir"], &["cd b c; dir"]),
     sent(
         "",
@@ -231,19 +238,34 @@ fn with_siblings(prefix: &str, list: &[&str], drives: &[(char, &str)]) -> Rewrit
     rewrite(&place_at(prefix), &words(list), &drives, &[sibling("yaat-server"), sibling("b")])
 }
 
-/// Asserts each word at `prefix` is rewritten to its pair's second, none outside.
+/// Asserts each word at `prefix` is rewritten to its pair's second, none outside, all left as paths.
 fn assert_sent(prefix: &str, pairs: &[(&str, &str)], drives: &[(char, &str)]) {
     for (word, expect) in pairs {
         let got = with_siblings(prefix, &[word], drives);
-        assert_eq!((got.words, got.outside), (words(&[expect]), None), "{word:?} at {prefix:?}");
+        assert_eq!(
+            (got.words, got.outside, got.program_named),
+            (words(&[expect]), None, false),
+            "{word:?} at {prefix:?}"
+        );
     }
 }
 
-/// Asserts each word at `prefix` is outside the worktree.
+/// Asserts each word at `prefix` is outside the worktree, naming no program.
 fn assert_outside(prefix: &str, list: &[&str]) {
     for word in list {
         let got = with_siblings(prefix, &[word], &[]);
         assert_eq!(got.outside.as_deref(), Some(*word), "{word:?} at {prefix:?}");
+        assert!(!got.program_named, "{word:?} at {prefix:?} names a program");
+    }
+}
+
+/// Asserts each word at `prefix` is outside the worktree as a command's second word, after `dotnet`, where the rule for
+/// a command's first word does not read it.
+fn assert_outside_after_first(prefix: &str, list: &[&str]) {
+    for word in list {
+        let got = with_siblings(prefix, &["dotnet", word], &[]);
+        assert_eq!(got.outside.as_deref(), Some(*word), "{word:?} after a first word at {prefix:?}");
+        assert!(!got.program_named, "{word:?} after a first word at {prefix:?} names a program");
     }
 }
 
@@ -286,21 +308,15 @@ fn a_relative_climb_into_a_declared_sibling_is_inside() {
 
 #[test]
 fn a_climb_into_an_undeclared_folder_is_outside() {
-    assert_outside("", &["../other/x", "X:/dev/yaat.wt/other/x", "../../yaat.wt/yaat-server"]);
+    assert_outside("", &["../other/x", "../../yaat.wt/yaat-server"]);
+    assert_outside_after_first("", &["X:/dev/yaat.wt/other/x"]);
     assert_outside("src/", &["../../other"]);
 }
 
 #[test]
 fn a_sibling_name_prefix_is_not_the_sibling() {
-    assert_outside(
-        "",
-        &[
-            "X:/dev/yaat.wt/yaat-server2/x",
-            "../yaat-server2/x",
-            "X:/dev/yaat.wt/yaat-serve/x",
-            "../bb",
-        ],
-    );
+    assert_outside("", &["../yaat-server2/x", "../bb"]);
+    assert_outside_after_first("", &["X:/dev/yaat.wt/yaat-server2/x", "X:/dev/yaat.wt/yaat-serve/x"]);
 }
 
 #[test]
@@ -316,15 +332,9 @@ fn a_sibling_path_on_a_subst_drive_is_inside() {
 fn a_climb_out_of_a_sibling_is_outside() {
     assert_outside(
         "",
-        &[
-            "../yaat-server/../x",
-            "X:/dev/yaat.wt/yaat-server/../x",
-            "..",
-            "../",
-            "X:/dev/yaat.wt",
-            r"X:\dev\yaat.wt\",
-        ],
+        &["../yaat-server/../x", "X:/dev/yaat.wt/yaat-server/../x", "..", "../", r"X:\dev\yaat.wt\"],
     );
+    assert_outside_after_first("", &["X:/dev/yaat.wt"]);
     assert_outside("src/", &["../..", "../../yaat-server/../../x"]);
 }
 
@@ -602,4 +612,92 @@ proptest! {
         prop_assert_eq!(&got.outside, &None);
         prop_assert_eq!(resolve(&folder, &got.words[0]), path);
     }
+}
+
+/// Asserts the words at the root rewrite to `expect`, with `outside` the first word judged outside the worktree, when
+/// any.
+fn assert_words(list: &[&str], expect: &[&str], outside: Option<&str>) {
+    let got = rewrite(&place_at(""), &words(list), &[], &[]);
+    assert_eq!(
+        (got.words, got.outside, got.program_named),
+        (words(expect), outside.map(str::to_owned), false),
+        "{list:?}"
+    );
+}
+
+/// A command's first word naming a program by an absolute path outside the worktree is sent as the program's name: its
+/// last segment with a trailing `.exe`, in any letter case, removed.
+#[test]
+fn a_first_word_naming_a_program_outside_the_worktree_becomes_its_name() {
+    for (given, name) in [
+        (r"F:\Godot\Godot_console.exe", "Godot_console"),
+        (r"C:\Program Files\dotnet\dotnet.exe", "dotnet"),
+        ("c:/tools/Run.EXE", "Run"),
+        (r"F:\tools\build.cmd", "build.cmd"),
+        (r"F:\tools\tool", "tool"),
+        (r"F:\tools\тест.exe", "тест"),
+        (r"F:\tools\日本.exe", "日本"),
+        (r"F:\tools\日本", "日本"),
+    ] {
+        let got = rewrite(&place_at(""), &words(&[given, "rest"]), &[], &[]);
+        assert_eq!((got.words, got.outside), (words(&[name, "rest"]), None), "{given:?}");
+        assert!(got.program_named, "{given:?} names a program");
+    }
+}
+
+/// A first word that names no program by a drive path stays outside the worktree, sent as written, or stands as it is.
+#[test]
+fn a_first_word_naming_no_program_by_a_drive_path_stays_outside() {
+    // A share, device, drive-relative or root-relative form names no program by an absolute path.
+    assert_outside("", &[r"\\host\share\x.exe", r"\\?\C:\x.exe", "//host/x.exe", "C:x.exe", r"\x.exe"]);
+    // A segment after the drive that is empty, `.` or `..` names no file by a path.
+    assert_outside("", &[r"C:\a\\x.exe", r"C:\a\.\x.exe", r"C:\a\..\b\x.exe"]);
+    // A trailing separator, or a name empty once a trailing `.exe` is removed, names no file.
+    assert_outside("", &[r"F:\tools\", r"F:\tools\.exe"]);
+    // A file name holding a wildcard, a redirect, a quote or a line break names no program.
+    assert_outside("", &[r"F:\tools\x*.exe", r"F:\tools\a|b.exe", r"F:\tools\a?b.exe"]);
+    assert_outside("", &[r#"F:\tools\a"b.exe"#, r"F:\tools\a<b.exe", r"F:\tools\a>b.exe"]);
+    assert_outside("", &["F:\\tools\\a\nb.exe", "F:\\tools\\a\rb.exe"]);
+    // A name holding an alternate stream's colon, white space, a trailing dot or space, or an 8.3 short name's `~` and
+    // digit names no program, and neither does a word holding a second drive path.
+    assert_outside(
+        "",
+        &[
+            r"F:\tools\tool.exe:s",
+            r"F:\tools\my tool.exe",
+            r"F:\tools\tool.exe.",
+            r"F:\tools\tool.exe ",
+            r"F:\tools\TOOLNA~1.EXE",
+            r"X:\a\x.exe;C:\other",
+        ],
+    );
+    // A folder segment Win32 reads another way names no program either: a single trailing dot is dropped, an 8.3 short
+    // name, a colon and a trailing space each name a folder the builder may not mean.
+    assert_outside(
+        "",
+        &[
+            r"X:\dev\yaat.wt\a.\tools\x.exe",
+            r"X:\dev\YAAT~1.WT\a\.dotnet\dotnet.exe",
+            r"X:\dev\yaat.wt\a::$INDEX_ALLOCATION\tools\x.exe",
+            r"X:\dev\yaat.wt\a \tools\x.exe",
+        ],
+    );
+    // A relative word is no drive path: one in the gate's folder stands as written, one climbing out is outside.
+    assert_unchanged(&[r".\x.exe"]);
+    assert_outside("", &[r"..\x\x.exe"]);
+    // Only the first word is read this way: a path after it, a wrapping script's `--` included, is judged by the path
+    // rules alone.
+    assert_words(
+        &["dotnet", "build", "-o", r"F:\out"],
+        &["dotnet", "build", "-o", r"F:\out"],
+        Some(r"F:\out"),
+    );
+    assert_words(
+        &["pwsh", "-File", "x.ps1", "--", r#""C:\Program Files\dotnet\dotnet.exe""#, "test"],
+        &["pwsh", "-File", "x.ps1", "--", r#""C:\Program Files\dotnet\dotnet.exe""#, "test"],
+        Some(r#""C:\Program Files\dotnet\dotnet.exe""#),
+    );
+    // A first word inside the worktree stays a path, a subst drive standing for the root included.
+    let subst = rewrite(&place_at(""), &words(&[r"D:\x"]), &[('D', r"X:\dev\yaat.wt\a".to_owned())], &[]);
+    assert_eq!((subst.words, subst.outside, subst.program_named), (words(&["x"]), None, false));
 }

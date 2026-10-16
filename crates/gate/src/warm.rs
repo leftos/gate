@@ -218,7 +218,7 @@ fn consented(config: &Config, repo: &str) -> Result<(), End> {
 }
 
 /// The warm-up file of `target`'s worktree read through the `.gate` reader, and its commands worded for the builder;
-/// else how the warm-up ends: no file, a file problem, or a command naming a path outside the worktree.
+/// else how the warm-up ends: no file, a file problem, or a command whose words name a path outside the worktree.
 fn read_file(target: &Target, machine: &Machine<'_>) -> Result<Warmup, End> {
     let bytes = match route::read_gate_file(Path::new(&target.place.root), "warmup.toml") {
         Ok(Some(bytes)) => bytes,
@@ -252,22 +252,22 @@ fn first_problem(problems: &[String]) -> String {
 }
 
 /// The commands of `file` as the builder of `target` runs them, as a routed run's words are made; a command a routed
-/// run keeps on this PC ([`stays_local`]) and a command naming a path outside the worktree and its siblings are
-/// problems of the file.
+/// run keeps on this PC ([`stays_local`]) and a command whose words, as the rewrite leaves them, name a path outside
+/// the worktree and its siblings are problems of the file. A first word naming a program by such a path is sent as the
+/// program's name, as a routed run sends it, and is no problem unless that name is one this PC keeps too.
 fn worded(target: &Target, file: &WarmupFile, machine: &Machine<'_>) -> Result<Vec<Vec<String>>, End> {
     file.commands
         .iter()
         .enumerate()
         .map(|(at, command)| {
+            let first = command.iter().find(|word| !word.is_empty()).map_or("", String::as_str);
             if stays_local(command) {
-                let first = command.iter().find(|word| !word.is_empty()).map_or("", String::as_str);
-                return Err(End::Usage(format!(
-                    "gate: warm: {FILE_SAID} command {} starts with {}, which a routed run never sends",
-                    at + 1,
-                    escaped(first)
-                )));
+                return Err(never_sent(at, first));
             }
             let sent = builder_words(target, command, machine);
+            if sent.program_named && stays_local(&sent.words) {
+                return Err(never_sent(at, first));
+            }
             match sent.outside {
                 Some(word) => Err(End::Usage(format!(
                     "gate: warm: {FILE_SAID} command {} names {}, outside the worktree",
@@ -278,6 +278,16 @@ fn worded(target: &Target, file: &WarmupFile, machine: &Machine<'_>) -> Result<V
             }
         })
         .collect()
+}
+
+/// The end of a command of the warm-up file a routed run never sends: a command this PC keeps ([`stays_local`]), by its
+/// first word as given or by the program's name the rewrite sends for it.
+fn never_sent(at: usize, first: &str) -> End {
+    End::Usage(format!(
+        "gate: warm: {FILE_SAID} command {} starts with {}, which a routed run never sends",
+        at + 1,
+        escaped(first)
+    ))
 }
 
 /// How a started warm-up ends.

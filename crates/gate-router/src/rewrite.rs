@@ -1,6 +1,8 @@
 //! The in-worktree path rewrite: a routed command's words as the builder runs them in the gate's folder there.
 //! Every drive path in a word that lies inside the worktree or a declared sibling beside it is made relative to the
-//! gate's folder; any other drive path marks the word as outside the worktree.
+//! gate's folder; any other drive path marks the word as outside the worktree. A command's first non-empty word that is
+//! a drive path outside the worktree and its siblings, every segment of it a name Win32 reads as written
+//! ([`plain_segment`]), is sent as the program's name instead, and the run says `gate: routed {given} as {name}` for it.
 //!
 //! A drive path starts at a drive letter, a colon and a separator not preceded by a letter, digit, `_` or `-`,
 //! anywhere in the word (`--flag=X:\a`, `-p:Name=X:\a`, `"X:\a;X:\b"`, a script's text), each such start a path of its
@@ -17,13 +19,23 @@ use crate::like::{eq_ignoring_case, lower_char};
 /// Characters that end a path in a word.
 const PATH_ENDS: [char; 9] = [',', ';', '"', '\'', ')', '|', '&', '<', '>'];
 
+/// Characters a program's file name cannot hold: the wildcards, the redirections and a quote. A line break and the
+/// characters Win32 reads another way are refused elsewhere ([`program_file_name`], [`plain_segment`]).
+const BANNED_NAME_CHARS: [char; 6] = ['*', '?', '"', '<', '>', '|'];
+
 /// A command's words rewritten for the builder.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rewritten {
-    /// Each word with its in-worktree paths made relative to the gate's folder; outside paths stay as written.
+    /// Each word with its in-worktree paths made relative to the gate's folder; outside paths stay as written, apart
+    /// from a first word naming a program by such a path, which is the program's name ([`Rewritten::program_named`]).
     pub words: Vec<String>,
-    /// The first word, as given, that names a path outside the worktree.
+    /// The first word, as given, that names a path outside the worktree, when one does, apart from a first word sent as
+    /// a program's name ([`Rewritten::program_named`]), which is not reported here.
     pub outside: Option<String>,
+    /// Whether the command's first non-empty word named a program by an absolute path outside the worktree and was
+    /// sent as the program's name: the builder finds the program on its `PATH`, and the name is no file of the gate's
+    /// folder.
+    pub program_named: bool,
 }
 
 /// A declared sibling of the worktree: its folder name as declared and its root beside the worktree root.
@@ -78,6 +90,12 @@ pub struct RewritePlace<'a> {
 /// any of these), a drive-relative path, a root-relative path (`\src`, and in a value position `/src`), a share or
 /// device path (two separators) or relative text that climbs out as above, read both to the end of the word and to the
 /// end of the path there. A word's rewritten text is the same either way.
+///
+/// A command's first non-empty word that is a drive path (`F:\x\y.exe`) outside the worktree and its siblings, with no
+/// other drive path in it and no segment of it empty, `.` or `..`, is sent as the program's name instead: its file name
+/// with a trailing `.exe`, in any letter case, removed, when that leaves a name a program can be named by
+/// ([`program_name`]). That name counts as inside, and the builder looks the program up on its `PATH`
+/// ([`Rewritten::program_named`]).
 #[must_use]
 pub fn rewrite_words(place: &RewritePlace<'_>, words: &[String], drives: &[(char, String)], siblings: &[SiblingRoot]) -> Rewritten {
     rewrite_named(
@@ -105,15 +123,26 @@ pub(crate) fn rewrite_named<'s>(
         floor: drive_floor(place.folder, cwd.len()),
     };
     let mut outside = None;
+    let mut program_named = false;
     let mut rewritten = Vec::with_capacity(words.len());
-    for word in words {
+    let first = words.iter().position(|word| !word.is_empty());
+    for (index, word) in words.iter().enumerate() {
         let (text, is_outside) = rewrite_word(&bases, &cwd, word);
-        rewritten.push(text);
-        if is_outside && outside.is_none() {
-            outside = Some(word.clone());
+        if let Some(name) = program_name(word, first == Some(index), is_outside) {
+            program_named = true;
+            rewritten.push(name);
+        } else {
+            rewritten.push(text);
+            if is_outside && outside.is_none() {
+                outside = Some(word.clone());
+            }
         }
     }
-    Rewritten { words: rewritten, outside }
+    Rewritten {
+        words: rewritten,
+        outside,
+        program_named,
+    }
 }
 
 /// The drive letters, in upper case and each once, that a path in `words` starts on, other than the root's own: the
@@ -281,6 +310,72 @@ fn rewrite_word(bases: &Bases<'_>, cwd: &[&str], word: &str) -> (String, bool) {
     }
     text.push_str(&word[at..]);
     (text, outside)
+}
+
+/// The name the command's first non-empty word `word` is sent as, when `first` and [`rewrite_word`] judged it outside
+/// the worktree: its file name ([`last_segment`]) with a trailing `.exe`, in any letter case, removed, when that leaves
+/// a name a program can be named by ([`program_file_name`]). `None` for a word that is no such path: not the command's
+/// first non-empty word, not outside, not a sole drive path ([`drive_rest`]) whose every segment Win32 reads as written
+/// ([`plain_segment`]), naming no such file name, or naming nothing once a trailing `.exe` is removed.
+fn program_name(word: &str, first: bool, outside: bool) -> Option<String> {
+    if !first || !outside {
+        return None;
+    }
+    let stem = without_exe(last_segment(drive_rest(word)?)?);
+    (!stem.is_empty() && program_file_name(stem)).then(|| stem.to_owned())
+}
+
+/// What follows a word's drive letter, `:`, and separator, either way, when that is the word's only drive path; `None`
+/// when the word starts with anything else, or holds another drive path.
+fn drive_rest(word: &str) -> Option<&str> {
+    matches!(drive_starts(word).as_slice(), [0]).then(|| &word[3..])
+}
+
+/// The last of `rest`'s segments, a drive path below its drive, when every segment of it is one Win32 reads as written,
+/// folders and file name alike ([`plain_segment`]).
+fn last_segment(rest: &str) -> Option<&str> {
+    if !rest.split(['\\', '/']).all(plain_segment) {
+        return None;
+    }
+    rest.rsplit(['\\', '/']).next()
+}
+
+/// Whether `segment`, a folder or file name of a path, is one Win32 reads as written: not empty, not `.` or `..`, the
+/// climb and the folder itself, without `:`, without an 8.3 short name's `~` and ASCII digit
+/// ([`names_a_short_name`]) and not ending in `.` or a space, which Win32 strips. A segment Win32 reads as another name
+/// than it spells, a folder's trailing dot dropped or an 8.3 short name expanded among them, leaves the word naming a
+/// folder the caller may not have meant.
+fn plain_segment(segment: &str) -> bool {
+    !segment.is_empty()
+        && segment != "."
+        && segment != ".."
+        && !segment.contains(':')
+        && !names_a_short_name(segment)
+        && !segment.ends_with(['.', ' '])
+}
+
+/// `name` without a trailing `.exe`, in any letter case.
+fn without_exe(name: &str) -> &str {
+    let at = name.len().saturating_sub(4);
+    match name.as_bytes().get(at..) {
+        Some(removed) if removed.eq_ignore_ascii_case(b".exe") => &name[..at],
+        _ => name,
+    }
+}
+
+/// Whether `name`, a file name, is one a program can be named by: without `*`, `?`, `"`, `<`, `>`, `|` and without white
+/// space. The characters Win32 reads another way, the colon, the ending `.` or space and the 8.3 short name among them,
+/// are refused for every segment of the path ([`plain_segment`]).
+fn program_file_name(name: &str) -> bool {
+    !name.contains(BANNED_NAME_CHARS) && !name.chars().any(char::is_whitespace)
+}
+
+/// Whether `name` holds a `~` followed by an ASCII digit: an 8.3 short name like `TOOLNA~1`, which names another file
+/// of the same folder.
+fn names_a_short_name(name: &str) -> bool {
+    name.as_bytes()
+        .windows(2)
+        .any(|pair| matches!(pair, [b'~', digit] if digit.is_ascii_digit()))
 }
 
 /// The byte indexes in `word` where a drive path starts: an ASCII letter, `:` and `\` or `/`, not preceded by a

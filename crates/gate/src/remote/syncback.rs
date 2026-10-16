@@ -3645,6 +3645,7 @@ mod tests {
             pattern: "*".to_owned(),
             words: Vec::new(),
             fallback: Vec::new(),
+            program_named: false,
             outputs: Vec::new(),
             inputs: Vec::new(),
             dropped_no_build: false,
