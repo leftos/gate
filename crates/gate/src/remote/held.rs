@@ -176,6 +176,17 @@ impl Held {
     }
 }
 
+#[cfg(all(test, feature = "test-seams"))]
+impl Held {
+    /// Gives the first held entry said as `name` the path `path`, as if its path had come to name another folder while
+    /// it was held, which no local construction can do ([`Held::recheck`] then refuses it as moved); whether one was
+    /// found.
+    pub(super) fn misplace(&mut self, name: &str, path: &str) -> bool {
+        let found = self.entries.iter_mut().find(|entry| entry.name == name);
+        found.map(|entry| path.clone_into(&mut entry.path)).is_some()
+    }
+}
+
 /// The root's parent, opened by the lexical parent of `root` following links, held without delete sharing: on a local
 /// volume, no reparse point, and its final path that parent. Any failure is said as the root's, named `leaf`.
 fn held_parent(root: &str, leaf: &str) -> Result<Entry, NotHeld> {

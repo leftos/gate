@@ -99,6 +99,14 @@ pub(crate) fn above_zero_u32(option: &str, value: &str) -> Result<u32, Problem> 
     })
 }
 
+/// The changes `--test-remote-tamper` may name, each its point and its step.
+#[cfg(feature = "test-seams")]
+pub(crate) const TAMPERS: &[&str] = &[
+    "before-hold:case",
+    "before-hold:replace",
+    "before-hold:replace-root",
+    "after-first-snapshot:worktree",
+];
 /// The calls `--test-remote-interrupt-at` may name.
 #[cfg(feature = "test-seams")]
 pub(crate) const INTERRUPTED_CALLS: &[&str] = &["preflight", "run", "outputs", "install", "sdks", "stop", "manifest", "apply"];

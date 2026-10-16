@@ -41,6 +41,7 @@ mod retry;
 pub(crate) mod siblings;
 mod snapshot;
 mod syncback;
+mod tamper;
 #[cfg_attr(
     not(test),
     expect(

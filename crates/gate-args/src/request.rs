@@ -212,6 +212,12 @@ pub struct TestSeams {
     pub remote_outputs_budget_bytes: Option<u64>,
     /// The most bytes of one remote call's output the remote client writes to the gate's log, in place of 256 MiB.
     pub remote_log_cap_bytes: Option<u64>,
+    /// A change the remote client makes to its own folders at one point of its run, as `<point>:<step>`: before it
+    /// holds the pair (`before-hold`), its first sibling's letter case changed (`case`), its first sibling replaced by a
+    /// new folder (`replace`) or its worktree root replaced by one (`replace-root`); or once the main repository's
+    /// snapshot is taken (`after-first-snapshot`), `core.worktree` written into its first sibling's git config, naming
+    /// the folder beside it whose name is the sibling's with `-canary` after it (`worktree`).
+    pub remote_tamper: Option<String>,
     /// Make this gate's own start unreadable both ways, so the run refuses before it writes anything.
     pub own_start_fails: bool,
     /// Count every live parent a slot marker names as one this gate runs inside the command of, so a marker naming the

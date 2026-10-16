@@ -1381,6 +1381,189 @@ fn a_pair_whose_sibling_shares_the_main_repository_stays_here() {
     assert_eq!(fallbacks(&events(&case)), ["client"]);
 }
 
+/// The folder beside the sibling `sibling` named as it is with `suffix` after its name, emptied of what an earlier run
+/// left there.
+fn beside_sibling(sibling: &Path, suffix: &str) -> PathBuf {
+    let name = sibling.file_name().expect("the sibling has a name").to_string_lossy();
+    let folder = sibling.with_file_name(format!("{name}{suffix}"));
+    if folder.exists() {
+        fs::remove_dir_all(&folder).expect("a folder left by an earlier run can be removed");
+    }
+    folder
+}
+
+/// Asserts the command `out ran here` ran here, as the case's `out.log` shows: the attempt's lines, the pushes'
+/// progress among them, come after the command's output, so the log's 20-line tail on stdout may not reach it.
+fn assert_ran_here(case: &Case) {
+    let log = fs::read_to_string(case.folder().join("out.log")).expect("the log was written");
+    assert!(log.lines().any(|line| line == "ran here"), "the command ran here: {log}");
+}
+
+/// The files of the commit `commit` in the builder's bare repository of the sibling `name`.
+fn sibling_builder_files(case: &Case, name: &str, commit: &str) -> Vec<String> {
+    let bare = shown(&case.folder().join("builder").join(format!("{}.git", repo_name(name))));
+    let listed = git_out(case, &[], &["--git-dir", &bare, "ls-tree", "-r", "--name-only", commit]);
+    listed.lines().map(str::to_owned).collect()
+}
+
+/// `core.worktree` written into a sibling's git config once the main repository's snapshot is taken, after the check
+/// of where git finds it (`--test-remote-tamper after-first-snapshot:worktree`), moves none of the client's git calls:
+/// the sibling's snapshot is of its own folder, so the canary folder's file is not pushed, and the check after its
+/// save keeps the run here naming it, with no run call.
+#[test]
+fn a_sibling_whose_config_names_another_work_tree_after_its_check_pushes_none_of_it() {
+    let (case, _, name, sibling) = pair_case("client-pair-worktree-later", sibling_repository);
+    let canary = beside_sibling(&sibling, "-canary");
+    fs::create_dir_all(&canary).expect("the canary folder can be made");
+    fs::write(canary.join("canary.txt"), "canary\n").expect("the canary's file can be written");
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+    let tuned = Tuned {
+        extra: &["--test-remote-tamper", "after-first-snapshot:worktree"],
+        ..Tuned::default()
+    };
+
+    let outcome = finish(client_gate_tuned(&case, "out.log", &steps, &tuned, &[r".\tool.exe", "out", "ran here"]));
+    let events = events(&case);
+    let pushed = sibling_builder_ref(&case, &name, &format!("refs/gate/{}", key_of(&events)));
+    let files = if pushed.is_empty() {
+        Vec::new()
+    } else {
+        sibling_builder_files(&case, &name, &pushed)
+    };
+    fs::remove_dir_all(&sibling).expect("the sibling can be removed");
+    fs::remove_dir_all(&canary).expect("the canary folder can be removed");
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_ran_here(&case);
+    let line = format!("gate: not routed: sibling {name} changed its git location while it was held");
+    assert!(outcome.stderr.lines().any(|said| said == line), "{line}: {outcome:?}");
+    assert_eq!(calls(&steps), ["preflight"], "no run call");
+    assert_eq!(fallbacks(&events), ["client"]);
+    assert!(files.iter().any(|file| file == "lib.txt"), "the sibling's own file was pushed: {files:?}");
+    assert!(
+        !files.iter().any(|file| file == "canary.txt"),
+        "the canary's file was not pushed: {files:?}"
+    );
+}
+
+/// Writes a `reference-transaction` hook into the folder `hooks` that appends a line to the file `marker`.
+fn marking_hook(hooks: &Path, marker: &Path) {
+    fs::create_dir_all(hooks).expect("the hooks folder can be made");
+    let marker = marker.to_string_lossy().replace('\\', "/");
+    fs::write(hooks.join("reference-transaction"), format!("#!/bin/sh\necho ran >> '{marker}'\n")).expect("the hook can be written");
+}
+
+/// No hook of a pair's repository runs from the client's git calls: the main repository's `reference-transaction`
+/// hook in its own hooks folder, and the sibling's in a folder its `core.hooksPath` names, each appending to a marker
+/// file, leave no marker after a pair run that went remote and saved both repositories' refs.
+#[test]
+fn no_hook_of_a_pair_s_repositories_runs_from_the_client_s_git_calls() {
+    let (case, _, _, sibling) = pair_case("client-pair-hooks", sibling_repository);
+    let markers = beside_sibling(&sibling, "-markers");
+    let hooks = beside_sibling(&sibling, "-hooks");
+    let (main_marker, sibling_marker) = (markers.join("main"), markers.join("sibling"));
+    marking_hook(&case.folder().join(".git").join("hooks"), &main_marker);
+    marking_hook(&hooks, &sibling_marker);
+    git_out(&case, &[], &["-C", &shown(&sibling), "config", "core.hooksPath", &shown(&hooks)]);
+    fs::create_dir_all(&markers).expect("the markers' folder can be made");
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "out", "ran there"]));
+    let saved = git_out(&case, &[], &["-C", &shown(&sibling), "for-each-ref", "refs/gate-remote/"]);
+    let marked = [main_marker.exists(), sibling_marker.exists()];
+    fs::remove_dir_all(&sibling).expect("the sibling can be removed");
+    fs::remove_dir_all(&markers).expect("the markers' folder can be removed");
+    fs::remove_dir_all(&hooks).expect("the hooks folder can be removed");
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "run"], "{outcome:?}");
+    assert_ne!(saved, "", "the sibling's ref was saved, a ref update its hook would see");
+    assert_eq!(marked, [false, false], "no hook ran, the main one's then the sibling's: {outcome:?}");
+}
+
+/// A sibling whose ref cannot be saved after its push, its `refs/gate-remote` a file, keeps the run here naming it,
+/// with no run call.
+#[test]
+fn a_sibling_whose_save_fails_stays_here_naming_it() {
+    let (case, _, name, sibling) = pair_case("client-pair-save-fails", |case, sibling| {
+        sibling_repository(case, sibling);
+        fs::write(sibling.join(".git").join("refs").join("gate-remote"), "").expect("the refs folder's place can be taken");
+    });
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "out", "ran here"]));
+    fs::remove_dir_all(&sibling).expect("the sibling can be removed");
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_ran_here(&case);
+    let start = format!("gate: not routed: sibling {name} cannot be sent: ");
+    assert!(outcome.stderr.lines().any(|said| said.starts_with(&start)), "{start}: {outcome:?}");
+    assert_eq!(calls(&steps), ["preflight"], "no run call");
+    assert_eq!(fallbacks(&events(&case)), ["client"]);
+}
+
+/// A pair whose main repository and sibling are each a .NET tree with no pin, so each needs this PC's newest major,
+/// run with this PC's `PATH` `path`: the run falls back `parity`, the sibling's mismatch line naming 999, the major
+/// this PC's stub lists. Its outcome.
+fn a_pair_needing_the_pcs_major(case: &Case, sibling: &Path, name: &str, path: &OsString) -> Outcome {
+    write(case, "src/App/App.csproj", "<Project />\n");
+    fs::create_dir_all(sibling.join("src")).expect("the sibling's src folder can be made");
+    fs::write(sibling.join("src").join("Lib.csproj"), "<Project />\n").expect("the sibling's project can be written");
+    let steps = ssh_steps(case, "ssh", &["ok", "ok"]);
+    let mut gate = client_gate(case, "out.log", &steps, &[r".\tool.exe", "out", "ran here"]);
+    gate.env("PATH", path);
+
+    let (pid, outcome) = finish_with_pid(gate);
+
+    assert_eq!(outcome.code, Some(0), "the run here passed: {outcome:?}");
+    assert_eq!(fallbacks(&own(case, pid)), ["parity"], "{outcome:?}");
+    let mismatch = format!(
+        "gate: remote toolchain mismatch: {} needs a .NET 999 SDK; builder has {BUILDER_SDK}",
+        repo_name(name)
+    );
+    assert!(outcome.stderr.lines().any(|said| said == mismatch), "{mismatch}: {outcome:?}");
+    assert_eq!(calls(&steps), ["preflight"], "the preflight alone reached the builder");
+    outcome
+}
+
+/// This PC's SDK list is read once per run however many of a pair's repositories need its major: the stub that lists
+/// it notes each run.
+#[test]
+fn a_pair_reads_the_pcs_sdk_list_once() {
+    let (case, _, name, sibling) = pair_case("client-pair-sdks-once", sibling_repository);
+    let marker = case.folder().join("ssh").join("pc-dotnet-ran");
+    let pc = format!(">>\"{}\" echo ran\r\necho 999.0.100 [C:\\stub]\r\n", marker.display());
+    let dotnet = box_path_with_pc_dotnet(&case, &[BUILDER_SDK], &pc);
+
+    a_pair_needing_the_pcs_major(&case, &sibling, &name, &dotnet.path);
+    let ran = fs::read_to_string(&marker).expect("this PC's dotnet ran");
+    fs::remove_dir_all(&sibling).expect("the sibling can be removed");
+
+    assert_eq!(ran.lines().count(), 1, "this PC's SDK list was read once: {ran:?}");
+}
+
+/// A folder inside a pair's sibling that `PATH` names before this PC's dotnet is skipped for this PC's SDK list, as one
+/// inside the main worktree is: the `dotnet.cmd` there, which lists the builder's SDK and notes each run, never runs.
+#[test]
+fn a_path_folder_inside_a_sibling_is_not_run_for_the_sdk_list() {
+    let (case, _, name, sibling) = pair_case("client-pair-path-in-sibling", sibling_repository);
+    let inside = sibling.join("bin");
+    fs::create_dir_all(&inside).expect("the folder inside the sibling can be made");
+    let marker = case.folder().join("ssh").join("sibling-dotnet-ran");
+    let decoy = format!("@echo off\r\n>>\"{}\" echo ran\r\n{}", marker.display(), listing(&[BUILDER_SDK]));
+    fs::write(inside.join("dotnet.cmd"), decoy).expect("the dotnet inside the sibling can be written");
+    let dotnet = box_path_with_pc_dotnet(&case, &[BUILDER_SDK], "echo 999.0.100 [C:\\stub]\r\n");
+    let mut folders: Vec<PathBuf> = std::env::split_paths(&dotnet.path).collect();
+    folders.insert(1, inside);
+    let path = std::env::join_paths(folders).expect("the folders join into a PATH");
+
+    a_pair_needing_the_pcs_major(&case, &sibling, &name, &path);
+    let ran = marker.exists();
+    fs::remove_dir_all(&sibling).expect("the sibling can be removed");
+
+    assert!(!ran, "the dotnet.cmd inside the sibling ran");
+}
+
 #[test]
 fn a_builder_gate_of_the_same_version_without_this_build_falls_back_version() {
     let case = client_case("client-version-no-build");

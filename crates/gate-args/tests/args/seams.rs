@@ -579,6 +579,39 @@ fn the_log_cap_seam_takes_a_whole_number_of_bytes_above_0_once() {
 
 #[cfg(feature = "test-seams")]
 #[test]
+fn the_tamper_seam_names_one_point_and_step_and_needs_the_transport() {
+    use crate::support::run_request;
+
+    const FLAG: &str = "--test-remote-tamper";
+    for tamper in [
+        "before-hold:case",
+        "before-hold:replace",
+        "before-hold:replace-root",
+        "after-first-snapshot:worktree",
+    ] {
+        let words = with(&RUN, &["--test-remote-transport", "local:b", FLAG, tamper, "--", "cmd"]);
+        assert_eq!(run_request(&refs(&words)).test_seams.remote_tamper.as_deref(), Some(tamper));
+    }
+    assert_eq!(
+        problems(&refs(&with(
+            &RUN,
+            &["--test-remote-transport", "local:b", FLAG, "after-first-snapshot:case", "--", "cmd"]
+        ))),
+        [format!(
+            "gate: {FLAG} must be before-hold:case, before-hold:replace, before-hold:replace-root or \
+             after-first-snapshot:worktree, got 'after-first-snapshot:case'"
+        )]
+    );
+    assert_eq!(
+        problems(&refs(&with(&RUN, &[FLAG, "before-hold:case", "--", "cmd"]))),
+        [format!("gate: {FLAG} needs --test-remote-transport")]
+    );
+    let none = run_request(&refs(&with(&RUN, &["--", "cmd"]))).test_seams;
+    assert_eq!(none.remote_tamper, None, "none unless given");
+}
+
+#[cfg(feature = "test-seams")]
+#[test]
 fn the_apply_cap_seam_takes_a_whole_number_of_bytes_above_0_once() {
     use crate::support::run_request;
 
