@@ -3,8 +3,9 @@
 //! `--test-heartbeat-ms <n>`, `--test-box-console fail-before`, `--test-box-token refused`, `--test-box-park-launch <path>`,
 //! `--test-outputs-budget-bytes <n>`, `--test-inputs-budget-bytes <n>`, `--test-dotnet-limit-ms <n>`,
 //! `--test-box-sample-ms <n>`, `--test-box-sampler-fail true|false`, `--test-box-free-percent <1-100>`,
-//! `--test-box-kill-leaves <n>` and `--test-probe-limit-ms <n>` (each also as `--<seam>=<value>`) before the verb;
-//! without the feature each is no verb, and so the box usage.
+//! `--test-box-kill-leaves <n>`, `--test-probe-limit-ms <n>`, `--test-box-desktop <fault>`,
+//! `--test-box-desktop-session <state>`, `--test-box-desktop-mutex <name>` and `--test-box-desktop-ms <n>` (each also as
+//! `--<seam>=<value>`) before the verb; without the feature each is no verb, and so the box usage.
 
 use std::ffi::{OsStr, OsString};
 use std::iter::Peekable;
@@ -74,6 +75,14 @@ enum Seam {
     KillLeaves,
     /// `--test-probe-limit-ms <n>`: how long the preflight's tool probes may take together.
     ProbeLimitMs,
+    /// `--test-box-desktop <fault>`: the fault a desktop run takes, in place of the real task start and helper.
+    Desktop,
+    /// `--test-box-desktop-session <state>`: the state a desktop run finds the console's session in.
+    DesktopSession,
+    /// `--test-box-desktop-mutex <name>`: the unique part of the private namespace and mutex a desktop run takes.
+    DesktopMutex,
+    /// `--test-box-desktop-ms <n>`: how long a desktop run's waits may take, in milliseconds.
+    DesktopMs,
 }
 
 #[cfg(feature = "test-seams")]
@@ -94,6 +103,10 @@ impl Seam {
             "--test-box-free-percent" => Some(Seam::FreePercent),
             "--test-box-kill-leaves" => Some(Seam::KillLeaves),
             "--test-probe-limit-ms" => Some(Seam::ProbeLimitMs),
+            "--test-box-desktop" => Some(Seam::Desktop),
+            "--test-box-desktop-session" => Some(Seam::DesktopSession),
+            "--test-box-desktop-mutex" => Some(Seam::DesktopMutex),
+            "--test-box-desktop-ms" => Some(Seam::DesktopMs),
             _ => None,
         }
     }
@@ -113,6 +126,10 @@ impl Seam {
             Seam::FreePercent => "--test-box-free-percent",
             Seam::KillLeaves => "--test-box-kill-leaves",
             Seam::ProbeLimitMs => "--test-probe-limit-ms",
+            Seam::Desktop => "--test-box-desktop",
+            Seam::DesktopSession => "--test-box-desktop-session",
+            Seam::DesktopMutex => "--test-box-desktop-mutex",
+            Seam::DesktopMs => "--test-box-desktop-ms",
         }
     }
 }
@@ -145,11 +162,12 @@ fn seams(words: &mut Peekable<impl Iterator<Item = OsString>>, problems: &mut Ve
     seams
 }
 
-/// Sets `seam` from `value`: whole milliseconds above 0 for the heartbeat, the dotnet limit, the sample period and the
-/// probe limit, `fail-before` for the console, `refused` for the token, any path for the park, whole bytes above 0 for the
-/// outputs and the inputs budgets, `true` or `false` for the sampler's failure, a whole percent from 1 to 100 for the free share, a whole
-/// count above 0 for the processes a kill leaves. An empty or
-/// missing value is no value.
+/// Sets `seam` from `value`: whole milliseconds above 0 for the heartbeat, the dotnet limit, the sample period, the
+/// probe limit and the desktop waits, `fail-before` for the console, `refused` for the token, any path for the park,
+/// whole bytes above 0 for the outputs and the inputs budgets, `true` or `false` for the sampler's failure, a whole
+/// percent from 1 to 100 for the free share, a whole count above 0 for the processes a kill leaves, one of the desktop
+/// faults for the desktop, one of the session states for the desktop session and 1 to 64 letters, digits and `-` for the
+/// desktop mutex. An empty or missing value is no value.
 #[cfg(feature = "test-seams")]
 fn set_seam(seams: &mut BoxSeams, seam: Seam, value: Result<Option<String>, Problem>) -> Result<(), Problem> {
     let name = seam.name();
@@ -167,6 +185,10 @@ fn set_seam(seams: &mut BoxSeams, seam: Seam, value: Result<Option<String>, Prob
         Seam::FreePercent => seams.free_percent = Some(crate::values::in_range(name, &value, 1, 100)?),
         Seam::KillLeaves => seams.kill_leaves = Some(crate::values::above_zero(name, &value)?),
         Seam::ProbeLimitMs => seams.probe_limit_ms = Some(crate::values::above_zero(name, &value)?),
+        Seam::Desktop => seams.desktop = Some(crate::values::desktop_mode(name, &value)?),
+        Seam::DesktopSession => seams.desktop_session = Some(crate::values::desktop_session(name, &value)?),
+        Seam::DesktopMutex => seams.desktop_mutex = Some(crate::values::desktop_mutex(name, &value)?),
+        Seam::DesktopMs => seams.desktop_ms = Some(crate::values::above_zero(name, &value)?),
         Seam::Console => seams.fail_console = the_word(name, value, "fail-before", |option, value| Problem::BadConsoleFailure { option, value })?,
         Seam::Token => seams.refuse_token = the_word(name, value, "refused", |option, value| Problem::BadTokenRefusal { option, value })?,
         Seam::ParkLaunch => seams.park_launch = Some(std::path::PathBuf::from(value)),

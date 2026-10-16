@@ -3482,7 +3482,7 @@ enum Protocol {
     Adjusted(f64),
 }
 
-/// The start marker, the three refusal tags, the two kill tags and the adjusted line's prefix of one run, made once for
+/// The start marker, the four refusal tags, the two kill tags and the adjusted line's prefix of one run, made once for
 /// its run call's readers.
 struct ProtocolLines {
     started: String,
@@ -5579,6 +5579,11 @@ mod tests {
         assert_eq!(started_line(NONCE), format!("gate-remote-started: {NONCE}"));
         assert_eq!(refused_line(NONCE, Refusal::Busy), format!("gate-remote-refused: {NONCE} busy"));
         assert_eq!(refused_line(NONCE, Refusal::Tools), format!("gate-remote-refused: {NONCE} tools"));
+    }
+
+    #[test]
+    fn refused_line_names_desktop() {
+        assert_eq!(refused_line(NONCE, Refusal::Desktop), format!("gate-remote-refused: {NONCE} desktop"));
     }
 
     #[test]

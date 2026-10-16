@@ -2,6 +2,8 @@
 
 use crate::problem::{MAX_WHOLE_NUMBER, Problem};
 use crate::request::{Ceiling, Slot};
+#[cfg(feature = "test-seams")]
+use crate::request::{DESKTOP_MODES, DESKTOP_SESSIONS, DesktopMode, DesktopSession};
 
 /// How a value reads as a whole number.
 enum Whole {
@@ -125,6 +127,49 @@ pub(crate) fn remote_call(option: &str, value: &str, calls: &'static [&'static s
         value: value.to_owned(),
         calls,
     })
+}
+
+/// The fault `--test-box-desktop` names, one of [`DESKTOP_MODES`]; else the problem naming the value.
+#[cfg(feature = "test-seams")]
+pub(crate) fn desktop_mode(option: &str, value: &str) -> Result<DesktopMode, Problem> {
+    DESKTOP_MODES
+        .iter()
+        .find_map(|(word, mode)| (*word == value).then_some(*mode))
+        .ok_or_else(|| Problem::BadDesktopMode {
+            option: option.to_owned(),
+            value: value.to_owned(),
+        })
+}
+
+/// The state `--test-box-desktop-session` names, one of [`DESKTOP_SESSIONS`]; else the problem naming the value.
+#[cfg(feature = "test-seams")]
+pub(crate) fn desktop_session(option: &str, value: &str) -> Result<DesktopSession, Problem> {
+    DESKTOP_SESSIONS
+        .iter()
+        .find_map(|(word, state)| (*word == value).then_some(*state))
+        .ok_or_else(|| Problem::BadDesktopSession {
+            option: option.to_owned(),
+            value: value.to_owned(),
+        })
+}
+
+/// The longest unique part `--test-box-desktop-mutex` takes.
+#[cfg(feature = "test-seams")]
+pub(crate) const MAX_MUTEX_NAME: usize = 64;
+
+/// The unique part `--test-box-desktop-mutex` names: 1 to [`MAX_MUTEX_NAME`] ASCII letters, digits and `-`, the rule a
+/// private namespace's unique part is held to; else the problem naming the value.
+#[cfg(feature = "test-seams")]
+pub(crate) fn desktop_mutex(option: &str, value: &str) -> Result<String, Problem> {
+    let named = !value.is_empty() && value.len() <= MAX_MUTEX_NAME && value.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-');
+    if named {
+        Ok(value.to_owned())
+    } else {
+        Err(Problem::BadDesktopMutex {
+            option: option.to_owned(),
+            value: value.to_owned(),
+        })
+    }
 }
 
 pub(crate) fn slot(option: &str, value: &str) -> Result<Slot, Problem> {

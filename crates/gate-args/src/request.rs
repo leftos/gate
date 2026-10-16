@@ -85,7 +85,85 @@ pub struct BoxSeams {
     /// How long `gate box preflight`'s tool probes may take together, in milliseconds, in place of the built-in 10 s;
     /// `None` without the feature.
     pub probe_limit_ms: Option<u64>,
+    /// The fault `gate box run`'s desktop run takes, in place of the real task start and helper; `None` without the
+    /// feature.
+    pub desktop: Option<DesktopMode>,
+    /// The state `gate box run`'s desktop run finds the console's session in, in place of the read; `None` without the
+    /// feature.
+    pub desktop_session: Option<DesktopSession>,
+    /// The unique part of the private namespace and its mutex `gate box run`'s desktop run takes, in place of the
+    /// production one; `None` without the feature.
+    pub desktop_mutex: Option<String>,
+    /// How long `gate box run`'s desktop run's waits may take, in milliseconds, in place of the built-in limits; `None`
+    /// without the feature.
+    pub desktop_ms: Option<u64>,
 }
+
+/// A fault `--test-box-desktop` makes the box's desktop run take, in place of the real task start and helper.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DesktopMode {
+    /// No fault: the task starts and the real helper serves.
+    Ok,
+    /// The helper exits before it says Hello.
+    ExitBeforeHello,
+    /// The helper never answers Hello.
+    Hang,
+    /// The helper says another build's version.
+    WrongVersion,
+    /// The helper reports a process value that is not the child it made.
+    LieHandle,
+    /// The helper exits right after it created the child.
+    ExitAfterCreate,
+    /// The task is not registered.
+    TaskNotRegistered,
+    /// The task is set up wrong.
+    TaskSetUpWrong,
+    /// The task's start failed.
+    TaskFailed,
+    /// The task's start gave no process id.
+    TaskNoPid,
+}
+
+/// The state `--test-box-desktop-session` makes the box's desktop run find the console's session in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DesktopSession {
+    /// A user is logged on and the console is unlocked.
+    Active,
+    /// Nobody is logged on at the console.
+    NoUser,
+    /// A user is logged on and the console is locked.
+    Locked,
+    /// Another user holds the console.
+    OtherUser,
+    /// The console's session is disconnected.
+    Disconnected,
+}
+
+/// Every fault `--test-box-desktop` names, with the value it parses to, in the order a refusal line lists them.
+#[cfg(feature = "test-seams")]
+pub(crate) const DESKTOP_MODES: &[(&str, DesktopMode)] = &[
+    ("ok", DesktopMode::Ok),
+    ("exit-before-hello", DesktopMode::ExitBeforeHello),
+    ("hang", DesktopMode::Hang),
+    ("wrong-version", DesktopMode::WrongVersion),
+    ("lie-handle", DesktopMode::LieHandle),
+    ("exit-after-create", DesktopMode::ExitAfterCreate),
+    ("task-not-registered", DesktopMode::TaskNotRegistered),
+    ("task-set-up-wrong", DesktopMode::TaskSetUpWrong),
+    ("task-failed", DesktopMode::TaskFailed),
+    ("task-no-pid", DesktopMode::TaskNoPid),
+];
+
+/// Every state `--test-box-desktop-session` names, with the value it parses to, in the order a refusal line lists
+/// them.
+#[cfg(feature = "test-seams")]
+pub(crate) const DESKTOP_SESSIONS: &[(&str, DesktopSession)] = &[
+    ("active", DesktopSession::Active),
+    ("none", DesktopSession::NoUser),
+    ("locked", DesktopSession::Locked),
+    ("other-user", DesktopSession::OtherUser),
+    ("disconnected", DesktopSession::Disconnected),
+];
 
 /// What `gate box` was asked to do on the builder.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -2,6 +2,11 @@
 
 use std::fmt;
 
+#[cfg(feature = "test-seams")]
+use crate::request::{DESKTOP_MODES, DESKTOP_SESSIONS};
+#[cfg(feature = "test-seams")]
+use crate::values::MAX_MUTEX_NAME;
+
 /// The largest value a timeout, stall window, tail or test-seam value may take.
 pub const MAX_WHOLE_NUMBER: u64 = 2_147_483_647;
 
@@ -79,6 +84,24 @@ pub enum Problem {
         option: String,
         value: String,
     },
+    /// A `--test-box-desktop` value other than the faults it names.
+    #[cfg(feature = "test-seams")]
+    BadDesktopMode {
+        option: String,
+        value: String,
+    },
+    /// A `--test-box-desktop-session` value other than the states it names.
+    #[cfg(feature = "test-seams")]
+    BadDesktopSession {
+        option: String,
+        value: String,
+    },
+    /// A `--test-box-desktop-mutex` value that is not 1 to [`MAX_MUTEX_NAME`] ASCII letters, digits and `-`.
+    #[cfg(feature = "test-seams")]
+    BadDesktopMutex {
+        option: String,
+        value: String,
+    },
     NeedsValue(String),
     /// A bare `--timeout auto`, which carries no floor.
     AutoNeedsFloor(String),
@@ -119,7 +142,9 @@ impl fmt::Display for Problem {
             Problem::BadSlot { option, value } => write!(f, "gate: {option} must be heavy, light, critical or none, got '{value}'"),
             Problem::BadExpectSlot { option, value } => write!(f, "gate: {option} must be heavy, light or critical, got '{value}'"),
             #[cfg(feature = "test-seams")]
-            Problem::BadRemoteCall { option, value, calls } => write!(f, "gate: {option} must be {}, got '{value}'", one_of(calls)),
+            Problem::BadRemoteCall { option, value, calls } => {
+                write!(f, "gate: {option} must be {}, got '{value}'", one_of(calls.iter().copied()))
+            }
             Problem::NotAboveZero { option, value } => write!(f, "gate: {option} must be a whole number above 0, got '{value}'"),
             Problem::NotZeroOrAbove { option, value } => write!(f, "gate: {option} must be a whole number 0 or above, got '{value}'"),
             Problem::TooLarge { option, value } => write!(f, "gate: {option} must be at most {MAX_WHOLE_NUMBER}, got '{value}'"),
@@ -129,6 +154,29 @@ impl fmt::Display for Problem {
             Problem::NotTrueOrFalse { option, value } => write!(f, "gate: {option} takes true or false, got '{value}'"),
             Problem::BadConsoleFailure { option, value } => write!(f, "gate: {option} must be fail-before, got '{value}'"),
             Problem::BadTokenRefusal { option, value } => write!(f, "gate: {option} must be refused, got '{value}'"),
+            #[cfg(feature = "test-seams")]
+            Problem::BadDesktopMode { option, value } => {
+                write!(
+                    f,
+                    "gate: {option} must be {}, got '{value}'",
+                    one_of(DESKTOP_MODES.iter().map(|(word, _)| *word))
+                )
+            }
+            #[cfg(feature = "test-seams")]
+            Problem::BadDesktopSession { option, value } => {
+                write!(
+                    f,
+                    "gate: {option} must be {}, got '{value}'",
+                    one_of(DESKTOP_SESSIONS.iter().map(|(word, _)| *word))
+                )
+            }
+            #[cfg(feature = "test-seams")]
+            Problem::BadDesktopMutex { option, value } => {
+                write!(
+                    f,
+                    "gate: {option} must be 1 to {MAX_MUTEX_NAME} ASCII letters, digits and '-', got '{value}'"
+                )
+            }
             Problem::NeedsValue(option) => write!(f, "gate: {option} needs a value"),
             Problem::AutoNeedsFloor(option) => write!(f, "gate: {option} auto needs a floor in seconds: auto:<n>"),
             Problem::GivenTwice(option) => write!(f, "gate: {option} is given twice"),
@@ -150,10 +198,11 @@ impl fmt::Display for Problem {
     }
 }
 
-/// The calls a seam may name, as a choice: `a or b`, `a, b or c`.
+/// The choices a seam may name, as a choice: `a or b`, `a, b or c`.
 #[cfg(feature = "test-seams")]
-fn one_of(calls: &[&str]) -> String {
-    match calls.split_last() {
+fn one_of<'a>(choices: impl IntoIterator<Item = &'a str>) -> String {
+    let choices: Vec<&str> = choices.into_iter().collect();
+    match choices.split_last() {
         Some((last, [])) => (*last).to_owned(),
         Some((last, rest)) => format!("{} or {last}", rest.join(", ")),
         None => String::new(),

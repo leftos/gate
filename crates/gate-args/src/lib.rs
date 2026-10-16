@@ -30,7 +30,7 @@ pub use problem::{MAX_WHOLE_NUMBER, Problem, Required, Spelling};
 pub use program::{ProgramSearch, resolve_program};
 pub use request::{
     BoxRequest, BoxSeams, BoxVerb, BurnRequest, Ceiling, CheckRequest, CheckSeams, CutoverRequest, CutoverSeams, DEFAULT_STALL_SECONDS,
-    DEFAULT_TAIL_LINES, ExpectRequest, Invocation, PushRequest, PushSeams, RunRequest, Slot, StopRequest, TestSeams,
+    DEFAULT_TAIL_LINES, DesktopMode, DesktopSession, ExpectRequest, Invocation, PushRequest, PushSeams, RunRequest, Slot, StopRequest, TestSeams,
 };
 pub use usage::USAGE;
 

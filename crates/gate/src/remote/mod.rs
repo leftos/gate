@@ -80,6 +80,10 @@ pub(crate) enum Refusal {
     Layout,
     /// The work folder does not hold the inputs the run's `InputsDigest` names.
     Inputs,
+    /// The run asked for the builder's desktop and could not have it: nobody is logged on at the console or it is
+    /// locked, another user holds it, or another run held the desktop for the whole wait the run gave.
+    #[cfg_attr(not(all(test, feature = "test-seams")), expect(dead_code, reason = "nothing outside tests reads it"))]
+    Desktop,
 }
 
 impl Refusal {
@@ -90,6 +94,7 @@ impl Refusal {
             Refusal::Tools => "tools",
             Refusal::Layout => "layout",
             Refusal::Inputs => "inputs",
+            Refusal::Desktop => "desktop",
         }
     }
 }
@@ -111,7 +116,8 @@ pub(crate) fn started_line(nonce: &str) -> String {
 }
 
 /// The refusal tag the box says on stderr just before the human line of a refusal of the run whose payload carries
-/// `nonce`: `gate-remote-refused: <nonce> busy|tools|layout`. The client reads a refusal from this line alone.
+/// `nonce`: `gate-remote-refused: <nonce> busy|tools|layout|inputs|desktop`. The client reads a refusal from this line
+/// alone.
 ///
 /// The nonce is no secret, as [`started_line`] says: a command can say this line too, and the client ignores it
 /// because the box's start marker came before anything the command says.

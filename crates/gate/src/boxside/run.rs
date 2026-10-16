@@ -116,6 +116,14 @@ pub(super) struct Request<'a> {
     pub(super) nonce: &'a str,
     /// The run's ceiling in whole seconds of load-adjusted time, `None` for a run the box gives none.
     timeout: Option<u64>,
+    /// Whether the run asks for the builder's desktop, its `Desktop` key; a run without one runs on the box's own
+    /// session.
+    #[cfg_attr(not(test), expect(dead_code, reason = "nothing outside tests reads it"))]
+    desktop: bool,
+    /// How long the run may wait for the builder's desktop, in whole seconds; `None` on a run that does not ask for
+    /// one, whatever its `DesktopWait` said.
+    #[cfg_attr(not(test), expect(dead_code, reason = "nothing outside tests reads it"))]
+    desktop_wait: Option<u64>,
     /// The PC's name for the builder, which the box's kill line names, empty when the payload gives none.
     host: &'a str,
     /// The digest of the inputs manifest the client installed the run's inputs from, `None` when it sent none.
@@ -131,6 +139,14 @@ impl Request<'_> {
         let nonce = payload.nonce()?;
         let outputs = Asked::new(&globs, full, key, nonce, payload.output_folder(work)?)?;
         let (timeout, host) = (payload.timeout()?, payload.optional_text("Host")?);
+        // A run of the builder's desktop has to say how long it may wait for one; a wait no run asks for is ignored,
+        // whatever it says.
+        let desktop = payload.desktop()?;
+        let desktop_wait = if desktop {
+            Some(payload.desktop_wait()?.ok_or_else(|| "gate: box payload lacks DesktopWait".to_owned())?)
+        } else {
+            None
+        };
         let bare = payload.path("Bare")?;
         let lock = payload.beside_work("Lock", work, "lock")?;
         let index = payload.beside_work("Index", work, "index")?;
@@ -155,6 +171,8 @@ impl Request<'_> {
             outputs,
             nonce,
             timeout,
+            desktop,
+            desktop_wait,
             host,
             inputs_digest,
         })
@@ -2087,7 +2105,11 @@ impl BackGit<'_> {
 mod tests {
     use std::io;
 
-    use super::{CLOSED_STATUS, GIT_CONFIG_COUNT, Look, STARTING_COMMAND, before_the_job, client_gone, look, with_safe_directory};
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD;
+    use serde_json::json;
+
+    use super::{CLOSED_STATUS, GIT_CONFIG_COUNT, Look, Payload, Request, STARTING_COMMAND, before_the_job, client_gone, look, with_safe_directory};
     use crate::console::Console;
     use crate::environment::Variables;
 
@@ -2194,5 +2216,52 @@ mod tests {
         let seen = look(|| Err(io::Error::other("the wait failed")), JOB, STARTING_COMMAND);
         assert_eq!(before_the_job(seen, JOB, &mut console), Ok(()));
         assert_eq!(console.take_notes(), [unread()]);
+    }
+
+    /// A payload of a run of one repo as `gate box run` reads it, with the object `desktop`'s keys, `Desktop` and
+    /// `DesktopWait`, merged in; every other key is the least `Request::read` accepts.
+    #[expect(clippy::expect_used, reason = "a payload the box cannot decode must fail the case loudly")]
+    fn run_payload(desktop: &serde_json::Value) -> Payload {
+        let mut json = json!({
+            "Snapshot": "0123456789abcdef0123456789abcdef01234567",
+            "Key": "app-1a2b3c4d",
+            "Work": r"C:\gate-remote\work\app-1a2b3c4d",
+            "OutputFolder": r"C:\gate-remote\outputs",
+            "Bare": r"C:\gate-remote\app.git",
+            "Lock": r"C:\gate-remote\work\app-1a2b3c4d.lock",
+            "Index": r"C:\gate-remote\work\app-1a2b3c4d.index",
+            "Job": r"Local\gate-remote-app-1a2b3c4d-0123456789ab",
+            "Nonce": "0123456789abcdef0123456789abcdef",
+            "Command": ["cmd"],
+        });
+        if let Some(keys) = desktop.as_object() {
+            for (key, value) in keys {
+                json[key] = value.clone();
+            }
+        }
+        Payload::decode(&STANDARD.encode(json.to_string())).expect("the payload decodes")
+    }
+
+    #[test]
+    #[expect(clippy::expect_used, reason = "a payload the box cannot read must fail the case loudly")]
+    fn desktop_true_without_a_wait_is_refused() {
+        let asking = run_payload(&json!({ "Desktop": true }));
+        assert_eq!(Request::read(&asking).err(), Some("gate: box payload lacks DesktopWait".to_owned()));
+
+        let not_a_bool = run_payload(&json!({ "Desktop": "yes" }));
+        assert_eq!(
+            Request::read(&not_a_bool).err(),
+            Some("gate: box payload Desktop is not true or false".to_owned())
+        );
+
+        let waited = run_payload(&json!({ "Desktop": true, "DesktopWait": 30 }));
+        let request = Request::read(&waited).expect("a run of the builder's desktop is read");
+        assert!(request.desktop, "the payload asks for the builder's desktop");
+        assert_eq!(request.desktop_wait, Some(30), "the whole seconds it gives");
+
+        let ignored = run_payload(&json!({ "DesktopWait": "30" }));
+        let request = Request::read(&ignored).expect("a run that asks for no desktop is read");
+        assert!(!request.desktop, "the payload asks for no desktop");
+        assert_eq!(request.desktop_wait, None, "a wait no run asks for is ignored");
     }
 }

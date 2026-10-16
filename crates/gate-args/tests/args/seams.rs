@@ -1479,6 +1479,232 @@ fn box_seam_token_is_an_unknown_word_without_the_feature() {
     assert_eq!(problems(&["box", "--test-box-token=refused", "run", "--stdin"]), [BOX_USAGE]);
 }
 
+/// Checks the mutex seam takes a name of exactly the most it allows, `longest` being one of that many characters.
+#[cfg(feature = "test-seams")]
+fn desktop_mutex_takes_the_longest_name(longest: &str) {
+    use gate_args::{BoxRequest, BoxSeams, BoxVerb, Invocation};
+
+    use crate::support::invocation;
+
+    assert_eq!(
+        invocation(&["box", "--test-box-desktop-mutex", longest, "run", "--stdin"]),
+        Invocation::Box(BoxRequest {
+            verb: BoxVerb::Run,
+            seams: BoxSeams {
+                desktop_mutex: Some(longest.to_owned()),
+                ..BoxSeams::default()
+            },
+        }),
+        "a name of the most the seam takes"
+    );
+}
+
+/// Checks a bad value of each of the box's desktop seams against the line it takes, `too_long` being a mutex name
+/// longer than the seam takes.
+#[cfg(feature = "test-seams")]
+fn desktop_seam_refusals_hold(too_long: &str) {
+    // The faults and the states a refusal line lists, as the seams' own words give them.
+    let modes = "ok, exit-before-hello, hang, wrong-version, lie-handle, exit-after-create, task-not-registered, \
+                 task-set-up-wrong, task-failed or task-no-pid";
+    let sessions = "active, none, locked, other-user or disconnected";
+    let mutex = "1 to 64 ASCII letters, digits and '-'";
+    let refused = |words: &[&str], want: String| assert_eq!(problems(words), [want], "{words:?}");
+    refused(
+        &["box", "--test-box-desktop", "restart", "run", "--stdin"],
+        format!("gate: --test-box-desktop must be {modes}, got 'restart'"),
+    );
+    refused(
+        &["box", "--test-box-desktop", "OK", "run", "--stdin"],
+        format!("gate: --test-box-desktop must be {modes}, got 'OK'"),
+    );
+    refused(
+        &["box", "--test-box-desktop-session", "signed-in", "run", "--stdin"],
+        format!("gate: --test-box-desktop-session must be {sessions}, got 'signed-in'"),
+    );
+    refused(
+        &["box", "--test-box-desktop-session", "Active", "run", "--stdin"],
+        format!("gate: --test-box-desktop-session must be {sessions}, got 'Active'"),
+    );
+    for bad in ["a b", "a_b", too_long] {
+        refused(
+            &["box", "--test-box-desktop-mutex", bad, "run", "--stdin"],
+            format!("gate: --test-box-desktop-mutex must be {mutex}, got '{bad}'"),
+        );
+    }
+    for bad in ["0", "fast"] {
+        refused(
+            &["box", "--test-box-desktop-ms", bad, "run", "--stdin"],
+            format!("gate: --test-box-desktop-ms must be a whole number above 0, got '{bad}'"),
+        );
+    }
+    refused(
+        &["box", "--test-box-desktop=", "run", "--stdin"],
+        "gate: --test-box-desktop needs a value".to_owned(),
+    );
+}
+
+/// The box's desktop seams: the fault its desktop run takes, the state it finds the console's session in, the unique
+/// part of the private namespace and mutex it takes, and how long its waits may take.
+#[cfg(feature = "test-seams")]
+#[test]
+fn the_desktop_seams_parse_and_refuse_bad_values() {
+    use gate_args::{BoxRequest, BoxSeams, BoxVerb, DesktopMode, DesktopSession, Invocation};
+
+    use crate::support::invocation;
+
+    let run = |seams: BoxSeams| Invocation::Box(BoxRequest { verb: BoxVerb::Run, seams });
+    let taking = |desktop| {
+        run(BoxSeams {
+            desktop: Some(desktop),
+            ..BoxSeams::default()
+        })
+    };
+    for (word, desktop) in [
+        ("ok", DesktopMode::Ok),
+        ("exit-before-hello", DesktopMode::ExitBeforeHello),
+        ("hang", DesktopMode::Hang),
+        ("wrong-version", DesktopMode::WrongVersion),
+        ("lie-handle", DesktopMode::LieHandle),
+        ("exit-after-create", DesktopMode::ExitAfterCreate),
+        ("task-not-registered", DesktopMode::TaskNotRegistered),
+        ("task-set-up-wrong", DesktopMode::TaskSetUpWrong),
+        ("task-failed", DesktopMode::TaskFailed),
+        ("task-no-pid", DesktopMode::TaskNoPid),
+    ] {
+        assert_eq!(
+            invocation(&["box", "--test-box-desktop", word, "run", "--stdin"]),
+            taking(desktop),
+            "{word}"
+        );
+        let joined = format!("--test-box-desktop={word}");
+        assert_eq!(invocation(&["box", joined.as_str(), "run", "--stdin"]), taking(desktop), "{joined}");
+    }
+    for (word, session) in [
+        ("active", DesktopSession::Active),
+        ("none", DesktopSession::NoUser),
+        ("locked", DesktopSession::Locked),
+        ("other-user", DesktopSession::OtherUser),
+        ("disconnected", DesktopSession::Disconnected),
+    ] {
+        let finding = run(BoxSeams {
+            desktop_session: Some(session),
+            ..BoxSeams::default()
+        });
+        assert_eq!(
+            invocation(&["box", "--test-box-desktop-session", word, "run", "--stdin"]),
+            finding,
+            "{word}"
+        );
+        let joined = format!("--test-box-desktop-session={word}");
+        assert_eq!(invocation(&["box", joined.as_str(), "run", "--stdin"]), finding, "{joined}");
+    }
+    assert_eq!(
+        invocation(&["box", "--test-box-desktop-mutex", "case-1-AB", "run", "--stdin"]),
+        run(BoxSeams {
+            desktop_mutex: Some("case-1-AB".to_owned()),
+            ..BoxSeams::default()
+        })
+    );
+    desktop_mutex_takes_the_longest_name(&"a".repeat(64));
+    assert_eq!(
+        invocation(&["box", "--test-box-desktop-ms", "250", "run", "--stdin"]),
+        run(BoxSeams {
+            desktop_ms: Some(250),
+            ..BoxSeams::default()
+        })
+    );
+    assert_eq!(
+        invocation(&[
+            "box",
+            "--test-box-desktop",
+            "task-no-pid",
+            "--test-box-desktop-session",
+            "none",
+            "--test-box-desktop-mutex",
+            "case-2",
+            "--test-box-desktop-ms",
+            "100",
+            "run",
+            "--stdin"
+        ]),
+        run(BoxSeams {
+            desktop: Some(DesktopMode::TaskNoPid),
+            desktop_session: Some(DesktopSession::NoUser),
+            desktop_mutex: Some("case-2".to_owned()),
+            desktop_ms: Some(100),
+            ..BoxSeams::default()
+        }),
+        "the desktop seams come with the others, in any order"
+    );
+
+    desktop_seam_refusals_hold(&"a".repeat(65));
+    assert_eq!(
+        problems(&["box", "--test-box-desktop", "--test-box-desktop-session", "active", "run", "--stdin"]),
+        ["gate: --test-box-desktop needs a value"],
+        "another seam in the value's place is no value"
+    );
+    assert_eq!(
+        problems(&["box", "run", "--test-box-desktop", "ok", "--stdin"]),
+        [BOX_USAGE],
+        "a desktop seam after the verb is no verb"
+    );
+}
+
+#[cfg(feature = "test-seams")]
+#[test]
+fn the_desktop_seams_are_each_given_once() {
+    let rows: [(&[&str], &[&str]); 4] = [
+        (
+            &["box", "--test-box-desktop", "ok", "--test-box-desktop=hang", "run", "--stdin"],
+            &["gate: --test-box-desktop is given twice"],
+        ),
+        (
+            &[
+                "box",
+                "--test-box-desktop-session",
+                "active",
+                "--test-box-desktop-session=locked",
+                "run",
+                "--stdin",
+            ],
+            &["gate: --test-box-desktop-session is given twice"],
+        ),
+        (
+            &[
+                "box",
+                "--test-box-desktop-mutex",
+                "case-1",
+                "--test-box-desktop-mutex=case-2",
+                "run",
+                "--stdin",
+            ],
+            &["gate: --test-box-desktop-mutex is given twice"],
+        ),
+        (
+            &["box", "--test-box-desktop-ms", "1", "--test-box-desktop-ms=2", "run", "--stdin"],
+            &["gate: --test-box-desktop-ms is given twice"],
+        ),
+    ];
+    for (words, want) in rows {
+        assert_eq!(problems(words), want, "{words:?}");
+    }
+}
+
+#[cfg(not(feature = "test-seams"))]
+#[test]
+fn the_desktop_seams_without_the_feature_are_no_verb() {
+    for (seam, value) in [
+        ("--test-box-desktop", "ok"),
+        ("--test-box-desktop-session", "active"),
+        ("--test-box-desktop-mutex", "case-1"),
+        ("--test-box-desktop-ms", "250"),
+    ] {
+        assert_eq!(problems(&["box", seam, value, "run", "--stdin"]), [BOX_USAGE], "{seam}");
+        let joined = format!("{seam}={value}");
+        assert_eq!(problems(&["box", joined.as_str(), "run", "--stdin"]), [BOX_USAGE], "{joined}");
+    }
+}
+
 #[cfg(feature = "test-seams")]
 #[test]
 fn the_job_breakaway_seam_parses_with_the_feature() {

@@ -134,6 +134,29 @@ impl Payload {
         }
     }
 
+    /// Whether the run asks for the builder's desktop, `Desktop`: true or false, false when the key is absent or null;
+    /// else the usage line saying it is not true or false.
+    pub(crate) fn desktop(&self) -> Result<bool, String> {
+        match self.0.get("Desktop") {
+            None | Some(Value::Null) => Ok(false),
+            Some(Value::Bool(desktop)) => Ok(*desktop),
+            Some(_) => Err("gate: box payload Desktop is not true or false".to_owned()),
+        }
+    }
+
+    /// The run's `DesktopWait`: whole seconds from 1 to 2147483647, how long the box may wait for the builder's
+    /// desktop; `None` when the key is absent or null. Else the usage line.
+    pub(crate) fn desktop_wait(&self) -> Result<Option<u64>, String> {
+        match self.0.get("DesktopWait") {
+            None | Some(Value::Null) => Ok(None),
+            Some(value) => value
+                .as_u64()
+                .filter(|seconds| (1..=MAX_WHOLE_NUMBER).contains(seconds))
+                .map(Some)
+                .ok_or_else(|| "gate: box payload DesktopWait is not a whole number of seconds".to_owned()),
+        }
+    }
+
     /// The run's `InputsDigest`, the SHA-256 of the inputs manifest line the client sent the work folder's inputs
     /// with: 64 lower-case hex digits; `None` when the key is absent or null. Else the usage line, the value shown with
     /// its control characters escaped.
@@ -746,6 +769,38 @@ mod tests {
     }
 
     const NONCE: &str = "0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn desktop_is_true_or_false_and_false_when_absent() {
+        let desktop = |json: serde_json::Value| decoded(&json.to_string()).and_then(|payload| payload.desktop());
+        assert_eq!(desktop(json!({})), Ok(false), "absent");
+        assert_eq!(desktop(json!({ "Desktop": null })), Ok(false), "null");
+        assert_eq!(desktop(json!({ "Desktop": true })), Ok(true));
+        assert_eq!(desktop(json!({ "Desktop": false })), Ok(false));
+        for bad in [json!("true"), json!(1), json!([true])] {
+            assert_eq!(
+                desktop(json!({ "Desktop": bad })),
+                Err("gate: box payload Desktop is not true or false".to_owned()),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn desktop_wait_is_whole_seconds_like_timeout() {
+        let wait = |json: serde_json::Value| decoded(&json.to_string()).and_then(|payload| payload.desktop_wait());
+        assert_eq!(wait(json!({})), Ok(None), "absent");
+        assert_eq!(wait(json!({ "DesktopWait": null })), Ok(None), "null");
+        assert_eq!(wait(json!({ "DesktopWait": 1 })), Ok(Some(1)), "a second");
+        assert_eq!(wait(json!({ "DesktopWait": 2_147_483_647 })), Ok(Some(2_147_483_647)), "the ceiling");
+        for bad in [json!(0), json!("30"), json!(1.5), json!([30]), json!(-1), json!(2_147_483_648u64)] {
+            assert_eq!(
+                wait(json!({ "DesktopWait": bad })),
+                Err("gate: box payload DesktopWait is not a whole number of seconds".to_owned()),
+                "{bad}"
+            );
+        }
+    }
 
     #[test]
     fn an_outputs_nonce_is_32_lower_case_hex_digits() {
