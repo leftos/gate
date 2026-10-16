@@ -11,9 +11,9 @@ doctest = false
 workspace = true
 
 [features]
-# The helper's two seams, `GATE_DESKTOP_TEST_LIMIT_MS`, which caps each of its waits, and
-# `GATE_DESKTOP_TEST_PIPE_OWNER=user`, which makes it take a control pipe its user owns in place of Administrators;
-# and gate-win32's own test seams. An installed helper is built without.
+# The helper's three seams: `GATE_DESKTOP_TEST_LIMIT_MS`, which caps each of its waits; `GATE_DESKTOP_TEST_PIPE_OWNER=user`,
+# which makes it take a control pipe its user owns in place of Administrators; and `GATE_DESKTOP_TEST_FAULT`, which picks
+# one step of its run to break. It also turns on gate-win32's own test seams. An installed helper is built without.
 test-seams = ["gate-win32/test-seams"]
 
 [dependencies]

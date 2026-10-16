@@ -11,12 +11,14 @@
 //! helper that one starts is left with no parent and only the job this process runs in still reaches it;
 //! `spawn-pid <path> <release> <program> [words]` starts the program with those words and this process's handles,
 //! writes its pid to the file at the path, whole, through a file beside it moved over it, prints `spawned <its pid>`,
-//! and goes on holding the program's handle until the file at the release path comes, so the program's parent outlives the case's own opening of it; `exit <n>`
-//! exits with status n, any 32-bit code, negative ones as Windows reads them back;
+//! and goes on holding the program's handle until the file at the release path comes, so the program's parent outlives
+//! the case's own opening of it; `exit <n>` exits with status n, any 32-bit code, negative ones as Windows reads them back;
 //! `env <name>` prints the variable's value, or `fake-tool: <name> is not set`, on its own line; `bytes <hex>` writes the
 //! bytes the hex digits spell to stdout as they are, with no line feed added; `lines <n> <text>` prints n lines on
-//! stdout, the i-th `<text><i>` counting from 1; `pid` prints `pid <its own pid>` on stdout; `mark <path>` adds the line
-//! `run` to the file at the path, creating it when missing, so a case can count how many times its command ran;
+//! stdout, the i-th `<text><i>` counting from 1; `pid` prints `pid <its own pid>` on stdout; `session` prints
+//! `session <its session id>`, `priority` prints `priority 0x<its priority class>` from `GetPriorityClass`, and
+//! `cwd` prints `cwd <its working folder>`, each on stdout; `mark <path>` adds the line `run` to the file at the path,
+//! creating it when missing, so a case can count how many times its command ran;
 //! `free-console` leaves this process's console, as a GUI program or one that detaches early does, its standard handles
 //! kept; `write <path> <text>` writes the text to the file at the path, replacing it, its folders made when missing;
 //! `fill <path> <bytes>` writes a file of that many `x` bytes at the path, its folders made when missing, through a
@@ -29,8 +31,8 @@
 //! `spawn-away <pid-path> <n> <stop-path>` starts `fake-tool spin <n> <stop-path>`, or, when n is 0, `fake-tool sleep
 //! 600000`, which never looks at the stop path and uses no CPU, outside this process's job
 //! (`CREATE_BREAKAWAY_FROM_JOB`, which the job must allow) with no standard handles, writes the line
-//! `<its pid> <its start>` to the file at the pid path, the start in 100 ns ticks since 1601, prints `spawned <its pid>` and goes on without
-//! waiting for it, so a case can stand it in for a packaged app the command's descendant starts;
+//! `<its pid> <its start>` to the file at the pid path, the start in 100 ns ticks since 1601, prints `spawned <its pid>`
+//! and goes on without waiting for it, so a case can stand it in for a packaged app the command's descendant starts;
 //! `token` prints what this process's token says of itself, one line each: `elevated` or `not-elevated`, its integrity
 //! level's relative ID as `integrity 0x<hex>`, `owner user` when the objects it creates are owned by its user, else
 //! `owner other`, and its default DACL as `dacl <sid>:0x<mask> …`, each entry's SID in its string form and the access
@@ -51,6 +53,9 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
+
+use windows_sys::Win32::System::RemoteDesktop::ProcessIdToSessionId;
+use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetCurrentProcessId, GetPriorityClass};
 
 /// How often `wait` looks for its path.
 const WAIT_STEP: Duration = Duration::from_millis(20);
@@ -116,11 +121,7 @@ fn run(args: &[OsString]) -> Result<i32, String> {
                 thread::sleep(Duration::from_millis(ms));
             }
             "wait" => {
-                let path = operand(&mut steps, "wait")?;
-                if !wait_for(&path)? {
-                    stdout.flush().map_err(|error| write_failed(&error))?;
-                    writeln!(io::stderr().lock(), "fake-tool: {path} did not appear within {} s", WAIT_LIMIT.as_secs())
-                        .map_err(|error| write_failed(&error))?;
+                if !wait_step(&mut steps, &mut stdout)? {
                     return Ok(1);
                 }
             }
@@ -168,6 +169,9 @@ fn run(args: &[OsString]) -> Result<i32, String> {
                 writeln!(stdout, "pid {}", std::process::id()).map_err(|error| write_failed(&error))?;
                 stdout.flush().map_err(|error| write_failed(&error))?;
             }
+            "session" => session(&mut stdout)?,
+            "priority" => priority(&mut stdout)?,
+            "cwd" => cwd(&mut stdout)?,
             "burn-threads" => burn_threads(&mut steps)?,
             "spin" => {
                 if !spin(&mut steps)? {
@@ -188,6 +192,18 @@ fn operand<'a>(steps: &mut impl Iterator<Item = &'a OsString>, step: &str) -> Re
         .next()
         .map(|word| word.to_string_lossy().into_owned())
         .ok_or_else(|| format!("{step} needs a value"))
+}
+
+/// The `wait <path>` step: whether the path came within [`WAIT_LIMIT`], saying on stderr when it did not, so the run
+/// ends 1.
+fn wait_step<'a>(steps: &mut impl Iterator<Item = &'a OsString>, stdout: &mut impl Write) -> Result<bool, String> {
+    let path = operand(steps, "wait")?;
+    if wait_for(&path)? {
+        return Ok(true);
+    }
+    stdout.flush().map_err(|error| write_failed(&error))?;
+    writeln!(io::stderr().lock(), "fake-tool: {path} did not appear within {} s", WAIT_LIMIT.as_secs()).map_err(|error| write_failed(&error))?;
+    Ok(false)
 }
 
 /// Sleeps until `path` exists, or gives up after [`WAIT_LIMIT`], so a helper no case lets go (one orphaned by a case
@@ -349,6 +365,35 @@ fn token(stdout: &mut impl Write) -> Result<(), String> {
         facts.integrity
     )
     .map_err(|error| write_failed(&error))
+}
+
+/// The `session <id>` step: the id of the session this process runs in, as `ProcessIdToSessionId` gives it.
+fn session(stdout: &mut impl Write) -> Result<(), String> {
+    let mut id = 0;
+    // SAFETY: the call writes one `u32` through the pointer, which is this call's own and writable throughout.
+    if unsafe { ProcessIdToSessionId(GetCurrentProcessId(), &raw mut id) } == 0 {
+        return Err(format!("cannot read this process's session: {}", io::Error::last_os_error()));
+    }
+    writeln!(stdout, "session {id}").map_err(|error| write_failed(&error))?;
+    stdout.flush().map_err(|error| write_failed(&error))
+}
+
+/// The `priority 0x<class>` step: this process's priority class, as `GetPriorityClass` gives it.
+fn priority(stdout: &mut impl Write) -> Result<(), String> {
+    // SAFETY: the call takes no arguments and returns this process's pseudo-handle, which is never closed.
+    let class = unsafe { GetPriorityClass(GetCurrentProcess()) };
+    if class == 0 {
+        return Err(format!("cannot read this process's priority class: {}", io::Error::last_os_error()));
+    }
+    writeln!(stdout, "priority 0x{class:x}").map_err(|error| write_failed(&error))?;
+    stdout.flush().map_err(|error| write_failed(&error))
+}
+
+/// The `cwd <path>` step: this process's working folder.
+fn cwd(stdout: &mut impl Write) -> Result<(), String> {
+    let folder = std::env::current_dir().map_err(|error| format!("cannot read the working folder: {error}"))?;
+    writeln!(stdout, "cwd {}", folder.display()).map_err(|error| write_failed(&error))?;
+    stdout.flush().map_err(|error| write_failed(&error))
 }
 
 /// Prints a numbered line about every [`CHATTER_STEP`], flushing each, until the file at `path` exists: the log a case's

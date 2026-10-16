@@ -8,8 +8,9 @@ publish = false
 workspace = true
 
 [features]
-# The hidden `--test-*` flags and the `fake-tool` helper the black-box suite needs; an installed gate is built without.
-test-seams = ["gate-args/test-seams", "gate-win32/test-seams"]
+# The hidden `--test-*` flags, the `fake-tool` helper and the stand-in desktop helper the black-box suite needs; an
+# installed gate is built without. The stand-in runs `gate-desktop`'s own code, so its seams come on too.
+test-seams = ["gate-args/test-seams", "gate-win32/test-seams", "gate-desktop/test-seams"]
 
 [dependencies]
 base64 = "0.23.1"
@@ -28,8 +29,15 @@ sha2 = "0.11.0"
 tar = "0.4.46"
 # Reads `.gate/toolchain.toml` into a `toml::Table`, its keys in file order; no writer, no derive.
 toml = { version = "1.1.8", default-features = false, features = ["std", "parse", "serde", "preserve_order"] }
-# `Win32_Storage_FileSystem` for the outputs walk and pack; `Win32_System_Console` for `fake-tool`, a `test-seams` bin.
-windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem", "Win32_System_Console"] }
+# `Win32_Storage_FileSystem` for the outputs walk and pack. `Win32_System_Console`, `Win32_System_Threading` and
+# `Win32_System_RemoteDesktop` serve only `fake-tool`, a `test-seams` bin, and so compile into `gate.exe` unused: a
+# package's bins cannot use its dev-dependencies, so they cannot be moved there.
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_RemoteDesktop",
+    "Win32_System_Threading",
+] }
 zstd = "0.14.2"
 
 [dev-dependencies]
@@ -47,6 +55,11 @@ required-features = ["test-seams"]
 [[bin]]
 name = "fake-ssh"
 path = "src/bin/fake-ssh.rs"
+required-features = ["test-seams"]
+
+[[bin]]
+name = "fake-desktop-helper"
+path = "src/bin/fake-desktop-helper.rs"
 required-features = ["test-seams"]
 
 # Without the `test-seams` feature (`--all-features` or `--features test-seams`) cargo skips this suite silently.

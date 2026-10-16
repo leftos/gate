@@ -67,6 +67,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Fallback**: a routed run that runs locally instead, after its builder refused it, the remote pool stayed full or the remote client could not start; journalled as a `fallback` event with its reason.
 - **Fallback poll**: the short timeout on every slot wait, which re-reads counts and tickets so a dead waiter's ticket is cleared even when no wake event comes.
 - **Family key**: the exact key with each filter value replaced by `<filter>`, so runs of one command with different filters count together; an estimate from it is marked as such.
+- **Fault seam**: the environment variable `GATE_DESKTOP_TEST_FAULT` of a `test-seams` build of the desktop helper, which names one step of its run to break (`exit-before-hello`, `hang`, `wrong-version`, `lie-handle`, `exit-after-create`); absent, empty or unknown is no fault.
 - **Folder id**: a folder's volume serial number and 128-bit file id, read from an open handle; two sibling names with one id are one folder, as is a sibling that is the worktree's own folder.
 - **Free share**: the fraction of the cores the command could use that other work left free in a sample, at least 5%; the load-adjusted clock advances by it.
 - **Generation**: the PowerShell gate or `gate.exe`, as `gate-state` tells them apart (`Generation`): ops-tower reads the PowerShell gate's files until the cutover flag exists and then `gate.exe`'s, plus the PowerShell claims of a slot whose mutex is open.

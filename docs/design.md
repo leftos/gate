@@ -2582,6 +2582,7 @@ A Rust integration suite drives the built `gate.exe` through its CLI and reads o
   It runs its steps in order:
 
   - `argv`, `pid` (prints `pid <its own pid>`), `env <name>` (prints the variable's value) and `exit <n>` (any 32-bit status).
+  - `session` (prints `session <its session id>`), `priority` (prints `priority 0x<its priority class>`) and `cwd` (prints `cwd <its working folder>`), one line each on stdout.
   - `out <text>`, `err <text>`, `bytes <hex>` (writes those bytes to stdout as they are) and `lines <n> <text>` (prints `<text>1` to `<text><n>`).
   - `noise <path> <bytes>` (writes a file of that many incompressible bytes, the same on every run, its folders made when missing).
   - `sleep <ms>` and `wait <path>` (until the path exists, giving up after 600 s with exit 1).
@@ -2608,7 +2609,15 @@ A Rust integration suite drives the built `gate.exe` through its CLI and reads o
 
   Beside the `.log` it writes `<steps file>.words`, one line a call (the verb, then the words before the host, ssh's options), and `<steps file>.input`, the stdin of the last push call.
 
-  It spawns children, burns CPU, prints its argv, writes output or sleeps on command, so build-server, orphan and kill-tree cases need no real toolchain.
+  `fake-tool` spawns children, burns CPU, prints its argv, writes output or sleeps on command, so build-server, orphan and kill-tree cases need no real toolchain.
+
+  A third helper, `fake-desktop-helper`, is the real desktop helper's code (`gate_desktop::run`) built beside `gate.exe`, so a box case can put it where the box looks for the installed one. It is built only with `--features test-seams` (`required-features`), and `gate`'s `test-seams` feature turns on `gate-desktop/test-seams` for it. With no argument it exits 10 (`HelperExit::BadArgument`).
+
+  The helper has three seams, environment variables that exist only in a `test-seams` build of it (unlike the `--test-*` flags). `GATE_DESKTOP_TEST_LIMIT_MS` caps each of its waits (connect, message, done) at that many whole milliseconds. `GATE_DESKTOP_TEST_PIPE_OWNER=user` makes it take a control pipe its own user owns in place of Administrators. A value of either that it cannot read (a limit that is not a whole number of milliseconds, an owner other than `user`) ends the helper at once with its bad-argument exit, 10.
+
+  The third, `GATE_DESKTOP_TEST_FAULT`, names the step it breaks; absent, empty or unknown is no fault:
+  - `exit-before-hello` exits 13 before saying hello, `hang` answers nothing and waits until the pipe goes away (13) or its own message limit passes (18), and `wrong-version` says the build `0.0.0+fault`.
+  - `lie-handle` reports the child's thread handle value as `process` (the real pid and thread), and `exit-after-create` creates its child, leaves it suspended and exits 19.
 - **No fixture from the checkout path.** No routing pattern, expected path or assertion is derived from where the repo is checked out; a case builds its own repository and routing file in its root. `checkout::repo_file` is the one route to a checked-in file (the install script), never for a path or pattern a case asserts on.
 - **Launcher cases** (GATE-41): `crates/gate/tests/suite/launcher.rs` has 8 cases. They run the synced `tools/gate.ps1`. A case's `LOCALAPPDATA` is its `appdata` folder, whose `gate\v1` is the default root with the real slot names, so every such case also sets `GATE_STATE_DIR` to a non-default folder. The flag-unset case points the launcher at a stub canonical gate through `CLAUDE_CONFIG_DIR`. A new suite module that calls `repo_file` updates the callers pin in `checkout.rs`.
 - **Cutover cases** (GATE-9): `crates/gate/tests/suite/cutover.rs` has 15 cases: the counts copy, the flag, the refused words and the printed request, and six over the drain. A live PowerShell gate is a `fake-tool wait` child whose claim or ticket, written by `support::write_powershell_claim` or `write_powershell_ticket` under `support::powershell_folder`, carries the child's real pid and start time; a stale one names a pid that has ended or a start that differs from the running process's.

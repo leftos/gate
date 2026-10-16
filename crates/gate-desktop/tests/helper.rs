@@ -8,6 +8,7 @@
 
 use std::ffi::OsStr;
 use std::io::Read;
+use std::ops::Deref;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::{AsHandle, AsRawHandle, OwnedHandle};
 use std::process::{Child, Command, Stdio};
@@ -33,11 +34,48 @@ fn unended() -> EndReport {
     Box::new(|pid, error| panic!("the adopted child {pid} could not be ended: {error}"))
 }
 
+/// How long the drop of a [`LeftChild`] waits for the child it ends.
+const END_WAIT: Duration = Duration::from_secs(5);
+
+/// A child a case found left behind, opened to be watched and ended by the case: its drop ends it, so an assertion
+/// that fails before the case ends the child itself strands no suspended process.
+struct LeftChild {
+    process: StoppableProcess,
+}
+
+impl LeftChild {
+    /// Opens the process `pid` a case found and left behind.
+    fn open(pid: u32) -> LeftChild {
+        LeftChild {
+            process: StoppableProcess::open(pid).expect("the left child opens").expect("the left child exists"),
+        }
+    }
+}
+
+impl Deref for LeftChild {
+    type Target = StoppableProcess;
+
+    fn deref(&self) -> &StoppableProcess {
+        &self.process
+    }
+}
+
+impl Drop for LeftChild {
+    fn drop(&mut self) {
+        // Nothing here may fail a test that is already ending; the wait is the moment the end takes.
+        let _ = self.process.terminate(1);
+        let _ = self.process.wait(END_WAIT);
+    }
+}
+
 /// The longest any wait of these tests may take: a guard against a hang, never a timing bound.
 const HANG_GUARD: Duration = Duration::from_secs(300);
 
 /// The helper's seam that caps each of its limits, in milliseconds.
 const LIMIT_VARIABLE: &str = "GATE_DESKTOP_TEST_LIMIT_MS";
+
+/// The helper's seam that picks one step of its run to break.
+const FAULT_VARIABLE: &str = "GATE_DESKTOP_TEST_FAULT";
 
 /// The variable the command echoes, set only in the block the box sends.
 const PROBE: &str = "GATE_DESKTOP_PROBE";
@@ -67,9 +105,9 @@ fn serve() -> PipeServer {
 /// The helper's seam that, set to `user`, makes it take a control pipe its user owns, as an unelevated test makes it.
 const PIPE_OWNER_VARIABLE: &str = "GATE_DESKTOP_TEST_PIPE_OWNER";
 
-/// The helper's command, with `args` and, when given, the seam capping its limits at `limit_ms`, and the seam that
-/// makes it take the pipe this unelevated test makes, which its user owns.
-fn helper_command(args: &[&str], limit_ms: Option<u64>) -> Command {
+/// The helper's command, with `args` and, when given, the seam capping its limits at `limit_ms`, the seam that makes
+/// it take the pipe this unelevated test makes, which its user owns, and the step `fault` breaks.
+fn helper_command(args: &[&str], limit_ms: Option<u64>, fault: Option<&str>) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_gate-desktop-helper"));
     command.args(args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
     match limit_ms {
@@ -77,12 +115,21 @@ fn helper_command(args: &[&str], limit_ms: Option<u64>) -> Command {
         None => command.env_remove(LIMIT_VARIABLE),
     };
     command.env(PIPE_OWNER_VARIABLE, "user");
+    match fault {
+        Some(mode) => command.env(FAULT_VARIABLE, mode),
+        None => command.env_remove(FAULT_VARIABLE),
+    };
     command
 }
 
 /// The helper, started as [`helper_command`] makes it.
 fn start_helper(args: &[&str], limit_ms: Option<u64>) -> Child {
-    gate_win32::spawn(&mut helper_command(args, limit_ms)).expect("the helper starts")
+    gate_win32::spawn(&mut helper_command(args, limit_ms, None)).expect("the helper starts")
+}
+
+/// The helper, started with the step `fault` breaks.
+fn start_helper_fault(args: &[&str], limit_ms: Option<u64>, fault: &str) -> Child {
+    gate_win32::spawn(&mut helper_command(args, limit_ms, Some(fault))).expect("the helper starts")
 }
 
 /// The helper's exit code, once it has exited.
@@ -113,9 +160,17 @@ impl Session {
     /// Serves a pipe, starts the helper on it with the seam at `limit_ms`, checks the client is the helper and reads
     /// its `Hello`.
     fn start(limit_ms: Option<u64>) -> Session {
+        Session::start_with_fault(limit_ms, None)
+    }
+
+    /// As [`Session::start`], with the helper made to break the step `fault` of its run.
+    fn start_with_fault(limit_ms: Option<u64>, fault: Option<&str>) -> Session {
         let server = serve();
         let arg = arg0(std::process::id(), server.name()).expect("the pipe's name makes an Arg0");
-        let helper = start_helper(&[&arg], limit_ms);
+        let helper = match fault {
+            Some(fault) => start_helper_fault(&[&arg], limit_ms, fault),
+            None => start_helper(&[&arg], limit_ms),
+        };
         let waited = server.wait_for_client(guard(), &[helper.as_handle()]).expect("the connect is waited on");
         assert_eq!(waited, ConnectWait::Connected, "the helper connects");
         assert_eq!(server.client_pid().expect("the client is read"), helper.id(), "the client is the helper");
@@ -307,7 +362,7 @@ fn the_production_pipe_passes_the_helpers_security_check() {
 fn the_helper_refuses_a_pipe_not_owned_by_administrators() {
     let server = serve();
     let arg = arg0(std::process::id(), server.name()).expect("the pipe's name makes an Arg0");
-    let mut command = helper_command(&[&arg], Some(ROOMY_LIMIT_MS));
+    let mut command = helper_command(&[&arg], Some(ROOMY_LIMIT_MS), None);
     // Without the seam the helper takes only a pipe Administrators own, which this test's pipe, its user's, is not.
     command.env_remove(PIPE_OWNER_VARIABLE);
 
@@ -444,7 +499,7 @@ fn reported_child(limit_ms: Option<u64>) -> (Session, u32, usize, usize) {
 #[test]
 fn a_box_that_closes_before_done_has_its_child_ended() {
     let (session, pid, _, _) = reported_child(Some(ROOMY_LIMIT_MS));
-    let watch = StoppableProcess::open(pid).expect("the child opens").expect("the child exists");
+    let watch = LeftChild::open(pid);
     let Session { server, mut helper, remote } = session;
 
     drop(server);
@@ -458,7 +513,7 @@ fn a_box_that_closes_before_done_has_its_child_ended() {
 #[test]
 fn a_box_that_never_says_done_leaves_the_child() {
     let (mut session, pid, process, thread) = reported_child(Some(ROOMY_LIMIT_MS));
-    let watch = StoppableProcess::open(pid).expect("the child opens").expect("the child exists");
+    let watch = LeftChild::open(pid);
     let process: OwnedHandle = session.remote.pull(process).expect("the process is taken");
     let thread: OwnedHandle = session.remote.pull(thread).expect("the thread is taken");
 
@@ -495,7 +550,7 @@ fn a_launch_that_fails_before_create_process_exits_setup_failed_without_failed()
 #[test]
 fn a_box_that_sends_another_message_after_the_child_leaves_it() {
     let (mut session, pid, process, thread) = reported_child(Some(ROOMY_LIMIT_MS));
-    let watch = StoppableProcess::open(pid).expect("the child opens").expect("the child exists");
+    let watch = LeftChild::open(pid);
     let process: OwnedHandle = session.remote.pull(process).expect("the process is taken");
     let thread: OwnedHandle = session.remote.pull(thread).expect("the thread is taken");
 
@@ -585,4 +640,130 @@ fn the_helper_runs_only_at_medium_integrity_or_below() {
         drop(server);
         assert_eq!(exit_of(&mut helper), code(HelperExit::BoxGone));
     }
+}
+
+#[test]
+fn exit_before_hello_mode_exits_without_a_hello() {
+    let server = serve();
+    let arg = arg0(std::process::id(), server.name()).expect("the pipe's name makes an Arg0");
+
+    let mut helper = start_helper_fault(&[&arg], Some(ROOMY_LIMIT_MS), "exit-before-hello");
+
+    let waited = server.wait_for_client(guard(), &[helper.as_handle()]).expect("the connect is waited on");
+    assert_eq!(waited, ConnectWait::Connected, "the helper connects before it exits");
+    assert_eq!(
+        exit_of(&mut helper),
+        code(HelperExit::BoxGone),
+        "it exits as a helper whose box went away"
+    );
+    let after = read_message(&server, guard(), HELPER_FRAME_LIMIT, &[]).expect_err("the helper sent no hello");
+    assert!(
+        matches!(after, gate_desktop::protocol::ReadError::Closed),
+        "its end closed the pipe: {after}"
+    );
+}
+
+#[test]
+fn hang_mode_never_answers_hello() {
+    // The seam caps the mode's wait on the pipe at 1 s, so the helper ends by itself and the case needs no bound of
+    // its own. The pipe exists before it starts, so its connect succeeds at once and the 1 s bounds only that read.
+    let server = serve();
+    let arg = arg0(std::process::id(), server.name()).expect("the pipe's name makes an Arg0");
+
+    let mut helper = start_helper_fault(&[&arg], Some(1_000), "hang");
+
+    assert_eq!(
+        exit_of(&mut helper),
+        code(HelperExit::TimedOut),
+        "the hanging helper ends at its own limit, having said nothing"
+    );
+    let after = read_message(&server, guard(), HELPER_FRAME_LIMIT, &[]).expect_err("the helper sent no hello");
+    assert!(
+        matches!(after, gate_desktop::protocol::ReadError::Closed),
+        "its end closed the pipe with nothing in it: {after}"
+    );
+}
+
+#[test]
+fn wrong_version_mode_says_another_build() {
+    let server = serve();
+    let arg = arg0(std::process::id(), server.name()).expect("the pipe's name makes an Arg0");
+
+    let mut helper = start_helper_fault(&[&arg], Some(ROOMY_LIMIT_MS), "wrong-version");
+
+    let waited = server.wait_for_client(guard(), &[helper.as_handle()]).expect("the connect is waited on");
+    assert_eq!(waited, ConnectWait::Connected, "the helper connects");
+    let hello = read_message(&server, guard(), HELPER_FRAME_LIMIT, &[]).expect("the hello is read");
+    let (version, desktop, ok) = match hello {
+        Message::Hello { version, desktop, ok } => Some((version, desktop, ok)),
+        _ => None,
+    }
+    .expect("the helper's first message is a hello");
+
+    assert_eq!(ok, desktop == "Default", "the desktop half is the helper's own ({desktop:?})");
+    assert_eq!(version, "0.0.0+fault", "the build the wrong-version fault names");
+    assert_ne!(version, gate_desktop::version::build_version(), "which is no build of this helper");
+
+    drop(server);
+    assert_eq!(exit_of(&mut helper), code(HelperExit::BoxGone), "the helper ends with its pipe");
+}
+
+#[test]
+fn lie_handle_mode_reports_a_bad_process_value() {
+    let mut session = Session::start_with_fault(Some(ROOMY_LIMIT_MS), Some("lie-handle"));
+    let (_out_read, out_write) = std::io::pipe().expect("the stdout pipe is made");
+    let (_err_read, err_write) = std::io::pipe().expect("the stderr pipe is made");
+    let (stdout, stderr) = (session.push(&out_write), session.push(&err_write));
+    drop((out_write, err_write));
+
+    session.send(&Message::Spawn(cmd_spawn("exit 0", "x", stdout, stderr)));
+    let (pid, process, thread) = child_of(&session.receive());
+    let left = LeftChild::open(pid);
+    assert_eq!(process, thread, "the lie reports the child's thread where the box reads its process");
+    // Taken while the helper still runs: once it has exited, no value of its table can be pulled, which would say
+    // nothing about the value it reported. The lie is a live handle, so the box's first pull succeeds, and it holds a
+    // thread where it means to hold the child's process.
+    let taken = session
+        .remote
+        .pull(process)
+        .expect("the reported process value is a live handle of the helper's table");
+    session.send(&Message::Done);
+    let helper_exit = exit_of(&mut session.helper);
+
+    assert_eq!(helper_exit, code(HelperExit::Done), "the mode waits for done as normal");
+    // The pair the box pulled goes through `Suspended::adopt`, the check every hand-off runs: a thread handle cannot
+    // stand for the child's process. The box holds one handle of that value, so the second of the pair is a copy.
+    let pair = taken.try_clone().expect("the handle is taken again");
+    let refused = Suspended::adopt(taken, pair, pid, unended());
+
+    assert!(refused.is_err(), "the pair is refused as the child's process and thread");
+    // The child the mode left behind is the test's to end; a failed assertion above leaves that to the guard.
+    left.terminate(1).expect("the left child is ended");
+    assert!(left.wait(HANG_GUARD).expect("the child is waited on"), "the left child ended");
+}
+
+#[test]
+fn exit_after_create_mode_leaves_a_suspended_child() {
+    let mut session = Session::start_with_fault(Some(ROOMY_LIMIT_MS), Some("exit-after-create"));
+    let (_out_read, out_write) = std::io::pipe().expect("the stdout pipe is made");
+    let (_err_read, err_write) = std::io::pipe().expect("the stderr pipe is made");
+    let (stdout, stderr) = (session.push(&out_write), session.push(&err_write));
+    drop((out_write, err_write));
+
+    session.send(&Message::Spawn(cmd_spawn("exit 0", "x", stdout, stderr)));
+
+    let helper_exit = exit_of(&mut session.helper);
+    let started = session.children();
+    // One guard per pid, before any assertion: whatever the helper left is ended even by a case that fails here.
+    let left: Vec<LeftChild> = started.iter().copied().map(LeftChild::open).collect();
+
+    assert_eq!(helper_exit, code(HelperExit::Internal), "the mode exits without reporting the child");
+    assert_eq!(left.len(), 1, "the helper started one child and left it: {started:?}");
+    let watch = &left[0];
+    assert!(
+        !watch.wait(Duration::ZERO).expect("the child is looked at"),
+        "the child still lives after the helper exited"
+    );
+    watch.terminate(1).expect("the left child is ended");
+    assert!(watch.wait(HANG_GUARD).expect("the child is waited on"), "the child ended");
 }

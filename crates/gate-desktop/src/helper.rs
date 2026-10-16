@@ -40,6 +40,47 @@ const TEST_LIMIT_VARIABLE: &str = "GATE_DESKTOP_TEST_LIMIT_MS";
 #[cfg(feature = "test-seams")]
 const TEST_PIPE_OWNER_VARIABLE: &str = "GATE_DESKTOP_TEST_PIPE_OWNER";
 
+/// The seam that picks one step of the run to break, in a build with the `test-seams` feature: `exit-before-hello`,
+/// `hang`, `wrong-version`, `lie-handle` or `exit-after-create`. An absent, empty or unknown value is no fault.
+#[cfg(feature = "test-seams")]
+const TEST_FAULT_VARIABLE: &str = "GATE_DESKTOP_TEST_FAULT";
+
+/// The build a `wrong-version` fault names in place of its own, which no [`build_version`] is.
+#[cfg(feature = "test-seams")]
+const FAULT_VERSION: &str = "0.0.0+fault";
+
+/// One step of the run a build with the `test-seams` feature may break, taken from `GATE_DESKTOP_TEST_FAULT`.
+#[cfg(feature = "test-seams")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Fault {
+    /// Exit right after connecting, before `Hello`, as [`HelperExit::BoxGone`] says a box that went away.
+    ExitBeforeHello,
+    /// Connect and never say `Hello`, waiting on the pipe as far as the run's own limits reach.
+    Hang,
+    /// Say `Hello` naming [`FAULT_VERSION`] in place of this build.
+    WrongVersion,
+    /// Start the child as normal and report its thread's handle value where the box reads its process's: a live
+    /// handle of this helper's table, of a kind that cannot stand for the child.
+    LieHandle,
+    /// Start the child suspended as normal, then exit without reporting it, leaving it suspended.
+    ExitAfterCreate,
+}
+
+#[cfg(feature = "test-seams")]
+impl Fault {
+    /// The fault `GATE_DESKTOP_TEST_FAULT` asks for; `None` for none.
+    fn asked() -> Option<Fault> {
+        match std::env::var_os(TEST_FAULT_VARIABLE)?.to_str()? {
+            "exit-before-hello" => Some(Fault::ExitBeforeHello),
+            "hang" => Some(Fault::Hang),
+            "wrong-version" => Some(Fault::WrongVersion),
+            "lie-handle" => Some(Fault::LieHandle),
+            "exit-after-create" => Some(Fault::ExitAfterCreate),
+            _ => None,
+        }
+    }
+}
+
 /// How long each step may take.
 #[derive(Clone, Copy, Debug)]
 struct Limits {
@@ -119,21 +160,75 @@ fn serve(box_pid: u32, name: &str, limits: Limits, owner: PipeOwner) -> Result<H
         Ok(pid) if pid == box_pid => {}
         Ok(_) | Err(_) => return Err(HelperExit::ServerRefused),
     }
+    #[cfg(feature = "test-seams")]
+    if let Some(exit) = fault_before_hello(&pipe, limits) {
+        return Err(exit);
+    }
     send(&pipe, &hello(), limits.message)?;
     let spawn = receive_spawn(&pipe, limits.message)?;
     let child = start(&pipe, spawn, limits.message)?;
     let released = child.release().map_err(|_| HelperExit::Internal)?;
-    let report = Message::Child {
-        pid: released.pid,
-        process: released.process.addr() as u64,
-        thread: released.thread.addr() as u64,
-    };
+    #[cfg(feature = "test-seams")]
+    if Fault::asked() == Some(Fault::ExitAfterCreate) {
+        return Err(HelperExit::Internal);
+    }
+    let report = report_of(&released);
     match write_message(&pipe, &report, Instant::now() + limits.message, &[]) {
         Ok(()) => Ok(await_done(&pipe, &released, limits)),
         Err(WriteError::Closed) => Err(box_gone(&released, limits.message)),
         Err(WriteError::Io(error)) if is_pipe_gone(&error) => Err(box_gone(&released, limits.message)),
         Err(WriteError::TimedOut) => Err(HelperExit::TimedOut),
         Err(WriteError::Io(_) | WriteError::Woken(_) | WriteError::TooLong) => Err(HelperExit::Internal),
+    }
+}
+
+/// The exit a fault asks for before `Hello` is sent: `exit-before-hello` exits at once, as a helper whose box went
+/// away, and `hang` waits on the pipe. `None` for the run to go on.
+#[cfg(feature = "test-seams")]
+fn fault_before_hello(pipe: &PipeClient, limits: Limits) -> Option<HelperExit> {
+    match Fault::asked()? {
+        Fault::ExitBeforeHello => Some(HelperExit::BoxGone),
+        Fault::Hang => Some(hang(pipe, limits)),
+        Fault::WrongVersion | Fault::LieHandle | Fault::ExitAfterCreate => None,
+    }
+}
+
+/// The exit `hang` ends with: the box gone when its pipe goes away before the message limit, else that the box did not
+/// answer in time. It never sends `Hello` and never answers what the box sends: it reads, and goes on waiting, until
+/// one of those two ends it.
+#[cfg(feature = "test-seams")]
+fn hang(pipe: &PipeClient, limits: Limits) -> HelperExit {
+    let deadline = Instant::now() + limits.message;
+    loop {
+        match read_message(pipe, deadline, FRAME_LIMIT, &[]) {
+            // Whatever the box said, the hanging helper keeps quiet and waits on. An empty frame and a body that is no
+            // message are both read whole, so the pipe still stands at a frame boundary.
+            Ok(_) | Err(ReadError::Empty | ReadError::Decode(_)) => {}
+            Err(ReadError::Closed) => return HelperExit::BoxGone,
+            Err(ReadError::Io(error)) if is_pipe_gone(&error) => return HelperExit::BoxGone,
+            // Too long, woken, out of time, or another failure of the pipe: the wait is over, and after the first
+            // three the stream stands at no frame boundary any more.
+            Err(ReadError::TooLong | ReadError::Woken(_) | ReadError::TimedOut | ReadError::Io(_)) => {
+                return HelperExit::TimedOut;
+            }
+        }
+    }
+}
+
+/// The `Child` report for `released`: its pid and the values of its process and thread handles, the process value
+/// alone replaced, by the thread's, under a `lie-handle` fault.
+fn report_of(released: &Released) -> Message {
+    #[cfg(feature = "test-seams")]
+    let process = match Fault::asked() {
+        Some(Fault::LieHandle) => released.thread.addr() as u64,
+        _ => released.process.addr() as u64,
+    };
+    #[cfg(not(feature = "test-seams"))]
+    let process = released.process.addr() as u64;
+    Message::Child {
+        pid: released.pid,
+        process,
+        thread: released.thread.addr() as u64,
     }
 }
 
@@ -172,11 +267,19 @@ fn connect(name: &str, limit: Duration, owner: PipeOwner) -> Result<PipeClient, 
     }
 }
 
-/// The `Hello` this helper sends: its build and the input desktop's name, empty when it cannot be read.
+/// The `Hello` this helper sends: its build and the input desktop's name, empty when it cannot be read. A
+/// `wrong-version` fault names [`FAULT_VERSION`] in place of its build.
 fn hello() -> Message {
     let desktop = gate_win32::input_desktop_name().unwrap_or_default();
+    #[cfg(feature = "test-seams")]
+    let version = match Fault::asked() {
+        Some(Fault::WrongVersion) => FAULT_VERSION.to_owned(),
+        _ => build_version(),
+    };
+    #[cfg(not(feature = "test-seams"))]
+    let version = build_version();
     Message::Hello {
-        version: build_version(),
+        version,
         ok: desktop == DEFAULT_DESKTOP,
         desktop,
     }
