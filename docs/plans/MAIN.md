@@ -7,7 +7,7 @@
 - [ ] GATE-19 Remote: send a repo's declared sibling worktrees with a routed run — Urgent · Remote
 - [/] GATE-22 Remote: send a routed command's ignored inputs to the builder, compressed — Urgent · Remote
 - [ ] GATE-206 A per-repo toolchain manifest: check and prepare builders, and check a fresh clone — Urgent · Remote
-- [ ] GATE-242 Suite: find and cut what makes remote_client's slow cases take tens of seconds — Urgent · Remote
+- [ ] GATE-312 Start fewer git processes per routed run and box run — Urgent · Remote
 - [ ] GATE-192 Turn routing back on, on the Rust remote client — High · Remote
 - [/] GATE-249 Siblings C: the client snapshots, checks parity and pushes each repo — High · Remote
 - [ ] GATE-251 Siblings E: outputs, install rewrite and stale-line wording for a pair — High · Remote
@@ -112,3 +112,5 @@
 - [ ] GATE-295 Give the gate's stdin feeders one rule for a failed write
 - [ ] GATE-299 Split the remote client's started() under the complexity limit and share its bounded join
 - [ ] GATE-260 Keep the load sampler working when a child of the gated command is suspended
+- [ ] GATE-313 Say when a suspended command the gate started cannot be ended on drop
+- [ ] GATE-314 Give the unit tests that start git the suite's git home
