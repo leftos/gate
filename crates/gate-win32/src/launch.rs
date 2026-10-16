@@ -199,7 +199,13 @@ fn check_entry(name: &[u16], value: &[u16]) -> io::Result<()> {
 pub fn same_variable_name(left: &OsStr, right: &OsStr) -> bool {
     let left: Vec<u16> = left.encode_wide().collect();
     let right: Vec<u16> = right.encode_wide().collect();
-    compare_names(&left, &right) == Ordering::Equal
+    ordinal_equal_ignore_case(&left, &right)
+}
+
+/// Whether two texts are one to Windows when it compares names or paths: equal ordinally without regard to case over
+/// all of Unicode (`CompareStringOrdinal`).
+pub(crate) fn ordinal_equal_ignore_case(left: &[u16], right: &[u16]) -> bool {
+    compare_names(left, right) == Ordering::Equal
 }
 
 /// The order of two names as Windows orders environment names: ordinal, without regard to case.
@@ -533,7 +539,7 @@ pub struct Suspended {
 
 /// Where a dropped [`Suspended::adopt`]ed command that could not be ended reports it, with its pid and the system's
 /// error: the caller's own console, such as the box's line writer, since a drop has no caller to return it to.
-pub type EndReport = Box<dyn FnOnce(u32, io::Error) + Send + Sync>;
+pub type EndReport = Box<dyn FnOnce(u32, io::Error) + Send>;
 
 /// How long ending a never-run command waits to see it ended when the terminate is refused, as it is for a command
 /// that is ending already, before it says the command could not be ended.
@@ -824,7 +830,8 @@ impl Drop for Suspended {
 /// # Errors
 ///
 /// The system's error, its code kept, when the terminate is refused and the command has not ended within `bound`: it
-/// stays suspended, never having run.
+/// stays suspended, never having run. When the wait to see it ended fails too, an error of the refusal's kind that
+/// holds both errors' texts.
 pub(crate) fn end_unstarted(process: &OwnedHandle, bound: Duration) -> io::Result<()> {
     // SAFETY: the process handle is open for the whole call; one without `PROCESS_TERMINATE` only makes the call fail.
     if unsafe { TerminateProcess(process.raw(), 1) } != 0 {
@@ -834,7 +841,11 @@ pub(crate) fn end_unstarted(process: &OwnedHandle, bound: Duration) -> io::Resul
     // `TerminateProcess` refuses a process that has ended already, or is ending, which is ended all the same.
     match crate::event::signalled_within(process, bound) {
         Ok(true) => Ok(()),
-        Ok(false) | Err(_) => Err(refused),
+        Ok(false) => Err(refused),
+        Err(waited) => Err(io::Error::new(
+            refused.kind(),
+            format!("{refused}, and the wait to see it ended failed: {waited}"),
+        )),
     }
 }
 
@@ -1091,6 +1102,80 @@ mod tests {
         let waited = unsafe { WaitForSingleObject(wait_only.raw(), crate::wait_millis(HANG_GUARD)) };
         assert_eq!(waited, WAIT_OBJECT_0, "the dropped child ended");
         super::end_unstarted(&wait_only, Duration::ZERO).expect("a process that has ended already is no failure to end it");
+    }
+
+    /// cmd, created suspended to run `exit 0`, its stdin and stdout pipes held by the [`super::Suspended`].
+    fn suspended_cmd() -> super::Suspended {
+        let system = system_directory().expect("the system folder is read");
+        Launch {
+            application: system.join("cmd.exe"),
+            command_line: units("cmd /d /c exit 0"),
+            directory: system,
+            environment: EnvironmentBlock::new(std::env::vars_os()).expect("the block is built"),
+            output: LaunchOutput::Piped,
+            priority: None,
+        }
+        .start_suspended()
+        .expect("the command is created")
+    }
+
+    #[test]
+    fn end_unstarted_waits_its_bound_for_a_process_another_ends() {
+        let _alone = crate::create::tests::ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner);
+        let child = suspended_cmd();
+        // SAFETY: `OpenProcess` takes no pointers. A success is a fresh handle nothing else owns.
+        let wait_only = unsafe { crate::own_handle(OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, 0, child.pid())) }
+            .expect("the child opens");
+        let process = child.process.as_ref().expect("the process is held");
+        // SAFETY: the guard keeps the handle open for as long as the borrow lives, which ends in this statement.
+        let terminate = EndOnDrop(
+            unsafe { std::os::windows::io::BorrowedHandle::borrow_raw(process.raw()) }
+                .try_clone_to_owned()
+                .expect("copied"),
+        );
+        let ender = std::thread::spawn(move || {
+            // An end that comes once the wait below has begun is what a wait of 0 ms misses; under load the end may come
+            // first, which the bounded wait takes all the same.
+            std::thread::sleep(Duration::from_millis(200));
+            drop(terminate);
+        });
+
+        let ended = super::end_unstarted(&wait_only, HANG_GUARD);
+
+        ender.join().expect("the thread that ends the child does not panic");
+        ended.expect("a process another ends within the bound is no failure to end it");
+        drop(child);
+    }
+
+    /// The report an adopted child is given: a child a drop could not end fails the test that dropped it.
+    ///
+    /// The path that fires it is not tested: it needs a terminate refused on a live process that then does not end
+    /// within the wait, and a handle this process can adopt carries `PROCESS_TERMINATE`, so its terminate succeeds.
+    #[expect(clippy::panic, reason = "a child a test's drop could not end must fail that test loudly")]
+    fn unended() -> crate::EndReport {
+        Box::new(|pid, error| panic!("the adopted child {pid} could not be ended: {error}"))
+    }
+
+    #[test]
+    fn end_ends_an_adopted_child() {
+        let _alone = crate::create::tests::ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner);
+        let released = suspended_cmd().release().expect("the child is released");
+        let kept = EndOnDrop(released.kept_process);
+        // SAFETY: `release` gave up both handles, open, and nothing else owns them now.
+        let (process, thread) = unsafe {
+            (
+                OwnedHandle::from_raw_handle(released.process),
+                OwnedHandle::from_raw_handle(released.thread),
+            )
+        };
+        let adopted = super::Suspended::adopt(process, thread, released.pid, unended()).expect("the child is adopted");
+
+        adopted.end(HANG_GUARD).expect("the adopted child is ended");
+
+        // SAFETY: the kept handle is open, with the `SYNCHRONIZE` access a created process's handle has; the wait is
+        // bounded.
+        let waited = unsafe { WaitForSingleObject(kept.0.as_raw_handle(), crate::wait_millis(HANG_GUARD)) };
+        assert_eq!(waited, WAIT_OBJECT_0, "the ended child is signalled");
     }
 
     #[test]

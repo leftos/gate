@@ -1,20 +1,22 @@
 //! Starting a registered scheduled task in a given session through the Task Scheduler's COM API, once its definition
 //! is checked: the desktop helper's task, which runs the helper beside the running program in the logged-on user's
 //! session. The COM work runs on a short-lived thread of its own, in the multithreaded apartment. The Task Scheduler's
-//! class is made from `taskschd.dll` loaded from the system folder, never looked up in the registry, where a user's
-//! own class entry could stand in for it; every interface is released before the library is freed and that thread
-//! ends.
+//! class is made from `taskschd.dll`, loaded once for the process by its full path in the system folder and never
+//! freed, never looked up in the registry, where a user's own class entry could stand in for it; every interface is
+//! released before that thread ends.
 
 use std::any::Any;
-use std::ffi::c_void;
+use std::ffi::{OsString, c_void};
 use std::fmt;
 use std::io;
 use std::marker::PhantomData;
 use std::mem::ManuallyDrop;
 use std::num::NonZeroU32;
-use std::os::windows::ffi::OsStrExt;
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::io::{AsRawHandle, BorrowedHandle};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::VARIANT_BOOL;
@@ -22,19 +24,25 @@ use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninit
 use windows::Win32::System::TaskScheduler::{
     IAction, IExecAction, IRegisteredTask, IRunningTask, ITaskDefinition, ITaskService, TASK_ACTION_EXEC, TASK_ACTION_TYPE, TASK_INSTANCES_PARALLEL,
     TASK_INSTANCES_POLICY, TASK_LOGON_INTERACTIVE_TOKEN, TASK_LOGON_TYPE, TASK_RUN_IGNORE_CONSTRAINTS, TASK_RUN_USE_SESSION_ID, TASK_RUNLEVEL_LUA,
-    TASK_RUNLEVEL_TYPE, TASK_STATE_QUEUED, TaskScheduler,
+    TASK_RUNLEVEL_TYPE, TASK_STATE, TASK_STATE_DISABLED, TASK_STATE_READY, TaskScheduler,
 };
 use windows::Win32::System::Variant::{VARIANT, VT_BSTR};
 use windows::core::{BSTR, GUID, HRESULT, IUnknown, Interface};
-use windows_sys::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, ERROR_NONE_MAPPED, FreeLibrary, HMODULE};
-use windows_sys::Win32::Globalization::{CSTR_EQUAL, CompareStringOrdinal};
-use windows_sys::Win32::Security::{ACL, DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, LookupAccountNameW, SID_NAME_USE};
-use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW};
+use windows_sys::Win32::Foundation::{
+    ERROR_INSUFFICIENT_BUFFER, ERROR_NONE_MAPPED, GENERIC_READ, HANDLE, HMODULE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+};
+use windows_sys::Win32::Security::{
+    ACL, DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, GetSecurityDescriptorOwner, LookupAccountNameW, OWNER_SECURITY_INFORMATION, PSID,
+    SID_NAME_USE,
+};
+use windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_READ;
+use windows_sys::Win32::System::LibraryLoader::{GetModuleFileNameW, GetProcAddress, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW};
 use windows_sys::Win32::System::SystemServices::ACCESS_DENIED_ACE_TYPE;
+use windows_sys::Win32::System::Threading::WaitForMultipleObjects;
 
 use crate::pipe::{Early, Entry, SecurityDescriptor, Signalled, check_wake, entries_of, is_sid_string, wait_any};
 
-/// The library the Task Scheduler's class is made from, loaded from the system folder alone.
+/// The library the Task Scheduler's class is made from, loaded by its full path in the system folder.
 const TASK_SCHEDULER_LIBRARY: &str = "taskschd.dll";
 
 /// The only arguments the task's action may have: the `Arg0` a run passes it, as the Task Scheduler substitutes it.
@@ -61,23 +69,9 @@ const PID_LOOK_STEP: Duration = Duration::from_millis(50);
 /// The SIDs that may change or run the task besides the user running gate: SYSTEM and the Administrators group.
 const TRUSTED_SIDS: [&str; 2] = ["S-1-5-18", "S-1-5-32-544"];
 
-/// The rights on a task that change it or run it: `FILE_WRITE_DATA`, `FILE_APPEND_DATA`, `FILE_WRITE_EA`,
-/// `FILE_EXECUTE`, `FILE_DELETE_CHILD`, `FILE_WRITE_ATTRIBUTES`, `DELETE`, `WRITE_DAC`, `WRITE_OWNER`,
-/// `MAXIMUM_ALLOWED`, `GENERIC_ALL`, `GENERIC_EXECUTE` and `GENERIC_WRITE`, as the Task Scheduler maps a task's
-/// rights onto a file's.
-const WRITE_OR_RUN: u32 = 0x0000_0002
-    | 0x0000_0004
-    | 0x0000_0010
-    | 0x0000_0020
-    | 0x0000_0040
-    | 0x0000_0100
-    | 0x0001_0000
-    | 0x0004_0000
-    | 0x0008_0000
-    | 0x0200_0000
-    | 0x1000_0000
-    | 0x2000_0000
-    | 0x4000_0000;
+/// The only rights an entry for anyone but SYSTEM, Administrators and the user running gate may allow on the task:
+/// reading it, `FILE_GENERIC_READ` and `GENERIC_READ`, as the Task Scheduler maps a task's rights onto a file's.
+const READ_ONLY: u32 = FILE_GENERIC_READ | GENERIC_READ;
 
 /// The `Arg0` a run of the task passes it: text of `0-9`, `a-f` and `:` alone, at most [`TaskArgument::LONGEST`]
 /// characters, as `gate_desktop::arg0` writes it, so nothing else can reach the task's command line.
@@ -116,7 +110,7 @@ pub struct TaskStart<'a> {
     /// The program the task's one action must run.
     pub helper: &'a Path,
     /// How long, once the task is started, to keep asking the Task Scheduler for its process while the instance is
-    /// queued. The deadline [`run_task`] is given must leave room for it.
+    /// queued or running without one; the deadline [`run_task`] is given ends that wait first when it comes sooner.
     pub pid_wait: Duration,
 }
 
@@ -125,13 +119,13 @@ pub struct TaskStart<'a> {
 pub enum StartedTask {
     /// The id of the process the Task Scheduler started for the task's action.
     Process(NonZeroU32),
-    /// The task was started, but the Task Scheduler gave no process for it within the pid wait, or the instance left
-    /// the queue without one: its helper may be running, and only the caller's own deadline bounds the wait for it.
+    /// The task was started, but the Task Scheduler gave no process for it within the pid wait, or the instance ended
+    /// without one: its helper may be running, and only the caller's own deadline bounds the wait for it.
     NoPid,
 }
 
-/// Why [`run_task`] did not give the task's process. Every text taken from the task itself is escaped and cut, so it
-/// holds no line break or control character.
+/// Why [`run_task`] did not give the task's process. Every text is escaped, and each part taken from the task itself
+/// cut too, so it holds no control character, line or paragraph separator, or format character.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TaskError {
     /// No task, or no folder, of the path is registered; nothing was started.
@@ -140,17 +134,35 @@ pub enum TaskError {
     /// that differs. Nothing was started.
     SetUpWrong(String),
     /// A call of the Task Scheduler or of COM failed before the task was started, so nothing was; the text names the
-    /// call and holds the system's message.
+    /// call and holds the system's message. When the text says the wait for the Task Scheduler failed, or the thread
+    /// that asked it panicked, the task may have been started; the caller drops its pipe server.
     Failed(String),
     /// The task was started, then a call of the Task Scheduler failed; the text names the call and holds the system's
     /// message. The instance may be running, and its helper ends by its own limits.
     StartedUnknown(String),
-    /// The Task Scheduler did not answer before the deadline. The thread that asked it is left to finish on its own; a
-    /// start it makes later runs a helper that finds no pipe and ends.
+    /// The Task Scheduler did not answer before the deadline. The thread that asked it is left to finish on its own, and
+    /// told to start nothing if it has not yet; the task may have been started; the caller drops its pipe server.
     TimedOut,
-    /// The wake handle at this index was signalled before the Task Scheduler answered, as [`TaskError::TimedOut`]
-    /// leaves it.
+    /// The wake handle at this index was signalled before the Task Scheduler answered, the thread left as
+    /// [`TaskError::TimedOut`] leaves it; the task may have been started; the caller drops its pipe server.
     Woken(usize),
+}
+
+impl TaskError {
+    /// A [`TaskError::Failed`] of `why`, escaped.
+    fn failed(why: &str) -> TaskError {
+        TaskError::Failed(escaped(why))
+    }
+
+    /// A [`TaskError::StartedUnknown`] of `why`, escaped.
+    fn started_unknown(why: &str) -> TaskError {
+        TaskError::StartedUnknown(escaped(why))
+    }
+
+    /// A [`TaskError::SetUpWrong`] of `what`, escaped.
+    fn set_up_wrong(what: &str) -> TaskError {
+        TaskError::SetUpWrong(escaped(what))
+    }
 }
 
 impl fmt::Display for TaskError {
@@ -173,23 +185,31 @@ impl std::error::Error for TaskError {}
 /// definition must be: enabled; started on demand; a second instance run in parallel; priority 4; neither kept from
 /// starting nor stopped on batteries; no execution time limit; no triggers; one action, which runs `start.helper`
 /// with the arguments `$(Arg0)` alone and no working folder; run with the interactive token, at the least privilege,
-/// of the user running gate; and a security descriptor that lets no one but SYSTEM, Administrators and that user
-/// change or run it. The run ignores the task's constraints, such as on batteries. It never registers, changes or
+/// of the user running gate; and a security descriptor owned by SYSTEM, Administrators or that user, which lets no one
+/// else do more than read it. The run ignores the task's constraints, such as on batteries. It never registers, changes or
 /// stops a task.
 ///
 /// The Task Scheduler is asked on a thread of its own, and the answer waited for until `deadline` or until a handle of
-/// `wake` is signalled.
+/// `wake` is signalled. A deadline passed or a wake handle signalled already gives its error before that thread is
+/// made, so nothing is started.
 ///
 /// # Errors
 ///
 /// A [`TaskError`]; [`TaskError::Failed`] also when the path holds no task name, the running user cannot be read, or
 /// `wake` holds more handles than a wait watches.
 pub fn run_task(start: &TaskStart<'_>, deadline: Instant, wake: &[BorrowedHandle<'_>]) -> Result<StartedTask, TaskError> {
-    check_wake(wake, "task start").map_err(|error| TaskError::Failed(error.to_string()))?;
+    check_wake(wake, "task start").map_err(|error| TaskError::failed(&error.to_string()))?;
     let Some((folder, name)) = split_task_path(start.path) else {
-        return Err(TaskError::Failed(format!("{} is not a task path, \\<folder>\\<name>", shown(start.path))));
+        return Err(TaskError::failed(&format!(
+            "{} is not a task path, \\<folder>\\<name>",
+            shown(start.path)
+        )));
     };
-    let user_sid = crate::current_user_sid().map_err(|error| TaskError::Failed(format!("the running user could not be read: {error}")))?;
+    let user_sid = crate::current_user_sid().map_err(|error| TaskError::failed(&format!("the running user could not be read: {error}")))?;
+    if let Some(given_up) = given_up(deadline, wake)? {
+        return Err(given_up);
+    }
+    let cancel = Arc::new(AtomicBool::new(false));
     let request = Request {
         folder: folder.to_owned(),
         name: name.to_owned(),
@@ -200,23 +220,56 @@ pub fn run_task(start: &TaskStart<'_>, deadline: Instant, wake: &[BorrowedHandle
             user_sid,
         },
         pid_wait: start.pid_wait,
+        deadline,
+        cancel: Arc::clone(&cancel),
     };
     let thread = std::thread::Builder::new()
         .name("gate-task".to_owned())
         .spawn(move || start_on_this_thread(&request))
-        .map_err(|error| TaskError::Failed(format!("the thread that starts the task could not be made: {error}")))?;
+        .map_err(|error| TaskError::failed(&format!("the thread that starts the task could not be made: {error}")))?;
     let mut handles = vec![thread.as_raw_handle()];
     handles.extend(wake.iter().map(AsRawHandle::as_raw_handle));
-    match wait_any(&handles, deadline) {
+    let waited = wait_any(&handles, deadline);
+    if !matches!(waited, Ok(Signalled::Event)) {
+        // The thread is left to finish on its own; one that has not reached the run yet starts nothing.
+        cancel.store(true, Ordering::SeqCst);
+    }
+    match waited {
         Ok(Signalled::Event) => thread.join().unwrap_or_else(|panic| {
-            Err(TaskError::Failed(format!(
+            Err(TaskError::failed(&format!(
                 "the thread that starts the task panicked: {}",
                 panic_text(&*panic)
             )))
         }),
         Ok(Signalled::Early(Early::TimedOut)) => Err(TaskError::TimedOut),
         Ok(Signalled::Early(Early::Woken(index))) => Err(TaskError::Woken(index)),
-        Err(error) => Err(TaskError::Failed(format!("the wait for the Task Scheduler failed: {error}"))),
+        Err(error) => Err(TaskError::failed(&format!("the wait for the Task Scheduler failed: {error}"))),
+    }
+}
+
+/// The error of a start given up before it is asked for: [`TaskError::TimedOut`] once `deadline` has passed,
+/// [`TaskError::Woken`] with the lowest index of a handle of `wake` signalled already; `None` when neither holds.
+fn given_up(deadline: Instant, wake: &[BorrowedHandle<'_>]) -> Result<Option<TaskError>, TaskError> {
+    if Instant::now() >= deadline {
+        return Ok(Some(TaskError::TimedOut));
+    }
+    if wake.is_empty() {
+        return Ok(None);
+    }
+    let handles: Vec<HANDLE> = wake.iter().map(AsRawHandle::as_raw_handle).collect();
+    let count = u32::try_from(handles.len()).map_err(|error| TaskError::failed(&format!("the wake handles could not be counted: {error}")))?;
+    // SAFETY: `handles` holds `count` handles, each borrowed open for the whole call; a wait of 0 ms only looks.
+    let result = unsafe { WaitForMultipleObjects(count, handles.as_ptr(), 0, 0) };
+    match result {
+        WAIT_TIMEOUT => Ok(None),
+        WAIT_FAILED => Err(TaskError::failed(&format!(
+            "the wake handles could not be looked at: {}",
+            io::Error::last_os_error()
+        ))),
+        _ if result < WAIT_OBJECT_0 + count => Ok(Some(TaskError::Woken((result - WAIT_OBJECT_0) as usize))),
+        _ => Err(TaskError::failed(&format!(
+            "the look at the wake handles ended with the unexpected result 0x{result:x}"
+        ))),
     }
 }
 
@@ -228,6 +281,10 @@ struct Request {
     session_id: u32,
     expected: Expected,
     pid_wait: Duration,
+    /// The deadline [`run_task`] waits until, which bounds the pid wait too.
+    deadline: Instant,
+    /// Set once [`run_task`] has stopped waiting, so a thread that has not run the task yet does not.
+    cancel: Arc<AtomicBool>,
 }
 
 /// What the task's definition is checked against besides the fixed settings.
@@ -260,33 +317,65 @@ fn split_task_path(path: &str) -> Option<(&str, &str)> {
     Some((if folder.is_empty() { "\\" } else { folder }, name))
 }
 
-/// The task started on this thread: the library loaded, then COM joined, then the work, whose interfaces are all
-/// released when it returns; COM is left before the library is freed.
+/// The task started on this thread: COM joined, then the work, whose interfaces are all released when it returns,
+/// before COM is left.
 fn start_on_this_thread(request: &Request) -> Result<StartedTask, TaskError> {
-    let library = SystemLibrary::load(TASK_SCHEDULER_LIBRARY)?;
-    let apartment = Apartment::join()?;
-    let started = start_checked(&library, request);
-    drop(apartment);
-    drop(library);
-    started
+    let library = task_library()?;
+    let _apartment = Apartment::join()?;
+    start_checked(library, request)
 }
 
-/// A library loaded from the system folder alone, freed when dropped.
+/// `taskschd.dll`, once loaded: kept for the rest of the process and never freed, as COM itself keeps an in-process
+/// server no one asks it to unload, so nothing the library keeps past its last interface's release runs unmapped.
+static TASK_LIBRARY: OnceLock<SystemLibrary> = OnceLock::new();
+
+/// `taskschd.dll`, loaded by its full path in the system folder the first time it is asked for.
+fn task_library() -> Result<&'static SystemLibrary, TaskError> {
+    if let Some(library) = TASK_LIBRARY.get() {
+        return Ok(library);
+    }
+    let loaded = SystemLibrary::load()?;
+    // Two threads may load it at once; the load that loses only counts the module once more, and is never freed either.
+    Ok(TASK_LIBRARY.get_or_init(|| loaded))
+}
+
+/// A library loaded from the system folder, never freed.
 struct SystemLibrary(HMODULE);
+
+// SAFETY: a module handle is the module's address in this process, good on every thread for as long as the module is
+// loaded, and this one is never freed.
+unsafe impl Send for SystemLibrary {}
+
+// SAFETY: as for `Send`; the handle is only read.
+unsafe impl Sync for SystemLibrary {}
 
 /// The signature every in-process COM server's `DllGetClassObject` has.
 type GetClassObject = unsafe extern "system" fn(*const GUID, *const GUID, *mut *mut c_void) -> HRESULT;
 
 impl SystemLibrary {
-    /// Loads `name` from the system folder, and nowhere else.
-    fn load(name: &str) -> Result<SystemLibrary, TaskError> {
-        let wide = crate::wide(name);
+    /// Loads [`TASK_SCHEDULER_LIBRARY`] by its full path in the system folder, and refuses the module the load gives
+    /// when it is not the file of that path, as one of the same name loaded before from elsewhere would be.
+    fn load() -> Result<SystemLibrary, TaskError> {
+        let system = crate::system_directory().map_err(|error| TaskError::failed(&format!("the system folder could not be read: {error}")))?;
+        let path = system.join(TASK_SCHEDULER_LIBRARY);
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
         // SAFETY: `wide` is NUL-terminated and outlives the call; no file handle is passed, as the call requires.
         let module = unsafe { LoadLibraryExW(wide.as_ptr(), std::ptr::null_mut(), LOAD_LIBRARY_SEARCH_SYSTEM32) };
         if module.is_null() {
-            return Err(TaskError::Failed(format!(
-                "{name} could not be loaded from the system folder: {}",
+            return Err(TaskError::failed(&format!(
+                "{} could not be loaded: {}",
+                path.display(),
                 io::Error::last_os_error()
+            )));
+        }
+        let loaded = module_path(module)
+            .map_err(|error| TaskError::failed(&format!("the file {TASK_SCHEDULER_LIBRARY} was loaded from could not be read: {error}")))?;
+        let (wanted, found): (Vec<u16>, Vec<u16>) = (path.as_os_str().encode_wide().collect(), loaded.as_os_str().encode_wide().collect());
+        if !crate::launch::ordinal_equal_ignore_case(&wanted, &found) {
+            return Err(TaskError::failed(&format!(
+                "{TASK_SCHEDULER_LIBRARY} was loaded from {}, not {}",
+                shown(&loaded.display().to_string()),
+                path.display()
             )));
         }
         Ok(SystemLibrary(module))
@@ -294,9 +383,9 @@ impl SystemLibrary {
 
     /// A new Task Scheduler service object, made by this library's own class factory.
     fn task_service(&self) -> Result<ITaskService, TaskError> {
-        // SAFETY: the module is loaded for as long as `self` lives, and the name is a NUL-terminated ASCII string.
+        // SAFETY: the module is never freed, and the name is a NUL-terminated ASCII string.
         let Some(found) = (unsafe { GetProcAddress(self.0, c"DllGetClassObject".as_ptr().cast()) }) else {
-            return Err(TaskError::Failed(format!(
+            return Err(TaskError::failed(&format!(
                 "{TASK_SCHEDULER_LIBRARY} has no DllGetClassObject: {}",
                 io::Error::last_os_error()
             )));
@@ -317,11 +406,22 @@ impl SystemLibrary {
     }
 }
 
-impl Drop for SystemLibrary {
-    fn drop(&mut self) {
-        // SAFETY: the library was loaded once, in `load`, and is freed once, here, after every interface made from it
-        // was released. A failed free leaves it loaded until the process ends, which harms nothing.
-        unsafe { FreeLibrary(self.0) };
+/// The path of the file the loaded module `module` was loaded from (`GetModuleFileNameW`).
+fn module_path(module: HMODULE) -> io::Result<PathBuf> {
+    let mut buffer = vec![0_u16; 260];
+    loop {
+        let size = u32::try_from(buffer.len()).map_err(io::Error::other)?;
+        // SAFETY: `buffer` is writable for `size` units, and the call writes at most that many; the module is loaded.
+        let length = unsafe { GetModuleFileNameW(module, buffer.as_mut_ptr(), size) } as usize;
+        if length == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if length < buffer.len() {
+            buffer.truncate(length);
+            return Ok(OsString::from_wide(&buffer).into());
+        }
+        // A path that filled the buffer was cut: ask again with room for a longer one.
+        buffer.resize(buffer.len() * 2, 0);
     }
 }
 
@@ -334,7 +434,7 @@ impl Apartment {
         // SAFETY: no reserved pointer is passed; the apartment is left once, when the guard made here drops.
         let joined = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
         if joined.is_err() {
-            return Err(TaskError::Failed(format!(
+            return Err(TaskError::failed(&format!(
                 "COM could not be set up: {}",
                 windows::core::Error::from(joined)
             )));
@@ -363,13 +463,16 @@ fn start_checked(library: &SystemLibrary, request: &Request) -> Result<StartedTa
     // SAFETY: the task's name is a valid BSTR for the call.
     let task = unsafe { found.GetTask(&BSTR::from(request.name.as_str())) }.map_err(missing("open the task"))?;
     let definition = read_definition(&task)?;
-    check_definition(&definition, &request.expected).map_err(TaskError::SetUpWrong)?;
+    check_definition(&definition, &request.expected).map_err(|what| TaskError::set_up_wrong(&what))?;
     run(&task, request)
 }
 
 /// Runs `task` in the request's session, as no named user and ignoring its constraints, with the request's argument
-/// as its one parameter, and reads the process it started.
+/// as its one parameter, and reads the process it started; runs nothing once the request is cancelled.
 fn run(task: &IRegisteredTask, request: &Request) -> Result<StartedTask, TaskError> {
+    if request.cancel.load(Ordering::SeqCst) {
+        return Err(TaskError::failed("the start was given up before the task was run"));
+    }
     let argument = BSTR::from(request.argument.as_str());
     let mut parameters = VARIANT::default();
     // SAFETY: the variant is set to hold a BSTR whose pointer is a bitwise copy of `argument`'s, in a field that never
@@ -383,15 +486,20 @@ fn run(task: &IRegisteredTask, request: &Request) -> Result<StartedTask, TaskErr
     // SAFETY: the variant holds a valid BSTR, and the empty user name asks for the task's own principal.
     let running = unsafe { task.RunEx(&parameters, flags, request.session_id.cast_signed(), &BSTR::new()) }.map_err(failed("run the task"))?;
     drop(argument);
-    engine_pid(&running, Instant::now() + request.pid_wait)
+    let by = Instant::now()
+        .checked_add(request.pid_wait)
+        .map_or(request.deadline, |end| end.min(request.deadline));
+    engine_pid(&running, by)
 }
 
-/// The process of the started instance `running`: asked again, after a refresh, while it reads 0 and the instance is
-/// queued, until `by`; [`StartedTask::NoPid`] when none is given by then, or the instance left the queue without one.
+/// The process of the started instance `running`, read after a refresh, and again while it reads 0 and the instance
+/// has not ended, until `by`; [`StartedTask::NoPid`] when none is given by then, or the instance ended without one.
 fn engine_pid(running: &IRunningTask, by: Instant) -> Result<StartedTask, TaskError> {
     loop {
-        // The state is read before the pid, so a pid given as the instance leaves the queue is read too.
         // SAFETY: the running task's interface is valid for the call.
+        unsafe { running.Refresh() }.map_err(unseen("refresh the started task"))?;
+        // The state is read before the pid, so a pid given as the instance ends is read too.
+        // SAFETY: as above.
         let state = unsafe { running.State() }.map_err(unseen("read the started task's state"))?;
         // SAFETY: as above.
         let pid = unsafe { running.EnginePID() }.map_err(unseen("read the started task's process"))?;
@@ -399,13 +507,17 @@ fn engine_pid(running: &IRunningTask, by: Instant) -> Result<StartedTask, TaskEr
             return Ok(StartedTask::Process(pid));
         }
         let now = Instant::now();
-        if state != TASK_STATE_QUEUED || now >= by {
+        if has_ended(state) || now >= by {
             return Ok(StartedTask::NoPid);
         }
         std::thread::sleep(PID_LOOK_STEP.min(by - now));
-        // SAFETY: as above.
-        unsafe { running.Refresh() }.map_err(unseen("refresh the started task"))?;
     }
+}
+
+/// Whether an instance in `state` has ended: the task reads ready, or disabled, once no instance of it runs. Queued,
+/// running and unknown are waited on.
+fn has_ended(state: TASK_STATE) -> bool {
+    state == TASK_STATE_READY || state == TASK_STATE_DISABLED
 }
 
 /// What the check reads of a registered task's definition.
@@ -441,6 +553,8 @@ struct Definition {
     user: String,
     /// The SID that user names; `None` when it names no account.
     user_sid: Option<String>,
+    /// The SID of the task's owner, which may change its DACL; `None` for a security descriptor that names none.
+    owner: Option<String>,
     /// The entries of the task's DACL; `None` for a task with no DACL, which anyone may change and run.
     dacl: Option<Vec<Entry>>,
 }
@@ -461,6 +575,7 @@ fn check_definition(definition: &Definition, expected: &Expected) -> Result<(), 
     check_limits(definition)?;
     check_action(&definition.actions, &expected.helper)?;
     check_principal(definition, &expected.user_sid)?;
+    check_owner(definition.owner.as_deref(), &expected.user_sid)?;
     check_dacl(definition.dacl.as_deref(), &expected.user_sid)
 }
 
@@ -539,19 +654,29 @@ fn check_principal(definition: &Definition, user_sid: &str) -> Result<(), String
     }
 }
 
-/// The first entry of the task's DACL, `dacl`, that lets anyone but SYSTEM, Administrators and the user
-/// `user_sid` change or run the task; an entry of a type the check does not read is refused too, and so is no DACL.
+/// Refuses an owner of the task, `owner`, that is not SYSTEM, Administrators or the user `user_sid`, since an owner
+/// may rewrite the DACL whatever it says; and a security descriptor that names no owner.
+fn check_owner(owner: Option<&str>, user_sid: &str) -> Result<(), String> {
+    match owner {
+        Some(sid) if is_trusted(sid, user_sid) => Ok(()),
+        Some(sid) => Err(format!("its owner ({}) may change who can run it", shown(sid))),
+        None => Err("its security descriptor names no owner".to_owned()),
+    }
+}
+
+/// The first entry of the task's DACL, `dacl`, that allows anyone but SYSTEM, Administrators and the user `user_sid`
+/// a right outside [`READ_ONLY`]; an entry of a type the check does not read is refused too, and so is no DACL.
 fn check_dacl(dacl: Option<&[Entry]>, user_sid: &str) -> Result<(), String> {
     let Some(entries) = dacl else {
         return Err("its security descriptor has no DACL, so anyone may change or run it".to_owned());
     };
     for entry in entries {
         match entry {
-            Entry::Allowed { mask, sid, .. } if mask & WRITE_OR_RUN != 0 && !is_trusted(sid, user_sid) => {
+            Entry::Allowed { mask, sid, .. } if mask & !READ_ONLY != 0 && !is_trusted(sid, user_sid) => {
                 return Err(format!(
-                    "its security descriptor lets {} change or run it (access 0x{:x})",
+                    "its security descriptor lets {} do more than read it (access 0x{:x})",
                     shown(sid),
-                    mask & WRITE_OR_RUN
+                    mask & !READ_ONLY
                 ));
             }
             Entry::Other { kind } if u32::from(*kind) != ACCESS_DENIED_ACE_TYPE => {
@@ -574,28 +699,13 @@ fn is_trusted(sid: &str, user_sid: &str) -> bool {
 fn same_path_text(text: &str, path: &Path) -> bool {
     let left: Vec<u16> = text.encode_utf16().collect();
     let right: Vec<u16> = path.as_os_str().encode_wide().collect();
-    let (Ok(left_len), Ok(right_len)) = (i32::try_from(left.len()), i32::try_from(right.len())) else {
-        return false;
-    };
-    // SAFETY: each pointer is to as many readable units as its length says, both outliving the call.
-    unsafe { CompareStringOrdinal(left.as_ptr(), left_len, right.as_ptr(), right_len, 1) == CSTR_EQUAL }
+    crate::launch::ordinal_equal_ignore_case(&left, &right)
 }
 
-/// `text`, read from a task, as an error may show it: every control and bidirectional formatting character escaped as
-/// `\u{…}`, and cut to [`SHOWN_LIMIT`] characters, `...` marking a cut, so it is one line that says what it holds.
+/// `text`, read from a task, as an error may show it: [`escaped`], and cut to [`SHOWN_LIMIT`] characters, `...`
+/// marking a cut, so it is one line that says what it holds.
 fn shown(text: &str) -> String {
-    let escaped: String = text
-        .chars()
-        .flat_map(|character| {
-            let escape = character.is_control() || is_bidi_format(character);
-            let (plain, escaped) = if escape {
-                (None, Some(character.escape_unicode()))
-            } else {
-                (Some(character), None)
-            };
-            plain.into_iter().chain(escaped.into_iter().flatten())
-        })
-        .collect();
+    let escaped = escaped(text);
     if escaped.chars().count() <= SHOWN_LIMIT {
         return escaped;
     }
@@ -604,10 +714,48 @@ fn shown(text: &str) -> String {
     cut
 }
 
-/// Whether `character` is one of Unicode's bidirectional formatting characters, which reorder the text shown after
-/// them.
-fn is_bidi_format(character: char) -> bool {
-    matches!(character, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+/// `text` with each character that could break or forge a line, or hide or reorder part of it, escaped as `\u{…}`:
+/// every control character (Cc), the line and paragraph separators, and every format character (Cf), the zero-width
+/// characters and the bidirectional marks, embeddings, overrides and isolates among them. Escaping twice changes
+/// nothing more.
+fn escaped(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for character in text.chars() {
+        if character.is_control() || matches!(character, '\u{2028}' | '\u{2029}') || is_format(character) {
+            escaped.extend(character.escape_unicode());
+        } else {
+            escaped.push(character);
+        }
+    }
+    escaped
+}
+
+/// Whether `character` is in Unicode's format category (Cf).
+fn is_format(character: char) -> bool {
+    matches!(
+        character,
+        '\u{ad}'
+            | '\u{600}'..='\u{605}'
+            | '\u{61c}'
+            | '\u{6dd}'
+            | '\u{70f}'
+            | '\u{890}'..='\u{891}'
+            | '\u{8e2}'
+            | '\u{180e}'
+            | '\u{200b}'..='\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{206f}'
+            | '\u{feff}'
+            | '\u{fff9}'..='\u{fffb}'
+            | '\u{110bd}'
+            | '\u{110cd}'
+            | '\u{13430}'..='\u{1343f}'
+            | '\u{1bca0}'..='\u{1bca3}'
+            | '\u{1d173}'..='\u{1d17a}'
+            | '\u{e0001}'
+            | '\u{e0020}'..='\u{e007f}'
+    )
 }
 
 /// What the check needs of `task`'s registered definition.
@@ -622,7 +770,7 @@ fn read_definition(task: &IRegisteredTask) -> Result<Definition, TaskError> {
     read_settings(&definition, &mut checked)?;
     read_principal(&definition, &mut checked)?;
     read_actions(&definition, &mut checked)?;
-    checked.dacl = read_dacl(task)?;
+    read_security(task, &mut checked)?;
     Ok(checked)
 }
 
@@ -713,23 +861,44 @@ fn read_action(action: &IAction) -> Result<Action, TaskError> {
     }
 }
 
-/// The entries of `task`'s DACL; `None` when it has none.
-fn read_dacl(task: &IRegisteredTask) -> Result<Option<Vec<Entry>>, TaskError> {
-    let unreadable = |error: io::Error| TaskError::Failed(format!("the task's security descriptor could not be read: {error}"));
+/// Reads the owner and the DACL of `task`'s security descriptor into `into`.
+fn read_security(task: &IRegisteredTask, into: &mut Definition) -> Result<(), TaskError> {
+    let unreadable = |error: io::Error| TaskError::failed(&format!("the task's security descriptor could not be read: {error}"));
+    let wanted = OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
     // SAFETY: the interface is valid for the call.
-    let sddl =
-        unsafe { task.GetSecurityDescriptor(DACL_SECURITY_INFORMATION.cast_signed()) }.map_err(failed("read the task's security descriptor"))?;
+    let sddl = unsafe { task.GetSecurityDescriptor(wanted.cast_signed()) }.map_err(failed("read the task's security descriptor"))?;
     let descriptor = SecurityDescriptor::from_sddl(&sddl.to_string()).map_err(unreadable)?;
+    into.owner = owner_of(&descriptor).map_err(unreadable)?;
+    into.dacl = dacl_of(&descriptor).map_err(unreadable)?;
+    Ok(())
+}
+
+/// The SID of the owner `descriptor` names; `None` when it names none.
+fn owner_of(descriptor: &SecurityDescriptor) -> io::Result<Option<String>> {
+    let (mut owner, mut defaulted): (PSID, _) = (std::ptr::null_mut(), 0);
+    // SAFETY: the descriptor is valid for as long as `descriptor` lives, and every out pointer is to a local.
+    if unsafe { GetSecurityDescriptorOwner(descriptor.0, &raw mut owner, &raw mut defaulted) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if owner.is_null() {
+        return Ok(None);
+    }
+    // SAFETY: `owner` points into the descriptor, which outlives the read.
+    unsafe { crate::token::sid_string(owner) }.map(Some)
+}
+
+/// The entries of the DACL of `descriptor`; `None` when it has none.
+fn dacl_of(descriptor: &SecurityDescriptor) -> io::Result<Option<Vec<Entry>>> {
     let (mut present, mut defaulted, mut acl) = (0, 0, std::ptr::null_mut::<ACL>());
     // SAFETY: the descriptor is valid for as long as `descriptor` lives, and every out pointer is to a local.
     if unsafe { GetSecurityDescriptorDacl(descriptor.0, &raw mut present, &raw mut acl, &raw mut defaulted) } == 0 {
-        return Err(unreadable(io::Error::last_os_error()));
+        return Err(io::Error::last_os_error());
     }
     if present == 0 || acl.is_null() {
         return Ok(None);
     }
     // SAFETY: `acl` points into the descriptor, which outlives the read.
-    unsafe { entries_of(acl) }.map(Some).map_err(unreadable)
+    unsafe { entries_of(acl) }.map(Some)
 }
 
 /// The string form of the SID the account `name` names: `name` itself when it is a SID's string form; `None` when it
@@ -741,7 +910,7 @@ fn sid_of_account(name: &str) -> Result<Option<String>, TaskError> {
     if name.is_empty() {
         return Ok(None);
     }
-    let lookup_failed = |error: io::Error| TaskError::Failed(format!("the task's user {} could not be looked up: {error}", shown(name)));
+    let lookup_failed = |error: io::Error| TaskError::failed(&format!("the task's user {} could not be looked up: {error}", shown(name)));
     let wide = crate::wide(name);
     let (mut sid_size, mut domain_size, mut kind) = (0_u32, 0_u32, SID_NAME_USE::default());
     // SAFETY: `wide` is NUL-terminated and outlives the call; with null buffers of size 0 the call only writes the
@@ -790,12 +959,12 @@ fn sid_of_account(name: &str) -> Result<Option<String>, TaskError> {
 
 /// The error of a failed call that did `what`, before anything was started, with the system's message and the HRESULT.
 fn failed(what: &'static str) -> impl Fn(windows::core::Error) -> TaskError {
-    move |error| TaskError::Failed(call_failed(what, &error))
+    move |error| TaskError::failed(&call_failed(what, &error))
 }
 
 /// As [`failed`], for a call made once the task was started: [`TaskError::StartedUnknown`].
 fn unseen(what: &'static str) -> impl Fn(windows::core::Error) -> TaskError {
-    move |error| TaskError::StartedUnknown(call_failed(what, &error))
+    move |error| TaskError::started_unknown(&call_failed(what, &error))
 }
 
 /// As [`failed`], but a task or folder that does not exist is [`TaskError::NotRegistered`].
@@ -870,11 +1039,13 @@ mod tests {
             least_privilege: true,
             user: r"BUILDER\someone".to_owned(),
             user_sid: Some(USER.to_owned()),
+            owner: Some(USER.to_owned()),
             dacl: Some(vec![
                 allowed("S-1-5-18", 0x001f_01ff),
                 allowed("S-1-5-32-544", 0x001f_01ff),
                 allowed(USER, 0x001f_01ff),
                 allowed("S-1-5-11", 0x0012_0089),
+                allowed("S-1-1-0", 0x8000_0000),
                 Entry::Other { kind: 1 },
             ]),
         }
@@ -920,6 +1091,13 @@ mod tests {
             Ok(()),
             "the user's SID is compared without regard to case"
         );
+        for owner in ["S-1-5-18", "S-1-5-32-544"] {
+            let owned = Definition {
+                owner: Some(owner.to_owned()),
+                ..good()
+            };
+            assert_eq!(check_definition(&owned, &expected()), Ok(()), "{owner} may own the task");
+        }
     }
 
     #[test]
@@ -1033,32 +1211,59 @@ mod tests {
     }
 
     #[test]
-    fn a_security_descriptor_that_lets_another_change_or_run_the_task_is_named() {
+    fn a_security_descriptor_that_lets_another_do_more_than_read_the_task_is_named() {
+        let with_dacl = |entries: Vec<Entry>| Definition {
+            dacl: Some(entries),
+            ..good()
+        };
         let cases = [
-            (None, "no DACL".to_owned()),
+            (Definition { dacl: None, ..good() }, "no DACL"),
             (
-                Some(vec![allowed("S-1-5-11", 0x0012_00a0)]),
-                "lets S-1-5-11 change or run it (access 0x20)".to_owned(),
+                with_dacl(vec![allowed("S-1-5-11", 0x0012_00a0)]),
+                "lets S-1-5-11 do more than read it (access 0x20)",
             ),
-            (Some(vec![allowed("S-1-1-0", 0x1000_0000)]), "lets S-1-1-0 change or run it".to_owned()),
             (
-                Some(vec![allowed("S-1-5-21-1-2-3-1002", 0x0004_0000)]),
-                "lets S-1-5-21-1-2-3-1002 change or run it (access 0x40000)".to_owned(),
+                with_dacl(vec![allowed("S-1-1-0", 0x1000_0000)]),
+                "lets S-1-1-0 do more than read it (access 0x10000000)",
             ),
-            (Some(vec![Entry::Other { kind: 5 }]), "an entry of type 5".to_owned()),
+            (
+                with_dacl(vec![allowed("S-1-5-21-1-2-3-1002", 0x0004_0000)]),
+                "lets S-1-5-21-1-2-3-1002 do more than read it (access 0x40000)",
+            ),
+            (
+                with_dacl(vec![allowed("S-1-1-0", 0x0100_0000)]),
+                "lets S-1-1-0 do more than read it (access 0x1000000)",
+            ),
+            (
+                with_dacl(vec![allowed("S-1-1-0", 0x0000_0400)]),
+                "lets S-1-1-0 do more than read it (access 0x400)",
+            ),
+            (with_dacl(vec![Entry::Other { kind: 5 }]), "an entry of type 5"),
+            (
+                Definition {
+                    owner: Some("S-1-5-21-1-2-3-1002".to_owned()),
+                    ..good()
+                },
+                "its owner (S-1-5-21-1-2-3-1002) may change who can run it",
+            ),
+            (Definition { owner: None, ..good() }, "names no owner"),
         ];
-        for (dacl, named) in cases {
-            let definition = Definition { dacl, ..good() };
-
+        for (definition, named) in cases {
             let why = mismatch(&definition);
 
-            assert!(why.contains(&named), "{:?} is refused for {named:?}: {why:?}", definition.dacl);
+            assert!(
+                why.contains(named),
+                "{:?} owned by {:?} is refused for {named:?}: {why:?}",
+                definition.dacl,
+                definition.owner
+            );
         }
     }
 
     #[test]
     fn task_text_with_a_line_break_or_bidi_control_is_shown_on_one_line_and_cut() {
-        let forged = "C:\\x\ngate-remote-refused: busy\r\n\u{202e}exe.";
+        let forged = "C:\\x\ngate-remote-refused: busy\r\n\u{202e}exe.\u{2028}gate-remote-refused: busy\u{200b}\u{feff}";
+        let forging = |character: char| character.is_control() || matches!(character, '\u{202e}' | '\u{2028}' | '\u{200b}' | '\u{feff}');
         let long = "x".repeat(500);
         for path in [forged, long.as_str()] {
             let definition = Definition {
@@ -1069,14 +1274,17 @@ mod tests {
             let why = mismatch(&definition);
 
             assert_eq!(why.lines().count(), 1, "{why:?}");
-            assert!(!why.chars().any(|character| character.is_control() || character == '\u{202e}'), "{why:?}");
+            assert!(!why.chars().any(forging), "{why:?}");
             assert!(why.chars().count() < 200 + HELPER.len() + 40, "the task's text is cut: {why:?}");
         }
         let why = mismatch(&Definition {
             actions: vec![exec(forged, "$(Arg0)")],
             ..good()
         });
-        assert!(why.contains(r"C:\x\u{a}gate-remote-refused: busy\u{d}\u{a}\u{202e}exe."), "{why:?}");
+        assert!(
+            why.contains(r"C:\x\u{a}gate-remote-refused: busy\u{d}\u{a}\u{202e}exe.\u{2028}gate-remote-refused: busy\u{200b}\u{feff}"),
+            "{why:?}"
+        );
     }
 
     #[test]
@@ -1089,10 +1297,11 @@ mod tests {
         }
         let denied = missing("open the task")(windows::core::Error::from_hresult(HRESULT(0x8007_0005_u32.cast_signed())));
 
-        assert!(
-            matches!(&denied, TaskError::Failed(why) if why.starts_with("the Task Scheduler could not open the task: ") && why.ends_with("(0x80070005)")),
-            "{denied:?}"
-        );
+        let named = match &denied {
+            TaskError::Failed(why) => why.starts_with("the Task Scheduler could not open the task: ") && why.ends_with("(0x80070005)"),
+            _ => false,
+        };
+        assert!(named, "{denied:?}");
     }
 
     #[test]
