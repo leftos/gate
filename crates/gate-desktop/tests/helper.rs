@@ -16,8 +16,8 @@ use std::time::{Duration, Instant};
 use gate_desktop::protocol::{HELPER_FRAME_LIMIT, Message, Spawn, read_message, write_message};
 use gate_desktop::{HelperExit, PIPE_PREFIX, arg0};
 use gate_win32::{
-    ConnectWait, EndReport, Job, PipeServer, RemoteProcess, StoppableProcess, Suspended, creation_time_of, current_user_sid, system_directory,
-    thread_is_suspended,
+    ConnectWait, EndReport, Job, PipeOwner, PipeServer, RemoteProcess, StoppableProcess, Suspended, creation_time_of, current_user_sid,
+    system_directory, thread_is_suspended,
 };
 use proc_table::win32::Win32ProcessTable;
 use windows_sys::Win32::Foundation::{CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE};
@@ -60,18 +60,28 @@ fn wide(text: impl AsRef<OsStr>) -> Vec<u16> {
 
 /// A fresh control pipe for this user.
 fn serve() -> PipeServer {
-    PipeServer::create(PIPE_PREFIX, &current_user_sid().expect("the user is read")).expect("the pipe is made")
+    PipeServer::create(PIPE_PREFIX, &current_user_sid().expect("the user is read"), PipeOwner::User).expect("the pipe is made")
 }
 
-/// The helper, started with `args` and, when given, the seam capping its limits at `limit_ms`.
-fn start_helper(args: &[&str], limit_ms: Option<u64>) -> Child {
+/// The helper's seam that, set to `user`, makes it take a control pipe its user owns, as an unelevated test makes it.
+const PIPE_OWNER_VARIABLE: &str = "GATE_DESKTOP_TEST_PIPE_OWNER";
+
+/// The helper's command, with `args` and, when given, the seam capping its limits at `limit_ms`, and the seam that
+/// makes it take the pipe this unelevated test makes, which its user owns.
+fn helper_command(args: &[&str], limit_ms: Option<u64>) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_gate-desktop-helper"));
     command.args(args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
     match limit_ms {
         Some(limit) => command.env(LIMIT_VARIABLE, limit.to_string()),
         None => command.env_remove(LIMIT_VARIABLE),
     };
-    gate_win32::spawn(&mut command).expect("the helper starts")
+    command.env(PIPE_OWNER_VARIABLE, "user");
+    command
+}
+
+/// The helper, started as [`helper_command`] makes it.
+fn start_helper(args: &[&str], limit_ms: Option<u64>) -> Child {
+    gate_win32::spawn(&mut helper_command(args, limit_ms)).expect("the helper starts")
 }
 
 /// The helper's exit code, once it has exited.
@@ -264,6 +274,23 @@ fn the_helper_refuses_a_server_whose_pid_is_not_the_box() {
     let waited = server.wait_for_client(guard(), &[helper.as_handle()]).expect("the connect is waited on");
     assert_eq!(waited, ConnectWait::Connected, "the helper reached the pipe before its server check");
     assert_eq!(exit_of(&mut helper), code(HelperExit::ServerRefused));
+}
+
+#[test]
+fn the_helper_refuses_a_pipe_not_owned_by_administrators() {
+    let server = serve();
+    let arg = arg0(std::process::id(), server.name()).expect("the pipe's name makes an Arg0");
+    let mut command = helper_command(&[&arg], Some(ROOMY_LIMIT_MS));
+    // Without the seam the helper takes only a pipe Administrators own, which this test's pipe, its user's, is not.
+    command.env_remove(PIPE_OWNER_VARIABLE);
+
+    let mut helper = gate_win32::spawn(&mut command).expect("the helper starts");
+
+    let waited = server.wait_for_client(guard(), &[helper.as_handle()]).expect("the connect is waited on");
+    assert_eq!(waited, ConnectWait::Connected, "the helper opened the pipe before reading its owner");
+    assert_eq!(exit_of(&mut helper), code(HelperExit::ServerRefused));
+    let after = read_message(&server, guard(), HELPER_FRAME_LIMIT, &[]).expect_err("the refusing helper sent nothing");
+    assert!(matches!(after, gate_desktop::protocol::ReadError::Closed), "no hello was sent: {after}");
 }
 
 /// The value of the helper's own handle to the control pipe: the one pipe handle in its table whose server is this

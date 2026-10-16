@@ -53,13 +53,13 @@ pub use launch::{
     same_variable_name,
 };
 pub use memory::working_set;
-pub use mutex::{AcquireError, MutexGuard, NamedMutex, OwnedMutexGuard, mutex_exists};
-pub use pipe::{ConnectWait, PipeClient, PipeRead, PipeServer, PipeWrite};
+pub use mutex::{AcquireError, MutexGuard, NamedMutex, OwnedMutexGuard, PrivateMutex, PrivateName, mutex_exists};
+pub use pipe::{ConnectWait, PipeClient, PipeOwner, PipeRead, PipeServer, PipeWrite};
 pub use piped::{DesktopLaunch, OutputPipes, PipedConsole, PipedFed, PipedLaunch, PipedSuspended, breakaway_refused, output_pipes};
 pub use session::{ConnectState, LockState, SessionState, active_console_session, input_desktop_name, session_state};
 pub use task::{StartedTask, TaskArgument, TaskError, TaskStart, run_task};
 pub use times::{ProcessTimes, SystemTimes, file_time_now, process_times, system_times, wsl_vm_cpu};
-pub use token::{Grant, NetworkGroup, RestrictedToken, TokenFacts, current_user_sid, token_facts};
+pub use token::{Account, Grant, NetworkGroup, RestrictedToken, TokenFacts, current_account, current_user_sid, token_facts};
 
 /// Refuses an open file that is not a plain disk file: one that is not on a disk, is a reparse point (a link or a
 /// junction, when opened with `FILE_FLAG_OPEN_REPARSE_POINT`), or has more than one name.
@@ -144,6 +144,24 @@ pub fn win32_message(code: u32) -> String {
     // SAFETY: the buffer was allocated by `FormatMessageW` with `LocalAlloc`, is no longer read, and is freed once.
     unsafe { LocalFree(buffer.cast()) };
     message.trim_end_matches(|c: char| c <= ' ').to_owned()
+}
+
+/// Makes a DLL this process loads by name after this call come from the system folder (`System32`) alone
+/// (`SetDefaultDllDirectories` with `LOAD_LIBRARY_SEARCH_SYSTEM32`), never from the program's folder, the working
+/// folder or `PATH`, so a DLL planted in a folder this process runs from is not loaded by name after it. DLLs loaded
+/// before the call, those the program imports among them, are not affected.
+///
+/// # Errors
+///
+/// The system's error when the search order cannot be set.
+pub fn set_default_dll_directories_system32() -> io::Result<()> {
+    use windows_sys::Win32::System::LibraryLoader::{LOAD_LIBRARY_SEARCH_SYSTEM32, SetDefaultDllDirectories};
+
+    // SAFETY: the call takes only a flag.
+    if unsafe { SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// This process's start time, as the process table gives start times (whole microseconds).
@@ -369,6 +387,11 @@ mod tests {
             tried.set(true);
             Ok("query only")
         }
+    }
+
+    #[test]
+    fn the_default_dll_directories_are_set_to_the_system_folder() {
+        super::set_default_dll_directories_system32().expect("the search order is set");
     }
 
     #[test]

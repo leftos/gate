@@ -57,8 +57,8 @@ pub enum HelperExit {
     BadArgument = 10,
     /// No pipe of the name appeared before the connect limit.
     NoPipe = 11,
-    /// The pipe could not be opened, its owner, DACL or label was not the box's, or its server's pid was not the box's
-    /// or could not be read.
+    /// The pipe could not be opened, its owner was not Administrators (so no elevated process made it), its DACL or
+    /// label was not the one the box gives it, or its server's pid was not the box's or could not be read.
     ServerRefused = 12,
     /// The box closed or disconnected the pipe: the write of `Hello` or `Child`, or the read of `Spawn` or `Done`,
     /// found it closed, or failed with `ERROR_BROKEN_PIPE`, `ERROR_PIPE_NOT_CONNECTED` or `ERROR_NO_DATA`. A child
@@ -95,6 +95,49 @@ impl HelperExit {
     #[must_use]
     pub fn code(self) -> u32 {
         self as u32
+    }
+
+    /// The exit whose code is `code`; `None` for a code no exit has.
+    #[must_use]
+    pub fn from_code(code: u32) -> Option<HelperExit> {
+        Some(match code {
+            0 => HelperExit::Done,
+            10 => HelperExit::BadArgument,
+            11 => HelperExit::NoPipe,
+            12 => HelperExit::ServerRefused,
+            13 => HelperExit::BoxGone,
+            14 => HelperExit::BadSpawn,
+            15 => HelperExit::SpawnFailed,
+            16 => HelperExit::NoDone,
+            17 => HelperExit::BadMessage,
+            18 => HelperExit::TimedOut,
+            19 => HelperExit::Internal,
+            20 => HelperExit::SetupFailed,
+            21 => HelperExit::ChildNotEnded,
+            22 => HelperExit::WrongIntegrity,
+            _ => return None,
+        })
+    }
+
+    /// Why the helper ended so, short and in lower case, for a line such as `the desktop helper failed: {why}`.
+    #[must_use]
+    pub fn why(self) -> &'static str {
+        match self {
+            HelperExit::Done => "it handed the command over and the box said done",
+            HelperExit::BadArgument => "it was started with a malformed argument",
+            HelperExit::NoPipe => "it found no control pipe in time",
+            HelperExit::ServerRefused => "it refused the control pipe or the process serving it",
+            HelperExit::BoxGone => "the box closed the control pipe",
+            HelperExit::BadSpawn => "it refused the box's start request",
+            HelperExit::SpawnFailed => "the command could not be created",
+            HelperExit::NoDone => "the box never said done",
+            HelperExit::BadMessage => "the box sent something other than done",
+            HelperExit::TimedOut => "the box did not answer in time",
+            HelperExit::Internal => "a system call failed in the helper",
+            HelperExit::SetupFailed => "the command's start could not be set up",
+            HelperExit::ChildNotEnded => "it could not show the command ended after the box closed its pipe",
+            HelperExit::WrongIntegrity => "it runs elevated or above medium integrity",
+        }
     }
 
     /// The exit code as a process's `main` returns it.
@@ -135,7 +178,42 @@ fn is_pipe_hex(hex: &str) -> bool {
 mod tests {
     use gate_win32::TaskArgument;
 
-    use super::{HELPER_FILE, PIPE_PREFIX, arg0, helper_path};
+    use super::{HELPER_FILE, HelperExit, PIPE_PREFIX, arg0, helper_path};
+
+    #[test]
+    fn every_exit_code_has_a_why_and_maps_back() {
+        let all = [
+            HelperExit::Done,
+            HelperExit::BadArgument,
+            HelperExit::NoPipe,
+            HelperExit::ServerRefused,
+            HelperExit::BoxGone,
+            HelperExit::BadSpawn,
+            HelperExit::SpawnFailed,
+            HelperExit::NoDone,
+            HelperExit::BadMessage,
+            HelperExit::TimedOut,
+            HelperExit::Internal,
+            HelperExit::SetupFailed,
+            HelperExit::ChildNotEnded,
+            HelperExit::WrongIntegrity,
+        ];
+        let mut whys = Vec::new();
+
+        for exit in all {
+            assert_eq!(HelperExit::from_code(exit.code()), Some(exit), "{exit:?} maps back from its code");
+            let why = exit.why();
+            assert!(!why.is_empty(), "{exit:?} has a why");
+            assert_eq!(why, why.to_lowercase(), "{exit:?}'s why is lower case");
+            assert!(!why.ends_with('.'), "{exit:?}'s why has no closing period");
+            assert!(!whys.contains(&why), "{exit:?}'s why is its own: {why}");
+            whys.push(why);
+        }
+        let codes: Vec<u32> = all.iter().map(|exit| exit.code()).collect();
+        for code in (0..=300).chain([u32::MAX]) {
+            assert_eq!(HelperExit::from_code(code).is_some(), codes.contains(&code), "code {code}");
+        }
+    }
 
     #[test]
     fn every_arg0_is_a_task_argument() {

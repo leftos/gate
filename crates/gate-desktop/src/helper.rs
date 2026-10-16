@@ -8,7 +8,7 @@ use std::os::windows::io::{AsHandle, BorrowedHandle};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use gate_win32::{DesktopLaunch, EnvironmentBlock, LaunchError, PipeClient, Released, Suspended};
+use gate_win32::{DesktopLaunch, EnvironmentBlock, LaunchError, PipeClient, PipeOwner, Released, Suspended};
 use windows_sys::Win32::System::SystemServices::SECURITY_MANDATORY_MEDIUM_RID;
 
 use crate::protocol::{DEFAULT_DESKTOP, FRAME_LIMIT, Message, ReadError, Spawn, WriteError, read_message, write_message};
@@ -34,6 +34,11 @@ const ENDED_UNSTARTED: u32 = 1;
 /// The seam that caps every limit, in milliseconds, in a build with the `test-seams` feature.
 #[cfg(feature = "test-seams")]
 const TEST_LIMIT_VARIABLE: &str = "GATE_DESKTOP_TEST_LIMIT_MS";
+
+/// The seam that, set to `user`, makes the helper take a control pipe its own user owns in place of Administrators,
+/// in a build with the `test-seams` feature.
+#[cfg(feature = "test-seams")]
+const TEST_PIPE_OWNER_VARIABLE: &str = "GATE_DESKTOP_TEST_PIPE_OWNER";
 
 /// How long each step may take.
 #[derive(Clone, Copy, Debug)]
@@ -84,15 +89,32 @@ pub fn run(args: impl IntoIterator<Item = OsString>) -> HelperExit {
     };
     #[cfg(not(feature = "test-seams"))]
     let limits = Limits::BUILT;
-    match serve(box_pid, &name, limits) {
+    #[cfg(feature = "test-seams")]
+    let Some(owner) = pipe_owner_seam() else {
+        return HelperExit::BadArgument;
+    };
+    #[cfg(not(feature = "test-seams"))]
+    let owner = PipeOwner::Administrators;
+    match serve(box_pid, &name, limits, owner) {
         Ok(exit) | Err(exit) => exit,
     }
 }
 
+/// The owner the control pipe must have: Administrators, or its user when `GATE_DESKTOP_TEST_PIPE_OWNER` is `user`.
+/// `None` for a seam set to anything else.
+#[cfg(feature = "test-seams")]
+fn pipe_owner_seam() -> Option<PipeOwner> {
+    match std::env::var_os(TEST_PIPE_OWNER_VARIABLE) {
+        None => Some(PipeOwner::Administrators),
+        Some(value) if value == "user" => Some(PipeOwner::User),
+        Some(_) => None,
+    }
+}
+
 /// The run once `Arg0` is read: every step in order, the first that ends the run giving its exit.
-fn serve(box_pid: u32, name: &str, limits: Limits) -> Result<HelperExit, HelperExit> {
+fn serve(box_pid: u32, name: &str, limits: Limits, owner: PipeOwner) -> Result<HelperExit, HelperExit> {
     check_integrity()?;
-    let pipe = connect(name, limits.connect)?;
+    let pipe = connect(name, limits.connect, owner)?;
     match pipe.server_pid() {
         Ok(pid) if pid == box_pid => {}
         Ok(_) | Err(_) => return Err(HelperExit::ServerRefused),
@@ -131,13 +153,13 @@ fn integrity_refused(elevated: bool, integrity: u32) -> bool {
     elevated || integrity > SECURITY_MANDATORY_MEDIUM_RID.cast_unsigned()
 }
 
-/// The control pipe `name`, opened as its owner, this process's user, made it, tried again while it is not there yet
-/// or busy until `limit` has passed.
-fn connect(name: &str, limit: Duration) -> Result<PipeClient, HelperExit> {
+/// The control pipe `name`, opened only when `owner` owns it and its DACL and label are the ones the box gives it for
+/// this process's user, tried again while it is not there yet or busy until `limit` has passed.
+fn connect(name: &str, limit: Duration, owner: PipeOwner) -> Result<PipeClient, HelperExit> {
     let user = gate_win32::current_user_sid().map_err(|_| HelperExit::Internal)?;
     let deadline = Instant::now() + limit;
     loop {
-        match PipeClient::open(name, &user) {
+        match PipeClient::open(name, &user, owner) {
             Ok(pipe) => return Ok(pipe),
             Err(error) if matches!(error.raw_os_error(), Some(ERROR_FILE_NOT_FOUND | ERROR_PIPE_BUSY)) => {}
             Err(_) => return Err(HelperExit::ServerRefused),

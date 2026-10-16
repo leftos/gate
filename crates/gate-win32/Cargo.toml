@@ -10,6 +10,11 @@ doctest = false
 [lints]
 workspace = true
 
+[features]
+# `PipeOwner::User` and `PrivateName::for_user`, which let an unelevated test make the control pipe and the desktop
+# namespace; an installed gate is built without.
+test-seams = []
+
 [dependencies]
 jiff = "0.2.37"
 proc-table = { path = "../proc-table" }

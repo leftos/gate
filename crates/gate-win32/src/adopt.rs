@@ -826,8 +826,8 @@ pub(crate) mod tests {
     fn check_received_output_takes_only_a_pipe_other_than_the_control_pipe() {
         // The helper's control pipe is the client end of a named pipe, as here.
         let sid = crate::current_user_sid().expect("the user is read");
-        let server = crate::PipeServer::create("gate-win32-adopt-test", &sid).expect("the control pipe is made");
-        let client = crate::PipeClient::open(server.name(), &sid).expect("the control pipe opens");
+        let server = crate::PipeServer::create("gate-win32-adopt-test", &sid, crate::PipeOwner::User).expect("the control pipe is made");
+        let client = crate::PipeClient::open(server.name(), &sid, crate::PipeOwner::User).expect("the control pipe opens");
         let control = client.handle();
         let (read, write) = pipe();
 

@@ -4,6 +4,12 @@
 
 #![windows_subsystem = "windows"]
 
+use gate_desktop::HelperExit;
+
 fn main() -> std::process::ExitCode {
+    // First of all, so no DLL the helper loads by name afterwards comes from its own folder or the working folder.
+    if gate_win32::set_default_dll_directories_system32().is_err() {
+        return HelperExit::Internal.exit_code();
+    }
     gate_desktop::run(std::env::args_os().skip(1)).exit_code()
 }

@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
-use gate_win32::{NamedEvent, PipeClient, PipeRead, PipeServer, PipeWrite};
+use gate_win32::{NamedEvent, PipeClient, PipeOwner, PipeRead, PipeServer, PipeWrite};
 
 use super::{
     DecodeError, FRAME_LIMIT, FramePipe, HELLO_TEXT_LIMIT, HELPER_FRAME_LIMIT, Message, ReadError, Spawn, WriteError, decode, encode, read_message,
@@ -429,8 +429,8 @@ fn a_deadline_already_passed_reads_nothing() {
 #[test]
 fn a_read_woken_by_a_set_manual_reset_event_returns_at_once_as_woken() {
     let sid = gate_win32::current_user_sid().expect("the user is read");
-    let server = PipeServer::create("gate-desktop-protocol-test", &sid).expect("the pipe is made");
-    let client = PipeClient::open(server.name(), &sid).expect("the client opens the pipe");
+    let server = PipeServer::create("gate-desktop-protocol-test", &sid, PipeOwner::User).expect("the pipe is made");
+    let client = PipeClient::open(server.name(), &sid, PipeOwner::User).expect("the client opens the pipe");
     let name = format!(r"Local\gate-desktop-protocol-test-{}", std::process::id());
     let stop = NamedEvent::create_new_manual(&name).expect("the event is made");
     stop.set().expect("the event is set");

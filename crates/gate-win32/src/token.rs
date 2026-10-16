@@ -13,10 +13,11 @@ use windows_sys::Win32::Foundation::{GENERIC_ALL, HANDLE, LocalFree};
 use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
 use windows_sys::Win32::Security::{
     ACCESS_ALLOWED_ACE, ACL, ACL_REVISION, AddAccessAllowedAce, CreateRestrictedToken, CreateWellKnownSid, EqualSid, GetAce, GetLengthSid,
-    GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, InitializeAcl, LUA_TOKEN, PSID, SECURITY_MAX_SID_SIZE, SID_AND_ATTRIBUTES,
-    SetTokenInformation, TOKEN_ACCESS_MASK, TOKEN_ADJUST_DEFAULT, TOKEN_ASSIGN_PRIMARY, TOKEN_DEFAULT_DACL, TOKEN_DUPLICATE, TOKEN_ELEVATION,
-    TOKEN_GROUPS, TOKEN_INFORMATION_CLASS, TOKEN_MANDATORY_LABEL, TOKEN_OWNER, TOKEN_QUERY, TOKEN_USER, TokenDefaultDacl, TokenElevation,
-    TokenGroups, TokenIntegrityLevel, TokenOwner, TokenUser, WELL_KNOWN_SID_TYPE, WinLocalSystemSid, WinMediumLabelSid, WinNetworkSid,
+    GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, InitializeAcl, LUA_TOKEN, LookupAccountSidW, PSID, SECURITY_MAX_SID_SIZE,
+    SID_AND_ATTRIBUTES, SID_NAME_USE, SetTokenInformation, TOKEN_ACCESS_MASK, TOKEN_ADJUST_DEFAULT, TOKEN_ASSIGN_PRIMARY, TOKEN_DEFAULT_DACL,
+    TOKEN_DUPLICATE, TOKEN_ELEVATION, TOKEN_GROUPS, TOKEN_INFORMATION_CLASS, TOKEN_MANDATORY_LABEL, TOKEN_OWNER, TOKEN_QUERY, TOKEN_USER,
+    TokenDefaultDacl, TokenElevation, TokenGroups, TokenIntegrityLevel, TokenOwner, TokenUser, WELL_KNOWN_SID_TYPE, WinLocalSystemSid,
+    WinMediumLabelSid, WinNetworkSid,
 };
 use windows_sys::Win32::System::SystemServices::{
     ACCESS_ALLOWED_ACE_TYPE, SE_GROUP_ENABLED, SE_GROUP_INTEGRITY, SE_GROUP_USE_FOR_DENY_ONLY, SECURITY_MANDATORY_MEDIUM_RID,
@@ -159,6 +160,77 @@ fn facts_of(token: &OwnedHandle) -> io::Result<TokenFacts> {
 /// The system's error when the token cannot be opened or read.
 pub fn current_user_sid() -> io::Result<String> {
     user_sid_of(&this_process_token(TOKEN_QUERY)?)
+}
+
+/// An account's name and the domain it belongs to (the computer's name for a local account), as the system names the
+/// account a SID stands for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Account {
+    /// The account's name, such as `alice`.
+    pub name: String,
+    /// Its domain, such as `CONTOSO` or the computer's name.
+    pub domain: String,
+}
+
+/// The account of this process's token's user (`TokenUser`, then `LookupAccountSidW`).
+///
+/// # Errors
+///
+/// The system's error when the token cannot be opened or read, or its user's account cannot be looked up.
+pub fn current_account() -> io::Result<Account> {
+    let token = this_process_token(TOKEN_QUERY)?;
+    let user = Information::<TOKEN_USER>::read(&token, TokenUser)?;
+    // SAFETY: the SID points into the buffer the system wrote it in, which lives across the call.
+    unsafe { account_of(user.get().User.Sid) }
+}
+
+/// The account `sid` stands for, as `LookupAccountSidW` names it on this computer.
+///
+/// # Safety
+///
+/// `sid` points to a valid SID for the whole call.
+unsafe fn account_of(sid: PSID) -> io::Result<Account> {
+    let (mut name_size, mut domain_size) = (0_u32, 0_u32);
+    let mut kind: SID_NAME_USE = 0;
+    // SAFETY: the caller guarantees `sid`; null buffers of no size ask only for the sizes, written to the two counts.
+    unsafe {
+        LookupAccountSidW(
+            std::ptr::null(),
+            sid,
+            std::ptr::null_mut(),
+            &raw mut name_size,
+            std::ptr::null_mut(),
+            &raw mut domain_size,
+            &raw mut kind,
+        )
+    };
+    if name_size == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut name = vec![0_u16; name_size as usize];
+    let mut domain = vec![0_u16; domain_size.max(1) as usize];
+    domain_size = u32::try_from(domain.len()).map_err(io::Error::other)?;
+    // SAFETY: as above, and each buffer is writable for the count given with it.
+    let found = unsafe {
+        LookupAccountSidW(
+            std::ptr::null(),
+            sid,
+            name.as_mut_ptr(),
+            &raw mut name_size,
+            domain.as_mut_ptr(),
+            &raw mut domain_size,
+            &raw mut kind,
+        )
+    };
+    if found == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // On success each count is the length written, its NUL left out.
+    let text = |units: &[u16], length: u32| String::from_utf16_lossy(units.get(..length as usize).unwrap_or(units));
+    Ok(Account {
+        name: text(&name, name_size),
+        domain: text(&domain, domain_size),
+    })
 }
 
 /// The string form of the SID of `token`'s user (`TokenUser`), `token` open with `TOKEN_QUERY`.
@@ -436,7 +508,8 @@ mod tests {
     };
 
     use super::{
-        Information, NetworkGroup, RestrictedToken, WellKnownSid, current_user_sid, facts_of, group_attributes, network_group_of, this_process_token,
+        Information, NetworkGroup, RestrictedToken, WellKnownSid, current_account, current_user_sid, facts_of, group_attributes, network_group_of,
+        this_process_token,
     };
 
     #[test]
@@ -459,6 +532,27 @@ mod tests {
         let sid = current_user_sid().expect("this process's user is read");
 
         assert_eq!(sid, listed, "whoami lists this process's user");
+    }
+
+    #[test]
+    fn the_own_account_names_match_the_token_user() {
+        let _alone = crate::create::tests::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let whoami = crate::system_directory().expect("the system folder is read").join("whoami.exe");
+        let output = crate::spawn(std::process::Command::new(whoami).stdout(std::process::Stdio::piped()))
+            .expect("whoami starts")
+            .wait_with_output()
+            .expect("whoami's output is read");
+        assert!(output.status.success(), "whoami succeeds: {output:?}");
+        // One line, `<domain>\<user>`, which whoami prints in lower case.
+        let listed = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+
+        let account = current_account().expect("this process's account is read");
+
+        assert!(!account.name.is_empty() && !account.domain.is_empty(), "{account:?}");
+        let named = format!("{}\\{}", account.domain, account.name);
+        assert_eq!(named.to_lowercase(), listed.to_lowercase(), "the account is whoami's, case aside");
     }
 
     /// This process's token, restricted.

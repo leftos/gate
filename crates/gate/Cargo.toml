@@ -9,7 +9,7 @@ workspace = true
 
 [features]
 # The hidden `--test-*` flags and the `fake-tool` helper the black-box suite needs; an installed gate is built without.
-test-seams = ["gate-args/test-seams"]
+test-seams = ["gate-args/test-seams", "gate-win32/test-seams"]
 
 [dependencies]
 base64 = "0.23.1"

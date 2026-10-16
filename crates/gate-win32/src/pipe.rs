@@ -170,29 +170,29 @@ impl PipeServer {
     ///
     /// The pipe has one instance (`FILE_FLAG_FIRST_PIPE_INSTANCE`, a maximum of one), so a pipe of the name made first
     /// by any other process fails the call rather than being joined. It refuses remote clients
-    /// (`PIPE_REJECT_REMOTE_CLIENTS`), reads and writes bytes, and is opened for overlapped I/O. Its owner is
-    /// `user_sid` (a SID in its string form, `S-1-5-21-…`), which this process's token must be able to make an owner:
-    /// its own user. Its DACL is protected and holds two entries, in this order: one for `user_sid`, granting reading
-    /// and writing and nothing that changes the pipe's security or makes another instance, and one for OWNER RIGHTS
-    /// granting only `READ_CONTROL`, so the owner keeps no implicit right to change the DACL. Its mandatory label is
-    /// medium, refusing a client below medium integrity reading, writing and executing (`NO_READ_UP`, `NO_WRITE_UP`,
-    /// `NO_EXECUTE_UP`).
+    /// (`PIPE_REJECT_REMOTE_CLIENTS`), reads and writes bytes, and is opened for overlapped I/O. Its owner is the one
+    /// `owner` names, Administrators in production, which only an elevated process can make an owner, so no process of
+    /// the user can make a pipe its client takes. Its DACL is protected and holds two entries, in this order: one for
+    /// `user_sid` (a SID in its string form, `S-1-5-21-…`), granting reading and writing and nothing that changes the
+    /// pipe's security or makes another instance, and one for OWNER RIGHTS granting only `READ_CONTROL`, so the owner
+    /// keeps no implicit right to change the DACL. Its mandatory label is medium, refusing a client below medium
+    /// integrity reading, writing and executing (`NO_READ_UP`, `NO_WRITE_UP`, `NO_EXECUTE_UP`).
     ///
     /// # Errors
     ///
     /// An error of kind [`io::ErrorKind::InvalidInput`] for a `user_sid` that is not a SID's string form; the
     /// system's error when the name cannot be drawn, the security descriptor cannot be built, or the pipe cannot be
     /// created, `ERROR_ACCESS_DENIED` when a pipe of the name exists already, `ERROR_INVALID_OWNER` when this process
-    /// cannot make `user_sid` an owner.
-    pub fn create(prefix: &str, user_sid: &str) -> io::Result<PipeServer> {
+    /// cannot make the owner an owner (an unelevated process and Administrators).
+    pub fn create(prefix: &str, user_sid: &str, owner: PipeOwner) -> io::Result<PipeServer> {
         let name = format!(r"\\.\pipe\{prefix}-{}", random_hex()?);
         check_local_pipe_name(&name)?;
-        PipeServer::create_named(name, user_sid)
+        PipeServer::create_named(name, user_sid, owner)
     }
 
     /// Creates the pipe `name` as [`PipeServer::create`] does.
-    fn create_named(name: String, user_sid: &str) -> io::Result<PipeServer> {
-        PipeServer::create_with(name, &server_sddl(user_sid)?)
+    fn create_named(name: String, user_sid: &str, owner: PipeOwner) -> io::Result<PipeServer> {
+        PipeServer::create_with(name, &server_sddl(user_sid, owner)?)
     }
 
     /// Creates the pipe `name` as [`PipeServer::create`] does, with the security descriptor `sddl` describes.
@@ -669,18 +669,47 @@ unsafe fn start_transfer(handle: HANDLE, op: &mut Transfer<'_>, overlapped: *mut
 /// A security descriptor the system built from a string, freed when dropped.
 pub(crate) struct SecurityDescriptor(pub(crate) PSECURITY_DESCRIPTOR);
 
-/// The descriptor string of a [`PipeServer`]'s pipe for `user_sid`: owned by it, a protected DACL allowing it
-/// [`CLIENT_ACCESS`] and OWNER RIGHTS `READ_CONTROL` alone, and a medium label refusing reads, writes and execution
-/// from below.
-fn server_sddl(user_sid: &str) -> io::Result<String> {
+/// The Administrators group's SID, the production owner of a [`PipeServer`]'s pipe.
+const ADMINISTRATORS: &str = "S-1-5-32-544";
+
+/// Who owns a [`PipeServer`]'s pipe, and so whom a [`PipeClient`] requires as its owner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PipeOwner {
+    /// The Administrators group (`S-1-5-32-544`): only an elevated process can make a pipe it owns.
+    Administrators,
+    /// The pipe's user itself, so that an unelevated test can make and open a pipe. Test builds only.
+    #[cfg(any(test, feature = "test-seams"))]
+    User,
+}
+
+impl PipeOwner {
+    /// The owner's SID, in its string form, for a pipe whose user is `user_sid`.
+    #[cfg_attr(
+        not(any(test, feature = "test-seams")),
+        expect(unused_variables, reason = "only the test owner is the pipe's user")
+    )]
+    fn sid(self, user_sid: &str) -> &str {
+        match self {
+            PipeOwner::Administrators => ADMINISTRATORS,
+            #[cfg(any(test, feature = "test-seams"))]
+            PipeOwner::User => user_sid,
+        }
+    }
+}
+
+/// The descriptor string of a [`PipeServer`]'s pipe for `user_sid`: owned by `owner`, a protected DACL allowing
+/// `user_sid` [`CLIENT_ACCESS`] and OWNER RIGHTS `READ_CONTROL` alone, and a medium label refusing reads, writes and
+/// execution from below.
+fn server_sddl(user_sid: &str, owner: PipeOwner) -> io::Result<String> {
     if !is_sid_string(user_sid) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("{user_sid:?} is not a SID in its string form"),
         ));
     }
+    let owner_sid = owner.sid(user_sid);
     Ok(format!(
-        "O:{user_sid}D:P(A;;0x{CLIENT_ACCESS:x};;;{user_sid})(A;;0x{READ_CONTROL:x};;;{OWNER_RIGHTS})S:(ML;;NWNRNX;;;ME)"
+        "O:{owner_sid}D:P(A;;0x{CLIENT_ACCESS:x};;;{user_sid})(A;;0x{READ_CONTROL:x};;;{OWNER_RIGHTS})S:(ML;;NWNRNX;;;ME)"
     ))
 }
 
@@ -744,10 +773,10 @@ pub struct PipeClient {
 impl PipeClient {
     /// Opens the pipe `name` with the access its server grants, for overlapped I/O, at the anonymous impersonation
     /// level (`SECURITY_SQOS_PRESENT | SECURITY_ANONYMOUS`): whatever process made the pipe cannot act as this one.
-    /// It then reads the pipe's owner, DACL and mandatory label and keeps the pipe only when the owner is `owner_sid` (a
-    /// SID in its string form) and the DACL and label are the ones a [`PipeServer`] for `owner_sid` writes, entry for
-    /// entry: a pipe of the name made by another identity, or by `owner_sid` below medium integrity, after the expected
-    /// one's has closed, is refused before anything is sent.
+    /// It then reads the pipe's owner, DACL and mandatory label and keeps the pipe only when the owner is the one
+    /// `owner` names and the DACL and label are the ones a [`PipeServer`] for `user_sid` (a SID in its string form)
+    /// writes, entry for entry: a pipe of the name made by another identity, or below medium integrity, after the
+    /// expected one's has closed, is refused before anything is sent.
     ///
     /// # Errors
     ///
@@ -758,10 +787,10 @@ impl PipeClient {
     /// is closed. An error of kind [`io::ErrorKind::InvalidInput`], with no system error code, before anything is opened,
     /// for a name that is not this machine's pipe: `\\.\pipe\` in any letter case, then one name that is not empty, `.`
     /// or `..` and holds no `\`, `/` or NUL.
-    pub fn open(name: &str, owner_sid: &str) -> io::Result<PipeClient> {
+    pub fn open(name: &str, user_sid: &str, owner: PipeOwner) -> io::Result<PipeClient> {
         check_local_pipe_name(name)?;
         let client = PipeClient::open_unchecked(name)?;
-        client.check_security(owner_sid)?;
+        client.check_security(user_sid, owner)?;
         Ok(client)
     }
 
@@ -831,11 +860,12 @@ impl PipeClient {
         write_pipe(self.handle.raw(), bytes, deadline, wake)
     }
 
-    /// Refuses the pipe unless its owner is `owner_sid`, its DACL is the one a [`PipeServer`] for `owner_sid` writes
-    /// (an entry allowing it [`CLIENT_ACCESS`], then one allowing OWNER RIGHTS `READ_CONTROL`, neither with flags), and
-    /// its SACL holds the server's label alone: medium, [`LABEL_POLICY`], no flags.
-    fn check_security(&self, owner_sid: &str) -> io::Result<()> {
+    /// Refuses the pipe unless its owner is the one `owner` names, its DACL is the one a [`PipeServer`] for `user_sid`
+    /// writes (an entry allowing `user_sid` [`CLIENT_ACCESS`], then one allowing OWNER RIGHTS `READ_CONTROL`, neither
+    /// with flags), and its SACL holds the server's label alone: medium, [`LABEL_POLICY`], no flags.
+    fn check_security(&self, user_sid: &str, owner: PipeOwner) -> io::Result<()> {
         let security = ObjectSecurity::of(self.handle.raw())?;
+        let owner_sid = owner.sid(user_sid);
         // SAFETY: the owner points into the descriptor `security` holds, alive for the whole call.
         let owner = unsafe { crate::token::sid_string(security.owner) }?;
         if !owner.eq_ignore_ascii_case(owner_sid) {
@@ -846,7 +876,7 @@ impl PipeClient {
         }
         // SAFETY: the DACL is not null and points into the descriptor `security` holds, alive for the whole call.
         let entries = unsafe { entries_of(security.dacl) }?;
-        let expected = [(owner_sid, CLIENT_ACCESS), (OWNER_RIGHTS, READ_CONTROL)];
+        let expected = [(user_sid, CLIENT_ACCESS), (OWNER_RIGHTS, READ_CONTROL)];
         let same = entries.len() == expected.len() && entries.iter().zip(expected).all(|(entry, (sid, mask))| entry.allows_only(sid, mask));
         if !same {
             return Err(refusal(format!("the pipe's DACL is {entries:?}, not the server's {expected:x?}")));
@@ -1009,7 +1039,9 @@ mod tests {
     use std::os::windows::io::{AsHandle, AsRawHandle, FromRawHandle, OwnedHandle};
     use std::time::{Duration, Instant};
 
-    use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_PIPE_NOT_CONNECTED, ERROR_PRIVILEGE_NOT_HELD, HANDLE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Foundation::{
+        ERROR_ACCESS_DENIED, ERROR_INVALID_OWNER, ERROR_PIPE_NOT_CONNECTED, ERROR_PRIVILEGE_NOT_HELD, HANDLE, INVALID_HANDLE_VALUE,
+    };
     use windows_sys::Win32::Security::{
         CreateWellKnownSid, DuplicateTokenEx, RevertToSelf, SECURITY_MAX_SID_SIZE, SID_AND_ATTRIBUTES, SecurityImpersonation, SetTokenInformation,
         TOKEN_ADJUST_DEFAULT, TOKEN_DUPLICATE, TOKEN_IMPERSONATE, TOKEN_MANDATORY_LABEL, TOKEN_QUERY, TokenImpersonation, TokenIntegrityLevel,
@@ -1022,15 +1054,15 @@ mod tests {
     use windows_sys::Win32::System::SystemServices::SE_GROUP_INTEGRITY;
     use windows_sys::Win32::System::Threading::{CreateEventW, GetCurrentProcess, OpenProcessToken, SetThreadToken};
 
-    use super::{CLIENT_ACCESS, ConnectWait, OWNER_RIGHTS, PipeClient, PipeRead, PipeServer, PipeWrite, random_hex, server_sddl};
+    use super::{CLIENT_ACCESS, ConnectWait, OWNER_RIGHTS, PipeClient, PipeOwner, PipeRead, PipeServer, PipeWrite, random_hex, server_sddl};
 
     /// The longest a test waits for something that must happen: it never runs out unless the code is broken.
     const HANG_GUARD: Duration = Duration::from_secs(600);
 
     /// A fresh pipe's server and a client connected to it.
     fn connected() -> (PipeServer, PipeClient) {
-        let server = PipeServer::create(&prefix(), &own_sid()).expect("the pipe is made");
-        let client = PipeClient::open(server.name(), &own_sid()).expect("the client opens the pipe");
+        let server = PipeServer::create(&prefix(), &own_sid(), PipeOwner::User).expect("the pipe is made");
+        let client = PipeClient::open(server.name(), &own_sid(), PipeOwner::User).expect("the client opens the pipe");
         let waited = server.wait_for_client(Instant::now() + HANG_GUARD, &[]).expect("the wait succeeds");
         assert_eq!(waited, ConnectWait::Connected);
         (server, client)
@@ -1119,7 +1151,7 @@ mod tests {
             r"\\.\pipe\a/b",
         ];
         for name in names {
-            let refused = PipeClient::open(name, &own_sid()).err().expect("the name is refused");
+            let refused = PipeClient::open(name, &own_sid(), PipeOwner::User).err().expect("the name is refused");
 
             assert_eq!(refused.kind(), std::io::ErrorKind::InvalidInput, "{name}: {refused}");
             assert_eq!(refused.raw_os_error(), None, "{name} is refused before any open: {refused}");
@@ -1129,7 +1161,9 @@ mod tests {
     #[test]
     fn a_server_refuses_a_prefix_that_makes_a_name_its_client_refuses() {
         for prefix in [r"gate\x", "gate/x", r"..\C:\gate-x"] {
-            let refused = PipeServer::create(prefix, &own_sid()).err().expect("the prefix is refused");
+            let refused = PipeServer::create(prefix, &own_sid(), PipeOwner::User)
+                .err()
+                .expect("the prefix is refused");
 
             assert_eq!(refused.kind(), std::io::ErrorKind::InvalidInput, "{prefix}: {refused}");
             assert_eq!(refused.raw_os_error(), None, "{prefix} is refused before any create: {refused}");
@@ -1152,11 +1186,11 @@ mod tests {
 
     #[test]
     fn a_write_larger_than_the_pipe_buffer_completes_while_the_other_end_reads() {
-        let server = PipeServer::create(&prefix(), &own_sid()).expect("the pipe is made");
+        let server = PipeServer::create(&prefix(), &own_sid(), PipeOwner::User).expect("the pipe is made");
         let message: Vec<u8> = (0..=250_u8).cycle().take(1024 * 1024).collect();
         let (name, sid, size) = (server.name().to_owned(), own_sid(), message.len());
         let reader = std::thread::spawn(move || {
-            let client = PipeClient::open(&name, &sid)?;
+            let client = PipeClient::open(&name, &sid, PipeOwner::User)?;
             Ok::<_, std::io::Error>(read_exactly(size, |buf| client.read(buf, Instant::now() + HANG_GUARD, &[])))
         });
         let waited = server.wait_for_client(Instant::now() + HANG_GUARD, &[]).expect("the wait succeeds");
@@ -1172,14 +1206,14 @@ mod tests {
     #[test]
     fn a_low_integrity_creator_cannot_make_a_pipe_with_the_server_s_medium_label() {
         let sid = own_sid();
-        let sddl = server_sddl(&sid).expect("the descriptor string is built");
+        let sddl = server_sddl(&sid, PipeOwner::User).expect("the descriptor string is built");
 
         let made = std::thread::spawn(move || {
             let server = {
                 let _low = LowIntegrity::impersonate();
                 PipeServer::create_with(test_name(), &sddl)
             };
-            server.map(|server| PipeClient::open(server.name(), &sid).err())
+            server.map(|server| PipeClient::open(server.name(), &sid, PipeOwner::User).err())
         })
         .join()
         .expect("the thread ends");
@@ -1194,6 +1228,20 @@ mod tests {
             Some(ERROR_PRIVILEGE_NOT_HELD.cast_signed()),
             "the creation is refused for the missing relabel privilege: {creation}"
         );
+    }
+
+    #[test]
+    fn an_unelevated_server_cannot_make_a_pipe_administrators_own() {
+        if crate::token_facts().expect("this process's token is read").elevated {
+            // An elevated process may make Administrators an owner, so there is nothing to refuse.
+            return;
+        }
+
+        let refused = PipeServer::create(&prefix(), &own_sid(), PipeOwner::Administrators)
+            .err()
+            .expect("an unelevated process cannot make Administrators the pipe's owner");
+
+        assert_eq!(refused.raw_os_error(), Some(ERROR_INVALID_OWNER.cast_signed()), "{refused}");
     }
 
     #[test]
@@ -1273,8 +1321,8 @@ mod tests {
 
     #[test]
     fn a_pipe_admits_its_user_and_reports_the_client_pid() {
-        let server = PipeServer::create(&prefix(), &own_sid()).expect("the pipe is made");
-        let _client = PipeClient::open(server.name(), &own_sid()).expect("the pipe admits its user");
+        let server = PipeServer::create(&prefix(), &own_sid(), PipeOwner::User).expect("the pipe is made");
+        let _client = PipeClient::open(server.name(), &own_sid(), PipeOwner::User).expect("the pipe admits its user");
 
         let waited = server.wait_for_client(Instant::now() + HANG_GUARD, &[]).expect("the wait succeeds");
 
@@ -1284,7 +1332,7 @@ mod tests {
         // Only SYSTEM can make a pipe SYSTEM owns, so this one is this user's, its one entry for SYSTEM alone.
         let sddl = format!("O:{}D:P(A;;0x{CLIENT_ACCESS:x};;;S-1-5-18)", own_sid());
         let system_only = PipeServer::create_with(test_name(), &sddl).expect("a pipe for SYSTEM is made");
-        let refused = PipeClient::open(system_only.name(), &own_sid())
+        let refused = PipeClient::open(system_only.name(), &own_sid(), PipeOwner::User)
             .err()
             .expect("a pipe for SYSTEM refuses this user");
         assert_eq!(refused.raw_os_error(), Some(ERROR_ACCESS_DENIED.cast_signed()), "{refused}");
@@ -1292,8 +1340,8 @@ mod tests {
 
     #[test]
     fn a_server_drops_a_wrong_client_and_admits_the_next() {
-        let server = PipeServer::create(&prefix(), &own_sid()).expect("the pipe is made");
-        let wrong = PipeClient::open(server.name(), &own_sid()).expect("the first client opens the pipe");
+        let server = PipeServer::create(&prefix(), &own_sid(), PipeOwner::User).expect("the pipe is made");
+        let wrong = PipeClient::open(server.name(), &own_sid(), PipeOwner::User).expect("the first client opens the pipe");
         let first = server.wait_for_client(Instant::now() + HANG_GUARD, &[]).expect("the first wait succeeds");
         assert_eq!(first, ConnectWait::Connected);
 
@@ -1323,7 +1371,7 @@ mod tests {
             if unsafe { WaitNamedPipeW(wide_name.as_ptr(), guard) } == 0 {
                 return Err(std::io::Error::last_os_error());
             }
-            PipeClient::open(&name, &sid).map(drop)
+            PipeClient::open(&name, &sid, PipeOwner::User).map(drop)
         });
         let second = server
             .wait_for_client(Instant::now() + HANG_GUARD, &[])
@@ -1338,9 +1386,9 @@ mod tests {
 
     #[test]
     fn a_client_refuses_a_pipe_whose_owner_is_not_the_expected_user() {
-        let server = PipeServer::create(&prefix(), &own_sid()).expect("the pipe is made");
+        let server = PipeServer::create(&prefix(), &own_sid(), PipeOwner::User).expect("the pipe is made");
 
-        let refused = PipeClient::open(server.name(), "S-1-5-18")
+        let refused = PipeClient::open(server.name(), "S-1-5-18", PipeOwner::User)
             .err()
             .expect("a pipe this user owns is not SYSTEM's");
 
@@ -1356,7 +1404,7 @@ mod tests {
         let sddl = format!("O:{sid}D:P(A;;0x{CLIENT_ACCESS:x};;;{sid})");
         let server = PipeServer::create_with(test_name(), &sddl).expect("the pipe is made");
 
-        let refused = PipeClient::open(server.name(), &sid)
+        let refused = PipeClient::open(server.name(), &sid, PipeOwner::User)
             .err()
             .expect("a DACL other than the server's is refused");
 
@@ -1367,10 +1415,14 @@ mod tests {
     #[test]
     fn a_client_refuses_a_pipe_whose_dacl_entry_has_a_flag() {
         let sid = own_sid();
-        let sddl = server_sddl(&sid).expect("the descriptor string is built").replacen("(A;;", "(A;CI;", 1);
+        let sddl = server_sddl(&sid, PipeOwner::User)
+            .expect("the descriptor string is built")
+            .replacen("(A;;", "(A;CI;", 1);
         let server = PipeServer::create_with(test_name(), &sddl).expect("the pipe is made");
 
-        let refused = PipeClient::open(server.name(), &sid).err().expect("a DACL entry with a flag is refused");
+        let refused = PipeClient::open(server.name(), &sid, PipeOwner::User)
+            .err()
+            .expect("a DACL entry with a flag is refused");
 
         assert_eq!(refused.kind(), std::io::ErrorKind::PermissionDenied, "{refused}");
         assert!(refused.to_string().contains("DACL is"), "refused for its DACL: {refused}");
@@ -1382,7 +1434,9 @@ mod tests {
         let sddl = format!("O:{sid}D:NO_ACCESS_CONTROLS:(ML;;NWNRNX;;;ME)");
         let server = PipeServer::create_with(test_name(), &sddl).expect("the pipe is made");
 
-        let refused = PipeClient::open(server.name(), &sid).err().expect("a null DACL is refused");
+        let refused = PipeClient::open(server.name(), &sid, PipeOwner::User)
+            .err()
+            .expect("a null DACL is refused");
 
         assert_eq!(refused.kind(), std::io::ErrorKind::PermissionDenied, "{refused}");
         assert!(refused.to_string().contains("null DACL"), "refused for its null DACL: {refused}");
@@ -1394,7 +1448,9 @@ mod tests {
         let sddl = format!("O:{sid}D:P(A;;0x{CLIENT_ACCESS:x};;;{sid})(A;;0x{READ_CONTROL:x};;;{OWNER_RIGHTS})");
         let server = PipeServer::create_with(test_name(), &sddl).expect("the pipe is made");
 
-        let refused = PipeClient::open(server.name(), &sid).err().expect("a pipe with no label is refused");
+        let refused = PipeClient::open(server.name(), &sid, PipeOwner::User)
+            .err()
+            .expect("a pipe with no label is refused");
 
         assert_eq!(refused.kind(), std::io::ErrorKind::PermissionDenied, "{refused}");
         assert!(refused.to_string().contains("mandatory label"), "refused for its label: {refused}");
@@ -1410,7 +1466,7 @@ mod tests {
                 let _low = LowIntegrity::impersonate();
                 PipeServer::create_with(test_name(), &sddl).expect("a low-integrity thread makes the pipe")
             };
-            PipeClient::open(server.name(), &sid).err()
+            PipeClient::open(server.name(), &sid, PipeOwner::User).err()
         })
         .join()
         .expect("the thread ends")
@@ -1422,9 +1478,9 @@ mod tests {
 
     #[test]
     fn a_second_instance_of_a_pipe_name_is_refused() {
-        let first = PipeServer::create(&prefix(), &own_sid()).expect("the pipe is made");
+        let first = PipeServer::create(&prefix(), &own_sid(), PipeOwner::User).expect("the pipe is made");
 
-        let second = PipeServer::create_named(first.name().to_owned(), &own_sid())
+        let second = PipeServer::create_named(first.name().to_owned(), &own_sid(), PipeOwner::User)
             .err()
             .expect("a second instance is refused");
 
@@ -1433,16 +1489,16 @@ mod tests {
 
     #[test]
     fn the_client_sees_the_server_pid() {
-        let server = PipeServer::create(&prefix(), &own_sid()).expect("the pipe is made");
+        let server = PipeServer::create(&prefix(), &own_sid(), PipeOwner::User).expect("the pipe is made");
 
-        let client = PipeClient::open(server.name(), &own_sid()).expect("the client opens the pipe");
+        let client = PipeClient::open(server.name(), &own_sid(), PipeOwner::User).expect("the client opens the pipe");
 
         assert_eq!(client.server_pid().expect("the server pid is read"), std::process::id());
     }
 
     #[test]
     fn a_connect_wait_ends_at_its_deadline() {
-        let server = PipeServer::create(&prefix(), &own_sid()).expect("the pipe is made");
+        let server = PipeServer::create(&prefix(), &own_sid(), PipeOwner::User).expect("the pipe is made");
 
         let waited = server.wait_for_client(Instant::now(), &[]).expect("the wait succeeds");
 
@@ -1451,7 +1507,7 @@ mod tests {
 
     #[test]
     fn a_connect_wait_ends_when_a_given_handle_is_signalled() {
-        let server = PipeServer::create(&prefix(), &own_sid()).expect("the pipe is made");
+        let server = PipeServer::create(&prefix(), &own_sid(), PipeOwner::User).expect("the pipe is made");
         let unset = event(false);
         let set = event(true);
 
@@ -1460,7 +1516,7 @@ mod tests {
             .expect("the wait succeeds");
 
         assert_eq!(waited, ConnectWait::Woken(1));
-        let _client = PipeClient::open(server.name(), &own_sid()).expect("the pipe still takes a client after the cancelled wait");
+        let _client = PipeClient::open(server.name(), &own_sid(), PipeOwner::User).expect("the pipe still takes a client after the cancelled wait");
         let again = server
             .wait_for_client(Instant::now() + HANG_GUARD, &[unset.as_handle()])
             .expect("the second wait succeeds");
@@ -1469,15 +1525,15 @@ mod tests {
 
     #[test]
     fn a_client_that_closed_before_the_wait_does_not_end_it() {
-        let server = PipeServer::create(&prefix(), &own_sid()).expect("the pipe is made");
-        drop(PipeClient::open(server.name(), &own_sid()).expect("the first client opens the pipe"));
+        let server = PipeServer::create(&prefix(), &own_sid(), PipeOwner::User).expect("the pipe is made");
+        drop(PipeClient::open(server.name(), &own_sid(), PipeOwner::User).expect("the first client opens the pipe"));
 
         let waited = server
             .wait_for_client(Instant::now(), &[])
             .expect("a client gone before the wait is no error");
 
         assert_eq!(waited, ConnectWait::TimedOut);
-        let _client = PipeClient::open(server.name(), &own_sid()).expect("the pipe takes the next client");
+        let _client = PipeClient::open(server.name(), &own_sid(), PipeOwner::User).expect("the pipe takes the next client");
         let again = server
             .wait_for_client(Instant::now() + HANG_GUARD, &[])
             .expect("the second wait succeeds");
@@ -1486,7 +1542,7 @@ mod tests {
 
     #[test]
     fn a_low_integrity_client_cannot_open_the_pipe() {
-        let server = PipeServer::create(&prefix(), &own_sid()).expect("the pipe is made");
+        let server = PipeServer::create(&prefix(), &own_sid(), PipeOwner::User).expect("the pipe is made");
         let name = server.name().to_owned();
 
         let accesses = [
