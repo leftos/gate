@@ -1779,7 +1779,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
     - A fetch the watchdog stops says its `gate: STALLED: ...` or `gate: TRANSFER TIMED OUT after 1800 s fetching the outputs` line (the ceiling counted from the fetch's own start), then `gate: remote outputs not brought back: the fetch was stopped by the watchdog`, and the run ends 124.
     - Any other failed fetch says `gate: remote outputs not brought back: <reason>`: the box's last stderr line (escaped, its first 4 KiB), `the outputs call failed (status <n>)`, `the outputs call sent a line longer than 64 KiB` or `cannot write <path>: <error>`. A passing run becomes 1. The partial archive is removed; a removal that fails says `gate: cannot remove the partial outputs archive <path>: <error>`.
     - A Ctrl+C during the fetch, or noticed by the end of an outputs call however it ended, ends the run as an interrupt with no `stop` call, and removes the partial archive.
-    - A fetch that already sent a byte is never retried as a pre-banner drop; one dropped before any byte is retried once like the other calls.
+    - A fetch that already sent a byte is never retried as a pre-banner drop; one dropped before any byte is retried like the other calls, up to three times.
 
     **Fetch cap** (GATE-137): the raw relay is bounded by the stall window, which any byte resets, and the transfer ceiling of 1800 s counted from the fetch's own start, and also by a size cap, so a broken or hostile builder cannot make the archive grow without bound. The cap bounds the archive only; what a builder's output may write to the gate's log has a cap of its own, the log cap (see The output cap below), which counts the outputs call's standard error but not the archive.
 
@@ -1886,7 +1886,9 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
     A folder the walk does not enter because its name is not plain or not Unicode (`bin/x~1/`, `bin/con/`, `bin/report./`) is read through a verbatim `\\?\` path only to count the files below it that the globs select, which are never packed (`Globs::counts_below`). That read enters no excluded or `.git*`-spelled folder and no folder of 64 parts or more. A folder or entry it cannot read leaves those files uncounted and the walk goes on, so the outputs are still brought back.
 
-  A pre-banner failure, which is exit 255 (128 for git) with empty stdout, no start marker heard and a first stderr line starting `Connection timed out during banner exchange`, `kex_exchange_identification: ` or `banner exchange: `, says `gate: <host> did not answer the ssh banner; trying once more` and is retried once after a 2 s pause. A run call whose box said the start marker is never retried or read as a pre-banner failure, whatever its first stderr line: the command may have started.
+  A pre-banner failure, which is exit 255 (128 for git) with empty stdout, no start marker heard and a first stderr line starting `Connection timed out during banner exchange`, `kex_exchange_identification: ` or `banner exchange: `, is made again up to three times, each after a 2 s pause and the line `gate: <host> did not answer the ssh banner; trying again (<n> of 3)`, until a call gets past the banner; the call counts as unreachable only when every one of them failed before it. This rides out a builder whose ssh server starts no session for half a minute.
+
+  The bounded `stop` and `boot` calls keep a single retry, said as `(1 of 1)`. A run call whose box said the start marker is never retried or read as a pre-banner failure, whatever its first stderr line: the command may have started.
 
   Two pre-banner failures of the run call fall back `unreachable`; the sync-back's `ls-remote` and `fetch` are retried the same way, and two failures of either end the run with status 1.
 

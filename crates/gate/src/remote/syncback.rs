@@ -1047,7 +1047,7 @@ struct Network<'a> {
     set: &'a [(&'a str, &'a OsStr)],
 }
 
-/// git with `args`, the call `network` that reaches the builder: retried once when it failed before the banner, its
+/// git with `args`, the call `network` that reaches the builder: retried when it failed before the banner, its
 /// lines kept out of the log, and killed as its watch says or at a line longer than the cap. A failure is the run's,
 /// or its interrupt when the console interrupt was raised during the call.
 fn to_the_builder(
@@ -3132,7 +3132,10 @@ mod tests {
 
         assert!(matches!(fetched, Ok(None)), "{fetched:?}");
         let said = std::fs::read_to_string(&log).expect("the log was written");
-        assert!(said.contains("gate: builder did not answer the ssh banner; trying once more"), "{said}");
+        assert!(
+            said.contains("gate: builder did not answer the ssh banner; trying again (1 of 3)"),
+            "{said}"
+        );
         let back = asked(&client, &[], &["rev-parse", "FETCH_HEAD"]).expect("FETCH_HEAD names the commit");
         let back = back.trim_end();
         assert!(asked(&client, &[], &["cat-file", "-e", back]).is_err(), "the real store lacks {back}");

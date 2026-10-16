@@ -338,7 +338,8 @@ fn a_snapshot_ignores_commit_signing() {
 /// What a client case's snapshot leaves out: the gate's state root, LOCALAPPDATA and logs, the builder root and the
 /// stand-in's files, and `.tmp/`, which the client writes in. `tool.exe` is sent, so the builder runs it.
 pub(super) const CLIENT_IGNORED: &str = "state/\nappdata/\n*.log\nbuilder/\nssh/\n.tmp/\n";
-const RETRY_LINE: &str = "gate: builder did not answer the ssh banner; trying once more";
+/// The start of every retry line of a builder that did not answer the ssh banner; its `n of 3` follows it.
+const RETRY_LINE: &str = "gate: builder did not answer the ssh banner; trying again (";
 const BUSY_LINE: &str = "gate: remote builder busy; running here";
 const UNREACHABLE_LINE: &str = "gate: remote builder unreachable; running here";
 /// The line of a run call whose connection was lost on a builder that did not restart.
@@ -904,33 +905,33 @@ fn a_dropped_preflight_logs_no_line_saying_its_input_was_not_sent() {
 }
 
 #[test]
-fn two_banner_drops_of_the_preflight_fall_back_unreachable() {
+fn a_preflight_that_never_answers_before_the_banner_falls_back_unreachable() {
     let case = client_case("client-preflight-drops");
-    let steps = ssh_steps(&case, "ssh", &["fail-banner", "fail-banner"]);
+    let steps = ssh_steps(&case, "ssh", &["fail-banner", "fail-banner", "fail-banner", "fail-banner"]);
 
     let outcome = finish(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "out", "ran here"]));
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
-    assert_eq!(outcome.stderr.matches(RETRY_LINE).count(), 1, "{outcome:?}");
+    assert_eq!(outcome.stderr.matches(RETRY_LINE).count(), 3, "{outcome:?}");
     assert!(outcome.stderr.contains(UNREACHABLE_LINE), "{outcome:?}");
     assert!(outcome.stdout.contains("ran here"), "{outcome:?}");
-    assert_eq!(calls(&steps), ["preflight", "preflight"]);
+    assert_eq!(calls(&steps), ["preflight", "preflight", "preflight", "preflight"]);
     assert_eq!(fallbacks(&events(&case)), ["unreachable"]);
 }
 
 #[test]
-fn two_banner_drops_of_the_run_call_fall_back_unreachable() {
+fn a_run_call_that_never_answers_before_the_banner_falls_back_unreachable() {
     let case = client_case("client-run-drops");
-    let steps = ssh_steps(&case, "ssh", &["ok", "fail-banner", "fail-banner"]);
+    let steps = ssh_steps(&case, "ssh", &["ok", "fail-banner", "fail-banner", "fail-banner", "fail-banner"]);
 
     let outcome = finish(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "out", "ran here"]));
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
-    assert_eq!(outcome.stderr.matches(RETRY_LINE).count(), 1, "{outcome:?}");
+    assert_eq!(outcome.stderr.matches(RETRY_LINE).count(), 3, "{outcome:?}");
     assert!(outcome.stderr.contains(UNREACHABLE_LINE), "{outcome:?}");
     let log = fs::read_to_string(case.folder().join("out.log")).expect("the log was written");
     assert!(log.contains("ran here"), "it ran here: {log}");
-    assert_eq!(calls(&steps), ["preflight", "run", "run"]);
+    assert_eq!(calls(&steps), ["preflight", "run", "run", "run", "run"]);
     assert_eq!(fallbacks(&events(&case)), ["unreachable"]);
 }
 
@@ -3927,6 +3928,12 @@ fn a_boot_call_dropped_before_the_banner_is_retried_once() {
 
     assert_eq!(outcome.code, Some(255), "{outcome:?}");
     assert_eq!(outcome.stderr.matches(RETRY_LINE).count(), 1, "{outcome:?}");
+    assert!(
+        outcome
+            .stderr
+            .contains("gate: builder did not answer the ssh banner; trying again (1 of 1)"),
+        "a bounded call's retry is its only one: {outcome:?}"
+    );
     assert!(outcome.stderr.contains(LOST_LINE), "{outcome:?}");
     assert_eq!(calls(&steps), ["preflight", "run", "stop", "boot", "boot"]);
     assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new());
@@ -4989,15 +4996,15 @@ fn ctrl_c_during_the_fetch_ends_as_an_interrupt() {
 }
 
 #[test]
-fn a_fetch_dropped_before_any_byte_is_retried_once() {
+fn a_fetch_dropped_before_any_byte_is_made_again_until_its_retries_run_out() {
     let case = outputs_case("client-outputs-fetch-banner", &BIN);
-    let steps = ssh_steps(&case, "ssh", &["ok", "ok", "fail-banner", "fail-banner"]);
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok", "fail-banner", "fail-banner", "fail-banner", "fail-banner"]);
 
     let outcome = finish(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "write", r"bin\new.txt", "built"]));
 
     assert_eq!(outcome.code, Some(1), "a passing run becomes 1: {outcome:?}");
-    assert_eq!(outcome.stderr.matches(RETRY_LINE).count(), 1, "{outcome:?}");
-    assert_eq!(calls(&steps), ["preflight", "run", "outputs", "outputs"]);
+    assert_eq!(outcome.stderr.matches(RETRY_LINE).count(), 3, "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "run", "outputs", "outputs", "outputs", "outputs"]);
     let line = "gate: remote outputs not brought back: Connection timed out during banner exchange";
     assert!(outcome.stderr.contains(line), "{outcome:?}");
     assert_eq!(fetched_archives(&case), Vec::<PathBuf>::new(), "nothing is left of either attempt");

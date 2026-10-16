@@ -1,20 +1,20 @@
 //! The Rust remote client, in the phases the PowerShell client runs: the snapshot; the run call built and checked
 //! against the most cmd takes before anything is sent; the preflight and the builder's version; the push and the saved
 //! ref; and the run call, its output passed through to the log and the console. A call that failed before the ssh
-//! banner is made once more, unless the box said the run's start marker. A Ctrl+C ends the attempt between its calls,
-//! during the retry pause, and during any call; one during the run call stops the command on the builder. Each call
-//! goes through the [`Transport`]; every process is created suspended, put in an anonymous job of its own that ends its
-//! whole tree when it is killed, and only then let run. The preflight, the push and the run call run under the run's
-//! watchdog, whose clock starts with the attempt: a call that sends nothing for the stall window, or outlives the run's
-//! ceiling, is killed. A kill before the run call falls back `unreachable`, as the command never started; a kill of the
-//! run call stops the command and ends the run 124. A run call that exits 255 other than a failure before the banner
-//! lost its connection: nothing is synced back and the command is stopped; then, when the preflight said the builder's
-//! boot time, the builder is asked for it again. One that booted more than 30 s later restarted, and the run falls back
-//! `rebooted`; one that gives no boot time, or when either value is no timestamp, falls back `unreachable`; else the
-//! run ends 255. No call holds more than 64 KiB of a line in memory, nor keeps more than a call's last 1,000 lines,
-//! totalling at most 1 MiB: a longer line ends any call but the run call, whose output is passed on whole. The run
-//! takes the work-folder key's lock, [`hold_key`], before its remote slot, so a second routed run of one worktree falls
-//! back `busy` at once.
+//! banner is made again up to three times, for as long as every call fails the same way, unless the box said the run's
+//! start marker. A Ctrl+C ends the attempt between its calls, during the retry pause, and during any call; one during
+//! the run call stops the command on the builder. Each call goes through the [`Transport`]; every process is created
+//! suspended, put in an anonymous job of its own that ends its whole tree when it is killed, and only then let run.
+//! The preflight, the push and the run call run under the run's watchdog, whose clock starts with the attempt: a call
+//! that sends nothing for the stall window, or outlives the run's ceiling, is killed. A kill before the run call falls
+//! back `unreachable`, as the command never started; a kill of the run call stops the command and ends the run 124. A
+//! run call that exits 255 other than a failure before the banner lost its connection: nothing is synced back and the
+//! command is stopped; then, when the preflight said the builder's boot time, the builder is asked for it again. One
+//! that booted more than 30 s later restarted, and the run falls back `rebooted`; one that gives no boot time, or when
+//! either value is no timestamp, falls back `unreachable`; else the run ends 255. No call holds more than 64 KiB of a
+//! line in memory, nor keeps more than a call's last 1,000 lines, totalling at most 1 MiB: a longer line ends any call
+//! but the run call, whose output is passed on whole. The run takes the work-folder key's lock, [`hold_key`], before
+//! its remote slot, so a second routed run of one worktree falls back `busy` at once.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
@@ -78,8 +78,8 @@ use crate::version::build_version;
 /// and a gate's usage error for a payload it does not read.
 pub(crate) const NOT_RECOGNIZED: i32 = 9009;
 pub(crate) const USAGE: i32 = 2;
-/// The most bytes a call's job may have written and still be made once more after a failure before the banner: ssh's
-/// own failure writes one line, and a second fetch from a builder would start a fresh count against its cap.
+/// The most bytes a call's job may have written and still be made again after a failure before the banner: ssh's own
+/// failure writes one line, and another fetch from a builder would start a fresh count against its cap.
 const RETRY_WRITTEN: u64 = 1 << 20;
 /// How often the retry pause looks at the console interrupt.
 const PAUSE_STEP: Duration = Duration::from_millis(20);
@@ -1702,9 +1702,10 @@ impl Attempt<'_, '_> {
         }
     }
 
-    /// The run call to the builder at `location`: the command's own status; `unreachable` when it failed before the
-    /// banner twice, as the command never started; a refusal when its 75 comes with the box's refusal tag for the run
-    /// whose nonce is `nonce` and no start marker; a lost connection when it exited 255 otherwise. A watchdog kill says
+    /// The run call to the builder at `location`: the command's own status; `unreachable` when the call and each of its
+    /// retries failed before the banner, as the command never started; a refusal when its 75 comes with the box's refusal
+    /// tag for the run whose nonce is `nonce` and no start marker; a lost connection when it exited 255 otherwise. A
+    /// watchdog kill says
     /// its line, stops the command and ends the run killed; a Ctrl+C stops the command too. Each call made is fed
     /// `input` on its standard input ([`payload::input`]). With the end, what the call that counts said of the outputs
     /// ([`RunEnd`]).
@@ -1803,22 +1804,24 @@ impl Attempt<'_, '_> {
     }
 
     /// Makes a call with `make` and, when it failed before the banner and its job did not write more than 1 MiB, says
-    /// so, pauses and makes it once more; a Ctrl+C
-    /// before the retry or during its pause ends the attempt instead. The call that counts, its lines not yet kept, and
-    /// whether the retry failed before the banner too.
+    /// so, pauses and makes it again, up to [`retry::PRE_BANNER_RETRIES`] more times for as long as every call fails
+    /// the same way; a Ctrl+C before a retry or during its pause ends the attempt instead. The call that counts, its
+    /// lines not yet kept, and whether that call failed before the banner too.
     pub(super) fn with_retry(&mut self, fail_status: i32, mut make: impl FnMut(&mut Self) -> Result<Called, End>) -> Result<(Called, bool), End> {
-        let mut first = make(self)?;
-        if !first.before_the_banner(fail_status) || first.wrote_much() {
-            return Ok((first, false));
+        let mut called = make(self)?;
+        for retry in 1..=retry::PRE_BANNER_RETRIES {
+            if !called.before_the_banner(fail_status) || called.wrote_much() {
+                return Ok((called, false));
+            }
+            self.lines.append(&mut called.lines);
+            self.go_on()?;
+            self.say(retry::retry_line(self.call.host, retry, retry::PRE_BANNER_RETRIES));
+            paused(self.pause, self.call.interrupt)?;
+            self.go_on()?;
+            called = make(self)?;
         }
-        self.lines.append(&mut first.lines);
-        self.go_on()?;
-        self.say(retry::retry_line(self.call.host));
-        paused(self.pause, self.call.interrupt)?;
-        self.go_on()?;
-        let second = make(self)?;
-        let again = second.before_the_banner(fail_status);
-        Ok((second, again))
+        let again = called.before_the_banner(fail_status);
+        Ok((called, again))
     }
 
     /// After the run call's connection to the builder at `location` was lost: stops the command, then, when the
@@ -1901,7 +1904,7 @@ impl Attempt<'_, '_> {
             if let Ok(first) = &mut made {
                 self.lines.append(&mut first.lines);
             }
-            self.say(retry::retry_line(self.call.host));
+            self.say(retry::retry_line(self.call.host, 1, 1));
             thread::sleep(self.pause);
             made = self.ssh(
                 verb,
@@ -1960,8 +1963,8 @@ impl Attempt<'_, '_> {
         self.started(&command, echo, watch, starts)
     }
 
-    /// The outputs call to the builder at `location` for the archive `name`: `gate box outputs`, made once more when
-    /// it failed before the banner, watched as a fetch by `limits`, and the console interrupt raised after its first
+    /// The outputs call to the builder at `location` for the archive `name`: `gate box outputs`, made again when it
+    /// failed before the banner, watched as a fetch by `limits`, and the console interrupt raised after its first
     /// output byte with `--test-remote-interrupt-at outputs`. Each attempt writes its standard output raw to the file
     /// `archive` makes new for it; its standard error lines go to the log. The call that counts, its lines kept; else
     /// why the file or the call could not be made, or the interrupt.
@@ -1981,7 +1984,7 @@ impl Attempt<'_, '_> {
         Ok(called)
     }
 
-    /// One inputs call, `gate box inputs`, made once more when it failed before the banner, watched as `watch` says,
+    /// One inputs call, `gate box inputs`, made again when it failed before the banner, watched as `watch` says,
     /// and the console interrupt raised after its first output byte with `--test-remote-interrupt-at inputs`. Each
     /// attempt is fed `head`, then, when an archive is given, the open file's first bytes up to its packed length, read
     /// from its start at a position of its own; its standard output goes raw into the sink `sink` makes anew when
@@ -3790,6 +3793,7 @@ mod tests {
     use gate_state::{FallbackReason, StateRoot};
     use gate_win32::{Interrupt, PipedConsole};
 
+    use super::retry::PRE_BANNER_RETRIES;
     use super::{
         Attempt, CallEnd, Called, Capped, Cut, Echo, End, GIT_SSH_FAILED, Heard, LINE_CAP, Limits, Loss, NonZeroU64, OUTPUTS_BUDGET, OneCall,
         ProtocolLines, Push, Raised, Reader, Reading, RustClient, SSH_FAILED, Shared, Split, Ssh, Unfinished, Watch, Watching, after_loss, boot_time,
@@ -5741,7 +5745,62 @@ mod tests {
     }
 
     #[test]
-    fn a_sync_back_git_call_dropped_before_the_banner_is_retried_once() {
+    fn a_call_dropped_before_the_banner_through_a_builder_stall_is_made_again_until_it_is_answered() {
+        let log = unwritten_log();
+        let mut given = call(&log);
+        given.interrupt = None;
+        let transport = Local::new(r"local:C:\builder", None).expect("a local transport");
+        let mut attempt = attempt(&given, &transport);
+        attempt.pause = Duration::ZERO;
+        let mut made = 0;
+
+        let retried = attempt.with_retry(SSH_FAILED, |_| {
+            made += 1;
+            Ok(if made < 3 {
+                ended_with(SSH_FAILED, "Connection timed out during banner exchange")
+            } else {
+                ended_with(0, "the command's line")
+            })
+        });
+
+        let (called, again) = retried.expect("a call that ends without an interrupt");
+        assert_eq!(made, 3, "the builder's ssh answered the third call");
+        assert_eq!(called.status, 0, "the answered call is the one returned");
+        assert_eq!(called.first_error.as_deref(), Some("the command's line"));
+        assert!(!again, "the call that counts did not fail before the banner");
+    }
+
+    #[test]
+    fn a_call_that_never_passes_the_banner_is_made_four_times_and_flagged() {
+        let log = crate::test_support::temp_dir().join(format!("gate-client-banner-never-{}.log", std::process::id()));
+        let mut given = call(&log);
+        given.interrupt = None;
+        let transport = Local::new(r"local:C:\builder", None).expect("a local transport");
+        let mut attempt = attempt(&given, &transport);
+        attempt.pause = Duration::ZERO;
+        let mut made = 0;
+
+        let retried = attempt.with_retry(SSH_FAILED, |_| {
+            made += 1;
+            Ok(ended_with(SSH_FAILED, "Connection timed out during banner exchange"))
+        });
+
+        let (called, again) = retried.expect("a call that ends without an interrupt");
+        assert_eq!(made, 1 + PRE_BANNER_RETRIES, "the call and its retries");
+        assert!(again, "the last call failed before the banner too");
+        assert_eq!(called.status, SSH_FAILED);
+        let said = std::fs::read_to_string(&log).expect("the retry lines were written");
+        let want = [
+            "gate: builder did not answer the ssh banner; trying again (1 of 3)",
+            "gate: builder did not answer the ssh banner; trying again (2 of 3)",
+            "gate: builder did not answer the ssh banner; trying again (3 of 3)",
+        ];
+        assert_eq!(said.lines().collect::<Vec<_>>(), want, "{said}");
+        std::fs::remove_file(&log).expect("the log can be removed");
+    }
+
+    #[test]
+    fn a_sync_back_git_call_dropped_before_the_banner_is_made_again_until_its_retries_run_out() {
         // The local transport runs git against a bare repository path, never through the ssh stand-in, so the only way
         // to reach the sync-back's retry is the decision itself, as a call that failed before the banner.
         let log = crate::test_support::temp_dir().join(format!("gate-client-sync-back-retry-{}.log", std::process::id()));
@@ -5761,12 +5820,13 @@ mod tests {
         });
 
         let (called, again) = retried.expect("a call that ends without an interrupt");
-        assert_eq!(made, 2, "the git call is made once more");
-        assert!(again, "the retry failed before the banner too");
+        assert_eq!(made, 1 + PRE_BANNER_RETRIES, "the git call and its retries");
+        assert!(again, "the last call failed before the banner too");
         assert_eq!(called.status, GIT_SSH_FAILED);
-        let said = std::fs::read_to_string(&log).expect("the retry line was written");
-        let retry_line = "gate: builder did not answer the ssh banner; trying once more";
-        assert_eq!(said.lines().filter(|line| *line == retry_line).count(), 1, "{said}");
+        let said = std::fs::read_to_string(&log).expect("the retry lines were written");
+        let retries = said.matches("gate: builder did not answer the ssh banner; trying again (").count();
+        assert_eq!(retries, PRE_BANNER_RETRIES, "{said}");
+        assert!(said.contains("(3 of 3)"), "the last retry is said: {said}");
         std::fs::remove_file(&log).expect("the log can be removed");
     }
 
@@ -5781,7 +5841,7 @@ mod tests {
         let transport = Local::new(r"local:C:\builder", None).expect("a local transport");
         let mut attempt = attempt(&given, &transport);
         attempt.pause = Duration::ZERO;
-        for (written, times) in [(Some(MIB + 1), 1), (Some(MIB), 2), (None, 2)] {
+        for (written, times) in [(Some(MIB + 1), 1), (Some(MIB), 1 + PRE_BANNER_RETRIES), (None, 1 + PRE_BANNER_RETRIES)] {
             let mut made = 0;
             let retried = attempt.with_retry(GIT_SSH_FAILED, |_| {
                 made += 1;
