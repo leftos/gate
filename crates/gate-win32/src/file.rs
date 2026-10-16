@@ -189,6 +189,25 @@ fn open_wide(folder: &File, name: &[u16], opening: Opening<'_>) -> io::Result<Fi
 /// the system's error, such as access denied for a folder at the name or a sharing violation for a file held open
 /// without delete sharing.
 pub fn rename_beneath(file: &File, folder: &File, name: &str) -> io::Result<()> {
+    renamed(
+        file,
+        folder,
+        name,
+        RENAME_REPLACE_IF_EXISTS | RENAME_POSIX_SEMANTICS | RENAME_IGNORE_READONLY_ATTRIBUTE,
+    )
+}
+
+/// [`rename_beneath`], except that nothing already of that name, a file or a link included, is replaced.
+///
+/// # Errors
+///
+/// As [`rename_beneath`]'s, and an error of kind [`io::ErrorKind::AlreadyExists`] when anything has the name.
+pub fn rename_beneath_no_replace(file: &File, folder: &File, name: &str) -> io::Result<()> {
+    renamed(file, folder, name, RENAME_POSIX_SEMANTICS)
+}
+
+/// [`rename_beneath`] with the rename flags `flags`.
+fn renamed(file: &File, folder: &File, name: &str, flags: u32) -> io::Result<()> {
     one_name(name)?;
     let wide: Vec<u16> = OsStr::new(name).encode_wide().collect();
     let name_bytes = size_of_val(wide.as_slice());
@@ -201,7 +220,7 @@ pub fn rename_beneath(file: &File, folder: &File, name: &str) -> io::Result<()> 
     // SAFETY: `buffer` is zeroed, aligned for `FILE_RENAME_INFORMATION` and holds `size` bytes, the structure and the name's
     // units after its `FileName` start; the copy writes `wide.len()` units from there, inside the buffer.
     unsafe {
-        (*info).Anonymous.Flags = RENAME_REPLACE_IF_EXISTS | RENAME_POSIX_SEMANTICS | RENAME_IGNORE_READONLY_ATTRIBUTE;
+        (*info).Anonymous.Flags = flags;
         (*info).RootDirectory = folder.as_raw_handle();
         (*info).FileNameLength = length;
         ptr::copy_nonoverlapping(wide.as_ptr(), (&raw mut (*info).FileName).cast::<u16>(), wide.len());
@@ -607,8 +626,8 @@ mod tests {
     };
 
     use super::{
-        Make, Share, delete_opened, delete_tree_opened, move_no_replace, names_beneath, open_beneath, open_beneath_as, rename_beneath, same_file,
-        verbatim,
+        Make, Share, delete_opened, delete_tree_opened, move_no_replace, names_beneath, open_beneath, open_beneath_as, rename_beneath,
+        rename_beneath_no_replace, same_file, verbatim,
     };
 
     /// Makes a junction at `link` leading to the folder `target`.
@@ -914,6 +933,26 @@ mod tests {
         );
         assert!(is_link_itself(&link), "the junction is opened as itself, not followed");
         drop((new, old, link, held));
+        std::fs::remove_dir_all(&folder).expect("the folder can be removed");
+    }
+
+    #[test]
+    fn a_rename_beneath_no_replace_leaves_an_entry_at_its_name_and_says_it_exists() {
+        let folder = folder("rename-no-replace");
+        std::fs::write(folder.join("a.txt"), "a").expect("the file can be written");
+        std::fs::write(folder.join("b.txt"), "b").expect("the file can be written");
+        let into = held(&folder);
+
+        let refused = rename_beneath_no_replace(&deletable(&folder.join("a.txt")), &into, "b.txt").expect_err("a file at the name is not replaced");
+
+        assert_eq!(refused.kind(), std::io::ErrorKind::AlreadyExists, "{refused}");
+        assert_eq!(
+            std::fs::read_to_string(folder.join("b.txt")).expect("the file at the name is still there"),
+            "b"
+        );
+        rename_beneath_no_replace(&deletable(&folder.join("a.txt")), &into, "c.txt").expect("a free name is taken");
+        assert_eq!(std::fs::read_to_string(folder.join("c.txt")).expect("the file is renamed"), "a");
+        drop(into);
         std::fs::remove_dir_all(&folder).expect("the folder can be removed");
     }
 

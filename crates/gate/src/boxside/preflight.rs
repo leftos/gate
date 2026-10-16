@@ -14,7 +14,7 @@ use std::time::Duration;
 use gate_args::BoxSeams;
 use gate_win32::{Make, Share};
 use windows_sys::Win32::Storage::FileSystem::{
-    DELETE, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_READ_ATTRIBUTES,
+    DELETE, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
 };
 
 use crate::answer::USAGE_STATUS;
@@ -475,18 +475,17 @@ fn found_at_name(folder: &File, name: &str, mut found: File, text: &str) -> Resu
 const MOVED_ASIDE_LIMIT: u32 = 100;
 
 /// Renames `found`, the folder `name` of the held folder `folder` opened with `DELETE` access, to
-/// `{name}.gate-moved-{n}` beside it, by handle ([`gate_win32::rename_beneath`]), for the first `n` from 1 nothing has
-/// the name of: the new name. Else why not, every `n` up to [`MOVED_ASIDE_LIMIT`] taken included.
+/// `{name}.gate-moved-{n}` beside it, by handle and never replacing what has that name
+/// ([`gate_win32::rename_beneath_no_replace`]), for the first `n` from 1 the rename finds free: the new name. Else why
+/// not: the rename's error, or every `n` up to [`MOVED_ASIDE_LIMIT`] taken.
 fn moved_aside(folder: &File, name: &str, found: &File) -> Result<String, String> {
     for n in 1..=MOVED_ASIDE_LIMIT {
         let moved = format!("{name}.gate-moved-{n}");
-        match gate_win32::open_beneath_as(folder, &moved, FILE_READ_ATTRIBUTES, Share::All, Make::Open) {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            _ => continue,
+        match gate_win32::rename_beneath_no_replace(found, folder, &moved) {
+            Ok(()) => return Ok(moved),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(format!("cannot move aside the folder {name}: {error}")),
         }
-        return gate_win32::rename_beneath(found, folder, &moved)
-            .map(|()| moved)
-            .map_err(|error| format!("cannot move aside the folder {name}: {error}"));
     }
     Err(format!(
         "cannot move aside the folder {name}: {name}.gate-moved-1 to {name}.gate-moved-{MOVED_ASIDE_LIMIT} are all taken"

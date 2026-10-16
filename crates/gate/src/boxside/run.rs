@@ -245,13 +245,20 @@ pub(super) fn lay_out_alone(work: &str, bare: &str, lock: &str, nonce: &str, con
 /// holds, and rewrites the tree's exclude file from it ([`inputs::unmatched`]), once the work folder is laid out and
 /// before the checkout: a record missing, unreadable or of another digest, a copy changed or gone, or an exclude file
 /// that cannot be written refuses the run `inputs`, its tag and line said under the box's output lock, so the PC runs
-/// the command itself; 75.
+/// the command itself; 75. A folder moved aside from the exclude file's name is said, under the lock too.
 fn inputs_matched(request: &Request<'_>, held: &File, beat: &Beat<'_>, console: &mut Console) -> Result<(), u32> {
     let Some(sent) = request.inputs_digest else {
         return Ok(());
     };
-    let Some(why) = inputs::unmatched(request.work, held, sent) else {
-        return Ok(());
+    let why = match inputs::unmatched(request.work, held, sent) {
+        Ok(moved_aside) => {
+            if let Some(line) = moved_aside {
+                let _held = beat.lock.lock().unwrap_or_else(PoisonError::into_inner);
+                console.err(&line);
+            }
+            return Ok(());
+        }
+        Err(why) => why,
     };
     let _held = beat.lock.lock().unwrap_or_else(PoisonError::into_inner);
     console.err(&inputs::refused_line(request.nonce));

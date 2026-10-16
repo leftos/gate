@@ -48,6 +48,5 @@ fn a_tree_thousands_of_folders_deep_is_deleted_without_overflowing_the_stack() {
     deleted.expect("the whole tree is deleted");
 
     assert!(!top.exists(), "the top folder is deleted with everything in it");
-    assert!(!top.exists(), "the top folder is deleted with everything in it");
     std::fs::remove_dir_all(&dir).expect("the folder can be removed");
 }

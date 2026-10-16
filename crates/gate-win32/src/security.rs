@@ -60,7 +60,9 @@ impl Drop for Descriptor {
 /// The SDDL of the security a folder of this process's is made with, for this process's `user` SID, integrity relative
 /// ID `integrity` and elevation `elevated`: owned by Administrators when elevated and by `user` when not, a protected
 /// DACL granting full control to SYSTEM, Administrators and `user`, handed down to files and folders, and a label of
-/// the integrity level that no lower process may write up past, handed down too.
+/// the integrity level that no lower process may write up past, handed down too. The label is not marked protected:
+/// a creation descriptor with a protected SACL needs `SeSecurityPrivilege`, which an unelevated box lacks, and a label
+/// a folder above hands down does not join a label given at creation.
 fn protected_sddl(user: &str, integrity: u32, elevated: bool) -> String {
     let owner = if elevated { "BA" } else { user };
     format!("O:{owner}D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;{user})S:(ML;OICI;NW;;;S-1-16-{integrity})")
@@ -207,7 +209,9 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::ptr;
 
-    use windows_sys::Win32::Security::{DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, OWNER_SECURITY_INFORMATION};
+    use windows_sys::Win32::Security::{
+        DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, GetSecurityDescriptorSacl, LABEL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
+    };
     use windows_sys::Win32::Storage::FileSystem::{DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_READ, READ_CONTROL, WRITE_DAC, WRITE_OWNER};
     use windows_sys::core::BOOL;
 
@@ -243,15 +247,26 @@ mod tests {
         make_folder_beneath(parent, name, FILE_GENERIC_READ, Share::All, &descriptor).expect("the folder can be made protected")
     }
 
-    /// Gives the open folder `folder` the DACL the SDDL `sddl` names, as a planter with the right to would.
-    fn set_dacl(folder: &File, sddl: &str) {
+    /// Gives the open folder `folder` the DACL and the label the SDDL `sddl` names, whichever it holds, as a planter
+    /// with the right to would.
+    fn set_lists(folder: &File, sddl: &str) {
         let descriptor = Descriptor::from_sddl(sddl).expect("the SDDL names a descriptor");
-        let (mut present, mut defaulted): (BOOL, BOOL) = (0, 0);
-        let mut dacl = ptr::null_mut();
-        // SAFETY: the descriptor outlives the calls, every out pointer is writable, and the list returned points into it.
-        let read = unsafe { GetSecurityDescriptorDacl(descriptor.as_ptr(), &raw mut present, &raw mut dacl, &raw mut defaulted) };
-        assert_ne!(read, 0, "the descriptor's DACL can be read");
-        set_security(folder, DACL_SECURITY_INFORMATION, ptr::null_mut(), dacl, ptr::null()).expect("the DACL can be set");
+        let (mut dacl_present, mut sacl_present, mut defaulted): (BOOL, BOOL, BOOL) = (0, 0, 0);
+        let (mut dacl, mut sacl) = (ptr::null_mut(), ptr::null_mut());
+        // SAFETY: the descriptor outlives the calls, every out pointer is writable, and the lists returned point into it.
+        let read = unsafe {
+            GetSecurityDescriptorDacl(descriptor.as_ptr(), &raw mut dacl_present, &raw mut dacl, &raw mut defaulted) != 0
+                && GetSecurityDescriptorSacl(descriptor.as_ptr(), &raw mut sacl_present, &raw mut sacl, &raw mut defaulted) != 0
+        };
+        assert!(read, "the descriptor's lists can be read");
+        let mut what = 0;
+        if dacl_present != 0 {
+            what |= DACL_SECURITY_INFORMATION;
+        }
+        if sacl_present != 0 {
+            what |= LABEL_SECURITY_INFORMATION;
+        }
+        set_security(folder, what, ptr::null_mut(), dacl, sacl).expect("the lists can be set");
     }
 
     /// The SDDL alias of the integrity level whose relative ID is `integrity`.
@@ -314,7 +329,7 @@ mod tests {
     fn a_folder_made_protected_is_protected_on_its_first_handle() {
         let folder = folder("first-handle");
         let parent = securable(&folder);
-        set_dacl(&parent, "D:(A;OICI;FA;;;WD)");
+        set_lists(&parent, "D:(A;OICI;FA;;;WD)");
         let plain = open_beneath_as(&parent, "plain", FILE_GENERIC_READ, Share::All, Make::NewFolder).expect("a plain folder can be made");
         assert!(
             !is_protected_folder(&plain).expect("its security can be read"),
@@ -327,6 +342,27 @@ mod tests {
         let text = security_text(&made).expect("the folder's security can be read through its first handle");
         assert!(is_protected_folder(&made).expect("its security can be read"), "{text}");
         assert!(!text.contains(";WD)"), "no grant to Everyone is inherited: {text}");
+        drop((made, plain, parent));
+        std::fs::remove_dir_all(&folder).expect("the folder can be removed");
+    }
+
+    #[test]
+    fn a_folder_made_protected_beneath_a_parent_handing_a_label_down_is_still_protected() {
+        let folder = folder("inherited-label");
+        let parent = securable(&folder);
+        set_lists(&parent, "S:(ML;OICI;NW;;;LW)");
+        let plain = open_beneath_as(&parent, "plain", FILE_GENERIC_READ, Share::All, Make::NewFolder).expect("a plain folder can be made");
+        assert!(
+            security_text(&plain).expect("its security can be read").contains("(ML;OICIID;NW;;;LW)"),
+            "the parent hands its label down to a folder made without a descriptor: {}",
+            security_text(&plain).expect("its security can be read")
+        );
+
+        let made = protected_beneath(&parent, "made");
+
+        let text = security_text(&made).expect("the folder's security can be read");
+        assert!(is_protected_folder(&made).expect("its security can be read"), "{text}");
+        assert!(!text.contains(";LW)"), "the parent's label is not inherited: {text}");
         drop((made, plain, parent));
         std::fs::remove_dir_all(&folder).expect("the folder can be removed");
     }

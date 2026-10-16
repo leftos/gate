@@ -523,6 +523,58 @@ fn a_run_rewrites_the_exclude_file_so_a_git_made_again_keeps_the_inputs() {
     );
 }
 
+/// Replaces the exclude file of `payload`'s work folder with a folder holding `inner.txt`: the exclude file's path and
+/// the line a step that moves the folder aside says.
+fn folder_at_exclude(payload: &Value) -> (PathBuf, String) {
+    let exclude = work(payload).join(r".git\info\exclude");
+    fs::remove_file(&exclude).expect("the exclude file can be removed");
+    fs::create_dir(&exclude).expect("a folder can take the exclude file's name");
+    fs::write(exclude.join("inner.txt"), "inner").expect("a file in it can be written");
+    let line = format!(
+        "gate: remote moved aside the folder {} to {}\n",
+        exclude.display(),
+        exclude.with_file_name("exclude.gate-moved-1").display()
+    );
+    (exclude, line)
+}
+
+#[test]
+fn a_run_says_the_folder_it_moved_aside_from_the_exclude_file_s_name() {
+    let case = Case::new("box_inputs_run_moved_aside");
+    let payload = snapshot_payload(&case);
+    put_all(&case, &payload, &[HELPER]);
+    let (exclude, line) = folder_at_exclude(&payload);
+
+    let run = run_box(&case, &digested(&payload, &manifest_line(&[HELPER])));
+
+    assert_eq!(run.code, Some(0), "{run:?}");
+    assert!(run.stderr.contains(&line), "{run:?}");
+    assert_eq!(fs::read_to_string(&exclude).expect("the exclude file is written"), "/.tmp/helper/a.dll\n");
+    assert!(
+        exclude.with_file_name("exclude.gate-moved-1").join("inner.txt").exists(),
+        "the folder is moved aside whole"
+    );
+}
+
+#[test]
+fn a_diff_that_needs_nothing_says_the_folder_it_moved_aside_from_the_exclude_file_s_name() {
+    let case = Case::new("box_inputs_diff_moved_aside");
+    let payload = snapshot_payload(&case);
+    put_all(&case, &payload, &[HELPER]);
+    let (exclude, line) = folder_at_exclude(&payload);
+
+    let outcome = inputs_call(&case, &stepped(&payload, "diff"), &[], &manifest_line(&[HELPER]), &[]);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(outcome.stdout, needs(&[]), "{outcome:?}");
+    assert_eq!(outcome.stderr, line, "{outcome:?}");
+    assert_eq!(fs::read_to_string(&exclude).expect("the exclude file is written"), "/.tmp/helper/a.dll\n");
+    assert!(
+        exclude.with_file_name("exclude.gate-moved-1").join("inner.txt").exists(),
+        "the folder is moved aside whole"
+    );
+}
+
 #[test]
 fn a_junction_at_the_last_folder_refuses_the_put_and_nothing_is_written_through_it() {
     let case = Case::new("box_inputs_last_folder_junction");

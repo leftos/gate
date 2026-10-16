@@ -54,7 +54,7 @@ pub fn check_plain_file(file: &std::fs::File) -> io::Result<()> {
 }
 pub use file::{
     Make, Share, delete_opened, delete_tree_opened, file_id, make_folder_beneath, move_no_replace, names_beneath, on_network_volume, open_beneath,
-    open_beneath_as, rename_beneath, reopen_through_filter, same_file,
+    open_beneath_as, rename_beneath, rename_beneath_no_replace, reopen_through_filter, same_file,
 };
 pub use security::{Descriptor, inherit_security, is_protected_folder, protected_descriptor, security_text};
 pub use tree::{Membership, OpenedJob, StoppableProcess, WaitableProcess};

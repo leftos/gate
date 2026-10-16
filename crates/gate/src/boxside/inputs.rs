@@ -74,18 +74,15 @@ pub(super) fn refused_line(nonce: &str) -> String {
 
 /// Why the work folder `work`, held as `held`, does not hold the inputs of the manifest whose digest is `sent`: no
 /// inputs record, one that cannot be read or of another digest, a recorded copy gone or not the one installed (its
-/// size, last write or file id differs), or a tree whose exclude file cannot be written from the record; `None` when
-/// it holds them, the exclude file written.
-pub(super) fn unmatched(work: &str, held: &File, sent: &str) -> Option<String> {
-    let record = match matching_record(work, sent) {
-        Ok(record) => record,
-        Err(why) => return Some(why),
-    };
+/// size, last write or file id differs), or a tree whose exclude file cannot be written from the record; `Ok` when it
+/// holds them, the exclude file written, with the line saying where a folder at the exclude file's name was moved
+/// aside, when one was ([`preflight::moved_aside_line`]), for the caller to say.
+pub(super) fn unmatched(work: &str, held: &File, sent: &str) -> Result<Option<String>, String> {
+    let record = matching_record(work, sent)?;
     if let Some(why) = changed_copy(held, &record) {
-        return Some(why);
+        return Err(why);
     }
-    // A folder moved aside from the exclude file's name is said by a put; a run's check has no line for it.
-    write_exclude(held, work, &record).err()
+    write_exclude(held, work, &record)
 }
 
 /// The work folder `work`'s inputs record when it holds the digest `sent`; else why not.
@@ -524,7 +521,9 @@ fn diff(asked: &Asked<'_>, sent: &Sent, work: &File, console: &mut Console) -> R
     if needed.is_empty() {
         unsealed(asked.work, &record)?;
         now.kept = swept(work, &record, &sent.manifest, console);
-        finished(asked.work, work, sent, &record, now)?;
+        if let Some(line) = finished(asked.work, work, sent, &record, now)? {
+            console.err(&line);
+        }
     }
     console.out(&format!("gate-remote-inputs: need {}", needed.len()));
     for path in needed {
@@ -1388,7 +1387,9 @@ mod tests {
         let inner = info.join(r"exclude\inner\a.txt");
         fs::write(&inner, "a").expect("a file in it can be written");
         let id = id_of(&inner);
-        fs::create_dir(info.join("exclude.gate-moved-1")).expect("a folder can take the first moved-aside name");
+        let taken = info.join("exclude.gate-moved-1");
+        fs::write(&taken, "taken").expect("a file can take the first moved-aside name");
+        let taken_id = id_of(&taken);
         fs::create_dir_all(outside.join("exclude")).expect("the outside folder can be made");
         fs::write(outside.join(r"exclude\keep.txt"), "keep").expect("the outside file can be written");
         let info_held = held(&info);
@@ -1400,6 +1401,11 @@ mod tests {
 
         drop(info_held);
         assert_eq!(moved.as_deref(), Some("exclude.gate-moved-2"), "the first free name");
+        assert_eq!(
+            id_of(&away.join("exclude.gate-moved-1")),
+            taken_id,
+            "the file at the first name is not replaced"
+        );
         assert_eq!(
             fs::read_to_string(away.join("exclude")).expect("the file is in the held folder"),
             "/a.txt\n",
