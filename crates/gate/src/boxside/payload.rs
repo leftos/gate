@@ -5,6 +5,7 @@
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use gate_args::MAX_WHOLE_NUMBER;
+use gate_router::warm::MOST_COMMANDS;
 pub(crate) use gate_router::{escaped, is_reordering_mark};
 use gate_router::{is_layout_name, repo_name};
 use serde_json::{Map, Value};
@@ -148,6 +149,72 @@ impl Payload {
         }
     }
 
+    /// What the run runs ([`Commands`]): the one `Command` of a payload that sets no `WarmCommands`, else the warm-up's
+    /// `WarmCommands` and its `WarmHash`, in a payload that sets no `Command`, asks for no outputs (no `Outputs` glob,
+    /// `OutputsFull` not true) and gives a `Timeout`. Else the usage line.
+    pub(crate) fn commands(&self) -> Result<Commands<'_>, String> {
+        if !self.sets("WarmCommands") {
+            return Ok(Commands {
+                words: vec![self.words("Command")?],
+                warm_hash: None,
+            });
+        }
+        if self.sets("Command") {
+            return Err("gate: box payload sets both Command and WarmCommands".to_owned());
+        }
+        let words = self.warm_commands()?;
+        let warm_hash = self.warm_hash()?;
+        if !self.output_globs()?.is_empty() || self.outputs_full()? {
+            return Err("gate: box payload asks a warm-up for outputs".to_owned());
+        }
+        // The budget bounds the warm-up's commands, their wall time included, though not the layout, checkout and
+        // restores before them; a warm-up never goes without one.
+        if self.timeout()?.is_none() {
+            return Err("gate: box payload lacks Timeout".to_owned());
+        }
+        Ok(Commands {
+            words,
+            warm_hash: Some(warm_hash),
+        })
+    }
+
+    /// The warm-up's `WarmCommands`: a list of 1 to [`MOST_COMMANDS`] commands, each a non-empty list of non-empty
+    /// texts; else the usage line.
+    fn warm_commands(&self) -> Result<Vec<Vec<String>>, String> {
+        let malformed =
+            || format!("gate: box payload WarmCommands is not a list of 1 to {MOST_COMMANDS} commands, each a non-empty list of non-empty texts");
+        let commands = self
+            .0
+            .get("WarmCommands")
+            .and_then(Value::as_array)
+            .filter(|commands| (1..=MOST_COMMANDS).contains(&commands.len()))
+            .ok_or_else(malformed)?;
+        commands
+            .iter()
+            .map(|command| {
+                let words = command.as_array().filter(|words| !words.is_empty()).ok_or_else(malformed)?;
+                words
+                    .iter()
+                    .map(|word| word.as_str().filter(|word| !word.is_empty()).map(str::to_owned).ok_or_else(malformed))
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// The warm-up's `WarmHash`, the SHA-256 of the warm-up file the commands come from: 64 lower-case hex digits.
+    /// Else the usage line saying the payload lacks it (absent or null) or, the value shown with its control characters
+    /// escaped, that it is not one.
+    fn warm_hash(&self) -> Result<&str, String> {
+        match self.0.get("WarmHash") {
+            None | Some(Value::Null) => Err("gate: box payload lacks WarmHash".to_owned()),
+            Some(Value::String(hash)) if is_lower_hex(hash, SHA256_DIGITS) => Ok(hash),
+            Some(other) => Err(format!(
+                "gate: box payload WarmHash is not 64 lower-case hex digits: {}",
+                escaped(&other.as_str().map_or_else(|| other.to_string(), str::to_owned))
+            )),
+        }
+    }
+
     /// Whether the payload sets `key` to anything but null.
     pub(crate) fn sets(&self, key: &str) -> bool {
         !matches!(self.0.get(key), None | Some(Value::Null))
@@ -160,6 +227,14 @@ impl Payload {
     pub(crate) fn snapshot(&self) -> Result<&str, String> {
         commit(self.0.get("Snapshot")).map_err(|shown| not_a_snapshot("Snapshot", &shown))
     }
+}
+
+/// What a run runs, as [`Payload::commands`] reads it.
+pub(crate) struct Commands<'a> {
+    /// Each command's words, its program first: the one command of a run, or each of a warm-up's in order.
+    pub(crate) words: Vec<Vec<String>>,
+    /// The warm-up file's hash the box records once every command passed; `None` for a run.
+    pub(crate) warm_hash: Option<&'a str>,
 }
 
 /// A sibling pair as the box lays it out: the main checkout's folder name, `Leaf`, and each sibling with the bare
@@ -636,6 +711,146 @@ mod tests {
             Err("gate: box payload lacks Work".to_owned()),
             "names are exact"
         );
+    }
+
+    /// A good warm-up hash: 64 lower-case hex digits.
+    const WARM_HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    /// The commands of the JSON `json` and its warm hash, or the line refusing them.
+    fn commands(json: &serde_json::Value) -> Result<(Vec<Vec<String>>, Option<String>), String> {
+        decoded(&json.to_string()).and_then(|payload| payload.commands().map(|commands| (commands.words, commands.warm_hash.map(str::to_owned))))
+    }
+
+    /// The words of `commands` as owned lists.
+    fn owned(commands: &[&[&str]]) -> Vec<Vec<String>> {
+        commands
+            .iter()
+            .map(|words| words.iter().map(|word| (*word).to_owned()).collect())
+            .collect()
+    }
+
+    #[test]
+    fn a_run_payload_runs_its_one_command() {
+        assert_eq!(
+            commands(&json!({"Command": ["dotnet", "build"], "WarmHash": WARM_HASH})),
+            Ok((owned(&[&["dotnet", "build"]]), None)),
+            "a WarmHash beside a Command is ignored"
+        );
+        assert_eq!(commands(&json!({})), Err("gate: box payload lacks Command".to_owned()));
+        assert_eq!(
+            commands(&json!({"WarmCommands": null})),
+            Err("gate: box payload lacks Command".to_owned()),
+            "a null WarmCommands is not set"
+        );
+    }
+
+    #[test]
+    fn a_warm_payload_reads_its_commands_and_hash() {
+        let json = json!({
+            "WarmCommands": [["dotnet", "restore"], ["dotnet", "build", "-c", "Release"]],
+            "WarmHash": WARM_HASH,
+            "Command": null,
+            "Outputs": [],
+            "OutputsFull": false,
+            "Timeout": 1800,
+        });
+        assert_eq!(
+            commands(&json),
+            Ok((
+                owned(&[&["dotnet", "restore"], &["dotnet", "build", "-c", "Release"]]),
+                Some(WARM_HASH.to_owned())
+            ))
+        );
+        let eight: Vec<Vec<&str>> = (0..8).map(|_| vec!["x"]).collect();
+        assert!(
+            commands(&json!({"WarmCommands": eight, "WarmHash": WARM_HASH, "Timeout": 1})).is_ok(),
+            "8 commands are allowed"
+        );
+    }
+
+    #[test]
+    fn a_warm_payload_without_a_timeout_is_refused() {
+        for json in [
+            json!({"WarmCommands": [["x"]], "WarmHash": WARM_HASH}),
+            json!({"WarmCommands": [["x"]], "WarmHash": WARM_HASH, "Timeout": null}),
+        ] {
+            assert_eq!(commands(&json), Err("gate: box payload lacks Timeout".to_owned()), "{json}");
+        }
+        assert_eq!(
+            commands(&json!({"WarmCommands": [["x"]], "WarmHash": WARM_HASH, "Timeout": 0})),
+            Err("gate: box payload Timeout is not a whole number of seconds".to_owned()),
+            "a bad Timeout keeps its own line"
+        );
+    }
+
+    #[test]
+    fn a_warm_payload_that_also_sets_command_is_refused() {
+        for command in [json!(["x"]), json!([]), json!("x")] {
+            assert_eq!(
+                commands(&json!({"Command": command, "WarmCommands": [["x"]], "WarmHash": WARM_HASH})),
+                Err("gate: box payload sets both Command and WarmCommands".to_owned()),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_warm_payload_without_a_warm_hash_is_refused() {
+        for json in [json!({"WarmCommands": [["x"]]}), json!({"WarmCommands": [["x"]], "WarmHash": null})] {
+            assert_eq!(commands(&json), Err("gate: box payload lacks WarmHash".to_owned()), "{json}");
+        }
+    }
+
+    #[test]
+    fn a_warm_payload_that_asks_for_outputs_is_refused() {
+        for json in [
+            json!({"WarmCommands": [["x"]], "WarmHash": WARM_HASH, "Outputs": ["bin/**"]}),
+            json!({"WarmCommands": [["x"]], "WarmHash": WARM_HASH, "OutputsFull": true}),
+        ] {
+            assert_eq!(commands(&json), Err("gate: box payload asks a warm-up for outputs".to_owned()), "{json}");
+        }
+    }
+
+    #[test]
+    fn warm_commands_must_be_1_to_8_non_empty_lists_of_non_empty_texts() {
+        let nine: Vec<Vec<&str>> = (0..9).map(|_| vec!["x"]).collect();
+        for bad in [
+            json!([]),
+            json!(nine),
+            json!([[]]),
+            json!([["x"], []]),
+            json!([[""]]),
+            json!([["x", 3]]),
+            json!(["x"]),
+            json!("x"),
+            json!({"a": ["x"]}),
+        ] {
+            assert_eq!(
+                commands(&json!({"WarmCommands": bad, "WarmHash": WARM_HASH})),
+                Err("gate: box payload WarmCommands is not a list of 1 to 8 commands, each a non-empty list of non-empty texts".to_owned()),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_warm_hash_must_be_64_lower_case_hex_digits() {
+        let upper = WARM_HASH.to_uppercase();
+        let short = &WARM_HASH[..63];
+        let newline = format!("{WARM_HASH}\n");
+        for (bad, shown) in [
+            (json!(upper), upper.clone()),
+            (json!(short), short.to_owned()),
+            (json!(newline), format!("{WARM_HASH}\\n")),
+            (json!(""), String::new()),
+            (json!(7), "7".to_owned()),
+        ] {
+            assert_eq!(
+                commands(&json!({"WarmCommands": [["x"]], "WarmHash": bad})),
+                Err(format!("gate: box payload WarmHash is not 64 lower-case hex digits: {shown}")),
+                "{bad}"
+            );
+        }
     }
 
     /// The run's snapshot of the JSON `json`: its text, or the line refusing it.

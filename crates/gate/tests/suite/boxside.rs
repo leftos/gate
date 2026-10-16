@@ -26,6 +26,7 @@ use crate::support::{
 
 mod inputs;
 mod outputs;
+mod warm;
 
 const BOX_USAGE: &str = "usage: gate box preflight|run|stop|boot|outputs|inflight|inputs --stdin (the base64 JSON request as stdin's first line)\n";
 
@@ -250,11 +251,12 @@ fn preflight_creates_the_bare_repo_and_work_folder() {
     let outcome = gate_box(&case, "preflight", &folders.payload(), None);
 
     let printed = passed(&outcome);
-    assert_eq!(printed.len(), 4, "{outcome:?}");
+    assert_eq!(printed.len(), 5, "{outcome:?}");
     assert_eq!(printed[0], format!("gate: remote created {}", folders.bare));
     assert_eq!(printed[1], format!("gate: remote version {}", build_version(&case)));
-    assert!(printed[2].starts_with("gate: remote boot "), "{outcome:?}");
-    assert!(printed[3].starts_with("gate: remote sdks "), "{outcome:?}");
+    assert_eq!(printed[2], "gate: remote warm none", "a folder made now is not warm: {outcome:?}");
+    assert!(printed[3].starts_with("gate: remote boot "), "{outcome:?}");
+    assert!(printed[4].starts_with("gate: remote sdks "), "{outcome:?}");
     assert!(Path::new(&folders.work).join(".git").is_dir());
     assert_eq!(git(&["-C", &folders.work, "config", "--get", "remote.origin.url"]), folders.bare);
     assert_eq!(git(&["-C", &folders.work, "config", "--local", "--get", "core.autocrlf"]), "false");
@@ -2651,7 +2653,12 @@ fn preflight_with_a_pair_creates_each_bare_and_nothing_in_the_work_folder() {
         bares.iter().map(|bare| format!("gate: remote created {bare}")).collect::<Vec<_>>(),
         "{outcome:?}"
     );
-    assert_eq!(printed.len(), 6, "the created lines, then the version, boot and sdks lines: {outcome:?}");
+    assert_eq!(
+        printed.len(),
+        7,
+        "the created lines, then the version, warm, boot and sdks lines: {outcome:?}"
+    );
+    assert_eq!(printed[4], "gate: remote warm none", "{outcome:?}");
     for bare in &bares {
         assert_eq!(
             git(&[&format!("--git-dir={bare}"), "rev-parse", "--is-bare-repository"]),

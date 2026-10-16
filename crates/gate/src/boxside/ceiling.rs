@@ -206,9 +206,14 @@ impl<'a> Ceiling<'a> {
         }
     }
 
+    /// The load-adjusted seconds of the closed watch, `None` once the sampler failed, its clock stopped there.
+    pub(super) fn adjusted_seconds(&self) -> Option<f64> {
+        (!self.watch.sampler_has_failed()).then(|| self.watch.adjusted_seconds())
+    }
+
     /// The line saying the load-adjusted seconds of the closed watch, `None` once the sampler failed.
     fn adjusted(&self) -> Option<String> {
-        (!self.watch.sampler_has_failed()).then(|| adjusted_line(self.nonce, self.watch.adjusted_seconds()))
+        self.adjusted_seconds().map(|seconds| adjusted_line(self.nonce, seconds))
     }
 
     /// Takes the sample whose reads begin at `began`, or, once the sampler has failed, brings the watch's wall time up

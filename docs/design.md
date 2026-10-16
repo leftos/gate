@@ -1964,9 +1964,11 @@ Each verb is one ssh call today, and the call's cost is its connection, not its 
 
 A routed run therefore moves to one long-lived connection carrying every verb, `gate box serve`, and the per-call client stays until that lands (GATE-70 holds the measurement, and GATE-109 the work).
 
-The payload is one base64 word (standard alphabet, padded) of UTF-8 JSON, sent as the first line of the call's stdin (never on a command line), holding the wrapper's keys: `Key`, `Bare`, `Work`, `Lock`, `Index`, `OutputFolder` and `Job`, and for `run` also `Command`, `Subfolder`, `Identity`, `Outputs`, `Nonce`, `OutputsFull`, `Timeout`, `Host` and the optional `InputsDigest`, and for `outputs` also `Name`. `inflight` reads only `Root`.
+The payload is one base64 word (standard alphabet, padded) of UTF-8 JSON, sent as the first line of the call's stdin (never on a command line), holding the wrapper's keys: `Key`, `Bare`, `Work`, `Lock`, `Index`, `OutputFolder` and `Job`, and for `run` also `Command` (or, for a warm-up, `WarmCommands` and `WarmHash` in its place), `Subfolder`, `Identity`, `Outputs`, `Nonce`, `OutputsFull`, `Timeout`, `Host` and the optional `InputsDigest`, and for `outputs` also `Name`. `inflight` reads only `Root`.
 
 `inputs` reads `Key`, `Bare`, `Work`, `Lock`, `Nonce` and `Step`.
+
+A warm-up's `run` payload sets `WarmCommands` (1 to 8 commands, each a non-empty list of non-empty texts) and `WarmHash` (64 lower-case hex digits, the hash of the warm-up file the commands come from), sets no `Command`, and asks for no outputs. The PC does not send it yet.
 
 `preflight` also reads an optional `Needs`, an object of tool name to minimum version text (`""` for any version), which the PC builds with `remote::payload::preflight_word` from the tools it wants probed; it is omitted when there are none, so a payload without needs is the same bytes as before.
 
@@ -2023,7 +2025,7 @@ Built verbs:
 
   With a `Pair` in the payload the preflight makes the folder above `Work` and one bare repo per repo, `Bare` for the main checkout and `{root}\{stem}.git` for each sibling (`{root}` is `Bare`'s folder, `{stem}` the sibling's name with every character but an ASCII letter, digit, `-` and `_` made `-`), and touches nothing inside `Work`.
 
-  It prints on stdout, in order: `gate: remote created <Bare>` (only when it created the bare repo), `gate: remote version <gate version>` (the same text as `gate --version` after `gate `, build id included), the boot line, `gate: remote sdks <v1,v2|none>`, and one `gate: remote tool <tool> ...` line for each tool of the payload's `Needs` (Tool probes, below); git's own output passes through. A payload without `Bare` or `Work` prints `gate: box payload lacks <key>` and exits 2.
+  It prints on stdout, in order: `gate: remote created <Bare>` (only when it created the bare repo), `gate: remote version <gate version>` (the same text as `gate --version` after `gate `, build id included), `gate: remote warm <64-hex>` or `gate: remote warm none` (the hash in the work folder's warm record `{Work}.warm`, read before the folders are readied; `none` when the main tree's `.git` or the record is missing, or the record is not a plain file holding exactly 64 lower-case hex digits, a line end included), the boot line, `gate: remote sdks <v1,v2|none>`, and one `gate: remote tool <tool> ...` line for each tool of the payload's `Needs` (Tool probes, below); git's own output passes through. A payload without `Bare` or `Work` prints `gate: box payload lacks <key>` and exits 2.
 - A failing git step prints `gate: remote <step> failed (status <n>)` and exits with that status; a git that cannot start prints `gate: remote <step> failed: <OS message>` and exits 1.
 
   The same `failed: <message>` form covers a config read or write the preflight made itself: `gate: remote git remote add failed: cannot write <config>: <why>`, `gate: remote git remote add failed: cannot open|read <path>: <why>` and `gate: remote git remote add failed: cannot write <config>: config.lock could not be removed: <why>`. The steps are `git init --bare`, `git init`, `git remote add`, `git config core.autocrlf` and `git config core.eol`.
@@ -2051,7 +2053,7 @@ Built verbs:
   The `<why>` of a skip is `unknown tool`, `no probe for godot`, `no answer in <n> s` (or `<n> ms` when the limit is not whole seconds), `no answer in <limit>, and could not be stopped: <error>`, `the probe failed` (followed by `: <panic text>` when the probe panicked), or the runner's failure text: `cannot run <program>: <why>`, `<program> <args> wrote more than 16 MiB` or `cannot run <program>: cannot read the system folder: <error>`.
 
   A payload whose `Needs` is not an object of texts prints `gate: box payload Needs is not an object of texts; probing nothing` on stderr, probes nothing and still exits 0.
-- **`run`** runs the payload's `Command` (a list of texts) in `Work` (in `Work\{Leaf}` for a sibling pair), and exits with the command's own whole 32-bit status after a successful run. Its stdout is the command's stdout, LF-terminated; its stderr is the command's stderr plus the box's own lines.
+- **`run`** runs the payload's `Command` (a list of texts), or, for a warm-up, each of its `WarmCommands` in order (Warm-up, below), in `Work` (in `Work\{Leaf}` for a sibling pair), and exits with the command's own whole 32-bit status after a successful run. Its stdout is the command's stdout, LF-terminated; its stderr is the command's stderr plus the box's own lines.
 
   The heartbeat: `gate box run` writes `gate-remote-heartbeat: <cpu ms>` on stderr every 5 s, on `gate-watchdog`'s `BeatClock` and `Pump`. Before the command starts (from just before the checkout) and after the command's wait ends it is not CPU-gated, so every period writes a beat, the first one period after it begins.
 
@@ -2071,7 +2073,11 @@ Built verbs:
 
   `gate-remote-adjusted: <nonce> <s.sss>` is also said as any watched command exits, once its output has drained, unless the sampler failed. A failed sample says `gate: sampler failed: <message>; watching by wall time only` and only the backstop is read from then on.
 
-  The start marker: just before it launches the command, before the donor console and the launch, the box says `gate-remote-started: <nonce>` on stderr once, with the payload's `Nonce`; a launch then refused or stopped has said it too.
+  The start marker: just before it launches the command, before the donor console and the launch, the box says `gate-remote-started: <nonce>` on stderr once, with the payload's `Nonce`; a launch then refused or stopped has said it too. A warm-up says it once, after every tool and pnpm restore and before its first command, and not again before the later ones.
+
+  Warm-up: a `run` with `WarmCommands` lays out and readies the work folder, restores the tools and the pnpm packages of every command, as a run does, then removes `{Work}.warm`, says the start marker and runs each command in order as a run's command is run (the stop signal looked at before each). It makes no back commit and packs no outputs, and on a pair run never says `gate: remote back commits: ...`. The payload's `Timeout` is one budget for all the commands: each command's ceiling is what the earlier ones left of it, in whole seconds rounded up, counting each one's load-adjusted seconds (its wall time once the sampler failed).
+
+  The first command that ends non-zero or is killed ends the warm-up with `gate: remote warm-up stopped at command <k> of <n>` on stderr and that command's status (124 for a kill). A budget spent before command `k` ends it with `gate: remote warm-up ran out of its <s> s budget before command <k> of <n>` and exit 124. Once every command passed, the box writes `{Work}.warm` holding exactly `WarmHash` and says `gate: remote warm <hash>` last, exit 0. A record that cannot be removed or written says `gate: remote could not remove <Work>.warm: <error>` or `gate: remote could not write <Work>.warm: <error>` and exits 1.
 
   The `CpuSource` is the job's own CPU, which only rises: the job's accounting keeps what its ended processes used. Another run's busy build on the box does not keep a silent idle command alive.
 
@@ -2086,6 +2092,8 @@ Built verbs:
   Ending the heartbeat waits at most 2 s (`Pump::stop_within`), so a pump stuck on a client that stopped reading is left behind and the work folder's lock is released.
 
   Payload refusals exit 2, each on stderr. The command's own: `gate: box payload Command is not a list of texts`, `gate: box payload lacks Command`, `gate: box payload Subfolder is not a text`, `gate: box payload Identity is not an object of texts`, `gate: box payload Identity may set only GIT_AUTHOR_* and GIT_COMMITTER_* names: <name>` and `gate: box payload Identity <name> holds a NUL`.
+
+  A warm-up payload's: `gate: box payload sets both Command and WarmCommands`, `gate: box payload lacks WarmHash`, `gate: box payload asks a warm-up for outputs` (an `Outputs` glob or `OutputsFull` true), `gate: box payload WarmCommands is not a list of 1 to 8 commands, each a non-empty list of non-empty texts` and `gate: box payload WarmHash is not 64 lower-case hex digits: <value>`. A `WarmHash` beside a `Command` is ignored, and a null `WarmCommands` is not set.
 
   The work folder's: `gate: box payload Lock must be <Work>.lock`, `gate: box payload Index must be <Work>.index`, `gate: box payload Key is not a work-folder key: <key>` and `gate: box payload Job is not this work folder's job name: <job>`.
 
@@ -2112,6 +2120,10 @@ Built verbs:
   The layout of the work folder: a run of one repo's tree is `Work` itself; a pair's are `Work\{Leaf}` for the main repo and `Work\{sibling}` for each sibling, each with its own bare repository and its own commit (`Snapshot` for the main repo, `SiblingSnapshots` for the others).
 
   The layout record `<Work>.layout`, beside the lock, says which layout `Work` holds: `single`, `pair {Leaf} {siblings}` (the siblings sorted without regard to ASCII case, one space before each, so the same siblings in another order are one layout) or `changing` while the folder is being cleared. A missing record says `single`. It is read and written as the tools record is, through a handle that refuses a link, a folder or a file with more than one name.
+
+  The records beside the lock, one file each, named `Work` plus: `.lock` (the run's lock), `.index` (the sync-back's copy of the index), `.layout` (above), `.inputs` (the copies the `inputs` verb left), `.tools` (the dotnet tool restore), `.packages` (the pnpm package restore) and `.warm` (the hash of the warm-up file whose commands last passed in the folder, 64 lower-case hex digits, no line end, written only by a warm-up). Each is described where its feature is.
+
+  The warm record is removed before a warm-up's first command, when a run finds the layout changed (before `changing` is written) and when the work folder is missing and the run makes it, so it never outlives the folder state it describes. The preflight reads it without taking the lock, sharing reading, writing and deletion.
 
   Under the lock, before any checkout, the run makes `Work` when missing, opens it as itself and holds it (a link, a junction or a file there is refused, never followed), and, when the record names another layout than the run's, writes `changing`, removes every child of `Work` (each as itself, a link never followed), readies each tree and writes the run's layout.
 
@@ -2165,7 +2177,7 @@ Built verbs:
 
   Known limit, as in PowerShell: after the builder's NuGet cache is cleared, the `*.tools` records must be deleted by hand.
 
-  The package restore (`boxside/packages.rs`) runs for a routed command whose first word's file stem is `pnpm`, in any case, after the tool restore and before the command. It looks for the folder to install in from `--dir` or `-C`, read only among pnpm's own options before the first non-option word, else the place folder, and walks up from it to the work root (the main tree on a pair run) for the first `pnpm-lock.yaml`; a walk that finds none does nothing.
+  The package restore (`boxside/packages.rs`) runs for a routed command whose first word's file stem is `pnpm`, in any case, after the tool restore and before the command. A run whose commands include more than one pnpm command (a warm-up's) installs once per distinct lockfile folder, in the commands' order, before the first command, and stops at the first install that fails. It looks for the folder to install in, for each command, from `--dir` or `-C`, read only among pnpm's own options before the first non-option word, else the place folder, and walks up from it to the work root (the main tree on a pair run) for the first `pnpm-lock.yaml`; a walk that finds none does nothing.
 
   It runs `pnpm install --frozen-lockfile` in the lockfile's folder in a job of its own named `{job}-packages`, created kill-on-close and never handed to pnpm, with the command's restricted token (the box's own is never the fallback) and the box's environment plus `CI=true` and git's `safe.directory=*`. Its output is forwarded as the tool restore's is, and it has no time limit (GATE-159).
 

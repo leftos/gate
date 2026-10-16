@@ -214,39 +214,39 @@ impl Record {
     }
 }
 
-/// The folder whose lockfile the command `request` runs pnpm with: none when its first word is not pnpm, when the
-/// folder it starts in lies outside the work root (said), when no lockfile is found up to the work root, or when a
-/// folder from the work root down to the lockfile's is a link or a junction (said). `Err` with status 1 when a
-/// lockfile's metadata cannot be read, its line said.
-fn lockfile_for(request: &Request<'_>, folders: &Folders<'_>, console: &mut Console) -> Result<Option<PathBuf>, u32> {
-    let Some((word, rest)) = request.command().split_first() else {
-        return Ok(None);
+/// Where the pnpm install of one command leads ([`lockfile_for`]).
+#[derive(PartialEq, Eq)]
+enum Found {
+    /// No install: the command is not pnpm, or no lockfile is found up to the work root.
+    Nothing,
+    /// No install: the folder pnpm starts in lies outside the work root.
+    Outside(PathBuf),
+    /// No install: this folder from the work root down to the lockfile's is a link or a junction.
+    Linked(String),
+    /// The folder of the lockfile to install from.
+    Lockfile(PathBuf),
+}
+
+/// Where the command of `words` leads its pnpm install ([`Found`]), nothing said. `Err` with the line saying a
+/// lockfile's metadata cannot be read.
+fn lockfile_for(words: &[String], folders: &Folders<'_>) -> Result<Found, String> {
+    let Some((word, rest)) = words.split_first() else {
+        return Ok(Found::Nothing);
     };
     if !is_pnpm(word) {
-        return Ok(None);
+        return Ok(Found::Nothing);
     }
     let start = match start_folder(folders.work, folders.place, rest) {
         Ok(start) => start,
-        Err(outside) => {
-            let outside = escaped(&outside.to_string_lossy());
-            console.err(&format!("gate: remote pnpm install skipped: {outside} is outside the work root"));
-            return Ok(None);
-        }
+        Err(outside) => return Ok(Found::Outside(outside)),
     };
-    let folder = lockfile_folder(folders.work, &start).map_err(|line| {
-        console.err(&line);
-        FAILED_STATUS
-    })?;
-    Ok(folder.filter(|folder| match linked(folders.work, folder) {
-        Some(link) => {
-            console.err(&format!(
-                "gate: remote pnpm install skipped: {} is reached through a link",
-                escaped(&link)
-            ));
-            false
-        }
-        None => true,
-    }))
+    Ok(match lockfile_folder(folders.work, &start)? {
+        None => Found::Nothing,
+        Some(folder) => match linked(folders.work, &folder) {
+            Some(link) => Found::Linked(link),
+            None => Found::Lockfile(folder),
+        },
+    })
 }
 
 /// The hash of `folder`'s package files: for each of [`HASHED`] that exists, its name, a NUL byte, its bytes and a NUL
@@ -482,28 +482,75 @@ fn refused(request: &Request<'_>, status: i32, beat: &Beat<'_>, console: &mut Co
     REFUSED_STATUS
 }
 
-/// Installs the pnpm packages of a `pnpm` command before it runs: nothing for another command, without a lockfile,
-/// when the record holds the lockfile folder's hash and its `node_modules` is there, or when git does not ignore
-/// `node_modules` there (said); else `pnpm install --frozen-lockfile` in the lockfile's folder, its line in
-/// `<Work>.packages` rewritten when it passes. `Ok` when nothing ran or the install passed; else `Err` with the status
-/// the run ends on, its lines said: 75 when the install failed or could not start; 1 when a package file could not be
-/// read, the record could not be written, a stop came before or during the install, or the box could not wait for it;
-/// 255 when the client closed the connection during it.
+/// Installs the pnpm packages of each `pnpm` command of the run before its first command runs ([`update_folder`]),
+/// once for each lockfile folder the commands need, in their order: nothing for another command or one without a
+/// lockfile. Where each command leads is found first and the same place kept once, so a skip's line is said once
+/// however many commands lead to it: the install skipped when the folder pnpm starts in lies outside the work root,
+/// or when a folder from the work root down to the lockfile's is a link or a junction. `Ok` when nothing ran or every
+/// install passed; else `Err` with the status of the first that did not, as [`update_folder`] gives it, its lines
+/// said, and no later install run; 1 when a lockfile's metadata cannot be read, its line said.
 pub(super) fn update(request: &Request<'_>, git: &WorkGit, folders: &Folders<'_>, beat: &Beat<'_>, console: &mut Console) -> Result<(), u32> {
-    let Some(folder) = lockfile_for(request, folders, console)? else {
-        return Ok(());
-    };
-    let digest = hash(&folder).map_err(|line| {
+    let mut places: Vec<Found> = Vec::new();
+    for words in request.commands() {
+        let found = lockfile_for(words, folders).map_err(|line| {
+            console.err(&line);
+            FAILED_STATUS
+        })?;
+        if !places.iter().any(|known| same_place(known, &found)) {
+            places.push(found);
+        }
+    }
+    for found in places {
+        match found {
+            Found::Nothing => {}
+            Found::Outside(outside) => console.err(&format!(
+                "gate: remote pnpm install skipped: {} is outside the work root",
+                escaped(&outside.to_string_lossy())
+            )),
+            Found::Linked(link) => console.err(&format!(
+                "gate: remote pnpm install skipped: {} is reached through a link",
+                escaped(&link)
+            )),
+            Found::Lockfile(folder) => update_folder(request, git, &Lockfile { work: folders.work, folder }, beat, console)?,
+        }
+    }
+    Ok(())
+}
+
+/// Whether `one` and `other` are the same place: two lockfile folders compared as Windows names them, without regard
+/// to letter case ([`ordinal_upper`]), anything else exactly.
+fn same_place(one: &Found, other: &Found) -> bool {
+    match (one, other) {
+        (Found::Lockfile(one), Found::Lockfile(other)) => ordinal_upper(&one.to_string_lossy()) == ordinal_upper(&other.to_string_lossy()),
+        _ => one == other,
+    }
+}
+
+/// A folder holding a lockfile a command needs, and the work folder it lies under.
+struct Lockfile<'a> {
+    work: &'a Path,
+    folder: PathBuf,
+}
+
+/// Installs the pnpm packages of `lockfile`'s folder: nothing when the record holds the folder's hash and its
+/// `node_modules` is there, or when git does not ignore `node_modules` there (said); else `pnpm install
+/// --frozen-lockfile` in the folder, its line in `<Work>.packages` rewritten when it passes. `Ok` when nothing ran or
+/// the install passed; else `Err` with the status the run ends on, its lines said: 75 when the install failed or could
+/// not start; 1 when a package file could not be read, the record could not be written, a stop came before or during
+/// the install, or the box could not wait for it; 255 when the client closed the connection during it.
+fn update_folder(request: &Request<'_>, git: &WorkGit, lockfile: &Lockfile<'_>, beat: &Beat<'_>, console: &mut Console) -> Result<(), u32> {
+    let folder = &lockfile.folder;
+    let digest = hash(folder).map_err(|line| {
         console.err(&line);
         FAILED_STATUS
     })?;
-    let key = relative(folders.work, &folder);
+    let key = relative(lockfile.work, folder);
     let path = format!("{}.packages", request.work);
     let mut record = read(&path, console);
-    if installed(&record, &key, &digest, &folder) || !ignored(git, folders.work, &key, console) {
+    if installed(&record, &key, &digest, folder) || !ignored(git, lockfile.work, &key, console) {
         return Ok(());
     }
-    let status = match install(request, &folder, &key, beat, console) {
+    let status = match install(request, folder, &key, beat, console) {
         Ok(Installed::Status(status)) => status,
         Ok(Installed::Ended(status)) => return Err(status),
         Err(message) => {
@@ -524,7 +571,16 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
 
-    use super::{Record, hash, is_pnpm, lockfile_folder, start_folder, start_word};
+    use super::{Found, Record, hash, is_pnpm, lockfile_folder, same_place, start_folder, start_word};
+
+    #[test]
+    fn lockfile_folders_are_one_place_whatever_their_letter_case() {
+        let folder = |path: &str| Found::Lockfile(PathBuf::from(path));
+        assert!(same_place(&folder(r"C:\w\App"), &folder(r"c:\W\app")), "one folder in two cases");
+        assert!(!same_place(&folder(r"C:\w\App"), &folder(r"C:\w\Lib")), "two folders");
+        assert!(!same_place(&folder(r"C:\w\App"), &Found::Nothing), "a folder and no install");
+        assert!(same_place(&Found::Nothing, &Found::Nothing));
+    }
 
     /// A folder for one test, removed when it ends.
     struct Scratch(PathBuf);

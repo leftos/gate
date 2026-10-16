@@ -1,6 +1,6 @@
 //! `gate box preflight`, the first call of every routed run: readies the work folder and its bare repository as the
-//! PowerShell wrapper's `Initialize-WorkFolder` does, then says the version, boot and SDK lines, and a line for each
-//! tool the payload's `Needs` names.
+//! PowerShell wrapper's `Initialize-WorkFolder` does, then says the version, warm, boot and SDK lines, and a line for
+//! each tool the payload's `Needs` names.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -23,7 +23,6 @@ use crate::boxside::forward::{ChildPipes, DRAIN, Drained, OutputLock};
 use crate::boxside::payload::{Pair, Payload};
 use crate::boxside::probe;
 use crate::boxside::run::{FILE_FLAG_OPEN_REPARSE_POINT, LAYOUT_SINGLE};
-use crate::boxside::tools;
 use crate::console::Console;
 use crate::environment::Variables;
 use crate::remote::git;
@@ -80,8 +79,11 @@ pub(crate) fn preflight(payload: &Payload, seams: &BoxSeams, console: &mut Conso
             return u32::from(USAGE_STATUS);
         }
     };
+    // Read once, before the folders are readied, which would make a missing `.git` and so a stale record look current.
+    let layout = layout_record(work);
+    let warm = warm_state(work, &layout);
     let readied = match &pair {
-        None => ready(bare, work, console),
+        None => ready(bare, work, &layout, console),
         Some(pair) => ready_bares(bare, work, pair, console),
     };
     if let Err(failed) = readied {
@@ -89,6 +91,7 @@ pub(crate) fn preflight(payload: &Payload, seams: &BoxSeams, console: &mut Conso
         return failed.status;
     }
     console.out(&format!("gate: remote version {}", build_version()));
+    console.out(&format!("gate: remote warm {}", warm.as_deref().unwrap_or("none")));
     boot::say(console);
     say_sdks_and_tools(payload, seams, console);
     0
@@ -129,27 +132,98 @@ fn say_sdks_and_tools(payload: &Payload, seams: &BoxSeams, console: &mut Console
     });
 }
 
+/// The most bytes of a warm record [`warm_state`] reads: one past a hash, so a longer record is seen as not one.
+const WARM_READ_LIMIT: u64 = 65;
+
+/// The hash the work folder `work`'s warm record, `{Work}.warm`, holds; `None` unless every tree its layout record
+/// `layout` names ([`laid_out_trees`]) has a plain `.git` ([`git_is_plain`]), as a work folder that is missing has
+/// not, and `None` when there is no record, when it cannot be opened or read or is not a plain file, and when it holds
+/// anything but exactly 64 lower-case hex digits, a line end included. The record is opened sharing reading, writing
+/// and deletion, so this read never makes a run's removal of it fail.
+fn warm_state(work: &str, layout: &io::Result<Option<String>>) -> Option<String> {
+    let trees = laid_out_trees(work, layout)?;
+    if !trees.iter().all(|tree| git_is_plain(Path::new(tree))) {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    shared_record(&crate::boxside::run::warm_record(work))
+        .ok()?
+        .take(WARM_READ_LIMIT)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    let text = String::from_utf8(bytes).ok()?;
+    crate::outputs::hash::is_lower_hex(&text, crate::outputs::hash::SHA256_DIGITS).then_some(text)
+}
+
+/// The record `record` beside the work folder opened as the preflight reads one: sharing reading, writing and
+/// deletion, without following a link there, and only as a plain file.
+fn shared_record(record: &str) -> io::Result<File> {
+    let file = OpenOptions::new()
+        .read(true)
+        .share_mode(Share::All.mode())
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(record)?;
+    gate_win32::check_plain_file(&file)?;
+    Ok(file)
+}
+
+/// The text of the work folder `work`'s layout record, `{work}.layout`, read once by the preflight ([`shared_record`]);
+/// `Ok(None)` when there is none.
+fn layout_record(work: &str) -> io::Result<Option<String>> {
+    let mut file = match shared_record(&format!("{work}.layout")) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let mut text = String::new();
+    file.read_to_string(&mut text)?;
+    Ok(Some(text))
+}
+
+/// The trees the layout record of the work folder `work`, `layout`, says it holds: `work` itself for a run of one
+/// repo's layout or no record, `{work}\{name}` for the leaf and each sibling of a pair's; `None` for a clear in
+/// progress, a record that cannot be read, or one that names no layout or a name that is not a folder name.
+fn laid_out_trees(work: &str, layout: &io::Result<Option<String>>) -> Option<Vec<String>> {
+    let text = match layout {
+        Ok(None) => return Some(vec![work.to_owned()]),
+        Ok(Some(text)) => text,
+        Err(_) => return None,
+    };
+    if text.eq_ignore_ascii_case(LAYOUT_SINGLE) {
+        return Some(vec![work.to_owned()]);
+    }
+    let names: Vec<&str> = text.strip_prefix("pair ")?.split(' ').collect();
+    let named = names.len() >= 2 && names.iter().all(|name| gate_router::is_layout_name(name));
+    named.then(|| names.iter().map(|name| format!(r"{work}\{name}")).collect())
+}
+
 /// The folder above `work`; the bare repository, said as created; and the work folder's repository ([`ready_tree`],
 /// which readies nothing through a link at its `.git`), unless the work folder is laid out for another layout
-/// ([`laid_out_for_one_repo`]): a run of the key changes it under its lock, which the preflight does not take.
-fn ready(bare: &str, work: &str, console: &mut Console) -> Result<(), Failed> {
+/// ([`laid_out_for_one_repo`] of its record `layout`): a run of the key changes it under its lock, which the
+/// preflight does not take.
+fn ready(bare: &str, work: &str, layout: &io::Result<Option<String>>, console: &mut Console) -> Result<(), Failed> {
     let git = Git::find();
     create_parent(work)?;
     create_bare(&git, bare, None, console)?;
-    if !laid_out_for_one_repo(work) {
+    if !laid_out_for_one_repo(layout) {
         return Ok(());
     }
-    ready_tree(&git, bare, work, None, console).map_err(|unready| match unready {
+    let warm = crate::boxside::run::warm_record(work);
+    let at = TreeAt {
+        tree: work,
+        bare,
+        warm: &warm,
+    };
+    ready_tree(&git, &at, None, console).map_err(|unready| match unready {
         Unready::Git(failed) => failed,
         Unready::Folder(why) => Failed::without_status(format!("gate: remote {why}")),
     })
 }
 
-/// Whether the layout record of the work folder `work`, `{work}.layout`, read without following a link, says the
-/// layout of a run of one repo or is missing; a record that says a pair's layout or a clear in progress, or that cannot
-/// be read, is not.
-fn laid_out_for_one_repo(work: &str) -> bool {
-    match tools::read_record(&format!("{work}.layout")) {
+/// Whether the work folder's layout record `layout` ([`layout_record`]) says the layout of a run of one repo or is
+/// missing; a record that says a pair's layout or a clear in progress, or that cannot be read, is not.
+fn laid_out_for_one_repo(layout: &io::Result<Option<String>>) -> bool {
+    match layout {
         Ok(None) => true,
         Ok(Some(text)) => text.eq_ignore_ascii_case(LAYOUT_SINGLE),
         Err(_) => false,
@@ -195,6 +269,14 @@ fn create_bare(git: &Git, bare: &str, name: Option<&str>, console: &mut Console)
     Ok(())
 }
 
+/// Where [`ready_tree`] readies a repository: the tree, its repo's bare repository, and the warm record of the work
+/// folder the tree lies in, `{Work}.warm`.
+pub(super) struct TreeAt<'a> {
+    pub(super) tree: &'a str,
+    pub(super) bare: &'a str,
+    pub(super) warm: &'a str,
+}
+
 /// How [`ready_tree`] runs git: the preflight's [`Git`], or the run's, with its safety options and its output forwarded
 /// under the box's output lock.
 pub(super) trait TreeGit {
@@ -230,7 +312,10 @@ impl TreeGit for Git {
 /// lock, those are repaired before the first git step ([`repair_git`]). So each git call goes through `git` and names
 /// the tree's own `.git` folder, config and the tree, and no other repository's config, objects or work tree is
 /// reached. A step's line names the repo `name` when given, as a pair run's lines do ([`tree_step`]).
-pub(super) fn ready_tree(git: &impl TreeGit, bare: &str, tree: &str, name: Option<&str>, console: &mut Console) -> Result<(), Unready> {
+/// A `.git` made anew is no warm tree: the work folder's warm record goes first, before `git init`. A record that
+/// cannot be removed readies nothing: the preflight leaves the tree to the run, whose own removal refuses it.
+pub(super) fn ready_tree(git: &impl TreeGit, at: &TreeAt<'_>, name: Option<&str>, console: &mut Console) -> Result<(), Unready> {
+    let (bare, tree) = (at.bare, at.tree);
     if git.holds_the_lock() {
         repair_git(tree).map_err(Unready::Folder)?;
     } else if has_a_link_in_its_git(Path::new(tree)) {
@@ -239,6 +324,18 @@ pub(super) fn ready_tree(git: &impl TreeGit, bare: &str, tree: &str, name: Optio
     // A run removes a link, a junction or a file named `.git` before it readies a tree (`plain_tree` in the run).
     let made = fs::symlink_metadata(Path::new(tree).join(".git")).is_err();
     if made {
+        if let Err(error) = remove_entry(Path::new(at.warm)) {
+            if !git.holds_the_lock() {
+                // The preflight leaves the tree to the run, which removes the record under the lock or is refused.
+                console.err(&format!(
+                    "gate: remote could not remove {}: {}",
+                    crate::boxside::payload::escaped(at.warm),
+                    crate::boxside::payload::escaped(&error.to_string())
+                ));
+                return Ok(());
+            }
+            return Err(Unready::Folder(format!("cannot remove {}: {error}", at.warm)));
+        }
         tree_step(git, "git init", name, &["init", "-q", "--", tree], console)?;
     }
     if !made || !fresh_config_written(bare, tree, name)? {
@@ -799,7 +896,7 @@ mod tests {
 
     use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
 
-    use super::{Git, fresh_config, fresh_config_written, git_failed, ready_tree, replace_config, run_forwarded, sdk_list};
+    use super::{Git, TreeAt, fresh_config, fresh_config_written, git_failed, ready_tree, replace_config, run_forwarded, sdk_list};
     use crate::boxside::forward::OutputLock;
     use crate::console::Console;
 
@@ -866,7 +963,13 @@ mod tests {
             let (written, called) = (folder.join("written"), folder.join("called"));
             fs::create_dir_all(&folder).expect("the test's folder can be made");
 
-            let readied = ready_tree(&git, bare, &written.to_string_lossy(), None, &mut Console::new());
+            let (tree, warm) = (written.to_string_lossy(), folder.join("written.warm").to_string_lossy().into_owned());
+            let at = TreeAt {
+                tree: &tree,
+                bare,
+                warm: &warm,
+            };
+            let readied = ready_tree(&git, &at, None, &mut Console::new());
 
             assert!(readied.is_ok(), "the tree is readied for {bare}");
             let called_dir = format!(r"--git-dir={}\.git", called.display());

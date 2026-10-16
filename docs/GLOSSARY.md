@@ -191,6 +191,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Verdict**: the outcome a `release` line records: `passed`, `failed`, `log-failure`, `stalled`, `timed-out`, `backstop`, `transfer-timed-out` or `unknown` (no run facts).
 - **Wake event**: the auto-reset named event each waiter sleeps on, which a gate signals when it takes or releases a slot or deletes a dead gate's ticket.
 - **Warm**: said of a work folder whose warm-up passed on the builder for this host and this `.gate/warmup.toml`; its warm-up record has state `warm`.
+- **Warm record**: the builder's file `{Work}.warm`, holding exactly the hash of the warm-up file whose commands last passed in the work folder; the box's preflight says it as `gate: remote warm <hash|none>`.
 - **Warm-up**: the commands a repo's tracked `.gate/warmup.toml` declares, run on the builder in a worktree's work folder before routed work for it, so a short-ceiling routed run meets an incremental build; it needs the repo named in `remote.json`'s `warmup` list. The router's judge and the record exist; nothing starts a warm-up yet.
 - **Watch call**: the one remote-client call (`preflight`, `push`, `inputs-diff`, `inputs`, `run`, `ls-remote`, `fetch` or `outputs`) that `--test-remote-watch-call` points the stall and ceiling seams at: the command's ceiling for `run`, the transfer ceiling for any other.
 - **Watchdog**: the part of a running gate that samples the command and kills its job on a stall, the ceiling or the backstop.
