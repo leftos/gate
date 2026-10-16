@@ -10,13 +10,13 @@ use std::path::PathBuf;
 
 use gate_state::v1::{self, Claim, ClaimKind, Ticket, TicketKind};
 use gate_state::{HeavyLight, KernelObject, MachineSnapshot, OtherClaim, beside_allowance};
-use gate_win32::mutex_exists;
+use gate_win32::{OwnedMutexGuard, mutex_exists};
 use jiff::Timestamp;
 
 use crate::acquire;
 use crate::console::Console;
 use crate::resolve::ResolvedRoot;
-use crate::slots::{self, ClaimOf, Held, Survey, Taken};
+use crate::slots::{self, BesideTry, ClaimOf, ClaimsFolder, Held, Survey, Taken};
 use crate::wait::{self, Arrival, Host, Waiter, Which};
 
 /// The kinds of earlier gate the waiting line counts and a drain with a light slot to take waits for.
@@ -139,6 +139,7 @@ impl<'a> MachineWait<'a> {
             pid: arrival.gate.pid,
             start_ms: arrival.gate.start_ms,
             holds: false,
+            lends_closed: false,
             remote: None,
             expected: arrival.expected.cloned(),
         };
@@ -222,19 +223,51 @@ impl<'a> MachineWait<'a> {
     /// Holds the machine once it holds every slot it takes: holding the beside mutex, counts the gates that run lent
     /// their light parent's slot by their lend markers, heavy holders it waits for outside the allowance, and with none
     /// rewrites its ticket as holding before it lets the mutex go, so a gate lent a slot after the count sees the ticket
-    /// and is not lent ([`slots::try_beside`]). Whether it holds the machine; not while the mutex is held by another
-    /// gate, a lent gate runs, or the claims folder cannot be listed, said once.
+    /// and is not lent ([`slots::try_beside`]). While some run, it rewrites its ticket once as closing its lends
+    /// (`lendsClosed`), so no light parent lends its slot again and the drain waits only for those already lent.
+    /// Whether it holds the machine; not while the mutex cannot be taken, a lent gate runs, the claims folder cannot be
+    /// listed, said once, or the ticket cannot be rewritten as holding ([`MachineWait::rewrite`]).
     fn hold(&mut self, survey: &mut Survey, console: &mut Console) -> bool {
-        let Some(_beside) = slots::try_beside(self.root, survey, console) else {
-            self.waiter.retry_soon();
+        let Some(_beside) = self.try_beside(survey, console) else {
             return false;
         };
-        if !matches!(survey.lent_children(&self.root.path, console), Ok(0)) {
+        match survey.lent_children(&self.root.path, console) {
+            Ok(0) => self.rewrite(true, false, survey, console),
+            Ok(_) => {
+                if !self.ticket.lends_closed {
+                    self.rewrite(false, true, survey, console);
+                }
+                false
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Rewrites the gate's ticket as holding the machine or not (`holds`) and as closing its lends or not
+    /// (`lends_closed`), keeping it as written; whether it was written. A ticket that cannot be written is said once a
+    /// wait and keeps what it said before, so the next pass tries again.
+    fn rewrite(&mut self, holds: bool, lends_closed: bool, survey: &mut Survey, console: &mut Console) -> bool {
+        let ticket = Ticket {
+            holds,
+            lends_closed,
+            ..self.ticket.clone()
+        };
+        if let Err(error) = self.waiter.rewrite(&ticket) {
+            survey.say_once("cannot write the ticket", &self.waiter.ticket().display().to_string(), error, console);
             return false;
         }
-        self.ticket.holds = true;
-        self.waiter.rewrite(&self.ticket, console);
+        self.ticket = ticket;
         true
+    }
+
+    /// The beside mutex, tried once ([`slots::try_beside`]); `None` when another gate holds it, which this gate looks
+    /// again for soon, or when it cannot be taken, said once.
+    fn try_beside(&mut self, survey: &mut Survey, console: &mut Console) -> Option<OwnedMutexGuard> {
+        let tried = slots::try_beside(self.root, survey, console);
+        if matches!(tried, BesideTry::Busy) {
+            self.waiter.retry_soon();
+        }
+        tried.held()
     }
 
     /// Takes the critical mutex unless a live critical request arrived first; whether it holds it.
@@ -290,8 +323,7 @@ impl<'a> MachineWait<'a> {
         if held >= target {
             return true;
         }
-        let Some(beside) = slots::try_beside(self.root, survey, console) else {
-            self.waiter.retry_soon();
+        let Some(beside) = self.try_beside(survey, console) else {
             return false;
         };
         let allowance = usize::try_from(beside_allowance(self.counts.light)).unwrap_or(usize::MAX);
@@ -321,19 +353,8 @@ impl<'a> MachineWait<'a> {
     /// listed, said once.
     fn running_light(&self, survey: &mut Survey, console: &mut Console) -> io::Result<usize> {
         let probe = self.probe_light(survey, console);
-        Ok(running_light(&probe, self.past_light(survey, console)?.len()))
-    }
-
-    /// The other gates' live light claims on slots past the light count, where a count lowered since they took their
-    /// slots left them, each as a claim kind and slot index; else why the claims folder cannot be listed, said once.
-    fn past_light(&self, survey: &mut Survey, console: &mut Console) -> io::Result<Vec<(ClaimKind, u32)>> {
-        let light = self.counts.light;
-        Ok(survey
-            .light_claims(&self.root.path, console)?
-            .into_iter()
-            .filter(|(_, index)| *index >= light)
-            .map(|(_, index)| (ClaimKind::Light, index))
-            .collect())
+        let claims = survey.live_claims(&self.root.path, console)?;
+        Ok(running_light(&probe, past_light(&claims, self.counts.light).len()))
     }
 
     /// The heavy and light counts from the counts file as it stands, each ignored line said once a wait.
@@ -369,39 +390,56 @@ impl<'a> MachineWait<'a> {
         }
     }
 
-    /// What the gate waits for, as its waiting lines say it, from the tickets and claims the last pass read and one
-    /// probe of the slots, each live gate lent its light parent's slot counted as a heavy holder (none when the claims
-    /// folder cannot be listed, said once); then, when no gate is ahead of it ([`eta_blockers`]), when the last holder of the slots it
-    /// waits for frees its slot, those busy by the probe and the light ones past the count by their live claims, as
-    /// [`MachineWait::running_light`] counts them, by the other gates' live claims as they stand
-    /// ([`wait::holder_eta`]).
+    /// What the gate waits for, as its waiting lines say it, from the tickets and claims the last pass read, one probe
+    /// of the slots and one listing of the claims folder ([`Survey::claims_folder`]), each live gate lent its light
+    /// parent's slot counted as a heavy holder (none when the claims folder cannot be listed, said once); then, when no
+    /// gate is ahead of it ([`eta_blockers`]), when the last holder it waits for ends ([`MachineWait::last_eta`]).
     fn status(&self, survey: &mut Survey, console: &mut Console) -> String {
         let order = self.ticket.queue_order();
         let earlier = earlier_waiters(&self.others, &self.holders, order);
         let probe = self.probe_slots(survey, console);
+        let folder = survey
+            .claims_folder(&self.root.path, console)
+            .inspect_err(|error| {
+                survey.say_once(
+                    "cannot read the claims in",
+                    &v1::slots_dir(&self.root.path).display().to_string(),
+                    error,
+                    console,
+                );
+            })
+            .ok();
         let mut held = held_of(&probe);
-        if let Ok(lent) = survey.lent_children(&self.root.path, console) {
-            held.heavy = held.heavy.saturating_add(u32::try_from(lent).unwrap_or(u32::MAX));
+        if let Some(folder) = &folder {
+            held.heavy = held.heavy.saturating_add(u32::try_from(folder.lent.len()).unwrap_or(u32::MAX));
         }
         let status = status_text(held, self.counts.light, earlier);
         if eta_blockers(&self.others, &self.holders, order) > 0 {
             return status;
         }
-        let (Ok(past), Ok(claims)) = (self.past_light(survey, console), survey.live_claims(&self.root.path, console)) else {
-            return status;
-        };
-        let Some(busy) = waited_for(&probe, past).filter(|busy| !busy.is_empty()) else {
-            return status;
-        };
-        let now = Timestamp::now();
-        let allowance = usize::try_from(beside_allowance(self.counts.light)).unwrap_or(usize::MAX);
-        let Some(busy) = drained_by(&claims, busy, allowance, now).filter(|busy| !busy.is_empty()) else {
-            return status;
-        };
-        match wait::holder_eta(&claims, &busy, Which::Last, now) {
+        match folder.and_then(|folder| self.last_eta(&probe, &folder)) {
             Some(eta) => format!("{status}, {eta}"),
             None => status,
         }
+    }
+
+    /// When the last holder the gate waits for ends, by `probe` and the claims folder as `folder` lists it: the holders
+    /// of the slots busy by the probe and of the light ones past the count by their live claims, as
+    /// [`MachineWait::running_light`] counts them, those the drain waits for ([`drained_by`]), and each gate lent its
+    /// light parent's slot by its lend marker's `expected` ([`wait::holder_usuals`]). `None` when none is waited for,
+    /// or one of them has no usual, a lend marker that cannot be read included.
+    fn last_eta(&self, probe: &[SlotProbe], folder: &ClaimsFolder) -> Option<String> {
+        let claims: Vec<Claim> = folder.claims.iter().map(|(_, claim)| claim.clone()).collect();
+        let busy = waited_for(probe, past_light(&claims, self.counts.light))?;
+        let now = Timestamp::now();
+        let allowance = usize::try_from(beside_allowance(self.counts.light)).unwrap_or(usize::MAX);
+        let busy = drained_by(&claims, busy, allowance, now)?;
+        let mut holders = wait::holder_usuals(&claims, &busy, now)?;
+        for marker in &folder.lent {
+            let lent = v1::read_claim(marker).ok()?;
+            holders.push(wait::usual(&lent, now)?);
+        }
+        wait::named_eta(holders, Which::Last)
     }
 
     /// One probe of the heavy and light slots of the counts, its own left out: each slot's claim kind and index, and
@@ -462,6 +500,16 @@ impl<'a> MachineWait<'a> {
             other_claims,
         }
     }
+}
+
+/// The live light claims of `claims` on slots past a light count of `light`, where a count lowered since they took
+/// their slots left them, each as a claim kind and slot index.
+fn past_light(claims: &[Claim], light: u32) -> Vec<(ClaimKind, u32)> {
+    claims
+        .iter()
+        .filter(|claim| claim.kind == ClaimKind::Light && claim.index >= light)
+        .map(|claim| (ClaimKind::Light, claim.index))
+        .collect()
 }
 
 /// Whether `ticket` is a local waiter of one of `kinds` ahead of the place `order`; a remote one never is.
@@ -756,6 +804,7 @@ mod tests {
             pid,
             start_ms: u64::from(pid) * 10,
             holds: false,
+            lends_closed: false,
             remote: None,
             expected: None,
         }

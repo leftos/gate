@@ -4,7 +4,7 @@
 //! it waits leaves nothing behind.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process;
 
 use gate_state::v1::{self, Claim, ClaimKind, Ticket, TicketKind};
@@ -90,6 +90,7 @@ fn write_ticket(case: &Case, kind: TicketKind, (pid, start): (u32, Timestamp), a
         pid,
         start_ms,
         holds: false,
+        lends_closed: false,
         remote: remote.then_some(true),
         expected: None,
     };
@@ -957,6 +958,217 @@ fn a_critical_gate_does_not_take_the_machine_while_a_lent_heavy_child_runs() {
     assert_passed(&critical.finish());
     assert_eq!(events_of(&case, child_pid), ["parent"]);
     assert!(events_of(&case, critical_pid).contains(&"take".to_owned()));
+}
+
+/// The ticket file of the gate `pid` in the case's root; fails when there is none.
+fn ticket_file(case: &Case, pid: u32) -> PathBuf {
+    fs::read_dir(v1::tickets_dir(&case.root()))
+        .expect("the tickets folder can be listed")
+        .map(|entry| entry.expect("a ticket entry can be read").path())
+        .find(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with(&format!("{pid}-")))
+        })
+        .expect("the gate has a ticket")
+}
+
+/// Whether the ticket of the gate `pid` refuses every new lend, as its `lendsClosed` says.
+fn lends_closed(case: &Case, pid: u32) -> bool {
+    fs::read_to_string(ticket_file(case, pid))
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .is_some_and(|ticket| ticket["lendsClosed"] == json!(true))
+}
+
+/// Waits until the critical gate `critical` says a still-waiting line that starts with `status` after the lines it said
+/// so far.
+fn wait_for_heartbeat_after(critical: &Running, status: &str) {
+    let heartbeat = "gate: still waiting for the machine (critical): ";
+    let before = critical.wait_for_stderr_where("its lines so far", |_| true).matches(heartbeat).count();
+    critical.wait_for_stderr_where("a later still-waiting line", |stderr| {
+        stderr.split(heartbeat).skip(before + 1).any(|line| line.starts_with(status))
+    });
+}
+
+/// The status of a critical gate that holds its slots of a count of heavy 1 and light 4 and waits for one lent child.
+const ONE_LENT: &str = "1 heavy and 0 light slots held (2 light slots beside it), 0 earlier waiters";
+
+#[test]
+fn a_light_parent_lends_no_more_once_the_critical_gate_holds_its_slots_and_waits_for_its_lent_child() {
+    let case = Case::new("a_light_parent_lends_no_more_once_the_critical_gate_holds_its_slots_and_waits_for_its_lent_child");
+    write_counts(&case.root(), r#"{"v":1,"heavy":1,"light":4}"#);
+    let go = case.folder().join("go");
+    let go_word = shown(&go);
+    let child_go = case.folder().join("child-go");
+    let child_go_word = shown(&child_go);
+    let held = holder(&case, &heavy_words("holder.log", &POLL, &[FAKE_TOOL, "wait", &go_word, "exit", "0"]));
+    let critical = case.start(&critical_words("critical.log", &with_heartbeat(), &[FAKE_TOOL, "exit", "0"]));
+    let critical_pid = critical.id();
+    critical.wait_for_stderr(WAITING);
+    write_claim(&case, KernelObject::LightSlot(3), ClaimKind::Light, (process::id(), own_start()));
+    let marker = test_marker(&case, "light");
+    let first = start(marked(
+        &case,
+        &heavy_words("first.log", &POLL, &[FAKE_TOOL, "wait", &child_go_word, "exit", "0"]),
+        &marker,
+    ));
+    first.wait_for_stderr(&lent(process::id()));
+
+    let_go(&go);
+    assert_passed(&held.finish());
+    wait_until("the critical gate closing its lends", || lends_closed(&case, critical_pid));
+    let second = start(marked(&case, &heavy_words("second.log", &POLL, &[FAKE_TOOL, "exit", "0"]), &marker));
+    let second_pid = second.id();
+    second.wait_for_stderr(&format!(
+        "gate: waiting for a heavy slot behind the critical request of gate {critical_pid}"
+    ));
+    assert_eq!(events_of(&case, second_pid), ["queue"], "the second child queues behind the request");
+
+    let_go(&child_go);
+    assert_passed(&first.finish());
+    assert_passed(&critical.finish());
+    let second = second.finish();
+    assert_passed(&second);
+    assert!(!second.stderr.contains(&lent(process::id())), "{second:?}");
+    assert!(at(&case, "take", critical_pid) < at(&case, "take", second_pid));
+    assert!(!events_of(&case, second_pid).contains(&"parent".to_owned()));
+}
+
+/// Writes a lend marker in the case's root naming this process as parent and child, started at `start_ms`, whose
+/// content is no claim.
+fn write_lend_marker(case: &Case, start_ms: u64) -> PathBuf {
+    let dir = v1::slots_dir(&case.root());
+    fs::create_dir_all(&dir).expect("the claims folder can be made");
+    let path = dir.join(format!("gate-lent-{0}-{0}-{start_ms}.json", process::id()));
+    fs::write(&path, "not a claim").expect("the lend marker can be written");
+    path
+}
+
+#[test]
+fn an_unreadable_lend_marker_named_for_a_live_gate_keeps_the_critical_gate_from_holding_the_machine() {
+    let case = Case::new("an_unreadable_lend_marker_named_for_a_live_gate_keeps_the_critical_gate_from_holding_the_machine");
+    write_counts(&case.root(), r#"{"v":1,"heavy":1,"light":4}"#);
+    let marker = write_lend_marker(&case, own_start().as_millisecond().unsigned_abs());
+
+    let critical = case.start(&critical_words("critical.log", &with_heartbeat(), &[FAKE_TOOL, "exit", "0"]));
+    let critical_pid = critical.id();
+    critical.wait_for_stderr(&format!("{WAITING}: {ONE_LENT}\n"));
+    wait_for_heartbeat_after(&critical, ONE_LENT);
+    assert_eq!(events_of(&case, critical_pid), ["queue"], "the marker's live gate is waited for");
+
+    fs::remove_file(&marker).expect("the marker can be deleted");
+    assert_passed(&critical.finish());
+    assert!(events_of(&case, critical_pid).contains(&"take".to_owned()));
+}
+
+#[test]
+fn a_lend_marker_named_for_a_dead_gate_is_deleted_and_does_not_hold_the_critical_gate_back() {
+    let case = Case::new("a_lend_marker_named_for_a_dead_gate_is_deleted_and_does_not_hold_the_critical_gate_back");
+    write_counts(&case.root(), r#"{"v":1,"heavy":1,"light":4}"#);
+    let marker = write_lend_marker(&case, 1);
+
+    let outcome = finish(case.gate(&critical_words("critical.log", &POLL, &[FAKE_TOOL, "exit", "0"])));
+
+    assert_passed(&outcome);
+    assert!(!outcome.stderr.contains(WAITING), "{outcome:?}");
+    assert!(!marker.exists(), "the dead gate's marker is deleted");
+}
+
+#[test]
+fn a_critical_gate_whose_ticket_cannot_be_rewritten_as_holding_does_not_hold_the_machine() {
+    let case = Case::new("a_critical_gate_whose_ticket_cannot_be_rewritten_as_holding_does_not_hold_the_machine");
+    write_counts(&case.root(), r#"{"v":1,"heavy":1,"light":4}"#);
+    let go = case.folder().join("go");
+    let go_word = shown(&go);
+    let held = holder(&case, &heavy_words("holder.log", &POLL, &[FAKE_TOOL, "wait", &go_word, "exit", "0"]));
+    let critical = case.start(&critical_words("critical.log", &with_heartbeat(), &[FAKE_TOOL, "exit", "0"]));
+    let critical_pid = critical.id();
+    critical.wait_for_stderr(WAITING);
+    let ticket = ticket_file(&case, critical_pid);
+    let set_read_only = |read_only: bool| {
+        let mut permissions = fs::metadata(&ticket).expect("the ticket's metadata can be read").permissions();
+        permissions.set_readonly(read_only);
+        fs::set_permissions(&ticket, permissions).expect("the ticket's read-only flag can be set");
+    };
+    set_read_only(true);
+
+    let_go(&go);
+    assert_passed(&held.finish());
+    let cannot = "gate: cannot write the ticket ";
+    critical.wait_for_stderr(cannot);
+    wait_for_heartbeat_after(&critical, "0 heavy and 0 light slots held");
+    assert_eq!(events_of(&case, critical_pid), ["queue"], "a ticket not rewritten as holding is no hold");
+
+    set_read_only(false);
+    let outcome = critical.finish();
+    assert_passed(&outcome);
+    assert_eq!(outcome.stderr.matches(cannot).count(), 1, "said once: {outcome:?}");
+    assert!(events_of(&case, critical_pid).contains(&"take".to_owned()));
+}
+
+#[test]
+fn a_heavy_child_that_cannot_read_the_critical_ticket_is_not_lent_its_parents_slot() {
+    let case = Case::new("a_heavy_child_that_cannot_read_the_critical_ticket_is_not_lent_its_parents_slot");
+    write_counts(&case.root(), r#"{"v":1,"heavy":1,"light":4}"#);
+    let go = case.folder().join("go");
+    let go_word = shown(&go);
+    let critical = holder(&case, &critical_words("critical.log", &POLL, &[FAKE_TOOL, "wait", &go_word, "exit", "0"]));
+    let critical_pid = critical.id();
+    fs::write(ticket_file(&case, critical_pid), "not a ticket").expect("the ticket can be overwritten");
+    write_claim(&case, KernelObject::LightSlot(3), ClaimKind::Light, (process::id(), own_start()));
+
+    let marker = test_marker(&case, "light");
+    let child = start(marked(&case, &heavy_words("child.log", &POLL, &[FAKE_TOOL, "exit", "0"]), &marker));
+    let child_pid = child.id();
+    child.wait_for_stderr("gate: waiting for a heavy slot");
+    assert_eq!(events_of(&case, child_pid), ["queue"], "the child queues as an ordinary heavy gate");
+
+    let_go(&go);
+    assert_passed(&critical.finish());
+    let outcome = child.finish();
+    assert_passed(&outcome);
+    assert!(!outcome.stderr.contains(&lent(process::id())), "{outcome:?}");
+    assert!(at(&case, "release", critical_pid) < at(&case, "take", child_pid));
+}
+
+#[test]
+fn a_critical_gate_does_not_take_the_machine_while_a_child_lent_as_it_waited_runs() {
+    let case = Case::new("a_critical_gate_does_not_take_the_machine_while_a_child_lent_as_it_waited_runs");
+    write_counts(&case.root(), r#"{"v":1,"heavy":1,"light":4}"#);
+    let go = case.folder().join("go");
+    let go_word = shown(&go);
+    let child_go = case.folder().join("child-go");
+    let child_go_word = shown(&child_go);
+    let held = holder(&case, &heavy_words("holder.log", &POLL, &[FAKE_TOOL, "wait", &go_word, "exit", "0"]));
+    write_claim(&case, KernelObject::LightSlot(3), ClaimKind::Light, (process::id(), own_start()));
+    let marker = test_marker(&case, "light");
+    let child = start(marked(
+        &case,
+        &heavy_words("child.log", &POLL, &[FAKE_TOOL, "wait", &child_go_word, "exit", "0"]),
+        &marker,
+    ));
+    let child_pid = child.id();
+    child.wait_for_stderr("gate: waiting for a heavy slot");
+
+    let critical = case.start(&critical_words("critical.log", &with_heartbeat(), &[FAKE_TOOL, "exit", "0"]));
+    let critical_pid = critical.id();
+    critical.wait_for_stderr(WAITING);
+    child.wait_for_stderr(&lent(process::id()));
+    assert_eq!(events_of(&case, child_pid), ["queue", "parent"], "lent as it waited");
+
+    let_go(&go);
+    assert_passed(&held.finish());
+    wait_for_heartbeat_after(&critical, ONE_LENT);
+    assert_eq!(
+        events_of(&case, critical_pid),
+        ["queue"],
+        "the critical gate waits for the child lent as it waited"
+    );
+
+    let_go(&child_go);
+    assert_passed(&child.finish());
+    assert_passed(&critical.finish());
+    assert!(at(&case, "parent", child_pid) < at(&case, "take", critical_pid));
 }
 
 #[test]

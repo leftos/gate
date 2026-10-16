@@ -57,6 +57,7 @@ fn ticket(pid: u32, arrived: u64) -> Ticket {
         pid,
         start_ms: 1_759_439_760_571,
         holds: false,
+        lends_closed: false,
         remote: None,
         expected: None,
     }

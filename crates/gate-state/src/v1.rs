@@ -345,6 +345,10 @@ pub struct Ticket {
     pub start_ms: u64,
     /// True only for a critical gate that holds the machine.
     pub holds: bool,
+    /// True only for a critical gate that holds every slot it takes and waits for the gates lent a light parent's slot
+    /// to end: no light parent lends its slot while it says so. Written only when true.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub lends_closed: bool,
     /// True while queued for the remote pool. Written only when `Some(true)`, so a local queue's ticket is `None`.
     #[serde(skip_serializing_if = "is_not_true")]
     pub remote: Option<bool>,
