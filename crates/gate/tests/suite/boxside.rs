@@ -1364,6 +1364,23 @@ fn box_run_gives_the_command_its_run_s_compiler_server_id() {
 }
 
 #[test]
+fn box_run_gives_the_command_the_payloads_env() {
+    let case = Case::new("box_run_env");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "env", "GATE362_PROBE", "env", "NuGetAudit"]);
+    snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
+    payload["Env"] = json!({"GATE362_PROBE": "x", "NuGetAudit": "false"});
+
+    // Inherited under the same name, so the case sees the payload's pair replace the box's own value.
+    let outcome = run_box_with_env(&case, &payload, "GATE362_PROBE", "inherited");
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(
+        outcome.stdout, "x\nfalse\n",
+        "the command reads the payload's Env, not the box's own: {outcome:?}"
+    );
+}
+
+#[test]
 fn box_run_turns_the_event_log_provider_off_for_the_command() {
     let case = Case::new("box_run_event_log_off");
     let mut payload = box_payload(&case, "k", &[r".\eventlog.cmd"]);
@@ -1436,6 +1453,70 @@ fn box_run_refuses_an_identity_name_outside_the_git_identity() {
         "gate: box payload Identity may set only GIT_AUTHOR_* and GIT_COMMITTER_* names: GIT_CONFIG_COUNT\n"
     );
     assert_eq!(work_entries(&payload), [".git"], "nothing is checked out or run");
+}
+
+#[test]
+fn box_run_refuses_a_malformed_env() {
+    let case = Case::new("box_run_env_refused");
+    let many = Value::Object((0..65).map(|number| (format!("A{number}"), json!("v"))).collect());
+    let hundred_thousand = Value::Object((0..100_000).map(|number| (format!("A{number:06}"), json!("v"))).collect());
+    // A name of 250 characters refused as the gate's own: its first 200 are shown, the control character among them
+    // escaped.
+    let long_name = format!("GATE_{}\u{1b}{}", "x".repeat(194), "y".repeat(50));
+    let long_line = format!(
+        "gate: box payload Env sets GATE_{}\\u{{1b}}…: GATE_ names are the gate's",
+        "x".repeat(194)
+    );
+    let long_env = Value::Object(std::iter::once((long_name, json!("c"))).collect());
+    let refusing = [
+        (json!("A=b"), "gate: box payload Env is not an object of texts"),
+        (json!({"A": 1}), "gate: box payload Env is not an object of texts"),
+        (
+            json!({"NuGetAudit": "false", "NUGETAUDIT": "true"}),
+            "gate: box payload Env names NUGETAUDIT twice",
+        ),
+        (
+            json!({"ZZ_\u{c4}_X": "a", "ZZ_\u{e4}_X": "b"}),
+            "gate: box payload Env names ZZ_\u{e4}_X twice",
+        ),
+        (
+            json!({"MSBUILDUSESERVER": "1"}),
+            "gate: box payload Env sets MSBUILDUSESERVER, which the gate sets itself",
+        ),
+        (
+            json!({"PATH": "C:\\x"}),
+            "gate: box payload Env sets PATH, a machine path the builder keeps",
+        ),
+        (
+            json!({"GATE_OTHER": "1"}),
+            "gate: box payload Env sets GATE_OTHER: GATE_ names are the gate's",
+        ),
+        (json!({"A": "b\u{0}c"}), "gate: box payload Env gives A a value holding NUL"),
+        (json!({"A=B": "c"}), "gate: box payload Env has a malformed name 'A=B'"),
+        (json!({"": "c"}), "gate: box payload Env has a malformed name ''"),
+        (json!({"A=\u{1b}": "c"}), "gate: box payload Env has a malformed name 'A=\\u{1b}'"),
+        (long_env, long_line.as_str()),
+        (many, "gate: box payload Env is over its cap of 64 names or 32 KiB"),
+        (hundred_thousand, "gate: box payload Env is over its cap of 64 names or 32 KiB"),
+    ];
+
+    // One preflight lays the work folder out, so each refusal is shown to leave it as it was.
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "env", "A"]);
+    snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
+    let laid = work_entries(&payload);
+    assert_eq!(laid, [".git"], "the preflight lays nothing else out");
+
+    for (env, line) in refusing {
+        let mut refused = payload.clone();
+        refused["Env"] = env;
+
+        let outcome = run_box(&case, &refused);
+
+        assert_eq!(outcome.code, Some(2), "{line}: {outcome:?}");
+        assert_eq!(outcome.stdout, "");
+        assert_eq!(outcome.stderr, format!("{line}\n"), "{outcome:?}");
+        assert_eq!(work_entries(&payload), laid, "nothing is checked out or run");
+    }
 }
 
 #[test]

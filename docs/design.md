@@ -1977,7 +1977,9 @@ Each verb is one ssh call today, and the call's cost is its connection, not its 
 
 A routed run therefore moves to one long-lived connection carrying every verb, `gate box serve`, and the per-call client stays until that lands (GATE-70 holds the measurement, and GATE-109 the work).
 
-The payload is one base64 word (standard alphabet, padded) of UTF-8 JSON, sent as the first line of the call's stdin (never on a command line), holding the wrapper's keys: `Key`, `Bare`, `Work`, `Lock`, `Index`, `OutputFolder` and `Job`, and for `run` also `Command` (or, for a warm-up, `WarmCommands` and `WarmHash` in its place), `Subfolder`, `Identity`, `Outputs`, `Nonce`, `OutputsFull`, `Timeout`, `Host` and the optional `InputsDigest`, and for `outputs` also `Name`. `inflight` reads only `Root`.
+The payload is one base64 word (standard alphabet, padded) of UTF-8 JSON, sent as the first line of the call's stdin (never on a command line), holding the wrapper's keys: `Key`, `Bare`, `Work`, `Lock`, `Index`, `OutputFolder` and `Job`, and for `run` also `Command` (or, for a warm-up, `WarmCommands` and `WarmHash` in its place), `Subfolder`, `Identity`, the optional `Env`, `Outputs`, `Nonce`, `OutputsFull`, `Timeout`, `Host` and the optional `InputsDigest`, and for `outputs` also `Name`.
+
+`inflight` reads only `Root`.
 
 `inputs` reads `Key`, `Bare`, `Work`, `Lock`, `Nonce` and `Step`.
 
@@ -2106,7 +2108,13 @@ Built verbs:
 
   Payload refusals exit 2, each on stderr. The command's own: `gate: box payload Command is not a list of texts`, `gate: box payload lacks Command`, `gate: box payload Subfolder is not a text`, `gate: box payload Identity is not an object of texts`, `gate: box payload Identity may set only GIT_AUTHOR_* and GIT_COMMITTER_* names: <name>` and `gate: box payload Identity <name> holds a NUL`.
 
-  A warm-up payload's: `gate: box payload sets both Command and WarmCommands`, `gate: box payload lacks WarmHash`, `gate: box payload asks a warm-up for outputs` (an `Outputs` glob or `OutputsFull` true), `gate: box payload WarmCommands is not a list of 1 to 8 commands, each a non-empty list of non-empty texts` and `gate: box payload WarmHash is not 64 lower-case hex digits: <value>`. A `WarmHash` beside a `Command` is ignored, and a null `WarmCommands` is not set.
+  `Env`'s: `gate: box payload Env is not an object of texts`, `gate: box payload Env has a malformed name '<name>'` (empty, or holding `=` or a NUL), `gate: box payload Env gives <name> a value holding NUL`, `gate: box payload Env sets <name>, which the gate sets itself` and `gate: box payload Env sets <name>, which git would read over the gate's own git settings`.
+
+  Also `gate: box payload Env sets <name>: GATE_ names are the gate's`, `gate: box payload Env sets <name>, a machine path the builder keeps`, `gate: box payload Env names <name> twice` and `gate: box payload Env is over its cap of 64 names or 32 KiB`. A null `Env` is not set.
+
+  A warm-up payload's: `gate: box payload sets both Command and WarmCommands`, `gate: box payload lacks WarmHash`, `gate: box payload asks a warm-up for outputs` (an `Outputs` glob or `OutputsFull` true), `gate: box payload asks a warm-up for Env` (an `Env` that is not null, even `{}`), `gate: box payload WarmCommands is not a list of 1 to 8 commands, each a non-empty list of non-empty texts` and `gate: box payload WarmHash is not 64 lower-case hex digits: <value>`.
+
+  A `WarmHash` beside a `Command` is ignored, and a null `WarmCommands` is not set.
 
   The work folder's: `gate: box payload Lock must be <Work>.lock`, `gate: box payload Index must be <Work>.index`, `gate: box payload Key is not a work-folder key: <key>` and `gate: box payload Job is not this work folder's job name: <job>`.
 
@@ -2119,6 +2127,16 @@ Built verbs:
   `SiblingSnapshots`, an object of exactly the pair's sibling names, each a 40 lower-case hex digit commit, is read by `run` alone: `gate: box payload SiblingSnapshots is not an object`, `gate: box payload SiblingSnapshots must name exactly the Pair's siblings: <names>` and `gate: remote run payload's SiblingSnapshots <name> '<value>' is not a 40-hex commit sha`.
 
   `Identity` may hold only `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL`, `GIT_AUTHOR_DATE`, `GIT_COMMITTER_NAME`, `GIT_COMMITTER_EMAIL` and `GIT_COMMITTER_DATE`.
+
+  `Env` is the caller's variables for the command: an object of texts of at most 64 names and 32 KiB of names and values together, the cap read from the raw object before any pair is checked.
+
+  It refuses a name the gate sets (`GATE_SLOT_HELD`, `GATE_STATE_DIR`, `SharedCompilationId`, `MSBUILDNODEHANDSHAKESALT`, `MSBUILDUSESERVER`, `DOTNET_CLI_USE_MSBUILD_SERVER`, `MSBUILDDISABLENODEREUSE`, `GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_<n>`, `GIT_CONFIG_VALUE_<n>`, and .NET's Event Log logging settings in any spelling: the `__` and `:` forms, a `DOTNET_` or `ASPNETCORE_` prefix, the provider's full type name).
+
+  It also refuses `GIT_CONFIG_PARAMETERS` and `GIT_CONFIG` (git reads them over the gate's own `safe.directory` entry), any `GATE_` name, and the machine paths `PATH`, `PATHEXT`, `TEMP`, `TMP`, `SystemRoot`, `windir`, `ComSpec`, `USERPROFILE`, `HOME`, `APPDATA`, `LOCALAPPDATA` and `ProgramData`. Names are compared without regard to ASCII case.
+
+  A name given twice is refused, first as an ASCII-case scan and then as Windows compares names, which folds more than ASCII. A refusal line shows the name shortened to 200 characters and escaped.
+
+  The pairs apply to the command only, never to the box's own steps (the git steps, the tool restore, the pnpm install).
 
   `Key` is `[A-Za-z0-9_-]+` and is the last name of `Work`; `Job` is `Local\gate-remote-<Key>-<12 hex digits>`. `run`, `stop` and `preflight` check the key; `run` and `stop` check the job.
 
@@ -2227,6 +2245,8 @@ Built verbs:
   The command's environment gains `GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_<n>=safe.directory` and `GIT_CONFIG_VALUE_<n>=*`, where n is the inherited count (0 when there is none) and the count grows by one.
 
   The inherited count is read as git reads it (leading whitespace, an optional `+`, decimal digits to the end, at most `i32::MAX`; an empty value is 0); a count git would refuse, or `i32::MAX` itself, leaves the environment unchanged. The work folders are owned by Administrators, which git refuses from a non-elevated token.
+
+  The command's environment is the box's own with the payload's `Env` pairs set over it, each replacing any inherited value; the settings below are applied after the pairs, so none of them can be undone by one.
 
   The command's environment also sets `Logging__EventLog__LogLevel__Default=None`, replacing any inherited value, so a .NET host with default logging writes nothing to the Windows Event Log; its console output is unchanged. Of the groups the Application log's default access lets write, a restricted copy of the box's token could hold only Administrators, INTERACTIVE, SERVICE, BATCH and WRITE_RESTRICTED, and the command's token holds none of them.
 
@@ -2503,7 +2523,7 @@ A virtual Cargo workspace (`resolver = "3"`) with every crate under `crates/`, l
 | `gate-win32` | The Win32 layer: job objects, process creation, named mutexes and events, priority, console, the WSL VM's CPU reader, the samples the watchdog consumes. | no |
 | `gate-watchdog` | Free-share, load-adjusted clock, stall, ceiling and backstop arithmetic over samples with the kill lines, and the box heartbeat, on an injected clock; the cores-hint verdict. | yes; a pure crate |
 | `gate-args` | The gate's own argv: the subcommand CLI, the compatibility layer, the C-runtime and cmd.exe quoting, the `%VAR%` refusals and the PATHEXT resolution rules over an injected environment and file lookup. | yes; a pure crate |
-| `gate-router` | The routing rules (T2-T4) over strings: what routes, the path rewrite, the `--no-build` drop (`test` and `run` only), the wrapped dotnet form, the builder warm-up's file, hash and judge (`warm.rs`). | yes; a pure crate |
+| `gate-router` | The routing rules (T2-T4) over strings: what routes, the path rewrite, the `--no-build` drop (`test` and `run` only), the wrapped dotnet form, the builder warm-up's file, hash and judge (`warm.rs`), the caller's variables a routed run does not send and the line it says for them (`watch.rs`). | yes; a pure crate |
 | `gate` | The `gate` binary: the subcommands, the wait loop, the run, the journal writes, the remote client and `gate box`. | no |
 
 Rules:

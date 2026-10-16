@@ -606,3 +606,12 @@ fn box_run_refuses_a_warm_up_that_asks_for_outputs() {
 
     refused_before_the_lock(&case, payload, "gate: box payload asks a warm-up for outputs");
 }
+
+#[test]
+fn box_run_refuses_a_warm_up_that_asks_for_env() {
+    let case = Case::new("box_warm_env");
+    let mut payload = warm_payload(&case, &[&[FAKE_TOOL, "exit", "0"]]);
+    payload["Env"] = json!({"NuGetAudit": "false"});
+
+    refused_before_the_lock(&case, payload, "gate: box payload asks a warm-up for Env");
+}
