@@ -4,6 +4,15 @@
 
 mod boot;
 mod ceiling;
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the box's desktop decisions are held for the run path that hands a command to the builder's desktop; \
+                  nothing outside tests reads them"
+    )
+)]
+mod desktop;
 mod forward;
 mod heartbeat;
 mod inflight;
