@@ -45,6 +45,7 @@ fn print_request_shows_the_new_cli_request() {
         "remoteTimeoutMs": null,
         "remoteBackstopMs": null,
         "remoteOutputsBudgetBytes": null,
+        "remoteInputsBudgetBytes": null,
         "ownStartFails": false,
         "parentJobTrusted": false,
         "jobBreakaway": false,

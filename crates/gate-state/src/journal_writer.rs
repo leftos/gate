@@ -241,6 +241,8 @@ pub enum FallbackReason {
     Version,
     /// The remote client could not start.
     Client,
+    /// The run's ignored inputs could not be sent to the builder, or its work folder no longer held them at the run.
+    Inputs,
 }
 
 impl FallbackReason {
@@ -257,6 +259,7 @@ impl FallbackReason {
             FallbackReason::Layout => "layout",
             FallbackReason::Version => "version",
             FallbackReason::Client => "client",
+            FallbackReason::Inputs => "inputs",
         }
     }
 }

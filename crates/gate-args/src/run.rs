@@ -71,6 +71,8 @@ pub(crate) enum ValueOption {
     #[cfg(feature = "test-seams")]
     RemoteOutputsBudgetBytes,
     #[cfg(feature = "test-seams")]
+    RemoteInputsBudgetBytes,
+    #[cfg(feature = "test-seams")]
     RemoteLogCapBytes,
     #[cfg(feature = "test-seams")]
     RemoteTamper,
@@ -276,6 +278,8 @@ impl RunBuilder {
             #[cfg(feature = "test-seams")]
             ValueOption::RemoteOutputsBudgetBytes => self.test_seams.remote_outputs_budget_bytes = Some(values::above_zero(spelled, value)?),
             #[cfg(feature = "test-seams")]
+            ValueOption::RemoteInputsBudgetBytes => self.test_seams.remote_inputs_budget_bytes = Some(values::above_zero(spelled, value)?),
+            #[cfg(feature = "test-seams")]
             ValueOption::RemoteLogCapBytes => self.test_seams.remote_log_cap_bytes = Some(values::above_zero(spelled, value)?),
             #[cfg(feature = "test-seams")]
             ValueOption::RemoteTamper => self.test_seams.remote_tamper = Some(values::remote_call(spelled, value, values::TAMPERS)?),
@@ -364,7 +368,8 @@ impl RunBuilder {
     /// `--test-remote-retry-pause-ms`, `--test-remote-bound-ms`, `--test-remote-interrupt-at`,
     /// `--test-remote-watch-call`, `--test-remote-timeout-ms`, `--test-remote-backstop-ms`, `--test-local-sdks`,
     /// `--test-remote-fetch-cap-bytes`,
-    /// `--test-remote-apply-cap-bytes`, `--test-remote-outputs-budget-bytes`, `--test-remote-log-cap-bytes` and
+    /// `--test-remote-apply-cap-bytes`, `--test-remote-outputs-budget-bytes`, `--test-remote-inputs-budget-bytes`,
+    /// `--test-remote-log-cap-bytes` and
     /// `--test-remote-tamper` without
     /// `--test-remote-transport`,
     /// whose client alone reads them, `--test-remote-timeout-ms` with it unless `--test-remote-watch-call` names a call
@@ -389,6 +394,7 @@ impl RunBuilder {
                 self.test_seams.remote_outputs_budget_bytes.is_some(),
                 "--test-remote-outputs-budget-bytes",
             ),
+            (self.test_seams.remote_inputs_budget_bytes.is_some(), "--test-remote-inputs-budget-bytes"),
             (self.test_seams.remote_log_cap_bytes.is_some(), "--test-remote-log-cap-bytes"),
             (self.test_seams.remote_tamper.is_some(), "--test-remote-tamper"),
         ] {

@@ -268,6 +268,7 @@ fn seam_option(name: &str) -> Option<RunOption> {
         "test-remote-fetch-cap-bytes" => Some(RunOption::Value(ValueOption::RemoteFetchCapBytes)),
         "test-remote-apply-cap-bytes" => Some(RunOption::Value(ValueOption::RemoteApplyCapBytes)),
         "test-remote-outputs-budget-bytes" => Some(RunOption::Value(ValueOption::RemoteOutputsBudgetBytes)),
+        "test-remote-inputs-budget-bytes" => Some(RunOption::Value(ValueOption::RemoteInputsBudgetBytes)),
         "test-remote-log-cap-bytes" => Some(RunOption::Value(ValueOption::RemoteLogCapBytes)),
         "test-remote-tamper" => Some(RunOption::Value(ValueOption::RemoteTamper)),
         _ => None,

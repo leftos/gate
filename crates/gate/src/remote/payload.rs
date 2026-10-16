@@ -112,6 +112,27 @@ pub(crate) struct RunCall<'a> {
     pub timeout: u64,
     pub host: &'a str,
     pub sibling_snapshots: &'a [(String, String)],
+    /// The SHA-256 of the inputs manifest line the inputs calls sent (`InputsDigest`), `None` for a run with no inputs.
+    pub inputs_digest: Option<&'a str>,
+}
+
+/// The step an inputs call asks the box for: which files the work folder needs (`diff`), or installing them (`put`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum InputsStep {
+    Diff,
+    Put,
+}
+
+/// The payload word of an inputs call: the location, the run's `Nonce` and the `Step`.
+pub(crate) fn inputs_word(location: &Location, nonce: &str, step: InputsStep) -> String {
+    let mut object = location.object();
+    let step = match step {
+        InputsStep::Diff => "diff",
+        InputsStep::Put => "put",
+    };
+    object.insert("Nonce".to_owned(), json!(nonce));
+    object.insert("Step".to_owned(), json!(step));
+    word(&object)
 }
 
 /// The payload word of the preflight, and of every verb that reads only the location.
@@ -169,6 +190,9 @@ pub(crate) fn run_word(location: &Location, run: &RunCall<'_>) -> String {
             .collect();
         object.insert("SiblingSnapshots".to_owned(), Value::Object(snapshots));
     }
+    if let Some(digest) = run.inputs_digest {
+        object.insert("InputsDigest".to_owned(), json!(digest));
+    }
     word(&object)
 }
 
@@ -217,7 +241,7 @@ mod tests {
     use gate_args::BoxVerb;
     use serde_json::{Value, json};
 
-    use super::{Location, Pair, RunCall, input, job_nonce, line, location_word, preflight_word, run_nonce, run_word};
+    use super::{InputsStep, Location, Pair, RunCall, input, inputs_word, job_nonce, line, location_word, preflight_word, run_nonce, run_word};
     use crate::boxside::payload::Payload;
 
     fn decoded(word: &str) -> Value {
@@ -261,6 +285,7 @@ mod tests {
             timeout: 1,
             host: "builder",
             sibling_snapshots,
+            inputs_digest: None,
         };
         run_word(&location().with_pair("app", &["lib".to_owned(), "tools".to_owned()]), &run)
     }
@@ -378,6 +403,7 @@ mod tests {
             timeout: 300,
             host: "builder",
             sibling_snapshots: &[],
+            inputs_digest: None,
         };
         let mut expected = preflight;
         let extra = json!({
@@ -416,10 +442,18 @@ mod tests {
             timeout: 1,
             host: "builder",
             sibling_snapshots: &[],
+            inputs_digest: Some("ab"),
         };
 
         let sent = decoded(&run_word(&location(), &run));
 
+        assert_eq!(sent["InputsDigest"], json!("ab"), "a run with inputs names their digest");
+        let diff = decoded(&inputs_word(&location(), "n2", InputsStep::Diff));
+        assert_eq!(
+            (&diff["Nonce"], &diff["Step"], &diff["Work"]),
+            (&json!("n2"), &json!("diff"), &sent["Work"])
+        );
+        assert_eq!(decoded(&inputs_word(&location(), "n2", InputsStep::Put))["Step"], json!("put"));
         assert_eq!(sent["Outputs"], json!(["**/bin/**", "out/*.dll"]));
         assert_eq!(sent["OutputsFull"], json!(true));
         assert_eq!(sent["Nonce"], json!("n2"));

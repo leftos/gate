@@ -32,6 +32,7 @@ mod carried;
 mod client;
 pub(crate) mod git;
 mod held;
+mod inputs;
 mod install;
 mod launch;
 mod outputs;
@@ -77,6 +78,8 @@ pub(crate) enum Refusal {
     Tools,
     /// The work folder could not be cleared or laid out for the run's repos.
     Layout,
+    /// The work folder does not hold the inputs the run's `InputsDigest` names.
+    Inputs,
 }
 
 impl Refusal {
@@ -86,6 +89,7 @@ impl Refusal {
             Refusal::Busy => "busy",
             Refusal::Tools => "tools",
             Refusal::Layout => "layout",
+            Refusal::Inputs => "inputs",
         }
     }
 }
@@ -256,12 +260,13 @@ pub(crate) struct RemoteOutcome {
 }
 
 /// How long a routed run's parts took: the run call, the command's own time, which its ceiling counts; the push; and the
-/// sync-back's fetch and the outputs fetch, each `None` when the run made none. A client that times none of them leaves
-/// them all at zero and `None`.
+/// inputs calls, the sync-back's fetch and the outputs fetch, each `None` when the run made none. A client that times
+/// none of them leaves them all at zero and `None`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Split {
     pub command: Duration,
     pub push: Duration,
+    pub inputs: Option<Duration>,
     pub sync_back: Option<Duration>,
     pub outputs: Option<Duration>,
 }
@@ -512,7 +517,7 @@ mod scripted {
     /// How often `wait` looks for its path and the interrupt.
     const WAIT_STEP: Duration = Duration::from_millis(20);
     /// Every reason a `refuse` step may give.
-    const REASONS: [FallbackReason; 9] = [
+    const REASONS: [FallbackReason; 10] = [
         FallbackReason::Full,
         FallbackReason::Busy,
         FallbackReason::Unreachable,
@@ -522,6 +527,7 @@ mod scripted {
         FallbackReason::Layout,
         FallbackReason::Version,
         FallbackReason::Client,
+        FallbackReason::Inputs,
     ];
 
     #[derive(Debug, PartialEq)]

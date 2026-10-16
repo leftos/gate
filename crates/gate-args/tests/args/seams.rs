@@ -443,7 +443,7 @@ fn the_remote_client_seams_need_a_value_once() {
             &RUN,
             &["--test-remote-transport", "local:b", "--test-remote-interrupt-at", "push", "--", "cmd"]
         ))),
-        ["gate: --test-remote-interrupt-at must be preflight, run, outputs, install, sdks, stop, manifest or apply, got 'push'"]
+        ["gate: --test-remote-interrupt-at must be preflight, inputs, run, outputs, install, sdks, stop, manifest or apply, got 'push'"]
     );
 }
 
@@ -464,7 +464,7 @@ fn the_remote_watch_seams_name_one_call_and_a_ceiling() {
             &RUN,
             &["--test-remote-transport", "local:b", "--test-remote-watch-call", "stop", "--", "cmd"]
         ))),
-        ["gate: --test-remote-watch-call must be preflight, push, run, ls-remote, fetch or outputs, got 'stop'"]
+        ["gate: --test-remote-watch-call must be preflight, push, inputs, run, ls-remote, fetch or outputs, got 'stop'"]
     );
     let words = with(
         &RUN,
@@ -544,6 +544,37 @@ fn the_outputs_budget_seam_takes_a_whole_number_of_bytes_above_0() {
     }
     let none = run_request(&refs(&with(&RUN, &["--", "cmd"]))).test_seams;
     assert_eq!(none.remote_outputs_budget_bytes, None, "none unless given");
+}
+
+#[cfg(feature = "test-seams")]
+#[test]
+fn the_inputs_budget_seam_takes_a_whole_number_of_bytes_above_0_once() {
+    use crate::support::run_request;
+
+    const FLAG: &str = "--test-remote-inputs-budget-bytes";
+    let transport = ["--test-remote-transport", "local:b"];
+    let words = with(&RUN, &[&transport[..], &[FLAG, "1048576", "--", "cmd"]].concat());
+    assert_eq!(run_request(&refs(&words)).test_seams.remote_inputs_budget_bytes, Some(1_048_576));
+    for (value, said) in [
+        ("0", format!("gate: {FLAG} must be a whole number above 0, got '0'")),
+        ("4GiB", format!("gate: {FLAG} must be a whole number above 0, got '4GiB'")),
+        (
+            "18446744073709551616",
+            format!("gate: {FLAG} must be at most 2147483647, got '18446744073709551616'"),
+        ),
+    ] {
+        let words = with(&RUN, &[&transport[..], &[FLAG, value, "--", "cmd"]].concat());
+        assert_eq!(problems(&refs(&words)), [said], "{value}");
+    }
+    let twice = with(&RUN, &[&transport[..], &[FLAG, "1", FLAG, "2", "--", "cmd"]].concat());
+    assert_eq!(problems(&refs(&twice)), [format!("gate: {FLAG} is given twice")]);
+    let empty = format!("{FLAG}=");
+    for missing in [&[FLAG][..], &[empty.as_str()][..]] {
+        let words = with(&RUN, &[&transport[..], missing, &["--", "cmd"]].concat());
+        assert_eq!(problems(&refs(&words)), [format!("gate: {FLAG} needs a value")], "{missing:?}");
+    }
+    let none = run_request(&refs(&with(&RUN, &["--", "cmd"]))).test_seams;
+    assert_eq!(none.remote_inputs_budget_bytes, None, "none unless given");
 }
 
 #[cfg(feature = "test-seams")]
@@ -680,6 +711,10 @@ fn the_remote_client_seams_that_conflict_are_refused() {
             "gate: --test-remote-outputs-budget-bytes needs --test-remote-transport",
         ),
         (
+            &["--test-remote-inputs-budget-bytes", "1048576"][..],
+            "gate: --test-remote-inputs-budget-bytes needs --test-remote-transport",
+        ),
+        (
             &["--test-remote-log-cap-bytes", "65536"][..],
             "gate: --test-remote-log-cap-bytes needs --test-remote-transport",
         ),
@@ -730,7 +765,7 @@ fn the_remote_timeout_seam_needs_a_watched_call_other_than_run() {
     }
     assert_eq!(
         problems(&refs(&given(&["--test-remote-watch-call", "stop", "--test-remote-timeout-ms", "300"]))),
-        ["gate: --test-remote-watch-call must be preflight, push, run, ls-remote, fetch or outputs, got 'stop'"],
+        ["gate: --test-remote-watch-call must be preflight, push, inputs, run, ls-remote, fetch or outputs, got 'stop'"],
         "a refused watched call says its own problem alone"
     );
     let fetch = run_request(&refs(&given(&["--test-remote-watch-call", "fetch", "--test-remote-timeout-ms", "300"])));
@@ -1505,6 +1540,7 @@ fn seam_flags_are_unknown_without_the_feature() {
         "--test-remote-fetch-cap-bytes",
         "--test-remote-apply-cap-bytes",
         "--test-remote-outputs-budget-bytes",
+        "--test-remote-inputs-budget-bytes",
         "--test-remote-log-cap-bytes",
         "--test-server-image",
         "--test-servers-under",

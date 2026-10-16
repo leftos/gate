@@ -216,6 +216,9 @@ pub struct TestSeams {
     /// The box's outputs budget the remote client reads, in place of 50 GiB: the outputs fetch is capped at zstd's
     /// worst case for it, and the install unpacks its archive to it.
     pub remote_outputs_budget_bytes: Option<u64>,
+    /// The most bytes one put of the remote client's inputs may total, decompressed, in place of 4 GiB: a set past it
+    /// is not sent, and the run falls back `inputs`.
+    pub remote_inputs_budget_bytes: Option<u64>,
     /// The most bytes of one remote call's output the remote client writes to the gate's log, in place of 256 MiB.
     pub remote_log_cap_bytes: Option<u64>,
     /// A change the remote client makes to its own folders at one point of its run, as `<point>:<step>`: before it

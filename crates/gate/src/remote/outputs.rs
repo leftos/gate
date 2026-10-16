@@ -573,7 +573,13 @@ fn manifest_line(
 /// already opened. The stamp is taken before the hash, never after: a write during the hash then leaves the file refused
 /// by the install as changed during the run, where a stamp read after would pair the old hash with the new stamp and let
 /// the install replace the write.
-fn sha256_for(file: &Found, inside: &Path, cache: &HashCache, go_on: &dyn Fn() -> bool, stopped: &Cell<bool>) -> io::Result<(String, Stamp)> {
+pub(super) fn sha256_for(
+    file: &Found,
+    inside: &Path,
+    cache: &HashCache,
+    go_on: &dyn Fn() -> bool,
+    stopped: &Cell<bool>,
+) -> io::Result<(String, Stamp)> {
     asked(go_on, stopped)?;
     let Some(held) = cache.held(&file.path) else {
         return hashed(&file.full, inside, go_on, stopped);

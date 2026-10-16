@@ -2491,6 +2491,7 @@ fn against_ceiling(adjusted: Option<f64>, wall: Duration, ceiling: u64) -> Strin
 fn split_said(split: Split) -> String {
     let seconds = |part: Duration| whole_seconds(part.as_secs_f64());
     let mut parts = vec![format!("command {} s", seconds(split.command)), format!("push {} s", seconds(split.push))];
+    parts.extend(split.inputs.map(|part| format!("inputs {} s", seconds(part))));
     parts.extend(split.sync_back.map(|part| format!("sync-back {} s", seconds(part))));
     parts.extend(split.outputs.map(|part| format!("outputs {} s", seconds(part))));
     parts.join(", ")
@@ -3004,6 +3005,7 @@ mod tests {
         let pushed = Split {
             command: Duration::from_millis(76_400),
             push: 224 * second,
+            inputs: None,
             sync_back: None,
             outputs: None,
         };

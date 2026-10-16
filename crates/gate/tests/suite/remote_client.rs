@@ -69,7 +69,7 @@ fn snapshot_words<'a>(log: &'a str, extra: &[&'a str]) -> Vec<&'a str> {
 }
 
 /// Writes `text` to the case folder's file `name`, making its folder.
-fn write(case: &Case, name: &str, text: &str) {
+pub(super) fn write(case: &Case, name: &str, text: &str) {
     let path = case.folder().join(name);
     fs::create_dir_all(path.parent().expect("a worktree file has a folder")).expect("the file's folder can be made");
     fs::write(path, text).expect("a worktree file can be written");
@@ -337,7 +337,7 @@ fn a_snapshot_ignores_commit_signing() {
 
 /// What a client case's snapshot leaves out: the gate's state root, LOCALAPPDATA and logs, the builder root and the
 /// stand-in's files, and `.tmp/`, which the client writes in. `tool.exe` is sent, so the builder runs it.
-const CLIENT_IGNORED: &str = "state/\nappdata/\n*.log\nbuilder/\nssh/\n.tmp/\n";
+pub(super) const CLIENT_IGNORED: &str = "state/\nappdata/\n*.log\nbuilder/\nssh/\n.tmp/\n";
 const RETRY_LINE: &str = "gate: builder did not answer the ssh banner; trying once more";
 const BUSY_LINE: &str = "gate: remote builder busy; running here";
 const UNREACHABLE_LINE: &str = "gate: remote builder unreachable; running here";
@@ -349,7 +349,7 @@ const BOOTED: &str = "2026-10-10T08:00:00.0000000Z";
 /// A case folder made a checkout of its own holding fake-tool as `tool.exe`, which its snapshot sends, with a routing
 /// file that sends its `*tool*` commands to the builder with no output globs and gives the remote pool two slots. The
 /// suite enters a job that allows breakaway first, as the box's command needs.
-fn client_case(name: &str) -> Case {
+pub(super) fn client_case(name: &str) -> Case {
     client_case_of(name, 2)
 }
 
@@ -440,7 +440,7 @@ fn call_words(steps: &Path) -> Vec<String> {
 
 /// The gate of a routed run logging to `log` through the Rust client: the builder root `builder` in the case folder,
 /// each ssh call made through the stand-in of the steps file `steps`, the retry pause 1 ms.
-fn client_gate(case: &Case, log: &str, steps: &Path, command: &[&str]) -> Command {
+pub(super) fn client_gate(case: &Case, log: &str, steps: &Path, command: &[&str]) -> Command {
     client_gate_through(case, "local", log, steps, command)
 }
 
@@ -458,14 +458,14 @@ const CLIENT_STALL: &str = "600";
 
 /// What a case changes in the words of a client run: the transport's form, the ceiling, the stall window, and more
 /// options before the command.
-struct Tuned<'a> {
-    kind: &'a str,
-    timeout: &'a str,
+pub(super) struct Tuned<'a> {
+    pub(super) kind: &'a str,
+    pub(super) timeout: &'a str,
     /// The run's `--stall`, [`CLIENT_STALL`] unless the case is about the window itself.
-    stall: &'a str,
-    extra: &'a [&'a str],
+    pub(super) stall: &'a str,
+    pub(super) extra: &'a [&'a str],
     /// The stand-in `--test-remote-ssh` names, [`FAKE_SSH`] when none.
-    ssh: Option<&'a str>,
+    pub(super) ssh: Option<&'a str>,
 }
 
 impl Default for Tuned<'_> {
@@ -481,7 +481,7 @@ impl Default for Tuned<'_> {
 }
 
 /// [`client_gate`] with the words `tuned` changes.
-fn client_gate_tuned(case: &Case, log: &str, steps: &Path, tuned: &Tuned<'_>, command: &[&str]) -> Command {
+pub(super) fn client_gate_tuned(case: &Case, log: &str, steps: &Path, tuned: &Tuned<'_>, command: &[&str]) -> Command {
     let transport = format!("{}:{}", tuned.kind, shown(&case.folder().join("builder")));
     let ssh = tuned.ssh.unwrap_or(FAKE_SSH);
     let mut seams = vec![
@@ -511,7 +511,7 @@ fn own(case: &Case, pid: u32) -> Vec<Value> {
 }
 
 /// The reasons of the `fallback` lines among `events`.
-fn fallbacks(events: &[Value]) -> Vec<&str> {
+pub(super) fn fallbacks(events: &[Value]) -> Vec<&str> {
     events
         .iter()
         .filter(|event| event["event"] == "fallback")
@@ -1117,7 +1117,7 @@ fn a_box_of_another_version_is_not_routed() {
 /// A [`client_case`] whose repo declares one sibling the routing file allows, the folder `make` makes beside the case
 /// folder, named after it: the case, its folder name, the sibling's name and its folder. A sibling an earlier run left
 /// is removed first.
-fn pair_case(name: &str, make: impl FnOnce(&Case, &Path)) -> (Case, String, String, PathBuf) {
+pub(super) fn pair_case(name: &str, make: impl FnOnce(&Case, &Path)) -> (Case, String, String, PathBuf) {
     let case = client_case(name);
     let leaf = case
         .folder()
@@ -1144,7 +1144,7 @@ fn pair_case(name: &str, make: impl FnOnce(&Case, &Path)) -> (Case, String, Stri
 }
 
 /// Makes `sibling` a repository of its own holding `lib.txt`.
-fn sibling_repository(case: &Case, sibling: &Path) {
+pub(super) fn sibling_repository(case: &Case, sibling: &Path) {
     fs::create_dir_all(sibling).expect("the sibling can be made");
     git_out(case, &[], &["-C", &shown(sibling), "init", "--quiet"]);
     fs::write(sibling.join("lib.txt"), "lib\n").expect("the sibling's file can be written");
@@ -3123,7 +3123,7 @@ fn a_command_the_box_kills_at_its_ceiling_ends_the_run_killed_with_no_stop_or_sy
 }
 
 /// The builder's work folder of the case's first run.
-fn work_folder(case: &Case) -> PathBuf {
+pub(super) fn work_folder(case: &Case) -> PathBuf {
     case.folder().join("builder").join("work").join(key_of(&events(case)))
 }
 
