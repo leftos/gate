@@ -17,6 +17,7 @@ run options:
   --no-markers         the command's status is the verdict
   --local              never route this run to a builder
   --state-dir <path>   use another state root (also GATE_STATE_DIR)
+  --cd <folder>        run the command in <folder> and route from it
   --bring-tracked <glob>
                        install a routed run's outputs git tracks that match <glob>; repeatable
 

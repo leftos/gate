@@ -139,8 +139,8 @@ pub(crate) struct PauseReader<'a> {
     root: &'a ResolvedRoot,
     /// This gate, as its ticket names it, which is never a child's.
     own: (u32, u64),
-    /// The parent whose marker this gate hands its command, as its pid and start, when that parent's slot covers it
-    /// or is lent to it: a gate under that command names its markers after the parent.
+    /// The parent whose marker this gate hands its command, as its pid and start, when that parent's slot covers it:
+    /// a gate under that command names its markers after the parent.
     hands_on: Option<(u32, u64)>,
     said: bool,
 }

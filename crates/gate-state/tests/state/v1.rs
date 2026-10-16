@@ -6,7 +6,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use gate_state::v1::{self, Claim, ClaimKind, Counts, CoveredMarker, FormatError, PoolSetting, Ticket, TicketKind};
-use gate_state::{KernelObject, SlotKind, reserved_light};
+use gate_state::{KernelObject, SlotKind, beside_allowance};
 use serde_json::json;
 
 use crate::support::{Machine, ts};
@@ -57,6 +57,7 @@ fn ticket(pid: u32, arrived: u64) -> Ticket {
         pid,
         start_ms: 1_759_439_760_571,
         holds: false,
+        lends_closed: false,
         remote: None,
         expected: None,
     }
@@ -121,10 +122,10 @@ fn default_counts_follow_the_thread_budgets() {
 }
 
 #[test]
-fn reserved_light_is_two_or_the_whole_pool() {
-    assert_eq!(reserved_light(1), 1);
-    assert_eq!(reserved_light(2), 2);
-    assert_eq!(reserved_light(5), 2);
+fn the_beside_allowance_is_two_light_gates_or_the_whole_pool() {
+    assert_eq!(beside_allowance(1), 1);
+    assert_eq!(beside_allowance(2), 2);
+    assert_eq!(beside_allowance(5), 2);
 }
 
 #[test]

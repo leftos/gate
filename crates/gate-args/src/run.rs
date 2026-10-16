@@ -20,6 +20,7 @@ pub(crate) enum ValueOption {
     Stall,
     Tail,
     StateDir,
+    Cd,
     Cores,
     Seconds,
     BringTracked,
@@ -44,6 +45,8 @@ pub(crate) enum ValueOption {
     GitLimitMs,
     #[cfg(feature = "test-seams")]
     GitDrainMs,
+    #[cfg(feature = "test-seams")]
+    BesideClaimWait,
     #[cfg(feature = "test-seams")]
     DotnetLimitMs,
     #[cfg(feature = "test-seams")]
@@ -128,6 +131,7 @@ pub(crate) struct RunBuilder {
     stall: Option<u64>,
     tail: Option<u64>,
     state_dir: Option<PathBuf>,
+    cd: Option<PathBuf>,
     cores: Option<u32>,
     seconds: Option<u32>,
     no_markers: bool,
@@ -221,6 +225,7 @@ impl RunBuilder {
             ValueOption::Stall => self.stall = Some(values::above_zero(spelled, value)?),
             ValueOption::Tail => self.tail = Some(values::zero_or_above(spelled, value)?),
             ValueOption::StateDir => self.state_dir = Some(PathBuf::from(value)),
+            ValueOption::Cd => self.cd = Some(PathBuf::from(value)),
             ValueOption::Cores => self.cores = Some(values::above_zero_u32(spelled, value)?),
             ValueOption::Seconds => self.seconds = Some(values::in_range(spelled, value, 1, values::MAX_BURN_SECONDS)?),
             ValueOption::BringTracked => self.bring_tracked.push(value.to_owned()),
@@ -247,6 +252,8 @@ impl RunBuilder {
             ValueOption::GitLimitMs => self.test_seams.git_limit_ms = Some(values::above_zero(spelled, value)?),
             #[cfg(feature = "test-seams")]
             ValueOption::GitDrainMs => self.test_seams.git_drain_ms = Some(values::above_zero(spelled, value)?),
+            #[cfg(feature = "test-seams")]
+            ValueOption::BesideClaimWait => self.test_seams.beside_claim_wait = Some(PathBuf::from(value)),
             #[cfg(feature = "test-seams")]
             ValueOption::DotnetLimitMs => self.test_seams.dotnet_limit_ms = Some(values::above_zero(spelled, value)?),
             #[cfg(feature = "test-seams")]
@@ -355,6 +362,7 @@ impl RunBuilder {
                 local: self.local,
                 bring_tracked: self.bring_tracked,
                 state_dir: self.state_dir,
+                cd: self.cd,
                 command,
                 test_seams: self.test_seams,
                 print_request: self.print_request,

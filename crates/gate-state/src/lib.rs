@@ -44,8 +44,8 @@ pub use journal_writer::{
     JournalNote, LockError, MachineSnapshot, OtherClaim, ROLLED_JOURNAL_FILE, RemoteTag, RunFacts, append_line, append_line_then, journal_line,
 };
 pub use model::{
-    CRITICAL_LIGHT_RESERVE, CoveredRun, CriticalState, CwdReader, DashboardState, Generation, MutexProbe, ParseError, PoolState, QueueTicket,
-    RemotePool, SlotCount, SlotCounts, SlotKind, SlotRow, SlotState, StateInputs, Waiting, reserved_light,
+    CRITICAL_BESIDE_LIGHT, CoveredRun, CriticalState, CwdReader, DashboardState, Generation, MutexProbe, ParseError, PoolState, QueueTicket,
+    RemotePool, SlotCount, SlotCounts, SlotKind, SlotRow, SlotState, StateInputs, Waiting, beside_allowance,
 };
 pub use root::{KernelObject, StateRoot, default_root, key_hash, log_hash, normalize_root, root_hash};
 pub use state::dashboard_state;

@@ -40,16 +40,20 @@ const DEVICE_NAMES: [&str; 22] = [
     "LPT6", "LPT7", "LPT8", "LPT9",
 ];
 
+/// Whether `character` is one a folder name the builder lays out is made of ([`is_layout_name`]): an ASCII letter or
+/// digit, `.`, `_` or `-`.
+#[must_use]
+pub fn is_layout_char(character: char) -> bool {
+    character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-')
+}
+
 /// Whether the builder can lay out a folder named `name` beside another: one or more ASCII letters, digits, `.`, `_`
-/// and `-`, neither starting nor ending with a dot (so never `.` or `..`, and never a name Windows would cut), and not
+/// and `-` ([`is_layout_char`]), neither starting nor ending with a dot (so never `.` or `..`, and never a name Windows would cut), and not
 /// a reserved device name (`CON`, `PRN`, `AUX`, `NUL`, `COM1`-`COM9`, `LPT1`-`LPT9`) in any ASCII case, whatever
 /// follows its first dot (`nul.txt`).
 #[must_use]
 pub fn is_layout_name(name: &str) -> bool {
-    let characters = !name.is_empty()
-        && name
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'));
+    let characters = !name.is_empty() && name.chars().all(is_layout_char);
     let device = name
         .split('.')
         .next()

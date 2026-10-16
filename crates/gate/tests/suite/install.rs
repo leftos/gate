@@ -7,7 +7,7 @@ use std::os::windows::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use crate::support::{Case, FAKE_TOOL, Outcome, finish, names, shown, start, version_of, wait_for_journal_line, wait_until_closed};
+use crate::support::{Case, DenyEntry, FAKE_TOOL, Outcome, finish, names, shown, start, version_of, wait_for_journal_line, wait_until_closed};
 
 /// `tools/install.ps1`, the script under test: a checked-in file a case runs.
 fn script() -> PathBuf {
@@ -481,53 +481,9 @@ fn an_install_keeps_the_aside_copy_when_it_installs_nothing() {
     assert!(aside.exists(), "an install that installed nothing keeps the aside copy: {outcome:?}");
 }
 
-/// An entry in a folder's access list that denies this user running any file put in the folder, existing or new, so an
-/// exe there cannot start while it can still be read, moved and deleted; dropping the guard takes the entry away.
-struct NoRunningIn(PathBuf);
-
-impl NoRunningIn {
-    fn new(folder: &Path) -> NoRunningIn {
-        let denied = NoRunningIn(folder.to_path_buf());
-        let status = Command::new("icacls")
-            .arg(folder)
-            .args(["/deny", &format!("{}:(OI)(IO)(X)", this_user())])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .status()
-            .expect("icacls starts");
-        assert!(status.success(), "the deny entry is added");
-        denied
-    }
-}
-
-/// This user, as `whoami` names one and icacls takes it.
-fn this_user() -> String {
-    let said = Command::new("whoami").stdin(Stdio::null()).output().expect("whoami starts");
-    assert!(said.status.success(), "whoami names this user: {said:?}");
-    String::from_utf8_lossy(&said.stdout).trim().to_owned()
-}
-
-impl Drop for NoRunningIn {
-    /// Takes the deny entry away; one that stays is said on stderr with its folder, since the test cannot fail here.
-    #[expect(clippy::print_stderr, reason = "a deny entry that cannot be taken away is said without failing the case")]
-    fn drop(&mut self) {
-        let removed = Command::new("icacls")
-            .arg(&self.0)
-            .args(["/remove:d", &this_user()])
-            .stdin(Stdio::null())
-            .output();
-        match removed {
-            Ok(output) if output.status.success() => {}
-            Ok(output) => eprintln!(
-                "the deny entry on {} is left: icacls said {}{}",
-                shown(&self.0),
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            ),
-            Err(error) => eprintln!("the deny entry on {} is left: icacls cannot start: {error}", shown(&self.0)),
-        }
-    }
-}
+/// The icacls rights that deny this user running any file put in a folder, existing or new, so an exe there cannot
+/// start while it can still be read, moved and deleted.
+const NO_RUNNING_IN: &str = "(OI)(IO)(X)";
 
 #[test]
 fn an_install_whose_copy_does_not_run_puts_the_previous_gate_back() {
@@ -535,7 +491,7 @@ fn an_install_whose_copy_does_not_run_puts_the_previous_gate_back() {
     let key = EnvironmentKey::new("an_install_whose_copy_does_not_run_puts_the_previous_gate_back");
     let (exe, aside) = installed_with_an_aside(&case, &key);
     // The new exe answers its version where it is built; the copy the install puts in the folder cannot start.
-    let denied = NoRunningIn::new(&install_dir(&case));
+    let denied = DenyEntry::new(&install_dir(&case), NO_RUNNING_IN);
     let other = copy_gate_with_a_byte(&case, "gate-b.exe");
 
     let outcome = install(&case, &key, &["-Exe", &shown(&other)]);

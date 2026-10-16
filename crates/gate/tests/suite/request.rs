@@ -61,6 +61,7 @@ fn print_request_shows_the_new_cli_request() {
         "noMarkers": false,
         "local": false,
         "bringTracked": [],
+        "cd": null,
         "stateDir": shown(&case.root()),
         "defaultRoot": false,
         "rootHash": request["rootHash"],
@@ -89,6 +90,15 @@ fn print_request_shows_slot_none() {
     words[2] = "none";
 
     assert_eq!(case.run(&words).request()["slot"], "none");
+}
+
+#[test]
+fn print_request_shows_cd_as_given() {
+    let case = Case::new("print_request_shows_cd_as_given");
+    let mut words = print_run(&["cmd"]);
+    words.splice(7..7, ["--cd", r"..\other"]);
+
+    assert_eq!(case.run(&words).request()["cd"], r"..\other");
 }
 
 /// The seams the case's runs give are printed as given.

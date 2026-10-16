@@ -41,6 +41,7 @@ run options:
   --no-markers         the command's status is the verdict
   --local              never route this run to a builder
   --state-dir <path>   use another state root (also GATE_STATE_DIR)
+  --cd <folder>        run the command in <folder> and route from it
   --bring-tracked <glob>
                        install a routed run's outputs git tracks that match <glob>; repeatable
 
@@ -1233,6 +1234,54 @@ pub fn write_powershell_ticket(case: &Case, (pid, start): (u32, Timestamp), kind
 /// Copies fake-tool into the case folder as `name`, so a command can name it inside the case's worktree.
 pub fn copy_tool(case: &Case, name: &str) {
     fs::copy(FAKE_TOOL, case.folder().join(name)).expect("fake-tool can be copied into the case folder");
+}
+
+/// An entry in a folder's access list that denies this user the icacls `rights` given, such as `(X)` (traverse the
+/// folder itself) or `(OI)(IO)(X)` (run any file put in it); dropping the guard takes the entry away.
+pub struct DenyEntry(PathBuf);
+
+impl DenyEntry {
+    pub fn new(folder: &Path, rights: &str) -> DenyEntry {
+        let denied = DenyEntry(folder.to_path_buf());
+        let status = Command::new("icacls")
+            .arg(folder)
+            .args(["/deny", &format!("{}:{rights}", this_user())])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .status()
+            .expect("icacls starts");
+        assert!(status.success(), "the deny entry is added");
+        denied
+    }
+}
+
+/// This user, as `whoami` names one and icacls takes it.
+fn this_user() -> String {
+    let said = Command::new("whoami").stdin(Stdio::null()).output().expect("whoami starts");
+    assert!(said.status.success(), "whoami names this user: {said:?}");
+    String::from_utf8_lossy(&said.stdout).trim().to_owned()
+}
+
+impl Drop for DenyEntry {
+    /// Takes the deny entry away; one that stays is said on stderr with its folder, since the test cannot fail here.
+    #[expect(clippy::print_stderr, reason = "a deny entry that cannot be taken away is said without failing the case")]
+    fn drop(&mut self) {
+        let removed = Command::new("icacls")
+            .arg(&self.0)
+            .args(["/remove:d", &this_user()])
+            .stdin(Stdio::null())
+            .output();
+        match removed {
+            Ok(output) if output.status.success() => {}
+            Ok(output) => eprintln!(
+                "the deny entry on {} is left: icacls said {}{}",
+                shown(&self.0),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ),
+            Err(error) => eprintln!("the deny entry on {} is left: icacls cannot start: {error}", shown(&self.0)),
+        }
+    }
 }
 
 /// Copies fake-tool into the case folder as `name` and returns its absolute path, so a command or a process the case

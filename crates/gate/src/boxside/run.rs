@@ -34,7 +34,7 @@ use crate::boxside::forward::{DRAIN, Forwarders, OutputLock};
 use crate::boxside::heartbeat;
 use crate::boxside::inputs;
 use crate::boxside::outputs::{self, Asked};
-use crate::boxside::payload::{Payload, bare_stem, escaped, ordinal_upper};
+use crate::boxside::payload::{PairSibling, Payload, bare_stem, escaped, ordinal_upper, trees};
 use crate::boxside::preflight::{self, Failed, GIT_REDIRECTS, Git, GitFailure, Unready, exit_code, git_failed};
 use crate::boxside::stop::{Ending, STOPPED, stop_event_name, terminate_and_wait};
 use crate::boxside::tools;
@@ -275,15 +275,19 @@ fn inputs_matched(request: &Request<'_>, held: &File, beat: &Beat<'_>, console: 
 /// its own bare repository and its commit from `SiblingSnapshots`. Else the usage line.
 fn repos<'a>(payload: &'a Payload, work: &str, bare: &str, snapshot: &'a str) -> Result<(Repo<'a>, Vec<Repo<'a>>), String> {
     let Some(pair) = payload.pair()? else {
-        return Ok((Repo::new(None, work.to_owned(), bare, snapshot), Vec::new()));
+        let (tree, _) = trees(work, None);
+        return Ok((Repo::new(None, tree, bare, snapshot), Vec::new()));
     };
     let commits = payload.sibling_snapshots(&pair)?;
-    let main = Repo::new(Some(pair.leaf()), format!(r"{work}\{}", pair.leaf()), bare, snapshot);
+    let names: Vec<&str> = pair.siblings().iter().map(PairSibling::name).collect();
+    let (main_tree, sibling_trees) = trees(work, Some((pair.leaf(), &names)));
+    let main = Repo::new(Some(pair.leaf()), main_tree, bare, snapshot);
     let siblings = pair
         .siblings()
         .iter()
         .zip(commits)
-        .map(|(sibling, commit)| Repo::new(Some(sibling.name()), format!(r"{work}\{}", sibling.name()), sibling.bare(), commit))
+        .zip(sibling_trees)
+        .map(|((sibling, commit), tree)| Repo::new(Some(sibling.name()), tree, sibling.bare(), commit))
         .collect();
     Ok((main, siblings))
 }

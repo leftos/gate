@@ -21,6 +21,6 @@ pub use decide::{
     sdk_build_target, sibling_root, without_no_build,
 };
 pub use escape::{escaped, is_reordering_mark};
-pub use key::{is_layout_name, repo_name, work_folder_key};
+pub use key::{is_layout_char, is_layout_name, repo_name, work_folder_key};
 pub use like::{InvalidPattern, Pattern};
 pub use rewrite::{RewritePlace, Rewritten, SiblingRoot, rewrite_words};

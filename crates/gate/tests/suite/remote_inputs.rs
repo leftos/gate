@@ -202,7 +202,7 @@ fn a_run_the_box_refuses_for_its_inputs_falls_back_inputs() {
 
 #[test]
 fn a_pair_with_inputs_falls_back_before_any_inputs_call() {
-    let (case, _, name, sibling) = pair_case("client-inputs-pair", sibling_repository);
+    let (case, _, name, sibling) = pair_case("client-inputs-pair", &[], sibling_repository);
     with_input(&case);
     routed(&case, Some(&name));
     let steps = ssh_steps(&case, "ssh", &["ok"; 4]);

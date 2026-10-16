@@ -1,6 +1,7 @@
-//! The folders a passing routed build left stale: the folders in the worktree that the judging output globs stop at and
-//! the run did not bring back. [`stale_folders`] finds them over a walk of the worktree, [`stale_line`] says them, and
-//! the caller says why when the walk fails.
+//! The folders a passing routed build left stale: the folders in the worktree, and in each sibling of a pair, that the
+//! judging output globs stop at and the run did not bring back. [`stale_folders`] finds them over a walk of one tree,
+//! [`stale_line`] says them, and [`stale_lines`] says them for the main worktree and its siblings, with why a tree
+//! could not be listed.
 
 use std::collections::BTreeSet;
 use std::io;
@@ -18,7 +19,7 @@ use crate::outputs::glob::{Globs, regex_upto};
 /// # Errors
 ///
 /// Why the tree could not be listed: a glob that cannot be matched, or the walk's own failure.
-pub(crate) fn stale_folders(
+fn stale_folders(
     mut walk: impl FnMut(&Globs) -> io::Result<Vec<String>>,
     judging: &[String],
     brought_back: &[String],
@@ -110,16 +111,54 @@ fn is_plain(part: &str) -> bool {
     !part.contains(['*', '?'])
 }
 
+/// The lines a passing routed build says of what it left stale in the main worktree at the root `main` and in each of
+/// `siblings` (its folder name and root), in their order: [`stale_folders`] over `walk` of each root, judged by
+/// `judging`, the main's against `brought_back` and a sibling's against nothing, since no sibling's output is ever
+/// brought back. One line names every folder ([`stale_line`]), the main's first, then each sibling's written
+/// `../{name}/{folder}`, relative to the main worktree. A tree that cannot be listed says why on its own line after it,
+/// the main's as [`could_not_list`] and a sibling's as [`sibling_not_listed`] says it, and the others' folders are
+/// still named.
+pub(crate) fn stale_lines(
+    main: &str,
+    siblings: &[(&str, &str)],
+    judging: &[String],
+    brought_back: &[String],
+    mut walk: impl FnMut(&str, &Globs) -> io::Result<Vec<String>>,
+) -> Vec<String> {
+    let mut folders = Vec::new();
+    let mut unlisted = Vec::new();
+    match stale_folders(|globs| walk(main, globs), judging, brought_back) {
+        Ok(found) => folders.extend(found),
+        Err(reason) => unlisted.push(could_not_list(&reason)),
+    }
+    for (name, root) in siblings {
+        match stale_folders(|globs| walk(root, globs), judging, &[]) {
+            Ok(found) => folders.extend(found.into_iter().map(|folder| format!("../{name}/{folder}"))),
+            Err(reason) => unlisted.push(sibling_not_listed(name, &reason)),
+        }
+    }
+    stale_line(&folders).into_iter().chain(unlisted).collect()
+}
+
 /// The line saying the folders could not be found, for `reason`.
 #[must_use]
-pub(crate) fn could_not_list(reason: &str) -> String {
+fn could_not_list(reason: &str) -> String {
     format!("gate: routed build may have left stale output; could not list it: {}", escaped(reason))
+}
+
+/// The line saying the folders of the sibling `name` could not be found, for `reason`.
+#[must_use]
+fn sibling_not_listed(name: &str, reason: &str) -> String {
+    format!(
+        "gate: routed build may have left stale output in ../{name}; could not list it: {}",
+        escaped(reason)
+    )
 }
 
 /// The line saying a routed build left the folders `folders` stale, each escaped, `/`-separated as the walk found them,
 /// joined with `, `; `None` when it left none.
 #[must_use]
-pub(crate) fn stale_line(folders: &[String]) -> Option<String> {
+fn stale_line(folders: &[String]) -> Option<String> {
     if folders.is_empty() {
         return None;
     }
@@ -134,7 +173,7 @@ mod tests {
 
     use gate_router::DEFAULT_OUTPUTS;
 
-    use super::{stale_folders, stale_line};
+    use super::{stale_folders, stale_line, stale_lines};
     use crate::outputs::walk::tests::tree;
     use crate::outputs::walk::walk;
 
@@ -271,6 +310,56 @@ mod tests {
     fn no_matching_folder_says_no_line() {
         assert_eq!(folders(&["src/app/main.cs"], &DEFAULTS, &[]), Vec::<String>::new());
         assert_eq!(stale_line(&folders(&[], &DEFAULTS, &[])), None);
+    }
+
+    #[test]
+    fn a_pair_s_sibling_that_cannot_be_listed_has_its_own_line() {
+        let siblings = [("lib", "X:/dev/lib"), ("tools", "X:/dev/tools"), ("web", "X:/dev/web")];
+        let listing = |root: &str| -> io::Result<Vec<String>> {
+            match root {
+                "X:/dev/app" => Ok(vec!["src/App/bin/Debug/x.dll".to_owned()]),
+                "X:/dev/lib" => Err(io::Error::other("access\ndenied")),
+                "X:/dev/tools" => Ok(vec!["bin/Debug/t.dll".to_owned(), "src/a.cs".to_owned()]),
+                _ => Ok(vec!["out/bin/w.dll".to_owned()]),
+            }
+        };
+
+        let lines = stale_lines("X:/dev/app", &siblings, &globs(&DEFAULTS), &globs(&[]), |root, _| listing(root));
+
+        assert_eq!(
+            lines,
+            [
+                "gate: routed build left stale: src/App/bin, ../tools/bin, ../web/out/bin",
+                r"gate: routed build may have left stale output in ../lib; could not list it: access\ndenied",
+            ],
+            "the main's folders first, each listed sibling's after in order, the unlisted sibling on its own line"
+        );
+    }
+
+    #[test]
+    fn a_pair_whose_main_cannot_be_listed_still_names_its_siblings_folders() {
+        let lines = stale_lines(
+            "X:/dev/app",
+            &[("lib", "X:/dev/lib")],
+            &globs(&DEFAULTS),
+            &globs(&["**/bin/**"]),
+            |root, _| {
+                if root == "X:/dev/app" {
+                    Err(io::Error::other("gone"))
+                } else {
+                    Ok(vec!["bin/Debug/l.dll".to_owned()])
+                }
+            },
+        );
+
+        assert_eq!(
+            lines,
+            [
+                "gate: routed build left stale: ../lib/bin",
+                "gate: routed build may have left stale output; could not list it: gone",
+            ],
+            "the main brought its glob back, but no sibling's output ever comes back"
+        );
     }
 
     #[test]

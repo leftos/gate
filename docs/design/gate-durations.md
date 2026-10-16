@@ -77,7 +77,7 @@ Each part is a sub-issue of CC-178 and lands on `feat/gate-durations`. Part 1 co
 
 ### Part 5: backfill during a critical drain
 
-- **Publisher.** In `Enter-Critical`, once the drain is under way, the critical gate prices each blocker (unreserved heavy and light claims) as `started + p25..p50 remaining`. It writes a window file `%LOCALAPPDATA%\gate\backfill\<pid>.json` with the shadow end (the slowest blocker's expected end) and the slot it lends, checked by pid and start ticks like a ticket. When any blocker is unpriced, it publishes no window.
+- **Publisher.** In `Enter-Critical`, once the drain is under way, the critical gate prices each blocker (heavy claims, and the light claims beyond the beside allowance of light gates) as `started + p25..p50 remaining`. It writes a window file `%LOCALAPPDATA%\gate\backfill\<pid>.json` with the shadow end (the slowest blocker's expected end) and the slot it lends, checked by pid and start ticks like a ticket. When any blocker is unpriced, it publishes no window.
 
   When any blocker passes its expected end, the critical gate deletes its window file and admits no new guest for the rest of the drain, without re-pricing: the worst case is plain FCFS, no worse than no backfill, where a window widened to the blocker's ceiling would admit guests the drain's end then kills and bars. A guest already running is left to the Overrun rule.
 - **Lending.** `Add-MachineSlot` releases the lent slot and skips it until the window closes or the guest is gone. This relaxes the critical gate's "lets go of nothing" rule, and the README says so.
@@ -90,7 +90,7 @@ Each part is a sub-issue of CC-178 and lands on `feat/gate-durations`. Part 1 co
 
   The guest's `take` line carries `backfill: true` and the window.
 - **Overrun.** Once the drain completes, a guest still running is killed, and its own gate re-queues it. Its key is barred from backfill for 24 h, recorded beside the window files. This is HTCondor's defrag rule, which admits only interruptible jobs to a draining machine and evicts them when the drain ends: the critical run the drain exists for never waits on a mispredicted guest (`docs/research/2026-10-09-gate-prior-art-local.md`, sections 3 and 4).
-- Nesting (`Test-ParentLend`, pause markers) and CC-172's reserved light slots keep working unchanged.
+- Nesting (`Test-ParentLend`, pause markers) and the beside allowance of light gates (CC-172's reserved light slots, kept as a count in `gate.exe`) keep working unchanged.
 
 ## In the Rust gate
 

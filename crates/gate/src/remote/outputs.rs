@@ -22,14 +22,14 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_SHARE_READ, FILE_SHARE_WRITE, FileDispositionInfo, GetFileInformationByHandle, SetFileInformationByHandle,
 };
 
-use super::RemoteCall;
 use super::client::{self, Attempt, Called, End, RawSink};
 use super::git::{FAILURE_BYTES, first_bytes};
 use super::install::{self, Fetched};
 use super::payload::Location;
 use super::syncback::Synced;
 use super::watchdog::Cut;
-use crate::boxside::payload::{archive_file_name, escaped};
+use super::{RemoteCall, Sibling};
+use crate::boxside::payload::{archive_file_name, escaped, trees};
 use crate::outputs::archive::final_path;
 use crate::outputs::cache::{HashCache, file_time_now};
 use crate::outputs::glob::Globs;
@@ -367,6 +367,27 @@ struct Kept<'k> {
     marker: &'k Path,
 }
 
+/// Each tree the box checked the run out in, as [`trees`] places it in the work folder of `location`, with the PC root
+/// it stands for: the main repo's tree with the worktree root, then each sibling's with the sibling's root, in the
+/// pair's order. A sibling's output is never brought back; its tree is here for a main repo's file that records it.
+///
+/// # Panics
+///
+/// When the location's pair names another number of siblings than the call carries: the location is built from the
+/// call's siblings, so that is a bug, and a sibling paired with no root would keep its box path unseen.
+fn box_trees<'a>(location: &Location, call: &RemoteCall<'a>) -> (String, Vec<(String, &'a str)>) {
+    let names: Vec<&str> = location.pair.iter().flat_map(|pair| pair.siblings.iter().map(String::as_str)).collect();
+    let (main, siblings) = trees(&location.work, location.pair.as_ref().map(|pair| (pair.leaf.as_str(), names.as_slice())));
+    assert_eq!(
+        siblings.len(),
+        call.siblings.len(),
+        "the run's Pair names {} siblings but the call carries {}",
+        siblings.len(),
+        call.siblings.len()
+    );
+    (main, siblings.into_iter().zip(call.siblings.iter().map(Sibling::root)).collect())
+}
+
 /// The outputs call of a passing run whose box packed an archive, `synced` its end so far: the archive the run's own
 /// key and nonce name, never the box's line, is fetched raw into the worktree's `.tmp` folder, which is held until this
 /// run's end. One fetched whole is installed, as [`install::installed`] says, through a stage folder beside it named
@@ -394,13 +415,15 @@ fn fetched(attempt: &mut Attempt<'_, '_>, kept: &Kept<'_>, ran: &Ran<'_>, synced
                 End::Status(0) if called.cut.is_none() => {
                     // The fetch ended whole, under the cap: how the install ends no longer bears on the count.
                     uncapped(attempt);
+                    let (main_tree, sibling_trees) = box_trees(ran.location, attempt.call);
                     let fetched = Fetched {
                         archive: &archive,
                         stage: tmp.join(format!("{}-{}", attempt.call.key, ran.nonce)),
                         marker: kept.marker,
                         manifest: kept.files,
                         globs: kept.globs,
-                        box_work: &ran.location.work,
+                        main_tree,
+                        sibling_trees,
                         started,
                     };
                     install::installed(attempt, &fetched)

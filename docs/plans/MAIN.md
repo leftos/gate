@@ -9,16 +9,15 @@
 - [ ] GATE-206 A per-repo toolchain manifest: check and prepare builders, and check a fresh clone — Urgent · Remote
 - [ ] GATE-312 Start fewer git processes per routed run and box run — Urgent · Remote
 - [ ] GATE-192 Turn routing back on, on the Rust remote client — High · Remote
-- [/] GATE-249 Siblings C: the client snapshots, checks parity and pushes each repo — High · Remote
 - [ ] GATE-251 Siblings E: outputs, install rewrite and stale-line wording for a pair — High · Remote
 - [ ] GATE-252 Siblings F: docs for routed sibling pairs — High · Remote
 - [!] GATE-214 Toolchain 7: roll the manifest out to the gated repos — High · Remote
 - [/] GATE-231 Run a routed command that needs a desktop in the builder's logged-on session — High · Remote
 - [ ] GATE-304 Restore a routed repo's pnpm packages on the builder before a pnpm command — High · Remote
-- [/] GATE-311 Let a critical gate drain past light runs on any slot, keeping the beside allowance by count — High · Backlog
 
 ## Remote
 
+- [ ] GATE-329 Make the gate's own suite pass on a builder
 - [ ] GATE-10 Port the remote client and box wrapper, then the remote cutover
   - [ ] GATE-109 Remote: carry every verb of a routed run over one ssh connection (gate box serve)
   - [ ] GATE-18 Remote preflight: refuse with `parity` when the builder lacks a .NET workload the repo needs
@@ -70,6 +69,11 @@
 - [ ] GATE-318 Pin and protocol-limit the sync-back's git calls
 - [ ] GATE-319 Hold a routed run's git store before its first use: a linked worktree's git dir, a single run's .git
 - [ ] GATE-320 Refuse a routed push that url.*.insteadOf sends to another host
+- [ ] GATE-324 Keep a routed command local when it names an ignored file the inputs do not cover
+- [ ] GATE-325 Let a toolchain manifest declare uv
+- [ ] GATE-326 gate check --builder: report a missing box repo instead of creating it
+- [ ] GATE-327 Box input stages: check each pruned stage is the box's own, test the denied arm, fix the refusal's advice
+- [ ] GATE-330 Harden gate run --cd: final path, git ownership refusals, DLL search path, gate expect --cd
 
 ## Cutover sweep
 
@@ -122,3 +126,5 @@
 - [ ] GATE-316 Use one escaper for the router's lines and the task errors, escaping format characters and the backslash
 - [ ] GATE-321 Take the beside mutex only while a critical request is queued, and give the late wait its busy retry
 - [ ] GATE-322 Bound the beside-claim test seam's wait, and keep older builds from reading a lend marker as a claim
+- [ ] GATE-328 Critical drain: unreadable tickets, a lendsClosed never cleared, a failed beside mutex, the lent-marker ETA test
+- [ ] GATE-331 Gates nested in a lent gate: their history rows and a command that outlives the lend

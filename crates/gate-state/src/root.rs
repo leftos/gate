@@ -71,6 +71,10 @@ pub enum KernelObject {
     RemoteSlot(u32),
     /// The critical gates' mutex.
     Critical,
+    /// The mutex a light gate behind a critical request holds while it counts the light gates beside the request, takes
+    /// its slot and writes its claim, and a critical gate holds while it counts the light gates and takes its light
+    /// slots, so no light gate is between its take and its claim while another counts.
+    CriticalBeside,
     /// The journal mutex.
     Journal,
     /// A waiting gate's wake event, by its pid and its process start in Unix epoch milliseconds.
@@ -94,6 +98,7 @@ impl KernelObject {
             KernelObject::LightSlot(index) => format!("light-slot-{index}"),
             KernelObject::RemoteSlot(index) => format!("remote-slot-{index}"),
             KernelObject::Critical => "critical".to_owned(),
+            KernelObject::CriticalBeside => "critical-beside".to_owned(),
             KernelObject::Journal => "journal".to_owned(),
             KernelObject::WakeEvent { pid, start_ms } => format!("wake-{pid}-{start_ms}"),
             KernelObject::Job { gate_pid } => format!("job-{gate_pid}"),
@@ -112,7 +117,8 @@ impl KernelObject {
             KernelObject::HeavySlot(_) | KernelObject::LightSlot(_) | KernelObject::RemoteSlot(_) | KernelObject::Critical => {
                 Some(format!("gate-{}.json", self.suffix()))
             }
-            KernelObject::Journal
+            KernelObject::CriticalBeside
+            | KernelObject::Journal
             | KernelObject::WakeEvent { .. }
             | KernelObject::Job { .. }
             | KernelObject::Log { .. }

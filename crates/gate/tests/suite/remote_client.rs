@@ -1115,9 +1115,9 @@ fn a_box_of_another_version_is_not_routed() {
 }
 
 /// A [`client_case`] whose repo declares one sibling the routing file allows, the folder `make` makes beside the case
-/// folder, named after it: the case, its folder name, the sibling's name and its folder. A sibling an earlier run left
-/// is removed first.
-pub(super) fn pair_case(name: &str, make: impl FnOnce(&Case, &Path)) -> (Case, String, String, PathBuf) {
+/// folder, named after it, and whose routing file gives its repo the output globs `outputs`: the case, its folder name,
+/// the sibling's name and its folder. A sibling an earlier run left is removed first.
+pub(super) fn pair_case(name: &str, outputs: &[&str], make: impl FnOnce(&Case, &Path)) -> (Case, String, String, PathBuf) {
     let case = client_case(name);
     let leaf = case
         .folder()
@@ -1136,7 +1136,7 @@ pub(super) fn pair_case(name: &str, make: impl FnOnce(&Case, &Path)) -> (Case, S
         "host": HOST,
         "slots": 2,
         "repos": { &repo: ["*tool*"] },
-        "outputs": { &repo: [] },
+        "outputs": { &repo: outputs },
         "siblings": { &repo: [&sibling_name] },
     });
     write_remote_json(&case, &routing.to_string());
@@ -1166,7 +1166,7 @@ fn pair_pushes(said: &str) -> Vec<&str> {
 /// snapshot; and the command's changes in both worktrees come back.
 #[test]
 fn a_pair_run_pushes_each_repo_main_first_and_syncs_both_back() {
-    let (case, leaf, name, sibling) = pair_case("client-pair", sibling_repository);
+    let (case, leaf, name, sibling) = pair_case("client-pair", &[], sibling_repository);
     let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
     let on_sibling = format!(r"..\{name}\made-on-sibling.txt");
 
@@ -1205,11 +1205,36 @@ fn a_pair_run_pushes_each_repo_main_first_and_syncs_both_back() {
     assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new(), "no fallback");
 }
 
+/// A pair run's box checks the main repository out in `{work}\{leaf}` and the sibling in `{work}\{name}`: a fetched
+/// test host's manifest that records both trees, in either case, names the main worktree and the sibling's own root on
+/// this PC, never the work folder's place under the main worktree. A first run names the work-folder key.
+#[test]
+fn a_pair_s_fetched_output_is_rewritten_to_the_main_s_pc_root() {
+    let (case, leaf, name, sibling) = pair_case("client-pair-rewrite", &BIN, sibling_repository);
+    write(&case, ".gitignore", &format!("{CLIENT_IGNORED}bin/\n"));
+    first_run(&case);
+    let builder = std::path::absolute(case.folder().join("builder")).expect("the builder root has a full path");
+    let work = format!(r"{}\work\{}", builder.display(), key_of(&events(&case)));
+    // After a `_`, neither path is one the router rewrites into the work folder: the builder sits in the worktree here.
+    let recorded = format!(r"Root_{}\{leaf}\src\App;Lib_{work}\{name}\lib", work.to_uppercase());
+    let second = ssh_steps(&case, "second", &["ok", "ok", "ok"]);
+    let command = [r".\tool.exe", "write", r"bin\MvcTestingAppManifest.json", &recorded];
+
+    let outcome = finish(client_gate(&case, "second.log", &second, &command));
+    fs::remove_dir_all(&sibling).expect("the sibling can be removed");
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let root = std::path::absolute(git_out(&case, &[], &["rev-parse", "--show-toplevel"])).expect("git names the worktree by a full path");
+    let sibling_root = root.parent().expect("the worktree has a parent").join(&name);
+    let expected = format!(r"Root_{}\src\App;Lib_{}\lib", root.display(), sibling_root.display());
+    assert_eq!(worktree_text(&case, r"bin\MvcTestingAppManifest.json"), expected, "{outcome:?}");
+}
+
 /// A sibling whose push fails, through `local-ssh` after the main one's went through, keeps the run here as
 /// `unreachable` with no run call: the main repository's ref is saved, the sibling's is not.
 #[test]
 fn a_pair_run_whose_sibling_push_fails_falls_back_with_no_run_call() {
-    let (case, _, name, sibling) = pair_case("client-pair-push-fails", sibling_repository);
+    let (case, _, name, sibling) = pair_case("client-pair-push-fails", &[], sibling_repository);
     let steps = ssh_steps(&case, "ssh", &["ok", "ok", "fail-other"]);
 
     let outcome = finish(client_gate_through(
@@ -1250,7 +1275,7 @@ fn a_pair_run_whose_sibling_push_fails_falls_back_with_no_run_call() {
 /// does.
 #[test]
 fn a_pair_s_new_sibling_bare_takes_no_bridge_while_the_main_one_does() {
-    let (case, _, name, sibling) = pair_case("client-pair-new-bare", sibling_repository);
+    let (case, _, name, sibling) = pair_case("client-pair-new-bare", &[], sibling_repository);
     let first_steps = ssh_steps(&case, "first", &["ok", "ok"]);
     let first = finish(client_gate(&case, "first.log", &first_steps, &[r".\tool.exe", "out", "first"]));
     assert_eq!(first.code, Some(0), "{first:?}");
@@ -1285,7 +1310,7 @@ fn a_pair_s_new_sibling_bare_takes_no_bridge_while_the_main_one_does() {
 /// commit made in its own repository.
 #[test]
 fn the_snapshot_seam_snapshots_every_repo_of_a_pair() {
-    let (case, _, _, sibling) = pair_case("snapshot-pair", sibling_repository);
+    let (case, _, _, sibling) = pair_case("snapshot-pair", &[], sibling_repository);
 
     let outcome = finish(case.gate(&snapshot_words("out.log", &[])));
     let commits: Vec<String> = outcome
@@ -1309,7 +1334,7 @@ fn the_snapshot_seam_snapshots_every_repo_of_a_pair() {
 /// naming the sibling's repository: each repository's own `global.json` is checked.
 #[test]
 fn a_pair_whose_sibling_pins_an_sdk_the_builder_lacks_is_refused_parity() {
-    let (case, _, name, sibling) = pair_case("client-pair-parity", |case, sibling| {
+    let (case, _, name, sibling) = pair_case("client-pair-parity", &[], |case, sibling| {
         sibling_repository(case, sibling);
         fs::write(sibling.join("global.json"), r#"{"sdk": {"version": "999.0.0"}}"#).expect("the sibling's global.json can be written");
     });
@@ -1364,7 +1389,7 @@ fn a_run_whose_push_fails_falls_back_and_runs_here() {
 /// it, before anything reaches the builder.
 #[test]
 fn a_pair_whose_sibling_shares_the_main_repository_stays_here() {
-    let (case, leaf, name, sibling) = pair_case("client-pair-shared", |case, sibling| {
+    let (case, leaf, name, sibling) = pair_case("client-pair-shared", &[], |case, sibling| {
         git(case, &["commit", "--quiet", "--allow-empty", "-m", "base"]);
         git(case, &["worktree", "add", "--quiet", "--detach", &shown(sibling)]);
     });
@@ -1412,7 +1437,7 @@ fn sibling_builder_files(case: &Case, name: &str, commit: &str) -> Vec<String> {
 /// save keeps the run here naming it, with no run call.
 #[test]
 fn a_sibling_whose_config_names_another_work_tree_after_its_check_pushes_none_of_it() {
-    let (case, _, name, sibling) = pair_case("client-pair-worktree-later", sibling_repository);
+    let (case, _, name, sibling) = pair_case("client-pair-worktree-later", &[], sibling_repository);
     let canary = beside_sibling(&sibling, "-canary");
     fs::create_dir_all(&canary).expect("the canary folder can be made");
     fs::write(canary.join("canary.txt"), "canary\n").expect("the canary's file can be written");
@@ -1458,7 +1483,7 @@ fn marking_hook(hooks: &Path, marker: &Path) {
 /// file, leave no marker after a pair run that went remote and saved both repositories' refs.
 #[test]
 fn no_hook_of_a_pair_s_repositories_runs_from_the_client_s_git_calls() {
-    let (case, _, _, sibling) = pair_case("client-pair-hooks", sibling_repository);
+    let (case, _, _, sibling) = pair_case("client-pair-hooks", &[], sibling_repository);
     let markers = beside_sibling(&sibling, "-markers");
     let hooks = beside_sibling(&sibling, "-hooks");
     let (main_marker, sibling_marker) = (markers.join("main"), markers.join("sibling"));
@@ -1485,7 +1510,7 @@ fn no_hook_of_a_pair_s_repositories_runs_from_the_client_s_git_calls() {
 /// with no run call.
 #[test]
 fn a_sibling_whose_save_fails_stays_here_naming_it() {
-    let (case, _, name, sibling) = pair_case("client-pair-save-fails", |case, sibling| {
+    let (case, _, name, sibling) = pair_case("client-pair-save-fails", &[], |case, sibling| {
         sibling_repository(case, sibling);
         fs::write(sibling.join(".git").join("refs").join("gate-remote"), "").expect("the refs folder's place can be taken");
     });
@@ -1530,7 +1555,7 @@ fn a_pair_needing_the_pcs_major(case: &Case, sibling: &Path, name: &str, path: &
 /// it notes each run.
 #[test]
 fn a_pair_reads_the_pcs_sdk_list_once() {
-    let (case, _, name, sibling) = pair_case("client-pair-sdks-once", sibling_repository);
+    let (case, _, name, sibling) = pair_case("client-pair-sdks-once", &[], sibling_repository);
     let marker = case.folder().join("ssh").join("pc-dotnet-ran");
     let pc = format!(">>\"{}\" echo ran\r\necho 999.0.100 [C:\\stub]\r\n", marker.display());
     let dotnet = box_path_with_pc_dotnet(&case, &[BUILDER_SDK], &pc);
@@ -1546,7 +1571,7 @@ fn a_pair_reads_the_pcs_sdk_list_once() {
 /// inside the main worktree is: the `dotnet.cmd` there, which lists the builder's SDK and notes each run, never runs.
 #[test]
 fn a_path_folder_inside_a_sibling_is_not_run_for_the_sdk_list() {
-    let (case, _, name, sibling) = pair_case("client-pair-path-in-sibling", sibling_repository);
+    let (case, _, name, sibling) = pair_case("client-pair-path-in-sibling", &[], sibling_repository);
     let inside = sibling.join("bin");
     fs::create_dir_all(&inside).expect("the folder inside the sibling can be made");
     let marker = case.folder().join("ssh").join("sibling-dotnet-ran");
@@ -5722,6 +5747,46 @@ fn a_routed_build_that_fell_back_prints_no_stale_line() {
     assert_eq!(outcome.code, Some(0), "the run here passed: {outcome:?}");
     assert_eq!(fallbacks(&own(&case, pid)), ["unreachable"], "the build ran here: {outcome:?}");
     assert!(!outcome.stderr.contains("gate: routed build left stale"), "{outcome:?}");
+}
+
+/// A sibling's output is never brought back, so a routed pair build names the sibling's stale folders on the same line
+/// as the main's, after them, each relative to the main worktree and judged by the same globs.
+#[test]
+fn a_passing_pair_build_names_a_sibling_s_stale_output_after_the_main_s() {
+    let (case, leaf, name, sibling) = pair_case("client-stale-pair", &[], |case, sibling| {
+        sibling_repository(case, sibling);
+        fs::write(sibling.join(".gitignore"), "bin/\n").expect("the sibling's ignore file can be written");
+        let folder = sibling.join("src").join("Lib").join("bin").join("Debug");
+        fs::create_dir_all(&folder).expect("the sibling's output folder can be made");
+        fs::write(folder.join("lib.dll"), "stale").expect("the sibling's output can be written");
+    });
+    copy_tool(&case, "pwsh.exe");
+    write(&case, ".gitignore", &format!("{CLIENT_IGNORED}bin/\n"));
+    git(&case, &["add", ".gitignore"]);
+    git(&case, &["commit", "--quiet", "-m", "start"]);
+    let repo = repo_name(&leaf);
+    let routing = json!({
+        "host": HOST,
+        "slots": 2,
+        "repos": { &repo: ["*tool*", "*dotnet*"] },
+        "outputs": { &repo: [] },
+        "siblings": { &repo: [&name] },
+    });
+    write_remote_json(&case, &routing.to_string());
+    write(&case, r"bin\app.txt", "stale");
+
+    let outcome = finish(client_gate(
+        &case,
+        "out.log",
+        &ssh_steps(&case, "ssh", &["ok", "ok"]),
+        &wrapped_build(&[], &RELEASE),
+    ));
+    fs::remove_dir_all(&sibling).expect("the sibling can be removed");
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let line = format!("gate: routed build left stale: bin, ../{name}/src/Lib/bin");
+    let said: Vec<&str> = outcome.stderr.lines().filter(|said| said.starts_with("gate: routed build")).collect();
+    assert_eq!(said, [line.as_str()], "{outcome:?}");
 }
 
 #[test]
