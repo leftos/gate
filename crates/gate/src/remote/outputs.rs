@@ -236,6 +236,20 @@ pub(super) struct Sent<'a> {
     built: Result<Manifest, String>,
 }
 
+impl Sent<'_> {
+    /// What a call that touches no outputs state carries: no globs, no manifest line, and no pending marker to write.
+    pub(super) fn nothing() -> Self {
+        Sent {
+            globs: &[],
+            full: false,
+            manifest: None,
+            marker: None,
+            withheld: None,
+            built: Ok(Manifest::default()),
+        }
+    }
+}
+
 /// What `attempt`'s run call carries of its outputs. A run with no output globs carries none, and reads no pending
 /// marker; one whose outputs the route withheld records the marker's path for [`marked`] to write. One with globs reads
 /// whether the marker is there, builds the manifest, polling the console interrupt as it hashes and taking each hash
@@ -245,14 +259,7 @@ pub(super) struct Sent<'a> {
 /// run call then carries no globs. Else the interrupt that ended the build.
 pub(super) fn sent<'a>(attempt: &mut Attempt<'_, 'a>) -> Result<Sent<'a>, End> {
     let call: &RemoteCall<'a> = attempt.call;
-    let mut sent = Sent {
-        globs: &[],
-        full: false,
-        manifest: None,
-        marker: None,
-        withheld: None,
-        built: Ok(Manifest::default()),
-    };
+    let mut sent = Sent::nothing();
     if call.outputs.is_empty() {
         if call.outputs_withheld {
             sent.withheld = Some(v1::outputs_pending_path(call.state_dir, call.key));

@@ -663,6 +663,7 @@ fn call_of<'r>(parts: CallParts<'r>, remote: &'r RemoteRun) -> Result<RemoteCall
         interrupt: host.interrupt,
         state: &root.root,
         state_dir: &root.path,
+        warmth: remote::Warmth::Unasked,
     })
 }
 

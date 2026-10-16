@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use gate_args::RunRequest;
 use gate_router::FolderId;
+use gate_state::v1::WarmFailure;
 use gate_state::{FallbackReason, StateRoot, Verdict};
 use gate_win32::{Interrupt, OwnedMutexGuard};
 
@@ -233,6 +234,35 @@ pub(crate) struct RemoteCall<'a> {
     pub state: &'a StateRoot,
     /// The state root's folder, which holds the work-folder key's outputs pending marker.
     pub state_dir: &'a Path,
+    /// What the call asks of the work folder's warm-up.
+    pub warmth: Warmth<'a>,
+}
+
+/// What a call asks of the work folder's warm-up: nothing; that the builder's preflight say the work folder is warm
+/// with the warm-up file of this hash, else the run falls back `cold`; or that the call be the warm-up itself, which
+/// runs `commands` from the warm-up file of `hash` in place of a command and brings nothing back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(
+    not(all(test, feature = "test-seams")),
+    expect(
+        dead_code,
+        reason = "no run asks for warmth and nothing starts a warm-up; only the client's tests make such a call"
+    )
+)]
+pub(crate) enum Warmth<'a> {
+    Unasked,
+    Needs(&'a str),
+    WarmUp { commands: &'a [Vec<String>], hash: &'a str },
+}
+
+/// How a warm-up ended, as the client classes it: warm, the box having confirmed the hash it was sent; failed, with
+/// the class that sets when the next one may start and why, a text built from the end alone and never from what the
+/// commands said; or interrupted, which leaves no record.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum WarmEnd {
+    Warm,
+    Failed { failure: WarmFailure, reason: String },
+    Deleted,
 }
 
 /// What the client hands back: the status, a refusal's reason, whether it killed the run, the lines it wrote to the
@@ -257,6 +287,12 @@ pub(crate) struct RemoteOutcome {
     /// The kill the box's kill tag named, when the box killed the command itself; the run's verdict comes from it,
     /// never from the log. `None` for any other end, a kill of the client's own included.
     pub box_killed: Option<BoxKill>,
+    /// How a warm-up ended; `None` for a call that is no warm-up.
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        expect(dead_code, reason = "nothing starts a warm-up, so only the scripted client of the test seams sets this")
+    )]
+    pub warm: Option<WarmEnd>,
 }
 
 /// How long a routed run's parts took: the run call, the command's own time, which its ceiling counts; the push; and the
@@ -435,6 +471,7 @@ mod snapshot_only {
                 interrupt,
                 state: &STATE,
                 state_dir: Path::new(r"C:\gate-snapshot-client-tests"),
+                warmth: crate::remote::Warmth::Unasked,
             }
         }
 
@@ -498,7 +535,8 @@ mod snapshot_only {
 /// the log and say it on stdout or stderr; `record <path>` writes the call as one JSON object; `wait <path>` returns
 /// when the path exists or the interrupt is raised, the latter ending the run with `STATUS_CONTROL_C_EXIT`;
 /// `interrupt` raises the call's interrupt; `killed` marks the run killed; `status <n>` sets the status; `refuse
-/// <reason>` refuses with status 75; `fail-start <why>` ends the run as a client that could not start.
+/// <reason>` refuses with status 75; `fail-start <why>` ends the run as a client that could not start; `warmed`,
+/// `warm-failed commands|refused <reason>` and `warm-deleted` set how a warm-up ended.
 #[cfg(feature = "test-seams")]
 mod scripted {
     use std::fs;
@@ -508,16 +546,17 @@ mod scripted {
     use std::time::Duration;
 
     use gate_state::FallbackReason;
+    use gate_state::v1::WarmFailure;
     use gate_win32::Interrupt;
     use serde_json::{Value, json};
 
-    use super::{BoxKill, FolderId, REFUSED, RemoteCall, RemoteClient, RemoteOutcome, Sibling};
+    use super::{BoxKill, FolderId, REFUSED, RemoteCall, RemoteClient, RemoteOutcome, Sibling, WarmEnd, Warmth};
     use crate::run::CONTROL_C_EXIT;
 
     /// How often `wait` looks for its path and the interrupt.
     const WAIT_STEP: Duration = Duration::from_millis(20);
     /// Every reason a `refuse` step may give.
-    const REASONS: [FallbackReason; 10] = [
+    const REASONS: [FallbackReason; 11] = [
         FallbackReason::Full,
         FallbackReason::Busy,
         FallbackReason::Unreachable,
@@ -528,6 +567,7 @@ mod scripted {
         FallbackReason::Version,
         FallbackReason::Client,
         FallbackReason::Inputs,
+        FallbackReason::Cold,
     ];
 
     #[derive(Debug, PartialEq)]
@@ -543,6 +583,9 @@ mod scripted {
         FailStart(String),
         Adjusted(f64),
         BoxKilled(BoxKill),
+        Warmed,
+        WarmFailed(WarmFailure, String),
+        WarmDeleted,
     }
 
     pub(crate) struct ScriptedClient {
@@ -592,6 +635,8 @@ mod scripted {
         match word {
             "interrupt" => Ok(Step::Interrupt),
             "killed" => Ok(Step::Killed),
+            "warmed" => Ok(Step::Warmed),
+            "warm-deleted" => Ok(Step::WarmDeleted),
             other => Err(format!("unknown step, or a step without its value: '{other}'")),
         }
     }
@@ -621,8 +666,19 @@ mod scripted {
                 .find(|reason| reason.as_str() == operand)
                 .map(Step::Refuse)
                 .ok_or_else(|| format!("refuse takes a reason, got '{operand}'")),
+            "warm-failed" => warm_failed(operand),
             other => Err(format!("unknown step '{other}'")),
         }
+    }
+
+    /// The `warm-failed` step of `operand`: `commands` or `refused`, then the reason.
+    fn warm_failed(operand: &str) -> Result<Step, String> {
+        let (failure, reason) = match operand.split_once(' ') {
+            Some(("commands", reason)) if !reason.is_empty() => (WarmFailure::Commands, reason),
+            Some(("refused", reason)) if !reason.is_empty() => (WarmFailure::Refused, reason),
+            _ => return Err(format!("warm-failed takes commands or refused and a reason, got '{operand}'")),
+        };
+        Ok(Step::WarmFailed(failure, reason.to_owned()))
     }
 
     /// Performs `step` of `call` into `outcome`; whether the run goes on to the next step, or why the client failed.
@@ -661,6 +717,14 @@ mod scripted {
                 *outcome = RemoteOutcome::not_started(why.clone());
                 return false;
             }
+            Step::Warmed => outcome.warm = Some(WarmEnd::Warm),
+            Step::WarmFailed(failure, reason) => {
+                outcome.warm = Some(WarmEnd::Failed {
+                    failure: *failure,
+                    reason: reason.clone(),
+                });
+            }
+            Step::WarmDeleted => outcome.warm = Some(WarmEnd::Deleted),
             Step::Out(_) | Step::Err(_) | Step::Record(_) | Step::Wait(_) => {}
         }
         true
@@ -692,9 +756,20 @@ mod scripted {
             "stall": call.stall,
             "tail": call.tail,
             "noMarkers": call.no_markers,
+            "warmth": recorded_warmth(call.warmth),
         });
         fs::write(path, recorded.to_string()).map_err(|error| format!("cannot record the call to {}: {error}", path.display()))?;
         Ok(true)
+    }
+
+    /// What the call asks of the warm-up, as the record writes it: `null` for nothing, `{"needs": <hash>}`, or
+    /// `{"warmUp": {"commands": [[<word>…]…], "hash": <hash>}}`.
+    fn recorded_warmth(warmth: Warmth<'_>) -> Value {
+        match warmth {
+            Warmth::Unasked => Value::Null,
+            Warmth::Needs(hash) => json!({"needs": hash}),
+            Warmth::WarmUp { commands, hash } => json!({"warmUp": {"commands": commands, "hash": hash}}),
+        }
     }
 
     /// A carried sibling as the record writes it: its name, its root, and its folder's id ([`recorded_id`]).
@@ -729,13 +804,16 @@ mod scripted {
         use std::path::PathBuf;
 
         use gate_state::FallbackReason;
+        use gate_state::v1::WarmFailure;
 
         use super::{Step, parse};
 
         #[test]
         fn each_step_parses_from_its_line() {
             let text = "out ran there\nerr error CS1002: x\n\nrecord C:\\a b\\call.json\r\nwait go\ninterrupt\nkilled\n\
-                        status -1\nrefuse rebooted\nfail-start no pwsh\n";
+                        status -1\nrefuse rebooted\nfail-start no pwsh\nrefuse cold\nwarmed\n\
+                        warm-failed commands command stopped with status 2\nwarm-failed refused the builder refused: busy\n\
+                        warm-deleted\n";
             assert_eq!(
                 parse(text),
                 Ok(vec![
@@ -748,6 +826,11 @@ mod scripted {
                     Step::Status(-1),
                     Step::Refuse(FallbackReason::Rebooted),
                     Step::FailStart("no pwsh".to_owned()),
+                    Step::Refuse(FallbackReason::Cold),
+                    Step::Warmed,
+                    Step::WarmFailed(WarmFailure::Commands, "command stopped with status 2".to_owned()),
+                    Step::WarmFailed(WarmFailure::Refused, "the builder refused: busy".to_owned()),
+                    Step::WarmDeleted,
                 ])
             );
             assert_eq!(parse(""), Ok(Vec::new()), "no steps");

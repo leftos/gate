@@ -165,14 +165,10 @@ pub(crate) fn outputs_word(location: &Location, name: &str) -> String {
 /// The payload word of the run call.
 pub(crate) fn run_word(location: &Location, run: &RunCall<'_>) -> String {
     let mut object = location.object();
-    let identity: Map<String, Value> = IDENTITY
-        .iter()
-        .map(|(name, value)| ((*name).to_owned(), Value::String((*value).to_owned())))
-        .collect();
     for (name, value) in [
         ("Command", json!(run.words)),
         ("Subfolder", json!(run.subfolder)),
-        ("Identity", Value::Object(identity)),
+        ("Identity", identity()),
         ("Outputs", json!(run.outputs)),
         ("Nonce", json!(run.nonce)),
         ("OutputsFull", json!(run.full)),
@@ -182,6 +178,50 @@ pub(crate) fn run_word(location: &Location, run: &RunCall<'_>) -> String {
     ] {
         object.insert(name.to_owned(), value);
     }
+    insert_siblings_and_inputs(&mut object, run);
+    word(&object)
+}
+
+/// What a warm-up's run call carries in place of a command: the commands of the warm-up file, in order, and the
+/// SHA-256 of its bytes, which the box confirms once every command passed.
+pub(crate) struct WarmCall<'a> {
+    pub commands: &'a [Vec<String>],
+    pub hash: &'a str,
+}
+
+/// The payload word of a warm-up's run call: the keys of `run`'s word, its `Timeout` always among them, with the
+/// warm-up's `WarmCommands` and `WarmHash` in place of `Command`, and no `Outputs` or `OutputsFull`, as the box takes a
+/// warm-up only without them; `run`'s words, output globs and `full` are not read.
+pub(crate) fn warm_word(location: &Location, run: &RunCall<'_>, warm: &WarmCall<'_>) -> String {
+    let mut object = location.object();
+    for (name, value) in [
+        ("WarmCommands", json!(warm.commands)),
+        ("WarmHash", json!(warm.hash)),
+        ("Subfolder", json!(run.subfolder)),
+        ("Identity", identity()),
+        ("Nonce", json!(run.nonce)),
+        ("Snapshot", json!(run.snapshot)),
+        ("Timeout", json!(run.timeout)),
+        ("Host", json!(run.host)),
+    ] {
+        object.insert(name.to_owned(), value);
+    }
+    insert_siblings_and_inputs(&mut object, run);
+    word(&object)
+}
+
+/// The git identity the box commits the run's changes as (`Identity`).
+fn identity() -> Value {
+    Value::Object(
+        IDENTITY
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), Value::String((*value).to_owned())))
+            .collect(),
+    )
+}
+
+/// Adds `run`'s `SiblingSnapshots`, when it has any, and its `InputsDigest`, when it has one, to `object`.
+fn insert_siblings_and_inputs(object: &mut Map<String, Value>, run: &RunCall<'_>) {
     if !run.sibling_snapshots.is_empty() {
         let snapshots: Map<String, Value> = run
             .sibling_snapshots
@@ -193,7 +233,6 @@ pub(crate) fn run_word(location: &Location, run: &RunCall<'_>) -> String {
     if let Some(digest) = run.inputs_digest {
         object.insert("InputsDigest".to_owned(), json!(digest));
     }
-    word(&object)
 }
 
 /// `object` as one word: base64 of its compact UTF-8 JSON.
@@ -241,7 +280,10 @@ mod tests {
     use gate_args::BoxVerb;
     use serde_json::{Value, json};
 
-    use super::{InputsStep, Location, Pair, RunCall, input, inputs_word, job_nonce, line, location_word, preflight_word, run_nonce, run_word};
+    use super::{
+        InputsStep, Location, Pair, RunCall, WarmCall, input, inputs_word, job_nonce, line, location_word, preflight_word, run_nonce, run_word,
+        warm_word,
+    };
     use crate::boxside::payload::Payload;
 
     fn decoded(word: &str) -> Value {
@@ -457,6 +499,98 @@ mod tests {
         assert_eq!(sent["Outputs"], json!(["**/bin/**", "out/*.dll"]));
         assert_eq!(sent["OutputsFull"], json!(true));
         assert_eq!(sent["Nonce"], json!("n2"));
+    }
+
+    const WARM_HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const WARM_NONCE: &str = "fedcba9876543210fedcba9876543210";
+
+    /// The warm-up's commands the warm cases send.
+    fn warm_commands() -> Vec<Vec<String>> {
+        vec![
+            vec!["dotnet".to_owned(), "build".to_owned(), "a b".to_owned()],
+            vec!["./tool.exe".to_owned()],
+        ]
+    }
+
+    /// The run call the warm cases build their word from, with `sibling_snapshots` and `inputs_digest`.
+    fn warm_run<'a>(sibling_snapshots: &'a [(String, String)], inputs_digest: Option<&'a str>) -> RunCall<'a> {
+        RunCall {
+            words: &[],
+            subfolder: "sub",
+            nonce: WARM_NONCE,
+            snapshot: SHA,
+            outputs: &[],
+            full: false,
+            timeout: 1800,
+            host: "builder",
+            sibling_snapshots,
+            inputs_digest,
+        }
+    }
+
+    #[test]
+    fn a_warm_word_sets_the_warm_keys_and_no_command_or_outputs() {
+        let commands = warm_commands();
+        let warm = WarmCall {
+            commands: &commands,
+            hash: WARM_HASH,
+        };
+        let sent = decoded(&warm_word(&location(), &warm_run(&[], None), &warm));
+
+        let mut expected = decoded(&location_word(&location()));
+        let extra = json!({
+            "WarmCommands": [["dotnet", "build", "a b"], ["./tool.exe"]],
+            "WarmHash": WARM_HASH,
+            "Subfolder": "sub",
+            "Identity": {
+                "GIT_AUTHOR_NAME": "gate-remote",
+                "GIT_AUTHOR_EMAIL": "gate-remote@localhost",
+                "GIT_COMMITTER_NAME": "gate-remote",
+                "GIT_COMMITTER_EMAIL": "gate-remote@localhost",
+            },
+            "Nonce": WARM_NONCE,
+            "Snapshot": SHA,
+            "Timeout": 1800,
+            "Host": "builder",
+        });
+        for (name, value) in extra.as_object().expect("an object") {
+            expected[name] = value.clone();
+        }
+        assert_eq!(sent, expected);
+        for key in ["Command", "Outputs", "OutputsFull"] {
+            assert!(sent.get(key).is_none(), "a warm word sends no {key}: {sent}");
+        }
+    }
+
+    #[test]
+    fn a_warm_word_is_read_back_by_the_box_s_payload() {
+        let commands = warm_commands();
+        let warm = WarmCall {
+            commands: &commands,
+            hash: WARM_HASH,
+        };
+        let other = "fedcba9876543210fedcba9876543210fedcba98";
+        let snapshots = [("tools".to_owned(), other.to_owned()), ("lib".to_owned(), SHA.to_owned())];
+        let digest = "ab".repeat(32);
+        let paired = || location().with_pair("app", &["lib".to_owned(), "tools".to_owned()]);
+        let run = warm_run(&snapshots, Some(&digest));
+        let word = warm_word(&paired(), &run, &warm);
+
+        let payload = on_the_box(&word);
+        let read = payload.commands().expect("the box takes the warm-up");
+        assert_eq!(read.words, commands, "the commands, in order");
+        assert_eq!(read.warm_hash, Some(WARM_HASH));
+        assert_eq!(payload.timeout(), Ok(Some(1800)));
+        assert_eq!(payload.nonce(), Ok(WARM_NONCE));
+        assert_eq!(payload.inputs_digest(), Ok(Some(digest.as_str())));
+        let pair = payload.pair().expect("the box takes the pair").expect("the box finds a pair");
+        assert_eq!(payload.sibling_snapshots(&pair), Ok(vec![SHA, other]), "in the pair's order");
+
+        let as_a_run = decoded(&run_word(&paired(), &run));
+        let sent = decoded(&word);
+        for key in ["Pair", "SiblingSnapshots", "InputsDigest"] {
+            assert_eq!(sent[key], as_a_run[key], "{key} is sent as a run sends it");
+        }
     }
 
     #[test]
