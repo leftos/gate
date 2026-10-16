@@ -15,9 +15,10 @@ use std::time::{Duration, Instant};
 use std::{fs, io};
 
 use gate_args::{Ceiling, ProgramSearch, RunRequest, Slot, batch_command_line, batch_refusal, command_line, is_batch_target, resolve_program};
+use gate_router::warm::{RecordRead, RecordState};
 use gate_router::{
     BuildSettings, BuildTarget, DEFAULT_OUTPUTS, Place, RemoteRun, Route, build_settings, dotnet_builds, dotnet_target, sdk_build_target,
-    without_no_build, work_folder_key,
+    warm::warm_hint_line, without_no_build, work_folder_key,
 };
 use gate_state::{Estimate, FallbackReason, JournalEvent, KernelObject, RebuildOwner, RemoteTag, RunFacts, StateRoot, Verdict, log_hash, v1};
 use gate_watchdog::{Cores, Hint, SlotKind, hint};
@@ -50,6 +51,7 @@ use crate::route::{self, Placed};
 use crate::slots::{self, ClaimOf, LendMarker, Pool, Survey, Taken, Takes, ThisGate, epoch_ms};
 use crate::stopping::{TERMINATE_CHECK, failure};
 use crate::wait::{self, Arrival, Host, UnderParent, Wait, Waited};
+use crate::warm;
 use crate::watch::{Start, Watched, Watcher, Watching};
 
 /// The status of a run the gate itself failed.
@@ -144,6 +146,7 @@ pub(crate) fn run(request: &RunRequest, log: &Path, root: &ResolvedRoot, environ
         host,
         client,
         tag: None,
+        warm_hash: None,
         arrived: epoch_ms(Timestamp::now()),
         queued_at: None,
         lent: false,
@@ -493,6 +496,9 @@ struct Run<'a> {
     client: Box<dyn RemoteClient>,
     /// The remote tag of a routed run, which its journal lines and remote claim carry until its fallback.
     tag: Option<RemoteTag>,
+    /// The hash of the warm-up file a routed run's work folder must be warm with, which its call asks the builder for;
+    /// `None` when the route asks no warmth. Set once, by [`Run::route`].
+    warm_hash: Option<String>,
     /// The run's first arrival in Unix epoch milliseconds, which every ticket it writes keeps.
     arrived: u64,
     /// The moment of the run's `queue` line: the moment the local `take` of a run the full remote pool sent back counts
@@ -623,6 +629,20 @@ struct CallParts<'r> {
     log: &'r Log,
     host: &'r Host,
     root: &'r ResolvedRoot,
+    /// What the call asks of the work folder's warm-up.
+    warmth: remote::Warmth<'r>,
+}
+
+/// Whether the warm-up record at `path` is still the one the route judged: `warm` for the warm-up file of `hash`. A
+/// record a warm-up wrote since, for another hash or state, or one that cannot be read, is not, and is left alone.
+fn still_judged(path: &Path, hash: &str) -> bool {
+    matches!(warm::read_warm_record(path), RecordRead::Parsed(record) if record.state == RecordState::Warm && record.hash == hash)
+}
+
+/// What a routed run's call asks of the work folder's warm-up: that it be warm with the warm-up file of `warm_hash`
+/// when the route asked that, else nothing.
+fn warmth_of(warm_hash: Option<&str>) -> remote::Warmth<'_> {
+    warm_hash.map_or(remote::Warmth::Unasked, remote::Warmth::Needs)
 }
 
 /// The client's call for `remote`, with the run's log, limits and interrupt, made of the run's `parts` so the run's
@@ -639,6 +659,7 @@ fn call_of<'r>(parts: CallParts<'r>, remote: &'r RemoteRun) -> Result<RemoteCall
         log,
         host,
         root,
+        warmth,
     } = parts;
     Ok(RemoteCall {
         host: &remote.host,
@@ -663,7 +684,7 @@ fn call_of<'r>(parts: CallParts<'r>, remote: &'r RemoteRun) -> Result<RemoteCall
         interrupt: host.interrupt,
         state: &root.root,
         state_dir: &root.path,
-        warmth: remote::Warmth::Unasked,
+        warmth,
     })
 }
 
@@ -756,13 +777,19 @@ impl Run<'_> {
     /// Decides where the command runs, and sets the remote tag of a routed run. A gate a parent's slot covers runs
     /// here, as does one whose light parent lends it its slot before it queues, while a critical request drains, which
     /// is not routed ([`Run::on_parent`]). The route, and what the decision learnt of the gate's place in its worktree.
+    /// The hash of the warm-up file the route asks the builder's work folder to be warm with is kept for the call.
     fn route(&mut self, environment: &Environment, console: &mut Console) -> (Route, Placed) {
         if self.lend_before_queue(console) {
             self.lent = true;
             return (Route::Local { reason: None }, Placed::NotAsked);
         }
         let covering = self.nesting.covering().is_some();
-        let (route, place) = route::route(self.request, environment, covering, console);
+        let route::Decided {
+            route,
+            placed: place,
+            warm_hash,
+        } = route::route(self.request, environment, covering, self.root, console);
+        self.warm_hash = warm_hash;
         self.tag = match &route {
             Route::Routed(remote) => Some(RemoteTag {
                 host: remote.host.clone(),
@@ -1026,6 +1053,7 @@ impl Run<'_> {
             log: &self.log,
             host: &self.host,
             root: self.root,
+            warmth: warmth_of(self.warm_hash.as_deref()),
         };
         let call = match call_of(parts, remote) {
             Ok(call) => call,
@@ -1038,7 +1066,12 @@ impl Run<'_> {
             return Remotely::Ended(self.interrupted_before_start(console));
         }
         if let Some(reason) = fallback {
-            return self.fell_back(reason, &outcome, hold.taken.take(), console);
+            let said = self.drop_warm_record(remote, reason);
+            let here = self.fell_back(reason, &outcome, hold.taken.take(), console);
+            for line in &said {
+                console.err(line);
+            }
+            return here;
         }
         let wall = started.elapsed();
         let words = unicode_words(&self.request.command);
@@ -1050,6 +1083,33 @@ impl Run<'_> {
             stale: &stale,
         };
         Remotely::Ended(self.remote_ended(&outcome, passing, wall, console))
+    }
+
+    /// Drops the work folder's warm-up record after the client's refusal for `reason`, while the run still holds the
+    /// work folder's key: a `cold` or a `layout` refusal deletes it while it is still the record the route judged
+    /// ([`still_judged`]), one already gone among them, and any other keeps it. A run that asked no warmth, a repo
+    /// with no consent among them, neither reads nor deletes anything under `remote\warm`.
+    /// The lines to say once the run has fallen back: why the delete failed, then, after `cold`, how the work folder is
+    /// warmed.
+    fn drop_warm_record(&self, remote: &RemoteRun, reason: FallbackReason) -> Vec<String> {
+        if !matches!(reason, FallbackReason::Cold | FallbackReason::Layout) {
+            return Vec::new();
+        }
+        let mut lines = Vec::new();
+        let path = v1::warm_record_path(&self.root.path, &remote.key);
+        let judged = self.warm_hash.as_deref().is_some_and(|hash| still_judged(&path, hash));
+        match judged.then(|| fs::remove_file(&path)) {
+            Some(Err(error)) if error.kind() != io::ErrorKind::NotFound => lines.push(format!(
+                "gate: cannot remove the warm-up record {}: {}",
+                gate_router::escaped(&path.to_string_lossy()),
+                gate_router::escaped(&error.to_string())
+            )),
+            _ => {}
+        }
+        if reason == FallbackReason::Cold {
+            lines.push(warm_hint_line(&remote.host));
+        }
+        lines
     }
 
     /// Updates the worktree's nothing-back record after a routed run that ended on the builder, killed, interrupted or
@@ -1138,6 +1198,7 @@ impl Run<'_> {
             log: &self.log,
             host: &self.host,
             root: self.root,
+            warmth: warmth_of(self.warm_hash.as_deref()),
         };
         call_of(parts, remote)
     }

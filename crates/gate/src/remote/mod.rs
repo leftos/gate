@@ -259,10 +259,6 @@ pub(crate) struct RemoteCall<'a> {
 /// with the warm-up file of this hash, else the run falls back `cold`; or that the call be the warm-up itself, which
 /// runs `commands` from the warm-up file of `hash` in place of a command and brings nothing back.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(
-    not(all(test, feature = "test-seams")),
-    expect(dead_code, reason = "no run asks for warmth; only the client's tests make such a call")
-)]
 pub(crate) enum Warmth<'a> {
     Unasked,
     Needs(&'a str),

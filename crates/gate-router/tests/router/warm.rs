@@ -3,8 +3,8 @@
 use std::time::{Duration, SystemTime};
 
 use gate_router::warm::{
-    FailureClass, FileRead, Judgement, Record, RecordRead, RecordState, Situation, WarmupFile, failed_line, file_problem_line, judge, read_warmup,
-    record_problem_line, starting_line, warming_line, warmup_hash,
+    FailureClass, FileRead, Judgement, Record, RecordRead, RecordState, Situation, WarmupFile, failed_line, file_problem_line, judge,
+    lock_problem_line, read_warmup, record_problem_line, starting_line, unwarmed_line, warm_hint_line, warming_line, warmup_hash,
 };
 
 fn problems(text: &str) -> Vec<String> {
@@ -456,5 +456,51 @@ fn the_lines_name_the_host_the_age_and_the_reason_escaped() {
     assert_eq!(
         warming_line("b\u{1b}"),
         r"gate: not routed: b\u{1b} is warming the work folder for this worktree"
+    );
+}
+
+#[test]
+fn the_warm_route_lines_name_the_host_and_the_lock_escaped() {
+    assert_eq!(
+        unwarmed_line("builder"),
+        "gate: not routed: the work folder for this worktree on builder is not warm; gate warm warms it"
+    );
+    assert_eq!(
+        unwarmed_line("b\u{1b}"),
+        r"gate: not routed: the work folder for this worktree on b\u{1b} is not warm; gate warm warms it"
+    );
+    assert_eq!(
+        warm_hint_line("builder"),
+        "gate: gate warm warms the work folder for this worktree on builder"
+    );
+    assert_eq!(warm_hint_line("b\n"), r"gate: gate warm warms the work folder for this worktree on b\n");
+    assert_eq!(
+        lock_problem_line(r"C:\s\k.lock", "Access is denied. (os error 5)"),
+        r"gate: not routed: the warm-up lock C:\s\k.lock cannot be read: Access is denied. (os error 5)"
+    );
+    assert_eq!(
+        lock_problem_line("k\u{202e}.lock", "bad\u{1b}"),
+        r"gate: not routed: the warm-up lock k\u{202e}.lock cannot be read: bad\u{1b}"
+    );
+}
+
+#[test]
+fn a_record_s_long_values_are_cut_to_200_characters() {
+    let long = "x".repeat(10_000);
+    let cut = format!("{}…", "x".repeat(200));
+    assert_eq!(failed_line(3, &long), format!("gate: not routed: the warm-up failed 3 min ago: {cut}"));
+    assert_eq!(
+        warming_line(&long),
+        format!("gate: not routed: {cut} is warming the work folder for this worktree")
+    );
+    assert_eq!(
+        record_problem_line("r.json", &long),
+        format!("gate: not routed: the warm-up record r.json cannot be read: {cut}")
+    );
+    let whole = "x".repeat(200);
+    assert_eq!(
+        failed_line(3, &whole),
+        format!("gate: not routed: the warm-up failed 3 min ago: {whole}"),
+        "200 characters are kept whole"
     );
 }

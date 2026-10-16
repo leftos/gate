@@ -12,19 +12,19 @@
 //! writes it. A warm-up takes no slot and writes no journal event.
 
 use std::fs::{self, File, OpenOptions};
-use std::io;
+use std::io::{self, Read};
 use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use gate_args::{DEFAULT_STALL_SECONDS, Spelling, TestSeams, WarmRequest};
-use gate_router::warm::{WarmupFile, read_warmup, warmup_hash};
+use gate_router::warm::{FailureClass, FileRead, Record, RecordRead, RecordState, WarmupFile, read_warmup, warmup_hash};
 use gate_router::{Config, Facts, Place, Target, builder_words, escaped, repo_name, stays_local, target};
 use gate_state::v1::{self, WarmFailure, WarmRecord, WarmState};
 use gate_win32::{Interrupt, OwnedMutexGuard};
 use jiff::Timestamp;
-use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE};
+use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE};
 
 use crate::answer::{FAILED_STATUS, USAGE_STATUS, enter};
 use crate::console::Console;
@@ -42,6 +42,8 @@ const LOCK_VIOLATION: i32 = 33;
 const LOCK_RETRY: Duration = Duration::from_millis(200);
 /// The pause between two opens of a lock another handle holds.
 const LOCK_STEP: Duration = Duration::from_millis(20);
+/// The largest warm-up record the route reads: 64 KiB.
+const RECORD_MOST_BYTES: u64 = 64 * 1024;
 /// How long one slice of the cap's wait lasts, between two looks at the console interrupt.
 const CAP_SLICE: Duration = Duration::from_millis(100);
 /// The warm-up file, as its path below the worktree root is said.
@@ -220,21 +222,113 @@ fn consented(config: &Config, repo: &str) -> Result<(), End> {
 /// The warm-up file of `target`'s worktree read through the `.gate` reader, and its commands worded for the builder;
 /// else how the warm-up ends: no file, a file problem, or a command whose words name a path outside the worktree.
 fn read_file(target: &Target, machine: &Machine<'_>) -> Result<Warmup, End> {
-    let bytes = match route::read_gate_file(Path::new(&target.place.root), "warmup.toml") {
-        Ok(Some(bytes)) => bytes,
-        Ok(None) => {
+    let (file, hash) = match read_warmup_file(Path::new(&target.place.root)) {
+        FileRead::Parsed { file, hash } => (file, hash),
+        FileRead::Absent => {
             let root = target.place.root.replace('/', "\\");
             return Err(End::Quiet(format!("gate: warm: {}\\{FILE_SAID} does not exist", escaped(&root))));
         }
-        Err(problem) => return Err(file_problem(&problem)),
+        FileRead::Problem(problem) => return Err(file_problem(&problem)),
     };
-    let file = read_warmup(&bytes).map_err(|problems| file_problem(&first_problem(&problems)))?;
     let commands = worded(target, &file, machine)?;
-    Ok(Warmup {
-        hash: warmup_hash(&bytes),
-        file,
-        commands,
+    Ok(Warmup { file, hash, commands })
+}
+
+/// The `.gate\warmup.toml` of the worktree at `root`, read through the `.gate` reader ([`route::read_gate_file`]),
+/// parsed and hashed: absent, its first problem ([`first_problem`]), or what it declares with the [`warmup_hash`] of its
+/// bytes. `gate warm` and the route read the file through this.
+pub(crate) fn read_warmup_file(root: &Path) -> FileRead {
+    match route::read_gate_file(root, "warmup.toml") {
+        Ok(None) => FileRead::Absent,
+        Err(problem) => FileRead::Problem(problem),
+        Ok(Some(bytes)) => match read_warmup(&bytes) {
+            Ok(file) => FileRead::Parsed {
+                file,
+                hash: warmup_hash(&bytes),
+            },
+            Err(problems) => FileRead::Problem(first_problem(&problems)),
+        },
+    }
+}
+
+/// The warm-up record at `path` as the route reads it: absent when nothing is there; else opened without following a
+/// link, sharing everything so a writer's replace is never blocked, required to be a plain file, read up to
+/// [`RECORD_MOST_BYTES`] and parsed strictly ([`v1::warm_record`]). A record that is there but fails any of these is
+/// unreadable, with why.
+pub(crate) fn read_warm_record(path: &Path) -> RecordRead {
+    let unreadable = |error: String| RecordRead::Unreadable {
+        path: path.to_string_lossy().into_owned(),
+        error,
+    };
+    let opened = OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path);
+    let file = match opened {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return RecordRead::Absent,
+        Err(error) => return unreadable(error.to_string()),
+        Ok(file) => file,
+    };
+    if let Err(error) = gate_win32::check_plain_file(&file) {
+        return unreadable(error.to_string());
+    }
+    let mut bytes = Vec::new();
+    if let Err(error) = file.take(RECORD_MOST_BYTES + 1).read_to_end(&mut bytes) {
+        return unreadable(error.to_string());
+    }
+    if bytes.len() as u64 > RECORD_MOST_BYTES {
+        return unreadable(format!("is larger than {} KiB", RECORD_MOST_BYTES / 1024));
+    }
+    match v1::warm_record(&bytes) {
+        Ok(record) => record_of(record).map_or_else(unreadable, RecordRead::Parsed),
+        Err(error) => unreadable(error.to_string()),
+    }
+}
+
+/// The router's [`Record`] of a record the strict reader passed; a failed record without its failure or reason, which
+/// that reader refuses, is a problem all the same.
+fn record_of(record: WarmRecord) -> Result<Record, String> {
+    let state = match (record.state, record.failure, record.reason) {
+        (WarmState::Warming, ..) => RecordState::Warming,
+        (WarmState::Warm, ..) => RecordState::Warm,
+        (WarmState::Failed, Some(failure), Some(reason)) => RecordState::Failed {
+            class: match failure {
+                WarmFailure::Commands => FailureClass::Commands,
+                WarmFailure::Refused => FailureClass::Refused,
+            },
+            reason,
+        },
+        (WarmState::Failed, ..) => return Err("state failed without failure or reason".to_owned()),
+    };
+    Ok(Record {
+        host: record.host,
+        state,
+        at: SystemTime::from(record.at),
+        hash: record.hash,
+        gate: record.gate,
     })
+}
+
+/// Whether the warm-up lock at `path` is held, from one open for reading that shares everything and does not follow a
+/// link, closed at once: a sharing or lock violation is held, and a lock that is not there, or that opens as a plain file, is free. The
+/// probe never takes the lock, and a warm-up whose own open meets it tries again ([`LOCK_RETRY`]).
+///
+/// # Errors
+///
+/// Why the lock cannot be opened, for any other failure, or why what opened is not a plain file (a link or a folder).
+pub(crate) fn lock_held(path: &Path) -> io::Result<bool> {
+    let opened = OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path);
+    match opened {
+        Ok(file) => gate_win32::check_plain_file(&file).map(|()| false),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) if matches!(error.raw_os_error(), Some(SHARING_VIOLATION | LOCK_VIOLATION)) => Ok(true),
+        Err(error) => Err(error),
+    }
 }
 
 /// The line of a problem of the warm-up file.
@@ -426,7 +520,7 @@ fn held_cap(path: &Path, wait: Duration, interrupt: Option<Interrupt>, hash: &st
 /// without following a link, and held open sharing reading and writing but not deletion, so nothing can put a link in
 /// its place while the client appends to it by its path; else the line saying why it cannot be.
 fn fresh_log(path: &Path) -> Result<File, String> {
-    let cannot = |what: &str, error: &dyn std::fmt::Display| format!("gate: warm: cannot {what} the warm-up log {}: {error}", shown(path));
+    let cannot = |what: &str, error: &dyn std::fmt::Display| format!("gate: warm: cannot {what} warm-up log {}: {error}", shown(path));
     match fs::remove_file(path) {
         Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(cannot("remove the earlier", &error)),
         _ => {}
@@ -437,8 +531,8 @@ fn fresh_log(path: &Path) -> Result<File, String> {
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)
-        .map_err(|error| cannot("create", &error))?;
-    gate_win32::check_plain_file(&file).map_err(|error| cannot("use", &error))?;
+        .map_err(|error| cannot("create the", &error))?;
+    gate_win32::check_plain_file(&file).map_err(|error| cannot("use the", &error))?;
     Ok(file)
 }
 
@@ -694,13 +788,15 @@ fn wait_for_cap(path: &Path, wait: Duration, interrupt: Option<Interrupt>) -> Ca
 mod tests {
     use std::fs;
     use std::os::windows::fs::OpenOptionsExt;
-    use std::path::PathBuf;
-    use std::time::Duration;
+    use std::path::{Path, PathBuf};
+    use std::time::{Duration, SystemTime};
 
+    use gate_router::warm::{FailureClass, Record, RecordRead, RecordState};
     use gate_state::FallbackReason;
-    use gate_state::v1::WarmFailure;
+    use gate_state::v1::{self, WarmFailure, WarmRecord, WarmState};
+    use jiff::Timestamp;
 
-    use super::{Ending, Lock, NOT_STARTED, ending_of, first_problem, fresh_log, take_lock};
+    use super::{Ending, Lock, NOT_STARTED, ending_of, first_problem, fresh_log, lock_held, read_warm_record, take_lock};
     use crate::remote::{RemoteOutcome, WarmEnd};
 
     const HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -847,6 +943,99 @@ mod tests {
         let problems = |list: &[&str]| first_problem(&list.iter().map(|text| (*text).to_owned()).collect::<Vec<_>>());
         assert_eq!(problems(&["a"]), "a");
         assert_eq!(problems(&["a", "b", "c"]), "a (and 2 more)");
+    }
+
+    #[test]
+    fn a_missing_record_is_absent() {
+        let folder = scratch("record-missing");
+        assert_eq!(read_warm_record(&folder.join("k.json")), RecordRead::Absent);
+        assert_eq!(
+            read_warm_record(&folder.join("gone").join("k.json")),
+            RecordRead::Absent,
+            "nor is its folder there"
+        );
+    }
+
+    /// Whether `read` is an unreadable record at `path`.
+    fn is_unreadable(read: &RecordRead, path: &Path) -> bool {
+        matches!(read, RecordRead::Unreadable { path: said, .. } if *said == path.to_string_lossy())
+    }
+
+    #[test]
+    fn a_record_that_is_a_junction_or_a_folder_is_a_read_problem() {
+        let folder = scratch("record-not-a-file");
+        let target = folder.join("target");
+        fs::create_dir(&target).expect("the junction's target is made");
+        let linked = folder.join("linked.json");
+        crate::test_support::junction(&linked, &target);
+        assert!(is_unreadable(&read_warm_record(&linked), &linked), "a junction");
+        let made = folder.join("folder.json");
+        fs::create_dir(&made).expect("a folder named like a record is made");
+        assert!(is_unreadable(&read_warm_record(&made), &made), "a folder");
+    }
+
+    #[test]
+    fn an_over_cap_or_malformed_record_is_a_read_problem() {
+        let path = scratch("record-bad").join("k.json");
+        fs::write(&path, " ".repeat(64 * 1024 + 1)).expect("an over-cap record is written");
+        assert_eq!(
+            read_warm_record(&path),
+            RecordRead::Unreadable {
+                path: path.to_string_lossy().into_owned(),
+                error: "is larger than 64 KiB".to_owned(),
+            }
+        );
+        for text in ["{", "{}", r#"{"v": 1, "host": "b"}"#, "\u{feff}{}"] {
+            fs::write(&path, text).expect("a malformed record is written");
+            assert!(is_unreadable(&read_warm_record(&path), &path), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_written_record_reads_as_the_router_s_record() {
+        let path = scratch("record-written").join("k.json");
+        let at = Timestamp::from_second(1_700_000_000).expect("a time in range");
+        let record = WarmRecord {
+            host: "builder".to_owned(),
+            state: WarmState::Failed,
+            at,
+            hash: HASH.to_owned(),
+            gate: "1.2.3".to_owned(),
+            pid: 7,
+            started: at,
+            failure: Some(WarmFailure::Refused),
+            reason: Some("the builder is busy".to_owned()),
+        };
+        v1::write_warm_record(&path, &record).expect("the record is written");
+        assert_eq!(
+            read_warm_record(&path),
+            RecordRead::Parsed(Record {
+                host: "builder".to_owned(),
+                state: RecordState::Failed {
+                    class: FailureClass::Refused,
+                    reason: "the builder is busy".to_owned(),
+                },
+                at: SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+                hash: HASH.to_owned(),
+                gate: "1.2.3".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn a_lock_a_warm_up_holds_is_held_and_one_nobody_holds_is_free() {
+        let folder = scratch("probe");
+        let lock = folder.join("k.lock");
+        assert!(!lock_held(&lock).expect("a missing lock can be probed"), "a missing lock is free");
+        let taken = take_lock(&lock, Duration::ZERO);
+        assert!(matches!(taken, Lock::Taken(_)), "the lock is taken as a warm-up takes it");
+        assert!(lock_held(&lock).expect("a held lock can be probed"), "a taken lock is held");
+        drop(taken);
+        assert!(!lock_held(&lock).expect("a free lock can be probed"), "a lock let go is free");
+        assert!(
+            matches!(take_lock(&lock, Duration::ZERO), Lock::Taken(_)),
+            "the probe left the lock free to take"
+        );
     }
 
     #[test]
