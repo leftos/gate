@@ -48,6 +48,7 @@ mod stopping;
 mod test_support;
 mod version;
 mod wait;
+mod warm;
 mod watch;
 
 use std::io::{self, Write};

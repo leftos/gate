@@ -30,8 +30,6 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use gate_args::BoxVerb;
-#[cfg(feature = "test-seams")]
-use gate_args::RunRequest;
 use gate_args::TestSeams;
 use gate_state::v1::WarmFailure;
 use gate_state::{FallbackReason, KernelObject, key_hash};
@@ -61,8 +59,8 @@ use super::transport::{Program, Transport, Wire};
 use super::watchdog::{self, Cut, Kept, Kill, LINE_CAP};
 use super::worktree_lock::{self, Folder, Locked, Wait};
 use super::{
-    BoxKill, FAILED, FAILED_RUN, REFUSED, Refusal, RemoteCall, RemoteClient, RemoteOutcome, Split, WarmEnd, Warmth, adjusted_prefix, killed_line,
-    refused_line, started_line,
+    BoxKill, FAILED, FAILED_RUN, KeyWait, REFUSED, Refusal, RemoteCall, RemoteClient, RemoteOutcome, Split, WarmEnd, Warmth, adjusted_prefix,
+    killed_line, refused_line, started_line,
 };
 use crate::boxside::outputs::{NAMES_SKIPPED, OUTPUTS_BUDGET};
 use crate::boxside::payload::{PairRefused, Payload, escaped};
@@ -161,8 +159,7 @@ impl RustClient {
     /// The client of the local transport `transport` names, with the request's seams; else the line saying why the
     /// transport cannot be used, or why the stand-in `--test-remote-ssh` names cannot be found.
     #[cfg(feature = "test-seams")]
-    pub(crate) fn local(request: &RunRequest, transport: &str) -> Result<RustClient, String> {
-        let seams = &request.test_seams;
+    pub(crate) fn local(seams: &TestSeams, transport: &str) -> Result<RustClient, String> {
         let local = local_transport(transport, seams.remote_ssh.as_deref())?;
         Ok(RustClient::over(Some(Box::new(local)), seams))
     }
@@ -282,6 +279,14 @@ fn found(slot: &mut Option<Box<dyn Transport>>) -> Result<&mut dyn Transport, St
 impl RemoteClient for RustClient {
     fn hold_key(&self, call: &RemoteCall<'_>) -> Result<Option<OwnedMutexGuard>, Option<String>> {
         hold_key(call).map(Some)
+    }
+
+    fn hold_key_waiting(&self, call: &RemoteCall<'_>, wait: Duration) -> Result<KeyWait, String> {
+        Ok(match hold_key_waiting(call, wait)? {
+            KeyHold::Held(held) => KeyWait::Held(Some(held)),
+            KeyHold::Busy => KeyWait::Busy,
+            KeyHold::Interrupted => KeyWait::Interrupted,
+        })
     }
 
     /// Looks for ssh on the routed attempt's first need of it, so a run that cannot find it falls back `client` before
@@ -3984,7 +3989,7 @@ mod tests {
         fs::rename(pair.folder("lib"), &moved).expect("the sibling can be moved");
         junction(&pair.folder("lib"), &moved);
         let log = pair.top.join("out.log");
-        let call = pair_call(&run, carried(&run).expect("the run's siblings check"), &log);
+        let call = pair_call(&run, carried(&run.root, &run.siblings).expect("the run's siblings check"), &log);
         let transport = nowhere();
         let mut attempt = attempt(&call, &transport);
 
@@ -4002,7 +4007,7 @@ mod tests {
         let pair = Pair::new("client-busy", &["lib"]);
         let run = pair.run(&pair.root, &["lib"]);
         let log = pair.top.join("out.log");
-        let call = pair_call(&run, carried(&run).expect("the run's siblings check"), &log);
+        let call = pair_call(&run, carried(&run.root, &run.siblings).expect("the run's siblings check"), &log);
         let (release, holder) = held_elsewhere(&lock_name(&STATE, &run.siblings[0].root));
         let transport = nowhere();
         let mut attempt = attempt(&call, &transport);
@@ -4065,7 +4070,7 @@ mod tests {
     fn pair_phases(pair: &Pair, names: &[&str], tamper: Option<&str>) -> Result<End, End> {
         let run = pair.run(&pair.root, names);
         let log = pair.top.join("out.log");
-        let call = pair_call(&run, carried(&run).expect("the run's siblings check"), &log);
+        let call = pair_call(&run, carried(&run.root, &run.siblings).expect("the run's siblings check"), &log);
         let transport = nowhere();
         let mut attempt = attempt(&call, &transport);
         attempt.tamper = tamper;
@@ -4201,7 +4206,7 @@ mod tests {
         repositories(&pair, &["lib"]);
         let run = pair.run(&pair.root, &["lib"]);
         let log = pair.top.join("out.log");
-        let call = pair_call(&run, carried(&run).expect("the run's siblings check"), &log);
+        let call = pair_call(&run, carried(&run.root, &run.siblings).expect("the run's siblings check"), &log);
         let transport = nowhere();
         let (mut attempt, repos) = held_pair(&call, &transport);
         misplaced(&mut attempt, &pair);
@@ -4221,7 +4226,7 @@ mod tests {
         repositories(&pair, &["lib"]);
         let run = pair.run(&pair.root, &["lib"]);
         let log = pair.top.join("out.log");
-        let call = pair_call(&run, carried(&run).expect("the run's siblings check"), &log);
+        let call = pair_call(&run, carried(&run.root, &run.siblings).expect("the run's siblings check"), &log);
         let transport = nowhere();
         let (mut attempt, repos) = held_pair(&call, &transport);
         attempt.snapshots(&repos).expect("the snapshots are taken");
@@ -4243,7 +4248,7 @@ mod tests {
         let main = linked_worktrees(&pair, &["lib"]);
         let run = pair.run(&pair.root, &["lib"]);
         let log = pair.top.join("out.log");
-        let call = pair_call(&run, carried(&run).expect("the run's siblings check"), &log);
+        let call = pair_call(&run, carried(&run.root, &run.siblings).expect("the run's siblings check"), &log);
         let transport = nowhere();
         let (mut attempt, repos) = held_pair(&call, &transport);
 
@@ -4284,7 +4289,7 @@ mod tests {
         let helper = format!("url.ext::touch {} .pushInsteadOf", marker.to_string_lossy().replace('\\', "/"));
         let run = pair.run(&pair.root, &["lib"]);
         let log = pair.top.join("out.log");
-        let call = pair_call(&run, carried(&run).expect("the run's siblings check"), &log);
+        let call = pair_call(&run, carried(&run.root, &run.siblings).expect("the run's siblings check"), &log);
         let transport = nowhere();
         let target = transport
             .push_target(call.host, call.repo)
@@ -4308,7 +4313,7 @@ mod tests {
         repositories(&pair, &["lib"]);
         let run = pair.run(&pair.root, &["lib"]);
         let log = pair.top.join("out.log");
-        let call = pair_call(&run, carried(&run).expect("the run's siblings check"), &log);
+        let call = pair_call(&run, carried(&run.root, &run.siblings).expect("the run's siblings check"), &log);
         let transport = nowhere();
         let (mut attempt, repos) = held_pair(&call, &transport);
         attempt.snapshots(&repos).expect("the snapshots are taken");
@@ -6682,7 +6687,7 @@ mod tests {
         let pair = Pair::new("client-one-clock", &["lib"]);
         let run = pair.run(&pair.root, &["lib"]);
         let log = pair.top.join("out.log");
-        let call = pair_call(&run, carried(&run).expect("the run's siblings check"), &log);
+        let call = pair_call(&run, carried(&run.root, &run.siblings).expect("the run's siblings check"), &log);
         let transport = nowhere();
         let mut attempt = attempt(&call, &transport);
         attempt.one_call = Some(OneCall {
@@ -6716,7 +6721,7 @@ mod tests {
         let pair = Pair::new("client-push-sum", &["lib"]);
         let run = pair.run(&pair.root, &["lib"]);
         let log = pair.top.join("out.log");
-        let call = pair_call(&run, carried(&run).expect("the run's siblings check"), &log);
+        let call = pair_call(&run, carried(&run.root, &run.siblings).expect("the run's siblings check"), &log);
         let transport = nowhere();
         let mut attempt = attempt(&call, &transport);
         let repos = attempt.repos();
@@ -6742,7 +6747,7 @@ mod tests {
         fs::write(&program, b"").expect("the stand-in ssh can be written");
         let run = pair.run(&pair.root, &["lib"]);
         let log = pair.top.join("out.log");
-        let call = pair_call(&run, carried(&run).expect("the run's siblings check"), &log);
+        let call = pair_call(&run, carried(&run.root, &run.siblings).expect("the run's siblings check"), &log);
         let ssh = Ssh { program: program.clone() };
         let mut client = RustClient::over(Some(Box::new(ssh)), &TestSeams::default());
 

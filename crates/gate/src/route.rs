@@ -9,7 +9,7 @@ use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use gate_args::{RunRequest, Slot};
+use gate_args::{RunRequest, Slot, TestSeams};
 use gate_router::{Config, ConfigProblem, Facts, FolderId, Inputs, LocalReason, Place, Route, SiblingFolder, decide};
 use gate_win32::Share;
 use windows_sys::Win32::Storage::FileSystem::{
@@ -77,13 +77,7 @@ pub(crate) fn route(request: &RunRequest, environment: &Environment, covering_pa
         git_hook: environment.git_index_file.as_deref().is_some_and(|value| !value.is_empty()),
         words: &words,
     };
-    let machine = Machine {
-        folder: std::env::current_dir(),
-        local_app_data: environment.local_app_data.as_deref(),
-        git_limit: git::limit(&request.test_seams),
-        git_drain: git::drain(&request.test_seams),
-        found: RefCell::new(Placed::NotAsked),
-    };
+    let machine = Machine::new(environment, &request.test_seams);
     let route = match decide(&inputs, &machine) {
         Route::Routed(_) if !unicode => Route::Local {
             reason: Some(LocalReason::Failed {
@@ -147,7 +141,7 @@ pub(crate) fn remote_json_path(local_app_data: Option<&OsStr>) -> Option<PathBuf
 /// This machine's facts: the gate's working folder, or why it cannot be read, the LOCALAPPDATA folder that holds the
 /// routing file, how long each of the decision's git calls may take, how long its readers get once git has exited, and
 /// what git said of the gate's place when the decision asked.
-struct Machine<'a> {
+pub(crate) struct Machine<'a> {
     folder: io::Result<PathBuf>,
     local_app_data: Option<&'a OsStr>,
     git_limit: Duration,
@@ -155,9 +149,20 @@ struct Machine<'a> {
     found: RefCell<Placed>,
 }
 
-impl Machine<'_> {
+impl<'a> Machine<'a> {
+    /// The facts of the gate's working folder now, with `environment`'s LOCALAPPDATA and the git limits `seams` set.
+    pub(crate) fn new(environment: &'a Environment, seams: &TestSeams) -> Machine<'a> {
+        Machine {
+            folder: std::env::current_dir(),
+            local_app_data: environment.local_app_data.as_deref(),
+            git_limit: git::limit(seams),
+            git_drain: git::drain(seams),
+            found: RefCell::new(Placed::NotAsked),
+        }
+    }
+
     /// The decision's git call in `folder` with `args`, under the decision's limit and drain.
-    fn git_call<'a>(&self, folder: &'a Path, args: &'a [&'a str]) -> git::Call<'a> {
+    fn git_call<'b>(&self, folder: &'b Path, args: &'b [&'b str]) -> git::Call<'b> {
         git::Call {
             drain: self.git_drain,
             ..git::Call::plain(folder, args, self.git_limit)

@@ -247,7 +247,7 @@ fn say_nesting(nesting: &Nesting, request: &RunRequest, console: &mut Console) {
 /// and the client a routed run calls.
 fn ready(request: &RunRequest, at: &Where<'_>, console: &mut Console) -> Result<(Plan, Box<dyn RemoteClient>), NotRun> {
     let plan = Plan::prepare(request, &request.command, at, console)?;
-    let client = remote::chosen(request).map_err(NotRun::failed)?;
+    let client = remote::chosen(&request.test_seams).map_err(NotRun::failed)?;
     Ok((plan, client))
 }
 
@@ -632,7 +632,7 @@ struct CallParts<'r> {
 ///
 /// Why a sibling the route carries fails its check again ([`remote::carried`]); no call is made then.
 fn call_of<'r>(parts: CallParts<'r>, remote: &'r RemoteRun) -> Result<RemoteCall<'r>, String> {
-    let siblings = remote::carried(remote)?;
+    let siblings = remote::carried(&remote.root, &remote.siblings)?;
     let CallParts {
         request,
         figures: Figures { ceiling, usual },

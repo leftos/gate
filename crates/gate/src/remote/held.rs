@@ -437,7 +437,7 @@ pub(super) mod tests {
 
     /// Holds the folders of `run`, its leaf `app`.
     fn hold(run: &RemoteRun) -> Result<Held, NotHeld> {
-        let siblings = carried(run).expect("the run's siblings check");
+        let siblings = carried(&run.root, &run.siblings).expect("the run's siblings check");
         Held::hold(&run.root, run.root_id, "app", &siblings)
     }
 

@@ -514,7 +514,8 @@ fn eligible(inputs: &Inputs<'_>, facts: &dyn Facts) -> Result<Config, Here> {
 
 /// Whether the command can never route: it has no non-empty word, or its first one is `git` or `prek`, however
 /// spelled (`git.exe`, a full path to it).
-fn stays_local(words: &[String]) -> bool {
+#[must_use]
+pub fn stays_local(words: &[String]) -> bool {
     first_word(words).is_none_or(|(_, word)| {
         let stem = file_stem(word);
         eq_ignoring_case(stem, "git") || eq_ignoring_case(stem, "prek")

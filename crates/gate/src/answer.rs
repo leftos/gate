@@ -33,6 +33,7 @@ pub(crate) fn answer(args: Vec<OsString>, environment: &Environment, console: &m
         Ok(Invocation::Cutover(request)) => crate::cutover::cutover(&request, environment, console),
         Ok(Invocation::Push(request)) => crate::push::push(&request, environment, console),
         Ok(Invocation::Check(request)) => crate::check::check(&request, console),
+        Ok(Invocation::Warm(request)) => crate::warm::warm(&request, environment, console),
         Ok(Invocation::Burn(request)) => crate::burn::burn(&request, console),
         Ok(Invocation::Expect(request)) => u32::from(expect(&request, environment, console)),
         Ok(Invocation::Box(request)) => crate::boxside::answer(&request, console),
@@ -82,7 +83,7 @@ const ERROR_DIRECTORY: i32 = 267;
 /// and the state root are made absolute, which stay the caller's, and before any slot is taken. Only a folder on a
 /// drive is entered: a UNC, verbatim or device path is refused before any filesystem call. Each line names the flag as
 /// the caller spelled it.
-fn enter(cd: Option<&Path>, spelling: Spelling) -> Result<(), String> {
+pub(crate) fn enter(cd: Option<&Path>, spelling: Spelling) -> Result<(), String> {
     let Some(given) = cd else {
         return Ok(());
     };
@@ -90,14 +91,15 @@ fn enter(cd: Option<&Path>, spelling: Spelling) -> Result<(), String> {
         Spelling::Cli => "--cd",
         Spelling::Compat => "-Cd",
     };
-    let cannot = |error: &io::Error| format!("gate: cannot run in {flag} {}: {error}", given.display());
+    let shown = gate_router::escaped(&given.to_string_lossy());
+    let cannot = |error: &io::Error| format!("gate: cannot run in {flag} {shown}: {error}");
     let folder = std::path::absolute(given).map_err(|error| cannot(&error))?;
     if !on_a_drive(&folder) {
-        return Err(format!("gate: {flag} {} is not a folder on a drive", given.display()));
+        return Err(format!("gate: {flag} {shown} is not a folder on a drive"));
     }
     std::env::set_current_dir(&folder).map_err(|error| {
         if is_not_a_folder(&error) {
-            format!("gate: {flag} {} is not a folder", given.display())
+            format!("gate: {flag} {shown} is not a folder")
         } else {
             cannot(&error)
         }

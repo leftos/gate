@@ -14,7 +14,7 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::time::Duration;
 
-use gate_args::RunRequest;
+use gate_args::TestSeams;
 use gate_router::FolderId;
 use gate_state::v1::WarmFailure;
 use gate_state::{FallbackReason, StateRoot, Verdict};
@@ -176,6 +176,13 @@ pub(crate) trait RemoteClient {
         Ok(None)
     }
 
+    /// Takes the lock of the call's work-folder key as [`RemoteClient::hold_key`] does, waiting up to `wait` for another
+    /// holder to let it go: `Held(None)` for a client that takes none. `Err` with the line saying why it could not be
+    /// opened or taken.
+    fn hold_key_waiting(&self, _call: &RemoteCall<'_>, _wait: Duration) -> Result<KeyWait, String> {
+        Ok(KeyWait::Held(None))
+    }
+
     /// Whether the client can start, checked before the run takes a key lock, a ticket or a remote slot. `Err` with why
     /// a part it starts is missing, which the run's `client` fallback line names as it falls back at once.
     fn ready(&mut self) -> Result<(), String> {
@@ -184,6 +191,16 @@ pub(crate) trait RemoteClient {
 
     /// Runs the call to its end, or to its refusal, on the run's thread.
     fn run(&mut self, call: &RemoteCall<'_>) -> RemoteOutcome;
+}
+
+/// How a client's wait for the work-folder key's lock ended.
+pub(crate) enum KeyWait {
+    /// The lock is held, its guard `None` for a client that takes none.
+    Held(Option<OwnedMutexGuard>),
+    /// Another holder still had it at the end of the wait.
+    Busy,
+    /// The console interrupt was raised during the wait.
+    Interrupted,
 }
 
 /// What the client is asked to run, and where: the route's facts, the run's log and limits, and the interrupt that
@@ -244,10 +261,7 @@ pub(crate) struct RemoteCall<'a> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(
     not(all(test, feature = "test-seams")),
-    expect(
-        dead_code,
-        reason = "no run asks for warmth and nothing starts a warm-up; only the client's tests make such a call"
-    )
+    expect(dead_code, reason = "no run asks for warmth; only the client's tests make such a call")
 )]
 pub(crate) enum Warmth<'a> {
     Unasked,
@@ -288,10 +302,6 @@ pub(crate) struct RemoteOutcome {
     /// never from the log. `None` for any other end, a kill of the client's own included.
     pub box_killed: Option<BoxKill>,
     /// How a warm-up ended; `None` for a call that is no warm-up.
-    #[cfg_attr(
-        not(feature = "test-seams"),
-        expect(dead_code, reason = "nothing starts a warm-up, so only the scripted client of the test seams sets this")
-    )]
     pub warm: Option<WarmEnd>,
 }
 
@@ -341,33 +351,32 @@ fn say<S: AsRef<str>>(log: &Path, lines: &[S], mut stream: impl Write) -> Result
     stream.flush().map_err(|error| format!("cannot say a line: {error}"))
 }
 
-/// The client `request` names: the one of `--test-remote-snapshot`, else the Rust client of `--test-remote-transport`,
+/// The client `seams` name: the one of `--test-remote-snapshot`, else the Rust client of `--test-remote-transport`,
 /// else the scripted one of `--test-remote-client`, else the Rust client over ssh; or the line saying why its
 /// transport or its step file cannot be used.
 #[cfg(feature = "test-seams")]
-pub(crate) fn chosen(request: &RunRequest) -> Result<Box<dyn RemoteClient>, String> {
-    if request.test_seams.remote_snapshot {
-        let limit = git::limit(&request.test_seams);
+pub(crate) fn chosen(seams: &TestSeams) -> Result<Box<dyn RemoteClient>, String> {
+    if seams.remote_snapshot {
+        let limit = git::limit(seams);
         return Ok(Box::new(snapshot_only::SnapshotOnly { limit }));
     }
-    if let Some(transport) = &request.test_seams.remote_transport {
-        return client::RustClient::local(request, transport).map(|client| Box::new(client) as Box<dyn RemoteClient>);
+    if let Some(transport) = &seams.remote_transport {
+        return client::RustClient::local(seams, transport).map(|client| Box::new(client) as Box<dyn RemoteClient>);
     }
-    let seams = &request.test_seams;
     if let Some(path) = &seams.remote_client {
         return scripted::ScriptedClient::load(path).map(|client| Box::new(client) as Box<dyn RemoteClient>);
     }
     Ok(Box::new(client::RustClient::ssh(seams)))
 }
 
-/// The client `request` names: the Rust client over ssh, in a gate built without the test seams.
+/// The client `seams` name: the Rust client over ssh, in a gate built without the test seams.
 #[cfg(not(feature = "test-seams"))]
 #[expect(
     clippy::unnecessary_wraps,
     reason = "the signature of the test-seams build, whose step file can fail to load"
 )]
-pub(crate) fn chosen(request: &RunRequest) -> Result<Box<dyn RemoteClient>, String> {
-    Ok(Box::new(client::RustClient::ssh(&request.test_seams)))
+pub(crate) fn chosen(seams: &TestSeams) -> Result<Box<dyn RemoteClient>, String> {
+    Ok(Box::new(client::RustClient::ssh(seams)))
 }
 
 /// The client of `--test-remote-snapshot`: makes the snapshot and bridge commits of each of the call's worktrees, the

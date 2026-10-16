@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use crate::problem::{Problem, Required, Spelling};
 use crate::request::{
     BurnRequest, Ceiling, CheckRequest, CheckSeams, CutoverRequest, CutoverSeams, DEFAULT_STALL_SECONDS, DEFAULT_TAIL_LINES, ExpectRequest,
-    PushRequest, PushSeams, RunRequest, Slot, StopRequest, TestSeams,
+    PushRequest, PushSeams, RunRequest, Slot, StopRequest, TestSeams, WarmRequest,
 };
 use crate::values;
 
@@ -87,6 +87,8 @@ pub(crate) enum ValueOption {
     PushBoundMs,
     #[cfg(feature = "test-seams")]
     ProbeLimitMs,
+    #[cfg(feature = "test-seams")]
+    WarmWaitMs,
 }
 
 /// An option that is on or off.
@@ -94,6 +96,7 @@ pub(crate) enum ValueOption {
 pub(crate) enum SwitchOption {
     NoMarkers,
     Local,
+    Background,
     #[cfg(feature = "test-seams")]
     PrintRequest,
     #[cfg(feature = "test-seams")]
@@ -124,6 +127,10 @@ pub(crate) enum RunOption {
 
 /// The options read so far and the problems found so far.
 #[derive(Default)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each bool is a switch of its own, set or not independently of the others"
+)]
 pub(crate) struct RunBuilder {
     slot: Option<Slot>,
     timeout: Option<Ceiling>,
@@ -136,6 +143,8 @@ pub(crate) struct RunBuilder {
     seconds: Option<u32>,
     no_markers: bool,
     local: bool,
+    /// `gate warm`'s `--background`.
+    background: bool,
     bring_tracked: Vec<String>,
     print_request: bool,
     test_seams: TestSeams,
@@ -298,6 +307,8 @@ impl RunBuilder {
             ValueOption::PushBoundMs => self.push_seams.bound_ms = Some(values::above_zero(spelled, value)?),
             #[cfg(feature = "test-seams")]
             ValueOption::ProbeLimitMs => self.check_seams.probe_limit_ms = Some(values::above_zero(spelled, value)?),
+            #[cfg(feature = "test-seams")]
+            ValueOption::WarmWaitMs => self.test_seams.warm_wait_ms = Some(values::above_zero(spelled, value)?),
         }
         Ok(())
     }
@@ -310,6 +321,7 @@ impl RunBuilder {
         match option {
             SwitchOption::NoMarkers => self.no_markers = on,
             SwitchOption::Local => self.local = on,
+            SwitchOption::Background => self.background = on,
             #[cfg(feature = "test-seams")]
             SwitchOption::PrintRequest => self.print_request = on,
             #[cfg(feature = "test-seams")]
@@ -504,6 +516,26 @@ impl RunBuilder {
                 remote_timeout_ms: self.test_seams.remote_timeout_ms,
                 ..self.check_seams
             },
+        })
+    }
+
+    /// The warm request, its folder, background switch, state root and seams read, or every problem: those found while
+    /// reading, then the remote client's seams that cannot work together, as a run's.
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        expect(unused_mut, reason = "only the test-seams build reads seams that can conflict")
+    )]
+    pub(crate) fn finish_warm(mut self) -> Result<WarmRequest, Vec<Problem>> {
+        #[cfg(feature = "test-seams")]
+        self.check_remote_seams();
+        if !self.problems.is_empty() {
+            return Err(self.problems);
+        }
+        Ok(WarmRequest {
+            cd: self.cd,
+            background: self.background,
+            state_dir: self.state_dir,
+            test_seams: self.test_seams,
         })
     }
 

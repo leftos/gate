@@ -3649,7 +3649,7 @@ mod tests {
         };
         let state = StateRoot::new(r"C:\gate-sync-back-tests", None);
         let mut call = call_in(&root, &case.log, &state);
-        call.siblings = crate::remote::carried(&run).expect("the sibling is carried");
+        call.siblings = crate::remote::carried(&run.root, &run.siblings).expect("the sibling is carried");
         let transport = case.local();
         let mut attempt = Attempt::for_tests(&call, &transport);
 
