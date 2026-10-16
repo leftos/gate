@@ -147,6 +147,19 @@ impl Git {
         Ok(Ran { status, stdout })
     }
 
+    /// Runs git as [`Git::run`] does, with the last [`ERRORS_KEPT`] bytes of its standard error kept beside the call's
+    /// end, for a caller that judges git's status itself and says its errors when it fails.
+    pub(crate) fn run_kept(&self, call: &Call<'_>) -> Result<(Ran, Vec<u8>), GitError> {
+        let mut file = output_file().map_err(|error| GitError::Failed(format!("cannot make a file for git's output: {error}")))?;
+        let into_file = move |mut pipe: File| -> io::Result<File> {
+            io::copy(&mut pipe, &mut file)?;
+            file.seek(SeekFrom::Start(0))?;
+            Ok(file)
+        };
+        let (status, stdout, errors) = self.spawned(call, into_file, |pipe: File| tail(pipe, ERRORS_KEPT), None)?;
+        Ok((Ran { status, stdout }, errors))
+    }
+
     /// Runs git as [`Git::run`] does and returns what it wrote on standard output, read up to [`OUTPUT_CAP`]; else why
     /// the call failed, from the last [`ERRORS_KEPT`] of its standard error.
     pub(crate) fn output(&self, call: &Call<'_>) -> Result<String, GitError> {

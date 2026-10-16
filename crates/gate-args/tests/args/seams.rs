@@ -452,7 +452,7 @@ fn the_remote_client_seams_need_a_value_once() {
 fn the_remote_watch_seams_name_one_call_and_a_ceiling() {
     use crate::support::run_request;
 
-    for call in ["preflight", "push", "run", "ls-remote", "fetch", "outputs"] {
+    for call in ["preflight", "push", "inputs-diff", "inputs", "run", "ls-remote", "fetch", "outputs"] {
         let words = with(
             &RUN,
             &["--test-remote-transport", "local:b", "--test-remote-watch-call", call, "--", "cmd"],
@@ -464,7 +464,7 @@ fn the_remote_watch_seams_name_one_call_and_a_ceiling() {
             &RUN,
             &["--test-remote-transport", "local:b", "--test-remote-watch-call", "stop", "--", "cmd"]
         ))),
-        ["gate: --test-remote-watch-call must be preflight, push, inputs, run, ls-remote, fetch or outputs, got 'stop'"]
+        ["gate: --test-remote-watch-call must be preflight, push, inputs-diff, inputs, run, ls-remote, fetch or outputs, got 'stop'"]
     );
     let words = with(
         &RUN,
@@ -765,7 +765,7 @@ fn the_remote_timeout_seam_needs_a_watched_call_other_than_run() {
     }
     assert_eq!(
         problems(&refs(&given(&["--test-remote-watch-call", "stop", "--test-remote-timeout-ms", "300"]))),
-        ["gate: --test-remote-watch-call must be preflight, push, inputs, run, ls-remote, fetch or outputs, got 'stop'"],
+        ["gate: --test-remote-watch-call must be preflight, push, inputs-diff, inputs, run, ls-remote, fetch or outputs, got 'stop'"],
         "a refused watched call says its own problem alone"
     );
     let fetch = run_request(&refs(&given(&["--test-remote-watch-call", "fetch", "--test-remote-timeout-ms", "300"])));

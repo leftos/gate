@@ -112,7 +112,7 @@ pub(crate) const TAMPERS: &[&str] = &[
 pub(crate) const INTERRUPTED_CALLS: &[&str] = &["preflight", "inputs", "run", "outputs", "install", "sdks", "stop", "manifest", "apply"];
 /// The calls `--test-remote-watch-call` may name.
 #[cfg(feature = "test-seams")]
-pub(crate) const WATCHED_CALLS: &[&str] = &["preflight", "push", "inputs", "run", "ls-remote", "fetch", "outputs"];
+pub(crate) const WATCHED_CALLS: &[&str] = &["preflight", "push", "inputs-diff", "inputs", "run", "ls-remote", "fetch", "outputs"];
 
 /// A call of the remote client a seam names, one of `calls`, as written.
 #[cfg(feature = "test-seams")]

@@ -441,7 +441,11 @@ The lines of a run that starts its command:
 
   The line names each sibling in declared order with its root as routing spells it. While it waits for a remote slot: `gate: waiting for a remote slot on <host> (<n> busy)` and `gate: still waiting for a remote slot on <host> (<s> s)`, as a local wait says them, ETA included.
 
-  A run the builder does not take says why and goes on here: `gate: remote <host> <reason>; running here`, with `<reason>` one of `full` (no remote slot within 60 s), `busy`, `unreachable`, `parity`, `rebooted`, `tools`, `layout` or `version`, and `gate: remote <host> client could not start: <detail>; running here` when the remote client cannot start.
+  A run the builder does not take says why and goes on here: `gate: remote <host> <reason>; running here`, with `<reason>` one of `full` (no remote slot within 60 s), `busy`, `unreachable`, `parity`, `rebooted`, `tools`, `layout`, `version` or `inputs` (the run's ignored inputs could not be sent, or the builder's work folder no longer held them at the run), and `gate: remote <host> client could not start: <detail>; running here` when the remote client cannot start.
+
+  A routed run whose repo declares `inputs` says `gate: inputs: <n> file(s), <X.X> MB (<Y.Y> MB compressed) in <Z.Z> s` once a put has sent files.
+
+  Four lines go to the log only: `gate: inputs: <n> file(s) unchanged` (the manifest's entries, said when the builder needed none), `gate: inputs: <glob> matched nothing`, `gate: inputs: <path> is in the snapshot; not sent as an input` and `gate: inputs: <folder> is another repository; not sent as an input`. The reason of an `inputs` fallback is the log line `gate: remote inputs not sent: <reason>` ([Routing](#routing), Inputs).
 
   A remote part the gate cannot start says the second line before it takes a remote slot when ssh is missing, else after it ([Routing](#routing), The remote client's run).
 
@@ -449,9 +453,9 @@ The lines of a run that starts its command:
 
   A Ctrl+C while the client waits to start ends the gate the same way with no slot to release, and journals an `abandon` after the `queue` line, not a `release`.
 
-  A routed run that passed says `gate: passed in <w> s on <host> (load-adjusted <a> s, ceiling <n> s; command <c> s, push <p> s[, sync-back <s> s][, outputs <o> s]). Full output: <log>`, with `past its ceiling of <n> s` in place of `ceiling <n> s` as the local line has it.
+  A routed run that passed says `gate: passed in <w> s on <host> (load-adjusted <a> s, ceiling <n> s; command <c> s, push <p> s[, inputs <i> s][, sync-back <s> s][, outputs <o> s]). Full output: <log>`, with `past its ceiling of <n> s` in place of `ceiling <n> s` as the local line has it.
 
-  In it `<w>` is the attempt's whole wall time; `<a>` is the load-adjusted time the builder counted for the command, the clock `--timeout` bounds; `<c>` is the run call's own wall time; the push is always named, the sync-back and the outputs fetch only when they ran, in the order they ran, each in whole seconds rounded half to even.
+  In it `<w>` is the attempt's whole wall time; `<a>` is the load-adjusted time the builder counted for the command, the clock `--timeout` bounds; `<c>` is the run call's own wall time; the push is always named, the inputs calls (diff and put together), the sync-back and the outputs fetch only when they ran, in the order they ran, each in whole seconds rounded half to even.
 
   With no figure from the builder (its sampler failed) the clause reads `load-adjusted unknown: the sampler failed` and the past-ceiling check uses `<c>`. The client's status is the gate's own, passed through as `N`.
 - The stale line, on stderr and in the log, before the passed line, when a routed dotnet build (verb `build`, `test`, `publish`, `pack`, `run` or `msbuild`, with no `--no-build` of its own) passed and did not bring everything back: `gate: routed build left stale: <folders>`.
@@ -594,6 +598,7 @@ For any other root, every kernel object name carries `<h>`, the first 8 lower-ca
 | `backfill\<pid>.json` and the backfill bar record | gates | gates | Reserved for backfill guests (GATE-7; [design/gate-durations.md](design/gate-durations.md)). |
 | `remote\<key>.outputs-pending` | the Rust remote client | the same | Empty file. The Rust client writes it after the push and before a routed run's run call when the run has output globs, or when the route withheld its outputs (a dotnet `--no-build` command the builder built; that marker no end clears), so a run refused at the preflight or by the parity check leaves none, removes it after an accepted `gate-remote-outputs: 0`, an install that skipped no file or only files it cannot rewrite, or a refusal of the archive's members for what they are, and sends `OutputsFull` while it stands ([The remote client's run](#routing)). |
 | `remote\<key>.outputs-hashes` | the Rust remote client | the same | The hash cache: one outputs manifest line, `{"files":{"<path>":{"size":…,"modified":…,"sha256":"…"}}}`, of the files of the worktree's last built manifest last written at least 2 s before that build. Saved after each manifest the client builds, and by a complete outputs install (one that skipped no file but ones it cannot rewrite), for the files it put in place, through `<key>.outputs-hashes.<pid>.tmp` and a rename; one that cannot be read, is not a manifest line or is over 64 MiB gives no hash and is replaced by the next save, and deleting the file resets the cache ([The remote client's run](#routing), Manifest time). |
+| `remote\<key>.inputs-hashes` | the Rust remote client | the same | The inputs' hash cache, in the outputs cache's shape and saved as it is, kept apart from it since the outputs saves drop every file the outputs walk no longer finds. Saved after an inputs manifest the client builds changes it; a file whose hash the pack finds wrong is dropped from it, and deleting the file resets the cache ([The remote client's run](#routing), Inputs). |
 | `remote\<key>.nothing-back` | the gate, after a routed dotnet build ends on the builder without its outputs known to be brought back, or, when none stands, a routed dotnet `--no-build` command whose word the builder dropped | every gate (the `--no-build` drop and the clear) | JSON `{"v":1,"host":"…","configuration":"…","framework":"…","runtime":"…"}`; the last three are optional and come from the routed build's own `-c`, `-f` and `-r` words. A passing local build of the whole worktree with the same three removes it, as does a passing routed build of that kind that brought all its outputs back ([Routing](#routing)). Written with create-new and the reparse-point flag, and read the same way, 4096 bytes at most; one that cannot be read counts as present. |
 | `remote\<key>.outputs-capped` | the Rust remote client, at an outputs fetch that passed the fetch cap | the same | The outputs cap record: JSON `{"v":1,"hits":<n>}`, the fetches in a row of that worktree that passed the cap. A second hit in a row fails the run; any other end of its outputs fetch but a Ctrl+C during it, and a box that packed nothing, removes it; one that cannot be read counts no hit ([The remote client's run](#routing), Outputs fetch). |
 `<start>` everywhere in a name is the process start time in Unix epoch milliseconds. Claims, tickets, counts, the nothing-back record and the outputs cap record are written to a temporary sibling (`<file>.<pid>.<n>.tmp`, where `<n>` is a per-process counter so two threads of one process never share one) and moved over the target, so a reader never sees a torn file (kept, L1, Q1).
@@ -782,7 +787,7 @@ Fields beyond J1's:
   `transfer-timed-out` is a routed run's fetch after the command cut at its transfer ceiling.
 
   A routed run is a kill only when the gate killed it; a command that exits 124 on its own is `failed`.
-- `fallback`: `reason`, one of `full` (no remote slot within the 60 s wait), `busy`, `unreachable`, `parity`, `rebooted`, `tools` (T5), `layout` (the box could not clear or lay out its work folder), `version` ([The box side](#the-box-side)) and `client` (the remote client could not start, as when it finds no usable ssh).
+- `fallback`: `reason`, one of `full` (no remote slot within the 60 s wait), `busy`, `unreachable`, `parity`, `rebooted`, `tools` (T5), `layout` (the box could not clear or lay out its work folder), `version` ([The box side](#the-box-side)), `client` (the remote client could not start, as when it finds no usable ssh) and `inputs` (the run's ignored inputs could not be sent, a sibling pair declared inputs, or the box refused the run because its work folder no longer held the inputs sent).
 
   The `take` after it is the run's local one, untagged, its `waitedSeconds` counted from the `fallback`, except after `full`, where it counts from the run's `queue` line; a Ctrl+C that ends that local wait writes the same figure on its `abandon`.
 - a routed run's `take`, `release` and `abandon` carry the tag; its `release` has the builder's `adjustedSeconds` (null when it said none) and a `wallSeconds` of the whole remote call, and the verdict `timed-out` or `backstop` after a kill by the builder or by the client's backstop.
@@ -1477,6 +1482,33 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
     A pair pushes each repo in order, the main one first, under one transfer clock started before the first push, and says `gate: remote pushed snapshot <repo> <8 hex> in <s> s (<size>|up to date)` for each; a failure says `gate: pushing the snapshot of <repo> to <url> failed (status <n>)`. The run's push time is the pushes' sum.
 
     The push is given `GIT_ALLOW_PROTOCOL`, `ssh` (`file` for the test transport's local bare repositories), which git reads in place of every `protocol.*.allow`, so no `pushInsteadOf` or protocol setting a repository's config names can turn the push into a protocol helper's.
+  - **Inputs.** In `remote/inputs.rs`, for a run whose repo declares `inputs`; a run without them builds no manifest, makes no inputs call and says nothing. The manifest is built before the preflight: the files the globs match, kept when `git check-ignore` reports them ignored, each hashed once (the hash cache below), so a refusal at the preflight or the parity check sends nothing.
+
+    The calls are made after the push and before the run call, and the run call's request carries `InputsDigest`, the SHA-256 of the manifest line.
+
+    The diff call (`gate box inputs`, `Step` `diff`) is fed the request and the manifest line and answers the paths whose copy is missing or differs. The put call (`Step` `put`) is made only when the diff named a file, fed the request, the manifest line and then an archive of exactly those files, in the outputs archive's format. A diff that names none says `gate: inputs: <n> file(s) unchanged` in the log.
+
+    A glob that matches nothing, a match git does not report ignored (it is in the snapshot) and a file inside a folder holding a `.git` of its own (another repository, which git cannot be asked about) are each said in the log and skipped.
+
+    Never sent, whatever the globs: any `.git` path, `.lfsconfig`, `.env`, `*.env`, `.env.<name>` and `.envrc` at any depth, matched without regard to case, the gate's own archives and stages under `.tmp` (named for the work folder's key) and the run's own log and `.err` file, found by canonical path. `.tmp` is otherwise reachable.
+
+    Caps: 50,000 members and a 64 MiB manifest, counted on what the globs match, and 4 GiB per put, counted on the files the diff named (`--test-remote-inputs-budget-bytes` replaces the 4 GiB). A set past a cap is not sent. A file that changes between its hashing and its packing is not sent either, and its entry is dropped from the hash cache.
+
+    The hash cache is `remote\<key>.inputs-hashes` in the state root, beside the outputs one and apart from it, since the outputs saves drop every file the outputs walk no longer finds. It holds the manifest line of the last built manifest's files last written well before that build, is saved when a build changes it, and is the same shape and rules as the outputs cache ([Manifest time](#routing)). There is no PC record of what the builder holds: the diff call is the truth.
+
+    The worktree's `.tmp` is held through the step. The diff's answer (`<key>-<nonce>.inputs-diff`) and the archive (`<key>-<nonce>.inputs.tar.zst`) are made new there, opened by handle with delete-on-close, so a gate killed outright leaves none, and each put attempt reads the archive at a position of its own.
+
+    The diff is watched as a fetch is, by the stall window on its output and its own transfer ceiling (1800 s) counted from its own start. The put is watched while the archive is being fed by the later of the last byte fed and the last byte of output, and once it is fully fed by the transfer ceiling alone, since the builder installs without a word. Either call is made once more when it failed before the banner.
+
+    Any failure of either call refuses the route with reason `inputs`: console `gate: remote <host> inputs; running here`, log `gate: remote inputs not sent: <reason>` and the run goes on here.
+
+    The reasons include `the box named <path> twice`, `the put stalled: no bytes sent or received for <n> s`, `the put passed its transfer ceiling of <n> s`, `the diff stalled: no output for <n> s`, `the diff passed its transfer ceiling of <n> s`, `git check-ignore failed: status <n>: <git's stderr>`, the builder's last error line, a count the builder installed other than the one sent, and a manifest or put past a cap.
+
+    A cut call says no `STALLED` or `TRANSFER TIMED OUT` line, since the log scan would fail the run here after the fallback. A run the box refuses with the `inputs` tag (its work folder no longer holds the inputs sent) falls back the same way, saying `the builder's work folder does not hold the inputs sent`.
+
+    A Ctrl+C during the step ends the run as an interrupt with no fallback. A call whose input could not be fed logs `gate: the inputs call's input was not sent: <error>`.
+
+    A sibling pair whose repos declare inputs is refused with reason `inputs` and `a sibling pair does not send inputs yet`, before any inputs call. `--test-remote-watch-call inputs-diff` names the diff and `inputs` the put; `--test-remote-interrupt-at inputs` raises the interrupt after the put's or diff's first output byte.
   - **Run call.** The line goes over `ssh -o RequestTTY=no -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=4 -o ForwardAgent=no -o ClearAllForwardings=yes -o Compression=yes -- <host> <line>`, each argument separate.
 
     `-o RequestTTY=no` leads the options of every `gate box` call and `gate push`'s, so stdin never passes through a pseudo-terminal. The last option, `-o Compression=yes`, is the run call's alone: the preflight, stop, boot and outputs calls, git's ssh command and `gate push` ask for none. The run call's compression covers both directions of its connection: the command's output and protocol lines one way, the request and the outputs manifest the other.
@@ -1845,9 +1877,9 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
   The design is [plans/remote-inputs.md](plans/remote-inputs.md).
 
-  Built so far: the `inputs` key and the route's `RemoteRun.inputs`, and the box's `inputs` verb with the run's `InputsDigest` check ([The box side](#the-box-side)). Not reached: the client's two `inputs` calls before the run call, its hash cache, its console and log lines and the `inputs` fallback reason, so a routed run sends no input yet.
+  Built: the `inputs` key and the route's `RemoteRun.inputs`, the box's `inputs` verb with the run's `InputsDigest` check ([The box side](#the-box-side)), and the client's part (the manifest, the diff and put calls, the hash cache, the lines and the `inputs` fallback reason), described under Inputs in [The remote client's run](#routing).
 
-  Inputs have their own exclusion set, not the outputs': `.tmp/` is reachable, but a client never sends a path with a `.git` component, `.lfsconfig`, `.env` or `*.env`, the gate's own archives and stages, or the run's log and `.err` file (the client's walk is the part not reached). The box refuses a manifest that names a `.git*` name, `.lfsconfig` or a `.env` file, or a path that is not plain and relative.
+  Inputs have their own exclusion set, not the outputs': `.tmp/` is reachable, but a client never sends a path with a `.git` component, `.lfsconfig`, `.env`, `*.env`, `.env.<name>` or `.envrc` (at any depth, matched without regard to case), the gate's own archives and stages, or the run's log and `.err` file. The box refuses a manifest that names a `.git*` name, `.lfsconfig` or a `.env` file, or a path that is not plain and relative.
 - **The per-host failure record** (GATE-27), planned, not built: a record in the state root holds a builder's failure reason and an expiry. A routed gate that finds an unexpired record says `gate: not routed: <host> <reason> <n> s ago`, runs here and journals `fallback` with the reason, rather than paying the snapshot, preflight and push again for the same reason.
 
   The windows per reason: `unreachable` a short one (60 s, distcc's default backoff); `parity` and `tools` until the snapshot's `global.json` or tool manifests change; `busy` and `full` are load, not faults, and are never recorded.
@@ -2028,7 +2060,7 @@ Built verbs:
 
   Otherwise the run is refused with `gate-remote-refused: <nonce> inputs` then `gate: remote inputs of work folder <key> are not the ones sent: <why>`, said together under the output lock, the command never started, and exit 75. A folder moved aside from the exclude file's name says its `moved aside` line, under the lock.
 
-  A payload without `InputsDigest` skips the check. The PC does not yet read the `inputs` tag; the client is not reached.
+  A payload without `InputsDigest` skips the check. The PC reads the `inputs` tag as fallback reason `inputs` and says `gate: remote <host> inputs; running here`, with `gate: remote inputs not sent: the builder's work folder does not hold the inputs sent` in the log.
 
   The steps are the layout, fetch, the commit probe, checkout, clean and the back ref reset (each of the three git steps once per repo on a pair run, the main repo first), the dotnet tool restore, then the command, then the sync-back. A failing step prints `gate: remote <fetch|checkout|clean|back ref reset> failed (status <n>)` and exits `n`.
 
@@ -2204,7 +2236,7 @@ Built verbs:
 
   The root, the stages folder and the stage are held without delete sharing for the whole put, and the stage is removed beneath its handle on every way out; a stage older than a day (any work folder's) is removed by the next put, a stage that cannot be opened or removed says so and stays (`gate: remote kept the stage <path>: <why>`, `gate: remote could not remove the old stage <path>: <error>`).
 
-  Caps: an archive of more than 50,000 members, or that decompresses to more than 4 GiB (`--test-inputs-budget-bytes` replaces it), is refused as the outputs archive's are, and the put fails (`gate: remote inputs put failed: <why>`, exit 1). The step is not watched on the box; the PC's deadline and stall counting for it are the client's part, not reached.
+  Caps: an archive of more than 50,000 members, or that decompresses to more than 4 GiB (`--test-inputs-budget-bytes` replaces it), is refused as the outputs archive's are, and the put fails (`gate: remote inputs put failed: <why>`, exit 1). The step is not watched on the box; the PC watches both calls ([The remote client's run](#routing), Inputs).
 
   Deployment prerequisites: the folders above `<root>` are writable by Administrators only; no account outside SYSTEM, Administrators and the builder's user may write in `<root>`; and `<root>\work` is not writable by other accounts. The stage's protection and the beneath-handle walk assume it; the box checks the stages folder it adopts, not the folders above it.
 
@@ -2431,7 +2463,7 @@ A Rust integration suite drives the built `gate.exe` through its CLI and reads o
 
   `--test-remote-bound-ms <n>` (whole milliseconds above 0) replaces the 30 s bound of the client's `stop` and `boot` calls.
 
-  `--test-remote-interrupt-at <preflight|run|outputs|install|sdks|stop|manifest|apply>` makes the client raise the console interrupt itself after that call's first output byte; `install` raises it before the second file's move, so an install of one file is never interrupted, and `sdks` just before the parity check reads this PC's SDK list with `dotnet --list-sdks`; `manifest` just before it reads the snapshot's `.gate/toolchain.toml`; `apply` once a pair's sync-back has checked every patch and before it applies the first (no output byte is waited for); `stop` raises it at the run call's first byte and again while the stop call runs.
+  `--test-remote-interrupt-at <preflight|inputs|run|outputs|install|sdks|stop|manifest|apply>` makes the client raise the console interrupt itself after that call's first output byte (for `inputs`, the first of either inputs call); `install` raises it before the second file's move, so an install of one file is never interrupted, and `sdks` just before the parity check reads this PC's SDK list with `dotnet --list-sdks`; `manifest` just before it reads the snapshot's `.gate/toolchain.toml`; `apply` once a pair's sync-back has checked every patch and before it applies the first (no output byte is waited for); `stop` raises it at the run call's first byte and again while the stop call runs.
 
   `--test-remote-backstop-ms <n>` (whole milliseconds above 0) replaces the run call's backstop of 5 x `--timeout` + 60 s for the client, counted from the run call's start.
 
@@ -2445,11 +2477,13 @@ A Rust integration suite drives the built `gate.exe` through its CLI and reads o
 
   `--test-remote-timeout-ms <n>` (whole milliseconds above 0) applies only under `--test-remote-watch-call` naming a call other than `run`, as that call's transfer ceiling; given with `--test-remote-transport` without such a call it is refused with `gate: --test-remote-timeout-ms needs --test-remote-watch-call naming a call other than run`.
 
-  `--test-remote-watch-call <preflight|push|run|ls-remote|fetch|outputs>` makes `--test-stall-ms` and `--test-remote-timeout-ms` apply to that one call alone, its limit counted from the call's own start, every other call keeping the run's own window and limits. For `run` only the stall seam applies (the backstop has its own seam); for any other call `--test-remote-timeout-ms` is that call's transfer ceiling.
+  `--test-remote-watch-call <preflight|push|inputs-diff|inputs|run|ls-remote|fetch|outputs>` makes `--test-stall-ms` and `--test-remote-timeout-ms` apply to that one call alone, its limit counted from the call's own start, every other call keeping the run's own window and limits. For `run` only the stall seam applies (the backstop has its own seam); for any other call `--test-remote-timeout-ms` is that call's transfer ceiling.
 
-  With `ls-remote`, `--test-remote-timeout-ms` is that call's deadline and `--test-stall-ms` alone leaves it on the git limit. With `fetch`, the stall and ceiling seams apply to the fetch alone; with `outputs`, to the outputs fetch alone.
+  With `ls-remote`, `--test-remote-timeout-ms` is that call's deadline and `--test-stall-ms` alone leaves it on the git limit. With `fetch`, the stall and ceiling seams apply to the fetch alone; with `outputs`, to the outputs fetch alone; with `inputs-diff`, to the inputs' diff call alone, and with `inputs`, to the inputs' put call alone, whose stall window counts the later of the last byte fed and the last byte of output while the archive is being fed.
 
-  A value outside a seam's calls says `gate: --test-remote-watch-call must be preflight, push, run, ls-remote, fetch or outputs, got '<v>'`, and `--test-remote-interrupt-at` says `must be preflight, run, outputs, install, sdks, stop, manifest or apply`. The five (with `--test-remote-backstop-ms`) need the transport; `--test-print-request` shows them as `testSeams.remoteBoundMs`, `remoteInterruptAt`, `remoteWatchCall`, `remoteTimeoutMs` and `remoteBackstopMs`, after `remoteRetryPauseMs`.
+  A value outside a seam's calls says `gate: --test-remote-watch-call must be preflight, push, inputs-diff, inputs, run, ls-remote, fetch or outputs, got '<v>'`, and `--test-remote-interrupt-at` says `must be preflight, inputs, run, outputs, install, sdks, stop, manifest or apply`.
+
+  The five (with `--test-remote-backstop-ms`) need the transport; `--test-print-request` shows them as `testSeams.remoteBoundMs`, `remoteInterruptAt`, `remoteWatchCall`, `remoteTimeoutMs` and `remoteBackstopMs`, after `remoteRetryPauseMs`.
 
   `--test-remote-fetch-cap-bytes <n>` (a whole number of bytes above 0, default 4 GiB) replaces the cap on what the sync-back fetch's job may write. Refused without the transport with `gate: --test-remote-fetch-cap-bytes needs --test-remote-transport`, and a value that is not a whole number above 0 with `gate: --test-remote-fetch-cap-bytes must be a whole number above 0, got '<v>'`. `--test-print-request` does not show it.
 
@@ -2458,6 +2492,8 @@ A Rust integration suite drives the built `gate.exe` through its CLI and reads o
   `--test-remote-outputs-budget-bytes <n>` (a whole number of bytes above 0, default the 50 GiB outputs budget) lowers the budget behind both the outputs fetch cap and the install's unpack limit.
 
   Refused without the transport with `gate: --test-remote-outputs-budget-bytes needs --test-remote-transport`, and a value that is not a whole number above 0 with `gate: --test-remote-outputs-budget-bytes must be a whole number above 0, got '<v>'`. `--test-print-request` shows it as `testSeams.remoteOutputsBudgetBytes` (null unless given), after `remoteTimeoutMs`; the fetch-cap and apply-cap seams are not shown.
+
+  `--test-remote-inputs-budget-bytes <n>` (a whole number of bytes above 0, default the 4 GiB one put of inputs may total) lowers that budget: a set the diff names past it is not sent, and the run falls back `inputs`. It is refused without the transport with `gate: --test-remote-inputs-budget-bytes needs --test-remote-transport`, and `--test-print-request` shows it as `testSeams.remoteInputsBudgetBytes` (null unless given), after `remoteOutputsBudgetBytes`.
 
   `--test-remote-log-cap-bytes <n>` (a whole number of bytes above 0, default 256 MiB) lowers the log cap, the most bytes of one call's output the client writes to the gate's log.
 
@@ -2503,7 +2539,7 @@ A Rust integration suite drives the built `gate.exe` through its CLI and reads o
 
   They also include `ok-then-out <line>` (as `ok`, then writes the line on stdout), `say-exit <n> <line>` (writes the line on stderr and exits `<n>`, as a call that fails with a line of its own does).
 
-  They also include `flood <n>`, `say-hold <word> <path>` `progress-ok <n>`, `truncate <n>` (passes `<n>` stdout bytes, writes `Connection timed out during banner exchange` on stderr and exits 255), `garbage <n>` and `bytes-hold <n> <path>`.
+  They also include `fed-hold <path>` (reads its whole stdin and keeps it as `<steps file>.input`, then waits for `<path>`, then runs the call as `ok` does fed what it read, so the call's input has all been sent before the call does anything), `flood <n>`, `say-hold <word> <path>` `progress-ok <n>`, `truncate <n>` (passes `<n>` stdout bytes, writes `Connection timed out during banner exchange` on stderr and exits 255), `garbage <n>` and `bytes-hold <n> <path>`.
 
   A line that starts `pwsh ` and holds `-EncodedCommand` is a `gate push` call (`push` in its call log): `ok` runs it with the local `pwsh`, `LOCALAPPDATA` set to `<GATE_FAKE_SSH_BUILDERS>\<host>`, so each builder is a folder the case owns. Started with `--version` alone, `fake-ssh` answers `gate 0.0.0-old`, the stand-in for an older gate on a builder.
 

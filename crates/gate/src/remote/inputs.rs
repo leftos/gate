@@ -1,25 +1,29 @@
 //! A routed run's ignored inputs on the PC: the files under its repo's input globs that git reports ignored in the
 //! worktree, hashed into the inputs manifest before anything is sent, each file whose stamp the inputs hash cache holds
 //! taking its hash from it. The globs are relative to the worktree root, `/`-separated and matched without regard to
-//! case, as output globs are, with the inputs' own exclusions: any `.git*` path, a `.lfsconfig`, a `.env` or `*.env`
-//! file, the gate's own archives and stages under `.tmp` (named for the work folder's key) and the run's own log and
-//! `.err` file are never sent. A match git does not report ignored is in the snapshot, and is skipped with a line.
+//! case, as output globs are, with the inputs' own exclusions: any `.git*` path, a `.lfsconfig`, a `.env`, `*.env`,
+//! `.env.<name>` or `.envrc` file, the gate's own archives and stages under `.tmp` (named for the work folder's key) and
+//! the run's own log and `.err` file are never sent. A match git does not report ignored is in the snapshot, and one
+//! inside a folder holding a `.git` of its own is another repository's; each is skipped with a line.
 
 use std::cell::Cell;
-use std::collections::{HashMap, HashSet};
-use std::fs::{self, OpenOptions};
-use std::io::Read;
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::num::NonZeroU64;
+use std::os::windows::fs::OpenOptionsExt;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
 use gate_state::{FallbackReason, v1};
 use gate_win32::Interrupt;
+use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_DELETE_ON_CLOSE, FILE_SHARE_READ};
 
-use super::client::{self, Attempt, Called, End, RawSink, Watch};
-use super::git::{Call, Git, GitError};
-use super::outputs::{Unbuilt, sha256_for};
+use super::client::{Attempt, Called, End, RawSink, Watch};
+use super::git::{Call, Git, GitError, failure_text};
+use super::outputs::{Archive, DELETE, GENERIC_WRITE, Unbuilt, sha256_for};
 use super::payload::{self, InputsStep, Location};
+use super::watchdog::{self, Cut};
 use crate::boxside::payload::escaped;
 use crate::outputs::archive::{final_path, pack};
 use crate::outputs::cache::{HashCache, file_time_now};
@@ -30,26 +34,50 @@ use crate::outputs::walk::{Found, in_context, walk};
 
 /// The most files one put carries: the archive's member limit.
 pub(super) const MEMBERS: usize = 50_000;
-/// The paths inputs never carry, whatever the globs: anything under a `.git` folder, and a `.env` or `*.env` file.
-/// Matched without regard to case; the gate's own files are added per run ([`exclusions`]).
-const EXCLUDED: &str = r"(^|/)\.git/|\.env$";
+/// The paths inputs never carry, whatever the globs: anything under a `.git` folder, a `.env.<name>` file, a `.env` or
+/// `*.env` file, and a `.envrc` file. Matched without regard to case; the gate's own files are added per run
+/// ([`exclusions`]).
+const EXCLUDED: &str = r"(^|/)\.git/|(^|/)\.env\.[^/]*$|\.env$|(^|/)\.envrc$";
+/// The worktree's folder the inputs' diff answer and archive are made in, held from before the diff until the put ends.
+const TMP: &str = ".tmp";
+/// `GENERIC_READ`, which lives in `Win32_Foundation`, a feature this crate does not enable: the access the diff answer
+/// and the archive are read back through.
+const GENERIC_READ: u32 = 0x8000_0000;
+
+/// The caps an inputs manifest is built under: the most files, and the most bytes of its line.
+#[derive(Clone, Copy)]
+pub(super) struct Caps {
+    pub(super) members: usize,
+    pub(super) manifest: usize,
+}
+
+impl Caps {
+    /// The caps of every run: [`MEMBERS`] files and a line of [`MANIFEST_LIMIT`] bytes.
+    pub(super) const FULL: Caps = Caps {
+        members: MEMBERS,
+        manifest: MANIFEST_LIMIT,
+    };
+}
 
 /// What a run's inputs manifest is built from: the worktree `root`, the repo's input `globs`, the work folder's `key`,
 /// which names the gate's own archives and stages under `.tmp`, the run's `log`, the inputs hash cache's file `cache`,
-/// and how long the `git check-ignore` call may take, answering to the console `interrupt`.
+/// the `caps` it is built under, and how long the `git check-ignore` call may take, answering to the console
+/// `interrupt`.
 pub(super) struct Asked<'a> {
     pub(super) root: &'a Path,
     pub(super) globs: &'a [String],
     pub(super) key: &'a str,
     pub(super) log: &'a Path,
     pub(super) cache: &'a Path,
+    pub(super) caps: Caps,
     pub(super) limit: Duration,
     pub(super) interrupt: Option<Interrupt>,
 }
 
 /// A run's inputs manifest as built: its line, newline included, the SHA-256 of that line without its newline (the
 /// run call's `InputsDigest`), the manifest it holds, the files it names as the walk found them, and the log-only lines
-/// the build said: each glob that matched nothing and each match that is in the snapshot.
+/// the build said: each glob that matched nothing, each folder that is another repository and each match that is in
+/// the snapshot.
 pub(super) struct Built {
     pub(super) line: String,
     pub(super) digest: String,
@@ -58,16 +86,22 @@ pub(super) struct Built {
     pub(super) said: Vec<String>,
 }
 
-/// The inputs manifest `asked` names: the matched files git reports ignored, each hashed once its stamp is read through
-/// its handle, or taking the hash the inputs hash cache holds at that stamp; `go_on` is asked before each file and each
-/// read. The cache the build leaves is saved, unless it equals the one it read. A set past [`MEMBERS`] files or a line
-/// past [`MANIFEST_LIMIT`] bytes is refused. [`Unbuilt::Interrupted`] once `go_on` says no or git was interrupted;
-/// else why the globs, the walk, git or a file failed, or why the set is not sent.
+/// The inputs manifest `asked` names: the matched files git reports ignored, outside any folder holding a `.git` of its
+/// own, each hashed once its stamp is read through its handle, or taking the hash the inputs hash cache holds at that
+/// stamp; `go_on` is asked before each file and each read. The cache the build leaves is saved, unless it equals the
+/// one it read. A set past `asked`'s caps is refused. [`Unbuilt::Interrupted`] once `go_on` says no or git was
+/// interrupted; else why the globs, the walk, git or a file failed, or why the set is not sent.
 pub(super) fn built(asked: &Asked<'_>, go_on: impl Fn() -> bool) -> Result<Built, Unbuilt> {
     let excluded = exclusions(asked.root, asked.key, asked.log);
     let globs = Globs::inputs(asked.globs, &excluded).map_err(Unbuilt::Failed)?;
     let found = walk(asked.root, &globs).map_err(|error| Unbuilt::Failed(error.to_string()))?;
-    let mut said = unmatched(asked.globs, &excluded, &found)?;
+    let mut said = unmatched(asked.globs, &globs, &found);
+    let (found, nested) = outside_nested(asked.root, found);
+    said.extend(
+        nested
+            .iter()
+            .map(|folder| format!("gate: inputs: {} is another repository; not sent as an input", escaped(folder))),
+    );
     let ignored = ignored(asked, &found)?;
     let (kept, tracked): (Vec<Found>, Vec<Found>) = found.into_iter().partition(|file| ignored.contains(&file.path));
     said.extend(
@@ -75,15 +109,16 @@ pub(super) fn built(asked: &Asked<'_>, go_on: impl Fn() -> bool) -> Result<Built
             .iter()
             .map(|file| format!("gate: inputs: {} is in the snapshot; not sent as an input", escaped(&file.path))),
     );
-    if kept.len() > MEMBERS {
+    if kept.len() > asked.caps.members {
         return Err(Unbuilt::Failed(format!(
-            "{} files match the input globs, more than one put carries ({MEMBERS})",
-            kept.len()
+            "{} files match the input globs, more than one put carries ({})",
+            kept.len(),
+            asked.caps.members
         )));
     }
     let manifest = hashed(asked, &kept, go_on)?;
     let line = manifest.line();
-    if line.len() > MANIFEST_LIMIT {
+    if line.len() > asked.caps.manifest {
         return Err(Unbuilt::Failed(PAST_THE_CAP.to_owned()));
     }
     let (digest, _) = sha256_of(line.trim_end_matches('\n').as_bytes()).map_err(|error| Unbuilt::Failed(error.to_string()))?;
@@ -96,7 +131,7 @@ pub(super) fn built(asked: &Asked<'_>, go_on: impl Fn() -> bool) -> Result<Built
     })
 }
 
-/// Why an inputs manifest past [`MANIFEST_LIMIT`] is not sent.
+/// Why an inputs manifest past its cap is not sent.
 const PAST_THE_CAP: &str = "the inputs manifest is larger than the box takes (64 MiB)";
 
 /// The manifest of `files`, below `asked`'s root, each hashed as [`sha256_for`] hashes an output, the inputs hash cache
@@ -109,7 +144,7 @@ fn hashed(asked: &Asked<'_>, files: &[Found], go_on: impl Fn() -> bool) -> Resul
     let started = file_time_now();
     let stopped = Cell::new(false);
     let mut next = HashCache::default();
-    let built = Manifest::build_with(files, MANIFEST_LIMIT, |file| {
+    let built = Manifest::build_with(files, asked.caps.manifest, |file| {
         let (sha256, stamp) = sha256_for(file, &inside, cache, &go_on, &stopped)?;
         next.keep(&file.path, stamp, &sha256, started);
         Ok((sha256, stamp))
@@ -119,7 +154,7 @@ fn hashed(asked: &Asked<'_>, files: &[Found], go_on: impl Fn() -> bool) -> Resul
     }
     let manifest = match built {
         Ok(manifest) => manifest,
-        Err(error) if error.kind() == std::io::ErrorKind::FileTooLarge => return Err(Unbuilt::Failed(PAST_THE_CAP.to_owned())),
+        Err(error) if error.kind() == io::ErrorKind::FileTooLarge => return Err(Unbuilt::Failed(PAST_THE_CAP.to_owned())),
         Err(error) => return Err(Unbuilt::Failed(error.to_string())),
     };
     if previous.as_ref() != Some(&next) {
@@ -140,31 +175,66 @@ fn exclusions(root: &Path, key: &str, log: &Path) -> String {
     format!("(?i){EXCLUDED}|^(?:{})", own.join("|"))
 }
 
-/// `path` as a `/`-separated path relative to `root`, compared without regard to case; `None` when it is not below it.
+/// The file `path` as a `/`-separated path relative to `root`, compared without regard to case, both as the system
+/// resolves them: the root's canonical path, and the file's folder's canonical path with its name. `None` when it is
+/// not below the root, or when either cannot be resolved: a file whose folder cannot be resolved is none a walk finds.
 fn relative(root: &Path, path: &Path) -> Option<String> {
-    let spelled = |path: &Path| std::path::absolute(path).ok().map(|path| path.to_string_lossy().replace('\\', "/"));
-    let (root, path) = (spelled(root)?, spelled(path)?);
+    let spelled = |path: &Path| path.to_string_lossy().replace('\\', "/");
+    let path = std::path::absolute(path).ok()?;
+    let folder = fs::canonicalize(path.parent()?).ok()?;
+    let (root, path) = (spelled(&fs::canonicalize(root).ok()?), spelled(&folder.join(path.file_name()?)));
     let root = root.trim_end_matches('/');
     let head = path.get(..root.len())?;
     let rest = path.get(root.len()..)?.strip_prefix('/')?;
     (head.eq_ignore_ascii_case(root) && !rest.is_empty()).then(|| rest.to_owned())
 }
 
-/// The line of each of `globs` that matches none of `found`, under the exclusions `excluded`; else why one cannot be
-/// matched.
-fn unmatched(globs: &[String], excluded: &str, found: &[Found]) -> Result<Vec<String>, Unbuilt> {
-    let mut said = Vec::new();
-    for glob in globs {
-        let one = Globs::inputs(std::slice::from_ref(glob), excluded).map_err(Unbuilt::Failed)?;
-        if !found.iter().any(|file| one.matches(&file.path)) {
-            said.push(format!("gate: inputs: {} matched nothing", escaped(glob)));
+/// The line of each of the input globs `asked` that matches none of `found`, matched by `globs`, built from them.
+fn unmatched(asked: &[String], globs: &Globs, found: &[Found]) -> Vec<String> {
+    asked
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| !found.iter().any(|file| globs.matched_by(*index, &file.path)))
+        .map(|(_, glob)| format!("gate: inputs: {} matched nothing", escaped(glob)))
+        .collect()
+}
+
+/// `found` without each file inside a folder below `root` that holds a `.git` of its own, a submodule or a nested
+/// repository, which git cannot be asked about; and those folders, each the outermost such one, once each, in order.
+fn outside_nested(root: &Path, found: Vec<Found>) -> (Vec<Found>, Vec<String>) {
+    let mut known = HashMap::new();
+    let mut nested = BTreeSet::new();
+    let mut kept = Vec::new();
+    for file in found {
+        match nested_folder(root, &file.path, &mut known) {
+            Some(folder) => {
+                nested.insert(folder);
+            }
+            None => kept.push(file),
         }
     }
-    Ok(said)
+    (kept, nested.into_iter().collect())
+}
+
+/// The outermost folder of the `/`-separated `path` below `root` that holds a `.git` entry, each folder looked at once
+/// and its answer kept in `known`. A `.git` whose entry cannot be read counts as none: git is asked about the path, and
+/// says why it cannot answer.
+fn nested_folder(root: &Path, path: &str, known: &mut HashMap<String, bool>) -> Option<String> {
+    for (end, _) in path.match_indices('/') {
+        let folder = path.get(..end)?;
+        let holds = *known
+            .entry(folder.to_owned())
+            .or_insert_with(|| fs::symlink_metadata(root.join(folder).join(".git")).is_ok());
+        if holds {
+            return Some(folder.to_owned());
+        }
+    }
+    None
 }
 
 /// The paths of `found` that `git check-ignore` reports ignored in `asked`'s worktree, the global excludes and
-/// `.git/info/exclude` included and a tracked file never; else the interrupt, or why git failed.
+/// `.git/info/exclude` included and a tracked file never; else the interrupt, or why git failed, its status and the
+/// last lines it wrote on standard error.
 fn ignored(asked: &Asked<'_>, found: &[Found]) -> Result<HashSet<String>, Unbuilt> {
     if found.is_empty() {
         return Ok(HashSet::new());
@@ -178,13 +248,13 @@ fn ignored(asked: &Asked<'_>, found: &[Found]) -> Result<HashSet<String>, Unbuil
         ..Call::plain(asked.root, &args, asked.limit)
     };
     let failed = |why: String| Unbuilt::Failed(format!("git check-ignore failed: {why}"));
-    let ran = git.run(&call).map_err(|error| match error {
+    let (ran, errors) = git.run_kept(&call).map_err(|error| match error {
         GitError::Interrupted => Unbuilt::Interrupted,
         GitError::Failed(why) | GitError::OverCap(why) => failed(why),
     })?;
     // 1 says no path is ignored; anything but 0 and 1 is git's own failure.
     if !matches!(ran.status.code(), Some(0 | 1)) {
-        return Err(failed(format!("status {:?}", ran.status.code())));
+        return Err(failed(git_failure(ran.status.code(), &errors)));
     }
     let mut listed = Vec::new();
     let most = u64::try_from(input.len()).unwrap_or(u64::MAX).saturating_add(1);
@@ -194,6 +264,19 @@ fn ignored(asked: &Asked<'_>, found: &[Found]) -> Result<HashSet<String>, Unbuil
         .map_err(|error| failed(error.to_string()))?;
     let listed = String::from_utf8(listed).map_err(|_| failed("its output is not UTF-8".to_owned()))?;
     Ok(listed.split('\0').filter(|path| !path.is_empty()).map(str::to_owned).collect())
+}
+
+/// Why git failed with the exit `code`, `None` when it had none, having written `errors` on standard error: `status
+/// <n>`, then its last error lines when it wrote any.
+fn git_failure(code: Option<i32>, errors: &[u8]) -> String {
+    let status = code.map_or_else(|| "unknown".to_owned(), |code| code.to_string());
+    let errors = String::from_utf8_lossy(errors);
+    let lines: Vec<&str> = errors.lines().filter(|line| !line.trim().is_empty()).collect();
+    if lines.is_empty() {
+        format!("status {status}")
+    } else {
+        format!("status {status}: {}", failure_text(&lines))
+    }
 }
 
 /// The most bytes one put unpacks on the box, decompressed: 4 GiB, unless `--test-remote-inputs-budget-bytes` says
@@ -243,6 +326,7 @@ pub(super) fn sent(attempt: &mut Attempt<'_, '_>) -> Result<Option<Built>, End> 
         key: call.key,
         log: call.log,
         cache: &cache,
+        caps: Caps::FULL,
         limit: attempt.limit,
         interrupt: call.interrupt,
     };
@@ -260,7 +344,7 @@ pub(super) fn sent(attempt: &mut Attempt<'_, '_>) -> Result<Option<Built>, End> 
 
 /// Sends `built` to the work folder at `location` for the run of `nonce`: the diff call, then, when the box needs any
 /// file, the put of an archive of exactly those, timed in the run's split. A Ctrl+C ends the run; any other failure of
-/// either call refuses the route `inputs`, its reason in the log.
+/// either call refuses the route `inputs`, its reason in the log. An end no inputs call returns fails the run.
 pub(super) fn send(attempt: &mut Attempt<'_, '_>, location: &Location, nonce: &str, built: &Built) -> Result<(), End> {
     let started = Instant::now();
     let ended = sent_to(attempt, location, nonce, built);
@@ -268,31 +352,84 @@ pub(super) fn send(attempt: &mut Attempt<'_, '_>, location: &Location, nonce: &s
     match ended {
         Ok(()) => Ok(()),
         Err(Unsent::Ended(End::Interrupted)) => Err(End::Interrupted),
-        Err(Unsent::Ended(end)) => Err(refused(attempt, &ended_why(&end))),
-        Err(Unsent::Refused(why)) => Err(refused(attempt, &why)),
+        Err(Unsent::Ended(End::Failed(why)) | Unsent::Refused(why)) => Err(refused(attempt, &why)),
+        Err(Unsent::Ended(End::Refused(reason))) => Err(refused(attempt, &format!("the inputs call ended {}", reason.as_str()))),
+        Err(Unsent::Ended(other)) => Err(End::Failed(format!(
+            "the inputs call ended {}, which no inputs call does",
+            unexpected(&other)
+        ))),
+    }
+}
+
+/// How an end no inputs call returns is said: the run call's own ends, and a pair's.
+fn unexpected(end: &End) -> &'static str {
+    match end {
+        End::Status(_) => "with a command's status",
+        End::Killed => "killed",
+        End::Lost(_) => "with its connection lost",
+        End::NotRouted(_) => "not routed",
+        End::Refused(_) => "refused",
+        End::Failed(_) => "failed",
+        End::Interrupted => "interrupted",
     }
 }
 
 /// Why an inputs step was not done: a call that ended the attempt's way, or a reason of the step's own.
+#[derive(Debug)]
 enum Unsent {
     Ended(End),
     Refused(String),
 }
 
-/// Why a call that ended as `end` sent no inputs.
-fn ended_why(end: &End) -> String {
-    match end {
-        End::Failed(why) => why.clone(),
-        End::Refused(reason) => format!("the inputs call ended {}", reason.as_str()),
-        other => format!("the inputs call ended: {other:?}"),
+/// The inputs calls, as their lines name them.
+#[derive(Clone, Copy)]
+enum Step {
+    Diff,
+    Put,
+}
+
+impl Step {
+    /// The call as a failure line names it.
+    fn what(self) -> &'static str {
+        match self {
+            Step::Diff => "the inputs diff call",
+            Step::Put => "the inputs put call",
+        }
+    }
+
+    /// The call as the reason of its cut names it.
+    fn short(self) -> &'static str {
+        match self {
+            Step::Diff => "the diff",
+            Step::Put => "the put",
+        }
     }
 }
 
-/// The diff, then the put of what it needs ([`send`]).
+/// Why the inputs call `step` was cut as `cut`: a stall, the put's counted on the bytes both ways and the diff's on its
+/// output, or its transfer ceiling, each in whole seconds; any other cut as the watchdog words it.
+fn cut_why(step: Step, cut: Cut) -> String {
+    let seconds = watchdog::whole_seconds;
+    match (step, cut) {
+        (Step::Put, Cut::Silent(window)) => format!("the put stalled: no bytes sent or received for {} s", seconds(window)),
+        (Step::Diff, Cut::Silent(window)) => format!("the diff stalled: no output for {} s", seconds(window)),
+        (_, Cut::Ceiling(ceiling)) => format!("{} passed its transfer ceiling of {} s", step.short(), seconds(ceiling)),
+        _ => cut.reason(step.what()),
+    }
+}
+
+/// The diff, then the put of what it needs ([`send`]), the worktree's `.tmp` held from before the diff's answer is
+/// made until the put has ended.
 fn sent_to(attempt: &mut Attempt<'_, '_>, location: &Location, nonce: &str, built: &Built) -> Result<(), Unsent> {
+    let root = Path::new(attempt.call.root);
+    let folder = root.join(TMP);
+    let mut held = Archive::new(root, folder.clone());
+    fs::create_dir_all(&folder)
+        .and_then(|()| held.hold(&folder))
+        .map_err(|error| Unsent::Refused(format!("cannot hold {}: {error}", folder.display())))?;
     let needed = diffed(attempt, location, nonce, built)?;
     if needed.is_empty() {
-        attempt.logged(&format!("gate: inputs: {} file(s) unchanged", built.found.len()));
+        attempt.logged(&format!("gate: inputs: {} file(s) unchanged", built.manifest.files().count()));
         return Ok(());
     }
     let bytes = needed.iter().fold(0_u64, |total, file| total.saturating_add(file.stamp.size));
@@ -302,21 +439,44 @@ fn sent_to(attempt: &mut Attempt<'_, '_>, location: &Location, nonce: &str, buil
             attempt.inputs_budget
         )));
     }
-    let root = Path::new(attempt.call.root);
-    let archive = root.join(".tmp").join(format!("{}-{nonce}.inputs.tar.zst", attempt.call.key));
+    let path = folder.join(format!("{}-{nonce}.inputs.tar.zst", attempt.call.key));
     let started = Instant::now();
-    let put = packed(root, &archive, &needed, &built.manifest).and_then(|compressed| {
-        put(attempt, location, nonce, built, (&archive, needed.len()))?;
-        Ok(compressed)
-    });
-    if let Err(error) = fs::remove_file(&archive)
-        && error.kind() != std::io::ErrorKind::NotFound
-    {
-        attempt.logged(&format!("gate: cannot remove the inputs archive {}: {error}", archive.display()));
-    }
-    let compressed = put?;
+    let archive = made_in_tmp(root, &path, "the inputs archive")?;
+    let cache = v1::inputs_hashes_path(attempt.call.state_dir, attempt.call.key);
+    let packing = Pack {
+        root,
+        files: &needed,
+        manifest: &built.manifest,
+        cache: &cache,
+    };
+    let compressed = packed(&archive, &path, &packing, &|| attempt.go_on().is_ok())?;
+    put(attempt, location, nonce, built, (&archive, compressed, needed.len()))?;
+    drop(archive);
+    drop(held);
     attempt.say(sent_line(needed.len(), bytes, compressed, started.elapsed()));
     Ok(())
+}
+
+/// A new file at `path` in the held `.tmp` of the worktree `root`, `what` it holds: made new, read and written through
+/// the handle it gives and its clones, shared for reading alone, and removed once its last handle closes, so a run
+/// killed outright leaves none behind. One whose own final path is not inside the worktree is refused, and goes with
+/// its handle. Else why it cannot be made.
+fn made_in_tmp(root: &Path, path: &Path, what: &str) -> Result<File, Unsent> {
+    let cannot = |error: io::Error| Unsent::Refused(format!("cannot make {what} {}: {error}", path.display()));
+    let inside = fs::canonicalize(root).map_err(cannot)?;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .access_mode(GENERIC_READ | GENERIC_WRITE | DELETE)
+        .share_mode(FILE_SHARE_READ)
+        .custom_flags(FILE_FLAG_DELETE_ON_CLOSE)
+        .create_new(true)
+        .open(path)
+        .map_err(cannot)?;
+    if !final_path(&file).map_err(cannot)?.starts_with(&inside) {
+        return Err(Unsent::Refused(format!("{what} {} is not inside the worktree", path.display())));
+    }
+    Ok(file)
 }
 
 /// The console line of a put that sent `count` files of `bytes` bytes, `compressed` as sent, in `took`.
@@ -330,58 +490,59 @@ fn sent_line(count: usize, bytes: u64, compressed: u64, took: Duration) -> Strin
     )
 }
 
-/// The files of `built` the box's diff call says its work folder lacks or holds otherwise; else why not.
+/// The files of `built` the box's diff call says its work folder lacks or holds otherwise; else why not. Its answer is
+/// written raw into a file of the held `.tmp` and read back through the same handle; the call is watched by its own
+/// output and a transfer ceiling counted from its own start, as a fetch is.
 fn diffed<'b>(attempt: &mut Attempt<'_, '_>, location: &Location, nonce: &str, built: &'b Built) -> Result<Vec<&'b Found>, Unsent> {
     let head = payload::input(&payload::inputs_word(location, nonce, InputsStep::Diff), Some(&built.line));
-    let said = Path::new(attempt.call.root)
-        .join(".tmp")
-        .join(format!("{}-{nonce}.inputs-diff", attempt.call.key));
+    let root = Path::new(attempt.call.root);
+    let path = root.join(TMP).join(format!("{}-{nonce}.inputs-diff", attempt.call.key));
+    let answer = made_in_tmp(root, &path, "the inputs diff answer")?;
     let cap = NonZeroU64::new(2 * (built.line.len() as u64) + 1024 * 1024).unwrap_or(NonZeroU64::MIN);
+    let shown = path.display().to_string();
+    // Each attempt writes the answer anew from its start, through a clone of the one handle. The clones share one
+    // position, which is safe here: a call's raw copy writes nothing more once its call has ended, before any retry.
     let make = || -> Result<RawSink, String> {
-        if let Some(folder) = said.parent() {
-            fs::create_dir_all(folder).map_err(|error| format!("cannot make {}: {error}", folder.display()))?;
-        }
-        let file = fs::File::create(&said).map_err(|error| format!("cannot write {}: {error}", said.display()))?;
+        let cannot = |error: io::Error| format!("cannot write {shown}: {error}");
+        let mut file = answer.try_clone().map_err(cannot)?;
+        file.set_len(0).map_err(cannot)?;
+        file.seek(SeekFrom::Start(0)).map_err(cannot)?;
         Ok(RawSink {
             file,
-            shown: said.display().to_string(),
+            shown: shown.clone(),
             cap,
         })
     };
-    let watch = Watch::Setup(attempt.limits_for("inputs"));
-    let called = attempt.inputs_call(&head, None, Some(&make), watch);
-    let text = fs::read(&said).map_err(|error| format!("cannot read {}: {error}", said.display()));
-    if let Err(error) = fs::remove_file(&said)
-        && error.kind() != std::io::ErrorKind::NotFound
-    {
-        attempt.logged(&format!("gate: cannot remove {}: {error}", said.display()));
-    }
-    let called = called.map_err(Unsent::Ended)?;
-    judged(attempt, &called, "the inputs diff call")?;
-    needed(&String::from_utf8_lossy(&text.map_err(Unsent::Refused)?), built).map_err(Unsent::Refused)
+    let watch = Watch::Fetch(attempt.limits_for("inputs-diff"), None);
+    let called = attempt.inputs_call(&head, None, Some(&make), watch).map_err(Unsent::Ended)?;
+    judged(attempt, &called, Step::Diff)?;
+    let mut text = Vec::new();
+    (&answer)
+        .seek(SeekFrom::Start(0))
+        .and_then(|_| (&answer).take(cap.get()).read_to_end(&mut text))
+        .map_err(|error| Unsent::Refused(format!("cannot read {shown}: {error}")))?;
+    needed(&String::from_utf8_lossy(&text), built).map_err(Unsent::Refused)
 }
 
-/// Why the inputs call `what` that ended as `called` failed: a cut, its line said, or a status other than 0, the box's
-/// last error line when it said one.
-fn judged(attempt: &mut Attempt<'_, '_>, called: &Called, what: &str) -> Result<(), Unsent> {
+/// Why the inputs call `step` that ended as `called` failed: a cut, said in the reason alone, as the preflight's is,
+/// since the run falls back here and a watchdog line in its log would fail the run here; or a status other than 0, the
+/// box's last error line when it said one.
+fn judged(attempt: &mut Attempt<'_, '_>, called: &Called, step: Step) -> Result<(), Unsent> {
     if let Some(cut) = called.cut {
-        if let Some(line) = client::watchdog_line(cut, "sending the inputs") {
-            attempt.say(line);
-        }
         attempt.noted(called);
-        return Err(Unsent::Refused(cut.reason(what)));
+        return Err(Unsent::Refused(cut_why(step, cut)));
     }
     if called.status != 0 {
         return Err(Unsent::Refused(match &called.last_error {
             Some(line) => line.clone(),
-            None => format!("{what} failed (status {})", called.status),
+            None => format!("{} failed (status {})", step.what(), called.status),
         }));
     }
     Ok(())
 }
 
 /// The files of `built` the diff's standard output `said` names: `need <n>`, then `n` paths, each escaped as the box
-/// escapes it and each a file of the manifest; else why the answer is not one.
+/// escapes it, each a file of the manifest and none named twice; else why the answer is not one.
 fn needed<'b>(said: &str, built: &'b Built) -> Result<Vec<&'b Found>, String> {
     let mut lines = said.lines().filter(|line| !line.trim().is_empty());
     let count: usize = lines
@@ -390,15 +551,20 @@ fn needed<'b>(said: &str, built: &'b Built) -> Result<Vec<&'b Found>, String> {
         .and_then(|count| count.trim().parse().ok())
         .ok_or_else(|| format!("the builder printed no '{NEED}<n>' line"))?;
     let by_escaped: HashMap<String, &Found> = built.found.iter().map(|file| (escaped(&file.path), file)).collect();
+    let mut seen = HashSet::new();
     let needed = lines
         .map(|line| {
             let path = line
                 .strip_prefix(PATH)
                 .ok_or_else(|| format!("the builder printed '{}'", escaped(line)))?;
-            by_escaped
+            let file = by_escaped
                 .get(path)
                 .copied()
-                .ok_or_else(|| format!("the builder named '{}', which the manifest does not hold", escaped(path)))
+                .ok_or_else(|| format!("the builder named '{}', which the manifest does not hold", escaped(path)))?;
+            if !seen.insert(path) {
+                return Err(format!("the box named {} twice", escaped(path)));
+            }
+            Ok(file)
         })
         .collect::<Result<Vec<_>, _>>()?;
     if needed.len() != count {
@@ -407,41 +573,80 @@ fn needed<'b>(said: &str, built: &'b Built) -> Result<Vec<&'b Found>, String> {
     Ok(needed)
 }
 
-/// Packs `files` from `root` into a new `archive` in the worktree's `.tmp`, each checked to hold what `manifest` says it
-/// held when it was hashed; the archive's compressed size, else why not.
-fn packed(root: &Path, archive: &Path, files: &[&Found], manifest: &Manifest) -> Result<u64, Unsent> {
-    let cannot = |error: std::io::Error| Unsent::Refused(format!("cannot pack the inputs into {}: {error}", archive.display()));
-    if let Some(folder) = archive.parent() {
-        fs::create_dir_all(folder).map_err(cannot)?;
+/// What a put's archive is packed of: the `files` below the worktree `root`, each to hold what `manifest` says it held
+/// when it was hashed, and the inputs hash cache file `cache` a file that does not is forgotten from.
+struct Pack<'p> {
+    root: &'p Path,
+    files: &'p [&'p Found],
+    manifest: &'p Manifest,
+    cache: &'p Path,
+}
+
+/// Packs `packing`'s files into the open `archive`, shown as `shown`, `go_on` asked before the pack and before each
+/// write into the archive; each packed file is checked to hold what the manifest says it held when it was hashed, and
+/// one that does not is forgotten from the inputs hash cache before the step is refused, so the next run hashes it
+/// again. The archive's compressed size; else the interrupt, or why not.
+fn packed(archive: &File, shown: &Path, packing: &Pack<'_>, go_on: &dyn Fn() -> bool) -> Result<u64, Unsent> {
+    let stopped = Cell::new(false);
+    if !go_on() {
+        return Err(Unsent::Ended(End::Interrupted));
     }
-    let file = OpenOptions::new().write(true).create_new(true).open(archive).map_err(cannot)?;
-    let inside = fs::canonicalize(root).map_err(cannot)?;
-    if !final_path(&file).map_err(cannot)?.starts_with(&inside) {
-        return Err(Unsent::Refused(format!(
-            "the inputs archive {} is not inside the worktree",
-            archive.display()
-        )));
+    let chosen: Vec<Chosen<'_>> = packing.files.iter().map(|file| Chosen::from(*file)).collect();
+    let sink = Asking {
+        inner: archive,
+        go_on,
+        stopped: &stopped,
+    };
+    let result = pack(sink, packing.root, &chosen, &HeldBy::new());
+    if stopped.get() {
+        return Err(Unsent::Ended(End::Interrupted));
     }
-    let chosen: Vec<Chosen<'_>> = files.iter().map(|file| Chosen::from(*file)).collect();
-    let packed = pack(&file, root, &chosen, &HeldBy::new()).map_err(cannot)?;
+    let packed = result.map_err(|error| Unsent::Refused(format!("cannot pack the inputs into {}: {error}", shown.display())))?;
     if let Some(entry) = packed
         .entries
         .iter()
-        .find(|entry| manifest.get(&entry.path).is_none_or(|held| held.sha256 != entry.sha256))
+        .find(|entry| packing.manifest.get(&entry.path).is_none_or(|held| held.sha256 != entry.sha256))
     {
+        if let Some(mut cache) = HashCache::load(packing.cache) {
+            cache.forget(&entry.path);
+            cache.save(packing.cache);
+        }
         return Err(Unsent::Refused(format!("{} changed after it was hashed", escaped(&entry.path))));
     }
     Ok(packed.compressed)
 }
 
-/// The put call of the `sent` files packed at `archive`: the request, the manifest and then the archive, watched as a
-/// put; else why not, a builder that installed another count than was sent included.
-fn put(attempt: &mut Attempt<'_, '_>, location: &Location, nonce: &str, built: &Built, sent: (&Path, usize)) -> Result<(), Unsent> {
-    let (archive, count) = sent;
+/// A writer into the inputs archive that asks `go_on` before each write, and fails the write once it says no, with
+/// `stopped` set, so a Ctrl+C during the pack ends it.
+struct Asking<'a, W: Write> {
+    inner: W,
+    go_on: &'a dyn Fn() -> bool,
+    stopped: &'a Cell<bool>,
+}
+
+impl<W: Write> Write for Asking<'_, W> {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        if !(self.go_on)() {
+            self.stopped.set(true);
+            return Err(io::Error::other("the run was interrupted"));
+        }
+        self.inner.write(buffer)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// The put call of the `sent` files packed into the open archive, its compressed length and their count: the request,
+/// the manifest and then the archive, watched as a put; else why not, a builder that installed another count than was
+/// sent included.
+fn put(attempt: &mut Attempt<'_, '_>, location: &Location, nonce: &str, built: &Built, sent: (&File, u64, usize)) -> Result<(), Unsent> {
+    let (archive, length, count) = sent;
     let head = payload::input(&payload::inputs_word(location, nonce, InputsStep::Put), Some(&built.line));
     let watch = Watch::Put(attempt.limits_for("inputs"));
-    let called = attempt.inputs_call(&head, Some(archive), None, watch).map_err(Unsent::Ended)?;
-    judged(attempt, &called, "the inputs put call")?;
+    let called = attempt.inputs_call(&head, Some((archive, length)), None, watch).map_err(Unsent::Ended)?;
+    judged(attempt, &called, Step::Put)?;
     installed_all(&called.lines, count).map_err(Unsent::Refused)
 }
 
@@ -463,25 +668,51 @@ fn installed_all(lines: &[String], sent: usize) -> Result<(), String> {
 #[expect(clippy::expect_used, reason = "a test that cannot make its files must fail loudly")]
 mod tests {
     use std::fs;
+    use std::ops::Deref;
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::time::{Duration, SystemTime};
 
     use serde_json::Value;
 
-    use super::{Asked, Built, built, installed_all};
+    use super::{Asked, Built, Caps, End, PAST_THE_CAP, Pack, Unsent, built, installed_all, made_in_tmp, needed, packed, relative};
     use crate::outputs::hash::sha256_of;
+    use crate::outputs::walk::Found;
     use crate::remote::git::GIT_LIMIT;
     use crate::remote::outputs::Unbuilt;
 
     const KEY: &str = "app-1a2b3c4d";
 
-    /// A scratch worktree for one test, emptied first, made a git repository whose `.gitignore` is `ignore`.
-    fn worktree(name: &str, ignore: &str) -> PathBuf {
+    /// A test's scratch folder, removed when the test ends.
+    struct Scratch(PathBuf);
+
+    impl Deref for Scratch {
+        type Target = Path;
+
+        fn deref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            // A folder a test leaves is emptied by the next run of the test, which starts by removing it.
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// An empty scratch folder for one test, emptied first.
+    fn scratch(name: &str) -> Scratch {
         let folder = crate::test_support::temp_dir().join(format!("gate-remote-inputs-{}-{name}", std::process::id()));
         // A folder left by an earlier run of the test may not be there.
         let _ = fs::remove_dir_all(&folder);
         fs::create_dir_all(&folder).expect("the scratch folder can be made");
+        Scratch(folder)
+    }
+
+    /// A scratch worktree for one test, emptied first, made a git repository whose `.gitignore` is `ignore`.
+    fn worktree(name: &str, ignore: &str) -> Scratch {
+        let folder = scratch(name);
         git(&folder, &["init", "--quiet"]);
         put(&folder, ".gitignore", ignore);
         folder
@@ -504,22 +735,58 @@ mod tests {
             .expect("its last write can be set");
     }
 
-    fn build(root: &Path, globs: &[&str]) -> Result<Built, Unbuilt> {
+    /// The inputs of `globs` in `root`, its log at `log`, built under `caps`.
+    fn build_as(root: &Path, globs: &[&str], log: &Path, caps: Caps) -> Result<Built, Unbuilt> {
         let globs: Vec<String> = globs.iter().map(|glob| (*glob).to_owned()).collect();
         let asked = Asked {
             root,
             globs: &globs,
             key: KEY,
-            log: &root.join("logs").join("run.log"),
-            cache: &root.join("state").join("inputs-hashes"),
+            log,
+            cache: &cache_of(root),
+            caps,
             limit: GIT_LIMIT,
             interrupt: None,
         };
         built(&asked, || true)
     }
 
+    fn build(root: &Path, globs: &[&str]) -> Result<Built, Unbuilt> {
+        build_as(root, globs, &root.join("logs").join("run.log"), Caps::FULL)
+    }
+
+    fn cache_of(root: &Path) -> PathBuf {
+        root.join("state").join("inputs-hashes")
+    }
+
     fn paths(built: &Built) -> Vec<&str> {
         built.manifest.files().map(|(path, _)| path).collect()
+    }
+
+    /// Why `built` failed, which it must have.
+    fn failure(built: Result<Built, Unbuilt>) -> String {
+        match built {
+            Err(Unbuilt::Failed(why)) => why,
+            Err(Unbuilt::Interrupted) => "the build was interrupted".to_owned(),
+            Ok(built) => format!("the build passed: {:?}", paths(&built)),
+        }
+    }
+
+    /// Packs every file of `built` in `root` into a new archive in its `.tmp`, the cache at [`cache_of`] forgotten from,
+    /// `go_on` asked.
+    fn pack_all(root: &Path, built: &Built, go_on: &dyn Fn() -> bool) -> Result<u64, Unsent> {
+        fs::create_dir_all(root.join(".tmp")).expect("the .tmp folder can be made");
+        let path = root.join(".tmp").join("pack.tar.zst");
+        let archive = made_in_tmp(root, &path, "the inputs archive").expect("the archive can be made");
+        let files: Vec<&Found> = built.found.iter().collect();
+        let cache = cache_of(root);
+        let packing = Pack {
+            root,
+            files: &files,
+            manifest: &built.manifest,
+            cache: &cache,
+        };
+        packed(&archive, &path, &packing, go_on)
     }
 
     #[test]
@@ -547,13 +814,20 @@ mod tests {
 
     #[test]
     fn the_inputs_exclusions_leave_out_each_class_and_reach_the_tmp_folder() {
-        let root = worktree("exclusions", ".tmp/\nlogs/\n*.env\n.env\n.lfsconfig\n");
+        let root = worktree("exclusions", ".tmp/\nlogs/\nx/\n*.env\n.env\n.env.*\n.envrc\n.lfsconfig\n");
         put(&root, ".tmp/helper/tool.dll", "helper");
         put(&root, &format!(".tmp/{KEY}-0123.tar.zst"), "an outputs archive");
         put(&root, &format!(".tmp/{KEY}-0123/staged.txt"), "an outputs stage");
         put(&root, ".tmp/other-key-0123.tar.zst", "another key's");
         put(&root, "secret.env", "secret");
         put(&root, ".env", "secret");
+        put(&root, ".env.local", "secret");
+        put(&root, ".env.production", "secret");
+        put(&root, "x/.env.development.local", "secret");
+        put(&root, ".ENV.Production", "secret");
+        put(&root, ".envrc", "secret");
+        put(&root, "x/.envrc", "secret");
+        put(&root, "x/kept.txt", "kept");
         put(&root, ".lfsconfig", "lfs");
         put(&root, "logs/run.log", "the log");
         put(&root, "logs/run.log.err", "its err");
@@ -562,7 +836,10 @@ mod tests {
 
         let built = build(&root, &["**"]).expect("the inputs are built");
 
-        assert_eq!(paths(&built), [".tmp/helper/tool.dll", ".tmp/other-key-0123.tar.zst", "logs/kept.txt"]);
+        assert_eq!(
+            paths(&built),
+            [".tmp/helper/tool.dll", ".tmp/other-key-0123.tar.zst", "logs/kept.txt", "x/kept.txt"]
+        );
     }
 
     #[test]
@@ -589,6 +866,91 @@ mod tests {
     }
 
     #[test]
+    fn a_folder_holding_its_own_git_is_left_out_once_with_its_line() {
+        let root = worktree("nested", "vendor/\n");
+        put(&root, "vendor/kept.txt", "kept");
+        put(&root, "vendor/lib/.git/HEAD", "ref: refs/heads/main");
+        put(&root, "vendor/lib/a.txt", "a");
+        put(&root, "vendor/lib/deep/b.txt", "b");
+        put(&root, "vendor/mod/.git", "gitdir: ../../.git/modules/mod");
+        put(&root, "vendor/mod/c.txt", "c");
+
+        let built = build(&root, &["vendor/**"]).expect("the inputs are built");
+
+        assert_eq!(paths(&built), ["vendor/kept.txt"]);
+        assert_eq!(
+            built.said,
+            [
+                "gate: inputs: vendor/lib is another repository; not sent as an input",
+                "gate: inputs: vendor/mod is another repository; not sent as an input",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_failed_check_ignore_says_git_s_error_and_its_plain_status() {
+        let root = scratch("check-ignore-fails");
+        put(&root, ".git", "gitdir: nowhere");
+        put(&root, "a.txt", "a");
+
+        let why = failure(build(&root, &["a.txt"]));
+
+        assert!(why.starts_with("git check-ignore failed: status 128: fatal: "), "{why}");
+        assert!(!why.contains("Some("), "{why}");
+    }
+
+    #[test]
+    fn a_set_past_the_member_cap_or_the_manifest_cap_is_refused() {
+        let root = worktree("caps", ".tmp/\n");
+        put(&root, ".tmp/a.txt", "a");
+        put(&root, ".tmp/b.txt", "b");
+        let log = root.join("logs").join("run.log");
+
+        let members = failure(build_as(&root, &[".tmp/**"], &log, Caps { members: 1, ..Caps::FULL }));
+        let manifest = failure(build_as(&root, &[".tmp/**"], &log, Caps { manifest: 64, ..Caps::FULL }));
+
+        assert_eq!(members, "2 files match the input globs, more than one put carries (1)");
+        assert_eq!(manifest, PAST_THE_CAP);
+        assert!(
+            build_as(&root, &[".tmp/**"], &log, Caps { members: 2, ..Caps::FULL }).is_ok(),
+            "a set at the cap is sent"
+        );
+    }
+
+    #[test]
+    fn the_run_s_log_spelled_another_way_is_still_left_out() {
+        let root = worktree("log-spelled", "logs/\n");
+        put(&root, "logs/run.log", "the log");
+        put(&root, "logs/run.log.err", "its err");
+        put(&root, "logs/kept.txt", "kept");
+        let verbatim = PathBuf::from(format!(r"\\?\{}", root.join("logs").join("run.log").display()));
+        let parent_hop = root.join("logs").join("..").join("logs").join("run.log");
+
+        let by_verbatim = build_as(&root, &["logs/**"], &verbatim, Caps::FULL).expect("the inputs are built");
+        let by_hop = build_as(&root, &["logs/**"], &parent_hop, Caps::FULL).expect("the inputs are built");
+
+        assert_eq!(paths(&by_verbatim), ["logs/kept.txt"]);
+        assert_eq!(paths(&by_hop), ["logs/kept.txt"]);
+    }
+
+    #[test]
+    fn a_log_outside_the_worktree_is_not_below_it() {
+        let root = worktree("log-outside", "logs/\n");
+        put(&root, "logs/run.log", "a file of the worktree's own, not the run's log");
+        let beside = scratch("log-outside2");
+        put(&beside, "run.log", "the log");
+
+        assert_eq!(
+            relative(&root, &beside.join("run.log")),
+            None,
+            "a sibling folder sharing the root's name as a prefix"
+        );
+        assert_eq!(relative(&root, &root.join("logs").join("run.log")).as_deref(), Some("logs/run.log"));
+        let built = build_as(&root, &["logs/**"], &beside.join("run.log"), Caps::FULL).expect("the inputs are built");
+        assert_eq!(paths(&built), ["logs/run.log"], "the log is elsewhere, so the worktree's file is sent");
+    }
+
+    #[test]
     fn the_digest_is_the_sha256_of_the_manifest_line_without_its_newline() {
         let root = worktree("digest", ".tmp/\n");
         put(&root, ".tmp/a.txt", "x");
@@ -605,16 +967,21 @@ mod tests {
         assert!(line.contains(&format!(r#""sha256":"{x}""#)) && line.contains(r#""size":1"#), "{line}");
     }
 
+    /// Rewrites the inputs cache in `root` with the hash `sha256` for `path`.
+    fn plant(root: &Path, path: &str, sha256: &str) {
+        let cache = cache_of(root);
+        let mut saved: Value = serde_json::from_str(&fs::read_to_string(&cache).expect("the cache was saved")).expect("JSON");
+        saved["files"][path]["sha256"] = Value::from(sha256);
+        fs::write(&cache, format!("{saved}\n")).expect("the cache can be rewritten");
+    }
+
     #[test]
     fn the_inputs_cache_is_trusted_at_a_matching_stamp_and_not_past_it() {
         let root = worktree("cache", ".tmp/\nstate/\n");
         put(&root, ".tmp/a.txt", "first");
         build(&root, &[".tmp/**"]).expect("the first build");
-        let cache = root.join("state").join("inputs-hashes");
-        let mut saved: Value = serde_json::from_str(&fs::read_to_string(&cache).expect("the cache was saved")).expect("JSON");
         let planted = "f".repeat(64);
-        saved["files"][".tmp/a.txt"]["sha256"] = Value::from(planted.as_str());
-        fs::write(&cache, format!("{saved}\n")).expect("the cache can be rewritten");
+        plant(&root, ".tmp/a.txt", &planted);
 
         let trusted = build(&root, &[".tmp/**"]).expect("the second build");
         put(&root, ".tmp/a.txt", "changed");
@@ -623,5 +990,126 @@ mod tests {
         let sha = |built: &Built| built.manifest.get(".tmp/a.txt").expect("the file is listed").sha256.clone();
         assert_eq!(sha(&trusted), planted, "the stamp matched, so the cache's hash is taken");
         assert_ne!(sha(&rehashed), planted, "the size changed, so the file is hashed again");
+    }
+
+    #[test]
+    fn a_wrong_cached_hash_found_at_the_pack_is_forgotten_so_the_next_build_heals() {
+        let root = worktree("heal", ".tmp/\nstate/\n");
+        put(&root, ".tmp/a.txt", "first");
+        let honest = build(&root, &[".tmp/**"]).expect("the first build");
+        let truth = honest.manifest.get(".tmp/a.txt").expect("the file is listed").sha256.clone();
+        plant(&root, ".tmp/a.txt", &"f".repeat(64));
+        let misled = build(&root, &[".tmp/**"]).expect("the second build");
+
+        let refused = pack_all(&root, &misled, &|| true);
+        let healed = build(&root, &[".tmp/**"]).expect("the third build");
+
+        assert!(
+            matches!(&refused, Err(Unsent::Refused(why)) if why == ".tmp/a.txt changed after it was hashed"),
+            "{refused:?}"
+        );
+        assert_eq!(healed.manifest.get(".tmp/a.txt").expect("the file is listed").sha256, truth);
+    }
+
+    #[test]
+    fn a_file_changed_after_it_was_hashed_is_refused_at_the_pack() {
+        let root = worktree("changed", ".tmp/\nstate/\n");
+        put(&root, ".tmp/a.txt", "first");
+        let hashed = build(&root, &[".tmp/**"]).expect("the build");
+        put(&root, ".tmp/a.txt", "other");
+
+        let refused = pack_all(&root, &hashed, &|| true);
+        let sent = pack_all(&root, &build(&root, &[".tmp/**"]).expect("the build again"), &|| true);
+
+        assert!(
+            matches!(&refused, Err(Unsent::Refused(why)) if why == ".tmp/a.txt changed after it was hashed"),
+            "{refused:?}"
+        );
+        assert!(matches!(sent, Ok(compressed) if compressed > 0), "{sent:?}");
+    }
+
+    #[test]
+    fn a_pack_ends_interrupted_once_the_run_is() {
+        let root = worktree("pack-interrupted", ".tmp/\nstate/\n");
+        put(&root, ".tmp/a.txt", "first");
+        let built = build(&root, &[".tmp/**"]).expect("the build");
+        let asked = std::cell::Cell::new(0);
+        let once = || {
+            asked.set(asked.get() + 1);
+            asked.get() == 1
+        };
+
+        let at_once = pack_all(&root, &built, &|| false);
+        let while_writing = pack_all(&root, &built, &once);
+
+        assert!(matches!(at_once, Err(Unsent::Ended(End::Interrupted))), "{at_once:?}");
+        assert!(matches!(while_writing, Err(Unsent::Ended(End::Interrupted))), "{while_writing:?}");
+    }
+
+    #[test]
+    fn the_archive_made_in_tmp_goes_with_its_last_handle() {
+        let root = worktree("tmp-file", ".tmp/\n");
+        fs::create_dir_all(root.join(".tmp")).expect("the .tmp folder can be made");
+        let path = root.join(".tmp").join("made.tar.zst");
+
+        let file = made_in_tmp(&root, &path, "the inputs archive").expect("the file is made");
+        let again = made_in_tmp(&root, &path, "the inputs archive");
+        let clone = file.try_clone().expect("the handle can be cloned");
+        drop(file);
+        let there_while_cloned = path.exists();
+        drop(clone);
+
+        assert!(matches!(again, Err(Unsent::Refused(_))), "made new, never over a file there");
+        assert!(there_while_cloned, "a clone of the handle keeps it");
+        assert!(!path.exists(), "the last handle closed removes it");
+    }
+
+    /// The manifest built of `a.txt` and `b.txt`, for the diff answers to name.
+    fn two_files(name: &str) -> (Scratch, Built) {
+        let root = worktree(name, "*.txt\n");
+        put(&root, "a.txt", "a");
+        put(&root, "b.txt", "b");
+        let built = build(&root, &["*.txt"]).expect("the inputs are built");
+        (root, built)
+    }
+
+    #[test]
+    fn a_diff_answer_naming_a_path_twice_is_refused() {
+        let (_root, built) = two_files("twice");
+
+        let twice = needed(
+            "gate-remote-inputs: need 2\ngate-remote-inputs: path a.txt\ngate-remote-inputs: path a.txt\n",
+            &built,
+        );
+
+        assert_eq!(twice.map(|found| found.len()), Err("the box named a.txt twice".to_owned()));
+    }
+
+    #[test]
+    fn a_malformed_diff_answer_is_refused() {
+        let (_root, built) = two_files("malformed");
+        let said = |text: &str| needed(text, &built).map(|found| found.iter().map(|file| file.path.clone()).collect::<Vec<_>>());
+
+        assert_eq!(
+            said("gate-remote-inputs: need 1\ngate-remote-inputs: path b.txt\n"),
+            Ok(vec!["b.txt".to_owned()])
+        );
+        assert_eq!(
+            said("gate-remote-inputs: path a.txt\n"),
+            Err("the builder printed no 'gate-remote-inputs: need <n>' line".to_owned())
+        );
+        assert_eq!(said(""), Err("the builder printed no 'gate-remote-inputs: need <n>' line".to_owned()));
+        assert_eq!(
+            said("gate-remote-inputs: need 2\ngate-remote-inputs: path a.txt\n"),
+            Err("the builder said it needs 2 file(s) and named 1".to_owned())
+        );
+        assert_eq!(
+            said("gate-remote-inputs: need 1\ngate-remote-inputs: path c.txt\n"),
+            Err("the builder named 'c.txt', which the manifest does not hold".to_owned())
+        );
+        assert_eq!(
+            said("gate-remote-inputs: need 1\nsomething else\n"),
+            Err("the builder printed 'something else'".to_owned())
+        );
     }
 }

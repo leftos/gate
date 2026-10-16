@@ -62,6 +62,11 @@ impl HashCache {
         }
     }
 
+    /// Forgets the hash the cache holds for `path`, found without regard to case, so the next build hashes the file.
+    pub(crate) fn forget(&mut self, path: &str) {
+        self.held.remove(path);
+    }
+
     /// Saves the cache at `path`, its folder made when missing, through a temporary sibling `<path>.<pid>.tmp` moved
     /// over it, so a reader never sees a torn file. A save that fails removes its temporary sibling and is not said.
     pub(crate) fn save(&self, path: &Path) {

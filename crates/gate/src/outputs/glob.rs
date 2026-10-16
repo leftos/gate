@@ -68,6 +68,12 @@ impl Globs {
         fits(path) && !is_git_s(path) && !is_lfs_config(path) && self.selects(path)
     }
 
+    /// Whether the glob at `index` of those this matcher was built from matches the `/`-separated relative `path`, its
+    /// pattern alone asked: for a path the matcher already [`Globs::matches`], which of its globs did.
+    pub(crate) fn matched_by(&self, index: usize, path: &str) -> bool {
+        self.patterns.get(index).is_some_and(|pattern| pattern.is_match(path))
+    }
+
     /// Whether the file at the `/`-separated relative `path` would come back but for its name: [`Globs::selects`] it,
     /// yet its name does not fit the outputs archive ([`fits`]).
     pub(crate) fn refuses_name(&self, path: &str) -> bool {

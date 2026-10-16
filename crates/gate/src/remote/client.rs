@@ -17,9 +17,10 @@
 //! back `busy` at once.
 
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::num::NonZeroU64;
 use std::ops::Range;
+use std::os::windows::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -576,7 +577,8 @@ impl Tree {
 }
 
 /// The ceiling of each transfer, whatever `--timeout` says: the setup up to the end of the push, counted from the
-/// attempt's start, and each fetch after the run call, the sync-back's and the outputs', counted from its own start.
+/// attempt's start; the inputs' diff and put calls, and each fetch after the run call, the sync-back's and the
+/// outputs', each counted from its own start.
 pub(super) const TRANSFER_CEILING: Duration = Duration::from_mins(30);
 
 /// The attempt's clock, which the setup's calls count on, and the limits the client's calls are watched by: the stall window; the
@@ -606,7 +608,8 @@ impl Limits {
     }
 }
 
-/// `--test-remote-watch-call`: the one call, `preflight`, `push`, `run`, `ls-remote`, `fetch` or `outputs`, that the
+/// `--test-remote-watch-call`: the one call, `preflight`, `push`, `inputs-diff` (the inputs' diff call), `inputs` (the
+/// inputs' put call), `run`, `ls-remote`, `fetch` or `outputs`, that the
 /// stall window of `--test-stall-ms` applies to, and the ceiling of `--test-remote-timeout-ms` for any call but `run`,
 /// counted from its own start: its transfer ceiling. For `ls-remote`, which has a deadline rather than a stall window,
 /// the ceiling is that deadline.
@@ -628,10 +631,13 @@ pub(super) enum Watch {
     /// attempt's start: the setup's calls, the preflight and the push.
     Setup(Limits),
     /// Killed once it sent nothing for the stall window of these limits, or at the transfer ceiling counted from its own
-    /// start, or once its job wrote more bytes than the cap when it has one: the sync-back's fetch, and the outputs call.
+    /// start, or once its job wrote more bytes than the cap when it has one: the sync-back's fetch, the outputs call,
+    /// and the inputs' diff call, which has no cap.
     Fetch(Limits, Option<u64>),
-    /// Killed once its job wrote no byte for the stall window of these limits, its output aside, or at the transfer
-    /// ceiling counted from its own start: the inputs' put, whose archive goes the other way.
+    /// Killed once, while its feeder still writes the archive, neither a byte was fed nor one of its output came for
+    /// the stall window of these limits, or at the transfer ceiling counted from its own start, which alone watches it
+    /// once the feeder has finished: the inputs' put call, whose archive goes the other way and whose box installs it
+    /// without a word.
     Put(Limits),
     /// Killed once it ran for this long.
     Deadline(Duration),
@@ -1897,13 +1903,14 @@ impl Attempt<'_, '_> {
 
     /// One inputs call, `gate box inputs`, made once more when it failed before the banner, watched as `watch` says,
     /// and the console interrupt raised after its first output byte with `--test-remote-interrupt-at inputs`. Each
-    /// attempt is fed `head`, then the file at `archive` to its end when one is given, opened anew; its standard output
-    /// goes raw into the sink `sink` makes anew when one is given, else to the log with its standard error. The call
-    /// that counts, its lines kept; else why the file, the sink or the call could not be made, or the interrupt.
+    /// attempt is fed `head`, then, when an archive is given, the open file's first bytes up to its packed length, read
+    /// from its start at a position of its own; its standard output goes raw into the sink `sink` makes anew when
+    /// one is given, else to the log with its standard error. The call that counts, its lines kept; else why the
+    /// archive, the sink or the call could not be made, or the interrupt.
     pub(super) fn inputs_call(
         &mut self,
         head: &Arc<str>,
-        archive: Option<&Path>,
+        archive: Option<(&File, u64)>,
         sink: Option<&dyn Fn() -> Result<RawSink, String>>,
         watch: Watch,
     ) -> Result<Called, End> {
@@ -1911,9 +1918,11 @@ impl Attempt<'_, '_> {
         let raise = self.raises_at("inputs");
         let (called, _) = self.with_retry(SSH_FAILED, |attempt| {
             let input = match archive {
-                Some(path) => {
-                    let file = File::open(path).map_err(|error| End::Failed(format!("cannot read {}: {error}", path.display())))?;
-                    Input::Streamed(Arc::clone(head), file)
+                Some((file, length)) => {
+                    let file = file
+                        .try_clone()
+                        .map_err(|error| End::Failed(format!("cannot read the inputs archive: {error}")))?;
+                    Input::Streamed(Arc::clone(head), Archived::new(file, length))
                 }
                 None => Input::Text(Arc::clone(head)),
             };
@@ -1986,8 +1995,8 @@ impl Attempt<'_, '_> {
         let launch = piped_launch(command, console_of(watch)).map_err(|error| cannot_start(error.to_string()))?;
         let (suspended, stdout, stderr, stdin) = launched(&launch, &job, starts.input.is_some()).map_err(|error| cannot_start(error.to_string()))?;
         let running = suspended.assign_and_resume(&job).map_err(|error| cannot_start(error.to_string()))?;
-        let sent = Arc::new(AtomicU64::new(0));
-        let feeder = stdin.zip(starts.input).map(|(stdin, input)| fed(stdin, input, Arc::clone(&sent)));
+        let feeding = Arc::new(Feeding::default());
+        let feeder = stdin.zip(starts.input).map(|(stdin, input)| fed(stdin, input, Arc::clone(&feeding)));
         let shared = Arc::new(Shared::new());
         // Only the run call carries the run's nonce, and only it says the hang hint.
         let run_call = starts.nonce.is_some();
@@ -2020,7 +2029,7 @@ impl Attempt<'_, '_> {
             running: &running,
             job: &job,
             progress: &shared.progress,
-            sent: &sent,
+            feeding: &feeding,
             readers: &readers,
             shown: &shown,
             hang: self
@@ -2388,6 +2397,22 @@ impl Sending {
         }
         now.saturating_duration_since(self.moved)
     }
+
+    /// How long, at `now`, the put has been silent: while its feeder still writes, `count` bytes written so far, the
+    /// shorter of the feeder's silence and its output's, `heard` ago; once the feeder has `finished`, never, since the
+    /// box installs the archive without a word and the transfer ceiling alone watches it then.
+    fn idle(&mut self, count: u64, finished: bool, heard: Duration, now: Instant) -> Duration {
+        let quiet = self.quiet(count, now);
+        if finished { Duration::ZERO } else { quiet.min(heard) }
+    }
+}
+
+/// What a call's feeder has done, shared with its watch: the bytes it has written to the call's standard input, and
+/// whether it has finished writing and closed it.
+#[derive(Default)]
+struct Feeding {
+    sent: AtomicU64,
+    finished: AtomicBool,
 }
 
 /// A started call the client watches: its process and job, when its streams last sent a byte, how many bytes its feeder
@@ -2397,7 +2422,7 @@ struct Watched<'w> {
     running: &'w Running,
     job: &'w Job,
     progress: &'w Progress,
-    sent: &'w AtomicU64,
+    feeding: &'w Feeding,
     readers: &'w Receiver<()>,
     shown: &'w str,
     hang: Option<RunHang<'w>>,
@@ -2440,27 +2465,43 @@ impl Watched<'_> {
                 let ended = over.map_or(CallEnd::Exited(code.cast_signed()), CallEnd::ExitedOver);
                 return Ok((ended, looks));
             }
-            if (self.progress.heard_any() || !watch.interruptible())
-                && let Some(interrupt) = raise.take()
-            {
-                interrupt.raise();
-            }
-            if watch.interruptible() && interrupt.is_some_and(Interrupt::is_raised) {
+            if self.interrupted(watch, interrupt, &mut raise) {
                 let ended = CallEnd::Interrupted(self.end(open));
                 return Ok((ended, looks));
             }
             let written = self.written(watch, &mut looks);
             let now = Instant::now();
-            // The put sends, so its silence is counted on the bytes its feeder wrote, not on its output.
-            let idle = match watch {
-                Watch::Put(_) => sending.quiet(self.sent.load(Ordering::Relaxed), now),
-                _ => self.progress.idle(),
-            };
+            let idle = self.idle(watch, &mut sending, now);
             if let Some(cut) = watch.cut(now, begun, idle, self.progress.raised(), written) {
                 let ended = CallEnd::Cut(cut, self.end(open));
                 return Ok((ended, looks));
             }
             open -= self.readers_ended(open, tick);
+        }
+    }
+
+    /// Raises `raise` once, taking it, when the call has sent its first byte, or at once for a call a Ctrl+C does not
+    /// end, which has no output to wait for; then whether the console `interrupt` has ended the call watched as `watch`.
+    fn interrupted(&self, watch: Watch, interrupt: Option<Interrupt>, raise: &mut Option<Interrupt>) -> bool {
+        if (self.progress.heard_any() || !watch.interruptible())
+            && let Some(interrupt) = raise.take()
+        {
+            interrupt.raise();
+        }
+        watch.interruptible() && interrupt.is_some_and(Interrupt::is_raised)
+    }
+
+    /// How long, at `now`, the call watched as `watch` has been silent: a put as its feeder's [`Sending::idle`] says,
+    /// since it sends; any other call since its output's last byte.
+    fn idle(&self, watch: Watch, sending: &mut Sending, now: Instant) -> Duration {
+        match watch {
+            Watch::Put(_) => sending.idle(
+                self.feeding.sent.load(Ordering::Relaxed),
+                self.feeding.finished.load(Ordering::Acquire),
+                self.progress.idle(),
+                now,
+            ),
+            _ => self.progress.idle(),
         }
     }
 
@@ -2558,8 +2599,40 @@ struct Fed {
 /// manifest and archive.
 pub(super) enum Input {
     Text(Arc<str>),
-    Streamed(Arc<str>, File),
+    Streamed(Arc<str>, Archived),
 }
+
+/// The inputs archive as one put attempt reads it: a handle on the held file, read by positional reads at an offset of
+/// this reader's own, so the position the handle shares with its clones, which a feeder of an earlier attempt may still
+/// move, never moves this one; up to the packed `length`.
+pub(super) struct Archived {
+    file: File,
+    offset: u64,
+    length: u64,
+}
+
+impl Archived {
+    /// The first `length` bytes of `file`, read from its start.
+    pub(super) fn new(file: File, length: u64) -> Archived {
+        Archived { file, offset: 0, length }
+    }
+}
+
+impl Read for Archived {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let left = usize::try_from(self.length.saturating_sub(self.offset)).unwrap_or(usize::MAX);
+        let most = left.min(buffer.len());
+        let Some(into) = buffer.get_mut(..most).filter(|into| !into.is_empty()) else {
+            return Ok(0);
+        };
+        let read = self.file.seek_read(into, self.offset)?;
+        self.offset += read as u64;
+        Ok(read)
+    }
+}
+
+/// The bytes a feeder writes to a call's standard input at a time.
+const FEED_BUFFER: usize = 64 * 1024;
 
 /// The thread feeding a call of `gate box` the `verb` its input, which gives back how the write went.
 struct Feeder {
@@ -2647,28 +2720,43 @@ impl<W: Write> Write for Counted<'_, W> {
     }
 }
 
-/// Writes what `fed` gives to a call's `stdin` on a thread of its own, each byte counted in `sent`, then closes it; the
-/// thread gives back how the write went, which [`Attempt::fed_out`] reads once the call has ended.
-fn fed(stdin: File, fed: Fed, sent: Arc<AtomicU64>) -> Feeder {
+/// Writes what `fed` gives to a call's `stdin` on a thread of its own, through a [`FEED_BUFFER`] buffer, each byte that
+/// reaches it counted in `feeding`, then closes it and marks `feeding` finished; the thread gives back how the write
+/// went, which [`Attempt::fed_out`] reads once the call has ended.
+fn fed(stdin: File, fed: Fed, feeding: Arc<Feeding>) -> Feeder {
     let Fed { verb, input } = fed;
     let thread = thread::spawn(move || {
-        let mut stdin = Counted { inner: stdin, sent: &sent };
-        fed_with(&mut stdin, input)
+        let mut stdin = feeder_writer(stdin, &feeding.sent);
+        let written = fed_with(&mut stdin, input);
+        drop(stdin);
+        feeding.finished.store(true, Ordering::Release);
+        written
     });
     Feeder { verb, thread }
 }
 
-/// Writes `input` to `stdin`: its text, and then the file it streams, to the file's end or to the box's.
+/// The writer a feeder writes a call's input through to `inner`: a [`FEED_BUFFER`] buffer over a count, in `sent`, of
+/// each byte that reaches `inner`.
+fn feeder_writer<W: Write>(inner: W, sent: &AtomicU64) -> BufWriter<Counted<'_, W>> {
+    BufWriter::with_capacity(FEED_BUFFER, Counted { inner, sent })
+}
+
+/// Writes `input` to `stdin` and flushes it: its text, and then the file it streams, to its packed length or until the box closes it.
 fn fed_with(stdin: &mut impl Write, input: Input) -> io::Result<()> {
     match input {
-        Input::Text(text) => stdin.write_all(text.as_bytes()),
+        Input::Text(text) => {
+            stdin.write_all(text.as_bytes())?;
+            stdin.flush()
+        }
         Input::Streamed(head, mut file) => {
+            // The head reaches the pipe before the archive does, so a pipe closed during it is the failure it is.
             stdin.write_all(head.as_bytes())?;
+            stdin.flush()?;
             // A box that refuses before it reads the file closes its input early: the write ends there, and the
             // call's own status and output say how it went.
-            match io::copy(&mut file, stdin) {
+            match io::copy(&mut file, stdin).and_then(|_| stdin.flush()) {
                 Err(error) if error.kind() == io::ErrorKind::BrokenPipe => Ok(()),
-                copied => copied.map(drop),
+                copied => copied,
             }
         }
     }
@@ -4393,6 +4481,125 @@ mod tests {
             Some(Cut::Silent(10 * second)),
             "a feeder that stopped writing is a stalled put"
         );
+    }
+
+    #[test]
+    fn a_put_counts_its_output_while_it_feeds_and_no_silence_once_fed() {
+        let second = Duration::from_secs(1);
+        let begun = Instant::now();
+        let limits = Limits {
+            started: begun,
+            stall: 10 * second,
+            command: 60 * second,
+            backstop: 360 * second,
+            transfer: 1800 * second,
+            bound: 30 * second,
+        };
+        let put = Watch::Put(limits);
+        let mut sending = super::Sending::new(begun);
+        let at = begun + 30 * second;
+        let heard_lately = sending.idle(0, false, 2 * second, at);
+        assert_eq!(heard_lately, 2 * second, "the box's output keeps a put whose feeder is blocked alive");
+        assert_eq!(put.cut(at, begun, heard_lately, Raised::default(), None), None);
+        let both_silent = sending.idle(0, false, 30 * second, at);
+        assert_eq!(
+            put.cut(at, begun, both_silent, Raised::default(), None),
+            Some(Cut::Silent(10 * second)),
+            "silent both ways while feeding is a stalled put"
+        );
+        let installing = begun + 1700 * second;
+        let fed = sending.idle(0, true, 1700 * second, installing);
+        assert_eq!(fed, Duration::ZERO, "a fed put is never silent");
+        assert_eq!(put.cut(installing, begun, fed, Raised::default(), None), None);
+        let late = begun + 1800 * second;
+        assert_eq!(
+            put.cut(late, begun, sending.idle(0, true, 1800 * second, late), Raised::default(), None),
+            Some(Cut::Ceiling(1800 * second)),
+            "the transfer ceiling alone watches a fed put"
+        );
+    }
+
+    /// A writer that takes `room` bytes, then fails each write as a closed pipe does.
+    struct ClosesAfter {
+        room: usize,
+    }
+
+    impl Write for ClosesAfter {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            if self.room == 0 {
+                return Err(io::Error::from(io::ErrorKind::BrokenPipe));
+            }
+            let taken = buffer.len().min(self.room);
+            self.room -= taken;
+            Ok(taken)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_feeder_ends_quietly_on_a_pipe_closed_in_its_archive_but_not_in_its_head() {
+        let folder = crate::test_support::temp_dir().join(format!("gate-client-feeder-{}", std::process::id()));
+        fs::create_dir_all(&folder).expect("the scratch folder can be made");
+        let path = folder.join("archive");
+        fs::write(&path, vec![b'a'; 200_000]).expect("the archive can be written");
+        let streamed = |head: &str| {
+            let file = fs::File::open(&path).expect("the archive can be opened");
+            super::Input::Streamed(Arc::from(head), super::Archived::new(file, 200_000))
+        };
+        // Each through the writer stack a feeder writes through, its buffer included.
+        let fed = |room: usize| {
+            let sent = std::sync::atomic::AtomicU64::new(0);
+            super::fed_with(&mut super::feeder_writer(ClosesAfter { room }, &sent), streamed("request\n"))
+        };
+
+        let in_head = fed(4);
+        let in_archive = fed(100);
+
+        assert_eq!(in_head.map_err(|error| error.kind()), Err(io::ErrorKind::BrokenPipe));
+        assert_eq!(in_archive.map_err(|error| error.kind()), Ok(()));
+        fs::remove_dir_all(&folder).expect("the scratch folder can be removed");
+    }
+
+    #[test]
+    fn two_put_attempts_over_one_handle_each_read_the_whole_archive() {
+        let folder = crate::test_support::temp_dir().join(format!("gate-client-archived-{}", std::process::id()));
+        fs::create_dir_all(&folder).expect("the scratch folder can be made");
+        let path = folder.join("archive");
+        let archive: Vec<u8> = (0..100_000_u32).map(|at| at.to_le_bytes()[0] ^ at.to_le_bytes()[1]).collect();
+        fs::write(&path, &archive).expect("the archive can be written");
+        let held = fs::File::open(&path).expect("the archive can be opened");
+        let packed = 90_000;
+        let clone = || held.try_clone().expect("the handle can be cloned");
+        let mut first = super::Archived::new(clone(), packed);
+        let mut second = super::Archived::new(clone(), packed);
+        let (mut read_first, mut read_second) = (Vec::new(), Vec::new());
+
+        let mut chunk = [0_u8; 7_000];
+        loop {
+            let one = first.read(&mut chunk).expect("the first attempt reads");
+            read_first.extend_from_slice(chunk.get(..one).unwrap_or_default());
+            let two = second.read(chunk.get_mut(..3_000).unwrap_or_default()).expect("the second attempt reads");
+            read_second.extend_from_slice(chunk.get(..two).unwrap_or_default());
+            if one == 0 && two == 0 {
+                break;
+            }
+        }
+
+        assert_eq!(
+            Some(read_first.as_slice()),
+            archive.get(..90_000),
+            "the first attempt reads the packed length from the start"
+        );
+        assert_eq!(
+            Some(read_second.as_slice()),
+            archive.get(..90_000),
+            "and so does the second, read between its reads"
+        );
+        drop(held);
+        fs::remove_dir_all(&folder).expect("the scratch folder can be removed");
     }
 
     #[test]

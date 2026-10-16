@@ -85,6 +85,11 @@ impl Manifest {
         self.files.insert(ordinal_upper(&path), (path, held));
     }
 
+    /// Drops the file at `path`, found without regard to case, when the manifest holds one.
+    pub(crate) fn remove(&mut self, path: &str) {
+        self.files.remove(&ordinal_upper(path));
+    }
+
     /// What the PC holds at `path`, found without regard to case.
     pub(crate) fn get(&self, path: &str) -> Option<&Held> {
         self.files.get(&ordinal_upper(path)).map(|(_, held)| held)

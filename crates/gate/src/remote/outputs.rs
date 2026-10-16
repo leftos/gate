@@ -53,10 +53,10 @@ const STOPPED: &str = "the fetch was stopped by the watchdog";
 const PARTIAL: &str = "partial";
 /// `GENERIC_WRITE`, which lives in `Win32_Foundation`, a feature this crate does not enable: the access the archive
 /// file is made with, beside [`DELETE`] so a make it refuses can remove that file through the same handle.
-const GENERIC_WRITE: u32 = 0x4000_0000;
+pub(super) const GENERIC_WRITE: u32 = 0x4000_0000;
 /// `DELETE`, from `Win32_Foundation` too: the access that lets [`Archive::create`] remove a file it refuses through the
 /// handle it made it with, whatever its name now resolves to.
-const DELETE: u32 = 0x0001_0000;
+pub(super) const DELETE: u32 = 0x0001_0000;
 /// The most of an outputs cap record that is read: its one count fits many times over.
 const CAP_RECORD_BYTES: u64 = 4096;
 /// What an archive fetched whole and handed to the install is called when it cannot be removed.
@@ -142,7 +142,7 @@ impl Archive {
     /// nor its rename, so nothing can move the folder or remove it while the archive, and the stage the install makes
     /// beside it, are in it. The handle also says through the folder itself that it is a folder, not a link or a
     /// junction, and that its final path is the worktree's own `.tmp`. Else why it cannot be held.
-    fn hold(&mut self, folder: &Path) -> io::Result<()> {
+    pub(super) fn hold(&mut self, folder: &Path) -> io::Result<()> {
         if self.hold.is_some() {
             return Ok(());
         }

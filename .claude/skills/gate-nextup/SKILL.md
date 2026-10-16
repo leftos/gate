@@ -69,6 +69,8 @@ The machine-alone case is `stall::a_command_whose_only_work_is_a_child_outside_i
 
 The machine-alone cases also include the escapee kill cases `stall::a_stall_kill_ends_a_child_outside_the_job_whose_launcher_has_ended`, `stall::a_stall_kill_ends_a_child_outside_the_job_whose_launcher_exited_at_once`, `ceiling::a_ceiling_kill_ends_a_child_outside_the_job_whose_launcher_has_ended` and `interrupt::a_ctrl_c_ends_a_child_outside_the_job_whose_launcher_has_ended`.
 
+The machine-alone cases also include `remote_inputs::a_put_whose_box_works_silently_after_the_archive_is_sent_still_passes`.
+
 That case proves "not stalled" inside a short window, with an escapee that runs at BelowNormal and can be starved into a false STALLED. When the diff touches the watchdog, also run `-Slot critical -TimeoutSeconds 600 -- cargo nextest run -p gate --all-features --cargo-profile test-release --run-ignored only -E 'binary(suite)'`.
 
 `stall::a_stall_kill_ends_a_packaged_app_the_command_started` is machine-dependent: it runs only where the first `pwsh` on PATH is the Store (WindowsApps) alias, and skips on this PC once the Store pwsh is removed. To drive it, run it through `gate.exe` directly with the alias first on PATH.
