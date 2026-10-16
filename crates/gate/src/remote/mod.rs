@@ -41,6 +41,7 @@ mod retry;
 pub(crate) mod siblings;
 mod snapshot;
 mod syncback;
+#[cfg(feature = "test-seams")]
 mod tamper;
 #[cfg_attr(
     not(test),

@@ -33,7 +33,7 @@ use gate_args::BoxVerb;
 use gate_args::RunRequest;
 use gate_args::TestSeams;
 use gate_state::{FallbackReason, KernelObject, key_hash};
-use gate_win32::{AcquireError, Interrupt, Job, NamedMutex, OwnedMutexGuard, PipedConsole, Running};
+use gate_win32::{AcquireError, Interrupt, Job, NamedMutex, OwnedMutexGuard, PipedConsole, Running, Share};
 use jiff::{SignedDuration, Timestamp};
 use regex::Regex;
 
@@ -48,6 +48,7 @@ use super::payload::{self, Location, RunCall};
 use super::retry::{self, Ended, GIT_SSH_FAILED, SSH_FAILED};
 use super::snapshot::{self, Bounded, Place, Snapshot};
 use super::syncback;
+#[cfg(feature = "test-seams")]
 use super::tamper;
 use super::toolchain::{self, Manifest, Reported};
 #[cfg(feature = "test-seams")]
@@ -65,6 +66,7 @@ use crate::boxside::payload::{PairRefused, Payload, escaped};
 use crate::durations::{Usual, hang_hint};
 use crate::environment::Variables;
 use crate::outputs::archive::sent_limit;
+use crate::route::open_followed;
 #[cfg(feature = "test-seams")]
 use crate::run::find_program;
 use crate::run::{CONTROL_C_EXIT, is_within, resolved};
@@ -136,6 +138,7 @@ pub(crate) struct RustClient {
     /// `--test-own-start-fails`: this gate's start, which names the sync-back's quarantine, cannot be read.
     own_start_fails: bool,
     /// `--test-remote-tamper`: the change the client makes to its own folders at one point of the run.
+    #[cfg(feature = "test-seams")]
     tamper: Option<String>,
 }
 
@@ -175,6 +178,7 @@ impl RustClient {
             outputs_budget: seams.remote_outputs_budget_bytes.unwrap_or(OUTPUTS_BUDGET),
             log_cap: seams.remote_log_cap_bytes.unwrap_or(watchdog::LOG_CAP),
             own_start_fails: seams.own_start_fails,
+            #[cfg(feature = "test-seams")]
             tamper: seams.remote_tamper.clone(),
         }
     }
@@ -288,6 +292,7 @@ impl RemoteClient for RustClient {
             outputs_budget: self.outputs_budget,
             log_cap: self.log_cap,
             own_start_fails: self.own_start_fails,
+            #[cfg(feature = "test-seams")]
             tamper: self.tamper.as_deref(),
             brought_back: None,
             split: Split::default(),
@@ -296,7 +301,7 @@ impl RemoteClient for RustClient {
             hang_said: false,
             adjusted: None,
             box_killed: None,
-            pair: None,
+            held_run: None,
             ceiling: None,
             places: Vec::new(),
             local_major: None,
@@ -316,8 +321,9 @@ impl RemoteClient for RustClient {
 
 /// What the line of a run that stays here for one of its pair's repositories starts with.
 const NOT_ROUTED: &str = "gate: not routed: ";
-/// Why a worktree whose lock another run's sync-back holds past the lock wait keeps the run here.
-const BUSY: &str = "is busy with another run's sync-back";
+/// Why a worktree whose lock another run holds past the lock wait keeps the run here: the holder may be another routed
+/// run's snapshot, push or sync-back.
+const BUSY: &str = "is busy with another routed run";
 /// Why a pair's repository keeps the run here when git finds it elsewhere after its save than at its check.
 const MOVED_GIT: &str = "changed its git location while it was held";
 
@@ -333,7 +339,7 @@ fn who(at: usize, name: &str) -> String {
     if at == 0 { name.to_owned() } else { sibling_who(name) }
 }
 
-/// The end of a run whose worktree `name`'s lock another run's sync-back holds past the wait, the main one's, named
+/// The end of a run whose worktree `name`'s lock another routed run holds past the wait, the main one's, named
 /// `leaf`, or a sibling's.
 fn busy(leaf: &str, name: &str) -> End {
     let who = if name == leaf { name.to_owned() } else { sibling_who(name) };
@@ -357,6 +363,19 @@ fn repo_end(at: usize, name: &str, end: End) -> End {
 /// Whether the paths `a` and `b` name one folder as git spells them: equal but for `\` against `/` and ASCII case.
 fn same_path(a: &str, b: &str) -> bool {
     a.replace('\\', "/").eq_ignore_ascii_case(&b.replace('\\', "/"))
+}
+
+/// The single repository's root `call` names, opened following links without delete sharing, so it cannot be moved
+/// or replaced while the handle is open; one whose id cannot be read, or is not the one the route was decided for,
+/// keeps the run here naming it, as a pair's root does ([`Held::hold`]).
+fn root_checked(call: &RemoteCall<'_>) -> Result<File, End> {
+    let cannot = |error: io::Error| not_routed(call.leaf, format_args!("cannot be checked: {error}"));
+    let folder = open_followed(Path::new(call.root), Share::NoDelete).map_err(cannot)?;
+    let (volume, file) = gate_win32::file_id(&folder).map_err(cannot)?;
+    if (gate_router::FolderId { volume, file }) != call.root_id {
+        return Err(not_routed(call.leaf, "is not the folder the route was decided for"));
+    }
+    Ok(folder)
 }
 
 /// The pair's repository `repo` as its git calls ask about it, bounded at the pair's parent folder `ceiling`.
@@ -389,7 +408,7 @@ struct Repo {
 /// What a run holds from before its snapshots until its last save: a pair's folders ([`Held`]), `None` for a run of one
 /// repository, and the worktree locks of its root and its siblings, so no other run's sync-back writes one of them
 /// while it is snapshotted and pushed.
-struct PairHold {
+struct RunHold {
     held: Option<Held>,
     _locks: Vec<Locked>,
 }
@@ -776,6 +795,7 @@ pub(super) struct Attempt<'c, 'a> {
     /// `--test-own-start-fails`: this gate's start, which names the sync-back's quarantine, cannot be read.
     pub(super) own_start_fails: bool,
     /// `--test-remote-tamper`: the change made to the run's own folders at one point of it ([`tamper::at`]).
+    #[cfg(feature = "test-seams")]
     tamper: Option<&'c str>,
     /// Whether the run's outputs were brought back, as its outputs step ended ([`outputs::ended`]); `None` for a run
     /// that never reached it.
@@ -792,7 +812,7 @@ pub(super) struct Attempt<'c, 'a> {
     /// The kill the box's kill tag named, set only when the run call ended as the box's own kill.
     box_killed: Option<BoxKill>,
     /// The run's folders and locks, held from before its snapshots until its last save; `None` before and once let go.
-    pair: Option<PairHold>,
+    held_run: Option<RunHold>,
     /// The folder every git call about a pair's repository stops its search at, the pair's parent folder; `None` for a
     /// run of one repository.
     ceiling: Option<PathBuf>,
@@ -817,8 +837,9 @@ struct RunEnd {
 impl Attempt<'_, '_> {
     /// The phases in order; `Err` for an end before the run call.
     fn phases(&mut self) -> Result<End, End> {
+        #[cfg(feature = "test-seams")]
         tamper::at(self.tamper, tamper::BEFORE_HOLD, self.call)?;
-        self.hold_pair()?;
+        self.hold_run()?;
         let mut repos = self.repos();
         let snapshots = self.snapshots(&repos)?;
         let location = self.location(&mut repos)?;
@@ -851,7 +872,7 @@ impl Attempt<'_, '_> {
         self.parity(&repos, &snapshots, &trees, &prepared)?;
         self.pushes(&repos, &snapshots, &prepared.created)?;
         // The pair's folders are let go before the run call, which never runs while they are held.
-        self.release_pair()?;
+        self.release_run()?;
         // After the push: a run refused before it, at the preflight or by the parity check, leaves no marker.
         outputs::marked(&sent)?;
         let called = self.run_call(&location, &run_input, &nonce)?;
@@ -897,17 +918,19 @@ impl Attempt<'_, '_> {
     }
 
     /// For a call that carries siblings, holds the pair's folders ([`Held::hold`]) and bounds every git call about the
-    /// pair at the root's parent; then, for every run, takes the worktree locks of the root and of each sibling, in the
-    /// order of their ids, waiting for one another run's sync-back holds until the lock wait has passed. A folder that
-    /// cannot be held, and a lock still held past the wait, keep the run here naming the repository.
-    fn hold_pair(&mut self) -> Result<(), End> {
+    /// pair at the root's parent; for a run of one repository, checks its root ([`root_checked`]). Then, for every run,
+    /// takes the worktree locks of the root and of each sibling, in the order of their ids, waiting for one another
+    /// routed run holds until the lock wait has passed. A folder that cannot be held or checked, and a lock still held
+    /// past the wait, keep the run here naming the repository.
+    fn hold_run(&mut self) -> Result<(), End> {
         self.go_on()?;
         let call = self.call;
-        let held = if call.siblings.is_empty() {
-            None
+        // A single repository's root stays open, so it cannot be moved or replaced, until its lock holds it.
+        let (held, _root) = if call.siblings.is_empty() {
+            (None, Some(root_checked(call)?))
         } else {
             let held = Held::hold(call.root, call.root_id, call.leaf, &call.siblings);
-            Some(held.map_err(|refused| End::NotRouted(refused.line()))?)
+            (Some(held.map_err(|refused| End::NotRouted(refused.line()))?), None)
         };
         let main = Folder {
             name: call.leaf,
@@ -929,51 +952,69 @@ impl Attempt<'_, '_> {
             };
             self.ceiling = Some(parent.to_path_buf());
         }
-        self.pair = Some(PairHold { held, _locks: locks });
+        self.held_run = Some(RunHold { held, _locks: locks });
         Ok(())
     }
 
     /// Reads every held folder of a pair again ([`Held::recheck`]): one that moved keeps the run here naming it.
     fn recheck_pair(&self) -> Result<(), End> {
-        match self.pair.as_ref().and_then(|pair| pair.held.as_ref()) {
+        match self.held_pair() {
             Some(held) => held.recheck().map_err(|refused| End::NotRouted(refused.line())),
             None => Ok(()),
         }
     }
 
+    /// The pair's folders while they are held; `None` for a run of one repository and once let go.
+    fn held_pair(&self) -> Option<&Held> {
+        self.held_run.as_ref().and_then(|run| run.held.as_ref())
+    }
+
     /// Lets the run's folders and locks go once every repository is pushed and saved, after reading every held folder's
     /// path again ([`Attempt::recheck_pair`]).
-    fn release_pair(&mut self) -> Result<(), End> {
+    fn release_run(&mut self) -> Result<(), End> {
         let rechecked = self.recheck_pair();
         self.places.clear();
-        self.pair = None;
+        self.held_run = None;
         rechecked
     }
 
     /// Holds the git folder and the common folder git named at `place` for the repository said as `who`
     /// ([`Held::hold_git`]); the common folder's id.
     fn hold_git(&mut self, who: &str, place: &Place) -> Result<gate_router::FolderId, End> {
-        let Some(held) = self.pair.as_mut().and_then(|pair| pair.held.as_mut()) else {
+        let Some(held) = self.held_run.as_mut().and_then(|run| run.held.as_mut()) else {
             return Err(End::Failed(format!("the folders of {who} are not held")));
         };
         held.hold_git(who, &place.git_dir, &place.common)
             .map_err(|refused| End::NotRouted(refused.line()))
     }
 
-    /// Where git found the pair's repository whose root is `folder` at its check; `None` for a run of one repository.
-    fn place_at(&self, folder: &Path) -> Option<&Place> {
-        self.places.iter().find(|(root, _)| Path::new(root) == folder).map(|(_, place)| place)
+    /// Where git found the pair's repository whose root is `folder` at its check; else, for a root spelled other than
+    /// the one recorded then, why it has none.
+    fn place_at(&self, folder: &Path) -> Result<&Place, String> {
+        self.places
+            .iter()
+            .find(|(root, _)| Path::new(root) == folder)
+            .map(|(_, place)| place)
+            .ok_or_else(|| format!("the git location of {} was not recorded at its check", folder.display()))
     }
 
-    /// The pair's repository whose root is `folder` as its git calls ask about it, at the place git found it at its
-    /// check; `None` for a run of one repository.
-    fn bound_at<'b>(&'b self, folder: &'b Path) -> Option<Bounded<'b>> {
-        let ceiling = self.ceiling.as_deref()?;
-        Some(Bounded {
+    /// The pair's repository whose root is `folder` as its git calls ask about it: while the pair is held, at the place
+    /// git found it at its check ([`Attempt::place_at`]), one with none recorded failing; once let go, bounded at the
+    /// pair's parent alone; `None` for a run of one repository.
+    fn bound_at<'b>(&'b self, folder: &'b Path) -> Result<Option<Bounded<'b>>, String> {
+        let Some(ceiling) = self.ceiling.as_deref() else {
+            return Ok(None);
+        };
+        let place = if self.held_pair().is_some() {
+            Some(self.place_at(folder)?)
+        } else {
+            None
+        };
+        Ok(Some(Bounded {
             root: folder,
             ceiling,
-            place: self.place_at(folder),
-        })
+            place,
+        }))
     }
 
     /// The repositories the run sends: the main one, named by its folder name, then each sibling in declared order.
@@ -1026,11 +1067,12 @@ impl Attempt<'_, '_> {
         for (at, repo) in repos.iter().enumerate() {
             let root = Path::new(&repo.root);
             let bound = Bounded {
-                place: self.place_at(root),
+                place: Some(self.place_at(root).map_err(End::Failed)?),
                 ..bounded(repo, &ceiling)
             };
             let taken = snapshot::take_bounded(bound, self.call.key, self.limit, self.call.interrupt);
             snapshots.push(taken.map_err(|error| repo_end(at, &repo.name, git_end(error)))?);
+            #[cfg(feature = "test-seams")]
             if at == 0 {
                 tamper::at(self.tamper, tamper::AFTER_FIRST_SNAPSHOT, self.call)?;
             }
@@ -1338,7 +1380,11 @@ impl Attempt<'_, '_> {
     /// repository asked at the place git found it at its check ([`Attempt::bound_at`]).
     fn git_bytes_in(&self, folder: &Path, git: &Git, args: &[&str]) -> Result<Vec<u8>, GitError> {
         // A run of one repository gives git no variable of its own.
-        let set = self.bound_at(folder).map(|bound| bound.variables()).unwrap_or_default();
+        let set = self
+            .bound_at(folder)
+            .map_err(GitError::Failed)?
+            .map(|bound| bound.variables())
+            .unwrap_or_default();
         let call = git::Call {
             set: &set,
             interrupt: self.call.interrupt,
@@ -1439,10 +1485,9 @@ impl Attempt<'_, '_> {
         let target = target.map_err(|why| repo_end(at, &repo.name, End::Failed(why)))?;
         // Only the transport's own protocol may carry the push, so no `pushInsteadOf` a repository's config names can
         // turn it into a protocol helper: ssh to a builder, a local path for the test transport's bare repositories.
+        // git reads `GIT_ALLOW_PROTOCOL` in place of every `protocol.*.allow`, a repository's own config's among them.
         let protocol = if target.ssh_command.is_some() { "ssh" } else { "file" };
-        let mut args: Vec<String> = ["-c", "protocol.allow=never", "-c"].map(str::to_owned).into();
-        args.push(format!("protocol.{protocol}.allow=always"));
-        args.extend(["push", "--no-verify", "--no-recurse-submodules", "--progress"].map(str::to_owned));
+        let mut args: Vec<String> = ["push", "--no-verify", "--no-recurse-submodules", "--progress"].map(str::to_owned).into();
         args.extend(target.receive_pack.iter().map(|pack| format!("--receive-pack={pack}")));
         args.extend(["--".to_owned(), target.url.clone(), format!("+{}:refs/gate/{key}", snapshot.commit)]);
         let bridge = snapshot.bridge.as_deref().filter(|_| !created);
@@ -1450,7 +1495,7 @@ impl Attempt<'_, '_> {
         let git = Git::find(root).map_err(|why| repo_end(at, &repo.name, End::Failed(why)))?;
         let started = Instant::now();
         let ceiling = self.ceiling.clone();
-        let place = self.place_at(root).cloned();
+        let place = self.bound_at(root).map_err(End::Failed)?.and_then(|bound| bound.place).cloned();
         let bound = ceiling.as_deref().map(|ceiling| Bounded {
             root,
             ceiling,
@@ -1459,7 +1504,8 @@ impl Attempt<'_, '_> {
         // A run of one repository gives git no variable of its own.
         let variables = bound.map(|bound| bound.variables()).unwrap_or_default();
         let ssh_command = target.ssh_command.as_deref().map(|ssh| ("GIT_SSH_COMMAND", std::ffi::OsStr::new(ssh)));
-        let set: Vec<(&str, &std::ffi::OsStr)> = ssh_command.into_iter().chain(variables.iter().copied()).collect();
+        let allowed = ("GIT_ALLOW_PROTOCOL", std::ffi::OsStr::new(protocol));
+        let set: Vec<(&str, &std::ffi::OsStr)> = ssh_command.into_iter().chain([allowed]).chain(variables.iter().copied()).collect();
         let (mut called, _) = self.with_retry(GIT_SSH_FAILED, |attempt| {
             attempt.git_started(git.command(root), &args, &set, Echo::Progress, watch)
         })?;
@@ -1476,10 +1522,12 @@ impl Attempt<'_, '_> {
         }
         let saved = snapshot::save(root, &variables, key, &snapshot.commit, self.limit);
         saved.map_err(|error| repo_end(at, &repo.name, git_end(error)))?;
+        // The push is timed to its save; the check of where git finds the repository is not part of it.
+        let took = started.elapsed();
         if let Some(bound) = bound {
             self.kept_its_place(at, repo, bound)?;
         }
-        self.pushed(repo, &snapshot.commit, &size, started.elapsed());
+        self.pushed(repo, &snapshot.commit, &size, took);
         Ok(())
     }
 
@@ -2134,7 +2182,7 @@ impl<'c, 'a> Attempt<'c, 'a> {
             hang_said: false,
             adjusted: None,
             box_killed: None,
-            pair: None,
+            held_run: None,
             ceiling: None,
             places: Vec::new(),
             local_major: None,
@@ -3335,13 +3383,13 @@ mod tests {
     };
     use super::{Entry, entries_of, gate_folders, manifest_candidates, manifest_entry};
     use crate::environment::Variables;
-    use crate::remote::git::{DOTNET_LIMIT, GIT_LIMIT, GitError};
+    use crate::remote::git::{DOTNET_LIMIT, GIT_LIMIT, Git, GitError};
     use crate::remote::held::tests::{Pair, junction};
     use crate::remote::outputs;
     use crate::remote::payload;
     use crate::remote::payload::Location;
     use crate::remote::snapshot::Snapshot;
-    use crate::remote::transport::Local;
+    use crate::remote::transport::{Local, Transport};
     use crate::remote::watchdog::{self, Kill, LOG_CAP};
     use crate::remote::worktree_lock::tests::{held_elsewhere, lock_name};
     use crate::remote::{Refusal, RemoteCall, RemoteClient, Sibling, adjusted_line, busy_line, carried, refused_line, started_line};
@@ -3490,7 +3538,7 @@ mod tests {
             hang_said: false,
             adjusted: None,
             box_killed: None,
-            pair: None,
+            held_run: None,
             ceiling: None,
             places: Vec::new(),
             local_major: None,
@@ -3543,12 +3591,12 @@ mod tests {
         let mut attempt = attempt(&call, &transport);
         attempt.lock_wait = Duration::ZERO;
 
-        let ended = attempt.hold_pair();
+        let ended = attempt.hold_run();
 
         release.send(()).expect("the other run is still there");
         holder.join().expect("the other run ends");
         drop(attempt);
-        let busy = "gate: not routed: sibling lib is busy with another run's sync-back";
+        let busy = "gate: not routed: sibling lib is busy with another routed run";
         assert!(matches!(&ended, Err(End::NotRouted(line)) if line == busy), "{ended:?}");
     }
 
@@ -3631,8 +3679,8 @@ mod tests {
         }
     }
 
-    /// A single-repository run whose root was replaced by a new folder between routing and its hold is refused at the
-    /// root's lock, which reads the folder's id against the route's.
+    /// A single-repository run whose root was replaced by a new folder between routing and its hold stays here naming
+    /// it, as a pair's root does: the folder's id is read against the route's before the root's lock is taken.
     #[test]
     fn a_root_replaced_between_routing_and_its_lock_is_refused_at_the_lock() {
         let pair = Pair::new("client-root-replaced", &[]);
@@ -3646,8 +3694,8 @@ mod tests {
         let ended = attempt.phases();
 
         drop(attempt);
-        let refused = format!("the worktree {} is not the folder the route was decided for", run.root);
-        assert!(matches!(&ended, Err(End::Failed(why)) if *why == refused), "{ended:?}");
+        let refused = "gate: not routed: app is not the folder the route was decided for";
+        assert!(matches!(&ended, Err(End::NotRouted(line)) if line == refused), "{ended:?}");
     }
 
     /// A single-repository run whose root's lock another run's sync-back holds past the lock wait stays here with the
@@ -3663,12 +3711,12 @@ mod tests {
         let mut attempt = attempt(&call, &transport);
         attempt.lock_wait = Duration::ZERO;
 
-        let ended = attempt.hold_pair();
+        let ended = attempt.hold_run();
 
         release.send(()).expect("the other run is still there");
         holder.join().expect("the other run ends");
         drop(attempt);
-        let busy = "gate: not routed: app is busy with another run's sync-back";
+        let busy = "gate: not routed: app is busy with another routed run";
         assert!(matches!(&ended, Err(End::NotRouted(line)) if line == busy), "{ended:?}");
     }
 
@@ -3716,14 +3764,14 @@ mod tests {
     /// The attempt of a pair run of `call` through [`nowhere`], its folders held and its repositories' order read.
     fn held_pair<'c, 'a>(call: &'c RemoteCall<'a>, transport: &'c Local) -> (Attempt<'c, 'a>, Vec<super::Repo>) {
         let mut attempt = attempt(call, transport);
-        attempt.hold_pair().expect("the pair is held");
+        attempt.hold_run().expect("the pair is held");
         let repos = attempt.repos();
         (attempt, repos)
     }
 
     /// Makes the held sibling `lib` of `attempt` seem to have moved ([`super::Held::misplace`]).
     fn misplaced(attempt: &mut Attempt<'_, '_>, pair: &Pair) {
-        let held = attempt.pair.as_mut().and_then(|pair| pair.held.as_mut()).expect("the pair is held");
+        let held = attempt.held_run.as_mut().and_then(|run| run.held.as_mut()).expect("the pair is held");
         let elsewhere = gate_router::sibling_root(&pair.root, "elsewhere");
         assert!(held.misplace("sibling lib", &elsewhere), "the sibling is held");
     }
@@ -3762,7 +3810,7 @@ mod tests {
         attempt.snapshots(&repos).expect("the snapshots are taken");
         misplaced(&mut attempt, &pair);
 
-        let ended = attempt.release_pair();
+        let ended = attempt.release_run();
 
         drop(attempt);
         let moved = "gate: not routed: sibling lib moved while it was held".to_owned();
@@ -3804,6 +3852,57 @@ mod tests {
 
         let line = "gate: not routed: sibling c shares its git repository with b";
         assert!(matches!(&ended, Err(End::NotRouted(said)) if said == line), "{ended:?}");
+    }
+
+    /// A pair repository's own config cannot turn its push into a protocol helper: with `protocol.ext.allow=always`
+    /// and a `pushInsteadOf` that makes the push's URL an `ext::` command writing a marker file, the push fails and the
+    /// command never runs.
+    #[test]
+    fn a_pair_repository_s_config_cannot_turn_its_push_into_a_protocol_helper() {
+        let pair = Pair::new("client-push-helper", &["lib"]);
+        repositories(&pair, &["lib"]);
+        let app = pair.folder("app");
+        let marker = pair.top.join("helper-ran");
+        git_at(&app, &["config", "protocol.ext.allow", "always"]);
+        let helper = format!("url.ext::touch {} .pushInsteadOf", marker.to_string_lossy().replace('\\', "/"));
+        let run = pair.run(&pair.root, &["lib"]);
+        let log = pair.top.join("out.log");
+        let call = pair_call(&run, carried(&run).expect("the run's siblings check"), &log);
+        let transport = nowhere();
+        let target = transport
+            .push_target(call.host, call.repo)
+            .expect("the main repository has a push target");
+        git_at(&app, &["config", &helper, &target.url]);
+        let (mut attempt, repos) = held_pair(&call, &transport);
+        let snapshots = attempt.snapshots(&repos).expect("the snapshots are taken");
+
+        let ended = attempt.pushes(&repos, &snapshots, &[]);
+
+        drop(attempt);
+        assert!(matches!(ended, Err(End::Refused(FallbackReason::Unreachable))), "{ended:?}");
+        assert!(!marker.exists(), "the protocol helper ran");
+    }
+
+    /// While a pair is held, a root spelled other than the one its git location was recorded under at its check has no
+    /// location to give git, so a git call about it fails before git starts rather than run with the ceiling alone.
+    #[test]
+    fn a_root_spelled_other_than_at_its_check_fails_while_the_pair_is_held() {
+        let pair = Pair::new("client-unrecorded", &["lib"]);
+        repositories(&pair, &["lib"]);
+        let run = pair.run(&pair.root, &["lib"]);
+        let log = pair.top.join("out.log");
+        let call = pair_call(&run, carried(&run).expect("the run's siblings check"), &log);
+        let transport = nowhere();
+        let (mut attempt, repos) = held_pair(&call, &transport);
+        attempt.snapshots(&repos).expect("the snapshots are taken");
+        let spelled = PathBuf::from(run.root.to_uppercase());
+        let git = Git::find(&spelled).expect("git is found");
+
+        let listed = attempt.git_bytes_in(&spelled, &git, &["ls-files"]);
+
+        drop(attempt);
+        let line = format!("the git location of {} was not recorded at its check", spelled.display());
+        assert!(matches!(&listed, Err(GitError::Failed(why)) if *why == line), "{listed:?}");
     }
 
     #[test]
