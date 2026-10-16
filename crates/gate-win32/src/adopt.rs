@@ -421,7 +421,7 @@ pub fn thread_is_suspended(thread: BorrowedHandle<'_>) -> io::Result<bool> {
 
 #[cfg(test)]
 #[expect(clippy::expect_used, reason = "a test whose process cannot be made or read must fail loudly")]
-mod tests {
+pub(crate) mod tests {
     use std::io;
     use std::os::windows::io::{AsHandle, AsRawHandle, BorrowedHandle, FromRawHandle};
     use std::sync::{MutexGuard, PoisonError};
@@ -451,8 +451,11 @@ mod tests {
     }
 
     /// The report an adopted child is given: a child a drop could not end fails the test that dropped it.
+    ///
+    /// The path that fires it is not tested: it needs a terminate refused on a live process that then does not end
+    /// within the wait, and a handle this process can adopt carries `PROCESS_TERMINATE`, so its terminate succeeds.
     #[expect(clippy::panic, reason = "a child a test's drop could not end must fail that test loudly")]
-    fn unended() -> crate::EndReport {
+    pub(crate) fn unended() -> crate::EndReport {
         Box::new(|pid, error| panic!("the adopted child {pid} could not be ended: {error}"))
     }
 

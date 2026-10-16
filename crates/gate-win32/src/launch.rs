@@ -1079,17 +1079,7 @@ mod tests {
     #[test]
     fn end_unstarted_reports_a_refused_terminate_of_a_live_process_and_takes_an_ended_one() {
         let _alone = crate::create::tests::ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner);
-        let system = system_directory().expect("the system folder is read");
-        let child = Launch {
-            application: system.join("cmd.exe"),
-            command_line: units("cmd /d /c exit 0"),
-            directory: system,
-            environment: EnvironmentBlock::new(std::env::vars_os()).expect("the block is built"),
-            output: LaunchOutput::Piped,
-            priority: None,
-        }
-        .start_suspended()
-        .expect("the command is created");
+        let child = suspended_cmd();
         // SAFETY: `OpenProcess` takes no pointers. A success is a fresh handle nothing else owns.
         let wait_only = unsafe { crate::own_handle(OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, 0, child.pid())) }
             .expect("the child opens");
@@ -1127,7 +1117,7 @@ mod tests {
         let wait_only = unsafe { crate::own_handle(OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, 0, child.pid())) }
             .expect("the child opens");
         let process = child.process.as_ref().expect("the process is held");
-        // SAFETY: the guard keeps the handle open for as long as the borrow lives, which ends in this statement.
+        // SAFETY: `child` holds the process handle open past this statement, and the borrow ends in it.
         let terminate = EndOnDrop(
             unsafe { std::os::windows::io::BorrowedHandle::borrow_raw(process.raw()) }
                 .try_clone_to_owned()
@@ -1147,15 +1137,6 @@ mod tests {
         drop(child);
     }
 
-    /// The report an adopted child is given: a child a drop could not end fails the test that dropped it.
-    ///
-    /// The path that fires it is not tested: it needs a terminate refused on a live process that then does not end
-    /// within the wait, and a handle this process can adopt carries `PROCESS_TERMINATE`, so its terminate succeeds.
-    #[expect(clippy::panic, reason = "a child a test's drop could not end must fail that test loudly")]
-    fn unended() -> crate::EndReport {
-        Box::new(|pid, error| panic!("the adopted child {pid} could not be ended: {error}"))
-    }
-
     #[test]
     fn end_ends_an_adopted_child() {
         let _alone = crate::create::tests::ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner);
@@ -1168,7 +1149,7 @@ mod tests {
                 OwnedHandle::from_raw_handle(released.thread),
             )
         };
-        let adopted = super::Suspended::adopt(process, thread, released.pid, unended()).expect("the child is adopted");
+        let adopted = super::Suspended::adopt(process, thread, released.pid, crate::adopt::tests::unended()).expect("the child is adopted");
 
         adopted.end(HANG_GUARD).expect("the adopted child is ended");
 
@@ -1181,17 +1162,7 @@ mod tests {
     #[test]
     fn release_gives_up_the_child_without_ending_it() {
         let _alone = crate::create::tests::ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner);
-        let system = system_directory().expect("the system folder is read");
-        let child = Launch {
-            application: system.join("cmd.exe"),
-            command_line: units("cmd /d /c exit 0"),
-            directory: system,
-            environment: EnvironmentBlock::new(std::env::vars_os()).expect("the block is built"),
-            output: LaunchOutput::Piped,
-            priority: None,
-        }
-        .start_suspended()
-        .expect("the command is created");
+        let child = suspended_cmd();
         let watch = StoppableProcess::open(child.pid()).expect("the child opens").expect("the child exists");
         let expected_pid = child.pid();
 

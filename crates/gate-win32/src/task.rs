@@ -17,6 +17,7 @@ use std::os::windows::io::{AsRawHandle, BorrowedHandle};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::VARIANT_BOOL;
@@ -28,9 +29,7 @@ use windows::Win32::System::TaskScheduler::{
 };
 use windows::Win32::System::Variant::{VARIANT, VT_BSTR};
 use windows::core::{BSTR, GUID, HRESULT, IUnknown, Interface};
-use windows_sys::Win32::Foundation::{
-    ERROR_INSUFFICIENT_BUFFER, ERROR_NONE_MAPPED, GENERIC_READ, HANDLE, HMODULE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
-};
+use windows_sys::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, ERROR_NONE_MAPPED, GENERIC_READ, HANDLE, HMODULE};
 use windows_sys::Win32::Security::{
     ACL, DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, GetSecurityDescriptorOwner, LookupAccountNameW, OWNER_SECURITY_INFORMATION, PSID,
     SID_NAME_USE,
@@ -38,9 +37,8 @@ use windows_sys::Win32::Security::{
 use windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_READ;
 use windows_sys::Win32::System::LibraryLoader::{GetModuleFileNameW, GetProcAddress, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW};
 use windows_sys::Win32::System::SystemServices::ACCESS_DENIED_ACE_TYPE;
-use windows_sys::Win32::System::Threading::WaitForMultipleObjects;
 
-use crate::pipe::{Early, Entry, SecurityDescriptor, Signalled, check_wake, entries_of, is_sid_string, wait_any};
+use crate::pipe::{Early, Entry, SecurityDescriptor, Signalled, check_wake, entries_of, is_sid_string, look_at_wake, wait_any};
 
 /// The library the Task Scheduler's class is made from, loaded by its full path in the system folder.
 const TASK_SCHEDULER_LIBRARY: &str = "taskschd.dll";
@@ -134,8 +132,7 @@ pub enum TaskError {
     /// that differs. Nothing was started.
     SetUpWrong(String),
     /// A call of the Task Scheduler or of COM failed before the task was started, so nothing was; the text names the
-    /// call and holds the system's message. When the text says the wait for the Task Scheduler failed, or the thread
-    /// that asked it panicked, the task may have been started; the caller drops its pipe server.
+    /// call and holds the system's message.
     Failed(String),
     /// The task was started, then a call of the Task Scheduler failed; the text names the call and holds the system's
     /// message. The instance may be running, and its helper ends by its own limits.
@@ -146,6 +143,9 @@ pub enum TaskError {
     /// The wake handle at this index was signalled before the Task Scheduler answered, the thread left as
     /// [`TaskError::TimedOut`] leaves it; the task may have been started; the caller drops its pipe server.
     Woken(usize),
+    /// The wait for the Task Scheduler failed, or the thread that asked it panicked, after the start may have been
+    /// requested; the text says which. The task may have been started; the caller drops its pipe server.
+    Unanswered(String),
 }
 
 impl TaskError {
@@ -163,6 +163,11 @@ impl TaskError {
     fn set_up_wrong(what: &str) -> TaskError {
         TaskError::SetUpWrong(escaped(what))
     }
+
+    /// A [`TaskError::Unanswered`] of `why`, escaped.
+    fn unanswered(why: &str) -> TaskError {
+        TaskError::Unanswered(escaped(why))
+    }
 }
 
 impl fmt::Display for TaskError {
@@ -174,6 +179,7 @@ impl fmt::Display for TaskError {
             TaskError::StartedUnknown(why) => write!(formatter, "the task was started, but {why}"),
             TaskError::TimedOut => write!(formatter, "the Task Scheduler did not answer in time"),
             TaskError::Woken(index) => write!(formatter, "the wait for the Task Scheduler was ended by wake handle {index}"),
+            TaskError::Unanswered(why) => write!(formatter, "the Task Scheduler gave no answer ({why}); the task may have been started"),
         }
     }
 }
@@ -234,16 +240,23 @@ pub fn run_task(start: &TaskStart<'_>, deadline: Instant, wake: &[BorrowedHandle
         // The thread is left to finish on its own; one that has not reached the run yet starts nothing.
         cancel.store(true, Ordering::SeqCst);
     }
+    answered(waited, thread)
+}
+
+/// The answer of the start `thread` asked for, as the wait `waited` for that thread and the wake handles found it: the
+/// thread's own result once it ended; [`TaskError::Unanswered`] when it panicked or the wait failed. A thread the wait
+/// did not see end is left to finish on its own.
+fn answered(waited: io::Result<Signalled>, thread: JoinHandle<Result<StartedTask, TaskError>>) -> Result<StartedTask, TaskError> {
     match waited {
         Ok(Signalled::Event) => thread.join().unwrap_or_else(|panic| {
-            Err(TaskError::failed(&format!(
+            Err(TaskError::unanswered(&format!(
                 "the thread that starts the task panicked: {}",
                 panic_text(&*panic)
             )))
         }),
         Ok(Signalled::Early(Early::TimedOut)) => Err(TaskError::TimedOut),
         Ok(Signalled::Early(Early::Woken(index))) => Err(TaskError::Woken(index)),
-        Err(error) => Err(TaskError::failed(&format!("the wait for the Task Scheduler failed: {error}"))),
+        Err(error) => Err(TaskError::unanswered(&format!("the wait for the Task Scheduler failed: {error}"))),
     }
 }
 
@@ -253,24 +266,9 @@ fn given_up(deadline: Instant, wake: &[BorrowedHandle<'_>]) -> Result<Option<Tas
     if Instant::now() >= deadline {
         return Ok(Some(TaskError::TimedOut));
     }
-    if wake.is_empty() {
-        return Ok(None);
-    }
     let handles: Vec<HANDLE> = wake.iter().map(AsRawHandle::as_raw_handle).collect();
-    let count = u32::try_from(handles.len()).map_err(|error| TaskError::failed(&format!("the wake handles could not be counted: {error}")))?;
-    // SAFETY: `handles` holds `count` handles, each borrowed open for the whole call; a wait of 0 ms only looks.
-    let result = unsafe { WaitForMultipleObjects(count, handles.as_ptr(), 0, 0) };
-    match result {
-        WAIT_TIMEOUT => Ok(None),
-        WAIT_FAILED => Err(TaskError::failed(&format!(
-            "the wake handles could not be looked at: {}",
-            io::Error::last_os_error()
-        ))),
-        _ if result < WAIT_OBJECT_0 + count => Ok(Some(TaskError::Woken((result - WAIT_OBJECT_0) as usize))),
-        _ => Err(TaskError::failed(&format!(
-            "the look at the wake handles ended with the unexpected result 0x{result:x}"
-        ))),
-    }
+    let signalled = look_at_wake(&handles).map_err(|error| TaskError::failed(&format!("the wake handles could not be looked at: {error}")))?;
+    Ok(signalled.map(TaskError::Woken))
 }
 
 /// What the thread that asks the Task Scheduler needs, owned so it can outlive [`run_task`]'s wait.
@@ -284,6 +282,7 @@ struct Request {
     /// The deadline [`run_task`] waits until, which bounds the pid wait too.
     deadline: Instant,
     /// Set once [`run_task`] has stopped waiting, so a thread that has not run the task yet does not.
+    /// Untested: it needs a live task, and the race it narrows cannot be driven.
     cancel: Arc<AtomicBool>,
 }
 
@@ -370,14 +369,7 @@ impl SystemLibrary {
         }
         let loaded = module_path(module)
             .map_err(|error| TaskError::failed(&format!("the file {TASK_SCHEDULER_LIBRARY} was loaded from could not be read: {error}")))?;
-        let (wanted, found): (Vec<u16>, Vec<u16>) = (path.as_os_str().encode_wide().collect(), loaded.as_os_str().encode_wide().collect());
-        if !crate::launch::ordinal_equal_ignore_case(&wanted, &found) {
-            return Err(TaskError::failed(&format!(
-                "{TASK_SCHEDULER_LIBRARY} was loaded from {}, not {}",
-                shown(&loaded.display().to_string()),
-                path.display()
-            )));
-        }
+        check_loaded_from(&path, &loaded)?;
         Ok(SystemLibrary(module))
     }
 
@@ -404,6 +396,20 @@ impl SystemLibrary {
         // SAFETY: no outer object is passed; the result is a new object this thread owns.
         unsafe { factory.CreateInstance::<Option<&IUnknown>, ITaskService>(None) }.map_err(failed("make the Task Scheduler"))
     }
+}
+
+/// Refuses a [`TASK_SCHEDULER_LIBRARY`] loaded from `loaded` when that is not `wanted`, its path in the system folder,
+/// compared ordinally without regard to case.
+fn check_loaded_from(wanted: &Path, loaded: &Path) -> Result<(), TaskError> {
+    let (left, right): (Vec<u16>, Vec<u16>) = (wanted.as_os_str().encode_wide().collect(), loaded.as_os_str().encode_wide().collect());
+    if crate::launch::ordinal_equal_ignore_case(&left, &right) {
+        return Ok(());
+    }
+    Err(TaskError::failed(&format!(
+        "{TASK_SCHEDULER_LIBRARY} was loaded from {}, not {}",
+        shown(&loaded.display().to_string()),
+        wanted.display()
+    )))
 }
 
 /// The path of the file the loaded module `module` was loaded from (`GetModuleFileNameW`).
@@ -468,9 +474,10 @@ fn start_checked(library: &SystemLibrary, request: &Request) -> Result<StartedTa
 }
 
 /// Runs `task` in the request's session, as no named user and ignoring its constraints, with the request's argument
-/// as its one parameter, and reads the process it started; runs nothing once the request is cancelled.
+/// as its one parameter, and reads the process it started; runs nothing once the request is cancelled or its deadline
+/// has passed.
 fn run(task: &IRegisteredTask, request: &Request) -> Result<StartedTask, TaskError> {
-    if request.cancel.load(Ordering::SeqCst) {
+    if request.cancel.load(Ordering::SeqCst) || Instant::now() >= request.deadline {
         return Err(TaskError::failed("the start was given up before the task was run"));
     }
     let argument = BSTR::from(request.argument.as_str());
@@ -492,17 +499,42 @@ fn run(task: &IRegisteredTask, request: &Request) -> Result<StartedTask, TaskErr
     engine_pid(&running, by)
 }
 
-/// The process of the started instance `running`, read after a refresh, and again while it reads 0 and the instance
-/// has not ended, until `by`; [`StartedTask::NoPid`] when none is given by then, or the instance ended without one.
-fn engine_pid(running: &IRunningTask, by: Instant) -> Result<StartedTask, TaskError> {
-    loop {
+/// What the pid poll reads of a started instance.
+trait Instance {
+    /// Takes a new snapshot of the instance, which the reads after it give.
+    fn refresh(&self) -> windows::core::Result<()>;
+    /// The instance's state in the last snapshot.
+    fn state(&self) -> windows::core::Result<TASK_STATE>;
+    /// The id of the instance's process in the last snapshot; 0 for none.
+    fn pid(&self) -> windows::core::Result<u32>;
+}
+
+impl Instance for IRunningTask {
+    fn refresh(&self) -> windows::core::Result<()> {
         // SAFETY: the running task's interface is valid for the call.
-        unsafe { running.Refresh() }.map_err(unseen("refresh the started task"))?;
-        // The state is read before the pid, so a pid given as the instance ends is read too.
+        unsafe { self.Refresh() }
+    }
+
+    fn state(&self) -> windows::core::Result<TASK_STATE> {
         // SAFETY: as above.
-        let state = unsafe { running.State() }.map_err(unseen("read the started task's state"))?;
+        unsafe { self.State() }
+    }
+
+    fn pid(&self) -> windows::core::Result<u32> {
         // SAFETY: as above.
-        let pid = unsafe { running.EnginePID() }.map_err(unseen("read the started task's process"))?;
+        unsafe { self.EnginePID() }
+    }
+}
+
+/// The process of the started instance `running`, read after a refresh, and again while it reads 0 and the instance
+/// has not ended, until `by`; [`StartedTask::NoPid`] when none is given by then, or the instance ended without one. A
+/// start given up goes on polling until `by`, which bounds it, since the cancel flag is not passed here.
+fn engine_pid(running: &impl Instance, by: Instant) -> Result<StartedTask, TaskError> {
+    loop {
+        running.refresh().map_err(unseen("refresh the started task"))?;
+        // Both reads come from the snapshot the refresh just took.
+        let state = running.state().map_err(unseen("read the started task's state"))?;
+        let pid = running.pid().map_err(unseen("read the started task's process"))?;
         if let Some(pid) = NonZeroU32::new(pid) {
             return Ok(StartedTask::Process(pid));
         }
@@ -977,21 +1009,36 @@ fn missing(what: &'static str) -> impl Fn(windows::core::Error) -> TaskError {
 
 /// The text of a failed call that did `what`.
 fn call_failed(what: &str, error: &windows::core::Error) -> String {
-    format!("the Task Scheduler could not {what}: {} (0x{:08X})", error.message(), error.code().0)
+    format!(
+        "the Task Scheduler could not {what}: {} (0x{:08X})",
+        shown(&error.message()),
+        error.code().0
+    )
 }
 
 #[cfg(test)]
 #[expect(clippy::expect_used, reason = "a test whose setup fails must fail loudly")]
 mod tests {
+    use std::cell::Cell;
+    use std::io;
+    use std::num::NonZeroU32;
+    use std::os::windows::io::{AsHandle, FromRawHandle, OwnedHandle};
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
 
+    use windows::Win32::Foundation::E_FAIL;
+    use windows::Win32::System::TaskScheduler::{TASK_STATE, TASK_STATE_DISABLED, TASK_STATE_QUEUED, TASK_STATE_READY, TASK_STATE_RUNNING};
     use windows::core::HRESULT;
+    use windows_sys::Win32::System::Threading::CreateEventW;
 
     use super::{
-        Action, Definition, Entry, Expected, FOLDER_NOT_FOUND, TASK_NOT_FOUND, TaskArgument, TaskError, TaskStart, check_definition, missing,
-        run_task, split_task_path,
+        Action, Definition, Entry, Expected, FOLDER_NOT_FOUND, Instance, StartedTask, TASK_NOT_FOUND, TaskArgument, TaskError, TaskStart, answered,
+        check_definition, check_loaded_from, engine_pid, failed, given_up, missing, run_task, split_task_path, unseen,
     };
+    use crate::pipe::Signalled;
+
+    /// The longest a test waits for anything: it never runs out unless the code is broken.
+    const HANG_GUARD: Duration = Duration::from_secs(600);
 
     const HELPER: &str = r"C:\Users\someone\AppData\Local\gate\bin\gate-desktop-helper.exe";
 
@@ -1348,5 +1395,179 @@ mod tests {
         let started = run_task(&start_of(&path, &argument), Instant::now() + Duration::from_secs(600), &[]);
 
         assert_eq!(started, Err(TaskError::NotRegistered));
+    }
+
+    /// A started instance whose snapshots are scripted: each refresh takes the next, `None` or one past the last
+    /// failing it.
+    struct Scripted {
+        snapshots: Vec<Option<(TASK_STATE, u32)>>,
+        refreshes: Cell<usize>,
+    }
+
+    impl Scripted {
+        fn new(snapshots: Vec<Option<(TASK_STATE, u32)>>) -> Scripted {
+            Scripted {
+                snapshots,
+                refreshes: Cell::new(0),
+            }
+        }
+
+        /// The snapshot the last refresh took.
+        fn current(&self) -> windows::core::Result<(TASK_STATE, u32)> {
+            let taken = self
+                .refreshes
+                .get()
+                .checked_sub(1)
+                .and_then(|index| self.snapshots.get(index).copied().flatten());
+            taken.ok_or_else(|| windows::core::Error::from_hresult(E_FAIL))
+        }
+    }
+
+    impl Instance for Scripted {
+        fn refresh(&self) -> windows::core::Result<()> {
+            self.refreshes.set(self.refreshes.get() + 1);
+            self.current().map(|_| ())
+        }
+
+        fn state(&self) -> windows::core::Result<TASK_STATE> {
+            self.current().map(|(state, _)| state)
+        }
+
+        fn pid(&self) -> windows::core::Result<u32> {
+            self.current().map(|(_, pid)| pid)
+        }
+    }
+
+    #[test]
+    fn the_pid_poll_waits_through_queued_and_running_and_stops_at_its_bound_or_an_end() {
+        let later = Instant::now() + HANG_GUARD;
+        let process = StartedTask::Process(NonZeroU32::new(42).expect("42 is not 0"));
+        let cases = [
+            (
+                "queued, running, then a pid",
+                vec![
+                    Some((TASK_STATE_QUEUED, 0)),
+                    Some((TASK_STATE_RUNNING, 0)),
+                    Some((TASK_STATE_RUNNING, 42)),
+                ],
+                later,
+                process,
+                3,
+            ),
+            (
+                "running with no pid past the bound",
+                vec![Some((TASK_STATE_RUNNING, 0))],
+                Instant::now(),
+                StartedTask::NoPid,
+                1,
+            ),
+            ("ready with no pid", vec![Some((TASK_STATE_READY, 0))], later, StartedTask::NoPid, 1),
+            ("disabled with no pid", vec![Some((TASK_STATE_DISABLED, 0))], later, StartedTask::NoPid, 1),
+        ];
+        for (named, snapshots, by, expected, refreshes) in cases {
+            let running = Scripted::new(snapshots);
+
+            let found = engine_pid(&running, by);
+
+            assert_eq!(found, Ok(expected), "{named}");
+            assert_eq!(running.refreshes.get(), refreshes, "{named}");
+        }
+        let unseen_instance = Scripted::new(vec![None]);
+        let refused = engine_pid(&unseen_instance, later);
+        assert!(
+            matches!(&refused, Err(TaskError::StartedUnknown(why)) if why.contains("could not refresh the started task")),
+            "{refused:?}"
+        );
+    }
+
+    /// A fresh manual-reset event, signalled when `set`.
+    fn event(set: bool) -> OwnedHandle {
+        // SAFETY: null security attributes and a null name are allowed; the 1 makes the event manual-reset. A success
+        // is a fresh handle nothing else owns.
+        let event = unsafe { CreateEventW(std::ptr::null(), 1, i32::from(set), std::ptr::null()) };
+        assert!(!event.is_null(), "the event is made: {}", io::Error::last_os_error());
+        // SAFETY: as above.
+        unsafe { OwnedHandle::from_raw_handle(event) }
+    }
+
+    #[test]
+    fn a_start_given_up_already_names_why() {
+        let (unset, set) = (event(false), event(true));
+        let later = Instant::now() + HANG_GUARD;
+
+        assert_eq!(given_up(Instant::now(), &[]), Ok(Some(TaskError::TimedOut)));
+        assert_eq!(
+            given_up(Instant::now(), &[set.as_handle()]),
+            Ok(Some(TaskError::TimedOut)),
+            "a deadline passed comes first"
+        );
+        assert_eq!(given_up(later, &[]), Ok(None));
+        assert_eq!(given_up(later, &[unset.as_handle()]), Ok(None));
+        assert_eq!(given_up(later, &[unset.as_handle(), set.as_handle()]), Ok(Some(TaskError::Woken(1))));
+    }
+
+    #[test]
+    #[expect(clippy::panic, reason = "the thread that asks the Task Scheduler is made to panic")]
+    fn a_start_the_task_scheduler_gave_no_answer_to_may_have_happened() {
+        let panicked = std::thread::spawn(|| -> Result<StartedTask, TaskError> { panic!("the call broke\nhere") });
+
+        let answer = answered(Ok(Signalled::Event), panicked);
+
+        assert_eq!(
+            answer,
+            Err(TaskError::Unanswered(
+                r"the thread that starts the task panicked: the call broke\u{a}here".to_owned()
+            ))
+        );
+        let finished = std::thread::spawn(|| Ok(StartedTask::NoPid));
+        let answer = answered(Err(io::Error::other("refused")), finished);
+        assert_eq!(
+            answer,
+            Err(TaskError::Unanswered("the wait for the Task Scheduler failed: refused".to_owned()))
+        );
+        assert_eq!(
+            answer.err().map(|error| error.to_string()).as_deref(),
+            Some("the Task Scheduler gave no answer (the wait for the Task Scheduler failed: refused); the task may have been started")
+        );
+    }
+
+    #[test]
+    fn every_task_error_text_is_escaped() {
+        let forged = "x\ngate-remote-refused: busy\u{2028}";
+        let call = || windows::core::Error::new(E_FAIL, forged);
+        let errors = [
+            failed("open the task")(call()),
+            unseen("refresh the started task")(call()),
+            TaskError::unanswered(forged),
+            TaskError::failed(&format!("the thread could not be made: {}", io::Error::other(forged))),
+        ];
+        for error in errors {
+            let text = error.to_string();
+
+            assert!(
+                !text.chars().any(|character| character.is_control() || character == '\u{2028}'),
+                "{text:?}"
+            );
+            assert!(text.contains(r"x\u{a}gate-remote-refused: busy\u{2028}"), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn a_library_loaded_from_elsewhere_is_refused_and_named() {
+        let wanted = Path::new(r"C:\Windows\System32\taskschd.dll");
+
+        assert_eq!(check_loaded_from(wanted, Path::new(r"C:\WINDOWS\SYSTEM32\TASKSCHD.DLL")), Ok(()));
+        assert_eq!(
+            check_loaded_from(wanted, Path::new(r"C:\x\taskschd.dll")),
+            Err(TaskError::Failed(
+                r"taskschd.dll was loaded from C:\x\taskschd.dll, not C:\Windows\System32\taskschd.dll".to_owned()
+            ))
+        );
+        assert_eq!(
+            check_loaded_from(wanted, Path::new("C:\\x\n\u{202e}\\taskschd.dll")),
+            Err(TaskError::Failed(
+                r"taskschd.dll was loaded from C:\x\u{a}\u{202e}\taskschd.dll, not C:\Windows\System32\taskschd.dll".to_owned()
+            ))
+        );
     }
 }

@@ -421,14 +421,36 @@ pub(crate) fn wait_any(handles: &[HANDLE], deadline: Instant) -> io::Result<Sign
     match result {
         WAIT_OBJECT_0 => Ok(Signalled::Event),
         WAIT_TIMEOUT => Ok(Signalled::Early(Early::TimedOut)),
+        _ => woken(result, count, 1).map(|index| Signalled::Early(Early::Woken(index))),
+    }
+}
+
+/// Looks, without waiting, at the wake handles `wake`: the lowest index of one signalled already; `None` when none is.
+pub(crate) fn look_at_wake(wake: &[HANDLE]) -> io::Result<Option<usize>> {
+    if wake.is_empty() {
+        return Ok(None);
+    }
+    let count = u32::try_from(wake.len()).map_err(io::Error::other)?;
+    // SAFETY: `wake` holds `count` handles, each borrowed open for the whole call; a wait of 0 ms only looks.
+    let result = unsafe { WaitForMultipleObjects(count, wake.as_ptr(), 0, 0) };
+    match result {
+        WAIT_TIMEOUT => Ok(None),
+        _ => woken(result, count, 0).map(Some),
+    }
+}
+
+/// The index into the wake list of the handle a wait on `count` handles, the first `first` of them not wake handles,
+/// ended on with `result`; the error of a failed wait, an abandoned mutex, or a result no such wait gives.
+fn woken(result: u32, count: u32, first: u32) -> io::Result<usize> {
+    match result {
         WAIT_FAILED => Err(io::Error::last_os_error()),
-        _ if result > WAIT_OBJECT_0 && result < WAIT_OBJECT_0 + count => Ok(Signalled::Early(Early::Woken((result - WAIT_OBJECT_0 - 1) as usize))),
-        _ if result > WAIT_ABANDONED_0 && result < WAIT_ABANDONED_0 + count => Err(io::Error::other(format!(
-            "the wake handle at index {} is a mutex its owner abandoned; a wait on a pipe wakes on no mutex",
-            result - WAIT_ABANDONED_0 - 1
+        _ if result >= WAIT_OBJECT_0 + first && result < WAIT_OBJECT_0 + count => Ok((result - WAIT_OBJECT_0 - first) as usize),
+        _ if result >= WAIT_ABANDONED_0 + first && result < WAIT_ABANDONED_0 + count => Err(io::Error::other(format!(
+            "the wake handle at index {} is a mutex its owner abandoned; a wait wakes on no mutex",
+            result - WAIT_ABANDONED_0 - first
         ))),
         _ => Err(io::Error::other(format!(
-            "the wait on a pipe ended with the unexpected result 0x{result:x}"
+            "the wait on the wake handles ended with the unexpected result 0x{result:x}"
         ))),
     }
 }
