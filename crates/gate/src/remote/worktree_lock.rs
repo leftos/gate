@@ -111,17 +111,20 @@ pub(super) struct Wait {
     deadline: Instant,
     limit: Duration,
     interrupt: Option<Interrupt>,
-    busy: fn(&str, Duration) -> End,
+    busy: Box<Busy>,
 }
+
+/// The end of a wait for the worktree named first past the limit given second.
+type Busy = dyn Fn(&str, Duration) -> End;
 
 impl Wait {
     /// A wait of at most `limit` from now, ended by `interrupt`, whose end past the limit is `busy`'s.
-    pub(super) fn until(limit: Duration, interrupt: Option<Interrupt>, busy: fn(&str, Duration) -> End) -> Wait {
+    pub(super) fn until(limit: Duration, interrupt: Option<Interrupt>, busy: impl Fn(&str, Duration) -> End + 'static) -> Wait {
         Wait {
             deadline: Instant::now() + limit,
             limit,
             interrupt,
-            busy,
+            busy: Box::new(busy),
         }
     }
 }

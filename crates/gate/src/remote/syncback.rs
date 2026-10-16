@@ -2950,7 +2950,7 @@ mod tests {
             host: "builder",
             key: KEY,
             root,
-            root_id: crate::route::root_id(root).unwrap_or(FolderId { volume: 0, file: [0; 16] }),
+            root_id: crate::route::root_id(root).expect("the wiring test's repository's id is read"),
             leaf: "app",
             siblings: Vec::new(),
             repo: "app",

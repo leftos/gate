@@ -5,8 +5,8 @@
 //! against its decided id too, and none of them, nor any `.git` entry, may be a reparse point of any kind. Every handle
 //! shares reading and writing but not deletion, so none of these folders and entries can be renamed, removed or
 //! swapped for a link while it is held; [`Held::recheck`] reads every path again before the hold ends, and opens each
-//! by path as git does to see that it still leads to the held folder. The hold does not cover the repository a
-//! `.git` file names, nor its common folder.
+//! by path as git does to see that it still leads to the held folder. Once git has said where each repository's git
+//! folder and common folder are, those are held too ([`Held::hold_git`]), so a linked worktree's are covered.
 
 use std::fs::{File, Metadata};
 use std::io;
@@ -34,32 +34,44 @@ const NOT_UNICODE: &str = "cannot be held: its path is not valid Unicode";
 const NETWORK: &str = "cannot be held: it is on a network volume";
 /// Why a held folder is refused when its path changed, or no longer leads to it, while it was held.
 const MOVED: &str = "moved while it was held";
+/// Why a repository is refused when a git folder git names for it is reached through a link or a junction.
+const GIT_THROUGH_LINK: &str = "has a git folder reached through a link or a junction";
 
-/// Why a pair's folder cannot be held: the sibling's name, or the worktree root's folder name for the root and its
-/// parent, and why.
+/// Why a pair's folder cannot be held: who it is, `sibling {name}` for a sibling, the worktree root's folder name for
+/// the root and its parent, and why.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct NotHeld {
-    name: String,
+    who: String,
     why: String,
 }
 
 impl NotHeld {
-    fn new(name: &str, why: impl Into<String>) -> NotHeld {
+    fn new(who: &str, why: impl Into<String>) -> NotHeld {
         NotHeld {
-            name: name.to_owned(),
+            who: who.to_owned(),
             why: why.into(),
         }
     }
 
-    /// The line the run says as it stays here: `gate: not routed: sibling {name} {why}`.
+    /// The line the run says as it stays here: `gate: not routed: {who} {why}`.
     pub(crate) fn line(&self) -> String {
-        format!("gate: not routed: sibling {} {}", self.name, self.why)
+        format!("gate: not routed: {} {}", self.who, self.why)
     }
 }
 
-/// The refusal of the folder `name` that could not be opened or read, for `error`.
-fn cannot_hold(name: &str, error: &io::Error) -> NotHeld {
-    NotHeld::new(name, format!("cannot be held: {error}"))
+/// How a pair's sibling `name` is said in a refusal: `sibling {name}`.
+pub(crate) fn sibling_who(name: &str) -> String {
+    format!("sibling {name}")
+}
+
+/// The refusal of the folder said as `who` that could not be opened or read, for `error`.
+fn cannot_hold(who: &str, error: &io::Error) -> NotHeld {
+    NotHeld::new(who, format!("cannot be held: {error}"))
+}
+
+/// The refusal of the repository said as `who` whose common folder could not be opened or read, for `error`.
+fn cannot_check(who: &str, error: &io::Error) -> NotHeld {
+    NotHeld::new(who, format!("cannot be checked: {error}"))
 }
 
 /// How a final path differs from the path the route decided on.
@@ -97,19 +109,22 @@ pub(crate) struct Held {
 }
 
 impl Held {
-    /// Holds the folders of the worktree root `root`, whose folder name is `leaf`, and of `siblings`: the root's parent
-    /// opened once, following links, on a local volume, its final path the root's lexical parent; the root opened
-    /// beneath it as itself, a folder and no reparse point, its final path `root`; each sibling opened beneath it the
-    /// same way, its id the one the decision read and its final path its root; and the `.git` of the root and of each
-    /// sibling opened beneath it, no reparse point.
+    /// Holds the folders of the worktree root `root`, whose folder name is `leaf` and whose id the decision read is
+    /// `root_id`, and of `siblings`: the root's parent opened once, following links, on a local volume, its final path
+    /// the root's lexical parent; the root opened beneath it as itself, a folder and no reparse point, its id `root_id`
+    /// and its final path `root`; each sibling opened beneath it the same way, its id the one the decision read and its
+    /// final path its root; and the `.git` of the root and of each sibling opened beneath it, no reparse point.
     ///
     /// # Errors
     ///
     /// The first folder that fails a check or cannot be opened, named; nothing stays held.
-    pub(crate) fn hold(root: &str, leaf: &str, siblings: &[Sibling<'_>]) -> Result<Held, NotHeld> {
+    pub(crate) fn hold(root: &str, root_id: FolderId, leaf: &str, siblings: &[Sibling<'_>]) -> Result<Held, NotHeld> {
         let parent = held_parent(root, leaf)?;
         let mut entries = Vec::with_capacity(3 + 2 * siblings.len());
-        let root_folder = folder_beneath(&parent.file, leaf)?;
+        let root_folder = folder_beneath(&parent.file, leaf, leaf)?;
+        if id_of(&root_folder, leaf)? != root_id {
+            return Err(NotHeld::new(leaf, OTHER_FOLDER));
+        }
         let root_path = checked(&root_folder, root, leaf)?;
         let root_git = git_beneath(&root_folder, leaf)?;
         for sibling in siblings {
@@ -123,6 +138,23 @@ impl Held {
         });
         entries.push(root_git);
         Ok(Held { entries })
+    }
+
+    /// Holds the git folder `git_dir` and the common folder `common` git named for the repository said as `who`, each
+    /// opened by its path, following links, without delete sharing, and refused unless its final path is the one git
+    /// printed but for letter case, so no link lies on the way to it; the common folder's id, which tells two
+    /// repositories apart.
+    ///
+    /// # Errors
+    ///
+    /// Either folder reached through a link, or one that cannot be opened or read, said as `who`'s.
+    pub(crate) fn hold_git(&mut self, who: &str, git_dir: &str, common: &str) -> Result<FolderId, NotHeld> {
+        let git = by_path(who, git_dir, cannot_hold)?;
+        let common = by_path(who, common, cannot_check)?;
+        let (volume, file) = gate_win32::file_id(&common.file).map_err(|error| cannot_check(who, &error))?;
+        self.entries.push(git);
+        self.entries.push(common);
+        Ok(FolderId { volume, file })
     }
 
     /// Reads every held folder's final path again, and opens each one's path as git does, following links, to see that
@@ -172,50 +204,74 @@ fn held_parent(root: &str, leaf: &str) -> Result<Entry, NotHeld> {
 
 /// The sibling `sibling`'s folder and its `.git`, each opened beneath `parent` as itself and checked.
 fn sibling_entries(parent: &File, sibling: &Sibling<'_>) -> Result<[Entry; 2], NotHeld> {
-    let name = sibling.name();
-    let folder = folder_beneath(parent, name)?;
-    let (volume, file) = gate_win32::file_id(&folder).map_err(|error| cannot_hold(name, &error))?;
-    if (FolderId { volume, file }) != sibling.id() {
-        return Err(NotHeld::new(name, OTHER_FOLDER));
+    let who = sibling_who(sibling.name());
+    let folder = folder_beneath(parent, sibling.name(), &who)?;
+    if id_of(&folder, &who)? != sibling.id() {
+        return Err(NotHeld::new(&who, OTHER_FOLDER));
     }
-    let path = checked(&folder, sibling.root(), name)?;
-    let git = git_beneath(&folder, name)?;
+    let path = checked(&folder, sibling.root(), &who)?;
+    let git = git_beneath(&folder, &who)?;
     Ok([
         Entry {
             file: folder,
             path,
-            name: name.to_owned(),
+            name: who,
         },
         git,
     ])
 }
 
-/// The `.git` entry of the open folder `folder`, said as `name`'s, opened beneath it as itself without delete sharing;
-/// refused when it is a reparse point of any kind.
-fn git_beneath(folder: &File, name: &str) -> Result<Entry, NotHeld> {
-    let git = gate_win32::open_beneath(folder, ".git", Share::NoDelete).map_err(|error| cannot_hold(name, &error))?;
-    if is_reparse_point(&git.metadata().map_err(|error| cannot_hold(name, &error))?) {
-        return Err(NotHeld::new(name, SIBLING_GIT_LINK));
-    }
-    let found = final_path(&git).map_err(|error| cannot_hold(name, &error))?;
-    let path = normalized(&found).ok_or_else(|| NotHeld::new(name, NOT_UNICODE))?;
+/// The id of the open folder `folder`, said as `who`'s.
+fn id_of(folder: &File, who: &str) -> Result<FolderId, NotHeld> {
+    let (volume, file) = gate_win32::file_id(folder).map_err(|error| cannot_hold(who, &error))?;
+    Ok(FolderId { volume, file })
+}
+
+/// The folder at `path`, a path git printed, said as `who`'s, opened following links without delete sharing; refused
+/// when its final path is not `path` but for letter case, as when a link lies on the way. `cannot` says a failure to
+/// open or read it.
+fn by_path(who: &str, path: &str, cannot: fn(&str, &io::Error) -> NotHeld) -> Result<Entry, NotHeld> {
+    let file = open_followed(Path::new(path), Share::NoDelete).map_err(|error| cannot(who, &error))?;
+    let found = final_path(&file).map_err(|error| cannot(who, &error))?;
+    let path = match compare(&found, path) {
+        Ok(path) => path,
+        Err(Mismatch::Case) => normalized(&found).ok_or_else(|| NotHeld::new(who, NOT_UNICODE))?,
+        Err(Mismatch::NotUnicode) => return Err(NotHeld::new(who, NOT_UNICODE)),
+        Err(Mismatch::Other) => return Err(NotHeld::new(who, GIT_THROUGH_LINK)),
+    };
     Ok(Entry {
-        file: git,
+        file,
         path,
-        name: name.to_owned(),
+        name: who.to_owned(),
     })
 }
 
-/// The folder `name` opened beneath `parent` as itself, without delete sharing; refused when it is a reparse point of
-/// any kind, a link, a junction or another, or not a folder.
-fn folder_beneath(parent: &File, name: &str) -> Result<File, NotHeld> {
-    let folder = gate_win32::open_beneath(parent, name, Share::NoDelete).map_err(|error| cannot_hold(name, &error))?;
-    let metadata = folder.metadata().map_err(|error| cannot_hold(name, &error))?;
+/// The `.git` entry of the open folder `folder`, said as `who`'s, opened beneath it as itself without delete sharing;
+/// refused when it is a reparse point of any kind.
+fn git_beneath(folder: &File, who: &str) -> Result<Entry, NotHeld> {
+    let git = gate_win32::open_beneath(folder, ".git", Share::NoDelete).map_err(|error| cannot_hold(who, &error))?;
+    if is_reparse_point(&git.metadata().map_err(|error| cannot_hold(who, &error))?) {
+        return Err(NotHeld::new(who, SIBLING_GIT_LINK));
+    }
+    let found = final_path(&git).map_err(|error| cannot_hold(who, &error))?;
+    let path = normalized(&found).ok_or_else(|| NotHeld::new(who, NOT_UNICODE))?;
+    Ok(Entry {
+        file: git,
+        path,
+        name: who.to_owned(),
+    })
+}
+
+/// The folder `name` opened beneath `parent` as itself, said as `who`'s, without delete sharing; refused when it is a
+/// reparse point of any kind, a link, a junction or another, or not a folder.
+fn folder_beneath(parent: &File, name: &str, who: &str) -> Result<File, NotHeld> {
+    let folder = gate_win32::open_beneath(parent, name, Share::NoDelete).map_err(|error| cannot_hold(who, &error))?;
+    let metadata = folder.metadata().map_err(|error| cannot_hold(who, &error))?;
     if is_reparse_point(&metadata) {
-        return Err(NotHeld::new(name, SIBLING_LINK));
+        return Err(NotHeld::new(who, SIBLING_LINK));
     }
     if !metadata.is_dir() {
-        return Err(NotHeld::new(name, SIBLING_NOT_A_FOLDER));
+        return Err(NotHeld::new(who, SIBLING_NOT_A_FOLDER));
     }
     Ok(folder)
 }
@@ -250,11 +306,11 @@ fn still_leads(entry: &Entry) -> Result<(), NotHeld> {
     }
 }
 
-/// The final path of the open `file`, normalized, when it is the path `expected` exactly; else the refusal naming
-/// `name` for how it differs.
-fn checked(file: &File, expected: &str, name: &str) -> Result<String, NotHeld> {
-    let found = final_path(file).map_err(|error| cannot_hold(name, &error))?;
-    compare(&found, expected).map_err(|mismatch| NotHeld::new(name, mismatch.why()))
+/// The final path of the open `file`, normalized, when it is the path `expected` exactly; else the refusal of `who`
+/// for how it differs.
+fn checked(file: &File, expected: &str, who: &str) -> Result<String, NotHeld> {
+    let found = final_path(file).map_err(|error| cannot_hold(who, &error))?;
+    compare(&found, expected).map_err(|mismatch| NotHeld::new(who, mismatch.why()))
 }
 
 /// The final path `found`, normalized ([`normalized`]), when it is `expected` with every `\` a `/`; else how they
@@ -370,7 +426,7 @@ pub(super) mod tests {
     /// Holds the folders of `run`, its leaf `app`.
     fn hold(run: &RemoteRun) -> Result<Held, NotHeld> {
         let siblings = carried(run).expect("the run's siblings check");
-        Held::hold(&run.root, "app", &siblings)
+        Held::hold(&run.root, run.root_id, "app", &siblings)
     }
 
     /// The line a refused hold says, or `None` for a hold that went through.
@@ -515,7 +571,7 @@ pub(super) mod tests {
 
         let refused = refusal(hold(&run));
 
-        assert_eq!(refused.as_deref(), Some("gate: not routed: sibling app is a link or a junction"));
+        assert_eq!(refused.as_deref(), Some("gate: not routed: app is a link or a junction"));
     }
 
     #[test]
@@ -529,7 +585,7 @@ pub(super) mod tests {
 
         assert_eq!(
             refused.as_deref(),
-            Some("gate: not routed: sibling app is under a folder that is not the one the route was decided for")
+            Some("gate: not routed: app is under a folder that is not the one the route was decided for")
         );
     }
 
@@ -543,7 +599,7 @@ pub(super) mod tests {
 
         assert_eq!(
             refused.as_deref(),
-            Some("gate: not routed: sibling app is under a folder that is not the one the route was decided for")
+            Some("gate: not routed: app is under a folder that is not the one the route was decided for")
         );
     }
 
@@ -606,7 +662,7 @@ pub(super) mod tests {
         let entry = |name: &str, path: &str| Entry {
             file: open_followed(&pair.folder(name), Share::NoDelete).expect("the folder can be opened"),
             path: path.to_owned(),
-            name: name.to_owned(),
+            name: format!("sibling {name}"),
         };
         let path_of = |name: &str| sibling_root(&pair.root, name);
 

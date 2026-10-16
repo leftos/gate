@@ -176,7 +176,8 @@ impl Git {
 
     /// git asked about `folder` alone, as every call starts it: the location and config variables removed,
     /// [`NO_CURRENT_FOLDER`] set, so the ssh git starts finds no program by name in the gate's working folder, `-C
-    /// <folder>`, and no file-system monitor. Its arguments, streams and start are the caller's.
+    /// <folder>`, no file-system monitor, and its hooks read from a folder that cannot exist, inside the git program's
+    /// own file, so no hook a repository's config names runs. Its arguments, streams and start are the caller's.
     pub(crate) fn command(&self, folder: &Path) -> Command {
         let mut command = Command::new(&self.program);
         command.env(NO_CURRENT_FOLDER, "1");
@@ -188,7 +189,9 @@ impl Git {
                 command.env_remove(name);
             }
         }
-        command.arg("-C").arg(folder).args(["-c", "core.fsmonitor=false"]);
+        let mut hooks = OsString::from("core.hooksPath=");
+        hooks.push(self.program.join("hooks"));
+        command.arg("-C").arg(folder).args(["-c", "core.fsmonitor=false", "-c"]).arg(hooks);
         command
     }
 

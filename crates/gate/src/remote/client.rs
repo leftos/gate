@@ -40,13 +40,13 @@ use regex::Regex;
 use gate_router::repo_name;
 
 use super::git::{self, Git, GitError, NO_CURRENT_FOLDER, last_update};
-use super::held::Held;
+use super::held::{Held, sibling_who};
 use super::launch::{DRAIN, KILL_WAIT, KILLED, call_job, launched, piped_launch};
 use super::outputs;
 use super::parity;
 use super::payload::{self, Location, RunCall};
 use super::retry::{self, Ended, GIT_SSH_FAILED, SSH_FAILED};
-use super::snapshot::{self, Bounded, CEILING, Snapshot};
+use super::snapshot::{self, Bounded, Place, Snapshot};
 use super::syncback;
 use super::toolchain::{self, Manifest, Reported};
 #[cfg(feature = "test-seams")]
@@ -60,7 +60,7 @@ use super::{
     started_line,
 };
 use crate::boxside::outputs::{NAMES_SKIPPED, OUTPUTS_BUDGET};
-use crate::boxside::payload::{Payload, escaped};
+use crate::boxside::payload::{PairRefused, Payload, escaped};
 use crate::durations::{Usual, hang_hint};
 use crate::environment::Variables;
 use crate::outputs::archive::sent_limit;
@@ -293,6 +293,7 @@ impl RemoteClient for RustClient {
             box_killed: None,
             pair: None,
             ceiling: None,
+            places: Vec::new(),
             local_major: None,
         };
         if let Some(line) = raised {
@@ -310,19 +311,34 @@ impl RemoteClient for RustClient {
 
 /// What the line of a run that stays here for one of its pair's repositories starts with.
 const NOT_ROUTED: &str = "gate: not routed: ";
-/// Why a sibling whose worktree lock another run's sync-back holds past the lock wait keeps the run here.
+/// Why a worktree whose lock another run's sync-back holds past the lock wait keeps the run here.
 const BUSY: &str = "is busy with another run's sync-back";
+/// Why a pair's repository keeps the run here when git finds it elsewhere after its save than at its check.
+const MOVED_GIT: &str = "changed its git location while it was held";
 
-/// The end of a run that stays here for its pair's repository `name`, the main one's folder name or a sibling's, for
-/// `why`: `gate: not routed: sibling {name} {why}`.
-fn not_routed(name: &str, why: impl std::fmt::Display) -> End {
-    End::NotRouted(format!("{NOT_ROUTED}sibling {name} {why}"))
+/// The end of a run that stays here for its repository said as `who`, the main one's folder name or `sibling {name}`,
+/// for `why`: `gate: not routed: {who} {why}`.
+fn not_routed(who: &str, why: impl std::fmt::Display) -> End {
+    End::NotRouted(format!("{NOT_ROUTED}{who} {why}"))
+}
+
+/// How the run's repository `name` at `at` in its order is said in a refusal: the main one, first, by its folder name;
+/// a sibling as `sibling {name}`.
+fn who(at: usize, name: &str) -> String {
+    if at == 0 { name.to_owned() } else { sibling_who(name) }
+}
+
+/// The end of a run whose worktree `name`'s lock another run's sync-back holds past the wait, the main one's, named
+/// `leaf`, or a sibling's.
+fn busy(leaf: &str, name: &str) -> End {
+    let who = if name == leaf { name.to_owned() } else { sibling_who(name) };
+    not_routed(&who, BUSY)
 }
 
 /// `end`, a failure of the pair's sibling `name`, as the run staying here naming it; any other end as it is.
 fn sibling_end(name: &str, end: End) -> End {
     match end {
-        End::Failed(why) => not_routed(name, format_args!("cannot be sent: {why}")),
+        End::Failed(why) => not_routed(&sibling_who(name), format_args!("cannot be sent: {why}")),
         end => end,
     }
 }
@@ -343,17 +359,17 @@ fn bounded<'b>(repo: &'b Repo, ceiling: &'b Path) -> Bounded<'b> {
     Bounded {
         root: Path::new(&repo.root),
         ceiling,
+        place: None,
     }
 }
 
-/// The sibling of `names` the box's refusal `why` names, the first it names; every one of them, joined by `, `, when
-/// it names none.
-fn named_in(names: &[String], why: &str) -> String {
-    names
-        .iter()
-        .find(|name| why.contains(name.as_str()))
-        .cloned()
-        .unwrap_or_else(|| names.join(", "))
+/// The line of a snapshot listing that cannot be read, for `why`: the main repository's, `of` `None`, skips the
+/// toolchain check; the sibling `of`'s skips its SDK check.
+fn skipped_listing(of: Option<&str>, why: &str) -> String {
+    match of {
+        None => format!("gate: cannot list the snapshot's files: {why}; skipping the toolchain check"),
+        Some(name) => format!("gate: cannot list the snapshot's files of {name}: {why}; skipping its SDK check"),
+    }
 }
 
 /// A repository the run sends: its name in the run's lines, the main one's folder name or a sibling's; its worktree's
@@ -365,10 +381,11 @@ struct Repo {
     bare: String,
 }
 
-/// What a pair run holds from before its snapshots until its last save: its folders ([`Held`]) and its siblings'
-/// worktree locks, so no other run's sync-back writes a sibling while it is snapshotted and pushed.
+/// What a run holds from before its snapshots until its last save: a pair's folders ([`Held`]), `None` for a run of one
+/// repository, and the worktree locks of its root and its siblings, so no other run's sync-back writes one of them
+/// while it is snapshotted and pushed.
 struct PairHold {
-    held: Held,
+    held: Option<Held>,
     _locks: Vec<Locked>,
 }
 
@@ -767,12 +784,14 @@ pub(super) struct Attempt<'c, 'a> {
     adjusted: Option<f64>,
     /// The kill the box's kill tag named, set only when the run call ended as the box's own kill.
     box_killed: Option<BoxKill>,
-    /// A sibling pair's folders and locks, held from before its snapshots until its last save; `None` for a run of one
-    /// repository and once let go.
+    /// The run's folders and locks, held from before its snapshots until its last save; `None` before and once let go.
     pair: Option<PairHold>,
     /// The folder every git call about a pair's repository stops its search at, the pair's parent folder; `None` for a
     /// run of one repository.
     ceiling: Option<PathBuf>,
+    /// Where git found each of a pair's repositories at its check, by its root, which every later git call about it is
+    /// given ([`Bounded::variables`]) while the pair is held; empty for a run of one repository and once let go.
+    places: Vec<(String, Place)>,
     /// This PC's newest .NET SDK major once [`Attempt::local_major`] has read it, so one run lists the SDKs once
     /// however many of its repositories need it; `None` before.
     local_major: Option<u64>,
@@ -869,42 +888,84 @@ impl Attempt<'_, '_> {
             .ok_or_else(|| End::Failed("the snapshot made no commit".to_owned()))
     }
 
-    /// For a call that carries siblings, holds the pair's folders ([`Held::hold`]) and then takes each sibling's
-    /// worktree lock, in the order of their ids, waiting for one another run's sync-back holds until the lock wait has
-    /// passed; and bounds every git call about the pair at the root's parent. A folder that cannot be held, and a lock
-    /// still held past the wait, keep the run here naming the sibling.
+    /// For a call that carries siblings, holds the pair's folders ([`Held::hold`]) and bounds every git call about the
+    /// pair at the root's parent; then, for every run, takes the worktree locks of the root and of each sibling, in the
+    /// order of their ids, waiting for one another run's sync-back holds until the lock wait has passed. A folder that
+    /// cannot be held, and a lock still held past the wait, keep the run here naming the repository.
     fn hold_pair(&mut self) -> Result<(), End> {
+        self.go_on()?;
         let call = self.call;
-        if call.siblings.is_empty() {
-            return Ok(());
-        }
-        let held = Held::hold(call.root, call.leaf, &call.siblings).map_err(|refused| End::NotRouted(refused.line()))?;
-        let Some(parent) = Path::new(call.root).parent() else {
-            return Err(not_routed(call.leaf, "has no parent folder"));
+        let held = if call.siblings.is_empty() {
+            None
+        } else {
+            let held = Held::hold(call.root, call.root_id, call.leaf, &call.siblings);
+            Some(held.map_err(|refused| End::NotRouted(refused.line()))?)
         };
-        let folders: Vec<Folder<'_>> = call
-            .siblings
-            .iter()
-            .map(|sibling| Folder {
-                name: sibling.name(),
-                root: sibling.root(),
-                id: sibling.id(),
-            })
-            .collect();
-        let wait = Wait::until(self.lock_wait, call.interrupt, |name, _| not_routed(name, BUSY));
+        let main = Folder {
+            name: call.leaf,
+            root: call.root,
+            id: call.root_id,
+        };
+        let siblings = call.siblings.iter().map(|sibling| Folder {
+            name: sibling.name(),
+            root: sibling.root(),
+            id: sibling.id(),
+        });
+        let folders: Vec<Folder<'_>> = std::iter::once(main).chain(siblings).collect();
+        let leaf = call.leaf.to_owned();
+        let wait = Wait::until(self.lock_wait, call.interrupt, move |name, _| busy(&leaf, name));
         let locks = worktree_lock::held_or(call.state, &folders, &wait, |line| self.say(line))?;
-        self.ceiling = Some(parent.to_path_buf());
+        if held.is_some() {
+            let Some(parent) = Path::new(call.root).parent() else {
+                return Err(not_routed(call.leaf, "has no parent folder"));
+            };
+            self.ceiling = Some(parent.to_path_buf());
+        }
         self.pair = Some(PairHold { held, _locks: locks });
         Ok(())
     }
 
-    /// Lets the pair's folders and locks go once every repository is pushed and saved, after reading every held
-    /// folder's path again ([`Held::recheck`]): one that moved keeps the run here naming it.
-    fn release_pair(&mut self) -> Result<(), End> {
-        match self.pair.take() {
-            Some(pair) => pair.held.recheck().map_err(|refused| End::NotRouted(refused.line())),
+    /// Reads every held folder of a pair again ([`Held::recheck`]): one that moved keeps the run here naming it.
+    fn recheck_pair(&self) -> Result<(), End> {
+        match self.pair.as_ref().and_then(|pair| pair.held.as_ref()) {
+            Some(held) => held.recheck().map_err(|refused| End::NotRouted(refused.line())),
             None => Ok(()),
         }
+    }
+
+    /// Lets the run's folders and locks go once every repository is pushed and saved, after reading every held folder's
+    /// path again ([`Attempt::recheck_pair`]).
+    fn release_pair(&mut self) -> Result<(), End> {
+        let rechecked = self.recheck_pair();
+        self.places.clear();
+        self.pair = None;
+        rechecked
+    }
+
+    /// Holds the git folder and the common folder git named at `place` for the repository said as `who`
+    /// ([`Held::hold_git`]); the common folder's id.
+    fn hold_git(&mut self, who: &str, place: &Place) -> Result<gate_router::FolderId, End> {
+        let Some(held) = self.pair.as_mut().and_then(|pair| pair.held.as_mut()) else {
+            return Err(End::Failed(format!("the folders of {who} are not held")));
+        };
+        held.hold_git(who, &place.git_dir, &place.common)
+            .map_err(|refused| End::NotRouted(refused.line()))
+    }
+
+    /// Where git found the pair's repository whose root is `folder` at its check; `None` for a run of one repository.
+    fn place_at(&self, folder: &Path) -> Option<&Place> {
+        self.places.iter().find(|(root, _)| Path::new(root) == folder).map(|(_, place)| place)
+    }
+
+    /// The pair's repository whose root is `folder` as its git calls ask about it, at the place git found it at its
+    /// check; `None` for a run of one repository.
+    fn bound_at<'b>(&'b self, folder: &'b Path) -> Option<Bounded<'b>> {
+        let ceiling = self.ceiling.as_deref()?;
+        Some(Bounded {
+            root: folder,
+            ceiling,
+            place: self.place_at(folder),
+        })
     }
 
     /// The repositories the run sends: the main one, named by its folder name, then each sibling in declared order.
@@ -926,32 +987,43 @@ impl Attempt<'_, '_> {
     }
 
     /// The snapshot of each of `repos`, in order. A pair's repositories are each asked first, git bounded at the
-    /// pair's parent, where git finds them: one whose top folder is not its root, and two that share a git repository,
-    /// keep the run here, as a sibling's git failure does; the main one's git failure ends the run.
+    /// pair's parent, where git finds them: one whose top folder is not its root, one whose git folders cannot be held
+    /// ([`Held::hold_git`]), and two that share a common folder, keep the run here, as a sibling's git failure does;
+    /// the main one's git failure ends the run. Each is then snapshotted at the place git found it, and the pair's
+    /// folders read again after each snapshot.
     fn snapshots(&mut self, repos: &[Repo]) -> Result<Vec<Snapshot>, End> {
         let Some(ceiling) = self.ceiling.clone() else {
             return self.snapshot().map(|snapshot| vec![snapshot]);
         };
-        let mut commons: Vec<(&str, String)> = Vec::with_capacity(repos.len());
+        let mut commons: Vec<(&str, gate_router::FolderId)> = Vec::with_capacity(repos.len());
         for (at, repo) in repos.iter().enumerate() {
             self.go_on()?;
-            let (top, common) = snapshot::place_of(bounded(repo, &ceiling), self.limit, self.call.interrupt)
+            let place = snapshot::place_of(bounded(repo, &ceiling), self.limit, self.call.interrupt)
                 .map_err(|error| repo_end(at, &repo.name, git_end(error)))?;
-            if !same_path(&top, &repo.root) {
+            let who = who(at, &repo.name);
+            if !same_path(&place.top, &repo.root) {
                 return Err(not_routed(
-                    &repo.name,
-                    format_args!("is not the top folder of its git repository: git names {top}"),
+                    &who,
+                    format_args!("is not the top folder of its git repository: git names {}", place.top),
                 ));
             }
-            if let Some((other, _)) = commons.iter().find(|(_, seen)| same_path(seen, &common)) {
-                return Err(not_routed(&repo.name, format_args!("shares its git repository with {other}")));
+            let common = self.hold_git(&who, &place)?;
+            if let Some((other, _)) = commons.iter().find(|(_, seen)| *seen == common) {
+                return Err(not_routed(&who, format_args!("shares its git repository with {other}")));
             }
             commons.push((&repo.name, common));
+            self.places.push((repo.root.clone(), place));
         }
         let mut snapshots = Vec::with_capacity(repos.len());
         for (at, repo) in repos.iter().enumerate() {
-            let taken = snapshot::take_bounded(bounded(repo, &ceiling), self.call.key, self.limit, self.call.interrupt);
+            let root = Path::new(&repo.root);
+            let bound = Bounded {
+                place: self.place_at(root),
+                ..bounded(repo, &ceiling)
+            };
+            let taken = snapshot::take_bounded(bound, self.call.key, self.limit, self.call.interrupt);
             snapshots.push(taken.map_err(|error| repo_end(at, &repo.name, git_end(error)))?);
+            self.recheck_pair()?;
         }
         Ok(snapshots)
     }
@@ -970,15 +1042,15 @@ impl Attempt<'_, '_> {
         }
         let names: Vec<String> = siblings.iter().map(|repo| repo.name.clone()).collect();
         let location = location.with_pair(self.call.leaf, &names);
-        let pair = match Payload::decode(&payload::location_word(&location)).and_then(|payload| payload.pair()) {
+        let decoded = Payload::decode(&payload::location_word(&location)).map_err(PairRefused::from);
+        let pair = match decoded.and_then(|payload| payload.laid_out()) {
             Ok(Some(pair)) => pair,
             Ok(None) => return Err(End::Failed("the run's payload carries no Pair".to_owned())),
-            Err(why) => {
-                let why = why.strip_prefix("gate: ").unwrap_or(&why);
-                return Err(not_routed(
-                    &named_in(&names, why),
-                    format_args!("cannot be laid out on the builder: {why}"),
-                ));
+            Err(refused) => {
+                let why = refused.line.strip_prefix("gate: ").unwrap_or(&refused.line);
+                // A refusal of no one sibling is of the pair as a whole, which the main repository's place carries.
+                let who = refused.sibling.as_deref().map_or_else(|| self.call.leaf.to_owned(), sibling_who);
+                return Err(not_routed(&who, format_args!("cannot be laid out on the builder: {why}")));
             }
         };
         for (repo, sibling) in siblings.iter_mut().zip(pair.siblings()) {
@@ -1008,7 +1080,7 @@ impl Attempt<'_, '_> {
         self.go_on()?;
         let folder = PathBuf::from(&repo.root);
         let git = Git::find(&folder).map_err(End::Failed)?;
-        let names = self.file_names(&folder, &git, &snapshot.commit)?;
+        let names = self.file_names(&folder, &git, &snapshot.commit, Some(&repo.name))?;
         Ok(names.map(|names| Tree {
             git,
             folder,
@@ -1084,7 +1156,7 @@ impl Attempt<'_, '_> {
         self.go_on()?;
         let folder = PathBuf::from(self.call.root);
         let git = Git::find(&folder).map_err(End::Failed)?;
-        let Some(names) = self.file_names(&folder, &git, &snapshot.commit)? else {
+        let Some(names) = self.file_names(&folder, &git, &snapshot.commit, None)? else {
             return Ok(None);
         };
         let Some(root) = self.tree_entries(&git, &snapshot.commit)? else {
@@ -1107,10 +1179,10 @@ impl Attempt<'_, '_> {
     }
 
     /// The names of the files and submodules of the snapshot's tree `treeish`, asked in the worktree `folder`, as its
-    /// listing spells them, one per NUL; `None`, with a line, when that listing is past the git output cap or is not
-    /// UTF-8.
-    fn file_names(&mut self, folder: &Path, git: &Git, treeish: &str) -> Result<Option<Vec<String>>, End> {
-        let Some(listing) = self.listed(folder, git, &["ls-tree", "-r", "-z", "--name-only", treeish])? else {
+    /// listing spells them, one per NUL; `None`, with a line naming the sibling `of`, `None` for the main repository,
+    /// when that listing is past the git output cap or is not UTF-8.
+    fn file_names(&mut self, folder: &Path, git: &Git, treeish: &str, of: Option<&str>) -> Result<Option<Vec<String>>, End> {
+        let Some(listing) = self.listed(folder, git, &["ls-tree", "-r", "-z", "--name-only", treeish], of)? else {
             return Ok(None);
         };
         Ok(Some(listing.split('\0').filter(|name| !name.is_empty()).map(str::to_owned).collect()))
@@ -1119,7 +1191,7 @@ impl Attempt<'_, '_> {
     /// The entries of `git ls-tree -z` over the tree `treeish` ([`entries_of`]), each with its mode, type, object id
     /// and path; `None`, with a line, when that listing is past the git output cap, is not UTF-8 or is not of that form.
     fn tree_entries(&mut self, git: &Git, treeish: &str) -> Result<Option<Vec<Entry>>, End> {
-        let Some(listing) = self.listed(Path::new(self.call.root), git, &["ls-tree", "-z", treeish])? else {
+        let Some(listing) = self.listed(Path::new(self.call.root), git, &["ls-tree", "-z", treeish], None)? else {
             return Ok(None);
         };
         let Some(entries) = entries_of(&listing) else {
@@ -1130,20 +1202,20 @@ impl Attempt<'_, '_> {
     }
 
     /// What one listing of `args` in the worktree `folder` answered as text; `None`, with a line, when it is past the
-    /// git output cap or is not UTF-8, either of which skips the whole toolchain check. Any other git failure ends the
-    /// run.
-    fn listed(&mut self, folder: &Path, git: &Git, args: &[&str]) -> Result<Option<String>, End> {
+    /// git output cap or is not UTF-8, either of which skips the whole toolchain check, or for the sibling `of` its SDK
+    /// check alone. Any other git failure ends the run.
+    fn listed(&mut self, folder: &Path, git: &Git, args: &[&str], of: Option<&str>) -> Result<Option<String>, End> {
         self.go_on()?;
         let listing = match self.git_bytes_in(folder, git, args) {
             Ok(listing) => listing,
             Err(GitError::OverCap(why)) => {
-                self.say(format!("gate: cannot list the snapshot's files: {why}; skipping the toolchain check"));
+                self.say(skipped_listing(of, &why));
                 return Ok(None);
             }
             Err(error) => return Err(git_end(error)),
         };
         let Ok(listing) = String::from_utf8(listing) else {
-            self.say("gate: cannot list the snapshot's files: a path is not valid UTF-8; skipping the toolchain check".to_owned());
+            self.say(skipped_listing(of, "a path is not valid UTF-8"));
             return Ok(None);
         };
         Ok(Some(listing))
@@ -1251,10 +1323,11 @@ impl Attempt<'_, '_> {
         self.git_bytes_in(Path::new(self.call.root), git, args)
     }
 
-    /// What git writes on standard output for `args` in the worktree `folder`, as [`Attempt::git_bytes`] asks it, its
-    /// search bounded at a pair's parent folder.
+    /// What git writes on standard output for `args` in the worktree `folder`, as [`Attempt::git_bytes`] asks it, a pair's
+    /// repository asked at the place git found it at its check ([`Attempt::bound_at`]).
     fn git_bytes_in(&self, folder: &Path, git: &Git, args: &[&str]) -> Result<Vec<u8>, GitError> {
-        let set: Vec<(&str, &std::ffi::OsStr)> = self.ceiling.iter().map(|ceiling| (CEILING, ceiling.as_os_str())).collect();
+        // A run of one repository gives git no variable of its own.
+        let set = self.bound_at(folder).map(|bound| bound.variables()).unwrap_or_default();
         let call = git::Call {
             set: &set,
             interrupt: self.call.interrupt,
@@ -1317,6 +1390,20 @@ impl Attempt<'_, '_> {
         Ok(())
     }
 
+    /// Asks git again, given no place, where the pair's repository `repo`, at `at` in the run's order, is, once it is
+    /// saved: a place other than `bound`'s, the one checked, keeps the run here naming it, as a `core.worktree`, a
+    /// `commondir` or a `gitdir:` written while it was held would.
+    fn kept_its_place(&self, at: usize, repo: &Repo, bound: Bounded<'_>) -> Result<(), End> {
+        let unplaced = Bounded { place: None, ..bound };
+        let again = snapshot::place_of(unplaced, self.limit, self.call.interrupt);
+        let again = again.map_err(|error| repo_end(at, &repo.name, git_end(error)))?;
+        if bound.place == Some(&again) {
+            Ok(())
+        } else {
+            Err(not_routed(&who(at, &repo.name), MOVED_GIT))
+        }
+    }
+
     /// Pushes one repository's snapshot, and its bridge unless its bare repository was created just now, with no hooks
     /// and no submodules, then saves the local ref and says the push: `gate: pushed snapshot …` for a run of one
     /// repository, `gate: remote pushed snapshot {name} …` for each of a pair's. A push that fails is `unreachable`; a
@@ -1325,20 +1412,31 @@ impl Attempt<'_, '_> {
         self.go_on()?;
         let Push { at, repo, snapshot, created } = *push;
         let (root, key, pair) = (Path::new(&repo.root), self.call.key, !self.call.siblings.is_empty());
-        let target = self.transport.push_target(self.call.host, &repo.on_builder).map_err(End::Failed)?;
-        let mut args: Vec<String> = ["push", "--no-verify", "--no-recurse-submodules", "--progress"].map(str::to_owned).into();
+        let target = self.transport.push_target(self.call.host, &repo.on_builder);
+        let target = target.map_err(|why| repo_end(at, &repo.name, End::Failed(why)))?;
+        // Only the transport's own protocol may carry the push, so no `pushInsteadOf` a repository's config names can
+        // turn it into a protocol helper: ssh to a builder, a local path for the test transport's bare repositories.
+        let protocol = if target.ssh_command.is_some() { "ssh" } else { "file" };
+        let mut args: Vec<String> = ["-c", "protocol.allow=never", "-c"].map(str::to_owned).into();
+        args.push(format!("protocol.{protocol}.allow=always"));
+        args.extend(["push", "--no-verify", "--no-recurse-submodules", "--progress"].map(str::to_owned));
         args.extend(target.receive_pack.iter().map(|pack| format!("--receive-pack={pack}")));
         args.extend(["--".to_owned(), target.url.clone(), format!("+{}:refs/gate/{key}", snapshot.commit)]);
         let bridge = snapshot.bridge.as_deref().filter(|_| !created);
         args.extend(bridge.map(|bridge| format!("+{bridge}:refs/gate-bridge/{key}")));
-        let git = Git::find(root).map_err(End::Failed)?;
+        let git = Git::find(root).map_err(|why| repo_end(at, &repo.name, End::Failed(why)))?;
         let started = Instant::now();
         let ceiling = self.ceiling.clone();
+        let place = self.place_at(root).cloned();
+        let bound = ceiling.as_deref().map(|ceiling| Bounded {
+            root,
+            ceiling,
+            place: place.as_ref(),
+        });
+        // A run of one repository gives git no variable of its own.
+        let variables = bound.map(|bound| bound.variables()).unwrap_or_default();
         let ssh_command = target.ssh_command.as_deref().map(|ssh| ("GIT_SSH_COMMAND", std::ffi::OsStr::new(ssh)));
-        let set: Vec<(&str, &std::ffi::OsStr)> = ssh_command
-            .into_iter()
-            .chain(ceiling.iter().map(|ceiling| (CEILING, ceiling.as_os_str())))
-            .collect();
+        let set: Vec<(&str, &std::ffi::OsStr)> = ssh_command.into_iter().chain(variables.iter().copied()).collect();
         let (mut called, _) = self.with_retry(GIT_SSH_FAILED, |attempt| {
             attempt.git_started(git.command(root), &args, &set, Echo::Progress, watch)
         })?;
@@ -1353,8 +1451,11 @@ impl Attempt<'_, '_> {
             ));
             return Err(End::Refused(FallbackReason::Unreachable));
         }
-        let saved = snapshot::save(root, ceiling.as_deref(), key, &snapshot.commit, self.limit);
+        let saved = snapshot::save(root, &variables, key, &snapshot.commit, self.limit);
         saved.map_err(|error| repo_end(at, &repo.name, git_end(error)))?;
+        if let Some(bound) = bound {
+            self.kept_its_place(at, repo, bound)?;
+        }
         let short = snapshot.commit.get(..8).unwrap_or(&snapshot.commit);
         let took = started.elapsed();
         self.split.push += took;
@@ -2006,6 +2107,7 @@ impl<'c, 'a> Attempt<'c, 'a> {
             box_killed: None,
             pair: None,
             ceiling: None,
+            places: Vec::new(),
             local_major: None,
         }
     }
@@ -3360,6 +3462,7 @@ mod tests {
             box_killed: None,
             pair: None,
             ceiling: None,
+            places: Vec::new(),
             local_major: None,
         }
     }
@@ -3394,10 +3497,8 @@ mod tests {
 
         drop(attempt);
         fs::remove_dir(pair.folder("lib")).expect("the junction can be removed");
-        assert!(
-            matches!(&ended, Err(End::NotRouted(line)) if line.starts_with("gate: not routed: sibling lib ")),
-            "{ended:?}"
-        );
+        let link = format!("gate: not routed: sibling lib {}", crate::route::SIBLING_LINK);
+        assert!(matches!(&ended, Err(End::NotRouted(line)) if *line == link), "{ended:?}");
     }
 
     /// A sibling whose worktree lock another run's sync-back holds past the lock wait keeps the run here naming it.

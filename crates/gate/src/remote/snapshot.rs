@@ -43,15 +43,43 @@ pub(crate) fn take(roots: &[PathBuf], key: &str, limit: Duration, interrupt: Opt
         return Ok(Vec::new());
     };
     let git = Git::find(first).map_err(GitError::Failed)?;
-    roots.iter().map(|root| take_one(&git, root, None, key, limit, interrupt)).collect()
+    roots.iter().map(|root| take_one(&git, root, &[], key, limit, interrupt)).collect()
 }
 
-/// A repository of a sibling pair as its git calls ask about it: its worktree's folder, and the folder git's search for
-/// a repository stops at, `GIT_CEILING_DIRECTORIES`, the pair's parent folder, so git never reaches a repository above.
+/// A repository of a sibling pair as its git calls ask about it: its worktree's folder; the folder git's search for a
+/// repository stops at, `GIT_CEILING_DIRECTORIES`, the pair's parent folder, so git never reaches a repository above;
+/// and, once checked, where git found it, which every later call is given outright, so a `core.worktree`, a
+/// `commondir` or a `gitdir:` written after the check cannot point it elsewhere; `None` before the check.
 #[derive(Clone, Copy)]
 pub(crate) struct Bounded<'a> {
     pub root: &'a Path,
     pub ceiling: &'a Path,
+    pub place: Option<&'a Place>,
+}
+
+impl<'a> Bounded<'a> {
+    /// The variables every git call about the repository is given: the ceiling, and with a checked place its git
+    /// folder, its worktree, the root, and its common folder.
+    pub(crate) fn variables(&self) -> Vec<(&'a str, &'a OsStr)> {
+        let mut variables = vec![(CEILING, self.ceiling.as_os_str())];
+        if let Some(place) = self.place {
+            variables.extend([
+                ("GIT_DIR", OsStr::new(place.git_dir.as_str())),
+                ("GIT_WORK_TREE", self.root.as_os_str()),
+                ("GIT_COMMON_DIR", OsStr::new(place.common.as_str())),
+            ]);
+        }
+        variables
+    }
+}
+
+/// Where git finds a pair's repository: the top folder of its worktree, its git folder and its common git folder, each
+/// absolute, as git printed them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Place {
+    pub top: String,
+    pub git_dir: String,
+    pub common: String,
 }
 
 /// The variable naming the folder git's search for a repository stops at, which every git call about a pair's
@@ -61,27 +89,38 @@ pub(crate) const CEILING: &str = "GIT_CEILING_DIRECTORIES";
 /// The snapshot of the pair's repository `repo`, as [`take`] takes one, under the work-folder `key`.
 pub(crate) fn take_bounded(repo: Bounded<'_>, key: &str, limit: Duration, interrupt: Option<Interrupt>) -> Result<Snapshot, GitError> {
     let git = Git::find(repo.root).map_err(GitError::Failed)?;
-    take_one(&git, repo.root, Some(repo.ceiling), key, limit, interrupt)
+    take_one(&git, repo.root, &repo.variables(), key, limit, interrupt)
 }
 
-/// Where git finds the pair's repository `repo`: the top folder of its worktree and its common git folder, as one
-/// `git rev-parse --show-toplevel --path-format=absolute --git-common-dir` prints them.
-pub(crate) fn place_of(repo: Bounded<'_>, limit: Duration, interrupt: Option<Interrupt>) -> Result<(String, String), GitError> {
+/// Where git finds the pair's repository `repo`, searching from its root up to its ceiling and given no place, as one
+/// `git rev-parse --show-toplevel --path-format=absolute --absolute-git-dir --git-common-dir` prints it.
+pub(crate) fn place_of(repo: Bounded<'_>, limit: Duration, interrupt: Option<Interrupt>) -> Result<Place, GitError> {
     let git = Git::find(repo.root).map_err(GitError::Failed)?;
+    let ceiling = [(CEILING, repo.ceiling.as_os_str())];
     let calls = Calls {
         git: &git,
         root: repo.root,
-        ceiling: Some(repo.ceiling),
+        bound: &ceiling,
         limit,
         interrupt,
     };
-    let args = ["rev-parse", "--show-toplevel", "--path-format=absolute", "--git-common-dir"];
+    let args = [
+        "rev-parse",
+        "--show-toplevel",
+        "--path-format=absolute",
+        "--absolute-git-dir",
+        "--git-common-dir",
+    ];
     let printed = calls.output(&args, &[], &[])?;
     let mut lines = printed.lines().map(str::trim_end);
-    match (lines.next(), lines.next(), lines.next()) {
-        (Some(top), Some(common), None) => Ok((top.to_owned(), common.to_owned())),
+    match (lines.next(), lines.next(), lines.next(), lines.next()) {
+        (Some(top), Some(git_dir), Some(common), None) => Ok(Place {
+            top: top.to_owned(),
+            git_dir: git_dir.to_owned(),
+            common: common.to_owned(),
+        }),
         _ => Err(GitError::Failed(format!(
-            "git {} did not print two paths: {}",
+            "git {} did not print three paths: {}",
             args.join(" "),
             printed.trim()
         ))),
@@ -89,14 +128,14 @@ pub(crate) fn place_of(repo: Bounded<'_>, limit: Duration, interrupt: Option<Int
 }
 
 /// Points `refs/gate-remote/<key>` at `commit` in the repository of `root`, once the builder has the snapshot, so the
-/// next bridge commit builds on it, git's search bounded at `ceiling` for a pair's repository. git holds the ref's lock
-/// while it runs, so it is a [`git::Call::locked`] call, which no Ctrl+C ends: it ends on its own or after `limit`.
-pub(crate) fn save(root: &Path, ceiling: Option<&Path>, key: &str, commit: &str, limit: Duration) -> Result<(), GitError> {
+/// next bridge commit builds on it, git given `bound`, a pair's repository's [`Bounded::variables`], none for a run
+/// of one. git holds the ref's lock while it runs, so it is a [`git::Call::locked`] call, which no Ctrl+C ends: it ends
+/// on its own or after `limit`.
+pub(crate) fn save(root: &Path, bound: &[(&str, &OsStr)], key: &str, commit: &str, limit: Duration) -> Result<(), GitError> {
     let git = Git::find(root).map_err(GitError::Failed)?;
     let args = ["update-ref", &format!("{REFS}{key}"), commit];
-    let set: Vec<(&str, &OsStr)> = ceiling.map(|ceiling| (CEILING, ceiling.as_os_str())).into_iter().collect();
     git.output(&git::Call {
-        set: &set,
+        set: bound,
         ..git::Call::locked(root, &args, limit)
     })
     .map(drop)
@@ -110,17 +149,24 @@ pub(super) fn worktree(root: &Path, limit: Duration, interrupt: Option<Interrupt
     worktree_tree(&Calls {
         git: &git,
         root,
-        ceiling: None,
+        bound: &[],
         limit,
         interrupt,
     })
 }
 
-fn take_one(git: &Git, root: &Path, ceiling: Option<&Path>, key: &str, limit: Duration, interrupt: Option<Interrupt>) -> Result<Snapshot, GitError> {
+fn take_one(
+    git: &Git,
+    root: &Path,
+    bound: &[(&str, &OsStr)],
+    key: &str,
+    limit: Duration,
+    interrupt: Option<Interrupt>,
+) -> Result<Snapshot, GitError> {
     let calls = Calls {
         git,
         root,
-        ceiling,
+        bound,
         limit,
         interrupt,
     };
@@ -150,21 +196,21 @@ fn previous(listing: &str, key: &str) -> Option<String> {
         .map(|(_, sha)| (*sha).to_owned())
 }
 
-/// git asked about one worktree, with the ceiling of a pair's repository, the limit and the interrupt every call of one
-/// snapshot shares.
+/// git asked about one worktree, with the variables of a pair's repository ([`Bounded::variables`]), the limit and the
+/// interrupt every call of one snapshot shares.
 struct Calls<'a> {
     git: &'a Git,
     root: &'a Path,
-    ceiling: Option<&'a Path>,
+    bound: &'a [(&'a str, &'a OsStr)],
     limit: Duration,
     interrupt: Option<Interrupt>,
 }
 
 impl Calls<'_> {
-    /// What git wrote on stdout for `args`, with `set` and the ceiling given and `unset` removed.
+    /// What git wrote on stdout for `args`, with `set` and the bound variables given and `unset` removed.
     fn output(&self, args: &[&str], set: &[(&str, &OsStr)], unset: &[&str]) -> Result<String, GitError> {
         let mut given = set.to_vec();
-        given.extend(self.ceiling.map(|ceiling| (CEILING, ceiling.as_os_str())));
+        given.extend(self.bound.iter().copied());
         self.git.output(&self.call(args, &given, unset))
     }
 
@@ -299,10 +345,39 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::slice;
 
-    use super::{DATES, IDENTITY, asked, copy_name, git_path, lock_of, previous, repository, save, take, worktree};
+    use super::{Bounded, DATES, IDENTITY, asked, copy_name, git_path, lock_of, place_of, previous, repository, save, take, worktree};
     use crate::remote::git::{GIT_LIMIT, GitError};
 
     const OWN: &str = "app-1a2b3c4d";
+
+    /// A folder with no `.git` of its own inside another repository is no repository to a search bounded at its parent:
+    /// git fails, and never names the repository above.
+    #[test]
+    fn a_folder_with_no_git_inside_a_repository_is_not_found_above_its_ceiling() {
+        let outer = repository("ceiling");
+        let parent = outer.join("dev");
+        let folder = parent.join("lib");
+        fs::create_dir_all(&folder).expect("the folder can be made");
+        let bounded = Bounded {
+            root: &folder,
+            ceiling: &parent,
+            place: None,
+        };
+
+        let found = place_of(bounded, GIT_LIMIT, None);
+
+        let outer_shown = outer.to_string_lossy().replace('\\', "/");
+        fs::remove_dir_all(&outer).expect("the repository can be removed");
+        let failed = match &found {
+            Err(GitError::Failed(why)) => Some(why.replace('\\', "/")),
+            _ => None,
+        };
+        assert!(failed.is_some(), "git found a repository above the ceiling: {found:?}");
+        assert!(
+            failed.is_some_and(|why| !why.contains(&format!("{outer_shown}/.git"))),
+            "the repository above is not named: {found:?}"
+        );
+    }
 
     #[test]
     fn the_previous_snapshot_is_the_key_s_own_else_the_newest_that_is_no_back_ref() {
@@ -368,7 +443,7 @@ mod tests {
         let first = take(roots, OWN, GIT_LIMIT, None).expect("the first snapshot is made");
         assert_eq!(first.len(), 1, "one snapshot for one root");
         assert_eq!(first[0].bridge, None, "no snapshot before the first");
-        save(&root, None, OWN, &first[0].commit, GIT_LIMIT).expect("the ref is saved");
+        save(&root, &[], OWN, &first[0].commit, GIT_LIMIT).expect("the ref is saved");
         fs::write(root.join("a.txt"), "b\n").expect("a file can be changed");
 
         let second = take(roots, OWN, GIT_LIMIT, None).expect("the second snapshot is made");
