@@ -383,6 +383,7 @@ fn a_fallback_line_names_each_reason_by_its_word() {
         (FallbackReason::Version, "version"),
         (FallbackReason::Client, "client"),
         (FallbackReason::Inputs, "inputs"),
+        (FallbackReason::Cold, "cold"),
     ];
     for (reason, word) in reasons {
         let line = journal_line(&identity(), ts(NOW), &JournalEvent::Fallback { reason }, Some(&tag()), None);

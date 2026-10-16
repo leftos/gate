@@ -311,6 +311,186 @@ fn an_outputs_cap_record_of_another_shape_holds_no_count() {
     }
 }
 
+const WARM_HASH: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+
+/// A warm-up record in `state`, failed ones by their commands.
+fn warm(state: v1::WarmState) -> v1::WarmRecord {
+    let failed = state == v1::WarmState::Failed;
+    v1::WarmRecord {
+        host: "builder".to_owned(),
+        state,
+        at: ts("2026-10-16T08:00:00.5000000Z"),
+        hash: WARM_HASH.to_owned(),
+        gate: "0.1.0+abc1234".to_owned(),
+        pid: 4242,
+        started: ts("2026-10-16T07:59:00Z"),
+        failure: failed.then_some(v1::WarmFailure::Commands),
+        reason: failed.then(|| "command 1 exited with status 1".to_owned()),
+    }
+}
+
+#[test]
+fn the_warm_up_files_sit_in_the_remote_folder() {
+    let root = Path::new("state-root");
+
+    assert_eq!(parts_under(root, &v1::warm_dir(root)), ["remote", "warm"]);
+    assert_eq!(
+        parts_under(root, &v1::warm_record_path(root, "app-1a2b3c4d")),
+        ["remote", "warm", "app-1a2b3c4d.json"]
+    );
+    assert_eq!(
+        parts_under(root, &v1::warm_log_path(root, "app-1a2b3c4d")),
+        ["remote", "warm", "app-1a2b3c4d.log"]
+    );
+    assert_eq!(
+        parts_under(root, &v1::warm_lock_path(root, "app-1a2b3c4d")),
+        ["remote", "warm", "app-1a2b3c4d.lock"]
+    );
+    assert_eq!(parts_under(root, &v1::warm_cap_lock_path(root)), ["remote", "warm.lock"]);
+}
+
+#[test]
+fn a_warm_up_record_of_each_state_is_written_whole_and_read_back() {
+    let root = scratch("warm-record");
+    let path = v1::warm_record_path(&root, "app-1a2b3c4d");
+    let refused = v1::WarmRecord {
+        failure: Some(v1::WarmFailure::Refused),
+        reason: Some("the builder is busy".to_owned()),
+        ..warm(v1::WarmState::Failed)
+    };
+    let records = [
+        warm(v1::WarmState::Warming),
+        warm(v1::WarmState::Warm),
+        warm(v1::WarmState::Failed),
+        refused,
+    ];
+
+    for record in records {
+        v1::write_warm_record(&path, &record).expect("the record can be written");
+        let bytes = fs::read(&path).expect("the record can be read");
+        assert_eq!(v1::warm_record(&bytes).expect("the record reads"), record);
+    }
+    let bytes = fs::read(&path).expect("the record can be read");
+    assert_eq!(
+        String::from_utf8_lossy(&bytes),
+        format!(
+            concat!(
+                r#"{{"v":1,"host":"builder","state":"failed","at":"2026-10-16T08:00:00.5000000Z","hash":"{WARM_HASH}","gate":"0.1.0+abc1234","#,
+                r#""pid":4242,"started":"2026-10-16T07:59:00.0000000Z","failure":"refused","reason":"the builder is busy"}}"#
+            ),
+            WARM_HASH = WARM_HASH
+        )
+    );
+    v1::write_warm_record(&path, &warm(v1::WarmState::Warm)).expect("the record can be written");
+    let bytes = fs::read(&path).expect("the record can be read");
+    assert!(!String::from_utf8_lossy(&bytes).contains("failure"), "a warm record has no failure");
+    let names: Vec<_> = fs::read_dir(v1::warm_dir(&root))
+        .expect("the warm folder can be listed")
+        .map(|entry| entry.expect("an entry can be read").file_name())
+        .collect();
+    assert_eq!(names, ["app-1a2b3c4d.json"], "no temp file is left beside it");
+}
+
+/// The JSON of a warm-up record that reads, for a test to spoil.
+fn good_warm_json() -> serde_json::Value {
+    json!({
+        "v": 1, "host": "builder", "state": "warm", "at": "2026-10-16T08:00:00Z", "hash": WARM_HASH,
+        "gate": "0.1.0", "pid": 4242, "started": "2026-10-16T07:59:00Z"
+    })
+}
+
+#[test]
+fn a_warm_up_record_of_another_shape_is_refused() {
+    let good = good_warm_json();
+    let with = |key: &str, value: serde_json::Value| {
+        let mut record = good.clone();
+        record[key] = value;
+        record.to_string().into_bytes()
+    };
+    let without = |key: &str| {
+        let mut record = good.clone();
+        record.as_object_mut().expect("an object").remove(key);
+        record.to_string().into_bytes()
+    };
+    let failed_with = |key: &str, value: &str| {
+        let mut record = good.clone();
+        record["state"] = json!("failed");
+        record[key] = json!(value);
+        record.to_string().into_bytes()
+    };
+    let rows: Vec<(&str, Vec<u8>)> = vec![
+        ("an unknown state", with("state", json!("cold"))),
+        ("a state in another case", with("state", json!("Warm"))),
+        ("a short hash", with("hash", json!(&WARM_HASH[1..]))),
+        ("an upper-case hash", with("hash", json!(WARM_HASH.to_uppercase()))),
+        ("a hash that is not hex", with("hash", json!(WARM_HASH.replacen('a', "g", 1)))),
+        ("a failure without failed", with("failure", json!("commands"))),
+        ("a reason without failed", with("reason", json!("why"))),
+        ("failed without a failure", failed_with("reason", "why")),
+        ("failed without a reason", failed_with("failure", "commands")),
+        ("an unknown failure", {
+            let mut record = good.clone();
+            record["state"] = json!("failed");
+            record["failure"] = json!("other");
+            record["reason"] = json!("why");
+            record.to_string().into_bytes()
+        }),
+        ("no host", without("host")),
+        ("no time", without("at")),
+        ("no gate", without("gate")),
+        ("no pid", without("pid")),
+        ("no start", without("started")),
+        ("a time that is no time", with("at", json!("yesterday"))),
+        ("another version", with("v", json!(2))),
+        ("no JSON", b"{\"v\":1,".to_vec()),
+    ];
+    for (label, bytes) in rows {
+        assert!(v1::warm_record(&bytes).is_err(), "{label}: {}", String::from_utf8_lossy(&bytes));
+    }
+    assert_eq!(
+        v1::warm_record(good.to_string().as_bytes()).expect("the good record reads").state,
+        v1::WarmState::Warm
+    );
+    let root = scratch("warm-record-refused");
+    let path = v1::warm_record_path(&root, "app-1a2b3c4d");
+    let bad = v1::WarmRecord {
+        failure: Some(v1::WarmFailure::Commands),
+        ..warm(v1::WarmState::Warm)
+    };
+    let error = v1::write_warm_record(&path, &bad).expect_err("a record that would not read back is not written");
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{error}");
+    assert!(!path.exists(), "nothing is written");
+}
+
+#[test]
+fn a_warm_up_record_with_an_empty_host_is_refused() {
+    let mut record = good_warm_json();
+    record["host"] = json!("");
+
+    let error = v1::warm_record(record.to_string().as_bytes()).expect_err("an empty host is refused");
+    assert_eq!(error.to_string(), "host is empty");
+}
+
+#[test]
+fn a_warm_up_record_with_an_empty_gate_is_refused() {
+    let mut record = good_warm_json();
+    record["gate"] = json!("");
+
+    let error = v1::warm_record(record.to_string().as_bytes()).expect_err("an empty gate is refused");
+    assert_eq!(error.to_string(), "gate is empty");
+}
+
+#[test]
+fn a_warm_up_record_whose_failed_state_gives_no_reason_is_refused() {
+    let mut record = good_warm_json();
+    record["state"] = json!("failed");
+    record["failure"] = json!("commands");
+    record["reason"] = json!("");
+
+    let error = v1::warm_record(record.to_string().as_bytes()).expect_err("an empty reason is refused");
+    assert_eq!(error.to_string(), "state failed with an empty reason");
+}
+
 #[test]
 fn a_pause_marker_name_builds_and_parses_and_refuses_anything_else() {
     let marker = v1::PauseMarker {

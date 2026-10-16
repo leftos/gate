@@ -5,9 +5,9 @@
 use std::path::PathBuf;
 
 use gate_router::{
-    BuildSettings, BuildTarget, Config, ConfigProblem, DROPPED_NO_BUILD_LINE, DotnetTarget, Inputs, LocalReason, NO_OUTPUTS_LINE, PROJECT_EXTENSIONS,
-    Place, RemoteRun, Route, SiblingFolder, Slot, build_settings, decide, dotnet_builds, dotnet_target, is_cargo, is_dotnet, is_usable_host,
-    sdk_build_target, without_no_build, work_folder_key,
+    BuildSettings, BuildTarget, Config, ConfigProblem, DROPPED_NO_BUILD_LINE, DotnetTarget, Facts, Inputs, LocalReason, NO_OUTPUTS_LINE,
+    PROJECT_EXTENSIONS, Place, RemoteRun, Route, SiblingFolder, Slot, Target, build_settings, builder_words, decide, dotnet_builds, dotnet_target,
+    is_cargo, is_dotnet, is_usable_host, sdk_build_target, target, without_no_build, work_folder_key,
 };
 
 use crate::support::{FakeFacts, HEAD, ROOT, carried, fake_id, heavy, place_at, sibling_root, words};
@@ -429,6 +429,67 @@ fn a_dotnet_no_build_command_brings_no_outputs_back() {
     assert!(run.outputs_withheld);
     assert_eq!(run.lines(), [DROPPED_NO_BUILD_LINE, NO_OUTPUTS_LINE]);
     assert_eq!(NO_OUTPUTS_LINE, "gate: outputs: none brought back for a --no-build command");
+}
+
+/// The target and the words a worktree's [`target`] and [`builder_words`] give for `command`, each checked against the
+/// [`RemoteRun`] the same worktree's decision builds.
+fn assert_builder_words_match(command: &[String], facts: &FakeFacts) -> (Target, Vec<String>) {
+    let run = routed(decide(&heavy(command), facts));
+    let place = facts.place().expect("the place reads").expect("there is a worktree");
+    let builder_target = target(&crate::support::config(), place, facts).expect("the worktree routes");
+    let built = builder_words(&builder_target, command, facts);
+    assert_eq!(built.words, run.words, "{command:?}");
+    assert_eq!(built.outside, None, "{command:?}");
+    assert_eq!(builder_target.host, run.host, "{command:?}");
+    assert_eq!(builder_target.slots, run.slots, "{command:?}");
+    assert_eq!(builder_target.key, run.key, "{command:?}");
+    assert_eq!(builder_target.repo, run.repo, "{command:?}");
+    assert_eq!(builder_target.leaf, run.leaf, "{command:?}");
+    assert_eq!(builder_target.root_id, run.root_id, "{command:?}");
+    assert_eq!(builder_target.place.root, run.root, "{command:?}");
+    assert_eq!(builder_target.siblings, run.siblings, "{command:?}");
+    assert_eq!(builder_target.inputs, run.inputs, "{command:?}");
+    (builder_target, built.words)
+}
+
+/// The file `file` under the sibling root `name`, as the fixtures spell that root ([`sibling_root`]).
+fn sibling_path(name: &str, file: &str) -> String {
+    format!("{}/{}", sibling_root(name), file)
+}
+
+#[test]
+fn builder_words_match_the_routed_run_for_the_same_worktree() {
+    let command = words(&["dotnet", "test", "--no-build"]);
+    let (_, built) = assert_builder_words_match(&command, &FakeFacts::at_root());
+    assert!(built.contains(&stamp()), "the worktree's sha is pinned: {built:?}");
+    assert!(!built.iter().any(|word| word == "--no-build"), "the drop is the routed run's: {built:?}");
+
+    let command = words(&["tool", "--x"]);
+    let facts = FakeFacts {
+        files: words(&["tool"]),
+        ..FakeFacts::at_root()
+    };
+    let (_, built) = assert_builder_words_match(&command, &facts);
+    assert_eq!(
+        built.first().map(String::as_str),
+        Some("./tool"),
+        "the gate's own file is marked: {built:?}"
+    );
+
+    let command = words(&["dotnet", "build", &sibling_path("b", "One.csproj"), &sibling_path("c", "Two.csproj")]);
+    let facts = FakeFacts::with_siblings("sub/", &["b", "c"], &["b", "c"]);
+    let (builder_target, built) = assert_builder_words_match(&command, &facts);
+    assert_eq!(
+        builder_target.siblings,
+        [carried("b"), carried("c")],
+        "both siblings are carried, in declared order"
+    );
+    assert!(built.contains(&stamp()), "the worktree's sha is pinned: {built:?}");
+    assert_eq!(
+        &built[2..4],
+        ["../../b/One.csproj", "../../c/Two.csproj"],
+        "each sibling's path is sent with its declared name, in the routed run's order: {built:?}"
+    );
 }
 
 /// Asserts whether `given` is a dotnet command, and the words it leaves once each `--no-build` of the dotnet command's

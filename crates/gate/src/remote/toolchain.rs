@@ -11,6 +11,8 @@
 use serde_json::Value as Json;
 use toml::{Table, Value};
 
+use gate_router::{parse_failure, spelled};
+
 use crate::boxside::payload::escaped;
 use crate::boxside::probe::Probed;
 use crate::remote::git::{FAILURE_BYTES, first_bytes};
@@ -346,26 +348,6 @@ pub(crate) fn read(text: &str) -> Result<Manifest, String> {
 /// `text` without a leading byte order mark.
 fn without_bom(text: &str) -> &str {
     text.strip_prefix('\u{feff}').unwrap_or(text)
-}
-
-/// The key `key` as TOML spells it: bare when it is one or more ASCII letters, digits, `_` and `-`, else quoted, its
-/// line ends and other control characters escaped, so it is always one line.
-pub(crate) fn spelled(key: &str) -> String {
-    let bare = !key.is_empty() && key.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-');
-    if bare { key.to_owned() } else { format!("{key:?}") }
-}
-
-/// `error`, a failure to parse `text`, as the line and column it starts at and its message; a leading byte order mark
-/// takes no column.
-fn parse_failure(text: &str, error: &toml::de::Error) -> String {
-    let message = error.message().trim_end();
-    let Some(span) = error.span() else {
-        return message.to_owned();
-    };
-    let before = without_bom(text.get(..span.start).unwrap_or(text));
-    let line = before.matches('\n').count() + 1;
-    let column = before.rsplit('\n').next().unwrap_or(before).chars().count() + 1;
-    format!("line {line}, column {column}: {message}")
 }
 
 /// Reads the `tools` value `value` into `manifest`, each entry a tool or a problem.

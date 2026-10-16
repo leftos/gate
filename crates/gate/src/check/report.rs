@@ -6,11 +6,11 @@
 //! that work over ssh, and its SDK line names the builder. The exit status is 0 only when nothing is missing or too old:
 //! a skipped item never fails the check.
 
-use gate_router::SiblingFolder;
+use gate_router::{SiblingFolder, spelled};
 
 use crate::answer::FAILED_STATUS;
 use crate::boxside::payload::escaped;
-use crate::remote::toolchain::{Reported, Standing, ToolNeed, Version, spelled, standing};
+use crate::remote::toolchain::{Reported, Standing, ToolNeed, Version, standing};
 
 /// Where the check looked: this PC, or the builder `host`, whose work folder for the repo is `key`.
 #[derive(Clone, Copy, Debug)]

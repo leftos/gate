@@ -243,6 +243,8 @@ pub enum FallbackReason {
     Client,
     /// The run's ignored inputs could not be sent to the builder, or its work folder no longer held them at the run.
     Inputs,
+    /// The builder's work folder was not warm for the run's warm-up file.
+    Cold,
 }
 
 impl FallbackReason {
@@ -260,6 +262,7 @@ impl FallbackReason {
             FallbackReason::Version => "version",
             FallbackReason::Client => "client",
             FallbackReason::Inputs => "inputs",
+            FallbackReason::Cold => "cold",
         }
     }
 }

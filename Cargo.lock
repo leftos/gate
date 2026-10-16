@@ -222,6 +222,7 @@ dependencies = [
  "proptest",
  "serde_json",
  "sha2",
+ "toml",
 ]
 
 [[package]]
