@@ -7,7 +7,7 @@
 - [!] GATE-214 Toolchain 7: roll the manifest out to the gated repos — High · Remote
 - [ ] GATE-192 Turn routing back on, on the Rust remote client — High · Remote
 - [/] GATE-231 Run a routed command that needs a desktop in the builder's logged-on session — High · Remote
-- [ ] GATE-304 Restore a routed repo's pnpm packages on the builder before a pnpm command — High · Remote
+- [/] GATE-347 Warm a builder work folder with a repo's warm-up commands before routing work for it — High · Remote
 
 ## Remote
 
@@ -80,6 +80,12 @@
 - [ ] GATE-344 Leave git-tracked folders out of a routed build's stale line
 - [ ] GATE-345 Bound a routed pair's sibling walks for the stale line
 - [ ] GATE-346 Clear a box work tree's config.lock a killed preflight left
+- [ ] GATE-348 Keep a run local when remote.json allows siblings its worktree does not declare
+- [ ] GATE-349 pnpm restore: check every workspace package's node_modules is ignored
+- [ ] GATE-350 Run the box's dotnet tool restore with the command's restricted token
+- [ ] GATE-351 Keep a planted DLL beside gate.exe out of its static imports
+- [ ] GATE-352 Treat a stop during the dotnet tool restore's start as a stop, not a tools refusal
+- [ ] GATE-353 Test a stop during the pnpm install's start with a box seam
 
 ## Cutover sweep
 
