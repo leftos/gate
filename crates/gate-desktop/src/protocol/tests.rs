@@ -436,7 +436,9 @@ fn a_read_woken_by_a_set_manual_reset_event_returns_at_once_as_woken() {
     stop.set().expect("the event is set");
     let started = Instant::now();
 
-    let woken = read_message(&client, far(), HELPER_FRAME_LIMIT, &[stop.as_handle()]).expect_err("nothing was written");
+    let bound = Instant::now() + Duration::from_secs(600);
+
+    let woken = read_message(&client, bound, HELPER_FRAME_LIMIT, &[stop.as_handle()]).expect_err("nothing was written");
 
     assert!(matches!(woken, ReadError::Woken(0)), "{woken}");
     assert!(

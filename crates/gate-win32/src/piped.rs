@@ -328,15 +328,11 @@ pub fn output_pipes() -> Result<OutputPipes, LaunchError> {
 /// A new pipe for the `stream` of a command another process creates, neither end inheritable: the read end, as a file
 /// this process reads, and the write end.
 fn output_pipe(stream: &str) -> Result<(File, std::os::windows::io::OwnedHandle), LaunchError> {
-    let (read, write) = new_pipe(&format!("create the {stream} pipe"))?;
-    // SAFETY: a success returns two fresh handles nothing else owns; each gets exactly one owner here.
-    let ends = unsafe {
-        (
-            File::from(std::os::windows::io::OwnedHandle::from_raw_handle(read)),
-            std::os::windows::io::OwnedHandle::from_raw_handle(write),
-        )
-    };
-    Ok(ends)
+    let (reader, writer) = pipe_from_child(stream)?;
+    let writer = std::mem::ManuallyDrop::new(writer).raw();
+    // SAFETY: the crate's guard of the write end was given up above without closing it, so the std guard made here
+    // alone owns the open handle.
+    Ok((reader, unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(writer) }))
 }
 
 /// A new pipe the command reads its `stream` from, neither end inheritable: the read end, for the command, and the

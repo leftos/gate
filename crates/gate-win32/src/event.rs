@@ -190,8 +190,13 @@ impl NamedEvent {
 
 /// Whether `handle`, such as an event's or a process's, is signalled, without waiting: true once a process has exited.
 pub(crate) fn signalled(handle: &OwnedHandle) -> io::Result<bool> {
+    signalled_within(handle, Duration::ZERO)
+}
+
+/// Whether `handle` is signalled now or becomes so within `timeout`, as [`signalled`] looks at it.
+pub(crate) fn signalled_within(handle: &OwnedHandle, timeout: Duration) -> io::Result<bool> {
     // SAFETY: the handle is open for the whole call; one without `SYNCHRONIZE` access only makes the call fail.
-    match unsafe { WaitForSingleObject(handle.raw(), 0) } {
+    match unsafe { WaitForSingleObject(handle.raw(), wait_millis(timeout)) } {
         WAIT_OBJECT_0 => Ok(true),
         WAIT_TIMEOUT => Ok(false),
         _ => Err(io::Error::last_os_error()),

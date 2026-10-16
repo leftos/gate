@@ -425,7 +425,8 @@ pub enum ReadError {
     Closed,
     /// The deadline passed before a whole frame arrived.
     TimedOut,
-    /// A wake handle at this index was signalled before a whole frame arrived.
+    /// A wake handle at this index was signalled before a whole frame arrived. Part of the frame may have been read,
+    /// so the pipe must be dropped.
     Woken(usize),
     /// The frame's length is 0.
     Empty,
@@ -468,7 +469,8 @@ pub enum WriteError {
     Closed,
     /// The deadline passed first.
     TimedOut,
-    /// A wake handle at this index was signalled first.
+    /// A wake handle at this index was signalled first. Part of the frame may have been written, so the pipe must be
+    /// dropped.
     Woken(usize),
     /// The message is longer than [`FRAME_LIMIT`]; nothing was written.
     TooLong,
@@ -505,7 +507,9 @@ impl std::error::Error for WriteError {
 /// # Errors
 ///
 /// A [`ReadError`] saying why no message was read: [`ReadError::Woken`] for a wake handle signalled first, which a
-/// caller tells from [`ReadError::TimedOut`].
+/// caller tells from [`ReadError::TimedOut`]. A read woken, timed out or failed partway through a frame has used up
+/// part of it, so the pipe holds no frame boundary any more: after [`ReadError::Woken`], [`ReadError::TimedOut`] or
+/// [`ReadError::Io`] the caller drops the pipe, and never reads or writes it again.
 pub fn read_message(pipe: &impl FramePipe, deadline: Instant, limit: u32, wake: &[BorrowedHandle<'_>]) -> Result<Message, ReadError> {
     let mut prefix = [0_u8; 4];
     read_exact(pipe, &mut prefix, deadline, wake)?;
@@ -549,7 +553,9 @@ fn read_exact(pipe: &impl FramePipe, buf: &mut [u8], deadline: Instant, wake: &[
 /// # Errors
 ///
 /// A [`WriteError`] saying why the frame was not written whole: [`WriteError::Woken`] for a wake handle signalled
-/// first, which a caller tells from [`WriteError::TimedOut`].
+/// first, which a caller tells from [`WriteError::TimedOut`]. A write woken, timed out or failed may have written part
+/// of the frame, so the pipe holds no frame boundary any more: after [`WriteError::Woken`], [`WriteError::TimedOut`]
+/// or [`WriteError::Io`] the caller drops the pipe, and never reads or writes it again.
 pub fn write_message(pipe: &impl FramePipe, message: &Message, deadline: Instant, wake: &[BorrowedHandle<'_>]) -> Result<(), WriteError> {
     let body = encode(message);
     if body.len() > FRAME_LIMIT as usize {

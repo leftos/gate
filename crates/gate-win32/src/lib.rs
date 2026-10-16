@@ -46,7 +46,7 @@ pub use event::{EventWait, NamedEvent};
 pub use interrupt::Interrupt;
 pub use job::{Accounting, Job};
 pub use launch::{
-    AdoptError, EnvironmentBlock, Launch, LaunchError, LaunchOutput, PriorityClass, Released, Running, StdioPipes, Suspended, Waited,
+    AdoptError, EndReport, EnvironmentBlock, Launch, LaunchError, LaunchOutput, PriorityClass, Released, Running, StdioPipes, Suspended, Waited,
     same_variable_name,
 };
 pub use memory::working_set;
@@ -54,7 +54,7 @@ pub use mutex::{AcquireError, MutexGuard, NamedMutex, OwnedMutexGuard, mutex_exi
 pub use pipe::{ConnectWait, PipeClient, PipeRead, PipeServer, PipeWrite};
 pub use piped::{DesktopLaunch, OutputPipes, PipedConsole, PipedFed, PipedLaunch, PipedSuspended, breakaway_refused, output_pipes};
 pub use session::{ConnectState, LockState, SessionState, active_console_session, input_desktop_name, session_state};
-pub use task::{StartedTask, TaskError, run_task};
+pub use task::{StartedTask, TaskArgument, TaskError, TaskStart, run_task};
 pub use times::{ProcessTimes, SystemTimes, file_time_now, process_times, system_times, wsl_vm_cpu};
 pub use token::{Grant, NetworkGroup, RestrictedToken, TokenFacts, current_user_sid, token_facts};
 

@@ -109,7 +109,7 @@ pub enum PipeWrite {
 }
 
 /// What ended a wait on an overlapped operation's event and the wake handles.
-enum Signalled {
+pub(crate) enum Signalled {
     /// The operation's event: the operation has ended.
     Event,
     /// The wait ended before the operation did.
@@ -118,7 +118,7 @@ enum Signalled {
 
 /// Why a wait ended before its operation did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Early {
+pub(crate) enum Early {
     /// The deadline passed.
     TimedOut,
     /// The handle at this index of the wake list was signalled.
@@ -186,6 +186,7 @@ impl PipeServer {
     /// cannot make `user_sid` an owner.
     pub fn create(prefix: &str, user_sid: &str) -> io::Result<PipeServer> {
         let name = format!(r"\\.\pipe\{prefix}-{}", random_hex()?);
+        check_local_pipe_name(&name)?;
         PipeServer::create_named(name, user_sid)
     }
 
@@ -365,7 +366,10 @@ impl PipeServer {
         self.handle.raw()
     }
 
-    /// The id of the process at the client end of the connected pipe (`GetNamedPipeClientProcessId`).
+    /// The id of the process at the client end of the connected pipe (`GetNamedPipeClientProcessId`). It is a guard
+    /// against a mix-up, such as another instance of the expected client connecting first, and not authentication: a
+    /// pid names a process only as long as that process lives, and says nothing of who made it. Whoever the client is
+    /// must still be shown by checks on handles to it.
     ///
     /// # Errors
     ///
@@ -381,7 +385,7 @@ impl PipeServer {
 }
 
 /// Refuses a wake list longer than a wait on an operation's event can watch, naming the operation, `what`.
-fn check_wake(wake: &[BorrowedHandle<'_>], what: &str) -> io::Result<()> {
+pub(crate) fn check_wake(wake: &[BorrowedHandle<'_>], what: &str) -> io::Result<()> {
     if wake.len() >= MAXIMUM_WAIT_OBJECTS as usize {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -408,7 +412,7 @@ fn wait_list(event: &OwnedHandle, wake: &[BorrowedHandle<'_>]) -> Vec<HANDLE> {
 /// Waits until `deadline` for any of `handles`, the operation's event first: [`Signalled::Event`] for the event, an
 /// [`Early::Woken`] with the index into the wake list for another, an [`Early::TimedOut`] past the deadline. The event
 /// wins over a wake handle signalled at the same moment.
-fn wait_any(handles: &[HANDLE], deadline: Instant) -> io::Result<Signalled> {
+pub(crate) fn wait_any(handles: &[HANDLE], deadline: Instant) -> io::Result<Signalled> {
     let count = u32::try_from(handles.len()).map_err(io::Error::other)?;
     let timeout = wait_millis(deadline.saturating_duration_since(Instant::now()));
     // SAFETY: `handles` holds `count` handles, each open for the whole call: the event this module made, and the wake
@@ -641,7 +645,7 @@ unsafe fn start_transfer(handle: HANDLE, op: &mut Transfer<'_>, overlapped: *mut
 }
 
 /// A security descriptor the system built from a string, freed when dropped.
-struct SecurityDescriptor(PSECURITY_DESCRIPTOR);
+pub(crate) struct SecurityDescriptor(pub(crate) PSECURITY_DESCRIPTOR);
 
 /// The descriptor string of a [`PipeServer`]'s pipe for `user_sid`: owned by it, a protected DACL allowing it
 /// [`CLIENT_ACCESS`] and OWNER RIGHTS `READ_CONTROL` alone, and a medium label refusing reads, writes and execution
@@ -660,7 +664,7 @@ fn server_sddl(user_sid: &str) -> io::Result<String> {
 
 impl SecurityDescriptor {
     /// The descriptor `sddl` describes.
-    fn from_sddl(sddl: &str) -> io::Result<SecurityDescriptor> {
+    pub(crate) fn from_sddl(sddl: &str) -> io::Result<SecurityDescriptor> {
         let sddl = wide(sddl);
         let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
         // SAFETY: `sddl` is NUL-terminated and outlives the call, `descriptor` is writable, and no size is asked for.
@@ -683,7 +687,7 @@ impl Drop for SecurityDescriptor {
 
 /// Whether `text` has the shape of a SID's string form, `S-` and then numbers joined by `-`, so it adds nothing but a
 /// SID to the descriptor string it goes into.
-fn is_sid_string(text: &str) -> bool {
+pub(crate) fn is_sid_string(text: &str) -> bool {
     text.strip_prefix("S-").is_some_and(|rest| {
         rest.split('-').count() >= 2
             && rest
@@ -913,18 +917,15 @@ impl ObjectSecurity {
     }
 }
 
-/// An entry of a DACL or SACL, as far as a pipe's check needs it.
-#[derive(Debug)]
-enum Entry {
+/// An entry of a DACL or SACL, as far as a pipe's check and a scheduled task's need it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Entry {
     /// An access-allowed entry: its flags, its mask and its SID's string form.
     Allowed { flags: u8, mask: u32, sid: String },
     /// A mandatory label entry: its flags, its policy and its label SID's string form.
     Label { flags: u8, policy: u32, sid: String },
     /// An entry of any other type.
-    Other {
-        #[expect(dead_code, reason = "read only through `Debug`, in a refusal's message")]
-        kind: u8,
-    },
+    Other { kind: u8 },
 }
 
 impl Entry {
@@ -944,7 +945,7 @@ impl Entry {
 /// # Safety
 ///
 /// `acl` points to a valid ACL for the whole call.
-unsafe fn entries_of(acl: *const ACL) -> io::Result<Vec<Entry>> {
+pub(crate) unsafe fn entries_of(acl: *const ACL) -> io::Result<Vec<Entry>> {
     // SAFETY: the caller guarantees `acl`.
     let count = unsafe { (*acl).AceCount };
     // SAFETY: as above, and each index is below the ACL's count of entries.
@@ -1100,6 +1101,16 @@ mod tests {
 
             assert_eq!(refused.kind(), std::io::ErrorKind::InvalidInput, "{name}: {refused}");
             assert_eq!(refused.raw_os_error(), None, "{name} is refused before any open: {refused}");
+        }
+    }
+
+    #[test]
+    fn a_server_refuses_a_prefix_that_makes_a_name_its_client_refuses() {
+        for prefix in [r"gate\x", "gate/x", r"..\C:\gate-x"] {
+            let refused = PipeServer::create(prefix, &own_sid()).err().expect("the prefix is refused");
+
+            assert_eq!(refused.kind(), std::io::ErrorKind::InvalidInput, "{prefix}: {refused}");
+            assert_eq!(refused.raw_os_error(), None, "{prefix} is refused before any create: {refused}");
         }
     }
 

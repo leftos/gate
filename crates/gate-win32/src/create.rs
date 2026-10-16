@@ -363,7 +363,7 @@ fn create_process(creation: &Creation<'_>, flags: PROCESS_CREATION_FLAGS, startu
     let thread = match thread {
         Ok(thread) => thread,
         Err(error) => {
-            let ended = end_unstarted(&process);
+            let ended = end_unstarted(&process, crate::launch::UNSTARTED_END_WAIT);
             return Err(setup(with_end(error, ended), "own the command's thread"));
         }
     };
@@ -373,6 +373,7 @@ fn create_process(creation: &Creation<'_>, flags: PROCESS_CREATION_FLAGS, startu
         pid: created.dwProcessId,
         pipes: None,
         note: None,
+        end_report: None,
     })
 }
 

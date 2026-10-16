@@ -450,6 +450,12 @@ mod tests {
         crate::create::tests::ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// The report an adopted child is given: a child a drop could not end fails the test that dropped it.
+    #[expect(clippy::panic, reason = "a child a test's drop could not end must fail that test loudly")]
+    fn unended() -> crate::EndReport {
+        Box::new(|pid, error| panic!("the adopted child {pid} could not be ended: {error}"))
+    }
+
     /// A fresh unset manual-reset event.
     fn event() -> std::os::windows::io::OwnedHandle {
         // SAFETY: null security attributes and a null name are allowed. A success is a fresh handle nothing else owns.
@@ -581,7 +587,7 @@ mod tests {
         let job = Job::anonymous_kill_on_close().expect("the job is made");
         assert!(!job.holds_process(process.as_handle()).expect("the membership is read"));
 
-        let adopted = Suspended::adopt(process, thread, pid).expect("the child is adopted");
+        let adopted = Suspended::adopt(process, thread, pid, unended()).expect("the child is adopted");
         adopted.assign(&job).expect("the adopted child is put in the job");
 
         assert_eq!(adopted.pid(), pid);
@@ -666,7 +672,7 @@ mod tests {
         let pid = child.pid();
         let watch = StoppableProcess::open(pid).expect("the child opens").expect("the child exists");
         let (process, thread) = handles_of(child);
-        let adopted = Suspended::adopt(process, thread, pid).expect("the child is adopted");
+        let adopted = Suspended::adopt(process, thread, pid, unended()).expect("the child is adopted");
 
         drop(adopted);
 
@@ -686,18 +692,18 @@ mod tests {
         let (first_process, first_thread) = handles_of(first);
         let (second_process, second_thread) = handles_of(second);
 
-        let refused = Suspended::adopt(first_process, second_thread, first_pid)
+        let refused = Suspended::adopt(first_process, second_thread, first_pid, unended())
             .err()
             .expect("a thread of another process is refused");
 
         assert_eq!(refused.why.kind(), io::ErrorKind::InvalidInput, "{refused}");
-        let other_process = Suspended::adopt(second_process, first_thread, first_pid)
+        let other_process = Suspended::adopt(second_process, first_thread, first_pid, unended())
             .err()
             .expect("a process of another pid is refused");
         assert_eq!(other_process.why.kind(), io::ErrorKind::InvalidInput, "{other_process}");
         // Both children are adopted as they are, so dropping them ends them.
-        drop(Suspended::adopt(refused.process, other_process.thread, first_pid).expect("the first child is adopted"));
-        drop(Suspended::adopt(other_process.process, refused.thread, second_pid).expect("the second child is adopted"));
+        drop(Suspended::adopt(refused.process, other_process.thread, first_pid, unended()).expect("the first child is adopted"));
+        drop(Suspended::adopt(other_process.process, refused.thread, second_pid, unended()).expect("the second child is adopted"));
     }
 
     /// A copy of `handle` with `access` alone.
@@ -730,10 +736,10 @@ mod tests {
         let query_process = narrowed(process.as_handle(), PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE);
         let query_thread = narrowed(thread.as_handle(), THREAD_QUERY_LIMITED_INFORMATION);
 
-        let no_terminate = Suspended::adopt(query_process, thread, pid)
+        let no_terminate = Suspended::adopt(query_process, thread, pid, unended())
             .err()
             .expect("a process handle that cannot end the process is refused");
-        let no_resume = Suspended::adopt(process, query_thread, pid)
+        let no_resume = Suspended::adopt(process, query_thread, pid, unended())
             .err()
             .expect("a thread handle that cannot resume the thread is refused");
 
@@ -742,7 +748,7 @@ mod tests {
         assert_eq!(no_resume.why.kind(), io::ErrorKind::InvalidInput, "{no_resume}");
         assert!(no_resume.why.to_string().contains("thread handle"), "{no_resume}");
         // The full handles are adopted as they are, so dropping them ends the child.
-        drop(Suspended::adopt(no_resume.process, no_terminate.thread, pid).expect("the child is adopted with full handles"));
+        drop(Suspended::adopt(no_resume.process, no_terminate.thread, pid, unended()).expect("the child is adopted with full handles"));
     }
 
     #[test]
@@ -753,7 +759,7 @@ mod tests {
         let watch = StoppableProcess::open(pid).expect("the child opens").expect("the child exists");
         let (process, thread) = handles_of(child);
 
-        let refused = Suspended::adopt(process, thread, pid + 4)
+        let refused = Suspended::adopt(process, thread, pid + 4, unended())
             .err()
             .expect("a pid the handles are not of is refused");
 
@@ -763,7 +769,7 @@ mod tests {
             thread_is_suspended(refused.thread.as_handle()).expect("the given-back thread is read"),
             "the given-back thread is still suspended once"
         );
-        drop(Suspended::adopt(refused.process, refused.thread, pid).expect("the child is adopted after all"));
+        drop(Suspended::adopt(refused.process, refused.thread, pid, unended()).expect("the child is adopted after all"));
         assert!(watch.wait(HANG_GUARD).expect("the wait succeeds"), "the adopted child ended once dropped");
     }
 

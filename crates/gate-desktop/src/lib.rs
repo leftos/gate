@@ -8,6 +8,8 @@ mod helper;
 pub mod protocol;
 pub mod version;
 
+use std::io;
+use std::path::PathBuf;
 use std::time::Duration;
 
 pub use helper::run;
@@ -19,6 +21,19 @@ pub const PIPE_PREFIX: &str = "gate-desktop";
 /// The Task Scheduler path of the desktop helper's task, which the box runs to start the helper in the logged-on
 /// user's session.
 pub const TASK_PATH: &str = "\\gate\\desktop-helper";
+
+/// The file name of the desktop helper, the `gate-desktop-helper` binary of this crate.
+pub const HELPER_FILE: &str = "gate-desktop-helper.exe";
+
+/// Where the desktop helper must be: [`HELPER_FILE`] in the folder of the running program, `gate.exe`. The task's
+/// action and the image of the helper that connects are both checked against it.
+///
+/// # Errors
+///
+/// The system's error when the running program's path cannot be read.
+pub fn helper_path() -> io::Result<PathBuf> {
+    Ok(std::env::current_exe()?.with_file_name(HELPER_FILE))
+}
 
 /// The longest the helper tries to reach the control pipe.
 pub const CONNECT_LIMIT: Duration = Duration::from_secs(10);
@@ -113,4 +128,32 @@ fn parse_arg0(text: &str) -> Option<(u32, String)> {
 /// Whether `hex` is a pipe name's random part: exactly 32 digits of `0-9a-f`.
 fn is_pipe_hex(hex: &str) -> bool {
     hex.len() == HEX_DIGITS && hex.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+#[cfg(test)]
+#[expect(clippy::expect_used, reason = "a test whose program path cannot be read must fail loudly")]
+mod tests {
+    use gate_win32::TaskArgument;
+
+    use super::{HELPER_FILE, PIPE_PREFIX, arg0, helper_path};
+
+    #[test]
+    fn every_arg0_is_a_task_argument() {
+        for (pid, digit) in [(1, "0"), (u32::MAX, "f")] {
+            let pipe = format!(r"\\.\pipe\{PIPE_PREFIX}-{}", digit.repeat(32));
+            let written = arg0(pid, &pipe).expect("the pipe's name makes an Arg0");
+
+            assert_eq!(TaskArgument::new(&written).map(|argument| argument.as_str().to_owned()), Some(written));
+        }
+    }
+
+    #[test]
+    fn the_helper_is_beside_the_running_program() {
+        let program = std::env::current_exe().expect("the program's path is read");
+
+        let helper = helper_path().expect("the helper's path is made");
+
+        assert_eq!(helper.parent(), program.parent());
+        assert_eq!(helper.file_name().and_then(|name| name.to_str()), Some(HELPER_FILE));
+    }
 }

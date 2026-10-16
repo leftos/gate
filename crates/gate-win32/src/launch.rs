@@ -514,6 +514,8 @@ pub(crate) fn check_plain_file(handle: HANDLE) -> io::Result<()> {
 
 /// A command created suspended: it has not run a single instruction until [`Suspended::assign_and_resume`]. Dropped
 /// without that, it is terminated with exit code 1, so a gate that fails before the resume leaves no suspended process.
+/// A caller that can say a failure to end it calls [`Suspended::end`] instead; a drop that cannot end it reports that
+/// only through the [`EndReport`] an adopted command was given.
 pub struct Suspended {
     /// The process, until [`Suspended::assign_and_resume`] takes it.
     pub(crate) process: Option<OwnedHandle>,
@@ -524,14 +526,30 @@ pub struct Suspended {
     /// What the launch could not give the command, for the caller to log: set when a desktop-app policy it only
     /// wanted could not be set, and the command was created without it.
     pub(crate) note: Option<String>,
+    /// Where a drop that could not end the command says so: the report [`Suspended::adopt`] was given; `None` for a
+    /// command this crate created.
+    pub(crate) end_report: Option<EndReport>,
 }
+
+/// Where a dropped [`Suspended::adopt`]ed command that could not be ended reports it, with its pid and the system's
+/// error: the caller's own console, such as the box's line writer, since a drop has no caller to return it to.
+pub type EndReport = Box<dyn FnOnce(u32, io::Error) + Send + Sync>;
+
+/// How long ending a never-run command waits to see it ended when the terminate is refused, as it is for a command
+/// that is ending already, before it says the command could not be ended.
+pub(crate) const UNSTARTED_END_WAIT: Duration = Duration::from_secs(1);
 
 impl Suspended {
     /// Takes a suspended process another process created, from its process handle and the handle of its first thread,
     /// as [`crate::RemoteProcess::pull`] copies them out, once both are checked to carry the access it needs and to
     /// stand for the process `pid`: the process's id (`GetProcessId`) and its thread's (`GetProcessIdOfThread`) must
-    /// both be `pid`. The caller has checked the rest it expects. From here it is as a command this crate created:
-    /// dropped before [`Suspended::assign_and_resume`], it is terminated with exit code 1. The process handle needs
+    /// both be `pid`. From here it is as a command this crate created: dropped before [`Suspended::assign_and_resume`],
+    /// it is terminated with exit code 1, and a terminate that fails is given to `end_report`.
+    ///
+    /// Adopting arms that terminate, so it is called only once every check of who the process is has passed: its
+    /// parent, its creation time, its session, its image, a first thread suspended exactly once, and its being in no
+    /// job. A process that fails any of those is never adopted, so it is never ended through these handles. The
+    /// process handle needs
     /// `PROCESS_TERMINATE`, `PROCESS_SET_QUOTA`, `PROCESS_QUERY_LIMITED_INFORMATION` and `SYNCHRONIZE`, and the thread
     /// handle `THREAD_SUSPEND_RESUME` and `THREAD_QUERY_LIMITED_INFORMATION`, as the handles `CreateProcessW` returns
     /// have; the access each was granted is read with `NtQueryObject`.
@@ -541,7 +559,12 @@ impl Suspended {
     /// An [`AdoptError`] holding both handles, unchanged, when either lacks an access it needs, when either id or
     /// either handle's access cannot be read, or when an id is not `pid`: nothing is ended, and the caller decides what
     /// becomes of the process. A missing access or a wrong id is of kind [`io::ErrorKind::InvalidInput`].
-    pub fn adopt(process: std::os::windows::io::OwnedHandle, thread: std::os::windows::io::OwnedHandle, pid: u32) -> Result<Suspended, AdoptError> {
+    pub fn adopt(
+        process: std::os::windows::io::OwnedHandle,
+        thread: std::os::windows::io::OwnedHandle,
+        pid: u32,
+        end_report: EndReport,
+    ) -> Result<Suspended, AdoptError> {
         use std::os::windows::io::{AsHandle, FromRawHandle, IntoRawHandle};
 
         if let Err(why) = check_adopted(process.as_handle(), thread.as_handle(), pid) {
@@ -558,6 +581,7 @@ impl Suspended {
                 pid,
                 pipes: None,
                 note: None,
+                end_report: Some(end_report),
             }),
             (process_guard, thread_guard) => {
                 // A guard that was made is never dropped, so both handles go back to the caller unclosed.
@@ -651,8 +675,22 @@ impl Suspended {
             u32::MAX => io::Error::last_os_error(),
             count => io::Error::other(format!("the command's thread had a suspend count of {count}, not 1")),
         };
-        let ended = end_unstarted(&process);
+        let ended = end_unstarted(&process, UNSTARTED_END_WAIT);
         Err(setup(with_end(error, ended), "resume the command"))
+    }
+
+    /// Ends the command, which never ran, with exit code 1, and says whether it ended: what a drop does, for a caller
+    /// that reports the failure itself. A terminate that is refused waits up to `bound` to see the command ended.
+    ///
+    /// # Errors
+    ///
+    /// An error when the process was already taken; the system's error, its code kept, when the terminate is refused
+    /// and the command has not ended within `bound`: it stays suspended, never having run.
+    pub fn end(mut self, bound: Duration) -> io::Result<()> {
+        let Some(process) = self.process.take() else {
+            return Err(io::Error::other("the process was already taken"));
+        };
+        end_unstarted(&process, bound)
     }
 
     /// Gives up the command without ending it or closing its process and thread handles, and returns its pid and the
@@ -686,6 +724,7 @@ impl Suspended {
         let mut released = std::mem::ManuallyDrop::new(self);
         released.pipes = None;
         released.note = None;
+        released.end_report = None;
         Ok(Released {
             pid: released.pid,
             process,
@@ -769,33 +808,31 @@ fn check_access(handle: std::os::windows::io::BorrowedHandle<'_>, needed: u32, w
 }
 
 impl Drop for Suspended {
-    #[expect(
-        clippy::print_stderr,
-        reason = "a drop has no caller to give the failure to, and a command left suspended must not go unsaid"
-    )]
     fn drop(&mut self) {
         if let Some(process) = &self.process
-            && let Err(error) = end_unstarted(process)
+            && let Err(error) = end_unstarted(process, UNSTARTED_END_WAIT)
+            && let Some(report) = self.end_report.take()
         {
-            eprintln!("gate: the suspended command {} could not be ended: {error}", self.pid);
+            report(self.pid, error);
         }
     }
 }
 
-/// Ends a command that never ran with exit code 1. A command that has ended already is no failure.
+/// Ends a command that never ran with exit code 1. A command that has ended already is no failure, and neither is one
+/// that ends within `bound` of a refused terminate, as one being ended by another does.
 ///
 /// # Errors
 ///
-/// The system's error, its code kept, when the terminate is refused and the command has not ended: it stays suspended,
-/// never having run.
-pub(crate) fn end_unstarted(process: &OwnedHandle) -> io::Result<()> {
+/// The system's error, its code kept, when the terminate is refused and the command has not ended within `bound`: it
+/// stays suspended, never having run.
+pub(crate) fn end_unstarted(process: &OwnedHandle, bound: Duration) -> io::Result<()> {
     // SAFETY: the process handle is open for the whole call; one without `PROCESS_TERMINATE` only makes the call fail.
     if unsafe { TerminateProcess(process.raw(), 1) } != 0 {
         return Ok(());
     }
     let refused = io::Error::last_os_error();
-    // `TerminateProcess` refuses a process that has ended already, which is ended all the same.
-    match crate::event::signalled(process) {
+    // `TerminateProcess` refuses a process that has ended already, or is ending, which is ended all the same.
+    match crate::event::signalled_within(process, bound) {
         Ok(true) => Ok(()),
         Ok(false) | Err(_) => Err(refused),
     }
@@ -810,7 +847,7 @@ pub(crate) fn end_unstarted(process: &OwnedHandle) -> io::Result<()> {
 pub(crate) fn end_unstarted_by_id(pid: u32) -> io::Result<()> {
     // SAFETY: `OpenProcess` takes no pointers. A success is a fresh handle nothing else owns.
     let process = unsafe { own_handle(OpenProcess(PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, 0, pid)) }?;
-    end_unstarted(&process)
+    end_unstarted(&process, UNSTARTED_END_WAIT)
 }
 
 /// `error`, with the failure to end the never-run command, `ended`, added to its text when there was one; its kind is
@@ -1046,14 +1083,14 @@ mod tests {
         let wait_only = unsafe { crate::own_handle(OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, 0, child.pid())) }
             .expect("the child opens");
 
-        let refused = super::end_unstarted(&wait_only).expect_err("a handle without PROCESS_TERMINATE cannot end it");
+        let refused = super::end_unstarted(&wait_only, Duration::from_millis(10)).expect_err("a handle without PROCESS_TERMINATE cannot end it");
 
         assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied, "{refused}");
         drop(child);
         // SAFETY: the handle is open, with `SYNCHRONIZE`; the wait is bounded.
         let waited = unsafe { WaitForSingleObject(wait_only.raw(), crate::wait_millis(HANG_GUARD)) };
         assert_eq!(waited, WAIT_OBJECT_0, "the dropped child ended");
-        super::end_unstarted(&wait_only).expect("a process that has ended already is no failure to end it");
+        super::end_unstarted(&wait_only, Duration::ZERO).expect("a process that has ended already is no failure to end it");
     }
 
     #[test]

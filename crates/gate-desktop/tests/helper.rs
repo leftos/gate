@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use gate_desktop::protocol::{HELPER_FRAME_LIMIT, Message, Spawn, read_message, write_message};
 use gate_desktop::{HelperExit, PIPE_PREFIX, arg0};
 use gate_win32::{
-    ConnectWait, Job, PipeServer, RemoteProcess, StoppableProcess, Suspended, creation_time_of, current_user_sid, system_directory,
+    ConnectWait, EndReport, Job, PipeServer, RemoteProcess, StoppableProcess, Suspended, creation_time_of, current_user_sid, system_directory,
     thread_is_suspended,
 };
 use proc_table::win32::Win32ProcessTable;
@@ -25,6 +25,12 @@ use windows_sys::Win32::Storage::FileSystem::{FILE_TYPE_PIPE, GetFileType};
 use windows_sys::Win32::System::Pipes::GetNamedPipeServerProcessId;
 use windows_sys::Win32::System::SystemServices::SECURITY_MANDATORY_MEDIUM_RID;
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+/// The report an adopted child is given: a child a drop could not end fails the test that dropped it.
+#[expect(clippy::panic, reason = "a child a test's drop could not end must fail that test loudly")]
+fn unended() -> EndReport {
+    Box::new(|pid, error| panic!("the adopted child {pid} could not be ended: {error}"))
+}
 
 /// The longest any wait of these tests may take: a guard against a hang, never a timing bound.
 const HANG_GUARD: Duration = Duration::from_secs(300);
@@ -186,7 +192,7 @@ fn a_spawned_command_runs_with_its_environment_and_output() {
     let (pid, process, thread) = child_of(&session.receive());
     let process = session.remote.pull(process).expect("the process is taken");
     let thread = session.remote.pull(thread).expect("the thread is taken");
-    let child = Suspended::adopt(process, thread, pid).expect("the child is adopted");
+    let child = Suspended::adopt(process, thread, pid, unended()).expect("the child is adopted");
     session.send(&Message::Done);
     let helper_exit = exit_of(&mut session.helper);
     let job = Job::anonymous_kill_on_close().expect("the job is made");
@@ -410,7 +416,7 @@ fn a_box_that_never_says_done_leaves_the_child() {
         thread_is_suspended(thread.as_handle()).expect("the thread is read"),
         "the child is still suspended"
     );
-    drop(Suspended::adopt(process, thread, pid).expect("the child is adopted"));
+    drop(Suspended::adopt(process, thread, pid, unended()).expect("the child is adopted"));
     assert!(watch.wait(HANG_GUARD).expect("the child is waited on"), "the test ended the child");
 }
 
@@ -451,7 +457,7 @@ fn a_box_that_sends_another_message_after_the_child_leaves_it() {
         thread_is_suspended(thread.as_handle()).expect("the thread is read"),
         "the child is still suspended"
     );
-    drop(Suspended::adopt(process, thread, pid).expect("the child is adopted"));
+    drop(Suspended::adopt(process, thread, pid, unended()).expect("the child is adopted"));
     assert!(watch.wait(HANG_GUARD).expect("the child is waited on"), "the test ended the child");
 }
 
