@@ -214,7 +214,7 @@ mod tests {
     use windows_sys::Win32::Security::{
         DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, GetSecurityDescriptorSacl, LABEL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
     };
-    use windows_sys::Win32::Storage::FileSystem::{DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_READ, READ_CONTROL, WRITE_DAC, WRITE_OWNER};
+    use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_READ, READ_CONTROL, WRITE_DAC, WRITE_OWNER};
     use windows_sys::core::BOOL;
 
     use super::{
@@ -223,20 +223,30 @@ mod tests {
     use crate::file::{Make, Share, make_folder_beneath, open_beneath_as};
     use crate::token::token_facts;
 
-    /// A new, empty folder of the test `name`'s own.
+    /// A new, empty folder of the test `name`'s own, granted to this user outright: its DACL is what a case's
+    /// assertions are made of, so it must not depend on the ACL the work folder above it hands down. An owner is
+    /// granted only `READ_CONTROL` and `WRITE_DAC` by owning, while a case that sets a label or an owner needs
+    /// `WRITE_OWNER`, and a builder runs the suite as a user whose work folder may grant it no more than modify.
     fn folder(name: &str) -> PathBuf {
         let folder = crate::test_support::temp_dir().join(format!("gate-win32-security-{name}-{}", std::process::id()));
         if folder.exists() {
             std::fs::remove_dir_all(&folder).expect("an earlier run's folder is removed");
         }
         std::fs::create_dir_all(&folder).expect("the folder can be made");
+        let facts = token_facts().expect("this process's token can be read");
+        let owned = OpenOptions::new()
+            .access_mode(READ_CONTROL | WRITE_DAC)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(&folder)
+            .expect("the folder this process just made can be opened to grant its user control");
+        set_lists(&owned, &format!("D:(A;OICI;FA;;;{})", facts.user));
         folder
     }
 
     /// `path`, a file or a folder, opened to read and set its security.
     fn securable(path: &Path) -> File {
         OpenOptions::new()
-            .access_mode(FILE_GENERIC_READ | READ_CONTROL | WRITE_DAC | WRITE_OWNER | DELETE)
+            .access_mode(FILE_GENERIC_READ | READ_CONTROL | WRITE_DAC | WRITE_OWNER)
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
             .open(path)
             .expect("the entry can be opened")

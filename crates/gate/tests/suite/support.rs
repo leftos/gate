@@ -1096,7 +1096,8 @@ pub fn git_init(case: &Case) {
 }
 
 /// Runs git with `args` in the case folder, as a committer of the suite's own, with no hook and no signing, and
-/// returns what it printed on stdout, its trailing line end cut; fails the case when git fails.
+/// returns what it printed on stdout, its trailing line end cut; fails the case, naming the arguments, the folder,
+/// git's exit status and both its streams, when git fails.
 pub fn git(case: &Case, args: &[&str]) -> String {
     let mut command = Command::new("git");
     for name in GIT_REDIRECTS {
@@ -1113,7 +1114,14 @@ pub fn git(case: &Case, args: &[&str]) -> String {
         .stdin(Stdio::null())
         .output()
         .expect("git starts");
-    assert!(output.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "git {args:?} in {}: {} stdout: {:?} stderr: {:?}",
+        case.folder().display(),
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
     String::from_utf8(output.stdout).expect("git's stdout is UTF-8").trim_end().to_owned()
 }
 
