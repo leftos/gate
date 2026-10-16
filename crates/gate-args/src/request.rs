@@ -263,6 +263,9 @@ pub struct RunRequest {
     pub bring_tracked: Vec<String>,
     /// `--state-dir` as given.
     pub state_dir: Option<PathBuf>,
+    /// `--cd` as given: the folder the run runs and routes from; a relative path is read against the working directory
+    /// by the binary, after the log and the state root.
+    pub cd: Option<PathBuf>,
     /// The words after `--`, unchanged.
     pub command: Vec<OsString>,
     pub test_seams: TestSeams,

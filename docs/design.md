@@ -57,7 +57,7 @@ Rules both parsers share:
 
 A valid `gate stop-tree` stops the tree ([`gate stop-tree`](#gate-stop-tree)).
 
-A valid `gate run` starts the command: it refuses a batch word (exit 2), refuses a `--log` inside the state root (exit 2, `gate: the log <path> is inside the gate's state folder <root>`; the paths are compared canonical, through links and junctions, after canonicalising the nearest existing folder), takes the log's mutex, prepares the log, queues, takes a slot, starts the command in the job `Local\gate[-<h>]-job-<gate pid>`, waits for it, reaches the verdict and releases the slot.
+A valid `gate run` starts the command: it refuses a batch word (exit 2), refuses a `--log` inside the state root (exit 2, `gate: the log <path> is inside the gate's state folder <root>`; the paths are compared canonical, through links and junctions, after canonicalising the nearest existing folder), refuses a `--cd` folder it cannot enter (exit 2, [Output lines](#output-lines)), takes the log's mutex, prepares the log, queues, takes a slot, starts the command in the job `Local\gate[-<h>]-job-<gate pid>`, waits for it, reaches the verdict and releases the slot.
 
 A `none` run takes no slot and starts at once ([Slots](#pools-and-names)).
 
@@ -73,15 +73,22 @@ The watchdog samples the command and kills its job on a stall, at the ceiling an
 |---|---|---|---|
 | `--slot heavy\|light\|critical\|none` | `-Slot` | The slot kind ([Slots](#slots)); `none` takes no slot and is for a command that only dispatches or watches remote work. | ruling |
 | `--timeout <seconds>` | `-TimeoutSeconds` | The ceiling in load-adjusted seconds, a whole number above 0 (W3). `auto:<n>` makes `n` a floor: each take resolves the ceiling to `max(n, ceil(3 x the command's adjusted p99))`, capped at 2147483647, and to `n` with no adjusted p99 ([Output lines](#output-lines), [design/gate-durations.md](design/gate-durations.md), part 4). The new CLI only: `-TimeoutSeconds` refuses it. | ruling |
-| `--log <path>` | `-Log` | The command's log; a relative path is read against the working directory once, at start (P5). | ruling |
+| `--log <path>` | `-Log` | The command's log; a relative path is read against the caller's working directory once, at start, before `--cd` (P5). | ruling |
 | `--stall <seconds>` | `-StallSeconds` | The stall window, default 120 (W2); the gate passes it as given, and the remote client raises a value under 15 to 15 on a routed run (F2). | kept (C1, F2) |
 | `--tail <lines>` | `-Tail` | Lines of the log printed at the end, default 20 (V3). | kept (C1, V3) |
 | `--no-markers` | `-NoMarkers` | The command's status is the verdict; the marker scan is off (V2). | ruling |
 | `--local` | `-Local` | Never route this run to a builder (F1). | kept (F1) |
-| `--state-dir <path>` | none | Use another [state root](#state-root). | ruling |
+| `--state-dir <path>` | none | Use another [state root](#state-root); a relative path is read against the caller's working directory, before `--cd`. | ruling |
+| `--cd <folder>` | `-Cd` | Run the command in `<folder>` and route from it ([Run folder](#run-folder)). | ruling (GATE-323) |
 | `--bring-tracked <glob>` | none | A routed run's fetched output that git tracks and `<glob>` matches is installed rather than skipped (Outputs install, "Tracked members"); repeatable, and the one option that is not refused when given twice. The launcher's PowerShell form (`-Log …`) does not take it: use the `gate run` form. | ruling |
 
 The words after `--` reach the command exactly as the caller passed them ([Command launching](#command-launching)).
+
+#### Run folder
+
+`--cd <folder>` (a relative folder is read against the caller's working directory) makes the gate enter `<folder>` once, after `--log` and `--state-dir` are made absolute against the caller's folder and before any slot is taken. From then on `<folder>` is the folder the gate was started in: [routing](#routing) reads its worktree, the command's working folder and program lookup, a fallback's local run, and the journal's and claim's `cwd` all take it. A relative `--log` or `--state-dir` stays the caller's.
+
+It is how a caller in a main checkout gates a command that names another worktree's files: `--cd <worktree>` routes the run as if the gate had been started there. Given twice it is refused (`gate: --cd is given twice`). `gate expect` and `gate check` do not take it (unknown option). The compatibility layer reads it as `-Cd`, which is the one new option it takes (the launcher's callers need it); the frozen PowerShell gate refuses `-Cd`. Nothing is said on success.
 
 ### `gate stop-tree`
 
@@ -343,20 +350,20 @@ Hidden from the usage and from `--help`. It is the builder side of a routed run,
 
 ### Later subcommands
 
-Further modes arrive as subcommands of the same binary, each designed with its issue: `gate status` and `gate drain`. New options, such as `--timeout auto:<n>` (GATE-16) and `--slot auto` (GATE-8), exist only in the new CLI, never in the compatibility layer.
+Further modes arrive as subcommands of the same binary, each designed with its issue: `gate status` and `gate drain`. New options, such as `--timeout auto:<n>` (GATE-16) and `--slot auto` (GATE-8), exist only in the new CLI, never in the compatibility layer. The one exception is `--cd` (GATE-323), which the compatibility layer reads as `-Cd` because the launcher's callers need it.
 
 ### Compatibility layer
 
 `gate.exe` also accepts the PowerShell gate's argument form, so the cutover breaks no caller:
 
-`gate -Log <path> -TimeoutSeconds <n> -Slot heavy|light|critical|none [-StallSeconds <n>] [-Tail <n>] [-NoMarkers] [-Local] -- <command>` and `gate -StopTree <pid>`.
+`gate -Log <path> -TimeoutSeconds <n> -Slot heavy|light|critical|none [-StallSeconds <n>] [-Tail <n>] [-NoMarkers] [-Local] [-Cd <folder>] -- <command>` and `gate -StopTree <pid>`.
 
-- It accepts exactly the options `-Log`, `-TimeoutSeconds`, `-Slot`, `-StallSeconds`, `-Tail`, `-NoMarkers`, `-Local` and `-StopTree`, compared case-insensitively, and maps each to the flag in the table above (`-StopTree <pid>` to `gate stop-tree <pid>`).
+- It accepts exactly the options `-Log`, `-TimeoutSeconds`, `-Slot`, `-StallSeconds`, `-Tail`, `-NoMarkers`, `-Local`, `-Cd` and `-StopTree`, compared case-insensitively, and maps each to the flag in the table above (`-StopTree <pid>` to `gate stop-tree <pid>`).
 
   Any other option, or a new-CLI flag in the old form (`-StateDir`, `--state-dir`, `--slot`), is a usage error (exit 2). `-TimeoutSeconds` refuses `auto:<n>`: `gate: -TimeoutSeconds must be a whole number above 0, got 'auto:900'`. The one exception is the hidden `--test-print-request` of a `test-seams` build ([Black-box suite harness](#black-box-suite-harness)).
 - `--` is required before the command; the command never starts at the first word that is not an option.
 - `-StopTree <pid>` (or `-StopTree:<pid>`) must be the only option.
-- A value option never takes one of the eight option names as its value: `-Log -NoMarkers` is `-Log` with no value, then `-NoMarkers`.
+- A value option never takes one of the nine option names as its value: `-Log -NoMarkers` is `-Log` with no value, then `-NoMarkers`.
 - The colon form `-Name:value` in one word is read as that option with that value (C2). A switch's colon form is read by its value, compared case-insensitively: `-NoMarkers:true`, `-Local:$true` set it, `-Local:false`, `-Local:$false` clear it, and any other value is a usage error. This fixes the PowerShell gate's reading of every `-Switch:<value>` as true (C2, CC-194).
 - Values are validated as in the new CLI; the messages may name either spelling. The missing-slot line reads `gate: missing --slot heavy|light|critical|none` or `gate: missing -Slot heavy|light|critical|none`, and a bad slot says `gate: <option> must be heavy, light, critical or none, got '<value>'`.
 - The layer is removed once no caller uses it. Until then, every reader of command-line text (ops-tower's activity join, the hooks that inspect a gated command) matches both spellings.
@@ -405,6 +412,7 @@ The lines of a run that starts its command:
   After the pass cap's reason comes `; first: <first problem>`: the first problem of the last pass that ended processes, then of the counting pass, so a terminate refused up to the cap is said; a problem of an earlier pass is not.
 - A gate failure after the slot is taken: `gate: the gate failed while running the command: <message>`, exit 1. The job is terminated with 124, with its follow-up lines `gate: and could not terminate the command's job: <error>`, `gate: the command was still running 5 s after its job was terminated` or `gate: cannot wait for the command after terminating its job: <error>`.
 - Failures before queueing, exit 1: `gate: cannot read the working directory: <error>`, `gate: cannot build the command's environment: <error>`, `gate: cannot create the log's folder <dir>: <error>` and `gate: cannot remove the earlier <path>: <error>`.
+- A `--cd` folder the gate cannot enter, on stderr only, exit 2, before any slot and with nothing queued or journalled, the flag named as the caller spelled it (`--cd` or `-Cd`): `gate: <flag> <value> is not a folder` (nothing is there, or a file); `gate: <flag> <value> is not a folder on a drive` (a UNC, `\\?\` or device value, refused before any filesystem call); `gate: cannot run in <flag> <value>: <error>` (any other OS error, such as access denied).
 - A gate that cannot read its own start, exit 1, before it writes any ticket, claim, slot marker, pause marker, wake event, covered marker or journal line: `gate: cannot read this gate's own start: <error>; not running <command>`.
 
   The gate reads its start a second way (`process_start_of` of its own pid, the source the sweepers judge liveness by) when the first read fails, and `<error>` is the second read's error, or `<first error>; then the process has no start` when that read finds no process start. A gate therefore always holds its real start.
@@ -565,7 +573,7 @@ A gate that is trying a slot holds a handle for an instant, so a probe can read 
 
 One folder holds every file the gate writes: `%LOCALAPPDATA%\gate\v1\` by default, beside the install folder `%LOCALAPPDATA%\gate\bin\` and the PowerShell gate's own files in `%LOCALAPPDATA%\gate\`, so the two generations' files never mix.
 
-`--state-dir <path>` overrides it, else the `GATE_STATE_DIR` environment variable; the flag wins over the variable. An empty `GATE_STATE_DIR` or `LOCALAPPDATA` counts as unset. A relative root is made absolute against the working directory, and the root need not exist: nothing is created under it by the CLI alone.
+`--state-dir <path>` overrides it, else the `GATE_STATE_DIR` environment variable; the flag wins over the variable. An empty `GATE_STATE_DIR` or `LOCALAPPDATA` counts as unset. A relative root is made absolute against the caller's working directory, before `--cd`, and the root need not exist: nothing is created under it by the CLI alone.
 
 A root that cannot be resolved exits 2 with one line and no usage: `gate: LOCALAPPDATA is not set; give the state root with --state-dir or GATE_STATE_DIR`, `gate: cannot read the LOCALAPPDATA variable` (both only when neither the flag nor the variable gave a root), `gate: cannot read the state root <path>`, `gate: cannot make the state root <path> absolute: <error>`, or `gate: cannot make the default state root <path> absolute: <error>`.
 
@@ -676,7 +684,7 @@ The environment carries one more name: `GATE_SLOT_HELD`, the slot marker ([Criti
 | `pid` | number | the gate's pid |
 | `processStart` | string | the gate's start time, ISO UTC |
 | `started` | string | when it took the slot, ISO UTC |
-| `cwd` | string | the gate's working directory |
+| `cwd` | string | the gate's working directory: the `--cd` folder when given |
 | `command` | string | the command's raw words (the program unresolved), each quoted as for CreateProcess (C4) even for a batch target and joined by spaces, as the PowerShell gate's `Format-CommandText` writes them, such as `cmd /c echo "a b" "x\"y"` |
 | `log` | string | the log's full path |
 | `timeoutSeconds` | number | the ceiling as the take resolved it ([`gate run`](#gate-run)); the writer refuses a value JSON cannot carry (not finite) |
@@ -721,7 +729,7 @@ A ticket whose gate is dead by the [liveness rule](#claim) is ignored and delete
 | `processStart` | number | the covered gate's process start, epoch ms |
 | `parentPid` | number | the pid of the parent gate whose slot covers it |
 | `command` | string | the command text, as the claim's [`command`](#claim) |
-| `cwd` | string | the gate's working directory |
+| `cwd` | string | the gate's working directory: the `--cd` folder when given |
 | `since` | number | when the marker was written, epoch ms |
 | `kind` | string | optional: the covered gate's own slot kind (`heavy`, `light`, `critical` or `none`), the kind of slot it takes if its parent gate ends first; `none` after the gate gave up watching its parent |
 
@@ -745,7 +753,7 @@ A missing file, or a missing key, gives the default silently. A file unreadable 
 
 `gate.exe` writes `covered` for a gate running under its parent's slot; `gate.exe` writes `parent` for a gate lent its light parent's slot while a critical request drains, once the command's environment is built.
 
-Every line starts with `v`, `time`, `event`, `pid`, `processStart`, `kind`, `cwd` and `command` (the same text as the claim's [`command`](#claim)), in that order, then the event's own fields, as the PowerShell gate writes them (J1); a routed run adds `remote` (true), `host` (the ssh destination) and `key` (the remote work folder's key) after the event's own fields and before `abandoned`, on its `queue`, `take`, `release`, `abandon` and `fallback` lines, and on none after the `fallback`.
+Every line starts with `v`, `time`, `event`, `pid`, `processStart`, `kind`, `cwd` (the `--cd` folder when given) and `command` (the same text as the claim's [`command`](#claim)), in that order, then the event's own fields, as the PowerShell gate writes them (J1); a routed run adds `remote` (true), `host` (the ssh destination) and `key` (the remote work folder's key) after the event's own fields and before `abandoned`, on its `queue`, `take`, `release`, `abandon` and `fallback` lines, and on none after the `fallback`.
 
 The journal keeps ISO 8601 UTC strings for `time` and `processStart` (7 fractional digits, ending in `Z`); it never held .NET ticks, so the move of claims, tickets and markers to epoch milliseconds does not touch it. `gate.exe` takes `processStart` from `GetProcessTimes`, in whole microseconds, so its 7th fractional digit is 0. Seconds fields (`heldSeconds`, `waitedSeconds`, `wallSeconds`, `adjustedSeconds`) are rounded to 3 decimals.
 
@@ -1176,7 +1184,7 @@ The box heartbeat (BW9) is the box wrapper's command-time heartbeat, not the wai
   The batch refusal's `%NAME%` check answers for this exact block.
 
   The block is built with names matched and sorted as Windows does (`CompareStringOrdinal`, case-insensitive over all of Unicode), and a later pair wins.
-- **Working directory.** The caller's (P5).
+- **Working directory.** The caller's (P5), or the `--cd` folder when given ([Run folder](#run-folder)).
 
 ## Log and tail
 
@@ -1287,7 +1295,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
   `gate run` answers those facts in `route.rs`, before it queues and before any command starts. The routing file is `%LOCALAPPDATA%\gate\remote.json` (no file when `LOCALAPPDATA` is unset or empty). The hook rule reads `GIT_INDEX_FILE`: set and non-empty means a git hook, which never routes.
 
-  The worktree comes from one `git rev-parse` (root, prefix below the root and common git folder), and a folder below the root asks `git ls-files` whether the snapshot would send anything there (tracked or untracked and not ignored, and still on disk). A `subst` drive is followed through `gate_win32::device_target`. A word that is not valid Unicode keeps a command that would route here, saying so.
+  The worktree comes from one `git rev-parse` run in the gate's folder, which is the `--cd` folder when given: a caller in a main checkout gates a worktree's command with `--cd <worktree>`. It reads (root, prefix below the root and common git folder), and a folder below the root asks `git ls-files` whether the snapshot would send anything there (tracked or untracked and not ignored, and still on disk). A `subst` drive is followed through `gate_win32::device_target`. A word that is not valid Unicode keeps a command that would route here, saying so.
 
   The queue line carries `notRouted` `--local` for a heavy `--local` gate and the remote tag for a routed one. When the remote client has a part missing, the routed run falls back before it takes a remote slot: the `fallback` line has reason `client`, the gate says `gate: remote <host> client could not start: ...; running here`, and the later `take` and `release` carry no remote fields.
 - **The routing file's text** is JSON with `//` and `/* */` comments and trailing commas allowed outside strings, and a leading byte order mark skipped, as the PowerShell gate's reader allows. Keys match in any letter case, and unknown keys are ignored.

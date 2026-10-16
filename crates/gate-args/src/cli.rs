@@ -146,6 +146,7 @@ fn run_option(name: &str) -> Option<RunOption> {
         "stall" => RunOption::Value(ValueOption::Stall),
         "tail" => RunOption::Value(ValueOption::Tail),
         "state-dir" => RunOption::Value(ValueOption::StateDir),
+        "cd" => RunOption::Value(ValueOption::Cd),
         "bring-tracked" => RunOption::Value(ValueOption::BringTracked),
         "no-markers" => RunOption::Switch(SwitchOption::NoMarkers),
         "local" => RunOption::Switch(SwitchOption::Local),

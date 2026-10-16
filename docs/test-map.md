@@ -17,7 +17,7 @@ Suite = `crates/gate/tests/suite/` (binary `suite`, needs `--all-features`; test
 | Area (crates/gate/src/) | Suite modules (evidence) | Central? |
 |---|---|---|
 | main.rs | all (entry; `answer::answer`, exit-status cast) | CENTRAL |
-| answer.rs | all; dispatch per subcommand, usage errors (`cli`), `--test-print-request` branch (`request`, `compat`, `cutover`, `harness`, `launcher`) | CENTRAL |
+| answer.rs | all; dispatch per subcommand, usage errors (`cli`), `--test-print-request` branch (`request`, `compat`, `cutover`, `harness`, `launcher`), `--cd` entering the folder and its refusals (`routing`) | CENTRAL |
 | run.rs | all runs (the run end: `launch` leftovers (`launch::a_spared_gate_whose_job_cannot_be_listed_is_said_before_the_verdict`, `launch::a_leftover_s_failure_output_fails_a_passing_command`, `launch::a_nested_gate_s_launcher_is_not_ended_by_the_run_end`) and run-id cases, `nesting::a_parent_s_run_end_ends_its_plain_child_and_spares_its_covered_gate`, the unit `end_tests`): launch, hold, stall, ceiling, cores, journal, slots, critical, nesting, routing (the local `--no-build` drop, its lines and kinds, the nothing-back record's write and clear), remote_client, interrupt, diagnostics, pause | CENTRAL |
 | no_build.rs | `routing` (the drop reasons, the obj check, the record's write, clear and unreadable cases); the unit tests inside (record read, solution readers, `Directory.Build.*` skip, listing parse) | no: routing |
 | resolve.rs | `request` (state root from `--state-dir`/`GATE_STATE_DIR`, log path), `compat`, `harness`, `launch` (log inside state root); used by every run | CENTRAL (resolve.rs:`root`/`log` on every run) |
@@ -66,8 +66,8 @@ Suite = `crates/gate/tests/suite/` (binary `suite`, needs `--all-features`; test
 | Area | Suite modules that reach it | Own tests | Central? |
 |---|---|---|---|
 | gate-args lib.rs / cli.rs / values.rs / problem.rs / usage.rs | every case parses argv: all suite (parse errors `cli`, usage `cli`) | `gate-args::args` (top, run, boxcmd), unit | CENTRAL |
-| gate-args request.rs / run.rs (seam parsing) | `request`, plus every module whose flags it parses (`--bring-tracked`: `remote_client`) | args tests `run` (`--timeout auto:<n>` and its bad floors), `seams` (the removed bridge seams are unknown options; the calls `--test-remote-interrupt-at` names, `manifest` and `apply` among them; the four values `--test-remote-tamper` takes and its need of the transport) | CENTRAL (a seam rename breaks callers) |
-| gate-args compat.rs | `compat`, `launcher`, `request`, `cli` | args `compat` (`-TimeoutSeconds` refuses `auto:<n>`) | no |
+| gate-args request.rs / run.rs (seam parsing) | `request`, plus every module whose flags it parses (`--bring-tracked`: `remote_client`; `--cd`: `routing`) | args tests `run` (`--timeout auto:<n>` and its bad floors), `seams` (the removed bridge seams are unknown options; the calls `--test-remote-interrupt-at` names, `manifest` and `apply` among them; the four values `--test-remote-tamper` takes and its need of the transport) | CENTRAL (a seam rename breaks callers) |
+| gate-args compat.rs | `compat`, `launcher`, `request`, `cli`, `routing` (`-Cd`) | args `compat` (`-TimeoutSeconds` refuses `auto:<n>`; `-Cd` is read) | no |
 | gate-args expect (parse in cli.rs / run.rs / request.rs, usage line in usage.rs) | `durations` (`gate expect`), `cli` (usage) | args `expect` | no (the files themselves are CENTRAL, first row) |
 | gate-args check (parse in cli.rs / run.rs / request.rs, usage line in usage.rs, `--builder`, the `--test-probe-limit-ms` and `--builder` seams) | `check` (`gate check`), `cli` (usage) | args `check` | no (the files themselves are CENTRAL, first row) |
 | gate-args boxcmd.rs | `boxside`, `boxside::outputs`, `remote_client`, `check` (`--builder` runs `gate box preflight --stdin` through `local:`) | args `boxcmd`, `seams` | no |
@@ -144,7 +144,7 @@ Always add `checkout` to any change that touches a suite file or adds a seam.
 | tools/gate.ps1 | `-E 'binary(suite) and test(/^(launcher\|cutover\|checkout)::/)'` |
 | tools/install.ps1 | `-E 'binary(suite) and test(/^(install\|checkout)::/)'` |
 | suite module `X.rs` only | `-E 'binary(suite) and test(/^(X\|checkout)::/)'` |
-| gate-args compat.rs | `-E 'package(gate-args) or (binary(suite) and test(/^(compat\|launcher\|request\|cli)::/))'` |
+| gate-args compat.rs | `-E 'package(gate-args) or (binary(suite) and test(/^(compat\|launcher\|request\|cli\|routing)::/))'` |
 | gate-args expect | `-E 'package(gate-args) or (binary(suite) and test(/^(durations\|cli)::/))'` |
 | gate-args check | `-E 'package(gate-args) or (binary(suite) and test(/^(check\|cli)::/))'` |
 | gate-args boxcmd.rs | `-E 'package(gate-args) or (binary(suite) and test(/^(boxside\|remote_client\|check)::/))'` |

@@ -56,6 +56,11 @@ fn check_takes_no_words() {
         ["gate: unknown option --state-dir", "gate: unexpected argument x"],
         "run options are not check options"
     );
+    assert_eq!(
+        problems(&["check", "--cd", "x"]),
+        ["gate: unknown option --cd", "gate: unexpected argument x"],
+        "run options are not check options"
+    );
 }
 
 #[test]

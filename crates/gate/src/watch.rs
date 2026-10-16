@@ -867,6 +867,7 @@ mod tests {
             local: false,
             bring_tracked: Vec::new(),
             state_dir: None,
+            cd: None,
             command: command.iter().map(OsString::from).collect(),
             test_seams: TestSeams::default(),
             print_request: false,

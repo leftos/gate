@@ -1,8 +1,10 @@
 //! What the gate answers for a command line: the lines it says on stdout and stderr, and the exit status.
 
 use std::ffi::OsString;
+use std::io;
+use std::path::{Component, Path, Prefix};
 
-use gate_args::{ExpectRequest, Invocation, Problem, RunRequest, StopRequest, USAGE, parse};
+use gate_args::{ExpectRequest, Invocation, Problem, RunRequest, Spelling, StopRequest, USAGE, parse};
 
 use crate::console::Console;
 use crate::request_json;
@@ -60,8 +62,57 @@ fn run(request: &RunRequest, environment: &Environment, console: &mut Console) -
             console.out(&request_json::run(request, &log, &root));
             0
         }
-        Ok((log, root)) => crate::run::run(request, &log, &root, environment, console),
+        Ok((log, root)) => match enter(request.cd.as_deref(), request.spelling) {
+            Err(line) => {
+                console.err(&line);
+                u32::from(USAGE_STATUS)
+            }
+            Ok(()) => crate::run::run(request, &log, &root, environment, console),
+        },
     }
+}
+
+/// `ERROR_PATH_NOT_FOUND`: a folder on the path is missing.
+const ERROR_PATH_NOT_FOUND: i32 = 3;
+/// `ERROR_DIRECTORY`: the path names a file, not a folder.
+const ERROR_DIRECTORY: i32 = 267;
+
+/// Makes `cd` (`--cd`, a relative path read against the caller's folder) the gate's working directory, so the run, its
+/// routing, its command and its journal lines all take it as the folder the gate was started in. Called after the log
+/// and the state root are made absolute, which stay the caller's, and before any slot is taken. Only a folder on a
+/// drive is entered: a UNC, verbatim or device path is refused before any filesystem call. Each line names the flag as
+/// the caller spelled it.
+fn enter(cd: Option<&Path>, spelling: Spelling) -> Result<(), String> {
+    let Some(given) = cd else {
+        return Ok(());
+    };
+    let flag = match spelling {
+        Spelling::Cli => "--cd",
+        Spelling::Compat => "-Cd",
+    };
+    let cannot = |error: &io::Error| format!("gate: cannot run in {flag} {}: {error}", given.display());
+    let folder = std::path::absolute(given).map_err(|error| cannot(&error))?;
+    if !on_a_drive(&folder) {
+        return Err(format!("gate: {flag} {} is not a folder on a drive", given.display()));
+    }
+    std::env::set_current_dir(&folder).map_err(|error| {
+        if is_not_a_folder(&error) {
+            format!("gate: {flag} {} is not a folder", given.display())
+        } else {
+            cannot(&error)
+        }
+    })
+}
+
+/// Whether the absolute `folder` starts with a drive letter, `X:`, and not a UNC, verbatim or device prefix.
+fn on_a_drive(folder: &Path) -> bool {
+    matches!(folder.components().next(), Some(Component::Prefix(prefix)) if matches!(prefix.kind(), Prefix::Disk(_)))
+}
+
+/// Whether entering a folder failed because there is no folder there: nothing at the path, or a file.
+fn is_not_a_folder(error: &io::Error) -> bool {
+    matches!(error.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory)
+        || matches!(error.raw_os_error(), Some(ERROR_PATH_NOT_FOUND | ERROR_DIRECTORY))
 }
 
 fn stop_tree(request: &StopRequest, environment: &Environment, console: &mut Console) -> u8 {

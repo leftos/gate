@@ -31,6 +31,21 @@ fn compat_accepts_the_powershell_form() {
 }
 
 #[test]
+fn compat_cd_parses_to_the_same_request_as_the_cli_s() {
+    let new = with(&RUN, &["--cd", r"X:\dev\repo.wt\other", "--", "cmd"]);
+    for cd in [
+        ["-Cd", r"X:\dev\repo.wt\other", "--", "cmd"].as_slice(),
+        [r"-cd:X:\dev\repo.wt\other", "--", "cmd"].as_slice(),
+    ] {
+        assert_eq!(run_request(&refs(&compat(cd))), as_compat(&new), "{cd:?}");
+    }
+    assert_eq!(
+        problems(&refs(&compat(&["-Cd", "a", "-CD", "b", "--", "cmd"]))),
+        ["gate: -CD is given twice"]
+    );
+}
+
+#[test]
 fn compat_options_are_case_insensitive() {
     let old = [
         "-log",
