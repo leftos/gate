@@ -83,6 +83,13 @@ impl RestrictedToken {
     pub(crate) fn handle(&self) -> &OwnedHandle {
         &self.0
     }
+
+    /// The token's raw handle, open while `self` lives, for a test that impersonates it on a thread. Test builds only.
+    #[cfg(any(test, feature = "test-seams"))]
+    #[must_use]
+    pub fn raw_handle(&self) -> HANDLE {
+        self.0.raw()
+    }
 }
 
 /// How a token holds the NETWORK group (S-1-5-2), which a network logon's token holds enabled.

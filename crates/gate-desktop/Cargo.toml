@@ -29,6 +29,7 @@ gate-win32 = { path = "../gate-win32", features = ["test-seams"] }
 proc-table = { path = "../proc-table" }
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
+    "Win32_Security",
     "Win32_Storage_FileSystem",
     "Win32_System_Pipes",
     "Win32_System_Threading",

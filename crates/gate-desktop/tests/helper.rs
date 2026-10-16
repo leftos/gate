@@ -16,11 +16,12 @@ use std::time::{Duration, Instant};
 use gate_desktop::protocol::{HELPER_FRAME_LIMIT, Message, Spawn, read_message, write_message};
 use gate_desktop::{HelperExit, PIPE_PREFIX, arg0};
 use gate_win32::{
-    ConnectWait, EndReport, Job, PipeOwner, PipeServer, RemoteProcess, StoppableProcess, Suspended, creation_time_of, current_user_sid,
-    system_directory, thread_is_suspended,
+    ConnectWait, EndReport, Job, PipeClient, PipeOwner, PipeServer, RemoteProcess, RestrictedToken, StoppableProcess, Suspended, creation_time_of,
+    current_user_sid, system_directory, thread_is_suspended,
 };
 use proc_table::win32::Win32ProcessTable;
 use windows_sys::Win32::Foundation::{CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE};
+use windows_sys::Win32::Security::{ImpersonateLoggedOnUser, RevertToSelf};
 use windows_sys::Win32::Storage::FileSystem::{FILE_TYPE_PIPE, GetFileType};
 use windows_sys::Win32::System::Pipes::GetNamedPipeServerProcessId;
 use windows_sys::Win32::System::SystemServices::SECURITY_MANDATORY_MEDIUM_RID;
@@ -274,6 +275,32 @@ fn the_helper_refuses_a_server_whose_pid_is_not_the_box() {
     let waited = server.wait_for_client(guard(), &[helper.as_handle()]).expect("the connect is waited on");
     assert_eq!(waited, ConnectWait::Connected, "the helper reached the pipe before its server check");
     assert_eq!(exit_of(&mut helper), code(HelperExit::ServerRefused));
+}
+
+#[test]
+#[ignore = "needs an elevated token: run elevated with --ignored"]
+fn the_production_pipe_passes_the_helpers_security_check() {
+    let user = current_user_sid().expect("the user is read");
+    let server = PipeServer::create(PIPE_PREFIX, &user, PipeOwner::Administrators).expect("an elevated process makes the Administrators' pipe");
+
+    let name = server.name().to_owned();
+
+    // The helper connects at medium with Administrators deny-only, as this thread does while it impersonates the token.
+    let opened = std::thread::spawn(move || {
+        let medium = RestrictedToken::of_this_process().expect("the medium restricted token is made");
+        // SAFETY: the token is open with `TOKEN_QUERY | TOKEN_DUPLICATE`, the access the call needs, while it runs.
+        let impersonated = unsafe { ImpersonateLoggedOnUser(medium.raw_handle()) } != 0;
+        assert!(impersonated, "the thread impersonates the token: {}", std::io::Error::last_os_error());
+        let opened = PipeClient::open(&name, &user, PipeOwner::Administrators).map(drop);
+        // SAFETY: `RevertToSelf` takes no arguments; it ends this thread's impersonation.
+        let reverted = unsafe { RevertToSelf() } != 0;
+        assert!(reverted, "the impersonation is reverted: {}", std::io::Error::last_os_error());
+        opened
+    })
+    .join()
+    .expect("the client thread ends");
+
+    assert!(opened.is_ok(), "the helper's check takes the pipe the box makes: {:?}", opened.err());
 }
 
 #[test]

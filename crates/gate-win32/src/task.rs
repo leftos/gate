@@ -23,16 +23,16 @@ use std::time::{Duration, Instant};
 use windows::Win32::Foundation::VARIANT_BOOL;
 use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize, IClassFactory};
 use windows::Win32::System::TaskScheduler::{
-    IAction, IExecAction, IRegisteredTask, IRunningTask, ITaskDefinition, ITaskService, TASK_ACTION_EXEC, TASK_ACTION_TYPE, TASK_INSTANCES_PARALLEL,
-    TASK_INSTANCES_POLICY, TASK_LOGON_INTERACTIVE_TOKEN, TASK_LOGON_TYPE, TASK_RUN_IGNORE_CONSTRAINTS, TASK_RUN_USE_SESSION_ID, TASK_RUNLEVEL_LUA,
-    TASK_RUNLEVEL_TYPE, TASK_STATE, TASK_STATE_DISABLED, TASK_STATE_READY, TaskScheduler,
+    IAction, IExecAction, IRegisteredTask, IRunningTask, ITaskDefinition, ITaskFolder, ITaskService, ITaskSettings, ITaskSettings3, TASK_ACTION_EXEC,
+    TASK_ACTION_TYPE, TASK_INSTANCES_PARALLEL, TASK_INSTANCES_POLICY, TASK_LOGON_INTERACTIVE_TOKEN, TASK_LOGON_TYPE, TASK_RUN_IGNORE_CONSTRAINTS,
+    TASK_RUN_USE_SESSION_ID, TASK_RUNLEVEL_LUA, TASK_RUNLEVEL_TYPE, TASK_STATE, TASK_STATE_DISABLED, TASK_STATE_READY, TaskScheduler,
 };
 use windows::Win32::System::Variant::{VARIANT, VT_BSTR};
 use windows::core::{BSTR, GUID, HRESULT, IUnknown, Interface};
 use windows_sys::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, ERROR_NONE_MAPPED, GENERIC_READ, HANDLE, HMODULE};
 use windows_sys::Win32::Security::{
-    ACL, DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, GetSecurityDescriptorOwner, LookupAccountNameW, OWNER_SECURITY_INFORMATION, PSID,
-    SID_NAME_USE,
+    ACL, DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, GetSecurityDescriptorOwner, INHERIT_ONLY_ACE, LookupAccountNameW,
+    OWNER_SECURITY_INFORMATION, PSID, SID_NAME_USE,
 };
 use windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_READ;
 use windows_sys::Win32::System::LibraryLoader::{GetModuleFileNameW, GetProcAddress, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW};
@@ -64,12 +64,15 @@ const SHOWN_LIMIT: usize = 200;
 /// How long a look for the started task's process sleeps before it asks the Task Scheduler again.
 const PID_LOOK_STEP: Duration = Duration::from_millis(50);
 
-/// The SIDs that may change or run the task besides the user running gate: SYSTEM and the Administrators group.
+/// The SIDs that may own or change the task and its folder: SYSTEM and the Administrators group.
 const TRUSTED_SIDS: [&str; 2] = ["S-1-5-18", "S-1-5-32-544"];
 
-/// The only rights an entry for anyone but SYSTEM, Administrators and the user running gate may allow on the task:
+/// The only rights an entry for anyone but SYSTEM and Administrators, the user running gate included, may allow on the task:
 /// reading it, `FILE_GENERIC_READ` and `GENERIC_READ`, as the Task Scheduler maps a task's rights onto a file's.
 const READ_ONLY: u32 = FILE_GENERIC_READ | GENERIC_READ;
+
+/// The parts of a task's or its folder's security descriptor the checks read: its owner and its DACL.
+const OWNER_AND_DACL: u32 = OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
 
 /// The `Arg0` a run of the task passes it: text of `0-9`, `a-f` and `:` alone, at most [`TaskArgument::LONGEST`]
 /// characters, as `gate_desktop::arg0` writes it, so nothing else can reach the task's command line.
@@ -191,8 +194,8 @@ impl std::error::Error for TaskError {}
 /// definition must be: enabled; started on demand; a second instance run in parallel; priority 4; neither kept from
 /// starting nor stopped on batteries; no execution time limit; no triggers; one action, which runs `start.helper`
 /// with the arguments `$(Arg0)` alone and no working folder; run with the interactive token, at the least privilege,
-/// of the user running gate; and a security descriptor owned by SYSTEM, Administrators or that user, which lets no one
-/// else do more than read it. The run ignores the task's constraints, such as on batteries. It never registers, changes or
+/// of the user running gate; and a security descriptor owned by SYSTEM or Administrators, which lets no one else, that
+/// user included, do more than read it; the task's folder's descriptor likewise. The run ignores the task's constraints, such as on batteries. It never registers, changes or
 /// stops a task.
 ///
 /// The Task Scheduler is asked on a thread of its own, and the answer waited for until `deadline` or until a handle of
@@ -468,6 +471,8 @@ fn start_checked(library: &SystemLibrary, request: &Request) -> Result<StartedTa
     let found = unsafe { service.GetFolder(&BSTR::from(request.folder.as_str())) }.map_err(missing("open the task's folder"))?;
     // SAFETY: the task's name is a valid BSTR for the call.
     let task = unsafe { found.GetTask(&BSTR::from(request.name.as_str())) }.map_err(missing("open the task"))?;
+    let (owner, dacl) = read_folder_security(&found)?;
+    check_folder(owner.as_deref(), dacl.as_deref(), &request.folder).map_err(|what| TaskError::set_up_wrong(&what))?;
     let definition = read_definition(&task)?;
     check_definition(&definition, &request.expected).map_err(|what| TaskError::set_up_wrong(&what))?;
     run(&task, request)
@@ -567,6 +572,10 @@ struct Definition {
     parallel: bool,
     /// The task's priority, 0 (realtime) to 10 (idle).
     priority: i32,
+    /// How many times the Task Scheduler restarts the task after a failure (`RestartCount`).
+    restart_count: i32,
+    /// Whether the task has maintenance settings (`MaintenanceSettings`), so it may run during automatic maintenance.
+    maintenance: bool,
     /// Whether the task is kept from starting on batteries (`DisallowStartIfOnBatteries`).
     no_start_on_batteries: bool,
     /// Whether the task is stopped when the machine goes on batteries (`StopIfGoingOnBatteries`).
@@ -607,8 +616,8 @@ fn check_definition(definition: &Definition, expected: &Expected) -> Result<(), 
     check_limits(definition)?;
     check_action(&definition.actions, &expected.helper)?;
     check_principal(definition, &expected.user_sid)?;
-    check_owner(definition.owner.as_deref(), &expected.user_sid)?;
-    check_dacl(definition.dacl.as_deref(), &expected.user_sid)
+    check_owner(definition.owner.as_deref())?;
+    check_dacl(definition.dacl.as_deref())
 }
 
 /// The first of the task's run settings that differs.
@@ -624,6 +633,15 @@ fn check_settings(definition: &Definition) -> Result<(), String> {
     }
     if definition.priority != TASK_PRIORITY {
         return Err(format!("its priority is {}, not {TASK_PRIORITY}", definition.priority));
+    }
+    if definition.restart_count != 0 {
+        return Err(format!(
+            "it restarts after a failure (RestartCount {}), not never",
+            definition.restart_count
+        ));
+    }
+    if definition.maintenance {
+        return Err("it has maintenance settings (MaintenanceSettings), not none".to_owned());
     }
     Ok(())
 }
@@ -686,32 +704,33 @@ fn check_principal(definition: &Definition, user_sid: &str) -> Result<(), String
     }
 }
 
-/// Refuses an owner of the task, `owner`, that is not SYSTEM, Administrators or the user `user_sid`, since an owner
-/// may rewrite the DACL whatever it says; and a security descriptor that names no owner.
-fn check_owner(owner: Option<&str>, user_sid: &str) -> Result<(), String> {
+/// Refuses an owner of the task, `owner`, that is not SYSTEM or Administrators, since an owner may rewrite the DACL
+/// whatever it says; and a security descriptor that names no owner.
+fn check_owner(owner: Option<&str>) -> Result<(), String> {
     match owner {
-        Some(sid) if is_trusted(sid, user_sid) => Ok(()),
+        Some(sid) if is_trusted(sid) => Ok(()),
         Some(sid) => Err(format!("its owner ({}) may change who can run it", shown(sid))),
         None => Err("its security descriptor names no owner".to_owned()),
     }
 }
 
-/// The first entry of the task's DACL, `dacl`, that allows anyone but SYSTEM, Administrators and the user `user_sid`
-/// a right outside [`READ_ONLY`]; an entry of a type the check does not read is refused too, and so is no DACL.
-fn check_dacl(dacl: Option<&[Entry]>, user_sid: &str) -> Result<(), String> {
+/// The first entry of the task's DACL, `dacl`, that allows anyone but SYSTEM and Administrators a right outside
+/// [`READ_ONLY`]; an entry of a type the check does not read is refused too, and so is no DACL. An inherit-only entry
+/// grants nothing on the object itself, so it is passed over whatever it holds.
+fn check_dacl(dacl: Option<&[Entry]>) -> Result<(), String> {
     let Some(entries) = dacl else {
         return Err("its security descriptor has no DACL, so anyone may change or run it".to_owned());
     };
-    for entry in entries {
+    for entry in entries.iter().filter(|entry| !is_inherit_only(entry)) {
         match entry {
-            Entry::Allowed { mask, sid, .. } if mask & !READ_ONLY != 0 && !is_trusted(sid, user_sid) => {
+            Entry::Allowed { mask, sid, .. } if mask & !READ_ONLY != 0 && !is_trusted(sid) => {
                 return Err(format!(
                     "its security descriptor lets {} do more than read it (access 0x{:x})",
                     shown(sid),
                     mask & !READ_ONLY
                 ));
             }
-            Entry::Other { kind } if u32::from(*kind) != ACCESS_DENIED_ACE_TYPE => {
+            Entry::Other { kind, .. } if u32::from(*kind) != ACCESS_DENIED_ACE_TYPE => {
                 return Err(format!(
                     "its security descriptor holds an entry of type {kind}, which the check does not read"
                 ));
@@ -722,9 +741,24 @@ fn check_dacl(dacl: Option<&[Entry]>, user_sid: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Whether `sid` may change and run the task: SYSTEM, Administrators, or the user `user_sid`.
-fn is_trusted(sid: &str, user_sid: &str) -> bool {
-    sid.eq_ignore_ascii_case(user_sid) || TRUSTED_SIDS.iter().any(|trusted| sid.eq_ignore_ascii_case(trusted))
+/// Refuses the task's folder `folder`, whose security descriptor names the owner `owner` and holds the DACL `dacl`,
+/// as [`check_owner`] and [`check_dacl`] refuse the task's own: whoever may change the folder may replace the task.
+fn check_folder(owner: Option<&str>, dacl: Option<&[Entry]>, folder: &str) -> Result<(), String> {
+    check_owner(owner)
+        .and_then(|()| check_dacl(dacl))
+        .map_err(|what| format!("its folder ({}): {what}", shown(folder)))
+}
+
+/// Whether `sid` may change and run the task: SYSTEM or Administrators. The user running gate is not, since a process
+/// of theirs at medium could change the task between its check and its run.
+fn is_trusted(sid: &str) -> bool {
+    TRUSTED_SIDS.iter().any(|trusted| sid.eq_ignore_ascii_case(trusted))
+}
+
+/// Whether `entry` is inherit-only (`INHERIT_ONLY_ACE`): it applies to the objects made inside, not to this one.
+fn is_inherit_only(entry: &Entry) -> bool {
+    let (Entry::Allowed { flags, .. } | Entry::Label { flags, .. } | Entry::Other { flags, .. }) = entry;
+    u32::from(*flags) & INHERIT_ONLY_ACE != 0
 }
 
 /// Whether the path text `text` names `path` to Windows: equal ordinally without regard to case.
@@ -826,11 +860,26 @@ fn read_settings(definition: &ITaskDefinition, into: &mut Definition) -> Result<
         settings.MultipleInstances(&raw mut policy).map_err(&read)?;
         into.parallel = policy == TASK_INSTANCES_PARALLEL;
         settings.Priority(&raw mut into.priority).map_err(&read)?;
+        settings.RestartCount(&raw mut into.restart_count).map_err(&read)?;
         let mut limit = BSTR::new();
         settings.ExecutionTimeLimit(&raw mut limit).map_err(&read)?;
         into.time_limit = limit.to_string();
+        into.maintenance = has_maintenance_settings(&settings)?;
     }
     Ok(())
+}
+
+/// Whether `settings` hold maintenance settings. The getter succeeds with no object for a task that has none, which
+/// the `windows` crate turns into an error whose code is `S_OK`.
+fn has_maintenance_settings(settings: &ITaskSettings) -> Result<bool, TaskError> {
+    let read = failed("read the task's maintenance settings");
+    let settings: ITaskSettings3 = settings.cast().map_err(&read)?;
+    // SAFETY: the interface is valid for the call.
+    match unsafe { settings.MaintenanceSettings() } {
+        Ok(_) => Ok(true),
+        Err(error) if error.code().is_ok() => Ok(false),
+        Err(error) => Err(read(error)),
+    }
 }
 
 /// Reads the principal of `definition` into `into`, with the SID its user names.
@@ -895,14 +944,24 @@ fn read_action(action: &IAction) -> Result<Action, TaskError> {
 
 /// Reads the owner and the DACL of `task`'s security descriptor into `into`.
 fn read_security(task: &IRegisteredTask, into: &mut Definition) -> Result<(), TaskError> {
-    let unreadable = |error: io::Error| TaskError::failed(&format!("the task's security descriptor could not be read: {error}"));
-    let wanted = OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
     // SAFETY: the interface is valid for the call.
-    let sddl = unsafe { task.GetSecurityDescriptor(wanted.cast_signed()) }.map_err(failed("read the task's security descriptor"))?;
-    let descriptor = SecurityDescriptor::from_sddl(&sddl.to_string()).map_err(unreadable)?;
-    into.owner = owner_of(&descriptor).map_err(unreadable)?;
-    into.dacl = dacl_of(&descriptor).map_err(unreadable)?;
+    let sddl = unsafe { task.GetSecurityDescriptor(OWNER_AND_DACL.cast_signed()) }.map_err(failed("read the task's security descriptor"))?;
+    (into.owner, into.dacl) = owner_and_dacl(&sddl, "the task's")?;
     Ok(())
+}
+
+/// The owner and the DACL of `folder`'s security descriptor.
+fn read_folder_security(folder: &ITaskFolder) -> Result<(Option<String>, Option<Vec<Entry>>), TaskError> {
+    // SAFETY: the interface is valid for the call.
+    let sddl = unsafe { folder.GetSecurityDescriptor(OWNER_AND_DACL.cast_signed()) }.map_err(failed("read the task folder's security descriptor"))?;
+    owner_and_dacl(&sddl, "the task folder's")
+}
+
+/// The owner and the DACL the descriptor string `sddl` of `whose` security descriptor names.
+fn owner_and_dacl(sddl: &BSTR, whose: &str) -> Result<(Option<String>, Option<Vec<Entry>>), TaskError> {
+    let unreadable = |error: io::Error| TaskError::failed(&format!("{whose} security descriptor could not be read: {error}"));
+    let descriptor = SecurityDescriptor::from_sddl(&sddl.to_string()).map_err(unreadable)?;
+    Ok((owner_of(&descriptor).map_err(unreadable)?, dacl_of(&descriptor).map_err(unreadable)?))
 }
 
 /// The SID of the owner `descriptor` names; `None` when it names none.
@@ -1033,7 +1092,7 @@ mod tests {
 
     use super::{
         Action, Definition, Entry, Expected, FOLDER_NOT_FOUND, Instance, StartedTask, TASK_NOT_FOUND, TaskArgument, TaskError, TaskStart, answered,
-        check_definition, check_loaded_from, engine_pid, failed, given_up, missing, run_task, split_task_path, unseen,
+        check_definition, check_folder, check_loaded_from, engine_pid, failed, given_up, missing, run_task, split_task_path, unseen,
     };
     use crate::pipe::Signalled;
 
@@ -1077,6 +1136,8 @@ mod tests {
             allow_demand_start: true,
             parallel: true,
             priority: 4,
+            restart_count: 0,
+            maintenance: false,
             no_start_on_batteries: false,
             stop_on_batteries: false,
             time_limit: "PT0S".to_owned(),
@@ -1086,14 +1147,14 @@ mod tests {
             least_privilege: true,
             user: r"BUILDER\someone".to_owned(),
             user_sid: Some(USER.to_owned()),
-            owner: Some(USER.to_owned()),
+            owner: Some("S-1-5-32-544".to_owned()),
             dacl: Some(vec![
                 allowed("S-1-5-18", 0x001f_01ff),
                 allowed("S-1-5-32-544", 0x001f_01ff),
-                allowed(USER, 0x001f_01ff),
+                allowed(USER, 0x0012_0089),
                 allowed("S-1-5-11", 0x0012_0089),
                 allowed("S-1-1-0", 0x8000_0000),
-                Entry::Other { kind: 1 },
+                Entry::Other { kind: 1, flags: 0 },
             ]),
         }
     }
@@ -1144,6 +1205,144 @@ mod tests {
                 ..good()
             };
             assert_eq!(check_definition(&owned, &expected()), Ok(()), "{owner} may own the task");
+        }
+    }
+
+    #[test]
+    fn a_task_that_restarts_after_a_failure_is_set_up_wrong() {
+        let restarting = Definition { restart_count: 3, ..good() };
+
+        assert_eq!(mismatch(&restarting), "it restarts after a failure (RestartCount 3), not never");
+    }
+
+    #[test]
+    fn a_task_with_maintenance_settings_is_set_up_wrong() {
+        let maintained = Definition { maintenance: true, ..good() };
+
+        assert_eq!(mismatch(&maintained), "it has maintenance settings (MaintenanceSettings), not none");
+    }
+
+    /// The DACL a `\gate` folder of SYSTEM and Administrators has, with the user and everyone else allowed to read it.
+    fn folder_dacl() -> Vec<Entry> {
+        vec![
+            allowed("S-1-5-18", 0x001f_01ff),
+            allowed("S-1-5-32-544", 0x001f_01ff),
+            allowed(USER, 0x0012_0089),
+            allowed("S-1-5-11", 0x0012_0089),
+        ]
+    }
+
+    /// The entry every Task Scheduler folder carries: full control for CREATOR OWNER, object and container inherit,
+    /// inherit-only, so it grants nothing on the folder itself.
+    fn creator_owner_inherited() -> Entry {
+        Entry::Allowed {
+            flags: 0x0b,
+            mask: 0x001f_01ff,
+            sid: "S-1-3-0".to_owned(),
+        }
+    }
+
+    #[test]
+    fn an_inherit_only_entry_for_creator_owner_is_not_refused() {
+        let mut dacl = folder_dacl();
+        dacl.push(creator_owner_inherited());
+        dacl.push(Entry::Other { kind: 5, flags: 0x08 });
+
+        assert_eq!(check_folder(Some("S-1-5-32-544"), Some(&dacl), "\\gate"), Ok(()), "the folder");
+        let task = Definition { dacl: Some(dacl), ..good() };
+        assert_eq!(check_definition(&task, &expected()), Ok(()), "the task");
+    }
+
+    #[test]
+    fn an_inherited_or_inheritable_entry_that_is_not_inherit_only_is_refused() {
+        // INHERITED_ACE, then OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE: both apply to the object itself.
+        for flags in [0x10, 0x03] {
+            let mut dacl = folder_dacl();
+            dacl.push(Entry::Allowed {
+                flags,
+                mask: 0x001f_01ff,
+                sid: "S-1-5-21-9-9-9-1002".to_owned(),
+            });
+            let what = "its security descriptor lets S-1-5-21-9-9-9-1002 do more than read it (access 0xd0176)";
+
+            let folder = check_folder(Some("S-1-5-32-544"), Some(&dacl), "\\gate");
+
+            assert_eq!(folder, Err(format!("its folder (\\gate): {what}")), "the folder, flags 0x{flags:x}");
+            let task = Definition { dacl: Some(dacl), ..good() };
+            assert_eq!(mismatch(&task), what, "the task, flags 0x{flags:x}");
+        }
+    }
+
+    #[test]
+    fn a_task_the_user_running_gate_may_change_is_set_up_wrong() {
+        let mut dacl = folder_dacl();
+        dacl.push(allowed(USER, 0x001f_01ff));
+        let writable = Definition { dacl: Some(dacl), ..good() };
+
+        assert_eq!(
+            mismatch(&writable),
+            "its security descriptor lets S-1-5-21-1-2-3-1001 do more than read it (access 0xd0176)"
+        );
+        let owned = Definition {
+            owner: Some(USER.to_owned()),
+            ..good()
+        };
+        assert_eq!(mismatch(&owned), "its owner (S-1-5-21-1-2-3-1001) may change who can run it");
+    }
+
+    #[test]
+    fn a_task_folder_owned_by_the_user_running_gate_is_set_up_wrong() {
+        let refused = check_folder(Some(USER), Some(&folder_dacl()), "\\gate");
+
+        assert_eq!(
+            refused,
+            Err("its folder (\\gate): its owner (S-1-5-21-1-2-3-1001) may change who can run it".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_task_folder_owned_by_an_untrusted_account_is_set_up_wrong() {
+        let refused = check_folder(Some("S-1-5-21-9-9-9-1002"), Some(&folder_dacl()), "\\gate");
+
+        assert_eq!(
+            refused,
+            Err("its folder (\\gate): its owner (S-1-5-21-9-9-9-1002) may change who can run it".to_owned())
+        );
+        let unowned = check_folder(None, Some(&folder_dacl()), "\\gate");
+        assert_eq!(unowned, Err("its folder (\\gate): its security descriptor names no owner".to_owned()));
+    }
+
+    #[test]
+    fn a_task_folder_that_lets_an_untrusted_account_write_is_set_up_wrong() {
+        let mut dacl = folder_dacl();
+        dacl.push(allowed("S-1-5-11", 0x0012_0116));
+
+        let refused = check_folder(Some("S-1-5-32-544"), Some(&dacl), "\\gate");
+
+        assert_eq!(
+            refused,
+            Err("its folder (\\gate): its security descriptor lets S-1-5-11 do more than read it (access 0x116)".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_task_folder_with_no_dacl_is_set_up_wrong() {
+        let refused = check_folder(Some("S-1-5-32-544"), None, "\\ga\u{202e}te");
+
+        assert_eq!(
+            refused,
+            Err("its folder (\\ga\\u{202e}te): its security descriptor has no DACL, so anyone may change or run it".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_task_folder_of_system_administrators_and_the_user_passes() {
+        for owner in ["S-1-5-18", "S-1-5-32-544"] {
+            assert_eq!(
+                check_folder(Some(owner), Some(&folder_dacl()), "\\gate"),
+                Ok(()),
+                "{owner} may own the folder"
+            );
         }
     }
 
@@ -1285,7 +1484,7 @@ mod tests {
                 with_dacl(vec![allowed("S-1-1-0", 0x0000_0400)]),
                 "lets S-1-1-0 do more than read it (access 0x400)",
             ),
-            (with_dacl(vec![Entry::Other { kind: 5 }]), "an entry of type 5"),
+            (with_dacl(vec![Entry::Other { kind: 5, flags: 0 }]), "an entry of type 5"),
             (
                 Definition {
                     owner: Some("S-1-5-21-1-2-3-1002".to_owned()),

@@ -976,8 +976,8 @@ pub(crate) enum Entry {
     Allowed { flags: u8, mask: u32, sid: String },
     /// A mandatory label entry: its flags, its policy and its label SID's string form.
     Label { flags: u8, policy: u32, sid: String },
-    /// An entry of any other type.
-    Other { kind: u8 },
+    /// An entry of any other type: its type and its flags.
+    Other { kind: u8, flags: u8 },
 }
 
 impl Entry {
@@ -1020,7 +1020,7 @@ unsafe fn entry_at(acl: *const ACL, index: u32) -> io::Result<Entry> {
     // SAFETY: every entry starts with its header, within the ACL.
     let (kind, flags) = unsafe { ((*ace).Header.AceType, (*ace).Header.AceFlags) };
     if u32::from(kind) != ACCESS_ALLOWED_ACE_TYPE && u32::from(kind) != SYSTEM_MANDATORY_LABEL_ACE_TYPE {
-        return Ok(Entry::Other { kind });
+        return Ok(Entry::Other { kind, flags });
     }
     // SAFETY: an entry of either type, which the system checked whole when the ACL was set, holds its mask and, from
     // `SidStart`, its SID, both within the entry.

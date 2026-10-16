@@ -10,8 +10,9 @@ use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, HANDLE, LocalFree, WA
 use windows_sys::Win32::Security::Authorization::ConvertStringSidToSidW;
 use windows_sys::Win32::Security::{PSID, SECURITY_ATTRIBUTES};
 use windows_sys::Win32::System::Threading::{
-    AddSIDToBoundaryDescriptor, ClosePrivateNamespace, CreateBoundaryDescriptorW, CreateMutexW, CreatePrivateNamespaceW, DeleteBoundaryDescriptor,
-    OpenMutexW, OpenPrivateNamespaceW, ReleaseMutex, SYNCHRONIZATION_SYNCHRONIZE, WaitForSingleObject,
+    AddIntegrityLabelToBoundaryDescriptor, AddSIDToBoundaryDescriptor, ClosePrivateNamespace, CreateBoundaryDescriptorW, CreateMutexW,
+    CreatePrivateNamespaceW, DeleteBoundaryDescriptor, OpenMutexW, OpenPrivateNamespaceW, ReleaseMutex, SYNCHRONIZATION_SYNCHRONIZE,
+    WaitForSingleObject,
 };
 
 use crate::security::Descriptor;
@@ -172,6 +173,16 @@ pub fn mutex_exists(name: &str) -> io::Result<bool> {
 /// The well-known SID of the Administrators group, the one the production boundary holds.
 const ADMINISTRATORS_SID: &str = "S-1-5-32-544";
 
+/// The authority of the mandatory label SIDs, whose last part is the integrity level's relative ID.
+#[cfg(any(test, feature = "test-seams"))]
+const MANDATORY_LABEL_PREFIX: &str = "S-1-16-";
+
+/// The high mandatory label, the one the production boundary holds: only a process at or above it can create the
+/// namespace, so a split-token administrator's unelevated process, at medium, cannot squat it. Opening it is decided
+/// by the namespace's descriptor, whose DACL grants Administrators alone, so a token holding `BA` deny-only, as that
+/// unelevated process's does, is granted nothing.
+const HIGH_INTEGRITY_LABEL: &str = "S-1-16-12288";
+
 /// The boundary of the production desktop namespace.
 const DESKTOP_BOUNDARY: &str = "gate-desktop";
 
@@ -187,27 +198,30 @@ const DESKTOP_NAMESPACE_SDDL: &str = "D:P(A;;GA;;;SY)(A;;GA;;;BA)";
 /// How many times a namespace that vanishes between its create and its open is looked for again.
 const NAMESPACE_TRIES: u32 = 3;
 
-/// Where a [`PrivateMutex`] lives: the boundary that isolates its private namespace (a name and the SID a process
-/// must hold to be within it), the namespace's DACL, the alias prefix this process opens the namespace under, and the
-/// mutex's name inside it.
+/// Where a [`PrivateMutex`] lives: the boundary that isolates its private namespace (a name, the SID a process must
+/// hold and the integrity label it must reach to create it), the namespace's DACL, the alias prefix this process opens
+/// the namespace under, and the mutex's name inside it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PrivateName {
     boundary: String,
     boundary_sid: String,
+    boundary_label: String,
     namespace_sddl: String,
     prefix: String,
     mutex: String,
 }
 
 impl PrivateName {
-    /// The builder's desktop mutex, `gate\desktop`: a boundary `gate-desktop` holding the Administrators SID, so only
-    /// an elevated process can create or open the namespace, whose DACL grants SYSTEM and Administrators alone. No
-    /// other local account can squat its name.
+    /// The builder's desktop mutex, `gate\desktop`: a boundary `gate-desktop` holding the Administrators SID and the
+    /// high integrity label, so only an elevated process can create the namespace, and a DACL granting SYSTEM and
+    /// Administrators alone, so only an elevated process can open it. No other local account, and no administrator's
+    /// unelevated process, can squat its name.
     #[must_use]
     pub fn desktop() -> PrivateName {
         PrivateName {
             boundary: DESKTOP_BOUNDARY.to_owned(),
             boundary_sid: ADMINISTRATORS_SID.to_owned(),
+            boundary_label: HIGH_INTEGRITY_LABEL.to_owned(),
             namespace_sddl: DESKTOP_NAMESPACE_SDDL.to_owned(),
             prefix: DESKTOP_PREFIX.to_owned(),
             mutex: DESKTOP_MUTEX.to_owned(),
@@ -215,15 +229,20 @@ impl PrivateName {
     }
 
     /// The desktop mutex as an unelevated test run reaches it: the boundary `gate-desktop-<unique>` holds the user SID
-    /// `user_sid` in place of Administrators, the namespace's DACL grants that user too, and the alias prefix is
-    /// `gate-<unique>`, so each `unique` names a namespace of its own. Test builds only.
+    /// `user_sid` in place of Administrators and the label of this process's own integrity level in place of high, the
+    /// namespace's DACL grants that user too, and the alias prefix is `gate-<unique>`, so each `unique` names a
+    /// namespace of its own. Test builds only.
     ///
     /// # Errors
     ///
-    /// An error of kind [`io::ErrorKind::InvalidInput`] when `unique` is empty or holds anything but ASCII letters,
-    /// digits and `-`.
+    /// An error of kind [`io::ErrorKind::InvalidInput`] when `user_sid` is not a SID's string form, or when `unique` is
+    /// empty or holds anything but ASCII letters, digits and `-`; the system's error when this process's token cannot
+    /// be read.
     #[cfg(any(test, feature = "test-seams"))]
     pub fn for_user(user_sid: &str, unique: &str) -> io::Result<PrivateName> {
+        if !crate::pipe::is_sid_string(user_sid) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("{user_sid:?} is not a SID string")));
+        }
         if unique.is_empty() || !unique.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-') {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -233,6 +252,7 @@ impl PrivateName {
         Ok(PrivateName {
             boundary: format!("{DESKTOP_BOUNDARY}-{unique}"),
             boundary_sid: user_sid.to_owned(),
+            boundary_label: format!("{MANDATORY_LABEL_PREFIX}{}", crate::token_facts()?.integrity),
             namespace_sddl: format!("{DESKTOP_NAMESPACE_SDDL}(A;;GA;;;{user_sid})"),
             prefix: format!("{DESKTOP_PREFIX}-{unique}"),
             mutex: DESKTOP_MUTEX.to_owned(),
@@ -249,6 +269,13 @@ impl PrivateName {
     #[must_use]
     pub fn boundary_sid(&self) -> &str {
         &self.boundary_sid
+    }
+
+    /// The mandatory label SID the boundary holds, in its string form: a process below that integrity level is outside
+    /// the boundary.
+    #[must_use]
+    pub fn boundary_label(&self) -> &str {
+        &self.boundary_label
     }
 
     /// The namespace's security descriptor, in SDDL.
@@ -284,9 +311,9 @@ impl PrivateMutex {
     /// # Errors
     ///
     /// An error of kind [`io::ErrorKind::InvalidInput`] when this process has another namespace open under the same
-    /// prefix (another boundary or DACL); the system's error when the boundary, the namespace's descriptor, the
-    /// namespace or the mutex cannot be made or opened: a process outside the boundary (one whose token does not hold
-    /// its SID) is refused here.
+    /// prefix (another boundary, label or DACL); the system's error when the boundary, the namespace's descriptor, the
+    /// namespace or the mutex cannot be made or opened: a process whose token does not hold the boundary's SID, or
+    /// that is below the boundary's integrity label when it would create the namespace, is refused here.
     pub fn open(name: &PrivateName) -> io::Result<PrivateMutex> {
         let created = open_namespace(name)?;
         let mutex = NamedMutex::open(&name.mutex_name())?;
@@ -406,7 +433,7 @@ struct Boundary {
 }
 
 impl Boundary {
-    /// The boundary `name` describes: its name and the one SID it holds.
+    /// The boundary `name` describes: its name, the one SID it holds and its integrity label.
     fn new(name: &PrivateName) -> io::Result<Boundary> {
         let boundary_name = wide(&name.boundary);
         // SAFETY: `boundary_name` is NUL-terminated and outlives the call; no flag is passed.
@@ -419,6 +446,11 @@ impl Boundary {
         // SAFETY: the boundary is open and the call may replace it through the pointer, which the guard then owns;
         // the SID is valid for the call, which copies it.
         if unsafe { AddSIDToBoundaryDescriptor(&raw mut boundary.handle, sid.0) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let label = Sid::from_string(&name.boundary_label)?;
+        // SAFETY: as above, for the label's SID.
+        if unsafe { AddIntegrityLabelToBoundaryDescriptor(&raw mut boundary.handle, label.0) } == 0 {
             return Err(io::Error::last_os_error());
         }
         Ok(boundary)
@@ -487,6 +519,34 @@ mod tests {
     }
 
     #[test]
+    fn a_private_name_for_a_text_that_is_not_a_sid_is_refused() {
+        for bad in ["", "S-1-", "BUILDER\\someone", "S-1-5-21-1-2-3-1001)(A;;GA;;;WD)", "S-1-5-\n18"] {
+            let refused = PrivateName::for_user(bad, "case-1").expect_err("the text is refused");
+
+            assert_eq!(refused.kind(), std::io::ErrorKind::InvalidInput, "{bad:?}: {refused}");
+            assert_eq!(refused.to_string(), format!("{bad:?} is not a SID string"));
+        }
+    }
+
+    #[test]
+    fn the_desktop_boundary_carries_the_high_integrity_label() {
+        assert_eq!(
+            PrivateName::desktop().boundary_label(),
+            "S-1-16-12288",
+            "only a process at high integrity or above is within the production boundary"
+        );
+        let integrity = crate::token_facts().expect("this process's token is read").integrity;
+
+        let name = unique_name("label");
+
+        assert_eq!(
+            name.boundary_label(),
+            format!("S-1-16-{integrity}"),
+            "a test's boundary carries this process's own level"
+        );
+    }
+
+    #[test]
     fn a_prefix_open_for_another_namespace_is_refused() {
         let name = unique_name("prefix");
         let _open = PrivateMutex::open(&name).expect("the mutex is made");
@@ -502,6 +562,28 @@ mod tests {
             .err()
             .expect("the same prefix with another DACL is refused");
         assert_eq!(refused.kind(), std::io::ErrorKind::InvalidInput, "{refused}");
+        let mut other_label = name.clone();
+        other_label.boundary_label = "S-1-16-4096".to_owned();
+        let refused = PrivateMutex::open(&other_label)
+            .err()
+            .expect("the same prefix with another label is refused");
+        assert_eq!(refused.kind(), std::io::ErrorKind::InvalidInput, "{refused}");
+    }
+
+    #[test]
+    fn a_boundary_labelled_above_this_process_refuses_its_create() {
+        if crate::token_facts().expect("this process's token is read").elevated {
+            // An elevated process is at high integrity already, so the label refuses nothing.
+            return;
+        }
+        let mut name = unique_name("high-label");
+        name.boundary_label = super::HIGH_INTEGRITY_LABEL.to_owned();
+
+        let refused = PrivateNamespace::create_or_open(&name)
+            .err()
+            .expect("a boundary holding this user's SID but labelled high is refused below high");
+
+        assert_eq!(refused.kind(), std::io::ErrorKind::PermissionDenied, "{refused}");
     }
 
     #[test]
