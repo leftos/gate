@@ -8,6 +8,8 @@
 - [ ] GATE-192 Turn routing back on, on the Rust remote client — High · Remote
 - [/] GATE-231 Run a routed command that needs a desktop in the builder's logged-on session — High · Remote
 - [/] GATE-347 Warm a builder work folder with a repo's warm-up commands before routing work for it — High · Remote
+- [!] GATE-361 Answer yaat's routed-run report: env forwarding, a corrupt ref assembly, the stale line, formatter fixes — High · Remote
+- [ ] GATE-362 Send a caller's chosen environment to a routed command, and say when a routed run drops one — High · Remote
 
 ## Remote
 
@@ -91,6 +93,8 @@
 - [ ] GATE-356 Fail closed when the box cannot start a routed command with its restricted token
 - [ ] GATE-357 Look at the box's stop signal before the program lookup
 - [ ] GATE-358 Keep a preflight's read from making a run's layout read or write fail
+- [ ] GATE-359 Mark a test-seams build in its version so a box refuses a seam helper
+- [ ] GATE-360 Harden the box's desktop hand-off: first-thread, token, clock-step and case checks
 
 ## Cutover sweep
 
