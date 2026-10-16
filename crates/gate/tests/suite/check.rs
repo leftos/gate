@@ -66,11 +66,13 @@ fn path_with_git(folders: &[PathBuf]) -> OsString {
     std::env::join_paths(folders.iter().cloned().chain([git_folder()])).expect("the folders join into a PATH")
 }
 
-/// `gate check` with `extra` in the repo, its `PATH` the `folders` then git's folder.
+/// `gate check` with `extra` in the repo, its `PATH` the `folders` then git's folder and no `GATE_GODOT_ROOT`, so the
+/// godot probe reads that `PATH` alone.
 fn check(case: &Case, folders: &[PathBuf], extra: &[&str]) -> Outcome {
     let args: Vec<&str> = ["check"].iter().chain(extra).copied().collect();
     let mut command = case.gate_in(REPO, &args);
     command.env("PATH", path_with_git(folders));
+    command.env_remove("GATE_GODOT_ROOT");
     finish(command)
 }
 
@@ -138,13 +140,45 @@ fn check_with_a_missing_tool_exits_1_and_says_how_to_install_it() {
         [
             "check: here: node 24.19.0 ok (needs 24.0.0 or later)",
             "check: here: cargo-nextest missing (needs it present)",
-            "check: here: godot skipped: no probe for godot",
+            "check: here: godot missing (needs 4.5.0 or later)",
             "install: here: cargo-nextest: cargo install cargo-nextest --locked",
-            "check: here: 1 missing, 0 too old, 1 skipped",
+            "check: here: 2 missing, 0 too old",
         ],
         "{outcome:?}"
     );
     assert_eq!(outcome.code, Some(1), "{outcome:?}");
+}
+
+/// A root inside the repo is refused as a program inside the worktree is, whatever the manifest declares of godot,
+/// and the install behind it never runs.
+#[test]
+fn check_a_godot_root_inside_the_repo_is_refused() {
+    let case = repo_case("check_godot_root_inside");
+    write(&case, ".gate/toolchain.toml", "[tools]\ngodot = \"\"\n");
+    let root = case.folder().join(REPO).join("godot");
+    let install = root.join("4.7.2");
+    fs::create_dir_all(&install).expect("the install folder can be made");
+    fs::copy(FAKE_TOOL, install.join("Godot_console.exe")).expect("the fake godot can be copied");
+    fs::write(install.join("version.txt"), "4.7.2.stable.mono.official.x\n").expect("the fake's answer can be written");
+    let mut command = case.gate_in(REPO, &["check"]);
+    command.env("PATH", path_with_git(&[]));
+    command.env("GATE_GODOT_ROOT", &root);
+
+    let outcome = finish(command);
+
+    let program = install.join("Godot_console.exe");
+    let said = format!(
+        "check: here: godot skipped: cannot run {}: {} lies inside the worktree",
+        program.display(),
+        program.display()
+    );
+    assert_eq!(
+        lines(&outcome.stdout)[1..],
+        [said.as_str(), "check: here: nothing missing (1 skipped)"],
+        "{outcome:?}"
+    );
+    assert!(!install.join("ran").exists(), "the refused install ran");
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
 }
 
 #[test]

@@ -239,7 +239,7 @@ The tool lines, for each tool of the manifest, probed as the box probes the tool
 - `<tool> missing (needs <min> or later)`, or `(needs it present)` for a tool declared with `""`;
 - `<tool> <found> ok` for a tool declared present at any version, and `<tool> ok (version not readable)` for a present one whose version the probe could not read;
 - `<tool> skipped: found, version not readable (needs <min> or later)` when a minimum is declared and the tool answered with no version;
-- `<tool> skipped: <why>` when the probe gave no answer, `<why>` being the probe's own reason (`no answer in 10 s`, `no probe for godot`, `cannot run <program>: <error>`);
+- `<tool> skipped: <why>` when the probe gave no answer, `<why>` being the probe's own reason (`no answer in 10 s`, `cannot run <program>: <error>`, and for `godot` the reasons of its probe, such as `cannot run <install>: <install> lies inside the worktree` for a `GATE_GODOT_ROOT` inside the repo, [Tool probes](#the-box-side));
 - `tools.<name> skipped: not a tool gate knows` for a name the manifest declares that gate has no probe for, which runs nothing.
 
 The SDK line comes only when the root has a `global.json` with an `sdk.version`; one with no `sdk` key, or an `sdk` with no `version`, pins nothing and prints none.
@@ -2109,7 +2109,13 @@ Built verbs:
 
   Tool probes (`boxside/probe.rs`): for each tool of the payload's `Needs`, in payload order, the box runs a probe and says one line on stdout after the sdks line, all once every probe has ended: `gate: remote tool <tool> <version>`, `gate: remote tool <tool> present` or `gate: remote tool <tool> missing`, or `gate: remote tool <tool> skipped: <why>`. The box only reports; the PC compares the minimums.
 
-  The probes are `rustc --version` for `rust`, `cargo-nextest nextest --version` for `cargo-nextest` (the plugin directly, never through `cargo`, so no `.cargo\config.toml` above the folder can alias it), `<name> --version` for `node`, `pnpm` and `pwsh`, and `ffmpeg -version`. `godot` has no probe.
+  The probes are `rustc --version` for `rust`, `cargo-nextest nextest --version` for `cargo-nextest` (the plugin directly, never through `cargo`, so no `.cargo\config.toml` above the folder can alias it), `<name> --version` for `node`, `pnpm` and `pwsh`, and `ffmpeg -version`. `godot` is probed as the next paragraph says.
+
+  The `godot` probe reads `GATE_GODOT_ROOT`, an environment variable of the builder naming a folder of side-by-side Godot installs, one per subfolder, each holding `Godot_console.exe`. It lists the direct subfolders of that folder (the first 64 entries, in path-name order), runs each install's `Godot_console.exe --version` under the batch's deadline and says the versions found as one line, `gate: remote tool godot <v1>,<v2>,...`, ordered by number and without repeats.
+
+  A version is the leading dot-separated digits of the first line of stdout, three parts as printed or two with `.0` added (`4.3.stable.mono.official.<hash>` is `4.3.0`); an install that prints a version and exits non-zero is still listed. With no `GATE_GODOT_ROOT` the probe runs the `Godot_console.exe` found on `PATH`. A root that names no install is `missing`. Subfolders whose name is not valid Unicode, that hold no plain `Godot_console.exe`, past the first 64, or that cannot be read are left out.
+
+  When no install gives a version the line is `gate: remote tool godot skipped: <why>`, the first reason met: `cannot run <install>: <install> lies inside the worktree` (an install inside the run's own folders, the folder above `Work`, `Work`, `Bare` and the outputs folder, is refused unrun; a `gate check` refuses the repo root), `cannot run <exe>: <path> is a link or a junction` (a subfolder or the exe), `GATE_GODOT_ROOT <path> is not an absolute path on a drive`, `cannot read GATE_GODOT_ROOT <path>: <error>`, `no answer in <limit>` (the listing was cut by the deadline with nothing read) or `Godot_console.exe --version gave no version: <line>` (the first line of stdout, cut to 200 characters with `…`, escaped, when a version part has over ten digits or the line leads with no version).
 
   Each program is found through `PATH` and `PATHEXT` as `dotnet` is (a `.cmd` shim runs through the system folder's cmd.exe; a `.ps1` is not run) and runs in the system folder on a hidden console, in the bounded runner of `remote/git.rs` (`program_output`).
 
@@ -2117,7 +2123,7 @@ Built verbs:
 
   The version is read from the first non-blank line of stdout, else of stderr: the first run of two or more dot-separated numbers after an optional `v`, its first three kept. A line with no such run, a number longer than 10 digits or a non-zero exit gives `present`; a program that cannot be found gives `missing`.
 
-  The `<why>` of a skip is `unknown tool`, `no probe for godot`, `no answer in <n> s` (or `<n> ms` when the limit is not whole seconds), `no answer in <limit>, and could not be stopped: <error>`, `the probe failed` (followed by `: <panic text>` when the probe panicked), or the runner's failure text: `cannot run <program>: <why>`, `<program> <args> wrote more than 16 MiB` or `cannot run <program>: cannot read the system folder: <error>`.
+  The `<why>` of a skip is `unknown tool`, the `godot` reasons above, `no answer in <n> s` (or `<n> ms` when the limit is not whole seconds), `no answer in <limit>, and could not be stopped: <error>`, `the probe failed` (followed by `: <panic text>` when the probe panicked), or the runner's failure text: `cannot run <program>: <why>`, `<program> <args> wrote more than 16 MiB` or `cannot run <program>: cannot read the system folder: <error>`.
 
   A payload whose `Needs` is not an object of texts prints `gate: box payload Needs is not an object of texts; probing nothing` on stderr, probes nothing and still exits 0.
 - **`run`** runs the payload's `Command` (a list of texts), or, for a warm-up, each of its `WarmCommands` in order (Warm-up, below), in `Work` (in `Work\{Leaf}` for a sibling pair), and exits with the command's own whole 32-bit status after a successful run. Its stdout is the command's stdout, LF-terminated; its stderr is the command's stderr plus the box's own lines.

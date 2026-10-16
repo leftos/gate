@@ -2404,16 +2404,15 @@ fn a_builder_with_no_sdks_line_still_has_its_tools_checked() {
 }
 
 /// Each tool the run cannot check is skipped with its line, and the run goes remote: a bad entry, a tool the builder's
-/// probe does not answer for in its 1 s bound, `godot`, which no probe reads, an unknown name, and a name that is no
-/// tool name at all. Only the probe's bound ends the hanging one, and no other line waits on a probe, so no load
-/// changes what the run says.
+/// probe does not answer for in its 1 s bound, an unknown name, and a name that is no tool name at all. Only the
+/// probe's bound ends the hanging one, and no other line waits on a probe, so no load changes what the run says.
 #[test]
 fn each_tool_the_run_cannot_check_is_skipped_with_its_line_and_the_run_goes_remote() {
     let case = client_case("client-tool-skipped");
     write(
         &case,
         MANIFEST,
-        "[tools]\nffmpeg = \"x\"\nnode = \"24\"\ngodot = \"4.7\"\nnodejs = \"24\"\n\"No de\" = \"1\"\n",
+        "[tools]\nffmpeg = \"x\"\nnode = \"24\"\nnodejs = \"24\"\n\"No de\" = \"1\"\n",
     );
     let go = Go(case.folder().join("ssh").join("node-go"));
     let held = case.folder().join("ssh").join("node-held");
@@ -2425,7 +2424,6 @@ fn each_tool_the_run_cannot_check_is_skipped_with_its_line_and_the_run_goes_remo
     let skipped = [
         "gate: .gate/toolchain.toml: tools.ffmpeg is not a version: \"x\"; skipping it",
         "gate: builder did not probe node: no answer in 1 s; not checking it",
-        "gate: builder did not probe godot: no probe for godot; not checking it",
         "gate: .gate/toolchain.toml names unknown tool nodejs; skipping it",
         "gate: .gate/toolchain.toml names unknown tool \"No de\"; skipping it",
     ];

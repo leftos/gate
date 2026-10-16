@@ -615,13 +615,13 @@ mod tests {
     fn skipped_probes_do_not_count_as_missing() {
         let checked = checked(vec![
             tool("node", Some("24"), Probed::Skipped("no answer in 10 s".to_owned())),
-            tool("godot", None, Probed::Skipped("no probe for godot".to_owned())),
+            tool("godot", None, Probed::Skipped("no answer in 10 s".to_owned())),
         ]);
         assert_eq!(
             body(&checked),
             [
                 "check: here: node skipped: no answer in 10 s",
-                "check: here: godot skipped: no probe for godot",
+                "check: here: godot skipped: no answer in 10 s",
             ]
         );
         assert_eq!(summary(&checked), "check: here: nothing missing (2 skipped)");
@@ -634,7 +634,7 @@ mod tests {
             tool("node", Some("24"), found("22.1.0")),
             tool("pnpm", None, Probed::Missing),
             tool("cargo-nextest", None, Probed::Missing),
-            tool("godot", None, Probed::Skipped("no probe for godot".to_owned())),
+            tool("godot", None, Probed::Skipped("no answer in 10 s".to_owned())),
         ]);
         assert_eq!(summary(&mixed), "check: here: 2 missing, 1 too old, 1 skipped");
         let workloads = Checked {

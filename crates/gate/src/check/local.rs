@@ -201,7 +201,7 @@ fn probed(needs: Vec<ToolNeed>, limit: Duration, root: &Path) -> Vec<Tool> {
         return Vec::new();
     }
     let names: Vec<String> = needs.iter().map(|need| need.name.clone()).collect();
-    probe::probe(&names, limit, outside_worktree(Variables::from_process(), root), Some(root))
+    probe::probe(&names, limit, outside_worktree(Variables::from_process(), root), &[root])
         .into_iter()
         .zip(needs)
         .map(|((_, probed), need)| Tool {

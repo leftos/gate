@@ -639,7 +639,7 @@ pub(crate) fn ordinal_upper(text: &str) -> String {
         .collect()
 }
 
-fn is_drive_path(value: &str) -> bool {
+pub(crate) fn is_drive_path(value: &str) -> bool {
     let rooted = matches!(value.as_bytes(), [drive, b':', b'\\' | b'/', ..] if drive.is_ascii_alphabetic());
     rooted && !value.chars().any(|character| character < ' ')
 }

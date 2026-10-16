@@ -277,7 +277,7 @@ The rule that shapes it: every file and kernel object another process sees is de
 
   And `watch.rs` (the watch of a running command: the sampler, the pause read, the load-adjusted clock, the stall kill and the Ctrl+C stop).
 
-`boxside/` is `gate box`: `mod.rs` (the verbs and their exits, and the read of the request from stdin's first line), `payload.rs` (the base64 JSON payload), `preflight.rs` (the bare repo, the work folder and the report lines), `probe.rs` (the tool probes the payload's `Needs` ask for: the table, the shared deadline and the `gate: remote tool` lines, with no console or payload coupling), `boot.rs` (the boot-time line), `ceiling.rs` (the box's watch of a routed command: the load-adjusted ceiling, the backstop and the kill and adjusted lines).
+`boxside/` is `gate box`: `mod.rs` (the verbs and their exits, and the read of the request from stdin's first line), `payload.rs` (the base64 JSON payload), `preflight.rs` (the bare repo, the work folder and the report lines), `probe.rs` (the tool probes the payload's `Needs` ask for: the table, the shared deadline, the `godot` probe's listing of the installs under `GATE_GODOT_ROOT` and the `gate: remote tool` lines, with no console or payload coupling), `boot.rs` (the boot-time line), `ceiling.rs` (the box's watch of a routed command: the load-adjusted ceiling, the backstop and the kill and adjusted lines).
 
 It also holds `run.rs` (the lock, the git flags, the sync, the command, the back commit and the call to pack outputs), `outputs.rs` (the PC's manifest read, the old-archive prune, the pack of a run's outputs, the 50 GiB trim of the outputs folder and the `outputs` verb that sends and deletes the archive).
 
