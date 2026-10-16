@@ -205,7 +205,7 @@ Paths are relative to the repo root, at feat/toolchain-manifest b903f50.
 | `crates\gate\src\boxside\stop.rs:30, 148, 168-174, 186` | by name | Unchanged, and it works because the job name lives in session 0 | I19 |
 | `crates\gate-win32\src\piped.rs:87-89, 127-153` | breakaway (88), job handle (129), flags (144-147), policy (148) | The helper's creation mirrors this without breakaway and with `NORMAL_PRIORITY_CLASS` | I12, I13, I16 |
 | `crates\gate-win32\src\create.rs:82-136, 278-288, 293-370` | spawn lock, handle list, no `lpDesktop` | Exposed for the helper; `lpDesktop` added | I15, I16 |
-| `crates\gate-win32\src\launch.rs:415-425` `Suspended` (fields `pub(crate)`), `464`, `480-492`, `495-501` | built only from `CreateProcess` | New constructor that adopts a process and thread handle; Drop still ends it unstarted | I9, I10 |
+| `crates\gate-win32\src\launch.rs:415-425` `Suspended` (fields `pub(crate)`), `464`, `480-492`, `495-501` | built only from `CreateProcess` | New constructor that adopts a process and thread handle and an `EndReport` sink; Drop still ends it unstarted, and a drop that cannot end it calls the sink once with the pid and the error, never writing to stderr | I9, I10 |
 | `crates\gate-win32\src\job.rs:321, 392-397, 404-412, 438` | | `holds` for the job-specific membership check | I9, I14 |
 | `crates\gate-win32\src\console.rs:369-371` | donor put in the job first | Never called for desktop runs | I11 |
 | `crates\gate-win32\src\mutex.rs:50-101` | null security attributes, abandoned flag | Desktop mutex; Administrators and SYSTEM through the elevated default DACL | I21-I23 |
@@ -279,13 +279,19 @@ Worst case:
 
 **D6. The job.** Kill-on-close (I14). Worst case: a box killed by sshd ends the desktop command at once. That is the behaviour we want for the one desktop.
 
-**D7. COM.** Use the `windows` crate with only `Win32_System_TaskScheduler`, `Win32_System_Com`, `Win32_System_Variant` and `Win32_Foundation`, confined to a new `task.rs` in gate-win32. The spike used `windows =0.62.2`; look up the current version that pairs with windows-sys 0.61.
+**D7. COM.** Use the `windows` crate (0.62.2) with only `Win32_System_TaskScheduler`, `Win32_System_Com`, `Win32_System_Ole`, `Win32_System_Variant` and `Win32_Foundation`, confined to `task.rs` in gate-win32.
 
-Run the COM calls on a short-lived multithreaded-apartment thread, and release every interface after `EnginePID`.
+Run the COM calls on a short-lived multithreaded-apartment thread, and release every interface before it ends.
+
+The Task Scheduler's class is made from `taskschd.dll`, loaded once for the process by its full path in the system folder (`LOAD_LIBRARY_SEARCH_SYSTEM32`) and never freed, never looked up in the registry, where a user's own class entry could stand in for it; the loaded module's path is checked against the system folder.
+
+`run_task(&TaskStart { path, argument, session_id, helper, pid_wait }, deadline, wake)` returns `StartedTask::Process(pid)`, or `NoPid` when the task started but the Task Scheduler gave no process within `pid_wait` (the helper may be running; only the caller's deadline bounds the wait for it). It reads the definition first and checks every K setting plus the task's owner (SYSTEM, Administrators or the user running gate) and DACL (no one else allowed more than read); it runs with `TASK_RUN_USE_SESSION_ID | TASK_RUN_IGNORE_CONSTRAINTS`.
+
+`TaskError` tells the caller whether the helper may exist. `NotRegistered`, `SetUpWrong` and `Failed`: nothing was started. `StartedUnknown`: started, then a later call failed. `TimedOut`, `Woken` and `Unanswered` (the wait failed or the start thread panicked): the start may have happened, the thread that asked is left to finish, one that has not yet run the task starts nothing, and the caller drops its pipe server. Every text is escaped and cut, so none can carry a line break or control character to the console.
 
 The alternatives are hand-written vtables for five interfaces, or pwsh `Schedule.Service` per run (about 1 s and a pwsh dependency). Neither is better.
 
-Worst case: compile time, and a second Windows API crate in the Layers rule (ARCHITECTURE.md:173).
+Worst case: compile time, and a second Windows API crate in the Layers rule (ARCHITECTURE.md, gate-win32).
 
 **D8. Order of a desktop start.**
 1. Lock, optional early WTS check, checkout, restore.
@@ -300,7 +306,7 @@ Worst case: compile time, and a second Windows API crate in the Layers rule (ARC
 10. Console-fallback line, stop look, resume, watch, drain.
 11. Release the mutex, session note, back commit.
 
-The helper ends the child it started only when its control pipe reads closed, or fails with a pipe-gone error (`ERROR_BROKEN_PIPE`, `ERROR_NO_DATA`, `ERROR_PIPE_NOT_CONNECTED`), before `DONE` has been read: the box is gone and nothing will resume the child. Any other read error leaves the child. It never ends the child on a timeout alone, since the box may have pulled the child and be about to resume it; the box bounds the helper instead (step 8) and ends the child itself through the handles it pulled. `adopt::process_of_child` proves only who a pid is, never whether the box took it.
+The helper ends the child it started only when its control pipe reads closed, or fails with a pipe-gone error (`ERROR_BROKEN_PIPE`, `ERROR_NO_DATA`, `ERROR_PIPE_NOT_CONNECTED`), before `DONE` has been read: the box is gone and nothing will resume the child. Any other read error leaves the child. It never ends the child on a timeout alone, since the box may have pulled the child and be about to resume it; the box bounds the helper instead (step 8) and ends the child itself through the handles it pulled. The helper ends the child through the copy of its process handle that its release kept, never by finding the pid again, so a reused pid is never ended.
 
 A received stdout or stderr value is used only when it passes `adopt::is_handle_value`, names a pipe, and is not the helper's own control-pipe handle (`adopt::check_received_output`).
 
