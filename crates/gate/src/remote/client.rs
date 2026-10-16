@@ -475,10 +475,6 @@ struct Tree {
 
 /// The repo's toolchain manifest, as its path at the repo root is spelled.
 const MANIFEST_PATH: &str = ".gate/toolchain.toml";
-/// The folder at the repo root that holds the manifest, matched ignoring ASCII case.
-const GATE_FOLDER: &str = ".gate";
-/// The manifest's name inside [`GATE_FOLDER`], matched ignoring ASCII case.
-const MANIFEST_NAME: &str = "toolchain.toml";
 
 /// One entry of the snapshot's tree as `git ls-tree -z` lists one: the mode, the object type (`blob`, `tree` or
 /// `commit`), the object id and the path.
@@ -506,30 +502,6 @@ fn entries_of(listing: &str) -> Option<Vec<Entry>> {
                 oid: oid.to_owned(),
                 path: path.to_owned(),
             })
-        })
-        .collect()
-}
-
-/// The repo's `.gate` folder among the root listing `root`: the entries named `.gate` ignoring ASCII case whose type is
-/// a tree, so one that is no folder names no manifest at all.
-fn gate_folders(root: &[Entry]) -> Vec<&Entry> {
-    root.iter()
-        .filter(|entry| entry.path.eq_ignore_ascii_case(GATE_FOLDER) && entry.kind == "tree")
-        .collect()
-}
-
-/// The entries of one `.gate` folder's listing `inside` that can be the repo's manifest: each named `toolchain.toml`
-/// ignoring ASCII case, its path the folder's path as `gate` spells it joined to its own name, so [`manifest_entry`]
-/// weighs it as the file that folder holds at the repo root, whatever the letter case of either.
-fn manifest_candidates(gate: &Entry, inside: &[Entry]) -> Vec<Entry> {
-    inside
-        .iter()
-        .filter(|entry| entry.path.eq_ignore_ascii_case(MANIFEST_NAME))
-        .map(|entry| Entry {
-            mode: entry.mode.clone(),
-            kind: entry.kind.clone(),
-            oid: entry.oid.clone(),
-            path: format!("{}/{}", gate.path, entry.path),
         })
         .collect()
 }
@@ -1159,7 +1131,7 @@ impl Attempt<'_, '_> {
         self.go_on()?;
         let folder = PathBuf::from(&repo.root);
         let git = Git::find(&folder).map_err(End::Failed)?;
-        let names = self.file_names(&folder, &git, &snapshot.commit, Some(&repo.name))?;
+        let names = self.file_names(&folder, &git, &snapshot.commit, &repo.name)?;
         Ok(names.map(|names| Tree {
             git,
             folder,
@@ -1226,29 +1198,24 @@ impl Attempt<'_, '_> {
         })
     }
 
-    /// The snapshot's tree as the parity check reads it, listed before the preflight: the names of its files and
-    /// submodules ([`Attempt::file_names`]) and its `.gate/toolchain.toml` ([`Attempt::manifest`]), the manifest found
-    /// in a listing of the root and one of each `.gate` folder it names ([`manifest_candidates`]), so the names
-    /// listing stays as small as one of names alone. A listing past the git output cap, or one that is not UTF-8 or not of
-    /// `ls-tree`'s form, is said and gives `None`, which skips the whole check.
+    /// The snapshot's tree as the parity check reads it, listed before the preflight by one recursive listing that
+    /// names its folders too ([`Attempt::tree_entries`]): the names of its files and submodules, and its
+    /// `.gate/toolchain.toml` ([`Attempt::manifest`]), found among all its entries ([`manifest_entry`]), which name a
+    /// folder at that path too. A listing past the git output cap, or one that is not UTF-8 or not of `ls-tree`'s form,
+    /// is said and gives `None`, which skips the whole check.
     fn tree(&mut self, snapshot: &Snapshot) -> Result<Option<Tree>, End> {
         self.go_on()?;
         let folder = PathBuf::from(self.call.root);
         let git = Git::find(&folder).map_err(End::Failed)?;
-        let Some(names) = self.file_names(&folder, &git, &snapshot.commit, None)? else {
+        let Some(entries) = self.tree_entries(&git, &snapshot.commit)? else {
             return Ok(None);
         };
-        let Some(root) = self.tree_entries(&git, &snapshot.commit)? else {
-            return Ok(None);
-        };
-        let mut candidates = Vec::new();
-        for gate in gate_folders(&root) {
-            let Some(inside) = self.tree_entries(&git, &gate.oid)? else {
-                return Ok(None);
-            };
-            candidates.extend(manifest_candidates(gate, &inside));
-        }
-        let manifest = self.manifest(&git, &candidates)?;
+        let names = entries
+            .iter()
+            .filter(|entry| entry.kind != "tree")
+            .map(|entry| entry.path.clone())
+            .collect();
+        let manifest = self.manifest(&git, &entries)?;
         Ok(Some(Tree {
             git,
             folder,
@@ -1258,19 +1225,20 @@ impl Attempt<'_, '_> {
     }
 
     /// The names of the files and submodules of the snapshot's tree `treeish`, asked in the worktree `folder`, as its
-    /// listing spells them, one per NUL; `None`, with a line naming the sibling `of`, `None` for the main repository,
-    /// when that listing is past the git output cap or is not UTF-8.
-    fn file_names(&mut self, folder: &Path, git: &Git, treeish: &str, of: Option<&str>) -> Result<Option<Vec<String>>, End> {
-        let Some(listing) = self.listed(folder, git, &["ls-tree", "-r", "-z", "--name-only", treeish], of)? else {
+    /// listing spells them, one per NUL; `None`, with a line naming the sibling `of`, when that listing is past the git
+    /// output cap or is not UTF-8.
+    fn file_names(&mut self, folder: &Path, git: &Git, treeish: &str, of: &str) -> Result<Option<Vec<String>>, End> {
+        let Some(listing) = self.listed(folder, git, &["ls-tree", "-r", "-z", "--name-only", treeish], Some(of))? else {
             return Ok(None);
         };
         Ok(Some(listing.split('\0').filter(|name| !name.is_empty()).map(str::to_owned).collect()))
     }
 
-    /// The entries of `git ls-tree -z` over the tree `treeish` ([`entries_of`]), each with its mode, type, object id
-    /// and path; `None`, with a line, when that listing is past the git output cap, is not UTF-8 or is not of that form.
+    /// The entries of `git ls-tree -r -t -z` over the tree `treeish` ([`entries_of`]), every file, submodule and folder
+    /// at any depth, each with its mode, type, object id and path from the root; `None`, with a line, when that listing
+    /// is past the git output cap, is not UTF-8 or is not of that form.
     fn tree_entries(&mut self, git: &Git, treeish: &str) -> Result<Option<Vec<Entry>>, End> {
-        let Some(listing) = self.listed(Path::new(self.call.root), git, &["ls-tree", "-z", treeish], None)? else {
+        let Some(listing) = self.listed(Path::new(self.call.root), git, &["ls-tree", "-r", "-t", "-z", treeish], None)? else {
             return Ok(None);
         };
         let Some(entries) = entries_of(&listing) else {
@@ -3614,7 +3582,7 @@ mod tests {
         called_of, console_of, held, is_heartbeat, last_update, local_sdk_listing, path_outside, paused, push_size, relay, relay_raw, relayed_raw,
         sdks_of, seconds, their_version, version_refusal,
     };
-    use super::{Entry, entries_of, gate_folders, manifest_candidates, manifest_entry};
+    use super::{Entry, entries_of, manifest_entry};
     use crate::environment::Variables;
     use crate::remote::git::{DOTNET_LIMIT, GIT_LIMIT, Git, GitError};
     use crate::remote::held::tests::{Pair, junction};
@@ -5523,6 +5491,7 @@ mod tests {
         let snapshot = Snapshot {
             commit: "0123456789abcdef0123456789abcdef01234567".to_owned(),
             bridge: None,
+            objects: PathBuf::from(r"C:\app\.git\objects"),
         };
         let location = Location::under(r"C:\builder", "app", "app-1a2b3c4d", "0123456789ab");
 
@@ -5694,49 +5663,48 @@ mod tests {
         assert_eq!(entries_of("100644 blob x y\ta\0"), None, "four words");
     }
 
-    /// The manifest's candidates are built from one listing of the root and one of each `.gate` folder it names: the
-    /// exact spelling at the repo root is read, a case variant alone is, two at once differ only in letter case, and a
-    /// `.gate` that is no folder holds no manifest at all.
+    /// The manifest is found in one recursive listing that names folders too, as `git ls-tree -r -t -z` gives it: the
+    /// exact spelling at the repo root is read, a case variant alone is, two at once differ only in letter case, a
+    /// `.gate` that is no folder holds no manifest at all, a folder at the manifest's path is no file, and a
+    /// `.gate/toolchain.toml` below the root is not the repo's.
     #[test]
-    fn the_manifest_s_entries_are_built_from_a_root_listing_and_a_gate_listing() {
+    fn the_manifest_is_found_in_one_recursive_listing() {
         let oid = "0123456789abcdef0123456789abcdef01234567";
         let record = |mode: &str, kind: &str, name: &str| format!("{mode} {kind} {oid}\t{name}\0");
-        let candidates = |root: &str, inside: &str| -> Vec<Entry> {
-            let root = entries_of(root).expect("the root listing reads");
-            let inside = entries_of(inside).expect("the .gate listing reads");
-            gate_folders(&root)
-                .into_iter()
-                .flat_map(|gate| manifest_candidates(gate, &inside))
-                .collect()
+        let tree = |name: &str| record("040000", "tree", name);
+        let blob = |name: &str| record("100644", "blob", name);
+        let found = |listing: &str| -> Option<Result<Entry, String>> {
+            let entries = entries_of(listing).expect("the listing reads");
+            manifest_entry(&entries).map(|matched| matched.map(|hit| entry(&hit.mode, &hit.kind, &hit.path)))
         };
 
-        let exact = candidates(&record("040000", "tree", ".gate"), &record("100644", "blob", "toolchain.toml"));
+        let exact = format!("{}{}{}", blob("a.txt"), tree(".gate"), blob(".gate/toolchain.toml"));
         assert_eq!(
-            exact,
-            vec![entry("100644", "blob", ".gate/toolchain.toml")],
+            found(&exact),
+            Some(Ok(entry("100644", "blob", ".gate/toolchain.toml"))),
             "the folder and the name as spelled"
         );
-        assert_eq!(manifest_entry(&exact), Some(Ok(&exact[0])), "and that is the one read");
 
-        let variant = candidates(&record("040000", "tree", ".Gate"), &record("100644", "blob", "Toolchain.TOML"));
-        assert_eq!(variant, vec![entry("100644", "blob", ".Gate/Toolchain.TOML")], "each part as spelled");
-        assert_eq!(manifest_entry(&variant), Some(Ok(&variant[0])), "a case variant alone is read too");
-
-        let both = format!(
-            "{}{}",
-            record("100644", "blob", "toolchain.toml"),
-            record("100644", "blob", "Toolchain.TOML")
-        );
+        let variant = format!("{}{}", tree(".Gate"), blob(".Gate/Toolchain.TOML"));
         assert_eq!(
-            manifest_entry(&candidates(&record("040000", "tree", ".Gate"), &both)),
+            found(&variant),
+            Some(Ok(entry("100644", "blob", ".Gate/Toolchain.TOML"))),
+            "a case variant alone is read too"
+        );
+
+        let both = format!("{}{}{}", tree(".Gate"), blob(".Gate/toolchain.toml"), blob(".Gate/Toolchain.TOML"));
+        assert_eq!(
+            found(&both),
             Some(Err(".Gate/toolchain.toml and .Gate/Toolchain.TOML differ only in letter case".to_owned()))
         );
 
-        assert_eq!(
-            candidates(&record("100644", "blob", ".gate"), &record("100644", "blob", "toolchain.toml")),
-            Vec::new(),
-            "a .gate that is no folder holds no manifest"
-        );
+        assert_eq!(found(&blob(".gate")), None, "a .gate that is no folder holds no manifest");
+
+        let folder = format!("{}{}{}", tree(".gate"), tree(".gate/toolchain.toml"), blob(".gate/toolchain.toml/x"));
+        assert_eq!(found(&folder), Some(Err(".gate/toolchain.toml is a folder, not a file".to_owned())));
+
+        let nested = format!("{}{}{}", tree("sub"), tree("sub/.gate"), blob("sub/.gate/toolchain.toml"));
+        assert_eq!(found(&nested), None, "a manifest below the root is not the repo's");
     }
 
     #[test]
@@ -6100,6 +6068,7 @@ mod tests {
         Snapshot {
             commit: COMMIT.to_owned(),
             bridge: None,
+            objects: PathBuf::from(r"C:\app\.git\objects"),
         }
     }
 

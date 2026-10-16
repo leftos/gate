@@ -237,9 +237,22 @@ pub(super) fn ready_tree(git: &impl TreeGit, bare: &str, tree: &str, name: Optio
         return Ok(());
     }
     // A run removes a link, a junction or a file named `.git` before it readies a tree (`plain_tree` in the run).
-    if fs::symlink_metadata(Path::new(tree).join(".git")).is_err() {
+    let made = fs::symlink_metadata(Path::new(tree).join(".git")).is_err();
+    if made {
         tree_step(git, "git init", name, &["init", "-q", "--", tree], console)?;
     }
+    if !made || !fresh_config_written(bare, tree, name)? {
+        configure(git, bare, tree, name, console)?;
+    }
+    if let Some(line) = write_alternates(bare, tree, git.holds_the_lock()).map_err(Unready::Folder)? {
+        console.err(&line);
+    }
+    Ok(())
+}
+
+/// The tree `tree`'s `origin`, the bare repository `bare`, added unless it has one, and its line-ending config, each
+/// written by a git step through `git`, its line naming the repo `name` when given ([`tree_step`]).
+fn configure(git: &impl TreeGit, bare: &str, tree: &str, name: Option<&str>, console: &mut Console) -> Result<(), Unready> {
     let git_dir = format!(r"--git-dir={tree}\.git");
     let work_tree = format!("--work-tree={tree}");
     let (git_dir, work_tree) = (git_dir.as_str(), work_tree.as_str());
@@ -255,10 +268,145 @@ pub(super) fn ready_tree(git: &impl TreeGit, bare: &str, tree: &str, name: Optio
         let args = [git_dir, work_tree, "config", setting, value];
         tree_step(git, &format!("git config {setting}"), name, &args, console)?;
     }
-    if let Some(line) = write_alternates(bare, tree, git.holds_the_lock()).map_err(Unready::Folder)? {
-        console.err(&line);
-    }
     Ok(())
+}
+
+/// The step whose line a failed [`fresh_config_written`] says, as the `git remote add` it stands in for would.
+const REMOTE_ADD: &str = "git remote add";
+/// The refspec `git remote add` gives a remote's `fetch`.
+const ORIGIN_FETCH: &str = "+refs/heads/*:refs/remotes/origin/*";
+
+/// The config's name in the tree's `.git` folder, and the lock git takes to replace it.
+const CONFIG: &str = "config";
+const CONFIG_LOCK: &str = "config.lock";
+
+/// Writes the config `git init` just made in the tree `tree` once, with the `origin` remote `bare` and the line-ending
+/// config in it, as [`configure`]'s git steps would leave it ([`fresh_config`]): whether it did. The tree's `.git` is
+/// opened as itself and held, and git's own `config.lock` taken beneath it before the config is read as itself and
+/// replaced whole ([`replace_config`]). `false`, with nothing written, so the git steps write it,
+/// when `.git` is not a folder itself, the config is missing, not a plain file or not UTF-8, it holds more than `git
+/// init`'s own `[core]` section, or its lock is held. A read or a write that fails says the `git remote add` step's
+/// line, naming the repo `name` when given, and leaves the config as it was.
+fn fresh_config_written(bare: &str, tree: &str, name: Option<&str>) -> Result<bool, Unready> {
+    let git_folder = Path::new(tree).join(".git");
+    let failed = |why: String| {
+        let line = format!("gate: remote {} failed: {why}", for_repo(REMOTE_ADD, name));
+        Unready::Git(failed_for(Failed::without_status(line), REMOTE_ADD, name))
+    };
+    let config = git_folder.join(CONFIG);
+    let folder = OpenOptions::new()
+        .read(true)
+        .share_mode(Share::NoDelete.mode())
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(&git_folder)
+        .map_err(|error| failed(format!("cannot open {}: {error}", git_folder.display())))?;
+    if !is_folder_itself(&folder).map_err(|error| failed(format!("cannot read {}: {error}", git_folder.display())))? {
+        return Ok(false);
+    }
+    replace_config(&folder, bare, |lock, text| lock.write_all(text.as_bytes()))
+        .map_err(|error| failed(format!("cannot write {}: {error}", config.display())))
+}
+
+/// The text of the config beneath the held `.git` folder `folder`, opened as itself and read through that handle;
+/// `None` when it is missing, not a plain file (a link, a junction or a folder) or not UTF-8. Else why it could not be
+/// read.
+fn plain_config(folder: &File) -> io::Result<Option<String>> {
+    let mut config = match gate_win32::open_beneath(folder, CONFIG, Share::All) {
+        Ok(config) => config,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let metadata = config.metadata()?;
+    if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Ok(None);
+    }
+    let mut bytes = Vec::new();
+    config.read_to_end(&mut bytes)?;
+    Ok(String::from_utf8(bytes).ok())
+}
+
+/// Replaces the config beneath the held `.git` folder `folder` whole, in git's order: `config.lock` made new beneath
+/// the handle, then the config read as itself ([`plain_config`]) and its new text, with the `origin` remote `bare`
+/// ([`fresh_config`]), written into the lock by `fill`, and the lock renamed over the config by handle. `false`, with
+/// nothing written, when the lock is there already, a git or another preflight holding it, or when the config cannot
+/// be written once. Every way but the rename deletes the lock through its handle and leaves the config as it was;
+/// else why it failed.
+fn replace_config(folder: &File, bare: &str, fill: impl FnOnce(&mut File, &str) -> io::Result<()>) -> io::Result<bool> {
+    let made = gate_win32::open_beneath_as(folder, CONFIG_LOCK, FILE_GENERIC_WRITE | DELETE, Share::NoDelete, Make::NewFile);
+    let mut lock = match made {
+        Ok(lock) => lock,
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let replaced = locked_replace(folder, &mut lock, bare, fill);
+    if matches!(replaced, Ok(true)) {
+        return replaced;
+    }
+    match (replaced, gate_win32::delete_opened(&lock)) {
+        (replaced, Ok(())) => replaced,
+        (Ok(_), Err(left)) => Err(io::Error::new(left.kind(), format!("{CONFIG_LOCK} could not be removed: {left}"))),
+        (Err(error), Err(left)) => Err(io::Error::new(
+            error.kind(),
+            format!("{error}; {CONFIG_LOCK} could not be removed: {left}"),
+        )),
+    }
+}
+
+/// [`replace_config`] once its lock `lock` is held: whether the config was replaced, `false` when it cannot be
+/// written once; else why the read, the write or the rename failed.
+fn locked_replace(folder: &File, lock: &mut File, bare: &str, fill: impl FnOnce(&mut File, &str) -> io::Result<()>) -> io::Result<bool> {
+    let read = plain_config(folder).map_err(|error| io::Error::new(error.kind(), format!("cannot read {CONFIG}: {error}")))?;
+    let Some(text) = read.and_then(|text| fresh_config(&text, bare)) else {
+        return Ok(false);
+    };
+    fill(lock, &text)?;
+    gate_win32::rename_beneath(lock, folder, CONFIG)?;
+    Ok(true)
+}
+
+/// The config `text` `git init` wrote, with `core.autocrlf=false` and `core.eol=lf` added to its `[core]` section and
+/// the `origin` remote `bare` after it, as `git remote add` and `git config` write them; `None` when `text` holds any
+/// section but `[core]`, either of those keys already, a U+FEFF anywhere, which could hide a section's header, or does
+/// not end its last line, or ends it with a `\` that would carry it on, which the git steps handle.
+fn fresh_config(text: &str, bare: &str) -> Option<String> {
+    let headers: Vec<&str> = text.lines().map(str::trim).filter(|line| line.starts_with('[')).collect();
+    let set = text.lines().any(|line| {
+        let key = line.trim_start().split(['=', ' ', '\t']).next().unwrap_or_default();
+        key.eq_ignore_ascii_case("autocrlf") || key.eq_ignore_ascii_case("eol")
+    });
+    let continued = text.lines().last().is_some_and(|line| line.ends_with('\\'));
+    if headers != ["[core]"] || set || continued || text.contains('\u{feff}') || !text.ends_with('\n') {
+        return None;
+    }
+    Some(format!(
+        "{text}\tautocrlf = false\n\teol = lf\n[remote \"origin\"]\n\turl = {}\n\tfetch = {ORIGIN_FETCH}\n",
+        config_value(bare)
+    ))
+}
+
+/// The config value `value` as git writes it: its `\` and `"` escaped, a line end and a tab written as `\n` and `\t`,
+/// and the whole quoted when it starts or ends with a space or holds a `;`, a `#` or a carriage return.
+fn config_value(value: &str) -> String {
+    let quoted = value.starts_with(' ') || value.ends_with(' ') || value.contains([';', '#', '\r']);
+    let mut said = String::new();
+    if quoted {
+        said.push('"');
+    }
+    for character in value.chars() {
+        match character {
+            '\n' => said.push_str("\\n"),
+            '\t' => said.push_str("\\t"),
+            '"' | '\\' => {
+                said.push('\\');
+                said.push(character);
+            }
+            other => said.push(other),
+        }
+    }
+    if quoted {
+        said.push('"');
+    }
+    said
 }
 
 /// Runs the git step `step` with `args` through `git`, named for the repo `name` on a pair run ([`for_repo`]), its
@@ -642,10 +790,18 @@ fn sdk_list(listing: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::fs::{self, OpenOptions};
+    use std::io::{self, Write as _};
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::path::Path;
+    use std::process::{Child, Stdio};
     use std::sync::PoisonError;
 
-    use super::{Git, git_failed, run_forwarded, sdk_list};
+    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
+
+    use super::{Git, fresh_config, fresh_config_written, git_failed, ready_tree, replace_config, run_forwarded, sdk_list};
     use crate::boxside::forward::OutputLock;
+    use crate::console::Console;
 
     #[test]
     #[expect(clippy::expect_used, reason = "a test whose git cannot start must fail loudly")]
@@ -678,6 +834,168 @@ mod tests {
         let failed = git_failed("git config core.eol", 128);
         assert_eq!(failed.line, "gate: remote git config core.eol failed (status 128)");
         assert_eq!(failed.status, 128);
+    }
+
+    /// The `git config --local --list` of the tree `tree`, and its config file's bytes.
+    #[expect(clippy::expect_used, reason = "a test whose git cannot start must fail loudly")]
+    fn config_of(git: &Git, tree: &Path) -> (String, Vec<u8>) {
+        let git_dir = format!(r"--git-dir={}\.git", tree.display());
+        let mut command = git.command(&[&git_dir, "config", "--local", "--list"]).expect("git is on PATH");
+        let output = gate_win32::spawn(command.stdout(Stdio::piped()).stderr(Stdio::null()))
+            .and_then(Child::wait_with_output)
+            .expect("git config runs");
+        assert_eq!(output.status.code(), Some(0), "git config --list in {}", tree.display());
+        let list = String::from_utf8(output.stdout).expect("the config list is UTF-8");
+        (list, fs::read(tree.join(".git").join("config")).expect("the config file reads"))
+    }
+
+    /// A tree the preflight makes has the config `git remote add` and `git config` would have given it, written once,
+    /// for a bare repository whose path holds a backslash and a space, and characters git escapes or quotes.
+    #[test]
+    #[expect(clippy::expect_used, reason = "a test whose git cannot start must fail loudly")]
+    fn a_fresh_tree_s_config_is_what_the_git_steps_write() {
+        let git = Git::find();
+        for (at, bare) in [r"C:\Box Work\x.git", r#"C:\Box Work\a"b;c #.git"#, r" C:\Box Work\x.git "]
+            .into_iter()
+            .enumerate()
+        {
+            let folder = crate::test_support::temp_dir().join(format!("gate-preflight-config-{at}-{}", std::process::id()));
+            if folder.exists() {
+                fs::remove_dir_all(&folder).expect("an earlier run's folder can be removed");
+            }
+            let (written, called) = (folder.join("written"), folder.join("called"));
+            fs::create_dir_all(&folder).expect("the test's folder can be made");
+
+            let readied = ready_tree(&git, bare, &written.to_string_lossy(), None, &mut Console::new());
+
+            assert!(readied.is_ok(), "the tree is readied for {bare}");
+            let called_dir = format!(r"--git-dir={}\.git", called.display());
+            let called_tree = called.to_string_lossy();
+            assert_eq!(
+                git.code(&["init", "-q", "--", &called_tree], Stdio::null(), Stdio::null()),
+                Ok(0),
+                "git init"
+            );
+            let initialised = fs::read_to_string(called.join(".git").join("config")).expect("git init's config reads");
+            assert!(
+                fresh_config(&initialised, bare).is_some(),
+                "the readied tree took the one write for {bare}: {initialised:?}"
+            );
+            for args in [
+                &[&called_dir, "remote", "add", "--", "origin", bare][..],
+                &[&called_dir, "config", "core.autocrlf", "false"],
+                &[&called_dir, "config", "core.eol", "lf"],
+            ] {
+                assert_eq!(git.code(args, Stdio::null(), Stdio::null()), Ok(0), "git {args:?}");
+            }
+            assert_eq!(config_of(&git, &written), config_of(&git, &called), "{bare}");
+            fs::remove_dir_all(&folder).expect("the test's folder can be removed");
+        }
+    }
+
+    /// The config `git init` writes on this machine's git, for the tests that hand it to the one write.
+    const INIT_CONFIG: &str = "[core]\n\trepositoryformatversion = 0\n\tfilemode = false\n\tbare = false\n";
+
+    /// A tree in the unit tests' temp folder for the test `name`, its `.git` folder holding `config` as `config`'s
+    /// bytes when given, and `config.lock` when `locked`; the tree's path.
+    #[expect(clippy::expect_used, reason = "a test that cannot make its tree must fail loudly")]
+    fn planted_tree(name: &str, config: Option<&[u8]>, locked: bool) -> std::path::PathBuf {
+        let tree = crate::test_support::temp_dir().join(format!("gate-preflight-{name}-{}", std::process::id()));
+        if tree.exists() {
+            fs::remove_dir_all(&tree).expect("an earlier run's tree can be removed");
+        }
+        fs::create_dir_all(tree.join(".git")).expect("the tree's .git can be made");
+        if let Some(config) = config {
+            fs::write(tree.join(".git").join("config"), config).expect("the config can be planted");
+        }
+        if locked {
+            fs::write(tree.join(".git").join("config.lock"), "held").expect("the lock can be planted");
+        }
+        tree
+    }
+
+    /// The one write leaves to the git steps, writing nothing, a config it cannot take whole: one that is missing, one
+    /// that is not UTF-8, one that holds another section, and one whose `config.lock` a git or another preflight holds;
+    /// a lock the write took itself is gone.
+    #[test]
+    #[expect(clippy::expect_used, reason = "a test whose tree cannot be read must fail loudly")]
+    fn a_config_the_one_write_cannot_take_is_left_to_the_git_steps() {
+        let not_utf8: &[u8] = b"[core]\n\tbare = \xff\n";
+        let other = format!("{INIT_CONFIG}[user]\n\tname = x\n");
+        for (name, config, locked) in [
+            ("config-missing", None, false),
+            ("config-not-utf8", Some(not_utf8), false),
+            ("config-other-section", Some(other.as_bytes()), false),
+            ("config-locked", Some(INIT_CONFIG.as_bytes()), true),
+        ] {
+            let tree = planted_tree(name, config, locked);
+
+            let written = fresh_config_written(r"C:\Box\x.git", &tree.to_string_lossy(), None);
+
+            assert!(matches!(written, Ok(false)), "{name}: left to the git steps");
+            let left = fs::read(tree.join(".git").join("config")).ok();
+            assert_eq!(left.as_deref(), config, "{name}: the config is as it was");
+            assert_eq!(
+                tree.join(".git").join("config.lock").exists(),
+                locked,
+                "{name}: no lock of the write's is left"
+            );
+            fs::remove_dir_all(&tree).expect("the tree can be removed");
+        }
+    }
+
+    /// A folder at the config's name is no plain config: the one write leaves it to the git steps and no lock behind.
+    #[test]
+    #[expect(clippy::expect_used, reason = "a test whose tree cannot be made must fail loudly")]
+    fn a_folder_at_the_config_s_name_is_left_to_the_git_steps() {
+        let tree = planted_tree("config-a-folder", None, false);
+        let git_folder = tree.join(".git");
+        fs::create_dir(git_folder.join("config")).expect("a folder can be planted at the config's name");
+
+        let written = fresh_config_written(r"C:\Box\x.git", &tree.to_string_lossy(), None);
+
+        assert!(matches!(written, Ok(false)), "left to the git steps");
+        assert!(git_folder.join("config").is_dir(), "the folder is as it was");
+        assert!(!git_folder.join("config.lock").exists(), "the write's lock is gone");
+        fs::remove_dir_all(&tree).expect("the tree can be removed");
+    }
+
+    /// A write into `config.lock` that fails before the rename leaves the config byte-identical and no lock behind.
+    #[test]
+    #[expect(clippy::expect_used, reason = "a test whose tree cannot be read must fail loudly")]
+    fn a_config_write_that_fails_before_the_rename_leaves_the_config_as_it_was() {
+        let tree = planted_tree("config-write-fails", Some(INIT_CONFIG.as_bytes()), false);
+        let git_folder = tree.join(".git");
+        let folder = OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(&git_folder)
+            .expect("the .git folder opens");
+        let replaced = replace_config(&folder, r"C:\Box\x.git", |lock, text| {
+            lock.write_all(&text.as_bytes()[..10])?;
+            Err(io::Error::other("the disk is full"))
+        });
+
+        drop(folder);
+        assert_eq!(replaced.map_err(|error| error.to_string()), Err("the disk is full".to_owned()));
+        assert_eq!(fs::read(git_folder.join("config")).expect("the config reads"), INIT_CONFIG.as_bytes());
+        assert!(!git_folder.join("config.lock").exists(), "the lock is removed");
+        fs::remove_dir_all(&tree).expect("the tree can be removed");
+    }
+
+    /// A config holding U+FEFF anywhere, which can hide a section header, or whose last line ends with `\`, which would
+    /// carry the next line on, is left to the git steps.
+    #[test]
+    fn a_config_with_a_byte_order_mark_or_a_continued_last_line_is_not_written_once() {
+        let bare = r"C:\Box\x.git";
+        assert!(fresh_config(INIT_CONFIG, bare).is_some(), "git init's own config is written once");
+        assert_eq!(
+            fresh_config(&format!("\u{feff}[remote \"x\"]\n{INIT_CONFIG}"), bare),
+            None,
+            "a hidden header"
+        );
+        assert_eq!(fresh_config(&format!("{INIT_CONFIG}\u{feff}"), bare), None, "U+FEFF at the end");
+        assert_eq!(fresh_config(&format!("{INIT_CONFIG}\tx = y \\\n"), bare), None, "a continued last line");
     }
 
     #[test]

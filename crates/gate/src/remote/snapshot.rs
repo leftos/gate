@@ -30,10 +30,13 @@ const BRIDGE_MESSAGE: &str = "gate-remote bridge";
 pub(super) const REFS: &str = "refs/gate-remote/";
 pub(super) const BACK: &str = "-back";
 
-/// One worktree's snapshot commit and, when there was a previous snapshot, its bridge commit; both full shas.
+/// One worktree's snapshot commit and, when there was a previous snapshot, its bridge commit, both full shas; and the
+/// repository's object store, as the snapshot's `git rev-parse --git-path objects` named it, which the sync-back
+/// fetches beside.
 pub(crate) struct Snapshot {
     pub commit: String,
     pub bridge: Option<String>,
+    pub objects: PathBuf,
 }
 
 /// The snapshot of each of `roots`, in order, under the work-folder `key`, each git call ended after `limit` or by the
@@ -153,6 +156,7 @@ pub(super) fn worktree(root: &Path, limit: Duration, interrupt: Option<Interrupt
         limit,
         interrupt,
     })
+    .map(|(tree, _)| tree)
 }
 
 fn take_one(
@@ -176,13 +180,13 @@ fn take_one(
         &[],
     )?;
     let previous = previous(&listing, key);
-    let tree = worktree_tree(&calls)?;
+    let (tree, objects) = worktree_tree(&calls)?;
     let commit = calls.committed(&["commit-tree", "--no-gpg-sign", &tree, "-m", SNAPSHOT_MESSAGE])?;
     let bridge = match &previous {
         Some(parent) => Some(calls.committed(&["commit-tree", "--no-gpg-sign", &tree, "-p", parent, "-m", BRIDGE_MESSAGE])?),
         None => None,
     };
-    Ok(Snapshot { commit, bridge })
+    Ok(Snapshot { commit, bridge, objects })
 }
 
 /// The snapshot a bridge builds on, from `for-each-ref`'s `<ref> <sha>` lines, newest first: the key's own, else the
@@ -246,26 +250,46 @@ fn first_line(args: &[&str], text: &str) -> Result<String, GitError> {
         .ok_or_else(|| GitError::Failed(format!("git {} printed nothing", args.join(" "))))
 }
 
-/// The tree of the worktree at `root`, written through a copy of its index, which is removed however the write ends.
-fn worktree_tree(calls: &Calls<'_>) -> Result<String, GitError> {
-    let (index, copy) = paths(calls, &copy_name(std::process::id()))?;
-    let tree = write_tree(calls, &index, &copy);
-    let removed = remove_leftovers(&copy);
+/// The tree of the worktree at `root`, written through a copy of its index, which is removed however the write ends,
+/// and the repository's object store.
+fn worktree_tree(calls: &Calls<'_>) -> Result<(String, PathBuf), GitError> {
+    let paths = paths(calls, &copy_name(std::process::id()))?;
+    let tree = write_tree(calls, &paths.index, &paths.copy);
+    let removed = remove_leftovers(&paths.copy);
     let tree = tree?;
-    removed.map(|()| tree)
+    removed.map(|()| (tree, paths.objects))
 }
 
-/// The index and the index copy of the worktree, as one `git rev-parse --git-path` call names them.
-fn paths(calls: &Calls<'_>, name: &str) -> Result<(PathBuf, PathBuf), GitError> {
-    let printed = calls.output(&["rev-parse", "--git-path", "index", "--git-path", name], &[], &[])?;
-    let mut lines = printed.lines();
-    match (lines.next(), lines.next()) {
-        (Some(index), Some(copy)) => Ok((git_path(calls.root, index.trim_end()), git_path(calls.root, copy.trim_end()))),
-        _ => Err(GitError::Failed(format!(
+/// The index, the index copy and the object store of the worktree's repository.
+struct GitPaths {
+    index: PathBuf,
+    copy: PathBuf,
+    objects: PathBuf,
+}
+
+/// The worktree's [`GitPaths`], as one `git rev-parse --git-path` call names them.
+fn paths(calls: &Calls<'_>, name: &str) -> Result<GitPaths, GitError> {
+    let printed = calls.output(
+        &["rev-parse", "--git-path", "index", "--git-path", name, "--git-path", "objects"],
+        &[],
+        &[],
+    )?;
+    let mut lines = printed.lines().map(str::trim_end);
+    let (Some(index), Some(copy)) = (lines.next(), lines.next()) else {
+        return Err(GitError::Failed(format!(
             "git rev-parse --git-path did not print both paths: {}",
             printed.trim()
-        ))),
-    }
+        )));
+    };
+    let objects = lines
+        .next()
+        .filter(|objects| !objects.is_empty())
+        .ok_or_else(|| GitError::Failed("git rev-parse --git-path objects printed nothing".to_owned()))?;
+    Ok(GitPaths {
+        index: git_path(calls.root, index),
+        copy: git_path(calls.root, copy),
+        objects: git_path(calls.root, objects),
+    })
 }
 
 /// `git add -A` and `git write-tree` on `copy`, a fresh copy of `index`; with no index, git starts from an empty one.
@@ -476,6 +500,32 @@ mod tests {
         );
         fs::write(root.join("b.txt"), "c\n").expect("a file can be changed");
         assert_ne!(worktree(&root, GIT_LIMIT, None).expect("the tree is written again"), tree, "read afresh");
+        fs::remove_dir_all(&root).expect("the repository can be removed");
+    }
+
+    /// The snapshot names its repository's object store: the `.git\objects` of a plain repository, and the common
+    /// folder's `objects` for a worktree `git worktree add` made, which the sync-back fetches beside.
+    #[test]
+    fn the_snapshot_names_the_repository_s_object_store() {
+        let root = repository("objects");
+        let store = fs::canonicalize(root.join(".git").join("objects")).expect("the store is there");
+        let objects_of = |folder: &Path| {
+            let made = take(slice::from_ref(&folder.to_path_buf()), OWN, GIT_LIMIT, None).expect("the snapshot is made");
+            fs::canonicalize(&made[0].objects).expect("the named store is there")
+        };
+        assert_eq!(objects_of(&root), store, "a plain repository's own");
+
+        let ask = |args: &[&str]| asked(&root, args).expect("git answers");
+        ask(&["add", "-A"]);
+        ask(&["-c", "user.name=t", "-c", "user.email=t@localhost", "commit", "-q", "-m", "start"]);
+        let linked = root.with_file_name(format!("{}-linked", root.file_name().expect("a name").to_string_lossy()));
+        if linked.exists() {
+            fs::remove_dir_all(&linked).expect("an earlier run's worktree can be removed");
+        }
+        ask(&["worktree", "add", "-q", "--detach", &linked.to_string_lossy()]);
+
+        assert_eq!(objects_of(&linked), store, "a linked worktree's is the common folder's");
+        fs::remove_dir_all(&linked).expect("the worktree can be removed");
         fs::remove_dir_all(&root).expect("the repository can be removed");
     }
 

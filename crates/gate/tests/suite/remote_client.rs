@@ -598,6 +598,59 @@ fn a_routed_run_runs_on_the_box_and_passes_its_output_and_status() {
     assert!(log.contains(&format!("gate: pushed snapshot {} in ", &snapshot[..8])), "{log}");
 }
 
+/// The most git processes the simple pass below starts, on the PC and the box together, children of git counted.
+const SIMPLE_PASS_GIT_STARTS: usize = 30;
+
+/// The `argv` of each git process that wrote a trace into the folder `traces`, the `GIT_TRACE2_EVENT` of the gate that
+/// started them: one `"event":"start"` record a process.
+fn git_starts(traces: &Path) -> Vec<String> {
+    let mut starts = Vec::new();
+    for entry in fs::read_dir(traces).expect("the trace folder can be listed") {
+        let text = fs::read_to_string(entry.expect("a trace file can be named").path()).expect("a trace file can be read");
+        for line in text.lines() {
+            let record: Value = serde_json::from_str(line).expect("a trace record is JSON");
+            if record["event"] == "start" {
+                starts.push(record["argv"].to_string());
+            }
+        }
+    }
+    starts.sort();
+    starts
+}
+
+/// The simple pass of a single repository with no outputs, its git processes counted through `GIT_TRACE2_EVENT`, which
+/// the stand-in passes on to the box's gate and every git it starts: a merged call that comes apart shows here.
+#[test]
+fn a_simple_routed_run_starts_at_most_its_counted_git_processes() {
+    let case = client_case("client-git-starts");
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+    let traces = case.folder().join(".tmp").join("git-trace2");
+    fs::create_dir_all(&traces).expect("the trace folder can be made");
+    let mut gate = client_gate(&case, "out.log", &steps, &[r".\tool.exe", "out", "ran there", "exit", "3"]);
+    gate.env("GIT_TRACE2_EVENT", &traces);
+
+    let outcome = finish(gate);
+
+    assert_eq!(outcome.code, Some(3), "the command's own status: {outcome:?}");
+    let starts = git_starts(&traces);
+    let listed = starts.join("\n");
+    assert!(
+        starts.iter().any(|argv| argv.contains(r#""push","--no-verify""#)),
+        "the PC's push is counted:\n{listed}"
+    );
+    assert!(
+        starts
+            .iter()
+            .any(|argv| argv.contains(r#""init","-q""#) || argv.contains(r#""cat-file","-e""#)),
+        "the box's git is counted:\n{listed}"
+    );
+    assert!(
+        starts.len() <= SIMPLE_PASS_GIT_STARTS,
+        "{} git processes, more than {SIMPLE_PASS_GIT_STARTS}:\n{listed}",
+        starts.len()
+    );
+}
+
 /// The command makes a file the sync-back brings and one the outputs fetch brings, so each transfer is named.
 #[test]
 fn a_routed_pass_splits_its_time() {

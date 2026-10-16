@@ -175,6 +175,11 @@ impl Worktree<'_> {
     fn snapshot(&self) -> &str {
         &self.target.snapshot.commit
     }
+
+    /// The object store of the worktree's repository, as the snapshot named it.
+    fn objects(&self) -> &Path {
+        &self.target.snapshot.objects
+    }
 }
 
 /// Fetches and applies the builder's changes for `targets`, the main repository first, or ends the run as `status`
@@ -209,8 +214,8 @@ fn one(attempt: &mut Attempt<'_, '_>, target: &Target<'_>, status: i64) -> Resul
         git: Git::find(Path::new(target.root)).map_err(End::Failed)?,
         pair: false,
     };
-    let objects = objects_folder(attempt, &worktree)?;
-    for line in swept(&objects, SystemTime::now(), slots::gate_liveness) {
+    let objects = worktree.objects();
+    for line in swept(objects, SystemTime::now(), slots::gate_liveness) {
         attempt.say(line);
     }
     let Some(advertised) = has_back(attempt, &worktree, &remote)? else {
@@ -221,7 +226,7 @@ fn one(attempt: &mut Attempt<'_, '_>, target: &Target<'_>, status: i64) -> Resul
         attempt.say(line);
     })?;
     let name = incoming_name(std::process::id(), own_start(attempt.own_start_fails)?, &payload::job_nonce());
-    let quarantine = Quarantine::made(&objects, &name).map_err(End::Failed)?;
+    let quarantine = Quarantine::made(objects, &name).map_err(End::Failed)?;
     let back = Back {
         commit: &advertised,
         quarantine: &quarantine,
@@ -387,8 +392,8 @@ fn first_phase<'t>(attempt: &mut Attempt<'_, '_>, repo: &Repo<'t, '_>, fetched: 
         git: Git::find(Path::new(target.root)).map_err(End::Failed)?,
         pair: true,
     };
-    let objects = objects_folder(attempt, &worktree)?;
-    for line in swept(&objects, SystemTime::now(), slots::gate_liveness) {
+    let objects = worktree.objects();
+    for line in swept(objects, SystemTime::now(), slots::gate_liveness) {
         attempt.say(line);
     }
     if has_back(attempt, &worktree, &remote)?.as_deref() != Some(repo.commit) {
@@ -396,7 +401,7 @@ fn first_phase<'t>(attempt: &mut Attempt<'_, '_>, repo: &Repo<'t, '_>, fetched: 
         return Ok(false);
     }
     let name = incoming_name(std::process::id(), own_start(attempt.own_start_fails)?, &payload::job_nonce());
-    let quarantine = Quarantine::made(&objects, &format!("{name}-{}", repo.at)).map_err(End::Failed)?;
+    let quarantine = Quarantine::made(objects, &format!("{name}-{}", repo.at)).map_err(End::Failed)?;
     let mut repo = Fetched {
         worktree,
         commit: repo.commit.to_owned(),
@@ -702,23 +707,6 @@ fn fetch(
 /// `status`, but 1 for a passing run: how a run whose changes were not applied ends.
 fn not_passing(status: i64) -> i64 {
     if status == 0 { 1 } else { status }
-}
-
-/// The object store of the worktree's repository, as `git rev-parse --git-path objects` names it, asked with no
-/// interrupt: a Ctrl+C meanwhile is left to the call that follows, which ends as the run's interrupt.
-fn objects_folder(attempt: &Attempt<'_, '_>, worktree: &Worktree<'_>) -> Result<PathBuf, End> {
-    let args = ["rev-parse", "--git-path", "objects"];
-    let printed = worktree
-        .git
-        .output(&git::Call::plain(worktree.root(), &args, attempt.limit))
-        .map_err(escaped_end)?;
-    let folder = printed
-        .lines()
-        .next()
-        .map(str::trim_end)
-        .filter(|folder| !folder.is_empty())
-        .ok_or_else(|| End::Failed(format!("git {} printed nothing", args.join(" "))))?;
-    Ok(worktree.root().join(folder))
 }
 
 /// The real object store `objects` as `GIT_ALTERNATE_OBJECT_DIRECTORIES` names it: as it is, or C-quoted, its `\` and
@@ -2181,6 +2169,7 @@ mod tests {
         let snapshot = Snapshot {
             commit: SNAPSHOT.to_owned(),
             bridge: None,
+            objects: objects.clone(),
         };
         let target = Target::new(routed("app", &root), "app", &snapshot, "app-1a2b3c4d");
         let worktree = Worktree {
@@ -2999,6 +2988,7 @@ mod tests {
         let snapshot = Snapshot {
             commit: snapshot,
             bridge: None,
+            objects,
         };
         (root, snapshot, back.trim_end().to_owned(), quarantine)
     }
@@ -3127,6 +3117,7 @@ mod tests {
         let snapshot = Snapshot {
             commit: SNAPSHOT.to_owned(),
             bridge: None,
+            objects: objects.clone(),
         };
         let target = Target::new(routed("app", &shown), "app", &snapshot, KEY);
         let worktree = Worktree {
@@ -3197,7 +3188,14 @@ mod tests {
                 let commit = asked(&root, &[], &["rev-parse", "HEAD"]).expect("HEAD is read").trim_end().to_owned();
                 let bare = folder.join("builder").join(format!("{repo}.git"));
                 asked(&folder, &[], &["init", "--bare", "--quiet", &bare.to_string_lossy()]).expect("the bare repository is made");
-                (root.to_string_lossy().into_owned(), Snapshot { commit, bridge: None })
+                (
+                    root.to_string_lossy().into_owned(),
+                    Snapshot {
+                        commit,
+                        bridge: None,
+                        objects: root.join(".git/objects"),
+                    },
+                )
             });
             let [(app, app_snapshot), (lib, lib_snapshot)] = made;
             PairCase {
