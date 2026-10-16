@@ -547,7 +547,7 @@ mod tests {
 
     #[test]
     fn only_a_listed_path_still_on_disk_counts() {
-        let root: PathBuf = std::env::temp_dir().join(format!("gate-route-listing-{}", std::process::id()));
+        let root: PathBuf = crate::test_support::temp_dir().join(format!("gate-route-listing-{}", std::process::id()));
         fs::create_dir_all(root.join("sub")).expect("the test folder can be made");
         fs::write(root.join("sub").join("here.txt"), "x").expect("a file can be written");
 
@@ -578,7 +578,7 @@ mod tests {
 
     #[test]
     fn the_siblings_file_is_read_only_as_a_small_regular_file_under_a_real_folder() {
-        let root: PathBuf = std::env::temp_dir().join(format!("gate-route-siblings-{}", std::process::id()));
+        let root: PathBuf = crate::test_support::temp_dir().join(format!("gate-route-siblings-{}", std::process::id()));
         let elsewhere = root.with_extension("elsewhere");
         for folder in [&root, &elsewhere] {
             if folder.exists() {
@@ -625,7 +625,7 @@ mod tests {
 
     #[test]
     fn a_sibling_folder_is_only_a_real_folder_holding_a_real_git() {
-        let parent: PathBuf = std::env::temp_dir().join(format!("gate-route-sibling-folder-{}", std::process::id()));
+        let parent: PathBuf = crate::test_support::temp_dir().join(format!("gate-route-sibling-folder-{}", std::process::id()));
         if parent.exists() {
             fs::remove_dir_all(&parent).expect("a folder left by an earlier run can be removed");
         }

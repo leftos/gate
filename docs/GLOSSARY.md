@@ -65,6 +65,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Folder id**: a folder's volume serial number and 128-bit file id, read from an open handle; two sibling names with one id are one folder, as is a sibling that is the worktree's own folder.
 - **Free share**: the fraction of the cores the command could use that other work left free in a sample, at least 5%; the load-adjusted clock advances by it.
 - **Generation**: the PowerShell gate or `gate.exe`, as `gate-state` tells them apart (`Generation`): ops-tower reads the PowerShell gate's files until the cutover flag exists and then `gate.exe`'s, plus the PowerShell claims of a slot whose mutex is open.
+- **Git home**: the suite's own git config folder, `target\tmp\git-home`, that `HOME` and `XDG_CONFIG_HOME` name for every git a case or harness helper starts, so none reads the developer's global config.
 - **Hang hint**: the line `gate: still running after <n>, <k>x its usual p90 of <p90>`, said once when a run passes 3x its estimate's p90 (never for a p90 under 1 s); it kills nothing.
 - **Hash cache**: the file `remote\<key>.outputs-hashes` in the state root, the outputs manifest line of a worktree's last built manifest, holding only its files last written at least 2 s before that build, and the files a complete outputs install put in place, at the stamp it read after the move and the hash it verified.
 

@@ -2897,7 +2897,7 @@ mod tests {
     /// its `PATH` holds writes no mark.
     #[test]
     fn an_interrupted_sdk_list_read_starts_no_dotnet() {
-        let folder = std::env::temp_dir().join(format!("gate-client-dotnet-{}", std::process::id()));
+        let folder = crate::test_support::temp_dir().join(format!("gate-client-dotnet-{}", std::process::id()));
         fs::create_dir_all(&folder).expect("the stub's folder can be made");
         let marker = folder.join("ran");
         let stub = format!("@echo off\r\n>\"{}\" echo ran\r\necho 9.0.100 [C:\\stub]\r\n", marker.display());
@@ -2933,7 +2933,7 @@ mod tests {
     #[test]
     fn two_readers_past_the_log_cap_say_it_once() {
         const CAP: u64 = 4096;
-        let log = std::env::temp_dir().join(format!("gate-client-log-cap-{}.log", std::process::id()));
+        let log = crate::test_support::temp_dir().join(format!("gate-client-log-cap-{}.log", std::process::id()));
         let file = fs::File::create(&log).expect("the log can be made");
         let shared = Arc::new(Shared::new());
         let reading = Reading {
@@ -3371,7 +3371,7 @@ mod tests {
 
     /// An empty state folder of the test `name`'s own, which a cap hit writes its outputs cap record under.
     fn fresh_state(name: &str) -> PathBuf {
-        let folder = std::env::temp_dir().join(format!("gate-client-state-{name}-{}", std::process::id()));
+        let folder = crate::test_support::temp_dir().join(format!("gate-client-state-{name}-{}", std::process::id()));
         if folder.exists() {
             fs::remove_dir_all(&folder).expect("a state folder left by an earlier run can be removed");
         }
@@ -3500,7 +3500,7 @@ mod tests {
         call.state_dir = &state;
         let transport = nowhere();
         let mut attempt = attempt(&call, &transport);
-        let folder = std::env::temp_dir().join(format!("gate-client-archive-{}", std::process::id()));
+        let folder = crate::test_support::temp_dir().join(format!("gate-client-archive-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&folder);
         std::fs::create_dir_all(&folder).expect("the folder can be made");
         let path = folder.join(".tmp").join("app.tar.zst");
@@ -3540,7 +3540,7 @@ mod tests {
 
     /// A worktree folder of the test `name`'s own, made empty, holding the output `bin/a.txt` when `held`.
     fn outputs_worktree(name: &str, held: bool) -> PathBuf {
-        let folder = std::env::temp_dir().join(format!("gate-client-worktree-{name}-{}", std::process::id()));
+        let folder = crate::test_support::temp_dir().join(format!("gate-client-worktree-{name}-{}", std::process::id()));
         if folder.exists() {
             fs::remove_dir_all(&folder).expect("a worktree left by an earlier run can be removed");
         }
@@ -4041,7 +4041,7 @@ mod tests {
     /// as the run call reads it; with what its readers wrote to the log, which a line it passes on reaches as it reaches
     /// the console.
     fn run_call_said(stdout: &str, stderr: &str, test: &str) -> (Called, String) {
-        let log = std::env::temp_dir().join(format!("gate-client-protocol-{}-{test}.log", std::process::id()));
+        let log = crate::test_support::temp_dir().join(format!("gate-client-protocol-{}-{test}.log", std::process::id()));
         let shared = Shared::new();
         let reading = Reading {
             echo: Echo::LogOnly,
@@ -4186,7 +4186,7 @@ mod tests {
         // 9 reads of 8 KiB end inside the two-byte character, whose second byte comes with the next read.
         let line = format!("{}\u{e9}{}", "x".repeat(9 * 8192 - 1), "y".repeat(10));
         let input = format!("{line}\nnext\n");
-        let log = std::env::temp_dir().join(format!("gate-client-long-line-{}.log", std::process::id()));
+        let log = crate::test_support::temp_dir().join(format!("gate-client-long-line-{}.log", std::process::id()));
 
         let shared = read_through(input.as_bytes(), false, Some(&log));
 
@@ -4202,7 +4202,7 @@ mod tests {
     }
 
     fn unwritten_log() -> std::path::PathBuf {
-        std::env::temp_dir().join("gate-client-tests-no-such-folder").join("out.log")
+        crate::test_support::temp_dir().join("gate-client-tests-no-such-folder").join("out.log")
     }
 
     #[test]
@@ -4258,7 +4258,7 @@ mod tests {
     fn a_sync_back_git_call_dropped_before_the_banner_is_retried_once() {
         // The local transport runs git against a bare repository path, never through the ssh stand-in, so the only way
         // to reach the sync-back's retry is the decision itself, as a call that failed before the banner.
-        let log = std::env::temp_dir().join(format!("gate-client-sync-back-retry-{}.log", std::process::id()));
+        let log = crate::test_support::temp_dir().join(format!("gate-client-sync-back-retry-{}.log", std::process::id()));
         let mut given = call(&log);
         given.interrupt = None;
         let transport = Local::new(r"local:C:\builder", None).expect("a local transport");
@@ -4289,7 +4289,7 @@ mod tests {
     #[test]
     fn a_call_whose_job_wrote_more_than_1_mib_is_not_made_again_after_a_failure_before_the_banner() {
         const MIB: u64 = 1 << 20;
-        let log = std::env::temp_dir().join(format!("gate-client-retry-written-{}.log", std::process::id()));
+        let log = crate::test_support::temp_dir().join(format!("gate-client-retry-written-{}.log", std::process::id()));
         let mut given = call(&log);
         given.interrupt = None;
         let transport = Local::new(r"local:C:\builder", None).expect("a local transport");

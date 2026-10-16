@@ -2112,7 +2112,7 @@ mod tests {
     /// its pack folder and git's fetch itself runs.
     #[test]
     fn a_ctrl_c_during_a_sync_back_call_to_the_builder_is_an_interrupt() {
-        let folder = std::env::temp_dir().join(format!("gate-sync-back-interrupt-{}", std::process::id()));
+        let folder = crate::test_support::temp_dir().join(format!("gate-sync-back-interrupt-{}", std::process::id()));
         std::fs::create_dir_all(&folder).expect("the test's folder can be made");
         let root = folder.to_string_lossy().into_owned();
         let log = folder.join("out.log");
@@ -2183,7 +2183,7 @@ mod tests {
 
     /// A new, empty object store of the test `name`'s own, holding only its `pack` folder.
     fn store(name: &str) -> PathBuf {
-        let objects = std::env::temp_dir().join(format!("gate-quarantine-{name}-{}", std::process::id()));
+        let objects = crate::test_support::temp_dir().join(format!("gate-quarantine-{name}-{}", std::process::id()));
         if objects.exists() {
             std::fs::remove_dir_all(&objects).expect("an earlier run's store is removed");
         }
@@ -2950,7 +2950,7 @@ mod tests {
 
     /// The log of the wiring test `name`, outside its repository, and none there yet.
     fn test_log(name: &str) -> PathBuf {
-        let log = std::env::temp_dir().join(format!("gate-sync-back-{name}-{}.log", std::process::id()));
+        let log = crate::test_support::temp_dir().join(format!("gate-sync-back-{name}-{}.log", std::process::id()));
         if log.exists() {
             std::fs::remove_file(&log).expect("an earlier run's log is removed");
         }
@@ -3077,7 +3077,7 @@ mod tests {
         let client = repository("retry-client");
         let objects = client.join(".git").join("objects");
         let quarantine = Quarantine::made(&objects, &incoming_name(std::process::id(), 1, NONCE)).expect("the quarantine is made");
-        let marker = std::env::temp_dir().join(format!("gate-sync-back-retry-{}", std::process::id()));
+        let marker = crate::test_support::temp_dir().join(format!("gate-sync-back-retry-{}", std::process::id()));
         if marker.exists() {
             std::fs::remove_file(&marker).expect("an earlier run's marker is removed");
         }
@@ -3156,7 +3156,7 @@ mod tests {
 
     impl PairCase {
         fn new(name: &str) -> PairCase {
-            let folder = std::env::temp_dir().join(format!("gate-pair-{name}-{}", std::process::id()));
+            let folder = crate::test_support::temp_dir().join(format!("gate-pair-{name}-{}", std::process::id()));
             if folder.exists() {
                 std::fs::remove_dir_all(&folder).expect("an earlier run's pair is removed");
             }

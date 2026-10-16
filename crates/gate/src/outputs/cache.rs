@@ -156,7 +156,7 @@ mod tests {
 
     /// A scratch folder for one test, emptied first.
     fn scratch(name: &str) -> PathBuf {
-        let folder = std::env::temp_dir().join(format!("gate-outputs-cache-{}-{name}", std::process::id()));
+        let folder = crate::test_support::temp_dir().join(format!("gate-outputs-cache-{}-{name}", std::process::id()));
         // A folder left by an earlier run of the test may not be there.
         let _ = fs::remove_dir_all(&folder);
         fs::create_dir_all(&folder).expect("the scratch folder can be made");

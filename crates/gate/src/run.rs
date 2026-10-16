@@ -3067,7 +3067,7 @@ mod tests {
 
     #[test]
     fn a_log_reached_through_a_junction_into_the_state_root_is_inside_it() {
-        let folder = std::env::temp_dir().join(format!("gate-run-junction-{}", std::process::id()));
+        let folder = crate::test_support::temp_dir().join(format!("gate-run-junction-{}", std::process::id()));
         if folder.exists() {
             fs::remove_dir_all(&folder).expect("a folder left by an earlier run can be removed");
         }

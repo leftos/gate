@@ -116,7 +116,7 @@ mod tests {
 
     #[test]
     fn a_file_that_cannot_be_read_is_named() {
-        let missing = std::env::temp_dir().join(format!("gate-hash-{}-absent", std::process::id()));
+        let missing = crate::test_support::temp_dir().join(format!("gate-hash-{}-absent", std::process::id()));
         let error = file_sha256(&missing).expect_err("a missing file does not hash");
         assert!(error.to_string().starts_with(&missing.display().to_string()), "{error}");
     }

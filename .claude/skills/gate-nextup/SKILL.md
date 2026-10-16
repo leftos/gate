@@ -18,7 +18,6 @@ linear: gate
 - **Focus fence: remote routing for every caller repo.** Until each repo GATE-192 names (delve-the-dungeon, godot-mcp, yaat, yaat-server, opening-hand, in-the-sky, rustling-tulip, towercab-3d) routes, or has its trial failure booked as GATE-192's ruling says, the queue holds only the items on that path, as a release fence does: the Urgent issues (each repo's next step) and the High ones (the tier after).
 
   Everything else waits, however high it sits in the project order; a finding off the path gets an **add**, not a fix. The path is kept in Linear's priorities: a step that lands moves the next one up.
-- **Suite fence (owner ruling on GATE-242):** optimizing the full suite's wall time comes first and lands before anything else. Until GATE-242 has landed, no other item lands on main or a feature branch; work already in flight may finish its runs and reviews and waits to land. Remove this bullet in GATE-242's landing commit.
 - The port is the owner's top priority. claude-config's CC-212 is its umbrella; the PowerShell gate in `~/.claude/tools/gate/` is frozen to bug fixes, which stay claude-config's.
 - A steer or a finding the item does not fix gets an **add**, in the project whose files it shares, else in `Backlog`. A change another repo needs (claude-config's launcher, docs or skills; ops-tower's use of `gate-state`) goes as a repo inbox request.
 - Tracker: **triage** as plan-operations says.
@@ -77,6 +76,10 @@ That case proves "not stalled" inside a short window, with an escapee that runs 
 To check a timing case holds under load, run it inside `~/.claude/tools/load-burn/load-burn.ps1`, which burns every core only while it holds the machine on a critical slot. A burn takes the owner's whole PC: one burn is at most 120 s (`-TimeoutSeconds 120`), one investigation spends at most about 5 minutes of burn time in all, and a brief that allows load-burn states that budget. Anything longer is asked of the owner first.
 
 load-burn does not starve a BelowNormal process: its critical gate runs the command at High, and Windows hands a child only Idle or BelowNormal, so a test under the burn runs at Normal beside the burners. A fault that shows only in the BelowNormal full suite is reproduced by suspending just the gate under test for seconds at a time (`NtSuspendProcess` / `NtResumeProcess` on the gate.exe the suite started), which costs no burn budget; GATE-128 was found that way.
+
+A measurement that needs a quiet machine (a timing comparison, a phase profile, a before-and-after) runs on `-Slot critical`, never by waiting for other sessions' load to drop. The critical gate drains every gate first, which can take tens of minutes behind a long heavy run, then holds the machine. Keep critical runs short and few, about 5 minutes of hold for one investigation, and ask the owner before going past that.
+
+To time the suite, add `--profile timing` to the nextest command. Its junit report, with every case's seconds, lands in `target\nextest\timing\junit.xml`. To count the git processes a case starts, set `GIT_TRACE2_EVENT=<a folder under target\tmp>` on the run. It costs almost nothing, where a WMI process tracer slows a case four times over.
 
 A commit goes through the gate: `-Slot heavy -TimeoutSeconds 300 -- git commit -F .tmp/msg-<slug>.txt`.
 

@@ -1,0 +1,4 @@
+# The default profile is nextest's own. `--profile timing` adds a junit report of every case's time, written to
+# target\nextest\timing\junit.xml.
+[profile.timing.junit]
+path = "junit.xml"

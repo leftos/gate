@@ -372,7 +372,7 @@ mod tests {
 
     /// A fresh folder for one test, under the system's temporary folder.
     fn folder(name: &str) -> PathBuf {
-        let folder = std::env::temp_dir().join(format!("gate-log-{name}-{}", std::process::id()));
+        let folder = crate::test_support::temp_dir().join(format!("gate-log-{name}-{}", std::process::id()));
         if folder.exists() {
             fs::remove_dir_all(&folder).expect("a folder left by an earlier run can be removed");
         }

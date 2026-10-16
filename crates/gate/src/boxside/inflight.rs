@@ -116,7 +116,7 @@ mod tests {
 
     /// A scratch folder for one test, emptied first.
     fn scratch(name: &str) -> PathBuf {
-        let folder = std::env::temp_dir().join(format!("gate-inflight-{name}-{}", std::process::id()));
+        let folder = crate::test_support::temp_dir().join(format!("gate-inflight-{name}-{}", std::process::id()));
         if folder.exists() {
             fs::remove_dir_all(&folder).expect("an earlier scratch folder can be removed");
         }

@@ -1007,10 +1007,10 @@ mod tests {
         wait_until_gone(pid, started);
     }
 
-    /// A folder of its own in the temporary folder for the case `name` of this process, holding a `dotnet.cmd` that runs
-    /// `body` after `@echo off`, and the `PATH` that names it alone.
+    /// A folder of its own in the unit tests' temp folder for the case `name` of this process, holding a `dotnet.cmd`
+    /// that runs `body` after `@echo off`, and the `PATH` that names it alone.
     fn dotnet_folder(name: &str, body: &str) -> (PathBuf, Variables) {
-        let folder = std::env::temp_dir().join(format!("gate-sdk-{name}-{}", std::process::id()));
+        let folder = crate::test_support::temp_dir().join(format!("gate-sdk-{name}-{}", std::process::id()));
         drop(fs::remove_dir_all(&folder));
         fs::create_dir_all(&folder).expect("the stub's folder can be made");
         fs::write(folder.join("dotnet.cmd"), format!("@echo off\r\n{body}")).expect("the stub dotnet can be written");
@@ -1144,7 +1144,7 @@ mod tests {
 
     #[test]
     fn a_batch_file_git_says_why_it_cannot_run() {
-        let program = std::env::temp_dir().join("gate-git-batch").join("git.cmd");
+        let program = crate::test_support::temp_dir().join("gate-git-batch").join("git.cmd");
         let git = Git { program: program.clone() };
         let here = Path::new(env!("CARGO_MANIFEST_DIR"));
         let Err(GitError::Failed(line)) = git.run(&Call::plain(here, &["version"], GIT_LIMIT)) else {
@@ -1423,7 +1423,7 @@ mod tests {
     /// What Windows PowerShell says its command line is when it is run as `tool`, found along a `PATH` holding only a
     /// link named `link` that leads to it, in a folder of its own named after `tag`.
     fn command_line_through_link(link: &str, tag: &str) -> String {
-        let folder = std::env::temp_dir().join(format!("gate-link-{tag}-{}", std::process::id()));
+        let folder = crate::test_support::temp_dir().join(format!("gate-link-{tag}-{}", std::process::id()));
         drop(fs::remove_dir_all(&folder));
         fs::create_dir_all(&folder).expect("the link's folder can be made");
         let _removed = Removed(folder.clone());

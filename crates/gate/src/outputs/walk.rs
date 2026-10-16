@@ -226,7 +226,7 @@ pub(crate) mod tests {
     /// A scratch folder for one test, emptied first, holding a file at each `/`-separated path of `files`, its text
     /// the path; the output modules' own tests share it.
     pub(crate) fn tree(test: &str, files: &[&str]) -> PathBuf {
-        let root = std::env::temp_dir().join(format!("gate-walk-{}-{test}", std::process::id()));
+        let root = crate::test_support::temp_dir().join(format!("gate-walk-{}-{test}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         for file in files {
             let full = root.join(file);

@@ -549,7 +549,7 @@ mod tests {
     #[expect(clippy::expect_used, reason = "a test whose git cannot start must fail loudly")]
     fn git_writes_its_stderr_through_the_output_lock() {
         let output = OutputLock::default();
-        let missing = std::env::temp_dir().join(format!("gate-preflight-no-such-repository-{}", std::process::id()));
+        let missing = crate::test_support::temp_dir().join(format!("gate-preflight-no-such-repository-{}", std::process::id()));
         let git_dir = format!("--git-dir={}", missing.display());
         let command = Git::find()
             .command(&[&git_dir, "rev-parse", "HEAD"])

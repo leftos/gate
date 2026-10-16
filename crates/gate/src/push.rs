@@ -933,7 +933,7 @@ mod tests {
 
     /// A folder of its own for `test`, empty.
     fn scratch(test: &str) -> PathBuf {
-        let folder = std::env::temp_dir().join(format!("gate-push-{}-{test}", std::process::id()));
+        let folder = crate::test_support::temp_dir().join(format!("gate-push-{}-{test}", std::process::id()));
         // A folder left by an earlier run of the same pid is cleared first.
         let _ = fs::remove_dir_all(&folder);
         fs::create_dir_all(&folder).expect("the scratch folder is made");

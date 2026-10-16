@@ -306,7 +306,7 @@ mod tests {
 
     impl Scratch {
         fn new(test: &str) -> Scratch {
-            let folder = std::env::temp_dir().join(format!("gate-tools-{}-{test}", std::process::id()));
+            let folder = crate::test_support::temp_dir().join(format!("gate-tools-{}-{test}", std::process::id()));
             let _ = fs::remove_dir_all(&folder);
             fs::create_dir_all(&folder).expect("the scratch folder can be made");
             Scratch(folder)

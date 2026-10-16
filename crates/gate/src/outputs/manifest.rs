@@ -418,7 +418,7 @@ mod tests {
 
     #[test]
     fn a_manifest_built_from_a_walk_holds_each_files_stamp_and_hash() {
-        let root = std::env::temp_dir().join(format!("gate-manifest-{}-build", std::process::id()));
+        let root = crate::test_support::temp_dir().join(format!("gate-manifest-{}-build", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(root.join("bin")).expect("the folder can be made");
         fs::write(root.join("bin").join("ü.dll"), "abc").expect("the file can be written");

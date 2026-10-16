@@ -306,7 +306,7 @@ mod tests {
 
     impl Pair {
         fn new(test: &str, names: &[&str]) -> Pair {
-            let top = std::env::temp_dir().join(format!("gate-held-{test}-{}", std::process::id()));
+            let top = crate::test_support::temp_dir().join(format!("gate-held-{test}-{}", std::process::id()));
             if top.exists() {
                 fs::remove_dir_all(&top).expect("an earlier run's folder is removed");
             }

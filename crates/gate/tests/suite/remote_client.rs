@@ -82,6 +82,7 @@ fn git_out(case: &Case, env: &[(&str, &Path)], args: &[&str]) -> String {
     for name in GIT_REDIRECTS {
         command.env_remove(name);
     }
+    crate::support::git_home_for(&mut command);
     for (name, value) in env {
         command.env(name, value);
     }

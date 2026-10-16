@@ -220,11 +220,11 @@ fn asked(root: &Path, args: &[&str]) -> Result<String, GitError> {
     git.output(&git::Call::plain(root, args, git::GIT_LIMIT))
 }
 
-/// A new git repository in the temporary folder for the test `name`, holding `a.txt`.
+/// A new git repository in the unit tests' temp folder for the test `name`, holding `a.txt`.
 #[cfg(test)]
 #[expect(clippy::expect_used, reason = "a test that cannot make its repository must fail loudly")]
 pub(super) fn repository(name: &str) -> PathBuf {
-    let root = std::env::temp_dir().join(format!("gate-snapshot-{name}-{}", std::process::id()));
+    let root = crate::test_support::temp_dir().join(format!("gate-snapshot-{name}-{}", std::process::id()));
     if root.exists() {
         fs::remove_dir_all(&root).expect("a repository left by an earlier run can be removed");
     }

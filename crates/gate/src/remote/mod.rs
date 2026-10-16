@@ -427,7 +427,7 @@ mod snapshot_only {
         fn an_interrupted_snapshot_ends_the_run_as_an_interrupt() {
             let interrupt = Interrupt::install().expect("the console handler is installed");
             interrupt.raise();
-            let log = std::env::temp_dir().join(format!("gate-snapshot-interrupt-{}.log", std::process::id()));
+            let log = crate::test_support::temp_dir().join(format!("gate-snapshot-interrupt-{}.log", std::process::id()));
 
             let outcome = SnapshotOnly { limit: GIT_LIMIT }.run(&call(r"C:\no-such-worktree", &log, Some(interrupt)));
 

@@ -93,7 +93,7 @@ mod tests {
 
     #[test]
     fn unreadable_local_app_data_fails_only_without_a_given_root() {
-        let given = std::env::temp_dir().join("gate-resolve-test");
+        let given = crate::test_support::temp_dir().join("gate-resolve-test");
         let no_root = Environment {
             state_dir: None,
             local_app_data: Some(unreadable()),
