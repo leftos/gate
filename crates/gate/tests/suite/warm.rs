@@ -1,8 +1,12 @@
 //! `gate warm` through the scripted remote client (`--test-remote-client`): where a warm-up is worded and sent from,
 //! what keeps one from starting and what it says then, foreground and `--background`, and the warm-up record each way
-//! the client says a warm-up ended leaves.
+//! the client says a warm-up ended leaves; and through the real client over the suite's `local:` transport and its
+//! stand-in for ssh, where the warm-up leaves its record, its log and the builder's `{Work}.warm`, how the box's end
+//! is classed, and what it brings back, which is nothing.
 
+use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
+use std::hash::{DefaultHasher, Hasher};
 use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -11,8 +15,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use gate_router::warm::warmup_hash;
 use serde_json::{Value, json};
 
+use crate::remote_client::{client_case, client_gate};
 use crate::routing::{CONTROL_C_EXIT, HOST, repo, routed_case};
-use crate::support::{Case, Outcome, build_version, finish, git, junction, shown, start, wait_until, write_remote_json};
+use crate::support::{
+    Case, FAKE_SSH, GATE, GATE_VARIABLE, Go, Outcome, Running, STEPS_VARIABLE, build_version, calls, finish, git, junction, nothing_back, shown,
+    ssh_steps, start, wait_until, write_remote_json,
+};
 
 /// The routing git limit and drain no machine reaches, so a starved gate still finds its worktree.
 const GIT_HANG_GUARDS: [&str; 4] = ["--test-git-limit-ms", "3600000", "--test-git-drain-ms", "600000"];
@@ -598,4 +606,469 @@ fn a_stale_warming_record_with_a_free_lock_is_overwritten() {
     let record = record(&case).expect("a record");
     assert_eq!(record["state"], "warm", "{record}");
     assert_ne!(record["pid"], 1, "the record is this warm-up's: {record}");
+}
+
+// `gate warm` through the real client over the suite's `local:` transport and its `fake-ssh` stand-in, whose builder
+// is `gate box` run here in the case folder: where the warm-up leaves its record, its log and the builder's
+// `{Work}.warm`, what keeps one from starting, how the box's end is classed, and what a warm-up brings back, which
+// is nothing.
+
+/// A real-client case: a checkout of its own holding fake-tool as `tool.exe`, a `builder` folder for the `local:`
+/// transport, an `ssh` folder for the stand-in, a `.gitignore` that leaves the gate's own folders out of the
+/// snapshot, its repo consented in the routing file and [`ONE_COMMAND`] as its `.gate/warmup.toml`.
+fn warm_client_case(name: &str) -> Case {
+    let case = client_case(name);
+    routing_with(&case, &json!([repo(&case)]));
+    warmup_file(&case, ONE_COMMAND.as_bytes());
+    case
+}
+
+/// `gate warm --state-dir <state>` in `worktree`'s folder through the real client: the builder root `builder` in
+/// `worktree`'s folder, each ssh call made through the stand-in of the steps file `steps`, the retry pause 1 ms, the
+/// git guards, and `extra` after them.
+fn warm_client_at(worktree: &Case, state: &Path, steps: &Path, extra: &[&str]) -> Command {
+    let root = shown(state);
+    let transport = format!("local:{}", shown(&worktree.folder().join("builder")));
+    let mut args = vec![
+        "warm",
+        "--state-dir",
+        root.as_str(),
+        "--test-remote-transport",
+        transport.as_str(),
+        "--test-remote-ssh",
+        FAKE_SSH,
+        "--test-remote-retry-pause-ms",
+        "1",
+    ];
+    args.extend(GIT_HANG_GUARDS);
+    args.extend(extra);
+    let mut command = worktree.gate(&args);
+    command.env(STEPS_VARIABLE, steps).env(GATE_VARIABLE, GATE);
+    command
+}
+
+/// [`warm_client_at`] with the case's own state root.
+fn warm_client(case: &Case, steps: &Path, extra: &[&str]) -> Command {
+    warm_client_at(case, &case.root(), steps, extra)
+}
+
+/// Whether the lock file at `path` can be opened sharing nothing, as a warm-up's own open of it does: no warm-up
+/// holds it.
+fn free(path: &Path) -> bool {
+    OpenOptions::new().read(true).write(true).share_mode(0).open(path).is_ok()
+}
+
+/// A path no write of the case makes, for a step that must never be released.
+fn never(case: &Case) -> String {
+    shown(&case.folder().join("ssh").join("never"))
+}
+
+/// The hash the builder's `{Work}.warm` of the case's one work folder holds; `None` when the builder holds none.
+fn box_warm(case: &Case) -> Option<String> {
+    let entries = fs::read_dir(case.folder().join("builder").join("work")).ok()?;
+    let warm: Vec<PathBuf> = entries
+        .map(|entry| entry.expect("a builder work entry can be read").path())
+        .filter(|path| path.extension().is_some_and(|kind| kind == "warm"))
+        .collect();
+    assert!(warm.len() <= 1, "one work folder at most: {warm:?}");
+    warm.first()
+        .map(|path| fs::read_to_string(path).expect("the builder's warm record can be read"))
+}
+
+/// Every warm-up record of the state root `case`, in entry order: a second worktree sharing the root writes its own.
+fn records(case: &Case) -> Vec<Value> {
+    let folder = warm_folder(case);
+    let entries = match fs::read_dir(&folder) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        listed => listed.expect("the warm-up folder can be listed"),
+    };
+    entries
+        .map(|entry| entry.expect("a warm entry can be read").path())
+        .filter(|path| path.extension().is_some_and(|kind| kind == "json"))
+        .map(|path| serde_json::from_str(&fs::read_to_string(path).expect("the record can be read")).expect("the record is JSON"))
+        .collect()
+}
+
+/// The entries of the state root's `remote` folder named like `suffix`.
+fn remote_entries(case: &Case, suffix: &str) -> Vec<String> {
+    let entries = match fs::read_dir(case.root().join("remote")) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        listed => listed.expect("the remote folder can be listed"),
+    };
+    entries
+        .map(|entry| entry.expect("a remote entry can be read").file_name().to_string_lossy().into_owned())
+        .filter(|name| name.ends_with(suffix))
+        .collect()
+}
+
+/// The case's worktree files, each with its length and a hash of its bytes: everything under the case folder but the
+/// gate's own folders — the builder, the stand-in's `ssh` folder, the state root and LOCALAPPDATA — and the logs.
+fn worktree(case: &Case) -> BTreeMap<PathBuf, (u64, u64)> {
+    let mut files = BTreeMap::new();
+    walk(&case.folder(), true, &mut files);
+    files
+}
+
+/// [`worktree`]'s walk of `folder`, leaving the gate's own top-level folders out when `top`.
+fn walk(folder: &Path, top: bool, files: &mut BTreeMap<PathBuf, (u64, u64)>) {
+    for entry in fs::read_dir(folder).expect("a worktree folder can be listed") {
+        let path = entry.expect("a worktree entry can be read").path();
+        let name = path.file_name().expect("an entry has a name").to_string_lossy().into_owned();
+        let the_gates = path.extension().is_some_and(|kind| kind == "log");
+        if the_gates || (top && ["builder", "appdata", "state", "ssh", ".git"].contains(&name.as_str())) {
+            continue;
+        }
+        if path.is_dir() {
+            walk(&path, false, files);
+        } else {
+            let bytes = fs::read(&path).expect("a listed file can be read");
+            let mut hasher = DefaultHasher::new();
+            hasher.write(&bytes);
+            files.insert(path, (bytes.len() as u64, hasher.finish()));
+        }
+    }
+}
+
+/// The case's routed run, held at its run call: its steps file `name`, its log `log`, and `command` on the builder.
+/// The run call is held until the returned go file is written, and the work folder's key with it.
+fn held_run(case: &Case, name: &str, log: &str, command: &[&str]) -> (Running, Go) {
+    let go = Go(case.folder().join("ssh").join(format!("{name}-go")));
+    let steps = ssh_steps(case, name, &["ok", &format!("hold {}", shown(go.path()))]);
+    let run = start(client_gate(case, log, &steps, command));
+    run.wait_until("the routed run's run call", || calls(&steps).len() == 2);
+    (run, go)
+}
+
+/// Starts the warm-up of `case` while `run` holds the work folder's key, runs `meanwhile` once the warm-up has taken
+/// its own lock and written its record (so it waits on the key), lets the run go, and returns the warm-up's steps
+/// file and outcome.
+fn while_the_key_is_held(case: &Case, run: (Running, Go), background: bool, meanwhile: impl FnOnce(&Case)) -> (PathBuf, Outcome) {
+    let (held, go) = run;
+    let steps = ssh_steps(case, "warm-key-wait", &["ok", "ok"]);
+    let mut extra = vec!["--test-warm-wait-ms", "3600000"];
+    if background {
+        extra.push("--background");
+    }
+    let warm = start(warm_client(case, &steps, &extra));
+    warm.wait_until("the warm-up's lock and record", || {
+        warm_entry(case, "lock").is_some_and(|lock| record(case).is_some() && !free(&lock))
+    });
+    meanwhile(case);
+    fs::write(go.path(), "").expect("the go file can be made");
+    let outcome = warm.finish();
+    let _ = held.finish();
+    (steps, outcome)
+}
+
+#[test]
+fn a_real_client_warm_up_writes_the_record_the_log_and_the_builder_s_record() {
+    let case = warm_client_case("warm-real");
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+
+    let outcome = finish(warm_client(&case, &steps, &[]));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "run"], "no outputs and no fetch call: {outcome:?}");
+    let hash = warmup_hash(ONE_COMMAND.as_bytes());
+    let record = record(&case).expect("a record");
+    assert_eq!((&record["state"], &record["host"]), (&json!("warm"), &json!(HOST)), "{record}");
+    assert_eq!(record["hash"], hash, "{record}");
+    assert_eq!(record["gate"], build_version(&case), "{record}");
+    assert!(record["pid"].as_u64().is_some_and(|pid| pid > 0), "{record}");
+    assert_eq!(box_warm(&case).as_deref(), Some(hash.as_str()), "the builder holds the hash");
+    let log = fs::read_to_string(warm_entry(&case, "log").expect("the warm-up wrote its log")).expect("the log can be read");
+    assert!(
+        log.lines().any(|line| line == format!("gate: remote warm {hash}")),
+        "the warm log holds the box's line: {log}"
+    );
+    let lock = warm_entry(&case, "lock").expect("the warm-up made its lock");
+    assert!(free(&lock), "the per-key lock is free afterwards");
+}
+
+#[test]
+fn a_real_client_warm_up_withdrawn_when_consent_goes_is_deleted() {
+    for background in [false, true] {
+        let case = warm_client_case(if background { "warm-real-consent-bg" } else { "warm-real-consent" });
+        let held = held_run(&case, "run", "run.log", &[r".\tool.exe", "out", "ran there"]);
+
+        let (steps, outcome) = while_the_key_is_held(&case, held, background, |case| routing_with(case, &json!(null)));
+
+        let line = format!("gate: warm: {} has not consented to warm-ups in remote.json\n", repo(&case));
+        let expected = if background { (Some(0), String::new()) } else { (Some(2), line) };
+        assert_eq!((outcome.code, outcome.stderr.clone()), expected, "{outcome:?}");
+        assert_eq!(record(&case), None, "the record is deleted");
+        assert!(calls(&steps).is_empty(), "nothing is sent: {outcome:?}");
+    }
+}
+
+#[test]
+fn a_real_client_warm_up_withdrawn_when_the_host_changes_is_deleted() {
+    for background in [false, true] {
+        let case = warm_client_case(if background { "warm-real-host-bg" } else { "warm-real-host" });
+        let held = held_run(&case, "run", "run.log", &[r".\tool.exe", "out", "ran there"]);
+
+        let (steps, outcome) = while_the_key_is_held(&case, held, background, |case| {
+            let routing = json!({ "host": "other-builder", "repos": { repo(case): ["*tool*"] }, "warmup": [repo(case)] });
+            write_remote_json(case, &routing.to_string());
+        });
+
+        let line = "gate: warm: remote.json's builder changed from builder to other-builder\n";
+        let expected = if background {
+            (Some(0), String::new())
+        } else {
+            (Some(2), line.to_owned())
+        };
+        assert_eq!((outcome.code, outcome.stderr.clone()), expected, "{outcome:?}");
+        assert_eq!(record(&case), None, "the record is deleted");
+        assert!(calls(&steps).is_empty(), "nothing is sent: {outcome:?}");
+    }
+}
+
+#[test]
+fn a_real_client_warm_up_sends_the_file_read_late() {
+    let case = warm_client_case("warm-real-late-read");
+    let early = warmup_hash(ONE_COMMAND.as_bytes());
+    let changed = "commands = [[\"tool.exe\", \"out\", \"late\"]]\n";
+    let late = warmup_hash(changed.as_bytes());
+    assert_ne!(early, late, "the file really changed");
+    let held = held_run(&case, "run", "run.log", &[r".\tool.exe", "out", "ran there"]);
+
+    let (steps, outcome) = while_the_key_is_held(&case, held, false, |case| warmup_file(case, changed.as_bytes()));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "run"], "{outcome:?}");
+    let record = record(&case).expect("a record");
+    assert_eq!(
+        (&record["state"], &record["hash"]),
+        (&json!("warm"), &json!(late)),
+        "the late hash: {record}"
+    );
+    assert_eq!(box_warm(&case).as_deref(), Some(late.as_str()), "the builder confirmed the hash sent");
+}
+
+#[test]
+fn a_real_client_warm_up_whose_command_fails_is_recorded_commands() {
+    let case = warm_client_case("warm-real-command-fails");
+    warmup_file(&case, b"commands = [[\"tool.exe\", \"exit\", \"3\"]]\n");
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+
+    let outcome = finish(warm_client(&case, &steps, &[]));
+
+    assert_failed(&outcome, record(&case).as_ref(), "commands", "command stopped with status 3");
+    assert!(
+        outcome
+            .stderr
+            .lines()
+            .any(|line| line == "gate: remote warm-up stopped at command 1 of 1"),
+        "the box's line: {outcome:?}"
+    );
+    assert_eq!(box_warm(&case), None, "a failed warm-up leaves no record on the builder");
+}
+
+#[test]
+fn a_real_client_warm_up_refused_before_the_marker_is_recorded_refused() {
+    let case = warm_client_case("warm-real-version");
+    let steps = ssh_steps(&case, "ssh", &["version 0.0.0-old"]);
+
+    let outcome = finish(warm_client(&case, &steps, &[]));
+
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    let record = record(&case).expect("a record");
+    assert_eq!((&record["state"], &record["failure"]), (&json!("failed"), &json!("refused")), "{record}");
+    assert_eq!(calls(&steps), ["preflight"], "the run call is never made: {outcome:?}");
+}
+
+#[test]
+fn a_real_client_warm_up_whose_connection_drops_after_the_marker_is_recorded_commands() {
+    let case = warm_client_case("warm-real-drop");
+    // The drop leaves the client to stop the command and to ask the builder's boot time: a step for each call.
+    let steps = ssh_steps(&case, "ssh", &["ok", "truncate 0", "ok", "ok"]);
+
+    let outcome = finish(warm_client(&case, &steps, &[]));
+
+    assert_failed(&outcome, record(&case).as_ref(), "commands", "the connection to the builder was lost");
+    assert_eq!(calls(&steps), ["preflight", "run", "stop", "boot"], "{outcome:?}");
+}
+
+#[test]
+fn a_real_client_warm_up_that_drops_before_the_marker_is_recorded_refused() {
+    let case = warm_client_case("warm-real-drop-early");
+    let steps = ssh_steps(&case, "ssh", &["ok", "out-then-drop", "ok", "ok"]);
+
+    let outcome = finish(warm_client(&case, &steps, &[]));
+
+    assert_failed(&outcome, record(&case).as_ref(), "refused", "the connection to the builder was lost");
+}
+
+#[test]
+fn a_real_client_warm_up_whose_key_is_held_past_the_wait_is_refused() {
+    let case = warm_client_case("warm-real-key-past");
+    let (held, go) = held_run(&case, "run", "run.log", &[r".\tool.exe", "out", "ran there"]);
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+
+    let outcome = finish(warm_client(&case, &steps, &["--test-warm-wait-ms", "300"]));
+    fs::write(go.path(), "").expect("the go file can be made");
+    let _ = held.finish();
+
+    assert_failed(
+        &outcome,
+        record(&case).as_ref(),
+        "refused",
+        "another routed run held the work folder past the wait",
+    );
+    assert!(calls(&steps).is_empty(), "the warm-up sends nothing: {outcome:?}");
+    let lock = warm_entry(&case, "lock").expect("the warm-up made its lock");
+    assert!(free(&lock), "the per-key lock is released");
+}
+
+#[test]
+fn a_real_client_warm_up_whose_lock_another_warm_up_holds_leaves_the_record_alone() {
+    let case = warm_client_case("warm-real-second-holder");
+    let (held, go) = held_run(&case, "run", "run.log", &[r".\tool.exe", "out", "ran there"]);
+    let first_steps = ssh_steps(&case, "first", &["ok", "ok"]);
+    let first = start(warm_client(&case, &first_steps, &["--test-warm-wait-ms", "3600000"]));
+    first.wait_until("the first warm-up's lock and record", || {
+        warm_entry(&case, "lock").is_some_and(|lock| record(&case).is_some() && !free(&lock))
+    });
+    let record_path = warm_entry(&case, "json").expect("the first warm-up wrote its record");
+    let before = fs::read(&record_path).expect("the record can be read");
+    let second_steps = ssh_steps(&case, "second", &["ok", "ok"]);
+
+    let second = finish(warm_client(&case, &second_steps, &[]));
+
+    assert_eq!(second.code, Some(1), "{second:?}");
+    assert_eq!(second.stderr.trim_end(), "gate: a warm-up of builder is already running", "{second:?}");
+    assert_eq!(fs::read(&record_path).expect("the record can be read"), before, "the record is untouched");
+    assert!(calls(&second_steps).is_empty(), "the second warm-up sends nothing");
+    fs::write(go.path(), "").expect("the go file can be made");
+    let first = first.finish();
+    assert_eq!(first.code, Some(0), "the first warm-up passes: {first:?}");
+    let _ = held.finish();
+}
+
+#[test]
+fn a_real_client_warm_up_waits_for_the_cap_of_another_worktree() {
+    let first_case = warm_client_case("warm-real-cap-a");
+    let second_case = warm_client_case("warm-real-cap-b");
+    let go = Go(first_case.folder().join("ssh").join("go"));
+    let first_steps = ssh_steps(&first_case, "ssh", &["ok", &format!("hold {}", shown(go.path())), "ok"]);
+    let first = start(warm_client(&first_case, &first_steps, &["--test-warm-wait-ms", "3600000"]));
+    first.wait_until("the first warm-up's run call", || calls(&first_steps).len() == 2);
+    let second_steps = ssh_steps(&second_case, "ssh", &["ok", "ok"]);
+    let second = start(warm_client_at(
+        &second_case,
+        &first_case.root(),
+        &second_steps,
+        &["--test-warm-wait-ms", "3600000"],
+    ));
+    second.wait_until("the second warm-up's record", || records(&first_case).len() == 2);
+
+    fs::write(go.path(), "").expect("the go file can be made");
+    let first = first.finish();
+    let second = second.finish();
+
+    assert_eq!(first.code, Some(0), "{first:?}");
+    assert_eq!(second.code, Some(0), "the second waited for the cap: {second:?}");
+    assert_eq!(calls(&second_steps), ["preflight", "run"], "{second:?}");
+    let hash = warmup_hash(ONE_COMMAND.as_bytes());
+    let ended = records(&first_case);
+    assert_eq!(ended.len(), 2, "one record each: {ended:?}");
+    assert!(
+        ended.iter().all(|record| record["state"] == "warm" && record["hash"] == hash),
+        "{ended:?}"
+    );
+    assert_eq!(box_warm(&first_case).as_deref(), Some(hash.as_str()));
+    assert_eq!(box_warm(&second_case).as_deref(), Some(hash.as_str()));
+    assert!(free(&first_case.root().join("remote").join("warm.lock")), "the cap is released");
+}
+
+#[test]
+fn a_real_client_warm_up_interrupted_at_its_run_call_is_deleted() {
+    let case = warm_client_case("warm-real-ctrl-c");
+    let steps = ssh_steps(&case, "ssh", &["ok", &format!("say-hold started {}", never(&case)), "ok"]);
+
+    let outcome = finish(warm_client(&case, &steps, &["--test-remote-interrupt-at", "run"]));
+
+    assert_eq!(outcome.code, Some(CONTROL_C_EXIT), "{outcome:?}");
+    assert_eq!(record(&case), None, "Ctrl+C deletes the record");
+    let next = ssh_steps(&case, "next", &["ok", "ok"]);
+    let again = finish(warm_client(&case, &next, &[]));
+    assert_eq!(again.code, Some(0), "a following warm-up takes the locks: {again:?}");
+}
+
+#[test]
+fn a_real_client_warm_up_brings_nothing_back() {
+    let case = warm_client_case("warm-real-nothing-back");
+    let before = worktree(&case);
+    let status = git(&case, &["--no-optional-locks", "status", "--porcelain=v2", "--untracked-files=all"]);
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+
+    let outcome = finish(warm_client(&case, &steps, &[]));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(worktree(&case), before, "the PC worktree is unchanged");
+    assert_eq!(
+        git(&case, &["--no-optional-locks", "status", "--porcelain=v2", "--untracked-files=all"]),
+        status,
+        "git's status is unchanged"
+    );
+    assert!(nothing_back(&case).is_none(), "no nothing-back record");
+    assert_eq!(
+        remote_entries(&case, ".outputs-pending"),
+        Vec::<String>::new(),
+        "no outputs-pending marker"
+    );
+    let bare = shown(&case.folder().join("builder").join(format!("{}.git", repo(&case))));
+    let back = git(&case, &["--git-dir", &bare, "for-each-ref", "--format=%(refname)", "refs/gate-back/"]);
+    assert_eq!(back, "", "the box wrote no back commit");
+}
+
+#[test]
+fn a_real_client_warm_up_of_a_warm_folder_runs_again() {
+    let case = warm_client_case("warm-real-twice");
+    let first = finish(warm_client(&case, &ssh_steps(&case, "first", &["ok", "ok"]), &[]));
+    assert_eq!(first.code, Some(0), "{first:?}");
+    let second_steps = ssh_steps(&case, "second", &["ok", "ok"]);
+
+    let second = finish(warm_client(&case, &second_steps, &[]));
+
+    assert_eq!(second.code, Some(0), "{second:?}");
+    assert_eq!(calls(&second_steps), ["preflight", "run"], "a warm folder warms again: {second:?}");
+    assert_eq!(record(&case).expect("a record")["state"], "warm");
+}
+
+#[test]
+fn a_real_client_warm_up_a_box_refuses_is_recorded_refused() {
+    let case = warm_client_case("warm-real-payload-refused");
+    let steps = ssh_steps(&case, "ssh", &["ok", "say-exit 2 gate: box payload lacks Command"]);
+
+    let outcome = finish(warm_client(&case, &steps, &[]));
+
+    assert_failed(
+        &outcome,
+        record(&case).as_ref(),
+        "refused",
+        "the builder ended the warm-up before its commands with status 2",
+    );
+}
+
+#[test]
+fn a_real_client_warm_up_on_a_held_lock_says_it_or_stays_quiet() {
+    let case = warm_client_case("warm-real-held-lock");
+    let first = finish(warm_client(&case, &ssh_steps(&case, "first", &["ok", "ok"]), &[]));
+    assert_eq!(first.code, Some(0), "{first:?}");
+    let record_path = warm_entry(&case, "json").expect("the first warm-up wrote its record");
+    let before = fs::read(&record_path).expect("the record can be read");
+    let held = hold(&warm_entry(&case, "lock").expect("the first warm-up made its lock"));
+    let steps = ssh_steps(&case, "second", &["ok", "ok"]);
+
+    let said = finish(warm_client(&case, &steps, &[]));
+    let quiet = finish(warm_client(&case, &steps, &["--background"]));
+
+    assert_eq!(said.code, Some(1), "{said:?}");
+    assert_eq!(said.stderr.trim_end(), "gate: a warm-up of builder is already running", "{said:?}");
+    assert_eq!((quiet.code, quiet.stderr.as_str()), (Some(0), ""), "{quiet:?}");
+    assert!(calls(&steps).is_empty(), "no call is made");
+    assert_eq!(fs::read(&record_path).expect("the record can be read"), before, "the record is untouched");
+    drop(held);
 }

@@ -27,7 +27,7 @@ Non-goals:
 
 The CLI is subcommands with GNU-style flags: `--name value` or `--name=value`, and `--` ends the gate's options. The first word picks the parser. `--version`, `--help`, `-h` and `help` are matched first; then a subcommand name selects the CLI below, and any other first word starting with `-` selects the [compatibility layer](#compatibility-layer). No arguments at all print the usage on stderr and exit 2.
 
-A `--help` or `-h` before the `--` of a `run`, `stop-tree`, `cutover`, `push`, `check`, `burn` or `expect` line also prints the usage on stdout and exits 0, whatever else the line holds; after the `--` it belongs to the command (`gate run --slot light --timeout 5 --log x.log -- tool --help` runs `tool --help`).
+A `--help` or `-h` before the `--` of a `run`, `stop-tree`, `cutover`, `push`, `check`, `warm`, `burn` or `expect` line also prints the usage on stdout and exits 0, whatever else the line holds; after the `--` it belongs to the command (`gate run --slot light --timeout 5 --log x.log -- tool --help` runs `tool --help`).
 
 | Subcommand | Purpose |
 |---|---|
@@ -38,6 +38,7 @@ A `--help` or `-h` before the `--` of a `run`, `stop-tree`, `cutover`, `push`, `
 | `gate check` | Say what this PC lacks for the repo in the current folder, and how to install it. |
 | `gate burn` | Spin the CPU for a set time, for the load-burn tool. |
 | `gate expect` | Print the expected time of a command here and on each builder, from the durations store. |
+| `gate warm` | Warm the builder's work folder of the worktree the gate is started in, by running its `.gate/warmup.toml` commands there ([`gate warm`](#gate-warm)). |
 | `gate box` | Hidden: the builder side of a routed run. |
 | `gate --version` | Print `gate <package version>+<build id>` and exit 0 ([Build id](#build-id)). |
 | `gate --help`, `gate -h`, `gate help`, `gate <subcommand> --help` | Print the usage on stdout and exit 0. |
@@ -342,6 +343,49 @@ It prints one line per place with an estimate on stdout, the local one first, th
 
 The launcher maps no `-Expect`: the compatibility layer refuses it, and callers run `gate.exe expect -- <command>` directly.
 
+### `gate warm`
+
+`gate warm [--cd <folder>] [--background] [--state-dir <path>]` warms the builder's work folder of the worktree the gate is started in: it runs the commands of the worktree's `.gate/warmup.toml` there and keeps how that ended in the worktree's warm-up record.
+
+It takes no command, `--log`, `--timeout` or `--local`: the commands come from the file, the log is `remote\warm\<key>.log` and the ceiling is the file's `timeout`. A warm-up takes no slot and writes no journal event. It runs the warm-up even when the work folder is already warm.
+
+- `--cd <folder>` enters the folder as `gate run --cd` does ([Run folder](#run-folder)), with the same refusals, which exit 2. Whatever folder of the worktree the gate starts in, the warm-up is worded and laid out from the worktree root (the gate makes the root its working folder), so its commands, their path rewrite and its work folder are those of a routed run started at the root, and the call's subfolder is empty.
+- `--background` keeps a warm-up that does not start quiet: no consent, no warm-up file and a warm-up already running say nothing and exit 0. It detaches nothing; whatever starts a warm-up in the background does that. Nothing starts one from a route yet.
+- `--state-dir` and `GATE_STATE_DIR` resolve the [state root](#state-root) as for `gate stop-tree`.
+- A test-seams build also takes `--test-warm-wait-ms <n>`, which replaces the file's ceiling as the length of the key mutex wait and of the cap wait, and the remote client's seams a routed run takes (`--test-remote-client`, `--test-remote-transport`, and the others that need the transport), but not `--test-print-request`.
+- Exit codes: 0 warm (also, with `--background`, a warm-up that did not start for no consent, no file or a warm-up already running); 2 a usage or precondition problem; 1 a warm-up that failed or was refused, a failed record write, and, without `--background`, a warm-up already running; `0xC000013A` on Ctrl+C. A word other than the options above is a usage error, exit 2.
+
+It works in this order, each step ending the warm-up where it fails.
+
+1. The state root, then `--cd`, then the worktree root, then `remote.json`, then the repo's consent (`warmup` in `remote.json`; one that cannot be read is no consent), then the routing target (a repo `remote.json` does not list, or siblings that cannot be used, end here), then the warm-up file's first read: through the `.gate` reader, parsed and hashed, each command worded for the builder as a routed run words it (`builder_words`). This read gives the hash of the first `warming` record only.
+2. The warm-up lock `remote\warm\<key>.lock`, taken for the warm-up's whole life: created when missing, opened without sharing and without following a link, required to be a plain file, its open tried again every 20 ms for 200 ms while another handle holds it, which rides out a route's probe. A lock still held ends the warm-up without touching the record. In the foreground it says `gate: a warm-up of <host> is already running` and exits 1; with `--background` it says nothing and exits 0.
+3. The warm-up's log `remote\warm\<key>.log`, made new: an earlier one is removed, then the new one is created as a plain file without following a link and held open sharing reading and writing but not deletion, so nothing can put a link in its place while the client appends to it by its path.
+4. The `warming` record, with the first read's hash, this process's pid and start and the PC gate's build id.
+5. The remote client chosen and `ready()`, then the key's mutex waited for up to the file's ceiling (the client's `hold_key_waiting`), then the cap lock `remote\warm.lock` waited for up to the same length in slices of 100 ms, looking at the console interrupt between them.
+
+   A key or cap not got in time ends the warm-up `failed`, class `refused`, with the reason `another routed run held the work folder past the wait` or `another warm-up held the warm-up cap past the wait`. A Ctrl+C during either wait deletes the record.
+
+   A client that is not ready ends it `failed`, class `refused`, with the client's line as the reason.
+6. The late recheck, in this order: `remote.json` read again, consent, the builder host, the routing entry, the siblings, then the warm-up file read again. The commands, the `WarmHash` and the final record come from this read alone, not from the first. A recheck that finds one of them gone or changed withdraws the warm-up: the record is deleted, the builder is not called, and the end says its line (quiet with `--background`, except a file problem or a target problem, which say their line).
+7. The client's warm call ([Warm-up call](#routing)) from the worktree root, with the late read's commands and hash and the late file's `timeout` as its ceiling.
+
+   The record is written from how the client says the warm-up ended alone, never from its status: `warm` for a confirmed warm-up, `failed` with the client's class and reason, deleted for a Ctrl+C (exit `0xC000013A`), and `failed`, class `refused`, with the client's detail (else `the client did not start the warm-up`) for a call that said nothing of its end.
+
+   A final write that fails says its line, deletes the `warming` record and exits 1. Its cap lock, key mutex and warm-up lock are let go last.
+
+The key mutex wait, the cap wait and the client's backstop on the run call (five ceilings and 60 s) bound the warm-up's life at about seven ceilings plus 60 s and the git limits; it has no deadline of its own, and a stale `warming` record counts as live only while its lock is held.
+
+The lines, each on stderr and escaped to one line where it carries a path, a repo, a host or a reason:
+
+- Ends before the record, exit 2: `gate: warm: LOCALAPPDATA is unset or not absolute, so there is no remote.json`, `gate: warm: <path> does not exist`, `gate: warm: <path> cannot be used: <reason>` (both for `remote.json`), `gate: warm: the folder is not in a git worktree`, `gate: warm: cannot find the git worktree: <why>`, `gate: warm: cannot enter the worktree root <path>: <error>`, `gate: warm: <repo> is not listed in remote.json`, and the target's siblings line.
+- No consent, exit 2 (quiet with `--background`, exit 0): `gate: warm: <repo> has not consented to warm-ups in remote.json` and `gate: warm: remote.json's warmup cannot be read: <reason>`.
+- No file, exit 2 (quiet with `--background`, exit 0): `gate: warm: <root>\.gate\warmup.toml does not exist`.
+- A file problem, exit 2: `gate: warm: .gate\warmup.toml <problem>` (the first problem, then ` (and <n> more)`), `gate: warm: .gate\warmup.toml command <n> starts with <word>, which a routed run never sends` (a command a routed run keeps on this PC) and `gate: warm: .gate\warmup.toml command <n> names <word>, outside the worktree`.
+- Withdrawn at the recheck, exit 2 (quiet with `--background`, exit 0): `gate: warm: remote.json's builder changed from <host> to <host>`, `gate: warm: remote.json's entry for <repo> changed` (also for a changed work folder key or inputs), `gate: warm: the siblings of <repo> changed while the warm-up waited`, and the consent and file lines above.
+- Ends that write no record, exit 1: `gate: warm: cannot make <folder>: <error>`, `gate: warm: cannot take <lock>: <why>`, `gate: warm: cannot remove the earlier the warm-up log <path>: <error>`, `gate: warm: cannot create the warm-up log <path>: <error>`, `gate: warm: cannot use the warm-up log <path>: <error>` and `gate: warm: cannot write the warm-up record <path>: <error>`.
+- `gate: warm: cannot delete the warm-up record <path>: <error>` joins the line of a final write that failed or a record a withdrawal could not delete.
+- `gate: cannot install the Ctrl+C handler, so Ctrl+C ends the gate at once: <error>`, and the verdicts: `gate: warm-up of <host> passed` (exit 0) and `gate: warm-up of <host> failed: <reason>` (exit 1). The client's own lines and the box's go to the console and the warm-up's log as a run's do.
+
 ### `gate box`
 
 Hidden from the usage and from `--help`. It is the builder side of a routed run, run over ssh on the builder ([The box side](#the-box-side)).
@@ -449,7 +493,7 @@ The lines of a run that starts its command:
 
   The line names each sibling in declared order with its root as routing spells it. While it waits for a remote slot: `gate: waiting for a remote slot on <host> (<n> busy)` and `gate: still waiting for a remote slot on <host> (<s> s)`, as a local wait says them, ETA included.
 
-  A run the builder does not take says why and goes on here: `gate: remote <host> <reason>; running here`, with `<reason>` one of `full` (no remote slot within 60 s), `busy`, `unreachable`, `parity`, `rebooted`, `tools`, `layout`, `version`, `inputs` (the run's ignored inputs could not be sent, or the builder's work folder no longer held them at the run) or `cold` (the builder's work folder was not warm for the run's warm-up file; the client says it for a call that needs a warm folder, and no run makes such a call yet), and `gate: remote <host> client could not start: <detail>; running here` when the remote client cannot start.
+  A run the builder does not take says why and goes on here: `gate: remote <host> <reason>; running here`, with `<reason>` one of `full` (no remote slot within 60 s), `busy`, `unreachable`, `parity`, `rebooted`, `tools`, `layout`, `version`, `inputs` (the run's ignored inputs could not be sent, or the builder's work folder no longer held them at the run) or `cold` (the builder's work folder was not warm for the run's warm-up file; the client says it for a call that needs a warm folder, and no route makes such a call yet), and `gate: remote <host> client could not start: <detail>; running here` when the remote client cannot start.
 
   A routed run whose repo declares `inputs` says `gate: inputs: <n> file(s), <X.X> MB (<Y.Y> MB compressed) in <Z.Z> s` once a put has sent files.
 
@@ -616,9 +660,9 @@ For any other root, every kernel object name carries `<h>`, the first 8 lower-ca
 | `remote\<key>.inputs-hashes` | the Rust remote client | the same | The inputs' hash cache, in the outputs cache's shape and saved as it is, kept apart from it since the outputs saves drop every file the outputs walk no longer finds. Saved after an inputs manifest the client builds changes it; a file whose hash the pack finds wrong is dropped from it, and deleting the file resets the cache ([The remote client's run](#routing), Inputs). |
 | `remote\<key>.nothing-back` | the gate, after a routed dotnet build ends on the builder without its outputs known to be brought back, or, when none stands, a routed dotnet `--no-build` command whose word the builder dropped | every gate (the `--no-build` drop and the clear) | JSON `{"v":1,"host":"…","configuration":"…","framework":"…","runtime":"…"}`; the last three are optional and come from the routed build's own `-c`, `-f` and `-r` words. A passing local build of the whole worktree with the same three removes it, as does a passing routed build of that kind that brought all its outputs back ([Routing](#routing)). Written with create-new and the reparse-point flag, and read the same way, 4096 bytes at most; one that cannot be read counts as present. |
 | `remote\<key>.outputs-capped` | the Rust remote client, at an outputs fetch that passed the fetch cap | the same | The outputs cap record: JSON `{"v":1,"hits":<n>}`, the fetches in a row of that worktree that passed the cap. A second hit in a row fails the run; any other end of its outputs fetch but a Ctrl+C during it, and a box that packed nothing, removes it; one that cannot be read counts no hit ([The remote client's run](#routing), Outputs fetch). |
-| `remote\warm\<key>.json` | the warm-up of the work folder `<key>` (not wired yet; `gate-state` has the writer and reader) | the route's warm-up judge | The warm-up record: JSON `{"v":1,"host":"…","state":"…","at":"<ISO>","hash":"…","gate":"…","pid":<n>,"started":"<ISO>"}`, then `failure` and `reason` when, and only when, `state` is `failed`. `state` is `warming`, `warm` or `failed`; `failure` is `commands` (the commands failed or ran out of time) or `refused` (refused before any command ran); `hash` is the 64 lower-case hex digits of the SHA-256 of the raw bytes of the worktree's `.gate/warmup.toml`, a byte order mark included; `gate` is the build id of the PC gate that wrote it; `pid` and `started` are the warming process's, for the lines only. Written whole or not at all like the nothing-back record; a record that breaks a rule of its shape is refused on read and on write. ops-tower does not read it. |
-| `remote\warm\<key>.log`, `remote\warm\<key>.lock` | the warming process | the route's warm-up judge (the lock) | The warm-up's log, and the lock it holds for its whole life: a `warming` record counts as live only while the lock is held. Paths only so far. |
-| `remote\warm.lock` | the warming process | other warming processes | The lock that lets one warm-up at a time run on this PC. Path only so far. |
+| `remote\warm\<key>.json` | `gate warm` for the work folder `<key>` (`gate-state` has the writer and reader) | the route's warm-up judge | The warm-up record: JSON `{"v":1,"host":"…","state":"…","at":"<ISO>","hash":"…","gate":"…","pid":<n>,"started":"<ISO>"}`, then `failure` and `reason` when, and only when, `state` is `failed`. `state` is `warming`, `warm` or `failed`; `failure` is `commands` (the commands failed or ran out of time) or `refused` (refused before any command ran); `hash` is the 64 lower-case hex digits of the SHA-256 of the raw bytes of the worktree's `.gate/warmup.toml`, a byte order mark included; `gate` is the build id of the PC gate that wrote it; `pid` and `started` are the warming process's, for the lines only. Written whole or not at all like the nothing-back record; a record that breaks a rule of its shape is refused on read and on write. ops-tower does not read it. |
+| `remote\warm\<key>.log`, `remote\warm\<key>.lock` | `gate warm` | the route's warm-up judge (the lock) | The warm-up's log, made new for each warm-up, opened without following links and held open without delete sharing, and the lock it holds for its whole life, opened without sharing: a `warming` record counts as live only while the lock is held. |
+| `remote\warm.lock` | `gate warm` | other warming processes | The lock that lets one warm-up at a time run on this PC, taken after the key's mutex and waited for up to the warm-up file's ceiling. |
 `<start>` everywhere in a name is the process start time in Unix epoch milliseconds. Claims, tickets, counts, the nothing-back record and the outputs cap record are written to a temporary sibling (`<file>.<pid>.<n>.tmp`, where `<n>` is a per-process counter so two threads of one process never share one) and moved over the target, so a reader never sees a torn file (kept, L1, Q1).
 
 A `remote-cutover.flag` or `remote-cutover.draining` left in a state root is ignored: nothing reads or writes either file.
@@ -819,7 +863,7 @@ Fields beyond J1's:
   `transfer-timed-out` is a routed run's fetch after the command cut at its transfer ceiling.
 
   A routed run is a kill only when the gate killed it; a command that exits 124 on its own is `failed`.
-- `fallback`: `reason`, one of `full` (no remote slot within the 60 s wait), `busy`, `unreachable`, `parity`, `rebooted`, `tools` (T5), `layout` (the box could not clear or lay out its work folder), `version` ([The box side](#the-box-side)), `client` (the remote client could not start, as when it finds no usable ssh), `inputs` (the run's ignored inputs could not be sent, a sibling pair declared inputs, or the box refused the run because its work folder no longer held the inputs sent) and `cold` (the builder's work folder was not warm for the run's warm-up file; `FallbackReason::Cold` writes the word, and the client refuses a call that needs a warm folder this way, but no run makes such a call yet).
+- `fallback`: `reason`, one of `full` (no remote slot within the 60 s wait), `busy`, `unreachable`, `parity`, `rebooted`, `tools` (T5), `layout` (the box could not clear or lay out its work folder), `version` ([The box side](#the-box-side)), `client` (the remote client could not start, as when it finds no usable ssh), `inputs` (the run's ignored inputs could not be sent, a sibling pair declared inputs, or the box refused the run because its work folder no longer held the inputs sent) and `cold` (the builder's work folder was not warm for the run's warm-up file; `FallbackReason::Cold` writes the word, and the client refuses a call that needs a warm folder this way, but no route makes such a call yet).
 
   The `take` after it is the run's local one, untagged, its `waitedSeconds` counted from the `fallback`, except after `full`, where it counts from the run's `queue` line; a Ctrl+C that ends that local wait writes the same figure on its `abandon`.
 - a routed run's `take`, `release` and `abandon` carry the tag; its `release` has the builder's `adjustedSeconds` (null when it said none) and a `wallSeconds` of the whole remote call, and the verdict `timed-out` or `backstop` after a kill by the builder or by the client's backstop.
@@ -896,7 +940,7 @@ ops-tower reads only `slots`.
 
 A repo's own `.gate/toolchain.toml`, which declares the tools and workloads a routed run's builder needs, is a separate file in the snapshot, not part of `remote.json`: [Routing](#routing) (Toolchain manifest) describes its format.
 
-A repo's `.gate/warmup.toml`, which declares the warm-up commands, is read by `gate_router::warm::read_warmup`: `commands`, an array of 1 to 8 commands, each a non-empty array of non-empty strings, and the optional `timeout`, whole seconds from 1 to 86400, 1800 when missing. A leading byte order mark is skipped, any other key is a problem, and any problem means no warm-up. Nothing in the gate binary reads the file yet.
+A repo's `.gate/warmup.toml`, which declares the warm-up commands, is read by `gate_router::warm::read_warmup`: `commands`, an array of 1 to 8 commands, each a non-empty array of non-empty strings, and the optional `timeout`, whole seconds from 1 to 86400, 1800 when missing. A leading byte order mark is skipped, any other key is a problem, and any problem means no warm-up. `gate warm` reads the file ([`gate warm`](#gate-warm)); nothing starts a warm-up from a route yet.
 
 The judge, `gate_router::warm::judge`, says where a command that would otherwise route goes, given the repo's consent, the file, the work folder's record and whether its warm-up lock is held; it does not run yet. In order: no consent or no file routes; a file problem runs here saying `gate: not routed: .gate/warmup.toml: <problem>`; a held lock means a warm-up is running and the run stays here with `gate: not routed: <host> is warming the work folder for this worktree`; an unreadable record runs here with `gate: not routed: the warm-up record <path> cannot be read: <error>`; no record, a `warming` record with a free lock, or a `warm` record of another host or file starts a warm-up, the run staying here with `gate: not routed: starting a warm-up of the work folder for this worktree on <host>`; a `warm` record of this host and the file's hash routes. A `failed` record of this host, file hash and gate build keeps the run here until its backoff has passed, 30 minutes after `commands` and 60 seconds after `refused`, with `gate: not routed: the warm-up failed <n> min ago: <reason>` (`less than a minute ago` under a minute); a failure of another host, file or build, or one written in the future, has no backoff and starts a warm-up. Every `<…>` text is escaped to one line.
 
@@ -1583,7 +1627,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
     A status 75 is a refusal only when this run's refusal tag came on stderr before any start marker (`busy`, `tools` or `layout`, the fallback reason); a tag after the marker is ignored, so a command that prints the human busy, tools or layout line, or a tag of its own, and exits 75 ends with status 75 and no fallback.
 
     Safety rests on order, not on the nonce being secret (the request is on no command line, but the nonce still appears in the run id, the pipe names and the archive name): the box says the marker before it creates the command's process, and the client ignores every tag once it has heard the marker.
-  - **Warm-up call.** A call whose `warmth` is a warm-up (`Warmth::WarmUp` in `remote/mod.rs`) runs the phases above with the run call's payload built by `payload::warm_word`: the run's keys, `Timeout` always among them, with `WarmCommands` and `WarmHash` in place of `Command` and no `Outputs` or `OutputsFull` key. Its limits are a run's, from the call's `timeout`. No run, verb or route makes such a call yet.
+  - **Warm-up call.** A call whose `warmth` is a warm-up (`Warmth::WarmUp` in `remote/mod.rs`) runs the phases above with the run call's payload built by `payload::warm_word`: the run's keys, `Timeout` always among them, with `WarmCommands` and `WarmHash` in place of `Command` and no `Outputs` or `OutputsFull` key. Its limits are a run's, from the call's `timeout`. `gate warm` makes such a call; no route does yet.
 
     The run call's end is classed by `warm_end` in `remote/client.rs` and handed back as `RemoteOutcome.warm`. It is warm only on status 0, after the start marker, with the call's last stderr line that is neither a heartbeat nor a protocol line exactly `gate: remote warm {H}` for the `WarmHash` sent. A Ctrl+C is deleted: it leaves no record.
 
@@ -1983,7 +2027,7 @@ The payload is one base64 word (standard alphabet, padded) of UTF-8 JSON, sent a
 
 `inputs` reads `Key`, `Bare`, `Work`, `Lock`, `Nonce` and `Step`.
 
-A warm-up's `run` payload sets `WarmCommands` (1 to 8 commands, each a non-empty list of non-empty texts) and `WarmHash` (64 lower-case hex digits, the hash of the warm-up file the commands come from), sets no `Command`, and asks for no outputs. The PC's client can send it (The remote client's run, Warm-up call), but no verb or run does yet.
+A warm-up's `run` payload sets `WarmCommands` (1 to 8 commands, each a non-empty list of non-empty texts) and `WarmHash` (64 lower-case hex digits, the hash of the warm-up file the commands come from), sets no `Command`, and asks for no outputs. The PC's client sends it (The remote client's run, Warm-up call) for `gate warm`; no route does yet.
 
 `preflight` also reads an optional `Needs`, an object of tool name to minimum version text (`""` for any version), which the PC builds with `remote::payload::preflight_word` from the tools it wants probed; it is omitted when there are none, so a payload without needs is the same bytes as before.
 
