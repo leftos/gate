@@ -1388,6 +1388,18 @@ impl Attempt<'_, '_> {
     /// Pushes each of `repos`' `snapshots` in order, the main one first, each then saved, under one transfer clock;
     /// the preflight `created` the bare repositories it names just now. The run's push time is the pushes' sum.
     fn pushes(&mut self, repos: &[Repo], snapshots: &[Snapshot], created: &[String]) -> Result<(), End> {
+        self.each_push(repos, snapshots, created, Self::push)
+    }
+
+    /// Makes each push of `repos`' `snapshots` in order through `push`, every one watched by the one transfer clock
+    /// started before the first.
+    fn each_push(
+        &mut self,
+        repos: &[Repo],
+        snapshots: &[Snapshot],
+        created: &[String],
+        mut push_one: impl FnMut(&mut Self, &Push<'_>, Watch) -> Result<(), End>,
+    ) -> Result<(), End> {
         let watch = Watch::Setup(self.limits_for("push"));
         for (at, (repo, snapshot)) in repos.iter().zip(snapshots).enumerate() {
             let push = Push {
@@ -1396,7 +1408,7 @@ impl Attempt<'_, '_> {
                 snapshot,
                 created: created.contains(&repo.bare),
             };
-            self.push(&push, watch)?;
+            push_one(self, &push, watch)?;
         }
         Ok(())
     }
@@ -1467,16 +1479,21 @@ impl Attempt<'_, '_> {
         if let Some(bound) = bound {
             self.kept_its_place(at, repo, bound)?;
         }
-        let short = snapshot.commit.get(..8).unwrap_or(&snapshot.commit);
-        let took = started.elapsed();
+        self.pushed(repo, &snapshot.commit, &size, started.elapsed());
+        Ok(())
+    }
+
+    /// Adds `took`, the time of the push of `repo`'s `commit` of `size`, to the run's push time, the pushes' sum, and
+    /// says the push.
+    fn pushed(&mut self, repo: &Repo, commit: &str, size: &str, took: Duration) {
         self.split.push += took;
-        let line = if pair {
-            format!("gate: remote pushed snapshot {} {short} in {} s ({size})", repo.name, seconds(took))
-        } else {
+        let short = commit.get(..8).unwrap_or(commit);
+        let line = if self.call.siblings.is_empty() {
             format!("gate: pushed snapshot {short} in {} s ({size})", seconds(took))
+        } else {
+            format!("gate: remote pushed snapshot {} {short} in {} s ({size})", repo.name, seconds(took))
         };
         self.say(line);
-        Ok(())
     }
 
     /// Ends the call `what`, a preflight or a push, that the client killed as the fallback `unreachable`: the command
@@ -3311,10 +3328,10 @@ mod tests {
     use gate_win32::{Interrupt, PipedConsole};
 
     use super::{
-        Attempt, CallEnd, Called, Capped, Cut, Echo, End, GIT_SSH_FAILED, Heard, LINE_CAP, Limits, Loss, NonZeroU64, OUTPUTS_BUDGET, ProtocolLines,
-        Push, Raised, Reader, Reading, RustClient, SSH_FAILED, Shared, Split, Ssh, Unfinished, Watch, Watching, after_loss, boot_time, called_of,
-        console_of, held, is_heartbeat, last_update, local_sdk_listing, path_outside, paused, push_size, relay, relay_raw, relayed_raw, sdks_of,
-        seconds, their_version, version_refusal,
+        Attempt, CallEnd, Called, Capped, Cut, Echo, End, GIT_SSH_FAILED, Heard, LINE_CAP, Limits, Loss, NonZeroU64, OUTPUTS_BUDGET, OneCall,
+        ProtocolLines, Push, Raised, Reader, Reading, RustClient, SSH_FAILED, Shared, Split, Ssh, Unfinished, Watch, Watching, after_loss, boot_time,
+        called_of, console_of, held, is_heartbeat, last_update, local_sdk_listing, path_outside, paused, push_size, relay, relay_raw, relayed_raw,
+        sdks_of, seconds, their_version, version_refusal,
     };
     use super::{Entry, entries_of, gate_folders, manifest_candidates, manifest_entry};
     use crate::environment::Variables;
@@ -3327,7 +3344,7 @@ mod tests {
     use crate::remote::transport::Local;
     use crate::remote::watchdog::{self, Kill, LOG_CAP};
     use crate::remote::worktree_lock::tests::{held_elsewhere, lock_name};
-    use crate::remote::{Refusal, RemoteCall, Sibling, adjusted_line, busy_line, carried, refused_line, started_line};
+    use crate::remote::{Refusal, RemoteCall, RemoteClient, Sibling, adjusted_line, busy_line, carried, refused_line, started_line};
     use crate::run::CONTROL_C_EXIT;
 
     /// A state root no gate uses; no test here takes its key's lock.
@@ -5570,5 +5587,93 @@ mod tests {
             .map(|(_, value)| value)
             .collect();
         assert_eq!(set, [Some(OsStr::new("1"))], "ssh and what it starts skip the working folder");
+    }
+
+    const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    /// A snapshot of [`COMMIT`] with no bridge.
+    fn snapshot() -> Snapshot {
+        Snapshot {
+            commit: COMMIT.to_owned(),
+            bridge: None,
+        }
+    }
+
+    /// A pair's pushes are watched by one transfer clock, started before the first: with `--test-remote-watch-call
+    /// push`, whose ceiling starts a clock at each reading of the push's limits, both pushes still count from one start.
+    #[test]
+    fn a_pair_s_pushes_share_one_transfer_clock() {
+        let pair = Pair::new("client-one-clock", &["lib"]);
+        let run = pair.run(&pair.root, &["lib"]);
+        let log = pair.top.join("out.log");
+        let call = pair_call(&run, carried(&run).expect("the run's siblings check"), &log);
+        let transport = nowhere();
+        let mut attempt = attempt(&call, &transport);
+        attempt.one_call = Some(OneCall {
+            name: "push",
+            stall: None,
+            ceiling: Some(Duration::from_secs(3600)),
+        });
+        let repos = attempt.repos();
+        let mut starts = Vec::new();
+
+        let pushed = attempt.each_push(&repos, &[snapshot(), snapshot()], &[], |_, _, watch| {
+            let Watch::Setup(limits) = watch else {
+                return Err(End::Failed(format!("a push watched as {watch:?}")));
+            };
+            // The clock moves past this push's start before the next push, so a clock of its own would start later.
+            while Instant::now() <= limits.started {
+                std::hint::spin_loop();
+            }
+            starts.push(limits.started);
+            Ok(())
+        });
+
+        assert!(pushed.is_ok(), "{pushed:?}");
+        assert_eq!(starts.len(), 2, "both repositories are pushed");
+        assert_eq!(starts.first(), starts.last(), "the second push counts from the first one's start");
+    }
+
+    /// A pair's push time is the sum of its pushes' times, each push said with its own.
+    #[test]
+    fn a_pair_s_push_time_is_the_sum_of_its_pushes() {
+        let pair = Pair::new("client-push-sum", &["lib"]);
+        let run = pair.run(&pair.root, &["lib"]);
+        let log = pair.top.join("out.log");
+        let call = pair_call(&run, carried(&run).expect("the run's siblings check"), &log);
+        let transport = nowhere();
+        let mut attempt = attempt(&call, &transport);
+        let repos = attempt.repos();
+
+        attempt.pushed(&repos[0], COMMIT, "1 KiB", Duration::from_millis(1200));
+        attempt.pushed(&repos[1], COMMIT, "2 KiB", Duration::from_millis(2500));
+
+        assert_eq!(attempt.split.push, Duration::from_millis(3700));
+        assert_eq!(
+            attempt.lines,
+            [
+                "gate: remote pushed snapshot app 01234567 in 1.2 s (1 KiB)",
+                "gate: remote pushed snapshot lib 01234567 in 2.5 s (2 KiB)",
+            ]
+        );
+    }
+
+    /// An ssh found inside a sibling's root starts nothing, refused as one inside the worktree root is.
+    #[test]
+    fn an_ssh_inside_a_sibling_s_root_starts_no_run() {
+        let pair = Pair::new("client-ssh-in-sibling", &["lib"]);
+        let program = pair.folder("lib").join("ssh.exe");
+        fs::write(&program, b"").expect("the stand-in ssh can be written");
+        let run = pair.run(&pair.root, &["lib"]);
+        let log = pair.top.join("out.log");
+        let call = pair_call(&run, carried(&run).expect("the run's siblings check"), &log);
+        let ssh = Ssh { program: program.clone() };
+        let mut client = RustClient::over(Some(Box::new(ssh)), &TestSeams::default());
+
+        let outcome = client.run(&call);
+
+        let why = format!("cannot run ssh: {} lies inside the worktree", program.display());
+        assert_eq!(outcome.reason, Some(FallbackReason::Client), "{outcome:?}");
+        assert_eq!(outcome.detail, Some(why), "{outcome:?}");
     }
 }
