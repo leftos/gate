@@ -12,7 +12,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
-use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, READ_CONTROL};
+use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_READ, FILE_SHARE_WRITE, READ_CONTROL};
 
 use super::{box_call, field, gate_box, git, lines, passed, payload, refused_line, run_box, snapshot};
 use crate::support::{Case, FAKE_TOOL, Outcome, box_payload, junction};
@@ -914,4 +914,88 @@ fn a_record_naming_a_git_file_reads_as_not_a_record() {
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert!(outcome.stderr.contains("is not an inputs record; every copy is hashed"), "{outcome:?}");
+}
+
+/// The tree's exclude file of `payload`'s work folder.
+fn exclude_of(payload: &Value) -> String {
+    fs::read_to_string(work(payload).join(r".git\info\exclude")).expect("the exclude file can be read")
+}
+
+#[test]
+fn a_stale_copy_kept_because_it_changed_stays_excluded_through_later_puts() {
+    let case = Case::new("box_inputs_kept_excluded");
+    let payload = inputs_payload(&case, "put");
+    let changed: (&str, &[u8]) = ("changed.txt", b"as sent");
+    put_all(&case, &payload, &[HELPER, changed]);
+    fs::write(work(&payload).join("changed.txt"), "changed on the box").expect("the copy can be changed");
+
+    put_all(&case, &payload, &[HELPER]);
+    assert_eq!(exclude_of(&payload), "/.tmp/helper/a.dll\n/changed.txt\n", "the kept copy is excluded");
+
+    put_all(&case, &payload, &[HELPER]);
+    assert_eq!(
+        fs::read(work(&payload).join("changed.txt")).expect("the kept copy is there"),
+        b"changed on the box",
+        "a later put leaves the kept copy in place"
+    );
+    assert_eq!(exclude_of(&payload), "/.tmp/helper/a.dll\n/changed.txt\n", "and still excluded");
+    let tree = field(&payload, "Work");
+    assert_eq!(git(&["-C", tree, "status", "--porcelain"]), "", "git sees no input, kept or installed");
+
+    put_all(&case, &payload, &[HELPER, changed]);
+    assert_eq!(
+        fs::read(work(&payload).join("changed.txt")).expect("the input is there"),
+        changed.1,
+        "a manifest naming it again installs it"
+    );
+    assert_eq!(exclude_of(&payload), "/.tmp/helper/a.dll\n/changed.txt\n", "as an input again");
+}
+
+#[test]
+fn a_junction_at_the_git_info_folder_is_replaced_by_a_folder_and_nothing_is_written_outside() {
+    let case = Case::new("box_inputs_info_junction");
+    let payload = inputs_payload(&case, "put");
+    put_all(&case, &payload, &[HELPER]);
+    let info = work(&payload).join(r".git\info");
+    fs::remove_dir_all(&info).expect("the info folder can be removed");
+    let outside = case.folder().join("outside");
+    fs::create_dir_all(&outside).expect("the outside folder can be made");
+    junction(&info, &outside);
+
+    put_all(&case, &payload, &[HELPER, DATA]);
+
+    assert!(
+        fs::symlink_metadata(&info).expect("the info folder is there").is_dir(),
+        "the junction is replaced by a folder of its own"
+    );
+    assert_eq!(exclude_of(&payload), "/.tmp/helper/a.dll\n/data/b.txt\n");
+    assert_eq!(
+        fs::read_dir(&outside).expect("the outside folder can be listed").count(),
+        0,
+        "nothing is written outside"
+    );
+}
+
+#[test]
+fn a_put_that_fails_after_moving_a_file_in_leaves_the_record_without_the_last_digest() {
+    let case = Case::new("box_inputs_interim_record");
+    let payload = snapshot_payload(&case);
+    put_all(&case, &payload, &[DATA]);
+    let first = manifest_line(&[DATA]);
+    let other: (&str, &[u8]) = ("data/b.txt", b"other bytes\n");
+    // Read and write shared but not deletion: the check reads the target, and the rename onto it fails.
+    let held = File::options()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .open(work(&payload).join(r"data\b.txt"))
+        .expect("the last target can be held");
+
+    let outcome = put_with(&case, &payload, &[], &[HELPER, other], &[HELPER, other]);
+
+    drop(held);
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert!(outcome.stderr.contains("cannot install 'data/b.txt'"), "{outcome:?}");
+    assert!(work(&payload).join(r".tmp\helper\a.dll").exists(), "the first file was moved in");
+    let run = run_box(&case, &digested(&payload, &first));
+    assert_refused_inputs(&payload, &run, "the interim record holds no digest");
 }

@@ -9,7 +9,7 @@
 //! manifest's digest, and per file its path, size, SHA-256, and the last write and file id the box left it with. A diff
 //! trusts a copy whose size, last write and file id the record holds and hashes any other; one that needs nothing
 //! finishes as a put of nothing would. A put deletes a recorded copy that left the manifest only while it still holds
-//! what was installed, rewrites the tree's `.git\info\exclude` from the record, so no input is cleaned by the checkout
+//! what was installed, keeps any other in the record as a kept copy until a manifest names its path again, rewrites the tree's `.git\info\exclude` from the record, so no input is cleaned by the checkout
 //! or committed back, and writes the record's digest last, only once the work folder holds every file of the manifest.
 //!
 //! The box runs elevated while the command and any other process of the builder's user may write in the work folder,
@@ -37,7 +37,7 @@ use crate::boxside::preflight::{self, is_folder_itself};
 use crate::boxside::run::{self, FAILED_STATUS, FILE_FLAG_OPEN_REPARSE_POINT, REFUSED_STATUS};
 use crate::boxside::tools;
 use crate::console::Console;
-use crate::outputs::archive::{Entry, PcFiles, unpack};
+use crate::outputs::archive::{Entry, PcFiles, final_path, unpack};
 use crate::outputs::hash::{SHA256_DIGITS, is_lower_hex, sha256_of};
 use crate::outputs::manifest::{Held, MANIFEST_LIMIT, Manifest};
 use crate::outputs::names::{is_git_s, is_lfs_config, is_plain_path};
@@ -285,11 +285,14 @@ struct Copy {
 }
 
 /// The inputs record: the digest of the manifest last installed from, empty while an install is under way or after
-/// one that did not finish, and each input installed, by its path's simple uppercase.
-#[derive(Default)]
+/// one that did not finish; each input installed, by its path's simple uppercase; and each kept stale copy, by the
+/// same key: one a put left in place, as it changed on the box or could not be opened, hashed or deleted, which the
+/// exclude file lists, which no sweep deletes and which is never trusted as installed.
+#[derive(Clone, Default)]
 struct Record {
     digest: String,
     files: BTreeMap<String, Copy>,
+    kept: BTreeMap<String, String>,
 }
 
 impl Record {
@@ -301,20 +304,25 @@ impl Record {
         let files = value.get("files").and_then(Value::as_object).ok_or_else(not_a_record)?;
         let mut record = Record {
             digest: digest.to_owned(),
-            files: BTreeMap::new(),
+            ..Record::default()
         };
         for (path, file) in files {
-            let copy = recorded_copy(path, file)
-                .filter(|_| refused_path(path).is_none())
-                .ok_or_else(not_a_record)?;
+            if refused_path(path).is_some() {
+                return Err(not_a_record());
+            }
+            if file.get("kept") == Some(&Value::Bool(true)) {
+                record.kept.insert(ordinal_upper(path), path.clone());
+                continue;
+            }
+            let copy = recorded_copy(path, file).ok_or_else(not_a_record)?;
             record.files.insert(ordinal_upper(path), copy);
         }
         Ok(record)
     }
 
-    /// The record's text: one line of JSON.
+    /// The record's text: one line of JSON, a kept copy's entry `{"kept": true}`.
     fn text(&self) -> String {
-        let files: Map<String, Value> = self
+        let mut files: Map<String, Value> = self
             .files
             .values()
             .map(|copy| {
@@ -323,7 +331,17 @@ impl Record {
                 (copy.path.clone(), file)
             })
             .collect();
+        for path in self.kept.values() {
+            files.insert(path.clone(), json!({ "kept": true }));
+        }
         json!({ "digest": self.digest, "files": files }).to_string()
+    }
+
+    /// Every path the record names, installed or kept, in the order of their keys.
+    fn paths(&self) -> Vec<&str> {
+        let mut paths: BTreeMap<&str, &str> = self.kept.iter().map(|(key, path)| (key.as_str(), path.as_str())).collect();
+        paths.extend(self.files.iter().map(|(key, copy)| (key.as_str(), copy.path.as_str())));
+        paths.into_values().collect()
     }
 
     /// The copy recorded at `path`, found without regard to case.
@@ -485,19 +503,24 @@ fn matched_copy(work: &File, path: &str, held: &Held, record: &Record) -> Option
 
 /// The diff: `gate-remote-inputs: need <n>`, then `gate-remote-inputs: path <path>` for each file of the manifest the
 /// work folder `work` lacks or holds otherwise, in the manifest's order, each path escaped. One that needs nothing first
-/// finishes the install as a put of nothing would ([`swept`], [`finished`]). Else why not.
+/// finishes the install as a put of nothing would ([`swept`], [`finished`]), from the copies this diff matched, each
+/// untrusted one hashed once. Else why not.
 fn diff(asked: &Asked<'_>, sent: &Sent, work: &File, console: &mut Console) -> Result<(), String> {
     let record = recorded(asked.work, console)?;
-    let needed: Vec<&str> = sent
-        .manifest
-        .files()
-        .filter(|(path, held)| matched_copy(work, path, held, &record).is_none())
-        .map(|(path, _)| path)
-        .collect();
+    let mut now = Record::default();
+    let mut needed = Vec::new();
+    for (path, held) in sent.manifest.files() {
+        match matched_copy(work, path, held, &record) {
+            Some(copy) => {
+                now.files.insert(ordinal_upper(path), copy);
+            }
+            None => needed.push(path),
+        }
+    }
     if needed.is_empty() {
         unsealed(asked.work, &record)?;
-        swept(work, &record, &sent.manifest, console);
-        finished(asked.work, work, sent, &record, Record::default())?;
+        now.kept = swept(work, &record, &sent.manifest, console);
+        finished(asked.work, work, sent, &record, now)?;
     }
     console.out(&format!("gate-remote-inputs: need {}", needed.len()));
     for path in needed {
@@ -507,16 +530,17 @@ fn diff(asked: &Asked<'_>, sent: &Sent, work: &File, console: &mut Console) -> R
 }
 
 /// The put: its stage made ([`made_stage`]), the archive on stdin unpacked into it before any lock is taken, then
-/// under the lock its files moved into the work folder ([`installed`]); the stage removed on every way out once made,
-/// and `gate-remote-inputs: installed <n>` said; 0. Else the status, its lines said.
+/// under the lock its files moved into the work folder ([`installed`]); the stage removed beneath its held handles on
+/// every way out once made ([`removed_stage`]), and `gate-remote-inputs: installed <n>` said; 0. Else the status, its
+/// lines said.
 fn put(asked: &Asked<'_>, sent: &Sent, seams: &BoxSeams, console: &mut Console) -> u32 {
-    let (stage_path, stage) = match made_stage(asked, console) {
+    let stage = match made_stage(asked, console) {
         Ok(made) => made,
         Err(why) => return failed(asked, &why, console),
     };
-    let done = staged(asked, sent, seams, (&stage_path, &stage), console);
+    let done = staged(asked, sent, seams, &stage, console);
+    let removal = removed_stage(&stage);
     drop(stage);
-    let removal = preflight::remove_entry(&stage_path).map_err(|error| format!("cannot remove the stage {}: {error}", stage_path.display()));
     match (done, removal) {
         (Ok(Ok(count)), Ok(())) => {
             console.out(&format!("gate-remote-inputs: installed {count}"));
@@ -532,10 +556,13 @@ fn put(asked: &Asked<'_>, sent: &Sent, seams: &BoxSeams, console: &mut Console) 
     }
 }
 
-/// The archive on stdin unpacked into the stage `stage`, at the path and held as the pair says, within the budget, then
-/// its files installed under the work folder's lock ([`locked`], [`installed`]): the count installed, or why not;
-/// `Err` with the status when the install never ran, its lines said.
-fn staged(asked: &Asked<'_>, sent: &Sent, seams: &BoxSeams, stage: (&Path, &File), console: &mut Console) -> Result<Result<usize, String>, u32> {
+/// The archive on stdin unpacked into the held stage `stage` by its path, once that path is shown to name the held
+/// folder ([`same_stage`]), within the budget, then its files installed under the work folder's lock ([`locked`],
+/// [`installed`]): the count installed, or why not; `Err` with the status when the install never ran, its lines said.
+fn staged(asked: &Asked<'_>, sent: &Sent, seams: &BoxSeams, stage: &Stage, console: &mut Console) -> Result<Result<usize, String>, u32> {
+    if let Err(why) = same_stage(stage) {
+        return Ok(Err(why));
+    }
     let budget = seams.inputs_budget_bytes.unwrap_or(INPUTS_BUDGET);
     let none = Manifest::default();
     let go_on = || true;
@@ -545,28 +572,43 @@ fn staged(asked: &Asked<'_>, sent: &Sent, seams: &BoxSeams, stage: (&Path, &File
         manifest: &none,
         go_on: &go_on,
     };
-    let entries = match unpack(io::stdin().lock(), &stage.0.join(STAGED_FILES), budget, &pc) {
+    let entries = match unpack(io::stdin().lock(), &stage.path.join(STAGED_FILES), budget, &pc) {
         Ok(entries) => entries,
         Err(error) => return Ok(Err(error.to_string())),
     };
-    let files = match gate_win32::open_beneath(stage.1, STAGED_FILES, Share::NoDelete) {
+    let files = match gate_win32::open_beneath(&stage.held, STAGED_FILES, Share::NoDelete) {
         Ok(files) => files,
         Err(error) => return Ok(Err(format!("cannot open the staged files: {error}"))),
     };
     locked(asked, console, |work, console| installed(asked, sent, (&files, &entries), work, console))
 }
 
-/// This put's stage, `{root}\inputs-stage\{key}-{nonce}`, made as a new folder and held, and its path: the stages
-/// folder opened or made beneath the root, refused when it is a link, a junction or not a folder, and given the
-/// security that keeps every lower process out ([`gate_win32::protect_folder`]); every stage older than a day removed
-/// first ([`pruned`]). A stage of that name already there is refused, never shared. Else why not.
-fn made_stage(asked: &Asked<'_>, console: &mut Console) -> Result<(PathBuf, File), String> {
+/// A put's stage, made and held: the box's root, the stages folder below it and the stage below that, each held
+/// without delete sharing, so none of them can be renamed or swapped for a link while the put works; and the stage's
+/// path, which the archive is unpacked below.
+struct Stage {
+    _root: File,
+    _stages: File,
+    /// The stage itself, opened with `DELETE` access, so it is removed through this handle.
+    held: File,
+    path: PathBuf,
+}
+
+/// This put's stage, `{root}\inputs-stage\{key}-{nonce}`, made as a new folder and held with its root and stages
+/// folder ([`Stage`]): the root opened as itself and refused when it is a link, a junction or not a folder; the stages
+/// folder opened or made beneath it, refused likewise, and given the owner and security that keep every lower process
+/// out ([`gate_win32::protect_folder`]), refused when they cannot be set; every stage older than a day removed first
+/// ([`pruned`]). A stage of that name already there is refused, never shared. Else why not.
+fn made_stage(asked: &Asked<'_>, console: &mut Console) -> Result<Stage, String> {
     let root = OpenOptions::new()
         .read(true)
-        .share_mode(Share::All.mode())
+        .share_mode(Share::NoDelete.mode())
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
         .open(asked.root)
         .map_err(|error| format!("cannot open {}: {error}", asked.root))?;
+    if !is_folder_itself(&root).map_err(|error| format!("cannot open {}: {error}", asked.root))? {
+        return Err(format!("{} is a link, a junction or not a folder", asked.root));
+    }
     let path = Path::new(asked.root).join(STAGES);
     let cannot = |error: io::Error| format!("cannot ready {}: {error}", path.display());
     let stages =
@@ -575,61 +617,109 @@ fn made_stage(asked: &Asked<'_>, console: &mut Console) -> Result<(PathBuf, File
         return Err(format!("{} is a link, a junction or not a folder", path.display()));
     }
     gate_win32::protect_folder(&stages).map_err(cannot)?;
-    for line in pruned(&path, SystemTime::now()) {
+    for line in pruned(&stages, &path, SystemTime::now()) {
         console.err(&line);
     }
     let name = format!("{}-{}", asked.key, asked.nonce);
-    let stage = gate_win32::open_beneath_as(&stages, &name, FILE_GENERIC_READ, Share::NoDelete, Make::NewFolder)
+    let stage = gate_win32::open_beneath_as(&stages, &name, FILE_GENERIC_READ | DELETE, Share::NoDelete, Make::NewFolder)
         .map_err(|error| format!("cannot make the stage {}: {error}", path.join(&name).display()))?;
-    Ok((path.join(name), stage))
+    Ok(Stage {
+        _root: root,
+        _stages: stages,
+        held: stage,
+        path: path.join(name),
+    })
 }
 
-/// Removes every stage in the stages folder `stages` last written more than a day before `now`, each as itself, of
-/// any work folder: one a put left when it could not remove it. The lines saying each that could not be removed.
-fn pruned(stages: &Path, now: SystemTime) -> Vec<String> {
-    let unlisted = |error: io::Error| {
-        vec![format!(
-            "gate: remote could not list {}: {}",
-            stages.display(),
-            escaped(&error.to_string())
-        )]
-    };
-    let entries = match std::fs::read_dir(stages) {
-        Ok(entries) => entries,
-        Err(error) => return unlisted(error),
+/// Whether the stage's path names the held stage itself: the folder it opens, through whatever links are on its way,
+/// has the held stage's final path. Else why not, so nothing is unpacked anywhere else.
+fn same_stage(stage: &Stage) -> Result<(), String> {
+    let cannot = |error: io::Error| format!("cannot check the stage {}: {error}", stage.path.display());
+    let by_path = OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(&stage.path)
+        .map_err(cannot)?;
+    let (reached, held) = (final_path(&by_path).map_err(cannot)?, final_path(&stage.held).map_err(cannot)?);
+    if reached != held {
+        return Err(format!(
+            "the stage {} leads to {}, not to the stage the box made, {}",
+            stage.path.display(),
+            reached.display(),
+            held.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Removes the stage beneath its held handles: everything in it deleted beneath the stage's handle, deepest first and
+/// each entry as itself ([`gate_win32::delete_beneath`]), then the stage through its own handle, while the stages
+/// folder is still held. Else why not.
+fn removed_stage(stage: &Stage) -> Result<(), String> {
+    gate_win32::delete_beneath(&stage.held)
+        .and_then(|()| gate_win32::delete_opened(&stage.held))
+        .map_err(|error| format!("cannot remove the stage {}: {error}", stage.path.display()))
+}
+
+/// Removes every stage in the held stages folder `stages`, whose path is `path`, last written more than a day before
+/// `now`, of any work folder: one a put left when it could not remove it. Each is listed, opened and removed beneath
+/// the held folder as itself ([`old_stage`], [`gate_win32::delete_beneath`]). The lines saying each kept because its
+/// last write cannot be read, and each that could not be removed.
+fn pruned(stages: &File, path: &Path, now: SystemTime) -> Vec<String> {
+    let names = match gate_win32::names_beneath(stages) {
+        Ok(names) => names,
+        Err(error) => return vec![format!("gate: remote could not list {}: {}", path.display(), escaped(&error.to_string()))],
     };
     let mut lines = Vec::new();
-    for entry in entries {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(error) => return unlisted(error),
-        };
-        if !entry.file_name().to_str().is_some_and(is_stage_name) {
-            continue;
-        }
-        let old = match entry.metadata().and_then(|metadata| metadata.modified()) {
-            Ok(written) => now.duration_since(written).is_ok_and(|age| age > STAGE_AGE),
+    for name in names.iter().filter(|name| is_stage_name(name)) {
+        let stage = path.join(name);
+        let removal = match old_stage(stages, name, now) {
+            Ok(None) => continue,
+            Ok(Some(old)) => removed_old(&old),
             Err(error) => {
-                let kept = format!(
-                    "gate: remote kept the stage {}: its last write cannot be read: {error}",
-                    entry.path().display()
-                );
+                let kept = format!("gate: remote kept the stage {}: its last write cannot be read: {error}", stage.display());
                 lines.push(escaped(&kept));
                 continue;
             }
         };
-        if old
-            && entry.file_name().to_str().is_some_and(is_stage_name)
-            && let Err(error) = preflight::remove_entry(&entry.path())
-        {
+        if let Err(error) = removal {
             lines.push(format!(
                 "gate: remote could not remove the old stage {}: {}",
-                entry.path().display(),
+                stage.display(),
                 escaped(&error.to_string())
             ));
         }
     }
     lines
+}
+
+/// The entry `name` of the held stages folder `stages`, opened as itself with `DELETE` access, when it was last written
+/// more than a day before `now`; `None` when it is younger or gone. Its age is read first through a handle that asks
+/// for no more than its attributes, so a stage another put holds is not opened against that put's sharing, then again
+/// through the handle it is removed by. Else why its last write cannot be read.
+fn old_stage(stages: &File, name: &str, now: SystemTime) -> io::Result<Option<File>> {
+    let is_old = |entry: &File| -> io::Result<bool> { Ok(now.duration_since(entry.metadata()?.modified()?).is_ok_and(|age| age > STAGE_AGE)) };
+    let open = |access| match gate_win32::open_beneath_as(stages, name, access, Share::All, Make::Open) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        opened => opened.map(Some),
+    };
+    match open(FILE_READ_ATTRIBUTES)? {
+        Some(entry) if is_old(&entry)? => {}
+        _ => return Ok(None),
+    }
+    match open(FILE_GENERIC_READ | DELETE)? {
+        Some(entry) if is_old(&entry)? => Ok(Some(entry)),
+        _ => Ok(None),
+    }
+}
+
+/// Removes the old stage `old`, opened as itself: a folder of its own emptied beneath its handle first, then deleted
+/// through it, and anything else deleted as itself.
+fn removed_old(old: &File) -> io::Result<()> {
+    if is_folder_itself(old)? {
+        gate_win32::delete_beneath(old)?;
+    }
+    gate_win32::delete_opened(old)
 }
 
 /// Whether `name` is a stage's name, `{key}-{nonce}`: a key and an outputs nonce of lower-case hex.
@@ -650,8 +740,10 @@ fn installed(asked: &Asked<'_>, sent: &Sent, staged: (&File, &[Entry]), work: &F
         free_target(work, &entry.path, &record, &sent.manifest)?;
     }
     unsealed(asked.work, &record)?;
-    swept(work, &record, &sent.manifest, console);
-    let mut now = Record::default();
+    let mut now = Record {
+        kept: swept(work, &record, &sent.manifest, console),
+        ..Record::default()
+    };
     for entry in entries {
         let stamp = moved_in(files, work, &entry.path)?;
         let copy = Copy {
@@ -672,17 +764,19 @@ fn unsealed(work: &str, record: &Record) -> Result<(), String> {
         work,
         &Record {
             digest: String::new(),
-            files: record.files.clone(),
+            ..record.clone()
         },
     )
 }
 
-/// Finishes an install whose moved files are `now`'s: adds every other file of the manifest the held work folder
-/// `work` holds as the manifest says ([`present`]); fails, the record written with no digest, when a file of the
-/// manifest is still missing; else rewrites the exclude file and, last, writes the record with the manifest's digest.
-/// Else why not.
+/// Finishes an install whose moved or matched files and newly kept copies are `now`'s: adds every other file of the
+/// manifest the held work folder `work` holds as the manifest says ([`present`]), and keeps every copy `record` kept
+/// that no file of `now` replaces; fails, the record written with no digest, when a file of the manifest is still
+/// missing; else rewrites the exclude file and, last, writes the record with the manifest's digest. Else why not.
 fn finished(work_path: &str, work: &File, sent: &Sent, record: &Record, mut now: Record) -> Result<(), String> {
     present(work, &sent.manifest, record, &mut now);
+    now.kept.extend(record.kept.clone());
+    now.kept.retain(|key, _| !now.files.contains_key(key));
     if let Some((path, _)) = sent.manifest.files().find(|(path, _)| now.get(path).is_none()) {
         let mut files = record.files.clone();
         files.extend(now.files);
@@ -691,6 +785,7 @@ fn finished(work_path: &str, work: &File, sent: &Sent, record: &Record, mut now:
             &Record {
                 digest: String::new(),
                 files,
+                kept: now.kept,
             },
         )?;
         return Err(match opened_copy(work, path, FILE_GENERIC_READ, Share::All) {
@@ -778,9 +873,11 @@ fn moved_in(files: &File, work: &File, path: &str) -> Result<Stamp, String> {
 
 /// Deletes each copy `record` holds whose path left `manifest`, by the handle it was checked through, only while it is
 /// a plain file below the held work folder `work` that still hashes to what the record holds; a copy changed on the box
-/// is kept. Says each copy kept because it could not be opened or hashed, and each that could not be deleted.
-fn swept(work: &File, record: &Record, manifest: &Manifest, console: &mut Console) {
-    for copy in record.files.values().filter(|copy| manifest.get(&copy.path).is_none()) {
+/// is kept. Says each copy kept because it could not be opened or hashed, and each that could not be deleted. The
+/// copies kept, by their key: each but those deleted and those no longer there.
+fn swept(work: &File, record: &Record, manifest: &Manifest, console: &mut Console) -> BTreeMap<String, String> {
+    let mut kept_copies = BTreeMap::new();
+    for (key, copy) in record.files.iter().filter(|(_, copy)| manifest.get(&copy.path).is_none()) {
         let kept = |why: String| format!("gate: remote kept the stale input {}: {}", escaped(&copy.path), escaped(&why));
         // No writer may share it, so the copy hashed is the copy deleted.
         let file = match opened_copy(work, &copy.path, FILE_GENERIC_READ | DELETE, Share::NoWrite) {
@@ -788,26 +885,36 @@ fn swept(work: &File, record: &Record, manifest: &Manifest, console: &mut Consol
             Ok(None) => continue,
             Err(error) => {
                 console.err(&kept(error.to_string()));
+                kept_copies.insert(key.clone(), copy.path.clone());
                 continue;
             }
         };
-        match sha256_of(&file) {
+        let deleted = match sha256_of(&file) {
             Ok((sha256, _)) if sha256 == copy.sha256 => removed_stale(&file, copy, console),
-            Ok(_) => {}
-            Err(error) => console.err(&kept(format!("it cannot be hashed: {error}"))),
+            Ok(_) => false,
+            Err(error) => {
+                console.err(&kept(format!("it cannot be hashed: {error}")));
+                false
+            }
+        };
+        if !deleted {
+            kept_copies.insert(key.clone(), copy.path.clone());
         }
     }
+    kept_copies
 }
 
-/// Deletes the stale `copy`, opened as `file`, by its handle; says so when it cannot be deleted.
-fn removed_stale(file: &File, copy: &Copy, console: &mut Console) {
-    if let Err(error) = gate_win32::delete_opened(file) {
-        console.err(&format!(
-            "gate: remote could not remove the stale input {}: {}",
-            escaped(&copy.path),
-            escaped(&error.to_string())
-        ));
-    }
+/// Deletes the stale `copy`, opened as `file`, by its handle; says so when it cannot be deleted. Whether it was.
+fn removed_stale(file: &File, copy: &Copy, console: &mut Console) -> bool {
+    let Err(error) = gate_win32::delete_opened(file) else {
+        return true;
+    };
+    console.err(&format!(
+        "gate: remote could not remove the stale input {}: {}",
+        escaped(&copy.path),
+        escaped(&error.to_string())
+    ));
+    false
 }
 
 /// Adds to `now`, which holds the files this put installed, every other file of `manifest` the held work folder `work`
@@ -824,7 +931,7 @@ fn present(work: &File, manifest: &Manifest, record: &Record, now: &mut Record) 
     }
 }
 
-/// Rewrites the tree's `.git\info\exclude` from `record`: one line per recorded path as a literal pattern, anchored
+/// Rewrites the tree's `.git\info\exclude` from `record`: one line per recorded path, installed or kept, as a literal pattern, anchored
 /// with a leading `/` and each glob character escaped. The `.git` must be a folder of its own, opened beneath the held
 /// work folder `work`, whose path is `work_path`; `.git\info` is made a folder of its own beneath it ([`info_folder`]),
 /// and the file written beneath that ([`preflight::written_beneath`]), so no link there is followed. Else why not.
@@ -838,12 +945,11 @@ fn write_exclude(work: &File, work_path: &str, record: &Record) -> Result<(), St
     let info_path = git_path.join("info");
     let info = info_folder(&git, &info_path)?;
     let mut text = String::new();
-    for copy in record.files.values() {
-        text.push_str(&literal_pattern(&copy.path));
+    for path in record.paths() {
+        text.push_str(&literal_pattern(path));
         text.push('\n');
     }
-    preflight::written_beneath(&info, &info_path, "exclude", &text)
-        .map_err(|why| format!("cannot write {}: {why}", info_path.join("exclude").display()))
+    preflight::written_beneath(&info, "exclude", &text).map_err(|why| format!("cannot write {}: {why}", info_path.join("exclude").display()))
 }
 
 /// The folder `info` beneath the held `.git` folder `git`, held without delete sharing: a link, a junction or a file
@@ -874,4 +980,173 @@ fn literal_pattern(path: &str) -> String {
         pattern.push(character);
     }
     pattern
+}
+
+#[cfg(test)]
+#[expect(clippy::expect_used, reason = "a test whose folders cannot be made must fail loudly")]
+mod tests {
+    use std::fs::{self, File, OpenOptions};
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::path::{Path, PathBuf};
+
+    use gate_win32::Share;
+    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
+
+    use super::{Asked, Copy, Record, Stamp, Step, made_stage, moved_in, removed_stage, swept};
+    use crate::boxside::payload::ordinal_upper;
+    use crate::boxside::preflight::written_beneath;
+    use crate::console::Console;
+    use crate::outputs::manifest::Manifest;
+    use crate::test_support::junction;
+
+    /// A new, empty folder of the test `name`'s own.
+    fn folder(name: &str) -> PathBuf {
+        let folder = std::env::temp_dir().join(format!("gate-inputs-{name}-{}", std::process::id()));
+        if fs::symlink_metadata(&folder).is_ok() {
+            fs::remove_dir_all(&folder).expect("an earlier run's folder is removed");
+        }
+        fs::create_dir_all(&folder).expect("the folder can be made");
+        folder
+    }
+
+    /// The folder `path` held open, sharing deletion, so a racer may still rename it away.
+    fn held(path: &Path) -> File {
+        OpenOptions::new()
+            .read(true)
+            .share_mode(Share::All.mode())
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)
+            .expect("the folder can be held")
+    }
+
+    /// The number of entries in `folder`.
+    fn entries(folder: &Path) -> usize {
+        fs::read_dir(folder).expect("the folder can be listed").count()
+    }
+
+    #[test]
+    fn a_stage_is_removed_beneath_its_held_handles_and_a_junction_swapped_in_reaches_nothing_outside() {
+        let folder = folder("stage-swap");
+        let root = folder.join("root");
+        let work = root.join(r"work\k");
+        fs::create_dir_all(&work).expect("the work folder can be made");
+        let nonce = "0123456789abcdef0123456789abcdef";
+        let (inner, outer) = (folder.join("inner"), folder.join("outer"));
+        fs::create_dir_all(&inner).expect("the outside folder can be made");
+        fs::write(inner.join("keep.txt"), "keep").expect("the outside file can be written");
+        fs::create_dir_all(outer.join(format!("k-{nonce}"))).expect("the outside stage can be made");
+        fs::write(outer.join(format!(r"k-{nonce}\keep.txt")), "keep").expect("the outside file can be written");
+        let (work_text, root_text) = (work.to_string_lossy().into_owned(), root.to_string_lossy().into_owned());
+        let asked = Asked {
+            key: "k",
+            work: &work_text,
+            bare: "",
+            lock: "",
+            nonce,
+            step: Step::Put,
+            root: &root_text,
+        };
+        let mut console = Console::new();
+        let stage = made_stage(&asked, &mut console).expect("the stage is made");
+        fs::create_dir_all(stage.path.join(r"files\a")).expect("an unpacked folder can be made");
+        fs::write(stage.path.join(r"files\a\b.txt"), "b").expect("an unpacked file can be written");
+        junction(&stage.path.join(r"files\link"), &inner);
+
+        // The seam between the install and the removal: a racer swaps the stages folder for a junction to `outer`.
+        let stages = root.join("inputs-stage");
+        let swapped = fs::rename(&stages, root.join("moved")).is_ok();
+        if swapped {
+            junction(&stages, &outer);
+        }
+        let removal = removed_stage(&stage);
+        drop(stage);
+
+        assert!(!swapped, "the held stages folder cannot be renamed away");
+        removal.expect("the stage is removed");
+        assert_eq!(entries(&stages), 0, "the stage is gone and the stages folder stays");
+        assert!(inner.join("keep.txt").exists(), "nothing a junction in the stage leads to is removed");
+        assert!(outer.join(format!(r"k-{nonce}\keep.txt")).exists(), "nothing outside is removed");
+        fs::remove_dir_all(&folder).expect("the folder can be removed");
+    }
+
+    #[test]
+    fn moved_in_refuses_a_folder_swapped_for_a_junction_and_writes_nothing_outside() {
+        let folder = folder("moved-in");
+        let (work, files, outside) = (folder.join("work"), folder.join("files"), folder.join("outside"));
+        for made in [work.join("data"), files.join("data"), outside.clone()] {
+            fs::create_dir_all(made).expect("the folder can be made");
+        }
+        fs::write(files.join(r"data\b.txt"), "b").expect("the staged file can be written");
+        let (work_held, files_held) = (held(&work), held(&files));
+        fs::rename(work.join("data"), work.join("data-away")).expect("the folder can be renamed away");
+        junction(&work.join("data"), &outside);
+
+        let moved = moved_in(&files_held, &work_held, "data/b.txt");
+
+        let why = moved.expect_err("the junction is refused");
+        assert!(why.contains("'data' is a link, a junction or not a folder"), "{why}");
+        assert_eq!(entries(&outside), 0, "nothing is written outside");
+        assert_eq!(entries(&work.join("data-away")), 0, "nothing is written in the folder renamed away");
+        assert!(files.join(r"data\b.txt").exists(), "the staged copy stays in the stage");
+        drop((work_held, files_held));
+        fs::remove_dir_all(&folder).expect("the folder can be removed");
+    }
+
+    #[test]
+    fn written_beneath_writes_in_the_held_folder_after_a_junction_takes_its_name() {
+        let folder = folder("written-beneath");
+        let (info, outside) = (folder.join("info"), folder.join("outside"));
+        fs::create_dir_all(info.join(r"exclude\inner")).expect("a folder can take the file's name");
+        fs::write(info.join(r"exclude\inner\a.txt"), "a").expect("a file in it can be written");
+        fs::create_dir_all(outside.join("exclude")).expect("the outside folder can be made");
+        fs::write(outside.join(r"exclude\keep.txt"), "keep").expect("the outside file can be written");
+        let info_held = held(&info);
+        fs::rename(&info, folder.join("info-away")).expect("the held folder, sharing deletion, can be renamed away");
+        junction(&info, &outside);
+
+        written_beneath(&info_held, "exclude", "/a.txt\n").expect("the file is written");
+
+        drop(info_held);
+        assert_eq!(
+            fs::read_to_string(folder.join(r"info-away\exclude")).expect("the file is in the held folder"),
+            "/a.txt\n",
+            "the folder at the name is replaced by the file"
+        );
+        assert!(outside.join(r"exclude\keep.txt").exists(), "nothing outside is deleted or written");
+        assert_eq!(entries(&outside), 1, "nothing else is made outside");
+        fs::remove_dir_all(&folder).expect("the folder can be removed");
+    }
+
+    #[test]
+    fn swept_keeps_a_stale_copy_below_a_folder_swapped_for_a_junction_and_deletes_nothing_outside() {
+        let folder = folder("swept");
+        let (work, outside) = (folder.join("work"), folder.join("outside"));
+        fs::create_dir_all(work.join("sub")).expect("the folder can be made");
+        fs::create_dir_all(&outside).expect("the outside folder can be made");
+        fs::write(work.join(r"sub\x.txt"), "x").expect("the copy can be written");
+        fs::write(outside.join("x.txt"), "x").expect("the outside file can be written");
+        let (sha256, _) = crate::outputs::hash::sha256_of(&b"x"[..]).expect("the bytes can be hashed");
+        let copy = Copy {
+            path: "sub/x.txt".to_owned(),
+            sha256,
+            stamp: Stamp {
+                size: 1,
+                modified: 1,
+                id: "0-0".to_owned(),
+            },
+        };
+        let mut record = Record::default();
+        record.files.insert(ordinal_upper(&copy.path), copy);
+        let work_held = held(&work);
+        fs::rename(work.join("sub"), work.join("sub-away")).expect("the folder can be renamed away");
+        junction(&work.join("sub"), &outside);
+
+        let kept = swept(&work_held, &record, &Manifest::default(), &mut Console::new());
+
+        drop(work_held);
+        assert_eq!(kept.values().collect::<Vec<_>>(), ["sub/x.txt"], "the copy is kept");
+        assert!(outside.join("x.txt").exists(), "nothing outside is deleted");
+        assert!(work.join(r"sub-away\x.txt").exists(), "nothing in the folder renamed away is deleted");
+        fs::remove_dir_all(&folder).expect("the folder can be removed");
+    }
 }

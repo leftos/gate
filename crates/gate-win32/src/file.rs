@@ -6,6 +6,7 @@ use std::ffi::OsStr;
 use std::fs::File;
 use std::io;
 use std::os::windows::ffi::OsStrExt;
+use std::os::windows::fs::MetadataExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle};
 use std::path::Path;
 use std::ptr;
@@ -16,12 +17,13 @@ use windows_sys::Wdk::Storage::FileSystem::{
     FILE_SYNCHRONOUS_IO_NONALERT, FileRenameInformationEx, NtCreateFile, NtSetInformationFile,
 };
 use windows_sys::Win32::Foundation::{
-    ERROR_INVALID_PARAMETER, GENERIC_READ, INVALID_HANDLE_VALUE, OBJ_CASE_INSENSITIVE, RtlNtStatusToDosError, UNICODE_STRING,
+    ERROR_INVALID_PARAMETER, ERROR_NO_MORE_FILES, GENERIC_READ, INVALID_HANDLE_VALUE, OBJ_CASE_INSENSITIVE, RtlNtStatusToDosError, UNICODE_STRING,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_POSIX_SEMANTICS, FILE_DISPOSITION_INFO_EX, FILE_GENERIC_READ, FILE_ID_INFO,
-    FILE_REMOTE_PROTOCOL_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileDispositionInfoEx, FileIdInfo, FileRemoteProtocolInfo,
-    GetFileInformationByHandleEx, MoveFileExW, ReOpenFile, SYNCHRONIZE, SetFileInformationByHandle,
+    DELETE, FILE_ATTRIBUTE_REPARSE_POINT, FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_POSIX_SEMANTICS, FILE_DISPOSITION_INFO_EX,
+    FILE_FULL_DIR_INFO, FILE_GENERIC_READ, FILE_ID_INFO, FILE_REMOTE_PROTOCOL_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    FileDispositionInfoEx, FileFullDirectoryInfo, FileFullDirectoryRestartInfo, FileIdInfo, FileRemoteProtocolInfo, GetFileInformationByHandleEx,
+    MoveFileExW, ReOpenFile, SYNCHRONIZE, SetFileInformationByHandle,
 };
 use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
@@ -190,6 +192,83 @@ pub fn delete_opened(file: &File) -> io::Result<()> {
     let deleted = unsafe { SetFileInformationByHandle(file.as_raw_handle(), FileDispositionInfoEx, (&raw const info).cast(), size) };
     if deleted == 0 {
         return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// The names of every entry inside the open folder `folder`, opened with list access (`FILE_GENERIC_READ` holds it),
+/// read through the handle: `GetFileInformationByHandleEx` with the full directory classes, so no path is looked up.
+/// `.` and `..` are left out.
+///
+/// # Errors
+///
+/// The system's error, such as an invalid-parameter error for a handle that is not a folder's.
+pub fn names_beneath(folder: &File) -> io::Result<Vec<String>> {
+    // Eight-byte units, so each entry the system writes is aligned for its structure.
+    let mut buffer = vec![0_u64; DIRECTORY_BUFFER_UNITS];
+    let size = u32::try_from(size_of_val(buffer.as_slice())).map_err(io::Error::other)?;
+    let mut names = Vec::new();
+    let mut class = FileFullDirectoryRestartInfo;
+    loop {
+        // SAFETY: the handle is open for the whole call, and `buffer` is writable for `size` bytes.
+        let read = unsafe { GetFileInformationByHandleEx(folder.as_raw_handle(), class, buffer.as_mut_ptr().cast(), size) };
+        if read == 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(ERROR_NO_MORE_FILES.cast_signed()) {
+                return Ok(names);
+            }
+            return Err(error);
+        }
+        class = FileFullDirectoryInfo;
+        entry_names(&buffer, &mut names)?;
+    }
+}
+
+/// The 64 KiB the directory listing reads into at once, in eight-byte units.
+const DIRECTORY_BUFFER_UNITS: usize = 8 * 1024;
+
+/// Adds to `names` the name of each entry the system wrote in `buffer`, `.` and `..` left out.
+fn entry_names(buffer: &[u64], names: &mut Vec<String>) -> io::Result<()> {
+    // SAFETY: the bytes of `buffer`, which it holds for as long as the slice lives; a byte needs no alignment.
+    let raw = unsafe { std::slice::from_raw_parts(buffer.as_ptr().cast::<u8>(), size_of_val(buffer)) };
+    let past = || io::Error::other("a directory entry runs past the listing's buffer");
+    let mut offset = 0_usize;
+    loop {
+        let fixed = raw.get(offset..offset + size_of::<FILE_FULL_DIR_INFO>()).ok_or_else(past)?;
+        // SAFETY: `fixed` holds a whole structure's bytes, written by the system; the read takes no alignment.
+        let info = unsafe { ptr::read_unaligned(fixed.as_ptr().cast::<FILE_FULL_DIR_INFO>()) };
+        let name_start = offset + std::mem::offset_of!(FILE_FULL_DIR_INFO, FileName);
+        let length = usize::try_from(info.FileNameLength).map_err(io::Error::other)?;
+        let name_bytes = raw.get(name_start..name_start + length).ok_or_else(past)?;
+        let wide: Vec<u16> = name_bytes.as_chunks::<2>().0.iter().map(|pair| u16::from_le_bytes(*pair)).collect();
+        let name = String::from_utf16(&wide).map_err(|_| io::Error::other("a directory entry's name is not UTF-16"))?;
+        if name != "." && name != ".." {
+            names.push(name);
+        }
+        if info.NextEntryOffset == 0 {
+            return Ok(());
+        }
+        offset += usize::try_from(info.NextEntryOffset).map_err(io::Error::other)?;
+    }
+}
+
+/// Deletes everything inside the open folder `folder`, which stays: each entry opened as itself beneath the folder it
+/// is in ([`open_beneath_as`]) with `DELETE` access and held without delete sharing, a folder of its own emptied the
+/// same way first, then deleted by its handle ([`delete_opened`]). A link or a junction is deleted as itself, never
+/// followed, so nothing outside the folder is reached.
+///
+/// # Errors
+///
+/// The first system error met, such as a sharing violation for an entry another process holds without delete
+/// sharing; what was deleted before it stays deleted.
+pub fn delete_beneath(folder: &File) -> io::Result<()> {
+    for name in names_beneath(folder)? {
+        let entry = open_beneath_as(folder, &name, FILE_GENERIC_READ | DELETE, Share::NoDelete, Make::Open)?;
+        let metadata = entry.metadata()?;
+        if metadata.is_dir() && metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0 {
+            delete_beneath(&entry)?;
+        }
+        delete_opened(&entry)?;
     }
     Ok(())
 }
@@ -382,7 +461,63 @@ mod tests {
         DELETE, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
     };
 
-    use super::{Make, Share, delete_opened, move_no_replace, open_beneath, open_beneath_as, rename_beneath, same_file, verbatim};
+    use super::{
+        Make, Share, delete_beneath, delete_opened, move_no_replace, names_beneath, open_beneath, open_beneath_as, rename_beneath, same_file,
+        verbatim,
+    };
+
+    /// Makes a junction at `link` leading to the folder `target`.
+    #[expect(clippy::disallowed_methods, reason = "a test's one mklink takes no spawn lock")]
+    fn junction(link: &Path, target: &Path) {
+        let made = Command::new("cmd")
+            .args(["/d", "/c", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .output()
+            .expect("cmd.exe runs");
+        assert!(made.status.success(), "a junction needs no privilege: {made:?}");
+    }
+
+    #[test]
+    fn names_beneath_lists_every_entry_of_the_held_folder_and_no_dot_names() {
+        let folder = folder("names-beneath");
+        std::fs::write(folder.join("a.txt"), "a").expect("the file can be written");
+        std::fs::create_dir(folder.join("sub")).expect("the folder can be made");
+        let many: Vec<String> = (0..600).map(|index| format!("{index:04}-{}", "n".repeat(100))).collect();
+        for name in &many {
+            std::fs::write(folder.join("sub").join(name), "").expect("the file can be written");
+        }
+
+        let mut top = names_beneath(&held(&folder)).expect("the folder can be listed");
+        let mut sub = names_beneath(&held(&folder.join("sub"))).expect("the folder can be listed");
+
+        top.sort();
+        sub.sort();
+        assert_eq!(top, ["a.txt", "sub"]);
+        assert_eq!(sub, many, "a listing past one buffer's worth is whole");
+        std::fs::remove_dir_all(&folder).expect("the folder can be removed");
+    }
+
+    #[test]
+    fn delete_beneath_empties_the_held_folder_and_deletes_a_junction_in_it_as_itself() {
+        let folder = folder("delete-beneath");
+        let (stage, outside) = (folder.join("stage"), folder.join("outside"));
+        std::fs::create_dir_all(stage.join(r"a\b")).expect("the folders can be made");
+        std::fs::create_dir(&outside).expect("the outside folder can be made");
+        std::fs::write(stage.join(r"a\b\c.txt"), "c").expect("the file can be written");
+        std::fs::write(stage.join("d.txt"), "d").expect("the file can be written");
+        std::fs::write(outside.join("keep.txt"), "keep").expect("the outside file can be written");
+        junction(&stage.join(r"a\link"), &outside);
+        let held = held(&stage);
+
+        delete_beneath(&held).expect("the folder's contents are deleted");
+
+        assert_eq!(names_beneath(&held).expect("the folder can be listed"), Vec::<String>::new());
+        assert!(stage.is_dir(), "the held folder itself stays");
+        assert!(outside.join("keep.txt").exists(), "nothing the junction leads to is deleted");
+        drop(held);
+        std::fs::remove_dir_all(&folder).expect("the folder can be removed");
+    }
 
     /// The folder `path` held open, as a caller of [`open_beneath`] holds one.
     fn held(path: &Path) -> File {
