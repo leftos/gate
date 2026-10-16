@@ -400,14 +400,8 @@ impl Survey {
             Err(error) => return Err(error),
         };
         for entry in entries {
-            let entry = match entry.and_then(|entry| entry.file_type().map(|kind| (entry, kind))) {
-                Ok((entry, kind)) if kind.is_file() => entry,
-                Ok(_) => continue,
-                Err(error) => {
-                    self.say_once("cannot read the claims in", &dir.display().to_string(), error, console);
-                    folder.entry_failed = true;
-                    continue;
-                }
+            let Some(entry) = self.file_entry(entry, &dir, &mut folder, console) else {
+                continue;
             };
             let name = entry.file_name().to_string_lossy().into_owned();
             if is_lend_marker(&name) {
@@ -420,6 +414,20 @@ impl Survey {
         }
         folder.claims.sort_by(|left, right| left.0.cmp(&right.0));
         Ok(folder)
+    }
+
+    /// The listed `entry` of the claims folder `dir` when it is a file; `None` for one that is not, and for one that
+    /// cannot be read, said once and noted in `folder`.
+    fn file_entry(&mut self, entry: io::Result<fs::DirEntry>, dir: &Path, folder: &mut ClaimsFolder, console: &mut Console) -> Option<fs::DirEntry> {
+        match entry.and_then(|entry| entry.file_type().map(|kind| (entry, kind))) {
+            Ok((entry, kind)) if kind.is_file() => Some(entry),
+            Ok(_) => None,
+            Err(error) => {
+                self.say_once("cannot read the claims in", &dir.display().to_string(), error, console);
+                folder.entry_failed = true;
+                None
+            }
+        }
     }
 
     /// The claim at `path` when it can be read and names another gate that still runs; else `None`.

@@ -365,9 +365,10 @@ impl Plan {
     fn prepare(request: &RunRequest, words: &[OsString], at: &Where<'_>, console: &mut Console) -> Result<Plan, NotRun> {
         let Where { root, gate, log, nesting } = *at;
         let folder = std::env::current_dir().map_err(|error| NotRun::failed(format!("gate: cannot read the working directory: {error}")))?;
-        // A covered gate hands on the marker of the parent whose slot its command runs under; one its parent lends its
-        // slot later is handed that marker then ([`Plan::handing_on`]).
-        let marker = match nesting.handed_on(false) {
+        // A covered gate hands on the marker of the parent whose slot its command runs under. Any other hands on its own,
+        // a gate its light parent lends its slot included: that gate's marker names it as a heavy holder, so every gate
+        // nested in its command runs covered by the lend.
+        let marker = match nesting.covering() {
             Some(parent) => parent.marker.clone(),
             None => environment::slot_marker(request.slot.as_str(), gate, &root.root),
         };
@@ -413,21 +414,6 @@ impl Plan {
             resolved: Some(program.to_string_lossy().into_owned()),
             launch,
         })
-    }
-
-    /// The plan with its command's environment handing on `marker`, the marker of the parent gate whose slot the
-    /// command runs on.
-    ///
-    /// # Errors
-    ///
-    /// An environment the gate cannot build (status 1).
-    fn handing_on(mut self, root: &ResolvedRoot, gate: &ThisGate, marker: &str) -> Result<Plan, NotRun> {
-        if let Ok(launch) = &mut self.launch {
-            launch.environment = Variables::for_command(root, gate, marker)
-                .block()
-                .map_err(|error| NotRun::failed(format!("gate: cannot build the command's environment: {error}")))?;
-        }
-        Ok(self)
     }
 }
 
@@ -997,22 +983,11 @@ impl Run<'_> {
         self.on_parent(parent, plan, figures, console)
     }
 
-    /// Runs the command on the slot of the light parent `parent`, which lends it while a critical request drains: hands
-    /// the command the parent's marker, then says so, journals `parent` with the parent's pid and runs it. The run
-    /// takes, claims and releases no slot. A command environment that cannot be built fails the gate (status 1) before
-    /// it says or journals the lend: a gate lent the slot before it queued then journals nothing, and one that queued
-    /// journals its release as any gate that fails before its command does. The command runs under `figures`.
+    /// Runs the command on the slot of the light parent `parent`, which lends it while a critical request drains: says
+    /// so, journals `parent` with the parent's pid and runs it. The run takes, claims and releases no slot. Its command
+    /// keeps the marker of this gate as a heavy holder ([`Plan::prepare`]), so a gate nested in it runs covered by the
+    /// lend and asks for none of its own. The command runs under `figures`.
     fn on_parent(&mut self, parent: &Parent, plan: Plan, figures: Figures, console: &mut Console) -> Ended {
-        let plan = match plan.handing_on(self.root, &self.gate, &parent.marker) {
-            Ok(plan) => plan,
-            Err(NotRun { status, line }) => {
-                console.err(&line);
-                return Ended {
-                    status: i64::from(status),
-                    facts: None,
-                };
-            }
-        };
         self.lent = true;
         console.err(&format!(
             "gate: running under the {} slot of gate {} while a critical request drains; taking no slot",
@@ -1274,7 +1249,8 @@ impl Run<'_> {
     /// The line a run says as it drops its `--no-build` for `reason`, naming where it builds: on the slot of the parent
     /// gate that covers or lent it, else on a heavy slot of its own.
     fn dropped_line(&self, reason: &str) -> String {
-        let building = match self.nesting.handed_on(self.lent) {
+        let lent_by = self.lent.then(|| self.nesting.uncovering()).flatten();
+        let building = match self.nesting.covering().or(lent_by) {
             Some(parent) => format!("building on the parent gate's {} slot", parent.held.as_str()),
             None => "building on a heavy slot".to_owned(),
         };
@@ -1779,7 +1755,7 @@ impl Run<'_> {
         start: &Start,
         console: &mut Console,
     ) -> Result<(Watched, Timing), String> {
-        let (nesting, host, arrived, lent) = (self.nesting, self.host, self.arrived, self.lent);
+        let (nesting, host, arrived) = (self.nesting, self.host, self.arrived);
         let Figures { ceiling, usual } = started.figures;
         let covering = nesting.covering();
         let (taker, held, covered) = self.late_taker(covering.map(|parent| parent.pid), ceiling);
@@ -1809,7 +1785,7 @@ impl Run<'_> {
             runs_as: nesting.runs_as(request.slot),
             root,
             gate,
-            hands_on: nesting.handed_on(lent),
+            hands_on: covering,
             recorded,
             late,
         };

@@ -16,7 +16,7 @@ use crate::durations::seed;
 use crate::nesting::{marked, test_marker};
 use crate::support::{
     Case, FAKE_TOOL, GATE, POLL, Running, assert_in_order, critical_words, events, events_of, finish, heavy_words, none_words, run_words, shown,
-    start, take_of, wait_for_journal_line, wait_until, write_counts,
+    start, take_of, wait_for_file, wait_for_journal_line, wait_until, write_counts,
 };
 
 /// The status Windows reports for a process Ctrl+C ended, `STATUS_CONTROL_C_EXIT`, as a signed exit code.
@@ -457,8 +457,8 @@ fn a_heavy_child_of_a_light_parent_is_lent_the_parents_slot_while_a_critical_req
     let child_log = fs::read_to_string(case.folder().join("child.log")).expect("the child wrote its log");
     assert!(child_log.contains(&lent(parent_pid)), "{child_log}");
     assert!(
-        child_log.contains(&format!("light:{parent_pid}:")),
-        "the child's command has its parent's marker: {child_log}"
+        child_log.contains(&format!("heavy:{child_pid}:")),
+        "the lent child hands its command its own heavy marker: {child_log}"
     );
 
     let marker = test_marker(&case, "light");
@@ -960,14 +960,17 @@ fn a_critical_gate_does_not_take_the_machine_while_a_lent_heavy_child_runs() {
     assert!(events_of(&case, critical_pid).contains(&"take".to_owned()));
 }
 
-/// The ticket file of the gate `pid` in the case's root; fails when there is none.
+/// The ticket file of the gate `pid` in the case's root, a `.json` file and not a rewrite's temporary one beside it;
+/// fails when there is none.
 fn ticket_file(case: &Case, pid: u32) -> PathBuf {
     fs::read_dir(v1::tickets_dir(&case.root()))
         .expect("the tickets folder can be listed")
         .map(|entry| entry.expect("a ticket entry can be read").path())
         .find(|path| {
-            path.file_name()
-                .is_some_and(|name| name.to_string_lossy().starts_with(&format!("{pid}-")))
+            path.extension().is_some_and(|extension| extension == "json")
+                && path
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with(&format!("{pid}-")))
         })
         .expect("the gate has a ticket")
 }
@@ -1032,6 +1035,62 @@ fn a_light_parent_lends_no_more_once_the_critical_gate_holds_its_slots_and_waits
     assert!(!second.stderr.contains(&lent(process::id())), "{second:?}");
     assert!(at(&case, "take", critical_pid) < at(&case, "take", second_pid));
     assert!(!events_of(&case, second_pid).contains(&"parent".to_owned()));
+}
+
+#[test]
+fn a_heavy_gate_nested_in_a_lent_gate_runs_covered_after_the_critical_gate_closes_its_lends() {
+    let case = Case::new("a_heavy_gate_nested_in_a_lent_gate_runs_covered_after_the_critical_gate_closes_its_lends");
+    write_counts(&case.root(), r#"{"v":1,"heavy":1,"light":4}"#);
+    let go = case.folder().join("go");
+    let go_word = shown(&go);
+    let (nested_go, release) = (case.folder().join("nested-go"), case.folder().join("release"));
+    let (nested_go_word, release_word) = (shown(&nested_go), shown(&release));
+    let pid_file = case.folder().join("nested.pid");
+    let pid_word = shown(&pid_file);
+    let held = holder(&case, &heavy_words("holder.log", &POLL, &[FAKE_TOOL, "wait", &go_word, "exit", "0"]));
+    let critical = case.start(&critical_words("critical.log", &with_heartbeat(), &[FAKE_TOOL, "exit", "0"]));
+    let critical_pid = critical.id();
+    critical.wait_for_stderr(WAITING);
+    write_claim(&case, KernelObject::LightSlot(3), ClaimKind::Light, (process::id(), own_start()));
+    let mut command = vec![FAKE_TOOL, "wait", &nested_go_word, "spawn-pid", &pid_word, &release_word, GATE];
+    command.extend(heavy_words("nested.log", &POLL, &[FAKE_TOOL, "env", "GATE_SLOT_HELD"]));
+    let lent_gate = start(marked(&case, &heavy_words("lent.log", &POLL, &command), &test_marker(&case, "light")));
+    let lent_pid = lent_gate.id();
+    lent_gate.wait_for_stderr(&lent(process::id()));
+
+    let_go(&go);
+    assert_passed(&held.finish());
+    wait_until("the critical gate closing its lends", || lends_closed(&case, critical_pid));
+    let_go(&nested_go);
+    wait_for_file(&pid_file);
+    let nested_pid: u32 = fs::read_to_string(&pid_file)
+        .expect("the pid file can be read")
+        .trim()
+        .parse()
+        .expect("the pid file holds a pid");
+    // The nested gate's first journal line says how it runs: a covered gate journals `covered`, a queued one `queue`.
+    wait_until("the nested gate journalling", || !events_of(&case, nested_pid).is_empty());
+    assert_eq!(events_of(&case, nested_pid), ["covered"], "the nested gate is neither lent nor queued");
+    let nested_log = || fs::read_to_string(case.folder().join("nested.log")).unwrap_or_default();
+    wait_until("the nested gate passing", || nested_log().contains("gate: passed in "));
+    let log = nested_log();
+    assert!(
+        log.contains(&format!("gate: running under the heavy slot of gate {lent_pid}")),
+        "the nested gate runs under the lent gate's slot: {log}"
+    );
+    assert!(
+        log.contains(&format!("heavy:{lent_pid}:")),
+        "its command has the lent gate's marker: {log}"
+    );
+    assert_eq!(events_of(&case, nested_pid), ["covered"], "the nested gate is neither lent nor queued");
+    // The nested gate has ended and the lent gate still runs, so the critical gate holding nothing yet pins that it
+    // holds the machine only after both end.
+    assert_eq!(events_of(&case, critical_pid), ["queue"], "the critical gate waits for the lent gate");
+
+    let_go(&release);
+    assert_passed(&lent_gate.finish());
+    assert_passed(&critical.finish());
+    assert_eq!(events_of(&case, lent_pid), ["parent"]);
 }
 
 /// Writes a lend marker in the case's root naming this process as parent and child, started at `start_ms`, whose
