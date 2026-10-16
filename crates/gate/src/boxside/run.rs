@@ -34,6 +34,7 @@ use crate::boxside::forward::{DRAIN, Forwarders, OutputLock};
 use crate::boxside::heartbeat;
 use crate::boxside::inputs;
 use crate::boxside::outputs::{self, Asked};
+use crate::boxside::packages;
 use crate::boxside::payload::{PairSibling, Payload, bare_stem, escaped, ordinal_upper, trees};
 use crate::boxside::preflight::{self, Failed, GIT_REDIRECTS, Git, GitFailure, Unready, exit_code, git_failed};
 use crate::boxside::stop::{Ending, STOPPED, stop_event_name, terminate_and_wait};
@@ -163,6 +164,11 @@ impl Request<'_> {
     /// The main repo's tree, which the command's subfolder, the tool manifests and the outputs are read in.
     pub(super) fn tree(&self) -> &str {
         &self.main.tree
+    }
+
+    /// The command's words, its program first, as the payload gives them.
+    pub(super) fn command(&self) -> &[String] {
+        &self.command
     }
 
     /// Every repo of the run, the main one first.
@@ -462,9 +468,9 @@ impl Beat<'_> {
 }
 
 /// The work folder and the folder below it the command runs in, both full paths.
-struct Folders<'a> {
-    work: &'a Path,
-    place: &'a Path,
+pub(super) struct Folders<'a> {
+    pub(super) work: &'a Path,
+    pub(super) place: &'a Path,
 }
 
 /// A run's outputs step as it goes: what the run asks for, the PC's manifest or why it could not be read, and the
@@ -587,10 +593,10 @@ fn in_work_folder(request: &Request<'_>, stop: &NamedEvent, seams: &BoxSeams, co
     ran
 }
 
-/// The run once the heartbeat beats: the snapshot checked out, the repo's dotnet tools restored, the outputs listed,
-/// the command seen to its end in the place, the tree it left committed back unless the box's ceiling killed it, and,
-/// after a passed command, its outputs packed; the status as [`in_work_folder`] gives it, 1 for a passed command whose
-/// outputs are not brought back, [`KILLED`] for a killed one.
+/// The run once the heartbeat beats: the snapshot checked out, the repo's dotnet tools restored, a pnpm command's pnpm
+/// packages installed, the outputs listed, the command seen to its end in the place, the tree it left committed back
+/// unless the box's ceiling killed it, and, after a passed command, its outputs packed; the status as
+/// [`in_work_folder`] gives it, 1 for a passed command whose outputs are not brought back, [`KILLED`] for a killed one.
 fn checked_out(
     request: &Request<'_>,
     git: &WorkGit,
@@ -631,9 +637,10 @@ fn checked_out(
     }
 }
 
-/// The run up to its command: the snapshot laid out and checked out, the subfolder found and the repo's dotnet tools
-/// restored; else `Err` with the status the run ends on, its lines said. A refusal is said as such; any other end is
-/// followed, on a pair run, by the box's `gate: remote back commits: failed` line ([`ended_before`]).
+/// The run up to its command: the snapshot laid out and checked out, the subfolder found, the repo's dotnet tools
+/// restored and, for a pnpm command, its pnpm packages installed ([`packages::update`]); else `Err` with the status the
+/// run ends on, its lines said. A refusal is said as such; any other end is followed, on a pair run, by the box's
+/// `gate: remote back commits: failed` line ([`ended_before`]).
 fn ready(request: &Request<'_>, git: &WorkGit, folders: &Folders<'_>, beat: &Beat<'_>, console: &mut Console) -> Result<(), u32> {
     let held = match git.lay_out(&request.laid(), console) {
         Ok(held) => held,
@@ -653,7 +660,9 @@ fn ready(request: &Request<'_>, git: &WorkGit, folders: &Folders<'_>, beat: &Bea
         ));
         return Err(ended_before(u32::from(USAGE_STATUS), request, beat, console));
     }
-    match tools::update(request, folders.work, folders.place, beat, console) {
+    let restored =
+        tools::update(request, folders.work, folders.place, beat, console).and_then(|()| packages::update(request, git, folders, beat, console));
+    match restored {
         // The tools' refusal, its tag said: the PC runs the command itself and syncs nothing back.
         Err(REFUSED_STATUS) => Err(REFUSED_STATUS),
         Err(status) => Err(ended_before(status, request, beat, console)),
@@ -863,8 +872,8 @@ pub(super) fn full_path(path: &Path) -> Option<PathBuf> {
 /// `Err` with the status of a run that ends here, its line said: 2 for a batch word refused, 1 for the box's own
 /// failure or a stop that came first, 255 for a client that closed the connection. The job's stop signal is looked at
 /// just before the job is created ([`before_the_job`]), so a stop that came while the snapshot was checked out starts
-/// nothing; the restore looks at it the same way before it runs, so such a stop runs no restore either
-/// ([`crate::boxside::tools`]). The command starts on a UTF-8 console when it can have one ([`start_command`]), whose
+/// nothing; the tool restore and the pnpm install look at it the same way before they run, so such a stop runs neither
+/// ([`crate::boxside::tools`], [`crate::boxside::packages`]). The command starts on a UTF-8 console when it can have one ([`start_command`]), whose
 /// donor lives until the wait for the command is over, however it ends. The heartbeat watches the job while [`watch`]
 /// waits for it. The command's environment is the box's own with the build-server settings of its run set over it
 /// ([`Variables::with_build_servers`]), replacing any value the box inherited: the compiler server's pipe and
@@ -953,7 +962,7 @@ const GIT_CONFIG_COUNT: &str = "GIT_CONFIG_COUNT";
 /// index `GIT_CONFIG_COUNT` holds, 0 when it is unset, and the count grows by one. A count git refuses
 /// ([`git_config_count`]), or one at `i32::MAX` that one more entry would take past what git accepts, leaves
 /// `variables` as they are.
-fn with_safe_directory(variables: Variables) -> Variables {
+pub(super) fn with_safe_directory(variables: Variables) -> Variables {
     let index = match variables.get(GIT_CONFIG_COUNT) {
         None => 0,
         Some(count) => match git_config_count(count) {
@@ -1475,6 +1484,7 @@ fn end_what_it_left(job: &Job, keep: &[u32], console: &mut Console) {
 pub(super) enum Watching {
     Command,
     Restore,
+    Packages,
 }
 
 impl Watching {
@@ -1483,6 +1493,7 @@ impl Watching {
         match self {
             Watching::Command => "the command",
             Watching::Restore => "the restore",
+            Watching::Packages => "the package restore",
         }
     }
 
@@ -1491,6 +1502,7 @@ impl Watching {
         match self {
             Watching::Command => "watching the command",
             Watching::Restore => "watching the restore",
+            Watching::Packages => "watching the package restore",
         }
     }
 
@@ -1499,6 +1511,7 @@ impl Watching {
         match self {
             Watching::Command => "gate: remote command's output is still held open by a leftover process; stopped reading",
             Watching::Restore => "gate: remote the restore's output is still held open by a leftover process; stopped reading",
+            Watching::Packages => "gate: remote the package restore's output is still held open by a leftover process; stopped reading",
         }
     }
 }
@@ -1729,8 +1742,8 @@ impl preflight::TreeGit for WorkGit {
 /// git as the box runs it in the work folder: none of the variables that would point it elsewhere, no standard input,
 /// its hooks read from a folder that cannot exist, no file-system monitor, and its output forwarded under the box's
 /// output lock.
-struct WorkGit {
-    git: Git,
+pub(super) struct WorkGit {
+    pub(super) git: Git,
     /// `core.hooksPath=<lock>\hooks`: a folder inside the lock file, which cannot exist while the run holds the lock
     /// open sharing nothing, since a file has no children and cannot be deleted, renamed or replaced meanwhile.
     hooks: String,
@@ -1769,7 +1782,7 @@ impl WorkGit {
     }
 
     /// The safety options, then `args`.
-    fn args<'a>(&'a self, args: &[&'a str]) -> Vec<&'a str> {
+    pub(super) fn args<'a>(&'a self, args: &[&'a str]) -> Vec<&'a str> {
         let mut all = vec!["-c", self.hooks.as_str(), "-c", "core.fsmonitor=false"];
         all.extend_from_slice(args);
         all
