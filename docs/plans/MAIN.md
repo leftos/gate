@@ -66,6 +66,10 @@
 - [ ] GATE-308 Let a routed input turn from a folder back into a file on the builder
 - [ ] GATE-309 Keep a fallback's own output in the printed tail after a failed routed attempt
 - [ ] GATE-310 Recover a pair run whose sibling bare on the builder was lost
+- [ ] GATE-317 Box: unpack a routed run's inputs beneath a held destination, never by path
+- [ ] GATE-318 Pin and protocol-limit the sync-back's git calls
+- [ ] GATE-319 Hold a routed run's git store before its first use: a linked worktree's git dir, a single run's .git
+- [ ] GATE-320 Refuse a routed push that url.*.insteadOf sends to another host
 
 ## Cutover sweep
 
@@ -114,3 +118,7 @@
 - [ ] GATE-260 Keep the load sampler working when a child of the gated command is suspended
 - [ ] GATE-313 Say when a suspended command the gate started cannot be ended on drop
 - [ ] GATE-314 Give the unit tests that start git the suite's git home
+- [ ] GATE-315 Hold a light count raised after a critical take to the beside allowance
+- [ ] GATE-316 Use one escaper for the router's lines and the task errors, escaping format characters and the backslash
+- [ ] GATE-321 Take the beside mutex only while a critical request is queued, and give the late wait its busy retry
+- [ ] GATE-322 Bound the beside-claim test seam's wait, and keep older builds from reading a lend marker as a claim
