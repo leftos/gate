@@ -831,7 +831,7 @@ Two rolls within one second collide on the archive name: the second archive fail
 
 ### remote.json
 
-`remote.json` keeps the PowerShell gate's format (T1), read by `gate-router` as [Routing](#routing) describes: `host`, `slots`, `repos` and the optional per-repo `outputs` and `siblings`, read afresh by each routed gate and ignored as a whole with one line when unusable. A host of one letter is refused (`host must not be a single letter, which a git host:path URL reads as a drive`).
+`remote.json` keeps the PowerShell gate's format (T1), read by `gate-router` as [Routing](#routing) describes: `host`, `slots`, `repos` and the optional per-repo `outputs`, `inputs` and `siblings`, read afresh by each routed gate and ignored as a whole with one line when unusable. A host of one letter is refused (`host must not be a single letter, which a git host:path URL reads as a drive`).
 
 The optional `hosts` is an array of strings naming further builders, which only `gate push` reaches; a routed run goes to `host` alone. Each entry passes the checks `host` does, with the same reasons worded `hosts entries ...`.
 
@@ -1281,6 +1281,8 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
   Any other host refuses the file (`host must be an ssh alias or user@host of letters, digits, '.', '_' and '-', not starting with '-'`), a recorded deviation: the PowerShell reader accepts any non-empty string. An IPv6 literal or a `host:port` is written as an alias in `~/.ssh/config`.
 
   `slots` is a whole number 1 to 16 (1 when missing), `repos` an object whose values are arrays of non-empty `-like` patterns, and `outputs` an optional object of the same shape whose globs may not hold `[` or `]`; a repo with no `outputs` entry brings back `**/bin/**` and `**/.godot/mono/temp/bin/**`.
+
+  `inputs` is an optional object of the same shape with the same `[`/`]` ban (`is not a valid input glob: '[' and ']' are not allowed`), read by the same table reader; a repo with no `inputs` entry sends nothing, and there is no default list. The route carries the repo's list as `RemoteRun.inputs` and `RemoteCall.inputs`, kept for a dotnet `--no-build` command, whose outputs alone are withheld.
 
   A cargo command instead (its first word's file stem is `cargo` in any case; one a `pwsh` script is handed after `--` is not) brings back `target/*/*.exe`, `target/*/*.dll` and `target/*/*.pdb`: each profile folder's own files, never `deps/`, `build/` or `incremental/`. A repo's own `outputs` list replaces either default.
 
@@ -1794,7 +1796,13 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
   `remote/held.rs` is the holder of a pair's folders for that send: the root's parent is opened once, the root and each sibling are opened beneath it without following a link, their ids, final paths, case, reparse points and `.git` are checked, a network volume is refused, the handles are held without delete sharing, and a recheck opens each path as git would. Nothing calls it yet, so its refusals (`gate: not routed: sibling <name> <why>`) are not said by any run.
 
   Sibling support lands before a repo with siblings is enabled for routing; a repo without siblings is enabled without it.
-- **Inputs** (GATE-22), planned, not built: a routed command can need ignored files only the PC has, and the snapshot sends only tracked and untracked-not-ignored files. A repo's optional `inputs` list of ignored-file globs, beside `outputs` in the routing file, is packed with the outputs' transport and hash-diffed against the builder's work folder, so an unchanged input costs nothing.
+- **Inputs** (GATE-22): a routed command can need ignored files only the PC has, and the snapshot sends only tracked and untracked-not-ignored files. A repo's optional `inputs` list of ignored-file globs, beside `outputs` in the routing file, names the ignored files a routed run sends to the builder's work folder before the run, compressed in the outputs archive's format and hash-diffed against what the work folder holds, so an unchanged input costs nothing.
+
+  The design is [plans/remote-inputs.md](plans/remote-inputs.md).
+
+  Built so far: the `inputs` key and the route's `RemoteRun.inputs`, and the box's `inputs` verb with the run's `InputsDigest` check ([The box side](#the-box-side)). Not reached: the client's two `inputs` calls before the run call, its hash cache, its console and log lines and the `inputs` fallback reason, so a routed run sends no input yet.
+
+  Inputs have their own exclusion set, not the outputs': `.tmp/` is reachable, but a client never sends a path with a `.git` component, `.lfsconfig`, `.env` or `*.env`, the gate's own archives and stages, or the run's log and `.err` file (the client's walk is the part not reached). The box refuses a manifest that names a `.git*` name, `.lfsconfig` or a `.env` file, or a path that is not plain and relative.
 - **The per-host failure record** (GATE-27), planned, not built: a record in the state root holds a builder's failure reason and an expiry. A routed gate that finds an unexpired record says `gate: not routed: <host> <reason> <n> s ago`, runs here and journals `fallback` with the reason, rather than paying the snapshot, preflight and push again for the same reason.
 
   The windows per reason: `unreachable` a short one (60 s, distcc's default backoff); `parity` and `tools` until the snapshot's `global.json` or tool manifests change; `busy` and `full` are load, not faults, and are never recorded.
@@ -1816,7 +1824,9 @@ Each verb is one ssh call today, and the call's cost is its connection, not its 
 
 A routed run therefore moves to one long-lived connection carrying every verb, `gate box serve`, and the per-call client stays until that lands (GATE-70 holds the measurement, and GATE-109 the work).
 
-The payload is one base64 word (standard alphabet, padded) of UTF-8 JSON, sent as the first line of the call's stdin (never on a command line), holding the wrapper's keys: `Key`, `Bare`, `Work`, `Lock`, `Index`, `OutputFolder` and `Job`, and for `run` also `Command`, `Subfolder`, `Identity`, `Outputs`, `Nonce`, `OutputsFull`, `Timeout` and `Host`, and for `outputs` also `Name`. `inflight` reads only `Root`.
+The payload is one base64 word (standard alphabet, padded) of UTF-8 JSON, sent as the first line of the call's stdin (never on a command line), holding the wrapper's keys: `Key`, `Bare`, `Work`, `Lock`, `Index`, `OutputFolder` and `Job`, and for `run` also `Command`, `Subfolder`, `Identity`, `Outputs`, `Nonce`, `OutputsFull`, `Timeout`, `Host` and the optional `InputsDigest`, and for `outputs` also `Name`. `inflight` reads only `Root`.
+
+`inputs` reads `Key`, `Bare`, `Work`, `Lock`, `Nonce` and `Step`.
 
 `preflight` also reads an optional `Needs`, an object of tool name to minimum version text (`""` for any version), which the PC builds with `remote::payload::preflight_word` from the tools it wants probed; it is omitted when there are none, so a payload without needs is the same bytes as before.
 
@@ -1840,11 +1850,11 @@ The box's ceiling has three seams: `--test-box-sample-ms <n>` replaces the 5 s s
 
 `--test-box-kill-leaves <n>` stands in for the number of processes the last ending of a ceiling or backstop kill leaves (a whole number above 0), so the box says its note for a job that is still not ended.
 
-The other three box seams are `--test-outputs-budget-bytes <n>`, which replaces the 50 GiB outputs budget of the box's trim, in bytes, `--test-dotnet-limit-ms <n>`, which replaces the 30 s bound of the preflight's `dotnet --list-sdks` read, in milliseconds, and `--test-probe-limit-ms <n>`, which replaces the 10 s shared bound of the preflight's tool probes, in milliseconds.
+The other four box seams are `--test-outputs-budget-bytes <n>`, which replaces the 50 GiB outputs budget of the box's trim, in bytes, `--test-inputs-budget-bytes <n>`, which replaces the 4 GiB a `gate box inputs` put unpacks, decompressed, in bytes, `--test-dotnet-limit-ms <n>`, which replaces the 30 s bound of the preflight's `dotnet --list-sdks` read, in milliseconds, and `--test-probe-limit-ms <n>`, which replaces the 10 s shared bound of the preflight's tool probes, in milliseconds.
 
 A seam is refused as the `gate run` seams are: no value, given twice, and a value outside its rule (`gate: --test-outputs-budget-bytes must be a whole number above 0, got '<v>'`, `... must be at most 2147483647 ...`, `... needs a value`, `... is given twice`).
 
-The rules: a whole number above 0 and at most 2147483647 for the heartbeat, the sample period, the outputs budget, the dotnet limit, the probe limit and the kill's leftover count, 1 to 100 for `--test-box-free-percent`, `true` or `false` for `--test-box-sampler-fail`. Without the feature each word gets the box usage line.
+The rules: a whole number above 0 and at most 2147483647 for the heartbeat, the sample period, the outputs and inputs budgets, the dotnet limit, the probe limit and the kill's leftover count, 1 to 100 for `--test-box-free-percent`, `true` or `false` for `--test-box-sampler-fail`. Without the feature each word gets the box usage line.
 
 The box gives each run's command its own build servers: the command's environment is the box's own with `SharedCompilationId` and `MSBUILDNODEHANDSHAKESALT` set to `gate-box-<Nonce>` (the payload's `Nonce`), `MSBUILDUSESERVER=0`, `DOTNET_CLI_USE_MSBUILD_SERVER=0` and `MSBUILDDISABLENODEREUSE=1`, each replacing any inherited value (names compared case-insensitively).
 
@@ -1961,13 +1971,19 @@ Built verbs:
 
   A `changing` record left by a clear that did not finish clears again. A run of one repo in a folder already of that layout whose `.git`, `.git\objects` and `.git\objects\info` are each a folder of its own, and whose `.git\config` is a file when there is one, readies nothing here: the preflight readied the tree. A pair run readies its trees every time.
 
-  Readying a tree makes the tree and its `.git` folders of their own (a link, a junction or a file at either is removed as itself and the folder made again), then does what the preflight does for `Work`: `git init`, `origin` set to the repo's bare repository, `core.autocrlf false`, `core.eol lf`, and the alternates file naming that repo's own bare repository's objects, rewritten when it holds anything else.
+  Readying a tree makes the tree and its `.git` folders of their own (a link, a junction or a file at either is removed as itself and the folder made again), then does what the preflight does for `Work`: `git init`, `origin` set to the repo's bare repository, `core.autocrlf false`, `core.eol lf`, and the alternates file naming that repo's own bare repository's objects, rewritten when it holds anything else. A folder found at the alternates file's name is never walked, deleted or followed: it is renamed beneath its held parent to `alternates.gate-moved-<n>` (the first free `n` from 1 to 100, never replacing an entry) and the box says `gate: remote moved aside the folder <old> to <new>`; every other thing there is deleted as itself.
 
   Before its first git step, a run holding the lock replaces a link at `.git\objects` or `.git\objects\info` with a folder and removes a `.git\config` that is not a file, as itself; git then writes a fresh config. A config that cannot be removed refuses the run with `layout`.
 
   A folder the box cannot clear or lay out refuses the run: `gate-remote-refused: <nonce> layout` then `gate: not routed: the builder could not clear <repo>'s work folder: <why>`, said together under the output lock, with the command never started, and exit 75. `<repo>` is the main repo's bare repository's name without `.git`.
 
   The PC reads the 75 plus the tag as fallback reason `layout`, says `gate: remote <host> layout; running here`, runs the command here and passes the box's line on as it came. A git step that fails while a tree is readied keeps its own line and status instead.
+
+  A payload with an `InputsDigest` (64 lower-case hex digits, else `gate: box payload InputsDigest is not 64 lower-case hex digits: <value>` and exit 2) is checked once the work folder is laid out and before the checkout: the `<Work>.inputs` record must exist, hold that digest, and name only copies still in `Work` with the size, last-write time and file id the box left them with, and the tree's `.git\info\exclude` is rewritten from the record (the `inputs` verb below).
+
+  Otherwise the run is refused with `gate-remote-refused: <nonce> inputs` then `gate: remote inputs of work folder <key> are not the ones sent: <why>`, said together under the output lock, the command never started, and exit 75. A folder moved aside from the exclude file's name says its `moved aside` line, under the lock.
+
+  A payload without `InputsDigest` skips the check. The PC does not yet read the `inputs` tag; the client is not reached.
 
   The steps are the layout, fetch, the commit probe, checkout, clean and the back ref reset (each of the three git steps once per repo on a pair run, the main repo first), the dotnet tool restore, then the command, then the sync-back. A failing step prints `gate: remote <fetch|checkout|clean|back ref reset> failed (status <n>)` and exits `n`.
 
@@ -2106,6 +2122,46 @@ Built verbs:
   It prints `gate: remote in flight <n>`, then `gate: remote in flight <key>` for each held lock, the keys escaped and sorted, and exits 0. A missing `Root` or work folder counts 0. A lock it cannot open for another reason counts as held and reads `gate: remote in flight <key> (cannot read: <error>)`.
 
   A work folder it cannot list (anything but not found) prints no count line, `gate: remote cannot list <work>: <error>` on stderr, and exits 1. A refused payload exits 2.
+
+- **`inputs`** (GATE-22, `boxside/inputs.rs`) installs a routed run's ignored inputs into the work folder in two calls, the payload's `Step` being `diff` or `put`. The payload holds `Key`, `Bare`, `Work`, `Lock`, `Nonce` (32 lower-case hex digits) and `Step`; a payload with a `Pair` is refused with `gate box: inputs for a sibling pair are not taken yet` and exit 2, and any other refused payload exits 2.
+
+  Stdin is the request line, then the PC's inputs manifest as one line (the outputs manifest's format, at most 64 MiB, its paths plain, relative and not `.git*`, `.lfsconfig` or `.env`/`*.env`), then for `put` the archive of exactly the files the diff named, in the outputs archive's format, to the end of stdin.
+
+  A manifest that cannot be read fails the step: `gate: remote inputs <diff|put> failed: <why>` and exit 1, before any lock.
+
+  Both steps take the work folder's lock as `run` does (a held lock prints `gate-remote-refused: <nonce> busy` and the busy line, exit 75) and lay the work folder out as `run` does, so a later run finds the layout unchanged and clears nothing.
+
+  The diff prints `gate-remote-inputs: need <n>` then `gate-remote-inputs: path <path>` per file (escaped, manifest order) whose copy is missing or differs; a diff that needs nothing finishes the install as a put of nothing would. The put prints `gate-remote-inputs: installed <n>`.
+
+  The record `<Work>.inputs`, beside `.lock`, `.tools` and `.layout`, is one JSON line: the digest of the manifest line last installed from (empty while an install is under way or after one that did not finish), and per installed file its path, size, SHA-256, and the last-write time and file id the box left it with. A diff trusts a copy whose size, last-write time and file id match its entry and hashes any other.
+
+  A copy a put left in place because it changed on the box, or could not be opened, hashed or deleted, is a kept entry, `{"kept": true}`: listed in the exclude file, never trusted as installed, never swept, and dropped when its file is gone or a manifest names its path again.
+
+  A record that is not a record is taken as empty (`gate: remote inputs record <path> <why>; every copy is hashed`); one that cannot be read (a link, a folder, more than one name) is removed as itself (`gate: remote removed the inputs record <path>, which cannot be read: <error>; every copy is hashed`).
+
+  The record is written without its digest before anything below `Work` changes and with it last, only once `Work` holds every file of the manifest, so no run passes the digest check halfway through an install.
+
+  The put deletes a recorded copy that left the manifest only while it is a plain file that still hashes to the record's value (`gate: remote kept the stale input <path>: <why>` or `gate: remote could not remove the stale input <path>: <error>` when it cannot); it deletes nothing else.
+
+  It then rewrites `<Work>\.git\info\exclude` from the record, one anchored literal line per installed or kept path, so `clean -fdq` keeps the inputs and the box's back commit never picks one up, whichever ignore rule made them ignored on the PC; a user edit of that file is overwritten at the next install.
+
+  A folder found at the exclude file's name is moved aside to `exclude.gate-moved-<n>` (`n` from 1 to 100, never replacing an entry) and never walked, with the line `gate: remote moved aside the folder <old> to <new>`.
+
+  Every file and folder the box makes, moves or deletes below `Work` is reached through handles opened one name at a time beneath the held work folder (`gate_win32::open_beneath_as`), never through a link, and acted on through the handle it was checked by.
+
+  A member's target must be a plain file of one name, or missing; a folder on its way that is a link, a junction or a file refuses the put (`cannot install '<path>': ...`). Each file is moved in by `rename_beneath` and given the DACL and label its folder hands down (`inherit_security`), in place of the stage's.
+
+  The put unpacks the archive before it takes any lock, into a stage `<root>\inputs-stage\<key>-<nonce>` of an elevated box, `<root>\inputs-stage-medium\<key>-<nonce>` of an unelevated one (`<root>` being the folder above `work`); neither box touches the other's folder.
+
+  The stages folder and the stage are made with a protected owner (Administrators when elevated, the box's user when not), a protected DACL granting full control to SYSTEM, Administrators and the box's user alone, and a mandatory label of the box's integrity level with no write up, all in the creation call, so they are never seen with any other security (`gate_win32::protected_descriptor`).
+
+  A stages folder that already exists is adopted only when it is a folder of its own whose owner, DACL and label are exactly those (`is_protected_folder`), read through the handle held; anything else at its name, one the box cannot open included, refuses the put with `cannot use <path>: another account made it; remove it, or give it to Administrators` and is never walked, emptied or replaced. A stage of the put's own name already there is refused.
+
+  The root, the stages folder and the stage are held without delete sharing for the whole put, and the stage is removed beneath its handle on every way out; a stage older than a day (any work folder's) is removed by the next put, a stage that cannot be opened or removed says so and stays (`gate: remote kept the stage <path>: <why>`, `gate: remote could not remove the old stage <path>: <error>`).
+
+  Caps: an archive of more than 50,000 members, or that decompresses to more than 4 GiB (`--test-inputs-budget-bytes` replaces it), is refused as the outputs archive's are, and the put fails (`gate: remote inputs put failed: <why>`, exit 1). The step is not watched on the box; the PC's deadline and stall counting for it are the client's part, not reached.
+
+  Deployment prerequisites: the folders above `<root>` are writable by Administrators only; no account outside SYSTEM, Administrators and the builder's user may write in `<root>`; and `<root>\work` is not writable by other accounts. The stage's protection and the beneath-handle walk assume it; the box checks the stages folder it adopts, not the folders above it.
 
 **The outputs module** (GATE-44) is shared by both ends, this exe, in `crates/gate/src/outputs/`. The box's `run` packs with it and the box's `outputs` verb sends the archive. The PC's manifest, the pending marker, the reading of the box's `gate-remote-outputs: ` line, the fetch of the archive and its install are built in the Rust remote client ([The remote client's run](#routing)).
 

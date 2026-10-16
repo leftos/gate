@@ -20,6 +20,8 @@ Worst case: a repo whose command needs a `.env` on the builder cannot route it; 
 
 **I4. Ignore rules only the PC has.** The box keeps every installed input out of its own git: after an install it rewrites `<Work>\.git\info\exclude` from the `<Work>.inputs` record (I12), with the no-link handling `preflight::ready_tree` gives `.git`. So `clean -fdq` keeps the inputs and the box's back commit never picks one up, whichever ignore rule made it ignored on the PC.
 
+A folder found at `.git\info\exclude` (or at `.git\objects\info\alternates`, which `ready_tree` writes) is never walked or deleted: it is renamed beside itself to `<name>.gate-moved-<n>` (`n` from 1 to 100, never replacing an entry), since another account may have filled it, and the box says `gate: remote moved aside the folder <old> to <new>`. Anything else at the name is deleted as itself.
+
 Worst case: a box-side `info/exclude` the user's command edits is overwritten at the next install.
 
 **I5. Transport.** A new box verb `inputs`, two calls per routed run that has an `inputs` list: a diff call (request + manifest of path, size, SHA-256; the box answers the paths whose copy differs or is missing), then a put call with an archive of exactly those files, skipped when nothing differs. Both after `push` and before the run call (`remote/client.rs`, the `outputs::marked` seam), so a refused route uploads nothing and the run's clocks do not count the upload.
@@ -48,11 +50,15 @@ Worst case: a builder that always fails the step sends every run of that repo lo
 
 **I11. PC hash cache.** Its own file `remote\<key>.inputs-hashes` (a `v1.rs` path function beside `outputs_hashes_path`), never the outputs cache, whose saves drop what the outputs walk no longer finds. No PC record of what the box holds: the diff call is the truth.
 
-**I12. Box record.** `<Work>.inputs` beside `<Work>.tools` and `<Work>.layout`, opened the way `.tools` is (refuses a link, a folder, more than one name): per installed file its path, size, SHA-256, and the last-write time and file id the box left it with, plus the manifest digest. The diff trusts a copy whose size, last-write time and file id match the record, and hashes any other. The layout step's clear removes the record with the work folder's children.
+**I12. Box record.** `<Work>.inputs` beside `<Work>.tools` and `<Work>.layout`, opened the way `.tools` is (refuses a link, a folder, more than one name): per installed file its path, size, SHA-256, and the last-write time and file id the box left it with, plus the manifest digest (empty while an install is under way, written last once the work folder holds every file of the manifest).
+
+A copy a put left in place because it changed on the box is a kept entry (`{"kept": true}`), listed in the exclude file and never trusted. The diff trusts a copy whose size, last-write time and file id match the record, and hashes any other. The layout step's clear removes the record with the work folder's children.
 
 **I13. Stale inputs.** A put deletes a box copy that left the manifest only when the record installed it and the copy still hashes to the record's value; it deletes nothing else.
 
-**I14. Destination safety.** Member paths are plain and relative; the put unpacks into a stage on the work folder's volume (outside `Work`), then moves each file in with `check_folder` on every parent under `Work` and a final-path check, as `remote/install.rs` installs outputs on the PC. An existing target that is not a plain file, or has more than one link, refuses the put. No path rewriting. The box writes inputs with the same token and owner as the checkout, so whatever a command can read of the checkout it can read of its inputs (GATE-231's desktop runs included).
+**I14. Destination safety.** Member paths are plain and relative; the put unpacks into a stage `<root>\inputs-stage\<key>-<nonce>` (`inputs-stage-medium` for an unelevated box), outside `Work` and on its volume, protected from the instant it exists (owner, DACL and label given at creation); a stages folder the box did not make refuses the put (`cannot use <path>: another account made it; ...`), and the route then falls back with reason `inputs` (the fallback is step (c)).
+
+The put then moves each file in with `check_folder` on every parent under `Work` and a final-path check, as `remote/install.rs` installs outputs on the PC. An existing target that is not a plain file, or has more than one link, refuses the put. No path rewriting. The box writes inputs with the same token and owner as the checkout, so whatever a command can read of the checkout it can read of its inputs (GATE-231's desktop runs included).
 
 **I15. Pairs.** Each repo's own `inputs` list applies to its own tree; the manifest's paths are prefixed with the tree's folder name (`{leaf}/…`, `{sibling}/…`). Reached only once GATE-249 sends pairs; until then a pair stays local before any call.
 
