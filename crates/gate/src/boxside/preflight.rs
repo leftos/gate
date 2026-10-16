@@ -410,7 +410,7 @@ pub(super) fn is_folder_itself(opened: &File) -> io::Result<bool> {
 /// Writes `text` as the file `name` in the held folder `folder` unless it already holds exactly that: whatever is at the
 /// name opened as itself beneath the handle, never followed; a plain file of other bytes, a link, a junction or
 /// anything else deleted as itself (a folder of its own emptied beneath its handle first,
-/// [`gate_win32::delete_beneath`]), and a new file made beneath the handle, refused when anything took the name
+/// [`gate_win32::delete_tree_opened`]), and a new file made beneath the handle, refused when anything took the name
 /// meanwhile. Else why not.
 pub(super) fn written_beneath(folder: &File, name: &str, text: &str) -> Result<(), String> {
     match gate_win32::open_beneath_as(folder, name, FILE_GENERIC_READ | DELETE, Share::All, Make::Open) {
@@ -439,10 +439,7 @@ fn holds_already(mut found: File, text: &str) -> Result<bool, String> {
             return Ok(true);
         }
     }
-    if metadata.is_dir() && !reparse {
-        gate_win32::delete_beneath(&found).map_err(|error| error.to_string())?;
-    }
-    gate_win32::delete_opened(&found).map_err(|error| error.to_string())?;
+    gate_win32::delete_tree_opened(&found).map_err(|error| error.to_string())?;
     Ok(false)
 }
 

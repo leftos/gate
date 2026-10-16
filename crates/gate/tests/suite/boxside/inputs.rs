@@ -952,6 +952,28 @@ fn a_stale_copy_kept_because_it_changed_stays_excluded_through_later_puts() {
 }
 
 #[test]
+fn a_kept_copy_deleted_by_hand_leaves_the_record_and_the_exclude_file() {
+    let case = Case::new("box_inputs_kept_gone");
+    let payload = inputs_payload(&case, "put");
+    let changed: (&str, &[u8]) = ("changed.txt", b"as sent");
+    put_all(&case, &payload, &[HELPER, changed]);
+    fs::write(work(&payload).join("changed.txt"), "changed on the box").expect("the copy can be changed");
+    put_all(&case, &payload, &[HELPER]);
+    assert_eq!(exclude_of(&payload), "/.tmp/helper/a.dll\n/changed.txt\n", "the kept copy is excluded");
+    fs::remove_file(work(&payload).join("changed.txt")).expect("the kept copy can be deleted");
+
+    put_all(&case, &payload, &[HELPER]);
+
+    assert_eq!(
+        exclude_of(&payload),
+        "/.tmp/helper/a.dll\n",
+        "the gone copy's line leaves the exclude file"
+    );
+    let record = fs::read_to_string(format!("{}.inputs", field(&payload, "Work"))).expect("the record can be read");
+    assert!(!record.contains("changed.txt"), "the gone copy's entry leaves the record: {record}");
+}
+
+#[test]
 fn a_junction_at_the_git_info_folder_is_replaced_by_a_folder_and_nothing_is_written_outside() {
     let case = Case::new("box_inputs_info_junction");
     let payload = inputs_payload(&case, "put");

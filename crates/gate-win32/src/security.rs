@@ -1,7 +1,7 @@
 //! A folder's security set so only SYSTEM, Administrators and this process's user may use it, its owner one of them,
-//! and no process below this one's integrity level may write in it ([`protect_folder`]), an open file's DACL and label set back to what its
-//! folder hands down ([`inherit_security`]), and an open file's DACL and label in their string form
-//! ([`security_text`]).
+//! and no process below this one's integrity level may write in it ([`protect_folder`]), and whether a folder's owner
+//! and DACL are those ([`is_protected_folder`]); an open file's DACL and label set back to what its folder hands down
+//! ([`inherit_security`]), and an open file's DACL and label in their string form ([`security_text`]).
 
 use std::fs::File;
 use std::io;
@@ -32,10 +32,11 @@ fn protected_sddl(user: &str, integrity: u32, elevated: bool) -> String {
 }
 
 /// Sets the open folder `folder`'s owner to Administrators when this process is elevated and to this process's user
-/// when it is not, so no other user owns it and may rewrite its DACL; its DACL to a protected one granting full control
-/// to SYSTEM, Administrators and this process's user alone; and its mandatory label to this process's integrity level with no write up, both handed down
-/// to whatever is made in it. A process may always label an object at or below its own level, so no privilege is
-/// needed; an elevated process thus keeps the same user's medium processes from writing in the folder.
+/// when it is not, so no other user owns it and may rewrite its DACL; its DACL to a protected one granting full
+/// control to SYSTEM, Administrators and this process's user alone; and its mandatory label to this process's
+/// integrity level with no write up, both handed down to whatever is made in it. A process may always label an object
+/// at or below its own level, so no privilege is needed; an elevated process thus keeps the same user's medium
+/// processes from writing in the folder.
 ///
 /// # Errors
 ///
@@ -43,20 +44,51 @@ fn protected_sddl(user: &str, integrity: u32, elevated: bool) -> String {
 /// `WRITE_OWNER`, cannot be given the security, its owner included.
 pub fn protect_folder(folder: &File) -> io::Result<()> {
     let facts = token_facts()?;
-    let wide: Vec<u16> = protected_sddl(&facts.user, facts.integrity, facts.elevated)
-        .encode_utf16()
-        .chain([0])
-        .collect();
+    let descriptor = descriptor_of(&protected_sddl(&facts.user, facts.integrity, facts.elevated))?;
+    let set = set_lists_of(folder, descriptor);
+    // SAFETY: the descriptor was allocated by the conversion with `LocalAlloc`, and nothing uses it after this.
+    unsafe { LocalFree(descriptor) };
+    set
+}
+
+/// Whether the open folder `folder`, opened with `READ_CONTROL`, has the owner and the DACL [`protect_folder`] gives
+/// it: owned by Administrators when this process is elevated and by this process's user when it is not, with the
+/// protected DACL granting full control to SYSTEM, Administrators and this process's user alone. The two are compared
+/// in their string form, each written by the system, the DACL's automatic-inheritance flags left out.
+///
+/// # Errors
+///
+/// The system's error when this process's token or the folder's security cannot be read.
+pub fn is_protected_folder(folder: &File) -> io::Result<bool> {
+    let facts = token_facts()?;
+    let what = OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
+    let descriptor = descriptor_of(&protected_sddl(&facts.user, facts.integrity, facts.elevated))?;
+    let expected = descriptor_text(descriptor, what);
+    // SAFETY: the descriptor was allocated by the conversion with `LocalAlloc`, and nothing uses it after this.
+    unsafe { LocalFree(descriptor) };
+    Ok(without_auto_inherit(&text_of(folder, what)?) == without_auto_inherit(&expected?))
+}
+
+/// The SDDL `text` with the DACL's automatic-inheritance flags (`AI`, `AR`) left out, which the system sets on a list
+/// it was given and the descriptor it was given lacks.
+fn without_auto_inherit(text: &str) -> String {
+    let Some((owner, rest)) = text.split_once("D:") else {
+        return text.to_owned();
+    };
+    let (flags, entries) = rest.split_at(rest.find('(').unwrap_or(rest.len()));
+    format!("{owner}D:{}{entries}", flags.replace("AI", "").replace("AR", ""))
+}
+
+/// The security descriptor the SDDL `sddl` names, allocated with `LocalAlloc`, for the caller to free with `LocalFree`.
+fn descriptor_of(sddl: &str) -> io::Result<PSECURITY_DESCRIPTOR> {
+    let wide: Vec<u16> = sddl.encode_utf16().chain([0]).collect();
     let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
     // SAFETY: `wide` is NUL-terminated and outlives the call, and `descriptor` is writable; the size is not asked for.
     let made = unsafe { ConvertStringSecurityDescriptorToSecurityDescriptorW(wide.as_ptr(), SDDL_REVISION_1, &raw mut descriptor, ptr::null_mut()) };
     if made == 0 {
         return Err(io::Error::last_os_error());
     }
-    let set = set_lists_of(folder, descriptor);
-    // SAFETY: the descriptor was allocated by the conversion with `LocalAlloc`, and nothing uses it after this.
-    unsafe { LocalFree(descriptor) };
-    set
+    Ok(descriptor)
 }
 
 /// Sets the open `file`'s owner, its DACL, protected, and its label from the security descriptor `descriptor`.
