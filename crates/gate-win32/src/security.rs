@@ -100,8 +100,10 @@ pub fn is_protected_folder(folder: &File) -> io::Result<bool> {
 }
 
 /// The SDDL `text` with the automatic-inheritance flags (`AI`, `AR`) left out of its DACL and its label, which the
-/// system sets on a list it was given and the descriptor it was given lacks.
-fn without_auto_inherit(text: &str) -> String {
+/// system sets on a list it was given and the descriptor it was given lacks, its ACE list kept whole; public so a
+/// caller may compare two texts whose only difference is those flags.
+#[must_use]
+pub fn without_auto_inherit(text: &str) -> String {
     let (before, label) = text.split_once("S:").map_or((text, None), |(before, label)| (before, Some(label)));
     let (owner, dacl) = before.split_once("D:").map_or((before, None), |(owner, dacl)| (owner, Some(dacl)));
     let mut stripped = owner.to_owned();
@@ -428,7 +430,10 @@ mod tests {
 
         inherit_security(&moved).expect("the security can be reset");
 
-        assert_eq!(security_text(&moved).expect("the moved file's security can be read"), fresh);
+        assert_eq!(
+            without_auto_inherit(&security_text(&moved).expect("the moved file's security can be read")),
+            without_auto_inherit(&fresh)
+        );
         drop(moved);
         std::fs::remove_dir_all(&folder).expect("the folder can be removed");
     }

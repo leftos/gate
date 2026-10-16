@@ -51,6 +51,14 @@ fn at(case: &Case, event: &str, pid: u32) -> usize {
     found.expect("checked above")
 }
 
+/// Whether the gate logging to `log` has journalled its own queue line, the one naming that log: a gate its parent lent
+/// its slot before it queued writes none.
+fn has_queued(case: &Case, log: &str) -> bool {
+    events(case)
+        .iter()
+        .any(|event| event["event"] == "queue" && event["log"].as_str().is_some_and(|line| line.ends_with(log)))
+}
+
 /// The names of a `slots` list, sorted: a critical gate lists its slots in the order it took them.
 fn sorted(slots: &Value) -> Vec<String> {
     let list = slots.as_array().expect("slots is a list");
@@ -487,18 +495,13 @@ fn a_lent_auto_run_uses_its_history_for_the_ceiling() {
     let go = case.folder().join("go");
     let go_word = shown(&go);
     let held = holder(&case, &heavy_words("holder.log", &POLL, &[FAKE_TOOL, "wait", &go_word, "exit", "0"]));
-    let held_pid = held.id();
     let mut child = vec![GATE];
     child.extend(heavy_words("child.log", &POLL, &command));
     assert_eq!(child[4], "--timeout", "the ceiling's value follows it");
     child[5] = "auto:900";
     let parent = holder(&case, &run_words("parent.log", &POLL, &child));
     let parent_pid = parent.id();
-    wait_until("the child gate queueing", || {
-        sequence(&case)
-            .iter()
-            .any(|(event, pid)| event == "queue" && ![held_pid, parent_pid].contains(pid))
-    });
+    wait_until("the child gate queueing", || has_queued(&case, "child.log"));
 
     let critical = case.start(&critical_words("critical.log", &POLL, &[FAKE_TOOL, "exit", "0"]));
     critical.wait_for_stderr(WAITING);

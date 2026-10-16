@@ -906,6 +906,17 @@ mod tests {
     /// Set for the process of its own the interrupt case runs in.
     const OWN_PROCESS: &str = "GATE_TEST_GIT_INTERRUPT_OWN_PROCESS";
 
+    /// Git's trust for this checkout, which on a machine whose folder is owned by another account git otherwise refuses
+    /// with "detected dubious ownership": `safe.directory` set to `*` through a call's own variables, which
+    /// `Git::command` gives to git after stripping the ones this process inherited.
+    fn trust() -> [(&'static str, &'static OsStr); 3] {
+        [
+            ("GIT_CONFIG_COUNT", OsStr::new("1")),
+            ("GIT_CONFIG_KEY_0", OsStr::new("safe.directory")),
+            ("GIT_CONFIG_VALUE_0", OsStr::new("*")),
+        ]
+    }
+
     /// This crate's folder, inside the repository's own checkout, and git found along `PATH` for it.
     fn this_checkout() -> (&'static Path, Git) {
         let here = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -1243,7 +1254,11 @@ mod tests {
     #[test]
     fn output_over_the_cap_is_over_cap_instead_of_reading_it_whole() {
         let (here, git) = this_checkout();
-        let call = Call::plain(here, &["ls-files"], GIT_LIMIT);
+        let trust = trust();
+        let call = Call {
+            set: &trust,
+            ..Call::plain(here, &["ls-files"], GIT_LIMIT)
+        };
         assert_eq!(
             git.output_bytes(&call).expect("git lists its files"),
             git.output(&call).expect("git lists its files, as text").into_bytes(),
@@ -1275,7 +1290,11 @@ mod tests {
         let missing: Vec<String> = (1..=40).map(|number| format!("missing-{number:02}")).collect();
         let mut args = vec!["ls-files", "--error-unmatch", "--"];
         args.extend(missing.iter().map(String::as_str));
-        let call = Call::plain(here, &args, GIT_LIMIT);
+        let trust = trust();
+        let call = Call {
+            set: &trust,
+            ..Call::plain(here, &args, GIT_LIMIT)
+        };
         let Err(GitError::Failed(line)) = git.output_within(&call, OUTPUT_CAP, 512) else {
             panic!("git ls-files --error-unmatch fails on a missing path");
         };

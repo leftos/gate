@@ -663,7 +663,8 @@ fn the_stages_folder_keeps_lower_processes_out_and_a_moved_input_takes_its_folde
     let facts = gate_win32::token_facts().expect("this process's token can be read");
 
     let stages = security_of(&stages_folder(work(&payload).parent().and_then(Path::parent).expect("a root")));
-    let (dacl, label) = stages.split_once("S:").expect("the stages folder has a label");
+    let stripped = gate_win32::without_auto_inherit(&stages);
+    let (dacl, label) = stripped.split_once("S:").expect("the stages folder has a label");
     assert!(dacl.starts_with("D:P"), "the DACL is protected: {stages}");
     assert_eq!(dacl.matches("(A;").count(), 3, "three grants and no more: {stages}");
     for grant in ["(A;OICI;FA;;;SY)", "(A;OICI;FA;;;BA)", &format!("(A;OICI;FA;;;{})", facts.user)] {
@@ -674,13 +675,13 @@ fn the_stages_folder_keeps_lower_processes_out_and_a_moved_input_takes_its_folde
         0x3000 => "HI".to_owned(),
         other => format!("S-1-16-{other}"),
     };
-    assert_eq!(label.trim_start_matches("AI"), format!("(ML;OICI;NW;;;{level})"), "{stages}");
+    assert_eq!(label, format!("(ML;OICI;NW;;;{level})"), "{stages}");
 
     let fresh = work(&payload).join(r"data\fresh.txt");
     fs::write(&fresh, "fresh").expect("a fresh file can be written");
     assert_eq!(
-        security_of(&work(&payload).join(r"data\b.txt")),
-        security_of(&fresh),
+        gate_win32::without_auto_inherit(&security_of(&work(&payload).join(r"data\b.txt"))),
+        gate_win32::without_auto_inherit(&security_of(&fresh)),
         "the moved input's DACL and label"
     );
 }
